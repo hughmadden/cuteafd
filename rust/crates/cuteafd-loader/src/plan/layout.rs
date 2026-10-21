@@ -101,6 +101,7 @@ pub struct LayoutOptions {
     /// Kimi MLA DFlash is opt-in and charged from its native checkpoint headers.
     pub kimi_drafter_snapshot: Option<std::path::PathBuf>,
     pub kimi_draft_fp8: bool,
+    pub mla_kv: cuteafd_core::MlaCacheFormat,
     /// Keep this much of every GPU free for runtime growth.
     pub headroom_bytes: u64,
     /// Concurrent sequences (state slots = concurrency + 2).
@@ -200,6 +201,7 @@ impl Default for LayoutOptions {
             glm5_attention_plan_rows: None,
             kimi_drafter_snapshot: None,
             kimi_draft_fp8: false,
+            mla_kv: Default::default(),
             headroom_bytes: 2 * GIB,
             concurrency: 0,
             state_slots: None,
@@ -444,6 +446,55 @@ mod draft_prefix_tests {
             assert_eq!(resolved_context(policy, 65536, 1048576, Some(&manifest)), 65536);
             assert_eq!(resolved_context(policy, 0, 1048576, None), 1048576);
         }
+    }
+
+    #[test]
+    fn kimi_host_snapshots_use_serve_context_and_selected_draft_record() -> anyhow::Result<()> {
+        use crate::plan::{self, testing, ExpertPlacement, PlanOptions};
+        let target = tempfile::tempdir()?;
+        testing::write_kimi_snapshot(target.path(), true);
+        let checkpoint = super::super::Checkpoint::open(target.path())?;
+        let draft = tempfile::tempdir()?;
+        let config = serde_json::json!({"architectures":["DFlash2DraftModel"], "hidden_size":7168,
+            "intermediate_size":14336, "num_hidden_layers":5, "num_attention_heads":64,
+            "num_key_value_heads":64, "q_lora_rank":1536, "kv_lora_rank":512,
+            "qk_nope_head_dim":128, "qk_rope_head_dim":64, "v_head_dim":128,
+            "rms_norm_eps":1e-5, "vocab_size":163840, "draft_vocab_size":163840,
+            "max_position_embeddings":1048576, "num_target_layers":93,
+            "layer_types":["sliding_attention","sliding_attention","sliding_attention",
+                "sliding_attention","full_attention"], "sliding_window":4096,
+            "use_sliding_window":true, "is_causal":false, "mla_use_output_gate":false,
+            "attention_bias":false, "hidden_act":"silu", "fc_norm":false,
+            "rope_parameters":{"rope_type":"yarn", "rope_theta":50000.0, "factor":32.0,
+                "original_max_position_embeddings":32768, "beta_fast":32, "beta_slow":1,
+                "mscale":1.0, "mscale_all_dim":1.0},
+            "dflash_config":{"attention_mode":"mla", "block_size":8,
+                "conv_kernel_size":2, "conv_group_size":16, "selector_rank":256,
+                "selector_top_k":16, "target_layer_ids":[0,1], "mask_token_id":163592}});
+        std::fs::write(draft.path().join("config.json"), config.to_string())?;
+        for format in [cuteafd_core::MlaCacheFormat::Bf16, cuteafd_core::MlaCacheFormat::Fp8] {
+            let mut options = LayoutOptions { rtx_bytes: vec![96 << 30; 2], concurrency: 2,
+                mla_kv: format, prefix_slots: Some(2), host_cache_bytes: Some(0),
+                onboard: Some(crate::placement::Onboard::Layers(5)), ..Default::default() };
+            let mut report = plan::plan(target.path(), &PlanOptions {
+                placement: ExpertPlacement::Sparks { ranks: 6 }, layout: Some(options.clone()),
+                ..Default::default()
+            })?;
+            let (base, context, concurrency) = selected_host_geometry(&mut report, &options, &checkpoint)?;
+            assert_eq!(context, crate::families::kimi_k3::DEFAULT_CONTEXT as u64);
+            assert_eq!(concurrency, 2);
+            assert_eq!(base.page_bytes, 24 * 64 * format.record_bytes() as u64);
+            options.kimi_drafter_snapshot = Some(draft.path().to_path_buf());
+            let (with_draft, _, _) = selected_host_geometry(&mut report, &options, &checkpoint)?;
+            assert_eq!(with_draft.mark_bytes - base.mark_bytes, 4 * 4160 * format.record_bytes() as u64);
+            assert_eq!(with_draft.page_bytes, base.page_bytes);
+            for context in [262_144, 524_288, 1_048_576] {
+                options.context_tokens = context;
+                let (_, selected, _) = selected_host_geometry(&mut report, &options, &checkpoint)?;
+                assert_eq!(selected, context);
+            }
+        }
+        Ok(())
     }
 
     #[test]
@@ -1024,7 +1075,7 @@ fn selected_host_geometry(report: &mut PlanReport, options: &LayoutOptions, chec
     let selected = CacheOptions { coordinator_ranks: ranks,
         attention_placement: Some(report.attention_placement),
         native_mtp_layers: if matches!(id, "deepseek_v4" | "qwen4") { shape.native_layers } else { 0 },
-        qwen_kv: options.qwen_kv, step5_kv: options.step5_kv, prefill_rows: admitted_rows.unwrap_or(shape.prefill_rows),
+        qwen_kv: options.qwen_kv, mla_kv: options.mla_kv, step5_kv: options.step5_kv, prefill_rows: admitted_rows.unwrap_or(shape.prefill_rows),
         glmf_index: options.glmf_index, kda_state_bytes: options.glmf_kda_state.bytes(),
         glmf_decode_rows: options.glmf_decode_rows, ..Default::default() };
     // Qwen's dual-owner layout partitions whole layers. Its host snapshot
@@ -1057,6 +1108,18 @@ fn selected_host_geometry(report: &mut PlanReport, options: &LayoutOptions, chec
         ensure!(shape.native_layers == 3, "V4.1 dSpark retains all three stages");
         mark_bytes = mark_bytes.checked_add(3 * 128 * 528).context("dSpark mark overflow")?;
     }
+    let mut context = shape.context_tokens;
+    if id == "kimi_k3" {
+        if options.context_tokens == 0 {
+            context = crate::families::kimi_k3::DEFAULT_CONTEXT as u64;
+        }
+        if let Some(snapshot) = &options.kimi_drafter_snapshot {
+            let draft = crate::formats::dflash::MlaDflashConfig::read(snapshot)?;
+            let windows = draft.paged_cache_layout(1, usize::try_from(context)?,
+                usize::try_from(context)?, options.mla_kv)?.window_bytes;
+            mark_bytes = mark_bytes.checked_add(windows).context("Kimi draft mark overflow")?;
+        }
+    }
     if id == "mimo_v2" && options.mimo_prefix_draft {
         let dir = checkpoint.snapshot.join("dflash");
         let draft = if dir.join("dflash_draft_model.safetensors").is_file() {
@@ -1069,7 +1132,6 @@ fn selected_host_geometry(report: &mut PlanReport, options: &LayoutOptions, chec
         } else { 0 };
         mark_bytes = mark_bytes.checked_add(draft).context("MiMo draft mark overflow")?;
     }
-    let mut context = shape.context_tokens;
     if id == "deepseek_v4" && options.context_tokens == 0 {
         if let Some(memory) = &report.memory_layout {
             if memory.pool_tokens < context { context = memory.pool_tokens.saturating_sub(256); }

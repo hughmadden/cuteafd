@@ -1,5 +1,6 @@
 //! Family caller for W7's native NoPE MLA chain. W9 supplies the owning
 //! allocations, launch metadata and TP2 partial-sum exchange.
+use cuteafd_core::MlaCacheFormat;
 use anyhow::{ensure, Context, Result};
 use crate::shared::{memory::device::{Allocation, Device, Stream}, placement::layers::AttentionShare, prefix::view};
 use cuteafd_core::prefix::ReuseRule;
@@ -18,12 +19,12 @@ pub(crate) struct Mla<'a> {
 
 impl<'a> Mla<'a> {
     pub(crate) fn load(cfg: &KimiK3Config, programs: &'a Programs<'a>, heads: usize,
-                       capacity: usize, mode: KimiMlaMode) -> Result<Self> {
+                       capacity: usize, mode: KimiMlaMode, cache_format: MlaCacheFormat) -> Result<Self> {
         ensure!(cfg.hidden == 7168 && cfg.heads == 96 && cfg.q_lora_rank == 1536
             && cfg.kv_lora_rank == 512 && cfg.qk_nope_dim == 128 && cfg.qk_rope_dim == 64
             && cfg.v_head_dim == 128, "unsupported Kimi native MLA geometry");
         ensure!(cfg.mla_record_values() * 2 == MLA_RECORD_BYTES, "Kimi MLA cache accounting mismatch");
-        Ok(Self { native: KimiMla::load(programs, heads, capacity, mode)?, layers: cfg.attention.clone() })
+        Ok(Self { native: KimiMla::load(programs, heads, capacity, mode, cache_format)?, layers: cfg.attention.clone() })
     }
 
     pub(crate) fn scratch_bytes(&self) -> [usize; 3] { self.native.scratch_bytes() }
@@ -44,6 +45,7 @@ impl<'a> Mla<'a> {
 /// alternating-layer assumptions. Head split intentionally keeps both copies.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CacheLayout {
+    format: MlaCacheFormat,
     layers: Vec<Option<AttentionShare>>,
     pages: usize,
     layer_bytes: usize,
@@ -51,7 +53,7 @@ pub(crate) struct CacheLayout {
 }
 
 impl CacheLayout {
-    pub(crate) fn new(cfg: &KimiK3Config, placement: &Placement, rank: usize) -> Result<Self> {
+    pub(crate) fn new(cfg: &KimiK3Config, placement: &Placement, rank: usize, format: MlaCacheFormat) -> Result<Self> {
         ensure!(rank < 2 && placement.layers.len() == cfg.layers && cfg.attention.len() == cfg.layers,
             "Kimi MLA cache placement inventory/rank");
         ensure!(cfg.mla_record_values() * 2 == MLA_RECORD_BYTES, "Kimi MLA cache record geometry");
@@ -64,14 +66,14 @@ impl CacheLayout {
         ensure!(tokens > 0 && tokens % MLA_PAGE_ROWS == 0, "Kimi MLA cache pool is not whole pages");
         let pages = tokens / MLA_PAGE_ROWS;
         ensure!(pages <= i32::MAX as usize, "Kimi MLA page count exceeds native ABI");
-        let layer_bytes = tokens.checked_mul(MLA_RECORD_BYTES).context("Kimi MLA cache extent overflow")?;
+        let layer_bytes = tokens.checked_mul(format.record_bytes()).context("Kimi MLA cache extent overflow")?;
         let layers = cfg.attention.iter().zip(&placement.layers).map(|(kind, assignment)| -> Result<_> {
             if *kind != KimiAttention::Mla { return Ok(None); }
             let share = AttentionShare::bind(assignment.mode, 2)?[rank];
             Ok(share.present().then_some(share))
         }).collect::<Result<Vec<_>>>()?;
         let bytes = layer_bytes.checked_mul(layers.iter().flatten().count()).context("Kimi MLA cache total overflow")?;
-        Ok(Self { layers, pages, layer_bytes, bytes })
+        Ok(Self { format, layers, pages, layer_bytes, bytes })
     }
 
     pub(crate) fn bytes(&self) -> usize { self.bytes }
@@ -80,7 +82,7 @@ impl CacheLayout {
         ensure!(self.layers.get(layer).is_some_and(Option::is_some), "Kimi MLA cache absent on nonowner or non-MLA layer");
         ensure!(page < self.pages && (1..=MLA_PAGE_ROWS).contains(&rows),
             "Kimi MLA prefix page/rows outside admitted pool");
-        Ok((page * MLA_PAGE_ROWS * MLA_RECORD_BYTES, rows * MLA_RECORD_BYTES))
+        Ok((page * MLA_PAGE_ROWS * self.format.record_bytes(), rows * self.format.record_bytes()))
     }
 
     pub(super) fn allocate<'a>(&self, device: Device<'a>, readers: Vec<Rc<Stream<'a>>>) -> Result<CacheBank<'a>> {
@@ -137,6 +139,8 @@ impl<'a> CacheBank<'a> {
         view(self.layer(layer)?, offset, bytes)
     }
 
+    pub(crate) fn format(&self) -> MlaCacheFormat { self.layout.format }
+
     pub(crate) fn pages(&self) -> usize { self.layout.pages }
 
     pub(crate) fn owners(&self) -> Vec<Rc<Allocation<'a>>> { self.layers.iter().flatten().cloned().collect() }
@@ -157,7 +161,7 @@ mod tests {
         let bytes = MLA_PAGE_ROWS * MLA_RECORD_BYTES;
         let bank = CacheBank { stream: Stream { device, raw: std::ptr::null_mut() }, readers: readers.clone(),
             layers: vec![None, Some(Rc::new(Allocation::new(device, bytes)?))],
-            layout: CacheLayout { layers: vec![None, Some(AttentionShare::Whole)], pages: 1, layer_bytes: bytes, bytes } };
+            layout: CacheLayout { format: MlaCacheFormat::Bf16, layers: vec![None, Some(AttentionShare::Whole)], pages: 1, layer_bytes: bytes, bytes } };
         assert!(bank.layer(0).is_err());
         assert!(bank.layer(2).is_err());
         assert_eq!(bank.pages(), 1);

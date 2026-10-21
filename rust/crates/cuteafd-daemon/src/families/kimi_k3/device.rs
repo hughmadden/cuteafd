@@ -145,7 +145,7 @@ impl NativeScratch {
 
 impl<'a> NativePrograms<'a> {
     pub(crate) fn load(device: Device<'a>, cfg: &KimiK3Config,
-        programs: &'a Programs<'a>, ffn_mode: cuteafd_ffi::KimiFfnMode) -> Result<Self> {
+        programs: &'a Programs<'a>, ffn_mode: cuteafd_ffi::KimiFfnMode, cache_format: cuteafd_core::MlaCacheFormat) -> Result<Self> {
         ensure!(device.id >= 0 && std::ptr::eq(device.library, programs.library()),
             "Kimi programs and device must share their native library");
         device.run(|| {
@@ -154,9 +154,9 @@ impl<'a> NativePrograms<'a> {
             // both before its measured baseline, never lazily after admission.
             let load_mla = |heads| -> Result<MlaPrograms<'a>> {
                 Ok(MlaPrograms {
-                    decode: super::mla::Mla::load(cfg, programs, heads, 64, KimiMlaMode::Decode)?,
-                    verify: super::mla::Mla::load(cfg, programs, heads, 64, KimiMlaMode::Verify)?,
-                    extend: super::mla::Mla::load(cfg, programs, heads, 4096, KimiMlaMode::Extend)?,
+                    decode: super::mla::Mla::load(cfg, programs, heads, 64, KimiMlaMode::Decode, cache_format)?,
+                    verify: super::mla::Mla::load(cfg, programs, heads, 64, KimiMlaMode::Verify, cache_format)?,
+                    extend: super::mla::Mla::load(cfg, programs, heads, 4096, KimiMlaMode::Extend, cache_format)?,
                 })
             };
             let mla = [load_mla(48)?, load_mla(96)?];

@@ -6,6 +6,7 @@ pub mod reference;
 pub mod w8;
 
 pub const COMPILED_CONTEXT: usize = 1_048_576;
+pub const DEFAULT_CONTEXT: usize = 524_288;
 pub const SPARK_DEFAULT_BUDGET_BYTES: u64 = 108 << 30;
 
 /// Offline ceiling only; the first full worker load/steady census qualifies it.

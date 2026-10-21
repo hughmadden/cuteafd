@@ -78,8 +78,9 @@ def test_kimi_w8_cross_sm_groups(group, names):
 
 
 def test_mla_draft_cross_sm_group_and_checkpoint_neutral_registry(monkeypatch):
-    names = ["mla_draft_producer_m64", "mla_draft_output_m64",
-             "mla_draft_attention_full_m64", "mla_draft_attention_w4096_m64"]
+    names = ["mla_draft_producer_m64", "mla_draft_producer_fp8_m64", "mla_draft_output_m64",
+             "mla_draft_attention_full_m64", "mla_draft_attention_w4096_m64",
+             "mla_draft_attention_full_fp8_m64", "mla_draft_attention_w4096_fp8_m64"]
     job = next(job for job in compare_sm.jobs("suspects") if job[0] == "mla-draft-h64")
     assert job == ("mla-draft-h64", "export_b12x_dsv4_aot.py",
                    ["--geometry", "kimik3", "--only", ",".join(names)])
@@ -100,13 +101,15 @@ def test_mla_draft_cross_sm_group_and_checkpoint_neutral_registry(monkeypatch):
     ns = {}
     exec(compile(tree, str(source), "exec"), ns)
     programs = ns["mla_draft_programs"](64, 262144)
-    assert [row[0] for row in programs] == names
+    assert {row[0] for row in programs} == set(names)
     for row in programs:
         row[-1]()
-    assert calls == [({"window_size": None}, {"max_rows": 64}),
-                     ({"window_size": None}, {"max_rows": 64}),
-                     ({"window_size": None}, {"max_rows": 64, "max_context": 262144}),
-                     ({"window_size": 4096}, {"max_rows": 64, "max_context": 262144})]
+    assert calls == [({"window_size": None, "kv_cache": "bf16"}, {"max_rows": 64})] + [
+        (dict(window_size=window, kv_cache=cache), dict(max_rows=64, **extra))
+        for cache in ("bf16", "fp8")
+        for window, extra in ((None, {}), (None, {"max_context": 262144}),
+                              (4096, {"max_context": 262144}))]
+
 
 
 @pytest.mark.parametrize("geometry", ["glm_stage", "glm2_stage"])

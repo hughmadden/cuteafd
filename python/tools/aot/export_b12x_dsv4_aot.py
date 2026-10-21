@@ -46,6 +46,7 @@ CHECKPOINT_CONTEXTS = {
     "qwen35": ("Qwen/Qwen3.5-9B", 262144),
     "qwen38": ("Qwen/Qwen3.8-27B", 262144),
     "step5": ("stepfun-ai/Step-5-Preview", 1048576),
+    "kimik3": ("moonshotai/Kimi-K3", 1048576),
 }
 
 
@@ -509,18 +510,22 @@ def kimi_kda_programs(g, decode_rows: int, prefill_rows: int, max_context: int):
         out.append((f"kda_m{rows}", "kda", params,
                     lambda kw=params: glmf.compile_glmf_kda_aot(g, **kw)))
     for heads in (48, 96):
-        mla = kimi_mla.KimiMlaGeometry(heads=heads)
         suffix = "" if heads == 48 else "_h96"
-        for rows in sorted({decode_rows, prefill_rows}):
-            for op, fn in (("mla_producer", kimi_mla.compile_kimi_mla_producer_aot),
-                           ("mla_output", kimi_mla.compile_kimi_mla_output_aot)):
-                out.append((f"{op}{suffix}_m{rows}", op, {"max_rows": rows, "heads": heads},
-                            lambda r=rows, g=mla, fn=fn: fn(g, max_rows=r)))
-        for mode, rows in (("decode", decode_rows), ("verify", decode_rows), ("extend", prefill_rows)):
-            out.append((f"dense_mla_{mode}{suffix}_m{rows}", "dense_mla",
-                        {"mode": mode, "max_rows": rows, "heads": heads},
-                        lambda m=mode, r=rows, g=mla: kimi_mla.compile_kimi_dense_mla_aot(
-                            g, max_rows=r, max_context=max_context, mode=m)))
+        for cache in ("bf16", "fp8"):
+            mla = kimi_mla.KimiMlaGeometry(heads=heads, kv_cache=cache)
+            cache_suffix = "" if cache == "bf16" else "_fp8"
+            for rows in sorted({decode_rows, prefill_rows}):
+                out.append((f"mla_producer{suffix}{cache_suffix}_m{rows}", "mla_producer",
+                            {"max_rows": rows, "heads": heads, "kv_cache": cache},
+                            lambda r=rows, g=mla: kimi_mla.compile_kimi_mla_producer_aot(g, max_rows=r)))
+                if cache == "bf16":
+                    out.append((f"mla_output{suffix}_m{rows}", "mla_output", {"max_rows": rows, "heads": heads},
+                                lambda r=rows, g=mla: kimi_mla.compile_kimi_mla_output_aot(g, max_rows=r)))
+            for mode, rows in (("decode", decode_rows), ("verify", decode_rows), ("extend", prefill_rows)):
+                out.append((f"dense_mla_{mode}{suffix}{cache_suffix}_m{rows}", "dense_mla",
+                            {"mode": mode, "max_rows": rows, "heads": heads, "kv_cache": cache},
+                            lambda m=mode, r=rows, g=mla: kimi_mla.compile_kimi_dense_mla_aot(
+                                g, max_rows=r, max_context=max_context, mode=m)))
     out.extend(kimi_w8_programs())
     out.extend(kimi_latent_programs())
     out.extend(kimi_route_programs())
@@ -532,21 +537,25 @@ def mla_draft_programs(max_rows: int, max_context: int):
     """Shared rotary MLA drafter; checkpoint scales are runtime ABI inputs."""
     from b12x.integration.cuteafd import kimi_mla
 
-    def build(op, window=None):
-        g = kimi_mla.MlaDraftGeometry(window_size=window)
+    def build(op, window=None, cache="bf16"):
+        g = kimi_mla.MlaDraftGeometry(window_size=window, kv_cache=cache)
         fn = getattr(kimi_mla, f"compile_mla_draft_{op}_aot")
         kwargs = {"max_rows": max_rows}
         if op == "attention":
             kwargs["max_context"] = max_context
         return fn(g, **kwargs)
 
-    out = [(f"mla_draft_{op}_m{max_rows}", f"mla_draft_{op}", {"max_rows": max_rows},
-            lambda op=op: build(op)) for op in ("producer", "output")]
-    for window in (None, 4096):
-        suffix = "full" if window is None else f"w{window}"
-        out.append((f"mla_draft_attention_{suffix}_m{max_rows}", "mla_draft_attention",
-                    {"max_rows": max_rows, "window_size": window, "max_context": max_context},
-                    lambda window=window: build("attention", window)))
+    out = [(f"mla_draft_output_m{max_rows}", "mla_draft_output", {"max_rows": max_rows},
+            lambda: build("output"))]
+    for cache in ("bf16", "fp8"):
+        cache_suffix = "" if cache == "bf16" else "_fp8"
+        out.append((f"mla_draft_producer{cache_suffix}_m{max_rows}", "mla_draft_producer",
+                    {"max_rows": max_rows, "kv_cache": cache}, lambda c=cache: build("producer", cache=c)))
+        for window in (None, 4096):
+            suffix = "full" if window is None else f"w{window}"
+            out.append((f"mla_draft_attention_{suffix}{cache_suffix}_m{max_rows}", "mla_draft_attention",
+                        {"max_rows": max_rows, "window_size": window, "max_context": max_context, "kv_cache": cache},
+                        lambda w=window, c=cache: build("attention", w, c)))
     return out
 
 

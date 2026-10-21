@@ -4,20 +4,22 @@ use crate::shared::{prefix::PrefixArgs, qwen::scheduler::{self, Backend}};
 use anyhow::{ensure, Context, Result};
 use cuteafd_api::openai::{chat::kimi::KimiEncoding, ModelEncoding, ModelProfile, NativeLimits, NativeRequest};
 use std::{net::SocketAddr, path::PathBuf, sync::{Arc, Mutex}};
-use cuteafd_loader::families::kimi_k3::COMPILED_CONTEXT;
+use cuteafd_loader::families::kimi_k3::{COMPILED_CONTEXT, DEFAULT_CONTEXT};
 
 #[derive(Debug, Clone, clap::Args)]
 pub(crate) struct ServeArgs {
+    /// Target and drafter share the exact selected MLA record.
+    #[arg(long, default_value = "bf16")] pub kv_cache: cuteafd_core::MlaCacheFormat,
     #[arg(long)] pub snapshot: PathBuf,
     #[arg(long, env = "CUTEAFD_NATIVE_LIB")] pub native_lib: PathBuf,
     #[arg(long, default_value = "/opt/cuteafd/share/PROGRAMS.json")] pub manifest: PathBuf,
     #[arg(long, default_value_t = 0)] pub device: i32,
     #[arg(long, default_value_t = 1)] pub split_device: i32,
     #[arg(long, value_delimiter = ',')] pub peers: Vec<SocketAddr>,
-    /// Auto admission targets 2M tokens on the reference coordinator pair.
+    /// Auto admission grows beyond the selected context floor while memory allows.
     #[arg(long)] pub pool_tokens: Option<u64>,
-    /// Native allocation extent and API ceiling, up to the compiled 1M capacity.
-    #[arg(long, default_value_t = COMPILED_CONTEXT)] pub max_context: usize,
+    /// Native allocation extent and API ceiling; defaults to 512K within the compiled 1M capacity.
+    #[arg(long, default_value_t = DEFAULT_CONTEXT)] pub max_context: usize,
     #[arg(long, default_value = "auto")] pub rtx_expert_layers: cuteafd_loader::placement::Onboard,
     /// Complete per-rank allocation ceiling, estimated until the first worker census.
     #[arg(long)] pub spark_budget_gib: Option<f64>,
@@ -92,8 +94,9 @@ pub(crate) async fn run(args: ServeArgs) -> Result<()> {
             let library = Arc::new(unsafe { cuteafd_ffi::NativeLibrary::load(&worker_args.native_lib)? });
             let programs = library.programs()?.with_manifest(&worker_args.manifest)?;
             let draft = worker_args.draft.as_ref().map(|snapshot| super::draft::Options {
-                snapshot: snapshot.clone(), fp8: worker_args.draft_fp8 });
+                snapshot: snapshot.clone(), fp8: worker_args.draft_fp8, cache_format: worker_args.kv_cache });
             let loaded = startup::load(&library, &programs, &checkpoint, &cfg, &cfg, startup::Options {
+                cache_format: worker_args.kv_cache,
                 devices: [worker_args.device, worker_args.split_device], native_lib: &worker_args.native_lib,
                 peers: worker_args.peers.clone(), rtx_expert_layers: worker_args.rtx_expert_layers,
                 spark_budget_gib: worker_args.spark_budget_gib,
@@ -190,12 +193,16 @@ mod tests {
         let peers = "127.0.0.1:1,127.0.0.1:2,127.0.0.1:3,127.0.0.1:4,127.0.0.1:5,127.0.0.1:6";
         let defaults = args(&["--peers", peers])?;
         defaults.validate()?;
-        assert_eq!(defaults.max_context, 1_048_576);
+        assert_eq!(defaults.max_context, 524_288);
+        assert_eq!(defaults.kv_cache, cuteafd_core::MlaCacheFormat::Bf16);
+        assert_eq!(args(&["--peers", peers, "--kv-cache", "fp8"])?.kv_cache, cuteafd_core::MlaCacheFormat::Fp8);
+        assert!(args(&["--peers", peers, "--kv-cache", "int8"]).is_err());
         assert_eq!(defaults.rtx_expert_layers, cuteafd_loader::placement::Onboard::Auto);
         assert_eq!(defaults.max_sequences, 16);
         assert_eq!(defaults.pool_tokens, None);
         assert_eq!(defaults.spark_budget_gib, None);
-        assert_eq!(defaults.api_limits(COMPILED_CONTEXT)?.context(), COMPILED_CONTEXT as u32);
+        assert_eq!(defaults.api_limits(COMPILED_CONTEXT)?.context(), DEFAULT_CONTEXT as u32);
+        args(&["--peers", peers, "--max-context", "1048576"])?.validate()?;
         let limited = args(&["--peers", peers, "--max-context", "262144"])?;
         limited.validate()?;
         let limits = limited.api_limits(COMPILED_CONTEXT)?;

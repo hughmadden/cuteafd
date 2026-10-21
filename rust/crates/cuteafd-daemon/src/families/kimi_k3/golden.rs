@@ -22,6 +22,7 @@ const SOURCE: [(&str, &str); 3] = [
 
 #[derive(Debug, clap::Args)]
 pub(crate) struct GoldenArgs {
+    #[arg(long, default_value = "bf16")] kv_cache: cuteafd_core::MlaCacheFormat,
     #[arg(long)] snapshot: PathBuf,
     #[arg(long, env = "CUTEAFD_NATIVE_LIB")] native_lib: Option<PathBuf>,
     #[arg(long, default_value = "/opt/cuteafd/share/PROGRAMS.json")] manifest: PathBuf,
@@ -61,7 +62,7 @@ impl GoldenArgs {
     }
 
     fn provenance(&self) -> Value {
-        serde_json::json!({"schema": "cuteafd.kimi.run/1", "ffn_mode": self.ffn_mode().name(),
+        serde_json::json!({"schema": "cuteafd.kimi.run/1", "ffn_mode": self.ffn_mode().name(), "kv_cache": self.kv_cache.label(),
             "gate_up_programs": ([3072, 16896].map(|width| self.ffn_mode().gate_up_stem(width))),
             "rtx_expert_layers":self.rtx_expert_layers, "window": self.window, "last_layer": self.last_layer, "diagnostic_only": !self.nll})
     }
@@ -309,10 +310,11 @@ fn native(args: &GoldenArgs, checkpoint: &cuteafd_loader::plan::Checkpoint,
         .max().unwrap_or(1).min(4096));
     let super::startup::Loaded { engine, admission_free, admitted_bytes } = super::startup::load(
         &library, &programs, checkpoint, full, cfg, super::startup::Options {
+            cache_format: args.kv_cache,
             devices: [args.device, args.split_device], native_lib: args.native_lib.as_deref().context("--native-lib required")?,
             peers: args.peers.clone(), rtx_expert_layers: cuteafd_loader::placement::Onboard::Layers(args.rtx_expert_layers),
             spark_budget_gib: args.spark_budget_gib,
-            rows, slots: 1, marks: 1, max_context: 1_048_576, pool_tokens: Some(1_048_576), graphs: false,
+            rows, slots: 1, marks: 1, max_context: cuteafd_loader::families::kimi_k3::COMPILED_CONTEXT, pool_tokens: Some(1_048_576), graphs: false,
             draft: None, ffn_mode: args.ffn_mode(), hosted_layers: Some(hosted_layers(&std::env::var("CUTEAFD_GOLDEN_EXPERT_LAYERS")?)?),
         })?;
     use cuteafd_engine::prefix::PrefixFamily;
@@ -661,7 +663,7 @@ mod tests {
             cuteafd_loader::families::kimi_k3::SPARK_DEFAULT_BUDGET_BYTES,
             cuteafd_loader::families::kimi_k3::SPARK_ESTIMATED_RESERVE_BYTES)?;
         let graph_set = super::super::graphs::owned_inventory(&cfg, 1, rows, slots)?;
-        let admitted = admission::admit(admission::Inputs { cfg: &cfg, gpus: [GpuBudget {
+        let admitted = admission::admit(admission::Inputs { cfg: &cfg, cache_format: cuteafd_core::MlaCacheFormat::Bf16, gpus: [GpuBudget {
             capacity_bytes: 96 << 30, headroom_bytes: 2 << 30,
             baseline: cuteafd_loader::placement::Baseline::Measured { free_bytes: (96 << 30) - reserve } }; 2],
             devices: [0, 1], peer_access: true, spark_ranks: 6, attention: None,

@@ -13,7 +13,7 @@ pub fn geometry(cfg: &KimiK3Config) -> KdaGeometry {
 
 /// Exact physical host snapshot segments: both KDA shards and every resident
 /// MLA copy. Head-split MLA keeps two copies, so neither may be deduplicated.
-pub fn cache_geometry(cfg: &KimiK3Config, mla_layers: [usize; 2])
+pub fn cache_geometry(cfg: &KimiK3Config, mla_layers: [usize; 2], cache_format: cuteafd_core::MlaCacheFormat)
     -> Result<crate::serving_capacity::FamilyCacheGeometry, crate::serving_capacity::CacheGeometryError> {
     use crate::serving_capacity::{CacheGeometryError, FamilyCacheGeometry, KvPlacement, RankCacheGeometry};
     if cfg.kda_heads != 96 || cfg.kda_head_dim != 128 || cfg.kda_conv != 4
@@ -23,7 +23,7 @@ pub fn cache_geometry(cfg: &KimiK3Config, mla_layers: [usize; 2])
     }
     let mark = (cfg.kda_state_bytes() + cfg.kda_conv_bytes()) / 2 * cfg.kda_layers() as u64;
     let ranks = mla_layers.into_iter().map(|layers| RankCacheGeometry {
-        persistent_unit_bytes: layers as u64 * 64 * cfg.mla_record_values() as u64 * 2,
+        persistent_unit_bytes: layers as u64 * 64 * cache_format.record_bytes() as u64,
         active_state_per_sequence_bytes: mark, retained_mark_bytes: mark, ..Default::default()
     }).collect();
     Ok(FamilyCacheGeometry { logical_unit_rows: 64, placement: KvPlacement::PartitionedLayers, ranks })

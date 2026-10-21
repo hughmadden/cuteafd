@@ -60,7 +60,7 @@ def test_kimi_dispatches_to_serve_kimi_with_its_own_defaults(tmp_path: Path) -> 
     assert _flag(serve, "--max-sequences") == "16"
     assert _flag(serve, "--embedding-placement") == "gpu"
     assert _flag(serve, "--prefix-cache-entries") == "20"
-    # serve-kimi's own defaults stay its own: compiled 1M context, automatic KV pool;
+    # serve-kimi's own defaults stay its own: 512K default context (1M compiled), automatic KV pool;
     # the planner picks the onboarded layers; it takes no speculator or media options.
     assert _flag(serve, "--rtx-expert-layers") == "auto"
     for absent in ("--max-context", "--pool-tokens", "--vision", "--audio",
@@ -112,6 +112,14 @@ def test_kimi_dflash2_uses_one_resolved_fp8_snapshot_for_plan_and_serve(tmp_path
         assert all(flag not in plan.split() for flag in ("--drafter-snapshot", "--draft-fp8"))
 
 
+@pytest.mark.parametrize("cache", [None, "bf16", "fp8"])
+def test_kimi_kv_format_reaches_both_plan_and_target_drafter(tmp_path: Path, cache) -> None:
+    result = _kimi(tmp_path, "" if cache is None else f"KV_CACHE={cache}\n")
+    expected = cache or "bf16"
+    assert _flag(_line(result, "cuteafd serve-kimi --snapshot"), "--kv-cache") == expected
+    assert _flag(_line(result, "cuteafd plan"), "--kv-cache") == expected
+
+
 def test_kimi_explicit_spark_budget_reaches_plan_and_workers(tmp_path: Path) -> None:
     result = _kimi(tmp_path, "SPARK_DEVICE_BUDGET_BYTES=107374182400\n")
     assert _flag(_line(result, "cuteafd plan"), "--spark-budget-gib") == "100.0"
@@ -133,7 +141,7 @@ def test_kimi_explicit_spark_budget_reaches_plan_and_workers(tmp_path: Path) -> 
     ("EMBEDDING=host\n", "GPU token embeddings only"),
     ("RTX_EXPERT_LAYERS=max\n", "auto or a fixed routed-layer count"),
     ("RTX_EXPERT_LAYERS=94\n", "RTX_EXPERT_LAYERS must be"),
-    ("KV_CACHE=bf16\n", "unused configuration key: KV_CACHE"),
+    ("KV_CACHE=int8\n", "KV_CACHE must be bf16 or fp8"),
     ("L2_PREFETCH=auto\n", "unused configuration key: L2_PREFETCH"),
 ])
 def test_kimi_refuses_unsupported_configuration(tmp_path: Path, keys: str, diagnostic: str) -> None:

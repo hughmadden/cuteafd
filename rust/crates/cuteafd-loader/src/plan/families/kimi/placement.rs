@@ -34,8 +34,8 @@ pub(super) fn layout(model: &Model, report: &mut PlanReport, opts: &crate::plan:
     };
     report.bytes_by_owner.clear();
     report.attention_placement = report.requested_attention.unwrap_or(AttentionPlacement::Layers);
-    let context = if opts.context_tokens == 0 { COMPILED_CAPACITY } else { opts.context_tokens };
-    memory.notes.push(format!("Kimi API max context: {context} tokens; compiled max context: {context} tokens (native capacity {COMPILED_CAPACITY} tokens)"));
+    let context = if opts.context_tokens == 0 { crate::families::kimi_k3::DEFAULT_CONTEXT as u64 } else { opts.context_tokens };
+    memory.notes.push(format!("Kimi API max context: {context} tokens; compiled max context: {COMPILED_CAPACITY} tokens"));
     if context > COMPILED_CAPACITY {
         refusal(report, format!("Kimi context {context} exceeds compiled capacity {COMPILED_CAPACITY}"),
             "Lower --context-tokens to at most 1M; the pool must cover the selected context extent.");
@@ -70,6 +70,7 @@ pub(super) fn layout(model: &Model, report: &mut PlanReport, opts: &crate::plan:
         return memory;
     }
     let requested_pool = opts.pool_tokens.filter(|n| *n > 0);
+    let target_pool = opts.target_pool_tokens.max(context);
     let edge = |c| *model.bytes.get(&c).unwrap_or(&0);
     let (embedding, head) = (edge(Component::Embedding), edge(Component::LmHead));
     let residency = model.coordinator;
@@ -140,7 +141,7 @@ pub(super) fn layout(model: &Model, report: &mut PlanReport, opts: &crate::plan:
         let representation = if opts.kimi_draft_fp8 { GlmDraftRepresentation::Fp8Only }
             else { GlmDraftRepresentation::Bf16Only };
         let layout = draft.runtime_layout(representation, GlmDraftCapacity::new(slots, slots.min(8), draft.block)?,
-            usize::try_from(context)?, slots.checked_mul(usize::try_from(context)?).context("draft pool overflow")?, opts.physical_sms.unwrap_or(188) as usize, 0)?;
+            usize::try_from(context)?, slots.checked_mul(usize::try_from(context)?).context("draft pool overflow")?, opts.physical_sms.unwrap_or(188) as usize, 0, opts.mla_kv)?;
         fixed.extend(crate::families::kimi_k3::draft_bridge_demands(&layout)?);
         fixed.push(crate::families::kimi_k3::draft_probe_demand(cfg.layers, cfg.topk, 64)?);
         let bytes = layout.window_mark_bytes()? as u64;
@@ -161,7 +162,7 @@ pub(super) fn layout(model: &Model, report: &mut PlanReport, opts: &crate::plan:
             return memory;
         }
     };
-    let record = (cfg.mla_record_values() * 2) as u64 * PAGE;
+    let record = opts.mla_kv.record_bytes() as u64 * PAGE;
     let layers = (0..cfg.layers).map(|layer| {
         let mla = cfg.attention[layer] == crate::families::kimi_k3::config::KimiAttention::Mla;
         LayerDemand { kind: if mla { AttentionClass::Mla } else { AttentionClass::Kda },
@@ -181,8 +182,8 @@ pub(super) fn layout(model: &Model, report: &mut PlanReport, opts: &crate::plan:
             spark_ranks: ranks, peer_access: true },
         attention_placement: report.requested_attention, context_buffers: ContextBuffers::default(), layers_first_gpu: 0,
         pool: PoolPolicy { compiled_context: context,
-            requested: requested_pool, target: opts.target_pool_tokens.max(context), floor: context,
-            ceiling: opts.target_pool_tokens.max(requested_pool.unwrap_or(0)).max(context), unit_rows: PAGE },
+            requested: requested_pool, target: target_pool, floor: context,
+            ceiling: target_pool.max(requested_pool.unwrap_or(0)), unit_rows: PAGE },
         layers, pool_overhead: vec![0; 2], pool_bounded: Vec::new(), fixed, startup: Vec::new(), movables: Vec::new(),
         expert_workspace: 0, tp2_workspace: [0; 2], onboard, expert_gpus: 2, minimum_expert_layers: 0,
         policy: LayerPolicy { default: vec![LayerMode::HeadSplit], ownership: LayerOwnership::Ranges, expert_ownership: ExpertOwnership::Contiguous,
@@ -248,7 +249,7 @@ pub(super) fn layout(model: &Model, report: &mut PlanReport, opts: &crate::plan:
                 memory.devices.push(device);
             }
             memory.notes.push(format!("MLA latent {} B/token over {} layers; {} placement, KDA and FFNs split TP2; \
-                pool {} tokens with {} routed layers on RTX ({:.2} GiB each)", cfg.mla_record_values() * 2 * cfg.mla_layers(),
+                pool {} tokens with {} routed layers on RTX ({:.2} GiB each)", opts.mla_kv.record_bytes() * cfg.mla_layers(),
                 cfg.mla_layers(), placed.attention_placement, placed.pool_tokens, placed.onboard_layers, layer_bytes as f64 / GIB as f64));
             placed.onboard_layers
         }

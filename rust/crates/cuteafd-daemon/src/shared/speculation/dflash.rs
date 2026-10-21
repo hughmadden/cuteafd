@@ -643,7 +643,7 @@ impl MlaWorkspace<'_> {
         requests: usize, page_table_width: usize, x: CuteafdDeviceBuffer, output: CuteafdDeviceBuffer,
         slots: CuteafdDeviceBuffer, positions: CuteafdDeviceBuffer) -> cuteafd_ffi::mla_draft::MlaDraftBatch {
         cuteafd_ffi::mla_draft::MlaDraftBatch { rows, requests, page_table_width,
-            cache_pages: layer.cache.buffer.bytes / (64 * 1152), active_splits: layer.program.splits(),
+            cache_pages: layer.cache.buffer.bytes / (64 * layer.program.cache_format().record_bytes()), active_splits: layer.program.splits(),
             rotary_factor: context.cfg.rotary.attention_factor, attention_scale: context.cfg.attention_scale(),
             x, slots, positions, inv_freq: self.inverse_frequencies.buffer, cache: layer.cache.buffer,
             page_table: layer.page_table.buffer, lengths: self.lengths.buffer, query_offsets: self.query_offsets.buffer,
@@ -1179,7 +1179,7 @@ impl<'a> DflashDrafter<'a> {
         let _scope = cuteafd_ffi::memory_ledger::scope("drafter");
         let native = MlaDflashConfig::read(snapshot)?;
         ensure!(native.runtime_layout(representation, layout.capacity(), layout.program().context,
-            layout.paged_cache().target_tokens, library.sm_count()?, fp8_rows.code() as u8)? == layout,
+            layout.paged_cache().target_tokens, library.sm_count()?, fp8_rows.code() as u8, layout.cache_format())? == layout,
             "MLA draft checkpoint/runtime differs from admitted immutable layout");
         let cfg = DflashConfig::mla(&native);
         let checkpoint = Checkpoint { data: file, tensors: read_safetensors_metadata(&snapshot.join("model.safetensors"))?
@@ -1187,7 +1187,7 @@ impl<'a> DflashDrafter<'a> {
         for (name, shape) in native.tensor_shapes() { checkpoint.bytes(&name, &shape)?; }
         let programs = native.windows.iter().map(|window| -> Result<_> {
             let program = MlaDraft::load(programs, program_namespace, if window.is_some() { MlaDraftWindow::Sliding4096 }
-                else { MlaDraftWindow::Full })?;
+                else { MlaDraftWindow::Full }, layout.cache_format())?;
             ensure!(program.max_context() >= layout.program().context
                 && program.splits() == layout.program().splits
                 && program.scratch_bytes() == layout.program().scratch,
@@ -1475,7 +1475,7 @@ impl<'a> DflashDrafter<'a> {
         // SAFETY: test-only readback retains all operands and their producing stream.
         unsafe { self.library.cuda_stream_synchronize(self.stream)?; }
         let cache = context.layout.cache();
-        let record_bytes = (context.cfg.mla.kv_rank + context.cfg.mla.rope) * 2;
+        let record_bytes = context.layout.paged_cache().record_bytes;
         let mut layers = Vec::new();
         for (index, layer) in self.layers.iter().enumerate() {
             let DraftAttention::Mla(attention) = &layer.attention else { anyhow::bail!("mixed MLA layers"); };
@@ -2539,7 +2539,7 @@ mod checkpoint_header_tests {
 
     fn mla_cache_state() -> cuteafd_loader::formats::dflash::MlaDraftCacheState {
         cuteafd_loader::formats::dflash::MlaDraftCacheState::new(
-            mla_config().cache_layout(2, 262144).unwrap()).unwrap()
+            mla_config().cache_layout(2, 262144, cuteafd_core::MlaCacheFormat::Bf16).unwrap()).unwrap()
     }
 
     #[test]
@@ -2547,7 +2547,7 @@ mod checkpoint_header_tests {
         use cuteafd_loader::{families::glm5::draft_representation::{GlmDraftCapacity, GlmDraftRepresentation},
             formats::dflash::MlaDraftCacheRequest};
         let layout = mla_config().runtime_layout(GlmDraftRepresentation::Fp8Only,
-            GlmDraftCapacity::new(2, 2, 8).unwrap(), 262144, 128, 188, 2).unwrap();
+            GlmDraftCapacity::new(2, 2, 8).unwrap(), 262144, 128, 188, 2, cuteafd_core::MlaCacheFormat::Bf16).unwrap();
         let mut state = MlaPagedState::new(&layout).unwrap();
         assert_eq!(state.pool.capacity(), 2);
         state.reset(0, 513).unwrap();

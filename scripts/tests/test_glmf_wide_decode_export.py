@@ -65,6 +65,7 @@ def exporter(monkeypatch):
     ("qwen35", "Qwen/Qwen3.5-9B", 262144),
     ("qwen38", "Qwen/Qwen3.8-27B", 262144),
     ("step5", "stepfun-ai/Step-5-Preview", 1048576),
+    ("kimik3", "moonshotai/Kimi-K3", 1048576),
 ])
 def test_checkpoint_extent_table_and_head_splits(exporter, geometry, checkpoint, limit):
     assert exporter.CHECKPOINT_CONTEXTS[geometry] == (checkpoint, limit)
@@ -365,24 +366,28 @@ def test_kimi_nope_mla_exports_both_head_layouts_and_all_modes(exporter, decode_
     programs = exporter.kimi_kda_programs(GEOMETRY, decode_rows, prefill_rows, 1048576)
     calls = {stem: (op, params, thunk()) for stem, op, params, thunk in programs
              if op in ("mla_producer", "mla_output", "dense_mla")}
-    assert len([p for p in programs if p[1].startswith("mla_draft_")]) == 4
-    assert len(calls) == 2 * (2 * len({decode_rows, prefill_rows}) + 3)
+    assert len([p for p in programs if p[1].startswith("mla_draft_")]) == 7
+    assert len(calls) == 2 * (3 * len({decode_rows, prefill_rows}) + 6)
     for heads in (48, 96):
         suffix = "" if heads == 48 else "_h96"
-        for rows in {decode_rows, prefill_rows}:
-            for op in ("mla_producer", "mla_output"):
-                actual_op, params, (module, fn, args, kwargs) = calls[f"{op}{suffix}_m{rows}"]
-                assert actual_op == op and module == "kimi_mla"
-                assert fn == f"compile_kimi_{op}_aot"
-                assert vars(args[0]) == {"heads": heads}
+        for cache in ("bf16", "fp8"):
+            cs = "" if cache == "bf16" else "_fp8"
+            for rows in {decode_rows, prefill_rows}:
+                op, params, (module, fn, args, kwargs) = calls[f"mla_producer{suffix}{cs}_m{rows}"]
+                assert op == "mla_producer" and module == "kimi_mla" and fn == "compile_kimi_mla_producer_aot"
+                assert vars(args[0]) == {"heads": heads, "kv_cache": cache}
                 assert kwargs == {"max_rows": rows}
-                assert params == {"max_rows": rows, "heads": heads}
-        for mode, rows in (("decode", decode_rows), ("verify", decode_rows), ("extend", prefill_rows)):
-            op, params, (module, fn, args, kwargs) = calls[f"dense_mla_{mode}{suffix}_m{rows}"]
-            assert op == "dense_mla" and module == "kimi_mla" and fn == "compile_kimi_dense_mla_aot"
-            assert vars(args[0]) == {"heads": heads}
-            assert kwargs == {"max_rows": rows, "max_context": 1048576, "mode": mode}
-            assert params == {"mode": mode, "max_rows": rows, "heads": heads}
+                assert params == {"max_rows": rows, "heads": heads, "kv_cache": cache}
+                if cache == "bf16":
+                    op, params, (module, fn, args, kwargs) = calls[f"mla_output{suffix}_m{rows}"]
+                    assert fn == "compile_kimi_mla_output_aot"
+                    assert params == {"max_rows": rows, "heads": heads}
+            for mode, rows in (("decode", decode_rows), ("verify", decode_rows), ("extend", prefill_rows)):
+                op, params, (module, fn, args, kwargs) = calls[f"dense_mla_{mode}{suffix}{cs}_m{rows}"]
+                assert op == "dense_mla" and module == "kimi_mla" and fn == "compile_kimi_dense_mla_aot"
+                assert vars(args[0]) == {"heads": heads, "kv_cache": cache}
+                assert kwargs == {"max_rows": rows, "max_context": 1048576, "mode": mode}
+                assert params == {"mode": mode, "max_rows": rows, "heads": heads, "kv_cache": cache}
 
 
 @pytest.mark.parametrize("namespace", ["kimik3"])
@@ -394,7 +399,7 @@ def test_shared_mla_drafter_requested_names_exist_in_family_catalog(exporter, na
     catalog = {f"{namespace}_{stem}" for stem, *_ in
                exporter.kimi_kda_programs(GEOMETRY, 64, 4096, 1048576)}
     for window in ("full", "w4096"):
-        names = {name.replace("{program_namespace}", namespace).replace("{}", window)
+        names = {name.replace("{program_namespace}", namespace).replace("{}", window).replace("{cache}", "_fp8")
                  for name in requested}
         assert names <= catalog, sorted(names - catalog)
         assert all(name.startswith(namespace + "_") for name in names)
@@ -402,8 +407,8 @@ def test_shared_mla_drafter_requested_names_exist_in_family_catalog(exporter, na
     startup = (daemon / "families/kimi_k3/startup.rs").read_text()
     admission = (daemon / "families/kimi_k3/admission.rs").read_text()
     shared = (daemon / "shared/speculation/dflash.rs").read_text()
-    assert f'MlaDraft::load(programs, "{namespace}", MlaDraftWindow::Full)' in startup
-    assert f'MlaDraft::load(programs, "{namespace}", MlaDraftWindow::Sliding4096)' in startup
+    assert f'MlaDraft::load(programs, "{namespace}", MlaDraftWindow::Full, options.cache_format)' in startup
+    assert f'MlaDraft::load(programs, "{namespace}", MlaDraftWindow::Sliding4096, options.cache_format)' in startup
     assert f'DflashDrafter::load_mla(device.library, programs, "{namespace}",' in admission
     assert "MlaDraft::load(programs, program_namespace," in shared
 

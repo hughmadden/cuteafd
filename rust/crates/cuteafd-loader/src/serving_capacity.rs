@@ -92,6 +92,7 @@ pub struct CacheOptions {
     pub mimo_kv: MimoKvCache,
     pub qwen_kv: Qwen4KvCache,
     pub step5_kv: Qwen4KvCache,
+    pub mla_kv: cuteafd_core::MlaCacheFormat,
     /// DeepSeek V4's window ring holds one prefill chunk plus its window.
     pub prefill_rows: u64,
     /// GLM 5.3 Flash's DSA index cache.
@@ -112,6 +113,7 @@ impl Default for CacheOptions {
             mimo_kv: MimoKvCache::Int8,
             qwen_kv: Qwen4KvCache::default(),
             step5_kv: Qwen4KvCache::Bf16,
+            mla_kv: Default::default(),
             prefill_rows: 4096,
             glmf_index: GlmfIndexCache::Keys,
             kda_state_bytes: 4,

@@ -94,7 +94,7 @@ pub use ids::{LayerId, PlacementVersion, PositionId, Priority, RequestId};
 pub use kv_cache::{
     KvBackedBlock, KvCacheAllocator, KvCacheBackingStore, KvCacheConfig, KvCacheDType,
     KvCacheSnapshot, KvLayout, KvReservation, KvReservationState, KvWriteRecord, KvWriteState,
-    MlaKvCacheRepresentation,
+    MlaCacheFormat, MlaKvCacheRepresentation,
 };
 pub use layerwave::{
     admit_layerwaves_for_iteration, plan_prefill_chunks, plan_prefill_chunks_with_model,

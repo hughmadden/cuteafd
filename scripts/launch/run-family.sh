@@ -208,7 +208,7 @@ PROFILE_SPARK_NCU_SET
 PROFILE_SPARK_NCU_SKIP
 PROFILE_SPARK_NSYS_GPU_METRICS
 EOF
-    [[ "$1" != kimi_k3 ]] || printf '%s\n' RTX_EXPERT_LAYERS NATIVE_K6 SPECULATOR_MODEL_ID SPECULATOR_MODEL_REVISION SPECULATOR_DRAFTS
+    [[ "$1" != kimi_k3 ]] || printf '%s\n' KV_CACHE RTX_EXPERT_LAYERS NATIVE_K6 SPECULATOR_MODEL_ID SPECULATOR_MODEL_REVISION SPECULATOR_DRAFTS
     [[ "$1" != step5 ]] || printf '%s\n' SPECULATOR_DEPTH KV_CACHE
     _spark_slot_keys HOST LANE_A
     return
@@ -2014,6 +2014,9 @@ if ((qualifying)); then
   [[ "$pool" == auto ]] || family_args+=(--pool-tokens "$pool")
 fi
 if [[ $family == kimi_k3 ]]; then
+  kv_cache="$(get KV_CACHE bf16)"
+  case "$kv_cache" in bf16|fp8) ;; *) release_die "KV_CACHE must be bf16 or fp8" ;; esac
+  family_args+=(--kv-cache "$kv_cache")
   local_layers="$(get RTX_EXPERT_LAYERS auto)"
   [[ "$local_layers" == auto || "$local_layers" =~ ^[0-9]+$ ]] ||
     release_die "Kimi K3 RTX_EXPERT_LAYERS is auto or a fixed routed-layer count, not $local_layers"
@@ -2615,6 +2618,9 @@ audio_encoder_hash=""
   # admits them, before an encoder placement is chosen.
   if [[ "$family" == glm5_flash && "${decode_rows:-64}" == 128 ]]; then
     plan_draft_args+=(--decode-rows 128)
+  fi
+  if [[ "$family" == kimi_k3 ]]; then
+    plan_draft_args+=(--kv-cache "$kv_cache")
   fi
   if [[ "$family" == qwen4 ]]; then
     plan_draft_args+=(--kv-cache "$kv_cache")

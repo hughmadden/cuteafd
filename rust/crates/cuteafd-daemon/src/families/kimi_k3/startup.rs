@@ -10,6 +10,7 @@ use std::{net::SocketAddr, path::Path, rc::Rc, sync::Arc};
 const HIDDEN: usize = 7168;
 
 pub(crate) struct Options<'a> {
+    pub cache_format: cuteafd_core::MlaCacheFormat,
     pub devices: [i32; 2],
     pub native_lib: &'a Path,
     pub peers: Vec<SocketAddr>,
@@ -42,10 +43,12 @@ pub(crate) fn load<'a>(library: &'a Arc<cuteafd_ffi::NativeLibrary>,
     programs: &'a cuteafd_ffi::programs::Programs<'a>,
     checkpoint: &cuteafd_loader::plan::Checkpoint, full: &KimiK3Config,
     cfg: &KimiK3Config, options: Options<'_>) -> Result<Loaded<'a>> {
+    ensure!(options.draft.as_ref().is_none_or(|draft| draft.cache_format == options.cache_format),
+        "Kimi target/draft cache records differ");
     ensure!(crate::shared::peer_split::probed_device(library, options.devices[0], Some(options.devices[1]))?
         == Some(options.devices[1]), "Kimi TP2 requires bidirectional peer access");
     let devices = [options.devices[0], options.devices[1]].map(|id| Device { library, id });
-    let native = devices.map(|device| NativePrograms::load(device, full, programs, options.ffn_mode).map(Rc::new));
+    let native = devices.map(|device| NativePrograms::load(device, full, programs, options.ffn_mode, options.cache_format).map(Rc::new));
     let [zero, one] = native;
     let native = [zero?, one?];
     let draft_layout = options.draft.as_ref().map(|draft| devices[1].run(||
@@ -53,8 +56,8 @@ pub(crate) fn load<'a>(library: &'a Arc<cuteafd_ffi::NativeLibrary>,
     // Resolve native modules before the measured baseline, while retaining their handles.
     let _draft_modules = options.draft.as_ref().map(|_| devices[1].run(|| {
         use cuteafd_ffi::mla_draft::{MlaDraft, MlaDraftWindow};
-        Ok([MlaDraft::load(programs, "kimik3", MlaDraftWindow::Full)?,
-            MlaDraft::load(programs, "kimik3", MlaDraftWindow::Sliding4096)?])
+        Ok([MlaDraft::load(programs, "kimik3", MlaDraftWindow::Full, options.cache_format)?,
+            MlaDraft::load(programs, "kimik3", MlaDraftWindow::Sliding4096, options.cache_format)?])
     })).transpose()?;
     let rows = options.rows;
     let spark_budget_gib = options.spark_budget_gib.unwrap_or(
@@ -116,7 +119,7 @@ pub(crate) fn load<'a>(library: &'a Arc<cuteafd_ffi::NativeLibrary>,
         GpuBudget { capacity_bytes: capacity, headroom_bytes: 2 << 30,
             baseline: cuteafd_loader::placement::Baseline::Measured { free_bytes: sample.free_bytes } }
     }).collect::<Vec<_>>().try_into().map_err(|_| anyhow::anyhow!("Kimi GPU sample count"))?;
-    let mut admitted = admission::admit(admission::Inputs { cfg, gpus, devices: [options.devices[0], options.devices[1]],
+    let mut admitted = admission::admit(admission::Inputs { cfg, cache_format: options.cache_format, gpus, devices: [options.devices[0], options.devices[1]],
         peer_access: true, spark_ranks: 6, attention: None, requested_pool: options.pool_tokens,
         state_slots: options.slots, prefix_marks: options.marks, rows, lanes: 1, lane_layouts, fixed,
         startup: graph_set.as_ref().map_or_else(Vec::new, |set|

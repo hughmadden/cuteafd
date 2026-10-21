@@ -13,6 +13,7 @@ use std::{cell::{Cell, RefCell}, path::PathBuf, rc::Rc};
 pub(crate) struct Options {
     pub snapshot: PathBuf,
     pub fp8: bool,
+    pub cache_format: cuteafd_core::MlaCacheFormat,
 }
 
 impl Options {
@@ -23,7 +24,7 @@ impl Options {
     pub(crate) fn layout(&self, slots: usize, context: usize, sms: usize) -> Result<MlaDraftRuntimeLayout> {
         let cfg = MlaDflashConfig::read(&self.snapshot)?;
         cfg.runtime_layout(self.representation(), GlmDraftCapacity::new(slots, slots.min(8), cfg.block)?,
-            context, slots.checked_mul(context).context("draft pool overflow")?, sms, Fp8Rows::W8a16.code() as u8).map_err(Into::into)
+            context, slots.checked_mul(context).context("draft pool overflow")?, sms, Fp8Rows::W8a16.code() as u8, self.cache_format).map_err(Into::into)
     }
 }
 
@@ -50,6 +51,7 @@ pub(crate) struct NativeDraft<'a> {
     context_pending: Cell<bool>,
     window_marks: Rc<Allocation<'a>>,
     window_bytes: usize,
+    cache_format: cuteafd_core::MlaCacheFormat,
     marks: usize,
 }
 
@@ -57,6 +59,7 @@ impl<'a> NativeDraft<'a> {
     pub(crate) fn load(admission: &mut super::admission::Admission<'a>,
         programs: &'a Programs<'a>, options: &Options, streams: [Rc<Stream<'a>>; 2],
         layout: &MlaDraftRuntimeLayout) -> Result<Self> {
+        ensure!(options.cache_format == layout.cache_format(), "Kimi draft options/admission cache records differ");
         let ranks = streams.each_ref().map(|s| RankDevice { device: s.device.id, stream: s.raw });
         let library = streams[0].device.library;
         let prepared = Prepared::new(library, ranks[0], ranks[1], 1, "kimi-remote-mla-dflash")?;
@@ -72,12 +75,14 @@ impl<'a> NativeDraft<'a> {
         let marks = usize::try_from(admission.mark_selection.slots)?;
         let window_bytes = layout.window_mark_bytes()?;
         let window_marks = admission.allocate_draft_marks(streams[1].device)?;
-        Ok(Self { window_marks, window_bytes, marks, owners: Owners { draft, target: None }, taps: allocate("DFlash bridge taps")?,
+        Ok(Self { window_marks, window_bytes, cache_format: layout.cache_format(), marks, owners: Owners { draft, target: None }, taps: allocate("DFlash bridge taps")?,
             ids: allocate("DFlash bridge input ids")?, input: allocate("DFlash bridge gathered input")?,
             bridge: RemoteBridge::new(prepared), producer: RefCell::new(crate::shared::memory::device::Event::new(device)?),
             consumed: RefCell::new(crate::shared::memory::device::Event::new(streams[1].device)?),
             context_pending: Cell::new(false), target_streams: streams })
     }
+
+    pub(crate) fn cache_format(&self) -> cuteafd_core::MlaCacheFormat { self.cache_format }
 
     pub(crate) fn bind_target(&mut self, target: [Rc<GlobalWeights<'a>>; 2]) -> Result<()> {
         ensure!(self.owners.target.is_none(), "Kimi draft target already bound");
@@ -367,7 +372,7 @@ mod tests {
 
     #[test]
     fn precision_is_one_explicit_resident_representation() {
-        let options = Options { snapshot: PathBuf::new(), fp8: false };
+        let options = Options { snapshot: PathBuf::new(), fp8: false, cache_format: Default::default() };
         assert_eq!(options.representation(), GlmDraftRepresentation::Bf16Only);
         assert_eq!(Options { fp8: true, ..options }.representation(), GlmDraftRepresentation::Fp8Only);
     }
@@ -386,6 +391,7 @@ mod tests {
         let manifest = PathBuf::from(env("CUTEAFD_PROGRAM_MANIFEST")?);
         let peers = env("CUTEAFD_GOLDEN_PEERS")?.split(',').map(str::parse)
             .collect::<std::result::Result<Vec<std::net::SocketAddr>, _>>()?;
+        let cache_format = std::env::var("CUTEAFD_KIMI_KV_CACHE").unwrap_or_else(|_| "bf16".into()).parse().map_err(anyhow::Error::msg)?;
         let checkpoint = cuteafd_loader::plan::Checkpoint::coordinator(&snapshot, false, false)?;
         let cfg = cuteafd_loader::families::kimi_k3::config::KimiK3Config::from_hf(&checkpoint.config)?;
         cfg.release_geometry()?;
@@ -398,12 +404,13 @@ mod tests {
         let library = Arc::new(unsafe { cuteafd_ffi::NativeLibrary::load(&native)? });
         let programs = library.programs()?.with_manifest(&manifest)?;
         let loaded = startup::load(&library, &programs, &checkpoint, &cfg, &cfg, startup::Options {
+            cache_format,
             devices: [0, 1], native_lib: &native, peers,
             rtx_expert_layers: cuteafd_loader::placement::Onboard::Layers(local_layers), spark_budget_gib: None,
             rows: TARGET_TAP_ROWS, slots: 1, marks: 1, max_context: 524_288,
             pool_tokens: Some(524_288), graphs: true, ffn_mode: cuteafd_ffi::KimiFfnMode::default(),
             hosted_layers: Some(hosted_layers),
-            draft: Some(Options { snapshot: drafter, fp8: true }),
+            draft: Some(Options { snapshot: drafter, fp8: true, cache_format }),
         })?;
         let engine = &loaded.engine;
         let backend = KimiBackend::new(engine)?;

@@ -260,7 +260,7 @@ fn max_card_jointly_selects_tp2_layers_marks_and_complete_spark_budget() {
     let memory = report.memory_layout.as_ref().unwrap();
     assert_eq!(memory.pool_tokens, 1_048_576);
     assert!(memory.notes.iter().any(|note| note.contains("API max context: 262144")
-        && note.contains("compiled max context: 262144")), "{:?}", memory.notes);
+        && note.contains("compiled max context: 1048576")), "{:?}", memory.notes);
     assert!(memory.notes.iter().any(|note| note.contains("selected RTX expert layers:")
         && note.contains("retained marks:")), "{:?}", memory.notes);
     assert!(memory.notes.iter().any(|note| note.contains("estimated runtime/workspace reserve")));

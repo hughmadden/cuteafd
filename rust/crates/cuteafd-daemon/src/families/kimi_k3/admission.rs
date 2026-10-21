@@ -36,6 +36,7 @@ pub(super) fn check_prefix(full: &KimiK3Config, selected: &KimiK3Config) -> Resu
 /// page tables; global weights, token IO and state banks add their own demands.
 pub(crate) struct Inputs<'a> {
     pub cfg: &'a KimiK3Config,
+    pub cache_format: cuteafd_core::MlaCacheFormat,
     pub gpus: [GpuBudget; 2],
     pub devices: [i32; 2],
     pub peer_access: bool,
@@ -426,6 +427,7 @@ impl<'a> Admission<'a> {
 
 pub(crate) fn admit<'a>(mut inputs: Inputs<'_>) -> Result<Admission<'a>> {
     let cfg = inputs.cfg;
+    let cache_format = inputs.cache_format;
     let devices = inputs.devices;
     let lanes = inputs.lanes as u64;
     let lane_layouts = inputs.lane_layouts.clone();
@@ -527,7 +529,7 @@ pub(crate) fn admit<'a>(mut inputs: Inputs<'_>) -> Result<Admission<'a>> {
     let lane_allocated = vec![[false; 2]; lane_layouts.len()];
     let io_allocated = vec![[false; 2]; lane_layouts.len()];
     let lane_readers = (0..lane_layouts.len()).map(|_| std::array::from_fn(|_| Weak::new())).collect();
-    let mla_layouts = [CacheLayout::new(cfg, &placement, 0)?, CacheLayout::new(cfg, &placement, 1)?];
+    let mla_layouts = [CacheLayout::new(cfg, &placement, 0, cache_format)?, CacheLayout::new(cfg, &placement, 1, cache_format)?];
     let admission = Admission { placement, mark_selection, graph_set, rtx, rtx_loaded: false, draft, draft_allocated: false, draft_marks_allocated: false, cfg: cfg.clone(), layouts, layer_owners, layer_uploaded, local_bound,
         devices, lanes, lane_layouts, lane_allocated, lane_readers,
         kda_layout, kda_allocated: [false; 2], kda_owners: std::array::from_fn(|_| Weak::new()),
@@ -578,7 +580,8 @@ fn request(i: Inputs<'_>) -> Result<PlacementRequest> {
     ensure!(i.lane_layouts.iter().flatten().all(|layout| layout.max_context() == context),
         "Kimi lanes must share the compiled context extent");
     if let Some(layout) = &i.draft {
-        ensure!(layout.capacity().context_slots == i.state_slots
+        ensure!(layout.cache_format() == i.cache_format
+            && layout.capacity().context_slots == i.state_slots
             && layout.capacity().max_batch_sequences <= i.rows.min(64)
             && layout.program().context == context
             && layout.cache().layers.iter().all(|layer| layer.slots() == i.state_slots),
@@ -658,7 +661,7 @@ fn request(i: Inputs<'_>) -> Result<PlacementRequest> {
         }
         let mla = cfg.attention[layer] == KimiAttention::Mla;
         let whole = if mla { LayerLayout::pair(cfg, layer, MODES[1])?[0].attention_bytes()? as u64 } else { 0 };
-        let unit = if mla { (MLA_PAGE_ROWS * MLA_RECORD_BYTES) as u64 } else { 0 };
+        let unit = if mla { (MLA_PAGE_ROWS * i.cache_format.record_bytes()) as u64 } else { 0 };
         layers.push(LayerDemand { kind: if mla { AttentionClass::Mla } else { AttentionClass::Kda },
             weights: ModeBytes { whole, split: split_attention },
             kv_unit: KvDemand { unit_bytes_whole: unit, unit_bytes_split: [unit; 2], unit_bytes_context: None },
@@ -709,7 +712,7 @@ pub(super) mod tests {
         println!("spark minimum_onboard={} max_four_expert_bytes={}", spark.minimum_rtx_layers()?,
             (0..6).map(|rank| spark.rank_bytes(rank, 4)).collect::<Result<Vec<_>>>()?.into_iter().max().unwrap());
         let context = std::env::var("CUTEAFD_KIMI_REPLAY_CONTEXT").ok().map(|v| v.parse::<usize>()).transpose()?.unwrap_or(1 << 20);
-        let draft = super::super::draft::Options { snapshot: path("CUTEAFD_KIMI_DRAFT")?, fp8: true }.layout(8, context, 188)?;
+        let draft = super::super::draft::Options { snapshot: path("CUTEAFD_KIMI_DRAFT")?, fp8: true, cache_format: cuteafd_core::MlaCacheFormat::Bf16 }.layout(8, context, 188)?;
         // Sealed program manifests and the failed card's post-module CUDA samples.
         // These are CPU arithmetic inputs, not a new hardware measurement.
         let scratch = NativeScratch { kda: 629_464_064, mla: [168_296_448, 101_056_512, 201_326_592] };
@@ -829,7 +832,7 @@ pub(super) mod tests {
     }
 
     pub(in crate::families::kimi_k3) fn inputs(cfg: &KimiK3Config) -> Inputs<'_> {
-        Inputs { cfg, gpus: [GpuBudget { capacity_bytes: 96 << 30, headroom_bytes: 2 << 30,
+        Inputs { cfg, cache_format: cuteafd_core::MlaCacheFormat::Bf16, gpus: [GpuBudget { capacity_bytes: 96 << 30, headroom_bytes: 2 << 30,
             baseline: Baseline::Measured { free_bytes: 96 << 30 } }; 2], devices: [0, 1], peer_access: true, spark_ranks: 6,
             attention: None, requested_pool: None, state_slots: 2, prefix_marks: 2, rows: 4096, lanes: 2,
             lane_layouts: vec![std::array::from_fn(|_| LaneLayout::new(
@@ -859,7 +862,7 @@ pub(super) mod tests {
                 "conv_kernel_size":2, "conv_group_size":16, "selector_rank":256,
                 "selector_top_k":16, "target_layer_ids":[0,1], "mask_token_id":163592}});
         MlaDflashConfig::from_json(&config).unwrap().runtime_layout(GlmDraftRepresentation::Fp8Only,
-            GlmDraftCapacity::new(slots, sequences, 8).unwrap(), context, slots * context, 188, 2).unwrap()
+            GlmDraftCapacity::new(slots, sequences, 8).unwrap(), context, slots * context, 188, 2, cuteafd_core::MlaCacheFormat::Bf16).unwrap()
     }
 
     #[test]
@@ -934,6 +937,10 @@ pub(super) mod tests {
             let mut i = inputs(&cfg); i.draft = Some(layout);
             assert!(request(i).is_err());
         }
+        let mut mixed = inputs(&cfg);
+        mixed.cache_format = cuteafd_core::MlaCacheFormat::Fp8;
+        mixed.draft = Some(draft_layout(2, 2, 1048576));
+        assert!(request(mixed).is_err(), "target/draft record mismatch must fail before admission");
         let mut i = inputs(&cfg);
         i.draft = Some(draft_layout(2, 2, 1048576));
         i.fixed.push(i.draft.as_ref().unwrap().demands(1)?.0.owned[0].clone());
@@ -1021,7 +1028,7 @@ pub(super) mod tests {
     }
 
     #[test]
-    fn planner_equals_runtime_context_extent_at_256k_and_1m() -> Result<()> {
+    fn planner_equals_runtime_context_extent_at_256k_512k_and_1m() -> Result<()> {
         use clap::Parser;
         use cuteafd_loader::plan::{self, layout::LayoutOptions, testing, ExpertPlacement, PlanOptions};
         let snapshot = tempfile::tempdir()?;
@@ -1029,7 +1036,7 @@ pub(super) mod tests {
         let cfg = KimiK3Config::from_hf(&testing::kimi_k3_config())?;
         let mut lane_bytes = Vec::new();
         let mut cache_bytes = Vec::new();
-        for context in [262_144, 1_048_576] {
+        for context in [262_144, 524_288, 1_048_576] {
             let text = context.to_string();
             let cli = crate::cli::Cli::try_parse_from(["cuteafd", "serve-kimi", "--snapshot", "/fixture",
                 "--native-lib", "/fixture.so", "--max-context", &text, "--pool-tokens", &text])?;
@@ -1067,7 +1074,7 @@ pub(super) mod tests {
             assert_eq!(memory.pool_tokens, context);
             let mut total = 0;
             for rank in 0..2 {
-                let mla = super::super::mla::CacheLayout::new(&cfg, &admitted.placement, rank)?;
+                let mla = super::super::mla::CacheLayout::new(&cfg, &admitted.placement, rank, cuteafd_core::MlaCacheFormat::Bf16)?;
                 total += mla.bytes();
                 let planned = memory.devices.iter().find(|d| d.kind == cuteafd_core::memory_layout::DeviceKind::Rtx
                     && d.index == rank as u32).context("planned RTX")?;
@@ -1080,8 +1087,42 @@ pub(super) mod tests {
             let refused = plan::plan(snapshot.path(), &options)?;
             assert!(!refused.fits, "planner must not shrink the explicit context floor");
         }
-        assert_eq!(lane_bytes[1] - lane_bytes[0], 3 << 20);
-        assert_eq!(cache_bytes[1] - cache_bytes[0], 24 * (1_048_576 - 262_144) * MLA_RECORD_BYTES);
+        assert_eq!(lane_bytes[1] - lane_bytes[0], 1 << 20);
+        assert_eq!(lane_bytes[2] - lane_bytes[0], 3 << 20);
+        assert_eq!(cache_bytes[1] - cache_bytes[0], 24 * (524_288 - 262_144) * MLA_RECORD_BYTES);
+        assert_eq!(cache_bytes[2] - cache_bytes[0], 24 * (1_048_576 - 262_144) * MLA_RECORD_BYTES);
+        Ok(())
+    }
+
+    #[test]
+    fn automatic_pool_grows_beyond_default_context_floor() -> Result<()> {
+        use cuteafd_loader::families::kimi_k3::DEFAULT_CONTEXT;
+        use cuteafd_loader::plan::{self, layout::LayoutOptions, testing, ExpertPlacement, PlanOptions};
+        let snapshot = tempfile::tempdir()?;
+        testing::write_kimi_snapshot(snapshot.path(), true);
+        let cfg = KimiK3Config::from_hf(&testing::kimi_k3_config())?;
+        for format in [cuteafd_core::MlaCacheFormat::Bf16, cuteafd_core::MlaCacheFormat::Fp8] {
+            let mut i = inputs(&cfg);
+            i.cache_format = format;
+            i.lane_layouts = vec![std::array::from_fn(|_| LaneLayout::new(&cfg, i.rows, DEFAULT_CONTEXT,
+                super::super::device::NativeScratch { kda: 1024, mla: [512, 0, 1024] }).unwrap()); i.lanes];
+            let request = request(i)?;
+            assert_eq!(request.pool.floor, DEFAULT_CONTEXT as u64);
+            assert_eq!(request.pool.compiled_context, DEFAULT_CONTEXT as u64);
+            assert!(request.pool.target > request.pool.floor);
+            assert!(solve(&request)?.pool_tokens > request.pool.floor);
+            let report = plan::plan(snapshot.path(), &PlanOptions {
+                placement: ExpertPlacement::Sparks { ranks: 6 },
+                layout: Some(LayoutOptions { rtx_bytes: vec![96 << 30; 2], concurrency: 2,
+                    mla_kv: format, prefix_slots: Some(2), host_cache_bytes: Some(0),
+                    onboard: Some(Onboard::Layers(5)), ..Default::default() }),
+                ..Default::default()
+            })?;
+            ensure!(report.fits && report.placement_supported, "{:?}", report.hints);
+            let memory = report.memory_layout.context("Kimi default planned layout")?;
+            assert!(memory.pool_tokens > DEFAULT_CONTEXT as u64);
+            assert!(memory.notes.iter().any(|note| note.contains("API max context: 524288 tokens; compiled max context: 1048576 tokens")));
+        }
         Ok(())
     }
 
@@ -1150,6 +1191,31 @@ pub(super) mod tests {
     }
 
     #[test]
+    fn compact_cache_admission_and_owner_ranges_use_the_same_record() -> Result<()> {
+        let cfg = cfg();
+        for attention in [None, Some(AttentionPlacement::Heads)] {
+            for format in [cuteafd_core::MlaCacheFormat::Bf16, cuteafd_core::MlaCacheFormat::Fp8] {
+                let mut input = inputs(&cfg);
+                input.cache_format = format;
+                input.attention = attention;
+                let admitted = admit(input)?;
+                for rank in 0..2 {
+                    let layout = admitted.check_mla(rank, rank as i32)?;
+                    let layers = if attention.is_some() { 2 } else { 1 };
+                    assert_eq!(layout.bytes(), layers * admitted.placement.pool_tokens as usize * format.record_bytes());
+                    for layer in [1, 3] {
+                        if let Ok((offset, bytes)) = layout.page_range(layer, 1, 17) {
+                            assert_eq!(offset, 64 * format.record_bytes());
+                            assert_eq!(bytes, 17 * format.record_bytes());
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
     fn mla_cache_residency_and_pages_follow_accepted_attention_modes() -> Result<()> {
         let cfg = cfg();
         let owned = admit(inputs(&cfg))?;
@@ -1187,14 +1253,14 @@ pub(super) mod tests {
         let mut placement = owned.placement.clone();
         for invalid in [LayerMode::ContextSplit, LayerMode::Whole { gpu: 2, ffn: FfnMode::Split }] {
             placement.layers[1].mode = invalid;
-            assert!(CacheLayout::new(&cfg, &placement, 0).is_err());
+            assert!(CacheLayout::new(&cfg, &placement, 0, cuteafd_core::MlaCacheFormat::Bf16).is_err());
         }
         placement = owned.placement.clone();
         for pool in [0, 65, u64::MAX] {
             placement.pool_tokens = pool;
-            assert!(CacheLayout::new(&cfg, &placement, 0).is_err());
+            assert!(CacheLayout::new(&cfg, &placement, 0, cuteafd_core::MlaCacheFormat::Bf16).is_err());
         }
-        assert!(CacheLayout::new(&cfg, &owned.placement, 2).is_err());
+        assert!(CacheLayout::new(&cfg, &owned.placement, 2, cuteafd_core::MlaCacheFormat::Bf16).is_err());
         Ok(())
     }
 

@@ -47,8 +47,15 @@ fn options(args: &PlanArgs) -> Result<PlanOptions, PlanError> {
                 spark_allocation_budget_bytes: args.spark_budget_gib
                     .map(|gib| budget_bytes("--spark-budget-gib", gib)).transpose()?,
                 pool_tokens: args.pool_tokens,
-                qwen_kv: args.kv_format.unwrap_or_default(),
-                step5_kv: args.kv_format.unwrap_or_default(),
+                qwen_kv: args.kv_format.map(|format| match format {
+                    cuteafd_core::MlaCacheFormat::Bf16 => cuteafd_loader::families::qwen4::Qwen4KvCache::Bf16,
+                    cuteafd_core::MlaCacheFormat::Fp8 => cuteafd_loader::families::qwen4::Qwen4KvCache::Fp8,
+                }).unwrap_or_default(),
+                step5_kv: args.kv_format.map(|format| match format {
+                    cuteafd_core::MlaCacheFormat::Bf16 => cuteafd_loader::families::qwen4::Qwen4KvCache::Bf16,
+                    cuteafd_core::MlaCacheFormat::Fp8 => cuteafd_loader::families::qwen4::Qwen4KvCache::Fp8,
+                }).unwrap_or_default(),
+                mla_kv: args.kv_format.unwrap_or_default(),
                 qwen_representation: cuteafd_loader::families::qwen4::resident::Qwen4Representation {
                     fp8_projections: args.fp8_decode, fp8_head: args.mtp_fp8_head },
                 qwen_attention_plan_rows: args.attention_plan_rows,

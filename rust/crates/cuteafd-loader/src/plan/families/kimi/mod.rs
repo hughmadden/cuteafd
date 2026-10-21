@@ -23,7 +23,7 @@ const GIB: u64 = 1 << 30;
 
 /// Complete per-rank allocation ceiling without `--spark-budget-gib`.
 /// Exact TP6 header arenas and endpoint I/O plus an estimated runtime/workspace
-/// reserve constrain RTX onboarding alongside marks and the fixed 1M pool floor.
+/// reserve constrain RTX onboarding alongside marks and the selected context floor.
 /// The default remains estimated until the first full worker load/steady census.
 pub const SPARK_BUDGET_BYTES: u64 = crate::families::kimi_k3::SPARK_DEFAULT_BUDGET_BYTES;
 
@@ -291,7 +291,7 @@ impl FamilyModel for Model {
         let layers = self.cfg.mla_layers();
         let resident = if options.attention_placement == Some(AttentionPlacement::Heads) { [layers; 2] }
             else { [layers.div_ceil(2), layers / 2] };
-        crate::families::kimi_k3::kda::cache_geometry(&self.cfg, resident).map(Some)
+        crate::families::kimi_k3::kda::cache_geometry(&self.cfg, resident, options.mla_kv).map(Some)
     }
     fn spark_budget_bytes(&self) -> u64 { SPARK_BUDGET_BYTES }
     fn activation(&self, layer: usize, _shared: bool) -> Option<FfnActivation> {
