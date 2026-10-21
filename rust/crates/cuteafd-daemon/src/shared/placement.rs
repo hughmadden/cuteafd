@@ -123,8 +123,13 @@ impl SparkAdmission {
             let cancel = pending.cancellation_streams()?;
             AdmissionWait::Push(PushAdmissionDriver { cancel, thread: Some(std::thread::spawn(move || {
                 let mut pending = pending;
-                pending.push_weights(|offers| super::memory::push_exl3::prepare(
-                    &snapshot, &layers, &assignments, offers))?;
+                pending.push_weights(|offers| {
+                    let started = std::time::Instant::now();
+                    let catalog = cuteafd_loader::read_expert_catalog(&snapshot)?;
+                    tracing::info!(elapsed_ms = started.elapsed().as_millis(),
+                        "Spark push admission catalog opened");
+                    super::memory::push_exl3::prepare(&snapshot, &catalog, &layers, &assignments, offers)
+                })?;
                 pending.wait()
             })) })
         } else { AdmissionWait::Mount(pending) };

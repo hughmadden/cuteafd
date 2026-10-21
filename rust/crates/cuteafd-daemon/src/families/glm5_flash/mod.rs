@@ -1787,12 +1787,42 @@ impl Opened {
                     else { cuteafd_loader::placement::TerminalHome::AttentionOwner },
             })?;
         let source = self.embed_source()?;
-        let (embedding, (model, mut shares)) = crate::shared::placement::load_while_admitting(admission, || {
-            crate::shared::token_io::TokenEmbedding::load(&self.library, source,
+        let tp2_layers = admitted_expert_layers(&self.cfg, &placement.layers,
+            cuteafd_loader::placement::ExpertHome::RtxTp2, args.skip_experts)?;
+        let startup_graphs = admitted_graphs.lifetime == cuteafd_loader::placement::Lifetime::Startup;
+        ensure!(tp2_layers.is_empty() || startup_graphs, "GLM Flash TP2 experts require startup graphs; remove \
+            --graph-budget-mib and set CUTEAFD_GLMF_STARTUP_GRAPHS=1 (post-ready captures are not admitted)");
+        // The admitted TP2 expert halves land inside the Spark admission window;
+        // execution (modules, workspaces, routes) binds once the engine exists.
+        let tp2_weights = || -> Result<crate::shared::experts::rtx::Tp2Weights<'_>> {
+            let peer = peer_stream.context("TP2 placement without peer device")?;
+            let catalog = self.experts.as_ref().context("TP2 expert catalog")?;
+            let devices = [crate::shared::memory::device::Device { library: &self.library, id: args.device },
+                crate::shared::memory::device::Device { library: &self.library, id: peer.0 }];
+            let budgets = placement.tp2.context("TP2 arena admission")?.peak_bytes.map(usize::try_from);
+            let budgets = [budgets[0].clone()?, budgets[1].clone()?];
+            use crate::shared::experts::rtx::{exl3::Exl3Tp2, fp8moe::Fp8MoeTp2, RtxSelectionPolicy, Tp2Weights};
+            Ok(if let Some(manifest) = catalog.exl3() {
+                let package = crate::shared::experts::exl3::aot_layout_directory(&args.native_lib,
+                    manifest.decoder_tiers(), "rtx-tp2");
+                Tp2Weights::Exl3(Exl3Tp2::load_pair_weights(devices, catalog, cuteafd_core::expert_geometry(),
+                    [&package; 2], tp2_layers.clone(), args.expert_rows(), budgets, RtxSelectionPolicy::CanonicalDecode)?)
+            } else {
+                let tensors = catalog.fp8().context("FP8 TP2 tensors")?;
+                let package = args.fp8_package.clone().unwrap_or_else(||
+                    crate::shared::experts::fp8::package_directory(&args.native_lib, 2, tensors.format()));
+                Tp2Weights::Fp8(Fp8MoeTp2::load_pair(devices, tensors, &package, tp2_layers.clone(),
+                    args.expert_rows(), budgets)?)
+            })
+        };
+        let (embedding, ((model, mut shares), tp2)) = crate::shared::placement::load_while_admitting(admission, || {
+            let loaded = crate::shared::token_io::TokenEmbedding::load(&self.library, source,
                 args.token_io.embed_placement, || {
                     let _memory_scope = cuteafd_ffi::memory_ledger::scope("weights");
                     loader.model(&self.cfg, &execution)
-                })
+                })?;
+            let tp2 = if tp2_layers.is_empty() { None } else { Some(tp2_weights()?) };
+            Ok((loaded.0, (loaded.1, tp2)))
         })?;
         probe("target-weights")?;
         let resident: usize = model.layers.iter().map(weights::GlmfLayer::bytes).sum();
@@ -1829,7 +1859,6 @@ impl Opened {
         let reserved_units = if args.prefix_marks == prefix::PrefixMarks::Pool {
             cuteafd_loader::serving_capacity::GLMF_POOL_MARK_RESERVED_UNITS } else { 0 };
         let pool_tokens = usize::try_from(placement.pool_tokens)?;
-        let startup_graphs = admitted_graphs.lifetime == cuteafd_loader::placement::Lifetime::Startup;
         if engine::startup_graphs_enabled() && !startup_graphs {
             tracing::info!(graph_budget_mib = ?args.graph_budget_mib,
                 "GLM Flash decode graphs captured lazily within the graph budget, not at startup");
@@ -1886,30 +1915,8 @@ impl Opened {
         engine.fp8_prefill = engine::Fp8Prefill { mla: group(Fp8PrefillGroup::Mla), ffn: group(Fp8PrefillGroup::Ffn),
             kda_bits: i32::from(kda && group(Fp8PrefillGroup::KdaIn))
                 | (i32::from(kda && group(Fp8PrefillGroup::KdaO)) << 1) };
-        let tp2_layers = admitted_expert_layers(&self.cfg, &placement.layers,
-            cuteafd_loader::placement::ExpertHome::RtxTp2, args.skip_experts)?;
-        if !tp2_layers.is_empty() {
-            ensure!(startup_graphs, "GLM Flash TP2 experts require startup graphs; remove --graph-budget-mib and \
-                set CUTEAFD_GLMF_STARTUP_GRAPHS=1 (post-ready captures are not admitted)");
-            let peer = peer_stream.context("TP2 placement without peer device")?;
-            let catalog = self.experts.as_ref().context("TP2 expert catalog")?;
-            let devices = [crate::shared::memory::device::Device { library: &self.library, id: args.device },
-                crate::shared::memory::device::Device { library: &self.library, id: peer.0 }];
-            let budgets = placement.tp2.context("TP2 arena admission")?.peak_bytes.map(usize::try_from);
-            let budgets = [budgets[0].clone()?, budgets[1].clone()?];
-            use crate::shared::experts::rtx::{exl3::Exl3Tp2, fp8moe::Fp8MoeTp2, RtxExpertLayer};
-            let ranks: [Box<dyn RtxExpertLayer + '_>; 2] = if let Some(manifest) = catalog.exl3() {
-                let package = crate::shared::experts::exl3::aot_layout_directory(&args.native_lib,
-                    manifest.decoder_tiers(), "rtx-tp2");
-                Exl3Tp2::load_pair(devices, catalog, &package, tp2_layers.clone(), args.expert_rows(), budgets)?
-                    .map(|r| Box::new(r) as Box<dyn RtxExpertLayer>)
-            } else {
-                let tensors = catalog.fp8().context("FP8 TP2 tensors")?;
-                let package = args.fp8_package.clone().unwrap_or_else(||
-                    crate::shared::experts::fp8::package_directory(&args.native_lib, 2, tensors.format()));
-                Fp8MoeTp2::load_pair(devices, tensors, &package, tp2_layers, args.expert_rows(), budgets)?
-                    .map(|r| Box::new(r) as Box<dyn RtxExpertLayer>)
-            };
+        if let Some(tp2) = tp2 {
+            let ranks = tp2.execution()?;
             probe("expert-packages")?;
             engine.install_tp2(ranks)?;
             probe("route-exchange")?;

@@ -21,11 +21,13 @@ pub(crate) mod combine;
 pub(crate) mod draft;
 pub(crate) mod exl3;
 pub(crate) mod fp8moe;
+pub(crate) mod landed;
 pub(crate) mod native;
 pub(crate) mod pair;
 pub(crate) mod routes;
 
 pub(crate) use combine::{Combine, ExchangeDtype, FusedCombine};
+pub(crate) use landed::Tp2Weights;
 pub(crate) use routes::{RouteCheck, RouteIdentity, RouteSource};
 
 /// Which part of each routed expert a resident layer set holds.

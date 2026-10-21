@@ -68,29 +68,56 @@ impl RankPlan {
     }
 }
 
-pub(crate) fn prepare(snapshot: &Path, layers: &[usize],
-    assignments: &[cuteafd_loader::placement::SparkAssignment], offers: &[Offer]) -> Result<PushGroup> {
+fn rank_plans(catalog: &OfficialV41Catalog, layers: &[usize],
+    assignments: &[cuteafd_loader::placement::SparkAssignment], offers: &[Offer]) -> Result<Vec<RankPlan>> {
     ensure!(offers.len() == assignments.len(), "push offer world differs from admission");
-    let catalog = cuteafd_loader::read_expert_catalog(snapshot)?;
-    let (root, _) = cuteafd_loader::push_load::namespace(snapshot)?;
-    let mut plans = Vec::new();
-    for (rank, (offer, assignment)) in offers.iter().zip(assignments).enumerate() {
-        let plan = RankPlan::new(&catalog, layers, offers.len(), rank,
-            usize::try_from(assignment.resident_bytes)?)?;
-        validate_offer(offer, rank, assignment, &plan.placement, plan.layout.logical_bytes() as u64)?;
-        plans.push(plan);
+    let mut plans = Vec::with_capacity(offers.len());
+    // Bound CPU/memory concurrency and join in rank order so plan IDs stay deterministic.
+    for start in (0..offers.len()).step_by(8) {
+        std::thread::scope(|scope| -> Result<()> {
+            let jobs: Vec<_> = (start..offers.len().min(start + 8)).map(|rank| scope.spawn(move || {
+                let assignment = &assignments[rank];
+                let plan = RankPlan::new(catalog, layers, offers.len(), rank,
+                    usize::try_from(assignment.resident_bytes)?)?;
+                validate_offer(&offers[rank], rank, assignment, &plan.placement,
+                    plan.layout.logical_bytes() as u64)?;
+                Ok::<_, anyhow::Error>(plan)
+            })).collect();
+            for job in jobs {
+                plans.push(job.join().map_err(|_| anyhow::anyhow!("push rank planner panicked"))??);
+            }
+            Ok(())
+        })?;
     }
+    Ok(plans)
+}
+
+pub(crate) fn prepare(snapshot: &Path, catalog: &OfficialV41Catalog, layers: &[usize],
+    assignments: &[cuteafd_loader::placement::SparkAssignment], offers: &[Offer]) -> Result<PushGroup> {
+    let started = std::time::Instant::now();
+    let (root, _) = cuteafd_loader::push_load::namespace(snapshot)?;
+    let plans = rank_plans(catalog, layers, assignments, offers)?;
+    let planned = started.elapsed();
     // Only validated, worker-reported placements become source/destination plans.
     let mut builder = Builder::new(&root, offers.iter().map(|o| o.arena_bytes).collect());
-    for (rank, plan) in plans.iter().enumerate() { plan.append(&mut builder, &catalog, u32::try_from(rank)?)?; }
+    for (rank, plan) in plans.iter().enumerate() { plan.append(&mut builder, catalog, u32::try_from(rank)?)?; }
+    let appended = started.elapsed();
     let checked = builder.finish()?;
+    let checked_at = started.elapsed();
     ensure!(checked.plan.files.iter().all(|file| cuteafd_loader::push_load::is_push_shard(&root.join(file))),
         "push source is not a SparkNest shard");
     let ranks = offers.iter().map(|offer| Ok(cuteafd_loader::push_load::proto::RankSpec {
         rank: u32::try_from(offer.rank)?, host: offer.host.clone(), arena_bytes: offer.arena_bytes,
     })).collect::<Result<Vec<_>>>()?;
+    let source_checked = started.elapsed();
     let group = PushClient::default().create(ranks, checked.plan.files.clone())?;
+    let created = started.elapsed();
     checked.upload(&group)?;
+    tracing::info!(ranks = offers.len(), rank_plan_ms = planned.as_millis(),
+        append_ms = (appended - planned).as_millis(), check_ms = (checked_at - appended).as_millis(),
+        source_check_ms = (source_checked - checked_at).as_millis(),
+        create_ms = (created - source_checked).as_millis(), upload_ms = (started.elapsed() - created).as_millis(),
+        "Spark EXL3 push group prepared");
     Ok(group)
 }
 
