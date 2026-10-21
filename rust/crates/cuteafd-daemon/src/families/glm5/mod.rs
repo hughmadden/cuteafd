@@ -4,6 +4,7 @@ use crate::shared::speculation::dflash;
 pub(crate) mod engine;
 pub(crate) mod prefix;
 pub(crate) mod serve;
+pub(crate) mod landing;
 pub(crate) mod weights;
 
 use anyhow::{ensure, Context, Result};

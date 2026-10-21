@@ -384,6 +384,15 @@ int cuteafd_copy_d2d_2d_async(struct device_buffer dst, size_t dst_pitch,
     return pack_status;
 }
 
+int cuteafd_fp8_grid_kmajor(const void *grid, void *kmajor, int64_t rows, int64_t kb, void *stream) {
+    (void)stream;
+    for (int64_t b = 0; b < kb; ++b)
+        for (int64_t r = 0; r < rows; ++r)
+            ((float *)kmajor)[b * rows + r] = ((const float *)grid)[(r / 128) * kb + b];
+    event('K');
+    return pack_status;
+}
+
 int cuteafd_fp8_block_dequant(const void *weight, const void *scale, void *out,
                             int rows, int cols, void *stream) {
     (void)weight; (void)scale; (void)out; (void)rows; (void)cols; (void)stream;

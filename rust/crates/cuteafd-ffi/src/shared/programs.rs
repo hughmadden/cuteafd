@@ -525,6 +525,20 @@ impl NativeLibrary {
         Ok(())
     }
 
+    /// FP32 128x128 block `grid` [ceil(rows/128), kb] widened to per-row scales
+    /// stored K-block major, `kmajor` [kb, rows] (exact gather).
+    ///
+    /// # Safety
+    /// Both pointers are live device memory of those shapes on the stream's device.
+    pub unsafe fn fp8_grid_kmajor(&self, grid: *const c_void, kmajor: *mut c_void, rows: usize, kb: usize,
+        stream: *mut c_void) -> Result<()> {
+        type Widen = unsafe extern "C" fn(*const c_void, *mut c_void, i64, i64, *mut c_void) -> i32;
+        let f = *unsafe { self.lib.get::<Widen>(b"cuteafd_fp8_grid_kmajor") }?;
+        let status = unsafe { f(grid, kmajor, i64::try_from(rows)?, i64::try_from(kb)?, stream) };
+        ensure!(status == 0, "FP8 K-major grid widening failed with {status}");
+        Ok(())
+    }
+
     /// BF16 `w` [rows, cols] -> E4M3 `q` [rows, cols] with FP32 128x128 block
     /// `scale` [ceil(rows/128), ceil(cols/128)] (amax / 448 per block), the
     /// inverse of [`Self::fp8_block_dequant`].
