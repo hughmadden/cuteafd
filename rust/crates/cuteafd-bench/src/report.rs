@@ -27,6 +27,9 @@ impl RunStatus {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Report {
     pub schema: String,
+    /// Absent in historical reports that used synthetic prompts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_content: Option<String>,
     pub id: String,
     /// RFC 3339 UTC.
     pub created: String,
@@ -570,6 +573,9 @@ pub struct BasicCard {
     pub concurrency: Vec<ConcurrentRate>,
     #[serde(default)]
     pub prefill: Option<PrefillRate>,
+    /// Server tokens per reference token from the corpus warm-up fit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_token_ratio: Option<f64>,
     /// Seconds of the untimed warm-up requests (first-use loads, graphs, tables).
     #[serde(default)]
     pub warmup_s: Option<f64>,

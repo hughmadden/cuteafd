@@ -535,7 +535,7 @@ impl Bench {
             *slot = Some(active.clone());
         }
         let report = Arc::new(Mutex::new(Report {
-            schema: SCHEMA.into(), id: id.clone(), created: now_rfc3339(), finished: None, status: RunStatus::Running,
+            schema: SCHEMA.into(), prompt_content: Some(crate::text::PROMPT_CONTENT.into()), id: id.clone(), created: now_rfc3339(), finished: None, status: RunStatus::Running,
             profile: name, plan: plan.clone(), server: ServerInfo::default(), fingerprint: String::new(), baseline: None,
             panels: plan.iter().map(|p| PanelResult { id: p.id.clone(),
                 title: panels::find(&p.id).map_or(p.id.clone(), |panel| panel.title().to_string()),

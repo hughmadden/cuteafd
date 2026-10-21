@@ -3,7 +3,7 @@
 use super::common::{self, aggregate, plain, sized_prompt, table, wave};
 use super::{Ctx, Panel, Rates};
 use crate::report::ServerInfo;
-use crate::text::{filler, nonce};
+use crate::text::{corpus, nonce};
 use anyhow::{Context, Result};
 use cuteafd_api::openai::probe::ProbeSpec;
 use serde_json::{json, Value};
@@ -299,13 +299,13 @@ impl Panel for PrefixCache {
     }
     fn run(&self, ctx: &Ctx<'_>) -> Result<Value> {
         let mut history = vec![json!({"role": "system", "content": format!("[{}] You are a concise assistant. \
-            Reference notes follow.\n\n{}", nonce(), filler(4242, 700))})];
+            Reference notes follow.\n\n{}", nonce(), corpus(4242, 700))})];
         let mut turns = Vec::new();
         let tiers_before = common::prefix_tier_counters(ctx.client);
         for turn in 1..=6 {
             ctx.progress.step((turn - 1) as f64 / 6.0, format!("turn {turn}"));
             history.push(json!({"role": "user", "content": format!("Question {turn}: {} Answer in three sentences.",
-                filler(turn as u64 * 77, 120))}));
+                corpus(turn as u64 * 77, 120))}));
             let body = super::context_load::body(&ctx.info.configuration, json!(history), 64);
             // From turn 2 the history carries the model's own answers, so the
             // prompt is model-determined and differs between arms by design.

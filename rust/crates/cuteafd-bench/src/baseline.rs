@@ -10,7 +10,7 @@ use crate::report::{
     now_rfc3339, BasicCard, Baseline, Check, CheckStatus, ConcurrentRate, ConcurrentTiming, ContentRate,
     PrefillRate, Quality, ServerInfo, StreamTiming,
 };
-use crate::text::{filler, nonce};
+use crate::text::{corpus, nonce};
 use anyhow::{Context, Result};
 use cuteafd_api::openai::probe::{ProbeRecord, ProbeSpec};
 use serde_json::{json, Value};
@@ -146,12 +146,12 @@ pub fn run(client: &Client, info: &ServerInfo, progress: &Progress, run_id: &str
             card: BasicCard { thinking: Some(info.configuration.thinking_label().into()), capacity: Some(capacity), ..BasicCard::default() }, quality: Quality::default(), seconds: 0.0, thermal: None, fabric: vec![] },
     };
     // Warm-up: first-use workspaces, graphs and tables (untimed), and a two-point
-    // fit of tokens per filler word for the prefill case.
+    // fit of tokens per reference token for the prefill case.
     run.step(0.01, "warm-up");
     let warmup = Instant::now();
     let mut fit = Vec::new();
-    for (i, words) in [300usize, 900].into_iter().enumerate() {
-        let text = format!("[{}] Summarize in one word.\n\n{}", nonce(), filler(17 + i as u64, words));
+    for words in [300usize, 900] {
+        let text = format!("[{}] Summarize in one word.\n\n{}", nonce(), corpus(99, words));
         let chat = client.chat(plain(client, &text, 8), None).context("warm-up request")?;
         fit.push((words as f64, chat.timing.prompt_tokens as f64));
     }
@@ -197,18 +197,19 @@ pub fn run(client: &Client, info: &ServerInfo, progress: &Progress, run_id: &str
     run.step(0.40, "8K prefill");
     let (slope, intercept) = match fit.as_slice() {
         [(w0, t0), (w1, t1)] if w1 > w0 && t1 > t0 => ((t1 - t0) / (w1 - w0), t0 - (t1 - t0) / (w1 - w0) * w0),
-        _ => (1.3, 20.0),
+        _ => (1.0, 20.0),
     };
+    run.baseline.card.prompt_token_ratio = Some(slope);
     let target = PREFILL_TOKENS.min(max_context.saturating_sub(64)) as f64;
     let words = ((target - intercept) / slope).max(64.0) as usize;
-    // Warm beyond the full 8K chunk when context permits. Near-equal filler
+    // Warm beyond the full 8K chunk when context permits. Near-equal corpus
     // lengths can move a lane boundary and leave part of the measured lane
     // cold. Keep normal prefix-cache retention work in both requests.
     let warm_target = (target + 512.0).min(max_context.saturating_sub(64) as f64);
     let warm_words = ((warm_target - intercept) / slope).max(64.0) as usize;
-    let text = format!("[{}] Reply with the single word OK.\n\n{}", nonce(), filler(98, warm_words));
+    let text = format!("[{}] Reply with the single word OK.\n\n{}", nonce(), corpus(98, warm_words));
     client.chat(plain(client, &text, 1), None).context("8K prefill warm-up")?;
-    let text = format!("[{}] Reply with the single word OK.\n\n{}", nonce(), filler(99, words));
+    let text = format!("[{}] Reply with the single word OK.\n\n{}", nonce(), corpus(99, words));
     // Prime this exact lane shape and its routed expert accesses too. A cold
     // probe neither reads nor retains a prefix, so the timed ordinary request
     // still performs its full prefill and normal snapshot work.
@@ -324,7 +325,7 @@ fn cache_exact(run: &mut Run<'_>, check: &mut Check) -> Result<()> {
     let client = run.client;
     let rows = |n: usize| ProbeSpec { no_speculation: true, record_rows: n, top_k: 1, ..ProbeSpec::default() };
     // Prompt end: the first request computes and retains, the second restores it whole.
-    let text = format!("[{}] Read the notes and answer in one word.\n\n{}", nonce(), filler(31, 1100));
+    let text = format!("[{}] Read the notes and answer in one word.\n\n{}", nonce(), corpus(31, 1100));
     let first = probed(client, plain(client, &text, 2), rows(2))?;
     if !honoured(&first) {
         unsupported(check);
@@ -335,7 +336,7 @@ fn cache_exact(run: &mut Run<'_>, check: &mut Check) -> Result<()> {
     // answer runs past 25 tokens, so the turn ends at its length limit and the turn snapshot is
     // followed by a decode step.
     let turn_text = format!("[{}] Here are some notes.\n\n{}\n\nCount from one to forty in words, separated by commas.",
-        nonce(), filler(57, 900));
+        nonce(), corpus(57, 900));
     let turn = probed(client, plain(client, &turn_text, TURN_TOKENS as u64), rows(TURN_TOKENS))?;
     let reference = probed(client, plain(client, &turn_text, TURN_TOKENS as u64 + 1), rows(TURN_TOKENS + 1))?;
     let mut ids = turn.prompt_ids.clone();
