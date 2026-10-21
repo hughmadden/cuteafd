@@ -185,84 +185,87 @@ fn full_context_mtp_forecast_charges_private_predictors_before_allocation() -> a
     let programs = ProgramSet::from_manifest(&manifest, &["step5", "step52"]);
     let capacity = inventory::PRO_TOTAL_BYTES;
     let arch = ArchContext::coordinator(capacity, None);
-    let inputs = RuntimeInputs {
-                kv_format: crate::families::qwen4::Qwen4KvCache::Bf16,
-        inventory: Inventory { gpus: vec![GpuBudget { capacity_bytes: capacity,
-            baseline: Baseline::Planned { context_bytes: arch.context_bytes, loaded_bytes: 0 },
-            headroom_bytes: 1 << 30 }; 2], spark_ranks: 6, peer_access: true },
-        rows: 256, sequences: 16, context: 1_048_576,
-        requested_pool: Some(1_048_576),
-        marks: MarkRule { lanes: 16, entries: 20, budget_bytes: 2 << 30, host: true },
-        pending_code: (0..2).map(|rank| inventory::loaded_code_allowance(
-            "step5", "step5:fp8", true, rank, &arch, Some(&programs)).bytes).collect(),
-        peer_diagnostics: false, startup: vec![],
-    };
-    let baseline = admission::forecast_mtp(&cp, &inputs, 0)?;
-    for depth in 0..=3 {
-        let admitted = admission::forecast_mtp(&cp, &inputs, depth)?;
-        assert_eq!(admitted.cache.context, 1_048_576);
-        assert_eq!(admitted.placement.pool_tokens, 1_048_576);
-        assert_eq!(admitted.marks, 2);
-        assert_eq!(admitted.cache.ranks[0].mtp_stage_hidden.len(), depth);
-        assert!(admitted.cache.ranks[1].mtp_stage_hidden.is_empty());
-        let weights = coordinator::RankWeightLayout::for_mtp(&cp, depth)?.resident_bytes;
-        let ownership = inputs.ownership(&Config::parse(&cp)?)?;
-        let target = native::rank_admission(&cp, &ownership, 0, inputs.rows)?.workspace;
-        let workspace = target.max(native::mtp_forecast_workspace(inputs.rows, depth, crate::families::qwen4::Qwen4KvCache::Bf16)?) - target;
-        let charged = |a: &admission::Admission, rank: usize| a.placement.items[rank].iter()
-            .map(|item| item.bytes).sum::<u64>();
-        let active_delta = admitted.reservations[0].active - baseline.reservations[0].active;
-        let marks_delta = admitted.reservations[0].marks - baseline.reservations[0].marks;
-        assert_eq!(charged(&admitted, 0) - charged(&baseline, 0),
-            weights + workspace + active_delta as u64 + marks_delta as u64);
-        assert_eq!(charged(&admitted, 1), charged(&baseline, 1));
-        let planned = plan::plan(&checkpoint_path, &PlanOptions {
-            placement: ExpertPlacement::from_spark_ranks(6),
-            draft_ownership: if depth == 0 { Some(spec::DraftOwnership::None) } else { None },
-            layout: Some(layout::LayoutOptions {
-                rtx_bytes: vec![capacity; 2], pool_tokens: inputs.requested_pool,
-                context_tokens: inputs.context, concurrency: inputs.sequences as u64,
-                prefill_rows: inputs.rows as u64, headroom_bytes: 1 << 30,
-                native_mtp_layers: depth, workspace_manifest: Some(manifest_path.clone()),
-                mimo_prefix_entries: inputs.marks.entries as u64,
-                mimo_prefix_mark_bytes: inputs.marks.budget_bytes,
-                ..Default::default()
-            }), ..Default::default()
-        })?;
-        assert!(planned.wip_launchable(), "depth {depth}: {:?}", planned.hints);
-        let memory = planned.memory_layout.as_ref().expect("depth-aware Step-5 layout");
-        assert_eq!(memory.pool_tokens, admitted.placement.pool_tokens);
-        for rank in 0..2 {
-            let device = &memory.devices[rank];
-            for category in [cuteafd_core::memory_layout::Category::Weights,
-                cuteafd_core::memory_layout::Category::Kv,
-                cuteafd_core::memory_layout::Category::Prefix,
-                cuteafd_core::memory_layout::Category::Workspace] {
-                let expected = admitted.placement.items[rank].iter()
-                    .filter(|item| item.category == category).map(|item| item.bytes).sum::<u64>();
-                let actual = device.items.iter().filter(|item| item.category == category)
-                    .map(|item| item.bytes).sum::<u64>();
-                assert_eq!(actual, expected, "depth {depth}, rank {rank}, {category:?}");
+    for kv_format in [crate::families::qwen4::Qwen4KvCache::Bf16,
+        crate::families::qwen4::Qwen4KvCache::Fp8] {
+        let inputs = RuntimeInputs {
+            kv_format,
+            inventory: Inventory { gpus: vec![GpuBudget { capacity_bytes: capacity,
+                baseline: Baseline::Planned { context_bytes: arch.context_bytes, loaded_bytes: 0 },
+                headroom_bytes: 1 << 30 }; 2], spark_ranks: 6, peer_access: true },
+            rows: 256, sequences: 16, context: 1_048_576,
+            requested_pool: Some(1_048_576),
+            marks: MarkRule { lanes: 16, entries: 20, budget_bytes: 2 << 30, host: true },
+            pending_code: (0..2).map(|rank| inventory::loaded_code_allowance(
+                "step5", "step5:fp8", true, rank, &arch, Some(&programs)).bytes).collect(),
+            peer_diagnostics: false, startup: vec![],
+        };
+        let baseline = admission::forecast_mtp(&cp, &inputs, 0)?;
+        for depth in 0..=3 {
+            let admitted = admission::forecast_mtp(&cp, &inputs, depth)?;
+            assert_eq!(admitted.cache.context, 1_048_576);
+            assert_eq!(admitted.placement.pool_tokens, 1_048_576);
+            assert_eq!(admitted.marks, 2);
+            assert_eq!(admitted.cache.ranks[0].mtp_stage_hidden.len(), depth);
+            assert!(admitted.cache.ranks[1].mtp_stage_hidden.is_empty());
+            let weights = coordinator::RankWeightLayout::for_mtp(&cp, depth)?.resident_bytes;
+            let ownership = inputs.ownership(&Config::parse(&cp)?)?;
+            let target = native::rank_admission(&cp, &ownership, 0, inputs.rows)?.workspace;
+            let workspace = target.max(native::mtp_forecast_workspace(inputs.rows, depth, kv_format)?) - target;
+            let charged = |a: &admission::Admission, rank: usize| a.placement.items[rank].iter()
+                .map(|item| item.bytes).sum::<u64>();
+            let active_delta = admitted.reservations[0].active - baseline.reservations[0].active;
+            let marks_delta = admitted.reservations[0].marks - baseline.reservations[0].marks;
+            assert_eq!(charged(&admitted, 0) - charged(&baseline, 0),
+                weights + workspace + active_delta as u64 + marks_delta as u64);
+            assert_eq!(charged(&admitted, 1), charged(&baseline, 1));
+            let planned = plan::plan(&checkpoint_path, &PlanOptions {
+                placement: ExpertPlacement::from_spark_ranks(6),
+                draft_ownership: if depth == 0 { Some(spec::DraftOwnership::None) } else { None },
+                layout: Some(layout::LayoutOptions {
+                    rtx_bytes: vec![capacity; 2], pool_tokens: inputs.requested_pool, step5_kv: kv_format,
+                    context_tokens: inputs.context, concurrency: inputs.sequences as u64,
+                    prefill_rows: inputs.rows as u64, headroom_bytes: 1 << 30,
+                    native_mtp_layers: depth, workspace_manifest: Some(manifest_path.clone()),
+                    mimo_prefix_entries: inputs.marks.entries as u64,
+                    mimo_prefix_mark_bytes: inputs.marks.budget_bytes,
+                    ..Default::default()
+                }), ..Default::default()
+            })?;
+            assert!(planned.wip_launchable(), "depth {depth}: {:?}", planned.hints);
+            let memory = planned.memory_layout.as_ref().expect("depth-aware Step-5 layout");
+            assert_eq!(memory.pool_tokens, admitted.placement.pool_tokens);
+            for rank in 0..2 {
+                let device = &memory.devices[rank];
+                for category in [cuteafd_core::memory_layout::Category::Weights,
+                    cuteafd_core::memory_layout::Category::Kv,
+                    cuteafd_core::memory_layout::Category::Prefix,
+                    cuteafd_core::memory_layout::Category::Workspace] {
+                    let expected = admitted.placement.items[rank].iter()
+                        .filter(|item| item.category == category).map(|item| item.bytes).sum::<u64>();
+                    let actual = device.items.iter().filter(|item| item.category == category)
+                        .map(|item| item.bytes).sum::<u64>();
+                    assert_eq!(actual, expected, "depth {depth}, rank {rank}, {category:?}");
+                }
             }
+            let by_category = (0..2).map(|rank| {
+                let mut categories = std::collections::BTreeMap::new();
+                for item in &admitted.placement.items[rank] {
+                    *categories.entry(format!("{:?}", item.category)).or_insert(0u64) += item.bytes;
+                }
+                serde_json::json!({"rank": rank, "charged": charged(&admitted, rank),
+                    "context": arch.context_bytes, "headroom": 1u64 << 30,
+                    "remaining": capacity - arch.context_bytes - (1 << 30) - charged(&admitted, rank),
+                    "categories": categories})
+            }).collect::<Vec<_>>();
+            eprintln!("Step-5 full-context forecast {}", serde_json::json!({
+                "depth": depth, "context": admitted.cache.context, "pool": admitted.placement.pool_tokens,
+                "sequences": inputs.sequences, "rows": inputs.rows,
+                "marks": admitted.marks, "predictor_weights": weights,
+                "predictor_arena_growth": workspace,
+                "active_delta": active_delta, "mark_delta": marks_delta, "ranks": by_category }));
         }
-        let by_category = (0..2).map(|rank| {
-            let mut categories = std::collections::BTreeMap::new();
-            for item in &admitted.placement.items[rank] {
-                *categories.entry(format!("{:?}", item.category)).or_insert(0u64) += item.bytes;
-            }
-            serde_json::json!({"rank": rank, "charged": charged(&admitted, rank),
-                "context": arch.context_bytes, "headroom": 1u64 << 30,
-                "remaining": capacity - arch.context_bytes - (1 << 30) - charged(&admitted, rank),
-                "categories": categories})
-        }).collect::<Vec<_>>();
-        eprintln!("Step-5 full-context forecast {}", serde_json::json!({
-            "depth": depth, "context": admitted.cache.context, "pool": admitted.placement.pool_tokens,
-            "sequences": inputs.sequences, "rows": inputs.rows,
-            "marks": admitted.marks, "predictor_weights": weights,
-            "predictor_arena_growth": workspace,
-            "active_delta": active_delta, "mark_delta": marks_delta, "ranks": by_category }));
+        assert!(admission::forecast_mtp(&cp, &inputs, 4).is_err());
     }
-    assert!(admission::forecast_mtp(&cp, &inputs, 4).is_err());
     Ok(())
 }
 
@@ -756,7 +759,12 @@ fn nvfp4_min_card_admits_native_w4a4_and_bf16_root_stays_reference_only() {
         if let Some(tokens) = pool {
             assert_eq!(memory.pool_tokens, tokens);
         } else {
-            assert!((262_144..=context).contains(&memory.pool_tokens));
+            let target = crate::placement::PoolPolicy::resolve(&[96 << 30], context, None, 64, false).target;
+            assert!((context..=target).contains(&memory.pool_tokens));
+            // More free capacity must grow the same default-format pool to its cap.
+            let roomy = report_context(dir.path(), 1, 128, 4, None, context);
+            assert!(roomy.wip_launchable(), "{:?}", roomy.hints);
+            assert_eq!(roomy.memory_layout.unwrap().pool_tokens, target);
         }
         assert!(memory.devices.iter().all(|d| d.used_bytes() <= d.capacity_bytes));
         let endpoint = cuteafd_core::SparkEndpoint { capacity: 256, ingress: cuteafd_core::SparkIngress::Bf16 };

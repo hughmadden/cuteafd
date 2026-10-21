@@ -1232,46 +1232,50 @@ mod tests {
 
     #[test]
     fn diagnostic_files_preserve_full_rows_bits_positions_and_head_input() -> Result<()> {
-        let root = tempfile::tempdir()?;
-        let mut args = diagnostic_args(&["--nll", "--dump-residuals", "/unused", "--dump-layers", "0,91"])?;
-        let logits_dir = root.path().join("logits");
-        let residual_dir = root.path().join("residuals");
-        args.save_logits = Some(logits_dir.clone());
-        args.dump_residuals = Some(residual_dir.clone());
-        let tokens = [2u32, 0, 1];
-        let positions = [1, 2];
-        let logits = [-0.0f32, 1., -2., 3., 4., 5., 6., 7., 8.];
-        let norm = vec![0.5f32; tokens.len() * H];
-        let mut requested = vec![];
-        save_diagnostics(&args, &tokens, &positions, 3, &logits, Some(&norm), |layer| {
-            requested.push(layer);
-            Ok(vec![layer as f32; tokens.len() * H])
-        })?;
-        assert_eq!(requested, [0, 91]);
-        assert_eq!(std::fs::read(logits_dir.join("tokens.bin"))?,
-            tokens.iter().flat_map(|t| t.to_le_bytes()).collect::<Vec<_>>());
-        assert_eq!(std::fs::read(logits_dir.join("logits.bin"))?,
-            logits.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>());
-        assert_eq!(std::fs::read(residual_dir.join("positions.bin"))?,
-            [0u32, 1, 2].into_iter().flat_map(u32::to_le_bytes).collect::<Vec<_>>());
-        for (file, value) in [("layer00.bin", 0f32), ("layer91.bin", 91.), ("final_norm.bin", 0.5)] {
-            assert_eq!(std::fs::read(residual_dir.join(file))?,
-                vec![value; tokens.len() * H].iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>());
+        for format in [cuteafd_loader::families::qwen4::Qwen4KvCache::Bf16,
+            cuteafd_loader::families::qwen4::Qwen4KvCache::Fp8] {
+            let root = tempfile::tempdir()?;
+            let mut args = diagnostic_args(&["--nll", "--dump-residuals", "/unused", "--dump-layers", "0,91"])?;
+            args.kv_cache = format;
+            let logits_dir = root.path().join("logits");
+            let residual_dir = root.path().join("residuals");
+            args.save_logits = Some(logits_dir.clone());
+            args.dump_residuals = Some(residual_dir.clone());
+            let tokens = [2u32, 0, 1];
+            let positions = [1, 2];
+            let logits = [-0.0f32, 1., -2., 3., 4., 5., 6., 7., 8.];
+            let norm = vec![0.5f32; tokens.len() * H];
+            let mut requested = vec![];
+            save_diagnostics(&args, &tokens, &positions, 3, &logits, Some(&norm), |layer| {
+                requested.push(layer);
+                Ok(vec![layer as f32; tokens.len() * H])
+            })?;
+            assert_eq!(requested, [0, 91]);
+            assert_eq!(std::fs::read(logits_dir.join("tokens.bin"))?,
+                tokens.iter().flat_map(|t| t.to_le_bytes()).collect::<Vec<_>>());
+            assert_eq!(std::fs::read(logits_dir.join("logits.bin"))?,
+                logits.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>());
+            assert_eq!(std::fs::read(residual_dir.join("positions.bin"))?,
+                [0u32, 1, 2].into_iter().flat_map(u32::to_le_bytes).collect::<Vec<_>>());
+            for (file, value) in [("layer00.bin", 0f32), ("layer91.bin", 91.), ("final_norm.bin", 0.5)] {
+                assert_eq!(std::fs::read(residual_dir.join(file))?,
+                    vec![value; tokens.len() * H].iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>());
+            }
+            let meta: Value = serde_json::from_slice(&std::fs::read(residual_dir.join("meta.json"))?)?;
+            assert_eq!(meta, serde_json::json!({
+                "schema":"cuteafd.step5.residuals/1", "window":"code-1", "kv_cache":format.to_string(), "rows":3, "width":H,
+                "dtype":"F32", "byte_order":"little", "positions":"positions.bin", "position_dtype":"U32",
+                "tokens":"tokens.bin", "layers":[0,91], "layer_pattern":"layerNN.bin",
+                "final_norm":"final_norm.bin", "final_norm_source_dtype":"BF16",
+                "scored_target_positions":[1,2], "logits_row_target_offset":1, "complete":true
+            }));
+            let scored = select_scored_rows(&logits, &positions, 3)?;
+            assert_eq!(scored, logits[..6]);
+            // Outputs survive the numerical rejection that follows writing in the shared path.
+            assert!(shared_diagnostic_verdict(0.02, 0., 0.01, 0.1).is_err());
+            assert!(logits_dir.join("logits.bin").is_file());
+            assert!(residual_dir.join("meta.json").is_file());
         }
-        let meta: Value = serde_json::from_slice(&std::fs::read(residual_dir.join("meta.json"))?)?;
-        assert_eq!(meta, serde_json::json!({
-            "schema":"cuteafd.step5.residuals/1", "window":"code-1", "kv_cache":"bf16", "rows":3, "width":H,
-            "dtype":"F32", "byte_order":"little", "positions":"positions.bin", "position_dtype":"U32",
-            "tokens":"tokens.bin", "layers":[0,91], "layer_pattern":"layerNN.bin",
-            "final_norm":"final_norm.bin", "final_norm_source_dtype":"BF16",
-            "scored_target_positions":[1,2], "logits_row_target_offset":1, "complete":true
-        }));
-        let scored = select_scored_rows(&logits, &positions, 3)?;
-        assert_eq!(scored, logits[..6]);
-        // Outputs survive the numerical rejection that follows writing in the shared path.
-        assert!(shared_diagnostic_verdict(0.02, 0., 0.01, 0.1).is_err());
-        assert!(logits_dir.join("logits.bin").is_file());
-        assert!(residual_dir.join("meta.json").is_file());
         Ok(())
     }
 
