@@ -183,7 +183,8 @@ def test_family_launch_wraps_only_the_selected_spark_ranks(tmp_path):
     assert f'--output={prof}/nsys-h1-rank1' in rank1
     # The wrapper sits between the image and the served command.
     assert rank1.index('--force-overwrite=true') < rank1.index('cuteafd expertd-native')
-    assert rank1.index('/hf/hub:ro ') < rank1.index('/bin/bash -c ') < rank1.index('cuteafd expertd-native')
+    # Spark push binds the whole SparkNest namespace (#587), not the old /hf/hub alias.
+    assert rank1.index(':ro ') < rank1.index('/bin/bash -c ') < rank1.index('cuteafd expertd-native')
     for worker in workers:
         assert f'mkdir -p {prof} && release_require_writable_state {prof} && docker run' in worker
 
