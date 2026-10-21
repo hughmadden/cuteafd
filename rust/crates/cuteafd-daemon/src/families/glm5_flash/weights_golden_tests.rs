@@ -114,6 +114,15 @@ fn installed_pushed_operands_match_the_mount_golden() -> Result<()> {
                 sparks + gpus, sparks + gpu as usize)?;
         }
         assert!(peak_steps <= crate::shared::experts::rtx::dense::STEP_BYTES, "a staged step exceeds its bound");
+        // In plan order (one source), one step is open at a time: staging stays
+        // one bounded buffer per rank, pinned once and reused.
+        let peaks = testing::PEAKS.with(|p| p.take());
+        assert_eq!(peaks.len(), gpus);
+        for (staged, pinned) in peaks {
+            assert!(staged <= crate::shared::experts::rtx::dense::STEP_BYTES as u64
+                && pinned <= crate::shared::experts::rtx::dense::STEP_BYTES as u64,
+                "dense rank staging peaked at {staged} B in use, {pinned} B pinned");
+        }
         for (prefix, share) in &operands {
             for (name, allocation) in &share.operands {
                 let key = format!("{prefix}.{name}");

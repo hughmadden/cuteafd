@@ -341,8 +341,12 @@ pub(crate) struct DenseArena<'a> {
     open: std::collections::HashMap<usize, (HostAllocation<'a>, u64)>,
     pool: Vec<HostAllocation<'a>>,
     run: usize,
+    /// Bytes of staging held by open steps now, and their peak.
     staged: u64,
     peak: u64,
+    /// Bytes of staging allocated (open steps and the pool), and their peak.
+    held: u64,
+    peak_held: u64,
 }
 
 impl<'a> DenseArena<'a> {
@@ -358,7 +362,7 @@ impl<'a> DenseArena<'a> {
             }
         };
         Ok(Self { device, layout, expected, coverage: Coverage::default(), kernels, stream,
-            open: Default::default(), pool: Vec::new(), run: 0, staged: 0, peak: 0 })
+            open: Default::default(), pool: Vec::new(), run: 0, staged: 0, peak: 0, held: 0, peak_held: 0 })
     }
 
     fn operand(&self, offset: u64, bytes: u64) -> Result<(CuteafdDeviceBuffer, usize)> {
@@ -418,9 +422,16 @@ impl PushDestination for DenseArena<'_> {
         let (index, at) = self.step(offset, length)?;
         let need = self.layout.steps[index].1.bytes();
         if !self.open.contains_key(&index) {
+            // Uniform buffers (a step's own size only past the bound), so returned
+            // staging always fits the next step.
             let staging = match self.pool.iter().position(|s| s.buffer.bytes >= need) {
                 Some(found) => self.pool.swap_remove(found),
-                None => HostAllocation::named(self.device.library, need.max(STEP_BYTES.min(1 << 20)), "staging/coordinator-dense")?,
+                None => {
+                    let bytes = need.max(STEP_BYTES);
+                    self.held += bytes as u64;
+                    self.peak_held = self.peak_held.max(self.held);
+                    HostAllocation::named(self.device.library, bytes, "staging/coordinator-dense")?
+                }
             };
             self.staged += staging.buffer.bytes as u64;
             self.peak = self.peak.max(self.staged);
@@ -436,6 +447,7 @@ impl PushDestination for DenseArena<'_> {
             let kernels = &mut self.kernels;
             self.device.run(|| step.run(kernels, library, &staging.bytes()[..need], stream))?;
             self.run += 1;
+            self.staged -= staging.buffer.bytes as u64;
             self.pool.push(staging);
         }
         Ok(())
@@ -449,7 +461,10 @@ impl PushDestination for DenseArena<'_> {
         ensure!(self.expected.complete(&self.coverage), "rank Done before all planned operand bytes completed");
         ensure!(self.open.is_empty() && self.run == self.layout.steps.len(), "rank Done before every staged step ran");
         tracing::info!(device = self.device.id, operands = self.layout.operands.len(), steps = self.run,
-            peak_staged_mib = self.peak as f64 / (1u64 << 20) as f64, "coordinator dense rank delivered");
+            peak_staged_mib = self.peak as f64 / (1u64 << 20) as f64,
+            peak_pinned_mib = self.peak_held as f64 / (1u64 << 20) as f64, "coordinator dense rank delivered");
+        #[cfg(test)]
+        testing::PEAKS.with(|p| p.borrow_mut().push((self.peak, self.peak_held)));
         Ok(())
     }
 }
@@ -485,6 +500,11 @@ pub(crate) fn plan_ranks<'a>(snapshot: &std::path::Path, operands: Vec<Operand>,
 #[cfg(test)]
 pub(crate) mod testing {
     use anyhow::Result;
+
+    thread_local! {
+        /// (peak staged, peak pinned) bytes of each delivered dense rank on this thread.
+        pub(crate) static PEAKS: std::cell::RefCell<Vec<(u64, u64)>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
     use std::os::unix::fs::FileExt;
 
     /// A one-source fake SparkNest for one rank: packs the rank's planned runs
