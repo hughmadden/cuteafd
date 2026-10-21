@@ -112,6 +112,9 @@ impl<'a> Execution<'a> {
             windows[0].len(), false)?;
         binding.draft = draft;
         binding.defer_publication = true;
+        tracing::info!(start = sequence.start, rows = sequence.rows, subwaves = windows.len(),
+            sizes = ?windows.iter().map(|window| window.len()).collect::<Vec<_>>(),
+            "Kimi prefill sub-wave pipeline");
         let mut completed = vec![0; windows.len()];
         let mut consumed = vec![vec![0; self.plan.hops().len()]; windows.len()];
         let mut pending = None;
