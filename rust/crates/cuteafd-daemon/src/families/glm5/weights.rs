@@ -667,15 +667,21 @@ impl<'a> GlmLoader<'a> {
             put(&mut ops, "w_o", self.bf16_split(&[format!("{p}.self_attn.o_proj.weight")], Axis::Cols, ranks)?);
         } else {
         let (values, scale, kscale) = if let Some(((values, values_bytes), (grid, grid_bytes))) = self.fp8_lands(&qkv_a)? {
-            // Prefill: per-row scales K-block major, from the landed grid's bytes.
-            let grid_image = landing::read(self.catalog, &grid, grid_bytes)?;
-            let grid_f32: Vec<f32> = grid_image.chunks_exact(4).map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect();
+            // Prefill: per-row scales K-block major, widened on each GPU from its landed grid.
             let rows: usize = values.iter().map(|land| land.rows.len()).sum();
             let kb = values[0].width().div_ceil(128);
-            let kscale: Vec<f32> = (0..kb).flat_map(|b| (0..rows).map(move |r| (r, b)))
-                .map(|(r, b)| grid_f32[(r / 128) * kb + b]).collect();
-            (self.landed_all(ranks, &values, values_bytes)?, self.landed_all(ranks, &grid, grid_bytes)?,
-                self.upload_all(ranks, &f32_bytes(&kscale))?)
+            let (values, grid) = (self.landed_all(ranks, &values, values_bytes)?, self.landed_all(ranks, &grid, grid_bytes)?);
+            let kscale = grid.iter().enumerate().map(|(rank, grid)| self.on_rank(rank, |stream| {
+                let kscale = DeviceAllocation::new(self.library, (rows * kb * 4).max(256))?;
+                // SAFETY: the grid holds ceil(rows/128) x kb FP32 scales and the destination
+                // kb x rows; both live on this rank, drained before return.
+                unsafe {
+                    self.library.fp8_grid_kmajor(grid.buffer.ptr, kscale.buffer.ptr, rows, kb, stream)?;
+                    self.library.cuda_stream_synchronize(stream)?;
+                }
+                Ok(kscale)
+            })).collect::<Result<Vec<_>>>()?;
+            (values, grid, kscale)
         } else { self.with_fp8(&qkv_a, |values, grid, rows, cols| {
             // Prefill: per-row scales K-block major (the block-FP8 GEMM wants whole 128-row blocks).
             let kb = cols.div_ceil(128);
