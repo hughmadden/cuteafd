@@ -500,6 +500,7 @@ pub(super) struct DraftState {
 }
 impl crate::shared::qwen::scheduler::DraftState for DraftState {
     fn pending_rows(&self) -> usize { usize::from(self.open || self.anchor.is_some()) }
+    fn restored(&mut self, frontier: usize) { self.open = frontier > 0; }
     fn close(&mut self, token: u32) {
         if self.open { self.anchor = Some(token); self.open = false; }
     }
@@ -614,6 +615,41 @@ impl<'a> Runtime<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn interleaved_target_only_probe_does_not_enter_teacher_catchup() -> Result<()> {
+        for start in [1usize, 2, 3, 63, 64, 65, 255, 256, 257, 511, 512, 513, 1492] {
+            let mut hit = [0usize; 3];
+            let mut cold = [0usize; 3];
+            let mut probe = [0usize; 3];
+            for stage in 0..3 { hit[stage] = start.saturating_sub(stage + 1); cold[stage] = hit[stage]; }
+            for position in start..start + 3 {
+                let rows = [11];
+                let known: Vec<_> = (position.saturating_sub(4)..position + 1).map(|p| (p, 11)).collect();
+                for (index, frontiers) in [&mut hit, &mut probe, &mut cold].into_iter().enumerate() {
+                    let mut placement = ();
+                    let mut state = DraftState::default();
+                    let v = crate::shared::qwen::scheduler::Verified { placement: &mut placement, seq: &mut state,
+                        start: position, history: (), rows: &rows, first_row: index, kept: Some((1, 17)),
+                        finished: false, neural: index != 1 };
+                    if let Some((kept, _)) = v.neural_kept() {
+                        for (stage, base) in frontiers.iter_mut().enumerate() {
+                            let selected = teacher_tokens(stage, *base, position, position + kept, 256, &known)?;
+                            *base += selected.len();
+                        }
+                    }
+                }
+                assert_eq!(hit, cold);
+                assert_eq!(probe, [0; 3]);
+            }
+            let mut restored = DraftState::default();
+            use crate::shared::qwen::scheduler::DraftState as _;
+            restored.restored(start);
+            restored.close(17);
+            assert_eq!(restored.anchor, Some(17));
+        }
+        Ok(())
+    }
 
     #[test]
     fn teacher_suffix_is_canonical_across_small_prefixes_and_full_chunks() -> Result<()> {

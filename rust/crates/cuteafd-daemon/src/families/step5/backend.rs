@@ -346,6 +346,13 @@ impl<'e, 'a> Backend<'a> for Step5Backend<'e, 'a> {
         if let Some(mtp) = self.mtp { mtp.bind(placement.sequence, tokens, resume); }
         Ok(())
     }
+    fn needs_snapshot_filter(&self, neural: bool) -> bool { neural && self.mtp.is_some() }
+    fn snapshot_compatible(&self, saved: &Self::Meta, frontier: usize, neural: bool) -> bool {
+        !neural || saved.supports_predictors(frontier, self.ranks.iter().map(|rank| {
+            let rank = rank.borrow();
+            rank.layout().ranks[rank.rank()].mtp_lengths.len()
+        }).sum())
+    }
     fn history(&self, _placement: &Placement) {}
     fn prefetch(&self, _tokens: &[u32], _next: &[u32]) {}
     fn require_live(&self) -> Result<()> {

@@ -477,7 +477,10 @@ mod tests {
                     &tokens, 0)?;
                 prefill(&mut cold, &mut cold_draft, 0, frontier, pool.pool())?;
                 ensure!(expected == backend.diagnostic_state(&cold)?, "live fresh mark differs at {frontier}");
-                let restored = pool.admit(&family, &tokens[..frontier + 1], frontier + 4, false,
+                let compatible = |saved: &super::super::prefix::Frontier, end|
+                    backend.snapshot_compatible(saved, end, true);
+                let restored = pool.admit_native_compatible(&family, &tokens[..frontier + 1],
+                    &tokens[..frontier + 1], &[], frontier + 4, false, Some(&compatible),
                     |pages| Placement { pages, sequence: 2, committed: 0 })?;
                 ensure!(restored.resume == frontier, "live exact prefix miss at {frontier}");
                 let mut restored = restored.placement;
@@ -504,19 +507,38 @@ mod tests {
                 backend.verify_device(&mut [(&mut source, &rows)], true, pool.pool())?;
                 backend.accept(&mut [scheduler::Verified { placement: &mut source, seq: &mut source_draft,
                     start: frontier, history: (), rows: &rows, first_row: 0,
-                    kept: Some((1, tokens[frontier + 1])), finished: true }], true, true)?;
+                    kept: Some((1, tokens[frontier + 1])), finished: true, neural: true }], true)?;
                 for (placement, draft) in [(&mut cold, &mut cold_draft), (&mut restored, &mut restored_draft)] {
                     backend.verify_device(&mut [(placement, &rows)], true, pool.pool())?;
                     backend.accept(&mut [scheduler::Verified { placement, seq: draft, start: frontier,
                         history: (), rows: &rows, first_row: 0, kept: Some((1, tokens[frontier + 1])),
-                        finished: true }], true, true)?;
+                        finished: true, neural: true }], true)?;
                 }
                 let continued = backend.diagnostic_state(&source)?;
                 ensure!(continued == backend.diagnostic_state(&cold)?, "live replay/fresh continuation differs at {frontier}");
                 ensure!(continued == backend.diagnostic_state(&restored)?, "live restored continuation differs at {frontier}");
-                backend.require_live()?;
-                println!("Step-5 live exactness frontier={frontier} target_kv_csa=real predictor_stages=3 abort_replay=true restore=true fresh_marks=true byte_exact=true");
+                ensure!(pool.capture(&family, SnapshotKind::Turn, &tokens[..frontier + 1], &source,
+                    After::default())?, "live drafting turn not retained");
                 for placement in [&source, &cold, &restored] { pool.release(&family, &placement.pages)?; }
+                let next = pool.admit_native_compatible(&family, &tokens[..frontier + 2],
+                    &tokens[..frontier + 2], &[], frontier + 4, false, Some(&compatible),
+                    |pages| Placement { pages, sequence: 0, committed: 0 })?;
+                ensure!(next.resume == frontier + 1, "live drafting conversation missed its prior turn");
+                let mut next = next.placement;
+                backend.bind_request(&mut next, (), cuteafd_engine::media::RequestMedia::new(Vec::new(), 4096, frontier + 1)?,
+                    &tokens, frontier + 1)?;
+                ensure!(continued == backend.diagnostic_state(&next)?, "live drafting turn restore differs");
+                let mut fresh = pool.admit_cold(&family, frontier + 1, frontier + 4,
+                    |pages| Placement { pages, sequence: 1, committed: 0 })?.placement;
+                let mut fresh_draft = super::super::mtp::DraftState::default();
+                backend.bind_request(&mut fresh, (), cuteafd_engine::media::RequestMedia::new(Vec::new(), 4096, frontier + 1)?,
+                    &tokens, 0)?;
+                prefill(&mut fresh, &mut fresh_draft, 0, frontier, pool.pool())?;
+                prefill(&mut fresh, &mut fresh_draft, frontier, frontier + 1, pool.pool())?;
+                ensure!(continued == backend.diagnostic_state(&fresh)?, "live prior-turn hit differs from cold prefill");
+                backend.require_live()?;
+                println!("Step-5 live exactness frontier={frontier} target_kv_csa=real predictor_stages=3 abort_replay=true restore=true fresh_marks=true turn_hit=true byte_exact=true");
+                for placement in [&next, &fresh] { pool.release(&family, &placement.pages)?; }
                 pool.clear(&family)?;
             }
             family.drain().map_err(|e| anyhow::anyhow!("live exactness drain: {e}"))?;

@@ -27,18 +27,26 @@ impl crate::shared::qwen::scheduler::Placement for Placement {
 pub(super) struct Frontier {
     committed: usize,
     logical_pages: usize,
+    predictor_frontiers: Vec<u64>,
 }
 
 impl Frontier {
     fn at(committed: usize) -> Self {
-        Self { committed, logical_pages: committed.div_ceil(64) }
+        Self { committed, logical_pages: committed.div_ceil(64), predictor_frontiers: Vec::new() }
+    }
+
+    pub(super) fn supports_predictors(&self, frontier: usize, depth: usize) -> bool {
+        self.committed == frontier && self.predictor_frontiers.len() == depth
+            && self.predictor_frontiers.iter().enumerate().all(|(stage, &end)|
+                end == frontier.saturating_sub(stage + 1) as u64)
     }
 
     fn validate_restore(&self, placement: &Placement, plan: &RestorePlan) -> Result<()> {
         ensure!(plan.exact() && plan.check(plan.snapshot_end).is_ok(),
             "Step-5 does not reconstruct approximate prefix state");
         ensure!(placement.committed == 0, "Step-5 restore requires a fresh destination");
-        ensure!(self == &Self::at(plan.resume()) && self.logical_pages <= placement.pages.len(),
+        ensure!(self.committed == plan.resume() && self.logical_pages == plan.resume().div_ceil(64)
+                && self.logical_pages <= placement.pages.len(),
             "Step-5 retained mark frontier mismatch");
         Ok(())
     }
@@ -149,7 +157,14 @@ impl<T> PrefixFamily<Frontier> for Step5Prefix<'_, '_, T> {
         if len != placement.committed {
             return Err("Step-5 capture must be at the committed frontier".into());
         }
-        Ok(Frontier::at(len))
+        let mut frontier = Frontier::at(len);
+        for rank in &self.ranks {
+            let rank = rank.borrow();
+            for stage in 0..rank.layout().ranks[rank.rank()].mtp_lengths.len() {
+                frontier.predictor_frontiers.push(rank.predictor_frontier(placement.sequence, stage)?);
+            }
+        }
+        Ok(frontier)
     }
 
     fn capture(&self, slot: MarkSlot, placement: &Placement, len: usize) -> Result<(), BoxError> {
@@ -176,10 +191,23 @@ impl<T> PrefixFamily<Frontier> for Step5Prefix<'_, '_, T> {
     fn restore_with(&self, mark: Option<&Mark>, saved: Option<&Frontier>, placement: &mut Placement,
         plan: &RestorePlan, _context: &RestoreContext<'_>) -> Result<(), BoxError> {
         self.pending.retire();
-        saved.ok_or("Step-5 retained mark frontier absent")?.validate_restore(placement, plan)?;
+        let saved = saved.ok_or("Step-5 retained mark frontier absent")?;
+        saved.validate_restore(placement, plan)?;
         let Some(Mark::Slot(slot)) = mark else {
             return Err("Step-5 exact restore requires an arena mark".into());
         };
+        let mut stage = 0;
+        for owner in &self.ranks {
+            let rank = owner.borrow();
+            let count = rank.layout().ranks[rank.rank()].mtp_lengths.len();
+            let expected = saved.predictor_frontiers.get(stage..stage + count)
+                .ok_or("Step-5 retained predictor metadata count mismatch")?;
+            rank.validate_predictor_metadata(placement.sequence, u64::from(slot.0), expected)?;
+            stage += count;
+        }
+        if stage != saved.predictor_frontiers.len() {
+            return Err("Step-5 retained predictor metadata count mismatch".into());
+        }
         self.restore_mark(*slot, placement, plan.resume())?;
         Ok(())
     }
@@ -214,6 +242,27 @@ mod tests {
     use crate::shared::memory::device::cache_test_device;
     use cuteafd_engine::prefix::{After, PrefixCache, PrefixConfig, SnapshotKind};
     use cuteafd_hostcache::copy::StubCopyEngine;
+
+    #[test]
+    fn drafting_restore_requires_every_canonical_predictor_frontier() {
+        for end in [1usize, 2, 3, 63, 64, 65, 255, 256, 257, 511, 512, 513, 1492] {
+            for depth in 1..=3 {
+                let mut saved = Frontier::at(end);
+                saved.predictor_frontiers = (0..depth).map(|stage| end.saturating_sub(stage + 1) as u64).collect();
+                assert!(saved.supports_predictors(end, depth));
+                assert!(!saved.supports_predictors(end + 1, depth));
+                assert!(!saved.supports_predictors(end, depth + 1));
+                for stage in 0..depth {
+                    let expected = saved.predictor_frontiers[stage];
+                    saved.predictor_frontiers[stage] = expected + 1;
+                    assert!(!saved.supports_predictors(end, depth));
+                    saved.predictor_frontiers[stage] = expected;
+                }
+                saved.predictor_frontiers.fill(0);
+                assert_eq!(saved.supports_predictors(end, depth), end <= 1);
+            }
+        }
+    }
 
     #[test]
     fn prefix_entry_points_retire_pending_before_validation() -> Result<(), BoxError> {

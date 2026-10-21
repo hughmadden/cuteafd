@@ -333,6 +333,14 @@ impl<'a> CacheRank<'a> {
         validate_mark_length(encoded, frontier)
     }
 
+    pub(super) fn validate_predictor_metadata(&self, sequence: u64, slot: u64, expected: &[u64]) -> Result<()> {
+        self.check_idle(sequence)?;
+        self.drain()?;
+        ensure!(self.predictor_frontiers(sequence, Some(slot))? == expected,
+            "Step-5 retained predictor metadata differs from canonical mark counters");
+        Ok(())
+    }
+
     /// Caller validates every rank with validate_retained before installing any
     /// rank. The shared family retains the arena slot across both phases.
     pub fn restore_retained(&self, sequence: u64, slot: u64, frontier: u64) -> Result<()> {
