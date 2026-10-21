@@ -525,13 +525,13 @@ mod tests {
             let checked = plan.checked(&catalog, root.path(), 6, rank)?;
             assert!(!checked.plan.entries.is_empty());
             assert_eq!(checked.arenas[rank], offer.arena_bytes);
-            // Current service/push.rs compares the ring against unused mount staging.
-            // The shared push admission follow-up (#573) must flip this refusal.
+            // Mount staging is not a push limit; service::push tests exercise
+            // independent ring admission against the actual allocatable pool.
             let ring = cuteafd_ffi::push_ring::DEFAULT_SLOTS * cuteafd_ffi::push_ring::DEFAULT_SLOT_BYTES;
             assert_eq!(ring, 134_217_728);
             assert_eq!(budget.pinned_host_bytes, 44_826_624);
             assert_eq!(budget.read_scratch_bytes, 268_435_456);
-            assert!(ring > budget.pinned_host_bytes, "Kimi currently falls back to mount");
+            assert!(ring > budget.pinned_host_bytes, "Kimi push must admit its ring independently");
             assert!(plan.validation.bytes() <= budget.read_scratch_bytes);
         }
         check_reports(&admission)?;
@@ -550,7 +550,7 @@ mod tests {
         assert_eq!(budget.pinned_host_bytes, 114_499_584);
         assert_eq!(budget.read_scratch_bytes, 268_435_456);
         assert!(cuteafd_ffi::push_ring::DEFAULT_SLOTS * cuteafd_ffi::push_ring::DEFAULT_SLOT_BYTES
-            > budget.pinned_host_bytes, "GLM K4 TP6 also falls back to mount");
+            > budget.pinned_host_bytes, "GLM K4 push must admit its ring independently");
         Ok(())
     }
 

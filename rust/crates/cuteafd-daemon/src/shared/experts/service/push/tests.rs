@@ -18,6 +18,43 @@ fn independent_ring_peak_rejects_short_memory_validation_and_overflow() -> Resul
     Ok(())
 }
 
+#[test]
+fn kimi_k2_and_glm_k4_tp6_admit_ring_independently_from_mount_staging() -> Result<()> {
+    use crate::shared::experts::layer::ExpertLayer;
+    use cuteafd_loader::plan::testing::{exl3, glm5_config, write_kimi_snapshot};
+    let kimi = tempfile::tempdir()?;
+    write_kimi_snapshot(kimi.path(), true);
+    let glm = tempfile::tempdir()?;
+    let tensors = (0..256).flat_map(|expert| [
+        ("gate_proj", 2048, 6144), ("up_proj", 2048, 6144), ("down_proj", 6144, 2048),
+    ].into_iter().flat_map(move |(projection, n, k)|
+        exl3(&format!("model.layers.1.mlp.experts.{expert}.{projection}"), n, k, 4))).collect::<Vec<_>>();
+    let mut config = glm5_config();
+    config["quantization_config"] = serde_json::json!({"quant_method": "exl3", "bits": 4.0,
+        "checkpoint_format": "exl3", "format": "exl3"});
+    write_snapshot(glm.path(), &config, &tensors, None);
+    for (snapshot, pinned) in [(kimi.path(), 44_826_624), (glm.path(), 114_499_584)] {
+        let catalog = cuteafd_loader::read_expert_catalog(snapshot)?;
+        for rank in 0..6 {
+            let budget = Exl3Weights::plan(&catalog, ExpertLayer::BackboneExl3Tp { layer: 1, rank, world: 6 })?;
+            // GLM's balanced TP6 has both 256- and 384-row ranks.
+            if rank == 0 { assert_eq!(budget.pinned_host_bytes, pinned); }
+            assert_eq!(budget.read_scratch_bytes, 268_435_456);
+            let ring = DEFAULT_SLOTS * DEFAULT_SLOT_BYTES;
+            assert_eq!(ring, 134_217_728);
+            assert!(ring > budget.pinned_host_bytes);
+            let plan = RankPlan::new(&catalog, &[1], 6, rank, budget.resident_bytes)?;
+            let headroom = usize::try_from(cuteafd_core::memory_layout::SPARK_RUNTIME_RESIDUAL_BYTES)?;
+            let peak = plan.layout.bytes() + ring + plan.validation.bytes() + headroom;
+            assert_eq!(admit_peak(plan.layout.bytes(), plan.validation.bytes(), budget.read_scratch_bytes,
+                headroom, peak)?, peak);
+            assert!(admit_peak(plan.layout.bytes(), plan.validation.bytes(), budget.read_scratch_bytes,
+                headroom, peak - 1).is_err());
+        }
+    }
+    Ok(())
+}
+
 fn installed_tp6_admission() -> Result<usize> {
     let snapshot = std::path::PathBuf::from(std::env::var_os("CUTEAFD_PUSH_EXL3")
         .context("set CUTEAFD_PUSH_EXL3 to the installed EXL3 snapshot")?);
