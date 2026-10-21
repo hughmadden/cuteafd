@@ -3,7 +3,7 @@
 #[path = "push_exlr8/tests.rs"]
 mod tests;
 use super::weight_arena::ArenaLayout;
-use anyhow::{ensure, Context, Result};
+use anyhow::{ensure, Result};
 use cuteafd_loader::{plan::exlr8::residency::{ExpertSet, Residency},
     push_load::{builder::{Builder, CheckedPlan, Destination}, PushClient, PushGroup}};
 use cuteafd_transport::worker_selection::push::{Offer, Placement};

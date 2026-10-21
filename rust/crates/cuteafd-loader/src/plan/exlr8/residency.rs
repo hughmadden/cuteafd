@@ -688,6 +688,7 @@ pub(crate) fn xxhash64(data: &[u8]) -> u64 {
 
 #[cfg(test)]
 mod tests {
+    use std::io::Write;
     use super::*;
     use serde_json::{Value, json};
 
