@@ -476,7 +476,9 @@ def test_matched_prefill_only_sweep_needs_no_decode_rounds(tmp_path):
             '2026-10-14T17:13:52.242369Z  INFO cuteafd::shared::probe: matched benchmark prompt engine="d" '
             'prompt_tokens=8192 prompt_token_hash="73b4ebf8f4958775"\n'
             '2026-10-14T17:13:53.242369Z  INFO cuteafd::shared::probe: benchmark output-dependent prompt engine="d" '
-            'prompt_tokens=439\n')
+            'prompt_tokens=439\n'
+            '2026-10-14T17:13:54.242369Z  INFO cuteafd::shared::probe: benchmark arm-local prompt engine="d" '
+            'prompt_tokens=1217\n')
         (state / 'reports' / entry['name']).mkdir(parents=True)
         (state / 'reports' / entry['name'] / 'sweep.json').write_text(json.dumps({'points': [], 'prefill': []}))
         return dict(card='c', arm='a', repeat=1, simulated=False, state=str(state), nonce_seed='s', entry=entry)
@@ -484,6 +486,7 @@ def test_matched_prefill_only_sweep_needs_no_decode_rounds(tmp_path):
     assert prefill['status'] == 'pass' and prefill['first_prompt_token_hash'] == '73b4ebf8f4958775'
     # The follow-up prompt is counted, not compared: it has no hash of its own.
     assert prefill['prompt_token_hashes'] == ['73b4ebf8f4958775'] and prefill['follow_up_prompts'] == 1
+    assert prefill['arm_local_prompts'] == 1
     decode = cards.summarize_job(job(dict(name='d', profile='panels:', levels=[1, 16], set={}, sparks=[])), 0)
     assert decode['status'] == 'failed' and 'per-request console rounds' in decode['error']
     # Fidelity-only runs (no baseline) score through the probe endpoint and decode nothing either.
@@ -515,6 +518,7 @@ def _matched_row(directory, arm, text):
     hashes = cards.prompt_token_hashes(text)
     directory.mkdir(parents=True, exist_ok=True)
     return dict(card='c', arm=arm, repeat=1, nonce_seed='seed', follow_up_prompts=cards.follow_up_prompts(text),
+                arm_local_prompts=cards.arm_local_prompts(text),
                 first_prompt_token_hash=hashes[0], prompt_token_hashes=sorted(hashes), state=str(directory), status='pass')
 
 
@@ -530,6 +534,21 @@ def test_matched_pair_ignores_the_follow_up_prompt_and_still_gates_the_rest(tmp_
     assert all(row['status'] == 'pass' for row in rows)
     # One differing input-determined prompt still fails the pair.
     logs['candidate'] = _coordinator_log(prompts[:2] + [(1217, '4444444444444444')], 420)
+    rows = [_matched_row(tmp_path / 'mismatch' / arm, arm, text) for arm, text in logs.items()]
+    cards.validate_matched_pairs(rows, ['base', 'candidate'])
+    assert all(row['status'] == 'failed' for row in rows)
+    assert all((Path(row['state']) / 'exit').read_text() == '81\n' for row in rows)
+
+
+def test_matched_pair_ignores_extra_arm_local_prompts_and_still_gates_shared_prompts(tmp_path):
+    prompts = [(48, '1111111111111111'), (437, '2222222222222222')]
+    local = 'benchmark arm-local prompt engine="test" prompt_tokens=1217\n' * 20
+    logs = {'base': _coordinator_log(prompts, 439), 'candidate': _coordinator_log(prompts, 439) + local}
+    rows = [_matched_row(tmp_path / 'match' / arm, arm, text) for arm, text in logs.items()]
+    assert [row['arm_local_prompts'] for row in rows] == [0, 20]
+    cards.validate_matched_pairs(rows, ['base', 'candidate'])
+    assert all(row['status'] == 'pass' for row in rows)
+    logs['candidate'] = _coordinator_log(prompts[:1] + [(437, '3333333333333333')], 439) + local
     rows = [_matched_row(tmp_path / 'mismatch' / arm, arm, text) for arm, text in logs.items()]
     cards.validate_matched_pairs(rows, ['base', 'candidate'])
     assert all(row['status'] == 'failed' for row in rows)
