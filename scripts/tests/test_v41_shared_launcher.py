@@ -18,7 +18,7 @@ import sys
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from v41_launch_capture import CASES, FIXTURES, KIT_CARDS, ROOT, capture, parse_run  # noqa: E402
+from v41_launch_capture import CASES, FIXTURES, KIT_CARDS, ROOT, capture, parse_run, namespace_launch_contract  # noqa: E402
 
 # Environment the shared launcher adds, by role, at its default values. Each
 # comes from a shared helper in scripts/launch/run-family.sh:
@@ -76,7 +76,7 @@ def test_shared_launcher_matches_the_private_v41_path(case: str, tmp_root) -> No
     current = capture(ROOT, case)
     assert [c["host"] for c in current["containers"]] == [c["host"] for c in golden["containers"]]
     for old, new in zip(golden["containers"], current["containers"]):
-        before, after = parse_run(old["argv"]), parse_run(new["argv"])
+        before, after = namespace_launch_contract(parse_run(old["argv"])), parse_run(new["argv"])
         role = "coordinator" if old["host"] == "raptor" else "worker"
         where = f"{case} {old['host']}"
         expected_options = []
@@ -133,6 +133,8 @@ def test_shared_launcher_matches_the_private_v41_path(case: str, tmp_root) -> No
         expected[expected.index("--rtx"):expected.index("--rtx")] = additions
         index = expected.index("--available-sparks") + 2
         expected[index:index] = ["--mapped-scale-preload-gib", "0"]
+        expected = [value.replace("/hf/hub/", "<root>/hf/hub/").replace("HF_HOME=/hf", "HF_HOME=/mnt/sparknest/hf-home") for value in expected]
+        expected = ["/mnt/sparknest:/mnt/sparknest:ro" if value.endswith(":/hf/hub:ro") else value for value in expected]
         expected_plans.append(expected)
     assert current["plans"] == expected_plans, case
 
@@ -198,18 +200,14 @@ def test_shared_features_reach_v41_with_no_v41_code(tmp_root, monkeypatch) -> No
         assert worker["CUTEAFD_PROFILE_HOST"] == container["host"]
 
 
-def test_serving_containers_run_as_the_host_user_with_the_hub_at_hf() -> None:
-    """#108 and #111: every V4.1 serving container and planner run as the host user
-    with HF_HOME=/hf and the hub at /hf/hub, so binaries that resolve snapshots
-    under HF_HOME (pre-#108 seals included) find drafters and checkpoints."""
-    for case in CASES:
-        golden = json.loads((FIXTURES / f"{case}.json").read_text())
-        for container in golden["containers"]:
-            run = parse_run(container["argv"])
-            assert any(option.startswith("--user ") for option in run["options"]), case
-            assert run["env"]["HF_HOME"] == "/hf", case
-            assert any(mount.endswith(":/hf/hub:ro") for mount in run["mounts"]), case
-            assert not any("/root/" in mount for mount in run["mounts"]), case
+def test_serving_containers_keep_namespace_paths_and_host_identity() -> None:
+    for container in capture(ROOT, CASES[0])["containers"]:
+        run = parse_run(container["argv"])
+        assert any(option.startswith("--user ") for option in run["options"])
+        assert run["env"]["HF_HOME"] == "/mnt/sparknest/hf-home"
+        assert "/mnt/sparknest:/mnt/sparknest:ro" in run["mounts"]
+        assert not any(":/hf" in mount for mount in run["mounts"])
+        assert run["command"][run["command"].index("--snapshot") + 1].startswith("<root>/hf/hub/")
 
 
 @pytest.mark.parametrize("value", [None, "off", "draft", "all"])

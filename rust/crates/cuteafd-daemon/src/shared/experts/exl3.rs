@@ -53,9 +53,14 @@ pub(crate) fn aot_layout_directory(
 
 pub(crate) struct Exl3Weights<'a> {
     buffers: Vec<WeightBuffer>,
-    _arena: DeviceAllocation<'a>,
+    _arena: ArenaOwner<'a>,
     pub(crate) layout: V41Exl3Residency,
     pub(crate) budget: ExpertLoadBudget,
+}
+
+enum ArenaOwner<'a> {
+    Mount(DeviceAllocation<'a>),
+    Push { _rank: std::rc::Rc<crate::shared::memory::weight_arena::ReadyArena<'a>> },
 }
 
 struct WeightBuffer { buffer: CuteafdDeviceBuffer }
@@ -131,7 +136,30 @@ fn budget(catalog: &OfficialV41Catalog, plan: &V41Exl3Residency) -> Result<Exper
 }
 
 impl<'a> Exl3Weights<'a> {
-    pub(crate) fn resident_bytes(&self) -> usize { self._arena.buffer.bytes }
+    pub(crate) fn resident_bytes(&self) -> usize {
+        match &self._arena {
+            ArenaOwner::Mount(arena) => arena.buffer.bytes,
+            ArenaOwner::Push { .. } => self.budget.resident_bytes,
+        }
+    }
+
+    pub(crate) fn from_push(
+        rank: std::rc::Rc<crate::shared::memory::weight_arena::ReadyArena<'a>>,
+        region: usize, layout: V41Exl3Residency, mut budget: ExpertLoadBudget,
+    ) -> Result<Self> {
+        let owner = rank.region(region)?;
+        let (offsets, bytes) = layout.device_arena_layout()?;
+        ensure!(bytes == budget.resident_bytes && owner.buffer().bytes == bytes,
+            "pushed EXL3 region differs from admission");
+        let buffers = layout.buffers.iter().zip(offsets).map(|(spec, offset)| {
+            Ok(WeightBuffer { buffer: owner.subregion(offset, spec.bytes.max(16))?.buffer() })
+        }).collect::<Result<Vec<_>>>()?;
+        // The push ring and validation image are gone before execution inventory.
+        budget.device_staging_bytes = 0;
+        budget.pinned_host_bytes = 0;
+        budget.read_scratch_bytes = 0;
+        Ok(Self { buffers, _arena: ArenaOwner::Push { _rank: rank }, layout, budget })
+    }
 
     pub(crate) fn plan(
         catalog: &OfficialV41Catalog,
@@ -189,7 +217,7 @@ impl<'a> Exl3Weights<'a> {
                         buffer.bytes = spec.bytes.max(16);
                         WeightBuffer { buffer }
                     }).collect();
-                    weights[rank].push(Self { buffers, _arena: arena, layout: plan, budget });
+                    weights[rank].push(Self { buffers, _arena: ArenaOwner::Mount(arena), layout: plan, budget });
                     Ok(())
                 })?;
             }
@@ -436,7 +464,7 @@ impl<'a> Exl3Weights<'a> {
             "EXL3 expert load timeline");
         Ok(Self {
             buffers,
-            _arena: arena,
+            _arena: ArenaOwner::Mount(arena),
             layout,
             budget,
         })

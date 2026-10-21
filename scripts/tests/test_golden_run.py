@@ -273,7 +273,8 @@ def test_env_per_arm_and_container_mounts(env, monkeypatch):
                 and call[i + 1].startswith('nvidia.com/gpu=')] == ['nvidia.com/gpu=0', 'nvidia.com/gpu=1']
         assert call[call.index('--ipc') + 1] == 'host' and 'memlock=-1:-1' in call
         mounts = [call[i + 1] for i, a in enumerate(call) if a == '-v']
-        assert f"{env['tmp']}/hub:/hf/hub:ro" in mounts
+        assert "/mnt/sparknest:/mnt/sparknest:ro" in mounts
+        assert f"{env['tmp'] / 'hub'}:{env['tmp'] / 'hub'}:ro" in mounts
         assert any(m.endswith(':/opt/cuteafd/lib/libcuteafd_native.so:ro') for m in mounts)
         assert any(m.endswith(':/opt/cuteafd/share:ro') for m in mounts)
         assert any(m.endswith(f'/gr/golden/{mode}/r1:/out') for m in mounts)
@@ -282,7 +283,7 @@ def test_env_per_arm_and_container_mounts(env, monkeypatch):
         assert (tail[-2:] == ['--trace', '/out/t']) == (mode == 'heads')
         if mode == 'heads':
             tail = tail[:-2]
-        assert tail[-8:] == ['glm-golden', '--snapshot', '/hf/hub/models--org--model/snapshots/rev1', '--device', '0',
+        assert tail[-8:] == ['glm-golden', '--snapshot', str(env['tmp'] / 'hub/models--org--model/snapshots/rev1'), '--device', '0',
                              '--split-device', '1', '--skip-routed-experts', '--nll'][-8:]
     out = env['home'] / '.cache/cuteafd/builds/gr/golden'
     record = json.loads((out / 'heads/r1/argv.json').read_text())
@@ -393,7 +394,7 @@ def test_compare_tool_on_synthetic_logits(tmp_path):
 
 def test_resolve_model_uses_hub_paths(env):
     host, container, extra = golden.resolve_model('org/model')
-    assert container == '/hf/hub/models--org--model/snapshots/rev1' and not extra
+    assert container == str(host) and extra == [str(host)]
     assert golden.vocab_size(host) == 8
 
 
@@ -565,7 +566,7 @@ def test_real_experts_start_before_and_stop_before_locks_release(spark_env, monk
     run_env = json.loads((env['tmp'] / 'run-env.json').read_text())
     assert run_env['CUTEAFD_GOLDEN_PEERS'] == '10.9.0.1:19451,10.9.0.2:19451,10.9.0.3:19451,10.9.0.4:19451'
     assert run_env['CUTEAFD_GOLDEN_SPARK_WORLD'] == '4' and run_env['CUTEAFD_GOLDEN_EXPERT_LAYERS'] == '3'
-    assert run_env['CUTEAFD_GOLDEN_SNAPSHOT'] == '/hf/hub/models--org--model/snapshots/rev1'
+    assert run_env['CUTEAFD_GOLDEN_SNAPSHOT'] == str(env['tmp'] / 'hub/models--org--model/snapshots/rev1')
     assert run_env['CUTEAFD_PROGRAM_MANIFEST'] == '/opt/cuteafd/share/PROGRAMS.json'
     assert run_env['CUTEAFD_GOLDEN_SPARK_PACKAGES'] == '/opt/cuteafd/spark'
     assert run_env['CUTEAFD_SPARK_ADMISSION_TIMEOUT_SECONDS'] == '2400'
@@ -720,8 +721,8 @@ def test_fixture_generation_command_mode(env, monkeypatch):
     assert call[-5:] == ['python3', '-m', 'pytest', '-q', 'python/tests/test_step5_chain_fixture.py']
     run_env = json.loads((env['tmp'] / 'run-env.json').read_text())
     assert run_env['CUTEAFD_STEP5_CHAIN_FIXTURE_DIR'] == str(fixtures) == run_env['CUTEAFD_GOLDEN_FIXTURES']
-    assert run_env['STEP5_QUANT_SNAPSHOT'] == '/hf/hub/models--org--model/snapshots/rev1'
-    assert run_env['STEP5_REFERENCE_SNAPSHOT'] == '/hf/hub/models--x/snapshots/r'
+    assert run_env['STEP5_QUANT_SNAPSHOT'] == str(env['tmp'] / 'hub/models--org--model/snapshots/rev1')
+    assert run_env['STEP5_REFERENCE_SNAPSHOT'] == str(env['tmp'] / 'hub/models--x/snapshots/r')
     assert run_env['PYTHONDONTWRITEBYTECODE'] == '1' and '/workspace/cuteafd/python/reference' in run_env['PYTHONPATH']
     assert 'CUTEAFD_GOLDEN_PEERS' not in run_env
 
@@ -784,3 +785,17 @@ def test_spark_port_checked_only_at_grant():
     assert "if at_grant else '-'" in source
     assert "if port!='-':" in golden.REMOTE_CHECK
     assert inspect.signature(golden.preflight).parameters['at_grant'].default is True
+
+
+def test_namespace_root_keeps_mount_loading_paths_identical(env, monkeypatch):
+    root = env['tmp'] / 'namespace'
+    snapshot = root / 'hf-home/hub/models--org--model/snapshots/rev1'
+    snapshot.mkdir(parents=True)
+    (snapshot / 'config.json').write_text('{"vocab_size": 8}')
+    monkeypatch.setenv('CUTEAFD_NAMESPACE_ROOT', str(root))
+    monkeypatch.setenv('CUTEAFD_HF_HUB', str(root / 'hf-home/hub'))
+    host, container, extra = golden.resolve_model(str(snapshot))
+    assert str(host) == container == str(snapshot)
+    assert not extra
+    assert (Path(container) / 'config.json').read_bytes() == (host / 'config.json').read_bytes()
+    assert golden.hub_root() == root / 'hf-home/hub'
