@@ -5,8 +5,10 @@ use sha2::{Digest, Sha256};
 use std::{collections::BTreeMap, io::{BufRead, BufReader, Read, Write}, net::{SocketAddr, TcpStream},
     path::Path, sync::{Mutex, OnceLock}, time::Duration};
 
+pub mod push;
+
 const CONTROL_LIMIT: usize = 64 * 1024;
-const VERSION: u32 = 3;
+const VERSION: u32 = 4;
 
 fn check_version(actual: u64, expected: u32) -> Result<()> {
     ensure!(actual == u64::from(expected),
@@ -60,6 +62,7 @@ pub struct WorkerSelection {
     identity: WorkerIdentity,
     ranges: Vec<LayerRange>,
     model: Option<ModelAdmission>,
+    push_weights: bool,
 }
 
 /// The same immutable placement seal also fixes every persistent endpoint.
@@ -133,7 +136,7 @@ impl WorkerSelection {
             if let Some(range) = ranges.last_mut().filter(|range| range.end == layer) { range.end = layer.checked_add(1).context("worker layer overflow")?; }
             else { ranges.push(LayerRange { first: layer, end: layer.checked_add(1).context("worker layer overflow")? }); }
         }
-        let selection = Self { version: VERSION, identity, ranges, model: None };
+        let selection = Self { version: VERSION, identity, ranges, model: None, push_weights: false };
         selection.validate()?;
         Ok(selection)
     }
@@ -145,6 +148,8 @@ impl WorkerSelection {
     }
     pub fn identity(&self) -> &WorkerIdentity { &self.identity }
     pub fn model(&self) -> Option<&ModelAdmission> { self.model.as_ref() }
+    pub fn push_weights(&self) -> bool { self.push_weights }
+    pub fn with_push_weights(mut self) -> Self { self.push_weights = true; self }
     pub fn with_model(mut self, model: ModelAdmission) -> Result<Self> {
         self.model = Some(model);
         self.validate()?;
@@ -683,6 +688,19 @@ pub fn start_model_admission(peers: &[SocketAddr], selection: &WorkerSelection,
 }
 
 impl PendingModelAdmission {
+    /// Cancellation handles belong to the admission owner, never a detached
+    /// startup thread. Shutting them down wakes every bounded control read.
+    pub fn cancellation_streams(&self) -> Result<Vec<TcpStream>> {
+        self.streams.iter().map(|stream| stream.try_clone().map_err(Into::into)).collect()
+    }
+
+    /// Drive optional weight startup without publishing any model admission seal.
+    pub fn push_weights(&mut self,
+        prepare: impl FnOnce(&[push::Offer]) -> Result<cuteafd_loader::push_load::PushGroup>) -> Result<()> {
+        ensure!(self.selection.push_weights(), "push rendezvous was not admitted");
+        push::coordinate(&mut self.streams, prepare)
+    }
+
     /// Await rank-ordered measurements and seal validated replies before links open.
     pub fn wait(self) -> Result<Vec<cuteafd_core::ModelAdmissionResponse>> {
         let Self { peers, selection, streams } = self;
@@ -910,7 +928,7 @@ mod tests {
             write(&mut client, &serde_json::json!({"message":message,
                 "selection":{"version":1,"identity":{"legacy":true}}}))?;
             let error = read::<serde_json::Value>(&server).unwrap_err().to_string();
-            assert!(error.contains("version 1; expected 3"), "{error}");
+            assert!(error.contains("version 1; expected 4"), "{error}");
         }
         let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
         let mut client = TcpStream::connect(listener.local_addr()?)?;
@@ -918,9 +936,9 @@ mod tests {
         write(&mut client, &serde_json::json!({"message":"worker_selection_start",
             "selection":{"version":1}}))?;
         let error = receive_worker_selection(&server, 0, Duration::from_secs(3)).unwrap_err();
-        assert!(error.to_string().contains("version 1; expected 3"));
+        assert!(error.to_string().contains("version 1; expected 4"));
         let rejection = read::<serde_json::Value>(&client).unwrap_err();
-        assert!(rejection.to_string().contains("version 1; expected 3"));
+        assert!(rejection.to_string().contains("version 1; expected 4"));
         let envelope = serde_json::to_value(admission_selection())?;
         assert!(envelope["identity"].get("manifest").is_none());
         assert_eq!(envelope["version"], VERSION);

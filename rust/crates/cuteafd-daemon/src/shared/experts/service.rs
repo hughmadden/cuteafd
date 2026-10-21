@@ -5,6 +5,7 @@ mod census;
 mod modules;
 mod routes;
 mod exlr8;
+mod push;
 
 use crate::shared::experts::execution::HostExpertExchange;
 use crate::shared::experts::layer::{ExpertLayer, ExpertWeights};
@@ -125,6 +126,7 @@ fn load_weights<'a>(
     catalog: &OfficialV41Catalog,
     config: &NativeExpertServiceConfig,
     modules: &mut modules::WarmModules<'a>,
+    push: Option<&mut std::net::TcpStream>,
 ) -> Result<(backend::Weights<'a>, usize)> {
     let layers = config.resident_layers(catalog.routed_experts().layers)?;
     let first = catalog.routed_experts().first_layer;
@@ -136,7 +138,7 @@ fn load_weights<'a>(
     if catalog.format() == cuteafd_loader::plan::checkpoint::CheckpointFormat::Exlr8 {
         return exlr8::load(library, catalog, config, modules.exlr8()?);
     }
-    if catalog.exl3().is_some() { return backend::load_exl3(library, catalog, config); }
+    if catalog.exl3().is_some() { return backend::load_exl3(library, catalog, config, push); }
     if catalog.fp8().is_some() { return backend::load_fp8(library, catalog, config, modules.take_fp8()?); }
     log_spark_memory_if_enabled(library, config, "worker startup", None, None);
     // NVFP4 backbone experts load through the format-aware ExpertWeights path.

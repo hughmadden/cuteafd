@@ -36,14 +36,16 @@ from wip_aot_scopes import family_scopes
 PROFILER_REPORTS = {'nsys': '.nsys-rep', 'ncu': '.ncu-rep'}
 NSYS_SESSION = 'cuteafd-profile'  # RELEASE_NSYS_SESSION in scripts/lib/release-common.sh
 HOSTS = ('ostrich', 'dodo', 'emu', 'kiwi', 'rhea', 'moa')
-# Out-of-pool build seeds: compile, export and seal Spark slots, never serve.
-# kakapo has no RoCE (10 GbE only): its staging lanes are its LAN address and
-# wip.sh moves its sealed slots through sparknest.
-SEED_HOSTS = ('kakapo',)
-SEEDS = ('rhea', 'moa', *SEED_HOSTS)
-# kakapo passed its gate 2026-10-13 (mimo26-flash-max: cold build sealed, distributed
-# through sparknest, served at C1 with 0 errors); it isolates seed CPU load from serving.
-DEFAULT_SEED = 'kakapo'
+# LAN-only build seeds: compile, export and seal Spark slots, never serve. They have
+# no RoCE (10 GbE only): their staging lanes are their LAN address and wip.sh moves
+# their sealed slots through sparknest. Keep in sync with release_lan_seed_hosts
+# (scripts/lib/release-common.sh). kakapo passed its gate 2026-10-13 (cold build
+# sealed, distributed through sparknest, served at C1 with 0 errors).
+SEED_HOSTS = ('kakapo', 'cassowary')
+SEEDS = ('auto', 'rhea', 'moa', *SEED_HOSTS)
+# 'auto': wip.sh picks the less-loaded LAN-only seed, then rhea/moa. A named seed
+# is a placement request (wip.sh --seed).
+DEFAULT_SEED = 'auto'
 CORRECTNESS = {'sim-5090', 'fidelity', 'cache', 'image', 'no-fit', 'packed-check'}
 NAME = re.compile(r'[A-Za-z0-9][A-Za-z0-9_.-]*\Z')
 ANSI = re.compile(r'\x1b\[[0-9;]*m')
@@ -1545,12 +1547,39 @@ def staging_hosts(union, seed, separate):
     return hosts if len(hosts) in (2, 3, 4, 6) else hosts + spare[:6 - len(hosts)]
 
 
+def lan_seeds_known(revision):
+    """The LAN-only seeds `revision`'s tooling knows: its release_lan_seed_hosts, or
+    kakapo alone before that set existed (such a wip.sh neither balances nor
+    detects cassowary's down RoCE ports)."""
+    shown = subprocess.run(['git', '-C', str(REPO), 'show', revision + ':scripts/lib/release-common.sh'],
+                           capture_output=True, text=True, timeout=120)
+    found = re.search(r'^release_lan_seed_hosts=\(([^)]*)\)', shown.stdout, re.M) if shown.returncode == 0 else None
+    return tuple(found[1].split()) if found else ('kakapo',)
+
+
+def resolve_seed(seed, revision, separate):
+    """(seed wip.sh starts from, whether it is a placement request, hosts it may build
+    on). 'auto' starts from kakapo and lets wip.sh balance over the LAN-only seeds
+    this revision knows, then fall back to rhea/moa; a named seed is passed as
+    `--seed`, a placement request."""
+    known = lan_seeds_known(revision)
+    if seed == 'auto':
+        return 'kakapo', False, (*known, 'rhea', 'moa') if separate else ('kakapo',)
+    if seed in SEED_HOSTS and seed not in known:
+        raise ValueError(f'{revision} predates the LAN-only seed {seed}; use --seed auto, '
+                         f'{", ".join(known)}, rhea or moa for this arm')
+    return seed, True, (seed,)
+
+
 def seed_env(arm, seed, dry):
     """wip.sh's seed parameters for a Spark build: WIP_SEED_HOST, plus the bulk
-    transfer address of a seed off the RoCE fabric. Legacy wip.sh reads neither."""
+    transfer address of a named seed off the RoCE fabric (an automatic one is
+    resolved by wip.sh after it balances). Legacy wip.sh reads neither."""
     if not arm.get('seed_separate') or arm.get('build_role') != 'both':
         return {}
-    return dict(WIP_SEED_HOST=seed, **({} if seed in HOSTS else {'WIP_SEED_ADDR': seed_lanes(seed, dry)[0]}))
+    if seed in HOSTS or not arm.get('seed_explicit', True):
+        return dict(WIP_SEED_HOST=seed)
+    return dict(WIP_SEED_HOST=seed, WIP_SEED_ADDR=seed_lanes(seed, dry)[0])
 
 
 def seed_lanes(seed, dry):
@@ -1644,6 +1673,10 @@ def build_arms(builds, arms, cards, state, task, dry, seed=DEFAULT_SEED):
         # unless this revision's wip.sh predates it.
         union = {h for card in cards for h in card.get('sparks', [])}
         arm['seed_separate'] = seed_option_capable(revision)
+        requested = seed
+        seed, arm['seed_explicit'], seed_candidates = resolve_seed(requested, revision, arm['seed_separate'])
+        if build_role == 'both' and arm['seed_separate'] and arm['seed_explicit']:
+            build_cmd += ['--seed', seed]
         # A coordinator-only slot stages to no Spark: SPARK_COUNT=0, no ranks named.
         hosts = staging_hosts(union, seed, arm['seed_separate']) if build_role == 'both' else []
         if build_role == 'both' and len(hosts) > 6:
@@ -1651,8 +1684,9 @@ def build_arms(builds, arms, cards, state, task, dry, seed=DEFAULT_SEED):
                              f'{seed} plus the {len(union)}-Spark union makes {len(hosts)} ranks; use --seed rhea|moa '
                              'for this arm or build a revision with the separate seed (#117)')
         if build_role == 'both':
-            print(f"# build seed {name}: {seed} ({'WIP_SEED_HOST' if arm['seed_separate'] else 'legacy SPARK_0_HOST'}); "
-                  f"Spark targets ({len(hosts)}): {','.join(hosts)}")
+            via = ('--seed' if arm['seed_explicit'] else 'WIP_SEED_HOST') if arm['seed_separate'] else 'legacy SPARK_0_HOST'
+            shown = f"auto: {seed} or least loaded of {','.join(seed_candidates)}" if requested == 'auto' and arm['seed_separate'] else seed
+            print(f"# build seed {name}: {shown} ({via}); Spark targets ({len(hosts)}): {','.join(hosts)}")
         build_config = state / ('build-' + name + '.config')
         # A staging config: the first card's model and its --set/--arm-set
         # overrides, the union of Spark hosts, and no serving topology. Export
@@ -1711,10 +1745,17 @@ def build_arms(builds, arms, cards, state, task, dry, seed=DEFAULT_SEED):
                         # A fair turn (hwlock), so a seed wait never overtakes an older queued job.
                         subprocess.run([sys.executable, str(REPO / 'scripts/hw/hwlock.py'), '--locks', seed,
                                         '--wait', str(seed_wait), '--', 'true'], check=True, timeout=seed_wait + 60)
-                    for host in (('raptor', *HOSTS, *([seed] if seed not in HOSTS else [])) if build_role == 'both' else ('raptor',)):
+                    seed_hosts = [h for h in seed_candidates if h not in HOSTS]
+                    for host in (('raptor', *HOSTS, *seed_hosts) if build_role == 'both' else ('raptor',)):
                         marker = owner_marker_script(root, task, arm['instance'], arm['slot'], revision)
                         mark = ['python3', '-c', marker]
-                        run(mark if host == 'raptor' else ['ssh', '-o', 'BatchMode=yes', host, shlex.join(mark)])
+                        try:
+                            run(mark if host == 'raptor' else ['ssh', '-o', 'BatchMode=yes', host, shlex.join(mark)])
+                        except subprocess.CalledProcessError as error:
+                            # An unreachable automatic seed is skipped by wip.sh too; anything else stops.
+                            if arm['seed_explicit'] or host not in seed_hosts or error.returncode != 255:
+                                raise
+                            print(f'# build seed {host} unreachable; wip.sh will not choose it')
                     env = {**os.environ, **scopes, 'WIP_INSTANCE': arm['instance'], 'WIP_ROOT': str(root)}
                     env.pop('WIP_SEED_HOST', None)
                     env.pop('WIP_SEED_ADDR', None)
@@ -1788,8 +1829,9 @@ def main():
     parser.add_argument('--build', action='append', default=[], metavar='ARM=REV')
     parser.add_argument('--build-only', action='store_true', help='build and seal selected arms without generating or launching smoke jobs')
     parser.add_argument('--seed', '--seed-host', dest='seed_host', default=DEFAULT_SEED, choices=SEEDS,
-                        help=f'out-of-serving Spark that compiles and seals --build arms (default {DEFAULT_SEED}); '
-                        'kakapo is a 10 GbE build-only seed whose slots reach the serving Sparks through sparknest')
+                        help=f'out-of-serving Spark that compiles and seals --build arms (default {DEFAULT_SEED}: the '
+                        'less-loaded LAN-only seed, kakapo or cassowary, then rhea/moa). The LAN-only seeds are 10 GbE '
+                        'build-only hosts whose slots reach the serving Sparks through sparknest; a named seed is a placement request')
     parser.add_argument('--cleanup', action='store_true')
     parser.add_argument('--dry-run', action='store_true')
     parser.add_argument('--observe', type=Path, help=argparse.SUPPRESS)

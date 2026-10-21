@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from v41_launch_capture import ROOT, capture, parse_run
+from v41_launch_capture import ROOT, capture, parse_run, namespace_launch_contract
 
 MATRIX = json.loads((ROOT / "scripts/bench/release-smoke.example.json").read_text())
 ENTRIES = MATRIX["entries"]
@@ -31,7 +31,7 @@ def test_deployment_preserves_release_container_commands(entry: dict) -> None:
     current = capture(ROOT, entry["name"], release_entry=release_entry(entry))
     assert [run["host"] for run in current["containers"]] == [run["host"] for run in golden]
     for old, new in zip(golden, current["containers"]):
-        before, after = parse_run(old["argv"]), parse_run(new["argv"])
+        before, after = namespace_launch_contract(parse_run(old["argv"])), parse_run(new["argv"])
         if old["host"] == "coordinator":
             # capture() bounds readiness to 30s; admission now shares that deadline.
             before["env"]["CUTEAFD_SPARK_ADMISSION_TIMEOUT_SECONDS"] = "30"
@@ -97,7 +97,7 @@ def test_exlr8_forwards_native_selection_without_dense_worker_flags(manifest: st
     plan = result["plans"][0]
     assert plan[plan.index("--exlr8-manifest") + 1] == manifest
     dense = plan[plan.index("--exlr8-dense-from") + 1]
-    assert dense.startswith("/hf/hub/models--deepseek-ai--DeepSeek-V4.1-Flash/snapshots/")
+    assert dense.startswith("<root>/hf/hub/models--deepseek-ai--DeepSeek-V4.1-Flash/snapshots/")
     assert "CUTEAFD_GLM_PREFILL_LANES=3" in plan
     assert len(result["containers"]) == 5
     for run in result["containers"]:

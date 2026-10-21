@@ -6,7 +6,7 @@ use super::{
 use crate::{
     client::Client,
     report::{Capacity, ServerInfo},
-    text::{filler, nonce},
+    text::{corpus, nonce},
 };
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -63,7 +63,7 @@ pub fn parse_levels_arg(text: &str) -> Result<String, String> {
 }
 
 fn base(run: &str, length: u64, words: usize) -> Value {
-    json!([{"role": "system", "content": format!("[{run}-{length}] You are a helpful assistant. Reference notes:\n{}", filler(4242, words))},
+    json!([{"role": "system", "content": format!("[{run}-{length}] You are a helpful assistant. Reference notes:\n{}", corpus(4242, words))},
         {"role": "user", "content": "Read the reference notes. Reply with the single word OK."}])
 }
 pub(crate) fn body(configuration: &crate::report::Configuration, messages: Value, output: u64) -> Value {
@@ -222,15 +222,15 @@ impl Panel for ContextLoad {
         let run = nonce();
         let mut points = Vec::new();
         let mut bases = Vec::new();
-        // As in the cold-prefill sweep, two short requests calibrate filler
-        // token density before the one long base is built.
+        // As in the cold-prefill sweep, two short requests calibrate corpus
+        // reference-token density before the one long base is built.
         let a = ctx.client.chat(body(&ctx.info.configuration, base(&run, 300, 300), 1), None)?;
         let b = ctx.client.chat(body(&ctx.info.configuration, base(&run, 900, 900), 1), None)?;
         let slope = (b.timing.prompt_tokens as f64 - a.timing.prompt_tokens as f64) / 600.0;
         let slope = if slope.is_finite() && slope > 0.3 {
             slope
         } else {
-            1.33
+            1.0
         };
         let intercept = a.timing.prompt_tokens as f64 - slope * 300.0;
         let mut lengths = Vec::new();

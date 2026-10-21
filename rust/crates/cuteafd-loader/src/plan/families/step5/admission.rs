@@ -305,11 +305,50 @@ pub fn admit(checkpoint: &Checkpoint, inputs: &RuntimeInputs) -> Result<Admissio
     })
 }
 
+/// Offline forecast uses the same allocation recipe as opt-in native MTP.
+/// Numerical and live-state qualification are separate from capacity admission.
+pub fn forecast_mtp(checkpoint: &Checkpoint, inputs: &RuntimeInputs, depth: usize) -> Result<Admission> {
+    admit_mtp(checkpoint, inputs, depth)
+}
+
+/// Includes native stage weights, private workspace, independent histories and
+/// the actual host-aware staging mark count before any live allocation.
+pub fn admit_mtp(checkpoint: &Checkpoint, inputs: &RuntimeInputs, depth: usize) -> Result<Admission> {
+    if depth == 0 { return admit(checkpoint, inputs); }
+    let cfg = Config::parse(checkpoint)?;
+    ensure!((1..=cfg.mtp).contains(&depth) && inputs.rows > depth,
+        "Step-5 predictor depth must fit checkpoint and row capacity");
+    let weights = super::coordinator::RankWeightLayout::for_mtp(checkpoint, depth)?.resident_bytes;
+    let workspace = super::native::mtp_forecast_workspace(inputs.rows, depth)?;
+    admit_depth_with(&cfg, inputs, depth, |ownership| {
+        (0..ownership.ranks()).map(|rank| {
+            let mut native = super::native::rank_admission(checkpoint, ownership, rank, inputs.rows)?;
+            if rank == usize::from(ownership.execution().spec().head_gpu) {
+                native.immutable = native.immutable.checked_add(weights)
+                    .context("Step-5 predictor weight forecast overflow")?;
+                native.workspace = native.workspace.max(workspace);
+            }
+            Ok(native)
+        }).collect()
+    })
+}
+
 pub fn admit_with(
     cfg: &Config,
     inputs: &RuntimeInputs,
     native: impl FnOnce(&ExecutionOwnership) -> Result<Vec<RankAdmission>>,
 ) -> Result<Admission> {
+    admit_depth_with(cfg, inputs, 0, native)
+}
+
+/// The caller includes every predictor's private immutable/workspace owner.
+fn admit_depth_with(
+    cfg: &Config,
+    inputs: &RuntimeInputs,
+    depth: usize,
+    native: impl FnOnce(&ExecutionOwnership) -> Result<Vec<RankAdmission>>,
+) -> Result<Admission> {
+    ensure!(depth <= cfg.mtp, "Step-5 forecast predictor depth exceeds checkpoint");
     inputs.validate(cfg)?;
     let ownership = inputs.ownership(cfg)?;
     let ranks = ownership.ranks();
@@ -338,7 +377,7 @@ pub fn admit_with(
         (initial, inputs.context.min(initial)),
         |tokens, &context| {
             let cache =
-                Step5CacheLayout::for_execution(cfg, &ownership, context, 0, inputs.rows as u64)?;
+                Step5CacheLayout::for_execution(cfg, &ownership, context, depth, inputs.rows as u64)?;
             let mark_bytes = usize::try_from(checked_sum(cache.ranks.iter().map(|r| r.bytes))?)?;
             let marks = inputs.marks.slots(mark_bytes);
             let mut fixed = Vec::new();

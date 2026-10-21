@@ -54,7 +54,7 @@ def _flag(line: str, flag: str) -> str | None:
 def test_kimi_dispatches_to_serve_kimi_with_its_own_defaults(tmp_path: Path) -> None:
     result = _kimi(tmp_path)
     serve = _line(result, "cuteafd serve-kimi --snapshot")
-    assert "/hf/hub/models--wrldsuksgo2mars--Kimi-K3-EXL3-K2/snapshots/abc" in serve
+    assert str(tmp_path / "hf/hub/models--wrldsuksgo2mars--Kimi-K3-EXL3-K2/snapshots/abc") in serve
     assert _flag(serve, "--peers") == ",".join(f"10.0.0.{i + 1}:19441" for i in range(6))
     assert (_flag(serve, "--device"), _flag(serve, "--split-device")) == ("0", "1")
     assert _flag(serve, "--max-sequences") == "16"
@@ -267,7 +267,7 @@ def _hosts(count: int) -> str:
 
 
 def _step5(tmp_path: Path, keys: str, *, wip: bool = True, model: str = STEP5_FP8, **kwargs):
-    return _family_launch_result(tmp_path, STEP5, model, "SPECULATOR=off\n" + keys,
+    return _family_launch_result(tmp_path, STEP5, model, keys,
                                  extra_args=("--wip", "s5") if wip else (),
                                  encoder_plan=kwargs.pop("encoder_plan", STEP5_PLANNED), **kwargs)
 
@@ -279,10 +279,11 @@ def test_step5_dispatches_to_serve_step5(tmp_path: Path, model: str, gpus: int, 
     assert f"/hf/hub/models--{model.replace('/', '--')}/snapshots/abc" in serve
     assert len(_flag(serve, "--peers").split(",")) == sparks
     assert _flag(serve, "--embedding-placement") == "gpu"
+    assert _flag(serve, "--mtp") == "3"
     assert _flag(serve, "--prefix-cache-entries") == "20"
     assert ((_flag(serve, "--device"), _flag(serve, "--split-device")) == ("0", "1")) == (gpus == 2)
     for absent in ("--max-context", "--pool-tokens", "--rtx-expert-layers", "--vision", "--audio",
-                   "--draft", "--draft-fp8", "--mtp", "--dspark", "--local-experts"):
+                   "--draft", "--draft-fp8", "--dspark", "--local-experts"):
         assert absent not in serve.split(), absent
     workers = [line for line in result.stderr.splitlines() if "cuteafd expertd-native" in line]
     assert len(workers) == sparks and f"--world {sparks}" in workers[0]
@@ -316,13 +317,22 @@ def test_step5_refuses_unsupported_configuration(tmp_path: Path, keys: str, diag
     assert "docker run -d" not in result.stderr and "Traceback" not in result.stderr
 
 
-@pytest.mark.parametrize("keys,depth", [("SPECULATOR=mtp\n", "1"), ("SPECULATOR=mtp\nSPECULATOR_DEPTH=3\n", "3")])
-def test_step5_native_mtp_is_opt_in(tmp_path: Path, keys: str, depth: str) -> None:
+@pytest.mark.parametrize("keys,depth", [
+    ("", "3"),
+    ("SPECULATOR=mtp\n", "3"),
+    *[(f"SPECULATOR=mtp\nSPECULATOR_DEPTH={depth}\n", str(depth)) for depth in (1, 2, 3)],
+    ("SPECULATOR=off\n", "0"),
+])
+def test_step5_native_mtp_defaults_on_with_explicit_off(tmp_path: Path, keys: str, depth: str) -> None:
     result = _step5(tmp_path, "SPARK_COUNT=6\nRTX_GPUS=2\n" + _hosts(6) + keys)
     serve = _line(result, "cuteafd serve-step5 --snapshot")
     assert _flag(serve, "--mtp") == depth
+    assert _flag(_line(result, "cuteafd plan"), "--native-mtp-layers") == depth
     for absent in ("--draft", "--dspark"):
         assert absent not in serve.split(), absent
+    other = _family_launch_result(tmp_path / "other", {"model_type": "deepseek_v4"},
+                                  "test/dsv4", "SPECULATOR=dspark\n")
+    assert _flag(_line(other, "cuteafd plan"), "--native-mtp-layers") is None
 
 
 def test_step5_refuses_release_images_and_slots_without_serve_step5(tmp_path: Path) -> None:
@@ -353,7 +363,7 @@ def test_step5_example_configs(tmp_path: Path, name, model, revision, gpus, spar
     values = _keys(path)
     assert (values["MODEL_ID"], values["MODEL_REVISION"], values["RTX_GPUS"]) == (model, revision, gpus)
     assert values["SPARK_COUNT"] == str(sparks)
-    assert (values["SPECULATOR"], values["VISION"], values["AUDIO"], values["POOL_TOKENS"]) == ("off", "off", "off", "auto")
+    assert (values["SPECULATOR"], values["VISION"], values["AUDIO"], values["POOL_TOKENS"]) == ("mtp", "off", "off", "auto")
     for rank in range(sparks):
         assert values[f"SPARK_{rank}_HOST"] == f"REPLACE-ME-spark-{rank}"
         assert values[f"SPARK_{rank}_LANE_A"] == f"192.0.2.{rank + 1}"

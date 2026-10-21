@@ -12,6 +12,11 @@ launch_argv=("$@")
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 source "$repo_root/scripts/lib/release-common.sh"
 source "$repo_root/scripts/lib/cdi-gpus.sh"
+namespace_root="$(readlink -f "${CUTEAFD_NAMESPACE_ROOT:-/mnt/sparknest}")"
+namespace_hf_home="$namespace_root/hf-home"
+if [[ -n "${CUTEAFD_NAMESPACE_ROOT:-}" ]]; then
+  export HF_HOME="$namespace_hf_home"
+fi
 config="$repo_root/cuteafd.config"
 restart=0
 restart_all=0
@@ -555,14 +560,20 @@ attention_plan_rows="$(get ATTENTION_PLAN_ROWS auto)"
 if [[ $attention_plan_rows != auto && ! $attention_plan_rows =~ ^[1-9][0-9]*$ ]]; then
   release_die "ATTENTION_PLAN_ROWS must be auto or a positive integer"
 fi
-shared_env_args=(-e "CUTEAFD_SPARK_INTAKE=$intake"
+shared_env_args=(-e "HF_HOME=$namespace_hf_home" -e "CUTEAFD_SPARK_INTAKE=$intake"
   -e "CUTEAFD_CONSOLE_TEXT=$([[ $console_text == on ]] && echo true || echo false)"
   -e "CUTEAFD_ATTENTION_PLACEMENT=$attention_placement" -e "CUTEAFD_FP8_EXPERT_PREFILL=$fp8_prefill"
   -e "CUTEAFD_SPARK_ADMISSION_TIMEOUT_SECONDS=${CUTEAFD_RELEASE_READY_TIMEOUT_SECONDS:-900}")
 if [[ $attention_plan_rows != auto ]]; then
   shared_env_args+=(-e "CUTEAFD_ATTENTION_PLAN_ROWS=$attention_plan_rows")
 fi
-shared_worker_env_args=(-e "CUTEAFD_FP8_EXPERT_PREFILL=$fp8_prefill" -e "CUTEAFD_THERMAL=$(get THERMAL on)")
+if [[ -n "${CUTEAFD_PUSH_SOCKET:-}" ]]; then
+  shared_env_args+=(-e "CUTEAFD_PUSH_SOCKET=$CUTEAFD_PUSH_SOCKET")
+fi
+shared_worker_env_args=(-e "HF_HOME=$namespace_hf_home" -e "CUTEAFD_FP8_EXPERT_PREFILL=$fp8_prefill" -e "CUTEAFD_THERMAL=$(get THERMAL on)")
+if [[ -n "${CUTEAFD_PUSH_SOCKET:-}" ]]; then
+  shared_worker_env_args+=(-e "CUTEAFD_PUSH_SOCKET=$CUTEAFD_PUSH_SOCKET")
+fi
 }
 shared_bench_nonce_args() {
 bench_nonce_env_args=()
@@ -725,7 +736,7 @@ case "$gateway" in on|off) api_args+=(--gateway "$gateway") ;; "") ;; *) echo "G
 # probe dumps, Spark intake, console text, API keys and console, serving
 # identity) comes from the shared helpers above, so it reaches V4.1 with no
 # V4.1 code. Engram tables need nothing here: they are read from the
-# checkpoint under the /hf/hub mount, kept local on raptor by sparknest.
+# checkpoint under the full namespace mount, kept local on raptor by sparknest.
 # ---------------------------------------------------------------------------
 launch_deepseek_v41() {
 # The release loader validates every key (run.sh --set overrides are in $config).
@@ -814,7 +825,7 @@ for tool in docker ssh curl jq ss nvidia-smi sha256sum python3; do release_need 
 docker info >/dev/null 2>&1 || release_die "local Docker daemon is unavailable"
 docker image inspect "$COORDINATOR_DOCKER_INFERENCE" >/dev/null 2>&1 ||
   release_die "coordinator image is missing: $COORDINATOR_DOCKER_INFERENCE (pull the published pair, or build it with a config whose COORDINATOR_DOCKER_INFERENCE names this tag)"
-hf_home="${HF_HOME:-$HOME/.cache/huggingface}"
+hf_home="${HF_HOME:-$namespace_root/hf-home}"
 release_resolve_local_model_revision "$hf_home"
 release_resolve_coordinator_gpu_identity
 profile_bytes="$(release_cuda_total_bytes "$RELEASE_COORDINATOR_GPU_UUID")" || release_die "cannot query coordinator CUDA capacity"
@@ -941,8 +952,8 @@ fi
 # Select and admit the count before touching any serving container or Spark.
 count_args=(--available-sparks "$RELEASE_AVAILABLE_SPARKS" --mapped-scale-preload-gib "$(get MAPPED_SCALE_PRELOAD_GIB 0)")
 ((RELEASE_SPARK_COUNT_EXPLICIT == 0)) || count_args+=(--spark-ranks "$SPARK_COUNT")
-# HF_HOME=/hf: the planner resolves draft snapshots under it, like serving.
-count_mounts=(-e HF_HOME=/hf ${v41_fp8_head_args[@]+"${v41_fp8_head_args[@]}"} -v "$(readlink -f "$hf_home/hub"):/hf/hub:ro")
+# Keep checkpoint paths unchanged inside the full namespace mount.
+count_mounts=(-e "HF_HOME=$namespace_hf_home" ${v41_fp8_head_args[@]+"${v41_fp8_head_args[@]}"} -v "$namespace_root:$namespace_root:ro")
 if [[ -n "$wip_layout" ]]; then
   count_mounts+=(-v "$wip_layout/bin:/opt/cuteafd/bin:ro" -v "$wip_layout/lib:/opt/cuteafd/lib:ro"
     -v "$wip_layout/share:/opt/cuteafd/share:ro" --entrypoint /opt/cuteafd/bin/cuteafd)
@@ -969,7 +980,7 @@ release_reject_unused_keys deepseek_v41 $(_v41_allowed_keys)
 readiness_args=(--require-ready)
 [[ -z "$wip_slot" ]] || readiness_args=()
 count_plan="$(docker run --rm --network none "${count_mounts[@]}" "$COORDINATOR_DOCKER_INFERENCE" \
-  "${count_command[@]}" plan "/hf/$snapshot_rel" --vision "$VISION" --audio off \
+  "${count_command[@]}" plan "$(readlink -f "$hf_home/$snapshot_rel")" --vision "$VISION" --audio off \
   --deployment "${readiness_args[@]}" "${count_args[@]}" --rtx "$RELEASE_RTX_GPUS" \
   --coordinator-gpu-budget-gib "$profile_gib" --coordinator-weight-budget-gib "$profile_gib" \
   --pool-tokens "$count_pool" --prefill-rows "$count_prefill" --context-tokens "$MAX_CONTEXT_TOKENS" \
@@ -1011,13 +1022,14 @@ for host in "${hosts[@]}"; do
   # arguments into one remote shell line, so an empty argument is elided and
   # every later positional shifts; the optional EXL3 family tag therefore
   # travels as a sentinel and the host name sits ahead of it.
-  spark_manifest="$(release_ssh -o ConnectTimeout=10 "$host" bash -s -- "$SPARK_EXPERT_DOCKER_INFERENCE" "$engine_commit" "$sparkinfer_commit" "$snapshot_rel" "$host" "$model_is_exl3" "${exl3_family_tag:-__none__}" "${wip_slot:-__none__}" "${wip_spark_container:-__none__}" "${WIP_LAYOUT_SLOT:-__none__}" "${WIP_ROOT:-__default__}" "${WIP_INSTANCE:-__none__}" <<'REMOTE'
+  spark_manifest="$(release_ssh -o ConnectTimeout=10 "$host" bash -s -- "$SPARK_EXPERT_DOCKER_INFERENCE" "$engine_commit" "$sparkinfer_commit" "$snapshot_rel" "$host" "$model_is_exl3" "${exl3_family_tag:-__none__}" "${wip_slot:-__none__}" "${wip_spark_container:-__none__}" "${WIP_LAYOUT_SLOT:-__none__}" "${WIP_ROOT:-__default__}" "${WIP_INSTANCE:-__none__}" "$namespace_root" <<'REMOTE'
 set -euo pipefail
 image="$1"; engine="$2"; sparkinfer="$3"; snapshot_rel="$4"; host="$5"
 exl3="$6"; exl3_family="${7:-__none__}"; wip_slot="${8:-__none__}"
 wip_spark_container="${9:-cuteafd-spark-expert-wip}"
 wip_layout_slot="${10:-$wip_slot}"
 wip_root_arg="${11:-__default__}"; wip_instance_arg="${12:-__none__}"
+namespace_root="${13:-/mnt/sparknest}"
 [[ "$wip_instance_arg" != __none__ ]] || wip_instance_arg=
 [[ "$wip_root_arg" != __default__ ]] || wip_root_arg="$HOME/.cache/cuteafd/builds/wip${wip_instance_arg:+-$wip_instance_arg}"
 wip_cp() { # slot files come from the container when it exists, else from the WIP root
@@ -1047,6 +1059,7 @@ if [[ "$wip_slot" == __none__ && "$image_sparkinfer" != "$sparkinfer" ]]; then
   die "$image carries SparkInfer ${image_sparkinfer:-<none>} but this checkout pins $sparkinfer; rebuild with $remedy"
 fi
 hf_home="${HF_HOME:-$HOME/.cache/huggingface}"
+[[ "$namespace_root" == /mnt/sparknest ]] || hf_home="$namespace_root/hf-home"
 [[ -d "$hf_home/$snapshot_rel" ]] || die "model snapshot is missing: $snapshot_rel"
 if find "$hf_home/$snapshot_rel" -xtype l -print -quit | grep -q .; then
   die "model snapshot has dangling links: $snapshot_rel"
@@ -1301,7 +1314,7 @@ fi
 
 start_coordinator() {
 echo "== starting native RTX coordinator =="
-local -a args=(--vision "$VISION" --audio "$AUDIO" serve-native "${vision_args[@]}" --snapshot "/hf/$snapshot_rel" --native-lib /opt/cuteafd/lib/libcuteafd_native.so --peers "$peers" --rtx-gpus "$RELEASE_RTX_GPUS" --embedding-placement "$EMBEDDING" --listen "$ADDR" --prefill-batch-tokens "$PREFILL_BATCH_TOKENS" --concurrency "$CONCURRENCY" --prefix-cache-entries "$PREFIX_CACHE_ENTRIES" --max-context-tokens "$MAX_CONTEXT_TOKENS" --max-output-tokens "$MAX_OUTPUT_TOKENS" --mapped-scale-preload-gib "$(get MAPPED_SCALE_PRELOAD_GIB 0)")
+local -a args=(--vision "$VISION" --audio "$AUDIO" serve-native "${vision_args[@]}" --snapshot "$(readlink -f "$hf_home/$snapshot_rel")" --native-lib /opt/cuteafd/lib/libcuteafd_native.so --peers "$peers" --rtx-gpus "$RELEASE_RTX_GPUS" --embedding-placement "$EMBEDDING" --listen "$ADDR" --prefill-batch-tokens "$PREFILL_BATCH_TOKENS" --concurrency "$CONCURRENCY" --prefix-cache-entries "$PREFIX_CACHE_ENTRIES" --max-context-tokens "$MAX_CONTEXT_TOKENS" --max-output-tokens "$MAX_OUTPUT_TOKENS" --mapped-scale-preload-gib "$(get MAPPED_SCALE_PRELOAD_GIB 0)")
 [[ -z "${COORDINATOR_GPU_BUDGET_GIB:-}" ]] || args+=(--coordinator-gpu-budget-gib "$COORDINATOR_GPU_BUDGET_GIB")
 [[ -z "${SERVED_MODEL_ID:-}" ]] || args+=(--model-id "$SERVED_MODEL_ID")
 args+=("${api_args[@]}")
@@ -1337,7 +1350,7 @@ docker run -d "${RELEASE_SERVING_ARGS[@]}" --name "$coordinator" --restart no "$
   "${wip_mount_args[@]}" \
   "${api_mount_args[@]}" -e "CUTEAFD_IMAGE=$COORDINATOR_DOCKER_INFERENCE" -v "$bench_dir:/run/cuteafd/bench" -v "$fidelity_cache:/run/cuteafd/fidelity" -e CUTEAFD_FIDELITY_CACHE=/run/cuteafd/fidelity \
   ${profile_wrapper_args[@]+"${profile_wrapper_args[@]}"} \
-  -v "$(readlink -f "$hf_home/hub"):/hf/hub:ro" "$COORDINATOR_DOCKER_INFERENCE" ${profile_wrapper[@]+"${profile_wrapper[@]}"} cuteafd "${args[@]}" >/dev/null
+  -v "$namespace_root:$namespace_root:ro" "$COORDINATOR_DOCKER_INFERENCE" ${profile_wrapper[@]+"${profile_wrapper[@]}"} cuteafd "${args[@]}" >/dev/null
 }
 deadline=$((SECONDS + ${CUTEAFD_RELEASE_READY_TIMEOUT_SECONDS:-900}))
 echo "== starting native Spark experts =="
@@ -1354,8 +1367,10 @@ for i in "${!hosts[@]}"; do
   # PROFILE switches (absent unless set) and the shared worker environment.
   release_profile_docker_args "${PROFILE:-}" "${PROFILE_DIR:-}" "$host"
   remote_args+=(--profile-args ${RELEASE_PROFILE_ARGS[@]+"${RELEASE_PROFILE_ARGS[@]}"} "${shared_worker_env_args[@]}")
-  release_ssh "$host" "$(declare -f release_serving_docker_args release_require_writable_state cuteafd_cdi_require cuteafd_cdi_gpu_args); export -f release_serving_docker_args release_require_writable_state cuteafd_cdi_require cuteafd_cdi_gpu_args; bash -s -- $(printf '%q ' "${remote_args[@]}")" <<'REMOTE' &
+  release_ssh "$host" "$(declare -f release_serving_docker_args release_require_writable_state cuteafd_cdi_require cuteafd_cdi_gpu_args); export -f release_serving_docker_args release_require_writable_state cuteafd_cdi_require cuteafd_cdi_gpu_args; CUTEAFD_NAMESPACE_ROOT=$(printf %q "$namespace_root") bash -s -- $(printf '%q ' "${remote_args[@]}")" <<'REMOTE' &
 set -euo pipefail
+namespace_root="${CUTEAFD_NAMESPACE_ROOT:-/mnt/sparknest}"
+[[ "$namespace_root" == /mnt/sparknest ]] || HF_HOME="$namespace_root/hf-home"
 image="$1"; name="$2"; rank="$3"; budget="$4"; port="$5"; snapshot_rel="$6"; fingerprint="$7"; world="$8"
 topology_explicit="$9"; topology_tp="${10}"; topology_ep="${11}"
 topology_args=()
@@ -1399,7 +1414,7 @@ hf_home="${HF_HOME:-$HOME/.cache/huggingface}"
 # positional argument, so the worker argument contract is unchanged.
 release_serving_docker_args
 cuteafd_cdi_gpu_args all || exit 2
-docker run -d "${RELEASE_SERVING_ARGS[@]}" --name "$name" --restart no "${CUTEAFD_CDI_ARGS[@]}" --network host --ipc host --ulimit memlock=-1:-1 --device=/dev/infiniband -e "CUTEAFD_RELEASE_CONFIG_SHA256=$fingerprint" -e "RUST_LOG=$rust_log" "${rdma_args[@]}" "${wip_args[@]}" ${profile_args[@]+"${profile_args[@]}"} -v "$(readlink -f "$hf_home/hub"):/hf/hub:ro" "$image" cuteafd expertd-native --snapshot "/hf/$snapshot_rel" --native-lib /opt/cuteafd/lib/libcuteafd_native.so --rank "$rank" --world "$world" --device-budget-bytes "$budget" --listen "0.0.0.0:$port" "${topology_args[@]}" "${encoder_args[@]}" >/dev/null
+docker run -d "${RELEASE_SERVING_ARGS[@]}" --name "$name" --restart no "${CUTEAFD_CDI_ARGS[@]}" --network host --ipc host --ulimit memlock=-1:-1 --device=/dev/infiniband -e "CUTEAFD_RELEASE_CONFIG_SHA256=$fingerprint" -e "RUST_LOG=$rust_log" "${rdma_args[@]}" "${wip_args[@]}" ${profile_args[@]+"${profile_args[@]}"} -v "$namespace_root:$namespace_root:ro" "$image" cuteafd expertd-native --snapshot "$(readlink -f "$hf_home/$snapshot_rel")" --native-lib /opt/cuteafd/lib/libcuteafd_native.so --rank "$rank" --world "$world" --device-budget-bytes "$budget" --listen "0.0.0.0:$port" "${topology_args[@]}" "${encoder_args[@]}" >/dev/null
 REMOTE
   pids+=("$!")
 done
@@ -1449,11 +1464,11 @@ instance="$(get INSTANCE)"
 coordinator_name="cuteafd-coordinator${instance:+-$instance}"
 model="$(get MODEL_ID)"
 revision="$(get MODEL_REVISION)"
-hf_home="${HF_HOME:-$HOME/.cache/huggingface}"
+hf_home="${HF_HOME:-$namespace_root/hf-home}"
 hub="$(readlink -f "$hf_home/hub")"
 root="$hub/models--${model//\//--}"
 [[ -n "$revision" ]] || revision="$(<"$root/refs/main")"
-snapshot="/hf/hub/models--${model//\//--}/snapshots/$revision"
+snapshot="$(readlink -f "$root/snapshots/$revision")"
 [[ -d "$root/snapshots/$revision" ]] || { echo "missing snapshot $model@$revision" >&2; exit 1; }
 # Family, the serving command and the layers with routed experts.
 described="$(python3 "$repo_root/scripts/lib/checkpoint-family.py" "$root/snapshots/$revision/config.json")" || exit 2
@@ -1493,8 +1508,8 @@ case "$family" in
 esac
 # Kimi K3 (#273) and Step-5 (#274) are under qualification: WIP slots only,
 # automatic attention placement, text only (their bundled vision towers are not
-# in scope) and GPU token embeddings. Kimi ships no MTP head; Step-5's native
-# MTP is opt-in (SPECULATOR=mtp) while it qualifies, never a default.
+# in scope) and GPU token embeddings. Kimi ships no MTP head; Step-5 defaults
+# to native MTP depth 3 (SPECULATOR=off disables it).
 qualifying=0
 [[ "$family" != kimi_k3 && "$family" != step5 ]] || qualifying=1
 if ((qualifying)); then
@@ -1621,7 +1636,7 @@ snapshot_of() {
   local id="$1" rev="$2" dir="$hub/models--${1//\//--}"
   [[ -n "$rev" ]] || rev="$(<"$dir/refs/main")"
   [[ -d "$dir/snapshots/$rev" ]] || { echo "missing snapshot $id@$rev" >&2; return 1; }
-  printf '%s' "/hf/hub/models--${id//\//--}/snapshots/$rev"
+  readlink -f "$dir/snapshots/$rev"
 }
 exlr8_manifest="$(get EXLR8_MANIFEST)"
 exlr8_dense="$(get EXLR8_DENSE_FROM)"
@@ -1640,9 +1655,7 @@ if [[ -n "$exlr8_manifest$exlr8_dense" ]]; then
   if [[ -d "$exlr8_dense" ]]; then
     exlr8_dense="$(readlink -f "$exlr8_dense")"
     release_validate_path_setting EXLR8_DENSE_FROM "$exlr8_dense"
-    if release_path_within "$exlr8_dense" "$hub"; then
-      exlr8_dense="/hf/hub${exlr8_dense#"$hub"}"
-    else
+    if ! release_path_within "$exlr8_dense" "$namespace_root"; then
       exlr8_mounts=(-v "$exlr8_dense:$exlr8_dense:ro")
     fi
   else
@@ -1717,6 +1730,10 @@ if [[ -z "$speculator" ]]; then
     speculator=dspark
     echo "note: DeepSeek V4 drafts with its bundled dSpark; SPECULATOR=off disables it" >&2
   fi
+  if [[ $speculator == off && $family == step5 ]]; then
+    speculator=mtp
+    echo "note: Step-5 drafts with native MTP (default depth 3); SPECULATOR=off disables it" >&2
+  fi
   # Only the resident local paths are qualified (EXL3, and NVFP4 with its FP8
   # MTP package). Spark workers serve backbone layers, not mtp.layers.0; other
   # expert formats keep their opt-in status. SPECULATOR=off disables the default.
@@ -1760,9 +1777,7 @@ if [[ -n "$chat_template_from" && "$vision" != off ]]; then
   if [[ -d "$chat_template_from" ]]; then
     chat_template_from="$(readlink -f "$chat_template_from")"
     release_validate_path_setting CHAT_TEMPLATE_FROM "$chat_template_from"
-    if release_path_within "$chat_template_from" "$hub"; then
-      chat_template_from="/hf/hub${chat_template_from#"$hub"}"
-    else
+    if ! release_path_within "$chat_template_from" "$namespace_root"; then
       chat_template_mounts=(-v "$chat_template_from:$chat_template_from:ro")
     fi
   else
@@ -1799,6 +1814,8 @@ if [[ $family == mimo_v2 ]]; then
   done
 fi
 case "$speculator" in
+  off)
+    [[ "$family" != step5 ]] || family_args+=(--mtp 0) ;;
   dflash2|dspark)
     drafter="$(get SPECULATOR_MODEL_ID)"
     [[ -n "$drafter" ]] || drafter="$default_drafter"
@@ -1816,6 +1833,7 @@ case "$speculator" in
     fi ;;
   mtp)
     mtp_depth=1
+    [[ "$family" != step5 ]] || mtp_depth=3
     [[ ( $qwen_exl3 != 1 && $qwen_nvfp4 != 1 ) || $qwen_mtp != 1 ]] || mtp_depth=3
     family_args+=(--mtp "$(get SPECULATOR_DEPTH "$mtp_depth")") ;;
 esac
@@ -2542,6 +2560,11 @@ audio_encoder_hash=""
   if ((count_explicit)) || [[ "$backend" == local ]]; then count_args+=(--spark-ranks "$ranks"); fi
   # The plan charges the drafter this launch actually serves (SPECULATOR=off charges none).
   count_args+=(--speculator "$speculator")
+  if [[ "$family" == step5 ]]; then
+    plan_mtp_depth=0
+    [[ "$speculator" != mtp ]] || plan_mtp_depth="$(get SPECULATOR_DEPTH "$mtp_depth")"
+    plan_draft_args+=(--native-mtp-layers "$plan_mtp_depth")
+  fi
   for pair in 'CONCURRENCY:--concurrency' 'PREFIX_CACHE_ENTRIES:--prefix-cache-entries' \
     'MAX_CONTEXT_TOKENS:--context-tokens' 'PREFILL_BATCH_TOKENS:--prefill-rows' \
     'RTX_EXPERT_LAYERS:--rtx-expert-layers'; do
@@ -2561,8 +2584,8 @@ audio_encoder_hash=""
   [[ -z "$(get MEMORY_RESERVATION)" ]] || deployment_args+=(--memory-reservation "$(get MEMORY_RESERVATION)")
   readiness_args=(--require-ready)
   [[ -z "$wip_slot" ]] || readiness_args=()
-  # HF_HOME=/hf: the planner resolves draft snapshots under it, like serving.
-  plan_json="$(docker run --rm --network none "${lane_env_args[@]}" -e HF_HOME=/hf -v "$hub:/hf/hub:ro" "${wip_mount_args[@]}" "${exlr8_mounts[@]}" \
+  # Keep checkpoint paths unchanged inside the full namespace mount.
+  plan_json="$(docker run --rm --network none "${lane_env_args[@]}" -e "HF_HOME=$namespace_hf_home" -v "$namespace_root:$namespace_root:ro" "${wip_mount_args[@]}" "${exlr8_mounts[@]}" \
     "$coordinator_image" cuteafd plan "$snapshot" --attention-placement "$attention_placement" --vision "$vision" --audio "$audio" --deployment "${readiness_args[@]}" \
     "${deployment_args[@]}" "${count_args[@]}" "${exlr8_plan_args[@]}" "${spark_budget_args[@]}" \
     --rtx "$plan_rtx" --coordinator-gpu-budget-gib "$plan_gib" --coordinator-weight-budget-gib "$plan_gib" --pool-tokens "$plan_pool" --vision-replicas "$vision_replicas" "${plan_draft_args[@]}")"
@@ -2794,7 +2817,7 @@ for ((rank = 0; rank < ranks; rank++)); do
   [[ -z "$(get PROFILE_DIR)" ]] || worker_prep="mkdir -p $(printf '%q' "$(get PROFILE_DIR)") && release_require_writable_state $(printf '%q' "$(get PROFILE_DIR)") && "
   ssh "$host" "$(declare -f release_serving_docker_args release_require_writable_state cuteafd_cdi_require cuteafd_cdi_gpu_args); release_serving_docker_args; cuteafd_cdi_gpu_args all || exit 2; ${worker_prep}docker run -d --name cuteafd-spark-expert-$host-$port --restart no \"\${CUTEAFD_CDI_ARGS[@]}\" --network host \
     --ipc host --ulimit memlock=-1:-1 --device=/dev/infiniband \"\${RELEASE_SERVING_ARGS[@]}\" -e RUST_LOG=info $(printf '%q ' "${shared_worker_env_args[@]}")$spark_worker_env $wip_worker_args $device_map_env$worker_profile \
-    -v \$(readlink -f \$HOME/.cache/huggingface/hub):/hf/hub:ro '$spark_image' \
+    -v $(printf %q "$namespace_root:$namespace_root:ro") '$spark_image' \
     cuteafd expertd-native --snapshot '$snapshot' --native-lib /opt/cuteafd/lib/libcuteafd_native.so \
     --rank $rank --world $ranks --device-budget-bytes $budget $spark_worker_args \
     --listen 0.0.0.0:$port $encoder_args >/dev/null" &
@@ -2852,7 +2875,7 @@ docker run -d "${RELEASE_SERVING_ARGS[@]}" --name "$coordinator_name" --restart 
   --ulimit memlock=-1:-1 --device=/dev/infiniband -e RUST_LOG=info "${shared_env_args[@]:0:4}" \
   "${bond_args[@]}" "${bench_nonce_env_args[@]}" "${tp2_env_args[@]}" "${graph_census_args[@]}" "${lane_env_args[@]}" "${thermal_args[@]}" \
   "${shared_env_args[@]:4}" -e "CUTEAFD_IMAGE=$coordinator_image" "${wip_mount_args[@]}" "${device_map_args[@]}" \
-  -v "$hub:/hf/hub:ro" -v "$bench_dir:/run/cuteafd/bench" -v "$fidelity_cache:/run/cuteafd/fidelity" -e CUTEAFD_FIDELITY_CACHE=/run/cuteafd/fidelity \
+  -v "$namespace_root:$namespace_root:ro" -v "$bench_dir:/run/cuteafd/bench" -v "$fidelity_cache:/run/cuteafd/fidelity" -e CUTEAFD_FIDELITY_CACHE=/run/cuteafd/fidelity \
   "${api_mount_args[@]}" "${chat_template_mounts[@]}" "${exlr8_mounts[@]}" "${trace_args[@]}" "${probe_args[@]}" ${profile_args[@]+"${profile_args[@]}"} ${profile_wrapper_args[@]+"${profile_wrapper_args[@]}"} "$coordinator_image" ${profile_wrapper[@]+"${profile_wrapper[@]}"} cuteafd "${coordinator_budget_args[@]}" $serve --snapshot "$snapshot" \
   --native-lib /opt/cuteafd/lib/libcuteafd_native.so "${peer_args[@]}" --listen "$addr" \
   --max-sequences "$effective_concurrency" "${context_args[@]}" \

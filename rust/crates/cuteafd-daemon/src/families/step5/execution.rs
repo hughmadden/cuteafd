@@ -71,11 +71,12 @@ struct NativeOwners<'a> {
     ranks: Vec<Vec<Option<Layer<'a>>>>,
     head: Option<super::head::TargetHeadOwner<'a>>,
     arenas: Vec<Arena<'a>>,
+    rope: Vec<Rc<TargetTables<'a>>>,
 }
 impl<'a> NativeOwners<'a> {
     fn load(programs: &'a Programs<'a>, checkpoint: &'a Checkpoint,
         ownership: &ExecutionOwnership, devices: &[Device<'a>], rows: usize,
-        count: usize, available: &[u64], reservations: &[u64]) -> Result<Self> {
+        count: usize, available: &[u64], reservations: &[u64], depth: usize) -> Result<Self> {
         validate_rank_inventory(ownership.ranks(), &[devices.len(), available.len(), reservations.len()])?;
         ensure!(matches!(count, 1 | 92), "Step-5 native layer inventory");
         let head_rank = ownership.execution().spec().head_gpu as usize;
@@ -87,16 +88,20 @@ impl<'a> NativeOwners<'a> {
             *plan = Execution::rank_admission(programs, checkpoint, ownership, rank, rows, count)?;
             if rank == head_rank {
                 if let Some(head) = &head_plan { *plan = plan.with_head(head)?; }
+                plan.workspace = plan.workspace.max(
+                    cuteafd_loader::plan::families::step5::native::mtp_forecast_workspace(rows, depth)?);
             }
         }
         admit_native(&admission, available, reservations, || {
             let contract = CoordinatorContract::from_checkpoint(checkpoint)?;
             let mut ranks: Vec<Vec<Option<Layer<'a>>>> = (0..ownership.ranks()).map(|_| Vec::new()).collect();
             let mut arenas = Vec::with_capacity(ownership.ranks());
+            let mut tables = Vec::with_capacity(ownership.ranks());
             for rank in 0..ownership.ranks() {
                 let device = devices[rank];
                 let arena = Arena::new(device, usize::try_from(admission[rank].workspace)?)?;
                 let rope = Rc::new(TargetTables::load(device, programs, &contract, "step5_", available[rank], &[])?);
+                tables.push(rope.clone());
                 for layer in 0..count {
                     if ownership.layer(layer, rank)?.query_heads == 0 { ranks[rank].push(None); continue; }
                     let attention = if contract.layers[layer].sliding.is_some() {
@@ -125,7 +130,7 @@ impl<'a> NativeOwners<'a> {
             }
             let head = head_plan.map(|plan| super::head::TargetHeadOwner::load_in(devices[head_rank],
                 programs, checkpoint, plan, available[head_rank], &[], Some((&arenas[head_rank], 0)))).transpose()?;
-            Ok(Self { ranks, head, arenas })
+            Ok(Self { ranks, head, arenas, rope: tables })
         })
     }
 }
@@ -301,7 +306,9 @@ impl<'e, 'a> Execution<'e, 'a> {
         ensure!(devices.iter().enumerate().all(|(rank, device)|
             std::ptr::eq(device.library, devices[0].library)
                 && devices[..rank].iter().all(|other| other.id != device.id)), "Step-5 rank devices/library differ");
-        let native = NativeOwners::load(programs, checkpoint, &ownership, &devices, rows, count, &available, &reservations)?;
+        let depth = caches[ownership.execution().spec().head_gpu as usize].borrow()
+            .layout().ranks[ownership.execution().spec().head_gpu as usize].mtp_lengths.len();
+        let native = NativeOwners::load(programs, checkpoint, &ownership, &devices, rows, count, &available, &reservations, depth)?;
         let main = MainExecution::bind(checkpoint, ownership, native, caches, stages, rows, transport, count, placement_version)?;
         Ok(Self { main, startup_captures: cuteafd_ffi::graph_captures() })
     }
@@ -530,6 +537,15 @@ impl<'e, 'a> Execution<'e, 'a> {
         }).collect::<Result<Vec<_>>>()?;
         resource::geometry_with_grouping(&homes, 352, 8, rows, width, 0,
             |layer, rows| resource::worker_group_rows_for_input(&reports, layer, rows, true))
+    }
+    pub(super) fn predictor_rope(&self) -> Rc<TargetTables<'a>> {
+        self.main.native.rope[self.ownership().execution().spec().head_gpu as usize].clone()
+    }
+    pub(super) fn predictor_arena(&self) -> &Arena<'a> {
+        &self.main.native.arenas[self.ownership().execution().spec().head_gpu as usize]
+    }
+    pub(super) fn predictor_stream(&self) -> Rc<crate::shared::memory::device::Stream<'a>> {
+        self.main.stages[self.ownership().execution().spec().head_gpu as usize].stream.clone()
     }
     pub(super) fn poison_scratch_between_layers(&self) { self.main.poison_scratch.set(true); }
     pub(super) fn retain_diagnostic_outputs(&self, layers: &[usize]) -> Result<()> {
