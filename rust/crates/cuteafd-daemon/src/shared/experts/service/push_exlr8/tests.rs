@@ -30,12 +30,12 @@ fn exlr8_ring_commit_corruption_and_failure_drain_before_mount() -> Result<()> {
     std::fs::write(fixture.directory().join("events"), b"")?;
     let root = tempfile::tempdir_in(fixture.directory())?;
     cuteafd_loader::plan::testing::exlr8::fixture(root.path(), false);
-    // Success, all-rank commit rejection, source failure, corrupt payload.
+    // Success, all-rank commit rejection, source failure, invalid sign structure.
     for outcome in 0..4 {
         let plan = RankPlan::new(root.path(), "mixed", &[3], 4, 3, usize::MAX)?;
         let budgets = plan.residencies.iter().map(Exlr8Weights::plan).collect::<Result<Vec<_>>>()?;
         let checked = plan.checked(root.path(), root.path(), 4, 3)?;
-        let corrupt_destination = plan.residencies[0].loads[0].destination[0] as u64;
+        let corrupt_destination = plan.residencies[0].signs_offsets[0] as u64;
         let sources = checked
             .plan
             .files
@@ -51,7 +51,7 @@ fn exlr8_ring_commit_corruption_and_failure_drain_before_mount() -> Result<()> {
                     ..(entry.src_base + src + u64::from(pattern.run)) as usize]
                     .to_vec();
                 if outcome == 3 && entry.dst_base + dst == corrupt_destination {
-                    bytes[0] ^= 1;
+                    bytes[0] = 0;
                 }
                 let mut bytes = bytes.as_slice();
                 let mut destination = entry.dst_base + dst;

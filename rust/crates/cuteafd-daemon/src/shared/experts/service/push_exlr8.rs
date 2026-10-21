@@ -24,17 +24,16 @@ pub(super) fn load<'a>(library: &'a NativeLibrary, config: &NativeExpertServiceC
         ensure!(checked.plan.files.iter().all(|file|
             cuteafd_loader::push_load::is_push_shard(&root.join(file))), "EXLR8 push source is not a SparkNest shard");
         // Original plans stay available for mount fallback until the group commits.
-        let scratch = residencies.iter().map(|r| r.staging_bytes).max().unwrap_or(0);
         let headroom = super::spark_runtime_headroom()?;
         let extra = workspace.checked_add(retained_host.checked_mul(2).ok_or_else(||
             anyhow::anyhow!("EXLR8 retained host overflow"))?)
-            .and_then(|n| n.checked_add(descriptors.max(scratch)))
+            .and_then(|n| n.checked_add(descriptors))
             .and_then(|n| n.checked_add(headroom))
             .ok_or_else(|| anyhow::anyhow!("EXLR8 push headroom overflow"))?;
         let peak = super::push::admit_peak(plan.layout.bytes(), 0, 0, extra,
             library.cuda_allocatable_memory_info()?.0)?;
         tracing::info!(rank = config.rank, resident_bytes = plan.layout.bytes(),
-            load_peak_bytes = peak, checksum_scratch_bytes = scratch, "Spark EXLR8 push admitted");
+            load_peak_bytes = peak, "Spark EXLR8 push admitted");
         let offer = Offer { rank: config.rank, host, arena_bytes: plan.layout.logical_bytes() as u64,
             placement: plan.placement.clone() };
         Ok((plan, checked, offer))
