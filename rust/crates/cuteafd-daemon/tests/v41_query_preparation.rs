@@ -20,7 +20,6 @@ mod shared {
     pub(crate) mod target_head;
     pub(crate) mod experts {
         pub(crate) mod rtx {
-            #[path = "dense/records.rs"]
             pub(crate) mod dense;
         }
     }
