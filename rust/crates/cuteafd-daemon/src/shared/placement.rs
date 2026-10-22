@@ -533,7 +533,7 @@ mod tests {
         mark(root, c"user.sparknest.cluster", br#"{"me":"coordinator"}"#)?;
         for entry in std::fs::read_dir(root)? {
             let path = entry?.path();
-            if path.extension().is_some_and(|e| e == "safetensors") { mark(&path, c"user.sparknest.hosts", b"[]")?; }
+            if path.extension().is_some_and(|e| e == "safetensors") { mark(&path, c"user.sparknest.hosts", b"coordinator")?; }
         }
         Ok(())
     }

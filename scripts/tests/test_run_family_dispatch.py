@@ -522,8 +522,12 @@ def test_glmf_selection_starts_after_solve_and_seals_before_opening_lanes() -> N
     assert body.index("SparkAdmission::plan(") < body.index("TokenEmbedding::load(") < body.index("self.experts_for_layers(")
     assert "args.experts_snapshot.as_deref().unwrap_or(&args.snapshot)" in body
     assert "&working, peers.len(), None, model)?;" in body and "admission.start_with(&peers, ranks)?" in body
-    # Coordinator GPUs (dense operands, TP2 halves) join the Spark push group only when it pushes.
+    # Coordinator GPUs (dense operands, TP2 halves) join the Spark push group only when it pushes,
+    # and without Spark peers form the push group alone.
     assert "if admission.coordinator_pushes() && dense_pushable(&args)" in body
+    alone = body.split("// No Spark peers: the coordinator GPUs push alone", 1)[1].split("None\n        };", 1)[0]
+    assert "plan_dense(0)?" in alone and "CoordinatorPush::prepare_alone(" in alone
+    assert "coordinator push unavailable; mount" in alone
     assert body.index("load_while_admitting(admission,") < body.index("TokenEmbedding::load(")
     assert body.index("TokenEmbedding::load(") < body.index("engine::GlmfEngine::new(")
     assert "let spark = !spark_layers.is_empty();" in body
@@ -542,8 +546,10 @@ def test_glmf_selection_starts_after_solve_and_seals_before_opening_lanes() -> N
     # coordinator ranks (the Sparks still push); a group fallback after
     # membership fills the same records through the mount.
     planning = body.split("let ranks = if admission.coordinator_pushes()", 1)[1].split("admission.start_with(&peers, ranks)?", 1)[0]
-    assert "planning.model(&self.cfg, &execution)?" in planning and "dense::plan_ranks(" in planning
-    assert "coordinator push unavailable; mount" in planning
+    assert "plan_dense(peers.len())?" in planning and "coordinator push unavailable; mount" in planning
+    plan_dense = body.split("let plan_dense = |sparks: usize|", 1)[1].split("let mut coordinator_push = None;", 1)[0]
+    assert "planning.model(&self.cfg, &execution)?" in plan_dense and "dense::plan_ranks(" in plan_dense
+    assert body.index("let plan_dense = |sparks: usize|") < body.index("admission.start_with(&peers, ranks)?")
     assert "dense::fill_by_mount(" in window
     assert body.index("engine::GlmfEngine::new(") < body.index("tp2.execution()?") < body.index("engine.install_tp2(ranks)?")
     assert body.index("engine.install_tp2(ranks)?") < body.index("engine.install_workspaces(workspaces)?")

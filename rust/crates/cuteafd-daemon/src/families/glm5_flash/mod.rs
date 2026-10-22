@@ -20,11 +20,11 @@ mod precision;
 pub(crate) mod weights;
 
 /// Whether this launch's coordinator operands can join a push group: every
-/// representation the push path records (BF16 checkpoint operands, GPU FP8
-/// copies). The NVFP4 numerics gate and token-row output sharding load
-/// through the mount.
+/// representation the push path records (BF16 operands, GPU FP8 copies,
+/// native E4M3 blocks, token-row output shards). The NVFP4 numerics gate
+/// (a measurement mode) loads through the mount.
 fn dense_pushable(args: &EngineArgs) -> bool {
-    args.kda_nvfp4_gate.is_none() && !args.kda_output_shard
+    args.kda_nvfp4_gate.is_none()
 }
 
 use anyhow::{ensure, Context, Result};
@@ -445,9 +445,10 @@ mod draft_cli_tests {
     }
 
     #[test]
-    fn coordinator_push_admits_primary_weights_without_token_row_sharding() {
+    fn coordinator_push_admits_primary_weights_and_token_row_sharding_but_not_the_nvfp4_gate() {
         assert!(dense_pushable(&parse(&[])));
-        assert!(!dense_pushable(&parse(&["--kda-fp8", "row128", "--kda-output-shard"])));
+        assert!(dense_pushable(&parse(&["--kda-fp8", "row128", "--kda-output-shard"])));
+        assert!(!dense_pushable(&parse(&["--kda-fp8", "off", "--kda-nvfp4-gate", "rtn"])));
     }
 
     #[test]
@@ -1787,6 +1788,39 @@ impl Opened {
                 terminal: if peer_stream.is_some() { cuteafd_loader::placement::TerminalHome::Replicated }
                     else { cuteafd_loader::placement::TerminalHome::AttentionOwner },
             })?;
+        // Each coordinator GPU is one push rank: its dense operands (class 2
+        // landing, class 3 staged and transformed on the GPU) and, with TP2
+        // layers, its EXL3 expert halves. Records are planned from headers
+        // before membership: a planning error offers no coordinator ranks
+        // (the coordinator loads by mount; Sparks still push). Without Spark
+        // peers the coordinator GPUs form the push group alone.
+        let gpus = 1 + usize::from(peer_stream.is_some());
+        let devices: Vec<_> = std::iter::once(args.device).chain(peer_stream.map(|(d, _)| d))
+            .map(|id| crate::shared::memory::device::Device { library: &self.library, id }).collect();
+        let plan_dense = |sparks: usize| -> Result<_> {
+            let load = std::rc::Rc::new(weights::DenseLoad::push(&self.library));
+            let planning = weights::GlmfLoader { dense: load.clone(), ..loader.clone() };
+            let model = {
+                let _memory_scope = cuteafd_ffi::memory_ledger::scope("weights");
+                planning.model(&self.cfg, &execution)?
+            };
+            let (operands, steps) = load.sink.as_ref().context("push sink")?.take();
+            let dense = crate::shared::experts::rtx::dense::plan_ranks(&args.snapshot, operands.clone(),
+                steps.clone(), &devices, sparks)?;
+            Ok((model, operands, steps, dense))
+        };
+        // Each GPU's TP2 halves' resident budget (admitted minus workspace), when any.
+        let tp2_budget_plan = || -> Result<Option<Vec<usize>>> {
+            Ok(match self.experts.as_ref().and_then(|c| c.exl3()) {
+                Some(manifest) if !tp2_layers.is_empty() => {
+                    let workspace = crate::shared::experts::rtx::exl3::Exl3Tp2::workspace_bytes_for(
+                        &tp2_package(manifest), self.cfg.hidden, args.expert_rows())?;
+                    Some(tp2_budgets()?.map(|b| b.saturating_sub(workspace)).to_vec())
+                }
+                None if !tp2_layers.is_empty() => anyhow::bail!("coordinator TP2 push needs EXL3 experts"),
+                _ => None,
+            })
+        };
         let mut coordinator_push = None;
         let admission = if args.peers.is_some() {
             let peers = args.peers.as_deref().context("worker placement handshake needs Spark peers")?
@@ -1806,48 +1840,36 @@ impl Opened {
             };
             let admission = crate::shared::placement::SparkAdmission::plan(source, geometry, self.experts.as_ref(),
                 &working, peers.len(), None, model)?;
-            // Each coordinator GPU joins the Spark push group as one more rank:
-            // its dense operands (class 2 landing, class 3 staged and transformed
-            // on the GPU) and, with TP2 layers, its EXL3 expert halves. Planning
-            // failure leaves the coordinator on the mount.
-            let gpus = 1 + usize::from(peer_stream.is_some());
-            // Plan the dense records from headers before membership: a planning
-            // error offers no coordinator ranks (the coordinator loads by mount,
-            // the Sparks still push).
-            let devices: Vec<_> = std::iter::once(args.device).chain(peer_stream.map(|(d, _)| d))
-                .map(|id| crate::shared::memory::device::Device { library: &self.library, id }).collect();
             let ranks = if admission.coordinator_pushes() && dense_pushable(&args) {
                 (|| -> Result<_> {
-                    let tp2 = match self.experts.as_ref().and_then(|c| c.exl3().map(|m| (c, m))) {
-                        Some((_, manifest)) if !tp2_layers.is_empty() => {
-                            let workspace = crate::shared::experts::rtx::exl3::Exl3Tp2::workspace_bytes_for(
-                                &tp2_package(manifest), self.cfg.hidden, args.expert_rows())?;
-                            Some(tp2_budgets()?.map(|b| b.saturating_sub(workspace)).to_vec())
-                        }
-                        None if !tp2_layers.is_empty() => anyhow::bail!("coordinator TP2 push needs EXL3 experts"),
-                        _ => None,
-                    };
-                    let load = std::rc::Rc::new(weights::DenseLoad::push(&self.library));
-                    let planning = weights::GlmfLoader { dense: load.clone(), ..loader.clone() };
-                    let model = {
-                        let _memory_scope = cuteafd_ffi::memory_ledger::scope("weights");
-                        planning.model(&self.cfg, &execution)?
-                    };
-                    let (operands, steps) = load.sink.as_ref().context("push sink")?.take();
-                    let dense = crate::shared::experts::rtx::dense::plan_ranks(&args.snapshot, operands.clone(),
-                        steps.clone(), &devices, peers.len())?;
+                    let tp2 = tp2_budget_plan()?;
+                    let planned = plan_dense(peers.len())?;
                     let prepared = crate::shared::experts::rtx::push::CoordinatorPush::prepare(&args.snapshot,
                         self.experts.as_ref().filter(|_| tp2.is_some()), gpus,
                         tp2.map(|budgets| (&tp2_layers[..], budgets)))?;
-                    Ok((prepared, (model, operands, steps, dense)))
-                })().map_err(|error| tracing::info!(%error, "coordinator push unavailable; mount")).ok()
+                    Ok((prepared, planned))
+                })().map_err(|error| tracing::warn!(%error, "coordinator push unavailable; mount")).ok()
             } else { None };
             let ranks = ranks.map(|((push, streams, ranks), planned)| {
-                coordinator_push = Some((push, peers.len(), devices, planned));
+                coordinator_push = Some((push, peers.len(), devices.clone(), planned));
                 (streams, ranks)
             });
             Some(admission.start_with(&peers, ranks)?)
-        } else { None };
+        } else {
+            // No Spark peers: the coordinator GPUs push alone (dense operands and
+            // their TP2 expert halves).
+            if dense_pushable(&args) {
+                coordinator_push = (|| -> Result<_> {
+                    let tp2 = tp2_budget_plan()?;
+                    let planned = plan_dense(0)?;
+                    let push = crate::shared::experts::rtx::push::CoordinatorPush::prepare_alone(&args.snapshot,
+                        self.experts.as_ref().filter(|_| tp2.is_some()), gpus,
+                        tp2.map(|budgets| (&tp2_layers[..], budgets)))?;
+                    Ok((push, 0, devices.clone(), planned))
+                })().map_err(|error| tracing::warn!(%error, "coordinator push unavailable; mount")).ok();
+            }
+            None
+        };
         // The admitted TP2 expert halves land inside the Spark admission window;
         // execution (modules, workspaces, routes) binds once the engine exists.
         let tp2_weights = |pushed| -> Result<crate::shared::experts::rtx::Tp2Weights<'_>> {

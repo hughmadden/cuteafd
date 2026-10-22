@@ -349,7 +349,7 @@ fn dense_planning_error_sends_the_whole_group_to_mount() -> Result<()> {
     mark(root.path(), c"user.sparknest.cluster", br#"{"me":"coordinator"}"#)?;
     for entry in std::fs::read_dir(root.path())? {
         let path = entry?.path();
-        if path.extension().is_some_and(|e| e == "safetensors") { mark(&path, c"user.sparknest.hosts", b"[]")?; }
+        if path.extension().is_some_and(|e| e == "safetensors") { mark(&path, c"user.sparknest.hosts", b"coordinator")?; }
     }
     let catalog = cuteafd_loader::read_expert_catalog(root.path())?;
     dense_error_mount_group(&library, root.path(), &catalog, true)?;
@@ -778,7 +778,7 @@ fn scales_first_shard_keeps_one_open_step_per_source() -> Result<()> {
         Ok(())
     };
     mark(root.path(), c"user.sparknest.cluster", br#"{"me":"coordinator"}"#)?;
-    mark(&shard, c"user.sparknest.hosts", b"[]")?;
+    mark(&shard, c"user.sparknest.hosts", b"coordinator")?;
     let rect = |base: usize, bytes: usize| Rect { name: format!("t{base}"), path: shard.clone(), base: base as u64,
         row_bytes: bytes, rows: 0..1, cols: 0..bytes };
     let (scale_at, weight_at) = (|e: usize| e * scale, |e: usize| experts * scale + e * weight);
@@ -828,5 +828,181 @@ fn scales_first_shard_keeps_one_open_step_per_source() -> Result<()> {
     let mut actual = vec![0u8; experts * scale];
     library.copy_d2h(&mut actual, scales.buffer)?;
     assert_eq!(&actual[..], &file[..experts * scale], "scales landed exactly");
+    Ok(())
+}
+
+/// Without Spark peers the coordinator GPUs form the push group alone: the
+/// owner's driver offers both ranks, creates the group on the SparkNest
+/// endpoint and uploads their dense entries; each rank joins, receives its
+/// runs in file order and commits, and every operand lands exactly.
+#[test]
+#[ignore = "requires an allocated CPU build slot and explicit NVMe fixture directory"]
+fn coordinator_ranks_alone_push_dense_records_exactly() -> Result<()> {
+    use crate::shared::experts::rtx::dense::{plan_records, Job, Operand, Rect, Records, Step};
+    let _ = tracing_subscriber::fmt().with_env_filter("info").with_test_writer().try_init();
+    let fixture = Fixture::build()?;
+    let library = fixture.load()?;
+    for device in 0..2 { fixture.configure_memory(&library, device, 64 << 30)?; }
+    let root = tempfile::tempdir_in(fixture.directory())?;
+    let (tensors, _) = qwen4_exl3(2, 4);
+    let tensors: Vec<_> = tensors.into_iter().filter(|t| !t.0.contains(".experts.")
+        || t.0.contains(".experts.0.")).collect();
+    let mut config = qwen4_config(2);
+    config["text_config"]["num_experts"] = serde_json::json!(1);
+    config["text_config"]["num_experts_per_tok"] = serde_json::json!(1);
+    write_snapshot(root.path(), &config, &tensors, None);
+    let mark = |path: &std::path::Path, name: &std::ffi::CStr, value: &[u8]| -> Result<()> {
+        let path = std::ffi::CString::new(path.as_os_str().as_encoded_bytes())?;
+        // SAFETY: both strings are NUL-terminated and live across the call; the
+        // value pointer and length describe one live buffer.
+        let status = unsafe { libc::setxattr(path.as_ptr(), name.as_ptr(), value.as_ptr().cast(), value.len(), 0) };
+        anyhow::ensure!(status == 0, "setxattr: {}", std::io::Error::last_os_error());
+        Ok(())
+    };
+    mark(root.path(), c"user.sparknest.cluster", br#"{"me":"coordinator"}"#)?;
+    let mut shards = Vec::new();
+    for entry in std::fs::read_dir(root.path())? {
+        let path = entry?.path();
+        if path.extension().is_some_and(|e| e == "safetensors") {
+            mark(&path, c"user.sparknest.hosts", b"coordinator")?;
+            let bytes = std::fs::metadata(&path)?.len();
+            let pattern: Vec<u8> = (0..bytes).map(|i| (i as u8).wrapping_mul(29) ^ 0xa5).collect();
+            // Keep the header; pattern the payload.
+            let header = 8 + u64::from_le_bytes(std::fs::read(&path)?[..8].try_into()?) as usize;
+            File::options().write(true).open(&path)?.write_all_at(&pattern[header..], header as u64)?;
+            shards.push(path);
+        }
+    }
+    // Four non-expert tensors, from the shards' own headers.
+    let mut names = Vec::new();
+    for path in &shards {
+        let bytes = std::fs::read(path)?;
+        let length = u64::from_le_bytes(bytes[..8].try_into()?) as usize;
+        let header: serde_json::Map<String, serde_json::Value> = serde_json::from_slice(&bytes[8..8 + length])?;
+        for (name, value) in header {
+            let Some(offsets) = value.get("data_offsets").and_then(|o| o.as_array()) else { continue };
+            let (start, end) = (offsets[0].as_u64().context("offset")?, offsets[1].as_u64().context("offset")?);
+            if !name.contains(".experts.") && end > start {
+                names.push((name, path.clone(), 8 + length as u64 + start, (end - start) as usize));
+            }
+        }
+    }
+    names.sort();
+    anyhow::ensure!(names.len() == 2, "fixture has two dense tensors, found {}", names.len());
+    // Both GPUs receive both tensors (a replica each, as head-split norms).
+    let names: Vec<_> = names.iter().chain(&names).cloned().collect();
+    let devices = [Device { library: &library, id: 0 }, Device { library: &library, id: 1 }];
+    // Per GPU: one landed operand and one staged upload.
+    let mut records = Records::default();
+    let mut owned = Vec::new();
+    for (gpu, pair) in names.chunks(2).enumerate() {
+        let rects: Vec<_> = pair.iter().map(|(name, path, base, bytes)| Rect { name: name.clone(), path: path.clone(),
+            base: *base, row_bytes: *bytes, rows: 0..1, cols: 0..*bytes }).collect();
+        let allocations = devices[gpu].run(|| rects.iter().map(|r|
+            crate::shared::memory::DeviceAllocation::new(&library, r.bytes().max(256))).collect::<Result<Vec<_>>>())?;
+        records.operands.push(Operand { device: gpu as i32, buffer: allocations[0].buffer,
+            lands: vec![(rects[0].clone(), 0)], bytes: rects[0].bytes() });
+        records.steps.push(Step { device: gpu as i32, rects: vec![rects[1].clone()],
+            jobs: vec![Job::Upload { at: 0, bytes: rects[1].bytes(), dst: allocations[1].buffer }] });
+        owned.push((rects, allocations));
+    }
+    let dense = plan_records(root.path(), records, &devices, 0)?;
+    let sockets = tempfile::tempdir_in(fixture.directory())?;
+    let socket = sockets.path().join("hub.sock").to_string_lossy().into_owned();
+    let listener = Listener::bind(&socket)?;
+    let push = CoordinatorPush::prepare_alone_at(root.path(), None, 2, None, Some(socket.clone()))?;
+    let hub_root = root.path().to_path_buf();
+    let hub_socket = socket.clone();
+    let hub = std::thread::spawn(move || -> Result<()> {
+        let listener = std::sync::Arc::new(listener);
+        let accept = { let listener = listener.clone(); let hub_socket = hub_socket.clone();
+            move || crate::shared::memory::push_testing::accept_within(&listener, &hub_socket, Duration::from_secs(120)) };
+        let coordinator = accept()?;
+        coordinator.set_timeout(Some(Duration::from_secs(60)))?;
+        let (request, _) = coordinator.next_request()?.context("no Create")?;
+        let Request::Create { ranks, files, .. } = request else { anyhow::bail!("expected Create") };
+        anyhow::ensure!(ranks.iter().map(|r| r.rank).eq([0, 1]), "coordinator ranks 0 and 1 alone");
+        coordinator.send_event(&Event::Created { group: 7, token: 11 })?;
+        // Ranks join (on their own connections) while the plan uploads; the
+        // driver starts once both have joined.
+        let joins = std::thread::spawn(move || -> Result<Vec<_>> {
+            let mut joined = Vec::new();
+            for _ in 0..2 {
+                let conn = accept()?;
+                conn.set_timeout(Some(Duration::from_secs(60)))?;
+                let (request, fd) = conn.next_request()?.context("rank did not join")?;
+                let Request::Join { rank, slots, slot_bytes, .. } = request else { anyhow::bail!("expected Join") };
+                conn.send_event(&Event::Joined)?;
+                joined.push((rank, conn, File::from(fd.context("ring fd")?), slots, slot_bytes));
+            }
+            Ok(joined)
+        });
+        let (mut patterns, mut entries) = (Vec::new(), Vec::new());
+        loop {
+            match coordinator.next_request()?.context("plan upload ended")?.0 {
+                Request::Patterns(p) => patterns.extend(p),
+                Request::Entries(e) => entries.extend(e),
+                Request::Start => break,
+                other => anyhow::bail!("unexpected {other:?}"),
+            }
+        }
+        coordinator.send_event(&Event::Planned(Default::default()))?;
+        let plan = cuteafd_loader::push_load::plan::Plan { files, patterns, entries };
+        let joined = joins.join().map_err(|_| anyhow::anyhow!("join acceptor panicked"))??;
+        for (rank, conn, ring, slots, slot_bytes) in &joined {
+            let mut runs = Vec::new();
+            for entry in plan.entries.iter().filter(|e| e.rank == *rank) {
+                let pattern = &plan.patterns[entry.pattern as usize];
+                for (src, dst) in pattern.runs() { runs.push((entry.file, entry.src_base + src, entry.dst_base + dst, pattern.run)); }
+            }
+            runs.sort_unstable();
+            let mut index = 0usize;
+            let mut packer = slot::Packer::new(vec![0; *slot_bytes as usize]);
+            let mut send = |bytes: Vec<u8>| -> Result<()> {
+                let at = index % *slots as usize;
+                ring.write_all_at(&bytes, at as u64 * u64::from(*slot_bytes))?;
+                conn.send_event(&Event::Filled { slot: at as u32, len: bytes.len() as u32 })?;
+                let (release, _) = conn.next_request()?.context("missing release")?;
+                anyhow::ensure!(matches!(release, Request::Release { slot } if slot == at as u32), "release order");
+                index += 1;
+                Ok(())
+            };
+            for (file, src, dst, length) in runs {
+                let mut run = vec![0u8; length as usize];
+                File::open(hub_root.join(&plan.files[file as usize]))?.read_exact_at(&mut run, src)?;
+                let (mut bytes, mut destination) = (&run[..], dst);
+                while !bytes.is_empty() {
+                    let n = packer.push(destination, bytes);
+                    if n == 0 {
+                        send(std::mem::replace(&mut packer, slot::Packer::new(vec![0; *slot_bytes as usize])).finish().0)?;
+                        continue;
+                    }
+                    destination += n as u64;
+                    bytes = &bytes[n..];
+                }
+            }
+            if !packer.is_empty() { send(packer.finish().0)?; }
+            conn.send_event(&Event::Done)?;
+        }
+        coordinator.send_event(&Event::Done)?;
+        // The driver keeps the group open until every rank initialized, then closes it.
+        anyhow::ensure!(coordinator.next_request()?.is_none(), "the driver closes its group after the commit");
+        Ok(())
+    });
+    let (pushed, ()) = push.receive_with(devices.to_vec(), None, 0, Some(Ok(dense)), || ());
+    let served = hub.join().map_err(|_| anyhow::anyhow!("fake hub panicked"))?;
+    let pushed = pushed?;
+    served?;
+    assert_eq!(pushed.map(|ranks| ranks.len()), Some(2), "both coordinator ranks commit");
+    for (gpu, (rects, allocations)) in owned.iter().enumerate() {
+        for (rect, allocation) in rects.iter().zip(allocations) {
+            let mut expected = vec![0; rect.bytes()];
+            rect.read(&mut expected)?;
+            let mut actual = vec![0; rect.bytes()];
+            devices[gpu].run(|| library.copy_d2h(&mut actual,
+                cuteafd_ffi::CuteafdDeviceBuffer { bytes: rect.bytes(), ..allocation.buffer }))?;
+            assert_eq!(actual, expected, "GPU {gpu} {}", rect.name);
+        }
+    }
     Ok(())
 }

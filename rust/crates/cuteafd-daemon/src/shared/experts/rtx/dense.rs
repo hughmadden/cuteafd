@@ -81,7 +81,7 @@ impl RankLayout {
 
     /// [`Self::new`] with `device`'s finishes from `finishes`.
     pub fn with_finishes(mut self, finishes: &[Finish]) -> Self {
-        self.finishes = finishes.iter().filter(|f| f.device() == self.device).copied().collect();
+        self.finishes = finishes.iter().filter(|f| f.device() == self.device).cloned().collect();
         self
     }
 

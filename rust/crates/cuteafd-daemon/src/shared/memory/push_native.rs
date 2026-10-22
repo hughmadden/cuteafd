@@ -260,7 +260,7 @@ fn checked_plan(root: &Path, catalog: &OfficialV41Catalog,
     }
     let mut builder = Builder::new(root, offers.iter().map(|o| o.arena_bytes).collect());
     for (rank, plan) in plans.iter().enumerate() { plan.append(&mut builder, catalog, sparks, rank)?; }
-    if let Some(coordinator) = coordinator { (coordinator.append)(&mut builder, catalog, &offers[sparks..])?; }
+    if let Some(coordinator) = coordinator { (coordinator.append)(&mut builder, Some(catalog), &offers[sparks..])?; }
     Ok(builder.finish()?)
 }
 
