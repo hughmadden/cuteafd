@@ -1,5 +1,6 @@
 //! Real checkpoint scale planes, independently packed on the CPU and compared
-//! with both production load paths. Run in the slot's architecture dev image.
+//! with production mount, Spark push, coordinator TP2 and recorded dSpark loads.
+//! Run in the slot's architecture dev image.
 use super::coordinator_golden_tests::{library, snapshot};
 use crate::shared::{
     experts::layer::{ExpertLayer, ExpertWeights},
@@ -133,6 +134,62 @@ fn installed_pushed_scale_codes_equal_cpu_pack() -> Result<()> {
                 && pinned <= (MAX_OPEN_STEPS * STEP_BYTES) as u64, "unbounded scale staging");
             eprintln!("push TP{world}: scale planes byte-exact; staged={staged} pinned={pinned}");
         }
+    }
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUTEAFD_PUSH_V41, CUTEAFD_NATIVE_LIB and V4.1 TP2 GPU packages"]
+fn installed_coordinator_tp2_scale_codes_equal_cpu_pack() -> Result<()> {
+    use crate::shared::{
+        experts::rtx::{dense::{testing::PEAKS, Job, Operand, Rect, Records, Step}, push::tests::receive_pushed},
+        memory::{push_coordinator::Tp2ExpertPlan, DeviceAllocation},
+    };
+    let snapshot = snapshot().context("set CUTEAFD_PUSH_V41")?;
+    let library = library()?;
+    library.cuda_set_device(0)?;
+    let device = Device { library: &library, id: 0 };
+    let catalog = cuteafd_loader::read_official_v41_catalog(&snapshot)?;
+    ensure!(catalog.mxfp4_scale_codes() && catalog.nvfp4().is_none(), "requires native V4.1");
+    let tensor = catalog.tensor("layers.3.ffn.experts.0.w1.scale")?;
+    let rect = Rect { name: tensor.metadata.name.clone(), path: snapshot.join(&tensor.shard),
+        base: tensor.metadata.byte_offset, row_bytes: tensor.metadata.shape[1], rows: 0..1,
+        cols: 0..tensor.metadata.shape[1] };
+    let mut dense_expected = vec![0; rect.bytes()];
+    rect.read(&mut dense_expected)?;
+    let allocations = [DeviceAllocation::new(&library, 256)?, DeviceAllocation::new(&library, 256)?];
+    let mut records = Records::default();
+    records.operands.push(Operand { device: 0, buffer: allocations[0].buffer,
+        lands: vec![(rect.clone(), 0)], bytes: rect.bytes() });
+    records.steps.push(Step { device: 0, rects: vec![rect.clone()],
+        jobs: vec![Job::Upload { at: 0, bytes: rect.bytes(), dst: allocations[1].buffer }] });
+    let socket_root = std::env::var_os("CUTEAFD_SCALE_CODES_SOCKET_DIR")
+        .context("set CUTEAFD_SCALE_CODES_SOCKET_DIR to a writable task directory")?;
+    let sockets = tempfile::tempdir_in(socket_root)?;
+    // Receive each logical TP2 half on one physical GPU, with real dense and
+    // staged bytes on either side of the TP2 arena's logical space. The
+    // bounded fake source and receive_rank exercise the actual Combined path.
+    for rank in 0..2 {
+        PEAKS.with(|p| { p.take(); });
+        let layer = ExpertLayer::BackboneTp2 { layer: 3, rank };
+        let budget = ExpertWeights::plan(&library, &catalog, layer)?;
+        let plan = Tp2ExpertPlan::new(&catalog, &[3], rank, budget.resident_bytes)?;
+        ensure!(plan.layout.bytes() == budget.resident_bytes, "TP2 admitted extent mismatch");
+        let pushed = receive_pushed(device, &catalog, &snapshot, sockets.path(), &records,
+            Some(plan), 6, rank)?.native()?;
+        ensure!(pushed.len() == 1, "expected one committed TP2 layer");
+        compare_mount(&library, &catalog, &pushed[0], layer)?;
+        for allocation in &allocations {
+            compare(&library, allocation.buffer, 0, &dense_expected, "combined dense/staged bytes")?;
+        }
+        let peaks = PEAKS.with(|p| p.take());
+        ensure!(peaks.len() == 2, "expected dense and coded TP2 staging ledgers");
+        for (staged, pinned) in peaks {
+            ensure!(staged <= 256u64 << 20 && pinned + (1 << 20) <= 257u64 << 20,
+                "coordinator TP2 scale staging exceeds 257 MiB including job table");
+            eprintln!("coordinator TP2 rank{rank}: staged={staged} pinned={pinned}");
+        }
+        eprintln!("{layer:?}: coordinator receive_rank scale planes byte-exact against CPU");
     }
     Ok(())
 }
