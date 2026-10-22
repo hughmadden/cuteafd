@@ -151,3 +151,44 @@ fn narrowing_matches_bf16_round_on_edge_values() -> Result<()> {
     }
     Ok(())
 }
+
+/// The two-GPU split operands recorded (allocated as through the mount,
+/// bytes deferred), then each GPU's records pushed through a ring in file
+/// order into its rank (narrowing on the GPU): every operand matches the mount
+/// golden and each rank's staging stays one buffer.
+#[test]
+#[ignore = "requires CUTEAFD_PUSH_STEP5 (a SparkNest namespace), CUTEAFD_NATIVE_LIB and two RTX GPUs"]
+fn installed_pushed_coordinator_operands_match_the_mount_golden() -> Result<()> {
+    use crate::shared::experts::rtx::dense::{Recorder, STEP_BYTES};
+    let Some(snapshot) = snapshot() else { return Ok(()) };
+    let checkpoint = Checkpoint::coordinator(&snapshot, false, true)?;
+    let library = library()?;
+    let (root, _) = cuteafd_loader::push_load::namespace(&snapshot)?;
+    let recorder = Recorder::start(true)?.context("recorder")?;
+    let mut owners = Vec::new();
+    for (prefix, device, layout) in layouts(&checkpoint)?.into_iter().filter(|(p, ..)| p.starts_with("split")) {
+        let device = Device { library: &library, id: device };
+        for operand in layout.operands.iter().filter(|o| covered(&o.name)) {
+            owners.push((format!("{prefix}.{}", operand.name),
+                super::weights::load_operand(device, &checkpoint, &layout, operand)?));
+        }
+    }
+    let records = recorder.finish();
+    let (bytes, operands, staged, steps, largest, finishes) = records.summary();
+    eprintln!("records: class2 {bytes} B in {operands} operands; class3 {staged} B in {steps} steps (largest {largest} B); \
+        {finishes} finishes");
+    anyhow::ensure!(steps > 0 && largest <= STEP_BYTES, "narrowing steps within the bound");
+    let catalog = cuteafd_loader::read_expert_catalog(&snapshot)?;
+    let sockets = tempfile::tempdir()?;
+    for gpu in 0..2 {
+        crate::shared::experts::rtx::push::tests::receive_pushed(Device { library: &library, id: gpu }, &catalog, &root,
+            sockets.path(), &records, None, 6, gpu as usize)?;
+    }
+    for (staged, pinned) in crate::shared::experts::rtx::dense::testing::PEAKS.with(|p| p.take()) {
+        eprintln!("rank staging peak {staged} B in use, {pinned} B pinned");
+        anyhow::ensure!(staged <= STEP_BYTES as u64 && pinned <= STEP_BYTES as u64, "staging beyond one step");
+    }
+    let mut actual = Digests::new();
+    for (key, allocation) in &owners { actual.insert(key.clone(), digest(&library, allocation.buffer)?); }
+    check(&actual, true)
+}
