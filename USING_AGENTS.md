@@ -367,6 +367,18 @@ before starting the gate; never move HEAD during it.
   Background shells and their completion watchers die with the session, so
   finished jobs must be collected by hand.
 - A session limit stops every agent at once; resume each with a short note.
+- **Launch every hardware run, golden and long build as a systemd user
+  unit:** `systemd-run --user --unit=<task-name> --collect
+  --setenv=PATH="$PATH" --setenv=HOME="$HOME" --working-directory=<dir>
+  bash -c '<cmd> > <log> 2>&1; echo exit $? >> <log>'`. `nohup setsid`
+  is not enough: the job stays in the Claude session's `tmux-spawn-*.scope`
+  cgroup and dies with it, queued hwlock tickets included (twice on
+  2026-10-22). Check `/proc/<pid>/cgroup` reads `app.slice/<name>.service`.
+  Pass PATH and HOME explicitly: a user unit otherwise gets systemd's
+  minimal PATH, and host-side Cargo exits 127. Transient units live only in
+  `/run` and unload when the command exits, so they leave nothing behind.
+- Stop your own jobs by PID or `systemctl --user stop <unit>`, never with
+  `pkill -f`: the pattern can match your own Bash command line and kill it.
 
 ### Known Codex behavior
 
