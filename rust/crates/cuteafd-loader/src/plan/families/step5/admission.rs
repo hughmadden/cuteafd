@@ -246,14 +246,19 @@ impl RuntimeInputs {
         }
     }
 
-    /// Shared alternating whole-layer ownership for CSA; SWA uses the native
-    /// head split on TP2. The same modes bind weights, state and residual hops.
+    /// Diagnostic alternating ownership; production admission scores complete ranges.
+    #[cfg(test)]
     pub fn ownership(&self, cfg: &Config) -> Result<ExecutionOwnership> {
-        let ranks = self.inventory.gpus.len();
         let owners = attention::alternating_owners(
             cfg.full[..cfg.layers].iter().map(|&full| (full, None)),
             0,
         )?;
+        self.ownership_for(cfg, &owners)
+    }
+
+    fn ownership_for(&self, cfg: &Config, owners: &[u8]) -> Result<ExecutionOwnership> {
+        let ranks = self.inventory.gpus.len();
+        ensure!(owners.len() == cfg.layers, "Step-5 CSA owner extent");
         let modes = (0..cfg.layers)
             .map(|layer| {
                 if ranks == 1 {
@@ -340,7 +345,7 @@ pub fn admit_mtp(checkpoint: &Checkpoint, inputs: &RuntimeInputs, depth: usize) 
 pub fn admit_with(
     cfg: &Config,
     inputs: &RuntimeInputs,
-    native: impl FnOnce(&ExecutionOwnership) -> Result<Vec<RankAdmission>>,
+    native: impl FnMut(&ExecutionOwnership) -> Result<Vec<RankAdmission>>,
 ) -> Result<Admission> {
     admit_depth_with(cfg, inputs, 0, native)
 }
@@ -350,13 +355,26 @@ fn admit_depth_with(
     cfg: &Config,
     inputs: &RuntimeInputs,
     depth: usize,
-    native: impl FnOnce(&ExecutionOwnership) -> Result<Vec<RankAdmission>>,
+    mut native: impl FnMut(&ExecutionOwnership) -> Result<Vec<RankAdmission>>,
 ) -> Result<Admission> {
     ensure!(depth <= cfg.mtp, "Step-5 forecast predictor depth exceeds checkpoint");
     inputs.validate(cfg)?;
-    let ownership = inputs.ownership(cfg)?;
+    let ranks = inputs.inventory.gpus.len();
+    let groups = cfg.full[..cfg.layers].iter().map(|&full| (ranks == 2 && full, None))
+        .collect::<Vec<_>>();
+    let policy = if ranks == 2 { attention::LayerOwnership::Ranges }
+        else { attention::LayerOwnership::Alternating };
+    attention::solve_owners(&groups, policy, 0, Onboard::Auto, |owners| -> Result<_> {
+        let ownership = inputs.ownership_for(cfg, owners)?;
+        let native = native(&ownership)?;
+        let admitted = admit_frozen(cfg, inputs, depth, &ownership, &native)?;
+        Ok((admitted.placement.clone(), admitted))
+    }).map(|(_, admitted)| admitted)
+}
+
+fn admit_frozen(cfg: &Config, inputs: &RuntimeInputs, depth: usize,
+    ownership: &ExecutionOwnership, native: &[RankAdmission]) -> Result<Admission> {
     let ranks = ownership.ranks();
-    let native = native(&ownership)?;
     ensure!(
         native.len() == ranks,
         "Step-5 native admission rank inventory"
@@ -737,7 +755,50 @@ mod tests {
                     admission.ownership.execution().mode(0)?,
                     LayerMode::HeadSplit
                 );
-                assert_eq!(admission.ownership.execution().mode(7)?, WHOLE1);
+                let owners = (0..92).filter(|&layer| config().full[layer])
+                    .map(|layer| admission.ownership.execution().mode(layer))
+                    .collect::<Result<Vec<_>>>()?;
+                assert!(owners.contains(&WHOLE0) && owners.contains(&WHOLE1));
+                assert!(owners.windows(2).all(|pair| pair != [WHOLE1, WHOLE0]));
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn owner_search_scores_predictor_complete_inventory_and_keeps_winning_layout() -> Result<()> {
+        let cfg = config();
+        for format in [crate::families::qwen4::Qwen4KvCache::Bf16,
+            crate::families::qwen4::Qwen4KvCache::Fp8] {
+            let mut inputs = inputs(2);
+            inputs.kv_format = format;
+            inputs.requested_pool = None;
+            inputs.marks.host = true;
+            let native = |ownership: &ExecutionOwnership, predictor: bool| -> Result<Vec<RankAdmission>> {
+                Ok((0..2).map(|rank| RankAdmission {
+                    immutable: (1 << 30) + if rank == 0 && predictor { 12 << 30 } else { 0 },
+                    workspace: if rank == 0 && predictor { 512 << 20 } else { 1 << 20 },
+                }).take(ownership.ranks()).collect())
+            };
+            let base = admit_depth_with(&cfg, &inputs, 0, |o| native(o, false))?;
+            let candidate = admit_depth_with(&cfg, &inputs, 3, |o| native(o, true))?;
+            let count = |a: &Admission| a.placement.layers.iter().enumerate().filter(|(layer, item)|
+                cfg.full[*layer] && item.mode == WHOLE0).count();
+            assert!(count(&candidate) < count(&base), "predictor pressure must move CSA off the head GPU");
+            let alternating = inputs.ownership(&cfg)?;
+            let old = admit_frozen(&cfg, &inputs, 3, &alternating, &native(&alternating, true)?)?;
+            assert!(attention::owner_score(Onboard::Auto, &candidate.placement)
+                > attention::owner_score(Onboard::Auto, &old.placement));
+            assert_eq!(candidate.marks, 2);
+            assert_eq!(candidate.cache.ranks[0].mtp_lengths.len(), 3);
+            assert!(candidate.cache.ranks[1].mtp_lengths.is_empty());
+            let expected = Step5CacheLayout::for_execution(&cfg, &candidate.ownership,
+                candidate.cache.context, 3, inputs.rows as u64, format)?;
+            assert_eq!(candidate.cache, expected);
+            for rank in 0..2 {
+                let reservation = Reservation::new(&expected, rank, inputs.sequences as u64,
+                    candidate.marks as u64, candidate.placement.pool_tokens / 64, usize::MAX)?;
+                assert_eq!(candidate.reservations[rank].total, reservation.total);
             }
         }
         Ok(())
