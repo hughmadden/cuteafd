@@ -15,8 +15,6 @@ use cuteafd_loader::{push_load::builder::{Builder, CheckedPlan, Destination}, Of
 /// native images at world 2, packed after Done like a Spark rank's).
 pub(crate) struct CoordinatorExpertPlan {
     pub residencies: Vec<V41Exl3Residency>,
-    /// Each EXL3 residency's expert layer selection (the mount loader's own).
-    pub selections: Vec<crate::shared::experts::layer::ExpertLayer>,
     /// Native planes per layer (empty for EXL3).
     pub native: Vec<cuteafd_loader::push_load::native::NativePlanes>,
     pub layers: Vec<usize>,
@@ -33,35 +31,28 @@ impl CoordinatorExpertPlan {
         let manifest = catalog.exl3().context("coordinator TP2 push requires EXL3 checkpoint headers")?;
         let residencies = layers.iter().map(|&layer| manifest.residency(V41Exl3Layer::Backbone(layer), 2, gpu))
             .collect::<Result<Vec<_>>>()?;
-        let selections = layers.iter().map(|&layer|
-            crate::shared::experts::layer::ExpertLayer::BackboneTp2 { layer, rank: gpu }).collect();
-        Self::exl3(residencies, selections, layers.to_vec(), gpu, admitted)
+        Self::exl3(residencies, layers.to_vec(), gpu, admitted)
     }
 
-    /// Whole expert layers on one coordinator GPU (`BackboneFull` layers and
-    /// `Dspark` stages, world 1), exactly the local mount loader's residencies.
-    pub fn whole(catalog: &OfficialV41Catalog, selections: &[crate::shared::experts::layer::ExpertLayer],
-        admitted: usize) -> Result<Self> {
-        use crate::shared::experts::layer::ExpertLayer;
-        ensure!(selections.iter().all(|s| matches!(s, ExpertLayer::BackboneFull { .. } | ExpertLayer::Dspark { .. })),
-            "a whole-layer coordinator plan takes full backbone layers and draft stages");
-        let residencies = selections.iter().map(|&s| crate::shared::experts::exl3::planned_residency(catalog, s))
-            .collect::<Result<Vec<_>>>()?;
-        let layers = selections.iter().filter_map(|s| match s { ExpertLayer::BackboneFull { layer } => Some(*layer),
+    /// Whole (world 1) EXL3 residencies on one coordinator GPU, backbone
+    /// layers and draft stages, as the caller planned them (the local mount
+    /// loader's own residencies).
+    pub fn whole(residencies: Vec<V41Exl3Residency>, admitted: usize) -> Result<Self> {
+        ensure!(residencies.iter().all(|r| r.world == 1 && r.rank == 0),
+            "a whole-layer coordinator plan takes world-1 residencies");
+        let layers = residencies.iter().filter_map(|r| match r.layer { V41Exl3Layer::Backbone(layer) => Some(layer),
             _ => None }).collect();
-        Self::exl3(residencies, selections.to_vec(), layers, 0, admitted)
+        Self::exl3(residencies, layers, 0, admitted)
     }
 
-    fn exl3(residencies: Vec<V41Exl3Residency>, selections: Vec<crate::shared::experts::layer::ExpertLayer>,
-        layers: Vec<usize>, gpu: usize, admitted: usize) -> Result<Self> {
+    fn exl3(residencies: Vec<V41Exl3Residency>, layers: Vec<usize>, gpu: usize, admitted: usize) -> Result<Self> {
         ensure!(residencies.iter().all(|r| r.unit_map.is_none()), "coordinator EXL3 keeps the legacy residency");
         let sizes = residencies.iter().map(|r| r.device_arena_layout().map(|(_, bytes)| bytes))
             .collect::<Result<Vec<_>, _>>()?;
         let layout = ArenaLayout::new(sizes, admitted)?;
         let validation = ValidationLayout::exl3(&residencies, layout.bytes() as u64, usize::MAX)?;
         let layout = layout.with_validation(validation.bytes(), validation.bytes())?;
-        Ok(Self { residencies, selections, native: Vec::new(), layers, gpu, layout, validation,
-            scales: Default::default() })
+        Ok(Self { residencies, native: Vec::new(), layers, gpu, layout, validation, scales: Default::default() })
     }
 
     /// Native MXFP4 halves: each layer's four planes for intermediate half
@@ -86,8 +77,7 @@ impl CoordinatorExpertPlan {
         }
         let layout = layout.with_generated(generated)?;
         let scales = super::push_native::ScalePlan::new(catalog, scale_layers, 2, gpu)?;
-        Ok(Self { residencies: Vec::new(), selections: Vec::new(), native, layers: layers.to_vec(), gpu, layout,
-            validation, scales })
+        Ok(Self { residencies: Vec::new(), native, layers: layers.to_vec(), gpu, layout, validation, scales })
     }
 
     /// Device scratch the post-Done native plane transform needs (0 for EXL3).

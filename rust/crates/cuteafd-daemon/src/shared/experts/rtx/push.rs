@@ -193,7 +193,15 @@ pub(crate) fn receive_rank<'a, D: PushDestination<Delivered = ()>>(
         let initialize = plan.residencies.iter().enumerate().map(|(region, residency)|
             push_initialize::Layer::Exl3 { region, residency }).collect::<Vec<_>>();
         let ready = std::rc::Rc::new(push_initialize::initialize(delivered, &initialize, Some(&plan.validation), 0)?);
-        plan.residencies.into_iter().zip(plan.selections).enumerate().map(|(region, (layout, selection))| {
+        plan.residencies.into_iter().enumerate().map(|(region, layout)| {
+            use crate::shared::experts::layer::ExpertLayer;
+            // The mount loader's selection of this residency.
+            let selection = match (layout.layer, layout.world) {
+                (V41Exl3Layer::Backbone(layer), 2) => ExpertLayer::BackboneTp2 { layer, rank: layout.rank },
+                (V41Exl3Layer::Backbone(layer), 1) => ExpertLayer::BackboneFull { layer },
+                (V41Exl3Layer::Dspark(stage), 1) => ExpertLayer::Dspark { stage },
+                (layer, world) => anyhow::bail!("coordinator EXL3 residency {layer:?} at world {world}"),
+            };
             let budget = crate::shared::experts::exl3::Exl3Weights::plan(catalog, selection)?;
             crate::shared::experts::exl3::Exl3Weights::from_push(ready.clone(), region, layout, budget)
         }).collect::<Result<Vec<_>>>().map(PushedExperts::Exl3)
@@ -247,8 +255,13 @@ impl CoordinatorExperts {
             Self::Tp2 { layers, budgets } => CoordinatorExpertPlan::new(catalog, layers, gpu,
                 *budgets.get(gpu).context("coordinator TP2 budget per GPU")?),
             Self::Whole { selections, budget } => {
+                use crate::shared::experts::layer::ExpertLayer;
                 ensure!(gpu == 0, "whole coordinator expert layers live on one GPU");
-                CoordinatorExpertPlan::whole(catalog, selections, *budget)
+                ensure!(selections.iter().all(|s| matches!(s, ExpertLayer::BackboneFull { .. } | ExpertLayer::Dspark { .. })),
+                    "a whole-layer coordinator plan takes full backbone layers and draft stages");
+                let residencies = selections.iter().map(|&s| crate::shared::experts::exl3::planned_residency(catalog, s))
+                    .collect::<Result<Vec<_>>>()?;
+                CoordinatorExpertPlan::whole(residencies, *budget)
             }
         }
     }

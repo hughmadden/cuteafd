@@ -1036,7 +1036,8 @@ fn coordinator_exl3_layers_push_byte_exact_at_world_one_and_two() -> Result<()> 
     let sockets = tempfile::tempdir_in(fixture.directory())?;
     let whole = [ExpertLayer::BackboneFull { layer: 0 }, ExpertLayer::BackboneFull { layer: 1 }];
     let plans: Vec<(CoordinatorExpertPlan, usize)> = vec![
-        (CoordinatorExpertPlan::whole(&catalog, &whole, usize::MAX)?, 0),
+        (CoordinatorExpertPlan::whole(whole.iter().map(|&s| crate::shared::experts::exl3::planned_residency(&catalog, s))
+            .collect::<Result<Vec<_>>>()?, usize::MAX)?, 0),
         (CoordinatorExpertPlan::new(&catalog, &[0, 1], 0, usize::MAX)?, 0),
         (CoordinatorExpertPlan::new(&catalog, &[0, 1], 1, usize::MAX)?, 1),
     ];
