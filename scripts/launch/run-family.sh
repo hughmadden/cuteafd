@@ -166,6 +166,7 @@ GATEWAY
 EOF
   if [[ "$1" == qwen3_5 ]]; then
     cat <<'EOF'
+KV_CACHE
 PREFIX_CACHE_MARK_MIB
 PREFIX_POINT_BOUNDARIES
 EOF
