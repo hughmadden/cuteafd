@@ -2413,40 +2413,43 @@ fn glm5_flash_layout_uses_physical_candidate_scratch_without_double_counting_ove
         "dflash_config":{"target_layer_ids":[0,8,16,24,32], "conv_group_size":16,
             "selector_rank":256, "block_size":8}});
     std::fs::write(draft.path().join("config.json"), config.to_string()).unwrap();
-    let mut options = layout::LayoutOptions { rtx_bytes: vec![32 << 30, 96 << 30], concurrency:8,
-        draft_sequences:8, draft_context_slots:Some(8), glmf_drafter_snapshot:Some(draft.path().into()),
-        context_tokens:131_072, ..Default::default() };
-    let run = |options: &layout::LayoutOptions| {
-        let report = plan(dir.path(), &PlanOptions { layout:Some(options.clone()),
-            attention_placement: Some(AttentionPlacement::Heads), ..sparks(4) }).unwrap();
-        assert!(report.placement_supported, "{:?}", report.memory_layout.as_ref().unwrap().notes);
-        report.memory_layout.unwrap()
-    };
-    let bytes = |memory: &cuteafd_core::memory_layout::MemoryLayout, rank, category| memory.devices.iter()
-        .filter(|d| d.kind == DeviceKind::Rtx && d.index == rank).flat_map(|d| &d.items)
-        .filter(|i| i.category == category && (category == Category::Drafter || i.group == "DFlash linear/attention scratch"))
-        .map(|i| i.bytes).sum::<u64>();
-    let (owned, scratch) = crate::placement::families::glm5_flash::drafter_inventory(&config,8,8,
-        &[170,188],GlmDraftRepresentation::Fp8Only,2, crate::families::qwen4::Qwen4KvCache::Bf16).unwrap();
-    let natural = run(&options);
-    assert_eq!(bytes(&natural,0,Category::Drafter), owned);
-    assert_eq!(bytes(&natural,0,Category::Workspace), scratch[0]);
-    assert_eq!(bytes(&natural,1,Category::Workspace), 0);
-    options.physical_sms = Some(188);
-    let simulated = run(&options);
-    assert_eq!(bytes(&simulated,0,Category::Drafter), owned);
-    assert_eq!(bytes(&simulated,0,Category::Workspace), scratch[1]);
-    options.drafter_bytes = owned + scratch[1];
-    // An explicit total must work even when no checkpoint can be read.
-    options.glmf_drafter_snapshot = Some(draft.path().join("absent"));
-    let explicit = run(&options);
-    assert_eq!(bytes(&explicit,0,Category::Drafter), options.drafter_bytes);
-    assert_eq!(bytes(&explicit,0,Category::Workspace), 0);
-    assert_eq!(explicit.pool_tokens, simulated.pool_tokens);
-    options.glmf_drafter_disabled = true;
-    let disabled = run(&options);
-    assert_eq!(bytes(&disabled,0,Category::Drafter), 0);
-    assert_eq!(bytes(&disabled,0,Category::Workspace), 0);
+    for draft_kv_cache in [crate::families::qwen4::Qwen4KvCache::Bf16,
+        crate::families::qwen4::Qwen4KvCache::Fp8] {
+        let mut options = layout::LayoutOptions { rtx_bytes: vec![32 << 30, 96 << 30], concurrency:8,
+            draft_sequences:8, draft_context_slots:Some(8), draft_kv_cache, glmf_drafter_snapshot:Some(draft.path().into()),
+            context_tokens:131_072, ..Default::default() };
+        let run = |options: &layout::LayoutOptions| {
+            let report = plan(dir.path(), &PlanOptions { layout:Some(options.clone()),
+                attention_placement: Some(AttentionPlacement::Heads), ..sparks(4) }).unwrap();
+            assert!(report.placement_supported, "{:?}", report.memory_layout.as_ref().unwrap().notes);
+            report.memory_layout.unwrap()
+        };
+        let bytes = |memory: &cuteafd_core::memory_layout::MemoryLayout, rank, category| memory.devices.iter()
+            .filter(|d| d.kind == DeviceKind::Rtx && d.index == rank).flat_map(|d| &d.items)
+            .filter(|i| i.category == category && (category == Category::Drafter || i.group == "DFlash linear/attention scratch"))
+            .map(|i| i.bytes).sum::<u64>();
+        let (owned, scratch) = crate::placement::families::glm5_flash::drafter_inventory(&config,8,8,
+            &[170,188],GlmDraftRepresentation::Fp8Only,2, draft_kv_cache).unwrap();
+        let natural = run(&options);
+        assert_eq!(bytes(&natural,0,Category::Drafter), owned);
+        assert_eq!(bytes(&natural,0,Category::Workspace), scratch[0]);
+        assert_eq!(bytes(&natural,1,Category::Workspace), 0);
+        options.physical_sms = Some(188);
+        let simulated = run(&options);
+        assert_eq!(bytes(&simulated,0,Category::Drafter), owned);
+        assert_eq!(bytes(&simulated,0,Category::Workspace), scratch[1]);
+        options.drafter_bytes = owned + scratch[1];
+        // An explicit total must work even when no checkpoint can be read.
+        options.glmf_drafter_snapshot = Some(draft.path().join("absent"));
+        let explicit = run(&options);
+        assert_eq!(bytes(&explicit,0,Category::Drafter), options.drafter_bytes);
+        assert_eq!(bytes(&explicit,0,Category::Workspace), 0);
+        assert_eq!(explicit.pool_tokens, simulated.pool_tokens);
+        options.glmf_drafter_disabled = true;
+        let disabled = run(&options);
+        assert_eq!(bytes(&disabled,0,Category::Drafter), 0);
+        assert_eq!(bytes(&disabled,0,Category::Workspace), 0);
+    }
 }
 
 #[test]
@@ -2718,32 +2721,38 @@ fn all_family_concurrency_defaults_match_explicit_logical_capacity() {
 
 #[test]
 fn mimo_draft_prefix_ledger_is_opt_in_and_checked() {
-    let dir = tempfile::tempdir().unwrap();
-    write_snapshot(dir.path(), &mimo_pro_config(), &mimo_pro_tensors(), Some(8));
-    let mut options = PlanOptions { layout: Some(layout::LayoutOptions {
-        concurrency: 16, ..Default::default()
-    }), ..sparks(4) };
-    let base = plan(dir.path(), &options).unwrap().memory_layout.unwrap();
-    assert!(!base.devices[0].items.iter().any(|i| i.group == "DFlash context marks"));
-    let draft = dir.path().join("dflash");
-    std::fs::create_dir(&draft).unwrap();
-    std::fs::write(draft.join("config.json"), json!({"num_hidden_layers": 5,
-        "num_key_value_heads": 8, "head_dim": 128}).to_string()).unwrap();
-    let disabled = plan(dir.path(), &options).unwrap().memory_layout.unwrap();
-    assert_eq!(disabled.devices[0].used_bytes(), base.devices[0].used_bytes());
-    options.layout.as_mut().unwrap().mimo_prefix_draft = true;
-    let marked = plan(dir.path(), &options).unwrap().memory_layout.unwrap();
-    let bytes = marked.devices[0].items.iter().find(|i| i.group == "DFlash context marks").unwrap().bytes;
-    assert_eq!(bytes, (20 * (1 << 20) + 8) * cuteafd_core::prefix::mark_slots_with_host(16, 20, 1, u64::MAX, true));
-    assert_eq!(marked.devices[0].items.iter().find(|i| i.group == "DFlash valid-floor transfer").unwrap().bytes, 16 * 8);
-    options.layout.as_mut().unwrap().draft_context_slots = Some(25);
-    let overridden = plan(dir.path(), &options).unwrap().memory_layout.unwrap();
-    assert_eq!(overridden.devices[0].items.iter().find(|i| i.group == "DFlash valid-floor transfer").unwrap().bytes, 16 * 8);
-    assert!(overridden.notes.iter().any(|note| note.contains("context slots 25")));
-    std::fs::write(draft.join("config.json"), "{}").unwrap();
-    let malformed = plan(dir.path(), &options).unwrap();
-    assert!(!malformed.placement_supported);
-    assert!(!malformed.executable());
+    for (draft_kv_cache, plane_bytes) in [
+        (crate::families::qwen4::Qwen4KvCache::Bf16, 2048),
+        (crate::families::qwen4::Qwen4KvCache::Fp8, 1056),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        write_snapshot(dir.path(), &mimo_pro_config(), &mimo_pro_tensors(), Some(8));
+        let mut options = PlanOptions { layout: Some(layout::LayoutOptions {
+            concurrency: 16, draft_kv_cache, ..Default::default()
+        }), ..sparks(4) };
+        let base = plan(dir.path(), &options).unwrap().memory_layout.unwrap();
+        assert!(!base.devices[0].items.iter().any(|i| i.group == "DFlash context marks"));
+        let draft = dir.path().join("dflash");
+        std::fs::create_dir(&draft).unwrap();
+        std::fs::write(draft.join("config.json"), json!({"num_hidden_layers": 5,
+            "num_key_value_heads": 8, "head_dim": 128}).to_string()).unwrap();
+        let disabled = plan(dir.path(), &options).unwrap().memory_layout.unwrap();
+        assert_eq!(disabled.devices[0].used_bytes(), base.devices[0].used_bytes());
+        options.layout.as_mut().unwrap().mimo_prefix_draft = true;
+        let marked = plan(dir.path(), &options).unwrap().memory_layout.unwrap();
+        let bytes = marked.devices[0].items.iter().find(|i| i.group == "DFlash context marks").unwrap().bytes;
+        let mark_bytes = 5 * 1024 * 2 * plane_bytes + 8;
+        assert_eq!(bytes, mark_bytes * cuteafd_core::prefix::mark_slots_with_host(16, 20, 1, u64::MAX, true));
+        assert_eq!(marked.devices[0].items.iter().find(|i| i.group == "DFlash valid-floor transfer").unwrap().bytes, 16 * 8);
+        options.layout.as_mut().unwrap().draft_context_slots = Some(25);
+        let overridden = plan(dir.path(), &options).unwrap().memory_layout.unwrap();
+        assert_eq!(overridden.devices[0].items.iter().find(|i| i.group == "DFlash valid-floor transfer").unwrap().bytes, 16 * 8);
+        assert!(overridden.notes.iter().any(|note| note.contains("context slots 25")));
+        std::fs::write(draft.join("config.json"), "{}").unwrap();
+        let malformed = plan(dir.path(), &options).unwrap();
+        assert!(!malformed.placement_supported);
+        assert!(!malformed.executable());
+    }
 }
 
 #[test]

@@ -297,11 +297,14 @@ mod draft_storage_tests {
 
     #[test]
     fn context_slots_do_not_widen_the_admitted_draft_batch() {
-        let args = args(&["--draft-representation", "fp8-only", "--draft-context-slots", "20", "--draft-sequences", "16"]);
-        assert_eq!(args.draft_capacity(8).unwrap(), MimoDraftCapacity {
-            context_slots: 20, max_batch_sequences: 16, block_rows: 128,
-            kv_cache: cuteafd_loader::families::qwen4::Qwen4KvCache::Bf16,
-        });
+        use cuteafd_loader::families::qwen4::Qwen4KvCache;
+        for (format, kv_cache) in [("bf16", Qwen4KvCache::Bf16), ("fp8", Qwen4KvCache::Fp8)] {
+            let args = args(&["--draft-representation", "fp8-only", "--draft-context-slots", "20",
+                "--draft-sequences", "16", "--draft-kv-cache", format]);
+            assert_eq!(args.draft_capacity(8).unwrap(), MimoDraftCapacity {
+                context_slots: 20, max_batch_sequences: 16, block_rows: 128, kv_cache,
+            });
+        }
     }
 
 }
