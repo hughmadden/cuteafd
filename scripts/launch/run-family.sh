@@ -342,6 +342,7 @@ MIMO_PREFILL_CHUNK_S
 PREFIX_CACHE_MARK_MIB
 PREFIX_PARTIAL
 KV_CACHE
+SWA_KV_CACHE
 DECODE_GRAPHS
 RTX_EXPERT_PEER
 L2_PREFETCH
@@ -1945,12 +1946,17 @@ if [[ $family == mimo_v2 ]]; then
   # PREFIX_PARTIAL=on: V4.1-style partial reuse (approximate; off = exact restores only).
   family_args+=(--prefix-partial "$(get PREFIX_PARTIAL off)")
   # KV_CACHE: int8 (the engine default: 8-bit full-attention records with FP32 scales per 32
-  # dims; SWA rings stay BF16) or bf16. Unset omits --kv-cache so the daemon default (int8) applies.
+  # dims) or bf16. SWA_KV_CACHE selects the sliding and native-MTP rings separately. Unset omits --kv-cache so the daemon default (int8) applies.
   mimo_kv="$(get KV_CACHE)"
   case "$mimo_kv" in
     "") ;;
     int8|bf16) family_args+=(--kv-cache "$mimo_kv") ;;
     *) release_die "KV_CACHE must be int8 or bf16" ;;
+  esac
+  mimo_swa_kv="$(get SWA_KV_CACHE bf16)"
+  case "$mimo_swa_kv" in
+    bf16|int8|fp8) family_args+=(--swa-kv-cache "$mimo_swa_kv") ;;
+    *) release_die "SWA_KV_CACHE must be bf16, int8 or fp8" ;;
   esac
   # DECODE_GRAPHS=on: decode/verify steps replay per-layer CUDA graph segments captured at startup
   # (default off: neutral against the host-driven Spark exchange, 0.4-1.2 GiB of graphs).
@@ -2573,6 +2579,7 @@ audio_encoder_hash=""
     [[ -z "$(get PREFIX_CACHE_MARK_MIB)" ]] || plan_draft_args+=(--prefix-cache-mark-mib "$(get PREFIX_CACHE_MARK_MIB)")
   fi
   if [[ "$family" == mimo_v2 ]]; then
+    plan_draft_args+=(--mimo-swa-kv-cache "${mimo_swa_kv:-bf16}")
     plan_draft_args+=(--prefix-cache-entries "$(get PREFIX_CACHE_ENTRIES 20)"
       --context-tokens "$(get MAX_CONTEXT_TOKENS "$default_context")"
       --prefill-rows 4096 --expert-input "${expert_input:-fp8}")

@@ -3,7 +3,7 @@
 //! CUDA module, graph, transport, expert and external-drafter reservations are
 //! supplied by the runtime, where their selected implementations are known.
 use super::resident::{MimoResidentLayout, MimoResidentOptions};
-use super::{MimoKvCache, MimoV2Config, MimoWorkspaceLayout, MimoWorkspaceOptions};
+use super::{MimoKvFormats, MimoV2Config, MimoWorkspaceLayout, MimoWorkspaceOptions};
 use crate::plan::checkpoint::Checkpoint;
 use crate::serving_capacity::{mimo_cache_geometry, CacheGeometryError};
 use cuteafd_core::serving_capacity::{
@@ -32,7 +32,7 @@ pub struct MimoCapacityOptions {
     pub max_context_tokens: u64,
     pub rings: u64,
     pub mark_slots: u64,
-    pub kv_cache: MimoKvCache,
+    pub kv_cache: MimoKvFormats,
     /// Logical rank order, independent of physical device id order.
     pub ranks: Vec<MimoRankRuntime>,
     pub host_prefix_bytes: u64,
@@ -299,7 +299,7 @@ mod tests {
             max_context_tokens: 32768,
             rings: 20,
             mark_slots: 42,
-            kv_cache: MimoKvCache::Int8,
+            kv_cache: MimoKvFormats::default(),
             host_prefix_bytes: 64 << 30,
             ranks: (0..ranks)
                 .map(|rank| MimoRankRuntime {
@@ -327,7 +327,7 @@ mod tests {
                                     expert_input: super::super::MimoExpertInput::Fp8,
                                     max_context: 32768,
                                     pool_pages: 0,
-                                    kv_cache: MimoKvCache::Int8,
+                                    kv_cache: MimoKvFormats::default(),
                                     attention: MimoAttentionWorkspace::Global,
                                     prefill_output: MimoPrefillOutput::AllRows,
                                     native_scratch_bytes: 16 << 20,

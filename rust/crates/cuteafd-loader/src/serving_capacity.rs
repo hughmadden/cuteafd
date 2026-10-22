@@ -3,7 +3,9 @@
 //! lane workspaces, graphs, transport or external drafter reservations.
 use crate::families::glm5::{GlmDsaConfig, GlmIndexer};
 use crate::families::glm5_flash::{GlmNextAttention, GlmNextConfig};
-use crate::families::mimo_v2::{MimoAttention, MimoKvCache, MimoV2Config};
+use crate::families::mimo_v2::{MimoAttention, MimoKvFormats, MimoV2Config};
+#[cfg(test)]
+use crate::families::mimo_v2::MimoKvCache;
 use crate::families::qwen4::{Qwen4Attention, Qwen4Config, Qwen4KvCache};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -87,7 +89,7 @@ pub const GLMF_POOL_MARK_RESERVED_UNITS: u64 = 1;
 pub struct CacheOptions {
     pub coordinator_ranks: usize,
     pub native_mtp_layers: usize,
-    pub mimo_kv: MimoKvCache,
+    pub mimo_kv: MimoKvFormats,
     pub qwen_kv: Qwen4KvCache,
     pub step5_kv: Qwen4KvCache,
     /// DeepSeek V4's window ring holds one prefill chunk plus its window.
@@ -106,7 +108,7 @@ impl Default for CacheOptions {
         Self {
             coordinator_ranks: 1,
             native_mtp_layers: 0,
-            mimo_kv: MimoKvCache::Int8,
+            mimo_kv: MimoKvFormats::default(),
             qwen_kv: Qwen4KvCache::default(),
             step5_kv: Qwen4KvCache::Bf16,
             prefill_rows: 4096,
@@ -729,7 +731,7 @@ pub fn mimo_cache_geometry(
     cfg: &MimoV2Config,
     layers: usize,
     ranks: usize,
-    kv: MimoKvCache,
+    kv: MimoKvFormats,
     mtp_stages: usize,
 ) -> Result<FamilyCacheGeometry, CacheGeometryError> {
     selected("mimo_v2", cfg.layers, layers)?;
@@ -1206,8 +1208,8 @@ mod tests {
     #[test]
     fn mimo_pro_records_partition_heads_while_rings_and_marks_keep_the_exact_window() {
         let cfg = full_mimo(mimo_pro_config(), 10, 60);
-        let one = mimo_cache_geometry(&cfg, 70, 1, MimoKvCache::Int8, 0).unwrap();
-        let split = mimo_cache_geometry(&cfg, 70, 2, MimoKvCache::Int8, 0).unwrap();
+        let one = mimo_cache_geometry(&cfg, 70, 1, MimoKvFormats::default(), 0).unwrap();
+        let split = mimo_cache_geometry(&cfg, 70, 2, MimoKvFormats::default(), 0).unwrap();
         assert_eq!(one.ranks[0].persistent_unit_bytes / 64, 28800);
         assert_eq!(split.placement, KvPlacement::PartitionedHeads);
         assert_eq!(
@@ -1221,7 +1223,7 @@ mod tests {
         assert_eq!(one.ranks[0].active_state_per_sequence_bytes, 75 << 20);
         assert_eq!(one.ranks[0].retained_mark_bytes, 75 << 19);
         assert_eq!(
-            mimo_cache_geometry(&cfg, 70, 1, MimoKvCache::Bf16, 0)
+            mimo_cache_geometry(&cfg, 70, 1, MimoKvFormats { full: MimoKvCache::Bf16, sliding: MimoKvCache::Bf16 }, 0)
                 .unwrap()
                 .ranks[0]
                 .persistent_unit_bytes
@@ -1233,8 +1235,8 @@ mod tests {
     #[test]
     fn mimo_flash_and_native_mtp_keep_lead_rank_only_history_costs() {
         let cfg = full_mimo(mimo_flash_config(), 9, 39);
-        let plain = mimo_cache_geometry(&cfg, 48, 2, MimoKvCache::Int8, 0).unwrap();
-        let mtp = mimo_cache_geometry(&cfg, 48, 2, MimoKvCache::Int8, 3).unwrap();
+        let plain = mimo_cache_geometry(&cfg, 48, 2, MimoKvFormats::default(), 0).unwrap();
+        let mtp = mimo_cache_geometry(&cfg, 48, 2, MimoKvFormats::default(), 3).unwrap();
         assert_eq!(
             plain
                 .ranks
@@ -1259,6 +1261,37 @@ mod tests {
             6_029_312
         );
         assert_eq!(mtp.ranks[0].fixed_state_bytes, (3 << 20) + 1280);
+    }
+
+    #[test]
+    fn mimo_compact_swa_and_mtp_keep_hidden_history_bf16() {
+        for config in [mimo_flash_config(), mimo_pro_config()] {
+            let cfg = full_mimo(config, 2, 3);
+            let mut identities = std::collections::BTreeSet::new();
+            for (sliding, record) in [(MimoKvCache::Bf16, 5120u64),
+                (MimoKvCache::Int8, 2880), (MimoKvCache::Fp8, 2720)] {
+                let kv = MimoKvFormats { full: MimoKvCache::Int8, sliding };
+                assert!(identities.insert(kv.record_format()));
+                for ranks in [1, 2] {
+                    let target = mimo_cache_geometry(&cfg, cfg.layers, ranks, kv, 0).unwrap();
+                    let mtp = mimo_cache_geometry(&cfg, cfg.layers, ranks, kv, 3).unwrap();
+                    let rank_record = record / ranks as u64;
+                    for rank in 0..ranks {
+                        let a = target.ranks[rank];
+                        assert_eq!(a.persistent_unit_bytes, 2 * 64 * cfg.full_kv_heads as u64 * 360 / ranks as u64);
+                        assert_eq!(a.active_state_per_sequence_bytes, 3 * 256 * rank_record);
+                        assert_eq!(a.retained_mark_bytes, 3 * 128 * rank_record);
+                        if rank == 0 {
+                            assert_eq!(mtp.ranks[rank].active_state_per_sequence_bytes - a.active_state_per_sequence_bytes,
+                                3 * 256 * record + 256 * cfg.hidden as u64 * 2);
+                            assert_eq!(mtp.ranks[rank].retained_mark_bytes - a.retained_mark_bytes,
+                                (128 + 3 + 1) * cfg.hidden as u64 * 2);
+                            assert_eq!(mtp.ranks[rank].fixed_state_bytes, 12 * 64 * cfg.hidden as u64 + 1280);
+                        } else { assert_eq!(mtp.ranks[rank], a); }
+                    }
+                }
+            }
+        }
     }
 
     #[test]

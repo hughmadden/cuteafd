@@ -212,7 +212,7 @@ pub(super) fn profile(checkpoint: &super::super::Checkpoint, options: &LayoutOpt
         if options.prefill_lanes > 0 { Some(options.prefill_lanes.to_string()) }
         else { std::env::var("CUTEAFD_MIMO_PREFILL_LANES").ok() }.as_deref())?;
     let rings = options.mimo_rings.max(concurrency);
-    let cache = crate::serving_capacity::mimo_cache_geometry(&cfg, cfg.layers, ranks, MimoKvCache::Int8, 0)?;
+    let cache = crate::serving_capacity::mimo_cache_geometry(&cfg, cfg.layers, ranks, MimoKvFormats { full: MimoKvCache::Int8, sliding: options.mimo_swa_kv }, 0)?;
     let dir = checkpoint.snapshot.join("dflash");
     let draft = if dir.join("dflash_draft_model.safetensors").is_file() {
         Some(draft_config::DflashConfig::read(&dir)?)
@@ -255,7 +255,7 @@ pub(super) fn profile(checkpoint: &super::super::Checkpoint, options: &LayoutOpt
             additional.extend(draft_prefix_reservations(options.mimo_prefix_draft, draft_mark, marks, rings)?);
         }
         let workspaces = workspace_options(&cfg, ranks, rank, rows as usize, context as usize,
-            lanes, spark_ranks > 0, options.mimo_expert_input, MimoKvCache::Int8, 0,
+            lanes, spark_ranks > 0, options.mimo_expert_input, MimoKvFormats { full: MimoKvCache::Int8, sliding: options.mimo_swa_kv }, 0,
             if options.full_prefill_logits { MimoPrefillOutput::AllRows } else { MimoPrefillOutput::LastRow },
             fp8_output, |name| {
                 let Some(manifest) = manifest else { return Ok(0); };
@@ -279,7 +279,7 @@ pub(super) fn profile(checkpoint: &super::super::Checkpoint, options: &LayoutOpt
     }, &MimoCapacityOptions { checkpoint_max_context_tokens:
         crate::serving_capacity::checkpoint_context_limit(&checkpoint.config)?
             .context("MiMo checkpoint lacks max_position_embeddings")?,
-        max_context_tokens: context, rings, mark_slots: marks, kv_cache: MimoKvCache::Int8,
+        max_context_tokens: context, rings, mark_slots: marks, kv_cache: MimoKvFormats { full: MimoKvCache::Int8, sliding: options.mimo_swa_kv },
         ranks: runtime, host_prefix_bytes: 0 })?)
 }
 
@@ -374,7 +374,8 @@ fn apply_selected(input: &super::super::PlanInput, options: &LayoutOptions,
         if options.prefill_lanes > 0 { Some(options.prefill_lanes.to_string()) }
         else { std::env::var("CUTEAFD_MIMO_PREFILL_LANES").ok() }.as_deref())?;
     let inputs = crate::placement::families::mimo_v2::MimoInputs { automatic_context: options.context_tokens == 0,
-        cfg: &cfg, profile: &profiles.steady, layers: cfg.layers, kv: MimoKvCache::Int8, mtp_stages: 0,
+        cfg: &cfg, profile: &profiles.steady, layers: cfg.layers,
+        kv: MimoKvFormats { full: MimoKvCache::Int8, sliding: options.mimo_swa_kv }, mtp_stages: 0,
         gpus: devices.iter().enumerate().map(|(rank, device)| (options.rtx_bytes[rank],
             crate::placement::Baseline::Planned { context_bytes: 0,
                 loaded_bytes: device.used_bytes() })).collect(),
@@ -410,7 +411,8 @@ fn apply_selected(input: &super::super::PlanInput, options: &LayoutOptions,
         }
     }
     let unit = selected.profile.pool_unit_rows;
-    let cache = crate::serving_capacity::mimo_cache_geometry(&cfg, cfg.layers, ranks, MimoKvCache::Int8, 0)?;
+    let cache = crate::serving_capacity::mimo_cache_geometry(&cfg, cfg.layers, ranks,
+        MimoKvFormats { full: MimoKvCache::Int8, sliding: options.mimo_swa_kv }, 0)?;
     for ((device, rank), storage) in devices.iter_mut().zip(&selected.profile.devices).zip(&cache.ranks) {
         let units = placement.pool_tokens / unit;
         let kv_unit = storage.persistent_unit_bytes + storage.pool_metadata_unit_bytes;
@@ -442,16 +444,18 @@ mod tests {
             let input = PlanInput::from_checkpoint(checkpoint);
             let checkpoint = input.checkpoint();
             let cfg = MimoV2Config::from_hf(&config).unwrap();
+            for swa in [MimoKvCache::Bf16, MimoKvCache::Int8, MimoKvCache::Fp8] {
+            let kv = MimoKvFormats { full: MimoKvCache::Int8, sliding: swa };
             for ranks in [1, 2] {
                 for (graphs, expert_input) in [false, true].into_iter().flat_map(|graphs|
                     [MimoExpertInput::Fp8, MimoExpertInput::Bf16, MimoExpertInput::Bf16Decode]
                         .map(|input| (graphs, input))) {
                     let opts = LayoutOptions { rtx_bytes: vec![95 * GIB; ranks], concurrency: 4,
-                        pool_tokens: Some(32768), mimo_decode_graphs: graphs,
+                        pool_tokens: Some(32768), mimo_decode_graphs: graphs, mimo_swa_kv: swa,
                         mimo_expert_input: expert_input, ..Default::default() };
                     let planned = profile(&checkpoint, &opts, ranks, 4, 4096, 4, 32768, None).unwrap();
                     let lanes = resolve_transport_lanes(true, cfg.program_family().unwrap(), None).unwrap();
-                    let cache = crate::serving_capacity::mimo_cache_geometry(&cfg, cfg.layers, ranks, MimoKvCache::Int8, 0).unwrap();
+                    let cache = crate::serving_capacity::mimo_cache_geometry(&cfg, cfg.layers, ranks, kv, 0).unwrap();
                     let mark_bytes = cache.ranks.iter().map(|r| r.retained_mark_bytes).sum();
                     let slots = cuteafd_core::prefix::mark_slots_with_host(4, opts.mimo_prefix_entries, mark_bytes, opts.mimo_prefix_mark_bytes, opts.host_cache_bytes != Some(0));
                     let graph = decode_graph::MimoDecodeGraphPlan::new(cfg.layers, ranks, 64, graphs).unwrap();
@@ -462,7 +466,7 @@ mod tests {
                             decode_graph::MIMO_GRAPH_DRIVER_MARGIN_BYTES).unwrap());
                         MimoRankRuntime { device: rank as u32, loading_additional: vec![], additional,
                             workspaces: workspace_options(&cfg, ranks, rank, 4096, 32768, lanes, true,
-                                opts.mimo_expert_input, MimoKvCache::Int8, 0, MimoPrefillOutput::LastRow, pro, |_| Ok(0)).unwrap() }
+                                opts.mimo_expert_input, kv, 0, MimoPrefillOutput::LastRow, pro, |_| Ok(0)).unwrap() }
                     }).collect();
                     let admitted = mimo_capacity_profiles(&checkpoint, &cfg, MimoResidentOptions {
                         layers: cfg.layers, coordinator_ranks: ranks, checkpoint_tp: if pro { 8 } else { 4 },
@@ -470,7 +474,7 @@ mod tests {
                         output_formats: (0..cfg.layers).map(|l| (format!("model.layers.{l}.self_attn.o_proj.weight"),
                             if pro { R::Fp8 } else { R::Bf16 })).collect(),
                     }, &MimoCapacityOptions { checkpoint_max_context_tokens: 1 << 20, max_context_tokens: 32768,
-                        rings: 16, mark_slots: slots, kv_cache: MimoKvCache::Int8, ranks: runtime, host_prefix_bytes: 0 }).unwrap();
+                        rings: 16, mark_slots: slots, kv_cache: kv, ranks: runtime, host_prefix_bytes: 0 }).unwrap();
                     let mut devices: Vec<_> = (0..ranks).map(|rank| DeviceLayout {
                         kind: DeviceKind::Rtx, index: rank as u32, capacity_bytes: 95 * GIB,
                         items: vec![], kv_tokens: 0,
@@ -499,6 +503,7 @@ mod tests {
                     }
                 }
             }
+        }
         }
     }
 
@@ -607,7 +612,7 @@ mod tests {
                     expert_costs(&input, &cfg, &opts, ranks, sparks, 4096).unwrap();
                 let lanes = resolve_transport_lanes(true, cfg.program_family().unwrap(), None).unwrap();
                 let inputs = MimoInputs { automatic_context: opts.context_tokens == 0, cfg: &cfg, profile: &costs.steady, layers: cfg.layers,
-                    kv: MimoKvCache::Int8, mtp_stages: 0, gpus: totals.iter().enumerate().map(|(rank, &total)|
+                    kv: MimoKvFormats::default(), mtp_stages: 0, gpus: totals.iter().enumerate().map(|(rank, &total)|
                         (total, Baseline::Measured { free_bytes: total - baseline[rank] })).collect(),
                     headroom_floor: opts.headroom_bytes, spark_ranks: sparks, startup_probe_bytes: 64 << 20,
                     context, requested_pool: opts.pool_tokens, pool_ceiling_at_target: false, onboard, experts, expert_workspace,
