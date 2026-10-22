@@ -8,6 +8,13 @@ use super::*;
 use cuteafd_ffi::native_library_lifetime_fixture::Fixture;
 use sha2::{Digest, Sha256};
 
+/// The pinned digests: CUTEAFD_GLMF_GOLDEN (another checkpoint's golden,
+/// e.g. the stitched Core FP8) or the checked-in file.
+fn golden_path() -> std::path::PathBuf {
+    std::env::var_os("CUTEAFD_GLMF_GOLDEN").map(std::path::PathBuf::from).unwrap_or_else(||
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/families/glm5_flash/weights_golden.json"))
+}
+
 fn digest(library: &NativeLibrary, buffer: CuteafdDeviceBuffer) -> Result<String> {
     let mut bytes = vec![0u8; buffer.bytes];
     library.copy_d2h(&mut bytes, buffer)?;
@@ -40,6 +47,15 @@ fn installed_head_split_operands_match_the_host_quantize_golden() -> Result<()> 
                 }
             }
         }
+        // Token-row KDA output sharding (the whole w_o on each GPU).
+        let oshard = GlmfLoader { kda_output_shard: true, ..loader.clone() };
+        for layer in [kda, mla, dense] {
+            for (rank, share) in oshard.layer_shares(&cfg, layer, LayerMode::HeadSplit)?.iter().enumerate() {
+                for (name, allocation) in &share.operands {
+                    actual.insert(format!("{rule:?}.oshard.layer{layer}.rank{rank}.{name}"), digest(&library, allocation.buffer)?);
+                }
+            }
+        }
         // The one-GPU coordinator (every operand whole on one device).
         let single = GlmfLoader { peers: Vec::new(), ..loader.clone() };
         for layer in [kda, mla, dense] {
@@ -51,7 +67,7 @@ fn installed_head_split_operands_match_the_host_quantize_golden() -> Result<()> 
         actual.insert(format!("{rule:?}.head.values"), digest(&library, values.buffer)?);
         actual.insert(format!("{rule:?}.head.scales"), digest(&library, scales.buffer)?);
     }
-    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/families/glm5_flash/weights_golden.json");
+    let path = golden_path();
     if std::env::var_os("CUTEAFD_WRITE_GLMF_OPERAND_GOLDEN").is_some() {
         std::fs::write(&path, serde_json::to_vec_pretty(&actual)?)?;
     }
@@ -83,27 +99,27 @@ fn installed_pushed_operands_match_the_mount_golden() -> Result<()> {
     let dense = (0..cfg.layers).find(|&l| cfg.dense[l]).context("no dense layer")?;
     let stream = std::ptr::null_mut();
     let rule = crate::shared::fp8_linear::Fp8Scales::Pow2;
-    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/families/glm5_flash/weights_golden.json");
-    let golden: std::collections::BTreeMap<String, String> = serde_json::from_slice(&std::fs::read(&path)?)?;
+    let golden: std::collections::BTreeMap<String, String> = serde_json::from_slice(&std::fs::read(golden_path())?)?;
     let sparks = 2;
-    for gpus in [2usize, 1] {
+    for (gpus, oshard) in [(2usize, false), (2, true), (1, false)] {
         let load = std::rc::Rc::new(DenseLoad::push(&library));
         let loader = GlmfLoader { library: &library, checkpoint: &checkpoint, stream,
-            kda_fp8: crate::families::glm5_flash::fp8::KdaFp8::Row128, kda_output_shard: false, fp8_head: true,
+            kda_fp8: crate::families::glm5_flash::fp8::KdaFp8::Row128, kda_output_shard: oshard, fp8_head: true,
             kda_nvfp4: None, fp8_scales: rule, device: 0,
             peers: if gpus == 2 { vec![crate::shared::peer_split::RankDevice { device: 1, stream }] } else { Vec::new() },
             dense: load.clone() };
         let mut operands = Vec::new();
         for layer in [kda, mla, dense] {
             if gpus == 2 {
+                let variant = if oshard { ".oshard" } else { "" };
                 for (rank, share) in loader.layer_shares(&cfg, layer, LayerMode::HeadSplit)?.into_iter().enumerate() {
-                    operands.push((format!("{rule:?}.layer{layer}.rank{rank}"), share));
+                    operands.push((format!("{rule:?}{variant}.layer{layer}.rank{rank}"), share));
                 }
             } else {
                 operands.push((format!("{rule:?}.single.layer{layer}"), loader.layer(&cfg, layer)?));
             }
         }
-        let head = (gpus == 2).then(|| loader.fp8(&["lm_head.weight".to_string()],
+        let head = (gpus == 2 && !oshard).then(|| loader.fp8(&["lm_head.weight".to_string()],
             crate::families::glm5_flash::fp8::Layout::Row128)).transpose()?;
         let (records, steps) = load.sink.as_ref().context("push sink")?.take();
         // Every kind of staged step (quantize, widen, absorb, A_log) fits one
