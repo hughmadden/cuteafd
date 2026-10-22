@@ -91,6 +91,12 @@ pub(crate) enum Commands {
     /// Qualify a native Step-5 target prefix with real Spark experts.
     #[command(hide = true)]
     Step5Golden(crate::families::step5::golden::GoldenArgs),
+    /// Compare a cold Kimi decoder prefix against a flagged residual state.
+    #[command(hide = true)]
+    KimiGolden(crate::families::kimi_k3::golden::GoldenArgs),
+    /// Serve Kimi K3 with TP2 attention and six real Spark expert ranks.
+    #[command(hide = true)]
+    ServeKimi(crate::families::kimi_k3::serve::ServeArgs),
     /// Serve an eager native Step-5 target with real Spark experts.
     #[command(hide = true)]
     ServeStep5(crate::families::step5::serve::ServeArgs),
@@ -267,6 +273,9 @@ pub(crate) struct PlanArgs {
     /// Separately configured drafter checkpoint to include in JSON inventory.
     #[arg(long)]
     pub(crate) drafter_snapshot: Option<PathBuf>,
+    /// Charge native MLA DFlash FP8 residency instead of BF16.
+    #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
+    pub(crate) draft_fp8: bool,
     /// Separately configured vision checkpoint to include in JSON inventory.
     #[arg(long)]
     pub(crate) vision_snapshot: Option<PathBuf>,
@@ -292,9 +301,9 @@ pub(crate) struct PlanArgs {
     /// Explicit KV pool tokens for --layout (0 or omitted: automatic).
     #[arg(long)]
     pub(crate) pool_tokens: Option<u64>,
-    /// Qwen or Step-5 KV format for --layout (family default when omitted).
+    /// Full-attention KV format for --layout (family default when omitted).
     #[arg(long = "kv-cache")]
-    pub(crate) kv_format: Option<cuteafd_loader::families::qwen4::Qwen4KvCache>,
+    pub(crate) kv_format: Option<cuteafd_core::MlaCacheFormat>,
     /// Qwen projection residency for --layout.
     #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
     pub(crate) fp8_decode: bool,
@@ -696,7 +705,9 @@ mod tests {
         ] {
             let super::Commands::Plan(args) = super::Cli::try_parse_from(
                 base.into_iter().chain(flags)).unwrap().command else { panic!("expected plan"); };
-            assert_eq!(args.kv_format, expected);
+            assert_eq!(args.kv_format.map(|format| match format {
+                cuteafd_core::MlaCacheFormat::Bf16 => Qwen4KvCache::Bf16,
+                cuteafd_core::MlaCacheFormat::Fp8 => Qwen4KvCache::Fp8 }), expected);
         }
         assert!(super::Cli::try_parse_from(base.into_iter().chain(["--kv-cache", "int8"])).is_err());
         assert!(super::Cli::try_parse_from(base.into_iter().chain(["--kv-format", "bf16"])).is_err());

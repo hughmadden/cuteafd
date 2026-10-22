@@ -615,6 +615,7 @@ impl<'a> DsparkDrafter<'a> {
                     "dSpark borrows the target BF16 head [{}, {}]", self.cfg.vocab, self.cfg.hidden);
                 HeadRef::Bf16(owner.buffer.ptr)
             }
+            TargetHead::Bf16Buffer(_) => anyhow::bail!("dSpark requires its retained target head owner"),
             TargetHead::Launch(launch) => HeadRef::Launch(launch),
         })
     }

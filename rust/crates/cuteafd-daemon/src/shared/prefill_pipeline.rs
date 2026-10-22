@@ -129,11 +129,92 @@ impl ChunkPermit<'_> {
     }
 }
 
+/// One executor lane can pipeline causal row windows without owning another
+/// stream, transport or workspace. Attention is layer-major, while a single
+/// pending FFN lands only after the successor's attention and before its FFN.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SubwaveAction {
+    Attention { layer: usize, wave: usize },
+    Begin { layer: usize, wave: usize },
+    Finish { layer: usize, wave: usize },
+}
+
+pub(crate) fn subwave_ranges(rows: usize, max_waves: usize, page_rows: usize,
+    min_rows: usize) -> anyhow::Result<Vec<std::ops::Range<usize>>> {
+    anyhow::ensure!(rows > 0 && max_waves > 0 && page_rows > 0 && min_rows > 0,
+        "prefill sub-wave geometry must be positive");
+    let count = max_waves.min((rows / min_rows).max(1));
+    let width = rows.div_ceil(count).checked_next_multiple_of(page_rows)
+        .ok_or_else(|| anyhow::anyhow!("prefill sub-wave width overflow"))?;
+    Ok((0..rows).step_by(width).map(|first| first..rows.min(first.saturating_add(width))).collect())
+}
+
+pub(crate) fn subwave_actions(layers: usize, waves: usize) -> Vec<SubwaveAction> {
+    let mut actions = Vec::new();
+    let mut pending = None;
+    for layer in 0..layers {
+        for wave in 0..waves {
+            // With one wave the next attention depends on the pending result.
+            if waves == 1 {
+                if let Some((layer, wave)) = pending.take() {
+                    actions.push(SubwaveAction::Finish { layer, wave });
+                }
+            }
+            actions.push(SubwaveAction::Attention { layer, wave });
+            if let Some((layer, wave)) = pending.take() {
+                actions.push(SubwaveAction::Finish { layer, wave });
+            }
+            actions.push(SubwaveAction::Begin { layer, wave });
+            pending = Some((layer, wave));
+        }
+    }
+    if let Some((layer, wave)) = pending { actions.push(SubwaveAction::Finish { layer, wave }); }
+    actions
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::cell::RefCell;
     use std::time::Duration;
+
+    #[test]
+    fn subwaves_preserve_causal_attention_and_single_link_dependencies() -> anyhow::Result<()> {
+        assert_eq!(subwave_ranges(4096, 3, 64, 256)?, [0..1408, 1408..2816, 2816..4096]);
+        assert_eq!(subwave_ranges(511, 3, 64, 256)?, [0..511]);
+        assert!(subwave_ranges(0, 3, 64, 256).is_err());
+        for rows in 1..=4096 {
+            let ranges = subwave_ranges(rows, 3, 64, 256)?;
+            assert!(ranges.len() <= 3);
+            assert_eq!(ranges.first().unwrap().start, 0);
+            assert_eq!(ranges.last().unwrap().end, rows);
+            assert!(ranges.windows(2).all(|pair| pair[0].end == pair[1].start && pair[1].start % 64 == 0));
+        }
+        for waves in 1..=3 {
+            let mut completed = vec![0; waves];
+            let mut attended = vec![0; 7];
+            let mut pending = None;
+            for action in subwave_actions(7, waves) {
+                match action {
+                    SubwaveAction::Attention { layer, wave } => {
+                        assert_eq!(completed[wave], layer, "attention before own FFN completion");
+                        assert_eq!(attended[layer], wave, "KDA/KV order changed");
+                        attended[layer] += 1;
+                    }
+                    SubwaveAction::Begin { layer, wave } => {
+                        assert!(pending.replace((layer, wave)).is_none(), "more than one Spark wave");
+                    }
+                    SubwaveAction::Finish { layer, wave } => {
+                        assert_eq!(pending.take(), Some((layer, wave)));
+                        completed[wave] += 1;
+                    }
+                }
+            }
+            assert_eq!(completed, vec![7; waves]);
+            assert!(pending.is_none());
+        }
+        Ok(())
+    }
 
     async fn jitter(seed: &mut u64) {
         *seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);

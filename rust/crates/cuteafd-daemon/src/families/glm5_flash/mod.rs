@@ -1251,8 +1251,8 @@ impl EngineArgs {
 /// admission charges on the lead GPU, as it charges the wide selector, beyond the allowances it
 /// keeps for `--prefill-rows` rows. `ranks` Spark ranks, one transport per prefill lane.
 fn wide_intake_bytes(args: &EngineArgs, ranks: usize, hidden: usize) -> u64 {
-    use cuteafd_loader::serving_capacity::glmf_spark_intake_bytes;
-    let at = |rows: usize| glmf_spark_intake_bytes(args.prefill_lanes as u64, ranks as u64, rows as u64, hidden as u64);
+    use cuteafd_loader::serving_capacity::spark_intake_bytes;
+    let at = |rows: usize| spark_intake_bytes(args.prefill_lanes as u64, ranks as u64, rows as u64, hidden as u64);
     at(args.expert_rows()) - at(args.prefill_rows)
 }
 

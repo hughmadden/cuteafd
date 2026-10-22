@@ -143,6 +143,17 @@ impl Fixture {
         Ok(fs::read_to_string(&self.events)?)
     }
 
+    /// CPU byte-roundtrip mode; ordinary lifetime fixtures retain deferred uploads.
+    pub fn immediate_copies(&self, library: &NativeLibrary) -> Result<()> {
+        // SAFETY: this export belongs only to the CPU fixture loaded above.
+        unsafe {
+            let configure: Symbol<unsafe extern "C" fn()> =
+                library.lib.get(b"fixture_configure_immediate_copies")?;
+            configure();
+        }
+        Ok(())
+    }
+
     pub fn configure_memory(&self, library: &NativeLibrary, device: i32, total: usize) -> Result<()> {
         // SAFETY: this export belongs to the CPU-only fixture loaded above.
         unsafe {
@@ -170,6 +181,10 @@ impl Fixture {
             .unwrap()
             .ensure(library, 64)?;
         Ok(())
+    }
+
+    pub fn finish_ordered_uploads(&self, library: &NativeLibrary) -> Result<()> {
+        library.release_ordered_h2d_staging()
     }
 
     pub fn configure_drain_after(&self, library: &NativeLibrary, completed: i32) -> Result<()> {

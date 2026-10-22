@@ -47,9 +47,19 @@ fn options(args: &PlanArgs) -> Result<PlanOptions, PlanError> {
                 spark_allocation_budget_bytes: args.spark_budget_gib
                     .map(|gib| budget_bytes("--spark-budget-gib", gib)).transpose()?,
                 pool_tokens: args.pool_tokens,
-                dense_qwen_kv: args.kv_format.unwrap_or(cuteafd_loader::families::qwen4::Qwen4KvCache::Fp8),
-                qwen_kv: args.kv_format.unwrap_or_default(),
-                step5_kv: args.kv_format.unwrap_or_default(),
+                dense_qwen_kv: args.kv_format.map(|format| match format {
+                    cuteafd_core::MlaCacheFormat::Bf16 => cuteafd_loader::families::qwen4::Qwen4KvCache::Bf16,
+                    cuteafd_core::MlaCacheFormat::Fp8 => cuteafd_loader::families::qwen4::Qwen4KvCache::Fp8,
+                }).unwrap_or(cuteafd_loader::families::qwen4::Qwen4KvCache::Fp8),
+                qwen_kv: args.kv_format.map(|format| match format {
+                    cuteafd_core::MlaCacheFormat::Bf16 => cuteafd_loader::families::qwen4::Qwen4KvCache::Bf16,
+                    cuteafd_core::MlaCacheFormat::Fp8 => cuteafd_loader::families::qwen4::Qwen4KvCache::Fp8,
+                }).unwrap_or_default(),
+                step5_kv: args.kv_format.map(|format| match format {
+                    cuteafd_core::MlaCacheFormat::Bf16 => cuteafd_loader::families::qwen4::Qwen4KvCache::Bf16,
+                    cuteafd_core::MlaCacheFormat::Fp8 => cuteafd_loader::families::qwen4::Qwen4KvCache::Fp8,
+                }).unwrap_or_default(),
+                mla_kv: args.kv_format.unwrap_or_default(),
                 qwen_representation: cuteafd_loader::families::qwen4::resident::Qwen4Representation {
                     fp8_projections: args.fp8_decode, fp8_head: args.mtp_fp8_head },
                 qwen_attention_plan_rows: args.attention_plan_rows,
@@ -98,6 +108,8 @@ fn options(args: &PlanArgs) -> Result<PlanOptions, PlanError> {
                 glm5_drafter_disabled: args.no_speculator || args.speculator == "off",
                 glm5_drafter_snapshot: args.drafter_snapshot.clone(),
                 glm5_draft_bf16: args.glm5_draft_bf16,
+                kimi_drafter_snapshot: None,
+                kimi_draft_fp8: args.draft_fp8,
                 glm5_attention_plan_rows: args.attention_plan_rows,
                 drafter_bytes: if args.drafter_gib > 0.0 { budget_bytes("--drafter-gib", args.drafter_gib)? } else { 0 },
                 ..Default::default()
@@ -234,6 +246,11 @@ pub(crate) fn run_plan(mut args: PlanArgs) -> Result<()> {
         if !options.draft_ownership.unwrap().uses_checkpoint() { layout.native_mtp_layers = 0; }
         layout.glmf_drafter_disabled = args.speculator == "off";
         layout.glm5_drafter_disabled = args.speculator == "off";
+        if family == "kimi_k3" && args.speculator != "off" {
+            anyhow::ensure!(args.speculator == "dflash2" && args.drafter_snapshot.is_some(),
+                "Kimi MLA speculation requires --speculator dflash2 --drafter-snapshot SNAPSHOT");
+            layout.kimi_drafter_snapshot = args.drafter_snapshot.clone();
+        }
         let config = std::fs::File::open(snapshot.join("config.json")).ok()
             .and_then(|file| serde_json::from_reader::<_, serde_json::Value>(file).ok());
         let v41 = config.as_ref().is_some_and(|value| {
@@ -413,11 +430,11 @@ fn resolve_speculator(args: &mut PlanArgs, snapshot: &std::path::Path, family: &
         anyhow::ensure!(args.drafter_snapshot.is_none() && args.role.as_deref() != Some("drafter"), "--no-speculator conflicts with drafter inputs/role");
         args.speculator = "off".into();
     } else if (args.include_speculator || args.drafter_snapshot.is_some()) && args.speculator == "off" {
-        args.speculator = default.into();
+        args.speculator = if family == "kimi_k3" && args.drafter_snapshot.is_some() { "dflash2".into() } else { default.into() };
         anyhow::ensure!(args.speculator != "off", "this family has no default speculator");
     }
     let enabled = match (family, args.speculator.as_str()) {
-        (_, "off") | ("glm5", "dflash2") | ("glm5_flash", "dflash2" | "dspark")
+        (_, "off") | ("kimi_k3", "dflash2") | ("glm5", "dflash2") | ("glm5_flash", "dflash2" | "dspark")
         | ("mimo_v2", "dflash2" | "mtp") | ("qwen4" | "step5", "mtp")
         | ("deepseek_v4" | "deepseek_v41", "dspark") => true,
         _ => false,
@@ -740,9 +757,21 @@ mod tests {
         use cuteafd_loader::families::qwen4::Qwen4KvCache;
         let mut args = args(std::path::Path::new("/model"), 6, false);
         assert_eq!(options(&args).unwrap().layout.unwrap().step5_kv, Qwen4KvCache::Fp8);
-        for format in [Qwen4KvCache::Bf16, Qwen4KvCache::Fp8] {
-            args.kv_format = Some(format);
+        for (selected, format) in [(cuteafd_core::MlaCacheFormat::Bf16, Qwen4KvCache::Bf16),
+            (cuteafd_core::MlaCacheFormat::Fp8, Qwen4KvCache::Fp8)] {
+            args.kv_format = Some(selected);
             assert_eq!(options(&args).unwrap().layout.unwrap().step5_kv, format);
+        }
+    }
+
+    #[test]
+    fn kimi_plan_defaults_to_fp8_and_preserves_explicit_bf16() {
+        use cuteafd_core::MlaCacheFormat;
+        let mut args = args(std::path::Path::new("/model"), 6, false);
+        assert_eq!(options(&args).unwrap().layout.unwrap().mla_kv, MlaCacheFormat::Fp8);
+        for format in [MlaCacheFormat::Bf16, MlaCacheFormat::Fp8] {
+            args.kv_format = Some(format);
+            assert_eq!(options(&args).unwrap().layout.unwrap().mla_kv, format);
         }
     }
 
@@ -770,7 +799,7 @@ mod tests {
             files: false, role: None, host: None, file_layout: None, fetch_parallel: 2, fetch: false, destination: None, source: None, forward_agent: false,
             dry_run: false, force: false, include_speculator: false,
             config: None, speculator: "auto".into(), no_speculator: false,
-            drafter_snapshot: None, vision_snapshot: None, audio_snapshot: None,
+            drafter_snapshot: None, draft_fp8: false, vision_snapshot: None, audio_snapshot: None,
             require_ready,
             layout: true,
             rtx: 2,

@@ -65,6 +65,7 @@ def exporter(monkeypatch):
     ("qwen35", "Qwen/Qwen3.5-9B", 262144),
     ("qwen38", "Qwen/Qwen3.8-27B", 262144),
     ("step5", "stepfun-ai/Step-5-Preview", 1048576),
+    ("kimik3", "moonshotai/Kimi-K3", 1048576),
 ])
 def test_checkpoint_extent_table_and_head_splits(exporter, geometry, checkpoint, limit):
     assert exporter.CHECKPOINT_CONTEXTS[geometry] == (checkpoint, limit)
@@ -390,37 +391,93 @@ def test_kimi_kda_exports_share_glmf_program_and_native_tp2_abi(exporter, decode
 @pytest.mark.parametrize("decode_rows,prefill_rows", [(64, 4096), (64, 64)])
 def test_kimi_nope_mla_exports_both_head_layouts_and_all_modes(exporter, decode_rows, prefill_rows):
     programs = exporter.kimi_kda_programs(GEOMETRY, decode_rows, prefill_rows, 1048576)
-    calls = {stem: (op, params, thunk()) for stem, op, params, thunk in programs if op.startswith("mla_") or op == "dense_mla"}
-    assert len(calls) == 2 * (2 * len({decode_rows, prefill_rows}) + 3)
+    calls = {stem: (op, params, thunk()) for stem, op, params, thunk in programs
+             if op in ("mla_producer", "mla_output", "dense_mla")}
+    assert len([p for p in programs if p[1].startswith("mla_draft_")]) == 7
+    assert len(calls) == 2 * (3 * len({decode_rows, prefill_rows}) + 6)
     for heads in (48, 96):
         suffix = "" if heads == 48 else "_h96"
-        for rows in {decode_rows, prefill_rows}:
-            for op in ("mla_producer", "mla_output"):
-                actual_op, params, (module, fn, args, kwargs) = calls[f"{op}{suffix}_m{rows}"]
-                assert actual_op == op and module == "kimi_mla"
-                assert fn == f"compile_kimi_{op}_aot"
-                assert vars(args[0]) == {"heads": heads}
+        for cache in ("bf16", "fp8"):
+            cs = "" if cache == "bf16" else "_fp8"
+            for rows in {decode_rows, prefill_rows}:
+                op, params, (module, fn, args, kwargs) = calls[f"mla_producer{suffix}{cs}_m{rows}"]
+                assert op == "mla_producer" and module == "kimi_mla" and fn == "compile_kimi_mla_producer_aot"
+                assert vars(args[0]) == {"heads": heads, "kv_cache": cache}
                 assert kwargs == {"max_rows": rows}
-                assert params == {"max_rows": rows, "heads": heads}
-        for mode, rows in (("decode", decode_rows), ("verify", decode_rows), ("extend", prefill_rows)):
-            op, params, (module, fn, args, kwargs) = calls[f"dense_mla_{mode}{suffix}_m{rows}"]
-            assert op == "dense_mla" and module == "kimi_mla" and fn == "compile_kimi_dense_mla_aot"
-            assert vars(args[0]) == {"heads": heads}
-            assert kwargs == {"max_rows": rows, "max_context": 1048576, "mode": mode}
-            assert params == {"mode": mode, "max_rows": rows, "heads": heads}
+                assert params == {"max_rows": rows, "heads": heads, "kv_cache": cache}
+                if cache == "bf16":
+                    op, params, (module, fn, args, kwargs) = calls[f"mla_output{suffix}_m{rows}"]
+                    assert fn == "compile_kimi_mla_output_aot"
+                    assert params == {"max_rows": rows, "heads": heads}
+            for mode, rows in (("decode", decode_rows), ("verify", decode_rows), ("extend", prefill_rows)):
+                op, params, (module, fn, args, kwargs) = calls[f"dense_mla_{mode}{suffix}{cs}_m{rows}"]
+                assert op == "dense_mla" and module == "kimi_mla" and fn == "compile_kimi_dense_mla_aot"
+                assert vars(args[0]) == {"heads": heads, "kv_cache": cache}
+                assert kwargs == {"max_rows": rows, "max_context": 1048576, "mode": mode}
+                assert params == {"mode": mode, "max_rows": rows, "heads": heads, "kv_cache": cache}
+
+
+@pytest.mark.parametrize("namespace", ["kimik3"])
+def test_shared_mla_drafter_requested_names_exist_in_family_catalog(exporter, namespace):
+    ffi = (ROOT / "rust/crates/cuteafd-ffi/src/shared/mla_draft.rs").read_text()
+    load = ffi.split("pub fn load(", 1)[1].split("pub fn scratch_bytes", 1)[0]
+    requested = re.findall(r'programs\.program\(&format!\("([^"]+)"', load)
+    assert len(requested) == 3
+    catalog = {f"{namespace}_{stem}" for stem, *_ in
+               exporter.kimi_kda_programs(GEOMETRY, 64, 4096, 1048576)}
+    for window in ("full", "w4096"):
+        names = {name.replace("{program_namespace}", namespace).replace("{}", window).replace("{cache}", "_fp8")
+                 for name in requested}
+        assert names <= catalog, sorted(names - catalog)
+        assert all(name.startswith(namespace + "_") for name in names)
+    daemon = ROOT / "rust/crates/cuteafd-daemon/src"
+    startup = (daemon / "families/kimi_k3/startup.rs").read_text()
+    admission = (daemon / "families/kimi_k3/admission.rs").read_text()
+    shared = (daemon / "shared/speculation/dflash.rs").read_text()
+    assert f'MlaDraft::load(programs, "{namespace}", MlaDraftWindow::Full, options.cache_format)' in startup
+    assert f'MlaDraft::load(programs, "{namespace}", MlaDraftWindow::Sliding4096, options.cache_format)' in startup
+    assert f'DflashDrafter::load_mla(device.library, programs, "{namespace}",' in admission
+    assert "MlaDraft::load(programs, program_namespace," in shared
+
+
+@pytest.mark.parametrize("family", ["glm5", "glm5_flash"])
+def test_shared_gqa_drafter_requested_symbols_exist_in_native_catalog(family):
+    # GQA uses the common native C ABI, not the family-prefixed AOT table.
+    shared = (ROOT / "rust/crates/cuteafd-daemon/src/shared/speculation/dflash.rs").read_text()
+    requested = set(re.findall(r"\.((?:glm_dflash_)[a-z0-9_]+)\(", shared))
+    assert requested
+    ffi = (ROOT / "rust/crates/cuteafd-ffi/src/families/glm5/glm_dflash.rs").read_text()
+    # One entry per wrapper; a wrapper may resolve several symbols (format variants).
+    symbols = {m.group(1): set(re.findall(r'b"(cuteafd_glm_dflash_\w+)"', m.group(2)))
+               for m in re.finditer(r'\n    pub (?:unsafe )?fn (glm_dflash_\w+)\b(.*?)(?=\n    pub |\Z)', ffi, re.S)}
+    assert requested <= symbols.keys(), sorted(requested - symbols.keys())
+    assert all(symbols[name] for name in requested), sorted(n for n in requested if not symbols[n])
+    native = ROOT / "native"
+    source = "families/glm5/cuda/glm_dflash.cu"
+    catalog = set(re.findall(r'extern "C" \w+ (cuteafd_glm_dflash_\w+)\(',
+                             (native / source).read_text()))
+    assert set().union(*(symbols[name] for name in requested)) <= catalog
+    cmake = (native / "CMakeLists.txt").read_text()
+    common_sources = cmake.split("list(APPEND CUTEAFD_NATIVE_SOURCES\n", 1)[1].split(")", 1)[0]
+    assert source in common_sources
+    adapter = ROOT / f"rust/crates/cuteafd-daemon/src/families/{family}"
+    assert any("DflashDrafter" in path.read_text() for path in adapter.glob("*.rs"))
 
 
 def test_kimi_w8_exports_every_residual_transition_and_situ_width(exporter):
     programs = exporter.kimi_w8_programs()
     calls = {stem: (op, params, thunk()) for stem, op, params, thunk in programs}
-    assert len(calls) == len(programs) == 44
+    assert len(calls) == len(programs) == 48
     for stem, (op, params, (module, fn, args, kwargs)) in calls.items():
         assert args == () and kwargs == params
         if op == "bf16_projection":
             assert module == "pointwise" and fn == "compile_bf16_projection_aot"
-            width = int(stem.rsplit("_i", 1)[1])
-            assert params == ({"width": 7168, "outputs": 2 * width} if "gate_up" in stem
-                              else {"width": width, "outputs": 7168})
+            width = int(stem.rsplit("_i", 1)[1].removesuffix("_comp"))
+            expected = ({"width": 7168, "outputs": 2 * width}
+                        if "gate_up" in stem else {"width": width, "outputs": 7168})
+            if stem.endswith("_comp"):
+                expected["compensated"] = True
+            assert params == expected
             continue
         assert module == "kimi_residual"
         if op == "situ":
@@ -431,6 +488,9 @@ def test_kimi_w8_exports_every_residual_transition_and_situ_width(exporter):
             assert params["hidden"] == 7168
             assert params["has_mix"] == (params["candidates"] != 1)
             assert params["append"] == stem.endswith("_append")
+    for width in (3072, 6144, 16896, 33792):
+        assert f"ffn_gate_up_i{width}" in calls
+        assert f"ffn_gate_up_i{width}_comp" in calls
     for candidates in range(2, 10):
         for mode in ("keep", "add", "replace"):
             assert f"attn_res_c{candidates}_{mode}" in calls

@@ -67,11 +67,49 @@ def test_two_target_counts():
                   "attn_res_c9_add", "attn_res_c9_replace", "attn_res_c9_keep"]),
     ("latent", ["rmsnorm_h3584", "rmsnorm_h7168", "latent_down", "latent_up"]),
     ("situ", [f"situ_i{width}" for width in (3072, 6144, 16896, 33792)]),
+    ("ffn", [f"ffn_{op}_i{width}" for width in (3072, 6144, 16896, 33792)
+             for op in ("gate_up", "down")] +
+            [f"ffn_gate_up_i{width}_comp" for width in (3072, 6144, 16896, 33792)]),
 ])
 def test_kimi_w8_cross_sm_groups(group, names):
     job = next(job for job in compare_sm.jobs("suspects") if job[0] == f"kimi-{group}")
     assert job == (f"kimi-{group}", "export_b12x_dsv4_aot.py",
                    ["--geometry", "kimik3", "--only", ",".join(names)])
+
+
+def test_mla_draft_cross_sm_group_and_checkpoint_neutral_registry(monkeypatch):
+    names = ["mla_draft_producer_m64", "mla_draft_producer_fp8_m64", "mla_draft_output_m64",
+             "mla_draft_attention_full_m64", "mla_draft_attention_w4096_m64",
+             "mla_draft_attention_full_fp8_m64", "mla_draft_attention_w4096_fp8_m64"]
+    job = next(job for job in compare_sm.jobs("suspects") if job[0] == "mla-draft-h64")
+    assert job == ("mla-draft-h64", "export_b12x_dsv4_aot.py",
+                   ["--geometry", "kimik3", "--only", ",".join(names)])
+    source = ROOT / "python/tools/aot/export_b12x_dsv4_aot.py"
+    tree = ast.parse(source.read_text())
+    tree.body = [node for node in tree.body
+                 if isinstance(node, ast.FunctionDef) and node.name == "mla_draft_programs"]
+    calls = []
+
+    def compile_fake(g, **kwargs):
+        calls.append((g, kwargs))
+        return kwargs
+
+    module = SimpleNamespace(kimi_mla=SimpleNamespace(
+        MlaDraftGeometry=lambda **kwargs: kwargs,
+        **{f"compile_mla_draft_{op}_aot": compile_fake for op in ("producer", "output", "attention")}))
+    monkeypatch.setitem(sys.modules, "b12x.integration.cuteafd", module)
+    ns = {}
+    exec(compile(tree, str(source), "exec"), ns)
+    programs = ns["mla_draft_programs"](64, 262144)
+    assert {row[0] for row in programs} == set(names)
+    for row in programs:
+        row[-1]()
+    assert calls == [({"window_size": None, "kv_cache": "bf16"}, {"max_rows": 64})] + [
+        (dict(window_size=window, kv_cache=cache), dict(max_rows=64, **extra))
+        for cache in ("bf16", "fp8")
+        for window, extra in ((None, {}), (None, {"max_context": 262144}),
+                              (4096, {"max_context": 262144}))]
+
 
 
 @pytest.mark.parametrize("geometry", ["glm_stage", "glm2_stage"])

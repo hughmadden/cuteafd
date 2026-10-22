@@ -831,6 +831,9 @@ pub fn read_official_v41_role_catalog(snapshot: &Path, role: &str, needed: impl 
 pub fn read_expert_catalog(snapshot: &Path) -> Result<OfficialV41Catalog> {
     let config: serde_json::Value =
         crate::families::deepseek_v41::v41_exl3::read_json(&snapshot.join("config.json"), 1024 * 1024)?;
+    if kimi_catalog_config(&config) {
+        return read_kimi_expert_catalog(snapshot, &config);
+    }
     if config.get("model_type").and_then(serde_json::Value::as_str) == Some("glm5_next") {
         return read_glm_dsa_expert_catalog(snapshot, &config);
     }
@@ -864,6 +867,28 @@ pub fn read_expert_catalog(snapshot: &Path) -> Result<OfficialV41Catalog> {
              tensors onto the six-region W1,W3,W2,S1,S3,S2 staging plan"
         ),
     }
+}
+
+fn kimi_catalog_config(config: &serde_json::Value) -> bool {
+    matches!(config["model_type"].as_str(), Some("kimi_k3" | "kimi_linear"))
+        || config["architectures"].as_array().is_some_and(|architectures| architectures.iter().any(|name|
+            matches!(name.as_str(), Some("KimiK3ForConditionalGeneration" | "KimiLinearForCausalLM"))))
+}
+
+fn read_kimi_expert_catalog(snapshot: &Path, config: &serde_json::Value) -> Result<OfficialV41Catalog> {
+    let cfg = crate::families::kimi_k3::config::KimiK3Config::from_hf(config)?;
+    cfg.release_geometry()?;
+    ensure!(config["quantization_config"]["quant_method"] == "exl3",
+        "Kimi Spark experts require the checkpoint's native EXL3 K2/K3 format");
+    let first_layer = cfg.dense.iter().position(|dense| !dense).context("Kimi config has no routed layers")?;
+    ensure!(cfg.dense[first_layer..].iter().all(|dense| !dense), "Kimi routed layers must follow dense layers");
+    let shape = RoutedExpertShape { layers: cfg.layers, first_layer, experts: cfg.experts,
+        topk: cfg.topk, hidden: cfg.latent, intermediate: cfg.moe_intermediate,
+        draft_stages: 0, draft_experts: 0 };
+    let checkpoint = crate::plan::Checkpoint::inventory(snapshot)?;
+    let catalog = deepseek_v4_exl3_catalog(snapshot, &checkpoint.weight_map, shape, &[2, 3])?;
+    ensure!(catalog.experts.draft_stages == 0, "Kimi K3 has no native draft expert stages");
+    Ok(catalog)
 }
 
 /// GLM 5.x (glm_moe_dsa) and GLM 5.3 Flash (glm5_next) routed experts. Only EXL3 publications serve from
@@ -1173,11 +1198,15 @@ fn read_deepseek_v4_expert_catalog(snapshot: &Path) -> Result<OfficialV41Catalog
     })
 }
 
-/// The decoder layer of a Hugging Face tensor name (`model.layers.{L}.` or
-/// `model.language_model.layers.{L}.`).
+/// Read a decoder layer from the actual header name, independent of its wrapper.
+/// Separate MTP modules are draft stages, not backbone layers.
 fn hf_layer(name: &str) -> Option<usize> {
-    name.strip_prefix("model.layers.").or_else(|| name.strip_prefix("model.language_model.layers."))?
-        .split('.').next()?.parse().ok()
+    if name.starts_with("mtp.") { return None; }
+    let mut segments = name.split('.');
+    while let Some(segment) = segments.next() {
+        if segment == "layers" { return segments.next()?.parse().ok(); }
+    }
+    None
 }
 
 /// Every tensor header of the shards `weight_map` names, each in its shard.
@@ -1243,7 +1272,7 @@ fn deepseek_v4_exl3_catalog(
                 let past_backbone = hf_layer(&tensor.name).is_some_and(|layer| layer >= manifest.experts.layers);
                 ensure!(
                     past_backbone
-                        || (!tensor.name.contains(".mlp.experts.") && !tensor.name.contains(".ffn.experts.")),
+                        || !tensor.name.contains(".experts."),
                     "routed expert tensor {} is not in the EXL3 storage map",
                     tensor.name
                 );
@@ -1397,6 +1426,116 @@ mod tests {
         OfficialV41Config::from_json(include_bytes!("official-v41-config.json"))
             .unwrap()
     }
+    #[test]
+    fn kimi_dispatch_uses_declared_family_before_v41_text_config() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let v41: serde_json::Value = serde_json::from_slice(include_bytes!("official-v41-config.json"))?;
+        assert!(!kimi_catalog_config(&v41));
+        std::fs::write(dir.path().join("config.json"), serde_json::to_vec(&v41)?)?;
+        let direct = format!("{:#}", read_official_v41_catalog(dir.path()).unwrap_err());
+        let dispatched = format!("{:#}", read_expert_catalog(dir.path()).unwrap_err());
+        assert_eq!(dispatched, direct, "V4.1 must retain its official catalog route");
+        let mut kimi = crate::plan::testing::kimi_k3_config();
+        assert!(kimi_catalog_config(&kimi));
+        kimi["quantization_config"]["quant_method"] = "unsupported".into();
+        std::fs::write(dir.path().join("config.json"), serde_json::to_vec(&kimi)?)?;
+        let error = format!("{:#}", read_expert_catalog(dir.path()).unwrap_err());
+        assert!(error.contains("Kimi Spark experts require"), "{error}");
+        kimi.as_object_mut().unwrap().remove("model_type");
+        assert!(kimi_catalog_config(&kimi), "declared architecture also identifies Kimi");
+        assert!(!kimi_catalog_config(&serde_json::json!({"text_config": {"hidden_size": 7168}})),
+            "nested shape alone cannot choose Kimi");
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "CPU-only isolated startup RSS trace; requires CUTEAFD_KIMI_EXL3_SNAPSHOT"]
+    fn mounted_expert_startup_host_rss() -> Result<()> {
+        let snapshot = std::env::var_os("CUTEAFD_KIMI_EXL3_SNAPSHOT").context("checkpoint required")?;
+        let snapshot = Path::new(&snapshot);
+        let sample = |phase: &str| -> Result<()> {
+            let status = std::fs::read_to_string("/proc/self/status")?;
+            let fields = status.lines().filter(|line| line.starts_with("VmRSS:") || line.starts_with("VmHWM:"))
+                .collect::<Vec<_>>().join(" ");
+            eprintln!("expert startup CPU RSS: phase={phase} {fields}");
+            Ok(())
+        };
+        sample("start")?;
+        // Mirror the shared worker's host-only startup, stopping before native load.
+        let inventory = crate::plan::Checkpoint::inventory(snapshot)?;
+        sample("inventory")?;
+        let catalog = read_expert_catalog(snapshot)?;
+        sample("catalog_before_native")?;
+        let identity = crate::plan::checkpoint::identity::CheckpointIdentity::from_snapshot(snapshot, None)?;
+        assert!(!identity.fingerprint.is_empty());
+        sample("identity")?;
+        let status = std::fs::read_to_string("/proc/self/status")?;
+        let peak_kib: u64 = status.lines().find_map(|line| line.strip_prefix("VmHWM:"))
+            .context("peak RSS unavailable")?.split_whitespace().next().context("peak RSS empty")?.parse()?;
+        ensure!(peak_kib < 1536 * 1024, "metadata startup exceeded 1.5 GiB peak: {peak_kib} KiB");
+        assert_eq!(catalog.routed_experts().geometry()?.family(), Some("kimik3"));
+        assert!(inventory.weight_map.len() > 900_000);
+        drop(inventory);
+        sample("inventory_dropped")?;
+        drop(catalog);
+        sample("catalog_dropped")?;
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires CUTEAFD_KIMI_EXL3_SNAPSHOT; reads headers and metadata, not weight payloads"]
+    fn mounted_kimi_exl3_catalog_and_six_rank_residency() -> Result<()> {
+        let snapshot = std::env::var_os("CUTEAFD_KIMI_EXL3_SNAPSHOT").context("Kimi snapshot not set")?;
+        let snapshot = Path::new(&snapshot);
+        let mut catalog = read_expert_catalog(snapshot)?;
+        catalog.select_draft(crate::plan::spec::DraftOwnership::None)?;
+        assert_eq!(catalog.routed_experts().geometry()?.family(), Some("kimik3"));
+        let manifest = catalog.exl3().context("Kimi EXL3 manifest absent")?;
+        assert_eq!(manifest.projections.len(), 92 * 896 * 3);
+        assert_eq!(manifest.decoder_tiers(), &[2, 3]);
+        for layer in 1..=4 {
+            for rank in 0..6 {
+                let plan = manifest.residency(crate::V41Exl3Layer::Backbone(layer), 6, rank)?;
+                assert_eq!((plan.experts, plan.intermediate, plan.intermediate_start), (896, 512, rank * 512));
+                plan.device_arena_layout()?;
+                for load in &plan.loads {
+                    let tensor = catalog.tensor(&load.tensor)?;
+                    ensure!(tensor.placement == V41TensorPlacement::BackboneExl3,
+                        "Kimi expert was not assigned to Spark residency");
+                    let stem = load.tensor.rsplit_once('.').context("missing tensor suffix")?.0;
+                    manifest.projections[stem].validate_tensor(&tensor.metadata)?;
+                    catalog.exl3_tensor_slice(&load.tensor, 6, rank)?;
+                }
+            }
+        }
+        let headers = crate::plan::files::open_role(snapshot, crate::plan::files::ReadRole::Spark { rank: 0, world: 6 })?;
+        let recipe = crate::plan::experts::checkpoint_spark_recipe(&headers, 6, &[1, 2, 3, 4])?;
+        assert_eq!(recipe.widths, vec![512; 6]);
+        let spark_manifest = std::env::var_os("CUTEAFD_KIMI_SPARK_PROGRAM_MANIFEST")
+            .context("set CUTEAFD_KIMI_SPARK_PROGRAM_MANIFEST to the sealed Spark inventory")?;
+        let spark_manifest = Path::new(&spark_manifest);
+        let packages = std::env::var_os("CUTEAFD_KIMI_SPARK_PACKAGE")
+            .context("set CUTEAFD_KIMI_SPARK_PACKAGE to the sealed Spark package")?;
+        let packages = Path::new(&packages);
+        crate::families::kimi_k3::validate_expert_inventory(spark_manifest, packages)?;
+        for rank in 0..6 {
+            recipe.validate_installed(&packages, rank, recipe.slicing, 512)?;
+        }
+        eprintln!("Kimi CPU startup gate: {} projections; six ranks x four hosted layers; recipe {:?}",
+            manifest.projections.len(), recipe.required_layouts);
+        Ok(())
+    }
+
+    #[test]
+    fn layer_ordinals_follow_header_segments_not_a_wrapper_allowlist() {
+        for prefix in ["model", "model.language_model", "language_model.model", "custom.encoder.text"] {
+            assert_eq!(hf_layer(&format!("{prefix}.layers.17.block_sparse_moe.experts.895.gate_proj.trellis")), Some(17));
+        }
+        for name in ["mtp.layers.0.mlp.experts.0.gate_proj.trellis", "model.layers.bad.weight", "layers_not.2.weight"] {
+            assert_eq!(hf_layer(name), None);
+        }
+    }
+
     fn assert_glm_coordinator_tensors(catalog: &OfficialV41Catalog) {
         for name in ["model.embed_tokens.weight", "lm_head.weight", "model.norm.weight"] {
             let tensor = catalog.tensor(name).unwrap();

@@ -590,6 +590,8 @@ fn plan_of(input: &PlanInput, options: &PlanOptions) -> Result<PlanReport, PlanE
         match executor.check_attention(options.attention_placement, gpus, peer) {
             Ok(mode) => report.attention_placement = mode,
             Err(error) => {
+                report.fits = false;
+                report.placement_supported = false;
                 report.config_error = Some(error.to_string());
                 report.hints.push(Hint { what: error.to_string(),
                     how: format!("Implement the {} attention executor before enabling this placement; use --attention-placement heads today.", family.id()) });
@@ -601,7 +603,10 @@ fn plan_of(input: &PlanInput, options: &PlanOptions) -> Result<PlanReport, PlanE
         report.max_image_tokens = Some(crate::media::QWEN_MAX_IMAGE_TOKENS);
     }
     report.runtime = Some(family.runtime());
-    let model = match family.open(&checkpoint) {
+    let model = match family.open(&checkpoint).and_then(|mut model| {
+        model.configure(options)?;
+        Ok(model)
+    }) {
         Ok(model) => model,
         Err(error) => {
             report.hints.push(Hint {

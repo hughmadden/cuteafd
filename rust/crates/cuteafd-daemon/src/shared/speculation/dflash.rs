@@ -643,7 +643,7 @@ impl MlaWorkspace<'_> {
         requests: usize, page_table_width: usize, x: CuteafdDeviceBuffer, output: CuteafdDeviceBuffer,
         slots: CuteafdDeviceBuffer, positions: CuteafdDeviceBuffer) -> cuteafd_ffi::mla_draft::MlaDraftBatch {
         cuteafd_ffi::mla_draft::MlaDraftBatch { rows, requests, page_table_width,
-            cache_pages: layer.cache.buffer.bytes / (64 * 1152), active_splits: layer.program.splits(),
+            cache_pages: layer.cache.buffer.bytes / (64 * layer.program.cache_format().record_bytes()), active_splits: layer.program.splits(),
             rotary_factor: context.cfg.rotary.attention_factor, attention_scale: context.cfg.attention_scale(),
             x, slots, positions, inv_freq: self.inverse_frequencies.buffer, cache: layer.cache.buffer,
             page_table: layer.page_table.buffer, lengths: self.lengths.buffer, query_offsets: self.query_offsets.buffer,
@@ -803,6 +803,8 @@ pub(crate) type InputLaunch<'h> = dyn Fn(&[u32], CuteafdDeviceBuffer, *mut c_voi
 pub(crate) enum TargetHead<'h> {
     /// The target's checkpoint BF16 `[vocab, hidden]`.
     Bf16(&'h Dev<'h>),
+    /// A scoped borrow from a device-aware target owner, retained through the draft drain.
+    Bf16Buffer(&'h CuteafdDeviceBuffer),
     /// A target-owned launcher over another representation (GLM 5.3 Flash's
     /// FP8-only head in 16-row spans); the drafter's head workspace is unused.
     Launch(HeadLaunch<'h>),
@@ -828,6 +830,14 @@ enum DraftInput<'r, 'e> {
     Table(&'r TokenEmbedding<'e>),
     /// A device-ordered gather/transport bridge owned by the target.
     Launch(&'r InputLaunch<'r>),
+}
+
+#[cfg(test)]
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct MlaReadback {
+    pub frontier: (usize, usize),
+    pub layers: Vec<Vec<u8>>,
+    pub taps: Vec<u8>,
 }
 
 pub(crate) struct DflashDrafter<'a> {
@@ -1173,7 +1183,7 @@ impl<'a> DflashDrafter<'a> {
     /// Programs and headers are checked before the exact arenas are allocated.
     #[allow(clippy::too_many_arguments, dead_code)]
     pub(crate) fn load_mla(library: &'a NativeLibrary, programs: &'a cuteafd_ffi::programs::Programs<'a>,
-        snapshot: &Path, file: Vec<u8>, stream: *mut c_void,
+        program_namespace: &str, snapshot: &Path, file: Vec<u8>, stream: *mut c_void,
         layout: cuteafd_loader::formats::dflash::MlaDraftRuntimeLayout,
         representation: GlmDraftRepresentation, scales: fp8_linear::Fp8Scales,
         fp8_rows: fp8_linear::Fp8Rows) -> Result<Self> {
@@ -1182,15 +1192,15 @@ impl<'a> DflashDrafter<'a> {
         let _scope = cuteafd_ffi::memory_ledger::scope("drafter");
         let native = MlaDflashConfig::read(snapshot)?;
         ensure!(native.runtime_layout(representation, layout.capacity(), layout.program().context,
-            layout.paged_cache().target_tokens, library.sm_count()?, fp8_rows.code() as u8)? == layout,
+            layout.paged_cache().target_tokens, library.sm_count()?, fp8_rows.code() as u8, layout.cache_format())? == layout,
             "MLA draft checkpoint/runtime differs from admitted immutable layout");
         let cfg = DflashConfig::mla(&native);
         let checkpoint = Checkpoint { data: file, tensors: read_safetensors_metadata(&snapshot.join("model.safetensors"))?
             .into_iter().map(|t| (t.name.clone(), t)).collect() };
         for (name, shape) in native.tensor_shapes() { checkpoint.bytes(&name, &shape)?; }
         let programs = native.windows.iter().map(|window| -> Result<_> {
-            let program = MlaDraft::load(programs, if window.is_some() { MlaDraftWindow::Sliding4096 }
-                else { MlaDraftWindow::Full })?;
+            let program = MlaDraft::load(programs, program_namespace, if window.is_some() { MlaDraftWindow::Sliding4096 }
+                else { MlaDraftWindow::Full }, layout.cache_format())?;
             ensure!(program.max_context() >= layout.program().context
                 && program.splits() == layout.program().splits
                 && program.scratch_bytes() == layout.program().scratch,
@@ -1461,6 +1471,52 @@ impl<'a> DflashDrafter<'a> {
         Ok(())
     }
 
+    /// Read only reachable committed records and explicitly initialized tap rows.
+    #[cfg(test)]
+    pub(crate) fn mla_readback(&self, slot: usize, tap_rows: usize) -> Result<MlaReadback> {
+        let DraftContext::Mla(context) = &self.context else { anyhow::bail!("MLA readback needs MLA context"); };
+        ensure!(tap_rows <= TAP_ROWS, "MLA readback tap extent");
+        let frontier @ (origin, end) = context.state.borrow().rings.frontier(slot)?;
+        let (snapshot, copies, pages) = {
+            let mut state = context.state.borrow_mut();
+            let binding = state.bindings[slot].context("MLA readback slot is not bound")?;
+            let (snapshot, copies) = state.pool.capture(binding)?;
+            let pages = state.pool.attachment(snapshot)?.pages;
+            (snapshot, copies, pages)
+        };
+        self.copy_mla_pages(&copies)?;
+        // SAFETY: test-only readback retains all operands and their producing stream.
+        unsafe { self.library.cuda_stream_synchronize(self.stream)?; }
+        let cache = context.layout.cache();
+        let record_bytes = context.layout.paged_cache().record_bytes;
+        let mut layers = Vec::new();
+        for (index, layer) in self.layers.iter().enumerate() {
+            let DraftAttention::Mla(attention) = &layer.attention else { anyhow::bail!("mixed MLA layers"); };
+            let bound = cache.layers[index].bind(slot, origin)?;
+            let start = context.cfg.windows[index].map_or(origin, |window| origin.max(end.saturating_sub(window)));
+            let mut bytes = Vec::with_capacity((end - start) * record_bytes);
+            for position in start..end {
+                let row = if context.cfg.windows[index].is_some() { bound.row(position)? } else {
+                    let relative = position - origin;
+                    pages[relative / 64].index as usize * 64 + relative % 64
+                };
+                let view = crate::shared::prefix::view(attention.cache.buffer,
+                    row * record_bytes, record_bytes)?;
+                let mut row = vec![0; record_bytes];
+                self.library.copy_d2h(&mut row, view)?;
+                bytes.extend(row);
+            }
+            layers.push(bytes);
+        }
+        let count = tap_rows * self.cfg.taps.len() * self.cfg.hidden * 2;
+        let mut taps = vec![0; count];
+        if count > 0 {
+            self.library.copy_d2h(&mut taps, crate::shared::prefix::view(self.taps.buffer, 0, count)?)?;
+        }
+        context.state.borrow_mut().pool.release_snapshot(snapshot)?;
+        Ok(MlaReadback { frontier, layers, taps })
+    }
+
     pub(crate) fn reset_context(&self, slot: usize, origin: usize) -> Result<()> {
         ensure!(slot < self.slots, "DFlash reset outside admitted slots");
         if let DraftContext::Mla(context) = &self.context {
@@ -1477,6 +1533,38 @@ impl<'a> DflashDrafter<'a> {
             // SAFETY: cancellation cannot recycle pages still addressed by queued work.
             unsafe { self.library.cuda_stream_synchronize(self.stream)?; }
             context.state.borrow_mut().discard(slot)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn mla_frontier(&self, slot: usize) -> Result<(usize, usize)> {
+        let DraftContext::Mla(context) = &self.context else { anyhow::bail!("not an MLA drafter") };
+        Ok(context.state.borrow().rings.frontier(slot)?)
+    }
+
+    pub(crate) fn mla_snapshot_buffers(&self) -> Result<Vec<CuteafdDeviceBuffer>> {
+        let DraftContext::Mla(_) = &self.context else { anyhow::bail!("not an MLA drafter") };
+        self.layers.iter().map(|layer| {
+            let DraftAttention::Mla(layer) = &layer.attention else { anyhow::bail!("MLA draft layer mismatch") };
+            Ok(layer.cache.buffer)
+        }).collect()
+    }
+
+    pub(crate) fn mla_draft_page_bytes(&self) -> usize {
+        let DraftContext::Mla(context) = &self.context else { return 0 };
+        let layout = context.layout.paged_cache();
+        layout.page_rows * layout.record_bytes * layout.full_layers
+    }
+
+    pub(crate) fn copy_mla_windows(&self, slot: usize, marks: &[CuteafdDeviceBuffer], capture: bool) -> Result<()> {
+        let windows = self.mla_window_segments(slot)?;
+        ensure!(windows.len() == marks.len(), "MLA window mark layer count");
+        for (window, mark) in windows.into_iter().zip(marks) {
+            ensure!(window.bytes == mark.bytes, "MLA window mark byte count");
+            let live = CuteafdDeviceBuffer { ptr: window.addr as *mut c_void, bytes: window.bytes, ..*mark };
+            let (dst, src) = if capture { (*mark, live) } else { (live, *mark) };
+            // SAFETY: family retains both window and mark owners until its drafter drain.
+            unsafe { self.library.copy_d2d_async(dst, src, src.bytes, self.stream)?; }
         }
         Ok(())
     }
@@ -1846,18 +1934,22 @@ impl<'a> DflashDrafter<'a> {
 
     fn head_call<'h>(&self, head: &'h TargetHead<'h>) -> Result<HeadCall<'h>> {
         Ok(match head {
-            TargetHead::Bf16(owner) => HeadCall::Bf16(self.borrowed_head(owner)?),
+            TargetHead::Bf16(owner) => HeadCall::Bf16(self.borrowed_head(owner.buffer)?),
+            TargetHead::Bf16Buffer(buffer) => {
+                ensure!(buffer.device_id == self.library.cuda_get_device()?, "draft head borrow on wrong device");
+                HeadCall::Bf16(self.borrowed_head(**buffer)?)
+            }
             TargetHead::Launch(launch) => HeadCall::Launch(launch),
         })
     }
 
-    fn borrowed_head(&self, owner: &Dev<'_>) -> Result<*const c_void> {
+    fn borrowed_head(&self, owner: CuteafdDeviceBuffer) -> Result<*const c_void> {
         let bytes = self.cfg.vocab.checked_mul(self.cfg.hidden).and_then(|n| n.checked_mul(2))
             .context("DFlash borrowed BF16 head byte count overflow")?;
-        ensure!(!owner.buffer.ptr.is_null() && owner.buffer.bytes == bytes,
+        ensure!(!owner.ptr.is_null() && owner.bytes == bytes,
             "DFlash requires the target-owned BF16 head [{}, {}] ({bytes} bytes); compact target-head \
              consumer is unsupported, no private head copy will be allocated", self.cfg.vocab, self.cfg.hidden);
-        Ok(owner.buffer.ptr)
+        Ok(owner.ptr)
     }
 
     fn draft_from(&self, sequences: &[DraftSeq], input: DraftInput<'_, '_>, head: HeadCall<'_>,
@@ -2460,7 +2552,7 @@ mod checkpoint_header_tests {
 
     fn mla_cache_state() -> cuteafd_loader::formats::dflash::MlaDraftCacheState {
         cuteafd_loader::formats::dflash::MlaDraftCacheState::new(
-            mla_config().cache_layout(2, 262144).unwrap()).unwrap()
+            mla_config().cache_layout(2, 262144, cuteafd_core::MlaCacheFormat::Bf16).unwrap()).unwrap()
     }
 
     #[test]
@@ -2468,7 +2560,7 @@ mod checkpoint_header_tests {
         use cuteafd_loader::{families::glm5::draft_representation::{GlmDraftCapacity, GlmDraftRepresentation},
             formats::dflash::MlaDraftCacheRequest};
         let layout = mla_config().runtime_layout(GlmDraftRepresentation::Fp8Only,
-            GlmDraftCapacity::new(2, 2, 8).unwrap(), 262144, 128, 188, 2).unwrap();
+            GlmDraftCapacity::new(2, 2, 8).unwrap(), 262144, 128, 188, 2, cuteafd_core::MlaCacheFormat::Bf16).unwrap();
         let mut state = MlaPagedState::new(&layout).unwrap();
         assert_eq!(state.pool.capacity(), 2);
         state.reset(0, 513).unwrap();

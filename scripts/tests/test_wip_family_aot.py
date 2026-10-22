@@ -316,3 +316,17 @@ def test_non_kimi_scope_does_not_enable_kimi_programs(tmp_path):
     output = dry_run(tmp_path, path)
     assert 'CUTEAFD_WIP_KIMIK3_AOT' not in output
     assert scopes['CUTEAFD_WIP_GLM_AOT'] == 'ON'
+
+
+def test_kimi_builds_always_package_k6_programs(tmp_path):
+    path = config_file(tmp_path, 'kimi_k3', 'Kimi-K3-EXL3-K2', 6)
+    _, scopes = aot.config_scopes(aot.read_config(path))
+    assert scopes['CUTEAFD_WIP_KIMIK3_AOT'] == 'ON'
+    assert not any('KIMIK6' in key for key in scopes)
+    for name in ('wip.sh', 'scripts/build/build-wip-artifacts.sh', 'scripts/build/build-release-artifacts.sh',
+                 'native/CMakeLists.txt', 'native/cmake/shared/dsv4_programs.cmake'):
+        assert 'KIMIK6' not in (ROOT / name).read_text(), name
+    table = (ROOT / 'native/cmake/shared/dsv4_programs.cmake').read_text()
+    assert '"kimik3,kimi_k6_dense,kimi_split"' in table
+    for exporter in ['export_b12x_kimi_k6_dense_aot.py', 'export_b12x_kimi_split_aot.py']:
+        assert exporter in table

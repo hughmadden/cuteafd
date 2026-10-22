@@ -1,12 +1,14 @@
 mod families;
 mod shared;
-pub use shared::{audio, exlr8, fp8_moe, glm_stage, mla_draft, native_dense, peer_exchange, programs, vision};
+pub use shared::{audio, dense_trellis, exlr8, fp8_moe, glm_stage, mla_draft, native_dense, peer_exchange, programs, vision};
 pub use families::kimi_k3::{KimiMla, KimiMlaBatch, KimiMlaError, KimiMlaMode, KimiMlaWeights,
-    KimiFfn, KimiFfnBatch, KimiLatent, KimiPrefixMode, KimiResidual, KimiResidualBatch, KimiResidualSite,
+    KimiFfn, KimiFfnBatch, KimiFfnMode, KimiLatent, KimiPrefixMode, KimiResidual, KimiResidualBatch, KimiResidualSite,
     KimiRmsNorm, KimiSitu, KimiW8Error, KimiKda, KimiKdaBatch, KimiKdaWeights, KimiKdaCommit,
     KimiRouter, KimiRoutes, KimiExpertInput, MLA_PAGE_ROWS, MLA_RECORD_BYTES};
+pub use families::kimi_k3_split::{KimiSplitError, KimiMlaSplit, KimiMlaRankBatch,
+    KimiKdaCore, KimiKdaCoreWeights, KimiKdaCoreBatch};
 pub use shared::vocab_head::{VOCAB_HEAD_ROWS_MAX, VOCAB_HEAD_ROWS_PASS};
-pub use shared::v41_device_ops::{Bf16Add, V41PeerCopy};
+pub use shared::v41_device_ops::{Bf16Add, F32Add, V41PeerCopy};
 pub use families::deepseek_v41::v41_candidate_blocks::V41CandidateBlocks;
 pub use families::deepseek_v41::v41_index_topk::V41IndexTopK;
 pub use families::deepseek_v41::v41_sparse_attention::{V41SparseAttention, V41SparseBatch, V41SparseSource, V41SparseWindow};
@@ -179,7 +181,19 @@ pub fn cgroup_memory_census() -> Result<Vec<cuteafd_core::expert_geometry::Cgrou
     cgroup_memory_samples(&membership, read_cgroup_file)
 }
 
-/// Bound a MemAvailable sample by every visible cgroup ancestor, without CUDA queries.
+/// Return freed startup metadata arenas once, before retained model allocations.
+/// glibc otherwise retains large JSON/header parsing arenas for the process lifetime.
+pub fn trim_startup_metadata() {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    {
+        unsafe extern "C" { fn malloc_trim(pad: usize) -> i32; }
+        // SAFETY: glibc malloc_trim is thread-safe and touches only allocator-owned free pages.
+        unsafe { malloc_trim(0); }
+    }
+}
+
+/// Host-charged allocation headroom, bounded by every visible cgroup ancestor.
+/// This is not device headroom: GB10 CUDA allocations are not charged to memcg.
 pub fn cgroup_memory_headroom(available: usize) -> Result<usize> {
     let membership = std::fs::read_to_string("/proc/self/cgroup").context("reading device cgroup membership")?;
     cgroup_allocatable_bytes(available, &membership, read_cgroup_file)
@@ -198,14 +212,8 @@ mod allocatable_memory_tests {
         let result = device_allocatable_memory(&info, || {
             queried.set(true);
             anyhow::bail!("cudaMemGetInfo failed: out of memory")
-        }, || cgroup_allocatable_bytes(
-            allocatable_bytes(true, 0, || Ok("MemAvailable: 112197632 kB\n".into()))?,
-            "0::/", |path| Ok(match path.to_str().unwrap() {
-                "/sys/fs/cgroup/memory.max" => Some((100u64 << 30).to_string()),
-                "/sys/fs/cgroup/memory.current" => Some((4u64 << 30).to_string()),
-                _ => None,
-            }))).unwrap();
-        assert_eq!(result, (96usize << 30, 128usize << 30));
+        }, || allocatable_bytes(true, 0, || Ok("MemAvailable: 112197632 kB\n".into()))).unwrap();
+        assert_eq!(result, (112_197_632usize * 1024, 128usize << 30));
         assert!(!queried.get());
         assert_eq!(device_allocatable_memory(&info, || panic!("raw query"),
             || Ok(200usize << 30)).unwrap(), (128usize << 30, 128usize << 30));
@@ -214,6 +222,30 @@ mod allocatable_memory_tests {
         let invalid = CuteafdCudaDeviceInfo { total_memory_bytes: 0, ..info };
         assert!(device_allocatable_memory(&invalid, || panic!("raw query"),
             || panic!("invalid total must fail first")).is_err());
+    }
+
+    #[test]
+    fn integrated_device_pages_do_not_spend_host_cgroup_headroom() {
+        // Recorded retained-arena phase: device +310.7 MB, memcg +2.6 MB.
+        let device_before = 5_117_050_880u64;
+        let device_after = 5_427_741_028u64;
+        let host_before = 33_460_191_232u64;
+        let host_after = 33_462_812_672u64;
+        assert_eq!(device_after - device_before, 310_690_148);
+        assert_eq!(host_after - host_before, 2_621_440);
+        let info = CuteafdCudaDeviceInfo { integrated: 1, total_memory_bytes: 130_594_160_640,
+            ..Default::default() };
+        let available = 110_105_620_480usize;
+        let host_cap = 116_500_987_904u64;
+        let host_headroom = cgroup_allocatable_bytes(available, "0::/", |path| Ok(
+            match path.to_str().unwrap() {
+                "/sys/fs/cgroup/memory.max" => Some(host_cap.to_string()),
+                "/sys/fs/cgroup/memory.current" => Some(host_after.to_string()),
+                _ => None,
+            })).unwrap();
+        assert!(host_headroom < available);
+        assert_eq!(device_allocatable_memory(&info, || panic!("raw CUDA query"),
+            || Ok(available)).unwrap().0, available);
     }
 
     #[test]
@@ -228,7 +260,7 @@ mod allocatable_memory_tests {
     }
 
     #[test]
-    fn gb10_respects_nested_cgroup_headroom_and_namespace_root() {
+    fn host_allocations_respect_nested_cgroup_headroom_and_namespace_root() {
         let files = std::collections::HashMap::from([
             ("/sys/fs/cgroup/team/worker/memory.max", "100"),
             ("/sys/fs/cgroup/team/worker/memory.current", "20"),
@@ -1614,13 +1646,26 @@ impl NativeLibrary {
     ) -> Result<CuteafdXGrammarCompiler<'a>> {
         let path = CString::new(tokenizer_json_path.to_string_lossy().as_bytes())
             .context("XGrammar tokenizer path contains a NUL byte")?;
-        let create: Symbol<XGrammarCompilerCreateFn> =
-            unsafe { self.lib.get(b"cuteafd_xgrammar_compiler_create")? };
+        self.xgrammar_compiler_input(&path, b"cuteafd_xgrammar_compiler_create", vocab_size, stop_token_ids)
+    }
+
+    /// Compile from the already loaded checkpoint tokenizer, including native TikToken snapshots.
+    pub fn xgrammar_compiler_json<'a>(&'a self, tokenizer_json: &str, vocab_size: usize,
+        stop_token_ids: &[i32]) -> Result<CuteafdXGrammarCompiler<'a>> {
+        let json = CString::new(tokenizer_json).context("XGrammar tokenizer JSON contains a NUL byte")?;
+        self.xgrammar_compiler_input(&json, b"cuteafd_xgrammar_compiler_create_json", vocab_size, stop_token_ids)
+    }
+
+    fn xgrammar_compiler_input<'a>(&'a self, input: &std::ffi::CStr, symbol: &[u8], vocab_size: usize,
+        stop_token_ids: &[i32]) -> Result<CuteafdXGrammarCompiler<'a>> {
+        // SAFETY: both native entry points share this signature and consume input before returning.
+        let create: Symbol<XGrammarCompilerCreateFn> = unsafe { self.lib.get(symbol)? };
         let mut handle = std::ptr::null_mut();
         let mut error = [0 as c_char; XGRAMMAR_ERROR_BYTES];
+        // SAFETY: the input and stop-token slices remain live; native code initializes the owned handle.
         let status = unsafe {
             create(
-                path.as_ptr(),
+                input.as_ptr(),
                 vocab_size,
                 if stop_token_ids.is_empty() {
                     std::ptr::null()
@@ -2077,7 +2122,9 @@ impl NativeLibrary {
 
     /// Allocatable free/total bytes on the current device, before logical budgets.
     /// Integrated-device allocations reclaim Linux page cache, so MemAvailable is the
-    /// shared device/host headroom, bounded by cgroup hard-limit headroom.
+    /// shared device/host headroom. GB10 device pages are not charged to memcg,
+    /// so Docker memory limits bound host allocations only, not device admission.
+    /// Callers reserve their planned safety margin before admitting payloads.
     /// Integrated devices do not query cudaMemGetInfo: even that query can fail
     /// before reclaiming page cache. Raw samples remain available for diagnostics.
     /// Discrete devices keep cudaMemGetInfo, regardless of compute capability.
@@ -2086,7 +2133,7 @@ impl NativeLibrary {
         device_allocatable_memory(&info, || self.cuda_physical_memory_info(), || {
             let available = allocatable_bytes(true, 0,
                 || std::fs::read_to_string("/proc/meminfo").context("reading device allocatable memory"))?;
-            cgroup_memory_headroom(available)
+            Ok(available)
         })
     }
 

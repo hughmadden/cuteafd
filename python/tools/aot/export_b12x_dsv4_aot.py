@@ -46,6 +46,7 @@ CHECKPOINT_CONTEXTS = {
     "qwen35": ("Qwen/Qwen3.5-9B", 262144),
     "qwen38": ("Qwen/Qwen3.8-27B", 262144),
     "step5": ("stepfun-ai/Step-5-Preview", 1048576),
+    "kimik3": ("moonshotai/Kimi-K3", 1048576),
 }
 
 
@@ -511,21 +512,52 @@ def kimi_kda_programs(g, decode_rows: int, prefill_rows: int, max_context: int):
         out.append((f"kda_m{rows}", "kda", params,
                     lambda kw=params: glmf.compile_glmf_kda_aot(g, **kw)))
     for heads in (48, 96):
-        mla = kimi_mla.KimiMlaGeometry(heads=heads)
         suffix = "" if heads == 48 else "_h96"
-        for rows in sorted({decode_rows, prefill_rows}):
-            for op, fn in (("mla_producer", kimi_mla.compile_kimi_mla_producer_aot),
-                           ("mla_output", kimi_mla.compile_kimi_mla_output_aot)):
-                out.append((f"{op}{suffix}_m{rows}", op, {"max_rows": rows, "heads": heads},
-                            lambda r=rows, g=mla, fn=fn: fn(g, max_rows=r)))
-        for mode, rows in (("decode", decode_rows), ("verify", decode_rows), ("extend", prefill_rows)):
-            out.append((f"dense_mla_{mode}{suffix}_m{rows}", "dense_mla",
-                        {"mode": mode, "max_rows": rows, "heads": heads},
-                        lambda m=mode, r=rows, g=mla: kimi_mla.compile_kimi_dense_mla_aot(
-                            g, max_rows=r, max_context=max_context, mode=m)))
+        for cache in ("bf16", "fp8"):
+            mla = kimi_mla.KimiMlaGeometry(heads=heads, kv_cache=cache)
+            cache_suffix = "" if cache == "bf16" else "_fp8"
+            for rows in sorted({decode_rows, prefill_rows}):
+                out.append((f"mla_producer{suffix}{cache_suffix}_m{rows}", "mla_producer",
+                            {"max_rows": rows, "heads": heads, "kv_cache": cache},
+                            lambda r=rows, g=mla: kimi_mla.compile_kimi_mla_producer_aot(g, max_rows=r)))
+                if cache == "bf16":
+                    out.append((f"mla_output{suffix}_m{rows}", "mla_output", {"max_rows": rows, "heads": heads},
+                                lambda r=rows, g=mla: kimi_mla.compile_kimi_mla_output_aot(g, max_rows=r)))
+            for mode, rows in (("decode", decode_rows), ("verify", decode_rows), ("extend", prefill_rows)):
+                out.append((f"dense_mla_{mode}{suffix}{cache_suffix}_m{rows}", "dense_mla",
+                            {"mode": mode, "max_rows": rows, "heads": heads, "kv_cache": cache},
+                            lambda m=mode, r=rows, g=mla: kimi_mla.compile_kimi_dense_mla_aot(
+                                g, max_rows=r, max_context=max_context, mode=m)))
     out.extend(kimi_w8_programs())
     out.extend(kimi_latent_programs())
     out.extend(kimi_route_programs())
+    out.extend(mla_draft_programs(decode_rows, max_context))
+    return out
+
+
+def mla_draft_programs(max_rows: int, max_context: int):
+    """Shared rotary MLA drafter; checkpoint scales are runtime ABI inputs."""
+    from b12x.integration.cuteafd import kimi_mla
+
+    def build(op, window=None, cache="bf16"):
+        g = kimi_mla.MlaDraftGeometry(window_size=window, kv_cache=cache)
+        fn = getattr(kimi_mla, f"compile_mla_draft_{op}_aot")
+        kwargs = {"max_rows": max_rows}
+        if op == "attention":
+            kwargs["max_context"] = max_context
+        return fn(g, **kwargs)
+
+    out = [(f"mla_draft_output_m{max_rows}", "mla_draft_output", {"max_rows": max_rows},
+            lambda: build("output"))]
+    for cache in ("bf16", "fp8"):
+        cache_suffix = "" if cache == "bf16" else "_fp8"
+        out.append((f"mla_draft_producer{cache_suffix}_m{max_rows}", "mla_draft_producer",
+                    {"max_rows": max_rows, "kv_cache": cache}, lambda c=cache: build("producer", cache=c)))
+        for window in (None, 4096):
+            suffix = "full" if window is None else f"w{window}"
+            out.append((f"mla_draft_attention_{suffix}{cache_suffix}_m{max_rows}", "mla_draft_attention",
+                        {"max_rows": max_rows, "window_size": window, "max_context": max_context, "kv_cache": cache},
+                        lambda w=window, c=cache: build("attention", w, c)))
     return out
 
 
@@ -595,6 +627,10 @@ def kimi_w8_programs():
                            ("down", {"width": width, "outputs": 7168})):
             out.append((f"ffn_{op}_i{width}", "bf16_projection", params,
                         lambda kw=params: build_projection(kw)))
+        # Speed-first default; compensation is for informational F32 comparisons.
+        params = {"width": 7168, "outputs": 2 * width, "compensated": True}
+        out.append((f"ffn_gate_up_i{width}_comp", "bf16_projection", params,
+                    lambda kw=params: build_projection(kw)))
     return out
 
 
@@ -774,7 +810,8 @@ def main() -> None:
                              "kimik3 (Kimi K3 KDA, 48 heads per TP2 rank), "
                              "step5/step52 (Step-5 full/two-GPU head split), exlr8 (the fork's EXLR8 programs "
                              "for --exlr8-role, after every other family), exlr8_dense (shared native dense operands), "
-                             "glm_stage/glm2_stage (dormant full/TP2 GLM primitive boundaries)")
+                             "glm_stage/glm2_stage (dormant full/TP2 GLM primitive boundaries), "
+                             "kimi_k6_dense (native K6 core projections)")
     parser.add_argument("--exlr8-role", choices=("all", "coordinator", "spark"), default="all",
                         help="with exlr8: coordinator = shared-expert K1/grouping and rotated glue (beside the "
                              "family programs), spark = routed K1 serving and grouping, all = every program")
@@ -803,9 +840,9 @@ def main() -> None:
 
     geometries = [name.strip() for name in args.geometry.split(",") if name.strip()]
     if not geometries or any(name not in ("flash", "flash2", "pro", "pro2", "glm", "glm2", "mimo", "mimo2", "mimop",
-                                          "mimop2", "mimof", "mimof2", "glmf", "glmf2", "qwen4", "qwen35", "qwen38", "step5", "step52", "exlr8", "exlr8_dense", "glm_stage", "glm2_stage", "kimik3") for name in geometries):
+                                          "mimop2", "mimof", "mimof2", "glmf", "glmf2", "qwen4", "qwen35", "qwen38", "step5", "step52", "exlr8", "exlr8_dense", "glm_stage", "glm2_stage", "kimi_k6_dense", "kimi_split", "kimik3") for name in geometries):
         raise SystemExit("--geometry takes flash, flash2, pro, pro2, glm, glm2, mimo, mimo2, mimop, mimop2, mimof, mimof2, "
-                         "glmf, glmf2, qwen4, qwen35, qwen38, step5, step52, exlr8, exlr8_dense, glm_stage, glm2_stage and/or kimik3")
+                         "glmf, glmf2, qwen4, qwen35, qwen38, step5, step52, exlr8, exlr8_dense, glm_stage, glm2_stage, kimi_k6_dense, kimi_split and/or kimik3")
     if args.context_split_only and any(name not in ("flash", "pro", "glm", "glmf") for name in geometries):
         raise SystemExit("--context-split-only takes flash, pro, glm and/or glmf")
     kimi_kda = None
@@ -835,6 +872,21 @@ def main() -> None:
             g = GLM53 if name == "glm_stage" else dataclasses.replace(GLM53, name="glm53_tp2", heads=32)
             manifest["families"][name] = dataclasses.asdict(g)
             work += [(name, *item) for item in glm_stage_programs(g, args.decode_rows, args.prefill_rows)]
+            continue
+        if name == "kimi_split":
+            from export_b12x_kimi_split_aot import programs as kimi_split_programs
+            manifest["families"][name] = {"abi_version": 1}
+            work += [(name, suffix, "kimi_split", {"max_rows": capacity}, thunk)
+                     for suffix, thunk, capacity in kimi_split_programs()]
+            continue
+        if name == "kimi_k6_dense":
+            from export_b12x_kimi_k6_dense_aot import programs as kimi_dense_programs, row_policies
+            manifest["families"][name] = {
+                "abi_version": 1,
+                "row_policies": row_policies(),
+                "measured_not_exported": ["tiled_mcg"],
+            }
+            work += [(name, *item) for item in kimi_dense_programs()]
             continue
         if name == "exlr8_dense":
             from export_b12x_exlr8_dense_aot import programs as dense_programs
@@ -936,7 +988,7 @@ def main() -> None:
     for family, suffix, op, params, thunk in work:
         if selected is not None and suffix not in selected:
             continue
-        stem = f"{family}_{suffix}"
+        stem = suffix if family == "kimi_split" else f"{family}_{suffix}"
         # Card-specific split/merge plans retain their numerics and matching
         # scratch layouts. Native load selects once, before graph capture.
         plan_sms = (170, 188) if props.minor == 0 and op == "sparse_mla" and params.get("route") == "decode" else (None,)

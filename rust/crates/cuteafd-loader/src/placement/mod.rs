@@ -25,14 +25,14 @@ pub mod attention;
 mod residual;
 mod solve;
 mod spark;
-pub use spark::{ComponentDemand, SparkAssignment, SparkIoBytes, SparkResidentLayout, SparkRingGeometry, SparkWorkingSet, WorkingSetComponent};
+pub use spark::{ComponentDemand, SparkAssignment, SparkBudgetInventory, SparkIoBytes, SparkResidentLayout, SparkRingGeometry, SparkWorkingSet, WorkingSetComponent};
 #[cfg(test)]
 mod tests;
 
 pub use inventory::{loaded_code, ArchContext, GraphRank, GraphSet, Lifetime, LoadedCode, ProgramSet, RuntimeSample, ARCH_CONTEXTS};
 pub use pool::PoolPolicy;
 pub use residual::{validate_layer_pipeline_lanes, LAYER_PIPELINE_MAX_LANES, hop_buffer_bytes, plan_hops, residual_homes, Hop, HopKind, HopPoint, HopSpec, HopStorage, LayerExecutionPlan, LayerPlanError, ResidualHome, RoutedReplication, TerminalHome, Transition, HOP_SLOTS};
-pub use solve::{solve, solve_frozen};
+pub use solve::{solve, solve_frozen, solve_with_marks, MarkSelection};
 pub use attention::{AttentionPlacement, ContextBuffers, ContextExchangeLayout, KvDemand, LayerOwnership, CONTEXT_EXCHANGES};
 
 /// What a request asks of the hardware, built by a family from its own
@@ -321,6 +321,16 @@ pub struct LayerPolicy {
     /// overrides these; the solver's memory lever cannot replace them.
     pub attention: Vec<(AttentionClass, AttentionPlacement)>,
     pub ownership: LayerOwnership,
+    /// Whole-expert ownership, independent of the attention owner.
+    pub expert_ownership: ExpertOwnership,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ExpertOwnership {
+    #[default]
+    Contiguous,
+    /// Alternate complete routed layers by routed ordinal, starting on GPU 0.
+    AlternatingWhole,
 }
 
 impl LayerPolicy {
@@ -487,7 +497,8 @@ pub struct Placement {
     pub onboard_layers: usize,
     pub layers: Vec<LayerAssignment>,
     pub movables: Vec<(MovableId, u8)>,
-    /// Contiguous whole-layer RTX expert range per GPU (`layers == 0`: none).
+    /// Bounding whole-layer RTX expert range per GPU (`layers == 0`: none).
+    /// Per-layer `experts` homes are authoritative; alternating owners have gaps.
     /// Under TP2 every GPU's range is empty and [`Placement::tp2`] holds the layers.
     pub expert_ranges: Vec<ExpertRange>,
     /// The residual's home at each layer boundary: before layer `i` at `i`,
@@ -560,7 +571,9 @@ impl Placement {
                 t.peak_bytes[0], t.peak_bytes[1], self.expert_ranges[0].peak_bytes);
         }
         let ranges = self.expert_ranges.iter().enumerate()
-            .map(|(gpu, r)| format!("rtx{gpu} {}..{} ({} B)", r.first, r.first + r.layers, r.peak_bytes))
+            .map(|(gpu, r)| format!("rtx{gpu} layers {:?} ({} B)", self.layers.iter().enumerate()
+                .filter_map(|(layer, a)| (a.experts == ExpertHome::RtxWhole { gpu: gpu as u8 }).then_some(layer))
+                .collect::<Vec<_>>(), r.peak_bytes))
             .collect::<Vec<_>>().join(", ");
         format!("attention {attention}; pool {} tokens; onboard {} RTX expert layers: {ranges}{hops}", self.pool_tokens, self.onboard_layers)
     }
@@ -611,6 +624,10 @@ pub enum PlacementError {
     RequestedBelowContext { requested: u64, floor: u64 },
     #[error("placement inventory is invalid: {0}")]
     Inventory(&'static str),
+    #[error("placement cannot retain the minimum {minimum} complete exact-restore marks after fixed floors: {reason}")]
+    PrefixMarks { minimum: u64, reason: String, #[source] source: Box<PlacementError> },
+    #[error("no legal attention owner candidate fits; best attainable KV pool is {fit} tokens with selected-layer owners rtx0={rank0}, rtx1={rank1}: {source}")]
+    OwnerCandidates { fit: u64, rank0: usize, rank1: usize, #[source] source: Box<PlacementError> },
     #[error("explicit KV pool of {requested} tokens does not fit beside admitted demands (fits {fit}); {limits}")]
     PoolDoesNotFit { requested: u64, fit: u64, limits: PoolLimits },
     #[error("{family} drafter was placed on rtx{gpu}, where this build has no executor for it")]

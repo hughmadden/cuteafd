@@ -93,7 +93,7 @@ pub(crate) fn system_placement(profile: &ModelProfile) -> SystemPlacement {
             reasoning_effort: None, tool_names: Vec::new(), tool_choice: super::glm5::GlmToolChoice::Auto, response_format: None }).is_err(),
         ModelEncoding::Step5(encoding) => encoding.render(&body, &super::step5::Step5PromptOptions {
             tool_names: Vec::new(), tool_choice: super::step5::Step5ToolChoice::Auto, response_format: None }).is_err(),
-        ModelEncoding::DeepseekV4 | ModelEncoding::DeepseekV41 => false,
+        ModelEncoding::DeepseekV4 | ModelEncoding::DeepseekV41 | ModelEncoding::Kimi(_) => false,
     };
     if rejects { SystemPlacement::FirstOnly } else { SystemPlacement::Anywhere }
 }

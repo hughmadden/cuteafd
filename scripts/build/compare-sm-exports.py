@@ -65,10 +65,17 @@ def jobs(scope):
         suffix = "" if heads == 48 else "_h96"
         names = [f"{op}{suffix}_m{rows}" for rows in (64, 4096)
                  for op in ("mla_producer", "mla_output")]
-        names += [f"dense_mla_{mode}{suffix}_m{rows}"
+        names += [f"mla_producer{suffix}_fp8_m{rows}" for rows in (64, 4096)]
+        names += [f"dense_mla_{mode}{suffix}{cache}_m{rows}"
+                  for cache in ("", "_fp8")
                   for mode, rows in (("decode", 64), ("verify", 64), ("extend", 4096))]
         result.append((f"kimi-mla-h{heads}", "export_b12x_dsv4_aot.py",
                        ["--geometry", "kimik3", "--only", ",".join(names)]))
+    result.append(("mla-draft-h64", "export_b12x_dsv4_aot.py",
+                   ["--geometry", "kimik3", "--only", ",".join([
+                       "mla_draft_producer_m64", "mla_draft_producer_fp8_m64", "mla_draft_output_m64",
+                       "mla_draft_attention_full_m64", "mla_draft_attention_w4096_m64",
+                       "mla_draft_attention_full_fp8_m64", "mla_draft_attention_w4096_fp8_m64"])]))
     result.append(("kimi-residual", "export_b12x_dsv4_aot.py",
                    ["--geometry", "kimik3", "--only", ",".join([
                        "attn_res_c1_keep_append", "attn_res_c2_add_append",
@@ -79,10 +86,16 @@ def jobs(scope):
     result.append(("kimi-situ", "export_b12x_dsv4_aot.py",
                    ["--geometry", "kimik3", "--only", ",".join(
                        f"situ_i{width}" for width in (3072, 6144, 16896, 33792))]))
+    result.append(("kimi-ffn", "export_b12x_dsv4_aot.py",
+                   ["--geometry", "kimik3", "--only", ",".join(
+                       f"ffn_{op}_i{width}" for width in (3072, 6144, 16896, 33792)
+                       for op in ("gate_up", "down")) + "," + ",".join(
+                       f"ffn_gate_up_i{width}_comp" for width in (3072, 6144, 16896, 33792))]))
     result.append(("kimi-routing", "export_b12x_dsv4_aot.py",
                    ["--geometry", "kimik3", "--only", "router_scores,expert_input_quant"]))
     if scope == "suspects":
         return result
+    result.append(("kimi-split", "export_b12x_kimi_split_aot.py", []))
     result.extend((geometry, "export_b12x_dsv4_aot.py", ["--geometry", geometry])
                   for geometry in GEOMETRIES)
     for family in ("dsv4f", "dsv4p"):
@@ -156,6 +169,7 @@ def jobs(scope):
                    ["--geometry", geometry, "--capacities", CAPACITIES])
                   for geometry in EXL3_GEOMETRIES)
     result.extend([
+        ("kimi-k6-dense", "export_b12x_dsv4_aot.py", ["--geometry", "kimi_k6_dense,kimi_split"]),
         ("exlr8", "export_b12x_dsv4_aot.py", ["--geometry", "exlr8"]),
         ("glm-stage", "export_b12x_dsv4_aot.py", ["--geometry", "glm_stage"]),
         ("glm2-stage", "export_b12x_dsv4_aot.py", ["--geometry", "glm2_stage"]),

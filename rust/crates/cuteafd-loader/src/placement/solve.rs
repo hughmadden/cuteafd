@@ -1,13 +1,94 @@
 //! Deterministic placement in TJ's order: layer modes, fixed demands,
-//! mandatory movables, the KV pool, then contiguous RTX expert ranges.
+//! mandatory movables, the KV pool, then policy-owned RTX experts.
 use super::*;
 use cuteafd_core::memory_layout::{Basis, Category, Item};
+
+/// Retained marks are optional only after every non-mark demand and the
+/// requested KV floor have been admitted. Existing callers keep their legacy count.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MarkSelection {
+    pub legacy_slots: u64,
+    pub slots: u64,
+    pub reduction_reason: Option<String>,
+}
+
+impl MarkSelection {
+    pub fn summary(&self) -> String {
+        match &self.reduction_reason {
+            None => format!("prefix marks: legacy, {} complete marks (reservation fits)", self.slots),
+            Some(reason) => format!("prefix marks: capacity-constrained, {} -> {} complete marks; \
+                concurrency/state, weights/workspaces and KV floor retained; {reason}", self.legacy_slots, self.slots),
+        }
+    }
+}
+
+/// `per_slot` names the exact per-GPU demands already charged in `request.fixed`
+/// at `legacy_slots`. Only those demands may change during constrained selection.
+pub fn solve_with_marks(request: &PlacementRequest, legacy_slots: u64, minimum_slots: u64,
+    per_slot: &[Demand]) -> Result<(Placement, MarkSelection), PlacementError> {
+    if minimum_slots == 0 || legacy_slots < minimum_slots || per_slot.is_empty()
+        || per_slot.iter().any(|d| d.category != Category::Prefix || d.bytes == 0) {
+        return Err(PlacementError::Inventory("invalid capacity-constrained mark inventory"));
+    }
+    for (index, mark) in per_slot.iter().enumerate() {
+        if per_slot[..index].iter().any(|d| d.gpu == mark.gpu && d.group == mark.group) {
+            return Err(PlacementError::Inventory("duplicate per-slot mark demand"));
+        }
+        let matching = request.fixed.iter().filter(|d| d.gpu == mark.gpu && d.group == mark.group).collect::<Vec<_>>();
+        if matching.len() != 1 || matching[0].category != Category::Prefix
+            || matching[0].bytes != mark.bytes.checked_mul(legacy_slots).ok_or(PlacementError::Overflow("legacy marks"))? {
+            return Err(PlacementError::Inventory("legacy mark reservation differs from per-slot inventory"));
+        }
+    }
+    let trial = |slots| {
+        let mut candidate = request.clone();
+        for mark in per_slot {
+            let demand = candidate.fixed.iter_mut().find(|d| d.gpu == mark.gpu && d.group == mark.group).unwrap();
+            demand.bytes = mark.bytes.checked_mul(slots).ok_or(PlacementError::Overflow("retained marks"))?;
+        }
+        let placement = solve(&candidate)?;
+        let floor = request.pool.requested.unwrap_or(request.pool.floor);
+        if placement.pool_tokens < floor {
+            return Err(PlacementError::BelowFloor { pool: placement.pool_tokens, floor,
+                layers: placement.onboard_layers, short: floor - placement.pool_tokens,
+                limits: placement.pool_limits.clone() });
+        }
+        Ok(placement)
+    };
+    let capacity_error = |error: &PlacementError| matches!(error,
+        PlacementError::PoolDoesNotFit { .. } | PlacementError::StartupPeak { .. }
+        | PlacementError::Mandatory { .. } | PlacementError::ExpertLayers { .. }
+        | PlacementError::BelowFloor { .. } | PlacementError::SparkFree { .. }
+        | PlacementError::OwnerCandidates { .. });
+    let mut final_error = match trial(legacy_slots) {
+        Ok(placement) => return Ok((placement, MarkSelection { legacy_slots, slots: legacy_slots, reduction_reason: None })),
+        Err(error) if capacity_error(&error) => error,
+        Err(error) => return Err(error),
+    };
+    let reason = final_error.to_string();
+    // Descend rather than assume the discrete owner/onboard chooser is monotone.
+    for slots in (minimum_slots..legacy_slots).rev() {
+        match trial(slots) {
+            Ok(placement) => return Ok((placement, MarkSelection { legacy_slots, slots, reduction_reason: Some(reason) })),
+            Err(error) if capacity_error(&error) => final_error = error,
+            Err(error) => return Err(error),
+        }
+    }
+    Err(PlacementError::PrefixMarks { minimum: minimum_slots,
+        reason: format!("tried {} complete-mark counts ({} down to {}); final attempt with {} marks: {}",
+            legacy_slots - minimum_slots + 1, legacy_slots, minimum_slots, minimum_slots, final_error),
+        source: Box::new(final_error) })
+}
 
 /// Places `request`. Pure arithmetic over the request: the planner and the
 /// runtime get the same answer for the same inputs.
 pub fn solve(request: &PlacementRequest) -> Result<Placement, PlacementError> {
     request.pool.validate_explicit()?;
     validate_attention(request)?;
+    if request.policy.expert_ownership == ExpertOwnership::AlternatingWhole
+        && request.layers.iter().any(|layer| layer.experts.is_some_and(|cost| cost.tp2)) {
+        return Err(PlacementError::Inventory("alternating whole ownership conflicts with TP2 experts"));
+    }
     let mut best = solve_once(request, &[], None);
     if request.attention_placement.is_some() || request.inventory.gpus.len() != 2 || !request.inventory.peer_access
         || best.as_ref().is_ok_and(|p| p.pool_tokens >= request.pool.target) { return best; }
@@ -468,7 +549,8 @@ fn solve_once(request: &PlacementRequest, flips: &[(AttentionClass, AttentionPla
         let range = ranges[gpu];
         if range.peak_bytes > 0 {
             items[gpu].push(Item::new(Category::Experts,
-                format!("resident routed layers {}..{}", range.first, range.first + range.layers),
+                format!("resident routed layers {:?}", homes.iter().enumerate().filter_map(|(layer, home)|
+                    (*home == ExpertHome::RtxWhole { gpu: gpu as u8 }).then_some(layer)).collect::<Vec<_>>()),
                 "local", range.peak_bytes, Basis::Formula));
         }
     }
@@ -652,7 +734,9 @@ fn conditional_movable(request: &PlacementRequest, movable: &Movable, available:
         let fit = if context { fit / 2 * 2 } else { fit };
         let required = request.pool.requested.map_or(request.pool.floor, |n| n.max(request.pool.floor))
             .div_ceil(request.pool.unit_rows);
-        if fit < required {
+        // A fixed expert prefix is admitted next. Let that stage produce the
+        // complete-cost pool refusal instead of reporting this pre-expert ceiling.
+        if fit < required && !(movable.allowed.len() == 1 && matches!(request.onboard, Onboard::Layers(_))) {
             let limits = pool_limits(request, available, &trial_used, &trial_arenas, unit_bytes);
             refusal.get_or_insert_with(|| match request.pool.requested {
                 Some(requested) => PlacementError::PoolDoesNotFit { requested,
@@ -756,6 +840,34 @@ fn place_experts(request: &PlacementRequest, available: &[u64], used: &[u64], ar
     if available.len() == 2 && request.inventory.peer_access
         && request.layers.iter().any(|l| l.experts.is_some_and(|c| c.tp2)) {
         return place_tp2(request, available, used, arenas, first_moe, limit, caps[0]);
+    }
+    if request.policy.expert_ownership == ExpertOwnership::AlternatingWhole {
+        let mut homes = vec![ExpertHome::Spark; request.layers.len()];
+        let mut ranges = arenas.iter().map(|arena| ExpertRange {
+            first: first_moe, layers: 0, peak_bytes: arena.peak,
+        }).collect::<Vec<_>>();
+        let mut counts = vec![0; arenas.len()];
+        let mut next = first_moe;
+        let mut ordinal = 0;
+        while next < limit {
+            let Some(cost) = request.layers[next].experts else { next += 1; continue; };
+            let gpu = ordinal % request.expert_gpus.max(1);
+            if gpu >= arenas.len() || counts[gpu] >= caps[gpu] { break; }
+            let mut candidate = arenas[gpu].clone();
+            candidate.open(request.expert_workspace);
+            candidate.add(cost.whole)?;
+            if candidate.peak > available[gpu].saturating_sub(used[gpu]) { break; }
+            arenas[gpu] = candidate;
+            let range = &mut ranges[gpu];
+            if counts[gpu] == 0 { range.first = next; }
+            range.layers = next + 1 - range.first;
+            range.peak_bytes = arenas[gpu].peak;
+            homes[next] = ExpertHome::RtxWhole { gpu: gpu as u8 };
+            counts[gpu] += 1;
+            ordinal += 1;
+            next += 1;
+        }
+        return Ok((ranges, homes, next, None));
     }
     let mut next = first_moe;
     let mut ranges = Vec::new();

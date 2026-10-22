@@ -523,7 +523,7 @@ fn attention_selectors_follow_declared_executor_capabilities() {
     for executor in families::EXECUTORS {
         // Auto is the recorded default on two peer GPUs (GLM 5.3: context, K3; GLM Flash: context,
         // #57; V4: context, #58), heads on one.
-        let recorded = if ["qwen4", "deepseek_v41"].contains(&executor.family) { AttentionPlacement::Layers }
+        let recorded = if ["qwen4", "deepseek_v41", "kimi_k3"].contains(&executor.family) { AttentionPlacement::Layers }
             else if ["glm5", "glm5_flash", "deepseek_v4"].contains(&executor.family) { AttentionPlacement::Context }
             else { AttentionPlacement::Heads };
         assert_eq!(executor.check_attention(None, 2, true).unwrap(), recorded);
@@ -1555,6 +1555,43 @@ fn compulsory_prefix_reserves_exact_costs_before_an_automatic_pool() {
 }
 
 #[test]
+fn spark_budget_feeds_existing_tp2_pool_first_and_mark_selection() {
+    let mut req = request(2, 8 * GIB, 4, 6, Onboard::Auto);
+    req.pool = PoolPolicy::resolve(&[96 * GIB; 2], 1 << 20, Some(1 << 20), 64, false);
+    req.pool_overhead = vec![128 * 1024; 2]; // 2 GiB per GPU at the fixed 1M extent.
+    for layer in &mut req.layers {
+        let cost = layer.experts.as_mut().unwrap();
+        cost.tp2 = true;
+        cost.half = [Bytes2 { resident: GIB, staging: GIB / 4 }; 2];
+    }
+    req.tp2_workspace = [GIB / 4; 2];
+    let marks = (0..2).map(|gpu| Demand::new(gpu, Category::Prefix,
+        "exact marks", GIB, cuteafd_core::memory_layout::Basis::Exact)).collect::<Vec<_>>();
+    req.fixed = marks.iter().cloned().map(|mut demand| { demand.bytes *= 4; demand }).collect();
+    let budget = SparkBudgetInventory { layers: vec![0, 1, 2, 3],
+        resident: vec![vec![GIB; 4], vec![GIB, GIB, 2 * GIB, GIB]],
+        overhead: vec![GIB; 2], budget: 4 * GIB };
+    assert_eq!(budget.minimum_rtx_layers().unwrap(), 2); // The asymmetric rank is binding.
+    budget.constrain(&mut req).unwrap();
+    assert_eq!(req.minimum_expert_layers, 2);
+    let (placed, marks) = solve_with_marks(&req, 4, 1, &marks).unwrap();
+    assert_eq!(placed.onboard_layers, 2);
+    assert_eq!(placed.pool_tokens, 1 << 20);
+    assert_eq!(marks.slots, 3);
+    assert!(placed.layers[..2].iter().all(|layer| layer.experts == ExpertHome::RtxTp2));
+    req.onboard = Onboard::Layers(1);
+    let error = budget.constrain(&mut req).unwrap_err().to_string();
+    assert!(error.contains("--rtx-expert-layers 1") && error.contains("--spark-budget-gib"));
+    req.onboard = Onboard::Layers(2);
+    budget.constrain(&mut req).unwrap();
+    let all = SparkBudgetInventory { budget: 1, ..budget.clone() };
+    assert_eq!(all.minimum_rtx_layers().unwrap(), 4);
+    assert_eq!(all.rank_bytes(0, 4).unwrap(), 0);
+    let invalid = SparkBudgetInventory { budget: 0, ..budget };
+    assert!(invalid.minimum_rtx_layers().is_err());
+}
+
+#[test]
 fn compulsory_prefix_fails_when_even_the_weights_do_not_fit() {
     let mut req = request(1, GIB, 2, 4, Onboard::Auto);
     req.minimum_expert_layers = 1;
@@ -1608,6 +1645,108 @@ fn alternating_owner_function_preserves_noncontiguous_colocate_groups() {
             [first, 0, 1 - first, first, first]);
     }
     assert!(attention::alternating_owners([], 2).is_err());
+}
+
+#[test]
+fn alternating_whole_experts_keep_exact_homes_and_arena_charges() {
+    let mut req = request(2, 44 * GIB, 8, 6, Onboard::Layers(4));
+    req.policy.expert_ownership = ExpertOwnership::AlternatingWhole;
+    // A dense hole does not consume an ownership ordinal.
+    req.layers[1].experts = None;
+    let p = solve(&req).unwrap();
+    assert_eq!(p.onboard_layers, 4);
+    for (layer, gpu) in [(0, 0), (2, 1), (3, 0), (4, 1)] {
+        assert_eq!(p.layers[layer].experts, ExpertHome::RtxWhole { gpu });
+    }
+    assert_eq!(p.layers[1].experts, ExpertHome::Dense);
+    assert_eq!(p.layers[5].experts, ExpertHome::Spark);
+    for gpu in 0..2 {
+        assert_eq!(p.expert_ranges[gpu].peak_bytes, 2 * GIB + GIB / 2);
+        assert_eq!(p.items[gpu].iter().filter(|i| i.category == cuteafd_core::memory_layout::Category::Experts)
+            .map(|i| i.bytes).sum::<u64>(), p.expert_ranges[gpu].peak_bytes);
+    }
+    assert!(p.summary().contains("rtx0 layers [0, 3]"));
+    assert!(p.summary().contains("rtx1 layers [2, 4]"));
+}
+
+#[test]
+fn alternating_whole_refuses_owner_overflow_instead_of_moving_layers() {
+    let mut req = request(2, 44 * GIB, 8, 6, Onboard::Layers(4));
+    req.policy.expert_ownership = ExpertOwnership::AlternatingWhole;
+    req.inventory.gpus[1].baseline = Baseline::Measured { free_bytes: GIB };
+    assert!(matches!(solve(&req), Err(PlacementError::ExpertLayers { requested: 4, .. })));
+    req.layers[0].experts.as_mut().unwrap().tp2 = true;
+    assert!(matches!(solve(&req), Err(PlacementError::Inventory(_))));
+}
+
+#[test]
+fn fitting_glm_flash_and_mimo_pro_keep_their_legacy_mark_counts() {
+    for (mark_bytes, expected) in [(147_619_840, 34), (39_321_600, 42)] {
+        let slots = cuteafd_core::prefix::mark_slots_for(16, 20, mark_bytes, 2 << 30);
+        assert_eq!(slots, expected);
+        let mut req = request(2, 44 * GIB, 2, 6, Onboard::Auto);
+        let parts = (0..2).map(|gpu| Demand::new(gpu, Category::Prefix,
+            "exact marks", mark_bytes / 2, Basis::Exact)).collect::<Vec<_>>();
+        req.fixed.extend(parts.iter().cloned().map(|mut d| { d.bytes *= slots; d }));
+        let (placement, selection) = solve_with_marks(&req, slots, 1, &parts).unwrap();
+        assert_eq!(selection.slots, expected);
+        assert!(selection.reduction_reason.is_none());
+        assert_eq!(placement, solve(&req).unwrap());
+        assert!(selection.summary().contains("legacy"));
+    }
+}
+
+#[test]
+fn kimi_c8_marks_reduce_only_after_context_and_fixed_floors() {
+    let mut req = request(2, 44 * GIB, 2, 6, Onboard::Layers(0));
+    req.pool.requested = Some(1 << 20);
+    req.pool.floor = 1 << 20;
+    req.pool.target = 1 << 20;
+    // This fixture's KV rate is 16 GiB/rank at 1M tokens. All other
+    // operands are fixed: 8 active states plus weights and workspaces.
+    let mark = 224_686_080;
+    let legacy = cuteafd_core::prefix::mark_slots_for(8, 20, 2 * mark, 2 << 30);
+    assert_eq!(legacy, 18);
+    let parts = (0..2).map(|gpu| Demand::new(gpu, Category::Prefix,
+        "Kimi exact KDA marks", mark, Basis::Exact)).collect::<Vec<_>>();
+    for gpu in 0..2 {
+        req.fixed.push(Demand::new(gpu, Category::Kv, "C8 active states", 8 * mark, Basis::Exact));
+        req.fixed.push(Demand::new(gpu, Category::Weights, "weights and workspaces",
+            44 * GIB - 16 * GIB - 12 * mark, Basis::Exact));
+    }
+    req.fixed.extend(parts.iter().cloned().map(|mut d| { d.bytes *= legacy; d }));
+    let original = req.clone();
+    let (placed, selection) = solve_with_marks(&req, legacy, 1, &parts).unwrap();
+    assert_eq!(selection.slots, 4);
+    assert_eq!(placed.pool_tokens, 1 << 20);
+    assert!(selection.reduction_reason.is_some());
+    assert!(selection.summary().contains("capacity-constrained"));
+    assert_eq!(req, original);
+    for gpu in 0..2 {
+        assert_eq!(placed.items[gpu].iter().find(|d| d.group == "Kimi exact KDA marks").unwrap().bytes, 4 * mark);
+        assert_eq!(placed.items[gpu].iter().find(|d| d.group == "C8 active states").unwrap().bytes, 8 * mark);
+    }
+    // Even one byte short of one complete mark is a typed refusal.
+    for gpu in &mut req.inventory.gpus { gpu.baseline = Baseline::Measured { free_bytes: 44 * GIB - 3 * mark - 1 }; }
+    let mut final_attempt = req.clone();
+    for demand in &mut final_attempt.fixed {
+        if demand.group == "Kimi exact KDA marks" { demand.bytes = mark; }
+    }
+    let expected = solve(&final_attempt).unwrap_err().to_string();
+    let Err(PlacementError::PrefixMarks { minimum: 1, reason, .. }) = solve_with_marks(&req, legacy, 1, &parts)
+        else { panic!("one-mark shortfall must be a typed refusal") };
+    assert!(reason.contains("tried 18 complete-mark counts (18 down to 1)"));
+    assert!(reason.ends_with(&format!("final attempt with 1 marks: {expected}")));
+    let Err(PlacementError::PrefixMarks { reason, .. }) = solve_with_marks(&final_attempt, 1, 1, &parts)
+        else { panic!("single attempted count must retain its diagnostic") };
+    assert!(reason.contains("tried 1 complete-mark counts (1 down to 1)"));
+    assert!(reason.ends_with(&expected));
+    req.fixed[0].bytes -= 1;
+    assert!(matches!(solve_with_marks(&req, legacy, 1, &parts),
+        Err(PlacementError::Inventory(_)) | Err(PlacementError::PrefixMarks { .. })));
+    let mut invalid = original;
+    invalid.fixed.last_mut().unwrap().bytes -= 1;
+    assert!(matches!(solve_with_marks(&invalid, legacy, 1, &parts), Err(PlacementError::Inventory(_))));
 }
 
 #[test]
@@ -1738,6 +1877,54 @@ fn owner_specific_inventory_callback_matches_frozen_admission() {
     let invalid: Result<(Placement, ()), PlacementError> = attention::solve_owners(&groups,
         LayerOwnership::Ranges, 2, Onboard::Auto, |_| unreachable!());
     assert!(matches!(invalid, Err(PlacementError::Inventory(_))));
+}
+
+#[test]
+fn fixed_expert_refusal_includes_experts_after_conditional_draft() {
+    let mut req = owner_balance_request();
+    req.onboard = Onboard::Layers(1);
+    req.pool.requested = Some(128 << 20);
+    req.pool.floor = 128 << 20;
+    req.pool.ceiling = 128 << 20;
+    for layer in &mut req.layers { layer.modes = vec![S0]; }
+    req.layers[0].experts = Some(ExpertCost { whole: Bytes2 { resident: GIB, staging: 0 },
+        half: [Bytes2 { resident: GIB / 2, staging: 0 }; 2], tp2: true, spark_ok: true });
+    req.expert_gpus = 2;
+    req.tp2_workspace = [GIB / 4; 2];
+    let plain = solve(&req).unwrap_err();
+    req.movables.push(Movable { id: MovableId::Drafter, allowed: vec![1], expert_arena: false,
+        parts: vec![], conditional: vec![MovableDemands { placement_gpu: 1,
+            demands: vec![Demand::new(1, Category::Drafter, "draft workspace", 256, Basis::Exact)] }] });
+    let draft = solve(&req).unwrap_err();
+    let PlacementError::PoolDoesNotFit { limits: plain, .. } = plain else { panic!("{plain}") };
+    let PlacementError::PoolDoesNotFit { limits: draft, .. } = draft else { panic!("{draft}") };
+    assert_eq!(draft.0[0].available_bytes, plain.0[0].available_bytes);
+    assert_eq!(draft.0[1].available_bytes + 256, plain.0[1].available_bytes);
+}
+
+#[test]
+fn owner_refusal_reports_largest_pool_and_selected_split_through_marks_and_context() {
+    let groups = [(false, None), (true, None), (false, None), (true, None)];
+    let mut attempted = 0;
+    let refused: anyhow::Result<(Placement, ())> = attention::solve_owners(&groups,
+        LayerOwnership::Ranges, 0, Onboard::Auto, |_| {
+            let fit = [100, 300, 200][attempted];
+            attempted += 1;
+            Err(anyhow::Error::new(PlacementError::PrefixMarks { minimum: 1,
+                reason: "one complete mark".into(),
+                source: Box::new(PlacementError::PoolDoesNotFit {
+                    requested: 400, fit, limits: PoolLimits(vec![]) }) }).context("native admission"))
+        });
+    assert_eq!(attempted, 3);
+    let error = refused.unwrap_err();
+    assert!(matches!(error.downcast_ref::<PlacementError>(), Some(PlacementError::OwnerCandidates {
+        fit: 300, rank0: 1, rank1: 1, .. })));
+    assert!(error.to_string().contains("rtx0=1, rtx1=1"));
+    // Equal failures retain the first legal candidate, as successful ties do.
+    let refused: Result<(Placement, ()), PlacementError> = attention::solve_owners(&groups,
+        LayerOwnership::Ranges, 1, Onboard::Auto, |_| Err(PlacementError::BelowFloor {
+            pool: 100, floor: 400, layers: 0, short: 300, limits: PoolLimits(vec![]) }));
+    assert!(matches!(refused, Err(PlacementError::OwnerCandidates { fit: 100, rank0: 2, rank1: 0, .. })));
 }
 
 #[test]

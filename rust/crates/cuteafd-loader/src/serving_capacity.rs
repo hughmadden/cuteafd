@@ -13,13 +13,15 @@ use thiserror::Error;
 
 mod deepseek;
 pub mod step5;
+mod spark_intake;
+pub use spark_intake::spark_intake_bytes;
 mod exl3_workspace;
 pub use exl3_workspace::exl3_workspace_bytes;
 pub mod glm_graphs;
 pub mod glmf_graphs;
 mod glmf_workspace;
 pub use glmf_workspace::{glmf_expert_rows, glmf_lane_bytes, glmf_manifest_scratch, glmf_selector_bytes,
-    glmf_spark_intake_bytes, glmf_step_scratch,
+    glmf_step_scratch,
     glmf_step_workspaces, glmf_table_pages, glmf_temporary_bytes, GlmfKdaState, GlmfLaneBytes, GlmfMissingProgram,
     GlmfScratch, GlmfScratchOptions, GlmfStepShape, GlmfStepWorkspaces, GlmfTemporaryBytes, GLMF_DECODE_ROWS,
     GLMF_DEFAULT_PREFILL_LANES, GLMF_HEAD_WORKSPACE, GLMF_SPARSE_TOPK, GLMF_WIDE_DECODE_ROWS};
@@ -87,12 +89,15 @@ pub const GLMF_POOL_MARK_RESERVED_UNITS: u64 = 1;
 
 #[derive(Debug, Clone, Copy)]
 pub struct CacheOptions {
+    /// Selected physical attention layout where a family supports multiple owners.
+    pub attention_placement: Option<crate::placement::AttentionPlacement>,
     pub coordinator_ranks: usize,
     pub native_mtp_layers: usize,
     pub mimo_kv: MimoKvFormats,
     pub dense_qwen_kv: crate::families::qwen4::Qwen4KvCache,
     pub qwen_kv: Qwen4KvCache,
     pub step5_kv: Qwen4KvCache,
+    pub mla_kv: cuteafd_core::MlaCacheFormat,
     /// DeepSeek V4's window ring holds one prefill chunk plus its window.
     pub prefill_rows: u64,
     /// GLM 5.3 Flash's DSA index cache.
@@ -107,12 +112,14 @@ pub struct CacheOptions {
 impl Default for CacheOptions {
     fn default() -> Self {
         Self {
+            attention_placement: None,
             coordinator_ranks: 1,
             native_mtp_layers: 0,
             mimo_kv: MimoKvFormats::default(),
             dense_qwen_kv: crate::families::qwen4::Qwen4KvCache::Fp8,
             qwen_kv: Qwen4KvCache::default(),
             step5_kv: Qwen4KvCache::Bf16,
+            mla_kv: Default::default(),
             prefill_rows: 4096,
             glmf_index: GlmfIndexCache::Keys,
             kda_state_bytes: 4,

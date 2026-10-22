@@ -11,6 +11,24 @@ pub fn geometry(cfg: &KimiK3Config) -> KdaGeometry {
         output_gate: KdaOutputGate::FullRank, o_norm_dtype: DType::F32 }
 }
 
+/// Exact physical host snapshot segments: both KDA shards and every resident
+/// MLA copy. Head-split MLA keeps two copies, so neither may be deduplicated.
+pub fn cache_geometry(cfg: &KimiK3Config, mla_layers: [usize; 2], cache_format: cuteafd_core::MlaCacheFormat)
+    -> Result<crate::serving_capacity::FamilyCacheGeometry, crate::serving_capacity::CacheGeometryError> {
+    use crate::serving_capacity::{CacheGeometryError, FamilyCacheGeometry, KvPlacement, RankCacheGeometry};
+    if cfg.kda_heads != 96 || cfg.kda_head_dim != 128 || cfg.kda_conv != 4
+        || cfg.layers != cfg.attention.len() || cfg.mla_record_values() != 576
+        || mla_layers.iter().any(|&n| n > cfg.mla_layers()) {
+        return Err(CacheGeometryError::Unsupported { family: "kimi_k3", what: "native TP2 cache geometry" });
+    }
+    let mark = (cfg.kda_state_bytes() + cfg.kda_conv_bytes()) / 2 * cfg.kda_layers() as u64;
+    let ranks = mla_layers.into_iter().map(|layers| RankCacheGeometry {
+        persistent_unit_bytes: layers as u64 * 64 * cache_format.record_bytes() as u64,
+        active_state_per_sequence_bytes: mark, retained_mark_bytes: mark, ..Default::default()
+    }).collect();
+    Ok(FamilyCacheGeometry { logical_unit_rows: 64, placement: KvPlacement::PartitionedLayers, ranks })
+}
+
 /// The checkpoint tensor holding `role` of KDA layer `layer` (0-based), or
 /// `None` for roles Kimi K3 does not ship (the low-rank output gate).
 pub fn tensor_name(layer: usize, role: KdaRole) -> Option<String> {

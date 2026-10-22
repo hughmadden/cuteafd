@@ -357,7 +357,7 @@ def test_kimi_release_derives_coordinator_programs(tmp_path, monkeypatch):
     derived, _ = SCOPE.derive(tmp_path, matrix, 'kimi', {})
     assert derived[P + 'KIMIK3_AOT'] == 'ON'
     assert derived[P + 'STEP5_AOT'] == 'OFF'
-    assert SCOPE.requirements(tmp_path, matrix, 'kimi')[0]['programs'] == ['kimik3']
+    assert SCOPE.requirements(tmp_path, matrix, 'kimi')[0]['programs'] == ['kimi_k6_dense', 'kimi_split', 'kimik3']
 
 
 def test_unrelated_release_keeps_kimi_disabled(tmp_path, monkeypatch):

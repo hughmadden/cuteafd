@@ -16,6 +16,9 @@ static _Thread_local int current_device;
 static int bind_after = -1, bind_calls;
 void fixture_configure_bind_after(int after) { bind_after = after; bind_calls = 0; }
 static size_t memory_total[8], memory_used[8], graph_bytes;
+static int immediate_copies;
+
+void fixture_configure_immediate_copies(void) { immediate_copies = 1; }
 
 void fixture_configure_memory(int device, size_t total, size_t used, size_t graph) {
     memory_total[device] = total;
@@ -194,12 +197,60 @@ int cuteafd_cuda_event_create_ordering(void **out) {
     event('C');
     return 0;
 }
+int cuteafd_cuda_event_create(void **out) {
+    return cuteafd_cuda_event_create_ordering(out);
+}
+
+int cuteafd_cuda_stream_wait_event(void *stream, void *handle) {
+    (void)stream; (void)handle;
+    event('W');
+    return 0;
+}
+
+int cuteafd_cuda_zero_bytes_async(void *dst, size_t bytes, void *stream) {
+    (void)stream;
+    memset(dst, 0, bytes);
+    return 0;
+}
+
+int cuteafd_copy_h2d_async(struct device_buffer dst, const void *source,
+                         size_t bytes, void *stream);
+
+int cuteafd_copy_d2d_async(struct device_buffer dst, struct device_buffer src,
+                           size_t bytes, void *stream) {
+    if (bytes > dst.bytes || bytes > src.bytes) return 1;
+    if (!immediate_copies) return cuteafd_copy_h2d_async(dst, src.ptr, bytes, stream);
+    if (dst.device_id != current_device) return 1;
+    memcpy(dst.ptr, src.ptr, bytes);
+    event('C');
+    return pack_status;
+}
+
+int cuteafd_copy_d2h(void *dst, struct device_buffer src, size_t bytes) {
+    if (bytes > src.bytes) return 1;
+    memcpy(dst, src.ptr, bytes);
+    return 0;
+}
+
+int cuteafd_copy_d2h_async(void *dst, struct device_buffer src, size_t bytes, void *stream) {
+    (void)stream;
+    if (!immediate_copies || bytes > src.bytes || src.device_id != current_device) return 1;
+    memcpy(dst, src.ptr, bytes);
+    event('J');
+    return 0;
+}
+
 int cuteafd_copy_h2d_async(struct device_buffer dst, const void *source,
                          size_t bytes, void *stream) {
     (void)stream;
     if (bytes > dst.bytes) return 1;
-    if (pending_count == 65536) return 1;
-    pending_uploads[pending_count++] = (struct upload){dst.ptr, source, bytes};
+    if (immediate_copies) {
+        if (dst.device_id != current_device) return 1;
+        memcpy(dst.ptr, source, bytes);
+    } else {
+        if (pending_count == 65536) return 1;
+        pending_uploads[pending_count++] = (struct upload){dst.ptr, source, bytes};
+    }
     event('Q');
     return 0;
 }
@@ -245,7 +296,7 @@ int cuteafd_cuda_event_destroy(void *handle) {
 
 int cuteafd_cuda_stream_query(void *stream, int *ready) {
     (void)stream;
-    *ready = 0;
+    *ready = immediate_copies;
     return 0;
 }
 
@@ -284,16 +335,9 @@ int cuteafd_copy_h2d(struct device_buffer dst, const void *source, size_t bytes)
     return 0;
 }
 
-int cuteafd_copy_d2h(void *dst, struct device_buffer src, size_t bytes) {
-    if (bytes > src.bytes) return 1;
-    memcpy(dst, src.ptr, bytes); return 0;
-}
 int cuteafd_copy_d2d(struct device_buffer dst, struct device_buffer src, size_t bytes) {
     if (bytes > dst.bytes || bytes > src.bytes) return 1;
     memcpy(dst.ptr, src.ptr, bytes); return 0;
-}
-int cuteafd_copy_d2d_async(struct device_buffer dst, struct device_buffer src, size_t bytes, void *stream) {
-    return cuteafd_copy_h2d_async(dst, src.ptr, bytes, stream);
 }
 int cuteafd_cuda_zero_bytes(void *dst, size_t bytes) { memset(dst, 0, bytes); return 0; }
 int cuteafd_zero_pitched_async(void *dst, uint64_t bytes, uint64_t pitch,

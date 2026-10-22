@@ -112,6 +112,7 @@ impl<'a> RemoteDflash<'a> {
                     &self.target.head, hidden, weight.buffer.ptr.cast_const(), logits.cast(), rows,
                     self.draft.cfg.hidden, self.draft.cfg.vocab, stream, self.draft.draft_head_mode()) }
             }
+            TargetHead::Bf16Buffer(_) => anyhow::bail!("GLM Flash remote adapter requires its retained target head owner"),
             TargetHead::Launch(launch) => launch(hidden, logits.cast(), rows, stream),
         })
     }
