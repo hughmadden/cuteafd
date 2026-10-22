@@ -139,8 +139,13 @@ fn retained_modules_are_measured_once_and_consumed_without_reload() -> Result<()
     let mut names: Vec<String> = ["descriptor_map", "global_to_combined", "intermediate_rotations", "gate_suh", "up_suh", "down_svh", "dummy_scales", "unit_scales"]
         .into_iter().map(str::to_owned).collect();
     for tier in 0..2 { for suffix in ["w13", "w2"] { names.push(format!("tier{tier}_{suffix}")); } }
-    let specs: Vec<_> = names.into_iter().map(|name| V41Exl3ResidentBuffer {
-        bytes: if name == "descriptor_map" {3*6*2*4} else {16}, name, initial_words: vec![] }).collect();
+    // A resident descriptor map carries its initial words, as every planned
+    // residency does (legacy 3-row descriptors: rows x experts x tiers).
+    let specs: Vec<_> = names.into_iter().map(|name| {
+        let descriptor = name == "descriptor_map";
+        V41Exl3ResidentBuffer { bytes: if descriptor {3*6*2*4} else {16},
+            initial_words: if descriptor { vec![0; 3*6*2] } else { vec![] }, name }
+    }).collect();
     let arena = DeviceAllocation::new(&library, 1024)?;
     let weights = Rc::new(vec![Exl3Weights {
         buffers: specs.iter().map(|s| WeightBuffer { buffer: CuteafdDeviceBuffer { bytes:s.bytes, ..arena.buffer } }).collect(),
