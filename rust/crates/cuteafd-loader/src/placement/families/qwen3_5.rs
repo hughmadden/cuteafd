@@ -285,7 +285,12 @@ pub fn norm_dtype(spec: &NativeProgram) -> Result<DType> {
     }
 }
 
-pub fn validate(cfg: &Qwen35Config, op: &str, rows: usize, spec: &NativeProgram) -> Result<()> {
+pub fn program_name(prefix: &str, op: &str, rows: usize, format: crate::families::qwen4::Qwen4KvCache) -> String {
+    let suffix = if matches!(op, "attn_producer" | "full_gqa") && format == crate::families::qwen4::Qwen4KvCache::Fp8 { "_kv_fp8" } else { "" };
+    if rows == 0 { format!("{prefix}_{op}{suffix}") } else { format!("{prefix}_{op}{suffix}_m{rows}") }
+}
+
+pub fn validate(cfg: &Qwen35Config, op: &str, rows: usize, format: crate::families::qwen4::Qwen4KvCache, spec: &NativeProgram) -> Result<()> {
     if rows > 0 {
         ensure!(spec.capacity_rows as usize >= rows, "{} capacity is smaller than {rows}", spec.name);
         integer(spec, "max_rows", rows)?;
@@ -319,7 +324,8 @@ pub fn validate(cfg: &Qwen35Config, op: &str, rows: usize, spec: &NativeProgram)
             integer(spec, "heads", cfg.heads)?;
             integer(spec, "kv_heads", cfg.kv_heads)?;
             integer(spec, "head_dim", cfg.head_dim)?;
-            integer(spec, "record_bytes", 2 * cfg.kv_heads * cfg.head_dim * 2)?;
+            integer(spec, "record_bytes", format.record_bytes(cfg.kv_heads, cfg.head_dim))?;
+            ensure!(spec.geometry["kv_format"] == format.to_string(), "{}: dense KV format mismatch", spec.name);
             ensure!(spec.geometry["indexed"] == false, "{}: dense attention must not use QSA", spec.name);
             if op == "attn_producer" {
                 integer(spec, "in_width", 2 * (cfg.heads + cfg.kv_heads) * cfg.head_dim)?;

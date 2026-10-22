@@ -140,6 +140,7 @@ pub struct LayoutOptions {
     /// Resident native drafter stages (zero disables optional native MTP).
     pub native_mtp_layers: usize,
     /// Qwen full-attention record format; index keys remain BF16.
+    pub dense_qwen_kv: crate::families::qwen4::Qwen4KvCache,
     pub qwen_kv: crate::families::qwen4::Qwen4KvCache,
     pub step5_kv: crate::families::qwen4::Qwen4KvCache,
     /// Selected Qwen projection/head residency, matching serve-qwen4.
@@ -219,6 +220,7 @@ impl Default for LayoutOptions {
             mimo_expert_manifest: None,
             context_tokens: 0,
             native_mtp_layers: 3,
+            dense_qwen_kv: crate::families::qwen4::Qwen4KvCache::Bf16,
             qwen_kv: Default::default(),
             step5_kv: crate::families::qwen4::Qwen4KvCache::Fp8,
             qwen_representation: crate::families::qwen4::resident::Qwen4Representation {
@@ -1025,7 +1027,7 @@ fn selected_host_geometry(report: &mut PlanReport, options: &LayoutOptions, chec
     let selected = CacheOptions { coordinator_ranks: ranks,
         native_mtp_layers: if matches!(id, "deepseek_v4" | "qwen4") { shape.native_layers } else { 0 },
         mimo_kv: crate::families::mimo_v2::MimoKvFormats { full: crate::families::mimo_v2::MimoKvCache::Int8, sliding: options.mimo_swa_kv },
-        qwen_kv: options.qwen_kv, step5_kv: options.step5_kv, prefill_rows: admitted_rows.unwrap_or(shape.prefill_rows),
+        dense_qwen_kv: options.dense_qwen_kv, qwen_kv: options.qwen_kv, step5_kv: options.step5_kv, prefill_rows: admitted_rows.unwrap_or(shape.prefill_rows),
         glmf_index: options.glmf_index, kda_state_bytes: options.glmf_kda_state.bytes(),
         glmf_decode_rows: options.glmf_decode_rows, ..Default::default() };
     // Qwen's dual-owner layout partitions whole layers. Its host snapshot

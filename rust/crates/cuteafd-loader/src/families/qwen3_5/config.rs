@@ -106,8 +106,8 @@ impl Qwen35Config {
             tied_embeddings: v["tie_word_embeddings"].as_bool().or(root["tie_word_embeddings"].as_bool()).unwrap_or(false) })
     }
 
-    pub fn full_kv_bytes_per_token(&self) -> usize {
-        self.attention.iter().filter(|&&a| a == HybridAttention::Full).count() * 2 * self.kv_heads * self.head_dim * 2
+    pub fn full_kv_bytes_per_token(&self, format: crate::families::qwen4::Qwen4KvCache) -> usize {
+        self.attention.iter().filter(|&&a| a == HybridAttention::Full).count() * format.record_bytes(self.kv_heads, self.head_dim)
     }
 
     pub fn recurrent_state_bytes(&self) -> usize {

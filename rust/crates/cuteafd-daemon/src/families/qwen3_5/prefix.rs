@@ -37,7 +37,7 @@ impl<'e, 'a> DensePrefix<'e, 'a> {
         ensure!(target.prefix_arena.as_ref().map_or(0, |arena| arena.buffer.bytes)
             == target.prefix_marks * mark.bytes, "dense prefix marks differ from admission");
         let layout = FamilyLayout { page_rows: 64, pages: target.pool_tokens / 64,
-            page_bytes: target.kv.iter().flatten().count() * 64 * 2 * target.cfg.kv_heads * target.cfg.head_dim * 2,
+            page_bytes: 64 * target.cfg.full_kv_bytes_per_token(target.kv_format),
             mark_bytes: mark.bytes, draft_bytes: 0, rule: ReuseRule::EXACT,
             mark_store: MarkStore::Arena, page_owners: Default::default() };
         drop(target);
@@ -78,7 +78,7 @@ impl<'e, 'a> DensePrefix<'e, 'a> {
     fn page_buffers(&self, page: u32, rows: usize) -> Result<Vec<CuteafdDeviceBuffer>> {
         ensure!((page as usize) < self.layout.pages && rows <= 64, "dense prefix page/rows outside admitted pool");
         let target = self.engine.borrow();
-        let record = 2 * target.cfg.kv_heads * target.cfg.head_dim * 2;
+        let record = target.kv_format.record_bytes(target.cfg.kv_heads, target.cfg.head_dim);
         target.kv.iter().flatten().map(|pool| view(pool.buffer, page as usize * 64 * record, rows * record)).collect()
     }
 }
@@ -130,7 +130,12 @@ pub(crate) fn check(engine: &RefCell<DenseEngine<'_>>, tokens: &[u32]) -> Result
 impl PrefixFamily for DensePrefix<'_, '_> {
     type Placement = Placement;
 
-    fn record_format(&self) -> &'static str { "qwen_dense_bf16_gqa_gdn_f32_v1" }
+    fn record_format(&self) -> &'static str {
+        match self.engine.borrow().kv_format {
+            cuteafd_loader::families::qwen4::Qwen4KvCache::Bf16 => "qwen_dense_bf16_gqa_gdn_f32_v1",
+            cuteafd_loader::families::qwen4::Qwen4KvCache::Fp8 => "qwen_dense_e4m3_head_f32_gqa_gdn_f32_v1",
+        }
+    }
     fn layout(&self) -> FamilyLayout { self.layout }
     fn pages<'p>(&self, placement: &'p Placement) -> &'p [u32] { &placement.units }
     fn commit_point(&self, placement: &Placement) -> usize { placement.len.min(placement.state_len) }

@@ -80,13 +80,23 @@ fn native_planner_fixture() -> (tempfile::TempDir, PlanOptions, crate::placement
                 "key_heads":16,"value_heads":32,"head_dim":if op == "gdn" {128} else {256},
                 "in_width":in_width,"output_gate":"silu","fp8_weights":false,"norm_dtype":"torch.float32",
                 "channels":8192,"replay_rows":64,"replay_bytes":buffers.replay_per_layer,
-                "heads":16,"kv_heads":4,"record_bytes":4096,"indexed":false,"rope_dim":64,
+                "heads":16,"kv_heads":4,"record_bytes":4096,"kv_format":"bf16","indexed":false,"rope_dim":64,
                 "rope_theta":10000000.0,"page_rows":64,"max_splits":32,"causal":true,
                 "empty_rows_zero":true,"width":4096,"intermediate":12288},
             "pointers":pointers.iter().map(|name| json!({"name":name})).collect::<Vec<_>>(),
             "scalars":(0..scalars).map(|_| json!({"type":"int32"})).collect::<Vec<_>>(),
             "scratch_bytes_at_capacity":{"scratch":1024}}));
     }
+    let compact = programs.iter().filter(|entry| {
+        let name = entry["name"].as_str().unwrap();
+        name.contains("attn_producer") || name.contains("full_gqa")
+    }).cloned().map(|mut entry| {
+        entry["name"] = json!(entry["name"].as_str().unwrap().replace("_m", "_kv_fp8_m"));
+        entry["geometry"]["record_bytes"] = json!(2080);
+        entry["geometry"]["kv_format"] = json!("fp8");
+        entry
+    }).collect::<Vec<_>>();
+    programs.extend(compact);
     let manifest = dir.path().join("PROGRAMS.json");
     let exports = json!({"programs":programs});
     std::fs::write(&manifest, serde_json::to_vec(&exports).unwrap()).unwrap();
@@ -255,7 +265,8 @@ fn dense_geometry_and_native_gate_sites() {
         (5120, 17408, 24, 48, 64, 65536, 153944064)] {
         let cfg = Qwen35Config::from_hf(&config(h, i, heads, values, layers)).unwrap();
         assert_eq!(cfg.gdn.output_gate, GdnOutputGate::Silu);
-        assert_eq!(cfg.full_kv_bytes_per_token(), kv);
+        assert_eq!(cfg.full_kv_bytes_per_token(crate::families::qwen4::Qwen4KvCache::Bf16), kv);
+        assert_eq!(cfg.full_kv_bytes_per_token(crate::families::qwen4::Qwen4KvCache::Fp8), kv / 4096 * 2080);
         assert_eq!(cfg.recurrent_state_bytes(), state);
         assert_eq!(cfg.attention[3], HybridAttention::Full);
     }
@@ -311,4 +322,34 @@ fn missing_or_malformed_projection_is_named() {
     weights.iter_mut().find(|(name, ..)| name.ends_with("linear_attn.in_proj_a.weight")).unwrap().1 = "F8_E4M3".into();
     write_snapshot(dir.path(), &cfg, &weights, None);
     assert!(format!("{:#}", Qwen35Checkpoint::read(dir.path()).err().unwrap()).contains("in_proj_a"));
+}
+
+
+#[test]
+fn native_compact_admission_keeps_fixed_slots_and_spends_half_the_pool_bytes() {
+    use crate::families::qwen4::Qwen4KvCache;
+    use crate::serving_capacity::CacheOptions;
+    use cuteafd_core::memory_layout::Category;
+    let (dir, mut options, _, _) = native_planner_fixture();
+    let mut memories = Vec::new();
+    for format in [Qwen4KvCache::Bf16, Qwen4KvCache::Fp8] {
+        let layout = options.layout.as_mut().unwrap();
+        layout.dense_qwen_kv = format;
+        layout.pool_tokens = Some(2_097_152);
+        let report = plan::plan(dir.path(), &options).unwrap();
+        assert!(report.native_serving_admitted, "{:?}", report.hints);
+        let memory = report.memory_layout.unwrap();
+        assert_eq!(memory.pool_tokens, 2_097_152);
+        assert!(memory.notes.iter().any(|n| n.contains("fixed slots and prefix marks do not grow")));
+        memories.push(memory.devices[0].by_category());
+        let cfg = Qwen35Config::from_hf(&config(4096, 12288, 16, 32, 32)).unwrap();
+        let bytes = cfg.full_kv_bytes_per_token(format);
+        assert_eq!(bytes, if format == Qwen4KvCache::Bf16 { 32768 } else { 16640 });
+        assert_eq!(CacheOptions { dense_qwen_kv: format, ..Default::default() }.dense_qwen_kv, format);
+    }
+    assert_eq!(memories[0][&Category::Prefix], memories[1][&Category::Prefix]);
+    let before = memories[0].get(&Category::Kv).copied().unwrap();
+    let after = memories[1].get(&Category::Kv).copied().unwrap();
+    // Fixture has one GQA layer; the actual 9B checkpoint has eight.
+    assert_eq!(before - after, 2_097_152 * (4096 - 2080));
 }

@@ -1968,6 +1968,9 @@ if [[ $family == mimo_v2 ]]; then
   esac
 fi
 if [[ "$family" == qwen3_5 ]]; then
+  dense_qwen_kv_cache="$(get KV_CACHE bf16)"
+  case "$dense_qwen_kv_cache" in bf16|fp8) ;; *) release_die "KV_CACHE must be bf16 or fp8" ;; esac
+  family_args+=(--kv-cache "$dense_qwen_kv_cache")
   [[ -z "$(get PREFIX_CACHE_MARK_MIB)" ]] || family_args+=(--prefix-cache-mark-mib "$(get PREFIX_CACHE_MARK_MIB)")
   # Qwen templates can remove old thinking; retain the exact frontier before
   # the generation message, not an approximate reconstruction of that state.
@@ -2574,7 +2577,7 @@ audio_encoder_hash=""
   plan_draft_args+=(--host-cache-bytes "$plan_host_cache")
   [[ "$(get FULL_PREFILL_LOGITS off)" != on ]] || plan_draft_args+=(--full-prefill-logits)
   if [[ "$family" == qwen3_5 ]]; then
-    plan_draft_args+=(--state-slots "$effective_concurrency" --prefill-rows 4096
+    plan_draft_args+=(--kv-cache "$dense_qwen_kv_cache" --state-slots "$effective_concurrency" --prefill-rows 4096
       --prefix-cache-entries "$(get PREFIX_CACHE_ENTRIES 20)")
     [[ -z "$(get PREFIX_CACHE_MARK_MIB)" ]] || plan_draft_args+=(--prefix-cache-mark-mib "$(get PREFIX_CACHE_MARK_MIB)")
   fi

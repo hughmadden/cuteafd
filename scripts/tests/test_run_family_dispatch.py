@@ -294,13 +294,15 @@ DENSE_CONFIG = {"model_type": "qwen3_5", "text_config": {
     ("PREFIX_CACHE_ENTRIES=4\nPREFIX_CACHE_MARK_MIB=1024\nPREFIX_POINT_BOUNDARIES=2\n", 4, 2),
     ("PREFIX_CACHE_ENTRIES=0\nPREFIX_POINT_BOUNDARIES=0\n", 0, 0),
 ])
-def test_dense_qwen_wip_uses_native_single_gpu_and_no_workers(tmp_path: Path, cache_keys, entries, boundaries) -> None:
+@pytest.mark.parametrize("kv_format", ["bf16", "fp8"])
+def test_dense_qwen_wip_uses_native_single_gpu_and_no_workers(tmp_path: Path, cache_keys, entries, boundaries, kv_format) -> None:
     result = _family_launch_result(tmp_path, DENSE_CONFIG, "Qwen/Qwen3.5-9B",
-        "SPARK_COUNT=0\nCONCURRENCY=8\n" + cache_keys,
+        "SPARK_COUNT=0\nCONCURRENCY=8\n" + f"KV_CACHE={kv_format}\n" + cache_keys,
         extra_args=("--wip", "dense-test"),
         encoder_plan={"placement_supported": True, "fits": True, "spark_ranks": 0})
     assert result.returncode == 0, result.stderr
     launch = next(line for line in result.stderr.splitlines() if "serve-qwen35 --snapshot" in line)
+    assert f"--kv-cache {kv_format}" in launch
     assert "--max-sequences 8" in launch
     assert launch.count("--host-cache-bytes") == 1 and "--host-cache-bytes auto" in launch
     assert f"--prefix-cache-entries {entries}" in launch

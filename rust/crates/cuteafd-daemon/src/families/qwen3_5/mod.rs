@@ -34,6 +34,9 @@ pub(crate) struct GoldenArgs {
     /// Strict explicit KV pool, otherwise the shared pool-first policy applies.
     #[arg(long)]
     pub pool_tokens: Option<u64>,
+    /// Full-attention KV storage only; GDN recurrence remains FP32.
+    #[arg(long, default_value = "bf16")]
+    pub kv_cache: cuteafd_loader::families::qwen4::Qwen4KvCache,
     /// Input chunk size, including serial decode-shaped qualification.
     #[arg(long, default_value_t = 4096)]
     pub prefill_chunk: usize,
@@ -93,7 +96,7 @@ pub(crate) async fn run_golden(args: GoldenArgs) -> Result<()> {
     let marks = args.prefix_check.then_some(crate::shared::prefix::MarkRule {
         lanes: slots, entries: 1, budget_bytes: 1 << 30, host: false });
     let mut engine = engine::DenseEngine::with_prefix(&library, &programs, &checkpoint, cfg.clone(),
-        args.pool_tokens, None, slots, marks)?;
+        args.pool_tokens, None, slots, marks, args.kv_cache)?;
     if args.verify_check {
         engine.verify_check(&tokens)?;
         if args.state_slots > 1 { engine.multislot_verify_check(&tokens)?; }
