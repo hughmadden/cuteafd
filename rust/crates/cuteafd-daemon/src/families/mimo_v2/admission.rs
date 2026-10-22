@@ -124,7 +124,7 @@ mod draft_prefix_tests {
         let target: u64 = cache.ranks.iter().map(|r| r.retained_mark_bytes).sum();
         for draft_kv_cache in [cuteafd_loader::families::qwen4::Qwen4KvCache::Bf16,
             cuteafd_loader::families::qwen4::Qwen4KvCache::Fp8] {
-            let draft = cuteafd_loader::families::mimo_v2::draft_representation::mimo_draft_mark_bytes(5, 1024, 1, draft_kv_cache).unwrap();
+            let draft = cuteafd_loader::families::mimo_v2::draft_representation::mimo_draft_mark_bytes(5, 8, 128, draft_kv_cache).unwrap();
             for concurrency in [4, 16] {
                 for enabled in [false, true] {
                     // Include a budget-tight case to catch the concurrency floor and
