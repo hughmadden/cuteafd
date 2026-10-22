@@ -142,7 +142,8 @@ fn real_1017_coded_scale_plan_file_order_has_bounded_staging_and_no_holes() -> R
                     let pattern = &checked.plan.patterns[entry.pattern as usize];
                     let extent = pattern.check().map_err(anyhow::Error::msg)?;
                     // Coalesce dense destination runs, preserving file/row
-                    // order, then fragment them to keep all sources interleaved.
+                    // order. A 16 KiB fragment also splits TP6's 60 KiB scales,
+                    // so every width exercises simultaneously open sources.
                     let mut dense = u64::from(pattern.run);
                     for dim in pattern.dims.iter().rev() {
                         let Steps::Count(count) = &dim.steps else { anyhow::bail!("unexpected scale index list"); };
@@ -157,7 +158,7 @@ fn real_1017_coded_scale_plan_file_order_has_bounded_staging_and_no_holes() -> R
                     let need = step.rects[0].bytes();
                     assert!(relative + dense - *consumed <= start + need as u64);
                     assert!(!completed.contains(&index), "source replay reopened a completed scale step");
-                    let bytes = (dense - *consumed).min(64 << 10) as usize;
+                    let bytes = (dense - *consumed).min(16 << 10) as usize;
                     let delivered = open.entry(index).or_default();
                     assert_eq!(relative - start, *delivered as u64, "scale source has delivery holes");
                     *delivered += bytes;
