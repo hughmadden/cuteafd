@@ -118,6 +118,56 @@ fn installed_coordinator_operands_match_the_mount_golden() -> Result<()> {
     for gpu in [0, 1] { Device { library: &library, id: gpu }.run(|| library.cuda_enable_peer(1 - gpu))?; }
     let mut actual = Digests::new();
     mount(&library, &checkpoint, &cfg, |fp8_decode| Qwen4Loader { library: &library, checkpoint: &checkpoint,
-        fp8_decode, fp8_scales: crate::shared::fp8_linear::Fp8Scales::Amax, stream: std::ptr::null_mut() }, &mut actual)?;
+        fp8_decode, fp8_scales: crate::shared::fp8_linear::Fp8Scales::Amax, stream: std::ptr::null_mut(),
+        dense: std::rc::Rc::new(crate::shared::experts::rtx::dense::DenseLoad::mount(&library)) }, &mut actual)?;
+    check(&actual)
+}
+
+/// The same operands recorded (allocated as through the mount, bytes
+/// deferred), then each GPU's records pushed through a ring into its rank in
+/// file order (block and row quantization, widening on the GPU): every operand
+/// matches the mount golden and each rank's staging stays bounded.
+#[test]
+#[ignore = "requires CUTEAFD_PUSH_QWEN4 (a SparkNest namespace), CUTEAFD_NATIVE_LIB and two RTX GPUs"]
+fn installed_pushed_coordinator_operands_match_the_mount_golden() -> Result<()> {
+    use crate::shared::experts::rtx::dense::{DenseLoad, STEP_BYTES};
+    let Some(snapshot) = snapshot() else { return Ok(()) };
+    let checkpoint = Checkpoint::coordinator(&snapshot, true, true)?;
+    let cfg = Qwen4Config::read(&snapshot)?;
+    let library = library()?;
+    library.cuda_set_device(0)?;
+    for gpu in [0, 1] { Device { library: &library, id: gpu }.run(|| library.cuda_enable_peer(1 - gpu))?; }
+    let (root, _) = cuteafd_loader::push_load::namespace(&snapshot)?;
+    let catalog = cuteafd_loader::read_expert_catalog(&snapshot)?;
+    let layers = golden_layers(&cfg)?;
+    let sockets = tempfile::tempdir()?;
+    let mut actual = Digests::new();
+    for fp8 in [false, true] {
+        let tag = if fp8 { "fp8" } else { "bf16" };
+        for placed in [false, true] {
+            let load = std::rc::Rc::new(DenseLoad::push(&library));
+            let loader = Qwen4Loader { library: &library, checkpoint: &checkpoint, fp8_decode: fp8,
+                fp8_scales: crate::shared::fp8_linear::Fp8Scales::Amax, stream: std::ptr::null_mut(), dense: load.clone() };
+            let weights = if placed {
+                let ranks: Vec<_> = (0..2).map(|id| (Device { library: &library, id }, std::ptr::null_mut())).collect();
+                loader.model_placed(&cfg, &(0..layers).map(|l| l % 2).collect::<Vec<_>>(), &ranks, true, true)?
+            } else { loader.model(&cfg, layers, true, true)? };
+            let records = load.sink.as_ref().context("push sink")?.take_all();
+            let (bytes, operands, staged, steps, largest, finishes) = records.summary();
+            eprintln!("{tag} placed={placed}: class2 {bytes} B in {operands} operands; class3 {staged} B in {steps} steps \
+                (largest {largest} B); {finishes} finishes");
+            ensure!(largest <= STEP_BYTES, "a step stages {largest} bytes");
+            for gpu in 0..if placed { 2 } else { 1 } {
+                if !records.operands.iter().any(|o| o.device == gpu as i32) { continue; }
+                crate::shared::experts::rtx::push::tests::receive_pushed(Device { library: &library, id: gpu as i32 },
+                    &catalog, &root, sockets.path(), &records, None, 0, gpu)?;
+            }
+            for (staged, pinned) in crate::shared::experts::rtx::dense::testing::PEAKS.with(|p| p.take()) {
+                ensure!(staged <= STEP_BYTES as u64 && pinned <= STEP_BYTES as u64,
+                    "rank staging peaked at {staged} B in use, {pinned} B pinned");
+            }
+            weights_digests(&library, &format!("{tag}.{}", if placed { "placed" } else { "single" }), &weights, &mut actual)?;
+        }
+    }
     check(&actual)
 }

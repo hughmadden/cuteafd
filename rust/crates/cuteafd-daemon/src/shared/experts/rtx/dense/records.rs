@@ -108,7 +108,7 @@ pub(crate) enum Job {
     /// FP32 scales by the row kernel (`cuteafd_fp8_row_quant_rule`, `rule`)
     /// into `q` [rows, cols] and `scale` [rows, cols / 128].
     RowQuant { rows: usize, cols: usize, rule: crate::shared::fp8_linear::Fp8Scales, q: CuteafdDeviceBuffer,
-        scale: CuteafdDeviceBuffer },
+        scale: CuteafdDeviceBuffer, block: bool },
     /// One raw UE8M0 rectangle, checked and coded directly from pinned staging.
     /// `rect` retains the checkpoint tensor and original row for refusals.
     ScaleCodes { rect: usize, at: usize, stored_rows: usize, start_row: usize, dst: CuteafdDeviceBuffer },
@@ -276,14 +276,17 @@ impl Step {
                         library.cuda_stream_synchronize(stream)
                     })?;
                 }
-                Job::RowQuant { rows, cols, rule, q, scale } => {
-                    ensure!(rows * cols * 2 <= self.bytes() && cols % 128 == 0 && q.bytes >= rows * cols
-                        && scale.bytes >= rows * cols / 128 * 4, "row quantization outside its step or operands");
+                Job::RowQuant { rows, cols, rule, q, scale, block } => {
+                    // Per-row x 128-K scales [rows, cols/128], or with `block` 128x128
+                    // block scales [ceil(rows/128), ceil(cols/128)] (`cuteafd_fp8_block_quant_rule`).
+                    let scale_bytes = if block { rows.div_ceil(128) * cols.div_ceil(128) * 4 } else { rows * cols / 128 * 4 };
+                    ensure!(rows * cols * 2 <= self.bytes() && (block || cols % 128 == 0) && q.bytes >= rows * cols
+                        && scale.bytes >= scale_bytes, "row quantization outside its step or operands");
                     let source = device_copy(scratch)?;
                     // SAFETY: the staged rows are in the live device scratch; both outputs
                     // are live operands; the stream drains before return.
                     load_timing::quantize(rows * cols * 2, || unsafe {
-                        library.fp8_quant_rule(source.cast(), q.ptr, scale.ptr, rows, cols, true, rule.code(), stream)?;
+                        library.fp8_quant_rule(source.cast(), q.ptr, scale.ptr, rows, cols, !block, rule.code(), stream)?;
                         library.cuda_stream_synchronize(stream)
                     })?;
                 }
@@ -326,10 +329,19 @@ impl Step {
 /// later step open until its last tensor arrived, and staging would grow
 /// with the tensor count rather than the source count.
 pub(crate) fn windows(rects: &[Rect], unit: usize) -> Result<Vec<(Vec<Rect>, Range<usize>)>> {
+    let total: usize = rects.iter().map(|r| r.rows.len()).sum();
+    ensure!(unit > 0 && total % unit == 0, "staged rows are not whole {unit}-row units");
+    windows_with_tail(rects, unit)
+}
+
+/// [`windows`] whose last unit may be partial (block quantization of a matrix
+/// whose rows are not a multiple of the block): every window but the last
+/// covers whole units.
+pub(crate) fn windows_with_tail(rects: &[Rect], unit: usize) -> Result<Vec<(Vec<Rect>, Range<usize>)>> {
     let width = rects.first().context("no rows to stage")?.width();
     ensure!(rects.iter().all(|r| r.width() == width), "staged rows differ in width");
     let total: usize = rects.iter().map(|r| r.rows.len()).sum();
-    ensure!(unit > 0 && total % unit == 0, "staged rows are not whole {unit}-row units");
+    ensure!(unit > 0 && total > 0, "no staged rows");
     let per = (STEP_BYTES / width / unit).max(1) * unit;
     // Unit-aligned rectangle boundaries (row offsets of the whole).
     let mut cuts = Vec::new();

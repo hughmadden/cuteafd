@@ -89,7 +89,8 @@ impl Opened {
         qwen4::check_dual_layer_owners(&owners)?;
         let streams = [Stream::new(devices[0])?, Stream::new(devices[1])?];
         let loader = weights::Qwen4Loader { library: &self.library, checkpoint: &self.checkpoint,
-            fp8_decode: args.fp8_decode, fp8_scales: args.fp8_scales, stream: streams[0].raw };
+            fp8_decode: args.fp8_decode, fp8_scales: args.fp8_scales, stream: streams[0].raw,
+            dense: std::rc::Rc::new(crate::shared::experts::rtx::dense::DenseLoad::mount(&self.library)) };
         let ranks = [(devices[0], streams[0].raw), (devices[1], streams[1].raw)];
         let (embedding, model) = crate::shared::token_io::TokenEmbedding::load(&self.library, self.embed_source()?,
             args.token_io.embed_placement, || {

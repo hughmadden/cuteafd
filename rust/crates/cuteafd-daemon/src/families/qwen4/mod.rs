@@ -475,7 +475,8 @@ impl Opened {
         let stream = self.library.cuda_stream_create()?;
         let started = Instant::now();
         let loader = weights::Qwen4Loader { library: &self.library, checkpoint: &self.checkpoint,
-            fp8_decode: args.fp8_decode, fp8_scales: args.fp8_scales, stream };
+            fp8_decode: args.fp8_decode, fp8_scales: args.fp8_scales, stream,
+            dense: std::rc::Rc::new(crate::shared::experts::rtx::dense::DenseLoad::mount(&self.library)) };
         let source = self.embed_source()?;
         let (embedding, model) = crate::shared::token_io::TokenEmbedding::load(&self.library, source,
             args.token_io.embed_placement,

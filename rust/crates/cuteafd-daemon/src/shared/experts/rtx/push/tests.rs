@@ -1006,3 +1006,63 @@ fn coordinator_ranks_alone_push_dense_records_exactly() -> Result<()> {
     }
     Ok(())
 }
+
+/// Coordinator EXL3 expert layers push byte for byte as the mount reads them,
+/// as TP2 halves over two GPUs (world 2) and as whole layers on one (world 1,
+/// the coordinator-local residency).
+#[test]
+#[ignore = "requires an allocated CPU build slot and explicit NVMe fixture directory"]
+fn coordinator_exl3_layers_push_byte_exact_at_world_one_and_two() -> Result<()> {
+    use crate::shared::experts::layer::ExpertLayer;
+    let fixture = Fixture::build()?;
+    let library = fixture.load()?;
+    for device in 0..2 { fixture.configure_memory(&library, device, 64 << 30)?; }
+    let root = tempfile::tempdir_in(fixture.directory())?;
+    let (tensors, _) = qwen4_exl3(2, 4);
+    let tensors: Vec<_> = tensors.into_iter().filter(|t| !t.0.contains(".experts.") || t.0.contains(".experts.0.")).collect();
+    let mut config = qwen4_config(2);
+    config["text_config"]["num_experts"] = serde_json::json!(1);
+    config["text_config"]["num_experts_per_tok"] = serde_json::json!(1);
+    write_snapshot(root.path(), &config, &tensors, None);
+    let catalog = cuteafd_loader::read_expert_catalog(root.path())?;
+    for tensor in catalog.tensors() {
+        let image: Vec<u8> = if tensor.metadata.name.ends_with(".mcg") { 0xcbac1fedu32.to_le_bytes().to_vec() }
+            else if tensor.metadata.name.ends_with(".suh") || tensor.metadata.name.ends_with(".svh") {
+                [0u8, 0x3c].into_iter().cycle().take(tensor.metadata.byte_length as usize).collect()
+            } else { (0..tensor.metadata.byte_length).map(|i| (i as u8).wrapping_mul(13) ^ 0x5a).collect() };
+        File::options().write(true).open(root.path().join(&tensor.shard))?.write_all_at(&image, tensor.metadata.byte_offset)?;
+    }
+    let records = crate::shared::experts::rtx::dense::Records::default();
+    let sockets = tempfile::tempdir_in(fixture.directory())?;
+    let whole = [ExpertLayer::BackboneFull { layer: 0 }, ExpertLayer::BackboneFull { layer: 1 }];
+    let plans: Vec<(CoordinatorExpertPlan, usize)> = vec![
+        (CoordinatorExpertPlan::whole(&catalog, &whole, usize::MAX)?, 0),
+        (CoordinatorExpertPlan::new(&catalog, &[0, 1], 0, usize::MAX)?, 0),
+        (CoordinatorExpertPlan::new(&catalog, &[0, 1], 1, usize::MAX)?, 1),
+    ];
+    for (plan, gpu) in plans {
+        let world = plan.residencies[0].world;
+        let pushed = receive_pushed(Device { library: &library, id: gpu as i32 }, &catalog, root.path(), sockets.path(),
+            &records, Some(plan), 0, gpu)?.exl3()?;
+        assert_eq!(pushed.len(), 2, "world {world}");
+        for weight in &pushed {
+            assert_eq!(weight.layout.world, world);
+            let mut scratch = vec![0; weight.layout.scratch_bytes(&catalog)?];
+            for (index, load) in weight.layout.loads.iter().enumerate() {
+                let mut expected = vec![0; load.bytes];
+                weight.layout.read_into(&catalog, index, &mut expected, &mut scratch)?;
+                for &(buffer, offset) in &load.destinations {
+                    let spec = &weight.layout.buffers[buffer];
+                    let buffer = weight.buffer(&spec.name)?;
+                    let mut actual = vec![0; load.bytes];
+                    // SAFETY: the load's destination range lies inside this published buffer.
+                    let view = cuteafd_ffi::CuteafdDeviceBuffer { bytes: load.bytes,
+                        ptr: unsafe { buffer.ptr.cast::<u8>().add(offset).cast() }, ..buffer };
+                    Device { library: &library, id: gpu as i32 }.run(|| library.copy_d2h(&mut actual, view))?;
+                    assert_eq!(actual, expected, "world {world} {}", load.tensor);
+                }
+            }
+        }
+    }
+    Ok(())
+}
