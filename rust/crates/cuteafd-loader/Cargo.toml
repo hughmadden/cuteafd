@@ -24,7 +24,7 @@ daachorse.workspace = true
 tokenizers.workspace = true
 base64 = "=0.22.1"
 tracing.workspace = true
-nest-push = { git = "https://github.com/tpurtell/sparknest", rev = "2901282714c50f4b853effec35f5bfd042352aab" }
+nest-push = { git = "https://github.com/tpurtell/sparknest", rev = "752e39a3ef6c805d3ae0230c90d797f6bd2cc38c" }
 rustix = { version = "1.1", features = ["fs"] }
 
 [dev-dependencies]
