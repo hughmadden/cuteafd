@@ -76,7 +76,8 @@ pub(crate) fn loader<'a>(library: &'a NativeLibrary, setup: &'a Setup, peers: us
         checkpoint_tp: setup.checkpoint_tp, fp8_head: true, output_formats: &setup.formats,
         fp8_scales: crate::shared::fp8_linear::Fp8Scales::Amax, device: 0,
         peers: (1..=peers).map(|device| crate::shared::peer_split::RankDevice { device: device as i32,
-            stream: std::ptr::null_mut() }).collect() }
+            stream: std::ptr::null_mut() }).collect(),
+        dense: std::rc::Rc::new(crate::shared::experts::rtx::dense::DenseLoad::mount(library)), transient: Default::default() }
 }
 
 /// Every golden operand through `loader`s (two-GPU head split, then one GPU).
@@ -140,4 +141,108 @@ fn installed_coordinator_operands_match_the_mount_golden() -> Result<()> {
     let mut actual = Digests::new();
     mount(&library, &setup, &mut actual)?;
     check(&actual, false)
+}
+
+/// The same split operands recorded (allocated as through the mount, bytes
+/// deferred), then each GPU's records pushed through a ring into its rank in
+/// file order (row-quant steps on the GPU, scale gathers at Done): every
+/// operand matches the mount golden and each rank's staging stays one buffer.
+#[test]
+#[ignore = "requires CUTEAFD_PUSH_MIMO (a SparkNest namespace), CUTEAFD_NATIVE_LIB and two RTX GPUs"]
+fn installed_pushed_coordinator_operands_match_the_mount_golden() -> Result<()> {
+    use crate::shared::experts::rtx::dense::{DenseLoad, STEP_BYTES};
+    let Some(snapshot) = snapshot() else { return Ok(()) };
+    let setup = setup(&snapshot)?;
+    let cfg = &setup.cfg;
+    let first_layer = cfg.dense.iter().position(|dense| !dense).unwrap_or(cfg.layers);
+    let _ = cuteafd_core::set_expert_geometry(cuteafd_loader::RoutedExpertShape { layers: cfg.layers, first_layer,
+        experts: cfg.experts, topk: cfg.topk, hidden: cfg.hidden, intermediate: cfg.moe_intermediate,
+        draft_stages: 0, draft_experts: 0 }.geometry()?);
+    let library = library()?;
+    library.cuda_set_device(0)?;
+    for gpu in [0, 1] { Device { library: &library, id: gpu }.run(|| library.cuda_enable_peer(1 - gpu))?; }
+    let (root, _) = cuteafd_loader::push_load::namespace(&snapshot)?;
+    let load = std::rc::Rc::new(DenseLoad::push(&library));
+    let split = MimoLoader { dense: load.clone(), ..loader(&library, &setup, 1) };
+    let (weights, shares) = split.model(&setup.cfg, LAYERS)?;
+    let records = load.sink.as_ref().context("push sink")?.take_all();
+    let (bytes, operands, staged, steps, largest, finishes) = records.summary();
+    eprintln!("records: class2 {bytes} B in {operands} operands; class3 {staged} B in {steps} steps (largest {largest} B); \
+        {finishes} finishes");
+    anyhow::ensure!(largest <= STEP_BYTES, "a step stages {largest} bytes");
+    let sockets = tempfile::tempdir()?;
+    for gpu in 0..2 {
+        let started = std::time::Instant::now();
+        crate::shared::experts::rtx::push::tests::receive_pushed(Device { library: &library, id: gpu as i32 },
+            &cuteafd_loader::read_expert_catalog(&snapshot)?, &root, sockets.path(), &records, None, 6, gpu)?;
+        eprintln!("gpu{gpu} rank pushed in {:.2} s", started.elapsed().as_secs_f64());
+    }
+    split.release_transient();
+    for (staged, pinned) in crate::shared::experts::rtx::dense::testing::PEAKS.with(|p| p.take()) {
+        eprintln!("rank staging peak {staged} B in use, {pinned} B pinned");
+        anyhow::ensure!(staged <= STEP_BYTES as u64 && pinned <= STEP_BYTES as u64, "staging beyond one step");
+    }
+    let mut actual = Digests::new();
+    weights_digests(&library, "split.rank0", &weights, &mut actual)?;
+    for (rank, share) in shares.iter().enumerate() {
+        for (layer, part) in share.iter().enumerate() {
+            layer_digests(&library, &format!("split.rank{}.layers.{layer}", rank + 1), part, &mut actual)?;
+        }
+    }
+    check(&actual, true)
+}
+
+/// The scale gather the push recipes use reproduces the host expansion the
+/// mount loader did before them (fused qkv per-row scales and their K-block
+/// major copy, padding rows zero), on the installed checkpoint's real grids,
+/// through the gather's CPU twin (the fake native DSO).
+#[test]
+#[ignore = "requires CUTEAFD_PUSH_MIMO, an allocated CPU build slot and explicit NVMe fixture directory"]
+fn scale_gather_matches_the_host_qkv_expansion() -> Result<()> {
+    use cuteafd_loader::families::mimo_v2::{FusedQkvLayout, MimoAttention};
+    let Some(snapshot) = snapshot() else { return Ok(()) };
+    let setup = setup(&snapshot)?;
+    let fixture = cuteafd_ffi::native_library_lifetime_fixture::Fixture::build()?;
+    let library = fixture.load()?;
+    let cfg = &setup.cfg;
+    for (layer, attention) in [(0usize, cfg.attention[0]), (1, cfg.attention[1])] {
+        let name = format!("model.layers.{layer}.self_attn.qkv_proj.weight_scale_inv");
+        let tensor = setup.checkpoint.tensors.iter().find(|t| t.meta.name == name).context("grid")?;
+        let mut bytes = vec![0u8; tensor.meta.byte_length as usize];
+        use std::os::unix::fs::FileExt;
+        std::fs::File::open(snapshot.join(&tensor.shard))?.read_exact_at(&mut bytes, tensor.meta.byte_offset)?;
+        let grid: Vec<f32> = bytes.chunks_exact(4).map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect();
+        let k_blocks = tensor.meta.shape[1];
+        for ranks in [1usize, 2] {
+            let share = cfg.head_split(ranks)?;
+            let layout = FusedQkvLayout::new(&share, attention, setup.checkpoint_tp / ranks)?;
+            let (width, segments) = layout.program_segments(&share)?;
+            let _ = MimoAttention::Full;
+            for rank in 0..ranks {
+                let scale0 = rank * layout.scale_rows();
+                // The pre-push host expansion.
+                let mut row_scales = vec![0f32; width * k_blocks];
+                let mut index = vec![u32::MAX; width];
+                for segment in &segments {
+                    for r in 0..segment.rows {
+                        let source = scale0 + segment.scale_row_of(r);
+                        row_scales[(segment.dest_row + r) * k_blocks..][..k_blocks]
+                            .copy_from_slice(&grid[source * k_blocks..][..k_blocks]);
+                        index[segment.dest_row + r] = source as u32;
+                    }
+                }
+                let mut host_k = vec![0f32; width * k_blocks];
+                for b in 0..k_blocks { for r in 0..width { host_k[b * width + r] = row_scales[r * k_blocks + b]; } }
+                let (mut row, mut kmaj) = (vec![0f32; width * k_blocks], vec![0f32; width * k_blocks]);
+                // SAFETY: host buffers of the shapes the CPU twin reads and writes.
+                unsafe { library.load_scale_gather(grid.as_ptr().cast(), index.as_ptr().cast(), row.as_mut_ptr().cast(),
+                    kmaj.as_mut_ptr().cast(), width, k_blocks, k_blocks, 0, std::ptr::null_mut())?; }
+                anyhow::ensure!(row.iter().map(|v| v.to_bits()).eq(row_scales.iter().map(|v| v.to_bits()))
+                    && kmaj.iter().map(|v| v.to_bits()).eq(host_k.iter().map(|v| v.to_bits())),
+                    "layer {layer} ranks {ranks} rank {rank}: gathered scales differ from the host expansion");
+            }
+        }
+        eprintln!("layer {layer}: gathered qkv scales match the host expansion on one and two GPUs");
+    }
+    Ok(())
 }

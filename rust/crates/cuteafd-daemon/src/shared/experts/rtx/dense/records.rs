@@ -104,22 +104,33 @@ pub(crate) enum Job {
     /// MXFP4 expert packed from its fused raw image at staged `at..at + bytes`
     /// (plane 0: up rows then gate rows, each padded) into `dst`.
     NativePlane { intermediate: u32, plane: u32, at: usize, bytes: usize, dst: CuteafdDeviceBuffer },
+    /// Staged BF16 rows `[rows, cols]` quantized to E4M3 with per-row x 128-K
+    /// FP32 scales by the row kernel (`cuteafd_fp8_row_quant_rule`, `rule`)
+    /// into `q` [rows, cols] and `scale` [rows, cols / 128].
+    RowQuant { rows: usize, cols: usize, rule: crate::shared::fp8_linear::Fp8Scales, q: CuteafdDeviceBuffer,
+        scale: CuteafdDeviceBuffer },
 }
 
 /// A device-to-device transform of landed class-2 bytes, run once every
 /// operand of the rank has landed (push: at Done; mount: after its fill).
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub(crate) enum Finish {
     /// V4.1 UE8M0 scales `[n/32, k/32]` packed for the `(k, n)` FP8 matrix kernel.
     V41Scales { capacity: u32, k: u32, n: u32, source: CuteafdDeviceBuffer, packed: CuteafdDeviceBuffer },
     /// One plane of a native expert packed from its landed raw image (the
     /// scale planes: their raw bytes sit apart from the weights in the file).
     NativePlane { intermediate: u32, plane: u32, source: CuteafdDeviceBuffer, dst: CuteafdDeviceBuffer },
+    /// Per-row scales gathered from a landed `grid` [*, grid_cols] (columns
+    /// `col0..col0 + kb` of row `index[r]`, zero for `u32::MAX`) into
+    /// `row_major` [rows, kb] and/or `k_major` [kb, rows].
+    ScaleGather { grid: CuteafdDeviceBuffer, index: std::sync::Arc<Vec<u32>>, kb: usize, grid_cols: usize,
+        col0: usize, row_major: Option<CuteafdDeviceBuffer>, k_major: Option<CuteafdDeviceBuffer> },
 }
 
 impl Finish {
     pub fn device(&self) -> i32 {
-        match self { Finish::V41Scales { packed, .. } | Finish::NativePlane { dst: packed, .. } => packed.device_id }
+        match self { Finish::V41Scales { packed, .. } | Finish::NativePlane { dst: packed, .. } => packed.device_id,
+            Finish::ScaleGather { grid, .. } => grid.device_id }
     }
 
     /// On the current device (`device`), on `stream` (the caller drains).
@@ -137,6 +148,24 @@ impl Finish {
                 // SAFETY: both buffers are live operand allocations on the current
                 // device; the native entry point checks extents, the caller drains.
                 unsafe { library.v41_pack_plane_async(source, dst, intermediate, plane, stream) }
+            }
+            Finish::ScaleGather { grid, ref index, kb, grid_cols, col0, row_major, k_major } => {
+                let rows = index.len();
+                ensure!(col0 + kb <= grid_cols && rows > 0
+                    && row_major.is_none_or(|b| b.bytes >= rows * kb * 4 && b.device_id == grid.device_id)
+                    && k_major.is_none_or(|b| b.bytes >= rows * kb * 4 && b.device_id == grid.device_id)
+                    && index.iter().all(|&r| r == u32::MAX || (r as usize + 1) * grid_cols * 4 <= grid.bytes),
+                    "scale gather outside its operands");
+                let staged = crate::shared::memory::DeviceAllocation::new(library, rows * 4)?;
+                let bytes: Vec<u8> = index.iter().flat_map(|r| r.to_le_bytes()).collect();
+                library.copy_h2d(staged.buffer, &bytes)?;
+                // SAFETY: every buffer is live on the current device and sized as
+                // checked above; drained before the index allocation drops.
+                unsafe {
+                    library.load_scale_gather(grid.ptr, staged.buffer.ptr, row_major.map_or(std::ptr::null_mut(), |b| b.ptr),
+                        k_major.map_or(std::ptr::null_mut(), |b| b.ptr), rows, kb, grid_cols, col0, stream)?;
+                    library.cuda_stream_synchronize(stream)
+                }
             }
         }
     }
@@ -212,6 +241,17 @@ impl Step {
                     // outputs are live operands; the stream drains before return.
                     load_timing::quantize(n * k * 2, || unsafe {
                         library.fp8_w8a16_pack(source.cast(), packed.ptr, scale.ptr, n, k, rule.code(), stream)?;
+                        library.cuda_stream_synchronize(stream)
+                    })?;
+                }
+                Job::RowQuant { rows, cols, rule, q, scale } => {
+                    ensure!(rows * cols * 2 <= self.bytes() && cols % 128 == 0 && q.bytes >= rows * cols
+                        && scale.bytes >= rows * cols / 128 * 4, "row quantization outside its step or operands");
+                    let source = device_copy(scratch)?;
+                    // SAFETY: the staged rows are in the live device scratch; both outputs
+                    // are live operands; the stream drains before return.
+                    load_timing::quantize(rows * cols * 2, || unsafe {
+                        library.fp8_quant_rule(source.cast(), q.ptr, scale.ptr, rows, cols, true, rule.code(), stream)?;
                         library.cuda_stream_synchronize(stream)
                     })?;
                 }
@@ -456,7 +496,7 @@ impl<'a> DenseLoad<'a> {
     /// Records `finish`, or runs it now (its operands were filled before it).
     pub fn finish(&self, finish: Finish, stream: *mut c_void) -> Result<()> {
         if let Some(sink) = &self.sink { sink.finish(finish); return Ok(()); }
-        if recorded(|r| r.finishes.push(finish)) { return Ok(()); }
+        if recorded(|r| r.finishes.push(finish.clone())) { return Ok(()); }
         let device = Device { library: self.library, id: finish.device() };
         device.run(|| {
             finish.run(self.library, stream)?;

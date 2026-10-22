@@ -908,27 +908,6 @@ impl Opened {
         let preflight = admission::preflight(self, args, &programs, split_device, serving, prefill_output, prefix_draft, automatic_context)?;
         resolved.max_context = usize::try_from(preflight.capacity.effective_max_context_tokens)?;
         let args = &resolved;
-        let admission = if args.peers.is_some() {
-            let peers = args.peers.as_deref().context("worker admission needs Spark peers")?
-                .split(',').map(str::parse).collect::<std::result::Result<Vec<std::net::SocketAddr>, _>>()?;
-            let geometry = cuteafd_core::ExpertGeometry { hidden: u32::try_from(self.cfg.hidden)?,
-                experts: u32::try_from(self.cfg.experts)?, topk: u32::try_from(self.cfg.topk)?,
-                intermediate: u32::try_from(self.cfg.moe_intermediate)?, layers: u32::try_from(self.cfg.layers)? };
-            let capacity = u32::try_from(engine::expert_capacity(args.prefill_rows))?;
-            let ingress = if args.expert_input.bf16(false) { cuteafd_core::SparkIngress::Bf16 }
-                else if args.expert_input.bf16(true) { cuteafd_core::SparkIngress::Bf16Decode {
-                    rows: u32::try_from(engine::DECODE_ROWS)? } }
-                else { cuteafd_core::SparkIngress::Fp8K32 };
-            let model = cuteafd_transport::worker_selection::ModelAdmission {
-                capacity, compiled_capacity: capacity,
-                endpoints: vec![cuteafd_core::SparkEndpoint { capacity, ingress };
-                    usize::try_from(preflight.working_set.prefill_lanes)?],
-                rings: crate::shared::placement::spark_rings(64 << 20)?,
-            };
-            Some(crate::shared::placement::SparkAdmission::plan(&args.snapshot, geometry, self.catalog.as_ref(),
-                &preflight.working_set, peers.len(), None, model)?
-                .start(&peers)?)
-        } else { None };
         let draft_dir = args.draft.as_deref().map(dflash::drafter_dir);
         let draft_file = draft_dir.as_deref().map(dflash::prefetch);
         let stream = self.library.cuda_stream_create()?;
@@ -951,11 +930,86 @@ impl Opened {
             fp8_head: self.weight_formats.head == MimoProjectionRepresentation::Fp8,
             output_formats: &self.weight_formats.output,
             fp8_scales: args.fp8_scales, device: args.device,
-            peers: peer_stream.iter().map(|&(device, stream)| crate::shared::peer_split::RankDevice { device, stream }).collect() };
+            peers: peer_stream.iter().map(|&(device, stream)| crate::shared::peer_split::RankDevice { device, stream }).collect(),
+            dense: std::rc::Rc::new(crate::shared::experts::rtx::dense::DenseLoad::mount(&self.library)),
+            transient: Default::default() };
+        let mut coordinator_push = None;
+        let admission = if args.peers.is_some() {
+            let peers = args.peers.as_deref().context("worker admission needs Spark peers")?
+                .split(',').map(str::parse).collect::<std::result::Result<Vec<std::net::SocketAddr>, _>>()?;
+            let geometry = cuteafd_core::ExpertGeometry { hidden: u32::try_from(self.cfg.hidden)?,
+                experts: u32::try_from(self.cfg.experts)?, topk: u32::try_from(self.cfg.topk)?,
+                intermediate: u32::try_from(self.cfg.moe_intermediate)?, layers: u32::try_from(self.cfg.layers)? };
+            let capacity = u32::try_from(engine::expert_capacity(args.prefill_rows))?;
+            let ingress = if args.expert_input.bf16(false) { cuteafd_core::SparkIngress::Bf16 }
+                else if args.expert_input.bf16(true) { cuteafd_core::SparkIngress::Bf16Decode {
+                    rows: u32::try_from(engine::DECODE_ROWS)? } }
+                else { cuteafd_core::SparkIngress::Fp8K32 };
+            let model = cuteafd_transport::worker_selection::ModelAdmission {
+                capacity, compiled_capacity: capacity,
+                endpoints: vec![cuteafd_core::SparkEndpoint { capacity, ingress };
+                    usize::try_from(preflight.working_set.prefill_lanes)?],
+                rings: crate::shared::placement::spark_rings(64 << 20)?,
+            };
+            let admission = crate::shared::placement::SparkAdmission::plan(&args.snapshot, geometry, self.catalog.as_ref(),
+                &preflight.working_set, peers.len(), None, model)?;
+            // Each coordinator GPU joins the Spark push group as one more rank with
+            // its dense operands, recorded and planned from headers before
+            // membership: a planning error offers no coordinator ranks (the
+            // coordinator loads by mount, the Sparks still push).
+            let ranks = if admission.coordinator_pushes() {
+                (|| -> Result<_> {
+                    let devices: Vec<_> = std::iter::once(args.device).chain(peer_stream.map(|(d, _)| d))
+                        .map(|id| crate::shared::memory::device::Device { library: &self.library, id }).collect();
+                    let load = std::rc::Rc::new(crate::shared::experts::rtx::dense::DenseLoad::push(&self.library));
+                    let planning = weights::MimoLoader { dense: load.clone(), ..loader.clone() };
+                    let model = {
+                        let _memory_scope = cuteafd_ffi::memory_ledger::scope("weights");
+                        planning.model(&self.cfg, layers)?
+                    };
+                    let records = load.sink.as_ref().context("push sink")?.take_all();
+                    let (landed, operands, staged, steps, largest, finishes) = records.summary();
+                    tracing::info!(landed, operands, staged, steps, largest_step_bytes = largest, finishes,
+                        "MiMo coordinator dense records planned");
+                    let dense = crate::shared::experts::rtx::dense::plan_records(&args.snapshot, records.clone(),
+                        &devices, peers.len())?;
+                    let prepared = crate::shared::experts::rtx::push::CoordinatorPush::prepare(&args.snapshot, None,
+                        devices.len(), None)?;
+                    Ok((prepared, (model, planning.transient.clone(), records, dense, devices)))
+                })().map_err(|error| tracing::info!(%error, "MiMo coordinator push unavailable; mount")).ok()
+            } else { None };
+            let ranks = ranks.map(|((push, streams, ranks), planned)| {
+                coordinator_push = Some((push, peers.len(), planned));
+                (streams, ranks)
+            });
+            Some(admission.start_with(&peers, ranks)?)
+        } else { None };
+        let embed_placement = args.token_io.embed_placement.context("MiMo embedding placement must resolve before admission")?;
         let (embedding, (model, mut shares)) = crate::shared::placement::load_while_admitting(admission, || {
-            crate::shared::token_io::TokenEmbedding::load(&self.library, self.embed_source()?,
-                args.token_io.embed_placement.context("MiMo embedding placement must resolve before admission")?, || { let _memory_scope = cuteafd_ffi::memory_ledger::scope("weights"); loader.model(&self.cfg, layers) })
+            let Some((push, sparks, (model, transient, records, dense, devices))) = coordinator_push.take() else {
+                return crate::shared::token_io::TokenEmbedding::load(&self.library, self.embed_source()?, embed_placement,
+                    || { let _memory_scope = cuteafd_ffi::memory_ledger::scope("weights"); loader.model(&self.cfg, layers) });
+            };
+            // The planned dense operands arrive in the group while the embedding loads beside.
+            let split = crate::shared::memory::load_timing::Split::start();
+            let (pushed, embedding) = push.receive_with(devices, None, sparks, Some(Ok(dense)), || {
+                crate::shared::token_io::TokenEmbedding::load(&self.library, self.embed_source()?, embed_placement, || Ok(()))
+            });
+            let pushed = pushed?;
+            let (embedding, ()) = embedding?;
+            if pushed.is_none() {
+                let rank_stream = |device: i32| if device == args.device { stream }
+                    else { peer_stream.map_or(stream, |(_, s)| s) };
+                crate::shared::experts::rtx::dense::fill_records_by_mount(&self.library, &records, rank_stream)?;
+            }
+            // Every gather ran (at Done or in the fill): free the landed grids.
+            transient.borrow_mut().clear();
+            split.log(if pushed.is_some() { "mimo dense push" } else { "mimo dense mount fill" });
+            tracing::info!(pushed = pushed.is_some(), operands = records.operands.len(), steps = records.steps.len(),
+                finishes = records.finishes.len(), "MiMo coordinator dense operands landed");
+            Ok((embedding, model))
         })?;
+        loader.release_transient();
         let mtp = if args.mtp > 0 {
             let started = Instant::now();
             let available = self.checkpoint.tensor_names()

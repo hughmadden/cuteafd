@@ -97,6 +97,7 @@ pub(crate) struct MimoWeights<'a> {
     pub output_fp8: bool,
 }
 
+#[derive(Clone)]
 pub(crate) struct MimoLoader<'a> {
     pub library: &'a NativeLibrary,
     pub checkpoint: &'a Checkpoint,
@@ -111,6 +112,11 @@ pub(crate) struct MimoLoader<'a> {
     pub device: i32,
     /// The other GPUs of a head split, ranks 1.. (empty: one GPU).
     pub peers: Vec<RankDevice>,
+    /// How this load fills its operands: through the mount as each is made,
+    /// or recorded for the coordinator's push ranks (shared dense records).
+    pub dense: std::rc::Rc<crate::shared::experts::rtx::dense::DenseLoad<'a>>,
+    /// Landed scale grids the gathers read (freed once their finishes ran).
+    pub transient: std::rc::Rc<std::cell::RefCell<Vec<DeviceAllocation<'a>>>>,
 }
 
 /// Scale-grid row of every weight row: uniform 128-row blocks, or per
@@ -204,6 +210,11 @@ impl<'a> MimoLoader<'a> {
     fn fp8_projection(&self, name: &str, ranks: usize, kmajor_scale: bool)
         -> Result<Vec<(DeviceAllocation<'a>, DeviceAllocation<'a>, Option<DeviceAllocation<'a>>)>> {
         let _memory_format = cuteafd_ffi::memory_ledger::format("fp8");
+        if self.tensor(name)?.meta.dtype == DType::Bf16 {
+            return self.fp8_projection_bf16(name, ranks, kmajor_scale);
+        }
+        ensure!(!self.dense.pushing() && !crate::shared::experts::rtx::dense::is_recording(),
+            "{name}: FP8-source projections load through the mount");
         let (bytes, dtype, shape) = self.raw(name)?;
         ensure!(shape.len() == 2 && shape[1] % (ranks *128) == 0,
             "{name}: FP8-only projection requires [N,K] with K divisible by128 per rank");
@@ -283,8 +294,54 @@ impl<'a> MimoLoader<'a> {
         })).collect()
     }
 
+    /// [`Self::fp8_projection`] of a BF16 checkpoint weight: each rank's
+    /// column block quantized by the row kernel in staged row windows of at
+    /// most one step (per-row scales, so windows reproduce the whole), and its
+    /// K-block major scales gathered from the row-major ones at Done.
+    #[allow(clippy::type_complexity)]
+    fn fp8_projection_bf16(&self, name: &str, ranks: usize, kmajor_scale: bool)
+        -> Result<Vec<(DeviceAllocation<'a>, DeviceAllocation<'a>, Option<DeviceAllocation<'a>>)>> {
+        use crate::shared::experts::rtx::dense::{Job, Step, STEP_BYTES};
+        let shape = self.tensor(name)?.meta.shape.clone();
+        ensure!(shape.len() == 2 && shape[1] % (ranks * 128) == 0,
+            "{name}: FP8-only projection requires [N,K] with K divisible by 128 per rank");
+        let (rows, cols) = (shape[0], shape[1] / ranks);
+        let layout = MimoProjectionLayout::new(rows as u64, cols as u64, MimoProjectionRepresentation::Fp8,
+            if kmajor_scale { 2 } else { 1 })?;
+        let kb = cols / 128;
+        let per = (STEP_BYTES / (cols * 2)).max(1);
+        (0..ranks).map(|rank| {
+            let (device, stream) = self.rank_device(rank)?;
+            let (values, scales) = self.on_rank(rank, |_| Ok((
+                DeviceAllocation::new(self.library, usize::try_from(layout.values)?)?,
+                DeviceAllocation::new(self.library, rows * kb * 4)?)))?;
+            for first in (0..rows).step_by(per) {
+                let n = per.min(rows - first);
+                let rect = self.rect(name, Some(first..first + n), Some(rank * cols * 2..(rank + 1) * cols * 2))?;
+                // SAFETY (offsets): rows first..first + n of both operands.
+                let q = CuteafdDeviceBuffer { ptr: unsafe { values.buffer.ptr.cast::<u8>().add(first * cols) }.cast(),
+                    bytes: n * cols, ..values.buffer };
+                let scale = CuteafdDeviceBuffer { ptr: unsafe { scales.buffer.ptr.cast::<u8>().add(first * kb * 4) }.cast(),
+                    bytes: n * kb * 4, ..scales.buffer };
+                self.on_rank(rank, |_| self.dense.step(Step { device, rects: vec![rect],
+                    jobs: vec![Job::RowQuant { rows: n, cols, rule: self.fp8_scales, q, scale }] }, stream))?;
+            }
+            let kscale = if kmajor_scale {
+                let kscale = self.on_rank(rank, |_| DeviceAllocation::new(self.library, (rows * kb * 4).max(256)))?;
+                self.on_rank(rank, |_| self.dense.finish(crate::shared::experts::rtx::dense::Finish::ScaleGather {
+                    grid: scales.buffer, index: std::sync::Arc::new((0..rows as u32).collect()), kb, grid_cols: kb, col0: 0,
+                    row_major: None, k_major: Some(CuteafdDeviceBuffer { bytes: rows * kb * 4, ..kscale.buffer }) },
+                    stream))?;
+                Some(kscale)
+            } else { None };
+            Ok((values, scales, kscale))
+        }).collect()
+    }
+
     /// The row-concatenation of 2-D `names` as one BF16 operand.
     fn rows(&self, names: &[String]) -> Result<DeviceAllocation<'a>> {
+        ensure!(!self.dense.pushing() && !crate::shared::experts::rtx::dense::is_recording(),
+            "{}: this representation loads through the mount", format!("{names:?}"));
         let _memory_format = cuteafd_ffi::memory_ledger::format("bf16");
         let tensors = names.iter().map(|n| self.raw(n).map(|t| (n, t))).collect::<Result<Vec<_>>>()?;
         ensure!(!tensors.is_empty() && tensors.iter().all(|(_, (_, _, s))| s.len() == 2 && s[0] > 0 && s[1] > 0),
@@ -374,43 +431,30 @@ impl<'a> MimoLoader<'a> {
     /// block-grid value; exact), row major and K-block major.
     fn fp8_kmajor(&self, names: &[String]) -> Result<Fp8Copy<'a>> {
         let _memory_format = cuteafd_ffi::memory_ledger::format("fp8");
-        let total: u64 = names.iter().map(|n| self.tensor(n).map(|t| t.meta.byte_length)).sum::<Result<u64>>()?;
-        crate::shared::memory::staging::with_staging(total as usize, |values| {
-            // Per row of the concatenation: its tensor's grid and that grid's block row.
-            let (mut grids, mut rows) = (Vec::new(), Vec::<(usize, usize)>::new());
-            let (mut cols, mut at) = (None, 0usize);
-            for name in names {
-                let (length, dtype, shape) = self.read_into(name, values, at)?;
-                at += length;
-                ensure!(dtype == DType::F8E4M3 && shape.len() == 2 && shape[1] % 128 == 0
-                    && cols.is_none_or(|c| c == shape[1]),
-                    "{name}: the mimo programs take this weight as an FP8 checkpoint tensor (the official FP8 \
-                     release), found {dtype:?} {shape:?}");
-                cols = Some(shape[1]);
-                let k_blocks = shape[1] / 128;
-                let (scale, scale_dtype, scale_shape) = self.raw(&format!("{name}_scale_inv"))?;
-                ensure!(scale_dtype == DType::F32 && scale_shape.len() == 2 && scale_shape[1] == k_blocks,
-                    "{name}: expected FP32 block scales, found {scale_dtype:?} {scale_shape:?}");
-                grids.push(scale.chunks_exact(4).map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect::<Vec<f32>>());
-                rows.extend(scale_rows(name, shape[0], scale_shape[0])?.into_iter().map(|r| (grids.len() - 1, r)));
-            }
-            let k_blocks = cols.context("no FP8 rows")? / 128;
-            // Row major (decode) and K-block major (prefill) copies of each row's grid values.
-            let n = rows.len();
-            let mut scale = vec![0u8; k_blocks * n * 4];
-            for (row, &(grid, r)) in scale.chunks_exact_mut(k_blocks * 4).zip(&rows) {
-                for (value, v) in row.chunks_exact_mut(4).zip(&grids[grid][r * k_blocks..(r + 1) * k_blocks]) {
-                    value.copy_from_slice(&v.to_le_bytes());
-                }
-            }
-            let mut kscale = vec![0u8; k_blocks * n * 4];
-            for (b, block) in kscale.chunks_exact_mut(n * 4).enumerate() {
-                for (value, &(grid, r)) in block.chunks_exact_mut(4).zip(&rows) {
-                    value.copy_from_slice(&grids[grid][r * k_blocks + b].to_le_bytes());
-                }
-            }
-            Ok(Fp8Copy { values: self.upload(values)?, scale: self.upload(&scale)?, kscale: self.upload(&kscale)? })
-        })
+        let (mut lands, mut rows, mut grids) = (Vec::new(), Vec::<Option<(usize, usize)>>::new(), Vec::new());
+        let (mut cols, mut at) = (None, 0usize);
+        for name in names {
+            let tensor = self.tensor(name)?;
+            let (dtype, shape) = (&tensor.meta.dtype, &tensor.meta.shape);
+            ensure!(*dtype == DType::F8E4M3 && shape.len() == 2 && shape[1] % 128 == 0
+                && cols.is_none_or(|c| c == shape[1]),
+                "{name}: the mimo programs take this weight as an FP8 checkpoint tensor (the official FP8 \
+                 release), found {dtype:?} {shape:?}");
+            cols = Some(shape[1]);
+            let scale_name = format!("{name}_scale_inv");
+            let grid = self.tensor(&scale_name)?;
+            ensure!(grid.meta.dtype == DType::F32 && grid.meta.shape.len() == 2 && grid.meta.shape[1] == shape[1] / 128,
+                "{name}: expected FP32 block scales, found {:?} {:?}", grid.meta.dtype, grid.meta.shape);
+            lands.push((self.rect(name, None, None)?, at));
+            at += tensor.meta.byte_length as usize;
+            grids.push(scale_name);
+            let g = grids.len() - 1;
+            rows.extend(scale_rows(name, shape[0], grid.meta.shape[0])?.into_iter().map(|r| Some((g, r))));
+        }
+        let k_blocks = cols.context("no FP8 rows")? / 128;
+        let values = self.landed(0, lands, at, &[])?;
+        let (scale, kscale) = self.gathered_scales(0, &grids, &rows, k_blocks, 0)?;
+        Ok(Fp8Copy { values, scale, kscale })
     }
 
     /// [`Self::fp8_kmajor`] over a head split's `ranks` GPUs: each tensor's rows
@@ -418,6 +462,8 @@ impl<'a> MimoLoader<'a> {
     /// heads they read), rank `r`'s slices concatenated in tensor order, every row
     /// with its own grid value. Read once.
     fn fp8_kmajor_ranks(&self, names: &[String], ranks: usize) -> Result<Vec<Fp8Copy<'a>>> {
+        ensure!(!self.dense.pushing() && !crate::shared::experts::rtx::dense::is_recording(),
+            "{}: this representation loads through the mount", format!("{names:?}"));
         let _memory_format = cuteafd_ffi::memory_ledger::format("fp8");
         let total: u64 = names.iter().map(|n| self.tensor(n).map(|t| t.meta.byte_length)).sum::<Result<u64>>()?;
         crate::shared::memory::staging::with_staging(total as usize, |values| {
@@ -480,42 +526,123 @@ impl<'a> MimoLoader<'a> {
         let layout = FusedQkvLayout::new(&share, attention, self.checkpoint_tp / ranks)?;
         ensure!(layout.rows() * ranks == full.rows() && layout.scale_rows() * ranks == full.scale_rows(),
             "{name}: checkpoint shards do not divide into {ranks} head groups");
-        let source_bytes = self.tensor(name)?.meta.byte_length as usize;
-        let (scale, scale_dtype, scale_shape) = self.raw(&format!("{name}_scale_inv"))?;
+        let tensor = self.tensor(name)?;
+        let scale_name = format!("{name}_scale_inv");
+        let grid = self.tensor(&scale_name)?;
+        let cols = tensor.meta.byte_length as usize / full.rows().max(1);
+        let k_blocks = cols.div_ceil(128);
+        ensure!(tensor.meta.dtype == DType::F8E4M3 && tensor.meta.shape == [full.rows(), cols]
+            && grid.meta.dtype == DType::F32 && grid.meta.shape == [full.scale_rows(), k_blocks] && cols % 128 == 0,
+            "{name}: expected E4M3 [{}, {cols}] with FP32 [{}, {}] scales for checkpoint TP {}, found {:?} {:?} / {:?} {:?}",
+            full.rows(), full.scale_rows(), k_blocks, self.checkpoint_tp, tensor.meta.dtype, tensor.meta.shape,
+            grid.meta.dtype, grid.meta.shape);
         let (width, segments) = layout.program_segments(&share)?;
-        let cols = source_bytes / full.rows().max(1);
-        crate::shared::memory::staging::with_staging_pair(width * cols, source_bytes, |values, bytes| {
-            let (_, dtype, shape) = self.read_into(name, bytes, 0)?;
-            let k_blocks = cols.div_ceil(128);
-            ensure!(dtype == DType::F8E4M3 && shape == [full.rows(), cols] && scale_dtype == DType::F32
-                && scale_shape == [full.scale_rows(), k_blocks] && cols % 128 == 0,
-                "{name}: expected E4M3 [{}, {cols}] with FP32 [{}, {}] scales for checkpoint TP {}, found {dtype:?} \
-                 {shape:?} / {scale_dtype:?} {scale_shape:?}", full.rows(), full.scale_rows(), k_blocks,
-                self.checkpoint_tp);
-            let grid: Vec<f32> = scale.chunks_exact(4).map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect();
-            (0..ranks).map(|rank| {
-                // This rank's shards: a contiguous run of checkpoint rows and grid rows.
-                let (source0, scale0) = (rank * layout.rows(), rank * layout.scale_rows());
-                // The padded E4M3 rows and each row's shard-grid scales; padding rows are zero.
-                let mut covered = vec![false; width];
-                let mut row_scales = vec![0f32; width * k_blocks];
-                for segment in &segments {
-                    values[segment.dest_row * cols..][..segment.rows * cols]
-                        .copy_from_slice(&bytes[(source0 + segment.source_row) * cols..][..segment.rows * cols]);
-                    covered[segment.dest_row..segment.dest_row + segment.rows].fill(true);
-                    for r in 0..segment.rows {
-                        row_scales[(segment.dest_row + r) * k_blocks..][..k_blocks]
-                            .copy_from_slice(&grid[(scale0 + segment.scale_row_of(r)) * k_blocks..][..k_blocks]);
-                    }
-                }
-                for (row, _) in covered.iter().enumerate().filter(|(_, &c)| !c) {
-                    values[row * cols..(row + 1) * cols].fill(0);
-                }
-                self.on_rank(rank, |_| Ok(Fp8Copy { values: self.upload(values)?,
-                    scale: self.upload(&f32_bytes(&row_scales))?, kscale: self.upload(&kmajor(&row_scales, k_blocks))? }))
-            }).collect()
+        (0..ranks).map(|rank| {
+            // This rank's shards: a contiguous run of checkpoint rows and grid rows.
+            let (source0, scale0) = (rank * layout.rows(), rank * layout.scale_rows());
+            let mut covered = vec![false; width];
+            let mut rows = vec![None; width];
+            let mut lands = Vec::new();
+            for segment in &segments {
+                lands.push((self.rect(name, Some(source0 + segment.source_row..source0 + segment.source_row + segment.rows),
+                    None)?, segment.dest_row * cols));
+                covered[segment.dest_row..segment.dest_row + segment.rows].fill(true);
+                for r in 0..segment.rows { rows[segment.dest_row + r] = Some((0, scale0 + segment.scale_row_of(r))); }
+            }
+            // Padding rows (keys zero-padded to their stride) keep zero values and scales.
+            let zero = covered.iter().enumerate().filter(|(_, &c)| !c).map(|(row, _)| row * cols..(row + 1) * cols)
+                .collect::<Vec<_>>();
+            let values = self.landed(rank, lands, width * cols, &zero)?;
+            let (scale, kscale) = self.gathered_scales(rank, &[scale_name.clone()], &rows, k_blocks, 0)?;
+            Ok(Fp8Copy { values, scale, kscale })
+        }).collect()
+    }
+
+    /// The device of rank `rank` and its load stream.
+    fn rank_device(&self, rank: usize) -> Result<(i32, *mut c_void)> {
+        if rank == 0 { return Ok((self.device, self.stream)); }
+        let peer = self.peers.get(rank - 1).with_context(|| format!("no rank {rank}"))?;
+        Ok((peer.device, peer.stream))
+    }
+
+    /// Rows `rows` (all when `None`), bytes `cols` of each, of tensor `name`.
+    fn rect(&self, name: &str, rows: Option<std::ops::Range<usize>>, cols: Option<std::ops::Range<usize>>)
+        -> Result<crate::shared::experts::rtx::dense::Rect> {
+        let tensor = self.tensor(name)?;
+        let total = if tensor.meta.shape.len() >= 2 { tensor.meta.shape[0] } else { 1 };
+        let bytes = tensor.meta.byte_length as usize;
+        ensure!(total > 0 && bytes % total == 0, "{name}: rows do not divide the tensor");
+        let row_bytes = bytes / total;
+        let (rows, cols) = (rows.unwrap_or(0..total), cols.unwrap_or(0..row_bytes));
+        ensure!(rows.end <= total && cols.end <= row_bytes && !rows.is_empty() && !cols.is_empty(),
+            "{name}: rectangle outside the tensor");
+        Ok(crate::shared::experts::rtx::dense::Rect { name: name.into(), path: self.checkpoint.snapshot.join(&tensor.shard),
+            base: tensor.meta.byte_offset, row_bytes, rows, cols })
+    }
+
+    /// An operand of `bytes` on rank `rank` whose `lands` (rect, offset) arrive
+    /// unchanged; `zero` byte ranges (padding no rect covers) are zeroed now,
+    /// before any landing.
+    fn landed(&self, rank: usize, lands: Vec<(crate::shared::experts::rtx::dense::Rect, usize)>, bytes: usize,
+        zero: &[std::ops::Range<usize>]) -> Result<DeviceAllocation<'a>> {
+        let (device, _) = self.rank_device(rank)?;
+        self.on_rank(rank, |_| {
+            let allocation = DeviceAllocation::new(self.library, bytes.max(256))?;
+            for range in zero.iter().filter(|r| !r.is_empty()) {
+                // SAFETY (offset): the range lies inside the new allocation.
+                let at = CuteafdDeviceBuffer { ptr: unsafe { allocation.buffer.ptr.cast::<u8>().add(range.start) }.cast(),
+                    bytes: range.len(), ..allocation.buffer };
+                self.library.cuda_zero_bytes(at, range.len())?;
+            }
+            self.dense.operand(crate::shared::experts::rtx::dense::Operand { device, buffer: allocation.buffer, lands,
+                bytes })?;
+            Ok(allocation)
         })
     }
+
+    /// Per-row FP32 scales (row major `[n, kb]` and K-block major `[kb, n]`)
+    /// gathered on the GPU from block grids `grids` (each landed whole, back
+    /// to back, into a transient operand): output row `i` takes grid row
+    /// `rows[i]` = (grid, row), or zeros for `None`, columns `col0..col0 + kb`.
+    fn gathered_scales(&self, rank: usize, grids: &[String], rows: &[Option<(usize, usize)>], k_blocks: usize,
+        col0: usize) -> Result<(DeviceAllocation<'a>, DeviceAllocation<'a>)> {
+        let (mut lands, mut firsts, mut at) = (Vec::new(), Vec::new(), 0usize);
+        let mut grid_cols = None;
+        for name in grids {
+            let tensor = self.tensor(name)?;
+            ensure!(tensor.meta.dtype == DType::F32 && tensor.meta.shape.len() == 2
+                && grid_cols.is_none_or(|c| c == tensor.meta.shape[1]), "{grids:?}: FP32 grids of one width");
+            grid_cols = Some(tensor.meta.shape[1]);
+            firsts.push(at / (tensor.meta.shape[1] * 4));
+            lands.push((self.rect(name, None, None)?, at));
+            at += tensor.meta.byte_length as usize;
+        }
+        let grid_cols = grid_cols.context("no scale grids")?;
+        let grid = self.landed(rank, lands, at, &[])?;
+        let index = rows.iter().map(|row| row.map_or(Ok(u32::MAX), |(g, r)| u32::try_from(firsts[g] + r)))
+            .collect::<std::result::Result<Vec<u32>, _>>()?;
+        self.gather(rank, grid, index, k_blocks, grid_cols, col0)
+    }
+
+    /// Row-major and K-major per-row scales from `grid` (an operand this load
+    /// owns until the gather ran) by `index`.
+    fn gather(&self, rank: usize, grid: DeviceAllocation<'a>, index: Vec<u32>, k_blocks: usize, grid_cols: usize,
+        col0: usize) -> Result<(DeviceAllocation<'a>, DeviceAllocation<'a>)> {
+        let n = index.len();
+        let (_, stream) = self.rank_device(rank)?;
+        let (scale, kscale) = self.on_rank(rank, |_| Ok((DeviceAllocation::new(self.library, (n * k_blocks * 4).max(256))?,
+            DeviceAllocation::new(self.library, (n * k_blocks * 4).max(256))?)))?;
+        let grid_buffer = grid.buffer;
+        self.transient.borrow_mut().push(grid);
+        self.on_rank(rank, |_| self.dense.finish(crate::shared::experts::rtx::dense::Finish::ScaleGather {
+            grid: grid_buffer, index: std::sync::Arc::new(index), kb: k_blocks, grid_cols, col0,
+            row_major: Some(CuteafdDeviceBuffer { bytes: n * k_blocks * 4, ..scale.buffer }),
+            k_major: Some(CuteafdDeviceBuffer { bytes: n * k_blocks * 4, ..kscale.buffer }) }, stream))?;
+        Ok((scale, kscale))
+    }
+
+    /// Frees the transient grids (every gather ran: mount, Done or fallback fill).
+    pub fn release_transient(&self) { self.transient.borrow_mut().clear(); }
 
     /// GPUs of the head split this loader fills (1: no split).
     pub fn ranks(&self) -> usize {
@@ -537,6 +664,8 @@ impl<'a> MimoLoader<'a> {
     /// The BF16 o_proj `[H, heads * v_head]` sliced by columns over `ranks`
     /// (rank `r`'s heads). The final operands own BF16 values only.
     fn o_proj(&self, name: &str, ranks: usize) -> Result<Vec<DeviceAllocation<'a>>> {
+        ensure!(!self.dense.pushing() && !crate::shared::experts::rtx::dense::is_recording(),
+            "{}: this representation loads through the mount", name);
         let tensor = self.tensor(name)?;
         if ranks == 1 && tensor.meta.dtype != DType::Bf16 {
             return Ok(vec![self.rows(&[name.to_string()])?]);
@@ -604,48 +733,53 @@ impl<'a> MimoLoader<'a> {
         if ranks == 1 {
             return Ok(vec![self.fp8_kmajor(names)?]);
         }
-        let tensors = names.iter().map(|name| -> Result<_> {
-            let (bytes, dtype, shape) = self.raw(name)?;
-            let (scale, scale_dtype, scale_shape) = self.raw(&format!("{name}_scale_inv"))?;
-            ensure!(dtype == DType::F8E4M3 && shape.len() == 2 && scale_dtype == DType::F32
-                && scale_shape == [shape[0].div_ceil(128), shape[1].div_ceil(128)]
+        for name in names {
+            let tensor = self.tensor(name)?;
+            let grid = self.tensor(&format!("{name}_scale_inv"))?;
+            let shape = &tensor.meta.shape;
+            ensure!(tensor.meta.dtype == DType::F8E4M3 && shape.len() == 2 && grid.meta.dtype == DType::F32
+                && grid.meta.shape == [shape[0].div_ceil(128), shape[1].div_ceil(128)]
                 && shape[if axis == Axis::Rows { 0 } else { 1 }] % (ranks * 128) == 0 && shape[1] % 128 == 0,
                 "{name}: a head split takes this weight as E4M3 with 128x128 FP32 blocks split into whole blocks, \
-                 found {dtype:?} {shape:?} / {scale_dtype:?} {scale_shape:?}");
-            let grid: Vec<f32> = scale.chunks_exact(4).map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect();
-            Ok((bytes, shape, grid))
-        }).collect::<Result<Vec<_>>>()?;
+                 found {:?} {shape:?} / {:?} {:?}", tensor.meta.dtype, grid.meta.dtype, grid.meta.shape);
+        }
         (0..ranks).map(|rank| {
-            let (mut values, mut row_scales, mut k_blocks) = (Vec::new(), Vec::new(), 0);
-            for (bytes, shape, grid) in &tensors {
-                let (rows, cols) = (shape[0], shape[1]);
-                let kb = cols / 128;
-                values.extend(slice_2d(bytes, rows, cols, 1, axis, rank, ranks));
+            let (mut lands, mut rows, mut at, mut k_blocks, mut col0) = (Vec::new(), Vec::new(), 0usize, 0, 0);
+            let grids = names.iter().map(|n| format!("{n}_scale_inv")).collect::<Vec<_>>();
+            for (g, name) in names.iter().enumerate() {
+                let shape = self.tensor(name)?.meta.shape.clone();
+                let (n, k) = (shape[0], shape[1]);
+                let kb = k / 128;
                 let (first, count, kb0, kbn) = match axis {
-                    Axis::Rows => (rank * rows / ranks, rows / ranks, 0, kb),
-                    Axis::Cols => (0, rows, rank * kb / ranks, kb / ranks),
+                    Axis::Rows => (rank * n / ranks, n / ranks, 0, kb),
+                    Axis::Cols => (0, n, rank * kb / ranks, kb / ranks),
                 };
-                k_blocks = kbn;
-                for r in first..first + count {
-                    row_scales.extend_from_slice(&grid[(r / 128) * kb + kb0..][..kbn]);
-                }
+                (k_blocks, col0) = (kbn, kb0);
+                lands.push((self.rect(name, Some(first..first + count), Some(kb0 * 128..(kb0 + kbn) * 128))?, at));
+                at += count * kbn * 128;
+                rows.extend((first..first + count).map(|r| Some((g, r / 128))));
             }
-            self.on_rank(rank, |_| Ok(Fp8Copy { values: self.upload(&values)?, scale: self.upload(&f32_bytes(&row_scales))?,
-                kscale: self.upload(&kmajor(&row_scales, k_blocks))? }))
+            let values = self.landed(rank, lands, at, &[])?;
+            let (scale, kscale) = self.gathered_scales(rank, &grids, &rows, k_blocks, col0)?;
+            Ok(Fp8Copy { values, scale, kscale })
         }).collect()
     }
 
     fn one(&self, name: &str) -> Result<DeviceAllocation<'a>> {
         let _memory_format = cuteafd_ffi::memory_ledger::format("bf16");
-        let (bytes, dtype, shape) = self.raw(name)?;
-        if shape.len() == 2 && dtype == DType::F8E4M3 {
+        let tensor = self.tensor(name)?;
+        if tensor.meta.shape.len() == 2 && tensor.meta.dtype == DType::F8E4M3 {
+            ensure!(!self.dense.pushing() && !crate::shared::experts::rtx::dense::is_recording(),
+                "{name}: FP8 dequantization loads through the mount");
             return self.rows(&[name.to_string()]);
         }
-        self.upload(&bytes)
+        self.landed(0, vec![(self.rect(name, None, None)?, 0)], tensor.meta.byte_length as usize, &[])
     }
 
     /// `[bf16(w); bf16(w - bf16(w))]` of the FP32 router weight.
     fn router_hilo(&self, name: &str) -> Result<DeviceAllocation<'a>> {
+        ensure!(!self.dense.pushing() && !crate::shared::experts::rtx::dense::is_recording(),
+            "{}: this representation loads through the mount", name);
         let _memory_format = cuteafd_ffi::memory_ledger::format("bf16-hilo");
         let (bytes, dtype, shape) = self.raw(name)?;
         ensure!(dtype == DType::F32 && shape.len() == 2, "{name}: the MiMo router weight is FP32 [E, H]");
@@ -700,11 +834,14 @@ impl<'a> MimoLoader<'a> {
         // Small BF16 operands: read once, every rank's slice (`Some(axis)`) or a copy.
         let small = |ops: &mut Vec<HashMap<&'static str, DeviceAllocation<'a>>>, key: &'static str, name: &str,
             split: bool| -> Result<()> {
-            let (bytes, _, _) = self.raw(name)?;
-            ensure!(!split || bytes.len() % ranks == 0, "{name} does not split over {ranks} GPUs");
+            let bytes = self.tensor(name)?.meta.byte_length as usize;
+            ensure!(!split || bytes % ranks == 0, "{name} does not split over {ranks} GPUs");
             for (rank, map) in ops.iter_mut().enumerate() {
-                let part = if split { &bytes[rank * bytes.len() / ranks..(rank + 1) * bytes.len() / ranks] } else { &bytes };
-                map.insert(key, self.on_rank(rank, |_| self.upload(part))?);
+                // One row of the whole tensor; a split rank lands its byte range of it.
+                let (lo, hi) = if split { (rank * bytes / ranks, (rank + 1) * bytes / ranks) } else { (0, bytes) };
+                let rect = crate::shared::experts::rtx::dense::Rect { rows: 0..1, cols: lo..hi, row_bytes: bytes,
+                    ..self.rect(name, None, None)? };
+                map.insert(key, self.landed(rank, vec![(rect, 0)], hi - lo, &[])?);
             }
             Ok(())
         };

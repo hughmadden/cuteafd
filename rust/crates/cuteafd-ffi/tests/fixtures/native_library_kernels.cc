@@ -43,3 +43,19 @@ extern "C" int32_t cuteafd_load_kvb_absorb(const void* kv_b, void* uk, void* uv,
     static_cast<uint16_t*>(uv)[i] = cuteafd_load_quant::absorb_uv(source, h0, nope, v, lat, i);
   return 0;
 }
+
+#include "../../../../../native/shared/cuda/load_scale_gather.h"
+
+extern "C" int32_t cuteafd_load_scale_gather(const void* grid, const void* index, void* row_major, void* k_major,
+                                             int64_t rows, int64_t kb, int64_t grid_cols, int64_t col0, void* stream) {
+  (void)stream;
+  if (!grid || !index || rows < 1 || kb < 1 || col0 < 0 || col0 + kb > grid_cols || (!row_major && !k_major)) return 1;
+  for (int64_t r = 0; r < rows; ++r)
+    for (int64_t b = 0; b < kb; ++b) {
+      const float v = cuteafd_scale_gather::gathered(static_cast<const float*>(grid),
+          static_cast<const uint32_t*>(index), grid_cols, col0, r, b);
+      if (row_major) static_cast<float*>(row_major)[r * kb + b] = v;
+      if (k_major) static_cast<float*>(k_major)[b * rows + r] = v;
+    }
+  return 0;
+}
