@@ -37,7 +37,7 @@ impl<'e, 'a> DensePrefix<'e, 'a> {
         ensure!(target.prefix_arena.as_ref().map_or(0, |arena| arena.buffer.bytes)
             == target.prefix_marks * mark.bytes, "dense prefix marks differ from admission");
         let layout = FamilyLayout { page_rows: 64, pages: target.pool_tokens / 64,
-            page_bytes: target.kv.iter().flatten().count() * 64 * 2 * target.cfg.kv_heads * target.cfg.head_dim * 2,
+            page_bytes: 64 * target.cfg.full_kv_bytes_per_token(target.kv_format),
             mark_bytes: mark.bytes, draft_bytes: 0, rule: ReuseRule::EXACT,
             mark_store: MarkStore::Arena, page_owners: Default::default() };
         drop(target);
@@ -78,7 +78,7 @@ impl<'e, 'a> DensePrefix<'e, 'a> {
     fn page_buffers(&self, page: u32, rows: usize) -> Result<Vec<CuteafdDeviceBuffer>> {
         ensure!((page as usize) < self.layout.pages && rows <= 64, "dense prefix page/rows outside admitted pool");
         let target = self.engine.borrow();
-        let record = 2 * target.cfg.kv_heads * target.cfg.head_dim * 2;
+        let record = target.kv_format.record_bytes(target.cfg.kv_heads, target.cfg.head_dim);
         target.kv.iter().flatten().map(|pool| view(pool.buffer, page as usize * 64 * record, rows * record)).collect()
     }
 }
@@ -88,8 +88,7 @@ impl<'e, 'a> DensePrefix<'e, 'a> {
 pub(crate) fn check(engine: &RefCell<DenseEngine<'_>>, tokens: &[u32]) -> Result<()> {
     ensure!(!tokens.is_empty(), "dense prefix check requires tokens");
     let family = DensePrefix::new(engine)?;
-    ensure!(family.slots() > 0 && family.layout.pages >= 4, "dense prefix check requires admitted marks and four pages");
-    let prompt = tokens.iter().copied().cycle().take(65).collect::<Vec<_>>();
+    ensure!(family.slots() > 0 && family.layout.pages >= 6, "dense prefix check requires admitted marks and six pages");
     let continuation = tokens.iter().copied().cycle().take(3).collect::<Vec<_>>();
     let state = || -> Result<Vec<Vec<u8>>> {
         let target = engine.borrow();
@@ -101,36 +100,46 @@ pub(crate) fn check(engine: &RefCell<DenseEngine<'_>>, tokens: &[u32]) -> Result
         }).collect()
     };
     let boxed = |error: BoxError| anyhow::anyhow!("dense prefix check: {error}");
-    let mut original = Placement { units: vec![0, 1], slot: 0, len: 0, state_len: 0 };
-    family.bind(&mut original).map_err(boxed)?;
-    engine.borrow_mut().prefill_device(0, &prompt, 1)?;
-    original.len = prompt.len();
-    original.state_len = prompt.len();
-    family.capture(MarkSlot(0), &original, prompt.len()).map_err(boxed)?;
-    family.drain().map_err(boxed)?;
-    let saved = state()?;
-    let library = engine.borrow().stream.device.library;
-    let expected = engine.borrow_mut().prefill_device(0, &continuation, 3)?.to_host(library)?;
-    let expected_state = state()?;
-    family.discard(&mut original).map_err(boxed)?;
-    family.copy_rows(TailCopy { from: 0, to: 2, rows: 64, owner: None }).map_err(boxed)?;
-    family.copy_rows(TailCopy { from: 1, to: 3, rows: 1, owner: None }).map_err(boxed)?;
-    let mut restored = Placement { units: vec![2, 3], slot: 0, len: 0, state_len: 0 };
-    family.restore(Some(MarkSlot(0)), &mut restored, prompt.len()).map_err(boxed)?;
-    ensure!(state()? == saved, "dense cached prefix changed recurrence/convolution bytes");
-    let actual = engine.borrow_mut().prefill_device(0, &continuation, 3)?.to_host(library)?;
-    ensure!(actual.iter().map(|v| v.to_bits()).eq(expected.iter().map(|v| v.to_bits()))
-        && state()? == expected_state, "dense cached prefix changed continuation logits or state");
-    family.discard(&mut restored).map_err(boxed)?;
-    family.drain().map_err(boxed)?;
-    println!("dense prefix adapter: exact 65-row state and continuation on copied full/partial KV pages byte-exact");
+    for len in [63usize, 64, 65, 127, 128, 129] {
+        let prompt = tokens.iter().copied().cycle().take(len).collect::<Vec<_>>();
+        let mut original = Placement { units: vec![0, 1, 2], slot: 0, len: 0, state_len: 0 };
+        family.bind(&mut original).map_err(boxed)?;
+        engine.borrow_mut().prefill_device(0, &prompt, 1)?;
+        original.len = len;
+        original.state_len = len;
+        family.capture(MarkSlot(0), &original, len).map_err(boxed)?;
+        family.drain().map_err(boxed)?;
+        let saved = state()?;
+        let library = engine.borrow().stream.device.library;
+        let expected = engine.borrow_mut().prefill_device(0, &continuation, 3)?.to_host(library)?;
+        let expected_state = state()?;
+        family.discard(&mut original).map_err(boxed)?;
+        for page in 0..len.div_ceil(64) {
+            family.copy_rows(TailCopy { from: page as u32, to: page as u32 + 3,
+                rows: (len - page * 64).min(64), owner: None }).map_err(boxed)?;
+        }
+        let mut restored = Placement { units: vec![3, 4, 5], slot: 0, len: 0, state_len: 0 };
+        family.restore(Some(MarkSlot(0)), &mut restored, len).map_err(boxed)?;
+        ensure!(state()? == saved, "dense cached prefix at {len} changed recurrence/convolution bytes");
+        let actual = engine.borrow_mut().prefill_device(0, &continuation, 3)?.to_host(library)?;
+        ensure!(actual.iter().map(|v| v.to_bits()).eq(expected.iter().map(|v| v.to_bits()))
+            && state()? == expected_state, "dense cached prefix at {len} changed continuation logits or state");
+        family.discard(&mut restored).map_err(boxed)?;
+        family.drain().map_err(boxed)?;
+        println!("dense prefix adapter: exact {len}-row state and continuation on copied full/partial KV pages byte-exact");
+    }
     Ok(())
 }
 
 impl PrefixFamily for DensePrefix<'_, '_> {
     type Placement = Placement;
 
-    fn record_format(&self) -> &'static str { "qwen_dense_bf16_gqa_gdn_f32_v1" }
+    fn record_format(&self) -> &'static str {
+        match self.engine.borrow().kv_format {
+            cuteafd_loader::families::qwen4::Qwen4KvCache::Bf16 => "qwen_dense_bf16_gqa_gdn_f32_v1",
+            cuteafd_loader::families::qwen4::Qwen4KvCache::Fp8 => "qwen_dense_e4m3_head_f32_gqa_gdn_f32_v1",
+        }
+    }
     fn layout(&self) -> FamilyLayout { self.layout }
     fn pages<'p>(&self, placement: &'p Placement) -> &'p [u32] { &placement.units }
     fn commit_point(&self, placement: &Placement) -> usize { placement.len.min(placement.state_len) }

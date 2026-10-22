@@ -698,6 +698,12 @@ def qwen_dense_programs(g, decode_rows: int, prefill_rows: int, max_context: int
             (f"ffn_m{rows}", "ffn", {"max_rows": rows},
              lambda r=rows: dense.compile_qwen_dense_ffn_aot(g, max_rows=r)),
         ]
+        out += [
+            (f"attn_producer_kv_fp8_m{rows}", "attn_producer", {"max_rows": rows, "kv_format": "fp8"},
+             lambda r=rows: dense.compile_qwen_dense_producer_aot(g, max_rows=r, kv_format="fp8")),
+            (f"full_gqa_kv_fp8_m{rows}", "full_gqa", {"max_rows": rows, "max_splits": 32, "kv_format": "fp8"},
+             lambda r=rows: dense.compile_qwen_dense_full_gqa_aot(g, max_rows=r, max_splits=32, kv_format="fp8")),
+        ]
     return out
 
 

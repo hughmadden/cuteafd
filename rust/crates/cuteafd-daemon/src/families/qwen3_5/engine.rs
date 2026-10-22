@@ -28,6 +28,7 @@ pub(crate) struct DenseEngine<'a> {
     // Drain queued work before fields retaining buffers/weights begin dropping.
     stream: Stream<'a>,
     pub(crate) cfg: Qwen35Config,
+    pub(crate) kv_format: cuteafd_loader::families::qwen4::Qwen4KvCache,
     programs: &'a Programs<'a>,
     admitted: DensePrograms,
     embedding: TokenEmbedding<'a>,
@@ -79,7 +80,7 @@ mod hook_borrow_tests {
         // Startup compares independently loaded allocation owners to offline
         // native admission, including multislot marks and retained prefixes.
         let mut engine = DenseEngine::with_prefix(&library, &programs, &checkpoint, cfg, None, None, 4,
-            Some(crate::shared::prefix::MarkRule { lanes: 4, entries: 4, budget_bytes: 1 << 30, host: false }))?;
+            Some(crate::shared::prefix::MarkRule { lanes: 4, entries: 4, budget_bytes: 1 << 30, host: false }), std::env::var("CUTEAFD_DENSE_TEST_KV_CACHE").unwrap_or_else(|_| "bf16".into()).parse()?)?;
         assert!(engine.pool_tokens >= 262144);
         let tokens = (1..=9).collect::<Vec<_>>();
         engine.verify_check(&tokens)?;
@@ -111,9 +112,9 @@ impl<'a> DenseEngine<'a> {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn with_prefix(library: &'a NativeLibrary, programs: &'a Programs<'a>, checkpoint: &'a Checkpoint,
         cfg: Qwen35Config, requested_pool: Option<u64>, drafter: Option<DrafterBytes>, slots: usize,
-        prefix: Option<crate::shared::prefix::MarkRule>) -> Result<Self> {
+        prefix: Option<crate::shared::prefix::MarkRule>, kv_format: cuteafd_loader::families::qwen4::Qwen4KvCache) -> Result<Self> {
         ensure!((1..=HEAD_ROWS).contains(&slots), "dense state slots must be 1..64");
-        let admitted = DensePrograms::new(&cfg, programs)?;
+        let admitted = DensePrograms::new(&cfg, programs, kv_format)?;
         let reader = WeightReader { library, checkpoint };
         let weight_bytes = NativeWeights::bf16(checkpoint, &cfg, admitted.norm_dtype.clone())?;
         programs.load_matching(|name| name.starts_with(&format!("{}_", admitted.prefix)))?;
@@ -136,9 +137,9 @@ impl<'a> DenseEngine<'a> {
             gpu: GpuBudget { capacity_bytes: total as u64, headroom_bytes: 1 << 30,
                 baseline: Baseline::Measured { free_bytes: free as u64 } }, layers: &layer_bytes,
             fixed, drafter, requested_pool, max_context: cfg.max_context as u64,
-            record_bytes: (2 * cfg.kv_heads * cfg.head_dim * 2) as u64, pool_overhead: 0, pool_bounded: vec![] })?;
+            record_bytes: kv_format.record_bytes(cfg.kv_heads, cfg.head_dim) as u64, pool_overhead: 0, pool_bounded: vec![] })?;
         let pool_tokens = usize::try_from(placement.pool_tokens)?;
-        tracing::info!(pool_tokens, layout = %placement.summary(), "dense Qwen admitted before weight/state allocation");
+        tracing::info!(pool_tokens, kv_format = %kv_format, slots, prefix_marks, kv_bytes_per_token = cfg.full_kv_bytes_per_token(kv_format), layout = %placement.summary(), "dense Qwen admitted before weight/state allocation");
         let tensor = reader.tensor(&format!("{PREFIX}embed_tokens.weight"))?;
         let source = EmbedSource::new(&checkpoint.snapshot, &tensor.shard, &tensor.meta, cfg.hidden)?;
         let (embedding, weights) = TokenEmbedding::load(library, source, EmbedPlacement::Gpu,
@@ -160,7 +161,7 @@ impl<'a> DenseEngine<'a> {
         let bank = GdnBank::new(library, programs, stream.raw, cfg.gdn, homes.gdn_layers[0], slots, commit)?;
         let kv: Vec<Option<std::rc::Rc<Allocation<'a>>>> = cfg.attention.iter().map(|&kind| -> Result<_> {
             if kind == HybridAttention::Gdn { return Ok(None); }
-            Ok(Some(std::rc::Rc::new(Allocation::new(device, pool_tokens * 2 * cfg.kv_heads * cfg.head_dim * 2)?)))
+            Ok(Some(std::rc::Rc::new(Allocation::new(device, pool_tokens * kv_format.record_bytes(cfg.kv_heads, cfg.head_dim))?)))
         }).collect::<Result<_>>()?;
         let verification = verify::Verification::new(device, &cfg, slots)?;
         let prefix_arena = if prefix_bytes == 0 { None } else {
@@ -183,10 +184,10 @@ impl<'a> DenseEngine<'a> {
             layer_bytes.iter().map(|layer| layer.replay as usize).sum(), buffers.commit],
             "dense native planner recurrence/replay differs from actual runtime allocations");
         ensure!(kv.iter().flatten().map(|a| a.buffer.bytes).sum::<usize>()
-            == pool_tokens * cfg.full_kv_bytes_per_token(),
+            == pool_tokens * cfg.full_kv_bytes_per_token(kv_format),
             "dense native planner KV differs from actual runtime allocations");
         tracing::info!("dense native planner equals actual weight, KV, state, replay, workspace and prefix allocations");
-        Ok(Self { stream, cfg, programs, admitted, embedding, weights, homes, bank, kv, planes,
+        Ok(Self { stream, cfg, kv_format, programs, admitted, embedding, weights, homes, bank, kv, planes,
             _planes: std::mem::take(&mut allocated), ids, logits, head, _head_workspace: head_workspace,
             pool_tokens, position: 0, slots: vec![rows::Slot { position: 0, pages: Vec::new() }; slots],
             prefix_arena, prefix_marks, healthy: true, verification })

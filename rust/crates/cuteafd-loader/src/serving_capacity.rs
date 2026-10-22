@@ -90,6 +90,7 @@ pub struct CacheOptions {
     pub coordinator_ranks: usize,
     pub native_mtp_layers: usize,
     pub mimo_kv: MimoKvFormats,
+    pub dense_qwen_kv: crate::families::qwen4::Qwen4KvCache,
     pub qwen_kv: Qwen4KvCache,
     pub step5_kv: Qwen4KvCache,
     /// DeepSeek V4's window ring holds one prefill chunk plus its window.
@@ -109,6 +110,7 @@ impl Default for CacheOptions {
             coordinator_ranks: 1,
             native_mtp_layers: 0,
             mimo_kv: MimoKvFormats::default(),
+            dense_qwen_kv: crate::families::qwen4::Qwen4KvCache::Bf16,
             qwen_kv: Qwen4KvCache::default(),
             step5_kv: Qwen4KvCache::Bf16,
             prefill_rows: 4096,

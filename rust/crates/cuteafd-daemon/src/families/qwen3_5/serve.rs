@@ -190,6 +190,9 @@ pub(crate) struct ServeArgs {
     pub device: i32,
     #[arg(long)]
     pub pool_tokens: Option<u64>,
+    /// Full-attention KV storage only; GDN recurrence remains FP32.
+    #[arg(long, default_value = "bf16")]
+    pub kv_cache: cuteafd_loader::families::qwen4::Qwen4KvCache,
     #[arg(long, default_value = "0.0.0.0:8000")]
     pub listen: String,
     #[arg(long, default_value_t = 32768)]
@@ -239,7 +242,7 @@ pub(crate) async fn run_serve(args: ServeArgs) -> Result<()> {
             let programs = library.programs()?.with_manifest(&engine_args.manifest)?;
             let lanes = usize::from(engine_args.max_sequences);
             let engine = RefCell::new(DenseEngine::with_prefix(&library, &programs, &checkpoint,
-                header.config, engine_args.pool_tokens.filter(|&tokens| tokens > 0), None, lanes, Some(engine_args.prefix.mark_rule(lanes)))?);
+                header.config, engine_args.pool_tokens.filter(|&tokens| tokens > 0), None, lanes, Some(engine_args.prefix.mark_rule(lanes)), engine_args.kv_cache)?);
             let backend = DenseBackend::new(&engine, &library);
             scheduler::schedule(&backend, &engine_args.snapshot, &mut receive, &worker_stats, lanes,
                 scheduler::Drafts::None, eos, engine_args.decode_share, &engine_args.prefix,

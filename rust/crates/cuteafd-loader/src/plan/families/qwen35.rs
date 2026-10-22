@@ -32,7 +32,7 @@ impl Family for Qwen35 {
             notes: vec!["0-Spark dense target; no router, experts, mHC, PLE or QSA indexer".into(),
                 "Transformers 5.13.0 reference: GDN SiLU, full-attention sigmoid; output_gate_type=swish is not a GQA gate selector".into(),
                 format!("BF16 full KV {} bytes/token; exact FP32 GDN + BF16 convolution state {} bytes/sequence or retained mark; native context {} tokens",
-                    cfg.full_kv_bytes_per_token(), cfg.recurrent_state_bytes(), cfg.max_context),
+                    cfg.full_kv_bytes_per_token(crate::families::qwen4::Qwen4KvCache::Bf16), cfg.recurrent_state_bytes(), cfg.max_context),
                 "Native single-GPU BF16 allocation planning is available with matching exports; serving remains unqualified, with BF16 KV and no captured graphs".into()],
         };
         Ok(Box::new(Model { header, spec }))
@@ -99,7 +99,7 @@ impl FamilyModel for Model {
         let state = buffers.mark_bytes as u64;
         let gdn = cfg.attention.iter().filter(|&&kind| kind == HybridAttention::Gdn).count() as u64;
         Ok(Some(FamilyCacheGeometry { logical_unit_rows: 64, placement: KvPlacement::SingleDevice,
-            ranks: vec![RankCacheGeometry { persistent_unit_bytes: 64 * cfg.full_kv_bytes_per_token() as u64,
+            ranks: vec![RankCacheGeometry { persistent_unit_bytes: 64 * cfg.full_kv_bytes_per_token(options.dense_qwen_kv) as u64,
                 active_state_per_sequence_bytes: state, retained_mark_bytes: state,
                 speculative_replay_bytes: gdn * buffers.replay_per_layer as u64, ..Default::default() }] }))
     }
@@ -135,11 +135,11 @@ fn native_layout(cfg: &crate::families::qwen3_5::Qwen35Config, input: &crate::pl
     let mut norm = None;
     for (op, rows) in [("norm", 0), ("add", 0), ("gdn_commit", 0)].into_iter().chain(
         [64, 4096].into_iter().flat_map(|rows| ["gdn", "attn_producer", "full_gqa", "attn_o", "ffn"].map(|op| (op, rows)))) {
-        let name = if rows == 0 { format!("{prefix}_{op}") } else { format!("{prefix}_{op}_m{rows}") };
+        let name = placement::families::qwen3_5::program_name(prefix, op, rows, options.dense_qwen_kv);
         let entry = entries.iter().find(|entry| entry["name"] == name)
             .with_context(|| format!("missing native dense program {name}"))?;
         let spec = placement::families::qwen3_5::NativeProgram::from_manifest(entry)?;
-        placement::families::qwen3_5::validate(cfg, op, rows, &spec)?;
+        placement::families::qwen3_5::validate(cfg, op, rows, options.dense_qwen_kv, &spec)?;
         placement::families::qwen3_5::validate_abi(op, rows, &spec)?;
         scratch = scratch.max(spec.scratch.values().copied().max().unwrap_or(0));
         if op == "gdn" {
@@ -163,12 +163,12 @@ fn native_layout(cfg: &crate::families::qwen3_5::Qwen35Config, input: &crate::pl
         gpu: GpuBudget { capacity_bytes: capacity, headroom_bytes: 1 << 30,
             baseline: Baseline::Planned { context_bytes: context, loaded_bytes: 0 } },
         layers: &layers, fixed, drafter: None, requested_pool: options.pool_tokens.filter(|&n| n > 0),
-        max_context: cfg.max_context as u64, record_bytes: (2 * cfg.kv_heads * cfg.head_dim * 2) as u64,
+        max_context: cfg.max_context as u64, record_bytes: options.dense_qwen_kv.record_bytes(cfg.kv_heads, cfg.head_dim) as u64,
         pool_overhead: 0, pool_bounded: vec![] })?;
     let mut items = result.items[0].clone();
     items.push(Item::new(Category::Runtime, "context and native modules", "native", context, Basis::Calibrated));
     Ok(MemoryLayout { devices: vec![DeviceLayout { kind: DeviceKind::Rtx, index: 0,
         capacity_bytes: capacity - (1 << 30), items, kv_tokens: result.pool_tokens }],
         pool_tokens: result.pool_tokens, waste: vec![], notes: vec![
-            "Native dense admission: BF16 KV, exact GDN state, no captured graphs; text-only single GPU".into()] })
+            format!("Native dense admission: {} KV, exact GDN state, no captured graphs; text-only single GPU; fixed slots and prefix marks do not grow when the pool cap frees memory", options.dense_qwen_kv)] })
 }

@@ -119,9 +119,10 @@ def test_dense_qwen_exports_only_native_dense_programs(exporter, norm_dtype, dec
                                              norm_dtype=norm_dtype)
     calls = {stem: (op, params, thunk()) for stem, op, params, thunk in programs}
     caps = set((decode_rows, prefill_rows))
-    assert len(calls) == len(programs) == 3 + 5 * len(caps)
+    assert len(calls) == len(programs) == 3 + 7 * len(caps)
     assert set(calls) == {"norm", "add", "gdn_commit"} | {
-        f"{op}_m{cap}" for cap in caps for op in ("gdn", "attn_producer", "full_gqa", "attn_o", "ffn")}
+        f"{op}_m{cap}" for cap in caps for op in ("gdn", "attn_producer", "full_gqa", "attn_o", "ffn")} | {
+        f"{op}_kv_fp8_m{cap}" for cap in caps for op in ("attn_producer", "full_gqa")}
     for stem, (op, params, call) in calls.items():
         module, function, args, kwargs = call
         assert module == "qwen_dense" and args == (GEOMETRY,)
@@ -130,7 +131,15 @@ def test_dense_qwen_exports_only_native_dense_programs(exporter, norm_dtype, dec
         assert params == {k: str(v) if k == "norm_dtype" else v for k, v in kwargs.items()}
     for cap in caps:
         assert calls[f"gdn_m{cap}"][2][3] == {"max_rows": cap, "norm_dtype": norm_dtype}
+        assert calls[f"attn_producer_m{cap}"][2][3] == {"max_rows": cap}
         assert calls[f"full_gqa_m{cap}"][2][3] == {"max_rows": cap, "max_splits": 32}
+        for op in ("attn_producer", "full_gqa"):
+            expected = {"max_rows": cap, "kv_format": "fp8"}
+            if op == "full_gqa":
+                expected["max_splits"] = 32
+            assert calls[f"{op}_kv_fp8_m{cap}"][2][3] == expected
+            assert "kv_format" not in calls[f"{op}_m{cap}"][1]
+            assert calls[f"{op}_kv_fp8_m{cap}"][1]["kv_format"] == "fp8"
 
 
 def test_glm_declared_static_w8a8_exports_decode_and_prefill(exporter):
