@@ -13,7 +13,7 @@ import subprocess
 import time
 import uuid
 
-from allocatable_memory import cgroup_allocatable_bytes, host_allocatable_memory
+from allocatable_memory import host_allocatable_memory
 
 
 GB10_EXPORT_JOBS = 8  # each worker holds a CUDA context plus ~4 GiB; GB10 has 121 GiB unified
@@ -31,6 +31,8 @@ GB10_GPU_WORKERS = 4
 # while memory PSI "some avg10" is above this percentage.
 MEMORY_PSI_LIMIT = 10.0
 PRESSURE_PATH = Path('/proc/pressure/memory')
+ADMISSION_TIMEOUT_S = 600
+ADMISSION_WARN_S = 30
 
 
 def _gb10_host() -> bool:
@@ -78,23 +80,6 @@ def memory_pressure() -> float:
     return 0.0
 
 
-def context_free_memory() -> int:
-    """Driver context creation cannot rely on GB10 reclaiming file cache in time.
-
-    This is deliberately stricter than serving/weight admission: keep their
-    MemAvailable policy, but bound new export contexts by MemFree and cgroups.
-    """
-    if not _gb10_host():
-        return host_allocatable_memory()
-    values = [line.split()[1:] for line in Path('/proc/meminfo').read_text().splitlines()
-              if line.startswith('MemFree:')]
-    if (len(values) != 1 or len(values[0]) != 2 or values[0][1] != 'kB'
-            or not values[0][0].isascii() or not values[0][0].isdigit()):
-        raise ValueError('export context admission requires valid MemFree')
-    return cgroup_allocatable_bytes(int(values[0][0]) * 1024,
-                                    Path('/proc/self/cgroup').read_text())
-
-
 def live_cuda_processes() -> str:
     """Host-wide compute processes as nvidia-smi sees them (pid:MiB), for logs."""
     smi = shutil.which('nvidia-smi')
@@ -107,6 +92,17 @@ def live_cuda_processes() -> str:
         return f'nvidia-smi failed ({type(error).__name__})'
     rows = [line.replace(' ', '').replace(',', ':') for line in out.splitlines() if line.strip()]
     return f'{len(rows)} compute processes' + (f' ({" ".join(rows)})' if rows else '')
+
+
+def _wait_for_admission(started, next_warn, status, kind):
+    now = time.monotonic()
+    if now >= next_warn:
+        print(f'WARN AOT {kind} admission waiting {now - started:.0f}s: {status}', flush=True)
+        next_warn = now + ADMISSION_WARN_S
+    if now - started >= ADMISSION_TIMEOUT_S:
+        raise TimeoutError(f'CUDA {kind} admission timed out after {ADMISSION_TIMEOUT_S}s: {status}')
+    time.sleep(1)
+    return next_warn
 
 
 @contextmanager
@@ -163,11 +159,17 @@ def gpu_admission():
     reservation = int(os.environ.get('CUTEAFD_EXPORT_WORKER_GPU_MIB', '640'))
     if reservation < 1 or reservation > budget:
         raise ValueError('export GPU reservation exceeds budget')
-    deadline = time.monotonic() + 7200
+    started = time.monotonic()
+    next_warn = started
     while True:
         with (root / 'admission.lock').open('a') as guard:
-            fcntl.flock(guard, fcntl.LOCK_EX)
-            reserved = 0
+            try:
+                fcntl.flock(guard, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                next_warn = _wait_for_admission(started, next_warn,
+                    f'free=unknown/{budget} MiB, needed={reservation} MiB, leases=unknown; admission lock busy', 'GPU')
+                continue
+            reserved = leases = 0
             vacant = None
             for path in root.glob('context.*.lock'):
                 with path.open('a+') as existing:
@@ -177,6 +179,7 @@ def gpu_admission():
                     except BlockingIOError:
                         existing.seek(0)
                         reserved += int(existing.read())
+                        leases += 1
             if reserved + reservation <= budget:
                 path = vacant or root / f'context.{uuid.uuid4().hex}.lock'
                 handle = path.open('r+' if vacant else 'x+')
@@ -189,9 +192,9 @@ def gpu_admission():
                 atexit.register(handle.close)
                 print(f'AOT GPU admitted: {reservation} MiB, {reserved} MiB reserved, {budget} MiB budget', flush=True)
                 return
-        if time.monotonic() >= deadline:
-            raise TimeoutError('CUDA context waited 7200s for GPU budget')
-        time.sleep(1)
+        next_warn = _wait_for_admission(started, next_warn,
+            f'free={max(0, budget - reserved)} MiB, needed={reservation} MiB, leases={leases}, '
+            f'reserved={reserved} MiB, budget={budget} MiB', 'GPU')
 
 
 def context_admission():
@@ -213,29 +216,28 @@ def context_admission():
                                    CONTEXT_SPACING_S if _gb10_host() else 0))
     if per_worker < 1 or count < 1 or spacing < 0:
         raise ValueError('export worker RAM and count must be positive')
-    deadline = time.monotonic() + 7200
-    pressured = False
+    started = time.monotonic()
+    next_warn = started
+    status = 'waiting for admission lock'
     while True:
         admitted = None
+        details = {}
         with (root / 'context-admission.lock').open('a') as guard:
-            fcntl.flock(guard, fcntl.LOCK_EX)
-            pressure = memory_pressure()
-            if pressure > MEMORY_PSI_LIMIT:
-                if not pressured:
-                    print(f'AOT context waits: memory pressure some avg10={pressure:.2f} > {MEMORY_PSI_LIMIT:g}',
-                          flush=True)
-                pressured = True
+            try:
+                fcntl.flock(guard, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                status = (f'available={host_allocatable_memory() // (1024 * 1024)} MiB, '
+                          f'needed={per_worker + 1024} MiB, leases=unknown/{count}; admission lock busy')
             else:
-                admitted = _admit_locked(root, per_worker, count, spacing)
+                admitted = _admit_locked(root, per_worker, count, spacing, details)
+                status = details['status']
         if admitted is not None:
             print(admitted, flush=True)
             return _context_admitted_at
-        if time.monotonic() >= deadline:
-            raise TimeoutError('CUDA context waited 7200s for host RAM admission')
-        time.sleep(1)
+        next_warn = _wait_for_admission(started, next_warn, status, 'context')
 
 
-def _admit_locked(root, per_worker, count, spacing):
+def _admit_locked(root, per_worker, count, spacing, details):
     """One admission attempt under context-admission.lock; a log line or None."""
     global _context_lease
     reserved = 0
@@ -253,9 +255,9 @@ def _admit_locked(root, per_worker, count, spacing):
                     parked += 1
                 else:
                     leased += 1
-    # Reserve before CUDA initialization; GB10 context buffers need free pages,
-    # not page cache that a simultaneous context burst may fail to reclaim.
-    available = context_free_memory() // (1024 * 1024)
+    # GB10 can reclaim file cache. Burst protection comes from the seed export
+    # turn, host context cap, spaced creation and PSI brake, not MemFree.
+    available = host_allocatable_memory() // (1024 * 1024)
     baseline_path = root / 'context-baseline.json'
     if reserved == 0:
         baseline_path.write_text(json.dumps({'available': available}))
@@ -263,7 +265,11 @@ def _admit_locked(root, per_worker, count, spacing):
     # Existing live contexts already reduce available RAM: subtract
     # reservations from the common baseline, not twice from the sample.
     budget = min(available, baseline - reserved)
-    if budget < per_worker + 1024:
+    pressure = memory_pressure()
+    details['status'] = (f'available={available} MiB, budget={budget} MiB, needed={per_worker + 1024} MiB, '
+                         f'leases={leased}/{count}, parked={parked}, reserved={reserved} MiB; '
+                         f'memory pressure some avg10={pressure:.2f} (limit {MEMORY_PSI_LIMIT:g})')
+    if pressure > MEMORY_PSI_LIMIT or budget < per_worker + 1024:
         return None
     for index in range(count):
         handle = (root / f'context.{index}.lock').open('a+')
@@ -295,7 +301,7 @@ def _admit_locked(root, per_worker, count, spacing):
         _context_lease = handle
         atexit.register(handle.close)
         return (f'AOT context admitted: lease {index}/{count}, {per_worker} MiB reservation, '
-                f'{available} MiB free, {reserved} MiB already reserved; live contexts '
+                f'{available} MiB available, {reserved} MiB already reserved; live contexts '
                 f'{leased} leased + {parked} parked before this one; memory PSI some avg10={memory_pressure():.2f}; '
                 f'host compute: {census}')
     return None

@@ -377,6 +377,10 @@ before starting the gate; never move HEAD during it.
   Pass PATH and HOME explicitly: a user unit otherwise gets systemd's
   minimal PATH, and host-side Cargo exits 127. Transient units live only in
   `/run` and unload when the command exits, so they leave nothing behind.
+  systemd expands `$VAR`/`${...}` in the unit command line itself, which
+  mangles bash arrays, `$?` and `$(...)` meant for the inner shell: pass
+  `--expand-environment=no`, or put the commands in a script file and run
+  `bash /path/script.sh`.
 - Stop your own jobs by PID or `systemctl --user stop <unit>`, never with
   `pkill -f`: the pattern can match your own Bash command line and kill it.
 
