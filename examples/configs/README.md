@@ -23,7 +23,9 @@ One file per v2.0.0 release card: `<model>-<quant>-<min|max>.config`, on the
 natural minimum (1 RTX + the fewest Sparks it fits) and the maximum
 (2 RTX + 4 or 6 Sparks). Each names the checkpoint revision, speculator,
 drafter, KV pool, media and expert placement the card ran with, so starting
-from one reproduces the published card. Replace the `REPLACE-ME-spark-N` hosts
+from one reproduces the published card, except that V4.1 MXFP4 max now uses
+six Sparks and keeps its four-Spark release layout as a reference.
+Replace the `REPLACE-ME-spark-N` hosts
 and the `192.0.2.N` (RFC 5737 documentation) RoCE addresses with your own,
 download the checkpoint and its drafter, then `--dry-run` and `--restart`.
 Cards and quality findings are in the main README and each family doc.
