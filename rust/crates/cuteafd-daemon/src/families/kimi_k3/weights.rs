@@ -458,6 +458,10 @@ impl<'a> LayerWeights<'a> {
 }
 
 #[cfg(test)]
+#[path = "coordinator_golden_tests.rs"]
+pub(crate) mod coordinator_golden_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use cuteafd_core::{TensorInfo, TensorRole};
