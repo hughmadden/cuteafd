@@ -80,8 +80,9 @@ pub(super) fn layout(model: &Model, report: &mut PlanReport, opts: &crate::plan:
     let slots = opts.concurrency.max(1);
     let state = cfg.kda_layers() as u64 * (cfg.kda_state_bytes() + cfg.kda_conv_bytes()) * slots / 2;
     let mark_bytes = cfg.kda_layers() as u64 * (cfg.kda_state_bytes() + cfg.kda_conv_bytes()) / 2;
-    let legacy_marks = opts.prefix_slots.unwrap_or_else(|| cuteafd_core::prefix::mark_slots_for(
-        opts.concurrency, opts.mimo_prefix_entries, 2 * mark_bytes, opts.mimo_prefix_mark_bytes));
+    let legacy_marks = opts.prefix_slots.unwrap_or_else(|| cuteafd_core::prefix::mark_slots_with_host(
+        opts.concurrency, opts.mimo_prefix_entries, 2 * mark_bytes, opts.mimo_prefix_mark_bytes,
+        opts.host_cache_bytes != Some(0)));
     let mut mark_demands = (0..2).map(|gpu| Demand::new(gpu, Category::Prefix,
         "Kimi exact KDA marks", mark_bytes, Basis::Formula)).collect::<Vec<_>>();
     let mut fixed = Vec::new();

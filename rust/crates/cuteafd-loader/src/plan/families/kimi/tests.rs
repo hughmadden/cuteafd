@@ -244,6 +244,36 @@ fn category(d: &cuteafd_core::memory_layout::DeviceLayout, c: cuteafd_core::memo
 }
 
 #[test]
+fn direct_layout_uses_shared_host_mark_rule_and_preserves_overrides() {
+    use cuteafd_core::memory_layout::{Category, DeviceKind};
+    let dir = snapshot(true);
+    let mark_bytes = 449_372_160;
+    for (host, entries, explicit) in [
+        (Some(0), 20, None), (None, 20, None), (Some(32 << 30), 20, None),
+        (None, 0, None), (None, 20, Some(4)),
+    ] {
+        let mut options = with_layout(6, Some(108 << 30));
+        let layout = options.layout.as_mut().unwrap();
+        layout.rtx_bytes = vec![256 << 30; 2];
+        layout.context_tokens = 262_144;
+        layout.pool_tokens = Some(524_288);
+        layout.concurrency = 8;
+        layout.host_cache_bytes = host;
+        layout.host_memory = Some((128 << 30, 128 << 30));
+        layout.mimo_prefix_entries = entries;
+        layout.prefix_slots = explicit;
+        let expected = explicit.unwrap_or_else(|| cuteafd_core::prefix::mark_slots_with_host(
+            layout.concurrency, entries, mark_bytes, layout.mimo_prefix_mark_bytes, host != Some(0)));
+        let report = plan::plan(dir.path(), &options).unwrap();
+        assert!(report.fits, "host={host:?} entries={entries} explicit={explicit:?}: {:?}", report.hints);
+        let reserved = device(report.memory_layout.as_ref().unwrap(), DeviceKind::Rtx)
+            .into_iter().map(|gpu| category(gpu, Category::Prefix)).sum::<u64>();
+        assert_eq!(reserved, expected * mark_bytes,
+            "host={host:?} entries={entries} explicit={explicit:?}");
+    }
+}
+
+#[test]
 fn max_card_jointly_selects_tp2_layers_marks_and_complete_spark_budget() {
     use cuteafd_core::memory_layout::{Category, DeviceKind};
     let dir = snapshot(true);
