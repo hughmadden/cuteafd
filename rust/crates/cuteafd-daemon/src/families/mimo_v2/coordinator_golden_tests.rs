@@ -257,3 +257,76 @@ fn scale_gather_matches_the_host_qkv_expansion() -> Result<()> {
     }
     Ok(())
 }
+
+/// The whole MiMo V2.6 Pro max push group's plan from installed headers, for
+/// offline replay of SparkNest's grant schedule (CUTEAFD_PUSH_PLAN_DUMP: the
+/// JSON path, `{plan, file_sizes, arenas}`): six Spark ranks with their TP6
+/// exact native FP8 slices of layers 12..=69 (the max card's admission),
+/// then the two coordinator GPU ranks' dense records for all layers (FP8
+/// head and o_proj, recorded through the native fixture, no GPU).
+#[test]
+#[ignore = "requires CUTEAFD_PUSH_MIMO, CUTEAFD_PUSH_PLAN_DUMP and an NVMe fixture directory"]
+fn dump_max_group_plan_from_installed_headers() -> Result<()> {
+    use crate::shared::experts::rtx::dense::{plan_records, DenseLoad};
+    use crate::shared::memory::push_fp8::RankPlan;
+    let Some(snapshot) = snapshot() else { return Ok(()) };
+    let out = std::path::PathBuf::from(std::env::var_os("CUTEAFD_PUSH_PLAN_DUMP").context("set CUTEAFD_PUSH_PLAN_DUMP")?);
+    let (sparks, world, spark_layers) = (6usize, 8usize, 12usize..=69);
+    let (root, _) = cuteafd_loader::push_load::namespace(&snapshot)?;
+    let catalog = cuteafd_loader::read_expert_catalog(&snapshot)?;
+    let tensors = catalog.fp8().context("native expert headers")?;
+    // Serving's slicing: exact native-unit slices (the max card's residents,
+    // 74,544,316,416 B on rank 0, match these and not the padded layout).
+    let layers: Vec<_> = spark_layers.map(|layer| Ok((layer, tensors.for_layer_metadata(layer)?.exact_slicing(sparks))))
+        .collect::<Result<_>>()?;
+    let mut plans = Vec::new();
+    for rank in 0..sparks {
+        let admitted = layers.iter().try_fold(0usize, |total, &(layer, slicing)| -> Result<usize> {
+            Ok(total + tensors.for_layer_metadata(layer)?.layer_load(layer, sparks, rank, slicing)?.resident)
+        })?;
+        let plan = RankPlan::new(&catalog, &layers, sparks, rank, admitted)?;
+        eprintln!("Spark rank {rank}: {} resident bytes", plan.layout.bytes());
+        plans.push(plan);
+    }
+    // The coordinator's dense records, as serving records them before membership.
+    let fixture = cuteafd_ffi::native_library_lifetime_fixture::Fixture::build()?;
+    let library = fixture.load()?;
+    for device in 0..2 { fixture.configure_memory(&library, device, 512 << 30)?; }
+    let cfg = MimoV2Config::read(&snapshot)?;
+    let checkpoint = cuteafd_loader::plan::checkpoint::Checkpoint::coordinator(&snapshot, false, true)?;
+    let formats: BTreeMap<String, MimoProjectionRepresentation> = (0..cfg.layers)
+        .map(|l| (format!("model.layers.{l}.self_attn.o_proj.weight"), MimoProjectionRepresentation::Fp8)).collect();
+    let setup = Setup { cfg, checkpoint, formats, checkpoint_tp: cuteafd_loader::families::mimo_v2::checkpoint_tp(&snapshot)? };
+    let load = std::rc::Rc::new(DenseLoad::push(&library));
+    let planning = MimoLoader { dense: load.clone(), ..loader(&library, &setup, 1) };
+    let model = planning.model(&setup.cfg, setup.cfg.layers)?;
+    let records = load.sink.as_ref().context("push sink")?.take_all();
+    let (landed, operands, staged, steps, largest, finishes) = records.summary();
+    eprintln!("coordinator records: landed {landed} B in {operands} operands; staged {staged} B in {steps} steps \
+        (largest {largest} B); {finishes} finishes");
+    let devices = [Device { library: &library, id: 0 }, Device { library: &library, id: 1 }];
+    let (dense, _arenas) = plan_records(&snapshot, records, &devices, sparks)?;
+    let mut arenas: Vec<u64> = plans.iter().map(|plan| plan.layout.logical_bytes() as u64).collect();
+    arenas.extend(dense.iter().map(|plan| plan.base + plan.host_bytes));
+    let mut builder = cuteafd_loader::push_load::builder::Builder::new(&root, arenas);
+    for (rank, plan) in plans.iter().enumerate() {
+        plan.append(&mut builder, &catalog, u32::try_from(rank)?, sparks)?;
+    }
+    // No coordinator TP2: each GPU's staged entries start at its device base.
+    for (gpu, plan) in dense.iter().enumerate() {
+        (plan.append)(&mut builder, u32::try_from(sparks + gpu)?, plan.base)?;
+    }
+    let checked = builder.finish()?;
+    anyhow::ensure!(checked.arenas.len() == world, "eight ranks");
+    for rank in 0..world {
+        let entries = checked.plan.entries.iter().filter(|e| e.rank == rank as u32).count();
+        eprintln!("rank {rank}: {} B in {entries} entries", checked.totals.rank_bytes[rank]);
+    }
+    let file = std::io::BufWriter::new(std::fs::File::create(&out)?);
+    serde_json::to_writer(file, &serde_json::json!({"plan": checked.plan, "file_sizes": checked.file_sizes,
+        "arenas": checked.arenas}))?;
+    eprintln!("wrote {} ({} files, {} patterns, {} entries)", out.display(), checked.plan.files.len(),
+        checked.plan.patterns.len(), checked.plan.entries.len());
+    drop(model);
+    Ok(())
+}
