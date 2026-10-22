@@ -362,7 +362,7 @@ fn coordinator_native_tp2_halves_land_the_mount_staging_bytes() -> Result<()> {
     for (root, layers) in roots {
         let catalog = cuteafd_loader::read_expert_catalog(&root)?;
         for gpu in 0..2 {
-            let plan = super::super::push_coordinator::Tp2ExpertPlan::new(&catalog, &layers, gpu, usize::MAX)?;
+            let plan = super::super::push_coordinator::CoordinatorExpertPlan::new(&catalog, &layers, gpu, usize::MAX)?;
             assert!(!plan.native.is_empty() && plan.validation.bytes() == 0);
             let world = 6;
             let checked = plan.checked(&catalog, &root, world, 4 + gpu)?;

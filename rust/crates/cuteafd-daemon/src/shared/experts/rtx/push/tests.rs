@@ -88,7 +88,7 @@ fn coordinator_tp2_pair_is_mount_exact_on_two_devices_and_drops_before_retry() -
     }
     let (sparks, world) = (6usize, 8usize);
     for fail in [false, true] {
-        let plans = (0..2).map(|gpu| Tp2ExpertPlan::new(&catalog, &[0, 1], gpu, usize::MAX)).collect::<Result<Vec<_>>>()?;
+        let plans = (0..2).map(|gpu| CoordinatorExpertPlan::new(&catalog, &[0, 1], gpu, usize::MAX)).collect::<Result<Vec<_>>>()?;
         let checked = plans.iter().enumerate().map(|(gpu, plan)| plan.checked(&catalog, root.path(), world, sparks + gpu))
             .collect::<Result<Vec<_>>>()?;
         // Independent mount reference: the coordinator's legacy residency reads.
@@ -248,7 +248,7 @@ fn combined_rank_lands_dense_operands_and_tp2_halves_exactly() -> Result<()> {
     }
     let base = cursor.next_multiple_of(256);
     let (rank, world) = (6usize, 8usize);
-    let plan = Tp2ExpertPlan::new(&catalog, &[0, 1], 0, usize::MAX)?;
+    let plan = CoordinatorExpertPlan::new(&catalog, &[0, 1], 0, usize::MAX)?;
     let checked_tp2 = plan.checked(&catalog, root.path(), world, rank)?;
     let mut arenas = vec![0; world];
     arenas[rank] = base + plan.layout.logical_bytes() as u64;
@@ -371,13 +371,13 @@ fn dense_error_mount_group(library: &cuteafd_ffi::NativeLibrary, root: &std::pat
     catalog: &OfficialV41Catalog, tp2: bool) -> Result<()> {
     let sparks = 1;
     if tp2 { for gpu in 0..2 {
-        let plan = Tp2ExpertPlan::new(catalog, &[0, 1], gpu, usize::MAX)?;
+        let plan = CoordinatorExpertPlan::new(catalog, &[0, 1], gpu, usize::MAX)?;
         let checked = plan.checked(catalog, root, sparks + 2, sparks + gpu)?;
         assert!(checked.plan.files.iter().all(|f| cuteafd_loader::push_load::is_push_shard(&root.join(f))),
             "without the dense error the TP2 halves would be offered");
     } }
     let (push, coordinator_streams, _) = CoordinatorPush::prepare(root, Some(catalog), 2,
-        tp2.then_some((&[0, 1][..], vec![usize::MAX; 2])))?;
+        tp2.then(|| CoordinatorExperts::Tp2 { layers: vec![0, 1], budgets: vec![usize::MAX; 2] }))?;
     // One Spark rank offering push, then the two coordinator ranks, in group order.
     let (mut spark_driver, mut spark) = control_pair()?;
     let spark_thread = std::thread::spawn(move || cuteafd_transport::worker_selection::push::offer(&mut spark,
@@ -590,7 +590,7 @@ fn sparknest_model_one_coordinator_rank_beside_spark_ranks() {
 /// committed. For installed-checkpoint goldens on real or fake devices.
 pub(crate) fn receive_pushed<'a>(device: Device<'a>, catalog: &cuteafd_loader::OfficialV41Catalog,
     root: &std::path::Path, socket_dir: &std::path::Path, records: &crate::shared::experts::rtx::dense::Records,
-    tp2: Option<Tp2ExpertPlan>, sparks: usize, gpu: usize) -> Result<PushedTp2<'a>> {
+    tp2: Option<CoordinatorExpertPlan>, sparks: usize, gpu: usize) -> Result<PushedExperts<'a>> {
     use crate::shared::experts::rtx::dense::RankLayout;
     let rank = sparks + gpu;
     let layout = RankLayout::new(records.operands.clone(), records.steps.clone(), device.id)?
@@ -724,7 +724,7 @@ fn receive_pushed_replays_dense_records_and_tp2_halves() -> Result<()> {
         bytes: dense[0].bytes() });
     records.steps.push(Step { device: 0, rects: vec![dense[1].clone()],
         jobs: vec![Job::Upload { at: 0, bytes: dense[1].bytes(), dst: allocations[1].buffer }] });
-    let plan = Tp2ExpertPlan::new(&catalog, &[0, 1], 0, usize::MAX)?;
+    let plan = CoordinatorExpertPlan::new(&catalog, &[0, 1], 0, usize::MAX)?;
     let sockets = tempfile::tempdir_in(fixture.directory())?;
     let pushed = receive_pushed(device, &catalog, root.path(), sockets.path(), &records, Some(plan), 1, 0)?;
     assert_eq!(pushed.exl3()?.len(), 2);

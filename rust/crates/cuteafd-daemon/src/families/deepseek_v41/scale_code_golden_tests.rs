@@ -143,7 +143,7 @@ fn installed_pushed_scale_codes_equal_cpu_pack() -> Result<()> {
 fn installed_coordinator_tp2_scale_codes_equal_cpu_pack() -> Result<()> {
     use crate::shared::{
         experts::rtx::{dense::{testing::PEAKS, Job, Operand, Rect, Records, Step}, push::tests::receive_pushed},
-        memory::{push_coordinator::Tp2ExpertPlan, DeviceAllocation},
+        memory::{push_coordinator::CoordinatorExpertPlan, DeviceAllocation},
     };
     let snapshot = snapshot().context("set CUTEAFD_PUSH_V41")?;
     let library = library()?;
@@ -173,7 +173,7 @@ fn installed_coordinator_tp2_scale_codes_equal_cpu_pack() -> Result<()> {
         PEAKS.with(|p| { p.take(); });
         let layer = ExpertLayer::BackboneTp2 { layer: 3, rank };
         let budget = ExpertWeights::plan(&library, &catalog, layer)?;
-        let plan = Tp2ExpertPlan::new(&catalog, &[3], rank, budget.resident_bytes)?;
+        let plan = CoordinatorExpertPlan::new(&catalog, &[3], rank, budget.resident_bytes)?;
         ensure!(plan.layout.bytes() == budget.resident_bytes, "TP2 admitted extent mismatch");
         let pushed = receive_pushed(device, &catalog, &snapshot, sockets.path(), &records,
             Some(plan), 6, rank)?.native()?;

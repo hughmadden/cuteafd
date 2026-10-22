@@ -658,7 +658,7 @@ impl Opened {
                     let (records, deferred) = sink.take();
                     let dense = push::plan_ranks(&self.snapshot, records.clone(), devices, peers.len())?;
                     let prepared = crate::shared::experts::rtx::push::CoordinatorPush::prepare(&self.snapshot,
-                        Some(&self.catalog), 2, Some((&range.clone().collect::<Vec<_>>(), budgets.to_vec())))?;
+                        Some(&self.catalog), 2, Some(crate::shared::experts::rtx::push::CoordinatorExperts::Tp2 { layers: range.clone().collect(), budgets: budgets.to_vec() }))?;
                     Ok((prepared, (model, records, deferred, dense)))
                 })().map_err(|error| tracing::info!(%error, "coordinator TP2 push unavailable; mount")).ok(),
                 _ => None,

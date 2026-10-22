@@ -4,7 +4,7 @@
 //! native TP2 routed halves arrive in the Spark push group. Dense records are
 //! planned from headers before membership: a planning error offers no
 //! coordinator ranks (the Sparks still push, the coordinator fills by mount).
-use crate::shared::experts::rtx::{dense::{self, Records}, push::{CoordinatorPush, PushedTp2}};
+use crate::shared::experts::rtx::{dense::{self, Records}, push::{CoordinatorPush, PushedExperts}};
 use crate::shared::memory::device::Device;
 use anyhow::{Context, Result};
 use cuteafd_loader::OfficialV41Catalog;
@@ -33,7 +33,7 @@ pub(super) fn plan<'a>(snapshot: &std::path::Path, catalog: &OfficialV41Catalog,
     let dense = dense::plan_records(snapshot, records.clone(), &devices, sparks)?;
     let layers = (0..tp2_layers).collect::<Vec<_>>();
     let (push, streams, ranks) = CoordinatorPush::prepare(snapshot, Some(catalog), 2,
-        (tp2_layers > 0).then(|| (&layers[..], tp2_budgets.to_vec())))?;
+        (tp2_layers > 0).then(|| crate::shared::experts::rtx::push::CoordinatorExperts::Tp2 { layers: layers.to_vec(), budgets: tp2_budgets.to_vec() }))?;
     Ok((Planned { push, dense: Some(dense), sparks }, streams, ranks))
 }
 
@@ -42,7 +42,7 @@ impl<'a> Planned<'a> {
     /// `Ok(None)`: the whole group fell back; the caller fills `records` and
     /// loads its TP2 halves through the mount.
     pub(super) fn receive(self, devices: [Device<'a>; 2], catalog: &OfficialV41Catalog)
-        -> Result<Option<[PushedTp2<'a>; 2]>> {
+        -> Result<Option<[PushedExperts<'a>; 2]>> {
         let Self { push, dense, sparks } = self;
         let started = std::time::Instant::now();
         let (pushed, ()) = push.receive_with(devices.to_vec(), Some(catalog), sparks, dense.map(Ok), || ());
