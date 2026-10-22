@@ -36,8 +36,9 @@ placeholder Spark hosts and addresses): Official MXFP4 [min](../../examples/conf
   FP4 pages, a copied SWA "front", pinned-host tier in `cuteafd-hostcache`.
 - RTX/Spark layouts: the v2 native MXFP4 minimum is 1 RTX + 3 Sparks;
   the v2 NVFP4 cards use 4 Sparks. Current MXFP4 and NVFP4 support TP3 as a
-  fit-minimum option; TP4 remains the serving default (see the TP3 decision in
-  `PLAN.md`). The v2 maximum is 2 RTX + 4 Sparks. V4.1 keeps the coordinator layer-range split by default — the
+  fit-minimum option (see the TP3 decision in `PLAN.md`). The current MXFP4
+  maximum is 2 RTX + 6 Sparks; 2 RTX + 4 Sparks is a reference layout.
+  V4.1 keeps the coordinator layer-range split by default — the
   measured head-split hop cost on this fabric does not clear the bar its
   attention weights would need to win (see `PLAN.md` Phase 6).
 - Vocabulary head: RC1 and RC2 default to `CUTEAFD_V41_FP8_HEAD=all`, one
