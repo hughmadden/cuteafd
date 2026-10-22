@@ -61,6 +61,12 @@ impl MimoLayer<'_> {
         self.operands.contains_key(operand)
     }
 
+    /// Every operand, by name (golden digests).
+    #[cfg(test)]
+    pub(crate) fn buffers(&self) -> Vec<(&'static str, CuteafdDeviceBuffer)> {
+        self.operands.iter().map(|(name, a)| (*name, a.buffer)).collect()
+    }
+
     /// The router scores program's weight operand: `w_hilo` (FP32 weight split
     /// into BF16 hi + lo, Flash) or `w_router` (BF16 as stored, V2.6 Pro).
     pub fn router_operand(&self) -> Result<(&'static str, *mut c_void)> {

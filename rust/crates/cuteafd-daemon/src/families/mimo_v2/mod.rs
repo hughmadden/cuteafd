@@ -15,6 +15,9 @@ mod split;
 mod teardown;
 #[cfg(test)]
 mod host_gate;
+#[cfg(test)]
+#[path = "coordinator_golden_tests.rs"]
+mod coordinator_golden_tests;
 
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::NativeLibrary;
