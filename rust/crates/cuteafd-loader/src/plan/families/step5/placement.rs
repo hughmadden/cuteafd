@@ -43,7 +43,7 @@ pub(super) fn layout(
             && report
                 .requested_attention
                 .is_none_or(|a| a == AttentionPlacement::Heads),
-        Unqualified("two-GPU execution requires head-split SWA with alternating whole-owned CSA; all-whole SWA has no routed reply reuse proof")
+        Unqualified("two-GPU execution requires head-split SWA with whole-owned CSA; all-whole SWA has no routed reply reuse proof")
     );
     ensure!(
         !opts.host_embedding

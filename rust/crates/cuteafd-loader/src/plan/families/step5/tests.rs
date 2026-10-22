@@ -910,7 +910,7 @@ fn planner_rejects_all_whole_swa_before_serving_admission() {
         }).unwrap();
         assert!(!result.wip_launchable() && !result.native_serving_admitted);
         assert!(result.hints.iter().any(|hint| hint.what.contains(
-            "two-GPU execution requires head-split SWA with alternating whole-owned CSA")),
+            "two-GPU execution requires head-split SWA with whole-owned CSA")),
             "{:?}", result.hints);
     }
 }

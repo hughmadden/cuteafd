@@ -776,17 +776,43 @@ mod tests {
             inputs.marks.host = true;
             let native = |ownership: &ExecutionOwnership, predictor: bool| -> Result<Vec<RankAdmission>> {
                 Ok((0..2).map(|rank| RankAdmission {
-                    immutable: (1 << 30) + if rank == 0 && predictor { 12 << 30 } else { 0 },
+                    // Cross a whole-CSA boundary in both cache formats, not just consume its slack.
+                    immutable: (1 << 30) + if rank == 0 && predictor { 32 << 30 } else { 0 },
                     workspace: if rank == 0 && predictor { 512 << 20 } else { 1 << 20 },
                 }).take(ownership.ranks()).collect())
             };
             let base = admit_depth_with(&cfg, &inputs, 0, |o| native(o, false))?;
+            let without_weights = admit_depth_with(&cfg, &inputs, 3, |o| native(o, false))?;
             let candidate = admit_depth_with(&cfg, &inputs, 3, |o| native(o, true))?;
+            let old_pressure = admit_depth_with(&cfg, &inputs, 3, |o| {
+                let mut inventory = native(o, true)?;
+                inventory[0].immutable -= 20 << 30;
+                Ok(inventory)
+            })?;
             let count = |a: &Admission| a.placement.layers.iter().enumerate().filter(|(layer, item)|
                 cfg.full[*layer] && item.mode == WHOLE0).count();
-            assert!(count(&candidate) < count(&base), "predictor pressure must move CSA off the head GPU");
+            assert!(count(&candidate) < count(&base), "{format:?}: predictor pressure must move CSA off the head GPU: base={} candidate={}, scores {:?} -> {:?}",
+                count(&base), count(&candidate), attention::owner_score(Onboard::Auto, &base.placement),
+                attention::owner_score(Onboard::Auto, &candidate.placement));
+            // At 12 GiB the neighboring 10/13 cut is still slightly worse:
+            // BF16 38,284 vs 38,338 pages; FP8 75,409 vs 75,631 pages.
+            assert_eq!(count(&old_pressure), 11);
+            assert!(attention::owner_score(Onboard::Auto, &old_pressure.placement)
+                < attention::owner_score(Onboard::Auto, &without_weights.placement));
+            eprintln!("{format:?}: omitted weights cut={}, 12 GiB cut={}, physical scores {:?} -> {:?}",
+                count(&without_weights), count(&old_pressure),
+                attention::owner_score(Onboard::Auto, &without_weights.placement),
+                attention::owner_score(Onboard::Auto, &old_pressure.placement));
+            assert_eq!(count(&without_weights), 11);
+            assert_eq!((count(&base), count(&candidate)), (11, 9),
+                "{format:?}: complete predictor costs must select the expected CSA cut");
             let alternating = inputs.ownership(&cfg)?;
             let old = admit_frozen(&cfg, &inputs, 3, &alternating, &native(&alternating, true)?)?;
+            eprintln!("{format:?}: CSA owners base={}/{}, MTP={}/{}, pool alternating={} solved={}, scores {:?} -> {:?}",
+                count(&base), 23 - count(&base), count(&candidate), 23 - count(&candidate),
+                old.placement.pool_tokens, candidate.placement.pool_tokens,
+                attention::owner_score(Onboard::Auto, &old.placement),
+                attention::owner_score(Onboard::Auto, &candidate.placement));
             assert!(attention::owner_score(Onboard::Auto, &candidate.placement)
                 > attention::owner_score(Onboard::Auto, &old.placement));
             assert_eq!(candidate.marks, 2);
