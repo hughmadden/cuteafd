@@ -82,6 +82,9 @@ pub(crate) enum Job {
     Upload { at: usize, bytes: usize, dst: CuteafdDeviceBuffer },
     /// BF16 `at..at + bytes` widened to F32 into `dst`.
     Widen { at: usize, bytes: usize, dst: CuteafdDeviceBuffer },
+    /// F32 `at..at + bytes` narrowed to BF16 (round to nearest even, NaN
+    /// quieted: `OutputPrecision::Bf16::round`) into `dst`.
+    NarrowF32Bf16 { at: usize, bytes: usize, dst: CuteafdDeviceBuffer },
     /// Staged BF16 rows `rows` (of `pitch` elements), columns `col0..col0 + cols`,
     /// quantized to FP8 into `target`.
     Quant { rows: Range<usize>, pitch: usize, col0: usize, cols: usize, layout: crate::shared::fp8_load_quant::Layout,
@@ -176,6 +179,16 @@ impl Step {
                     load_timing::upload(bytes, || library.copy_h2d(CuteafdDeviceBuffer { bytes, ..dst },
                         &staged[at..at + bytes]))?;
                 }
+                Job::NarrowF32Bf16 { at, bytes, dst } => {
+                    ensure!(at + bytes <= staged.len() && bytes % 4 == 0 && dst.bytes >= bytes / 2,
+                        "narrowing outside its step");
+                    // SAFETY: `staged` is pinned, device-mapped memory the caller keeps
+                    // alive until the drain below; `dst` holds bytes / 2.
+                    load_timing::quantize(bytes, || unsafe {
+                        library.load_narrow_f32_bf16(staged[at..].as_ptr().cast(), dst.ptr, bytes / 4, stream)?;
+                        library.cuda_stream_synchronize(stream)
+                    })?;
+                }
                 Job::Widen { at, bytes, dst } => {
                     ensure!(at + bytes <= staged.len(), "widening outside its step");
                     load_timing::quantize(bytes, || kernels.widen_from(&staged[at..at + bytes], dst, stream))?;
@@ -222,16 +235,30 @@ impl Step {
 /// `rects` (rows of equal width, back to back) as steps of at most
 /// [`STEP_BYTES`] in whole `unit`-row groups: each step's rectangles and the
 /// row range of the whole it covers.
+///
+/// A step also ends at every rectangle boundary that falls on a whole unit,
+/// so a step reads one tensor's contiguous rows: delivered in file order, a
+/// step that mixed tensors (q rows, then k rows far later) would hold every
+/// later step open until its last tensor arrived, and staging would grow
+/// with the tensor count rather than the source count.
 pub(crate) fn windows(rects: &[Rect], unit: usize) -> Result<Vec<(Vec<Rect>, Range<usize>)>> {
     let width = rects.first().context("no rows to stage")?.width();
     ensure!(rects.iter().all(|r| r.width() == width), "staged rows differ in width");
     let total: usize = rects.iter().map(|r| r.rows.len()).sum();
     ensure!(unit > 0 && total % unit == 0, "staged rows are not whole {unit}-row units");
     let per = (STEP_BYTES / width / unit).max(1) * unit;
+    // Unit-aligned rectangle boundaries (row offsets of the whole).
+    let mut cuts = Vec::new();
+    let mut at = 0;
+    for rect in rects {
+        at += rect.rows.len();
+        if at % unit == 0 && at < total { cuts.push(at); }
+    }
     let mut out = Vec::new();
     let mut start = 0;
     while start < total {
-        let end = (start + per).min(total);
+        let next_cut = cuts[cuts.partition_point(|&c| c <= start)..].first().copied().unwrap_or(total);
+        let end = (start + per).min(total).min(next_cut);
         let (mut parts, mut at) = (Vec::new(), 0);
         for rect in rects {
             let n = rect.rows.len();
@@ -530,3 +557,68 @@ pub(crate) fn fill_records_by_mount(library: &NativeLibrary, records: &Records,
     records.run_finishes(library, stream)
 }
 
+
+#[cfg(test)]
+mod window_tests {
+    use super::*;
+
+    fn rect(name: &str, base: u64, rows: usize, width: usize) -> Rect {
+        Rect { name: name.into(), path: "shard".into(), base, row_bytes: width, rows: 0..rows, cols: 0..width }
+    }
+
+    /// Steps open at the first delivered byte and close at the last; one source
+    /// streams the file in offset order: the peak number open at once.
+    fn peak_open(steps: &[Vec<Rect>]) -> usize {
+        let mut events = Vec::new();
+        for (index, rects) in steps.iter().enumerate() {
+            for r in rects {
+                let start = r.base + (r.rows.start * r.row_bytes) as u64;
+                events.push((start, index, r.bytes() as u64));
+            }
+        }
+        events.sort_unstable();
+        let mut left: Vec<u64> = steps.iter().map(|rs| rs.iter().map(|r| r.bytes() as u64).sum()).collect();
+        let (mut open, mut peak) = (std::collections::BTreeSet::new(), 0);
+        for (_, index, bytes) in events {
+            open.insert(index);
+            peak = peak.max(open.len());
+            left[index] -= bytes;
+            if left[index] == 0 { open.remove(&index); }
+        }
+        peak
+    }
+
+    /// The NVFP4/KDA shape: one operand row-concatenating three tensors that
+    /// sit far apart in one shard, each larger than a step. Windows used to mix
+    /// q rows with k and v rows, holding every q step open until v arrived.
+    #[test]
+    fn steps_never_mix_tensors_so_one_file_stream_holds_one_open_step() -> Result<()> {
+        let width = 8192 * 2;
+        let rows = 4096; // 64 MiB a tensor, two steps each
+        let q = rect("q", 0, rows, width);
+        let k = rect("k", 1 << 30, rows, width);
+        let v = rect("v", 2 << 30, rows, width);
+        for unit in [1, 128] {
+            let steps: Vec<Vec<Rect>> = windows(&[q.clone(), k.clone(), v.clone()], unit)?
+                .into_iter().map(|(parts, _)| parts).collect();
+            assert!(steps.iter().all(|parts| parts.len() == 1), "a step reads one tensor");
+            assert!(steps.iter().all(|parts| parts.iter().map(Rect::bytes).sum::<usize>() <= STEP_BYTES));
+            assert_eq!(peak_open(&steps), 1, "unit {unit}");
+        }
+        // Rows still cover the whole in order, in whole units.
+        let covered: Vec<_> = windows(&[q, k, v], 128)?.into_iter().map(|(_, r)| r).collect();
+        assert!(covered.windows(2).all(|w| w[0].end == w[1].start) && covered[0].start == 0
+            && covered.last().unwrap().end == 3 * rows && covered.iter().all(|r| r.len() % 128 == 0));
+        Ok(())
+    }
+
+    /// A unit straddling two tensors stays in one step (its rows quantize together).
+    #[test]
+    fn a_unit_across_tensors_stays_whole() -> Result<()> {
+        let (a, b) = (rect("a", 0, 100, 256), rect("b", 1 << 20, 156, 256));
+        let out = windows(&[a, b], 128)?;
+        assert!(out.iter().all(|(_, rows)| rows.len() % 128 == 0));
+        assert_eq!(out.iter().map(|(_, r)| r.len()).sum::<usize>(), 256);
+        Ok(())
+    }
+}

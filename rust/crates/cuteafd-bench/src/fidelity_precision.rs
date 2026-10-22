@@ -637,7 +637,7 @@ mod tests {
                 "deepseek-ai/DeepSeek-V4-Pro-0813",
             ),
             (
-                "wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K3.25-v1",
+                "wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K3.25-Core-FP8",
                 3.25,
                 "zai-org/GLM-5.3-Flash-BF16",
             ),

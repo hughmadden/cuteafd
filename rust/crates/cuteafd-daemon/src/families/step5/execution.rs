@@ -293,10 +293,19 @@ impl<'e, 'a> Execution<'e, 'a> {
         stages: Vec<&'e Staging<'a>>, rows: usize, available: Vec<u64>,
         reservations: Vec<u64>, transport: Option<DeviceOwner<'a, SparkLink<'a>>>,
         count: usize, placement_version: u64) -> Result<Self> {
-        ensure!(placement_version != 0, "Step-5 execution needs an admitted placement version");
+        let native = Self::load_native(programs, checkpoint, &ownership, &caches, &stages, rows, &available,
+            &reservations, count)?;
+        Self::bind_native(checkpoint, ownership, native, caches, stages, rows, transport, count, placement_version)
+    }
+
+    /// The admitted native owners (weights and arenas) alone, before any Spark
+    /// transport exists: serving loads them while Spark admission is in flight.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn load_native(programs: &'a Programs<'a>, checkpoint: &'a Checkpoint,
+        ownership: &ExecutionOwnership, caches: &[&'e RefCell<CacheRank<'a>>], stages: &[&'e Staging<'a>],
+        rows: usize, available: &[u64], reservations: &[u64], count: usize) -> Result<LoadedNative<'a>> {
         ensure!(matches!(count, 1 | 92), "Step-5 execution count must be layer-zero diagnostic or full target");
         validate_rank_inventory(ownership.ranks(), &[caches.len(), stages.len(), available.len(), reservations.len()])?;
-        ensure!(transport.is_some() == (count == 92), "Step-5 main Spark transport inventory");
         let kv_format = caches[0].borrow().layout().kv_format;
         for rank in 0..ownership.ranks() {
             ensure!(rows as u64 <= ownership.execution().spec().rows, "Step-5 live rows exceed execution plan");
@@ -311,11 +320,25 @@ impl<'e, 'a> Execution<'e, 'a> {
                 && devices[..rank].iter().all(|other| other.id != device.id)), "Step-5 rank devices/library differ");
         let depth = caches[ownership.execution().spec().head_gpu as usize].borrow()
             .layout().ranks[ownership.execution().spec().head_gpu as usize].mtp_lengths.len();
-        let native = NativeOwners::load(programs, checkpoint, &ownership, &devices, rows, count, &available, &reservations, depth, kv_format)?;
-        let main = MainExecution::bind(checkpoint, ownership, native, caches, stages, rows, transport, count, placement_version)?;
+        Ok(LoadedNative(NativeOwners::load(programs, checkpoint, ownership, &devices, rows, count, available,
+            reservations, depth, kv_format)?))
+    }
+
+    /// Binds loaded native owners to the caches and the (now connected) transport.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn bind_native(checkpoint: &'a Checkpoint, ownership: ExecutionOwnership, native: LoadedNative<'a>,
+        caches: Vec<&'e RefCell<CacheRank<'a>>>, stages: Vec<&'e Staging<'a>>, rows: usize,
+        transport: Option<DeviceOwner<'a, SparkLink<'a>>>, count: usize, placement_version: u64) -> Result<Self> {
+        ensure!(placement_version != 0, "Step-5 execution needs an admitted placement version");
+        ensure!(transport.is_some() == (count == 92), "Step-5 main Spark transport inventory");
+        let main = MainExecution::bind(checkpoint, ownership, native.0, caches, stages, rows, transport, count,
+            placement_version)?;
         Ok(Self { main, startup_captures: cuteafd_ffi::graph_captures() })
     }
 }
+
+/// Native owners loaded ahead of their execution binding.
+pub(super) struct LoadedNative<'a>(NativeOwners<'a>);
 
 impl<'e, 'a> MainExecution<'e, 'a> {
     #[allow(clippy::too_many_arguments)]

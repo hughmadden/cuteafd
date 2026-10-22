@@ -26,6 +26,13 @@ extern "C" int32_t cuteafd_load_widen_bf16_f32(const void* src, void* dst, int64
   return 0;
 }
 
+extern "C" int32_t cuteafd_load_narrow_f32_bf16(const void* src, void* dst, int64_t n, void* stream) {
+  (void)stream;
+  for (int64_t i = 0; i < n; ++i)
+    static_cast<uint16_t*>(dst)[i] = cuteafd_load_quant::narrow_f32(static_cast<const uint32_t*>(src)[i]);
+  return 0;
+}
+
 extern "C" int32_t cuteafd_load_kvb_absorb(const void* kv_b, void* uk, void* uv, int64_t h0, int64_t heads,
                                            int64_t nope, int64_t v, int64_t lat, void* stream) {
   (void)stream;

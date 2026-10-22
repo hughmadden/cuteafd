@@ -50,12 +50,19 @@ impl<'a> PushDestination for LoadingArena<'a> {
 
 pub(crate) trait RankEvents {
     fn next(&self) -> std::io::Result<Event>;
+    /// The group's first event: no hub event (not even Progress) precedes the
+    /// group's start, which waits for every rank to join.
+    fn first(&self) -> std::io::Result<Event> { self.next() }
     fn try_next(&self) -> std::io::Result<Poll>;
     fn release(&self, slot: u32) -> std::io::Result<()>;
 }
 impl RankEvents for PushRank {
     fn next(&self) -> std::io::Result<Event> {
         self.next()
+    }
+    fn first(&self) -> std::io::Result<Event> {
+        use cuteafd_loader::push_load::{PUSH_IDLE_TIMEOUT, PUSH_START_TIMEOUT};
+        self.first(PUSH_START_TIMEOUT, PUSH_IDLE_TIMEOUT)
     }
     fn try_next(&self) -> std::io::Result<Poll> {
         self.try_next()
@@ -149,12 +156,25 @@ pub(crate) fn consume<'a, A: PushDestination>(
     );
     ensure!(arena.belongs_to(device), "push arena device mismatch");
     let mut copies = Copies::new(device)?;
+    // What this rank received, for the cause of any failure below.
+    let joined = std::time::Instant::now();
+    let (mut slots, mut payload, mut last) = (0u64, 0u64, None::<std::time::Instant>);
+    let delivered = |slots: u64, payload: u64, last: Option<std::time::Instant>| match last {
+        Some(at) => format!("after {slots} slots ({payload} B) delivered; last event {:.1} s ago, \
+            {:.1} s after join", at.elapsed().as_secs_f64(), (at - joined).as_secs_f64()),
+        None => format!("with nothing delivered {:.1} s after join", joined.elapsed().as_secs_f64()),
+    };
     let mut done = false;
+    let mut started = false;
+    let looped = (|| -> Result<()> {
     while !done {
         if copies.pending.len() == window {
             copies.complete(&mut arena, &rank)?;
         }
-        let event = if copies.pending.is_empty() {
+        let event = if !started {
+            started = true;
+            rank.first()?
+        } else if copies.pending.is_empty() {
             rank.next()?
         } else {
             match rank.try_next()? {
@@ -166,6 +186,8 @@ pub(crate) fn consume<'a, A: PushDestination>(
                 Poll::Closed => anyhow::bail!("push closed before Done"),
             }
         };
+        last = Some(std::time::Instant::now());
+        if let Event::Filled { len, .. } = &event { slots += 1; payload += u64::from(*len); }
         match event {
             Event::Progress { .. } => {}
             Event::Done => done = true,
@@ -185,6 +207,9 @@ pub(crate) fn consume<'a, A: PushDestination>(
                 }
                 let event = copies.events[index as usize];
                 let mut fragments = Vec::new();
+                // One batched copy per slot: a fine-grained plan (thousands of
+                // small fragments a slot) must not pay a copy call per fragment.
+                let (mut dsts, mut srcs, mut lens) = (Vec::new(), Vec::new(), Vec::new());
                 let mut source = 0;
                 for (offset, bytes) in slot::Fragments::new(data, parsed) {
                     let bytes = bytes as usize;
@@ -195,17 +220,9 @@ pub(crate) fn consume<'a, A: PushDestination>(
                             .saturating_sub(usize::try_from(offset)?),
                     );
                     if device_bytes > 0 {
-                        let dst = arena.destination(usize::try_from(offset)?, device_bytes)?;
-                        let src = ring.payload(index, source, device_bytes)?;
-                        // SAFETY: checked live arena/ring, retained through event or teardown drain.
-                        device.run(|| unsafe {
-                            device.library.copy_host_buffer_h2d_async(
-                                dst,
-                                src,
-                                device_bytes,
-                                copies.stream,
-                            )
-                        })?;
+                        dsts.push(arena.destination(usize::try_from(offset)?, device_bytes)?);
+                        srcs.push(ring.payload(index, source, device_bytes)?);
+                        lens.push(device_bytes);
                         fragments.push((offset, device_bytes as u64));
                     }
                     if device_bytes < bytes {
@@ -216,6 +233,11 @@ pub(crate) fn consume<'a, A: PushDestination>(
                     }
                     source += bytes;
                 }
+                // SAFETY: checked live arena/ring views, retained through the slot's
+                // event or the teardown drain; the copies stream is non-default.
+                device.run(|| unsafe {
+                    device.library.copy_host_buffers_h2d_batch_async(&dsts, &srcs, &lens, copies.stream)
+                })?;
                 // SAFETY: event and stream belong to device and remain retained by Copies.
                 device.run(|| unsafe { device.library.cuda_event_record(event, copies.stream) })?;
                 copies.pending.push_back(Pending {
@@ -230,6 +252,9 @@ pub(crate) fn consume<'a, A: PushDestination>(
     while !copies.pending.is_empty() {
         copies.complete(&mut arena, &rank)?;
     }
+    Ok(())
+    })();
+    looped.map_err(|error| error.context(delivered(slots, payload, last)))?;
     drop(copies);
     ensure!(
         !device.library.is_quarantined_after_failed_drain(),
@@ -237,5 +262,5 @@ pub(crate) fn consume<'a, A: PushDestination>(
     );
     drop(rank);
     drop(ring);
-    arena.done()
+    arena.done().map_err(|error| error.context(delivered(slots, payload, last)))
 }

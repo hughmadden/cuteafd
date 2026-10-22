@@ -400,7 +400,7 @@ mod tests {
             ("nvidia/DeepSeek-V4.1-Flash-NVFP4", "base_model: [deepseek-ai/DeepSeek-V4.1-Flash]", dataset::CONFIG),
             ("wrldsuksgo2mars/DeepSeek-V4.1-EXL3-K3.25-v1", "base_model: deepseek-ai/DeepSeek-V4.1-Flash", dataset::CONFIG),
             ("diffbot/DeepSeek-V4.1-Flash-EXL3-2.0bpw-test", "base_model: deepseek-ai/DeepSeek-V4.1-Flash\nbase_model_relation: quantized", dataset::CONFIG),
-            ("wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K3.25-v1", "base_model: zai-org/GLM-5.3-Flash-BF16", dataset::GLMF_CONFIG),
+            ("wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K3.25-Core-FP8", "base_model: zai-org/GLM-5.3-Flash-BF16", dataset::GLMF_CONFIG),
             ("wrldsuksgo2mars/Qwen3.8-Flash-Next-EXL3-K4.25-PLE-FP8-v1", "base_model: [wrldsuksgo2mars/Qwen3.8-Flash-Next-EXL3-K4.25-v1, nvidia/Qwen3.8-Flash-Next-NVFP4]\nbase_model_relation: merge", dataset::QWEN_CONFIG),
         ];
         add(hub, "wrldsuksgo2mars/Qwen3.8-Flash-Next-EXL3-K4.25-v1", "base_model: Qwen/Qwen3.8-Flash-Next-FP8");

@@ -408,7 +408,15 @@ fn installed_native_complete_rank_plans_fit_admission_and_control_frames() -> Re
                     frame.len() + 1 <= 64 * 1024,
                     "native offer exceeds control bound"
                 );
-                eprintln!("native TP{world} rank {rank} exact={exact}: {} layers, {admitted} device bytes, {} entries, {} host scratch, {} offer bytes",
+                // Padded slices leave gaps between every row run (MiMo TP6
+                // Down: 2.4M per layer); delivery coverage must stay small.
+                // Every expected footprint builds; padded TP6 also delivers.
+                crate::shared::memory::weight_arena::ExpectedCoverage::from_plan(&checked, rank as u32)?;
+                let peak = if world == 6 && !exact && rank < 2 {
+                    crate::shared::memory::weight_arena::real_tests::simulate(&checked, rank, "native")?
+                } else { 0 };
+                assert!(peak < 100_000, "TP{world} rank {rank} exact={exact}: {peak} coverage intervals");
+                eprintln!("native TP{world} rank {rank} exact={exact}: {} layers, {admitted} device bytes, {} entries, {} host scratch, {} offer bytes, peak {peak} coverage intervals",
                     layers.len(), checked.plan.entries.len(), plan.host_scratch, frame.len() + 1);
             }
         }

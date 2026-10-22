@@ -324,7 +324,10 @@ fn exercise(window: usize, mode: Mode, bytes: usize) -> Result<(usize, f64)> {
             assert_eq!(actual, expected);
             drop(delivered);
         } else {
-            ensure!(value.is_err(), "partial or invalid load published");
+            let Err(error) = value else { anyhow::bail!("partial or invalid load published") };
+            // The cause says what this rank received before failing.
+            let cause = format!("{error:#}");
+            ensure!(cause.contains("delivered") || cause.contains("drain"), "cause omits delivery: {cause}");
         }
         Ok(())
     });

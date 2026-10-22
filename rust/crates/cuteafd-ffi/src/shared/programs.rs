@@ -563,6 +563,20 @@ impl NativeLibrary {
         Ok(())
     }
 
+    /// `n` F32 values in `src` (device-visible) narrowed to BF16 (round to
+    /// nearest even, NaN quieted) into `dst` on the current device.
+    ///
+    /// # Safety
+    /// `src` holds `n` F32 and `dst` room for `n` BF16, live through the stream.
+    pub unsafe fn load_narrow_f32_bf16(&self, src: *const c_void, dst: *mut c_void, n: usize, stream: *mut c_void)
+        -> Result<()> {
+        type Narrow = unsafe extern "C" fn(*const c_void, *mut c_void, i64, *mut c_void) -> i32;
+        let f = *unsafe { self.lib.get::<Narrow>(b"cuteafd_load_narrow_f32_bf16") }?;
+        let status = unsafe { f(src, dst, i64::try_from(n)?, stream) };
+        ensure!(status == 0, "F32 load narrowing failed with {status}");
+        Ok(())
+    }
+
     /// MLA `kv_b` [heads * (nope + v), lat] (BF16, device-visible) absorbed per head
     /// into `uk` [heads][lat][nope] and `uv` [heads][v][lat] for heads `h0..h0 + heads`.
     ///

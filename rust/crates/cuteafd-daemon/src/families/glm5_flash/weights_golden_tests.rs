@@ -28,7 +28,7 @@ fn installed_head_split_operands_match_the_host_quantize_golden() -> Result<()> 
     let stream = std::ptr::null_mut();
     let mut actual = std::collections::BTreeMap::new();
     for rule in [crate::shared::fp8_linear::Fp8Scales::Pow2, crate::shared::fp8_linear::Fp8Scales::Best] {
-        let loader = GlmfLoader { library: &library, checkpoint: &checkpoint, stream, fp8_source: None,
+        let loader = GlmfLoader { library: &library, checkpoint: &checkpoint, stream,
             kda_fp8: crate::families::glm5_flash::fp8::KdaFp8::Row128, kda_output_shard: false, fp8_head: true, kda_nvfp4: None,
             fp8_scales: rule, device: 0, peers: vec![crate::shared::peer_split::RankDevice { device: 1, stream }],
             dense: std::rc::Rc::new(DenseLoad::mount(&library)) };
@@ -88,7 +88,7 @@ fn installed_pushed_operands_match_the_mount_golden() -> Result<()> {
     let sparks = 2;
     for gpus in [2usize, 1] {
         let load = std::rc::Rc::new(DenseLoad::push(&library));
-        let loader = GlmfLoader { library: &library, checkpoint: &checkpoint, stream, fp8_source: None,
+        let loader = GlmfLoader { library: &library, checkpoint: &checkpoint, stream,
             kda_fp8: crate::families::glm5_flash::fp8::KdaFp8::Row128, kda_output_shard: false, fp8_head: true,
             kda_nvfp4: None, fp8_scales: rule, device: 0,
             peers: if gpus == 2 { vec![crate::shared::peer_split::RankDevice { device: 1, stream }] } else { Vec::new() },
@@ -113,7 +113,7 @@ fn installed_pushed_operands_match_the_mount_golden() -> Result<()> {
         for step in &steps {
             assert!(step.bytes() <= STEP_BYTES, "a step stages {} bytes", step.bytes());
             for job in &step.jobs {
-                let kind = match job { Job::Upload { .. } => "upload", Job::Widen { .. } => "widen",
+                let kind = match job { Job::Upload { .. } => "upload", Job::Widen { .. } => "widen", Job::NarrowF32Bf16 { .. } => "narrow",
                     Job::Quant { .. } => "quant", Job::Absorb { .. } => "absorb", Job::ALog { .. } => "a_log",
                     Job::W8a16Pack { .. } => "w8a16", Job::NativePlane { .. } => "plane" };
                 let largest = kinds.entry(kind).or_default();

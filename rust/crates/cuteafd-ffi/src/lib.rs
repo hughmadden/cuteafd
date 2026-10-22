@@ -2747,11 +2747,15 @@ impl NativeLibrary {
                     src.bytes
                 );
             }
-            validate_device_buffer_bytes(
-                &format!("{context} entry {index} destination"),
-                *dst,
-                entry_bytes,
-            )?;
+            // Format the context only on failure: a fine-grained slot has
+            // thousands of entries.
+            if dst.ptr.is_null() || dst.bytes < entry_bytes {
+                validate_device_buffer_bytes(
+                    &format!("{context} entry {index} destination"),
+                    *dst,
+                    entry_bytes,
+                )?;
+            }
         }
         let source_ptrs = srcs
             .iter()
