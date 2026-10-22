@@ -55,7 +55,7 @@ pub fn coordinate_outcome(streams: &mut [TcpStream],
         Err(error) => {
             tracing::warn!(error = %format!("{error:#}"), "weight push driver failed; every rank loads through the mount");
             cuteafd_core::push_outcome::record(Outcome::Fallback { group: None,
-                failures: vec![(usize::MAX, format!("driver: {error:#}"))] });
+                failures: vec![(None, format!("driver: {error:#}"))] });
             for stream in streams { let _ = stream.shutdown(std::net::Shutdown::Both); }
         }
     }
@@ -65,14 +65,14 @@ pub fn coordinate_outcome(streams: &mut [TcpStream],
 use cuteafd_core::push_outcome::Outcome;
 
 /// The group as a whole: every failing rank's own cause (rank `None` for the
-/// driver, reported as `usize::MAX`), logged at WARN.
+/// driver), logged at WARN.
 fn fell_back(group: Option<u64>, failures: Vec<(Option<usize>, String)>) -> Outcome {
     for (rank, reason) in &failures {
         tracing::warn!(group, rank, %reason, "weight push fell back to the mount for the whole group");
     }
     Outcome::Fallback {
         group,
-        failures: failures.into_iter().map(|(rank, reason)| (rank.unwrap_or(usize::MAX), reason)).collect(),
+        failures,
     }
 }
 

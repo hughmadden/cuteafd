@@ -50,7 +50,8 @@ fn fallback_records_every_failing_rank_and_its_own_cause() -> Result<()> {
     for job in jobs { job.join().unwrap()?; }
     let cuteafd_core::push_outcome::Outcome::Fallback { group: None, failures } = outcome
         else { panic!("fallback not reported: {outcome:?}") };
-    assert_eq!(failures, [(1, "no push offer: fixture cause 1".to_string()), (2, "no push offer: fixture cause 2".to_string())]);
+    assert_eq!(failures, [(Some(1), "no push offer: fixture cause 1".to_string()),
+        (Some(2), "no push offer: fixture cause 2".to_string())]);
     Ok(())
 }
 

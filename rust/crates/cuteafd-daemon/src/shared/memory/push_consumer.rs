@@ -156,8 +156,17 @@ pub(crate) fn consume<'a, A: PushDestination>(
     );
     ensure!(arena.belongs_to(device), "push arena device mismatch");
     let mut copies = Copies::new(device)?;
+    // What this rank received, for the cause of any failure below.
+    let joined = std::time::Instant::now();
+    let (mut slots, mut payload, mut last) = (0u64, 0u64, None::<std::time::Instant>);
+    let delivered = |slots: u64, payload: u64, last: Option<std::time::Instant>| match last {
+        Some(at) => format!("after {slots} slots ({payload} B) delivered; last event {:.1} s ago, \
+            {:.1} s after join", at.elapsed().as_secs_f64(), (at - joined).as_secs_f64()),
+        None => format!("with nothing delivered {:.1} s after join", joined.elapsed().as_secs_f64()),
+    };
     let mut done = false;
     let mut started = false;
+    let looped = (|| -> Result<()> {
     while !done {
         if copies.pending.len() == window {
             copies.complete(&mut arena, &rank)?;
@@ -177,6 +186,8 @@ pub(crate) fn consume<'a, A: PushDestination>(
                 Poll::Closed => anyhow::bail!("push closed before Done"),
             }
         };
+        last = Some(std::time::Instant::now());
+        if let Event::Filled { len, .. } = &event { slots += 1; payload += u64::from(*len); }
         match event {
             Event::Progress { .. } => {}
             Event::Done => done = true,
@@ -241,6 +252,9 @@ pub(crate) fn consume<'a, A: PushDestination>(
     while !copies.pending.is_empty() {
         copies.complete(&mut arena, &rank)?;
     }
+    Ok(())
+    })();
+    looped.map_err(|error| error.context(delivered(slots, payload, last)))?;
     drop(copies);
     ensure!(
         !device.library.is_quarantined_after_failed_drain(),
@@ -248,5 +262,5 @@ pub(crate) fn consume<'a, A: PushDestination>(
     );
     drop(rank);
     drop(ring);
-    arena.done()
+    arena.done().map_err(|error| error.context(delivered(slots, payload, last)))
 }

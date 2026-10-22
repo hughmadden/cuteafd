@@ -7,7 +7,8 @@ use std::sync::{Mutex, OnceLock};
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Outcome {
     Committed { group: u64, ranks: usize },
-    Fallback { group: Option<u64>, failures: Vec<(usize, String)> },
+    /// Each failure's rank, or `None` for the group driver itself.
+    Fallback { group: Option<u64>, failures: Vec<(Option<usize>, String)> },
 }
 
 fn state() -> &'static Mutex<Option<Outcome>> {
@@ -36,8 +37,9 @@ mod tests {
     use super::*;
     #[test]
     fn fallback_reports_ranks_and_causes() {
-        record(Outcome::Fallback { group: Some(7), failures: vec![(2, "coverage".into())] });
-        assert_eq!(current(), json!({"status": "fallback", "group": 7, "failures": [{"rank": 2, "reason": "coverage"}]}));
+        record(Outcome::Fallback { group: Some(7), failures: vec![(Some(2), "coverage".into()), (None, "driver".into())] });
+        assert_eq!(current(), json!({"status": "fallback", "group": 7, "failures": [{"rank": 2, "reason": "coverage"},
+            {"rank": null, "reason": "driver"}]}));
         record(Outcome::Committed { group: 8, ranks: 8 });
         assert_eq!(current()["status"], "committed");
     }
