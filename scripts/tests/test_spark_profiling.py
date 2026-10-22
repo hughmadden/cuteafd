@@ -168,7 +168,7 @@ def _launch_lines(result):
 def test_family_launch_wraps_only_the_selected_spark_ranks(tmp_path):
     prof = tmp_path / 'prof'
     result = _family_launch_result(tmp_path, GLMF_TWO_LAYER, 'test/glmf',
-                                   f'GLM5_FLASH_FP8_MODEL_ID=off\nSPARK_COUNT=2\nSPARK_1_HOST=h1\nSPARK_1_LANE_A=10.0.0.2\n'
+                                   f'SPARK_COUNT=2\nSPARK_1_HOST=h1\nSPARK_1_LANE_A=10.0.0.2\n'
                                    f'PROFILE_SPARK=nsys\nPROFILE_SPARK_RANKS=1\nPROFILE_DIR={prof}\n')
     assert result.returncode == 0, result.stderr
     coordinator, workers = _launch_lines(result)
@@ -192,7 +192,7 @@ def test_family_launch_wraps_only_the_selected_spark_ranks(tmp_path):
 def test_family_launch_profiles_coordinator_and_spark_together(tmp_path):
     prof = tmp_path / 'prof'
     result = _family_launch_result(tmp_path, GLMF_TWO_LAYER, 'test/glmf',
-                                   f'GLM5_FLASH_FP8_MODEL_ID=off\nPROFILE=ncu,expert-timing\nPROFILE_NCU_KERNEL=gemm\n'
+                                   f'PROFILE=ncu,expert-timing\nPROFILE_NCU_KERNEL=gemm\n'
                                    f'PROFILE_NCU_SKIP=300\nPROFILE_SPARK=ncu\nPROFILE_SPARK_NCU_KERNEL=grouped\n'
                                    f'PROFILE_SPARK_NCU_SKIP=900\nPROFILE_SPARK_NCU_COUNT=4\nPROFILE_DIR={prof}\n')
     assert result.returncode == 0, result.stderr
@@ -214,7 +214,7 @@ def test_family_launch_profiles_coordinator_and_spark_together(tmp_path):
     ('PROFILE_SPARK_RANKS=0\n', 'need PROFILE_SPARK'),
 ])
 def test_family_launch_spark_profile_fails_before_any_worker(tmp_path, keys, message):
-    result = _family_launch_result(tmp_path, GLMF_TWO_LAYER, 'test/glmf', 'GLM5_FLASH_FP8_MODEL_ID=off\n' + keys)
+    result = _family_launch_result(tmp_path, GLMF_TWO_LAYER, 'test/glmf', keys)
     assert result.returncode != 0 and message in result.stderr, result.stderr
     assert 'cuteafd expertd-native' not in result.stderr
 

@@ -654,8 +654,8 @@ mod tests {
         for local_flag in ["--reference", "--rows"] {
             assert_eq!(dataset_source(&parse(&["--tier", "full", local_flag, "local"]), model).unwrap(), None);
         }
-        for quant in ["zai-org/GLM-5.3-Flash-BF16", "wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K3.25-v1",
-            "wrldsuksgo2mars--GLM-5.3-Flash-EXL3-K3.25-v1"] {
+        for quant in ["zai-org/GLM-5.3-Flash-BF16", "wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K3.25-Core-FP8",
+            "wrldsuksgo2mars--GLM-5.3-Flash-EXL3-K3.25-Core-FP8"] {
             assert_eq!(dataset_source(&full, quant).unwrap(), dataset_source(&full, model).unwrap());
         }
         for other in ["zai-org/GLM-5.3-Flashlight", "RedHatAI/GLM-5.3-Flash-speculator.dspark-preview"] {
@@ -731,7 +731,7 @@ mod tests {
         let glm: Reference = serde_json::from_value(json!({"name":"test", "models":["zai-org/GLM-5.3-Flash"],
             "checkpoint":"zai-org/GLM-5.3-Flash", "vocab":154880,
             "expect":{"top1_min":0.93,"kl_max":0.05}})).unwrap();
-        assert!(validate_served_reference(&glm, "wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K3.25-v1", true).is_ok());
+        assert!(validate_served_reference(&glm, "wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K3.25-Core-FP8", true).is_ok());
         assert!(validate_served_reference(&glm, quant, true).is_err());
     }
 

@@ -1428,8 +1428,8 @@ zero cached tokens; smoke primes complete chunks plus the exact measured
 prompt before timing an ordinary request, including normal cache retention.
 The split loader also accepts BF16 block projections from the selected
 checkpoint, quantizing before aligned slicing exactly as the unsplit loader
-does. This makes `GLM5_FLASH_FP8_MODEL_ID=off` valid with NVFP4 head split;
-the companion and precision defaults remain unchanged.
+does. Native NVFP4 dense and routed weights keep their primary-checkpoint
+format; all projections now load from that same checkpoint.
 
 Measurements and conditions belong in the follow-up commit messages. Task
 logs, reproducible configs and exports are under

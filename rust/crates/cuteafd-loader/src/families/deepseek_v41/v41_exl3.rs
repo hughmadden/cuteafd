@@ -1115,6 +1115,31 @@ mod tests {
     }
 
     #[test]
+    fn stitched_native_core_metadata_preserves_exl3_contract() {
+        let (mut config, mut manifest, shape, headers) = deepseek_v4_publication();
+        let native = serde_json::json!({"quant_method": "fp8", "fmt": "e4m3",
+            "activation_scheme": "dynamic", "weight_block_size": [128, 128],
+            "modules": ["model.layers.0.self_attn.q_a_proj"]});
+        let meta = serde_json::json!({"native_core_quantization": native});
+        config["quantization_config"]["meta"] = meta.clone();
+        manifest["meta"] = meta;
+        let parsed = read_publication(&config, &[("quantize_config.json", &manifest),
+            ("quantization_config.json", &manifest)], shape, &headers, &[]).unwrap();
+        assert_eq!(parsed.projections.len(), 27);
+        assert_eq!(parsed.storage, Exl3StorageSource::GptqModel);
+        let mut drift = manifest.clone();
+        drift["meta"]["native_core_quantization"]["fmt"] = serde_json::json!("e5m2");
+        let error = read_publication(&config, &[("quantize_config.json", &drift)], shape, &headers, &[])
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("disagree at meta"));
+        // Native format declarations are metadata, not new EXL3 storage keys.
+        manifest["native_core_quantization"] = native;
+        let error = read_publication(&config, &[("quantize_config.json", &manifest)], shape, &headers, &[])
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("unexpected key native_core_quantization"));
+    }
+
+    #[test]
     fn deepseek_v4_publication_rejects_contract_drift() {
         let (config, manifest, shape, headers) = deepseek_v4_publication();
         for (pointer, value, expected) in [

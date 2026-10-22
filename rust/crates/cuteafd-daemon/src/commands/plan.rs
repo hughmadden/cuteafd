@@ -496,28 +496,6 @@ fn attach_snapshots(manifest: &mut cuteafd_loader::plan::files::FileManifest,
     for (role, path, enabled) in configured {
         if let Some(path) = path.as_ref().filter(|_| enabled) { manifest.additional_snapshots.push(manifest_standalone(path, role)?); }
     }
-    if coordinator {
-        let root = PathBuf::from(&manifest.snapshot);
-        let inventory = cuteafd_loader::plan::checkpoint::Checkpoint::inventory(&root)?;
-        if cuteafd_loader::plan::family::detect(&inventory).is_some_and(|f| f.id() == "glm5_flash") {
-            let cfg = launch_config(args.config.as_deref())?;
-            let model = cfg.get("GLM5_FLASH_FP8_MODEL_ID").or_else(|| cfg.get("GLMF_FP8_MODEL_ID"))
-                .filter(|v| !v.is_empty()).map(String::as_str).unwrap_or("zai-org/GLM-5.3-Flash");
-            if model != "off" {
-                let hf_home = args.hf_home.clone().unwrap_or_else(default_hf_home);
-                let revision = cfg.get("GLM5_FLASH_FP8_MODEL_REVISION").or_else(|| cfg.get("GLMF_FP8_MODEL_REVISION"))
-                    .filter(|v| !v.is_empty()).map(String::as_str);
-                let source = resolve_snapshot_at_revision(model, Some(&hf_home), revision)?.snapshot_path
-                    .with_context(|| format!("required GLM Flash FP8 source {model} is not downloaded"))?;
-                if source != root {
-                    let mut fp8 = cuteafd_loader::plan::files::manifest(&source,
-                        ReadRole::Coordinator { local_experts: false, speculator: false })?;
-                    fp8.role = "fp8 projections".into();
-                    manifest.additional_snapshots.push(fp8);
-                }
-            }
-        }
-    }
     manifest.total_bytes = manifest.additional_snapshots.iter().fold(manifest.total_bytes, |sum, repo|
         sum.and_then(|sum| sum.checked_add(repo.total_bytes?)));
     Ok(())
@@ -894,26 +872,18 @@ mod tests {
     }
 
     #[test]
-    fn glm_flash_includes_the_configured_fp8_projection_source() {
+    fn glm_flash_coordinator_files_need_only_the_primary_checkpoint() {
         use cuteafd_loader::plan::testing::*;
-        let hf = tempfile::tempdir().unwrap();
-        let source = hf.path().join("hub/models--fixture--fp8/snapshots/pinned");
-        std::fs::create_dir_all(&source).unwrap();
-        write_snapshot(&source, &glm5_flash_config(2), &[t("lm_head.weight", "BF16", &[2])], None);
         let target = tempfile::tempdir().unwrap();
         write_snapshot(target.path(), &glm5_flash_config(2), &[t("lm_head.weight", "BF16", &[2])], None);
-        let config = target.path().join("launch.config");
-        std::fs::write(&config, "SPECULATOR=off\nGLM5_FLASH_FP8_MODEL_ID=fixture/fp8\nGLM5_FLASH_FP8_MODEL_REVISION=pinned\n").unwrap();
         let mut input = args(target.path(), 4, false);
-        input.config = Some(config);
-        input.hf_home = Some(hf.path().into());
-        let effective = file_args(input, target.path()).unwrap();
+        input.speculator = "off".into();
         let roles = [cuteafd_loader::plan::files::ReadRole::Coordinator { local_experts: false, speculator: false }];
         let mut manifest = cuteafd_loader::plan::files::manifest_roles(target.path(), &roles).unwrap();
-        attach_snapshots(&mut manifest, &roles, &effective).unwrap();
-        assert_eq!(manifest.additional_snapshots.len(), 1);
-        assert_eq!(manifest.additional_snapshots[0].snapshot, source.display().to_string());
-        assert_eq!(manifest.additional_snapshots[0].role, "fp8 projections");
+        let primary_bytes = manifest.total_bytes;
+        attach_snapshots(&mut manifest, &roles, &input).unwrap();
+        assert!(manifest.additional_snapshots.is_empty());
+        assert_eq!(manifest.total_bytes, primary_bytes);
     }
 
     #[test]
