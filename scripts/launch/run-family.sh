@@ -2059,7 +2059,7 @@ if [[ $serve == serve-dsv4 || $serve == serve-glm || $serve == serve-mimo ]]; th
   esac
 fi
 if [[ "$family" == glm5 || "$family" == glm5_flash || "$family" == mimo_v2 ]]; then
-  draft_kv_cache="$(get DRAFT_KV_CACHE bf16)"
+  draft_kv_cache="$(get DRAFT_KV_CACHE fp8)"
   case "$draft_kv_cache" in bf16|fp8) ;; *) release_die "DRAFT_KV_CACHE must be bf16 or fp8" ;; esac
   family_args+=(--draft-kv-cache "$draft_kv_cache")
 fi

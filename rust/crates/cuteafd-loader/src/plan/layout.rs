@@ -208,7 +208,7 @@ impl Default for LayoutOptions {
             mimo_rings: 16,
             mimo_expert_input: Default::default(),
             draft_sequences: 4,
-            draft_kv_cache: crate::families::qwen4::Qwen4KvCache::Bf16,
+            draft_kv_cache: crate::families::qwen4::Qwen4KvCache::Fp8,
             draft_context_slots: None,
             mimo_decode_graphs: false,
             physical_sms: None,

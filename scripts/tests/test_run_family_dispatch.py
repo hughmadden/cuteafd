@@ -1884,7 +1884,7 @@ def test_glm_drafter_quantization_is_explicit(tmp_path, family, selection, expec
 
 
 @pytest.mark.parametrize("family", ["glm5", "glm5_flash", "mimo_v2"])
-@pytest.mark.parametrize("selection, expected", [(None, "bf16"), ("bf16", "bf16"), ("fp8", "fp8")])
+@pytest.mark.parametrize("selection, expected", [(None, "fp8"), ("bf16", "bf16"), ("fp8", "fp8")])
 def test_drafter_kv_format_is_independent_of_target_kv(tmp_path, family, selection, expected):
     configs = {
         "glm5": {"model_type": "glm_moe_dsa", "num_hidden_layers": 4, "first_k_dense_replace": 3},

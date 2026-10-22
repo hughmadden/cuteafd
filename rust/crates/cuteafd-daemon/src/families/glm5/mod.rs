@@ -20,7 +20,7 @@ use std::time::Instant;
 #[derive(Debug, Clone, clap::Args)]
 pub(crate) struct EngineArgs {
     /// Shared GQA drafter-ring storage (independent of weight precision).
-    #[arg(long, default_value = "bf16")]
+    #[arg(long, default_value = "fp8")]
     pub draft_kv_cache: cuteafd_loader::families::qwen4::Qwen4KvCache,
     /// Checkpoint snapshot (the EXL3 publication carries the dense weights).
     #[arg(long)]
