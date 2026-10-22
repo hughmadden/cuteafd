@@ -17,6 +17,8 @@ SPEC = importlib.util.spec_from_loader('cpu_gate', LOADER)
 gate = importlib.util.module_from_spec(SPEC)
 LOADER.exec_module(gate)
 
+BUILD_OK = '{"reason":"build-finished","success":true}\n'
+
 ARGS = SimpleNamespace(cargo_build_timeout=60, cargo_timeout=60, scripts_timeout=60, skip_live_planners=False, cargo_jobs=4, pytest_jobs=4)
 
 
@@ -37,15 +39,15 @@ def _fake(monkeypatch, outputs):
 def test_cargo_passes_only_with_parsed_tests_and_no_failures(tmp_path, monkeypatch):
     (tmp_path / 'logs').mkdir()
     ok = 'test result: ok. 12 passed; 0 failed; 1 ignored; 0 measured\ntest result: ok. 3 passed; 0 failed; 0 ignored\n'
-    _fake(monkeypatch, [(0, 'built'), (0, ok)])
+    _fake(monkeypatch, [(0, BUILD_OK), (0, ok)])
     result = gate.cargo(ROOT, tmp_path, ARGS, {})
     assert result['status'] == 'pass' and result['passed'] == 15 and result['binaries'] == 2
     # Exit 0 but nothing ran (e.g. a wrapper that masked a missing lock): failed.
-    _fake(monkeypatch, [(0, 'built'), (0, 'fd: unbound variable\n')])
+    _fake(monkeypatch, [(0, BUILD_OK), (0, 'fd: unbound variable\n')])
     result = gate.cargo(ROOT, tmp_path, ARGS, {})
     assert result['status'] == 'failed' and 'no test summaries' in result['error']
     bad = ok + 'test a::b ... FAILED\ntest result: FAILED. 4 passed; 1 failed; 0 ignored\n'
-    _fake(monkeypatch, [(0, 'built'), (101, bad)])
+    _fake(monkeypatch, [(0, BUILD_OK), (101, bad)])
     result = gate.cargo(ROOT, tmp_path, ARGS, {})
     assert result['status'] == 'failed' and result['failing'] == ['a::b']
     _fake(monkeypatch, [(1, 'error[E0425]: cannot find value\nerror: could not compile\n')])
@@ -53,9 +55,62 @@ def test_cargo_passes_only_with_parsed_tests_and_no_failures(tmp_path, monkeypat
     assert result['status'] == 'failed' and 'E0425' in result['error']
 
 
+@pytest.mark.parametrize('build', ['', 'error: compile failed\n',
+                                   '{"reason":"build-finished","success":false}\n',
+                                   BUILD_OK + '{"reason":"compiler-message","message":{"level":"error"}}\n'])
+def test_masked_compile_failure_never_runs_stale_test_binaries(tmp_path, monkeypatch, build):
+    (tmp_path / 'logs').mkdir()
+    calls = _fake(monkeypatch, [(0, build), (0, 'test result: ok. 8 passed; 0 failed; 0 ignored\n')])
+    result = gate.cargo(ROOT, tmp_path, ARGS, {})
+    assert result['status'] == 'failed' and not result['build_complete']
+    assert len(calls) == 1 and '--message-format=json-render-diagnostics' in calls[0]
+    calls = _fake(monkeypatch, [(0, build), (0, 'test result: ok. 1 passed; 0 failed; 0 ignored\n')])
+    assert gate.benches(ROOT, tmp_path, ARGS, {})['status'] == 'failed'
+    assert len(calls) == len(gate.BENCHES)
+
+
+def test_zero_exit_does_not_mask_test_failure_counts(tmp_path, monkeypatch):
+    (tmp_path / 'logs').mkdir()
+    _fake(monkeypatch, [(0, BUILD_OK), (0, 'test a::b ... FAILED\n'
+                                             'test result: FAILED. 8 passed; 1 failed; 0 ignored\n')])
+    result = gate.cargo(ROOT, tmp_path, ARGS, {})
+    assert result['status'] == 'failed' and result['failing'] == ['a::b']
+
+
+@pytest.mark.parametrize('problem', ['timeout', 'missing-summary', 'moved', 'base-empty', 'shared-test'])
+def test_base_comparison_does_not_mask_infrastructure_failures(tmp_path, monkeypatch, problem):
+    suite = dict(suite='cargo', status='pass', passed=8, failed=0, failing=[], exit=0)
+    head = dict(head='a', suites=[dict(suite)], status='pass', dirty=False, moved=False)
+    base = dict(head='b', suites=[dict(suite)], status='pass', dirty=False, moved=False)
+    if problem == 'timeout':
+        head['suites'][0].update(status='failed', exit=124)
+    elif problem == 'missing-summary':
+        head['suites'][0].update(status='failed')
+    elif problem == 'moved':
+        head['moved'] = True
+    elif problem == 'base-empty':
+        base['suites'][0].update(status='failed', passed=0)
+    else:
+        for side in (head, base):
+            side['suites'][0].update(status='failed', failed=1, failing=['a::b'], exit=101)
+    monkeypatch.setattr(gate, 'gate', lambda source, *a, **k: head if source == ROOT else base)
+    monkeypatch.setattr(gate, 'checked', lambda *a, **k: '')
+    args = SimpleNamespace(task='test', source=ROOT, base='base', skip_live_planners=False)
+    code = gate.run_gate(args, tmp_path)
+    assert code == (0 if problem == 'shared-test' else 1)
+
+
+def test_child_shell_preserves_errexit_inside_agent_and_list(tmp_path):
+    script = tmp_path / 'gate.sh'
+    script.write_text('set -euo pipefail\nfalse\nprintf false-green\\n\n')
+    result = subprocess.run(['bash', '-c', 'true && eval \'bash "$1"\' && echo green', '_', str(script)],
+                            text=True, capture_output=True)
+    assert result.returncode != 0 and not result.stdout
+
+
 def test_live_planner_skip_is_explicit_and_recorded(tmp_path, monkeypatch):
     (tmp_path / 'logs').mkdir()
-    calls = _fake(monkeypatch, [(0, ''), (0, 'test result: ok. 1 passed; 0 failed; 0 ignored\n')])
+    calls = _fake(monkeypatch, [(0, BUILD_OK), (0, 'test result: ok. 1 passed; 0 failed; 0 ignored\n')])
     result = gate.cargo(ROOT, tmp_path, SimpleNamespace(**{**vars(ARGS), 'skip_live_planners': True}), {})
     test_cmd = calls[1]
     assert test_cmd[-1] == '--exact' and test_cmd.count('--skip') == 2
@@ -91,7 +146,7 @@ def test_benches_record_medians_and_fail_on_a_bound_or_an_empty_run(tmp_path, mo
     (tmp_path / 'logs').mkdir()
     ran = ('C16 V4.1 geometry, medians: select 937.1 us, choose_width 1603.7 us, observe 56.8 us, total 2597.6 us\n'
            'test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured\n')
-    calls = _fake(monkeypatch, [(0, 'built'), (0, ran)])
+    calls = _fake(monkeypatch, [(0, BUILD_OK), (0, ran)])
     envs = []
     original = gate.run_logged
     def run_logged(cmd, log_path, env, cwd, timeout):
@@ -107,11 +162,11 @@ def test_benches_record_medians_and_fail_on_a_bound_or_an_empty_run(tmp_path, mo
     assert 'select 937 us' in gate.render(record)
     over = 'medians: select 1500.0 us, choose_width 2500.0 us, observe 57.0 us\nselect median 1500.0 us exceeds 1200 us\n' \
            'test result: FAILED. 0 passed; 1 failed; 0 ignored\n'
-    _fake(monkeypatch, [(0, 'built'), (101, over)])
+    _fake(monkeypatch, [(0, BUILD_OK), (101, over)])
     result = gate.benches(ROOT, tmp_path, ARGS, {})
     assert result['status'] == 'failed' and result['failing'] == ['draft_policy_bench']
     assert result['medians']['draft_policy_bench']['select'] == 1500.
-    _fake(monkeypatch, [(0, 'built'), (0, 'running 0 tests\n')])
+    _fake(monkeypatch, [(0, BUILD_OK), (0, 'running 0 tests\n')])
     assert gate.benches(ROOT, tmp_path, ARGS, {})['status'] == 'failed'
 
 
@@ -199,7 +254,7 @@ def test_nextest_machine_report_includes_crashes_and_skips(tmp_path):
 
 def test_worker_budget_reaches_both_runners(tmp_path, monkeypatch):
     (tmp_path / 'logs').mkdir()
-    calls = _fake(monkeypatch, [(0, ''), (0, 'test result: ok. 1 passed; 0 failed; 0 ignored\n')])
+    calls = _fake(monkeypatch, [(0, BUILD_OK), (0, 'test result: ok. 1 passed; 0 failed; 0 ignored\n')])
     envs = []
     run_logged = gate.run_logged
     def capture_env(cmd, path, env, cwd, timeout):
@@ -217,7 +272,7 @@ def test_worker_budget_reaches_both_runners(tmp_path, monkeypatch):
 def test_slow_runs_only_explicit_cpu_tests(tmp_path, monkeypatch):
     (tmp_path / 'logs').mkdir()
     ok = 'test result: ok. 1 passed; 0 failed; 0 ignored\n'
-    calls = _fake(monkeypatch, [(0, ''), (0, ok), *[(0, ok)] * len(gate.SLOW_TESTS)])
+    calls = _fake(monkeypatch, [(0, BUILD_OK), (0, ok), *[(0, ok)] * len(gate.SLOW_TESTS)])
     args = SimpleNamespace(**vars(ARGS), slow=True)
     result = gate.cargo(ROOT, tmp_path, args, {})
     assert result['status'] == 'pass'
@@ -241,7 +296,7 @@ def test_suites_overlap_without_changing_receipt_order(tmp_path, monkeypatch):
 
 def test_missing_nextest_report_cannot_be_masked_by_passing_doctests(tmp_path, monkeypatch):
     (tmp_path / 'logs').mkdir()
-    calls = _fake(monkeypatch, [(0, ''), (0, ''), (0, 'test result: ok. 2 passed; 0 failed; 0 ignored\n')])
+    calls = _fake(monkeypatch, [(0, BUILD_OK), (0, BUILD_OK), (0, 'test result: ok. 2 passed; 0 failed; 0 ignored\n')])
     monkeypatch.setattr(gate, 'nextest_for', lambda env: '/tools/cargo-nextest')
     result = gate.cargo(ROOT, tmp_path, ARGS, {})
     assert calls[1][4:6] == ['nextest', 'run']

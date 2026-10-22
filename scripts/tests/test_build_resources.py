@@ -186,7 +186,7 @@ def test_host_worker_admission_is_shared_across_builds(tmp_path, monkeypatch):
         assert resource.try_lock(tmp_path / 'host/0.lock') is None
 
 
-def test_context_ram_reservation_precedes_cuda_and_includes_reclaimable_cache(tmp_path, monkeypatch):
+def test_context_ram_reservation_precedes_cuda_and_excludes_reclaimable_cache(tmp_path, monkeypatch):
     import platform
     monkeypatch.setattr(export, '_context_lease', None)
     monkeypatch.setattr(platform, 'machine', lambda: 'aarch64')
@@ -203,15 +203,52 @@ def test_context_ram_reservation_precedes_cuda_and_includes_reclaimable_cache(tm
     monkeypatch.setattr(Path, 'read_text', text)
     export.context_admission()
     assert export._context_lease
-    assert json.loads((tmp_path / 'context-baseline.json').read_text())['available'] == 122880
+    assert json.loads((tmp_path / 'context-baseline.json').read_text())['available'] == 6144
     assert (tmp_path / 'context.0.lock').read_text() == '1536'
     export._context_lease.close()
     export._context_lease = None
 
 
+@pytest.mark.parametrize('text', ['', 'MemFree: invalid kB\n', 'MemFree: -1 kB\n',
+                                  'MemFree: 1 MB\n', 'MemFree: 1 kB\nMemFree: 2 kB\n'])
+def test_context_free_memory_fails_closed(tmp_path, monkeypatch, text):
+    monkeypatch.setattr(export, '_gb10_host', lambda: True)
+    monkeypatch.setattr(Path, 'read_text', lambda *a, **k: text)
+    with pytest.raises(ValueError, match='MemFree'):
+        export.context_free_memory()
+
+
+def test_context_free_memory_respects_cgroup_headroom(monkeypatch):
+    monkeypatch.setattr(export, '_gb10_host', lambda: True)
+    monkeypatch.setattr(Path, 'read_text', lambda path: (
+        'MemFree: 8192 kB\nMemAvailable: 999999 kB\n' if path.name == 'meminfo' else '0::/\n'))
+    def bounded(free, membership):
+        assert free == 8 * 1024**2 and membership == '0::/\n'
+        return 1024
+    monkeypatch.setattr(export, 'cgroup_allocatable_bytes', bounded)
+    assert export.context_free_memory() == 1024
+
+
+def test_context_admission_waits_when_only_page_cache_is_available(tmp_path, monkeypatch):
+    monkeypatch.setattr(export, '_gb10_host', lambda: True)
+    monkeypatch.setattr(export, '_context_lease', None)
+    original = Path.read_text
+    monkeypatch.setattr(Path, 'read_text', lambda path, *a, **k: (
+        'MemFree: 512000 kB\nMemAvailable: 125829120 kB\n' if path.name == 'meminfo'
+        else '' if str(path) == '/proc/self/cgroup' else original(path, *a, **k)))
+    monkeypatch.setenv('CUTEAFD_EXPORT_HOST_SLOT_DIR', str(tmp_path))
+    def stop_wait(seconds):
+        raise TimeoutError('free pages exhausted')
+    monkeypatch.setattr(export.time, 'sleep', stop_wait)
+    with pytest.raises(TimeoutError, match='free pages'):
+        export.context_admission()
+    assert export._context_lease is None
+
+
 @pytest.mark.parametrize('available,reservation,expected', [(120000, 1536, True), (7000, 4096, False)])
 def test_context_admission_accounts_live_reservations_across_worker_limits(tmp_path, monkeypatch, available, reservation, expected):
     monkeypatch.setattr(export, '_context_lease', None)
+    monkeypatch.setattr(export, 'context_free_memory', lambda: available * 1024**2)
     monkeypatch.setenv('CUTEAFD_EXPORT_HOST_SLOT_DIR', str(tmp_path))
     monkeypatch.setenv('CUTEAFD_EXPORT_WORKER_RAM_MIB', str(reservation))
     monkeypatch.setenv('CUTEAFD_EXPORT_HOST_WORKERS', '2')
@@ -597,6 +634,37 @@ def _end(lease, process, owner):
 def locks(tmp_path):
     (tmp_path / 'locks').mkdir()
     return tmp_path / 'locks'
+
+
+def test_seed_export_progresses_with_an_older_queued_serving_ticket(tmp_path, locks):
+    lease = _lease(tmp_path, 'build', '--host', 'kakapo')
+    serving = None
+    try:
+        _wait_file(lease[0] / 'granted')
+        # This older job cannot get the umbrella until the build exits. The
+        # build's later export turn must not wait behind an unrelated ticket.
+        marker = tmp_path / 'served'
+        serving = subprocess.Popen([sys.executable, str(ROOT / 'scripts/hw/hwlock.py'),
+                                    '--locks', 'sparks,kakapo', '--wait', '20', '--',
+                                    'touch', str(marker)],
+                                   env={**os.environ, 'CUTEAFD_LOCK_DIR': str(locks)})
+        deadline = time.monotonic() + 5
+        while not list((locks / 'hwq').glob('*.ticket')):
+            assert serving.poll() is None and time.monotonic() < deadline
+            time.sleep(0.02)
+        (lease[0] / 'export-request').touch()
+        _wait_file(lease[0] / 'export-granted', timeout=5)
+        assert not marker.exists()
+        (lease[0] / 'export-done').touch()
+        _end(*lease)
+        lease = None
+        assert serving.wait(timeout=5) == 0 and marker.exists()
+    finally:
+        if lease:
+            _end(*lease)
+        if serving and serving.poll() is None:
+            serving.terminate()
+            serving.wait(timeout=5)
 
 
 def test_two_builds_on_one_seed_share_cpu_slots_but_serialize_the_export(tmp_path, locks):
