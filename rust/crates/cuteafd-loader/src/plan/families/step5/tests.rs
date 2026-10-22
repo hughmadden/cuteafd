@@ -248,6 +248,8 @@ fn full_context_mtp_forecast_charges_private_predictors_before_allocation() -> a
                     assert_eq!(actual, expected, "depth {depth}, rank {rank}, {category:?}");
                 }
             }
+            let charged = |a: &admission::Admission, rank: usize| a.placement.items[rank].iter()
+                .map(|item| item.bytes).sum::<u64>();
             let by_category = (0..2).map(|rank| {
                 let mut categories = std::collections::BTreeMap::new();
                 for item in &admitted.placement.items[rank] {
@@ -262,8 +264,8 @@ fn full_context_mtp_forecast_charges_private_predictors_before_allocation() -> a
                 "depth": depth, "context": admitted.cache.context, "pool": admitted.placement.pool_tokens,
                 "sequences": inputs.sequences, "rows": inputs.rows,
                 "marks": admitted.marks, "predictor_weights": weights,
-                "predictor_arena_growth": workspace,
-                "active_delta": active_delta, "mark_delta": marks_delta, "ranks": by_category }));
+                "owners": admitted.ownership.execution().modes().iter().map(|mode| format!("{mode:?}")).collect::<Vec<_>>(),
+                "ranks": by_category }));
         }
         assert!(admission::forecast_mtp(&cp, &inputs, 4).is_err());
     }

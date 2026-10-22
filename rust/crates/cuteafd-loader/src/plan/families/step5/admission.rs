@@ -757,7 +757,7 @@ mod tests {
                 );
                 let owners = (0..92).filter(|&layer| config().full[layer])
                     .map(|layer| admission.ownership.execution().mode(layer))
-                    .collect::<Result<Vec<_>>>()?;
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
                 assert!(owners.contains(&WHOLE0) && owners.contains(&WHOLE1));
                 assert!(owners.windows(2).all(|pair| pair != [WHOLE1, WHOLE0]));
             }
