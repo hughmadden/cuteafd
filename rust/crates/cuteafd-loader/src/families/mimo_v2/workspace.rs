@@ -1,7 +1,7 @@
 //! One allocation description for MiMo startup admission and engine workspaces.
 //! Keeping attention geometry explicit lets a separately qualified head-width
 //! reduction change Q/attention/KV storage without changing hidden rows or MTP.
-use super::{MimoAttention, MimoKvCache, MimoV2Config};
+use super::{MimoAttention, MimoKvCache, MimoKvFormats, MimoV2Config};
 use crate::serving_capacity::CacheGeometryError;
 use cuteafd_core::serving_capacity::MemoryReservation;
 
@@ -56,7 +56,7 @@ pub struct MimoWorkspaceOptions {
     pub expert_input: MimoExpertInput,
     pub max_context: u64,
     pub pool_pages: u64,
-    pub kv_cache: MimoKvCache,
+    pub kv_cache: MimoKvFormats,
     pub attention: MimoAttentionWorkspace,
     pub prefill_output: MimoPrefillOutput,
     /// Maximum scratch of every applicable native program at this shape.
@@ -69,7 +69,7 @@ impl MimoWorkspaceOptions {
     /// Both lanes may borrow the same arena: the next widen follows every
     /// earlier attention read on that stream. Decode/BF16 keep private dummies.
     pub fn shares_prefill_kv_wide(self) -> bool {
-        !self.decode && self.kv_cache != MimoKvCache::Bf16
+        !self.decode && self.kv_cache.full != MimoKvCache::Bf16
     }
 }
 
@@ -203,14 +203,14 @@ impl MimoWorkspaceLayout {
             )?,
             delta: bytes("MiMo layer delta", &[t, h, 2])?,
             kv_step: bytes("MiMo KV step", &[t, record])?,
-            kv_wide: if options.decode || options.kv_cache == MimoKvCache::Bf16 {
+            kv_wide: if options.decode || options.kv_cache.full == MimoKvCache::Bf16 {
                 256
             } else {
                 bytes(
                     "MiMo prefill BF16 KV shadow",
                     &[
                         options.max_context,
-                        attention.record_bytes(MimoAttention::Full, MimoKvCache::Bf16) as u64,
+                        attention.record_bytes(MimoAttention::Full, MimoKvFormats { full: MimoKvCache::Bf16, sliding: MimoKvCache::Bf16 }) as u64,
                     ],
                 )?
             },
@@ -286,7 +286,7 @@ mod tests {
             expert_input: MimoExpertInput::Fp8,
             max_context: 1 << 20,
             pool_pages: 1 << 14,
-            kv_cache: MimoKvCache::Int8,
+            kv_cache: MimoKvFormats::default(),
             attention: MimoAttentionWorkspace::Global,
             prefill_output: MimoPrefillOutput::AllRows,
             native_scratch_bytes: 16 << 20,
@@ -378,7 +378,7 @@ mod tests {
         let cfg = MimoV2Config::from_hf(&mimo_pro_config()).unwrap();
         for ranks in [1, 2] {
             for rank in 0..ranks {
-                for kv_cache in [MimoKvCache::Bf16, MimoKvCache::Int8] {
+                for kv_cache in [MimoKvFormats { full: MimoKvCache::Bf16, sliding: MimoKvCache::Bf16 }, MimoKvFormats::default()] {
                     let before_options = MimoWorkspaceOptions {
                         lead: rank == 0, with_head: false, spark: rank == 0,
                         kv_cache, prefill_output: MimoPrefillOutput::LastRow,
@@ -400,7 +400,7 @@ mod tests {
                     let mut costs = shared.workspace_reservations("first", &after, after_options).unwrap();
                     costs.extend(shared.workspace_reservations("second", &after, after_options).unwrap());
                     costs.extend(shared.reservation());
-                    if kv_cache != MimoKvCache::Bf16 {
+                    if kv_cache.full != MimoKvCache::Bf16 {
                         assert_eq!(costs.iter().filter(|r| r.name == "state.prefill_kv_wide").count(), 1);
                         assert!(!costs.iter().any(|r| r.name == "first.kv_wide" || r.name == "second.kv_wide"));
                     }
@@ -489,7 +489,7 @@ mod tests {
         let prefill = MimoWorkspaceLayout::new(
             &cfg,
             MimoWorkspaceOptions {
-                kv_cache: MimoKvCache::Bf16,
+                kv_cache: MimoKvFormats { full: MimoKvCache::Bf16, sliding: MimoKvCache::Bf16 },
                 ..options()
             },
         )
@@ -542,7 +542,7 @@ mod tests {
         owner.workspace_reservations("prefill", &layout, opts).unwrap();
         assert!(owner.workspace_reservations("lane", &changed, changed_opts).is_err());
         assert_eq!(owner.reservation().unwrap().bytes, layout.kv_wide);
-        let opts = MimoWorkspaceOptions { kv_cache: MimoKvCache::Bf16, ..opts };
+        let opts = MimoWorkspaceOptions { kv_cache: MimoKvFormats { full: MimoKvCache::Bf16, sliding: MimoKvCache::Bf16 }, ..opts };
         let bf16 = MimoWorkspaceLayout::new(&cfg, opts).unwrap();
         let mut owner = MimoPrefillKvShadowPlan::default();
         for name in ["prefill", "lane"] {

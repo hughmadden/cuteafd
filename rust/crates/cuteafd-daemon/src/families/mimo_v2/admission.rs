@@ -5,7 +5,7 @@ use cuteafd_loader::families::mimo_v2::admission::{tensor_bytes, draft_prefix_re
 
 use cuteafd_core::serving_capacity::MemoryReservation;
 use cuteafd_ffi::programs::Programs;
-use cuteafd_loader::families::mimo_v2::{MimoKvCache, MimoPrefillOutput, MimoV2Config};
+use cuteafd_loader::families::mimo_v2::{MimoKvCache, MimoKvFormats, MimoPrefillOutput, MimoV2Config};
 
 /// Exact tensor admission against the measured post-module baseline.
 pub(super) struct Preflight {
@@ -119,31 +119,35 @@ mod draft_prefix_tests {
         std::fs::write(dir.path().join("dflash/config.json"),
             r#"{"num_hidden_layers":5,"num_key_value_heads":8,"head_dim":128}"#).unwrap();
         let cfg = MimoV2Config::from_hf(&config).unwrap();
-        let cache = cuteafd_loader::serving_capacity::mimo_cache_geometry(
-            &cfg, cfg.layers, 1, MimoKvCache::Int8, 0).unwrap();
-        let target: u64 = cache.ranks.iter().map(|r| r.retained_mark_bytes).sum();
-        for draft_kv_cache in [cuteafd_loader::families::qwen4::Qwen4KvCache::Bf16,
-            cuteafd_loader::families::qwen4::Qwen4KvCache::Fp8] {
-            let draft = cuteafd_loader::families::mimo_v2::draft_representation::mimo_draft_mark_bytes(5, 8, 128, draft_kv_cache).unwrap();
-            for concurrency in [4, 16] {
-                for enabled in [false, true] {
-                    // Include a budget-tight case to catch the concurrency floor and
-                    // a warm mark changing the number of affordable retained slots.
-                    for mib in [0, 1024, 2048] {
-                        let cli = Cli::parse_from(["serve", "--prefix-cache-mark-mib", &mib.to_string()]);
-                        let slots = mark_slots(&cli.prefix, concurrency,
-                            aggregate_mark_bytes(target, draft, enabled).unwrap() as usize).unwrap() as u64;
-                        let layout = plan(dir.path(), &PlanOptions {
-                            layout: Some(LayoutOptions {
-                                concurrency: concurrency as u64, mimo_prefix_draft: enabled, draft_kv_cache,
-                                mimo_prefix_mark_bytes: mib << 20, host_cache_bytes: Some(0), ..Default::default()
-                            }), ..Default::default()
-                        }).unwrap().memory_layout.unwrap();
-                        let bytes = |name| layout.devices[0].items.iter().filter(|i| i.group == name).map(|i| i.bytes).sum::<u64>();
-                        assert_eq!(bytes("marks"), target * slots, "C{concurrency}, warm={enabled}, MiB={mib}: {:?}", layout.notes);
-                        let reservations = draft_prefix_reservations(enabled, draft, slots, 16).unwrap();
-                        assert_eq!(bytes("DFlash context marks"), reservations.first().map_or(0, |r| r.bytes));
-                        assert_eq!(bytes("DFlash valid-floor transfer"), reservations.get(1).map_or(0, |r| r.bytes));
+        assert_eq!(LayoutOptions::default().mimo_swa_kv, MimoKvFormats::default().sliding);
+        for sliding in [MimoKvCache::Bf16, MimoKvCache::Int8, MimoKvCache::Fp8] {
+            let cache = cuteafd_loader::serving_capacity::mimo_cache_geometry(
+                &cfg, cfg.layers, 1, MimoKvFormats { full: MimoKvCache::Int8, sliding }, 0).unwrap();
+            let target: u64 = cache.ranks.iter().map(|r| r.retained_mark_bytes).sum();
+            for draft_kv_cache in [cuteafd_loader::families::qwen4::Qwen4KvCache::Bf16,
+                cuteafd_loader::families::qwen4::Qwen4KvCache::Fp8] {
+                let draft = cuteafd_loader::families::mimo_v2::draft_representation::mimo_draft_mark_bytes(5, 8, 128, draft_kv_cache).unwrap();
+                for concurrency in [4, 16] {
+                    for enabled in [false, true] {
+                        // Include a budget-tight case to catch the concurrency floor and
+                        // a warm mark changing the number of affordable retained slots.
+                        for mib in [0, 1024, 2048] {
+                            let cli = Cli::parse_from(["serve", "--prefix-cache-mark-mib", &mib.to_string()]);
+                            let slots = mark_slots(&cli.prefix, concurrency,
+                                aggregate_mark_bytes(target, draft, enabled).unwrap() as usize).unwrap() as u64;
+                            let layout = plan(dir.path(), &PlanOptions {
+                                layout: Some(LayoutOptions {
+                                    concurrency: concurrency as u64, mimo_prefix_draft: enabled, draft_kv_cache,
+                                    mimo_swa_kv: sliding,
+                                    mimo_prefix_mark_bytes: mib << 20, host_cache_bytes: Some(0), ..Default::default()
+                                }), ..Default::default()
+                            }).unwrap().memory_layout.unwrap();
+                            let bytes = |name| layout.devices[0].items.iter().filter(|i| i.group == name).map(|i| i.bytes).sum::<u64>();
+                            assert_eq!(bytes("marks"), target * slots, "C{concurrency}, warm={enabled}, MiB={mib}: {:?}", layout.notes);
+                            let reservations = draft_prefix_reservations(enabled, draft, slots, 16).unwrap();
+                            assert_eq!(bytes("DFlash context marks"), reservations.first().map_or(0, |r| r.bytes));
+                            assert_eq!(bytes("DFlash valid-floor transfer"), reservations.get(1).map_or(0, |r| r.bytes));
+                        }
                     }
                 }
             }
@@ -220,7 +224,7 @@ pub(super) fn preflight(
     );
     let context = checkpoint_context_limit(&opened.checkpoint.config)?
         .context("MiMo checkpoint has no max_position_embeddings; specify its context capability in config.json")?;
-    let kv = args.kv_cache.into();
+    let kv = args.kv_formats();
     let cache = mimo_cache_geometry(cfg, layers, ranks, kv, args.mtp)?;
     let draft_mark_bytes = args.draft.as_deref().filter(|_| prefix_draft).map(super::dflash::drafter_dir)
         .map(|dir| -> Result<u64> {
@@ -692,7 +696,7 @@ fn workspace_options(
 > {
     let _ = head_workspace_bytes;
     cuteafd_loader::families::mimo_v2::admission::workspace_options(cfg, ranks, rank,
-        args.prefill_rows, args.max_context, transport_lanes, spark, args.expert_input.into(), args.kv_cache.into(), args.mtp,
+        args.prefill_rows, args.max_context, transport_lanes, spark, args.expert_input.into(), args.kv_formats(), args.mtp,
         prefill_output, fp8_output, |name| Ok(programs.spec(name)?.scratch.get("scratch").copied().unwrap_or(0)))
 }
 
@@ -805,7 +809,7 @@ pub(super) fn workspace_native_scratch(
     ranks: usize,
     rank: usize,
     decode: bool,
-    kv: MimoKvCache,
+    kv: MimoKvFormats,
     fp8_output: bool,
 ) -> Result<u64> {
     workspace_scratch(cfg, ranks, rank, decode, kv, fp8_output, |name| {
@@ -1178,7 +1182,7 @@ mod tests {
     fn lead_reserves_unsplit_mtp_programs_and_peer_only_its_share() {
         let cfg = MimoV2Config::from_hf(&cuteafd_loader::plan::testing::mimo_pro_config()).unwrap();
         let mut lead = Vec::new();
-        let bytes = workspace_scratch(&cfg, 2, 0, true, MimoKvCache::Int8, false, |name| {
+        let bytes = workspace_scratch(&cfg, 2, 0, true, MimoKvFormats::default(), false, |name| {
             lead.push(name.to_string());
             Ok(if name.starts_with("mimop_") {
                 4096
@@ -1192,7 +1196,7 @@ mod tests {
         assert!(lead.iter().any(|n| n.starts_with("mimop2_")));
         assert!(lead.iter().any(|n| n.starts_with("mimop_full_attention")));
         let mut peer = Vec::new();
-        let bytes = workspace_scratch(&cfg, 2, 1, false, MimoKvCache::Int8, false, |name| {
+        let bytes = workspace_scratch(&cfg, 2, 1, false, MimoKvFormats::default(), false, |name| {
             peer.push(name.to_string());
             Ok(2048)
         })
@@ -1204,10 +1208,32 @@ mod tests {
     }
 
     #[test]
+    fn selected_swa_format_queries_target_and_unsplit_mtp_programs() {
+        let cfg = MimoV2Config::from_hf(&cuteafd_loader::plan::testing::mimo_pro_config()).unwrap();
+        for sliding in [MimoKvCache::Bf16, MimoKvCache::Int8, MimoKvCache::Fp8] {
+            for (rank, decode) in [(0, true), (0, false), (1, true), (1, false)] {
+                let mut queried = Vec::new();
+                let kv = MimoKvFormats { full: MimoKvCache::Int8, sliding };
+                let bytes = workspace_scratch(&cfg, 2, rank, decode, kv, false, |name| {
+                    queried.push(name.to_owned());
+                    Ok(if name.contains("swa_attention") { 8192 } else { 4096 })
+                }).unwrap();
+                assert_eq!(bytes, 8192);
+                let (mode, cap) = if decode { ("decode", "m64") } else { ("prefill", "m4096") };
+                for family in if rank == 0 { vec!["mimop2", "mimop"] } else { vec!["mimop2"] } {
+                    assert!(queried.contains(&format!("{family}_swa_producer{}_{}", sliding.program_tag(), cap)));
+                    assert!(queried.contains(&format!("{family}_swa_attention{}_{mode}_{cap}", sliding.program_tag())));
+                    assert!(queried.contains(&format!("{family}_full_attention_kvint8_{mode}_{cap}")));
+                }
+            }
+        }
+    }
+
+    #[test]
     fn missing_selected_native_program_fails_before_workspace_allocation() {
         let cfg =
             MimoV2Config::from_hf(&cuteafd_loader::plan::testing::mimo_flash_config()).unwrap();
-        let error = workspace_scratch(&cfg, 1, 0, true, MimoKvCache::Bf16, false, |name| {
+        let error = workspace_scratch(&cfg, 1, 0, true, MimoKvFormats { full: MimoKvCache::Bf16, sliding: MimoKvCache::Bf16 }, false, |name| {
             if name == "mimo_full_attention_decode_m64" {
                 anyhow::bail!("missing {name}")
             } else {
@@ -1221,7 +1247,7 @@ mod tests {
     fn selected_fp8_output_reserves_each_rank_family_scratch_and_requires_export() {
         let cfg = MimoV2Config::from_hf(&cuteafd_loader::plan::testing::mimo_pro_config()).unwrap();
         let mut queried = Vec::new();
-        let bytes = workspace_scratch(&cfg, 2, 0, false, MimoKvCache::Int8, true, |name| {
+        let bytes = workspace_scratch(&cfg, 2, 0, false, MimoKvFormats::default(), true, |name| {
             queried.push(name.to_owned());
             Ok(match name {
                 "mimop_o_w8_m4096" => 69_206_016,
@@ -1232,7 +1258,7 @@ mod tests {
         .unwrap();
         assert_eq!(bytes, 69_206_016);
         assert!(queried.iter().any(|name| name == "mimop2_o_w8_m4096"));
-        let peer = workspace_scratch(&cfg, 2, 1, false, MimoKvCache::Int8, true, |name| {
+        let peer = workspace_scratch(&cfg, 2, 1, false, MimoKvFormats::default(), true, |name| {
             Ok(if name == "mimop2_o_w8_m4096" {
                 34_603_008
             } else {
@@ -1241,7 +1267,7 @@ mod tests {
         })
         .unwrap();
         assert_eq!(peer, 34_603_008);
-        let error = workspace_scratch(&cfg, 2, 1, true, MimoKvCache::Int8, true, |name| {
+        let error = workspace_scratch(&cfg, 2, 1, true, MimoKvFormats::default(), true, |name| {
             if name == "mimop2_o_w8_m64" {
                 anyhow::bail!("missing {name}");
             }

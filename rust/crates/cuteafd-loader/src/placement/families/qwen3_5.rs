@@ -117,6 +117,7 @@ pub const HEAD_WORKSPACE: usize = 4 << 20;
 pub struct NativeBuffers {
     pub planes: [usize; 13],
     pub logits: usize,
+    pub head_rows: usize,
     pub ids: usize,
     pub head: usize,
     pub commit: usize,
@@ -129,7 +130,7 @@ pub struct NativeBuffers {
 }
 
 impl NativeBuffers {
-    pub fn new(cfg: &Qwen35Config, scratch: usize, slots: usize, marks: usize) -> Result<Self> {
+    pub fn new(cfg: &Qwen35Config, scratch: usize, slots: usize, marks: usize, full_prefill_logits: bool) -> Result<Self> {
         ensure!((1..=VERIFY_ROWS).contains(&slots), "dense state slots must be 1..64");
         // Bound all products below before computing the native allocation recipe.
         ensure!(cfg.hidden <= 16_777_216 && cfg.vocab <= 16_777_216
@@ -150,7 +151,8 @@ impl NativeBuffers {
         let planes = [hidden, hidden, hidden, query, query, query, scratch,
             PREFILL_ROWS * 4, PREFILL_ROWS * 4, PREFILL_ROWS * 12, PREFILL_ROWS * 8,
             PREFILL_ROWS * 8, VERIFY_ROWS * cfg.max_context.div_ceil(64) * 4].map(|n| n.max(256));
-        Ok(Self { planes, logits: VERIFY_ROWS * cfg.vocab * 4, ids: PREFILL_ROWS * 4,
+        let head_rows = if full_prefill_logits { PREFILL_ROWS } else { VERIFY_ROWS };
+        Ok(Self { planes, logits: head_rows * cfg.vocab * 4, head_rows, ids: PREFILL_ROWS * 4,
             head: HEAD_WORKSPACE, commit: 3 * VERIFY_ROWS * 4, state_per_layer, replay_per_layer,
             verify: [mark_bytes.checked_mul(slots).ok_or_else(|| anyhow::anyhow!("dense verify mark overflow"))?.max(256),
                 VERIFY_ROWS * cfg.vocab * 4, cfg.attention.len() * VERIFY_ROWS * cfg.hidden * 2],
@@ -285,7 +287,12 @@ pub fn norm_dtype(spec: &NativeProgram) -> Result<DType> {
     }
 }
 
-pub fn validate(cfg: &Qwen35Config, op: &str, rows: usize, spec: &NativeProgram) -> Result<()> {
+pub fn program_name(prefix: &str, op: &str, rows: usize, format: crate::families::qwen4::Qwen4KvCache) -> String {
+    let suffix = if matches!(op, "attn_producer" | "full_gqa") && format == crate::families::qwen4::Qwen4KvCache::Fp8 { "_kv_fp8" } else { "" };
+    if rows == 0 { format!("{prefix}_{op}{suffix}") } else { format!("{prefix}_{op}{suffix}_m{rows}") }
+}
+
+pub fn validate(cfg: &Qwen35Config, op: &str, rows: usize, format: crate::families::qwen4::Qwen4KvCache, spec: &NativeProgram) -> Result<()> {
     if rows > 0 {
         ensure!(spec.capacity_rows as usize >= rows, "{} capacity is smaller than {rows}", spec.name);
         integer(spec, "max_rows", rows)?;
@@ -313,13 +320,14 @@ pub fn validate(cfg: &Qwen35Config, op: &str, rows: usize, spec: &NativeProgram)
             integer(spec, "value_heads", cfg.gdn.value_heads)?;
             integer(spec, "channels", cfg.gdn.conv_width())?;
             integer(spec, "replay_rows", VERIFY_ROWS)?;
-            integer(spec, "replay_bytes", NativeBuffers::new(cfg, 0, 1, 0)?.replay_per_layer)?;
+            integer(spec, "replay_bytes", NativeBuffers::new(cfg, 0, 1, 0, false)?.replay_per_layer)?;
         }
         "attn_producer" | "full_gqa" => {
             integer(spec, "heads", cfg.heads)?;
             integer(spec, "kv_heads", cfg.kv_heads)?;
             integer(spec, "head_dim", cfg.head_dim)?;
-            integer(spec, "record_bytes", 2 * cfg.kv_heads * cfg.head_dim * 2)?;
+            integer(spec, "record_bytes", format.record_bytes(cfg.kv_heads, cfg.head_dim))?;
+            ensure!(spec.geometry["kv_format"] == format.to_string(), "{}: dense KV format mismatch", spec.name);
             ensure!(spec.geometry["indexed"] == false, "{}: dense attention must not use QSA", spec.name);
             if op == "attn_producer" {
                 integer(spec, "in_width", 2 * (cfg.heads + cfg.kv_heads) * cfg.head_dim)?;

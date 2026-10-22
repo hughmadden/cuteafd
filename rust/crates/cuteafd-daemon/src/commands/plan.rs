@@ -47,6 +47,10 @@ fn options(args: &PlanArgs) -> Result<PlanOptions, PlanError> {
                 spark_allocation_budget_bytes: args.spark_budget_gib
                     .map(|gib| budget_bytes("--spark-budget-gib", gib)).transpose()?,
                 pool_tokens: args.pool_tokens,
+                dense_qwen_kv: args.kv_format.map(|format| match format {
+                    cuteafd_core::MlaCacheFormat::Bf16 => cuteafd_loader::families::qwen4::Qwen4KvCache::Bf16,
+                    cuteafd_core::MlaCacheFormat::Fp8 => cuteafd_loader::families::qwen4::Qwen4KvCache::Fp8,
+                }).unwrap_or(cuteafd_loader::families::qwen4::Qwen4KvCache::Fp8),
                 qwen_kv: args.kv_format.map(|format| match format {
                     cuteafd_core::MlaCacheFormat::Bf16 => cuteafd_loader::families::qwen4::Qwen4KvCache::Bf16,
                     cuteafd_core::MlaCacheFormat::Fp8 => cuteafd_loader::families::qwen4::Qwen4KvCache::Fp8,
@@ -88,6 +92,7 @@ fn options(args: &PlanArgs) -> Result<PlanOptions, PlanError> {
                     .ok_or_else(|| PlanError::InvalidOption { option: "--prefix-cache-mark-mib", reason: "byte budget overflows".into() })?,
                 mimo_prefix_draft: args.mimo_prefix_draft,
                 mimo_rings: args.mimo_rings,
+                mimo_swa_kv: args.mimo_swa_kv_cache.into(),
                 mimo_expert_input: args.expert_input.into(),
                 draft_sequences: args.draft_sequences,
                 draft_kv_cache: args.draft_kv_cache,
@@ -852,6 +857,7 @@ mod tests {
             prefix_cache_mark_mib: 2048,
             mimo_prefix_draft: false,
             mimo_rings: 16,
+            mimo_swa_kv_cache: crate::families::mimo_v2::SwaKvCacheArg::Int8,
             expert_input: crate::families::mimo_v2::engine::ExpertInput::Fp8,
             draft_sequences: 4,
             draft_context_slots: None,
@@ -1380,6 +1386,20 @@ mod tests {
                 assert!(!layout.glmf_representation.fp8_head);
                 assert_eq!(layout.drafter_bytes, 0, "head arithmetic must not add a weight copy");
             }
+        }
+    }
+
+    #[test]
+    fn dense_kv_defaults_to_fp8_and_preserves_explicit_formats() {
+        use clap::Parser;
+        use cuteafd_loader::families::qwen4::Qwen4KvCache;
+        for (extra, expected) in [(&[][..], Qwen4KvCache::Fp8),
+            (&["--kv-cache", "bf16"][..], Qwen4KvCache::Bf16),
+            (&["--kv-cache", "fp8"][..], Qwen4KvCache::Fp8)] {
+            let cli = crate::cli::Cli::try_parse_from(
+                ["cuteafd", "plan", "/not-read", "--layout"].into_iter().chain(extra.iter().copied())).unwrap();
+            let crate::cli::Commands::Plan(args) = cli.command else { panic!("plan") };
+            assert_eq!(options(&args).unwrap().layout.unwrap().dense_qwen_kv, expected);
         }
     }
 

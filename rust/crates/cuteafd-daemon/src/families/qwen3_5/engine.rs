@@ -28,6 +28,7 @@ pub(crate) struct DenseEngine<'a> {
     // Drain queued work before fields retaining buffers/weights begin dropping.
     stream: Stream<'a>,
     pub(crate) cfg: Qwen35Config,
+    pub(crate) kv_format: cuteafd_loader::families::qwen4::Qwen4KvCache,
     programs: &'a Programs<'a>,
     admitted: DensePrograms,
     embedding: TokenEmbedding<'a>,
@@ -40,6 +41,7 @@ pub(crate) struct DenseEngine<'a> {
     ids: Allocation<'a>,
     logits: Allocation<'a>,
     head: VocabularyHead<'a>,
+    head_rows: usize,
     _head_workspace: Allocation<'a>,
     pub(crate) pool_tokens: usize,
     pub(crate) position: usize,
@@ -79,7 +81,7 @@ mod hook_borrow_tests {
         // Startup compares independently loaded allocation owners to offline
         // native admission, including multislot marks and retained prefixes.
         let mut engine = DenseEngine::with_prefix(&library, &programs, &checkpoint, cfg, None, None, 4,
-            Some(crate::shared::prefix::MarkRule { lanes: 4, entries: 4, budget_bytes: 1 << 30, host: false }))?;
+            Some(crate::shared::prefix::MarkRule { lanes: 4, entries: 4, budget_bytes: 1 << 30, host: false }), std::env::var("CUTEAFD_DENSE_TEST_KV_CACHE").unwrap_or_else(|_| "bf16".into()).parse()?, false)?;
         assert!(engine.pool_tokens >= 262144);
         let tokens = (1..=9).collect::<Vec<_>>();
         engine.verify_check(&tokens)?;
@@ -111,9 +113,9 @@ impl<'a> DenseEngine<'a> {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn with_prefix(library: &'a NativeLibrary, programs: &'a Programs<'a>, checkpoint: &'a Checkpoint,
         cfg: Qwen35Config, requested_pool: Option<u64>, drafter: Option<DrafterBytes>, slots: usize,
-        prefix: Option<crate::shared::prefix::MarkRule>) -> Result<Self> {
+        prefix: Option<crate::shared::prefix::MarkRule>, kv_format: cuteafd_loader::families::qwen4::Qwen4KvCache, full_prefill_logits: bool) -> Result<Self> {
         ensure!((1..=HEAD_ROWS).contains(&slots), "dense state slots must be 1..64");
-        let admitted = DensePrograms::new(&cfg, programs)?;
+        let admitted = DensePrograms::new(&cfg, programs, kv_format)?;
         let reader = WeightReader { library, checkpoint };
         let weight_bytes = NativeWeights::bf16(checkpoint, &cfg, admitted.norm_dtype.clone())?;
         programs.load_matching(|name| name.starts_with(&format!("{}_", admitted.prefix)))?;
@@ -125,7 +127,7 @@ impl<'a> DenseEngine<'a> {
             .context("dense prefix mark size overflow")?;
         let prefix_marks = prefix.map_or(0, |rule| rule.slots(mark_bytes));
         let prefix_bytes = prefix_marks.checked_mul(mark_bytes).context("dense prefix arena overflow")?;
-        let buffers = NativeBuffers::new(&cfg, admitted.scratch_bytes, slots, prefix_marks)?;
+        let buffers = NativeBuffers::new(&cfg, admitted.scratch_bytes, slots, prefix_marks, full_prefill_logits)?;
         ensure!(buffers.mark_bytes == mark_bytes && buffers.prefix == prefix_bytes,
             "dense native prefix admission differs from state layout");
         let (layer_bytes, fixed) = weight_bytes.demands(&cfg, &buffers, slots);
@@ -136,9 +138,9 @@ impl<'a> DenseEngine<'a> {
             gpu: GpuBudget { capacity_bytes: total as u64, headroom_bytes: 1 << 30,
                 baseline: Baseline::Measured { free_bytes: free as u64 } }, layers: &layer_bytes,
             fixed, drafter, requested_pool, max_context: cfg.max_context as u64,
-            record_bytes: (2 * cfg.kv_heads * cfg.head_dim * 2) as u64, pool_overhead: 0, pool_bounded: vec![] })?;
+            record_bytes: kv_format.record_bytes(cfg.kv_heads, cfg.head_dim) as u64, pool_overhead: 0, pool_bounded: vec![] })?;
         let pool_tokens = usize::try_from(placement.pool_tokens)?;
-        tracing::info!(pool_tokens, layout = %placement.summary(), "dense Qwen admitted before weight/state allocation");
+        tracing::info!(pool_tokens, kv_format = %kv_format, slots, prefix_marks, full_prefill_logits, head_rows = buffers.head_rows, kv_bytes_per_token = cfg.full_kv_bytes_per_token(kv_format), layout = %placement.summary(), "dense Qwen admitted before weight/state allocation");
         let tensor = reader.tensor(&format!("{PREFIX}embed_tokens.weight"))?;
         let source = EmbedSource::new(&checkpoint.snapshot, &tensor.shard, &tensor.meta, cfg.hidden)?;
         let (embedding, weights) = TokenEmbedding::load(library, source, EmbedPlacement::Gpu,
@@ -154,13 +156,13 @@ impl<'a> DenseEngine<'a> {
         let head_workspace = Allocation::new(device, buffers.head)?;
         // SAFETY: owned workspace is retained after the head and stream, including error cleanup.
         let head = unsafe { library.vocabulary_head_rows(head_workspace.buffer.ptr, cfg.hidden as u32,
-            HEAD_ROWS as u32, cfg.vocab as u32)? };
+            buffers.head_rows as u32, cfg.vocab as u32)? };
         let commit = match admitted.prefix { "qwen35" => "qwen35_gdn_commit", "qwen38" => "qwen38_gdn_commit",
             _ => anyhow::bail!("unadmitted dense prefix") };
         let bank = GdnBank::new(library, programs, stream.raw, cfg.gdn, homes.gdn_layers[0], slots, commit)?;
         let kv: Vec<Option<std::rc::Rc<Allocation<'a>>>> = cfg.attention.iter().map(|&kind| -> Result<_> {
             if kind == HybridAttention::Gdn { return Ok(None); }
-            Ok(Some(std::rc::Rc::new(Allocation::new(device, pool_tokens * 2 * cfg.kv_heads * cfg.head_dim * 2)?)))
+            Ok(Some(std::rc::Rc::new(Allocation::new(device, pool_tokens * kv_format.record_bytes(cfg.kv_heads, cfg.head_dim))?)))
         }).collect::<Result<_>>()?;
         let verification = verify::Verification::new(device, &cfg, slots)?;
         let prefix_arena = if prefix_bytes == 0 { None } else {
@@ -183,17 +185,18 @@ impl<'a> DenseEngine<'a> {
             layer_bytes.iter().map(|layer| layer.replay as usize).sum(), buffers.commit],
             "dense native planner recurrence/replay differs from actual runtime allocations");
         ensure!(kv.iter().flatten().map(|a| a.buffer.bytes).sum::<usize>()
-            == pool_tokens * cfg.full_kv_bytes_per_token(),
+            == pool_tokens * cfg.full_kv_bytes_per_token(kv_format),
             "dense native planner KV differs from actual runtime allocations");
         tracing::info!("dense native planner equals actual weight, KV, state, replay, workspace and prefix allocations");
-        Ok(Self { stream, cfg, programs, admitted, embedding, weights, homes, bank, kv, planes,
-            _planes: std::mem::take(&mut allocated), ids, logits, head, _head_workspace: head_workspace,
+        Ok(Self { stream, cfg, kv_format, programs, admitted, embedding, weights, homes, bank, kv, planes,
+            _planes: std::mem::take(&mut allocated), ids, logits, head, head_rows: buffers.head_rows, _head_workspace: head_workspace,
             pool_tokens, position: 0, slots: vec![rows::Slot { position: 0, pages: Vec::new() }; slots],
             prefix_arena, prefix_marks, healthy: true, verification })
     }
 
     pub(crate) fn slot_count(&self) -> usize { self.slots.len() }
     pub(crate) fn decode_rows(&self) -> usize { HEAD_ROWS }
+    pub(crate) fn full_prefill_logits(&self) -> bool { self.head_rows == ROWS }
     pub(crate) fn slot_position(&self, slot: usize) -> Result<usize> {
         self.slots.get(slot).map(|state| state.position).context("dense slot outside admission")
     }
@@ -214,7 +217,7 @@ impl<'a> DenseEngine<'a> {
     /// the embedding concurrently needs no mutable engine borrow or storage copy.
     pub(crate) fn target_head(&self, hidden: CuteafdDeviceBuffer,
         output: CuteafdDeviceBuffer, rows: usize) -> Result<DeviceLogits> {
-        ensure!((1..=HEAD_ROWS).contains(&rows), "target head requires 1..64 rows");
+        ensure!((1..=self.head_rows).contains(&rows), "target head rows outside admission");
         ensure!(hidden.device_id == self.stream.device.id && output.device_id == self.stream.device.id,
             "target head buffers must reside on the target device");
         ensure!(!hidden.ptr.is_null() && hidden.bytes >= rows * self.cfg.hidden * 2,
@@ -298,7 +301,7 @@ impl<'a> DenseEngine<'a> {
     pub(crate) fn prefill_device(&mut self, slot: usize, tokens: &[u32], logit_rows: usize) -> Result<DeviceLogits> {
         ensure!(slot < self.slots.len() && !tokens.is_empty() && tokens.len() <= ROWS,
             "dense prefill outside admitted slot/row capacity");
-        ensure!((1..=HEAD_ROWS.min(tokens.len())).contains(&logit_rows), "dense prefill head rows outside admission");
+        ensure!(logit_rows <= self.head_rows.min(tokens.len()), "dense prefill head rows outside admission");
         ensure!(self.healthy && self.verification.pending.is_none(), "dense prefill requires committed healthy state");
         self.embedding.check(tokens)?;
         let state = &self.slots[slot];
@@ -325,14 +328,20 @@ impl<'a> DenseEngine<'a> {
         for (index, layer) in self.weights.layers.iter().enumerate() {
             blocks.run(index, layer, self.planes, self.kv[index].as_ref().map(|v| v.buffer), &step)?;
         }
-        let norm = self.programs.program(&format!("{}_norm", self.admitted.prefix), &["x", "weight", "out"])?;
-        let hidden = CuteafdDeviceBuffer { ptr: self.planes.residual.ptr.cast::<u8>()
-            .wrapping_add((tokens.len() - logit_rows) * self.cfg.hidden * 2).cast(),
-            bytes: logit_rows * self.cfg.hidden * 2, ..self.planes.residual };
-        // SAFETY: selected hidden rows and owned normalized output remain live through drain.
-        unsafe { norm.launch(&[hidden.ptr, self.weights.norm.buffer.ptr, self.planes.norm.ptr],
-            &[Scalar::I32(i32::try_from(logit_rows)?)], self.stream.raw)?; }
-        let output = self.target_head(self.planes.norm, self.logits.buffer, logit_rows)?;
+        let output = if logit_rows == 0 {
+            // Scoring may warm a prefix without consuming logits; never launch a zero-row head.
+            DeviceLogits { ptr: self.logits.buffer.ptr, rows: 0, vocab: self.cfg.vocab,
+                stride: self.cfg.vocab, stream: self.stream.raw, greedy: None }
+        } else {
+            let norm = self.programs.program(&format!("{}_norm", self.admitted.prefix), &["x", "weight", "out"])?;
+            let hidden = CuteafdDeviceBuffer { ptr: self.planes.residual.ptr.cast::<u8>()
+                .wrapping_add((tokens.len() - logit_rows) * self.cfg.hidden * 2).cast(),
+                bytes: logit_rows * self.cfg.hidden * 2, ..self.planes.residual };
+            // SAFETY: selected hidden rows and owned normalized output remain live through drain.
+            unsafe { norm.launch(&[hidden.ptr, self.weights.norm.buffer.ptr, self.planes.norm.ptr],
+                &[Scalar::I32(i32::try_from(logit_rows)?)], self.stream.raw)?; }
+            self.target_head(self.planes.norm, self.logits.buffer, logit_rows)?
+        };
         self.stream.drain()?;
         self.slots[slot].position = end;
         self.position = self.slots[0].position;

@@ -1,15 +1,15 @@
 //! MiMo V2 (Flash, V2.6 Pro) as a prefix-cache family (`cuteafd_engine::prefix`).
 //!
-//! Paged state: the full-attention layers' BF16 records, 64 rows per page; one page index
-//! spans every full layer (Flash 9 x 64 x 2,560 B = 1.47 MB, Pro 10 x 64 x 5,120 B = 3.28 MB).
+//! Paged state: the selected full-attention records, 64 rows per page; one page index
+//! spans every full layer. Codes and FP32 descales are copied without conversion.
 //! Full pages are shared by reference; nobody writes them again (every sequence appends past
 //! its own length), so only a partial tail page is copied.
 //!
 //! Mark: the sliding-window layers keep a 256-slot ring per sequence that the next step
 //! overwrites, and their attention reads keys `p - window + 1 ..= p`, so a sequence continuing
 //! at `P` needs ring rows `P - window + 1 .. P`; the mark keeps the last `window` rows of
-//! every SWA layer in position order (Flash 39 x 128 x 5,120 B = 25.6 MB, Pro 60 layers =
-//! 39.3 MB). With MTP (Flash) it also keeps the last `window + stages + 1` rows of the MTP
+//! every SWA layer in position order, using its selected record bytes. With MTP it
+//! also keeps the last `window + stages + 1` rows of the MTP
 //! hidden ring: `mtp_reset` at the restored length makes every stage recompute its own ring
 //! from them, exactly as after a full prefill (~1 MiB). Rows go back to the same `position %
 //! 256` slots of the new sequence's ring, so the restored ring reads exactly as the captured
@@ -280,18 +280,11 @@ impl PrefixFamily for MimoPrefix<'_, '_> {
     type Placement = MimoPlacement;
 
     fn record_format(&self) -> &'static str {
-        use cuteafd_loader::families::{mimo_v2::MimoKvCache, qwen4::Qwen4KvCache};
         let draft = self.engine.drafter.as_ref().filter(|_| self.draft_metadata.is_some())
             .map(|drafter| drafter.kv_cache);
-        match (self.engine.kv_cache(), draft) {
-            (MimoKvCache::Bf16, None) => "mimo_bf16_swa_bf16_draft_cold_v1",
-            (MimoKvCache::Int8, None) => "mimo_int8_group32_swa_bf16_draft_cold_v1",
-            (MimoKvCache::Bf16, Some(Qwen4KvCache::Bf16)) => "mimo_bf16_swa_bf16_draft_bf16_v1",
-            (MimoKvCache::Int8, Some(Qwen4KvCache::Bf16)) => "mimo_int8_group32_swa_bf16_draft_bf16_v1",
-            (MimoKvCache::Bf16, Some(Qwen4KvCache::Fp8)) => "mimo_bf16_swa_bf16_draft_e4m3_head_f32_planar_v1",
-            (MimoKvCache::Int8, Some(Qwen4KvCache::Fp8)) => "mimo_int8_group32_swa_bf16_draft_e4m3_head_f32_planar_v1",
-        }
+        self.engine.kv_cache().snapshot_record_format(draft)
     }
+
 
     fn layout(&self) -> FamilyLayout {
         FamilyLayout {

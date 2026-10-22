@@ -56,7 +56,7 @@ pub(crate) struct Blocks<'p, 'a> {
 impl Blocks<'_, '_> {
     fn launch(&self, op: &str, capacity: Option<usize>, pointers: &[(&str, *mut c_void)], scalars: &[Scalar]) -> Result<()> {
         let prefix = self.admitted.prefix;
-        let name = match capacity { Some(rows) => format!("{prefix}_{op}_m{rows}"), None => format!("{prefix}_{op}") };
+        let name = cuteafd_loader::placement::families::qwen3_5::program_name(prefix, op, capacity.unwrap_or(0), self.admitted.kv_format);
         let names: Vec<_> = pointers.iter().map(|&(name, _)| name).collect();
         let values: Vec<_> = pointers.iter().map(|&(_, ptr)| ptr).collect();
         let program = self.programs.program(&name, &names)?;
@@ -92,7 +92,7 @@ impl Blocks<'_, '_> {
             }
             HybridAttention::Full => {
                 let kv = kv.ok_or_else(|| anyhow::anyhow!("full GQA lacks admitted records"))?;
-                ensure!(!kv.ptr.is_null() && kv.bytes >= 64 * 2 * self.cfg.kv_heads * self.cfg.head_dim * 2,
+                ensure!(!kv.ptr.is_null() && kv.bytes >= 64 * self.admitted.kv_format.record_bytes(self.cfg.kv_heads, self.cfg.head_dim),
                     "full GQA record pool too small");
                 let tables = if step.table_stride == 0 { 1 } else { step.rows };
                 ensure!(!p.page_table.ptr.is_null() && p.page_table.bytes >= tables * step.table_stride.max(1) * 4,

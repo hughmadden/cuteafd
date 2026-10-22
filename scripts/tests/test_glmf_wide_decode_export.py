@@ -37,7 +37,7 @@ def exporter(monkeypatch):
         monkeypatch.setenv(name, "1")
     monkeypatch.setitem(sys.modules, "_pinned_sparkinfer", types.SimpleNamespace(REVISION="test"))
     package = types.ModuleType("b12x.integration.cuteafd")
-    for name in ("glmf", "glm_ffn", "glm_attention", "glm_indexer", "dsv4_mhc", "glm_sparse_mla", "context_split", "qwen4", "qwen4_gdn", "qwen4_attention", "qwen_dense", "kimi_mla", "kimi_residual", "pointwise"):
+    for name in ("glmf", "glm_ffn", "glm_attention", "glm_indexer", "dsv4_mhc", "glm_sparse_mla", "context_split", "qwen4", "qwen4_gdn", "qwen4_attention", "qwen_dense", "kimi_mla", "kimi_residual", "pointwise", "mimo_attention", "mimo_ffn"):
         module = _Compilers(f"b12x.integration.cuteafd.{name}")
         setattr(package, name, module)
         monkeypatch.setitem(sys.modules, module.__name__, module)
@@ -77,6 +77,24 @@ def test_checkpoint_extent_table_and_head_splits(exporter, geometry, checkpoint,
         exporter.geometry_context(geometry, 0)
 
 
+@pytest.mark.parametrize("split", [False, True])
+def test_mimo_swa_exports_each_record_without_changing_full_formats(exporter, split):
+    make = exporter.mimo_head_split_programs if split else exporter.mimo_programs
+    programs = make(GEOMETRY, 64, 4096, 1048576)
+    calls = {stem: (params, thunk()[3]) for stem, _, params, thunk in programs}
+    assert len(calls) == len(programs)
+    for mode, rows in [("decode", 64), ("prefill", 4096)]:
+        for kind, formats in [("full", [("bf16", ""), ("int8", "_kvint8")]),
+                              ("swa", [("bf16", ""), ("int8", "_kvint8"), ("fp8", "_kvfp8")])]:
+            for fmt, tag in formats:
+                producer = dict(kind=kind, max_rows=rows, fp8_only=mode, kv=fmt)
+                reader = dict(kind=kind, route=mode, max_rows=rows, kv=fmt)
+                assert calls[f"{kind}_producer{tag}_m{rows}"] == (producer, producer)
+                assert calls[f"{kind}_attention{tag}_{mode}_m{rows}"] == (reader, reader)
+        assert f"full_producer_kvfp8_m{rows}" not in calls
+        assert f"full_attention_kvfp8_{mode}_m{rows}" not in calls
+
+
 def test_qwen_fp8_kv_exports_preserve_bf16_and_weight_variants(exporter):
     programs = exporter.qwen4_programs(GEOMETRY, 64, 4096, 262144)
     calls = {stem: thunk()[3] for stem, _, _, thunk in programs}
@@ -102,9 +120,10 @@ def test_dense_qwen_exports_only_native_dense_programs(exporter, norm_dtype, dec
                                              norm_dtype=norm_dtype)
     calls = {stem: (op, params, thunk()) for stem, op, params, thunk in programs}
     caps = set((decode_rows, prefill_rows))
-    assert len(calls) == len(programs) == 3 + 5 * len(caps)
+    assert len(calls) == len(programs) == 3 + 7 * len(caps)
     assert set(calls) == {"norm", "add", "gdn_commit"} | {
-        f"{op}_m{cap}" for cap in caps for op in ("gdn", "attn_producer", "full_gqa", "attn_o", "ffn")}
+        f"{op}_m{cap}" for cap in caps for op in ("gdn", "attn_producer", "full_gqa", "attn_o", "ffn")} | {
+        f"{op}_kv_fp8_m{cap}" for cap in caps for op in ("attn_producer", "full_gqa")}
     for stem, (op, params, call) in calls.items():
         module, function, args, kwargs = call
         assert module == "qwen_dense" and args == (GEOMETRY,)
@@ -113,7 +132,15 @@ def test_dense_qwen_exports_only_native_dense_programs(exporter, norm_dtype, dec
         assert params == {k: str(v) if k == "norm_dtype" else v for k, v in kwargs.items()}
     for cap in caps:
         assert calls[f"gdn_m{cap}"][2][3] == {"max_rows": cap, "norm_dtype": norm_dtype}
+        assert calls[f"attn_producer_m{cap}"][2][3] == {"max_rows": cap}
         assert calls[f"full_gqa_m{cap}"][2][3] == {"max_rows": cap, "max_splits": 32}
+        for op in ("attn_producer", "full_gqa"):
+            expected = {"max_rows": cap, "kv_format": "fp8"}
+            if op == "full_gqa":
+                expected["max_splits"] = 32
+            assert calls[f"{op}_kv_fp8_m{cap}"][2][3] == expected
+            assert "kv_format" not in calls[f"{op}_m{cap}"][1]
+            assert calls[f"{op}_kv_fp8_m{cap}"][1]["kv_format"] == "fp8"
 
 
 def test_glm_declared_static_w8a8_exports_decode_and_prefill(exporter):
