@@ -353,30 +353,31 @@ fn initialize(
     })
 }
 
-pub(crate) fn prepare(
-    snapshot: &Path,
+fn checked_plan(
+    root: &Path,
     catalog: &OfficialV41Catalog,
     assignments: &[cuteafd_loader::placement::SparkAssignment],
     offers: &[Offer],
-) -> Result<PushGroup> {
+    coordinator: Option<&super::push_exl3::CoordinatorRanks>,
+) -> Result<CheckedPlan> {
+    let sparks = assignments.len();
     ensure!(
-        offers.len() == assignments.len(),
+        offers.len() == sparks + coordinator.map_or(0, |c| c.ranks),
         "native push world differs from admission"
     );
     let tensors = catalog.fp8().context("native expert headers absent")?;
-    let (root, _) = cuteafd_loader::push_load::namespace(snapshot)?;
     let mut plans = Vec::new();
-    for (rank, (offer, assignment)) in offers.iter().zip(assignments).enumerate() {
+    for (rank, (offer, assignment)) in offers[..sparks].iter().zip(assignments).enumerate() {
         let layers = assignment
             .slices
             .iter()
             .map(|expected| {
                 let layer = expected.layer as usize;
                 let tensors = tensors.for_layer_metadata(layer)?;
-                let slicing = [Slicing::Padded, tensors.exact_slicing(offers.len())]
+                let slicing = [Slicing::Padded, tensors.exact_slicing(sparks)]
                     .into_iter()
                     .find(|&slicing| {
-                        slice(&tensors, layer, offers.len(), rank, slicing)
+                        slice(&tensors, layer, sparks, rank, slicing)
                             .is_ok_and(|slice| &slice == expected)
                     })
                     .context("native push worker slice differs from admission")?;
@@ -386,7 +387,7 @@ pub(crate) fn prepare(
         let plan = RankPlan::new(
             catalog,
             &layers,
-            offers.len(),
+            sparks,
             rank,
             usize::try_from(assignment.resident_bytes)?,
         )?;
@@ -400,13 +401,25 @@ pub(crate) fn prepare(
         plans.push(plan);
     }
     let mut builder = Builder::new(
-        &root,
+        root,
         offers.iter().map(|offer| offer.arena_bytes).collect(),
     );
     for (rank, plan) in plans.iter().enumerate() {
-        plan.append(&mut builder, catalog, u32::try_from(rank)?, offers.len())?;
+        plan.append(&mut builder, catalog, u32::try_from(rank)?, sparks)?;
     }
-    let checked = builder.finish()?;
+    if let Some(coordinator) = coordinator { (coordinator.append)(&mut builder, catalog, &offers[sparks..])?; }
+    Ok(builder.finish()?)
+}
+
+pub(crate) fn prepare(
+    snapshot: &Path,
+    catalog: &OfficialV41Catalog,
+    assignments: &[cuteafd_loader::placement::SparkAssignment],
+    offers: &[Offer],
+    coordinator: Option<&super::push_exl3::CoordinatorRanks>,
+) -> Result<PushGroup> {
+    let (root, _) = cuteafd_loader::push_load::namespace(snapshot)?;
+    let checked = checked_plan(&root, catalog, assignments, offers, coordinator)?;
     ensure!(
         checked
             .plan

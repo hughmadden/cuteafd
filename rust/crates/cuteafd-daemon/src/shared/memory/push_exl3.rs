@@ -1,7 +1,7 @@
 //! Header-derived EXL3 rank plans shared by startup admission and consumers.
 #[cfg(test)]
 #[path = "push_exl3/tests.rs"]
-mod tests;
+pub(crate) mod tests;
 use super::{weight_arena::ArenaLayout, weight_validation::ValidationLayout};
 use anyhow::{ensure, Context, Result};
 use cuteafd_core::SparkSlice;

@@ -3474,3 +3474,20 @@ def test_namespace_root_and_push_endpoint_reach_both_serving_roles(tmp_path):
             assert f"{hf}/hub/models--zai-org--GLM-5.3-Flash/snapshots/abc" in line
     assert result.stderr.count("CUTEAFD_PUSH_SOCKET=@isolated-push") >= 2
     assert f"--snapshot '{hf}/hub/models--zai-org--GLM-5.3-Flash/snapshots/abc'" in result.stderr
+
+
+@pytest.mark.parametrize("format", ["native", "fp8", "exlr8"])
+def test_push_group_appends_coordinator_suffix_before_one_finish_and_upload(format: str) -> None:
+    source = (ROOT / f"rust/crates/cuteafd-daemon/src/shared/memory/push_{format}.rs").read_text()
+    plan = source.split("fn checked_plan(", 1)[1].split("pub(crate) fn prepare(", 1)[0]
+    prepare = source.split("pub(crate) fn prepare(", 1)[1]
+    assert "let sparks = assignments.len();" in plan
+    assert "offers[sparks..]" in plan
+    assert plan.count("builder.finish()?") == 1
+    assert plan.index("plan.append(") < plan.index("(coordinator.append)") < plan.index("builder.finish()?")
+    assert "offers.len()" not in plan.split("let mut plans", 1)[1]
+    assert prepare.count("checked_plan(") == 1
+    assert prepare.count(".create(") == 1
+    assert prepare.count("checked.upload(&group)?") == 1
+    assert "builder.finish(" not in prepare
+    assert prepare.index("checked_plan(") < prepare.index(".create(") < prepare.index("checked.upload(")
