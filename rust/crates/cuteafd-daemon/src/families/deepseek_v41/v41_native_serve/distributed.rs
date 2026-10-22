@@ -268,6 +268,10 @@ pub(super) fn worker(args: crate::cli::NativeServeArgs, mut receive: mpsc::Recei
     if args.tp2_attention { second.enable_dual_attention()?; }
     pass.install_attention_plan(attention_plan)?;
     second.install_attention_plan(attention_plan)?;
+    if let Some(budget) = args.l2.budget(&lib, crate::shared::l2_prefetch::OTHER_DEFAULT)? {
+        pass.enable_l2_prefetch(budget)?;
+        second.enable_l2_prefetch(budget)?;
+    }
     memory_checkpoint("second target lane")?;
     // dSpark is admitted before it exists (#65): plan every retained owner from
     // the native plans and AOT packages, sample with no draft allocation, solve

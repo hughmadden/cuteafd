@@ -252,6 +252,37 @@ def test_v41_fp8_head_key_reaches_planner_and_coordinator(tmp_root, monkeypatch,
         assert "CUTEAFD_V41_FP8_HEAD" not in parse_run(worker["argv"])["env"]
 
 
+@pytest.mark.parametrize("value", [None, "off", "auto", "48", "on"])
+def test_v41_l2_prefetch_key_reaches_only_the_coordinator_command(tmp_root, monkeypatch, value) -> None:
+    """L2_PREFETCH=off|auto|MiB becomes serve-native --l2-prefetch VALUE; unset passes
+    nothing (the engine default, off); other values fail before any container."""
+    import v41_launch_capture as capture_module
+
+    original = capture_module.example_config
+
+    def with_key(name, directory):
+        config = original(name, directory)
+        if value is not None:
+            config.write_text(config.read_text() + f"L2_PREFETCH={value}\n")
+        return config
+
+    monkeypatch.setattr(capture_module, "example_config", with_key)
+    if value == "on":
+        with pytest.raises(RuntimeError, match=r"L2_PREFETCH must be off, auto or a MiB count"):
+            capture_module.capture(ROOT, "deepseek-v41-mxfp4-max")
+        return
+    result = capture_module.capture(ROOT, "deepseek-v41-mxfp4-max")
+    command = parse_run(result["containers"][0]["argv"])["command"]
+    if value is None:
+        assert "--l2-prefetch" not in command
+    else:
+        assert command[command.index("--l2-prefetch") + 1] == value
+        assert command.count("--l2-prefetch") == 1
+    assert not any("l2-prefetch" in arg for plan in result["plans"] for arg in plan)
+    for worker in result["containers"][1:]:
+        assert not any("l2-prefetch" in arg or "L2_PREFETCH" in arg for arg in worker["argv"])
+
+
 def test_v41_rejects_kv_cache_as_an_unused_key(tmp_root, monkeypatch) -> None:
     """V4.1 has no KV-precision flag. KV_CACHE is a hard error before any container."""
     import v41_launch_capture as capture_module
