@@ -909,7 +909,17 @@ struct Checkpoint {
 /// Reads the drafter's safetensors file on a thread (while the target loads).
 pub(crate) fn prefetch(snapshot: &Path) -> std::thread::JoinHandle<std::io::Result<Vec<u8>>> {
     let path = snapshot.join("model.safetensors");
-    std::thread::spawn(move || std::fs::read(path))
+    std::thread::spawn(move || {
+        tracing::info!("drafter checkpoint read started");
+        let started = std::time::Instant::now();
+        let result = std::fs::read(path);
+        let seconds = started.elapsed().as_secs_f64();
+        let bytes = result.as_ref().map_or(0, Vec::len);
+        tracing::info!(bytes, elapsed_ms = seconds * 1000.0,
+            gb_per_second = bytes as f64 / seconds.max(f64::MIN_POSITIVE) / 1e9,
+            success = result.is_ok(), "drafter checkpoint read finished");
+        result
+    })
 }
 
 impl Checkpoint {
