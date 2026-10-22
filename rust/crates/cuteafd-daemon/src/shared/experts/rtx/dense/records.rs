@@ -133,6 +133,19 @@ impl Finish {
             Finish::ScaleGather { grid, .. } => grid.device_id }
     }
 
+    /// [`Self::run`], then drained; a failed drain quarantines the module so
+    /// its operands (and any index scratch) outlive the unproved work.
+    pub fn run_drained(&self, library: &NativeLibrary, stream: *mut c_void) -> Result<()> {
+        let ran = self.run(library, stream);
+        // SAFETY: `stream` is this GPU's load stream, live for the call.
+        if let Err(drain) = unsafe { library.cuda_stream_synchronize(stream) } {
+            library.quarantine_module_after_failed_drain();
+            let error = ran.err().unwrap_or_else(|| anyhow::anyhow!("load finish completion failed"));
+            return Err(error.context(format!("load owners and native module quarantined after a failed drain: {drain}")));
+        }
+        ran
+    }
+
     /// On the current device (`device`), on `stream` (the caller drains).
     pub fn run(&self, library: &NativeLibrary, stream: *mut c_void) -> Result<()> {
         match *self {
@@ -187,6 +200,22 @@ impl Step {
     /// gather (expert and W8A16 packs) first copy the step into `scratch`, a
     /// [`STEP_BYTES`] device buffer allocated on first use.
     pub fn run<'l>(&self, kernels: &mut LoadKernels<'_>, library: &'l NativeLibrary, staged: &[u8], stream: *mut c_void,
+        scratch: &mut Option<crate::shared::memory::DeviceAllocation<'l>>) -> Result<()> {
+        let ran = self.run_jobs(kernels, library, staged, stream, scratch);
+        if let Err(error) = ran {
+            // A failed job may leave queued work reading the staging or scratch:
+            // drain it, or quarantine so every owner outlives that work.
+            // SAFETY: `stream` is this GPU's load stream, live for the call.
+            if let Err(drain) = unsafe { library.cuda_stream_synchronize(stream) } {
+                library.quarantine_module_after_failed_drain();
+                return Err(error.context(format!("load owners and native module quarantined after a failed drain: {drain}")));
+            }
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    fn run_jobs<'l>(&self, kernels: &mut LoadKernels<'_>, library: &'l NativeLibrary, staged: &[u8], stream: *mut c_void,
         scratch: &mut Option<crate::shared::memory::DeviceAllocation<'l>>) -> Result<()> {
         ensure!(staged.len() >= self.bytes(), "step staging is short");
         let mut on_device = None;
@@ -428,12 +457,7 @@ impl Records {
     pub fn run_finishes(&self, library: &NativeLibrary, stream: impl Fn(i32) -> *mut c_void) -> Result<()> {
         for finish in &self.finishes {
             let device = Device { library, id: finish.device() };
-            device.run(|| {
-                let stream = stream(finish.device());
-                finish.run(library, stream)?;
-                // SAFETY: the finish's buffers are live operand allocations.
-                unsafe { library.cuda_stream_synchronize(stream) }
-            })?;
+            device.run(|| finish.run_drained(library, stream(finish.device())))?;
         }
         Ok(())
     }
@@ -498,11 +522,7 @@ impl<'a> DenseLoad<'a> {
         if let Some(sink) = &self.sink { sink.finish(finish); return Ok(()); }
         if recorded(|r| r.finishes.push(finish.clone())) { return Ok(()); }
         let device = Device { library: self.library, id: finish.device() };
-        device.run(|| {
-            finish.run(self.library, stream)?;
-            // SAFETY: the finish's buffers are live operand allocations.
-            unsafe { self.library.cuda_stream_synchronize(stream) }
-        })
+        device.run(|| finish.run_drained(self.library, stream))
     }
 
     /// Releases the mount runner's pinned staging (after the load).
