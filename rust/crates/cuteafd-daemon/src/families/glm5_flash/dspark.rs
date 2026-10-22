@@ -39,6 +39,35 @@ pub(crate) use crate::shared::speculation::block_dspark::{
     is_dspark, check_checkpoint, prefetch, DsparkConfig, DsparkDrafter, MAX_SEQUENCES,
 };
 
+/// A drafter checkpoint read started ahead of the routed-expert load.
+///
+/// [`Drafter::load`] reads the drafter's snapshot inline, after the expert
+/// packages: the 2.3 GB read then adds its whole duration to readiness. The
+/// caller starts it here instead (before the expert load) and hands the handle
+/// to [`Drafter::load`], which joins it, so the read runs under the exchange.
+pub(crate) enum DraftRead {
+    Dspark(std::thread::JoinHandle<Result<std::collections::HashMap<String, Vec<u8>>>>),
+    Dflash(std::thread::JoinHandle<std::io::Result<Vec<u8>>>),
+}
+
+impl DraftRead {
+    /// Starts reading the drafter snapshot `snapshot` names (the family's
+    /// `prefetch` for whichever drafter it holds).
+    pub(crate) fn start(snapshot: &Path) -> Result<Self> {
+        Ok(if is_dspark(snapshot)? { Self::Dspark(prefetch(snapshot)) }
+            else { Self::Dflash(crate::shared::speculation::dflash::prefetch(snapshot)) })
+    }
+
+    /// The DFlash2 file bytes, for a read started with [`Self::start`]; errors
+    /// when the snapshot is a dSpark drafter.
+    pub(crate) fn join_dflash(self) -> Result<Vec<u8>> {
+        match self {
+            Self::Dflash(handle) => Ok(handle.join().map_err(|_| anyhow::anyhow!("drafter read panicked"))??),
+            Self::Dspark(_) => anyhow::bail!("the drafter read was started for dSpark, not DFlash2"),
+        }
+    }
+}
+
 /// The GLM 5.3 Flash drafter: DFlash2 or dSpark, behind one interface the
 /// engine (taps), the serve loop and glmf-golden use.
 pub(crate) enum Drafter<'a> {
@@ -84,15 +113,15 @@ impl<'a> Drafter<'a> {
     #[allow(clippy::too_many_arguments)]
     pub fn load(library: &'a NativeLibrary, snapshot: &Path, stream: *mut c_void, slots: usize, sequences: usize,
         embedding: &TokenEmbedding<'_>, hidden: usize, vocab: usize, layers: usize,
-        representation: GlmDraftRepresentation, scales: fp8_linear::Fp8Scales, fp8_rows: fp8_linear::Fp8Rows, kv_cache: cuteafd_loader::families::qwen4::Qwen4KvCache)
+        representation: GlmDraftRepresentation, scales: fp8_linear::Fp8Scales, fp8_rows: fp8_linear::Fp8Rows, kv_cache: cuteafd_loader::families::qwen4::Qwen4KvCache, read: DraftRead)
         -> Result<Self> {
-        if is_dspark(snapshot)? {
+        if let DraftRead::Dspark(handle) = read {
             let cfg = DsparkConfig::read(snapshot)?;
             ensure!(cfg.hidden == hidden && cfg.vocab == vocab && cfg.taps.iter().all(|&l| l < layers),
                 "the dSpark drafter does not fit this target");
             let mask = embedding.host_rows(&[cfg.mask_token])?;
             tracing::info!(mask_source = "target mask_token row", mask_token = cfg.mask_token, "drafter mask source");
-            let tensors = prefetch(snapshot).join().map_err(|_| anyhow::anyhow!("drafter read panicked"))??;
+            let tensors = handle.join().map_err(|_| anyhow::anyhow!("drafter read panicked"))??;
             return Ok(Self::Dspark(DsparkDrafter::load(library, snapshot, tensors, stream, slots,
                 sequences.min(MAX_SEQUENCES), mask, representation, scales, fp8_rows, kv_cache)?));
         }
@@ -101,8 +130,7 @@ impl<'a> Drafter<'a> {
             "the DFlash2 drafter does not fit this target");
         let mask = embedding.host_rows(&[cfg.mask_token])?;
         tracing::info!(mask_source = "target mask_token row", mask_token = cfg.mask_token, "drafter mask source");
-        let file = crate::shared::speculation::dflash::prefetch(snapshot).join()
-            .map_err(|_| anyhow::anyhow!("drafter read panicked"))??;
+        let file = read.join_dflash()?;
         Ok(Self::Dflash2(crate::shared::speculation::dflash::DflashDrafter::load(library, snapshot, file, stream, slots,
             sequences, mask, true, representation, scales, fp8_rows, kv_cache)?))
     }
