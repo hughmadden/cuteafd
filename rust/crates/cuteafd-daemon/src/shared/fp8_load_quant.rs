@@ -53,6 +53,15 @@ pub(crate) struct Target {
     pub kmajor: Option<(usize, usize)>,
 }
 
+/// A scale source already read into bounded pinned staging, and its admitted
+/// final coded plane. Gate/up sources have distinct tensor names and row bases.
+pub(crate) struct ScaleCodeTarget<'a> {
+    pub source: cuteafd_loader::formats::scale_codes::Rows<'a>,
+    pub destination: CuteafdDeviceBuffer,
+    pub stored_rows: usize,
+    pub start_row: usize,
+}
+
 /// One load's pinned source (mount reads) and the load kernels, reused across tensors.
 pub(crate) struct GpuQuantizer<'a> {
     source: Option<HostAllocation<'a>>,
@@ -176,6 +185,57 @@ impl<'a> LoadKernels<'a> {
             self.library.fp8_load_quant(jobs_ptr.cast(), units, stream)?;
             self.library.cuda_stream_synchronize(stream)
         }
+    }
+
+    /// GPU span-check and nibble pack from bounded mapped-host source bytes.
+    /// The stream always drains before the job table/source can be reused.
+    pub fn scale_codes_from(&mut self, targets: &[ScaleCodeTarget<'_>], stream: *mut c_void) -> Result<()> {
+        use cuteafd_ffi::V41ScaleCodeJob;
+        use cuteafd_loader::formats::scale_codes::{plane_bytes, ScaleCodeError};
+        ensure!(!targets.is_empty(), "no scale-code source rectangles");
+        let bytes = 8usize.checked_add(targets.len().checked_mul(std::mem::size_of::<V41ScaleCodeJob>())
+            .context("scale-code job table overflow")?).context("scale-code job table overflow")?;
+        Self::grow(self.library, &mut self.tables, bytes, "staging/scale-code-jobs")?;
+        let table = self.tables.as_mut().context("scale-code job table")?;
+        table.bytes_mut()[..8].copy_from_slice(&u64::MAX.to_le_bytes());
+        let jobs = table.bytes_mut()[8..].as_mut_ptr().cast::<V41ScaleCodeJob>();
+        for (index, target) in targets.iter().enumerate() {
+            let source = target.source;
+            ensure!(source.rows > 0 && source.columns > 0 && source.pitch >= source.columns
+                && target.stored_rows % 256 == 0
+                && target.start_row.checked_add(source.rows).is_some_and(|n| n <= target.stored_rows)
+                && (source.rows - 1).checked_mul(source.pitch).and_then(|n| n.checked_add(source.columns))
+                    .is_some_and(|n| n <= source.bytes.len())
+                && plane_bytes(target.stored_rows, source.columns) == Some(target.destination.bytes),
+                "{}: invalid scale-code job geometry", source.tensor);
+            // SAFETY: mapped pinned job storage was sized for all targets above;
+            // the source and admitted output remain live through the drain below.
+            unsafe { jobs.add(index).write(V41ScaleCodeJob {
+                source: source.bytes.as_ptr(), destination: target.destination.ptr.cast(),
+                source_bytes: source.bytes.len() as u64, destination_bytes: target.destination.bytes as u64,
+                pitch: source.pitch as u64, rows: u32::try_from(source.rows)?, columns: u32::try_from(source.columns)?,
+                stored_rows: u32::try_from(target.stored_rows)?, start_row: u32::try_from(target.start_row)?,
+            }); }
+        }
+        // SAFETY: the tables and all source/output buffers are live and mapped;
+        // draining even an enqueue failure prevents staging reuse racing a GPU.
+        let submitted = unsafe { self.library.v41_pack_scale_codes_async(jobs, targets.len(),
+            table.buffer.ptr.cast::<u64>(), stream) };
+        let drained = unsafe { self.library.cuda_stream_synchronize(stream) };
+        if drained.is_err() { self.library.quarantine_module_after_failed_drain(); }
+        drained?;
+        submitted?;
+        let error = u64::from_le_bytes(table.bytes()[..8].try_into().unwrap());
+        if error != u64::MAX {
+            let target = targets.get((error >> 32) as usize).context("invalid scale-code refusal job")?;
+            let row = error as u32 as usize;
+            ensure!(row < target.source.rows, "invalid scale-code refusal row");
+            let values = &target.source.bytes[row * target.source.pitch..row * target.source.pitch + target.source.columns];
+            let span = values.iter().max().unwrap() - values.iter().min().unwrap();
+            return Err(ScaleCodeError::Span { tensor: target.source.tensor.into(),
+                row: target.source.first_row + row, span }.into());
+        }
+        Ok(())
     }
 
     /// BF16 `source` (pinned, device-visible) widened to F32 into `dst`.

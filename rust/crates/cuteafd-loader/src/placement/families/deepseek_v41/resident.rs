@@ -46,7 +46,8 @@ impl Fp8Head {
 /// slice. This applies to full RTX experts and each independently packed TP
 /// Spark/RTX slice; dividing a full layer's bytes misses TP4's 576->640 pad.
 pub fn native_expert_bytes(experts: u64, hidden: u64, intermediate: u64) -> u64 {
-    experts * hidden * intermediate.div_ceil(128) * 128 * 51 / 32
+    crate::formats::scale_codes::expert_bytes(experts, hidden, intermediate)
+        .expect("validated V4.1 coded expert geometry")
 }
 
 /// NVFP4 native planes mirror `Nvfp4Side::plane_sizes`: fused FC1, FC2,
@@ -264,7 +265,7 @@ mod tests {
 
     #[test]
     fn snapshot_and_expert_placement_keep_physical_owners() {
-        assert_eq!(native_expert_bytes(384, 5120, 576), 2_005_401_600);
+        assert_eq!(native_expert_bytes(384, 5120, 576), 1_948_876_800);
         let one = prefix_bytes(20, true, 1);
         let two = prefix_bytes(20, true, 2);
         assert_eq!(one[0], two.iter().sum::<u64>());
@@ -277,7 +278,8 @@ mod tests {
     fn tp3_and_tp6_charge_whole_native_and_nvfp4_planes() {
         for (tp, width) in [(3, 768), (6, 384)] {
             let native = native_expert_bytes(384, 5120, width);
-            assert_eq!(native * tp, native_expert_bytes(384, 5120, 2304));
+            // FC2 carries one row base on every rank; gate/up bases partition.
+            assert_eq!(native * tp, native_expert_bytes(384, 5120, 2304) + (tp - 1) * 384 * 5120);
             let nvfp4 = nvfp4_expert_bytes(384, 5120, width);
             assert_eq!(nvfp4, 384 * (3 * 5120 * width * 9 / 16 + 16));
             assert_eq!(nvfp4 * tp, nvfp4_expert_bytes(384, 5120, 2304) + (tp - 1) * 384 * 16);
