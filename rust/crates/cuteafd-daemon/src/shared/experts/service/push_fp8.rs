@@ -78,11 +78,11 @@ pub(super) fn load<'a>(
         Ok((plan, checked, offer))
     })();
     if let Err(error) = &planned {
-        tracing::info!(%error, "Spark native push unavailable; offering mount");
+        tracing::warn!(%error, "Spark native push unavailable; offering mount");
     }
-    let credentials = push::offer(
+    let credentials = push::offer_with(
         stream,
-        planned.as_ref().ok().map(|(_, _, offer)| offer.clone()),
+        planned.as_ref().map(|(_, _, offer)| offer.clone()).map_err(|error| format!("{error:#}")),
     )?;
     let Some((group, token)) = credentials else {
         return Ok(None);
@@ -133,7 +133,7 @@ fn receive<'a>(
         })?;
         Ok((arena, ring, rank))
     })();
-    push::joined(stream, joined.is_ok())?;
+    push::joined_with(stream, joined.as_ref().map(|_| ()).map_err(|error| format!("{error:#}")))?;
     let candidate = joined.and_then(|(arena, ring, rank)| {
         let delivered = push_consumer::consume(device, arena, ring, rank, DEFAULT_SLOTS)?;
         let initializers = plan
@@ -177,9 +177,9 @@ fn receive<'a>(
             .collect::<Result<Vec<_>>>()
     });
     if let Err(error) = &candidate {
-        tracing::info!(group, rank = rank_id, %error, "Spark native push candidate rejected");
+        tracing::warn!(group, rank = rank_id, %error, "Spark native push candidate rejected");
     }
-    if push::completed(stream, candidate.is_ok())? {
+    if push::completed_with(stream, candidate.as_ref().map(|_| ()).map_err(|error| format!("{error:#}")))? {
         let layers = candidate?;
         tracing::info!(
             group,

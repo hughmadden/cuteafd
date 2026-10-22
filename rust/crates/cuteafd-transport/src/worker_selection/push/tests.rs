@@ -38,6 +38,23 @@ fn absent_rank_or_rejected_plan_uses_mount_without_joining() -> Result<()> {
 }
 
 #[test]
+fn fallback_records_every_failing_rank_and_its_own_cause() -> Result<()> {
+    let pairs = (0..3).map(|_| pair()).collect::<Result<Vec<_>>>()?;
+    let (mut clients, servers): (Vec<_>, Vec<_>) = pairs.into_iter().unzip();
+    let jobs = servers.into_iter().enumerate().map(|(rank, mut stream)| thread::spawn(move || -> Result<()> {
+        let offered = if rank == 0 { Ok(rank_offer(rank)) } else { Err(format!("fixture cause {rank}")) };
+        assert!(offer_with(&mut stream, offered)?.is_none());
+        Ok(())
+    })).collect::<Vec<_>>();
+    let outcome = coordinate_outcome(&mut clients, |_| unreachable!("an absent offer never prepares"))?;
+    for job in jobs { job.join().unwrap()?; }
+    let cuteafd_core::push_outcome::Outcome::Fallback { group: None, failures } = outcome
+        else { panic!("fallback not reported: {outcome:?}") };
+    assert_eq!(failures, [(1, "no push offer: fixture cause 1".to_string()), (2, "no push offer: fixture cause 2".to_string())]);
+    Ok(())
+}
+
+#[test]
 fn commit_waits_for_every_initialized_rank_and_retry_waits_for_owner_drops() -> Result<()> {
     for failure in 0..4 {
         let directory = tempfile::tempdir()?;
