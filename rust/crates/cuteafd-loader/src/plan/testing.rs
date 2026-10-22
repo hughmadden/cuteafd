@@ -23,8 +23,26 @@ pub fn write_kimi_tokenizer(snapshot: &Path) {
 
 /// Real Kimi geometry with one sparse shard per layer, below the header limit.
 pub fn write_kimi_snapshot(dir: &Path, all: bool) {
-    let mut shards = std::collections::BTreeMap::<usize, Vec<Tensor>>::new();
+    write_kimi_tensors(dir, kimi_k3_tensors(all));
+}
+
+/// Sparse K6 header fixture only, not a numerically quantized checkpoint.
+/// The payload is intentionally unsuitable for layer-forward qualification.
+pub fn write_kimi_core_snapshot(dir: &Path, all: bool) {
+    let mut tensors = Vec::new();
     for tensor in kimi_k3_tensors(all) {
+        if let Some(stem) = tensor.0.strip_suffix(".weight").filter(|stem|
+            crate::families::kimi_k3::core::split(stem).is_some()) {
+            let n = if stem.ends_with(".kv_a_proj_with_mqa") { tensor.2[0].next_multiple_of(128) } else { tensor.2[0] };
+            tensors.extend(exl3(stem, n, tensor.2[1], 6));
+        } else { tensors.push(tensor); }
+    }
+    write_kimi_tensors(dir, tensors);
+}
+
+fn write_kimi_tensors(dir: &Path, tensors: Vec<Tensor>) {
+    let mut shards = std::collections::BTreeMap::<usize, Vec<Tensor>>::new();
+    for tensor in tensors {
         let shard = tensor.0.split(".layers.").nth(1)
             .and_then(|tail| tail.split('.').next())
             .and_then(|layer| layer.parse::<usize>().ok()).map_or(0, |layer| layer + 1);
@@ -847,4 +865,68 @@ pub fn kimi_k3_tensors(all: bool) -> Vec<Tensor> {
     out.push(t("vision_tower.encoder.blocks.0.wqkv.weight", "BF16", &[1536, 1024]));
     out.push(t("mm_projector.proj.0.weight", "BF16", &[4096, 4096]));
     out
+}
+
+/// CPU-only installed package fixture; no native objects are executed.
+pub fn write_kimi_installed_inventory(root: &std::path::Path, spark: bool) -> std::path::PathBuf {
+    use serde_json::json;
+    let lock: serde_json::Value = serde_json::from_str(include_str!(concat!(env!("CARGO_MANIFEST_DIR"),
+        "/../../../third_party/sparkinfer.lock.json"))).unwrap();
+    let revision = lock["revision"].as_str().unwrap();
+    let mut programs = Vec::new();
+    for (name, geometry) in [
+        ("kimik3_router_scores", json!({"hidden":7168,"experts":896,"top_k":16})),
+        ("kimik3_expert_input_quant", json!({"hidden":3584})),
+        ("kimik3_latent_down", json!({"width":7168,"outputs":3584})),
+        ("kimik3_latent_up", json!({"width":3584,"outputs":7168})),
+        ("kimik3_rmsnorm_h3584", json!({"hidden":3584})),
+    ] {
+        if !spark { programs.push(json!({"name":name,"geometry":geometry,"object_sha256":"b".repeat(64)})); }
+    }
+    if !spark {
+        for (name, bytes) in [("kimik3_kda_m64", 8_673_280), ("kimik3_kda_m4096", 629_464_064)] {
+            programs.push(json!({"name":name,"scratch_bytes_at_capacity":{"scratch":bytes}}));
+        }
+        for (suffix, producer, output, attention) in [("",92_798_976,100_663_296,50_528_256),
+            ("_h96",168_296_448,201_326_592,101_056_512)] {
+            for rows in [64,4096] {
+                for (prefix, bytes) in [("mla_producer",producer), ("mla_output",output)] {
+                    programs.push(json!({"name":format!("kimik3_{prefix}{suffix}_m{rows}"),
+                        "scratch_bytes_at_capacity":{"scratch":bytes}}));
+                }
+            }
+            for (mode, rows, bytes) in [("decode",64,attention),("verify",64,attention),("extend",4096,0)] {
+                programs.push(json!({"name":format!("kimik3_dense_mla_{mode}{suffix}_m{rows}"),
+                    "scratch_bytes_at_capacity":{"scratch":bytes}}));
+            }
+        }
+    }
+    std::fs::create_dir_all(root.join("share")).unwrap();
+    let path = root.join("share/PROGRAMS.json");
+    std::fs::write(&path, json!({"schema":1,"sparkinfer_revision":revision,"programs":programs}).to_string()).unwrap();
+    let package = root.join("lib/exl3/exl3-kimik3-k23");
+    let layouts = if spark { (0..6).map(|r| (format!("tp6-rank{r}"), 512)).collect::<Vec<_>>() }
+        else { vec![("rtx-tp1".into(), 3072), ("rtx-tp2".into(), 1536)] };
+    let mut variants = Vec::new();
+    for (layout, intermediate) in layouts {
+        for capacity in [1, 80, 256, 1024, 4096] {
+            let directory = format!("{layout}/m{capacity}");
+            let meta = json!({"directory":directory,"capacity":capacity,"intermediate":intermediate,
+                "experts":896,"top_k":16,"bits":[2,3],"output_dtype":if spark {"bf16"} else {"fp32"},
+                "hidden":3584,"activation":"situ","descriptor_bits":10,"sparkinfer_revision":revision,
+                "trellis_lut":{"bytes":4096},"buffers":{"scratch":{"allocation":"scratch",
+                    "bytes":capacity * 4096,"dtype":"f32","zero_on_create":false}}});
+            let target = package.join(&directory);
+            std::fs::create_dir_all(target.join("routes")).unwrap();
+            std::fs::write(target.join("v41_exl3.json"), meta.to_string()).unwrap();
+            for file in ["libcuteafd_exl3.so", "routes/libv41_exl3_routes.so", "trellis_lut.bin"] {
+                std::fs::write(target.join(file), []).unwrap();
+            }
+            variants.push(meta);
+        }
+    }
+    std::fs::write(package.join("manifest.json"), json!({"schema":"cuteafd.exl3-package.v1",
+        "geometry":"kimik3","role":if spark {"spark"} else {"coordinator"},
+        "sparkinfer_revision":revision,"variants":variants}).to_string()).unwrap();
+    path
 }

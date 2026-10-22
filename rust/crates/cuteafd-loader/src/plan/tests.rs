@@ -814,7 +814,7 @@ fn malformed_trellis_and_scales_name_the_tensor() {
         (detect_group("p", &[("trellis", "I16", &[4, 2, 48]), ("suh", "F16", &[64]), ("svh", "F16", &[32])]),
             "p.trellis", "3INST codebook"),
         (detect_group("p", &[("trellis", "I16", &[4, 2, 48]), ("suh", "F16", &[64]), ("svh", "F16", &[32]),
-            ("mul1", "I32", &[])]), "p.mul1", "MUL1 codebook"),
+            ("mul1", "I32", &[]), ("mcg", "I32", &[])]), "p.mul1", "multiple EXL3 codebook markers"),
         (detect_group("p", &[("trellis", "I16", &[4, 2, 48]), ("su", "I16", &[4]), ("sv", "I16", &[2]),
             ("mcg", "I32", &[])]), "p.su", "packed EXL3 sign bitfield"),
         (detect_group("p", &[("trellis", "I16", &[4, 2, 48]), ("suh", "F16", &[64]), ("mcg", "I32", &[])]),
@@ -2174,7 +2174,7 @@ fn glm5_flash_layout_charges_the_wide_decode_rows() {
         let engine = glmf_step_workspaces(&cfg, 2, rows, decode_rows, &shape,
             glmf_step_scratch(&lookup, &cfg, Default::default(), decode_rows, true).unwrap(),
             glmf_step_scratch(&lookup, &cfg, Default::default(), rows, false).unwrap()).device_bytes();
-        let intake = crate::serving_capacity::glmf_spark_intake_bytes(2, 4, intake_rows, 4096);
+        let intake = crate::serving_capacity::spark_intake_bytes(2, 4, intake_rows, 4096);
         assert_eq!(intake, 2 * 4 * intake_rows * 4096 * 2);
         assert_eq!(item(&lane(rows, decode_rows), "steps"), Some((Category::Workspace, engine, Basis::Formula)),
             "{rows} prefill rows, {decode_rows} decode rows");

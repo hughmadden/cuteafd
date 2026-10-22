@@ -18,8 +18,9 @@ pub(crate) struct ServeArgs {
     #[arg(long, value_delimiter = ',')] pub peers: Vec<SocketAddr>,
     /// Auto admission grows beyond the selected context floor while memory allows.
     #[arg(long)] pub pool_tokens: Option<u64>,
-    /// Native allocation extent and API ceiling; defaults to 512K within the compiled 1M capacity.
-    #[arg(long, default_value_t = DEFAULT_CONTEXT)] pub max_context: usize,
+    /// Native allocation extent and API ceiling; unset takes the checkpoint core's
+    /// default (the compiled 1M for a K6 core, 512K for a BF16 core).
+    #[arg(long)] pub max_context: Option<usize>,
     #[arg(long, default_value = "auto")] pub rtx_expert_layers: cuteafd_loader::placement::Onboard,
     /// Complete per-rank allocation ceiling, estimated until the first worker census.
     #[arg(long)] pub spark_budget_gib: Option<f64>,
@@ -41,8 +42,14 @@ pub(crate) struct ServeArgs {
 }
 
 impl ServeArgs {
-    fn api_limits(&self, compiled_context: usize) -> Result<NativeLimits> {
-        NativeLimits::new(u32::try_from(self.max_context.min(compiled_context))?, self.max_output)
+    /// `admitted` is the engine's resolved context extent (the explicit
+    /// --max-context, else the checkpoint core's default).
+    fn api_limits(&self, admitted: usize) -> Result<NativeLimits> {
+        NativeLimits::new(u32::try_from(self.max_context.unwrap_or(admitted).min(admitted))?, self.max_output)
+    }
+
+    fn max_context(&self, core: &cuteafd_loader::families::kimi_k3::core::CoreInventory) -> usize {
+        self.max_context.unwrap_or_else(|| cuteafd_loader::families::kimi_k3::default_context(core))
     }
 
     fn validate(&self) -> Result<()> {
@@ -50,7 +57,8 @@ impl ServeArgs {
             "Kimi serving requires two distinct coordinator devices");
         ensure!(self.peers.len() == 6 && self.peers.iter().collect::<std::collections::HashSet<_>>().len() == 6,
             "Kimi serving requires six distinct real Spark endpoints");
-        ensure!((1..=COMPILED_CONTEXT).contains(&self.max_context), "Kimi context exceeds the compiled 1M extent");
+        ensure!(self.max_context.is_none_or(|context| (1..=COMPILED_CONTEXT).contains(&context)),
+            "Kimi context exceeds the compiled 1M extent");
         ensure!(self.spark_budget_gib.is_none_or(|gib| gib.is_finite() && gib > 0.0),
             "Kimi requires a finite positive estimated --spark-budget-gib");
         ensure!(self.prefix.prefix_partial == crate::shared::prefix::Toggle::Off,
@@ -100,7 +108,8 @@ pub(crate) async fn run(args: ServeArgs) -> Result<()> {
                 devices: [worker_args.device, worker_args.split_device], native_lib: &worker_args.native_lib,
                 peers: worker_args.peers.clone(), rtx_expert_layers: worker_args.rtx_expert_layers,
                 spark_budget_gib: worker_args.spark_budget_gib,
-                rows: 4096, slots, marks, max_context: worker_args.max_context,
+                rows: 4096, slots, marks,
+                max_context: worker_args.max_context(&cuteafd_loader::plan::families::kimi::core_inventory(&checkpoint)?),
                 pool_tokens: worker_args.pool_tokens.filter(|&tokens| tokens > 0), graphs: true,
                 ffn_mode: cuteafd_ffi::KimiFfnMode::default(), hosted_layers: None, draft,
             })?;
@@ -193,7 +202,17 @@ mod tests {
         let peers = "127.0.0.1:1,127.0.0.1:2,127.0.0.1:3,127.0.0.1:4,127.0.0.1:5,127.0.0.1:6";
         let defaults = args(&["--peers", peers])?;
         defaults.validate()?;
-        assert_eq!(defaults.max_context, 524_288);
+        // Unset follows the checkpoint core: 1M for a header-native K6 core, 512K for BF16.
+        assert_eq!(defaults.max_context, None);
+        let bf16 = cuteafd_loader::families::kimi_k3::core::CoreInventory::default();
+        assert_eq!(defaults.max_context(&bf16), DEFAULT_CONTEXT);
+        let mut k6 = bf16.clone();
+        let head = "language_model.lm_head".to_owned();
+        k6.projections.insert(head.clone(), cuteafd_loader::families::kimi_k3::core::CoreProjection { stem: head,
+            bits: 6, codebook: cuteafd_loader::formats::exl3_storage::Exl3Codebook::Mcg, shape: [163840, 7168],
+            stored_outputs: 163840, split: cuteafd_loader::families::kimi_k3::core::CoreSplit::Whole, source_bytes: 0 });
+        assert_eq!(defaults.max_context(&k6), COMPILED_CONTEXT);
+        assert_eq!(args(&["--peers", peers, "--max-context", "524288"])?.max_context(&k6), 524_288);
         assert_eq!(defaults.kv_cache, cuteafd_core::MlaCacheFormat::Fp8);
         assert_eq!(cuteafd_loader::plan::layout::LayoutOptions::default().mla_kv, defaults.kv_cache);
         assert_eq!(args(&["--peers", peers, "--kv-cache", "bf16"])?.kv_cache, cuteafd_core::MlaCacheFormat::Bf16);
@@ -201,9 +220,11 @@ mod tests {
         assert!(args(&["--peers", peers, "--kv-cache", "int8"]).is_err());
         assert_eq!(defaults.rtx_expert_layers, cuteafd_loader::placement::Onboard::Auto);
         assert_eq!(defaults.max_sequences, 16);
+        assert!(args(&["--peers", peers, "--native-k6"]).is_err());
         assert_eq!(defaults.pool_tokens, None);
         assert_eq!(defaults.spark_budget_gib, None);
-        assert_eq!(defaults.api_limits(COMPILED_CONTEXT)?.context(), DEFAULT_CONTEXT as u32);
+        assert_eq!(defaults.api_limits(DEFAULT_CONTEXT)?.context(), DEFAULT_CONTEXT as u32);
+        assert_eq!(defaults.api_limits(COMPILED_CONTEXT)?.context(), COMPILED_CONTEXT as u32);
         args(&["--peers", peers, "--max-context", "1048576"])?.validate()?;
         let limited = args(&["--peers", peers, "--max-context", "262144"])?;
         limited.validate()?;

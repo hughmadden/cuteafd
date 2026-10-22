@@ -250,8 +250,8 @@ def test_kimi_switch_is_forwarded_to_coordinator_and_native_dispatch():
     assert '${CUTEAFD_WIP_KIMIK3_AOT:-OFF}' in dispatch
     cmake = (ROOT / 'native/cmake/shared/dsv4_programs.cmake').read_text()
     block = cmake.split('if(CUTEAFD_ENABLE_KIMIK3_AOT)', 1)[1].split('if(CUTEAFD_ENABLE_EXLR8_AOT)', 1)[0]
-    assert 'set(CUTEAFD_PROGRAM_GEOMETRY "kimik3")' in block
-    assert 'set(CUTEAFD_PROGRAM_GEOMETRY "${CUTEAFD_PROGRAM_GEOMETRY},kimik3")' in block
+    assert 'set(CUTEAFD_PROGRAM_GEOMETRY "kimik3,kimi_k6_dense,kimi_split")' in block
+    assert 'set(CUTEAFD_PROGRAM_GEOMETRY "${CUTEAFD_PROGRAM_GEOMETRY},kimik3,kimi_k6_dense,kimi_split")' in block
 
 
 def test_kimi_native_key_preserves_off_and_keys_on():

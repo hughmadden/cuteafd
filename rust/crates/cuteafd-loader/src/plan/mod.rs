@@ -603,7 +603,10 @@ fn plan_of(input: &PlanInput, options: &PlanOptions) -> Result<PlanReport, PlanE
         report.max_image_tokens = Some(crate::media::QWEN_MAX_IMAGE_TOKENS);
     }
     report.runtime = Some(family.runtime());
-    let model = match family.open(&checkpoint) {
+    let model = match family.open(&checkpoint).and_then(|mut model| {
+        model.configure(options)?;
+        Ok(model)
+    }) {
         Ok(model) => model,
         Err(error) => {
             report.hints.push(Hint {

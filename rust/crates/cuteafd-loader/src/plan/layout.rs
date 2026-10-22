@@ -1121,7 +1121,8 @@ fn selected_host_geometry(report: &mut PlanReport, options: &LayoutOptions, chec
     let mut context = shape.context_tokens;
     if id == "kimi_k3" {
         if options.context_tokens == 0 {
-            context = crate::families::kimi_k3::DEFAULT_CONTEXT as u64;
+            context = crate::families::kimi_k3::default_context(
+                &crate::plan::families::kimi::core_inventory(checkpoint)?) as u64;
         }
         if let Some(snapshot) = &options.kimi_drafter_snapshot {
             let draft = crate::formats::dflash::MlaDflashConfig::read(snapshot)?;

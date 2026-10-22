@@ -471,6 +471,36 @@ impl<'e, 'a, 's> Bindings<'e, 'a, 's> {
         Ok(())
     }
 
+    fn publish_core(&self,ffn:bool)->Result<()> {
+        let name=if ffn {"K6 FFN partial"}else{"K6 attention partial"};
+        ensure!(self.protocol.peer.slot_bytes()>=self.rows*7168*4,"Kimi K6 peer slot shorter than F32 hidden rows");
+        for rank in 0..2 {
+            self.protocol.producers(self.lane,rank)?;
+            self.protocol.peer.push(rank,self.lane,self.local[rank].buffer(name)?.ptr,self.rows*7168*4)?;
+        }
+        Ok(())
+    }
+    /// Native K6 FFN partials cross the peer link as F32; BF16 otherwise.
+    fn publish_ffn(&self, layer: usize) -> Result<()> {
+        if self.local[0].native_ffn(layer)? {
+            ensure!(self.local[1].native_ffn(layer)?, "Kimi K6 FFN rank formats differ");
+            self.publish_core(true)
+        } else {
+            self.publish("ffn output")
+        }
+    }
+    fn meet_core(&mut self,layer:usize,ffn:bool,destination:&str)->Result<()> {
+        for rank in 0..2 {
+            self.protocol.peer.wait(rank,self.lane)?;
+            let peer=CuteafdDeviceBuffer{ptr:self.protocol.peer.recv(rank,self.lane)?,
+                bytes:self.rows*7168*4,device_id:self.local[rank].stream().device.id,flags:0};
+            self.protocol.peer.on(rank,||self.local[rank].reduce_core(layer,ffn,self.rows,peer,destination,
+                self.protocol.peer.stream(rank)))?;
+            self.protocol.consumer(self.lane,rank)?;
+        }
+        Ok(())
+    }
+
     /// Copies into retained lane operands, not a second exchange ring. Both
     /// producer joins include previous readers before any destination overwrite.
     fn transfer(&self, from: usize, name: &str, bytes: usize) -> Result<()> {
@@ -530,8 +560,13 @@ impl LayerKernels for Bindings<'_, '_, '_> {
     fn heads(&mut self, layer: usize) -> Result<()> {
         self.before_attention(layer)?;
         for rank in 0..2 { self.attention_rank(layer, rank)?; }
-        self.publish("attention output")?;
-        self.meet("attention output", "delta")
+        if self.local[0].native_attention(layer)? {
+            ensure!(self.local[1].native_attention(layer)?,"Kimi K6 attention rank formats differ");
+            self.publish_core(false)?;self.meet_core(layer,false,"delta")
+        } else {
+            self.publish("attention output")?;
+            self.meet("attention output", "delta")
+        }
     }
     fn context(&mut self, _: usize, _: usize) -> Result<()> {
         anyhow::bail!("Kimi context split has no query/LSE exchange ABI")
@@ -632,16 +667,17 @@ impl PipelineKernels for Bindings<'_, '_, '_> {
                 Some(ticket)
             }
         };
-        if !self.defer_publication { self.publish("ffn output")?; }
+        if !self.defer_publication { self.publish_ffn(layer)?; }
         let ticket = FfnTicket { layer, spark, rtx: rtx.then_some(owner) };
         self.pending = Some(ticket);
         Ok(ticket)
     }
     fn finish_ffn(&mut self, layer: usize, ticket: FfnTicket) -> Result<()> {
         ensure!(self.pending == Some(ticket) && ticket.layer == layer, "Kimi FFN ticket differs from pending layer");
-        if self.defer_publication { self.publish("ffn output")?; }
+        if self.defer_publication { self.publish_ffn(layer)?; }
         if ticket.spark.is_some() || ticket.rtx.is_some() {
-            self.meet("ffn output", "shared output")?;
+            if self.local[0].native_ffn(layer)? {self.meet_core(layer,true,"shared output")?;}
+            else {self.meet("ffn output", "shared output")?;}
             let rank = super::weights::routed_owner(self.local[0].config(), layer)?;
             if let Some(spark) = ticket.spark {
                 self.routed.finish(&self.local[1], spark)?;
@@ -660,7 +696,8 @@ impl PipelineKernels for Bindings<'_, '_, '_> {
                 local.adopt("delta", combined, self.rows, 7168)?;
             }
         } else {
-            self.meet("ffn output", "delta")?;
+            if self.local[0].native_ffn(layer)? {self.meet_core(layer,true,"delta")?;}
+            else {self.meet("ffn output", "delta")?;}
         }
         // Checkpoint taps are the completed decoder prefix plus final FFN
         // delta, before the following residual mixer or final output norm.

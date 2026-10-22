@@ -55,6 +55,9 @@ pub struct ExpertContract {
 pub trait FamilyModel: Send + Sync {
     fn spec(&self) -> &ModelSpec;
 
+    /// Apply explicit execution opt-ins before checking the tensor contract.
+    fn configure(&mut self, _options: &super::PlanOptions) -> Result<(), ConfigError> { Ok(()) }
+
     /// Placement accounts for executable runtime owners, not only checkpoint inventory.
     fn native_serving_admission(&self) -> bool { false }
 

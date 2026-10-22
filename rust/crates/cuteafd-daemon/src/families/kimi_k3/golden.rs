@@ -640,7 +640,7 @@ mod tests {
         let arch = cuteafd_loader::placement::ArchContext::for_device("sm_120", 96 << 30);
         let names = programs.iter().filter_map(|p| p["name"].as_str()).collect::<Vec<_>>();
         let selected = cuteafd_loader::placement::ProgramSet::from_names(&["kimik3"], names);
-        let mut fixed = exchange_demands(rows, false)?;
+        let mut fixed = exchange_demands(rows, false,false)?;
         for rank in 0..2 {
             let code = cuteafd_loader::placement::inventory::loaded_code_allowance("kimik3", "exl3", true,
                 rank as u8, arch, Some(&selected));
@@ -667,7 +667,7 @@ mod tests {
             cuteafd_loader::families::kimi_k3::SPARK_DEFAULT_BUDGET_BYTES,
             cuteafd_loader::families::kimi_k3::SPARK_ESTIMATED_RESERVE_BYTES)?;
         let graph_set = super::super::graphs::owned_inventory(&cfg, 1, rows, slots)?;
-        let admitted = admission::admit(admission::Inputs { cfg: &cfg, cache_format: cuteafd_core::MlaCacheFormat::Bf16, gpus: [GpuBudget {
+        let admitted = admission::admit(admission::Inputs { cfg: &cfg, core: Default::default(), cache_format: cuteafd_core::MlaCacheFormat::Bf16, gpus: [GpuBudget {
             capacity_bytes: 96 << 30, headroom_bytes: 2 << 30,
             baseline: cuteafd_loader::placement::Baseline::Measured { free_bytes: (96 << 30) - reserve } }; 2],
             devices: [0, 1], peer_access: true, spark_ranks: 6, attention: None,
@@ -728,7 +728,7 @@ mod tests {
     fn peer_exchange_fixed_charges_exclude_solver_owned_hop_planes() -> Result<()> {
         for rows in [1, 64, 4096] {
             for diagnostics in [false, true] {
-                let demands = exchange_demands(rows, diagnostics)?;
+                let demands = exchange_demands(rows, diagnostics,false)?;
                 let progress = if diagnostics {
                     (2 * std::mem::size_of::<cuteafd_ffi::peer_exchange::PeerProgress>()).max(256)
                 } else { 0 };
@@ -740,8 +740,8 @@ mod tests {
                 }
             }
         }
-        assert!(exchange_demands(0, false).is_err());
-        assert!(exchange_demands(4097, false).is_err());
+        assert!(exchange_demands(0, false,false).is_err());
+        assert!(exchange_demands(4097, false,false).is_err());
         Ok(())
     }
 

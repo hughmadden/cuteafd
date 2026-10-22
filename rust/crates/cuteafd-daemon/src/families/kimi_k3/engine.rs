@@ -160,7 +160,7 @@ impl<'a> Engine<'a> {
                 local[0][0].config().dense.clone(), local[0][0].config().topk, 64))).transpose()?;
         // Weak admission registries must not outlive these strong startup owners
         // until every persistent local binding has acquired the same operands.
-        if let Some(draft) = draft.as_mut() { draft.bind_target(weights.global.clone())?; }
+        if let Some(draft) = draft.as_mut() { draft.bind_target(weights.global.clone(), programs[1].clone())?; }
         drop((weights, kda, mla));
         pending.wait()?;
         let world = SparkWorld::canonical(6)?;
@@ -361,7 +361,7 @@ impl<'a> Engine<'a> {
             let normalized = result?[0];
             let input = crate::shared::prefix::view(normalized,
                 (rows - logit_rows) * 7168 * 2, logit_rows * 7168 * 2)?;
-            let logits = io[0][1].project(input, logit_rows)?;
+            let logits = io[0][1].project(input, logit_rows, &local[0][1])?;
             let stream = local[0][1].stream();
             Ok(crate::shared::token_io::DeviceLogits { ptr: logits.ptr.cast_const(), rows: logit_rows,
                 vocab: local[0][1].config().vocab_size, stride: local[0][1].config().vocab_size,
@@ -551,7 +551,7 @@ impl<'a> Engine<'a> {
                 for first in (0..rows[lane]).step_by(64) {
                     let count = (rows[lane] - first).min(64);
                     let input = crate::shared::prefix::view(normalized, first * 7168 * 2, count * 7168 * 2)?;
-                    let logits = io[lane][1].project(input, count)?;
+                    let logits = io[lane][1].project(input, count, &local[lane][1])?;
                     let values = stream.device.run(|| {
                         // SAFETY: diagnostic download is outside capture; the
                         // exact lane's head finishes before its logits are reused.
