@@ -87,6 +87,15 @@ def role_geometry(family, role):
     return shape["experts"], intermediate, (intermediate + 127) // 128 * 128, shape["topk"]
 
 
+def expert_plane_bytes(family: str, hidden: int, intermediate: int, stored: int) -> tuple[int, ...]:
+    """Package-fixed payload/scale extents; coded FC2 uses logical, not padded K."""
+    values = hidden * stored
+    if family == "v41":
+        return (values, 2 * stored * (2 * ((hidden // 32 + 3) // 4) + 1),
+                values // 2, hidden * (2 * ((intermediate // 32 + 3) // 4) + 1))
+    return values, values // 16, values // 2, values // 32
+
+
 def numerical_recipe(width: int, intermediate: int, *, atomic: bool, compact: bool) -> dict:
     """Pinned slice products and fold order, independent of launch capacity."""
     if width not in (64, 128, 192) or intermediate <= 0 or intermediate % 32:
@@ -163,6 +172,8 @@ def export(output, capacities, width, atomic_min_capacity=None, role="spark", *,
         family=family,
         spark_tp_degree=spark_tp_degree,
         input_format="bf16" if coordinator else "fp8_k32",
+        weight_scale_layout="ue8m0_offset4_n256_k128" if family == "v41" else "ue8m0_n256_k128",
+        expert_plane_bytes=expert_plane_bytes(family, hidden, intermediate, kernel_intermediate),
         sparkinfer_revision=_pinned_sparkinfer.REVISION,
         capability=[props.major, props.minor],
         physical_sms=props.multi_processor_count,
@@ -203,8 +214,8 @@ def export(output, capacities, width, atomic_min_capacity=None, role="spark", *,
             (cutlass.Uint8, (capacity, hidden // 32), (wire, 1)),
             # Per-expert packed W13, S13, W2 and S2 in 32-bit words.
             *[
-                (cutlass.Uint32, (experts * kernel_intermediate * hidden // words,), (1,))
-                for words in (4, 64, 8, 128)
+                (cutlass.Uint32, (experts * plane_bytes // 4,), (1,))
+                for plane_bytes in expert_plane_bytes(family, hidden, intermediate, kernel_intermediate)
             ],
             (cutlass.Int32, (routes,), (1,)),
             (cutlass.Float32, (routes,), (1,)),
@@ -226,15 +237,15 @@ def export(output, capacities, width, atomic_min_capacity=None, role="spark", *,
         ]
         label = (f"{family}_{role}_m{capacity}" if standard_names
                  else f"v41_slices_m{capacity}_w{selected_width}")
-        pipeline = (V41DraftSlicePipeline(capacity, selected_width)
+        pipeline = (V41DraftSlicePipeline(capacity, selected_width, scale_codes=family == "v41")
                     if coordinator else V41SlicePipeline(capacity, selected_width, atomic_tokens=atomic,
                                                experts=experts, topk=topk, intermediate=intermediate,
-                                               hidden=hidden,
+                                               hidden=hidden, scale_codes=family == "v41",
                                                fc2_n_splits=fc2_n_splits(role, capacity, selected_width, hidden)))
         if compact:
             from b12x.moe._shared.kernels.v41_compact_pipeline import V41HybridPipeline
             pipeline = V41HybridPipeline(capacity, selected_width,
-                intermediate=intermediate, cutoff=min(capacity, compact_live_rows))
+                intermediate=intermediate, cutoff=min(capacity, compact_live_rows), scale_codes=True)
         if coordinator:
             args.insert(0, make_fake_tensor(cutlass.BFloat16, (capacity, 5120), (5120, 1), assumed_align=16))
         compiled = cute.compile(

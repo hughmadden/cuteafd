@@ -32,8 +32,8 @@ fn installed_native_rank_plan_tp4_tp6_rejects_changed_worker_placement() -> Resu
             let stored = width.div_ceil(128) * 128;
             let slice = SparkSlice { unit_map: None, layer: 0, first: (rank * width) as u32,
                 width: width as u32, stored_width: stored as u32, tiers: vec![], projection_counts: vec![] };
-            let resident = usize::try_from(cuteafd_loader::placement::families::deepseek_v41::resident_bytes(
-                geometry.hidden as u64, stored as u64, geometry.experts as u64, nvfp4)?)?;
+            let resident = NativePlanes::with_scale_codes(geometry.hidden, width, stored,
+                geometry.experts, nvfp4, !nvfp4 && catalog.mxfp4_scale_codes())?.bytes;
             let plan = RankPlan::new(&catalog, &[slice.clone()], world, rank, resident)?;
             let checked = plan.checked(&catalog, root, world, rank)?;
             checked.plan.check(&checked.file_sizes, &checked.arenas)?;
@@ -41,7 +41,7 @@ fn installed_native_rank_plan_tp4_tp6_rejects_changed_worker_placement() -> Resu
             let assignment = cuteafd_loader::placement::SparkAssignment { rank: rank as u32,
                 resident_bytes: resident as u64, slices: vec![slice.clone()], io: Default::default() };
             let offer = Offer { rank, host: format!("rank-{rank}"),
-                arena_bytes: plan.layout.logical_bytes() as u64, placement: plan.placement.clone() };
+                arena_bytes: plan.logical_bytes(), placement: plan.placement.clone() };
             super::super::push_exl3::validate_offer(&offer, rank, &assignment, &plan.placement, offer.arena_bytes)?;
             let mut bad = offer.clone();
             bad.placement[0].slice.first += 32;

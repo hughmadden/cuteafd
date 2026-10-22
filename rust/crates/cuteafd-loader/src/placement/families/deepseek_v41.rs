@@ -250,10 +250,13 @@ pub fn expert_cost(
         catalog.expert_staging(selection)?.staging_bytes()
     };
     let shape = catalog.routed_experts();
-    Ok(Bytes2 {
-        resident: resident_bytes(shape.hidden as u64, stored, shape.experts as u64, nvfp4)?,
-        staging: staging as u64,
-    })
+    let resident = if !nvfp4 && catalog.mxfp4_scale_codes() {
+        crate::formats::scale_codes::expert_bytes(shape.experts as u64, shape.hidden as u64,
+            shape.intermediate as u64 / world as u64).context("coded expert residency overflow")?
+    } else {
+        resident_bytes(shape.hidden as u64, stored, shape.experts as u64, nvfp4)?
+    };
+    Ok(Bytes2 { resident, staging: staging as u64 })
 }
 
 /// Exact conditional expert owners: immutable checkpoint residency and two

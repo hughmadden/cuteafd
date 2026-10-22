@@ -28,7 +28,7 @@ pub use shared::v41_exl3_wire::V41Exl3Wire;
 pub use shared::v41_experts::{
     V41ExpertReduction, V41ExpertInfo, V41ExpertInputQuantizer, V41ExpertKernel, V41ExpertLaunchArgs, V41ExpertPacker, V41ExpertPointer, V41ExpertOutputKind,
     V41CompactReducer, V41LocalExpertReducer, V41Tp2ExpertReducer, V41RouteReducer, V41_EXPERT_POINTER_COUNT,
-    v41_pack_intermediate_supported, v41_rank_count_supported,
+    v41_pack_intermediate_supported, v41_rank_count_supported, V41ScaleCodeJob,
 };
 pub use shared::rtx_combine::{RtxPartialDtype, RtxTp2Combine};
 mod cuda_runtime;

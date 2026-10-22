@@ -215,8 +215,13 @@ impl SparkAssignment {
                     slice.first = u32::try_from(rank * width)?;
                     slice.width = u32::try_from(width)?;
                     slice.stored_width = u32::try_from(stored_width)?;
-                    super::families::deepseek_v41::resident_bytes(geometry.hidden as u64,
-                        slice.stored_width as u64, geometry.experts as u64, catalog.nvfp4().is_some())?
+                    if catalog.nvfp4().is_none() && catalog.mxfp4_scale_codes() {
+                        crate::formats::scale_codes::expert_bytes(geometry.experts as u64,
+                            geometry.hidden as u64, width as u64).context("coded Spark residency overflow")?
+                    } else {
+                        super::families::deepseek_v41::resident_bytes(geometry.hidden as u64,
+                            slice.stored_width as u64, geometry.experts as u64, catalog.nvfp4().is_some())?
+                    }
                 }
             };
             assignment.resident_bytes = assignment.resident_bytes.checked_add(resident)

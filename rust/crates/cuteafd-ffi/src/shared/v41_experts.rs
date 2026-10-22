@@ -6,6 +6,21 @@ use std::ptr::NonNull;
 
 pub const V41_EXPERT_POINTER_COUNT: usize = 44;
 
+/// Load-time source rectangle and coded plane; matches cuteafd_scale_code_job_t.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct V41ScaleCodeJob {
+    pub source: *const u8,
+    pub destination: *mut u8,
+    pub source_bytes: u64,
+    pub destination_bytes: u64,
+    pub pitch: u64,
+    pub rows: u32,
+    pub columns: u32,
+    pub stored_rows: u32,
+    pub start_row: u32,
+}
+
 /// Native slot 41 representation; dtype and route axis are independent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum V41ExpertOutputKind {
@@ -621,6 +636,34 @@ impl NativeLibrary {
         let status = unsafe { pack(source.ptr.cast(), source.bytes as u64,
             destination.ptr.cast(), destination.bytes as u64, intermediate, plane, stream) };
         ensure!(status == 0, "V4.1 plane packing failed with CUDA status {status}");
+        Ok(())
+    }
+
+    /// Pack W1/W3/W2 payloads without allocating raw scale destinations.
+    /// # Safety
+    /// Sources and destinations are disjoint, correctly sized device buffers
+    /// on the current device and remain live through stream completion.
+    pub unsafe fn v41_pack_weights_async(&self, sources: [*const u8; 3],
+        destinations: [*mut u8; 2], intermediate: u32, stream: *mut c_void) -> Result<()> {
+        type F = unsafe extern "C" fn(*const *const u8, *const *mut u8, u32, *mut c_void) -> i32;
+        let pack = unsafe { self.lib.get::<F>(b"cuteafd_pack_expert_weights_async")? };
+        let status = unsafe { pack(sources.as_ptr(), destinations.as_ptr(), intermediate, stream) };
+        ensure!(status == 0, "expert payload packing failed with CUDA status {status}");
+        Ok(())
+    }
+
+    /// Recode scale rectangles without changing a checkpoint exponent.
+    /// # Safety
+    /// Jobs must be in mapped pinned memory, all source/output/error storage
+    /// device-visible on the current device and live through stream completion.
+    /// Output omitted rows are zeroed by the caller; error starts at u64::MAX.
+    pub unsafe fn v41_pack_scale_codes_async(&self, jobs: *const V41ScaleCodeJob,
+        count: usize, error: *mut u64, stream: *mut c_void) -> Result<()> {
+        type F = unsafe extern "C" fn(*const V41ScaleCodeJob, u32, *mut u64, *mut c_void) -> i32;
+        let count = u32::try_from(count)?;
+        let pack = unsafe { self.lib.get::<F>(b"cuteafd_v41_pack_scale_codes_async")? };
+        let status = unsafe { pack(jobs, count, error, stream) };
+        ensure!(status == 0, "V4.1 scale-code packing failed with CUDA status {status}");
         Ok(())
     }
 

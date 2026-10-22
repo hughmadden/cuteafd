@@ -21,6 +21,7 @@ pub(crate) struct Tp2ExpertPlan {
     pub gpu: usize,
     pub layout: ArenaLayout,
     pub validation: ValidationLayout,
+    pub scales: super::push_native::ScalePlan,
 }
 
 impl Tp2ExpertPlan {
@@ -36,7 +37,8 @@ impl Tp2ExpertPlan {
         let layout = ArenaLayout::new(sizes, admitted)?;
         let validation = ValidationLayout::exl3(&residencies, layout.bytes() as u64, usize::MAX)?;
         let layout = layout.with_validation(validation.bytes(), validation.bytes())?;
-        Ok(Self { residencies, native: Vec::new(), layers: layers.to_vec(), gpu, layout, validation })
+        Ok(Self { residencies, native: Vec::new(), layers: layers.to_vec(), gpu, layout, validation,
+            scales: Default::default() })
     }
 
     /// Native MXFP4 halves: each layer's four planes for intermediate half
@@ -47,16 +49,26 @@ impl Tp2ExpertPlan {
         let geometry = catalog.routed_experts();
         ensure!(geometry.intermediate % 2 == 0, "native TP2 halves need an even intermediate");
         let width = geometry.intermediate / 2;
-        let planes = cuteafd_loader::push_load::native::NativePlanes::new(geometry.hidden as usize, width,
-            width.div_ceil(128) * 128, geometry.experts as usize, false)?;
+        let planes = cuteafd_loader::push_load::native::NativePlanes::with_scale_codes(geometry.hidden as usize, width,
+            width.div_ceil(128) * 128, geometry.experts as usize, false, catalog.mxfp4_scale_codes())?;
         let native = layers.iter().map(|_| planes.clone()).collect::<Vec<_>>();
         let layout = ArenaLayout::new(native.iter().map(|p| p.bytes), admitted)?;
         let validation = ValidationLayout::exl3(&[], layout.bytes() as u64, usize::MAX)?;
-        Ok(Self { residencies: Vec::new(), native, layers: layers.to_vec(), gpu, layout, validation })
+        let mut generated = Vec::new();
+        let mut scale_layers = Vec::new();
+        for (region, (&layer, planes)) in layers.iter().zip(&native).enumerate() {
+            let base = layout.region(region)?.start;
+            generated.extend(planes.generated_ranges().into_iter().map(|r| base + r.start..base + r.end));
+            scale_layers.push((layer, planes.clone(), base));
+        }
+        let layout = layout.with_generated(generated)?;
+        let scales = super::push_native::ScalePlan::new(catalog, scale_layers, 2, gpu)?;
+        Ok(Self { residencies: Vec::new(), native, layers: layers.to_vec(), gpu, layout, validation, scales })
     }
 
     /// Device scratch the post-Done native plane transform needs (0 for EXL3).
     pub fn scratch_bytes(&self) -> usize { self.native.iter().map(|p| p.scratch_bytes()).max().unwrap_or(0) }
+    pub fn logical_bytes(&self) -> u64 { self.scales.logical_bytes(&self.layout) }
 
     /// Entries for group rank `rank` (the coordinator GPU's rank in the group).
     pub fn append(&self, builder: &mut Builder, catalog: &OfficialV41Catalog, rank: u32) -> Result<()> {
@@ -76,6 +88,7 @@ impl Tp2ExpertPlan {
                     builder.v41_resident(catalog, &names, planes, expert, 2, self.gpu as u32, destination, None)?;
                 }
             }
+            self.scales.append(builder, rank, base + self.scales.base(&self.layout))?;
             return Ok(());
         }
         for (index, residency) in self.residencies.iter().enumerate() {
@@ -93,7 +106,7 @@ impl Tp2ExpertPlan {
     pub fn checked(&self, catalog: &OfficialV41Catalog, root: &std::path::Path, world: usize, rank: usize)
         -> Result<CheckedPlan> {
         let mut arenas = vec![0; world];
-        *arenas.get_mut(rank).context("coordinator rank outside group")? = self.layout.logical_bytes() as u64;
+        *arenas.get_mut(rank).context("coordinator rank outside group")? = self.logical_bytes();
         let mut builder = Builder::new(root, arenas);
         self.append(&mut builder, catalog, u32::try_from(rank)?)?;
         Ok(builder.finish()?)
