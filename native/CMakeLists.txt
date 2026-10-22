@@ -350,6 +350,7 @@ if(CUTEAFD_ENABLE_CUDA)
     families/mimo_v2/cuda/mimo_dflash.cu
     shared/cuda/fp8_block_dequant.cu
     shared/cuda/fp8_grid_kmajor.cu
+    shared/cuda/load_scale_gather.cu
     shared/cuda/fp8_load_quant.cu
     shared/cuda/fp8_gemv.cu
     shared/cuda/l2_prefetch.cu
@@ -654,6 +655,10 @@ if(CUTEAFD_ENABLE_CUDA)
   target_link_libraries(cuteafd_cuda_peer_planes_selftest PRIVATE cuteafd_native CUDA::cudart)
   add_test(NAME cuteafd_cuda_peer_planes_selftest COMMAND cuteafd_cuda_peer_planes_selftest)
   set_tests_properties(cuteafd_cuda_peer_planes_selftest PROPERTIES TIMEOUT 30 SKIP_RETURN_CODE 77)
+  add_executable(cuteafd_cuda_load_scale_gather_selftest tests/cuda_load_scale_gather_selftest.cc)
+  target_link_libraries(cuteafd_cuda_load_scale_gather_selftest PRIVATE cuteafd_native CUDA::cudart)
+  add_test(NAME cuteafd_cuda_load_scale_gather_selftest COMMAND cuteafd_cuda_load_scale_gather_selftest)
+  set_tests_properties(cuteafd_cuda_load_scale_gather_selftest PROPERTIES TIMEOUT 30 SKIP_RETURN_CODE 77)
   add_executable(cuteafd_cuda_fp8_grid_kmajor_selftest tests/cuda_fp8_grid_kmajor_selftest.cc)
   target_link_libraries(cuteafd_cuda_fp8_grid_kmajor_selftest PRIVATE cuteafd_native CUDA::cudart)
   add_test(NAME cuteafd_cuda_fp8_grid_kmajor_selftest COMMAND cuteafd_cuda_fp8_grid_kmajor_selftest)

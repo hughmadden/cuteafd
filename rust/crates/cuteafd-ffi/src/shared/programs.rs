@@ -611,6 +611,25 @@ impl NativeLibrary {
         Ok(())
     }
 
+    /// Per-row FP32 scales gathered from `grid` [*, grid_cols] (columns
+    /// `col0..col0 + kb` of row `index[r]`, or zero for `u32::MAX`) into
+    /// `row_major` [rows, kb] and/or `k_major` [kb, rows] (null to skip).
+    ///
+    /// # Safety
+    /// Every non-null pointer is a live device buffer of its shape (`index`:
+    /// `rows` u32) on the stream's device.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn load_scale_gather(&self, grid: *const c_void, index: *const c_void, row_major: *mut c_void,
+        k_major: *mut c_void, rows: usize, kb: usize, grid_cols: usize, col0: usize, stream: *mut c_void) -> Result<()> {
+        type Gather = unsafe extern "C" fn(*const c_void, *const c_void, *mut c_void, *mut c_void, i64, i64, i64, i64,
+            *mut c_void) -> i32;
+        let f = *unsafe { self.lib.get::<Gather>(b"cuteafd_load_scale_gather") }?;
+        let status = unsafe { f(grid, index, row_major, k_major, i64::try_from(rows)?, i64::try_from(kb)?,
+            i64::try_from(grid_cols)?, i64::try_from(col0)?, stream) };
+        ensure!(status == 0, "load-time scale gather failed with {status}");
+        Ok(())
+    }
+
     /// BF16 `w` [rows, cols] -> E4M3 `q` [rows, cols] with FP32 128x128 block
     /// `scale` [ceil(rows/128), ceil(cols/128)] (amax / 448 per block), the
     /// inverse of [`Self::fp8_block_dequant`].

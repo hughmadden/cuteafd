@@ -110,6 +110,7 @@ impl RankPlan {
                     widen: vec![],
                     scalars: vec![],
                     inputs: None,
+                    expand: vec![],
                 },
             });
         }
@@ -155,6 +156,7 @@ impl RankPlan {
                     widen,
                     scalars,
                     inputs,
+                    expand,
                 } => {
                     let widening = widen
                         .iter()
@@ -167,7 +169,15 @@ impl RankPlan {
                     let inputs = inputs
                         .as_ref()
                         .map_or(0, |(gate, up, _)| gate.len() + up.len());
-                    widening.max(scalar).max(inputs)
+                    let expanding = expand
+                        .iter()
+                        .map(|(_, _, width, pitch)| {
+                            let rows = (1024 * 1024 / pitch).max(1);
+                            rows * (width + pitch)
+                        })
+                        .max()
+                        .unwrap_or(0);
+                    widening.max(scalar).max(inputs).max(expanding)
                 }
                 _ => 0,
             })
@@ -210,6 +220,15 @@ impl RankPlan {
                     }
                     let (source, dtype) = tensors.push_source(&names[1])?;
                     let mut image = scale;
+                    // A grid whose rows pad to a wider pitch lands packed (so its
+                    // runs merge into whole slots) and spreads after Done; a BF16
+                    // source lands in the first half of its packed FP32 extent.
+                    let packed = packed_rows(&scale);
+                    let (at, extent) = if packed {
+                        image.destination_pitch = image.width;
+                        image.destination_bytes = image.rows * image.width;
+                        (expert * image.rows * image.width, image.rows * image.width)
+                    } else { (expert * s_bytes, s_bytes) };
                     if dtype == DType::Bf16 {
                         for value in [
                             &mut image.source_offset,
@@ -225,12 +244,7 @@ impl RankPlan {
                     builder.fp8_matrix(
                         &source,
                         image,
-                        destination(
-                            rank,
-                            &layer.planes[2 * index + 1],
-                            expert * s_bytes,
-                            s_bytes,
-                        )?,
+                        destination(rank, &layer.planes[2 * index + 1], at, extent)?,
                     )?;
                     if tensors.format() == ExpertFormat::Nvfp4 {
                         for (name, offset) in names[2..].iter().zip([
@@ -315,6 +329,12 @@ fn source_names(
     }
     names
 }
+/// A scale grid whose execution rows pad to a wider pitch (MXFP4 down
+/// projections pad K/32 scale bytes to 4): pushed packed, spread after Done.
+fn packed_rows(image: &cuteafd_loader::formats::fp8_experts::Fp8MatrixSlice) -> bool {
+    image.width > 0 && image.width < image.destination_pitch
+}
+
 fn initialize(
     tensors: &Fp8ExpertTensors,
     layer: &LayerPlan,
@@ -324,6 +344,7 @@ fn initialize(
     let mut widen = Vec::new();
     let mut scalars = Vec::new();
     let mut inputs = Vec::new();
+    let mut expand = Vec::new();
     let experts = tensors.shape().experts;
     for (index, projection) in Fp8Projection::ALL.into_iter().enumerate() {
         if tensors.format() == ExpertFormat::Bf16 {
@@ -331,11 +352,21 @@ fn initialize(
         }
         let (_, grid) = tensors.slice_bytes_with(projection, world, rank, layer.slicing)?;
         let plane = &layer.planes[2 * index + 1];
+        let [_, image] = tensors.projection_slices(projection, world, rank, layer.slicing)?;
+        let packed = packed_rows(&image);
+        if packed {
+            ensure!(image.rows * image.destination_pitch == grid, "padded scale grid differs from its slice bytes");
+            expand.push((plane.start..plane.start + experts * grid, experts * image.rows, image.width,
+                image.destination_pitch));
+        }
         if tensors.format() == ExpertFormat::Fp8Block128 {
             for expert in 0..experts {
                 let name = tensors.name(layer.layer, expert, projection);
                 if tensors.push_source(&format!("{name}_scale_inv"))?.1 == DType::Bf16 {
-                    widen.push(plane.start + expert * grid..plane.start + (expert + 1) * grid);
+                    // A packed grid widens as one packed FP32 extent before it spreads.
+                    widen.push(if packed { plane.start + expert * image.rows * image.width
+                        ..plane.start + (expert + 1) * image.rows * image.width }
+                        else { plane.start + expert * grid..plane.start + (expert + 1) * grid });
                 }
             }
         }
@@ -350,6 +381,7 @@ fn initialize(
         widen,
         scalars,
         inputs,
+        expand,
     })
 }
 
