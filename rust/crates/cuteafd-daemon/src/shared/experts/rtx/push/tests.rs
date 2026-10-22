@@ -606,7 +606,9 @@ pub(crate) fn receive_pushed<'a>(device: Device<'a>, catalog: &cuteafd_loader::O
         Ok(builder.finish()?)
     };
     let checked = build()?;
-    let expected = crate::shared::memory::weight_arena::ExpectedCoverage::from_plan(&checked, rank as u32)?;
+    // As plan_records: the dense destination's coverage from its own plan alone.
+    let expected = crate::shared::memory::weight_arena::ExpectedCoverage::from_plan(
+        &layout.checked(root, sparks + 2, rank)?, rank as u32)?;
     let dense = crate::shared::experts::rtx::dense::DenseArena::new(device, layout, expected)?;
     let socket = socket_dir.join(format!("g{gpu}.sock")).to_string_lossy().into_owned();
     let listener = Listener::bind(&socket)?;
@@ -661,10 +663,68 @@ pub(crate) fn receive_pushed<'a>(device: Device<'a>, catalog: &cuteafd_loader::O
         write_control(&mut coordinator, &serde_json::json!({"message":"commit", "success": true}))?;
         Ok(())
     });
-    let client = PushClient::at(socket, Duration::from_secs(600))?;
-    let tp2 = tp2.map(|plan| (catalog, plan, &checked));
+    let client = PushClient::at(socket.clone(), Duration::from_secs(600))?;
+    // As the group driver: the TP2 arena's own checked entries (from offset 0).
+    let tp2_checked = tp2.as_ref().map(|plan| plan.checked(catalog, root, sparks + 2, rank)).transpose()?;
+    let tp2 = tp2.zip(tp2_checked.as_ref()).map(|(plan, checked)| (catalog, plan, checked));
     let received = receive_rank(device, tp2, Some(DenseRank { destination: dense, base }), rank, &client,
         &mut worker, (7, 11), 8, DEFAULT_SLOT_BYTES);
-    server.join().map_err(|_| anyhow::anyhow!("fake SparkNest panicked"))??;
-    received?.context("pushed rank fell back")
+    if !server.is_finished() {
+        // A rank that failed before joining never connects: wake the fake source.
+        let _ = std::os::unix::net::UnixStream::connect(&socket);
+    }
+    let served = server.join().map_err(|_| anyhow::anyhow!("fake SparkNest panicked"))?;
+    let received = received?;
+    served?;
+    received.context("pushed rank fell back")
+}
+
+/// `receive_pushed` (the installed-golden replay driver) on a synthetic
+/// snapshot: dense operands, a staged step and TP2 halves in one rank.
+#[test]
+#[ignore = "requires an allocated CPU build slot and explicit NVMe fixture directory"]
+fn receive_pushed_replays_dense_records_and_tp2_halves() -> Result<()> {
+    use crate::shared::experts::rtx::dense::{Job, Operand, Rect, Records, Step};
+    let _ = tracing_subscriber::fmt().with_env_filter("info").with_test_writer().try_init();
+    let fixture = Fixture::build()?;
+    let library = fixture.load()?;
+    fixture.configure_memory(&library, 0, 64 << 30)?;
+    let root = tempfile::tempdir_in(fixture.directory())?;
+    let (tensors, _) = qwen4_exl3(2, 4);
+    let tensors: Vec<_> = tensors.into_iter().filter(|tensor| !tensor.0.contains(".experts.")
+        || tensor.0.contains(".experts.0.")).collect();
+    let mut config = qwen4_config(2);
+    config["text_config"]["num_experts"] = serde_json::json!(1);
+    config["text_config"]["num_experts_per_tok"] = serde_json::json!(1);
+    write_snapshot(root.path(), &config, &tensors, None);
+    let catalog = cuteafd_loader::read_expert_catalog(root.path())?;
+    for tensor in catalog.tensors().iter().filter(|t| t.metadata.name.ends_with(".mcg")) {
+        let source = Builder::v41_source(&catalog, &tensor.metadata.name)?;
+        File::options().write(true).open(source.path)?.write_all_at(&0xcbac1fedu32.to_le_bytes(), source.offset)?;
+    }
+    let device = Device { library: &library, id: 0 };
+    let dense = catalog.tensors().iter().filter(|t| !t.metadata.name.contains(".experts.")).take(3)
+        .map(|t| Rect { name: t.metadata.name.clone(), path: root.path().join(&t.shard), base: t.metadata.byte_offset,
+            row_bytes: t.metadata.byte_length as usize, rows: 0..1, cols: 0..t.metadata.byte_length as usize })
+        .collect::<Vec<_>>();
+    let allocations = dense.iter().map(|r| crate::shared::memory::DeviceAllocation::new(&library, r.bytes().max(256)))
+        .collect::<Result<Vec<_>>>()?;
+    let mut records = Records::default();
+    anyhow::ensure!(dense.len() == 2, "fixture has two dense tensors");
+    records.operands.push(Operand { device: 0, buffer: allocations[0].buffer, lands: vec![(dense[0].clone(), 0)],
+        bytes: dense[0].bytes() });
+    records.steps.push(Step { device: 0, rects: vec![dense[1].clone()],
+        jobs: vec![Job::Upload { at: 0, bytes: dense[1].bytes(), dst: allocations[1].buffer }] });
+    let plan = Tp2ExpertPlan::new(&catalog, &[0, 1], 0, usize::MAX)?;
+    let sockets = tempfile::tempdir_in(fixture.directory())?;
+    let pushed = receive_pushed(device, &catalog, root.path(), sockets.path(), &records, Some(plan), 1, 0)?;
+    assert_eq!(pushed.exl3()?.len(), 2);
+    for (rect, allocation) in dense.iter().zip(&allocations) {
+        let mut expected = vec![0; rect.bytes()];
+        rect.read(&mut expected)?;
+        let mut actual = vec![0; rect.bytes()];
+        library.copy_d2h(&mut actual, cuteafd_ffi::CuteafdDeviceBuffer { bytes: rect.bytes(), ..allocation.buffer })?;
+        assert_eq!(actual, expected, "{}", rect.name);
+    }
+    Ok(())
 }
