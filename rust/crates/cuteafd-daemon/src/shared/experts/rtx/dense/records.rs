@@ -286,6 +286,7 @@ impl Step {
                         library.fp8_quant_rule(source.cast(), q.ptr, scale.ptr, rows, cols, true, rule.code(), stream)?;
                         library.cuda_stream_synchronize(stream)
                     })?;
+                }
                 Job::ScaleCodes { rect, at, stored_rows, start_row, dst } => {
                     let source = self.rects.get(rect).context("scale-code source rectangle absent")?;
                     let bytes = staged.get(at..at.checked_add(source.bytes()).context("scale-code source overflow")?)
