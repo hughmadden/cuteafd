@@ -392,7 +392,17 @@ def test_dead_startup_503_relaunches_and_clears_error(cli, monkeypatch):
     name, call, root = cli
     monkeypatch.setenv('FAKE_STARTUP_503', str(root / 'startup503'))
     call('start', name, '--tool', 'agy', '--cwd', str(root), '--retry-delay', '0.2')
-    result = call('wait', name, '--until', 'idle', '--timeout', '12')
+    # The supervisor owns the relaunch: wait on the observed retry transition
+    # (retry_count rises and the error clears), not one fixed wall-clock window
+    # that a fully loaded suite can overrun while the supervisor is descheduled.
+    deadline = time.monotonic() + 60
+    while True:
+        result = call('status', name)
+        if result['retry_count'] == 1 and result['error'] is None and result['state'] not in ('error', 'starting', 'exited'):
+            break
+        assert time.monotonic() < deadline, result
+        time.sleep(0.1)
+    result = call('wait', name, '--until', 'idle', '--timeout', '20')
     assert not result.get('timed_out')
     assert result['retry_count'] == 1 and result['error'] is None
     events = [json.loads(line) for line in (root / 'runs' / name / 'events.jsonl').read_text().splitlines()]

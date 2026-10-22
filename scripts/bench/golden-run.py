@@ -65,9 +65,12 @@ workers/HOST.log} and whatever the run wrote to {out}; argv.json holds the exact
 and worker commands, image IDs, seal SHAs, env and the GPUs' power context (gpu-powerd
 state, sampled power limit and draw). summary.md lists exit codes and the key log lines
 (admission, logits digests, agreement/top-1, resume verdicts, test results, errors),
-the workers' readiness and errors, plus each --compare-logits A:B result: sha256
-byte-equality, then max |diff|, KL and top-1 over rows (vocab from the checkpoint's
-config.json, or --vocab).
+the workers' readiness and errors, plus each --compare-logits A:B result: byte
+equality, then max |diff|, KL and top-1 over rows (vocab from the checkpoint's
+config.json, or --vocab). Both layouts a golden writes are compared: a flat
+`*logits*.bin` dump and the per-row safetensors directory (row-NNNNNNNN.safetensors
+plus manifest.jsonl) that Kimi and the shared probe write; for the row layout the
+table names the row carrying the largest KL.
 """
 from __future__ import annotations
 
@@ -92,6 +95,7 @@ SUBCOMMANDS = {'dsv4': 'dsv4-golden', 'v41': 'v41-golden', 'glm': 'glm-golden', 
 # Families without a golden subcommand yet: native tests and commands only.
 RAW_FAMILIES = ('kimi',)
 NAME = re.compile(r'[A-Za-z0-9][A-Za-z0-9_.-]*\Z')
+ROW_FILE = re.compile(r'row-[0-9]+\.safetensors\Z')
 ENV_KEY = re.compile(r'[A-Za-z_][A-Za-z0-9_]*\Z')
 ANSI = re.compile(r'\x1b\[[0-9;]*m')
 # Key result lines across the families' goldens.
@@ -1018,6 +1022,16 @@ def logits_files(directory):
     return sorted(str(p.relative_to(directory)) for p in Path(directory).rglob('*logits*.bin') if p.is_file())
 
 
+def row_dump_dirs(directory):
+    """Relative directories holding a per-row safetensors dump (row-NNNNNNNN.safetensors).
+
+    Kimi and the shared probe write their logits this way: one F32 tensor per
+    row plus manifest.jsonl, instead of a single flat `.bin` file.
+    """
+    return sorted({str(p.parent.relative_to(directory)) for p in Path(directory).rglob('row-*.safetensors')
+                   if p.is_file() and ROW_FILE.fullmatch(p.name)})
+
+
 def compare_pairs(state, pairs, repeats):
     """Compare saved logits of arm pairs, per repeat, file by file."""
     results = []
@@ -1028,33 +1042,49 @@ def compare_pairs(state, pairs, repeats):
     for a, b in pairs:
         for repeat in range(1, repeats + 1):
             da, db = Path(state['root']) / a / f'r{repeat}', Path(state['root']) / b / f'r{repeat}'
+            dumped = False
             files = [f for f in logits_files(da) if (db / f).is_file()]
-            if not files:
-                results.append(dict(a=a, b=b, repeat=repeat, file=None, error='no saved logits common to both arms'))
-                continue
             for name in files:
+                dumped = True
                 out = Path(state['root']) / f'compare-{a}-{b}-r{repeat}-{name.replace("/", "_")}.json'
                 extra = []
                 tokens = (da / name).parent / 'tokens.bin'
                 if Path(name).name == 'logits.bin' and tokens.is_file():
                     extra = ['--tokens', str(tokens)]
                 args = [str(da / name), str(db / name), str(state['vocab']), *extra, '--json', str(out)]
-                if python:
-                    cmd = [*python, str(tool), *args]
-                else:  # the dev image has numpy; read-only views of the outputs
-                    image = state['slots'][a]['image_id']
-                    cmd = ['docker', 'run', '--rm', '--network', 'none', '--user', f'{os.getuid()}:{os.getgid()}',
-                           '-v', f'{tool}:{tool}:ro', '-v', f"{state['root']}:{state['root']}", '--entrypoint',
-                           'python3', image, str(tool), *args]
-                proc = subprocess.run(cmd, capture_output=True, text=True, timeout=3600)
-                if proc.returncode or not out.is_file():
+                results.append(compare_one(state, python, tool, args, out, dict(a=a, b=b, repeat=repeat, file=name)))
+            # Per-row dumps: each directory of row-NNNNNNNN.safetensors compares as
+            # one set, and the tool reports the row holding the largest KL.
+            dirs_b = set(row_dump_dirs(db)) if db.is_dir() else set()
+            for name in row_dump_dirs(da) if da.is_dir() else []:
+                dumped = True
+                if name not in dirs_b:
                     results.append(dict(a=a, b=b, repeat=repeat, file=name,
-                                        error=(proc.stderr.strip().splitlines() or ['compare failed'])[-1]))
+                                        error='row dump present in one arm only'))
                     continue
-                measured = json.loads(out.read_text())
-                results.append(dict(measured, a=a, b=b, repeat=repeat, file=name,
-                                    path_a=measured['a'], path_b=measured['b']))
+                out = Path(state['root']) / f'compare-{a}-{b}-r{repeat}-{name.replace("/", "_")}-rows.json'
+                args = [str(da / name), str(db / name), '--json', str(out)]
+                results.append(compare_one(state, python, tool, args, out, dict(a=a, b=b, repeat=repeat, file=name)))
+            if not dumped:
+                results.append(dict(a=a, b=b, repeat=repeat, file=None,
+                                    error='no saved logits common to both arms'))
     return results
+
+
+def compare_one(state, python, tool, args, out, record):
+    """Run compare-logits.py once and fold its JSON into a summary row."""
+    if python:
+        cmd = [*python, str(tool), *args]
+    else:  # the dev image has numpy; read-only views of the outputs
+        image = state['slots'][record['a']]['image_id']
+        cmd = ['docker', 'run', '--rm', '--network', 'none', '--user', f'{os.getuid()}:{os.getgid()}',
+               '-v', f'{tool}:{tool}:ro', '-v', f"{state['root']}:{state['root']}", '--entrypoint',
+               'python3', image, str(tool), *args]
+    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=3600)
+    if proc.returncode or not out.is_file():
+        return dict(record, error=(proc.stderr.strip().splitlines() or ['compare failed'])[-1])
+    measured = json.loads(out.read_text())
+    return dict(measured, **record, path_a=measured['a'], path_b=measured['b'])
 
 
 def write_summary(state, records, comparisons):
@@ -1085,17 +1115,18 @@ def write_summary(state, records, comparisons):
             lines += ['', f"workers (ready after {r.get('workers_ready_s', '-')} s):", '', '```',
                       *(worker_lines(run_dir / 'workers') or ['(no worker logs)']), '```']
     if comparisons:
-        lines += ['', '## Logits comparisons', '', '| a | b | repeat | file | byte-identical | rows | max abs diff | mean KL | max KL | top-1 |',
-                  '|---|---|---|---|---|---|---|---|---|---|']
+        lines += ['', '## Logits comparisons', '', '| a | b | repeat | file | byte-identical | rows | max abs diff | mean KL | max KL | top-1 | worst row |',
+                  '|---|---|---|---|---|---|---|---|---|---|---|']
         for c in comparisons:
             if c.get('error'):
-                lines.append(f"| {c['a']} | {c['b']} | {c['repeat']} | {c['file'] or '-'} | error: {c['error']} | | | | | |")
+                lines.append(f"| {c['a']} | {c['b']} | {c['repeat']} | {c['file'] or '-'} | error: {c['error']} | | | | | | |")
                 continue
+            worst = '-' if c['byte_identical'] or not c.get('worst_row') else c['worst_row']
             if not c['rows']:
-                lines.append(f"| {c['a']} | {c['b']} | {c['repeat']} | {c['file']} | {c['byte_identical']} | 0 | | | | |")
+                lines.append(f"| {c['a']} | {c['b']} | {c['repeat']} | {c['file']} | {c['byte_identical']} | 0 | | | | | {worst} |")
                 continue
             lines.append(f"| {c['a']} | {c['b']} | {c['repeat']} | {c['file']} | {c['byte_identical']} | {c['rows']} | "
-                         f"{c['max_abs_diff']:.4e} | {c['mean_kl']:.6f} | {c['max_kl']:.6f} | {100 * c['top1_agreement']:.2f}% |")
+                         f"{c['max_abs_diff']:.4e} | {c['mean_kl']:.6f} | {c['max_kl']:.6f} | {100 * c['top1_agreement']:.2f}% | {worst} |")
     text = '\n'.join(lines) + '\n'
     (Path(state['root']) / 'summary.md').write_text(text)
     return text
