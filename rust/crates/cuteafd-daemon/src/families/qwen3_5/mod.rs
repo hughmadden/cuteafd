@@ -96,7 +96,7 @@ pub(crate) async fn run_golden(args: GoldenArgs) -> Result<()> {
     let marks = args.prefix_check.then_some(crate::shared::prefix::MarkRule {
         lanes: slots, entries: 1, budget_bytes: 1 << 30, host: false });
     let mut engine = engine::DenseEngine::with_prefix(&library, &programs, &checkpoint, cfg.clone(),
-        args.pool_tokens, None, slots, marks, args.kv_cache)?;
+        args.pool_tokens, None, slots, marks, args.kv_cache, false)?;
     if args.verify_check {
         engine.verify_check(&tokens)?;
         if args.state_slots > 1 { engine.multislot_verify_check(&tokens)?; }

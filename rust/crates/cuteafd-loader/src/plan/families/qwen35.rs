@@ -94,7 +94,7 @@ impl FamilyModel for Model {
             return Err(CacheGeometryError::Unsupported { family: "qwen3_5", what: "dense target currently owns one GPU" });
         }
         let cfg = &self.header.config;
-        let buffers = crate::placement::families::qwen3_5::NativeBuffers::new(cfg, 0, 1, 0)
+        let buffers = crate::placement::families::qwen3_5::NativeBuffers::new(cfg, 0, 1, 0, false)
             .map_err(|_| CacheGeometryError::Overflow("dense native cache"))?;
         let state = buffers.mark_bytes as u64;
         let gdn = cfg.attention.iter().filter(|&&kind| kind == HybridAttention::Gdn).count() as u64;
@@ -151,10 +151,10 @@ fn native_layout(cfg: &crate::families::qwen3_5::Qwen35Config, input: &crate::pl
     ensure!(scratch > 0 && matches!(options.prefill_rows, 0 | 4096), "dense native prefill requires capacity 4096");
     let slots = usize::try_from(if options.concurrency == 0 { 4 } else { options.concurrency })?;
     ensure!(options.state_slots.is_none_or(|n| n == slots as u64), "dense state slots must equal concurrency");
-    let mark = NativeBuffers::new(cfg, scratch as usize, slots, 0)?.mark_bytes;
+    let mark = NativeBuffers::new(cfg, scratch as usize, slots, 0, options.full_prefill_logits)?.mark_bytes;
     let marks = options.prefix_slots.unwrap_or_else(|| cuteafd_core::prefix::mark_slots_with_host(slots as u64,
         options.mimo_prefix_entries, mark as u64, options.mimo_prefix_mark_bytes, options.host_cache_bytes != Some(0)));
-    let buffers = NativeBuffers::new(cfg, scratch as usize, slots, usize::try_from(marks)?)?;
+    let buffers = NativeBuffers::new(cfg, scratch as usize, slots, usize::try_from(marks)?, options.full_prefill_logits)?;
     let weights = NativeWeights::bf16(input.checkpoint(), cfg, norm.context("missing GDN precision")?)?;
     let (layers, fixed) = weights.demands(cfg, &buffers, slots);
     let capacity = options.rtx_bytes[0];

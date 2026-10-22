@@ -117,6 +117,7 @@ pub const HEAD_WORKSPACE: usize = 4 << 20;
 pub struct NativeBuffers {
     pub planes: [usize; 13],
     pub logits: usize,
+    pub head_rows: usize,
     pub ids: usize,
     pub head: usize,
     pub commit: usize,
@@ -129,7 +130,7 @@ pub struct NativeBuffers {
 }
 
 impl NativeBuffers {
-    pub fn new(cfg: &Qwen35Config, scratch: usize, slots: usize, marks: usize) -> Result<Self> {
+    pub fn new(cfg: &Qwen35Config, scratch: usize, slots: usize, marks: usize, full_prefill_logits: bool) -> Result<Self> {
         ensure!((1..=VERIFY_ROWS).contains(&slots), "dense state slots must be 1..64");
         // Bound all products below before computing the native allocation recipe.
         ensure!(cfg.hidden <= 16_777_216 && cfg.vocab <= 16_777_216
@@ -150,7 +151,8 @@ impl NativeBuffers {
         let planes = [hidden, hidden, hidden, query, query, query, scratch,
             PREFILL_ROWS * 4, PREFILL_ROWS * 4, PREFILL_ROWS * 12, PREFILL_ROWS * 8,
             PREFILL_ROWS * 8, VERIFY_ROWS * cfg.max_context.div_ceil(64) * 4].map(|n| n.max(256));
-        Ok(Self { planes, logits: VERIFY_ROWS * cfg.vocab * 4, ids: PREFILL_ROWS * 4,
+        let head_rows = if full_prefill_logits { PREFILL_ROWS } else { VERIFY_ROWS };
+        Ok(Self { planes, logits: head_rows * cfg.vocab * 4, head_rows, ids: PREFILL_ROWS * 4,
             head: HEAD_WORKSPACE, commit: 3 * VERIFY_ROWS * 4, state_per_layer, replay_per_layer,
             verify: [mark_bytes.checked_mul(slots).ok_or_else(|| anyhow::anyhow!("dense verify mark overflow"))?.max(256),
                 VERIFY_ROWS * cfg.vocab * 4, cfg.attention.len() * VERIFY_ROWS * cfg.hidden * 2],
@@ -318,7 +320,7 @@ pub fn validate(cfg: &Qwen35Config, op: &str, rows: usize, format: crate::famili
             integer(spec, "value_heads", cfg.gdn.value_heads)?;
             integer(spec, "channels", cfg.gdn.conv_width())?;
             integer(spec, "replay_rows", VERIFY_ROWS)?;
-            integer(spec, "replay_bytes", NativeBuffers::new(cfg, 0, 1, 0)?.replay_per_layer)?;
+            integer(spec, "replay_bytes", NativeBuffers::new(cfg, 0, 1, 0, false)?.replay_per_layer)?;
         }
         "attn_producer" | "full_gqa" => {
             integer(spec, "heads", cfg.heads)?;
