@@ -64,7 +64,7 @@ impl<'a> IndexQueryWeights<'a> {
             raw: library.cuda_stream_create()?,
         };
         let launched =
-            unsafe { kernel.pack_scales(tensors.get(&names[1])?, scales.buffer, stream.raw) };
+            unsafe { crate::shared::experts::rtx::dense::v41_pack_scales(&kernel, tensors.get(&names[1])?, scales.buffer, stream.raw) };
         let drained = unsafe { library.cuda_stream_synchronize(stream.raw) };
         launched.and(drained)?;
         Ok(Self {
@@ -581,5 +581,13 @@ mod reuse_tests {
         assert_eq!(comparisons, 48);
         eprintln!("PASS 48 real index-query fresh/rebound comparisons, all eight layers, rows 1/80/4096, changed inputs, cached handles and invalid-row recovery");
         Ok(())
+    }
+}
+
+#[cfg(test)]
+impl IndexQueryWeights<'_> {
+    pub(crate) fn visit(&self, prefix: &str, f: &mut dyn FnMut(String, cuteafd_ffi::CuteafdDeviceBuffer)) {
+        self.tensors.visit(prefix, f);
+        f(format!("{prefix}packed_scale"), self.scales.buffer);
     }
 }

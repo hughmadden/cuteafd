@@ -97,8 +97,9 @@ fn native_ring_commit_failure_and_scalar_rejection_drop_before_mount_barrier() -
         }
         let events_path = fixture.directory().join("events");
         let before = fixture.events()?.len();
+        let server_socket = socket.clone();
         let server = std::thread::spawn(move || -> Result<()> {
-            let conn = listener.accept()?;
+            let conn = crate::shared::memory::push_testing::accept_within(&listener, &server_socket, Duration::from_secs(120))?;
             conn.set_timeout(Some(Duration::from_secs(10)))?;
             let (request, fd) = conn.next_request()?.context("native rank did not join")?;
             let Request::Join {
