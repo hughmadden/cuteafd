@@ -130,7 +130,7 @@ impl<'e, 'a> Backend<'a> for DenseBackend<'e, 'a> {
                 placement.state_len = placement.len;
             }
         }
-        Ok((logit_rows > 0).then_some(output))
+        Ok(Some(output))
     }
     fn verify_device_ungraphed(&self, sequences: &mut [(&mut Placement, &[u32])], speculative: bool,
         _kind: scheduler::UngraphedKind, pool: &cuteafd_engine::prefix::RefPagePool) -> Result<Option<DeviceLogits>> {

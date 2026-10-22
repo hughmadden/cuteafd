@@ -3561,4 +3561,4 @@ def test_dense_full_prefill_logits_reaches_serve_and_plan(tmp_path, full, kv):
     assert ("--full-prefill-logits" in launch) == (full == "on")
     assert ("--full-prefill-logits" in plan) == (full == "on")
     assert f"--kv-cache {kv}" in launch
-    assert f"--dense-qwen-kv-cache {kv}" in plan
+    assert f"--kv-cache {kv}" in plan
