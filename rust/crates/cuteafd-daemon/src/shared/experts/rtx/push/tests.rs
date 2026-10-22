@@ -349,7 +349,7 @@ fn dense_planning_error_sends_the_whole_group_to_mount() -> Result<()> {
     mark(root.path(), c"user.sparknest.cluster", br#"{"me":"coordinator"}"#)?;
     for entry in std::fs::read_dir(root.path())? {
         let path = entry?.path();
-        if path.extension().is_some_and(|e| e == "safetensors") { mark(&path, c"user.sparknest.hosts", b"[]")?; }
+        if path.extension().is_some_and(|e| e == "safetensors") { mark(&path, c"user.sparknest.hosts", b"coordinator")?; }
     }
     let catalog = cuteafd_loader::read_expert_catalog(root.path())?;
     dense_error_mount_group(&library, root.path(), &catalog, true)?;
@@ -778,7 +778,7 @@ fn scales_first_shard_keeps_one_open_step_per_source() -> Result<()> {
         Ok(())
     };
     mark(root.path(), c"user.sparknest.cluster", br#"{"me":"coordinator"}"#)?;
-    mark(&shard, c"user.sparknest.hosts", b"[]")?;
+    mark(&shard, c"user.sparknest.hosts", b"coordinator")?;
     let rect = |base: usize, bytes: usize| Rect { name: format!("t{base}"), path: shard.clone(), base: base as u64,
         row_bytes: bytes, rows: 0..1, cols: 0..bytes };
     let (scale_at, weight_at) = (|e: usize| e * scale, |e: usize| experts * scale + e * weight);
@@ -864,7 +864,7 @@ fn coordinator_ranks_alone_push_dense_records_exactly() -> Result<()> {
     for entry in std::fs::read_dir(root.path())? {
         let path = entry?.path();
         if path.extension().is_some_and(|e| e == "safetensors") {
-            mark(&path, c"user.sparknest.hosts", b"[]")?;
+            mark(&path, c"user.sparknest.hosts", b"coordinator")?;
             let bytes = std::fs::metadata(&path)?.len();
             let pattern: Vec<u8> = (0..bytes).map(|i| (i as u8).wrapping_mul(29) ^ 0xa5).collect();
             // Keep the header; pattern the payload.
