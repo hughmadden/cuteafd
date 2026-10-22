@@ -175,7 +175,7 @@ fn installed_coordinator_tp2_scale_codes_equal_cpu_pack() -> Result<()> {
         let budget = ExpertWeights::plan(&library, &catalog, layer)?;
         let plan = CoordinatorExpertPlan::new(&catalog, &[3], rank, budget.resident_bytes)?;
         ensure!(plan.layout.bytes() == budget.resident_bytes, "TP2 admitted extent mismatch");
-        let pushed = receive_pushed(device, &catalog, &snapshot, sockets.path(), &records,
+        let pushed = receive_pushed(device, Some(&catalog), &snapshot, sockets.path(), &records,
             Some(plan), 6, rank)?.native()?;
         ensure!(pushed.len() == 1, "expected one committed TP2 layer");
         compare_mount(&library, &catalog, &pushed[0], layer)?;

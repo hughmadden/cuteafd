@@ -160,7 +160,7 @@ fn installed_pushed_coordinator_operands_match_the_mount_golden() -> Result<()> 
             for gpu in 0..if placed { 2 } else { 1 } {
                 if !records.operands.iter().any(|o| o.device == gpu as i32) { continue; }
                 crate::shared::experts::rtx::push::tests::receive_pushed(Device { library: &library, id: gpu as i32 },
-                    &catalog, &root, sockets.path(), &records, None, 0, gpu)?;
+                    Some(&catalog), &root, sockets.path(), &records, None, 0, gpu)?;
             }
             for (staged, pinned) in crate::shared::experts::rtx::dense::testing::PEAKS.with(|p| p.take()) {
                 ensure!(staged <= STEP_BYTES as u64 && pinned <= STEP_BYTES as u64,

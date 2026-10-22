@@ -457,6 +457,9 @@ impl<'a> LayerWeights<'a> {
     }
 }
 
+#[path = "records.rs"]
+pub(crate) mod records;
+
 #[cfg(test)]
 #[path = "coordinator_golden_tests.rs"]
 pub(crate) mod coordinator_golden_tests;

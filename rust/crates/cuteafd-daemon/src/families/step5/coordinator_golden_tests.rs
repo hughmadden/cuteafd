@@ -181,7 +181,7 @@ fn installed_pushed_coordinator_operands_match_the_mount_golden() -> Result<()> 
     let catalog = cuteafd_loader::read_expert_catalog(&snapshot)?;
     let sockets = tempfile::tempdir()?;
     for gpu in 0..2 {
-        crate::shared::experts::rtx::push::tests::receive_pushed(Device { library: &library, id: gpu }, &catalog, &root,
+        crate::shared::experts::rtx::push::tests::receive_pushed(Device { library: &library, id: gpu }, Some(&catalog), &root,
             sockets.path(), &records, None, 6, gpu as usize)?;
     }
     for (staged, pinned) in crate::shared::experts::rtx::dense::testing::PEAKS.with(|p| p.take()) {

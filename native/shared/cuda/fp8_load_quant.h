@@ -262,6 +262,21 @@ CUTEAFD_LQ_FN uint16_t narrow_f32(uint32_t bits) {
   return uint16_t((bits + 0x7fffu + ((bits >> 16) & 1u)) >> 16);
 }
 
+// Two BF16 values promoted to F32 and multiplied once, round to nearest
+// (the Kimi residual score `norm * proj`, never a BF16 product).
+CUTEAFD_LQ_FN uint32_t product_bf16_f32(uint16_t a, uint16_t b) {
+  return f32_bits(fmul(bits_f32(widen_bf16(a)), bits_f32(widen_bf16(b))));
+}
+
+// EXL3 trellis tiles (16x16, `tile_bytes` each) of a staged window: `rows`
+// K16 rows from local row `k0`, `tiles` N16 tiles each, in checkpoint order
+// [K16][N16]. Staged tile (r, c) lands at this tile index of the native
+// shard: side 0 (output) [N128][K16][8], side 1 (input) [K128][N128][8][8].
+CUTEAFD_LQ_FN int64_t trellis_tile(int32_t side, int64_t kr, int64_t c, int64_t tiles, int64_t k16) {
+  if (side == 0) return ((c / 8) * k16 + kr) * 8 + c % 8;
+  return ((kr / 8) * (tiles / 8) + c / 8) * 64 + (kr % 8) * 8 + c % 8;
+}
+
 // MLA kv_b [heads * (nope + v), lat] BF16 split per head into
 // uk [heads][lat][nope] (key rows transposed) and uv [heads][v][lat] (value
 // rows copied), for heads [h0, h0 + count): element `i` of that output range.

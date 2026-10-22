@@ -44,6 +44,26 @@ extern "C" int32_t cuteafd_load_kvb_absorb(const void* kv_b, void* uk, void* uv,
   return 0;
 }
 
+extern "C" int32_t cuteafd_load_bf16_product_f32(const void* a, const void* b, void* dst, int64_t n, void* stream) {
+  (void)stream;
+  for (int64_t i = 0; i < n; ++i)
+    static_cast<uint32_t*>(dst)[i] = cuteafd_load_quant::product_bf16_f32(static_cast<const uint16_t*>(a)[i],
+                                                                          static_cast<const uint16_t*>(b)[i]);
+  return 0;
+}
+
+extern "C" int32_t cuteafd_load_trellis_tiles(const void* src, void* dst, int64_t rows, int64_t k0, int64_t tiles,
+                                              int64_t tile_bytes, int32_t side, int64_t k16, void* stream) {
+  (void)stream;
+  if (rows < 1 || k0 < 0 || tiles < 1 || tile_bytes < 16 || tile_bytes % 16 != 0 || (side != 0 && side != 1)
+      || k0 + rows > k16 || tiles % 8 != 0) return 1;
+  for (int64_t r = 0; r < rows; ++r)
+    for (int64_t c = 0; c < tiles; ++c)
+      memcpy(static_cast<uint8_t*>(dst) + cuteafd_load_quant::trellis_tile(side, k0 + r, c, tiles, k16) * tile_bytes,
+             static_cast<const uint8_t*>(src) + (r * tiles + c) * tile_bytes, size_t(tile_bytes));
+  return 0;
+}
+
 #include "../../../../../native/shared/cuda/load_scale_gather.h"
 
 extern "C" int32_t cuteafd_load_scale_gather(const void* grid, const void* index, void* row_major, void* k_major,
