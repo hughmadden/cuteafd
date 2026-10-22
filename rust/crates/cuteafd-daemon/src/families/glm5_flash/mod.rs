@@ -1846,7 +1846,7 @@ impl Opened {
                     let planned = plan_dense(peers.len())?;
                     let prepared = crate::shared::experts::rtx::push::CoordinatorPush::prepare(&args.snapshot,
                         self.experts.as_ref().filter(|_| tp2.is_some()), gpus,
-                        tp2.map(|budgets| (&tp2_layers[..], budgets)))?;
+                        tp2.map(|budgets| crate::shared::experts::rtx::push::CoordinatorExperts::Tp2 { layers: tp2_layers.clone(), budgets }))?;
                     Ok((prepared, planned))
                 })().map_err(|error| tracing::warn!(%error, "coordinator push unavailable; mount")).ok()
             } else { None };
@@ -1864,7 +1864,7 @@ impl Opened {
                     let planned = plan_dense(0)?;
                     let push = crate::shared::experts::rtx::push::CoordinatorPush::prepare_alone(&args.snapshot,
                         self.experts.as_ref().filter(|_| tp2.is_some()), gpus,
-                        tp2.map(|budgets| (&tp2_layers[..], budgets)))?;
+                        tp2.map(|budgets| crate::shared::experts::rtx::push::CoordinatorExperts::Tp2 { layers: tp2_layers.clone(), budgets }))?;
                     Ok((push, 0, devices.clone(), planned))
                 })().map_err(|error| tracing::warn!(%error, "coordinator push unavailable; mount")).ok();
             }

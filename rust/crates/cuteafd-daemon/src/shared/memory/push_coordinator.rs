@@ -9,11 +9,11 @@ use anyhow::{ensure, Context, Result};
 use cuteafd_loader::{push_load::builder::{Builder, CheckedPlan, Destination}, OfficialV41Catalog, V41Exl3Layer,
     V41Exl3Residency};
 
-/// One coordinator GPU's admitted TP2 expert halves, laid out as today's mount
-/// arenas, one region per layer: EXL3 residencies (the legacy, non-balanced
-/// coordinator residency) or native MXFP4 planes (the Spark native images at
-/// world 2, packed after Done like a Spark rank's).
-pub(crate) struct Tp2ExpertPlan {
+/// One coordinator GPU's admitted expert layers, laid out as today's mount
+/// arenas, one region per layer: EXL3 residencies of TP2 halves or of whole
+/// (world 1) layers and draft stages, or native MXFP4 TP2 planes (the Spark
+/// native images at world 2, packed after Done like a Spark rank's).
+pub(crate) struct CoordinatorExpertPlan {
     pub residencies: Vec<V41Exl3Residency>,
     /// Native planes per layer (empty for EXL3).
     pub native: Vec<cuteafd_loader::push_load::native::NativePlanes>,
@@ -24,21 +24,35 @@ pub(crate) struct Tp2ExpertPlan {
     pub scales: super::push_native::ScalePlan,
 }
 
-impl Tp2ExpertPlan {
+impl CoordinatorExpertPlan {
     pub fn new(catalog: &OfficialV41Catalog, layers: &[usize], gpu: usize, admitted: usize) -> Result<Self> {
         ensure!(gpu < 2, "coordinator TP2 has two GPUs");
         if catalog.exl3().is_none() { return Self::native(catalog, layers, gpu, admitted); }
         let manifest = catalog.exl3().context("coordinator TP2 push requires EXL3 checkpoint headers")?;
         let residencies = layers.iter().map(|&layer| manifest.residency(V41Exl3Layer::Backbone(layer), 2, gpu))
             .collect::<Result<Vec<_>>>()?;
-        ensure!(residencies.iter().all(|r| r.unit_map.is_none()), "coordinator TP2 keeps the legacy residency");
+        Self::exl3(residencies, layers.to_vec(), gpu, admitted)
+    }
+
+    /// Whole (world 1) EXL3 residencies on one coordinator GPU, backbone
+    /// layers and draft stages, as the caller planned them (the local mount
+    /// loader's own residencies).
+    pub fn whole(residencies: Vec<V41Exl3Residency>, admitted: usize) -> Result<Self> {
+        ensure!(residencies.iter().all(|r| r.world == 1 && r.rank == 0),
+            "a whole-layer coordinator plan takes world-1 residencies");
+        let layers = residencies.iter().filter_map(|r| match r.layer { V41Exl3Layer::Backbone(layer) => Some(layer),
+            _ => None }).collect();
+        Self::exl3(residencies, layers, 0, admitted)
+    }
+
+    fn exl3(residencies: Vec<V41Exl3Residency>, layers: Vec<usize>, gpu: usize, admitted: usize) -> Result<Self> {
+        ensure!(residencies.iter().all(|r| r.unit_map.is_none()), "coordinator EXL3 keeps the legacy residency");
         let sizes = residencies.iter().map(|r| r.device_arena_layout().map(|(_, bytes)| bytes))
             .collect::<Result<Vec<_>, _>>()?;
         let layout = ArenaLayout::new(sizes, admitted)?;
         let validation = ValidationLayout::exl3(&residencies, layout.bytes() as u64, usize::MAX)?;
         let layout = layout.with_validation(validation.bytes(), validation.bytes())?;
-        Ok(Self { residencies, native: Vec::new(), layers: layers.to_vec(), gpu, layout, validation,
-            scales: Default::default() })
+        Ok(Self { residencies, native: Vec::new(), layers, gpu, layout, validation, scales: Default::default() })
     }
 
     /// Native MXFP4 halves: each layer's four planes for intermediate half

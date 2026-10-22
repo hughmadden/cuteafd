@@ -88,7 +88,7 @@ fn coordinator_tp2_pair_is_mount_exact_on_two_devices_and_drops_before_retry() -
     }
     let (sparks, world) = (6usize, 8usize);
     for fail in [false, true] {
-        let plans = (0..2).map(|gpu| Tp2ExpertPlan::new(&catalog, &[0, 1], gpu, usize::MAX)).collect::<Result<Vec<_>>>()?;
+        let plans = (0..2).map(|gpu| CoordinatorExpertPlan::new(&catalog, &[0, 1], gpu, usize::MAX)).collect::<Result<Vec<_>>>()?;
         let checked = plans.iter().enumerate().map(|(gpu, plan)| plan.checked(&catalog, root.path(), world, sparks + gpu))
             .collect::<Result<Vec<_>>>()?;
         // Independent mount reference: the coordinator's legacy residency reads.
@@ -248,7 +248,7 @@ fn combined_rank_lands_dense_operands_and_tp2_halves_exactly() -> Result<()> {
     }
     let base = cursor.next_multiple_of(256);
     let (rank, world) = (6usize, 8usize);
-    let plan = Tp2ExpertPlan::new(&catalog, &[0, 1], 0, usize::MAX)?;
+    let plan = CoordinatorExpertPlan::new(&catalog, &[0, 1], 0, usize::MAX)?;
     let checked_tp2 = plan.checked(&catalog, root.path(), world, rank)?;
     let mut arenas = vec![0; world];
     arenas[rank] = base + plan.layout.logical_bytes() as u64;
@@ -371,13 +371,13 @@ fn dense_error_mount_group(library: &cuteafd_ffi::NativeLibrary, root: &std::pat
     catalog: &OfficialV41Catalog, tp2: bool) -> Result<()> {
     let sparks = 1;
     if tp2 { for gpu in 0..2 {
-        let plan = Tp2ExpertPlan::new(catalog, &[0, 1], gpu, usize::MAX)?;
+        let plan = CoordinatorExpertPlan::new(catalog, &[0, 1], gpu, usize::MAX)?;
         let checked = plan.checked(catalog, root, sparks + 2, sparks + gpu)?;
         assert!(checked.plan.files.iter().all(|f| cuteafd_loader::push_load::is_push_shard(&root.join(f))),
             "without the dense error the TP2 halves would be offered");
     } }
     let (push, coordinator_streams, _) = CoordinatorPush::prepare(root, Some(catalog), 2,
-        tp2.then_some((&[0, 1][..], vec![usize::MAX; 2])))?;
+        tp2.then(|| CoordinatorExperts::Tp2 { layers: vec![0, 1], budgets: vec![usize::MAX; 2] }))?;
     // One Spark rank offering push, then the two coordinator ranks, in group order.
     let (mut spark_driver, mut spark) = control_pair()?;
     let spark_thread = std::thread::spawn(move || cuteafd_transport::worker_selection::push::offer(&mut spark,
@@ -590,7 +590,7 @@ fn sparknest_model_one_coordinator_rank_beside_spark_ranks() {
 /// committed. For installed-checkpoint goldens on real or fake devices.
 pub(crate) fn receive_pushed<'a>(device: Device<'a>, catalog: &cuteafd_loader::OfficialV41Catalog,
     root: &std::path::Path, socket_dir: &std::path::Path, records: &crate::shared::experts::rtx::dense::Records,
-    tp2: Option<Tp2ExpertPlan>, sparks: usize, gpu: usize) -> Result<PushedTp2<'a>> {
+    tp2: Option<CoordinatorExpertPlan>, sparks: usize, gpu: usize) -> Result<PushedExperts<'a>> {
     use crate::shared::experts::rtx::dense::RankLayout;
     let rank = sparks + gpu;
     let layout = RankLayout::new(records.operands.clone(), records.steps.clone(), device.id)?
@@ -724,7 +724,7 @@ fn receive_pushed_replays_dense_records_and_tp2_halves() -> Result<()> {
         bytes: dense[0].bytes() });
     records.steps.push(Step { device: 0, rects: vec![dense[1].clone()],
         jobs: vec![Job::Upload { at: 0, bytes: dense[1].bytes(), dst: allocations[1].buffer }] });
-    let plan = Tp2ExpertPlan::new(&catalog, &[0, 1], 0, usize::MAX)?;
+    let plan = CoordinatorExpertPlan::new(&catalog, &[0, 1], 0, usize::MAX)?;
     let sockets = tempfile::tempdir_in(fixture.directory())?;
     let pushed = receive_pushed(device, &catalog, root.path(), sockets.path(), &records, Some(plan), 1, 0)?;
     assert_eq!(pushed.exl3()?.len(), 2);
@@ -1002,6 +1002,67 @@ fn coordinator_ranks_alone_push_dense_records_exactly() -> Result<()> {
             devices[gpu].run(|| library.copy_d2h(&mut actual,
                 cuteafd_ffi::CuteafdDeviceBuffer { bytes: rect.bytes(), ..allocation.buffer }))?;
             assert_eq!(actual, expected, "GPU {gpu} {}", rect.name);
+        }
+    }
+    Ok(())
+}
+
+/// Coordinator EXL3 expert layers push byte for byte as the mount reads them,
+/// as TP2 halves over two GPUs (world 2) and as whole layers on one (world 1,
+/// the coordinator-local residency).
+#[test]
+#[ignore = "requires an allocated CPU build slot and explicit NVMe fixture directory"]
+fn coordinator_exl3_layers_push_byte_exact_at_world_one_and_two() -> Result<()> {
+    use crate::shared::experts::layer::ExpertLayer;
+    let fixture = Fixture::build()?;
+    let library = fixture.load()?;
+    for device in 0..2 { fixture.configure_memory(&library, device, 64 << 30)?; }
+    let root = tempfile::tempdir_in(fixture.directory())?;
+    let (tensors, _) = qwen4_exl3(2, 4);
+    let tensors: Vec<_> = tensors.into_iter().filter(|t| !t.0.contains(".experts.") || t.0.contains(".experts.0.")).collect();
+    let mut config = qwen4_config(2);
+    config["text_config"]["num_experts"] = serde_json::json!(1);
+    config["text_config"]["num_experts_per_tok"] = serde_json::json!(1);
+    write_snapshot(root.path(), &config, &tensors, None);
+    let catalog = cuteafd_loader::read_expert_catalog(root.path())?;
+    for tensor in catalog.tensors() {
+        let image: Vec<u8> = if tensor.metadata.name.ends_with(".mcg") { 0xcbac1fedu32.to_le_bytes().to_vec() }
+            else if tensor.metadata.name.ends_with(".suh") || tensor.metadata.name.ends_with(".svh") {
+                [0u8, 0x3c].into_iter().cycle().take(tensor.metadata.byte_length as usize).collect()
+            } else { (0..tensor.metadata.byte_length).map(|i| (i as u8).wrapping_mul(13) ^ 0x5a).collect() };
+        File::options().write(true).open(root.path().join(&tensor.shard))?.write_all_at(&image, tensor.metadata.byte_offset)?;
+    }
+    let records = crate::shared::experts::rtx::dense::Records::default();
+    let sockets = tempfile::tempdir_in(fixture.directory())?;
+    let whole = [ExpertLayer::BackboneFull { layer: 0 }, ExpertLayer::BackboneFull { layer: 1 }];
+    let plans: Vec<(CoordinatorExpertPlan, usize)> = vec![
+        (CoordinatorExpertPlan::whole(whole.iter().map(|&s| crate::shared::experts::exl3::planned_residency(&catalog, s))
+            .collect::<Result<Vec<_>>>()?, usize::MAX)?, 0),
+        (CoordinatorExpertPlan::new(&catalog, &[0, 1], 0, usize::MAX)?, 0),
+        (CoordinatorExpertPlan::new(&catalog, &[0, 1], 1, usize::MAX)?, 1),
+    ];
+    for (plan, gpu) in plans {
+        let world = plan.residencies[0].world;
+        let pushed = receive_pushed(Device { library: &library, id: gpu as i32 }, &catalog, root.path(), sockets.path(),
+            &records, Some(plan), 0, gpu)?.exl3()?;
+        assert_eq!(pushed.len(), 2, "world {world}");
+        for weight in &pushed {
+            assert_eq!(weight.layout.world, world);
+            let mut scratch = vec![0; weight.layout.scratch_bytes(&catalog)?];
+            for (index, load) in weight.layout.loads.iter().enumerate() {
+                let mut expected = vec![0; load.bytes];
+                weight.layout.read_into(&catalog, index, &mut expected, &mut scratch)?;
+                for &(buffer, offset) in &load.destinations {
+                    let spec = &weight.layout.buffers[buffer];
+                    let buffer = weight.buffer(&spec.name)?;
+                    let mut actual = vec![0; load.bytes];
+                    // SAFETY: the load's destination range lies inside this published buffer.
+                    let view = cuteafd_ffi::CuteafdDeviceBuffer { bytes: load.bytes,
+                        ptr: unsafe { buffer.ptr.cast::<u8>().add(offset).cast() }, ..buffer };
+                    Device { library: &library, id: gpu as i32 }.run(|| library.copy_d2h(&mut actual, view))?;
+                    assert_eq!(actual, expected, "world {world} {}", load.tensor);
+                }
+            }
         }
     }
     Ok(())

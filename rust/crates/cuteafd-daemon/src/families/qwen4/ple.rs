@@ -37,7 +37,8 @@ impl<'a> PleTable<'a> {
         args: &MappedTableArgs, max_rows: usize) -> Result<Self> {
         let _memory_scope = cuteafd_ffi::memory_ledger::scope("ple");
         let loader = super::weights::Qwen4Loader { library, checkpoint, fp8_decode: false,
-            fp8_scales: crate::shared::fp8_linear::Fp8Scales::Amax, stream: std::ptr::null_mut() };
+            fp8_scales: crate::shared::fp8_linear::Fp8Scales::Amax, stream: std::ptr::null_mut(),
+            dense: std::rc::Rc::new(crate::shared::experts::rtx::dense::DenseLoad::mount(library)) };
         let prefix = format!("{}layers.{layer}.ple.ple_embedding.", super::weights::PREFIX);
         let multipliers = i64s(&loader.raw(&format!("{prefix}layer_multipliers"))?.0);
         let sizes = i64s(&loader.raw(&format!("{prefix}ngram_heads_vocab_sizes"))?.0);

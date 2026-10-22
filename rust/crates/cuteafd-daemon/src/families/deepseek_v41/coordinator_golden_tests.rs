@@ -258,7 +258,7 @@ fn installed_pushed_coordinator_operands_match_the_mount_golden() -> Result<()> 
         {finishes} finishes");
     assert!(largest <= STEP_BYTES, "a step stages {largest} bytes");
     // Native TP2 halves, admitted as serving admits them.
-    let plans = (0..2).map(|gpu| crate::shared::memory::push_coordinator::Tp2ExpertPlan::new(&catalog,
+    let plans = (0..2).map(|gpu| crate::shared::memory::push_coordinator::CoordinatorExpertPlan::new(&catalog,
         &(0..layers).collect::<Vec<_>>(), gpu, usize::MAX)).collect::<Result<Vec<_>>>()?;
     rss_guard(32)?;
     let mut pushed = Vec::new();
