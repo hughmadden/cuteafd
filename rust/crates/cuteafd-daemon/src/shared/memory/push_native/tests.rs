@@ -1,6 +1,208 @@
 use super::*;
 use std::os::unix::fs::FileExt;
 
+/// Replay real shard offsets without reading weight payloads or allocating a
+/// device arena. Each completed scale step contributes its entire code/base
+/// write footprint; padding is initialized separately, never counted as a job.
+#[test]
+fn real_1017_coded_scale_plan_file_order_has_bounded_staging_and_no_holes() -> Result<()> {
+    use crate::shared::experts::rtx::dense::{MAX_OPEN_STEPS, STEP_BYTES};
+    use cuteafd_loader::push_load::plan::{Entry, Steps};
+    use std::collections::{BTreeMap, BTreeSet, VecDeque};
+
+    let Some(snapshot) = std::env::var_os("CUTEAFD_SCALE_CODES_LAYOUT_SNAPSHOT") else { return Ok(()); };
+    let snapshot = std::path::PathBuf::from(snapshot);
+    let catalog = cuteafd_loader::read_official_v41_catalog(&snapshot)?;
+    let shape = catalog.routed_experts();
+    ensure!(catalog.mxfp4_scale_codes() && catalog.nvfp4().is_none(), "requires coded native V4.1");
+    assert_eq!((shape.hidden, shape.intermediate, shape.experts, shape.layers), (5120, 2304, 384, 40));
+    let budget = 257usize << 20;
+    assert_eq!(MAX_OPEN_STEPS * STEP_BYTES + (1 << 20), budget);
+
+    struct Plane {
+        rows: Vec<u8>,
+        columns: usize,
+        bytes: usize,
+    }
+    impl Plane {
+        fn new(hidden: usize, logical: usize, stored: usize, down: bool) -> Self {
+            let mut rows = vec![0; if down { hidden } else { 2 * stored }];
+            if !down {
+                rows[logical..stored].fill(2);
+                rows[stored + logical..].fill(2);
+            }
+            let columns = if down { logical / 32 } else { hidden / 32 };
+            let bytes = rows.len() * (1 + 2 * columns.div_ceil(4));
+            Self { rows, columns, bytes }
+        }
+        fn write(&mut self, first: usize, count: usize) {
+            assert!(self.rows[first..first + count].iter().all(|&n| n == 0),
+                "overlapping transform rows or a transform wrote FC1 padding");
+            self.rows[first..first + count].fill(1);
+        }
+        fn complete(&self) -> bool { self.rows.iter().all(|&n| n != 0) }
+        fn check_bytes(&self) {
+            let tiles = self.columns.div_ceil(4);
+            let code_bytes = self.rows.len() * 2 * tiles;
+            let mut writes = vec![0u8; self.bytes];
+            // Expand row ownership independently into every lane-major code
+            // byte and row base. Duplicate writes and unwritten padding fail.
+            for group in (0..self.rows.len()).step_by(256) {
+                let mut first = group;
+                while first < group + 256 {
+                    let owner = self.rows[first];
+                    assert_ne!(owner, 0, "generated plane contains an unwritten row");
+                    let end = (first + 1..group + 256).find(|&row| self.rows[row] != owner)
+                        .unwrap_or(group + 256);
+                    for tile in 0..tiles {
+                        let start = ((group / 256 * tiles + tile) * 256 + first % 256) * 2;
+                        let range = &mut writes[start..start + (end - first) * 2];
+                        assert!(range.iter().all(|&n| n == 0), "overlapping generated code bytes");
+                        range.fill(owner);
+                    }
+                    let bases = &mut writes[code_bytes + first..code_bytes + end];
+                    assert!(bases.iter().all(|&n| n == 0), "overlapping generated row bases");
+                    bases.fill(owner);
+                    first = end;
+                }
+            }
+            assert!(writes.iter().all(|&n| n != 0), "generated plane has byte holes");
+        }
+    }
+
+    for world in [4, 6] {
+        let rank = world - 1;
+        let logical = shape.intermediate / world;
+        let stored = logical.div_ceil(128) * 128;
+        let planes = NativePlanes::with_scale_codes(shape.hidden, logical, stored, shape.experts, false, true)?;
+        let slices = (shape.first_layer..shape.layers).map(|layer| SparkSlice {
+            unit_map: None, layer: layer as u32, first: (rank * logical) as u32,
+            width: logical as u32, stored_width: stored as u32, tiers: vec![], projection_counts: vec![],
+        }).collect::<Vec<_>>();
+        let plan = RankPlan::new(&catalog, &slices, world, rank, slices.len() * planes.bytes)?;
+        let checked = plan.checked(&catalog, &snapshot, world, rank)?;
+        let tail = plan.scales.base(&plan.layout);
+        assert_eq!(plan.scales.host_peak(), budget);
+        let mut expected = BTreeMap::new();
+        for (region, _) in slices.iter().enumerate() {
+            let base = plan.layout.region(region)?.start;
+            for expert in 0..shape.experts {
+                for plane in [1, 3] {
+                    let (offset, bytes) = planes.expert_plane(plane, expert)?;
+                    let down = plane == 3;
+                    let rows = if down { shape.hidden } else { 2 * stored };
+                    let columns = if down { logical / 32 } else { shape.hidden / 32 };
+                    assert_eq!(bytes, rows * (1 + 2 * columns.div_ceil(4)));
+                    assert!(expected.insert(base + offset, (bytes, down)).is_none());
+                }
+            }
+        }
+        assert_eq!(plan.scales.steps.len(), slices.len() * shape.experts * 3);
+        let mut files = BTreeMap::<u32, Vec<&Entry>>::new();
+        for entry in &checked.plan.entries { files.entry(entry.file).or_default().push(entry); }
+        let mut separated = false;
+        for entries in files.values_mut() {
+            entries.sort_by_key(|entry| entry.src_base);
+            let mut previous_end = 0;
+            let mut weight_start = None;
+            let mut scale_start = None;
+            for entry in entries {
+                let extent = checked.plan.patterns[entry.pattern as usize].check().map_err(anyhow::Error::msg)?;
+                assert!(entry.src_base >= previous_end, "source tensor extents interleave inside a file");
+                previous_end = entry.src_base + extent.src_len;
+                if entry.dst_base < tail {
+                    if scale_start.is_some_and(|at| entry.src_base.saturating_sub(at) > (1 << 20)) { separated = true; }
+                    weight_start.get_or_insert(entry.src_base);
+                } else {
+                    if weight_start.is_some_and(|at| entry.src_base.saturating_sub(at) > (1 << 20)) { separated = true; }
+                    scale_start.get_or_insert(entry.src_base);
+                }
+            }
+        }
+        assert!(separated, "real layout did not exercise scales distant from weights");
+
+        for sources in [6, 8] {
+            let mut queues = (0..sources).map(|_| VecDeque::new()).collect::<Vec<_>>();
+            for (&file, entries) in &files {
+                for &entry in entries { queues[file as usize % sources].push_back((entry, 0u64)); }
+            }
+            let mut open = BTreeMap::<usize, usize>::new();
+            let mut completed = BTreeSet::new();
+            let mut partial = BTreeMap::<usize, Plane>::new();
+            let mut finished = BTreeSet::new();
+            let (mut peak, mut weights) = (0, 0usize);
+            while queues.iter().any(|queue| !queue.is_empty()) {
+                for queue in &mut queues {
+                    let Some((entry, consumed)) = queue.front_mut() else { continue; };
+                    if entry.dst_base < tail {
+                        weights += 1;
+                        queue.pop_front();
+                        continue;
+                    }
+                    let pattern = &checked.plan.patterns[entry.pattern as usize];
+                    let extent = pattern.check().map_err(anyhow::Error::msg)?;
+                    // Coalesce dense destination runs, preserving file/row
+                    // order, then fragment them to keep all sources interleaved.
+                    let mut dense = u64::from(pattern.run);
+                    for dim in pattern.dims.iter().rev() {
+                        let Steps::Count(count) = &dim.steps else { anyhow::bail!("unexpected scale index list"); };
+                        assert_eq!(dim.dst_stride, dense);
+                        dense *= u64::from(*count);
+                    }
+                    assert_eq!(dense, extent.bytes);
+                    let relative = entry.dst_base - tail + *consumed;
+                    let index = plan.scales.steps.partition_point(|(start, _)| *start <= relative) - 1;
+                    let (start, step) = &plan.scales.steps[index];
+                    assert_eq!(step.rects.len(), 1, "scale step spans independent source tensors");
+                    let need = step.rects[0].bytes();
+                    assert!(relative + dense - *consumed <= start + need as u64);
+                    assert!(!completed.contains(&index), "source replay reopened a completed scale step");
+                    let bytes = (dense - *consumed).min(64 << 10) as usize;
+                    let delivered = open.entry(index).or_default();
+                    assert_eq!(relative - start, *delivered as u64, "scale source has delivery holes");
+                    *delivered += bytes;
+                    peak = peak.max(open.len());
+                    assert!(open.len() <= 8 && open.len() <= MAX_OPEN_STEPS, "unbounded open scale steps");
+                    assert!(peak * (32 << 20) + (1 << 20) <= budget, "pinned scale budget exceeded");
+                    *consumed += bytes as u64;
+                    if open[&index] == need {
+                        open.remove(&index);
+                        assert!(completed.insert(index));
+                        for output in &step.outputs {
+                            let rect = &step.rects[output.rect];
+                            let &(expected_bytes, down) = expected.get(&output.offset).context("unplanned coded plane")?;
+                            assert_eq!(output.bytes, expected_bytes);
+                            assert_eq!(output.at, 0);
+                            assert!(!finished.contains(&output.offset), "plane written after completion");
+                            let plane = partial.entry(output.offset)
+                                .or_insert_with(|| Plane::new(shape.hidden, logical, stored, down));
+                            assert_eq!((plane.bytes, plane.rows.len(), plane.columns),
+                                (output.bytes, output.stored_rows, rect.cols.len()));
+                            let first = if rect.name.ends_with(".w1.scale") { stored } else { 0 };
+                            assert_eq!(output.start_row, first);
+                            assert_eq!(rect.rows.len(), if down { shape.hidden } else { logical });
+                            plane.write(output.start_row, rect.rows.len());
+                            if plane.complete() {
+                                plane.check_bytes();
+                                partial.remove(&output.offset);
+                                assert!(finished.insert(output.offset));
+                            }
+                        }
+                    }
+                    if *consumed == dense { queue.pop_front(); }
+                }
+            }
+            assert!(weights > 0 && peak > 1, "source interleaving was not exercised");
+            assert!(open.is_empty() && partial.is_empty(), "Done left incomplete steps or planes");
+            assert_eq!(completed.len(), plan.scales.steps.len());
+            assert_eq!(finished, expected.keys().copied().collect());
+            eprintln!("coded V4.1 TP{world} rank{rank}, {sources} file-ordered sources: {} steps, {} planes, peak_open={peak}, peak_pinned_with_table={} <= {budget}, no byte holes",
+                completed.len(), finished.len(), peak * (32 << 20) + (1 << 20));
+        }
+    }
+    Ok(())
+}
+
 #[test]
 fn native_plane_geometry_keeps_tp4_tp6_mount_admission() -> Result<()> {
     for nvfp4 in [false, true] {
