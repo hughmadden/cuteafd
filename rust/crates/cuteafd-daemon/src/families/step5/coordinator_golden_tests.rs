@@ -96,3 +96,58 @@ fn installed_coordinator_operands_match_the_mount_golden() -> Result<()> {
     }
     check(&actual, false)
 }
+
+/// The dense records `load_operand` makes, filled through the mount on the
+/// fake native DSO (the narrowing through its CPU twin of the GPU kernel),
+/// equal the host packing they replaced for every covered operand of the
+/// installed checkpoint's headers (both split ranks, one GPU, MTP stage 0).
+#[test]
+#[ignore = "requires CUTEAFD_PUSH_STEP5, an allocated CPU build slot and explicit NVMe fixture directory"]
+fn records_match_the_host_packing_on_installed_headers() -> Result<()> {
+    let Some(snapshot) = snapshot() else { return Ok(()) };
+    let checkpoint = Checkpoint::coordinator(&snapshot, false, true)?;
+    let fixture = cuteafd_ffi::native_library_lifetime_fixture::Fixture::build()?;
+    let library = fixture.load()?;
+    for device in 0..2 { fixture.configure_memory(&library, device, 256 << 30)?; }
+    let reader = crate::shared::qwen::weights::WeightReader { library: &library, checkpoint: &checkpoint };
+    let (mut checked, mut narrowed) = (0, 0);
+    for (prefix, device, layout) in layouts(&checkpoint)? {
+        let device = Device { library: &library, id: device };
+        for operand in layout.operands.iter().filter(|o| covered(&o.name)) {
+            let expected = super::weights::pack_reference(operand, &layout, |name| reader.raw(name))?;
+            let allocation = super::weights::load_operand(device, &checkpoint, &layout, operand)?;
+            let mut actual = vec![0u8; expected.len()];
+            library.copy_d2h(&mut actual, cuteafd_ffi::CuteafdDeviceBuffer { bytes: expected.len(), ..allocation.buffer })?;
+            anyhow::ensure!(actual == expected, "{prefix}.{}: records differ from the host packing", operand.name);
+            checked += 1;
+            narrowed += usize::from(operand.sources.iter().any(|s| s.meta.dtype != operand.dtype));
+        }
+    }
+    anyhow::ensure!(narrowed > 0, "no F32 narrowing exercised");
+    eprintln!("PASS {checked} operands ({narrowed} narrowed from F32) match the host packing");
+    Ok(())
+}
+
+/// The GPU narrowing's CPU twin equals `OutputPrecision::Bf16::round` bit for
+/// bit on edge values: ties both ways, the largest finite values rounding to
+/// infinity, infinities, signed zeros, subnormals and NaN payloads.
+#[test]
+#[ignore = "requires an allocated CPU build slot and explicit NVMe fixture directory"]
+fn narrowing_matches_bf16_round_on_edge_values() -> Result<()> {
+    let fixture = cuteafd_ffi::native_library_lifetime_fixture::Fixture::build()?;
+    let library = fixture.load()?;
+    let mut values: Vec<u32> = vec![0, 0x8000_0000, 1, 0x8000_0001, 0x007f_ffff, 0x7f7f_ffff, 0xff7f_ffff,
+        0x7f80_0000, 0xff80_0000, 0x7f80_0001, 0xffc0_0000, 0x7fff_ffff, 0x3f80_8000, 0x3f81_8000, 0x3f80_7fff,
+        0x3f80_8001, 0x7f7f_8000, 0x7fbf_ffff];
+    let mut x = 0x9e37_79b9u32;
+    for _ in 0..1 << 20 { x ^= x << 13; x ^= x >> 17; x ^= x << 5; values.push(x); }
+    let mut out = vec![0u16; values.len()];
+    // SAFETY: host buffers of the shapes the CPU twin reads and writes.
+    unsafe { library.load_narrow_f32_bf16(values.as_ptr().cast(), out.as_mut_ptr().cast(), values.len(),
+        std::ptr::null_mut())?; }
+    for (&bits, &half) in values.iter().zip(&out) {
+        let want = cuteafd_core::dense_attention::OutputPrecision::Bf16.round(f32::from_bits(bits)).to_bits();
+        anyhow::ensure!(u32::from(half) << 16 == want, "{bits:#010x}: narrowed {half:#06x}, round gives {want:#010x}");
+    }
+    Ok(())
+}

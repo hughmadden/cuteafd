@@ -82,6 +82,9 @@ pub(crate) enum Job {
     Upload { at: usize, bytes: usize, dst: CuteafdDeviceBuffer },
     /// BF16 `at..at + bytes` widened to F32 into `dst`.
     Widen { at: usize, bytes: usize, dst: CuteafdDeviceBuffer },
+    /// F32 `at..at + bytes` narrowed to BF16 (round to nearest even, NaN
+    /// quieted: `OutputPrecision::Bf16::round`) into `dst`.
+    NarrowF32Bf16 { at: usize, bytes: usize, dst: CuteafdDeviceBuffer },
     /// Staged BF16 rows `rows` (of `pitch` elements), columns `col0..col0 + cols`,
     /// quantized to FP8 into `target`.
     Quant { rows: Range<usize>, pitch: usize, col0: usize, cols: usize, layout: crate::shared::fp8_load_quant::Layout,
@@ -175,6 +178,16 @@ impl Step {
                     ensure!(at + bytes <= staged.len() && bytes <= dst.bytes, "upload outside its step");
                     load_timing::upload(bytes, || library.copy_h2d(CuteafdDeviceBuffer { bytes, ..dst },
                         &staged[at..at + bytes]))?;
+                }
+                Job::NarrowF32Bf16 { at, bytes, dst } => {
+                    ensure!(at + bytes <= staged.len() && bytes % 4 == 0 && dst.bytes >= bytes / 2,
+                        "narrowing outside its step");
+                    // SAFETY: `staged` is pinned, device-mapped memory the caller keeps
+                    // alive until the drain below; `dst` holds bytes / 2.
+                    load_timing::quantize(bytes, || unsafe {
+                        library.load_narrow_f32_bf16(staged[at..].as_ptr().cast(), dst.ptr, bytes / 4, stream)?;
+                        library.cuda_stream_synchronize(stream)
+                    })?;
                 }
                 Job::Widen { at, bytes, dst } => {
                     ensure!(at + bytes <= staged.len(), "widening outside its step");
