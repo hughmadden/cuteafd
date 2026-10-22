@@ -488,3 +488,26 @@ fn header_native_k6_core_is_admitted_by_default() -> Result<()> {
     }
     Ok(())
 }
+
+#[test]
+fn default_context_follows_the_checkpoint_core() -> Result<()> {
+    use crate::families::kimi_k3::{default_context, COMPILED_CONTEXT, DEFAULT_CONTEXT};
+    let k6 = tempfile::tempdir()?;
+    testing::write_kimi_core_snapshot(k6.path(), false);
+    let bf16 = snapshot(false);
+    for (dir, expected) in [(k6.path(), COMPILED_CONTEXT), (bf16.path(), DEFAULT_CONTEXT)] {
+        let checkpoint = Checkpoint::open(dir)?;
+        assert_eq!(default_context(&Model::open(&checkpoint)?.core), expected);
+        // The planner's unset context selects the same extent; an explicit one wins.
+        let report = plan::plan(dir, &PlanOptions { placement: ExpertPlacement::Sparks { ranks: 6 },
+            layout: Some(plan::layout::LayoutOptions { rtx_bytes: vec![96 << 30; 2], ..Default::default() }), ..Default::default() })?;
+        let notes = report.memory_layout.as_ref().map(|m| m.notes.join("\n")).unwrap_or_default();
+        assert!(notes.contains(&format!("Kimi API max context: {expected} tokens")), "{notes}");
+        let explicit = plan::plan(dir, &PlanOptions { placement: ExpertPlacement::Sparks { ranks: 6 },
+            layout: Some(plan::layout::LayoutOptions { rtx_bytes: vec![96 << 30; 2], context_tokens: 262_144, ..Default::default() }),
+            ..Default::default() })?;
+        let notes = explicit.memory_layout.as_ref().map(|m| m.notes.join("\n")).unwrap_or_default();
+        assert!(notes.contains("Kimi API max context: 262144 tokens"), "{notes}");
+    }
+    Ok(())
+}

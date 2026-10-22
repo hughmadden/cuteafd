@@ -9,7 +9,16 @@ pub mod w8;
 pub mod weight_layout;
 
 pub const COMPILED_CONTEXT: usize = 1_048_576;
+/// Default context for a BF16 (K2-class) core: one full-length conversation
+/// would leave little pool beside the BF16 core weights.
 pub const DEFAULT_CONTEXT: usize = 524_288;
+
+/// The default API/allocation context from the checkpoint's own core: a
+/// header-native K6 core frees the memory for the full compiled 1M extent with
+/// the full pool and onboard experts (TJ, 2026-10-22); BF16 cores keep 512K.
+pub fn default_context(core: &core::CoreInventory) -> usize {
+    if core.projections.is_empty() { DEFAULT_CONTEXT } else { COMPILED_CONTEXT }
+}
 pub const SPARK_DEFAULT_BUDGET_BYTES: u64 = 108 << 30;
 
 /// Offline ceiling only; the first full worker load/steady census qualifies it.

@@ -31,7 +31,7 @@ pub(super) fn layout(model: &Model, report: &mut PlanReport, opts: &crate::plan:
     };
     report.bytes_by_owner.clear();
     report.attention_placement = report.requested_attention.unwrap_or(AttentionPlacement::Layers);
-    let context = if opts.context_tokens == 0 { crate::families::kimi_k3::DEFAULT_CONTEXT as u64 } else { opts.context_tokens };
+    let context = if opts.context_tokens == 0 { crate::families::kimi_k3::default_context(&model.core) as u64 } else { opts.context_tokens };
     memory.notes.push(format!("Kimi API max context: {context} tokens; compiled max context: {COMPILED_CAPACITY} tokens"));
     if context > COMPILED_CAPACITY {
         refusal(report, format!("Kimi context {context} exceeds compiled capacity {COMPILED_CAPACITY}"),

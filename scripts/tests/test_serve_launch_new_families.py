@@ -60,7 +60,8 @@ def test_kimi_dispatches_to_serve_kimi_with_its_own_defaults(tmp_path: Path) -> 
     assert _flag(serve, "--max-sequences") == "16"
     assert _flag(serve, "--embedding-placement") == "gpu"
     assert _flag(serve, "--prefix-cache-entries") == "20"
-    # serve-kimi's own defaults stay its own: 512K default context (1M compiled), automatic KV pool;
+    # serve-kimi's own defaults stay its own: the checkpoint core picks the context (1M for a K6
+    # core, 512K for BF16; 1M compiled), automatic KV pool;
     # the planner picks the onboarded layers; it takes no speculator or media options.
     assert _flag(serve, "--rtx-expert-layers") == "auto"
     for absent in ("--max-context", "--pool-tokens", "--vision", "--audio",
@@ -190,6 +191,8 @@ def test_family_table_and_planner_fixtures_name_kimi() -> None:
 # --- the example config --------------------------------------------------------
 
 EXAMPLE = ROOT / "examples/configs/kimi-k3-exl3-max.config"
+K6_EXAMPLE = ROOT / "examples/configs/kimi-k3-exl3-k6-max.config"
+KIMI_K6_ID = "wrldsuksgo2mars/Kimi-K3-EXL3-K2-Core-K6"
 PRIVATE = ("raptor", "ostrich", "dodo", "emu", "kiwi", "rhea", "moa", "10.55.", "/home/", "/mnt/", "sparknest")
 
 
@@ -212,6 +215,20 @@ def test_kimi_example_config_is_the_max_card() -> None:
     text = EXAMPLE.read_text()
     assert not any(needle in text.lower() for needle in PRIVATE)
     assert "./run.sh --config examples/configs/kimi-k3-exl3-max.config --wip SLOT --dry-run" in text
+
+
+def test_kimi_k6_example_config_serves_the_k6_core_with_its_own_1m_default() -> None:
+    values = _keys(K6_EXAMPLE)
+    assert (values["MODEL_ID"], values["MODEL_REVISION"]) == (KIMI_K6_ID, "1a28050d2954426a43a3db705e53ca120e5f2b47")
+    assert (values["SPECULATOR"], values["SPECULATOR_MODEL_ID"]) == ("dflash2", "lightseekorg/kimi-k3-dflash2")
+    assert (values["RTX_GPUS"], values["SPARK_COUNT"], values["POOL_TOKENS"]) == ("2", "6", "auto")
+    # Unset: serve-kimi takes the full compiled 1M from the checkpoint's K6 core.
+    for absent in ("MAX_CONTEXT_TOKENS", "SPARK_DEVICE_BUDGET_BYTES", "KV_CACHE", "CONCURRENCY", "RTX_EXPERT_LAYERS"):
+        assert absent not in values
+    text = K6_EXAMPLE.read_text()
+    assert not any(needle in text.lower() for needle in PRIVATE)
+    assert "./run.sh --config examples/configs/kimi-k3-exl3-k6-max.config --wip SLOT --dry-run" in text
+    assert _keys(EXAMPLE).keys() - {"SPECULATOR_MODEL_ID"} == values.keys() - {"SPECULATOR_MODEL_ID"}
 
 
 def test_kimi_example_config_launches_through_run_family(tmp_path: Path) -> None:

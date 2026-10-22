@@ -1138,7 +1138,7 @@ pub(super) mod tests {
                 let mut i = inputs(&cfg);
                 i.cache_format = args.kv_cache;
                 i.requested_pool = args.pool_tokens;
-                i.lane_layouts = vec![std::array::from_fn(|_| LaneLayout::new(&cfg, i.rows, args.max_context,
+                i.lane_layouts = vec![std::array::from_fn(|_| LaneLayout::new(&cfg, i.rows, args.max_context.unwrap(),
                     super::super::device::NativeScratch { kda: 1024, mla: [512, 0, 1024] }).unwrap()); i.lanes];
                 lane_bytes.push(i.lane_layouts[0][0].bytes()?);
                 let mut under = request(i)?;
