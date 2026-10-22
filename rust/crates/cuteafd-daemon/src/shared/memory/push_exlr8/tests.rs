@@ -72,15 +72,7 @@ fn coordinator_suffix_preserves_mixed_exlr8_spark_plans() -> Result<()> {
     for padded in [false, true] {
         let root = tempfile::tempdir()?;
         fixture(root.path(), padded);
-        let mut config = cuteafd_loader::plan::testing::glm5_config();
-        for (key, value) in [("hidden_size", 128), ("moe_intermediate_size", 384),
-            ("n_routed_experts", 2), ("num_experts_per_tok", 1), ("num_hidden_layers", 4),
-            ("first_k_dense_replace", 3)] { config[key] = value.into(); }
-        config["indexer_types"] = serde_json::json!(["full", "full", "full", "full"]);
-        config["mlp_layer_types"] = serde_json::json!(["dense", "dense", "dense", "sparse"]);
-        std::fs::write(root.path().join("config.json"), serde_json::to_vec(&config)?)?;
-        let catalog = cuteafd_loader::read_expert_catalog(root.path())?;
-        assert!(matches!(catalog.format(), cuteafd_loader::plan::checkpoint::CheckpointFormat::Exlr8));
+        let catalog = fixture_catalog(root.path())?;
         for world in [4, 6] {
             let plans = (0..world).map(|rank| {
                 let plan = RankPlan::new(root.path(), "mixed", &[3], world, rank, usize::MAX)?;
@@ -93,4 +85,28 @@ fn coordinator_suffix_preserves_mixed_exlr8_spark_plans() -> Result<()> {
         }
     }
     Ok(())
+}
+
+pub(crate) fn fixture_catalog(root: &Path) -> Result<cuteafd_loader::OfficialV41Catalog> {
+    use std::io::Write;
+    // Inventory needs a dense native header as well as the routed index.
+    std::fs::create_dir(root.join("dense"))?;
+    let header = serde_json::to_vec(&serde_json::json!({
+        "__metadata__": {"format": "exlr8-v2", "scheme": "exlr8-e4m3-v2"},
+        "norm": {"dtype": "BF16", "shape": [1], "data_offsets": [0, 2]}
+    }))?;
+    let mut file = File::create(root.join("dense/exlr8-dense-000.safetensors"))?;
+    file.write_all(&(header.len() as u64).to_le_bytes())?;
+    file.write_all(&header)?;
+    file.write_all(&[0, 0])?;
+    let mut config = cuteafd_loader::plan::testing::glm5_config();
+    for (key, value) in [("hidden_size", 128), ("moe_intermediate_size", 384),
+        ("n_routed_experts", 2), ("num_experts_per_tok", 1), ("num_hidden_layers", 4),
+        ("first_k_dense_replace", 3)] { config[key] = value.into(); }
+    config["indexer_types"] = serde_json::json!(["full", "full", "full", "full"]);
+    config["mlp_layer_types"] = serde_json::json!(["dense", "dense", "dense", "sparse"]);
+    std::fs::write(root.join("config.json"), serde_json::to_vec(&config)?)?;
+    let catalog = cuteafd_loader::read_expert_catalog(root)?;
+    assert!(matches!(catalog.format(), cuteafd_loader::plan::checkpoint::CheckpointFormat::Exlr8));
+    Ok(catalog)
 }

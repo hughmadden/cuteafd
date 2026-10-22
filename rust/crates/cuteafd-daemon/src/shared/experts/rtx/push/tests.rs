@@ -354,13 +354,12 @@ fn dense_planning_error_sends_the_whole_group_to_mount() -> Result<()> {
     // Non-EXL3 groups carry dense-only coordinator ranks, not EXL3 TP2 halves.
     let root = tempfile::tempdir_in(fixture.directory())?;
     let catalog = crate::shared::memory::push_fp8::tests::fixture(root.path(),
-        cuteafd_loader::formats::fp8_experts::ExpertFormat::Fp8, false)?;
+        cuteafd_loader::formats::fp8_experts::ExpertFormat::Fp8Block128, false)?;
     mark(root.path(), c"user.sparknest.cluster", br#"{"me":"coordinator"}"#)?;
     dense_error_mount_group(&library, root.path(), &catalog, false)?;
     let root = tempfile::tempdir_in(fixture.directory())?;
     cuteafd_loader::plan::testing::exlr8::fixture(root.path(), false);
-    // Dense-only ranks do not inspect the expert catalog; the EXLR8 snapshot
-    // still uses exactly the same whole-group decline transaction.
+    let catalog = crate::shared::memory::push_exlr8::tests::fixture_catalog(root.path())?;
     mark(root.path(), c"user.sparknest.cluster", br#"{"me":"coordinator"}"#)?;
     dense_error_mount_group(&library, root.path(), &catalog, false)?;
     Ok(())
@@ -393,7 +392,7 @@ fn dense_error_mount_group(library: &cuteafd_ffi::NativeLibrary, root: &std::pat
         drop(spark_driver.shutdown(std::net::Shutdown::Both));
         Ok(prepared)
     });
-    let devices = [Device { library: library, id: 0 }, Device { library: library, id: 1 }];
+    let devices = [Device { library, id: 0 }, Device { library, id: 1 }];
     let dense: Option<Result<(Vec<DensePlan>, Vec<NoDense>)>> = Some(Err(anyhow::anyhow!("injected dense planning error")));
     let (pushed, ()) = push.receive_with(devices.to_vec(), Some(catalog), sparks, dense, || ());
     assert!(pushed?.is_none(), "a declined dense plan must fall back to mount");

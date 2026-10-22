@@ -1,7 +1,7 @@
 //! Checkpoint-native EXLR8 rank plans and worker-reported placement seals.
 #[cfg(test)]
 #[path = "push_exlr8/tests.rs"]
-mod tests;
+pub(crate) mod tests;
 use super::weight_arena::ArenaLayout;
 use anyhow::{ensure, Result};
 use cuteafd_loader::{plan::exlr8::residency::{ExpertSet, Residency},

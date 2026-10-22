@@ -418,7 +418,7 @@ fn installed_native_complete_rank_plans_fit_admission_and_control_frames() -> Re
 
 #[test]
 fn coordinator_suffix_preserves_fp8_and_nvfp4_spark_plans() -> Result<()> {
-    for format in [ExpertFormat::Fp8, ExpertFormat::Nvfp4] {
+    for format in [ExpertFormat::Fp8Block128, ExpertFormat::Nvfp4] {
         let root = tempfile::tempdir()?;
         let catalog = fixture(root.path(), format, false)?;
         for world in [4, 6] {
