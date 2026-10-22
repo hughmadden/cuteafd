@@ -26,12 +26,15 @@ def fixture(tmp_path):
     base, fp8 = tmp_path / "base", tmp_path / "fp8"
     base.mkdir()
     fp8.mkdir()
+    quant = dict(quant_method="exl3", method="exl3", format="exl3", checkpoint_format="exl3",
+                 bits=3, codebook="mcg", group_size=-1, desc_act=False, pack_dtype="int32",
+                 out_scales="auto", meta=dict(quantizer="unchanged"))
     cfg = dict(model_type="glm5_next", text_config=dict(num_hidden_layers=2, first_k_dense_replace=1,
         layer_types=["linear_attention", "deepseek_sparse_attention"], mlp_layer_types=["dense", "sparse"]),
-        quantization_config=dict(quant_method="exl3", bits=3))
+        quantization_config=quant)
     (base / "config.json").write_text(json.dumps(cfg))
     for name in ("quantize_config.json", "quantization_config.json"):
-        (base / name).write_text(json.dumps(dict(quant_method="exl3", tensor_storage={})))
+        (base / name).write_text(json.dumps(dict(quant, tensor_storage={})))
     (base / "tokenizer_config.json").write_text('{"chat_template":"unchanged"}')
     contract = json.loads(tool.CONTRACT.read_text())
     names = []
@@ -65,8 +68,18 @@ def test_stitch_exact_union_and_native_formats(tmp_path):
     cfg = json.loads((output / "config.json").read_text())
     assert cfg["_name_or_path"] == tool.TARGET_REPO
     assert cfg["quantization_config"]["quant_method"] == "exl3"
-    assert cfg["quantization_config"]["native_core_quantization"]["weight_block_size"] == [128, 128]
-    assert json.loads((output / "quantize_config.json").read_text())["tensor_storage"] == {}
+    compact = cfg["quantization_config"]
+    native = compact["meta"]["native_core_quantization"]
+    assert native["weight_block_size"] == [128, 128]
+    assert compact["meta"]["quantizer"] == "unchanged"
+    assert "native_core_quantization" not in compact
+    for filename in ("quantize_config.json", "quantization_config.json"):
+        full = json.loads((output / filename).read_text())
+        # The strict EXL3 reader requires compact/full equality and no new top-level keys.
+        assert full == dict(compact, tensor_storage={})
+    original = json.loads((base.root / "config.json").read_text())["quantization_config"]
+    assert {key: value for key, value in compact.items() if key != "meta"} == {
+        key: value for key, value in original.items() if key != "meta"}
     assert (output / "tokenizer_config.json").read_bytes() == (base.root / "tokenizer_config.json").read_bytes()
     assert tool.TARGET_REPO in (output / "README.md").read_text()
     provenance = json.loads((output / "stitch-provenance.json").read_text())

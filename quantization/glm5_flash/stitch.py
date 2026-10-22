@@ -199,6 +199,20 @@ this stitch changes storage provenance, not the routed expert quantization.
 """
 
 
+def write_quantization_metadata(base, selected, destination):
+    native = dict(quant_method="fp8", fmt="e4m3", activation_scheme="dynamic", weight_block_size=[128, 128],
+                  modules=sorted(name.removesuffix(".weight") for name in selected if name.endswith(".weight")))
+    cfg = read_json(base.root / "config.json")
+    cfg["_name_or_path"] = TARGET_REPO
+    # EXL3 manifests reserve top-level keys for their storage contract.
+    cfg["quantization_config"].setdefault("meta", {})["native_core_quantization"] = native
+    write_json(destination / "config.json", cfg)
+    for filename in ("quantize_config.json", "quantization_config.json"):
+        quant = read_json(base.root / filename)
+        quant.setdefault("meta", {})["native_core_quantization"] = native
+        write_json(destination / filename, quant)
+
+
 def stitch(base, fp8, destination):
     selected = selection(base, fp8)
     expected = source_map(base, fp8, selected)
@@ -231,16 +245,7 @@ def stitch(base, fp8, destination):
                                                   "quantize_config.json", "quantization_config.json")
                 and not asset.name.endswith(".safetensors") and asset.suffix in (".json", ".jinja", ".model", ".txt")):
             shutil.copyfile(asset, destination / asset.name)
-    cfg = read_json(base.root / "config.json")
-    native = dict(quant_method="fp8", fmt="e4m3", activation_scheme="dynamic", weight_block_size=[128, 128],
-                  modules=sorted(name.removesuffix(".weight") for name in selected if name.endswith(".weight")))
-    cfg["_name_or_path"] = TARGET_REPO
-    cfg["quantization_config"]["native_core_quantization"] = native
-    write_json(destination / "config.json", cfg)
-    for filename in ("quantize_config.json", "quantization_config.json"):
-        quant = read_json(base.root / filename)
-        quant["native_core_quantization"] = native
-        write_json(destination / filename, quant)
+    write_quantization_metadata(base, selected, destination)
     write_json(destination / "stitch-provenance.json", provenance)
     (destination / "README.md").write_text(model_card(provenance, total_bytes, len(shards)))
     result = verify(base, fp8, Snapshot(destination), provenance)
