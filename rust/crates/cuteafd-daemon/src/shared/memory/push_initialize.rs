@@ -43,6 +43,9 @@ pub(crate) enum Layer<'a> {
         widen: Vec<Range<usize>>,
         scalars: Vec<Range<usize>>,
         inputs: Option<(Range<usize>, Range<usize>, usize)>,
+        /// Scale grids landed packed (`rows` x `width` from the region start)
+        /// whose execution layout pads each row to `pitch`: (region, rows, width, pitch).
+        expand: Vec<(Range<usize>, usize, usize, usize)>,
     },
 }
 
@@ -93,6 +96,7 @@ impl Layer<'_> {
             widen,
             scalars,
             inputs,
+            expand: Vec::new(),
         })
     }
 }
@@ -141,7 +145,7 @@ pub(crate) fn initialize<'a>(
                 }
                 Layer::Exl3 { region, residency } => exl3(arena, *region, residency)?,
                 Layer::Exlr8 { region, residency } => exlr8(arena, *region, residency)?,
-                Layer::Fp8 { widen, scalars, inputs } => {
+                Layer::Fp8 { widen, scalars, inputs, expand } => {
                     for range in scalars {
                         ensure!(range.len() % 4 == 0, "partial NVFP4 scalar");
                         let mut image = vec![0; range.len()];
@@ -153,6 +157,10 @@ pub(crate) fn initialize<'a>(
                         }), "NVFP4 projection has a non-positive or non-finite scalar");
                     }
                     for range in widen { widen_scales(arena, range.clone(), 1024 * 1024)?; }
+                    // Packed grids (widened above when BF16) spread to their row pitch.
+                    for (region, rows, width, pitch) in expand {
+                        expand_rows(arena, region.clone(), *rows, *width, *pitch, 1024 * 1024)?;
+                    }
                     if let Some((gate, up, layer)) = inputs {
                         let mut a = vec![0; gate.len()];
                         let mut b = vec![0; up.len()];
@@ -364,6 +372,48 @@ fn nvfp4_vectors(image: &[u8], experts: usize) -> Result<[Vec<f32>; 4]> {
         }
     }
     Ok(result)
+}
+
+/// Rows landed packed (`width` bytes each from the region start) spread to
+/// `pitch` with zeroed padding, in bounded chunks from the last row back: a
+/// row's padded destination never precedes its packed source, so no unread
+/// source byte is overwritten.
+pub(crate) fn expand_rows(
+    arena: &DeliveredArena<'_>,
+    region: Range<usize>,
+    rows: usize,
+    width: usize,
+    pitch: usize,
+    chunk_bytes: usize,
+) -> Result<()> {
+    ensure!(
+        width > 0 && pitch >= width && rows.checked_mul(pitch).is_some_and(|n| n <= region.len()),
+        "invalid scale row expansion extent"
+    );
+    if pitch == width { return Ok(()); }
+    let device = arena.device();
+    device.run(|| {
+        let per = (chunk_bytes / pitch).max(1);
+        let mut end = rows;
+        while end > 0 {
+            let start = end.saturating_sub(per);
+            let mut packed = vec![0; (end - start) * width];
+            device.library.copy_d2h(
+                &mut packed,
+                arena.buffer(region.start + start * width..region.start + end * width)?,
+            )?;
+            let mut padded = vec![0; (end - start) * pitch];
+            for (out, row) in padded.chunks_exact_mut(pitch).zip(packed.chunks_exact(width)) {
+                out[..width].copy_from_slice(row);
+            }
+            device.library.copy_h2d(
+                arena.buffer(region.start + start * pitch..region.start + end * pitch)?,
+                &padded,
+            )?;
+            end = start;
+        }
+        Ok(())
+    })
 }
 
 /// BF16 scales land packed at half-width offsets within their final FP32 grid.
