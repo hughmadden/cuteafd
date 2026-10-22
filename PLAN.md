@@ -5593,3 +5593,26 @@ Oliver's root NVMe. Its separate default HF hub is now a sparknest symlink;
 this job uses `HF_HUB_CACHE=~/.cache/huggingface/cuteafd-local-hub` for its
 published snapshot so hardlinks remain on NVMe without another checkpoint copy.
 After stable progress, sleep 30 minutes between layer/phase and ETA reports.
+
+Completed and published on 2026-10-22 (Taipei), revision
+`1a28050d2954426a43a3db705e53ca120e5f2b47`. The export contains 94 shards,
+994,590 tensors and 731,275,813,496 payload bytes (681.05 GiB), saving
+62.50 GiB against the K2 base. All 926 core projections used the full calibration
+stream. All 247,296 routed K2 projections and other excluded tensors passed
+the independent byte-preservation audit. Every remote shard checksum passed;
+anonymous Hub access and all local snapshot hardlinks were verified. Both
+completion records and the successful supervisor exit remain in the run root.
+Rolling frontiers and phase captures are retired, the container is stopped,
+and GPU ownership is released. Quantization took about 47 hours; publication
+and remote verification took about 11 minutes. Full-model generation and
+serving qualification remain separate, unperformed work.
+
+Production used GPTQModel `d97ee86801d9315e77ae91de47da061d6e5e6ccf`,
+recorded in its immutable plan and qualification evidence. After publication,
+the fork and pin advance to `2079be3e12f5d62cb82b9f899b521ac705406945` to
+complete the optional Torch-reference loader's logical 576/stored 640 output
+support. It preserves the complete stored Hadamard transforms before cropping.
+Independent focused validation passed 64 CPU cases and 24 RTX CUDA cases,
+covering FP16/BF16/FP32 inputs, bias and batches 1/33. The production native
+loader already supported this geometry. Recovery of the completed producer
+uses its recorded commit; a new producer pin requires fresh admission evidence.
