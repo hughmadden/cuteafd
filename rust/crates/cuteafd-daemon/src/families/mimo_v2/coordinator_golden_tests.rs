@@ -23,7 +23,10 @@ pub(crate) fn digest(library: &NativeLibrary, buffer: CuteafdDeviceBuffer) -> Re
 
 pub(crate) fn layer_digests(library: &NativeLibrary, prefix: &str, layer: &MimoLayer<'_>, out: &mut Digests)
     -> Result<()> {
-    for (name, buffer) in layer.buffers() {
+    for (name, mut buffer) in layer.buffers() {
+        // Sinks below 256 B (a split rank's share) sit in a 256 B allocation
+        // whose tail no loader writes: digest the operand's own bytes.
+        if name == "sinks" { buffer.bytes = buffer.bytes.min(SINK_BYTES.with(|s| s.get()) / if layer.split { 2 } else { 1 }); }
         let key = format!("{prefix}.{name}");
         anyhow::ensure!(out.insert(key.clone(), digest(library, buffer)?).is_none(), "duplicate {key}");
     }
@@ -40,6 +43,11 @@ pub(crate) fn weights_digests(library: &NativeLibrary, prefix: &str, weights: &M
         out.insert(format!("{prefix}.head.{i}"), digest(library, allocation.buffer)?);
     }
     Ok(())
+}
+
+thread_local! {
+    /// The whole sink tensor's bytes (set by `setup`).
+    static SINK_BYTES: std::cell::Cell<usize> = const { std::cell::Cell::new(usize::MAX) };
 }
 
 pub(crate) fn snapshot() -> Option<std::path::PathBuf> {
@@ -68,6 +76,9 @@ pub(crate) fn setup(snapshot: &std::path::Path) -> Result<Setup> {
     let formats = (0..LAYERS).map(|l| format!("model.layers.{l}.self_attn.o_proj.weight"))
         .chain(std::iter::once("model.mtp.layers.0.self_attn.o_proj.weight".to_string()))
         .map(|name| (name, MimoProjectionRepresentation::Fp8)).collect();
+    let sinks = checkpoint.tensors.iter().find(|t| t.meta.name == "model.layers.1.self_attn.attention_sink_bias")
+        .context("layer 1 sinks")?.meta.byte_length as usize;
+    SINK_BYTES.with(|s| s.set(sinks));
     Ok(Setup { cfg, checkpoint_tp: cuteafd_loader::families::mimo_v2::checkpoint_tp(snapshot)?, checkpoint, formats })
 }
 
