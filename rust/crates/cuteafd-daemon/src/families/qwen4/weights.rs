@@ -38,6 +38,12 @@ impl Qwen4Layer<'_> {
         self.operands.contains_key(operand)
     }
 
+    /// Every operand by name (golden digests).
+    #[cfg(test)]
+    pub(crate) fn operands(&self) -> impl Iterator<Item = (&'static str, &Allocation<'_>)> {
+        self.operands.iter().map(|(name, allocation)| (*name, allocation))
+    }
+
     /// The device range of `operand`, when the layer has it.
     pub fn range(&self, operand: &str) -> Option<crate::shared::l2_prefetch::Range> {
         self.operands.get(operand).map(|a| (a.buffer.ptr.cast_const(), a.buffer.bytes))
@@ -362,6 +368,10 @@ impl<'a> Qwen4Loader<'a> {
         })
     }
 }
+
+#[cfg(test)]
+#[path = "coordinator_golden_tests.rs"]
+mod coordinator_golden_tests;
 
 #[cfg(test)]
 mod tests {
