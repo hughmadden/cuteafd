@@ -64,7 +64,7 @@ impl ArenaLayout {
 
 #[cfg(test)]
 #[path = "weight_arena_tests.rs"]
-mod real_tests;
+pub(crate) mod real_tests;
 
 const MAX_COVERAGE_INTERVALS: usize = 1_000_000;
 
@@ -110,83 +110,191 @@ impl Coverage {
     }
 }
 
+/// One plan entry's destination shape: `run` bytes at each point of
+/// `dims` (outermost first, `(count, dst_stride)`, unit and dense axes folded).
+struct Shape {
+    dst_base: u64,
+    dst_len: u64,
+    packed_base: u64,
+    run: u64,
+    dims: Vec<(u64, u64)>,
+}
+
 /// Exact destination footprint of a checked plan, excluding generated padding.
-/// Dense dimensions collapse before enumeration, so packed tensors cost one node.
+///
+/// Delivery is tracked in the rank's packed space: each entry's runs in order,
+/// entries in destination order (`plan.check` keeps a rank's entry extents
+/// disjoint). Padding between runs never maps, so a fragment touching it is
+/// refused and a missing run stays a hole, while a complete delivery is one
+/// interval whatever the padding. The footprint costs O(entries), not O(runs).
 #[derive(Default)]
-pub(crate) struct ExpectedCoverage(Coverage);
+pub(crate) struct ExpectedCoverage {
+    shapes: Vec<Shape>,
+    bytes: u64,
+}
 impl ExpectedCoverage {
     pub fn from_plan(
         plan: &cuteafd_loader::push_load::builder::CheckedPlan,
         rank: u32,
     ) -> Result<Self> {
         use cuteafd_loader::push_load::plan::Steps;
-        let mut expected = Self::default();
+        let mut shapes = Vec::new();
         for entry in plan.plan.entries.iter().filter(|e| e.rank == rank) {
             let pattern = &plan.plan.patterns[entry.pattern as usize];
-            let mut span = u64::from(pattern.run);
-            let mut sparse = Vec::new();
+            let mut run = u64::from(pattern.run);
+            let mut dims = Vec::new();
+            let mut extent = run;
+            let mut empty = false;
             for dim in pattern.dims.iter().rev() {
                 let count = match &dim.steps {
                     Steps::Count(n) => u64::from(*n),
                     Steps::Indices(v) => v.len() as u64,
                 };
+                if count == 0 {
+                    empty = true;
+                    break;
+                }
                 if count == 1 {
                     continue;
                 }
-                if sparse.is_empty() && dim.dst_stride == span {
-                    span = span
-                        .checked_mul(count)
-                        .context("expected footprint overflow")?;
+                ensure!(dim.dst_stride >= extent, "plan pattern destination strides overlap");
+                if dims.is_empty() && dim.dst_stride == run {
+                    run = run.checked_mul(count).context("expected footprint overflow")?;
+                    extent = run;
                 } else {
-                    sparse.push((count, dim.dst_stride));
+                    dims.push((count, dim.dst_stride));
+                    extent = (count - 1)
+                        .checked_mul(dim.dst_stride)
+                        .and_then(|v| v.checked_add(extent))
+                        .context("expected extent overflow")?;
                 }
             }
-            fn insert(
-                coverage: &mut Coverage,
-                sparse: &[(u64, u64)],
-                base: u64,
-                span: u64,
-            ) -> Result<()> {
-                if let Some((&(count, stride), rest)) = sparse.split_first() {
-                    for index in 0..count {
-                        insert(
-                            coverage,
-                            rest,
-                            base.checked_add(
-                                index
-                                    .checked_mul(stride)
-                                    .context("expected stride overflow")?,
-                            )
-                            .context("expected base overflow")?,
-                            span,
-                        )?;
-                    }
-                } else {
-                    coverage.insert(base, span)?;
-                }
-                Ok(())
+            if empty {
+                continue;
             }
-            insert(&mut expected.0, &sparse, entry.dst_base, span)?;
+            dims.reverse();
+            shapes.push(Shape { dst_base: entry.dst_base, dst_len: extent, packed_base: 0, run, dims });
+        }
+        shapes.sort_unstable_by_key(|shape| shape.dst_base);
+        let mut bytes = 0u64;
+        let mut end = 0u64;
+        for shape in &mut shapes {
+            ensure!(shape.dst_base >= end, "plan entries overlap in the rank arena");
+            end = shape.dst_base.checked_add(shape.dst_len).context("expected end overflow")?;
+            shape.packed_base = bytes;
+            let runs = shape
+                .dims
+                .iter()
+                .try_fold(1u64, |n, &(count, _)| n.checked_mul(count))
+                .context("expected run count overflow")?;
+            bytes = runs
+                .checked_mul(shape.run)
+                .and_then(|v| v.checked_add(bytes))
+                .context("expected footprint overflow")?;
         }
         ensure!(
-            Some(&expected.0.bytes) == plan.totals.rank_bytes.get(rank as usize),
+            Some(&bytes) == plan.totals.rank_bytes.get(rank as usize),
             "checked plan destination total differs from footprint"
         );
-        Ok(expected)
+        Ok(Self { shapes, bytes })
+    }
+
+    /// The packed position of destination byte `offset` and the bytes left in
+    /// its run, or None when `offset` is padding or outside every entry.
+    fn locate(&self, offset: u64) -> Option<(u64, u64)> {
+        let index = self.shapes.partition_point(|shape| shape.dst_base <= offset).checked_sub(1)?;
+        let shape = &self.shapes[index];
+        let mut rel = offset - shape.dst_base;
+        if rel >= shape.dst_len {
+            return None;
+        }
+        let mut linear = 0u64;
+        for &(count, stride) in &shape.dims {
+            let step = rel / stride;
+            if step >= count {
+                return None;
+            }
+            rel -= step * stride;
+            linear = linear * count + step;
+        }
+        (rel < shape.run).then(|| (shape.packed_base + linear * shape.run + rel, shape.run - rel))
+    }
+
+    /// Packed intervals of a destination fragment, coalesced; None if any
+    /// byte is padding or outside the footprint.
+    fn packed(&self, start: u64, bytes: u64) -> Option<Vec<(u64, u64)>> {
+        let end = start.checked_add(bytes)?;
+        let mut out: Vec<(u64, u64)> = Vec::new();
+        let mut at = start;
+        while at < end {
+            let (packed, left) = self.locate(at)?;
+            let take = left.min(end - at);
+            match out.last_mut() {
+                Some((s, n)) if *s + *n == packed => *n += take,
+                _ => out.push((packed, take)),
+            }
+            at += take;
+        }
+        Some(out)
+    }
+
+    /// Record a delivered destination fragment; it must lie in the footprint.
+    pub(crate) fn record(&self, coverage: &mut Coverage, start: u64, bytes: u64) -> Result<()> {
+        ensure!(bytes > 0, "empty delivery fragment");
+        let pieces = self.packed(start, bytes).context("delivered fragment outside checked footprint")?;
+        for (packed, length) in pieces {
+            coverage.insert(packed, length)?;
+        }
+        Ok(())
     }
     /// Delivered coverage equals this footprint exactly.
     pub(crate) fn complete(&self, delivered: &Coverage) -> bool {
-        delivered.bytes == self.0.bytes && delivered.intervals == self.0.intervals
+        delivered.bytes == self.bytes
+            && (self.bytes == 0 || delivered.intervals.iter().eq([(&0, &self.bytes)]))
     }
-    pub(crate) fn bytes(&self) -> u64 { self.0.bytes }
+    pub(crate) fn bytes(&self) -> u64 { self.bytes }
     pub(crate) fn contains(&self, start: u64, bytes: u64) -> bool {
-        start.checked_add(bytes).is_some_and(|end| {
-            self.0
-                .intervals
-                .range(..=start)
-                .next_back()
-                .is_some_and(|(_, &limit)| end <= limit)
-        })
+        bytes > 0 && self.packed(start, bytes).is_some()
+    }
+    /// Contiguous ascending destination spans, one entry each (fixtures).
+    #[cfg(test)]
+    pub(crate) fn spans(spans: &[(u64, u64)]) -> Self {
+        let mut bytes = 0;
+        let shapes = spans.iter().map(|&(dst_base, len)| {
+            let shape = Shape { dst_base, dst_len: len, packed_base: bytes, run: len, dims: Vec::new() };
+            bytes += len;
+            shape
+        }).collect();
+        Self { shapes, bytes }
+    }
+    /// End of the last planned byte (the footprint's destination extent).
+    fn end(&self) -> u64 {
+        self.shapes.last().map_or(0, |shape| shape.dst_base + shape.dst_len)
+    }
+    /// Every destination gap below `limit` in ascending order: between
+    /// entries, between runs inside each entry, and after the last entry.
+    fn gaps(&self, limit: u64, gap: &mut dyn FnMut(u64, u64) -> Result<()>) -> Result<()> {
+        fn inner(dims: &[(u64, u64)], run: u64, base: u64,
+            gap: &mut dyn FnMut(u64, u64) -> Result<()>) -> Result<()> {
+            let Some((&(count, stride), rest)) = dims.split_first() else { return Ok(()) };
+            let extent = rest.iter().fold(run, |e, &(n, s)| (n - 1) * s + e);
+            for step in 0..count {
+                let at = base + step * stride;
+                inner(rest, run, at, gap)?;
+                if step + 1 < count && stride > extent {
+                    gap(at + extent, at + stride)?;
+                }
+            }
+            Ok(())
+        }
+        let mut cursor = 0u64;
+        for shape in &self.shapes {
+            if shape.dst_base >= limit { break; }
+            gap(cursor, shape.dst_base)?;
+            inner(&shape.dims, shape.run, shape.dst_base, &mut |a, b| gap(a.min(limit), b.min(limit)))?;
+            cursor = (shape.dst_base + shape.dst_len).min(limit);
+        }
+        gap(cursor.min(limit), limit)
     }
 }
 
@@ -239,11 +347,7 @@ impl<'a> LoadingArena<'a> {
         expected: ExpectedCoverage,
     ) -> Result<Self> {
         ensure!(
-            expected
-                .0
-                .intervals
-                .last_key_value()
-                .is_none_or(|(_, &end)| end <= layout.logical_bytes() as u64),
+            expected.end() <= layout.logical_bytes() as u64,
             "expected footprint exceeds admitted arena"
         );
         let validation = vec![0; layout.validation_bytes];
@@ -293,7 +397,7 @@ impl<'a> LoadingArena<'a> {
             .get_mut(start..end)
             .context("validation fragment exceeds host tail")?
             .copy_from_slice(bytes);
-        self.coverage.insert(offset, bytes.len() as u64)
+        self.expected.record(&mut self.coverage, offset, bytes.len() as u64)
     }
 
     /// Called only after a slot's CUDA copy event completes, before Release.
@@ -308,9 +412,9 @@ impl<'a> LoadingArena<'a> {
             self.expected.contains(offset, bytes),
             "completed fragment is outside checked plan footprint"
         );
-        self.coverage.insert(offset, bytes)?;
+        self.expected.record(&mut self.coverage, offset, bytes)?;
         ensure!(
-            self.coverage.bytes <= self.expected.0.bytes,
+            self.coverage.bytes <= self.expected.bytes(),
             "rank unique delivery exceeds checked plan"
         );
         Ok(())
@@ -320,8 +424,7 @@ impl<'a> LoadingArena<'a> {
     /// become execution-visible even when the control socket says Done.
     pub fn done(self) -> Result<DeliveredArena<'a>> {
         ensure!(
-            self.coverage.bytes == self.expected.0.bytes
-                && self.coverage.intervals == self.expected.0.intervals,
+            self.expected.complete(&self.coverage),
             "rank Done before all planned bytes completed"
         );
         Ok(DeliveredArena {
@@ -366,13 +469,9 @@ impl<'a> DeliveredArena<'a> {
                     pending = Some((start, width, width, 1));
                     Ok(())
                 };
-                let mut cursor = 0usize;
-                for (&start, &end) in &self.expected.0.intervals {
-                    let start = usize::try_from(start)?.min(self.layout.bytes);
-                    gap(cursor, start)?;
-                    cursor = usize::try_from(end)?.min(self.layout.bytes);
-                }
-                gap(cursor, self.layout.bytes)?;
+                self.expected.gaps(self.layout.bytes as u64, &mut |start, end| {
+                    gap(usize::try_from(start)?, usize::try_from(end)?)
+                })?;
                 if let Some(group) = pending { flush(group)?; }
                 Ok(())
             })();
@@ -440,11 +539,7 @@ mod tests {
     use cuteafd_ffi::native_library_lifetime_fixture::Fixture;
 
     fn expected(bytes: u64) -> Result<ExpectedCoverage> {
-        let mut value = ExpectedCoverage::default();
-        if bytes != 0 {
-            value.0.insert(0, bytes)?;
-        }
-        Ok(value)
+        Ok(if bytes == 0 { ExpectedCoverage::default() } else { ExpectedCoverage::spans(&[(0, bytes)]) })
     }
 
     #[test]
@@ -501,8 +596,7 @@ mod tests {
             library: &library,
             id: 0,
         };
-        let mut footprint = expected(4)?;
-        footprint.0.insert(256, 4)?;
+        let footprint = ExpectedCoverage::spans(&[(0, 4), (256, 4)]);
         let layout = ArenaLayout::new([256], 256)?.with_validation(4, 4)?;
         assert!(ArenaLayout::new([256], 256)?.with_validation(4, 3).is_err());
         let mut loading = LoadingArena::new(device, layout, footprint)?;
@@ -548,52 +642,146 @@ mod tests {
 #[cfg(test)]
 mod coverage_tests {
     use super::*;
+    use cuteafd_loader::push_load::{
+        builder::CheckedPlan,
+        plan::{Dim, Entry, Pattern, Plan, Steps},
+    };
+
+    fn checked(patterns: Vec<Pattern>, entries: Vec<Entry>, file: u64, arena: u64) -> Result<CheckedPlan> {
+        let plan = Plan { files: vec!["weights".into()], patterns, entries };
+        let totals = plan.check(&[file], &[arena])?;
+        Ok(CheckedPlan { plan, file_sizes: vec![file], arenas: vec![arena], totals })
+    }
+    fn entry(pattern: u32, src_base: u64, dst_base: u64) -> Entry {
+        Entry { file: 0, pattern, rank: 0, src_base, dst_base }
+    }
+    /// Every destination run of the rank's entries (oracle).
+    fn runs(plan: &CheckedPlan) -> Vec<(u64, u64)> {
+        let mut out = plan.plan.entries.iter().flat_map(|e| {
+            let p = &plan.plan.patterns[e.pattern as usize];
+            p.runs().into_iter().map(move |(_, d)| (e.dst_base + d, u64::from(p.run)))
+        }).collect::<Vec<_>>();
+        out.sort_unstable();
+        out
+    }
+    /// Gaps must be exactly the complement of the runs below `limit`.
+    fn assert_gaps(expected: &ExpectedCoverage, plan: &CheckedPlan, limit: u64) -> Result<()> {
+        let mut want = Vec::new();
+        let mut cursor = 0;
+        for (start, len) in runs(plan) {
+            if start.min(limit) > cursor { want.push((cursor, start.min(limit))); }
+            cursor = (start + len).min(limit);
+        }
+        if limit > cursor { want.push((cursor, limit)); }
+        let mut got = Vec::new();
+        expected.gaps(limit, &mut |a, b| { if a < b { got.push((a, b)); } Ok(()) })?;
+        // Adjacent gaps may be reported separately; merge before comparing.
+        let mut merged: Vec<(u64, u64)> = Vec::new();
+        for (a, b) in got {
+            match merged.last_mut() { Some((_, e)) if *e == a => *e = b, _ => merged.push((a, b)) }
+        }
+        assert_eq!(merged, want);
+        Ok(())
+    }
+
     #[test]
     fn expected_footprint_excludes_padding_and_merges_dense_axes() -> Result<()> {
-        use cuteafd_loader::push_load::{
-            builder::CheckedPlan,
-            plan::{Dim, Entry, Pattern, Plan, Steps},
-        };
-        let plan = Plan {
-            files: vec!["weights".into()],
-            patterns: vec![Pattern {
+        let plan = checked(
+            vec![Pattern {
                 run: 4,
                 dims: vec![
-                    Dim {
-                        steps: Steps::Count(2),
-                        src_stride: 64,
-                        dst_stride: 16,
-                    },
-                    Dim {
-                        steps: Steps::Indices(vec![0, 3]),
-                        src_stride: 4,
-                        dst_stride: 4,
-                    },
+                    Dim { steps: Steps::Count(2), src_stride: 64, dst_stride: 16 },
+                    Dim { steps: Steps::Indices(vec![0, 3]), src_stride: 4, dst_stride: 4 },
                 ],
             }],
-            entries: vec![Entry {
-                file: 0,
-                pattern: 0,
-                rank: 0,
-                src_base: 0,
-                dst_base: 0,
-            }],
-        };
-        let totals = plan.check(&[128], &[32])?;
-        let checked = CheckedPlan {
-            plan,
-            file_sizes: vec![128],
-            arenas: vec![32],
-            totals,
-        };
-        let expected = ExpectedCoverage::from_plan(&checked, 0)?;
-        assert_eq!(expected.0.intervals, [(0, 8), (16, 24)].into());
+            vec![entry(0, 0, 0)],
+            128,
+            32,
+        )?;
+        let expected = ExpectedCoverage::from_plan(&plan, 0)?;
+        assert_eq!(expected.bytes(), 16);
         assert!(expected.contains(4, 4));
         assert!(!expected.contains(4, 8));
         assert!(!expected.contains(8, 4));
-        assert!(ExpectedCoverage::from_plan(&checked, 2).is_err());
+        assert!(ExpectedCoverage::from_plan(&plan, 2).is_err());
+        assert_gaps(&expected, &plan, 32)?;
         Ok(())
     }
+
+    #[test]
+    fn padding_never_hides_a_missing_run() -> Result<()> {
+        // Four 6-byte rows at an 8-byte pitch: 2 bytes of padding per row.
+        let pattern = Pattern { run: 6, dims: vec![Dim { steps: Steps::Count(4), src_stride: 6, dst_stride: 8 }] };
+        let plan = checked(vec![pattern], vec![entry(0, 0, 0)], 24, 40)?;
+        let expected = ExpectedCoverage::from_plan(&plan, 0)?;
+        let mut coverage = Coverage::default();
+        for row in [0u64, 1, 3] {
+            expected.record(&mut coverage, row * 8, 6)?;
+        }
+        assert!(!expected.complete(&coverage), "a missing row must stay a hole");
+        // Padding is not deliverable, alone or straddling a run.
+        assert!(expected.record(&mut coverage, 6, 2).is_err());
+        assert!(expected.record(&mut coverage, 20, 6).is_err());
+        assert!(expected.record(&mut coverage, 30, 2).is_err());
+        expected.record(&mut coverage, 16, 6)?;
+        assert!(expected.complete(&coverage));
+        assert_eq!(coverage.intervals.len(), 1);
+        // Replays merge without changing the total.
+        expected.record(&mut coverage, 8, 6)?;
+        assert_eq!(coverage.bytes, 24);
+        assert_gaps(&expected, &plan, 40)?;
+        Ok(())
+    }
+
+    /// MiMo V2.6 Pro TP6 Down on a 256-wide rank stored at the padded 384
+    /// width: one 256 B run per row at a 384 B pitch, every expert of a layer.
+    #[test]
+    fn padded_mimo_down_layer_stays_far_under_the_cap() -> Result<()> {
+        let (rows, experts, width, pitch, cols) = (6144u64, 384u64, 256u64, 384u64, 2048u64);
+        let pattern = Pattern {
+            run: width as u32,
+            dims: vec![Dim { steps: Steps::Count(rows as u32), src_stride: cols, dst_stride: pitch }],
+        };
+        let image = rows * pitch;
+        let entries = (0..experts).map(|e| entry(0, e * rows * cols + 768, e * image)).collect();
+        let plan = checked(vec![pattern], entries, experts * rows * cols, experts * image)?;
+        let expected = ExpectedCoverage::from_plan(&plan, 0)?;
+        assert_eq!(expected.bytes(), rows * experts * width);
+        let mut coverage = Coverage::default();
+        // Deliver in file order, one row run at a time, as the source does.
+        for e in 0..experts {
+            for row in 0..rows {
+                expected.record(&mut coverage, e * image + row * pitch, width)?;
+            }
+            assert!(coverage.intervals.len() <= 1);
+        }
+        assert!(expected.complete(&coverage));
+        assert_eq!(coverage.peak, 1, "2.4M row runs fold into one packed interval");
+        Ok(())
+    }
+
+    #[test]
+    fn gaps_follow_multi_dimensional_and_inter_entry_padding() -> Result<()> {
+        let patterns = vec![
+            Pattern { run: 3, dims: vec![
+                Dim { steps: Steps::Count(2), src_stride: 100, dst_stride: 20 },
+                Dim { steps: Steps::Indices(vec![1, 4, 5]), src_stride: 3, dst_stride: 5 },
+            ] },
+            Pattern { run: 8, dims: vec![] },
+        ];
+        let plan = checked(patterns, vec![entry(1, 300, 2), entry(0, 0, 12), entry(1, 400, 60)], 512, 80)?;
+        let expected = ExpectedCoverage::from_plan(&plan, 0)?;
+        assert_gaps(&expected, &plan, 80)?;
+        assert_gaps(&expected, &plan, 40)?;
+        let mut coverage = Coverage::default();
+        for (start, len) in runs(&plan).into_iter().rev() {
+            assert!(!expected.complete(&coverage));
+            expected.record(&mut coverage, start, len)?;
+        }
+        assert!(expected.complete(&coverage));
+        Ok(())
+    }
+
     #[test]
     fn replay_merges_partial_overlaps_and_cap_fails_closed() -> Result<()> {
         let mut coverage = Coverage::default();
