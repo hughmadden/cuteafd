@@ -89,7 +89,7 @@ fn checked_plan(root: &Path, snapshot: &Path, catalog: &cuteafd_loader::Official
     for (rank, plan) in plans.iter().enumerate() {
         plan.append(&mut builder, snapshot, u32::try_from(rank)?)?;
     }
-    if let Some(coordinator) = coordinator { (coordinator.append)(&mut builder, catalog, &offers[sparks..])?; }
+    if let Some(coordinator) = coordinator { (coordinator.append)(&mut builder, Some(catalog), &offers[sparks..])?; }
     let appended = started.elapsed();
     let checked = builder.finish()?;
     tracing::info!(rank_plan_ms = planned.as_millis(), append_ms = (appended - planned).as_millis(),

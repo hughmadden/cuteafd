@@ -243,6 +243,37 @@ pub(crate) struct CoordinatorPush {
     host: String,
     snapshot: std::path::PathBuf,
     dense: DenseSlot,
+    /// The group driver when no Spark admission drives the group (coordinator ranks alone).
+    driver: Option<AloneDriver>,
+    /// The SparkNest push endpoint the ranks join (and an alone driver creates on).
+    socket: Option<String>,
+}
+
+/// The push group driver of coordinator ranks alone, on its own thread; joined
+/// after every rank has committed or drained.
+struct AloneDriver {
+    cancel: Vec<std::net::TcpStream>,
+    thread: Option<std::thread::JoinHandle<Result<()>>>,
+}
+impl AloneDriver {
+    fn join(mut self) -> Result<()> {
+        self.thread.take().map_or(Ok(()), |thread| thread.join()
+            .map_err(|_| anyhow::anyhow!("coordinator push driver panicked"))?)
+    }
+}
+impl Drop for AloneDriver {
+    fn drop(&mut self) {
+        for stream in &self.cancel { let _ = stream.shutdown(std::net::Shutdown::Both); }
+        if let Some(thread) = self.thread.take() { let _ = thread.join(); }
+    }
+}
+
+/// The push client on `socket`, or the configured endpoint.
+fn client(socket: Option<String>) -> Result<cuteafd_loader::push_load::PushClient> {
+    Ok(match socket {
+        Some(socket) => cuteafd_loader::push_load::PushClient::at(socket, cuteafd_loader::push_load::PUSH_IDLE_TIMEOUT)?,
+        None => cuteafd_loader::push_load::PushClient::default(),
+    })
 }
 
 /// Group rank of coordinator GPU `gpu` after `sparks` Spark ranks.
@@ -278,25 +309,57 @@ impl CoordinatorPush {
         let append_tp2 = tp2.map(|(layers, budgets)| (layers.to_vec(), budgets));
         let append_dense = dense.clone();
         let append = Box::new(move |builder: &mut cuteafd_loader::push_load::builder::Builder,
-            catalog: &OfficialV41Catalog, offers: &[cuteafd_transport::worker_selection::push::Offer]| -> Result<()> {
+            catalog: Option<&OfficialV41Catalog>, offers: &[cuteafd_transport::worker_selection::push::Offer]| -> Result<()> {
             ensure!(offers.len() == gpus, "coordinator push offer count differs");
             let dense = append_dense.lock().map_err(|_| anyhow::anyhow!("coordinator dense plan poisoned"))?;
             for (gpu, offer) in offers.iter().enumerate() {
                 let rank = u32::try_from(offer.rank)?;
                 let (base, host) = dense.as_ref().map_or((0, 0), |dense| (dense[gpu].base, dense[gpu].host_bytes));
-                let tp2 = append_tp2.as_ref().map(|(layers, budgets)| Tp2ExpertPlan::new(catalog, layers, gpu, budgets[gpu]))
+                let tp2 = append_tp2.as_ref().map(|(layers, budgets)| Tp2ExpertPlan::new(
+                    catalog.context("coordinator TP2 push needs the expert catalog")?, layers, gpu, budgets[gpu]))
                     .transpose()?;
                 let (host_base, total) = rank_bytes(base, tp2.as_ref().map_or(0, |p| p.layout.logical_bytes() as u64), host);
                 if let Some(dense) = dense.as_ref() { (dense[gpu].append)(builder, rank, host_base)?; }
-                if let Some(plan) = &tp2 { plan.append_at(builder, catalog, rank, base)?; }
+                if let (Some(plan), Some(catalog)) = (&tp2, catalog) { plan.append_at(builder, catalog, rank, base)?; }
                 ensure!(offer.placement.is_empty() && offer.arena_bytes == total,
                     "coordinator push offer differs from its admitted arenas");
             }
             Ok(())
         });
         let ranks_spec = crate::shared::memory::push_exl3::CoordinatorRanks { ranks: gpus, append };
-        Ok((Self { gpus: plans.into_iter().zip(ranks).collect(), host, snapshot: snapshot.to_path_buf(), dense },
-            driver, ranks_spec))
+        Ok((Self { gpus: plans.into_iter().zip(ranks).collect(), host, snapshot: snapshot.to_path_buf(), dense,
+            driver: None, socket: None }, driver, ranks_spec))
+    }
+
+    /// [`Self::prepare`] for a launch without Spark peers: the coordinator GPUs
+    /// form the push group alone, driven by a thread of this owner (the same
+    /// whole-group commit or mount fallback). Every family's coordinator dense
+    /// records push this way on Spark-free layouts.
+    /// With `tp2`, the GPUs' admitted TP2 expert halves join the group too.
+    pub(crate) fn prepare_alone(snapshot: &std::path::Path, catalog: Option<&OfficialV41Catalog>, gpus: usize,
+        tp2: Option<(&[usize], Vec<usize>)>) -> Result<Self> {
+        Self::prepare_alone_at(snapshot, catalog, gpus, tp2, None)
+    }
+
+    /// [`Self::prepare_alone`] on push endpoint `socket` (None: the configured one).
+    pub(crate) fn prepare_alone_at(snapshot: &std::path::Path, catalog: Option<&OfficialV41Catalog>, gpus: usize,
+        tp2: Option<(&[usize], Vec<usize>)>, socket: Option<String>) -> Result<Self> {
+        let experts = tp2.is_some();
+        let (mut push, streams, ranks) = Self::prepare(snapshot, catalog, gpus, tp2)?;
+        push.socket = socket.clone();
+        let cancel = streams.iter().map(std::net::TcpStream::try_clone).collect::<std::io::Result<Vec<_>>>()?;
+        let snapshot = snapshot.to_path_buf();
+        let thread = std::thread::Builder::new().name("coordinator-push".into()).spawn(move || {
+            let mut streams = streams;
+            cuteafd_transport::worker_selection::push::coordinate(&mut streams, |offers| {
+                // As the Spark driver: the expert catalog is reopened on this thread.
+                let catalog = experts.then(|| cuteafd_loader::read_expert_catalog(&snapshot)).transpose()?;
+                crate::shared::memory::push_exl3::prepare_coordinator(&snapshot, catalog.as_ref(), offers, &ranks,
+                    &client(socket.clone())?)
+            })
+        })?;
+        push.driver = Some(AloneDriver { cancel, thread: Some(thread) });
+        Ok(push)
     }
 
     /// Receives every coordinator GPU (two: each on its own thread) while
@@ -312,7 +375,7 @@ impl CoordinatorPush {
         dense: Option<Result<(Vec<DensePlan>, Vec<D>)>>, beside: impl FnOnce() -> U)
         -> (Result<Option<Vec<PushedTp2<'a>>>>, U) {
         use cuteafd_ffi::push_ring::{DEFAULT_SLOTS, DEFAULT_SLOT_BYTES};
-        let Self { gpus, host, snapshot, dense: slot } = self;
+        let Self { gpus, host, snapshot, dense: slot, driver, socket } = self;
         if devices.len() != gpus.len() || dense.as_ref().is_some_and(|d| d.as_ref()
             .is_ok_and(|(p, d)| p.len() != gpus.len() || d.len() != gpus.len())) {
             return (Err(anyhow::anyhow!("coordinator push GPUs differ from their plans")), beside());
@@ -336,7 +399,7 @@ impl CoordinatorPush {
             }
             None => (vec![(0, 0); gpus.len()], (0..gpus.len()).map(|_| None).collect()),
         };
-        let client = cuteafd_loader::push_load::PushClient::default();
+        let client = match client(socket) { Ok(client) => client, Err(error) => return (Err(error), beside()) };
         let (snapshot, namespace_host) = (&snapshot, &host);
         let receive = |gpu: usize, (tp2, mut stream, dense): (Option<Tp2ExpertPlan>, std::net::TcpStream, Option<D>)| {
             let rank = group_rank(sparks, gpu);
@@ -382,7 +445,10 @@ impl CoordinatorPush {
             let result = inputs.pop().context("one coordinator GPU").and_then(|input| receive(0, input)).map(|r| vec![r]);
             (result, beside())
         };
+        // Every rank has committed or drained: the driver has finished its protocol.
+        let driven = driver.map_or(Ok(()), AloneDriver::join);
         let pushed = results.and_then(|results| {
+            driven?;
             let committed = results.iter().filter(|r| r.is_some()).count();
             match committed {
                 0 => Ok(None),

@@ -10,7 +10,9 @@ struct host_buffer { void *ptr; size_t bytes; uint64_t flags; };
 static char *event_path;
 static int quiet_events;
 void fixture_quiet_events(int quiet) { quiet_events = quiet; }
-static int pack_status, drain_status, drain_calls, drain_after, current_device;
+static int pack_status, drain_status, drain_calls, drain_after;
+/* Per thread, as CUDA's current device: two GPU loader threads bind their own. */
+static _Thread_local int current_device;
 static int bind_after = -1, bind_calls;
 void fixture_configure_bind_after(int after) { bind_after = after; bind_calls = 0; }
 static size_t memory_total[8], memory_used[8], graph_bytes;

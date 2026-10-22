@@ -122,6 +122,10 @@ fn installed_pushed_operands_match_the_mount_golden() -> Result<()> {
         let head = (gpus == 2 && !oshard).then(|| loader.fp8(&["lm_head.weight".to_string()],
             crate::families::glm5_flash::fp8::Layout::Row128)).transpose()?;
         let (records, steps) = load.sink.as_ref().context("push sink")?.take();
+        let landed: usize = records.iter().map(|r| r.bytes).sum();
+        let staged: usize = steps.iter().map(|s| s.bytes()).sum();
+        eprintln!("records gpus={gpus} oshard={oshard}: class2 {landed} B in {} operands; class3 {staged} B in {} steps \
+            (largest {} B)", records.len(), steps.len(), steps.iter().map(|s| s.bytes()).max().unwrap_or(0));
         // Every kind of staged step (quantize, widen, absorb, A_log) fits one
         // uniform staging buffer exactly or below.
         use crate::shared::experts::rtx::dense::{Job, STEP_BYTES};
