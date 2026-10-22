@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shlex
 import subprocess
 from pathlib import Path
 
@@ -2408,31 +2409,37 @@ def test_deepseek_v4_launches_with_the_prefix_cache_keys(tmp_path: Path) -> None
     assert "--host-cache-bytes auto" in launch[0] and "--pool-tokens 0" in launch[0]
 
 
-def test_glm_flash_drafts_with_its_default_speculator(tmp_path: Path) -> None:
+@pytest.mark.parametrize("draft_kv", ["bf16", "fp8"])
+def test_glm_flash_drafts_with_its_default_speculator(tmp_path: Path, draft_kv: str) -> None:
     config = {"model_type": "glm5_next", "num_hidden_layers": 2, "mlp_layer_types": ["sparse"] * 2,
               "layer_types": ["linear_attention", "deepseek_sparse_attention"]}
     model = "wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K3.25-v1"
     default = "incoai/GLM-5.3-Flash-DFlash2"
     dspark = "RedHatAI/GLM-5.3-Flash-speculator.dspark-preview"
-    keys = "GLM5_FLASH_FP8_MODEL_ID=off\n"
+    keys = f"GLM5_FLASH_FP8_MODEL_ID=off\nDRAFT_KV_CACHE={draft_kv}\n"
 
     def launch(sub: str, extra: str, drafters: tuple[str, ...] = (default, dspark)) -> tuple[str, list[str]]:
         hf = tmp_path / sub / "hf"
         for name in drafters:
             _snapshot(hf, name, {"speculators_model_type": "dspark"} if name == dspark else {})
         text = _family_launch_lines(tmp_path / sub, config, model, keys + extra)
-        return text, [l for l in text.splitlines() if "cuteafd serve-glmf" in l]
+        lines = [l for l in text.splitlines() if "cuteafd serve-glmf" in l]
+        for line in lines:
+            command = shlex.split(line)
+            assert command.count("--draft-kv-cache") == 1
+            assert command[command.index("--draft-kv-cache") + 1] == draft_kv
+        return text, lines
 
     snap = lambda sub, name: f"--draft {tmp_path}/{sub}/hf/hub/models--{name.replace('/', '--')}/snapshots/abc"
     text, lines = launch("a", "")
     assert lines and snap("a", default) in lines[0], text
     assert "drafts with dflash2" in text
     text, lines = launch("b", "SPECULATOR=off\n")
-    assert lines and "--draft" not in lines[0], text
+    assert lines and "--draft" not in shlex.split(lines[0]), text
     text, lines = launch("c", f"SPECULATOR=dspark\nSPECULATOR_MODEL_ID={dspark}\n")
     assert lines and snap("c", dspark) in lines[0], text
     text, lines = launch("d", "", ())
-    assert lines and "--draft" not in lines[0] and "hf download " + default in text, text
+    assert lines and "--draft" not in shlex.split(lines[0]) and "hf download " + default in text, text
 
 
 def test_glmf_pool_defaults_to_the_planned_pool(tmp_path: Path) -> None:
@@ -2502,16 +2509,20 @@ def test_budget_key_is_accepted_for_cleanup_and_native_launchers(tmp_path):
     ("SPECULATOR_FP8=auto\n", "checkpoint"), ("SPECULATOR_FP8=off\n", "bf16"),
     ("SPECULATOR=off\n", "off"), ("SPECULATOR=mtp\n", "mtp"),
 ])
-def test_flash_mopd_defaults_to_its_qualified_bundled_drafter(tmp_path: Path, keys: str, expected: str) -> None:
+@pytest.mark.parametrize("draft_kv", ["bf16", "fp8"])
+def test_flash_mopd_defaults_to_its_qualified_bundled_drafter(tmp_path: Path, keys: str, expected: str, draft_kv: str) -> None:
     config = {"model_type": "mimo_v2", "hidden_size": 4096, "num_hidden_layers": 2,
               "moe_layer_freq": [0, 1], "quantization_config": {"store_dtype": "mxfp4"}}
     model = "XiaomiMiMo/MiMo-V2.6-Flash-MOPD"
-    result = _family_launch_result(tmp_path, config, model, keys)
+    result = _family_launch_result(tmp_path, config, model, keys + f"DRAFT_KV_CACHE={draft_kv}\n")
     assert result.returncode == 0, result.stderr
     launch = next(line for line in result.stderr.splitlines() if "serve-mimo --snapshot" in line)
+    command = shlex.split(launch)
+    assert command.count("--draft-kv-cache") == 1
+    assert command[command.index("--draft-kv-cache") + 1] == draft_kv
     assert "--fp8-head" not in launch and "--fp8-o-proj" not in launch
     if expected in ("off", "mtp"):
-        assert "--draft" not in launch
+        assert "--draft" not in command
         assert ("--mtp 1" in launch) == (expected == "mtp")
     else:
         assert f"--draft {tmp_path}/hf/hub/models--XiaomiMiMo--MiMo-V2.6-Flash-MOPD/snapshots/abc" in launch

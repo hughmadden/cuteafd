@@ -26,15 +26,25 @@ def release_entry(entry: dict) -> dict:
 
 
 @pytest.mark.parametrize("entry", ENTRIES, ids=lambda e: e["name"])
-def test_deployment_preserves_release_container_commands(entry: dict) -> None:
+@pytest.mark.parametrize("draft_kv", ["bf16", "fp8"])
+def test_deployment_preserves_release_container_commands(entry: dict, draft_kv: str) -> None:
     golden = json.loads((FIXTURES / f"{entry['name']}.json").read_text())
-    current = capture(ROOT, entry["name"], release_entry=release_entry(entry))
+    selected = release_entry(entry)
+    compact_draft = entry["family"] in {"glm5", "glm5_flash", "mimo_v2"}
+    if compact_draft:
+        selected["set"]["DRAFT_KV_CACHE"] = draft_kv
+    current = capture(ROOT, entry["name"], release_entry=selected)
     assert [run["host"] for run in current["containers"]] == [run["host"] for run in golden]
     for old, new in zip(golden, current["containers"]):
         before, after = namespace_launch_contract(parse_run(old["argv"])), parse_run(new["argv"])
         if old["host"] == "coordinator":
             # capture() bounds readiness to 30s; admission now shares that deadline.
             before["env"]["CUTEAFD_SPARK_ADMISSION_TIMEOUT_SECONDS"] = "30"
+            if compact_draft:
+                anchor = {"glm5": "--pool-tokens", "glm5_flash": "--host-cache-bytes",
+                          "mimo_v2": "--prefix-partial"}[entry["family"]]
+                position = before["command"].index(anchor) + 2
+                before["command"][position:position] = ["--draft-kv-cache", draft_kv]
         # Includes the byte-identical V4.1 fingerprint. Other families have no
         # resolved-config fingerprint today; adding a fabricated one is a failure.
         if entry["family"] == "deepseek_v41" and "serve-native" in before["command"]:
