@@ -201,6 +201,13 @@ int cuteafd_copy_h2d_async(struct device_buffer dst, const void *source,
     event('Q');
     return 0;
 }
+int cuteafd_copy_h2d_batch_async(const struct device_buffer *dsts, const void *const *sources,
+                                 const size_t *bytes, size_t count, void *stream) {
+    for (size_t index = 0; index < count; ++index) {
+        if (cuteafd_copy_h2d_async(dsts[index], sources[index], bytes[index], stream)) return 1;
+    }
+    return 0;
+}
 int cuteafd_cuda_event_record(void *handle, void *stream) {
     (void)stream;
     struct upload_event *upload = handle;
