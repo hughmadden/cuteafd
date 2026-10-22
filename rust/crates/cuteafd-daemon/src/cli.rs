@@ -402,7 +402,7 @@ pub(crate) struct PlanArgs {
     #[arg(long = "rings", default_value_t = 16)]
     pub(crate) mimo_rings: u64,
     /// MiMo sliding and native-MTP ring format for --layout (matches serving).
-    #[arg(long, value_enum, default_value = "bf16")]
+    #[arg(long, value_enum, default_value = "int8")]
     pub(crate) mimo_swa_kv_cache: crate::families::mimo_v2::SwaKvCacheArg,
     /// MiMo Spark activation format for --layout (matches serve-mimo).
     #[arg(long, value_enum, default_value = "fp8")]
@@ -860,6 +860,22 @@ mod tests {
         }
     }
     use super::*;
+
+    #[test]
+    fn mimo_layout_swa_default_and_explicit_formats_match_serving() {
+        use cuteafd_loader::families::mimo_v2::MimoKvCache;
+        let parse = |extra: &[&str]| {
+            let Commands::Plan(args) = Cli::try_parse_from(
+                ["cuteafd", "plan", "model"].into_iter().chain(extra.iter().copied())).unwrap().command else {
+                panic!("expected plan command");
+            };
+            MimoKvCache::from(args.mimo_swa_kv_cache)
+        };
+        assert_eq!(parse(&[]), MimoKvCache::Int8);
+        for (flag, expected) in [("bf16", MimoKvCache::Bf16), ("int8", MimoKvCache::Int8), ("fp8", MimoKvCache::Fp8)] {
+            assert_eq!(parse(&["--mimo-swa-kv-cache", flag]), expected);
+        }
+    }
 
     #[test]
     fn transport_benchmark_defaults_use_flash_geometry() {

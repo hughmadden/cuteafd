@@ -64,7 +64,7 @@ pub(crate) struct EngineArgs {
     #[arg(long, value_enum, default_value_t = KvCacheArg::Int8, env = "CUTEAFD_MIMO_KV_CACHE")]
     pub kv_cache: KvCacheArg,
     /// Sliding-attention and native-MTP ring format, independent of full KV.
-    #[arg(long, value_enum, default_value = "bf16")]
+    #[arg(long, value_enum, default_value = "int8")]
     pub swa_kv_cache: SwaKvCacheArg,
     /// Sequences with a sliding-window ring.
     #[arg(long, default_value_t = 16)]
@@ -469,11 +469,12 @@ mod source_format_tests {
     }
 
     #[test]
-    fn full_and_sliding_kv_select_independently_with_bf16_swa_default() {
+    fn full_and_sliding_kv_select_independently_with_int8_swa_default() {
         use cuteafd_loader::families::mimo_v2::{MimoKvCache, MimoKvFormats};
         let args = Command::try_parse_from(["mimo", "--snapshot", "/missing", "--native-lib", "/missing.so"])
             .unwrap().engine;
-        assert_eq!(args.kv_formats(), MimoKvFormats { full: MimoKvCache::Int8, sliding: MimoKvCache::Bf16 });
+        assert_eq!(args.kv_formats(), MimoKvFormats { full: MimoKvCache::Int8, sliding: MimoKvCache::Int8 });
+        assert_eq!(args.kv_formats(), MimoKvFormats::default());
         for (full, full_format) in [("bf16", MimoKvCache::Bf16), ("int8", MimoKvCache::Int8)] {
             for (swa, sliding) in [("bf16", MimoKvCache::Bf16), ("int8", MimoKvCache::Int8), ("fp8", MimoKvCache::Fp8)] {
                 let args = Command::try_parse_from(["mimo", "--snapshot", "/missing", "--native-lib", "/missing.so",

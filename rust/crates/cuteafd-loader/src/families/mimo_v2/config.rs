@@ -55,7 +55,7 @@ pub struct MimoKvFormats {
 }
 
 impl Default for MimoKvFormats {
-    fn default() -> Self { Self { full: MimoKvCache::Int8, sliding: MimoKvCache::Bf16 } }
+    fn default() -> Self { Self { full: MimoKvCache::Int8, sliding: MimoKvCache::Int8 } }
 }
 
 impl MimoKvFormats {
@@ -440,7 +440,11 @@ mod tests {
         assert_eq!(cfg.dense.iter().filter(|d| **d).count(), 1);
         assert_eq!((cfg.record_elems(MimoAttention::Full), cfg.record_elems(MimoAttention::Sliding)), (1280, 2560));
         assert_eq!((cfg.record_bytes(MimoAttention::Full, MimoKvFormats::default()),
-            cfg.record_bytes(MimoAttention::Sliding, MimoKvFormats::default())), (1440, 5120));
+            cfg.record_bytes(MimoAttention::Sliding, MimoKvFormats::default())), (1440, 2880));
+        for (sliding, bytes) in [(MimoKvCache::Bf16, 5120), (MimoKvCache::Int8, 2880), (MimoKvCache::Fp8, 2720)] {
+            assert_eq!(cfg.record_bytes(MimoAttention::Sliding,
+                MimoKvFormats { full: MimoKvCache::Int8, sliding }), bytes);
+        }
         assert_eq!(cfg.head_split(2)?.record_bytes(MimoAttention::Full, MimoKvFormats::default()), 720);
         assert!((cfg.routed_scale - 1.0).abs() < 1e-12 && !cfg.full_sinks && cfg.swa_sinks);
         Ok(())
@@ -468,6 +472,12 @@ mod tests {
         assert_eq!(cfg.record_elems(MimoAttention::Full), 2560);
         assert_eq!(cfg.record_bytes(MimoAttention::Full, MimoKvFormats::default()), 2560 + 320);
         assert_eq!(cfg.head_split(2)?.record_bytes(MimoAttention::Full, MimoKvFormats::default()), 1280 + 160);
+        assert_eq!(cfg.record_bytes(MimoAttention::Sliding, MimoKvFormats::default()), 2880);
+        for (sliding, bytes) in [(MimoKvCache::Bf16, 5120), (MimoKvCache::Int8, 2880), (MimoKvCache::Fp8, 2720)] {
+            let formats = MimoKvFormats { full: MimoKvCache::Int8, sliding };
+            assert_eq!(cfg.record_bytes(MimoAttention::Sliding, formats), bytes);
+            assert_eq!(cfg.head_split(2)?.record_bytes(MimoAttention::Sliding, formats), bytes / 2);
+        }
         assert_eq!(cfg.program_family()?, "mimop");
         Ok(())
     }

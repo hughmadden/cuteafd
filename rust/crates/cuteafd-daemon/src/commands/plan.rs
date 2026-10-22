@@ -827,7 +827,7 @@ mod tests {
             prefix_cache_mark_mib: 2048,
             mimo_prefix_draft: false,
             mimo_rings: 16,
-            mimo_swa_kv_cache: crate::families::mimo_v2::SwaKvCacheArg::Bf16,
+            mimo_swa_kv_cache: crate::families::mimo_v2::SwaKvCacheArg::Int8,
             expert_input: crate::families::mimo_v2::engine::ExpertInput::Fp8,
             draft_sequences: 4,
             draft_context_slots: None,

@@ -1953,7 +1953,7 @@ if [[ $family == mimo_v2 ]]; then
     int8|bf16) family_args+=(--kv-cache "$mimo_kv") ;;
     *) release_die "KV_CACHE must be int8 or bf16" ;;
   esac
-  mimo_swa_kv="$(get SWA_KV_CACHE bf16)"
+  mimo_swa_kv="$(get SWA_KV_CACHE int8)"
   case "$mimo_swa_kv" in
     bf16|int8|fp8) family_args+=(--swa-kv-cache "$mimo_swa_kv") ;;
     *) release_die "SWA_KV_CACHE must be bf16, int8 or fp8" ;;

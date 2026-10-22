@@ -28,7 +28,7 @@ def release_entry(entry: dict) -> dict:
 @pytest.mark.parametrize("entry,swa_kv", [
     pytest.param(entry, swa_kv, id=entry["name"] + (f"-{swa_kv}" if swa_kv else ""))
     for entry in ENTRIES
-    for swa_kv in (["bf16", "int8", "fp8"] if entry["family"] == "mimo_v2" else [None])
+    for swa_kv in ([None, "bf16", "int8", "fp8"] if entry["family"] == "mimo_v2" else [None])
 ])
 @pytest.mark.parametrize("draft_kv", ["bf16", "fp8"])
 def test_deployment_preserves_release_container_commands(entry: dict, swa_kv: str | None, draft_kv: str) -> None:
@@ -46,10 +46,10 @@ def test_deployment_preserves_release_container_commands(entry: dict, swa_kv: st
         if old["host"] == "coordinator":
             # capture() bounds readiness to 30s; admission now shares that deadline.
             before["env"]["CUTEAFD_SPARK_ADMISSION_TIMEOUT_SECONDS"] = "30"
-            if swa_kv is not None:
+            if entry["family"] == "mimo_v2":
                 anchor = "--kv-cache" if "--kv-cache" in before["command"] else "--prefix-partial"
                 position = before["command"].index(anchor) + 2
-                before["command"][position:position] = ["--swa-kv-cache", swa_kv]
+                before["command"][position:position] = ["--swa-kv-cache", swa_kv or "int8"]
             if compact_draft:
                 anchor = {"glm5": "--pool-tokens", "glm5_flash": "--host-cache-bytes",
                           "mimo_v2": "--swa-kv-cache"}[entry["family"]]
