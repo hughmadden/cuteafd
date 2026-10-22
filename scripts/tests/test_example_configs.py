@@ -1,4 +1,4 @@
-"""The per-family starting configs in examples/configs/ (one per v2.0.0 release card).
+"""The per-family starting configs in examples/configs/ (current serving recipes).
 
 Each one parses through the real launcher's dry-run or argv path (CPU only:
 docker, ssh, nvidia-smi and nest are stubs that print their argv), and its
@@ -51,7 +51,7 @@ CHECKPOINTS = {
     "wrldsuksgo2mars/GLM-5.3-EXL3-K4-v1": GLM5,
     "nvidia/GLM-5.3-NVFP4": GLM5,
     "zai-org/GLM-5.3-Flash": GLMF,
-    "wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K3.25-v1": GLMF,
+    "wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K3.25-Core-FP8": GLMF,
     "nvidia/GLM-5.3-Flash-NVFP4": GLMF,
     "brandonmusic/GLM-5.3-Flash-tr3-4bpw": GLMF,
     "XiaomiMiMo/MiMo-V2.6-Flash-MOPD": {**MIMO, "hidden_size": 4096},
@@ -340,6 +340,22 @@ def test_v3_5090_precheck_requires_real_hardware(tmp_path: Path, gpu_name: str, 
         result = subprocess.run(hook["argv"], env={**os.environ, "PATH": f"{tmp_path}:{os.environ['PATH']}"},
                                 timeout=hook["timeout_s"], check=False)
         assert result.returncode == expected, entry["name"]
+
+
+def test_glmf_exl3_smoke_and_gate_cards_use_the_published_core_checkpoint() -> None:
+    model = "wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K3.25-Core-FP8"
+    revision = "d31ebc921f1f098b4a56d37aaccb3cdef4096184"
+    for filename in ("scripts/bench/release-smoke.example.json", "scripts/bench/release-smoke-v3.json",
+                     "scripts/bench/kits/gate/matrix-gate.json"):
+        matrix = json.loads((ROOT / filename).read_text())
+        entries = [entry for entry in matrix["entries"] if entry["family"] == "glm5_flash"
+                   and "exl3" in entry["name"]]
+        assert entries, filename
+        for entry in entries:
+            effective = {**keys(ROOT / entry["config"]), **matrix.get("defaults", {}).get("set", {}),
+                         **entry.get("set", {})}
+            assert effective["MODEL_ID"] == model, entry["name"]
+            assert effective["MODEL_REVISION"] == revision, entry["name"]
 
 
 def test_published_matrix_pins_current_reports() -> None:

@@ -321,10 +321,7 @@ def capture(launcher_root: Path, case: str, *, release_entry: dict | None = None
             revision = release_values["MODEL_REVISION"]
             checkpoint = release_checkpoint(release_entry["family"], model)
             checkpoints[model], revisions[model] = checkpoint, revision
-            if release_entry["family"] == "glm5_flash" and release_values.get("GLM5_FLASH_FP8_MODEL_ID") != "off":
-                checkpoints.setdefault("zai-org/GLM-5.3-Flash", {"model_type": "glm5_next"})
-                revisions.setdefault("zai-org/GLM-5.3-Flash", "companion-revision")
-            for key in ("SPECULATOR_MODEL_ID", "GLM5_FLASH_FP8_MODEL_ID", "CHAT_TEMPLATE_FROM"):
+            for key in ("SPECULATOR_MODEL_ID", "CHAT_TEMPLATE_FROM"):
                 companion = release_values.get(key)
                 if companion and companion != "off":
                     checkpoints.setdefault(companion, {"architectures": ["DFlash2DraftModel"]})

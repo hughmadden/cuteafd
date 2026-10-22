@@ -270,7 +270,7 @@ def test_family_table_names_every_launchable_family() -> None:
 
 def test_glmf_solved_worker_startup_waits_bootstrap_by_default(tmp_path: Path) -> None:
     result = _family_launch_result(tmp_path, SPLIT_CONFIGS["glm5_flash"], "test/glmf",
-                                  "SPECULATOR=off\nVISION=off\nAUDIO=off\nGLM5_FLASH_FP8_MODEL_ID=off\n",
+                                  "SPECULATOR=off\nVISION=off\nAUDIO=off\n",
                                   extra_env={"STUB_WORKER_READY": "worker bootstrap ready"})
     assert result.returncode == 0, result.stderr
     lines = result.stderr.splitlines()
@@ -394,8 +394,6 @@ def test_every_family_failed_wip_deployment_prints_planner_hints(tmp_path, famil
         keys += "MODEL_REVISION=\nRTX_EXPERT_LAYERS=0\nSPARK_COUNT=1\n"
     elif family == "qwen3_5":
         keys += "SPARK_COUNT=0\n"
-    elif family == "glm5_flash":
-        keys += "GLM5_FLASH_FP8_MODEL_ID=off\n"
     overrides = {"executable": False, "wip_launchable": failure != "refused"}
     if failure == "wrong-launch-family":
         overrides["launch"] = {"family": "wrong"}
@@ -414,7 +412,7 @@ def test_every_family_failed_wip_deployment_prints_planner_hints(tmp_path, famil
 
 def test_glmf_zero_spark_launch_does_not_enable_worker_selection(tmp_path: Path) -> None:
     result = _family_launch_result(tmp_path, SPLIT_CONFIGS["glm5_flash"], "test/glmf",
-                                  "SPARK_COUNT=0\nSPECULATOR=off\nVISION=off\nAUDIO=off\nGLM5_FLASH_FP8_MODEL_ID=off\n",
+                                  "SPARK_COUNT=0\nSPECULATOR=off\nVISION=off\nAUDIO=off\n",
                                   extra_env={"CUTEAFD_PLACEMENT_HANDSHAKE": "1"})
     assert result.returncode == 0, result.stderr
     assert "--placement-handshake" not in result.stderr
@@ -525,7 +523,7 @@ def test_glmf_selection_starts_after_solve_and_seals_before_opening_lanes() -> N
     assert "args.experts_snapshot.as_deref().unwrap_or(&args.snapshot)" in body
     assert "&working, peers.len(), None, model)?;" in body and "admission.start_with(&peers, ranks)?" in body
     # Coordinator GPUs (dense operands, TP2 halves) join the Spark push group only when it pushes.
-    assert "if admission.coordinator_pushes() && dense_pushable(&args, self.fp8_checkpoint.is_some())" in body
+    assert "if admission.coordinator_pushes() && dense_pushable(&args)" in body
     assert body.index("load_while_admitting(admission,") < body.index("TokenEmbedding::load(")
     assert body.index("TokenEmbedding::load(") < body.index("engine::GlmfEngine::new(")
     assert "let spark = !spark_layers.is_empty();" in body
@@ -870,8 +868,7 @@ def test_family_prelaunch_plan_uses_coordinator_card_memory(tmp_path, family, bu
         tmp_path, ({"model_type": "glm_moe_dsa", "num_hidden_layers": 4, "first_k_dense_replace": 3}
                    if family == "glm5" else {"model_type": "deepseek_v4"}
                    if family == "deepseek_v4" else SPLIT_CONFIGS["mimo_flash" if family == "mimo_v2" else family]), "test/model",
-        f"COORDINATOR_GPU_BUDGET_GIB={budget}\nRTX_GPUS=1\nSPECULATOR=off\nVISION=off\nAUDIO=off\n"
-        + ("GLM5_FLASH_FP8_MODEL_ID=off\n" if family == "glm5_flash" else ""),
+        f"COORDINATOR_GPU_BUDGET_GIB={budget}\nRTX_GPUS=1\nSPECULATOR=off\nVISION=off\nAUDIO=off\n",
         gpu_total_mib=total, gpu_free_mib=total)
     assert result.returncode == 0, result.stderr
     plan = next(line for line in result.stderr.splitlines() if "cuteafd plan" in line)
@@ -896,9 +893,7 @@ def test_shared_concurrency_default_reaches_plan_and_serve(tmp_path, family, bud
     model = "deepseek-ai/DeepSeek-V4.1-Flash" if family == "deepseek_v41" else "test/model"
     keys = (f"COORDINATOR_GPU_BUDGET_GIB={budget}\nRTX_GPUS=1\n"
             "SPECULATOR=off\nVISION=off\nAUDIO=off\n")
-    if family == "glm5_flash":
-        keys += "GLM5_FLASH_FP8_MODEL_ID=off\n"
-    elif family == "deepseek_v41":
+    if family == "deepseek_v41":
         keys += ("MODEL_REVISION=\nRTX_EXPERT_LAYERS=0\nSPARK_COUNT=2\n"
                  "SPARK_1_HOST=h1\nSPARK_1_LANE_A=10.0.0.2\n")
     if override:
@@ -1029,8 +1024,6 @@ def test_a_key_the_family_never_reads_fails_before_launch(tmp_path, family, extr
     }
     model = {"glm5": "zai-org/GLM-5.3", "deepseek_v41": "deepseek-ai/DeepSeek-V4.1-Flash"}.get(family, "test/model")
     keys = "SPECULATOR=off\n" + extra
-    if family == "glm5_flash":
-        keys += "GLM5_FLASH_FP8_MODEL_ID=off\n"
     if family == "deepseek_v41":
         keys += ("MODEL_REVISION=\nRTX_EXPERT_LAYERS=0\nSPARK_COUNT=2\n"
                  "SPARK_1_HOST=h1\nSPARK_1_LANE_A=10.0.0.2\n")
@@ -1087,8 +1080,7 @@ def test_worker_endpoint_count_matches_family_connection_ownership(tmp_path, con
     fixture = {"num_hidden_layers": 4, "layer_types": ["linear_attention"] * 4,
         "mlp_layer_types": ["dense"] * dense_layers + ["sparse"] * (4 - dense_layers), **config}
     result = _family_launch_result(tmp_path, fixture, "test/model",
-        "EXPERT_BACKEND=spark\nSPECULATOR=off\nVISION=off\nAUDIO=off\n"
-        + ("GLM5_FLASH_FP8_MODEL_ID=off\n" if config["model_type"] == "glm5_next" else "") + keys,
+        "EXPERT_BACKEND=spark\nSPECULATOR=off\nVISION=off\nAUDIO=off\n" + keys,
         extra_env=env)
     assert result.returncode == 0, result.stderr
     workers = [line for line in result.stderr.splitlines() if "cuteafd expertd-native" in line]
@@ -1245,7 +1237,7 @@ def test_glm53_all_local_two_rtx_launch_has_no_spark_peers(tmp_path):
 
 @pytest.mark.parametrize("value", [None, "auto", "0", "2", "50%", "all", "max"])
 def test_glm_flash_forwards_explicit_rtx_expert_onboarding(tmp_path, value):
-    keys = "SPECULATOR=off\nGLM5_FLASH_FP8_MODEL_ID=off\n"
+    keys = "SPECULATOR=off\n"
     if value is not None:
         keys += f"RTX_EXPERT_LAYERS={value}\n"
     result = _family_launch_result(tmp_path, {
@@ -1323,7 +1315,7 @@ def test_deepseek_v4_rejects_invalid_local_limit_before_launch(tmp_path, value):
                                         "GLMF_KDA_FP8=auto\nGLMF_FP8_HEAD=auto\n"])
 def test_glmf_precision_defaults_follow_serving_split(tmp_path, layout, physical_gpus, split, precision):
     result = _family_launch_result(tmp_path, SPLIT_CONFIGS["glm5_flash"], "test/glmf",
-                                  "GLM5_FLASH_FP8_MODEL_ID=off\n" + layout + precision,
+                                  layout + precision,
                                   physical_gpus=physical_gpus)
     assert result.returncode == 0, result.stderr
     launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-glmf" in line)
@@ -1333,6 +1325,7 @@ def test_glmf_precision_defaults_follow_serving_split(tmp_path, layout, physical
     assert "--kda-fp8 row128" in launch
     assert "--fp8-head true" in launch
     assert launch.count("--kda-fp8") == launch.count("--fp8-head") == 1
+    assert launch.count("--snapshot ") == 1
     assert ("--kda-output-shard --kda-prefill-expanded" in launch) == split
 
 
@@ -1340,7 +1333,7 @@ def test_glmf_precision_defaults_follow_serving_split(tmp_path, layout, physical
                                         ("GLM5_FLASH_KDA_FP8=off\n", False)])
 def test_glmf_split_token_rows_follow_fp8_kda(tmp_path, keys, shard):
     result = _family_launch_result(tmp_path, SPLIT_CONFIGS["glm5_flash"], "test/glmf",
-                                  "GLM5_FLASH_FP8_MODEL_ID=off\nRTX_GPUS=2\n" + keys)
+                                  "RTX_GPUS=2\n" + keys)
     assert result.returncode == 0, result.stderr
     launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-glmf" in line)
     assert ("--kda-output-shard" in launch) == shard
@@ -1354,12 +1347,13 @@ def test_glmf_explicit_precision_wins_on_either_layout(tmp_path, layout, prefix,
     keys = "GLMF_KDA_FP8=channel\nGLMF_FP8_HEAD=on\n" if prefix == "GLM5_FLASH" else ""
     keys += f"{prefix}_KDA_FP8={kda}\n{prefix}_FP8_HEAD={head}\n"
     result = _family_launch_result(tmp_path, SPLIT_CONFIGS["glm5_flash"], "test/glmf",
-                                  "GLM5_FLASH_FP8_MODEL_ID=off\n" + layout + keys)
+                                  layout + keys)
     assert result.returncode == 0, result.stderr
     launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-glmf" in line)
     assert f"--kda-fp8 {kda}" in launch
     assert f"--fp8-head {'true' if head == 'on' else 'false'}" in launch
     assert launch.count("--kda-fp8") == launch.count("--fp8-head") == 1
+    assert launch.count("--snapshot ") == 1
 
 
 @pytest.mark.parametrize("layout,keys,kda,head", [
@@ -1370,7 +1364,7 @@ def test_glmf_explicit_precision_wins_on_either_layout(tmp_path, layout, prefix,
 ])
 def test_glmf_precision_overrides_are_independent(tmp_path, layout, keys, kda, head):
     result = _family_launch_result(tmp_path, SPLIT_CONFIGS["glm5_flash"], "test/glmf",
-                                  "GLM5_FLASH_FP8_MODEL_ID=off\n" + layout + keys)
+                                  layout + keys)
     assert result.returncode == 0, result.stderr
     launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-glmf" in line)
     assert f"--kda-fp8 {kda}" in launch
@@ -1380,7 +1374,7 @@ def test_glmf_precision_overrides_are_independent(tmp_path, layout, keys, kda, h
 @pytest.mark.parametrize("layout,accepted", [("RTX_GPUS=1\n", True), ("RTX_GPUS=2\n", False)])
 def test_glmf_kda_prefill_validation_uses_resolved_precision(tmp_path, layout, accepted):
     result = _family_launch_result(tmp_path, SPLIT_CONFIGS["glm5_flash"], "test/glmf",
-                                  "GLM5_FLASH_FP8_MODEL_ID=off\nGLM5_FLASH_FP8_PREFILL=all\n" + layout)
+                                  "GLM5_FLASH_FP8_PREFILL=all\n" + layout)
     assert result.returncode == (0 if accepted else 2), result.stderr
     if accepted:
         assert "--fp8-prefill all" in result.stderr
@@ -1407,7 +1401,7 @@ def test_glmf_single_copy_fp8_options_are_forwarded(tmp_path, keys, expected):
     config = {"model_type": "glm5_next", "num_hidden_layers": 2,
               "mlp_layer_types": ["sparse"] * 2,
               "layer_types": ["linear_attention", "deepseek_sparse_attention"]}
-    result = _family_launch_result(tmp_path, config, "test/glmf", f"GLM5_FLASH_FP8_MODEL_ID=off\n{keys}")
+    result = _family_launch_result(tmp_path, config, "test/glmf", keys)
     assert result.returncode == 0, result.stderr
     launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-glmf" in line)
     for option in expected:
@@ -1426,7 +1420,7 @@ def test_glmf_invalid_fp8_options_fail_before_workers_launch(tmp_path, key, valu
               "mlp_layer_types": ["sparse"] * 2,
               "layer_types": ["linear_attention", "deepseek_sparse_attention"]}
     result = _family_launch_result(tmp_path, config, "test/glmf",
-                                  f"GLM5_FLASH_FP8_MODEL_ID=off\nGLM5_FLASH_KDA_FP8=off\n{key}={value}\n")
+                                  f"GLM5_FLASH_KDA_FP8=off\n{key}={value}\n")
     assert result.returncode == 2 and message in result.stderr
     assert not any(line.startswith(("docker ", "ssh ", "nest ")) for line in result.stderr.splitlines())
 
@@ -1446,7 +1440,7 @@ GLMF_TWO_LAYER = {"model_type": "glm5_next", "num_hidden_layers": 2, "mlp_layer_
     ("GLM5_FLASH_TARGET_HEAD=exact\n", "exact")])
 def test_glmf_target_head_defaults_to_tensor_with_the_bf16_head(tmp_path, keys, forwarded):
     result = _family_launch_result(tmp_path, GLMF_TWO_LAYER, "test/glmf",
-                                  "GLM5_FLASH_FP8_MODEL_ID=off\nRTX_GPUS=1\n" + keys)
+                                  "RTX_GPUS=1\n" + keys)
     assert result.returncode == 0, result.stderr
     launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-glmf" in line)
     assert ("--target-head" in launch) == (forwarded is not None), launch
@@ -1461,7 +1455,7 @@ def test_glmf_fp8_head_launch_is_identical_with_and_without_the_target_head_key(
         root = tmp_path / str(index)
         root.mkdir()
         result = _family_launch_result(root, GLMF_TWO_LAYER, "test/glmf",
-                                      "GLM5_FLASH_FP8_MODEL_ID=off\nRTX_GPUS=1\n" + keys)
+                                      "RTX_GPUS=1\n" + keys)
         assert result.returncode == 0, result.stderr
         launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-glmf" in line)
         assert "--fp8-head true" in launch and "--target-head" not in launch, launch
@@ -1476,7 +1470,7 @@ def test_glmf_fp8_head_launch_is_identical_with_and_without_the_target_head_key(
     ("GLM5_FLASH_FP8_HEAD=on\nGLM5_FLASH_TARGET_HEAD=tensor\n", "set GLM5_FLASH_FP8_HEAD=off"),
 ])
 def test_glmf_target_head_rejects_bad_values_and_explicit_tensor_with_the_fp8_head(tmp_path, keys, message):
-    result = _family_launch_result(tmp_path, GLMF_TWO_LAYER, "test/glmf", "GLM5_FLASH_FP8_MODEL_ID=off\n" + keys)
+    result = _family_launch_result(tmp_path, GLMF_TWO_LAYER, "test/glmf", keys)
     assert result.returncode == 2 and message in result.stderr, result.stderr
     assert not any(line.startswith(("docker ", "ssh ", "nest ")) for line in result.stderr.splitlines())
 
@@ -1485,7 +1479,7 @@ def test_glmf_target_head_rejects_bad_values_and_explicit_tensor_with_the_fp8_he
 def test_glmf_serving_head_has_no_arithmetic_selection(tmp_path, value):
     keys = "" if value is None else f"GLM5_FLASH_DRAFT_HEAD={value}\n"
     result = _family_launch_result(tmp_path, GLMF_TWO_LAYER, "test/glmf",
-                                  "GLM5_FLASH_FP8_MODEL_ID=off\nRTX_GPUS=1\n" + keys)
+                                  "RTX_GPUS=1\n" + keys)
     if value is None:
         assert result.returncode == 0, result.stderr
         launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-glmf" in line)
@@ -1503,7 +1497,7 @@ def test_target_head_key_is_forwarded_to_the_coordinator_only_when_set(tmp_path,
     when set: unset launch lines are unchanged and the engine's default (tensor) applies."""
 
     result = _family_launch_result(tmp_path, GLMF_TWO_LAYER, "test/glmf",
-                                  "GLM5_FLASH_FP8_MODEL_ID=off\nRTX_GPUS=1\n" + keys)
+                                  "RTX_GPUS=1\n" + keys)
     assert result.returncode == 0, result.stderr
     launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-glmf" in line)
     assert ("CUTEAFD_TARGET_HEAD" in launch) == (forwarded is not None), launch
@@ -1512,7 +1506,7 @@ def test_target_head_key_is_forwarded_to_the_coordinator_only_when_set(tmp_path,
 
 
 def test_target_head_key_rejects_bad_values_before_launch(tmp_path):
-    result = _family_launch_result(tmp_path, GLMF_TWO_LAYER, "test/glmf", "GLM5_FLASH_FP8_MODEL_ID=off\nTARGET_HEAD=fp8\n")
+    result = _family_launch_result(tmp_path, GLMF_TWO_LAYER, "test/glmf", "TARGET_HEAD=fp8\n")
     assert result.returncode == 2 and "TARGET_HEAD must be tensor or exact" in result.stderr, result.stderr
     assert not any(line.startswith(("docker ", "ssh ", "nest ")) for line in result.stderr.splitlines())
 
@@ -1523,7 +1517,7 @@ def test_target_head_key_rejects_bad_values_before_launch(tmp_path):
                                            ("GLM5_FLASH_DRAFT_LINEAR=w8a8\n", "w8a8")])
 def test_glmf_draft_linear_is_forwarded_only_past_w8a16(tmp_path, keys, forwarded):
     result = _family_launch_result(tmp_path, GLMF_TWO_LAYER, "test/glmf",
-                                  "GLM5_FLASH_FP8_MODEL_ID=off\nRTX_GPUS=1\n" + keys)
+                                  "RTX_GPUS=1\n" + keys)
     assert result.returncode == 0, result.stderr
     launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-glmf" in line)
     if forwarded is None:
@@ -1534,7 +1528,7 @@ def test_glmf_draft_linear_is_forwarded_only_past_w8a16(tmp_path, keys, forwarde
 
 def test_glmf_draft_linear_rejects_unknown_values_before_launch(tmp_path):
     result = _family_launch_result(tmp_path, GLMF_TWO_LAYER, "test/glmf",
-                                  "GLM5_FLASH_FP8_MODEL_ID=off\nGLM5_FLASH_DRAFT_LINEAR=w4a16\n")
+                                  "GLM5_FLASH_DRAFT_LINEAR=w4a16\n")
     assert result.returncode == 2 and "GLM5_FLASH_DRAFT_LINEAR must be w8a16, wide or w8a8" in result.stderr, \
         result.stderr
     assert not any(line.startswith(("docker ", "ssh ", "nest ")) for line in result.stderr.splitlines())
@@ -1553,7 +1547,7 @@ def test_glmf_draft_linear_rejects_unknown_values_before_launch(tmp_path):
 def test_glmf_exl3_worker_env_reaches_only_the_spark_workers(tmp_path, keys, env):
     """The Spark worker's host path and route capture are worker environment: forwarded to
     every Spark rank's container, never to the coordinator; the defaults add nothing."""
-    result = _family_launch_result(tmp_path, GLMF_TWO_LAYER, "test/glmf", f"GLM5_FLASH_FP8_MODEL_ID=off\n{keys}")
+    result = _family_launch_result(tmp_path, GLMF_TWO_LAYER, "test/glmf", keys)
     assert result.returncode == 0, result.stderr
     lines = result.stderr.splitlines()
     workers = [line for line in lines if "cuteafd expertd-native" in line]
@@ -1575,7 +1569,7 @@ def test_glmf_exl3_worker_env_reaches_only_the_spark_workers(tmp_path, keys, env
     ("GLM5_FLASH_EXL3_ROUTE_DUMP=/data/r\nSPARK_COUNT=0\n", "GLM5_FLASH_EXL3_ROUTE_DUMP records Spark expert calls"),
 ])
 def test_glmf_exl3_worker_env_rejects_bad_requests_before_launch(tmp_path, keys, message):
-    result = _family_launch_result(tmp_path, GLMF_TWO_LAYER, "test/glmf", f"GLM5_FLASH_FP8_MODEL_ID=off\n{keys}")
+    result = _family_launch_result(tmp_path, GLMF_TWO_LAYER, "test/glmf", keys)
     assert result.returncode == 2 and message in result.stderr, result.stderr
     assert not any(line.startswith(("docker ", "ssh ", "nest ")) for line in result.stderr.splitlines())
 
@@ -1586,7 +1580,7 @@ def test_glmf_index_cache_is_forwarded_only_when_compact(tmp_path, keys, compact
     config = {"model_type": "glm5_next", "num_hidden_layers": 2,
               "mlp_layer_types": ["sparse"] * 2,
               "layer_types": ["linear_attention", "deepseek_sparse_attention"]}
-    result = _family_launch_result(tmp_path, config, "test/glmf", f"GLM5_FLASH_FP8_MODEL_ID=off\n{keys}")
+    result = _family_launch_result(tmp_path, config, "test/glmf", keys)
     assert result.returncode == 0, result.stderr
     launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-glmf" in line)
     assert ("--index-cache compact" in launch) == compact, launch
@@ -1605,7 +1599,7 @@ def test_glmf_lanes_and_headroom_are_forwarded_only_when_set(tmp_path, keys, exp
     config = {"model_type": "glm5_next", "num_hidden_layers": 2,
               "mlp_layer_types": ["sparse"] * 2,
               "layer_types": ["linear_attention", "deepseek_sparse_attention"]}
-    result = _family_launch_result(tmp_path, config, "test/glmf", f"GLM5_FLASH_FP8_MODEL_ID=off\n{keys}")
+    result = _family_launch_result(tmp_path, config, "test/glmf", keys)
     assert result.returncode == 0, result.stderr
     launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-glmf" in line)
     for option in expected:
@@ -1628,7 +1622,7 @@ def test_glmf_invalid_lanes_or_headroom_fail_before_workers_launch(tmp_path, key
     config = {"model_type": "glm5_next", "num_hidden_layers": 2,
               "mlp_layer_types": ["sparse"] * 2,
               "layer_types": ["linear_attention", "deepseek_sparse_attention"]}
-    result = _family_launch_result(tmp_path, config, "test/glmf", f"GLM5_FLASH_FP8_MODEL_ID=off\n{key}={value}\n")
+    result = _family_launch_result(tmp_path, config, "test/glmf", f"{key}={value}\n")
     assert result.returncode == 2 and message in result.stderr
     assert not any(line.startswith(("docker ", "ssh ", "nest ")) for line in result.stderr.splitlines())
 
@@ -1639,7 +1633,7 @@ GLMF_CONFIG = {"model_type": "glm5_next", "num_hidden_layers": 2, "mlp_layer_typ
 
 def test_glmf_default_launch_passes_no_admission_option(tmp_path):
     """Packed admission prefill is opt-in; the default keeps one pass per prompt."""
-    result = _family_launch_result(tmp_path, GLMF_CONFIG, "test/glmf", "GLM5_FLASH_FP8_MODEL_ID=off\n")
+    result = _family_launch_result(tmp_path, GLMF_CONFIG, "test/glmf", "")
     assert result.returncode == 0, result.stderr
     launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-glmf" in line)
     assert "--prefill-batch" not in launch, launch
@@ -1650,7 +1644,7 @@ def test_glmf_default_launch_passes_no_admission_option(tmp_path):
     ("GLM5_FLASH_PREFILL_BATCH=on\n", ("--prefill-batch",), ()),
 ])
 def test_glmf_admission_keys_are_forwarded(tmp_path, keys, expected, absent):
-    result = _family_launch_result(tmp_path, GLMF_CONFIG, "test/glmf", f"GLM5_FLASH_FP8_MODEL_ID=off\n{keys}")
+    result = _family_launch_result(tmp_path, GLMF_CONFIG, "test/glmf", keys)
     assert result.returncode == 0, result.stderr
     launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-glmf" in line)
     for option in expected:
@@ -1663,7 +1657,7 @@ def test_glmf_admission_keys_are_forwarded(tmp_path, keys, expected, absent):
     ("GLM5_FLASH_PREFILL_BATCH=yes\n", "GLM5_FLASH_PREFILL_BATCH must be"),
 ])
 def test_glmf_admission_keys_reject_bad_values_before_launch(tmp_path, keys, message):
-    result = _family_launch_result(tmp_path, GLMF_CONFIG, "test/glmf", f"GLM5_FLASH_FP8_MODEL_ID=off\n{keys}")
+    result = _family_launch_result(tmp_path, GLMF_CONFIG, "test/glmf", keys)
     assert result.returncode == 2 and message in result.stderr, result.stderr
     assert not any(line.startswith(("docker ", "ssh ", "nest ")) for line in result.stderr.splitlines())
 
@@ -1674,7 +1668,7 @@ def test_glmf_admission_keys_reject_bad_values_before_launch(tmp_path, keys, mes
 ])
 def test_glmf_draft_policy_keys_reach_the_coordinator(tmp_path, keys, expected, absent):
     """The shared draft policy has no switch; the route ring check is diagnostic."""
-    result = _family_launch_result(tmp_path, GLMF_CONFIG, "test/glmf", f"GLM5_FLASH_FP8_MODEL_ID=off\n{keys}")
+    result = _family_launch_result(tmp_path, GLMF_CONFIG, "test/glmf", keys)
     assert result.returncode == 0, result.stderr
     launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-glmf" in line)
     for option in expected:
@@ -1691,7 +1685,7 @@ def test_glmf_draft_policy_keys_reach_the_coordinator(tmp_path, keys, expected, 
     ("GLM5_FLASH_REMOTE_DRAFTER=yes\n", "GLM5_FLASH_REMOTE_DRAFTER must be"),
 ])
 def test_glmf_draft_policy_keys_reject_bad_values_before_launch(tmp_path, keys, message):
-    result = _family_launch_result(tmp_path, GLMF_CONFIG, "test/glmf", f"GLM5_FLASH_FP8_MODEL_ID=off\n{keys}")
+    result = _family_launch_result(tmp_path, GLMF_CONFIG, "test/glmf", keys)
     assert result.returncode == 2 and message in result.stderr, result.stderr
     assert not any(line.startswith(("docker ", "ssh ", "nest ")) for line in result.stderr.splitlines())
 
@@ -1702,7 +1696,7 @@ def test_glmf_draft_policy_keys_reject_bad_values_before_launch(tmp_path, keys, 
 @pytest.mark.parametrize("projection", ("off", "row128", "channel"))
 def test_glmf_kda_state_is_forwarded_with_either_kda_storage(tmp_path, keys, forwarded, projection):
     result = _family_launch_result(tmp_path, SPLIT_CONFIGS["glm5_flash"], "test/glmf",
-                                  f"GLM5_FLASH_FP8_MODEL_ID=off\nRTX_GPUS=1\nGLM5_FLASH_KDA_FP8={projection}\n" + keys)
+                                  f"RTX_GPUS=1\nGLM5_FLASH_KDA_FP8={projection}\n" + keys)
     assert result.returncode == 0, result.stderr
     launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-glmf" in line)
     if forwarded is None:
@@ -1717,7 +1711,7 @@ def test_glmf_kda_state_is_forwarded_with_either_kda_storage(tmp_path, keys, for
 ])
 def test_glmf_kda_state_rejects_unsupported_layouts_before_launch(tmp_path, keys, message):
     result = _family_launch_result(tmp_path, SPLIT_CONFIGS["glm5_flash"], "test/glmf",
-                                  "GLM5_FLASH_FP8_MODEL_ID=off\n" + keys)
+                                  keys)
     assert result.returncode == 2 and message in result.stderr, result.stderr
     assert not any(line.startswith(("docker ", "ssh ", "nest ")) for line in result.stderr.splitlines())
 
@@ -1730,7 +1724,7 @@ def test_glmf_exl3_schedule_reaches_only_the_spark_workers(tmp_path, keys, sched
     config = {"model_type": "glm5_next", "num_hidden_layers": 2,
               "mlp_layer_types": ["sparse"] * 2,
               "layer_types": ["linear_attention", "deepseek_sparse_attention"]}
-    result = _family_launch_result(tmp_path, config, "test/glmf", f"GLM5_FLASH_FP8_MODEL_ID=off\n{keys}")
+    result = _family_launch_result(tmp_path, config, "test/glmf", keys)
     assert result.returncode == 0, result.stderr
     lines = result.stderr.splitlines()
     worker = next(line for line in lines if "cuteafd expertd-native" in line)
@@ -1750,7 +1744,7 @@ def test_glmf_exl3_schedule_rejects_bad_requests_before_launch(tmp_path, keys, m
     config = {"model_type": "glm5_next", "num_hidden_layers": 2,
               "mlp_layer_types": ["sparse"] * 2,
               "layer_types": ["linear_attention", "deepseek_sparse_attention"]}
-    result = _family_launch_result(tmp_path, config, "test/glmf", f"GLM5_FLASH_FP8_MODEL_ID=off\n{keys}")
+    result = _family_launch_result(tmp_path, config, "test/glmf", keys)
     assert result.returncode == 2 and message in result.stderr, result.stderr
     assert not any(line.startswith(("docker ", "ssh ", "nest ")) for line in result.stderr.splitlines())
 
@@ -1758,7 +1752,7 @@ def test_glmf_exl3_schedule_rejects_bad_requests_before_launch(tmp_path, keys, m
 @pytest.mark.parametrize("keys,expected", [("", None), ("GLM5_FLASH_PREFIX_MARKS=arena\n", "arena"),
                                            ("GLM5_FLASH_PREFIX_MARKS=pool\n", "pool")])
 def test_glmf_prefix_marks_are_forwarded(tmp_path, keys, expected):
-    result = _family_launch_result(tmp_path, GLMF_TWO_LAYER, "test/glmf", f"GLM5_FLASH_FP8_MODEL_ID=off\n{keys}")
+    result = _family_launch_result(tmp_path, GLMF_TWO_LAYER, "test/glmf", keys)
     assert result.returncode == 0, result.stderr
     launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-glmf" in line)
     if expected is None:
@@ -1775,7 +1769,7 @@ def test_glmf_prefix_marks_are_forwarded(tmp_path, keys, expected):
     ("", "auto"),
 ])
 def test_glmf_marks_default_to_host_retention(tmp_path, keys, expected):
-    result = _family_launch_result(tmp_path, GLMF_TWO_LAYER, "test/glmf", f"GLM5_FLASH_FP8_MODEL_ID=off\n{keys}")
+    result = _family_launch_result(tmp_path, GLMF_TWO_LAYER, "test/glmf", keys)
     assert result.returncode == 0, result.stderr
     launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-glmf" in line)
     if expected is None:
@@ -1805,7 +1799,7 @@ def test_glmf_prefix_marks_reach_the_encoder_plan(tmp_path, keys, expected):
 
 def test_glmf_prefix_marks_reject_unknown_stores_before_launch(tmp_path):
     result = _family_launch_result(tmp_path, GLMF_TWO_LAYER, "test/glmf",
-                                  "GLM5_FLASH_FP8_MODEL_ID=off\nGLM5_FLASH_PREFIX_MARKS=host\n")
+                                  "GLM5_FLASH_PREFIX_MARKS=host\n")
     assert result.returncode == 2 and "GLM5_FLASH_PREFIX_MARKS must be arena or pool" in result.stderr
     assert not any(line.startswith(("docker ", "ssh ", "nest ")) for line in result.stderr.splitlines())
 
@@ -1814,7 +1808,7 @@ def test_glmf_prefix_marks_reject_unknown_stores_before_launch(tmp_path):
                                         ("GLM5_FLASH_REPLAY_RECORDS=shared\n", True)])
 def test_glmf_replay_records_are_forwarded_only_when_shared(tmp_path, keys, shared):
     result = _family_launch_result(tmp_path, SPLIT_CONFIGS["glm5_flash"], "test/glmf",
-                                  "GLM5_FLASH_FP8_MODEL_ID=off\nRTX_GPUS=1\n" + keys)
+                                  "RTX_GPUS=1\n" + keys)
     assert result.returncode == 0, result.stderr
     launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-glmf" in line)
     assert ("--replay-records shared" in launch) == shared, launch
@@ -1827,7 +1821,7 @@ def test_glmf_replay_records_are_forwarded_only_when_shared(tmp_path, keys, shar
 ])
 def test_glmf_replay_records_reject_unsupported_layouts_before_launch(tmp_path, keys, message):
     result = _family_launch_result(tmp_path, SPLIT_CONFIGS["glm5_flash"], "test/glmf",
-                                  "GLM5_FLASH_FP8_MODEL_ID=off\n" + keys)
+                                  keys)
     assert result.returncode == 2 and message in result.stderr, result.stderr
     assert not any(line.startswith(("docker ", "ssh ", "nest ")) for line in result.stderr.splitlines())
 
@@ -1838,7 +1832,7 @@ def test_glmf_decode_rows_are_forwarded_only_at_128(tmp_path, keys, forwarded):
     """GLM5_FLASH_DECODE_ROWS=128 reaches the coordinator as --decode-rows 128 (the wide decode
     programs); 64, the default, passes nothing; no Spark worker sees it."""
     result = _family_launch_result(tmp_path, SPLIT_CONFIGS["glm5_flash"], "test/glmf",
-                                  "GLM5_FLASH_FP8_MODEL_ID=off\nRTX_GPUS=1\n" + keys)
+                                  "RTX_GPUS=1\n" + keys)
     assert result.returncode == 0, result.stderr
     lines = result.stderr.splitlines()
     launch = next(line for line in lines if "cuteafd serve-glmf" in line)
@@ -1849,7 +1843,7 @@ def test_glmf_decode_rows_are_forwarded_only_at_128(tmp_path, keys, forwarded):
 def test_glmf_wide_decode_rows_take_shared_replay_records(tmp_path):
     """128-row steps keep their records in the prefill scratch too: both keys reach the coordinator."""
     result = _family_launch_result(tmp_path, SPLIT_CONFIGS["glm5_flash"], "test/glmf",
-                                  "GLM5_FLASH_FP8_MODEL_ID=off\nRTX_GPUS=1\nGLM5_FLASH_DECODE_ROWS=128\n"
+                                  "RTX_GPUS=1\nGLM5_FLASH_DECODE_ROWS=128\n"
                                   "GLM5_FLASH_REPLAY_RECORDS=shared\n")
     assert result.returncode == 0, result.stderr
     launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-glmf" in line)
@@ -1863,7 +1857,7 @@ def test_glmf_wide_decode_rows_take_shared_replay_records(tmp_path):
 ])
 def test_glmf_decode_rows_reject_unsupported_layouts_before_launch(tmp_path, keys, message):
     result = _family_launch_result(tmp_path, SPLIT_CONFIGS["glm5_flash"], "test/glmf",
-                                  "GLM5_FLASH_FP8_MODEL_ID=off\n" + keys)
+                                  keys)
     assert result.returncode == 2 and message in result.stderr, result.stderr
     assert not any(line.startswith(("docker ", "ssh ", "nest ")) for line in result.stderr.splitlines())
 
@@ -1872,15 +1866,15 @@ def test_probe_dump_root_is_mounted_for_remote_row_dumps(tmp_path):
     root = tmp_path / "dumps"
     root.mkdir()
     result = _family_launch_result(tmp_path, SPLIT_CONFIGS["glm5_flash"], "test/glmf",
-                                  f"GLM5_FLASH_FP8_MODEL_ID=off\nRTX_GPUS=1\nPROBE_DUMP_ROOT={root}\n")
+                                  f"RTX_GPUS=1\nPROBE_DUMP_ROOT={root}\n")
     assert result.returncode == 0, result.stderr
     launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-glmf" in line)
     assert f"-v {root}:{root} -e CUTEAFD_PROBE_DUMP_ROOT={root}" in launch
     result = _family_launch_result(tmp_path / "unset", SPLIT_CONFIGS["glm5_flash"], "test/glmf",
-                                  "GLM5_FLASH_FP8_MODEL_ID=off\nRTX_GPUS=1\n")
+                                  "RTX_GPUS=1\n")
     assert result.returncode == 0 and "CUTEAFD_PROBE_DUMP_ROOT" not in result.stderr
     result = _family_launch_result(tmp_path / "missing", SPLIT_CONFIGS["glm5_flash"], "test/glmf",
-                                  f"GLM5_FLASH_FP8_MODEL_ID=off\nPROBE_DUMP_ROOT={tmp_path}/absent\n")
+                                  f"PROBE_DUMP_ROOT={tmp_path}/absent\n")
     assert result.returncode == 2 and "PROBE_DUMP_ROOT must be" in result.stderr
     assert not any(line.startswith(("docker ", "ssh ", "nest ")) for line in result.stderr.splitlines())
 
@@ -1890,7 +1884,7 @@ def test_glmf_kda_rejects_invalid_conversion_before_launch(tmp_path):
               "mlp_layer_types": ["sparse"] * 2,
               "layer_types": ["linear_attention", "deepseek_sparse_attention"]}
     result = _family_launch_result(tmp_path, config, "test/glmf",
-                                  "GLM5_FLASH_FP8_MODEL_ID=off\nGLM5_FLASH_KDA_FP8=invalid\n")
+                                  "GLM5_FLASH_KDA_FP8=invalid\n")
     assert result.returncode == 2 and "GLM5_FLASH_KDA_FP8 must be" in result.stderr
     assert not any(line.startswith(("docker ", "ssh ", "nest ")) for line in result.stderr.splitlines())
 
@@ -1921,7 +1915,7 @@ def test_drafter_kv_format_is_independent_of_target_kv(tmp_path, family, selecti
         "glm5_flash": SPLIT_CONFIGS["glm5_flash"],
         "mimo_v2": {"model_type": "mimo_v2_flash", "num_hidden_layers": 2, "moe_layer_freq": [0, 1]},
     }
-    keys = "GLM5_FLASH_FP8_MODEL_ID=off\n" if family == "glm5_flash" else ""
+    keys = ""
     if selection is not None:
         keys += f"DRAFT_KV_CACHE={selection}\n"
     result = _family_launch_result(tmp_path, configs[family], "test/model", keys)
@@ -1932,7 +1926,7 @@ def test_drafter_kv_format_is_independent_of_target_kv(tmp_path, family, selecti
 
 def test_invalid_drafter_kv_rejects_before_starting_containers(tmp_path):
     result = _family_launch_result(tmp_path, SPLIT_CONFIGS["glm5_flash"], "test/model",
-                                  "GLM5_FLASH_FP8_MODEL_ID=off\nDRAFT_KV_CACHE=invalid\n")
+                                  "DRAFT_KV_CACHE=invalid\n")
     assert result.returncode == 2, result.stderr
     assert "DRAFT_KV_CACHE must be bf16 or fp8" in result.stderr
     assert not any(line.startswith(("docker ", "ssh ", "nest ")) for line in result.stderr.splitlines())
@@ -2009,7 +2003,7 @@ def test_expert_input_is_opt_in_and_mimo_only(tmp_path):
         assert ("--expert-input fp8" in serve_line) == bool(mode)
     other = {"model_type": "glm5_next", "num_hidden_layers": 2, "mlp_layer_types": ["sparse"] * 2,
              "layer_types": ["linear_attention", "deepseek_sparse_attention"]}
-    result = _family_launch_result(tmp_path / "other", other, "test/glm", "EXPERT_INPUT=bf16-decode\nGLM5_FLASH_FP8_MODEL_ID=off\n")
+    result = _family_launch_result(tmp_path / "other", other, "test/glm", "EXPERT_INPUT=bf16-decode\n")
     assert result.returncode == 2 and "applies to MiMo" in result.stderr
     assert "docker run" not in result.stderr
 
@@ -2106,7 +2100,7 @@ def test_glm_vision_template_override_is_explicit_and_coordinator_only(tmp_path,
         Path(source).mkdir()
         expected = source
     result = _family_launch_result(tmp_path, config, "test/model",
-                                  f"SPECULATOR=off\nGLM5_FLASH_FP8_MODEL_ID=off\nVISION=auto\nCHAT_TEMPLATE_FROM={source}\n")
+                                  f"SPECULATOR=off\nVISION=auto\nCHAT_TEMPLATE_FROM={source}\n")
     assert result.returncode == 0, result.stderr
     launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-glmf" in line)
     assert f"--chat-template-from {expected}" in launch
@@ -2122,7 +2116,7 @@ def test_text_only_glm_ignores_template_override(tmp_path):
     config = {"model_type": "glm5_next", "num_hidden_layers": 2,
               "mlp_layer_types": ["sparse"] * 2, "layer_types": ["linear_attention", "deepseek_sparse_attention"]}
     result = _family_launch_result(tmp_path, config, "test/model",
-                                  "SPECULATOR=off\nGLM5_FLASH_FP8_MODEL_ID=off\nVISION=off\nCHAT_TEMPLATE_FROM=missing/vendor\n")
+                                  "SPECULATOR=off\nVISION=off\nCHAT_TEMPLATE_FROM=missing/vendor\n")
     assert result.returncode == 0, result.stderr
     assert "--chat-template-from" not in result.stderr and "missing/vendor" not in result.stderr
 
@@ -2132,7 +2126,7 @@ def test_glm_template_override_invalid_source_refused_before_workers(tmp_path, s
     config = {"model_type": "glm5_next", "num_hidden_layers": 2,
               "mlp_layer_types": ["sparse"] * 2, "layer_types": ["linear_attention", "deepseek_sparse_attention"]}
     result = _family_launch_result(tmp_path, config, "test/model",
-                                  f"SPECULATOR=off\nGLM5_FLASH_FP8_MODEL_ID=off\nVISION=auto\nCHAT_TEMPLATE_FROM={source}\n")
+                                  f"SPECULATOR=off\nVISION=auto\nCHAT_TEMPLATE_FROM={source}\n")
     assert result.returncode == 2, result.stderr
     assert "CHAT_TEMPLATE_FROM" in result.stderr or "missing snapshot" in result.stderr
     assert "cuteafd expertd-native" not in result.stderr and "cuteafd serve-glmf" not in result.stderr
@@ -2185,8 +2179,6 @@ SPLIT_CONFIGS = {
 @pytest.mark.parametrize("setting", ["", "FULL_PREFILL_LOGITS=off\n", "FULL_PREFILL_LOGITS=on\n"])
 def test_full_prefill_logits_is_one_shared_opt_in(tmp_path, family_config, setting):
     keys = "SPECULATOR=off\n" + setting
-    if family_config.get("model_type") == "glm5_next":
-        keys = "GLM5_FLASH_FP8_MODEL_ID=off\n" + keys
     result = _family_launch_result(tmp_path, family_config, "test/model", keys)
     assert result.returncode == 0, result.stderr
     launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-" in line)
@@ -2283,8 +2275,6 @@ def test_dual_maps_encoder_owner_to_visible_device(tmp_path: Path, family: str,
             "encoder": {"kind": {"kind": "rtx", "gpu": encoder_owner}, "replicas": []}}
     keys = (f"COORDINATOR_GPUS={owners}\nSPARK_COUNT=0\nEXPERT_BACKEND=local\n"
             "SPECULATOR=off\nVISION=auto\nAUDIO=off\n")
-    if family == "glm5_flash":
-        keys += "GLM5_FLASH_FP8_MODEL_ID=off\n"
     result = _family_launch_result(tmp_path, config, "test/model", keys, encoder_plan=plan)
     assert result.returncode == 0, result.stderr
     serve = {"qwen4": "serve-qwen4", "glm5_flash": "serve-glmf",
@@ -2443,10 +2433,10 @@ def test_deepseek_v4_launches_with_the_prefix_cache_keys(tmp_path: Path) -> None
 def test_glm_flash_drafts_with_its_default_speculator(tmp_path: Path, draft_kv: str) -> None:
     config = {"model_type": "glm5_next", "num_hidden_layers": 2, "mlp_layer_types": ["sparse"] * 2,
               "layer_types": ["linear_attention", "deepseek_sparse_attention"]}
-    model = "wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K3.25-v1"
+    model = "wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K3.25-Core-FP8"
     default = "incoai/GLM-5.3-Flash-DFlash2"
     dspark = "RedHatAI/GLM-5.3-Flash-speculator.dspark-preview"
-    keys = f"GLM5_FLASH_FP8_MODEL_ID=off\nDRAFT_KV_CACHE={draft_kv}\n"
+    keys = f"DRAFT_KV_CACHE={draft_kv}\n"
 
     def launch(sub: str, extra: str, drafters: tuple[str, ...] = (default, dspark)) -> tuple[str, list[str]]:
         hf = tmp_path / sub / "hf"
@@ -2478,7 +2468,7 @@ def test_glmf_pool_defaults_to_the_planned_pool(tmp_path: Path) -> None:
     for keys, flag in (("", "--pool-tokens 0"), ("POOL_TOKENS=auto\n", "--pool-tokens 0"),
                        ("POOL_TOKENS=65536\n", "--pool-tokens 65536")):
         result = _family_launch_result(tmp_path / str(len(keys)), config, "test/glmf",
-                                       "GLM5_FLASH_FP8_MODEL_ID=off\n" + keys)
+                                       keys)
         assert result.returncode == 0, result.stderr
         launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-glmf" in line)
         assert flag in launch, launch
@@ -2905,7 +2895,7 @@ def test_glmf_encoder_placement_plan_gets_the_template_source_serving_gets(tmp_p
     placement = {"kind": kind, **({"rank": 0} if kind == "spark" else {"gpu": 0})}
     plan = {"placement_supported": True, "fits": True, "spark_ranks": 1,
             "encoder_plan_hash": "ab" * 32, "encoder": {"kind": placement, "replicas": []}}
-    keys = ("RTX_GPUS=1\nSPECULATOR=off\nGLM5_FLASH_FP8_MODEL_ID=off\nCHAT_TEMPLATE_FROM=test/model\n"
+    keys = ("RTX_GPUS=1\nSPECULATOR=off\nCHAT_TEMPLATE_FROM=test/model\n"
             + (f"VISION={vision}\n" if vision else ""))
     result = _family_launch_result(tmp_path, config, "test/model", keys, encoder_plan=plan)
     assert result.returncode == 0, result.stderr
@@ -2924,7 +2914,7 @@ def test_glmf_text_launch_gives_the_plan_no_template_source(tmp_path):
     config = {"model_type": "glm5_next", "num_hidden_layers": 2, "mlp_layer_types": ["sparse"] * 2,
               "layer_types": ["linear_attention", "deepseek_sparse_attention"], "vision_config": {"depth": 24}}
     result = _family_launch_result(tmp_path, config, "test/model",
-                                   "RTX_GPUS=1\nSPECULATOR=off\nGLM5_FLASH_FP8_MODEL_ID=off\nVISION=off\n"
+                                   "RTX_GPUS=1\nSPECULATOR=off\nVISION=off\n"
                                    "CHAT_TEMPLATE_FROM=test/model\n")
     assert result.returncode == 0, result.stderr
     assert "cuteafd plan" in result.stderr and "--chat-template-from" not in result.stderr
@@ -3134,7 +3124,7 @@ _GLMF = {"model_type": "glm5_next", "num_hidden_layers": 2, "mlp_layer_types": [
 
 @pytest.mark.parametrize("slot", ["../x", "-s", "a b", ""])
 def test_invalid_wip_slot_fails_before_any_container(tmp_path, slot):
-    result = _family_launch_result(tmp_path, _GLMF, "test/glmf", "GLM5_FLASH_FP8_MODEL_ID=off\n",
+    result = _family_launch_result(tmp_path, _GLMF, "test/glmf", "",
                                    extra_args=("--wip", slot))
     assert result.returncode != 0
     assert not any(line.startswith(("docker ", "ssh ", "nest ")) for line in result.stderr.splitlines())
@@ -3142,7 +3132,7 @@ def test_invalid_wip_slot_fails_before_any_container(tmp_path, slot):
 
 def test_restart_removes_only_own_worker_port(tmp_path):
     result = _family_launch_result(tmp_path, _GLMF, "test/glmf",
-                                   "GLM5_FLASH_FP8_MODEL_ID=off\nEXPERT_PORT=19555\nINSTANCE=own\n", restart=True)
+                                   "EXPERT_PORT=19555\nINSTANCE=own\n", restart=True)
     assert result.returncode == 0, result.stderr
     assert "docker rm -f cuteafd-spark-expert-h0-19555" in result.stderr
     assert "docker ps -aq --filter" not in result.stderr
@@ -3151,7 +3141,7 @@ def test_restart_removes_only_own_worker_port(tmp_path):
 
 
 def test_restart_all_sweeps_workers_and_keeps_the_wip_container(tmp_path):
-    result = _family_launch_result(tmp_path, _GLMF, "test/glmf", "GLM5_FLASH_FP8_MODEL_ID=off\n",
+    result = _family_launch_result(tmp_path, _GLMF, "test/glmf", "",
                                    restart=True, extra_args=("--all",))
     assert result.returncode == 0, result.stderr
     cleanup = next(line for line in result.stderr.splitlines()
@@ -3166,7 +3156,7 @@ def test_restart_all_sweeps_workers_and_keeps_the_wip_container(tmp_path):
 
 def test_rdma_device_map_reaches_the_workers_and_the_coordinator(tmp_path):
     device_map = "10.0.0.9=mlx5_bond_0,10.0.0.1=rocep1s0f1"
-    result = _family_launch_result(tmp_path, _GLMF, "test/glmf", "GLM5_FLASH_FP8_MODEL_ID=off\n",
+    result = _family_launch_result(tmp_path, _GLMF, "test/glmf", "",
                                    extra_env={"CUTEAFD_PROTOCOL_V2_VERBS_HOST_DEVICE_MAP": device_map})
     assert result.returncode == 0, result.stderr
     lines = result.stderr.splitlines()
@@ -3177,14 +3167,14 @@ def test_rdma_device_map_reaches_the_workers_and_the_coordinator(tmp_path):
 
 
 def test_rdma_device_map_is_not_set_unless_given(tmp_path):
-    result = _family_launch_result(tmp_path, _GLMF, "test/glmf", "GLM5_FLASH_FP8_MODEL_ID=off\n",
+    result = _family_launch_result(tmp_path, _GLMF, "test/glmf", "",
                                    extra_env={"CUTEAFD_PROTOCOL_V2_VERBS_HOST_DEVICE_MAP": ""})
     assert result.returncode == 0, result.stderr
     assert "CUTEAFD_PROTOCOL_V2_VERBS_HOST_DEVICE_MAP" not in result.stderr
 
 
 def test_invalid_rdma_device_map_fails_before_workers_launch(tmp_path):
-    result = _family_launch_result(tmp_path, _GLMF, "test/glmf", "GLM5_FLASH_FP8_MODEL_ID=off\n",
+    result = _family_launch_result(tmp_path, _GLMF, "test/glmf", "",
                                    extra_env={"CUTEAFD_PROTOCOL_V2_VERBS_HOST_DEVICE_MAP": "10.0.0.1=dev x"})
     assert result.returncode == 2
     assert "local-ip=device" in result.stderr
@@ -3193,7 +3183,7 @@ def test_invalid_rdma_device_map_fails_before_workers_launch(tmp_path):
 
 @pytest.mark.parametrize("with_nest", [False, True])
 def test_spark_launch_preserves_page_cache(tmp_path, with_nest):
-    result = _family_launch_result(tmp_path, _GLMF, "test/glmf", "GLM5_FLASH_FP8_MODEL_ID=off\n", with_nest=with_nest)
+    result = _family_launch_result(tmp_path, _GLMF, "test/glmf", "", with_nest=with_nest)
     assert result.returncode == 0, result.stderr
     assert "drop_caches" not in result.stderr
     assert "drop-caches" not in result.stderr
@@ -3211,7 +3201,7 @@ def test_serving_source_has_no_page_cache_drop():
 def test_rdma_bond_balance_reaches_only_the_coordinator(tmp_path, keys, mode):
     """The flow-label switch is the coordinator's: forwarded only when not off. Workers get
     nothing; they connect with whatever label each coordinator connection asks for."""
-    result = _family_launch_result(tmp_path, _GLMF, "test/glmf", "GLM5_FLASH_FP8_MODEL_ID=off\n" + keys)
+    result = _family_launch_result(tmp_path, _GLMF, "test/glmf", keys)
     assert result.returncode == 0, result.stderr
     lines = result.stderr.splitlines()
     launch = next(line for line in lines if "cuteafd serve-glmf" in line)
@@ -3224,7 +3214,7 @@ def test_rdma_bond_balance_reaches_only_the_coordinator(tmp_path, keys, mode):
 
 def test_rdma_bond_balance_rejects_unknown_modes_before_launch(tmp_path):
     result = _family_launch_result(tmp_path, _GLMF, "test/glmf",
-                                   "GLM5_FLASH_FP8_MODEL_ID=off\nRDMA_BOND_BALANCE=yes\n")
+                                   "RDMA_BOND_BALANCE=yes\n")
     assert result.returncode == 2 and "RDMA_BOND_BALANCE must be off, labels or probe" in result.stderr, result.stderr
     assert not any(line.startswith(("docker ", "ssh ", "nest ")) for line in result.stderr.splitlines())
 @pytest.mark.parametrize("mode,kind", [("auto", "spark"), ("spark:0", "spark"),
@@ -3323,8 +3313,6 @@ def test_explicit_audio_without_tower_refuses(tmp_path, mode):
 def test_generic_family_checkpoint_context_default_and_override(tmp_path, family, context):
     config = SPLIT_CONFIGS.get(family, {"model_type": "glm_moe_dsa" if family == "glm5" else "deepseek_v4", "num_hidden_layers": 2, "first_k_dense_replace": 1})
     keys = "SPECULATOR=off\nVISION=off\nAUDIO=off\n"
-    if family == "glm5_flash":
-        keys += "GLM5_FLASH_FP8_MODEL_ID=test/model\n"
     if context is not None:
         keys += f"MAX_CONTEXT_TOKENS={context}\n"
     result = _family_launch_result(tmp_path, config, "test/model", keys)
@@ -3341,8 +3329,8 @@ def test_pre_108_wip_seal_serves_with_hub_under_hf_home(tmp_path):
     (9968af44, no #108 ancestry): its `cuteafd plan` refused Spark count 2 without
     HF_HOME and fit with HF_HOME=/hf."""
     _snapshot(tmp_path / "hf", "incoai/GLM-5.3-Flash-DFlash2", {"architectures": ["DFlash2DraftModel"]})
-    family_config, model = GLMF_TWO_LAYER, "wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K3.25-v1"
-    result = _family_launch_result(tmp_path, family_config, model, "VISION=off\nAUDIO=off\nGLM5_FLASH_FP8_MODEL_ID=off\n",
+    family_config, model = GLMF_TWO_LAYER, "wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K3.25-Core-FP8"
+    result = _family_launch_result(tmp_path, family_config, model, "VISION=off\nAUDIO=off\n",
                                    extra_args=("--wip", "pre108"))
     assert result.returncode == 0, result.stderr
     lines = result.stderr.splitlines()
@@ -3365,8 +3353,6 @@ def test_glm_qualified_layers_release_and_wip_preserve_auto_default(tmp_path, wi
     config = ({"model_type": "glm_moe_dsa", "num_hidden_layers": 4, "first_k_dense_replace": 3}
               if family == "glm5" else SPLIT_CONFIGS["glm5_flash"])
     keys = "RTX_GPUS=2\nVISION=off\nAUDIO=off\nSPECULATOR=off\n"
-    if family == "glm5_flash":
-        keys += "GLM5_FLASH_FP8_MODEL_ID=off\n"
     if mode is not None:
         keys += f"ATTENTION_PLACEMENT={mode}\n"
     result = _family_launch_result(tmp_path, config, "test/model", keys,
@@ -3497,7 +3483,6 @@ def test_launcher_plans_against_cuda_total_not_nvml_total(tmp_path, family, budg
     result = _family_launch_result(tmp_path, config,
         "deepseek-ai/DeepSeek-V4.1-Flash" if family == "deepseek_v41" else "test/model",
         f"COORDINATOR_GPU_BUDGET_GIB={budget}\nRTX_GPUS=1\nSPECULATOR=off\nVISION=off\nAUDIO=off\n"
-        + ("GLM5_FLASH_FP8_MODEL_ID=off\n" if family == "glm5_flash" else "")
         + ("SPARK_COUNT=4\n" + "".join(f"SPARK_{i}_HOST=h{i}\nSPARK_{i}_LANE_A=10.0.0.{i + 1}\n" for i in range(4))
            if family == "deepseek_v41" else ""),
         gpu_total_mib=97887, gpu_free_mib=97887, cuda_total_bytes=total,
@@ -3530,7 +3515,7 @@ def test_namespace_root_and_push_endpoint_reach_both_serving_roles(tmp_path):
     model = "zai-org/GLM-5.3-Flash"
     _snapshot(hf, model, GLMF_TWO_LAYER)
     result = _family_launch_result(tmp_path, GLMF_TWO_LAYER, model,
-        "SPECULATOR=off\nVISION=off\nAUDIO=off\nGLM5_FLASH_FP8_MODEL_ID=off\n",
+        "SPECULATOR=off\nVISION=off\nAUDIO=off\n",
         extra_env={"CUTEAFD_NAMESPACE_ROOT": str(root), "CUTEAFD_PUSH_SOCKET": "@isolated-push"})
     assert result.returncode == 0, result.stderr
     for line in result.stderr.splitlines():

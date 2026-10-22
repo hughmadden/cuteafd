@@ -21,10 +21,10 @@ pub(crate) mod weights;
 
 /// Whether this launch's coordinator operands can join a push group: every
 /// representation the push path records (BF16 checkpoint operands, GPU FP8
-/// copies). Native FP8 sources, the NVFP4 numerics gate and token-row
-/// output sharding load through the mount.
-fn dense_pushable(args: &EngineArgs, fp8_source: bool) -> bool {
-    !fp8_source && args.kda_nvfp4_gate.is_none() && !args.kda_output_shard
+/// copies). The NVFP4 numerics gate and token-row output sharding load
+/// through the mount.
+fn dense_pushable(args: &EngineArgs) -> bool {
+    args.kda_nvfp4_gate.is_none() && !args.kda_output_shard
 }
 
 use anyhow::{ensure, Context, Result};
@@ -160,16 +160,6 @@ pub(crate) struct EngineArgs {
     /// prefix-cache state marks. Attention and recurrent pools are already allocated.
     #[arg(long, default_value_t = 12)]
     pub expert_reserve_gib: usize,
-    /// Kept for launch scripts: the MLA, dense and shared-expert projections
-    /// are always FP8 (their only copies): the official FP8 release's E4M3
-    /// blocks with --fp8-snapshot (or native FP8 in the primary checkpoint),
-    /// else 128x128 blocks quantized from BF16 at load.
-    #[arg(long)]
-    pub fp8_decode: bool,
-    /// The official FP8 checkpoint (zai-org/GLM-5.3-Flash): the MLA, dense and
-    /// shared-expert weights (E4M3 with FP32 128x128 block scales).
-    #[arg(long)]
-    pub fp8_snapshot: Option<PathBuf>,
     /// KDA in/out projections: the checkpoint's BF16 (off), or E4M3 quantized
     /// per row x 128-K block (row128) or per row (channel) at load, then the
     /// only resident copy: decode rows up to 16 on the FP8 GEMV, wider verify
@@ -452,6 +442,12 @@ mod draft_cli_tests {
     fn parse(extra: &[&str]) -> EngineArgs {
         Parse::try_parse_from(["test", "--snapshot", "/checkpoint", "--native-lib", "/native"].into_iter()
             .chain(extra.iter().copied())).unwrap().engine
+    }
+
+    #[test]
+    fn coordinator_push_admits_primary_weights_without_token_row_sharding() {
+        assert!(dense_pushable(&parse(&[])));
+        assert!(!dense_pushable(&parse(&["--kda-fp8", "row128", "--kda-output-shard"])));
     }
 
     #[test]
@@ -1332,7 +1328,6 @@ fn admitted_step_experts(cfg: &GlmNextConfig, placement: &cuteafd_loader::placem
 /// The checkpoint and native library, opened on the calling thread.
 pub(crate) struct Opened {
     pub checkpoint: Checkpoint,
-    pub fp8_checkpoint: Option<Checkpoint>,
     pub cfg: GlmNextConfig,
     pub library: std::sync::Arc<NativeLibrary>,
     /// The FP8 expert catalog for --local-experts.
@@ -1349,10 +1344,8 @@ pub(crate) fn open(args: &EngineArgs) -> Result<Opened> {
     check_options(args)?;
     let checkpoint = Checkpoint::coordinator(&args.snapshot, false, false)?;
     let cfg = GlmNextConfig::read(&args.snapshot)?;
-    let fp8_checkpoint = args.fp8_snapshot.as_deref()
-        .map(|snapshot| Checkpoint::coordinator(snapshot, false, false)).transpose()?;
     header::check_kda_inputs(&checkpoint, &cfg, args.layers.unwrap_or(cfg.layers))?;
-    precision::check_projection_inputs(&checkpoint, fp8_checkpoint.as_ref(), &cfg,
+    precision::check_projection_inputs(&checkpoint, &cfg,
         args.layers.unwrap_or(cfg.layers))?;
     if let Some(snapshot) = &args.draft {
         let head = checkpoint.tensors.iter().find(|t| t.meta.name == "lm_head.weight")
@@ -1386,7 +1379,7 @@ pub(crate) fn open(args: &EngineArgs) -> Result<Opened> {
     // SAFETY: the library is the cuteafd native shim built for this engine.
     let library = std::sync::Arc::new(unsafe { NativeLibrary::load(&args.native_lib) }?);
     library.cuda_set_device(args.device)?;
-    Ok(Opened { checkpoint, fp8_checkpoint, cfg, library, experts })
+    Ok(Opened { checkpoint, cfg, library, experts })
 }
 
 /// Heads on two GPUs needs token keys; context needs compact pools. Whole MLA
@@ -1727,7 +1720,7 @@ impl Opened {
         let mark_slots = args.mark_arena.slots_placed(&self.cfg, layers, index_cache, args.kda_state,
             context_mode.is_some())?;
         let loader = weights::GlmfLoader { library: &self.library, checkpoint: &self.checkpoint, stream,
-            fp8_source: self.fp8_checkpoint.as_ref(), kda_fp8: args.kda_fp8, kda_output_shard: args.kda_output_shard,
+            kda_fp8: args.kda_fp8, kda_output_shard: args.kda_output_shard,
             fp8_head: args.fp8_head, kda_nvfp4: args.kda_nvfp4_gate.as_deref().map(|mode| mode == "search"),
             fp8_scales: args.fp8_scales, device: args.device,
             peers: peer_stream.iter().map(|&(device, stream)| crate::shared::peer_split::RankDevice { device, stream })
@@ -1823,7 +1816,7 @@ impl Opened {
             // the Sparks still push).
             let devices: Vec<_> = std::iter::once(args.device).chain(peer_stream.map(|(d, _)| d))
                 .map(|id| crate::shared::memory::device::Device { library: &self.library, id }).collect();
-            let ranks = if admission.coordinator_pushes() && dense_pushable(&args, self.fp8_checkpoint.is_some()) {
+            let ranks = if admission.coordinator_pushes() && dense_pushable(&args) {
                 (|| -> Result<_> {
                     let tp2 = match self.experts.as_ref().and_then(|c| c.exl3().map(|m| (c, m))) {
                         Some((_, manifest)) if !tp2_layers.is_empty() => {
@@ -1944,7 +1937,7 @@ impl Opened {
         let mib = |bytes: usize| bytes as f64 / (1u64 << 20) as f64;
         tracing::info!(layers, gib = resident as f64 / (1u64 << 30) as f64,
             split_gib = peer_resident as f64 / (1u64 << 30) as f64,
-            fp8_source = self.fp8_checkpoint.is_some(), kda_fp8 = ?args.kda_fp8, fp8_prefill = ?args.fp8_prefill,
+            kda_fp8 = ?args.kda_fp8, fp8_prefill = ?args.fp8_prefill,
             kda_bf16_mib = mib(single.kda_bf16), kda_fp8_mib = mib(single.kda_fp8),
             head = model.head.name(), head_mib = mib(single.head_bf16 + single.head_fp8),
             elapsed_ms = started.elapsed().as_millis() as u64,

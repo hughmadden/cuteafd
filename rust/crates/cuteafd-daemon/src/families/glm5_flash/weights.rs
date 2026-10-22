@@ -1,17 +1,14 @@
 //! GLM 5.3 Flash coordinator weights, packed for the exported glmf_* programs.
 //!
 //! The MLA (`q_a|kv_a`, `q_b`, `o_proj`), dense and shared-expert projections
-//! are FP8 only: the official FP8 release's E4M3 bytes and FP32 128x128 block
-//! scales (`--fp8-snapshot` or native FP8 in the primary checkpoint), else
-//! 128x128 blocks quantized from BF16 at load (the BF16 is never resident).
-//! Every other matrix operand is BF16 (the EXL3
-//! publications store the dense tensors in BF16, equal to the official BF16
-//! release; FP8 checkpoint tensors are dequantized on the GPU with their FP32
-//! 128x128 block scales), except where an FP8 representation is selected
-//! instead: the KDA in/out projections (`--kda-fp8 row128|channel`: E4M3 with
-//! per-row x 128-K scales stored K-block major, `w_in_fp8`/`w_in_kscale`,
-//! `w_o_fp8`/`w_o_kscale`, no BF16 `w_in`/`w_o`) and the LM head
-//! (`--fp8-head`, [`super::head::GlmfHead::Fp8`]). One resident copy each.
+//! are FP8 only: the primary checkpoint's E4M3 bytes and FP32 128x128 block
+//! scales, or 128x128 blocks quantized from its BF16 at load (the BF16 is
+//! never resident). Every other matrix operand is BF16, except where an FP8
+//! representation is selected instead: the KDA in/out projections
+//! (`--kda-fp8 row128|channel`: E4M3 with per-row x 128-K scales stored
+//! K-block major, `w_in_fp8`/`w_in_kscale`, `w_o_fp8`/`w_o_kscale`, no BF16
+//! `w_in`/`w_o`) and the LM head (`--fp8-head`, [`super::head::GlmfHead::Fp8`]).
+//! One resident copy each.
 //! Packing (see the glmf program docstrings): KDA `w_in = [q; k; v; f_a; g_a;
 //! b]`, `w_fg = [f_b; g_b]`, `conv_w` FP32 `[3D, 4]`; MLA `w_qkv_a = [q_a;
 //! kv_a]`, `kv_b` split per head into `w_uk [N, 512, 256]` (transposed key
@@ -138,9 +135,6 @@ pub(crate) struct GlmfLoader<'a> {
     pub library: &'a NativeLibrary,
     pub checkpoint: &'a Checkpoint,
     pub stream: *mut c_void,
-    /// The official FP8 release: MLA/dense/shared weights (their only copies,
-    /// 128x128 blocks) come from it when given, else from primary native FP8.
-    pub fp8_source: Option<&'a Checkpoint>,
     pub kda_fp8: super::fp8::KdaFp8,
     /// Replicate FP8 KDA output weights for token-row sharding; requires two GPUs and FP8 KDA.
     pub kda_output_shard: bool,
@@ -299,51 +293,8 @@ impl<'a> GlmfLoader<'a> {
         Ok(allocation)
     }
 
-    /// The row-concatenation of 2-D `names` as one BF16 operand (FP8 blocks dequantized).
-    fn rows(&self, names: &[String]) -> Result<DeviceAllocation<'a>> {
-        let _memory_format = cuteafd_ffi::memory_ledger::format("bf16");
-        if names.iter().all(|n| self.tensor(n).is_ok_and(|t| t.meta.dtype == DType::Bf16)) {
-            return self.rows_on(0, names);
-        }
-        ensure!(!self.dense.pushing(), "{names:?}: native FP8 dequantization loads through the mount");
-        let tensors = names.iter().map(|n| self.raw(n).map(|t| (n, t))).collect::<Result<Vec<_>>>()?;
-        let cols = tensors[0].1 .2[1];
-        let rows: usize = tensors.iter().map(|(_, (_, _, shape))| shape[0]).sum();
-        ensure!(tensors.iter().all(|(_, (_, _, s))| s.len() == 2 && s[1] == cols), "{names:?} do not share columns");
-        let out = DeviceAllocation::new(self.library, rows * cols * 2)?;
-        let mut row = 0;
-        for (name, (bytes, dtype, shape)) in &tensors {
-            let dest = |first: usize, count: usize| CuteafdDeviceBuffer {
-                // SAFETY: rows row+first..row+first+count lie inside `out`.
-                ptr: unsafe { out.buffer.ptr.cast::<u8>().add((row + first) * cols * 2) }.cast(),
-                bytes: count * cols * 2,
-                ..out.buffer
-            };
-            match dtype {
-                DType::Bf16 => crate::shared::memory::load_timing::upload(bytes.len(), || self.library.copy_h2d(dest(0, shape[0]), bytes))?,
-                DType::F8E4M3 => {
-                    let (scale, scale_dtype, scale_shape) = self.raw(&format!("{name}_scale_inv"))?;
-                    ensure!(scale_dtype == DType::F32, "{name}: block scales must be FP32");
-                    ensure!(scale_shape == [shape[0].div_ceil(128), cols.div_ceil(128)],
-                        "{name}: unexpected scale grid {scale_shape:?}");
-                    let (w, s) = (self.upload(bytes)?, self.upload(&scale)?);
-                    // SAFETY: the FP8 weight, its scales and the destination rows are live;
-                    // the stream drains before `w`/`s` drop.
-                    unsafe {
-                        self.library.fp8_block_dequant(w.buffer.ptr, s.buffer.ptr, dest(0, shape[0]).ptr, shape[0],
-                            cols, self.stream)?;
-                        self.library.cuda_stream_synchronize(self.stream)?;
-                    }
-                }
-                other => anyhow::bail!("{name}: unsupported coordinator dtype {other:?}"),
-            }
-            row += shape[0];
-        }
-        Ok(out)
-    }
-
     /// The row-concatenation of 2-D `names` as E4M3 bytes and FP32 scales in
-    /// `layout`: the FP8 source checkpoint's own blocks when it stores the
+    /// `layout`: the primary checkpoint's own blocks when it stores the
     /// tensors as FP8 (block layout), else quantized from BF16 at load (the
     /// FP8 copy is the only resident one).
     fn fp8(&self, names: &[String], layout: super::fp8::Layout) -> Result<(DeviceAllocation<'a>, DeviceAllocation<'a>)> {
@@ -361,12 +312,12 @@ impl<'a> GlmfLoader<'a> {
         Ok((self.upload(&values)?, self.upload(&scales)?))
     }
 
-    /// The FP8 source's own E4M3 blocks and FP32 128x128 grids of `names`
+    /// The primary checkpoint's own E4M3 blocks and FP32 128x128 grids of `names`
     /// (row-concatenated) on the device, read through this thread's staging
     /// buffer; None when a part is not an FP8 tensor there (quantized instead).
     fn fp8_blocks(&self, names: &[String]) -> Result<Option<(DeviceAllocation<'a>, DeviceAllocation<'a>)>> {
         let _memory_format = cuteafd_ffi::memory_ledger::format("fp8");
-        let checkpoint = self.fp8_source.unwrap_or(self.checkpoint);
+        let checkpoint = self.checkpoint;
         let find = |name: &str| -> Result<&'a CheckpointTensor> {
             let at = checkpoint.tensors.binary_search_by(|t| t.meta.name.as_str().cmp(name))
                 .map_err(|_| anyhow::anyhow!("FP8 checkpoint has no tensor {name}"))?;
@@ -405,7 +356,7 @@ impl<'a> GlmfLoader<'a> {
     /// allocated as the host path allocated them.
     fn gpu_fp8(&self, parts: &[QuantPart<'_>], layout: super::fp8::Layout, kmajor: bool, rank: usize)
         -> Result<(DeviceAllocation<'a>, DeviceAllocation<'a>)> {
-        let source = self.fp8_source.unwrap_or(self.checkpoint);
+        let source = self.checkpoint;
         let rects = parts.iter().map(|part| match part {
             QuantPart::Tensor(name) => {
                 let at = source.tensors.binary_search_by(|t| t.meta.name.as_str().cmp(name))
@@ -508,11 +459,9 @@ impl<'a> GlmfLoader<'a> {
         self.on_rank(rank, || self.gpu_fp8(&parts, layout, false, rank))
     }
 
-    /// [`Self::rows`] on rank `rank` (BF16 parts land unchanged).
+    /// Row-concatenate BF16 matrices on rank `rank`, unchanged.
     fn rows_on(&self, rank: usize, names: &[String]) -> Result<DeviceAllocation<'a>> {
-        if rank == 0 && !names.iter().all(|n| self.tensor(n).is_ok_and(|t| t.meta.dtype == DType::Bf16)) {
-            return self.rows(names);
-        }
+        let _memory_format = cuteafd_ffi::memory_ledger::format("bf16");
         let mut lands = Vec::new();
         let mut at = 0;
         for name in names {
@@ -530,7 +479,7 @@ impl<'a> GlmfLoader<'a> {
 
     /// Whether every name is a BF16 matrix in the source checkpoint (quantized on the GPU).
     fn all_bf16(&self, names: &[String]) -> Result<bool> {
-        let source = self.fp8_source.unwrap_or(self.checkpoint);
+        let source = self.checkpoint;
         names.iter().try_fold(true, |all, name| {
             let at = source.tensors.binary_search_by(|t| t.meta.name.as_str().cmp(name))
                 .map_err(|_| anyhow::anyhow!("checkpoint has no tensor {name}"))?;
@@ -556,29 +505,15 @@ impl<'a> GlmfLoader<'a> {
     /// Host bytes of [`Self::fp8`]: E4M3 values, FP32 scales, and the column count.
     fn fp8_host(&self, names: &[String], layout: super::fp8::Layout) -> Result<(Vec<u8>, Vec<u8>, usize)> {
         use super::fp8::{quantize, Layout};
-        let source = |name: &str| -> Result<(Vec<u8>, DType, Vec<usize>)> {
-            match self.fp8_source {
-                Some(checkpoint) => {
-                    let at = checkpoint.tensors.binary_search_by(|t| t.meta.name.as_str().cmp(name))
-                        .map_err(|_| anyhow::anyhow!("FP8 checkpoint has no tensor {name}"))?;
-                    let tensor = &checkpoint.tensors[at];
-                    let mut bytes = vec![0u8; tensor.meta.byte_length as usize];
-                    crate::shared::memory::load_timing::read(bytes.len(), || std::fs::File::open(checkpoint.snapshot.join(&tensor.shard))?
-                        .read_exact_at(&mut bytes, tensor.meta.byte_offset))?;
-                    Ok((bytes, tensor.meta.dtype.clone(), tensor.meta.shape.clone()))
-                }
-                None => self.raw(name),
-            }
-        };
         let (mut values, mut scales) = (Vec::new(), Vec::<u8>::new());
         let mut cols = None;
         for name in names {
-            let (bytes, dtype, shape) = source(name)?;
+            let (bytes, dtype, shape) = self.raw(name)?;
             ensure!(shape.len() == 2 && cols.is_none_or(|c| c == shape[1]), "{name}: FP8 rows must share columns");
             cols = Some(shape[1]);
             match dtype {
                 DType::F8E4M3 if layout == Layout::Block => {
-                    let (scale, scale_dtype, scale_shape) = source(&format!("{name}_scale_inv"))?;
+                    let (scale, scale_dtype, scale_shape) = self.raw(&format!("{name}_scale_inv"))?;
                     ensure!(scale_dtype == DType::F32 && shape[0] % 128 == 0
                         && scale_shape == [shape[0] / 128, shape[1].div_ceil(128)],
                         "{name}: expected FP32 128x128 block scales, found {scale_dtype:?} {scale_shape:?}");
@@ -602,10 +537,8 @@ impl<'a> GlmfLoader<'a> {
     fn one_on(&self, rank: usize, name: &str) -> Result<DeviceAllocation<'a>> {
         let _memory_format = cuteafd_ffi::memory_ledger::format("bf16");
         let tensor = self.tensor(name)?;
-        if tensor.meta.shape.len() == 2 && tensor.meta.dtype == DType::F8E4M3 {
-            ensure!(rank == 0 && !self.dense.pushing(), "{name}: native FP8 dequantization loads through the mount");
-            return self.rows(&[name.to_string()]);
-        }
+        ensure!(matches!(tensor.meta.dtype, DType::Bf16 | DType::F32),
+            "{name}: unchanged coordinator operands require BF16 or FP32");
         self.whole(rank, name)
     }
 
@@ -694,7 +627,7 @@ impl<'a> GlmfLoader<'a> {
         ops.insert("w_o_scale", s);
         let i = |name: &str| a(&format!("indexer.{name}"));
         ops.insert("w_iq", self.one(&i("wq_b.weight"))?);
-        ops.insert("w_ik", self.rows(&[i("wk.weight"), i("weights_proj.weight"),
+        ops.insert("w_ik", self.rows_on(0, &[i("wk.weight"), i("weights_proj.weight"),
             i("index_kpool_compress_gate")])?);
         ops.insert("k_norm_w", self.one(&i("k_norm.weight"))?);
         ops.insert("k_norm_b", self.one(&i("k_norm.bias"))?);
@@ -840,12 +773,6 @@ impl<'a> GlmfLoader<'a> {
     }
 
     fn kda_upload(&self, cfg: &GlmNextConfig, prefix: &str, operand: KdaOperand) -> Result<DeviceAllocation<'a>> {
-        let names: Vec<_> = Self::kda_geometry(cfg).roles(operand).into_iter()
-            .map(|role| Self::kda_name(prefix, role)).collect();
-        // Native FP8 projections keep the existing device dequantization path.
-        let native_fp8 = matches!(operand, KdaOperand::WIn | KdaOperand::WFg)
-            && names.iter().any(|name| self.tensor(name).is_ok_and(|tensor| tensor.meta.dtype == DType::F8E4M3));
-        if native_fp8 { return self.rows(&names); } // Bails in push mode (mount-only dequantization).
         Ok(self.kda_operand(cfg, prefix, operand, 1)?.remove(0))
     }
 
@@ -967,7 +894,7 @@ impl<'a> GlmfLoader<'a> {
         }
         let (mut values, mut grids) = (vec![Vec::new(); ranks], vec![Vec::new(); ranks]);
         for name in names {
-            let (v, g, rows, cols) = Self::fp8_block_host(self.fp8_source.unwrap_or(self.checkpoint), name,
+            let (v, g, rows, cols) = Self::fp8_block_host(self.checkpoint, name,
                 self.fp8_scales)?;
             let along = if axis == Axis::Rows { rows } else { cols };
             ensure!(along % (128 * ranks) == 0, "{name}: [{rows}, {cols}] does not split into whole 128 blocks over \
@@ -991,7 +918,7 @@ impl<'a> GlmfLoader<'a> {
     /// blocks as the whole tensor's), staged in bounded row windows.
     fn gpu_fp8_split(&self, names: &[String], axis: Axis, ranks: usize)
         -> Result<Vec<(DeviceAllocation<'a>, DeviceAllocation<'a>)>> {
-        let source = self.fp8_source.unwrap_or(self.checkpoint);
+        let source = self.checkpoint;
         let tensor = |name: &str| -> Result<&CheckpointTensor> {
             let at = source.tensors.binary_search_by(|t| t.meta.name.as_str().cmp(name))
                 .map_err(|_| anyhow::anyhow!("checkpoint has no tensor {name}"))?;

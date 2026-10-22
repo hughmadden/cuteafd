@@ -295,10 +295,6 @@ SPECULATOR_MODEL_ID
 SPECULATOR_MODEL_REVISION
 MEDIA_CACHE_BYTES
 PREFIX_CACHE_MARK_MIB
-GLM5_FLASH_FP8_MODEL_ID
-GLMF_FP8_MODEL_ID
-GLM5_FLASH_FP8_MODEL_REVISION
-GLMF_FP8_MODEL_REVISION
 GLM5_FLASH_KDA_FP8
 GLMF_KDA_FP8
 GLM5_FLASH_KDA_SPLIT
@@ -2240,10 +2236,9 @@ fi
 if [[ "$family" == qwen4 && "$attention_placement" == layers && "$head_split" != 1 ]]; then
   release_die "Qwen whole-layer attention requires a Spark-free coordinator pair"
 fi
-# GLM 5.3 Flash: the MLA, dense and shared-expert projections are FP8 only,
-# from the official FP8 release (GLM5_FLASH_FP8_MODEL_ID; "off" requires native
-# FP8 block tensors in the primary checkpoint, else BF16 ones are quantized to
-# 128x128 blocks at load). Resolve precision after the serving split: both
+# GLM 5.3 Flash: MLA and shared-expert projections use the primary checkpoint's
+# FP8 blocks or BF16 quantized to 128x128 blocks at load. Dense MLPs use the
+# same route, or native packed NVFP4. Resolve precision after the split: both
 # layouts default to row128 KDA and an FP8 head; the two-GPU head split adds
 # token-row KDA output ownership (--kda-output-shard --kda-prefill-expanded),
 # which avoids rounding half-K BF16 partials (2026-10-05: C1 +7.6%, paired
@@ -2259,11 +2254,6 @@ fi
 if [[ $family == glm5_flash ]]; then
   local_layers="$(get RTX_EXPERT_LAYERS)"
   [[ -z "$local_layers" ]] || family_args+=(--rtx-expert-layers "$local_layers")
-  fp8_model="$(key GLM5_FLASH_FP8_MODEL_ID GLMF_FP8_MODEL_ID zai-org/GLM-5.3-Flash)"
-  if [[ "$fp8_model" != off ]]; then
-    fp8_snapshot="$(snapshot_of "$fp8_model" "$(key GLM5_FLASH_FP8_MODEL_REVISION GLMF_FP8_MODEL_REVISION)")" || exit 1
-    family_args+=(--fp8-decode --fp8-snapshot "$fp8_snapshot")
-  fi
   kda_fp8="$(key GLM5_FLASH_KDA_FP8 GLMF_KDA_FP8 auto)"
   case "$kda_fp8" in
     ""|auto) kda_fp8=row128 ;;
