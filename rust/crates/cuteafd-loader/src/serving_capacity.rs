@@ -110,7 +110,7 @@ impl Default for CacheOptions {
             coordinator_ranks: 1,
             native_mtp_layers: 0,
             mimo_kv: MimoKvFormats::default(),
-            dense_qwen_kv: crate::families::qwen4::Qwen4KvCache::Bf16,
+            dense_qwen_kv: crate::families::qwen4::Qwen4KvCache::Fp8,
             qwen_kv: Qwen4KvCache::default(),
             step5_kv: Qwen4KvCache::Bf16,
             prefill_rows: 4096,

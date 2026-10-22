@@ -35,7 +35,7 @@ pub(crate) struct GoldenArgs {
     #[arg(long)]
     pub pool_tokens: Option<u64>,
     /// Full-attention KV storage only; GDN recurrence remains FP32.
-    #[arg(long, default_value = "bf16")]
+    #[arg(long, default_value = "fp8")]
     pub kv_cache: cuteafd_loader::families::qwen4::Qwen4KvCache,
     /// Input chunk size, including serial decode-shaped qualification.
     #[arg(long, default_value_t = 4096)]
@@ -96,7 +96,7 @@ pub(crate) async fn run_golden(args: GoldenArgs) -> Result<()> {
     let marks = args.prefix_check.then_some(crate::shared::prefix::MarkRule {
         lanes: slots, entries: 1, budget_bytes: 1 << 30, host: false });
     let mut engine = engine::DenseEngine::with_prefix(&library, &programs, &checkpoint, cfg.clone(),
-        args.pool_tokens, None, slots, marks, args.kv_cache)?;
+        args.pool_tokens, None, slots, marks, args.kv_cache, false)?;
     if args.verify_check {
         engine.verify_check(&tokens)?;
         if args.state_slots > 1 { engine.multislot_verify_check(&tokens)?; }
@@ -249,6 +249,7 @@ mod tests {
         assert_eq!(args.max_sequences, 8);
         assert_eq!(args.pool_tokens.filter(|&tokens| tokens > 0), None);
         assert_eq!(args.prefix.prefix_cache_entries, 4);
+        assert_eq!(args.kv_cache, cuteafd_loader::families::qwen4::Qwen4KvCache::Fp8);
     }
 
     #[test]
@@ -267,5 +268,6 @@ mod tests {
         let cli = crate::cli::Cli::try_parse_from(["cuteafd", "qwen35-golden", "--snapshot", "/m", "--check-headers"]).unwrap();
         let crate::cli::Commands::Qwen35Golden(args) = cli.command else { panic!("dense golden not registered") };
         assert_eq!(args.nll_tolerance, 0.01);
+        assert_eq!(args.kv_cache, cuteafd_loader::families::qwen4::Qwen4KvCache::Fp8);
     }
 }

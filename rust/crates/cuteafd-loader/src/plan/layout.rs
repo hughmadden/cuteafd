@@ -220,7 +220,7 @@ impl Default for LayoutOptions {
             mimo_expert_manifest: None,
             context_tokens: 0,
             native_mtp_layers: 3,
-            dense_qwen_kv: crate::families::qwen4::Qwen4KvCache::Bf16,
+            dense_qwen_kv: crate::families::qwen4::Qwen4KvCache::Fp8,
             qwen_kv: Default::default(),
             step5_kv: crate::families::qwen4::Qwen4KvCache::Fp8,
             qwen_representation: crate::families::qwen4::resident::Qwen4Representation {

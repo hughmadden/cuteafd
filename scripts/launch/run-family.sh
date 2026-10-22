@@ -167,6 +167,7 @@ EOF
   if [[ "$1" == qwen3_5 ]]; then
     cat <<'EOF'
 KV_CACHE
+FULL_PREFILL_LOGITS
 PREFIX_CACHE_MARK_MIB
 PREFIX_POINT_BOUNDARIES
 EOF
@@ -1969,7 +1970,7 @@ if [[ $family == mimo_v2 ]]; then
   esac
 fi
 if [[ "$family" == qwen3_5 ]]; then
-  dense_qwen_kv_cache="$(get KV_CACHE bf16)"
+  dense_qwen_kv_cache="$(get KV_CACHE fp8)"
   case "$dense_qwen_kv_cache" in bf16|fp8) ;; *) release_die "KV_CACHE must be bf16 or fp8" ;; esac
   family_args+=(--kv-cache "$dense_qwen_kv_cache")
   [[ -z "$(get PREFIX_CACHE_MARK_MIB)" ]] || family_args+=(--prefix-cache-mark-mib "$(get PREFIX_CACHE_MARK_MIB)")

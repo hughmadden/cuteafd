@@ -3546,3 +3546,20 @@ def test_mimo_swa_record_format_reaches_serve_and_plan(tmp_path, value, model_ty
     assert f"--swa-kv-cache {expected}" in launch
     plans = [line for line in result.stderr.splitlines() if "cuteafd plan" in line]
     assert plans and all(f"--mimo-swa-kv-cache {expected}" in line for line in plans)
+
+
+@pytest.mark.parametrize("full", ["off", "on"])
+@pytest.mark.parametrize("kv", [None, "bf16", "fp8"])
+def test_dense_full_prefill_logits_reaches_serve_and_plan(tmp_path, full, kv):
+    result = _family_launch_result(tmp_path, DENSE_CONFIG, "Qwen/Qwen3.5-9B",
+        f"SPARK_COUNT=0\nSPECULATOR=off\nFULL_PREFILL_LOGITS={full}\n" + (f"KV_CACHE={kv}\n" if kv else ""),
+        extra_args=("--wip", "dense-test"),
+        encoder_plan={"placement_supported": True, "fits": True, "spark_ranks": 0})
+    assert result.returncode == 0, result.stderr
+    launch = next(line for line in result.stderr.splitlines() if "serve-qwen35 --snapshot" in line)
+    plan = next(line for line in result.stderr.splitlines() if "cuteafd plan " in line)
+    assert ("--full-prefill-logits" in launch) == (full == "on")
+    assert ("--full-prefill-logits" in plan) == (full == "on")
+    expected_kv = kv or "fp8"
+    assert f"--kv-cache {expected_kv}" in launch
+    assert f"--kv-cache {expected_kv}" in plan

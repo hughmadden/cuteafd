@@ -58,7 +58,7 @@ fn native_planner_fixture() -> (tempfile::TempDir, PlanOptions, crate::placement
     let raw = config(4096, 12288, 16, 32, 4);
     let cfg = Qwen35Config::from_hf(&raw).unwrap();
     write_snapshot(dir.path(), &raw, &tensors(false), None);
-    let buffers = NativeBuffers::new(&cfg, 1024, 4, 10).unwrap();
+    let buffers = NativeBuffers::new(&cfg, 1024, 4, 10, false).unwrap();
     let mut programs = Vec::new();
     for (op, rows) in [("norm", 0), ("add", 0), ("gdn_commit", 0)].into_iter().chain(
         [64, 4096].into_iter().flat_map(|rows| ["gdn", "attn_producer", "full_gqa", "attn_o", "ffn"].map(|op| (op, rows)))) {
@@ -103,7 +103,8 @@ fn native_planner_fixture() -> (tempfile::TempDir, PlanOptions, crate::placement
     let options = PlanOptions { placement: ExpertPlacement::Local, vision: plan::MediaMode::Off,
         audio: plan::MediaMode::Off, layout: Some(plan::layout::LayoutOptions {
             rtx_bytes: vec![96 << 30], concurrency: 4, prefix_slots: Some(10), native_mtp_layers: 0,
-            pool_tokens: Some(262144), workspace_manifest: Some(manifest.clone()), ..Default::default() }),
+            pool_tokens: Some(262144), workspace_manifest: Some(manifest.clone()),
+            dense_qwen_kv: crate::families::qwen4::Qwen4KvCache::Bf16, ..Default::default() }),
         ..Default::default() };
     (dir, options, buffers, exports)
 }
@@ -156,7 +157,7 @@ fn dense_default_prefix_geometry_releases_retention_with_host() {
         ("Qwen3.8-27B", 5120, 17408, 24, 48, 64, 153_944_064),
     ] {
         let cfg = Qwen35Config::from_hf(&config(hidden, intermediate, heads, values, layers)).unwrap();
-        let mark = NativeBuffers::new(&cfg, 0, 16, 0).unwrap().mark_bytes as u64;
+        let mark = NativeBuffers::new(&cfg, 0, 16, 0, false).unwrap().mark_bytes as u64;
         assert_eq!(mark, expected_mark);
         let old = mark_slots_for(16, 20, mark, 2 << 30);
         let staged = mark_slots_with_host(16, 20, mark, 2 << 30, true);
@@ -257,6 +258,69 @@ fn automatic_spark_count_retains_native_wip_zero_spark_candidate() {
     let explicit = plan::plan_spark_count(dir.path(), &options, 2, Some(2)).unwrap();
     assert!(!explicit.wip_launchable() && !explicit.executable());
     assert!(explicit.hints.iter().any(|h| h.what.contains("counts that work: [0]")));
+}
+
+#[test]
+fn dense_default_kv_is_compact_in_planner_and_cache_geometry() {
+    use crate::families::qwen4::Qwen4KvCache;
+    assert_eq!(plan::layout::LayoutOptions::default().dense_qwen_kv, Qwen4KvCache::Fp8);
+    assert_eq!(crate::serving_capacity::CacheOptions::default().dense_qwen_kv, Qwen4KvCache::Fp8);
+}
+
+#[test]
+fn full_prefill_head_changes_only_the_admitted_logit_arena() {
+    use crate::placement::families::qwen3_5::{NativeBuffers, PREFILL_ROWS, VERIFY_ROWS};
+    for (hidden, intermediate, heads, values, layers) in [
+        (4096, 12288, 16, 32, 32), (5120, 17408, 24, 48, 64),
+    ] {
+        let mut raw = config(hidden, intermediate, heads, values, layers);
+        raw["text_config"]["vocab_size"] = json!(248320);
+        let cfg = Qwen35Config::from_hf(&raw).unwrap();
+        for slots in [1, 4, 16, 64] {
+            let narrow = NativeBuffers::new(&cfg, 1024, slots, 10, false).unwrap();
+            let mut wide = NativeBuffers::new(&cfg, 1024, slots, 10, true).unwrap();
+            assert_eq!(narrow.head_rows, VERIFY_ROWS);
+            assert_eq!(wide.head_rows, PREFILL_ROWS);
+            assert_eq!(narrow.logits, VERIFY_ROWS * cfg.vocab * 4);
+            assert_eq!(wide.logits, PREFILL_ROWS * cfg.vocab * 4);
+            assert_eq!(wide.fixed().iter().map(|d| d.bytes).sum::<u64>()
+                - narrow.fixed().iter().map(|d| d.bytes).sum::<u64>(),
+                ((PREFILL_ROWS - VERIFY_ROWS) * cfg.vocab * 4) as u64);
+            wide.logits = narrow.logits;
+            wide.head_rows = narrow.head_rows;
+            assert_eq!(wide, narrow, "full scoring must not change recurrence, replay or marks");
+        }
+    }
+}
+
+#[test]
+fn full_prefill_planner_equals_runtime_recipe_for_each_kv_format() {
+    use crate::{families::qwen4::Qwen4KvCache, placement::families::qwen3_5::NativeBuffers};
+    let (dir, mut options, _, _) = native_planner_fixture();
+    let cfg = Qwen35Config::from_hf(&config(4096, 12288, 16, 32, 4)).unwrap();
+    for kv in [Qwen4KvCache::Bf16, Qwen4KvCache::Fp8] {
+        let mut previous = None;
+        for full in [false, true] {
+            let layout = options.layout.as_mut().unwrap();
+            layout.full_prefill_logits = full;
+            layout.dense_qwen_kv = kv;
+            let buffers = NativeBuffers::new(&cfg, 1024, 4, 10, full).unwrap();
+            let report = plan::plan(dir.path(), &options).unwrap();
+            assert!(report.wip_launchable(), "{:?}", report.hints);
+            let memory = report.memory_layout.unwrap();
+            assert_eq!(memory.pool_tokens, 262144);
+            let device = &memory.devices[0];
+            for demand in buffers.fixed() {
+                let item = device.items.iter().find(|i| i.group == demand.group).unwrap();
+                assert_eq!(item.bytes, demand.bytes, "full={full}, kv={kv}, {}", demand.group);
+            }
+            let bytes = device.used_bytes();
+            if let Some(narrow_bytes) = previous {
+                assert_eq!(bytes - narrow_bytes, ((4096 - 64) * cfg.vocab * 4) as u64);
+            }
+            previous = Some(bytes);
+        }
+    }
 }
 
 #[test]

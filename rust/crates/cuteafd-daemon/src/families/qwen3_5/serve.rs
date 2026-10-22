@@ -42,7 +42,7 @@ impl<'e, 'a> Backend<'a> for DenseBackend<'e, 'a> {
     fn geometry(&self) -> scheduler::Geometry {
         let engine = self.engine.borrow();
         scheduler::Geometry { family: "qwen3_5", vocab_size: engine.cfg.vocab, max_context: engine.cfg.max_context,
-            slots: engine.slot_count(), prefill_rows: 4096, decode_rows: engine.decode_rows(), full_prefill_logits: false }
+            slots: engine.slot_count(), prefill_rows: 4096, decode_rows: engine.decode_rows(), full_prefill_logits: engine.full_prefill_logits() }
     }
     fn library(&self) -> &'a NativeLibrary { self.library }
     fn profile(&self) -> &RefCell<[f64; 2]> { &self.profile }
@@ -51,7 +51,8 @@ impl<'e, 'a> Backend<'a> for DenseBackend<'e, 'a> {
         let family = DensePrefix::new(self.engine)?;
         let layout = family.layout();
         let shape = self.geometry();
-        let args = &args.with_scoring(shape.decode_rows, shape.decode_rows, shape.vocab_size)?;
+        let args = &args.with_scoring(if shape.full_prefill_logits { shape.prefill_rows } else { shape.decode_rows },
+            shape.prefill_rows, shape.vocab_size)?;
         let host = args.host_config(layout, shape.max_context, lanes)?.map(|config|
             CudaCopyEngine::registered_owned(self.library, family.snapshot_owners()).map(|copy| (config, copy))).transpose()?;
         let config = PrefixConfig { entries: args.prefix_cache_entries, mark_slots: family.slots(),
@@ -99,7 +100,7 @@ impl<'e, 'a> Backend<'a> for DenseBackend<'e, 'a> {
         let output = engine.prefill_device(placement.slot, tokens, logit_rows)?;
         placement.len += tokens.len();
         placement.state_len = placement.len;
-        Ok(Some(output))
+        Ok((logit_rows > 0).then_some(output))
     }
     fn verify_device(&self, sequences: &mut [(&mut Placement, &[u32])], speculative: bool,
         _pool: &cuteafd_engine::prefix::RefPagePool) -> Result<Option<DeviceLogits>> {
@@ -191,8 +192,11 @@ pub(crate) struct ServeArgs {
     #[arg(long)]
     pub pool_tokens: Option<u64>,
     /// Full-attention KV storage only; GDN recurrence remains FP32.
-    #[arg(long, default_value = "bf16")]
+    #[arg(long, default_value = "fp8")]
     pub kv_cache: cuteafd_loader::families::qwen4::Qwen4KvCache,
+    /// Admit a full prefill batch of vocabulary logits for quality scoring.
+    #[arg(long)]
+    pub full_prefill_logits: bool,
     #[arg(long, default_value = "0.0.0.0:8000")]
     pub listen: String,
     #[arg(long, default_value_t = 32768)]
@@ -242,7 +246,7 @@ pub(crate) async fn run_serve(args: ServeArgs) -> Result<()> {
             let programs = library.programs()?.with_manifest(&engine_args.manifest)?;
             let lanes = usize::from(engine_args.max_sequences);
             let engine = RefCell::new(DenseEngine::with_prefix(&library, &programs, &checkpoint,
-                header.config, engine_args.pool_tokens.filter(|&tokens| tokens > 0), None, lanes, Some(engine_args.prefix.mark_rule(lanes)), engine_args.kv_cache)?);
+                header.config, engine_args.pool_tokens.filter(|&tokens| tokens > 0), None, lanes, Some(engine_args.prefix.mark_rule(lanes)), engine_args.kv_cache, engine_args.full_prefill_logits)?);
             let backend = DenseBackend::new(&engine, &library);
             scheduler::schedule(&backend, &engine_args.snapshot, &mut receive, &worker_stats, lanes,
                 scheduler::Drafts::None, eos, engine_args.decode_share, &engine_args.prefix,
@@ -277,4 +281,38 @@ pub(crate) async fn run_serve(args: ServeArgs) -> Result<()> {
 
 pub(crate) fn text_media() -> MediaAdmission<scheduler::Prompt, crate::shared::qwen::Encoder> {
     MediaAdmission::new(EmbeddingCache::new(0), crate::shared::qwen::Encoder::Off, 16)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    #[derive(Parser)]
+    struct Cli {
+        #[command(flatten)]
+        serve: ServeArgs,
+    }
+
+    #[test]
+    fn dense_defaults_to_compact_kv_without_full_prefill_arena() {
+        let parsed = Cli::try_parse_from(["dense", "--snapshot", "checkpoint", "--native-lib", "native.so"])
+            .unwrap().serve;
+        assert_eq!(parsed.kv_cache, cuteafd_loader::families::qwen4::Qwen4KvCache::Fp8);
+        assert!(!parsed.full_prefill_logits);
+    }
+
+    #[test]
+    fn full_prefill_logits_is_explicit_and_preserves_kv_selection() {
+        for kv in ["bf16", "fp8"] {
+            for full in [false, true] {
+                let mut args = vec!["dense", "--snapshot", "checkpoint", "--native-lib", "native.so", "--kv-cache", kv];
+                if full { args.push("--full-prefill-logits"); }
+                let parsed = Cli::try_parse_from(args).unwrap().serve;
+                assert_eq!(parsed.full_prefill_logits, full);
+                assert_eq!(parsed.kv_cache.to_string(), kv);
+                assert_eq!(parsed.max_sequences, 4);
+            }
+        }
+    }
 }
