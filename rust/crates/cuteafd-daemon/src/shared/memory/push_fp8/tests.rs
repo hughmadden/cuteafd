@@ -415,3 +415,22 @@ fn installed_native_complete_rank_plans_fit_admission_and_control_frames() -> Re
     }
     Ok(())
 }
+
+#[test]
+fn coordinator_suffix_preserves_fp8_and_nvfp4_spark_plans() -> Result<()> {
+    for format in [ExpertFormat::Fp8, ExpertFormat::Nvfp4] {
+        let root = tempfile::tempdir()?;
+        let catalog = fixture(root.path(), format, false)?;
+        for world in [4, 6] {
+            let plans = (0..world).map(|rank| {
+                let plan = RankPlan::new(&catalog, &[(1, Slicing::Padded), (2, Slicing::Padded)],
+                    world, rank, usize::MAX)?;
+                Ok((plan.layout.bytes() as u64, plan.placement.clone(),
+                    plan.checked(&catalog, root.path(), world, rank)?))
+            }).collect::<Result<Vec<_>>>()?;
+            super::super::push_exl3::tests::coordinator_suffix(root.path(), &catalog, &plans,
+                |assignments, offers, coordinator| checked_plan(root.path(), &catalog, assignments, offers, coordinator))?;
+        }
+    }
+    Ok(())
+}

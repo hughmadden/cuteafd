@@ -66,3 +66,31 @@ fn installed_exlr8_rank_plans_match_admission_when_supplied() -> Result<()> {
     }
     Ok(())
 }
+
+#[test]
+fn coordinator_suffix_preserves_mixed_exlr8_spark_plans() -> Result<()> {
+    for padded in [false, true] {
+        let root = tempfile::tempdir()?;
+        fixture(root.path(), padded);
+        let mut config = cuteafd_loader::plan::testing::glm5_config();
+        for (key, value) in [("hidden_size", 128), ("moe_intermediate_size", 384),
+            ("n_routed_experts", 2), ("num_experts_per_tok", 1), ("num_hidden_layers", 4),
+            ("first_k_dense_replace", 3)] { config[key] = value.into(); }
+        config["indexer_types"] = serde_json::json!(["full", "full", "full", "full"]);
+        config["mlp_layer_types"] = serde_json::json!(["dense", "dense", "dense", "sparse"]);
+        std::fs::write(root.path().join("config.json"), serde_json::to_vec(&config)?)?;
+        let catalog = cuteafd_loader::read_expert_catalog(root.path())?;
+        assert!(matches!(catalog.format(), cuteafd_loader::plan::checkpoint::CheckpointFormat::Exlr8));
+        for world in [4, 6] {
+            let plans = (0..world).map(|rank| {
+                let plan = RankPlan::new(root.path(), "mixed", &[3], world, rank, usize::MAX)?;
+                Ok((plan.layout.bytes() as u64, plan.placement.clone(),
+                    plan.checked(root.path(), root.path(), world, rank)?))
+            }).collect::<Result<Vec<_>>>()?;
+            super::super::push_exl3::tests::coordinator_suffix(root.path(), &catalog, &plans,
+                |assignments, offers, coordinator| checked_plan(root.path(), root.path(), &catalog,
+                    "mixed", &[3], assignments, offers, coordinator))?;
+        }
+    }
+    Ok(())
+}

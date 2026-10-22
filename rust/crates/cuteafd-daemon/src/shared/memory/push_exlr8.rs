@@ -62,16 +62,17 @@ impl RankPlan {
     }
 }
 
-pub(crate) fn prepare(snapshot: &Path, manifest: &str, layers: &[usize],
-    assignments: &[cuteafd_loader::placement::SparkAssignment], offers: &[Offer]) -> Result<PushGroup> {
+fn checked_plan(root: &Path, snapshot: &Path, catalog: &cuteafd_loader::OfficialV41Catalog,
+    manifest: &str, layers: &[usize], assignments: &[cuteafd_loader::placement::SparkAssignment],
+    offers: &[Offer], coordinator: Option<&super::push_exl3::CoordinatorRanks>) -> Result<CheckedPlan> {
     let started = std::time::Instant::now();
-    let (root, _) = cuteafd_loader::push_load::namespace(snapshot)?;
-    ensure!(offers.len() == assignments.len(), "EXLR8 push offer world differs from admission");
-    let mut plans = Vec::with_capacity(offers.len());
-    for start in (0..offers.len()).step_by(8) {
+    let sparks = assignments.len();
+    ensure!(offers.len() == sparks + coordinator.map_or(0, |c| c.ranks), "EXLR8 push offer world differs from admission");
+    let mut plans = Vec::with_capacity(sparks);
+    for start in (0..sparks).step_by(8) {
         std::thread::scope(|scope| -> Result<()> {
-            let jobs = (start..offers.len().min(start + 8)).map(|rank| scope.spawn(move || {
-                let plan = RankPlan::new(snapshot, manifest, layers, offers.len(), rank,
+            let jobs = (start..sparks.min(start + 8)).map(|rank| scope.spawn(move || {
+                let plan = RankPlan::new(snapshot, manifest, layers, sparks, rank,
                     usize::try_from(assignments[rank].resident_bytes)?)?;
                 super::push_exl3::validate_offer(&offers[rank], rank, &assignments[rank],
                     &plan.placement, plan.layout.logical_bytes() as u64)?;
@@ -84,12 +85,24 @@ pub(crate) fn prepare(snapshot: &Path, manifest: &str, layers: &[usize],
         })?;
     }
     let planned = started.elapsed();
-    let mut builder = Builder::new(&root, offers.iter().map(|o| o.arena_bytes).collect());
+    let mut builder = Builder::new(root, offers.iter().map(|o| o.arena_bytes).collect());
     for (rank, plan) in plans.iter().enumerate() {
         plan.append(&mut builder, snapshot, u32::try_from(rank)?)?;
     }
+    if let Some(coordinator) = coordinator { (coordinator.append)(&mut builder, catalog, &offers[sparks..])?; }
     let appended = started.elapsed();
     let checked = builder.finish()?;
+    tracing::info!(rank_plan_ms = planned.as_millis(), append_ms = (appended - planned).as_millis(),
+        check_ms = (started.elapsed() - appended).as_millis(), "Spark EXLR8 push plan checked");
+    Ok(checked)
+}
+
+pub(crate) fn prepare(snapshot: &Path, catalog: &cuteafd_loader::OfficialV41Catalog,
+    manifest: &str, layers: &[usize], assignments: &[cuteafd_loader::placement::SparkAssignment],
+    offers: &[Offer], coordinator: Option<&super::push_exl3::CoordinatorRanks>) -> Result<PushGroup> {
+    let started = std::time::Instant::now();
+    let (root, _) = cuteafd_loader::push_load::namespace(snapshot)?;
+    let checked = checked_plan(&root, snapshot, catalog, manifest, layers, assignments, offers, coordinator)?;
     let checked_at = started.elapsed();
     ensure!(checked.plan.files.iter().all(|file|
         cuteafd_loader::push_load::is_push_shard(&root.join(file))), "EXLR8 push source is not a SparkNest shard");
@@ -100,8 +113,7 @@ pub(crate) fn prepare(snapshot: &Path, manifest: &str, layers: &[usize],
     let group = PushClient::default().create(ranks, checked.plan.files.clone())?;
     let created = started.elapsed();
     checked.upload(&group)?;
-    tracing::info!(ranks = offers.len(), rank_plan_ms = planned.as_millis(),
-        append_ms = (appended - planned).as_millis(), check_ms = (checked_at - appended).as_millis(),
+    tracing::info!(ranks = offers.len(), plan_ms = checked_at.as_millis(),
         source_check_ms = (source_checked - checked_at).as_millis(),
         create_ms = (created - source_checked).as_millis(), upload_ms = (started.elapsed() - created).as_millis(),
         "Spark EXLR8 push group prepared");

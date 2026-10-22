@@ -59,3 +59,47 @@ fn installed_native_rank_plan_tp4_tp6_rejects_changed_worker_placement() -> Resu
     }
     Ok(())
 }
+
+#[test]
+fn coordinator_suffix_preserves_native_spark_plans() -> Result<()> {
+    use cuteafd_loader::plan::testing::{t, write_snapshot};
+    let root = tempfile::tempdir()?;
+    let config = serde_json::json!({"model_type":"deepseek_v4"});
+    let args = serde_json::json!({
+        "vocab_size":64,"dim":256,"moe_inter_dim":768,"n_layers":1,"n_heads":4,
+        "n_routed_experts":2,"n_shared_experts":1,"n_activated_experts":1,
+        "score_func":"sqrtsoftplus","route_scale":1.5,"swiglu_limit":10.0,
+        "q_lora_rank":128,"head_dim":128,"rope_head_dim":64,"o_groups":1,
+        "o_lora_rank":128,"window_size":128,"original_seq_len":65536,
+        "rope_theta":10000,"rope_factor":16,"beta_fast":32,"beta_slow":1,
+        "index_n_heads":4,"index_head_dim":128,"index_topk":512,"hc_mult":4,
+        "hc_sinkhorn_iters":20,"compress_rope_theta":160000,"compress_ratios":[0]
+    });
+    let mut tensors = Vec::new();
+    for expert in 0..2 {
+        for (projection, rows, cols) in [("w1", 768, 256), ("w3", 768, 256), ("w2", 256, 768)] {
+            let prefix = format!("layers.0.ffn.experts.{expert}.{projection}");
+            tensors.push(t(format!("{prefix}.weight"), "I8", &[rows, cols / 2]));
+            tensors.push(t(format!("{prefix}.scale"), "F8_E8M0", &[rows, cols / 32]));
+        }
+    }
+    write_snapshot(root.path(), &config, &tensors, None);
+    std::fs::create_dir(root.path().join("inference"))?;
+    std::fs::write(root.path().join("inference/config.json"), serde_json::to_vec(&args)?)?;
+    let catalog = cuteafd_loader::read_expert_catalog(root.path())?;
+    for world in [4, 6] {
+        let plans = (0..world).map(|rank| {
+            let width: usize = 768 / world;
+            let stored = width.div_ceil(128) * 128;
+            let slice = SparkSlice { unit_map: None, layer: 0, first: (rank * width) as u32,
+                width: width as u32, stored_width: stored as u32, tiers: vec![], projection_counts: vec![] };
+            let bytes = NativePlanes::new(256, width, stored, 2, false)?.bytes;
+            let plan = RankPlan::new(&catalog, &[slice], world, rank, bytes)?;
+            Ok((plan.layout.bytes() as u64, plan.placement.clone(),
+                plan.checked(&catalog, root.path(), world, rank)?))
+        }).collect::<Result<Vec<_>>>()?;
+        super::super::push_exl3::tests::coordinator_suffix(root.path(), &catalog, &plans,
+            |assignments, offers, coordinator| checked_plan(root.path(), &catalog, assignments, offers, coordinator))?;
+    }
+    Ok(())
+}

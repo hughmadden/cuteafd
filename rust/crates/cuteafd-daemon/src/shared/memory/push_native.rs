@@ -106,20 +106,30 @@ impl RankPlan {
     }
 }
 
-pub(crate) fn prepare(snapshot: &Path, catalog: &OfficialV41Catalog,
-    assignments: &[cuteafd_loader::placement::SparkAssignment], offers: &[Offer]) -> Result<PushGroup> {
-    ensure!(!offers.is_empty() && offers.len() == assignments.len(), "native push offer world differs from admission");
-    let (root, _) = cuteafd_loader::push_load::namespace(snapshot)?;
+fn checked_plan(root: &Path, catalog: &OfficialV41Catalog,
+    assignments: &[cuteafd_loader::placement::SparkAssignment], offers: &[Offer],
+    coordinator: Option<&super::push_exl3::CoordinatorRanks>) -> Result<CheckedPlan> {
+    let sparks = assignments.len();
+    ensure!(sparks > 0 && offers.len() == sparks + coordinator.map_or(0, |c| c.ranks),
+        "native push offer world differs from admission");
     let mut plans = Vec::new();
-    for (rank, (offer, assignment)) in offers.iter().zip(assignments).enumerate() {
+    for (rank, (offer, assignment)) in offers[..sparks].iter().zip(assignments).enumerate() {
         let slices = offer.placement.iter().map(|p| p.slice.clone()).collect::<Vec<_>>();
-        let plan = RankPlan::new(catalog, &slices, offers.len(), rank, usize::try_from(assignment.resident_bytes)?)?;
+        let plan = RankPlan::new(catalog, &slices, sparks, rank, usize::try_from(assignment.resident_bytes)?)?;
         super::push_exl3::validate_offer(offer, rank, assignment, &plan.placement, plan.layout.logical_bytes() as u64)?;
         plans.push(plan);
     }
-    let mut builder = Builder::new(&root, offers.iter().map(|o| o.arena_bytes).collect());
-    for (rank, plan) in plans.iter().enumerate() { plan.append(&mut builder, catalog, offers.len(), rank)?; }
-    let checked = builder.finish()?;
+    let mut builder = Builder::new(root, offers.iter().map(|o| o.arena_bytes).collect());
+    for (rank, plan) in plans.iter().enumerate() { plan.append(&mut builder, catalog, sparks, rank)?; }
+    if let Some(coordinator) = coordinator { (coordinator.append)(&mut builder, catalog, &offers[sparks..])?; }
+    Ok(builder.finish()?)
+}
+
+pub(crate) fn prepare(snapshot: &Path, catalog: &OfficialV41Catalog,
+    assignments: &[cuteafd_loader::placement::SparkAssignment], offers: &[Offer],
+    coordinator: Option<&super::push_exl3::CoordinatorRanks>) -> Result<PushGroup> {
+    let (root, _) = cuteafd_loader::push_load::namespace(snapshot)?;
+    let checked = checked_plan(&root, catalog, assignments, offers, coordinator)?;
     ensure!(checked.plan.files.iter().all(|file| cuteafd_loader::push_load::is_push_shard(&root.join(file))),
         "native push source is not a SparkNest shard");
     let ranks = offers.iter().map(|o| Ok(cuteafd_loader::push_load::proto::RankSpec {

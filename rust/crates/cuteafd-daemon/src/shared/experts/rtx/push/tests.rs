@@ -350,15 +350,33 @@ fn dense_planning_error_sends_the_whole_group_to_mount() -> Result<()> {
         if path.extension().is_some_and(|e| e == "safetensors") { mark(&path, c"user.sparknest.hosts", b"[]")?; }
     }
     let catalog = cuteafd_loader::read_expert_catalog(root.path())?;
+    dense_error_mount_group(&library, root.path(), &catalog, true)?;
+    // Non-EXL3 groups carry dense-only coordinator ranks, not EXL3 TP2 halves.
+    let root = tempfile::tempdir_in(fixture.directory())?;
+    let catalog = crate::shared::memory::push_fp8::tests::fixture(root.path(),
+        cuteafd_loader::formats::fp8_experts::ExpertFormat::Fp8, false)?;
+    mark(root.path(), c"user.sparknest.cluster", br#"{"me":"coordinator"}"#)?;
+    dense_error_mount_group(&library, root.path(), &catalog, false)?;
+    let root = tempfile::tempdir_in(fixture.directory())?;
+    cuteafd_loader::plan::testing::exlr8::fixture(root.path(), false);
+    // Dense-only ranks do not inspect the expert catalog; the EXLR8 snapshot
+    // still uses exactly the same whole-group decline transaction.
+    mark(root.path(), c"user.sparknest.cluster", br#"{"me":"coordinator"}"#)?;
+    dense_error_mount_group(&library, root.path(), &catalog, false)?;
+    Ok(())
+}
+
+fn dense_error_mount_group(library: &cuteafd_ffi::NativeLibrary, root: &std::path::Path,
+    catalog: &OfficialV41Catalog, tp2: bool) -> Result<()> {
     let sparks = 1;
-    for gpu in 0..2 {
-        let plan = Tp2ExpertPlan::new(&catalog, &[0, 1], gpu, usize::MAX)?;
-        let checked = plan.checked(&catalog, root.path(), sparks + 2, sparks + gpu)?;
-        assert!(checked.plan.files.iter().all(|f| cuteafd_loader::push_load::is_push_shard(&root.path().join(f))),
+    if tp2 { for gpu in 0..2 {
+        let plan = Tp2ExpertPlan::new(catalog, &[0, 1], gpu, usize::MAX)?;
+        let checked = plan.checked(catalog, root, sparks + 2, sparks + gpu)?;
+        assert!(checked.plan.files.iter().all(|f| cuteafd_loader::push_load::is_push_shard(&root.join(f))),
             "without the dense error the TP2 halves would be offered");
-    }
-    let (push, coordinator_streams, _) = CoordinatorPush::prepare(root.path(), Some(&catalog), 2,
-        Some((&[0, 1], vec![usize::MAX; 2])))?;
+    } }
+    let (push, coordinator_streams, _) = CoordinatorPush::prepare(root, Some(catalog), 2,
+        tp2.then_some((&[0, 1][..], vec![usize::MAX; 2])))?;
     // One Spark rank offering push, then the two coordinator ranks, in group order.
     let (mut spark_driver, mut spark) = control_pair()?;
     let spark_thread = std::thread::spawn(move || cuteafd_transport::worker_selection::push::offer(&mut spark,
@@ -375,9 +393,9 @@ fn dense_planning_error_sends_the_whole_group_to_mount() -> Result<()> {
         drop(spark_driver.shutdown(std::net::Shutdown::Both));
         Ok(prepared)
     });
-    let devices = [Device { library: &library, id: 0 }, Device { library: &library, id: 1 }];
+    let devices = [Device { library: library, id: 0 }, Device { library: library, id: 1 }];
     let dense: Option<Result<(Vec<DensePlan>, Vec<NoDense>)>> = Some(Err(anyhow::anyhow!("injected dense planning error")));
-    let (pushed, ()) = push.receive_with(devices.to_vec(), Some(&catalog), sparks, dense, || ());
+    let (pushed, ()) = push.receive_with(devices.to_vec(), Some(catalog), sparks, dense, || ());
     assert!(pushed?.is_none(), "a declined dense plan must fall back to mount");
     assert!(!driver.join().map_err(|_| anyhow::anyhow!("driver panicked"))??, "the group driver must not prepare a group");
     assert_eq!(spark_thread.join().map_err(|_| anyhow::anyhow!("spark panicked"))??, None,

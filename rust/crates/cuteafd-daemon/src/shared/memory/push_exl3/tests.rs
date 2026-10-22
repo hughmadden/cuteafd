@@ -199,3 +199,61 @@ fn installed_exl3_tp6_prepare_serial_parallel_equivalence_and_timing() -> Result
     }
     Ok(())
 }
+
+/// Exercise each production group builder with and without a coordinator suffix.
+pub(crate) fn coordinator_suffix(
+    root: &Path, catalog: &OfficialV41Catalog,
+    plans: &[(u64, Vec<Placement>, CheckedPlan)],
+    build: impl Fn(&[cuteafd_loader::placement::SparkAssignment], &[Offer], Option<&CoordinatorRanks>) -> Result<CheckedPlan>,
+) -> Result<()> {
+    use cuteafd_loader::push_load::builder::Source;
+    use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
+    let sparks = plans.len();
+    let assignments = plans.iter().enumerate().map(|(rank, (resident, placement, _))|
+        cuteafd_loader::placement::SparkAssignment { rank: rank as u32, resident_bytes: *resident,
+            slices: placement.iter().map(|p| p.slice.clone()).collect(), io: Default::default() }).collect::<Vec<_>>();
+    let mut offers = plans.iter().enumerate().map(|(rank, (_, placement, checked))| Offer {
+        rank, host: format!("spark-{rank}"), arena_bytes: checked.arenas[rank], placement: placement.clone(),
+    }).collect::<Vec<_>>();
+    let plain = build(&assignments, &offers, None)?;
+    // Compare the complete Spark group with independently checked rank plans.
+    let records = |checked: &CheckedPlan, rank: usize| checked.plan.entries.iter()
+        .filter(|e| e.rank as usize == rank).map(|e| serde_json::to_vec(&(
+            &checked.plan.files[e.file as usize], &checked.plan.patterns[e.pattern as usize],
+            e.src_base, e.dst_base, e.rank))).collect::<std::result::Result<Vec<_>, _>>();
+    for (rank, (_, _, checked)) in plans.iter().enumerate() {
+        assert_eq!(records(&plain, rank)?, records(checked, rank)?);
+    }
+    let source = root.join("coordinator.bin");
+    std::fs::write(&source, [17u8; 16])?;
+    for gpu in 0..2 {
+        offers.push(Offer { rank: sparks + gpu, host: "coordinator".into(), arena_bytes: 16, placement: vec![] });
+    }
+    let suffix = offers[sparks..].to_vec();
+    let snapshot = catalog.snapshot().to_path_buf();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let appended = calls.clone();
+    let coordinator = CoordinatorRanks { ranks: 2, append: Box::new(move |builder, seen_catalog, offers| {
+        assert_eq!(seen_catalog.snapshot(), snapshot);
+        assert_eq!(serde_json::to_vec(offers)?, serde_json::to_vec(&suffix)?);
+        appended.fetch_add(1, Ordering::SeqCst);
+        for offer in offers {
+            builder.contiguous(&Source { path: source.clone(), offset: 0, bytes: 16 }, 0, 16,
+                Destination { rank: offer.rank as u32, offset: 0, bytes: 16 })?;
+        }
+        Ok(())
+    }) };
+    let joined = build(&assignments, &offers, Some(&coordinator))?;
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    let n = plain.plan.entries.len();
+    assert_eq!(&joined.plan.entries[..n], plain.plan.entries);
+    assert_eq!(&joined.plan.patterns[..plain.plan.patterns.len()], plain.plan.patterns);
+    assert_eq!(&joined.plan.files[..plain.plan.files.len()], plain.plan.files);
+    assert_eq!(&joined.arenas[..sparks], plain.arenas);
+    assert_eq!(joined.plan.entries[n..].iter().map(|e| e.rank).collect::<Vec<_>>(),
+        [sparks as u32, sparks as u32 + 1]);
+    assert!(build(&assignments, &offers, None).is_err(), "unclaimed suffix rejected");
+    assert!(build(&assignments, &offers[..sparks + 1], Some(&coordinator)).is_err(), "missing suffix rejected");
+    assert_eq!(calls.load(Ordering::SeqCst), 1, "bad worlds fail before append");
+    Ok(())
+}
