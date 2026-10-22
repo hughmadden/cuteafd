@@ -250,6 +250,47 @@ def test_prelaunch_foreign_container_refused(entry, tmp_path, monkeypatch):
         cards.assert_absent(job)
 
 
+def test_container_absence_is_checked_at_grant_not_before_queuing(entry, tmp_path, monkeypatch):
+    # A job may queue behind a running task that still holds a container of the same
+    # name; refusing it up front wastes the queue slot. Absence is rechecked once
+    # smoke holds the card's locks (the prelaunch hook).
+    job = make(entry, tmp_path)
+    arm = dict(instance='test-base', slot='s')
+    sealed = json.dumps(dict(slot='s', seal_sha256='h', artifact_manifest_sha256='a'))
+    monkeypatch.setattr(cards, 'slot_check', lambda arm, host: sealed)
+    artifacts = cards.preflight_job(job, arm)
+    assert artifacts['raptor'] == dict(slot='s', seal_sha256='h', artifact_manifest_sha256='a')
+    name = 'cuteafd-coordinator-' + job['entry']['set']['INSTANCE']
+    monkeypatch.setattr(cards, 'run', lambda cmd: SimpleNamespace(stdout=name + '\n'))
+    with pytest.raises(ValueError, match='existing .*container'):
+        cards.preflight_at_grant(job, arm)
+
+
+def test_binary_defaults_to_the_arms_sealed_slot_binary(tmp_path, monkeypatch):
+    monkeypatch.setattr(Path, 'home', lambda: tmp_path / 'home')
+    arm = dict(instance='test-base', slot='s')
+    monkeypatch.setattr(cards.shutil, 'which', lambda name: None)
+    with pytest.raises(ValueError, match='not on PATH'):
+        cards.resolve_binary(None, arm)
+    binary = tmp_path / 'home/.cache/cuteafd/builds/wip-test-base/slots/s/coordinator/workspace/.cuteafd-wip/cuteafd'
+    binary.parent.mkdir(parents=True)
+    binary.write_text('#!/bin/sh\n')
+    assert cards.resolve_binary(None, arm) == str(binary)
+    # An externally reused slot names its own instance for the same default.
+    assert cards.resolve_binary(None, dict(arm, wip_instance='test-base')) == str(binary)
+    monkeypatch.setattr(cards.shutil, 'which', lambda name: '/opt/bin/cuteafd')
+    assert cards.resolve_binary(None, arm) == '/opt/bin/cuteafd'
+    assert cards.resolve_binary('/built/cuteafd', arm) == '/built/cuteafd'
+    monkeypatch.setattr(cards.shutil, 'which', lambda name: None)
+    assert cards.resolve_binary(None, arm, dry=True) == 'cuteafd'
+    with pytest.raises(ValueError, match='neither a file nor on PATH'):
+        cards.resolve_binary('/no/such/cuteafd', arm)
+    with pytest.raises(ValueError, match='release arm'):
+        cards.resolve_binary(None, dict(instance='i', slot='s', release='v3.0.0'))
+    with pytest.raises(ValueError, match='sealed slot has no binary'):
+        cards.resolve_binary(None, dict(instance='unbuilt', slot='s'))
+
+
 def test_slot_check_every_host_and_seal(monkeypatch):
     calls = []
     monkeypatch.setattr(cards, 'run', lambda cmd: calls.append(cmd) or SimpleNamespace(stdout='{}'))
@@ -805,7 +846,8 @@ def test_runtime_seed_is_explicit_only(entry, tmp_path, monkeypatch, seed):
     kit.mkdir()
     (kit / 'matrix-main.json').write_text(json.dumps(dict(entries=[entry])))
     state = tmp_path / 'state'
-    args = ['wip-cards', '--kit', str(kit), '--cards', 'v41-min', '--matrix', '--arm', 'base=b:s', '--state', str(state)]
+    args = ['wip-cards', '--kit', str(kit), '--cards', 'v41-min', '--matrix', '--arm', 'base=b:s', '--state', str(state),
+            '--binary', sys.executable]
     if seed is not None:
         args += ['--nonce-seed', seed]
     monkeypatch.setattr(sys, 'argv', args)
@@ -869,7 +911,7 @@ def test_release_arm_uses_same_launcher_without_wip(entry, tmp_path, monkeypatch
     argv = ['wip-cards', '--kit', str(kit), '--cards', 'v41-min', '--interleave',
             '--repeats', '1', '--arm', 'candidate=v3s1a-c:s',
             '--arm-release', 'release=v3s1a-release:v2.0.0', '--state', str(state),
-            '--repo', '/same-candidate-launcher']
+            '--repo', '/same-candidate-launcher', '--binary', sys.executable]
     if dry:
         argv.append('--dry-run')
     monkeypatch.setattr(sys, 'argv', argv)
@@ -1187,7 +1229,10 @@ def _fake_slot(packages=(), audio=True):
 
 def _run_main(monkeypatch, argv, slot=None, rc_for=lambda job: 0, results=None):
     """Runs main() with hardware stubbed: no containers, a sealed slot, and a
-    smoke 'process' that writes an exit code and (optionally) a result."""
+    smoke 'process' that writes an exit code and (optionally) a result. The binary
+    must exist (it never runs); the sealed-slot default needs a built slot."""
+    if '--binary' not in argv:
+        argv = [*argv, '--binary', sys.executable]
     monkeypatch.setattr(sys, 'argv', ['wip-cards', *argv])
     monkeypatch.setattr(cards, 'assert_absent', lambda job: None)
     monkeypatch.setattr(cards, 'slot_check', slot or _fake_slot())
@@ -1796,6 +1841,34 @@ def test_build_arms_serve_through_their_own_source_checkout(entry, tmp_path, mon
         assert plan['arms'][arm]['repo'] == wanted
         assert next(j for j in plan['jobs'] if j['arm'] == arm)['launcher']['repo'] == wanted
     assert not any('/global' in line for line in smoke)
+
+
+def test_coordinator_only_build_claims_its_root_before_any_build_work(tmp_path, monkeypatch):
+    # A 0-Spark (coordinator-only) export claims the WIP root on raptor before the
+    # source checkout runs, so a failed or interrupted build still leaves a root
+    # this task owns and a later --resume never has to adopt an unowned one.
+    home = tmp_path / 'home'
+    monkeypatch.setattr(Path, 'home', lambda: home)
+    config = tmp_path / 'zero.config'
+    config.write_text('MODEL_ID=test/model\nSPARK_COUNT=0\n')
+    card = dict(name='zero', family='glm5', config=str(config), sparks=[], set={})
+    root = home / '.cache/cuteafd/builds/wip-test-base'
+    marker = root / '.wip-card-owner.json'
+    revision = subprocess.run(['git', '-C', str(ROOT), 'rev-parse', 'HEAD'], capture_output=True, text=True, check=True).stdout.strip()
+    real = subprocess.run
+    seen = []
+    def run(cmd, **kwargs):
+        if not isinstance(cmd, list) or cmd[0] == 'git':
+            return real(cmd, **kwargs)
+        if '-c' in cmd:  # the owner marker writes under the redirected home
+            return real(cmd, **kwargs, env={**os.environ, 'HOME': str(home)})
+        seen.append((Path(str(cmd[0])).name, marker.is_file()))
+        return subprocess.CompletedProcess(cmd, 0, '' if kwargs.get('text') else b'', '')
+    monkeypatch.setattr(cards.subprocess, 'run', run)
+    cards.build_arms({'base': revision}, cards.arms_from(['base=test-base:s']), [card], tmp_path, 'task', False)
+    assert seen, 'build_arms ran no build command'
+    assert all(claimed for _name, claimed in seen), seen
+    assert json.loads(marker.read_text()) == dict(task='task', instance='test-base')
 
 
 def test_arm_repo_overrides_arm_wip_and_unmapped_arm_falls_back_to_repo(entry, tmp_path, monkeypatch, capsys):
