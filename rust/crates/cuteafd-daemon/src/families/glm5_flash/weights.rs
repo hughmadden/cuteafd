@@ -681,13 +681,15 @@ impl<'a> GlmfLoader<'a> {
         ops.insert("w_uk", uk);
         ops.insert("w_uv", uv);
         let block = super::fp8::Layout::Block;
-        let (q, s) = self.fp8(&[a("q_a_proj.weight"), a("kv_a_proj_with_mqa.weight")], block)?;
+        let projections: Vec<_> = cuteafd_loader::families::glm5_flash::core_fp8_projections("mla")
+            .iter().map(|name| a(name)).collect();
+        let (q, s) = self.fp8(&projections[..2], block)?;
         ops.insert("w_qkv_a_fp8", q);
         ops.insert("w_qkv_a_scale", s);
-        let (q, s) = self.fp8(&[a("q_b_proj.weight")], block)?;
+        let (q, s) = self.fp8(&projections[2..3], block)?;
         ops.insert("w_q_b_fp8", q);
         ops.insert("w_q_b_scale", s);
-        let (q, s) = self.fp8(&[a("o_proj.weight")], block)?;
+        let (q, s) = self.fp8(&projections[3..4], block)?;
         ops.insert("w_o_fp8", q);
         ops.insert("w_o_scale", s);
         let i = |name: &str| a(&format!("indexer.{name}"));
@@ -771,10 +773,12 @@ impl<'a> GlmfLoader<'a> {
         let mlp = if dense { format!("{p}.mlp") } else { format!("{p}.mlp.shared_experts") };
         if !(dense && self.nvfp4_dense(cfg, &mlp, &mut ops)?) {
             let block = super::fp8::Layout::Block;
-            let (q, s) = self.fp8(&[format!("{mlp}.gate_proj.weight"), format!("{mlp}.up_proj.weight")], block)?;
+            let projections: Vec<_> = cuteafd_loader::families::glm5_flash::core_fp8_projections("mlp")
+                .iter().map(|name| format!("{mlp}.{name}")).collect();
+            let (q, s) = self.fp8(&projections[..2], block)?;
             ops.insert("w_gate_up_fp8", q);
             ops.insert("w_gate_up_scale", s);
-            let (q, s) = self.fp8(&[format!("{mlp}.down_proj.weight")], block)?;
+            let (q, s) = self.fp8(&projections[2..3], block)?;
             ops.insert("w_down_fp8", q);
             ops.insert("w_down_scale", s);
         }
@@ -1150,15 +1154,16 @@ impl<'a> GlmfLoader<'a> {
                 let (uk, uv): (Vec<_>, Vec<_>) = self.absorbed(cfg, &a("kv_b_proj.weight"), ranks)?.into_iter().unzip();
                 put(&mut ops, "w_uk", uk);
                 put(&mut ops, "w_uv", uv);
-                let qkv_a = [a("q_a_proj.weight"), a("kv_a_proj_with_mqa.weight")];
-                let (q, s): (Vec<_>, Vec<_>) = self.on_every_rank_pair(|r| self.fp8_on(r, &qkv_a,
+                let projections: Vec<_> = cuteafd_loader::families::glm5_flash::core_fp8_projections("mla")
+                    .iter().map(|name| a(name)).collect();
+                let (q, s): (Vec<_>, Vec<_>) = self.on_every_rank_pair(|r| self.fp8_on(r, &projections[..2],
                     super::fp8::Layout::Block))?.into_iter().unzip();
                 put(&mut ops, "w_qkv_a_fp8", q);
                 put(&mut ops, "w_qkv_a_scale", s);
-                let (q, s): (Vec<_>, Vec<_>) = self.fp8_split(&[a("q_b_proj.weight")], Axis::Rows, ranks)?.into_iter().unzip();
+                let (q, s): (Vec<_>, Vec<_>) = self.fp8_split(&projections[2..3], Axis::Rows, ranks)?.into_iter().unzip();
                 put(&mut ops, "w_q_b_fp8", q);
                 put(&mut ops, "w_q_b_scale", s);
-                let (q, s): (Vec<_>, Vec<_>) = self.fp8_split(&[a("o_proj.weight")], Axis::Cols, ranks)?.into_iter().unzip();
+                let (q, s): (Vec<_>, Vec<_>) = self.fp8_split(&projections[3..4], Axis::Cols, ranks)?.into_iter().unzip();
                 put(&mut ops, "w_o_fp8", q);
                 put(&mut ops, "w_o_scale", s);
                 let i = |name: &str| a(&format!("indexer.{name}"));
@@ -1173,11 +1178,12 @@ impl<'a> GlmfLoader<'a> {
         let mlp = if dense { format!("{p}.mlp") } else { format!("{p}.mlp.shared_experts") };
         // A ModelOpt NVFP4 dense MLP runs whole on rank 0 (rank 1 adds a zero partial).
         if !(dense && self.nvfp4_dense(cfg, &mlp, &mut ops[0])?) {
-            let (q, s): (Vec<_>, Vec<_>) = self.fp8_split(&[format!("{mlp}.gate_proj.weight"),
-                format!("{mlp}.up_proj.weight")], Axis::Rows, ranks)?.into_iter().unzip();
+            let projections: Vec<_> = cuteafd_loader::families::glm5_flash::core_fp8_projections("mlp")
+                .iter().map(|name| format!("{mlp}.{name}")).collect();
+            let (q, s): (Vec<_>, Vec<_>) = self.fp8_split(&projections[..2], Axis::Rows, ranks)?.into_iter().unzip();
             put(&mut ops, "w_gate_up_fp8", q);
             put(&mut ops, "w_gate_up_scale", s);
-            let (q, s): (Vec<_>, Vec<_>) = self.fp8_split(&[format!("{mlp}.down_proj.weight")], Axis::Cols, ranks)?
+            let (q, s): (Vec<_>, Vec<_>) = self.fp8_split(&projections[2..3], Axis::Cols, ranks)?
                 .into_iter().unzip();
             put(&mut ops, "w_down_fp8", q);
             put(&mut ops, "w_down_scale", s);
