@@ -86,6 +86,10 @@ __global__ void widen_kernel(const uint16_t* src, uint32_t* dst, int64_t n) {
   for (int64_t i = int64_t(blockIdx.x) * blockDim.x + threadIdx.x; i < n; i += int64_t(gridDim.x) * blockDim.x)
     dst[i] = lq::widen_bf16(src[i]);
 }
+__global__ void narrow_kernel(const uint32_t* src, uint16_t* dst, int64_t n) {
+  for (int64_t i = int64_t(blockIdx.x) * blockDim.x + threadIdx.x; i < n; i += int64_t(gridDim.x) * blockDim.x)
+    dst[i] = lq::narrow_f32(src[i]);
+}
 __global__ void absorb_kernel(const uint16_t* kv_b, uint16_t* uk, uint16_t* uv, int64_t h0, int64_t heads,
                               int64_t nope, int64_t v, int64_t lat) {
   const int64_t nk = heads * lat * nope, nv = heads * v * lat;
@@ -107,6 +111,14 @@ extern "C" int32_t cuteafd_load_widen_bf16_f32(const void* src, void* dst, int64
   if (n < 1) return cudaErrorInvalidValue;
   widen_kernel<<<grid_for(n), 256, 0, static_cast<cudaStream_t>(stream)>>>(
       static_cast<const uint16_t*>(src), static_cast<uint32_t*>(dst), n);
+  return cudaGetLastError();
+}
+
+// F32 -> BF16 (round to nearest even) of n values (see fp8_load_quant.h).
+extern "C" int32_t cuteafd_load_narrow_f32_bf16(const void* src, void* dst, int64_t n, void* stream) {
+  if (n < 1) return cudaErrorInvalidValue;
+  narrow_kernel<<<grid_for(n), 256, 0, static_cast<cudaStream_t>(stream)>>>(
+      static_cast<const uint32_t*>(src), static_cast<uint16_t*>(dst), n);
   return cudaGetLastError();
 }
 

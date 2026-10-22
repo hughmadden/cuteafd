@@ -45,8 +45,8 @@ pub(super) fn load<'a>(library: &'a NativeLibrary, catalog: &OfficialV41Catalog,
             host_scratch_bytes = plan.host_scratch, load_peak_bytes = peak, "Spark native planes push admitted");
         Ok((plan, checked, offer, selections, budgets))
     })();
-    if let Err(error) = &planned { tracing::info!(%error, "Spark native planes push unavailable; offering mount"); }
-    let credentials = push::offer(stream, planned.as_ref().ok().map(|(_, _, offer, _, _)| offer.clone()))?;
+    if let Err(error) = &planned { tracing::warn!(%error, "Spark native planes push unavailable; offering mount"); }
+    let credentials = push::offer_with(stream, planned.as_ref().map(|(_, _, offer, _, _)| offer.clone()).map_err(|error| format!("{error:#}")))?;
     let Some((group, token)) = credentials else { return Ok(None); };
     let (plan, checked, _, selections, budgets) = planned?;
     receive(library, plan, &checked, &selections, &budgets, config.rank, &PushClient::default(), stream, group, token)
@@ -75,7 +75,7 @@ fn receive<'a>(library: &'a NativeLibrary, plan: RankPlan,
             slot_bytes: u32::try_from(ring.slot_bytes())? })?;
         Ok((arena, ring, rank))
     })();
-    push::joined(stream, joined.is_ok())?;
+    push::joined_with(stream, joined.as_ref().map(|_| ()).map_err(|error| format!("{error:#}")))?;
     let candidate = joined.and_then(|(arena, ring, rank)| {
         let delivered = push_consumer::consume(device, arena, ring, rank, DEFAULT_SLOTS)?;
         let initializers = plan.layers.iter().enumerate().map(|(region, layer)|
@@ -90,9 +90,9 @@ fn receive<'a>(library: &'a NativeLibrary, plan: RankPlan,
             .collect::<Result<Vec<_>>>()
     });
     if let Err(error) = &candidate {
-        tracing::info!(group, rank = rank_id, %error, "Spark native planes push candidate rejected");
+        tracing::warn!(group, rank = rank_id, %error, "Spark native planes push candidate rejected");
     }
-    if push::completed(stream, candidate.is_ok())? {
+    if push::completed_with(stream, candidate.as_ref().map(|_| ()).map_err(|error| format!("{error:#}")))? {
         let weights = candidate?;
         tracing::info!(group, rank = rank_id, layers = weights.len(),
             "Spark native planes push committed; publishing ready rank arena");

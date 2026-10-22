@@ -226,7 +226,7 @@ mod tests {
     fn real_exl3_and_fp8_headers_match_rc3_uploaded_operands() {
         let home = std::env::var_os("HF_HOME").map(std::path::PathBuf::from)
             .unwrap_or_else(|| "/mnt/sparknest/hf-home".into());
-        for model in ["wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K3.25-v1", "zai-org/GLM-5.3-Flash"] {
+        for model in ["wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K3.25-Core-FP8", "zai-org/GLM-5.3-Flash"] {
             let Ok(resolved) = crate::resolve_snapshot_at_revision(model, Some(&home), None) else { continue };
             let Some(path) = resolved.snapshot_path else { continue };
             let checkpoint = Checkpoint::open(&path).unwrap();

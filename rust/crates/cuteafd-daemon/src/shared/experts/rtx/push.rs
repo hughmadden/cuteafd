@@ -165,7 +165,7 @@ pub(crate) fn receive_rank<'a, D: PushDestination<Delivered = ()>>(
         Ok((arena, ring, joined))
     });
     if let Err(error) = &joined { tracing::info!(group, rank, %error, "coordinator push rank join failed"); }
-    push::joined(stream, joined.is_ok()).context("coordinator push joined frame")?;
+    push::joined_with(stream, joined.as_ref().map(|_| ()).map_err(|error| format!("{error:#}"))).context("coordinator push joined frame")?;
     let candidate = joined.and_then(|(arena, ring, joined)| {
         let delivered = match (arena, dense) {
             (Some(arena), Some(DenseRank { destination, base })) =>
@@ -201,8 +201,8 @@ pub(crate) fn receive_rank<'a, D: PushDestination<Delivered = ()>>(
             crate::shared::experts::exl3::Exl3Weights::from_push(ready.clone(), region, layout, budget)
         }).collect::<Result<Vec<_>>>().map(PushedTp2::Exl3)
     });
-    if let Err(error) = &candidate { tracing::info!(group, rank, %error, "coordinator push candidate rejected"); }
-    if push::completed(stream, candidate.is_ok()).context("coordinator push completion")? {
+    if let Err(error) = &candidate { tracing::warn!(group, rank, %error, "coordinator push candidate rejected"); }
+    if push::completed_with(stream, candidate.as_ref().map(|_| ()).map_err(|error| format!("{error:#}"))).context("coordinator push completion")? {
         let weights = candidate?;
         tracing::info!(group, rank, layers = weights.len(), "coordinator push committed; publishing ready rank arena");
         return Ok(Some(weights));
@@ -210,7 +210,7 @@ pub(crate) fn receive_rank<'a, D: PushDestination<Delivered = ()>>(
     drop(candidate);
     ensure!(!library.is_quarantined_after_failed_drain(), "failed push drain prevents safe mount retry");
     push::drained(stream).context("coordinator push drained barrier")?;
-    tracing::info!(group, rank, "whole push group discarded; coordinator loads through mount");
+    tracing::warn!(group, rank, "whole push group discarded; coordinator loads through mount");
     Ok(None)
 }
 
@@ -350,12 +350,13 @@ impl CoordinatorPush {
                     "coordinator push source is not a SparkNest shard");
                 Ok(Some(checked))
             })();
-            if let Err(error) = &planned { tracing::info!(gpu, %error, "coordinator push unavailable; offering mount"); }
+            if let Err(error) = &planned { tracing::warn!(gpu, %error, "coordinator push unavailable; offering mount"); }
             let tp2_bytes = tp2.as_ref().map_or(0, |p| p.logical_bytes());
             let (host_base, arena_bytes) = rank_bytes(base, tp2_bytes, host);
-            let offer = planned.as_ref().ok().map(|_| cuteafd_transport::worker_selection::push::Offer {
-                rank, host: namespace_host.clone(), arena_bytes, placement: Vec::new() });
-            let credentials = cuteafd_transport::worker_selection::push::offer(&mut stream, offer)?;
+            let offer = planned.as_ref().map(|_| cuteafd_transport::worker_selection::push::Offer {
+                rank, host: namespace_host.clone(), arena_bytes, placement: Vec::new() })
+                .map_err(|error| format!("{error:#}"));
+            let credentials = cuteafd_transport::worker_selection::push::offer_with(&mut stream, offer)?;
             let Some(credentials) = credentials else { return Ok(None) };
             let checked = planned?;
             let tp2 = match (tp2, checked.as_ref()) {

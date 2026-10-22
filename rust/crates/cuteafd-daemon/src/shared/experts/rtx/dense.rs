@@ -238,7 +238,7 @@ impl PushDestination for DenseArena<'_> {
         let (staging, delivered) = self.open.get_mut(&index).context("open step")?;
         staging.bytes_mut()[at..at + bytes.len()].copy_from_slice(bytes);
         *delivered += length;
-        self.coverage.insert(offset, length)?;
+        self.expected.record(&mut self.coverage, offset, length)?;
         if *delivered == need as u64 {
             let (staging, _) = self.open.remove(&index).context("complete step")?;
             let (library, stream, step) = (self.device.library, self.stream, &self.layout.steps[index].1);
@@ -253,7 +253,7 @@ impl PushDestination for DenseArena<'_> {
     fn copied(&mut self, offset: u64, bytes: u64) -> Result<()> {
         ensure!(offset + bytes <= self.layout.base && self.expected.contains(offset, bytes),
             "completed fragment is outside checked plan footprint");
-        self.coverage.insert(offset, bytes)
+        self.expected.record(&mut self.coverage, offset, bytes)
     }
     fn done(self) -> Result<()> {
         ensure!(self.expected.complete(&self.coverage), "rank Done before all planned operand bytes completed");
