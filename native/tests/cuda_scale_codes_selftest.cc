@@ -261,6 +261,7 @@ int main(int argc, char** argv) {
     for (int stage = 0; stage < 3; ++stage)
       real_expert(snapshot, index, "mtp." + std::to_string(stage) + ".ffn.experts.0");
     std::puts("scale codes selftest: PASS");
+    std::puts("test result: ok. 1 passed; 0 failed");
     return 0;
   } catch (const std::exception& error) {
     std::fprintf(stderr, "scale codes selftest: FAIL: %s\n", error.what());
