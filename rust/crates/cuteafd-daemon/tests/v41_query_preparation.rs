@@ -21,6 +21,15 @@ mod shared {
     pub(crate) mod experts {
         pub(crate) mod rtx {
             pub(crate) mod dense;
+            // The query fixture has no push receiver, only dense plan records.
+            pub(crate) mod push {
+                pub(crate) struct DensePlan {
+                    pub base: u64,
+                    pub host_bytes: u64,
+                    pub append: Box<dyn Fn(&mut cuteafd_loader::push_load::builder::Builder,
+                        u32, u64) -> anyhow::Result<()> + Send>,
+                }
+            }
         }
     }
 }
