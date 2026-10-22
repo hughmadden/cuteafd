@@ -1779,6 +1779,60 @@ fn opened_copy(engine: &engine::MimoEngine<'_>, out: &mut [u8], source: cuteafd_
     engine.library.copy_d2h(out, source)
 }
 
+fn resume_mtp_check(engine: &engine::MimoEngine<'_>, tokens: &[u32], at: usize,
+    original: &engine::MimoPlacement, restored: &engine::MimoPlacement) -> Result<()> {
+    let Some(mtp) = &engine.mtp else { return Ok(()) };
+    let stages = mtp.stages.len();
+    let read_rows = |buffer: cuteafd_ffi::CuteafdDeviceBuffer, ring: usize, row: usize,
+        from: usize, to: usize| -> Result<Vec<u8>> {
+        ensure!(from <= to && to - from <= engine::RING_ROWS, "MTP comparison exceeds retained ring rows");
+        let mut bytes = Vec::with_capacity((to - from) * row);
+        let mut position = from;
+        while position < to {
+            let rows = (to - position).min(engine::RING_ROWS - position % engine::RING_ROWS);
+            let offset = (ring * engine::RING_ROWS + position % engine::RING_ROWS) * row;
+            let size = rows * row;
+            ensure!(offset + size <= buffer.bytes, "MTP comparison outside its allocation");
+            let start = bytes.len();
+            bytes.resize(start + size, 0);
+            opened_copy(engine, &mut bytes[start..], cuteafd_ffi::CuteafdDeviceBuffer {
+                ptr: buffer.ptr.cast::<u8>().wrapping_add(offset).cast(), bytes: size, ..buffer })?;
+            position += rows;
+        }
+        Ok(bytes)
+    };
+    let hidden_from = at.saturating_sub(engine.cfg.window + stages + 1);
+    let hidden_a = read_rows(mtp.hidden.buffer, original.ring as usize, engine.cfg.hidden * 2, hidden_from, at)?;
+    let hidden_b = read_rows(mtp.hidden.buffer, restored.ring as usize, engine.cfg.hidden * 2, hidden_from, at)?;
+    ensure!(hidden_a == hidden_b, "restored MTP BF16 hidden history differs before catch-up at {at}");
+    let mut hidden_before = vec![0; mtp.hidden.buffer.bytes];
+    opened_copy(engine, &mut hidden_before, mtp.hidden.buffer)?;
+    let mut drafts = Vec::new();
+    for placement in [original, restored] {
+        engine.mtp_reset(placement.ring as usize, at);
+        drafts.push(engine.mtp_draft(&[mtp::MtpSeq { ring: placement.ring as usize,
+            len: at, tokens: &tokens[..=at], media: None }], stages)?);
+    }
+    ensure!(drafts[0] == drafts[1], "restored MTP draft IDs differ at {at}: {:?} vs {:?}", drafts[0], drafts[1]);
+    let row = engine.cfg.record_bytes(
+        cuteafd_loader::families::mimo_v2::MimoAttention::Sliding, engine.kv_cache());
+    let mut compared = 0;
+    for (stage, state) in mtp.stages.iter().enumerate() {
+        // Only true-token rows are committed; later rows contain speculative inputs.
+        let end = at.saturating_sub(stage);
+        let from = hidden_from.max(end.saturating_sub(engine.cfg.window));
+        let a = read_rows(state.ring.buffer, original.ring as usize, row, from, end)?;
+        let b = read_rows(state.ring.buffer, restored.ring as usize, row, from, end)?;
+        ensure!(a == b, "restored MTP stage {stage} committed record bytes differ at {at}");
+        compared += a.len();
+    }
+    let mut hidden_after = vec![0; hidden_before.len()];
+    opened_copy(engine, &mut hidden_after, mtp.hidden.buffer)?;
+    ensure!(hidden_before == hidden_after, "MTP catch-up changed BF16 hidden history at {at}");
+    println!("resume MTP at {at}: {stages} stages | draft IDs identical | committed records identical ({compared} B) | BF16 hidden history unchanged");
+    Ok(())
+}
+
 fn resume_check(args: &GoldenArgs, engine: &engine::MimoEngine<'_>, tokens: &[u32], at: usize)
     -> Result<()> {
     use cuteafd_engine::prefix::{MarkSlot, PrefixFamily};
@@ -1824,6 +1878,7 @@ fn resume_check(args: &GoldenArgs, engine: &engine::MimoEngine<'_>, tokens: &[u3
         Ok(bytes)
     };
     let mark_equal = mark(0)? == mark(1)?;
+    resume_mtp_check(engine, tokens, at, &a, &b)?;
     let straight = prefill_digest(engine, &mut a, &embed[at..], chunk, true)?;
     let restored = prefill_digest(engine, &mut b, &embed[at..], chunk, true)?;
     let first_layer = straight.layers.iter().zip(&restored.layers).position(|(x, y)| x != y);
