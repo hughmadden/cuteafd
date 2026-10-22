@@ -113,8 +113,9 @@ fn coordinator_suffix_preserves_native_spark_plans() -> Result<()> {
 /// The coordinator's native TP2 halves (a coordinator rank of any push group)
 /// land the mount's own BackboneTp2 staging bytes in each expert's plane
 /// slots before the post-Done pack: W3 then W1 rows of the half (each padded
-/// to the kernel width), the W2 column half, and their scales. Synthetic
-/// MXFP4 headers, and the installed checkpoint when CUTEAFD_PUSH_V41 is set.
+/// to the kernel width) and the W2 column half. Raw packages also land scales
+/// directly; coded scales use a staged source tail and have GPU exactness tests.
+/// Synthetic MXFP4 headers, plus the checkpoint when CUTEAFD_PUSH_V41 is set.
 #[test]
 fn coordinator_native_tp2_halves_land_the_mount_staging_bytes() -> Result<()> {
     use cuteafd_loader::plan::testing::{t, write_snapshot};
@@ -167,6 +168,9 @@ fn coordinator_native_tp2_halves_land_the_mount_staging_bytes() -> Result<()> {
             let mut image = vec![0u8; plan.layout.logical_bytes()];
             let mut files = std::collections::HashMap::new();
             for entry in checked.plan.entries.iter().filter(|e| e.rank as usize == 4 + gpu) {
+                // Generated planes are tested through the production GPU path;
+                // this host image only verifies directly delivered operands.
+                if entry.dst_base >= plan.scales.base(&plan.layout) { continue; }
                 let file = files.entry(entry.file).or_insert_with(||
                     std::fs::File::open(root.join(&checked.plan.files[entry.file as usize])).unwrap());
                 let pattern = &checked.plan.patterns[entry.pattern as usize];
@@ -185,6 +189,7 @@ fn coordinator_native_tp2_halves_land_the_mount_staging_bytes() -> Result<()> {
                     staging.read_into(&mut staged, &mut scratch)?;
                     let tensor = |slot: usize| &staged[staging.tensor_ranges()[slot].clone()];
                     for (plane, (first, second)) in [(0, (1, 0)), (1, (4, 3))] {
+                        if planes.scale_codes && plane == 1 { continue; }
                         let (offset, bytes) = planes.expert_plane(plane, expert)?;
                         let slot = &image[base + offset..base + offset + bytes];
                         let half = bytes / 2;
@@ -193,6 +198,7 @@ fn coordinator_native_tp2_halves_land_the_mount_staging_bytes() -> Result<()> {
                         assert_eq!(&slot[half..half + b.len()], b, "layer {layer} expert {expert} plane {plane} gate rows");
                     }
                     for (plane, source) in [(2, 2), (3, 5)] {
+                        if planes.scale_codes && plane == 3 { continue; }
                         let (offset, bytes) = planes.expert_plane(plane, expert)?;
                         let expected = tensor(source);
                         assert_eq!(&image[base + offset..base + offset + expected.len()], expected,

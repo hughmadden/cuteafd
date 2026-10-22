@@ -220,7 +220,7 @@ pub fn expert_cost(
     rank: usize,
     stored: u64,
 ) -> anyhow::Result<Bytes2> {
-    use anyhow::ensure;
+    use anyhow::{ensure, Context};
     ensure!(
         matches!(world, 1 | 2) && rank < world && layer < 40,
         "invalid V4.1 RTX expert selection"
