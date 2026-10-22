@@ -629,3 +629,31 @@ fn socket_setting_defaults_and_accepts_an_explicit_endpoint() {
     }
     assert_eq!(PushClient::configured(Some("@isolated-push".into())).socket, "@isolated-push");
 }
+
+/// A joined rank waits through the group's start (its peers still joining,
+/// with no hub events at all) beyond the stream idle deadline; once the group
+/// runs, the idle deadline applies again.
+#[test]
+fn joined_rank_waits_for_the_group_start_then_keeps_the_idle_deadline() {
+    let server = Server::new(|conn| {
+        assert!(matches!(request(&conn), Request::Join { .. }));
+        event(&conn, Event::Joined);
+        // Slow peers: nothing for several idle deadlines.
+        thread::sleep(Duration::from_millis(900));
+        event(&conn, Event::Progress { done: 0, total: 1 });
+        // Then the group stalls: the idle deadline must fire.
+        thread::sleep(Duration::from_millis(900));
+    });
+    let client = PushClient::at(server.client.socket.clone(), Duration::from_millis(200)).unwrap();
+    let ring = tempfile::tempfile().unwrap();
+    let rank = client
+        .join(JoinArgs { group: 7, token: 11, rank: 0, ring_fd: ring.as_raw_fd(), slots: 1, slot_bytes: 4096 })
+        .unwrap();
+    let first = rank.first(Duration::from_secs(5), Duration::from_millis(200)).unwrap();
+    assert!(matches!(first, Event::Progress { .. }));
+    let started = std::time::Instant::now();
+    assert_eq!(rank.next().unwrap_err().kind(), io::ErrorKind::TimedOut);
+    assert!(started.elapsed() < Duration::from_millis(800), "the idle deadline applies after the start");
+    drop(rank);
+    server.finish();
+}

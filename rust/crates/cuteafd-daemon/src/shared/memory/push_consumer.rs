@@ -50,12 +50,19 @@ impl<'a> PushDestination for LoadingArena<'a> {
 
 pub(crate) trait RankEvents {
     fn next(&self) -> std::io::Result<Event>;
+    /// The group's first event: no hub event (not even Progress) precedes the
+    /// group's start, which waits for every rank to join.
+    fn first(&self) -> std::io::Result<Event> { self.next() }
     fn try_next(&self) -> std::io::Result<Poll>;
     fn release(&self, slot: u32) -> std::io::Result<()>;
 }
 impl RankEvents for PushRank {
     fn next(&self) -> std::io::Result<Event> {
         self.next()
+    }
+    fn first(&self) -> std::io::Result<Event> {
+        use cuteafd_loader::push_load::{PUSH_IDLE_TIMEOUT, PUSH_START_TIMEOUT};
+        self.first(PUSH_START_TIMEOUT, PUSH_IDLE_TIMEOUT)
     }
     fn try_next(&self) -> std::io::Result<Poll> {
         self.try_next()
@@ -150,11 +157,15 @@ pub(crate) fn consume<'a, A: PushDestination>(
     ensure!(arena.belongs_to(device), "push arena device mismatch");
     let mut copies = Copies::new(device)?;
     let mut done = false;
+    let mut started = false;
     while !done {
         if copies.pending.len() == window {
             copies.complete(&mut arena, &rank)?;
         }
-        let event = if copies.pending.is_empty() {
+        let event = if !started {
+            started = true;
+            rank.first()?
+        } else if copies.pending.is_empty() {
             rank.next()?
         } else {
             match rank.try_next()? {

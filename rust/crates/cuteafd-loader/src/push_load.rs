@@ -21,6 +21,10 @@ pub mod native;
 // Applied by nest-push as SO_RCVTIMEO/SO_SNDTIMEO for each blocking I/O,
 // not a wall-clock load limit: every received progress event renews the wait.
 pub const PUSH_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+/// A joined rank's wait for its group's first event: the hub runs nothing (and
+/// sends no Progress) until every rank has joined, and a peer rank may first
+/// allocate a large arena. The idle deadline applies once the group runs.
+pub const PUSH_START_TIMEOUT: Duration = Duration::from_secs(1200);
 const HOSTS_XATTR: &str = "user.sparknest.hosts";
 
 /// Presence, not a placement decision: archive-only files may have no hosts.
@@ -191,6 +195,15 @@ impl PushRank {
             event @ (Event::Filled { .. } | Event::Progress { .. } | Event::Done) => Ok(event),
             other => Err(unexpected(other)),
         }
+    }
+
+    /// The group's first event, waited for up to `start` (every rank joining,
+    /// then planning); afterwards `next` keeps the idle deadline `idle`.
+    pub fn first(&self, start: Duration, idle: Duration) -> io::Result<Event> {
+        self.rank.set_timeout(Some(start))?;
+        let event = self.next();
+        self.rank.set_timeout(Some(idle))?;
+        event
     }
 
     /// Only after the slot's copy event completes (ring consumer owns this).
