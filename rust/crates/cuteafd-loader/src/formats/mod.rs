@@ -15,3 +15,4 @@ pub mod mapped_preload;
 pub mod modelopt;
 
 pub mod native_dense;
+pub mod scale_codes;

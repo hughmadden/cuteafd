@@ -4,8 +4,7 @@
 //! Spark rank. Publication follows the whole-group commit.
 #[cfg(test)]
 pub(crate) mod tests;
-use crate::shared::memory::{push_consumer::PushDestination, push_coordinator::Tp2ExpertPlan,
-    weight_arena::{DeliveredArena, LoadingArena}};
+use crate::shared::memory::{push_consumer::PushDestination, push_coordinator::Tp2ExpertPlan};
 use anyhow::{ensure, Context, Result};
 use cuteafd_loader::{push_load::builder::CheckedPlan, OfficialV41Catalog, V41Exl3Layer};
 
@@ -14,15 +13,15 @@ use cuteafd_loader::{push_load::builder::CheckedPlan, OfficialV41Catalog, V41Exl
 /// its host validation tail) from `base`, then the dense destination's staged
 /// bytes (its host part) from `host_base`. Gaps separate the three, so no
 /// fragment spans two.
-pub(crate) struct Combined<'a, D> {
+pub(crate) struct Combined<D, T> {
     dense: D,
     base: u64,
     host_base: u64,
-    tp2: LoadingArena<'a>,
+    tp2: T,
 }
 
-impl<'a, D: PushDestination<Delivered = ()>> Combined<'a, D> {
-    pub fn new(dense: D, base: u64, tp2: LoadingArena<'a>) -> Result<Self> {
+impl<D: PushDestination<Delivered = ()>, T: PushDestination> Combined<D, T> {
+    pub fn new(dense: D, base: u64, tp2: T) -> Result<Self> {
         ensure!(dense.device_bytes() as u64 <= base && base % 256 == 0, "dense operands overlap the TP2 arena");
         let (host_base, _) = rank_bytes(base, PushDestination::logical_bytes(&tp2) as u64, 1);
         Ok(Self { dense, base, host_base, tp2 })
@@ -35,8 +34,8 @@ impl<'a, D: PushDestination<Delivered = ()>> Combined<'a, D> {
     fn tp2_offset(&self, offset: u64) -> Option<u64> { offset.checked_sub(self.base) }
 }
 
-impl<'a, D: PushDestination<Delivered = ()>> PushDestination for Combined<'a, D> {
-    type Delivered = DeliveredArena<'a>;
+impl<D: PushDestination<Delivered = ()>, T: PushDestination> PushDestination for Combined<D, T> {
+    type Delivered = T::Delivered;
     fn belongs_to(&self, device: crate::shared::memory::device::Device<'_>) -> bool {
         self.dense.belongs_to(device) && PushDestination::belongs_to(&self.tp2, device)
     }
@@ -69,7 +68,7 @@ impl<'a, D: PushDestination<Delivered = ()>> PushDestination for Combined<'a, D>
             None => self.dense.copied(offset, bytes),
         }
     }
-    fn done(self) -> Result<DeliveredArena<'a>> {
+    fn done(self) -> Result<T::Delivered> {
         self.dense.done()?;
         PushDestination::done(self.tp2)
     }
@@ -157,7 +156,7 @@ pub(crate) fn receive_rank<'a, D: PushDestination<Delivered = ()>>(
     let joined = device.run(|| -> Result<_> {
         let arena = tp2.as_ref().map(|(_, plan, checked)| -> Result<_> {
             let expected = ExpectedCoverage::from_plan(checked, u32::try_from(rank)?)?;
-            LoadingArena::new(device, plan.layout.clone(), expected)
+            plan.scales.destination(device, plan.layout.clone(), expected)
         }).transpose()?;
         let ring = RegisteredRing::new(library, slots, slot_bytes)?;
         let joined = client.join(cuteafd_loader::push_load::JoinArgs { group, token,
@@ -286,7 +285,7 @@ impl CoordinatorPush {
                 let (base, host) = dense.as_ref().map_or((0, 0), |dense| (dense[gpu].base, dense[gpu].host_bytes));
                 let tp2 = append_tp2.as_ref().map(|(layers, budgets)| Tp2ExpertPlan::new(catalog, layers, gpu, budgets[gpu]))
                     .transpose()?;
-                let (host_base, total) = rank_bytes(base, tp2.as_ref().map_or(0, |p| p.layout.logical_bytes() as u64), host);
+                let (host_base, total) = rank_bytes(base, tp2.as_ref().map_or(0, |p| p.logical_bytes()), host);
                 if let Some(dense) = dense.as_ref() { (dense[gpu].append)(builder, rank, host_base)?; }
                 if let Some(plan) = &tp2 { plan.append_at(builder, catalog, rank, base)?; }
                 ensure!(offer.placement.is_empty() && offer.arena_bytes == total,
@@ -352,7 +351,7 @@ impl CoordinatorPush {
                 Ok(Some(checked))
             })();
             if let Err(error) = &planned { tracing::warn!(gpu, %error, "coordinator push unavailable; offering mount"); }
-            let tp2_bytes = tp2.as_ref().map_or(0, |p| p.layout.logical_bytes() as u64);
+            let tp2_bytes = tp2.as_ref().map_or(0, |p| p.logical_bytes());
             let (host_base, arena_bytes) = rank_bytes(base, tp2_bytes, host);
             let offer = planned.as_ref().map(|_| cuteafd_transport::worker_selection::push::Offer {
                 rank, host: namespace_host.clone(), arena_bytes, placement: Vec::new() })

@@ -104,6 +104,9 @@ pub(crate) enum Job {
     /// MXFP4 expert packed from its fused raw image at staged `at..at + bytes`
     /// (plane 0: up rows then gate rows, each padded) into `dst`.
     NativePlane { intermediate: u32, plane: u32, at: usize, bytes: usize, dst: CuteafdDeviceBuffer },
+    /// One raw UE8M0 rectangle, checked and coded directly from pinned staging.
+    /// `rect` retains the checkpoint tensor and original row for refusals.
+    ScaleCodes { rect: usize, at: usize, stored_rows: usize, start_row: usize, dst: CuteafdDeviceBuffer },
 }
 
 /// A device-to-device transform of landed class-2 bytes, run once every
@@ -214,6 +217,18 @@ impl Step {
                         library.fp8_w8a16_pack(source.cast(), packed.ptr, scale.ptr, n, k, rule.code(), stream)?;
                         library.cuda_stream_synchronize(stream)
                     })?;
+                }
+                Job::ScaleCodes { rect, at, stored_rows, start_row, dst } => {
+                    let source = self.rects.get(rect).context("scale-code source rectangle absent")?;
+                    let bytes = staged.get(at..at.checked_add(source.bytes()).context("scale-code source overflow")?)
+                        .context("scale-code source outside staging")?;
+                    let target = crate::shared::fp8_load_quant::ScaleCodeTarget {
+                        source: cuteafd_loader::formats::scale_codes::Rows { tensor: &source.name, bytes,
+                            rows: source.rows.len(), pitch: source.width(), columns: source.width(),
+                            first_row: source.rows.start },
+                        destination: dst, stored_rows, start_row,
+                    };
+                    load_timing::quantize(source.bytes(), || kernels.scale_codes_from(&[target], stream))?;
                 }
                 Job::NativePlane { intermediate, plane, at, bytes, dst } => {
                     ensure!(at + bytes <= self.bytes() && at % 4 == 0, "native plane outside its step");

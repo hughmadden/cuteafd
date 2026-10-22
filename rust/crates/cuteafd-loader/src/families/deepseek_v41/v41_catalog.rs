@@ -180,6 +180,10 @@ impl OfficialV41Catalog {
 
     pub fn format(&self) -> crate::plan::checkpoint::CheckpointFormat { self.format }
 
+    /// Package-fixed MXFP4 scale layout. Other native families retain UE8M0
+    /// until their packages adopt the same checked transform.
+    pub fn mxfp4_scale_codes(&self) -> bool { self.config.is_some() }
+
     pub fn exl3(&self) -> Option<&crate::V41Exl3Manifest> {
         self.exl3.as_ref()
     }

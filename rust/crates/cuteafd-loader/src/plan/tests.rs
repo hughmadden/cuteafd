@@ -486,9 +486,16 @@ fn v41_tp3_tp6_layout_charges_packed_residency_and_bf16_rings() {
             let experts = report.experts.as_ref().unwrap();
             assert!(experts.package.starts_with(if nvfp4 { "v41:nvfp4" } else { "v41:mxfp4" }));
             let packed = |tp: u64| {
-                let width = (2304 / tp).div_ceil(128) * 128;
-                if nvfp4 { 384 * (3 * 5120 * width * 9 / 16 + 16) }
-                else { 384 * 5120 * width * 51 / 32 }
+                let (hidden, logical, experts) = (5120u64, 2304 / tp, 384u64);
+                let stored = logical.div_ceil(128) * 128;
+                if nvfp4 { experts * (3 * hidden * stored * 9 / 16 + 16) }
+                else {
+                    let payloads = hidden * stored + hidden * stored / 2;
+                    // One base byte plus a uint16 per K128 block, per stored row.
+                    let gate_up = 2 * stored * (1 + 2 * (hidden / 128));
+                    let down = hidden * (1 + 2 * logical.div_ceil(128));
+                    experts * (payloads + gate_up + down)
+                }
             };
             for device in &memory.devices {
                 match device.kind {
