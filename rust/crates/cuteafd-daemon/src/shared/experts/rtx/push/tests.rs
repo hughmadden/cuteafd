@@ -7,28 +7,6 @@ use cuteafd_loader::{plan::testing::{qwen4_config, qwen4_exl3, write_snapshot},
     push_load::{proto::{Event, Request}, slot, Listener, PushClient}};
 use std::{fs::File, net::TcpStream, os::unix::fs::FileExt, time::Duration};
 
-/// A fake SparkNest's `accept`, bounded: a rank that never connects fails the
-/// test after `timeout` with a clear error instead of hanging (Listener has no
-/// accept timeout; a waker connects at the deadline).
-pub(crate) fn accept_within(listener: &Listener, socket: &str, timeout: Duration)
-    -> Result<cuteafd_loader::push_load::Conn> {
-    let (accepted, watch) = std::sync::mpsc::channel::<()>();
-    let fired = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let (path, flag) = (socket.to_string(), fired.clone());
-    let watchdog = std::thread::spawn(move || {
-        if watch.recv_timeout(timeout).is_err() {
-            flag.store(true, std::sync::atomic::Ordering::SeqCst);
-            let _ = cuteafd_loader::push_load::Conn::connect(&path);
-        }
-    });
-    let conn = listener.accept();
-    let _ = accepted.send(());
-    let _ = watchdog.join();
-    anyhow::ensure!(!fired.load(std::sync::atomic::Ordering::SeqCst),
-        "fake SparkNest: no rank connected to {socket} within {} s", timeout.as_secs());
-    Ok(conn?)
-}
-
 fn control_pair() -> Result<(TcpStream, TcpStream)> {
     let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
     let client = TcpStream::connect(listener.local_addr()?)?;
@@ -139,7 +117,7 @@ fn coordinator_tp2_pair_is_mount_exact_on_two_devices_and_drops_before_retry() -
             let server_socket = socket.clone();
             workers.push((worker, socket));
             servers.push(std::thread::spawn(move || -> Result<()> {
-                let conn = accept_within(&listener, &server_socket, Duration::from_secs(120))?;
+                let conn = crate::shared::memory::push_testing::accept_within(&listener, &server_socket, Duration::from_secs(120))?;
                 conn.set_timeout(Some(Duration::from_secs(10)))?;
                 let (request, fd) = conn.next_request()?.context("rank did not join")?;
                 let Request::Join { slots, slot_bytes, rank: joined, .. } = request else { anyhow::bail!("expected rank Join") };
@@ -287,7 +265,7 @@ fn combined_rank_lands_dense_operands_and_tp2_halves_exactly() -> Result<()> {
     let (mut coordinator, mut worker) = control_pair()?;
     let server_socket = socket.clone();
     let server = std::thread::spawn(move || -> Result<()> {
-        let conn = accept_within(&listener, &server_socket, Duration::from_secs(120))?;
+        let conn = crate::shared::memory::push_testing::accept_within(&listener, &server_socket, Duration::from_secs(120))?;
         conn.set_timeout(Some(Duration::from_secs(10)))?;
         let (_, fd) = conn.next_request()?.context("rank did not join")?;
         let file = File::from(fd.context("rank ring fd absent")?);
@@ -449,7 +427,7 @@ fn pre_membership_dense_planning_error_offers_no_coordinator_ranks_and_sparks_pu
     let listener = Listener::bind(&socket)?;
     let server_socket = socket.clone();
     let server = std::thread::spawn(move || -> Result<usize> {
-        let conn = accept_within(&listener, &server_socket, Duration::from_secs(120))?;
+        let conn = crate::shared::memory::push_testing::accept_within(&listener, &server_socket, Duration::from_secs(120))?;
         conn.set_timeout(Some(Duration::from_secs(10)))?;
         let (request, _) = conn.next_request()?.context("no Create")?;
         let Request::Create { ranks, .. } = request else { anyhow::bail!("expected Create") };
@@ -643,7 +621,7 @@ pub(crate) fn receive_pushed<'a>(device: Device<'a>, catalog: &cuteafd_loader::O
     let source_root = root.to_path_buf();
     let server_socket = socket.clone();
     let server = std::thread::spawn(move || -> Result<()> {
-        let conn = accept_within(&listener, &server_socket, Duration::from_secs(300))?;
+        let conn = crate::shared::memory::push_testing::accept_within(&listener, &server_socket, Duration::from_secs(300))?;
         conn.set_timeout(Some(Duration::from_secs(600)))?;
         let (request, fd) = conn.next_request()?.context("rank did not join")?;
         let Request::Join { slots, slot_bytes, .. } = request else { anyhow::bail!("expected rank Join") };
@@ -762,7 +740,7 @@ fn fake_source_accept_is_bounded() -> Result<()> {
     let socket = root.path().join("idle.sock").to_string_lossy().into_owned();
     let listener = Listener::bind(&socket)?;
     let started = std::time::Instant::now();
-    let error = accept_within(&listener, &socket, Duration::from_secs(1)).err().context("an idle source must fail")?;
+    let error = crate::shared::memory::push_testing::accept_within(&listener, &socket, Duration::from_secs(1)).err().context("an idle source must fail")?;
     assert!(error.to_string().contains("no rank connected"), "{error}");
     assert!(started.elapsed() < Duration::from_secs(10));
     Ok(())

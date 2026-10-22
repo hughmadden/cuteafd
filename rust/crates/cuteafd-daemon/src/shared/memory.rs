@@ -301,3 +301,29 @@ mod load_stream_lifetime_tests {
         Ok(())
     }
 }
+
+/// Test support for fake SparkNest push sources.
+#[cfg(test)]
+pub(crate) mod push_testing {
+    /// A fake SparkNest's `accept`, bounded: a rank that never connects fails the
+    /// test after `timeout` with a clear error instead of hanging (Listener has no
+    /// accept timeout; a waker connects at the deadline).
+    pub(crate) fn accept_within(listener: &cuteafd_loader::push_load::Listener, socket: &str, timeout: std::time::Duration)
+        -> anyhow::Result<cuteafd_loader::push_load::Conn> {
+        let (accepted, watch) = std::sync::mpsc::channel::<()>();
+        let fired = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (path, flag) = (socket.to_string(), fired.clone());
+        let watchdog = std::thread::spawn(move || {
+            if watch.recv_timeout(timeout).is_err() {
+                flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                let _ = cuteafd_loader::push_load::Conn::connect(&path);
+            }
+        });
+        let conn = listener.accept();
+        let _ = accepted.send(());
+        let _ = watchdog.join();
+        anyhow::ensure!(!fired.load(std::sync::atomic::Ordering::SeqCst),
+            "fake SparkNest: no rank connected to {socket} within {} s", timeout.as_secs());
+        Ok(conn?)
+    }
+}

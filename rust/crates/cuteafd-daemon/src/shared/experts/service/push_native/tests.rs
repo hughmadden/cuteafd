@@ -135,8 +135,9 @@ fn native_planes_ring_exact_commit_and_failed_transactions_drain_before_mount() 
             fixture.configure_pack(&library, i32::from(outcome == 3), 0)?;
             let events_path = fixture.directory().join("events");
             let before = fixture.events()?.len();
+            let server_socket = socket.clone();
             let server = std::thread::spawn(move || -> Result<()> {
-                let conn = listener.accept()?;
+                let conn = crate::shared::memory::push_testing::accept_within(&listener, &server_socket, Duration::from_secs(120))?;
                 conn.set_timeout(Some(Duration::from_secs(20)))?;
                 let (request, fd) = conn.next_request()?.context("native rank did not join")?;
                 let Request::Join { slots, slot_bytes, rank, .. } = request else { anyhow::bail!("expected Join") };
