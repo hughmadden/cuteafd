@@ -2,7 +2,7 @@
 //! lane; active recurrent slots and immutable prefix marks are shared by lanes.
 use crate::shared::{memory::device::{Allocation, Device, Stream}, prefix::view};
 use anyhow::{ensure, Context, Result};
-use cuteafd_core::memory_layout::{Basis, Category};
+
 use cuteafd_ffi::{CuteafdDeviceBuffer, KimiKda};
 use cuteafd_loader::{families::kimi_k3::config::{KimiAttention, KimiK3Config}, placement::Demand};
 use std::rc::Rc;
@@ -125,15 +125,13 @@ impl KdaLayout {
     }
 
     pub(crate) fn demands(&self, rank: u8) -> Result<[Demand; 4]> {
-        ensure!(rank < 2, "Kimi KDA rank outside TP2");
         let [state, conv, replay, marks] = self.extents()?;
-        let state = state.checked_add(conv).context("Kimi KDA active state overflow")?;
-        let replay = replay.checked_mul(self.lanes).context("Kimi KDA lane replay overflow")?;
-        Ok([(Category::Kv, "Kimi KDA active state", state),
-            (Category::Workspace, "Kimi KDA replay", replay),
-            (Category::Prefix, "Kimi exact KDA marks", marks),
-            (Category::Workspace, "Kimi KDA commit tables", self.lanes * self.slots * 3 * 4)]
-            .map(|(category, group, bytes)| Demand::new(rank, category, group, bytes as u64, Basis::Exact)))
+        let demands = cuteafd_loader::families::kimi_k3::allocation::kda_demands_for_layers(
+            self.layers, self.slots, self.marks, self.lanes, rank)?;
+        ensure!(demands.iter().map(|d| d.bytes).collect::<Vec<_>>() ==
+            vec![(state + conv) as u64, (replay * self.lanes) as u64, marks as u64,
+                (self.lanes * self.slots * 3 * 4) as u64], "Kimi state owner differs from shared admission");
+        Ok(demands)
     }
 
     fn lane_inputs(&self, lane: usize, replay: &[CuteafdDeviceBuffer], tables: &[CuteafdDeviceBuffer])

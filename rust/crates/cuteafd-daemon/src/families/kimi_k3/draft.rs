@@ -408,7 +408,7 @@ mod tests {
             devices: [0, 1], native_lib: &native, peers,
             rtx_expert_layers: cuteafd_loader::placement::Onboard::Layers(local_layers), spark_budget_gib: None,
             rows: TARGET_TAP_ROWS, slots: 1, marks: 1, max_context: 524_288,
-            pool_tokens: Some(524_288), graphs: true, ffn_mode: cuteafd_ffi::KimiFfnMode::default(),
+            pool_tokens: Some(524_288), graphs: true, native_k6: false, ffn_mode: cuteafd_ffi::KimiFfnMode::default(),
             hosted_layers: Some(hosted_layers),
             draft: Some(Options { snapshot: drafter, fp8: true, cache_format }),
         })?;

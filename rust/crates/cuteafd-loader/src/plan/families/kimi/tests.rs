@@ -22,46 +22,7 @@ fn with_layout(ranks: usize, budget: Option<u64>) -> PlanOptions {
 }
 
 fn installed_inventory(root: &std::path::Path, spark: bool) -> std::path::PathBuf {
-    use serde_json::json;
-    let lock: Value = serde_json::from_str(include_str!(concat!(env!("CARGO_MANIFEST_DIR"),
-        "/../../../third_party/sparkinfer.lock.json"))).unwrap();
-    let revision = lock["revision"].as_str().unwrap();
-    let mut programs = Vec::new();
-    for (name, geometry) in [
-        ("kimik3_router_scores", json!({"hidden":7168,"experts":896,"top_k":16})),
-        ("kimik3_expert_input_quant", json!({"hidden":3584})),
-        ("kimik3_latent_down", json!({"width":7168,"outputs":3584})),
-        ("kimik3_latent_up", json!({"width":3584,"outputs":7168})),
-        ("kimik3_rmsnorm_h3584", json!({"hidden":3584})),
-    ] {
-        if !spark { programs.push(json!({"name":name,"geometry":geometry,"object_sha256":"b".repeat(64)})); }
-    }
-    std::fs::create_dir_all(root.join("share")).unwrap();
-    let path = root.join("share/PROGRAMS.json");
-    std::fs::write(&path, json!({"schema":1,"sparkinfer_revision":revision,"programs":programs}).to_string()).unwrap();
-    let package = root.join("lib/exl3/exl3-kimik3-k23");
-    let layouts = if spark { (0..6).map(|r| (format!("tp6-rank{r}"), 512)).collect::<Vec<_>>() }
-        else { vec![("rtx-tp1".into(), 3072), ("rtx-tp2".into(), 1536)] };
-    let mut variants = Vec::new();
-    for (layout, intermediate) in layouts {
-        for capacity in [1, 80, 256, 1024, 4096] {
-            let directory = format!("{layout}/m{capacity}");
-            let meta = json!({"directory":directory,"capacity":capacity,"intermediate":intermediate,
-                "experts":896,"top_k":16,"bits":[2,3],"output_dtype":if spark {"bf16"} else {"fp32"},
-                "hidden":3584,"activation":"situ","descriptor_bits":10,"sparkinfer_revision":revision});
-            let target = package.join(&directory);
-            std::fs::create_dir_all(target.join("routes")).unwrap();
-            std::fs::write(target.join("v41_exl3.json"), meta.to_string()).unwrap();
-            for file in ["libcuteafd_exl3.so", "routes/libv41_exl3_routes.so", "trellis_lut.bin"] {
-                std::fs::write(target.join(file), []).unwrap();
-            }
-            variants.push(meta);
-        }
-    }
-    std::fs::write(package.join("manifest.json"), json!({"schema":"cuteafd.exl3-package.v1",
-        "geometry":"kimik3","role":if spark {"spark"} else {"coordinator"},
-        "sparkinfer_revision":revision,"variants":variants}).to_string()).unwrap();
-    path
+    testing::write_kimi_installed_inventory(root, spark)
 }
 
 #[test]
@@ -380,4 +341,157 @@ fn cache_geometry_requires_tp2_and_preserves_physical_mla_copies() {
     }
     assert!(model.cache_geometry(CacheOptions { coordinator_ranks: 2,
         attention_placement: Some(AttentionPlacement::Context), ..Default::default() }).is_err());
+}
+
+#[test]
+fn core_k6_headers_charge_native_bytes_but_do_not_claim_runtime_support() {
+    let dir = tempfile::tempdir().unwrap();
+    testing::write_kimi_core_snapshot(dir.path(), false);
+    let checkpoint = Checkpoint::open(dir.path()).unwrap();
+    let model = Model::open(&checkpoint).unwrap();
+    assert_eq!(model.core.projections.len(), 926);
+    assert!(!model.native_serving_admission());
+    assert!(!dir.path().join("quantize_config.json").exists());
+    let source: u64 = model.core.projections.values().map(|p| p.source_bytes).sum();
+    assert_eq!(source, 40_323_110_520);
+    let kv_a = &model.core.projections[&format!("{TEXT}layers.3.self_attn.kv_a_proj_with_mqa")];
+    assert_eq!(kv_a.shape, [576, 7168]);
+    assert_eq!(kv_a.stored_outputs, 640);
+    let original = snapshot(false);
+    let bf16 = Model::open(&Checkpoint::open(original.path()).unwrap()).unwrap();
+    let weights = |model: &Model, gpu: usize| {
+        model.coordinator.split / 2 + model.coordinator.replicated - model.frontends[1 - gpu]
+            + model.mla.iter().enumerate().filter(|(layer, _)| model.cfg.attention[*layer] == KimiAttention::Mla)
+                .enumerate().filter(|(ordinal, _)| ordinal % 2 == gpu).map(|(_, (_, r))| r.split + r.replicated).sum::<u64>()
+            + if gpu == 0 { model.bytes[&Component::Embedding] } else {
+                model.core.projections.get("language_model.lm_head").map_or(model.bytes[&Component::LmHead],
+                    |p| p.resident_bytes(1).unwrap()) }
+    };
+    let freed = [weights(&bf16, 0) - weights(&model, 0), weights(&bf16, 1) - weights(&model, 1)];
+    assert_eq!(freed, [32_815_041_536, 34_282_705_920]);
+    for (stem, projection) in &model.core.projections {
+        let members = checkpoint.tensors.iter().filter(|t| format::split_stem(&t.meta.name).0 == stem)
+            .cloned().collect::<Vec<_>>();
+        let mut operand = format::detect(format::group_by_stem(&members).values().next().unwrap()).unwrap();
+        assert_eq!(operand.exl3_bits(), Some(6));
+        assert_eq!(operand.logical, [projection.stored_outputs, projection.shape[1]]);
+        let role = KIMI_K3.classify(&model.spec, &format!("{stem}.trellis")).unwrap();
+        assert!(model.accepts(&role, stem, &mut operand).unwrap_err().contains("no BF16 fallback"));
+    }
+}
+
+#[test]
+fn core_index_only_native_inventory_reads_headers_and_preserves_runtime_gate() {
+    let dir = tempfile::tempdir().unwrap();
+    testing::write_kimi_core_snapshot(dir.path(), false);
+    let checkpoint = Checkpoint::inventory(dir.path()).unwrap();
+    assert!(checkpoint.tensors.is_empty());
+    let model = Model::open(&checkpoint).unwrap();
+    assert_eq!(model.core.projections.len(), 926);
+    assert!(!model.native_serving_admission());
+    assert_eq!(model.core.projections.values().map(|p| p.source_bytes).sum::<u64>(), 40_323_110_520);
+    model.core.validate_runtime_groups(&model.cfg).unwrap();
+    let names = files::required_tensors(&checkpoint,
+        files::ReadRole::Coordinator { local_experts: false, speculator: false }).unwrap();
+    assert!(names.contains("language_model.lm_head.trellis"));
+    assert!(!names.contains("language_model.lm_head.weight"));
+    // Already-loaded core headers must not reopen a shard on the readiness path.
+    let loaded = Checkpoint::open(dir.path()).unwrap();
+    for shard in loaded.weight_map.values().collect::<std::collections::BTreeSet<_>>() {
+        std::fs::remove_file(dir.path().join(shard)).unwrap();
+    }
+    assert_eq!(Model::open(&loaded).unwrap().core.projections.len(), 926);
+}
+
+#[test]
+fn core_index_only_mixed_inventory_keeps_bf16_kda_and_opens_spark_role() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut mixed = Vec::new();
+    for tensor in tensors(false) {
+        let native = tensor.0.starts_with("language_model.model.layers.1.block_sparse_moe.shared_experts.")
+            || tensor.0.starts_with("language_model.model.layers.1.block_sparse_moe.routed_expert_")
+                && !tensor.0.contains("routed_expert_norm");
+        if native {
+            let stem = tensor.0.strip_suffix(".weight").unwrap();
+            mixed.extend(testing::exl3(stem, tensor.2[0], tensor.2[1], 6));
+        } else { mixed.push(tensor); }
+    }
+    testing::write_snapshot(dir.path(), &config(), &mixed, None);
+    let checkpoint = Checkpoint::inventory(dir.path()).unwrap();
+    assert!(checkpoint.tensors.is_empty());
+    let model = Model::open(&checkpoint).unwrap();
+    assert_eq!(model.core.projections.len(), 5);
+    model.core.validate_runtime_groups(&model.cfg).unwrap();
+    assert!(model.core.get_weight("language_model.model.layers.1.self_attn.q_proj.weight").is_none());
+    let role = files::ReadRole::Spark { rank: 0, world: 6 };
+    let spark = files::open_role(dir.path(), role).unwrap();
+    assert!(spark.tensors.iter().all(|tensor| tensor.meta.name.contains(".experts.")));
+    assert!(!spark.tensors.is_empty());
+    // Spark-only headers still discover core formats from the authoritative index.
+    assert_eq!(Model::open(&spark).unwrap().core.projections.len(), 5);
+}
+
+#[test]
+fn core_header_validation_rejects_wrong_bits_keep_list_and_duplicate_bf16() {
+    let dir = tempfile::tempdir().unwrap();
+    testing::write_kimi_core_snapshot(dir.path(), false);
+    let checkpoint = Checkpoint::open(dir.path()).unwrap();
+    for corruption in ["bits", "duplicate", "keep-list", "missing-scale", "shape", "codebook"] {
+        let mut changed = Checkpoint::open(dir.path()).unwrap();
+        let stem = format!("{TEXT}layers.0.self_attn.q_proj");
+        let trellis = changed.tensors.iter_mut().find(|t| t.meta.name == format!("{stem}.trellis")).unwrap();
+        match corruption {
+            "bits" => { trellis.meta.shape[2] = 80; trellis.meta.byte_length = trellis.meta.byte_length / 6 * 5; }
+            "duplicate" => {
+                let mut tensor = checkpoint.tensors[0].clone();
+                tensor.meta.name = format!("{stem}.weight");
+                changed.weight_map.insert(tensor.meta.name.clone(), tensor.shard.clone());
+                changed.tensors.push(tensor);
+            }
+            "keep-list" => {
+                for tensor in &mut changed.tensors {
+                    if tensor.meta.name.starts_with(&format!("{stem}.")) {
+                        tensor.meta.name = tensor.meta.name.replace("self_attn.q_proj", "self_attn.f_a_proj");
+                    }
+                }
+            }
+            "missing-scale" => changed.tensors.retain(|t| t.meta.name != format!("{stem}.svh")),
+            "shape" => trellis.meta.shape[0] -= 1,
+            "codebook" => {
+                let mut marker = changed.tensors.iter().find(|t| t.meta.name == format!("{stem}.mcg")).unwrap().clone();
+                marker.meta.name = format!("{stem}.mul1");
+                changed.tensors.push(marker);
+            }
+            _ => unreachable!(),
+        }
+        assert!(Model::open(&changed).is_err(), "accepted {corruption}");
+    }
+}
+
+#[test]
+fn native_k6_opt_in_accepts_header_formats_and_leaves_default_closed() -> Result<()> {
+    let dir=tempfile::tempdir()?;
+    testing::write_kimi_core_snapshot(dir.path(),false);
+    let checkpoint=Checkpoint::open(dir.path())?;
+    let mut model=Model::open(&checkpoint)?;
+    let options=PlanOptions {native_k6:true,..Default::default()};
+    model.configure(&options).map_err(anyhow::Error::msg)?;
+    assert!(model.native_serving_admission());
+    for (stem,projection) in &model.core.projections {
+        let members=checkpoint.tensors.iter().filter(|t|format::split_stem(&t.meta.name).0==stem)
+            .cloned().collect::<Vec<_>>();
+        let mut operand=format::detect(format::group_by_stem(&members).values().next().unwrap())
+            .map_err(|error|anyhow::anyhow!("{error:?}"))?;
+        let role=KIMI_K3.classify(&model.spec,&format!("{stem}.trellis")).unwrap();
+        model.accepts(&role,stem,&mut operand).map_err(anyhow::Error::msg)?;
+        assert_eq!(operand.logical,[projection.stored_outputs,projection.shape[1]]);
+    }
+    model.configure(&PlanOptions::default()).map_err(anyhow::Error::msg)?;
+    assert!(!model.native_serving_admission());
+    // With no native operands, enabling the opt-in changes no ledger or verdict.
+    let bf16=snapshot(false);
+    let off=plan::plan(bf16.path(),&PlanOptions::default())?;
+    let on=plan::plan(bf16.path(),&options)?;
+    assert_eq!(serde_json::to_value(off)?,serde_json::to_value(on)?);
+    Ok(())
 }

@@ -18,5 +18,10 @@ pub(crate) mod spark;
 pub(crate) mod mla;
 pub(crate) mod state;
 pub(crate) mod weights;
+pub(crate) mod core_runtime;
 #[cfg(test)]
 pub(crate) mod reference;
+#[cfg(test)]
+mod core_native_tests;
+#[cfg(test)]
+mod core_layer_tests;

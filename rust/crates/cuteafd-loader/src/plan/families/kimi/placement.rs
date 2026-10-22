@@ -1,7 +1,4 @@
-//! Header lower bound on 2 RTX + 6 Sparks through the shared pool solver: real
-//! TP2 residency, Spark runtime/IO charges and optional whole-layer RTX expert
-//! onboarding and retained marks. Not runtime admission: coordinator workspaces,
-//! graphs and the EXL3 workspace of the final export set come with the engine.
+//! Kimi TP2 admission with checkpoint residency and shared native allocation layouts.
 use super::Model;
 use anyhow::Context;
 use crate::{placement::*, plan::{Component, ExpertPlacement, Hint, PlanReport}};
@@ -72,16 +69,38 @@ pub(super) fn layout(model: &Model, report: &mut PlanReport, opts: &crate::plan:
     let requested_pool = opts.pool_tokens.filter(|n| *n > 0);
     let target_pool = opts.target_pool_tokens.max(context);
     let edge = |c| *model.bytes.get(&c).unwrap_or(&0);
-    let (embedding, head) = (edge(Component::Embedding), edge(Component::LmHead));
+    let (embedding, head) = (edge(Component::Embedding), model.core.projections.get("language_model.lm_head")
+        .map_or(edge(Component::LmHead), |p| p.resident_bytes(1).expect("validated core dimensions")));
     let residency = model.coordinator;
+    if !model.core.projections.is_empty() {
+        let status=if model.native_k6 {"experimental native execution enabled"}else{"native runtime binding pending"};
+        memory.notes.push(format!("Kimi K6 core: {} header-native projections; payload + H128 scale vectors charged without BF16 expansion; {status}",
+            model.core.projections.len()));
+    }
     let mla_weights: u64 = model.mla.iter().map(|r| r.split + r.replicated).sum();
     report.bytes_by_owner.insert("coordinator text weights".into(), embedding + head + residency.split + residency.replicated + mla_weights);
     report.bytes_by_owner.insert("routed expert weights".into(), experts);
-    let slots = opts.concurrency.max(1);
+    let slots = opts.state_slots.unwrap_or_else(|| if opts.concurrency > 0 { opts.concurrency } else { 16 });
+    let rows = if opts.prefill_rows > 0 { opts.prefill_rows as usize } else { 4096 };
+    let path = opts.workspace_manifest.as_deref().unwrap_or_else(||
+        std::path::Path::new("/opt/cuteafd/share/PROGRAMS.json"));
+    // Header-only diagnostics remain available without installed artifacts. An
+    // explicit package or a serving image must supply a complete allocation ledger.
+    let manifest = if path.is_file() {
+        match std::fs::read(path).map_err(anyhow::Error::from)
+            .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).map_err(Into::into)) {
+            Ok(value) => Some(value),
+            Err(error) => { refusal(report, format!("Kimi package inventory refused: {error:#}"),
+                "Supply the matching PROGRAMS.json through --workspace-manifest."); return memory; }
+        }
+    } else if opts.workspace_manifest.is_some() {
+        refusal(report, "Kimi explicit workspace manifest is missing".into(), "Supply the installed PROGRAMS.json.");
+        return memory;
+    } else { None };
     let state = cfg.kda_layers() as u64 * (cfg.kda_state_bytes() + cfg.kda_conv_bytes()) * slots / 2;
     let mark_bytes = cfg.kda_layers() as u64 * (cfg.kda_state_bytes() + cfg.kda_conv_bytes()) / 2;
     let legacy_marks = opts.prefix_slots.unwrap_or_else(|| cuteafd_core::prefix::mark_slots_with_host(
-        opts.concurrency, opts.mimo_prefix_entries, 2 * mark_bytes, opts.mimo_prefix_mark_bytes,
+        slots, opts.mimo_prefix_entries, 2 * mark_bytes, opts.mimo_prefix_mark_bytes,
         opts.host_cache_bytes != Some(0)));
     let mut mark_demands = (0..2).map(|gpu| Demand::new(gpu, Category::Prefix,
         "Kimi exact KDA marks", mark_bytes, Basis::Formula)).collect::<Vec<_>>();
@@ -95,13 +114,60 @@ pub(super) fn layout(model: &Model, report: &mut PlanReport, opts: &crate::plan:
         demand.bytes = bytes;
         fixed.push(demand);
     }
+    let packed = manifest.as_ref().map(|_| &model.core);
+    let globals = packed.map(|core| crate::families::kimi_k3::weight_layout::GlobalLayout::pair_with_core(cfg, core)).transpose();
+    let globals = match globals { Ok(value) => value, Err(error) => {
+        refusal(report, format!("Kimi packed global inventory refused: {error:#}"), "Check checkpoint global geometry."); return memory;
+    }};
     for gpu in 0..2u8 {
+        if let Some(globals) = &globals {
+            fixed.push(globals[usize::from(gpu)].demand().expect("validated global extent"));
+        } else {
         fixed.push(Demand::new(gpu, Category::Weights, "text weights, head/intermediate split", residency.split / 2, Basis::Exact));
         fixed.push(Demand::new(gpu, Category::Weights, "text weights replicated (KDA low-rank A, routers, latent proj, norms)",
             residency.replicated - model.frontends[1 - gpu as usize], Basis::Exact));
         fixed.push(Demand::new(gpu, if gpu == 0 { Category::Embedding } else { Category::Weights },
             if gpu == 0 { "token embedding" } else { "lm head" }, if gpu == 0 { embedding } else { head }, Basis::Exact));
+        }
         fixed.push(Demand::new(gpu, Category::Kv, format!("KDA FP32 state + BF16 conv, {slots} slots, 48 heads"), state, Basis::Formula));
+    }
+    let mut baseline = [Baseline::Planned { context_bytes: 0, loaded_bytes: 0 }; 2];
+    let mut tp2_workspace = [0; 2];
+    if let Some(manifest) = &manifest {
+        let extra = (|| -> anyhow::Result<_> {
+            use crate::families::kimi_k3::{allocation, core};
+            let mut demands = allocation::baseline_demands(cfg, manifest, rows, context as usize,
+                usize::try_from(slots)?, &model.core, report.requested_attention == Some(AttentionPlacement::Heads))?;
+            let families = if model.core.projections.is_empty() { &["kimik3"][..] } else { &["kimik3", "kimi"][..] };
+            let programs = ProgramSet::from_manifest(manifest, families);
+            for rank in 0..2 {
+                let arch = ArchContext::for_device("sm_120", opts.rtx_bytes[rank]);
+                let code = crate::placement::inventory::loaded_code_allowance("kimik3", "exl3", true,
+                    rank as u8, arch, Some(&programs));
+                baseline[rank] = Baseline::Planned { context_bytes: arch.context_bytes, loaded_bytes: 0 };
+                demands.push(allocation::code_demand(rank, code.bytes, arch.cublas_bytes, 1)?);
+            }
+            if model.native_k6 && !model.core.projections.is_empty() {
+                // The baseline already includes the full peer receive allocation.
+                demands.extend(core::CoreCharges::from_package(cfg, &model.core, rows, manifest)?.demands()?
+                    .into_iter().filter(|d| d.group != "Kimi K6 peer receive"));
+            }
+            if opts.onboard != Some(Onboard::Layers(0)) {
+                let package = allocation::expert_package(path)?;
+                tp2_workspace = [allocation::expert_workspace(&package, rows)?; 2];
+            }
+            Ok(demands)
+        })();
+        match extra {
+            Ok(demands) => fixed.extend(demands),
+            Err(error) => { refusal(report, format!("Kimi package admission refused: {error:#}"),
+                "Supply complete matching native and EXL3 workspace manifests."); return memory; }
+        }
+        memory.notes[0] = "Kimi shared runtime allocation ledger; graph executable bytes retain the runtime's explicit startup estimate".into();
+    } else if model.native_k6 && !model.core.projections.is_empty() {
+        refusal(report, "Kimi native K6 requires installed workspace inventory".into(),
+            "Supply the matching K6 PROGRAMS.json through --workspace-manifest.");
+        return memory;
     }
     let inventory = (|| -> anyhow::Result<_> {
         let catalog = crate::read_expert_catalog(&model.snapshot)?;
@@ -164,35 +230,53 @@ pub(super) fn layout(model: &Model, report: &mut PlanReport, opts: &crate::plan:
         }
     };
     let record = opts.mla_kv.record_bytes() as u64 * PAGE;
-    let layers = (0..cfg.layers).map(|layer| {
+    let layers = (|| -> anyhow::Result<Vec<LayerDemand>> { (0..cfg.layers).map(|layer| {
         let mla = cfg.attention[layer] == crate::families::kimi_k3::config::KimiAttention::Mla;
-        LayerDemand { kind: if mla { AttentionClass::Mla } else { AttentionClass::Kda },
-            weights: ModeBytes { whole: model.mla[layer].split + model.mla[layer].replicated,
-                split: [model.mla[layer].split / 2 + model.mla[layer].replicated; 2] },
+        let mut weights = ModeBytes { whole: model.mla[layer].split + model.mla[layer].replicated,
+            split: [model.mla[layer].split / 2 + model.mla[layer].replicated; 2] };
+        if let Some(core) = packed {
+            use crate::families::kimi_k3::weight_layout::LayerLayout;
+            let split = LayerLayout::pair_with_core(cfg, layer, LayerMode::HeadSplit, core)?;
+            let mut attention = [0; 2];
+            for rank in 0..2 {
+                attention[rank] = split[rank].attention_bytes()? as u64;
+                fixed.push(Demand::new(rank as u8, Category::Weights,
+                    format!("Kimi layer {layer} TP2 FFN/residual/router/latent"),
+                    split[rank].bytes()? as u64 - attention[rank], Basis::Exact));
+            }
+            weights = ModeBytes { split: attention, whole: if mla {
+                LayerLayout::pair_with_core(cfg, layer, MODES[1], core)?[0].attention_bytes()? as u64
+            } else { 0 } };
+        }
+        Ok(LayerDemand { kind: if mla { AttentionClass::Mla } else { AttentionClass::Kda },
+            weights,
             kv_unit: KvDemand { unit_bytes_whole: if mla { record } else { 0 }, unit_bytes_split: if mla { [record; 2] } else { [0; 2] },
                 unit_bytes_context: None },
             fixed_bytes: ModeBytes::default(), extra: Vec::new(), context_indexer: false, colocate: None,
             experts: (!cfg.dense[layer]).then_some(ExpertCost { whole: Bytes2::default(),
-                half: costs[layer], tp2: true, spark_ok: true }), modes: if mla { MODES.to_vec() } else { vec![LayerMode::HeadSplit] } }
-    }).collect();
+                half: costs[layer], tp2: true, spark_ok: true }), modes: if mla { MODES.to_vec() } else { vec![LayerMode::HeadSplit] } })
+    }).collect() })();
+    let layers = match layers { Ok(value) => value, Err(error) => {
+        refusal(report, format!("Kimi packed layer inventory refused: {error:#}"), "Check checkpoint layer geometry."); return memory;
+    }};
     // Reuse pool-first TP2 onboarding, constrained by the Spark suffix budget.
     let onboard = opts.onboard.unwrap_or(Onboard::Auto);
     let mut request = PlacementRequest {
-        inventory: Inventory { gpus: opts.rtx_bytes.iter().map(|bytes| GpuBudget { capacity_bytes: *bytes,
-            headroom_bytes: opts.headroom_bytes, baseline: Baseline::Planned { context_bytes: 0, loaded_bytes: 0 } }).collect(),
+        inventory: Inventory { gpus: opts.rtx_bytes.iter().enumerate().map(|(rank, bytes)| GpuBudget { capacity_bytes: *bytes,
+            headroom_bytes: opts.headroom_bytes, baseline: baseline[rank] }).collect(),
             spark_ranks: ranks, peer_access: true },
         attention_placement: report.requested_attention, context_buffers: ContextBuffers::default(), layers_first_gpu: 0,
         pool: PoolPolicy { compiled_context: context,
             requested: requested_pool, target: target_pool, floor: context,
             ceiling: target_pool.max(requested_pool.unwrap_or(0)), unit_rows: PAGE },
         layers, pool_overhead: vec![0; 2], pool_bounded: Vec::new(), fixed, startup: Vec::new(), movables: Vec::new(),
-        expert_workspace: 0, tp2_workspace: [0; 2], onboard, expert_gpus: 2, minimum_expert_layers: 0,
+        expert_workspace: 0, tp2_workspace, onboard, expert_gpus: 2, minimum_expert_layers: 0,
         policy: LayerPolicy { default: vec![LayerMode::HeadSplit], ownership: LayerOwnership::Ranges, expert_ownership: ExpertOwnership::Contiguous,
             attention: vec![(AttentionClass::Mla, AttentionPlacement::Layers), (AttentionClass::Kda, AttentionPlacement::Heads)],
             ..Default::default() },
-        hops: HopSpec { storage: HopStorage::ReceiveSlots, row_bytes: cfg.hidden as u64 * 2, rows: 0, lanes: 0,
+        hops: HopSpec { storage: HopStorage::ReceiveSlots, row_bytes: cfg.hidden as u64 * 2, rows: if manifest.is_some() { rows as u64 } else { 0 }, lanes: if manifest.is_some() { LANES } else { 0 },
             entry_gpu: 0, head_gpu: 1, terminal: TerminalHome::Replicated },
-        executor: ExecutorModes { family: "kimi_k3 metadata only", modes: MODES, hops: true, attention: AttentionPlacement::Layers },
+        executor: ExecutorModes { family: "kimi_k3", modes: MODES, hops: true, attention: AttentionPlacement::Layers },
     };
     if let Err(error) = spark_budget.constrain(&mut request) {
         refusal(report, format!("Kimi joint admission refused: {error:#}"),
@@ -244,7 +328,7 @@ pub(super) fn layout(model: &Model, report: &mut PlanReport, opts: &crate::plan:
                     .collect::<Vec<_>>();
                 let categories = device.by_category();
                 memory.notes.push(format!("RTX{gpu}: owned MLA layers {owned:?}; weights {} B, KV/state {} B, total {} B, \
-                    reserved {} B, remaining {} B (header lower bound)",
+                    reserved {} B, remaining {} B",
                     categories.get(&Category::Weights).unwrap_or(&0) + categories.get(&Category::Embedding).unwrap_or(&0),
                     categories.get(&Category::Kv).unwrap_or(&0), device.used_bytes(), opts.headroom_bytes, device.free_bytes()));
                 memory.devices.push(device);
@@ -255,7 +339,7 @@ pub(super) fn layout(model: &Model, report: &mut PlanReport, opts: &crate::plan:
             placed.onboard_layers
         }
         Err(error) => {
-            refusal(report, format!("Kimi K3 coordinator lower bound refused: {error}"),
+            refusal(report, format!("Kimi K3 coordinator admission refused: {error}"),
                 "Coordinator text weights are 105.7 GiB BF16; free KV room by placement, not a smaller pool floor.");
             return memory;
         }

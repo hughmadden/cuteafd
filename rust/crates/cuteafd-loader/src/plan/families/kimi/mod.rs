@@ -17,6 +17,12 @@ mod tests;
 pub struct KimiK3;
 pub static KIMI_K3: KimiK3 = KimiK3;
 
+/// The same validated header inventory used by planning, for native startup.
+/// This does not grant serving admission or convert any core weight format.
+pub fn core_inventory(checkpoint: &Checkpoint) -> Result<crate::families::kimi_k3::core::CoreInventory> {
+    Ok(Model::open(checkpoint)?.core)
+}
+
 const TEXT: &str = "language_model.model.";
 const HEAD: &str = "language_model.lm_head.";
 const GIB: u64 = 1 << 30;
@@ -54,6 +60,8 @@ pub(super) struct Model {
     frontends: [u64; 2],
     /// MLA operands by layer, held whole on the owner or head-split explicitly.
     mla: Vec<Residency>,
+    core: crate::families::kimi_k3::core::CoreInventory,
+    native_k6: bool,
 }
 
 /// Coordinator text weights by how a two-GPU head split holds them.
@@ -141,10 +149,14 @@ impl Model {
         let spec = spec(&cfg, checkpoint);
         let mla = vec![Residency::default(); cfg.layers];
         let mut model = Self { cfg, snapshot: checkpoint.snapshot.clone(), spec, tensors, bytes: BTreeMap::new(), complete: true, expert_formats: Vec::new(),
-            coordinator: Residency::default(), frontends: [0; 2], mla };
+            coordinator: Residency::default(), frontends: [0; 2], mla,
+            core: crate::families::kimi_k3::core::CoreInventory::default(), native_k6: false };
+        model.core = crate::families::kimi_k3::core::CoreInventory::from_checkpoint(&model.cfg, checkpoint,
+            &model.tensors.iter().map(|(name, tensor)| (name.clone(), tensor.shape.clone())).collect())?;
         let mut headers = BTreeMap::new();
         for tensor in &checkpoint.tensors { headers.insert(tensor.meta.name.as_str(), &tensor.meta); }
         for (name, expected) in &model.tensors {
+            if model.core.get_weight(name).is_some() { continue; }
             let Some(meta) = headers.get(name.as_str()) else {
                 ensure!(checkpoint.contains_tensor(name), "Kimi K3 checkpoint lacks {name}");
                 model.complete = false;
@@ -156,6 +168,7 @@ impl Model {
         for tensor in &checkpoint.tensors {
             if let Some(role) = KIMI_K3.classify(&model.spec, &tensor.meta.name) {
                 *model.bytes.entry(role.component).or_default() += tensor.meta.byte_length;
+                if model.core.projections.contains_key(format::split_stem(&tensor.meta.name).0) { continue; }
                 if let Some((layer, rest)) = text(&tensor.meta.name).and_then(|r| indexed(r, "layers."))
                     .filter(|_| role.component != Component::RoutedExpert) {
                     if matches!(role.component, Component::LatentProjection | Component::Router) {
@@ -170,6 +183,19 @@ impl Model {
                 } else if matches!(role.component, Component::Norm | Component::ResidualMix) {
                     model.coordinator.replicated += tensor.meta.byte_length;
                 }
+            }
+        }
+        for projection in model.core.projections.values() {
+            let Some((layer, rest)) = text(&projection.stem).and_then(|r| indexed(r, "layers.")) else { continue; };
+            let (split, replicated) = projection.residency();
+            let residency = if rest.starts_with("self_attn.") && model.cfg.attention[layer] == KimiAttention::Mla {
+                &mut model.mla[layer]
+            } else { &mut model.coordinator };
+            residency.split += split;
+            residency.replicated += replicated;
+            if rest.starts_with("block_sparse_moe.routed_expert_") {
+                let ordinal = model.cfg.dense[..layer].iter().filter(|dense| !**dense).count();
+                model.frontends[ordinal % 2] += replicated;
             }
         }
         let mut formats = std::collections::BTreeSet::new();
@@ -278,7 +304,14 @@ impl Family for KimiK3 {
 
 impl FamilyModel for Model {
     fn spec(&self) -> &ModelSpec { &self.spec }
-    fn native_serving_admission(&self) -> bool { true }
+    fn configure(&mut self, options: &crate::plan::PlanOptions) -> Result<(), ConfigError> {
+        if options.native_k6 {
+            self.core.validate_runtime_groups(&self.cfg).map_err(ConfigError::from_anyhow)?;
+        }
+        self.native_k6 = options.native_k6;
+        Ok(())
+    }
+    fn native_serving_admission(&self) -> bool { self.native_k6 || self.core.projections.is_empty() }
     fn vision_mode(&self, mode: crate::plan::MediaMode) -> crate::plan::MediaMode {
         if mode == crate::plan::MediaMode::Auto { crate::plan::MediaMode::Off } else { mode }
     }
@@ -298,6 +331,15 @@ impl FamilyModel for Model {
         (layer < self.cfg.layers).then(|| self.cfg.activation())
     }
     fn accepts(&self, role: &TensorRole, stem: &str, operand: &mut QuantOperand) -> Result<(), String> {
+        if let Some(projection) = self.core.projections.get(stem) {
+            if self.native_k6 {
+                return super::require(matches!(operand.encoding, format::Encoding::Exl3 { bits: 6 })
+                    && operand.logical == [projection.stored_outputs, projection.shape[1]],
+                    || format!("{stem}: expected header-native K6 {:?}", projection.shape));
+            }
+            return Err(format!("{stem}: header-native K{} core {:?} needs the Kimi shared trellis ABI/package and runtime rotations; no BF16 fallback",
+                projection.bits, projection.shape));
+        }
         if role.component == Component::RoutedExpert && operand.exl3_bits() == Some(2) {
             let expected = match stem.rsplit_once('.').map(|(_, name)| name) {
                 Some("w1" | "w3") => [self.cfg.moe_intermediate, self.cfg.latent],

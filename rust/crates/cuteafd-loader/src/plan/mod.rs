@@ -274,6 +274,8 @@ impl PlanReport {
 
 #[derive(Debug, Clone)]
 pub struct PlanOptions {
+    /// Experimental checkpoint-native Kimi K6 core execution; default closed.
+    pub native_k6: bool,
     pub mapped_scale_preload_bytes: u64,
     /// Available host budget override for offline planning; live cgroup-aware sample otherwise.
     pub mapped_scale_host_budget_bytes: Option<u64>,
@@ -296,6 +298,7 @@ pub struct PlanOptions {
 impl Default for PlanOptions {
     fn default() -> Self {
         Self {
+            native_k6: false,
             mapped_scale_preload_bytes: crate::formats::mapped_preload::DEFAULT_CAP_BYTES,
             mapped_scale_host_budget_bytes: None,
             draft_ownership: None,
@@ -603,7 +606,10 @@ fn plan_of(input: &PlanInput, options: &PlanOptions) -> Result<PlanReport, PlanE
         report.max_image_tokens = Some(crate::media::QWEN_MAX_IMAGE_TOKENS);
     }
     report.runtime = Some(family.runtime());
-    let model = match family.open(&checkpoint) {
+    let model = match family.open(&checkpoint).and_then(|mut model| {
+        model.configure(options)?;
+        Ok(model)
+    }) {
         Ok(model) => model,
         Err(error) => {
             report.hints.push(Hint {

@@ -130,6 +130,7 @@ pub struct Programs<'a> {
     programs: HashMap<String, (u32, ProgramSpec)>,
     card_specs: HashMap<String, [ProgramSpec; 2]>,
     capacities: ProgramCapacities,
+    families: serde_json::Value,
 }
 
 impl NativeLibrary {
@@ -160,7 +161,7 @@ impl NativeLibrary {
             };
             programs.insert(name, (index, spec));
         }
-        Ok(Programs { library: self, load, launch, programs, card_specs: HashMap::new(), capacities: ProgramCapacities::default() })
+        Ok(Programs { library: self, load, launch, programs, card_specs: HashMap::new(), capacities: ProgramCapacities::default(), families: serde_json::Value::Null })
     }
 }
 
@@ -183,6 +184,7 @@ impl<'a> Programs<'a> {
                 self.library.sm_count()?.try_into().context("runtime SM count exceeds u32")?)?;
         }
         self.capacities = ProgramCapacities::from_manifest(&manifest)?;
+        self.families = manifest.get("families").cloned().unwrap_or_default();
         let entries = manifest["programs"].as_array().context("manifest has no programs")?;
         ensure!(entries.len() == self.programs.len(), "manifest lists {} programs, the library {}",
             entries.len(), self.programs.len());
@@ -291,6 +293,12 @@ impl<'a> Programs<'a> {
 
     pub fn capacities(&self) -> ProgramCapacities {
         self.capacities
+    }
+
+    /// Package-owned policies accompany the program table; callers validate
+    /// their schema and linked program geometry before allocating or capturing.
+    pub fn family_metadata(&self, family: &str) -> Result<&serde_json::Value> {
+        self.families.get(family).with_context(|| format!("manifest has no family metadata for {family}"))
     }
 
     /// Resolves a program and loads its kernels on the current device.

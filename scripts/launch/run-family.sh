@@ -2577,6 +2577,9 @@ audio_encoder_hash=""
   if [[ "$family:$speculator" == kimi_k3:dflash2 ]]; then
     plan_draft_args+=(--drafter-snapshot "$draft_snapshot" --draft-fp8 true)
   fi
+  if [[ "$family" == kimi_k3 && "$(get NATIVE_K6 off)" == on ]]; then
+    plan_draft_args+=(--native-k6)
+  fi
   # Read the effective serve argv, including family modes that enable auto.
   plan_host_cache=0
   for ((i=0; i<${#family_args[@]}; i++)); do

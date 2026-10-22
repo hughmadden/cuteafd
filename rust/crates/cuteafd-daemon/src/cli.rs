@@ -162,6 +162,9 @@ pub(crate) struct FabricArgs {
 
 #[derive(Debug, Clone, Args)]
 pub(crate) struct PlanArgs {
+    /// Admit experimental checkpoint-native Kimi K6 core tensors.
+    #[arg(long)]
+    pub(crate) native_k6: bool,
     /// Published EXLR8 manifest name (defaults to bit325).
     #[arg(long)]
     pub(crate) exlr8_manifest: Option<String>,

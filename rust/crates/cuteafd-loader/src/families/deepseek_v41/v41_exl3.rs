@@ -615,11 +615,8 @@ fn build_deepseek_v4_manifest(
     backbone: crate::RoutedExpertShape,
     tiers: &[usize],
 ) -> Result<V41Exl3Manifest> {
-    if storage == Exl3StorageSource::GptqModel {
-        if let Some(name) = derived.keys().find(|name| !is_routed_module(name)) {
-            anyhow::bail!("EXL3 manifest includes non-routed or unexpected projections: {name}");
-        }
-    }
+    // Header derivation and optional side-map equality validate every module.
+    // Dense core modules belong to coordinator loaders, not this routed view.
     let routed: BTreeMap<&str, &Exl3Module> = derived
         .iter()
         .filter(|(name, _)| is_routed_module(name))
@@ -681,6 +678,8 @@ fn build_deepseek_v4_manifest(
                         module.input_features,
                         module.output_features
                     );
+                    ensure!(module.codebook == crate::formats::exl3_storage::Exl3Codebook::Mcg,
+                        "projection {name}: routed expert kernels require MCG, found {}", module.codebook.marker());
                     ensure!(
                         (2..=5).contains(&module.bits),
                         "projection {name} is K{}; the expert kernels run K2..K5",
@@ -1112,6 +1111,68 @@ mod tests {
             assert!(read_publication(&config, &[], shape, &mixed, &[2, 3]).is_err());
         }
         Ok(())
+    }
+
+    #[test]
+    fn mixed_core_k6_and_routed_k2_preserve_catalog_and_side_map_checks() -> Result<()> {
+        for kimi in [false, true] {
+            let (config, mut manifest, shape, mut headers) = deepseek_v4_publication();
+            let rename = |name: &str| if kimi {
+                name.replace("model.layers.", "language_model.model.layers.")
+                    .replace(".mlp.experts.", ".block_sparse_moe.experts.")
+            } else { name.into() };
+            if kimi {
+                headers.retain(|tensor| !tensor.name.starts_with("mtp."));
+                for tensor in &mut headers { tensor.name = rename(&tensor.name); }
+                let entries = manifest["tensor_storage"].as_object().unwrap().iter()
+                    .filter(|(name, _)| !name.starts_with("mtp.")).map(|(name, entry)| {
+                    let mut entry = entry.clone();
+                    entry["stored_tensors"] = serde_json::Value::Object(entry["stored_tensors"].as_object().unwrap()
+                        .iter().map(|(name, tensor)| (rename(name), tensor.clone())).collect());
+                    (rename(name), entry)
+                }).collect();
+                manifest["tensor_storage"] = serde_json::Value::Object(entries);
+            }
+            let core = if kimi { "language_model.model.layers.0.self_attn.q_proj" }
+                else { "model.layers.0.self_attn.q_a_proj" };
+            let mut stored = serde_json::Map::new();
+            for (suffix, dtype, label, dims, width) in [
+                ("trellis", DType::I16, "int16", vec![16, 24, 96], 2),
+                ("suh", DType::F16, "float16", vec![256], 2),
+                ("svh", DType::F16, "float16", vec![384], 2),
+                ("mcg", DType::I32, "int32", vec![], 4),
+            ] {
+                let name = format!("{core}.{suffix}");
+                stored.insert(name.clone(), serde_json::json!({"torch_dtype":label,"shape":dims}));
+                headers.push(SafetensorsTensorMetadata { name, dtype, byte_offset: 0,
+                    byte_length: width * dims.iter().product::<usize>() as u64, shape: dims });
+            }
+            manifest["tensor_storage"][core] = serde_json::json!({"bits_per_weight":6,
+                "mcg_multiplier":3417055213u64,"quant_format":"exl3","stored_tensors":stored});
+            let catalog = read_publication(&config, &[("quantize_config.json", &manifest)], shape, &headers, &[2,3])?;
+            assert_eq!(catalog.projections.len(), if kimi { 18 } else { 27 });
+            assert!(!catalog.projections.contains_key(core));
+            assert_eq!(catalog.decoder_tiers(), &[2,3]);
+            let mut mismatch = manifest.clone();
+            mismatch["tensor_storage"][core]["bits_per_weight"] = serde_json::json!(5);
+            let error = read_publication(&config, &[("quantize_config.json", &mismatch)], shape, &headers, &[]).unwrap_err();
+            assert!(format!("{error:#}").contains(core));
+            let mut incomplete = headers.clone();
+            incomplete.retain(|tensor| tensor.name != format!("{core}.svh"));
+            assert!(read_publication(&config, &[("quantize_config.json", &manifest)], shape, &incomplete, &[]).is_err());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn routed_mul1_is_rejected_after_shared_header_derivation() {
+        let (config, _, shape, mut headers) = deepseek_v4_publication();
+        let marker = headers.iter_mut().find(|tensor| tensor.name.ends_with(".mcg")).unwrap();
+        let stem = marker.name.strip_suffix(".mcg").unwrap().to_owned();
+        marker.name = format!("{stem}.mul1");
+        let error = read_publication(&config, &[], shape, &headers, &[]).unwrap_err();
+        let text = format!("{error:#}");
+        assert!(text.contains(&stem) && text.contains("routed expert kernels require MCG"), "{text}");
     }
 
     #[test]

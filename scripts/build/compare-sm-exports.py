@@ -95,6 +95,7 @@ def jobs(scope):
                    ["--geometry", "kimik3", "--only", "router_scores,expert_input_quant"]))
     if scope == "suspects":
         return result
+    result.append(("kimi-split", "export_b12x_kimi_split_aot.py", []))
     result.extend((geometry, "export_b12x_dsv4_aot.py", ["--geometry", geometry])
                   for geometry in GEOMETRIES)
     for family in ("dsv4f", "dsv4p"):
@@ -168,6 +169,7 @@ def jobs(scope):
                    ["--geometry", geometry, "--capacities", CAPACITIES])
                   for geometry in EXL3_GEOMETRIES)
     result.extend([
+        ("kimi-k6-dense", "export_b12x_dsv4_aot.py", ["--geometry", "kimi_k6_dense,kimi_split"]),
         ("exlr8", "export_b12x_dsv4_aot.py", ["--geometry", "exlr8"]),
         ("glm-stage", "export_b12x_dsv4_aot.py", ["--geometry", "glm_stage"]),
         ("glm2-stage", "export_b12x_dsv4_aot.py", ["--geometry", "glm2_stage"]),

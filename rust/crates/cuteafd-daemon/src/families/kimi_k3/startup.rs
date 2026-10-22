@@ -4,8 +4,10 @@ use super::{admission, device::NativePrograms, engine::Engine};
 use crate::shared::{inventory::{InventoryPhase, RuntimeInventory}, memory::device::{Device, Stream},
     peer_split::{hop::HopLink, PeerExchange, RankDevice}};
 use anyhow::{ensure, Context, Result};
-use cuteafd_core::{ExpertGeometry, memory_layout::{Basis, Category}};
-use cuteafd_loader::{families::kimi_k3::config::KimiK3Config, placement::{Demand, GpuBudget, HOP_SLOTS}};
+use cuteafd_core::ExpertGeometry;
+#[cfg(test)]
+use cuteafd_core::memory_layout::Basis;
+use cuteafd_loader::{families::kimi_k3::config::KimiK3Config, placement::{Demand, GpuBudget}};
 use std::{net::SocketAddr, path::Path, rc::Rc, sync::Arc};
 const HIDDEN: usize = 7168;
 
@@ -22,6 +24,7 @@ pub(crate) struct Options<'a> {
     pub max_context: usize,
     pub pool_tokens: Option<u64>,
     pub graphs: bool,
+    pub native_k6: bool,
     pub ffn_mode: cuteafd_ffi::KimiFfnMode,
     pub hosted_layers: Option<Vec<usize>>,
     pub draft: Option<super::draft::Options>,
@@ -45,10 +48,14 @@ pub(crate) fn load<'a>(library: &'a Arc<cuteafd_ffi::NativeLibrary>,
     cfg: &KimiK3Config, options: Options<'_>) -> Result<Loaded<'a>> {
     ensure!(options.draft.as_ref().is_none_or(|draft| draft.cache_format == options.cache_format),
         "Kimi target/draft cache records differ");
+    let core = cuteafd_loader::plan::families::kimi::core_inventory(checkpoint)?;
+    validate_core(full, &core, options.native_k6)?;
+    let f32_partials = needs_f32_partials(cfg, &core);
     ensure!(crate::shared::peer_split::probed_device(library, options.devices[0], Some(options.devices[1]))?
         == Some(options.devices[1]), "Kimi TP2 requires bidirectional peer access");
     let devices = [options.devices[0], options.devices[1]].map(|id| Device { library, id });
-    let native = devices.map(|device| NativePrograms::load(device, full, programs, options.ffn_mode, options.cache_format).map(Rc::new));
+    let native = devices.map(|device| NativePrograms::load_with_core(device, full, programs, options.ffn_mode,
+        options.cache_format, &core, options.rows).map(Rc::new));
     let [zero, one] = native;
     let native = [zero?, one?];
     let draft_layout = options.draft.as_ref().map(|draft| devices[1].run(||
@@ -102,12 +109,13 @@ pub(crate) fn load<'a>(library: &'a Arc<cuteafd_ffi::NativeLibrary>,
     let lane_layouts = vec![[native[0].lane_layout(full, rows, options.max_context)?,
         native[1].lane_layout(full, rows, options.max_context)?]];
     let graph_set = options.graphs.then(|| super::graphs::owned_inventory(cfg, 1, rows, options.slots)).transpose()?;
-    let mut fixed = exchange_demands(rows, diagnostics)?;
+    let mut fixed = exchange_demands(rows, diagnostics, f32_partials)?;
     if let Some(layout) = &draft_layout {
         fixed.extend(super::draft::bridge_demands(layout)?);
         fixed.push(cuteafd_loader::families::kimi_k3::draft_probe_demand(cfg.layers, cfg.topk, rows.min(64))?);
     }
-    let selected = cuteafd_loader::placement::ProgramSet::from_names(&["kimik3"], programs.names());
+    let selected = cuteafd_loader::placement::ProgramSet::from_names(
+        if core.projections.is_empty() { &["kimik3"][..] } else { &["kimik3", "kimi"][..] }, programs.names());
     for (rank, sample) in inventory.gpus.iter().enumerate() {
         let pending = crate::shared::inventory::pending_code(library, sample.device, rank, true,
             "kimik3", "exl3", &selected)?;
@@ -119,7 +127,7 @@ pub(crate) fn load<'a>(library: &'a Arc<cuteafd_ffi::NativeLibrary>,
         GpuBudget { capacity_bytes: capacity, headroom_bytes: 2 << 30,
             baseline: cuteafd_loader::placement::Baseline::Measured { free_bytes: sample.free_bytes } }
     }).collect::<Vec<_>>().try_into().map_err(|_| anyhow::anyhow!("Kimi GPU sample count"))?;
-    let mut admitted = admission::admit(admission::Inputs { cfg, cache_format: options.cache_format, gpus, devices: [options.devices[0], options.devices[1]],
+    let mut admitted = admission::admit(admission::Inputs { cfg, core, cache_format: options.cache_format, gpus, devices: [options.devices[0], options.devices[1]],
         peer_access: true, spark_ranks: 6, attention: None, requested_pool: options.pool_tokens,
         state_slots: options.slots, prefix_marks: options.marks, rows, lanes: 1, lane_layouts, fixed,
         startup: graph_set.as_ref().map_or_else(Vec::new, |set|
@@ -145,7 +153,7 @@ pub(crate) fn load<'a>(library: &'a Arc<cuteafd_ffi::NativeLibrary>,
         .collect::<Vec<_>>();
     let streams = [Rc::new(Stream::new(devices[0])?), Rc::new(Stream::new(devices[1])?)];
     let ranks = streams.each_ref().map(|s| RankDevice { device: s.device.id, stream: s.raw });
-    let peer = devices[0].run(|| PeerExchange::new_abortable(library, ranks, 1, rows * HIDDEN * 2))?;
+    let peer = devices[0].run(|| PeerExchange::new_abortable(library, ranks, 1, exchange_recv_bytes(rows,f32_partials)?))?;
     let mut hops = devices[0].run(|| HopLink::new(library, ranks, plan.hops(), plan.spec()))?;
     hops.attach_abort([peer.abort_word(0)?.context("Kimi missing abort owner")?,
         peer.abort_word(1)?.context("Kimi missing abort owner")?])?;
@@ -173,28 +181,75 @@ pub(crate) fn load<'a>(library: &'a Arc<cuteafd_ffi::NativeLibrary>,
 }
 
 pub(super) fn code_demand(rank: usize, pending: u64, cublas_bytes: u64, lanes: usize) -> Result<Demand> {
-    ensure!(rank < 2 && (1..=2).contains(&lanes), "Kimi code allowance rank/lane geometry");
-    // Shared allowance covers one thread-local handle per rank. Each head-rank
-    // lane owns an additional private handle beside its explicitly charged workspace.
-    let heads = if rank == 1 { lanes as u64 } else { 0 };
-    let bytes = heads.checked_mul(cublas_bytes).and_then(|extra| pending.checked_add(extra))
-        .context("Kimi future code/handle allowance overflow")?;
-    Ok(Demand::new(rank as u8, Category::Workspace, "Kimi future loaded code and private head handles",
-        bytes, Basis::Formula))
+    cuteafd_loader::families::kimi_k3::allocation::code_demand(rank, pending, cublas_bytes, lanes)
 }
 
-pub(super) fn exchange_demands(rows: usize, diagnostics: bool) -> Result<Vec<Demand>> {
-    ensure!((1..=4096).contains(&rows), "Kimi exchange row capacity");
-    let recv = (rows * HIDDEN * 2).max(256);
+fn validate_core(cfg:&KimiK3Config,core:&cuteafd_loader::families::kimi_k3::core::CoreInventory,
+    enabled:bool)->Result<()> {
+    ensure!(enabled || core.projections.is_empty(),
+        "Kimi checkpoint contains native K6 core tensors; --native-k6 is experimental and off by default pending model-level KL/top-1 qualification");
+    core.validate_runtime_groups(cfg)
+}
+
+use cuteafd_loader::families::kimi_k3::core::{needs_f32_partials,exchange_recv_bytes};
+
+pub(super) fn exchange_demands(rows: usize, diagnostics: bool,f32_partials:bool) -> Result<Vec<Demand>> {
     let progress = if diagnostics { (2 * std::mem::size_of::<cuteafd_ffi::peer_exchange::PeerProgress>()).max(256) } else { 0 };
-    // Hop receive planes are charged by the shared solver; only controls are fixed.
-    let bytes = recv + 256 + 256 + (((HOP_SLOTS + 1) * 16) as usize).max(256) + progress;
-    Ok((0..2).map(|rank| Demand::new(rank, Category::Workspace, "Kimi peer/abort/hop controls",
-        bytes as u64, Basis::Exact)).collect())
+    (0..2).map(|rank| cuteafd_loader::families::kimi_k3::allocation::exchange_demand(
+        rows, rank, f32_partials, progress)).collect()
 }
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use cuteafd_loader::families::kimi_k3::core::{CoreInventory,CoreProjection,CoreSplit};
+
+    fn projection(stem:&str)->CoreProjection {
+        CoreProjection {stem:stem.into(),bits:6,codebook:cuteafd_loader::formats::exl3_storage::Exl3Codebook::Mcg,
+            shape:[128,128],stored_outputs:128,split:CoreSplit::Whole,source_bytes:0}
+    }
+
+    #[test]
+    fn native_core_opt_in_is_closed_before_device_access_and_checks_mixed_groups()->Result<()> {
+        let cfg=KimiK3Config::from_hf(&cuteafd_loader::plan::testing::kimi_k3_config())?;
+        let mut core=CoreInventory::default();
+        validate_core(&cfg,&core,false)?;
+        validate_core(&cfg,&core,true)?;
+        let head="language_model.lm_head";
+        core.projections.insert(head.into(),projection(head));
+        assert!(validate_core(&cfg,&core,false).unwrap_err().to_string().contains("--native-k6"));
+        validate_core(&cfg,&core,true)?;
+        assert!(!needs_f32_partials(&cfg,&core));
+        let root="language_model.model.layers.1.self_attn";
+        let stem=format!("{root}.q_proj");
+        core.projections.insert(stem.clone(),projection(&stem));
+        let error=validate_core(&cfg,&core,true).unwrap_err().to_string();
+        assert!(error.contains(&stem) && error.contains("k_proj") && error.contains("whole-group"));
+        for leaf in ["k_proj","v_proj","g_proj","o_proj"] {
+            let stem=format!("{root}.{leaf}");core.projections.insert(stem.clone(),projection(&stem));
+        }
+        validate_core(&cfg,&core,true)?;
+        assert!(needs_f32_partials(&cfg,&core));
+        let mut prefix=cfg.clone();prefix.layers=1;
+        assert!(!needs_f32_partials(&prefix,&core));
+        Ok(())
+    }
+
+    #[test]
+    fn f32_partial_receivers_and_admission_use_the_same_exact_extent()->Result<()> {
+        for rows in [1,8,64,4096] {for diagnostics in [false,true] {
+            let old=exchange_demands(rows,diagnostics,false)?;
+            let native=exchange_demands(rows,diagnostics,true)?;
+            assert_eq!(exchange_recv_bytes(rows,true)?,rows*HIDDEN*4);
+            for rank in 0..2 {
+                assert_eq!(native[rank].bytes-old[rank].bytes,(rows*HIDDEN*2) as u64);
+                assert_eq!(native[rank].basis,Basis::Exact);
+            }
+        }}
+        assert!(exchange_recv_bytes(0,true).is_err());
+        assert!(exchange_recv_bytes(4097,true).is_err());
+        Ok(())
+    }
     #[test]
     #[ignore = "requires CUTEAFD_KIMI_RUNTIME_ROOT; validates real lib/share layout in an isolated process"]
     fn mounted_runtime_artifact_preflight() -> anyhow::Result<()> {

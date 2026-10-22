@@ -79,6 +79,20 @@ impl<'a> KimiMla<'a> {
     pub fn max_context(&self) -> usize { self.context }
     pub fn splits(&self) -> usize { self.splits }
 
+    /// Shared dense attention after an independently projected producer. The
+    /// projected route retains the same cache/query layout and attention math.
+    pub fn attention(&self,b:KimiMlaBatch,stream:*mut c_void)->Result<()> {
+        validate_projected_attention(b,self.heads,self.rows,self.context,self.splits,self.scratch[1],
+            self.cache_format.record_bytes())?;
+        // SAFETY: metadata, device and extents checked; the caller publishes
+        // query/cache/indices first and retains storage through stream drain.
+        unsafe {self.attention.launch(&[b.query.ptr,b.cache.ptr,b.page_table.ptr,b.lengths.ptr,
+            b.query_offsets.ptr,b.attention.ptr,b.lse.ptr,b.attention_scratch.ptr],
+            &[Scalar::I32(b.rows as i32),Scalar::I32(b.requests as i32),Scalar::I64(b.page_table_width as i64),
+                Scalar::I32(b.active_splits as i32)],stream)?;}
+        Ok(())
+    }
+
     /// Enqueue without allocation of device storage, synchronization or lazy
     /// kernel loading. The owning engine serializes accesses and retains all
     /// buffers through completion and every replay of a captured graph.
@@ -122,6 +136,36 @@ impl<'a> KimiMla<'a> {
         }
         Ok(())
     }
+}
+
+fn validate_projected_attention(b:KimiMlaBatch,heads:usize,rows:usize,context:usize,splits:usize,scratch:usize,
+    record_bytes:usize)->Result<()> {
+    if b.rows==0 || b.rows>rows || b.requests==0 || b.requests>b.rows
+        || b.page_table_width==0 || b.page_table_width>context.div_ceil(MLA_PAGE_ROWS)
+        || b.cache_pages==0 || b.cache_pages>i32::MAX as usize || b.active_splits!=splits {
+        return Err(KimiMlaError::Invalid("projected attention batch/context/split geometry"));
+    }
+    let cache=b.cache_pages.checked_mul(MLA_PAGE_ROWS*record_bytes)
+        .ok_or(KimiMlaError::Invalid("projected attention cache overflow"))?;
+    let operands=[(b.query,b.rows*heads*576*2),(b.cache,cache),
+        (b.page_table,b.requests*b.page_table_width*4),(b.lengths,b.requests*4),
+        (b.query_offsets,(b.requests+1)*4),(b.attention,b.rows*heads*512*2),
+        (b.lse,b.rows*heads*4),(b.attention_scratch,scratch)];
+    validate_buffers(&operands,b.query.device_id)?;
+    for (buffer,bytes) in operands {
+        if buffer.flags!=0 || (buffer.ptr as usize).checked_add(bytes).is_none() {
+            return Err(KimiMlaError::Invalid("attention flags/address overflow"));
+        }
+    }
+    for writer in 5..8 {for other in 0..8 {
+        if writer!=other && operands[writer].1>0 && operands[other].1>0 {
+            let (a,an)=operands[writer];let (b,bn)=operands[other];
+            let start=a.ptr as usize;let end=start.checked_add(an).ok_or(KimiMlaError::Invalid("attention address overflow"))?;
+            let other_start=b.ptr as usize;let other_end=other_start.checked_add(bn).ok_or(KimiMlaError::Invalid("attention address overflow"))?;
+            if start<other_end && other_start<end {return Err(KimiMlaError::Invalid("attention operands overlap"));}
+        }
+    }}
+    Ok(())
 }
 
 fn validate_manifest(specs: [&ProgramSpec; 3], heads: usize, rows: usize, mode: KimiMlaMode, cache_format: MlaCacheFormat)
@@ -360,6 +404,27 @@ impl<'a> KimiFfn<'a> {
         KimiFfnMode::Direct.validate(down.spec())?;
         let rows = situ.rows.min(gate_up.spec().capacity_rows as usize).min(down.spec().capacity_rows as usize);
         Ok(Self { gate_up, situ, down, rows, width: intermediate })
+    }
+
+    /// Standalone BF16 projection with this FFN's gate/up geometry. It also
+    /// provides a same-weight reduction-order control for projected seams.
+    pub fn project_gate_up(&self,rows:usize,input:Buffer,weight:Buffer,output:Buffer,
+        stream:*mut c_void)->W8Result<()> {
+        validate_projection_buffers(rows,self.rows,7168,2*self.width,input,weight,output)?;
+        // SAFETY: resolved program, checked geometry/devices/disjoint output;
+        // the caller retains every operand until the stream drains.
+        unsafe {self.gate_up.launch(&[input.ptr,weight.ptr,output.ptr],&[Scalar::I32(rows as i32)],stream)?;}
+        Ok(())
+    }
+
+    /// Standalone down projection, retaining the existing BF16 reduction.
+    pub fn project_down(&self,rows:usize,input:Buffer,weight:Buffer,output:Buffer,
+        stream:*mut c_void)->W8Result<()> {
+        validate_projection_buffers(rows,self.rows,self.width,7168,input,weight,output)?;
+        // SAFETY: resolved program with validated dense disjoint operands;
+        // the caller retains all storage through completion.
+        unsafe {self.down.launch(&[input.ptr,weight.ptr,output.ptr],&[Scalar::I32(rows as i32)],stream)?;}
+        Ok(())
     }
 
     pub fn launch(&self, b: KimiFfnBatch, stream: *mut c_void) -> W8Result<()> {
@@ -849,6 +914,35 @@ mod tests {
                 "page_rows": 64, "norm_eps": 1e-6, "kv_cache": "bf16", "max_context": context,
                 "num_splits": splits, "chunks_per_split": context.div_ceil(64).div_ceil(splits), "mode": mode.name()}),
         })
+    }
+
+    #[test]
+    fn projected_attention_checks_geometry_extents_and_writer_aliases() {
+        let buffer=|index|Buffer{ptr:(index*0x10000000usize)as *mut c_void,
+            bytes:0x10000000,device_id:0,flags:0};
+        let b=KimiMlaBatch{rows:8,requests:1,page_table_width:1,cache_pages:1,active_splits:16,
+            x:buffer(9),slots:buffer(10),cache:buffer(2),page_table:buffer(3),lengths:buffer(4),
+            query_offsets:buffer(5),query:buffer(1),q_resid:buffer(11),attention:buffer(6),lse:buffer(7),
+            output:buffer(12),producer_scratch:buffer(13),attention_scratch:buffer(8),output_scratch:buffer(14)};
+        let validate=|batch|validate_projected_attention(batch,96,64,1048576,16,4096,MLA_RECORD_BYTES);
+        validate(b).unwrap();
+        for bad in [KimiMlaBatch{rows:0,..b},KimiMlaBatch{rows:65,..b},
+            KimiMlaBatch{requests:9,..b},KimiMlaBatch{page_table_width:16385,..b},
+            KimiMlaBatch{cache_pages:usize::MAX,..b},KimiMlaBatch{active_splits:1,..b}] {
+            assert!(validate(bad).is_err());
+        }
+        let readers=[b.query,b.cache,b.page_table,b.lengths,b.query_offsets];
+        for reader in readers {
+            assert!(validate(KimiMlaBatch{attention:Buffer{ptr:reader.ptr,..b.attention},..b}).is_err());
+            assert!(validate(KimiMlaBatch{lse:Buffer{ptr:reader.ptr,..b.lse},..b}).is_err());
+            assert!(validate(KimiMlaBatch{attention_scratch:Buffer{ptr:reader.ptr,..b.attention_scratch},..b}).is_err());
+        }
+        for query in [Buffer{bytes:1,..b.query},Buffer{device_id:1,..b.query},Buffer{flags:1,..b.query},
+            Buffer{ptr:std::ptr::null_mut(),..b.query},
+            Buffer{ptr:(usize::MAX-15)as *mut c_void,..b.query}] {
+            assert!(validate(KimiMlaBatch{query,..b}).is_err());
+        }
+        assert!(validate(KimiMlaBatch{lse:Buffer{ptr:b.attention.ptr,..b.lse},..b}).is_err());
     }
 
     #[test]

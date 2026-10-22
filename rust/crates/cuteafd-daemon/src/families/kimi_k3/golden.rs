@@ -49,6 +49,8 @@ pub(crate) struct GoldenArgs {
     /// Informational F32 comparison only; direct gate/up is the speed-first default.
     #[arg(long, env = "CUTEAFD_KIMI_COMPENSATED_FFN")]
     compensated_ffn: bool,
+    /// Experimental native K6 core execution; off until explicitly selected.
+    #[arg(long)] native_k6: bool,
     /// All-layer logits scored against the immutable F32 reference quick subset.
     #[arg(long, requires_all = ["golden", "save_logits"], conflicts_with_all = ["reference_state", "last_layer", "windows"])] nll: bool,
 }
@@ -63,6 +65,7 @@ impl GoldenArgs {
 
     fn provenance(&self) -> Value {
         serde_json::json!({"schema": "cuteafd.kimi.run/1", "ffn_mode": self.ffn_mode().name(), "kv_cache": self.kv_cache.label(),
+            "native_k6": self.native_k6,
             "gate_up_programs": ([3072, 16896].map(|width| self.ffn_mode().gate_up_stem(width))),
             "rtx_expert_layers":self.rtx_expert_layers, "window": self.window, "last_layer": self.last_layer, "diagnostic_only": !self.nll})
     }
@@ -315,7 +318,7 @@ fn native(args: &GoldenArgs, checkpoint: &cuteafd_loader::plan::Checkpoint,
             peers: args.peers.clone(), rtx_expert_layers: cuteafd_loader::placement::Onboard::Layers(args.rtx_expert_layers),
             spark_budget_gib: args.spark_budget_gib,
             rows, slots: 1, marks: 1, max_context: cuteafd_loader::families::kimi_k3::COMPILED_CONTEXT, pool_tokens: Some(1_048_576), graphs: false,
-            draft: None, ffn_mode: args.ffn_mode(), hosted_layers: Some(hosted_layers(&std::env::var("CUTEAFD_GOLDEN_EXPERT_LAYERS")?)?),
+            draft: None, ffn_mode: args.ffn_mode(), native_k6: args.native_k6, hosted_layers: Some(hosted_layers(&std::env::var("CUTEAFD_GOLDEN_EXPERT_LAYERS")?)?),
         })?;
     use cuteafd_engine::prefix::PrefixFamily;
     let pages = engine.prefix_family()?.layout().pages;
@@ -542,6 +545,21 @@ mod tests {
     }
 
     #[test]
+    fn native_k6_cli_is_off_by_default_and_records_explicit_selection()->Result<()> {
+        use clap::Parser;
+        let args=["cuteafd","kimi-golden","--snapshot","/checkpoint","--windows","/panel",
+            "--reference-state","/state","--window","w","--last-layer","3"];
+        for enabled in [false,true] {
+            let tail=if enabled {vec!["--native-k6"]}else{vec![]};
+            let cli=crate::cli::Cli::try_parse_from(args.into_iter().chain(tail))?;
+            let crate::cli::Commands::KimiGolden(parsed)=cli.command else {panic!("Kimi command")};
+            assert_eq!(parsed.native_k6,enabled);
+            assert_eq!(parsed.provenance()["native_k6"],enabled);
+        }
+        Ok(())
+    }
+
+    #[test]
     fn ffn_cli_and_env_opt_in_are_explicit_and_recorded() -> Result<()> {
         use clap::{CommandFactory, FromArgMatches};
         let args = ["cuteafd", "kimi-golden", "--snapshot", "/checkpoint", "--windows", "/panel",
@@ -640,7 +658,7 @@ mod tests {
         let arch = cuteafd_loader::placement::ArchContext::for_device("sm_120", 96 << 30);
         let names = programs.iter().filter_map(|p| p["name"].as_str()).collect::<Vec<_>>();
         let selected = cuteafd_loader::placement::ProgramSet::from_names(&["kimik3"], names);
-        let mut fixed = exchange_demands(rows, false)?;
+        let mut fixed = exchange_demands(rows, false,false)?;
         for rank in 0..2 {
             let code = cuteafd_loader::placement::inventory::loaded_code_allowance("kimik3", "exl3", true,
                 rank as u8, arch, Some(&selected));
@@ -667,7 +685,7 @@ mod tests {
             cuteafd_loader::families::kimi_k3::SPARK_DEFAULT_BUDGET_BYTES,
             cuteafd_loader::families::kimi_k3::SPARK_ESTIMATED_RESERVE_BYTES)?;
         let graph_set = super::super::graphs::owned_inventory(&cfg, 1, rows, slots)?;
-        let admitted = admission::admit(admission::Inputs { cfg: &cfg, cache_format: cuteafd_core::MlaCacheFormat::Bf16, gpus: [GpuBudget {
+        let admitted = admission::admit(admission::Inputs { cfg: &cfg, core: Default::default(), cache_format: cuteafd_core::MlaCacheFormat::Bf16, gpus: [GpuBudget {
             capacity_bytes: 96 << 30, headroom_bytes: 2 << 30,
             baseline: cuteafd_loader::placement::Baseline::Measured { free_bytes: (96 << 30) - reserve } }; 2],
             devices: [0, 1], peer_access: true, spark_ranks: 6, attention: None,
@@ -728,7 +746,7 @@ mod tests {
     fn peer_exchange_fixed_charges_exclude_solver_owned_hop_planes() -> Result<()> {
         for rows in [1, 64, 4096] {
             for diagnostics in [false, true] {
-                let demands = exchange_demands(rows, diagnostics)?;
+                let demands = exchange_demands(rows, diagnostics,false)?;
                 let progress = if diagnostics {
                     (2 * std::mem::size_of::<cuteafd_ffi::peer_exchange::PeerProgress>()).max(256)
                 } else { 0 };
@@ -740,8 +758,8 @@ mod tests {
                 }
             }
         }
-        assert!(exchange_demands(0, false).is_err());
-        assert!(exchange_demands(4097, false).is_err());
+        assert!(exchange_demands(0, false,false).is_err());
+        assert!(exchange_demands(4097, false,false).is_err());
         Ok(())
     }
 

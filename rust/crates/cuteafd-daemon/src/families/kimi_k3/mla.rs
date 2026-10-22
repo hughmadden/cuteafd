@@ -31,6 +31,11 @@ impl<'a> Mla<'a> {
     pub(crate) fn max_context(&self) -> usize { self.native.max_context() }
     pub(crate) fn splits(&self) -> usize { self.native.splits() }
 
+    pub(crate) fn attention(&self,layer:usize,batch:KimiMlaBatch,stream:*mut c_void)->Result<()> {
+        ensure!(self.layers.get(layer)==Some(&KimiAttention::Mla),"layer {layer} is not Kimi MLA");
+        self.native.attention(batch,stream)?;Ok(())
+    }
+
     /// Output is head-local at 48 heads and complete at 96 heads. This call
     /// never applies the TP2 meet twice or substitutes an ungated projection.
     pub(crate) fn forward(&self, layer: usize, weights: KimiMlaWeights,

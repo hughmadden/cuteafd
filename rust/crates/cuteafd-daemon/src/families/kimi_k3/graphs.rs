@@ -5,7 +5,7 @@ use crate::shared::{decode_graph::{GraphBank, GraphDecision, GraphOwner, GraphPo
     memory::device::Stream};
 use anyhow::{ensure, Result};
 use cuteafd_loader::{families::kimi_k3::config::{KimiAttention, KimiK3Config},
-    placement::{GraphSet, Lifetime, inventory::StartupGraphs}};
+    placement::inventory::StartupGraphs};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum Op { Residual(MixSite), Attention { layer: usize, sequences: usize }, Ffn(usize) }
@@ -13,16 +13,8 @@ pub(crate) enum Op { Residual(MixSite), Attention { layer: usize, sequences: usi
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct Key { pub lane: usize, pub rank: usize, pub rows: usize, pub op: Op }
 
-pub(crate) const RESERVE: &str = "Kimi startup graph reserve";
-
-pub(crate) fn demand(set: &GraphSet, rank: usize) -> cuteafd_loader::placement::Demand {
-    let mut demand = set.demand(rank);
-    demand.group = RESERVE.into();
-    demand.basis = cuteafd_core::memory_layout::Basis::Estimated;
-    demand
-}
-
-pub(crate) const ROWS: [usize; 5] = [1, 4, 16, 64, 4096];
+pub(crate) use cuteafd_loader::families::kimi_k3::allocation::{GRAPH_RESERVE as RESERVE,
+    GRAPH_ROWS as ROWS, graph_demand as demand};
 
 /// An estimated reserve until the first real serving census qualifies its bytes.
 /// The exact same key set is charged by admission and sealed by each binding.
@@ -30,7 +22,6 @@ pub(crate) fn inventory(cfg: &KimiK3Config, lanes: usize, capacity: usize, slots
     resident: impl Fn(usize, usize) -> bool) -> Result<StartupGraphs<Key>> {
     ensure!((1..=2).contains(&lanes) && (1..=4096).contains(&capacity) && (1..=64).contains(&slots), "Kimi graph lane/row capacity");
     let mut keys = Vec::new();
-    let mut counts = [0u64; 2];
     for lane in 0..lanes {
         for rank in 0..2 {
             for rows in ROWS.into_iter().filter(|&rows| rows <= capacity) {
@@ -49,8 +40,7 @@ pub(crate) fn inventory(cfg: &KimiK3Config, lanes: usize, capacity: usize, slots
             }
         }
     }
-    for key in &keys { counts[key.rank] += 1; }
-    GraphSet::new(&counts, 256 << 10, 10, 64 << 20, keys.len() as u64, Lifetime::Startup)
+    cuteafd_loader::families::kimi_k3::allocation::graphs(cfg, lanes, capacity, slots, resident)?
         .startup(keys).map_err(anyhow::Error::msg)
 }
 
