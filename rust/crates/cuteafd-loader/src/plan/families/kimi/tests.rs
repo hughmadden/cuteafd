@@ -344,13 +344,13 @@ fn cache_geometry_requires_tp2_and_preserves_physical_mla_copies() {
 }
 
 #[test]
-fn core_k6_headers_charge_native_bytes_but_do_not_claim_runtime_support() {
+fn core_k6_headers_charge_native_bytes_and_admit_native_operands() {
     let dir = tempfile::tempdir().unwrap();
     testing::write_kimi_core_snapshot(dir.path(), false);
     let checkpoint = Checkpoint::open(dir.path()).unwrap();
     let model = Model::open(&checkpoint).unwrap();
     assert_eq!(model.core.projections.len(), 926);
-    assert!(!model.native_serving_admission());
+    assert!(model.native_serving_admission());
     assert!(!dir.path().join("quantize_config.json").exists());
     let source: u64 = model.core.projections.values().map(|p| p.source_bytes).sum();
     assert_eq!(source, 40_323_110_520);
@@ -376,19 +376,19 @@ fn core_k6_headers_charge_native_bytes_but_do_not_claim_runtime_support() {
         assert_eq!(operand.exl3_bits(), Some(6));
         assert_eq!(operand.logical, [projection.stored_outputs, projection.shape[1]]);
         let role = KIMI_K3.classify(&model.spec, &format!("{stem}.trellis")).unwrap();
-        assert!(model.accepts(&role, stem, &mut operand).unwrap_err().contains("no BF16 fallback"));
+        model.accepts(&role, stem, &mut operand).unwrap();
     }
 }
 
 #[test]
-fn core_index_only_native_inventory_reads_headers_and_preserves_runtime_gate() {
+fn core_index_only_native_inventory_reads_headers_and_admits_native_core() {
     let dir = tempfile::tempdir().unwrap();
     testing::write_kimi_core_snapshot(dir.path(), false);
     let checkpoint = Checkpoint::inventory(dir.path()).unwrap();
     assert!(checkpoint.tensors.is_empty());
     let model = Model::open(&checkpoint).unwrap();
     assert_eq!(model.core.projections.len(), 926);
-    assert!(!model.native_serving_admission());
+    assert!(model.native_serving_admission());
     assert_eq!(model.core.projections.values().map(|p| p.source_bytes).sum::<u64>(), 40_323_110_520);
     model.core.validate_runtime_groups(&model.cfg).unwrap();
     let names = files::required_tensors(&checkpoint,
