@@ -115,7 +115,8 @@ fn installed_pushed_operands_match_the_mount_golden() -> Result<()> {
             for job in &step.jobs {
                 let kind = match job { Job::Upload { .. } => "upload", Job::Widen { .. } => "widen", Job::NarrowF32Bf16 { .. } => "narrow",
                     Job::Quant { .. } => "quant", Job::Absorb { .. } => "absorb", Job::ALog { .. } => "a_log",
-                    Job::W8a16Pack { .. } => "w8a16", Job::NativePlane { .. } => "plane" };
+                    Job::W8a16Pack { .. } => "w8a16", Job::NativePlane { .. } => "plane",
+                    Job::ScaleCodes { .. } => panic!("GLM Flash must not record V4.1 scale coding") };
                 let largest = kinds.entry(kind).or_default();
                 *largest = (*largest).max(step.bytes());
             }

@@ -10,6 +10,7 @@ pub(crate) struct ArenaLayout {
     regions: Vec<Range<usize>>,
     bytes: usize,
     validation_bytes: usize,
+    generated: Vec<Range<usize>>,
 }
 
 impl ArenaLayout {
@@ -37,6 +38,7 @@ impl ArenaLayout {
             regions,
             bytes,
             validation_bytes: 0,
+            generated: Vec::new(),
         })
     }
 
@@ -49,6 +51,16 @@ impl ArenaLayout {
             "host validation tail exceeds admission"
         );
         self.validation_bytes = bytes;
+        Ok(self)
+    }
+    /// Generated regions are initialized before delivery and written only by
+    /// checked load transforms. They are not part of source delivery coverage.
+    pub fn with_generated(mut self, mut ranges: Vec<Range<usize>>) -> Result<Self> {
+        ranges.sort_by_key(|r| r.start);
+        ensure!(ranges.iter().all(|r| r.start < r.end && r.end <= self.bytes)
+            && ranges.windows(2).all(|r| r[0].end <= r[1].start),
+            "generated regions overlap or exceed the arena");
+        self.generated = ranges;
         Ok(self)
     }
     pub fn logical_bytes(&self) -> usize {
@@ -247,6 +259,26 @@ impl ExpectedCoverage {
         }
         Ok(())
     }
+    /// Separate a bounded staged tail from the resident/source prefix. Tail
+    /// offsets become relative to `base`; no delivery may straddle the gap.
+    pub fn split_at(self, base: u64) -> Result<(Self, Self)> {
+        let (mut prefix, mut tail) = (Self::default(), Self::default());
+        for mut shape in self.shapes {
+            let bytes = shape.dims.iter().fold(shape.run, |n, &(count, _)| n * count);
+            if shape.dst_base + shape.dst_len <= base {
+                shape.packed_base = prefix.bytes;
+                prefix.bytes += bytes;
+                prefix.shapes.push(shape);
+            } else {
+                ensure!(shape.dst_base >= base, "delivery crosses staged-tail boundary");
+                shape.dst_base -= base;
+                shape.packed_base = tail.bytes;
+                tail.bytes += bytes;
+                tail.shapes.push(shape);
+            }
+        }
+        Ok((prefix, tail))
+    }
     /// Delivered coverage equals this footprint exactly.
     pub(crate) fn complete(&self, delivered: &Coverage) -> bool {
         delivered.bytes == self.bytes
@@ -270,6 +302,22 @@ impl ExpectedCoverage {
     /// End of the last planned byte (the footprint's destination extent).
     fn end(&self) -> u64 {
         self.shapes.last().map_or(0, |shape| shape.dst_base + shape.dst_len)
+    }
+    /// Whether a generated range touches a delivered run, without expanding
+    /// the shape into per-row intervals.
+    fn overlaps(&self, start: u64, end: u64) -> bool {
+        fn inner(dims: &[(u64, u64)], run: u64, start: u64, end: u64) -> bool {
+            let Some((&(count, stride), rest)) = dims.split_first() else { return start < run && end > 0 };
+            let step = start / stride;
+            if step >= count { return false; }
+            let at = step * stride;
+            inner(rest, run, start - at, end - at)
+                || (step + 1 < count && end > at + stride)
+        }
+        self.shapes.iter().any(|shape| {
+            shape.dst_base < end && start < shape.dst_base + shape.dst_len
+                && inner(&shape.dims, shape.run, start.saturating_sub(shape.dst_base), end - shape.dst_base)
+        })
     }
     /// Every destination gap below `limit` in ascending order: between
     /// entries, between runs inside each entry, and after the last entry.
@@ -350,8 +398,23 @@ impl<'a> LoadingArena<'a> {
             expected.end() <= layout.logical_bytes() as u64,
             "expected footprint exceeds admitted arena"
         );
+        ensure!(layout.generated.iter().all(|r| !expected.overlaps(r.start as u64, r.end as u64)),
+            "generated region overlaps delivered source bytes");
         let validation = vec![0; layout.validation_bytes];
         let allocation = Allocation::new(device, layout.bytes())?;
+        let initialized = if layout.generated.is_empty() { Ok(()) } else { device.run(|| {
+            let queued = layout.generated.iter().try_for_each(|range| {
+                let buffer = slice(allocation.buffer, range.clone())?;
+                // SAFETY: generated ranges are disjoint unpublished arena storage.
+                unsafe { device.library.zero_pitched_async(buffer, range.len(), range.len(), 1, std::ptr::null_mut()) }
+            });
+            // SAFETY: the arena retains all queued zero-fill destinations.
+            let drained = unsafe { device.library.cuda_stream_synchronize(std::ptr::null_mut()) };
+            drained?;
+            queued
+        }) };
+        if initialized.is_err() { device.library.quarantine_module_after_failed_drain(); }
+        initialized?;
         Ok(Self {
             allocation,
             layout,
@@ -470,7 +533,17 @@ impl<'a> DeliveredArena<'a> {
                     Ok(())
                 };
                 self.expected.gaps(self.layout.bytes as u64, &mut |start, end| {
-                    gap(usize::try_from(start)?, usize::try_from(end)?)
+                    let mut cursor = usize::try_from(start)?;
+                    let end = usize::try_from(end)?;
+                    // Preserve generated scale planes without expanding the
+                    // shape-based source footprint into per-row intervals.
+                    let first = self.layout.generated.partition_point(|r| r.end <= cursor);
+                    for range in &self.layout.generated[first..] {
+                        if range.start >= end { break; }
+                        gap(cursor, range.start.max(cursor))?;
+                        cursor = range.end.min(end);
+                    }
+                    gap(cursor, end)
                 })?;
                 if let Some(group) = pending { flush(group)?; }
                 Ok(())
@@ -550,6 +623,78 @@ mod tests {
         assert!(ArenaLayout::new([257, 32], 543).is_err());
         assert!(ArenaLayout::new([usize::MAX, 1], usize::MAX).is_err());
         assert!(ArenaLayout::new([], 0).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn generated_ranges_are_disjoint_and_inside_device_storage() -> Result<()> {
+        let layout = ArenaLayout::new([512], 512)?;
+        assert_eq!(layout.clone().with_generated(vec![256..512, 16..32])?.generated, vec![16..32, 256..512]);
+        for ranges in [vec![0..0], vec![0..513], vec![16..32, 31..48]] {
+            assert!(layout.clone().with_generated(ranges).is_err());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn staged_coverage_split_preserves_gaps_and_rejects_crossing() -> Result<()> {
+        let coverage = ExpectedCoverage::spans(&[(0, 16), (32, 16), (256, 32)]);
+        let (prefix, tail) = coverage.split_at(256)?;
+        assert!(prefix.contains(0, 16) && prefix.contains(32, 16));
+        assert!(!prefix.contains(16, 16));
+        assert!(tail.contains(0, 32));
+        assert!(!tail.contains(32, 1));
+        assert!(expected(32)?.split_at(16).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn shaped_staged_coverage_rebases_packed_offsets_and_checks_generated_overlap() -> Result<()> {
+        let make = || ExpectedCoverage {
+            shapes: vec![
+                Shape { dst_base: 0, dst_len: 12, packed_base: 0, run: 4, dims: vec![(2, 8)] },
+                Shape { dst_base: 256, dst_len: 44, packed_base: 8, run: 4, dims: vec![(2, 32), (2, 8)] },
+            ], bytes: 24,
+        };
+        let expected = make();
+        for start in 0..310 {
+            for end in start + 1..=310 {
+                assert_eq!(expected.overlaps(start, end), (start..end).any(|at| expected.contains(at, 1)),
+                    "overlap {start}..{end}");
+            }
+        }
+        assert!(make().split_at(280).is_err());
+        let (prefix, tail) = make().split_at(256)?;
+        assert_eq!((prefix.bytes(), tail.bytes()), (8, 16));
+        let mut delivered = Coverage::default();
+        for at in [0, 8, 32, 40] { tail.record(&mut delivered, at, 4)?; }
+        assert!(tail.complete(&delivered));
+        assert!(!tail.contains(4, 4));
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires an allocated CPU build slot and explicit NVMe fixture directory"]
+    fn generated_planes_survive_padding_zero_and_do_not_complete_source_delivery() -> Result<()> {
+        let fixture = Fixture::build()?;
+        let library = fixture.load()?;
+        let device = Device { library: &library, id: 0 };
+        let layout = ArenaLayout::new([512], 512)?.with_generated(vec![256..512])?;
+        assert!(LoadingArena::new(device, layout.clone(), expected(512)?).is_err());
+        let mut loading = LoadingArena::new(device, layout, expected(16)?)?;
+        let generated = loading.destination(256, 256)?;
+        let mut bytes = vec![0xff; 256];
+        library.copy_d2h(&mut bytes, generated)?;
+        assert_eq!(bytes, vec![0; 256]);
+        library.copy_h2d(generated, &[0x6b; 256])?;
+        assert!(loading.copied(256, 256).is_err());
+        loading.copied(0, 16)?;
+        let ready = loading.done()?.initialize(|arena| arena.zero_padding())?;
+        library.copy_d2h(&mut bytes, ready.region(0)?.subregion(256, 256)?.buffer())?;
+        assert_eq!(bytes, vec![0x6b; 256]);
+        let mut padding = [0xff; 240];
+        library.copy_d2h(&mut padding, ready.region(0)?.subregion(16, 240)?.buffer())?;
+        assert_eq!(padding, [0; 240]);
         Ok(())
     }
 
