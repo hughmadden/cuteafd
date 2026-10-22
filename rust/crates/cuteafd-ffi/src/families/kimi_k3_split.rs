@@ -1,5 +1,6 @@
 //! Already-projected Kimi seams. The original fused BF16 bindings are unchanged.
-use super::kimi_k3::{KimiKda, MLA_RECORD_BYTES, MLA_PAGE_ROWS};
+use super::kimi_k3::{KimiKda, MLA_PAGE_ROWS};
+use cuteafd_core::MlaCacheFormat;
 use crate::{programs::{Program, ProgramSpec, Programs, Scalar}, CuteafdDeviceBuffer as Buffer};
 use std::ffi::c_void;
 use thiserror::Error;
@@ -20,20 +21,20 @@ const KDA: &[&str] = &["x", "q", "k", "v", "gate", "w_fab", "w_f", "conv_w", "a_
 
 pub struct KimiMlaSplit<'a> {
     rank: Program<'a>, query: Program<'a>, gate: Program<'a>,
-    heads: usize, rows: usize, kv_stride: usize, scratch: usize,
+    heads: usize, rows: usize, kv_stride: usize, scratch: usize, cache_format: MlaCacheFormat,
 }
 impl<'a> KimiMlaSplit<'a> {
     pub fn load(programs: &'a Programs<'a>, names: [&str; 3], heads: usize, rows: usize,
-        kv_stride: usize) -> Result<Self> {
+        kv_stride: usize, cache_format: MlaCacheFormat) -> Result<Self> {
         if !matches!(heads, 48 | 96) || !(1..=4096).contains(&rows) || !matches!(kv_stride, 576 | 640) {
             return Err(KimiSplitError::Invalid("MLA geometry"));
         }
         let specs = [programs.spec(names[0])?, programs.spec(names[1])?, programs.spec(names[2])?];
-        let scratch = validate_mla(specs, heads, rows, kv_stride)?;
+        let scratch = validate_mla(specs, heads, rows, kv_stride, cache_format)?;
         let rank = programs.program(names[0], RANK)?;
         let query = programs.program(names[1], QUERY)?;
         let gate = programs.program(names[2], GATE)?;
-        Ok(Self { rank, query, gate, heads, rows, kv_stride, scratch })
+        Ok(Self { rank, query, gate, heads, rows, kv_stride, scratch, cache_format })
     }
     pub fn scratch_bytes(&self) -> usize { self.scratch }
 
@@ -44,7 +45,7 @@ impl<'a> KimiMlaSplit<'a> {
         if b.cache_pages == 0 || b.cache_pages > i32::MAX as usize {
             return Err(KimiSplitError::Invalid("MLA cache pages"));
         }
-        let cache = b.cache_pages.checked_mul(MLA_PAGE_ROWS*MLA_RECORD_BYTES)
+        let cache = b.cache_pages.checked_mul(MLA_PAGE_ROWS*self.cache_format.record_bytes())
             .ok_or(KimiSplitError::Invalid("MLA cache overflow"))?;
         checked(&[(b.q_a,b.rows*1536*2),(b.kv_a,b.rows*self.kv_stride*2),
             (b.q_norm,1536*2),(b.kv_norm,512*2),(b.slots,b.rows*8),
@@ -144,7 +145,8 @@ fn schema(spec: &ProgramSpec, pointers: &[&str], scalars: &[u8], rows: usize) ->
     }
     Ok(())
 }
-fn validate_mla(specs: [&ProgramSpec;3], heads: usize, rows: usize, kv_stride: usize) -> Result<usize> {
+fn validate_mla(specs: [&ProgramSpec;3], heads: usize, rows: usize, kv_stride: usize,
+    cache_format: MlaCacheFormat) -> Result<usize> {
     for (spec, pointers) in specs.iter().zip([RANK,QUERY,GATE]) {
         schema(spec,pointers,b"i",rows)?;
         if [("heads",heads),("hidden",7168),("q_lora_rank",1536),("kv_lora_rank",512),
@@ -156,6 +158,7 @@ fn validate_mla(specs: [&ProgramSpec;3], heads: usize, rows: usize, kv_stride: u
     }
     let bytes = (rows*2112*2).div_ceil(1024)*1024;
     if specs[0].geometry["kv_stride"].as_u64()!=Some(kv_stride as u64)
+        || specs[0].geometry["kv_cache"].as_str()!=Some(cache_format.label())
         || specs[0].scratch.get("scratch").copied()!=Some(bytes as u64)
         || specs[0].scratch.len()!=1 || !specs[1].scratch.is_empty() || !specs[2].scratch.is_empty() {
         return Err(KimiSplitError::Invalid("MLA manifest stride/scratch"));
@@ -218,12 +221,18 @@ mod tests {
     fn mla_accepts_stored_h640_without_changing_logical_geometry() {
         let mut a = spec(RANK,64);
         a.geometry["kv_stride"]=json!(640);
+        a.geometry["kv_cache"]=json!("bf16");
         a.scratch.insert("scratch".into(),(64usize*2112*2).div_ceil(1024) as u64*1024);
         let b=spec(QUERY,64); let c=spec(GATE,64);
-        assert!(validate_mla([&a,&b,&c],48,64,640).is_ok());
-        assert!(validate_mla([&a,&b,&c],48,64,576).is_err());
+        assert!(validate_mla([&a,&b,&c],48,64,640,MlaCacheFormat::Bf16).is_ok());
+        assert!(validate_mla([&a,&b,&c],48,64,576,MlaCacheFormat::Bf16).is_err());
+        // Cache records are written by this stage: its format must match the target's.
+        assert!(validate_mla([&a,&b,&c],48,64,640,MlaCacheFormat::Fp8).is_err());
+        a.geometry["kv_cache"]=json!("fp8");
+        assert!(validate_mla([&a,&b,&c],48,64,640,MlaCacheFormat::Fp8).is_ok());
+        assert!(validate_mla([&a,&b,&c],48,64,640,MlaCacheFormat::Bf16).is_err());
         a.pointers.swap(0,1);
-        assert!(validate_mla([&a,&b,&c],48,64,640).is_err());
+        assert!(validate_mla([&a,&b,&c],48,64,640,MlaCacheFormat::Fp8).is_err());
     }
     #[test]
     fn kda_rejects_different_state_and_scratch_arithmetic() {

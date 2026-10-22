@@ -259,7 +259,7 @@ fn mla_layer(device:Device<'_>,base:&Programs<'_>,programs:&Programs<'_>,source:
     let stream=Stream::new(device)?;
     let attention=device.run(||Ok(KimiMla::load(base,96,64,KimiMlaMode::Verify,cuteafd_core::MlaCacheFormat::Bf16)?))?;
     let split=device.run(||Ok(KimiMlaSplit::load(programs,["mla_rank_norm_h96_kv640_m64",
-        "mla_query_h96_m64","mla_gate_output_h96_m64"],96,64,640)?))?;
+        "mla_query_h96_m64","mla_gate_output_h96_m64"],96,64,640,cuteafd_core::MlaCacheFormat::Bf16)?))?;
     let mut weights=BTreeMap::new();
     for (name,operand) in [("qa",MlaOperand::QkvA),("qn",MlaOperand::QNorm),("kn",MlaOperand::KvNorm),
         ("qb",MlaOperand::QB),("uk",MlaOperand::Uk),("uv",MlaOperand::Uv),("gate",MlaOperand::Gate),("out",MlaOperand::Output)] {

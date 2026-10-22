@@ -149,7 +149,7 @@ impl<'a> NativePrograms<'a> {
             Ok(Self { device, w8: W8::load(cfg, programs, ffn_mode)?, norm: KimiRmsNorm::load(programs, cfg.hidden)?,
                 kda, commit: KimiKdaCommit::load(programs)?, mla, latent: KimiLatent::load(programs)?,
                 router: KimiRouter::load(programs)?, wire: KimiExpertInput::load(programs)?,
-                add: device.library.bf16_add()?, core:super::core_runtime::CorePrograms::load(programs,cfg,inventory,rows)?, scratch,
+                add: device.library.bf16_add()?, core:super::core_runtime::CorePrograms::load(programs,cfg,inventory,rows,cache_format)?, scratch,
                 wire_grid: crate::shared::launch_grid::Fp8QuantizeGrid::new(device.library.sm_count()?, None)? })
         })
     }

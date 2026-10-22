@@ -163,7 +163,8 @@ pub(crate) struct CorePrograms<'a> {
 }
 impl<'a> CorePrograms<'a> {
     pub(crate) fn load(programs:&'a Programs<'a>,cfg:&cuteafd_loader::families::kimi_k3::config::KimiK3Config,
-        inventory:&cuteafd_loader::families::kimi_k3::core::CoreInventory,rows:usize)->Result<Option<Self>> {
+        inventory:&cuteafd_loader::families::kimi_k3::core::CoreInventory,rows:usize,
+        cache_format:cuteafd_core::MlaCacheFormat)->Result<Option<Self>> {
         use cuteafd_loader::placement::{LayerMode,FfnMode};
         inventory.validate_runtime_groups(cfg)?;
         if inventory.projections.is_empty() {return Ok(None);}
@@ -207,10 +208,10 @@ impl<'a> CorePrograms<'a> {
             KimiKdaCore::load(programs,"kda_core_h48_m4096",4096,false)?];
         let mut mla=BTreeMap::new();
         for heads in [48,96] {for stride in [576,640] {for capacity in [64,4096] {
-            let names=[format!("mla_rank_norm_h{heads}_kv{stride}_m{capacity}"),
+            let names=[format!("mla_rank_norm_h{heads}_kv{stride}{}_m{capacity}",cache_format.program_suffix()),
                 format!("mla_query_h{heads}_m{capacity}"),format!("mla_gate_output_h{heads}_m{capacity}")];
             mla.insert((heads,stride,capacity),KimiMlaSplit::load(programs,
-                [&names[0],&names[1],&names[2]],heads,capacity,stride)?);
+                [&names[0],&names[1],&names[2]],heads,capacity,stride,cache_format)?);
         }}}
         Ok(Some(Self{projections,layout,kda,mla,norm:cuteafd_ffi::KimiRmsNorm::load(programs,3584)?,situ:KimiSitu::load(programs,3072)?,
             copy:programs.library().v41_peer_copy()?,add:programs.library().f32_add()?}))
@@ -315,7 +316,9 @@ mod runtime_layout_tests {
                 for mode in if capacity == 64 { &["decode", "verify"][..] } else { &["extend"][..] } {
                     program(format!("kimik3_dense_mla_{mode}{suffix}_m{capacity}"),4096);
                 }
-                for stride in [576,640] {program(format!("mla_rank_norm_h{heads}_kv{stride}_m{capacity}"),2048);}
+                for stride in [576,640] {for cache in ["","_fp8"] {
+                    program(format!("mla_rank_norm_h{heads}_kv{stride}{cache}_m{capacity}"),2048);
+                }}
             }
         }
         let metadata=serde_json::json!({"abi_version":1,"row_policies":policies});

@@ -180,9 +180,9 @@ pub fn package_lane_extents(manifest: &serde_json::Value, rows: usize) -> Result
         for heads in [48,96] {
             let suffix=if heads==48 {""}else{"_h96"};
             base_mla=base_mla.max(scratch(&format!("kimik3_mla_producer{suffix}_m{capacity}"))?);
-            for stride in [576,640] {
-                split_mla=split_mla.max(scratch(&format!("mla_rank_norm_h{heads}_kv{stride}_m{capacity}"))?);
-            }
+            for stride in [576,640] {for cache in ["","_fp8"] {
+                split_mla=split_mla.max(scratch(&format!("mla_rank_norm_h{heads}_kv{stride}{cache}_m{capacity}"))?);
+            }}
         }
     }
     lane_extents(rows,base_kda,base_mla,split_kda,split_mla)

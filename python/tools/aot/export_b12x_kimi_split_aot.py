@@ -27,9 +27,13 @@ def programs():
             params = dict(max_rows=rows, decode=rows == 64)
             result.append((f"kda_core_h{heads}_m{rows}",
                            partial(compile_kimi_kda_core_aot, kg, **params), rows))
-            for stride in (576, 640):
-                result.append((f"mla_rank_norm_h{heads}_kv{stride}_m{rows}",
-                    partial(compile_kimi_mla_rank_norm_aot, mg, max_rows=rows, kv_stride=stride), rows))
+            # The rank-norm stage writes cache records, so it follows the
+            # target's admitted KV format (BF16 576 or compact FP8 656 bytes).
+            for cache, cache_suffix in (("bf16", ""), ("fp8", "_fp8")):
+                cg = KimiMlaGeometry(heads=heads, kv_cache=cache)
+                for stride in (576, 640):
+                    result.append((f"mla_rank_norm_h{heads}_kv{stride}{cache_suffix}_m{rows}",
+                        partial(compile_kimi_mla_rank_norm_aot, cg, max_rows=rows, kv_stride=stride), rows))
             for name, compiler in (("mla_query", compile_kimi_mla_query_aot),
                                    ("mla_gate_output", compile_kimi_mla_gate_output_aot)):
                 result.append((f"{name}_h{heads}_m{rows}", partial(compiler, mg, max_rows=rows), rows))
