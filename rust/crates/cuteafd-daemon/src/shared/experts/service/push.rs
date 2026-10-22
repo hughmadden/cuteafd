@@ -36,8 +36,8 @@ pub(super) fn load<'a>(library: &'a NativeLibrary, catalog: &OfficialV41Catalog,
             placement: plan.placement.clone() };
         Ok((plan, checked, offer))
     })();
-    if let Err(error) = &planned { tracing::info!(%error, "Spark push unavailable; offering mount"); }
-    let credentials = push::offer(stream, planned.as_ref().ok().map(|(_, _, offer)| offer.clone()))?;
+    if let Err(error) = &planned { tracing::warn!(%error, "Spark push unavailable; offering mount"); }
+    let credentials = push::offer_with(stream, planned.as_ref().map(|(_, _, offer)| offer.clone()).map_err(|error| format!("{error:#}")))?;
     let Some((group, token)) = credentials else { return Ok(None); };
     let (plan, checked, _) = planned?;
     receive(library, plan, &checked, budgets, config.rank, &PushClient::default(), stream, group, token)
@@ -73,7 +73,7 @@ fn receive<'a>(library: &'a NativeLibrary, plan: RankPlan,
             slots: u32::try_from(ring.slots())?, slot_bytes: u32::try_from(ring.slot_bytes())? })?;
         Ok((arena, ring, rank))
     })();
-    push::joined(stream, joined.is_ok())?;
+    push::joined_with(stream, joined.as_ref().map(|_| ()).map_err(|error| format!("{error:#}")))?;
     let candidate = joined.and_then(|(arena, ring, rank)| {
         let delivered = push_consumer::consume(device, arena, ring, rank, DEFAULT_SLOTS)?;
         let initialize = plan.residencies.iter().enumerate().map(|(region, residency)|
@@ -82,8 +82,8 @@ fn receive<'a>(library: &'a NativeLibrary, plan: RankPlan,
         plan.residencies.into_iter().zip(budgets).enumerate().map(|(region, (layout, &budget))|
             Exl3Weights::from_push(ready.clone(), region, layout, budget)).collect::<Result<Vec<_>>>()
     });
-    if let Err(error) = &candidate { tracing::info!(group, rank = rank_id, %error, "Spark push candidate rejected"); }
-    if push::completed(stream, candidate.is_ok())? {
+    if let Err(error) = &candidate { tracing::warn!(group, rank = rank_id, %error, "Spark push candidate rejected"); }
+    if push::completed_with(stream, candidate.as_ref().map(|_| ()).map_err(|error| format!("{error:#}")))? {
         let weights = candidate?;
         tracing::info!(group, rank = rank_id, layers = weights.len(), "Spark EXL3 push committed; publishing ready rank arena");
         return Ok(Some(weights));

@@ -410,6 +410,8 @@ async fn stats_route(State(state): State<NativeState>) -> Json<Value> {
     object.insert("http_queue_len".into(), json!(state.queue.max_capacity() - state.queue.capacity()));
     let thermal = cuteafd_core::thermal::current();
     if !thermal.is_null() { object.insert("thermal".into(), thermal); }
+    let push = cuteafd_core::push_outcome::current();
+    if !push.is_null() { object.insert("weight_push".into(), push); }
     Json(value)
 }
 /// GPU throttle report over `[from, to]` seconds on the report clock (`now_s` in the reply).
