@@ -99,7 +99,7 @@ fn native_planes_ring_exact_commit_and_failed_transactions_drain_before_mount() 
                 unit_map: None, layer: layer as u32, first: 0, width: 384, stored_width: 384,
                 tiers: vec![], projection_counts: vec![] }, planes: planes.clone(),
                 scalars: layer * planes.scalar_bytes()..(layer + 1) * planes.scalar_bytes() }).collect();
-            let plan = RankPlan { layers, layout, placement: vec![], scratch: planes.scratch_bytes(), host_scratch: 256 };
+            let plan = RankPlan { layers, layout, placement: vec![], scratch: planes.scratch_bytes(), host_scratch: 256, scales: Default::default() };
             let budgets = [ExpertLoadBudget { resident_bytes: planes.bytes, device_staging_bytes: 0,
                 pinned_host_bytes: 0, read_scratch_bytes: 0 }; 2];
             let selections = [ExpertLayer::BackboneFull { layer: 0 }, ExpertLayer::BackboneFull { layer: 1 }];

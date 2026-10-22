@@ -215,8 +215,13 @@ impl SparkAssignment {
                     slice.first = u32::try_from(rank * width)?;
                     slice.width = u32::try_from(width)?;
                     slice.stored_width = u32::try_from(stored_width)?;
-                    super::families::deepseek_v41::resident_bytes(geometry.hidden as u64,
-                        slice.stored_width as u64, geometry.experts as u64, catalog.nvfp4().is_some())?
+                    if catalog.nvfp4().is_none() && catalog.mxfp4_scale_codes() {
+                        crate::formats::scale_codes::expert_bytes(geometry.experts as u64,
+                            geometry.hidden as u64, width as u64).context("coded Spark residency overflow")?
+                    } else {
+                        super::families::deepseek_v41::resident_bytes(geometry.hidden as u64,
+                            slice.stored_width as u64, geometry.experts as u64, catalog.nvfp4().is_some())?
+                    }
                 }
             };
             assignment.resident_bytes = assignment.resident_bytes.checked_add(resident)
@@ -300,8 +305,18 @@ mod tests {
                     SparkResidentLayout::Native { world: 4, rank: 3, stored_width }, &endpoints, rings).unwrap();
                 assert_eq!((assignment.slices[0].first, assignment.slices[0].width, assignment.slices[0].stored_width),
                     (1728, 576, stored_width as u32));
-                assert_eq!(assignment.resident_bytes, super::super::families::deepseek_v41::resident_bytes(
-                    5120, stored_width as u64, 384, nvfp4).unwrap());
+                let expected = if nvfp4 {
+                    super::super::families::deepseek_v41::resident_bytes(
+                        5120, stored_width as u64, 384, true).unwrap()
+                } else {
+                    // Coded packages pad each FC1 half to N128; FC2 keeps logical K576.
+                    let (hidden, logical, stored, experts) = (5120u64, 576u64, 640u64, 384u64);
+                    let payloads = hidden * stored + hidden * stored / 2;
+                    let gate_up = 2 * stored * (1 + 2 * (hidden / 128));
+                    let down = hidden * (1 + 2 * logical.div_ceil(128));
+                    experts * (payloads + gate_up + down)
+                };
+                assert_eq!(assignment.resident_bytes, expected);
             }
             for stored_width in [544, 577] {
                 assert!(SparkAssignment::from_catalog(&catalog, &working, 3,

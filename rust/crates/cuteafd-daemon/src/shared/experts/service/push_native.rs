@@ -2,7 +2,7 @@
 use super::{ExpertLayer, ExpertWeights, NativeExpertServiceConfig};
 use crate::shared::{experts::layer::ExpertLoadBudget, memory::{device::Device,
     push_consumer, push_initialize, push_native::RankPlan,
-    weight_arena::{ExpectedCoverage, LoadingArena}}};
+    weight_arena::ExpectedCoverage}};
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::{NativeLibrary, push_ring::{RegisteredRing, DEFAULT_SLOTS, DEFAULT_SLOT_BYTES}};
 use cuteafd_loader::{OfficialV41Catalog, push_load::{JoinArgs, PushClient}};
@@ -39,7 +39,7 @@ pub(super) fn load<'a>(library: &'a NativeLibrary, catalog: &OfficialV41Catalog,
         if config.declared_world.ownership_topology().is_some() {
             ensure!(peak <= config.device_budget, "native push unified peak exceeds configured admission");
         }
-        let offer = Offer { rank: config.rank, host, arena_bytes: plan.layout.logical_bytes() as u64,
+        let offer = Offer { rank: config.rank, host, arena_bytes: plan.logical_bytes(),
             placement: plan.placement.clone() };
         tracing::info!(rank = config.rank, resident_bytes = resident, transform_bytes = plan.scratch,
             host_scratch_bytes = plan.host_scratch, load_peak_bytes = peak, "Spark native planes push admitted");
@@ -68,7 +68,7 @@ fn receive<'a>(library: &'a NativeLibrary, plan: RankPlan,
     tracing::info!(group, rank = rank_id, "Spark native planes push rank joining load group");
     let joined = (|| -> Result<_> {
         let expected = ExpectedCoverage::from_plan(checked, u32::try_from(rank_id)?)?;
-        let arena = LoadingArena::new(device, plan.layout.clone(), expected)?;
+        let arena = plan.scales.destination(device, plan.layout.clone(), expected)?;
         let ring = RegisteredRing::new(library, DEFAULT_SLOTS, DEFAULT_SLOT_BYTES)?;
         let rank = client.join(JoinArgs { group, token, rank: u32::try_from(rank_id)?,
             ring_fd: ring.fd().as_raw_fd(), slots: u32::try_from(ring.slots())?,

@@ -35,3 +35,5 @@ pub(crate) mod v41_window;
 #[cfg(test)]
 #[path = "coordinator_golden_tests.rs"]
 mod coordinator_golden_tests;
+#[cfg(test)]
+mod scale_code_golden_tests;

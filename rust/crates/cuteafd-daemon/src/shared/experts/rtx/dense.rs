@@ -26,7 +26,7 @@ use cuteafd_loader::push_load::builder::{Builder, CheckedPlan, Destination, Sour
 use std::ffi::c_void;
 
 /// `rect`'s rows as plan entries landing at `offset` of rank `rank`.
-fn append(rect: &Rect, builder: &mut Builder, rank: u32, offset: u64) -> Result<()> {
+pub(crate) fn append(rect: &Rect, builder: &mut Builder, rank: u32, offset: u64) -> Result<()> {
     let source = Source { path: rect.path.clone(), offset: rect.base,
         bytes: (rect.rows.end * rect.row_bytes) as u64 };
     builder.rows(&source, (rect.rows.start * rect.row_bytes + rect.cols.start) as u64,

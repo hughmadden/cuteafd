@@ -592,6 +592,7 @@ impl Builder {
                 return Err(invalid("native projection name is not W1/W3/W2"));
             }
             let scale = slot >= 3;
+            if scale && layout.scale_codes { continue; }
             let plane = usize::from(down) * 2 + usize::from(scale);
             let divisor = if scale { if layout.nvfp4 { 16 } else { 32 } } else { 2 };
             let source = Self::v41_source(catalog, name)?;

@@ -597,7 +597,7 @@ pub(crate) fn receive_pushed<'a>(device: Device<'a>, catalog: &cuteafd_loader::O
         .with_finishes(&records.finishes);
     let dense_plan = layout.plan();
     let (base, host) = (dense_plan.base, dense_plan.host_bytes);
-    let tp2_bytes = tp2.as_ref().map_or(0, |p| p.layout.logical_bytes() as u64);
+    let tp2_bytes = tp2.as_ref().map_or(0, |p| p.logical_bytes());
     let (host_base, total) = rank_bytes(base, tp2_bytes, host);
     // The rank's checked plan (built twice: one copy streams from the fake source).
     let build = || -> Result<CheckedPlan> {

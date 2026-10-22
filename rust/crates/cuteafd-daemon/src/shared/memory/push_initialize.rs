@@ -246,7 +246,8 @@ impl<'a> Transforms<'a> {
         let queued = self.device.run(|| {
             for expert in 0..layout.experts {
                 for plane in 0..4 {
-                    if layout.nvfp4 && plane % 2 == 0 {
+                    if (layout.nvfp4 && plane % 2 == 0)
+                        || (layout.scale_codes && plane % 2 == 1) {
                         continue;
                     }
                     let (offset, bytes) = layout.expert_plane(plane, expert)?;

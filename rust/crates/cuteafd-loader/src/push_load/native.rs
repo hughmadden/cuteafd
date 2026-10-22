@@ -9,6 +9,7 @@ pub struct NativePlanes {
     pub kernel_intermediate: usize,
     pub experts: usize,
     pub nvfp4: bool,
+    pub scale_codes: bool,
     pub planes: [(usize, usize); 4],
     pub vectors: [(usize, usize); 4],
     pub bytes: usize,
@@ -21,6 +22,13 @@ impl NativePlanes {
         experts: usize,
         nvfp4: bool,
     ) -> Result<Self> {
+        Self::with_scale_codes(hidden, intermediate, kernel_intermediate, experts, nvfp4, false)
+    }
+
+    /// Select the package's immutable scale representation before allocation.
+    pub fn with_scale_codes(hidden: usize, intermediate: usize, kernel_intermediate: usize,
+        experts: usize, nvfp4: bool, scale_codes: bool) -> Result<Self> {
+        ensure!(!nvfp4 || !scale_codes, "NVFP4 cannot use UE8M0 scale codes");
         ensure!(
             hidden > 0
                 && hidden % 256 == 0
@@ -33,11 +41,13 @@ impl NativePlanes {
                 && experts > 0,
             "invalid native push geometry"
         );
-        let sizes = crate::placement::families::deepseek_v41::resident_planes(
-            hidden as u64,
-            kernel_intermediate as u64,
-            nvfp4,
-        )?;
+        let sizes = if scale_codes {
+            crate::formats::scale_codes::expert_planes(hidden, intermediate, kernel_intermediate)
+                .context("invalid coded expert geometry")?.map(|n| n as u64)
+        } else {
+            crate::placement::families::deepseek_v41::resident_planes(
+                hidden as u64, kernel_intermediate as u64, nvfp4)?
+        };
         let mut cursor = 0usize;
         let mut reserve = |size: usize| -> Result<(usize, usize)> {
             cursor = cursor
@@ -70,6 +80,7 @@ impl NativePlanes {
             kernel_intermediate,
             experts,
             nvfp4,
+            scale_codes,
             planes,
             vectors,
             bytes: cursor,
@@ -87,10 +98,14 @@ impl NativePlanes {
         self.planes
             .iter()
             .enumerate()
-            .filter(|(i, _)| !self.nvfp4 || i % 2 == 1)
+            .filter(|(i, _)| if self.nvfp4 { i % 2 == 1 } else { !self.scale_codes || i % 2 == 0 })
             .map(|(_, (_, bytes))| bytes / self.experts)
             .max()
             .unwrap_or(0)
+    }
+    pub fn generated_ranges(&self) -> Vec<std::ops::Range<usize>> {
+        if !self.scale_codes { return Vec::new(); }
+        [1, 3].map(|i| self.planes[i].0..self.planes[i].0 + self.planes[i].1).to_vec()
     }
     pub fn scalar_bytes(&self) -> usize {
         if self.nvfp4 {
