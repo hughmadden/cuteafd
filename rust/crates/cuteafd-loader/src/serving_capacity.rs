@@ -1208,59 +1208,67 @@ mod tests {
     #[test]
     fn mimo_pro_records_partition_heads_while_rings_and_marks_keep_the_exact_window() {
         let cfg = full_mimo(mimo_pro_config(), 10, 60);
-        let one = mimo_cache_geometry(&cfg, 70, 1, MimoKvFormats::default(), 0).unwrap();
-        let split = mimo_cache_geometry(&cfg, 70, 2, MimoKvFormats::default(), 0).unwrap();
-        assert_eq!(one.ranks[0].persistent_unit_bytes / 64, 28800);
-        assert_eq!(split.placement, KvPlacement::PartitionedHeads);
-        assert_eq!(
-            split
-                .ranks
-                .iter()
-                .map(|r| r.persistent_unit_bytes)
-                .sum::<u64>(),
-            one.ranks[0].persistent_unit_bytes
-        );
-        assert_eq!(one.ranks[0].active_state_per_sequence_bytes, 75 << 20);
-        assert_eq!(one.ranks[0].retained_mark_bytes, 75 << 19);
-        assert_eq!(
-            mimo_cache_geometry(&cfg, 70, 1, MimoKvFormats { full: MimoKvCache::Bf16, sliding: MimoKvCache::Bf16 }, 0)
-                .unwrap()
-                .ranks[0]
-                .persistent_unit_bytes
-                / 64,
-            51200
-        );
+        for (sliding, record) in [(MimoKvCache::Bf16, 5120u64),
+            (MimoKvCache::Int8, 2880), (MimoKvCache::Fp8, 2720)] {
+            let kv = MimoKvFormats { full: MimoKvCache::Int8, sliding };
+            let one = mimo_cache_geometry(&cfg, 70, 1, kv, 0).unwrap();
+            let split = mimo_cache_geometry(&cfg, 70, 2, kv, 0).unwrap();
+            assert_eq!(one.ranks[0].persistent_unit_bytes / 64, 28800);
+            assert_eq!(split.placement, KvPlacement::PartitionedHeads);
+            assert_eq!(
+                split
+                    .ranks
+                    .iter()
+                    .map(|r| r.persistent_unit_bytes)
+                    .sum::<u64>(),
+                one.ranks[0].persistent_unit_bytes
+            );
+            assert_eq!(one.ranks[0].active_state_per_sequence_bytes, 60 * 256 * record);
+            assert_eq!(one.ranks[0].retained_mark_bytes, 60 * 128 * record);
+            assert_eq!(
+                mimo_cache_geometry(&cfg, 70, 1, MimoKvFormats { full: MimoKvCache::Bf16, sliding: MimoKvCache::Bf16 }, 0)
+                    .unwrap()
+                    .ranks[0]
+                    .persistent_unit_bytes
+                    / 64,
+                51200
+            );
+        }
     }
 
     #[test]
     fn mimo_flash_and_native_mtp_keep_lead_rank_only_history_costs() {
         let cfg = full_mimo(mimo_flash_config(), 9, 39);
-        let plain = mimo_cache_geometry(&cfg, 48, 2, MimoKvFormats::default(), 0).unwrap();
-        let mtp = mimo_cache_geometry(&cfg, 48, 2, MimoKvFormats::default(), 3).unwrap();
-        assert_eq!(
-            plain
-                .ranks
-                .iter()
-                .map(|r| r.persistent_unit_bytes)
-                .sum::<u64>()
-                / 64,
-            12960
-        );
-        assert!(
-            mtp.ranks[0].active_state_per_sequence_bytes
-                > plain.ranks[0].active_state_per_sequence_bytes
-        );
-        assert_eq!(mtp.ranks[1], plain.ranks[1]);
-        assert_eq!(
-            mtp.ranks[0].retained_mark_bytes - plain.ranks[0].retained_mark_bytes,
-            (128 + 3 + 1) * cfg.hidden as u64 * 2
-        );
-        assert_eq!(
-            mtp.ranks[0].active_state_per_sequence_bytes
-                - plain.ranks[0].active_state_per_sequence_bytes,
-            6_029_312
-        );
-        assert_eq!(mtp.ranks[0].fixed_state_bytes, (3 << 20) + 1280);
+        for (sliding, record) in [(MimoKvCache::Bf16, 5120u64),
+            (MimoKvCache::Int8, 2880), (MimoKvCache::Fp8, 2720)] {
+            let kv = MimoKvFormats { full: MimoKvCache::Int8, sliding };
+            let plain = mimo_cache_geometry(&cfg, 48, 2, kv, 0).unwrap();
+            let mtp = mimo_cache_geometry(&cfg, 48, 2, kv, 3).unwrap();
+            assert_eq!(
+                plain
+                    .ranks
+                    .iter()
+                    .map(|r| r.persistent_unit_bytes)
+                    .sum::<u64>()
+                    / 64,
+                12960
+            );
+            assert!(
+                mtp.ranks[0].active_state_per_sequence_bytes
+                    > plain.ranks[0].active_state_per_sequence_bytes
+            );
+            assert_eq!(mtp.ranks[1], plain.ranks[1]);
+            assert_eq!(
+                mtp.ranks[0].retained_mark_bytes - plain.ranks[0].retained_mark_bytes,
+                (128 + 3 + 1) * cfg.hidden as u64 * 2
+            );
+            assert_eq!(
+                mtp.ranks[0].active_state_per_sequence_bytes
+                    - plain.ranks[0].active_state_per_sequence_bytes,
+                3 * 256 * record + 256 * cfg.hidden as u64 * 2
+            );
+            assert_eq!(mtp.ranks[0].fixed_state_bytes, (3 << 20) + 1280);
+        }
     }
 
     #[test]

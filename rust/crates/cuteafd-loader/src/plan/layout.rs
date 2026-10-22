@@ -208,7 +208,7 @@ impl Default for LayoutOptions {
             mimo_prefix_mark_bytes: 2 * GIB,
             mimo_prefix_draft: false,
             mimo_rings: 16,
-            mimo_swa_kv: crate::families::mimo_v2::MimoKvCache::Bf16,
+            mimo_swa_kv: crate::families::mimo_v2::MimoKvFormats::default().sliding,
             mimo_expert_input: Default::default(),
             draft_sequences: 4,
             draft_kv_cache: crate::families::qwen4::Qwen4KvCache::Fp8,
