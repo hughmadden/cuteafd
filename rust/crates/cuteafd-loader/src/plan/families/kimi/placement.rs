@@ -210,6 +210,12 @@ pub(super) fn layout(model: &Model, report: &mut PlanReport, opts: &crate::plan:
             usize::try_from(context)?, slots.checked_mul(usize::try_from(context)?).context("draft pool overflow")?, opts.physical_sms.unwrap_or(188) as usize, 0, opts.mla_kv)?;
         fixed.extend(crate::families::kimi_k3::draft_bridge_demands(&layout)?);
         fixed.push(crate::families::kimi_k3::draft_probe_demand(cfg.layers, cfg.topk, 64)?);
+        // A K6 vocabulary head has no BF16 operand to borrow: the drafter owns
+        // a head-only K6 scratch on the head rank.
+        if let Some(manifest) = &manifest {
+            fixed.extend(crate::families::kimi_k3::core::draft_head_demand(&model.core,
+                layout.capacity().block_rows, &manifest["families"]["kimi_k6_dense"])?);
+        }
         let bytes = layout.window_mark_bytes()? as u64;
         if bytes > 0 && legacy_marks > 0 {
             let per_mark = Demand::new(1, Category::Prefix, "Kimi exact draft windows", bytes, Basis::Exact);

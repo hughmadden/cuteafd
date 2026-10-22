@@ -51,6 +51,9 @@ pub(crate) struct NativeDraft<'a> {
     context_pending: Cell<bool>,
     window_marks: Rc<Allocation<'a>>,
     window_bytes: usize,
+    /// A K6 target head (no BF16 operand to borrow): the target rank's K6
+    /// programs and this drafter's own head scratch, used only on the bridge stream.
+    k6_head: Option<(Rc<super::device::NativePrograms<'a>>, super::core_runtime::ProjectionScratch<'a>)>,
     cache_format: cuteafd_core::MlaCacheFormat,
     marks: usize,
 }
@@ -75,7 +78,7 @@ impl<'a> NativeDraft<'a> {
         let marks = usize::try_from(admission.mark_selection.slots)?;
         let window_bytes = layout.window_mark_bytes()?;
         let window_marks = admission.allocate_draft_marks(streams[1].device)?;
-        Ok(Self { window_marks, window_bytes, cache_format: layout.cache_format(), marks, owners: Owners { draft, target: None }, taps: allocate("DFlash bridge taps")?,
+        Ok(Self { window_marks, window_bytes, k6_head: None, cache_format: layout.cache_format(), marks, owners: Owners { draft, target: None }, taps: allocate("DFlash bridge taps")?,
             ids: allocate("DFlash bridge input ids")?, input: allocate("DFlash bridge gathered input")?,
             bridge: RemoteBridge::new(prepared), producer: RefCell::new(crate::shared::memory::device::Event::new(device)?),
             consumed: RefCell::new(crate::shared::memory::device::Event::new(streams[1].device)?),
@@ -84,13 +87,31 @@ impl<'a> NativeDraft<'a> {
 
     pub(crate) fn cache_format(&self) -> cuteafd_core::MlaCacheFormat { self.cache_format }
 
-    pub(crate) fn bind_target(&mut self, target: [Rc<GlobalWeights<'a>>; 2]) -> Result<()> {
+    /// `head_programs` are the head rank's native programs; with a K6 head the
+    /// drafter projects through them into its own admitted head scratch.
+    pub(crate) fn bind_target(&mut self, target: [Rc<GlobalWeights<'a>>; 2],
+        head_programs: Rc<super::device::NativePrograms<'a>>) -> Result<()> {
         ensure!(self.owners.target.is_none(), "Kimi draft target already bound");
         for (rank, owner) in target.iter().enumerate() { owner.check_device(self.target_streams[rank].device)?; }
         let cfg = &self.owners.draft.cfg;
-        ensure!(target[0].buffer("embedding")?.bytes == cfg.vocab * cfg.hidden * 2
-            && target[1].buffer("head")?.bytes == cfg.vocab * cfg.hidden * 2,
-            "Kimi draft target embedding/head differs from admitted BF16 geometry");
+        ensure!(target[0].buffer("embedding")?.bytes == cfg.vocab * cfg.hidden * 2,
+            "Kimi draft target embedding differs from admitted BF16 geometry");
+        if let Some(head) = &target[1].core_head {
+            ensure!(head.shape == [cfg.vocab, cfg.hidden], "Kimi draft K6 target head geometry differs");
+            ensure!(head_programs.device.id == self.target_streams[1].device.id,
+                "Kimi draft K6 head programs are not on the head rank");
+            let projection = head_programs.core.as_ref().context("K6 head programs not resolved")?.projection(head)?;
+            let rows = self.owners.draft.max_batch_sequences() * cfg.block;
+            let scratch = {
+                let _scope = cuteafd_ffi::memory_ledger::scope("drafter/kimi K6 head scratch");
+                super::core_runtime::ProjectionLayout::new(&projection.program, rows)?
+                    .allocate(self.target_streams[1].device)?
+            };
+            self.k6_head = Some((head_programs, scratch));
+        } else {
+            ensure!(target[1].buffer("head")?.bytes == cfg.vocab * cfg.hidden * 2,
+                "Kimi draft target head differs from admitted BF16 geometry");
+        }
         self.owners.target = Some(target);
         self.owners.draft.device.run(|| self.owners.draft.prime_remote())?;
         // Prime the target-side ordered ID staging before readiness. This is an
@@ -234,7 +255,6 @@ impl<'a> NativeDraft<'a> {
         let target = self.owners.target.as_ref().context("Kimi draft target is not bound")?;
         // The reference is tied to this adapter's retained owner, not to a copied
         // buffer descriptor or a synthetic legacy allocation.
-        let head = target[1].borrowed_buffer("head")?;
         self.bridge.checked(|| draft.device.run(|| {
             let input = |tokens: &[u32], output: CuteafdDeviceBuffer, stream| {
                 ensure!(stream == self.bridge.stream.raw, "Kimi draft input stream differs from bridge");
@@ -242,7 +262,24 @@ impl<'a> NativeDraft<'a> {
                 self.bridge.send_input(self.input.buffer.ptr.cast_const(), output.ptr,
                     tokens.len() * draft.cfg.hidden * 2)
             };
-            draft.draft_device_with(sequences, &input, TargetHead::Bf16Buffer(head))
+            let head = match &self.k6_head {
+                Some((programs, scratch)) => {
+                    let weight = target[1].core_head.as_ref().context("Kimi draft K6 target head absent")?;
+                    let projection = programs.core.as_ref().context("K6 head programs not resolved")?.projection(weight)?;
+                    let device = self.target_streams[1].device.id;
+                    let (hidden, vocab) = (draft.cfg.hidden, draft.cfg.vocab);
+                    TargetHead::Launch(Box::new(move |x, logits, rows, stream| {
+                        ensure!(stream == self.bridge.stream.raw, "Kimi draft K6 head stream differs from bridge");
+                        let input = CuteafdDeviceBuffer { ptr: x.cast_mut(), bytes: rows * hidden * 2, device_id: device, flags: 0 };
+                        let output = CuteafdDeviceBuffer { ptr: logits.cast(), bytes: rows * vocab * 4, device_id: device, flags: 0 };
+                        // The drafter's own scratch, used only on this bridge stream; the
+                        // target head weights are retained by the bound target owner.
+                        projection.local(rows, input, weight, scratch, output, stream)
+                    }))
+                }
+                None => TargetHead::Bf16Buffer(target[1].borrowed_buffer("head")?),
+            };
+            draft.draft_device_with(sequences, &input, head)
         }))
     }
 }
@@ -540,5 +577,19 @@ mod tests {
         let drops = Rc::new(RefCell::new(Vec::new()));
         drop(Owners { draft: Owner("draft", drops.clone()), target: Owner("head", drops.clone()) });
         assert_eq!(*drops.borrow(), ["draft", "head"]);
+    }
+
+    #[test]
+    fn k6_target_head_projects_through_draft_owned_scratch_not_a_bf16_borrow() {
+        let source = include_str!("draft.rs").split("\n#[cfg(test)]\nmod tests").next().unwrap();
+        let bind = source.split("pub(crate) fn bind_target").nth(1).unwrap().split("fn gather").next().unwrap();
+        // The BF16 head is required only when the target head is not K6.
+        let (k6, bf16) = bind.split_once("} else {").unwrap();
+        assert!(k6.contains("if let Some(head) = &target[1].core_head"));
+        assert!(!k6.contains("buffer(\"head\")") && bf16.contains("buffer(\"head\")"));
+        assert!(k6.contains("ProjectionLayout::new(&projection.program, rows)") && k6.contains(".allocate(self.target_streams[1].device)"));
+        let propose = source.split("pub(crate) fn propose").nth(1).unwrap().split("impl crate::shared").next().unwrap();
+        assert!(propose.contains("TargetHead::Launch") && propose.contains("stream == self.bridge.stream.raw"));
+        assert!(propose.contains("None => TargetHead::Bf16Buffer(target[1].borrowed_buffer(\"head\")?)"));
     }
 }

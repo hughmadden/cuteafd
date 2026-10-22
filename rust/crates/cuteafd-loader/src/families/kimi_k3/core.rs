@@ -278,6 +278,37 @@ pub fn projection_scratch(cfg: &KimiK3Config, core: &CoreInventory, rows: usize,
     Ok(combined)
 }
 
+/// The drafter's own K6 vocabulary-head scratch at its `rows` (<= 64) head
+/// rows, or `None` when the head is BF16. The drafter projects through the
+/// target's K6 head on its bridge stream; the target lane scratch is never shared.
+pub fn draft_head_scratch(core: &CoreInventory, rows: usize, metadata: &serde_json::Value)
+    -> Result<Option<ProjectionScratchLayout>> {
+    let Some(head) = core.projections.get("language_model.lm_head") else { return Ok(None) };
+    ensure!((1..=64).contains(&rows), "Kimi K6 draft head rows outside 1..=64");
+    ensure!(metadata["abi_version"] == 1, "Kimi K6 row-policy ABI");
+    let (n, k) = (head.stored_outputs, head.shape[1]);
+    let book = match head.codebook {
+        crate::formats::exl3_storage::Exl3Codebook::Mcg => "mcg",
+        crate::formats::exl3_storage::Exl3Codebook::Mul1 => "mul1",
+    };
+    let policies = metadata["row_policies"].as_array().context("Kimi K6 row-policy list")?;
+    let matching = policies.iter().filter(|p| p["input_features"] == k && p["output_features"] == n
+        && p["sharded_side"] == 1 && p["codebook"] == book).collect::<Vec<_>>();
+    ensure!(matching.len() == 1, "lm_head: expected one K6 row policy for K{k}/N{n}/{book}, found {}", matching.len());
+    let integer = |key: &str| matching[0][key].as_u64().and_then(|v| usize::try_from(v).ok())
+        .with_context(|| format!("Kimi K6 row-policy {key}"));
+    Ok(Some(ProjectionScratchLayout::new(k, n, rows, integer("chunk_columns")?, integer("weight_scratch_bytes")?)?))
+}
+
+/// Admission charge of [`draft_head_scratch`] on the head rank (GPU1).
+pub fn draft_head_demand(core: &CoreInventory, rows: usize, metadata: &serde_json::Value)
+    -> Result<Option<crate::placement::Demand>> {
+    use cuteafd_core::memory_layout::{Basis, Category};
+    Ok(draft_head_scratch(core, rows, metadata)?.map(|layout| layout.bytes().map(|bytes|
+        crate::placement::Demand::new(1, Category::Drafter, "Kimi K6 draft head scratch", bytes as u64, Basis::Exact)))
+        .transpose()?)
+}
+
 #[derive(Debug, Default, Clone)]
 pub struct CoreInventory {
     pub projections: BTreeMap<String, CoreProjection>,
@@ -475,6 +506,49 @@ mod scratch_admission_tests {
         }
         assert!(ProjectionScratchLayout::new(7168,6144,0,6144,7168*6144*2).is_err());
         assert!(ProjectionScratchLayout::new(7168,6144,64,128,1).is_err());
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod draft_head_tests {
+    use super::*;
+    use crate::families::kimi_k3::weight_layout::GlobalLayout;
+    use crate::formats::dense_trellis::TrellisSide;
+
+    /// The published head policy: K7168/N163840, 16384-column chunks.
+    fn head_policy(book: &str) -> serde_json::Value {
+        serde_json::json!({"abi_version": 1, "row_policies": [{"input_features": 7168, "output_features": 163840,
+            "sharded_side": 1, "codebook": book, "chunk_columns": 16384, "weight_scratch_bytes": 7168 * 16384 * 2}]})
+    }
+
+    /// Real-geometry K6 core (every core projection K6, the head included, as the
+    /// published Core-K6 checkpoint ships). Neither TP2 rank holds a BF16 head:
+    /// rank 0 keeps the BF16 embedding, rank 1 holds only the K6 head, and a
+    /// drafter must own a K6 head scratch on rank 1 instead of borrowing one.
+    #[test]
+    fn k6_head_has_no_bf16_operand_on_either_rank_and_charges_the_drafter() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        crate::plan::testing::write_kimi_core_snapshot(dir.path(), false);
+        let checkpoint = Checkpoint::open(dir.path())?;
+        let cfg = KimiK3Config::from_hf(&checkpoint.config)?;
+        let core = crate::plan::families::kimi::core_inventory(&checkpoint)?;
+        let head = &core.projections["language_model.lm_head"];
+        assert_eq!((head.bits, head.shape, head.stored_outputs), (6, [163840, 7168], 163840));
+        let pair = GlobalLayout::pair_with_core(&cfg, &core)?;
+        assert!(pair.iter().all(|rank| !rank.operands.contains_key("head")));
+        assert!(pair[0].operands.contains_key("embedding") && pair[0].core_head.is_none());
+        let resident = pair[1].core_head.as_ref().context("rank 1 K6 head")?;
+        assert_eq!((resident.rank, resident.ranks, resident.side), (0, 1, TrellisSide::Output));
+        let book = match head.codebook { crate::formats::exl3_storage::Exl3Codebook::Mcg => "mcg",
+            crate::formats::exl3_storage::Exl3Codebook::Mul1 => "mul1" };
+        // C8 x block 8: the drafter's head rows.
+        let demand = draft_head_demand(&core, 64, &head_policy(book))?.context("K6 draft head demand")?;
+        let expected = ProjectionScratchLayout::new(7168, 163840, 64, 16384, 7168 * 16384 * 2)?.bytes()?;
+        assert_eq!((demand.gpu, demand.bytes), (1, expected as u64));
+        assert!(draft_head_demand(&core, 65, &head_policy(book)).is_err());
+        assert!(draft_head_demand(&core, 64, &head_policy(if book == "mcg" { "mul1" } else { "mcg" })).is_err());
+        assert!(draft_head_demand(&CoreInventory::default(), 64, &head_policy(book))?.is_none());
         Ok(())
     }
 }

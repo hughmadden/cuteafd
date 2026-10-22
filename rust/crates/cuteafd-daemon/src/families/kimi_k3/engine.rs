@@ -160,7 +160,7 @@ impl<'a> Engine<'a> {
                 local[0][0].config().dense.clone(), local[0][0].config().topk, 64))).transpose()?;
         // Weak admission registries must not outlive these strong startup owners
         // until every persistent local binding has acquired the same operands.
-        if let Some(draft) = draft.as_mut() { draft.bind_target(weights.global.clone())?; }
+        if let Some(draft) = draft.as_mut() { draft.bind_target(weights.global.clone(), programs[1].clone())?; }
         drop((weights, kda, mla));
         pending.wait()?;
         let world = SparkWorld::canonical(6)?;
