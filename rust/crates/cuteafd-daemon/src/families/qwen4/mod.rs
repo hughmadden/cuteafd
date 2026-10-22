@@ -478,9 +478,44 @@ impl Opened {
             fp8_decode: args.fp8_decode, fp8_scales: args.fp8_scales, stream,
             dense: std::rc::Rc::new(crate::shared::experts::rtx::dense::DenseLoad::mount(&self.library)) };
         let source = self.embed_source()?;
-        let (embedding, model) = crate::shared::token_io::TokenEmbedding::load(&self.library, source,
-            args.token_io.embed_placement,
-            || { let _memory_scope = cuteafd_ffi::memory_ledger::scope("weights"); loader.model(&self.cfg, layers, args.mtp > 0 && layers == self.cfg.layers, args.mtp_fp8_head) })?;
+        let with_mtp = args.mtp > 0 && layers == self.cfg.layers;
+        // The coordinator's dense records push in a group of this GPU alone when
+        // the checkpoint is SparkNest's; records are planned from headers first,
+        // and any failure loads them through the mount.
+        let device = crate::shared::memory::device::Device { library: &self.library, id: self.library.cuda_get_device()? };
+        let planned = (|| -> Result<_> {
+            let load = std::rc::Rc::new(crate::shared::experts::rtx::dense::DenseLoad::push(&self.library));
+            let planning = weights::Qwen4Loader { dense: load.clone(), ..loader.clone() };
+            let model = {
+                let _memory_scope = cuteafd_ffi::memory_ledger::scope("weights");
+                planning.model(&self.cfg, layers, with_mtp, args.mtp_fp8_head)?
+            };
+            let records = load.sink.as_ref().context("push sink")?.take_all();
+            let (landed, operands, staged, steps, largest, finishes) = records.summary();
+            tracing::info!(landed, operands, staged, steps, largest_step_bytes = largest, finishes,
+                "Qwen coordinator dense records planned");
+            let dense = crate::shared::experts::rtx::dense::plan_records(&args.snapshot, records.clone(), &[device], 0)?;
+            let push = crate::shared::experts::rtx::push::CoordinatorPush::prepare_alone(&args.snapshot, None, 1, None)?;
+            Ok((push, model, records, dense))
+        })().map_err(|error| tracing::warn!(%error, "Qwen coordinator dense push unavailable; mount")).ok();
+        let (embedding, model) = match planned {
+            Some((push, model, records, dense)) => {
+                let split = crate::shared::memory::load_timing::Split::start();
+                let (pushed, embedding) = push.receive_with(vec![device], None, 0, Some(Ok(dense)), ||
+                    crate::shared::token_io::TokenEmbedding::load(&self.library, source, args.token_io.embed_placement,
+                        || Ok(())));
+                let pushed = pushed?;
+                let (embedding, ()) = embedding?;
+                if pushed.is_none() {
+                    crate::shared::experts::rtx::dense::fill_records_by_mount(&self.library, &records, |_| stream)?;
+                }
+                split.log(if pushed.is_some() { "qwen4 dense push" } else { "qwen4 dense mount fill" });
+                (embedding, model)
+            }
+            None => crate::shared::token_io::TokenEmbedding::load(&self.library, source, args.token_io.embed_placement,
+                || { let _memory_scope = cuteafd_ffi::memory_ledger::scope("weights");
+                    loader.model(&self.cfg, layers, with_mtp, args.mtp_fp8_head) })?,
+        };
         let attention_plan = attention_plan(args, model.mtp.is_some())?;
         let programs = programs.with_attention_plan(attention_plan, |name| selected.contains(name))?;
         if let Some(manifest) = &mut manifest_json {
@@ -558,6 +593,11 @@ impl Opened {
         if args.planner_graph_modes.is_some() { engine.enable_startup_graphs(); }
         engine.w8a8_prefill = args.fp8_prefill_w8a8;
         if let Some(experts) = match admitted_experts { Some(experts) => experts, None => self.experts(args, layers, stream)? } {
+            // Local EXL3 experts load their first window by push when the
+            // checkpoint is SparkNest's (a group of this GPU alone), else lazily.
+            if let engine::Experts::LocalExl3(local) = &experts {
+                local.push_window(args.experts_snapshot.as_deref().unwrap_or(&args.snapshot), self.library.cuda_get_device()?)?;
+            }
             engine.set_experts(experts);
         }
         if let Some(budget) = args.l2.budget(&self.library, crate::shared::l2_prefetch::OTHER_DEFAULT)? {

@@ -187,6 +187,43 @@ pub(crate) struct LocalExl3<'a> {
 }
 
 impl LocalExl3<'_> {
+    /// Pushes the first window (layers from 0, and the MTP stage) in a push
+    /// group of this GPU alone, as the first [`Self::ensure`] would load it
+    /// through the mount; on any fallback the window stays lazy and later
+    /// windows always reload through the mount. Returns whether it committed.
+    pub(super) fn push_window(&self, snapshot: &std::path::Path, device: i32) -> Result<bool> {
+        if self.resident.borrow().is_some() { return Ok(true); }
+        let backbone: Vec<_> = (0..self.window.min(self.layers)).collect();
+        let Some((selections, weights_budget)) = crate::families::deepseek_v4::local::LocalExperts::exl3_selections(
+            &self.native_lib, self.catalog, usize::from(self.mtp), &backbone, self.max_rows, self.budget)?
+            else { return Ok(false) };
+        if selections.is_empty() { return Ok(false); }
+        let started = std::time::Instant::now();
+        let experts = crate::shared::experts::rtx::push::CoordinatorExperts::Whole { selections: selections.clone(),
+            budget: weights_budget };
+        let push = match crate::shared::experts::rtx::push::CoordinatorPush::prepare_alone(snapshot, Some(self.catalog), 1,
+            Some(experts)) {
+            Ok(push) => push,
+            Err(error) => {
+                tracing::warn!(%error, "Qwen EXL3 expert window push unavailable; it loads through the mount");
+                return Ok(false);
+            }
+        };
+        let devices = vec![crate::shared::memory::device::Device { library: self.library, id: device }];
+        let (pushed, ()) = push.receive_with::<crate::shared::experts::rtx::push::NoDense, _>(devices, Some(self.catalog),
+            0, None, || ());
+        let Some(mut ranks) = pushed? else { return Ok(false) };
+        let weights = ranks.pop().context("one coordinator rank")?.exl3()?;
+        let local = crate::families::deepseek_v4::local::LocalExperts::from_exl3_weights(self.library, &self.native_lib,
+            self.catalog, &selections, weights, self.max_rows)?.context("pushed EXL3 expert window")?;
+        let layers = local.layers().to_vec();
+        *self.loads.borrow_mut() += layers.len();
+        tracing::info!(layers = layers.len(), stages = usize::from(self.mtp), elapsed_ms = started.elapsed().as_millis() as u64,
+            "Qwen EXL3 expert window pushed");
+        *self.resident.borrow_mut() = Some((layers, local));
+        Ok(true)
+    }
+
     pub(super) fn ensure(&self, layer: usize, stream: *mut c_void) -> Result<()> {
         if self.resident.borrow().as_ref().is_some_and(|(layers, _)| layers.binary_search(&layer).is_ok() || layer == self.layers) {
             ensure!(layer < self.layers || self.mtp, "MTP experts are not loaded");

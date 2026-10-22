@@ -167,6 +167,7 @@ impl MtpWeights<'_> {
     }
 }
 
+#[derive(Clone)]
 pub(crate) struct Qwen4Loader<'a> {
     pub library: &'a NativeLibrary,
     pub checkpoint: &'a Checkpoint,
