@@ -3527,3 +3527,20 @@ def test_push_group_appends_coordinator_suffix_before_one_finish_and_upload(form
     assert prepare.count("checked.upload(&group)?") == 1
     assert "builder.finish(" not in prepare
     assert prepare.index("checked_plan(") < prepare.index(".create(") < prepare.index("checked.upload(")
+
+
+@pytest.mark.parametrize("model_type,model", [
+    ("mimo_v2_flash", "XiaomiMiMo/MiMo-V2-Flash"),
+    ("mimo_v2", "XiaomiMiMo/MiMo-V2.6-Pro-MOPD"),
+])
+@pytest.mark.parametrize("value", [None, "bf16", "int8", "fp8"])
+def test_mimo_swa_record_format_reaches_serve_and_plan(tmp_path, value, model_type, model):
+    config = {"model_type": model_type, "num_hidden_layers": 2, "moe_layer_freq": [0, 1]}
+    keys = "SPECULATOR=off\n" + (f"SWA_KV_CACHE={value}\n" if value else "")
+    result = _family_launch_result(tmp_path, config, model, keys)
+    assert result.returncode == 0, result.stderr
+    launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-mimo" in line)
+    expected = value or "int8"
+    assert f"--swa-kv-cache {expected}" in launch
+    plans = [line for line in result.stderr.splitlines() if "cuteafd plan" in line]
+    assert plans and all(f"--mimo-swa-kv-cache {expected}" in line for line in plans)

@@ -13,13 +13,8 @@ use std::path::Path;
 
 use crate::plan::checkpoint::read_json;
 
-/// Storage format of the full-attention KV records (the paged pool shared by sequences and
-/// prefix snapshots). SWA rings and steps stay BF16: they hold 256 rows per sequence, and
-/// widening 8-bit ring records cost a V2 Flash decode step ~1.3% (39 SWA layers).
-///
-/// E4M3 records (scales per 64 dims) are not offered: on the goldens they raised
-/// KL(golden||engine) by 0.235 (V2 Flash) and 0.012 (V2.6 Pro) over BF16, int8 by
-/// -0.0002 and 0.0015 at about the same size.
+/// Storage format of an attention KV record. Full and sliding attention select
+/// independently; native MTP uses the sliding-attention selection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum MimoKvCache {
     /// BF16 keys and values.
@@ -28,6 +23,8 @@ pub enum MimoKvCache {
     /// and value (sparkinfer `_mimo_kernels`, `kv8="s8"`).
     #[default]
     Int8,
+    /// E4M3 keys and values with FP32 scales per 64 dimensions.
+    Fp8,
 }
 
 impl MimoKvCache {
@@ -36,14 +33,7 @@ impl MimoKvCache {
         match self {
             Self::Bf16 => "",
             Self::Int8 => "_kvint8",
-        }
-    }
-
-    /// The format of `attention` layers' records: `self` for full attention, BF16 for SWA.
-    pub fn of(self, attention: MimoAttention) -> Self {
-        match attention {
-            MimoAttention::Full => self,
-            MimoAttention::Sliding => Self::Bf16,
+            Self::Fp8 => "_kvfp8",
         }
     }
 
@@ -52,6 +42,49 @@ impl MimoKvCache {
         match self {
             Self::Bf16 => 0,
             Self::Int8 => 32,
+            Self::Fp8 => 64,
+        }
+    }
+}
+
+/// Explicit selection shared by allocation, admission, dispatch and snapshots.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MimoKvFormats {
+    pub full: MimoKvCache,
+    pub sliding: MimoKvCache,
+}
+
+impl Default for MimoKvFormats {
+    fn default() -> Self { Self { full: MimoKvCache::Int8, sliding: MimoKvCache::Int8 } }
+}
+
+impl MimoKvFormats {
+    pub fn of(self, attention: MimoAttention) -> MimoKvCache {
+        match attention { MimoAttention::Full => self.full, MimoAttention::Sliding => self.sliding }
+    }
+
+    pub fn record_format(self) -> &'static str { self.snapshot_record_format(None) }
+
+    /// Retained draft records are part of the snapshot identity, not target KV.
+    pub fn snapshot_record_format(self, draft: Option<crate::families::qwen4::Qwen4KvCache>) -> &'static str {
+        use crate::families::qwen4::Qwen4KvCache;
+        macro_rules! format {
+            ($base:literal) => { match draft {
+                None => concat!($base, "_mtp_hidden_bf16_draft_cold_v1"),
+                Some(Qwen4KvCache::Bf16) => concat!($base, "_mtp_hidden_bf16_draft_bf16_v1"),
+                Some(Qwen4KvCache::Fp8) => concat!($base, "_mtp_hidden_bf16_draft_e4m3_head_f32_planar_v1"),
+            } };
+        }
+        match (self.full, self.sliding) {
+            (MimoKvCache::Bf16, MimoKvCache::Bf16) => format!("mimo_full_bf16_swa_bf16"),
+            (MimoKvCache::Bf16, MimoKvCache::Int8) => format!("mimo_full_bf16_swa_s8g32"),
+            (MimoKvCache::Bf16, MimoKvCache::Fp8) => format!("mimo_full_bf16_swa_e4m3g64"),
+            (MimoKvCache::Int8, MimoKvCache::Bf16) => format!("mimo_full_s8g32_swa_bf16"),
+            (MimoKvCache::Int8, MimoKvCache::Int8) => format!("mimo_full_s8g32_swa_s8g32"),
+            (MimoKvCache::Int8, MimoKvCache::Fp8) => format!("mimo_full_s8g32_swa_e4m3g64"),
+            (MimoKvCache::Fp8, MimoKvCache::Bf16) => format!("mimo_full_e4m3g64_swa_bf16"),
+            (MimoKvCache::Fp8, MimoKvCache::Int8) => format!("mimo_full_e4m3g64_swa_s8g32"),
+            (MimoKvCache::Fp8, MimoKvCache::Fp8) => format!("mimo_full_e4m3g64_swa_e4m3g64"),
         }
     }
 }
@@ -337,7 +370,7 @@ impl MimoV2Config {
     /// Bytes of one token's KV record in `kv`: BF16 (`record_elems * 2`), or int8 (sparkinfer
     /// `_mimo_kernels`): signed bytes for keys and values, then one FP32 scale per
     /// `kv.scale_group()` dims of each KV head's key and value, padded to 16 bytes.
-    pub fn record_bytes(&self, attention: MimoAttention, kv: MimoKvCache) -> usize {
+    pub fn record_bytes(&self, attention: MimoAttention, kv: MimoKvFormats) -> usize {
         self.record_bytes_of(self.kv_heads(attention), kv.of(attention))
     }
 
@@ -345,7 +378,7 @@ impl MimoV2Config {
     pub fn record_bytes_of(&self, heads: usize, kv: MimoKvCache) -> usize {
         match kv {
             MimoKvCache::Bf16 => heads * (self.head_dim + self.v_head_dim) * 2,
-            MimoKvCache::Int8 => {
+            MimoKvCache::Int8 | MimoKvCache::Fp8 => {
                 let raw = heads * (self.head_dim + self.v_head_dim)
                     + 4 * heads * (self.head_dim + self.v_head_dim) / kv.scale_group();
                 raw.div_ceil(16) * 16
@@ -364,6 +397,25 @@ impl MimoV2Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn record_identities_distinguish_full_and_sliding_formats() {
+        let mut formats = std::collections::BTreeSet::new();
+        for full in [MimoKvCache::Bf16, MimoKvCache::Int8, MimoKvCache::Fp8] {
+            for sliding in [MimoKvCache::Bf16, MimoKvCache::Int8, MimoKvCache::Fp8] {
+                let kv = MimoKvFormats { full, sliding };
+                assert_eq!(kv.of(MimoAttention::Full), full);
+                assert_eq!(kv.of(MimoAttention::Sliding), sliding);
+                assert!(kv.record_format().contains("mtp_hidden_bf16"));
+                assert_eq!(kv.record_format(), kv.snapshot_record_format(None));
+                for draft in [None, Some(crate::families::qwen4::Qwen4KvCache::Bf16),
+                    Some(crate::families::qwen4::Qwen4KvCache::Fp8)] {
+                    assert!(formats.insert(kv.snapshot_record_format(draft)));
+                }
+            }
+        }
+        assert_eq!(formats.len(), 27);
+    }
 
     #[test]
     fn mimo_v2_flash_hub_config() -> Result<()> {
@@ -387,9 +439,13 @@ mod tests {
         assert_eq!(cfg.attention[5], MimoAttention::Full);
         assert_eq!(cfg.dense.iter().filter(|d| **d).count(), 1);
         assert_eq!((cfg.record_elems(MimoAttention::Full), cfg.record_elems(MimoAttention::Sliding)), (1280, 2560));
-        assert_eq!((cfg.record_bytes(MimoAttention::Full, MimoKvCache::Int8),
-            cfg.record_bytes(MimoAttention::Sliding, MimoKvCache::Int8)), (1440, 5120));
-        assert_eq!(cfg.head_split(2)?.record_bytes(MimoAttention::Full, MimoKvCache::Int8), 720);
+        assert_eq!((cfg.record_bytes(MimoAttention::Full, MimoKvFormats::default()),
+            cfg.record_bytes(MimoAttention::Sliding, MimoKvFormats::default())), (1440, 2880));
+        for (sliding, bytes) in [(MimoKvCache::Bf16, 5120), (MimoKvCache::Int8, 2880), (MimoKvCache::Fp8, 2720)] {
+            assert_eq!(cfg.record_bytes(MimoAttention::Sliding,
+                MimoKvFormats { full: MimoKvCache::Int8, sliding }), bytes);
+        }
+        assert_eq!(cfg.head_split(2)?.record_bytes(MimoAttention::Full, MimoKvFormats::default()), 720);
         assert!((cfg.routed_scale - 1.0).abs() < 1e-12 && !cfg.full_sinks && cfg.swa_sinks);
         Ok(())
     }
@@ -414,8 +470,14 @@ mod tests {
         assert_eq!((cfg.rope_dim, cfg.full_kv_heads, cfg.swa_kv_heads), (64, 8, 8));
         assert_eq!(cfg.attention.iter().filter(|a| **a == MimoAttention::Full).count(), 10);
         assert_eq!(cfg.record_elems(MimoAttention::Full), 2560);
-        assert_eq!(cfg.record_bytes(MimoAttention::Full, MimoKvCache::Int8), 2560 + 320);
-        assert_eq!(cfg.head_split(2)?.record_bytes(MimoAttention::Full, MimoKvCache::Int8), 1280 + 160);
+        assert_eq!(cfg.record_bytes(MimoAttention::Full, MimoKvFormats::default()), 2560 + 320);
+        assert_eq!(cfg.head_split(2)?.record_bytes(MimoAttention::Full, MimoKvFormats::default()), 1280 + 160);
+        assert_eq!(cfg.record_bytes(MimoAttention::Sliding, MimoKvFormats::default()), 2880);
+        for (sliding, bytes) in [(MimoKvCache::Bf16, 5120), (MimoKvCache::Int8, 2880), (MimoKvCache::Fp8, 2720)] {
+            let formats = MimoKvFormats { full: MimoKvCache::Int8, sliding };
+            assert_eq!(cfg.record_bytes(MimoAttention::Sliding, formats), bytes);
+            assert_eq!(cfg.head_split(2)?.record_bytes(MimoAttention::Sliding, formats), bytes / 2);
+        }
         assert_eq!(cfg.program_family()?, "mimop");
         Ok(())
     }

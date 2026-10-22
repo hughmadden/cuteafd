@@ -25,14 +25,20 @@ def release_entry(entry: dict) -> dict:
     return entry
 
 
-@pytest.mark.parametrize("entry", ENTRIES, ids=lambda e: e["name"])
+@pytest.mark.parametrize("entry,swa_kv", [
+    pytest.param(entry, swa_kv, id=entry["name"] + (f"-{swa_kv}" if swa_kv else ""))
+    for entry in ENTRIES
+    for swa_kv in ([None, "bf16", "int8", "fp8"] if entry["family"] == "mimo_v2" else [None])
+])
 @pytest.mark.parametrize("draft_kv", ["bf16", "fp8"])
-def test_deployment_preserves_release_container_commands(entry: dict, draft_kv: str) -> None:
+def test_deployment_preserves_release_container_commands(entry: dict, swa_kv: str | None, draft_kv: str) -> None:
     golden = json.loads((FIXTURES / f"{entry['name']}.json").read_text())
     selected = release_entry(entry)
     compact_draft = entry["family"] in {"glm5", "glm5_flash", "mimo_v2"}
     if compact_draft:
         selected["set"]["DRAFT_KV_CACHE"] = draft_kv
+    if swa_kv is not None:
+        selected["set"]["SWA_KV_CACHE"] = swa_kv
     current = capture(ROOT, entry["name"], release_entry=selected)
     assert [run["host"] for run in current["containers"]] == [run["host"] for run in golden]
     for old, new in zip(golden, current["containers"]):
@@ -40,9 +46,13 @@ def test_deployment_preserves_release_container_commands(entry: dict, draft_kv: 
         if old["host"] == "coordinator":
             # capture() bounds readiness to 30s; admission now shares that deadline.
             before["env"]["CUTEAFD_SPARK_ADMISSION_TIMEOUT_SECONDS"] = "30"
+            if entry["family"] == "mimo_v2":
+                anchor = "--kv-cache" if "--kv-cache" in before["command"] else "--prefix-partial"
+                position = before["command"].index(anchor) + 2
+                before["command"][position:position] = ["--swa-kv-cache", swa_kv or "int8"]
             if compact_draft:
                 anchor = {"glm5": "--pool-tokens", "glm5_flash": "--host-cache-bytes",
-                          "mimo_v2": "--prefix-partial"}[entry["family"]]
+                          "mimo_v2": "--swa-kv-cache"}[entry["family"]]
                 position = before["command"].index(anchor) + 2
                 before["command"][position:position] = ["--draft-kv-cache", draft_kv]
         # Includes the byte-identical V4.1 fingerprint. Other families have no

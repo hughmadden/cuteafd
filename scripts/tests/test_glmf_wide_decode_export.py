@@ -37,7 +37,7 @@ def exporter(monkeypatch):
         monkeypatch.setenv(name, "1")
     monkeypatch.setitem(sys.modules, "_pinned_sparkinfer", types.SimpleNamespace(REVISION="test"))
     package = types.ModuleType("b12x.integration.cuteafd")
-    for name in ("glmf", "glm_ffn", "glm_attention", "glm_indexer", "dsv4_mhc", "glm_sparse_mla", "context_split", "qwen4", "qwen4_gdn", "qwen4_attention", "qwen_dense", "kimi_mla", "kimi_residual", "pointwise"):
+    for name in ("glmf", "glm_ffn", "glm_attention", "glm_indexer", "dsv4_mhc", "glm_sparse_mla", "context_split", "qwen4", "qwen4_gdn", "qwen4_attention", "qwen_dense", "kimi_mla", "kimi_residual", "pointwise", "mimo_attention", "mimo_ffn"):
         module = _Compilers(f"b12x.integration.cuteafd.{name}")
         setattr(package, name, module)
         monkeypatch.setitem(sys.modules, module.__name__, module)
@@ -74,6 +74,24 @@ def test_checkpoint_extent_table_and_head_splits(exporter, geometry, checkpoint,
         assert exporter.geometry_context(name, 2097152) == limit
     with pytest.raises(ValueError, match="positive"):
         exporter.geometry_context(geometry, 0)
+
+
+@pytest.mark.parametrize("split", [False, True])
+def test_mimo_swa_exports_each_record_without_changing_full_formats(exporter, split):
+    make = exporter.mimo_head_split_programs if split else exporter.mimo_programs
+    programs = make(GEOMETRY, 64, 4096, 1048576)
+    calls = {stem: (params, thunk()[3]) for stem, _, params, thunk in programs}
+    assert len(calls) == len(programs)
+    for mode, rows in [("decode", 64), ("prefill", 4096)]:
+        for kind, formats in [("full", [("bf16", ""), ("int8", "_kvint8")]),
+                              ("swa", [("bf16", ""), ("int8", "_kvint8"), ("fp8", "_kvfp8")])]:
+            for fmt, tag in formats:
+                producer = dict(kind=kind, max_rows=rows, fp8_only=mode, kv=fmt)
+                reader = dict(kind=kind, route=mode, max_rows=rows, kv=fmt)
+                assert calls[f"{kind}_producer{tag}_m{rows}"] == (producer, producer)
+                assert calls[f"{kind}_attention{tag}_{mode}_m{rows}"] == (reader, reader)
+        assert f"full_producer_kvfp8_m{rows}" not in calls
+        assert f"full_attention_kvfp8_{mode}_m{rows}" not in calls
 
 
 def test_qwen_fp8_kv_exports_preserve_bf16_and_weight_variants(exporter):

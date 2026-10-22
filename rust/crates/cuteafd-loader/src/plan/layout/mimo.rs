@@ -212,7 +212,7 @@ pub(super) fn profile(checkpoint: &super::super::Checkpoint, options: &LayoutOpt
         if options.prefill_lanes > 0 { Some(options.prefill_lanes.to_string()) }
         else { std::env::var("CUTEAFD_MIMO_PREFILL_LANES").ok() }.as_deref())?;
     let rings = options.mimo_rings.max(concurrency);
-    let cache = crate::serving_capacity::mimo_cache_geometry(&cfg, cfg.layers, ranks, MimoKvCache::Int8, 0)?;
+    let cache = crate::serving_capacity::mimo_cache_geometry(&cfg, cfg.layers, ranks, MimoKvFormats { full: MimoKvCache::Int8, sliding: options.mimo_swa_kv }, 0)?;
     let dir = checkpoint.snapshot.join("dflash");
     let draft = if dir.join("dflash_draft_model.safetensors").is_file() {
         Some(draft_config::DflashConfig::read(&dir)?)
@@ -255,7 +255,7 @@ pub(super) fn profile(checkpoint: &super::super::Checkpoint, options: &LayoutOpt
             additional.extend(draft_prefix_reservations(options.mimo_prefix_draft, draft_mark, marks, rings)?);
         }
         let workspaces = workspace_options(&cfg, ranks, rank, rows as usize, context as usize,
-            lanes, spark_ranks > 0, options.mimo_expert_input, MimoKvCache::Int8, 0,
+            lanes, spark_ranks > 0, options.mimo_expert_input, MimoKvFormats { full: MimoKvCache::Int8, sliding: options.mimo_swa_kv }, 0,
             if options.full_prefill_logits { MimoPrefillOutput::AllRows } else { MimoPrefillOutput::LastRow },
             fp8_output, |name| {
                 let Some(manifest) = manifest else { return Ok(0); };
@@ -279,7 +279,7 @@ pub(super) fn profile(checkpoint: &super::super::Checkpoint, options: &LayoutOpt
     }, &MimoCapacityOptions { checkpoint_max_context_tokens:
         crate::serving_capacity::checkpoint_context_limit(&checkpoint.config)?
             .context("MiMo checkpoint lacks max_position_embeddings")?,
-        max_context_tokens: context, rings, mark_slots: marks, kv_cache: MimoKvCache::Int8,
+        max_context_tokens: context, rings, mark_slots: marks, kv_cache: MimoKvFormats { full: MimoKvCache::Int8, sliding: options.mimo_swa_kv },
         ranks: runtime, host_prefix_bytes: 0 })?)
 }
 
@@ -374,7 +374,8 @@ fn apply_selected(input: &super::super::PlanInput, options: &LayoutOptions,
         if options.prefill_lanes > 0 { Some(options.prefill_lanes.to_string()) }
         else { std::env::var("CUTEAFD_MIMO_PREFILL_LANES").ok() }.as_deref())?;
     let inputs = crate::placement::families::mimo_v2::MimoInputs { automatic_context: options.context_tokens == 0,
-        cfg: &cfg, profile: &profiles.steady, layers: cfg.layers, kv: MimoKvCache::Int8, mtp_stages: 0,
+        cfg: &cfg, profile: &profiles.steady, layers: cfg.layers,
+        kv: MimoKvFormats { full: MimoKvCache::Int8, sliding: options.mimo_swa_kv }, mtp_stages: 0,
         gpus: devices.iter().enumerate().map(|(rank, device)| (options.rtx_bytes[rank],
             crate::placement::Baseline::Planned { context_bytes: 0,
                 loaded_bytes: device.used_bytes() })).collect(),
@@ -410,7 +411,8 @@ fn apply_selected(input: &super::super::PlanInput, options: &LayoutOptions,
         }
     }
     let unit = selected.profile.pool_unit_rows;
-    let cache = crate::serving_capacity::mimo_cache_geometry(&cfg, cfg.layers, ranks, MimoKvCache::Int8, 0)?;
+    let cache = crate::serving_capacity::mimo_cache_geometry(&cfg, cfg.layers, ranks,
+        MimoKvFormats { full: MimoKvCache::Int8, sliding: options.mimo_swa_kv }, 0)?;
     for ((device, rank), storage) in devices.iter_mut().zip(&selected.profile.devices).zip(&cache.ranks) {
         let units = placement.pool_tokens / unit;
         let kv_unit = storage.persistent_unit_bytes + storage.pool_metadata_unit_bytes;
@@ -442,60 +444,63 @@ mod tests {
             let input = PlanInput::from_checkpoint(checkpoint);
             let checkpoint = input.checkpoint();
             let cfg = MimoV2Config::from_hf(&config).unwrap();
-            for ranks in [1, 2] {
-                for (graphs, expert_input) in [false, true].into_iter().flat_map(|graphs|
-                    [MimoExpertInput::Fp8, MimoExpertInput::Bf16, MimoExpertInput::Bf16Decode]
-                        .map(|input| (graphs, input))) {
-                    let opts = LayoutOptions { rtx_bytes: vec![95 * GIB; ranks], concurrency: 4,
-                        pool_tokens: Some(32768), mimo_decode_graphs: graphs,
-                        mimo_expert_input: expert_input, ..Default::default() };
-                    let planned = profile(&checkpoint, &opts, ranks, 4, 4096, 4, 32768, None).unwrap();
-                    let lanes = resolve_transport_lanes(true, cfg.program_family().unwrap(), None).unwrap();
-                    let cache = crate::serving_capacity::mimo_cache_geometry(&cfg, cfg.layers, ranks, MimoKvCache::Int8, 0).unwrap();
-                    let mark_bytes = cache.ranks.iter().map(|r| r.retained_mark_bytes).sum();
-                    let slots = cuteafd_core::prefix::mark_slots_with_host(4, opts.mimo_prefix_entries, mark_bytes, opts.mimo_prefix_mark_bytes, opts.host_cache_bytes != Some(0));
-                    let graph = decode_graph::MimoDecodeGraphPlan::new(cfg.layers, ranks, 64, graphs).unwrap();
-                    let runtime = (0..ranks).map(|rank| {
-                        let mut additional = transport_reservations(&cfg, ranks, rank, 4096, lanes, 4).unwrap();
-                        if rank == 0 { additional.extend(sampling_reservations(cfg.vocab_size).unwrap()); }
-                        additional.extend(graph.reservations(rank, decode_graph::MIMO_GRAPH_EXEC_BOUND_BYTES,
-                            decode_graph::MIMO_GRAPH_DRIVER_MARGIN_BYTES).unwrap());
-                        MimoRankRuntime { device: rank as u32, loading_additional: vec![], additional,
-                            workspaces: workspace_options(&cfg, ranks, rank, 4096, 32768, lanes, true,
-                                opts.mimo_expert_input, MimoKvCache::Int8, 0, MimoPrefillOutput::LastRow, pro, |_| Ok(0)).unwrap() }
-                    }).collect();
-                    let admitted = mimo_capacity_profiles(&checkpoint, &cfg, MimoResidentOptions {
-                        layers: cfg.layers, coordinator_ranks: ranks, checkpoint_tp: if pro { 8 } else { 4 },
-                        native_mtp_layers: 0, gpu_embedding: true, head_format: if pro { R::Fp8 } else { R::Bf16 },
-                        output_formats: (0..cfg.layers).map(|l| (format!("model.layers.{l}.self_attn.o_proj.weight"),
-                            if pro { R::Fp8 } else { R::Bf16 })).collect(),
-                    }, &MimoCapacityOptions { checkpoint_max_context_tokens: 1 << 20, max_context_tokens: 32768,
-                        rings: 16, mark_slots: slots, kv_cache: MimoKvCache::Int8, ranks: runtime, host_prefix_bytes: 0 }).unwrap();
-                    let mut devices: Vec<_> = (0..ranks).map(|rank| DeviceLayout {
-                        kind: DeviceKind::Rtx, index: rank as u32, capacity_bytes: 95 * GIB,
-                        items: vec![], kv_tokens: 0,
-                    }).collect();
-                    let placement = apply(&input, &opts, &mut devices, 4, 4096, 4, 32768, None).unwrap();
-                    assert_eq!(placement.pool_tokens, 32768);
-                    let waste = replicated_weights(&placement);
-                    if ranks == 1 {
-                        assert!(waste.is_empty());
-                    } else {
-                        let replica: u64 = admitted.steady.devices[1].reservations.iter()
-                            .filter(|r| r.name.contains("layernorm") || r.name.contains(".mlp.gate."))
-                            .map(|r| r.bytes).sum();
-                        assert!(replica > 0);
-                        assert_eq!(waste.len(), 1);
-                        assert_eq!(waste[0].bytes, replica);
-                        assert_eq!(waste[0].device, "rtx1");
-                    }
-                    for rank in 0..ranks {
-                        let total: u64 = admitted.steady.devices[rank].reservations.iter().map(|r| r.bytes).sum::<u64>()
-                            + (32768 / admitted.steady.pool_unit_rows) * admitted.steady.devices[rank].pool_unit_bytes;
-                        assert_eq!(devices[rank].used_bytes(), total, "mapped planner items equal admission total");
-                        assert_eq!(planned.steady.devices[rank].reservations, admitted.steady.devices[rank].reservations,
-                            "pro={pro}, ranks={ranks}, graphs={graphs}, rank={rank}");
-                        assert_eq!(planned.steady.devices[rank].pool_unit_bytes, admitted.steady.devices[rank].pool_unit_bytes);
+            for swa in [MimoKvCache::Bf16, MimoKvCache::Int8, MimoKvCache::Fp8] {
+                let kv = MimoKvFormats { full: MimoKvCache::Int8, sliding: swa };
+                for ranks in [1, 2] {
+                    for (graphs, expert_input) in [false, true].into_iter().flat_map(|graphs|
+                        [MimoExpertInput::Fp8, MimoExpertInput::Bf16, MimoExpertInput::Bf16Decode]
+                            .map(|input| (graphs, input))) {
+                        let opts = LayoutOptions { rtx_bytes: vec![95 * GIB; ranks], concurrency: 4,
+                            pool_tokens: Some(32768), mimo_decode_graphs: graphs, mimo_swa_kv: swa,
+                            mimo_expert_input: expert_input, ..Default::default() };
+                        let planned = profile(&checkpoint, &opts, ranks, 4, 4096, 4, 32768, None).unwrap();
+                        let lanes = resolve_transport_lanes(true, cfg.program_family().unwrap(), None).unwrap();
+                        let cache = crate::serving_capacity::mimo_cache_geometry(&cfg, cfg.layers, ranks, kv, 0).unwrap();
+                        let mark_bytes = cache.ranks.iter().map(|r| r.retained_mark_bytes).sum();
+                        let slots = cuteafd_core::prefix::mark_slots_with_host(4, opts.mimo_prefix_entries, mark_bytes, opts.mimo_prefix_mark_bytes, opts.host_cache_bytes != Some(0));
+                        let graph = decode_graph::MimoDecodeGraphPlan::new(cfg.layers, ranks, 64, graphs).unwrap();
+                        let runtime = (0..ranks).map(|rank| {
+                            let mut additional = transport_reservations(&cfg, ranks, rank, 4096, lanes, 4).unwrap();
+                            if rank == 0 { additional.extend(sampling_reservations(cfg.vocab_size).unwrap()); }
+                            additional.extend(graph.reservations(rank, decode_graph::MIMO_GRAPH_EXEC_BOUND_BYTES,
+                                decode_graph::MIMO_GRAPH_DRIVER_MARGIN_BYTES).unwrap());
+                            MimoRankRuntime { device: rank as u32, loading_additional: vec![], additional,
+                                workspaces: workspace_options(&cfg, ranks, rank, 4096, 32768, lanes, true,
+                                    opts.mimo_expert_input, kv, 0, MimoPrefillOutput::LastRow, pro, |_| Ok(0)).unwrap() }
+                        }).collect();
+                        let admitted = mimo_capacity_profiles(&checkpoint, &cfg, MimoResidentOptions {
+                            layers: cfg.layers, coordinator_ranks: ranks, checkpoint_tp: if pro { 8 } else { 4 },
+                            native_mtp_layers: 0, gpu_embedding: true, head_format: if pro { R::Fp8 } else { R::Bf16 },
+                            output_formats: (0..cfg.layers).map(|l| (format!("model.layers.{l}.self_attn.o_proj.weight"),
+                                if pro { R::Fp8 } else { R::Bf16 })).collect(),
+                        }, &MimoCapacityOptions { checkpoint_max_context_tokens: 1 << 20, max_context_tokens: 32768,
+                            rings: 16, mark_slots: slots, kv_cache: kv, ranks: runtime, host_prefix_bytes: 0 }).unwrap();
+                        let mut devices: Vec<_> = (0..ranks).map(|rank| DeviceLayout {
+                            kind: DeviceKind::Rtx, index: rank as u32, capacity_bytes: 95 * GIB,
+                            items: vec![], kv_tokens: 0,
+                        }).collect();
+                        let placement = apply(&input, &opts, &mut devices, 4, 4096, 4, 32768, None).unwrap();
+                        assert_eq!(placement.pool_tokens, 32768);
+                        let waste = replicated_weights(&placement);
+                        if ranks == 1 {
+                            assert!(waste.is_empty());
+                        } else {
+                            let replica: u64 = admitted.steady.devices[1].reservations.iter()
+                                .filter(|r| r.name.contains("layernorm") || r.name.contains(".mlp.gate."))
+                                .map(|r| r.bytes).sum();
+                            assert!(replica > 0);
+                            assert_eq!(waste.len(), 1);
+                            assert_eq!(waste[0].bytes, replica);
+                            assert_eq!(waste[0].device, "rtx1");
+                        }
+                        for rank in 0..ranks {
+                            let total: u64 = admitted.steady.devices[rank].reservations.iter().map(|r| r.bytes).sum::<u64>()
+                                + (32768 / admitted.steady.pool_unit_rows) * admitted.steady.devices[rank].pool_unit_bytes;
+                            assert_eq!(devices[rank].used_bytes(), total, "mapped planner items equal admission total");
+                            assert_eq!(planned.steady.devices[rank].reservations, admitted.steady.devices[rank].reservations,
+                                "pro={pro}, ranks={ranks}, graphs={graphs}, rank={rank}");
+                            assert_eq!(planned.steady.devices[rank].pool_unit_bytes, admitted.steady.devices[rank].pool_unit_bytes);
+                        }
                     }
                 }
             }
@@ -580,103 +585,112 @@ mod tests {
             let input = PlanInput::from_checkpoint(checkpoint);
             let checkpoint = input.checkpoint();
             let cfg = MimoV2Config::from_hf(&config).unwrap();
-            for ranks in [1, 2] {
-                // Native CPU scratch sizing from the pinned SM120 package;
-                // TP1 and TP2 retain different intermediate workspaces.
-                let scratch = match (pro, ranks) {
-                    (true, 1) => 805_573_632, (true, _) => 604_247_040,
-                    (false, 1) => 671_354_880, (false, _) => 470_028_288,
-                };
-                let totals = [101_973_491_712, 101_970_345_984][..ranks].to_vec();
-                let baseline = [586_416_128, 596_901_888];
-                let package = dir.path().join(format!("tp{ranks}-manifest.json"));
-                let layout = format!("tp{ranks}");
-                std::fs::write(&package, serde_json::to_vec(&serde_json::json!({"layouts": {layout: {
-                    "input": "bf16", "tp": ranks, "hidden": cfg.hidden, "experts": cfg.experts,
-                    "top_k": cfg.topk, "intermediate": cfg.moe_intermediate,
-                    "slice": cfg.moe_intermediate / ranks, "weights": "mxfp4",
-                    "capacities": [{"capacity": 4096, "scratch_bytes": scratch}]
-                }}})).unwrap()).unwrap();
-                let context = 256 << 10;
-                let sparks = if pro { 6 } else if ranks == 1 { 2 } else { 4 };
-                let opts = LayoutOptions { rtx_bytes: totals.clone(), head_split: ranks == 2,
-                    pool_tokens: Some(2 << 20), concurrency: 16, host_cache_bytes: Some(0), mimo_expert_manifest: Some(package),
-                    ..Default::default() };
-                let costs = profile(&checkpoint, &opts, ranks, sparks, 4096, 16, context, None).unwrap();
-                let (experts, expert_workspace, tp2_workspace, onboard) =
-                    expert_costs(&input, &cfg, &opts, ranks, sparks, 4096).unwrap();
-                let lanes = resolve_transport_lanes(true, cfg.program_family().unwrap(), None).unwrap();
-                let inputs = MimoInputs { automatic_context: opts.context_tokens == 0, cfg: &cfg, profile: &costs.steady, layers: cfg.layers,
-                    kv: MimoKvCache::Int8, mtp_stages: 0, gpus: totals.iter().enumerate().map(|(rank, &total)|
-                        (total, Baseline::Measured { free_bytes: total - baseline[rank] })).collect(),
-                    headroom_floor: opts.headroom_bytes, spark_ranks: sparks, startup_probe_bytes: 64 << 20,
-                    context, requested_pool: opts.pool_tokens, pool_ceiling_at_target: false, onboard, experts, expert_workspace,
-                    tp2_workspace, rows: 4096, lanes: lanes as u64 };
-                let no_spark = profile(&checkpoint, &opts, ranks, 0, 4096, 16, context, None).unwrap();
-                let solution = solve_working_set(&inputs, &no_spark.steady).unwrap();
-                let selected = inputs.selected(&no_spark.steady, &solution.working_set);
-                let runtime_request = &solution.request;
-                let runtime = &solution.placement;
-                assert_eq!(solution.working_set.spark_ranks, sparks);
-                assert_eq!(solution.working_set.spark_layers,
-                    runtime.layers.iter().enumerate().filter_map(|(layer, assignment)|
-                        (assignment.experts == ExpertHome::Spark).then_some(layer)).collect::<Vec<_>>());
-                if ranks == 1 {
-                    let cost = runtime_request.layers.iter().find_map(|layer| layer.experts).unwrap();
-                    assert!(cost.whole.resident > 0 && !cost.tp2, "single RTX offers whole TP1 experts");
-                    let fixed = costs.steady.devices[0].reservations.iter().map(|r| r.bytes).sum::<u64>();
-                    let pool = (runtime.pool_tokens / costs.steady.pool_unit_rows) * costs.steady.devices[0].pool_unit_bytes;
-                    let remaining = runtime_request.inventory.gpus[0].available() - fixed - pool;
-                    println!("mimo pro={pro} TP1 offered: whole={} workspace={} remaining={remaining}",
-                        cost.whole.resident, runtime_request.expert_workspace);
-                    if pro {
-                        assert!(remaining < cost.whole.resident, "Pro min cannot fit one TP1 layer even with zero scratch");
+            for sliding in [MimoKvCache::Bf16, MimoKvCache::Int8, MimoKvCache::Fp8] {
+                let kv = MimoKvFormats { full: MimoKvCache::Int8, sliding };
+                for ranks in [1, 2] {
+                    // Native CPU scratch sizing from the pinned SM120 package;
+                    // TP1 and TP2 retain different intermediate workspaces.
+                    let scratch = match (pro, ranks) {
+                        (true, 1) => 805_573_632, (true, _) => 604_247_040,
+                        (false, 1) => 671_354_880, (false, _) => 470_028_288,
+                    };
+                    let totals = [101_973_491_712, 101_970_345_984][..ranks].to_vec();
+                    let baseline = [586_416_128, 596_901_888];
+                    let package = dir.path().join(format!("tp{ranks}-manifest.json"));
+                    let layout = format!("tp{ranks}");
+                    std::fs::write(&package, serde_json::to_vec(&serde_json::json!({"layouts": {layout: {
+                        "input": "bf16", "tp": ranks, "hidden": cfg.hidden, "experts": cfg.experts,
+                        "top_k": cfg.topk, "intermediate": cfg.moe_intermediate,
+                        "slice": cfg.moe_intermediate / ranks, "weights": "mxfp4",
+                        "capacities": [{"capacity": 4096, "scratch_bytes": scratch}]
+                    }}})).unwrap()).unwrap();
+                    let context = 256 << 10;
+                    let sparks = if pro { 6 } else if ranks == 1 { 2 } else { 4 };
+                    let opts = LayoutOptions { rtx_bytes: totals.clone(), head_split: ranks == 2, mimo_swa_kv: sliding,
+                        pool_tokens: Some(2 << 20), concurrency: 16, host_cache_bytes: Some(0), mimo_expert_manifest: Some(package),
+                        ..Default::default() };
+                    let costs = profile(&checkpoint, &opts, ranks, sparks, 4096, 16, context, None).unwrap();
+                    let (experts, expert_workspace, tp2_workspace, onboard) =
+                        expert_costs(&input, &cfg, &opts, ranks, sparks, 4096).unwrap();
+                    let lanes = resolve_transport_lanes(true, cfg.program_family().unwrap(), None).unwrap();
+                    let inputs = MimoInputs { automatic_context: opts.context_tokens == 0, cfg: &cfg, profile: &costs.steady, layers: cfg.layers,
+                        kv, mtp_stages: 0, gpus: totals.iter().enumerate().map(|(rank, &total)|
+                            (total, Baseline::Measured { free_bytes: total - baseline[rank] })).collect(),
+                        headroom_floor: opts.headroom_bytes, spark_ranks: sparks, startup_probe_bytes: 64 << 20,
+                        context, requested_pool: opts.pool_tokens, pool_ceiling_at_target: false, onboard, experts, expert_workspace,
+                        tp2_workspace, rows: 4096, lanes: lanes as u64 };
+                    let no_spark = profile(&checkpoint, &opts, ranks, 0, 4096, 16, context, None).unwrap();
+                    let solution = solve_working_set(&inputs, &no_spark.steady).unwrap();
+                    let selected = inputs.selected(&no_spark.steady, &solution.working_set);
+                    let runtime_request = &solution.request;
+                    let runtime = &solution.placement;
+                    assert_eq!(solution.working_set.spark_ranks, sparks);
+                    assert_eq!(solution.working_set.spark_layers,
+                        runtime.layers.iter().enumerate().filter_map(|(layer, assignment)|
+                            (assignment.experts == ExpertHome::Spark).then_some(layer)).collect::<Vec<_>>());
+                    if ranks == 1 {
+                        let cost = runtime_request.layers.iter().find_map(|layer| layer.experts).unwrap();
+                        assert!(cost.whole.resident > 0 && !cost.tp2, "single RTX offers whole TP1 experts");
+                        let fixed = costs.steady.devices[0].reservations.iter().map(|r| r.bytes).sum::<u64>();
+                        let pool = (runtime.pool_tokens / costs.steady.pool_unit_rows) * costs.steady.devices[0].pool_unit_bytes;
+                        let remaining = runtime_request.inventory.gpus[0].available() - fixed - pool;
+                        println!("mimo pro={pro} TP1 offered: whole={} workspace={} remaining={remaining}",
+                            cost.whole.resident, runtime_request.expert_workspace);
+                        if pro {
+                            match sliding {
+                                MimoKvCache::Bf16 => assert!(remaining < cost.whole.resident,
+                                    "BF16 Pro min cannot fit one TP1 layer even with zero scratch"),
+                                MimoKvCache::Int8 | MimoKvCache::Fp8 => assert!(
+                                    remaining >= cost.whole.resident + runtime_request.expert_workspace,
+                                    "compact Pro min fits one TP1 layer including scratch"),
+                            }
+                        }
                     }
-                }
-                let capacity = resolved_capacity(&selected, runtime_request, runtime, 16, 16).unwrap();
-                let mut devices = totals.iter().enumerate().map(|(rank, &total)| DeviceLayout {
-                    kind: DeviceKind::Rtx, index: rank as u32, capacity_bytes: total, kv_tokens: 0,
-                    items: vec![Item::new(Category::Runtime, "context+modules", "measured post-module",
-                        baseline[rank], Basis::Calibrated)],
-                }).collect::<Vec<_>>();
-                let planned = apply(&input, &opts, &mut devices, sparks, 4096, 16, context, None).unwrap();
-                assert_eq!(&planned, runtime, "pro={pro}, ranks={ranks}");
-                assert_eq!(planned.pool_tokens, 2 << 20);
-                assert_eq!(capacity.active_max_context_sequences, 8);
-                for rank in 0..ranks {
-                    let admitted = &capacity.devices[rank];
-                    assert_eq!(devices[rank].used_bytes(), baseline[rank] + admitted.reserved_bytes + admitted.pool_bytes);
-                    let categories = [Category::Embedding, Category::Weights, Category::Drafter, Category::Experts,
-                        Category::Workspace, Category::Transport, Category::Prefix, Category::Kv, Category::Runtime];
-                    for category in categories {
-                        let planned = devices[rank].items.iter().filter(|item| item.category == category)
-                            .map(|item| item.bytes).sum::<u64>();
-                        let runtime = admitted.reservations.iter().filter(|item|
-                            reservation_category(&item.name) == category).map(|item| item.bytes).sum::<u64>();
-                        let pool = devices[rank].items.iter().filter(|item| item.category == category
-                            && (item.group == "records" || item.group == "pool page tables"))
-                            .map(|item| item.bytes).sum::<u64>();
-                        assert_eq!(planned, runtime + pool + if category == Category::Runtime { baseline[rank] } else { 0 });
+                    let capacity = resolved_capacity(&selected, runtime_request, runtime, 16, 16).unwrap();
+                    let mut devices = totals.iter().enumerate().map(|(rank, &total)| DeviceLayout {
+                        kind: DeviceKind::Rtx, index: rank as u32, capacity_bytes: total, kv_tokens: 0,
+                        items: vec![Item::new(Category::Runtime, "context+modules", "measured post-module",
+                            baseline[rank], Basis::Calibrated)],
+                    }).collect::<Vec<_>>();
+                    let planned = apply(&input, &opts, &mut devices, sparks, 4096, 16, context, None).unwrap();
+                    assert_eq!(&planned, runtime, "pro={pro}, ranks={ranks}");
+                    assert_eq!(planned.pool_tokens, 2 << 20);
+                    assert_eq!(capacity.active_max_context_sequences, 8);
+                    for rank in 0..ranks {
+                        let admitted = &capacity.devices[rank];
+                        assert_eq!(devices[rank].used_bytes(), baseline[rank] + admitted.reserved_bytes + admitted.pool_bytes);
+                        let categories = [Category::Embedding, Category::Weights, Category::Drafter, Category::Experts,
+                            Category::Workspace, Category::Transport, Category::Prefix, Category::Kv, Category::Runtime];
+                        for category in categories {
+                            let planned = devices[rank].items.iter().filter(|item| item.category == category)
+                                .map(|item| item.bytes).sum::<u64>();
+                            let runtime = admitted.reservations.iter().filter(|item|
+                                reservation_category(&item.name) == category).map(|item| item.bytes).sum::<u64>();
+                            let pool = devices[rank].items.iter().filter(|item| item.category == category
+                                && (item.group == "records" || item.group == "pool page tables"))
+                                .map(|item| item.bytes).sum::<u64>();
+                            assert_eq!(planned, runtime + pool + if category == Category::Runtime { baseline[rank] } else { 0 });
+                        }
+                        println!("mimo pro={pro} ranks={ranks} rank={rank}: pool={} experts={} reserved={} pool_bytes={} baseline={}",
+                            planned.pool_tokens, planned.onboard_layers, admitted.reserved_bytes, admitted.pool_bytes, baseline[rank]);
                     }
-                    println!("mimo pro={pro} ranks={ranks} rank={rank}: pool={} experts={} reserved={} pool_bytes={} baseline={}",
-                        planned.pool_tokens, planned.onboard_layers, admitted.reserved_bytes, admitted.pool_bytes, baseline[rank]);
+                    if ranks == 2 {
+                        assert!(runtime.onboard_layers > 0);
+                        assert!(runtime.expert_ranges.iter().all(|range| range.layers == 0));
+                        assert!(runtime.layers.iter().all(|layer| !matches!(layer.experts, ExpertHome::RtxWhole { .. })));
+                    }
+                    // Auto with no package must retain the automatic pool bound,
+                    // and cannot charge routes/arena that runtime never allocates.
+                    let fallback = MimoInputs { requested_pool: None, onboard: Onboard::Auto,
+                        expert_workspace: 0, tp2_workspace: [0; 2], ..inputs };
+                    let fallback_solution = solve_working_set(&fallback, &no_spark.steady).unwrap();
+                    let fallback_selected = fallback.selected(&no_spark.steady, &fallback_solution.working_set);
+                    assert_eq!(fallback_solution.request.pool.ceiling, 2 << 20);
+                    assert_eq!(fallback_solution.placement.pool_tokens, 2 << 20);
+                    assert_eq!(fallback_solution.placement.onboard_layers, 0);
+                    assert!(crate::placement::families::mimo_v2::expert_items(&fallback_selected,
+                        &fallback_solution.placement, 0).unwrap().is_empty());
                 }
-                if ranks == 2 {
-                    assert!(runtime.onboard_layers > 0);
-                    assert!(runtime.expert_ranges.iter().all(|range| range.layers == 0));
-                    assert!(runtime.layers.iter().all(|layer| !matches!(layer.experts, ExpertHome::RtxWhole { .. })));
-                }
-                // Auto with no package must retain the automatic pool bound,
-                // and cannot charge routes/arena that runtime never allocates.
-                let fallback = MimoInputs { requested_pool: None, onboard: Onboard::Auto,
-                    expert_workspace: 0, tp2_workspace: [0; 2], ..inputs };
-                let fallback_solution = solve_working_set(&fallback, &no_spark.steady).unwrap();
-                let fallback_selected = fallback.selected(&no_spark.steady, &fallback_solution.working_set);
-                assert_eq!(fallback_solution.request.pool.ceiling, 2 << 20);
-                assert_eq!(fallback_solution.placement.pool_tokens, 2 << 20);
-                assert_eq!(fallback_solution.placement.onboard_layers, 0);
-                assert!(crate::placement::families::mimo_v2::expert_items(&fallback_selected,
-                    &fallback_solution.placement, 0).unwrap().is_empty());
             }
         }
     }

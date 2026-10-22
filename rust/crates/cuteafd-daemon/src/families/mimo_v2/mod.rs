@@ -60,9 +60,12 @@ pub(crate) struct EngineArgs {
     pub pool_tokens: usize,
     /// Full-attention KV record format: int8 (signed bytes with an FP32 scale
     /// `amax / 127` per 32 dims of each head's key and value: 0.56x the bytes of
-    /// BF16) or bf16. SWA rings are BF16 either way.
+    /// BF16) or bf16.
     #[arg(long, value_enum, default_value_t = KvCacheArg::Int8, env = "CUTEAFD_MIMO_KV_CACHE")]
     pub kv_cache: KvCacheArg,
+    /// Sliding-attention and native-MTP ring format, independent of full KV.
+    #[arg(long, value_enum, default_value = "int8")]
+    pub swa_kv_cache: SwaKvCacheArg,
     /// Sequences with a sliding-window ring.
     #[arg(long, default_value_t = 16)]
     pub rings: usize,
@@ -466,6 +469,24 @@ mod source_format_tests {
     }
 
     #[test]
+    fn full_and_sliding_kv_select_independently_with_int8_swa_default() {
+        use cuteafd_loader::families::mimo_v2::{MimoKvCache, MimoKvFormats};
+        let args = Command::try_parse_from(["mimo", "--snapshot", "/missing", "--native-lib", "/missing.so"])
+            .unwrap().engine;
+        assert_eq!(args.kv_formats(), MimoKvFormats { full: MimoKvCache::Int8, sliding: MimoKvCache::Int8 });
+        assert_eq!(args.kv_formats(), MimoKvFormats::default());
+        for (full, full_format) in [("bf16", MimoKvCache::Bf16), ("int8", MimoKvCache::Int8)] {
+            for (swa, sliding) in [("bf16", MimoKvCache::Bf16), ("int8", MimoKvCache::Int8), ("fp8", MimoKvCache::Fp8)] {
+                let args = Command::try_parse_from(["mimo", "--snapshot", "/missing", "--native-lib", "/missing.so",
+                    "--kv-cache", full, "--swa-kv-cache", swa]).unwrap().engine;
+                assert_eq!(args.kv_formats(), MimoKvFormats { full: full_format, sliding });
+            }
+        }
+        assert!(Command::try_parse_from(["mimo", "--snapshot", "/missing", "--native-lib", "/missing.so",
+            "--swa-kv-cache", "unknown"]).is_err());
+    }
+
+    #[test]
     fn checkpoint_policy_and_draft_source_selector_are_explicit_cli_options() {
         let mut args = Command::try_parse_from(["mimo", "--snapshot", "/missing", "--native-lib", "/missing.so",
             "--weight-policy", "checkpoint", "--draft-representation", "checkpoint"]).unwrap().engine;
@@ -528,6 +549,25 @@ mod source_format_tests {
                 assert!(resolve_weight_formats(&target_only, &checkpoint, &cfg).is_ok());
             }
         }
+    }
+}
+
+impl EngineArgs {
+    fn kv_formats(&self) -> cuteafd_loader::families::mimo_v2::MimoKvFormats {
+        cuteafd_loader::families::mimo_v2::MimoKvFormats {
+            full: self.kv_cache.into(), sliding: self.swa_kv_cache.into(),
+        }
+    }
+}
+
+/// Sliding-attention storage is independently measured before default changes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub(crate) enum SwaKvCacheArg { Bf16, Int8, Fp8 }
+
+impl From<SwaKvCacheArg> for cuteafd_loader::families::mimo_v2::MimoKvCache {
+    fn from(value: SwaKvCacheArg) -> Self {
+        match value { SwaKvCacheArg::Bf16 => Self::Bf16, SwaKvCacheArg::Int8 => Self::Int8,
+            SwaKvCacheArg::Fp8 => Self::Fp8 }
     }
 }
 
@@ -925,7 +965,7 @@ impl Opened {
                 Ok(allocation)
             };
             let (h, record) = (self.cfg.hidden, self.cfg.record_bytes(cuteafd_loader::families::mimo_v2::MimoAttention::Sliding,
-                args.kv_cache.into()));
+                args.kv_formats()));
             let stages = (0..args.mtp).map(|k| -> Result<mtp::MtpStage<'_>> {
                 let [eh, enorm, hnorm, final_norm] = loader.mtp_extras(k)?;
                 Ok(mtp::MtpStage { layer: loader.mtp_layer(&self.cfg, k)?, eh, enorm, hnorm, final_norm,
@@ -951,7 +991,7 @@ impl Opened {
             "MiMo coordinator weights resident after Spark admission (elapsed includes wait)");
         let pages = usize::try_from(preflight.capacity.allocated_gpu_kv_tokens)? / engine::PAGE_ROWS;
         let mut engine = engine::MimoEngine::new(&self.library, &programs, self.cfg.clone(), model, stream,
-            args.max_context, args.prefill_rows, pages, args.rings, embedding, args.kv_cache.into(), prefill_output)?;
+            args.max_context, args.prefill_rows, pages, args.rings, embedding, args.kv_formats(), prefill_output)?;
         // Once an engine exists, setup and body failures share the same terminal
         // retirement path. Pre-engine loader ownership is a separate boundary.
         let result = (|| -> Result<T> {
@@ -962,12 +1002,12 @@ impl Opened {
             engine.graph_storage_bound_bytes = Some(preflight.graph_bound_bytes.clone());
             {
                 use cuteafd_loader::families::mimo_v2::MimoAttention;
-                let kv = args.kv_cache.into();
+                let kv = args.kv_formats();
                 let per_token: usize = self.cfg.attention.iter().take(layers).filter(|a| **a == MimoAttention::Full)
                     .map(|_| self.cfg.record_bytes(MimoAttention::Full, kv)).sum();
                 let ring_bytes: usize = self.cfg.attention.iter().take(layers).filter(|a| **a == MimoAttention::Sliding)
                     .map(|_| self.cfg.record_bytes(MimoAttention::Sliding, kv) * engine::RING_ROWS).sum();
-                tracing::info!(kv_cache = ?args.kv_cache, pool_tokens = pages * engine::PAGE_ROWS,
+                tracing::info!(kv_cache = ?args.kv_cache, swa_kv_cache = ?args.swa_kv_cache, pool_tokens = pages * engine::PAGE_ROWS,
                     bytes_per_token = per_token, tokens_per_gib = (1usize << 30) / per_token.max(1),
                     ring_mib_per_sequence = format!("{:.2}", ring_bytes as f64 / (1u64 << 20) as f64), "MiMo KV records");
             }
@@ -1740,6 +1780,60 @@ fn opened_copy(engine: &engine::MimoEngine<'_>, out: &mut [u8], source: cuteafd_
     engine.library.copy_d2h(out, source)
 }
 
+fn resume_mtp_check(engine: &engine::MimoEngine<'_>, tokens: &[u32], at: usize,
+    original: &engine::MimoPlacement, restored: &engine::MimoPlacement) -> Result<()> {
+    let Some(mtp) = &engine.mtp else { return Ok(()) };
+    let stages = mtp.stages.len();
+    let read_rows = |buffer: cuteafd_ffi::CuteafdDeviceBuffer, ring: usize, row: usize,
+        from: usize, to: usize| -> Result<Vec<u8>> {
+        ensure!(from <= to && to - from <= engine::RING_ROWS, "MTP comparison exceeds retained ring rows");
+        let mut bytes = Vec::with_capacity((to - from) * row);
+        let mut position = from;
+        while position < to {
+            let rows = (to - position).min(engine::RING_ROWS - position % engine::RING_ROWS);
+            let offset = (ring * engine::RING_ROWS + position % engine::RING_ROWS) * row;
+            let size = rows * row;
+            ensure!(offset + size <= buffer.bytes, "MTP comparison outside its allocation");
+            let start = bytes.len();
+            bytes.resize(start + size, 0);
+            opened_copy(engine, &mut bytes[start..], cuteafd_ffi::CuteafdDeviceBuffer {
+                ptr: buffer.ptr.cast::<u8>().wrapping_add(offset).cast(), bytes: size, ..buffer })?;
+            position += rows;
+        }
+        Ok(bytes)
+    };
+    let hidden_from = at.saturating_sub(engine.cfg.window + stages + 1);
+    let hidden_a = read_rows(mtp.hidden.buffer, original.ring as usize, engine.cfg.hidden * 2, hidden_from, at)?;
+    let hidden_b = read_rows(mtp.hidden.buffer, restored.ring as usize, engine.cfg.hidden * 2, hidden_from, at)?;
+    ensure!(hidden_a == hidden_b, "restored MTP BF16 hidden history differs before catch-up at {at}");
+    let mut hidden_before = vec![0; mtp.hidden.buffer.bytes];
+    opened_copy(engine, &mut hidden_before, mtp.hidden.buffer)?;
+    let mut drafts = Vec::new();
+    for placement in [original, restored] {
+        engine.mtp_reset(placement.ring as usize, at);
+        drafts.push(engine.mtp_draft(&[mtp::MtpSeq { ring: placement.ring as usize,
+            len: at, tokens: &tokens[..=at], media: None }], stages)?);
+    }
+    ensure!(drafts[0] == drafts[1], "restored MTP draft IDs differ at {at}: {:?} vs {:?}", drafts[0], drafts[1]);
+    let row = engine.cfg.record_bytes(
+        cuteafd_loader::families::mimo_v2::MimoAttention::Sliding, engine.kv_cache());
+    let mut compared = 0;
+    for (stage, state) in mtp.stages.iter().enumerate() {
+        // Only true-token rows are committed; later rows contain speculative inputs.
+        let end = at.saturating_sub(stage);
+        let from = hidden_from.max(end.saturating_sub(engine.cfg.window));
+        let a = read_rows(state.ring.buffer, original.ring as usize, row, from, end)?;
+        let b = read_rows(state.ring.buffer, restored.ring as usize, row, from, end)?;
+        ensure!(a == b, "restored MTP stage {stage} committed record bytes differ at {at}");
+        compared += a.len();
+    }
+    let mut hidden_after = vec![0; hidden_before.len()];
+    opened_copy(engine, &mut hidden_after, mtp.hidden.buffer)?;
+    ensure!(hidden_before == hidden_after, "MTP catch-up changed BF16 hidden history at {at}");
+    println!("resume MTP at {at}: {stages} stages | draft IDs identical | committed records identical ({compared} B) | BF16 hidden history unchanged");
+    Ok(())
+}
+
 fn resume_check(args: &GoldenArgs, engine: &engine::MimoEngine<'_>, tokens: &[u32], at: usize)
     -> Result<()> {
     use cuteafd_engine::prefix::{MarkSlot, PrefixFamily};
@@ -1785,6 +1879,7 @@ fn resume_check(args: &GoldenArgs, engine: &engine::MimoEngine<'_>, tokens: &[u3
         Ok(bytes)
     };
     let mark_equal = mark(0)? == mark(1)?;
+    resume_mtp_check(engine, tokens, at, &a, &b)?;
     let straight = prefill_digest(engine, &mut a, &embed[at..], chunk, true)?;
     let restored = prefill_digest(engine, &mut b, &embed[at..], chunk, true)?;
     let first_layer = straight.layers.iter().zip(&restored.layers).position(|(x, y)| x != y);
