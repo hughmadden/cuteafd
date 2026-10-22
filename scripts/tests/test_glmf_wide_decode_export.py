@@ -420,14 +420,16 @@ def test_shared_gqa_drafter_requested_symbols_exist_in_native_catalog(family):
     requested = set(re.findall(r"\.((?:glm_dflash_)[a-z0-9_]+)\(", shared))
     assert requested
     ffi = (ROOT / "rust/crates/cuteafd-ffi/src/families/glm5/glm_dflash.rs").read_text()
-    symbols = dict(re.findall(r'pub (?:unsafe )?fn (glm_dflash_\w+)\b.*?self\.lib\.get::<F>\(b"([^"]+)"',
-                              ffi, re.S))
+    # One entry per wrapper; a wrapper may resolve several symbols (format variants).
+    symbols = {m.group(1): set(re.findall(r'b"(cuteafd_glm_dflash_\w+)"', m.group(2)))
+               for m in re.finditer(r'\n    pub (?:unsafe )?fn (glm_dflash_\w+)\b(.*?)(?=\n    pub |\Z)', ffi, re.S)}
     assert requested <= symbols.keys(), sorted(requested - symbols.keys())
+    assert all(symbols[name] for name in requested), sorted(n for n in requested if not symbols[n])
     native = ROOT / "native"
     source = "families/glm5/cuda/glm_dflash.cu"
     catalog = set(re.findall(r'extern "C" \w+ (cuteafd_glm_dflash_\w+)\(',
                              (native / source).read_text()))
-    assert {symbols[name] for name in requested} <= catalog
+    assert set().union(*(symbols[name] for name in requested)) <= catalog
     cmake = (native / "CMakeLists.txt").read_text()
     common_sources = cmake.split("list(APPEND CUTEAFD_NATIVE_SOURCES\n", 1)[1].split(")", 1)[0]
     assert source in common_sources
