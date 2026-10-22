@@ -14,6 +14,7 @@ from pathlib import Path
 import re
 import secrets
 import shlex
+import shutil
 import statistics
 import socket
 import threading
@@ -402,6 +403,35 @@ def smoke_groups(jobs, parallel):
     return [[job] for job in jobs]
 
 
+def slot_binary(arm):
+    """The smoke runner a sealed WIP slot ships: the arm's own coordinator build."""
+    root = arm.get('root') or str(Path.home() / '.cache/cuteafd/builds' / ('wip-' + arm.get('wip_instance', arm['instance'])))
+    return Path(root) / 'slots' / arm['slot'] / 'coordinator/workspace/.cuteafd-wip/cuteafd'
+
+
+def resolve_binary(binary, arm, dry=False):
+    """The cuteafd that runs one arm's smoke: --binary as given, else the one on
+    PATH, else the arm's own sealed slot binary. An agent shell rarely has cuteafd
+    on PATH, and the slot binary is the runner that arm's build shipped, so it is
+    the right default per arm (an A/B of two builds keeps each arm's own smoke)."""
+    if binary:
+        if not dry and not (Path(binary).is_file() or shutil.which(binary)):
+            raise ValueError(f'--binary {binary} is neither a file nor on PATH')
+        return binary
+    found = shutil.which('cuteafd')
+    if found:
+        return found
+    if dry:
+        return 'cuteafd'
+    if 'release' in arm:
+        raise ValueError('--binary is required for a release arm: it serves published images and ships no host binary')
+    path = slot_binary(arm)
+    if not path.is_file():
+        raise ValueError(f'--binary: cuteafd is not on PATH and this arm\'s sealed slot has no binary at {path}; '
+                         'build the arm (--build) or pass --binary')
+    return str(path)
+
+
 def binary_supports(binary, repo, job, needs):
     """Asks the smoke binary itself (a CPU-only --dry-run of this job's matrix)
     whether it knows each needed entry field; an older binary would ignore them."""
@@ -431,13 +461,21 @@ def speculating(values):
     return values.get('SPECULATOR', 'auto') != 'off' and values.get('DSPARK', 'on') != 'off'
 
 
-def preflight_job(job, arm):
-    """Everything about one job that is checkable without hardware: no serving
-    container of ours exists, the arm is sealed on every host it runs on, the
-    slot holds the packages and audio entry the card needs, and the job's
-    trace/profile directories are writable. Returns the artifact record."""
-    values = job['entry']['set']
+def preflight_at_grant(job, arm):
+    """Smoke's prelaunch hook, run once it holds this card's locks: the absence of
+    our containers is only meaningful then. Checked up front it would refuse a job
+    queued behind a running task that still holds a container of the same name."""
     assert_absent(job)
+    return preflight_job(job, arm)
+
+
+def preflight_job(job, arm):
+    """Everything about one job that is checkable before its turn: the arm is
+    sealed on every host it runs on, the slot holds the packages and audio entry
+    the card needs, and the job's trace/profile directories are writable. Container
+    absence is asserted at grant (preflight_at_grant), not here. Returns the
+    artifact record."""
+    values = job['entry']['set']
     needs = job.get('needs') or {'coordinator': [], 'spark': [], 'audio': False}
     artifacts, problems = {}, []
     for host in ('raptor', *job['entry']['sparks']):
@@ -1526,7 +1564,7 @@ def v41_tp_role(card, values):
 def checkpoint_is_nvfp4(values):
     """Whether the card's checkpoint ships NVFP4 routed experts (its own
     config.json's moe_quant_algo, as the launcher reads it)."""
-    model = values.get('MODEL_ID', 'deepseek-ai/DeepSeek-V4.1-Flash')
+    model = values.get('MODEL_ID', 'deepseek-ai/DeepSeek-V4.1-Flash-1017')
     hub = Path(os.environ.get('HF_HOME', Path.home() / '.cache/huggingface')) / 'hub' / ('models--' + model.replace('/', '--'))
     revision = values.get('MODEL_REVISION') or ((hub / 'refs/main').read_text().strip() if (hub / 'refs/main').is_file() else '')
     try:
@@ -1693,6 +1731,30 @@ m.write_text(json.dumps(owner))
 """.replace('ROOT_NAME', repr(Path(root).name)).replace('OWNER', repr(dict(task=task, instance=instance))).replace('SLOT', repr(slot)).replace('INSTANCE', repr(instance)).replace('REVISION', repr(revision))
 
 
+def claim_root(root, task, arm, revision, seed_candidates, dry=False):
+    """Write this task's owner marker before any build work touches the root: on
+    raptor and, for a both-role build, every host the slot is staged to plus any
+    seed that may compile it. A coordinator-only export claims raptor alone. An
+    unreachable automatic seed is skipped (wip.sh would not choose it either);
+    any other failure stops the build. Claiming first keeps a root that a failed
+    or interrupted run leaves behind owned by this task, so a later --resume never
+    has to adopt an unowned root."""
+    seed_hosts = [h for h in seed_candidates if h not in HOSTS]
+    hosts = ('raptor', *HOSTS, *seed_hosts) if arm['build_role'] == 'both' else ('raptor',)
+    for host in hosts:
+        if dry:
+            continue
+        marker = owner_marker_script(root, task, arm['instance'], arm['slot'], revision)
+        command = ['python3', '-c', marker]
+        try:
+            run(command if host == 'raptor' else ['ssh', '-o', 'BatchMode=yes', host, shlex.join(command)])
+        except subprocess.CalledProcessError as error:
+            # An unreachable automatic seed is skipped by wip.sh too; anything else stops.
+            if arm['seed_explicit'] or host not in seed_hosts or error.returncode != 255:
+                raise
+            print(f'# build seed {host} unreachable; wip.sh will not choose it')
+
+
 def build_arms(builds, arms, cards, state, task, dry, seed=DEFAULT_SEED):
     scopes = build_scopes(cards)
     for name, revision in builds.items():
@@ -1764,6 +1826,7 @@ def build_arms(builds, arms, cards, state, task, dry, seed=DEFAULT_SEED):
             lane_a, lane_b = seed_lanes(host, dry)
             values.update({f'SPARK_{i}_HOST': host, f'SPARK_{i}_LANE_A': lane_a, f'SPARK_{i}_LANE_B': lane_b})
         build_config.write_text(''.join(f'{k}={v}\n' for k, v in sorted(values.items())))
+        claim_root(root, task, arm, revision, seed_candidates, dry)
         # Only the submodules a WIP build reads, from the local module stores
         # (scripts/build/wip-source-checkout.sh, verified against the tree locks).
         checkout = REPO / 'scripts/build/wip-source-checkout.sh'
@@ -1797,17 +1860,6 @@ def build_arms(builds, arms, cards, state, task, dry, seed=DEFAULT_SEED):
                         # A fair turn (hwlock), so a seed wait never overtakes an older queued job.
                         subprocess.run([sys.executable, str(REPO / 'scripts/hw/hwlock.py'), '--locks', seed,
                                         '--wait', str(seed_wait), '--', 'true'], check=True, timeout=seed_wait + 60)
-                    seed_hosts = [h for h in seed_candidates if h not in HOSTS]
-                    for host in (('raptor', *HOSTS, *seed_hosts) if build_role == 'both' else ('raptor',)):
-                        marker = owner_marker_script(root, task, arm['instance'], arm['slot'], revision)
-                        mark = ['python3', '-c', marker]
-                        try:
-                            run(mark if host == 'raptor' else ['ssh', '-o', 'BatchMode=yes', host, shlex.join(mark)])
-                        except subprocess.CalledProcessError as error:
-                            # An unreachable automatic seed is skipped by wip.sh too; anything else stops.
-                            if arm['seed_explicit'] or host not in seed_hosts or error.returncode != 255:
-                                raise
-                            print(f'# build seed {host} unreachable; wip.sh will not choose it')
                     env = {**os.environ, **scopes, 'WIP_INSTANCE': arm['instance'], 'WIP_ROOT': str(root)}
                     env.pop('WIP_SEED_HOST', None)
                     env.pop('WIP_SEED_ADDR', None)
@@ -1848,7 +1900,8 @@ def main():
     parser.add_argument('--repo', type=Path, default=REPO, help='launcher checkout for arms that are neither --build nor --arm-repo')
     parser.add_argument('--arm-repo', action='append', default=[], metavar='ARM=PATH', help='launcher checkout serving this non-built arm '
                         '(a reused slot names its matching source); --build arms serve through their own source-ARM checkout')
-    parser.add_argument('--binary', default='cuteafd')
+    parser.add_argument('--binary', help='the cuteafd that runs smoke; default: cuteafd on PATH, else the arm\'s sealed '
+                        'slot binary (<WIP_ROOT>/slots/<slot>/coordinator/workspace/.cuteafd-wip/cuteafd)')
     parser.add_argument('--set', action='append', default=[], metavar='CARD:KEY=VALUE')
     parser.add_argument('--arm-set', action='append', default=[], metavar='ARM:CARD:KEY=VALUE', help='arm-specific setting, overriding --set')
     parser.add_argument('--probe', action='append', default=[], metavar='[ARM:]CARD:image,memory,console,fabric')
@@ -1898,7 +1951,7 @@ def main():
         # Smoke's prelaunch hook: the same checks again, now that smoke holds the locks.
         job = json.loads(args.preflight_job.read_text())
         plan = json.loads((args.preflight_job.resolve().parent.parent / 'plan.json').read_text())
-        artifacts = preflight_job(job, plan['arms'][job['arm']])
+        artifacts = preflight_at_grant(job, plan['arms'][job['arm']])
         if job.get('artifacts') and artifacts != job['artifacts']:
             raise ValueError('sealed artifacts changed since enqueue: ' + json.dumps(artifacts, sort_keys=True))
         print('preflight at grant: pass')
@@ -2089,6 +2142,8 @@ def main():
     for job in jobs:
         job['launcher'] = dict(repo=arms[job['arm']]['repo'], commit=arms[job['arm']]['repo_commit'])
         job['needs'] = slot_needs(variants[(job['card'], job['arm'])])
+        # Per arm: an A/B of two builds runs each arm's own smoke runner.
+        job['binary'] = resolve_binary(args.binary, arms[job['arm']], args.dry_run)
         save(Path(job['state']) / 'job.json', {**job, 'probes': sorted(job['probes'])})
     parallel_safe(jobs, args.parallel)
     for job in jobs:
@@ -2112,13 +2167,13 @@ def main():
     save(state / 'plan.json', {'task': args.task, 'arms': arms, 'jobs': [{**j, 'probes': sorted(j['probes'])} for j in jobs]})
     if args.dry_run:
         if groups and len(groups[0]) > 1:
-            cmd = smoke_command(args.binary, arms[jobs[0]['arm']]['repo'], dict(state=str(state / 'parallel-smoke')))
+            cmd = smoke_command(jobs[0]['binary'], arms[jobs[0]['arm']]['repo'], dict(state=str(state / 'parallel-smoke')))
             cmd[-1] = str(args.parallel)
             prefix = ('CUTEAFD_BENCH_NONCE_SEED=' + shlex.quote(args.nonce_seed) + ' ') if args.nonce_seed is not None else ''
             print(prefix + 'setsid ' + shlex.join(cmd) + ' # grouped smoke scheduler; numeric exits per card')
             return 0
         for job in jobs:
-            cmd = smoke_command(args.binary, job['launcher']['repo'], job)
+            cmd = smoke_command(job['binary'], job['launcher']['repo'], job)
             prefix = ('CUTEAFD_BENCH_NONCE_SEED=' + shlex.quote(job['nonce_seed']) + ' ') if job.get('nonce_seed') else ''
             print('# settings ' + job['arm'] + '/' + job['card'] + ': ' + json.dumps(job['entry']['set'], sort_keys=True))
             print(prefix + 'setsid ' + shlex.join(cmd) + ' # numeric exit -> ' + job['state'] + '/exit')
@@ -2155,7 +2210,7 @@ def main():
         (['context_lengths'] if context_lengths is not None else []) + (['context_levels'] if context_levels is not None else []) + \
         (['worker_stop'] if any(job['entry']['set'].get('PROFILE_SPARK') for job in jobs) else [])
     for job in {j['launcher']['repo']: j for j in reversed(jobs)}.values():
-        binary_supports(args.binary, job['launcher']['repo'], job, fields)
+        binary_supports(job['binary'], job['launcher']['repo'], job, fields)
     # Everything checkable without hardware, before any queue ticket.
     problems = []
     for job in jobs:
@@ -2200,7 +2255,7 @@ def main():
         job_env.pop('CUTEAFD_BENCH_NONCE_SEED', None)
         if job.get('nonce_seed'):
             job_env['CUTEAFD_BENCH_NONCE_SEED'] = job['nonce_seed']
-        process = detached(smoke_command(args.binary, job['launcher']['repo'], job), dest / 'driver.log', exit_file, job_env)
+        process = detached(smoke_command(job['binary'], job['launcher']['repo'], job), dest / 'driver.log', exit_file, job_env)
         rc = process.wait()
         code = int(exit_file.read_text()) if exit_file.exists() else (rc if rc >= 0 else 128 - rc)
         exit_file.write_text(str(code) + '\n')
@@ -2226,7 +2281,7 @@ def main():
                 rows.append(row)
             write_summary(state, rows, arms)
             return 1
-        command = smoke_command(args.binary, arms[jobs[0]['arm']]['repo'], dict(state=str(group_root)))
+        command = smoke_command(jobs[0]['binary'], arms[jobs[0]['arm']]['repo'], dict(state=str(group_root)))
         command[-1] = str(args.parallel)
         process = detached(command, group_root / 'driver.log', group_root / 'exit', env)
         rc = process.wait()

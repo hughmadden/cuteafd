@@ -392,6 +392,82 @@ def test_compare_tool_on_synthetic_logits(tmp_path):
     assert cli.returncode == 0 and 'byte-identical: True' in cli.stdout
 
 
+def log_probs(values) -> np.ndarray:
+    """Row-wise log-softmax: the probe's `log_probs` tensor is already normalized."""
+    values = np.asarray(values, dtype=np.float64)
+    top = values.max(axis=-1, keepdims=True)
+    return (values - top - np.log(np.exp(values - top).sum(axis=-1, keepdims=True))).astype('<f4')
+
+
+def write_row(path: Path, values) -> None:
+    """One row as the probe writes it: the safetensors header from rows.rs."""
+    data = np.asarray(values, dtype='<f4').tobytes()
+    header = json.dumps({'log_probs': {'dtype': 'F32', 'shape': [len(values)],
+                                       'data_offsets': [0, len(data)]}}).encode()
+    header += b' ' * (-len(header) % 8)
+    path.write_bytes(len(header).to_bytes(8, 'little') + header + data)
+
+
+def test_compare_tool_reads_safetensors_rows(tmp_path):
+    rng = np.random.default_rng(1)
+    rows = log_probs(rng.normal(size=(3, 40)))
+    a, b = tmp_path / 'a', tmp_path / 'b'
+    a.mkdir()
+    b.mkdir()
+    for index, row in enumerate(rows):
+        write_row(a / f'row-{index:08}.safetensors', row)
+        write_row(b / f'row-{index:08}.safetensors', row)
+    same = compare.compare_paths(a, b)
+    assert same['layout'] == 'rows' and same['rows'] == 3 and same['byte_identical']
+    assert same['max_abs_diff'] == 0 and same['mean_kl'] == 0 and same['top1_agreement'] == 1
+    # Perturb one row into a new top-1: the row is named and its metrics are its own.
+    perturbed = rows[1].copy()
+    perturbed[3] = perturbed.max() + 2
+    write_row(b / 'row-00000001.safetensors', log_probs(perturbed))
+    diff = compare.compare_paths(a, b)
+    assert not diff['byte_identical'] and diff['rows'] == 3 and diff['vocab'] == 40
+    assert diff['worst_row'] == 'row-00000001.safetensors'
+    assert diff['worst_abs_diff_row'] == 'row-00000001.safetensors'
+    assert diff['top1_agreement'] == pytest.approx(2 / 3)
+    # Only one row moved, so its KL is the mean's three times over.
+    assert diff['mean_kl'] == pytest.approx(diff['max_kl'] / 3)
+    assert diff['max_kl'] > 0 and diff['max_abs_diff'] > 0
+    # A row only one side wrote is a difference, and a width mismatch names its row.
+    (b / 'row-00000002.safetensors').unlink()
+    missing = compare.compare_paths(a, b)
+    assert missing['only_a'] == 1 and missing['rows'] == 2 and not missing['byte_identical']
+    write_row(b / 'row-00000001.safetensors', np.zeros(39))
+    with pytest.raises(ValueError, match='widths differ'):
+        compare.compare_paths(a, b)
+    cli = subprocess.run([sys.executable, str(COMPARE), str(a), str(b)], capture_output=True, text=True)
+    assert cli.returncode == 2 and 'widths differ' in cli.stderr
+
+
+def test_compare_pairs_reads_safetensors_row_dumps(tmp_path):
+    root = tmp_path / 'golden'
+    rows = log_probs(np.random.default_rng(2).normal(size=(2, 24)))
+    for arm in ('a', 'b'):
+        (root / arm / 'r1' / 'logits').mkdir(parents=True)
+        for index, row in enumerate(rows):
+            write_row(root / arm / 'r1' / 'logits' / f'row-{index:08}.safetensors', row)
+    state = dict(root=str(root), task='t', family='kimi', snapshot='org/model', gpus='0', locks='gpu0',
+                 golden=['kimi-golden'], mode='golden', vocab=24, slots={})
+    results = golden.compare_pairs(state, [('a', 'b')], 1)
+    assert len(results) == 1 and not results[0].get('error')
+    assert results[0]['file'] == 'logits' and results[0]['rows'] == 2 and results[0]['byte_identical']
+    golden.write_summary(state, [], results)
+    assert '| a | b | 1 | logits | True | 2 |' in (root / 'summary.md').read_text()
+    bad = rows[1].copy()
+    bad[0] = bad.max() + 3
+    write_row(root / 'b/r1/logits/row-00000001.safetensors', log_probs(bad))
+    results = golden.compare_pairs(state, [('a', 'b')], 1)
+    assert results[0]['worst_row'] == 'row-00000001.safetensors'
+    golden.write_summary(state, [], results)
+    table = next(line for line in (root / 'summary.md').read_text().splitlines()
+                 if line.startswith('| a | b |') and 'repeat' not in line)
+    assert '| False |' in table and 'row-00000001.safetensors' in table
+
+
 def test_resolve_model_uses_hub_paths(env):
     host, container, extra = golden.resolve_model('org/model')
     assert container == str(host) and extra == [str(host)]

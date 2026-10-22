@@ -6,6 +6,7 @@ import os
 import re
 import shlex
 import subprocess
+import time
 from pathlib import Path
 
 import pytest
@@ -538,9 +539,14 @@ def test_glmf_selection_starts_after_solve_and_seals_before_opening_lanes() -> N
     # Admitted TP2 expert weights land inside the Spark admission window;
     # execution binds after the engine exists and before step workspaces.
     window = body.split("load_while_admitting(admission,", 1)[1].split("probe(\"target-weights\")", 1)[0]
-    assert "tp2_weights(pushed)?" in window and "push.receive_with(devices, catalog, sparks, Some(dense)" in window
-    # A planning failure declines the group; a group fallback fills the same records through the mount.
-    assert "Err(error) => (None, Err(error))" in window and "dense::fill_by_mount(" in window
+    assert "tp2_weights(pushed)?" in window and "push.receive_with(devices, catalog, sparks, Some(Ok(dense))" in window
+    # Dense records are planned before membership: a planning error offers no
+    # coordinator ranks (the Sparks still push); a group fallback after
+    # membership fills the same records through the mount.
+    planning = body.split("let ranks = if admission.coordinator_pushes()", 1)[1].split("admission.start_with(&peers, ranks)?", 1)[0]
+    assert "planning.model(&self.cfg, &execution)?" in planning and "dense::plan_ranks(" in planning
+    assert "coordinator push unavailable; mount" in planning
+    assert "dense::fill_by_mount(" in window
     assert body.index("engine::GlmfEngine::new(") < body.index("tp2.execution()?") < body.index("engine.install_tp2(ranks)?")
     assert body.index("engine.install_tp2(ranks)?") < body.index("engine.install_workspaces(workspaces)?")
     admission = source[source.index("    fn admit("):source.index("    pub fn with_engine<")]
@@ -646,7 +652,10 @@ def _family_launch_result(tmp_path: Path, family_config: dict, model: str, keys:
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
     for tool in ("docker", "ssh", "nest") if with_nest else ("docker", "ssh"):
-        (bin_dir / tool).write_text('#!/usr/bin/env bash\nprintf "%s " "$(basename "$0")" "$@" >&2; echo >&2\n'
+        # One line per invocation, in a single write: the per-host worker legs
+        # run concurrently, and a two-write line (argv, then newline) lets a
+        # sibling's argv slip between them and merge two lines into one.
+        (bin_dir / tool).write_text('#!/usr/bin/env bash\nprintf "%s \\n" "$(basename "$0") $*" >&2\n'
                                     + ('case "$*" in *"docker run --rm"*"python3"*) exit 2 ;; esac\n'
                                        if preflight_error and tool == "ssh" else '') +
                                     'case "$*" in *"docker logs"*) echo "${STUB_WORKER_READY:-worker bootstrap ready}"; '
@@ -765,9 +774,28 @@ print(json.dumps(deployment))
     if not with_nest:
         # Hide any nest the host has, keeping only the stub directory and the system tools.
         env["PATH"] = f"{bin_dir}:/usr/bin:/bin"
-    return subprocess.run(["bash", str(repo / "scripts" / "launch" / "run-family.sh"), "--config", str(config),
-                           *(["--restart"] if restart else []), *extra_args],
-                          env=env, capture_output=True, text=True, timeout=30)
+    # Capture through files, not pipes: the per-host worker legs print
+    # concurrently, and a pipe capture also loses a writer that is a moment
+    # behind the launcher when it exits.
+    stdout_path, stderr_path = tmp_path / "launch.stdout", tmp_path / "launch.stderr"
+    with stdout_path.open("wb") as stdout, stderr_path.open("wb") as stderr:
+        completed = subprocess.run(["bash", str(repo / "scripts" / "launch" / "run-family.sh"), "--config", str(config),
+                                    *(["--restart"] if restart else []), *extra_args],
+                                   env=env, stdout=stdout, stderr=stderr, timeout=30)
+
+    def read(path: Path) -> str:
+        return path.read_text(encoding="utf-8", errors="replace")
+
+    # V4.1 launches its experts through a heredoc (the command line is stdin, so
+    # it prints no worker argv); every other family prints one per host.
+    expected = 0 if native_v41 or completed.returncode else exact_count
+    deadline = time.monotonic() + 10
+    while True:
+        text = read(stderr_path)
+        if text.count("cuteafd expertd-native") >= expected or time.monotonic() >= deadline:
+            break
+        time.sleep(0.05)
+    return subprocess.CompletedProcess(completed.args, completed.returncode, read(stdout_path), text)
 
 
 @pytest.mark.parametrize("wip", [False, True])

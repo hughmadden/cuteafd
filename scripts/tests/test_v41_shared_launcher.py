@@ -3,7 +3,7 @@
 The goldens in fixtures/v41-launch/ were recorded from run.sh's private V4.1
 path (scripts/tests/v41_launch_capture.py, before #82). Today's launcher must
 start the same coordinator and Spark containers for every V4.1 example config
-and the gate kit's v41-flash-max/min: the same options, mounts, environment,
+and the gate kit's max/min/TP4-reference cards: the same options, mounts, environment,
 image and serve command. The only differences allowed are the intended
 additions listed in INTENDED and the legacy GPU-request conversion to CDI: shared launch features that now reach V4.1 at
 their defaults, with no V4.1 code.
@@ -123,8 +123,21 @@ def test_shared_launcher_matches_the_private_v41_path(case: str, tmp_root) -> No
         coordinator = parse_run(golden["containers"][0]["argv"])
         command = coordinator["command"]
         additions = []
+        # Derived native_ownership makes TP explicit in serving argv, not in
+        # planner argv. Only user-supplied topology keys reach the planner.
+        if case in KIT_CARDS:
+            kit = json.loads((ROOT / "scripts/bench/kits/gate/matrix-gate.json").read_text())
+            entry = next(e for e in kit["entries"] if e["name"] == case)
+            config = ROOT / entry["config"]
+            overrides = entry.get("set", {})
+        else:
+            config = ROOT / "examples/configs" / f"{case}.config"
+            overrides = {}
+        explicit_topology = any(line.startswith(("SPARK_TP=", "SPARK_EP="))
+                                for line in config.read_text().splitlines()) or any(
+                                    key in overrides for key in ("SPARK_TP", "SPARK_EP"))
         for flag in ("--spark-tp", "--spark-ep", "--kv-pool-size", "--memory-reservation"):
-            if flag in command:
+            if flag in command and (flag not in ("--spark-tp", "--spark-ep") or explicit_topology):
                 additions += [flag, command[command.index(flag) + 1]]
         cache = command[command.index("--host-cache-bytes") + 1] if "--host-cache-bytes" in command else "0"
         expected[expected.index("--prefix-cache-entries") + 2:expected.index("--prefix-cache-entries") + 2] = ["--host-cache-bytes", cache]
@@ -237,6 +250,37 @@ def test_v41_fp8_head_key_reaches_planner_and_coordinator(tmp_root, monkeypatch,
         assert result["containers"][0]["argv"].count(f"CUTEAFD_V41_FP8_HEAD={value}") == 1
     for worker in result["containers"][1:]:
         assert "CUTEAFD_V41_FP8_HEAD" not in parse_run(worker["argv"])["env"]
+
+
+@pytest.mark.parametrize("value", [None, "off", "auto", "48", "on"])
+def test_v41_l2_prefetch_key_reaches_only_the_coordinator_command(tmp_root, monkeypatch, value) -> None:
+    """L2_PREFETCH=off|auto|MiB becomes serve-native --l2-prefetch VALUE; unset passes
+    nothing (the engine default, off); other values fail before any container."""
+    import v41_launch_capture as capture_module
+
+    original = capture_module.example_config
+
+    def with_key(name, directory):
+        config = original(name, directory)
+        if value is not None:
+            config.write_text(config.read_text() + f"L2_PREFETCH={value}\n")
+        return config
+
+    monkeypatch.setattr(capture_module, "example_config", with_key)
+    if value == "on":
+        with pytest.raises(RuntimeError, match=r"L2_PREFETCH must be off, auto or a MiB count"):
+            capture_module.capture(ROOT, "deepseek-v41-mxfp4-max")
+        return
+    result = capture_module.capture(ROOT, "deepseek-v41-mxfp4-max")
+    command = parse_run(result["containers"][0]["argv"])["command"]
+    if value is None:
+        assert "--l2-prefetch" not in command
+    else:
+        assert command[command.index("--l2-prefetch") + 1] == value
+        assert command.count("--l2-prefetch") == 1
+    assert not any("l2-prefetch" in arg for plan in result["plans"] for arg in plan)
+    for worker in result["containers"][1:]:
+        assert not any("l2-prefetch" in arg or "L2_PREFETCH" in arg for arg in worker["argv"])
 
 
 def test_v41_rejects_kv_cache_as_an_unused_key(tmp_root, monkeypatch) -> None:

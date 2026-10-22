@@ -368,8 +368,8 @@ facts recorded somewhere for agents working on it.
   limit they ran at. Fabric 10.55.0.22 / 10.55.1.22.
 - Sparks (GB10, SM121, ARM64, 121 GiB unified; `nvidia-smi` memory reads
   N/A, measure with CUDA): ostrich, dodo, emu, kiwi, rhea, moa at
-  10.55.0.1–6. Ranks 0–5 in that order. All six are the pool. TP4 on the
-  first four is the qualified V4.1 default until a six-rank layout wins.
+  10.55.0.1–6. Ranks 0–5 in that order. All six are the pool. V4.1 max
+  uses all six (TJ 2026-10-22); TP4 is a reference layout.
 - LAN-only build seeds `kakapo` (GB10, 172.22.2.7) and `cassowary` (GB10,
   172.22.2.8, ConnectX ports down): build only, never serve; 10 GbE, off the
   RoCE fabric. Their sealed slots reach the Sparks through sparknest. Each has

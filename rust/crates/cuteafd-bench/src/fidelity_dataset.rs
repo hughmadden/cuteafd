@@ -173,6 +173,19 @@ pub fn same_base_checkpoint(reference: &str, served: &str) -> bool {
 }
 
 pub fn default_publication(model: &str) -> Option<(&'static str, &'static str)> {
+    default_publication_in(model, &crate::fidelity_match::hub())
+}
+
+fn default_publication_in(model: &str, hub: &Path) -> Option<(&'static str, &'static str)> {
+    named_publication(model).or_else(|| {
+        let resolved = crate::fidelity_match::resolve_in(model, None, hub).ok()?;
+        let publication = crate::fidelity_match::official(&resolved.reference_root)?;
+        Some((publication.revision, publication.config))
+    })
+}
+
+// Resolver name checks must not recurse into the ancestry fallback.
+pub(crate) fn named_publication(model: &str) -> Option<(&'static str, &'static str)> {
     if let Some(p) = crate::fidelity_match::official(model) { return Some((p.revision, p.config)); }
     match base_model(model) {
         Some("Qwen3.8-Flash-Next") => return Some((QWEN_REVISION, QWEN_CONFIG)),
@@ -490,6 +503,34 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn cached_publication_fallback_rejects_speculators_and_invalid_ancestry() {
+        let hub = tempfile::tempdir().unwrap();
+        let models = [
+            ("RedHatAI/GLM-5.3-Flash-speculator.dspark-preview",
+                json!({"architectures":["DSparkDraftModel"]}),
+                "base_model: zai-org/GLM-5.3-Flash\nbase_model_relation: quantized", false),
+            ("test/local-quant", json!({"architectures":["GlmMoeDsaForCausalLM"]}),
+                "base_model: zai-org/GLM-5.3-Flash\nbase_model_relation: quantized", true),
+            ("test/local-finetune", json!({"architectures":["GlmMoeDsaForCausalLM"]}),
+                "base_model: zai-org/GLM-5.3-Flash\nbase_model_relation: finetune", false),
+            ("test/local-merge", json!({"architectures":["GlmMoeDsaForCausalLM"]}),
+                "base_model: [zai-org/GLM-5.3-Flash, Qwen/Qwen3.8-Flash-Next]\nbase_model_relation: merge", false),
+        ];
+        for (model, config, card, accepted) in models {
+            let path = hub.path().join(format!("models--{}", model.replace('/', "--")))
+                .join("snapshots/abcdef");
+            std::fs::create_dir_all(&path).unwrap();
+            std::fs::write(path.join("config.json"), config.to_string()).unwrap();
+            std::fs::write(path.join("README.md"), format!("---\n{card}\n---\n")).unwrap();
+            assert!(crate::fidelity_match::lineage_in(model, None, hub.path())
+                .iter().any(|ancestor| ancestor == "zai-org/GLM-5.3-Flash"));
+            assert_eq!(default_publication_in(model, hub.path()),
+                accepted.then_some((GLMF_REVISION, GLMF_CONFIG)), "{model}");
+        }
+        assert_eq!(default_publication_in("test/not-cached", hub.path()), None);
+    }
 
     fn kimi_reference_qualification() -> (Value, Value) {
         let revision = "a".repeat(40);

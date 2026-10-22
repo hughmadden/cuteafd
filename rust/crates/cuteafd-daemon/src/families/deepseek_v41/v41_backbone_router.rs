@@ -62,6 +62,10 @@ impl<'a> BackboneRouterWeights<'a> {
         })
     }
 
+    /// The buffers a decode step reads (L2 prefetch): gate weight and biases.
+    pub(crate) fn decode_reads(&self) -> Vec<CuteafdDeviceBuffer> {
+        Self::names(self.layer).into_iter().flatten().filter_map(|name| self.tensors.get(&name).ok()).collect()
+    }
     pub fn wave(&self, capacity: u32, budget: usize) -> Result<BackboneRouterWave<'_, 'a>> {
         ensure!(
             BackboneRouterWave::device_bytes(capacity)? <= budget,
@@ -893,5 +897,12 @@ impl RouterOutput<'_> {
         // Prove the same complete-batch contract used by every Spark receiver.
         cuteafd_transport::expert::BackboneRequest::validate_owned(&request, self.rows)?;
         Ok(BoundExpertRequest { request, binding })
+    }
+}
+
+#[cfg(test)]
+impl BackboneRouterWeights<'_> {
+    pub(crate) fn visit(&self, prefix: &str, f: &mut dyn FnMut(String, cuteafd_ffi::CuteafdDeviceBuffer)) {
+        self.tensors.visit(prefix, f);
     }
 }

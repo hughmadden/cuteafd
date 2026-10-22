@@ -68,7 +68,7 @@ impl<'a> BackboneSharedWeights<'a> {
                 kernel.info().packed_weight_scale_bytes as usize,
             )?);
             unsafe {
-                kernel.pack_scales(
+                crate::shared::experts::rtx::dense::v41_pack_scales(&kernel, 
                     tensors.get(&names[2 * i + 1])?,
                     scales[i].buffer,
                     stream.raw,
@@ -84,6 +84,14 @@ impl<'a> BackboneSharedWeights<'a> {
             tensors,
             scales,
         })
+    }
+    /// The buffers a decode step reads, in order (L2 prefetch): w1, w3 (gate
+    /// and up) and w2 (down), each followed by its packed scales.
+    pub(crate) fn decode_reads(&self) -> Vec<CuteafdDeviceBuffer> {
+        ["w1", "w3", "w2"].into_iter().zip(&self.scales).flat_map(|(name, scales)| [
+            self.tensors.get(&format!("layers.{}.ffn.shared_experts.{name}.weight", self.layer)).ok(),
+            Some(scales.buffer),
+        ]).flatten().collect()
     }
     pub fn wave(&self, capacity: u32, budget: usize) -> Result<BackboneSharedWave<'_, 'a>> {
         ensure!(
@@ -382,5 +390,13 @@ impl Drop for BackboneSharedWave<'_, '_> {
         {
             crate::shared::decode_graph::fatal_drain(Err(e), "shared FFN");
         }
+    }
+}
+
+#[cfg(test)]
+impl BackboneSharedWeights<'_> {
+    pub(crate) fn visit(&self, prefix: &str, f: &mut dyn FnMut(String, cuteafd_ffi::CuteafdDeviceBuffer)) {
+        self.tensors.visit(prefix, f);
+        for (i, s) in self.scales.iter().enumerate() { f(format!("{prefix}packed_scale{i}"), s.buffer); }
     }
 }

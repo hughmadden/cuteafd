@@ -638,17 +638,22 @@ fn placement(name: &str) -> V41TensorPlacement {
 
 /// Header-only inspection: never reads or eagerly allocates checkpoint tensor payloads.
 pub fn read_official_v41_catalog(snapshot: &Path) -> Result<OfficialV41Catalog> {
-    read_official_v41_catalog_filtered(snapshot, None)
+    read_official_v41_role_catalog(snapshot, "full catalog", |_| true)
 }
 
 /// Official-format worker inventory, without opening coordinator-only shards.
 pub fn read_official_v41_spark_catalog(snapshot: &Path, rank: usize, world: usize) -> Result<OfficialV41Catalog> {
     ensure!(rank < world, "Spark rank {rank} outside TP{world}");
-    read_official_v41_catalog_filtered(snapshot,
-        Some(format!("spark{rank} (TP{world})")))
+    read_official_v41_role_catalog(snapshot, &format!("spark{rank} (TP{world})"),
+        |name| name.starts_with("layers.") && name.contains(".ffn.experts."))
 }
 
-fn read_official_v41_catalog_filtered(snapshot: &Path, spark_role: Option<String>) -> Result<OfficialV41Catalog> {
+/// Inventory for a role that reads only the tensors `needed` selects. The
+/// index is checked in full, but only shards holding a needed tensor are
+/// opened and validated, so a host may omit the rest (e.g. the
+/// coordinator-only Engram shards).
+pub fn read_official_v41_role_catalog(snapshot: &Path, role: &str, needed: impl Fn(&str) -> bool)
+    -> Result<OfficialV41Catalog> {
     let raw_config: serde_json::Value = crate::families::deepseek_v41::v41_exl3::read_json(&snapshot.join("config.json"), 1024 * 1024)?;
     let exl3 = if raw_config["quantization_config"]["quant_method"] == "exl3" {
         Some(crate::read_v41_exl3_manifest(snapshot)?)
@@ -740,13 +745,12 @@ fn read_official_v41_catalog_filtered(snapshot: &Path, spark_role: Option<String
         "checkpoint requires all {shard_count} shards"
     );
     let mut tensors = Vec::with_capacity(expected.len());
-    let needed = |name: &str| spark_role.is_none() || name.starts_with("layers.") && name.contains(".ffn.experts.");
     for (shard, names) in shards {
         let Some(first_needed) = names.iter().find(|name| needed(name)) else { continue };
         let path = snapshot.join(&shard);
         let metadata = read_safetensors_metadata(&path).with_context(|| format!(
-            "role {} needs tensor {first_needed} in shard {shard} at snapshot {}",
-            spark_role.as_deref().unwrap_or("full catalog"), snapshot.display()))?;
+            "role {role} needs tensor {first_needed} in shard {shard} at snapshot {}",
+            snapshot.display()))?;
         ensure!(
             metadata.len() == names.len(),
             "index/header tensor count mismatch in {shard}"
@@ -1651,6 +1655,46 @@ mod tests {
         assert_eq!(manifest.experts.draft_experts, 0);
     }
 
+    #[test]
+    fn role_catalog_opens_only_shards_with_needed_tensors() {
+        use std::io::Write;
+        // Shard 1 holds the vision tensors and is the only shard on disk; the
+        // rest (Engram included) are indexed but absent, as on a Spark host.
+        let vision = |name: &str| name.starts_with("vision.") || name.starts_with("aligner.")
+            || name.starts_with("image_");
+        let expected = expected_tensors().unwrap();
+        let shard = |i: usize| format!("model-{i:05}-of-00048.safetensors");
+        let weight_map: BTreeMap<_, _> = expected.keys().enumerate().map(|(i, name)| {
+            (name.clone(), if vision(name) { shard(1) } else { shard(2 + i % 47) })
+        }).collect();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("config.json"), include_bytes!("official-v41-config.json")).unwrap();
+        std::fs::write(dir.path().join("model.safetensors.index.json"),
+            serde_json::json!({ "weight_map": weight_map }).to_string()).unwrap();
+        let mut header = serde_json::Map::new();
+        let mut offset = 0u64;
+        for (name, spec) in expected.iter().filter(|(name, _)| vision(name)) {
+            let dtype = match spec.dtype { DType::Bf16 => "BF16", DType::F32 => "F32", _ => unreachable!() };
+            header.insert(name.clone(), serde_json::json!({
+                "dtype": dtype, "shape": spec.shape, "data_offsets": [offset, offset + spec.bytes] }));
+            offset += spec.bytes;
+        }
+        let header = serde_json::Value::Object(header).to_string();
+        let mut file = File::create(dir.path().join(shard(1))).unwrap();
+        file.write_all(&(header.len() as u64).to_le_bytes()).unwrap();
+        file.write_all(header.as_bytes()).unwrap();
+        file.set_len(8 + header.len() as u64 + offset).unwrap();
+
+        let error = format!("{:#}", read_official_v41_catalog(dir.path()).unwrap_err());
+        assert!(error.contains("role full catalog needs tensor") && error.contains(&shard(2)), "{error}");
+        let catalog = read_official_v41_role_catalog(dir.path(), "vision", vision).unwrap();
+        assert_eq!(catalog.tensors().len(), expected.keys().filter(|name| vision(name)).count());
+        let norm = catalog.tensor("vision.norm.weight").unwrap();
+        assert_eq!((norm.shard.as_str(), norm.metadata.dtype.clone()), (shard(1).as_str(), DType::Bf16));
+        let error = format!("{:#}", read_official_v41_role_catalog(dir.path(), "vision",
+            |name| vision(name) || name == "layers.1.engram.embed.scale").unwrap_err());
+        assert!(error.contains("role vision needs tensor layers.1.engram.embed.scale"), "{error}");
+    }
     #[test]
     fn rejects_same_byte_count_with_wrong_representation() {
         let spec = ExpectedTensor {

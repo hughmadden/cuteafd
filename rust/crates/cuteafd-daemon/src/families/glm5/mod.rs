@@ -625,6 +625,9 @@ impl Opened {
             let budgets = placement.tp2.context("TP2 budget")?.peak_bytes;
             Ok([usize::try_from(budgets[0])?, usize::try_from(budgets[1])?])
         };
+        let loader = weights::GlmLoader { library: &self.library, catalog: dense_catalog, stream, device: args.device,
+            peers: peer_stream.iter().map(|&(device, stream)| crate::shared::peer_split::RankDevice { device, stream })
+                .collect(), push: None };
         let mut coordinator_push = None;
         let admission = if let Some(peers) = args.peers.as_deref() {
             let peers = peers.split(',').map(str::parse)
@@ -635,24 +638,38 @@ impl Opened {
                 args.exlr8_manifest.as_deref())?;
             // The coordinator GPUs' EXL3 TP2 halves join the Spark push group as
             // two more ranks; planning failure leaves them on the mount.
+            // The coordinator GPUs' EXL3 TP2 halves and dense operands join the
+            // Spark push group as two more ranks, planned from headers before
+            // membership: a planning error offers no coordinator ranks (the
+            // coordinator loads by mount, the Sparks still push).
             let ranks = match (&tp2_range, local.as_ref().map(|l| &l.format)) {
                 (Some(range), Some(glm::GlmLocalFormat::Exl3)) if admission.coordinator_pushes() => (|| -> Result<_> {
                     let local = local.as_ref().context("TP2 local inventory")?;
                     let workspace = crate::shared::experts::rtx::exl3::Exl3Tp2::workspace_bytes_for(
                         &local.package, self.cfg.hidden, max_rows)?;
                     let budgets = tp2_budgets()?.map(|b| b.saturating_sub(workspace));
-                    crate::shared::experts::rtx::push::CoordinatorPush::prepare(&self.snapshot, Some(&self.catalog), 2,
-                        Some((&range.clone().collect::<Vec<_>>(), budgets.to_vec())))
+                    let devices = tp2_devices()?;
+                    let sink = std::rc::Rc::new(landing::PushSink::default());
+                    let planning = weights::GlmLoader { push: Some(sink.clone()), ..loader.clone() };
+                    let model = {
+                        let _memory_scope = cuteafd_ffi::memory_ledger::scope("weights");
+                        planning.model(&self.cfg, layers, owners.as_deref(), native)?
+                    };
+                    let (records, deferred) = sink.take();
+                    let dense = push::plan_ranks(&self.snapshot, records.clone(), devices, peers.len())?;
+                    let prepared = crate::shared::experts::rtx::push::CoordinatorPush::prepare(&self.snapshot,
+                        Some(&self.catalog), 2, Some((&range.clone().collect::<Vec<_>>(), budgets.to_vec())))?;
+                    Ok((prepared, (model, records, deferred, dense)))
                 })().map_err(|error| tracing::info!(%error, "coordinator TP2 push unavailable; mount")).ok(),
                 _ => None,
             };
-            let ranks = ranks.map(|(push, streams, ranks)| { coordinator_push = Some((push, peers.len())); (streams, ranks) });
+            let ranks = ranks.map(|((push, streams, ranks), planned)| {
+                coordinator_push = Some((push, peers.len(), planned));
+                (streams, ranks)
+            });
             Some(admission.start_with(&peers, ranks)?)
         } else { None };
         let started = Instant::now();
-        let loader = weights::GlmLoader { library: &self.library, catalog: dense_catalog, stream, device: args.device,
-            peers: peer_stream.iter().map(|&(device, stream)| crate::shared::peer_split::RankDevice { device, stream })
-                .collect(), push: None };
         // The admitted TP2 expert halves are charged before the serving pool;
         // their bytes land inside the Spark admission window (pushed, or through
         // the mount). Execution (modules, workspaces, routes) binds after the engine exists.
@@ -678,32 +695,17 @@ impl Opened {
             let (embedding, (model, pushed)) = crate::shared::token_io::TokenEmbedding::load(&self.library,
                 self.embed_source()?, args.token_io.embed_placement, || {
                 let _memory_scope = cuteafd_ffi::memory_ledger::scope("weights");
-                let Some((push, sparks)) = coordinator_push.take() else {
+                let Some((push, sparks, (model, records, deferred, dense))) = coordinator_push.take() else {
                     return Ok((loader.model(&self.cfg, layers, owners.as_deref(), native)?, None));
                 };
-                // The dense operands join the same ranks as the TP2 halves: allocate
-                // and plan them, receive both, then run the transforms of landed bytes.
+                // The planned dense operands join the same ranks as the TP2 halves:
+                // receive both, then run the transforms of landed bytes.
                 let devices = tp2_devices()?;
-                // A planning failure (allocation or plan) still answers the group:
-                // every coordinator rank offers mount and the whole group falls back.
-                let sink = std::rc::Rc::new(landing::PushSink::default());
-                let planning = weights::GlmLoader { push: Some(sink.clone()), ..loader.clone() };
-                let planned = planning.model(&self.cfg, layers, owners.as_deref(), native).and_then(|model| {
-                    let (records, deferred) = sink.take();
-                    let dense = push::plan_ranks(&self.snapshot, records.clone(), devices, sparks)?;
-                    Ok((model, records, deferred, dense))
-                });
-                let (planned, dense) = match planned {
-                    Ok((model, records, deferred, dense)) => (Some((model, records, deferred)), Ok(dense)),
-                    Err(error) => (None, Err(error)),
-                };
-                let (pushed, ()) = push.receive_with(devices.to_vec(), Some(&self.catalog), sparks, Some(dense), || ());
-                let pushed = pushed?.map(|ranks| <[_; 2]>::try_from(ranks)
-                    .map_err(|_| anyhow::anyhow!("two coordinator GPUs"))).transpose()?;
-                let Some((model, records, deferred)) = planned else {
-                    // Planning allocated nothing that survives; the mount loads as usual.
-                    return Ok((loader.model(&self.cfg, layers, owners.as_deref(), native)?, None));
-                };
+                let (pushed, ()) = push.receive_with(devices.to_vec(), Some(&self.catalog), sparks, Some(Ok(dense)), || ());
+                let pushed = pushed?.map(|ranks| -> Result<[_; 2]> {
+                    let ranks = ranks.into_iter().map(|r| r.exl3()).collect::<Result<Vec<_>>>()?;
+                    <[_; 2]>::try_from(ranks).map_err(|_| anyhow::anyhow!("two coordinator GPUs"))
+                }).transpose()?;
                 let rank_stream = |device: i32| if device == args.device { stream }
                     else { peer_stream.map_or(stream, |(_, s)| s) };
                 if pushed.is_none() {

@@ -38,9 +38,9 @@ CHECKPOINTS = {"deepseek-ai/DeepSeek-V4.1-Flash": {"model_type": "deepseek_v41"}
 GPU_UUIDS = ("GPU-00000000-0000-0000-0000-000000000000", "GPU-11111111-1111-1111-1111-111111111111")
 GPU_PCI = ("00000000:01:00.0", "00000000:02:00.0")
 HOSTS = ("ostrich", "dodo", "emu", "kiwi", "rhea", "moa")
-# The gate kit's two V4.1 cards (scripts/bench/kits/gate/matrix-gate.json), as
+# The gate kit's V4.1 cards (scripts/bench/kits/gate/matrix-gate.json), as
 # wip-cards.py generates their configs for a WIP arm.
-KIT_CARDS = ("v41-flash-max", "v41-flash-min")
+KIT_CARDS = ("v41-flash-max", "v41-flash-min", "v41-flash-ref-tp4")
 EXAMPLES = ("deepseek-v41-mxfp4-max", "deepseek-v41-mxfp4-min")
 CASES = EXAMPLES + KIT_CARDS
 WIP_SLOT = "gate"

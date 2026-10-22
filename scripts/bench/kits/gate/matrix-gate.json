@@ -111,11 +111,39 @@
     "ostrich",
     "dodo",
     "emu",
-    "kiwi"
+    "kiwi",
+    "rhea",
+    "moa"
    ],
    "set": {
     "ADDR": "0.0.0.0:8701",
     "EXPERT_PORT": "19801",
+    "SPARK_COUNT": "6",
+    "SPARK_0_HOST": "ostrich",
+    "SPARK_1_HOST": "dodo",
+    "SPARK_2_HOST": "emu",
+    "SPARK_3_HOST": "kiwi",
+    "SPARK_4_HOST": "rhea",
+    "SPARK_5_HOST": "moa"
+   }
+  },
+  {
+   "name": "v41-flash-ref-tp4",
+   "family": "deepseek_v41",
+   "config": "examples/configs/deepseek-v41-mxfp4-max.config",
+   "gpus": [
+    0,
+    1
+   ],
+   "sparks": [
+    "ostrich",
+    "dodo",
+    "emu",
+    "kiwi"
+   ],
+   "set": {
+    "ADDR": "0.0.0.0:8745",
+    "EXPERT_PORT": "19845",
     "SPARK_COUNT": "4",
     "SPARK_0_HOST": "ostrich",
     "SPARK_1_HOST": "dodo",

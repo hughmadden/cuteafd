@@ -5,6 +5,7 @@ pub(crate) mod speculative;
 pub(crate) mod scheduler;
 pub(crate) mod console;
 mod distributed;
+mod coordinator_push;
 pub(crate) mod scores;
 use scores::RetainedScores;
 pub(crate) mod prefix;
@@ -465,6 +466,10 @@ fn worker(
     admission::startup_phase(&lib, "v41/transport", device_total)?;
     pass.install_attention_plan(attention_plan)?;
     prefill_pass.install_attention_plan(attention_plan)?;
+    if let Some(budget) = args.l2.budget(&lib, crate::shared::l2_prefetch::OTHER_DEFAULT)? {
+        pass.enable_l2_prefetch(budget)?;
+        prefill_pass.enable_l2_prefetch(budget)?;
+    }
     let exl3_tiers: &[usize] = catalog.exl3().map(|m| m.decoder_tiers()).unwrap_or(&[]);
     let draft_free_before = if small_card { lib.cuda_memory_info()?.0 } else { 0 };
     let draft_weights = if args.dspark {

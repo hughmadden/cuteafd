@@ -325,6 +325,21 @@ external agent never merges, and never pushes to work/p0 or the fork's master.
 Compact the scorecard log into its summary table every ~10 entries, and
 update this section's table as the picture firms up.
 
+## Gate execution
+
+The agent Bash tool can evaluate commands in a non-final `&&` operand, where
+Bash ignores inline `set -e`. Never run a multi-step gate as an inline
+`set -e; build; tests; echo PASS` command. Invoke the standalone entry point
+(`scripts/dev/cpu-gate`, or `bash path/to/gate.sh`), or explicitly chain every
+required step with `&&` / `|| exit 1`. Do not source a gate or call its shell
+function from an `if`/`&&` condition: that also suppresses errexit.
+
+The canonical CPU gate requires Cargo's JSON `build-finished.success` before
+running tests, then parses test-result failure counts (or nextest's JUnit
+report). Missing/empty reports, timeouts and moved HEADs fail closed, including
+with `--base`. Report failing test IDs, not merely exit codes or counts. Commit
+before starting the gate; never move HEAD during it.
+
 ## Running agents
 
 - Workers update current state with `scripts/dev/pr-sync push` at checkpoints
@@ -352,6 +367,22 @@ update this section's table as the picture firms up.
   Background shells and their completion watchers die with the session, so
   finished jobs must be collected by hand.
 - A session limit stops every agent at once; resume each with a short note.
+- **Launch every hardware run, golden and long build as a systemd user
+  unit:** `systemd-run --user --unit=<task-name> --collect
+  --setenv=PATH="$PATH" --setenv=HOME="$HOME" --working-directory=<dir>
+  bash -c '<cmd> > <log> 2>&1; echo exit $? >> <log>'`. `nohup setsid`
+  is not enough: the job stays in the Claude session's `tmux-spawn-*.scope`
+  cgroup and dies with it, queued hwlock tickets included (twice on
+  2026-10-22). Check `/proc/<pid>/cgroup` reads `app.slice/<name>.service`.
+  Pass PATH and HOME explicitly: a user unit otherwise gets systemd's
+  minimal PATH, and host-side Cargo exits 127. Transient units live only in
+  `/run` and unload when the command exits, so they leave nothing behind.
+  systemd expands `$VAR`/`${...}` in the unit command line itself, which
+  mangles bash arrays, `$?` and `$(...)` meant for the inner shell: pass
+  `--expand-environment=no`, or put the commands in a script file and run
+  `bash /path/script.sh`.
+- Stop your own jobs by PID or `systemctl --user stop <unit>`, never with
+  `pkill -f`: the pattern can match your own Bash command line and kill it.
 
 ### Known Codex behavior
 

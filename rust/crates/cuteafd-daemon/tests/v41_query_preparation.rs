@@ -15,8 +15,15 @@ mod families {
 mod shared {
     pub(crate) mod decode_graph;
     pub(crate) mod fp8_linear;
+    pub(crate) mod fp8_load_quant;
     pub(crate) mod memory;
     pub(crate) mod target_head;
+    pub(crate) mod experts {
+        pub(crate) mod rtx {
+            #[path = "dense/records.rs"]
+            pub(crate) mod dense;
+        }
+    }
 }
 use families::deepseek_v41::{v41_attention_query, v41_hc, v41_tensors};
 use anyhow::{ensure, Result};

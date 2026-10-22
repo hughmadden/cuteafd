@@ -321,8 +321,36 @@ pub(crate) struct ExpertWeights<'a> {
     /// W4A4 resident storage. `None` for the native and EXL3 families.
     nvfp4: Option<nvfp4::Nvfp4Side<'a>>,
     format: ExpertFormat,
+    /// A recorded load's raw scale images, until their Done finishes ran.
+    raw_scales: RawScales<'a>,
+}
+
+/// A recorded load's raw scale images (one device allocation), freed once its
+/// Done finishes ran, or with the layer. Covariant (no lifetime in a cell).
+pub(crate) struct RawScales<'a> {
+    library: Option<&'a NativeLibrary>,
+    buffer: std::cell::Cell<Option<cuteafd_ffi::CuteafdDeviceBuffer>>,
+}
+impl<'a> RawScales<'a> {
+    fn none() -> Self { Self { library: None, buffer: std::cell::Cell::new(None) } }
+    fn owned(allocation: DeviceAllocation<'a>) -> Self {
+        let allocation = std::mem::ManuallyDrop::new(allocation);
+        Self { library: Some(allocation.library), buffer: std::cell::Cell::new(Some(allocation.buffer)) }
+    }
+    /// Frees the images (their packs ran).
+    pub(crate) fn release(&self) {
+        if let (Some(library), Some(buffer)) = (self.library, self.buffer.take()) {
+            drop(DeviceAllocation { library, buffer });
+        }
+    }
+}
+impl Drop for RawScales<'_> {
+    fn drop(&mut self) { self.release(); }
 }
 impl<'a> ExpertWeights<'a> {
+    /// Frees raw scale images kept for recorded plane packs (after they ran).
+    pub(crate) fn release_raw_scales(&self) { self.raw_scales.release(); }
+
     fn layout(
         library: &NativeLibrary,
         catalog: &OfficialV41Catalog,
@@ -427,6 +455,13 @@ impl<'a> ExpertWeights<'a> {
         }
         let buffers: [DeviceAllocation<'a>; 4] =
             owned.try_into().ok().expect("four packed buffers");
+        if crate::shared::experts::rtx::dense::is_recording() {
+            // Recorded for the coordinator push group: one staged step per expert,
+            // packed on the GPU into its slice of the four planes.
+            let raw = Self::record_steps(library, catalog, layer, intermediate, experts, &sizes, &buffers)?;
+            return Ok(Self { buffers: buffers.map(Into::into), layer, experts, budget, nvfp4: None,
+                format: ExpertFormat::of(catalog), raw_scales: RawScales::owned(raw) });
+        }
         let device_staging = DeviceAllocation::new(library, budget.device_staging_bytes)?;
         let mut hosts = (0..EXPERT_READ_LANES)
             .map(|_| HostAllocation::new(library, budget.pinned_host_bytes / EXPERT_READ_LANES))
@@ -514,8 +549,70 @@ impl<'a> ExpertWeights<'a> {
             experts,
             budget,
             nvfp4: None,
-            format: ExpertFormat::of(catalog),
-        })
+            format: ExpertFormat::of(catalog), raw_scales: RawScales::none() })
+    }
+
+    /// A native layer's records for the coordinator push group, bounded per
+    /// source in file order: each expert's weights ([w3, w1, w2], one
+    /// contiguous file region) are one staged step packed into planes 0 and 2;
+    /// all scales (stored apart, at the shard's front) land class 2 in a
+    /// transient device image `raw` and finishes pack planes 1 and 3 at Done.
+    fn record_steps(library: &'a NativeLibrary, catalog: &OfficialV41Catalog, layer: ExpertLayer, intermediate: u32,
+        experts: usize, sizes: &[usize; 4], buffers: &[DeviceAllocation<'a>; 4]) -> Result<DeviceAllocation<'a>> {
+        use crate::shared::experts::rtx::dense::{DenseLoad, Finish, Job, Operand, Rect, Step, STEP_BYTES};
+        let dense = DenseLoad::mount(library);
+        let device = library.cuda_get_device()?;
+        let whole = |name: &str| -> Result<Rect> {
+            let tensor = catalog.tensor(name)?;
+            let bytes = usize::try_from(tensor.metadata.byte_length)?;
+            Ok(Rect { name: name.into(), path: catalog.snapshot().join(&tensor.shard), base: tensor.metadata.byte_offset,
+                row_bytes: bytes, rows: 0..1, cols: 0..bytes })
+        };
+        let plane = |i: usize, expert: usize| {
+            let stride = sizes[i] / experts;
+            // SAFETY (offset): expert `expert`'s slice lies inside plane `i`.
+            cuteafd_ffi::CuteafdDeviceBuffer { ptr: unsafe { buffers[i].buffer.ptr.cast::<u8>().add(expert * stride) }.cast(),
+                bytes: stride, ..buffers[i].buffer }
+        };
+        // Raw scale images, per expert: [w3 scale; w1 scale] then the w2 scale.
+        let first = catalog.expert_staging(layer.expert(0))?;
+        let names = first.tensor_names();
+        let (gate_scale, down_scale) = (2 * catalog.tensor(&names[3])?.metadata.byte_length as usize,
+            catalog.tensor(&names[5])?.metadata.byte_length as usize);
+        let per = (gate_scale + down_scale).next_multiple_of(256);
+        let raw = DeviceAllocation::new(library, per * experts)?;
+        for expert in 0..experts {
+            let plan = catalog.expert_staging(layer.expert(expert))?;
+            ensure!(plan.tp_world().is_none() && !matches!(layer.expert(expert),
+                V41ExpertSelection::BackboneTp2 { .. } | V41ExpertSelection::DsparkTp2 { .. }),
+                "recorded native experts are whole tensors");
+            let n = plan.tensor_names();
+            // Weights: one contiguous step (bounded per open source).
+            let rects = vec![whole(&n[1])?, whole(&n[0])?, whole(&n[2])?];
+            let gate_bytes = rects[0].bytes() + rects[1].bytes();
+            let bytes = gate_bytes + rects[2].bytes();
+            ensure!(bytes <= STEP_BYTES, "native expert weights exceed one staged step");
+            dense.step(Step { device, rects, jobs: vec![
+                Job::NativePlane { intermediate, plane: 0, at: 0, bytes: gate_bytes, dst: plane(0, expert) },
+                Job::NativePlane { intermediate, plane: 2, at: gate_bytes, bytes: bytes - gate_bytes, dst: plane(2, expert) },
+            ] }, std::ptr::null_mut())?;
+            // Scales: landed unchanged into this expert's raw image, packed at Done.
+            let (up, gate, down) = (whole(&n[4])?, whole(&n[3])?, whole(&n[5])?);
+            ensure!(up.bytes() + gate.bytes() == gate_scale && down.bytes() == down_scale, "native scale extents differ");
+            // SAFETY (offset): expert `expert`'s image lies inside `raw`.
+            let image = cuteafd_ffi::CuteafdDeviceBuffer { ptr: unsafe { raw.buffer.ptr.cast::<u8>().add(expert * per) }.cast(),
+                bytes: per, ..raw.buffer };
+            dense.operand(Operand { device, buffer: image, bytes: gate_scale + down_scale,
+                lands: vec![(up.clone(), 0), (gate, up.bytes()), (down, gate_scale)] })?;
+            // SAFETY (offsets): both halves lie inside this expert's image.
+            let at = |offset: usize, bytes: usize| cuteafd_ffi::CuteafdDeviceBuffer {
+                ptr: unsafe { image.ptr.cast::<u8>().add(offset) }.cast(), bytes, ..image };
+            dense.finish(Finish::NativePlane { intermediate, plane: 1, source: at(0, gate_scale), dst: plane(1, expert) },
+                std::ptr::null_mut())?;
+            dense.finish(Finish::NativePlane { intermediate, plane: 3, source: at(gate_scale, down_scale), dst: plane(3, expert) },
+                std::ptr::null_mut())?;
+        }
+        Ok(raw)
     }
 
     /// Read each native projection once for both GPUs. Eight readers in each
@@ -549,7 +646,7 @@ impl<'a> ExpertWeights<'a> {
                     let mut owned = Vec::with_capacity(4);
                     for bytes in sizes { owned.push(DeviceAllocation::new(devices[rank].library, bytes)?); }
                     weights[rank].push(Self { buffers: <[DeviceAllocation<'a>; 4]>::try_from(owned).ok().expect("four native slabs").map(Into::into),
-                        layer: selection, experts, budget, nvfp4: None, format: ExpertFormat::Native });
+                        layer: selection, experts, budget, nvfp4: None, format: ExpertFormat::Native, raw_scales: RawScales::none() });
                     Ok(())
                 })?;
             }
@@ -650,8 +747,7 @@ impl<'a> ExpertWeights<'a> {
             experts,
             budget,
             nvfp4: Some(side),
-            format: ExpertFormat::Nvfp4,
-        })
+            format: ExpertFormat::Nvfp4, raw_scales: RawScales::none() })
     }
     pub(crate) fn from_push(library: &'a NativeLibrary,
         rank: std::rc::Rc<crate::shared::memory::weight_arena::ReadyArena<'a>>,
@@ -676,7 +772,7 @@ impl<'a> ExpertWeights<'a> {
         budget.read_scratch_bytes = 0;
         Ok(Self { buffers: planes.try_into().ok().expect("four native planes"), layer,
             experts: layout.experts, budget, nvfp4,
-            format: if layout.nvfp4 { ExpertFormat::Nvfp4 } else { ExpertFormat::Native } })
+            format: if layout.nvfp4 { ExpertFormat::Nvfp4 } else { ExpertFormat::Native }, raw_scales: RawScales::none() })
     }
 
     /// Intermediate values per expert held by this resident layer.

@@ -415,6 +415,7 @@ HTTP_QUEUE_WAIT_MS
 INSTANCE
 KV_POOL_SIZE
 KV_POOL_TOKENS
+L2_PREFETCH
 MAPPED_SCALE_PRELOAD_GIB
 MAX_CONTEXT_TOKENS
 MAX_OUTPUT_TOKENS
@@ -855,6 +856,12 @@ case "${V41_FP8_HEAD:-}" in
     v41_fp8_head_args=(-e "CUTEAFD_V41_FP8_HEAD=$V41_FP8_HEAD") ;;
   *) release_die "V41_FP8_HEAD must be off, draft or all" ;;
 esac
+# L2_PREFETCH (off, auto = 3/4 of the L2, or MiB; unset: off): one-lane decode and
+# verify passes pull the next layer's weights into L2 while each layer's routed
+# experts are on the Sparks (serve-native --l2-prefetch).
+v41_l2_prefetch="$(get L2_PREFETCH)"
+[[ -z "$v41_l2_prefetch" || "$v41_l2_prefetch" =~ ^(off|auto|[0-9]+)$ ]] ||
+  release_die "L2_PREFETCH must be off, auto or a MiB count"
 case "$RTX_GPUS" in auto|1|2) ;; *) release_die "RTX_GPUS must be auto, 1, or 2" ;; esac
 [[ "$RTX_EXPERT_LAYERS" == auto || "$RTX_EXPERT_LAYERS" =~ ^[0-9]+$ ]] ||
   release_die "DeepSeek V4.1 RTX_EXPERT_LAYERS must be auto, all, N or N% with a readable checkpoint; max needs experts-first admission"
@@ -1391,6 +1398,7 @@ fi
 [[ "$TP2_QUERY_PROJECTION" != on ]] || args+=(--tp2-query-projection)
 [[ "$TP2_OUTPUT_PROJECTION" != on ]] || args+=(--tp2-output-projection)
 [[ "$TP2_DSPARK_EXPERTS" != on ]] || args+=(--tp2-dspark-experts)
+[[ -z "$v41_l2_prefetch" ]] || args+=(--l2-prefetch "$v41_l2_prefetch")
 # Explicit replicated topology is described to the coordinator once, and each
 # worker derives group=rank/TP and tp_rank=rank%TP from the same two flags.
 if ((topology_explicit)); then

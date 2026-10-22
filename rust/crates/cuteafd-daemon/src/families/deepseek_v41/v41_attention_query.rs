@@ -81,7 +81,7 @@ impl<'a> AttentionQueryWeights<'a> {
             let scale =
                 DeviceAllocation::new(library, kernel.info().packed_weight_scale_bytes as usize)?;
             let launched = unsafe {
-                kernel.pack_scales(tensors.get(&names[i * 2 + 1])?, scale.buffer, stream.raw)
+                crate::shared::experts::rtx::dense::v41_pack_scales(&kernel, tensors.get(&names[i * 2 + 1])?, scale.buffer, stream.raw)
             };
             launched.and(unsafe { library.cuda_stream_synchronize(stream.raw) })?;
             scales.push(scale);
@@ -94,6 +94,13 @@ impl<'a> AttentionQueryWeights<'a> {
             scales,
             split_query_b,
         })
+    }
+    /// The buffers a decode step reads, in order (L2 prefetch): wq_a and its
+    /// packed scales, q_norm, then wq_b and its scales unless TP2 splits it.
+    pub(crate) fn decode_reads(&self) -> Vec<CuteafdDeviceBuffer> {
+        let mut scales = self.scales.iter().map(|scale| scale.buffer);
+        [self.tensors.get(&self.names[0]).ok(), scales.next(), self.tensors.get(&self.names[4]).ok(),
+            self.tensors.get(&self.names[2]).ok(), scales.next()].into_iter().flatten().collect()
     }
     pub fn wave(&self, capacity: u32, budget: usize) -> Result<AttentionQueryWave<'_, 'a>> {
         ensure!(
@@ -698,5 +705,13 @@ mod tp2_tests {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+impl AttentionQueryWeights<'_> {
+    pub(crate) fn visit(&self, prefix: &str, f: &mut dyn FnMut(String, cuteafd_ffi::CuteafdDeviceBuffer)) {
+        self.tensors.visit(prefix, f);
+        for (i, s) in self.scales.iter().enumerate() { f(format!("{prefix}packed_scale{i}"), s.buffer); }
     }
 }

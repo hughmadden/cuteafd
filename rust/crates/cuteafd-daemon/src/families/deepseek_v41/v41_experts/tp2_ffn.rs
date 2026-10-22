@@ -9,7 +9,7 @@ use crate::shared::experts::rtx::{
     RtxSelectionPolicy,
 };
 use crate::shared::memory::device::{Allocation, Device, Stream};
-use anyhow::{ensure, Result};
+use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::{CuteafdDeviceBuffer, Bf16Add};
 use std::rc::Rc;
 
@@ -93,6 +93,26 @@ pub(crate) fn load_routed_weights<'a>(
         output,
     )?
     .map(OwnerWeights::Native))
+}
+
+/// [`load_routed_weights`] over native halves a push group delivered.
+pub(crate) fn pushed_routed_weights<'a>(
+    devices: [Device<'a>; 2],
+    catalog: &cuteafd_loader::OfficialV41Catalog,
+    layers: usize,
+    capacity: u32,
+    budgets: [usize; 2],
+    pushed: [Vec<crate::shared::experts::layer::ExpertWeights<'a>>; 2],
+) -> Result<[OwnerWeights<'a>; 2]> {
+    ensure!(catalog.exl3().is_none() && catalog.nvfp4().is_none(), "pushed coordinator halves are native MXFP4");
+    let selection = RtxSelectionPolicy::CanonicalDecode;
+    let reducer = devices[0].run(|| devices[0].library.v41_tp2_expert_reducer())?;
+    let output = if reducer.supports_route_sums() { NativeOutputPolicy::TokenSums } else { NativeOutputPolicy::KernelPlanes };
+    let workspace = NativeTp2::workspace_bytes_for_format(devices[0].library, capacity as usize, selection, output, false)?;
+    let budgets = [budgets[0].checked_add(workspace).context("TP2 native budget overflow")?,
+        budgets[1].checked_add(workspace).context("TP2 native budget overflow")?];
+    Ok(NativeTp2::pushed_pair_weights(devices, catalog, (0..layers).collect(), capacity as usize, budgets,
+        selection, output, pushed)?.map(OwnerWeights::Native))
 }
 
 struct PeerInputs<'a> {

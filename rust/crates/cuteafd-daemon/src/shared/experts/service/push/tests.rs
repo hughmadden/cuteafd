@@ -180,8 +180,9 @@ fn spark_exl3_ring_to_shared_owner_is_mount_exact_and_drops_before_retry() -> Re
         }
         if !packer.is_empty() { packed.push(packer.finish().0); }
         let (mut coordinator, mut worker) = control_pair()?;
+        let server_socket = socket.clone();
         let server = std::thread::spawn(move || -> Result<()> {
-            let conn = listener.accept()?;
+            let conn = crate::shared::memory::push_testing::accept_within(&listener, &server_socket, Duration::from_secs(120))?;
             conn.set_timeout(Some(Duration::from_secs(10)))?;
             let (request, fd) = conn.next_request()?.context("rank did not join")?;
             let Request::Join { slots, slot_bytes, rank, .. } = request else { anyhow::bail!("expected rank Join") };

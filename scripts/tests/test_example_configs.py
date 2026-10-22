@@ -247,6 +247,32 @@ def test_release_smoke_matrix_covers_owned_columns_with_current_defaults() -> No
     assert all(columns == {1, 2} for columns in models.values())
 
 
+def test_v41_max_uses_six_sparks_and_keeps_tp4_reference() -> None:
+    pool = ["ostrich", "dodo", "emu", "kiwi", "rhea", "moa"]
+    config = keys(ROOT / "examples/configs/deepseek-v41-mxfp4-max.config")
+    assert config["RTX_GPUS"] == "2" and config["SPARK_COUNT"] == "6"
+    for rank in range(6):
+        assert config[f"SPARK_{rank}_HOST"] == f"REPLACE-ME-spark-{rank}"
+        assert config[f"SPARK_{rank}_LANE_A"] == f"192.0.2.{rank + 1}"
+    for path in ("scripts/bench/kits/gate/matrix-gate.json",
+                 "scripts/bench/release-smoke.example.json"):
+        matrix = json.loads((ROOT / path).read_text())
+        entries = {entry["name"]: entry for entry in matrix["entries"]}
+        maximum = entries["v41-flash-max"]
+        assert maximum["gpus"] == [0, 1] and maximum["sparks"] == pool
+        assert maximum["set"]["SPARK_COUNT"] == "6"
+        assert [maximum["set"][f"SPARK_{rank}_HOST"] for rank in range(6)] == pool
+        if "v41-flash-ref-tp4" in entries:
+            reference = entries["v41-flash-ref-tp4"]
+            assert reference["gpus"] == [0, 1] and reference["sparks"] == pool[:4]
+            assert reference["set"]["SPARK_COUNT"] == "4"
+            for key in ("ADDR", "EXPERT_PORT"):
+                assert sum(entry.get("set", {}).get(key) == reference["set"][key]
+                           for entry in entries.values()) == 1
+        elif "matrix-gate" in path:
+            pytest.fail("gate kit must retain the TP4 reference card")
+
+
 def test_v3_release_matrix_covers_shipped_quants_reference_layouts_and_real_5090() -> None:
     matrix = json.loads((ROOT / "scripts/bench/release-smoke-v3.json").read_text())
     values_of = lambda entry: {**keys(ROOT / entry["config"]), **matrix["defaults"]["set"], **entry["set"]}
