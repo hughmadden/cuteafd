@@ -230,6 +230,7 @@ pub(crate) fn prefetch(snapshot: &Path) -> std::thread::JoinHandle<Result<HashMa
 }
 
 pub(crate) struct DsparkDrafter<'a> {
+    pub(crate) kv_cache: cuteafd_loader::families::qwen4::Qwen4KvCache,
     library: &'a NativeLibrary,
     pub cfg: DsparkConfig,
     stream: *mut c_void,
@@ -284,11 +285,11 @@ impl<'a> DsparkDrafter<'a> {
     #[allow(clippy::too_many_arguments)]
     pub fn load(library: &'a NativeLibrary, snapshot: &Path, tensors: HashMap<String, Vec<u8>>, stream: *mut c_void,
         slots: usize, max_sequences: usize, mask_row: Vec<u8>, representation: GlmDraftRepresentation,
-        scales: fp8_linear::Fp8Scales, fp8_rows: fp8_linear::Fp8Rows) -> Result<Self> {
+        scales: fp8_linear::Fp8Scales, fp8_rows: fp8_linear::Fp8Rows, kv_cache: cuteafd_loader::families::qwen4::Qwen4KvCache) -> Result<Self> {
         let cfg = DsparkConfig::read(snapshot)?;
         let capacity = cfg.window.context("full-context dSpark requires explicit admitted context capacity")?;
         Self::load_admitted(library, snapshot, tensors, stream, slots, max_sequences, mask_row,
-            representation, scales, fp8_rows, capacity)
+            representation, scales, fp8_rows, capacity, kv_cache)
     }
 
     /// Full-context capacity is explicit: reject positions beyond admission,
@@ -297,7 +298,7 @@ impl<'a> DsparkDrafter<'a> {
     pub fn load_admitted(library: &'a NativeLibrary, snapshot: &Path, tensors: HashMap<String, Vec<u8>>,
         stream: *mut c_void, slots: usize, max_sequences: usize, mask_row: Vec<u8>,
         representation: GlmDraftRepresentation, scales: fp8_linear::Fp8Scales,
-        fp8_rows: fp8_linear::Fp8Rows, context_capacity: usize) -> Result<Self> {
+        fp8_rows: fp8_linear::Fp8Rows, context_capacity: usize, kv_cache: cuteafd_loader::families::qwen4::Qwen4KvCache) -> Result<Self> {
         let _memory_scope = cuteafd_ffi::memory_ledger::scope("drafter");
         let cfg = DsparkConfig::read(snapshot)?;
         ensure!(context_capacity > 0 && slots > 0 && max_sequences <= slots,
@@ -310,8 +311,8 @@ impl<'a> DsparkDrafter<'a> {
         let config = serde_json::from_slice(&std::fs::read(snapshot.join("config.json"))?)?;
         let (resident_bytes, scratch_bytes) = cuteafd_loader::families::glm5::draft_representation::block_dspark_resident_bytes(
             &config, slots, max_sequences, library.sm_count()? as u64, representation, fp8_rows.code() as u8,
-            context_capacity)?;
-        tracing::info!(resident_bytes, scratch_bytes, "dSpark shared readiness inventory");
+            context_capacity, kv_cache)?;
+        tracing::info!(resident_bytes, scratch_bytes, kv_cache = %kv_cache, "dSpark shared readiness inventory");
         ensure!((1..=MAX_SEQUENCES).contains(&max_sequences), "dSpark drafts take 1..={MAX_SEQUENCES} sequences");
         let path = snapshot.join("model.safetensors");
         let shapes: HashMap<String, Vec<usize>> = read_safetensors_metadata(&path)?.into_iter()
@@ -376,8 +377,8 @@ impl<'a> DsparkDrafter<'a> {
                 gate_up: matrix(concat(&[(&format!("{p}.mlp.gate_proj.weight"), inter),
                     (&format!("{p}.mlp.up_proj.weight"), inter)], h)?, 2 * inter, h)?,
                 down: matrix(tensor(&format!("{p}.mlp.down_proj.weight"), &[h, inter])?, h, inter)?,
-                k_ring: zeroed(slots * context_capacity * kv * 2)?,
-                v_ring: zeroed(slots * context_capacity * kv * 2)?,
+                k_ring: zeroed(slots * context_capacity * kv_cache.plane_record_bytes(cfg.kv_heads, cfg.head_dim))?,
+                v_ring: zeroed(slots * context_capacity * kv_cache.plane_record_bytes(cfg.kv_heads, cfg.head_dim))?,
             })
         }).collect::<Result<Vec<_>>>()?;
         let taps = cfg.taps.len() * h;
@@ -395,6 +396,7 @@ impl<'a> DsparkDrafter<'a> {
         unsafe { library.glmf_dspark_markov_norms(markov_w2.buffer.ptr, markov_norms.buffer.ptr, cfg.vocab, cfg.rank,
             stream)? };
         Ok(Self {
+            kv_cache,
             library,
             stream,
             slots,
@@ -546,7 +548,7 @@ impl<'a> DsparkDrafter<'a> {
                 self.library.block_dspark_qk_rope(self.context_kv.buffer.ptr, layer.q_norm.buffer.ptr,
                     layer.k_norm.buffer.ptr, self.context_positions.buffer.ptr, self.context_slots.buffer.ptr,
                     self.inv_freq.as_ref().map_or(std::ptr::null(), |v| v.buffer.ptr.cast_const()), std::ptr::null_mut(), layer.k_ring.buffer.ptr, layer.v_ring.buffer.ptr, n, 0, self.cfg.kv_heads, self.cfg.head_dim,
-                    self.cfg.theta, self.cfg.rotary.as_ref().map_or(1.0, |p| p.attention_factor), self.cfg.eps, s)?;
+                    self.cfg.theta, self.cfg.rotary.as_ref().map_or(1.0, |p| p.attention_factor), self.cfg.eps, self.kv_cache == cuteafd_loader::families::qwen4::Qwen4KvCache::Fp8, s)?;
             }
         }
         Ok(())
@@ -696,11 +698,11 @@ impl<'a> DsparkDrafter<'a> {
                     w.positions.buffer.ptr, std::ptr::null(),
                     self.inv_freq.as_ref().map_or(std::ptr::null(), |v| v.buffer.ptr.cast_const()), w.q.buffer.ptr, w.k.buffer.ptr, w.v.buffer.ptr, rows,
                     c.heads, c.kv_heads, c.head_dim, c.theta,
-                    c.rotary.as_ref().map_or(1.0, |p| p.attention_factor), eps, s)?;
+                    c.rotary.as_ref().map_or(1.0, |p| p.attention_factor), eps, false, s)?;
                 l.block_dspark_attention(w.q.buffer.ptr, w.k.buffer.ptr, w.v.buffer.ptr, layer.k_ring.buffer.ptr,
                     layer.v_ring.buffer.ptr, w.tables.buffer.ptr, at(&w.tables, s_count * 4), at(&w.tables, 2 * s_count * 4),
                     w.attn.buffer.ptr, w.attention_workspace.buffer.ptr, s_count, block, c.heads, c.kv_heads, self.context_capacity,
-                    max_keys, c.causal, c.head_dim, 1.0 / (c.head_dim as f32).sqrt(), s)?;
+                    max_keys, c.causal, c.head_dim, 1.0 / (c.head_dim as f32).sqrt(), self.kv_cache == cuteafd_loader::families::qwen4::Qwen4KvCache::Fp8, s)?;
                 self.linear(w.attn.buffer.ptr, &layer.o, 0, w.delta.buffer.ptr, rows, c.q_width(), h)?;
                 l.glmf_dspark_add_rmsnorm(w.h.buffer.ptr, w.delta.buffer.ptr, layer.post_norm.buffer.ptr,
                     w.h.buffer.ptr, w.n.buffer.ptr, rows, h, eps, s)?;

@@ -1,6 +1,9 @@
 //! DFlash2 drafter kernels (GLM 5.3 and GLM 5.3 Flash) (`native/families/glm5/cuda/glm_dflash.cu`) and
 //! the cuBLAS BF16 linear its GEMMs use. Every pointer is device memory of
 //! the documented shape on the stream's device; the stream orders them.
+//! With `fp8_kv`, retained K/V planes use `align16(kv_heads * (head_dim + 4))`
+//! bytes per row: E4M3 codes, FP32 head descales, zero alignment padding.
+//! Queries and speculative block K/V remain BF16 in either mode.
 use crate::NativeLibrary;
 use anyhow::{ensure, Result};
 use std::ffi::c_void;
@@ -74,10 +77,12 @@ impl NativeLibrary {
     /// As [`Self::linear_bf16`]; `positions` I64 [rows], `slots` I32 [rows].
     #[allow(clippy::too_many_arguments)]
     pub unsafe fn glm_dflash_qk_rope(&self, qkv: P, q_norm: P, k_norm: P, positions: P, slots: P, q_out: M,
-        k_out: M, v_out: M, rows: usize, heads: usize, kv_heads: usize, theta: f32, eps: f32, stream: M)
+        k_out: M, v_out: M, rows: usize, heads: usize, kv_heads: usize, theta: f32, eps: f32, fp8_kv: bool, stream: M)
         -> Result<()> {
         type F = unsafe extern "C" fn(P, P, P, P, P, M, M, M, i32, i32, i32, f32, f32, M) -> i32;
-        let f = *unsafe { self.lib.get::<F>(b"cuteafd_glm_dflash_qk_rope") }?;
+        let symbol: &[u8] = if fp8_kv { b"cuteafd_glm_dflash_qk_rope_fp8" } else { b"cuteafd_glm_dflash_qk_rope" };
+        // SAFETY: both format-specific symbols have the native signature above.
+        let f = *unsafe { self.lib.get::<F>(symbol) }?;
         check(unsafe {
             f(qkv, q_norm, k_norm, positions, slots, q_out, k_out, v_out, i(rows)?, i(heads)?, i(kv_heads)?, theta,
                 eps, stream)
@@ -99,9 +104,11 @@ impl NativeLibrary {
     #[allow(clippy::too_many_arguments)]
     pub unsafe fn glm_dflash_attention(&self, q: P, k_block: P, v_block: P, k_ring: P, v_ring: P, seq_slots: P,
         ctx_lengths: P, ctx_ends: P, out: M, workspace: M, sequences: usize, block_rows: usize, heads: usize,
-        kv_heads: usize, ring: usize, max_keys: usize, window: usize, scale: f32, stream: M) -> Result<()> {
+        kv_heads: usize, ring: usize, max_keys: usize, window: usize, scale: f32, fp8_kv: bool, stream: M) -> Result<()> {
         type F = unsafe extern "C" fn(P, P, P, P, P, P, P, P, M, M, i32, i32, i32, i32, i32, i32, i32, f32, M) -> i32;
-        let f = *unsafe { self.lib.get::<F>(b"cuteafd_glm_dflash_attention") }?;
+        let symbol: &[u8] = if fp8_kv { b"cuteafd_glm_dflash_attention_fp8" } else { b"cuteafd_glm_dflash_attention" };
+        // SAFETY: both format-specific symbols have the native signature above.
+        let f = *unsafe { self.lib.get::<F>(symbol) }?;
         check(unsafe {
             f(q, k_block, v_block, k_ring, v_ring, seq_slots, ctx_lengths, ctx_ends, out, workspace, i(sequences)?,
                 i(block_rows)?, i(heads)?, i(kv_heads)?, i(ring)?, i(max_keys)?, i(window)?, scale, stream)

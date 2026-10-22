@@ -831,6 +831,7 @@ enum DraftInput<'r, 'e> {
 }
 
 pub(crate) struct DflashDrafter<'a> {
+    pub(crate) kv_cache: cuteafd_loader::families::qwen4::Qwen4KvCache,
     library: &'a NativeLibrary,
     timing: crate::shared::draft::timing::DraftTiming<'a>,
     pub cfg: DflashConfig,
@@ -1031,7 +1032,8 @@ impl<'a> DflashDrafter<'a> {
 
     fn confidence_key(&self, family: &str, fp8_head: bool) -> String {
         let head = if fp8_head { "head-fp8-row".into() } else { format!("head-bf16-{:?}", self.head_mode.get()) };
-        let numerics = format!("{}-{:?}-{head}-{:?}-r1", self.representation.name(), self.fp8_rows.get(),
+        let kv = if self.kv_cache == cuteafd_loader::families::qwen4::Qwen4KvCache::Fp8 { "-kv-fp8" } else { "" };
+        let numerics = format!("{}-{:?}-{head}-{:?}{kv}-r1", self.representation.name(), self.fp8_rows.get(),
             self.confidence_scales).to_ascii_lowercase();
         format!("{family}/dflash2/{numerics}")
     }
@@ -1045,15 +1047,15 @@ impl<'a> DflashDrafter<'a> {
     #[allow(clippy::too_many_arguments)]
     pub fn load(library: &'a NativeLibrary, snapshot: &Path, file: Vec<u8>, stream: *mut c_void, slots: usize,
         max_sequences: usize, mask_row: Vec<u8>, row_window: bool, representation: GlmDraftRepresentation,
-        scales: fp8_linear::Fp8Scales, fp8_rows: fp8_linear::Fp8Rows) -> Result<Self> {
+        scales: fp8_linear::Fp8Scales, fp8_rows: fp8_linear::Fp8Rows, kv_cache: cuteafd_loader::families::qwen4::Qwen4KvCache) -> Result<Self> {
         let _memory_scope = cuteafd_ffi::memory_ledger::scope("drafter");
         let cfg = DflashConfig { row_window, ..DflashConfig::read(snapshot)? };
         let capacity = GlmDraftCapacity::new(slots, max_sequences, cfg.block)?;
         let layout = cfg.runtime_layout(representation, capacity)?;
         let config = serde_json::from_slice(&std::fs::read(snapshot.join("config.json"))?)?;
         let (resident_bytes, scratch_bytes) = cuteafd_loader::families::glm5::draft_representation::draft_resident_bytes_with_mode(
-            &config, slots, max_sequences, library.sm_count()? as u64, representation, fp8_rows.code() as u8)?;
-        tracing::info!(resident_bytes, scratch_bytes, "DFlash shared readiness inventory");
+            &config, slots, max_sequences, library.sm_count()? as u64, representation, fp8_rows.code() as u8, kv_cache)?;
+        tracing::info!(resident_bytes, scratch_bytes, kv_cache = %kv_cache, "DFlash shared readiness inventory");
         ensure!(mask_row.len() == cfg.hidden * 2, "DFlash BF16 mask row has wrong hidden width");
         let path = snapshot.join("model.safetensors");
         let checkpoint = Checkpoint {
@@ -1110,8 +1112,8 @@ impl<'a> DflashDrafter<'a> {
                     k_norm: tensor(&format!("{a}.k_norm.weight"), &[cfg.head_dim])?,
                     o: matrix(tensor(&format!("{a}.o_proj.weight"), &[h, cfg.heads * cfg.head_dim])?,
                         h, cfg.heads * cfg.head_dim)?,
-                    k_ring: zeroed(slots * RING * kv * 2)?,
-                    v_ring: zeroed(slots * RING * kv * 2)?,
+                    k_ring: zeroed(slots * RING * kv_cache.plane_record_bytes(cfg.kv_heads, cfg.head_dim))?,
+                    v_ring: zeroed(slots * RING * kv_cache.plane_record_bytes(cfg.kv_heads, cfg.head_dim))?,
                 }),
                 gate_up: matrix(concat(&[(&format!("{p}.mlp.gate_proj.weight"), inter),
                     (&format!("{p}.mlp.up_proj.weight"), inter)], h)?, 2 * inter, h)?,
@@ -1123,6 +1125,7 @@ impl<'a> DflashDrafter<'a> {
             own_weight_bytes = layout.weights.resident_bytes()?, max_load_staging = layout.weights.max_load_staging,
             "DFlash single-copy storage admitted; vocabulary head borrowed from target");
         Ok(Self {
+            kv_cache,
             library,
             stream,
             slots,
@@ -1236,7 +1239,7 @@ impl<'a> DflashDrafter<'a> {
         let AttentionWorkspace::Mla(attention) = &workspace.attention else { unreachable!() };
         library.copy_h2d(draft_view(attention.inverse_frequencies.buffer, 0,
             native.rotary.inv_freq.len() * 4)?, bytes_of(&native.rotary.inv_freq))?;
-        let result = Self { library, stream, slots: layout.capacity().context_slots,
+        let result = Self { kv_cache: cuteafd_loader::families::qwen4::Qwen4KvCache::Bf16, library, stream, slots: layout.capacity().context_slots,
             max_sequences: layout.capacity().max_batch_sequences,
             fc: matrix(tensor("fc.weight", &[h, cfg.taps.len() * h])?, h, cfg.taps.len() * h)?,
             hidden_norm: tensor("hidden_norm.weight", &[h])?, norm: tensor("norm.weight", &[h])?,
@@ -1441,7 +1444,7 @@ impl<'a> DflashDrafter<'a> {
                 self.library.glm_dflash_qk_rope(context.kv.buffer.ptr, layer.q_norm.buffer.ptr,
                     layer.k_norm.buffer.ptr, self.context_positions.buffer.ptr, context.slots.buffer.ptr,
                     std::ptr::null_mut(), layer.k_ring.buffer.ptr, layer.v_ring.buffer.ptr, n, 0, self.cfg.kv_heads,
-                    self.cfg.theta, self.cfg.eps, s)?;
+                    self.cfg.theta, self.cfg.eps, self.kv_cache == cuteafd_loader::families::qwen4::Qwen4KvCache::Fp8, s)?;
             }
         }
         self.timing.end(context_span, s)?;
@@ -1970,12 +1973,12 @@ impl<'a> DflashDrafter<'a> {
                         self.linear(w.conv.buffer.ptr, &a.qkv, 0, attention.qkv.buffer.ptr, rows, h, c.qkv_width())?;
                         l.glm_dflash_qk_rope(attention.qkv.buffer.ptr, a.q_norm.buffer.ptr, a.k_norm.buffer.ptr,
                             w.positions.buffer.ptr, std::ptr::null(), attention.q.buffer.ptr, attention.k.buffer.ptr, attention.v.buffer.ptr,
-                            rows, c.heads, c.kv_heads, c.theta, eps, s)?;
+                            rows, c.heads, c.kv_heads, c.theta, eps, false, s)?;
                         l.glm_dflash_attention(attention.q.buffer.ptr, attention.k.buffer.ptr, attention.v.buffer.ptr,
                             a.k_ring.buffer.ptr, a.v_ring.buffer.ptr, attention.tables.buffer.ptr,
                             at(&attention.tables, s_count * 4), at(&attention.tables, 2 * s_count * 4),
                             attention.attn.buffer.ptr, attention.scratch.buffer.ptr, s_count, block, c.heads, c.kv_heads, RING,
-                            max_keys, if c.row_window { c.window } else { 0 }, 1.0 / (c.head_dim as f32).sqrt(), s)?;
+                            max_keys, if c.row_window { c.window } else { 0 }, 1.0 / (c.head_dim as f32).sqrt(), self.kv_cache == cuteafd_loader::families::qwen4::Qwen4KvCache::Fp8, s)?;
                         self.linear(attention.attn.buffer.ptr, &a.o, 0, w.delta.buffer.ptr, rows, attention_width, h)?;
                     }
                     (DraftAttention::Mla(a), AttentionWorkspace::Mla(attention), DraftContext::Mla(context)) => {

@@ -218,10 +218,10 @@ pub(super) fn profile(checkpoint: &super::super::Checkpoint, options: &LayoutOpt
         Some(draft_config::DflashConfig::read(&dir)?)
     } else { None };
     let draft_mark = if options.mimo_prefix_draft {
-        if let Some(draft) = &draft { draft_representation::mimo_draft_mark_bytes(draft.layers as u64, draft.kv_width() as u64)? }
+        if let Some(draft) = &draft { draft_representation::mimo_draft_mark_bytes(draft.layers as u64, draft.kv_heads as u64, draft.head_dim as u64, options.draft_kv_cache)? }
         else if dir.join("config.json").is_file() {
             let config = serde_json::from_slice(&std::fs::read(dir.join("config.json"))?)?;
-            super::mimo_draft_prefix_bytes(&config, 1, rings).map_err(anyhow::Error::msg)?.0
+            super::mimo_draft_prefix_bytes(&config, 1, rings, options.draft_kv_cache).map_err(anyhow::Error::msg)?.0
         } else { 0 }
     } else { 0 };
     let mark = cache.ranks.iter().map(|r| r.retained_mark_bytes).sum::<u64>() + draft_mark;
@@ -238,7 +238,8 @@ pub(super) fn profile(checkpoint: &super::super::Checkpoint, options: &LayoutOpt
             if let Some(draft) = &draft {
                 let sequences = options.draft_sequences.max(concurrency);
                 let slots = draft_representation::mimo_draft_context_slots(sequences, rings, options.draft_context_slots);
-                let capacity = draft_representation::MimoDraftCapacity::new(slots as usize, sequences as usize, draft.block)?;
+                let mut capacity = draft_representation::MimoDraftCapacity::new(slots as usize, sequences as usize, draft.block)?;
+                capacity.kv_cache = options.draft_kv_cache;
                 let headers = crate::read_safetensors_metadata(&dir.join("dflash_draft_model.safetensors"))?;
                 let costs = draft_reservations_with(draft, &headers,
                     if options.mimo_draft_bf16 { draft_representation::MimoDraftRepresentation::Bf16Only }

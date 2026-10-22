@@ -83,6 +83,7 @@ fn options(args: &PlanArgs) -> Result<PlanOptions, PlanError> {
                 mimo_rings: args.mimo_rings,
                 mimo_expert_input: args.expert_input.into(),
                 draft_sequences: args.draft_sequences,
+                draft_kv_cache: args.draft_kv_cache,
                 draft_context_slots: args.draft_context_slots,
                 mimo_decode_graphs: args.mimo_decode_graphs,
                 physical_sms: args.physical_sms,
@@ -767,6 +768,7 @@ mod tests {
 
     fn args(model: &std::path::Path, spark_ranks: usize, require_ready: bool) -> PlanArgs {
         PlanArgs {
+            draft_kv_cache: cuteafd_loader::families::qwen4::Qwen4KvCache::Bf16,
             exlr8_manifest: None,
             exlr8_dense_from: None,
             mapped_scale_preload_gib: 0.0,

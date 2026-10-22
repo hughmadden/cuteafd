@@ -19,6 +19,9 @@ use std::time::Instant;
 /// What every GLM command needs to stand up the engine.
 #[derive(Debug, Clone, clap::Args)]
 pub(crate) struct EngineArgs {
+    /// Shared GQA drafter-ring storage (independent of weight precision).
+    #[arg(long, default_value = "fp8")]
+    pub draft_kv_cache: cuteafd_loader::families::qwen4::Qwen4KvCache,
     /// Checkpoint snapshot (the EXL3 publication carries the dense weights).
     #[arg(long)]
     pub snapshot: PathBuf,
@@ -541,7 +544,7 @@ impl Opened {
         };
         let drafter_bytes = args.draft.as_deref().map(|snapshot| glm::drafter_bytes(snapshot,
             args.draft_context_slots.unwrap_or(20.max(args.draft_sequences)), args.draft_sequences,
-            self.library.sm_count()? as u64, args.draft_fp8 == Some(false))).transpose()?.unwrap_or(0);
+            self.library.sm_count()? as u64, args.draft_fp8 == Some(false), args.draft_kv_cache)).transpose()?.unwrap_or(0);
         let drafter_staging = args.draft.as_deref().map(|snapshot| glm::drafter_staging(snapshot,
             args.draft_context_slots.unwrap_or(20.max(args.draft_sequences)), args.draft_sequences,
             args.draft_fp8 == Some(false))).transpose()?.unwrap_or(0);
@@ -757,7 +760,7 @@ impl Opened {
                 ::from_fp8_option(args.draft_fp8);
             let drafter = dflash::DflashDrafter::load(&self.library, snapshot, file, stream,
                 args.draft_context_slots.unwrap_or(20.max(args.draft_sequences)), args.draft_sequences,
-                mask, false, representation, args.fp8_scales, crate::shared::fp8_linear::Fp8Rows::W8a16)?;
+                mask, false, representation, args.fp8_scales, crate::shared::fp8_linear::Fp8Rows::W8a16, args.draft_kv_cache)?;
             // Admission includes the shared drafter's maximum serving workspace.
             drafter.prepare_workspace()?;
             tracing::info!(elapsed_ms = started.elapsed().as_millis() as u64,
