@@ -512,7 +512,7 @@ fn check_storage_maps(snapshot: &Path, config: &Value, derived: &Exl3StorageMap)
             &path, MAX_MANIFEST_BYTES, Some(derived))?;
         normalize_legacy_names(&mut manifest);
         let flavor = if manifest.get("checkpoint_format").is_some() {
-            check_gptqmodel_manifest(compact, &manifest).with_context(|| format!("checking {file}"))?;
+            check_gptqmodel_manifest(compact, &manifest, derived).with_context(|| format!("checking {file}"))?;
             Exl3StorageSource::GptqModel
         } else {
             check_exllamav3_manifest(compact, &manifest).with_context(|| format!("checking {file}"))?;
@@ -541,8 +541,10 @@ fn read_bytes(path: &Path, limit: u64) -> Result<Vec<u8>> {
 }
 
 /// GPTQModel's storage contract: the compact `config.json` block repeated,
-/// the EXL3 layout fields, and nothing else.
-fn check_gptqmodel_manifest(compact: &Value, manifest: &Value) -> Result<()> {
+/// the EXL3 layout fields, and nothing else. `core_bits` (a core quant over
+/// the routed experts' base `bits`) must match every non-expert EXL3 module's
+/// header-derived bits in `derived`.
+fn check_gptqmodel_manifest(compact: &Value, manifest: &Value, derived: &Exl3StorageMap) -> Result<()> {
     for field in ["quant_method", "method", "format", "checkpoint_format"] {
         ensure!(
             manifest.get(field).and_then(Value::as_str) == Some("exl3"),
@@ -572,12 +574,15 @@ fn check_gptqmodel_manifest(compact: &Value, manifest: &Value) -> Result<()> {
         ensure!(
             matches!(
                 key.as_str(),
-                "bits" | "checkpoint_format" | "codebook" | "desc_act" | "format" | "group_size"
+                "bits" | "checkpoint_format" | "codebook" | "core_bits" | "desc_act" | "format" | "group_size"
                     | "lm_head" | "meta" | "method" | "module_include" | "out_scales"
                     | "pack_dtype" | "quant_method" | "tensor_storage"
             ),
             "EXL3 manifest has unexpected key {key}"
         );
+    }
+    if let Some(core) = manifest.get("core_bits") {
+        check_core_bits(core, derived)?;
     }
     let compact = compact.as_object().context("missing compact EXL3 config")?;
     ensure!(
@@ -585,10 +590,30 @@ fn check_gptqmodel_manifest(compact: &Value, manifest: &Value) -> Result<()> {
         "config must declare EXL3 quantization"
     );
     for (key, value) in compact {
+        // The compact block may point at its per-module storage map; that
+        // pointer must name the GPTQModel map and nothing else.
+        if key == "per_module_metadata" {
+            ensure!(value == "quantize_config.json:tensor_storage" && manifest.get("tensor_storage").is_some(),
+                "EXL3 per_module_metadata must name quantize_config.json:tensor_storage, not {value}");
+            continue;
+        }
         ensure!(
             manifest.get(key) == Some(value),
             "compact/full EXL3 metadata disagree at {key}"
         );
+    }
+    Ok(())
+}
+
+/// `core_bits` declares the non-expert (core) EXL3 projections' width; the
+/// safetensors headers are authoritative, so every core module must carry it.
+fn check_core_bits(core: &Value, derived: &Exl3StorageMap) -> Result<()> {
+    let bits = core.as_f64().filter(|v| v.fract() == 0.0 && (1.0..=8.0).contains(v))
+        .context("EXL3 core_bits must be an integer in 1..8")? as usize;
+    let mut cores = derived.iter().filter(|(name, _)| !is_routed_module(name)).peekable();
+    ensure!(cores.peek().is_some(), "EXL3 core_bits={bits} but the headers carry no core EXL3 modules");
+    for (name, module) in cores {
+        ensure!(module.bits == bits, "EXL3 core_bits={bits} disagrees with the headers at {name} (K{})", module.bits);
     }
     Ok(())
 }
@@ -1674,5 +1699,65 @@ mod qwen_naming_tests {
         assert_eq!(naming.projection(false, 47, 511, V41Exl3ProjectionKind::Down),
             "model.language_model.layers.47.mlp.experts.511.down_proj");
         assert_eq!(naming.projection(true, 0, 3, V41Exl3ProjectionKind::Gate), "mtp.layers.0.mlp.experts.3.gate_proj");
+    }
+
+    fn k6_core_storage() -> Exl3StorageMap {
+        let module = |bits| Exl3Module { codebook: crate::formats::exl3_storage::Exl3Codebook::Mcg, bits,
+            input_features: 128, output_features: 128, tensors: BTreeMap::new() };
+        BTreeMap::from([
+            ("language_model.model.layers.1.block_sparse_moe.experts.0.w1".to_owned(), module(2)),
+            ("language_model.model.layers.1.self_attn.q_proj".to_owned(), module(6)),
+            ("language_model.model.layers.1.block_sparse_moe.routed_expert_up_proj".to_owned(), module(6)),
+            ("language_model.lm_head".to_owned(), module(6)),
+        ])
+    }
+
+    /// The published Kimi K3 Core-K6 key set: compact `config.json` block and
+    /// the top-level `quantize_config.json` keys (tensor_storage elided).
+    fn k6_publication() -> (Value, Value) {
+        let compact = serde_json::json!({"bits": 2.0, "checkpoint_format": "exl3", "core_bits": 6.0, "format": "exl3",
+            "per_module_metadata": "quantize_config.json:tensor_storage", "quant_method": "exl3"});
+        let manifest = serde_json::json!({"bits": 2.0, "checkpoint_format": "exl3", "codebook": "mcg",
+            "core_bits": 6.0, "desc_act": false, "format": "exl3", "group_size": -1, "method": "exl3",
+            "module_include": ["^language_model\\.lm_head$"], "out_scales": "auto", "quant_method": "exl3",
+            "meta": {"core_quantization_provenance": {}, "quantization_provenance": {}},
+            "tensor_storage": {}});
+        (compact, manifest)
+    }
+
+    #[test]
+    fn k6_core_bits_is_checked_against_core_headers() {
+        let (compact, manifest) = k6_publication();
+        let storage = k6_core_storage();
+        check_gptqmodel_manifest(&compact, &manifest, &storage).unwrap();
+        // A core module at another width disagrees with the declared core_bits.
+        let mut wrong = storage.clone();
+        wrong.get_mut("language_model.lm_head").unwrap().bits = 4;
+        let error = format!("{:#}", check_gptqmodel_manifest(&compact, &manifest, &wrong).unwrap_err());
+        assert!(error.contains("core_bits=6") && error.contains("language_model.lm_head"), "{error}");
+        // core_bits with only routed experts in the headers is not a core quant.
+        let routed: Exl3StorageMap = storage.iter().filter(|(name, _)| is_routed_module(name))
+            .map(|(name, module)| (name.clone(), module.clone())).collect();
+        assert!(check_gptqmodel_manifest(&compact, &manifest, &routed).is_err());
+        for bad in [Value::from(6.5), Value::from(0), Value::from("6")] {
+            let mut bad_manifest = manifest.clone();
+            bad_manifest["core_bits"] = bad.clone();
+            let mut bad_compact = compact.clone();
+            bad_compact["core_bits"] = bad;
+            assert!(check_gptqmodel_manifest(&bad_compact, &bad_manifest, &storage).is_err());
+        }
+        // Compact and full metadata still have to agree on core_bits.
+        let mut disagree = compact.clone();
+        disagree["core_bits"] = Value::from(5.0);
+        assert!(check_gptqmodel_manifest(&disagree, &manifest, &storage).is_err());
+        // The pointer may name only the GPTQModel storage map.
+        let mut pointer = compact.clone();
+        pointer["per_module_metadata"] = Value::from("other.json:tensor_storage");
+        assert!(check_gptqmodel_manifest(&pointer, &manifest, &storage).is_err());
+        // Unknown keys are still refused.
+        let mut extra = manifest.clone();
+        extra["head_core_bits"] = Value::from(6.0);
+        let error = format!("{:#}", check_gptqmodel_manifest(&compact, &extra, &storage).unwrap_err());
+        assert!(error.contains("unexpected key head_core_bits"), "{error}");
     }
 }
