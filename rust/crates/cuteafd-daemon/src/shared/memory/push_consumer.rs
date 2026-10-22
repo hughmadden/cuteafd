@@ -207,6 +207,9 @@ pub(crate) fn consume<'a, A: PushDestination>(
                 }
                 let event = copies.events[index as usize];
                 let mut fragments = Vec::new();
+                // One batched copy per slot: a fine-grained plan (thousands of
+                // small fragments a slot) must not pay a copy call per fragment.
+                let (mut dsts, mut srcs, mut lens) = (Vec::new(), Vec::new(), Vec::new());
                 let mut source = 0;
                 for (offset, bytes) in slot::Fragments::new(data, parsed) {
                     let bytes = bytes as usize;
@@ -217,17 +220,9 @@ pub(crate) fn consume<'a, A: PushDestination>(
                             .saturating_sub(usize::try_from(offset)?),
                     );
                     if device_bytes > 0 {
-                        let dst = arena.destination(usize::try_from(offset)?, device_bytes)?;
-                        let src = ring.payload(index, source, device_bytes)?;
-                        // SAFETY: checked live arena/ring, retained through event or teardown drain.
-                        device.run(|| unsafe {
-                            device.library.copy_host_buffer_h2d_async(
-                                dst,
-                                src,
-                                device_bytes,
-                                copies.stream,
-                            )
-                        })?;
+                        dsts.push(arena.destination(usize::try_from(offset)?, device_bytes)?);
+                        srcs.push(ring.payload(index, source, device_bytes)?);
+                        lens.push(device_bytes);
                         fragments.push((offset, device_bytes as u64));
                     }
                     if device_bytes < bytes {
@@ -238,6 +233,11 @@ pub(crate) fn consume<'a, A: PushDestination>(
                     }
                     source += bytes;
                 }
+                // SAFETY: checked live arena/ring views, retained through the slot's
+                // event or the teardown drain; the copies stream is non-default.
+                device.run(|| unsafe {
+                    device.library.copy_host_buffers_h2d_batch_async(&dsts, &srcs, &lens, copies.stream)
+                })?;
                 // SAFETY: event and stream belong to device and remain retained by Copies.
                 device.run(|| unsafe { device.library.cuda_event_record(event, copies.stream) })?;
                 copies.pending.push_back(Pending {
