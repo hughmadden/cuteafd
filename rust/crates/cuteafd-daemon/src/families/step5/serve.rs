@@ -104,13 +104,6 @@ fn text_media() -> cuteafd_engine::media::MediaAdmission<scheduler::Prompt, crat
         crate::shared::qwen::Encoder::Off, 16)
 }
 
-/// Whether the coordinator joins this Spark admission's push group (its
-/// format pushes, and coordinator push is not switched off for measurement).
-fn coordinator_push(admission: &SparkAdmission) -> bool {
-    admission.coordinator_pushes()
-        && std::env::var("CUTEAFD_STEP5_COORDINATOR_PUSH").as_deref() != Ok("off")
-}
-
 fn with_backend<T>(args: &ServeArgs,
     run: impl FnOnce(&Step5Backend<'_, '_>, usize) -> Result<T>) -> Result<T> {
     args.validate()?;
@@ -228,7 +221,7 @@ fn with_backend<T>(args: &ServeArgs,
     // planning error offers no coordinator ranks: the Sparks still push and the
     // coordinator fills through the mount); otherwise they load through the
     // mount while the Sparks load.
-    let push = coordinator_push(&spark_admission);
+    let push = spark_admission.coordinator_pushes();
     let mut native = None;
     let mut coordinator = None;
     let mut ranks = None;
