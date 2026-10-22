@@ -245,7 +245,9 @@ def glm_head_split_programs(g, decode_rows: int, prefill_rows: int, max_context:
 
 def mimo_programs(g, decode_rows: int, prefill_rows: int, max_context: int):
     """MiMo V2 programs, same (stem suffix, op, params, thunk) shape as ``programs``.
-    Full-attention producers and attention come in both KV record formats (BF16, int8 ``_kvint8``). qkv and the dense FFN take only the checkpoint's E4M3 weights (per-row x 128-K FP32
+    Full-attention producers and attention retain BF16 and int8 ``_kvint8``.
+    SWA additionally exports E4M3 ``_kvfp8`` with direct compact reads. QKV and
+    the dense FFN take only the checkpoint's E4M3 weights (per-row x 128-K FP32
     scales): decode rows up to ``fp8_rows`` on the GEMVs, W8A16 above; prefill W8A8
     (``fp8_rows`` nonzero) or W8A16. ``o_w8`` takes one E4M3 output weight for
     every row count, with no BF16 operand; its prefill activation precision is
