@@ -5476,8 +5476,8 @@ Ideas TJ wants kept for later; not v2 work.
 
 - raptor: 2× RTX PRO 6000 (SM120), capped at 325 W while TJ is away.
   Sparks: ostrich, dodo, emu, kiwi, rhea, moa (GB10, SM121, 121 GiB each),
-  fabric 10.55.0.1–6. Six Sparks are the pool now; TP4 stays the qualified
-  V4.1 default until a six-rank layout beats it.
+  fabric 10.55.0.1–6. Six Sparks are the pool now; V4.1 max uses all six
+  (TJ 2026-10-22), with TP4 retained as a reference layout.
 - Never build on `/mnt/scratch` (NTFS kernel bug). Build under
   `~/.cache/cuteafd/builds/<task>` and keep ds41rt's filesystem assertion.
 - Serialize WIP builds and performance runs; one model served at a time.

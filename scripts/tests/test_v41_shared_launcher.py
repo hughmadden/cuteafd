@@ -3,7 +3,7 @@
 The goldens in fixtures/v41-launch/ were recorded from run.sh's private V4.1
 path (scripts/tests/v41_launch_capture.py, before #82). Today's launcher must
 start the same coordinator and Spark containers for every V4.1 example config
-and the gate kit's v41-flash-max/min: the same options, mounts, environment,
+and the gate kit's max/min/TP4-reference cards: the same options, mounts, environment,
 image and serve command. The only differences allowed are the intended
 additions listed in INTENDED and the legacy GPU-request conversion to CDI: shared launch features that now reach V4.1 at
 their defaults, with no V4.1 code.
@@ -123,8 +123,21 @@ def test_shared_launcher_matches_the_private_v41_path(case: str, tmp_root) -> No
         coordinator = parse_run(golden["containers"][0]["argv"])
         command = coordinator["command"]
         additions = []
+        # Derived native_ownership makes TP explicit in serving argv, not in
+        # planner argv. Only user-supplied topology keys reach the planner.
+        if case in KIT_CARDS:
+            kit = json.loads((ROOT / "scripts/bench/kits/gate/matrix-gate.json").read_text())
+            entry = next(e for e in kit["entries"] if e["name"] == case)
+            config = ROOT / entry["config"]
+            overrides = entry.get("set", {})
+        else:
+            config = ROOT / "examples/configs" / f"{case}.config"
+            overrides = {}
+        explicit_topology = any(line.startswith(("SPARK_TP=", "SPARK_EP="))
+                                for line in config.read_text().splitlines()) or any(
+                                    key in overrides for key in ("SPARK_TP", "SPARK_EP"))
         for flag in ("--spark-tp", "--spark-ep", "--kv-pool-size", "--memory-reservation"):
-            if flag in command:
+            if flag in command and (flag not in ("--spark-tp", "--spark-ep") or explicit_topology):
                 additions += [flag, command[command.index(flag) + 1]]
         cache = command[command.index("--host-cache-bytes") + 1] if "--host-cache-bytes" in command else "0"
         expected[expected.index("--prefix-cache-entries") + 2:expected.index("--prefix-cache-entries") + 2] = ["--host-cache-bytes", cache]
