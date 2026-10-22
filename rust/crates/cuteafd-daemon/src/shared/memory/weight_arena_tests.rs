@@ -25,7 +25,7 @@ impl<'a> FileWalk<'a> {
     }
     // Merge all entry cursors by file offset, including replicated rotations.
     // Adjacent destination runs combine before touching the coverage tree.
-    fn batch(&mut self, coverage: &mut Coverage) -> Result<bool> {
+    fn batch(&mut self, expected: &ExpectedCoverage, coverage: &mut Coverage) -> Result<bool> {
         let mut remaining = 4 * 1024 * 1024u64;
         let mut pending: Option<(u64, u64)> = None;
         while remaining > 0 {
@@ -39,7 +39,7 @@ impl<'a> FileWalk<'a> {
                     Some((start, len)) if *start + *len == destination => *len += bytes,
                     _ => {
                         if let Some((start, len)) = pending.take() {
-                            coverage.insert(start, len)?;
+                            expected.record(coverage, start, len)?;
                         }
                         pending = Some((destination, bytes));
                     }
@@ -50,7 +50,7 @@ impl<'a> FileWalk<'a> {
             }
         }
         if let Some((start, len)) = pending {
-            coverage.insert(start, len)?;
+            expected.record(coverage, start, len)?;
         }
         Ok(!self.heads.is_empty())
     }
@@ -107,7 +107,9 @@ fn full_exl3_plan(variable: &str) -> Result<()> {
     Ok(())
 }
 
-fn simulate(
+/// Deliver a rank's plan from six then eight interleaved sources in file
+/// order plus one whole-file replay; returns the peak coverage intervals.
+pub(crate) fn simulate(
     plan: &cuteafd_loader::push_load::builder::CheckedPlan,
     rank: usize,
     label: &str,
@@ -128,20 +130,19 @@ fn simulate(
         while queues.iter().any(|q| !q.is_empty()) {
             for queue in &mut queues {
                 if let Some(file) = queue.front_mut() {
-                    if !file.batch(&mut coverage)? {
+                    if !file.batch(&expected, &mut coverage)? {
                         queue.pop_front();
                     }
                 }
             }
         }
-        assert_eq!(coverage.intervals, expected.0.intervals);
-        assert_eq!(coverage.bytes, expected.0.bytes);
+        assert!(expected.complete(&coverage));
         let before = coverage.bytes;
         let mut replay = FileWalk::new(
             files.first_key_value().unwrap().1.clone(),
             &plan.plan.patterns,
         );
-        while replay.batch(&mut coverage)? {}
+        while replay.batch(&expected, &mut coverage)? {}
         assert_eq!(coverage.bytes, before);
         peak = peak.max(coverage.peak);
         eprintln!("{label} TP6 rank{rank}, {sources} sources + file replay: peak {} intervals, conservative tree bound {} bytes", coverage.peak, coverage.peak*128);

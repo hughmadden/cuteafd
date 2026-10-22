@@ -19,3 +19,6 @@ mod swa;
 mod scratch;
 mod transaction;
 mod weights;
+#[cfg(test)]
+#[path = "coordinator_golden_tests.rs"]
+mod coordinator_golden_tests;

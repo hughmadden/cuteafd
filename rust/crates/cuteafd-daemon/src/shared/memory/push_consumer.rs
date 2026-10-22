@@ -50,12 +50,19 @@ impl<'a> PushDestination for LoadingArena<'a> {
 
 pub(crate) trait RankEvents {
     fn next(&self) -> std::io::Result<Event>;
+    /// The group's first event: no hub event (not even Progress) precedes the
+    /// group's start, which waits for every rank to join.
+    fn first(&self) -> std::io::Result<Event> { self.next() }
     fn try_next(&self) -> std::io::Result<Poll>;
     fn release(&self, slot: u32) -> std::io::Result<()>;
 }
 impl RankEvents for PushRank {
     fn next(&self) -> std::io::Result<Event> {
         self.next()
+    }
+    fn first(&self) -> std::io::Result<Event> {
+        use cuteafd_loader::push_load::{PUSH_IDLE_TIMEOUT, PUSH_START_TIMEOUT};
+        self.first(PUSH_START_TIMEOUT, PUSH_IDLE_TIMEOUT)
     }
     fn try_next(&self) -> std::io::Result<Poll> {
         self.try_next()
@@ -149,12 +156,25 @@ pub(crate) fn consume<'a, A: PushDestination>(
     );
     ensure!(arena.belongs_to(device), "push arena device mismatch");
     let mut copies = Copies::new(device)?;
+    // What this rank received, for the cause of any failure below.
+    let joined = std::time::Instant::now();
+    let (mut slots, mut payload, mut last) = (0u64, 0u64, None::<std::time::Instant>);
+    let delivered = |slots: u64, payload: u64, last: Option<std::time::Instant>| match last {
+        Some(at) => format!("after {slots} slots ({payload} B) delivered; last event {:.1} s ago, \
+            {:.1} s after join", at.elapsed().as_secs_f64(), (at - joined).as_secs_f64()),
+        None => format!("with nothing delivered {:.1} s after join", joined.elapsed().as_secs_f64()),
+    };
     let mut done = false;
+    let mut started = false;
+    let looped = (|| -> Result<()> {
     while !done {
         if copies.pending.len() == window {
             copies.complete(&mut arena, &rank)?;
         }
-        let event = if copies.pending.is_empty() {
+        let event = if !started {
+            started = true;
+            rank.first()?
+        } else if copies.pending.is_empty() {
             rank.next()?
         } else {
             match rank.try_next()? {
@@ -166,6 +186,8 @@ pub(crate) fn consume<'a, A: PushDestination>(
                 Poll::Closed => anyhow::bail!("push closed before Done"),
             }
         };
+        last = Some(std::time::Instant::now());
+        if let Event::Filled { len, .. } = &event { slots += 1; payload += u64::from(*len); }
         match event {
             Event::Progress { .. } => {}
             Event::Done => done = true,
@@ -230,6 +252,9 @@ pub(crate) fn consume<'a, A: PushDestination>(
     while !copies.pending.is_empty() {
         copies.complete(&mut arena, &rank)?;
     }
+    Ok(())
+    })();
+    looped.map_err(|error| error.context(delivered(slots, payload, last)))?;
     drop(copies);
     ensure!(
         !device.library.is_quarantined_after_failed_drain(),
@@ -237,5 +262,5 @@ pub(crate) fn consume<'a, A: PushDestination>(
     );
     drop(rank);
     drop(ring);
-    arena.done()
+    arena.done().map_err(|error| error.context(delivered(slots, payload, last)))
 }

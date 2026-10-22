@@ -26,6 +26,7 @@ mod engram;
 pub mod prefix;
 pub mod serving_capacity;
 pub mod thermal;
+pub mod push_outcome;
 pub mod memory_layout;
 pub mod media;
 pub use media::{AudioKey, ImageKey, MediaKey, MediaSpan};

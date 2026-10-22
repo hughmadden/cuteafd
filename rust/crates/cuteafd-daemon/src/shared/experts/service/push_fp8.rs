@@ -78,11 +78,11 @@ pub(super) fn load<'a>(
         Ok((plan, checked, offer))
     })();
     if let Err(error) = &planned {
-        tracing::info!(%error, "Spark native push unavailable; offering mount");
+        tracing::warn!(%error, "Spark native push unavailable; offering mount");
     }
-    let credentials = push::offer(
+    let credentials = push::offer_with(
         stream,
-        planned.as_ref().ok().map(|(_, _, offer)| offer.clone()),
+        planned.as_ref().map(|(_, _, offer)| offer.clone()).map_err(|error| format!("{error:#}")),
     )?;
     let Some((group, token)) = credentials else {
         return Ok(None);
@@ -120,9 +120,11 @@ fn receive<'a>(
         "Spark native push rank joining load group"
     );
     let joined = (|| -> Result<_> {
+        let started = std::time::Instant::now();
         let expected = ExpectedCoverage::from_plan(checked, u32::try_from(rank_id)?)?;
         let arena = LoadingArena::new(device, plan.layout.clone(), expected)?;
         let ring = RegisteredRing::new(library, DEFAULT_SLOTS, DEFAULT_SLOT_BYTES)?;
+        let allocated = started.elapsed();
         let rank = client.join(JoinArgs {
             group,
             token,
@@ -131,9 +133,11 @@ fn receive<'a>(
             slots: u32::try_from(ring.slots())?,
             slot_bytes: u32::try_from(ring.slot_bytes())?,
         })?;
+        tracing::info!(group, rank = rank_id, arena_ms = allocated.as_millis() as u64,
+            join_ms = (started.elapsed() - allocated).as_millis() as u64, "Spark native push rank joined");
         Ok((arena, ring, rank))
     })();
-    push::joined(stream, joined.is_ok())?;
+    push::joined_with(stream, joined.as_ref().map(|_| ()).map_err(|error| format!("{error:#}")))?;
     let candidate = joined.and_then(|(arena, ring, rank)| {
         let delivered = push_consumer::consume(device, arena, ring, rank, DEFAULT_SLOTS)?;
         let initializers = plan
@@ -177,9 +181,9 @@ fn receive<'a>(
             .collect::<Result<Vec<_>>>()
     });
     if let Err(error) = &candidate {
-        tracing::info!(group, rank = rank_id, %error, "Spark native push candidate rejected");
+        tracing::warn!(group, rank = rank_id, %error, "Spark native push candidate rejected");
     }
-    if push::completed(stream, candidate.is_ok())? {
+    if push::completed_with(stream, candidate.as_ref().map(|_| ()).map_err(|error| format!("{error:#}")))? {
         let layers = candidate?;
         tracing::info!(
             group,
