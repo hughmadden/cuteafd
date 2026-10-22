@@ -536,9 +536,14 @@ def test_glmf_selection_starts_after_solve_and_seals_before_opening_lanes() -> N
     # Admitted TP2 expert weights land inside the Spark admission window;
     # execution binds after the engine exists and before step workspaces.
     window = body.split("load_while_admitting(admission,", 1)[1].split("probe(\"target-weights\")", 1)[0]
-    assert "tp2_weights(pushed)?" in window and "push.receive_with(devices, catalog, sparks, Some(dense)" in window
-    # A planning failure declines the group; a group fallback fills the same records through the mount.
-    assert "Err(error) => (None, Err(error))" in window and "dense::fill_by_mount(" in window
+    assert "tp2_weights(pushed)?" in window and "push.receive_with(devices, catalog, sparks, Some(Ok(dense))" in window
+    # Dense records are planned before membership: a planning error offers no
+    # coordinator ranks (the Sparks still push); a group fallback after
+    # membership fills the same records through the mount.
+    planning = body.split("let ranks = if admission.coordinator_pushes()", 1)[1].split("admission.start_with(&peers, ranks)?", 1)[0]
+    assert "planning.model(&self.cfg, &execution)?" in planning and "dense::plan_ranks(" in planning
+    assert "coordinator push unavailable; mount" in planning
+    assert "dense::fill_by_mount(" in window
     assert body.index("engine::GlmfEngine::new(") < body.index("tp2.execution()?") < body.index("engine.install_tp2(ranks)?")
     assert body.index("engine.install_tp2(ranks)?") < body.index("engine.install_workspaces(workspaces)?")
     admission = source[source.index("    fn admit("):source.index("    pub fn with_engine<")]
