@@ -902,3 +902,11 @@ mod replay_tests {
         Ok(())
     }
 }
+
+#[cfg(test)]
+impl WindowWeights<'_> {
+    pub(crate) fn visit(&self, prefix: &str, f: &mut dyn FnMut(String, cuteafd_ffi::CuteafdDeviceBuffer)) {
+        self.tensors.visit(prefix, f);
+        f(format!("{prefix}packed_scale"), self.scales.buffer);
+    }
+}

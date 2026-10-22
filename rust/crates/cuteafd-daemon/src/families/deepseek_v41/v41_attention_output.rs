@@ -683,3 +683,12 @@ mod tp2_tests {
         Ok(())
     }
 }
+
+#[cfg(test)]
+impl AttentionOutputWeights<'_> {
+    pub(crate) fn visit(&self, prefix: &str, f: &mut dyn FnMut(String, cuteafd_ffi::CuteafdDeviceBuffer)) {
+        self.tensors.visit(prefix, f);
+        f(format!("{prefix}grouped_scale"), self.grouped_scales.buffer);
+        if let Some(s) = &self.scales { f(format!("{prefix}packed_scale"), s.buffer); }
+    }
+}

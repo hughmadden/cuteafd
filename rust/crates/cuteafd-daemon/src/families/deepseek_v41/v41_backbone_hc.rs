@@ -87,3 +87,10 @@ impl<'a> BackboneHcWeights<'a> {
         )
     }
 }
+
+#[cfg(test)]
+impl BackboneHcWeights<'_> {
+    pub(crate) fn visit(&self, prefix: &str, f: &mut dyn FnMut(String, cuteafd_ffi::CuteafdDeviceBuffer)) {
+        self.tensors.visit(prefix, f);
+    }
+}

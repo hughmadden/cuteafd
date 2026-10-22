@@ -1100,3 +1100,14 @@ mod tests {
         assert!(output_bytes(ExpertGeometry::DEEPSEEK_V4_PRO, usize::MAX).is_err());
     }
 }
+
+#[cfg(test)]
+impl NativeTp2Weights<'_> {
+    pub(crate) fn visit(&self, f: &mut dyn FnMut(String, cuteafd_ffi::CuteafdDeviceBuffer)) {
+        for (layer, w) in self.layers.iter().zip(self.weights.iter()) {
+            for (plane, b) in w.buffers.iter().enumerate() {
+                f(format!("gpu{}.tp2.layers.{layer}.plane{plane}", self.device.id), b.buffer);
+            }
+        }
+    }
+}

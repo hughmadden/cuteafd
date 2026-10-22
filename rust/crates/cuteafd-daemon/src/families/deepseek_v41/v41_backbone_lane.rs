@@ -1188,3 +1188,17 @@ mod tests {
         Ok(())
     }
 }
+
+#[cfg(test)]
+impl BackboneLaneWeights<'_> {
+    pub(crate) fn visit(&self, f: &mut dyn FnMut(String, cuteafd_ffi::CuteafdDeviceBuffer)) {
+        for (layer, w) in self.layers.iter().enumerate() {
+            let p = |part: &str| format!("gpu{}.layers.{layer}.{part}.", w.device.id);
+            w.hc.visit(&p("hc"), f);
+            w.query.visit(&p("query"), f);
+            w.projection.visit(&p("output"), f);
+            if let Some(shared) = &w.shared { shared.visit(&p("shared"), f); }
+            w.router.visit(&p("router"), f);
+        }
+    }
+}

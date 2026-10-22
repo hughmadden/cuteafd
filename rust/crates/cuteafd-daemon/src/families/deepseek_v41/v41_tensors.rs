@@ -218,3 +218,19 @@ impl<'library> VocabularyHead<'library> {
     pub fn device_id(&self) -> i32 { self.shard.device_id() }
     pub fn fp8(&self) -> Option<&crate::shared::fp8_linear::Fp8Weight<'library>> { self.shard.fp8() }
 }
+
+#[cfg(test)]
+impl NativeRtxTensors<'_> {
+    /// Every resident tensor (golden digests).
+    pub(crate) fn visit(&self, prefix: &str, f: &mut dyn FnMut(String, cuteafd_ffi::CuteafdDeviceBuffer)) {
+        for (name, allocation) in &self.tensors { f(format!("{prefix}{name}"), allocation.buffer); }
+        if let Some((_, alias)) = &self.mapped_embedding { f(format!("{prefix}embed.weight"), *alias); }
+    }
+}
+
+#[cfg(test)]
+impl VocabularyHead<'_> {
+    pub(crate) fn visit(&self, prefix: &str, f: &mut dyn FnMut(String, cuteafd_ffi::CuteafdDeviceBuffer)) {
+        self.shard.visit(prefix, f);
+    }
+}

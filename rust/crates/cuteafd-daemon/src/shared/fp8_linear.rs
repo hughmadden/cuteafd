@@ -197,3 +197,11 @@ mod rows_tests {
         assert_eq!(Fp8Rows::default(), Fp8Rows::W8a16);
     }
 }
+
+#[cfg(test)]
+impl Fp8Weight<'_> {
+    pub(crate) fn visit(&self, prefix: &str, f: &mut dyn FnMut(String, cuteafd_ffi::CuteafdDeviceBuffer)) {
+        f(format!("{prefix}packed"), self.packed.buffer);
+        f(format!("{prefix}scale"), self.scale.buffer);
+    }
+}

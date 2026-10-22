@@ -126,3 +126,11 @@ mod tests {
         Ok(())
     }
 }
+
+#[cfg(test)]
+impl VocabularyShard<'_> {
+    pub(crate) fn visit(&self, prefix: &str, f: &mut dyn FnMut(String, cuteafd_ffi::CuteafdDeviceBuffer)) {
+        if let Some(a) = &self.allocation { f(format!("{prefix}bf16"), a.buffer); }
+        if let Some(w) = &self.fp8 { w.visit(&format!("{prefix}fp8."), f); }
+    }
+}

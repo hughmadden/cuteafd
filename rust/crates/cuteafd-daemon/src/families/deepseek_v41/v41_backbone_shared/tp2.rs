@@ -294,3 +294,14 @@ mod tests {
         Ok(())
     }
 }
+
+#[cfg(test)]
+impl Weights<'_> {
+    pub(crate) fn visit(&self, f: &mut dyn FnMut(String, cuteafd_ffi::CuteafdDeviceBuffer)) {
+        for (name, m) in ["w1", "w3", "w2"].iter().zip(&self.matrices) {
+            let p = format!("gpu{}.shared_tp2.layers.{}.{name}.", self.device.id, self.layer);
+            f(format!("{p}weight"), m.weight.buffer);
+            f(format!("{p}packed_scale"), m.scales.buffer);
+        }
+    }
+}

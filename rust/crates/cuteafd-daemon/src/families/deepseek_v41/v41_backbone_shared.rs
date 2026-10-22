@@ -384,3 +384,11 @@ impl Drop for BackboneSharedWave<'_, '_> {
         }
     }
 }
+
+#[cfg(test)]
+impl BackboneSharedWeights<'_> {
+    pub(crate) fn visit(&self, prefix: &str, f: &mut dyn FnMut(String, cuteafd_ffi::CuteafdDeviceBuffer)) {
+        self.tensors.visit(prefix, f);
+        for (i, s) in self.scales.iter().enumerate() { f(format!("{prefix}packed_scale{i}"), s.buffer); }
+    }
+}

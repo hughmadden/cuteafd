@@ -895,3 +895,10 @@ impl RouterOutput<'_> {
         Ok(BoundExpertRequest { request, binding })
     }
 }
+
+#[cfg(test)]
+impl BackboneRouterWeights<'_> {
+    pub(crate) fn visit(&self, prefix: &str, f: &mut dyn FnMut(String, cuteafd_ffi::CuteafdDeviceBuffer)) {
+        self.tensors.visit(prefix, f);
+    }
+}
