@@ -58,21 +58,19 @@ but bounded engineering still goes to Sol.
 | Important design/planning, front-end design | Claude Fable | default; extremely rarely |
 | Everything else exhausted | MiMo | default |
 
-- **Judgment calls and shared tooling go to Claude (TJ, 2026-10-13).** Use Opus agents for important judgment calls, and Opus or Sonnet for shared build-system work done in response to another agent's tooling request: every agent depends on that tooling, so a mistake there costs everyone. Sol `-backup` stays the default for everything else.
-- **Astra for hard kernels (TJ, 2026-10-13):** Astra `high` is good for kernel and optimization concepts and can code those kernels itself. Don't spend it on simple kernels or on probes, harnesses and integration, which Sol does. Astra burned a backup week mostly on probe plumbing in one investigation.
+- **Judgment calls and shared tooling go to Claude (TJ, 2026-10-13).** Use Opus agents for important judgment calls, and Opus or Sonnet for shared build-system work done in response to another agent's tooling request: every agent depends on that tooling, so a mistake there costs everyone. Sol stays the default for everything else.
+- **Astra for hard kernels (TJ, 2026-10-13):** Astra `high` is good for kernel and optimization concepts and can code those kernels itself. Don't spend it on simple kernels or on probes, harnesses and integration, which Sol does. Astra once burned a subscription week mostly on probe plumbing in one investigation.
 - **Rotate models on repeated kernel ideas (TJ, 2026-10-13):** when a kernel or optimization idea needs several iterations, don't give every round to the same model. Rotate the strong models (Astra `high`, Opus, Fable, Sol `xhigh`), each taking a turn with the previous rounds' results and measurements, and pick who goes first at random. Different smart friends see different things. One round per model per turn, then the measured result goes to the next.
 - **Fable is rare.** It costs far more per task; use it at a critical minimum (TJ, 2026-10-05). Opus 5.5 and Sol 6.1 are strong, and in some ways better, so default to them for hard problems.
-- **Codex subscriptions:** start new agents on the `-backup` models (TJ's
-  second subscription); when backup hits its weekly limit, start new agents
-  on primary. TJ can reset backup's usage; after a reset, new agents go
-  back to backup while running agents stay where they are (don't cancel
-  them to move them). Astra burns budget faster than Sol but less
-  than Fable.
+- **Codex subscription:** there is one Codex subscription (TJ cancelled the
+  backup one, 2026-10-22). Start agents on the plain `claude/chatgpt/...`
+  models; the `-backup` model names no longer authenticate. Astra burns
+  budget faster than Sol but less than Fable.
 - **Read the error body, not the headline.** The gateway prints "Server is
   temporarily limiting requests (not your usage limit)" for both cases. A
   body with `usage_limit_reached` and `resets_in_seconds` in days is the
-  subscription's weekly limit: every agent on that subscription stops at
-  its next call. Relaunch each on the other subscription as a fresh agent
+  subscription's weekly limit: every Codex agent stops at its next call.
+  Relaunch each on another model (Opus, DeepSeek) as a fresh agent
   with a resume note pointing at its PR (`pr-sync pull` restores STATUS.md;
   its background jobs keep running and must not be duplicated). Keep a shared
   `codex-runs/resume-note.md` for this.
@@ -84,8 +82,8 @@ but bounded engineering still goes to Sol.
 - **Capacity vs limit:** "Selected model is at capacity" (or a similar
   overload error) is the provider being busy, not our quota. Retry after a
   few minutes; pushed commits survive, so resume with a note. A usage-limit
-  error means switch subscription (backup ↔ primary) or model.
-- **Budget pacing:** a backup subscription's week lasted a few hours with six Sol `xhigh`/`high` agents plus Astra `high` in parallel. Keep about three `xhigh` agents at once, default to `high`, and don't let an agent spawn sub-agents at `xhigh` without reason.
+  error means switch model.
+- **Budget pacing:** a Codex subscription's week lasted a few hours with six Sol `xhigh`/`high` agents plus Astra `high` in parallel. Keep about three `xhigh` agents at once, default to `high`, and don't let an agent spawn sub-agents at `xhigh` without reason.
 - **Parallelism:** run several Sol agents at once on independent tasks
   (separate branches and worktrees, disjoint hardware); serialize only what
   shares a GPU or build cache. Queue Codex work early, it is slower per task
@@ -195,7 +193,7 @@ tool returns at once and a completion notification wakes the orchestrator):
 
 ```text
 Agent(subagent_type="general-purpose",
-      model="claude/chatgpt/gpt-6.1-sol-backup",   # see table below
+      model="claude/chatgpt/gpt-6.1-sol",   # see table below
       effort="high",                               # per-launch reasoning effort
       description="<3-5 words>",
       prompt="Read and follow scripts/agents/codex-preamble.md. <brief>")
@@ -203,8 +201,8 @@ Agent(subagent_type="general-purpose",
 
 | Model id | Use |
 |---|---|
-| `claude/chatgpt/gpt-6.1-sol-backup`, `claude/chatgpt/gpt-6.1-sol` | Sol 6.1 (backup first); effort `high`/`xhigh` |
-| `claude/chatgpt/gpt-6-astra-backup`, `claude/chatgpt/gpt-6-astra` | Astra 6; effort `medium`/`high` |
+| `claude/chatgpt/gpt-6.1-sol` | Sol 6.1; effort `high`/`xhigh` |
+| `claude/chatgpt/gpt-6-astra` | Astra 6; effort `medium`/`high` |
 | `claude/deepseek/deepseek-flash` | DeepSeek 4.1 Flash; effort `high`/`max` |
 | `opus`, `fable` | Claude subagents |
 | `claude/xiaomi/mimo-v2.6-pro` | last resort; no graded effort |
@@ -275,7 +273,7 @@ orchestrator's to use; TJ isn't using these subscriptions.
 
 | CLI | Model | Launch flags | Expected strengths |
 |---|---|---|---|
-| `grok` (X Premium+) | `grok-4.7` (default), `grok-4.7-build-fast` | `--always-approve`, `--prompt-file`, `--reasoning-effort` | mechanical work; a fallback when Codex is down or out of quota (the backup Codex subscription expires in a few weeks) |
+| `grok` (X Premium+) | `grok-4.7` (default), `grok-4.7-build-fast` | `--always-approve`, `--prompt-file`, `--reasoning-effort` | mechanical work; a fallback when Codex is down or out of quota |
 | `agy` (Google Antigravity) | `gemini-4-argon-high`/`-medium`/`-low`, `gemini-3.8-flash-*` | `--dangerously-skip-permissions`, `-p`, `--effort`, `--add-dir` | second opinions on hard kernel and technical problems, vision, deep research and search |
 
 Use the interactive stdlib driver for a worker that needs steering or answers:
@@ -446,4 +444,4 @@ duplicating it. Record the lesson in the table below.
 | Orchestrator's `git commit -a` in its own worktree swept a sub-agent's uncommitted edits (the harness had placed the agent there) into a pushed commit | Orchestrator merges and commits in a dedicated throwaway worktree, stages files by name, and checks `git status` first; agent briefs name an explicit worktree outside `.claude/` |
 | "Model at capacity" ended a run | Retry after a few minutes; resume with a note |
 | ~2,700 hand-written driver scripts; most of one day's failures came from them (wrong container prefix, stale markers, dropped trace, missing --interleave) | The preamble's two commands; wip-cards preflights before queuing, `--resume` replaces retries, and agents ask for tooling instead of writing drivers |
-| Backup subscription hit its weekly limit; 6 agents stopped at once | Read `usage_limit_reached`; relaunch on the other subscription from STATUS.md |
+| Codex subscription hit its weekly limit; 6 agents stopped at once | Read `usage_limit_reached`; relaunch on another model from STATUS.md |
