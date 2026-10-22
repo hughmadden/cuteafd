@@ -13,7 +13,7 @@ import subprocess
 import time
 import uuid
 
-from allocatable_memory import host_allocatable_memory
+from allocatable_memory import cgroup_allocatable_bytes, host_allocatable_memory
 
 
 GB10_EXPORT_JOBS = 8  # each worker holds a CUDA context plus ~4 GiB; GB10 has 121 GiB unified
@@ -76,6 +76,23 @@ def memory_pressure() -> float:
     except (OSError, ValueError, KeyError):
         pass
     return 0.0
+
+
+def context_free_memory() -> int:
+    """Driver context creation cannot rely on GB10 reclaiming file cache in time.
+
+    This is deliberately stricter than serving/weight admission: keep their
+    MemAvailable policy, but bound new export contexts by MemFree and cgroups.
+    """
+    if not _gb10_host():
+        return host_allocatable_memory()
+    values = [line.split()[1:] for line in Path('/proc/meminfo').read_text().splitlines()
+              if line.startswith('MemFree:')]
+    if (len(values) != 1 or len(values[0]) != 2 or values[0][1] != 'kB'
+            or not values[0][0].isascii() or not values[0][0].isdigit()):
+        raise ValueError('export context admission requires valid MemFree')
+    return cgroup_allocatable_bytes(int(values[0][0]) * 1024,
+                                    Path('/proc/self/cgroup').read_text())
 
 
 def live_cuda_processes() -> str:
@@ -236,8 +253,9 @@ def _admit_locked(root, per_worker, count, spacing):
                     parked += 1
                 else:
                     leased += 1
-    # Reserve before CUDA initialization, using cgroup-bounded OS headroom.
-    available = host_allocatable_memory() // (1024 * 1024)
+    # Reserve before CUDA initialization; GB10 context buffers need free pages,
+    # not page cache that a simultaneous context burst may fail to reclaim.
+    available = context_free_memory() // (1024 * 1024)
     baseline_path = root / 'context-baseline.json'
     if reserved == 0:
         baseline_path.write_text(json.dumps({'available': available}))

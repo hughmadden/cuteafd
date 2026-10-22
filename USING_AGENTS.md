@@ -325,6 +325,21 @@ external agent never merges, and never pushes to work/p0 or the fork's master.
 Compact the scorecard log into its summary table every ~10 entries, and
 update this section's table as the picture firms up.
 
+## Gate execution
+
+The agent Bash tool can evaluate commands in a non-final `&&` operand, where
+Bash ignores inline `set -e`. Never run a multi-step gate as an inline
+`set -e; build; tests; echo PASS` command. Invoke the standalone entry point
+(`scripts/dev/cpu-gate`, or `bash path/to/gate.sh`), or explicitly chain every
+required step with `&&` / `|| exit 1`. Do not source a gate or call its shell
+function from an `if`/`&&` condition: that also suppresses errexit.
+
+The canonical CPU gate requires Cargo's JSON `build-finished.success` before
+running tests, then parses test-result failure counts (or nextest's JUnit
+report). Missing/empty reports, timeouts and moved HEADs fail closed, including
+with `--base`. Report failing test IDs, not merely exit codes or counts. Commit
+before starting the gate; never move HEAD during it.
+
 ## Running agents
 
 - Workers update current state with `scripts/dev/pr-sync push` at checkpoints

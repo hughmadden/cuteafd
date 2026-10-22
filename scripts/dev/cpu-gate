@@ -254,6 +254,24 @@ def nextest_for(env):
     return str(persistent) if persistent.is_file() and os.access(persistent, os.X_OK) else None
 
 
+def cargo_build_succeeded(path):
+    """Require Cargo's completion event even if an enclosing shell masks its exit."""
+    finished = []
+    errors = False
+    for line in path.read_text(errors='replace').splitlines():
+        try:
+            event = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(event, dict):
+            continue
+        if event.get('reason') == 'build-finished':
+            finished.append(event.get('success'))
+        if event.get('reason') == 'compiler-message':
+            errors |= event.get('message', {}).get('level') == 'error'
+    return finished == [True] and not errors
+
+
 def cargo(source, root, args, env):
     target = root / 'target-cpu-gate'
     checked([sys.executable, str(source / 'scripts/build/assert-build-filesystem.py'), str(target)])
@@ -264,11 +282,13 @@ def cargo(source, root, args, env):
     log('cargo: compiling tests (build slot held while compiling)')
     build_log = root / 'logs/cargo-build.log'
     code, build_s = run_logged(['nice', '-n', '19', str(source / 'scripts/build/build-slot.sh'), 'cargo', 'test', '--workspace', '--locked',
-                                '--no-run'], build_log, env, source / 'rust', args.cargo_build_timeout)
-    result = dict(suite='cargo', build_exit=code, build_s=round(build_s), build_log=str(build_log))
-    if code:
+                                '--no-run', '--message-format=json-render-diagnostics'], build_log, env, source / 'rust', args.cargo_build_timeout)
+    complete = cargo_build_succeeded(build_log)
+    result = dict(suite='cargo', build_exit=code, build_complete=complete, build_s=round(build_s), build_log=str(build_log))
+    if code or not complete:
         tail = [line for line in build_log.read_text(errors='replace').splitlines() if line.startswith('error')][:5]
-        return {**result, 'status': 'failed', 'error': 'compile failed: ' + ('; '.join(tail) or f'exit {code}')}
+        return {**result, 'status': 'failed', 'error': 'compile failed: ' + ('; '.join(tail) or
+                f'exit {code}; missing or unsuccessful build-finished event')}
     skips = []
     if args.skip_live_planners:
         for name in LIVE_PLANNERS:
@@ -373,10 +393,10 @@ def benches(source, root, args, env):
         log(f'benches: compiling {crate}/{test} (release, build slot held while compiling)')
         build_log = root / f'logs/bench-{test}-build.log'
         code, seconds = run_logged([str(source / 'scripts/build/build-slot.sh'), 'cargo', 'test', '--release', '--locked',
-                                    '-p', crate, '--test', test, '--no-run'], build_log, env, source / 'rust',
+                                    '-p', crate, '--test', test, '--no-run', '--message-format=json-render-diagnostics'], build_log, env, source / 'rust',
                                    args.cargo_build_timeout)
         build_s += seconds
-        if code:
+        if code or not cargo_build_succeeded(build_log):
             result['failed'] += 1
             result['failing'].append(test)
             result.setdefault('errors', []).append(f'{test}: compile exit {code}')
@@ -542,8 +562,18 @@ def run_gate(args, root):
         for suite in record['suites']:
             before = next((s for s in record['base']['suites'] if s['suite'] == suite['suite']), {})
             record['new_failing'][suite['suite']] = sorted(set(suite.get('failing', [])) - set(before.get('failing', [])))
-        ran = all(s.get('passed', 0) > 0 for s in record['suites'])
-        record['verdict'] = 'pass' if ran and not any(record['new_failing'].values()) else 'failed'
+        # A shared named test failure may be tolerated; a timeout, moved HEAD,
+        # missing build/report, or unexplained failure must never become green
+        # just because both failing-id sets happen to be empty.
+        comparable = all(not side.get('moved') and all(
+            suite.get('passed', 0) > 0 and (suite['status'] == 'pass' or (
+                suite.get('failed', 0) > 0
+                and suite['failed'] == len(suite.get('failing', []))
+                and suite.get('exit', 0) != 124
+                and suite.get('build_exit', 0) == 0
+                and suite.get('build_complete', True)))
+            for suite in side['suites']) for side in (record, record['base']))
+        record['verdict'] = 'pass' if comparable and not any(record['new_failing'].values()) else 'failed'
     else:
         record['verdict'] = record['status']
     (root / 'cpu-gate.json').write_text(json.dumps(record, indent=2) + '\n')
