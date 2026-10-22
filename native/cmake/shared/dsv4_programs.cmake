@@ -10,7 +10,7 @@
 # (the Spark expert build) its routed serving programs alone.
 set(CUTEAFD_FAMILY_PROGRAMS OFF)
 if(CUTEAFD_ENABLE_DSV4_AOT OR CUTEAFD_ENABLE_GLM_AOT OR CUTEAFD_ENABLE_MIMO_AOT OR CUTEAFD_ENABLE_GLMF_AOT OR
-   CUTEAFD_ENABLE_QWEN4_AOT OR CUTEAFD_ENABLE_QWEN_DENSE_AOT OR CUTEAFD_ENABLE_STEP5_AOT OR CUTEAFD_ENABLE_KIMIK3_AOT OR CUTEAFD_ENABLE_KIMIK6_AOT)
+   CUTEAFD_ENABLE_QWEN4_AOT OR CUTEAFD_ENABLE_QWEN_DENSE_AOT OR CUTEAFD_ENABLE_STEP5_AOT OR CUTEAFD_ENABLE_KIMIK3_AOT)
   set(CUTEAFD_FAMILY_PROGRAMS ON)
 endif()
 if(CUTEAFD_CUDA_ARCHITECTURES MATCHES "^120")
@@ -72,17 +72,12 @@ if(CUTEAFD_ENABLE_STEP5_AOT)
   endif()
 endif()
 if(CUTEAFD_ENABLE_KIMIK3_AOT)
+  # Kimi always packages the native K6 core programs; the runtime selects them
+  # from the checkpoint's own headers.
   if(CUTEAFD_PROGRAM_GEOMETRY STREQUAL "")
-    set(CUTEAFD_PROGRAM_GEOMETRY "kimik3")
+    set(CUTEAFD_PROGRAM_GEOMETRY "kimik3,kimi_k6_dense,kimi_split")
   else()
-    set(CUTEAFD_PROGRAM_GEOMETRY "${CUTEAFD_PROGRAM_GEOMETRY},kimik3")
-  endif()
-endif()
-if(CUTEAFD_ENABLE_KIMIK6_AOT)
-  if(CUTEAFD_PROGRAM_GEOMETRY STREQUAL "")
-    set(CUTEAFD_PROGRAM_GEOMETRY "kimi_k6_dense,kimi_split")
-  else()
-    set(CUTEAFD_PROGRAM_GEOMETRY "${CUTEAFD_PROGRAM_GEOMETRY},kimi_k6_dense,kimi_split")
+    set(CUTEAFD_PROGRAM_GEOMETRY "${CUTEAFD_PROGRAM_GEOMETRY},kimik3,kimi_k6_dense,kimi_split")
   endif()
 endif()
 if(CUTEAFD_ENABLE_EXLR8_AOT)
@@ -111,12 +106,6 @@ file(GENERATE OUTPUT "${stamp}" CONTENT "${CUTEAFD_DSV4_EXPORT_ARGS}\n")
 # The program list lives in the exporter; objects are collected into one
 # archive so CMake need not know each stem.
 set(CUTEAFD_DSV4_ARCHIVE "${CUTEAFD_DSV4_DIR}/libcuteafd_dsv4_programs.a")
-set(CUTEAFD_KIMIK6_EXPORT_INPUTS "")
-if(CUTEAFD_ENABLE_KIMIK6_AOT)
-  list(APPEND CUTEAFD_KIMIK6_EXPORT_INPUTS
-    "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/aot/export_b12x_kimi_k6_dense_aot.py"
-    "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/aot/export_b12x_kimi_split_aot.py")
-endif()
 add_custom_command(
   OUTPUT "${CUTEAFD_DSV4_DIR}/dsv4_programs.h" "${CUTEAFD_DSV4_DIR}/dsv4_programs.json"
     "${CUTEAFD_DSV4_ARCHIVE}"
@@ -129,7 +118,9 @@ add_custom_command(
   DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/aot/export_b12x_dsv4_aot.py" "${stamp}"
     "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/aot/export_b12x_step5_aot.py"
     "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/aot/export_b12x_exlr8_aot.py"
-    ${CUTEAFD_KIMIK6_EXPORT_INPUTS} ${CUTEAFD_SPARKINFER_PROVENANCE_INPUTS} ${CUTEAFD_SPARKINFER_EXPORT_INPUTS}
+    "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/aot/export_b12x_kimi_k6_dense_aot.py"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/aot/export_b12x_kimi_split_aot.py"
+    ${CUTEAFD_SPARKINFER_PROVENANCE_INPUTS} ${CUTEAFD_SPARKINFER_EXPORT_INPUTS}
   COMMENT "Exporting coordinator programs (${CUTEAFD_PROGRAM_GEOMETRY})"
   VERBATIM)
 add_custom_target(cuteafd_dsv4_programs_export DEPENDS

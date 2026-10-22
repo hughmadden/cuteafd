@@ -194,7 +194,7 @@ def requirements(repo, matrix, scope):
         elif family == 'step5':
             programs = {'step5', 'step52'} if dual else {'step5'}
         elif family == 'kimi_k3':
-            programs = {'kimik3'}
+            programs = {'kimik3', 'kimi_k6_dense', 'kimi_split'}
         result.append(dict(name=entry['name'], family=family, programs=sorted(programs),
                            experts=sorted(experts), spark_experts=sorted(tokens(scopes['CUTEAFD_WIP_EXPERT_FAMILIES'])),
                            spark_count=count, spark_tp=tp, dual=dual,
