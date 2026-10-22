@@ -2579,7 +2579,7 @@ audio_encoder_hash=""
     [[ -z "$(get PREFIX_CACHE_MARK_MIB)" ]] || plan_draft_args+=(--prefix-cache-mark-mib "$(get PREFIX_CACHE_MARK_MIB)")
   fi
   if [[ "$family" == mimo_v2 ]]; then
-    plan_draft_args+=(--mimo-swa-kv-cache "${mimo_swa_kv:-bf16}")
+    plan_draft_args+=(--mimo-swa-kv-cache "$mimo_swa_kv")
     plan_draft_args+=(--prefix-cache-entries "$(get PREFIX_CACHE_ENTRIES 20)"
       --context-tokens "$(get MAX_CONTEXT_TOKENS "$default_context")"
       --prefill-rows 4096 --expert-input "${expert_input:-fp8}")
