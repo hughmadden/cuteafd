@@ -1,4 +1,5 @@
 #include "draft_attention.cuh"
+#include "draft_kv.cuh"
 #include <cuda_bf16.h>
 #include <math_constants.h>
 #include <mma.h>
@@ -37,7 +38,7 @@ int partition_capacity(int kv_heads, int slices, int max_keys, int sms) {
 
 // Four warps cover a 32-query x 32-key score tile. PV reuses those warps
 // for two 16-query tiles and two disjoint halves of the value dimension.
-template <int dim>
+template <int dim, bool fp8>
 __global__ void partial_kernel(const bf16* q, const bf16* k_block, const bf16* v_block,
     const bf16* k_ring, const bf16* v_ring, const int32_t* slots, const int32_t* lengths,
     const int32_t* ends, float* partial_o, float* partial_ml, int heads, int kv_heads,
@@ -90,14 +91,22 @@ __global__ void partial_kernel(const bf16* q, const bf16* k_block, const bf16* v
         const bf16 *kp, *vp;
         if (j < ctx) {
           const int position = end - ctx + j;
-          const uint64_t at = ((uint64_t(slot) * ring + position % ring) * kv_heads + kvh) * dim + d;
-          kp = k_ring + at; vp = v_ring + at;
+          const uint64_t row = uint64_t(slot) * ring + position % ring;
+          if constexpr (fp8) {
+            k4 = draft_kv::load8<dim>(k_ring, row, kvh, kv_heads, d);
+            v4 = draft_kv::load8<dim>(v_ring, row, kvh, kv_heads, d);
+          } else {
+            const uint64_t at = (row * kv_heads + kvh) * dim + d;
+            kp = k_ring + at; vp = v_ring + at;
+          }
         } else {
           const uint64_t at = ((uint64_t(sequence) * block_rows + j - ctx) * kv_heads + kvh) * dim + d;
           kp = k_block + at; vp = v_block + at;
         }
-        k4 = *reinterpret_cast<const uint4*>(kp);
-        v4 = *reinterpret_cast<const uint4*>(vp);
+        if (!fp8 || j >= ctx) {
+          k4 = *reinterpret_cast<const uint4*>(kp);
+          v4 = *reinterpret_cast<const uint4*>(vp);
+        }
       }
       *reinterpret_cast<uint4*>(&ks[key][d]) = k4;
       *reinterpret_cast<uint4*>(&vs[key][d]) = v4;
@@ -181,7 +190,7 @@ __global__ void partial_kernel(const bf16* q, const bf16* k_block, const bf16* v
 
 // The original warp-per-query scalar arithmetic wins on skinny, short-context
 // shapes. Keep its 128-key chunks, FP32 probabilities and reduction order.
-template <int dim, bool windowed, bool has_sink>
+template <int dim, bool windowed, bool has_sink, bool fp8>
 __global__ void scalar_partial_kernel(const bf16* q, const bf16* k_block, const bf16* v_block,
     const bf16* k_ring, const bf16* v_ring, const int32_t* slots, const int32_t* lengths,
     const int32_t* ends, float* partial_o, float* partial_ml, int heads, int kv_heads,
@@ -215,14 +224,22 @@ __global__ void scalar_partial_kernel(const bf16* q, const bf16* k_block, const 
         const bf16 *kp, *vp;
         if (j < ctx) {
           const int position = end - ctx + j;
-          const uint64_t at = ((uint64_t(slot) * ring + position % ring) * kv_heads + kvh) * dim + d;
-          kp = k_ring + at; vp = v_ring + at;
+          const uint64_t row = uint64_t(slot) * ring + position % ring;
+          if constexpr (fp8) {
+            k4 = draft_kv::load8<dim>(k_ring, row, kvh, kv_heads, d);
+            v4 = draft_kv::load8<dim>(v_ring, row, kvh, kv_heads, d);
+          } else {
+            const uint64_t at = (row * kv_heads + kvh) * dim + d;
+            kp = k_ring + at; vp = v_ring + at;
+          }
         } else {
           const uint64_t at = ((uint64_t(sequence) * block_rows + j - ctx) * kv_heads + kvh) * dim + d;
           kp = k_block + at; vp = v_block + at;
         }
-        k4 = *reinterpret_cast<const uint4*>(kp);
-        v4 = *reinterpret_cast<const uint4*>(vp);
+        if (!fp8 || j >= ctx) {
+          k4 = *reinterpret_cast<const uint4*>(kp);
+          v4 = *reinterpret_cast<const uint4*>(vp);
+        }
       }
       const auto* k2 = reinterpret_cast<const __nv_bfloat162*>(&k4);
 #pragma unroll
@@ -295,7 +312,7 @@ __global__ void merge_kernel(const float* partial_o, const float* partial_ml, co
   out[((uint64_t(sequence) * block_rows + row) * heads + head) * dim + d] = __float2bfloat16(value / l);
 }
 
-template <int dim>
+template <int dim, bool fp8>
 int dispatch_wmma(const void* q, const void* k_block, const void* v_block, const void* k_ring,
     const void* v_ring, const void* slots, const void* lengths, const void* ends, const void* sinks,
     void* out, void* scratch, int sequences, int block_rows, int heads, int kv_heads, int ring,
@@ -308,7 +325,7 @@ int dispatch_wmma(const void* q, const void* k_block, const void* v_block, const
   const int partitions = (tiles + tiles_per_partition - 1) / tiles_per_partition;
   auto* partial_o = static_cast<float*>(scratch);
   auto* partial_ml = partial_o + uint64_t(sequences) * kv_heads * slices * partitions * queries_per_slice * dim;
-  partial_kernel<dim><<<dim3(partitions, kv_heads * slices, sequences), threads, 0, stream>>>(
+  partial_kernel<dim, fp8><<<dim3(partitions, kv_heads * slices, sequences), threads, 0, stream>>>(
       static_cast<const bf16*>(q), static_cast<const bf16*>(k_block), static_cast<const bf16*>(v_block),
       static_cast<const bf16*>(k_ring), static_cast<const bf16*>(v_ring), static_cast<const int32_t*>(slots),
       static_cast<const int32_t*>(lengths), static_cast<const int32_t*>(ends), partial_o, partial_ml, heads,
@@ -320,7 +337,7 @@ int dispatch_wmma(const void* q, const void* k_block, const void* v_block, const
       static_cast<const bf16*>(sinks), static_cast<bf16*>(out), heads, kv_heads, block_rows, slices, partitions);
   return cudaGetLastError();
 }
-template <int dim, bool windowed, bool has_sink>
+template <int dim, bool windowed, bool has_sink, bool fp8>
 int dispatch_scalar(const void* q, const void* k_block, const void* v_block, const void* k_ring,
     const void* v_ring, const void* slots, const void* lengths, const void* ends, const void* sinks,
     void* out, void* scratch, int sequences, int block_rows, int heads, int kv_heads, int ring,
@@ -330,7 +347,7 @@ int dispatch_scalar(const void* q, const void* k_block, const void* v_block, con
   const int chunks = (max_keys + scalar_keys - 1) / scalar_keys;
   auto* partial_o = static_cast<float*>(scratch);
   auto* partial_ml = partial_o + uint64_t(sequences) * kv_heads * chunks * partial_rows * dim;
-  scalar_partial_kernel<dim, windowed, has_sink><<<dim3(chunks, kv_heads, sequences), queries * 32, 0, stream>>>(
+  scalar_partial_kernel<dim, windowed, has_sink, fp8><<<dim3(chunks, kv_heads, sequences), queries * 32, 0, stream>>>(
       static_cast<const bf16*>(q), static_cast<const bf16*>(k_block), static_cast<const bf16*>(v_block),
       static_cast<const bf16*>(k_ring), static_cast<const bf16*>(v_ring), static_cast<const int32_t*>(slots),
       static_cast<const int32_t*>(lengths), static_cast<const int32_t*>(ends), partial_o, partial_ml,
@@ -343,7 +360,7 @@ int dispatch_scalar(const void* q, const void* k_block, const void* v_block, con
   return cudaGetLastError();
 }
 
-template <int dim>
+template <int dim, bool fp8>
 int route(const void* q, const void* k_block, const void* v_block, const void* k_ring,
     const void* v_ring, const void* slots, const void* lengths, const void* ends, const void* sinks,
     void* out, void* scratch, int sequences, int block_rows, int heads, int kv_heads, int ring,
@@ -351,13 +368,13 @@ int route(const void* q, const void* k_block, const void* v_block, const void* k
   const int queries = heads / kv_heads * block_rows;
   // max_keys includes the new block; the boundary is resident context only.
   if (queries <= scalar_queries && max_keys - block_rows <= scalar_context) {
-#define SCALAR(W, S) dispatch_scalar<dim, W, S>(q, k_block, v_block, k_ring, v_ring, slots, lengths, ends, \
+#define SCALAR(W, S) dispatch_scalar<dim, W, S, fp8>(q, k_block, v_block, k_ring, v_ring, slots, lengths, ends, \
     sinks, out, scratch, sequences, block_rows, heads, kv_heads, ring, max_keys, window, causal, scale, stream)
     if (window > 0) return sinks ? SCALAR(true, true) : SCALAR(true, false);
     return sinks ? SCALAR(false, true) : SCALAR(false, false);
 #undef SCALAR
   }
-  return dispatch_wmma<dim>(q, k_block, v_block, k_ring, v_ring, slots, lengths, ends, sinks,
+  return dispatch_wmma<dim, fp8>(q, k_block, v_block, k_ring, v_ring, slots, lengths, ends, sinks,
       out, scratch, sequences, block_rows, heads, kv_heads, ring, max_keys, window, causal, slices, sms, scale, stream);
 }
 }  // namespace
@@ -378,7 +395,7 @@ uint64_t workspace(int sequences, int kv_heads, int slices, int max_keys, int he
 int launch(const void* q, const void* k_block, const void* v_block, const void* k_ring,
     const void* v_ring, const void* slots, const void* lengths, const void* ends, const void* sinks,
     void* out, void* scratch, int sequences, int block_rows, int heads, int kv_heads, int ring,
-    int max_keys, int window, bool causal, int head_dim, int slices, float scale, cudaStream_t stream) {
+    int max_keys, int window, bool causal, int head_dim, int slices, bool fp8, float scale, cudaStream_t stream) {
   if (sequences < 1 || block_rows < 1 || heads < 1 || kv_heads < 1 || heads % kv_heads ||
       ring < 1 || max_keys < block_rows || window < 0 || slices < 1 ||
       (heads / kv_heads * block_rows + queries_per_slice - 1) / queries_per_slice > slices ||
@@ -386,9 +403,13 @@ int launch(const void* q, const void* k_block, const void* v_block, const void* 
     return cudaErrorInvalidValue;
   const int sms = sm_count();
   if (sms < 1) return cudaErrorInvalidDevice;
-  if (head_dim == 128) return route<128>(q, k_block, v_block, k_ring, v_ring, slots, lengths, ends,
+  if (fp8 && head_dim == 128) return route<128, true>(q, k_block, v_block, k_ring, v_ring, slots, lengths, ends,
       sinks, out, scratch, sequences, block_rows, heads, kv_heads, ring, max_keys, window, causal, slices, sms, scale, stream);
-  if (head_dim == 64) return route<64>(q, k_block, v_block, k_ring, v_ring, slots, lengths, ends,
+  if (fp8 && head_dim == 64) return route<64, true>(q, k_block, v_block, k_ring, v_ring, slots, lengths, ends,
+      sinks, out, scratch, sequences, block_rows, heads, kv_heads, ring, max_keys, window, causal, slices, sms, scale, stream);
+  if (head_dim == 128) return route<128, false>(q, k_block, v_block, k_ring, v_ring, slots, lengths, ends,
+      sinks, out, scratch, sequences, block_rows, heads, kv_heads, ring, max_keys, window, causal, slices, sms, scale, stream);
+  if (head_dim == 64) return route<64, false>(q, k_block, v_block, k_ring, v_ring, slots, lengths, ends,
       sinks, out, scratch, sequences, block_rows, heads, kv_heads, ring, max_keys, window, causal, slices, sms, scale, stream);
   return cudaErrorInvalidValue;
 }

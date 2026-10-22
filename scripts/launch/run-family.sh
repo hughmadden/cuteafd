@@ -276,6 +276,7 @@ FP8_SCALES
 SPECULATOR_FP8
 DRAFT_CONTEXT_SLOTS
 DRAFT_SEQUENCES
+DRAFT_KV_CACHE
 SPECULATOR_MODEL_ID
 SPECULATOR_MODEL_REVISION
 EOF
@@ -287,6 +288,7 @@ FP8_SCALES
 SPECULATOR_FP8
 DRAFT_CONTEXT_SLOTS
 DRAFT_SEQUENCES
+DRAFT_KV_CACHE
 SPECULATOR_MODEL_ID
 SPECULATOR_MODEL_REVISION
 MEDIA_CACHE_BYTES
@@ -346,6 +348,7 @@ L2_PREFETCH
 FP8_SCALES
 DRAFT_CONTEXT_SLOTS
 DRAFT_SEQUENCES
+DRAFT_KV_CACHE
 SPECULATOR_FP8
 EOF
       ;;
@@ -2055,6 +2058,11 @@ if [[ $serve == serve-dsv4 || $serve == serve-glm || $serve == serve-mimo ]]; th
     *) family_args+=("$fixed_onboard_flag" "$local_layers") ;;
   esac
 fi
+if [[ "$family" == glm5 || "$family" == glm5_flash || "$family" == mimo_v2 ]]; then
+  draft_kv_cache="$(get DRAFT_KV_CACHE bf16)"
+  case "$draft_kv_cache" in bf16|fp8) ;; *) release_die "DRAFT_KV_CACHE must be bf16 or fp8" ;; esac
+  family_args+=(--draft-kv-cache "$draft_kv_cache")
+fi
 # GLM, GLM Flash, MiMo, Qwen: L2_PREFETCH (off, auto = 3/4 of the L2, or MiB;
 # unset: auto for GLM 5.3 and GLM 5.3 Flash, off for MiMo and Qwen) pulls the
 # next layer's weights into L2 during each one-lane decode step's Spark exchange; FP8_SCALES (amax, pow2, best) is the scale rule of the FP8
@@ -2611,6 +2619,9 @@ audio_encoder_hash=""
   # admits them, before an encoder placement is chosen.
   if [[ "$family" == glm5_flash && "${decode_rows:-64}" == 128 ]]; then
     plan_draft_args+=(--decode-rows 128)
+  fi
+  if [[ "$family" == glm5 || "$family" == glm5_flash || "$family" == mimo_v2 ]]; then
+    plan_draft_args+=(--draft-kv-cache "$draft_kv_cache")
   fi
   if [[ "$family" == qwen4 ]]; then
     plan_draft_args+=(--kv-cache "$kv_cache")

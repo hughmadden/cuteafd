@@ -293,10 +293,10 @@ mod tests {
             let prepared = Prepared::new(&library, RankDevice { device: 0, stream: lead.raw },
                 RankDevice { device: 1, stream: peer_target.raw }, 0, IDENTITY)?;
             let local = DflashDrafter::load(&library, &draft_path, file.clone(), lead.raw, 4, 4,
-                mask.clone(), true, representation, Fp8Scales::Pow2, Fp8Rows::W8a8)?;
+                mask.clone(), true, representation, Fp8Scales::Pow2, Fp8Rows::W8a8, cuteafd_loader::families::qwen4::Qwen4KvCache::Bf16)?;
             let draft_device = prepared.stream.device;
             let draft = draft_device.own(|| DflashDrafter::load(&library, &draft_path, file.clone(),
-                prepared.stream.raw, 4, 4, mask.clone(), true, representation, Fp8Scales::Pow2, Fp8Rows::W8a8))?;
+                prepared.stream.raw, 4, 4, mask.clone(), true, representation, Fp8Scales::Pow2, Fp8Rows::W8a8, cuteafd_loader::families::qwen4::Qwen4KvCache::Bf16))?;
             let remote = RemoteDflash::new(draft, prepared)?;
             let result = (|| -> Result<()> {
                 remote.prime(&embedding, TargetHead::Bf16(&head))?;

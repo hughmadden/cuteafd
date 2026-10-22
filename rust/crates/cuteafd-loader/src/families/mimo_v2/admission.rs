@@ -87,8 +87,10 @@ pub fn draft_reservations_with(
     use crate::families::mimo_v2::draft_representation::MimoDraftCapacity;
     let slots = capacity.context_slots;
     let max_sequences = capacity.max_batch_sequences;
+    let expected = MimoDraftCapacity { kv_cache: capacity.kv_cache,
+        ..MimoDraftCapacity::new(slots, max_sequences, cfg.block)? };
     ensure!(
-        capacity == MimoDraftCapacity::new(slots, max_sequences, cfg.block)?,
+        capacity == expected,
         "DFlash capacity does not match its configured block extent"
     );
     ensure!(
@@ -215,7 +217,7 @@ pub fn draft_reservations_with(
         for kind in ["k", "v"] {
             reserve(
                 format!("draft.layer{layer}.{kind}_ring"),
-                &[slots, RING, kv, 2],
+                &[slots, RING, capacity.kv_cache.plane_record_bytes(cfg.kv_heads, cfg.head_dim)],
             )?;
         }
     }

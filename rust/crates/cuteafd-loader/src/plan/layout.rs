@@ -121,6 +121,8 @@ pub struct LayoutOptions {
     pub mimo_expert_input: crate::families::mimo_v2::MimoExpertInput,
     /// MiMo drafter batch limit (serving raises it to concurrency).
     pub draft_sequences: u64,
+    /// Shared GQA drafter rings, independent of target KV and weight precision.
+    pub draft_kv_cache: crate::families::qwen4::Qwen4KvCache,
     /// Explicit MiMo DFlash context arena; does not widen its draft batch.
     pub draft_context_slots: Option<u64>,
     /// MiMo segmented decode graphs (runtime default: off).
@@ -206,6 +208,7 @@ impl Default for LayoutOptions {
             mimo_rings: 16,
             mimo_expert_input: Default::default(),
             draft_sequences: 4,
+            draft_kv_cache: crate::families::qwen4::Qwen4KvCache::Bf16,
             draft_context_slots: None,
             mimo_decode_graphs: false,
             physical_sms: None,
@@ -408,12 +411,10 @@ const fn gib(hundredths: u64) -> u64 {
     hundredths * GIB / 100
 }
 
-fn mimo_draft_prefix_bytes(config: &serde_json::Value, marks: u64, rings: u64) -> Result<(u64, u64), String> {
+fn mimo_draft_prefix_bytes(config: &serde_json::Value, marks: u64, rings: u64, kv_cache: crate::families::qwen4::Qwen4KvCache) -> Result<(u64, u64), String> {
     let field = |name| config[name].as_u64().filter(|&n| n > 0)
         .ok_or_else(|| format!("missing or zero {name}"));
-    let width = field("num_key_value_heads")?.checked_mul(field("head_dim")?)
-        .ok_or("DFlash KV width overflow")?;
-    let mark = crate::families::mimo_v2::draft_representation::mimo_draft_mark_bytes(field("num_hidden_layers")?, width)
+    let mark = crate::families::mimo_v2::draft_representation::mimo_draft_mark_bytes(field("num_hidden_layers")?, field("num_key_value_heads")?, field("head_dim")?, kv_cache)
         .map_err(|e| e.to_string())?;
     Ok((mark.checked_mul(marks).ok_or("DFlash marks overflow")?,
         rings.checked_mul(8).ok_or("DFlash floors overflow")?))
@@ -444,10 +445,12 @@ mod draft_prefix_tests {
     #[test]
     fn draft_prefix_reserves_marks_and_all_ring_floors() {
         let config = serde_json::json!({"num_hidden_layers": 5, "num_key_value_heads": 8, "head_dim": 128});
-        assert_eq!(mimo_draft_prefix_bytes(&config, 42, 18).unwrap(), ((20 * MIB + 8) * 42, 144));
-        assert!(mimo_draft_prefix_bytes(&config, u64::MAX, 18).is_err());
-        assert!(mimo_draft_prefix_bytes(&config, 42, u64::MAX).is_err());
-        assert!(mimo_draft_prefix_bytes(&serde_json::json!({}), 42, 18).is_err());
+        assert_eq!(mimo_draft_prefix_bytes(&config, 42, 18, crate::families::qwen4::Qwen4KvCache::Bf16).unwrap(), ((20 * MIB + 8) * 42, 144));
+        assert_eq!(mimo_draft_prefix_bytes(&config, 42, 18, crate::families::qwen4::Qwen4KvCache::Fp8).unwrap(),
+            ((5 * 1024 * 2 * 1056 + 8) * 42, 144));
+        assert!(mimo_draft_prefix_bytes(&config, u64::MAX, 18, crate::families::qwen4::Qwen4KvCache::Bf16).is_err());
+        assert!(mimo_draft_prefix_bytes(&config, 42, u64::MAX, crate::families::qwen4::Qwen4KvCache::Bf16).is_err());
+        assert!(mimo_draft_prefix_bytes(&serde_json::json!({}), 42, 18, crate::families::qwen4::Qwen4KvCache::Bf16).is_err());
     }
 }
 
@@ -1055,10 +1058,10 @@ fn selected_host_geometry(report: &mut PlanReport, options: &LayoutOptions, chec
         let dir = checkpoint.snapshot.join("dflash");
         let draft = if dir.join("dflash_draft_model.safetensors").is_file() {
             let cfg = crate::families::mimo_v2::draft_config::DflashConfig::read(&dir)?;
-            crate::families::mimo_v2::draft_representation::mimo_draft_mark_bytes(cfg.layers as u64, cfg.kv_width() as u64)?
+            crate::families::mimo_v2::draft_representation::mimo_draft_mark_bytes(cfg.layers as u64, cfg.kv_heads as u64, cfg.head_dim as u64, options.draft_kv_cache)?
         } else if dir.join("config.json").is_file() {
             let config = serde_json::from_slice(&std::fs::read(dir.join("config.json"))?)?;
-            mimo_draft_prefix_bytes(&config, 1, options.mimo_rings.max(shape.concurrency))
+            mimo_draft_prefix_bytes(&config, 1, options.mimo_rings.max(shape.concurrency), options.draft_kv_cache)
                 .map_err(anyhow::Error::msg)?.0
         } else { 0 };
         mark_bytes = mark_bytes.checked_add(draft).context("MiMo draft mark overflow")?;

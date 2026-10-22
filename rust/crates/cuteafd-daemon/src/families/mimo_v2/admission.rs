@@ -122,7 +122,7 @@ mod draft_prefix_tests {
         let cache = cuteafd_loader::serving_capacity::mimo_cache_geometry(
             &cfg, cfg.layers, 1, MimoKvCache::Int8, 0).unwrap();
         let target: u64 = cache.ranks.iter().map(|r| r.retained_mark_bytes).sum();
-        let draft = cuteafd_loader::families::mimo_v2::draft_representation::mimo_draft_mark_bytes(5, 1024).unwrap();
+        let draft = cuteafd_loader::families::mimo_v2::draft_representation::mimo_draft_mark_bytes(5, 1024, 1, cuteafd_loader::families::qwen4::Qwen4KvCache::Bf16).unwrap();
         for concurrency in [4, 16] {
             for enabled in [false, true] {
                 // Include a budget-tight case to catch the concurrency floor and
@@ -222,9 +222,7 @@ pub(super) fn preflight(
     let draft_mark_bytes = args.draft.as_deref().filter(|_| prefix_draft).map(super::dflash::drafter_dir)
         .map(|dir| -> Result<u64> {
             let draft = super::dflash::DflashConfig::read(&dir)?;
-            let width = (draft.kv_heads as u64).checked_mul(draft.head_dim as u64)
-                .context("DFlash KV width overflow")?;
-            Ok(cuteafd_loader::families::mimo_v2::draft_representation::mimo_draft_mark_bytes(draft.layers as u64, width)?)
+            Ok(cuteafd_loader::families::mimo_v2::draft_representation::mimo_draft_mark_bytes(draft.layers as u64, draft.kv_heads as u64, draft.head_dim as u64, args.draft_kv_cache)?)
         }).transpose()?.unwrap_or(0);
     let target_mark_bytes = cache
         .ranks
@@ -1085,6 +1083,31 @@ mod tests {
     }
 
     #[test]
+    fn compact_draft_rings_preserve_every_other_reservation() {
+        use cuteafd_loader::families::{mimo_v2::draft_representation::{MimoDraftCapacity,
+            MimoDraftRepresentation}, qwen4::Qwen4KvCache};
+        let (cfg, headers) = draft_fixture();
+        for mode in [MimoDraftRepresentation::Bf16Only, MimoDraftRepresentation::Fp8Only] {
+            let capacity = MimoDraftCapacity::new(20, 16, cfg.block).unwrap();
+            let bf16 = draft_reservations_with(&cfg, &headers, mode, capacity, |_| Ok(2048)).unwrap();
+            let compact = MimoDraftCapacity { kv_cache: Qwen4KvCache::Fp8, ..capacity };
+            let fp8 = draft_reservations_with(&cfg, &headers, mode, compact, |_| Ok(2048)).unwrap();
+            assert_eq!(bf16.steady.len(), fp8.steady.len());
+            for (a, b) in bf16.steady.iter().zip(&fp8.steady) {
+                assert_eq!(a.name, b.name);
+                if a.name.ends_with("_ring") {
+                    assert_eq!(a.bytes, 20 * 1024 * 128 * 2);
+                    assert_eq!(b.bytes, 20 * 1024 * 144);
+                } else {
+                    assert_eq!(a.bytes, b.bytes, "{}", a.name);
+                }
+            }
+            assert_eq!(bf16.packing.iter().map(|r| r.bytes).sum::<u64>(),
+                fp8.packing.iter().map(|r| r.bytes).sum::<u64>());
+        }
+    }
+
+    #[test]
     fn unsupported_draft_source_fails_before_native_workspace_queries() {
         use cuteafd_loader::families::mimo_v2::draft_representation::{
             MimoDraftCapacity, MimoDraftRepresentation,
@@ -1133,6 +1156,7 @@ mod tests {
             .any(|r| r.name == "draft.weights.bf16_values"));
         assert!(reservations.packing.is_empty());
         let invalid = MimoDraftCapacity {
+            kv_cache: cuteafd_loader::families::qwen4::Qwen4KvCache::Bf16,
             context_slots: 16,
             max_batch_sequences: 20,
             block_rows: 160,

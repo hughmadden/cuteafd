@@ -2427,7 +2427,7 @@ fn glm5_flash_layout_uses_physical_candidate_scratch_without_double_counting_ove
         .filter(|i| i.category == category && (category == Category::Drafter || i.group == "DFlash linear/attention scratch"))
         .map(|i| i.bytes).sum::<u64>();
     let (owned, scratch) = crate::placement::families::glm5_flash::drafter_inventory(&config,8,8,
-        &[170,188],GlmDraftRepresentation::Fp8Only,2).unwrap();
+        &[170,188],GlmDraftRepresentation::Fp8Only,2, crate::families::qwen4::Qwen4KvCache::Bf16).unwrap();
     let natural = run(&options);
     assert_eq!(bytes(&natural,0,Category::Drafter), owned);
     assert_eq!(bytes(&natural,0,Category::Workspace), scratch[0]);

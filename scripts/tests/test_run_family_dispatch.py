@@ -1882,6 +1882,31 @@ def test_glm_drafter_quantization_is_explicit(tmp_path, family, selection, expec
         assert f"--draft-fp8 {expected}" in launch
 
 
+@pytest.mark.parametrize("family", ["glm5", "glm5_flash", "mimo_v2"])
+@pytest.mark.parametrize("selection, expected", [(None, "bf16"), ("bf16", "bf16"), ("fp8", "fp8")])
+def test_drafter_kv_format_is_independent_of_target_kv(tmp_path, family, selection, expected):
+    configs = {
+        "glm5": {"model_type": "glm_moe_dsa", "num_hidden_layers": 4, "first_k_dense_replace": 3},
+        "glm5_flash": SPLIT_CONFIGS["glm5_flash"],
+        "mimo_v2": {"model_type": "mimo_v2_flash", "num_hidden_layers": 2, "moe_layer_freq": [0, 1]},
+    }
+    keys = "GLM5_FLASH_FP8_MODEL_ID=off\n" if family == "glm5_flash" else ""
+    if selection is not None:
+        keys += f"DRAFT_KV_CACHE={selection}\n"
+    result = _family_launch_result(tmp_path, configs[family], "test/model", keys)
+    assert result.returncode == 0, result.stderr
+    launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-" in line)
+    assert f"--draft-kv-cache {expected}" in launch
+
+
+def test_invalid_drafter_kv_rejects_before_starting_containers(tmp_path):
+    result = _family_launch_result(tmp_path, SPLIT_CONFIGS["glm5_flash"], "test/model",
+                                  "GLM5_FLASH_FP8_MODEL_ID=off\nDRAFT_KV_CACHE=invalid\n")
+    assert result.returncode == 2, result.stderr
+    assert "DRAFT_KV_CACHE must be bf16 or fp8" in result.stderr
+    assert not any(line.startswith(("docker ", "ssh ", "nest ")) for line in result.stderr.splitlines())
+
+
 @pytest.mark.parametrize("family", ["glm5", "glm5_flash"])
 def test_glm_drafter_context_slots_and_batch_are_independent(tmp_path, family):
     config = ({"model_type": "glm_moe_dsa", "num_hidden_layers": 4, "first_k_dense_replace": 3}

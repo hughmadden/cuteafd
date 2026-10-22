@@ -407,6 +407,9 @@ pub(crate) struct PlanArgs {
     /// MiMo drafter batch sequences for --layout (serving raises to concurrency).
     #[arg(long, default_value_t = 4)]
     pub(crate) draft_sequences: u64,
+    /// Shared GQA drafter-ring format for layout admission.
+    #[arg(long, default_value = "bf16")]
+    pub(crate) draft_kv_cache: cuteafd_loader::families::qwen4::Qwen4KvCache,
     /// Explicit MiMo drafter context arena for --layout.
     #[arg(long)]
     pub(crate) draft_context_slots: Option<u64>,
