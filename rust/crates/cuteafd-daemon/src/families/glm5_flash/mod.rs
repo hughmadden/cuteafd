@@ -445,9 +445,10 @@ mod draft_cli_tests {
     }
 
     #[test]
-    fn coordinator_push_admits_primary_weights_without_token_row_sharding() {
+    fn coordinator_push_admits_primary_weights_and_token_row_sharding_but_not_the_nvfp4_gate() {
         assert!(dense_pushable(&parse(&[])));
-        assert!(!dense_pushable(&parse(&["--kda-fp8", "row128", "--kda-output-shard"])));
+        assert!(dense_pushable(&parse(&["--kda-fp8", "row128", "--kda-output-shard"])));
+        assert!(!dense_pushable(&parse(&["--kda-fp8", "off", "--kda-nvfp4-gate", "rtn"])));
     }
 
     #[test]
