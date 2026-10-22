@@ -596,19 +596,24 @@ pub(crate) fn receive_pushed<'a>(device: Device<'a>, catalog: &cuteafd_loader::O
     let (base, host) = (dense_plan.base, dense_plan.host_bytes);
     let tp2_bytes = tp2.as_ref().map_or(0, |p| p.layout.logical_bytes() as u64);
     let (host_base, total) = rank_bytes(base, tp2_bytes, host);
-    let mut arenas = vec![0; sparks + 2];
-    arenas[rank] = total;
-    let mut builder = Builder::new(root, arenas);
-    (dense_plan.append)(&mut builder, rank as u32, host_base)?;
-    if let Some(plan) = &tp2 { plan.append_at(&mut builder, catalog, rank as u32, base)?; }
-    let checked = builder.finish()?;
+    // The rank's checked plan (built twice: one copy streams from the fake source).
+    let build = || -> Result<CheckedPlan> {
+        let mut arenas = vec![0; sparks + 2];
+        arenas[rank] = total;
+        let mut builder = Builder::new(root, arenas);
+        (dense_plan.append)(&mut builder, rank as u32, host_base)?;
+        if let Some(plan) = &tp2 { plan.append_at(&mut builder, catalog, rank as u32, base)?; }
+        Ok(builder.finish()?)
+    };
+    let checked = build()?;
     let expected = crate::shared::memory::weight_arena::ExpectedCoverage::from_plan(&checked, rank as u32)?;
     let dense = crate::shared::experts::rtx::dense::DenseArena::new(device, layout, expected)?;
     let socket = socket_dir.join(format!("g{gpu}.sock")).to_string_lossy().into_owned();
     let listener = Listener::bind(&socket)?;
-    let packed = pack(&checked, root, rank as u32, DEFAULT_SLOT_BYTES)?;
     let (mut coordinator, mut worker) = control_pair()?;
     for stream in [&coordinator, &worker] { stream.set_read_timeout(Some(Duration::from_secs(600)))?; }
+    let streamed = build()?;
+    let source_root = root.to_path_buf();
     let server = std::thread::spawn(move || -> Result<()> {
         let conn = listener.accept()?;
         conn.set_timeout(Some(Duration::from_secs(600)))?;
@@ -617,13 +622,40 @@ pub(crate) fn receive_pushed<'a>(device: Device<'a>, catalog: &cuteafd_loader::O
         let file = File::from(fd.context("rank ring fd absent")?);
         conn.send_event(&Event::Joined)?;
         assert_eq!(read_control(&coordinator)?["message"], "joined");
-        for (index, bytes) in packed.into_iter().enumerate() {
-            let index = index % slots as usize;
-            file.write_all_at(&bytes, index as u64 * u64::from(slot_bytes))?;
-            conn.send_event(&Event::Filled { slot: index as u32, len: bytes.len() as u32 })?;
+        // Streams the rank's runs in plan order, one slot at a time (bounded memory).
+        let mut index = 0usize;
+        let mut send = |bytes: Vec<u8>| -> Result<()> {
+            let at = index % slots as usize;
+            file.write_all_at(&bytes, at as u64 * u64::from(slot_bytes))?;
+            conn.send_event(&Event::Filled { slot: at as u32, len: bytes.len() as u32 })?;
             let (release, _) = conn.next_request()?.context("missing slot release")?;
-            anyhow::ensure!(matches!(release, Request::Release { slot } if slot == index as u32), "release order");
+            anyhow::ensure!(matches!(release, Request::Release { slot } if slot == at as u32), "release order");
+            index += 1;
+            Ok(())
+        };
+        let mut sources = std::collections::HashMap::new();
+        let mut packer = slot::Packer::new(vec![0; slot_bytes as usize]);
+        for entry in streamed.plan.entries.iter().filter(|e| e.rank == rank as u32) {
+            let source = sources.entry(entry.file).or_insert_with(||
+                File::open(source_root.join(&streamed.plan.files[entry.file as usize])));
+            let source = source.as_ref().map_err(|e| anyhow::anyhow!("{e}"))?;
+            let pattern = &streamed.plan.patterns[entry.pattern as usize];
+            let mut run = vec![0u8; pattern.run as usize];
+            for (src, dst) in pattern.runs() {
+                source.read_exact_at(&mut run, entry.src_base + src)?;
+                let (mut bytes, mut destination) = (&run[..], entry.dst_base + dst);
+                while !bytes.is_empty() {
+                    let n = packer.push(destination, bytes);
+                    if n == 0 {
+                        send(std::mem::replace(&mut packer, slot::Packer::new(vec![0; slot_bytes as usize])).finish().0)?;
+                        continue;
+                    }
+                    destination += n as u64;
+                    bytes = &bytes[n..];
+                }
+            }
         }
+        if !packer.is_empty() { send(packer.finish().0)?; }
         conn.send_event(&Event::Done)?;
         anyhow::ensure!(read_control(&coordinator)?["success"] == true, "rank candidate rejected");
         write_control(&mut coordinator, &serde_json::json!({"message":"commit", "success": true}))?;

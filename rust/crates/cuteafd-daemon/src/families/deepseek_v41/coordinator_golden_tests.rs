@@ -146,8 +146,20 @@ pub(crate) fn mount_one_gpu(library: &NativeLibrary, catalog: &cuteafd_loader::O
     })
 }
 
+/// The pinned digests: CUTEAFD_V41_GOLDEN (a container run of a slot whose
+/// source predates them), else the checked-in file.
 pub(crate) fn path() -> std::path::PathBuf {
-    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/families/deepseek_v41/coordinator_golden.json")
+    std::env::var_os("CUTEAFD_V41_GOLDEN").map(std::path::PathBuf::from).unwrap_or_else(||
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/families/deepseek_v41/coordinator_golden.json"))
+}
+
+/// Fails the test before a runaway host allocation can pressure a shared host.
+pub(crate) fn rss_guard(limit_gib: u64) -> Result<()> {
+    let status = std::fs::read_to_string("/proc/self/status")?;
+    let kib: u64 = status.lines().find(|l| l.starts_with("VmRSS:"))
+        .and_then(|l| l.split_whitespace().nth(1)).and_then(|v| v.parse().ok()).unwrap_or(0);
+    anyhow::ensure!(kib >> 20 < limit_gib, "test RSS {} GiB exceeds its {limit_gib} GiB guard", kib >> 20);
+    Ok(())
 }
 
 /// Compares (or with CUTEAFD_V41_GOLDEN_WRITE=1 records) `actual` against the
@@ -248,12 +260,14 @@ fn installed_pushed_coordinator_operands_match_the_mount_golden() -> Result<()> 
     // Native TP2 halves, admitted as serving admits them.
     let plans = (0..2).map(|gpu| crate::shared::memory::push_coordinator::Tp2ExpertPlan::new(&catalog,
         &(0..layers).collect::<Vec<_>>(), gpu, usize::MAX)).collect::<Result<Vec<_>>>()?;
+    rss_guard(32)?;
     let mut pushed = Vec::new();
     for (gpu, plan) in plans.into_iter().enumerate() {
         let started = std::time::Instant::now();
         pushed.push(crate::shared::experts::rtx::push::tests::receive_pushed(devices[gpu], &catalog, &root,
             socket_dir.path(), &records, (layers > 0).then_some(plan), 4, gpu)?);
         eprintln!("gpu{gpu} rank pushed in {:.2} s", started.elapsed().as_secs_f64());
+        rss_guard(32)?;
     }
     collect(&library, owners_ref, |f| weights.visit(f))?;
     collect(&library, owners_ref, |f| producers.visit(f))?;
