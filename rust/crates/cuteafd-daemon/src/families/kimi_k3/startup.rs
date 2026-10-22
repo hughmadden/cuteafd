@@ -24,7 +24,6 @@ pub(crate) struct Options<'a> {
     pub max_context: usize,
     pub pool_tokens: Option<u64>,
     pub graphs: bool,
-    pub native_k6: bool,
     pub ffn_mode: cuteafd_ffi::KimiFfnMode,
     pub hosted_layers: Option<Vec<usize>>,
     pub draft: Option<super::draft::Options>,
@@ -49,7 +48,7 @@ pub(crate) fn load<'a>(library: &'a Arc<cuteafd_ffi::NativeLibrary>,
     ensure!(options.draft.as_ref().is_none_or(|draft| draft.cache_format == options.cache_format),
         "Kimi target/draft cache records differ");
     let core = cuteafd_loader::plan::families::kimi::core_inventory(checkpoint)?;
-    validate_core(full, &core, options.native_k6)?;
+    core.validate_runtime_groups(full)?;
     let f32_partials = needs_f32_partials(cfg, &core);
     ensure!(crate::shared::peer_split::probed_device(library, options.devices[0], Some(options.devices[1]))?
         == Some(options.devices[1]), "Kimi TP2 requires bidirectional peer access");
@@ -184,13 +183,6 @@ pub(super) fn code_demand(rank: usize, pending: u64, cublas_bytes: u64, lanes: u
     cuteafd_loader::families::kimi_k3::allocation::code_demand(rank, pending, cublas_bytes, lanes)
 }
 
-fn validate_core(cfg:&KimiK3Config,core:&cuteafd_loader::families::kimi_k3::core::CoreInventory,
-    enabled:bool)->Result<()> {
-    ensure!(enabled || core.projections.is_empty(),
-        "Kimi checkpoint contains native K6 core tensors; --native-k6 is experimental and off by default pending model-level KL/top-1 qualification");
-    core.validate_runtime_groups(cfg)
-}
-
 use cuteafd_loader::families::kimi_k3::core::{needs_f32_partials,exchange_recv_bytes};
 
 pub(super) fn exchange_demands(rows: usize, diagnostics: bool,f32_partials:bool) -> Result<Vec<Demand>> {
@@ -210,25 +202,23 @@ mod tests {
     }
 
     #[test]
-    fn native_core_opt_in_is_closed_before_device_access_and_checks_mixed_groups()->Result<()> {
+    fn header_native_core_checks_mixed_groups_before_device_access()->Result<()> {
         let cfg=KimiK3Config::from_hf(&cuteafd_loader::plan::testing::kimi_k3_config())?;
         let mut core=CoreInventory::default();
-        validate_core(&cfg,&core,false)?;
-        validate_core(&cfg,&core,true)?;
+        core.validate_runtime_groups(&cfg)?;
         let head="language_model.lm_head";
         core.projections.insert(head.into(),projection(head));
-        assert!(validate_core(&cfg,&core,false).unwrap_err().to_string().contains("--native-k6"));
-        validate_core(&cfg,&core,true)?;
+        core.validate_runtime_groups(&cfg)?;
         assert!(!needs_f32_partials(&cfg,&core));
         let root="language_model.model.layers.1.self_attn";
         let stem=format!("{root}.q_proj");
         core.projections.insert(stem.clone(),projection(&stem));
-        let error=validate_core(&cfg,&core,true).unwrap_err().to_string();
+        let error=core.validate_runtime_groups(&cfg).unwrap_err().to_string();
         assert!(error.contains(&stem) && error.contains("k_proj") && error.contains("whole-group"));
         for leaf in ["k_proj","v_proj","g_proj","o_proj"] {
             let stem=format!("{root}.{leaf}");core.projections.insert(stem.clone(),projection(&stem));
         }
-        validate_core(&cfg,&core,true)?;
+        core.validate_runtime_groups(&cfg)?;
         assert!(needs_f32_partials(&cfg,&core));
         let mut prefix=cfg.clone();prefix.layers=1;
         assert!(!needs_f32_partials(&prefix,&core));

@@ -34,8 +34,6 @@ pub(crate) struct ServeArgs {
     /// Fixed draft depth; absent lets the shared policy choose up to the checkpoint width.
     #[arg(long, requires = "draft", value_parser = clap::value_parser!(u8).range(1..=7))]
     pub draft_fixed: Option<u8>,
-    /// Experimental native K6 core execution; requires model-level qualification.
-    #[arg(long)] pub native_k6: bool,
     #[command(flatten)] pub prefix: PrefixArgs,
     #[command(flatten)] pub decode_share: crate::shared::prefill_share::DecodeShareArgs,
     #[command(flatten)] pub token_io: crate::shared::token_io::TokenIoArgs,
@@ -104,7 +102,7 @@ pub(crate) async fn run(args: ServeArgs) -> Result<()> {
                 spark_budget_gib: worker_args.spark_budget_gib,
                 rows: 4096, slots, marks, max_context: worker_args.max_context,
                 pool_tokens: worker_args.pool_tokens.filter(|&tokens| tokens > 0), graphs: true,
-                ffn_mode: cuteafd_ffi::KimiFfnMode::default(), native_k6: worker_args.native_k6, hosted_layers: None, draft,
+                ffn_mode: cuteafd_ffi::KimiFfnMode::default(), hosted_layers: None, draft,
             })?;
             crate::shared::memory_report::release_load_staging(&library);
             let backend = KimiBackend::new(&loaded.engine)?;
@@ -203,8 +201,7 @@ mod tests {
         assert!(args(&["--peers", peers, "--kv-cache", "int8"]).is_err());
         assert_eq!(defaults.rtx_expert_layers, cuteafd_loader::placement::Onboard::Auto);
         assert_eq!(defaults.max_sequences, 16);
-        assert!(!defaults.native_k6);
-        assert!(args(&["--peers",peers,"--native-k6"])?.native_k6);
+        assert!(args(&["--peers", peers, "--native-k6"]).is_err());
         assert_eq!(defaults.pool_tokens, None);
         assert_eq!(defaults.spark_budget_gib, None);
         assert_eq!(defaults.api_limits(COMPILED_CONTEXT)?.context(), DEFAULT_CONTEXT as u32);

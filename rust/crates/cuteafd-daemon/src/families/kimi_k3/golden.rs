@@ -49,8 +49,6 @@ pub(crate) struct GoldenArgs {
     /// Informational F32 comparison only; direct gate/up is the speed-first default.
     #[arg(long, env = "CUTEAFD_KIMI_COMPENSATED_FFN")]
     compensated_ffn: bool,
-    /// Experimental native K6 core execution; off until explicitly selected.
-    #[arg(long)] native_k6: bool,
     /// All-layer logits scored against the immutable F32 reference quick subset.
     #[arg(long, requires_all = ["golden", "save_logits"], conflicts_with_all = ["reference_state", "last_layer", "windows"])] nll: bool,
 }
@@ -65,7 +63,6 @@ impl GoldenArgs {
 
     fn provenance(&self) -> Value {
         serde_json::json!({"schema": "cuteafd.kimi.run/1", "ffn_mode": self.ffn_mode().name(), "kv_cache": self.kv_cache.label(),
-            "native_k6": self.native_k6,
             "gate_up_programs": ([3072, 16896].map(|width| self.ffn_mode().gate_up_stem(width))),
             "rtx_expert_layers":self.rtx_expert_layers, "window": self.window, "last_layer": self.last_layer, "diagnostic_only": !self.nll})
     }
@@ -318,7 +315,7 @@ fn native(args: &GoldenArgs, checkpoint: &cuteafd_loader::plan::Checkpoint,
             peers: args.peers.clone(), rtx_expert_layers: cuteafd_loader::placement::Onboard::Layers(args.rtx_expert_layers),
             spark_budget_gib: args.spark_budget_gib,
             rows, slots: 1, marks: 1, max_context: cuteafd_loader::families::kimi_k3::COMPILED_CONTEXT, pool_tokens: Some(1_048_576), graphs: false,
-            draft: None, ffn_mode: args.ffn_mode(), native_k6: args.native_k6, hosted_layers: Some(hosted_layers(&std::env::var("CUTEAFD_GOLDEN_EXPERT_LAYERS")?)?),
+            draft: None, ffn_mode: args.ffn_mode(), hosted_layers: Some(hosted_layers(&std::env::var("CUTEAFD_GOLDEN_EXPERT_LAYERS")?)?),
         })?;
     use cuteafd_engine::prefix::PrefixFamily;
     let pages = engine.prefix_family()?.layout().pages;
@@ -541,21 +538,6 @@ mod tests {
         assert_eq!(full_reference(&args)?.len(), 1);
         args.window = Some("a01".into());
         assert!(full_reference(&args).is_err());
-        Ok(())
-    }
-
-    #[test]
-    fn native_k6_cli_is_off_by_default_and_records_explicit_selection()->Result<()> {
-        use clap::Parser;
-        let args=["cuteafd","kimi-golden","--snapshot","/checkpoint","--windows","/panel",
-            "--reference-state","/state","--window","w","--last-layer","3"];
-        for enabled in [false,true] {
-            let tail=if enabled {vec!["--native-k6"]}else{vec![]};
-            let cli=crate::cli::Cli::try_parse_from(args.into_iter().chain(tail))?;
-            let crate::cli::Commands::KimiGolden(parsed)=cli.command else {panic!("Kimi command")};
-            assert_eq!(parsed.native_k6,enabled);
-            assert_eq!(parsed.provenance()["native_k6"],enabled);
-        }
         Ok(())
     }
 

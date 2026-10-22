@@ -73,8 +73,7 @@ pub(super) fn layout(model: &Model, report: &mut PlanReport, opts: &crate::plan:
         .map_or(edge(Component::LmHead), |p| p.resident_bytes(1).expect("validated core dimensions")));
     let residency = model.coordinator;
     if !model.core.projections.is_empty() {
-        let status=if model.native_k6 {"experimental native execution enabled"}else{"native runtime binding pending"};
-        memory.notes.push(format!("Kimi K6 core: {} header-native projections; payload + H128 scale vectors charged without BF16 expansion; {status}",
+        memory.notes.push(format!("Kimi K6 core: {} header-native projections; payload + H128 scale vectors charged without BF16 expansion",
             model.core.projections.len()));
     }
     let mla_weights: u64 = model.mla.iter().map(|r| r.split + r.replicated).sum();
@@ -147,7 +146,7 @@ pub(super) fn layout(model: &Model, report: &mut PlanReport, opts: &crate::plan:
                 baseline[rank] = Baseline::Planned { context_bytes: arch.context_bytes, loaded_bytes: 0 };
                 demands.push(allocation::code_demand(rank, code.bytes, arch.cublas_bytes, 1)?);
             }
-            if model.native_k6 && !model.core.projections.is_empty() {
+            if !model.core.projections.is_empty() {
                 // The baseline already includes the full peer receive allocation.
                 demands.extend(core::CoreCharges::from_package(cfg, &model.core, rows, manifest)?.demands()?
                     .into_iter().filter(|d| d.group != "Kimi K6 peer receive"));
@@ -164,7 +163,7 @@ pub(super) fn layout(model: &Model, report: &mut PlanReport, opts: &crate::plan:
                 "Supply complete matching native and EXL3 workspace manifests."); return memory; }
         }
         memory.notes[0] = "Kimi shared runtime allocation ledger; graph executable bytes retain the runtime's explicit startup estimate".into();
-    } else if model.native_k6 && !model.core.projections.is_empty() {
+    } else if !model.core.projections.is_empty() {
         refusal(report, "Kimi native K6 requires installed workspace inventory".into(),
             "Supply the matching K6 PROGRAMS.json through --workspace-manifest.");
         return memory;
