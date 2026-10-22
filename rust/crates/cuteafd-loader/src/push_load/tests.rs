@@ -127,7 +127,7 @@ fn absent_attribute_missing_file_and_empty_group_use_mount_without_push() {
 }
 
 #[test]
-fn empty_hosts_is_still_sparknest_and_snapshot_symlinks_are_followed() {
+fn archive_only_files_are_not_pushed_and_snapshot_symlinks_are_followed() {
     let shard = push_shard();
     let directory = tempfile::tempdir().unwrap();
     let link = directory.path().join("shard");
@@ -140,7 +140,8 @@ fn empty_hosts_is_still_sparknest_and_snapshot_symlinks_are_followed() {
         rustix::fs::XattrFlags::empty(),
     )
     .unwrap();
-    assert!(is_push_shard(shard.path()));
+    assert!(!is_push_shard(shard.path()), "no live copy: the hub refuses it");
+    assert!(!is_push_shard(&link));
 }
 
 #[test]

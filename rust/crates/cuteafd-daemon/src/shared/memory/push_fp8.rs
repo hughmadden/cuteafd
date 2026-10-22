@@ -439,7 +439,7 @@ fn checked_plan(
     for (rank, plan) in plans.iter().enumerate() {
         plan.append(&mut builder, catalog, u32::try_from(rank)?, sparks)?;
     }
-    if let Some(coordinator) = coordinator { (coordinator.append)(&mut builder, catalog, &offers[sparks..])?; }
+    if let Some(coordinator) = coordinator { (coordinator.append)(&mut builder, Some(catalog), &offers[sparks..])?; }
     Ok(builder.finish()?)
 }
 

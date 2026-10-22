@@ -236,7 +236,7 @@ pub(crate) fn coordinator_suffix(
     let calls = Arc::new(AtomicUsize::new(0));
     let appended = calls.clone();
     let coordinator = CoordinatorRanks { ranks: 2, append: Box::new(move |builder, seen_catalog, offers| {
-        assert_eq!(seen_catalog.snapshot(), snapshot);
+        assert_eq!(seen_catalog.expect("Spark groups pass their catalog").snapshot(), snapshot);
         assert_eq!(serde_json::to_vec(offers)?, serde_json::to_vec(&suffix)?);
         appended.fetch_add(1, Ordering::SeqCst);
         for offer in offers {
