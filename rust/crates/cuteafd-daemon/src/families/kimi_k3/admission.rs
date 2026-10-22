@@ -1043,10 +1043,12 @@ pub(super) mod tests {
         let context = 1_048_576;
         let capacity = cuteafd_loader::placement::inventory::PRO_TOTAL_BYTES;
         let spark_bytes = 115_964_116_992;
-        for (slots, prefix_slots, host_cache_bytes, entries) in [
-            (16, Some(1), Some(0), 20),
-            (8, None, None, 20),
-            (16, None, Some(8 << 30), 20),
+        use cuteafd_core::MlaCacheFormat;
+        for (slots, prefix_slots, host_cache_bytes, entries, format) in [
+            (16, Some(1), Some(0), 20, MlaCacheFormat::Fp8),
+            (8, None, None, 20, MlaCacheFormat::Fp8),
+            (16, None, Some(8 << 30), 20, MlaCacheFormat::Fp8),
+            (8, None, None, 20, MlaCacheFormat::Bf16),
         ] {
             let rule = crate::shared::prefix::MarkRule { lanes: slots as usize, entries,
                 budget_bytes: 512 << 20, host: host_cache_bytes != Some(0) };
@@ -1057,7 +1059,7 @@ pub(super) mod tests {
                 layout: Some(LayoutOptions { rtx_bytes: vec![capacity; 2], prefill_rows: rows as u64,
                     concurrency: slots, state_slots: Some(slots), prefix_slots,
                     mimo_prefix_entries: entries as u64, mimo_prefix_mark_bytes: rule.budget_bytes,
-                    context_tokens: context as u64, host_cache_bytes,
+                    context_tokens: context as u64, host_cache_bytes, mla_kv: format,
                     workspace_manifest: Some(manifest_path.clone()), onboard: Some(Onboard::Auto),
                     spark_allocation_budget_bytes: Some(spark_bytes), ..Default::default() }), ..Default::default() };
             let report = plan::plan(snapshot.path(), &options)?;
@@ -1078,6 +1080,7 @@ pub(super) mod tests {
             let programs = ProgramSet::from_manifest(&manifest, &["kimik3"]);
             let arch = ArchContext::for_device("sm_120", capacity);
             let mut i = inputs(&cfg);
+            i.cache_format = format;
             i.rows = rows; i.lanes = 1; i.state_slots = slots as usize; i.prefix_marks = marks as usize;
             i.lane_layouts = vec![std::array::from_fn(|_| LaneLayout::new(&cfg, rows, context,
                 allocation::NativeScratch::from_manifest(&manifest).unwrap()).unwrap())];
@@ -1105,11 +1108,11 @@ pub(super) mod tests {
                 let planned_marks = planned.items.iter().filter(|item| item.category == Category::Prefix)
                     .map(|item| item.bytes).sum::<u64>();
                 assert_eq!(planned_marks, mark_bytes as u64 / 2 * marks,
-                    "rank {rank}, concurrency {slots}: planner must charge runtime staging marks");
+                    "rank {rank}, concurrency {slots}, {format}: planner must charge runtime staging marks");
                 let non_pool = planned.items.iter().filter(|item| item.group != "records").map(|item| item.bytes).sum::<u64>();
                 let remaining = capacity - arch.context_bytes - non_pool;
                 assert_eq!(remaining, admitted.placement.pool_limits.0[rank].available_bytes,
-                    "rank {rank}: installed planner and runtime must leave identical KV room");
+                    "rank {rank}, {format}: installed planner and runtime must leave identical KV room");
             }
             assert!(admitted.placement.pool_tokens >= context as u64);
         }
