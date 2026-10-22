@@ -374,8 +374,9 @@ pub(super) fn worker(args: crate::cli::NativeServeArgs, mut receive: mpsc::Recei
     // a planning error leaves them out (the Sparks still push).
     let coordinator = match (records.as_ref(), spark_plan.as_ref()) {
         (Some(records), Some(spark)) if spark.coordinator_pushes() => (|| {
-            let (_, offered, largest, ..) = records.summary();
-            tracing::info!(operands = offered, largest_step_bytes = largest, "V4.1 coordinator dense records planned");
+            let (landed, operands, staged, steps, largest, finishes) = records.summary();
+            tracing::info!(landed, operands, staged, steps, largest_step_bytes = largest, finishes,
+                "V4.1 coordinator dense records planned");
             super::coordinator_push::plan(&args.snapshot, &catalog, devices, records, expert_layers, rank_budgets,
                 args.peers.len())
         })().map_err(|error| tracing::info!(%error, "V4.1 coordinator push unavailable; mount")).ok(),
@@ -404,6 +405,7 @@ pub(super) fn worker(args: crate::cli::NativeServeArgs, mut receive: mpsc::Recei
     drop(records);
     // Every recorded scale pack ran (Done or mount fill): release raw scales.
     for weights in shared_owned.iter_mut().flatten() { weights.release_raw_scales(); }
+    if let Some(draft) = draft_weights.as_ref() { draft.release_raw_scales(); }
     let shared: [Rc<Vec<SharedWeights<'_>>>; 2] = shared_owned.map(Rc::new);
     if let Some(pending) = spark_admission { pending.wait()?; }
     let mut make_transport = || {

@@ -36,6 +36,12 @@ fn append(rect: &Rect, builder: &mut Builder, rank: u32, offset: u64) -> Result<
 }
 
 
+/// Staged steps a dense rank may hold open at once: one per push source
+/// (SparkNest streams each file from one source; a rank's files come from at
+/// most this many storage hosts). Pinned staging peaks at this many
+/// [`STEP_BYTES`] buffers.
+pub(crate) const MAX_OPEN_STEPS: usize = 8;
+
 /// One GPU's operands and steps in its rank's logical space.
 pub(crate) struct RankLayout {
     pub device: i32,
@@ -206,6 +212,14 @@ impl PushDestination for DenseArena<'_> {
         let (index, at) = self.step(offset, length)?;
         let need = self.layout.steps[index].1.bytes();
         if !self.open.contains_key(&index) {
+            // Admission planned one staged step per open source: a step whose
+            // bytes interleave with others (sources in file order over a
+            // layout that scatters a step) would grow pinned staging without
+            // bound, so refuse it rather than pin unplanned memory.
+            ensure!(self.open.len() < MAX_OPEN_STEPS,
+                "coordinator dense rank on GPU {} would open {} staged steps ({} MiB pinned), beyond the planned {}                  (one {} MiB step per source): a step's bytes interleave with others in the push order",
+                self.device.id, self.open.len() + 1, (self.open.len() + 1) * (STEP_BYTES >> 20), MAX_OPEN_STEPS,
+                STEP_BYTES >> 20);
             // Uniform buffers (every step is within the bound, checked when
             // recorded), so returned staging always fits the next step.
             let staging = match self.pool.iter().position(|s| s.buffer.bytes >= need) {

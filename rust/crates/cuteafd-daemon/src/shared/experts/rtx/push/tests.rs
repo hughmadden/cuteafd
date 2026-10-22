@@ -641,24 +641,29 @@ pub(crate) fn receive_pushed<'a>(device: Device<'a>, catalog: &cuteafd_loader::O
         };
         let mut sources = std::collections::HashMap::new();
         let mut packer = slot::Packer::new(vec![0; slot_bytes as usize]);
+        // SparkNest streams each file's runs in source-offset order (one source
+        // per file): replay that order, not the plan's entry order.
+        let mut runs = Vec::new();
         for entry in streamed.plan.entries.iter().filter(|e| e.rank == rank as u32) {
-            let source = sources.entry(entry.file).or_insert_with(||
-                File::open(source_root.join(&streamed.plan.files[entry.file as usize])));
-            let source = source.as_ref().map_err(|e| anyhow::anyhow!("{e}"))?;
             let pattern = &streamed.plan.patterns[entry.pattern as usize];
-            let mut run = vec![0u8; pattern.run as usize];
-            for (src, dst) in pattern.runs() {
-                source.read_exact_at(&mut run, entry.src_base + src)?;
-                let (mut bytes, mut destination) = (&run[..], entry.dst_base + dst);
-                while !bytes.is_empty() {
-                    let n = packer.push(destination, bytes);
-                    if n == 0 {
-                        send(std::mem::replace(&mut packer, slot::Packer::new(vec![0; slot_bytes as usize])).finish().0)?;
-                        continue;
-                    }
-                    destination += n as u64;
-                    bytes = &bytes[n..];
+            for (src, dst) in pattern.runs() { runs.push((entry.file, entry.src_base + src, entry.dst_base + dst, pattern.run)); }
+        }
+        runs.sort_unstable();
+        for (file, src, dst, length) in runs {
+            let source = sources.entry(file).or_insert_with(||
+                File::open(source_root.join(&streamed.plan.files[file as usize])));
+            let source = source.as_ref().map_err(|e| anyhow::anyhow!("{e}"))?;
+            let mut run = vec![0u8; length as usize];
+            source.read_exact_at(&mut run, src)?;
+            let (mut bytes, mut destination) = (&run[..], dst);
+            while !bytes.is_empty() {
+                let n = packer.push(destination, bytes);
+                if n == 0 {
+                    send(std::mem::replace(&mut packer, slot::Packer::new(vec![0; slot_bytes as usize])).finish().0)?;
+                    continue;
                 }
+                destination += n as u64;
+                bytes = &bytes[n..];
             }
         }
         if !packer.is_empty() { send(packer.finish().0)?; }
@@ -743,5 +748,85 @@ fn fake_source_accept_is_bounded() -> Result<()> {
     let error = crate::shared::memory::push_testing::accept_within(&listener, &socket, Duration::from_secs(1)).err().context("an idle source must fail")?;
     assert!(error.to_string().contains("no rank connected"), "{error}");
     assert!(started.elapsed() < Duration::from_secs(10));
+    Ok(())
+}
+
+/// A shard that stores every expert's scales at its front and the weights
+/// after them (the V4.1 dSpark layout), streamed by one source in file order:
+/// one staged step per expert holding both pieces opens every step at once and
+/// is refused by the staging bound; the recipe that stages only each expert's
+/// contiguous weights (scales landing as operands) keeps one step open and
+/// pinned staging at one buffer.
+#[test]
+#[ignore = "requires an allocated CPU build slot and explicit NVMe fixture directory"]
+fn scales_first_shard_keeps_one_open_step_per_source() -> Result<()> {
+    use crate::shared::experts::rtx::dense::{testing::PEAKS, Job, Operand, Rect, Records, Step, MAX_OPEN_STEPS};
+    let fixture = Fixture::build()?;
+    let library = fixture.load()?;
+    fixture.configure_memory(&library, 0, 64 << 30)?;
+    let root = tempfile::tempdir_in(fixture.directory())?;
+    // A SparkNest-shaped namespace with one shard: 16 scales (4 KiB each), then 16 weights (256 KiB each).
+    let experts = MAX_OPEN_STEPS * 2;
+    let (scale, weight) = (4096usize, 256usize << 10);
+    let shard = root.path().join("model-00001-of-00001.safetensors");
+    std::fs::write(&shard, (0..experts * (scale + weight)).map(|i| (i % 251) as u8).collect::<Vec<_>>())?;
+    let mark = |path: &std::path::Path, name: &std::ffi::CStr, value: &[u8]| -> Result<()> {
+        let path = std::ffi::CString::new(path.as_os_str().as_encoded_bytes())?;
+        // SAFETY: NUL-terminated strings and one live value buffer for the call.
+        let status = unsafe { libc::setxattr(path.as_ptr(), name.as_ptr(), value.as_ptr().cast(), value.len(), 0) };
+        anyhow::ensure!(status == 0, "setxattr: {}", std::io::Error::last_os_error());
+        Ok(())
+    };
+    mark(root.path(), c"user.sparknest.cluster", br#"{"me":"coordinator"}"#)?;
+    mark(&shard, c"user.sparknest.hosts", b"[]")?;
+    let rect = |base: usize, bytes: usize| Rect { name: format!("t{base}"), path: shard.clone(), base: base as u64,
+        row_bytes: bytes, rows: 0..1, cols: 0..bytes };
+    let (scale_at, weight_at) = (|e: usize| e * scale, |e: usize| experts * scale + e * weight);
+    let catalog = cuteafd_loader::read_expert_catalog(&{
+        // Any expert catalog serves only as the replay driver's argument (no TP2 here).
+        let synthetic = tempfile::tempdir_in(fixture.directory())?;
+        let (tensors, _) = qwen4_exl3(2, 4);
+        write_snapshot(synthetic.path(), &qwen4_config(2), &tensors, None);
+        synthetic.keep()
+    })?;
+    let device = Device { library: &library, id: 0 };
+    let sockets = tempfile::tempdir_in(fixture.directory())?;
+    // Old shape: each step stages [scale (front), weight (back)].
+    let staged = crate::shared::memory::DeviceAllocation::new(&library, experts * (scale + weight))?;
+    let mut mixed = Records::default();
+    for e in 0..experts {
+        let dst = cuteafd_ffi::CuteafdDeviceBuffer { bytes: scale + weight, ..staged.buffer };
+        mixed.steps.push(Step { device: 0, rects: vec![rect(scale_at(e), scale), rect(weight_at(e), weight)],
+            jobs: vec![Job::Upload { at: 0, bytes: scale + weight, dst }] });
+    }
+    let refused = receive_pushed(device, &catalog, root.path(), sockets.path(), &mixed, None, 1, 0);
+    anyhow::ensure!(refused.is_err(), "interleaved steps must be refused by the staging bound");
+    PEAKS.with(|p| p.take());
+    // New shape: weights-only steps, scales as operands.
+    let scales = crate::shared::memory::DeviceAllocation::new(&library, experts * scale)?;
+    let weights = crate::shared::memory::DeviceAllocation::new(&library, experts * weight)?;
+    let mut split = Records::default();
+    for e in 0..experts {
+        // SAFETY (offsets): expert e's slices lie inside both allocations.
+        let at = |a: &crate::shared::memory::DeviceAllocation<'_>, off: usize, bytes: usize| cuteafd_ffi::CuteafdDeviceBuffer {
+            ptr: unsafe { a.buffer.ptr.cast::<u8>().add(off) }.cast(), bytes, ..a.buffer };
+        split.operands.push(Operand { device: 0, buffer: at(&scales, e * scale, scale), bytes: scale,
+            lands: vec![(rect(scale_at(e), scale), 0)] });
+        split.steps.push(Step { device: 0, rects: vec![rect(weight_at(e), weight)],
+            jobs: vec![Job::Upload { at: 0, bytes: weight, dst: at(&weights, e * weight, weight) }] });
+    }
+    receive_pushed(device, &catalog, root.path(), sockets.path(), &split, None, 1, 0)?;
+    let peaks = PEAKS.with(|p| p.take());
+    assert_eq!(peaks.len(), 1);
+    let (staged, pinned) = peaks[0];
+    assert_eq!((staged, pinned), (crate::shared::experts::rtx::dense::STEP_BYTES as u64,
+        crate::shared::experts::rtx::dense::STEP_BYTES as u64), "one open step, one pinned buffer");
+    let mut actual = vec![0u8; experts * weight];
+    library.copy_d2h(&mut actual, weights.buffer)?;
+    let file = std::fs::read(&shard)?;
+    assert_eq!(&actual[..], &file[experts * scale..], "weights landed exactly");
+    let mut actual = vec![0u8; experts * scale];
+    library.copy_d2h(&mut actual, scales.buffer)?;
+    assert_eq!(&actual[..], &file[..experts * scale], "scales landed exactly");
     Ok(())
 }

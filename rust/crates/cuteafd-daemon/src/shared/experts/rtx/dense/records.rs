@@ -97,9 +97,10 @@ pub(crate) enum Job {
     /// 16-row tile is independent, so row windows reproduce the whole pack.
     W8a16Pack { n: usize, k: usize, rule: crate::shared::fp8_linear::Fp8Scales,
         packed: CuteafdDeviceBuffer, scale: CuteafdDeviceBuffer },
-    /// One native MXFP4 expert staged as six tensors at `ranges` (W1, W3, W2
-    /// weights then scales), packed into its slice of the four planes.
-    NativeExpert { intermediate: u32, ranges: [Range<usize>; 6], planes: [CuteafdDeviceBuffer; 4] },
+    /// One plane (`plane`: 0 gate/up weights, 2 down weights) of a native
+    /// MXFP4 expert packed from its fused raw image at staged `at..at + bytes`
+    /// (plane 0: up rows then gate rows, each padded) into `dst`.
+    NativePlane { intermediate: u32, plane: u32, at: usize, bytes: usize, dst: CuteafdDeviceBuffer },
 }
 
 /// A device-to-device transform of landed class-2 bytes, run once every
@@ -108,11 +109,14 @@ pub(crate) enum Job {
 pub(crate) enum Finish {
     /// V4.1 UE8M0 scales `[n/32, k/32]` packed for the `(k, n)` FP8 matrix kernel.
     V41Scales { capacity: u32, k: u32, n: u32, source: CuteafdDeviceBuffer, packed: CuteafdDeviceBuffer },
+    /// One plane of a native expert packed from its landed raw image (the
+    /// scale planes: their raw bytes sit apart from the weights in the file).
+    NativePlane { intermediate: u32, plane: u32, source: CuteafdDeviceBuffer, dst: CuteafdDeviceBuffer },
 }
 
 impl Finish {
     pub fn device(&self) -> i32 {
-        match self { Finish::V41Scales { packed, .. } => packed.device_id }
+        match self { Finish::V41Scales { packed, .. } | Finish::NativePlane { dst: packed, .. } => packed.device_id }
     }
 
     /// On the current device (`device`), on `stream` (the caller drains).
@@ -124,6 +128,12 @@ impl Finish {
                 // SAFETY: both buffers are live operand allocations on the current
                 // device; the kernel checks their extents, the caller drains.
                 unsafe { kernel.pack_scales(source, packed, stream) }
+            }
+            Finish::NativePlane { intermediate, plane, source, dst } => {
+                ensure!(source.device_id == dst.device_id, "plane pack across GPUs");
+                // SAFETY: both buffers are live operand allocations on the current
+                // device; the native entry point checks extents, the caller drains.
+                unsafe { library.v41_pack_plane_async(source, dst, intermediate, plane, stream) }
             }
         }
     }
@@ -192,19 +202,14 @@ impl Step {
                         library.cuda_stream_synchronize(stream)
                     })?;
                 }
-                Job::NativeExpert { intermediate, ref ranges, planes } => {
-                    ensure!(ranges.iter().all(|r| r.end <= self.bytes() && r.start % 4 == 0),
-                        "native expert outside its step");
-                    let packer = library.v41_expert_packer(intermediate)?;
-                    let sizes = packer.packed_bytes();
-                    ensure!(planes.iter().zip(sizes).all(|(p, s)| p.bytes as u64 >= s), "native expert planes too small");
+                Job::NativePlane { intermediate, plane, at, bytes, dst } => {
+                    ensure!(at + bytes <= self.bytes() && at % 4 == 0, "native plane outside its step");
                     let base = device_copy(scratch)?;
-                    // SAFETY: the six sources lie in the live device scratch (checked
-                    // above), the planes are live operand slices; the stream drains
-                    // before the scratch is reused.
-                    load_timing::quantize(self.bytes(), || unsafe {
-                        packer.pack(std::array::from_fn(|i| base.add(ranges[i].start)),
-                            planes.map(|p| p.ptr.cast::<u8>()), stream)?;
+                    // SAFETY: the plane's source lies in the live device scratch (checked
+                    // above), `dst` is a live operand slice; drained before reuse.
+                    let source = CuteafdDeviceBuffer { ptr: unsafe { base.add(at) }.cast_mut().cast(), bytes, ..dst };
+                    load_timing::quantize(bytes, || unsafe {
+                        library.v41_pack_plane_async(source, dst, intermediate, plane, stream)?;
                         library.cuda_stream_synchronize(stream)
                     })?;
                 }
