@@ -555,11 +555,11 @@ pub fn solve_working_set(inputs: &GlmInputs<'_>, serial_tp2_workspace: [u64; 2],
 
 /// Header-only draft storage shared by plan and serve (mode 0 is GLM's W8A16).
 pub fn drafter_bytes(snapshot: &std::path::Path, slots: usize, sequences: usize,
-    sms: u64, bf16: bool) -> anyhow::Result<u64> {
+    sms: u64, bf16: bool, kv_cache: crate::families::qwen4::Qwen4KvCache) -> anyhow::Result<u64> {
     use crate::families::glm5::draft_representation::{draft_resident_bytes_with_mode, GlmDraftRepresentation};
     let config = crate::plan::checkpoint::read_json(&snapshot.join("config.json"))?;
     let (owned, scratch) = draft_resident_bytes_with_mode(&config, slots, sequences, sms,
-        if bf16 { GlmDraftRepresentation::Bf16Only } else { GlmDraftRepresentation::Fp8Only }, 0)?;
+        if bf16 { GlmDraftRepresentation::Bf16Only } else { GlmDraftRepresentation::Fp8Only }, 0, kv_cache)?;
     owned.checked_add(scratch).ok_or_else(|| anyhow::anyhow!("GLM draft storage overflow"))
 }
 

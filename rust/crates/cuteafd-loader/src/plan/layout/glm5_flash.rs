@@ -118,7 +118,7 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyMo
             let slots = options.draft_context_slots.unwrap_or(sequences.max(8)) as usize;
             let batch = options.draft_sequences.max(sequences).min(slots as u64) as usize;
             let (bytes, scratch) = glmf::drafter_inventory(&config, slots, batch,
-                &draft_sms, crate::families::glm5::draft_representation::GlmDraftRepresentation::Fp8Only, 2)?;
+                &draft_sms, crate::families::glm5::draft_representation::GlmDraftRepresentation::Fp8Only, 2, options.draft_kv_cache)?;
             let bridge = if ranks == 2 && glmf::remote_dflash_requested() {
                 glmf::drafter_bridge_inventory(&config, slots, batch)? } else { None };
             (bytes, scratch, bridge)

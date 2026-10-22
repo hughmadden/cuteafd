@@ -38,6 +38,9 @@ use std::time::Instant;
 /// What every GLM 5.3 Flash command needs to stand up the engine.
 #[derive(Debug, Clone, clap::Args)]
 pub(crate) struct EngineArgs {
+    /// Shared GQA drafter-ring storage (independent of weight precision).
+    #[arg(long, default_value = "fp8")]
+    pub draft_kv_cache: cuteafd_loader::families::qwen4::Qwen4KvCache,
     /// Checkpoint snapshot (coordinator weights, config, tokenizer).
     #[arg(long)]
     pub snapshot: PathBuf,
@@ -1498,7 +1501,7 @@ impl Opened {
             let batch = args.draft_sequences.min(slots);
             let (bytes, scratch) = admission::drafter_inventory(&config, slots, batch, &draft_sms,
                 cuteafd_loader::families::glm5::draft_representation::GlmDraftRepresentation::from_fp8_option(args.draft_fp8),
-                args.draft_linear.code() as u8)?;
+                args.draft_linear.code() as u8, args.draft_kv_cache)?;
             let bridge = if prepared_draft.is_some() { admission::drafter_bridge_inventory(&config, slots, batch)? }
                 else { None };
             Ok((bytes, scratch, bridge))
@@ -2107,12 +2110,12 @@ impl Opened {
                 .map_err(|_| anyhow::anyhow!("drafter read panicked"))??;
             let device = prepared.stream.device;
             let draft = device.own(|| DflashDrafter::load(&self.library, snapshot, file, prepared.stream.raw,
-                slots, args.draft_sequences.min(slots), mask, true, representation, args.fp8_scales, args.draft_linear))?;
+                slots, args.draft_sequences.min(slots), mask, true, representation, args.fp8_scales, args.draft_linear, args.draft_kv_cache))?;
             dspark::Drafter::RemoteDflash(remote_dflash::RemoteDflash::new(draft, prepared)?)
         } else {
             dspark::Drafter::load(&self.library, snapshot, stream, slots, args.draft_sequences.min(slots),
                 embedding, self.cfg.hidden, self.cfg.vocab_size, self.cfg.layers, representation, args.fp8_scales,
-                args.draft_linear)?
+                args.draft_linear, args.draft_kv_cache)?
         };
         drafter.set_draft_head(args.draft_head);
         tracing::info!(elapsed_ms = started.elapsed().as_millis() as u64, draft_head = ?args.draft_head,

@@ -53,7 +53,7 @@ pub(super) fn spec_decode<'a>(args: &GoldenArgs, library: &'a NativeLibrary, pro
     // Full checkpoint context is charged before target pool selection; no
     // diagnostic-sized truncation is allowed to masquerade as serving admission.
     let (owned, scratch) = block_dspark_resident_bytes(&config, 1, 1, library.sm_count()? as u64,
-        GlmDraftRepresentation::Bf16Only, Fp8Rows::W8a16.code() as u8, cfg.max_context)?;
+        GlmDraftRepresentation::Bf16Only, Fp8Rows::W8a16.code() as u8, cfg.max_context, cuteafd_loader::families::qwen4::Qwen4KvCache::Bf16)?;
     let mut engine = DenseEngine::with_prefix(library, programs, checkpoint, cfg.clone(), args.pool_tokens,
         Some(DrafterBytes { owned, scratch }), 1, None)?;
     ensure!(required <= engine.pool_tokens, "spec decode exceeds admitted target pool");
@@ -84,7 +84,7 @@ pub(super) fn spec_decode<'a>(args: &GoldenArgs, library: &'a NativeLibrary, pro
     let drafter = DsparkDrafter::load_admitted(library, snapshot,
         weights.join().map_err(|_| anyhow::anyhow!("draft tensor loader panicked"))??,
         stream, 1, 1, mask, GlmDraftRepresentation::Bf16Only, Fp8Scales::Amax, Fp8Rows::W8a16,
-        cfg.max_context)?;
+        cfg.max_context, cuteafd_loader::families::qwen4::Qwen4KvCache::Bf16)?;
     drafter.prepare_workspace()?;
     let mut last = vec![];
     let mut position = 0;

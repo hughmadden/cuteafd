@@ -5559,3 +5559,60 @@ resolves that revision through hardlinks without another weight copy. Completion
 records remain in the run root. No capture directories, packed candidate tensors
 or rolling frontiers remain. GPU ownership was released. Full-model generation
 and serving qualification remain separate, unperformed work.
+
+## Kimi K3 incremental core K6 (Oliver, 2026-10-20)
+
+The user authorized `wrldsuksgo2mars/Kimi-K3-EXL3-K2-Core-K6`: retain the
+published K2 expert bytes and quantize exactly 926 reviewed dense projections
+to standard EXL3 K6. The inventory is executable in
+`quantization/kimi_k3/core_k6/recipe.py`; all excluded tensors are independently
+compared byte-for-byte during assembly. Expected tensor payload:
+731,275,813,496 bytes (681.05 GiB), 62.50 GiB below the base. The 24 MLA kv_a
+matrices retain native output width 576, with standard 128-channel EXL3 storage
+padded to 640 and cropped only after complete reconstruction.
+
+Use the same full 1,426-prompt, 1,201,086-token native Kimi calibration stream.
+Every new projection sees reconstructed K6 predecessors and the immutable K2
+experts; dense Hessians contain actual observations only, with no identity rows.
+Attention entry, MLA q_b, attention output, MoE entry, shared down, latent up
+and final AttnRes/norm-to-head inputs form separate causal calibration phases.
+Completed phase manifests, serialized projection receipts, an audited layer
+shard and the successor frontier are the successive retirement barriers.
+
+Implementation: `quantization/kimi_k3/core_k6/`. Use its `launch.py` with the
+same path flags and `--publish`; recovery adds `--resume`. Quantization runs
+inside the local SM120 container with the uv `.venv`, bounded gpu1 hardware
+admission, 86 GiB CUDA allocation ceiling, 58 GiB host RSS guard and 64 GiB disk
+reserve. The supervisor releases GPU ownership before CPU-only publication,
+verifies Hub hashes and makes a hardlinked local snapshot. Run root:
+`~/.cache/cuteafd/quantization/kimi-k3-exl3-k2-core-k6/`; export:
+`~/.cache/huggingface/cuteafd-exports/Kimi-K3-EXL3-K2-Core-K6/`.
+
+The base export under `cuteafd-exports/Kimi-K3-EXL3-K2` is fully local on
+Oliver's root NVMe. Its separate default HF hub is now a sparknest symlink;
+this job uses `HF_HUB_CACHE=~/.cache/huggingface/cuteafd-local-hub` for its
+published snapshot so hardlinks remain on NVMe without another checkpoint copy.
+After stable progress, sleep 30 minutes between layer/phase and ETA reports.
+
+Completed and published on 2026-10-22 (Taipei), revision
+`1a28050d2954426a43a3db705e53ca120e5f2b47`. The export contains 94 shards,
+994,590 tensors and 731,275,813,496 payload bytes (681.05 GiB), saving
+62.50 GiB against the K2 base. All 926 core projections used the full calibration
+stream. All 247,296 routed K2 projections and other excluded tensors passed
+the independent byte-preservation audit. Every remote shard checksum passed;
+anonymous Hub access and all local snapshot hardlinks were verified. Both
+completion records and the successful supervisor exit remain in the run root.
+Rolling frontiers and phase captures are retired, the container is stopped,
+and GPU ownership is released. Quantization took about 47 hours; publication
+and remote verification took about 11 minutes. Full-model generation and
+serving qualification remain separate, unperformed work.
+
+Production used GPTQModel `d97ee86801d9315e77ae91de47da061d6e5e6ccf`,
+recorded in its immutable plan and qualification evidence. After publication,
+the fork and pin advance to `2079be3e12f5d62cb82b9f899b521ac705406945` to
+complete the optional Torch-reference loader's logical 576/stored 640 output
+support. It preserves the complete stored Hadamard transforms before cropping.
+Independent focused validation passed 64 CPU cases and 24 RTX CUDA cases,
+covering FP16/BF16/FP32 inputs, bias and batches 1/33. The production native
+loader already supported this geometry. Recovery of the completed producer
+uses its recorded commit; a new producer pin requires fresh admission evidence.

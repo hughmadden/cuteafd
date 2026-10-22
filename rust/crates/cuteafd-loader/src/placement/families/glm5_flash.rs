@@ -186,7 +186,7 @@ pub fn replicated_mla_bytes(cfg: &GlmNextConfig, index: cache::GlmfIndexCache,
 /// Shared checkpoint-derived inventory; linear/attention scratch follows the chosen GPU.
 pub fn drafter_inventory(config: &serde_json::Value, slots: usize, sequences: usize,
     sms: &[u64], representation: crate::families::glm5::draft_representation::GlmDraftRepresentation,
-    mode: u8) -> Result<(u64, Vec<u64>), crate::families::glm5::draft_representation::GlmDraftStorageError> {
+    mode: u8, kv_cache: crate::families::qwen4::Qwen4KvCache) -> Result<(u64, Vec<u64>), crate::families::glm5::draft_representation::GlmDraftStorageError> {
     use crate::families::glm5::draft_representation::{draft_resident_bytes_with_mode, GlmDraftStorageError};
     if ![1, 2].contains(&sms.len()) {
         return Err(GlmDraftStorageError::Unsupported("GLM Flash draft candidate inventory needs one or two GPUs"));
@@ -194,7 +194,7 @@ pub fn drafter_inventory(config: &serde_json::Value, slots: usize, sequences: us
     let mut owned = None;
     let mut scratch = Vec::with_capacity(sms.len());
     for &sms in sms {
-        let (bytes, workspace) = draft_resident_bytes_with_mode(config, slots, sequences, sms, representation, mode)?;
+        let (bytes, workspace) = draft_resident_bytes_with_mode(config, slots, sequences, sms, representation, mode, kv_cache)?;
         if owned.is_some_and(|previous| previous != bytes) {
             return Err(GlmDraftStorageError::Unsupported("GLM Flash owned draft bytes depend on SM count"));
         }
@@ -1148,21 +1148,24 @@ mod tests {
     #[test]
     fn draft_inventory_keeps_owned_bytes_independent_and_scratch_candidate_local() {
         use crate::families::glm5::draft_representation::{draft_resident_bytes_with_mode, GlmDraftRepresentation};
+        use crate::families::qwen4::Qwen4KvCache;
         for mode in 0..=2 {
             for representation in [GlmDraftRepresentation::Fp8Only, GlmDraftRepresentation::Bf16Only] {
-                let (owned, scratch) = drafter_inventory(&draft_config(), 8, 8, &[188, 170], representation, mode).unwrap();
-                for (rank, sms) in [188, 170].into_iter().enumerate() {
-                    assert_eq!((owned, scratch[rank]), draft_resident_bytes_with_mode(&draft_config(), 8, 8,
-                        sms, representation, mode).unwrap());
+                for format in [Qwen4KvCache::Bf16, Qwen4KvCache::Fp8] {
+                    let (owned, scratch) = drafter_inventory(&draft_config(), 8, 8, &[188, 170], representation, mode, format).unwrap();
+                    for (rank, sms) in [188, 170].into_iter().enumerate() {
+                        assert_eq!((owned, scratch[rank]), draft_resident_bytes_with_mode(&draft_config(), 8, 8,
+                            sms, representation, mode, format).unwrap());
+                    }
+                    let attention: Vec<_> = [188, 170].into_iter().map(|sms|
+                        cache::draft_attention_workspace_bytes(8, 8, 2, 2056, 128, sms).unwrap()).collect();
+                    if representation == GlmDraftRepresentation::Bf16Only { assert_eq!(scratch, attention); }
+                    else { assert!(scratch.iter().zip(attention).all(|(&total, arena)| total > arena)); }
+                    assert!(scratch[0] > scratch[1]);
                 }
-                let attention: Vec<_> = [188, 170].into_iter().map(|sms|
-                    cache::draft_attention_workspace_bytes(8, 8, 2, 2056, 128, sms).unwrap()).collect();
-                if representation == GlmDraftRepresentation::Bf16Only { assert_eq!(scratch, attention); }
-                else { assert!(scratch.iter().zip(attention).all(|(&total, arena)| total > arena)); }
-                assert!(scratch[0] > scratch[1]);
             }
         }
-        let (owned, scratch) = drafter_inventory(&draft_config(), 8, 8, &[188, 170], GlmDraftRepresentation::Fp8Only, 2).unwrap();
+        let (owned, scratch) = drafter_inventory(&draft_config(), 8, 8, &[188, 170], GlmDraftRepresentation::Fp8Only, 2, crate::families::qwen4::Qwen4KvCache::Bf16).unwrap();
         let old_attention = 8 * 8 * 17 * 64 * 130 * 4;
         let attention: Vec<_> = [188, 170].into_iter().map(|sms|
             cache::draft_attention_workspace_bytes(8, 8, 2, 2056, 128, sms).unwrap()).collect();
@@ -1222,7 +1225,7 @@ mod tests {
     fn draft_inventory_rejects_bad_devices_and_orphan_or_overflow_scratch() {
         use crate::families::glm5::draft_representation::GlmDraftRepresentation;
         for sms in [vec![], vec![188, 170, 188], vec![0], vec![4097], vec![188, 0]] {
-            assert!(drafter_inventory(&draft_config(), 8, 8, &sms, GlmDraftRepresentation::Fp8Only, 2).is_err());
+            assert!(drafter_inventory(&draft_config(), 8, 8, &sms, GlmDraftRepresentation::Fp8Only, 2, crate::families::qwen4::Qwen4KvCache::Bf16).is_err());
         }
         let cfg = GlmNextConfig::from_hf(&crate::plan::testing::glm5_flash_config(2)).unwrap();
         let mut input = inputs(&cfg, 2, inventory::PRO_TOTAL_BYTES);
@@ -1246,7 +1249,7 @@ mod tests {
                 "num_key_value_heads":8, "head_dim":64, "vocab_size":154880, "rms_norm_eps":1e-6,
                 "rope_parameters":{"rope_type":"default","rope_theta":10000.0}, "hidden_act":"silu",
                 "layer_types":["sliding_attention","sliding_attention","sliding_attention"], "sliding_window":2048}});
-        let (owned, scratch) = drafter_inventory(&config, 8, 8, &[188, 170], GlmDraftRepresentation::Fp8Only, 2).unwrap();
+        let (owned, scratch) = drafter_inventory(&config, 8, 8, &[188, 170], GlmDraftRepresentation::Fp8Only, 2, crate::families::qwen4::Qwen4KvCache::Bf16).unwrap();
         let cfg = GlmNextConfig::from_hf(&crate::plan::testing::glm5_flash_config(2)).unwrap();
         let mut input = inputs(&cfg, 2, inventory::PRO_TOTAL_BYTES);
         input.drafter_bytes = owned;
@@ -1263,7 +1266,7 @@ mod tests {
         let config = draft_config();
         let cfg = GlmNextConfig::from_hf(&crate::plan::testing::glm5_flash_config(2)).unwrap();
         let mut input = inputs(&cfg, 2, inventory::PRO_TOTAL_BYTES);
-        let (owned, scratch) = drafter_inventory(&config, 8, 8, &[188, 170], GlmDraftRepresentation::Fp8Only, 2).unwrap();
+        let (owned, scratch) = drafter_inventory(&config, 8, 8, &[188, 170], GlmDraftRepresentation::Fp8Only, 2, crate::families::qwen4::Qwen4KvCache::Bf16).unwrap();
         input.drafter_bytes = owned;
         input.drafter_scratch = scratch;
         input.drafter_bridge = drafter_bridge_inventory(&config, 8, 8).unwrap();
@@ -1304,7 +1307,7 @@ mod tests {
             // Make one target rank heavier without forcing the Movable's home.
             planned.resident[1 - expected_home as usize].weights += 6 << 30;
             let (owned, scratch) = drafter_inventory(&draft_config(), 8, 8, &[188, 170],
-                GlmDraftRepresentation::Fp8Only, 2).unwrap();
+                GlmDraftRepresentation::Fp8Only, 2, crate::families::qwen4::Qwen4KvCache::Bf16).unwrap();
             planned.drafter_bytes = owned;
             planned.drafter_scratch = scratch;
             planned.drafter_bridge = drafter_bridge_inventory(&draft_config(), 8, 8).unwrap();

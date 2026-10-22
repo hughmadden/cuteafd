@@ -84,7 +84,7 @@ impl<'a> Drafter<'a> {
     #[allow(clippy::too_many_arguments)]
     pub fn load(library: &'a NativeLibrary, snapshot: &Path, stream: *mut c_void, slots: usize, sequences: usize,
         embedding: &TokenEmbedding<'_>, hidden: usize, vocab: usize, layers: usize,
-        representation: GlmDraftRepresentation, scales: fp8_linear::Fp8Scales, fp8_rows: fp8_linear::Fp8Rows)
+        representation: GlmDraftRepresentation, scales: fp8_linear::Fp8Scales, fp8_rows: fp8_linear::Fp8Rows, kv_cache: cuteafd_loader::families::qwen4::Qwen4KvCache)
         -> Result<Self> {
         if is_dspark(snapshot)? {
             let cfg = DsparkConfig::read(snapshot)?;
@@ -94,7 +94,7 @@ impl<'a> Drafter<'a> {
             tracing::info!(mask_source = "target mask_token row", mask_token = cfg.mask_token, "drafter mask source");
             let tensors = prefetch(snapshot).join().map_err(|_| anyhow::anyhow!("drafter read panicked"))??;
             return Ok(Self::Dspark(DsparkDrafter::load(library, snapshot, tensors, stream, slots,
-                sequences.min(MAX_SEQUENCES), mask, representation, scales, fp8_rows)?));
+                sequences.min(MAX_SEQUENCES), mask, representation, scales, fp8_rows, kv_cache)?));
         }
         let cfg = crate::shared::speculation::dflash::DflashConfig::read(snapshot)?;
         ensure!(cfg.hidden == hidden && cfg.vocab == vocab && cfg.taps.iter().all(|&l| l < layers),
@@ -104,7 +104,7 @@ impl<'a> Drafter<'a> {
         let file = crate::shared::speculation::dflash::prefetch(snapshot).join()
             .map_err(|_| anyhow::anyhow!("drafter read panicked"))??;
         Ok(Self::Dflash2(crate::shared::speculation::dflash::DflashDrafter::load(library, snapshot, file, stream, slots,
-            sequences, mask, true, representation, scales, fp8_rows)?))
+            sequences, mask, true, representation, scales, fp8_rows, kv_cache)?))
     }
 
     pub fn prepare_workspace(&self) -> Result<()> {

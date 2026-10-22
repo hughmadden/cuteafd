@@ -29,6 +29,9 @@ use std::time::Instant;
 /// What every MiMo command needs to stand up the engine.
 #[derive(Debug, Clone, clap::Args)]
 pub(crate) struct EngineArgs {
+    /// Shared GQA drafter-ring storage (independent of weight precision).
+    #[arg(long, default_value = "fp8")]
+    pub draft_kv_cache: cuteafd_loader::families::qwen4::Qwen4KvCache,
     /// Checkpoint snapshot (XiaomiMiMo/MiMo-V2-Flash).
     #[arg(long)]
     pub snapshot: PathBuf,
@@ -216,8 +219,10 @@ impl EngineArgs {
     }
 
     fn draft_capacity(&self, block: usize) -> Result<MimoDraftCapacity> {
-        Ok(MimoDraftCapacity::new(self.draft_context_slots.unwrap_or(self.draft_sequences),
-            self.draft_sequences, block)?)
+        let mut capacity = MimoDraftCapacity::new(self.draft_context_slots.unwrap_or(self.draft_sequences),
+            self.draft_sequences, block)?;
+        capacity.kv_cache = self.draft_kv_cache;
+        Ok(capacity)
     }
 
     fn validate_draft_replay(&self, replay: bool) -> Result<()> {
@@ -292,10 +297,14 @@ mod draft_storage_tests {
 
     #[test]
     fn context_slots_do_not_widen_the_admitted_draft_batch() {
-        let args = args(&["--draft-representation", "fp8-only", "--draft-context-slots", "20", "--draft-sequences", "16"]);
-        assert_eq!(args.draft_capacity(8).unwrap(), MimoDraftCapacity {
-            context_slots: 20, max_batch_sequences: 16, block_rows: 128,
-        });
+        use cuteafd_loader::families::qwen4::Qwen4KvCache;
+        for (format, kv_cache) in [("bf16", Qwen4KvCache::Bf16), ("fp8", Qwen4KvCache::Fp8)] {
+            let args = args(&["--draft-representation", "fp8-only", "--draft-context-slots", "20",
+                "--draft-sequences", "16", "--draft-kv-cache", format]);
+            assert_eq!(args.draft_capacity(8).unwrap(), MimoDraftCapacity {
+                context_slots: 20, max_batch_sequences: 16, block_rows: 128, kv_cache,
+            });
+        }
     }
 
 }
@@ -978,7 +987,7 @@ impl Opened {
                 let capacity = args.draft_capacity(cfg.block)?;
                 let representation = self.weight_formats.draft;
                 let drafter = dflash::MimoDrafter::load(&self.library, dir, file, stream, capacity.context_slots,
-                    capacity.max_batch_sequences, mask, representation, args.fp8_scales)?;
+                    capacity.max_batch_sequences, mask, representation, args.fp8_scales, args.draft_kv_cache)?;
                 engine.drafter = Some(drafter);
                 tracing::info!(elapsed_ms = started.elapsed().as_millis() as u64, "DFlash drafter resident");
             }

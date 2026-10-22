@@ -416,6 +416,9 @@ pub(crate) struct PlanArgs {
     /// MiMo drafter batch sequences for --layout (serving raises to concurrency).
     #[arg(long, default_value_t = 4)]
     pub(crate) draft_sequences: u64,
+    /// Shared GQA drafter-ring format for layout admission.
+    #[arg(long, default_value = "fp8")]
+    pub(crate) draft_kv_cache: cuteafd_loader::families::qwen4::Qwen4KvCache,
     /// Explicit MiMo drafter context arena for --layout.
     #[arg(long)]
     pub(crate) draft_context_slots: Option<u64>,
@@ -610,6 +613,32 @@ pub(crate) struct TransportCapabilitiesArgs {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn retained_draft_kv_defaults_to_fp8_and_preserves_explicit_bf16() {
+        use clap::Parser;
+        use cuteafd_loader::families::qwen4::Qwen4KvCache;
+        for (flags, expected) in [(vec![], Qwen4KvCache::Fp8),
+            (vec!["--draft-kv-cache", "bf16"], Qwen4KvCache::Bf16),
+            (vec!["--draft-kv-cache", "fp8"], Qwen4KvCache::Fp8)] {
+            let super::Commands::Plan(args) = super::Cli::try_parse_from(
+                ["cuteafd", "plan", "/model"].into_iter().chain(flags.iter().copied()))
+                .unwrap().command else { panic!("expected plan"); };
+            assert_eq!(args.draft_kv_cache, expected);
+            for command in ["serve-glm", "serve-glmf", "serve-mimo"] {
+                let parsed = super::Cli::try_parse_from(
+                    ["cuteafd", command, "--snapshot", "/model", "--native-lib", "/native.so"]
+                        .into_iter().chain(flags.iter().copied())).unwrap();
+                let actual = match parsed.command {
+                    super::Commands::ServeGlm(args) => args.engine.draft_kv_cache,
+                    super::Commands::ServeGlmf(args) => args.engine.draft_kv_cache,
+                    super::Commands::ServeMimo(args) => args.engine.draft_kv_cache,
+                    _ => panic!("expected retained-ring family"),
+                };
+                assert_eq!(actual, expected, "{command}");
+            }
+        }
+    }
+
     #[test]
     fn fabric_landing_diagnostics_are_bounded_and_opt_in() {
         use clap::Parser;

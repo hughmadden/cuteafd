@@ -59,6 +59,16 @@ struct RingState {
     draft: bool,
 }
 
+impl RingState {
+    fn mark_views(&self, arena: CuteafdDeviceBuffer, base: usize, ring: usize, len: usize)
+        -> Result<Vec<(CuteafdDeviceBuffer, CuteafdDeviceBuffer)>> {
+        runs(ring, self.ring_rows, self.rows, len).into_iter().map(|(ring_row, mark_row, rows)| {
+            Ok((view(self.buffer, ring_row * self.row, rows * self.row)?,
+                view(arena, base + self.offset + mark_row * self.row, rows * self.row)?))
+        }).collect()
+    }
+}
+
 pub(crate) struct MimoPrefix<'e, 'a> {
     engine: &'e MimoEngine<'a>,
     /// Full-attention record pools: (rank, buffer, record bytes).
@@ -123,7 +133,7 @@ impl<'e, 'a> MimoPrefix<'e, 'a> {
         let draft_metadata = if let Some(drafter) = engine.drafter.as_ref().filter(|_| warm_draft) {
             // Leave room for speculative writes and the target mark's capture reach.
             let rows = draft_mark_rows(window);
-            let row = drafter.cfg.kv_width() * 2;
+            let row = drafter.kv_cache.plane_record_bytes(drafter.cfg.kv_heads, drafter.cfg.head_dim);
             for buffer in drafter.context_rings() {
                 states.push(RingState { rank: 0, buffer, row, ring_rows: super::dflash::RING,
                     rows, offset: offsets[0], draft: true });
@@ -132,7 +142,7 @@ impl<'e, 'a> MimoPrefix<'e, 'a> {
             offsets[0] += 8;
             debug_assert_eq!((offsets[0] - draft_offset) as u64,
                 cuteafd_loader::families::mimo_v2::draft_representation::mimo_draft_mark_bytes(
-                    drafter.cfg.layers as u64, drafter.cfg.kv_width() as u64)?);
+                    drafter.cfg.layers as u64, drafter.cfg.kv_heads as u64, drafter.cfg.head_dim as u64, drafter.kv_cache)?);
             Some(Rc::new(Allocation::new(Device { library: engine.library, id: engine.kv_layer_on(0, 0).1.device_id }, engine.rings * 8)?))
         } else { None };
         let mark_bytes: usize = offsets.iter().sum();
@@ -235,9 +245,7 @@ impl<'e, 'a> MimoPrefix<'e, 'a> {
             let arena = self.arenas[state.rank].buffer;
             let base = slot.0 as usize * self.rank_mark_bytes[state.rank];
             let Some(state_ring) = self.state_ring(state, ring) else { continue };
-            for (ring_row, mark_row, rows) in runs(state_ring, state.ring_rows, state.rows, len) {
-                let ring_view = view(state.buffer, ring_row * state.row, rows * state.row)?;
-                let mark_view = view(arena, base + state.offset + mark_row * state.row, rows * state.row)?;
+            for (ring_view, mark_view) in state.mark_views(arena, base, state_ring, len)? {
                 if capture {
                     self.copy(state.rank, mark_view, ring_view)?;
                 } else {
@@ -270,6 +278,20 @@ fn runs(ring: usize, ring_rows: usize, rows: usize, len: usize) -> Vec<(usize, u
 
 impl PrefixFamily for MimoPrefix<'_, '_> {
     type Placement = MimoPlacement;
+
+    fn record_format(&self) -> &'static str {
+        use cuteafd_loader::families::{mimo_v2::MimoKvCache, qwen4::Qwen4KvCache};
+        let draft = self.engine.drafter.as_ref().filter(|_| self.draft_metadata.is_some())
+            .map(|drafter| drafter.kv_cache);
+        match (self.engine.kv_cache(), draft) {
+            (MimoKvCache::Bf16, None) => "mimo_bf16_swa_bf16_draft_cold_v1",
+            (MimoKvCache::Int8, None) => "mimo_int8_group32_swa_bf16_draft_cold_v1",
+            (MimoKvCache::Bf16, Some(Qwen4KvCache::Bf16)) => "mimo_bf16_swa_bf16_draft_bf16_v1",
+            (MimoKvCache::Int8, Some(Qwen4KvCache::Bf16)) => "mimo_int8_group32_swa_bf16_draft_bf16_v1",
+            (MimoKvCache::Bf16, Some(Qwen4KvCache::Fp8)) => "mimo_bf16_swa_bf16_draft_e4m3_head_f32_planar_v1",
+            (MimoKvCache::Int8, Some(Qwen4KvCache::Fp8)) => "mimo_int8_group32_swa_bf16_draft_e4m3_head_f32_planar_v1",
+        }
+    }
 
     fn layout(&self) -> FamilyLayout {
         FamilyLayout {
@@ -397,6 +419,58 @@ mod tests {
         }
         assert_eq!(draft_mark_rows(128), 896);
         assert_eq!(runs(3, ring, 896, 64), vec![(3 * ring, 0, 64)]);
+    }
+
+    #[test]
+    #[ignore = "requires CUTEAFD_NATIVE_LIB and CUDA"]
+    fn native_draft_marks_preserve_record_bytes_at_page_and_ring_frontiers() -> anyhow::Result<()> {
+        use super::{RingState, view};
+        use crate::shared::memory::device::{Allocation, Stream, cache_test_device};
+        use cuteafd_loader::families::qwen4::Qwen4KvCache;
+        // SAFETY: the explicitly selected test library implements the native CUDA ABI.
+        let library = unsafe { cuteafd_ffi::NativeLibrary::load(std::env::var("CUTEAFD_NATIVE_LIB")?)? };
+        let device = cache_test_device(&library)?;
+        device.run(|| {
+            let stream = Stream::new(device)?;
+            for format in [Qwen4KvCache::Bf16, Qwen4KvCache::Fp8] {
+                for (heads, dim, ring_rows) in [(1, 64, 1024), (2, 128, 1024), (8, 128, 2048)] {
+                    let row = format.plane_record_bytes(heads, dim);
+                    let ring = Allocation::new(device, 3 * ring_rows * row)?;
+                    let arena = Allocation::new(device, ring_rows * row + 32)?;
+                    let state = RingState { rank: 0, buffer: ring.buffer, row, ring_rows,
+                        rows: ring_rows - 128, offset: 16, draft: true };
+                    for len in [1, 63, 64, 65, ring_rows - 1, ring_rows, ring_rows + 1,
+                        2 * ring_rows - 1, 2 * ring_rows + 1] {
+                        let source: Vec<u8> = (0..ring.buffer.bytes).map(|i| ((i * 37 + len) % 251) as u8).collect();
+                        library.copy_h2d(ring.buffer, &source)?;
+                        // Exercise the production mark range generator for capture on slot 1.
+                        for (src, dst) in state.mark_views(arena.buffer, 0, 1, len)? {
+                            // SAFETY: checked views are live on this device and ordered on the owned stream.
+                            unsafe { library.copy_d2d_async(dst, src, src.bytes, stream.raw)?; }
+                        }
+                        // Restore into another ring after poisoning every destination byte.
+                        let destination = view(ring.buffer, 2 * ring_rows * row, ring_rows * row)?;
+                        // SAFETY: the destination and prior copies are on this owned stream.
+                        unsafe { library.cuda_zero_bytes_async(destination, destination.bytes, stream.raw)?; }
+                        for (dst, src) in state.mark_views(arena.buffer, 0, 2, len)? {
+                            // SAFETY: checked views are live on this device and ordered on the owned stream.
+                            unsafe { library.copy_d2d_async(dst, src, src.bytes, stream.raw)?; }
+                        }
+                        // SAFETY: retire every queued copy before host inspection or storage release.
+                        unsafe { library.cuda_stream_synchronize(stream.raw)?; }
+                        let mut actual = vec![0; destination.bytes];
+                        library.copy_d2h(&mut actual, destination)?;
+                        let mut expected = vec![0; destination.bytes];
+                        for (ring_row, _, rows) in runs(1, ring_rows, state.rows, len) {
+                            let at = (ring_row % ring_rows) * row;
+                            expected[at..at + rows * row].copy_from_slice(&source[ring_row * row..(ring_row + rows) * row]);
+                        }
+                        assert_eq!(actual, expected, "{format} H{heads} D{dim} frontier {len}");
+                    }
+                }
+            }
+            Ok(())
+        })
     }
 
     #[test]
