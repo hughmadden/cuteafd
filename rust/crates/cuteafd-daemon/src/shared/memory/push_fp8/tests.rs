@@ -1,5 +1,5 @@
 use super::*;
-use cuteafd_loader::plan::testing::{fp8, mimo_flash_config, nvfp4, write_snapshot};
+use cuteafd_loader::plan::testing::{fp8, mimo_flash_config, mxfp4, nvfp4, write_snapshot};
 use std::{fs::File, os::unix::fs::FileExt};
 
 pub(crate) fn fixture(
@@ -29,10 +29,10 @@ pub(crate) fn fixture(
             [("gate", 1024, 128), ("up", 1024, 128), ("down", 128, 1024)]
         {
             let name = format!("model.layers.1.mlp.experts.{expert}.{projection}_proj");
-            tensors.extend(if format == ExpertFormat::Nvfp4 {
-                nvfp4(&name, rows, columns)
-            } else {
-                fp8(&name, rows, columns, None)
+            tensors.extend(match format {
+                ExpertFormat::Nvfp4 => nvfp4(&name, rows, columns),
+                ExpertFormat::Mxfp4 => mxfp4(&name, rows, columns),
+                _ => fp8(&name, rows, columns, None),
             });
         }
     }
@@ -119,6 +119,22 @@ fn landed(checked: &CheckedPlan, root: &Path, rank: usize) -> Result<Vec<u8>> {
     Ok(image)
 }
 
+/// The host model of the post-Done spreading: packed grids (no BF16 here)
+/// spread to their row pitch with zero padding, as `push_initialize` does.
+fn spread_packed(plan: &RankPlan, image: &mut [u8]) {
+    for layer in &plan.layers {
+        let push_initialize::Layer::Fp8 { expand, .. } = &layer.initialize else { continue };
+        for (region, rows, width, pitch) in expand {
+            let packed = image[region.start..region.start + rows * width].to_vec();
+            let out = &mut image[region.start..region.start + rows * pitch];
+            out.fill(0);
+            for (row, bytes) in packed.chunks_exact(*width).enumerate() {
+                out[row * pitch..row * pitch + width].copy_from_slice(bytes);
+            }
+        }
+    }
+}
+
 pub(crate) fn compare(
     plan: &RankPlan,
     catalog: &OfficialV41Catalog,
@@ -198,13 +214,9 @@ fn planar_rank_images_match_mount_at_tp4_tp6_with_native_scalar_tails() -> Resul
                             .is_err()
                     );
                     let checked = plan.checked(&catalog, root.path(), world, rank)?;
-                    compare(
-                        &plan,
-                        &catalog,
-                        world,
-                        rank,
-                        &landed(&checked, root.path(), rank)?,
-                    )?;
+                    let mut image = landed(&checked, root.path(), rank)?;
+                    spread_packed(&plan, &mut image);
+                    compare(&plan, &catalog, world, rank, &image)?;
                     let good = Offer {
                         rank,
                         host: format!("rank-{rank}"),
@@ -256,16 +268,25 @@ fn ready_native_views_match_mount_and_retain_one_arena() -> Result<()> {
         (ExpertFormat::Fp8Block128, false),
         (ExpertFormat::Fp8Block128, true),
         (ExpertFormat::Nvfp4, false),
+        (ExpertFormat::Mxfp4, false),
     ] {
         let root = tempfile::tempdir_in(native.directory())?;
         let catalog = fixture(root.path(), format, bf16)?;
-        let plan = RankPlan::new(
-            &catalog,
-            &[(1, Slicing::Padded), (2, Slicing::Padded)],
-            6,
-            5,
-            usize::MAX,
-        )?;
+        // MXFP4 serves exact native-unit slices (MiMo V2.6 Pro): TP6 down
+        // widths of 5-6 K/32 scale bytes pad to an 8-byte row, landed packed.
+        let slicing = if format == ExpertFormat::Mxfp4 {
+            catalog.fp8().unwrap().for_layer_metadata(1)?.exact_slicing(6)
+        } else { Slicing::Padded };
+        let layers = [(1, slicing), (2, Slicing::Padded)];
+        let plan = RankPlan::new(&catalog, &layers, 6, 5, usize::MAX)?;
+        if format == ExpertFormat::Mxfp4 {
+            let push_initialize::Layer::Fp8 { expand, .. } = &plan.layers[0].initialize else { unreachable!() };
+            assert!(!expand.is_empty() && expand.iter().all(|(_, _, w, p)| w < p), "padded down scales land packed");
+            let checked = plan.checked(&catalog, root.path(), 6, 5)?;
+            let pad = checked.plan.patterns.iter().filter(|p| p.dims.iter().any(|d| d.dst_stride > u64::from(p.run))
+                && p.run < 16).count();
+            assert_eq!(pad, 0, "no scale run lands with a destination pad");
+        }
         let checked = plan.checked(&catalog, root.path(), 6, 5)?;
         let image = landed(&checked, root.path(), 5)?;
         let mut arena = LoadingArena::new(
@@ -298,13 +319,7 @@ fn ready_native_views_match_mount_and_retain_one_arena() -> Result<()> {
             0,
         )?);
         let mut actual = vec![0; image.len()];
-        let plan = RankPlan::new(
-            &catalog,
-            &[(1, Slicing::Padded), (2, Slicing::Padded)],
-            6,
-            5,
-            usize::MAX,
-        )?;
+        let plan = RankPlan::new(&catalog, &layers, 6, 5, usize::MAX)?;
         for region in 0..plan.layers.len() {
             library.copy_d2h(
                 &mut actual[plan.layout.region(region)?],

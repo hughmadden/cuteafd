@@ -106,7 +106,7 @@ pub(crate) fn prepare(snapshot: &Path, catalog: &OfficialV41Catalog, layers: &[u
     // Only validated, worker-reported placements become source/destination plans.
     let mut builder = Builder::new(&root, offers.iter().map(|o| o.arena_bytes).collect());
     for (rank, plan) in plans.iter().enumerate() { plan.append(&mut builder, catalog, u32::try_from(rank)?)?; }
-    if let Some(coordinator) = coordinator { (coordinator.append)(&mut builder, catalog, &offers[sparks..])?; }
+    if let Some(coordinator) = coordinator { (coordinator.append)(&mut builder, Some(catalog), &offers[sparks..])?; }
     let appended = started.elapsed();
     let checked = builder.finish()?;
     let checked_at = started.elapsed();
@@ -130,7 +130,26 @@ pub(crate) fn prepare(snapshot: &Path, catalog: &OfficialV41Catalog, layers: &[u
 /// In-process coordinator-GPU ranks of a Spark push group.
 pub(crate) struct CoordinatorRanks {
     pub ranks: usize,
-    pub append: Box<dyn Fn(&mut Builder, &OfficialV41Catalog, &[Offer]) -> Result<()> + Send>,
+    pub append: Box<dyn Fn(&mut Builder, Option<&OfficialV41Catalog>, &[Offer]) -> Result<()> + Send>,
+}
+
+/// A push group of coordinator ranks alone (no Spark peers): every offer is a
+/// coordinator GPU and `coordinator` appends all of their entries.
+pub(crate) fn prepare_coordinator(snapshot: &Path, catalog: Option<&OfficialV41Catalog>, offers: &[Offer],
+    coordinator: &CoordinatorRanks, client: &PushClient) -> Result<PushGroup> {
+    let (root, _) = cuteafd_loader::push_load::namespace(snapshot)?;
+    ensure!(offers.len() == coordinator.ranks, "coordinator push offers differ from its ranks");
+    let mut builder = Builder::new(&root, offers.iter().map(|o| o.arena_bytes).collect());
+    (coordinator.append)(&mut builder, catalog, offers)?;
+    let checked = builder.finish()?;
+    ensure!(checked.plan.files.iter().all(|file| cuteafd_loader::push_load::is_push_shard(&root.join(file))),
+        "coordinator push source is not a SparkNest shard");
+    let ranks = offers.iter().map(|offer| Ok(cuteafd_loader::push_load::proto::RankSpec {
+        rank: u32::try_from(offer.rank)?, host: offer.host.clone(), arena_bytes: offer.arena_bytes,
+    })).collect::<Result<Vec<_>>>()?;
+    let group = client.create(ranks, checked.plan.files.clone())?;
+    checked.upload(&group)?;
+    Ok(group)
 }
 
 pub(crate) fn validate_offer(offer: &Offer, rank: usize,

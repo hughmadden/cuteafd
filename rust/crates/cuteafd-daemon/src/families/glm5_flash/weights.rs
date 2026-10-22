@@ -31,7 +31,7 @@
 use crate::shared::experts::rtx::dense::{Job, Rect};
 use crate::shared::fp8_load_quant::Target;
 use crate::shared::memory::DeviceAllocation;
-use crate::shared::peer_split::{slice_2d, Axis, RankDevice};
+use crate::shared::peer_split::{Axis, RankDevice};
 use anyhow::{ensure, Context, Result};
 use cuteafd_core::DType;
 use cuteafd_loader::kda::{KdaGeometry, KdaOutputGate, KdaRole, KdaOperand, KdaError};
@@ -299,10 +299,8 @@ impl<'a> GlmfLoader<'a> {
     /// FP8 copy is the only resident one).
     fn fp8(&self, names: &[String], layout: super::fp8::Layout) -> Result<(DeviceAllocation<'a>, DeviceAllocation<'a>)> {
         let _memory_format = cuteafd_ffi::memory_ledger::format("fp8");
-        if layout == super::fp8::Layout::Block {
-            if let Some(copy) = self.fp8_blocks(names)? {
-                return Ok(copy);
-            }
+        if layout == super::fp8::Layout::Block && self.all_native_blocks(names)? {
+            return self.native_blocks(0, names, None);
         }
         if self.all_bf16(names)? {
             let parts = names.iter().map(|n| QuantPart::Tensor(n)).collect::<Vec<_>>();
@@ -312,43 +310,76 @@ impl<'a> GlmfLoader<'a> {
         Ok((self.upload(&values)?, self.upload(&scales)?))
     }
 
-    /// The primary checkpoint's own E4M3 blocks and FP32 128x128 grids of `names`
-    /// (row-concatenated) on the device, read through this thread's staging
-    /// buffer; None when a part is not an FP8 tensor there (quantized instead).
-    fn fp8_blocks(&self, names: &[String]) -> Result<Option<(DeviceAllocation<'a>, DeviceAllocation<'a>)>> {
-        let _memory_format = cuteafd_ffi::memory_ledger::format("fp8");
-        let checkpoint = self.checkpoint;
-        let find = |name: &str| -> Result<&'a CheckpointTensor> {
-            let at = checkpoint.tensors.binary_search_by(|t| t.meta.name.as_str().cmp(name))
-                .map_err(|_| anyhow::anyhow!("FP8 checkpoint has no tensor {name}"))?;
-            Ok(&checkpoint.tensors[at])
-        };
-        let tensors = names.iter().map(|n| find(n)).collect::<Result<Vec<_>>>()?;
-        if tensors.iter().any(|t| t.meta.dtype != DType::F8E4M3 || t.meta.shape.len() != 2) {
-            return Ok(None);
-        }
-        let total: usize = tensors.iter().map(|t| t.meta.byte_length as usize).sum();
-        crate::shared::memory::staging::with_staging(total, |values| {
-            let (mut grid, mut at) = (Vec::new(), 0usize);
-            for (i, (name, tensor)) in names.iter().zip(&tensors).enumerate() {
-                let shape = &tensor.meta.shape;
-                ensure!(shape[1] == tensors[0].meta.shape[1] && (i + 1 == names.len() || shape[0] % 128 == 0),
-                    "{names:?}: FP8 rows must share columns and fill whole 128-row blocks but the last");
-                let length = tensor.meta.byte_length as usize;
-                crate::shared::memory::load_timing::read(length, || std::fs::File::open(checkpoint.snapshot.join(&tensor.shard))?
-                    .read_exact_at(&mut values[at..at + length], tensor.meta.byte_offset))
-                    .with_context(|| format!("reading {name}"))?;
-                at += length;
-                let scale = find(&format!("{name}_scale_inv"))?;
-                ensure!(scale.meta.dtype == DType::F32 && scale.meta.shape == [shape[0] / 128, shape[1].div_ceil(128)],
-                    "{name}: expected FP32 128x128 block scales, found {:?} {:?}", scale.meta.dtype, scale.meta.shape);
-                let mut bytes = vec![0u8; scale.meta.byte_length as usize];
-                crate::shared::memory::load_timing::read(bytes.len(), || std::fs::File::open(checkpoint.snapshot.join(&scale.shard))?
-                    .read_exact_at(&mut bytes, scale.meta.byte_offset))?;
-                grid.extend_from_slice(&bytes);
-            }
-            Ok(Some((self.upload(values)?, self.upload(&grid)?)))
+    /// Whether every name is a native E4M3 matrix with FP32 128x128 `_scale_inv`
+    /// blocks in the source checkpoint.
+    fn all_native_blocks(&self, names: &[String]) -> Result<bool> {
+        let source = self.checkpoint;
+        names.iter().try_fold(true, |all, name| {
+            let tensor = Self::source_tensor(source, name)?;
+            Ok(all && tensor.meta.dtype == DType::F8E4M3 && tensor.meta.shape.len() == 2)
         })
+    }
+
+    fn source_tensor(source: &'a Checkpoint, name: &str) -> Result<&'a CheckpointTensor> {
+        let at = source.tensors.binary_search_by(|t| t.meta.name.as_str().cmp(name))
+            .map_err(|_| anyhow::anyhow!("FP8 checkpoint has no tensor {name}"))?;
+        Ok(&source.tensors[at])
+    }
+
+    /// The checkpoint's own E4M3 blocks and FP32 128x128 grids of `names`
+    /// (row-concatenated), landing unchanged on rank `rank` (class 2). With
+    /// `split = (axis, ranks)`, rank `rank`'s whole-128-block share of each
+    /// tensor: rows, or a column window of every row (values and grid alike).
+    fn native_blocks(&self, rank: usize, names: &[String], split: Option<(Axis, usize)>)
+        -> Result<(DeviceAllocation<'a>, DeviceAllocation<'a>)> {
+        let _memory_format = cuteafd_ffi::memory_ledger::format("fp8");
+        let source = self.checkpoint;
+        let (mut values, mut grids) = (Vec::new(), Vec::new());
+        let (mut at, mut grid_at, mut width) = (0usize, 0usize, None);
+        for (i, name) in names.iter().enumerate() {
+            let tensor = Self::source_tensor(source, name)?;
+            let shape = &tensor.meta.shape;
+            ensure!(tensor.meta.dtype == DType::F8E4M3 && shape.len() == 2, "{name}: expected an E4M3 matrix");
+            let (rows, cols) = (shape[0], shape[1]);
+            let scale_name = format!("{name}_scale_inv");
+            let scale = Self::source_tensor(source, &scale_name)?;
+            ensure!(scale.meta.dtype == DType::F32 && scale.meta.shape == [rows.div_ceil(128), cols.div_ceil(128)],
+                "{name}: expected FP32 128x128 block scales, found {:?} {:?}", scale.meta.dtype, scale.meta.shape);
+            let (kb, rb) = (cols.div_ceil(128), rows.div_ceil(128));
+            let (row_range, col_range, grid_rows, grid_cols) = match split {
+                None => {
+                    ensure!(i + 1 == names.len() || rows % 128 == 0,
+                        "{names:?}: FP8 rows must fill whole 128-row blocks but the last");
+                    (0..rows, 0..cols, 0..rb, 0..kb)
+                }
+                Some((axis, ranks)) => {
+                    ensure!(rows % 128 == 0 && cols % 128 == 0, "{name}: split FP8 blocks require whole 128x128 \
+                        blocks, found {shape:?}");
+                    let along = if axis == Axis::Rows { rows } else { cols };
+                    ensure!(along % (128 * ranks) == 0, "{name}: [{rows}, {cols}] does not split into whole 128 \
+                        blocks over {ranks} GPUs");
+                    let share = along / ranks;
+                    let window = rank * share..(rank + 1) * share;
+                    let blocks = window.start / 128..window.end / 128;
+                    match axis {
+                        Axis::Rows => (window, 0..cols, blocks, 0..kb),
+                        Axis::Cols => (0..rows, window, 0..rb, blocks),
+                    }
+                }
+            };
+            ensure!(width.is_none_or(|w| w == col_range.len()), "{names:?}: FP8 rows must share columns");
+            width = Some(col_range.len());
+            let value = Rect { name: name.clone(), path: source.snapshot.join(&tensor.shard),
+                base: tensor.meta.byte_offset, row_bytes: cols, rows: row_range, cols: col_range };
+            let grid = Rect { name: scale_name, path: source.snapshot.join(&scale.shard),
+                base: scale.meta.byte_offset, row_bytes: kb * 4, rows: grid_rows, cols: grid_cols.start * 4..grid_cols.end * 4 };
+            let (bytes, grid_bytes) = (value.bytes(), grid.bytes());
+            values.push((value, at));
+            grids.push((grid, grid_at));
+            at += bytes;
+            grid_at += grid_bytes;
+        }
+        Ok((self.landed(rank, values, at)?, self.landed(rank, grids, grid_at)?))
     }
 
     /// `parts` row-concatenated and quantized on the current device: E4M3 values
@@ -454,7 +485,10 @@ impl<'a> GlmfLoader<'a> {
     fn fp8_on(&self, rank: usize, names: &[String], layout: super::fp8::Layout)
         -> Result<(DeviceAllocation<'a>, DeviceAllocation<'a>)> {
         if rank == 0 { return self.fp8(names, layout); }
-        ensure!(self.all_bf16(names)?, "{names:?}: native FP8 replicas load through the mount");
+        if layout == super::fp8::Layout::Block && self.all_native_blocks(names)? {
+            return self.native_blocks(rank, names, None);
+        }
+        ensure!(self.all_bf16(names)?, "{names:?}: FP8 {layout:?} replicas take BF16 or native block sources");
         let parts = names.iter().map(|n| QuantPart::Tensor(n)).collect::<Vec<_>>();
         self.on_rank(rank, || self.gpu_fp8(&parts, layout, false, rank))
     }
@@ -853,7 +887,9 @@ impl<'a> GlmfLoader<'a> {
     }
 
     /// The selected source's 2-D `name` as E4M3 blocks, quantized from BF16
-    /// when necessary: values, FP32 scale grid, rows, cols.
+    /// when necessary: values, FP32 scale grid, rows, cols (the host
+    /// reference of the GPU block quantization).
+    #[cfg(test)]
     fn fp8_block_host(checkpoint: &Checkpoint, name: &str, scales: crate::shared::fp8_linear::Fp8Scales)
         -> Result<(Vec<u8>, Vec<u8>, usize, usize)> {
         let read = |name: &str| -> Result<(Vec<u8>, DType, Vec<usize>)> {
@@ -892,20 +928,8 @@ impl<'a> GlmfLoader<'a> {
         if self.all_bf16(names)? {
             return self.gpu_fp8_split(names, axis, ranks);
         }
-        let (mut values, mut grids) = (vec![Vec::new(); ranks], vec![Vec::new(); ranks]);
-        for name in names {
-            let (v, g, rows, cols) = Self::fp8_block_host(self.checkpoint, name,
-                self.fp8_scales)?;
-            let along = if axis == Axis::Rows { rows } else { cols };
-            ensure!(along % (128 * ranks) == 0, "{name}: [{rows}, {cols}] does not split into whole 128 blocks over \
-                {ranks} GPUs");
-            for rank in 0..ranks {
-                values[rank].extend(slice_2d(&v, rows, cols, 1, axis, rank, ranks));
-                grids[rank].extend(slice_2d(&g, rows / 128, cols / 128, 4, axis, rank, ranks));
-            }
-        }
-        values.into_iter().zip(grids).enumerate()
-            .map(|(rank, (v, g))| self.on_rank(rank, || Ok((self.upload(&v)?, self.upload(&g)?)))).collect()
+        ensure!(self.all_native_blocks(names)?, "{names:?}: split FP8 blocks require BF16 or native E4M3 sources");
+        (0..ranks).map(|rank| self.native_blocks(rank, names, Some((axis, ranks)))).collect()
     }
 
     /// The load stream of rank `rank` (its device is current inside `on_rank`).
