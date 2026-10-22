@@ -43,7 +43,7 @@ pub(super) fn layout(
             && report
                 .requested_attention
                 .is_none_or(|a| a == AttentionPlacement::Heads),
-        Unqualified("two-GPU execution requires head-split SWA with alternating whole-owned CSA; all-whole SWA has no routed reply reuse proof")
+        Unqualified("two-GPU execution requires head-split SWA with whole-owned CSA; all-whole SWA has no routed reply reuse proof")
     );
     ensure!(
         !opts.host_embedding
@@ -202,8 +202,13 @@ pub(super) fn layout(
         waste: vec![], notes: vec![format!("WIP eager Step-5: exact native allocation owners; zero graphs; {} native MTP stages; no media", opts.native_mtp_layers),
             "Offline CUDA/code baseline is estimated; serving must re-admit against pre-weight live samples and native export ABIs".into(),
             format!("{}; {sequences} sequences, request context {}, compiled extent {}",
-                if coordinators == 2 { "SWA head split, alternating whole-owned CSA" } else { "Single-device SWA and CSA ownership" },
+                if coordinators == 2 { "SWA head split, complete-cost contiguous CSA owners" } else { "Single-device SWA and CSA ownership" },
                 admitted.cache.context, model.cfg.max_context)] };
+    let csa_owners = (0..coordinators).map(|rank| admitted.placement.layers.iter().enumerate()
+        .filter(|(layer, item)| model.cfg.full[*layer]
+            && matches!(item.mode, LayerMode::Whole { gpu, .. } if usize::from(gpu) == rank)).count())
+        .collect::<Vec<_>>();
+    memory.notes.push(format!("Step-5 admitted CSA owners: {csa_owners:?}"));
     for rank in 0..coordinators {
         let mut items = admitted.placement.items[rank].clone();
         items.push(Item::new(

@@ -199,7 +199,6 @@ fn full_context_mtp_forecast_charges_private_predictors_before_allocation() -> a
                 "step5", "step5:fp8", true, rank, &arch, Some(&programs)).bytes).collect(),
             peer_diagnostics: false, startup: vec![],
         };
-        let baseline = admission::forecast_mtp(&cp, &inputs, 0)?;
         for depth in 0..=3 {
             let admitted = admission::forecast_mtp(&cp, &inputs, depth)?;
             assert_eq!(admitted.cache.context, 1_048_576);
@@ -208,16 +207,18 @@ fn full_context_mtp_forecast_charges_private_predictors_before_allocation() -> a
             assert_eq!(admitted.cache.ranks[0].mtp_stage_hidden.len(), depth);
             assert!(admitted.cache.ranks[1].mtp_stage_hidden.is_empty());
             let weights = coordinator::RankWeightLayout::for_mtp(&cp, depth)?.resident_bytes;
-            let ownership = inputs.ownership(&Config::parse(&cp)?)?;
-            let target = native::rank_admission(&cp, &ownership, 0, inputs.rows)?.workspace;
-            let workspace = target.max(native::mtp_forecast_workspace(inputs.rows, depth, kv_format)?) - target;
-            let charged = |a: &admission::Admission, rank: usize| a.placement.items[rank].iter()
-                .map(|item| item.bytes).sum::<u64>();
-            let active_delta = admitted.reservations[0].active - baseline.reservations[0].active;
-            let marks_delta = admitted.reservations[0].marks - baseline.reservations[0].marks;
-            assert_eq!(charged(&admitted, 0) - charged(&baseline, 0),
-                weights + workspace + active_delta as u64 + marks_delta as u64);
-            assert_eq!(charged(&admitted, 1), charged(&baseline, 1));
+            for rank in 0..2 {
+                let target = native::rank_admission(&cp, &admitted.ownership, rank, inputs.rows)?;
+                let item = |group| admitted.fixed.iter().find(|item| item.gpu == rank as u8 && item.group == group)
+                    .expect("native charge").bytes;
+                assert_eq!(item("Step-5 native target and head"), target.immutable + if rank == 0 { weights } else { 0 });
+                let workspace = if rank == 0 {
+                    target.workspace.max(native::mtp_forecast_workspace(inputs.rows, depth, kv_format)?)
+                } else { target.workspace };
+                assert_eq!(item("Step-5 native workspace"), workspace);
+                assert_eq!(item("Step-5 exact retained marks"), admitted.reservations[rank].marks as u64);
+                assert_eq!(item("Step-5 active sequence state"), admitted.reservations[rank].active as u64);
+            }
             let planned = plan::plan(&checkpoint_path, &PlanOptions {
                 placement: ExpertPlacement::from_spark_ranks(6),
                 draft_ownership: if depth == 0 { Some(spec::DraftOwnership::None) } else { None },
@@ -247,6 +248,8 @@ fn full_context_mtp_forecast_charges_private_predictors_before_allocation() -> a
                     assert_eq!(actual, expected, "depth {depth}, rank {rank}, {category:?}");
                 }
             }
+            let charged = |a: &admission::Admission, rank: usize| a.placement.items[rank].iter()
+                .map(|item| item.bytes).sum::<u64>();
             let by_category = (0..2).map(|rank| {
                 let mut categories = std::collections::BTreeMap::new();
                 for item in &admitted.placement.items[rank] {
@@ -261,8 +264,8 @@ fn full_context_mtp_forecast_charges_private_predictors_before_allocation() -> a
                 "depth": depth, "context": admitted.cache.context, "pool": admitted.placement.pool_tokens,
                 "sequences": inputs.sequences, "rows": inputs.rows,
                 "marks": admitted.marks, "predictor_weights": weights,
-                "predictor_arena_growth": workspace,
-                "active_delta": active_delta, "mark_delta": marks_delta, "ranks": by_category }));
+                "owners": admitted.ownership.execution().modes().iter().map(|mode| format!("{mode:?}")).collect::<Vec<_>>(),
+                "ranks": by_category }));
         }
         assert!(admission::forecast_mtp(&cp, &inputs, 4).is_err());
     }
@@ -907,7 +910,7 @@ fn planner_rejects_all_whole_swa_before_serving_admission() {
         }).unwrap();
         assert!(!result.wip_launchable() && !result.native_serving_admitted);
         assert!(result.hints.iter().any(|hint| hint.what.contains(
-            "two-GPU execution requires head-split SWA with alternating whole-owned CSA")),
+            "two-GPU execution requires head-split SWA with whole-owned CSA")),
             "{:?}", result.hints);
     }
 }
