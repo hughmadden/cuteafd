@@ -224,8 +224,10 @@ pub(crate) fn coordinator_suffix(
     for (rank, (_, _, checked)) in plans.iter().enumerate() {
         assert_eq!(records(&plain, rank)?, records(checked, rank)?);
     }
-    let source = root.join("coordinator.bin");
-    std::fs::write(&source, [17u8; 16])?;
+    // Reuse a source header so installed-checkpoint proofs remain read-only.
+    let source = root.join(&plain.plan.files[0]);
+    let source_bytes = plain.file_sizes[0];
+    assert!(source_bytes >= 16);
     for gpu in 0..2 {
         offers.push(Offer { rank: sparks + gpu, host: "coordinator".into(), arena_bytes: 16, placement: vec![] });
     }
@@ -238,7 +240,7 @@ pub(crate) fn coordinator_suffix(
         assert_eq!(serde_json::to_vec(offers)?, serde_json::to_vec(&suffix)?);
         appended.fetch_add(1, Ordering::SeqCst);
         for offer in offers {
-            builder.contiguous(&Source { path: source.clone(), offset: 0, bytes: 16 }, 0, 16,
+            builder.contiguous(&Source { path: source.clone(), offset: 0, bytes: source_bytes }, 0, 16,
                 Destination { rank: offer.rank as u32, offset: 0, bytes: 16 })?;
         }
         Ok(())

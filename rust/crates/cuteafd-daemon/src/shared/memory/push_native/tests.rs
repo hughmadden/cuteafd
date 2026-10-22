@@ -23,14 +23,16 @@ fn installed_native_rank_plan_tp4_tp6_rejects_changed_worker_placement() -> Resu
     let root = Path::new(&root);
     let catalog = cuteafd_loader::read_expert_catalog(root)?;
     let geometry = catalog.routed_experts();
+    let nvfp4 = catalog.nvfp4().is_some();
     for world in [4, 6] {
+        let mut plans = Vec::new();
         for rank in 0..world {
             let width = geometry.intermediate as usize / world;
             let stored = width.div_ceil(128) * 128;
             let slice = SparkSlice { unit_map: None, layer: 0, first: (rank * width) as u32,
                 width: width as u32, stored_width: stored as u32, tiers: vec![], projection_counts: vec![] };
             let resident = usize::try_from(cuteafd_loader::placement::families::deepseek_v41::resident_bytes(
-                geometry.hidden as u64, stored as u64, geometry.experts as u64, false)?)?;
+                geometry.hidden as u64, stored as u64, geometry.experts as u64, nvfp4)?)?;
             let plan = RankPlan::new(&catalog, &[slice.clone()], world, rank, resident)?;
             let checked = plan.checked(&catalog, root, world, rank)?;
             checked.plan.check(&checked.file_sizes, &checked.arenas)?;
@@ -55,7 +57,10 @@ fn installed_native_rank_plan_tp4_tp6_rejects_changed_worker_placement() -> Resu
             assert!(RankPlan::new(&catalog, &[plan.placement[0].slice.clone()], world, rank, resident - 1).is_err());
             eprintln!("native TP{world} rank={rank}: checked {} entries, resident={resident}, scratch={}",
                 checked.plan.entries.len(), plan.scratch);
+            plans.push((resident as u64, plan.placement.clone(), checked));
         }
+        super::super::push_exl3::tests::coordinator_suffix(root, &catalog, &plans,
+            |assignments, offers, coordinator| checked_plan(root, &catalog, assignments, offers, coordinator))?;
     }
     Ok(())
 }
