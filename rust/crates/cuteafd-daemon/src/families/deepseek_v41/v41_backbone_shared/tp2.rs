@@ -5,9 +5,9 @@ use cuteafd_ffi::{CuteafdDeviceBuffer, Bf16Add, V41Fp8Plan, V41SharedSwiGlu};
 use cuteafd_loader::OfficialV41Catalog;
 use std::rc::Rc;
 
-/// The packed weight and scales; the raw scales stay resident (a push lands
-/// them and packs after Done; only 1/32 of the packed scale bytes).
-struct Matrix<'a> { weight: Allocation<'a>, scales: Allocation<'a>, _source_scales: Allocation<'a> }
+/// The packed weight and scales; the raw scales live until their pack ran
+/// (a push lands them and packs at Done), then [`Weights::release_raw_scales`].
+struct Matrix<'a> { weight: Allocation<'a>, scales: Allocation<'a>, source_scales: Option<Allocation<'a>> }
 
 /// Complete shared TP2 operation for one lane, with either GPU as destination.
 pub(crate) struct Wave<'a> {
@@ -93,9 +93,11 @@ pub(crate) struct Weights<'a> {
 }
 impl<'a> Weights<'a> {
     pub fn device(&self) -> Device<'a> { self.device }
-    /// Weights, packed scales and the raw scales they pack from (kept resident).
-    pub fn device_bytes() -> usize { 3 * (5120 * 1152 + 5120 * 1152 / 32 + 5120 * 1152 / 1024) }
-    pub fn load_peak_device_bytes() -> usize { Self::device_bytes() }
+    /// Frees raw scales kept for a recorded scale pack (after it ran).
+    pub fn release_raw_scales(&mut self) { for m in &mut self.matrices { drop(m.source_scales.take()); } }
+    pub fn device_bytes() -> usize { 3 * (5120 * 1152 + 5120 * 1152 / 32) }
+    /// Including every matrix's raw scales (resident until their pack ran).
+    pub fn load_peak_device_bytes() -> usize { Self::device_bytes() + 3 * (5120 * 1152 / 1024) }
     pub fn load(device: Device<'a>, catalog: &OfficialV41Catalog, layer: usize, budget: usize) -> Result<Self> {
         ensure!(layer < 40 && matches!(device.id, 0 | 1) && budget >= Self::load_peak_device_bytes(),
             "invalid TP2 shared weight layer, rank, or budget");
@@ -119,7 +121,9 @@ impl<'a> Weights<'a> {
                 source_scales.buffer, scales.buffer, stream.raw) });
             let drained = stream.drain();
             packed.and(drained)?;
-            matrices.push(Matrix { weight, scales, _source_scales: source_scales });
+            // Through the mount the pack already drained: release the raw scales now.
+            let source_scales = crate::shared::experts::rtx::dense::is_recording().then_some(source_scales);
+            matrices.push(Matrix { weight, scales, source_scales });
         }
         Ok(Self { device, layer, matrices: matrices.try_into().ok().unwrap() })
     }

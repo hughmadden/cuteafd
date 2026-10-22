@@ -158,7 +158,7 @@ pub(super) fn worker(args: crate::cli::NativeServeArgs, mut receive: mpsc::Recei
         )
     })?;
     memory_checkpoint("head normalization weights")?;
-    let shared: [Rc<Vec<SharedWeights<'_>>>; 2] = [0, 1]
+    let mut shared_owned: [Vec<SharedWeights<'_>>; 2] = [0, 1]
         .map(|r| {
             (0..40)
                 .map(|l| {
@@ -170,7 +170,7 @@ pub(super) fn worker(args: crate::cli::NativeServeArgs, mut receive: mpsc::Recei
                     )
                 })
                 .collect::<Result<Vec<_>>>()
-                .map(Rc::new)
+                
         })
         .into_iter()
         .collect::<Result<Vec<_>>>()?
@@ -402,6 +402,9 @@ pub(super) fn worker(args: crate::cli::NativeServeArgs, mut receive: mpsc::Recei
             rank_budgets, &exl3_directory)?,
     };
     drop(records);
+    // Every recorded scale pack ran (Done or mount fill): release raw scales.
+    for weights in shared_owned.iter_mut().flatten() { weights.release_raw_scales(); }
+    let shared: [Rc<Vec<SharedWeights<'_>>>; 2] = shared_owned.map(Rc::new);
     if let Some(pending) = spark_admission { pending.wait()?; }
     let mut make_transport = || {
         let timing = crate::families::deepseek_v41::v41_native_serve::protocol_v2_timing();
