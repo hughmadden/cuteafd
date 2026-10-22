@@ -481,6 +481,39 @@ impl<'a> NativeTp2<'a> {
         }))
     }
 
+    /// [`Self::load_pair_weights`] over halves a push group delivered
+    /// (already transformed and published on their GPUs).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn pushed_pair_weights(
+        devices: [Device<'a>; 2],
+        catalog: &cuteafd_loader::OfficialV41Catalog,
+        layers: Vec<usize>,
+        max_rows: usize,
+        budgets: [usize; 2],
+        selection: RtxSelectionPolicy,
+        output_policy: NativeOutputPolicy,
+        pushed: [Vec<ExpertWeights<'a>>; 2],
+    ) -> Result<[NativeTp2Weights<'a>; 2]> {
+        let workspaces = [Self::admit(devices[0], catalog, 0, &layers, max_rows, budgets[0], selection, output_policy)?,
+            Self::admit(devices[1], catalog, 1, &layers, max_rows, budgets[1], selection, output_policy)?];
+        let [left, right] = pushed;
+        for (rank, weights) in [&left, &right].into_iter().enumerate() {
+            ensure!(weights.len() == layers.len() && weights.iter().zip(&layers).all(|(w, &layer)|
+                w.layer == ExpertLayer::BackboneTp2 { layer, rank }), "pushed TP2 halves differ from admission");
+        }
+        let owners = [Rc::new(devices[0].own(|| Ok(left))?), Rc::new(devices[1].own(|| Ok(right))?)];
+        Ok(std::array::from_fn(|rank| NativeTp2Weights {
+            device: devices[rank],
+            rank: rank as u8,
+            layers: layers.clone(),
+            max_rows,
+            workspace_bytes: workspaces[rank],
+            weights: owners[rank].clone(),
+            selection,
+            output_policy,
+        }))
+    }
+
     pub(crate) fn load(
         device: Device<'a>,
         catalog: &cuteafd_loader::OfficialV41Catalog,

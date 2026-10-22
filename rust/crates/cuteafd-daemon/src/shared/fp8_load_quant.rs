@@ -3,7 +3,6 @@
 //! each scale unit writes its final E4M3 rows and scales into the operand.
 //! Bit-for-bit the host rule (`glm5_flash::fp8::quantize`); see
 //! native/shared/cuda/fp8_load_quant.h.
-use crate::families::glm5_flash::fp8::Layout;
 use crate::shared::{fp8_linear::Fp8Scales, memory::HostAllocation};
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::{CuteafdDeviceBuffer, NativeLibrary};
@@ -29,6 +28,14 @@ struct Job {
     q_stride: i64,
     scales: *mut f32,
     scale_stride: i64,
+}
+
+/// FP8 scale layout: 128x128 blocks, per row and 128-wide K block, or per row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Layout {
+    Block,
+    Row128,
+    Channel,
 }
 
 fn layout_code(layout: Layout) -> i32 {

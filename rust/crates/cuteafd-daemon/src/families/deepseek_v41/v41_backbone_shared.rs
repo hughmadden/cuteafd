@@ -68,7 +68,7 @@ impl<'a> BackboneSharedWeights<'a> {
                 kernel.info().packed_weight_scale_bytes as usize,
             )?);
             unsafe {
-                kernel.pack_scales(
+                crate::shared::experts::rtx::dense::v41_pack_scales(&kernel, 
                     tensors.get(&names[2 * i + 1])?,
                     scales[i].buffer,
                     stream.raw,

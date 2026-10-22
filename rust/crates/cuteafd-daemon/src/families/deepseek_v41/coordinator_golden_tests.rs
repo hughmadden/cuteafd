@@ -193,3 +193,88 @@ fn installed_coordinator_operands_match_the_mount_golden() -> Result<()> {
     mount_tp2(&library, &catalog, layers, &mut actual)?;
     check(&actual, false)
 }
+
+/// The same owners recorded (allocated as through the mount, bytes deferred),
+/// then each GPU's dense records and native TP2 halves pushed through a ring
+/// into its rank (staged steps packed on the GPU, scale packs at Done) and
+/// published: every operand matches the mount golden, each step stays within
+/// the bound, and each rank's staging peaks at one buffer.
+#[test]
+#[ignore = "requires CUTEAFD_PUSH_V41 (a SparkNest namespace), CUTEAFD_NATIVE_LIB and two RTX GPUs"]
+fn installed_pushed_coordinator_operands_match_the_mount_golden() -> Result<()> {
+    use crate::shared::experts::rtx::dense::{Recorder, Records, STEP_BYTES};
+    let Some(snapshot) = snapshot() else { return Ok(()) };
+    let library = library()?;
+    library.cuda_set_device(0)?;
+    for gpu in [0, 1] { Device { library: &library, id: gpu }.run(|| library.cuda_enable_peer(1 - gpu))?; }
+    let catalog = cuteafd_loader::read_official_v41_catalog(&snapshot)?;
+    let (root, _) = cuteafd_loader::push_load::namespace(&snapshot)?;
+    let layers = std::env::var("CUTEAFD_V41_GOLDEN_TP2_LAYERS").ok().map(|v| v.parse()).transpose()?.unwrap_or(2);
+    let devices = [Device { library: &library, id: 0 }, Device { library: &library, id: 1 }];
+    let socket_dir = tempfile::tempdir()?;
+    // Dense owners, recorded in groups the size of one GPU's memory headroom.
+    let recorder = Recorder::start(true)?.context("recorder")?;
+    let mut owners = Digests::new();
+    let owners_ref = &mut owners;
+    // Record the owners, keeping them alive until pushed and digested.
+    let map = CachePlacement::encoder_decoder();
+    let weights = BackboneLaneWeights::load_distributed(&library, &catalog, map,
+        BackboneLaneWeights::distributed_device_bytes(&library, &catalog, map)?, 16 << 20)?;
+    let producers = CacheProducerWeights::load_distributed(&library, &catalog, map,
+        CacheProducerWeights::distributed_device_bytes(&library, &catalog, map)?, 16 << 20)?;
+    let index = IndexLaneWeights::load_distributed(&library, &catalog, map,
+        IndexLaneWeights::distributed_device_bytes(&library, &catalog, map)?, 16 << 20)?;
+    let engram = PlacedEngramWeights::load(&library, &catalog, map,
+        PlacedEngramWeights::device_bytes(&library, &catalog, map)?, 16 << 20)?;
+    let table = devices[0].own(|| NativeRtxTensors::load_embedding(&library, &catalog,
+        crate::shared::memory::EmbedPlacement::Gpu))?;
+    let vocab = [(0usize, 0..64640), (1, 64640..129280)].map(|(gpu, tokens)|
+        devices[gpu].own(|| VocabularyShard::load(&library, &catalog, tokens, 1 << 30, 16 << 20)));
+    let vocab = vocab.into_iter().collect::<Result<Vec<_>>>()?;
+    let head = devices[1].own(|| TargetHeadWeights::load(&library, &catalog,
+        TargetHeadWeights::device_bytes(&catalog)?, 16 << 20))?;
+    use crate::families::deepseek_v41::v41_backbone_shared::tp2::Weights as SharedWeights;
+    let mut shared = Vec::new();
+    for device in devices {
+        for layer in 0..40 { shared.push(SharedWeights::load(device, &catalog, layer, SharedWeights::load_peak_device_bytes())?); }
+    }
+    let draft = devices[1].own(|| crate::families::deepseek_v41::v41_experts::dspark::DsparkWeights::load_serving(
+        &library, &catalog, 80, 8, 32 << 30, 16 << 20))?;
+    let records: Records = recorder.finish();
+    let (bytes, operands, staged, steps, largest, finishes) = records.summary();
+    eprintln!("records: class2 {bytes} B in {operands} operands; class3 {staged} B in {steps} steps (largest {largest} B); \
+        {finishes} finishes");
+    assert!(largest <= STEP_BYTES, "a step stages {largest} bytes");
+    // Native TP2 halves, admitted as serving admits them.
+    let plans = (0..2).map(|gpu| crate::shared::memory::push_coordinator::Tp2ExpertPlan::new(&catalog,
+        &(0..layers).collect::<Vec<_>>(), gpu, usize::MAX)).collect::<Result<Vec<_>>>()?;
+    let mut pushed = Vec::new();
+    for (gpu, plan) in plans.into_iter().enumerate() {
+        let started = std::time::Instant::now();
+        pushed.push(crate::shared::experts::rtx::push::tests::receive_pushed(devices[gpu], &catalog, &root,
+            socket_dir.path(), &records, (layers > 0).then_some(plan), 4, gpu)?);
+        eprintln!("gpu{gpu} rank pushed in {:.2} s", started.elapsed().as_secs_f64());
+    }
+    collect(&library, owners_ref, |f| weights.visit(f))?;
+    collect(&library, owners_ref, |f| producers.visit(f))?;
+    collect(&library, owners_ref, |f| index.visit(f))?;
+    collect(&library, owners_ref, |f| engram.visit(f))?;
+    collect(&library, owners_ref, |f| table.visit("gpu0.", f))?;
+    for (gpu, shard) in vocab.iter().enumerate() { collect(&library, owners_ref, |f| shard.visit(&format!("gpu{gpu}.vocab."), f))?; }
+    collect(&library, owners_ref, |f| head.visit("gpu1.head.", f))?;
+    for w in &shared { collect(&library, owners_ref, |f| w.visit(f))?; }
+    collect(&library, owners_ref, |f| draft.visit(f))?;
+    let [left, right]: [_; 2] = pushed.try_into().map_err(|_| anyhow::anyhow!("two ranks"))?;
+    let halves = crate::families::deepseek_v41::v41_experts::tp2_ffn::pushed_routed_weights(devices, &catalog,
+        layers, 80, [80 << 30; 2], [left.native()?, right.native()?])?;
+    for weights in &halves {
+        let crate::shared::experts::rtx::pair::OwnerWeights::Native(native) = weights else { anyhow::bail!("native") };
+        collect(&library, owners_ref, |f| native.visit(f))?;
+    }
+    let peaks = crate::shared::experts::rtx::dense::testing::PEAKS.with(|p| p.take());
+    for (staged, pinned) in &peaks {
+        eprintln!("rank staging peak {staged} B in use, {pinned} B pinned");
+        assert!(*staged <= STEP_BYTES as u64 && *pinned <= STEP_BYTES as u64);
+    }
+    check(&owners, true)
+}

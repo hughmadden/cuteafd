@@ -64,7 +64,7 @@ impl<'a> IndexQueryWeights<'a> {
             raw: library.cuda_stream_create()?,
         };
         let launched =
-            unsafe { kernel.pack_scales(tensors.get(&names[1])?, scales.buffer, stream.raw) };
+            unsafe { crate::shared::experts::rtx::dense::v41_pack_scales(&kernel, tensors.get(&names[1])?, scales.buffer, stream.raw) };
         let drained = unsafe { library.cuda_stream_synchronize(stream.raw) };
         launched.and(drained)?;
         Ok(Self {

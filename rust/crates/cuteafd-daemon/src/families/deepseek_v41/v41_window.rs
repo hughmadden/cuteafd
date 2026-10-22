@@ -281,7 +281,7 @@ impl<'a> WindowWeights<'a> {
             raw: library.cuda_stream_create()?,
         };
         let launched =
-            unsafe { fp8.pack_scales(tensors.get(&names[1])?, scales.buffer, stream.raw) };
+            unsafe { crate::shared::experts::rtx::dense::v41_pack_scales(&fp8, tensors.get(&names[1])?, scales.buffer, stream.raw) };
         launched.and(unsafe { library.cuda_stream_synchronize(stream.raw) })?;
         Ok(Self {
             library,

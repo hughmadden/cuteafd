@@ -86,6 +86,10 @@ pub(super) fn worker(args: crate::cli::NativeServeArgs, mut receive: mpsc::Recei
     }
     let mut lane_modules = [decode_modules, prefill_modules].into_iter();
     let expert_demands=admission::expert_demands(&lib,&catalog,capacity,2)?;
+    // Dense owners allocate exactly as through the mount; with coordinator push
+    // possible their bytes are recorded and arrive in the Spark push group.
+    let pushing = super::coordinator_push::wanted(&args, &catalog);
+    let recorder = crate::shared::experts::rtx::dense::Recorder::start(pushing)?;
     let weights = BackboneLaneWeights::load_distributed_with_split(
         &lib,
         &catalog,
@@ -173,6 +177,7 @@ pub(super) fn worker(args: crate::cli::NativeServeArgs, mut receive: mpsc::Recei
         .try_into()
         .ok()
         .expect("two ranks");
+    let mut records = recorder.map(|r| r.finish());
     memory_checkpoint("weights")?;
     tracing::info!(capacity, backbone_lane_bytes=BackboneLane::placed_workspace_bytes_with_split(&lib, capacity,args.tp2_query_projection,args.tp2_output_projection)?,
         producer_bytes=?crate::families::deepseek_v41::v41_backbone_execution::PlacedProducerWaves::device_bytes(&lib, map, capacity)?,
@@ -318,6 +323,7 @@ pub(super) fn worker(args: crate::cli::NativeServeArgs, mut receive: mpsc::Recei
     if args.dspark {
         ensure!(cuteafd_loader::placement::draft::home(&pool.placement) == Some(1), "V4.1 dSpark must be placed beside the decoder head");
     }
+    let recorder = crate::shared::experts::rtx::dense::Recorder::start(records.is_some())?;
     let draft_weights = if args.dspark {
         Some(if args.tp2_dspark_experts {
             devices[1].own(||crate::families::deepseek_v41::v41_experts::dspark::DsparkWeights::load_serving_tp2(&lib,&catalog,
@@ -325,6 +331,7 @@ pub(super) fn worker(args: crate::cli::NativeServeArgs, mut receive: mpsc::Recei
         } else {devices[1].own(|| crate::families::deepseek_v41::v41_experts::dspark::DsparkWeights::load_serving_with_width(&lib, &catalog,
             capacity, args.concurrency, draft_budgets(1), 16 << 20, draft_width, Some(&dspark_directory)))?})
     } else { None };
+    if let (Some(records), Some(recorder)) = (records.as_mut(), recorder) { records.extend(recorder.finish()); }
     memory_checkpoint("draft weights")?;
     if let (Some(weights), Some(inventory)) = (&draft_weights, &dspark_inventory) {
         // The loaded weights size their lane chains through the same shape the
@@ -361,11 +368,40 @@ pub(super) fn worker(args: crate::cli::NativeServeArgs, mut receive: mpsc::Recei
         && spark_world.supports_device_exchange()
         && format == crate::families::deepseek_v41::v41_experts::ExpertFormat::Native
         && expert_layers < 40;
-    let spark_admission = admission::start_sparks(&args, &catalog, expert_layers, capacity, aot_capacity,
+    let spark_plan = admission::plan_sparks(&args, &catalog, expert_layers, capacity, aot_capacity,
         topology, if device_exchange { 2 } else { 0 })?;
+    // Coordinator ranks join only a pushing group, planned before membership:
+    // a planning error leaves them out (the Sparks still push).
+    let coordinator = match (records.as_ref(), spark_plan.as_ref()) {
+        (Some(records), Some(spark)) if spark.coordinator_pushes() => (|| {
+            let (_, offered, largest, ..) = records.summary();
+            tracing::info!(operands = offered, largest_step_bytes = largest, "V4.1 coordinator dense records planned");
+            super::coordinator_push::plan(&args.snapshot, &catalog, devices, records, expert_layers, rank_budgets,
+                args.peers.len())
+        })().map_err(|error| tracing::info!(%error, "V4.1 coordinator push unavailable; mount")).ok(),
+        _ => None,
+    };
+    let (coordinator, ranks) = match coordinator {
+        Some((planned, streams, ranks)) => (Some(planned), Some((streams, ranks))),
+        None => (None, None),
+    };
+    let spark_admission = spark_plan.map(|plan| plan.start_with(&args.peers, ranks)).transpose()?;
     eprintln!("loading bottom {expert_layers} expert layers as TP2");
-    let routed = tp2_ffn::load_routed_weights(devices, &catalog, expert_layers, capacity,
-        rank_budgets, &exl3_directory)?;
+    let pushed = match coordinator {
+        Some(planned) => planned.receive(devices, &catalog)?,
+        None => None,
+    };
+    if pushed.is_none() { if let Some(records) = &records { super::coordinator_push::fill(&lib, records)?; } }
+    let routed = match pushed {
+        Some(pushed) if expert_layers > 0 => {
+            let [left, right] = pushed;
+            tp2_ffn::pushed_routed_weights(devices, &catalog, expert_layers, capacity, rank_budgets,
+                [left.native()?, right.native()?])?
+        }
+        _ => tp2_ffn::load_routed_weights(devices, &catalog, expert_layers, capacity,
+            rank_budgets, &exl3_directory)?,
+    };
+    drop(records);
     if let Some(pending) = spark_admission { pending.wait()?; }
     let mut make_transport = || {
         let timing = crate::families::deepseek_v41::v41_native_serve::protocol_v2_timing();

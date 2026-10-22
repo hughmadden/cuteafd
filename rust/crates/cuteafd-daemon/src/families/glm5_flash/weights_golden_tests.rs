@@ -31,7 +31,7 @@ fn installed_head_split_operands_match_the_host_quantize_golden() -> Result<()> 
         let loader = GlmfLoader { library: &library, checkpoint: &checkpoint, stream, fp8_source: None,
             kda_fp8: crate::families::glm5_flash::fp8::KdaFp8::Row128, kda_output_shard: false, fp8_head: true, kda_nvfp4: None,
             fp8_scales: rule, device: 0, peers: vec![crate::shared::peer_split::RankDevice { device: 1, stream }],
-            dense: Default::default() };
+            dense: std::rc::Rc::new(DenseLoad::mount(&library)) };
         let dense = (0..cfg.layers).find(|&l| cfg.dense[l]).context("no dense layer")?;
         for layer in [kda, mla, dense] {
             for (rank, share) in loader.layer_shares(&cfg, layer, LayerMode::HeadSplit)?.iter().enumerate() {
@@ -87,7 +87,7 @@ fn installed_pushed_operands_match_the_mount_golden() -> Result<()> {
     let golden: std::collections::BTreeMap<String, String> = serde_json::from_slice(&std::fs::read(&path)?)?;
     let sparks = 2;
     for gpus in [2usize, 1] {
-        let load = std::rc::Rc::new(DenseLoad::push());
+        let load = std::rc::Rc::new(DenseLoad::push(&library));
         let loader = GlmfLoader { library: &library, checkpoint: &checkpoint, stream, fp8_source: None,
             kda_fp8: crate::families::glm5_flash::fp8::KdaFp8::Row128, kda_output_shard: false, fp8_head: true,
             kda_nvfp4: None, fp8_scales: rule, device: 0,
@@ -114,7 +114,8 @@ fn installed_pushed_operands_match_the_mount_golden() -> Result<()> {
             assert!(step.bytes() <= STEP_BYTES, "a step stages {} bytes", step.bytes());
             for job in &step.jobs {
                 let kind = match job { Job::Upload { .. } => "upload", Job::Widen { .. } => "widen",
-                    Job::Quant { .. } => "quant", Job::Absorb { .. } => "absorb", Job::ALog { .. } => "a_log" };
+                    Job::Quant { .. } => "quant", Job::Absorb { .. } => "absorb", Job::ALog { .. } => "a_log",
+                    Job::W8a16Pack { .. } => "w8a16", Job::NativeExpert { .. } => "expert" };
                 let largest = kinds.entry(kind).or_default();
                 *largest = (*largest).max(step.bytes());
             }

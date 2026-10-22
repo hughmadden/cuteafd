@@ -55,7 +55,7 @@ impl<'a> EngramLayerWeights<'a> {
             raw: library.cuda_stream_create()?,
         };
         unsafe {
-            kernel.pack_scales(tensors.get(&names[1])?, packed_scales.buffer, stream.raw)?;
+            crate::shared::experts::rtx::dense::v41_pack_scales(&kernel, tensors.get(&names[1])?, packed_scales.buffer, stream.raw)?;
             library.cuda_stream_synchronize(stream.raw)?;
         }
         Ok(Self {

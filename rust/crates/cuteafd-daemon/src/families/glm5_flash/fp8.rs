@@ -122,12 +122,7 @@ pub(crate) enum KdaFp8 {
     Row128,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Layout {
-    Block,
-    Row128,
-    Channel,
-}
+pub(crate) use crate::shared::fp8_load_quant::Layout;
 
 fn bf16(bytes: &[u8], i: usize) -> f32 {
     f32::from_bits(u32::from(u16::from_le_bytes([bytes[2 * i], bytes[2 * i + 1]])) << 16)

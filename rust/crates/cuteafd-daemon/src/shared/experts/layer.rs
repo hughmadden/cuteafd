@@ -427,6 +427,13 @@ impl<'a> ExpertWeights<'a> {
         }
         let buffers: [DeviceAllocation<'a>; 4] =
             owned.try_into().ok().expect("four packed buffers");
+        if crate::shared::experts::rtx::dense::is_recording() {
+            // Recorded for the coordinator push group: one staged step per expert,
+            // packed on the GPU into its slice of the four planes.
+            Self::record_steps(library, catalog, layer, intermediate, experts, &sizes, &buffers)?;
+            return Ok(Self { buffers: buffers.map(Into::into), layer, experts, budget, nvfp4: None,
+                format: ExpertFormat::of(catalog) });
+        }
         let device_staging = DeviceAllocation::new(library, budget.device_staging_bytes)?;
         let mut hosts = (0..EXPERT_READ_LANES)
             .map(|_| HostAllocation::new(library, budget.pinned_host_bytes / EXPERT_READ_LANES))
@@ -516,6 +523,41 @@ impl<'a> ExpertWeights<'a> {
             nvfp4: None,
             format: ExpertFormat::of(catalog),
         })
+    }
+
+    /// One [`crate::shared::experts::rtx::dense::Step`] per expert: its six
+    /// whole tensors staged back to back (the staging plan's own ranges), packed
+    /// into expert `e`'s slice of each plane.
+    fn record_steps(library: &'a NativeLibrary, catalog: &OfficialV41Catalog, layer: ExpertLayer, intermediate: u32,
+        experts: usize, sizes: &[usize; 4], buffers: &[DeviceAllocation<'a>; 4]) -> Result<()> {
+        use crate::shared::experts::rtx::dense::{DenseLoad, Job, Rect, Step};
+        let dense = DenseLoad::mount(library);
+        let device = library.cuda_get_device()?;
+        for expert in 0..experts {
+            let plan = catalog.expert_staging(layer.expert(expert))?;
+            ensure!(plan.tp_world().is_none() && !matches!(layer.expert(expert),
+                V41ExpertSelection::BackboneTp2 { .. } | V41ExpertSelection::DsparkTp2 { .. }),
+                "recorded native experts are whole tensors");
+            let mut rects = Vec::with_capacity(6);
+            let mut at = 0;
+            for (name, range) in plan.tensor_names().iter().zip(plan.tensor_ranges()) {
+                let tensor = catalog.tensor(name)?;
+                let bytes = usize::try_from(tensor.metadata.byte_length)?;
+                ensure!(range.start == at && range.len() == bytes, "{name}: staged expert tensors are not back to back");
+                rects.push(Rect { name: name.clone(), path: catalog.snapshot().join(&tensor.shard),
+                    base: tensor.metadata.byte_offset, row_bytes: bytes, rows: 0..1, cols: 0..bytes });
+                at += bytes;
+            }
+            let planes = std::array::from_fn(|i| {
+                let stride = sizes[i] / experts;
+                // SAFETY (offset): expert `expert`'s slice lies inside plane `i`.
+                cuteafd_ffi::CuteafdDeviceBuffer { ptr: unsafe { buffers[i].buffer.ptr.cast::<u8>().add(expert * stride) }.cast(),
+                    bytes: stride, ..buffers[i].buffer }
+            });
+            dense.step(Step { device, rects, jobs: vec![Job::NativeExpert { intermediate,
+                ranges: plan.tensor_ranges().clone(), planes }] }, std::ptr::null_mut())?;
+        }
+        Ok(())
     }
 
     /// Read each native projection once for both GPUs. Eight readers in each

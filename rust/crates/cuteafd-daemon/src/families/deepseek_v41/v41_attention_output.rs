@@ -75,9 +75,9 @@ impl<'a> AttentionOutputWeights<'a> {
             staging,
         )?;
         let launched = (|| unsafe {
-            grouped_kernel.pack_scales(tensors.get(&names[1])?, grouped_scales.buffer, stream.raw)?;
+            crate::shared::experts::rtx::dense::v41_pack_scales(&grouped_kernel, tensors.get(&names[1])?, grouped_scales.buffer, stream.raw)?;
             if let Some(scales)=&scales {
-                kernel.pack_scales(tensors.get(&names[3])?,scales.buffer,stream.raw)?;
+                crate::shared::experts::rtx::dense::v41_pack_scales(&kernel, tensors.get(&names[3])?,scales.buffer,stream.raw)?;
             }
             Ok(())
         })();

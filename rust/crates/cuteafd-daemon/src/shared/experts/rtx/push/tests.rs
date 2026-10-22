@@ -163,7 +163,7 @@ fn coordinator_tp2_pair_is_mount_exact_on_two_devices_and_drops_before_retry() -
             continue;
         }
         for (gpu, (weights, image)) in results.into_iter().zip(expected).enumerate() {
-            let weights = weights.context("successful push fell back")?;
+            let weights = weights.context("successful push fell back")?.exl3()?;
             assert_eq!(weights.len(), 2);
             for (weight, image) in weights.iter().zip(image) {
                 for (spec, expected) in weight.layout.buffers.iter().zip(image) {
@@ -288,7 +288,7 @@ fn combined_rank_lands_dense_operands_and_tp2_halves_exactly() -> Result<()> {
     let weights = receive_rank(device, Some((&catalog, plan, &checked_tp2)), Some(DenseRank { destination: dense, base }),
         rank, &client, &mut worker, (7, 11), 8, DEFAULT_SLOT_BYTES)?;
     server.join().map_err(|_| anyhow::anyhow!("fake SparkNest panicked"))??;
-    let weights = weights.context("combined push fell back")?;
+    let weights = weights.context("combined push fell back")?.exl3()?;
     assert_eq!(weights.len(), 2);
     let image = delivered.lock().unwrap().clone();
     for (name, &(start, bytes)) in dense_names.iter().zip(&planned) {
@@ -399,6 +399,53 @@ fn dense_error_mount_group(library: &cuteafd_ffi::NativeLibrary, root: &std::pat
     assert!(!driver.join().map_err(|_| anyhow::anyhow!("driver panicked"))??, "the group driver must not prepare a group");
     assert_eq!(spark_thread.join().map_err(|_| anyhow::anyhow!("spark panicked"))??, None,
         "the Spark rank receives the whole-group mount decision");
+    Ok(())
+}
+
+/// The families plan their dense records before membership: a planning error
+/// there offers no coordinator ranks, so the group driver sees the Spark
+/// ranks alone and opens their push group (the coordinator then loads by
+/// mount). The whole-group fallback stays only for errors after membership.
+#[test]
+fn pre_membership_dense_planning_error_offers_no_coordinator_ranks_and_sparks_push() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    // The families' pre-membership step: planning fails, so nothing is offered.
+    let planned = (|| -> Result<(CoordinatorPush, Vec<std::net::TcpStream>,
+        crate::shared::memory::push_exl3::CoordinatorRanks)> {
+        anyhow::bail!("injected dense planning error")
+    })().map_err(|error| tracing::info!(%error, "coordinator push unavailable; mount")).ok();
+    assert!(planned.is_none());
+    let coordinator_streams = planned.map(|(_, streams, _)| streams).unwrap_or_default();
+    // One Spark rank offering push, and no coordinator rank: the group opens.
+    let (mut spark_driver, mut spark) = control_pair()?;
+    let spark_thread = std::thread::spawn(move || cuteafd_transport::worker_selection::push::offer(&mut spark,
+        Some(cuteafd_transport::worker_selection::push::Offer { rank: 0, host: "spark".into(), arena_bytes: 1,
+            placement: Vec::new() })));
+    let socket = root.path().join("group.sock").to_string_lossy().into_owned();
+    let listener = Listener::bind(&socket)?;
+    let server = std::thread::spawn(move || -> Result<usize> {
+        let conn = listener.accept()?;
+        conn.set_timeout(Some(Duration::from_secs(10)))?;
+        let (request, _) = conn.next_request()?.context("no Create")?;
+        let Request::Create { ranks, .. } = request else { anyhow::bail!("expected Create") };
+        conn.send_event(&Event::Created { group: 7, token: 11 })?;
+        Ok(ranks.len())
+    });
+    let mut streams = vec![spark_driver.try_clone()?];
+    streams.extend(coordinator_streams);
+    let mut offered = 0;
+    let client = PushClient::at(socket, Duration::from_secs(10))?;
+    let _ = cuteafd_transport::worker_selection::push::coordinate(&mut streams, |offers| {
+        offered = offers.len();
+        let ranks = offers.iter().map(|o| cuteafd_loader::push_load::proto::RankSpec {
+            rank: o.rank as u32, host: o.host.clone(), arena_bytes: o.arena_bytes }).collect();
+        Ok(client.create(ranks, Vec::new())?)
+    });
+    drop(spark_driver.shutdown(std::net::Shutdown::Both));
+    assert_eq!(offered, 1, "the Spark rank alone is offered");
+    assert_eq!(server.join().map_err(|_| anyhow::anyhow!("server panicked"))??, 1, "the group opens with the Spark rank");
+    let credentials = spark_thread.join().map_err(|_| anyhow::anyhow!("spark panicked"))??;
+    assert_eq!(credentials, Some((7, 11)), "the Spark rank receives the group's push credentials");
     Ok(())
 }
 
@@ -531,4 +578,61 @@ fn sparknest_model_one_coordinator_rank_beside_spark_ranks() {
         "grants parked at busy sources are expected to stall under today's policy");
     assert!(run(Policy::SourceFloor, &hosts, 128, 64, &streams),
         "a per-(source, rank) credit floor outside the shared budget must complete");
+}
+
+
+/// One coordinator GPU's rank (dense records and/or TP2 halves, laid out as
+/// the group driver lays them out) received through a ring from a fake
+/// SparkNest that streams the rank's checked plan in plan order, then
+/// committed. For installed-checkpoint goldens on real or fake devices.
+pub(crate) fn receive_pushed<'a>(device: Device<'a>, catalog: &cuteafd_loader::OfficialV41Catalog,
+    root: &std::path::Path, socket_dir: &std::path::Path, records: &crate::shared::experts::rtx::dense::Records,
+    tp2: Option<Tp2ExpertPlan>, sparks: usize, gpu: usize) -> Result<PushedTp2<'a>> {
+    use crate::shared::experts::rtx::dense::RankLayout;
+    let rank = sparks + gpu;
+    let layout = RankLayout::new(records.operands.clone(), records.steps.clone(), device.id)?
+        .with_finishes(&records.finishes);
+    let dense_plan = layout.plan();
+    let (base, host) = (dense_plan.base, dense_plan.host_bytes);
+    let tp2_bytes = tp2.as_ref().map_or(0, |p| p.layout.logical_bytes() as u64);
+    let (host_base, total) = rank_bytes(base, tp2_bytes, host);
+    let mut arenas = vec![0; sparks + 2];
+    arenas[rank] = total;
+    let mut builder = Builder::new(root, arenas);
+    (dense_plan.append)(&mut builder, rank as u32, host_base)?;
+    if let Some(plan) = &tp2 { plan.append_at(&mut builder, catalog, rank as u32, base)?; }
+    let checked = builder.finish()?;
+    let expected = crate::shared::memory::weight_arena::ExpectedCoverage::from_plan(&checked, rank as u32)?;
+    let dense = crate::shared::experts::rtx::dense::DenseArena::new(device, layout, expected)?;
+    let socket = socket_dir.join(format!("g{gpu}.sock")).to_string_lossy().into_owned();
+    let listener = Listener::bind(&socket)?;
+    let packed = pack(&checked, root, rank as u32, DEFAULT_SLOT_BYTES)?;
+    let (mut coordinator, mut worker) = control_pair()?;
+    for stream in [&coordinator, &worker] { stream.set_read_timeout(Some(Duration::from_secs(600)))?; }
+    let server = std::thread::spawn(move || -> Result<()> {
+        let conn = listener.accept()?;
+        conn.set_timeout(Some(Duration::from_secs(600)))?;
+        let (request, fd) = conn.next_request()?.context("rank did not join")?;
+        let Request::Join { slots, slot_bytes, .. } = request else { anyhow::bail!("expected rank Join") };
+        let file = File::from(fd.context("rank ring fd absent")?);
+        conn.send_event(&Event::Joined)?;
+        assert_eq!(read_control(&coordinator)?["message"], "joined");
+        for (index, bytes) in packed.into_iter().enumerate() {
+            let index = index % slots as usize;
+            file.write_all_at(&bytes, index as u64 * u64::from(slot_bytes))?;
+            conn.send_event(&Event::Filled { slot: index as u32, len: bytes.len() as u32 })?;
+            let (release, _) = conn.next_request()?.context("missing slot release")?;
+            anyhow::ensure!(matches!(release, Request::Release { slot } if slot == index as u32), "release order");
+        }
+        conn.send_event(&Event::Done)?;
+        anyhow::ensure!(read_control(&coordinator)?["success"] == true, "rank candidate rejected");
+        write_control(&mut coordinator, &serde_json::json!({"message":"commit", "success": true}))?;
+        Ok(())
+    });
+    let client = PushClient::at(socket, Duration::from_secs(600))?;
+    let tp2 = tp2.map(|plan| (catalog, plan, &checked));
+    let received = receive_rank(device, tp2, Some(DenseRank { destination: dense, base }), rank, &client,
+        &mut worker, (7, 11), 8, DEFAULT_SLOT_BYTES);
+    server.join().map_err(|_| anyhow::anyhow!("fake SparkNest panicked"))??;
+    received?.context("pushed rank fell back")
 }

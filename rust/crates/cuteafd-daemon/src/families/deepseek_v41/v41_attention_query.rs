@@ -81,7 +81,7 @@ impl<'a> AttentionQueryWeights<'a> {
             let scale =
                 DeviceAllocation::new(library, kernel.info().packed_weight_scale_bytes as usize)?;
             let launched = unsafe {
-                kernel.pack_scales(tensors.get(&names[i * 2 + 1])?, scale.buffer, stream.raw)
+                crate::shared::experts::rtx::dense::v41_pack_scales(&kernel, tensors.get(&names[i * 2 + 1])?, scale.buffer, stream.raw)
             };
             launched.and(unsafe { library.cuda_stream_synchronize(stream.raw) })?;
             scales.push(scale);

@@ -9,10 +9,16 @@ use anyhow::{ensure, Context, Result};
 use cuteafd_loader::{push_load::builder::{Builder, CheckedPlan, Destination}, OfficialV41Catalog, V41Exl3Layer,
     V41Exl3Residency};
 
-/// One coordinator GPU's admitted TP2 expert halves: the coordinator's legacy
-/// (non-balanced) residency, laid out as today's mount arenas, one region per layer.
+/// One coordinator GPU's admitted TP2 expert halves, laid out as today's mount
+/// arenas, one region per layer: EXL3 residencies (the legacy, non-balanced
+/// coordinator residency) or native MXFP4 planes (the Spark native images at
+/// world 2, packed after Done like a Spark rank's).
 pub(crate) struct Tp2ExpertPlan {
     pub residencies: Vec<V41Exl3Residency>,
+    /// Native planes per layer (empty for EXL3).
+    pub native: Vec<cuteafd_loader::push_load::native::NativePlanes>,
+    pub layers: Vec<usize>,
+    pub gpu: usize,
     pub layout: ArenaLayout,
     pub validation: ValidationLayout,
 }
@@ -20,6 +26,7 @@ pub(crate) struct Tp2ExpertPlan {
 impl Tp2ExpertPlan {
     pub fn new(catalog: &OfficialV41Catalog, layers: &[usize], gpu: usize, admitted: usize) -> Result<Self> {
         ensure!(gpu < 2, "coordinator TP2 has two GPUs");
+        if catalog.exl3().is_none() { return Self::native(catalog, layers, gpu, admitted); }
         let manifest = catalog.exl3().context("coordinator TP2 push requires EXL3 checkpoint headers")?;
         let residencies = layers.iter().map(|&layer| manifest.residency(V41Exl3Layer::Backbone(layer), 2, gpu))
             .collect::<Result<Vec<_>>>()?;
@@ -29,8 +36,27 @@ impl Tp2ExpertPlan {
         let layout = ArenaLayout::new(sizes, admitted)?;
         let validation = ValidationLayout::exl3(&residencies, layout.bytes() as u64, usize::MAX)?;
         let layout = layout.with_validation(validation.bytes(), validation.bytes())?;
-        Ok(Self { residencies, layout, validation })
+        Ok(Self { residencies, native: Vec::new(), layers: layers.to_vec(), gpu, layout, validation })
     }
+
+    /// Native MXFP4 halves: each layer's four planes for intermediate half
+    /// `gpu` (W1/W3 rows, W2 columns), exactly the mount's TP2 residency.
+    fn native(catalog: &OfficialV41Catalog, layers: &[usize], gpu: usize, admitted: usize) -> Result<Self> {
+        ensure!(catalog.fp8().is_none() && catalog.nvfp4().is_none(),
+            "coordinator native TP2 push takes MXFP4 checkpoints");
+        let geometry = catalog.routed_experts();
+        ensure!(geometry.intermediate % 2 == 0, "native TP2 halves need an even intermediate");
+        let width = geometry.intermediate / 2;
+        let planes = cuteafd_loader::push_load::native::NativePlanes::new(geometry.hidden as usize, width,
+            width.div_ceil(128) * 128, geometry.experts as usize, false)?;
+        let native = layers.iter().map(|_| planes.clone()).collect::<Vec<_>>();
+        let layout = ArenaLayout::new(native.iter().map(|p| p.bytes), admitted)?;
+        let validation = ValidationLayout::exl3(&[], layout.bytes() as u64, usize::MAX)?;
+        Ok(Self { residencies: Vec::new(), native, layers: layers.to_vec(), gpu, layout, validation })
+    }
+
+    /// Device scratch the post-Done native plane transform needs (0 for EXL3).
+    pub fn scratch_bytes(&self) -> usize { self.native.iter().map(|p| p.scratch_bytes()).max().unwrap_or(0) }
 
     /// Entries for group rank `rank` (the coordinator GPU's rank in the group).
     pub fn append(&self, builder: &mut Builder, catalog: &OfficialV41Catalog, rank: u32) -> Result<()> {
@@ -40,6 +66,18 @@ impl Tp2ExpertPlan {
     /// As `append`, with this plan's logical space starting at `base` of the
     /// rank's (the coordinator's dense operands come first).
     pub fn append_at(&self, builder: &mut Builder, catalog: &OfficialV41Catalog, rank: u32, base: u64) -> Result<()> {
+        if !self.native.is_empty() {
+            for (index, (planes, &layer)) in self.native.iter().zip(&self.layers).enumerate() {
+                let range = self.layout.region(index)?;
+                let destination = Destination { rank, offset: base + range.start as u64, bytes: range.len() as u64 };
+                for expert in 0..planes.experts {
+                    let names = catalog.expert_staging(cuteafd_loader::V41ExpertSelection::BackboneTp2 {
+                        layer, expert, rank: self.gpu })?.tensor_names().to_vec();
+                    builder.v41_resident(catalog, &names, planes, expert, 2, self.gpu as u32, destination, None)?;
+                }
+            }
+            return Ok(());
+        }
         for (index, residency) in self.residencies.iter().enumerate() {
             let range = self.layout.region(index)?;
             let (offsets, _) = residency.device_arena_layout()?;

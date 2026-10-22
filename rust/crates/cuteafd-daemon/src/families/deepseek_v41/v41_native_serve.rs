@@ -5,6 +5,7 @@ pub(crate) mod speculative;
 pub(crate) mod scheduler;
 pub(crate) mod console;
 mod distributed;
+mod coordinator_push;
 pub(crate) mod scores;
 use scores::RetainedScores;
 pub(crate) mod prefix;

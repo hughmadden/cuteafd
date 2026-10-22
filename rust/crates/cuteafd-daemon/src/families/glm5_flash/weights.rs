@@ -158,19 +158,7 @@ pub(crate) struct GlmfLoader<'a> {
     pub dense: std::rc::Rc<DenseLoad<'a>>,
 }
 
-/// How this load fills its class-2 operands and class-3 steps: through the
-/// mount as each is allocated, or recorded for the push group (the same
-/// records then run through the mount if the group falls back).
-#[derive(Default)]
-pub(crate) struct DenseLoad<'a> {
-    mount: std::cell::RefCell<Option<crate::shared::experts::rtx::dense::Mount<'a>>>,
-    pub sink: Option<crate::shared::experts::rtx::dense::DenseSink>,
-}
-
-impl<'a> DenseLoad<'a> {
-    pub fn push() -> Self { Self { mount: Default::default(), sink: Some(Default::default()) } }
-    pub fn pushing(&self) -> bool { self.sink.is_some() }
-}
+pub(crate) use crate::shared::experts::rtx::dense::DenseLoad;
 
 /// One part of a row concatenation quantized on the GPU: a checkpoint tensor
 /// (read straight into pinned memory) or BF16 bytes the loader already sliced.
@@ -467,12 +455,8 @@ impl<'a> GlmfLoader<'a> {
     fn step(&self, rank: usize, rects: Vec<Rect>, jobs: Vec<Job>) -> Result<()> {
         let device = self.rank_device(rank)?;
         let step = crate::shared::experts::rtx::dense::Step { device, rects, jobs };
-        if let Some(sink) = &self.dense.sink { return sink.step(step); }
         let stream = self.rank_stream(rank)?;
-        let mut mount = self.dense.mount.borrow_mut();
-        if mount.is_none() { *mount = Some(crate::shared::experts::rtx::dense::Mount::new(self.library)?); }
-        let mount = mount.as_mut().context("mount runner")?;
-        self.on_rank(rank, || mount.step(&step, stream))
+        self.dense.step(step, stream)
     }
 
     /// Records or fills one class-2 operand of `bytes` on rank `rank`'s GPU.
@@ -481,14 +465,7 @@ impl<'a> GlmfLoader<'a> {
         self.on_rank(rank, || {
             let allocation = DeviceAllocation::new(self.library, bytes.max(256))?;
             let operand = crate::shared::experts::rtx::dense::Operand { device, buffer: allocation.buffer, lands, bytes };
-            match &self.dense.sink {
-                Some(sink) => sink.operand(operand)?,
-                None => {
-                    let mut mount = self.dense.mount.borrow_mut();
-                    if mount.is_none() { *mount = Some(crate::shared::experts::rtx::dense::Mount::new(self.library)?); }
-                    mount.as_mut().context("mount runner")?.operand(&operand)?;
-                }
-            }
+            self.dense.operand(operand)?;
             Ok(allocation)
         })
     }
@@ -1240,7 +1217,7 @@ impl<'a> GlmfLoader<'a> {
         };
         crate::shared::memory::staging::release_staging();
         // The pinned GPU-quantization source and tables live only for the load.
-        drop(self.dense.mount.borrow_mut().take());
+        self.dense.release();
         split.log(if self.dense.pushing() { "glm5_flash dense planning" } else { "glm5_flash dense" });
         Ok((weights, shares.collect()))
     }
