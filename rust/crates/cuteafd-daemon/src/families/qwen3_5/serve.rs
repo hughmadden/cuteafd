@@ -192,7 +192,7 @@ pub(crate) struct ServeArgs {
     #[arg(long)]
     pub pool_tokens: Option<u64>,
     /// Full-attention KV storage only; GDN recurrence remains FP32.
-    #[arg(long, default_value = "bf16")]
+    #[arg(long, default_value = "fp8")]
     pub kv_cache: cuteafd_loader::families::qwen4::Qwen4KvCache,
     /// Admit a full prefill batch of vocabulary logits for quality scoring.
     #[arg(long)]
@@ -292,6 +292,14 @@ mod tests {
     struct Cli {
         #[command(flatten)]
         serve: ServeArgs,
+    }
+
+    #[test]
+    fn dense_defaults_to_compact_kv_without_full_prefill_arena() {
+        let parsed = Cli::try_parse_from(["dense", "--snapshot", "checkpoint", "--native-lib", "native.so"])
+            .unwrap().serve;
+        assert_eq!(parsed.kv_cache, cuteafd_loader::families::qwen4::Qwen4KvCache::Fp8);
+        assert!(!parsed.full_prefill_logits);
     }
 
     #[test]

@@ -103,7 +103,8 @@ fn native_planner_fixture() -> (tempfile::TempDir, PlanOptions, crate::placement
     let options = PlanOptions { placement: ExpertPlacement::Local, vision: plan::MediaMode::Off,
         audio: plan::MediaMode::Off, layout: Some(plan::layout::LayoutOptions {
             rtx_bytes: vec![96 << 30], concurrency: 4, prefix_slots: Some(10), native_mtp_layers: 0,
-            pool_tokens: Some(262144), workspace_manifest: Some(manifest.clone()), ..Default::default() }),
+            pool_tokens: Some(262144), workspace_manifest: Some(manifest.clone()),
+            dense_qwen_kv: crate::families::qwen4::Qwen4KvCache::Bf16, ..Default::default() }),
         ..Default::default() };
     (dir, options, buffers, exports)
 }
@@ -257,6 +258,13 @@ fn automatic_spark_count_retains_native_wip_zero_spark_candidate() {
     let explicit = plan::plan_spark_count(dir.path(), &options, 2, Some(2)).unwrap();
     assert!(!explicit.wip_launchable() && !explicit.executable());
     assert!(explicit.hints.iter().any(|h| h.what.contains("counts that work: [0]")));
+}
+
+#[test]
+fn dense_default_kv_is_compact_in_planner_and_cache_geometry() {
+    use crate::families::qwen4::Qwen4KvCache;
+    assert_eq!(plan::layout::LayoutOptions::default().dense_qwen_kv, Qwen4KvCache::Fp8);
+    assert_eq!(crate::serving_capacity::CacheOptions::default().dense_qwen_kv, Qwen4KvCache::Fp8);
 }
 
 #[test]

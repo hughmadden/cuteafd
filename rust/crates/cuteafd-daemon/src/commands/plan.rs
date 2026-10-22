@@ -47,7 +47,7 @@ fn options(args: &PlanArgs) -> Result<PlanOptions, PlanError> {
                 spark_allocation_budget_bytes: args.spark_budget_gib
                     .map(|gib| budget_bytes("--spark-budget-gib", gib)).transpose()?,
                 pool_tokens: args.pool_tokens,
-                dense_qwen_kv: args.kv_format.unwrap_or(cuteafd_loader::families::qwen4::Qwen4KvCache::Bf16),
+                dense_qwen_kv: args.kv_format.unwrap_or(cuteafd_loader::families::qwen4::Qwen4KvCache::Fp8),
                 qwen_kv: args.kv_format.unwrap_or_default(),
                 step5_kv: args.kv_format.unwrap_or_default(),
                 qwen_representation: cuteafd_loader::families::qwen4::resident::Qwen4Representation {
@@ -1357,6 +1357,20 @@ mod tests {
                 assert!(!layout.glmf_representation.fp8_head);
                 assert_eq!(layout.drafter_bytes, 0, "head arithmetic must not add a weight copy");
             }
+        }
+    }
+
+    #[test]
+    fn dense_kv_defaults_to_fp8_and_preserves_explicit_formats() {
+        use clap::Parser;
+        use cuteafd_loader::families::qwen4::Qwen4KvCache;
+        for (extra, expected) in [(&[][..], Qwen4KvCache::Fp8),
+            (&["--kv-cache", "bf16"][..], Qwen4KvCache::Bf16),
+            (&["--kv-cache", "fp8"][..], Qwen4KvCache::Fp8)] {
+            let cli = crate::cli::Cli::try_parse_from(
+                ["cuteafd", "plan", "/not-read", "--layout"].into_iter().chain(extra.iter().copied())).unwrap();
+            let crate::cli::Commands::Plan(args) = cli.command else { panic!("plan") };
+            assert_eq!(options(&args).unwrap().layout.unwrap().dense_qwen_kv, expected);
         }
     }
 
