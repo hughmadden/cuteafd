@@ -169,12 +169,14 @@ fn with_backend<T>(args: &ServeArgs,
     let endpoint = SparkEndpoint { capacity: args.prefill_rows, ingress: SparkIngress::Bf16 };
     let clients = admission.ownership.routed_endpoints()?;
     let config = TcpTransportConfig::default();
-    SparkAdmission::plan(&args.snapshot, ExpertGeometry::STEP5, Some(&catalog), &SparkWorkingSet {
+    // Spark admission is planned (headers only) here and started below, once the
+    // coordinator's own allocations are admitted; the coordinator then loads
+    // its weights while the Sparks load theirs (and, pushing, in one group).
+    let spark_admission = SparkAdmission::plan(&args.snapshot, ExpertGeometry::STEP5, Some(&catalog), &SparkWorkingSet {
         rtx_layers: vec![], spark_layers: (3..91).collect(), spark_ranks: args.peers.len(),
         prefill_lanes: 1 }, args.peers.len(), None,
         ModelAdmission::for_clients(ExpertGeometry::STEP5, endpoint, compiled,
-            spark_rings(config.max_frame_bytes)?, clients)?)?.select(&args.peers)?;
-    cuteafd_transport::worker_selection::require_peer_clients(&args.peers, endpoint, clients)?;
+            spark_rings(config.max_frame_bytes)?, clients)?)?;
     let available = inputs.inventory.gpus.iter().map(GpuBudget::available).collect::<Vec<_>>();
     let reserves = (0..ids.len()).map(|rank| {
         let native = Execution::serving_admission(&programs, &checkpoint, &admission.ownership, rank, inputs.rows)?;
@@ -206,6 +208,73 @@ fn with_backend<T>(args: &ServeArgs,
             Staging::bytes_for_sequences(&admission.cache, rank, inputs.sequences)?, inputs.sequences)
     }).collect::<Result<Vec<_>>>()?;
     let target_input = Inputs::allocate(devices[0], inputs.rows, Inputs::bytes(inputs.rows)?)?;
+    let tensor = checkpoint.tensors.iter().find(|t| t.meta.name == "model.embed_tokens.weight")
+        .context("Step-5 embedding header missing")?;
+    let source = EmbedSource::new(&args.snapshot, &tensor.shard, &tensor.meta, cfg.hidden)?;
+    library.cuda_set_device(args.device)?;
+    let ownership = admission.ownership;
+    let caches_ref: Vec<_> = caches.iter().collect();
+    let stages_ref: Vec<_> = stages.iter().collect();
+    // Admission precedes allocation: `load_native` re-checks every rank's
+    // admitted budget before allocating. With coordinator push, the native
+    // owners are allocated and their records planned before membership (a
+    // planning error offers no coordinator ranks: the Sparks still push and the
+    // coordinator fills through the mount); otherwise they load through the
+    // mount while the Sparks load.
+    let push = spark_admission.coordinator_pushes();
+    let mut native = None;
+    let mut coordinator = None;
+    let mut ranks = None;
+    if push {
+        let recorder = crate::shared::experts::rtx::dense::Recorder::start(true)?.context("dense recorder")?;
+        let loaded = Execution::load_native(&programs, &checkpoint, &ownership, &caches_ref, &stages_ref,
+            inputs.rows, &available, &reserves, 92);
+        let records = recorder.finish();
+        native = Some(loaded?);
+        let planned = (|| -> Result<_> {
+            let (landed, operands, staged, steps, largest, finishes) = records.summary();
+            tracing::info!(landed, operands, staged, steps, largest_step_bytes = largest, finishes,
+                "Step-5 coordinator dense records planned");
+            let dense = crate::shared::experts::rtx::dense::plan_records(&args.snapshot, records.clone(), &devices,
+                args.peers.len())?;
+            let prepared = crate::shared::experts::rtx::push::CoordinatorPush::prepare(&args.snapshot, None,
+                devices.len(), None)?;
+            Ok((prepared, dense))
+        })();
+        match planned {
+            Ok(((push, streams, offered), dense)) => {
+                coordinator = Some((push, records, dense));
+                ranks = Some((streams, offered));
+            }
+            Err(error) => {
+                // No coordinator ranks: the Sparks still push; fill the recorded owners here.
+                tracing::info!(%error, "Step-5 coordinator push unavailable; mount");
+                crate::shared::experts::rtx::dense::fill_records_by_mount(&library, &records, |_| std::ptr::null_mut())?;
+            }
+        }
+    }
+    let pending = spark_admission.start_with(&args.peers, ranks)?;
+    let (embedding, native) = crate::shared::placement::load_while_admitting(Some(pending), || {
+        TokenEmbedding::load(&library, source, EmbedPlacement::Gpu, || -> Result<super::execution::LoadedNative<'_>> {
+            if let Some((push, records, dense)) = coordinator {
+                let split = crate::shared::memory::load_timing::Split::start();
+                let (pushed, ()) = push.receive_with(devices.clone(), None, args.peers.len(), Some(Ok(dense)), || ());
+                let pushed = pushed?;
+                if pushed.is_none() {
+                    crate::shared::experts::rtx::dense::fill_records_by_mount(&library, &records, |_| std::ptr::null_mut())?;
+                }
+                split.log(if pushed.is_some() { "step5 dense push" } else { "step5 dense mount fill" });
+                tracing::info!(pushed = pushed.is_some(), operands = records.operands.len(), steps = records.steps.len(),
+                    "Step-5 coordinator dense operands landed");
+            }
+            match native {
+                Some(native) => Ok(native),
+                None => Execution::load_native(&programs, &checkpoint, &ownership, &caches_ref, &stages_ref, inputs.rows,
+                    &available, &reserves, 92),
+            }
+        })
+    })?;
+    cuteafd_transport::worker_selection::require_peer_clients(&args.peers, endpoint, clients)?;
     let world = SparkWorld::canonical(args.peers.len())?;
     let transport = devices[0].own(|| {
         let mut link = SparkLink::new(&library, world, &args.peers, args.prefill_rows, config, 4096 * 2)?;
@@ -213,14 +282,9 @@ fn with_backend<T>(args: &ServeArgs,
         link.bootstrap(&super::execution::bootstrap_request(inputs.rows, 1)?)?;
         Ok(link)
     })?;
-    let tensor = checkpoint.tensors.iter().find(|t| t.meta.name == "model.embed_tokens.weight")
-        .context("Step-5 embedding header missing")?;
-    let source = EmbedSource::new(&args.snapshot, &tensor.shard, &tensor.meta, cfg.hidden)?;
     library.cuda_set_device(args.device)?;
-    let (embedding, execution) = TokenEmbedding::load(&library, source, EmbedPlacement::Gpu, ||
-        Execution::load_count(&programs, &checkpoint, admission.ownership,
-            caches.iter().collect(), stages.iter().collect(), inputs.rows,
-            available, reserves, Some(transport), 92, 1))?;
+    let execution = Execution::bind_native(&checkpoint, ownership, native, caches_ref, stages_ref, inputs.rows,
+        Some(transport), 92, 1)?;
     let mtp = predictor_budget.map(|(available, reserved)| super::mtp::Runtime::load(
         &execution, &programs, &checkpoint, &caches[head_rank].borrow(),
         usize::from(args.mtp), inputs.rows, available, &[reserved])).transpose()?;
@@ -598,5 +662,29 @@ mod tests {
         assert!(compiled_capacity(&metadata, 256).is_err());
         assert!(compiled_capacity(&serde_json::json!({"layouts":{}}), 1).is_err());
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod load_order_tests {
+    /// Serving admits every coordinator owner, plans the Spark admission from
+    /// headers, records (pushing) or starts first, loads the native owners
+    /// while the Sparks load (`load_while_admitting`: a Spark failure returns
+    /// its error after the coordinator owners drop), and connects the Spark
+    /// transport only after admission completed.
+    #[test]
+    fn coordinator_loads_while_admitting_and_connects_after() {
+        let source = include_str!("serve.rs");
+        let start = source.find("fn with_backend<T>").unwrap();
+        let body = &source[start..start + source[start..].find("\nfn worker(").unwrap()];
+        let at = |needle: &str| body.find(needle).unwrap_or_else(|| panic!("missing {needle}"));
+        assert!(at("admission::admit_mtp(") < at("let spark_admission = SparkAdmission::plan("));
+        assert!(at("let spark_admission = SparkAdmission::plan(") < at("Execution::load_native("));
+        assert!(at("Execution::load_native(") < at("spark_admission.start_with("));
+        assert!(at("spark_admission.start_with(") < at("load_while_admitting(Some(pending)"));
+        assert!(at("load_while_admitting(Some(pending)") < at("require_peer_clients("));
+        assert!(at("require_peer_clients(") < at("SparkLink::new("));
+        assert!(at("SparkLink::new(") < at("Execution::bind_native("));
+        assert!(!body.contains(".select(&args.peers)"), "admission must not block before the coordinator load");
     }
 }

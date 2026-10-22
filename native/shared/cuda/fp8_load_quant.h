@@ -255,6 +255,13 @@ CUTEAFD_LQ_FN void quantize_unit_from(const Src& src, uint8_t* q, float* scales,
 // BF16 -> F32 widening (exact).
 CUTEAFD_LQ_FN uint32_t widen_bf16(uint16_t v) { return uint32_t(v) << 16; }
 
+// F32 -> BF16, round to nearest even; NaN keeps its sign and top payload bits
+// and becomes quiet (cuteafd_core::OutputPrecision::Bf16::round).
+CUTEAFD_LQ_FN uint16_t narrow_f32(uint32_t bits) {
+  if ((bits & 0x7fffffffu) > 0x7f800000u) return uint16_t(((bits & 0xffff0000u) | 0x00400000u) >> 16);
+  return uint16_t((bits + 0x7fffu + ((bits >> 16) & 1u)) >> 16);
+}
+
 // MLA kv_b [heads * (nope + v), lat] BF16 split per head into
 // uk [heads][lat][nope] (key rows transposed) and uv [heads][v][lat] (value
 // rows copied), for heads [h0, h0 + count): element `i` of that output range.
