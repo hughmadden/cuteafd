@@ -768,6 +768,8 @@ def docker_command(state, name, arm, slot, out_dir, golden, packages=None):
            '--label', f"cuteafd.golden-run={state['task']}/{name}",
            *state['serving_args'], *cards.cdi_gpu_args(gpus), '--ipc', 'host',
            '--ulimit', 'memlock=-1:-1']
+    if state.get('memory'):  # cap the coordinator container's host memory, swap equally
+        cmd += ['--memory', str(state['memory']), '--memory-swap', str(state['memory'])]
     if state.get('sparks'):
         cmd += ['--network', 'host', '--device=/dev/infiniband']
     for source, target in mounts:
@@ -1172,7 +1174,7 @@ def build_state(args, arms):
     if not hub.is_relative_to(namespace_root()):
         extra = [str(hub)] + [path for path in extra if not Path(path).is_relative_to(hub)]
     covered = [hub, Path(namespace_root()), snapshot] + ([Path(fixtures)] if fixtures else [])
-    state = dict(task=args.task, family=args.family, root=str(task_root / 'golden'), gpus=parse_gpus(args.gpus),
+    state = dict(task=args.task, family=args.family, root=str(task_root / 'golden'), gpus=parse_gpus(args.gpus), memory=args.memory_bytes,
                  snapshot=str(snapshot), snapshot_container=container_path, hub=str(hub), timeout=args.timeout,
                  golden=golden, extra_mounts=extra + path_mounts(golden, covered + [Path(p) for p in extra]),
                  mode=mode, native_test=native_test, native_test_sha256=native_digest, fixtures=fixtures,
@@ -1225,6 +1227,8 @@ def main(argv=None):
                         help='worker environment for one arm (repeatable; over --worker-env)')
     parser.add_argument('--worker-arg', action='append', default=[], metavar='ARG',
                         help='extra expertd-native argument (repeatable; e.g. --worker-arg=--exl3-schedule)')
+    parser.add_argument('--memory-bytes', type=int, metavar='N',
+                        help='host memory cap for the coordinator container (docker --memory/--memory-swap)')
     parser.add_argument('--worker-budget-bytes', type=int, default=DEFAULT_WORKER_BUDGET)
     parser.add_argument('--worker-memory-bytes', type=int, metavar='N',
                         help='container memory cap per worker (docker --memory/--memory-swap); above the device budget')
