@@ -988,7 +988,9 @@ fn place(report: &mut PlanReport, options: &PlanOptions, spec: &ModelSpec, model
                                 contract.block),
                         },
                     });
-                } else if !fits_on(ranks) {
+                } else if !fits_on(ranks) && !(spec.family == "minimax_m3" && options.layout.is_some()) {
+                    // MiniMax's device layout admits the actual hosted layer
+                    // slices after onboarding, including runtime reservations.
                     report.fits = false;
                     report.hints.push(Hint {
                         what: format!("routed experts need {:.1} GiB on the widest of {ranks} Spark ranks, over the \

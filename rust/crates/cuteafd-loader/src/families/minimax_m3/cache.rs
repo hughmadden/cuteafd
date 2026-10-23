@@ -18,6 +18,22 @@ pub const PAGE_ROWS: u64 = 64;
 pub const PAGES_PER_BLOCK: u64 = 2;
 /// One E4M3 index row plus its FP32 scale.
 pub const INDEX_ROW_BYTES: u64 = 128 + 4;
+pub const INDEX_PAGE_BYTES: u64 = 8448;
+pub const INDEX_SCALE_OFFSET: u64 = 8192;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PagePlane {
+    pub offset: u64,
+    pub bytes: u64,
+    pub page_bytes: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LayerPlanes {
+    pub key: PagePlane,
+    pub value: PagePlane,
+    pub index: PagePlane,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RankPages {
@@ -46,6 +62,13 @@ fn invalid(what: &'static str) -> CacheGeometryError {
 }
 
 impl MiniMaxCacheLayout {
+    /// The current native ABI has separate E4M3 K/V planes on one device.
+    pub fn for_runtime(cfg: &MiniMaxM3Config, ranks: usize, context: u64, kv_format: Qwen4KvCache) -> Result<Self, CacheGeometryError> {
+        if ranks != 1 { return Err(invalid("two-GPU MiniMax serving is not implemented")); }
+        if kv_format != Qwen4KvCache::Fp8 { return Err(invalid("MiniMax native MSA requires FP8 KV; BF16 KV has no export")); }
+        Self::new(cfg, ranks, context, kv_format)
+    }
+
     pub fn new(cfg: &MiniMaxM3Config, ranks: usize, context: u64, kv_format: Qwen4KvCache) -> Result<Self, CacheGeometryError> {
         if !(1..=2).contains(&ranks) || cfg.kv_heads % ranks != 0 || cfg.msa.block as u64 != PAGE_ROWS * PAGES_PER_BLOCK
             || cfg.msa.index_dim as u64 + 4 != INDEX_ROW_BYTES {
@@ -74,6 +97,23 @@ impl MiniMaxCacheLayout {
 
     /// Bytes per token on `rank` (for pool sizing and reports).
     pub fn token_bytes(&self, rank: usize) -> u64 { self.ranks[rank].page_bytes / PAGE_ROWS }
+
+    /// A layer owns contiguous K, V and packed-index planes, never interleaved K/V.
+    /// Offsets are relative to this layer's allocation; physical page IDs index
+    /// each plane independently.
+    pub fn layer_planes(&self, rank: usize, pages: u64) -> Result<LayerPlanes, CacheGeometryError> {
+        if pages == 0 || pages > i32::MAX as u64 { return Err(invalid("physical page count must fit positive Int32")); }
+        let rank = self.ranks.get(rank).ok_or_else(|| invalid("cache rank is absent"))?;
+        let kv = pages.checked_mul(rank.kv_page_bytes).ok_or(CacheGeometryError::Overflow("MiniMax KV plane"))?;
+        let index = pages.checked_mul(rank.index_page_bytes).ok_or(CacheGeometryError::Overflow("MiniMax index plane"))?;
+        let offset = kv.checked_mul(2).ok_or(CacheGeometryError::Overflow("MiniMax plane offset"))?;
+        offset.checked_add(index).ok_or(CacheGeometryError::Overflow("MiniMax layer planes"))?;
+        Ok(LayerPlanes {
+            key: PagePlane { offset: 0, bytes: kv, page_bytes: rank.kv_page_bytes },
+            value: PagePlane { offset: kv, bytes: kv, page_bytes: rank.kv_page_bytes },
+            index: PagePlane { offset, bytes: index, page_bytes: rank.index_page_bytes },
+        })
+    }
 
     pub fn geometry(&self) -> FamilyCacheGeometry {
         FamilyCacheGeometry {
@@ -106,5 +146,21 @@ mod tests {
         assert_eq!(one.geometry().ranks[0].persistent_unit_bytes, 128 * 69_360);
         assert!(MiniMaxCacheLayout::new(&cfg, 3, 1 << 20, Qwen4KvCache::Fp8).is_err());
         assert!(MiniMaxCacheLayout::new(&cfg, 1, (1 << 20) + 1, Qwen4KvCache::Fp8).is_err());
+    }
+
+    #[test]
+    fn native_planes_match_packed_index_and_separate_kv_abi() {
+        let cfg = MiniMaxM3Config::from_hf(&release_config()).unwrap();
+        let cache = MiniMaxCacheLayout::for_runtime(&cfg, 1, 1 << 20, Qwen4KvCache::Fp8).unwrap();
+        let p = cache.layer_planes(0, 3).unwrap();
+        assert_eq!(p.key, PagePlane { offset: 0, bytes: 3 * 32768, page_bytes: 32768 });
+        assert_eq!(p.value.offset, p.key.bytes);
+        assert_eq!(p.index.offset, p.key.bytes + p.value.bytes);
+        assert_eq!(p.index.bytes, 3 * INDEX_PAGE_BYTES);
+        assert_eq!(INDEX_SCALE_OFFSET + 64 * 4, INDEX_PAGE_BYTES);
+        assert_eq!((p.index.offset + p.index.bytes) * 60, 3 * cache.ranks[0].page_bytes);
+        assert!(cache.layer_planes(0, i32::MAX as u64 + 1).is_err());
+        assert!(MiniMaxCacheLayout::for_runtime(&cfg, 2, 1024, Qwen4KvCache::Fp8).is_err());
+        assert!(MiniMaxCacheLayout::for_runtime(&cfg, 1, 1024, Qwen4KvCache::Bf16).is_err());
     }
 }

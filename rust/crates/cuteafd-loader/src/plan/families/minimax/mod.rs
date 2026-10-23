@@ -13,6 +13,7 @@ use crate::families::minimax_m3::config::{MiniMaxM3Config, MiniMaxM3DsparkConfig
 use crate::plan::{checkpoint::Checkpoint, family::*, format::{self, QuantOperand, ScaleEncoding}, names::indexed, spec::*};
 
 pub mod coordinator;
+pub mod admission;
 mod placement;
 #[cfg(test)]
 mod tests;
@@ -62,6 +63,8 @@ pub(super) struct Model {
     expert_layer_bytes: BTreeMap<usize, u64>,
     /// Every expected tensor has a readable header.
     complete: bool,
+    /// Only successful manifest-backed placement can admit the WIP executor.
+    native_admission: bool,
 }
 
 fn text(name: &str) -> Option<&str> { name.strip_prefix(TEXT) }
@@ -142,7 +145,7 @@ impl Model {
             }
         }
         let mut model = Self { spec: spec(&cfg, vision.is_some(), draft.as_ref(), checkpoint), cfg, vision, draft, contracts,
-            bytes: BTreeMap::new(), expert_layer_bytes: BTreeMap::new(), complete: checkpoint.missing_shards.is_empty() };
+            bytes: BTreeMap::new(), expert_layer_bytes: BTreeMap::new(), complete: checkpoint.missing_shards.is_empty(), native_admission: false };
         let mut stems: BTreeMap<&str, Vec<&crate::SafetensorsTensorMetadata>> = BTreeMap::new();
         for tensor in &checkpoint.tensors { stems.entry(format::split_stem(&tensor.meta.name).0).or_default().push(&tensor.meta); }
         for (stem, contract) in &model.contracts {
@@ -261,20 +264,18 @@ impl Family for MiniMaxM3 {
     fn component_hint(&self, component: Component) -> Option<Hint> {
         match component {
             Component::Attention | Component::Indexer => Some(Hint {
-                what: "MiniMax M3 MSA attention execution is not wired".into(),
-                how: "Export the pinned b12x MSA indexer (dsa_indexer msa paged/contiguous block scores, q2k selection) and the \
-                    paged block-sparse GQA attention (attention/paged MSA, page 128, FP8 KV) at 64/4x128, top-16 of 128; the \
-                    contract is b12x/attention/dsa_indexer/MSA.md.".into(),
+                what: "MiniMax M3 native MSA execution awaits device qualification".into(),
+                how: "Use the matching MiniMax PROGRAMS.json for single-device WIP admission; serving uses FP8 K/V planes, \
+                    8448-byte index pages and causal paged tiles. Qualify real-weight numerics and cache replay before release.".into(),
             }),
             Component::RoutedExpert => Some(Hint {
-                what: "MiniMax M3 compressed-tensors NVFP4 experts have no package".into(),
-                how: "Package the fp8_moe NVFP4 programs at H6144/E128/K4/I3072 with the SwiGLU-OAI epilogue (alpha 1.702, \
-                    limit 7, +1 on up); stage weight_packed/weight_scale unchanged and invert weight_global_scale and \
-                    input_global_scale into the launch scalars.".into(),
+                what: "MiniMax M3 native NVFP4 W4A4 expert execution awaits device qualification".into(),
+                how: "Install fp8-minimax-nvfp4a4 with SwiGLU-OAI activation code 3; use mount loading for divisor scales, \
+                    Spark TP2/TP3/TP4 and TP1 for onboarded bottom routed layers. Push loading is unsupported.".into(),
             }),
             Component::Vision => Some(Hint {
-                what: "MiniMax M3 vision awaits GPU qualification and language-model integration".into(),
-                how: "Compile the MiniMax D80 vision attention export and qualify the native BF16 tower against the CPU reference; wire its features to the MiniMax language-model path.".into(),
+                what: "MiniMax M3 image feature injection awaits device qualification".into(),
+                how: "Compile the MiniMax D80 vision attention export and qualify the native BF16 tower and language-model feature injection against the CPU reference. Video input is unsupported.".into(),
             }),
             Component::Speculator => Some(Hint {
                 what: "MiniMax M3 DSpark drafting is not wired".into(),
@@ -291,6 +292,12 @@ impl Family for MiniMaxM3 {
 
 impl FamilyModel for Model {
     fn spec(&self) -> &ModelSpec { &self.spec }
+    fn configure(&mut self, options: &crate::plan::PlanOptions) -> Result<(), ConfigError> {
+        self.native_admission = options.layout.as_ref().is_some_and(|layout| layout.workspace_manifest.is_some()
+            || std::path::Path::new("/opt/cuteafd/share/PROGRAMS.json").is_file());
+        Ok(())
+    }
+    fn native_serving_admission(&self) -> bool { self.native_admission }
     fn activation(&self, layer: usize, _shared: bool) -> Option<FfnActivation> {
         (layer < self.cfg.layers).then_some(FfnActivation::SwigluOai {
             alpha: self.cfg.swiglu_alpha as f32, limit: self.cfg.swiglu_limit as f32 })
@@ -326,9 +333,9 @@ impl FamilyModel for Model {
                 bottom layers onboard to the RTX beside 2, 3, 4 or 6 Spark ranks".into()),
         })
     }
-    fn placement(&self, _input: &crate::plan::PlanInput, report: &mut crate::plan::PlanReport,
+    fn placement(&self, input: &crate::plan::PlanInput, report: &mut crate::plan::PlanReport,
         options: &crate::plan::layout::LayoutOptions, requested: crate::plan::ExpertPlacement)
         -> Option<anyhow::Result<cuteafd_core::memory_layout::MemoryLayout>> {
-        Some(Ok(placement::layout(self, report, options, requested)))
+        Some(placement::layout(self, input, report, options, requested))
     }
 }

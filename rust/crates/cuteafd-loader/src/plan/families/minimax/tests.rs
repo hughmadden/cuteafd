@@ -138,3 +138,87 @@ fn vision_uses_encoder_owner_and_reserves_weights_and_scratch() {
         }
     }
 }
+
+#[test]
+fn native_manifest_uses_shared_allocation_ledger() {
+    let dir = snapshot(false, false);
+    let programs = dir.path().join("PROGRAMS.json");
+    std::fs::write(&programs, admission::tests::programs_manifest().to_string()).unwrap();
+    let experts = dir.path().join("fp8/fp8-minimax-nvfp4a4");
+    std::fs::create_dir_all(&experts).unwrap();
+    std::fs::write(experts.join("manifest.json"), admission::tests::expert_manifest().to_string()).unwrap();
+    let mut options = with_layout(PRO_TOTAL_BYTES, 3);
+    let layout = options.layout.as_mut().unwrap();
+    layout.workspace_manifest = Some(programs.clone());
+    layout.prefill_rows = 256;
+    layout.concurrency = 16;
+    layout.pool_tokens = Some(16384);
+    layout.native_mtp_layers = 0;
+    let report = plan::plan(dir.path(), &options).unwrap();
+    assert!(report.placement_supported, "{:?}", report.hints);
+    assert!(report.wip_launchable() && !report.executable(), "{:?}", report.hints);
+    let memory = report.memory_layout.as_ref().unwrap();
+    assert_eq!(memory.pool_tokens, 16384);
+    assert!(memory.notes.iter().any(|n| n.contains("native allocation ledger")));
+    assert!(!memory.notes.iter().any(|n| n.contains("header lower bound")));
+    let rtx = memory.devices.iter().find(|d| d.kind == DeviceKind::Rtx).unwrap();
+    let item = |name: &str| rtx.items.iter().find(|i| i.group == name).unwrap();
+    assert_eq!(item("MiniMax residual").bytes, 256 * 6144 * 4);
+    assert_eq!(item("MiniMax scratch").bytes, 53_478_400);
+    assert!(rtx.used_bytes() <= PRO_TOTAL_BYTES);
+    options.layout.as_mut().unwrap().minimax_kv = crate::families::qwen4::Qwen4KvCache::Bf16;
+    let refused = plan::plan(dir.path(), &options).unwrap();
+    assert!(!refused.placement_supported && refused.hints.iter().any(|h| h.what.contains("BF16 KV")));
+    options.layout.as_mut().unwrap().minimax_kv = crate::families::qwen4::Qwen4KvCache::Fp8;
+    options.layout.as_mut().unwrap().rtx_bytes.push(PRO_TOTAL_BYTES);
+    let refused = plan::plan(dir.path(), &options).unwrap();
+    assert!(!refused.placement_supported && refused.hints.iter().any(|h| h.what.contains("two-GPU")));
+}
+
+#[test]
+fn explicit_missing_native_manifest_does_not_fall_back_to_headers() {
+    let dir = snapshot(false, false);
+    let mut options = with_layout(PRO_TOTAL_BYTES, 3);
+    options.layout.as_mut().unwrap().workspace_manifest = Some(dir.path().join("missing-PROGRAMS.json"));
+    options.layout.as_mut().unwrap().native_mtp_layers = 0;
+    let report = plan::plan(dir.path(), &options).unwrap();
+    assert!(!report.placement_supported);
+    assert!(report.memory_layout.unwrap().devices.is_empty());
+    assert!(report.hints.iter().any(|h| h.what.contains("PROGRAMS.json")));
+}
+
+#[test]
+fn native_tp2_auto_vision_preserves_text_admission() {
+    use crate::plan::{encoder::EncoderKind, MediaMode};
+    let dir = snapshot(true, false);
+    let programs = dir.path().join("PROGRAMS.json");
+    std::fs::write(&programs, admission::tests::programs_manifest().to_string()).unwrap();
+    let experts = dir.path().join("fp8/fp8-minimax-nvfp4a4");
+    std::fs::create_dir_all(&experts).unwrap();
+    let mut package = admission::tests::expert_manifest();
+    package["layouts"].as_object_mut().unwrap().retain(|name, _| name == "tp1");
+    std::fs::write(experts.join("manifest.json"), package.to_string()).unwrap();
+    let mut options = with_layout(RTX_5090, 2);
+    options.vision = MediaMode::Auto;
+    let layout = options.layout.as_mut().unwrap();
+    layout.workspace_manifest = Some(programs);
+    layout.native_mtp_layers = 0;
+    layout.prefill_rows = 1024;
+    layout.concurrency = 64;
+    let report = plan::plan(dir.path(), &options).unwrap();
+    assert!(report.wip_launchable(), "{:?}", report.hints);
+    assert_eq!(report.encoder.as_ref().unwrap().kind, EncoderKind::Off);
+    let memory = report.memory_layout.as_ref().unwrap();
+    assert!(memory.pool_tokens >= 64);
+    assert!(memory.devices.iter().all(|d| d.used_bytes() <= d.capacity_bytes));
+    assert!(memory.notes.iter().any(|n| n.starts_with("2 routed layers on the RTX")));
+    assert!(!report.hints.iter().any(|h| h.what.starts_with("routed experts need ")));
+    options.layout.as_mut().unwrap().prefill_rows = 4096;
+    let refused = plan::plan(dir.path(), &options).unwrap();
+    assert!(!refused.fits && !refused.placement_supported);
+    options.layout.as_mut().unwrap().prefill_rows = 1024;
+    options.layout.as_mut().unwrap().onboard = Some(crate::placement::Onboard::Layers(0));
+    let refused = plan::plan(dir.path(), &options).unwrap();
+    assert!(!refused.fits && !refused.placement_supported);
+    assert!(refused.hints.iter().any(|h| h.what.contains("MiniMax allocation needs")));
+}
