@@ -36,7 +36,10 @@ impl ExecutionOwnership {
             "Step-5 execution entry/head rank");
         ensure!(execution.spec().row_bytes == 4096 * 4 && execution.spec().rows <= 4096,
             "Step-5 residual hop geometry");
-        ensure!(execution.spec().lanes == 1, "Step-5 has one main execution lane");
+        // One execution lane; with prefill units in flight each unit slot owns
+        // its hop receive slots (a hop lane per slot), so no unit's hop lands
+        // in a slot another unit has not yet consumed.
+        ensure!((1..=4).contains(&execution.spec().lanes), "Step-5 hop lanes are one per prefill wave (1..=4)");
         for (layer, mode) in execution.modes().iter().enumerate() {
             match mode {
                 LayerMode::Whole { gpu, ffn: FfnMode::Owner } =>

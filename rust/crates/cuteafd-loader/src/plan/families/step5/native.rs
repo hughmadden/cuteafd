@@ -140,9 +140,23 @@ fn region(sizes: &[usize], order: &[usize], start: usize) -> Result<(Vec<(usize,
     Ok((layout, next))
 }
 
+/// Live planes hold every in-flight unit's rows (`span` rows, each unit at its
+/// own row offset); FFN scratch is hook-local and holds one unit.
+fn routed_sizes(unit: usize, span: usize) -> Result<[usize; 14]> {
+    ensure!(unit > 0 && unit <= span, "Step-5 FFN unit rows exceed the span");
+    let (local, live) = (routed_planes(unit)?, routed_planes(span)?);
+    Ok(std::array::from_fn(|plane| if ROUTED_LIVE.contains(&plane) { live[plane] } else { local[plane] }))
+}
+
+fn dense_sizes(unit: usize, span: usize) -> Result<[usize; 6]> {
+    ensure!(unit > 0 && unit <= span, "Step-5 FFN unit rows exceed the span");
+    let (local, live) = (dense_planes(unit)?, dense_planes(span)?);
+    Ok(std::array::from_fn(|plane| if DENSE_LIVE.contains(&plane) { live[plane] } else { local[plane] }))
+}
+
 /// End of the live prefix: OUTPUT, INPUT, SHARED and both reply planes.
-fn live_prefix(rows: usize) -> Result<usize> {
-    let routed = routed_planes(rows)?;
+fn live_prefix(unit: usize, span: usize) -> Result<usize> {
+    let routed = routed_sizes(unit, span)?;
     let (_, end) = region(&routed, &ROUTED_LIVE, 0)?;
     end.checked_add(routed[9]).and_then(|n| n.checked_add(15)).map(|n| n / 16 * 16)
         .context("Step-5 FFN region overflow")
@@ -150,33 +164,37 @@ fn live_prefix(rows: usize) -> Result<usize> {
 
 /// (offset, bytes) per routed plane, in the routed owner's plane-index order,
 /// relative to the rank's FFN region. `full` (CSA) layers use the second reply plane.
-pub fn routed_layout(rows: usize, full: bool) -> Result<[(usize, usize); 14]> {
-    let sizes = routed_planes(rows)?;
+pub fn routed_layout(unit: usize, span: usize, full: bool) -> Result<[(usize, usize); 14]> {
+    let sizes = routed_sizes(unit, span)?;
     let (mut layout, swa_end) = region(&sizes, &ROUTED_LIVE, 0)?;
     if full { layout[9].0 = swa_end; }
     let local = (0..14).filter(|plane| !ROUTED_LIVE.contains(plane)).collect::<Vec<_>>();
-    let (tail, _) = region(&sizes, &local, live_prefix(rows)?)?;
+    let (tail, _) = region(&sizes, &local, live_prefix(unit, span)?)?;
     for &plane in &local { layout[plane] = tail[plane]; }
     Ok(layout.try_into().expect("routed plane count"))
 }
 
 /// Dense OUTPUT and INPUT share the routed offsets; its scratch follows the
 /// whole live prefix, including the routed-only SHARED and reply planes.
-pub fn dense_layout(rows: usize) -> Result<[(usize, usize); 6]> {
-    let sizes = dense_planes(rows)?;
+pub fn dense_layout(unit: usize, span: usize) -> Result<[(usize, usize); 6]> {
+    let sizes = dense_sizes(unit, span)?;
     let (mut layout, _) = region(&sizes, &DENSE_LIVE, 0)?;
     let local = [1, 2, 3, 4];
-    let (tail, _) = region(&sizes, &local, live_prefix(rows)?)?;
+    let (tail, _) = region(&sizes, &local, live_prefix(unit, span)?)?;
     for plane in local { layout[plane] = tail[plane]; }
     Ok(layout.try_into().expect("dense plane count"))
 }
 
+/// Whether a routed (or dense) plane holds rows of every in-flight unit.
+pub fn routed_live(plane: usize) -> bool { ROUTED_LIVE.contains(&plane) }
+pub fn dense_live(plane: usize) -> bool { DENSE_LIVE.contains(&plane) }
+
 /// One FFN region per rank, after that rank's largest attention region.
-pub fn ffn_region_bytes(rows: usize) -> Result<u64> {
+pub fn ffn_region_bytes(unit: usize, span: usize) -> Result<u64> {
     let end = |layout: &[(usize, usize)]| layout.iter().map(|&(offset, bytes)| offset + bytes)
         .max().unwrap_or(0);
-    let bytes = end(&routed_layout(rows, false)?).max(end(&routed_layout(rows, true)?))
-        .max(end(&dense_layout(rows)?));
+    let bytes = end(&routed_layout(unit, span, false)?).max(end(&routed_layout(unit, span, true)?))
+        .max(end(&dense_layout(unit, span)?));
     Ok(u64::try_from(bytes.div_ceil(16) * 16)?)
 }
 
@@ -230,7 +248,7 @@ pub fn mtp_input_planes(rows: usize) -> Result<[usize; 6]> {
 }
 
 pub fn mtp_input_offset(rows: usize) -> Result<u64> {
-    layer_workspace(rows, false, 64)
+    layer_workspace(rows, rows, false, 64)
 }
 
 pub fn mtp_metadata_offset(rows: usize) -> Result<u64> {
@@ -256,15 +274,19 @@ pub fn mtp_scratch_core(rows: usize, kv_format: Qwen4KvCache) -> Result<u64> {
         .max(plane_bytes(&head_planes(head_rows(rows, false))?)?))
 }
 
+/// `unit` rows run through attention and FFN scratch per hook; `span` rows
+/// (unit x waves in flight) are held by the live FFN planes.
 pub fn rank_admission(
     checkpoint: &Checkpoint,
     ownership: &ExecutionOwnership,
     rank: usize,
-    rows: usize,
+    unit: usize,
+    span: usize,
     logits: usize,
 ) -> Result<RankAdmission> {
     ensure!(
-        rows > 0 && rows as u64 <= ownership.execution().spec().rows && (1..=rows).contains(&logits),
+        unit > 0 && unit <= span && unit as u64 <= ownership.execution().spec().rows
+            && (1..=span).contains(&logits),
         "Step-5 native row admission"
     );
     let cfg = Config::parse(checkpoint)?;
@@ -280,7 +302,7 @@ pub fn rank_admission(
         .context("Step-5 native rank immutable overflow")?;
     let owns = (0..cfg.layers).any(|layer| ownership.layer(layer, rank).is_ok_and(|l| l.query_heads > 0));
     let mut workspace = if owns {
-        rank_attention_bytes(&cfg, ownership, rank, rows)?.checked_add(ffn_region_bytes(rows)?)
+        rank_attention_bytes(&cfg, ownership, rank, unit)?.checked_add(ffn_region_bytes(unit, span)?)
             .context("Step-5 rank workspace overflow")?
     } else { 0 };
     if rank == ownership.execution().spec().head_gpu as usize {
@@ -300,8 +322,8 @@ pub fn plane_bytes(planes: &[usize]) -> Result<u64> {
 }
 
 /// One layer kind's attention region plus the shared FFN region.
-pub fn layer_workspace(rows: usize, full: bool, heads: usize) -> Result<u64> {
-    attention_bytes(rows, full, heads)?.checked_add(ffn_region_bytes(rows)?)
+pub fn layer_workspace(unit: usize, span: usize, full: bool, heads: usize) -> Result<u64> {
+    attention_bytes(unit, full, heads)?.checked_add(ffn_region_bytes(unit, span)?)
         .context("Step-5 layer scratch overflow")
 }
 
@@ -316,14 +338,14 @@ mod tests {
     #[test]
     fn ffn_region_keeps_live_planes_at_common_offsets_for_every_kind() -> Result<()> {
         for rows in [1, 16, 64, 256, 512, 1024, 2048, 4096] {
-            let routed = routed_layout(rows, false)?;
-            let csa = routed_layout(rows, true)?;
-            let dense = dense_layout(rows)?;
+            let routed = routed_layout(rows, rows, false)?;
+            let csa = routed_layout(rows, rows, true)?;
+            let dense = dense_layout(rows, rows)?;
             // Head-split and whole-owned replies never share storage; every
             // other plane is identical between the two routed kinds.
             assert!(routed[9].0 + routed[9].1 <= csa[9].0);
             assert!((0..14).filter(|&p| p != 9).all(|p| routed[p] == csa[p]));
-            let region = usize::try_from(ffn_region_bytes(rows)?)?;
+            let region = usize::try_from(ffn_region_bytes(rows, rows)?)?;
             // OUTPUT first, then INPUT, in both kinds.
             assert_eq!((routed[13].0, dense[5].0), (0, 0));
             assert_eq!(routed[0].0, dense[0].0);
@@ -351,18 +373,33 @@ mod tests {
             assert_eq!(region % 16, 0);
             assert!(region < usize::try_from(plane_bytes(&routed_planes(rows)?)? + plane_bytes(&dense_planes(rows)?)?)?);
         }
+        // Units: live planes span every in-flight unit's rows, scratch holds one unit.
+        for (unit, span) in [(256, 512), (512, 1024), (2048, 4096)] {
+            let routed = routed_layout(unit, span, true)?;
+            let dense = dense_layout(unit, span)?;
+            for plane in 0..14 {
+                let expected = if routed_live(plane) { routed_planes(span)?[plane] } else { routed_planes(unit)?[plane] };
+                assert_eq!(routed[plane].1, expected);
+            }
+            for plane in 0..6 {
+                let expected = if dense_live(plane) { dense_planes(span)?[plane] } else { dense_planes(unit)?[plane] };
+                assert_eq!(dense[plane].1, expected);
+            }
+            assert!(ffn_region_bytes(unit, span)? < ffn_region_bytes(span, span)?);
+        }
+        assert!(routed_layout(512, 256, false).is_err());
         Ok(())
     }
 
     #[test]
     fn layer_scratch_is_attention_plus_one_shared_ffn_region() -> Result<()> {
         for rows in [1, 256, 2048, 4096] {
-            let region = ffn_region_bytes(rows)?;
+            let region = ffn_region_bytes(rows, rows)?;
             for (full, heads) in [(false, 32), (false, 64), (true, 64)] {
-                assert_eq!(layer_workspace(rows, full, heads)?, attention_bytes(rows, full, heads)? + region);
+                assert_eq!(layer_workspace(rows, rows, full, heads)?, attention_bytes(rows, full, heads)? + region);
             }
-            assert!(layer_workspace(rows, true, 64)? >= layer_workspace(rows, false, 64)?);
-            assert!(layer_workspace(rows, true, 64)? > plane_bytes(&head_planes(head_rows(rows, false))?)?);
+            assert!(layer_workspace(rows, rows, true, 64)? >= layer_workspace(rows, rows, false, 64)?);
+            assert!(layer_workspace(rows, rows, true, 64)? > plane_bytes(&head_planes(head_rows(rows, false))?)?);
         }
         assert_eq!(head_rows(4096, false), 64);
         assert_eq!(head_rows(16, false), 16);

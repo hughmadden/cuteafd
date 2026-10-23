@@ -34,11 +34,13 @@ pub(super) fn admit_mtp<'a>(
     let ownership = &admitted.ownership;
     for rank in 0..ownership.ranks() {
         let native =
-            Execution::serving_admission(programs, checkpoint, ownership, rank, inputs.rows, inputs.logit_rows())?;
+            Execution::serving_admission(programs, checkpoint, ownership, rank, inputs.unit_rows(), inputs.rows,
+                inputs.logit_rows())?;
         let shared = cuteafd_loader::plan::families::step5::native::rank_admission(
             checkpoint,
             ownership,
             rank,
+            inputs.unit_rows(),
             inputs.rows,
             inputs.logit_rows(),
         )?;
@@ -213,10 +215,17 @@ mod tests {
             assert!(!report.executable());
             // The planner's automatic prefill unit (2048, or the step-down that
             // keeps its pool) is what the daemon admits.
-            let rows = report.prefill_rows.unwrap_or(2048) as usize;
+            // Unit rows and waves; the span the daemon admits is their product.
+            let unit = report.prefill_rows.unwrap_or(2048) as usize;
+            let waves = report.prefill_lanes.unwrap_or(1) as usize;
+            let rows = unit * waves;
             if launchable {
-                assert!([2048, 1024, 512].contains(&rows), "{rows}");
-                assert!(report.prefill_selection.as_deref().is_some_and(|s| s.contains(&format!("{rows} rows"))));
+                assert!([2048, 1024, 512].contains(&unit), "{unit}");
+                // Two in flight unless device-only retention at full context
+                // forces the default down to one.
+                assert!(waves == 2 || (waves == 1 && host == Some(0)), "waves {waves}");
+                assert!(report.prefill_selection.as_deref().is_some_and(|s|
+                    s.contains(&format!("{unit} rows x {waves} waves"))));
             }
             let mut code = Vec::new();
             let gpus = opts
@@ -254,6 +263,7 @@ mod tests {
                 },
                 rows,
                 full_prefill_logits: false,
+                waves,
                 sequences: 16,
                 context,
                 requested_pool: pool,

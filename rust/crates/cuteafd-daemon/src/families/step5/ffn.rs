@@ -16,6 +16,8 @@ const DENSE: usize = 13824;
 #[derive(Debug, Clone)]
 struct Admission {
     rows: usize,
+    /// Rows of every in-flight unit held by the live planes (`span >= rows`).
+    span: usize,
     planes: [usize; 6],
     bytes: u64,
 }
@@ -49,6 +51,7 @@ impl Admission {
         );
         Ok(Self {
             rows,
+            span: rows,
             planes,
             bytes,
         })
@@ -67,6 +70,8 @@ pub(super) struct DenseFfn<'a> {
     planes: Vec<Plane<'a>>,
     admission: Admission,
     immutable: std::rc::Rc<DenseWeights<'a>>,
+    /// Row offset of the selected prefill unit inside the live planes.
+    unit: std::cell::Cell<usize>,
 }
 
 pub(super) struct DensePlan {
@@ -84,6 +89,19 @@ impl DensePlan {
 
     pub fn workspace_bytes(&self) -> u64 {
         cuteafd_loader::plan::families::step5::native::plane_bytes(&self.admission.planes).expect("admitted planes")
+    }
+
+    /// Live planes hold `span` rows (every in-flight unit); scratch holds one.
+    pub(super) fn with_span(mut self, span: usize) -> Result<Self> {
+        ensure!(span >= self.admission.rows && span <= 4096, "Step-5 dense span outside 1..=4096");
+        let live = cuteafd_loader::plan::families::step5::native::dense_planes(span)?;
+        for plane in 0..6 {
+            if cuteafd_loader::plan::families::step5::native::dense_live(plane) {
+                self.admission.planes[plane] = live[plane];
+            }
+        }
+        self.admission.span = span;
+        Ok(self)
     }
 
     pub fn prepare(
@@ -313,12 +331,12 @@ impl<'a> DenseFfn<'a> {
     fn workspace(device: Device<'a>, admission: Admission,
         immutable: std::rc::Rc<DenseWeights<'a>>, arena: Option<(&Arena<'a>, usize)>) -> Result<Self> {
         let _scope = cuteafd_ffi::memory_ledger::scope("step5_dense_workspace");
-        let spans = cuteafd_loader::plan::families::step5::native::dense_layout(admission.rows)?;
+        let spans = cuteafd_loader::plan::families::step5::native::dense_layout(admission.rows, admission.span)?;
         ensure!(spans.iter().zip(&admission.planes).all(|(span, &bytes)| span.1 == bytes),
             "Step-5 dense region layout differs from admission");
         let planes = scratch::region_planes(device, &spans, arena)?;
         let stream = Stream::new(device)?;
-        Ok(Self { stream, planes, admission, immutable })
+        Ok(Self { stream, planes, admission, immutable, unit: std::cell::Cell::new(0) })
     }
 
     pub fn enqueue(&mut self, rows: usize) -> Result<()> {
@@ -336,11 +354,27 @@ impl<'a> DenseFfn<'a> {
         super::weights::validate_live_weights(device.id, &self.immutable.weights)
     }
 
+    /// Live planes (INPUT, OUTPUT) are viewed at the selected unit's rows.
+    fn plane(&self, index: usize) -> cuteafd_ffi::CuteafdDeviceBuffer {
+        let buffer = self.planes[index].buffer;
+        if !cuteafd_loader::plan::families::step5::native::dense_live(index) { return buffer; }
+        let offset = self.unit.get() * (buffer.bytes / self.admission.span);
+        cuteafd_ffi::CuteafdDeviceBuffer { ptr: buffer.ptr.wrapping_byte_add(offset), bytes: buffer.bytes - offset, ..buffer }
+    }
+
+    /// Selects a prefill unit's rows of the live planes; whole steps use row 0.
+    pub(super) fn select_unit(&self, start: usize, rows: usize) -> Result<()> {
+        ensure!(start.checked_add(rows).is_some_and(|end| end <= self.admission.span) && rows <= self.admission.rows,
+            "Step-5 dense unit rows outside admitted span");
+        self.unit.set(start);
+        Ok(())
+    }
+
     pub fn input(&self) -> cuteafd_ffi::CuteafdDeviceBuffer {
-        self.planes[0].buffer
+        self.plane(0)
     }
     pub fn output(&self) -> cuteafd_ffi::CuteafdDeviceBuffer {
-        self.planes[5].buffer
+        self.plane(5)
     }
 
     pub(super) fn diagnostic_planes(&self) -> [(cuteafd_ffi::CuteafdDeviceBuffer, bool); 4] {
@@ -387,9 +421,7 @@ impl<'a> DenseFfn<'a> {
                     .is_some_and(|end| end <= self.admission.rows),
             "dense stage/capacity mismatch"
         );
-        let p = self
-            .planes
-            .iter()
+        let p = (0..6).map(|index| self.plane(index))
             .zip([
                 HIDDEN * 4,
                 HIDDEN * 2,
@@ -398,7 +430,7 @@ impl<'a> DenseFfn<'a> {
                 HIDDEN * 2,
                 HIDDEN * 4,
             ])
-            .map(|(a, stride)| a.buffer.ptr.wrapping_byte_add(start * stride))
+            .map(|(a, stride)| a.ptr.wrapping_byte_add(start * stride))
             .collect::<Vec<_>>();
         let w = self
             .immutable

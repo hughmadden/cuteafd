@@ -140,14 +140,14 @@ mod tests {
             let metadata_offset = usize::try_from(native::mtp_metadata_offset(rows)?)?;
             let core = usize::try_from(native::mtp_scratch_core(rows, kv_format)?)?;
             let attention = view_layout(predictor, &attention_sizes, 0)?;
-            let dense = native::dense_layout(rows)?.map(|(offset, bytes)| (attention_bytes + offset, bytes)).to_vec();
+            let dense = native::dense_layout(rows, rows)?.map(|(offset, bytes)| (attention_bytes + offset, bytes)).to_vec();
             let inputs = view_layout(predictor, &native::mtp_input_planes(rows)?, input_offset)?;
             let metadata_sizes = native::mtp_metadata_planes(rows)?;
             let metadata = view_layout(predictor, &metadata_sizes[..4], metadata_offset)?;
             let head = view_layout(predictor, &native::head_planes(native::head_rows(rows, false))?, 0)?;
             let selected = (0..3).map(|stage| view_layout(predictor, &metadata_sizes[4..],
                 core + stage * 256).map(|views| views[0])).collect::<Result<Vec<_>>>()?;
-            assert_eq!(input_offset, attention_bytes + usize::try_from(native::ffn_region_bytes(rows)?)?);
+            assert_eq!(input_offset, attention_bytes + usize::try_from(native::ffn_region_bytes(rows, rows)?)?);
             let compact = if kv_format == Qwen4KvCache::Fp8 {
                 view_layout(predictor, &native::mtp_compact_planes(rows, kv_format)?,
                     usize::try_from(native::mtp_compact_offset(rows)?)?)?
@@ -170,7 +170,7 @@ mod tests {
             // Target outputs can alias predictor scratch only after the backend's
             // history copy and the scheduler's logit selection have retired them.
             for (full, heads) in [(false, 32), (false, 64), (true, 64)] {
-                let target = usize::try_from(native::layer_workspace(rows, full, heads)?)?;
+                let target = usize::try_from(native::layer_workspace(rows, rows, full, heads)?)?;
                 let capacity = target.max(predictor);
                 for &(offset, bytes) in live_core.iter().chain(&head).chain(&selected) {
                     assert!(offset + bytes <= capacity);
@@ -209,7 +209,7 @@ mod tests {
         for rows in [1, 3, 16, 63, 64, 65, 256, 640, 1025, 2048, 4095, 4096] {
             let residual = rows * 4096 * 4;
             let largest = usize::try_from(native::attention_bytes(rows, true, 64)?)?;
-            let region = usize::try_from(native::ffn_region_bytes(rows)?)?;
+            let region = usize::try_from(native::ffn_region_bytes(rows, rows)?)?;
             for attention in [native::swa_planes(rows, 32)?.to_vec(),
                 native::swa_planes(rows, 64)?.to_vec(), native::csa_planes(rows)?.to_vec()] {
                 let attention_bytes = usize::try_from(native::plane_bytes(&attention)?)?;
@@ -219,8 +219,8 @@ mod tests {
                 // Attention never reaches the shared FFN region at the rank's offset.
                 assert!(attention_views.iter().all(|&(offset, bytes)| offset + bytes <= largest));
             }
-            for ffn in [native::dense_layout(rows)?.to_vec(), native::routed_layout(rows, false)?.to_vec(),
-                native::routed_layout(rows, true)?.to_vec()] {
+            for ffn in [native::dense_layout(rows, rows)?.to_vec(), native::routed_layout(rows, rows, false)?.to_vec(),
+                native::routed_layout(rows, rows, true)?.to_vec()] {
                 let views = ffn.iter().map(|&(offset, bytes)| (largest + offset, bytes)).collect::<Vec<_>>();
                 assert!(views.iter().all(|&(offset, bytes)| offset >= largest && offset + bytes <= largest + region));
                 // Every kind's OUTPUT is the region's first plane.
