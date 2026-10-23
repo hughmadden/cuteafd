@@ -3613,3 +3613,17 @@ def test_dense_full_prefill_logits_reaches_serve_and_plan(tmp_path, full, kv):
     expected_kv = kv or "fp8"
     assert f"--kv-cache {expected_kv}" in launch
     assert f"--kv-cache {expected_kv}" in plan
+
+
+def test_dense_qwen_forwards_speculation_trace(tmp_path: Path) -> None:
+    # Dense Qwen writes the trace through the shared Qwen scheduler; the card's
+    # --trace sets SPECULATION_TRACE, which the launcher must mount and pass on.
+    trace = tmp_path / "trace" / "speculation-trace.jsonl"
+    result = _family_launch_result(tmp_path, DENSE_CONFIG, "Qwen/Qwen3.5-9B",
+        f"SPARK_COUNT=0\nSPECULATION_TRACE={trace}\n",
+        extra_args=("--wip", "dense-test"),
+        encoder_plan={"placement_supported": True, "fits": True, "spark_ranks": 0})
+    assert result.returncode == 0, result.stderr
+    launch = next(line for line in result.stderr.splitlines() if "serve-qwen35 --snapshot" in line)
+    assert f"CUTEAFD_SPECULATION_TRACE={trace}" in launch
+    assert f"{trace.parent}:{trace.parent}" in launch
