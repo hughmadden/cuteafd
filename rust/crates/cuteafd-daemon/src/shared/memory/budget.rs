@@ -119,14 +119,11 @@ impl FromStr for LocalLayers {
     }
 }
 
-/// Admit all future pinned tables for this coordinator process before allocation.
-/// Families supply the names and byte formulas, summed across every local GPU.
-/// This check is independent of whether retained-prefix caching is enabled.
-pub(crate) fn admit_pinned_tables(tables: &[(&str, u64)], deferred_logits: u64, headroom: u64)
-    -> Result<cuteafd_core::memory_layout::HostLayout> {
-    admit_host_memory(0, tables, deferred_logits, headroom)
-}
-
+/// Admit the complete future host working set once, before any allocation.
+/// Families supply table byte formulas summed across every local GPU, together
+/// with the full prefix-cache quota (zero when disabled) and deferred logits.
+/// Separate checks for tables and cache against the same live sample are not
+/// reservations: they can each fit while their combined working set does not.
 pub(crate) fn admit_host_memory(cache: u64, tables: &[(&str, u64)], deferred_logits: u64, headroom: u64)
     -> Result<cuteafd_core::memory_layout::HostLayout> {
     use cuteafd_core::memory_layout::{Basis, Category, Item};
@@ -192,6 +189,17 @@ mod tests {
         assert_eq!((ledger.resident_bytes, ledger.deferred_bytes, ledger.headroom_bytes), (300, 300, 150));
         assert_eq!(ledger.reserve_bytes, 150);
         assert_eq!(host_admission(memory, vec![], 100, &[], 100, 0)?.deferred_bytes, 100);
+        Ok(())
+    }
+
+    #[test]
+    fn tables_and_prefix_must_be_admitted_in_one_complete_working_set() -> Result<()> {
+        let memory = HostMemory { total: 1000, available: 600 };
+        let tables = [("synthetic/table", 300)];
+        assert!(host_admission(memory, vec![], 300, &[], 0, 0).is_ok());
+        assert!(host_admission(memory, vec![], 0, &tables, 0, 0).is_ok());
+        let error = host_admission(memory, vec![], 300, &tables, 0, 0).unwrap_err();
+        assert!(error.to_string().contains("shortfall 100 bytes"), "{error}");
         Ok(())
     }
 
