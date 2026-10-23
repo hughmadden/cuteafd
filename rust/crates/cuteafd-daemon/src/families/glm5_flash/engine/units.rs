@@ -38,7 +38,8 @@ impl<'a> UnitHooks<'_, 'a, '_> {
         let e = self.engine;
         let w = &self.work[unit.slot];
         let t = self.rows(unit);
-        let rows = Scalar::I32(t as i32);
+        let tables = &self.steps[unit.index].0;
+        let spans = tables.spans();
         // Publish rank 1's retained FFN partial only when this unit lands.
         if let Some(w1) = self.peer(unit)? {
             if e.layer_execution.is_none() && !e.tp2_layer(layer) {
@@ -48,11 +49,21 @@ impl<'a> UnitHooks<'_, 'a, '_> {
         }
         let out = e.meet_ffn(w, layer, unit.slot, e.weights.layers.len(), t)?;
         if let Some(w1) = self.peer(unit)? { e.peer_post(layer, unit.slot, w1, t, PREFILL_CAP)?; }
-        match e.weights.layers.get(layer + 1) {
-            Some(next) => e.post_pre_on(0, w, out, 1, next, "attn", "input_norm", rows, PREFILL_CAP)?,
-            None => e.mhc_post_at(w, out, 1, &Span { first: 0, rows: t })?,
+        for span in &spans {
+            match e.weights.layers.get(layer + 1) {
+                Some(next) => e.post_pre_at(0, w, out, 1, next, "attn", "input_norm",
+                    span.first, span.rows(), PREFILL_CAP)?,
+                None => e.mhc_post_at(w, out, 1, span)?,
+            }
         }
         if let Some(drafter) = &e.drafter {
+            if !tables.segments.is_empty() {
+                for s in tables.segments.iter().filter(|s| s.tap_rows > 0) {
+                    drafter.tap_streams_at(layer, w.streams[0].buffer.ptr, HC,
+                        s.end_row() - s.tap_rows, s.tap_rows, s.tap_offset)?;
+                }
+                return Ok(());
+            }
             let window = self.total.saturating_sub(crate::shared::speculation::dflash::TAP_ROWS);
             let from = unit.rows.start.max(window);
             if from < unit.rows.end {
@@ -124,10 +135,16 @@ impl PrefillHooks for UnitHooks<'_, '_, '_> {
             }
             e.peer_attention(index, unit.slot, w1, unit.rows.len(), PREFILL_CAP, &self.ranked[unit.index][1])?;
         }
-        if index == 0 { e.pre(w, &w.streams[0], layer, rows)?; }
+        let spans = self.steps[unit.index].0.spans();
+        if index == 0 {
+            for span in &spans { e.pre_at(0, w, &w.streams[0], layer, span.first, span.rows())?; }
+        }
         e.attention(0, w, index, layer, rows, PREFILL_CAP, &self.ranked[unit.index][0], None)?;
         let attended = e.meet_attention(w, slot(index, false, unit.slot), unit.rows.len(), layer, PREFILL_CAP)?;
-        e.post_pre_on(0, w, attended, 0, layer, "ffn", "post_norm", rows, PREFILL_CAP)
+        for span in &spans {
+            e.post_pre_at(0, w, attended, 0, layer, "ffn", "post_norm", span.first, span.rows(), PREFILL_CAP)?;
+        }
+        Ok(())
     }
     fn local_ffn(&mut self, index: usize, unit: &Unit) -> Result<()> {
         let e = self.engine;
@@ -144,7 +161,7 @@ impl PrefillHooks for UnitHooks<'_, '_, '_> {
             e.ffn(w, layer, e.cfg.dense_intermediate, PREFILL_CAP, w.delta.buffer.ptr, rows)?;
         } else {
             e.moe_front(w, index, layer, unit.rows.len(), rows, PREFILL_CAP,
-                &[Span { first: 0, rows: unit.rows.len() }])?;
+                &self.steps[unit.index].0.spans())?;
             let w1 = self.peer(unit)?;
             if e.tp2_layer(index) {
                 e.tp2_pair(index, unit.slot, w, w1, unit.rows.len(), rows, PREFILL_CAP)?;
@@ -165,7 +182,7 @@ impl PrefillHooks for UnitHooks<'_, '_, '_> {
                 &self.ranked[unit.index], unit, index, self.total)?));
         }
         e.moe_front(w, index, layer, unit.rows.len(), rows, PREFILL_CAP,
-            &[Span { first: 0, rows: unit.rows.len() }])?;
+            &self.steps[unit.index].0.spans())?;
         let Some(Experts::Spark { transport, .. }) = e.routed_experts(index) else {
             anyhow::bail!("Spark unit without its link");
         };
@@ -189,6 +206,12 @@ impl PrefillHooks for UnitHooks<'_, '_, '_> {
             e.unit_exit([w, w1], &self.ranked[unit.index], unit, self.total, &mut self.consumed[unit.index])?;
         }
         if let Some(w1) = self.peer(unit)? { e.replicate_terminal(w, w1, 0, unit.rows.len())?; }
+        if !self.steps[unit.index].0.segments.is_empty() {
+            // Packed consumers project each sequence's last normalized row later.
+            e.run("head", &[("streams", w.streams[0].buffer.ptr), ("weight", e.weights.norm.buffer.ptr),
+                ("out", w.x.buffer.ptr)], &[Scalar::I32(unit.rows.len() as i32)])?;
+            return Ok(());
+        }
         let wanted = unit.rows.end.saturating_sub((self.total - self.wanted).max(unit.rows.start));
         if wanted > 0 {
             e.layer_head(w, unit.rows.len(), wanted)?;

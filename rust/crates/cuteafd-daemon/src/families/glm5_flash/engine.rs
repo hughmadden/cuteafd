@@ -3475,7 +3475,7 @@ impl<'a> GlmfEngine<'a> {
         }
         tables.segments = segments.clone();
         let tokens: Vec<u32> = sequences.iter().flat_map(|(_, tokens)| tokens.iter().copied()).collect();
-        self.step(&tables, &tokens, 1, None, None, None, None)?;
+        self.step_units(&[(tables, &tokens)], 0, false, None)?;
         let lanes = self.prefill_slots_of(0, 1)?;
         let w = lanes.first().context("prefill workspace")?;
         let outcomes = packed_tail(sequences, |i| {
