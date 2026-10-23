@@ -65,9 +65,13 @@ impl RouteIdentity {
     }
 }
 
-/// Retained diagnostic buffers for live prefill slots. Allocate `storage` before
-/// peer waits are queued; begin/finish never replace a slot's pinned allocations.
-/// The owner drains both producer streams in `finish` before reading the buffers.
+/// Retained diagnostic buffers for live prefill slots. Allocate max-row buffers
+/// for every slot before any peer waits are queued; begin/finish never replace
+/// those pinned allocations. The `finish` callback drains both producer streams,
+/// then trims each buffer to the unit's actual rows before returning RouteChecks.
+/// Always call `finish_span`, including before propagating an executor error;
+/// strict mode rejects a begun unit that never finished. An error does not prove
+/// device work drained: the owner's submission guard still owns abort and teardown.
 #[derive(Debug)]
 pub(crate) struct SlotRouteChecks<T> {
     slots: Vec<(T, Option<CheckedUnit>)>,
