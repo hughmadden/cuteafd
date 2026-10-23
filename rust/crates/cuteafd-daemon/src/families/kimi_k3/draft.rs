@@ -31,10 +31,9 @@ impl Options {
     }
 }
 
-pub(crate) const TARGET_TAP_ROWS: usize = cuteafd_loader::families::kimi_k3::DRAFT_TARGET_TAP_ROWS;
-
-pub(crate) fn bridge_demands(layout: &MlaDraftRuntimeLayout) -> Result<Vec<Demand>> {
-    cuteafd_loader::families::kimi_k3::draft_bridge_demands(layout)
+/// The target's tap staging holds one prefill call's `rows` (the lane rows).
+pub(crate) fn bridge_demands(layout: &MlaDraftRuntimeLayout, rows: usize) -> Result<Vec<Demand>> {
+    cuteafd_loader::families::kimi_k3::draft_bridge_demands(layout, rows)
 }
 
 /// Field order is intentional: the common executor drops before its borrowed
@@ -72,7 +71,7 @@ impl<'a> NativeDraft<'a> {
         let file = std::fs::read(options.snapshot.join("model.safetensors"))?;
         let draft = admission.allocate_draft(prepared.stream.device, programs, &options.snapshot, file,
             prepared.stream.raw, options.representation(), Fp8Scales::Amax, Fp8Rows::W8a16)?;
-        let demands = bridge_demands(layout)?;
+        let demands = bridge_demands(layout, admission.lane_rows())?;
         let device = streams[0].device;
         let allocate = |name| -> Result<Allocation<'a>> {
             let demand = demands.iter().find(|d| d.group == name).context("Kimi draft bridge inventory missing")?;
@@ -153,7 +152,7 @@ impl<'a> NativeDraft<'a> {
         rows: usize, to: usize) -> Result<()> {
         let Some(index) = self.owners.draft.tap_index(layer) else { return Ok(()) };
         let cfg = &self.owners.draft.cfg;
-        let offset = tap_offset(to, rows, cfg.taps.len() * cfg.hidden)?;
+        let offset = tap_offset(to, rows, cfg.taps.len() * cfg.hidden, self.tap_rows())?;
         ensure!(Rc::ptr_eq(local.stream(), &self.target_streams[0]),
             "Kimi draft taps exceed staging or use the wrong producer stream");
         let hidden = local.terminal_residual(rows)?;
@@ -179,8 +178,14 @@ impl<'a> NativeDraft<'a> {
     }
 
     pub(crate) fn update(&self, rows: &[ContextRow]) -> Result<()> {
-        for slice in context_slices(rows)? { self.update_slice(&slice)?; }
+        for slice in context_slices(rows, self.tap_rows())? { self.update_slice(&slice)?; }
         Ok(())
+    }
+
+    /// Rows of the target's tap staging (one prefill call's lane rows).
+    fn tap_rows(&self) -> usize {
+        let cfg = &self.owners.draft.cfg;
+        self.taps.buffer.bytes / (cfg.taps.len() * cfg.hidden * 2)
     }
 
     fn update_slice(&self, rows: &[ContextRow]) -> Result<()> {
@@ -300,10 +305,10 @@ impl Drop for NativeDraft<'_> {
 
 /// Bound the span, not just the number of accepted rows: rejected verify rows
 /// can leave holes between requests in the target's tap staging.
-fn context_slices(rows: &[ContextRow]) -> Result<Vec<Vec<ContextRow>>> {
+fn context_slices(rows: &[ContextRow], tap_rows: usize) -> Result<Vec<Vec<ContextRow>>> {
     let mut rows = rows.to_vec();
     rows.sort_unstable_by_key(|r| r.tap_row);
-    ensure!(rows.iter().all(|r| r.tap_row < TARGET_TAP_ROWS)
+    ensure!(rows.iter().all(|r| r.tap_row < tap_rows)
         && rows.windows(2).all(|pair| pair[0].tap_row != pair[1].tap_row),
         "Kimi context taps are duplicate or outside target staging");
     let mut slices: Vec<Vec<ContextRow>> = Vec::new();
@@ -316,8 +321,8 @@ fn context_slices(rows: &[ContextRow]) -> Result<Vec<Vec<ContextRow>>> {
     Ok(slices)
 }
 
-fn tap_offset(to: usize, rows: usize, stride: usize) -> Result<usize> {
-    ensure!(to.checked_add(rows).is_some_and(|end| end <= TARGET_TAP_ROWS),
+fn tap_offset(to: usize, rows: usize, stride: usize, tap_rows: usize) -> Result<usize> {
+    ensure!(to.checked_add(rows).is_some_and(|end| end <= tap_rows),
         "Kimi draft tap destination exceeds staging");
     to.checked_mul(stride).and_then(|offset| offset.checked_mul(2))
         .context("Kimi draft tap offset overflow")
@@ -326,6 +331,8 @@ fn tap_offset(to: usize, rows: usize, stride: usize) -> Result<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// Default lane rows (unit 2048 x 2 waves) for these tap fixtures.
+    const TARGET_TAP_ROWS: usize = 4096;
 
     #[test]
     fn subwave_taps_match_full_chunk_bytes() -> Result<()> {
@@ -340,7 +347,7 @@ mod tests {
                 full[at..at + hidden * 2].copy_from_slice(&source[row * hidden * 2..(row + 1) * hidden * 2]);
             }
             for (first, count) in [(0, 1408), (1408, 1408), (2816, 1280)] {
-                let base = tap_offset(first, count, stride)?;
+                let base = tap_offset(first, count, stride, TARGET_TAP_ROWS)?;
                 for row in 0..count {
                     let at = base + row * stride * 2 + tap * hidden * 2;
                     let from = (first + row) * hidden * 2;
@@ -349,8 +356,9 @@ mod tests {
             }
         }
         assert_eq!(split, full);
-        assert!(tap_offset(4095, 2, stride).is_err());
-        assert!(tap_offset(usize::MAX, 1, stride).is_err());
+        assert!(tap_offset(4095, 2, stride, TARGET_TAP_ROWS).is_err());
+        assert!(tap_offset(8191, 1, stride, 8192).is_ok() && tap_offset(8191, 2, stride, 8192).is_err());
+        assert!(tap_offset(usize::MAX, 1, stride, TARGET_TAP_ROWS).is_err());
         Ok(())
     }
 
@@ -384,7 +392,7 @@ mod tests {
     fn wide_prefill_keeps_every_tap_in_two_common_slices() -> Result<()> {
         let rows = (0..TARGET_TAP_ROWS).map(|tap_row| ContextRow {
             tap_row, slot: 3, position: 8192 + tap_row }).collect::<Vec<_>>();
-        let slices = context_slices(&rows)?;
+        let slices = context_slices(&rows, TARGET_TAP_ROWS)?;
         assert_eq!(slices.iter().map(Vec::len).collect::<Vec<_>>(), [TAP_ROWS, TAP_ROWS]);
         for (actual, expected) in slices.iter().flatten().zip(&rows) {
             assert_eq!((actual.tap_row, actual.slot, actual.position),
@@ -397,16 +405,16 @@ mod tests {
     fn accepted_tap_holes_bound_span_not_row_count() -> Result<()> {
         let rows = [4095, 2047, 2048, 0].map(|tap_row| ContextRow {
             tap_row, slot: tap_row / TAP_ROWS, position: 17000 + tap_row });
-        let slices = context_slices(&rows)?;
+        let slices = context_slices(&rows, TARGET_TAP_ROWS)?;
         assert_eq!(slices.iter().map(|slice| slice.iter().map(|r| r.tap_row)
             .collect::<Vec<_>>()).collect::<Vec<_>>(), [vec![0, 2047], vec![2048, 4095]]);
         for slice in &slices {
             let first = slice[0].tap_row;
             assert!(slice.iter().all(|row| row.tap_row - first < TAP_ROWS));
         }
-        assert!(context_slices(&[])?.is_empty());
-        assert!(context_slices(&[rows[0], rows[0]]).is_err());
-        assert!(context_slices(&[ContextRow { tap_row: TARGET_TAP_ROWS, ..rows[0] }]).is_err());
+        assert!(context_slices(&[], TARGET_TAP_ROWS)?.is_empty());
+        assert!(context_slices(&[rows[0], rows[0]], TARGET_TAP_ROWS).is_err());
+        assert!(context_slices(&[ContextRow { tap_row: TARGET_TAP_ROWS, ..rows[0] }], TARGET_TAP_ROWS).is_err());
         Ok(())
     }
 

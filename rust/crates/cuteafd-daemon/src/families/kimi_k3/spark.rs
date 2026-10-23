@@ -28,7 +28,7 @@ pub(crate) fn demand(rows: usize, waves: usize, lane: usize) -> Result<Demand> {
 }
 
 pub(crate) fn demand_with(rows: usize, waves: usize, unit: Option<usize>, lane: usize) -> Result<Demand> {
-    ensure!((1..=4096).contains(&rows), "Kimi Spark row capacity");
+    ensure!((1..=cuteafd_loader::families::kimi_k3::allocation::LANE_ROWS_MAX).contains(&rows), "Kimi Spark row capacity");
     let shape = cuteafd_loader::families::kimi_k3::allocation::prefill_shape_with(rows, waves, unit)?;
     Ok(cuteafd_loader::families::kimi_k3::allocation::spark_demand(shape, lane))
 }
@@ -83,13 +83,14 @@ impl<'a> RoutedLane<'a> {
             && charges[0].basis == charge.basis && charges[0].bytes == charge.bytes,
             "Kimi Spark intake differs from accepted admission");
         let stream = local.stream().clone();
-        let layout = RouteStaging::new(local.rows(), TOPK, KimiExpertInput::ROW_BYTES)?;
+        // Each wave is one unit's rows: staging and transport serve a unit.
+        let layout = RouteStaging::new(unit, TOPK, KimiExpertInput::ROW_BYTES)?;
         let library = library_owner.as_ref();
         let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
         let (mut link, staging, ready) = stream.device.run(|| {
             library.v41_compact_reducer()?.require_plane_reduction(RANKS as u32)?;
-            let mut link = SparkLink::new_waves(library, world, &peers, local.rows() as u32, config, LATENT * 2,
-                waves, unit as u32)?;
+            let mut link = SparkLink::new_waves(library, world, &peers, u32::try_from(unit)?, config, LATENT * 2,
+                waves, u32::try_from(unit)?)?;
             link.enable_terminal_ownership(Arc::clone(library_owner))?;
             Ok((link, HostAllocation::new(library, layout.bytes)?, Event::new(stream.device)?))
         })?;
@@ -101,7 +102,7 @@ impl<'a> RoutedLane<'a> {
                 "Kimi bootstrap requires installed grouping from all six ranks");
         }
         Ok(Self { stream, link: Some(link), runtime, library_owner: Arc::clone(library_owner),
-            terminal: false, staging, ready, capacity: local.rows(), waves, unit, sequence: 0,
+            terminal: false, staging, ready, capacity: unit, waves, unit, sequence: 0,
             outstanding: std::collections::VecDeque::new() })
     }
 
@@ -325,7 +326,8 @@ mod tests {
         bytes[..4].copy_from_slice(&896u32.to_le_bytes());
         assert!(request(1, 1, 1, ExpertV2SourceKind::Decode, &layout, &bytes).is_err());
         assert!(demand(0, 1, 0).is_err());
-        assert!(demand(4097, 1, 0).is_err());
+        assert!(demand(8193, 1, 0).is_err());
+        assert!(demand(8192, 2, 0).is_ok(), "two 4096-row units on one lane");
         assert!(demand(4096, 3, 0).is_ok() && demand(128, 3, 0).is_err());
         Ok(())
     }

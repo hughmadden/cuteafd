@@ -141,26 +141,31 @@ impl ProjectionScratchLayout {
 }
 
 /// Named split-stage outputs retained beside the fused lane's existing arena.
-pub fn intermediate_extents(rows: usize) -> Result<BTreeMap<&'static str, usize>> {
+/// Arena stages live within one unit's hook (`unit` rows); the peer meet
+/// planes are row planes of the whole call (`rows`, windowed per unit).
+pub fn intermediate_extents(rows: usize, unit: usize) -> Result<BTreeMap<&'static str, usize>> {
     [("K6 q",6144,2),("K6 k",6144,2),("K6 v",6144,2),("K6 gate",12288,2),
         ("K6 q_a",1536,2),("K6 kv_a",640,2),("K6 q_b",18432,2),("K6 normalized",12288,2),
         ("K6 FFN gate",3072,2),("K6 FFN up",3072,2),("K6 attention partial",7168,4),
         ("K6 FFN partial",7168,4),("K6 reduced",7168,4)].into_iter()
-        .map(|(name,width,element)| Ok((name,rows.checked_mul(width*element).context("K6 lane intermediate overflow")?)))
+        .map(|(name,width,element)| {
+            let rows = if super::allocation::CORE_MEET_PLANES.contains(&name) { rows } else { unit };
+            Ok((name,rows.checked_mul(width*element).context("K6 lane intermediate overflow")?))
+        })
         .collect()
 }
 
 /// Split entrypoints can need separate scratch larger than the fused plane.
-pub fn lane_extents(rows: usize, base_kda: usize, base_mla: usize,
+pub fn lane_extents(rows: usize, unit: usize, base_kda: usize, base_mla: usize,
     split_kda: usize, split_mla: usize) -> Result<BTreeMap<&'static str, usize>> {
-    let mut extents=intermediate_extents(rows)?;
+    let mut extents=intermediate_extents(rows, unit)?;
     if split_kda>base_kda {extents.insert("K6 KDA scratch",split_kda);}
     if split_mla>base_mla {extents.insert("K6 MLA scratch",split_mla);}
     Ok(extents)
 }
 
 /// Inert installed-package inspection, with no CUDA load or payload read.
-pub fn package_lane_extents(manifest: &serde_json::Value, rows: usize) -> Result<BTreeMap<&'static str,usize>> {
+pub fn package_lane_extents(manifest: &serde_json::Value, rows: usize, unit: usize) -> Result<BTreeMap<&'static str,usize>> {
     let programs=manifest["programs"].as_array().context("Kimi K6 package program list")?;
     let scratch=|name: &str| -> Result<usize> {
         let entries=programs.iter().filter(|p|p["name"]==name).collect::<Vec<_>>();
@@ -181,7 +186,7 @@ pub fn package_lane_extents(manifest: &serde_json::Value, rows: usize) -> Result
             }}
         }
     }
-    lane_extents(rows,base_kda,base_mla,split_kda,split_mla)
+    lane_extents(rows,unit,base_kda,base_mla,split_kda,split_mla)
 }
 
 pub fn needs_f32_partials(cfg: &KimiK3Config, core: &CoreInventory) -> bool {
@@ -202,19 +207,21 @@ pub struct CoreCharges {
     pub receive: usize,
 }
 impl CoreCharges {
-    pub fn from_package(cfg: &KimiK3Config, core: &CoreInventory, rows: usize,
+    /// `rows` lane rows of `unit`-row units: projections and the peer
+    /// receive serve one unit's launch; meet planes span the lane.
+    pub fn from_package(cfg: &KimiK3Config, core: &CoreInventory, rows: usize, unit: usize,
         manifest: &serde_json::Value) -> Result<Self> {
-        let stages = if core.projections.is_empty() { BTreeMap::new() } else { package_lane_extents(manifest,rows)? };
+        let stages = if core.projections.is_empty() { BTreeMap::new() } else { package_lane_extents(manifest,rows,unit)? };
         let stage_bytes = if stages.is_empty() { 0 } else {
-            let base = super::allocation::NativeLaneLayout::new(cfg, rows, super::COMPILED_CONTEXT,
+            let base = super::allocation::NativeLaneLayout::new(cfg, rows, unit, super::COMPILED_CONTEXT,
                 super::allocation::NativeScratch::from_manifest(manifest)?)?;
             base.clone().with_core_stages(stages.clone())?.bytes()?.checked_sub(base.bytes()?)
                 .context("Kimi core stage charge underflow")?
         };
         Ok(Self {
-            projection: projection_scratch(cfg,core,rows,&manifest["families"]["kimi_k6_dense"] )?,
+            projection: projection_scratch(cfg,core,unit,&manifest["families"]["kimi_k6_dense"] )?,
             stages, stage_bytes,
-            receive: exchange_recv_bytes(rows,needs_f32_partials(cfg,core))?,
+            receive: exchange_recv_bytes(unit,needs_f32_partials(cfg,core))?,
         })
     }
     pub fn demands(&self) -> Result<Vec<crate::placement::Demand>> {
