@@ -158,7 +158,7 @@ def execute(args):
     import torch
     from shape_invariant import linear, qualify
     started = time.monotonic()
-    manifest = load_set(args.windows, "minimax")
+    manifest = load_set(args.windows, "minimax_m3")
     identity = verify_snapshot(manifest, args.snapshot)
     if manifest["checkpoint"] != model.CHECKPOINT or args.snapshot.name != model.REVISION:
         raise ValueError("MiniMax golden requires the pinned release checkpoint")

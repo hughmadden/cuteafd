@@ -242,7 +242,7 @@ def test_served_and_diagnostic_activation_arms_differ(snapshot):
 
 def panel(tokens):
     from fidelity_windows import set_hash
-    result = dict(schema="cuteafd.fidelity.set/1", family="minimax", checkpoint=model.CHECKPOINT,
+    result = dict(schema="cuteafd.fidelity.set/1", family="minimax_m3", checkpoint=model.CHECKPOINT,
                   windows=[dict(id="sample", tokens=tokens, roles=["ctx"] * 3 + ["gen"] * (len(tokens) - 3),
                                 score_from=3, bucket="0-2K")], quick_windows=["sample"])
     result["set_sha256"] = set_hash(result)
@@ -349,7 +349,7 @@ def test_family_registrations_are_present():
         assignment = next(node for node in tree.body if isinstance(node, ast.Assign)
                           and any(isinstance(t, ast.Name) and t.id == symbol for t in node.targets))
         value = ast.literal_eval(assignment.value)
-        assert "minimax" in value
+        assert ("minimax" if symbol == "SUBCOMMANDS" else "minimax_m3") in value
         if symbol == "SUBCOMMANDS":
             assert value["minimax"] == "minimax-golden"
 
