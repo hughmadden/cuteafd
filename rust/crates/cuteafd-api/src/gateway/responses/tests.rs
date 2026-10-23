@@ -1340,3 +1340,16 @@ async fn full_log_captures_messages_responses_and_websocket_turns() {
     }
     server.abort();
 }
+
+#[test]
+fn input_video_preserves_canonical_frames_and_sampling_options() {
+    let item = json!({"role":"user", "content":[{"type":"input_video",
+        "video_url":{"frames":["https://example.com/a.png"], "source_fps":30},
+        "do_sample_frames":true, "fps":2, "do_resize":false}]});
+    let parsed = parse::parse_item(&item).unwrap();
+    let Item::Message { content, .. } = &parsed[0] else { panic!("expected message") };
+    assert_eq!(content.as_slice(), [Part::Video { source: json!({"frames":["https://example.com/a.png"],
+        "source_fps":30, "do_sample_frames":true, "fps":2, "do_resize":false}) }]);
+    let mut invalid = item; invalid["content"][0]["fps"] = json!("invalid");
+    assert!(parse::parse_item(&invalid).is_err());
+}

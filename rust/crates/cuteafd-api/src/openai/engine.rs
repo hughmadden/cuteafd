@@ -151,6 +151,7 @@ fn content(content: &[Part], role: &str) -> Result<Value, GatewayError> {
                 if let Some(detail) = detail { image["detail"] = json!(detail); }
                 json!({"type":"image_url","image_url":image})
             }
+            Part::Video { source } => json!({"type":"video_url", "video_url":source}),
             Part::Audio { format, data } => {
                 let (format, data) = if format == "pcm16" { ("wav".to_owned(), pcm16_wav(data)?) } else { (format.clone(), data.clone()) };
                 json!({"type":"input_audio","input_audio":{"format":format,"data":data}})

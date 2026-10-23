@@ -101,6 +101,7 @@ fn parts(content: &[Part], flavor: Flavor) -> Result<Value, GatewayError> {
                     ImageSource::Url { url } => json!({"type":"url", "url":url}),
                     ImageSource::Base64 { media_type, data } => json!({"type":"base64", "media_type":media_type,"data":data}) }}),
             },
+            Part::Video { .. } => return Err(GatewayError::unsupported("upstream video input is not supported")),
             Part::Audio { format, data } if flavor == Flavor::OpenaiChat => chat_audio(format,data)?,
             Part::Audio { .. } => return Err(GatewayError::unsupported("Anthropic upstream audio input is not supported")),
             Part::File { .. } => return Err(GatewayError::unsupported("upstream file input requires a frontend text conversion")),

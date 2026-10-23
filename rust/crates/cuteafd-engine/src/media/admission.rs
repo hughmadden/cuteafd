@@ -36,11 +36,12 @@ impl<T> MediaWaiter<T> {
             }
             inputs.entry(image.key).or_insert(image);
         }
-        for span in media.spans() {
+        for (index, span) in media.spans().iter().enumerate() {
             let image = inputs
                 .get(&span.key)
                 .ok_or(MediaError::NotReady(span.key))?;
-            if image.tokens != span.len || image.feature_bytes()? != span.len * media.row_bytes() {
+            if image.tokens != media.feature_rows(index)
+                || image.feature_bytes()? != media.feature_rows(index) * media.row_bytes() {
                 return Err(MediaError::Features);
             }
         }
@@ -497,6 +498,37 @@ mod tests {
             self.cancellations.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             self.inner.cancel(ticket);
         }
+    }
+
+    #[test]
+    fn separated_video_pairs_encode_once_and_reserve_the_complete_segment() {
+        let key = ImageKey([7; 32]);
+        let spans = vec![MediaSpan { start: 1, len: 2, key: key.into() },
+            MediaSpan { start: 5, len: 2, key: key.into() }];
+        let media = RequestMedia::new_with_layout(spans.clone(), 16, 8, vec![0, 2], vec![4, 4]).unwrap();
+        let job = EncodeJob::video(key, [2, 2, 4], vec![0; 4*28*56*3].into(), 4, 16);
+        let expected = FakeEncoder::features(&job).unwrap();
+        let mut partial = job.clone(); partial.tokens = 2;
+        assert!(MediaWaiter::new(0, media.clone(), vec![partial], 0).is_err());
+        let mut queue = MediaAdmission::new(EmbeddingCache::new(128), FakeEncoder::default(), 2);
+        let waiter = MediaWaiter::new(1, media.clone(), vec![job.clone(), job.clone()], 0).unwrap();
+        queue.enqueue(waiter).unwrap();
+        let waiter = MediaWaiter::new(2, media, vec![job], 5).unwrap();
+        queue.enqueue(waiter).unwrap();
+        let first = ready(queue.poll(|_| false));
+        let second = ready(queue.poll(|_| false));
+        assert_eq!(queue.encoder().submitted, 1);
+        assert_eq!(queue.cache.bytes(), 128);
+        let mut chunk = crate::media::MediaChunk::default();
+        first.media().write_chunk(0, 8, &mut chunk).unwrap();
+        assert_eq!(chunk.indices, [1, 2, 5, 6]);
+        assert_eq!(&*chunk.features, &*expected);
+        second.media().write_chunk(5, 7, &mut chunk).unwrap();
+        assert_eq!(&chunk.features, &expected[64..]);
+        assert_ne!(&expected[..64], &expected[64..]);
+        first.media().write_chunk(2, 6, &mut chunk).unwrap();
+        assert_eq!(chunk.indices, [0, 3]);
+        assert_eq!(&chunk.features, &expected[32..96]);
     }
 
     #[test]

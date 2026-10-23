@@ -1,5 +1,6 @@
 //! Family-neutral, bounded preparation. CUDA work stays on the encoder owner.
 pub mod audio;
+pub mod video;
 use anyhow::{ensure, Context, Result};
 use cuteafd_loader::media::{
     decode_bounded, EncoderId, ImageProcessor, PreparedImage, PreprocessId, ProcessorConfig,

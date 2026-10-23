@@ -35,8 +35,10 @@ pub fn start(config: &EncoderWorkerConfig, snapshot: &Path, library: PathBuf, bu
     let processor = ProcessorConfig::from_snapshot(snapshot, spec.image_family())?;
     let handshake = EncoderHandshake { encoder_id: id, max_patches: spec.native.max_tokens * processor.merge.pow(2),
         output_width: spec.native.output_width, patch_size: processor.patch, merge_size: processor.merge, plan_hash: config.plan_hash };
+    let minimax = spec.image_family() == cuteafd_loader::media::ImageFamily::Minimax;
     let service = EncoderService::start(spec, library, 0, ledger.total_bytes())?;
-    let server = EncoderServer::start(config.listen.parse().context("encoder listen address")?, handshake, service, normalization_lut(&processor), Duration::from_secs(60))
+    let start = if minimax { EncoderServer::start_minimax } else { EncoderServer::start };
+    let server = start(config.listen.parse().context("encoder listen address")?, handshake, service, normalization_lut(&processor), Duration::from_secs(60))
         .map_err(|e| anyhow::anyhow!("{e}"))?;
     tracing::info!(address = %server.address, sm, admitted_bytes = ledger.total_bytes(), "vision encoder ready");
     Ok((server, ledger.total_bytes()))

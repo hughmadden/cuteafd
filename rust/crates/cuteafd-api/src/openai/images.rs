@@ -17,7 +17,7 @@ const IMAGE_BYTES: usize = 32 << 20;
 const TOTAL_BYTES: usize = 64 << 20;
 pub(super) const BODY_BYTES: usize = 96 << 20;
 
-pub(super) fn guard_content(body: &serde_json::Value, loaded: super::MediaCapabilities) -> Result<(), &'static str> {
+pub(super) fn guard_content(body: &serde_json::Value, loaded: super::MediaCapabilities, video: bool) -> Result<(), &'static str> {
     for message in body.get("messages").and_then(serde_json::Value::as_array).into_iter().flatten() {
         for part in message.get("content").and_then(serde_json::Value::as_array).into_iter().flatten() {
             match part.get("type").and_then(serde_json::Value::as_str) {
@@ -25,7 +25,7 @@ pub(super) fn guard_content(body: &serde_json::Value, loaded: super::MediaCapabi
                     return Err("this deployment has no image input; launch with VISION=auto"),
                 Some("input_audio" | "audio") if !loaded.audio =>
                     return Err("this deployment has no audio input; launch with AUDIO=auto"),
-                Some("video" | "video_url" | "input_video") => return Err("video input is not supported"),
+                Some("video" | "video_url" | "input_video") if !video || !loaded.vision => return Err("video input requires the MiniMax bundled encoder"),
                 _ => {}
             }
         }
@@ -117,14 +117,18 @@ impl ImageDecoder {
 }
 
 pub(super) fn data_url_bytes(url: &str, limit: usize) -> Result<Vec<u8>> {
+    data_url_bytes_for(url, limit, "image/")
+}
+
+pub(super) fn data_url_bytes_for(url: &str, limit: usize, media_type: &str) -> Result<Vec<u8>> {
     let (header, body) = url
         .strip_prefix("data:")
         .context("invalid image data URL")?
         .split_once(',')
         .context("image data URL has no payload")?;
     ensure!(
-        header.split(';').next().unwrap_or("").starts_with("image/"),
-        "data URL must contain an image media type"
+        header.split(';').next().unwrap_or("").starts_with(media_type),
+        "data URL must contain a {media_type} media type"
     );
     // Percent encoding can triple the base64 payload size. Bound before decoding.
     ensure!(
@@ -417,7 +421,7 @@ mod guard_tests {
         let v41 = ModelProfile::default();
         assert!(v41.capabilities.vision);
         assert!(!v41.capabilities.audio);
-        assert!(guard_content(&json!({"messages":[{"content":[{"type":"image_url"}]}]}), v41.capabilities).is_ok());
-        assert!(guard_content(&json!({"messages":[{"content":[{"type":"input_audio"}]}]}), v41.capabilities).is_err());
+        assert!(guard_content(&json!({"messages":[{"content":[{"type":"image_url"}]}]}), v41.capabilities, false).is_ok());
+        assert!(guard_content(&json!({"messages":[{"content":[{"type":"input_audio"}]}]}), v41.capabilities, false).is_err());
     }
 }

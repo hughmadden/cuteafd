@@ -20,6 +20,7 @@ pub struct LocalEncoder {
     width: usize,
     max_tokens: usize,
     patch_size: usize,
+    video: bool,
     queue: VecDeque<Pending>,
     running: Option<Running>,
     next: u64,
@@ -27,6 +28,7 @@ pub struct LocalEncoder {
 impl LocalEncoder {
     pub fn new(service: EncoderService, config: &ProcessorConfig, width: usize, max_tokens: usize) -> Self {
         Self { service, lut: normalization_lut(config), width, max_tokens, patch_size: config.patch as usize,
+            video: config.family == cuteafd_loader::media::ImageFamily::Minimax,
             queue: VecDeque::new(), running: None, next: 0 }
     }
     pub fn healthy(&self) -> bool { self.service.healthy() }
@@ -34,17 +36,22 @@ impl LocalEncoder {
     fn validate(&self, job: &media::EncodeJob) -> Result<(), MediaError> {
         job.validate()?;
         if job.hidden_width != self.width { return Err(MediaError::Features); }
-        let EncodeInput::Image { grid: [t, h, w], rgb8 } = &job.input else {
-            return if self.service.audio_ledger.is_some() { Ok(()) }
-                else { Err(MediaError::Encoder("audio encoder not loaded".into())) };
+        let (grid, rgb8, video) = match &job.input {
+            EncodeInput::Image { grid, rgb8 } => (grid, rgb8, false),
+            EncodeInput::Video { grid, rgb8 } if self.video => (grid, rgb8, true),
+            EncodeInput::Video { .. } => return Err(MediaError::Encoder("video encoder not loaded".into())),
+            EncodeInput::Audio { .. } => return if self.service.audio_ledger.is_some() { Ok(()) }
+                else { Err(MediaError::Encoder("audio encoder not loaded".into())) },
         };
-        let (t, h, w) = (*t, *h, *w);
-        let patches = (h as usize).checked_mul(w as usize).ok_or(MediaError::Features)?;
-        if t != 1 || h == 0 || w == 0 || h % 2 != 0 || w % 2 != 0
+        let [t, h, w] = *grid;
+        let patches = (h as usize).checked_mul(w as usize)
+            .and_then(|n| n.checked_mul(t as usize)).ok_or(MediaError::Features)?;
+        if (!video && t != 1) || (video && !(1..=2).contains(&t))
+            || h == 0 || w == 0 || h % 2 != 0 || w % 2 != 0
             || job.tokens != patches / 4 || job.tokens > self.max_tokens
-            || job.hidden_width != self.width
             || self.patch_size.checked_mul(self.patch_size).and_then(|pixels| pixels.checked_mul(3))
-                .and_then(|bytes| patches.checked_mul(bytes)) != Some(rgb8.len()) {
+                .and_then(|bytes| patches.checked_mul(bytes))
+                .and_then(|bytes| bytes.checked_mul(if video { 2 } else { 1 })) != Some(rgb8.len()) {
             return Err(MediaError::Features);
         }
         job.feature_bytes()?;
@@ -68,6 +75,9 @@ impl EncoderClient for LocalEncoder {
             let submitted = match &pending.job.input {
                 EncodeInput::Image { grid, rgb8 } => self.service.submit(EncodeJob {
                     rgb: rgb8.clone(), grid: [grid[1] as usize, grid[2] as usize],
+                    lut: self.lut.clone(), output }),
+                EncodeInput::Video { grid, rgb8 } => self.service.submit_video(super::VideoEncodeJob {
+                    rgb: rgb8.clone(), grid: grid.map(|n| n as usize),
                     lut: self.lut.clone(), output }),
                 EncodeInput::Audio { pcm } => self.service.submit_audio(super::audio::AudioEncodeJob {
                     pcm: pcm.clone(), fp32_scratch: vec![0.0; output.len()], output }),
@@ -118,6 +128,47 @@ mod tests {
     use super::*;
     use cuteafd_core::ImageKey;
     use std::sync::{atomic::Ordering, mpsc};
+
+    #[test]
+    fn video_frames_reach_owner_and_other_towers_refuse_them() {
+        use cuteafd_loader::media::ImageFamily;
+        for family in [ImageFamily::Minimax, ImageFamily::Mimo, ImageFamily::Qwen, ImageFamily::GlmFlash] {
+            let (queue, jobs) = mpsc::sync_channel::<super::super::Work>(2);
+            let owner = std::thread::spawn(move || {
+                while let Ok(work) = jobs.recv() {
+                    let super::super::EncoderJob::Video(mut job) = work.job else { panic!("expected video job") };
+                    assert_eq!(job.grid, [2, 2, 2]);
+                    assert_eq!(job.rgb.len(), 4 * 28 * 28 * 3);
+                    job.output.fill(0x3f80);
+                    let _ = work.reply.send(Ok(job.output));
+                }
+            });
+            let service = EncoderService { queue: Some(queue), owner: Some(owner), ledger: Default::default(),
+                audio_ledger: None, healthy: Arc::new(std::sync::atomic::AtomicBool::new(true)) };
+            let config = ProcessorConfig::for_family(family);
+            let mut encoder = LocalEncoder::new(service, &config, 2, 2);
+            let job = media::EncodeJob::video(ImageKey([3; 32]), [2, 2, 2], vec![0; 4*28*28*3].into(), 2, 2);
+            if family != ImageFamily::Minimax {
+                assert!(encoder.submit(job).is_err());
+                continue;
+            }
+            for grid in [[3, 2, 2], [2, 4, 2], [1, 2, 2], [2, 3, 2], [2, u32::MAX, u32::MAX]] {
+                let mut invalid = job.clone();
+                invalid.input = EncodeInput::Video { grid, rgb8: vec![0; 4*28*28*3].into() };
+                assert!(encoder.submit(invalid).is_err());
+            }
+            let ticket = encoder.submit(job).unwrap();
+            let deadline = Instant::now() + std::time::Duration::from_secs(2);
+            loop {
+                if let Some(output) = encoder.poll(ticket) {
+                    assert_eq!(&*output.unwrap().features, &[0x80, 0x3f, 0x80, 0x3f, 0x80, 0x3f, 0x80, 0x3f]);
+                    break;
+                }
+                assert!(Instant::now() < deadline);
+                std::thread::yield_now();
+            }
+        }
+    }
 
     #[test]
     fn rgb_extent_uses_the_processor_patch_size() {

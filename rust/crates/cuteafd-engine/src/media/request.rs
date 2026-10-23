@@ -5,6 +5,8 @@ use super::{keys::validate_spans, EmbeddingLease, MediaKey, MediaError, MediaSpa
 pub struct RequestMedia {
     spans: Vec<MediaSpan>,
     features: Vec<Option<EmbeddingLease>>,
+    offsets: Vec<usize>,
+    feature_rows: Vec<usize>,
     row_bytes: usize,
     prompt_len: usize,
 }
@@ -21,15 +23,25 @@ impl RequestMedia {
         hidden_width: usize,
         prompt_len: usize,
     ) -> Result<Self, MediaError> {
+        let offsets = vec![0; spans.len()];
+        let feature_rows = spans.iter().map(|span| span.len).collect();
+        Self::new_with_layout(spans, hidden_width, prompt_len, offsets, feature_rows)
+    }
+    pub fn new_with_layout(spans: Vec<MediaSpan>, hidden_width: usize, prompt_len: usize,
+        offsets: Vec<usize>, feature_rows: Vec<usize>) -> Result<Self, MediaError> {
         validate_spans(&spans)?;
+        if offsets.len() != spans.len() || feature_rows.len() != spans.len() {
+            return Err(MediaError::Spans);
+        }
         let row_bytes = hidden_width
             .checked_mul(2)
             .filter(|&n| n > 0)
             .ok_or(MediaError::Features)?;
-        for span in &spans {
+        for (index, span) in spans.iter().enumerate() {
             if span.checked_end().unwrap() > prompt_len
-                || span.len.checked_mul(row_bytes).is_none()
-                || spans.iter().any(|s| s.key == span.key && s.len != span.len)
+                || feature_rows[index].checked_mul(row_bytes).is_none()
+                || offsets[index].checked_add(span.len).is_none_or(|end| end > feature_rows[index])
+                || spans.iter().enumerate().any(|(i, s)| s.key == span.key && feature_rows[i] != feature_rows[index])
             {
                 return Err(MediaError::Spans);
             }
@@ -38,6 +50,8 @@ impl RequestMedia {
         Ok(Self {
             spans,
             features,
+            offsets,
+            feature_rows,
             row_bytes,
             prompt_len,
         })
@@ -45,6 +59,7 @@ impl RequestMedia {
     pub fn spans(&self) -> &[MediaSpan] {
         &self.spans
     }
+    pub fn feature_rows(&self, index: usize) -> usize { self.feature_rows[index] }
     pub fn span_features(&self, index: usize) -> Option<&std::sync::Arc<[u8]>> {
         self.features.get(index)?.as_ref()?.features()
     }
@@ -69,9 +84,9 @@ impl RequestMedia {
     pub fn attach(&mut self, lease: EmbeddingLease) -> Result<(), MediaError> {
         let rows = lease.features().ok_or(MediaError::NotReady(lease.key()))?;
         let mut found = false;
-        for (span, slot) in self.spans.iter().zip(&mut self.features) {
+        for ((span, slot), &rows_count) in self.spans.iter().zip(&mut self.features).zip(&self.feature_rows) {
             if span.key == lease.key() {
-                if rows.len() != span.len * self.row_bytes {
+                if rows.len() != rows_count * self.row_bytes {
                     return Err(MediaError::Features);
                 }
                 *slot = Some(lease.clone());
@@ -91,9 +106,9 @@ impl RequestMedia {
         if lease.key() == image_key { return Err(MediaError::Features); }
         let rows = lease.features().ok_or(MediaError::NotReady(lease.key()))?;
         let mut found = false;
-        for (span, slot) in self.spans.iter().zip(&mut self.features) {
+        for ((span, slot), &rows_count) in self.spans.iter().zip(&mut self.features).zip(&self.feature_rows) {
             if span.key == image_key {
-                if rows.len() != span.len * self.row_bytes { return Err(MediaError::Features); }
+                if rows.len() != rows_count * self.row_bytes { return Err(MediaError::Features); }
                 *slot = Some(lease.clone());
                 found = true;
             }
@@ -134,7 +149,7 @@ impl RequestMedia {
         out.features.clear();
         out.mask.clear();
         out.mask.resize(count, 0);
-        for (span, lease) in self.spans.iter().zip(&self.features) {
+        for ((span, lease), &offset) in self.spans.iter().zip(&self.features).zip(&self.offsets) {
             let lo = start.max(span.start);
             let hi = end.min(span.checked_end().unwrap());
             if lo >= hi {
@@ -142,7 +157,7 @@ impl RequestMedia {
             }
             let data = lease.as_ref().unwrap().features().unwrap();
             out.features.extend_from_slice(
-                &data[(lo - span.start) * self.row_bytes..(hi - span.start) * self.row_bytes],
+                &data[(offset + (lo - span.start)) * self.row_bytes..(offset + (hi - span.start)) * self.row_bytes],
             );
             for row in lo..hi {
                 out.indices.push((row - start) as u32);
@@ -159,6 +174,46 @@ mod tests {
     use super::super::ImageKey;
     use crate::media::EmbeddingCache;
     use std::sync::Arc;
+    #[test]
+    fn separated_spans_slice_one_complete_feature_buffer() {
+        let key = ImageKey([7; 32]);
+        let spans = vec![MediaSpan { start: 1, len: 2, key: key.into() },
+            MediaSpan { start: 5, len: 2, key: key.into() }];
+        let mut request = RequestMedia::new_with_layout(spans.clone(), 2, 8, vec![0, 2], vec![4, 4]).unwrap();
+        assert_eq!(request.feature_rows(1), 4);
+        let mut cache = EmbeddingCache::new(16);
+        let pin = cache.reserve(key, 16).unwrap();
+        let lease = cache.complete(key, (0u8..16).collect::<Vec<_>>().into()).unwrap();
+        request.attach(lease).unwrap(); drop(pin);
+        let mut chunk = MediaChunk::default();
+        request.write_chunk(2, 6, &mut chunk).unwrap();
+        assert_eq!(chunk.indices, [0, 3]);
+        assert_eq!(chunk.features, (4u8..12).collect::<Vec<_>>());
+        assert_eq!(chunk.mask, [1, 0, 0, 1]);
+        request.write_chunk(5, 8, &mut chunk).unwrap();
+        assert_eq!(chunk.features, (8u8..16).collect::<Vec<_>>());
+        assert_eq!(chunk.indices, [0, 1]);
+        let mut cache = EmbeddingCache::new(8);
+        let pin = cache.reserve(key, 8).unwrap();
+        let short = cache.complete(key, vec![0; 8].into()).unwrap();
+        assert!(request.attach(short).is_err()); drop(pin);
+        let probe_key = ImageKey([8; 32]);
+        let mut cache = EmbeddingCache::new(16);
+        let pin = cache.reserve(probe_key, 16).unwrap();
+        let probe = cache.complete(probe_key, (16u8..32).collect::<Vec<_>>().into()).unwrap();
+        request.attach_probe_override(key, probe).unwrap(); drop(pin);
+        request.write_chunk(5, 7, &mut chunk).unwrap();
+        assert_eq!(chunk.features, (24u8..32).collect::<Vec<_>>());
+        for (offsets, rows) in [(vec![0], vec![4, 4]), (vec![0, 2], vec![4]),
+            (vec![0, 3], vec![4, 4]), (vec![0, usize::MAX], vec![4, 4]),
+            (vec![0, 2], vec![4, 5]), (vec![0, 2], vec![usize::MAX; 2])] {
+            assert!(RequestMedia::new_with_layout(spans.clone(), 2, 8, offsets, rows).is_err());
+        }
+        let unequal = vec![spans[0], MediaSpan { len: 1, ..spans[1] }];
+        assert!(RequestMedia::new(unequal.clone(), 2, 8).is_err());
+        assert!(RequestMedia::new_with_layout(unequal, 2, 8, vec![0, 2], vec![4, 4]).is_ok());
+    }
+
     #[test]
     fn span_features_borrows_attached_features_by_index() {
         let key = ImageKey([7; 32]);

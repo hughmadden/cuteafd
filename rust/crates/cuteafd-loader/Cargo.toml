@@ -6,6 +6,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+tempfile.workspace = true
 anyhow.workspace = true
 libc.workspace = true
 io-uring = "0.7"
@@ -28,5 +29,4 @@ nest-push = { git = "https://github.com/tpurtell/sparknest", rev = "752e39a3ef6c
 rustix = { version = "1.1", features = ["fs"] }
 
 [dev-dependencies]
-tempfile.workspace = true
 socket2 = { version = "0.6.4", features = ["all"] }

@@ -9,6 +9,11 @@ pub struct MediaKeys {
 
 impl MediaKeys {
     pub fn new(native: &[u32], vocabulary: u32, spans: &[MediaSpan]) -> Result<Self, MediaError> {
+        Self::new_with_offsets(native, vocabulary, spans, &vec![0; spans.len()])
+    }
+    pub fn new_with_offsets(native: &[u32], vocabulary: u32, spans: &[MediaSpan],
+        offsets: &[usize]) -> Result<Self, MediaError> {
+        if offsets.len() != spans.len() { return Err(MediaError::Spans); }
         if vocabulary == 0 || vocabulary >= 0x8000_0000 || native.iter().any(|&t| t >= vocabulary) {
             return Err(MediaError::Vocabulary);
         }
@@ -20,9 +25,10 @@ impl MediaKeys {
             return Err(MediaError::Spans);
         }
         let mut tokens = native.to_vec();
-        for span in spans {
+        for (span, &offset) in spans.iter().zip(offsets) {
+            offset.checked_add(span.len).ok_or(MediaError::Spans)?;
             for row in 0..span.len {
-                tokens[span.start + row] = media_token_id(span.key, row);
+                tokens[span.start + row] = media_token_id(span.key, offset + row);
             }
         }
         Ok(Self {
@@ -105,6 +111,22 @@ pub fn verify_media(frontier: usize, saved: &[MediaSpan], request: &[MediaSpan])
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn separated_video_pairs_use_distinct_feature_row_identities() {
+        let key = ImageKey([7; 32]).into();
+        let spans = [MediaSpan { start: 1, len: 2, key }, MediaSpan { start: 5, len: 2, key }];
+        let native = [1; 8];
+        let keys = MediaKeys::new_with_offsets(&native, 10, &spans, &[0, 2]).unwrap();
+        assert_eq!(&keys.tokens()[1..3], &[media_token_id(key, 0), media_token_id(key, 1)]);
+        assert_eq!(&keys.tokens()[5..7], &[media_token_id(key, 2), media_token_id(key, 3)]);
+        assert_ne!(keys.tokens()[1..3], keys.tokens()[5..7]);
+        assert_eq!(keys.tokens()[3..5], native[3..5]);
+        assert_eq!(MediaKeys::new_with_offsets(&native, 10, &spans, &[0, 0]).unwrap().tokens(),
+            MediaKeys::new(&native, 10, &spans).unwrap().tokens());
+        assert!(MediaKeys::new_with_offsets(&native, 10, &spans, &[0]).is_err());
+        assert!(MediaKeys::new_with_offsets(&native, 10, &spans, &[0, usize::MAX]).is_err());
+    }
+
     #[test]
     fn keys_do_not_mutate_native_ids_and_are_stable() {
         let native = vec![1, 2, 3, 3, 4];

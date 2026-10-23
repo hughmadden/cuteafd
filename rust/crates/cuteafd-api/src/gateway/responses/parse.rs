@@ -681,6 +681,7 @@ fn parts(v: &Value) -> Result<Vec<Part>, GatewayError> {
                 }
                 Part::Image { source, detail }
             }
+            "input_video" => crate::gateway::video::responses(part)?,
             "input_file" => {
                 if part.get("file_id").is_some_and(|v| !v.is_null())
                     || part.get("file_url").is_some_and(|v| !v.is_null())

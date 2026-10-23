@@ -763,7 +763,7 @@ mod http_503_mapping {
         openai::NativeRequest {
             prefix_cache_source: Default::default(), literal_spans: Vec::new(), prompt: String::new(),
             constraint: None,
-            images: Vec::new(), media: Vec::new(), audio: Vec::new(),
+            images: Vec::new(), media: Vec::new(), videos: Vec::new(), audio: Vec::new(),
             max_tokens: 1,
             sampling: Default::default(),
             stop_token_ids: Vec::new(),
