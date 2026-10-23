@@ -5,6 +5,9 @@ use crate::CuteafdDeviceBuffer as Buffer;
 use std::ffi::c_void;
 use thiserror::Error;
 
+// Native prefill writes F32 output directly; only rows below 130 use split-K partials.
+pub const TRELLIS_PARTIAL_ROWS: usize = 129;
+
 const INPUT: &[&str] = &["input", "suh", "rotated", "input_block_scales"];
 const CORE: &[&str] = &["rotated_inputs", "payload", "input_block_scales", "partial", "output"];
 const OUTPUT: &[&str] = &["input", "svh", "output"];
@@ -60,7 +63,7 @@ impl DenseTrellisGeometry {
         product(&[rows, k, self.input_dtype.bytes()])?;
         product(&[rows, n, self.output_dtype.bytes()])?;
         Ok(DenseTrellisWorkspace { rotated: product(&[rows, k, 2])?, pointer_table: 8,
-            block_scales: k / 128 * 2, partial: product(&[rows, splits, n, 4])?,
+            block_scales: k / 128 * 2, partial: product(&[rows.min(TRELLIS_PARTIAL_ROWS), splits, n, 4])?,
             accumulator: product(&[rows, n, 4])? })
     }
 }
@@ -113,7 +116,7 @@ impl<'a> DenseTrellis<'a> {
         self.rows(rows)?;
         let g = self.geometry;
         buffers(&[(pointer_table, 8), (payload, g.input*g.output*g.bits/8),
-            (scales, self.workspace.block_scales), (partial, rows*g.input.div_ceil(1024)*g.output*4),
+            (scales, self.workspace.block_scales), (partial, rows.min(TRELLIS_PARTIAL_ROWS)*g.input.div_ceil(1024)*g.output*4),
             (accumulator, rows*g.output*4)])?;
         disjoint(&[pointer_table, payload, scales, partial, accumulator])?;
         // SAFETY: buffer metadata and scratch extents checked. The caller owns
@@ -150,7 +153,10 @@ fn validate_manifest(specs: [&ProgramSpec; 3], g: DenseTrellisGeometry, codebook
         return Err(DenseTrellisError::Invalid("codebook"));
     }
     let compiled_rows = specs[1].capacity_rows as usize;
-    let compiled_workspace = DenseTrellisGeometry { rows: compiled_rows, ..g }.workspace()?;
+    DenseTrellisGeometry { rows: compiled_rows, ..g }.workspace()?;
+    let compiled_partial = compiled_rows.checked_mul(g.input.div_ceil(1024))
+        .and_then(|v|v.checked_mul(g.output)).and_then(|v|v.checked_mul(4))
+        .ok_or(DenseTrellisError::Invalid("manifest scratch overflow"))?;
     for (i, spec) in specs.iter().enumerate() {
         let pointers = [INPUT, CORE, OUTPUT][i];
         if compiled_rows < g.rows || spec.capacity_rows as usize != compiled_rows
@@ -163,8 +169,8 @@ fn validate_manifest(specs: [&ProgramSpec; 3], g: DenseTrellisGeometry, codebook
     let input = &specs[0].geometry;
     let core = &specs[1].geometry;
     let output = &specs[2].geometry;
-    if input["features"].as_u64() != Some(g.input as u64) || input["input_dtype"].as_str() != Some(g.input_dtype.name())
-        || input.get("output_dtype").is_some_and(|value| value.as_str() != Some("f16"))
+    if !matching_rotated_dtype(input, core)
+        || input["features"].as_u64() != Some(g.input as u64) || input["input_dtype"].as_str() != Some(g.input_dtype.name())
         || output["features"].as_u64() != Some(g.output as u64) || output["output_dtype"].as_str() != Some(g.output_dtype.name())
         || !specs[0].scratch.is_empty() || !specs[2].scratch.is_empty() || specs[1].scratch.len() != 1
         || core["codebook"].as_str() != Some(codebook)
@@ -173,10 +179,16 @@ fn validate_manifest(specs: [&ProgramSpec; 3], g: DenseTrellisGeometry, codebook
             ("split_k_blocks", 8), ("splits", g.input.div_ceil(1024)), ("ctas_per_sm", 4)]
             .iter().any(|&(key, value)| core[key].as_u64() != Some(value as u64))
         || w != g.workspace()?
-        || specs[1].scratch.get("partial").copied() != Some(compiled_workspace.partial as u64) {
+        || specs[1].scratch.get("partial").copied() != Some(compiled_partial as u64) {
         return Err(DenseTrellisError::Invalid("manifest geometry/dtype/scratch"));
     }
     Ok(())
+}
+
+fn matching_rotated_dtype(input: &serde_json::Value, core: &serde_json::Value) -> bool {
+    let input_dtype = input.get("output_dtype").map_or(Some("f16"), serde_json::Value::as_str);
+    let core_dtype = core.get("input_dtype").map_or(Some("f16"), serde_json::Value::as_str);
+    matches!(input_dtype, Some("f16" | "bf16")) && input_dtype == core_dtype
 }
 
 fn buffers(items: &[(Buffer, usize)]) -> Result<()> {
@@ -217,7 +229,7 @@ mod tests {
         let mut core = spec(CORE, b"iii", json!({"abi_version":1,"input_features":g.input,
             "output_features":g.output,"bits":g.bits,"codebook":"mcg","sharded_side":g.side,
             "rotation_count":1,"max_rows":g.rows,"split_k_blocks":8,"splits":7,"ctas_per_sm":4}));
-        core.scratch.insert("partial".into(), g.workspace().unwrap().partial as u64);
+        core.scratch.insert("partial".into(), (g.rows*g.input.div_ceil(1024)*g.output*4) as u64);
         let output = spec(OUTPUT, b"ii", json!({"features":g.output,"output_dtype":"f32","max_rows":g.rows}));
         [input, core, output]
     }
@@ -233,11 +245,18 @@ mod tests {
         assert!(validate_manifest([&s[0], &s[1], &s[2]], g, "mcg", w).is_err());
     }
     #[test]
+    fn prefill_workspace_bounds_narrow_split_k_storage() {
+        for rows in [64,129,130,2048,4096] {
+            let g=DenseTrellisGeometry {rows,..geometry()};
+            assert_eq!(g.workspace().unwrap().partial,rows.min(TRELLIS_PARTIAL_ROWS)*7*6144*4);
+        }
+    }
+    #[test]
     fn decode_workspace_uses_live_ceiling_not_wide_compiled_capacity() {
         let g = geometry();
         let wide = DenseTrellisGeometry { rows: 4096, ..g };
         let mut s = specs(wide);
-        s[1].scratch.insert("partial".into(), wide.workspace().unwrap().partial as u64);
+        s[1].scratch.insert("partial".into(), (wide.rows*wide.input.div_ceil(1024)*wide.output*4) as u64);
         assert!(validate_manifest([&s[0], &s[1], &s[2]], g, "mcg", g.workspace().unwrap()).is_ok());
         assert!(g.workspace().unwrap().partial < wide.workspace().unwrap().partial);
         s[0].capacity_rows = 64;
@@ -263,6 +282,23 @@ mod tests {
         assert!(bad.workspace().is_err());
     }
     #[test]
+    fn rotated_dtype_is_validated_between_input_and_core() {
+        let g = geometry();
+        for dtype in ["f16", "bf16"] {
+            let mut s = specs(g);
+            s[0].geometry["output_dtype"] = json!(dtype);
+            s[1].geometry["input_dtype"] = json!(dtype);
+            validate_manifest([&s[0], &s[1], &s[2]], g, "mcg", g.workspace().unwrap()).unwrap();
+            s[1].geometry["input_dtype"] = json!(if dtype == "f16" { "bf16" } else { "f16" });
+            assert!(validate_manifest([&s[0], &s[1], &s[2]], g, "mcg", g.workspace().unwrap()).is_err());
+            for invalid in [json!("f32"), json!(null), json!(17)] {
+                s[0].geometry["output_dtype"] = invalid.clone();
+                s[1].geometry["input_dtype"] = invalid;
+                assert!(validate_manifest([&s[0], &s[1], &s[2]], g, "mcg", g.workspace().unwrap()).is_err());
+            }
+        }
+    }
+    #[test]
     fn rejects_aliases_short_buffers_and_wrong_devices() {
         let b = |at, bytes, device_id| Buffer { ptr: at as *mut c_void, bytes, device_id, flags: 0 };
         let a = b(0x1000, 128, 0);
@@ -281,12 +317,8 @@ mod tests {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DenseTrellisPolicy {
     pub shape: String, pub input: usize, pub output: usize, pub side: usize,
-    pub codebook: String, pub chunk_columns: usize, pub weight_scratch: usize,
-    pub native: String, pub native_input: String, pub wide_input: String,
-    pub dequant: String, pub projection: String, pub output_program: String,
+    pub codebook: String, pub native: String, pub native_input: String, pub output_program: String,
 }
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DenseTrellisRoute { Native, Chunk }
 impl DenseTrellisPolicy {
     pub fn parse(value: &serde_json::Value) -> Result<Self> {
         let integer = |key: &str| value[key].as_u64().and_then(|v| usize::try_from(v).ok())
@@ -294,27 +326,15 @@ impl DenseTrellisPolicy {
         let text = |key: &str| value[key].as_str().filter(|v| !v.is_empty()).map(str::to_owned)
             .ok_or(DenseTrellisError::Invalid("row-policy string"));
         let policy=Self { shape:text("shape")?, input:integer("input_features")?, output:integer("output_features")?,
-            side:integer("sharded_side")?, codebook:text("codebook")?, chunk_columns:integer("chunk_columns")?,
-            weight_scratch:integer("weight_scratch_bytes")?, native:text("native_program")?,
-            native_input:text("native_input")?, wide_input:text("wide_input")?, dequant:text("dequant_program")?,
-            projection:text("projection_program")?, output_program:text("output_program")? };
-        if integer("threshold_rows")? != 64 || text("below")? != "shared_native"
-            || text("at_or_above")? != "chunk_dequant_bf16" || text("chunk_output_dtype")? != "f32"
-            || value["stitch_before_output_transform"].as_bool()!=Some(true)
-            || policy.chunk_columns.checked_mul(4)!=Some(integer("chunk_output_scratch_bytes_per_row")?) {
-            return Err(DenseTrellisError::Invalid("row-policy geometry/route/scratch"));
-        }
+            side:integer("sharded_side")?, codebook:text("codebook")?, native:text("native_program")?,
+            native_input:text("native_input")?, output_program:text("output_program")? };
         policy.validate()?;
         Ok(policy)
     }
     fn validate(&self) -> Result<()> {
-        if self.chunk_columns==0 || self.chunk_columns%128!=0 || self.output%self.chunk_columns!=0
-            || self.input==0 || self.input%128!=0 || self.output==0 || !matches!(self.side,1|2)
+        if self.input==0 || self.input%128!=0 || self.output==0 || self.output%128!=0 || !matches!(self.side,1|2)
             || !matches!(self.codebook.as_str(),"mcg"|"mul1")
-            || self.chunk_columns.checked_mul(self.input).and_then(|v|v.checked_mul(2))!=Some(self.weight_scratch)
-            || self.weight_scratch>256*1024*1024
-            || [&self.shape,&self.native,&self.native_input,&self.wide_input,&self.dequant,
-                &self.projection,&self.output_program].iter().any(|name|name.is_empty()) {
+            || [&self.shape,&self.native,&self.native_input,&self.output_program].iter().any(|name|name.is_empty()) {
             return Err(DenseTrellisError::Invalid("row-policy geometry/route/scratch"));
         }
         Ok(())
@@ -342,92 +362,51 @@ impl DenseTrellisPolicy {
         let selected=matches.next().ok_or(DenseTrellisError::Invalid("missing row policy"))?;
         if matches.next().is_some() { return Err(DenseTrellisError::Invalid("duplicate row policy")); }
         let mut policy=Self::parse(selected)?;
-        for name in [&mut policy.native,&mut policy.native_input,&mut policy.wide_input,&mut policy.dequant,
-            &mut policy.projection,&mut policy.output_program] {
+        for name in [&mut policy.native,&mut policy.native_input,&mut policy.output_program] {
             *name=format!("kimi_k6_dense_{name}");
         }
         Ok(policy)
     }
-    pub fn route(&self, rows: usize) -> Result<DenseTrellisRoute> {
+    pub fn validate_rows(&self, rows: usize) -> Result<()> {
         if !(1..=4096).contains(&rows) { return Err(DenseTrellisError::Invalid("row-policy live rows")); }
-        Ok(if rows<64 { DenseTrellisRoute::Native } else { DenseTrellisRoute::Chunk })
+        Ok(())
     }
 }
 
 /// Programs are resolved before capture. Scratch is caller-owned and reusable
-/// only on the serialized lane; chunks are stitched before the single egress.
+/// only on the serialized lane; the native core writes F32 before one egress.
 pub struct DenseTrellisDispatch<'a> {
-    native: DenseTrellis<'a>, wide_input: Program<'a>, dequant: Program<'a>, projection: Program<'a>,
-    stitch: crate::V41PeerCopy<'a>, policy: DenseTrellisPolicy,
+    native: DenseTrellis<'a>, policy: DenseTrellisPolicy,
 }
 #[derive(Debug, Clone, Copy)]
 pub struct DenseTrellisBuffers {
     pub input: Buffer, pub payload: Buffer, pub suh: Buffer, pub svh: Buffer,
     pub rotated: Buffer, pub pointer_table: Buffer, pub scales: Buffer, pub partial: Buffer,
-    pub accumulator: Buffer, pub chunk_weights: Buffer, pub chunk_output: Buffer,
+    pub accumulator: Buffer,
 }
 impl<'a> DenseTrellisDispatch<'a> {
     pub fn load(programs: &'a Programs<'a>, policy: DenseTrellisPolicy, rows: usize,
         output_dtype: TrellisDType) -> Result<Self> {
         policy.validate()?;
-        policy.route(rows)?;
+        policy.validate_rows(rows)?;
         let native=DenseTrellis::load(programs,[&policy.native_input,&policy.native,&policy.output_program],
             DenseTrellisGeometry{input:policy.input,output:policy.output,bits:6,side:policy.side,rows,
                 input_dtype:TrellisDType::Bf16,output_dtype},&policy.codebook)?;
-        let wide=programs.spec(&policy.wide_input)?;
-        let dequant=programs.spec(&policy.dequant)?;
-        let projection=programs.spec(&policy.projection)?;
-        if wide.capacity_rows<rows as u32 || wide.scalar_kinds!=b"ii" || !wide.scratch.is_empty()
-            || wide.geometry["features"].as_u64()!=Some(policy.input as u64)
-            || wide.geometry["input_dtype"].as_str()!=Some("bf16") || wide.geometry["output_dtype"].as_str()!=Some("bf16")
-            || dequant.scalar_kinds!=b"i" || !dequant.scratch.is_empty()
-            || projection.capacity_rows<rows as u32 || projection.scalar_kinds!=b"i" || !projection.scratch.is_empty()
-            || projection.geometry["width"].as_u64()!=Some(policy.input as u64)
-            || projection.geometry["outputs"].as_u64()!=Some(policy.chunk_columns as u64)
-            || projection.geometry["output_dtype"].as_str()!=Some("torch.float32")
-            || [("input_features",policy.input),("output_features",policy.output),("chunk_columns",policy.chunk_columns),
-                ("sharded_side",policy.side)].iter().any(|&(key,v)|dequant.geometry[key].as_u64()!=Some(v as u64))
-            || dequant.geometry["codebook"].as_str()!=Some(policy.codebook.as_str()) {
-            return Err(DenseTrellisError::Invalid("wide-route program geometry/ABI"));
-        }
-        Ok(Self {wide_input:programs.program(&policy.wide_input,INPUT)?,
-            dequant:programs.program(&policy.dequant,&["payload","scales","output"])?,
-            projection:programs.program(&policy.projection,&["x","w","out"])?,
-            stitch:programs.library().v41_peer_copy()?,native,policy})
+        Ok(Self {native,policy})
     }
     pub fn workspace(&self) -> DenseTrellisWorkspace { self.native.workspace() }
     pub fn policy(&self) -> &DenseTrellisPolicy { &self.policy }
     /// Emit only F32 core values. K-split callers must reduce these values before egress.
     pub fn core(&self, rows: usize, b: DenseTrellisBuffers, stream: *mut c_void) -> Result<()> {
         self.native.rows(rows)?;
-        if self.policy.route(rows)?==DenseTrellisRoute::Native {
-            let p=&self.policy;
-            buffers(&[(b.input,rows*p.input*2),(b.suh,p.input*2),(b.rotated,rows*p.input*2),
-                (b.pointer_table,8),(b.payload,p.input*p.output*6/8),(b.scales,p.input/128*2),
-                (b.partial,rows*p.input.div_ceil(1024)*p.output*4),(b.accumulator,rows*p.output*4)])?;
-            disjoint(&[b.input,b.suh,b.rotated,b.pointer_table,b.payload,b.scales,b.partial,b.accumulator])?;
-            self.native.input(rows,b.input,b.suh,b.rotated,b.scales,stream)?;
-            return self.native.core(rows,b.pointer_table,b.payload,b.scales,b.partial,b.accumulator,stream);
-        }
         let p=&self.policy;
         buffers(&[(b.input,rows*p.input*2),(b.suh,p.input*2),(b.rotated,rows*p.input*2),
-            (b.payload,p.input*p.output*6/8),(b.scales,p.input/128*2),(b.accumulator,rows*p.output*4),
-            (b.chunk_weights,p.weight_scratch),(b.chunk_output,rows*p.chunk_columns*4)])?;
-        disjoint(&[b.input,b.suh,b.rotated,b.payload,b.scales,b.accumulator,b.chunk_weights,b.chunk_output])?;
-        // SAFETY: every extent and alias checked; the caller owns all buffers
-        // and stream through completion/replay, as with the native core route.
-        unsafe {
-            self.wide_input.launch(&[b.input.ptr,b.suh.ptr,b.rotated.ptr,b.scales.ptr],
-                &[Scalar::I32(rows as i32),Scalar::I32(self.native.ctas)],stream)?;
-            for first in (0..p.output).step_by(p.chunk_columns) {
-                self.dequant.launch(&[b.payload.ptr,b.scales.ptr,b.chunk_weights.ptr],&[Scalar::I32(first as i32)],stream)?;
-                self.projection.launch(&[b.rotated.ptr,b.chunk_weights.ptr,b.chunk_output.ptr],&[Scalar::I32(rows as i32)],stream)?;
-                let offset=first*4;
-                let destination=Buffer {ptr:b.accumulator.ptr.cast::<u8>().add(offset).cast(),bytes:b.accumulator.bytes-offset,..b.accumulator};
-                self.stitch.launch_rows(destination,b.chunk_output,p.chunk_columns*4,rows,p.output*4,p.chunk_columns*4,stream)?;
-            }
-        }
-        Ok(())
+            (b.pointer_table,8),(b.payload,p.input*p.output*6/8),(b.scales,p.input/128*2),
+            (b.partial,rows.min(TRELLIS_PARTIAL_ROWS)*p.input.div_ceil(1024)*p.output*4),
+            (b.accumulator,rows*p.output*4)])?;
+        disjoint(&[b.input,b.suh,b.rotated,b.pointer_table,b.payload,b.scales,b.partial,b.accumulator])?;
+        self.native.input(rows,b.input,b.suh,b.rotated,b.scales,stream)?;
+        self.native.core(rows,b.pointer_table,b.payload,b.scales,b.partial,b.accumulator,stream)
     }
     pub fn output(&self, rows: usize, accumulator: Buffer, svh: Buffer, output: Buffer,
         stream: *mut c_void) -> Result<()> { self.native.output(rows,accumulator,svh,output,stream) }
@@ -438,11 +417,7 @@ mod policy_tests {
     use super::*;
     fn policy() -> serde_json::Value {
         serde_json::json!({"shape":"test","input_features":128,"output_features":256,"sharded_side":2,
-            "codebook":"mcg","threshold_rows":64,"below":"shared_native","at_or_above":"chunk_dequant_bf16",
-            "native_program":"core","native_input":"input","wide_input":"wide","dequant_program":"dequant",
-            "projection_program":"projection","output_program":"output","chunk_columns":128,
-            "weight_scratch_bytes":32768,"chunk_output_dtype":"f32","chunk_output_scratch_bytes_per_row":512,
-            "stitch_before_output_transform":true})
+            "codebook":"mcg","native_program":"core","native_input":"input","output_program":"output"})
     }
     #[test]
     fn package_resolves_prefixed_names_and_rejects_duplicate_policy() {
@@ -460,7 +435,7 @@ mod policy_tests {
             let mut p=policy();
             for (key,value) in [("shape",serde_json::json!(shape)),("input_features",serde_json::json!(k)),
                 ("output_features",serde_json::json!(n)),("sharded_side",serde_json::json!(side)),
-                ("codebook",serde_json::json!(book)),("weight_scratch_bytes",serde_json::json!(128*k*2)),
+                ("codebook",serde_json::json!(book)),
                 ("native_program",serde_json::json!(format!("trellis_{shape}_{book}")))] {p[key]=value;}
             p
         };
@@ -488,37 +463,16 @@ mod policy_tests {
         assert!(DenseTrellisPolicy::from_geometry_metadata(&family,6144,7168,2,"mul1").is_err());
     }
     #[test]
-    fn vocabulary_head_live_rows_use_native_below_64_and_chunk_at_64() {
-        for book in ["mcg","mul1"] {
-            let mut value=policy();
-            for (key,value_new) in [("shape",serde_json::json!("lm_head")),
-                ("input_features",serde_json::json!(7168)),("output_features",serde_json::json!(163840)),
-                ("sharded_side",serde_json::json!(1)),("codebook",serde_json::json!(book)),
-                ("weight_scratch_bytes",serde_json::json!(128*7168*2))] {value[key]=value_new;}
-            let family=serde_json::json!({"abi_version":1,"row_policies":[value]});
-            let head=DenseTrellisPolicy::from_geometry_metadata(&family,7168,163840,1,book).unwrap();
-            for rows in [1,8,16,63] {assert_eq!(head.route(rows).unwrap(),DenseTrellisRoute::Native);}
-            assert_eq!(head.route(64).unwrap(),DenseTrellisRoute::Chunk);
-            assert_eq!(head.route(4096).unwrap(),DenseTrellisRoute::Chunk);
+    fn native_policy_accepts_all_live_rows_and_validates_geometry() {
+        let p=DenseTrellisPolicy::parse(&policy()).unwrap();
+        for rows in [1,8,63,64,129,130,4096] {p.validate_rows(rows).unwrap();}
+        assert!(p.validate_rows(0).is_err());assert!(p.validate_rows(4097).is_err());
+        for key in ["input_features","output_features","sharded_side"] {
+            let mut value=policy();value[key]=serde_json::json!(0);
+            assert!(DenseTrellisPolicy::parse(&value).is_err(),"{key}");
         }
     }
 
-    #[test]
-    fn package_policy_owns_exact_64_row_boundary_and_scratch() {
-        let p=DenseTrellisPolicy::parse(&policy()).unwrap();
-        for corrupt in [DenseTrellisPolicy{chunk_columns:0,..p.clone()},
-            DenseTrellisPolicy{input:0,..p.clone()},DenseTrellisPolicy{weight_scratch:1,..p.clone()}] {
-            assert!(corrupt.validate().is_err());
-        }
-        for rows in [1,8,63] { assert_eq!(p.route(rows).unwrap(),DenseTrellisRoute::Native); }
-        for rows in [64,256,4096] { assert_eq!(p.route(rows).unwrap(),DenseTrellisRoute::Chunk); }
-        assert!(p.route(0).is_err());assert!(p.route(4097).is_err());
-        for (key,bad) in [("threshold_rows",serde_json::json!(65)),("weight_scratch_bytes",serde_json::json!(1)),
-            ("chunk_columns",serde_json::json!(0)),("stitch_before_output_transform",serde_json::json!(false)),
-            ("chunk_output_dtype",serde_json::json!("bf16"))] {
-            let mut value=policy();value[key]=bad;assert!(DenseTrellisPolicy::parse(&value).is_err(),"{key}");
-        }
-    }
 }
 
 fn reduced_egress<T>(reduce: impl FnOnce()->Result<T>,egress:impl FnOnce(T)->Result<()>) -> Result<()> {
@@ -570,7 +524,7 @@ impl GroupedPolicy {
             .map(|name| format!("kimi_k6_dense_{name}")).ok_or(DenseTrellisError::Invalid("grouped program"));
         let policy = Self { groups: integer("groups")?, max_rows: integer("max_rows")?,
             native: text("native_program")?, native_input: text("native_input")?, output_program: text("output_program")? };
-        if policy.groups != GROUPS || policy.max_rows != 64 {
+        if policy.groups != GROUPS || policy.max_rows != 4096 {
             return Err(DenseTrellisError::Invalid("grouped groups/rows"));
         }
         Ok(Some(policy))
@@ -602,7 +556,7 @@ const GROUPED_CORE: &[&str] = &["rotated_inputs", "q_payload", "k_payload", "v_p
 const GROUPED_OUTPUT: &[&str] = &["q_input", "k_input", "v_input", "g_input", "q_svh", "k_svh", "v_svh",
     "g_svh", "q_output", "k_output", "v_output", "g_output"];
 
-/// Minimum grouped scratch at `rows` (< 64) live rows. Callers place each
+/// Minimum grouped scratch at `rows` live rows. Callers place each
 /// member in a fixed quarter of the lane's (larger, merged) scratch owners, so
 /// the pointer table and captured graphs never depend on live rows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -612,7 +566,7 @@ pub struct GroupedWorkspace {
 }
 impl GroupedWorkspace {
     pub fn new(input: usize, output: usize, rows: usize) -> Result<Self> {
-        if !(1..64).contains(&rows) { return Err(DenseTrellisError::Invalid("grouped rows")); }
+        if !(1..=4096).contains(&rows) { return Err(DenseTrellisError::Invalid("grouped rows")); }
         let single = DenseTrellisGeometry { input, output, bits: 6, side: 1, rows,
             input_dtype: TrellisDType::Bf16, output_dtype: TrellisDType::Bf16 }.workspace()?;
         let times = |bytes: usize| bytes.checked_mul(GROUPS).ok_or(DenseTrellisError::Invalid("grouped overflow"));
@@ -659,7 +613,7 @@ impl<'a> GroupedTrellis<'a> {
             || input.scalar_kinds != b"ii" || core.scalar_kinds != b"iii" || output.scalar_kinds != b"ii"
             || !input.scratch.is_empty() || !output.scratch.is_empty()
             || input.geometry["features"].as_u64() != Some(k as u64) || input.geometry["input_dtype"].as_str() != Some("bf16")
-            || input.geometry.get("output_dtype").is_some()
+            || !matching_rotated_dtype(&input.geometry, &core.geometry)
             || output.geometry["features"].as_u64() != Some(n as u64) || output.geometry["output_dtype"].as_str() != Some("bf16")
             || core.geometry["codebook"].as_str() != Some(base.codebook.as_str())
             || [("abi_version", 1), ("input_features", k), ("output_features", n), ("bits", 6), ("sharded_side", 1),
@@ -732,19 +686,20 @@ mod grouped_tests {
     use super::*;
     #[test]
     fn grouped_policy_and_workspace_use_fixed_capacity_slices() {
-        let value = serde_json::json!({"grouped":{"groups":4,"max_rows":64,"native_program":"trellis_kda_qkvg_tp2_mcg_g4",
+        let value = serde_json::json!({"grouped":{"groups":4,"max_rows":4096,"native_program":"trellis_kda_qkvg_tp2_mcg_g4",
             "native_input":"trellis_input_k7168_bf16_g4","output_program":"trellis_output_n6144_bf16_g4"}});
         let p = GroupedPolicy::parse(&value).unwrap().unwrap();
         assert_eq!(p.native, "kimi_k6_dense_trellis_kda_qkvg_tp2_mcg_g4");
         assert!(GroupedPolicy::parse(&serde_json::json!({})).unwrap().is_none());
-        for (key, bad) in [("groups", 2), ("max_rows", 4096)] {
+        for (key, bad) in [("groups", 2), ("max_rows", 64)] {
             let mut v = value.clone(); v["grouped"][key] = serde_json::json!(bad);
             assert!(GroupedPolicy::parse(&v).is_err(), "{key}");
         }
         let w = GroupedWorkspace::new(7168, 6144, 63).unwrap();
         assert_eq!((w.rotated, w.pointer_table, w.block_scales, w.partial, w.accumulator),
             (4*63*7168*2, 32, 4*56*2, 4*63*7*6144*4, 4*63*6144*4));
-        assert!(GroupedWorkspace::new(7168, 6144, 64).is_err());
+        assert!(GroupedWorkspace::new(7168, 6144, 4097).is_err());
+        assert_eq!(GroupedWorkspace::new(7168,6144,4096).unwrap().partial,4*129*7*6144*4);
         let b = Buffer { ptr: 0x10000 as *mut c_void, bytes: w.rotated, device_id: 0, flags: 0 };
         let s = GroupedWorkspace::slice(b, 3).unwrap();
         assert_eq!((s.ptr as usize, s.bytes), (0x10000 + 3*63*7168*2, 63*7168*2));

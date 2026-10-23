@@ -899,7 +899,8 @@ def main() -> None:
                 "row_policies": row_policies(),
                 "measured_not_exported": ["tiled_mcg"],
             }
-            work += [(name, *item) for item in kimi_dense_programs()]
+            # Diagnostic only: isolate activation range from native T2 integration.
+            work += [(name, *item) for item in kimi_dense_programs(input_dtype="bf16")]
             continue
         if name == "exlr8_dense":
             from export_b12x_exlr8_dense_aot import programs as dense_programs

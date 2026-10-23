@@ -88,39 +88,32 @@ pub struct ProjectionScratchLayout {
     pub rows: usize,
 }
 impl ProjectionScratchLayout {
-    pub fn new(k: usize, n: usize, rows: usize, chunk: usize, weights: usize) -> Result<Self> {
+    pub fn new(k: usize, n: usize, rows: usize) -> Result<Self> {
         ensure!((1..=4096).contains(&rows) && k > 0 && n > 0 && k % 128 == 0 && n % 128 == 0,
             "Kimi K6 scratch geometry");
-        ensure!(chunk > 0 && chunk % 128 == 0 && n % chunk == 0
-            && k.checked_mul(chunk).and_then(|v| v.checked_mul(2)) == Some(weights)
-            && weights <= 256 * 1024 * 1024, "Kimi K6 chunk policy geometry");
         let product = |values: &[usize]| values.iter().try_fold(1usize, |a, b| a.checked_mul(*b))
             .context("Kimi K6 scratch overflow");
-        let mut extents = BTreeMap::from([
+        let extents = BTreeMap::from([
             ("rotated", product(&[rows, k, 2])?), ("table", 8), ("scales", k / 128 * 2),
-            ("partial", product(&[rows.min(63), k.div_ceil(1024), n, 4])?),
+            ("partial", product(&[rows.min(129), k.div_ceil(1024), n, 4])?),
             ("accumulator", product(&[rows, n, 4])?),
         ]);
-        if rows >= 64 {
-            extents.insert("chunk weights", weights);
-            extents.insert("chunk output", product(&[rows, chunk, 4])?);
-        }
         let layout = Self { extents, rows };
         layout.bytes()?;
         Ok(layout)
     }
-    /// A grouped decode launch (KDA q/k/v/g) below the 64-row chunk threshold:
+    /// A grouped native launch (KDA q/k/v/g):
     /// each member uses a fixed quarter of rotated/scales/accumulator, the
     /// table names the quarters, and the core indexes one shared partial.
     pub fn grouped(k: usize, n: usize, rows: usize, groups: usize) -> Result<Self> {
         ensure!((1..=4096).contains(&rows) && groups == 4 && k > 0 && n > 0 && k % 128 == 0 && n % 128 == 0,
             "Kimi K6 grouped scratch geometry");
-        let live = rows.min(63);
+        let live = rows;
         let product = |values: &[usize]| values.iter().try_fold(1usize, |a, b| a.checked_mul(*b))
             .context("Kimi K6 grouped scratch overflow");
         let layout = Self { rows, extents: BTreeMap::from([
             ("rotated", product(&[groups, live, k, 2])?), ("table", groups * 8),
-            ("scales", groups * k / 128 * 2), ("partial", product(&[groups, live, k.div_ceil(1024), n, 4])?),
+            ("scales", groups * k / 128 * 2), ("partial", product(&[groups, live.min(129), k.div_ceil(1024), n, 4])?),
             ("accumulator", product(&[groups, live, n, 4])?),
         ]) };
         layout.bytes()?;
@@ -137,22 +130,8 @@ impl ProjectionScratchLayout {
     pub fn storage(&self) -> Result<ProjectionStorageLayout> {
         let mut owners = self.extents.clone();
         let partial = owners.remove("partial").context("Kimi K6 native partial absent")?;
-        let weights = owners.remove("chunk weights");
-        let output = owners.remove("chunk output");
-        let mut route_offsets = BTreeMap::from([("partial", 0)]);
-        let wide = match (weights, output) {
-            (Some(weights), Some(output)) => {
-                let offset = weights.checked_add(255).map(|n| n / 256 * 256)
-                    .context("Kimi K6 chunk alignment overflow")?;
-                route_offsets.insert("chunk weights", 0);
-                route_offsets.insert("chunk output", offset);
-                offset.checked_add(output).context("Kimi K6 chunk arena overflow")?
-            }
-            (None, None) => 0,
-            _ => anyhow::bail!("Kimi K6 incomplete chunk scratch"),
-        };
-        // Native M<64 and chunk M>=64 never execute in the same projection.
-        owners.insert("route arena", partial.max(wide));
+        let route_offsets = BTreeMap::from([("partial", 0)]);
+        owners.insert("route arena", partial);
         Ok(ProjectionStorageLayout { owners, route_offsets })
     }
     pub fn bytes(&self) -> Result<usize> {
@@ -250,7 +229,7 @@ impl CoreCharges {
     }
 }
 
-/// The package owns chunk geometry. Headers select projections; no second export table.
+/// The package selects native projection geometry. Headers select projections; no second export table.
 pub fn projection_scratch(cfg: &KimiK3Config, core: &CoreInventory, rows: usize,
     metadata: &serde_json::Value) -> Result<Option<ProjectionScratchLayout>> {
     if core.projections.is_empty() { return Ok(None); }
@@ -279,15 +258,7 @@ pub fn projection_scratch(cfg: &KimiK3Config, core: &CoreInventory, rows: usize,
             ensure!(matching.len() == 1, "{}: expected one K6 row policy for K{k}/N{n}/side{side}/{book}, found {}",
                 projection.stem, matching.len());
             let policy = matching[0];
-            ensure!(policy["threshold_rows"] == 64 && policy["below"] == "shared_native"
-                && policy["at_or_above"] == "chunk_dequant_bf16" && policy["chunk_output_dtype"] == "f32"
-                && policy["stitch_before_output_transform"] == true, "Kimi K6 row-policy route");
-            let integer = |key: &str| policy[key].as_u64().and_then(|v| usize::try_from(v).ok())
-                .with_context(|| format!("Kimi K6 row-policy {key}"));
-            let chunk = integer("chunk_columns")?;
-            ensure!(integer("chunk_output_scratch_bytes_per_row")? == chunk * 4, "Kimi K6 chunk output extent");
-            let mut layout = ProjectionScratchLayout::new(k,n,if head {rows.min(64)} else {rows},
-                chunk,integer("weight_scratch_bytes")?)?;
+            let mut layout = ProjectionScratchLayout::new(k,n,if head {rows.min(64)} else {rows})?;
             layout.rows = rows;
             if let Some(grouped) = policy.get("grouped") {
                 let groups = grouped["groups"].as_u64().and_then(|v| usize::try_from(v).ok())
@@ -317,9 +288,7 @@ pub fn draft_head_scratch(core: &CoreInventory, rows: usize, metadata: &serde_js
     let matching = policies.iter().filter(|p| p["input_features"] == k && p["output_features"] == n
         && p["sharded_side"] == 1 && p["codebook"] == book).collect::<Vec<_>>();
     ensure!(matching.len() == 1, "lm_head: expected one K6 row policy for K{k}/N{n}/{book}, found {}", matching.len());
-    let integer = |key: &str| matching[0][key].as_u64().and_then(|v| usize::try_from(v).ok())
-        .with_context(|| format!("Kimi K6 row-policy {key}"));
-    Ok(Some(ProjectionScratchLayout::new(k, n, rows, integer("chunk_columns")?, integer("weight_scratch_bytes")?)?))
+    Ok(Some(ProjectionScratchLayout::new(k, n, rows)?))
 }
 
 /// Admission charge of [`draft_head_scratch`] on the head rank (GPU1).
@@ -490,61 +459,43 @@ mod tests {
 mod scratch_admission_tests {
     use super::*;
     #[test]
-    fn route_arena_drops_wide_native_partials_and_keeps_chunk_views_disjoint() -> Result<()> {
-        let mut layout=ProjectionScratchLayout::new(7168,12288,4096,12288,7168*12288*2)?;
-        layout.merge(&ProjectionScratchLayout::new(12288,7168,4096,7168,12288*7168*2)?)?;
-        layout.merge(&ProjectionScratchLayout::new(1536,18432,4096,18432,1536*18432*2)?)?;
-        assert_eq!(layout.extents["partial"],21_676_032);
-        assert_eq!(layout.bytes()?,880_804_040);
-        assert_eq!(2_290_090_184usize-layout.bytes()?,1_409_286_144);
-        let mut head=ProjectionScratchLayout::new(7168,163840,64,16384,7168*16384*2)?;
-        head.rows=4096;
-        layout.merge(&head)?;
-        assert_eq!(layout.extents["partial"],289_013_760);
-        assert_eq!(layout.bytes()?,939_524_296);
-        let storage=layout.storage()?;
-        assert_eq!(storage.route_offsets["partial"],0);
-        assert_eq!(storage.route_offsets["chunk weights"],0);
-        let output=storage.route_offsets["chunk output"];
-        assert_eq!(output%256,0);
-        assert!(output>=layout.extents["chunk weights"]);
-        assert!(output+layout.extents["chunk output"]<=storage.owners["route arena"]);
-        assert!(!storage.owners.contains_key("partial"));
-        assert!(!storage.owners.contains_key("chunk weights"));
-        assert!(!storage.owners.contains_key("chunk output"));
-        assert!(ProjectionScratchLayout {rows:64,extents:BTreeMap::from([
-            ("partial",16),("chunk weights",usize::MAX),("chunk output",16)])}.bytes().is_err());
+    fn production_merged_scratch_includes_grouped_owners_once() -> Result<()> {
+        for (rows,expected) in [(2048,612_368_864),(4096,931_135_968)] {
+            let mut layout=ProjectionScratchLayout::grouped(7168,6144,rows,4)?;
+            // Hook-local owners use the unit ceiling, not the in-flight wave span.
+            assert_eq!(layout.extents["rotated"],rows*57_344);
+            assert_eq!(layout.extents["accumulator"],rows*98_304);
+            for (k,n) in [(7168,6144),(6144,7168),(7168,3072),(3072,7168),(7168,3584),
+                (3584,7168),(7168,1536),(7168,640),(1536,18432),(1536,9216),
+                (7168,12288),(12288,7168),(7168,163840)] {
+                let mut single=ProjectionScratchLayout::new(k,n,if n==163840 {64}else{rows})?;
+                single.rows=rows;
+                layout.merge(&single)?;
+            }
+            assert_eq!(layout.bytes()?,expected);
+        }
         Ok(())
     }
     #[test]
-    fn row_policy_scratch_uses_native_ceiling_and_adds_chunk_only_at_64() -> Result<()> {
-        for rows in [1,8,16,63,64,4096] {
-            let layout=ProjectionScratchLayout::new(7168,6144,rows,6144,7168*6144*2)?;
-            assert_eq!(layout.extents["partial"],rows.min(63)*7*6144*4);
-            assert_eq!(layout.extents.contains_key("chunk weights"),rows>=64);
-            assert_eq!(layout.extents.contains_key("chunk output"),rows>=64);
+    fn native_scratch_bounds_partials_and_removes_materialized_weights() -> Result<()> {
+        for rows in [1,8,16,63,64,129,130,4096] {
+            let layout=ProjectionScratchLayout::new(7168,6144,rows)?;
+            assert_eq!(layout.extents["partial"],rows.min(129)*7*6144*4);
+            assert_eq!(layout.extents.len(),5);
+            assert_eq!(layout.storage()?.owners["route arena"],layout.extents["partial"]);
             assert_eq!(exchange_recv_bytes(rows,true)?,rows*7168*4);
             assert_eq!(exchange_recv_bytes(rows,false)?,rows*7168*2);
         }
-        assert!(ProjectionScratchLayout::new(7168,6144,0,6144,7168*6144*2).is_err());
-        // Grouped KDA: four fixed quarters of the live (<64-row) extents, one table entry each.
+        assert!(ProjectionScratchLayout::new(7168,6144,0).is_err());
         let grouped=ProjectionScratchLayout::grouped(7168,6144,4096,4)?;
-        assert_eq!(grouped.extents["rotated"],4*63*7168*2);
+        assert_eq!(grouped.extents["rotated"],4*4096*7168*2);
         assert_eq!(grouped.extents["table"],32);
-        assert_eq!(grouped.extents["partial"],4*63*7*6144*4);
-        assert_eq!(grouped.extents["accumulator"],4*63*6144*4);
-        assert!(!grouped.extents.contains_key("chunk weights"));
-        let mut merged=ProjectionScratchLayout::new(7168,6144,4096,6144,7168*6144*2)?;
-        let single=merged.clone();
+        assert_eq!(grouped.extents["partial"],4*129*7*6144*4);
+        assert_eq!(grouped.extents["accumulator"],4*4096*6144*4);
+        let mut merged=ProjectionScratchLayout::new(7168,6144,4096)?;
         merged.merge(&grouped)?;
-        assert_eq!(merged.extents["rotated"],single.extents["rotated"]);
-        assert_eq!(merged.extents["accumulator"],single.extents["accumulator"]);
-        assert_eq!(merged.extents["table"],32);
-        assert_eq!(merged.storage()?.owners["route arena"],single.storage()?.owners["route arena"]);
-        let small=ProjectionScratchLayout::grouped(7168,6144,8,4)?;
-        assert_eq!(small.extents["rotated"],4*8*7168*2);
+        assert_eq!(merged,grouped);
         assert!(ProjectionScratchLayout::grouped(7168,6144,8,2).is_err());
-        assert!(ProjectionScratchLayout::new(7168,6144,64,128,1).is_err());
         Ok(())
     }
 }
@@ -555,10 +506,10 @@ mod draft_head_tests {
     use crate::families::kimi_k3::weight_layout::GlobalLayout;
     use crate::formats::dense_trellis::TrellisSide;
 
-    /// The published head policy: K7168/N163840, 16384-column chunks.
+    /// The published native head geometry: K7168/N163840.
     fn head_policy(book: &str) -> serde_json::Value {
         serde_json::json!({"abi_version": 1, "row_policies": [{"input_features": 7168, "output_features": 163840,
-            "sharded_side": 1, "codebook": book, "chunk_columns": 16384, "weight_scratch_bytes": 7168 * 16384 * 2}]})
+            "sharded_side": 1, "codebook": book}]})
     }
 
     /// Real-geometry K6 core (every core projection K6, the head included, as the
@@ -583,7 +534,7 @@ mod draft_head_tests {
             crate::formats::exl3_storage::Exl3Codebook::Mul1 => "mul1" };
         // C8 x block 8: the drafter's head rows.
         let demand = draft_head_demand(&core, 64, &head_policy(book))?.context("K6 draft head demand")?;
-        let expected = ProjectionScratchLayout::new(7168, 163840, 64, 16384, 7168 * 16384 * 2)?.bytes()?;
+        let expected = ProjectionScratchLayout::new(7168, 163840, 64)?.bytes()?;
         assert_eq!((demand.gpu, demand.bytes), (1, expected as u64));
         assert!(draft_head_demand(&core, 65, &head_policy(book)).is_err());
         assert!(draft_head_demand(&core, 64, &head_policy(if book == "mcg" { "mul1" } else { "mcg" })).is_err());

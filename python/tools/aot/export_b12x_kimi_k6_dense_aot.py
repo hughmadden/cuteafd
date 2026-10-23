@@ -7,10 +7,9 @@ requires a stored N640 tensor and a caller-side N576 trim; unpadded N576 is
 not a supported native trellis geometry. Independently calibrated projections
 are never concatenated. One fixed arithmetic covers rows 1 through 4096.
 
-KDA q/k/v/g share one activation: below the 64-row chunk threshold they also
-run as one grouped launch per H128 stage (input, core, output), each
-projection keeping its own payload, scales and rotation. The grouped core is
-bitwise-equal to the four standalone launches; it is decode-only (max 64 rows).
+KDA q/k/v/g share one activation and run as one grouped launch per H128
+stage. Each projection retains its own payload, scales and rotation. Native
+prefill decodes exact FP16 weights in shared memory, never into global scratch.
 """
 from __future__ import annotations
 
@@ -41,38 +40,20 @@ TRELLIS_SHAPES = (
 )
 
 
-CHUNK_WEIGHT_LIMIT_BYTES = 256 * 1024 * 1024
 # Projections sharing one activation and geometry, launched as one group of four.
 GROUPED_SHAPES = {"kda_qkvg_tp2": 4}
-GROUPED_MAX_ROWS = 64
-
-
-def chunk_columns(k, n):
-    columns = min(n, CHUNK_WEIGHT_LIMIT_BYTES // (2 * k) // 128 * 128)
-    while columns and n % columns:
-        columns -= 128
-    if not columns:
-        raise ValueError("no H128 chunk fits the weight scratch limit")
-    return columns
+GROUPED_MAX_ROWS = 4096
 
 
 def row_policies():
     result = []
     for name, k, n, side in TRELLIS_SHAPES:
-        columns = chunk_columns(k, n)
         for book in ("mcg", "mul1"):
             result.append(dict(shape=name, input_features=k, output_features=n,
-                sharded_side=side, codebook=book, threshold_rows=64,
-                below="shared_native", at_or_above="chunk_dequant_bf16",
+                sharded_side=side, codebook=book,
                 native_program=f"trellis_{name}_{book}",
                 native_input=f"trellis_input_k{k}_bf16",
-                wide_input=f"trellis_input_k{k}_bf16_rotated_bf16",
-                dequant_program=f"trellis_dequant_{name}_{book}",
-                projection_program=f"trellis_chunk_bf16_{name}_f32",
                 output_program=f"trellis_output_n{n}_{'f32' if n == 163840 else 'bf16'}",
-                chunk_columns=columns, weight_scratch_bytes=columns*k*2,
-                chunk_output_dtype="f32", chunk_output_scratch_bytes_per_row=columns*4,
-                stitch_before_output_transform=True,
                 **({"grouped": grouped_policy(name, k, n, book)} if name in GROUPED_SHAPES else {})))
     return result
 
@@ -85,45 +66,32 @@ def grouped_policy(name, k, n, book):
                 output_program=f"trellis_output_n{n}_bf16_g{groups}")
 
 
-def programs():
-    return programs_for_shapes(TRELLIS_SHAPES)
+def programs(*, input_dtype="f16"):
+    return programs_for_shapes(TRELLIS_SHAPES, input_dtype=input_dtype)
 
 
-def programs_for_shapes(shapes, *, max_rows=4096, include_chunk=True, f32_outputs=(163840,)):
+def programs_for_shapes(shapes, *, max_rows=4096, f32_outputs=(163840,), input_dtype="f16"):
     """Explicit-shape hook for small native fixture packages; production uses the table."""
     from b12x.integration.cuteafd.trellis_linear import compile_trellis_linear_aot
     from b12x.integration.cuteafd.trellis_transform import (
         compile_trellis_input_aot, compile_trellis_output_aot,
     )
-    import torch
-    from b12x.integration.cuteafd.trellis_dequant import compile_trellis_dequant_aot
-    from b12x.integration.cuteafd.pointwise import compile_bf16_projection_aot
+    if input_dtype not in ("f16", "bf16"):
+        raise ValueError("trellis input dtype must be f16 or bf16")
+    core_dtype = {"input_dtype": "bf16"} if input_dtype == "bf16" else {}
+    ingress_dtype = {"output_dtype": "bf16"} if input_dtype == "bf16" else {}
     result = []
     for name, k, n, side in shapes:
-        columns = chunk_columns(k, n)
-        if include_chunk:
-            projection = dict(width=k, outputs=columns, output_dtype="f32")
-            result.append((f"trellis_chunk_bf16_{name}_f32", "bf16_projection", projection,
-                           partial(compile_bf16_projection_aot, width=k, outputs=columns, output_dtype=torch.float32)))
         for codebook in ("mcg", "mul1"):
             params = dict(input_features=k, output_features=n, bits=6,
                           codebook=codebook, sharded_side=side,
-                          rotation_count=1, max_rows=max_rows)
+                          rotation_count=1, max_rows=max_rows, **core_dtype)
             result.append((f"trellis_{name}_{codebook}", "trellis_linear", params,
                            partial(compile_trellis_linear_aot, **params)))
-            if include_chunk:
-                dequant = dict(input_features=k, output_features=n, chunk_columns=columns,
-                               codebook=codebook, sharded_side=side)
-                result.append((f"trellis_dequant_{name}_{codebook}", "trellis_dequant", dequant,
-                               partial(compile_trellis_dequant_aot, **dequant)))
     for k in sorted({k for _, k, _, _ in shapes}):
-        params = dict(features=k, input_dtype="bf16", max_rows=max_rows)
+        params = dict(features=k, input_dtype="bf16", max_rows=max_rows, **ingress_dtype)
         result.append((f"trellis_input_k{k}_bf16", "trellis_input", params,
                        partial(compile_trellis_input_aot, **params)))
-        if include_chunk:
-            wide_params = dict(params, output_dtype="bf16")
-            result.append((f"trellis_input_k{k}_bf16_rotated_bf16", "trellis_input", wide_params,
-                           partial(compile_trellis_input_aot, **wide_params)))
     for n in sorted({n for _, _, n, _ in shapes}):
         dtype = "f32" if n in f32_outputs else "bf16"
         params = dict(features=n, output_dtype=dtype, max_rows=max_rows)
@@ -136,10 +104,10 @@ def programs_for_shapes(shapes, *, max_rows=4096, include_chunk=True, f32_output
         rows = min(max_rows, GROUPED_MAX_ROWS)
         for codebook in ("mcg", "mul1"):
             params = dict(input_features=k, output_features=n, bits=6, codebook=codebook,
-                          sharded_side=side, rotation_count=groups, max_rows=rows, groups=groups)
+                          sharded_side=side, rotation_count=groups, max_rows=rows, groups=groups, **core_dtype)
             result.append((f"trellis_{name}_{codebook}_g{groups}", "trellis_linear", params,
                            partial(compile_trellis_linear_aot, **params)))
-        params = dict(features=k, input_dtype="bf16", max_rows=rows, groups=groups)
+        params = dict(features=k, input_dtype="bf16", max_rows=rows, groups=groups, **ingress_dtype)
         result.append((f"trellis_input_k{k}_bf16_g{groups}", "trellis_input", params,
                        partial(compile_trellis_input_aot, **params)))
         params = dict(features=n, output_dtype="bf16", max_rows=rows, groups=groups)
