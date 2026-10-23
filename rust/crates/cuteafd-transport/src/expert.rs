@@ -37,7 +37,7 @@ pub const V41_PARTIAL_ROW_BYTES: u32 = V41_HIDDEN * 2;
 /// Each peer carries one rank plane; rank count multiplies retained intake/rings,
 /// never this frame bound. Keep the ordinary transport default as the floor.
 pub fn native_frame_budget(geometry: cuteafd_core::ExpertGeometry, capacity: u32) -> Result<usize> {
-    let endpoint = cuteafd_core::SparkEndpoint {
+    let endpoint = cuteafd_core::SparkEndpoint { ring_depth: None,
         capacity, ingress: cuteafd_core::SparkIngress::Bf16,
     };
     let (request, response) = endpoint.wire_bytes(geometry)
@@ -649,7 +649,7 @@ mod tests {
                 let request = 128 + rows * (40 + geometry.topk as usize * 12 + geometry.hidden as usize * 2);
                 let budget = native_frame_budget(geometry, capacity)?;
                 assert_eq!(budget, indexed_reply.max(request).max(crate::DEFAULT_MAX_FRAME_BYTES));
-                let endpoint = cuteafd_core::SparkEndpoint { capacity,
+                let endpoint = cuteafd_core::SparkEndpoint { ring_depth: None, capacity,
                     ingress: cuteafd_core::SparkIngress::Bf16 };
                 let (input, output) = endpoint.wire_bytes(geometry).unwrap();
                 assert_eq!(output + 32, indexed_reply);

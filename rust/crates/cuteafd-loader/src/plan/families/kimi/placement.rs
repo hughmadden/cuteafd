@@ -195,7 +195,7 @@ pub(super) fn layout(model: &Model, report: &mut PlanReport, opts: &mut crate::p
         let working = SparkWorkingSet { rtx_layers: vec![], spark_layers: cfg.dense.iter().enumerate()
             .filter_map(|(layer, dense)| (!dense).then_some(layer)).collect(), spark_ranks: ranks, prefill_lanes: LANES };
         let rings = crate::plan::layout::spark_ring_geometry(LANES as usize);
-        let endpoints = [cuteafd_core::SparkEndpoint { capacity: opts.spark_capacity_rows as u32,
+        let endpoints = [cuteafd_core::SparkEndpoint { ring_depth: None, capacity: opts.spark_capacity_rows as u32,
             ingress: cuteafd_core::SparkIngress::Fp8K32 }];
         let budget = opts.spark_allocation_budget_bytes.unwrap_or(super::SPARK_BUDGET_BYTES);
         let spark = SparkBudgetInventory::exl3(&catalog, &working, &endpoints,

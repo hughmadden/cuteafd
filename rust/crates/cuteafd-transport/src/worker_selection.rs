@@ -843,7 +843,8 @@ impl EndpointReservation {
     pub(crate) fn index(&self) -> u32 { self.index as u32 }
     pub(crate) fn contract(&self) -> (cuteafd_core::SparkEndpoint, cuteafd_core::SparkRings) {
         let model = self.endpoints.selection.model().expect("typed endpoint");
-        (model.endpoints[self.index], model.rings)
+        let endpoint = model.endpoints[self.index];
+        (endpoint, endpoint.resolved_rings(model.rings).expect("validated endpoint rings"))
     }
 }
 
@@ -1002,7 +1003,7 @@ mod tests {
         use cuteafd_core::{SparkEndpoint, SparkIngress, SparkRings};
         WorkerSelection::new(WorkerIdentity { world: 1, topology: [1, 1], ..identity() }, &[13]).unwrap()
             .with_model(ModelAdmission { capacity: 4096, compiled_capacity: 4096,
-                endpoints: vec![SparkEndpoint { capacity: 4096, ingress: SparkIngress::Bf16Decode { rows: 80 } }],
+                endpoints: vec![SparkEndpoint { ring_depth: None, capacity: 4096, ingress: SparkIngress::Bf16Decode { rows: 80 } }],
                 rings: SparkRings { max_frame_bytes: 64 << 20, depth: 8, slot_bytes: 8 << 20, alignment: 4096 } }).unwrap()
     }
 
@@ -1017,6 +1018,44 @@ mod tests {
                 workspace_bytes: 1 << 28, pinned_workspace_bytes: 0 },
             mapped_ring_bytes: selection.model().unwrap().ring_bytes(selection.geometry()).unwrap() as u64,
             host_exchange_bytes: 4096 * (6144 * 2 + 8 * 8), row_indices_bytes: 4096 * 4 }
+    }
+
+    #[test]
+    fn endpoint_ring_depth_contract_matches_planner_and_seals_each_endpoint() -> Result<()> {
+        use cuteafd_core::{SparkEndpoint, SparkRings};
+        use cuteafd_loader::placement::SparkWorkingSet;
+        let mut selection = admission_selection();
+        let model = selection.model.as_mut().unwrap();
+        let endpoint = model.endpoints[0];
+        model.endpoints = vec![endpoint, endpoint, SparkEndpoint { ring_depth: Some(2), ..endpoint }];
+        selection.validate()?;
+        let roundtrip: WorkerSelection = serde_json::from_slice(&serde_json::to_vec(&selection)?)?;
+        assert_eq!(roundtrip, selection);
+        let model = selection.model().unwrap();
+        let working = SparkWorkingSet { spark_layers: vec![13], spark_ranks: 1, ..Default::default() };
+        let planned = working.rank_endpoints_io(0, selection.geometry(), &model.endpoints, model.rings)?;
+        let installed = InstalledModelAdmission::new(0, selection.clone(), Some(admission_report(&selection)))?;
+        let mut actual_bytes = 0;
+        for (index, depth) in [8, 8, 2].into_iter().enumerate() {
+            let lease = installed.reserve_endpoint(Some(index as u32))?.unwrap();
+            let (endpoint, rings) = lease.contract();
+            assert_eq!(rings, SparkRings { depth, ..model.rings });
+            let (request, response) = endpoint.wire_bytes(selection.geometry()).unwrap();
+            actual_bytes += crate::verbs_host_persistent_ring_bytes(rings.max_frame_bytes,
+                request, response, rings.slot_bytes, rings.alignment, rings.depth)?;
+        }
+        assert_eq!(actual_bytes as u64, planned.mapped_rings);
+        assert_eq!(actual_bytes, model.ring_bytes(selection.geometry())?);
+        let mut changed = selection.clone();
+        changed.model.as_mut().unwrap().endpoints[2].ring_depth = Some(8);
+        assert_ne!(changed.digest()?, selection.digest()?);
+        for depth in [0, 9, usize::MAX] {
+            changed.model.as_mut().unwrap().endpoints[2].ring_depth = Some(depth);
+            assert!(changed.validate().is_err());
+            let model = changed.model().unwrap();
+            assert!(working.rank_endpoints_io(0, selection.geometry(), &model.endpoints, model.rings).is_err());
+        }
+        Ok(())
     }
 
     #[test]
@@ -1126,7 +1165,7 @@ mod tests {
         use cuteafd_core::{SparkEndpoint, SparkIngress, ExpertGeometry};
         use std::sync::atomic::Ordering;
         let geometry = ExpertGeometry::STEP5;
-        let endpoint = SparkEndpoint { capacity: 640, ingress: SparkIngress::Bf16 };
+        let endpoint = SparkEndpoint { ring_depth: None, capacity: 640, ingress: SparkIngress::Bf16 };
         let rings = admission_selection().model().unwrap().rings;
         for clients in [0, 9, usize::MAX] {
             assert!(ModelAdmission::for_clients(geometry, endpoint, 4096, rings, clients).is_err());
@@ -1295,7 +1334,7 @@ mod tests {
         let selection = admission_selection();
         let mut admission = selection.model().unwrap().clone();
         admission.validate(selection.geometry()).unwrap();
-        admission.endpoints.push(cuteafd_core::SparkEndpoint {
+        admission.endpoints.push(cuteafd_core::SparkEndpoint { ring_depth: None,
             capacity: 80, ingress: cuteafd_core::SparkIngress::Bf16,
         });
         admission.validate(selection.geometry()).unwrap();
@@ -1398,7 +1437,7 @@ mod tests {
         let mut selection = admission_selection();
         let geometry = selection.geometry();
         selection.model = Some(ModelAdmission::for_clients(geometry,
-            SparkEndpoint { capacity: 640, ingress: SparkIngress::Bf16 }, 4096,
+            SparkEndpoint { ring_depth: None, capacity: 640, ingress: SparkIngress::Bf16 }, 4096,
             selection.model().unwrap().rings, 2)?);
         for shrink_selection in [true, false] {
             let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
