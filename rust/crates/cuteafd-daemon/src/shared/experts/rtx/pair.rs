@@ -1177,12 +1177,12 @@ mod tests {
             ),
             (
                 include_str!("../../../families/glm5_flash/engine.rs"),
-                "step",
+                "decode_primitive",
                 "replay_on",
             ),
             (
                 include_str!("../../../families/glm5_flash/engine.rs"),
-                "step_units",
+                "step_units_with",
                 "replay_on",
             ),
             (
@@ -1202,11 +1202,14 @@ mod tests {
             ),
         ] {
             let start = source.find(&format!("    fn {step}(")).unwrap();
-            let end = source[start..]
-                .find(&format!("    fn {step}_inner("))
-                .unwrap()
-                + start;
+            // The Flash executor body lives in units.rs, not beside its wrapper.
+            let end = source[start..].find("\n    }").unwrap() + start;
             let wrapper = &source[start..end];
+            if step == "step_units_with" {
+                let units = include_str!("../../../families/glm5_flash/engine/units.rs");
+                assert!(wrapper.contains("self.step_units_inner(scope,"));
+                assert!(units.contains("pub(super) fn step_units_inner(&self, _scope: &crate::shared::experts::rtx::pair::SubmissionScope<'_>"));
+            }
             assert!(
                 shared_submission_entrypoint(wrapper),
                 "{step} bypasses the shared boundary"
