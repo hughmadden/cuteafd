@@ -29,13 +29,13 @@ impl ProjectionLayout {
             extents:self.extents.clone(),rows:self.rows }.bytes()
     }
     pub(crate) fn new(program:&DenseTrellisDispatch<'_>,rows:usize)->Result<Self> {
-        let p=program.policy();p.route(rows)?;
-        let layout=cuteafd_loader::families::kimi_k3::core::ProjectionScratchLayout::new(p.input,p.output,rows,p.chunk_columns,p.weight_scratch)?;
+        let p=program.policy();p.validate_rows(rows)?;
+        let layout=cuteafd_loader::families::kimi_k3::core::ProjectionScratchLayout::new(p.input,p.output,rows)?;
         let w=program.workspace();
         ensure!([("rotated",w.rotated),("table",w.pointer_table),("scales",w.block_scales),
             ("accumulator",w.accumulator)].iter()
             .all(|(name,bytes)|layout.extents.get(name)==Some(bytes))
-            && layout.extents["partial"]==w.partial/rows*rows.min(63),"K6 package/planner scratch mismatch");
+            && layout.extents["partial"]==w.partial,"K6 package/planner scratch mismatch");
         Ok(Self{extents:layout.extents,rows:layout.rows})
     }
     pub(crate) fn demand(&self,device:u8)->Result<Demand> {
@@ -68,12 +68,9 @@ pub(crate) struct ProjectionScratch<'a> {
 impl ProjectionScratch<'_> {
     fn buffers(&self,input:Buffer,weights:&CoreWeights<'_>)->DenseTrellisBuffers {
         let get=|name|self.buffers[name];
-        // Decode never touches chunk storage; a valid existing view is used
-        // as the unused placeholder instead of a null device pointer.
         DenseTrellisBuffers {input,payload:weights.payload.buffer,suh:weights.suh.buffer,svh:weights.svh.buffer,
             rotated:get("rotated"),pointer_table:get("table"),scales:get("scales"),partial:get("partial"),
-            accumulator:get("accumulator"),chunk_weights:self.buffers.get("chunk weights").copied().unwrap_or(get("partial")),
-            chunk_output:self.buffers.get("chunk output").copied().unwrap_or(get("partial"))}
+            accumulator:get("accumulator")}
     }
 }
 pub(crate) struct Projection<'a> {pub program:DenseTrellisDispatch<'a>}
@@ -119,13 +116,13 @@ impl Projected<'_,'_> {
 }
 
 /// q/k/v/g are independent calibrations: four rotations, four projections.
-/// Below the 64-row chunk route they share one grouped launch per H128 stage,
+/// They share one grouped native launch per H128 stage at every row count,
 /// bitwise-equal to the four standalone launches. The existing recurrence
 /// owns convolution, state, replay and normalization.
 pub(crate) fn kda_projected(core:&KimiKdaCore<'_>,projections:[Projected<'_,'_>;4],grouped:Option<&GroupedTrellis<'_>>,
     weights:KimiKdaCoreWeights,batch:KimiKdaCoreBatch,stream:*mut c_void)->Result<()> {
     let outputs=[batch.q,batch.k,batch.v,batch.gate];
-    match grouped.filter(|_|batch.rows<64) {
+    match grouped {
         Some(grouped)=> {
             let scratch=projections[0].scratch;
             ensure!(projections.iter().all(|p|std::ptr::eq(p.scratch,scratch)
@@ -281,7 +278,7 @@ mod runtime_layout_tests {
         fixture.immediate_copies(&library)?;
         let device=Device{library:&library,id:0};
         for rows in [1,16,63,64,4096] {
-            let planned=ProjectionScratchLayout::new(128,256,rows,128,128*128*2)?;
+            let planned=ProjectionScratchLayout::new(128,256,rows)?;
             let layout=ProjectionLayout{extents:planned.extents.clone(),rows};
             let scratch=layout.allocate(device)?;
             assert_eq!(layout.demand(0)?.bytes as usize,
@@ -289,14 +286,7 @@ mod runtime_layout_tests {
             assert_eq!(layout.bytes()?,planned.bytes()?);
             let arena=scratch._owners["route arena"].buffer;
             assert_eq!(scratch.buffers["partial"].ptr,arena.ptr);
-            assert_eq!(scratch.buffers["partial"].bytes,rows.min(63)*256*4);
-            if rows>=64 {
-                let weights=scratch.buffers["chunk weights"];
-                let output=scratch.buffers["chunk output"];
-                assert_eq!(weights.ptr,arena.ptr);
-                assert!((output.ptr as usize)>=weights.ptr as usize+weights.bytes);
-                assert!((output.ptr as usize)+output.bytes<=arena.ptr as usize+arena.bytes);
-            }
+            assert_eq!(scratch.buffers["partial"].bytes,rows.min(129)*256*4);
             drop(scratch);
         }
         let events=fixture.events()?;
@@ -333,11 +323,7 @@ mod runtime_layout_tests {
         let head=CoreWeightLayout::new(inventory.get_weight("language_model.lm_head").unwrap(),TrellisSide::Output,0,1)?;
         geometries.insert(projection_key(head.shape,head.side,head.codebook),());
         let policies=geometries.keys().map(|(k,n,side,book)|{
-            let chunk=if k*n*2<=256*1024*1024 {*n}else{128};
-            serde_json::json!({"input_features":k,"output_features":n,"sharded_side":side,"codebook":book,
-                "threshold_rows":64,"below":"shared_native","at_or_above":"chunk_dequant_bf16",
-                "chunk_output_dtype":"f32","stitch_before_output_transform":true,"chunk_columns":chunk,
-                "weight_scratch_bytes":k*chunk*2,"chunk_output_scratch_bytes_per_row":chunk*4})
+            serde_json::json!({"input_features":k,"output_features":n,"sharded_side":side,"codebook":book})
         }).collect::<Vec<_>>();
         let mut programs=Vec::new();
         let mut program=|name:String,bytes:usize| programs.push(serde_json::json!({"name":name,
@@ -370,13 +356,8 @@ mod runtime_layout_tests {
                         let live=if *n==cfg.vocab_size {rows.min(64)}else{rows};
                         let w=DenseTrellisGeometry{input:*k,output:*n,bits:6,side:*side,rows:live,
                             input_dtype:TrellisDType::Bf16,output_dtype:TrellisDType::Bf16}.workspace()?;
-                        let mut extents=BTreeMap::from([("rotated",w.rotated),("table",w.pointer_table),
-                            ("scales",w.block_scales),("partial",w.partial/live*live.min(63)),("accumulator",w.accumulator)]);
-                        if live>=64 {
-                            let chunk=if k*n*2<=256*1024*1024 {*n}else{128};
-                            extents.insert("chunk weights",k*chunk*2);
-                            extents.insert("chunk output",live*chunk*4);
-                        }
+                        let extents=BTreeMap::from([("rotated",w.rotated),("table",w.pointer_table),
+                            ("scales",w.block_scales),("partial",w.partial),("accumulator",w.accumulator)]);
                         let layout=ProjectionLayout{extents,rows};
                         if let Some(runtime)=&mut runtime {runtime.merge(&layout)?;}else{runtime=Some(layout);}
                     }
@@ -409,9 +390,9 @@ mod runtime_layout_tests {
         let mut shared=ProjectionLayout{rows:64,extents:BTreeMap::from([("rotated",256),("partial",4096),
             ("table",8),("accumulator",512)])};
         let other=ProjectionLayout{rows:64,extents:BTreeMap::from([("rotated",512),("partial",2048),
-            ("table",8),("accumulator",1024),("chunk weights",8192),("chunk output",512)])};
+            ("table",8),("accumulator",1024)])};
         shared.merge(&other)?;
-        assert_eq!(shared.bytes()?,512+8+1024+(8192usize+512).max(4096));
+        assert_eq!(shared.bytes()?,512+8+1024+4096);
         let once=shared.clone();shared.merge(&other)?;assert_eq!(shared,once);
         assert!(shared.merge(&ProjectionLayout{rows:63,..other}).is_err());
         Ok(())

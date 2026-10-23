@@ -38,23 +38,15 @@ def test_only_shared_native_compiler_and_both_codebooks(monkeypatch):
     transforms.compile_trellis_input_aot = lambda **params: params
     transforms.compile_trellis_output_aot = lambda **params: params
     monkeypatch.setitem(sys.modules, transforms.__name__, transforms)
-    dequant = ModuleType("b12x.integration.cuteafd.trellis_dequant")
-    dequant.compile_trellis_dequant_aot = lambda **params: params
-    projection = ModuleType("b12x.integration.cuteafd.pointwise")
-    projection.compile_bf16_projection_aot = lambda **params: params
-    torch = ModuleType("torch")
-    torch.float32 = "f32"
-    for fake_module in (dequant, projection, torch):
-        monkeypatch.setitem(sys.modules, fake_module.__name__, fake_module)
     programs = module["programs"]()
-    assert len(programs) == 91
+    assert len(programs) == 46
     assert len({name for name, *_ in programs}) == len(programs)
     grouped = [item for item in programs if item[2].get("groups")]
     assert {name for name, *_ in grouped} == {
         "trellis_kda_qkvg_tp2_mcg_g4", "trellis_kda_qkvg_tp2_mul1_g4",
         "trellis_input_k7168_bf16_g4", "trellis_output_n6144_bf16_g4"}
     for name, op, params, compile_program in grouped:
-        assert params["groups"] == 4 and params["max_rows"] == 64
+        assert params["groups"] == 4 and params["max_rows"] == 4096
         assert compile_program() == params
         if op == "trellis_linear":
             assert params["rotation_count"] == 4 and params["sharded_side"] == 1 and params["bits"] == 6
@@ -72,7 +64,7 @@ def test_only_shared_native_compiler_and_both_codebooks(monkeypatch):
         assert compile_program() == params
     ingress = [item for item in programs if item[1] == "trellis_input"]
     egress = [item for item in programs if item[1] == "trellis_output"]
-    assert len(ingress) == 12
+    assert len(ingress) == 6
     assert {params["features"] for _, _, params, _ in ingress} == {1536, 3072, 3584, 6144, 7168, 12288}
     assert {params["features"] for _, _, params, _ in egress} == {640, 1536, 3072, 3584, 6144, 7168, 9216, 12288, 18432, 163840}
     for name, op, params, compile_program in ingress + egress:
@@ -90,7 +82,7 @@ def test_only_shared_native_compiler_and_both_codebooks(monkeypatch):
         assert compile_program() == params
     names = {name for name, *_ in programs} | {name for name, *_ in grouped}
     for policy in module["row_policies"]():
-        for field in ("native_program", "native_input", "wide_input", "dequant_program", "projection_program", "output_program"):
+        for field in ("native_program", "native_input", "output_program"):
             assert policy[field] in names
         if "grouped" in policy:
             assert policy["shape"] == "kda_qkvg_tp2"
@@ -99,7 +91,7 @@ def test_only_shared_native_compiler_and_both_codebooks(monkeypatch):
                 assert policy["grouped"][field] in names
     assert sum("grouped" in policy for policy in module["row_policies"]()) == 2
     fixture = module["programs_for_shapes"]((("s1", 128, 256, 1), ("s2", 128, 256, 2)),
-        max_rows=64, include_chunk=False, f32_outputs=(256,))
+        max_rows=64, f32_outputs=(256,))
     assert {name for name, *_ in fixture} == {
         "trellis_s1_mcg", "trellis_s1_mul1", "trellis_s2_mcg", "trellis_s2_mul1",
         "trellis_input_k128_bf16", "trellis_output_n256_f32"}
@@ -116,20 +108,13 @@ def test_comparison_group_is_opt_in():
     assert group[1:] == ("export_b12x_dsv4_aot.py", ["--geometry", "kimi_k6_dense,kimi_split"])
 
 
-def test_chunk_route_policy_and_scratch(monkeypatch):
-    module = load_exporter(monkeypatch)
-    policies = module["row_policies"]()
+def test_native_only_policy_has_no_dequant_scratch(monkeypatch):
+    policies = load_exporter(monkeypatch)["row_policies"]()
     assert len(policies) == 26
     for policy in policies:
-        k, n, c = policy["input_features"], policy["output_features"], policy["chunk_columns"]
-        assert c % 128 == 0 and n % c == 0
-        assert policy["weight_scratch_bytes"] == c*k*2 <= 256*1024*1024
-        assert policy["threshold_rows"] == 64
-        assert policy["below"] == "shared_native"
-        assert policy["at_or_above"] == "chunk_dequant_bf16"
-        assert policy["stitch_before_output_transform"]
-        assert policy["chunk_output_dtype"] == "f32"
-        assert policy["chunk_output_scratch_bytes_per_row"] == c*4
+        assert not any("chunk" in key or "dequant" in key or "scratch" in key for key in policy)
+        assert "wide_input" not in policy
+        if "grouped" in policy:
+            assert policy["grouped"]["max_rows"] == 4096
     head = next(p for p in policies if p["shape"] == "lm_head")
-    assert head["chunk_columns"] == 16384
     assert head["output_program"].endswith("_f32")
