@@ -75,6 +75,8 @@ pub(super) struct Execution<'a> {
     decode_rows:usize,
     table_stride:usize,
     poisoned:std::cell::Cell<bool>,
+    draft:Option<super::dspark::Dspark<'a>>,
+    draft_causal:bool,
 }
 impl<'a> Execution<'a> {
     pub fn load(device:Device<'a>, programs:&'a Programs<'a>, checkpoint:&Checkpoint,
@@ -104,7 +106,36 @@ impl<'a> Execution<'a> {
         commands.drain()?;
         let head=TargetHeadOwner::new(&commands,&scratch,rows,cfg.vocab_size)?;
         Ok(Self{commands,head,weights,scratch,cfg:cfg.clone(),rows,context,decode_rows,table_stride,
-            poisoned:std::cell::Cell::new(false)})
+            poisoned:std::cell::Cell::new(false),draft:None,draft_causal:false})
+    }
+    pub fn load_draft(&mut self, contract:&cuteafd_loader::families::minimax_m3::dspark::DsparkContract,
+        layout:super::dspark::Layout)->Result<()> {
+        ensure!(contract.sample_from_anchor && !contract.causal,MiniMaxError::Unsupported("draft mask or anchor mode"));
+        self.draft=Some(super::dspark::Dspark::load(Device {library:self.commands.library(),id:self.commands.device()},
+            &self.commands,contract,layout)?);
+        self.draft_causal=contract.causal;
+        Ok(())
+    }
+    pub fn draft(&self)->Result<&super::dspark::Dspark<'a>> { self.draft.as_ref().context("MiniMax drafter not admitted") }
+    pub fn update_draft(&self,rows:&[crate::shared::speculation::dflash::ContextRow])->Result<()> {
+        ensure!(!self.poisoned.get(),MiniMaxError::Invalid("previous native execution failure; restart required"));
+        let result=self.draft()?.update(&self.commands,&self.scratch,rows);
+        let drained=self.commands.drain();
+        let result=result.and(drained);
+        if result.is_err() {self.poisoned.set(true);}
+        result
+    }
+    pub fn propose(&self,seqs:&[crate::shared::speculation::dflash::DraftSeq],embedding:&crate::shared::token_io::TokenEmbedding<'a>)
+        ->Result<Vec<crate::shared::speculation::dflash::Draft>> {
+        ensure!(!self.poisoned.get(),MiniMaxError::Invalid("previous native execution failure; restart required"));
+        ensure!(seqs.iter().all(|s|s.position.checked_add(7).is_some_and(|end|end<=self.context)),
+            MiniMaxError::Invalid("draft RoPE extent"));
+        let result=self.draft()?.propose(&self.commands,&self.scratch,embedding,&self.head,&self.weights,seqs,self.draft_causal);
+        if result.is_err() {
+            self.poisoned.set(true);
+            self.commands.drain()?;
+        }
+        result
     }
     pub fn stream(&self)->*mut std::ffi::c_void { self.commands.raw() }
     pub fn drain(&self)->Result<()> { self.commands.drain() }
@@ -137,6 +168,7 @@ impl<'a> Execution<'a> {
                     self.commands.add_bf16(self.scratch.get("shared")?,self.scratch.get("routed")?,self.scratch.get("delta")?,rows*6144)?;
                 } else { ffn::dense(&self.commands,&self.weights,&self.scratch,layer,rows,false)?; }
                 self.residual(rows)?;
+                if let Some(draft)=&self.draft { draft.tap(&self.commands,layer,self.scratch.get("residual")?,rows)?; }
             }
             self.head.logits(&self.commands,&self.weights,&self.scratch,rows)
         })();

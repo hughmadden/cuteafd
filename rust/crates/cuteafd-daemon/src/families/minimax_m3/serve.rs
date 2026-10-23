@@ -37,7 +37,7 @@ pub(crate) struct ServeArgs {
     prefill_rows: u32,
     #[arg(long, default_value = "auto")]
     rtx_expert_layers: String,
-    #[arg(long, default_value = "off")]
+    #[arg(long, default_value = "dspark", value_parser = ["dspark", "off"])]
     speculator: String,
     #[arg(long, default_value = "0.0.0.0:8000")]
     listen: String,
@@ -76,7 +76,8 @@ impl ServeArgs {
             return Err(MiniMaxError::Invalid("one coordinator and distinct TP2/TP3/TP4 peers required").into());
         }
         if self.kv_cache != Qwen4KvCache::Fp8 { return Err(MiniMaxError::Unsupported("BF16 KV has no exported MiniMax kernel").into()); }
-        if self.speculator != "off" { return Err(MiniMaxError::Unsupported("speculation; use --speculator off").into()); }
+        if !matches!(self.speculator.as_str(),"off"|"dspark") { return Err(MiniMaxError::Unsupported("speculator must be dspark or off").into()); }
+        if self.speculator=="dspark" && self.prefill_rows<7 {return Err(MiniMaxError::Invalid("DSpark needs at least seven scratch rows").into());}
         if matches!(std::env::var("CUTEAFD_SPARK_WRITE").as_deref(), Ok("1" | "on")) {
             return Err(MiniMaxError::Unsupported("Spark write mode has no MiniMax allocation ledger").into());
         }
@@ -125,6 +126,9 @@ fn worker(args: &ServeArgs, receive: &mut tokio::sync::mpsc::Receiver<cuteafd_ap
     let sizing = RuntimeSizing { rows: args.prefill_rows as usize, decode_rows: (args.prefill_rows as usize).min(64),
         sequences: args.max_sequences as usize, context: if args.max_context == 0 {cfg.max_position as u64} else {args.max_context},
         spark_ranks: args.peers.len() };
+    let draft_contract=if args.speculator=="dspark" {Some(cuteafd_loader::families::minimax_m3::dspark::DsparkContract::open(&args.snapshot)?)} else {None};
+    let draft_layout=draft_contract.as_ref().map(|c|super::dspark::Layout::new(&library,c,sizing.sequences,sizing.rows)).transpose()?;
+    let draft_bytes=draft_layout.as_ref().map_or(0,|l|l.bytes);
     let manifest = cuteafd_loader::plan::checkpoint::read_json(&args.manifest)?;
     let package = crate::shared::experts::fp8::package_directory(&args.native_lib, 1,
         cuteafd_loader::formats::fp8_experts::ExpertFormat::Nvfp4);
@@ -141,7 +145,7 @@ fn worker(args: &ServeArgs, receive: &mut tokio::sync::mpsc::Receiver<cuteafd_ap
         let free = available()?;
         let text = admission::solve(&checkpoint, &manifest, local_package.as_ref(), admission::Request {
             sizing, available: free, requested_pool: None, kv_format: args.kv_cache, onboard,
-            spark_budget: args.spark_budget_bytes, headroom: 2 << 30 })?;
+            spark_budget: args.spark_budget_bytes, headroom: 2 << 30, draft_bytes })?;
         let vision_bytes = ReadyVision::local_bytes(&args.snapshot, &args.native_lib)?;
         let cache_target = args.pool_tokens.filter(|n| *n > 0).unwrap_or(262_144)
             .checked_mul(text.cache.cache.token_bytes(0)).context("MiniMax vision cache target overflow")?;
@@ -159,7 +163,7 @@ fn worker(args: &ServeArgs, receive: &mut tokio::sync::mpsc::Receiver<cuteafd_ap
         let remote_reserve = vision.as_ref().map_or(0, |v| v.spark_reserve_bytes);
         admission::solve(&checkpoint, &manifest, local_package.as_ref(), admission::Request {
             sizing, available, requested_pool: args.pool_tokens, kv_format: args.kv_cache, onboard,
-            spark_budget: args.spark_budget_bytes.saturating_sub(remote_reserve), headroom: 2 << 30 })?
+            spark_budget: args.spark_budget_bytes.saturating_sub(remote_reserve), headroom: 2 << 30, draft_bytes })?
     };
     let mut catalog = cuteafd_loader::read_expert_catalog(&args.snapshot)?;
     catalog.select_draft(cuteafd_loader::plan::spec::DraftOwnership::None)?;
@@ -179,7 +183,8 @@ fn worker(args: &ServeArgs, receive: &mut tokio::sync::mpsc::Receiver<cuteafd_ap
     let source = EmbedSource::new(&args.snapshot, &tensor.shard, &tensor.meta, cfg.hidden)?;
     let (embedding, (execution, local)) = crate::shared::placement::load_while_admitting(Some(pending), || {
         TokenEmbedding::load(&library, source, EmbedPlacement::Gpu, || {
-            let execution = Execution::load(device, &programs, &checkpoint, &cfg, &admitted.ledger)?;
+            let mut execution = Execution::load(device, &programs, &checkpoint, &cfg, &admitted.ledger)?;
+            if let (Some(contract),Some(layout))=(&draft_contract,draft_layout) {execution.load_draft(contract,layout)?;}
             let local = if admitted.local_layers.is_empty() {None} else {
                 let tensors = catalog.fp8().context("MiniMax native expert catalog missing")?.for_coordinator();
                 Some(crate::shared::experts::fp8::Fp8Experts::load(&library, &tensors, &package,
@@ -213,12 +218,13 @@ fn worker(args: &ServeArgs, receive: &mut tokio::sync::mpsc::Receiver<cuteafd_ap
     let expander = vision.as_ref().map(|_| cuteafd_loader::media::minimax::span_expander(&args.snapshot, cfg.vocab_size as u32, false)).transpose()?;
     let backend = MiniMaxBackend { execution: &execution, cache: &cache, embedding: &embedding, token_ids, embedded,
         experts: RefCell::new(Routed::new(local, spark)?), rows: sizing.rows, vocabulary: cfg.vocab_size, expander,
-        pending: RefCell::new(None), timing: RefCell::new([0.0; 2]) };
+        pending: RefCell::new(None), timing: RefCell::new([0.0; 2]), probe: RefCell::new(crate::shared::draft::routes::RoundRoutes::new(1,4)) };
     let (encoder, preparer, media_bytes) = vision.map_or((Encoder::Off, None, 0), |v| (v.encoder, Some(v.preparer), v.cache_bytes));
     let mut media = cuteafd_engine::media::MediaAdmission::new(cuteafd_engine::media::EmbeddingCache::new(media_bytes), encoder, 16);
     tracing::info!(pool_tokens=admitted.cache.pool_tokens, context=cache.context, local_layers=?admitted.local_layers,
         rows=sizing.rows, "MiniMax native eager target; prefill uses causal paged MSA tiles");
-    scheduler::schedule(&backend, &args.snapshot, receive, stats, sizing.sequences, scheduler::Drafts::None,
+    let drafts=if args.speculator=="dspark" {scheduler::Drafts::Neural {depth:7,fixed:false}} else {scheduler::Drafts::None};
+    scheduler::schedule(&backend, &args.snapshot, receive, stats, sizing.sequences, drafts,
         eos, args.decode_share, &prefix, args.token_io.token_select, &mut media, None,
         || initialized((backend.geometry().max_context, preparer)))
 }
@@ -280,7 +286,9 @@ mod tests {
         assert_eq!(args().validate().unwrap(), None);
         let mut a=args(); a.split_device=Some(1); assert!(a.validate().unwrap_err().downcast_ref::<MiniMaxError>().is_some());
         let mut a=args(); a.kv_cache=Qwen4KvCache::Bf16; assert!(a.validate().is_err());
-        let mut a=args(); a.speculator="dspark".into(); assert!(a.validate().is_err());
+        let mut a=args(); a.speculator="mtp".into(); assert!(a.validate().is_err());
+        assert_eq!(args().speculator,"dspark");
+        let mut a=args(); a.speculator="off".into(); assert!(a.validate().is_ok());
         let mut a=args(); a.rtx_expert_layers="58".into(); assert!(a.validate().is_err());
         let mut a=args(); a.rtx_expert_layers="3".into(); assert_eq!(a.validate().unwrap(),Some(3));
     }

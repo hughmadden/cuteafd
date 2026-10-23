@@ -2,7 +2,7 @@ use super::{cache::Cache, execution::{BatchView, Execution, RequestView}, prefix
     routed::Routed, transaction::Step, MiniMaxError};
 use crate::shared::{draft::routes::RoundRoutes, prefix::{CudaCopyEngine, PrefixArgs, Toggle},
     qwen::{Encoder, scheduler::{self, Backend}}, token_io::{DeviceLogits, TokenEmbedding}};
-use anyhow::{Context, Result};
+use anyhow::{ensure, Context, Result};
 use cuteafd_api::openai::NativeRequest;
 use cuteafd_engine::{media::{EncodeJob, EmbeddingCache, RequestMedia},
     prefix::{PrefixCache, PrefixConfig, PrefixFamily, RefPagePool}};
@@ -10,21 +10,33 @@ use cuteafd_ffi::{minimax::Buffer, NativeLibrary};
 use cuteafd_loader::media::SpanExpander;
 use std::{cell::RefCell, path::Path};
 
-#[derive(Default)]
-pub(super) struct NoDraft;
-impl scheduler::DraftState for NoDraft {
-    fn pending_rows(&self) -> usize { 0 }
-    fn close(&mut self, _: u32) {}
-}
+use super::dspark::State;
 
-fn accept_step(step: Step, verified: &mut [scheduler::Verified<'_, Placement, NoDraft, ()>]) -> Result<()> {
-    if verified.iter().any(|v| !step.matches(v.placement.sequence, v.start, v.rows) || v.neural
+fn accept_step(step: Step, verified: &mut [scheduler::Verified<'_, Placement, State, ()>]) -> Result<()> {
+    if verified.iter().any(|v| !step.matches(v.placement.sequence, v.start, v.rows)
         || (v.kept.is_none() && !v.finished)) {
         return Err(MiniMaxError::Invalid("accepted wave identity").into());
     }
     let mut publish = verified.iter_mut().map(|v| (&mut *v.placement, v.kept.map_or(0, |(n, _)| n))).collect::<Vec<_>>();
     step.publish(&mut publish)?;
     Ok(())
+}
+
+fn accept_context(verified: &mut [scheduler::Verified<'_, Placement, State, ()>],
+    update: impl FnOnce(&[crate::shared::speculation::dflash::ContextRow])->Result<()>) -> Result<()> {
+        let mut context=Vec::new();
+        let mut states=Vec::new();
+        for (index,v) in verified.iter().enumerate() {
+            let Some((keep,after))=v.neural_kept() else {continue};
+            ensure!(keep>0 && keep<=v.rows.len(),MiniMaxError::Invalid("draft accepted prefix"));
+            let mut state=v.seq.clone(); state.advance(v.start,keep,Some(after))?;
+            context.extend((0..keep).map(|offset|crate::shared::speculation::dflash::ContextRow {
+                tap_row:v.first_row+offset,slot:v.placement.sequence,position:v.start+offset }));
+            states.push((index,state));
+        }
+        if !context.is_empty() {update(&context)?;}
+        for (index,state) in states {*verified[index].seq=state;}
+        Ok(())
 }
 
 pub(super) struct MiniMaxBackend<'e, 'a> {
@@ -39,6 +51,7 @@ pub(super) struct MiniMaxBackend<'e, 'a> {
     pub expander: Option<SpanExpander>,
     pub pending: RefCell<Option<Step>>,
     pub timing: RefCell<[f64; 2]>,
+    pub probe: RefCell<RoundRoutes>,
 }
 impl<'e, 'a> MiniMaxBackend<'e, 'a> {
     fn execute(&self, sequences: &mut [(&mut Placement, &[u32])], pool: &RefPagePool,
@@ -87,7 +100,7 @@ impl<'e, 'a> MiniMaxBackend<'e, 'a> {
 
 impl<'e, 'a> Backend<'a> for MiniMaxBackend<'e, 'a> {
     type Placement = Placement;
-    type Draft = NoDraft;
+    type Draft = State;
     type History = ();
     type Coordinates = ();
     type Encoder = Encoder;
@@ -142,7 +155,7 @@ impl<'e, 'a> Backend<'a> for MiniMaxBackend<'e, 'a> {
     }
     fn verify_device(&self, sequences: &mut [(&mut Placement, &[u32])], speculative: bool,
         pool: &RefPagePool) -> Result<Option<DeviceLogits>> {
-        if speculative { return Err(MiniMaxError::Unsupported("speculation; use --speculator off").into()); }
+        let _ = speculative;
         let (step, logits) = self.execute(sequences, pool, false)?;
         *self.pending.borrow_mut() = Some(step);
         Ok(Some(logits))
@@ -161,25 +174,66 @@ impl<'e, 'a> Backend<'a> for MiniMaxBackend<'e, 'a> {
         serde_json::json!({"kind":"minimax_msa_paged", "rows":rows, "contexts":contexts,
             "attention":"causal_paged_decode_tiles", "arithmetic":"native_mxfp8_nvfp4a4"})
     }
-    fn draft_geometry(&self, _: &Path, _: usize) -> Result<cuteafd_core::PolicyGeometry> {
-        Err(MiniMaxError::Unsupported("speculation").into())
+    fn draft_geometry(&self, _: &Path, width: usize) -> Result<cuteafd_core::PolicyGeometry> {
+        self.execution.draft()?;
+        ensure!(width==7, MiniMaxError::Invalid("draft policy width"));
+        // Until per-layer probes are qualified, all measured cost belongs to
+        // the shared policy's round fit; no synthetic expert routes are priced.
+        Ok(cuteafd_core::PolicyGeometry { layers:vec![cuteafd_core::LayerResource {
+            class:None,slice_bytes:0.,group_rows:1,timed:false }], experts:128,topk:4,
+            max_requests:self.rows.min(64),max_positions:7,widths:vec![7],
+            classes:vec![cuteafd_core::ResourceClass::rtx()],group_rows_by_rows:vec![],regimes:1 })
     }
-    fn arm_draft_probe(&self) -> Result<()> { Err(MiniMaxError::Unsupported("speculation").into()) }
-    fn prefill_draft(&self, _: &Placement, _: usize, _: &[u32], _: Option<u32>, _: &mut NoDraft) -> Result<()> {
-        Err(MiniMaxError::Unsupported("speculation").into())
+    fn arm_draft_probe(&self) -> Result<()> { self.execution.draft()?; Ok(()) }
+    fn prefill_draft(&self, p: &Placement, start: usize, chunk: &[u32], next: Option<u32>, state: &mut State) -> Result<()> {
+        ensure!(start.checked_add(chunk.len())==Some(p.committed),MiniMaxError::Invalid("draft prefill frontier"));
+        let mut next_state=state.clone(); next_state.advance(start,chunk.len(),next)?;
+        let rows=(0..chunk.len()).map(|tap_row|crate::shared::speculation::dflash::ContextRow {
+            tap_row,slot:p.sequence,position:start+tap_row }).collect::<Vec<_>>();
+        self.execution.update_draft(&rows)?;
+        *state=next_state; Ok(())
     }
-    fn draft(&self, _: &mut [scheduler::DraftSeq<'_, Placement, NoDraft>], _: &mut scheduler::DraftTiming) -> Result<Vec<Vec<u32>>> {
-        Err(MiniMaxError::Unsupported("speculation").into())
+    fn draft(&self, sequences: &mut [scheduler::DraftSeq<'_, Placement, State>], timing: &mut scheduler::DraftTiming) -> Result<Vec<Vec<u32>>> {
+        let draft=self.execution.draft()?;
+        let started=std::time::Instant::now();
+        let mut output=vec![Vec::new();sequences.len()];
+        let selected=sequences.iter().enumerate().filter(|(_,s)|s.depth>0)
+            .map(|(index,s)| {
+                ensure!(s.seq.ready && s.seq.end==s.placement.committed && s.depth<=7,
+                    MiniMaxError::Invalid("draft continuation"));
+                Ok((index,crate::shared::speculation::dflash::DraftSeq {slot:s.placement.sequence,
+                    position:s.placement.committed,valid_from:s.seq.valid_from,
+                    anchor:s.seq.anchor.context("MiniMax draft anchor missing")?}))
+            }).collect::<Result<Vec<_>>>()?;
+        for batch in selected.chunks(draft.layout.sequences) {
+            // The block always executes seven rows; near the RoPE limit use
+            // target-only verification rather than inventing future positions.
+            let batch=batch.iter().filter(|(_,s)|s.position+7<=self.cache.context).copied().collect::<Vec<_>>();
+            if batch.is_empty() {continue;}
+            let proposals=self.execution.propose(&batch.iter().map(|(_,s)|*s).collect::<Vec<_>>(),self.embedding)?;
+            ensure!(proposals.len()==batch.len(),MiniMaxError::Invalid("draft output count"));
+            for ((index,_),proposal) in batch.into_iter().zip(proposals) {
+                sequences[index].seq.confidence=proposal.confidence;
+                output[index]=proposal.tokens.into_iter().take(sequences[index].depth).collect();
+            }
+            timing.steps+=1;
+        }
+        timing.seconds+=started.elapsed().as_secs_f64(); Ok(output)
     }
-    fn accept(&self, verified: &mut [scheduler::Verified<'_, Placement, NoDraft, ()>], speculative: bool) -> Result<()> {
-        if speculative { return Err(MiniMaxError::Unsupported("speculation").into()); }
+    fn draft_confidence<'s>(&self, state: &'s State) -> Option<&'s [f32]> { Some(&state.confidence) }
+    fn accept(&self, verified: &mut [scheduler::Verified<'_, Placement, State, ()>], _: bool) -> Result<()> {
         let step = self.pending.borrow_mut().take().context("MiniMax accept has no completed wave")?;
-        accept_step(step, verified)
+        accept_step(step, verified)?;
+        accept_context(verified, |rows|self.execution.update_draft(rows))
     }
     fn cancel(&self, _: &Placement) -> Result<()> { self.pending.borrow_mut().take(); self.execution.drain() }
-    fn probe_begin(&self, _: usize) {}
+    fn probe_begin(&self, rows: usize) {
+        let mut probe=self.probe.borrow_mut(); probe.begin(rows); probe.dense(0).expect("one aggregate stage");
+    }
     fn probe_end(&self) {}
-    fn probe_finish<T>(&self, _: impl FnOnce(&RoundRoutes, &[Option<f64>]) -> T) -> Option<T> { None }
+    fn probe_finish<T>(&self, observe: impl FnOnce(&RoundRoutes, &[Option<f64>]) -> T) -> Option<T> {
+        Some(observe(&self.probe.borrow(),&[None]))
+    }
 }
 
 #[cfg(test)]
@@ -188,11 +242,54 @@ mod tests {
     use scheduler::Placement as _;
 
     #[test]
+    fn minimax_fake_verifier_commits_only_the_accepted_taps() -> Result<()> {
+        use scheduler::DraftState as _;
+        let mut pool=RefPagePool::new(8,64);
+        let mut p=Placement {pages:pool.alloc(2)?,sequence:0,committed:63,
+            media:RequestMedia::new(Vec::new(),6144,0)?};
+        let mut state=State::default();
+        for keep in 1..=8 {
+            p.committed=63;
+            state.restored(63);
+            state.close(10);
+            assert_eq!(state.pending_rows(),0,"prefix restores never expose stale draft KV");
+            let rows=[10,11,12,13,14,15,16,17];
+            let mut step=Step::begin(&[(&mut p,&rows)],&pool,1,64,128,8)?;
+            step.completed();
+            p.committed+=keep;
+            let mut verified=[scheduler::Verified {placement:&mut p,seq:&mut state,start:63,history:(),
+                rows:&rows,first_row:9,kept:Some((keep,99)),finished:false,neural:true}];
+            accept_step(step,&mut verified)?;
+            let mut fake=Vec::new();
+            accept_context(&mut verified,|rows| {
+                fake.extend(rows.iter().map(|r|(r.tap_row,r.slot,r.position))); Ok(())
+            })?;
+            assert_eq!(fake,(0..keep).map(|i|(9+i,0,63+i)).collect::<Vec<_>>());
+            assert_eq!((state.valid_from,state.end,state.anchor),(63,63+keep,Some(99)));
+            assert_eq!(p.committed,63+keep);
+            assert_eq!(state.pending_rows(),1);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn minimax_failed_draft_update_does_not_publish_continuation() -> Result<()> {
+        let mut p=Placement {pages:vec![],sequence:0,committed:2,
+            media:RequestMedia::new(Vec::new(),6144,0)?};
+        let mut state=State::default();
+        let mut verified=[scheduler::Verified {placement:&mut p,seq:&mut state,start:0,history:(),
+            rows:&[1,2,3],first_row:0,kept:Some((2,4)),finished:false,neural:true}];
+        assert!(accept_context(&mut verified,|_|Err(MiniMaxError::Invalid("fake executor failure").into())).is_err());
+        assert!(!state.ready);
+        Ok(())
+    }
+
+    #[test]
     fn minimax_scheduler_accepts_only_completed_matching_wave() -> Result<()> {
         let mut pool = RefPagePool::new(8, 64);
         let mut p = Placement { pages: pool.alloc(2)?, sequence: 0, committed: 63,
             media: RequestMedia::new(Vec::new(), 6144, 0)? };
-        let mut draft = NoDraft;
+        let mut draft = State::default();
         for (completed, token, kept, finished, succeeds) in [
             (false, 7, Some((1, 8)), false, false),
             (true, 9, Some((1, 8)), false, false),

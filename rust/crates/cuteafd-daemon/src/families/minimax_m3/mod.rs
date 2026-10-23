@@ -2,6 +2,7 @@
 mod admission;
 mod backend;
 mod cache;
+mod dspark;
 mod execution;
 mod ffn;
 mod head;

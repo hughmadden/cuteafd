@@ -1568,7 +1568,7 @@ if [[ "$family" == minimax_m3 ]]; then
   minimax_local_layers="$(get RTX_EXPERT_LAYERS auto)"
   [[ "$minimax_local_layers" == auto || "$minimax_local_layers" =~ ^[0-9]+$ ]] ||
     release_die "MiniMax RTX_EXPERT_LAYERS must be auto or a fixed routed-layer count"
-  [[ "$(get SPECULATOR off)" == off ]] || release_die "MiniMax supports only SPECULATOR=off"
+  case "$(get SPECULATOR off)" in off|dspark) ;; *) release_die "MiniMax supports SPECULATOR=dspark or off" ;; esac
   case "$(get RTX_GPUS auto)" in auto|1|2) ;; *) release_die "RTX_GPUS must be auto, 1 or 2" ;; esac
   case "$(get COORDINATOR_SPLIT auto)" in auto|off|heads) ;; *) release_die "COORDINATOR_SPLIT must be auto, heads or off" ;; esac
   minimax_coordinator_gpus="$(get COORDINATOR_GPUS "$(get COORDINATOR_GPU 0)")"
@@ -1887,7 +1887,7 @@ if [[ -z "$speculator" ]]; then
 fi
 case "$family:$speculator" in
   qwen4:mtp) ;; # The MTP layer's experts stay local even with Spark backbone experts.
-  *:off|glm5:dflash2|glm5_flash:dflash2|glm5_flash:dspark|mimo_v2:dflash2|mimo_v2:mtp|kimi_k3:dflash2|step5:mtp|deepseek_v4:dspark) ;;
+  *:off|glm5:dflash2|glm5_flash:dflash2|glm5_flash:dspark|mimo_v2:dflash2|mimo_v2:mtp|kimi_k3:dflash2|step5:mtp|deepseek_v4:dspark|minimax_m3:dspark) ;;
   *) echo "SPECULATOR=$speculator does not apply to $family" >&2; exit 2 ;;
 esac
 draft_args=()
@@ -1963,7 +1963,9 @@ case "$speculator" in
   dflash2|dspark)
     drafter="$(get SPECULATOR_MODEL_ID)"
     [[ -n "$drafter" ]] || drafter="$default_drafter"
-    if [[ $speculator == dspark && $family == deepseek_v4 ]]; then
+    if [[ $family == minimax_m3 ]]; then
+      : # The release owns its bundled drafter.
+    elif [[ $speculator == dspark && $family == deepseek_v4 ]]; then
       dspark_args=(--dspark)
     elif [[ -n "$drafter" ]]; then
       draft_snapshot="$(snapshot_of "$drafter" "$(get SPECULATOR_MODEL_REVISION)")" ||
@@ -2102,7 +2104,7 @@ if ((qualifying)) || [[ "$family" == minimax_m3 ]]; then
 fi
 if [[ "$family" == minimax_m3 ]]; then
   family_args+=(--kv-cache "$minimax_kv_cache" --rtx-expert-layers "$minimax_local_layers"
-    --speculator off --prefill-batch-tokens "$minimax_prefill_rows")
+    --speculator "$speculator" --prefill-batch-tokens "$minimax_prefill_rows")
 fi
 if [[ $family == kimi_k3 ]]; then
   kv_cache="$(get KV_CACHE fp8)"

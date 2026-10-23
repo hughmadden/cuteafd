@@ -141,6 +141,7 @@ pub(crate) trait Backend<'a> {
         draft: &mut Self::Draft) -> Result<()>;
     fn draft(&self, sequences: &mut [DraftSeq<'_, Self::Placement, Self::Draft>], timing: &mut DraftTiming)
         -> Result<Vec<Vec<u32>>>;
+    fn draft_confidence<'s>(&self, _draft: &'s Self::Draft) -> Option<&'s [f32]> { None }
     fn accept(&self, verified: &mut [Verified<'_, Self::Placement, Self::Draft, Self::History>],
         speculative: bool) -> Result<()>;
     /// Drop any unaccepted replay owned by this request before its storage is released.
@@ -1065,6 +1066,12 @@ pub(crate) fn schedule<'a, B: Backend<'a>>(engine: &B, snapshot: &std::path::Pat
                 }
             }
         };
+        for ((request, proposal), prior) in active.iter().zip(&proposals).zip(&mut neural_confidence) {
+            if let Some(head) = engine.draft_confidence(&request.draft) {
+                anyhow::ensure!(head.len() >= proposal.len(), "draft confidence does not cover its proposal");
+                *prior = resource::head_confidence(&request.outcomes, &head[..proposal.len()]);
+            }
+        }
         let trace_neural = trace.as_ref().map(|_| proposals.clone());
         let trace_copy = trace.as_ref().map(|_| active.iter().zip(&proposals).map(|(a, p)|
             crate::shared::draft::copy::trace_window(&a.history, p.len() + crate::shared::draft::copy::COPY_EXTENSION))

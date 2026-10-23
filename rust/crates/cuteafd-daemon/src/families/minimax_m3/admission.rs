@@ -17,6 +17,7 @@ pub(super) struct Request {
     pub onboard: Option<usize>,
     pub spark_budget: u64,
     pub headroom: u64,
+    pub draft_bytes: u64,
 }
 
 pub(super) struct Admitted {
@@ -69,7 +70,7 @@ pub(super) fn solve(checkpoint: &Checkpoint, programs: &serde_json::Value,
             .min().context("MiniMax TP1 package row capacity")?;
         (bytes, Some(usize::try_from(capacity)?))
     };
-    let mut reservations = Reservations { weights: weights.resident_bytes, local_experts: onboard.local_bytes,
+    let mut reservations = Reservations { weights: weights.resident_bytes.checked_add(request.draft_bytes).context("MiniMax draft admission overflow")?, local_experts: onboard.local_bytes,
         expert_workspace, headroom: request.headroom, ..Default::default() };
     reservations.startup = reservations.fixed_bytes(&ledger)?.checked_add(admission::scale_prep_staging_bytes(&weights))
         .context("MiniMax load peak overflow")?;
@@ -114,7 +115,7 @@ mod tests {
         let mut live = solve(&checkpoint, &programs, None, Request {
             sizing: RuntimeSizing { rows: 256, decode_rows: 64, sequences: 16, context: 4096, spark_ranks: 3 },
             available: options.rtx_bytes[0] - measured_baseline, requested_pool: Some(4096),
-            kv_format: Qwen4KvCache::Fp8, onboard: None, spark_budget: 108 << 30, headroom: 0,
+            kv_format: Qwen4KvCache::Fp8, onboard: None, spark_budget: 108 << 30, headroom: 0, draft_bytes:0,
         })?;
         assert_eq!(live.cache.total_bytes + measured_baseline, device.used_bytes());
         assert_eq!(live.cache.pool_tokens, memory.pool_tokens);
