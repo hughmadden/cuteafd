@@ -71,7 +71,11 @@ pub const STEP5: ExecutorModes = ExecutorModes { family: "step5", modes: &[WHOLE
     hops: true, attention: AttentionPlacement::Heads };
 
 /// Every family's executor set, for lookups by family name.
-pub const EXECUTORS: [ExecutorModes; 8] = [DEEPSEEK_V4, DEEPSEEK_V41, GLM5, GLM5_FLASH, MIMO_V2, QWEN4, KIMI_K3, STEP5];
+/// MiniMax M3: one coordinator GPU owns every layer (a KV-head split is not executed yet).
+pub const MINIMAX_M3: ExecutorModes = ExecutorModes { family: "minimax_m3", modes: &[WHOLE0],
+    hops: false, attention: AttentionPlacement::Heads };
+
+pub const EXECUTORS: [ExecutorModes; 9] = [DEEPSEEK_V4, DEEPSEEK_V41, GLM5, GLM5_FLASH, MIMO_V2, QWEN4, KIMI_K3, STEP5, MINIMAX_M3];
 
 pub fn executor(family: &str) -> Option<ExecutorModes> {
     EXECUTORS.into_iter().find(|e| e.family == family)
