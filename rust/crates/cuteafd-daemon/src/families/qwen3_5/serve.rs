@@ -114,22 +114,23 @@ impl<'e, 'a> Backend<'a> for DenseBackend<'e, 'a> {
             rows.extend(tokens.iter().enumerate().map(|(offset, &token)| VerifyRow {
                 slot: placement.slot, position: placement.len + offset, token: Some(token) }));
         }
-        let mark = engine.checkpoint(&slots)?;
-        let output = match engine.verify(&mark, VerifyRequest { rows: &rows, tap_layers: &[] }) {
-            Ok(output) => output.logits,
-            Err(error) => { engine.restore(&mark)?; return Err(error); }
-        };
-        if speculative {
+        let request = VerifyRequest { rows: &rows, tap_layers: &[] };
+        let output = if speculative {
+            let mark = engine.checkpoint(&slots)?;
+            let output = match engine.verify(&mark, request) {
+                Ok(output) => output.logits,
+                Err(error) => { engine.restore(&mark)?; return Err(error); }
+            };
             *self.pending.borrow_mut() = Some(mark);
+            output
         } else {
-            let accepted = sequences.iter().map(|(placement, tokens)| AcceptedPrefix {
-                slot: placement.slot, rows: tokens.len() }).collect::<Vec<_>>();
-            engine.commit(&mark, &accepted)?;
+            let output = engine.decode_device(&slots, request)?;
             for (placement, tokens) in sequences {
                 placement.len += tokens.len();
                 placement.state_len = placement.len;
             }
-        }
+            output
+        };
         Ok(Some(output))
     }
     fn verify_device_ungraphed(&self, sequences: &mut [(&mut Placement, &[u32])], speculative: bool,

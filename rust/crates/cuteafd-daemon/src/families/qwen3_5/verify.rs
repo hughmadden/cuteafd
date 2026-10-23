@@ -251,8 +251,43 @@ impl<'a> DenseEngine<'a> {
             }
             ensure!(state(self)? == actual, "dense multislot accepted-input state differs for {kept:?}");
         }
+        let kv = |engine: &Self| -> Result<Vec<Vec<u8>>> {
+            let record = engine.kv_format.record_bytes(engine.cfg.kv_heads, engine.cfg.head_dim);
+            let mut output = Vec::new();
+            for slot in &engine.slots {
+                for position in 0..slot.position {
+                    let offset = (slot.pages[position / 64] as usize * 64 + position % 64) * record;
+                    for pool in engine.kv.iter().flatten() {
+                        let mut bytes = vec![0; record];
+                        library.copy_d2h(&mut bytes, view(pool.buffer, offset, record)?)?;
+                        output.push(bytes);
+                    }
+                }
+            }
+            Ok(output)
+        };
+        reset(self)?;
+        let mark = self.checkpoint(&[1, 0])?;
+        let expected_logits = self.verify(&mark, VerifyRequest { rows: &rows, tap_layers: &[] })?
+            .logits.to_host(library)?;
+        self.commit(&mark, &[AcceptedPrefix { slot: 0, rows: 4 }, AcceptedPrefix { slot: 1, rows: 3 }])?;
+        let expected_state = state(self)?;
+        let expected_kv = kv(self)?;
+        reset(self)?;
+        let stale = self.checkpoint(&[1, 0])?;
+        let actual = self.decode_device(&[1, 0], VerifyRequest { rows: &rows, tap_layers: &[] })?.to_host(library)?;
+        ensure!(actual.iter().map(|v| v.to_bits()).eq(expected_logits.iter().map(|v| v.to_bits()))
+            && state(self)? == expected_state && kv(self)? == expected_kv,
+            "dense direct multislot logits, KV or recurrent state differ from full speculative commit");
+        ensure!(self.slots[0].position == 7 && self.slots[1].position == 6
+            && self.verification.pending.is_none(), "dense direct decode did not retire committed inputs");
+        ensure!(self.restore(&stale).is_err(), "dense direct decode retained a stale transactional mark");
+        let invalid = [VerifyRow { slot: 0, position: 6, token: Some(tokens[0]) }];
+        ensure!(self.decode_device(&[0], VerifyRequest { rows: &invalid, tap_layers: &[] }).is_err()
+            && self.healthy && state(self)? == expected_state && kv(self)? == expected_kv,
+            "dense invalid direct decode changed committed state");
         for slot in 0..self.slots.len() { self.reset_slot(slot)?; }
-        println!("dense multislot verify: interleaved logits, sentinel padding and independent accepted-input state byte-exact");
+        println!("dense multislot verify: interleaved logits, sentinel padding, accepted-input replay and direct-commit logits/KV/state byte-exact");
         Ok(())
     }
 
@@ -291,7 +326,24 @@ impl<'a> DenseEngine<'a> {
         Ok(())
     }
 
-    fn verify_rows(&mut self, plan: rows::Rows, rows: usize, layers: &[usize]) -> Result<()> {
+    /// Plain decode commits every input in place; only speculative rows need a
+    /// checkpoint and replay. Retained prefix snapshots own a separate arena.
+    pub(crate) fn decode_device(&mut self, slots: &[usize], request: VerifyRequest<'_>) -> Result<DeviceLogits> {
+        ensure!(self.healthy && self.verification.pending.is_none(), "dense decode requires committed healthy state");
+        ensure!(!slots.is_empty(), "dense decode requires active slots");
+        let marked = slots.iter().map(|&slot| {
+            self.slots.get(slot).cloned().map(|state| (slot, state))
+                .context("dense decode slot outside admission")
+        }).collect::<Result<Vec<_>>>()?;
+        let plan = rows::Rows::new(&request, self.cfg.attention.len(), self.cfg.vocab, &marked,
+            self.cfg.max_context, self.pool_tokens)?;
+        self.verification.invalidate()?;
+        self.verify_rows(plan, request.rows.len(), request.tap_layers, false)?;
+        Ok(DeviceLogits { ptr: self.verification.logits.buffer.ptr, rows: request.rows.len(),
+            vocab: self.cfg.vocab, stride: self.cfg.vocab, stream: self.stream.raw, greedy: None })
+    }
+
+    fn verify_rows(&mut self, plan: rows::Rows, rows: usize, layers: &[usize], speculative: bool) -> Result<()> {
         self.stream.drain()?;
         self.healthy = false;
         let tokens = &plan.tokens;
@@ -309,7 +361,7 @@ impl<'a> DenseEngine<'a> {
         if !tokens.is_empty() {
             self.row_tables(&plan)?;
             self.embedding.embed(tokens, self.ids.buffer, 1, self.planes.residual, self.stream.raw)?;
-            let step = Step { rows: tokens.len(), capacity: REPLAY_ROWS, table_stride: plan.stride, splits: 1, speculative: true };
+            let step = Step { rows: tokens.len(), capacity: REPLAY_ROWS, table_stride: plan.stride, splits: 1, speculative };
             let blocks = Blocks { programs: self.programs, admitted: &self.admitted, cfg: &self.cfg,
                 homes: &self.homes, bank: &self.bank, stream: self.stream.raw };
             for (index, layer) in self.weights.layers.iter().enumerate() {
@@ -341,7 +393,12 @@ impl<'a> DenseEngine<'a> {
             }
         }
         self.stream.drain()?;
-        self.verification.pending = Some(plan);
+        if speculative {
+            self.verification.pending = Some(plan);
+        } else {
+            for group in &plan.groups { self.slots[group.slot].position += group.rows; }
+            self.position = self.slots[0].position;
+        }
         self.healthy = true;
         Ok(())
     }
@@ -370,7 +427,7 @@ impl<'a> BlockVerifyTarget for DenseEngine<'a> {
             self.cfg.max_context, self.pool_tokens);
         self.restore_mark(mark)?;
         let plan = active?;
-        if let Err(error) = self.verify_rows(plan, request.rows.len(), request.tap_layers) {
+        if let Err(error) = self.verify_rows(plan, request.rows.len(), request.tap_layers, true) {
             self.restore_mark(mark).context("restoring dense checkpoint after failed verify")?;
             return Err(error);
         }

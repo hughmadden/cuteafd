@@ -128,6 +128,64 @@ pub(crate) fn check(engine: &RefCell<DenseEngine<'_>>, tokens: &[u32]) -> Result
         family.drain().map_err(boxed)?;
         println!("dense prefix adapter: exact {len}-row state and continuation on copied full/partial KV pages byte-exact");
     }
+    check_direct_frontiers(engine, tokens)?;
+    Ok(())
+}
+
+fn check_direct_frontiers(engine: &RefCell<DenseEngine<'_>>, tokens: &[u32]) -> Result<()> {
+    use crate::shared::qwen::scheduler::Backend;
+    let family = DensePrefix::new(engine)?;
+    ensure!(family.slots() >= 2, "dense direct prefix check requires prompt and turn marks");
+    let library = engine.borrow().stream.device.library;
+    let backend = super::super::serve::DenseBackend::new(engine, library);
+    let pool = cuteafd_engine::prefix::RefPagePool::new(family.layout.pages, 64);
+    let boxed = |error: BoxError| anyhow::anyhow!("dense direct prefix check: {error}");
+    let snapshot = |placement: &Placement| -> Result<Vec<Vec<u8>>> {
+        let target = engine.borrow();
+        target.stream.drain()?;
+        let mut regions = DensePrefix::state(&target, placement.slot);
+        drop(target);
+        for (index, &page) in placement.units.iter().enumerate().take(placement.len.div_ceil(64)) {
+            regions.extend(family.page_buffers(page, (placement.len - index * 64).min(64))?);
+        }
+        regions.into_iter().map(|region| {
+            let mut bytes = vec![0; region.bytes];
+            library.copy_d2h(&mut bytes, region)?;
+            Ok(bytes)
+        }).collect()
+    };
+    let decode = |placement: &mut Placement, inputs: &[u32]| -> Result<Vec<f32>> {
+        backend.verify_device(&mut [(placement, inputs)], false, &pool)?
+            .context("dense direct prefix check requires logits")?.to_host(library)
+    };
+    let continuation = tokens.iter().copied().cycle().take(3).collect::<Vec<_>>();
+    for len in [63usize, 65, 129] {
+        let prompt = tokens.iter().copied().cycle().take(len).collect::<Vec<_>>();
+        let mut placement = Placement { units: vec![0, 1, 2], slot: 0, len: 0, state_len: 0 };
+        family.bind(&mut placement).map_err(boxed)?;
+        backend.prefill_device(&mut placement, &prompt, 1, &pool)?;
+        family.capture(MarkSlot(0), &placement, len).map_err(boxed)?;
+        family.drain().map_err(boxed)?;
+        let prompt_bytes = snapshot(&placement)?;
+        let first = decode(&mut placement, &continuation)?;
+        let turn_len = placement.len;
+        family.capture(MarkSlot(1), &placement, turn_len).map_err(boxed)?;
+        family.drain().map_err(boxed)?;
+        let turn_bytes = snapshot(&placement)?;
+        let second = decode(&mut placement, &continuation)?;
+        for (mark, frontier, saved, expected) in [(MarkSlot(0), len, &prompt_bytes, &first),
+            (MarkSlot(1), turn_len, &turn_bytes, &second)] {
+            family.discard(&mut placement).map_err(boxed)?;
+            family.restore(Some(mark), &mut placement, frontier).map_err(boxed)?;
+            ensure!(snapshot(&placement)? == *saved,
+                "dense direct decode changed retained frontier {frontier} state/KV bytes");
+            let actual = decode(&mut placement, &continuation)?;
+            ensure!(actual.iter().map(|v| v.to_bits()).eq(expected.iter().map(|v| v.to_bits())),
+                "dense direct decode changed retained frontier {frontier} continuation logits");
+        }
+        family.discard(&mut placement).map_err(boxed)?;
+        println!("dense direct prefix adapter: retained prompt {len} and turn {turn_len} state/KV/logits byte-exact after further direct decode");
+    }
     Ok(())
 }
 
