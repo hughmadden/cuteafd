@@ -6,18 +6,15 @@
 //! writes the same outputs (KV record, `query`, `q_resid`, FP8 index query and
 //! head weights, `delta`, FFN output) into the same workspace buffers.
 //!
-//! Row routes: decode and verify (rows <= 64) run every projection on its native
-//! kernel. Prefill (rows > 64): trellis projections take the exact FP8 unpack
-//! baseline ([`Unpacked`]: the payload decoded once per chunk to E4M3 `[N, K]`
-//! with unit 128x128 scales, then the block-FP8 W8A16 GEMM over the
-//! BF16-rotated rows, F32 out); MXFP8 and int4 stay on their native kernels.
+//! Trellis dense prefill uses exact FP16 MMA over on-chip decoded weights;
+//! MXFP8 and int4 retain their native BF16-activation kernels. No activation
+//! quantization records or unpacked weight staging are admitted.
 //!
 //! Trellis transforms: `rotated = H128(x * suh)` before the core, `H128(acc) *
 //! svh` after. Split projections apply svh per rank (o by input columns, down
 //! by intermediate) before the existing BF16 partial exchange, the order the
 //! shared trellis ABI permits ("transform each rank then reduce BF16 outputs").
 use super::*;
-use cuteafd_ffi::dense_trellis::{DenseTrellisGeometry, TrellisDType};
 use cuteafd_ffi::native_dense::DenseLinear;
 use cuteafd_ffi::native_dense_glue::Companion;
 use cuteafd_ffi::CuteafdDeviceBuffer as Buffer;
@@ -84,23 +81,7 @@ pub(crate) struct NativeScratch<'a> {
     values: Dev<'a>,
 }
 
-/// One GPU's prefill workspace for the trellis unpack baseline: the largest
-/// trellis payload of any native layer unpacked to E4M3 `[N, K]` (transient,
-/// rewritten by every projection) and the all-ones 128x128 grid.
-///
-/// This owner is the per-GPU prefill route slot. A tensor-core MXFP8 route
-/// replaces it: it holds instead one shared MXFP8 activation record
-/// ([`mx8_activation_bytes`] at the largest K a projection reads), reused by
-/// gate/up and every projection that shares an input, beside the per-lane
-/// F16/BF16 rotated inputs in [`NativeScratch`]. Admission charges whichever
-/// route is active (`GlmInputs::native_dense`).
-pub(crate) struct Unpacked<'a> {
-    weight: Dev<'a>,
-    ones: Dev<'a>,
-}
-
-/// Bytes a lane's [`NativeScratch`] takes at `rows`, and the [`Unpacked`] bytes
-/// of a GPU whose largest trellis weight is `[n, k]` (admission charges both).
+/// Bytes of one lane's native dense scratch, charged before allocation.
 pub(crate) fn scratch_bytes(cfg: &GlmDsaConfig, heads: usize, inter: usize, rows: usize) -> usize {
     let (h, q, ih) = (cfg.hidden, cfg.q_lora_rank, cfg.index_heads);
     let max_k = [h, q, heads * cfg.v_head_dim, inter].into_iter().max().unwrap_or(0);
@@ -112,18 +93,6 @@ pub(crate) fn scratch_bytes(cfg: &GlmDsaConfig, heads: usize, inter: usize, rows
         .into_iter().map(|b| b.max(256).next_multiple_of(256)).sum()
 }
 
-/// Bytes of one MXFP8 activation record of `rows` rows over `k` input
-/// features: E4M3 values plus one UE8M0 scale per 32 (the MX8 prefill route's
-/// per-GPU workspace; not allocated by the unpack baseline).
-#[allow(dead_code)]
-pub(crate) fn mx8_activation_bytes(rows: usize, k: usize) -> usize {
-    rows * k + rows * k.div_ceil(32)
-}
-
-pub(crate) fn unpacked_bytes(n: usize, k: usize) -> usize {
-    (n * k).max(256).next_multiple_of(256) + (n.div_ceil(128) * (k / 128) * 4).max(256).next_multiple_of(256)
-}
-
 impl<'a> NativeScratch<'a> {
     pub(crate) fn new(engine: &GlmEngine<'a>, heads: usize, inter: usize, rows: usize) -> Result<Self> {
         let _scope = cuteafd_ffi::memory_ledger::scope("native-dense-scratch");
@@ -133,8 +102,7 @@ impl<'a> NativeScratch<'a> {
         let max_n = [heads * (cfg.qk_nope_head_dim + cfg.qk_rope_head_dim), h, inter, ih * 128].into_iter().max().unwrap_or(0);
         let a = |bytes: usize| engine.alloc(bytes);
         let scratch = Self { rotated: a(rows * max_k * 2)?, table: a(64)?, block_scales: a(max_k / 128 * 2)?,
-            // Split-K partials serve only the trellis decode core (<= 64 rows); prefill
-            // trellis takes the unpack route and the scaled linears use no partials.
+            // Exact trellis prefill and native scaled linears do not use partials.
             partial: a(rows.min(NATIVE_DECODE_ROWS) * max_k.div_ceil(1024) * max_n * 4)?, acc: a(rows * max_n * 4)?,
             qkv: a(rows * (q + cfg.kv_lora_rank + cfg.qk_rope_head_dim) * 2)?, q: a(rows * heads * 256 * 2)?,
             gate: a(rows * inter * 2)?, up: a(rows * inter * 2)?, hidden: a(rows * inter * 2)?,
@@ -142,16 +110,6 @@ impl<'a> NativeScratch<'a> {
         // The trellis core reads rotated inputs through a one-entry pointer table (rotation id 0).
         engine.library.copy_h2d(scratch.table.buffer, &(scratch.rotated.buffer.ptr as u64).to_le_bytes())?;
         Ok(scratch)
-    }
-}
-
-impl<'a> Unpacked<'a> {
-    pub(crate) fn new(engine: &GlmEngine<'a>, n: usize, k: usize) -> Result<Self> {
-        let _scope = cuteafd_ffi::memory_ledger::scope("native-dense-prefill-staging");
-        let ones = engine.alloc(n.div_ceil(128) * (k / 128) * 4)?;
-        let values: Vec<u8> = std::iter::repeat_n(1.0f32.to_le_bytes(), n.div_ceil(128) * (k / 128)).flatten().collect();
-        engine.library.copy_h2d(ones.buffer, &values)?;
-        Ok(Self { weight: engine.alloc(n * k)?, ones })
     }
 }
 
@@ -208,25 +166,15 @@ impl<'a> GlmEngine<'a> {
                 let core = programs.linear(&format!("exlr8_dense_trellis_{stem}"))?;
                 let (k, n) = (core.geometry().input_features as usize, core.geometry().output_features as usize);
                 let (payload, suh, svh) = (key("trellis")?, key("suh")?, key("svh")?);
-                let prefill = rows > NATIVE_DECODE_ROWS;
-                let input = programs.companion(&format!("exlr8_dense_trellis_input_k{k}_{}", if prefill { "bf16" } else { "f16" }))?;
+                let input = programs.companion(&format!("exlr8_dense_trellis_input_k{k}_f16"))?;
                 let output = programs.companion(&format!("exlr8_dense_trellis_output_n{n}"))?;
                 let rotated = head(s.rotated.buffer, rows * k * 2)?;
                 // SAFETY (each launch): rank-local live buffers of the companion/linear
                 // contracts at `rows`; this rank's stream orders them.
                 self.on(rank, || unsafe {
                     input.launch(&[x.ptr, suh.ptr, rotated.ptr, s.block_scales.buffer.ptr], rows as u32, 0, stream)?;
-                    if prefill {
-                        let (unpack, gemm) = (programs.companion(&format!("exlr8_dense_unpack_{stem}"))?,
-                            programs.companion(&format!("exlr8_dense_prefill_{stem}"))?);
-                        let staged = self.native_unpacked(rank)?;
-                        unpack.launch(&[payload.ptr, staged.weight.buffer.ptr], 0, 0, stream)?;
-                        gemm.launch(&[rotated.ptr, staged.weight.buffer.ptr, staged.ones.buffer.ptr, s.acc.buffer.ptr],
-                            rows as u32, 0, stream)?;
-                    } else {
-                        core.launch(s.table.buffer.ptr, payload.ptr, s.block_scales.buffer.ptr, s.partial.buffer.ptr,
-                            s.partial.buffer.bytes as u64, s.acc.buffer.ptr, rows as u32, 0, stream)?;
-                    }
+                    core.launch(s.table.buffer.ptr, payload.ptr, s.block_scales.buffer.ptr, s.partial.buffer.ptr,
+                        s.partial.buffer.bytes as u64, s.acc.buffer.ptr, rows as u32, 0, stream)?;
                     output.launch(&[s.acc.buffer.ptr, svh.ptr, head(bf16_out, rows * n * 2)?.ptr], rows as u32, 0, stream)?;
                     Ok::<_, anyhow::Error>(())
                 })?;
@@ -358,18 +306,6 @@ pub(super) enum NativeOut {
     F32 { n: usize },
     /// BF16 `[rows, n]` in the caller's output (trellis after its output transform).
     Bf16 { #[allow(dead_code)] n: usize },
-}
-
-/// Trellis geometries a GLM rank's native layers use (for admission and binding checks).
-pub(crate) fn trellis_geometries(split: bool) -> Vec<(&'static str, DenseTrellisGeometry)> {
-    let g = |input, output, side| DenseTrellisGeometry { input, output, bits: 4, side, rows: NATIVE_DECODE_ROWS,
-        input_dtype: TrellisDType::Bf16, output_dtype: TrellisDType::Bf16 };
-    if split {
-        vec![("q_b_tp2", g(2048, 8192, 1)), ("o_tp2", g(8192, 6144, 2)), ("gate_up_tp2", g(6144, 6144, 1)),
-            ("down_tp2", g(6144, 6144, 2))]
-    } else {
-        vec![("q_b", g(2048, 16384, 1)), ("o", g(16384, 6144, 2)), ("gate_up", g(6144, 12288, 1)), ("down", g(12288, 6144, 2))]
-    }
 }
 
 #[cfg(test)]

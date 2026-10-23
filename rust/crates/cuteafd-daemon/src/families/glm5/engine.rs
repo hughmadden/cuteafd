@@ -289,7 +289,6 @@ pub(crate) struct GlmEngine<'a> {
     /// Per rank: bound native dense programs and the prefill unpack staging
     /// (EXLR8 checkpoint dense operands); empty on the official path.
     pub(crate) native_dense: Vec<Option<native_dense::NativePrograms<'a>>>,
-    pub(crate) native_unpacked: Vec<native_dense::Unpacked<'a>>,
     pub(crate) native_experts: Vec<exlr8::NativeExperts<'a>>,
     quantize_grid: Fp8QuantizeGrid,
     pub library: &'a NativeLibrary,
@@ -434,7 +433,7 @@ impl<'a> GlmEngine<'a> {
         let local = if context_mode.is_some() { pages / 2 } else { pages };
         let (kv, index, cos_sin) = caches(library, &cfg, &weights.layers, local, max_context)?;
         let device = library.cuda_get_device()?;
-        Ok(Self { quantize_grid, device, native_experts: Vec::new(), native_dense: Vec::new(), native_unpacked: Vec::new(), peer: None, exchange: None, tp2: None, tp2_exchange: ExchangeDtype::Bf16, force_route_check: Cell::new(false), context_mode, context: None, layer_execution: None,
+        Ok(Self { quantize_grid, device, native_experts: Vec::new(), native_dense: Vec::new(), peer: None, exchange: None, tp2: None, tp2_exchange: ExchangeDtype::Bf16, force_route_check: Cell::new(false), context_mode, context: None, layer_execution: None,
             context_units: RefCell::new(Vec::new()), library, programs, cfg, weights, stream, max_context, prefill_rows, pages, kv, index, cos_sin,
             decode_workspace: RefCell::new(None), lane_workspaces: RefCell::new(Vec::new()),
             prefill_lanes, staged: Cell::new(library.cuda_event_create_ordering()?),
@@ -2281,10 +2280,7 @@ impl<'a> GlmEngine<'a> {
         Ok(if rank == 0 { self.device } else { self.peer()?.device })
     }
 
-    /// Rank `rank`'s prefill unpack staging.
-    fn native_unpacked(&self, rank: usize) -> Result<&native_dense::Unpacked<'a>> {
-        self.native_unpacked.get(rank).context("native dense prefill staging on this rank")
-    }
+
 }
 
 /// Optional static per-tensor prefill route for undeclared FP8 modules.

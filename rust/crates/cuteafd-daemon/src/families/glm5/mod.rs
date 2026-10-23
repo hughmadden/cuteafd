@@ -554,17 +554,15 @@ impl Opened {
             *reserved = reserved.checked_add(plan.resident).context("EXLR8 coordinator reservation overflow")?;
         }
         let spark_bf16 = checkpoint.as_ref().is_some_and(|c| c.spark_input_is_bf16());
-        // Native dense: decode plus every prefill lane's scratch, and the prefill unpack staging.
+        // Native dense: decode plus every prefill lane's scratch; no unpack or A8 records.
         let native_dense_charge: Vec<u64> = if native {
             let split = devices.len() == 2;
             let heads = self.cfg.heads / if split { 2 } else { 1 };
             let inter = self.cfg.dense_intermediate / if split { 2 } else { 1 };
             let lanes = glm::prefill_lanes(args.peers.as_deref().map_or(0, |p| p.split(',').count()),
                 engine::configured_lanes() as u64) as usize;
-            let staging = engine::native_dense::trellis_geometries(split).iter()
-                .map(|(_, g)| engine::native_dense::unpacked_bytes(g.output, g.input)).max().unwrap_or(0);
             let per_gpu = engine::native_dense::scratch_bytes(&self.cfg, heads, inter, engine::DECODE_ROWS)
-                + lanes * engine::native_dense::scratch_bytes(&self.cfg, heads, inter, args.prefill_rows) + staging;
+                + lanes * engine::native_dense::scratch_bytes(&self.cfg, heads, inter, args.prefill_rows);
             vec![per_gpu as u64; devices.len()]
         } else { Vec::new() };
         let gpus = inventory.gpus.iter().zip(&reserved_weights).map(|(gpu, &bytes)| -> Result<_> {
@@ -842,16 +840,10 @@ impl Opened {
         }
         if owners.is_some() { engine.bind_layer_execution(&placement)?; }
         if native {
-            // Native dense programs bound per GPU (runtime SM count) and one prefill
-            // unpack staging each, before any capture; admission charged both.
-            let split = engine.ranks() == 2;
-            let (n, k) = engine::native_dense::trellis_geometries(split).iter()
-                .map(|(_, g)| (g.output, g.input)).max_by_key(|(n, k)| n * k).context("trellis geometries")?;
+            // Bind each GPU before capture; all prefill scratch is lane-local.
             for rank in 0..engine.ranks() {
                 let bound = engine.on(rank, || engine::native_dense::NativePrograms::bind(&programs, &manifest))?;
-                let staged = engine.on(rank, || engine::native_dense::Unpacked::new(&engine, n, k))?;
                 engine.native_dense.push(Some(bound));
-                engine.native_unpacked.push(staged);
             }
         }
         if let Some(tp2) = tp2 {
