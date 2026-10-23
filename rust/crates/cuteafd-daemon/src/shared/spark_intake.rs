@@ -1254,8 +1254,10 @@ fn egress_setting() -> Egress {
     })
 }
 
-fn egress_bytes(capacity: usize, row_bytes: usize, enable: bool, setting: Egress) -> usize {
-    if enable && setting != Egress::Copied { capacity * row_bytes } else { 0 }
+fn egress_bytes(capacity: usize, row_bytes: usize, enable: bool, setting: Egress, waves: usize) -> usize {
+    // Pending replies retain request payloads. One registered buffer cannot
+    // back overlapping waves; those requests need their own copied payload.
+    if enable && setting != Egress::Copied && waves == 1 { capacity * row_bytes } else { 0 }
 }
 
 /// Logs once how this coordinator moves expert traffic, from the fabric it
@@ -1351,7 +1353,7 @@ impl<'a> SparkLink<'a> {
         unsafe { intake.attach(&mut transport)? };
         // Expert input rows are at most BF16, as wide as a partial row.
         log_transfer_plan(mode, ranks);
-        let egress_bytes = egress_bytes(capacity as usize, row_bytes, enable_egress, egress_setting());
+        let egress_bytes = egress_bytes(capacity as usize, row_bytes, enable_egress, egress_setting(), waves);
         if egress_bytes > 0 {
             transport.enable_egress(egress_bytes, egress_setting() == Egress::Staggered)?;
         }
@@ -1858,9 +1860,31 @@ mod tests {
     #[test]
     fn adopted_transport_preserves_egress_while_new_links_enable_it() {
         for setting in [Egress::Copied, Egress::Parallel, Egress::Staggered] {
-            assert_eq!(egress_bytes(4096, 10240, false, setting), 0);
-            assert_eq!(egress_bytes(4096, 10240, true, setting),
+            assert_eq!(egress_bytes(4096, 10240, false, setting, 1), 0);
+            assert_eq!(egress_bytes(4096, 10240, true, setting, 1),
                 if setting == Egress::Copied { 0 } else { 4096 * 10240 });
+        }
+    }
+
+    #[test]
+    fn overlapping_waves_keep_independent_payloads_until_both_replies_land() {
+        for setting in [Egress::Copied, Egress::Parallel, Egress::Staggered] {
+            for waves in [2, 3] {
+                assert_eq!(egress_bytes(4096, 10240, true, setting, waves), 0);
+                let mut pinned = vec![1u8; 4096];
+                let first: bytes::Bytes = pinned.clone().into();
+                // Each rank retains a clone until its reply, beyond dispatch.
+                let pending_first = first.clone();
+                drop(first);
+                pinned.fill(2);
+                let second: bytes::Bytes = pinned.clone().into();
+                let pending_second = second.clone();
+                drop(second);
+                assert!(pending_first.iter().all(|&byte| byte == 1));
+                assert!(pending_second.iter().all(|&byte| byte == 2));
+                drop(pending_first);
+                assert!(pending_second.iter().all(|&byte| byte == 2));
+            }
         }
     }
 
