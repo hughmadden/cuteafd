@@ -20,6 +20,7 @@ def bind(path):
         "cuteafd_block_dspark_qk_rope": ([P] * 9 + [I] * 4 + [F] * 3 + [P], I),
         "cuteafd_block_dspark_attention_workspace": ([I] * 6, C.c_uint64),
         "cuteafd_block_dspark_attention": ([P] * 10 + [I] * 8 + [F, P], I),
+        "cuteafd_block_dspark_attention_paged": ([P] * 11 + [I] * 9 + [F, P], I),
         "cuteafd_glmf_dspark_attention_workspace": ([I] * 3, C.c_uint64),
         "cuteafd_glmf_dspark_attention": ([P] * 10 + [I] * 7 + [F, P], I),
     }
@@ -118,6 +119,30 @@ def attention_check(lib):
                     geometry = [sequences, block, heads, kvh, capacity, max_keys, int(causal)]
                     assert lib.cuteafd_block_dspark_attention(*pointers, out.data_ptr(), scratch.data_ptr(),
                         *geometry, dim, dim ** -0.5, stream) == 0
+                    # Fragmented pages must preserve the exact arithmetic of the
+                    # slot-local route, including page boundaries and peaked scores.
+                    width = (capacity + 63) // 64
+                    page_ids = torch.randperm(sequences * width, device="cuda", dtype=torch.int32)
+                    page_tables = page_ids.reshape(sequences, width)[slots.long()].contiguous()
+                    kp = torch.zeros(sequences * width, 64, kvh, dim, device="cuda", dtype=torch.bfloat16)
+                    vp = torch.zeros_like(kp)
+                    for slot in range(sequences):
+                        padded_k = torch.nn.functional.pad(kc[slot], (0, 0, 0, 0, 0, width * 64 - capacity))
+                        padded_v = torch.nn.functional.pad(vc[slot], (0, 0, 0, 0, 0, width * 64 - capacity))
+                        kp[page_ids.reshape(sequences, width)[slot].long()] = padded_k.reshape(width, 64, kvh, dim)
+                        vp[page_ids.reshape(sequences, width)[slot].long()] = padded_v.reshape(width, 64, kvh, dim)
+                    for amplitude in (1., 8.):
+                        query = (q.float() * amplitude).bfloat16()
+                        contiguous = torch.empty_like(q)
+                        paged = torch.empty_like(q)
+                        assert lib.cuteafd_block_dspark_attention(query.data_ptr(), *pointers[1:],
+                            contiguous.data_ptr(), scratch.data_ptr(), *geometry, dim, dim ** -0.5, stream) == 0
+                        paged_pointers = [query.data_ptr(), k.data_ptr(), v.data_ptr(), kp.data_ptr(), vp.data_ptr(),
+                                          slots.data_ptr(), lengths.data_ptr(), ends.data_ptr(), page_tables.data_ptr()]
+                        assert lib.cuteafd_block_dspark_attention_paged(*paged_pointers, paged.data_ptr(),
+                            scratch.data_ptr(), *geometry, dim, width, dim ** -0.5, stream) == 0
+                        torch.cuda.synchronize()
+                        assert torch.equal(contiguous, paged), "fragmented pages changed attention bytes"
                     if dim == 64:
                         legacy_size = lib.cuteafd_glmf_dspark_attention_workspace(16, kvh, max_keys)
                         assert size == legacy_size

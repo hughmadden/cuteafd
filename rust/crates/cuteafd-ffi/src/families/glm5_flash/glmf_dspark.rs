@@ -83,6 +83,31 @@ impl NativeLibrary {
             i32::from(causal), i(head_dim)?, scale, stream) }, "block attention")
     }
 
+    /// Paged full-context attention. I32 page tables are [sequences, table_width],
+    /// with 64 rows per page. Ends are relative to each binding's storage origin.
+    ///
+    /// # Safety
+    /// Buffers satisfy [`Self::block_dspark_attention`]; every visible page ID
+    /// addresses a live, initialized segment in both retained K/V planes.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn block_dspark_attention_paged(&self, q: P, k_block: P, v_block: P,
+        k_context: P, v_context: P, slots: P, lengths: P, ends: P, pages: P,
+        out: M, workspace: M, sequences: usize, block: usize, heads: usize,
+        kv_heads: usize, capacity: usize, max_keys: usize, causal: bool,
+        head_dim: usize, table_width: usize, scale: f32, fp8_kv: bool, stream: M) -> Result<()> {
+        type F = unsafe extern "C" fn(P, P, P, P, P, P, P, P, P, M, M,
+            i32, i32, i32, i32, i32, i32, i32, i32, i32, f32, M) -> i32;
+        let symbol: &[u8] = if fp8_kv { b"cuteafd_block_dspark_attention_paged_fp8" }
+            else { b"cuteafd_block_dspark_attention_paged" };
+        // SAFETY: both format-specific symbols have the native signature above.
+        let f = *unsafe { self.lib.get::<F>(symbol) }?;
+        // SAFETY: caller retains all visible pages and workspaces on the owned stream.
+        check(unsafe { f(q, k_block, v_block, k_context, v_context, slots, lengths,
+            ends, pages, out, workspace, i(sequences)?, i(block)?, i(heads)?,
+            i(kv_heads)?, i(capacity)?, i(max_keys)?, i32::from(causal), i(head_dim)?,
+            i(table_width)?, scale, stream) }, "paged block attention")
+    }
+
     /// Per-head (64-wide) RMSNorm + RoPE of `qkv` rows; k/v rows land at
     /// `slots[row]` (row when null, skipped when negative).
     ///

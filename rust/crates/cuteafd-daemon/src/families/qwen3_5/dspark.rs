@@ -8,7 +8,7 @@ use anyhow::{ensure, Context, Result};
 use cuteafd_core::{verify_dspark_greedy_vocab, DraftCandidate, DraftPolicy, LayerResource, PolicyGeometry,
     PolicySeed, ResourceClass};
 use cuteafd_ffi::{programs::Programs, CuteafdDeviceBuffer, NativeLibrary};
-use cuteafd_loader::{families::{glm5::draft_representation::{block_dspark_resident_bytes, GlmDraftRepresentation},
+use cuteafd_loader::{families::{glm5::draft_representation::{block_dspark_paged_resident_bytes, GlmDraftRepresentation},
     qwen3_5::Qwen35Config}, plan::checkpoint::Checkpoint};
 use std::time::{Duration, Instant};
 
@@ -52,8 +52,9 @@ pub(super) fn spec_decode<'a>(args: &GoldenArgs, library: &'a NativeLibrary, pro
     let config = serde_json::from_slice(&std::fs::read(snapshot.join("config.json"))?)?;
     // Full checkpoint context is charged before target pool selection; no
     // diagnostic-sized truncation is allowed to masquerade as serving admission.
-    let (owned, scratch) = block_dspark_resident_bytes(&config, 1, 1, library.sm_count()? as u64,
-        GlmDraftRepresentation::Bf16Only, Fp8Rows::W8a16.code() as u8, cfg.max_context, cuteafd_loader::families::qwen4::Qwen4KvCache::Bf16)?;
+    let (owned, scratch) = block_dspark_paged_resident_bytes(&config, 1, 1, library.sm_count()? as u64,
+        GlmDraftRepresentation::Bf16Only, Fp8Rows::W8a16.code() as u8, cfg.max_context,
+        cfg.max_context, cuteafd_loader::families::qwen4::Qwen4KvCache::Bf16)?;
     let mut engine = DenseEngine::with_prefix(library, programs, checkpoint, cfg.clone(), args.pool_tokens,
         Some(DrafterBytes { owned, scratch }), 1, None, args.kv_cache, false)?;
     ensure!(required <= engine.pool_tokens, "spec decode exceeds admitted target pool");

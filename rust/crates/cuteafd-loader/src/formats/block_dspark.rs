@@ -187,6 +187,31 @@ struct Layers {
 }
 
 impl BlockDsparkConfig {
+    /// Full layers share the target token budget; windowed layers keep their
+    /// original slot-local rings. Both use the shared draft cache inventory.
+    pub fn paged_cache_layout(&self, slots: usize, context: usize, target_tokens: usize,
+        kv: crate::families::qwen4::Qwen4KvCache) -> Result<super::dflash::DraftCacheLayout, DsparkConfigError> {
+        let invalid = || DsparkConfigError::Unsupported("invalid dSpark paged cache admission".into());
+        if slots == 0 || context == 0 || target_tokens == 0
+            || context.checked_add(self.block).is_none_or(|n| n > i32::MAX as usize)
+            || self.window.is_some_and(|window| window != context) { return Err(invalid()); }
+        let pages = target_tokens.div_ceil(64);
+        let rows = pages.checked_mul(64).ok_or_else(invalid)?;
+        if rows > i32::MAX as usize { return Err(invalid()); }
+        let plane = kv.plane_record_bytes(self.kv_heads, self.head_dim);
+        let record_bytes = plane.checked_mul(2).ok_or_else(invalid)?;
+        let full = self.window.is_none();
+        let cache_rows = if full { rows } else { slots.checked_mul(context).ok_or_else(invalid)? };
+        let layer_bytes = cache_rows.checked_mul(record_bytes).ok_or_else(invalid)?;
+        let total = layer_bytes.checked_mul(self.layers).ok_or_else(invalid)? as u64;
+        let page_table_bytes = if full { slots.checked_mul(context.div_ceil(64))
+            .and_then(|n| n.checked_mul(4)).ok_or_else(invalid)? as u64 } else { 0 };
+        Ok(super::dflash::DraftCacheLayout { target_tokens, page_rows: 64, pages, record_bytes,
+            full_layers: if full { self.layers } else { 0 },
+            window_bytes: if full { 0 } else { total }, full_bytes: if full { total } else { 0 },
+            page_table_bytes, layer_bytes: vec![layer_bytes; self.layers] })
+    }
+
     pub fn read(snapshot: &Path) -> Result<Self, DsparkConfigError> {
         Self::from_json(&serde_json::from_slice(&std::fs::read(
             snapshot.join("config.json"),
@@ -536,6 +561,22 @@ mod tests {
         .unwrap();
         assert_eq!(plan.attention_factor, 1.0);
         assert_eq!(plan.inv_freq[0], 1.0);
+    }
+
+    #[test]
+    fn shared_paged_inventory_is_token_budget_not_slot_context_product() {
+        use crate::families::qwen4::Qwen4KvCache;
+        let cfg = BlockDsparkConfig::from_json(&qwen()).unwrap();
+        for kv in [Qwen4KvCache::Bf16, Qwen4KvCache::Fp8] {
+            let one = cfg.paged_cache_layout(1, 262144, 8193, kv).unwrap();
+            let many = cfg.paged_cache_layout(16, 262144, 8193, kv).unwrap();
+            assert_eq!(one.full_bytes, many.full_bytes);
+            assert_eq!(one.pages, 129);
+            assert_eq!(one.full_bytes, (129 * 64 * 2 * kv.plane_record_bytes(8, 128) * 5) as u64);
+            assert_eq!(many.page_table_bytes, 16 * 4096 * 4);
+            assert_eq!(many.window_bytes, 0);
+            assert!(cfg.paged_cache_layout(16, 262144, 0, kv).is_err());
+        }
     }
 
     #[test]
