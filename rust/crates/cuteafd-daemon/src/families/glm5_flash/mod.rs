@@ -11,7 +11,7 @@ pub(crate) mod serve;
 mod media;
 mod speculate;
 mod expert_rows;
-mod lane_check;
+mod unit_check;
 mod packed_check;
 pub(crate) mod packing;
 mod header;
@@ -1122,11 +1122,10 @@ pub(crate) struct GoldenArgs {
     /// candidates).
     #[arg(long, hide = true, requires = "resume_at")]
     pub resume_poison_unit0: bool,
-    /// Prefill lanes against serial passes: one pipelined chunk of the golden prompt (--prefill N
-    /// truncates it) through the lanes, and through serial passes over the same cuts; every row's
-    /// logits, the KDA state and every paged byte must be identical. Local or Spark experts.
+    /// Compare executor N=1 and N=2 at identical row cuts, including recycled slots:
+    /// every row's logits, KDA state and paged bytes must be identical.
     #[arg(long)]
-    pub lane_check: bool,
+    pub unit_check: bool,
     /// Packed prefill against each sequence's own pass: N (2 to 10) sequences of mixed lengths cut
     /// from the golden prompt (the last resumed past the dense context) in one packed pass and
     /// each in its own pass; every sequence's last-row logits, KDA state and paged bytes must be
@@ -2249,7 +2248,7 @@ pub(crate) async fn run_golden(mut args: GoldenArgs) -> Result<()> {
         // Capture speculative buckets even when this fixed-token diagnostic has no drafter.
         args.engine.serving_graph_policy = Some((16, true));
     }
-    args.engine.full_prefill_logits |= args.nll || args.resume_at.is_some() || args.lane_check;
+    args.engine.full_prefill_logits |= args.nll || args.resume_at.is_some() || args.unit_check;
     // --resume-at captures into two arena marks (`prefix::resume_check`); pool marks take units.
     args.engine.mark_arena = if args.resume_at.is_some() && args.engine.prefix_marks == prefix::PrefixMarks::Arena {
         prefix::ArenaMarks::Slots(2) } else { prefix::ArenaMarks::None };
@@ -2343,12 +2342,12 @@ fn golden_run(args: &GoldenArgs, opened: &Opened, engine: &engine::GlmfEngine<'_
         return speculate::bench_verify(args, engine, rows);
     }
     if args.upload_check {
-        let tokens = lane_check::input_tokens(&args.golden, engine.cfg.vocab_size)?;
+        let tokens = unit_check::input_tokens(&args.golden, engine.cfg.vocab_size)?;
         let n = args.prefill.unwrap_or(tokens.len()).min(tokens.len());
         return prefix::upload_check(engine, &tokens[..n], args.prefill_chunk.unwrap_or(256));
     }
     if let Some(at) = args.resume_at {
-        let tokens = lane_check::input_tokens(&args.golden, engine.cfg.vocab_size)?;
+        let tokens = unit_check::input_tokens(&args.golden, engine.cfg.vocab_size)?;
         let n = args.prefill.unwrap_or(tokens.len()).min(tokens.len());
         return prefix::resume_check(engine, &tokens, at, n,
             args.prefill_chunk.unwrap_or(engine.prefill_rows), args.resume_decode, args.resume_cold,
@@ -2357,13 +2356,13 @@ fn golden_run(args: &GoldenArgs, opened: &Opened, engine: &engine::GlmfEngine<'_
     if let Some(steps) = args.token_check {
         return token_check(args, opened, engine, steps);
     }
-    if args.lane_check {
-        let tokens = lane_check::input_tokens(&args.golden, engine.cfg.vocab_size)?;
+    if args.unit_check {
+        let tokens = unit_check::input_tokens(&args.golden, engine.cfg.vocab_size)?;
         let n = args.prefill.unwrap_or(tokens.len()).min(tokens.len());
-        return lane_check::lane_check(engine, &tokens[..n]);
+        return unit_check::unit_check(engine, &tokens[..n]);
     }
     if let Some(sequences) = args.packed_check {
-        let tokens = lane_check::input_tokens(&args.golden, engine.cfg.vocab_size)?;
+        let tokens = unit_check::input_tokens(&args.golden, engine.cfg.vocab_size)?;
         return packed_check::packed_check(engine, &tokens, sequences);
     }
     if engine.drafter.is_some() {
@@ -2412,7 +2411,7 @@ fn golden_run(args: &GoldenArgs, opened: &Opened, engine: &engine::GlmfEngine<'_
     let mut logits: Option<Vec<f32>> = None;
     let mut done = 0;
     // --logits-only prefills without layer downloads (Spark prefill then runs
-    // pipelined in lanes, chunks up to the engine's prefill capacity).
+    // through continuous units, chunks up to the engine's prefill capacity).
     let chunk_rows = if args.logits_only && !args.teacher_force { engine.prefill_capacity() } else { engine.prefill_rows };
     while done < prefill {
         let n = chunk_rows.min(prefill - done);

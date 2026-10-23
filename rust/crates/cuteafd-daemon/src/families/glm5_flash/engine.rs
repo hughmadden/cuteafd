@@ -2149,7 +2149,7 @@ impl<'a> GlmfEngine<'a> {
         let tokens: Vec<u32> = (0..rows).map(|i| (i % self.cfg.vocab_size) as u32).collect();
         *tp2.schedule.borrow_mut() = Some(Default::default());
         tp2.checking.set(true);
-        self.prefill_serial(&mut placement, &tokens, false)?;
+        self.prefill_units_with(&mut placement, &tokens, false, false, None, 1, None, None)?;
         *tp2.schedule.borrow_mut() = Some(Default::default());
         tp2.checking.set(true);
         self.decode_step(&mut [(&mut placement, 1)], &[1], None, false, None, None, true)?;
@@ -3365,9 +3365,11 @@ impl<'a> GlmfEngine<'a> {
         self.prefill_units_with(placement, tokens, all_logits, device, media, waves, on_layer, forced)
     }
 
-    pub(crate) fn prefill_serial(&self, placement: &mut GlmfPlacement, tokens: &[u32], all_logits: bool)
+    /// Compare executor widths without changing row cuts or numerical kernels.
+    pub(crate) fn prefill_unit_width(&self, placement: &mut GlmfPlacement, tokens: &[u32], waves: usize)
         -> Result<Option<Vec<f32>>> {
-        self.prefill_units_with(placement, tokens, all_logits, false, None, 1, None, None)?
+        ensure!(waves > 0 && waves <= self.prefill_waves, "unit width exceeds admitted slots");
+        self.prefill_units_with(placement, tokens, true, false, None, waves, None, None)?
             .map(|logits| logits.into_host(self.library)).transpose()
     }
 

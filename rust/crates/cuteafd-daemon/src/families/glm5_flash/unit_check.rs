@@ -1,9 +1,4 @@
-//! glmf-golden --lane-check: N prefill lanes give the bits of N passes. One chunk prefills through
-//! the pipelined lanes into sequence A and, over the same cuts, through serial passes into
-//! sequence B; every row's logits, the KDA state (with everything `slot_state` carries, the compact
-//! index cache's tails included) and every paged byte of both sequences' units must agree bit for
-//! bit. Both sequences take fresh units of a fresh engine, which the caches zero, so whole units
-//! compare exactly whatever their layout (with or without the per-token index keys).
+//! Same-cut executor N=1/N=2 golden and shared token/cache diagnostics.
 use super::engine::{Allocator, GlmfEngine, GlmfPlacement};
 use anyhow::{ensure, Context, Result};
 
@@ -57,40 +52,33 @@ pub(crate) fn unit_bytes(engine: &GlmfEngine<'_>, placement: &GlmfPlacement) -> 
     Ok(out)
 }
 
-/// Prefills `tokens` (up to one pipelined chunk) both ways and compares them.
-pub(crate) fn lane_check(engine: &GlmfEngine<'_>, tokens: &[u32]) -> Result<()> {
-    ensure!(engine.weights.layers.len() == engine.cfg.layers, "--lane-check needs every layer");
-    ensure!(engine.full_prefill_logits, "--lane-check needs every prefill row's logits");
+/// Compare two shared-executor schedules with identical cuts, weights and fresh pages.
+pub(crate) fn unit_check(engine: &GlmfEngine<'_>, tokens: &[u32]) -> Result<()> {
+    ensure!(engine.weights.layers.len() == engine.cfg.layers, "--unit-check needs every layer");
+    ensure!(engine.full_prefill_logits, "--unit-check needs every prefill row's logits");
+    ensure!(engine.prefill_waves >= 2, "--unit-check needs at least two admitted slots");
     let n = tokens.len().min(engine.prefill_capacity());
     let cuts = engine.prefill_cuts(n)?;
-    ensure!(engine.prefill_capacity() > engine.prefill_rows || engine.prefill_waves == 1,
-        "--lane-check needs admitted pipelined prefill lanes (every layer)");
+    ensure!(cuts.len() > 2, "--unit-check needs more than two units to exercise slot reuse");
     let mut allocator = Allocator::for_engine(engine);
-    let (mut lanes, mut serial) = (allocator.admit(n)?, allocator.admit(n)?);
+    let (mut one, mut two) = (allocator.admit(n)?, allocator.admit(n)?);
     let started = std::time::Instant::now();
-    let lane_logits = engine.prefill_forced(&mut lanes, &tokens[..n], None, None, true)?
-        .context("--lane-check needs the head")?;
-    let lane_seconds = started.elapsed().as_secs_f64();
+    let one_logits = engine.prefill_unit_width(&mut one, &tokens[..n], 1)?.context("unit golden needs the head")?;
+    let one_seconds = started.elapsed().as_secs_f64();
     let started = std::time::Instant::now();
-    let mut serial_logits = Vec::with_capacity(lane_logits.len());
-    let mut first = 0;
-    for &rows in &cuts {
-        serial_logits.extend(engine.prefill_serial(&mut serial, &tokens[first..first + rows], true)?
-            .context("--lane-check needs the head")?);
-        first += rows;
-    }
-    let serial_seconds = started.elapsed().as_secs_f64();
-    let logits = lane_logits.len() == serial_logits.len()
-        && lane_logits.iter().zip(&serial_logits).all(|(a, b)| a.to_bits() == b.to_bits());
-    let state = engine.slot_state(lanes.slot)? == engine.slot_state(serial.slot)?;
-    let paged = unit_bytes(engine, &lanes)? == unit_bytes(engine, &serial)?;
+    let two_logits = engine.prefill_unit_width(&mut two, &tokens[..n], 2)?.context("unit golden needs the head")?;
+    let two_seconds = started.elapsed().as_secs_f64();
+    let logits = one_logits.len() == two_logits.len()
+        && one_logits.iter().zip(&two_logits).all(|(a, b)| a.to_bits() == b.to_bits());
+    let state = engine.slot_state(one.slot)? == engine.slot_state(two.slot)?;
+    let paged = unit_bytes(engine, &one)? == unit_bytes(engine, &two)?;
     let verdict = |same: bool| if same { "identical" } else { "DIFFER" };
-    println!("lane check: {n} tokens in {} lanes of up to {} rows (cuts {cuts:?}): logits {}, KDA state {}, paged \
-        units {} (lanes {:.0} ms, serial passes {:.0} ms)", engine.prefill_waves, engine.prefill_rows,
-        verdict(logits), verdict(state), verdict(paged), 1e3 * lane_seconds, 1e3 * serial_seconds);
-    allocator.release(serial);
-    allocator.release(lanes);
-    ensure!(logits && state && paged, "the lanes differ from serial passes over the same cuts");
+    println!("unit check: {n} tokens (same cuts {cuts:?}): logits {}, KDA state {}, paged units {} \
+        (N1 {:.0} ms, N2 {:.0} ms)", verdict(logits), verdict(state), verdict(paged),
+        1e3 * one_seconds, 1e3 * two_seconds);
+    allocator.release(two);
+    allocator.release(one);
+    ensure!(logits && state && paged, "executor N1 and N2 differ over the same cuts");
     Ok(())
 }
 
