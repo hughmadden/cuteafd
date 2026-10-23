@@ -388,7 +388,7 @@ EOF
 # Each shared-executor port opts in here after its serve CLI accepts the shape.
 family_prefill_mode() {
   case "$1" in
-    step5|kimi_k3|qwen4) echo units ;;
+    step5|kimi_k3|qwen4|deepseek_v4) echo units ;;
     glm5) echo units-span ;;
     *) echo legacy ;;
   esac
@@ -2704,7 +2704,7 @@ audio_encoder_hash=""
   fi
   if [[ "$family" == deepseek_v4 ]]; then
     [[ -z "$(get PREFILL_ROWS)" ]] || plan_draft_args+=(--prefill-rows "$(get PREFILL_ROWS)")
-    [[ -z "$(get PREFILL_WAVES)" ]] || plan_draft_args+=(--prefill-lanes "$(get PREFILL_WAVES)")
+    [[ -z "$(get PREFILL_WAVES)" ]] || plan_draft_args+=(--prefill-waves "$(get PREFILL_WAVES)")
   fi
   if [[ "$family" == step5 ]]; then
     [[ -z "$(get PREFILL_WAVES)" ]] || plan_draft_args+=(--prefill-waves "$(get PREFILL_WAVES)")
@@ -2757,10 +2757,6 @@ audio_encoder_hash=""
   esac
   if [[ "$(family_prefill_mode "$family")" == units-span ]]; then
     family_args+=(--prefill-span-rows "$PREFILL_SPAN_ROWS")
-  fi
-  if [[ "$family" == deepseek_v4 ]]; then
-    family_args+=(--prefill-rows "$(get PREFILL_ROWS "$(jq -er '.prefill_rows' <<<"$deployment_json")")")
-    family_args+=(--prefill-waves "$(get PREFILL_WAVES "$(jq -er '.report.prefill_lanes // 2' <<<"$deployment_json")")")
   fi
   [[ -n "$budget" ]] || budget="$(jq -er '.spark_budget_bytes | select(type == "number" and . > 0)' <<<"$plan_json")" ||
     release_die "the deployment plan names no Spark budget"

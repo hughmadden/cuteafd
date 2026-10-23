@@ -1655,6 +1655,8 @@ fn v4_plan_shared_span_is_independent_of_unit_rows_and_waves() {
                     prefill_span_rows: span, pool_tokens: Some(32768), ..Default::default()
                 }), ..sparks(4) }).unwrap();
                 assert_eq!(report.prefill_span_rows, Some(span.unwrap_or(16384)));
+                assert_eq!(report.prefill_unit_rows, Some(unit));
+                assert_eq!(report.prefill_waves, Some(waves));
                 report
             }).collect();
             let device_items = |report: &PlanReport| report.memory_layout.as_ref().unwrap().devices.iter()
@@ -1663,6 +1665,21 @@ fn v4_plan_shared_span_is_independent_of_unit_rows_and_waves() {
             assert_eq!(device_items(&reports[0]), device_items(&reports[1]));
             assert_eq!(device_items(&reports[0]), device_items(&reports[2]));
         }
+    }
+}
+
+#[test]
+fn v4_plan_resolves_serving_wave_default_and_explicit_requests() {
+    let dir = v4_snapshot();
+    for (requested, expected) in [(0, 2), (1, 1), (2, 2), (3, 3)] {
+        let report = plan(dir.path(), &PlanOptions { layout: Some(layout::LayoutOptions {
+            host_memory: Some((128 << 30, 128 << 30)), host_cache_bytes: Some(0),
+            prefill_lanes: requested, prefill_waves: requested.max(1),
+            pool_tokens: Some(32768), ..Default::default()
+        }), ..sparks(4) }).unwrap();
+        assert_eq!(report.prefill_unit_rows, Some(4096));
+        assert_eq!(report.prefill_waves, Some(expected));
+        assert_eq!(report.prefill_span_rows, Some(16384));
     }
 }
 

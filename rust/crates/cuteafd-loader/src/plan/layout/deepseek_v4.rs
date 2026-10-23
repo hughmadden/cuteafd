@@ -30,6 +30,10 @@ use crate::plan::Checkpoint;
 pub(crate) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyModel,
     input: &super::super::PlanInput, options: &mut LayoutOptions) -> MemoryLayout {
     let checkpoint = input.checkpoint();
+    // Explicit requests win; otherwise admit the serving default of two units.
+    options.prefill_waves = if options.prefill_lanes > 0 { options.prefill_lanes }
+        else if options.prefill_unit_rows.is_none() && options.prefill_waves == 1 { 2 }
+        else { options.prefill_waves };
     let mut shape = Shape::resolve(report, model, options,
         ShapePolicy { all_native_stages: true, ..ShapePolicy::manifest_bounded() });
     shape.prefill_rows = options.prefill_unit_rows.unwrap_or(shape.prefill_rows);
