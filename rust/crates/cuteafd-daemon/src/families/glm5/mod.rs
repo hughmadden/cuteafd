@@ -12,7 +12,7 @@ use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::NativeLibrary;
 use cuteafd_loader::families::glm5::GlmDsaConfig;
 use crate::shared::spark_intake::SparkLink;
-use std::ffi::c_void;
+
 use std::path::PathBuf;
 use std::time::Instant;
 
