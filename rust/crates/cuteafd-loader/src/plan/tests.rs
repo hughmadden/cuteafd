@@ -711,6 +711,10 @@ fn glm5_layout_matches_runtime_request_from_header_baseline() {
             let report = plan(dir.path(), &PlanOptions { layout: Some(options.clone()),
                 attention_placement: Some(crate::placement::AttentionPlacement::Heads), ..Default::default() }).unwrap();
             assert!(report.executable(), "{}", render(&report));
+            // The planner publishes the units serving runs: rows each, waves in
+            // flight (one without Sparks), and the default continuous span.
+            assert_eq!((report.prefill_unit_rows, report.prefill_waves, report.prefill_span_rows),
+                (Some(4096), Some(if report.spark_ranks == 0 { 1 } else { 3 }), Some(16384)));
             let memory = report.memory_layout.unwrap();
             let gpus = memory.devices.iter().filter(|d| d.kind == cuteafd_core::memory_layout::DeviceKind::Rtx)
                 .map(|d| (d.capacity_bytes, Baseline::Measured { free_bytes: d.capacity_bytes - d.items.iter()
@@ -746,6 +750,24 @@ fn glm5_layout_matches_runtime_request_from_header_baseline() {
             }
         }
     }
+}
+
+#[test]
+fn glm5_layout_publishes_an_explicit_span_without_charging_it() {
+    let dir = snapshot(glm5_config(), &glm5_tensors(|name, n, k| fp8(name, n, k, None)));
+    let plan_with = |span| {
+        let options = layout::LayoutOptions { rtx_bytes: vec![96 << 30], context_tokens: 65536,
+            prefill_rows: 4096, prefill_lanes: 2, prefill_span_rows: span, glm5_drafter_disabled: true,
+            ..Default::default() };
+        plan(dir.path(), &PlanOptions { layout: Some(options),
+            attention_placement: Some(crate::placement::AttentionPlacement::Heads), ..sparks(4) }).unwrap()
+    };
+    let (default, explicit) = (plan_with(None), plan_with(Some(8192)));
+    assert_eq!(default.prefill_span_rows, Some(16384));
+    assert_eq!((explicit.prefill_unit_rows, explicit.prefill_waves, explicit.prefill_span_rows),
+        (Some(4096), Some(2), Some(8192)));
+    assert_eq!(default.memory_layout.unwrap().pool_tokens, explicit.memory_layout.unwrap().pool_tokens,
+        "workspaces are per unit slot; the span charges nothing");
 }
 
 #[test]

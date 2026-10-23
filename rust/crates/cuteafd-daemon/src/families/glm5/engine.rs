@@ -2346,7 +2346,7 @@ where B: Fn(usize) -> Result<()>,
 }
 
 /// Default rows per continuous prefill span (shared PREFILL_SPAN_ROWS key).
-pub(crate) const DEFAULT_PREFILL_SPAN_ROWS: usize = 16384;
+pub(crate) const DEFAULT_PREFILL_SPAN_ROWS: usize = cuteafd_loader::plan::layout::GLM_DEFAULT_PREFILL_SPAN_ROWS as usize;
 
 
 /// The expert request of `t` staged rows: expert ids (U32) and gate

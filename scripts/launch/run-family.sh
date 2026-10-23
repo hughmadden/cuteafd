@@ -385,6 +385,7 @@ EOF
 family_prefill_mode() {
   case "$1" in
     step5|kimi_k3) echo units ;;
+    glm5) echo units-span ;;
     *) echo legacy ;;
   esac
 }
@@ -2060,14 +2061,6 @@ fi
 # pool admitted only seven 4096-output requests, below the default eight
 # serving lanes; DeepSeek V4's former engine default was 262144 tokens (v2.0.0
 # cards: 650K-1.3M tokens with auto).
-if [[ $family == glm5 && -n "$(get PREFILL_ROWS)" ]]; then
-  family_args+=(--prefill-rows "$(get PREFILL_ROWS)")
-fi
-# PREFILL_SPAN_ROWS: rows per continuous prefill span (shared prefill key).
-if [[ $family == glm5 && -n "$(get PREFILL_SPAN_ROWS)" ]]; then
-  [[ "$(get PREFILL_SPAN_ROWS)" =~ ^[1-9][0-9]*$ ]] || release_die "PREFILL_SPAN_ROWS must be a positive row count"
-  family_args+=(--prefill-span-rows "$(get PREFILL_SPAN_ROWS)")
-fi
 if [[ $family =~ ^(glm5|qwen4|qwen3_5|deepseek_v4)$ ]]; then
   pool="$(get POOL_TOKENS auto)"
   if [[ "$pool" == auto ]]; then
@@ -2562,15 +2555,8 @@ lane_env_args=()
 case "$family" in
   deepseek_v4) ;;
   glm5)
-    # PREFILL_WAVES: shared prefill units in flight (default 2; one with no
-    # Sparks). The planner and serve-glm both take it as a flag.
-    selected_lanes="$(get PREFILL_WAVES 2)"
-    [[ "$selected_lanes" =~ ^[1-4]$ ]] || { echo "PREFILL_WAVES must be 1 to 4" >&2; exit 2; }
-    if [[ "$ranks" == 0 ]]; then
-      selected_lanes=1
-    fi
-    glm_prefill_waves="$selected_lanes"
-    family_args+=(--prefill-waves "$selected_lanes") ;;
+    # Prefill units, waves and span come from the deployment plan (units-span).
+    ;;
   glm5_flash)
     # Planner and server must offer the same conditional drafter homes.
     # Explicit config overrides the legacy process-wide diagnostic switch.
@@ -2622,7 +2608,6 @@ audio_encoder_hash=""
     plan_gib="$(python3 -c 'import sys;f,t,b=map(float,sys.argv[1:]);print(max(0,b-(t-f)/1024))' "$free_mib" "$total_mib" "$profile_gib")"
   fi
   plan_draft_args=(--concurrency "$effective_concurrency" --mapped-scale-preload-gib "$(get MAPPED_SCALE_PRELOAD_GIB 0)")
-  [[ -z "${glm_prefill_waves:-}" ]] || plan_draft_args+=(--prefill-lanes "$glm_prefill_waves")
   if [[ "$family:$speculator" == qwen3_5:dspark ]]; then
     plan_draft_args+=(--drafter-snapshot "$draft_snapshot")
   fi
@@ -2698,6 +2683,11 @@ audio_encoder_hash=""
   fi
   if [[ "$family" == glm5 || "$family" == glm5_flash || "$family" == mimo_v2 ]]; then
     plan_draft_args+=(--draft-kv-cache "$draft_kv_cache")
+  fi
+  if [[ "$family" == glm5 ]]; then
+    [[ -z "$(get PREFILL_ROWS)" ]] || plan_draft_args+=(--prefill-rows "$(get PREFILL_ROWS)")
+    [[ -z "$(get PREFILL_WAVES)" ]] || plan_draft_args+=(--prefill-waves "$(get PREFILL_WAVES)")
+    [[ -z "$(get PREFILL_SPAN_ROWS)" ]] || plan_draft_args+=(--prefill-span-rows "$(get PREFILL_SPAN_ROWS)")
   fi
   if [[ "$family" == qwen4 ]]; then
     plan_draft_args+=(--kv-cache "$kv_cache")

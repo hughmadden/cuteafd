@@ -118,8 +118,7 @@ def test_exlr8_forwards_native_selection_without_dense_worker_flags(manifest: st
     assert plan[plan.index("--exlr8-manifest") + 1] == manifest
     dense = plan[plan.index("--exlr8-dense-from") + 1]
     assert dense.startswith("<root>/hf/hub/models--deepseek-ai--DeepSeek-V4.1-Flash/snapshots/")
-    assert plan[plan.index("--prefill-lanes") + 1] == "2"
-    assert "CUTEAFD_GLM_PREFILL_LANES=2" not in plan
+    assert "--prefill-lanes" not in plan and "CUTEAFD_GLM_PREFILL_LANES=2" not in plan
     assert len(result["containers"]) == 5
     for run in result["containers"]:
         parsed = parse_run(run["argv"])
@@ -138,7 +137,7 @@ def test_exlr8_forwards_native_selection_without_dense_worker_flags(manifest: st
 def test_exlr8_launcher_preserves_explicit_prefill_waves(waves: str) -> None:
     result = capture(ROOT, f"exlr8-waves-{waves}", release_entry=exlr8_entry(PREFILL_WAVES=waves))
     plan = result["plans"][0]
-    assert plan[plan.index("--prefill-lanes") + 1] == waves
+    assert plan[plan.index("--prefill-waves") + 1] == waves
     coordinator = parse_run(result["containers"][0]["argv"])
     assert coordinator["command"][coordinator["command"].index("--prefill-waves") + 1] == waves
     assert "CUTEAFD_GLM_PREFILL_LANES" not in coordinator["env"]

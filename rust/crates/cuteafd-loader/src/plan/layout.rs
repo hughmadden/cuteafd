@@ -55,6 +55,8 @@ pub struct LayoutOptions {
     pub prefill_lanes: u64,
     /// Family-resolved rows per wave, independent of the admitted span.
     pub prefill_unit_rows: Option<u64>,
+    /// Requested rows per continuous prefill call (units-span families).
+    pub prefill_span_rows: Option<u64>,
     /// Continuous row-unit waves on one transport.
     pub prefill_waves: u64,
     /// Rows of a GLM 5.3 Flash decode or verify step (`--decode-rows`): 64, or 128 with the wide
@@ -191,6 +193,7 @@ impl Default for LayoutOptions {
             full_prefill_logits: false,
             prefill_lanes: 0,
             prefill_unit_rows: None,
+            prefill_span_rows: None,
             prefill_waves: 1,
             glmf_decode_rows: crate::serving_capacity::GLMF_DECODE_ROWS,
             glmf_representation: Default::default(),
@@ -256,6 +259,8 @@ impl Default for LayoutOptions {
 /// GLM prefill units in flight: the default (None) or a parsed value, clamped
 /// to 1..=4. Default: 2 units of 4096 rows (PLAN "Prefill contract"); serve-glm
 /// takes `--prefill-waves`, the planner `--prefill-lanes`.
+pub const GLM_DEFAULT_PREFILL_SPAN_ROWS: u64 = 16384;
+
 pub fn glm_prefill_lanes(value: Option<&str>) -> usize {
     value.and_then(|v| v.parse().ok()).unwrap_or(2).clamp(1, 4)
 }
