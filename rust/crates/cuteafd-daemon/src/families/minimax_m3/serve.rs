@@ -81,7 +81,6 @@ impl ServeArgs {
         if matches!(std::env::var("CUTEAFD_SPARK_WRITE").as_deref(), Ok("1" | "on")) {
             return Err(MiniMaxError::Unsupported("Spark write mode has no MiniMax allocation ledger").into());
         }
-        if self.token_io.embed_placement != EmbedPlacement::Gpu { return Err(MiniMaxError::Unsupported("host token embeddings").into()); }
         if self.max_sequences as u32 > self.prefill_rows || self.max_context > 1_048_576 {
             return Err(MiniMaxError::Invalid("request context or row capacity").into());
         }
@@ -145,7 +144,8 @@ fn worker(args: &ServeArgs, receive: &mut tokio::sync::mpsc::Receiver<cuteafd_ap
         let free = available()?;
         let text = admission::solve(&checkpoint, &manifest, local_package.as_ref(), admission::Request {
             sizing, available: free, requested_pool: None, kv_format: args.kv_cache, onboard,
-            spark_budget: args.spark_budget_bytes, headroom: 2 << 30, draft_bytes })?;
+            spark_budget: args.spark_budget_bytes, headroom: 2 << 30, draft_bytes,
+            host_embedding: args.token_io.embed_placement == EmbedPlacement::Host })?;
         let vision_bytes = ReadyVision::local_bytes(&args.snapshot, &args.native_lib)?;
         let cache_target = args.pool_tokens.filter(|n| *n > 0).unwrap_or(262_144)
             .checked_mul(text.cache.cache.token_bytes(0)).context("MiniMax vision cache target overflow")?;
@@ -163,7 +163,8 @@ fn worker(args: &ServeArgs, receive: &mut tokio::sync::mpsc::Receiver<cuteafd_ap
         let remote_reserve = vision.as_ref().map_or(0, |v| v.spark_reserve_bytes);
         admission::solve(&checkpoint, &manifest, local_package.as_ref(), admission::Request {
             sizing, available, requested_pool: args.pool_tokens, kv_format: args.kv_cache, onboard,
-            spark_budget: args.spark_budget_bytes.saturating_sub(remote_reserve), headroom: 2 << 30, draft_bytes })?
+            spark_budget: args.spark_budget_bytes.saturating_sub(remote_reserve), headroom: 2 << 30, draft_bytes,
+            host_embedding: args.token_io.embed_placement == EmbedPlacement::Host })?
     };
     let mut catalog = cuteafd_loader::read_expert_catalog(&args.snapshot)?;
     catalog.select_draft(cuteafd_loader::plan::spec::DraftOwnership::None)?;
@@ -182,7 +183,7 @@ fn worker(args: &ServeArgs, receive: &mut tokio::sync::mpsc::Receiver<cuteafd_ap
         .context("MiniMax embedding header missing")?;
     let source = EmbedSource::new(&args.snapshot, &tensor.shard, &tensor.meta, cfg.hidden)?;
     let (embedding, (execution, local)) = crate::shared::placement::load_while_admitting(Some(pending), || {
-        TokenEmbedding::load(&library, source, EmbedPlacement::Gpu, || {
+        TokenEmbedding::load(&library, source, args.token_io.embed_placement, || {
             let mut execution = Execution::load(device, &programs, &checkpoint, &cfg, &admitted.ledger)?;
             if let (Some(contract),Some(layout))=(&draft_contract,draft_layout) {execution.load_draft(contract,layout)?;}
             let local = if admitted.local_layers.is_empty() {None} else {
@@ -289,6 +290,7 @@ mod tests {
         let mut a=args(); a.speculator="mtp".into(); assert!(a.validate().is_err());
         assert_eq!(args().speculator,"dspark");
         let mut a=args(); a.speculator="off".into(); assert!(a.validate().is_ok());
+        let mut a=args(); a.token_io.embed_placement=EmbedPlacement::Host; assert!(a.validate().is_ok());
         let mut a=args(); a.rtx_expert_layers="58".into(); assert!(a.validate().is_err());
         let mut a=args(); a.rtx_expert_layers="3".into(); assert_eq!(a.validate().unwrap(),Some(3));
     }

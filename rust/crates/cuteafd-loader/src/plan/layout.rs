@@ -149,6 +149,10 @@ pub struct LayoutOptions {
     pub step5_kv: crate::families::qwen4::Qwen4KvCache,
     /// MiniMax M3 paged K/V storage (`--kv-cache`).
     pub minimax_kv: crate::families::qwen4::Qwen4KvCache,
+    /// Planning-only NVFP4 cache and selected-block backing options.
+    pub minimax_cache: super::families::minimax::capacity::CachePlan,
+    /// Opt-in C1 profile: 256 prefill rows and one sequence, preserving DSpark.
+    pub minimax_5090: bool,
     /// Selected Qwen projection/head residency, matching serve-qwen4.
     pub qwen_representation: crate::families::qwen4::resident::Qwen4Representation,
     /// Qwen immutable attention scratch override.
@@ -233,6 +237,8 @@ impl Default for LayoutOptions {
             qwen_kv: Default::default(),
             step5_kv: crate::families::qwen4::Qwen4KvCache::Fp8,
             minimax_kv: crate::families::qwen4::Qwen4KvCache::Fp8,
+            minimax_cache: Default::default(),
+            minimax_5090: false,
             qwen_representation: crate::families::qwen4::resident::Qwen4Representation {
                 fp8_projections: false, fp8_head: true },
             qwen_attention_plan_rows: None,
@@ -1261,6 +1267,9 @@ pub(crate) fn charge_host(report: &mut PlanReport, options: &LayoutOptions, chec
         let bytes = report.components.iter().filter(|c| c.component == Component::Embedding)
             .try_fold(0u64, |n, c| n.checked_add(c.bytes)).context("host embedding overflow")?;
         push(Category::Embedding, "embedding", "checkpoint", bytes, Basis::Exact);
+    }
+    if let Some(&bytes) = report.bytes_by_owner.get("proposed host KV backing") {
+        push(Category::Kv, "proposed pinned K/V backing (NOT IMPLEMENTED)", "payload", bytes, Basis::Estimated);
     }
     push(Category::Tables, "mapped-scales/preloaded", "checkpoint", report.mapped_placement.preloaded_bytes, Basis::Exact);
     let media_cache_loaded = (matches!(family, "mimo_v2" | "qwen4" | "glm5_flash")

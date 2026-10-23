@@ -153,6 +153,16 @@ impl RankWeightLayout {
         Ok(Self { rank, ranks, operands, resident_bytes })
     }
 
+    /// Mapped token lookup owns the embedding; the untied output head stays resident.
+    pub fn with_host_embedding(mut self, checkpoint: &Checkpoint) -> Result<Self> {
+        const EMBEDDING: &str = "language_model.model.embed_tokens.weight";
+        checkpoint.require_untied_embedding(EMBEDDING)?;
+        self.operands.retain(|operand| operand.name != EMBEDDING);
+        self.resident_bytes = self.operands.iter().try_fold(0u64, |n, o| n.checked_add(o.allocation_bytes))
+            .context("rank weight overflow")?;
+        Ok(self)
+    }
+
     /// Caller supplies every non-weight cost; nothing missing is inferred as zero.
     pub fn check_budget(&self, available: u64, reservations: &[u64]) -> Result<u64> {
         let total = reservations.iter().try_fold(self.resident_bytes, |n, v| n.checked_add(*v))
@@ -190,5 +200,24 @@ mod tests {
         assert!(r1.operands.iter().any(|o| o.name.contains("lm_head")));
         // A split saves the attention heads, not the replicated MLPs.
         assert!(r0.resident_bytes < one.resident_bytes && r0.resident_bytes > one.resident_bytes / 2);
+    }
+
+    #[test]
+    fn minimax_host_embedding_removes_only_the_input_table() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        testing::write_minimax_m3_snapshot(dir.path(), false, false);
+        let mut checkpoint = Checkpoint::open(dir.path())?;
+        let gpu = RankWeightLayout::from_checkpoint(&checkpoint, 0, 1)?;
+        let host = gpu.clone().with_host_embedding(&checkpoint)?;
+        let embedding = gpu.operands.iter().find(|o| o.name.ends_with("embed_tokens.weight")).unwrap();
+        assert_eq!(gpu.resident_bytes - host.resident_bytes, embedding.allocation_bytes);
+        assert_eq!(host.operands.len() + 1, gpu.operands.len());
+        assert!(!host.operands.iter().any(|o| o.name.ends_with("embed_tokens.weight")));
+        let head = |layout: &RankWeightLayout| layout.operands.iter()
+            .find(|o| o.name == "language_model.lm_head.weight").unwrap().allocation_bytes;
+        assert_eq!(head(&gpu), head(&host));
+        checkpoint.config["tie_word_embeddings"] = serde_json::Value::Bool(true);
+        assert!(gpu.with_host_embedding(&checkpoint).is_err());
+        Ok(())
     }
 }
