@@ -371,7 +371,7 @@ for wip_family in "${wip_fp8_list[@]}"; do
   case "$wip_family" in
     *:fp8) wip_package="fp8-${wip_family%%:*}" ;;
     step5:bf16) wip_package="fp8-step5-bf16-weights" ;;
-    step5:nvfp4) wip_package="fp8-step5-nvfp4a4" ;;
+    step5:nvfp4|minimax:nvfp4) wip_package="fp8-${wip_family%%:*}-nvfp4a4" ;;
     # ModelOpt NVFP4 calibrated W4A4 share the fp8_moe programs.
     *:nvfp4|*:nvfp4a4) wip_package="fp8-${wip_family%%:*}-${wip_family#*:}" ;;
     *) continue ;;
@@ -385,7 +385,7 @@ for wip_family in "${wip_fp8_list[@]}"; do
     [[ ";$bf16_families;" != *";${wip_family%%:*};"* ]] ||
       wip_packages+=("${wip_package}-bf16")
   fi
-  [[ "$wip_family" == *:nvfp4 && "$wip_family" != step5:nvfp4 ]] && wip_packages+=("${wip_package}a4")
+  [[ "$wip_family" == *:nvfp4 && "$wip_family" != step5:nvfp4 && "$wip_family" != minimax:nvfp4 ]] && wip_packages+=("${wip_package}a4")
   # Local Qwen NVFP4 keeps its MTP experts in FP8: CMake builds the TP1 FP8 sibling on the
   # coordinator (fp8_moe.cmake); stage it as release images do.
   [[ "$role" == coordinator && "$wip_family" == qwen4:nvfp4* ]] && wip_packages+=("fp8-qwen4")

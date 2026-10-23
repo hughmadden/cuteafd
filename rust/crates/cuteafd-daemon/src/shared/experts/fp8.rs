@@ -47,8 +47,11 @@ pub(super) fn validate_checkpoint_contract(info: &Fp8MoeInfo, tensors: &Fp8Exper
                 (Fp8MoeActivation::SiluPostClampFp32Product, limit),
             cuteafd_core::FfnActivation::Situ { .. } =>
                 anyhow::bail!("expert layer {layer}: native FP8 packages do not export the checkpoint's Situ activation"),
-            cuteafd_core::FfnActivation::SwigluOai { .. } =>
-                anyhow::bail!("expert layer {layer}: native FP8 packages do not export the checkpoint's SwiGLU-OAI activation yet"),
+            cuteafd_core::FfnActivation::SwigluOai { alpha, limit } => {
+                ensure!(alpha == 1.702 && limit == 7.0,
+                    "expert layer {layer}: SwiGLU-OAI package requires alpha 1.702 and limit 7, found {alpha}/{limit}");
+                (Fp8MoeActivation::SwigluOai, limit)
+            }
         };
         info.validate_activation(mode, limit, Fp8MoeProjection::Bf16)
             .with_context(|| format!("expert layer {layer}"))?;
@@ -714,6 +717,55 @@ mod tests {
     use super::{resident_admission, validate_bf16_package};
     use clap::Parser;
     use cuteafd_ffi::fp8_moe::{Fp8MoeInfo, Fp8MoeWeights};
+
+    #[test]
+    fn minimax_contract_accepts_native_packages_and_refuses_divisor_push() {
+        use cuteafd_loader::plan::testing::{compressed_nvfp4, minimax_m3_config, write_snapshot};
+        use cuteafd_loader::formats::fp8_experts::{Fp8ExpertTensors, Slicing};
+        use cuteafd_ffi::fp8_moe::{Fp8MoeActivation, Fp8MoeProjection};
+        let dir = tempfile::tempdir().unwrap();
+        let shape = cuteafd_loader::RoutedExpertShape { layers: 60, first_layer: 3, experts: 2, topk: 1,
+            hidden: 128, intermediate: 3072, draft_stages: 0, draft_experts: 0 };
+        let fixture = (0..2).flat_map(|e| [("w1", 3072, 128), ("w3", 3072, 128), ("w2", 128, 3072)]
+            .into_iter().flat_map(move |(p,n,k)| compressed_nvfp4(
+                &format!("language_model.model.layers.3.block_sparse_moe.experts.{e}.{p}"), n, k))).collect::<Vec<_>>();
+        let mut config = minimax_m3_config();
+        write_snapshot(dir.path(), &config, &fixture, None);
+        let tensors = Fp8ExpertTensors::read(dir.path(), shape).unwrap();
+        for tp in [1, 2, 3, 4, 6] {
+            let info = Fp8MoeInfo { hidden: 128, slice: 3072 / tp, experts: 2, topk: 1, intermediate: 3072, tp,
+                wire_input: false, swiglu_limit: 7.0, activation: Fp8MoeActivation::SwigluOai,
+                projection: Fp8MoeProjection::Bf16, capacities: vec![16], weights: Fp8MoeWeights::Nvfp4 };
+            super::validate_checkpoint_contract(&info, &tensors, &[3], tp, 0, Slicing::Blocks(16)).unwrap();
+            for mutation in 0..4 {
+                let mut bad = info.clone();
+                match mutation {
+                    0 => bad.activation = Fp8MoeActivation::SiluBf16Product,
+                    1 => bad.swiglu_limit = 10.0,
+                    2 => bad.wire_input = true,
+                    _ => bad.weights = Fp8MoeWeights::Fp8,
+                }
+                assert!(super::validate_checkpoint_contract(&bad, &tensors, &[3], tp, 0, Slicing::Blocks(16)).is_err());
+            }
+            for (key, value) in [("swiglu_alpha", 1.0), ("swiglu_limit", 10.0)] {
+                let original = config["text_config"][key].clone();
+                config["text_config"][key] = value.into();
+                std::fs::write(dir.path().join("config.json"), config.to_string()).unwrap();
+                let bad = Fp8ExpertTensors::read(dir.path(), shape).unwrap();
+                assert!(super::validate_checkpoint_contract(&info, &bad, &[3], tp, 0, Slicing::Blocks(16))
+                    .unwrap_err().to_string().contains("requires alpha 1.702 and limit 7"));
+                config["text_config"][key] = original;
+            }
+        }
+        let result = crate::shared::memory::push_initialize::Layer::fp8(&tensors, 3, 0, 2, 0,
+            Slicing::Blocks(16), [0..0, 0..0, 0..0]);
+        assert!(result.err().unwrap().to_string().contains("use mount loading"));
+        let library = std::path::Path::new("/exports/libcuteafd_native.so");
+        for tp in [1, 2, 3, 4, 6] {
+            assert_eq!(super::package_directory_for(library, tp, super::ExpertFormat::Nvfp4, Some("minimax")),
+                std::path::Path::new("/exports/fp8/fp8-minimax-nvfp4a4").join(format!("tp{tp}")));
+        }
+    }
 
     #[test]
     fn native_bf16_load_contract_rejects_wrong_storage_rounding_limit_and_input() {

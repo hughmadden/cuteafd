@@ -27,7 +27,7 @@ Library ABI (``native/shared/include/cuteafd_fp8_moe.h``)::
         words: [0] bytes [version=5, storage, activation, projection]. Storage:
         1 FP8 block128, 2 MXFP4, 4 NVFP4 W4A4, 5 BF16 (no scales).
         Activation: 1 pre-SiLU clamp/BF16 intermediate, 2 post-SiLU clamp/FP32
-        product. Projection: 1 BF16 gate/up and down. All bytes are mandatory.
+        product, 3 swigluoai_uninterleave (alpha 1.702, beta 1). Projection: 1 BF16 gate/up and down. All bytes are mandatory.
         [1] hidden, [2] slice, [3] experts, [4] top-k,
         [5] intermediate, [6] tp, [7] input dtype (7 = FP8 K32 wire rows, 1 = BF16 rows),
         [8] SwiGLU limit (FP32 bits, 0 = none), [9] capacities n, [10..] capacities
@@ -75,9 +75,10 @@ ROLE_LAYOUTS = {"spark": ("tp4", "tp2", "tp6"), "coordinator": ("tp1", "tp2")}
 MXFP4_ROLE_LAYOUTS = {"spark": ("tp6", "tp2"), "coordinator": ("tp1", "tp2")}
 # NVFP4 slices own whole 16-value blocks: every Spark world the FP8 worker runs.
 NVFP4_ROLE_LAYOUTS = {"spark": ("tp4", "tp2", "tp3", "tp6"), "coordinator": ("tp1", "tp2")}
+MINIMAX_ROLE_LAYOUTS = {"spark": ("tp2", "tp3", "tp4", "tp6"), "coordinator": ("tp1",)}
 ABI_VERSION = 5
 STORAGE = {"fp8": 1, "mxfp4": 2, "nvfp4a4": 4, "bf16": 5}
-ACTIVATION = {"silu_bf16_product": 1, "silu_post_clamp_fp32_product": 2}
+ACTIVATION = {"silu_bf16_product": 1, "silu_post_clamp_fp32_product": 2, "swigluoai_uninterleave": 3}
 PROJECTION = {"bf16": 1}
 ROLE_COMPUTE = {"spark": (12, 1), "coordinator": (12, 0)}
 # Spark ranks take the FP8 K32 wire rows of the expert protocol; coordinator
@@ -419,6 +420,8 @@ def build(args: argparse.Namespace) -> None:
         if args.layouts:
             raise SystemExit("--all-spark-counts and --layouts are mutually exclusive")
         layouts = spark_layouts(base.intermediate)
+    if args.geometry == "minimax_nvfp4" and not args.layouts:
+        layouts = list(MINIMAX_ROLE_LAYOUTS[args.role])
     if args.geometry.startswith("glmfdense") and not args.layouts:
         layouts = ["tp1"]  # One always-selected dense expert is not an RTX TP2 backend.
     if args.exact_slices:
@@ -543,7 +546,7 @@ def main() -> None:
     create.add_argument("--role", choices=sorted(ROLE_LAYOUTS), required=True)
     create.add_argument("--geometry", choices=("mimo", "mimop", "mimof", "glm", "glmf", "qwen4", "glm_nvfp4", "glmf_nvfp4",
                                                "qwen4_nvfp4", "glm_nvfp4a4", "glmf_nvfp4a4", "qwen4_nvfp4a4",
-                                               "glmfdense_nvfp4", "glmfdense_nvfp4a4", "step5", "step5_bf16", "step5_nvfp4"),
+                                               "glmfdense_nvfp4", "glmfdense_nvfp4a4", "step5", "step5_bf16", "step5_nvfp4", "minimax_nvfp4"),
                         required=True)
     create.add_argument("--layouts", help="comma list (default: tp4,tp2,tp6 where they split for spark, "
                         "tp1 for coordinator)")

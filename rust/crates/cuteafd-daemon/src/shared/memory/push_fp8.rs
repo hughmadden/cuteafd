@@ -71,6 +71,7 @@ impl RankPlan {
         for &(layer, slicing) in layers {
             let tensors = tensors.for_layer_metadata(layer)?;
             tensors.validate_layer(layer)?;
+            tensors.validate_push_scales()?;
             let planes = RegionLayout::fp8(&tensors, world, rank, slicing)?;
             // Do not silently widen the worker-reported checkpoint admission.
             ensure!(
