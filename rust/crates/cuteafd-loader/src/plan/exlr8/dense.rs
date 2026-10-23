@@ -1,4 +1,4 @@
-//! Dormant native coordinator layouts. No serving path selects these yet.
+//! Checkpoint-native coordinator layouts and shared runtime/planner admission.
 use super::{Header, files, number};
 use anyhow::{Context, ensure};
 use serde::Serialize;
@@ -199,6 +199,18 @@ fn component(
             bytes,
         },
     })
+}
+
+/// One native dense lane: BF16 rotations/intermediates and decode-sized split-K scratch.
+pub fn scratch_bytes(cfg: &crate::families::glm5::GlmDsaConfig, heads: usize, inter: usize, rows: usize) -> usize {
+    let (h, q, ih) = (cfg.hidden, cfg.q_lora_rank, cfg.index_heads);
+    let max_k = [h, q, heads * cfg.v_head_dim, inter].into_iter().max().unwrap_or(0);
+    let max_n = [heads * (cfg.qk_nope_head_dim + cfg.qk_rope_head_dim), h, inter, ih * 128].into_iter().max().unwrap_or(0);
+    let splits = max_k.div_ceil(1024);
+    [rows * max_k * 2, 64, max_k / 128 * 2, rows.min(64) * splits * max_n * 4, rows * max_n * 4,
+        rows * (q + cfg.kv_lora_rank + cfg.qk_rope_head_dim) * 2, rows * heads * 256 * 2, rows * inter * 2,
+        rows * inter * 2, rows * inter * 2, rows * (128 + ih) * 2, rows * ih * 128 * 2, rows * heads * cfg.v_head_dim * 2]
+        .into_iter().map(|b| b.max(256).next_multiple_of(256)).sum()
 }
 
 /// Read headers and tiny record tables only. The official checkpoint is not an input.

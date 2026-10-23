@@ -286,7 +286,6 @@ PREFILL_ROWS
 PREFILL_WAVES
 PREFILL_SPAN_ROWS
 EXLR8_MANIFEST
-EXLR8_DENSE_FROM
 RTX_EXPERT_PEER
 L2_PREFETCH
 FP8_SCALES
@@ -1755,12 +1754,10 @@ snapshot_of() {
   readlink -f "$dir/snapshots/$rev"
 }
 exlr8_manifest="$(get EXLR8_MANIFEST)"
-exlr8_dense="$(get EXLR8_DENSE_FROM)"
-exlr8_plan_args=() exlr8_mounts=()
-if [[ -n "$exlr8_manifest$exlr8_dense" ]]; then
+exlr8_plan_args=()
+if [[ -n "$exlr8_manifest" ]]; then
   [[ "$family" == glm5 ]] || release_die "EXLR8 is supported only for glm5"
   [[ "$exlr8_manifest" == up1 || "$exlr8_manifest" == bit325 ]] || release_die "EXLR8_MANIFEST must be up1 or bit325"
-  [[ -n "$exlr8_dense" ]] || release_die "EXLR8_DENSE_FROM must name the compatible official GLM-5.3 FP8 snapshot"
   exlr8_gpu_count="$(get RTX_GPUS 1)"
   [[ ( "$exlr8_gpu_count" == 1 || "$exlr8_gpu_count" == 2 ) && "$ranks" -ge 1 && "$ranks" -le 8 ]] || release_die "EXLR8 requires 1..2 RTX GPUs and 1..8 canonical Spark ranks"
   [[ "$(get SPECULATOR dflash2)" == off || "$(get SPECULATOR dflash2)" == dflash2 ]] || release_die "EXLR8 supports SPECULATOR=off or dflash2"
@@ -1768,18 +1765,7 @@ if [[ -n "$exlr8_manifest$exlr8_dense" ]]; then
   exlr8_attention=heads
   [[ "$exlr8_gpu_count" != 2 ]] || exlr8_attention=context
   [[ "$attention_placement" == auto || "$attention_placement" == "$exlr8_attention" ]] || release_die "EXLR8 requires $exlr8_attention attention for $exlr8_gpu_count RTX GPUs"
-  if [[ -d "$exlr8_dense" ]]; then
-    exlr8_dense="$(readlink -f "$exlr8_dense")"
-    release_validate_path_setting EXLR8_DENSE_FROM "$exlr8_dense"
-    if ! release_path_within "$exlr8_dense" "$namespace_root"; then
-      exlr8_mounts=(-v "$exlr8_dense:$exlr8_dense:ro")
-    fi
-  else
-    [[ "$exlr8_dense" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] && release_path_has_no_dot_segment "$exlr8_dense" ||
-      release_die "EXLR8_DENSE_FROM must be an existing snapshot or ORG/MODEL HF id"
-    exlr8_dense="$(snapshot_of "$exlr8_dense" "")" || exit 2
-  fi
-  exlr8_plan_args=(--exlr8-manifest "$exlr8_manifest" --exlr8-dense-from "$exlr8_dense")
+  exlr8_plan_args=(--exlr8-manifest "$exlr8_manifest")
   spark_worker_args+=" --exlr8-manifest $exlr8_manifest"
   cfg[RTX_EXPERT_LAYERS]=0
 fi
@@ -2733,7 +2719,7 @@ audio_encoder_hash=""
   readiness_args=(--require-ready)
   [[ -z "$wip_slot" ]] || readiness_args=()
   # Keep checkpoint paths unchanged inside the full namespace mount.
-  plan_json="$(docker run --rm --network none "${lane_env_args[@]}" -e "HF_HOME=$namespace_hf_home" -v "$namespace_root:$namespace_root:ro" "${wip_mount_args[@]}" "${exlr8_mounts[@]}" \
+  plan_json="$(docker run --rm --network none "${lane_env_args[@]}" -e "HF_HOME=$namespace_hf_home" -v "$namespace_root:$namespace_root:ro" "${wip_mount_args[@]}" \
     "$coordinator_image" cuteafd plan "$snapshot" --attention-placement "$attention_placement" --vision "$vision" --audio "$audio" --deployment "${readiness_args[@]}" \
     "${deployment_args[@]}" "${count_args[@]}" "${exlr8_plan_args[@]}" "${spark_budget_args[@]}" \
     --rtx "$plan_rtx" --coordinator-gpu-budget-gib "$plan_gib" --coordinator-weight-budget-gib "$plan_gib" --pool-tokens "$plan_pool" --vision-replicas "$vision_replicas" "${plan_draft_args[@]}")"
@@ -3034,7 +3020,7 @@ docker run -d "${RELEASE_SERVING_ARGS[@]}" --name "$coordinator_name" --restart 
   "${bond_args[@]}" "${bench_nonce_env_args[@]}" "${tp2_env_args[@]}" "${graph_census_args[@]}" "${lane_env_args[@]}" "${thermal_args[@]}" \
   "${shared_env_args[@]:4}" -e "CUTEAFD_IMAGE=$coordinator_image" "${wip_mount_args[@]}" "${device_map_args[@]}" \
   -v "$namespace_root:$namespace_root:ro" -v "$bench_dir:/run/cuteafd/bench" -v "$fidelity_cache:/run/cuteafd/fidelity" -e CUTEAFD_FIDELITY_CACHE=/run/cuteafd/fidelity \
-  "${api_mount_args[@]}" "${chat_template_mounts[@]}" "${exlr8_mounts[@]}" "${trace_args[@]}" "${probe_args[@]}" ${profile_args[@]+"${profile_args[@]}"} ${profile_wrapper_args[@]+"${profile_wrapper_args[@]}"} "$coordinator_image" ${profile_wrapper[@]+"${profile_wrapper[@]}"} cuteafd "${coordinator_budget_args[@]}" $serve --snapshot "$snapshot" \
+  "${api_mount_args[@]}" "${chat_template_mounts[@]}" "${trace_args[@]}" "${probe_args[@]}" ${profile_args[@]+"${profile_args[@]}"} ${profile_wrapper_args[@]+"${profile_wrapper_args[@]}"} "$coordinator_image" ${profile_wrapper[@]+"${profile_wrapper[@]}"} cuteafd "${coordinator_budget_args[@]}" $serve --snapshot "$snapshot" \
   --native-lib /opt/cuteafd/lib/libcuteafd_native.so "${peer_args[@]}" --listen "$addr" \
   --max-sequences "$effective_concurrency" "${context_args[@]}" \
   --max-output "$(get MAX_OUTPUT_TOKENS 4096)" "${dspark_args[@]}" \

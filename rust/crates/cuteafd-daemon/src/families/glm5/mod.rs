@@ -29,9 +29,6 @@ pub(crate) struct EngineArgs {
     /// Published native EXLR8 expert manifest (for example, up1).
     #[arg(long)]
     pub exlr8_manifest: Option<String>,
-    /// Official architecture-matched dense checkpoint snapshot; expert weights stay native.
-    #[arg(long, requires = "exlr8_manifest")]
-    pub exlr8_dense_from: Option<PathBuf>,
     #[arg(long, env = "CUTEAFD_NATIVE_LIB")]
     pub native_lib: PathBuf,
     #[arg(long, default_value = "/opt/cuteafd/share/PROGRAMS.json")]
@@ -143,13 +140,6 @@ fn native_activation(args: &EngineArgs, first_moe: usize, layers: usize, serving
     Ok(())
 }
 
-fn native_dense_format(config: &serde_json::Value) -> Result<()> {
-    let quant = &config["quantization_config"];
-    ensure!(quant["quant_method"] == "fp8" && quant["weight_block_size"] == serde_json::json!([128, 128]),
-        "EXLR8 dense-from currently requires official block-FP8 GLM dense operands");
-    Ok(())
-}
-
 fn spark_model(lanes: usize, bf16: bool, native: bool) -> Result<cuteafd_transport::worker_selection::ModelAdmission> {
     ensure!(lanes > 0, "GLM Spark admission requires at least one prefill lane");
     let ingress = if native { cuteafd_core::SparkIngress::Fp8K32 }
@@ -201,22 +191,19 @@ mod draft_cli_tests {
     }
 
     #[test]
-    fn native_expert_and_dense_source_options_reach_golden() {
+    fn native_expert_selection_reaches_golden() {
         #[derive(Parser)]
         struct Golden { #[command(flatten)] args: GoldenArgs }
         let args = Golden::try_parse_from(["test", "--snapshot", "/native", "--native-lib", "/library",
-            "--golden", "/golden", "--exlr8-manifest", "up1", "--exlr8-dense-from", "/official"])
+            "--golden", "/golden", "--exlr8-manifest", "up1"])
             .unwrap().args.engine;
         assert_eq!(args.exlr8_manifest.as_deref(), Some("up1"));
-        assert_eq!(args.exlr8_dense_from, Some(PathBuf::from("/official")));
-        assert!(Parse::try_parse_from(["test", "--snapshot", "/native", "--native-lib", "/library",
-            "--exlr8-dense-from", "/official"]).is_err());
     }
 
     #[test]
     fn native_full_activation_is_narrow_and_preserves_component_goldens() {
         let args = Parse::try_parse_from(["test", "--snapshot", "/native", "--native-lib", "/library",
-            "--exlr8-manifest", "up1", "--exlr8-dense-from", "/official", "--split-device", "1",
+            "--exlr8-manifest", "up1", "--split-device", "1",
             "--peers", "a:1,b:1,c:1,d:1", "--attention-placement", "context", "--rtx-expert-layers", "0"])
             .unwrap().engine;
         for manifest in ["up1", "bit325"] {
@@ -261,13 +248,7 @@ mod draft_cli_tests {
         component.layers = Some(4);
         assert!(native_activation(&component, 3, 78, false).is_ok());
         assert!(native_activation(&component, 3, 78, true).is_err());
-        assert!(native_dense_format(&serde_json::json!({"quantization_config": {
-            "quant_method": "fp8", "weight_block_size": [128, 128]}})).is_ok());
-        for config in [serde_json::json!({}), serde_json::json!({"quantization_config": {
-            "quant_method": "nvfp4", "weight_block_size": [128, 128]}}),
-            serde_json::json!({"quantization_config": {"quant_method": "fp8"}})] {
-            assert!(native_dense_format(&config).is_err());
-        }
+
     }
 
     #[test]
@@ -407,7 +388,6 @@ pub(crate) struct GoldenArgs {
 pub(crate) struct Opened {
     pub snapshot: PathBuf,
     pub catalog: cuteafd_loader::OfficialV41Catalog,
-    dense_catalog: Option<cuteafd_loader::OfficialV41Catalog>,
     /// An EXLR8 checkpoint: its own dense records run natively.
     pub native: bool,
     pub cfg: GlmDsaConfig,
@@ -421,14 +401,12 @@ pub(crate) fn open(args: &EngineArgs) -> Result<Opened> {
         .map_err(|g| anyhow::anyhow!("geometry already {g:?}"))?;
     let cfg = GlmDsaConfig::read(&args.snapshot)?;
     let native = catalog.format() == cuteafd_loader::plan::checkpoint::CheckpointFormat::Exlr8;
-    let dense_catalog = if native {
+    if native {
         ensure!(args.exlr8_manifest.is_some(), "native EXLR8 requires --exlr8-manifest");
         native_activation(args, cfg.first_moe_layer, cfg.layers, false)?;
-        None
     } else {
         ensure!(args.exlr8_manifest.is_none(), "EXLR8 options require a native EXLR8 checkpoint");
-        None
-    };
+    }
     if let Some(snapshot) = &args.draft {
         // A native EXLR8 target lends its row-FP8 head through a launcher.
         if !native { dflash::check_snapshot_target_bf16_head(&args.snapshot, cfg.hidden, cfg.vocab_size, false)?; }
@@ -436,7 +414,7 @@ pub(crate) fn open(args: &EngineArgs) -> Result<Opened> {
     }
     let library = std::sync::Arc::new(unsafe { NativeLibrary::load(&args.native_lib) }?);
     library.cuda_set_device(args.device)?;
-    Ok(Opened { snapshot: args.snapshot.clone(), catalog, dense_catalog, native, cfg, library })
+    Ok(Opened { snapshot: args.snapshot.clone(), catalog, native, cfg, library })
 }
 
 impl Opened {
@@ -451,7 +429,7 @@ impl Opened {
             &args.snapshot, &args.manifest, "glm5", args.max_context)?;
         let args = &context_args;
         let native = self.native;
-        let dense_catalog = self.dense_catalog.as_ref().unwrap_or(&self.catalog);
+        let dense_catalog = &self.catalog;
         ensure!(!args.skip_routed_experts || args.peers.is_none(),
             "--skip-routed-experts is a coordinator-only diagnostic; do not pass --peers");
         let programs = self.library.programs()?.with_manifest(&args.manifest)?;
@@ -1038,7 +1016,7 @@ impl Opened {
 
     /// The checkpoint's `model.embed_tokens.weight` (BF16 [vocab, hidden]).
     fn embed_source(&self) -> Result<crate::shared::token_io::EmbedSource> {
-        let catalog = self.dense_catalog.as_ref().unwrap_or(&self.catalog);
+        let catalog = &self.catalog;
         let tensor = catalog.tensor("model.embed_tokens.weight")?;
         crate::shared::token_io::EmbedSource::new(catalog.snapshot(), &tensor.shard, &tensor.metadata,
             self.cfg.hidden)

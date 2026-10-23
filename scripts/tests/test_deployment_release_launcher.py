@@ -75,8 +75,7 @@ def test_all_family_deployment_dry_run_starts_no_serving_containers(entry: dict)
 def exlr8_entry(manifest: str = "up1", **overrides: str) -> dict:
     entry = release_entry(next(e for e in ENTRIES if e["name"] == "glm53-exl3-max"))
     entry["set"].update(SPARK_COUNT="4", SPECULATOR="off", RTX_EXPERT_LAYERS="0",
-        ATTENTION_PLACEMENT="context", EXLR8_MANIFEST=manifest,
-        EXLR8_DENSE_FROM="deepseek-ai/DeepSeek-V4.1-Flash", **overrides)
+        ATTENTION_PLACEMENT="context", EXLR8_MANIFEST=manifest, **overrides)
     return entry
 
 
@@ -104,20 +103,18 @@ def test_exlr8_uses_glm_drafter_default_and_explicit_opt_out(speculator: str, tm
             assert ("--draft" in command) == (selected == "dflash2")
             if selected == "dflash2":
                 assert "models--incoai--GLM-5.3-DFlash2/snapshots/" in command[command.index("--draft") + 1]
-            assert "--exlr8-dense-from" in command
         else:
             assert "expertd-native" in command
             assert "--draft" not in command
 
 
 @pytest.mark.parametrize("manifest", ["up1", "bit325"])
-def test_exlr8_forwards_native_selection_without_dense_worker_flags(manifest: str) -> None:
+def test_exlr8_forwards_checkpoint_native_selection(manifest: str) -> None:
     result = capture(ROOT, f"exlr8-{manifest}", release_entry=exlr8_entry(manifest))
     assert len(result["plans"]) == 1
     plan = result["plans"][0]
     assert plan[plan.index("--exlr8-manifest") + 1] == manifest
-    dense = plan[plan.index("--exlr8-dense-from") + 1]
-    assert dense.startswith("<root>/hf/hub/models--deepseek-ai--DeepSeek-V4.1-Flash/snapshots/")
+    assert "--exlr8-dense-from" not in plan
     assert "--prefill-lanes" not in plan and "CUTEAFD_GLM_PREFILL_LANES=2" not in plan
     assert len(result["containers"]) == 5
     for run in result["containers"]:
@@ -125,12 +122,11 @@ def test_exlr8_forwards_native_selection_without_dense_worker_flags(manifest: st
         command = parsed["command"]
         assert command[command.index("--exlr8-manifest") + 1] == manifest
         if "serve-glm" in command:
-            assert command[command.index("--exlr8-dense-from") + 1] == dense
+            assert "--exlr8-dense-from" not in command
             assert command[command.index("--prefill-waves") + 1] == "2"
             assert "CUTEAFD_GLM_PREFILL_LANES" not in parsed["env"]
         else:
             assert "expertd-native" in command
-            assert "--exlr8-dense-from" not in command
 
 
 @pytest.mark.parametrize("waves", ["1", "2", "3", "4"])
@@ -160,7 +156,6 @@ def test_exlr8_launcher_accepts_canonical_spark_worlds(ranks: int, gpus: str, at
 
 @pytest.mark.parametrize("overrides,reason", [
     ({"EXLR8_MANIFEST": "other"}, "EXLR8_MANIFEST"),
-    ({"EXLR8_DENSE_FROM": ""}, "EXLR8_DENSE_FROM"),
     ({"RTX_GPUS": "0"}, "RTX GPUs"),
     ({"RTX_GPUS": "3"}, "RTX GPUs"),
     ({"RTX_GPUS": "1"}, "heads attention"),

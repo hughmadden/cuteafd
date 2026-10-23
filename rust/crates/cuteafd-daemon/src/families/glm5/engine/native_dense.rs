@@ -83,14 +83,7 @@ pub(crate) struct NativeScratch<'a> {
 
 /// Bytes of one lane's native dense scratch, charged before allocation.
 pub(crate) fn scratch_bytes(cfg: &GlmDsaConfig, heads: usize, inter: usize, rows: usize) -> usize {
-    let (h, q, ih) = (cfg.hidden, cfg.q_lora_rank, cfg.index_heads);
-    let max_k = [h, q, heads * cfg.v_head_dim, inter].into_iter().max().unwrap_or(0);
-    let max_n = [heads * (cfg.qk_nope_head_dim + cfg.qk_rope_head_dim), h, inter, ih * 128].into_iter().max().unwrap_or(0);
-    let splits = max_k.div_ceil(1024);
-    [rows * max_k * 2, 64, max_k / 128 * 2, rows.min(NATIVE_DECODE_ROWS) * splits * max_n * 4, rows * max_n * 4,
-        rows * (q + cfg.kv_lora_rank + cfg.qk_rope_head_dim) * 2, rows * heads * 256 * 2, rows * inter * 2,
-        rows * inter * 2, rows * inter * 2, rows * (128 + ih) * 2, rows * ih * 128 * 2, rows * heads * cfg.v_head_dim * 2]
-        .into_iter().map(|b| b.max(256).next_multiple_of(256)).sum()
+    cuteafd_loader::plan::exlr8::dense::scratch_bytes(cfg, heads, inter, rows)
 }
 
 impl<'a> NativeScratch<'a> {

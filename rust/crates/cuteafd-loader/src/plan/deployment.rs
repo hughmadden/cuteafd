@@ -266,7 +266,7 @@ mod tests {
             if component.status == Status::Ready { component.status = Status::Planned; }
         }
         let native = NativePlan { report, selection: NativeSelection {
-            manifest: "up1".into(), set_id: "checkpoint-set".into(), dense_from: "official-fp8".into() },
+            manifest: "up1".into(), set_id: "checkpoint-set".into() },
             sparks: SparkRequirements { resident_bytes_per_rank: vec![100; 4],
                 k1_workspace: "checked_by_worker_live_admission" } };
         let mut options = DeploymentOptions { rtx_gpus: 2, speculator: "off".into(), ..Default::default() };
@@ -282,7 +282,6 @@ mod tests {
             assert_eq!(value["version"], 1);
             assert_eq!(value["exlr8"]["manifest"], "up1");
             assert_eq!(value["exlr8"]["set_id"], "checkpoint-set");
-            assert_eq!(value["exlr8"]["dense_from"], "official-fp8");
             assert_eq!(value["spark_requirements"]["resident_bytes_per_rank"], serde_json::json!([100, 100, 100, 100]));
             assert_eq!(value["spark_requirements"]["k1_workspace"], "checked_by_worker_live_admission");
             assert_eq!(value["rtx_gpus"], gpus);

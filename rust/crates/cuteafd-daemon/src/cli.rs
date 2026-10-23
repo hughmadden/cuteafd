@@ -165,9 +165,6 @@ pub(crate) struct PlanArgs {
     /// Published EXLR8 manifest name (defaults to bit325).
     #[arg(long)]
     pub(crate) exlr8_manifest: Option<String>,
-    /// Native non-expert operands from an architecture-matched official checkpoint.
-    #[arg(long)]
-    pub(crate) exlr8_dense_from: Option<String>,
     /// Host RAM cap for all separate per-row mapped-table scales; 0 keeps all mapped.
     #[arg(long, default_value_t = 0.0, value_parser = parse_scale_preload_gib)]
     pub mapped_scale_preload_gib: f64,

@@ -340,8 +340,6 @@ pub fn native_layout(checkpoint: &Checkpoint, options: &LayoutOptions, shared_by
     let cfg = GlmDsaConfig::from_hf(&checkpoint.config)?;
     let rows = if options.prefill_rows == 0 { 4096 } else { options.prefill_rows };
     let context = if options.context_tokens == 0 { 1 << 20 } else { options.context_tokens };
-    let requested_pool = options.pool_tokens.filter(|&n| n > 0)
-        .unwrap_or_else(|| cuteafd_core::serving_capacity::DEFAULT_GPU_KV_TOKENS.max(context));
     let (draft, draft_staging, active_drafts) = drafter_admission(options)?;
     let plan = cuteafd_core::coordinator_programs::AttentionReductionPlan::new(
         glm::DECODE_ROWS as usize, active_drafts, options.glm5_attention_plan_rows)?;
@@ -355,7 +353,22 @@ pub fn native_layout(checkpoint: &Checkpoint, options: &LayoutOptions, shared_by
             "sm_120", options.rtx_bytes[0]).sms) as usize, &plan)
         .ok_or_else(|| anyhow::anyhow!("EXLR8 requires GLM context programs in PROGRAMS.json"))?) }
         else { None };
-    let resident = resident_owned(checkpoint, gpu_count, cfg.layers, None)?;
+    let native = crate::plan::exlr8::recognizes(&checkpoint.snapshot)?;
+    let resident = if native {
+        let records = crate::plan::exlr8::dense::DenseRecord::inventory(&checkpoint.snapshot)?;
+        (0..gpu_count).map(|rank| crate::plan::exlr8::dense::resident_native(&records,
+            gpu_count, rank, cfg.layers, cfg.heads, cfg.qk_nope_head_dim, cfg.v_head_dim,
+            cfg.kv_lora_rank).map_err(anyhow::Error::from)).collect::<anyhow::Result<Vec<_>>>()?
+    } else { resident_owned(checkpoint, gpu_count, cfg.layers, None)? };
+    let lanes = glm::prefill_lanes(spark_ranks, if options.prefill_lanes > 0 { options.prefill_lanes }
+        else { glm_prefill_lanes(None) as u64 });
+    let dense_scratch = if native {
+        let heads = cfg.heads / gpu_count;
+        let inter = cfg.dense_intermediate / gpu_count;
+        let bytes = crate::plan::exlr8::dense::scratch_bytes(&cfg, heads, inter, glm::DECODE_ROWS as usize)
+            + lanes as usize * crate::plan::exlr8::dense::scratch_bytes(&cfg, heads, inter, rows as usize);
+        vec![bytes as u64; gpu_count]
+    } else { Vec::new() };
     let mut devices = Vec::new();
     for (rank, groups) in resident.into_iter().enumerate() {
         let mut items: Vec<_> = groups.into_iter().filter(|(group, _, _)| group != "shared_expert")
@@ -375,16 +388,13 @@ pub fn native_layout(checkpoint: &Checkpoint, options: &LayoutOptions, shared_by
         gpus: devices.iter().zip(&options.rtx_bytes).map(|(device, &capacity)| (capacity,
             Baseline::Planned { context_bytes: 0, loaded_bytes: device.used_bytes() })).collect(),
         headroom_bytes: options.headroom_bytes, spark_ranks, native_experts: true,
-        native_workspace: workspace, native_dense: Vec::new(), skip_routed_experts: false, prefill_rows: rows,
-        prefill_lanes: glm::prefill_lanes(spark_ranks, if options.prefill_lanes > 0 { options.prefill_lanes }
-            else { glm_prefill_lanes(None) as u64 }),
-        max_context: context, automatic_context: false, scratch: Some(scratch), drafter_bytes: draft,
+        native_workspace: workspace, native_dense: dense_scratch, skip_routed_experts: false, prefill_rows: rows,
+        prefill_lanes: lanes,
+        max_context: context, automatic_context: options.context_tokens == 0, scratch: Some(scratch), drafter_bytes: draft,
         drafter_staging: draft_staging, pending_code: Vec::new(), experts: Vec::new(), expert_workspace: 0,
-        tp2_workspace: [0; 2], requested_pool: Some(requested_pool), onboard: Onboard::Layers(0),
+        tp2_workspace: [0; 2], requested_pool: options.pool_tokens, onboard: Onboard::Layers(0),
         full_prefill_logits: options.full_prefill_logits, context: context_programs };
     let (placement, _) = glm::solve_working_set(&inputs, [0; 2], Some(attention))?;
-    anyhow::ensure!(placement.pool_tokens >= requested_pool,
-        "EXLR8 requested KV pool {requested_pool} was reduced to {}", placement.pool_tokens);
     for (device, items) in devices.iter_mut().zip(&placement.items) {
         device.items.extend(items.iter().cloned());
         device.kv_tokens = placement.pool_tokens;
@@ -408,7 +418,7 @@ mod tests {
     use crate::plan::testing::{fp8, glm5_config, glm5_tensors, write_snapshot};
 
     #[test]
-    fn native_automatic_pool_covers_context_without_relaxing_explicit_pools() {
+    fn native_automatic_pool_matches_ordinary_and_keeps_explicit_requests_strict() {
         use crate::placement::{families::glm5 as glm, PlacementError};
         use serde_json::json;
         let dir = tempfile::tempdir().unwrap();
@@ -448,11 +458,55 @@ mod tests {
                         .filter(|item| item.category == Category::Drafter).map(|item| item.bytes).sum();
                     assert_eq!(draft, 1 << 30);
                     assert_eq!(memory.devices.len(), gpus);
-                    assert_eq!(memory.pool_tokens, default.max(context));
-                    assert_eq!(placement.pool_tokens, default.max(context));
+                    assert!(memory.pool_tokens >= default.max(context));
+                    assert_eq!(placement.pool_tokens, memory.pool_tokens);
                     assert_eq!(placement.attention_placement, if gpus == 2 { crate::placement::AttentionPlacement::Context }
                         else { crate::placement::AttentionPlacement::Heads });
                 }
+            }
+            // Put the small header fixture under the same pressure as the full
+            // checkpoint: automatic pools must fit, not become strict 2M requests.
+            for lanes in [2, 3] {
+                let options = LayoutOptions { host_memory: Some((128 << 30, 128 << 30)), rtx_bytes: vec![96 << 30; gpus],
+                    prefill_rows: 4096, prefill_lanes: lanes, glm5_drafter_disabled: true, ..Default::default() };
+                let sparks = if gpus == 1 { 4 } else { 6 };
+                let (unpressured, _) = native_layout(&checkpoint, &options, &vec![256; gpus], 256, sparks, &manifest).unwrap();
+                let shared: Vec<_> = unpressured.devices.iter().map(|device| {
+                    let records: u64 = device.items.iter().filter(|item| item.group == "records")
+                        .map(|item| item.bytes).sum();
+                    let target_records = records / unpressured.pool_tokens * default;
+                    256 + device.capacity_bytes - device.used_bytes() + records - target_records + target_records / 8
+                }).collect();
+                let input = crate::plan::PlanInput::open(dir.path()).unwrap();
+                let report = crate::plan::empty_report(&checkpoint, &crate::plan::PlanOptions {
+                    placement: crate::plan::ExpertPlacement::Sparks { ranks: sparks },
+                    attention_placement: Some(if gpus == 2 { crate::placement::AttentionPlacement::Context }
+                        else { crate::placement::AttentionPlacement::Heads }), ..Default::default()
+                }).unwrap();
+                for pool_tokens in [None, Some(0)] {
+                    let options = LayoutOptions { pool_tokens, onboard: Some(crate::placement::Onboard::Layers(0)),
+                        ..options.clone() };
+                    let (memory, native) = native_layout(&checkpoint, &options, &shared, 256, sparks, &manifest).unwrap();
+                    assert!(memory.pool_tokens >= 1 << 20);
+                    assert!(memory.pool_tokens < default);
+                    assert_eq!(memory.pool_tokens, native.pool_tokens);
+                    assert!(memory.devices.iter().all(|device| device.used_bytes() <= device.capacity_bytes));
+                    // Give the ordinary planner identical resident/working-set
+                    // bytes, including the native-only shared execution arena.
+                    let devices: Vec<_> = memory.devices.iter().zip(&native.items).map(|(device, solved)| {
+                        let baseline = device.used_bytes() - solved.iter().map(|item| item.bytes).sum::<u64>();
+                        DeviceLayout { items: vec![Item::new(Category::Weights, "identical resident bytes", "",
+                            baseline + 256 * (1 + lanes), Basis::Exact)], kv_tokens: 0, ..device.clone() }
+                    }).collect();
+                    let (ordinary, _) = placement(&report, &input, &options, &devices, Some(&manifest),
+                        4096, 1 << 20).unwrap();
+                    assert_eq!(native.pool_tokens, ordinary.pool_tokens, "{gpus} RTX/{sparks} Sparks/{lanes} lanes");
+                }
+                let explicit = LayoutOptions { pool_tokens: Some(default), ..options.clone() };
+                assert!(native_layout(&checkpoint, &explicit, &shared, 256, sparks, &manifest).is_err());
+                let diagnostic = LayoutOptions { pool_tokens: Some(1 << 19), ..options };
+                let (memory, _) = native_layout(&checkpoint, &diagnostic, &shared, 256, sparks, &manifest).unwrap();
+                assert_eq!(memory.pool_tokens, 1 << 19);
             }
             let options = LayoutOptions { host_memory: Some((128 << 30, 128 << 30)), rtx_bytes: vec![96 << 30; gpus],
                 context_tokens: default + 128, pool_tokens: Some(default), glm5_drafter_disabled: true, ..Default::default() };
