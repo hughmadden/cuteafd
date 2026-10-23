@@ -464,7 +464,7 @@ pub fn plan(snapshot: &Path, options: &PlanOptions) -> Result<PlanReport, PlanEr
 }
 
 fn family_layout(model: &dyn FamilyModel, input: &PlanInput, report: &mut PlanReport,
-    options: &layout::LayoutOptions, requested: ExpertPlacement)
+    options: &mut layout::LayoutOptions, requested: ExpertPlacement)
     -> anyhow::Result<cuteafd_core::memory_layout::MemoryLayout> {
     match model.placement(input, report, options, requested) {
         Some(Ok(memory)) => {
@@ -823,7 +823,7 @@ fn plan_unrestricted(input: &PlanInput, options: &PlanOptions) -> Result<PlanRep
         let mut layout_options = layout_options.clone();
         if !ownership.uses_checkpoint() { layout_options.native_mtp_layers = 0; }
         layout_options.weight_budget_bytes = options.coordinator_budget_bytes;
-        let memory = family_layout(model.as_ref(), input, &mut report, &layout_options, options.placement)?;
+        let memory = family_layout(model.as_ref(), input, &mut report, &mut layout_options, options.placement)?;
         if layout_options.host_embedding {
             for note in memory.notes.iter().filter(|n| n.starts_with("host embedding ineligible:")) {
                 report.fits = false;
@@ -842,8 +842,9 @@ fn plan_unrestricted(input: &PlanInput, options: &PlanOptions) -> Result<PlanRep
                 });
             }
         }
+        let refused = !report.placement_supported && memory.devices.is_empty();
         report.memory_layout = Some(memory);
-        layout::charge_host(&mut report, &layout_options, checkpoint, false)?;
+        if !refused { layout::charge_host(&mut report, &layout_options, checkpoint, false)?; }
     }
     if !report.unclassified.is_empty() {
         report.hints.push(Hint {
@@ -864,11 +865,11 @@ fn plan_unrestricted(input: &PlanInput, options: &PlanOptions) -> Result<PlanRep
     }
     if options.layout.is_none() {
         // A tensor-only inventory does not request an external speculation checkpoint.
-        let inventory = layout::LayoutOptions { rtx_bytes: vec![options.coordinator_budget_bytes], spark_bytes: options.spark_budget(),
+        let mut inventory = layout::LayoutOptions { rtx_bytes: vec![options.coordinator_budget_bytes], spark_bytes: options.spark_budget(),
             spark_allocation_budget_bytes: Some(options.spark_budget()), glm5_drafter_disabled: true,
             glmf_drafter_disabled: true, native_mtp_layers: if ownership.uses_checkpoint() { 3 } else { 0 },
             weight_budget_bytes: options.coordinator_budget_bytes, ..Default::default() };
-        let _ = family_layout(model.as_ref(), input, &mut report, &inventory, options.placement)?;
+        let _ = family_layout(model.as_ref(), input, &mut report, &mut inventory, options.placement)?;
     }
     if let Some(encoder) = &report.encoder {
         let owner = match &encoder.kind {

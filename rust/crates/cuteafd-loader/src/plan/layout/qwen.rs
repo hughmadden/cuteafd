@@ -12,7 +12,7 @@ const SPARK_HOST_BYTES: u64 = 13 * GIB;
 /// Qwen plan adapter: a dual 0-Spark layout runs whole-layer TP2 owners
 /// (`dual_layout`); every other layout serves on rtx0 (`single_layout`).
 pub(crate) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyModel,
-    input: &super::super::PlanInput, options: &LayoutOptions) -> MemoryLayout {
+    input: &super::super::PlanInput, options: &mut LayoutOptions) -> MemoryLayout {
     let shape = Shape::resolve(report, model, options, ShapePolicy::manifest_bounded());
     if options.rtx_bytes.len() == 2 && options.head_split && report.placement == ExpertPlacement::Local {
         return dual_layout(report, model, input, options, shape.prefill_rows, shape.concurrency,

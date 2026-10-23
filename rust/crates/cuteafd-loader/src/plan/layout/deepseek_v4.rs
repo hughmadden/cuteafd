@@ -28,7 +28,7 @@ fn resident_embedding(checkpoint: &Checkpoint, ranks: usize, dspark: bool) -> Op
 use crate::plan::Checkpoint;
 
 pub(crate) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyModel,
-    input: &super::super::PlanInput, options: &LayoutOptions) -> MemoryLayout {
+    input: &super::super::PlanInput, options: &mut LayoutOptions) -> MemoryLayout {
     let checkpoint = input.checkpoint();
     let mut shape = Shape::resolve(report, model, options,
         ShapePolicy { all_native_stages: true, ..ShapePolicy::manifest_bounded() });

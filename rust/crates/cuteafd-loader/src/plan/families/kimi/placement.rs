@@ -15,8 +15,13 @@ const SPARK_EXL3_WORKSPACE: u64 = crate::families::kimi_k3::SPARK_ESTIMATED_WORK
 /// Prefill lanes the Spark transport serves (one QP endpoint each).
 const LANES: u64 = 1;
 
-pub(super) fn layout(model: &Model, report: &mut PlanReport, opts: &crate::plan::layout::LayoutOptions,
+pub(super) fn layout(model: &Model, report: &mut PlanReport, opts: &mut crate::plan::layout::LayoutOptions,
     requested: ExpertPlacement) -> MemoryLayout {
+    let rows = if opts.prefill_rows > 0 { opts.prefill_rows as usize } else { 4096 };
+    report.prefill_rows = Some(rows as u64);
+    if opts.prefill_waves == 1 && opts.prefill_unit_rows.is_none() {
+        opts.prefill_unit_rows = Some(rows as u64);
+    }
     let cfg = model.cfg();
     let ranks = requested.spark_ranks();
     let gpus = opts.rtx_bytes.len();
@@ -80,7 +85,6 @@ pub(super) fn layout(model: &Model, report: &mut PlanReport, opts: &crate::plan:
     report.bytes_by_owner.insert("coordinator text weights".into(), embedding + head + residency.split + residency.replicated + mla_weights);
     report.bytes_by_owner.insert("routed expert weights".into(), experts);
     let slots = opts.state_slots.unwrap_or_else(|| if opts.concurrency > 0 { opts.concurrency } else { 16 });
-    let rows = if opts.prefill_rows > 0 { opts.prefill_rows as usize } else { 4096 };
     let path = opts.workspace_manifest.as_deref().unwrap_or_else(||
         std::path::Path::new("/opt/cuteafd/share/PROGRAMS.json"));
     // Header-only diagnostics remain available without installed artifacts. An
