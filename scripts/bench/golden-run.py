@@ -5,7 +5,7 @@ on raptor's RTX GPUs, optionally against real expert workers on Sparks.
   scripts/bench/golden-run.py --task NAME --family dsv4|glm|glmf|mimo|qwen4|qwen35|step5 \\
       --model HF_ID_OR_SNAPSHOT_DIR --arm A=WIP_INSTANCE:SLOT [--arm B=...] \\
       [--arm-env A:KEY=VALUE] [--arm-arg A:TOKEN] [--env KEY=VALUE] [--gpus 0,1] [--repeats N] \\
-      [--timeout SECONDS] [--preflight CMD] [--compare-logits A:B] \\
+      [--timeout SECONDS] [--preflight CMD] [--compare-logits A:B] [--output-dir DIR] \\
       [--native-test TEST_EXECUTABLE | --command] [--fixtures DIR [--fixtures-writable]] \\
       [--spark-hosts H1,H2,... [--expert-layers 3,5-7] [--worker-env KEY=VALUE] [--arm-worker-env A:KEY=VALUE] [--worker-arg ARG]] \\
       -- ARGS...
@@ -60,7 +60,8 @@ not), is removed on any exit before the locks are released, and runs under a per
 timeout. --dry-run runs the checks and prints every docker and worker command without
 taking locks.
 
-Output, under ~/.cache/cuteafd/builds/TASK/golden/: ARM/rN/{log,exit,argv.json,
+Output, under ~/.cache/cuteafd/builds/TASK/golden/ (or --output-dir, a child of
+the same task build directory): ARM/rN/{log,exit,argv.json,
 workers/HOST.log} and whatever the run wrote to {out}; argv.json holds the exact docker
 and worker commands, image IDs, seal SHAs, env and the GPUs' power context (gpu-powerd
 state, sampled power limit and draw). summary.md lists exit codes and the key log lines
@@ -1157,8 +1158,16 @@ def resolve_fixtures(args, task_root):
     return str(path)
 
 
+def output_root(task_root, value=None):
+    output = Path(value or task_root / 'golden').expanduser().resolve()
+    if output == task_root.resolve() or not output.is_relative_to(task_root.resolve()):
+        raise ValueError('--output-dir must be a child of the task build directory')
+    return output
+
+
 def build_state(args, arms):
     task_root = Path.home() / '.cache/cuteafd/builds' / args.task
+    output = output_root(task_root, getattr(args, 'output_dir', None))
     snapshot, container_path, extra = resolve_model(args.model)
     hub = hub_root()
     sparks = None
@@ -1205,7 +1214,7 @@ def build_state(args, arms):
     if not hub.is_relative_to(namespace_root()):
         extra = [str(hub)] + [path for path in extra if not Path(path).is_relative_to(hub)]
     covered = [hub, Path(namespace_root()), snapshot] + ([Path(fixtures)] if fixtures else [])
-    state = dict(task=args.task, family=args.family, root=str(task_root / 'golden'), gpus=parse_gpus(args.gpus), memory=args.memory_bytes,
+    state = dict(task=args.task, family=args.family, root=str(output), gpus=parse_gpus(args.gpus), memory=args.memory_bytes,
                  snapshot=str(snapshot), snapshot_container=container_path, hub=str(hub), timeout=args.timeout,
                  golden=golden, extra_mounts=extra + path_mounts(golden, covered + [Path(p) for p in extra]),
                  mode=mode, native_test=native_test, native_test_sha256=native_digest, fixtures=fixtures,
@@ -1233,6 +1242,7 @@ def parse_pairs(values, arms):
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('--task', required=True, help='output under ~/.cache/cuteafd/builds/TASK/golden')
+    parser.add_argument('--output-dir', type=Path, help='distinct output directory within the task build directory')
     parser.add_argument('--family', required=True, choices=sorted({*SUBCOMMANDS, *RAW_FAMILIES}),
                         help='family (its golden subcommand; raw-only families need --native-test/--command)')
     parser.add_argument('--model', required=True, help='HF id (ORG/NAME[@REV]) or snapshot directory; {snapshot} in ARGS')
