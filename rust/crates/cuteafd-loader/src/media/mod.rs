@@ -4,6 +4,7 @@ pub mod audio_tower;
 mod decode;
 mod exif;
 pub mod minimax;
+pub mod video;
 mod resize;
 mod spans;
 

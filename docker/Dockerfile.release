@@ -15,7 +15,7 @@ ENV CUTEAFD_NATIVE_LIB=/opt/cuteafd/lib/libcuteafd_native.so
 
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
-      bash ca-certificates curl jq tini \
+      bash ca-certificates curl ffmpeg jq tini \
       rdma-core ibverbs-providers libibverbs1 \
       libnl-3-200 libnl-route-3-200 \
       iproute2 pciutils netcat-openbsd && \
