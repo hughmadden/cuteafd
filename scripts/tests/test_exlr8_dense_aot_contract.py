@@ -111,3 +111,13 @@ def test_bf16_core_is_static_and_matches_f16_geometry(monkeypatch):
             assert thunk() == params
     assert sum(op == "trellis_linear" and p.get("input_dtype") == "bf16"
                for op, p, _ in entries.values()) == 8
+
+
+def test_native_host_admission_uses_shared_working_set_budget():
+    engine = (ROOT / "rust/crates/cuteafd-daemon/src/families/glm5/engine/exlr8.rs").read_text()
+    family = (ROOT / "rust/crates/cuteafd-daemon/src/families/glm5/mod.rs").read_text()
+    shared = "cuteafd_loader::formats::mapped_preload::host_memory()?"
+    assert shared in engine.split("fn admit_host(", 1)[1].split("pub(crate) struct NativeExperts", 1)[0]
+    assert shared in family.split("fn load_native<", 1)[1]
+    assert "fn host_available(" not in engine
+    assert 'read_to_string("/proc/meminfo")' not in engine
