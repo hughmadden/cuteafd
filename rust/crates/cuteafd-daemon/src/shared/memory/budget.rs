@@ -119,9 +119,102 @@ impl FromStr for LocalLayers {
     }
 }
 
+/// Admit all future pinned tables for this coordinator process before allocation.
+/// Families supply the names and byte formulas, summed across every local GPU.
+/// This check is independent of whether retained-prefix caching is enabled.
+pub(crate) fn admit_pinned_tables(tables: &[(&str, u64)], deferred_logits: u64, headroom: u64)
+    -> Result<cuteafd_core::memory_layout::HostLayout> {
+    admit_host_memory(0, tables, deferred_logits, headroom)
+}
+
+pub(crate) fn admit_host_memory(cache: u64, tables: &[(&str, u64)], deferred_logits: u64, headroom: u64)
+    -> Result<cuteafd_core::memory_layout::HostLayout> {
+    use cuteafd_core::memory_layout::{Basis, Category, Item};
+    let memory = crate::shared::prefix::budget::host_memory()?;
+    let snapshot = cuteafd_ffi::memory_ledger::snapshot();
+    let resident = snapshot.by_scope(cuteafd_ffi::memory_ledger::Space::Pinned, -1).into_iter()
+        .map(|(scope, bytes)| Item::new(Category::of_scope(scope), scope, "pinned", bytes as u64, Basis::Exact))
+        .collect();
+    let ledger = host_admission(memory, resident, cache, tables, deferred_logits, headroom)?;
+    tracing::info!(host_budget_bytes = cache, host_ledger = %serde_json::to_string(&ledger)?,
+        "coordinator host memory admitted");
+    Ok(ledger)
+}
+
+fn host_admission(memory: crate::shared::prefix::budget::HostMemory,
+    mut resident: Vec<cuteafd_core::memory_layout::Item>, cache: u64,
+    tables: &[(&str, u64)], deferred_logits: u64, headroom: u64)
+    -> Result<cuteafd_core::memory_layout::HostLayout> {
+    use cuteafd_core::memory_layout::{Basis, Category, HostLayout, Item, ItemLifetime, host_table_item};
+    // Resident bytes are already missing from live availability. Only these
+    // future consumers and the reserve are charged against it again.
+    resident.extend(tables.iter().map(|&(name, bytes)| host_table_item(name, bytes)));
+    resident.push(Item::new(Category::Workspace, "scoring/full-logits", "FP32", deferred_logits, Basis::Formula)
+        .with_lifetime(ItemLifetime::PostReadyReserve));
+    let ledger = HostLayout::new(memory.total, memory.available, headroom.max(memory.total / 10), cache, resident)
+        .context("host admission byte count overflow")?;
+    ensure!(ledger.shortfall_bytes == 0,
+        "coordinator host memory cannot admit host cache {} plus deferred consumers {} and reserve {}: available {}, total {}, resident {}, shortfall {} bytes",
+        cache, ledger.deferred_bytes, ledger.reserve_bytes, memory.available, memory.total,
+        ledger.resident_bytes, ledger.shortfall_bytes);
+    Ok(ledger)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::shared::prefix::budget::HostMemory;
+    use cuteafd_core::memory_layout::{Basis, Category, Item, ItemLifetime};
+
+    #[test]
+    fn named_pinned_tables_are_admitted_without_a_prefix_cache() -> Result<()> {
+        let memory = HostMemory { total: 1000, available: 800 };
+        let resident = vec![Item::new(Category::Weights, "resident/weight", "pinned", 200, Basis::Exact)];
+        let ledger = host_admission(memory, resident, 0,
+            &[("synthetic/ordered-table", 300), ("synthetic/other-gpu", 200)], 100, 0)?;
+        assert_eq!((ledger.host_budget_bytes, ledger.resident_bytes, ledger.deferred_bytes), (0, 200, 600));
+        assert_eq!((ledger.reserve_bytes, ledger.headroom_bytes, ledger.shortfall_bytes), (100, 100, 0));
+        for (name, bytes) in [("synthetic/ordered-table", 300), ("synthetic/other-gpu", 200)] {
+            let item = ledger.items.iter().find(|item| item.group == name).unwrap();
+            assert_eq!((item.category, item.bytes, item.lifetime),
+                (Category::Staging, bytes, ItemLifetime::PostReadyReserve));
+        }
+        let encoded = serde_json::to_value(&ledger)?;
+        assert_eq!(serde_json::from_value::<cuteafd_core::memory_layout::HostLayout>(encoded)?, ledger);
+        Ok(())
+    }
+
+    #[test]
+    fn host_admission_charges_future_tables_and_prefix_once_but_not_resident_twice() -> Result<()> {
+        let memory = HostMemory { total: 1000, available: 700 };
+        let resident = vec![Item::new(Category::Staging, "resident/table", "pinned", 300, Basis::Exact)];
+        let ledger = host_admission(memory, resident, 100, &[("synthetic/table", 200)], 100, 150)?;
+        assert_eq!((ledger.resident_bytes, ledger.deferred_bytes, ledger.headroom_bytes), (300, 300, 150));
+        assert_eq!(ledger.reserve_bytes, 150);
+        assert_eq!(host_admission(memory, vec![], 100, &[], 100, 0)?.deferred_bytes, 100);
+        Ok(())
+    }
+
+    #[test]
+    fn host_admission_refuses_available_total_and_arithmetic_shortfalls() {
+        let memory = HostMemory { total: 1000, available: 300 };
+        let error = host_admission(memory, vec![], 0, &[("synthetic/table", 201)], 0, 0).unwrap_err();
+        assert!(error.to_string().contains("shortfall 1 bytes"), "{error}");
+        let resident = vec![Item::new(Category::Staging, "resident/table", "pinned", 800, Basis::Exact)];
+        let error = host_admission(HostMemory { total: 1000, available: 1000 }, resident, 0,
+            &[("synthetic/table", 101)], 0, 0).unwrap_err();
+        assert!(error.to_string().contains("shortfall 1 bytes"), "{error}");
+        let memory = HostMemory { total: u64::MAX, available: u64::MAX };
+        for (cache, tables, logits, headroom) in [
+            (0, vec![("synthetic/a", u64::MAX), ("synthetic/b", 1)], 0, 0),
+            (1, vec![("synthetic/a", u64::MAX)], 0, 0),
+            (0, vec![("synthetic/a", u64::MAX)], 1, 0),
+            (0, vec![], 1, u64::MAX),
+        ] {
+            let error = host_admission(memory, vec![], cache, &tables, logits, headroom).unwrap_err();
+            assert!(error.to_string().contains("overflow"), "{error}");
+        }
+    }
     #[test]
     fn local_layers_max_uses_shared_experts_first_policy() {
         use cuteafd_loader::placement::{Onboard, EXPERTS_FIRST_POOL_FLOOR};

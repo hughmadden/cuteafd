@@ -247,6 +247,13 @@ impl HostLayout {
     }
 }
 
+/// A named, not-yet-allocated pinned table. The family owns the byte formula;
+/// offline and live host admission share its category and future lifetime.
+pub fn host_table_item(name: impl Into<String>, bytes: u64) -> Item {
+    Item::new(Category::Staging, name, "pinned", bytes, Basis::Formula)
+        .with_lifetime(ItemLifetime::PostReadyReserve)
+}
+
 /// Host gather plus one lane download can coexist. Single-lane scoring returns
 /// the download directly. Every size is FP32, regardless of checkpoint format.
 pub fn host_logits_bytes(rows: u64, lane_rows: u64, vocab: u64) -> Option<u64> {
@@ -363,6 +370,20 @@ mod tests {
         assert_eq!(total.shortfall_bytes, 10);
         let encoded = serde_json::to_value(&host).unwrap();
         assert_eq!(serde_json::from_value::<HostLayout>(encoded).unwrap(), host);
+    }
+
+    #[test]
+    fn named_host_table_keeps_its_future_owner_and_serialized_lifetime() {
+        let item = host_table_item("synthetic/ordered-table", 1024);
+        assert_eq!(item.category, Category::Staging);
+        assert_eq!(item.group, "synthetic/ordered-table");
+        assert_eq!(item.bytes, 1024);
+        assert_eq!(item.basis, Basis::Formula);
+        assert_eq!(item.lifetime, ItemLifetime::PostReadyReserve);
+        let encoded = serde_json::to_value(&item).unwrap();
+        assert_eq!(encoded["group"], "synthetic/ordered-table");
+        assert_eq!(encoded["lifetime"], "post_ready_reserve");
+        assert_eq!(serde_json::from_value::<Item>(encoded).unwrap(), item);
     }
 
     #[test]
