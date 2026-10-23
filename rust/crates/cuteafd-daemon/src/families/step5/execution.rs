@@ -286,12 +286,12 @@ impl<'e, 'a> Execution<'e, 'a> {
                 let plan = RoutedPlan::for_execution(programs, checkpoint, layer, rows, u64::MAX, &[], rank, ownership)?;
                 (plan.workspace_bytes(), "routed")
             };
-            ensure!(planes <= cuteafd_loader::plan::families::step5::native::ffn_region_bytes(rows)?,
+            ensure!(planes <= cuteafd_loader::plan::families::step5::native::ffn_region_bytes(rows, rows)?,
                 "Step-5 {ffn} FFN planes exceed the shared FFN region");
         }
         let workspace = if !owned { 0 } else {
             ffn_offset(checkpoint, ownership, rank, rows, count)?
-                .checked_add(cuteafd_loader::plan::families::step5::native::ffn_region_bytes(rows)?)
+                .checked_add(cuteafd_loader::plan::families::step5::native::ffn_region_bytes(rows, rows)?)
                 .context("Step-5 native rank workspace overflow")?
         };
         Ok(RankAdmission { immutable, workspace })
@@ -1263,9 +1263,10 @@ mod unit_overwrite_tests {
                 out.attention[rank].push(planes(&sequential(&sizes), 0, &sequential(&half)));
                 let own = native::plane_bytes(&sizes).unwrap() as usize;
                 let (ffn, ffn_half) = match (routed(layer), shared_region) {
-                    (true, true) => (native::routed_layout(CHUNK, full(layer)).unwrap().to_vec(),
-                        native::routed_layout(CHUNK / 2, full(layer)).unwrap().to_vec()),
-                    (false, true) => (native::dense_layout(CHUNK).unwrap().to_vec(), native::dense_layout(CHUNK / 2).unwrap().to_vec()),
+                    (true, true) => (native::routed_layout(CHUNK, CHUNK, full(layer)).unwrap().to_vec(),
+                        native::routed_layout(CHUNK / 2, CHUNK / 2, full(layer)).unwrap().to_vec()),
+                    (false, true) => (native::dense_layout(CHUNK, CHUNK).unwrap().to_vec(),
+                        native::dense_layout(CHUNK / 2, CHUNK / 2).unwrap().to_vec()),
                     (true, false) => (sequential(&native::routed_planes(CHUNK).unwrap()), sequential(&native::routed_planes(CHUNK / 2).unwrap())),
                     (false, false) => (sequential(&native::dense_planes(CHUNK).unwrap()), sequential(&native::dense_planes(CHUNK / 2).unwrap())),
                 };

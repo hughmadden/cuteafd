@@ -164,7 +164,11 @@ const EXECUTOR: ExecutorModes = crate::placement::families::STEP5;
 pub struct RuntimeInputs {
     pub kv_format: crate::families::qwen4::Qwen4KvCache,
     pub inventory: Inventory,
+    /// Span rows: one prefill call's rows, `waves` units in flight.
     pub rows: usize,
+    /// Prefill units in flight on the one Spark transport (PLAN "Prefill
+    /// contract"); each unit is `rows / waves` rows.
+    pub waves: usize,
     /// All-row prefill scoring was admitted at launch; otherwise the head holds
     /// only the decode/verify width (prefill needs its last row).
     pub full_prefill_logits: bool,
@@ -204,6 +208,9 @@ impl RuntimeInputs {
         super::native::head_rows(self.rows, self.full_prefill_logits)
     }
 
+    /// Rows one hook runs: attention, FFN scratch, peer partials and hops.
+    pub fn unit_rows(&self) -> usize { self.rows / self.waves.max(1) }
+
     pub fn validate(&self, cfg: &Config) -> Result<()> {
         let ranks = self.inventory.gpus.len();
         ensure!(
@@ -216,9 +223,12 @@ impl RuntimeInputs {
         );
         ensure!(
             (1..=4096).contains(&self.rows)
+                && (1..=4).contains(&self.waves)
+                && self.rows % self.waves == 0
+                && (self.waves == 1 || self.unit_rows() % 64 == 0)
                 && (1..=64).contains(&self.sequences)
-                && self.sequences <= self.rows,
-            "Step-5 rows or sequence slots"
+                && self.sequences <= self.unit_rows(),
+            "Step-5 span rows, prefill waves or sequence slots"
         );
         ensure!(
             cfg.max_context == EXTENT && (FLOOR..=EXTENT).contains(&self.context),
@@ -245,7 +255,7 @@ impl RuntimeInputs {
         HopSpec {
             storage: HopStorage::ReceiveSlots,
             row_bytes: 4096 * 4,
-            rows: self.rows as u64,
+            rows: self.unit_rows() as u64,
             lanes: 1,
             entry_gpu: 0,
             head_gpu: 0,
@@ -316,7 +326,8 @@ pub fn admit(checkpoint: &Checkpoint, inputs: &RuntimeInputs) -> Result<Admissio
     let cfg = Config::parse(checkpoint)?;
     admit_with(&cfg, inputs, |ownership| {
         (0..ownership.ranks())
-            .map(|rank| super::native::rank_admission(checkpoint, ownership, rank, inputs.rows, inputs.logit_rows()))
+            .map(|rank| super::native::rank_admission(checkpoint, ownership, rank, inputs.unit_rows(),
+                inputs.rows, inputs.logit_rows()))
             .collect()
     })
 }
@@ -338,8 +349,8 @@ pub fn admit_mtp(checkpoint: &Checkpoint, inputs: &RuntimeInputs, depth: usize) 
     let workspace = super::native::mtp_forecast_workspace(inputs.rows, depth, inputs.kv_format)?;
     admit_depth_with(&cfg, inputs, depth, |ownership| {
         (0..ownership.ranks()).map(|rank| {
-            let mut native = super::native::rank_admission(checkpoint, ownership, rank, inputs.rows,
-                inputs.logit_rows())?;
+            let mut native = super::native::rank_admission(checkpoint, ownership, rank, inputs.unit_rows(),
+                inputs.rows, inputs.logit_rows())?;
             if rank == usize::from(ownership.execution().spec().head_gpu) {
                 native.immutable = native.immutable.checked_add(weights)
                     .context("Step-5 predictor weight forecast overflow")?;
@@ -485,7 +496,9 @@ fn admit_frozen(cfg: &Config, inputs: &RuntimeInputs, depth: usize,
                     add(
                         Category::Transport,
                         "Step-5 Spark intake planes",
-                        scaled((inputs.rows as u64 * 4096 * 2).max(256), inputs.inventory.spark_ranks)?,
+                        crate::serving_capacity::prefill_return_bytes(inputs.waves as u64,
+                            inputs.unit_rows() as u64, inputs.inventory.spark_ranks as u64, 4096)
+                            .max(256 * inputs.inventory.spark_ranks as u64),
                     );
                     add(Category::Workspace, "Step-5 routed reply", (inputs.rows as u64 * 4096 * 2).max(256));
                 }
@@ -501,7 +514,7 @@ fn admit_frozen(cfg: &Config, inputs: &RuntimeInputs, depth: usize,
                         Category::Transport,
                         "Step-5 private peer and hop control",
                         checked_sum([
-                                8 * (inputs.rows as u64 * 4096 * 4).max(256),
+                                8 * (inputs.unit_rows() as u64 * 4096 * 4).max(256),
                                 256,
                                 256,
                                 256,
@@ -678,7 +691,7 @@ mod tests {
     fn inputs(ranks: usize) -> RuntimeInputs {
         RuntimeInputs {
                 kv_format: crate::families::qwen4::Qwen4KvCache::Bf16,
-            full_prefill_logits: false,
+            full_prefill_logits: false, waves: 1,
             inventory: Inventory {
                 gpus: vec![
                     GpuBudget {

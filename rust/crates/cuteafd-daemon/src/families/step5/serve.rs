@@ -33,8 +33,13 @@ pub(crate) struct ServeArgs {
     kv_cache: cuteafd_loader::families::qwen4::Qwen4KvCache,
     #[arg(long, default_value_t = 1_048_576)]
     max_context: u64,
+    /// Prefill unit rows (PLAN "Prefill contract"); a prefill call holds
+    /// `--prefill-waves` units, at most 4096 rows.
     #[arg(long, default_value_t = 256, value_parser = clap::value_parser!(u32).range(1..=4096))]
     prefill_rows: u32,
+    /// Prefill units in flight: Spark waves outstanding on the one transport.
+    #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u8).range(1..=4))]
+    prefill_waves: u8,
     /// Native predictor depth; 0 disables speculation.
     #[arg(long, default_value_t = 3, value_parser = clap::value_parser!(u8).range(0..=3))]
     mtp: u8,
@@ -60,7 +65,14 @@ pub(crate) struct ServeArgs {
 }
 
 impl ServeArgs {
+    /// One prefill call's rows: `--prefill-waves` units of `--prefill-rows`.
+    fn span(&self) -> u32 { self.prefill_rows * u32::from(self.prefill_waves) }
+
     fn validate(&self) -> Result<()> {
+        // WIP: the PrefillHooks port lands in later commits of this branch.
+        ensure!(self.prefill_waves == 1, "Step-5 prefill waves > 1 need the shared executor port (in progress)");
+        ensure!(self.span() <= 4096 && (self.prefill_waves == 1 || self.prefill_rows % 64 == 0),
+            "Step-5 --prefill-rows x --prefill-waves must hold at most 4096 page-aligned rows");
         ensure!(self.device >= 0 && self.split_device.is_none_or(|d| d >= 0 && d != self.device),
             "Step-5 needs one GPU or two distinct actual GPUs");
         ensure!(matches!(self.peers.len(), 4 | 6), "Step-5 requires TP4 or TP6 Spark experts");
@@ -121,7 +133,7 @@ fn with_backend<T>(args: &ServeArgs,
     let package = args.native_lib.parent().context("native library directory")?.join("fp8")
         .join(format.package_name("step5")).join("manifest.json");
     let metadata = cuteafd_loader::plan::checkpoint::read_json(&package)?;
-    let compiled = compiled_capacity(&metadata, args.prefill_rows)?;
+    let compiled = compiled_capacity(&metadata, args.span())?;
     // SAFETY: this owner outlives all programs, native lanes, transports and allocations.
     let library = Arc::new(unsafe { NativeLibrary::load(&args.native_lib)? });
     library.cuda_set_device(args.device)?;
@@ -150,8 +162,9 @@ fn with_backend<T>(args: &ServeArgs,
     let headroom = cuteafd_loader::plan::layout::LayoutOptions::default().headroom_bytes;
     let mut inputs = RuntimeInputs { kv_format: args.kv_cache, inventory: Inventory { gpus: measured.baselines(&[]).into_iter()
         .map(|(capacity_bytes, baseline)| GpuBudget { capacity_bytes, baseline, headroom_bytes: headroom }).collect(),
-        spark_ranks: args.peers.len(), peer_access: ids.len() == 2 }, rows: args.prefill_rows as usize,
+        spark_ranks: args.peers.len(), peer_access: ids.len() == 2 }, rows: args.span() as usize,
         full_prefill_logits: args.full_prefill_logits,
+        waves: usize::from(args.prefill_waves),
         sequences: usize::from(args.max_sequences), context: args.max_context,
         requested_pool: args.pool_tokens,
         marks: admission::prefix_marks(&args.prefix, usize::from(args.max_sequences)),
@@ -167,7 +180,7 @@ fn with_backend<T>(args: &ServeArgs,
     }).collect::<Result<Vec<_>>>()?;
     let admission = admission::admit_mtp(&programs, &checkpoint, &inputs, usize::from(args.mtp))?;
     measured.record("step5", &measured.gpus.iter().map(|g| g.free_bytes).collect::<Vec<_>>());
-    let endpoint = SparkEndpoint { capacity: args.prefill_rows, ingress: SparkIngress::Bf16 };
+    let endpoint = SparkEndpoint { capacity: args.span(), ingress: SparkIngress::Bf16 };
     let clients = admission.ownership.routed_endpoints()?;
     let config = TcpTransportConfig::default();
     // Spark admission is planned (headers only) here and started below, once the
@@ -280,7 +293,7 @@ fn with_backend<T>(args: &ServeArgs,
     cuteafd_transport::worker_selection::require_peer_clients(&args.peers, endpoint, clients)?;
     let world = SparkWorld::canonical(args.peers.len())?;
     let transport = devices[0].own(|| {
-        let mut link = SparkLink::new(&library, world, &args.peers, args.prefill_rows, config, 4096 * 2)?;
+        let mut link = SparkLink::new(&library, world, &args.peers, args.span(), config, 4096 * 2)?;
         link.enable_terminal_ownership(library.clone())?;
         link.bootstrap(&super::execution::bootstrap_request(inputs.rows, 1)?)?;
         Ok(link)
@@ -440,7 +453,7 @@ mod tests {
             inventory: Inventory { gpus: vec![GpuBudget { capacity_bytes: capacity,
                 baseline: Baseline::Measured { free_bytes: capacity - arch.context_bytes },
                 headroom_bytes: LayoutOptions::default().headroom_bytes }; 2], spark_ranks: 6, peer_access: true },
-            rows: 256, full_prefill_logits: false, sequences: 16, context: args.max_context, requested_pool: None,
+            rows: 256, waves: 1, full_prefill_logits: false, sequences: 16, context: args.max_context, requested_pool: None,
             marks: admission::prefix_marks(&args.prefix, 16), peer_diagnostics: false,
             pending_code: (0..2).map(|rank| placement::inventory::loaded_code_allowance(
                 "step5", &format.package_name("step5"), true, rank, &arch, Some(&selected)).bytes).collect(),

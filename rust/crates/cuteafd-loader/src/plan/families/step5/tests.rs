@@ -192,7 +192,7 @@ fn full_context_mtp_forecast_charges_private_predictors_before_allocation() -> a
             inventory: Inventory { gpus: vec![GpuBudget { capacity_bytes: capacity,
                 baseline: Baseline::Planned { context_bytes: arch.context_bytes, loaded_bytes: 0 },
                 headroom_bytes: 1 << 30 }; 2], spark_ranks: 6, peer_access: true },
-            rows: 256, full_prefill_logits: false, sequences: 16, context: 1_048_576,
+            rows: 256, waves: 1, full_prefill_logits: false, sequences: 16, context: 1_048_576,
             requested_pool: Some(1_048_576),
             marks: MarkRule { lanes: 16, entries: 20, budget_bytes: 2 << 30, host: true },
             pending_code: (0..2).map(|rank| inventory::loaded_code_allowance(
@@ -208,7 +208,7 @@ fn full_context_mtp_forecast_charges_private_predictors_before_allocation() -> a
             assert!(admitted.cache.ranks[1].mtp_stage_hidden.is_empty());
             let weights = coordinator::RankWeightLayout::for_mtp(&cp, depth)?.resident_bytes;
             for rank in 0..2 {
-                let target = native::rank_admission(&cp, &admitted.ownership, rank, inputs.rows, inputs.logit_rows())?;
+                let target = native::rank_admission(&cp, &admitted.ownership, rank, inputs.unit_rows(), inputs.rows, inputs.logit_rows())?;
                 let item = |group| admitted.fixed.iter().find(|item| item.gpu == rank as u8 && item.group == group)
                     .expect("native charge").bytes;
                 assert_eq!(item("Step-5 native target and head"), target.immutable + if rank == 0 { weights } else { 0 });
@@ -225,7 +225,7 @@ fn full_context_mtp_forecast_charges_private_predictors_before_allocation() -> a
                 layout: Some(layout::LayoutOptions {
                     rtx_bytes: vec![capacity; 2], pool_tokens: inputs.requested_pool, step5_kv: kv_format,
                     context_tokens: inputs.context, concurrency: inputs.sequences as u64,
-                    prefill_rows: inputs.rows as u64, headroom_bytes: 1 << 30,
+                    prefill_rows: inputs.rows as u64, prefill_lanes: inputs.waves as u64, headroom_bytes: 1 << 30,
                     native_mtp_layers: depth, workspace_manifest: Some(manifest_path.clone()),
                     mimo_prefix_entries: inputs.marks.entries as u64,
                     mimo_prefix_mark_bytes: inputs.marks.budget_bytes,
@@ -312,12 +312,12 @@ fn execution_owners_bind_native_weights_cache_and_exact_snapshots() {
                     (local.query_heads > 0).then(|| native::attention_bytes(
                         rows, cfg.full[layer], local.query_heads).unwrap())
                 }).collect::<Vec<_>>();
-                let layer_bytes = attention.iter().map(|bytes| bytes + native::ffn_region_bytes(rows).unwrap())
+                let layer_bytes = attention.iter().map(|bytes| bytes + native::ffn_region_bytes(rows, rows).unwrap())
                     .collect::<Vec<_>>();
                 let logits = native::head_rows(rows, false);
                 let head_bytes = if rank == usize::from(head) { native::plane_bytes(&native::head_planes(logits).unwrap()).unwrap() } else { 0 };
                 let expected = layer_bytes.iter().copied().max().unwrap_or(0).max(head_bytes);
-                assert_eq!(native::rank_admission(&cp, &owners, rank, rows, logits).unwrap().workspace, expected);
+                assert_eq!(native::rank_admission(&cp, &owners, rank, rows, rows, logits).unwrap().workspace, expected);
                 if layer_bytes.len() > 1 { assert!(expected < layer_bytes.iter().sum::<u64>() + head_bytes); }
             }
             for (layer, &mode) in modes.iter().enumerate() {
@@ -1211,7 +1211,7 @@ fn shared_ffn_region_keeps_replicated_replies_apart() {
                     let destination = 1 - usize::from(copy.source);
                     let base = native::rank_attention_bytes(&cfg, &owners, destination, rows).unwrap() as usize;
                     // Live binding: the destination layer's ROUTED plane in its arena.
-                    copy.storage = 1 + base + native::routed_layout(rows, cfg.full[layer]).unwrap()[9].0;
+                    copy.storage = 1 + base + native::routed_layout(rows, rows, cfg.full[layer]).unwrap()[9].0;
                 }
             }
             owners.execution().validate_routed_replications(&copies)

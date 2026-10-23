@@ -218,7 +218,7 @@ PROFILE_SPARK_NCU_SKIP
 PROFILE_SPARK_NSYS_GPU_METRICS
 EOF
     [[ "$1" != kimi_k3 ]] || printf '%s\n' KV_CACHE RTX_EXPERT_LAYERS SPECULATOR_MODEL_ID SPECULATOR_MODEL_REVISION SPECULATOR_DRAFTS PREFILL_ROWS PREFILL_WAVES
-    [[ "$1" != step5 ]] || printf '%s\n' SPECULATOR_DEPTH KV_CACHE PREFILL_BATCH_TOKENS FULL_PREFILL_LOGITS
+    [[ "$1" != step5 ]] || printf '%s\n' SPECULATOR_DEPTH KV_CACHE PREFILL_BATCH_TOKENS PREFILL_WAVES FULL_PREFILL_LOGITS
     _spark_slot_keys HOST LANE_A
     return
   fi
@@ -2664,6 +2664,7 @@ audio_encoder_hash=""
   # The plan charges the drafter this launch actually serves (SPECULATOR=off charges none).
   count_args+=(--speculator "$speculator")
   if [[ "$family" == step5 ]]; then
+    [[ -z "$(get PREFILL_WAVES)" ]] || plan_draft_args+=(--prefill-lanes "$(get PREFILL_WAVES)")
     plan_mtp_depth=0
     [[ "$speculator" != mtp ]] || plan_mtp_depth="$(get SPECULATOR_DEPTH "$mtp_depth")"
     plan_draft_args+=(--native-mtp-layers "$plan_mtp_depth" --kv-cache "$step5_kv_cache")
@@ -2707,11 +2708,14 @@ audio_encoder_hash=""
   # admission policy and endpoints come from the typed deployment above.
   deployment_json="$plan_json"
   plan_json="$(jq -c '.report' <<<"$deployment_json")"
-  # Step-5 serves the planner's prefill unit (2048 rows by default, stepped down
-  # only to keep pool capacity; PREFILL_BATCH_TOKENS is the explicit override).
+  # Step-5 serves the planner's prefill units: rows per unit (2048 by default,
+  # stepped down only to keep pool capacity; PREFILL_BATCH_TOKENS overrides)
+  # and units in flight (PREFILL_WAVES overrides; the plan's prefill_lanes).
   if [[ "$family" == step5 ]]; then
     family_args+=(--prefill-rows "$(jq -er '.prefill_rows | select(type == "number" and . > 0)' <<<"$deployment_json")") ||
       release_die "the Step-5 deployment plan names no prefill rows"
+    family_args+=(--prefill-waves "$(jq -er '.report.prefill_lanes // 1 | select(type == "number" and . > 0)' <<<"$deployment_json")") ||
+      release_die "the Step-5 deployment plan names no prefill waves"
   fi
   [[ -n "$budget" ]] || budget="$(jq -er '.spark_budget_bytes | select(type == "number" and . > 0)' <<<"$plan_json")" ||
     release_die "the deployment plan names no Spark budget"
