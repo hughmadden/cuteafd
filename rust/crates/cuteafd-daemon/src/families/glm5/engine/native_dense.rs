@@ -6,7 +6,7 @@
 //! writes the same outputs (KV record, `query`, `q_resid`, FP8 index query and
 //! head weights, `delta`, FFN output) into the same workspace buffers.
 //!
-//! Trellis dense prefill uses exact FP16 MMA over on-chip decoded weights;
+//! Trellis dense prefill uses BF16 activations/MMA over exact E4M3 weights;
 //! MXFP8 and int4 retain their native BF16-activation kernels. No activation
 //! quantization records or unpacked weight staging are admitted.
 //!
@@ -163,10 +163,12 @@ impl<'a> GlmEngine<'a> {
             }
             DenseEncoding::Trellis { bits: 4 } => {
                 let stem = shape_name(projection, split);
-                let core = programs.linear(&format!("exlr8_dense_trellis_{stem}"))?;
+                let dtype = if rows > NATIVE_DECODE_ROWS { "bf16" } else { "f16" };
+                let suffix = if dtype == "bf16" { "_bf16" } else { "" };
+                let core = programs.linear(&format!("exlr8_dense_trellis_{stem}{suffix}"))?;
                 let (k, n) = (core.geometry().input_features as usize, core.geometry().output_features as usize);
                 let (payload, suh, svh) = (key("trellis")?, key("suh")?, key("svh")?);
-                let input = programs.companion(&format!("exlr8_dense_trellis_input_k{k}_f16"))?;
+                let input = programs.companion(&format!("exlr8_dense_trellis_input_k{k}_{dtype}"))?;
                 let output = programs.companion(&format!("exlr8_dense_trellis_output_n{n}"))?;
                 let rotated = head(s.rotated.buffer, rows * k * 2)?;
                 // SAFETY (each launch): rank-local live buffers of the companion/linear

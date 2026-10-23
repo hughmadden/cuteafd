@@ -51,7 +51,7 @@ def test_dense_trellis_catalog_has_native_full_shapes(monkeypatch):
 def test_dense_tp2_catalog_halves_only_the_owned_axis(monkeypatch):
     entries = {name: (op, params, thunk)
                for name, op, params, thunk in catalog(monkeypatch)}
-    assert len(entries) == 55
+    assert len(entries) == 63
     for name in ("trellis_q_b", "trellis_o", "trellis_gate_up", "trellis_down",
                  "int4_q_b", "int4_o"):
         op, full, _ = entries[name]
@@ -99,3 +99,15 @@ def test_exlr8_coordinator_enables_dense_and_both_stage_geometries():
     text = (ROOT / "native/cmake/shared/dsv4_programs.cmake").read_text()
     assert 'if(CUTEAFD_EXLR8_ROLE STREQUAL "coordinator")' in text
     assert '${CUTEAFD_PROGRAM_GEOMETRY},exlr8_dense,glm_stage,glm2_stage' in text
+
+
+def test_bf16_core_is_static_and_matches_f16_geometry(monkeypatch):
+    entries = {name: (op, params, thunk)
+               for name, op, params, thunk in catalog(monkeypatch)}
+    for name, (op, params, thunk) in entries.items():
+        if name.startswith("trellis_") and name.endswith("_bf16") and op == "trellis_linear":
+            base = entries[name.removesuffix("_bf16")][1]
+            assert params == dict(base, input_dtype="bf16")
+            assert thunk() == params
+    assert sum(op == "trellis_linear" and p.get("input_dtype") == "bf16"
+               for op, p, _ in entries.values()) == 8

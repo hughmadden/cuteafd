@@ -179,6 +179,10 @@ def jobs(scope):
         ("exlr8-dense-trellis-tp2", "export_b12x_dsv4_aot.py",
          ["--geometry", "exlr8_dense", "--only",
           "trellis_q_b_tp2,trellis_o_tp2,trellis_gate_up_tp2,trellis_down_tp2"]),
+        ("exlr8-dense-trellis-bf16", "export_b12x_dsv4_aot.py",
+         ["--geometry", "exlr8_dense", "--only", ",".join(
+             f"trellis_{name}{tp}_bf16" for tp in ("", "_tp2")
+             for name in ("q_b", "o", "gate_up", "down"))]),
         ("exlr8-dense-mxfp8", "export_b12x_dsv4_aot.py",
          ["--geometry", "exlr8_dense", "--only",
           "mxfp8_q_a,mxfp8_kv_a,mxfp8_index_q,mxfp8_index_k"]),

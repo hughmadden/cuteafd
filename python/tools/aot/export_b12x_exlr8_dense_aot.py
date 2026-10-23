@@ -55,6 +55,12 @@ def programs():
                       max_rows=4096)
         result.append((f"trellis_{name}", "trellis_linear", params,
                        partial(compile_trellis_linear_aot, **params)))
+    for name, k, n, side in TRELLIS_SHAPES:
+        params = dict(input_features=k, output_features=n, bits=4,
+                      codebook="e4m3", sharded_side=side, rotation_count=4,
+                      max_rows=4096, input_dtype="bf16")
+        result.append((f"trellis_{name}_bf16", "trellis_linear", params,
+                       partial(compile_trellis_linear_aot, **params)))
     for name, k, n, encoding, side in SCALED_SHAPES:
         params = dict(input_features=k, output_features=n, encoding=encoding,
                       sharded_side=side, max_rows=4096)
