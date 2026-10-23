@@ -109,6 +109,7 @@ fn options(args: &PlanArgs) -> Result<PlanOptions, PlanError> {
                 glm5_drafter_snapshot: args.drafter_snapshot.clone(),
                 glm5_draft_bf16: args.glm5_draft_bf16,
                 kimi_drafter_snapshot: None,
+                dense_qwen_drafter_snapshot: args.drafter_snapshot.clone().filter(|_| args.speculator != "off"),
                 kimi_draft_fp8: args.draft_fp8,
                 glm5_attention_plan_rows: args.attention_plan_rows,
                 drafter_bytes: if args.drafter_gib > 0.0 { budget_bytes("--drafter-gib", args.drafter_gib)? } else { 0 },
@@ -251,6 +252,11 @@ pub(crate) fn run_plan(mut args: PlanArgs) -> Result<()> {
         if !options.draft_ownership.unwrap().uses_checkpoint() { layout.native_mtp_layers = 0; }
         layout.glmf_drafter_disabled = args.speculator == "off";
         layout.glm5_drafter_disabled = args.speculator == "off";
+        if family == "qwen3_5" && args.speculator != "off" {
+            let resolved = file_args(args.clone(), &snapshot)?;
+            layout.dense_qwen_drafter_snapshot = Some(resolved.drafter_snapshot
+                .context("dense dSpark planning requires its checkpoint")?);
+        }
         if family == "kimi_k3" && args.speculator != "off" {
             anyhow::ensure!(args.speculator == "dflash2" && args.drafter_snapshot.is_some(),
                 "Kimi MLA speculation requires --speculator dflash2 --drafter-snapshot SNAPSHOT");
@@ -420,6 +426,8 @@ fn resolve_speculator(args: &mut PlanArgs, snapshot: &std::path::Path, family: &
     cfg: &std::collections::BTreeMap<String, String>) -> Result<()> {
     let default = match family {
         "glm5" | "glm5_flash" => "dflash2",
+        "qwen3_5" if serde_json::from_slice::<serde_json::Value>(&std::fs::read(snapshot.join("config.json"))?)
+            .is_ok_and(|config| config.get("text_config").unwrap_or(&config)["hidden_size"] == 5120) => "dspark",
         "mimo_v2" if snapshot.join("dflash").is_dir() => "dflash2",
         "mimo_v2" | "qwen4" | "step5" if args.native_mtp_layers > 0 => "mtp",
         "deepseek_v4" | "deepseek_v41" if args.native_mtp_layers > 0 => "dspark",
@@ -445,7 +453,7 @@ fn resolve_speculator(args: &mut PlanArgs, snapshot: &std::path::Path, family: &
         anyhow::ensure!(args.speculator != "off", "this family has no default speculator");
     }
     let enabled = match (family, args.speculator.as_str()) {
-        (_, "off") | ("kimi_k3", "dflash2") | ("glm5", "dflash2") | ("glm5_flash", "dflash2" | "dspark")
+        (_, "off") | ("qwen3_5", "dspark") | ("kimi_k3", "dflash2") | ("glm5", "dflash2") | ("glm5_flash", "dflash2" | "dspark")
         | ("mimo_v2", "dflash2" | "mtp") | ("qwen4" | "step5", "mtp")
         | ("deepseek_v4" | "deepseek_v41", "dspark") => true,
         _ => false,
@@ -484,6 +492,7 @@ fn file_args(mut args: PlanArgs, snapshot: &std::path::Path) -> Result<PlanArgs>
     if needs_drafter && args.drafter_snapshot.is_none() && matches!(args.speculator.as_str(), "dflash2" | "dspark") {
         let model = cfg.get("SPECULATOR_MODEL_ID").or_else(|| cfg.get("DRAFT_MODEL_ID"))
             .filter(|v| !v.is_empty()).map(String::as_str).or(match (family, args.speculator.as_str()) {
+                ("qwen3_5", "dspark") => Some("RadixArk/Qwen3.8-27B-DSpark"),
                 ("glm5", "dflash2") => Some("incoai/GLM-5.3-DFlash2"),
                 ("glm5_flash", "dflash2") => Some("incoai/GLM-5.3-Flash-DFlash2"),
                 ("glm5_flash", "dspark") => Some("RedHatAI/GLM-5.3-Flash-speculator.dspark-preview"),
@@ -492,7 +501,11 @@ fn file_args(mut args: PlanArgs, snapshot: &std::path::Path) -> Result<PlanArgs>
         if let Some(model) = model {
             let hf_home = args.hf_home.clone().unwrap_or_else(default_hf_home);
             let revision = cfg.get("SPECULATOR_MODEL_REVISION").or_else(|| cfg.get("DRAFT_MODEL_REVISION"))
-                .filter(|v| !v.is_empty()).map(String::as_str);
+                .filter(|v| !v.is_empty()).map(String::as_str).or_else(|| {
+                    (family == "qwen3_5" && args.speculator == "dspark"
+                        && model == "RadixArk/Qwen3.8-27B-DSpark")
+                        .then_some("85ef153be924f17ce4bf62726954eeaa4a73e854")
+                });
             args.drafter_snapshot = Some(resolve_snapshot_at_revision(model, Some(&hf_home), revision)?
                 .snapshot_path.with_context(|| format!("required speculator {model} is not downloaded; use --no-speculator only when serving without it"))?);
         }
@@ -1382,6 +1395,32 @@ mod tests {
                 assert!(!layout.glmf_representation.fp8_head);
                 assert_eq!(layout.drafter_bytes, 0, "head arithmetic must not add a weight copy");
             }
+        }
+    }
+
+    #[test]
+    fn dense_dspark_pins_qualified_revision_and_preserves_overrides() {
+        use cuteafd_loader::plan::testing::*;
+        let target = tempfile::tempdir().unwrap();
+        write_snapshot(target.path(), &serde_json::json!({"model_type":"qwen3_5", "text_config": {
+            "model_type":"qwen3_5_text", "hidden_size":5120}}), &[t("unused.weight", "BF16", &[2])], None);
+        let home = tempfile::tempdir().unwrap();
+        let repo = home.path().join("hub/models--RadixArk--Qwen3.8-27B-DSpark");
+        std::fs::create_dir_all(repo.join("refs")).unwrap();
+        std::fs::write(repo.join("refs/main"), "unavailable-main").unwrap();
+        let config = target.path().join("launch.config");
+        for selected in [None, Some("explicit-revision")] {
+            let revision = selected.unwrap_or("85ef153be924f17ce4bf62726954eeaa4a73e854");
+            let draft = repo.join("snapshots").join(revision);
+            std::fs::create_dir_all(&draft).unwrap();
+            std::fs::write(&config, selected.map_or_else(String::new,
+                |revision| format!("SPECULATOR_MODEL_REVISION={revision}\n"))).unwrap();
+            let mut input = args(target.path(), 0, false);
+            input.hf_home = Some(home.path().into());
+            input.config = Some(config.clone());
+            let resolved = file_args(input, target.path()).unwrap();
+            assert_eq!(resolved.speculator, "dspark");
+            assert_eq!(resolved.drafter_snapshot, Some(draft));
         }
     }
 

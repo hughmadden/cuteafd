@@ -300,6 +300,11 @@ impl<'a> DenseEngine<'a> {
     /// Prefill stays on device; the shared selector consumes the last requested
     /// logits before another engine operation reuses the admitted output arena.
     pub(crate) fn prefill_device(&mut self, slot: usize, tokens: &[u32], logit_rows: usize) -> Result<DeviceLogits> {
+        self.prefill_tapped(slot, tokens, logit_rows, |_, _| Ok(()))
+    }
+
+    pub(crate) fn prefill_tapped(&mut self, slot: usize, tokens: &[u32], logit_rows: usize,
+        mut hook: impl FnMut(usize, CuteafdDeviceBuffer) -> Result<()>) -> Result<DeviceLogits> {
         ensure!(slot < self.slots.len() && !tokens.is_empty() && tokens.len() <= ROWS,
             "dense prefill outside admitted slot/row capacity");
         ensure!(logit_rows <= self.head_rows.min(tokens.len()), "dense prefill head rows outside admission");
@@ -328,6 +333,7 @@ impl<'a> DenseEngine<'a> {
             homes: &self.homes, bank: &self.bank, stream: self.stream.raw };
         for (index, layer) in self.weights.layers.iter().enumerate() {
             blocks.run(index, layer, self.planes, self.kv[index].as_ref().map(|v| v.buffer), &step)?;
+            hook(index, self.planes.residual)?;
         }
         let output = if logit_rows == 0 {
             // Scoring may warm a prefix without consuming logits; never launch a zero-row head.
