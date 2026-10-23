@@ -173,7 +173,7 @@ pub(crate) fn ffn_projected(gate:Projected<'_,'_>,up:Projected<'_,'_>,down:Proje
 /// Serialized projections reuse one lane-private scratch set, never one set per
 /// layer. Their BF16 outputs remain distinct until the downstream core consumes them.
 pub(crate) struct CorePrograms<'a> {
-    projections:BTreeMap<(usize,usize,usize,String),Projection<'a>>,
+    projections:BTreeMap<((usize,usize,usize,String),bool),Projection<'a>>,
     grouped:BTreeMap<(usize,usize,usize,String),GroupedTrellis<'a>>,
     /// Diagnostic only: false forces the four standalone launches (bitwise A/B).
     grouped_enabled:std::cell::Cell<bool>,
@@ -200,8 +200,12 @@ impl<'a> CorePrograms<'a> {
                 for rank in super::weights::LayerLayout::pair_with_core(cfg,layer,mode,inventory)? {
                     for weight in rank.core_layouts() {
                         let key=projection_key(weight.shape,weight.side,weight.codebook);
-                        if projections.contains_key(&key) {continue;}
-                        let projection=Projection::load_geometry(programs,key.0,key.1,key.2,&key.3,rows,TrellisDType::Bf16)?;
+                        let semantic_key=(key.clone(),weight.bf16_prefill);
+                        if projections.contains_key(&semantic_key) {continue;}
+                        let mut projection=Projection::load_geometry(programs,key.0,key.1,key.2,&key.3,rows,TrellisDType::Bf16)?;
+                        if weight.bf16_prefill {
+                            projection.program=projection.program.with_bf16_prefill(programs,rows,TrellisDType::Bf16)?;
+                        }
                         let mut required=ProjectionLayout::new(&projection.program,rows)?;
                         if let Some(policy)=GroupedPolicy::from_package_geometry(programs,key.0,key.1,key.2,&key.3)? {
                             let program=GroupedTrellis::load(programs,projection.program.policy(),&policy)?;
@@ -210,7 +214,7 @@ impl<'a> CorePrograms<'a> {
                             grouped.insert(key.clone(),program);
                         }
                         if let Some(layout)=&mut layout {layout.merge(&required)?;} else {layout=Some(required);}
-                        projections.insert(key,projection);
+                        projections.insert(semantic_key,projection);
                     }
                 }
             }
@@ -225,7 +229,7 @@ impl<'a> CorePrograms<'a> {
             // owner also serves full-capacity serialized layer projections.
             required.rows=rows;
             if let Some(layout)=&mut layout {layout.merge(&required)?;}else{layout=Some(required);}
-            projections.insert(key,projection);
+            projections.insert((key,false),projection);
         }
         let Some(layout)=layout else {anyhow::bail!("Kimi K6 inventory has no bound projections");};
         let planned=cuteafd_loader::families::kimi_k3::core::projection_scratch(cfg,inventory,rows,
@@ -245,7 +249,7 @@ impl<'a> CorePrograms<'a> {
             copy:programs.library().v41_peer_copy()?,add:programs.library().f32_add()?}))
     }
     pub(crate) fn projection(&self,weights:&CoreWeights<'_>)->Result<&Projection<'a>> {
-        self.projections.get(&projection_key(weights.shape,weights.side,weights.codebook))
+        self.projections.get(&(projection_key(weights.shape,weights.side,weights.codebook),weights.bf16_prefill))
             .ok_or_else(||anyhow::anyhow!("Kimi K6 weight geometry not resolved before admission"))
     }
     /// The grouped KDA launch for these member weights, when the package has one.

@@ -143,3 +143,31 @@ def test_bf16_diagnostic_specialization_preserves_stems_and_default(monkeypatch)
             assert original.get("output_dtype", "f16") == "f16"
         else:
             assert params == original
+
+
+def test_selective_bf16_is_additive_and_excludes_head_and_grouped(monkeypatch):
+    module = load_exporter(monkeypatch)
+    fake = ModuleType("b12x.integration.cuteafd.trellis_linear")
+    fake.compile_trellis_linear_aot = lambda **params: params
+    monkeypatch.setitem(sys.modules, fake.__name__, fake)
+    transforms = ModuleType("b12x.integration.cuteafd.trellis_transform")
+    transforms.compile_trellis_input_aot = lambda **params: params
+    transforms.compile_trellis_output_aot = lambda **params: params
+    monkeypatch.setitem(sys.modules, transforms.__name__, transforms)
+    default = module["programs"]()
+    selective = module["selective_programs"]()
+    assert [p[:3] for p in selective[:len(default)]] == [p[:3] for p in default]
+    assert len(selective) == len(default) + 9
+    assert len({p[0] for p in selective}) == len(selective)
+    exports = {name: (op, params) for name, op, params, _ in selective}
+    for name, op, params, thunk in selective[len(default):]:
+        assert name.endswith("_prefill_bf16")
+        assert not params.get("groups") and "lm_head" not in name
+        assert thunk() == params
+        assert params["input_dtype" if op == "trellis_linear" else "output_dtype"] == "bf16"
+    for policy in module["row_policies"]():
+        wide = policy.get("bf16_prefill")
+        assert bool(wide) == (policy["shape"] in {"shared_down_tp2", "kda_o_tp2", "mla_o_owned"})
+        if wide:
+            assert exports[wide["native_program"]][1]["input_dtype"] == "bf16"
+            assert exports[wide["native_input"]][1]["output_dtype"] == "bf16"
