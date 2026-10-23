@@ -5515,8 +5515,10 @@ Each port:
 3. gates on 1-window/N=1 vs W-window/N byte-identity, exact prefix cache, and one card (8K, TTFT, memory, KL);
 4. reports the onboard layers or pool the freed workspace bought.
 
-Phases 1 and 2 can run in parallel once phase 0's API is fixed. Phase 3
-follows the release.
+Phases 1 and 2 can run in parallel once phase 0's API is fixed. Phases 2
+and 3 are gated on one lane family showing a win on the executor (GLM 5.3,
+#660, TJ 2026-10-23), not on the release: once it does, every lane family
+ports for v4.
 
 ## Backlog (lowest priority: only when nothing planned is left)
 
