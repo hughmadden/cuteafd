@@ -263,57 +263,53 @@ def _export_exl3(extra, output):
     capacities = (package.package_capacities(geometry, requested) if hasattr(package, "package_capacities")
                   else sorted({int(item) for item in requested.split(",")}))
     bits = tuple(int(item) for item in extra[extra.index("--bits") + 1].split(",")) if "--bits" in extra else (3, 4)
-    if "--compact-companions" in extra:
+    compact = "--compact-companions" in extra
+    role = extra[extra.index("--role") + 1] if "--role" in extra else "coordinator"
+    if compact:
         if len(bits) != 2:
             raise ValueError("compact companions require two-tier Spark exports")
-        profiles = package.compact_profiles(geometry, package.build_profiles("spark", geometry))
-        for profile, width, experts, topk, dtype, _ in profiles:
-            for rows in capacities:
-                options = dict(compile_only=True, tile=(64, 128, 64, 128), compact_weights=True)
-                if geometry != "v41":
-                    options["hidden"] = package.GEOMETRIES[geometry][0]
-                if package.activation(geometry) != "silu":
-                    options["activation"] = package.activation(geometry)
-                block = package.route_block(geometry, rows)
-                if block != 8:
-                    options["route_block"] = block
-                if len(bits) == 2 and package.token_major_rotation(geometry, rows):
-                    options["token_major_rotation"] = True
-                limit = package.swiglu_limit(geometry)
-                if limit != 10.0:
-                    options["swiglu_limit"] = limit
-                export(output / profile / f"m{rows}", width, experts, rows,
-                       bits, "auto", topk, dtype, **options)
-        return
-    for profile, width, experts, topk, dtype, _ in package.profiles_for_role("coordinator", geometry):
+        role = "spark"
+        profiles = package.compact_profiles(geometry, package.build_profiles(role, geometry))
+    else:
+        profiles = package.profiles_for_role(role, geometry)
+    for profile, width, experts, topk, dtype, _ in profiles:
         for rows in capacities:
-            options = {"hidden": package.GEOMETRIES[geometry][0], "compile_only": True}
-            if getattr(package, "activation", lambda _: "silu")(geometry) != "silu":
+            options = {"compile_only": True}
+            if compact:
+                options["compact_weights"] = True
+            tile = (64, 128, 64, 128) if compact else package.decode_tile(geometry, width, rows)
+            if tile is not None:
+                options["tile"] = tile
+            if geometry != "v41":
+                options["hidden"] = package.GEOMETRIES[geometry][0]
+            if package.activation(geometry) != "silu":
                 options["activation"] = package.activation(geometry)
             block = package.route_block(geometry, rows)
-            if len(bits) == 2 and package.warp_specialized(geometry, "coordinator", width, rows):
-                block = 64
+            compact_ws = compact and len(bits) == 2 and package.compact_warp_specialized(
+                geometry, role, width, rows)
+            ws = compact_ws or (len(bits) == 2 and tile is None
+                                and package.warp_specialized(geometry, role, width, rows))
+            if ws:
+                block = 32 if compact_ws else 64
                 options["warp_specialized"] = True
-                if package.wire_input(geometry, "coordinator", width, rows):
+                if package.wire_input(geometry, role, width, rows):
                     options["wire_input"] = True
-                stages = package.ws_input_stages(geometry, "coordinator", width, rows)
+                stages = package.ws_input_stages(geometry, role, width, rows)
                 if stages is not None:
                     options["ws_input_stages"] = stages
-                if package.ws_dynamic_tiles(geometry, "coordinator", width, rows):
+                if package.ws_dynamic_tiles(geometry, role, width, rows):
                     options["ws_dynamic_tiles"] = True
-                tile = package.ws_tile(geometry, "coordinator", width, rows)
-                if tile is not None:
-                    options["tile"] = tile
-            elif len(bits) == 2 and package.fused_input_rotation(geometry, "coordinator", width, rows):
+                policy_tile = package.ws_tile(geometry, role, width, rows)
+                if policy_tile is not None:
+                    options["tile"] = policy_tile
+            elif len(bits) == 2 and tile is None and package.fused_input_rotation(geometry, role, width, rows):
                 options["fused_input_rotation"] = True
             elif len(bits) == 2 and package.token_major_rotation(geometry, rows):
                 options["token_major_rotation"] = True
-            # The package pins its decode capacities to the canonical tile (#309);
-            # compare the geometry that ships, not the planner's widened default.
-            tile = package.decode_tile(geometry, width, rows)
-            if tile is not None:
-                options["tile"] = tile
-            options.update(route_block=block, swiglu_limit=package.swiglu_limit(geometry))
+            if block != 8:
+                options["route_block"] = block
+            if (limit := package.swiglu_limit(geometry)) != 10.0:
+                options["swiglu_limit"] = limit
             export(output / profile / f"m{rows}", width, experts, rows, bits, "auto", topk, dtype, **options)
 
 
@@ -545,6 +541,8 @@ def parse_sms(value):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--sms", type=parse_sms, default=(188, 170))
+    parser.add_argument("--role", choices=("coordinator", "spark"), default="coordinator",
+                        help="role for non-compact EXL3 expert groups")
     parser.add_argument("--scope", choices=("suspects", "all"), default="all")
     parser.add_argument("--groups", help="comma-separated job names; --list prints available names")
     parser.add_argument("--list", action="store_true")
@@ -570,6 +568,9 @@ def main():
         if unknown:
             parser.error(f"unknown groups: {sorted(unknown)}")
         selected_jobs = [job for job in selected_jobs if job[0] in selected]
+    selected_jobs = [(name, exporter, [*extra, "--role", args.role]
+                      if exporter == "package_exl3_aot.py" else extra)
+                     for name, exporter, extra in selected_jobs]
     output = args.output_dir.expanduser().resolve()
     load_file("cuteafd_build_filesystem", ROOT / "scripts/build/assert-build-filesystem.py").check_path(str(output))
     output.mkdir(parents=True, exist_ok=True)

@@ -145,7 +145,8 @@ class PackageProfileTests(unittest.TestCase):
             # Preserve the policy's options in the fake export record.
             self.assertLessEqual(set(options), {'tile', 'blocks_per_sm', 'route_block',
                                                 'hidden', 'swiglu_limit', 'decode_schedule',
-                                                'compact_weights', 'token_major_rotation'},
+                                                'compact_weights', 'token_major_rotation', 'warp_specialized',
+                                                'wire_input', 'ws_input_stages', 'ws_dynamic_tiles'},
                                  'unexpected option consumed by the fake export')
             if options.get('compact_weights'):
                 self.assertEqual(len(tiers), 2)

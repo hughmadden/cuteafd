@@ -365,6 +365,11 @@ def warp_specialized(geometry: str, role: str, width: int, capacity: int) -> boo
     return capacity >= 256
 
 
+def compact_warp_specialized(geometry: str, role: str, width: int, capacity: int) -> bool:
+    """Compact profiles retain the cooperative kernel until qualified."""
+    return False
+
+
 # Warp-specialized tile (fc1_k, fc1_n, fc2_k, fc2_n) of widths that are odd
 # multiples of 128 and multiples of 192 (GLM 5.3 TP6 width 384).
 TILE_384 = (64, 192, 64, 256)
@@ -798,6 +803,11 @@ def build(args: argparse.Namespace) -> None:
                 # path is what every existing build used.
                 profile_dir = (args.build_dir / profile if tile is None else
                                args.build_dir / f"{profile}+tile{'-'.join(map(str, tile))}")
+                compact_ws = compact and len(args.bits) == 2 and compact_warp_specialized(
+                    geometry, args.role, width, capacity)
+                if compact_ws:
+                    # N128 alone also names the cooperative export; separate its cache.
+                    profile_dir = profile_dir.with_name(f'{profile_dir.name}+ws-m32')
                 raw = profile_dir / f'm{capacity}'  # one capacity, one directory
                 options = {'compact_weights': True} if compact else {}
                 if activation(geometry) != 'silu':
@@ -807,9 +817,10 @@ def build(args: argparse.Namespace) -> None:
                 if geometry != 'v41':
                     options['hidden'] = hidden
                 block = route_block(geometry, capacity)
-                ws = len(args.bits) == 2 and tile is None and warp_specialized(geometry, args.role, width, capacity)
+                ws = compact_ws or (len(args.bits) == 2 and tile is None
+                                    and warp_specialized(geometry, args.role, width, capacity))
                 if ws:
-                    block = 64
+                    block = 32 if compact_ws else 64
                 if block != 8:
                     options['route_block'] = block
                 if ws:
