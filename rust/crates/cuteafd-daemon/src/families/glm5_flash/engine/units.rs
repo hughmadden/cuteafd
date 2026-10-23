@@ -280,7 +280,6 @@ impl<'a> GlmfEngine<'a> {
         }
         *self.context_units.borrow_mut() = vec![[context::ContextUnit::default(); 2]; steps.len()];
         *self.staging_owner.borrow_mut() = [None; 2];
-        self.unit_prefill.set(true);
         let released = (0..waves).map(|_| self.peer.as_ref().map(|p|
             crate::shared::memory::device::Event::new(crate::shared::memory::device::Device {
                 library: self.library, id: p.device })).transpose()).collect::<Result<_>>()?;
@@ -289,6 +288,7 @@ impl<'a> GlmfEngine<'a> {
             consumed: (0..steps.len()).map(|_| vec![0; self.layer_execution.as_ref()
                 .map_or(0, |execution| execution.plan.hops().len())]).collect(),
             waves, total, wanted: logit_rows, device, logits: Vec::new(), result: None, media, on_layer, forced };
+        self.unit_prefill.set(true);
         let outcome = run_prefill_units(&mut hooks, &units, waves);
         self.unit_prefill.set(false);
         self.context_unit.set(0);
