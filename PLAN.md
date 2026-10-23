@@ -5490,6 +5490,28 @@ and scratch scheme. Step-5 and Qwen 4 had no overlap at all.
   Defaults today: GLM 5.3 3 lanes, GLM Flash 2, MiMo 3/2 by size (measured),
   V4.1 2 lanes, Kimi ≤3 windows. Only MiMo's default was measured.
 
+### Prefill migration plan (cross-family, TJ 2026-10-23)
+
+One owner holds `shared/prefill_pipeline.rs` and builds the shared executor.
+Each family's port is then a separate, mechanical task.
+
+| Phase | Work | Families | Bar |
+|---|---|---|---|
+| 0 | Shared executor: per-layer/per-window hook trait, N waves in flight on one transport, return-buffer admission, planner chunk pick, schedule test, byte-identity harness | shared; Kimi first adopter | Kimi N=1 byte-identical; Kimi N=1/2/3 card |
+| 1 | Families with no overlap today | Step-5, Qwen 4 (Spark layout) | 8K prefill ≥ 1.2× at N=1 |
+| 2 | Lane families to one lane | V4.1 (2 lanes), V4 (2) | 8K prefill ≥ 0.98× of today at the measured N, workspace freed |
+| 3 | Lane families to one lane | GLM 5.3 (3), GLM Flash (2), MiMo (3/2) | same bar; freed memory goes to the planner |
+| 4 | Shared defaults | all | the sweep (windows × N × chunk), then one default rule |
+
+Each port:
+1. implements the hook trait;
+2. deletes the family's own lane workspaces, transports and schedule loop;
+3. gates on 1-window/N=1 vs W-window/N byte-identity, exact prefix cache, and one card (8K, TTFT, memory, KL);
+4. reports the onboard layers or pool the freed workspace bought.
+
+Phases 1 and 2 can run in parallel once phase 0's API is fixed. Phase 3
+follows the release.
+
 ## Backlog (lowest priority: only when nothing planned is left)
 
 - Qwen 3.8 Flash Next NVFP4 without Sparks, competitive with vLLM on one
