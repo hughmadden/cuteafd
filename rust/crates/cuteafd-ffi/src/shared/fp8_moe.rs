@@ -32,6 +32,8 @@ pub enum Fp8MoeActivation {
     SiluBf16Product = 1,
     /// Clamp FP32 SiLU, multiply in FP32, then round once to BF16.
     SiluPostClampFp32Product = 2,
+    /// Gate-first SwiGLU-OAI: alpha 1.702, beta 1.0, asymmetric gate clamp.
+    SwigluOai = 3,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -64,7 +66,7 @@ impl Fp8MoeInfo {
         let count = words[9] as usize;
         let [version, format, activation, projection] = words[0].to_le_bytes();
         ensure!(version == 5 && matches!(format, 1 | 2 | 4 | 5)
-            && matches!(activation, 1 | 2) && !(format == 2 && activation == 2) && projection == 1
+            && matches!(activation, 1 | 2 | 3) && !(format == 2 && activation != 1) && projection == 1
             && matches!(words[7], 1 | 7) && (1..=6).contains(&count),
             "unsupported FP8 expert package ABI {words:?}");
         let info = Self {
@@ -78,7 +80,8 @@ impl Fp8MoeInfo {
             swiglu_limit: f32::from_bits(words[8]),
             activation: match activation {
                 1 => Fp8MoeActivation::SiluBf16Product,
-                _ => Fp8MoeActivation::SiluPostClampFp32Product,
+                2 => Fp8MoeActivation::SiluPostClampFp32Product,
+                _ => Fp8MoeActivation::SwigluOai,
             },
             projection: Fp8MoeProjection::Bf16,
             capacities: words[10..10 + count].iter().map(|&c| c as usize).collect(),
@@ -383,17 +386,18 @@ mod metadata_tests {
     #[test]
     fn activation_contract_is_explicit_and_fail_closed() {
         for format in [1, 2, 4, 5] {
-            for activation in [1, 2] {
+            for activation in [1, 2, 3] {
                 let mut w = words();
                 w[0] = 5 | format << 8 | activation << 16 | 1 << 24;
                 w[8] = 7.0f32.to_bits();
-                if format == 2 && activation == 2 {
+                if format == 2 && activation != 1 {
                     assert!(Fp8MoeInfo::from_words(w).is_err());
                     continue;
                 }
                 let info = Fp8MoeInfo::from_words(w).unwrap();
                 let requested = if activation == 1 { Fp8MoeActivation::SiluBf16Product }
-                    else { Fp8MoeActivation::SiluPostClampFp32Product };
+                    else if activation == 2 { Fp8MoeActivation::SiluPostClampFp32Product }
+                    else { Fp8MoeActivation::SwigluOai };
                 info.validate_activation(requested, 7.0, Fp8MoeProjection::Bf16).unwrap();
                 assert!(info.validate_activation(requested, 2.0, Fp8MoeProjection::Bf16).is_err());
                 if activation == 1 {
@@ -402,7 +406,7 @@ mod metadata_tests {
                 }
             }
         }
-        for abi in [1, 2, 3, 4, 0x01000105, 0x01030105, 0x02010105, 0x01010305] {
+        for abi in [1, 2, 3, 4, 0x01000105, 0x01040105, 0x02010105, 0x01010305] {
             let mut w = words();
             w[0] = abi;
             assert!(Fp8MoeMetadata::from_words_and_scratch(w, |_| panic!("invalid contract queried scratch")).is_err());

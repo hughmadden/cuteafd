@@ -854,6 +854,15 @@ pub fn read_expert_catalog(snapshot: &Path) -> Result<OfficialV41Catalog> {
         return Ok(OfficialV41Catalog { reader: Default::default(), format: crate::plan::checkpoint::CheckpointFormat::HfIndexed, config: None, experts: shape, snapshot: snapshot.to_path_buf(),
             tensors: Vec::new(), exl3: None, nvfp4: None, fp8: Some(fp8) });
     }
+    if config["model_type"] == "minimax_m3_vl" {
+        let cfg = crate::families::minimax_m3::config::MiniMaxM3Config::from_hf(&config)?;
+        cfg.release_geometry()?;
+        let first_layer = cfg.moe.iter().position(|&moe| moe).context("MiniMax M3 has no routed layers")?;
+        ensure!(cfg.moe[first_layer..].iter().all(|&moe| moe), "MiniMax M3 routed layers must be contiguous");
+        return fp8_catalog(snapshot, RoutedExpertShape { layers: cfg.layers, first_layer,
+            experts: cfg.experts, topk: cfg.topk, hidden: cfg.hidden, intermediate: cfg.moe_intermediate,
+            draft_stages: 0, draft_experts: 0 });
+    }
     if config.get("text_config").is_some() {
         return read_official_v41_catalog(snapshot);
     }
@@ -1078,7 +1087,7 @@ fn fp8_catalog(snapshot: &Path, shape: RoutedExpertShape) -> Result<OfficialV41C
     let index: Index = crate::families::deepseek_v41::v41_exl3::read_json(&snapshot.join("model.safetensors.index.json"),
         64 * 1024 * 1024).and_then(|value| Ok(serde_json::from_value(value)?))?;
     let mut coordinator: Vec<V41Tensor> = read_index_headers(snapshot, &index.weight_map)?.into_iter()
-        .filter(|(_, tensor)| !(tensor.name.contains(".mlp.experts.")
+        .filter(|(_, tensor)| !((tensor.name.contains(".mlp.experts.") || tensor.name.contains(".block_sparse_moe.experts."))
             && hf_layer(&tensor.name).is_some_and(|layer| layer < shape.layers)))
         .map(|(shard, metadata)| V41Tensor { shard, metadata, placement: V41TensorPlacement::CoordinatorRtx })
         .collect();

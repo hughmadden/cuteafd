@@ -63,6 +63,7 @@ impl Layer<'_> {
     ) -> Result<Self> {
         use cuteafd_loader::formats::fp8_experts::{ExpertFormat, Fp8Projection};
         let tensors = tensors.for_layer_metadata(layer)?;
+        tensors.validate_push_scales()?;
         let mut widen = Vec::new();
         let mut scalars = Vec::new();
         let mut inputs = Vec::new();

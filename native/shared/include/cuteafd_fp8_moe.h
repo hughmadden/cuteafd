@@ -15,9 +15,11 @@ extern "C" {
 //   bits 0..7: ABI version 5 (old unversioned contracts are rejected)
 //   bits 8..15: storage 1=FP8 block128, 2=MXFP4, 4=NVFP4 W4A4, 5=BF16
 //   bits 16..23: activation 1=pre-SiLU clamp + BF16 SiLU/product rounding,
-//                          2=post-SiLU clamp + FP32 product/final BF16 rounding
+//                          2=post-SiLU clamp + FP32 product/final BF16 rounding,
+//                          3=swigluoai_uninterleave (gate first, alpha=1.702, beta=1)
 //   bits 24..31: projection 1=BF16 gate/up and down outputs
-// Both activations clamp up to [-limit, limit]; limit zero disables clamping.
+// Codes 1/2 clamp up to [-limit, limit]; limit zero disables clamping.
+// Code 3: g=min(gate,limit), u=clamp(up,-limit,limit), g*sigmoid(1.702*g)*(u+1).
 // [1] hidden, [2] slice, [3] experts, [4] top-k,
 // [5] intermediate, [6] tp, [7] input dtype (7 = FP8 E4M3 + UE8M0 K32 wire
 // rows: Spark packages; 1 = BF16 rows: coordinator packages), [8] SwiGLU limit (FP32 bits, 0 = none), [9] capacity count n,
