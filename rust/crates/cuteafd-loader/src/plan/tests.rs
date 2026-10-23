@@ -2111,7 +2111,7 @@ fn glm5_flash_selected_working_set_drives_plan_request_and_runtime_buffers() {
                 topk: cfg.topk as u32, intermediate: cfg.moe_intermediate as u32, layers: cfg.layers as u32 };
             let io = working.rank_io(device.index as usize, geometry, 4096, checkpoint.spark_input_is_bf16(),
                 placement::SparkRingGeometry { max_frame_bytes: 64 << 20, depth: 8, slot_bytes: 8 << 20,
-                    alignment: 4096, endpoints: working.prefill_lanes as usize }).unwrap();
+                    alignment: 4096, endpoints: 1 }).unwrap();
             for (group, bytes) in [("expert intake", io.intake), ("host expert exchange", io.host_exchange),
                 ("expert row indices", io.row_indices), ("endpoint response prefixes", io.endpoint_staging),
                 ("rdma rings", io.mapped_rings)] {

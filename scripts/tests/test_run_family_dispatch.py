@@ -581,7 +581,7 @@ def test_glmf_selection_starts_after_solve_and_seals_before_opening_lanes() -> N
     assert body.index("load_while_admitting(admission,") < body.index("TokenEmbedding::load(")
     assert body.index("TokenEmbedding::load(") < body.index("engine::GlmfEngine::new(")
     assert "let spark = !spark_layers.is_empty();" in body
-    assert "selected_args.prefill_lanes = usize::try_from(working.prefill_lanes)?;" in body
+    assert "selected_args.prefill_waves = usize::try_from(working.prefill_lanes)?;" in body
     assert body.index("working.prefill_lanes") < body.index("TokenEmbedding::load(")
     assert "spark_layers == working.spark_layers" in body
     assert "rtx_layers == working.rtx_layers" in body
@@ -606,14 +606,18 @@ def test_glmf_selection_starts_after_solve_and_seals_before_opening_lanes() -> N
     admission = source[source.index("    fn admit("):source.index("    pub fn with_engine<")]
     assert "solve_attention_working_set_with_graphs(" in admission
     assert "let local_workspace = workspaces(false, lanes);" in admission
-    assert "configured_prefill_lanes(layers == self.cfg.layers, args.prefill_lanes)" in admission
+    assert "configured_prefill_waves(layers == self.cfg.layers, args.prefill_waves)" in admission
+    assert "admitted_prefill_waves(attention.mode, lanes as u64)" in admission
     engine = (ROOT / "rust/crates/cuteafd-daemon/src/families/glm5_flash/engine.rs").read_text()
-    pipeline = engine.split("    fn pipelined(&self)", 1)[1].split("    /// Longest chunk", 1)[0]
-    assert "prefill_pipeline_available(" in pipeline and "_ => None" in pipeline
-    lane_step = engine.split("    fn step_lanes_inner(", 1)[1].split("    ///", 1)[0]
-    assert "pipelined prefill needs Spark experts" not in lane_step
-    assert "self.spark_land_lane(" in lane_step
-    assert "Some(Experts::Skip)" in lane_step
+    pipeline = engine.split("    fn pipelined(&self)", 1)[1].split("    /// The continuous span", 1)[0]
+    assert "self.weights.layers.len() == self.cfg.layers" in pipeline
+    units = (ROOT / "rust/crates/cuteafd-daemon/src/families/glm5_flash/engine/units.rs").read_text()
+    assert "run_prefill_units(&mut hooks, &units, waves)" in units
+    assert "spark_land_unit(" in units and "unit_ffn_finish(" in units
+    begin = units.split("    fn begin_unit(", 1)[1].split("    fn attention(", 1)[0]
+    attention = units.split("    fn attention(", 1)[1].split("    fn local_ffn(", 1)[0]
+    assert "exchange_direct(" not in begin
+    assert attention.index("return e.unit_attention(") < attention.index("e.exchange_direct(") < attention.index("e.peer_attention(")
     layout = (ROOT / "rust/crates/cuteafd-loader/src/plan/layout/glm5_flash.rs").read_text()
     assert "step_workspace(&ExpertPlacement::Local, lanes)" in layout
     assert "local_workspace = Some(estimate(lanes))" in layout
@@ -632,7 +636,7 @@ def test_glmf_selection_starts_after_solve_and_seals_before_opening_lanes() -> N
     assert "GlmfComponent::SparkExperts, gpu, Category::Transport, \"Spark intake\"" in request
     expert = source[source.index("    fn experts_for_layers<"):source.index("impl Opened {\n    /// The checkpoint's `embed_tokens`")]
     assert expert.index("validate_expert_layers(&self.cfg, served, selected)?;") < expert.index("if selected.is_empty() { return Ok(None); }")
-    assert expert.index("if selected.is_empty() { return Ok(None); }") < expert.index("Fp8Experts::load(") < expert.index("SparkLink::new(")
+    assert expert.index("if selected.is_empty() { return Ok(None); }") < expert.index("Fp8Experts::load(") < expert.index("SparkLink::new_waves(")
     assert "tensors, &directory, selected, 1, 0," in expert
     assert "layers: selected.to_vec()" in expert
     assert "spark_warmup_request(&self.cfg, warm_rows, remote[0], self.checkpoint.spark_input_is_bf16())" in expert
@@ -1188,9 +1192,8 @@ def test_mimo_transport_timing_is_resolved_once_for_all_prefill_lanes():
     ({"model_type": "glm_moe_dsa", "num_hidden_layers": 4, "first_k_dense_replace": 3}, "", {}, 4),
     ({"model_type": "glm_moe_dsa", "num_hidden_layers": 4, "first_k_dense_replace": 3}, "", {"CUTEAFD_GLM_PREFILL_LANES": "1"}, 1),
     ({"model_type": "glm_moe_dsa", "num_hidden_layers": 4, "first_k_dense_replace": 3}, "", {"CUTEAFD_GLM_PREFILL_LANES": "4"}, 5),
-    ({"model_type": "glm5_next"}, "", {}, 2),
-    ({"model_type": "glm5_next"}, "GLM5_FLASH_PREFILL_LANES=4\n", {}, 4),
-    ({"model_type": "glm5_next"}, "GLM5_FLASH_PREFILL_LANES=4\n", {"CUTEAFD_GLMF_PREFILL_LANES": "1"}, 1),
+    ({"model_type": "glm5_next"}, "", {}, 1),
+    ({"model_type": "glm5_next"}, "PREFILL_WAVES=4\n", {}, 1),
     ({"model_type": "qwen4_exp"}, "", {}, 1),
     ({"model_type": "mimo_v2_flash"}, "", {}, 2),
     ({"model_type": "mimo_v2", "hidden_size": 6144}, "", {}, 3),
@@ -1709,14 +1712,14 @@ def test_glmf_index_cache_is_forwarded_only_when_compact(tmp_path, keys, compact
 
 
 @pytest.mark.parametrize("keys,expected,absent", [
-    ("", [], ["--prefill-lanes", "--prefill-lane-rows", "--headroom-gib", "--graph-budget-mib"]),
-    ("GLM5_FLASH_PREFILL_LANES=4\nGLM5_FLASH_PREFILL_LANE_ROWS=2048\n",
-     ["--prefill-lanes 4", "--prefill-lane-rows 2048"], []),
-    ("GLM5_FLASH_PREFILL_LANES=1\n", ["--prefill-lanes 1"], ["--prefill-lane-rows"]),
-    ("GLM5_FLASH_HEADROOM_GIB=1\n", ["--headroom-gib 1"], ["--prefill-lanes"]),
+    ("", [], ["--prefill-waves", "--prefill-rows", "--headroom-gib", "--graph-budget-mib"]),
+    ("PREFILL_WAVES=4\nPREFILL_ROWS=2048\n",
+     ["--prefill-waves 4", "--prefill-rows 2048"], []),
+    ("PREFILL_WAVES=1\n", ["--prefill-waves 1"], ["--prefill-rows"]),
+    ("GLM5_FLASH_HEADROOM_GIB=1\n", ["--headroom-gib 1"], ["--prefill-waves"]),
     ("GLM5_FLASH_GRAPH_BUDGET_MIB=512\n", ["--graph-budget-mib 512"], ["--headroom-gib"]),
 ])
-def test_glmf_lanes_and_headroom_are_forwarded_only_when_set(tmp_path, keys, expected, absent):
+def test_glmf_units_and_headroom_are_forwarded_only_when_set(tmp_path, keys, expected, absent):
     config = {"model_type": "glm5_next", "num_hidden_layers": 2,
               "mlp_layer_types": ["sparse"] * 2,
               "layer_types": ["linear_attention", "deepseek_sparse_attention"]}
@@ -1730,16 +1733,16 @@ def test_glmf_lanes_and_headroom_are_forwarded_only_when_set(tmp_path, keys, exp
 
 
 @pytest.mark.parametrize("key,value,message", [
-    ("GLM5_FLASH_PREFILL_LANES", "0", "GLM5_FLASH_PREFILL_LANES must be 1 to 4"),
-    ("GLM5_FLASH_PREFILL_LANES", "5", "GLM5_FLASH_PREFILL_LANES must be 1 to 4"),
-    ("GLM5_FLASH_PREFILL_LANE_ROWS", "2000", "GLM5_FLASH_PREFILL_LANE_ROWS must be a multiple of 64"),
-    ("GLM5_FLASH_PREFILL_LANE_ROWS", "8192", "GLM5_FLASH_PREFILL_LANE_ROWS must be a multiple of 64"),
-    ("GLM5_FLASH_PREFILL_LANE_ROWS", "0", "GLM5_FLASH_PREFILL_LANE_ROWS must be a multiple of 64"),
+    ("PREFILL_WAVES", "0", "PREFILL_WAVES must be 1 to 4"),
+    ("PREFILL_WAVES", "5", "PREFILL_WAVES must be 1 to 4"),
+    ("PREFILL_ROWS", "2000", "PREFILL_ROWS must be a multiple of 64"),
+    ("PREFILL_ROWS", "8192", "PREFILL_ROWS must be a multiple of 64"),
+    ("PREFILL_ROWS", "0", "PREFILL_ROWS must be a multiple of 64"),
     ("GLM5_FLASH_HEADROOM_GIB", "-1", "GLM5_FLASH_HEADROOM_GIB must be a non-negative size"),
     ("GLM5_FLASH_HEADROOM_GIB", "1GiB", "GLM5_FLASH_HEADROOM_GIB must be a non-negative size"),
     ("GLM5_FLASH_GRAPH_BUDGET_MIB", "0", "GLM5_FLASH_GRAPH_BUDGET_MIB must be a positive whole number"),
 ])
-def test_glmf_invalid_lanes_or_headroom_fail_before_workers_launch(tmp_path, key, value, message):
+def test_glmf_invalid_units_or_headroom_fail_before_workers_launch(tmp_path, key, value, message):
     config = {"model_type": "glm5_next", "num_hidden_layers": 2,
               "mlp_layer_types": ["sparse"] * 2,
               "layer_types": ["linear_attention", "deepseek_sparse_attention"]}

@@ -11,7 +11,7 @@ pub(crate) mod serve;
 mod media;
 mod speculate;
 mod expert_rows;
-mod lane_check;
+mod unit_check;
 mod packed_check;
 pub(crate) mod packing;
 mod header;
@@ -94,7 +94,7 @@ pub(crate) struct EngineArgs {
     #[arg(long, value_enum, env = "CUTEAFD_GLMF_INDEX_CACHE", default_value = "keys")]
     pub index_cache: engine::IndexCache,
     /// Rows of one prefill lane, and of a serial prefill chunk (the programs take up to 4096).
-    #[arg(long, visible_alias = "prefill-lane-rows", default_value_t = 4096)]
+    #[arg(long, default_value_t = 4096)]
     pub prefill_rows: usize,
     /// The most rows of one decode or verify step: 64 (the `_m64` programs), or 128, where a step of
     /// more than 64 rows runs the wide `_m128` programs (a build with CUTEAFD_GLMF_WIDE_DECODE_ROWS=128;
@@ -108,12 +108,16 @@ pub(crate) struct EngineArgs {
     /// Numerical decode/verify reduction rows, independent of execution capacity.
     #[arg(long, env = "CUTEAFD_ATTENTION_PLAN_ROWS")]
     pub attention_plan_rows: Option<usize>,
-    /// Lanes a Spark prefill chunk runs in, each with its own Spark transport and exchange in
-    /// flight while the other lanes' GPU layers run (1 to 4): a chunk of up to lanes x
-    /// --prefill-rows rows. The lanes share one set of attention temporaries.
-    #[arg(long, default_value_t = engine::DEFAULT_PREFILL_LANES,
-        value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..=engine::MAX_PREFILL_LANES as u64))]
-    pub prefill_lanes: usize,
+    /// Maximum live prefill units on one Spark transport (1 to 4; mixed layer ownership caps
+    /// this at 2). Units retain their own operands and share attention temporaries; long
+    /// spans reuse slots continuously. --prefill-rows bounds each unit's rows.
+    #[arg(long = "prefill-waves", default_value_t = engine::DEFAULT_PREFILL_WAVES,
+        value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..=engine::MAX_PREFILL_WAVES as u64))]
+    pub prefill_waves: usize,
+    /// Maximum rows of a continuous prefill call; units recycle the admitted slots.
+    #[arg(long, default_value_t = 16384,
+        value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..))]
+    pub prefill_span_rows: usize,
     /// GPU memory (GiB) an automatic pool leaves free for growth the start-up cannot measure
     /// (lazily loaded kernels, cuBLAS, allocator rounding), when every other allocation precedes
     /// the pool (one GPU, Spark experts): the pool takes the rest, less the graph reserve and the
@@ -768,7 +772,7 @@ mod draft_cli_tests {
         }
         // Two lanes' transports, each with a plane per Spark (4 ranks) of 64 more rows of 4,096 BF16.
         assert_eq!(wide_intake_bytes(&args, 4, 4096), 2 * 4 * 64 * 4096 * 2);
-        assert_eq!(wide_intake_bytes(&parse(&["--prefill-rows", "64", "--decode-rows", "128", "--prefill-lanes", "4"]),
+        assert_eq!(wide_intake_bytes(&parse(&["--prefill-rows", "64", "--decode-rows", "128", "--prefill-waves", "4"]),
             4, 4096), 4 * 4 * 64 * 4096 * 2);
         for flags in [&[][..], &["--decode-rows", "128"][..], &["--prefill-rows", "64"][..],
             &["--prefill-rows", "128", "--decode-rows", "128"][..]] {
@@ -791,14 +795,16 @@ mod draft_cli_tests {
         let sized = ["args.expert", "_rows()"].concat();
         assert!(dense.contains(&["DenseNvfp4::load(&self.library, &directory, &self.cfg, ", &sized, ")?"].concat()));
         // FP8 experts, EXL3 experts and the Spark transports, each with the rows among its arguments.
-        for site in ["Fp8Experts::load(", "max_rows: ", "SparkLink::new("] {
+        for site in ["Fp8Experts::load(", "max_rows: ", "SparkLink::new_waves("] {
             let at = experts.find(site).unwrap_or_else(|| panic!("{site}"));
             let arguments: String = experts[at..].chars().take(200).collect();
             assert!(arguments.contains(&sized), "{site}");
         }
         assert_eq!(experts.matches(&sized).count(), 4);
         let lane = ["args.prefill", "_rows"].concat();
-        assert!(!dense.contains(&lane) && !experts.contains(&lane));
+        assert!(!dense.contains(&lane));
+        // Only the intake plane uses the unit width; all expert math holds expert_rows.
+        assert_eq!(experts.matches(&lane).count(), 1);
     }
 
     #[test]
@@ -850,14 +856,22 @@ mod draft_cli_tests {
     #[test]
     fn prefill_lanes_default_to_two_of_4096_rows_and_take_one_to_four() {
         let defaults = parse(&[]);
-        assert_eq!((defaults.prefill_lanes, defaults.prefill_rows), (2, 4096));
-        let four = parse(&["--prefill-lanes", "4", "--prefill-lane-rows", "2048"]);
-        assert_eq!((four.prefill_lanes, four.prefill_rows), (4, 2048));
+        assert_eq!((defaults.prefill_waves, defaults.prefill_rows), (2, 4096));
+        let four = parse(&["--prefill-waves", "4", "--prefill-rows", "2048"]);
+        assert_eq!((four.prefill_waves, four.prefill_rows), (4, 2048));
         assert_eq!(parse(&["--prefill-rows", "2048"]).prefill_rows, 2048);
         for lanes in ["0", "5"] {
             assert!(Parse::try_parse_from(["test", "--snapshot", "/checkpoint", "--native-lib", "/native",
-                "--prefill-lanes", lanes]).is_err());
+                "--prefill-waves", lanes]).is_err());
         }
+    }
+
+    #[test]
+    fn prefill_span_is_an_explicit_positive_engine_flag() {
+        assert_eq!(parse(&[]).prefill_span_rows, 16384);
+        assert_eq!(parse(&["--prefill-span-rows", "32768"]).prefill_span_rows, 32768);
+        assert!(Parse::try_parse_from(["test", "--snapshot", "/checkpoint", "--native-lib", "/native",
+            "--prefill-span-rows", "0"]).is_err());
     }
 
     #[test]
@@ -984,8 +998,8 @@ pub(crate) enum Fp8PrefillGroup {
 pub(crate) struct GoldenArgs {
     #[command(flatten)]
     pub engine: EngineArgs,
-    /// Directory with tokens.bin, layerNN.bin and logits.bin from
-    /// python/reference/families/glm5_flash/golden.py.
+    /// Directory with tokens.bin, layerNN.bin and logits.bin from the family reference;
+    /// token-only diagnostics also accept the published Flash fidelity dataset's quick windows.
     #[arg(long)]
     pub golden: PathBuf,
     /// Prefill only the first N tokens, then feed the rest through decode
@@ -1120,11 +1134,10 @@ pub(crate) struct GoldenArgs {
     /// candidates).
     #[arg(long, hide = true, requires = "resume_at")]
     pub resume_poison_unit0: bool,
-    /// Prefill lanes against serial passes: one pipelined chunk of the golden prompt (--prefill N
-    /// truncates it) through the lanes, and through serial passes over the same cuts; every row's
-    /// logits, the KDA state and every paged byte must be identical. Needs Spark --peers.
+    /// Compare executor N=1 and N=2 at identical row cuts, including recycled slots:
+    /// every row's logits, KDA state and paged bytes must be identical.
     #[arg(long)]
-    pub lane_check: bool,
+    pub unit_check: bool,
     /// Packed prefill against each sequence's own pass: N (2 to 10) sequences of mixed lengths cut
     /// from the golden prompt (the last resumed past the dense context) in one packed pass and
     /// each in its own pass; every sequence's last-row logits, KDA state and paged bytes must be
@@ -1148,6 +1161,20 @@ mod replay_cli_tests {
     struct Parse {
         #[command(flatten)]
         args: GoldenArgs,
+    }
+
+    #[test]
+    fn unit_identity_is_a_golden_option_not_an_engine_key() {
+        #[derive(Parser)]
+        struct EngineOnly {
+            #[command(flatten)]
+            args: super::EngineArgs,
+        }
+        let golden = ["test", "--snapshot", "/checkpoint", "--native-lib", "/native", "--golden", "/golden"];
+        assert!(Parse::try_parse_from(golden.into_iter().chain(["--unit-check"])).unwrap().args.unit_check);
+        assert!(Parse::try_parse_from(golden.into_iter().chain(["--lane-check"])).is_err());
+        assert!(EngineOnly::try_parse_from(["test", "--snapshot", "/checkpoint", "--native-lib", "/native",
+            "--unit-check"]).is_err());
     }
 
     #[test]
@@ -1252,7 +1279,7 @@ impl EngineArgs {
 /// keeps for `--prefill-rows` rows. `ranks` Spark ranks, one transport per prefill lane.
 fn wide_intake_bytes(args: &EngineArgs, ranks: usize, hidden: usize) -> u64 {
     use cuteafd_loader::serving_capacity::spark_intake_bytes;
-    let at = |rows: usize| spark_intake_bytes(args.prefill_lanes as u64, ranks as u64, rows as u64, hidden as u64);
+    let at = |rows: usize| spark_intake_bytes(args.prefill_waves as u64, ranks as u64, rows as u64, hidden as u64);
     at(args.expert_rows()) - at(args.prefill_rows)
 }
 
@@ -1447,7 +1474,8 @@ impl Opened {
                 args.token_io.embed_placement, engine::GlmfAttention { first_owner: 1 - attention.first_owner, ..attention }))
             .transpose()?;
         let spark_ranks = args.peers.as_deref().map_or(0, |p| p.split(',').count());
-        let lanes = engine::configured_prefill_lanes(layers == self.cfg.layers, args.prefill_lanes);
+        let lanes = engine::configured_prefill_waves(layers == self.cfg.layers, args.prefill_waves);
+        let lanes = usize::try_from(admission::admitted_prefill_waves(attention.mode, lanes as u64))?;
         let lookup = |name: &str| programs.spec(name).ok().map(|p| p.scratch.get("scratch").copied().unwrap_or(0));
         let scratch = GlmfScratchOptions { split, kda_w8: representation.kda_fp8,
             kda_fp32_partials: args.kda_fp32_partials, kda_output_shard: args.kda_output_shard,
@@ -1748,9 +1776,9 @@ impl Opened {
         if draft_gpu == 0 { drop(prepared_draft.take()); }
         probe("admission-programs")?;
         let mut selected_args = args.clone();
-        selected_args.prefill_lanes = usize::try_from(working.prefill_lanes)?;
+        selected_args.prefill_waves = usize::try_from(working.prefill_lanes)?;
         let args = &selected_args;
-        if !args.skip_experts && placement.tp2.is_some() { engine::check_tp2_lanes(args.prefill_lanes)?; }
+
         let spark_layers = admitted_spark_layers(&self.cfg, &placement.layers, args.skip_experts)?;
         if !args.skip_experts {
             ensure!(spark_layers == working.spark_layers,
@@ -1835,7 +1863,7 @@ impl Opened {
                 else { cuteafd_core::SparkIngress::Fp8K32 };
             let model = cuteafd_transport::worker_selection::ModelAdmission {
                 capacity, compiled_capacity: capacity,
-                endpoints: vec![cuteafd_core::SparkEndpoint { ring_depth: None, capacity, ingress }; args.prefill_lanes],
+                endpoints: vec![cuteafd_core::SparkEndpoint { ring_depth: None, capacity, ingress }],
                 rings: crate::shared::placement::spark_rings(64 << 20)?,
             };
             let admission = crate::shared::placement::SparkAdmission::plan(source, geometry, self.experts.as_ref(),
@@ -1980,14 +2008,14 @@ impl Opened {
             let mut settings = step_settings(args, index_cache, self.checkpoint.spark_input_is_bf16());
             settings.max_context = max_context;
             let plan = engine::StepPlan::new(&self.library, &programs, &self.cfg, &model.layers, step_experts, settings);
-            let lanes = engine::configured_prefill_lanes(layers == self.cfg.layers, args.prefill_lanes);
+            let lanes = engine::configured_prefill_waves(layers == self.cfg.layers, args.prefill_waves);
             Some(engine::StepWorkspaces::allocate(&plan, args.prefill_rows, lanes)?)
         } else { None };
         let records = early_workspaces.as_ref().map(|w| w.prefill_scratch()
             .context("shared replay records need prefill lanes")).transpose()?;
         let pages = (pool_tokens + reserved_units as usize * engine::UNIT_ROWS).div_ceil(engine::PAGE_ROWS);
         let mut engine = engine::GlmfEngine::new(&self.library, &programs, self.cfg.clone(), model, stream,
-            max_context, args.prefill_rows, args.prefill_lanes, pages, args.slots, embedding, index_cache,
+            max_context, args.prefill_rows, args.prefill_waves, args.prefill_span_rows, pages, args.slots, embedding, index_cache,
             args.kda_state, args.decode_rows, records, context_mode, args.prefix_marks == prefix::PrefixMarks::Pool,
             &execution, step_experts)?;
         engine.attention_plan = attention_plan;
@@ -2185,44 +2213,31 @@ impl Opened {
         let remote = selected;
         let peers = peers.split(',').map(str::parse).collect::<std::result::Result<Vec<std::net::SocketAddr>, _>>()?;
         let spark_world = cuteafd_transport::expert::SparkWorld::canonical(peers.len())?;
-        // One transport per prefill lane: each lane's wave stays in flight on its own QPs. Each takes
-        // waves of the widest step (`expert_rows`): a verify step may be wider than a prefill lane.
-        let mut transports = (0..args.prefill_lanes).map(|_| crate::shared::spark_intake::SparkLink::new(&self.library,
+        // One link retains independent intake planes for every outstanding unit wave.
+        let mut transport = crate::shared::spark_intake::SparkLink::new_waves(&self.library,
             spark_world, &peers, u32::try_from(args.expert_rows())?, cuteafd_transport::TcpTransportConfig { timing: false,
-                timeout: std::time::Duration::from_secs(120), max_frame_bytes: 64 << 20 }, self.cfg.hidden * 2))
-            .collect::<Result<Vec<_>>>()?;
-        for link in &mut transports { link.enable_terminal_ownership(self.library.clone())?; }
+                timeout: std::time::Duration::from_secs(120), max_frame_bytes: 64 << 20 }, self.cfg.hidden * 2,
+            args.prefill_waves, u32::try_from(args.prefill_rows)?)?;
+        transport.enable_terminal_ownership(self.library.clone())?;
         crate::shared::memory_report::release_load_staging(&self.library);
         let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
-        // Connect every rank and register full-size buffers now, as GLM-5, MiMo and DeepSeek V4 do: a
-        // rank's session fits the request that opened it, and a request that does not fit reconnects
-        // the rank first (`LocalTp4Client::post`). A lane's rows follow the prompt, so each new longest
-        // prompt would reconnect four ranks mid-prefill, and the first request would open transport 0.
-        // Every transport a prefill runs on (transport 0 also carries decode, verify and serial chunks)
-        // is warmed with `expert_rows` rows, the most any of its waves carries.
-        let warmed = engine::configured_prefill_lanes(served == self.cfg.layers, transports.len());
         let warm_rows = args.expert_rows();
         let warm = engine::spark_warmup_request(&self.cfg, warm_rows, remote[0], self.checkpoint.spark_input_is_bf16())?;
-        // Connect every warmed rank now and publish its installed expert
-        // grouping: the draft planner prices the workers before any wave opens a
-        // session, and the warm-up below then reuses these sessions.
-        for link in &mut transports[..warmed] { link.bootstrap(&warm)?; }
+        // Publish grouping before the draft planner prices the installed workers.
+        transport.bootstrap(&warm)?;
         let rings = || cuteafd_ffi::memory_ledger::snapshot().by_scope(cuteafd_ffi::memory_ledger::Space::Pinned, -1)
             .get("transport/rdma-rings").copied().unwrap_or(0);
         let (started, before) = (Instant::now(), rings());
-        // Drained and destroyed on every way out, before the transports drop.
         let warm_stream = crate::shared::spark_intake::WarmStream::new(self.library.as_ref())?;
-        for (index, transport) in transports[..warmed].iter_mut().enumerate() {
-            runtime.block_on(async {
-                let wave = transport.dispatch(&warm)?;
-                transport.receive(wave, warm_rows, warm_stream.raw()).await
-            }).with_context(|| format!("warming Spark expert transport {index} with {warm_rows} rows"))?;
-        }
+        runtime.block_on(async {
+            let wave = transport.dispatch(&warm)?;
+            transport.receive(wave, warm_rows, warm_stream.raw()).await
+        }).with_context(|| format!("warming Spark expert transport with {warm_rows} rows"))?;
         warm_stream.finish()?;
-        tracing::info!(transports = warmed, lanes = transports.len(), ranks = peers.len(), rows = warm_rows,
+        tracing::info!(waves = args.prefill_waves, ranks = peers.len(), rows = warm_rows,
             ring_bytes = rings().saturating_sub(before), elapsed_ms = started.elapsed().as_millis() as u64,
-            "Spark expert transports warm");
-        Ok(Some(engine::Experts::Spark { transports: std::cell::RefCell::new(transports), runtime }))
+            "Spark expert transport warm");
+        Ok(Some(engine::Experts::Spark { transport: std::cell::RefCell::new(transport), runtime }))
     }
 }
 
@@ -2259,7 +2274,7 @@ pub(crate) async fn run_golden(mut args: GoldenArgs) -> Result<()> {
         // Capture speculative buckets even when this fixed-token diagnostic has no drafter.
         args.engine.serving_graph_policy = Some((16, true));
     }
-    args.engine.full_prefill_logits |= args.nll || args.resume_at.is_some() || args.lane_check;
+    args.engine.full_prefill_logits |= args.nll || args.resume_at.is_some() || args.unit_check;
     // --resume-at captures into two arena marks (`prefix::resume_check`); pool marks take units.
     args.engine.mark_arena = if args.resume_at.is_some() && args.engine.prefix_marks == prefix::PrefixMarks::Arena {
         prefix::ArenaMarks::Slots(2) } else { prefix::ArenaMarks::None };
@@ -2353,14 +2368,12 @@ fn golden_run(args: &GoldenArgs, opened: &Opened, engine: &engine::GlmfEngine<'_
         return speculate::bench_verify(args, engine, rows);
     }
     if args.upload_check {
-        let tokens: Vec<u32> = std::fs::read(args.golden.join("tokens.bin"))?
-            .chunks_exact(4).map(|b| u32::from_le_bytes(b.try_into().unwrap())).collect();
+        let tokens = unit_check::input_tokens(&args.golden, engine.cfg.vocab_size)?;
         let n = args.prefill.unwrap_or(tokens.len()).min(tokens.len());
         return prefix::upload_check(engine, &tokens[..n], args.prefill_chunk.unwrap_or(256));
     }
     if let Some(at) = args.resume_at {
-        let tokens: Vec<u32> = std::fs::read(args.golden.join("tokens.bin"))?
-            .chunks_exact(4).map(|b| u32::from_le_bytes(b.try_into().unwrap())).collect();
+        let tokens = unit_check::input_tokens(&args.golden, engine.cfg.vocab_size)?;
         let n = args.prefill.unwrap_or(tokens.len()).min(tokens.len());
         return prefix::resume_check(engine, &tokens, at, n,
             args.prefill_chunk.unwrap_or(engine.prefill_rows), args.resume_decode, args.resume_cold,
@@ -2369,15 +2382,13 @@ fn golden_run(args: &GoldenArgs, opened: &Opened, engine: &engine::GlmfEngine<'_
     if let Some(steps) = args.token_check {
         return token_check(args, opened, engine, steps);
     }
-    if args.lane_check {
-        let tokens: Vec<u32> = std::fs::read(args.golden.join("tokens.bin"))?
-            .chunks_exact(4).map(|b| u32::from_le_bytes(b.try_into().unwrap())).collect();
+    if args.unit_check {
+        let tokens = unit_check::input_tokens(&args.golden, engine.cfg.vocab_size)?;
         let n = args.prefill.unwrap_or(tokens.len()).min(tokens.len());
-        return lane_check::lane_check(engine, &tokens[..n]);
+        return unit_check::unit_check(engine, &tokens[..n]);
     }
     if let Some(sequences) = args.packed_check {
-        let tokens: Vec<u32> = std::fs::read(args.golden.join("tokens.bin"))?
-            .chunks_exact(4).map(|b| u32::from_le_bytes(b.try_into().unwrap())).collect();
+        let tokens = unit_check::input_tokens(&args.golden, engine.cfg.vocab_size)?;
         return packed_check::packed_check(engine, &tokens, sequences);
     }
     if engine.drafter.is_some() {
@@ -2426,7 +2437,7 @@ fn golden_run(args: &GoldenArgs, opened: &Opened, engine: &engine::GlmfEngine<'_
     let mut logits: Option<Vec<f32>> = None;
     let mut done = 0;
     // --logits-only prefills without layer downloads (Spark prefill then runs
-    // pipelined in lanes, chunks up to the engine's prefill capacity).
+    // through continuous units, chunks up to the engine's prefill capacity).
     let chunk_rows = if args.logits_only && !args.teacher_force { engine.prefill_capacity() } else { engine.prefill_rows };
     while done < prefill {
         let n = chunk_rows.min(prefill - done);

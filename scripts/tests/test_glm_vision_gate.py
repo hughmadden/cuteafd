@@ -182,16 +182,16 @@ def test_glm_serving_admits_and_precreates_all_reachable_workspaces():
     temporaries = source.split("fn temporaries(", 1)[1].split("fn lane(", 1)[0]
     assert "glmf_temporary_bytes(" in temporaries and "self.alloc(bytes.scratch)" in temporaries
     lane = source.split("fn lane(", 1)[1].split("/// ModelOpt NVFP4 dense MLPs", 1)[0]
-    assert "glmf_lane_bytes(" in lane and "self.alloc(bytes.streams)" in lane
+    assert "glmf_lane_bytes(" in lane and "streams: [alloc(bytes.streams)?" in lane
     reserve = source.split("pub(crate) fn workspace_reserve(", 1)[1].split("/// The prefill lanes a serving engine", 1)[0]
     assert "plan.workspace_bytes(" in reserve and "workspace_reserve_bytes(" in reserve
     prepare = source.split("pub fn prepare_serving_workspaces(", 1)[1].split("/// Capture the complete", 1)[0]
-    for required in ("self.decode_workspace_of(rank)", "self.pipelined()", "self.prefill_lane_count",
-                     "self.prefill_lanes_of(rank, lanes)", "drafter.prepare_workspace()", "self.synchronize()"):
+    for required in ("self.decode_workspace_of(rank)", "self.pipelined()", "self.prefill_waves",
+                     "self.prefill_slots_of(rank, lanes)", "drafter.prepare_workspace()", "self.synchronize()"):
         assert required in prepare
     # Scoring (`--full-prefill-logits`) precreates the same lanes: a serial prefill runs in lane 0.
     scoring = source.split("pub fn prepare_scoring_prefill(", 1)[1].split("fn step_plan(", 1)[0]
-    assert "self.prefill_lanes_of(rank, lanes)" in scoring and "self.workspace(" not in scoring
+    assert "self.prefill_slots_of(rank, lanes)" in scoring and "self.workspace(" not in scoring
     # The per-workspace runtime allowance is the loader's shared definition; where the measured
     # loaded code covers it (`placement::inventory::LOADED_CODE`) the reserve charges that instead.
     graphs = (ROOT / "rust/crates/cuteafd-loader/src/serving_capacity/glmf_graphs.rs").read_text()

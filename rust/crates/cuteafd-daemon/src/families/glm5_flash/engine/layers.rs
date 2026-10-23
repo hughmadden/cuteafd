@@ -72,7 +72,7 @@ struct Bindings<'e, 'a, 'c> {
 }
 
 #[derive(Clone, Copy)]
-struct Ticket {
+pub(super) struct Ticket {
     layer: usize,
     lane: usize,
     spark: bool,
@@ -89,7 +89,9 @@ impl<'a> GlmfEngine<'a> {
         // Context tables currently describe one global unit partition, not per-layer geometry.
         ensure!(self.context.is_none() && !plan.modes().contains(&LayerMode::ContextSplit),
             "GLM mixed context execution requires per-layer paging tables");
-        cuteafd_loader::placement::validate_layer_pipeline_lanes(plan.spec().lanes, self.prefill_lane_count)?;
+        ensure!(plan.spec().lanes == self.prefill_waves as u64,
+            "GLM Flash hop slots must match admitted unit slots");
+        cuteafd_loader::placement::validate_layer_pipeline_lanes(plan.spec().lanes, self.prefill_waves)?;
         ensure!(plan.modes().iter().all(|mode| !matches!(mode,
             LayerMode::Whole { ffn: FfnMode::Owner, .. })), "GLM layer executor requires split FFNs");
         let exchange = self.exchange()?;
@@ -99,7 +101,7 @@ impl<'a> GlmfEngine<'a> {
         hops.attach_abort([exchange.abort_word(0)?.context("rank 0 terminal owner")?,
             exchange.abort_word(1)?.context("rank 1 terminal owner")?])?;
         hops.validate_binding(&plan, exchange)?;
-        self.layer_waves = RefCell::new((0..self.prefill_lane_count).map(|_| None).collect());
+        self.layer_waves = RefCell::new((0..self.prefill_waves).map(|_| None).collect());
         self.layer_execution = Some(Execution { plan, hops });
         Ok(())
     }
@@ -163,64 +165,52 @@ impl<'a> GlmfEngine<'a> {
         Ok(Some(self.device_logits(w, logit_rows, false)))
     }
 
-    pub(super) fn layer_steps(&self, scope: &SubmissionScope<'_>, lanes: &[(StepTables, &[u32])],
-        logit_rows: usize, device: bool, media: Option<&cuteafd_engine::media::RequestMedia>)
-        -> Result<Option<StepLogits>> {
-        let workspaces = self.prefill_lanes_of(0, lanes.len())?;
-        let peers = self.peer_workspaces(false, Some(lanes.len()))?.context("per-layer peer lanes")?;
-        let total: usize = lanes.iter().map(|(tables, _)| tables.kv_slots.len()).sum();
-        ensure!(!lanes.is_empty() && logit_rows <= total && (self.full_prefill_logits || logit_rows <= DECODE_ROWS),
-            "per-layer prefill logit rows exceed admission");
-        let units = lanes.iter().zip(workspaces.iter()).enumerate().map(|(lane, ((tables, _), w))|
-            Ok((w, Some(peers.get(lane)?), tables))).collect::<Result<Vec<_>>>()?;
-        self.on(1, || unsafe {
-            // SAFETY: drain this engine's peer stream before replacing its persistent tables.
-            self.library.cuda_stream_synchronize(self.stream_of(1))
-        })?;
-        let ranked = self.step_tables(&units, &lanes.iter().map(|(t, _)| placement_units(t)).collect::<Vec<_>>())?;
-        let mut bindings = Vec::new();
-        let mut first = 0;
-        for (lane, ((tables, tokens), w)) in lanes.iter().zip(workspaces.iter()).enumerate() {
-            let rows = tables.kv_slots.len();
-            ensure!(rows <= w.rows && tokens.len() == rows && tables.segments.is_empty(),
-                "per-layer lane needs unpacked rows within its workspace");
-            self.load_streams(w, tokens, false)?;
-            self.inject_media(w, tables, media)?;
-            let tap_start = (total - total.min(crate::shared::speculation::dflash::TAP_ROWS)).max(first).min(first + rows);
-            let n = first + rows - tap_start;
-            bindings.push(Bindings { engine: self, work: [w, peers.get(lane)?],
-                tables: [&ranked[lane][0], &ranked[lane][1]], owners: self.layer_owners(),
-                lane, rows, graphed: false, on_layer: None, prepared: Cell::new(None), tap: (tap_start - first, n,
-                    tap_start.saturating_sub(total - total.min(crate::shared::speculation::dflash::TAP_ROWS))) });
-            first += rows;
-        }
-        self.prepare_route_checks(&bindings.iter().map(|binding| binding.rows).collect::<Vec<_>>())?;
-        self.layer_pipeline(scope, &mut bindings)?;
-        if logit_rows == 0 { self.synchronize()?; return Ok(None); }
-        let last = lanes.len() - 1;
-        if device {
-            let w = &workspaces[last];
-            let rows = lanes[last].0.kv_slots.len();
-            ensure!(logit_rows <= rows, "device logits span per-layer lanes");
-            self.layer_head(w, rows, logit_rows)?;
-            return Ok(Some(StepLogits::Device(self.device_logits(w, logit_rows, false))));
-        }
-        let mut logits = Vec::with_capacity(logit_rows * self.cfg.vocab_size);
-        let mut first = 0;
-        for ((tables, _), w) in lanes.iter().zip(workspaces.iter()) {
-            let rows = tables.kv_slots.len();
-            let wanted = (first + rows).saturating_sub((total - logit_rows).max(first));
-            if wanted > 0 {
-                self.layer_head(w, rows, wanted)?;
-                logits.extend(self.download(&w.logits, wanted * self.cfg.vocab_size * 4)?.chunks_exact(4)
-                    .map(|bytes| f32::from_le_bytes(bytes.try_into().unwrap())));
-            }
-            first += rows;
-        }
-        Ok(Some(StepLogits::Host(logits)))
+    fn unit_binding<'s>(&'s self, work: [&'s Workspace<'a>; 2],
+        tables: &'s [StepTables; 2], unit: &crate::shared::prefill_pipeline::Unit,
+        total: usize, prepared: Option<usize>) -> Bindings<'s, 'a, 's> {
+        let window = total.saturating_sub(crate::shared::speculation::dflash::TAP_ROWS);
+        let from = unit.rows.start.max(window).min(unit.rows.end);
+        Bindings { engine: self, work, tables: [&tables[0], &tables[1]], owners: self.layer_owners(),
+            lane: unit.slot, rows: unit.rows.len(), graphed: false, on_layer: None,
+            prepared: Cell::new(prepared), tap: (from - unit.rows.start, unit.rows.end - from,
+                from.saturating_sub(window)) }
     }
 
-    fn layer_head(&self, w: &Workspace<'_>, rows: usize, wanted: usize) -> Result<()> {
+    pub(super) fn unit_attention(&self, work: [&Workspace<'a>; 2], tables: &[StepTables; 2],
+        unit: &crate::shared::prefill_pipeline::Unit, layer: usize, total: usize,
+        consumed: &mut [usize]) -> Result<()> {
+        let execution = self.layer_execution.as_ref().context("per-layer execution")?;
+        execution.hops.validate_binding(&execution.plan, self.exchange()?)?;
+        let exchange = RecordedExchange { engine: self, execution, entry: Cell::new(None) };
+        let mut binding = self.unit_binding(work, tables, unit, total, Some(layer));
+        attention::pipeline_attention(&exchange, &execution.plan, layer, unit.slot, unit.rows.len(),
+            &mut binding, consumed)?;
+        Ok(())
+    }
+
+    pub(super) fn unit_ffn_begin(&self, work: [&Workspace<'a>; 2], tables: &[StepTables; 2],
+        unit: &crate::shared::prefill_pipeline::Unit, layer: usize, total: usize) -> Result<Ticket> {
+        self.unit_binding(work, tables, unit, total, Some(layer)).begin_ffn(layer, None)
+    }
+
+    pub(super) fn unit_ffn_finish(&self, work: [&Workspace<'a>; 2], tables: &[StepTables; 2],
+        unit: &crate::shared::prefill_pipeline::Unit, layer: usize, total: usize, ticket: Ticket) -> Result<()> {
+        self.unit_binding(work, tables, unit, total, Some(layer)).finish_ffn(layer, ticket)
+    }
+
+    pub(super) fn unit_exit(&self, work: [&Workspace<'a>; 2], tables: &[StepTables; 2],
+        unit: &crate::shared::prefill_pipeline::Unit, total: usize, consumed: &mut [usize]) -> Result<()> {
+        let execution = self.layer_execution.as_ref().context("per-layer execution")?;
+        let exchange = RecordedExchange { engine: self, execution, entry: Cell::new(None) };
+        let mut binding = self.unit_binding(work, tables, unit, total, Some(unit.layers.end));
+        attention::pipeline_hops(&exchange, &execution.plan, HopPoint::Exit, unit.slot, unit.rows.len(),
+            &mut binding, consumed)?;
+        ensure!(consumed.len() == execution.plan.hops().len() && consumed.iter().all(|&count| count == 1),
+            "planned unit hop missing or duplicated");
+        Ok(())
+    }
+
+    pub(super) fn layer_head(&self, w: &Workspace<'_>, rows: usize, wanted: usize) -> Result<()> {
         self.run("head", &[("streams", w.streams[0].buffer.ptr), ("weight", self.weights.norm.buffer.ptr),
             ("out", w.x.buffer.ptr)], &[Scalar::I32(rows as i32)])?;
         self.logits(w, rows, wanted, false)
@@ -411,11 +401,10 @@ impl PipelineKernels for Bindings<'_, '_, '_> {
             e.probe_ring(index, w, real, matches!(e.routed_experts(index), Some(Experts::Spark { .. })))?;
             if e.tp2_layer(index) {
                 e.tp2_pair(index, self.lane, w, Some(w1), real, rows, self.cap())?;
-            } else if let Some(Experts::Spark { transports, .. }) = e.routed_experts(index) {
+            } else if let Some(Experts::Spark { transport, .. }) = e.routed_experts(index) {
                 ensure!(e.layer_waves.borrow()[self.lane].is_none(), "unconsumed per-layer Spark wave");
-                let mut transports = transports.borrow_mut();
-                let transport = transports.get_mut(self.lane).context("per-layer Spark lane transport")?;
-                let wave = e.spark_dispatch(w, index, real, self.tables[0].decode, transport, || {
+                let mut transport = transport.borrow_mut();
+                let wave = e.spark_dispatch(w, index, real, self.tables[0].decode, &mut transport, || {
                     e.ffn(w, layer, e.cfg.moe_intermediate, self.cap(), w.shared.buffer.ptr, rows)
                 })?;
                 e.layer_waves.borrow_mut()[self.lane] = Some(wave);
@@ -431,13 +420,12 @@ impl PipelineKernels for Bindings<'_, '_, '_> {
         let e = self.engine;
         let real = if self.tables[0].decode && e.startup_graphs { self.tables[0].real_rows } else { self.rows };
         if ticket.spark {
-            let Some(Experts::Spark { transports, runtime }) = e.routed_experts(index) else { anyhow::bail!("Spark ticket backend changed"); };
+            let Some(Experts::Spark { transport, runtime }) = e.routed_experts(index) else { anyhow::bail!("Spark ticket backend changed"); };
             let wave = e.layer_waves.borrow_mut()[self.lane].take().context("retained Spark wave")?;
             // Only protocol assembly state moves into receive. All QPs, receive registrations,
             // intake planes and pinned upload owners remain in the engine through teardown.
-            let mut transports = transports.borrow_mut();
-            runtime.block_on(e.spark_land(self.work[0], real,
-                transports.get_mut(self.lane).context("Spark completion transport")?, wave))?;
+            let mut transport = transport.borrow_mut();
+            runtime.block_on(e.spark_land(self.work[0], real, &mut transport, wave))?;
         }
         if !self.layer(0, index).dense && real < self.rows {
             let offset = real * e.cfg.hidden * 2;

@@ -1059,6 +1059,21 @@ mod warm_stream_tests {
         }
     }
 
+    fn spark_transport_constructor(source: &str) -> Option<usize> {
+        ["new", "new_waves"].iter()
+            .filter_map(|constructor| source.find(&format!("SparkLink::{constructor}(")))
+            .min()
+    }
+
+    #[test]
+    fn transport_audit_recognizes_single_and_multi_wave_constructors() {
+        for constructor in ["new", "new_waves"] {
+            let source = format!("let transport = SparkLink::{constructor}(");
+            assert_eq!(spark_transport_constructor(&source), Some(16));
+        }
+        assert_eq!(spark_transport_constructor("SparkLink::new_unchecked("), None);
+    }
+
     /// Every family that builds a Spark transport bootstraps it with a request
     /// at install, so each rank's persistent session is open and its immutable
     /// installed expert grouping is published before anything plans against the
@@ -1072,7 +1087,6 @@ mod warm_stream_tests {
     #[test]
     fn every_spark_family_bootstraps_its_transport_with_a_wave_request() {
         // The needles are joined here, so this file's own text does not match them.
-        let link = ["SparkLink::", "new("].concat();
         let open = [".boot", "strap(&"].concat();
         for (family, source) in [
             ("deepseek_v4", include_str!("../families/deepseek_v4/mod.rs")),
@@ -1083,7 +1097,8 @@ mod warm_stream_tests {
             ("step5", include_str!("../families/step5/serve.rs")),
             ("step5 golden", include_str!("../families/step5/golden.rs")),
         ] {
-            let transport = source.find(&link).unwrap_or_else(|| panic!("{family}: no Spark transport"));
+            let transport = spark_transport_constructor(source)
+                .unwrap_or_else(|| panic!("{family}: no Spark transport"));
             let bootstrap = source.find(&open)
                 .unwrap_or_else(|| panic!("{family}: the Spark transport is never bootstrapped"));
             assert!(bootstrap > transport, "{family}: the bootstrap precedes the transport it opens");

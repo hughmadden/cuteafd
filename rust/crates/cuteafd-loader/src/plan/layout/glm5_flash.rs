@@ -26,6 +26,7 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyMo
         // keeps the compact index cache, heads on two GPUs the token keys.
         let attention = glmf::resolve_attention(report.requested_attention, ranks,
             manifest.and_then(glmf::manifest_context))?;
+        let lanes = glmf::admitted_prefill_waves(attention.mode, lanes);
         report.attention_placement = attention.mode;
         let index = match attention.mode {
             placement::AttentionPlacement::Context => crate::serving_capacity::GlmfIndexCache::Compact,

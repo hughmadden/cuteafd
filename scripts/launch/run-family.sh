@@ -311,8 +311,8 @@ GLM5_FLASH_KDA_FP8
 GLMF_KDA_FP8
 GLM5_FLASH_KDA_SPLIT
 GLM5_FLASH_INDEX_CACHE
-GLM5_FLASH_PREFILL_LANES
-GLM5_FLASH_PREFILL_LANE_ROWS
+PREFILL_WAVES
+PREFILL_ROWS
 GLM5_FLASH_HEADROOM_GIB
 GLM5_FLASH_GRAPH_BUDGET_MIB
 GLM5_FLASH_FP8_HEAD
@@ -2326,20 +2326,18 @@ if [[ $family == glm5_flash ]]; then
     compact) family_args+=(--index-cache compact) ;;
     *) echo "GLM5_FLASH_INDEX_CACHE must be keys or compact" >&2; exit 2 ;;
   esac
-  # GLM5_FLASH_PREFILL_LANES (1-4) lanes of GLM5_FLASH_PREFILL_LANE_ROWS rows (whole 64-row
-  # pages up to 4096) take each Spark prefill chunk, every lane with its own exchange in flight;
-  # unset keeps the engine's two lanes of 4096.
-  prefill_lanes="$(get GLM5_FLASH_PREFILL_LANES)"
-  if [[ -n "$prefill_lanes" ]]; then
-    [[ "$prefill_lanes" =~ ^[1-4]$ ]] || { echo "GLM5_FLASH_PREFILL_LANES must be 1 to 4" >&2; exit 2; }
-    family_args+=(--prefill-lanes "$prefill_lanes")
+  # Continuous row units share one Spark link; every in-flight wave owns an intake plane.
+  prefill_waves="$(get PREFILL_WAVES)"
+  if [[ -n "$prefill_waves" ]]; then
+    [[ "$prefill_waves" =~ ^[1-4]$ ]] || { echo "PREFILL_WAVES must be 1 to 4" >&2; exit 2; }
+    family_args+=(--prefill-waves "$prefill_waves")
   fi
-  lane_rows="$(get GLM5_FLASH_PREFILL_LANE_ROWS)"
-  if [[ -n "$lane_rows" ]]; then
-    if ! [[ "$lane_rows" =~ ^[1-9][0-9]*$ ]] || ((lane_rows > 4096 || lane_rows % 64 != 0)); then
-      echo "GLM5_FLASH_PREFILL_LANE_ROWS must be a multiple of 64 up to 4096" >&2; exit 2
+  unit_rows="$(get PREFILL_ROWS)"
+  if [[ -n "$unit_rows" ]]; then
+    if ! [[ "$unit_rows" =~ ^[1-9][0-9]*$ ]] || ((unit_rows > 4096 || unit_rows % 64 != 0)); then
+      echo "PREFILL_ROWS must be a multiple of 64 up to 4096" >&2; exit 2
     fi
-    family_args+=(--prefill-lane-rows "$lane_rows")
+    family_args+=(--prefill-rows "$unit_rows")
   fi
   # GLM5_FLASH_HEADROOM_GIB: GPU memory an automatic pool leaves free for runtime growth when
   # every other allocation precedes it (unset: the engine's 2 GiB; a 32 GB card takes 1).
@@ -2560,7 +2558,6 @@ case "$family" in
     fi
     lane_env_args+=(-e "CUTEAFD_GLM_PREFILL_LANES=$selected_lanes") ;;
   glm5_flash)
-    [[ -z "${CUTEAFD_GLMF_PREFILL_LANES:-}" ]] || lane_env_args+=(-e "CUTEAFD_GLMF_PREFILL_LANES=$CUTEAFD_GLMF_PREFILL_LANES")
     # Planner and server must offer the same conditional drafter homes.
     # Explicit config overrides the legacy process-wide diagnostic switch.
     case "$remote_drafter" in
@@ -2701,6 +2698,10 @@ audio_encoder_hash=""
   if ((count_explicit)) || [[ "$backend" == local ]]; then count_args+=(--spark-ranks "$ranks"); fi
   # The plan charges the drafter this launch actually serves (SPECULATOR=off charges none).
   count_args+=(--speculator "$speculator")
+  if [[ "$family" == glm5_flash ]]; then
+    [[ -z "$(get PREFILL_WAVES)" ]] || plan_draft_args+=(--prefill-lanes "$(get PREFILL_WAVES)")
+    [[ -z "$(get PREFILL_ROWS)" ]] || plan_draft_args+=(--prefill-rows "$(get PREFILL_ROWS)")
+  fi
   if [[ "$family" == step5 ]]; then
     [[ -z "$(get PREFILL_WAVES)" ]] || plan_draft_args+=(--prefill-waves "$(get PREFILL_WAVES)")
     plan_mtp_depth=0

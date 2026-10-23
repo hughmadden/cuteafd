@@ -328,7 +328,8 @@ pub fn spark_endpoints(family: &str, lanes: u64) -> usize {
     match family {
         "deepseek_v41" | "deepseek_v4" => 2,
         "glm5" => 1 + if lanes > 1 { lanes as usize } else { 0 },
-        "glm5_flash" | "mimo_v2" => lanes as usize,
+        "glm5_flash" => 1,
+        "mimo_v2" => lanes as usize,
         "qwen4" => 1,
         _ => 0,
     }
