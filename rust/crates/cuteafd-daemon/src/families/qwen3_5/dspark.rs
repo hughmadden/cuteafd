@@ -44,13 +44,17 @@ fn tapped_rows(library: &NativeLibrary, drafter: &DsparkDrafter<'_>, rows: usize
     Ok(host)
 }
 
-/// Exercise the live cache hooks against serial cold replay of the same canonical
-/// target taps, not an approximate reconstruction of drafter state.
-fn check_draft_prefix(library: &NativeLibrary, drafter: &DsparkDrafter<'_>, taps: &[u8], label: &str)
+/// Exercise the live cache hooks against cold replay of identical canonical taps
+/// and producer row shapes; cuBLAS projection rounding depends on the row count.
+fn check_draft_prefix(library: &NativeLibrary, drafter: &DsparkDrafter<'_>, taps: &[u8],
+    update_rows: &[usize], label: &str)
     -> Result<()> {
     let pitch = drafter.cfg.taps.len() * drafter.cfg.hidden * 2;
     ensure!(!taps.is_empty() && taps.len() % pitch == 0, "dense draft prefix tap shape");
     let frontier = taps.len() / pitch;
+    ensure!(update_rows.iter().all(|&rows| rows > 0 && rows <= TAP_ROWS)
+        && update_rows.iter().try_fold(0usize, |sum, &rows| sum.checked_add(rows)) == Some(frontier),
+        "dense draft prefix update groups differ from retained taps");
     let saved = drafter.capture_pages(0, frontier, frontier)?;
     let read = |attachment: &cuteafd_engine::prefix::DraftPageAttachment| -> Result<Vec<Vec<u8>>> {
         let mut bytes = Vec::new();
@@ -68,12 +72,16 @@ fn check_draft_prefix(library: &NativeLibrary, drafter: &DsparkDrafter<'_>, taps
     };
     let expected = read(&saved)?;
     drafter.reset_context(0, 0)?;
-    for (position, row) in taps.chunks_exact(pitch).enumerate() {
-        drafter.put_taps(row)?;
-        drafter.update(&[ContextRow { tap_row: 0, slot: 0, position }])?;
+    let mut position = 0;
+    for &count in update_rows {
+        drafter.put_taps(&taps[position * pitch..(position + count) * pitch])?;
+        let rows: Vec<_> = (0..count).map(|tap_row| ContextRow {
+            tap_row, slot: 0, position: position + tap_row }).collect();
+        drafter.update(&rows)?;
+        position += count;
     }
     let cold = drafter.capture_pages(0, frontier, frontier)?;
-    ensure!(read(&cold)? == expected, "dense {label} drafter cold/row-invariance bytes differ");
+    ensure!(read(&cold)? == expected, "dense {label} drafter same-shape cold bytes differ");
     drafter.release_pages(&cold)?;
     let continuation = &taps[..3.min(frontier) * pitch];
     let append = || -> Result<cuteafd_engine::prefix::DraftPageAttachment> {
@@ -96,7 +104,7 @@ fn check_draft_prefix(library: &NativeLibrary, drafter: &DsparkDrafter<'_>, taps
     drafter.release_pages(&grown)?;
     drafter.restore_pages(0, &saved, frontier)?;
     drafter.release_pages(&saved)?;
-    println!("dense {label} drafter prefix: {frontier} rows, serial cold/row-invariance, restore and continuation byte-identical");
+    println!("dense {label} drafter prefix: {frontier} rows, same-shape cold replay, restore and continuation byte-identical");
     Ok(())
 }
 
@@ -154,6 +162,7 @@ pub(super) fn spec_decode<'a>(args: &GoldenArgs, library: &'a NativeLibrary, pro
     let mut last = vec![];
     let mut position = 0;
     let mut canonical_taps = Vec::new();
+    let mut update_rows = Vec::new();
     for chunk in prompt.chunks(args.prefill_chunk.min(TAP_ROWS)) {
         last = engine.evaluate(chunk, |layer, hidden| {
             if drafter.tap_index(layer).is_some() {
@@ -167,10 +176,13 @@ pub(super) fn spec_decode<'a>(args: &GoldenArgs, library: &'a NativeLibrary, pro
             position: position + tap_row }).collect();
         drafter.update(&rows)?;
         engine.target_stream().drain()?;
-        if args.prefix_check { canonical_taps.extend(tapped_rows(library, &drafter, chunk.len())?); }
+        if args.prefix_check {
+            canonical_taps.extend(tapped_rows(library, &drafter, chunk.len())?);
+            update_rows.push(chunk.len());
+        }
         position += chunk.len();
     }
-    if args.prefix_check { check_draft_prefix(library, &drafter, &canonical_taps, "prompt")?; }
+    if args.prefix_check { check_draft_prefix(library, &drafter, &canonical_taps, &update_rows, "prompt")?; }
     let mut next = argmax(&last[last.len() - cfg.vocab..])?;
     let mut output = vec![next];
     let mut policy = policy(cfg.attention.len(), draft_cfg.block)?;
@@ -223,7 +235,8 @@ pub(super) fn spec_decode<'a>(args: &GoldenArgs, library: &'a NativeLibrary, pro
         engine.target_stream().drain()?;
         if args.prefix_check && cycles == 0 {
             canonical_taps.extend(tapped_rows(library, &drafter, retained)?);
-            check_draft_prefix(library, &drafter, &canonical_taps, "turn")?;
+            update_rows.push(retained);
+            check_draft_prefix(library, &drafter, &canonical_taps, &update_rows, "turn")?;
         }
         verify_time += verify_start.elapsed();
         proposed += want;
