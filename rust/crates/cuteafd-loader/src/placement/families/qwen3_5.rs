@@ -622,6 +622,7 @@ mod tests {
             LayerBytes { weights: 1 << 30, state: 0, replay: 0, prefix: 0 }];
         for tokens in [262144, 524288] {
             let mut input = inputs(&cfg, &layers, 0);
+            input.gpu.capacity_bytes = 32 << 30;
             input.requested_pool = Some(tokens);
             input.drafter = Some(DrafterBytes { owned: 1 << 30, scratch: 1 << 20, pool_unit: 64 * 20480 });
             let req = request(input)?;

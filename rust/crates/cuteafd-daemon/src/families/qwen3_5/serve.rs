@@ -41,7 +41,7 @@ impl DenseProbe {
 #[derive(Default)]
 pub(crate) struct DraftState { anchor: Option<u32> }
 impl scheduler::DraftState for DraftState {
-    fn pending_rows(&self) -> usize { 0 }
+    fn pending_rows(&self) -> usize { usize::from(self.anchor.is_some()) }
     fn close(&mut self, token: u32) { self.anchor = Some(token); }
 }
 
@@ -451,6 +451,54 @@ mod tests {
     struct Cli {
         #[command(flatten)]
         serve: ServeArgs,
+    }
+
+    #[test]
+    fn dense_anchor_enables_drafting_after_prefill_or_restore() {
+        use scheduler::DraftState as _;
+        let mut state = DraftState::default();
+        assert_eq!(state.pending_rows(), 0);
+        state.close(42);
+        assert_eq!(state.pending_rows(), 1);
+        assert_eq!(state.anchor, Some(42));
+    }
+
+    #[test]
+    #[ignore = "requires dense target/drafter checkpoints, matching native library and allocated GPU"]
+    fn dense_dspark_prefix_frontiers_are_byte_exact() -> Result<()> {
+        use cuteafd_loader::{families::qwen3_5::Qwen35Config, plan::checkpoint::Checkpoint};
+        let snapshot = std::path::PathBuf::from(std::env::var("CUTEAFD_DENSE_TEST_SNAPSHOT")?);
+        let draft_snapshot = std::path::PathBuf::from(std::env::var("CUTEAFD_DENSE_TEST_DRAFT")?);
+        let manifest = std::path::PathBuf::from(std::env::var("CUTEAFD_DENSE_TEST_MANIFEST")?);
+        // SAFETY: the library outlives every stream, program and allocation owner.
+        let library = unsafe { NativeLibrary::load(std::env::var("CUTEAFD_NATIVE_LIB")?)? };
+        library.cuda_set_device(0)?;
+        let programs = library.programs()?.with_manifest(&manifest)?;
+        let cfg = Qwen35Config::read(&snapshot)?;
+        let checkpoint = Checkpoint::open(&snapshot)?;
+        let config = serde_json::from_slice(&std::fs::read(draft_snapshot.join("config.json"))?)?;
+        let bytes = super::super::engine::DrafterBytes::block_dspark(&config, 4,
+            library.sm_count()? as u64, cfg.max_context)?;
+        let engine = RefCell::new(DenseEngine::with_prefix(&library, &programs, &checkpoint, cfg,
+            Some(262144), Some(bytes), 4, Some(crate::shared::prefix::MarkRule {
+                lanes: 4, entries: 4, budget_bytes: 1 << 30, host: false }),
+            std::env::var("CUTEAFD_DENSE_TEST_KV_CACHE").unwrap_or_else(|_| "fp8".into()).parse()?, false)?);
+        let draft = {
+            let target = engine.borrow();
+            let cfg = block_dspark::DsparkConfig::read(&draft_snapshot)?;
+            let tensors = block_dspark::prefetch(&draft_snapshot).join()
+                .map_err(|_| anyhow::anyhow!("draft loader panicked"))??;
+            let mask = target.token_embedding().host_rows(&[cfg.mask_token])?;
+            Rc::new(DsparkDrafter::load_paged(&library, &draft_snapshot, tensors, target.target_stream().raw,
+                4, 4, mask, cuteafd_loader::families::glm5::draft_representation::GlmDraftRepresentation::Bf16Only,
+                Fp8Scales::Amax, Fp8Rows::W8a16, target.cfg.max_context, target.pool_tokens,
+                cuteafd_loader::families::qwen4::Qwen4KvCache::Bf16)?)
+        };
+        draft.prepare_workspace()?;
+        let family = DensePrefix::with_draft(&engine, Some(draft.clone()))?;
+        let mut backend = DenseBackend::new(&engine, &library);
+        backend.drafter = Some(draft);
+        super::super::engine::prefix::check_backend_frontiers(&engine, &[1, 2, 3, 4], &backend, family, true)
     }
 
     #[test]

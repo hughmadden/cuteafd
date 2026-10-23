@@ -501,7 +501,11 @@ fn file_args(mut args: PlanArgs, snapshot: &std::path::Path) -> Result<PlanArgs>
         if let Some(model) = model {
             let hf_home = args.hf_home.clone().unwrap_or_else(default_hf_home);
             let revision = cfg.get("SPECULATOR_MODEL_REVISION").or_else(|| cfg.get("DRAFT_MODEL_REVISION"))
-                .filter(|v| !v.is_empty()).map(String::as_str);
+                .filter(|v| !v.is_empty()).map(String::as_str).or_else(|| {
+                    (family == "qwen3_5" && args.speculator == "dspark"
+                        && model == "RadixArk/Qwen3.8-27B-DSpark")
+                        .then_some("85ef153be924f17ce4bf62726954eeaa4a73e854")
+                });
             args.drafter_snapshot = Some(resolve_snapshot_at_revision(model, Some(&hf_home), revision)?
                 .snapshot_path.with_context(|| format!("required speculator {model} is not downloaded; use --no-speculator only when serving without it"))?);
         }
@@ -1391,6 +1395,32 @@ mod tests {
                 assert!(!layout.glmf_representation.fp8_head);
                 assert_eq!(layout.drafter_bytes, 0, "head arithmetic must not add a weight copy");
             }
+        }
+    }
+
+    #[test]
+    fn dense_dspark_pins_qualified_revision_and_preserves_overrides() {
+        use cuteafd_loader::plan::testing::*;
+        let target = tempfile::tempdir().unwrap();
+        write_snapshot(target.path(), &serde_json::json!({"model_type":"qwen3_5", "text_config": {
+            "model_type":"qwen3_5_text", "hidden_size":5120}}), &[t("unused.weight", "BF16", &[2])], None);
+        let home = tempfile::tempdir().unwrap();
+        let repo = home.path().join("hub/models--RadixArk--Qwen3.8-27B-DSpark");
+        std::fs::create_dir_all(repo.join("refs")).unwrap();
+        std::fs::write(repo.join("refs/main"), "unavailable-main").unwrap();
+        let config = target.path().join("launch.config");
+        for selected in [None, Some("explicit-revision")] {
+            let revision = selected.unwrap_or("85ef153be924f17ce4bf62726954eeaa4a73e854");
+            let draft = repo.join("snapshots").join(revision);
+            std::fs::create_dir_all(&draft).unwrap();
+            std::fs::write(&config, selected.map_or_else(String::new,
+                |revision| format!("SPECULATOR_MODEL_REVISION={revision}\n"))).unwrap();
+            let mut input = args(target.path(), 0, false);
+            input.hf_home = Some(home.path().into());
+            input.config = Some(config.clone());
+            let resolved = file_args(input, target.path()).unwrap();
+            assert_eq!(resolved.speculator, "dspark");
+            assert_eq!(resolved.drafter_snapshot, Some(draft));
         }
     }
 
