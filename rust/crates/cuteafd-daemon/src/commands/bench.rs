@@ -337,6 +337,24 @@ mod tests {
     }
 
     #[test]
+    fn dense_qwen_context_reports_family_and_active_draft_settings() {
+        for draft in [None, Some("/model/dspark")] {
+            let mut argv = vec!["cuteafd", "serve-qwen35", "--snapshot", "/target", "--native-lib", "/native.so"];
+            if let Some(snapshot) = draft { argv.extend(["--draft", snapshot, "--draft-fixed", "7"]); }
+            let matches = crate::cli::Cli::command().try_get_matches_from(argv).unwrap();
+            let context = serve_context(&matches, None).unwrap().expect("dense serve context");
+            assert_eq!(context.family.as_deref(), Some("qwen3_5"));
+            assert_eq!(context.snapshot.as_deref(), Some(std::path::Path::new("/target")));
+            let configuration = cuteafd_bench::server::configuration(&context, &Default::default());
+            assert_eq!(configuration.speculator.is_some(), draft.is_some());
+            if draft.is_some() {
+                assert_eq!(configuration.speculator.as_deref(), Some("dSpark (dspark)"));
+                assert_eq!(context.settings.iter().find(|s| s.name == "draft-fixed").unwrap().value.as_deref(), Some("7"));
+            }
+        }
+    }
+
+    #[test]
     fn serve_options_are_captured_with_defaults_and_sources() {
         let argv = ["cuteafd", "--coordinator-gpu-budget-gib", "32", "serve-qwen4", "--snapshot", "/hub/models--Qwen--Q/snapshots/abc", "--native-lib",
             "/opt/lib.so", "--max-sequences", "2"];

@@ -423,8 +423,7 @@ pub(crate) async fn run_serve(args: ServeArgs) -> Result<()> {
     });
     let max_context = ready_rx.await.context("dense engine failed before readiness")??;
     let limits = NativeLimits::new(u32::try_from(max_context)?, args.max_output)?;
-    let hub = crate::shared::console::hub(false, || Ok(crate::shared::console::Layout::new(
-        "qwen3_5", profile.id.clone(), snapshot.clone())));
+    let hub = crate::shared::console::hub(false, || console_layout(&args, &profile.id));
     let router = cuteafd_api::openai::router_for_model(queue, limits, stats, std::time::Duration::from_secs(25),
         hub.clone(), api.serve(profile, &snapshot)?);
     let listener = tokio::net::TcpListener::bind(&args.listen).await?;
@@ -436,6 +435,19 @@ pub(crate) async fn run_serve(args: ServeArgs) -> Result<()> {
         _ = crate::shared::api::watch_scheduler(worker) => unreachable!(),
     }
     Ok(())
+}
+
+fn console_layout(args: &ServeArgs, model: &str) -> Result<crate::shared::console::Layout> {
+    use crate::shared::console;
+    let mut layout = console::Layout::new("qwen3_5", model.into(), args.snapshot.clone());
+    layout.hardware = console::hardware(1, 0, true);
+    layout.concurrency = usize::from(args.max_sequences);
+    layout.speculator = args.draft.as_deref().map(|snapshot| {
+        let depth = args.draft_fixed.unwrap_or(block_dspark::DsparkConfig::read(snapshot)?.drafts());
+        Ok::<_, anyhow::Error>(console::Speculator { name: "dSpark".into(), positions: depth,
+            policy: if args.draft_fixed.is_some() { format!("fixed {depth}") } else { format!("adaptive <= {depth}") } })
+    }).transpose()?;
+    Ok(layout)
 }
 
 pub(crate) fn text_media() -> MediaAdmission<scheduler::Prompt, crate::shared::qwen::Encoder> {
