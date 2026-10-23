@@ -528,7 +528,13 @@ def main():
         args.cargo = args.scripts = True
     if args.jobs < 1:
         parser.error('--jobs must be positive')
-    concurrent = args.scripts and (args.cargo or args.benches)
+    # A systemd unit without ~/.cargo/bin on PATH otherwise burns a whole gate
+    # (cargo exit 127 plus the scripts that shell out to rustc).
+    missing = [tool for tool in ('cargo', 'rustc') if not shutil.which(tool)]
+    if missing and (args.cargo or args.benches or args.scripts):
+        parser.error(f'{", ".join(missing)} not on PATH; pass PATH including ~/.cargo/bin '
+                     '(systemd-run --setenv=PATH=...)')
+    concurrent =args.scripts and (args.cargo or args.benches)
     args.cargo_jobs = max(1, args.jobs // 2) if concurrent else args.jobs
     args.pytest_jobs = max(1, args.jobs - args.cargo_jobs) if concurrent else args.jobs
     root = BUILDS / args.task

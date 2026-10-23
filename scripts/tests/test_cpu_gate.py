@@ -36,6 +36,15 @@ def _fake(monkeypatch, outputs):
     return calls
 
 
+def test_missing_toolchain_refuses_before_any_work(tmp_path):
+    env = {'HOME': str(tmp_path), 'PATH': '/nonexistent'}
+    result = subprocess.run([sys.executable, str(ROOT / 'scripts/dev/cpu-gate'), '--task', 'path-probe'],
+                            env=env, capture_output=True, text=True)
+    assert result.returncode == 2
+    assert 'cargo, rustc not on PATH' in result.stderr
+    assert not (tmp_path / '.cache/cuteafd/builds/path-probe').exists()
+
+
 def test_cargo_passes_only_with_parsed_tests_and_no_failures(tmp_path, monkeypatch):
     (tmp_path / 'logs').mkdir()
     ok = 'test result: ok. 12 passed; 0 failed; 1 ignored; 0 measured\ntest result: ok. 3 passed; 0 failed; 0 ignored\n'
