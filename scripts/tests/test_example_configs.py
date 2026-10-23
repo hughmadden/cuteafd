@@ -637,7 +637,10 @@ def test_v4_matrix_card_set_and_retired_pins() -> None:
         assert (ROOT / entry["config"]).is_file()
         report = json.loads((ROOT / entry["report"] / "report.json").read_text())
         assert report["profile"] == "smoke" and report["baseline"]
-        assert entry["release"] == "v3.0.0" and entry["release_note"]
+        build = report["server"]["build"]
+        expected = build["release"] or f"v3 dev {report['created'][:10]}"
+        assert entry["release"] == expected and entry["release_note"]
+        assert "nearest" not in entry["release_note"].lower()
         if entry["name"] == "glm53f-exl3-v1":
             candidates = [d for _, d in reports if d["profile"] == "smoke" and
                           d["server"]["model"] == "wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K3.25-v1"]
