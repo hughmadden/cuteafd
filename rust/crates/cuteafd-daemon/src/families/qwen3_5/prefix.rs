@@ -139,7 +139,6 @@ pub(crate) fn check(engine: &RefCell<DenseEngine<'_>>, tokens: &[u32]) -> Result
 }
 
 fn check_direct_frontiers(engine: &RefCell<DenseEngine<'_>>, tokens: &[u32]) -> Result<()> {
-    use crate::shared::qwen::scheduler::Backend;
     let family = DensePrefix::new(engine)?;
     ensure!(family.slots() >= 2, "dense direct prefix check requires prompt and turn marks");
     let library = engine.borrow().stream.device.library;
@@ -170,10 +169,10 @@ pub(crate) fn check_backend_frontiers(engine: &RefCell<DenseEngine<'_>>, tokens:
             for (index, &page) in saved.pages.iter().enumerate() {
                 let rows = (saved.frontier - index * 64).min(64);
                 for segment in family.draft_page_segments(page) {
-                    let bytes = segment.bytes / 64 * rows;
-                    let mut data = vec![0; bytes];
+                    let segment_bytes = segment.bytes / 64 * rows;
+                    let mut data = vec![0; segment_bytes];
                     library.copy_d2h(&mut data, CuteafdDeviceBuffer { ptr: segment.addr as *mut _,
-                        bytes, device_id: library.cuda_get_device()?, ..Default::default() })?;
+                        bytes: segment_bytes, device_id: library.cuda_get_device()?, ..Default::default() })?;
                     bytes.push(data);
                 }
             }
