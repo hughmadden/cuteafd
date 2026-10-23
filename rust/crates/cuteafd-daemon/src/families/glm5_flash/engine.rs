@@ -2778,9 +2778,7 @@ impl<'a> GlmfEngine<'a> {
             for rank in 0..self.ranks() {
                 let map = self.caches_of(rank).pool_logical.buffer;
                 // SAFETY: each rank's map consumers run on its owned stream.
-                self.on(rank, || unsafe { self.library.copy_h2d_ordered(
-                    cuteafd_ffi::CuteafdDeviceBuffer { bytes: host.len() * 4, ..map },
-                    bytes_of(&host[..]), self.stream_of(rank)) })?;
+                self.on(rank, || unsafe { self.library.copy_h2d_ordered(map, bytes_of(&host[..]), self.stream_of(rank)) })?;
             }
         }
         Ok(())
@@ -3149,7 +3147,10 @@ impl<'a> GlmfEngine<'a> {
         let row = self.cfg.hidden * 2;
         let t = tokens.len();
         let host = std::time::Instant::now();
-        let staged = cuteafd_ffi::CuteafdDeviceBuffer { bytes: embed.len(), ..w.streams[1].buffer };
+        // A fixed [rows, H] view of the second stream buffer: the ordered staging is
+        // sized once by it (the whole [rows, 4, H] buffer would pin 4x as much).
+        let staged = cuteafd_ffi::CuteafdDeviceBuffer { bytes: w.rows * row, ..w.streams[1].buffer };
+        ensure!(staged.bytes <= w.streams[1].buffer.bytes, "embedding staging view exceeds its stream buffer");
         // SAFETY: embedding scratch is read/written only on the engine stream.
         unsafe { self.library.copy_h2d_ordered(staged, &embed, self.stream)?; }
         self.host_op("host: embedding upload", host);
@@ -3217,8 +3218,7 @@ impl<'a> GlmfEngine<'a> {
         let rank = usize::from(self.peer.as_ref().is_some_and(|p| p.device == dev.buffer.device_id));
         // SAFETY: this engine owns the destination and its rank stream; uploads
         // precede new consumers and follow previous consumers outside capture.
-        unsafe { self.library.copy_h2d_ordered(cuteafd_ffi::CuteafdDeviceBuffer { bytes: bytes.len(), ..dev.buffer },
-            bytes, self.stream_of(rank)) }
+        unsafe { self.library.copy_h2d_ordered(dev.buffer, bytes, self.stream_of(rank)) }
     }
 
     fn download(&self, dev: &Dev<'_>, bytes: usize) -> Result<Vec<u8>> {

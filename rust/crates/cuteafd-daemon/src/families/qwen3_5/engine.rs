@@ -239,7 +239,7 @@ impl<'a> DenseEngine<'a> {
     fn put(&self, buffer: CuteafdDeviceBuffer, bytes: &[u8]) -> Result<()> {
         ensure!(bytes.len() <= buffer.bytes, "dense step table exceeds admitted capacity");
         // SAFETY: ordered upload owns pinned staging until this stream consumes it.
-        unsafe { self.stream.device.library.copy_h2d_ordered(CuteafdDeviceBuffer { bytes: bytes.len(), ..buffer }, bytes, self.stream.raw) }
+        unsafe { self.stream.device.library.copy_h2d_ordered(buffer, bytes, self.stream.raw) }
     }
 
     fn tables(&self, rows: usize) -> Result<()> {

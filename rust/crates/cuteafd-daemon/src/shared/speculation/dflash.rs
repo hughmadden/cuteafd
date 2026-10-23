@@ -1766,8 +1766,7 @@ impl<'a> DflashDrafter<'a> {
         ensure!(bytes.len() <= dev.buffer.bytes, "table exceeds its buffer");
         // SAFETY: metadata consumers and overwrites share the owned drafter
         // stream; pinned staging survives through the upload completion event.
-        unsafe { self.library.copy_h2d_ordered(CuteafdDeviceBuffer { bytes: bytes.len(), ..dev.buffer },
-            bytes, self.stream) }
+        unsafe { self.library.copy_h2d_ordered(dev.buffer, bytes, self.stream) }
     }
 
     /// Shared startup path for every serving DFlash family; diagnostics may

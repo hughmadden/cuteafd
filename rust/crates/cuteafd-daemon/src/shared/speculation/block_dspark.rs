@@ -812,8 +812,7 @@ impl<'a> DsparkDrafter<'a> {
     fn put(&self, dev: &Dev<'_>, bytes: &[u8]) -> Result<()> {
         ensure!(bytes.len() <= dev.buffer.bytes, "table exceeds its buffer");
         // SAFETY: metadata and its consumers share this drafter's owned stream.
-        unsafe { self.library.copy_h2d_ordered(CuteafdDeviceBuffer { bytes: bytes.len(), ..dev.buffer },
-            bytes, self.stream) }
+        unsafe { self.library.copy_h2d_ordered(dev.buffer, bytes, self.stream) }
     }
 
     /// Explicit serving startup admission; other callers retain lazy allocation.

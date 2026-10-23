@@ -2572,9 +2572,57 @@ impl NativeLibrary {
         unsafe { self.copy_h2d_raw_ptr(dst, staging.ptr as *const c_void, src.len()) }
     }
 
+    /// Create the pinned staging and fence for ordered uploads into `dst` on
+    /// `stream`, sized to all of `dst`, without copying. Ports that reuse a
+    /// destination mid-call (while peer waits are queued) reserve it before
+    /// readiness, so no upload ever allocates host memory under queued work.
+    /// Reserving an existing entry of at least this capacity is a no-op.
+    ///
+    /// # Safety
+    /// Same contract as [`Self::copy_h2d_ordered`].
+    pub unsafe fn reserve_h2d_ordered(&self, dst: CuteafdDeviceBuffer, stream: *mut c_void) -> Result<()> {
+        anyhow::ensure!(!dst.ptr.is_null() && dst.bytes > 0, "ordered H2D reservation is empty or null");
+        anyhow::ensure!(!self.is_quarantined_after_failed_drain(), "ordered H2D library is quarantined");
+        let device = self.cuda_get_device()?;
+        let mut entries = self.ordered_h2d_staging.lock()
+            .map_err(|_| anyhow::anyhow!("ordered H2D staging lock is poisoned"))?;
+        self.ordered_h2d_entry(&mut entries, (device, stream as usize, dst.ptr as usize), dst.bytes)?;
+        Ok(())
+    }
+
+    /// The entry for `key`, created with staging for `capacity` bytes. An
+    /// existing entry never grows: replacing pinned staging frees host memory
+    /// (cudaFreeHost synchronizes the device), which deadlocks against a
+    /// queued peer wait. A larger source is refused; pass the destination's
+    /// whole admitted extent on first use, or reserve it at startup.
+    fn ordered_h2d_entry<'e>(&self,
+        entries: &'e mut std::collections::BTreeMap<(i32, usize, usize), OrderedH2DStaging>,
+        key: (i32, usize, usize), capacity: usize) -> Result<&'e mut OrderedH2DStaging> {
+        if let Some(entry) = entries.get(&key) {
+            anyhow::ensure!(capacity <= entry.staging.buffer.bytes,
+                "ordered H2D upload of {capacity} bytes exceeds the {}-byte staging reserved for its \
+                 destination; size the first upload or reservation by the destination's whole extent",
+                entry.staging.buffer.bytes);
+        } else {
+            let event = self.cuda_event_create_ordering()?;
+            let mut staging = SyncH2DStagingBuffer::default();
+            if let Err(error) = staging.ensure(self, capacity) {
+                // SAFETY: the fresh event was never recorded.
+                let _ = unsafe { self.cuda_event_destroy(event) };
+                return Err(error);
+            }
+            entries.insert(key, OrderedH2DStaging { staging, event, pending: false });
+        }
+        Ok(entries.get_mut(&key).expect("ordered upload entry present"))
+    }
+
     /// Upload after prior consumers on `stream`, retaining the pinned source
     /// until the copy's event completes. Unlike default-stream copy_h2d, this
     /// permits workspace reuse while previous compute is still queued.
+    ///
+    /// The first upload into a destination sizes its staging to `dst.bytes`
+    /// (pass the whole admitted buffer, not a view narrowed to `src`); later
+    /// uploads reuse it and never reallocate (see [`Self::reserve_h2d_ordered`]).
     ///
     /// # Safety
     /// `dst` and `stream` belong to the current device and remain live through
@@ -2588,11 +2636,8 @@ impl NativeLibrary {
         let mut entries = self.ordered_h2d_staging.lock()
             .map_err(|_| anyhow::anyhow!("ordered H2D staging lock is poisoned"))?;
         let key = (device, stream as usize, dst.ptr as usize);
-        if !entries.contains_key(&key) {
-            entries.insert(key, OrderedH2DStaging { staging: SyncH2DStagingBuffer::default(),
-                event: self.cuda_event_create_ordering()?, pending: false });
-        }
-        let entry = entries.get_mut(&key).expect("ordered upload entry inserted");
+        let capacity = if entries.contains_key(&key) { src.len() } else { dst.bytes };
+        let entry = self.ordered_h2d_entry(&mut entries, key, capacity)?;
         if entry.pending {
             // SAFETY: this entry owns the event recorded after its last copy.
             if let Err(error) = unsafe { self.cuda_event_synchronize(entry.event) } {
@@ -2601,8 +2646,9 @@ impl NativeLibrary {
             }
             entry.pending = false;
         }
-        let staging = entry.staging.ensure(self, src.len())?;
-        // SAFETY: pinned staging is private, large enough, and its last reader completed.
+        let staging = entry.staging.buffer;
+        // SAFETY: pinned staging is private, holds src (checked by ordered_h2d_entry),
+        // and its last reader completed.
         unsafe { std::ptr::copy_nonoverlapping(src.as_ptr(), staging.ptr.cast::<u8>(), src.len()); }
         entry.pending = true;
         // SAFETY: caller supplies live stream/destination; the entry retains the source.
