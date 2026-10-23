@@ -97,6 +97,8 @@ pub struct CacheOptions {
     pub dense_qwen_kv: crate::families::qwen4::Qwen4KvCache,
     pub qwen_kv: Qwen4KvCache,
     pub step5_kv: Qwen4KvCache,
+    /// MiniMax M3 paged K/V pages (the MSA index key is always E4M3 + FP32 row scale).
+    pub minimax_kv: Qwen4KvCache,
     pub mla_kv: cuteafd_core::MlaCacheFormat,
     /// DeepSeek V4's window ring holds one prefill chunk plus its window.
     pub prefill_rows: u64,
@@ -119,6 +121,7 @@ impl Default for CacheOptions {
             dense_qwen_kv: crate::families::qwen4::Qwen4KvCache::Fp8,
             qwen_kv: Qwen4KvCache::default(),
             step5_kv: Qwen4KvCache::Bf16,
+            minimax_kv: Qwen4KvCache::Fp8,
             mla_kv: Default::default(),
             prefill_rows: 4096,
             glmf_index: GlmfIndexCache::Keys,

@@ -5,10 +5,10 @@
 //! transport are estimates until the engine's allocation ledger exists; this
 //! is NOT serving admission.
 use super::Model;
-use crate::families::minimax_m3::{config::MiniMaxM3Config, reference};
+use crate::families::{minimax_m3::{cache::MiniMaxCacheLayout, config::MiniMaxM3Config}, qwen4::Qwen4KvCache};
 use crate::placement::{ArchContext, AttentionPlacement};
 use crate::plan::{Component, ExpertPlacement, Hint, MediaMode, PlanReport};
-use crate::serving_capacity::{CacheGeometryError, CacheOptions, FamilyCacheGeometry, KvPlacement, RankCacheGeometry};
+use crate::serving_capacity::{CacheGeometryError, CacheOptions, FamilyCacheGeometry};
 use cuteafd_core::memory_layout::{Basis, Category, DeviceKind, DeviceLayout, Item, MemoryLayout};
 
 const GIB: u64 = 1 << 30;
@@ -26,24 +26,17 @@ const COORDINATOR_WORKSPACE_BYTES: u64 = 3 * GIB;
 /// The smallest pool this plan calls a card: one full 256K agentic request.
 const POOL_FLOOR_TOKENS: u64 = 262_144;
 
-/// KV record bytes per token on each coordinator rank: FP8 K/V (BF16 doubles
-/// them) for that rank's KV heads, plus the full MSA index key (one shared
-/// head, FP8 row and FP32 scale) on every rank.
-fn per_token(cfg: &MiniMaxM3Config, ranks: usize, element: usize) -> u64 {
-    (reference::kv_bytes_per_token(cfg, element) / ranks + reference::index_bytes_per_token(cfg)) as u64
+/// KV record bytes per token on each coordinator rank (the exact paged layout:
+/// that rank's KV heads, plus the whole shared MSA index key).
+fn per_token(cfg: &MiniMaxM3Config, ranks: usize, kv: Qwen4KvCache) -> u64 {
+    MiniMaxCacheLayout::new(cfg, ranks, cfg.max_position as u64, kv).map_or(0, |layout| layout.token_bytes(0))
 }
 
 pub(super) fn cache_geometry(cfg: &MiniMaxM3Config, options: CacheOptions) -> Result<FamilyCacheGeometry, CacheGeometryError> {
-    let ranks = options.coordinator_ranks;
-    if !(1..=2).contains(&ranks) || options.attention_placement.is_some_and(|p| p != AttentionPlacement::Heads) {
+    if options.attention_placement.is_some_and(|p| p != AttentionPlacement::Heads) {
         return Err(CacheGeometryError::Unsupported { family: "minimax_m3", what: "one GPU, or two splitting KV heads" });
     }
-    let unit = per_token(cfg, ranks, 1).checked_mul(UNIT_ROWS).ok_or(CacheGeometryError::Overflow("MiniMax KV unit"))?;
-    Ok(FamilyCacheGeometry {
-        logical_unit_rows: UNIT_ROWS,
-        placement: if ranks == 1 { KvPlacement::SingleDevice } else { KvPlacement::PartitionedHeads },
-        ranks: vec![RankCacheGeometry { persistent_unit_bytes: unit, ..Default::default() }; ranks],
-    })
+    MiniMaxCacheLayout::new(cfg, options.coordinator_ranks, cfg.max_position as u64, options.minimax_kv).map(|l| l.geometry())
 }
 
 pub(super) fn layout(model: &Model, report: &mut PlanReport, opts: &crate::plan::layout::LayoutOptions,
@@ -127,7 +120,7 @@ pub(super) fn layout(model: &Model, report: &mut PlanReport, opts: &crate::plan:
     };
     // An explicit onboard that overflows the GPU is refused below; an automatic
     // one is what the Sparks need, so the GPU check reports the shortfall.
-    let token = per_token(cfg, gpus, 1);
+    let token = per_token(cfg, gpus, opts.minimax_kv);
     let free = |local: u64| (0..gpus).map(|gpu| {
         let used: u64 = gpu_items(gpu, local).iter().map(|item| item.bytes).sum();
         opts.rtx_bytes[gpu].saturating_sub(used)
@@ -139,8 +132,8 @@ pub(super) fn layout(model: &Model, report: &mut PlanReport, opts: &crate::plan:
     memory.pool_tokens = pool_tokens;
     for gpu in 0..gpus {
         let mut items = gpu_items(gpu, local);
-        items.push(Item::new(Category::Kv, format!("FP8 KV ({} KV heads) + MSA index keys, {token} B/token",
-            cfg.kv_heads / gpus), "fp8", pool_tokens * token, Basis::Formula));
+        items.push(Item::new(Category::Kv, format!("{:?} KV ({} KV heads) + MSA index keys, {token} B/token",
+            opts.minimax_kv, cfg.kv_heads / gpus), "paged", pool_tokens * token, Basis::Formula));
         memory.devices.push(DeviceLayout { kind: DeviceKind::Rtx, index: gpu as u32, capacity_bytes: opts.rtx_bytes[gpu],
             items, kv_tokens: pool_tokens });
     }

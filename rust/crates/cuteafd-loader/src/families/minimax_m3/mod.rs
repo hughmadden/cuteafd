@@ -2,6 +2,7 @@
 //! checkpoint readers: MSA block-sparse GQA, sigmoid-routed SwiGLU-OAI MoE on
 //! compressed-tensors NVFP4 experts, MXFP8 (1x32 UE8M0) dense projections, a
 //! bundled CLIP-style vision tower and a bundled DSpark drafter.
+pub mod cache;
 pub mod config;
 pub mod reference;
 
