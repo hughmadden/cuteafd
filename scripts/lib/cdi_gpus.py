@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import os
 import re
+import shutil
+import subprocess
 from collections.abc import Iterable
 from pathlib import Path
 
@@ -26,12 +28,25 @@ def cdi_names(specs: Iterable[Path] = SPECS) -> set[str]:
     return names
 
 
+def single_gpu_host() -> bool:
+    if (count := os.environ.get('CUTEAFD_CDI_GPU_COUNT')) is not None:  # script tests only
+        return count == '1'
+    nvidia_smi = next((p for p in ('nvidia-smi', '/usr/lib/wsl/lib/nvidia-smi') if shutil.which(p)), None)
+    if nvidia_smi is None:
+        return False
+    result = subprocess.run([nvidia_smi, '-L'], capture_output=True, text=True)
+    return result.returncode == 0 and len(result.stdout.splitlines()) == 1
+
+
 def cdi_gpu_args(gpus: Iterable[object] | str, specs: Iterable[Path] = SPECS) -> list[str]:
     """`--device nvidia.com/gpu=X` per GPU (index, GPU-uuid, or 'all'); raises if the spec lacks one."""
     wanted = [g.strip() for g in (gpus.split(',') if isinstance(gpus, str) else map(str, gpus))]
     if not wanted or not all(wanted):
         raise ValueError('empty GPU request')
     have = cdi_names(specs)
+    # WSL2's spec lists only `all`; on a single-GPU host that is the one GPU asked for.
+    if have == {'all'} and len(wanted) == 1 and single_gpu_host():
+        wanted = ['all']
     missing = [] if os.environ.get('CUTEAFD_CDI_CHECK') == 'off' else [g for g in wanted if g not in have]  # off: script tests only
     if missing:
         raise RuntimeError(f'CDI device nvidia.com/gpu={",".join(missing)} is not in /var/run/cdi/nvidia.yaml; '
