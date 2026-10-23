@@ -614,22 +614,23 @@ impl<'a> Engine<'a> {
 
     /// Reserve every upload source before any peer wait can be queued. Growing
     /// pinned storage later may implicitly synchronize the device and deadlock.
-    fn prime_upload(&self, buffer: cuteafd_ffi::CuteafdDeviceBuffer) -> Result<()> {
-        if buffer.bytes > 0 { self.upload(buffer, &vec![0u8; buffer.bytes])?; }
-        Ok(())
+    fn reserve_upload(&self, buffer: cuteafd_ffi::CuteafdDeviceBuffer) -> Result<()> {
+        let stream = if self.library.cuda_get_device()? == self.device { self.stream }
+            else { self.peer()?.stream };
+        // SAFETY: startup selects the owning device; the persistent buffer uses only this stream.
+        unsafe { self.library.reserve_h2d_ordered(buffer, stream) }
     }
 
-    fn prime_slot_uploads(&self, lane: &UnitSlot<'_>, lead: bool) -> Result<()> {
+    fn reserve_slot_uploads(&self, lane: &UnitSlot<'_>, lead: bool) -> Result<()> {
         let tables = &lane.tables;
         for buffer in [&lane.tokens, &tables.positions, &tables.main_slots,
             &tables.swa_indices, &tables.swa_lengths, &tables.c4_page_table,
             &tables.c4_visible, &tables.c4_indexed_lengths, &tables.c128_indices,
             &tables.c128_lengths].into_iter().chain(&tables.c4).chain(&tables.c128) {
-            self.prime_upload(buffer.buffer)?;
+            self.reserve_upload(buffer.buffer)?;
         }
-        if lead && !self.embedding.device_gather() { self.prime_upload(lane.stream_a.buffer)?; }
-        // SAFETY: startup-only uploads have no peer waits and retain their source storage.
-        unsafe { self.library.cuda_stream_synchronize(if lead { self.stream } else { self.peer()?.stream }) }
+        if lead && !self.embedding.device_gather() { self.reserve_upload(lane.stream_a.buffer)?; }
+        Ok(())
     }
 
     /// Allocate both shapes on every rank before readiness, even with no local experts.
@@ -708,7 +709,7 @@ impl<'a> Engine<'a> {
                 tables: self.step_buffers(t, if shared_page_list { 1 } else { t })?,
                 taps: self.alloc(draft_bytes(t.min(TAP_ROWS) * self.cfg.dspark_target_layer_ids.len() * h * 2))?,
             };
-            self.prime_slot_uploads(&slot, lead)?;
+            self.reserve_slot_uploads(&slot, lead)?;
             Ok(slot)
         };
         Ok(Workspace {

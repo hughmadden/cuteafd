@@ -120,21 +120,18 @@ impl PrefillHooks for UnitHooks<'_, '_, '_, '_, '_> {
         e.route_check_unit(unit.slot, unit.index);
         e.embedding.check(tokens)?;
         e.fill(&lane.tables, tables)?;
-        e.upload(cuteafd_ffi::CuteafdDeviceBuffer { bytes: tokens.len() * 4,
-            ..lane.tokens.buffer }, bytes_of(tokens))?;
+        e.upload(lane.tokens.buffer, bytes_of(tokens))?;
         if e.embedding.device_gather() {
             e.gather_streams(lane, tokens.len())?;
         } else {
             let embedding = e.embedding.host_rows_repeated(tokens, 4)?;
-            e.upload(cuteafd_ffi::CuteafdDeviceBuffer { bytes: embedding.len(),
-                ..lane.stream_a.buffer }, &embedding)?;
+            e.upload(lane.stream_a.buffer, &embedding)?;
         }
         if let Some(w1) = self.w1 {
             let peer = &w1.slots[unit.slot];
             e.on(1, || {
                 e.fill(&peer.tables, tables)?;
-                e.upload(cuteafd_ffi::CuteafdDeviceBuffer { bytes: tokens.len() * 4,
-                    ..peer.tokens.buffer }, bytes_of(tokens))
+                e.upload(peer.tokens.buffer, bytes_of(tokens))
             })?;
             if e.context.is_some() {
                 let contexts = [e.put_context_tables(0, &lane.tables, tables, unit.slot, true, &self.placement.units)?,

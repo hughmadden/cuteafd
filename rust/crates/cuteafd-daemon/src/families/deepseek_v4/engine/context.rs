@@ -84,7 +84,7 @@ pub(super) struct V4ContextSplit<'a> {
 /// each prefill lane's gather and commit counts.
 #[derive(Debug, Clone, Default)]
 pub(super) struct ContextUnit {
-    /// History units gathered per owner (`[GPU0's, GPU1's]`); 0 on later prefill lanes.
+    /// Full history units per owner; attention skips gathering only after its exact predecessor.
     pub shards: [usize; 2],
     /// Commit blocks per plane (payload, footer, keys, scales).
     pub commits: [usize; 4],
@@ -135,12 +135,10 @@ impl<'a> V4ContextSplit<'a> {
                 let half = staging_units.div_ceil(2);
                 for slot in 0..lanes as usize {
                     for owner in 0..2 {
-                        engine.prime_upload(super::context::view(&gather, (slot * 2 + owner) * half * 4, half * 4)?)?;
+                        engine.reserve_upload(super::context::view(&gather, (slot * 2 + owner) * half * 4, half * 4)?)?;
                     }
-                    engine.prime_upload(commit[slot].buffer)?;
+                    engine.reserve_upload(commit[slot].buffer)?;
                 }
-                // SAFETY: startup has no peer waits and staging retains every source.
-                unsafe { engine.library.cuda_stream_synchronize(engine.stream_of(rank))?; }
                 Ok(ContextRank { candidates, own, peer, topk_scratch, partial_scratch, gather, local_lengths,
                     empty_window, commit, staging })
             })
@@ -215,7 +213,7 @@ impl<'a> Engine<'a> {
     }
 
     /// Rank `rank`'s C4 tables for a step under context, uploaded into `lane`'s buffers (both
-    /// streams drained by the caller): decode/verify: owned or scratch output slots, compact half
+    /// streams ordered by the caller): decode/verify: owned or scratch output slots, compact half
     /// tables, shard lengths; prefill: the gathered view's logical slots and identity table, the
     /// history units to gather and the owned groups to commit (lane `index`; `gather` 0 skips the
     /// gather: an earlier lane of the same step gathered every unit this lane reads).
