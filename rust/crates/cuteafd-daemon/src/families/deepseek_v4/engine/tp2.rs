@@ -74,6 +74,7 @@ pub(super) struct Tp2State<'a> {
     routes: PeerExchange<'a>,
     source: Cell<RouteSource>,
     pub(super) checking: Cell<bool>,
+    check_units: RefCell<Vec<usize>>,
     checks: RefCell<BTreeMap<(usize, usize), PendingCheck<'a>>>,
     schedule: RefCell<Option<Schedule>>,
     identity: RefCell<RouteIdentity>,
@@ -121,7 +122,7 @@ impl<'a> Engine<'a> {
         let combine = [FusedCombine::new(self.library, ExchangeDtype::Bf16)?,
             FusedCombine::new(self.library, ExchangeDtype::F32)?];
         self.tp2 = Some(Tp2State { layers: layers.clone(), ranks: ranks.map(RefCell::new), combine, routes,
-            source: Cell::new(RouteSource::Replicated), checking: Cell::new(false), checks: RefCell::new(BTreeMap::new()),
+            source: Cell::new(RouteSource::Replicated), checking: Cell::new(false), check_units: RefCell::new(Vec::new()), checks: RefCell::new(BTreeMap::new()),
             schedule: RefCell::new(None), identity: RefCell::new(RouteIdentity::default()),
             interval, steps: Cell::new(0), fallbacks: Cell::new(0),
             streams: [self.stream, peer.stream], output_pending: [Cell::new(false), Cell::new(false)] });
@@ -325,6 +326,7 @@ impl<'a> Engine<'a> {
     pub(super) fn prepare_route_checks(&self, rows: &[usize]) -> Result<()> {
         let Some(tp2) = &self.tp2 else { return Ok(()) };
         if !tp2.checking.get() { return Ok(()); }
+        *tp2.check_units.borrow_mut() = (0..rows.len()).collect();
         // cudaHostAlloc may synchronize. Allocate before queuing any peer waits,
         // never from a layer whose matching push has not been enqueued yet.
         let mut checks = tp2.checks.borrow_mut();
@@ -340,14 +342,20 @@ impl<'a> Engine<'a> {
         Ok(())
     }
 
+    pub(super) fn route_check_unit(&self, slot: usize, unit: usize) {
+        if let Some(tp2) = self.tp2.as_ref().filter(|t| t.checking.get()) {
+            tp2.check_units.borrow_mut()[slot] = unit;
+        }
+    }
+
     fn collect_routes(&self, rank: usize, layer: usize, lane: usize, rows: usize, w: &Workspace<'_>) -> Result<()> {
         let tp2 = self.tp2.as_ref().context("TP2 experts")?;
         if !tp2.checking.get() || self.capture_only.get() { return Ok(()); }
         self.on(rank, || {
             let bytes = rows * self.cfg.n_activated_experts * 4;
             let checks = tp2.checks.borrow();
-            let check = checks.get(&(layer, lane)).context("route diagnostic storage not prepared")?;
-            ensure!(check.rows >= rows, "route-check rows changed");
+            let check = checks.get(&(layer, tp2.check_units.borrow()[lane])).context("route diagnostic storage not prepared")?;
+            ensure!(check.rows == rows, "route-check rows changed");
             let host = check.ranks[rank].as_ref().context("route diagnostic rank buffer")?;
             // SAFETY: pinned host storage is retained until both streams drain in finish_route_step.
             unsafe {

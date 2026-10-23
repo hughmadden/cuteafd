@@ -227,7 +227,7 @@ impl<'a> Engine<'a> {
                 let local = local_pages(&units[..history], owner)?;
                 *count = local.len();
                 if !local.is_empty() {
-                    self.on(rank, || self.library.copy_h2d(view(&own.gather, (index * 2 + owner) * half * 4, local.len() * 4)?,
+                    self.on(rank, || self.upload(view(&own.gather, (index * 2 + owner) * half * 4, local.len() * 4)?,
                         bytes_of(&local)))?;
                 }
             }
@@ -236,7 +236,7 @@ impl<'a> Engine<'a> {
             let commits = c4_context_commits(rank, first, groups, units, split.commit_limit)?;
             unit.commits.copy_from_slice(&commits.counts);
             let commit = own.commit.get(index).context("commit lane")?;
-            self.on(rank, || self.library.copy_h2d(commit.buffer, bytes_of(&commits.table)))?;
+            self.on(rank, || self.upload(commit.buffer, bytes_of(&commits.table)))?;
             shard
         };
         self.on(rank, || self.fill_c4(m, &shard))?;
@@ -247,7 +247,7 @@ impl<'a> Engine<'a> {
     fn fill_c4(&self, m: &StepBuffers<'_>, shard: &C4Shard) -> Result<()> {
         let put = |buffer: &Dev<'_>, bytes: &[u8]| -> Result<()> {
             ensure!(bytes.len() <= buffer.buffer.bytes, "C4 shard table exceeds its buffer");
-            self.library.copy_h2d(CuteafdDeviceBuffer { bytes: bytes.len(), ..buffer.buffer }, bytes)
+            self.upload(CuteafdDeviceBuffer { bytes: bytes.len(), ..buffer.buffer }, bytes)
         };
         for (buffer, (_, values)) in m.c4.iter().zip(&shard.c4_tables) {
             put(buffer, bytes_of(values))?;

@@ -345,8 +345,9 @@ pub(crate) fn with_engine<T>(
     };
     let mut max_context = crate::shared::context::checkpoint_context(
         &args.snapshot, &args.manifest, "deepseek_v4", args.max_context)?;
-    let prefill_rows = args.prefill_rows.unwrap_or(caps["prefill_rows"].as_u64().context("prefill_rows")? as usize);
-    ensure!(prefill_rows > 0 && prefill_rows % 64 == 0
+    let prefill_kernel_rows = caps["prefill_rows"].as_u64().context("prefill_rows")? as usize;
+    let prefill_rows = args.prefill_rows.unwrap_or(prefill_kernel_rows.min(4096));
+    ensure!(matches!(prefill_rows, 512 | 1024 | 2048 | 4096)
         && prefill_rows <= caps["prefill_rows"].as_u64().context("prefill_rows")? as usize
         && (1..=3).contains(&args.prefill_waves), "V4 prefill needs page-aligned rows within the export capacity and 1..=3 waves");
     let decode_rows = caps["decode_rows"].as_u64().context("decode_rows")? as usize;
@@ -497,7 +498,7 @@ pub(crate) fn with_engine<T>(
         usize::try_from(placement.pool_tokens)?, 256)?;
     let shape = pool::PoolShape::new(
         args.max_sequences,
-        caps["prefill_rows"].as_u64().context("prefill_rows")? as usize,
+        prefill_rows,
         pool::PoolShape::context_units(pool::PoolShape::units_for(usize::try_from(placement.pool_tokens)?,
             args.max_sequences), context_mode.is_some()),
     );
@@ -509,6 +510,7 @@ pub(crate) fn with_engine<T>(
         family: loaded.family,
         decode_rows: caps["decode_rows"].as_u64().context("decode_rows")? as usize,
         prefill_rows,
+        prefill_kernel_rows,
         prefill_waves: args.prefill_waves,
         c128_width: usize::try_from(cuteafd_loader::serving_capacity::compiled_c128_width(&loaded.manifest, loaded.family)?)?,
         max_context,

@@ -34,7 +34,7 @@ impl<'a> Engine<'a> {
                     *self.context_units.borrow_mut() = vec![Default::default(); self.prefill_waves];
                 }
                 // Diagnostics own rows by slot too; a slot is reused only after its unit commits.
-                self.prepare_route_checks(&vec![self.prefill_rows; self.prefill_waves])?;
+                self.prepare_route_checks(&units.iter().map(|u| u.rows.len()).collect::<Vec<_>>())?;
                 let mut links = transports.borrow_mut();
                 let mut hooks = UnitHooks { engine: self, placement, tokens, tables: &tables, w, w1,
                     transport: links.first_mut(), runtime, logit_rows, download, on_layer,
@@ -106,22 +106,23 @@ impl PrefillHooks for UnitHooks<'_, '_, '_, '_, '_> {
         let lane = &self.w.slots[unit.slot];
         let tables = &self.tables[unit.index];
         let tokens = &self.tokens[unit.rows.clone()];
+        e.route_check_unit(unit.slot, unit.index);
         e.embedding.check(tokens)?;
         e.fill(&lane.tables, tables)?;
-        e.library.copy_h2d(cuteafd_ffi::CuteafdDeviceBuffer { bytes: tokens.len() * 4,
+        e.upload(cuteafd_ffi::CuteafdDeviceBuffer { bytes: tokens.len() * 4,
             ..lane.tokens.buffer }, bytes_of(tokens))?;
         if e.embedding.device_gather() {
             e.gather_streams(lane, tokens.len())?;
         } else {
             let embedding = e.embedding.host_rows_repeated(tokens, 4)?;
-            e.library.copy_h2d(cuteafd_ffi::CuteafdDeviceBuffer { bytes: embedding.len(),
+            e.upload(cuteafd_ffi::CuteafdDeviceBuffer { bytes: embedding.len(),
                 ..lane.stream_a.buffer }, &embedding)?;
         }
         if let Some(w1) = self.w1 {
             let peer = &w1.slots[unit.slot];
             e.on(1, || {
                 e.fill(&peer.tables, tables)?;
-                e.library.copy_h2d(cuteafd_ffi::CuteafdDeviceBuffer { bytes: tokens.len() * 4,
+                e.upload(cuteafd_ffi::CuteafdDeviceBuffer { bytes: tokens.len() * 4,
                     ..peer.tokens.buffer }, bytes_of(tokens))
             })?;
             if e.context.is_some() {
@@ -210,13 +211,58 @@ impl PrefillHooks for UnitHooks<'_, '_, '_, '_, '_> {
     }
 
     fn commit_unit(&mut self, unit: &Unit) -> Result<()> {
-        self.engine.write_draft_kv(self.w, &self.w.slots[unit.slot], unit.rows.len(), self.engine.prefill_rows)
+        let e = self.engine;
+        e.write_draft_kv(self.w, &self.w.slots[unit.slot], unit.rows.len(), e.prefill_rows)?;
+        if self.w1.is_some() {
+            // Rank 0 must join the peer's last reader before reusing this slot's entry residual.
+            e.record_peer(1, "unit-commit", DIRECT, true, e.cfg.n_layers, unit.slot);
+            e.exchange()?.signal(1, DIRECT)?;
+            e.record_peer(0, "unit-commit", DIRECT, false, e.cfg.n_layers, unit.slot);
+            e.exchange()?.wait(0, DIRECT)?;
+        }
+        Ok(())
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn v4_two_waves_bound_spark_idle_across_slot_reuse() -> Result<()> {
+        use prefill_pipeline::Step;
+        for layers in [43, 61] {
+            for local in [0usize, 2, 8] {
+                let routes: Vec<_> = (0..layers).map(|l| if l < local { FfnRoute::Local } else { FfnRoute::Spark }).collect();
+                let units = prefill_pipeline::sequence_units(32768, 4096, 2, layers)?;
+                let schedule = prefill_pipeline::prefill_schedule(&routes, &units, 2)?;
+                let (mut gpu, mut spark, mut idle) = (0.0f64, 0.0f64, 0.0f64);
+                let mut finishes = std::collections::VecDeque::new();
+                let mut sent = 0;
+                for step in schedule {
+                    match step {
+                        Step::Attention { .. } | Step::Local { .. } => gpu += 4.0,
+                        Step::Send { .. } => {
+                            gpu += 1.0;
+                            let start = gpu.max(spark);
+                            if sent > 0 { idle += start - spark; }
+                            spark = start + 10.0;
+                            finishes.push_back(spark);
+                            sent += 1;
+                        }
+                        Step::Land { .. } => gpu = gpu.max(finishes.pop_front().unwrap()) + 1.0,
+                        _ => {}
+                    }
+                }
+                let lead = 4.0 * (2 * local + 1) as f64 + 2.0;
+                let bound = (units.len() - 1) as f64 * (lead - 10.0).max(0.0);
+                assert!(idle <= bound + 1e-9, "{layers} layers/{local} local: idle {idle} > {bound}");
+                assert_eq!(sent, units.len() * (layers - local));
+                assert!(finishes.is_empty());
+            }
+        }
+        Ok(())
+    }
 
     #[test]
     fn v4_routes_cover_local_prefix_and_fifo_spark_suffix() -> Result<()> {

@@ -85,7 +85,7 @@ impl<'a> Engine<'a> {
         let first = t - n;
         for (stage, weights) in dspark.stages.iter().enumerate() {
             let cache = &self.pools[self.cfg.n_layers + stage];
-            self.run(&format!("producer_m{cap}"), &[
+            self.run(&format!("producer_m{}", self.kernel_rows(cap)), &[
                 ("hidden", w.main_x.buffer.ptr), ("positions", offset(&lane.tables.positions, first * 8)),
                 ("main_slots", offset(&lane.tables.main_slots, first * 8)), ("cos_sin", self.rope_window.buffer.ptr),
                 ("w_qkv", weights.ptr("w_qkv")?), ("w_qkv_scale", weights.ptr("w_qkv_scale")?),
@@ -159,7 +159,7 @@ impl<'a> Engine<'a> {
                 ("base", weights.ptr("attn.base")?), ("norm", weights.ptr("attn.norm")?), ("post", lane.post.buffer.ptr),
                 ("comb", lane.comb.buffer.ptr), ("y", w.y.buffer.ptr), ("scratch", w.scratch.buffer.ptr),
             ], &[scalar])?;
-            self.run(&format!("producer_m{cap}"), &[
+            self.run(&format!("producer_m{}", self.kernel_rows(cap)), &[
                 ("hidden", w.y.buffer.ptr), ("positions", m.positions.buffer.ptr), ("main_slots", m.main_slots.buffer.ptr),
                 ("cos_sin", self.rope_window.buffer.ptr), ("w_qkv", weights.ptr("w_qkv")?),
                 ("w_qkv_scale", weights.ptr("w_qkv_scale")?), ("w_q", weights.ptr("w_q")?),

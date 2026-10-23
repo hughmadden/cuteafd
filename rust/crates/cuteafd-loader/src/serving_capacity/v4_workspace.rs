@@ -136,9 +136,10 @@ pub fn deepseek_v4_workspace_scratch(
         }
     }
     let shared_bytes = selected.shared_scratch(sizes);
+    let prefill_kernel_rows = manifest["capacities"]["prefill_rows"].as_u64().unwrap_or(prefill_rows);
     let mut index_topk_bytes = 0;
     for name in [
-        format!("{family}_index_topk_prefill_m{prefill_rows}"),
+        format!("{family}_index_topk_prefill_m{prefill_kernel_rows}"),
         format!("{family}_index_topk_decode_m{decode_rows}"),
     ] {
         let program = programs
@@ -445,6 +446,18 @@ mod tests {
                 assert_eq!(runtime, if split { 200 } else { 100 });
                 assert_eq!(planned.index_topk_bytes, 300);
             }
+        }
+    }
+
+    #[test]
+    fn live_v4_units_select_the_compiled_topk_scratch() {
+        let manifest = serde_json::json!({"capacities": {"prefill_rows": 4096}, "programs": [
+            {"name": "dsv4p_index_topk_prefill_m4096", "scratch_bytes_at_capacity": {"scratch": 300}},
+            {"name": "dsv4p_index_topk_decode_m64", "scratch_bytes_at_capacity": {"scratch": 40}}
+        ]});
+        for rows in [512, 1024, 2048, 4096] {
+            assert_eq!(deepseek_v4_workspace_scratch(&manifest, "dsv4p", false, rows, 64)
+                .unwrap().index_topk_bytes, 300);
         }
     }
 

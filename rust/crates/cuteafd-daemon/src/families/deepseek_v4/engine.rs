@@ -35,9 +35,15 @@ pub(crate) use tp2::ExchangePolicy;
 use tp2::Tp2State;
 pub(crate) use dspark::DraftRequest;
 
-struct Dev<'a> {
-    buffer: cuteafd_ffi::CuteafdDeviceBuffer,
+pub(crate) struct Dev<'a> {
+    pub(crate) buffer: cuteafd_ffi::CuteafdDeviceBuffer,
     _owner: std::rc::Rc<DeviceAllocation<'a>>,
+}
+
+impl<'a> From<DeviceAllocation<'a>> for Dev<'a> {
+    fn from(allocation: DeviceAllocation<'a>) -> Self {
+        Self { buffer: allocation.buffer, _owner: std::rc::Rc::new(allocation) }
+    }
 }
 
 impl<'a> Dev<'a> {
@@ -59,6 +65,8 @@ pub(crate) struct Engine<'a> {
     pub family: &'static str,
     pub decode_rows: usize,
     pub prefill_rows: usize,
+    /// Export row capacity used for program names, independent of live unit cuts.
+    pub prefill_kernel_rows: usize,
     pub prefill_waves: usize,
     pub full_prefill_logits: bool,
     pub c128_width: usize,
@@ -139,8 +147,7 @@ const LOCAL_EXPERTS: usize = usize::MAX;
 /// `exchange` result for a layer whose routed experts were skipped.
 const SKIPPED_EXPERTS: usize = usize::MAX - 1;
 
-/// Lanes a long prefill chunk splits into, and the fewest rows per lane worth
-/// a second Spark exchange per layer.
+/// Independently outstanding row units on the single Spark link.
 pub(crate) const PREFILL_WAVES: usize = 2;
 
 
@@ -155,8 +162,6 @@ const TAP_ROWS: usize = metadata::WINDOW;
 struct RowStep<'s> {
     tables: &'s StepTables,
     tokens: &'s [u32],
-    /// The sequence's units (a prefill lane's C4 gather and commit); empty for decode/verify.
-    units: &'s [u32],
 }
 
 /// Everything a captured decode segment bakes in.
@@ -260,6 +265,8 @@ pub(crate) struct EngineParts<'a> {
     pub family: &'static str,
     pub decode_rows: usize,
     pub prefill_rows: usize,
+    /// Export row capacity used for program names, independent of live unit cuts.
+    pub prefill_kernel_rows: usize,
     pub prefill_waves: usize,
     pub c128_width: usize,
     pub max_context: usize,
@@ -384,6 +391,10 @@ impl<'a> Engine<'a> {
         Ok(allocation)
     }
 
+    fn kernel_rows(&self, rows: usize) -> usize {
+        if rows == self.prefill_rows { self.prefill_kernel_rows } else { rows }
+    }
+
     fn program(&self, name: &str, pointers: &[&str]) -> Result<Program<'a>> {
         self.programs.program(&format!("{}_{name}", self.family), pointers)
     }
@@ -456,7 +467,7 @@ impl<'a> Engine<'a> {
                 let values = metadata::rope_table(&self.cfg, compressed, self.max_context.max(metadata::WINDOW));
                 let allocation = DeviceAllocation::new(self.library, values.len() * 4)?;
                 self.library.copy_h2d(allocation.buffer, bytes_of(&values))?;
-                Ok(allocation)
+                Ok(allocation.into())
             };
             let pools = (0..self.cfg.n_layers).map(|l| Self::pool_layer_for(self.library, &self.cfg, parts.shape, l,
                 self.context_mode.is_some())).collect::<Result<Vec<_>>>()?;
@@ -497,7 +508,7 @@ impl<'a> Engine<'a> {
         let zeroed = |bytes: usize| -> Result<Dev<'a>> {
             let allocation = DeviceAllocation::new(library, bytes.max(256))?;
             library.cuda_zero_bytes(allocation.buffer, allocation.buffer.bytes)?;
-            Ok(allocation)
+            Ok(allocation.into())
         };
         let sequences = shape.sequences;
         let main = zeroed(shape.window_pages() * MAIN_PAGE_BYTES)?;
@@ -537,7 +548,7 @@ impl<'a> Engine<'a> {
             let values = metadata::rope_table(&parts.cfg, compressed, parts.max_context.max(metadata::WINDOW));
             let allocation = DeviceAllocation::new(parts.library, values.len() * 4)?;
             parts.library.copy_h2d(allocation.buffer, bytes_of(&values))?;
-            Ok(allocation)
+            Ok(allocation.into())
         };
         let split_family = match (parts.weights.layers.iter().any(|l| l.attention_split || l.ffn_split), parts.family) {
             (false, _) => None,
@@ -573,6 +584,7 @@ impl<'a> Engine<'a> {
             family: parts.family,
             decode_rows: parts.decode_rows,
             prefill_rows: parts.prefill_rows,
+            prefill_kernel_rows: parts.prefill_kernel_rows,
             prefill_waves: parts.prefill_waves,
             full_prefill_logits: false,
             c128_width: parts.c128_width,
@@ -626,7 +638,7 @@ impl<'a> Engine<'a> {
         let (experts, topk) = (self.cfg.n_routed_experts, self.cfg.n_activated_experts);
         let head_workspace = self.alloc(lead_only(cuteafd_ffi::programs::VOCABULARY_HEAD_WORKSPACE))?;
         let mut topk_scratch = 0usize;
-        for route in [format!("decode_m{}", self.decode_rows), format!("prefill_m{}", self.prefill_rows)] {
+        for route in [format!("decode_m{}", self.decode_rows), format!("prefill_m{}", self.prefill_kernel_rows)] {
             let spec = self.programs.spec(&format!("{}_index_topk_{route}", self.family))?;
             topk_scratch = topk_scratch.max(spec.scratch.get("scratch").copied().unwrap_or(0) as usize);
         }
@@ -715,12 +727,20 @@ impl<'a> Engine<'a> {
         })
     }
 
+    /// Stream-ordered slot uploads retain their pinned source until the copy completes.
+    fn upload(&self, buffer: cuteafd_ffi::CuteafdDeviceBuffer, bytes: &[u8]) -> Result<()> {
+        // SAFETY: callers select the owning device; all workspace consumers use its engine stream.
+        let stream = if self.library.cuda_get_device()? == self.device { self.stream }
+            else { self.peer()?.stream };
+        unsafe { self.library.copy_h2d_ordered(buffer, bytes, stream) }
+    }
+
     fn fill(&self, m: &StepBuffers<'_>, tables: &StepTables) -> Result<()> {
         ensure!(tables.rows <= m.rows, "step of {} rows exceeds its buffers ({})", tables.rows, m.rows);
         let put = |buffer: &Dev<'_>, bytes: &[u8]| -> Result<()> {
             ensure!(bytes.len() <= buffer.buffer.bytes, "step table exceeds its buffer");
             if !bytes.is_empty() {
-                self.library.copy_h2d(cuteafd_ffi::CuteafdDeviceBuffer { bytes: bytes.len(), ..buffer.buffer }, bytes)?;
+                self.upload(buffer.buffer, bytes)?;
             }
             Ok(())
         };
@@ -775,8 +795,7 @@ impl<'a> Engine<'a> {
     /// returns FP32 logits of its last `logit_rows` rows [logit_rows, vocab].
     /// `on_layer` receives each layer's stream.
     ///
-    /// A long chunk without `on_layer` runs as [`PREFILL_WAVES`] lanes of
-    /// consecutive rows, so one lane's attention overlaps the other's experts.
+    /// Consecutive units reuse their slots as they commit, without draining at chunk boundaries.
     #[allow(clippy::too_many_arguments)]
     pub fn prefill(
         &self,
@@ -854,7 +873,7 @@ impl<'a> Engine<'a> {
         let mut tables = metadata::decode_step(&steps, &self.shape, self.cfg.index_topk, self.c128_width)?;
         tables.pad_c4_geometry(self.shape.units)?;
         let tables = &tables;
-        let step = RowStep { tables, tokens: &tokens, units: &[] };
+        let step = RowStep { tables, tokens: &tokens };
         let transports = match transport {
             Some(transport) => std::slice::from_mut(transport),
             None => &mut [],
@@ -900,7 +919,7 @@ impl<'a> Engine<'a> {
         let mut tables = metadata::verify_step(&spans, &self.shape, self.cfg.index_topk, self.c128_width)?;
         tables.pad_c4_geometry(self.shape.units)?;
         let tables = &tables;
-        let step = RowStep { tables, tokens: &tokens, units: &[] };
+        let step = RowStep { tables, tokens: &tokens };
         let logits = self.step(&[step], transports, runtime, tokens.len(), None, false)?;
         for (placement, tokens) in sequences.iter_mut() {
             placement.len += tokens.len();
@@ -932,97 +951,56 @@ impl<'a> Engine<'a> {
         transports: &mut [SparkLink<'_>],
         runtime: &tokio::runtime::Runtime,
         logit_rows: usize,
-        mut on_layer: Option<&mut dyn FnMut(usize, &[u8]) -> Result<()>>,
+        on_layer: Option<&mut dyn FnMut(usize, &[u8]) -> Result<()>>,
         download: bool,
     ) -> Result<Logits> {
         self.begin_route_step();
         let h = self.cfg.dim;
-        ensure!(!lanes.is_empty(), "a step needs a lane");
-        let decode = lanes[0].tables.decode;
-        let total: usize = lanes.iter().map(|l| l.tables.rows).sum();
-        ensure!(logit_rows <= total && (on_layer.is_none() || lanes.len() == 1)
-            && lanes.iter().all(|l| l.tokens.len() == l.tables.rows)
-            && (!decode || lanes.len() == 1), "step lanes disagree");
-        let slot = if decode { &self.decode_workspace } else { &self.prefill_workspace };
-        if slot.borrow().is_none() {
-            let (rows, count) = if decode { (self.decode_rows, 1) } else { (self.prefill_rows, self.prefill_waves) };
-            *slot.borrow_mut() = Some(self.workspace(rows, count)?);
+        ensure!(lanes.len() == 1 && lanes[0].tables.decode
+            && lanes[0].tokens.len() == lanes[0].tables.rows && logit_rows <= lanes[0].tables.rows,
+            "single-step requires one decode batch");
+        ensure!(on_layer.is_none() && !download, "decode returns device logits");
+        if self.decode_workspace.borrow().is_none() {
+            *self.decode_workspace.borrow_mut() = Some(self.workspace(self.decode_rows, 1)?);
         }
-        let workspace = slot.borrow();
-        let w = workspace.as_ref().context("workspace")?;
-        ensure!(lanes.len() <= w.slots.len(), "{} lanes exceed the workspace", lanes.len());
-        // Tables are copied in only after the previous step's last read (the
-        // head download synchronized the stream).
-        // The decode graph's first segment gathers the streams itself.
+        let workspace = self.decode_workspace.borrow();
+        let w = workspace.as_ref().context("decode workspace")?;
+        let step = &lanes[0];
+        let lane = &w.slots[0];
         let gather = self.embedding.device_gather();
-        for (step, lane) in lanes.iter().zip(&w.slots) {
-            self.fill(&lane.tables, step.tables)?;
-            self.embedding.check(step.tokens)?;
-            // Token ids feed hash routing and the embedding gather.
-            let token_bytes: Vec<u8> = step.tokens.iter().flat_map(|token| token.to_le_bytes()).collect();
-            self.library.copy_h2d(cuteafd_ffi::CuteafdDeviceBuffer { bytes: token_bytes.len(), ..lane.tokens.buffer }, &token_bytes)?;
-            if !gather {
-                // The mHC streams start as four copies of the embedding.
-                let rows = self.embedding.host_rows_repeated(step.tokens, 4)?;
-                self.library.copy_h2d(cuteafd_ffi::CuteafdDeviceBuffer { bytes: rows.len(), ..lane.stream_a.buffer }, &rows)?;
-            } else if !decode {
-                self.gather_streams(lane, step.tables.rows)?;
-            }
+        self.fill(&lane.tables, step.tables)?;
+        self.embedding.check(step.tokens)?;
+        self.upload(lane.tokens.buffer, bytes_of(step.tokens))?;
+        if !gather {
+            self.upload(lane.stream_a.buffer, &self.embedding.host_rows_repeated(step.tokens, 4)?)?;
         }
-        self.prepare_route_checks(&lanes.iter().map(|l| l.tables.rows).collect::<Vec<_>>())?;
-        let cap = if decode { self.decode_rows } else { self.prefill_rows };
-        let rows_of = |lane: usize| Scalar::I32(lanes[lane].tables.rows as i32);
-        // The head split's second GPU: its workspace of the same shape, the same tables,
-        // and each lane's residual streams pushed over (the first decode segment pushes them).
+        self.prepare_route_checks(&[step.tables.rows])?;
+        let cap = self.decode_rows;
+        let rows_of = |_: usize| Scalar::I32(step.tables.rows as i32);
         let peer_workspace = match &self.peer {
             Some(peer) => {
-                let cell = if decode { &peer.decode_workspace } else { &peer.prefill_workspace };
-                if cell.borrow().is_none() {
-                    let (rows, count) = if decode { (self.decode_rows, 1) } else { (self.prefill_rows, self.prefill_waves) };
-                    *cell.borrow_mut() = Some(self.workspace_on(1, rows, count)?);
+                if peer.decode_workspace.borrow().is_none() {
+                    *peer.decode_workspace.borrow_mut() = Some(self.workspace_on(1, self.decode_rows, 1)?);
                 }
-                Some(cell.borrow())
+                Some(peer.decode_workspace.borrow())
             }
             None => None,
         };
-        let w1 = match &peer_workspace {
-            Some(ws) => Some(ws.as_ref().context("peer workspace")?),
-            None => None,
-        };
+        let w1 = peer_workspace.as_ref().and_then(|ws| ws.as_ref());
         if let Some(w1) = w1 {
-            // SAFETY: the engine owns the peer stream; every wait on it was matched by a
-            // push rank 0 queued, so it drains before its tables are rewritten.
-            unsafe { self.library.cuda_stream_synchronize(self.stream_of(1))? };
-            for (step, lane1) in lanes.iter().zip(&w1.slots) {
-                self.on(1, || {
-                    self.fill(&lane1.tables, step.tables)?;
-                    self.library.copy_h2d(cuteafd_ffi::CuteafdDeviceBuffer {
-                        bytes: step.tokens.len() * 4, ..lane1.tokens.buffer
-                    }, bytes_of(step.tokens))
-                })?;
-            }
+            // Decode's previous call is complete before its single slot is reused.
+            self.on(1, || {
+                // SAFETY: all prior peer waits have matching publications.
+                unsafe { self.library.cuda_stream_synchronize(self.stream_of(1))?; }
+                self.fill(&w1.slots[0].tables, step.tables)?;
+                self.upload(w1.slots[0].tokens.buffer, bytes_of(step.tokens))
+            })?;
             if self.context.is_some() {
-                // Each rank's own C4 tables over the replicated ones, after both streams drained
-                // (rank 0's step tables were written above under the same contract).
                 self.sync()?;
-                let mut units = Vec::new();
-                for (index, (step, (lane0, lane1))) in lanes.iter().zip(w.slots.iter().zip(&w1.slots)).enumerate() {
-                    // The step's first prefill lane gathers the history every later lane reads.
-                    let gather = index == 0;
-                    units.push([self.put_context_tables(0, &lane0.tables, step.tables, index, gather, step.units)?,
-                        self.put_context_tables(1, &lane1.tables, step.tables, index, gather, step.units)?]);
-                }
-                *self.context_units.borrow_mut() = units;
-            }
-            if !decode {
-                for (index, (step, lane)) in lanes.iter().zip(&w.slots).enumerate() {
-                    self.record_peer(0, "entry", DIRECT, true, 0, index);
-                    self.exchange()?.push_to(0, DIRECT, lane.stream_a.buffer.ptr, w1.slots[index].stream_a.buffer.ptr,
-                        step.tables.rows * 4 * h * 2)?;
-                }
-                for (index, step) in lanes.iter().enumerate() {
-                    self.peer_front(0, step.tables, &w1.slots[index], index, w1, rows_of(index), cap)?;
-                }
+                *self.context_units.borrow_mut() = vec![[
+                    self.put_context_tables(0, &lane.tables, step.tables, 0, false, &[])?,
+                    self.put_context_tables(1, &w1.slots[0].tables, step.tables, 0, false, &[])?,
+                ]];
             }
         }
         if decode {
@@ -1345,7 +1323,7 @@ impl<'a> Engine<'a> {
         self.attention_front(1, layer, weights, tables, lane, w, rows, cap)?;
         self.attention_sum(1, layer, index, w, rows)?;
         self.attention_back(1, weights, lane, w, rows, cap, w.sum.buffer.ptr)?;
-        self.run_on(1, weights.ffn_split, &format!("shared_ffn_m{cap}"), &[
+        self.run_on(1, weights.ffn_split, &format!("shared_ffn_m{}", self.kernel_rows(cap)), &[
             ("x", w.y.buffer.ptr), ("w13", weights.ptr("w13")?), ("w13_scale", weights.ptr("w13_scale")?),
             ("w2", weights.ptr("w2")?), ("w2_scale", weights.ptr("w2_scale")?), ("out", lane.shared.buffer.ptr),
             ("scratch", w.scratch.buffer.ptr),
@@ -1502,7 +1480,7 @@ impl<'a> Engine<'a> {
             ("base", weights.ptr("attn.base")?), ("norm", weights.ptr("attn.norm")?), ("post", lane.post.buffer.ptr),
             ("comb", lane.comb.buffer.ptr), ("y", w.y.buffer.ptr), ("scratch", w.scratch.buffer.ptr),
         ], &[rows])?;
-        self.run_on(rank, split, &format!("producer_m{cap}"), &[
+        self.run_on(rank, split, &format!("producer_m{}", self.kernel_rows(cap)), &[
             ("hidden", w.y.buffer.ptr), ("positions", m.positions.buffer.ptr), ("main_slots", m.main_slots.buffer.ptr),
             ("cos_sin", rope.buffer.ptr), ("w_qkv", weights.ptr("w_qkv")?), ("w_qkv_scale", weights.ptr("w_qkv_scale")?),
             ("w_q", weights.ptr("w_q")?), ("w_q_scale", weights.ptr("w_q_scale")?), ("q_norm", weights.ptr("q_norm")?),
@@ -1532,7 +1510,7 @@ impl<'a> Engine<'a> {
             for range in self.attention_reduction.indexed_ranges(&tables.c128_lengths) {
                 let (start, count) = (range.start, range.rows);
                 let attention = if range.compressed { "c128" } else { "win" };
-                self.run_on(rank, weights.attention_split, &format!("sparse_mla_{mode}_{attention}_m{cap}"), &[
+                self.run_on(rank, weights.attention_split, &format!("sparse_mla_{mode}_{attention}_m{}", self.kernel_rows(cap)), &[
                     ("q", at(&w.query, start, count, heads * 512 * 2)?),
                     ("swa_cache", main),
                     ("swa_indices", at(&m.swa_indices, start, count, metadata::WINDOW * 4)?),
@@ -1547,7 +1525,7 @@ impl<'a> Engine<'a> {
             }
             return Ok(());
         }
-        self.run_on(rank, weights.attention_split, &format!("sparse_mla_{mode}_{attention}_m{cap}"), &[
+        self.run_on(rank, weights.attention_split, &format!("sparse_mla_{mode}_{attention}_m{}", self.kernel_rows(cap)), &[
             ("q", w.query.buffer.ptr), ("swa_cache", main), ("swa_indices", m.swa_indices.buffer.ptr),
             ("swa_lengths", m.swa_lengths.buffer.ptr), ("indexed_cache", indexed_cache),
             ("indexed_indices", indexed_indices), ("indexed_lengths", indexed_lengths),
@@ -1559,7 +1537,7 @@ impl<'a> Engine<'a> {
         w: &Workspace<'_>, rows: Scalar, cap: usize) -> Result<()> {
         let m = &lane.tables;
         let rope = self.attention_rope(rank, weights.ratio);
-        self.run_on(rank, weights.attention_split, &format!("wo_m{cap}"), &[
+        self.run_on(rank, weights.attention_split, &format!("wo_m{}", self.kernel_rows(cap)), &[
             ("o", w.attn_out.buffer.ptr), ("positions", m.positions.buffer.ptr), ("cos_sin", rope.buffer.ptr),
             ("wo_a", weights.ptr("wo_a")?), ("wo_a_scale", weights.ptr("wo_a_scale")?), ("wo_b", weights.ptr("wo_b")?),
             ("wo_b_scale", weights.ptr("wo_b_scale")?), ("out", w.delta.buffer.ptr), ("scratch", w.scratch.buffer.ptr),
@@ -1572,7 +1550,7 @@ impl<'a> Engine<'a> {
     fn attention_back(&self, rank: usize, weights: &LayerWeights<'_>, lane: &UnitSlot<'_>, w: &Workspace<'_>, rows: Scalar,
         cap: usize, x: *mut c_void) -> Result<()> {
         let (a, b) = (&lane.stream_a, &lane.stream_b);
-        self.run_on(rank, false, &format!("mhc_post_pre_m{cap}"), &[
+        self.run_on(rank, false, &format!("mhc_post_pre_m{}", self.kernel_rows(cap)), &[
             ("x", x), ("residual", a.buffer.ptr), ("prev_post", lane.post.buffer.ptr),
             ("prev_comb", lane.comb.buffer.ptr), ("fn", weights.ptr("ffn.fn")?), ("scale", weights.ptr("ffn.scale")?),
             ("base", weights.ptr("ffn.base")?), ("norm", weights.ptr("ffn.norm")?), ("residual_out", b.buffer.ptr),
@@ -1652,7 +1630,7 @@ impl<'a> Engine<'a> {
         }
         self.index_produce(rank, weights, m, w, rope, rows, cap)?;
         let mode = if tables.decode { "decode" } else { "prefill" };
-        self.run_on(rank, false, &format!("index_topk_{mode}_m{cap}"), &[
+        self.run_on(rank, false, &format!("index_topk_{mode}_m{}", self.kernel_rows(cap)), &[
             ("q_fp8", w.index_query.buffer.ptr), ("weights", w.index_weights.buffer.ptr),
             ("index_k_cache", index),
             ("page_table", m.c4_page_table.buffer.ptr), ("cache_lengths", m.c4_visible.buffer.ptr),
@@ -1708,7 +1686,7 @@ impl<'a> Engine<'a> {
     #[allow(clippy::too_many_arguments)]
     fn index_produce(&self, rank: usize, weights: &LayerWeights<'_>, m: &StepBuffers<'_>, w: &Workspace<'_>,
         rope: &Dev<'_>, rows: Scalar, cap: usize) -> Result<()> {
-        self.run_on(rank, false, &format!("index_producer_m{cap}"), &[
+        self.run_on(rank, false, &format!("index_producer_m{}", self.kernel_rows(cap)), &[
             ("q_rank", w.q_rank.buffer.ptr), ("hidden", w.y.buffer.ptr), ("positions", m.positions.buffer.ptr),
             ("cos_sin", rope.buffer.ptr), ("w_q", weights.ptr("index_w_q")?), ("w_q_scale", weights.ptr("index_w_q_scale")?),
             ("w_proj", weights.ptr("index_w_proj")?), ("query", w.index_query.buffer.ptr),
@@ -1858,7 +1836,7 @@ impl<'a> Engine<'a> {
     fn shared_ffn(&self, layer: usize, w: &Workspace<'_>, lane: &UnitSlot<'_>, rows: Scalar, cap: usize,
         weights: &LayerWeights<'_>) -> Result<()> {
         // A head split's layers hold half the shared expert (its program family's share).
-        self.run_on(0, weights.ffn_split, &format!("shared_ffn_m{cap}"), &[
+        self.run_on(0, weights.ffn_split, &format!("shared_ffn_m{}", self.kernel_rows(cap)), &[
             ("x", w.y.buffer.ptr), ("w13", weights.ptr("w13")?), ("w13_scale", weights.ptr("w13_scale")?),
             ("w2", weights.ptr("w2")?), ("w2_scale", weights.ptr("w2_scale")?), ("out", lane.shared.buffer.ptr),
             ("scratch", w.scratch.buffer.ptr),
