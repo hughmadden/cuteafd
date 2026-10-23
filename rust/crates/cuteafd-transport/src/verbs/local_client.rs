@@ -17,6 +17,8 @@ pub(crate) struct LocalTp4Client {
     retired: Vec<TcpStream>,
     retirement_error: Option<String>,
     capacity: Option<u32>,
+    /// Explicit immutable ModelAdmission endpoint; survives every QP reconnect.
+    model_endpoint: Option<u32>,
     pending: Vec<VecDeque<VerbsHostProtocolV2PendingChunkRoundtrip>>,
     /// Dispatched waves, oldest first. Every rank serves its requests in post
     /// order, so the oldest wave completes first on each rank; `poll` serves
@@ -61,6 +63,7 @@ impl LocalTp4Client {
             retired: Vec::new(),
             retirement_error: None,
             capacity: None,
+            model_endpoint: None,
             pending: (0..world).map(|_| VecDeque::with_capacity(1)).collect(),
             waves: VecDeque::with_capacity(1),
             max_waves: 1,
@@ -75,6 +78,15 @@ impl LocalTp4Client {
         }
     }
     pub(crate) fn set_capacity(&mut self, capacity: u32) { self.capacity = Some(capacity); }
+    pub(crate) fn bind_model_endpoint(&mut self, endpoint: u32) -> Result<()> {
+        anyhow::ensure!(endpoint < 8, "ModelAdmission endpoint index must be below eight");
+        anyhow::ensure!(self.model_endpoint.is_none(), "ModelAdmission endpoint already bound");
+        anyhow::ensure!(self.sessions.iter().all(Option::is_none)
+            && self.expert_grouping.iter().all(Option::is_none) && self.waves.is_empty(),
+            "ModelAdmission endpoint must be bound before bootstrap or dispatch");
+        self.model_endpoint = Some(endpoint);
+        Ok(())
+    }
     /// Admit up to `waves` outstanding waves. Raising it requires no open wave.
     pub(crate) fn set_max_waves(&mut self, waves: usize) -> Result<()> {
         anyhow::ensure!((1..=4).contains(&waves), "Spark transport admits 1..=4 outstanding waves");
@@ -130,7 +142,7 @@ impl LocalTp4Client {
         self.sessions[rank] = Some(VerbsHostProtocolV2PersistentClientSession::connect_local(
             self.peers[rank], &self.config, request, landing,
             if egress { self.egress.as_ref() } else { None },
-            self.write[rank], self.terminal_owner.clone(), flow_label, capacity)?);
+            self.write[rank], self.terminal_owner.clone(), flow_label, capacity, self.model_endpoint)?);
         self.retain_grouping(rank)
     }
 
@@ -594,6 +606,26 @@ mod tests {
         assert!(error.contains("rank 0 has no live Spark session"), "{error}");
         assert!(error.contains("bootstrap the transport"), "{error}");
         assert!(!error.contains("did not report installed expert grouping"), "{error}");
+        Ok(())
+    }
+
+    #[test]
+    fn explicit_model_endpoint_is_immutable_and_survives_reset() -> Result<()> {
+        let peer = "127.0.0.1:19453".parse()?;
+        let mut client = LocalTp4Client::new_ranks(vec![peer], TcpTransportConfig::default());
+        assert!(client.bind_model_endpoint(8).is_err());
+        assert!(client.model_endpoint.is_none());
+        client.bind_model_endpoint(2)?;
+        assert!(client.bind_model_endpoint(0).is_err());
+        client.reset();
+        assert_eq!(client.model_endpoint, Some(2));
+        assert!(client.bind_model_endpoint(1).is_err());
+        let mut unbound = LocalTp4Client::new_ranks(vec![peer], TcpTransportConfig::default());
+        let (_sender, chunks) = tokio::sync::mpsc::unbounded_channel();
+        let (_done, completed) = tokio::sync::oneshot::channel();
+        unbound.waves.push_back(OpenWave { chunks, done: vec![completed], deadline: None });
+        assert!(unbound.bind_model_endpoint(2).is_err());
+        assert!(unbound.model_endpoint.is_none());
         Ok(())
     }
 
