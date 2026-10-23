@@ -1,4 +1,4 @@
-//! Bundled MiniMax processors at release revision 9e7ebacac350497ad4a1272a2e817639bf11561c.
+//! Bundled MiniMax processors at release revision 54e4e69dfc452b1e94a426c24a4fdeeaa8e3ad5e.
 //! The executable processors use smart resize, not the legacy grid-pinpoint fields.
 use super::{invalid, resize, EncoderId, ImageFamily, ImageGrid, ImageKey, MediaError, ProcessorConfig, Result, RgbImage, SpanExpander};
 use sha2::{Digest, Sha256};

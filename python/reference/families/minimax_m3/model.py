@@ -19,7 +19,7 @@ import torch.nn.functional as F
 from shape_invariant import ROWS, linear
 
 CHECKPOINT = "MiniMaxAI/MiniMax-M3.1-Flash"
-REVISION = "9e7ebacac350497ad4a1272a2e817639bf11561c"
+REVISION = "54e4e69dfc452b1e94a426c24a4fdeeaa8e3ad5e"
 TRANSFORMERS_REVISION = "6b6792ff3b1a434913dc59659d4461acc9c3a51a"
 SOURCE_PINS = {
     "src/transformers/models/minimax_m3_vl/modular_minimax_m3_vl.py":

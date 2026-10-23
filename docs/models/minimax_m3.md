@@ -9,7 +9,7 @@ tensor header and plans memory; the engine is being brought up.
 
 ## Supported checkpoints / quants
 
-- `MiniMaxAI/MiniMax-M3.1-Flash` (revision `9e7ebacac350497ad4a1272a2e817639bf11561c`),
+- `MiniMaxAI/MiniMax-M3.1-Flash` (revision `54e4e69dfc452b1e94a426c24a4fdeeaa8e3ad5e`),
   the official release, served in its own formats: routed experts
   compressed-tensors NVFP4 W4A4 (`weight_packed`, E4M3 per-16 scales, divisor
   `weight_global_scale` / `input_global_scale`), attention, indexer, dense and
@@ -62,6 +62,7 @@ RTX, vision on a Spark, FP8 KV, Spark budget 108 GiB per rank.
 | Date | Change | Basic eval |
 | --- | --- | --- |
 | 2026-10-23 | Planner family, tensor contract, cache layout | — |
+| 2026-10-23 | Re-pinned to `54e4e69`: the release rewrote its history (README/docs only; every weight, config, tokenizer and template blob is identical to `9e7ebac`) | — |
 
 ## Single 32 GiB coordinator: KV-saving design
 

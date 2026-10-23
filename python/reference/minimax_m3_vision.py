@@ -10,7 +10,7 @@ from __future__ import annotations
 import math
 
 VISION_PREFIX = "vision_tower.vision_model."
-MODEL_REVISION = "9e7ebacac350497ad4a1272a2e817639bf11561c"
+MODEL_REVISION = "54e4e69dfc452b1e94a426c24a4fdeeaa8e3ad5e"
 MODELING_SHA256 = "1c755515c8aefdbc6f9145ae8f051e43907e21022d9644e81afe47cd2e37b58d"
 POSITION_SOURCE_SHA256 = "bcecd5a92b3266b9926272a549d2b1a0f1fe7646c698c0fa19bd96f976085356"
 

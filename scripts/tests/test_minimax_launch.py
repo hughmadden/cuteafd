@@ -14,7 +14,7 @@ from test_serve_launch_new_families import _flag, _hosts, _line
 
 ROOT = Path(__file__).resolve().parents[2]
 MODEL = "MiniMaxAI/MiniMax-M3.1-Flash"
-REVISION = "9e7ebacac350497ad4a1272a2e817639bf11561c"
+REVISION = "54e4e69dfc452b1e94a426c24a4fdeeaa8e3ad5e"
 CONFIG = {"model_type": "minimax_m3_vl", "text_config": {
     "model_type": "minimax_m3", "num_hidden_layers": 60,
     "moe_layer_freq": [0] * 3 + [1] * 57,

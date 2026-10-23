@@ -17,7 +17,7 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::{io::{Read, Write}, net::SocketAddr, path::{Component, Path, PathBuf}};
 
-const REVISION: &str = "9e7ebacac350497ad4a1272a2e817639bf11561c";
+const REVISION: &str = "54e4e69dfc452b1e94a426c24a4fdeeaa8e3ad5e";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum, serde::Serialize)]
 #[serde(rename_all = "lowercase")]
