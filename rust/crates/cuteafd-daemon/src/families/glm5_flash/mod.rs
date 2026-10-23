@@ -94,7 +94,7 @@ pub(crate) struct EngineArgs {
     #[arg(long, value_enum, env = "CUTEAFD_GLMF_INDEX_CACHE", default_value = "keys")]
     pub index_cache: engine::IndexCache,
     /// Rows of one prefill lane, and of a serial prefill chunk (the programs take up to 4096).
-    #[arg(long, visible_alias = "prefill-lane-rows", default_value_t = 4096)]
+    #[arg(long, default_value_t = 4096)]
     pub prefill_rows: usize,
     /// The most rows of one decode or verify step: 64 (the `_m64` programs), or 128, where a step of
     /// more than 64 rows runs the wide `_m128` programs (a build with CUTEAFD_GLMF_WIDE_DECODE_ROWS=128;
@@ -111,7 +111,7 @@ pub(crate) struct EngineArgs {
     /// Lanes a Spark prefill chunk runs in, each with its own Spark transport and exchange in
     /// flight while the other lanes' GPU layers run (1 to 4): a chunk of up to lanes x
     /// --prefill-rows rows. The lanes share one set of attention temporaries.
-    #[arg(long, default_value_t = engine::DEFAULT_PREFILL_LANES,
+    #[arg(long = "prefill-waves", default_value_t = engine::DEFAULT_PREFILL_LANES,
         value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..=engine::MAX_PREFILL_LANES as u64))]
     pub prefill_lanes: usize,
     /// GPU memory (GiB) an automatic pool leaves free for growth the start-up cannot measure
@@ -768,7 +768,7 @@ mod draft_cli_tests {
         }
         // Two lanes' transports, each with a plane per Spark (4 ranks) of 64 more rows of 4,096 BF16.
         assert_eq!(wide_intake_bytes(&args, 4, 4096), 2 * 4 * 64 * 4096 * 2);
-        assert_eq!(wide_intake_bytes(&parse(&["--prefill-rows", "64", "--decode-rows", "128", "--prefill-lanes", "4"]),
+        assert_eq!(wide_intake_bytes(&parse(&["--prefill-rows", "64", "--decode-rows", "128", "--prefill-waves", "4"]),
             4, 4096), 4 * 4 * 64 * 4096 * 2);
         for flags in [&[][..], &["--decode-rows", "128"][..], &["--prefill-rows", "64"][..],
             &["--prefill-rows", "128", "--decode-rows", "128"][..]] {
@@ -851,12 +851,12 @@ mod draft_cli_tests {
     fn prefill_lanes_default_to_two_of_4096_rows_and_take_one_to_four() {
         let defaults = parse(&[]);
         assert_eq!((defaults.prefill_lanes, defaults.prefill_rows), (2, 4096));
-        let four = parse(&["--prefill-lanes", "4", "--prefill-lane-rows", "2048"]);
+        let four = parse(&["--prefill-waves", "4", "--prefill-rows", "2048"]);
         assert_eq!((four.prefill_lanes, four.prefill_rows), (4, 2048));
         assert_eq!(parse(&["--prefill-rows", "2048"]).prefill_rows, 2048);
         for lanes in ["0", "5"] {
             assert!(Parse::try_parse_from(["test", "--snapshot", "/checkpoint", "--native-lib", "/native",
-                "--prefill-lanes", lanes]).is_err());
+                "--prefill-waves", lanes]).is_err());
         }
     }
 
@@ -1750,7 +1750,7 @@ impl Opened {
         let mut selected_args = args.clone();
         selected_args.prefill_lanes = usize::try_from(working.prefill_lanes)?;
         let args = &selected_args;
-        if !args.skip_experts && placement.tp2.is_some() { engine::check_tp2_lanes(args.prefill_lanes)?; }
+
         let spark_layers = admitted_spark_layers(&self.cfg, &placement.layers, args.skip_experts)?;
         if !args.skip_experts {
             ensure!(spark_layers == working.spark_layers,
@@ -1835,7 +1835,7 @@ impl Opened {
                 else { cuteafd_core::SparkIngress::Fp8K32 };
             let model = cuteafd_transport::worker_selection::ModelAdmission {
                 capacity, compiled_capacity: capacity,
-                endpoints: vec![cuteafd_core::SparkEndpoint { ring_depth: None, capacity, ingress }; args.prefill_lanes],
+                endpoints: vec![cuteafd_core::SparkEndpoint { ring_depth: None, capacity, ingress }],
                 rings: crate::shared::placement::spark_rings(64 << 20)?,
             };
             let admission = crate::shared::placement::SparkAdmission::plan(source, geometry, self.experts.as_ref(),
@@ -2187,10 +2187,10 @@ impl Opened {
         let spark_world = cuteafd_transport::expert::SparkWorld::canonical(peers.len())?;
         // One transport per prefill lane: each lane's wave stays in flight on its own QPs. Each takes
         // waves of the widest step (`expert_rows`): a verify step may be wider than a prefill lane.
-        let mut transports = (0..args.prefill_lanes).map(|_| crate::shared::spark_intake::SparkLink::new(&self.library,
+        let mut transports = vec![crate::shared::spark_intake::SparkLink::new_waves(&self.library,
             spark_world, &peers, u32::try_from(args.expert_rows())?, cuteafd_transport::TcpTransportConfig { timing: false,
-                timeout: std::time::Duration::from_secs(120), max_frame_bytes: 64 << 20 }, self.cfg.hidden * 2))
-            .collect::<Result<Vec<_>>>()?;
+                timeout: std::time::Duration::from_secs(120), max_frame_bytes: 64 << 20 }, self.cfg.hidden * 2,
+            args.prefill_lanes, u32::try_from(args.prefill_rows)?)?];
         for link in &mut transports { link.enable_terminal_ownership(self.library.clone())?; }
         crate::shared::memory_report::release_load_staging(&self.library);
         let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
@@ -2200,7 +2200,7 @@ impl Opened {
         // prompt would reconnect four ranks mid-prefill, and the first request would open transport 0.
         // Every transport a prefill runs on (transport 0 also carries decode, verify and serial chunks)
         // is warmed with `expert_rows` rows, the most any of its waves carries.
-        let warmed = engine::configured_prefill_lanes(served == self.cfg.layers, transports.len());
+        let warmed = 1;
         let warm_rows = args.expert_rows();
         let warm = engine::spark_warmup_request(&self.cfg, warm_rows, remote[0], self.checkpoint.spark_input_is_bf16())?;
         // Connect every warmed rank now and publish its installed expert

@@ -356,7 +356,7 @@ impl<'a> GlmfEngine<'a> {
         let staging = &own.staging[ordinal % 2];
         let records = view(staging, 0, split.staging_units * UNIT_RECORD_BYTES)?;
         let pools = view(staging, records.bytes, split.staging_units * POOL_PAGE_BYTES)?;
-        for (owner, &shard) in unit.shards.iter().enumerate().filter(|(_, &n)| n > 0) {
+        for (owner, &shard) in unit.shards.iter().enumerate().filter(|(_, &n)| n > 0 && !self.context_reuse.get()) {
             let caches = self.caches_of(owner);
             let kv = caches.kv[index].as_ref().context("MLA layer without a record pool")?;
             let pool_keys = &caches.index[index].as_ref().context("MLA layer without an index cache")?.pools;
