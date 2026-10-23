@@ -601,7 +601,7 @@ mod tests {
             ModelAdmission {
                 capacity: 64,
                 compiled_capacity: u32::try_from(compiled)?,
-                endpoints: vec![SparkEndpoint {
+                endpoints: vec![SparkEndpoint { ring_depth: None,
                     capacity: 64,
                     ingress: SparkIngress::Bf16,
                 }],

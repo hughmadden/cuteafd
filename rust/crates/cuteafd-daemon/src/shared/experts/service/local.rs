@@ -56,7 +56,7 @@ mod selection_tests {
             snapshot: dir.path().into(), exlr8_manifest: None, rank: 0, world: 6, model_admission: None, selected_layers: None, capacity: 4096, device_budget: 121 << 30, max_frame_bytes: 64 << 20,
             rdma_endpoints: 3, declared_world: cuteafd_transport::expert::SparkWorld::canonical(6).unwrap(), native_spark_tp2: false, bf16_ingress: false };
         let model = cuteafd_transport::worker_selection::ModelAdmission { capacity: 80, compiled_capacity: 80,
-            endpoints: vec![cuteafd_core::SparkEndpoint { capacity: 80,
+            endpoints: vec![cuteafd_core::SparkEndpoint { ring_depth: None, capacity: 80,
                 ingress: cuteafd_core::SparkIngress::Bf16Decode { rows: 16 } }],
             rings: cuteafd_core::SparkRings { max_frame_bytes: 32 << 20, depth: 2,
                 slot_bytes: 1 << 20, alignment: 4096 } };

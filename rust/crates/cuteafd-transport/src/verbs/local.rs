@@ -251,11 +251,13 @@ impl LocalVerbsExpertConnection {
         if let Some(installed) = selection {
             if let Some(spec) = installed.endpoint_spec(start.model_endpoint)? {
                 let model = installed.selection().model().expect("typed endpoint");
+                let rings = spec.resolved_rings(model.rings)
+                    .context("invalid admitted endpoint ring depth")?;
                 let (request, response) = spec.wire_bytes(installed.selection().geometry())
                     .context("invalid admitted endpoint wire geometry")?;
-                let slot = |bytes: usize| bytes.max(model.rings.slot_bytes).min(model.rings.max_frame_bytes);
-                let expected_request = VerbsHostRdmaRing::new(slot(request), model.rings.alignment, model.rings.depth)?;
-                let expected_response = VerbsHostRdmaRing::new(slot(response), model.rings.alignment, model.rings.depth)?;
+                let slot = |bytes: usize| bytes.max(rings.slot_bytes).min(rings.max_frame_bytes);
+                let expected_request = VerbsHostRdmaRing::new(slot(request), rings.alignment, rings.depth)?;
+                let expected_response = VerbsHostRdmaRing::new(slot(response), rings.alignment, rings.depth)?;
                 let (request, response) = Self::validated_rings(&start)?;
                 anyhow::ensure!(request == expected_request && response == expected_response,
                     "endpoint {:?} ring geometry differs from ModelAdmission", start.model_endpoint);
@@ -785,11 +787,17 @@ mod budget_tests {
     use super::*;
 
     fn typed_admission() -> Result<crate::worker_selection::InstalledModelAdmission> {
+        typed_admission_with_depths(&[None])
+    }
+
+    fn typed_admission_with_depths(depths: &[Option<usize>]) -> Result<crate::worker_selection::InstalledModelAdmission> {
         use crate::worker_selection::{InstalledModelAdmission, ModelAdmission};
         use cuteafd_core::{ModelAdmissionResponse, RuntimeSample, SparkEndpoint, SparkIngress,
             SparkRings, SparkRuntimeInventory, SparkSlice};
         let selection = placement_selection(&[13]).with_model(ModelAdmission {
-            capacity: 80, compiled_capacity: 80, endpoints: vec![SparkEndpoint { capacity: 80, ingress: SparkIngress::Bf16 }],
+            capacity: 80, compiled_capacity: 80,
+            endpoints: depths.iter().map(|&ring_depth| SparkEndpoint {
+                capacity: 80, ingress: SparkIngress::Bf16, ring_depth }).collect(),
             rings: SparkRings { max_frame_bytes: 64 << 20, depth: 8, slot_bytes: 8 << 20, alignment: 4096 },
         })?;
         let report = ModelAdmissionResponse {
@@ -804,6 +812,41 @@ mod budget_tests {
             host_exchange_bytes: 0, row_indices_bytes: 0,
         };
         InstalledModelAdmission::new(0, selection, Some(report))
+    }
+
+    #[test]
+    fn typed_mixed_depth_handshake_matches_each_endpoint_before_allocation() -> Result<()> {
+        let installed = typed_admission_with_depths(&[None, None, Some(2)])?;
+        for (index, expected_depth) in [8, 8, 2].into_iter().enumerate() {
+            for depth in [0, 1, 2, 4, 8, 9] {
+                let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+                let mut client = TcpStream::connect(listener.local_addr()?)?;
+                let (server, _) = listener.accept()?;
+                let lease = installed.reserve_endpoint(Some(index as u32))?.unwrap();
+                let (endpoint, rings) = lease.contract();
+                assert_eq!(rings.depth, expected_depth);
+                let (request, response) = endpoint.wire_bytes(installed.selection().geometry()).unwrap();
+                let (request, response) = persistent_ring_geometry(rings.max_frame_bytes, request,
+                    response, rings.slot_bytes, rings.alignment, rings.depth)?;
+                let mut start = placement_start(Some(installed.selection().digest()?), 0);
+                start["model_endpoint"] = index.into();
+                start["ring_depth"] = depth.into();
+                start["request_capacity_wire_bytes"] = request.slot_capacity_bytes.into();
+                start["response_capacity_wire_bytes"] = response.slot_capacity_bytes.into();
+                start["request_slot_stride_bytes"] = request.slot_stride_bytes.into();
+                start["response_slot_stride_bytes"] = response.slot_stride_bytes.into();
+                start["request_registered_span_bytes"] = (request.slot_stride_bytes * depth).into();
+                start["response_registered_span_bytes"] = (response.slot_stride_bytes * depth).into();
+                write_control(&mut client, &start)?;
+                let result = LocalVerbsExpertConnection::read_persistent_start(&server, 64 << 20, Some(&installed));
+                assert_eq!(result.is_ok(), depth == expected_depth,
+                    "endpoint={index} depth={depth}: {:?}", result.err());
+            }
+        }
+        for depth in [0, 9, usize::MAX] {
+            assert!(typed_admission_with_depths(&[None, Some(depth)]).is_err());
+        }
+        Ok(())
     }
 
     #[test]

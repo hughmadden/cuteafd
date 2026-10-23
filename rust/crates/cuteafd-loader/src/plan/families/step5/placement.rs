@@ -294,7 +294,7 @@ pub(super) fn layout(
         prefill_lanes: 1,
     };
     let endpoints = (0..admitted.ownership.routed_endpoints()?)
-        .map(|_| cuteafd_core::SparkEndpoint {
+        .map(|_| cuteafd_core::SparkEndpoint { ring_depth: None,
             capacity: u32::try_from(rows).unwrap_or(u32::MAX),
             ingress: cuteafd_core::SparkIngress::Bf16,
         })

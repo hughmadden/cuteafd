@@ -550,7 +550,7 @@ mod tests {
             world,
             model_admission: Some(cuteafd_transport::worker_selection::ModelAdmission {
                 capacity: 16, compiled_capacity: 16,
-                endpoints: vec![cuteafd_core::SparkEndpoint { capacity: 16,
+                endpoints: vec![cuteafd_core::SparkEndpoint { ring_depth: None, capacity: 16,
                     ingress: cuteafd_core::SparkIngress::Fp8K32 }; 2],
                 rings: cuteafd_core::SparkRings { max_frame_bytes: 64 << 20,
                     depth: 8, slot_bytes: 8 << 20, alignment: 4096 },
@@ -634,7 +634,7 @@ mod tests {
                     let model = worker.model_admission.as_mut().unwrap();
                     model.capacity = capacity;
                     model.compiled_capacity = 4096;
-                    model.endpoints = vec![cuteafd_core::SparkEndpoint { capacity,
+                    model.endpoints = vec![cuteafd_core::SparkEndpoint { ring_depth: None, capacity,
                         ingress: cuteafd_core::SparkIngress::Fp8K32 }];
                     let workspace = Exl3Worker::plan(&package.join(format!("tp6-rank{rank}")), capacity,
                         Default::default())?;
@@ -740,7 +740,7 @@ mod tests {
     fn set_model(config: &mut NativeExpertServiceConfig, capacity: u32, bf16: bool, endpoints: usize) {
         config.model_admission = Some(cuteafd_transport::worker_selection::ModelAdmission {
             capacity, compiled_capacity: capacity,
-            endpoints: vec![cuteafd_core::SparkEndpoint { capacity, ingress: if bf16 {
+            endpoints: vec![cuteafd_core::SparkEndpoint { ring_depth: None, capacity, ingress: if bf16 {
                 cuteafd_core::SparkIngress::Bf16
             } else { cuteafd_core::SparkIngress::Fp8K32 } }; endpoints],
             rings: cuteafd_core::SparkRings { max_frame_bytes: 64 << 20,
@@ -997,7 +997,7 @@ mod tests {
         use cuteafd_loader::placement::SparkWorkingSet;
         use cuteafd_transport::worker_selection::ModelAdmission;
         let geometry = ExpertGeometry::STEP5;
-        let endpoint = SparkEndpoint { capacity: 640, ingress: SparkIngress::Bf16 };
+        let endpoint = SparkEndpoint { ring_depth: None, capacity: 640, ingress: SparkIngress::Bf16 };
         let rings = SparkRings { max_frame_bytes: 64 << 20, depth: 8,
             slot_bytes: 8 << 20, alignment: 4096 };
         let working = SparkWorkingSet { spark_layers: (3..91).collect(), spark_ranks: 6,
@@ -1053,9 +1053,9 @@ mod tests {
         let geometry = cuteafd_core::ExpertGeometry::DEEPSEEK_V41;
         for device in [1, 2] {
             let mut config = config(4, 0, None);
-            let mut endpoints = vec![cuteafd_core::SparkEndpoint { capacity: 1024,
+            let mut endpoints = vec![cuteafd_core::SparkEndpoint { ring_depth: None, capacity: 1024,
                 ingress: cuteafd_core::SparkIngress::Fp8K32 }; 2];
-            endpoints.extend(std::iter::repeat_n(cuteafd_core::SparkEndpoint { capacity: 80,
+            endpoints.extend(std::iter::repeat_n(cuteafd_core::SparkEndpoint { ring_depth: None, capacity: 80,
                 ingress: cuteafd_core::SparkIngress::Fp8K32 }, device));
             let model = cuteafd_transport::worker_selection::ModelAdmission {
                 capacity: 1024, compiled_capacity: 1024, endpoints,
@@ -1142,11 +1142,11 @@ mod tests {
                 for rtx in [1, 2] {
                     let mut config = config(world, 0, None);
                     config.capacity = 4096;
-                    let mut endpoints = vec![SparkEndpoint { capacity: 4096,
+                    let mut endpoints = vec![SparkEndpoint { ring_depth: None, capacity: 4096,
                         ingress: SparkIngress::Bf16Decode { rows: 80 } }];
-                    endpoints.extend(std::iter::repeat_n(SparkEndpoint { capacity: 80,
+                    endpoints.extend(std::iter::repeat_n(SparkEndpoint { ring_depth: None, capacity: 80,
                         ingress: SparkIngress::Fp8K32 }, rtx));
-                    endpoints.push(SparkEndpoint { capacity: 1024, ingress: SparkIngress::Fp8K32 });
+                    endpoints.push(SparkEndpoint { ring_depth: Some(2), capacity: 1024, ingress: SparkIngress::Fp8K32 });
                     config.model_admission.as_mut().unwrap().endpoints = endpoints.clone();
                     config.model_admission.as_mut().unwrap().capacity = 4096;
                     config.model_admission.as_mut().unwrap().compiled_capacity = 4096;
@@ -1159,9 +1159,10 @@ mod tests {
                     let mut reservations = Vec::new();
                     for endpoint in endpoints {
                         let (request, response) = endpoint.wire_bytes(geometry).unwrap();
+                        let rings = endpoint.resolved_rings(model.rings).unwrap();
                         let actual = cuteafd_transport::verbs_host_persistent_ring_bytes(
-                            model.rings.max_frame_bytes, request, response, model.rings.slot_bytes,
-                            model.rings.alignment, model.rings.depth).unwrap();
+                            rings.max_frame_bytes, request, response, rings.slot_bytes,
+                            rings.alignment, rings.depth).unwrap();
                         reservations.push(budget.reserve(actual).unwrap());
                     }
                     assert_eq!(budget.limit() as u64, planned.mapped_rings);
