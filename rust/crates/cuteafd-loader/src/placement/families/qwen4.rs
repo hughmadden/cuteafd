@@ -63,6 +63,13 @@ pub fn request(inputs: &QwenInputs<'_>, graph_bytes: u64) -> anyhow::Result<Plac
     let mut fixed = admission.items.iter().map(|&(category, group, bytes)|
         Demand::new(0, category, group, bytes, Basis::Formula)).collect::<Vec<_>>();
     fixed.push(Demand::new(0, Category::Runtime, "startup graphs", graph_bytes, Basis::Formula));
+    if inputs.spark_ranks > 0 {
+        // The Spark intake's BF16 partial planes, one per rank at prefill width
+        // (SparkLink::new), allocated on this GPU before serving.
+        fixed.push(Demand::new(0, Category::Transport, "Spark intake planes",
+            crate::serving_capacity::spark_intake_bytes(1, inputs.spark_ranks as u64,
+                inputs.admission.prefill_rows.max(64), inputs.admission.cfg.hidden as u64), Basis::Formula));
+    }
     if inputs.pending_code_bytes > 0 {
         fixed.push(Demand::new(0, Category::Runtime, "loaded code", inputs.pending_code_bytes, Basis::Formula));
     }

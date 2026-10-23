@@ -3357,11 +3357,22 @@ impl<'a> Qwen4Engine<'a> {
     }
 
     /// Routes and wire rows down, one request to every Spark rank, the BF16
-    /// rank partials and the shared expert summed into `delta`.
+    /// rank partials and the shared expert summed into `delta`. Serial today:
+    /// the shared prefill executor will call the two hooks with other units'
+    /// work between them.
     #[allow(clippy::too_many_arguments)]
     fn spark_moe(&self, w: &Workspace<'_>, index: usize, t: usize, rows: Scalar, decode: bool,
         transport: &mut SparkLink<'_>,
         runtime: &tokio::runtime::Runtime) -> Result<()> {
+        let wave = self.send_experts(w, index, t, rows, decode, transport)?;
+        self.land_experts(w, t, wave, transport, runtime)
+    }
+
+    /// Router outputs and wire rows go down to pinned staging, the shared
+    /// expert queues behind the copies, and one owned request is dispatched.
+    /// The host waits only on the copies' event, never the stream.
+    fn send_experts(&self, w: &Workspace<'_>, index: usize, t: usize, rows: Scalar, decode: bool,
+        transport: &mut SparkLink<'_>) -> Result<cuteafd_transport::expert::SparkExpertWave> {
         let kind = if decode { ExpertV2SourceKind::Decode } else { ExpertV2SourceKind::Prefill };
         let (h, topk) = (self.cfg.hidden, self.cfg.topk);
         let (route_bytes, wire_bytes) = (t * topk * 4, t * (if self.spark_bf16 { h * 2 } else { h + h / 32 }));
@@ -3374,7 +3385,7 @@ impl<'a> Qwen4Engine<'a> {
             ..host
         };
         let timer = std::time::Instant::now();
-        // SAFETY: the pinned regions are large enough; the sync completes them.
+        // SAFETY: the pinned regions are large enough; the event wait completes them.
         unsafe {
             self.library.copy_d2h_host_buffer_async(at(0), w.route_ids.buffer, route_bytes, self.execution_stream())?;
             self.library.copy_d2h_host_buffer_async(at(route_bytes), w.route_weights.buffer, route_bytes, self.execution_stream())?;
@@ -3408,11 +3419,15 @@ impl<'a> Qwen4Engine<'a> {
         request.header.flags |= EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16;
         let ranks = transport.world_size();
         ensure!(ranks <= MAX_RANKS, "{ranks} Spark ranks exceed the reduction planes");
+        transport.dispatch(&request)
+    }
+
+    /// Receives the wave's BF16 rank partials and sums them with the shared
+    /// expert into `delta`, ordered on the engine stream.
+    fn land_experts(&self, w: &Workspace<'_>, t: usize, wave: cuteafd_transport::expert::SparkExpertWave,
+        transport: &mut SparkLink<'_>, runtime: &tokio::runtime::Runtime) -> Result<()> {
         let timer = std::time::Instant::now();
-        runtime.block_on(async {
-            let wave = transport.dispatch(&request)?;
-            transport.receive(wave, t, self.execution_stream()).await
-        })?;
+        runtime.block_on(transport.receive(wave, t, self.execution_stream()))?;
         self.profile.borrow_mut()[1] += timer.elapsed().as_secs_f64();
         // SAFETY: the shared-expert plane and `delta` are live [t, h] BF16
         // buffers; the intake planes are ordered after the wave by `receive`.
