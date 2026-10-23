@@ -1152,6 +1152,20 @@ mod replay_cli_tests {
     }
 
     #[test]
+    fn unit_identity_is_a_golden_option_not_an_engine_key() {
+        #[derive(Parser)]
+        struct EngineOnly {
+            #[command(flatten)]
+            args: super::EngineArgs,
+        }
+        let golden = ["test", "--snapshot", "/checkpoint", "--native-lib", "/native", "--golden", "/golden"];
+        assert!(Parse::try_parse_from(golden.into_iter().chain(["--unit-check"])).unwrap().args.unit_check);
+        assert!(Parse::try_parse_from(golden.into_iter().chain(["--lane-check"])).is_err());
+        assert!(EngineOnly::try_parse_from(["test", "--snapshot", "/checkpoint", "--native-lib", "/native",
+            "--unit-check"]).is_err());
+    }
+
+    #[test]
     fn production_replay_requires_a_replay_width() {
         let base = ["test", "--snapshot", "/checkpoint", "--native-lib", "/native", "--golden", "/golden"];
         assert!(Parse::try_parse_from(base.into_iter().chain(["--replay-production"])).is_err());

@@ -1840,7 +1840,7 @@ impl<'a> GlmfEngine<'a> {
         self.warming_graphs.set(true);
         let captured = (|| -> Result<()> {
             for &(rows, spec, geometry) in &shapes {
-                self.decode_primitive(&startup_tables(rows, spec, geometry), &vec![0; rows], rows, None, None, None, None)?;
+                self.decode_primitive(&startup_tables(rows, spec, geometry), &vec![0; rows], rows, None, None, None)?;
             }
             self.synchronize()
         })();
@@ -3615,13 +3615,13 @@ impl<'a> GlmfEngine<'a> {
             pad_decode_tables(&mut tables, bucket);
             let mut padded = tokens.to_vec();
             padded.resize(bucket, 0);
-            self.decode_primitive(&tables, &padded, bucket, None, None, None, None)?.map(|mut logits| {
+            self.decode_primitive(&tables, &padded, bucket, None, None, None)?.map(|mut logits| {
                 // Keep the bucket-sized greedy status offset while exposing only real rows.
                 logits.rows = rows;
                 logits
             })
         } else {
-            self.decode_primitive(&tables, tokens, rows, on_layer, None, trace, media)?
+            self.decode_primitive(&tables, tokens, rows, on_layer, trace, media)?
         };
         for (placement, count) in sequences.iter_mut() {
             placement.len += *count;
@@ -3882,16 +3882,16 @@ impl<'a> GlmfEngine<'a> {
 
     fn decode_primitive(&self, tables: &StepTables, tokens: &[u32], logit_rows: usize,
         on_layer: Option<&mut dyn FnMut(usize, &[u8]) -> Result<()>>,
-        forced: Option<&dyn Fn(usize) -> Option<Vec<u8>>>, trace: Option<&std::path::Path>, media: Option<&cuteafd_engine::media::RequestMedia>) -> Result<Option<DeviceLogits>> {
+        trace: Option<&std::path::Path>, media: Option<&cuteafd_engine::media::RequestMedia>) -> Result<Option<DeviceLogits>> {
         crate::shared::experts::rtx::pair::submit_scoped(
             || self.require_live(), || self.shutdown_submission(),
-            |scope| self.decode_primitive_inner(scope, tables, tokens, logit_rows, on_layer, forced, trace, media))
+            |scope| self.decode_primitive_inner(scope, tables, tokens, logit_rows, on_layer, trace, media))
     }
 
     fn decode_primitive_inner(&self, scope: &crate::shared::experts::rtx::pair::SubmissionScope<'_>,
         tables: &StepTables, tokens: &[u32], logit_rows: usize,
         mut on_layer: Option<&mut dyn FnMut(usize, &[u8]) -> Result<()>>,
-        forced: Option<&dyn Fn(usize) -> Option<Vec<u8>>>, trace: Option<&std::path::Path>, media: Option<&cuteafd_engine::media::RequestMedia>) -> Result<Option<DeviceLogits>> {
+        trace: Option<&std::path::Path>, media: Option<&cuteafd_engine::media::RequestMedia>) -> Result<Option<DeviceLogits>> {
         let (h, t) = (self.cfg.hidden, tables.kv_slots.len());
         ensure!(tables.decode, "decode primitive received prefill tables");
         let decode_workspace = self.decode_workspace_of(0)?;
@@ -3902,20 +3902,19 @@ impl<'a> GlmfEngine<'a> {
         self.prepare_route_checks(&[t])?;
         let peer_workspaces = self.peer_workspaces(true, None)?;
         let w1 = peer_workspaces.as_ref().map(|p| p.get(0)).transpose()?;
-        ensure!(w1.is_none() || forced.is_none(), "teacher-forced prefill runs without a head split");
         let ranked = self.step_tables(&[(w, w1, tables)], &[placement_units(tables)])?;
         let [tables, tables1] = &ranked[0];
         let row = h * 2;
         ensure!(tokens.len() == t, "{} tokens for a {t}-row step", tokens.len());
-        let graphed = !self.tp2.as_ref().is_some_and(|t| t.checking.get()) && self.use_graphs && tables.decode && !tables.eager && on_layer.is_none() && forced.is_none()
+        let graphed = !self.tp2.as_ref().is_some_and(|t| t.checking.get()) && self.use_graphs && tables.decode && !tables.eager && on_layer.is_none()
             && media.is_none_or(|m| m.spans().is_empty());
         self.load_streams(w, tokens, graphed)?;
         self.inject_media(w, tables, media)?;
         if media.is_some_and(|m| !m.spans().is_empty()) { self.put(&w.ids, tokens)?; }
         let rows = Scalar::I32(t as i32);
         if self.layer_execution.is_some() {
-            ensure!(forced.is_none() && trace.is_none() && tables.segments.is_empty(),
-                "per-layer execution needs unpacked rows without tracing or teacher forcing");
+            ensure!(trace.is_none() && tables.segments.is_empty(),
+                "per-layer decode needs unpacked rows without tracing");
             return self.layer_step(scope, w, w1.context("per-layer peer workspace")?,
                 tables, tables1, t, logit_rows, graphed, on_layer);
         }
@@ -3926,10 +3925,8 @@ impl<'a> GlmfEngine<'a> {
         }
         let cap = decode_cap(t);
         let layers = &self.weights.layers;
-        // The mHC sites and the router scores run per sequence in a packed prefill (one span: the
-        // whole step).
         let spans = tables.spans();
-        ensure!(w1.is_none() || tables.segments.is_empty(), "a packed prefill runs on one GPU");
+        ensure!(tables.segments.is_empty(), "decode cannot contain packed prefill segments");
         if let Some(w1) = w1 {
             // The streams to the second GPU, which runs a unit ahead of the host's rank-0
             // work (all its inputs are pushes from rank 0).
@@ -4031,14 +4028,6 @@ impl<'a> GlmfEngine<'a> {
             }
             if let Some(on_layer) = on_layer.as_mut() {
                 on_layer(index, &self.download(&w.streams[cur], t * HC * row)?)?;
-            }
-            if let Some(rows_forced) = forced.and_then(|f| f(index)) {
-                ensure!(rows_forced.len() == t * HC * row, "teacher-forced streams of the wrong size");
-                self.library.copy_h2d(cuteafd_ffi::CuteafdDeviceBuffer { bytes: rows_forced.len(),
-                    ..w.streams[cur].buffer }, &rows_forced)?;
-                if let Some(next) = layers.get(index + 1) {
-                    self.pre(w, &w.streams[cur], next, rows)?;
-                }
             }
             crate::shared::console::layer_mark(index);
             self.probe_mark(index)?;
