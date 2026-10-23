@@ -150,6 +150,19 @@ fn release_headers_classify_native_text_without_installed_artifacts() {
 }
 
 #[test]
+fn planned_headers_supply_range_geometry_without_claiming_fit() {
+    let dir = snapshot(false);
+    let columns = PlanInput::open(dir.path()).unwrap().spark_ranges(&PlanOptions::default()).unwrap();
+    assert_eq!(columns.len(), 2);
+    for column in columns {
+        assert_eq!(column.package, PACKAGE);
+        assert_eq!((column.intermediate, column.unit_columns, column.policy.width_cap), (3072, 128, 12));
+        assert!(column.routed_expert_bytes > 0);
+        assert!(column.range.is_none() && column.executable_minimum.is_none());
+    }
+}
+
+#[test]
 fn context_refuses_the_missing_executor_instead_of_claiming_fit() {
     let dir = snapshot(false);
     let mut options = with_layout(6, None);
@@ -280,7 +293,7 @@ fn max_card_jointly_selects_tp2_layers_marks_and_complete_spark_budget() {
     assert!(!refused.fits);
     // Other card columns are refused by name.
     let refused = plan::plan(dir.path(), &with_layout(4, None)).unwrap();
-    assert!(refused.hints.iter().any(|h| h.what.contains("6 Spark ranks")));
+    assert!(refused.hints.iter().any(|h| h.what.contains("missing Spark recipe kimik3:exl3-k23 TP4")));
 }
 
 #[test]

@@ -1,3 +1,8 @@
+/// Physical Spark world ceiling shared by planning, protocols and rank storage.
+pub const MAX_SPARK_WORLD: usize = 8;
+// WaveReceipt uses one bit per physical rank.
+const _: () = assert!(MAX_SPARK_WORLD <= u8::BITS as usize);
+
 pub mod tp_units;
 pub mod dense_attention;
 pub mod ffn_activation;

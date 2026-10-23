@@ -1624,7 +1624,7 @@ fn spark_rank_options_follow_transport_and_packages() {
     let dsv41 = strict_v41_snapshot(false);
     for ranks in 0..=9 {
         let options = PlanOptions { layout: None, ..sparks(ranks) };
-        if ranks > 6 {
+        if ranks > cuteafd_core::MAX_SPARK_WORLD {
             let error = plan(flash.path(), &options).unwrap_err();
             assert!(matches!(error, PlanError::InvalidOption { option: "spark ranks", .. }), "{ranks}: {error}");
             continue;
@@ -1697,7 +1697,7 @@ fn exl3_tp6_geometry_remains_supported_for_glm_and_flash() {
 }
 
 #[test]
-fn qwen_nvfp4_tp6_remains_valid_but_deleted_worlds_refuse() {
+fn qwen_nvfp4_preserves_shipped_six_and_refuses_seven_and_eight() {
     let mut config = qwen4_config(1);
     config["quantization_config"] = json!({"quant_method": "modelopt", "quant_algo": "NVFP4", "group_size": 16});
     let mut tensors = Vec::new();
@@ -1715,10 +1715,32 @@ fn qwen_nvfp4_tp6_remains_valid_but_deleted_worlds_refuse() {
     tensors.extend(qwen4_coordinator(&config, false));
     let dir = snapshot(config, &tensors);
     let legacy = plan(dir.path(), &sparks(6)).unwrap();
-    assert!(legacy.placement_supported && legacy.fits && legacy.executable(), "{}", render(&legacy));
+    assert!(legacy.placement_supported, "{}", render(&legacy));
+    assert!(legacy.spark_range_refusal.is_none());
+    let recipe = experts::spark_recipe("qwen4:nvfp4", 640, 6).unwrap();
+    assert_eq!(recipe.slicing, crate::formats::fp8_experts::Slicing::Padded);
+    assert_eq!(recipe.widths, [128; 6]);
+    let columns = PlanInput::open(dir.path()).unwrap().spark_ranges(&PlanOptions::default()).unwrap();
+    assert_eq!(columns.len(), 2);
+    if let Some(single) = &columns[0].range {
+        assert!(columns[1].range.as_ref().unwrap().minimum <= single.minimum);
+    }
+    for column in &columns {
+        assert_eq!(column.policy.maximum, 6);
+        assert_eq!(column.policy.width_cap, 2);
+        let six = column.counts.iter().find(|count| count.sparks == 6).unwrap();
+        assert!(six.padded && six.shipped_exception);
+        assert_eq!((six.unit_columns, six.source_block_columns), (128, 16));
+        assert_eq!(six.rule, cuteafd_core::tp_units::UnitRule::Contiguous);
+        assert_eq!(six.resolved_width_columns, Some(vec![128; 6]));
+    }
+    let text = spark_range::render(&columns);
+    assert!(text.contains("width_cap=2") && text.contains("shipped exception"), "{text}");
     for ranks in [7, 8] {
-        let error = plan(dir.path(), &sparks(ranks)).unwrap_err();
-        assert!(matches!(error, PlanError::InvalidOption { option: "spark ranks", .. }), "{ranks}: {error}");
+        let report = plan(dir.path(), &sparks(ranks)).unwrap();
+        assert!(!report.executable());
+        assert!(matches!(report.spark_range_refusal,
+            Some(spark_range::RangeRefusal::Unsupported { maximum: 6, .. })), "{}", render(&report));
     }
 }
 

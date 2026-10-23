@@ -217,8 +217,8 @@ impl Residency {
         set: ExpertSet,
     ) -> anyhow::Result<Self> {
         ensure!(
-            (1..=6).contains(&world) && rank < world,
-            "expected TP1..6 and rank below world"
+            (1..=8).contains(&world) && rank < world,
+            "expected TP1..8 and rank below world"
         );
         let config = read_json(&snapshot.join("config.json"))?;
         ensure!(
@@ -635,7 +635,7 @@ mod tests {
         for padded in [false, true] {
             let root = tempfile::tempdir().unwrap();
             fixture(root.path(), padded);
-            for world in 1..=6 {
+            for world in 1..=8 {
                 for set in [ExpertSet::Routed, ExpertSet::Shared] {
                     let mut owners = BTreeSet::new();
                     for rank in 0..world {
@@ -756,7 +756,7 @@ mod tests {
                 .contains("outside its projection")
         );
         assert!(Residency::plan(root.path(), "../mixed", 3, 1, 0, ExpertSet::Routed).is_err());
-        assert!(Residency::plan(root.path(), "mixed", 3, 7, 0, ExpertSet::Routed).is_err());
+        assert!(Residency::plan(root.path(), "mixed", 3, 9, 0, ExpertSet::Routed).is_err());
     }
 
     #[test]

@@ -479,7 +479,7 @@ EOF
 vision="$(get VISION auto)"
 audio="$(get AUDIO auto)"
 vision_replicas="$(get VISION_REPLICAS 1)"
-[[ "$vision_replicas" =~ ^[1-6]$ ]] || release_die "VISION_REPLICAS must be 1..6"
+[[ "$vision_replicas" =~ ^[1-8]$ ]] || release_die "VISION_REPLICAS must be 1..8"
 [[ "$vision" =~ ^(auto|off|rtx|spark)(:[0-9]+)?$ && ( "$vision" != auto:* && "$vision" != off:* ) ]] || release_die "VISION must be auto, off, rtx[:gpu] or spark[:rank]"
 [[ "$audio" =~ ^(auto|off|rtx|spark)(:[0-9]+)?$ && ( "$audio" != auto:* && "$audio" != off:* ) ]] || release_die "AUDIO must be auto, off, rtx[:gpu] or spark[:rank]"
 coordinator_budget="$(get COORDINATOR_GPU_BUDGET_GIB)"
@@ -1653,7 +1653,7 @@ if [[ "$family" == qwen3_5 ]]; then
 fi
 if [[ "$family" == kimi_k3 ]]; then
   [[ "$backend" != local && "$ranks" == 6 ]] ||
-    release_die "Kimi K3 serves its routed experts on exactly six Spark ranks (TP6), not $ranks; set SPARK_COUNT=6"
+    release_die "Kimi K3 TP$ranks has no installed kimik3:exl3-k23 Spark recipe or rank-sized intake/admission; export balanced H128 widths and parameterize the Kimi executor (currently TP6 width 512)"
 fi
 if [[ "$family" == step5 ]]; then
   step5_kv_cache="$(get KV_CACHE fp8)"
@@ -1730,7 +1730,7 @@ if [[ -n "$exlr8_manifest$exlr8_dense" ]]; then
   [[ "$exlr8_manifest" == up1 || "$exlr8_manifest" == bit325 ]] || release_die "EXLR8_MANIFEST must be up1 or bit325"
   [[ -n "$exlr8_dense" ]] || release_die "EXLR8_DENSE_FROM must name the compatible official GLM-5.3 FP8 snapshot"
   exlr8_gpu_count="$(get RTX_GPUS 1)"
-  [[ ( "$exlr8_gpu_count" == 1 || "$exlr8_gpu_count" == 2 ) && "$ranks" -ge 1 && "$ranks" -le 6 ]] || release_die "EXLR8 requires 1..2 RTX GPUs and 1..6 canonical Spark ranks"
+  [[ ( "$exlr8_gpu_count" == 1 || "$exlr8_gpu_count" == 2 ) && "$ranks" -ge 1 && "$ranks" -le 8 ]] || release_die "EXLR8 requires 1..2 RTX GPUs and 1..8 canonical Spark ranks"
   [[ "$(get SPECULATOR dflash2)" == off || "$(get SPECULATOR dflash2)" == dflash2 ]] || release_die "EXLR8 supports SPECULATOR=off or dflash2"
   [[ "$(get RTX_EXPERT_LAYERS 0)" == 0 ]] || release_die "EXLR8 cannot onboard routed experts"
   exlr8_attention=heads

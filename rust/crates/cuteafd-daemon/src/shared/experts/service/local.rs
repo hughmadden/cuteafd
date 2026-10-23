@@ -159,7 +159,7 @@ impl Drop for Admission {
 
 pub(super) fn run(mut config: NativeExpertServiceConfig, listen: &str) -> Result<()> {
     ensure!(
-        config.rank < config.world && (1..=6).contains(&config.world),
+        config.rank < config.world && (1..=8).contains(&config.world),
         "native rank must be below the launched Spark world"
     );
     // The checkpoint fixes the process expert geometry before the native
