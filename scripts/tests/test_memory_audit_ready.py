@@ -193,8 +193,9 @@ def test_pool_following_v4_page_tables_use_the_planners_kv_records_scope(tmp_pat
     engine = (Path(__file__).parents[2] / "rust/crates/cuteafd-daemon/src/families/deepseek_v4/engine.rs").read_text()
     allocation = engine.split("c4_page_table: {", 1)[1].split("},", 1)[0]
     assert 'scope("kv/records")' in allocation
-    assert "ints(rows.max(1) * self.shape.units)?" in allocation
-    table_bytes = (2_097_152 // 256) * (2 * 4096 + 64) * 4
+    assert "ints(page_lists * self.shape.units)?" in allocation
+    assert "self.step_buffers(t, if shared_page_list { 1 } else { t })?" in engine
+    table_bytes = (2_097_152 // 256) * (2 + 64) * 4
     log = tmp_path / "coordinator.log"
     log.write_text(report(1000 * MIB + table_bytes, 900 * MIB + table_bytes,
                           {"weights": 900 * MIB, "kv/records": table_bytes}))

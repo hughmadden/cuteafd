@@ -1675,6 +1675,11 @@ fn v4_workspace_plan_matches_runtime_below_compiled_context() {
             let steps = device.items.iter().find(|i| i.group == "steps").unwrap_or_else(|| panic!("{gib} {context}: {notes:?}"));
             let intake = (2 * 4096 + 64) * 2 * cfg.dim as u64 * 2;
             assert_eq!((steps.bytes, steps.basis), (runtime[0].fixed_device_bytes + intake, Basis::Formula));
+            let records = device.items.iter().find(|i| i.group == "records").unwrap();
+            let cache = crate::serving_capacity::deepseek_v4_cache_geometry(&cfg, 1, 4096, 0).unwrap();
+            assert_eq!(runtime[0].pool_unit_device_bytes, (2 + 64) * 4);
+            assert_eq!(records.bytes, (cache.ranks[0].persistent_unit_bytes
+                + cache.ranks[0].pool_metadata_unit_bytes + runtime[0].pool_unit_device_bytes) * (32768 / 256));
             let graph = crate::placement::families::deepseek_v4::GRAPH_BYTES[0];
             // The PRO envelope covers the measured loaded code as well (`V4Inputs::code_bytes`).
             let code = crate::placement::loaded_code("dsv4f", "*", false, 0).unwrap().bytes;

@@ -374,7 +374,11 @@ impl<'a> Engine<'a> {
         let mut schedule = tp2.schedule.borrow_mut();
         let Some(schedule) = schedule.as_mut() else { return };
         let label = format!("gpu{rank} {exchange} {} L{layer} lane{lane}", if push { "push" } else { "wait" });
-        if push { schedule.push(rank, exchange, slot, label); }
+        if exchange == "unit-commit" {
+            // Completion has no payload; distinct slots may publish before either joins.
+            if push { schedule.push_to(rank, exchange, slot, lane, label); }
+            else { schedule.wait_for(rank, exchange, slot, lane, label); }
+        } else if push { schedule.push(rank, exchange, slot, label); }
         else { schedule.wait(rank, exchange, slot, label); }
     }
 
@@ -602,9 +606,10 @@ mod tests {
                         schedule.wait(1, "ffn", slot(layer, true, lane), "peer FFN sum");
                     }
                 }
-                Step::Commit { .. } => {
-                    schedule.push(1, "unit-commit", DIRECT, "peer final reader complete");
-                    schedule.wait(0, "unit-commit", DIRECT, "join peer before slot reuse");
+                Step::Commit { unit } => {
+                    let lane = units[unit].slot;
+                    schedule.push_to(1, "unit-commit", DIRECT, lane, "peer final reader complete");
+                    schedule.wait_for(0, "unit-commit", DIRECT, lane, "join peer before slot reuse");
                 }
                 Step::Send { .. } | Step::End { .. } => {}
             }

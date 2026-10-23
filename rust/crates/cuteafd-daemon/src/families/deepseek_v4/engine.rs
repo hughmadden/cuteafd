@@ -607,7 +607,7 @@ impl<'a> Engine<'a> {
     /// All-row diagnostics reuse the admitted bounded head buffer, downloading
     /// its rows in LOGIT_ROWS batches; no vocabulary-sized GPU buffer is added.
     pub fn prepare_scoring_prefill(&mut self) -> Result<()> {
-        self.prepare_prefill_workspaces()?;
+        self.prepare_workspaces()?;
         self.full_prefill_logits = true;
         Ok(())
     }
@@ -632,11 +632,18 @@ impl<'a> Engine<'a> {
         unsafe { self.library.cuda_stream_synchronize(if lead { self.stream } else { self.peer()?.stream }) }
     }
 
-    pub fn prepare_prefill_workspaces(&self) -> Result<()> {
+    /// Allocate both shapes on every rank before readiness, even with no local experts.
+    pub fn prepare_workspaces(&self) -> Result<()> {
+        if self.decode_workspace.borrow().is_none() {
+            *self.decode_workspace.borrow_mut() = Some(self.workspace(self.decode_rows, 1, false)?);
+        }
         if self.prefill_workspace.borrow().is_none() {
             *self.prefill_workspace.borrow_mut() = Some(self.workspace(self.prefill_rows, self.prefill_waves, true)?);
         }
         if let Some(peer) = &self.peer {
+            if peer.decode_workspace.borrow().is_none() {
+                *peer.decode_workspace.borrow_mut() = Some(self.workspace_on(1, self.decode_rows, 1, false)?);
+            }
             if peer.prefill_workspace.borrow().is_none() {
                 *peer.prefill_workspace.borrow_mut() = Some(self.workspace_on(1, self.prefill_rows, self.prefill_waves, true)?);
             }
@@ -1920,15 +1927,8 @@ impl<'a> Engine<'a> {
     /// Every local-expert row shape is captured at startup, without executing
     /// uninitialized routes or unmatched peer waits. Pointer ownership is fixed.
     pub fn warm_local_graphs(&self) -> Result<()> {
+        self.prepare_workspaces()?;
         if self.local_layers() == 0 { return Ok(()); }
-        if self.decode_workspace.borrow().is_none() {
-            *self.decode_workspace.borrow_mut() = Some(self.workspace(self.decode_rows, 1, false)?);
-        }
-        if let Some(peer) = &self.peer {
-            if peer.decode_workspace.borrow().is_none() {
-                *peer.decode_workspace.borrow_mut() = Some(self.workspace_on(1, self.decode_rows, 1, false)?);
-            }
-        }
         self.warm_tp2_routers()?;
         self.capture_only.set(true);
         let result = (|| {

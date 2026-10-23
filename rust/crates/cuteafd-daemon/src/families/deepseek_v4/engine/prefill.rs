@@ -38,7 +38,8 @@ impl<'a> Engine<'a> {
                 let mut links = transports.borrow_mut();
                 let mut hooks = UnitHooks { engine: self, placement, tokens, tables: &tables, w, w1,
                     transport: links.get_mut(1), runtime, logit_rows, download, on_layer,
-                    logits: Vec::new(), landed: 0 };
+                    logits: Vec::new(), landed: 0,
+                    context_plans: vec![Default::default(); self.prefill_waves], staging_owner: [None; 2] };
                 prefill_pipeline::run_prefill_units(&mut hooks, &units, waves)?;
                 self.finish_route_step()?;
                 // No unit cursor survives into decode/verify: all geometry is selected by hook.
@@ -69,6 +70,16 @@ struct UnitHooks<'h, 'a, 't, 'l, 'c> {
     on_layer: Option<&'c mut dyn FnMut(usize, &[u8]) -> Result<()>>,
     logits: Vec<f32>,
     landed: usize,
+    context_plans: Vec<[context::ContextUnit; 2]>,
+    staging_owner: [Option<(usize, usize)>; 2],
+}
+
+/// Only an immediate same-layer predecessor leaves this parity's full history live.
+fn reuse_context(owner: &mut [Option<(usize, usize)>; 2], ordinal: usize, layer: usize, unit: usize) -> bool {
+    let view = &mut owner[ordinal % 2];
+    let reuse = unit.checked_sub(1).is_some_and(|previous| *view == Some((layer, previous)));
+    *view = Some((layer, unit));
+    reuse
 }
 
 impl UnitHooks<'_, '_, '_, '_, '_> {
@@ -128,7 +139,7 @@ impl PrefillHooks for UnitHooks<'_, '_, '_, '_, '_> {
             if e.context.is_some() {
                 let contexts = [e.put_context_tables(0, &lane.tables, tables, unit.slot, true, &self.placement.units)?,
                     e.put_context_tables(1, &peer.tables, tables, unit.slot, true, &self.placement.units)?];
-                e.context_units.borrow_mut()[unit.slot] = contexts;
+                self.context_plans[unit.slot] = contexts;
             }
             // The entry copy lands in this slot's residual, never attention scratch.
             let entry = slot(0, false, unit.slot);
@@ -143,6 +154,13 @@ impl PrefillHooks for UnitHooks<'_, '_, '_, '_, '_> {
         let e = self.engine;
         let tables = &self.tables[unit.index];
         let rows = Scalar::I32(unit.rows.len() as i32);
+        if let Some(ordinal) = e.context.as_ref().and_then(|split| split.ordinal(layer)) {
+            let mut plans = self.context_plans[unit.slot].clone();
+            if reuse_context(&mut self.staging_owner, ordinal, layer, unit.index) {
+                for plan in &mut plans { plan.shards = [0; 2]; }
+            }
+            e.context_units.borrow_mut()[unit.slot] = plans;
+        }
         if let Some(w1) = self.w1 {
             e.attention_split(layer, &e.weights.layers[layer], tables, &self.w.slots[unit.slot],
                 unit.slot, self.w, rows, e.prefill_rows)?;
@@ -227,6 +245,70 @@ impl PrefillHooks for UnitHooks<'_, '_, '_, '_, '_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn c4_staging_reuse_requires_the_same_layers_immediate_predecessor() {
+        let mut owner = [None; 2];
+        assert!(!reuse_context(&mut owner, 0, 2, 0));
+        assert!(reuse_context(&mut owner, 0, 2, 1));
+        assert!(!reuse_context(&mut owner, 2, 6, 1));
+        assert!(!reuse_context(&mut owner, 0, 2, 2));
+        assert!(reuse_context(&mut owner, 0, 2, 3));
+        assert!(!reuse_context(&mut owner, 1, 4, 3));
+        assert!(reuse_context(&mut owner, 0, 2, 4));
+        assert!(!reuse_context(&mut owner, 0, 2, 6));
+        assert!(!reuse_context(&mut owner, 0, 2, 0));
+    }
+
+    #[test]
+    fn c4_staging_matches_cold_history_across_ramps_and_slot_reuse() -> Result<()> {
+        use prefill_pipeline::Step;
+        for layers in [43, 61] {
+            for local in [0, 2, 8, layers] {
+                let routes: Vec<_> = (0..layers).map(|layer| if layer < local {
+                    FfnRoute::Local
+                } else { FfnRoute::Spark }).collect();
+                for waves in [1, 2, 3] {
+                    let units = prefill_pipeline::sequence_units(32769, 4096, waves, layers)?;
+                    for start in [0, 257, 4097] {
+                        let groups = (start + 32769) / 4;
+                        let value = |layer, group| (layer + 1) * (groups + 1) + group;
+                        let mut pools: Vec<Vec<_>> = (0..layers).map(|layer|
+                            (0..start / 4).map(|group| value(layer, group)).collect()).collect();
+                        let mut staging = [Vec::new(), Vec::new()];
+                        let mut owner = [None; 2];
+                        let mut reused = 0;
+                        let mut gathered = 0;
+                        for step in prefill_pipeline::prefill_schedule(&routes, &units, waves)? {
+                            let Step::Attention { layer, unit } = step else { continue };
+                            // C4 ordinals, not physical layer parity: C128 layers never touch staging.
+                            if layer < 2 || layer % 2 != 0 { continue; }
+                            let ordinal = (layer - 2) / 2;
+                            let view = &mut staging[ordinal % 2];
+                            let first = (start + units[unit].rows.start) / 4;
+                            assert_eq!(pools[layer].len(), first);
+                            if reuse_context(&mut owner, ordinal, layer, unit) {
+                                reused += 1;
+                            } else {
+                                *view = pools[layer].clone();
+                                gathered += 1;
+                            }
+                            assert_eq!(&view[..first], pools[layer].as_slice(),
+                                "{layers} layers/{local} local/{waves} waves/start {start}/unit {unit}/layer {layer}");
+                            let end = (start + units[unit].rows.end) / 4;
+                            view.resize(end, 0);
+                            for group in first..end { view[group] = value(layer, group); }
+                            pools[layer].extend_from_slice(&view[first..end]);
+                            assert_eq!(*view, pools[layer]);
+                        }
+                        assert!(gathered > 0);
+                        if waves > 1 && local == 0 { assert!(reused > 0); }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
 
     #[test]
     fn v4_two_waves_bound_spark_idle_across_slot_reuse() -> Result<()> {
