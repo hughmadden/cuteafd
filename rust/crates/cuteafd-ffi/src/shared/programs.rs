@@ -324,6 +324,14 @@ impl<'a> Programs<'a> {
     pub fn library(&self) -> &'a NativeLibrary {
         self.library
     }
+
+    #[cfg(test)]
+    pub(crate) fn fixture(library: &'a NativeLibrary, specs: Vec<ProgramSpec>, launch: LaunchFn) -> Self {
+        unsafe extern "C" fn load(_: u32) -> i32 { 0 }
+        Self { library, load, launch, programs: specs.into_iter().enumerate()
+            .map(|(index,spec)|(spec.name.clone(),(index as u32,spec))).collect(),
+            card_specs:HashMap::new(), capacities:ProgramCapacities::default(),families:serde_json::Value::Null }
+    }
 }
 
 pub struct Program<'a> {

@@ -1,5 +1,6 @@
 mod families;
 mod shared;
+pub use families::minimax;
 pub use shared::{audio, dense_trellis, exlr8, fp8_moe, glm_stage, mla_draft, native_dense, peer_exchange, programs, vision};
 pub use families::kimi_k3::{KimiMla, KimiMlaBatch, KimiMlaError, KimiMlaMode, KimiMlaWeights,
     KimiFfn, KimiFfnBatch, KimiFfnMode, KimiLatent, KimiPrefixMode, KimiResidual, KimiResidualBatch, KimiResidualSite,
