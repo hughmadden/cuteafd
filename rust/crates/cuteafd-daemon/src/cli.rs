@@ -358,9 +358,9 @@ pub(crate) struct PlanArgs {
     /// Include the diagnostic all-row prefill head reservation in --layout.
     #[arg(long)]
     pub(crate) full_prefill_logits: bool,
-    /// Prefill lanes for --layout (GLM 5.3 Flash; 0: the family default).
+    /// Prefill units in flight for --layout (0: the family default).
     #[arg(long, default_value_t = 0)]
-    pub(crate) prefill_lanes: u64,
+    pub(crate) prefill_waves: u64,
     /// Decode and verify step rows for --layout (GLM 5.3 Flash's --decode-rows: 64, or 128 with the
     /// wide programs on one GPU): its decode workspace, token selector and replay records.
     #[arg(long, default_value_t = 64, value_parser = plan_decode_rows)]
@@ -911,6 +911,16 @@ mod tests {
         for (flag, expected) in [("bf16", MimoKvCache::Bf16), ("int8", MimoKvCache::Int8), ("fp8", MimoKvCache::Fp8)] {
             assert_eq!(parse(&["--mimo-swa-kv-cache", flag]), expected);
         }
+    }
+
+    #[test]
+    fn plan_prefill_wave_option_has_no_lane_alias() {
+        let Commands::Plan(args) = Cli::try_parse_from([
+            "cuteafd", "plan", "model", "--prefill-waves", "2"]).unwrap().command else {
+            panic!("expected plan command");
+        };
+        assert_eq!(args.prefill_waves, 2);
+        assert!(Cli::try_parse_from(["cuteafd", "plan", "model", "--prefill-lanes", "2"]).is_err());
     }
 
     #[test]

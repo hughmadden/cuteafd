@@ -378,6 +378,28 @@ EOF
       ;;
   esac
 }
+# Each shared-executor port opts in here after its serve CLI accepts the shape.
+family_prefill_mode() {
+  case "$1" in
+    step5|kimi_k3) echo units ;;
+    *) echo legacy ;;
+  esac
+}
+release_prefill_shape() {
+  local deployment="$1" family="$2" mode
+  mode="$(family_prefill_mode "$family")"
+  PREFILL_ROWS="$(jq -er '.prefill_unit_rows | select(type == "number" and . > 0)' <<<"$deployment")" ||
+    release_die "the $family deployment plan names no prefill unit rows"
+  PREFILL_WAVES="$(jq -er '.prefill_waves | select(type == "number" and . > 0)' <<<"$deployment")" ||
+    release_die "the $family deployment plan names no prefill waves"
+  if [[ "$mode" == units-span ]]; then
+    PREFILL_SPAN_ROWS="$(jq -er '.prefill_span_rows | select(type == "number" and . > 0)' <<<"$deployment")" ||
+      release_die "the $family deployment plan names no prefill span rows"
+    echo "Resolved prefill: PREFILL_ROWS=$PREFILL_ROWS PREFILL_WAVES=$PREFILL_WAVES PREFILL_SPAN_ROWS=$PREFILL_SPAN_ROWS"
+  elif [[ "$mode" == units ]]; then
+    echo "Resolved prefill: PREFILL_ROWS=$PREFILL_ROWS PREFILL_WAVES=$PREFILL_WAVES"
+  fi
+}
 # WIP bypasses artifact readiness, never the planner's deployment guards.
 release_validate_deployment() {
   local plan="$1" family="$2"
@@ -1064,7 +1086,8 @@ if ((RELEASE_SPARK_COUNT_EXPLICIT)); then
   [[ "$selected_count" == "$SPARK_COUNT" ]] || release_die "planner changed exact Spark count $SPARK_COUNT to $selected_count"
 fi
 SPARK_COUNT="$selected_count"
-PREFILL_BATCH_TOKENS="$(jq -er '.prefill_rows' <<<"$count_plan")"
+release_prefill_shape "$count_plan" deepseek_v41
+PREFILL_BATCH_TOKENS="$PREFILL_ROWS"
 spark_tp="$(jq -er '.topology.tp' <<<"$count_plan")"
 spark_ep="$(jq -er '.topology.ep' <<<"$count_plan")"
 spark_wire="$(jq -er '.topology.wire' <<<"$count_plan")"
@@ -2060,10 +2083,6 @@ if [[ $family == kimi_k3 ]]; then
   [[ "$local_layers" == auto || "$local_layers" =~ ^[0-9]+$ ]] ||
     release_die "Kimi K3 RTX_EXPERT_LAYERS is auto or a fixed routed-layer count, not $local_layers"
   family_args+=(--rtx-expert-layers "$local_layers")
-  # PREFILL_ROWS/PREFILL_WAVES: the shared prefill units (rows each, units in
-  # flight on the one Spark transport); unset takes the family default.
-  [[ -z "$(get PREFILL_ROWS)" ]] || family_args+=(--prefill-rows "$(get PREFILL_ROWS)")
-  [[ -z "$(get PREFILL_WAVES)" ]] || family_args+=(--prefill-waves "$(get PREFILL_WAVES)")
   # Header-native EXL3 K6 core tensors are served natively (Kimi slots always
   # package the K6 programs).
 fi
@@ -2662,6 +2681,8 @@ audio_encoder_hash=""
   fi
   if [[ "$family" == kimi_k3 ]]; then
     plan_draft_args+=(--kv-cache "$kv_cache")
+    [[ -z "$(get PREFILL_ROWS)" ]] || plan_draft_args+=(--prefill-rows "$(get PREFILL_ROWS)")
+    [[ -z "$(get PREFILL_WAVES)" ]] || plan_draft_args+=(--prefill-waves "$(get PREFILL_WAVES)")
   fi
   if [[ "$family" == glm5 || "$family" == glm5_flash || "$family" == mimo_v2 ]]; then
     plan_draft_args+=(--draft-kv-cache "$draft_kv_cache")
@@ -2681,7 +2702,7 @@ audio_encoder_hash=""
   # The plan charges the drafter this launch actually serves (SPECULATOR=off charges none).
   count_args+=(--speculator "$speculator")
   if [[ "$family" == step5 ]]; then
-    [[ -z "$(get PREFILL_WAVES)" ]] || plan_draft_args+=(--prefill-lanes "$(get PREFILL_WAVES)")
+    [[ -z "$(get PREFILL_WAVES)" ]] || plan_draft_args+=(--prefill-waves "$(get PREFILL_WAVES)")
     plan_mtp_depth=0
     [[ "$speculator" != mtp ]] || plan_mtp_depth="$(get SPECULATOR_DEPTH "$mtp_depth")"
     plan_draft_args+=(--native-mtp-layers "$plan_mtp_depth" --kv-cache "$step5_kv_cache")
@@ -2725,14 +2746,12 @@ audio_encoder_hash=""
   # admission policy and endpoints come from the typed deployment above.
   deployment_json="$plan_json"
   plan_json="$(jq -c '.report' <<<"$deployment_json")"
-  # Step-5 serves the planner's prefill units: rows per unit (2048 by default,
-  # stepped down only to keep pool capacity; PREFILL_BATCH_TOKENS overrides)
-  # and units in flight (PREFILL_WAVES overrides; the plan's prefill_lanes).
-  if [[ "$family" == step5 ]]; then
-    family_args+=(--prefill-rows "$(jq -er '.prefill_rows | select(type == "number" and . > 0)' <<<"$deployment_json")") ||
-      release_die "the Step-5 deployment plan names no prefill rows"
-    family_args+=(--prefill-waves "$(jq -er '.report.prefill_lanes // 1 | select(type == "number" and . > 0)' <<<"$deployment_json")") ||
-      release_die "the Step-5 deployment plan names no prefill waves"
+  release_prefill_shape "$deployment_json" "$family"
+  case "$(family_prefill_mode "$family")" in
+    units|units-span) family_args+=(--prefill-rows "$PREFILL_ROWS" --prefill-waves "$PREFILL_WAVES") ;;
+  esac
+  if [[ "$(family_prefill_mode "$family")" == units-span ]]; then
+    family_args+=(--prefill-span-rows "$PREFILL_SPAN_ROWS")
   fi
   [[ -n "$budget" ]] || budget="$(jq -er '.spark_budget_bytes | select(type == "number" and . > 0)' <<<"$plan_json")" ||
     release_die "the deployment plan names no Spark budget"

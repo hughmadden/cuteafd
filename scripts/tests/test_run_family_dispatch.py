@@ -744,7 +744,7 @@ def _family_launch_result(tmp_path: Path, family_config: dict, model: str, keys:
             stub = stub.replace('case "$*" in', intercept + 'case "$*" in', 1)
             if native_v41:
                 stub += ('case "$*" in container\\ inspect*|inspect\\ *) ' + ('if [[ "$*" == *-wip* ]]; then exit 0; else exit 1; fi' if wip else 'exit 1') + ' ;; image\\ inspect*) echo test-pin ;; esac\n'
-                         'case "$*" in *"cuteafd plan"*) printf \'{"spark_ranks":%s,"prefill_rows":4096}\\n\' '
+                         'case "$*" in *"cuteafd plan"*) printf \'{"spark_ranks":%s,"prefill_unit_rows":4096,"prefill_waves":1,"prefill_span_rows":4096}\\n\' '
                          '"$STUB_SPARK_COUNT" ;; esac\n')
             if program_manifest is None:
                 stub += 'case "$*" in *"PROGRAMS.json"*) exit 1 ;; esac\n'
@@ -798,10 +798,14 @@ report = json.loads(os.environ["STUB_ENCODER_PLAN"])
 report.update(spark_ranks=ranks)
 gpus = int(value("--rtx", "1"))
 placement_ready = report.get("placement_supported", True) and report.get("fits", True)
+shared = family in {"step5", "kimi_k3"}
+unit = int(value("--prefill-rows", "0")) or (2048 if shared else 4096)
+waves = int(value("--prefill-waves", "0")) or (2 if shared else 1)
+report.update(prefill_unit_rows=unit, prefill_waves=waves, prefill_span_rows=unit * waves, prefill_transports=1)
 deployment = dict(version=1, family=family, executable=family != "qwen3_5" and placement_ready, wip_launchable=placement_ready, rtx_gpus=gpus, spark_ranks=ranks,
     topology=dict(tp=tp, ep=ep,
                   wire="native_ownership" if explicit else "canonical"), peers=peers,
-    speculator=value("--speculator", "off"), prefill_rows=int(value("--prefill-rows", "4096")) or 4096,
+    speculator=value("--speculator", "off"), prefill_unit_rows=unit, prefill_waves=waves, prefill_span_rows=unit * waves,
     admission=dict(kv_pool_size=value("--kv-pool-size"), memory_reservation=value("--memory-reservation")),
     spark_admission="coordinator_authoritative",
     launch=dict(family=family, first_expert_layer=int(first), last_expert_layer=None if last == "-1" else int(last)),
@@ -850,6 +854,67 @@ print(json.dumps(deployment))
             break
         time.sleep(0.05)
     return subprocess.CompletedProcess(completed.args, completed.returncode, read(stdout_path), text)
+
+
+@pytest.mark.parametrize("family_config,model,row_key,rtx,ranks", [
+    ({"model_type": "step5_vl", "text_config": {"model_type": "step5", "num_hidden_layers": 92,
+      "moe_layer_list": list(range(3, 91))}}, "test/Step-5-NVFP4", "PREFILL_BATCH_TOKENS", 1, 4),
+    ({"model_type": "step5_vl", "text_config": {"model_type": "step5", "num_hidden_layers": 92,
+      "moe_layer_list": list(range(3, 91))}}, "test/Step-5", "PREFILL_BATCH_TOKENS", 2, 6),
+    ({"model_type": "kimi_k3", "text_config": {"model_type": "kimi_linear", "num_hidden_layers": 93,
+      "first_k_dense_replace": 1, "moe_layer_freq": 1}}, "test/Kimi-K3", "PREFILL_ROWS", 2, 6),
+])
+@pytest.mark.parametrize("explicit", [False, True])
+def test_shared_prefill_launcher_forwards_resolved_units_without_span(
+    tmp_path: Path, family_config: dict, model: str, row_key: str, rtx: int, ranks: int, explicit: bool,
+) -> None:
+    keys = (f"SPARK_COUNT={ranks}\nSPECULATOR=off\nVISION=off\nAUDIO=off\n"
+            f"RTX_GPUS={rtx}\nCOORDINATOR_GPUS=" + ("0,1" if rtx == 2 else "0") + "\n")
+    keys += "".join(f"SPARK_{rank}_HOST=h{rank}\nSPARK_{rank}_LANE_A=10.0.0.{rank + 1}\n"
+                    for rank in range(1, ranks))
+    if explicit:
+        keys += f"{row_key}=1024\nPREFILL_WAVES=2\n"
+    unit, waves = (1024, 2) if explicit else (2048, 2)
+    result = _family_launch_result(tmp_path, family_config, model, keys,
+        extra_args=("--wip", "prefill-shape"),
+        encoder_plan={"placement_supported": True, "fits": True, "spark_budget_bytes": 108 << 30},
+        deployment_overrides={"prefill_unit_rows": unit, "prefill_waves": waves,
+                              "prefill_span_rows": 32768})
+    assert result.returncode == 0, result.stderr
+    plan = next(shlex.split(line) for line in result.stderr.splitlines()
+                if "cuteafd plan" in line and "--deployment" in line)
+    if explicit:
+        assert plan[plan.index("--prefill-rows") + 1] == str(unit)
+        assert plan[plan.index("--prefill-waves") + 1] == str(waves)
+    assert "--prefill-lanes" not in plan
+    command_name = "serve-kimi" if family_config["model_type"] == "kimi_k3" else "serve-step5"
+    serve = next(shlex.split(line) for line in result.stderr.splitlines()
+                 if "docker run -d" in line and command_name in line)
+    assert serve.count("--prefill-rows") == serve.count("--prefill-waves") == 1
+    assert serve[serve.index("--prefill-rows") + 1] == str(unit)
+    assert serve[serve.index("--prefill-waves") + 1] == str(waves)
+    assert "--prefill-span-rows" not in serve
+    assert "PREFILL_SPAN_ROWS" not in result.stdout + result.stderr
+    assert f"Resolved prefill: PREFILL_ROWS={unit} PREFILL_WAVES={waves}" in result.stdout
+
+
+@pytest.mark.parametrize("family_config", [
+    {"model_type": "qwen4_exp", "text_config": {"num_hidden_layers": 2,
+     "mtp_num_hidden_layers": 1, "layer_types": ["linear_attention", "full_attention"]}},
+    {"model_type": "deepseek_v4", "num_hidden_layers": 61},
+    {"model_type": "glm_moe_dsa", "num_hidden_layers": 4, "first_k_dense_replace": 3},
+    {"model_type": "mimo_v2_flash", "num_hidden_layers": 2, "moe_layer_freq": [0, 1]},
+])
+def test_legacy_prefill_launcher_does_not_forward_typed_shape(tmp_path: Path, family_config: dict) -> None:
+    result = _family_launch_result(tmp_path, family_config, "test/model",
+        "SPECULATOR=off\nVISION=off\nAUDIO=off\n",
+        deployment_overrides={"prefill_unit_rows": 1024, "prefill_waves": 3, "prefill_span_rows": 32768})
+    assert result.returncode == 0, result.stderr
+    serve = next(shlex.split(line) for line in result.stderr.splitlines()
+                 if "docker run -d" in line and "cuteafd serve-" in line)
+    assert "--prefill-waves" not in serve and "--prefill-span-rows" not in serve
+    assert "Resolved prefill:" not in result.stdout
+    assert "PREFILL_SPAN_ROWS" not in result.stdout + result.stderr
 
 
 @pytest.mark.parametrize("wip", [False, True])

@@ -226,12 +226,18 @@ pub struct PlanReport {
     /// Policy refusal, distinct from absent executable packages.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub spark_range_refusal: Option<spark_range::RangeRefusal>,
-    /// Resolved prefill shape, including V4.1 automatic capacity admission.
+    /// Resolved retained prefill span, not the row count of an individual unit.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub prefill_rows: Option<u64>,
-    /// Solver-selected GLM prefill lanes, shared by device and host admission.
+    pub prefill_span_rows: Option<u64>,
+    /// Family-resolved rows per unit; never inferred from the retained span.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub prefill_lanes: Option<u64>,
+    pub prefill_unit_rows: Option<u64>,
+    /// Family-resolved units in flight on each transport.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prefill_waves: Option<u64>,
+    /// Solver-selected transport count, independent of units in flight.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prefill_transports: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prefill_selection: Option<String>,
     /// The package and layouts that serve this checkpoint's routed experts.
@@ -553,8 +559,10 @@ fn plan_unrestricted(input: &PlanInput, options: &PlanOptions) -> Result<PlanRep
         spark_ranks: options.placement.spark_ranks(),
         spark_count_warning: None,
         spark_range_refusal: None,
-        prefill_rows: None,
-        prefill_lanes: None,
+        prefill_span_rows: None,
+        prefill_unit_rows: None,
+        prefill_waves: None,
+        prefill_transports: None,
         prefill_selection: None,
         experts: None,
         placement_supported: true,
@@ -824,6 +832,8 @@ fn plan_unrestricted(input: &PlanInput, options: &PlanOptions) -> Result<PlanRep
         if !ownership.uses_checkpoint() { layout_options.native_mtp_layers = 0; }
         layout_options.weight_budget_bytes = options.coordinator_budget_bytes;
         let memory = family_layout(model.as_ref(), input, &mut report, &mut layout_options, options.placement)?;
+        report.prefill_unit_rows = layout_options.prefill_unit_rows;
+        report.prefill_waves = Some(layout_options.prefill_waves);
         if layout_options.host_embedding {
             for note in memory.notes.iter().filter(|n| n.starts_with("host embedding ineligible:")) {
                 report.fits = false;
@@ -870,6 +880,8 @@ fn plan_unrestricted(input: &PlanInput, options: &PlanOptions) -> Result<PlanRep
             glmf_drafter_disabled: true, native_mtp_layers: if ownership.uses_checkpoint() { 3 } else { 0 },
             weight_budget_bytes: options.coordinator_budget_bytes, ..Default::default() };
         let _ = family_layout(model.as_ref(), input, &mut report, &mut inventory, options.placement)?;
+        report.prefill_unit_rows = inventory.prefill_unit_rows;
+        report.prefill_waves = Some(inventory.prefill_waves);
     }
     if let Some(encoder) = &report.encoder {
         let owner = match &encoder.kind {
@@ -1087,7 +1099,7 @@ fn plan_spark_count_of(input: &PlanInput, options: &PlanOptions, available: usiz
             return Ok(report);
         }
         let rows = candidate.layout.as_ref().unwrap().prefill_rows;
-        report.prefill_rows = Some(if rows == 0 { 2048 } else { rows });
+        report.prefill_span_rows = Some(if rows == 0 { 2048 } else { rows });
         if rows != 0 {
             if !report.executable() {
                 report.hints.push(Hint {
@@ -1105,7 +1117,7 @@ fn plan_spark_count_of(input: &PlanInput, options: &PlanOptions, available: usiz
                 layout.prefill_rows = rows;
                 layout.spark_capacity_rows = rows;
                 let mut smaller = input.plan(&candidate)?;
-                smaller.prefill_rows = Some(rows);
+                smaller.prefill_span_rows = Some(rows);
                 if smaller.executable() {
                     smaller.prefill_selection = Some(format!(
                         "V4.1 automatic prefill selected {rows} rows (2048 refused: {reason})"));

@@ -17,11 +17,25 @@ const LANES: u64 = 1;
 
 pub(super) fn layout(model: &Model, report: &mut PlanReport, opts: &mut crate::plan::layout::LayoutOptions,
     requested: ExpertPlacement) -> MemoryLayout {
-    let rows = if opts.prefill_rows > 0 { opts.prefill_rows as usize } else { 4096 };
-    report.prefill_rows = Some(rows as u64);
-    if opts.prefill_waves == 1 && opts.prefill_unit_rows.is_none() {
-        opts.prefill_unit_rows = Some(rows as u64);
+    let unit_rows = if opts.prefill_rows > 0 { opts.prefill_rows } else { 2048 };
+    let waves = if opts.prefill_lanes > 0 { opts.prefill_lanes } else { 2 };
+    let shape = crate::serving_capacity::PrefillShape { unit_rows, waves };
+    if let Err(error) = shape.validate().and_then(|shape| {
+        anyhow::ensure!((256..=4096).contains(&shape.slot_rows()),
+            "Kimi prefill span must hold 256..=4096 rows");
+        Ok(shape)
+    }) {
+        report.fits = false;
+        report.placement_supported = false;
+        report.hints.push(Hint { what: format!("Kimi prefill: {error:#}"),
+            how: "Select page-aligned unit rows and waves with a 256..=4096-row span.".into() });
+        return MemoryLayout { devices: Vec::new(), pool_tokens: 0, waste: Vec::new(), notes: vec![error.to_string()] };
     }
+    let rows = shape.slot_rows() as usize;
+    report.prefill_span_rows = Some(shape.slot_rows());
+    report.prefill_transports = Some(LANES);
+    opts.prefill_unit_rows = Some(unit_rows);
+    opts.prefill_waves = waves;
     let cfg = model.cfg();
     let ranks = requested.spark_ranks();
     let gpus = opts.rtx_bytes.len();

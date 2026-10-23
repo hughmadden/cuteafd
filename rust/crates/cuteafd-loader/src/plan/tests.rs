@@ -48,8 +48,8 @@ fn native_host_ledger_charges_six_spark_ranks_without_spark_device_entries() {
     let input = PlanInput::open(dir.path()).unwrap();
     let mut report = input.plan(&sparks(6)).unwrap();
     assert_eq!(report.spark_ranks, 6);
-    report.prefill_rows = Some(4096);
-    report.prefill_lanes = Some(3);
+    report.prefill_span_rows = Some(4096);
+    report.prefill_transports = Some(3);
     report.memory_layout = Some(MemoryLayout { devices: vec![DeviceLayout {
         kind: DeviceKind::Rtx, index: 0, capacity_bytes: 96 << 30, items: vec![], kv_tokens: 0,
     }], pool_tokens: 0, waste: vec![], notes: vec![] });
@@ -92,17 +92,17 @@ fn host_prefill_waves_keep_unit_scratch_and_independent_return_slots() {
     let mut options = layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)),
         host_cache_bytes: Some(0), full_prefill_logits: true, prefill_lanes: 1,
         prefill_rows: 4096, ..Default::default() };
-    report.prefill_lanes = Some(1);
+    report.prefill_transports = Some(1);
     for native in [false, true] {
         for (unit, waves, span) in [(4096, 1, 4096), (4096, 2, 8192), (4096, 2, 16384), (2048, 2, 16384), (4096, 2, 2048)] {
             options.prefill_rows = span;
             options.prefill_unit_rows = Some(unit);
             options.prefill_waves = waves;
-            report.prefill_rows = Some(span);
+            report.prefill_span_rows = Some(span);
             for family in ["mimo_v2", "deepseek_v41"] {
                 report.family = Some(family.into());
                 layout::charge_host(&mut report, &options, input.checkpoint(), native).unwrap();
-                assert_eq!(report.prefill_rows, Some(span));
+                assert_eq!(report.prefill_span_rows, Some(span));
                 let host = report.host_ledger.as_ref().unwrap();
                 let bytes = |name| host.items.iter().find(|i| i.group == name).unwrap().bytes;
                 let endpoints = layout::spark_endpoints(family, 1) as u64;
@@ -130,17 +130,17 @@ fn spark_host_layout_requires_explicit_family_unit_even_for_one_wave() {
     for native in [false, true] {
         for waves in [1, 2] {
             let mut report = input.plan(&sparks(4)).unwrap();
-            report.prefill_rows = Some(16384);
+            report.prefill_span_rows = Some(16384);
             let mut options = layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)),
                 host_cache_bytes: Some(0), prefill_rows: 4096, prefill_waves: waves, ..Default::default() };
             let error = layout::charge_host(&mut report, &options, input.checkpoint(), native).unwrap_err();
             assert!(error.to_string().contains("requires family-resolved prefill_unit_rows"), "{error:#}");
-            assert_eq!(report.prefill_rows, Some(16384));
+            assert_eq!(report.prefill_span_rows, Some(16384));
             options.prefill_unit_rows = Some(0);
             assert!(layout::charge_host(&mut report, &options, input.checkpoint(), native).is_err());
             options.prefill_unit_rows = Some(2048);
             layout::charge_host(&mut report, &options, input.checkpoint(), native).unwrap();
-            assert_eq!(report.prefill_rows, Some(16384));
+            assert_eq!(report.prefill_span_rows, Some(16384));
         }
     }
 }
@@ -218,13 +218,14 @@ fn host_full_logits_charge_gather_and_live_lane_but_not_mimo_pipeline() {
     let dir = snapshot(mimo_flash_config(), &mimo_flash_tensors());
     let input = PlanInput::open(dir.path()).unwrap();
     let mut report = input.plan(&PlanOptions::default()).unwrap();
-    report.prefill_rows = Some(4096);
+    report.prefill_span_rows = Some(4096);
     let options = layout::LayoutOptions { host_memory: Some((183 << 30, 183 << 30)),
         host_cache_bytes: Some(0), prefill_lanes: 3, full_prefill_logits: true,
         prefill_unit_rows: Some(4096), ..Default::default() };
     let vocab = report.spec.as_ref().unwrap().vocab as u64;
     for (family, rows) in [("mimo_v2", 4096u64), ("glm5_flash", 4096 * 4), ("glm5", 4096 * 4)] {
         report.family = Some(family.into());
+        report.prefill_transports = None;
         layout::charge_host(&mut report, &options, input.checkpoint(), false).unwrap();
         let logits = report.host_ledger.as_ref().unwrap().items.iter()
             .find(|item| item.group == "scoring/full-logits").unwrap().bytes;
@@ -3107,7 +3108,7 @@ fn v41_32gib_mxfp4_default_prefill_solves_1024_and_exact_2048_refuses() {
     }), ..sparks(4) };
     let automatic = plan_spark_count(dir.path(), &options, 6, Some(4)).unwrap();
     assert!(automatic.executable(), "{}", render(&automatic));
-    assert_eq!(automatic.prefill_rows, Some(1024));
+    assert_eq!(automatic.prefill_span_rows, Some(1024));
     assert!(automatic.prefill_selection.as_ref().unwrap().contains("selected 1024"));
     assert!(automatic.memory_layout.as_ref().unwrap().pool_tokens >= 1 << 20);
     let explicit = PlanOptions { layout: Some(layout::LayoutOptions {
@@ -3115,7 +3116,7 @@ fn v41_32gib_mxfp4_default_prefill_solves_1024_and_exact_2048_refuses() {
     }), ..sparks(4) };
     let refused = plan_spark_count(dir.path(), &explicit, 6, Some(4)).unwrap();
     assert!(!refused.executable());
-    assert_eq!(refused.prefill_rows, Some(2048));
+    assert_eq!(refused.prefill_span_rows, Some(2048));
     assert!(refused.prefill_selection.is_none());
     assert!(refused.hints.iter().any(|hint| hint.what.contains("native placement refused")));
     assert!(refused.hints.iter().any(|hint| hint.what.contains("explicit V4.1 prefill capacity 2048 refused")));

@@ -16,7 +16,7 @@ struct Unqualified(&'static str);
 
 /// Prefill units (PLAN "Prefill contract"): 2048 rows with two in flight by
 /// default, stepping down 2048 -> 1024 -> 512 when the larger unit would cost
-/// pool capacity. Explicit --prefill-rows / --prefill-lanes (waves) are never
+/// pool capacity. Explicit --prefill-rows / --prefill-waves are never
 /// changed. Two units in flight everywhere: NVFP4 min's 8K prefill gained
 /// 1.47x at 512 x 2 for a smaller pool (measured 2026-10-23).
 const DEFAULT_ROWS: [usize; 3] = [2048, 1024, 512];
@@ -234,8 +234,8 @@ pub(super) fn layout(
         admitted
     };
     let rows = inputs.rows;
-    report.prefill_rows = Some(inputs.unit_rows() as u64);
-    report.prefill_lanes = Some(waves as u64);
+    report.prefill_span_rows = Some(rows as u64);
+    report.prefill_transports = Some(1);
     opts.prefill_unit_rows = Some(inputs.unit_rows() as u64);
     opts.prefill_waves = waves as u64;
     report.attention_placement = admitted.placement.attention_placement;

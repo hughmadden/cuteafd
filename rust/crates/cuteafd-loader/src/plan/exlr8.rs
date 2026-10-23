@@ -152,7 +152,9 @@ pub fn native_plan(snapshot: &Path, selected: &str, dense: &Path,
     report.placement_supported = true;
     report.fits = true;
     report.attention_placement = attention;
-    report.prefill_rows = Some(if layout.prefill_rows == 0 { 4096 } else { layout.prefill_rows });
+    report.prefill_span_rows = Some(if layout.prefill_rows == 0 { 4096 } else { layout.prefill_rows });
+    report.prefill_unit_rows = layout.prefill_unit_rows;
+    report.prefill_waves = Some(layout.prefill_waves);
     report.experts = Some(super::family::ExpertContract { package: "glm:exlr8".into(), block: 128,
         spark_worlds: vec![world], local: Err("EXLR8 coordinator-local routed experts are unsupported".into()) });
     report.hints = vec![super::Hint { what: "EXLR8 native runtime is WIP admitted, not quality-qualified".into(),

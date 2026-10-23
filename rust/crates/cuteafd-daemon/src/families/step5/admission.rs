@@ -215,10 +215,10 @@ mod tests {
             assert!(!report.executable());
             // The planner's automatic prefill unit (2048, or the step-down that
             // keeps its pool) is what the daemon admits.
-            // Unit rows and waves; the span the daemon admits is their product.
-            let unit = report.prefill_rows.unwrap_or(2048) as usize;
-            let waves = report.prefill_lanes.unwrap_or(1) as usize;
-            let rows = unit * waves;
+            let unit = report.prefill_unit_rows.unwrap() as usize;
+            let waves = report.prefill_waves.unwrap() as usize;
+            let rows = report.prefill_span_rows.unwrap() as usize;
+            assert_eq!(rows, unit * waves);
             if launchable {
                 assert!([2048, 1024, 512].contains(&unit), "{unit}");
                 // Two in flight unless device-only retention at full context
