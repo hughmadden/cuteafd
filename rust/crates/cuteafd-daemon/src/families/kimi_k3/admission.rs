@@ -191,9 +191,10 @@ impl<'a> Admission<'a> {
     }
     pub(crate) fn draft_layout(&self) -> Option<&MlaDraftRuntimeLayout> { self.draft.as_ref() }
 
+    /// Hops, the peer exchange and Spark waves serve one prefill unit.
     pub(crate) fn execution_plan(&self) -> Result<LayerExecutionPlan> {
         Ok(LayerExecutionPlan::new(&self.placement, hop_spec(self.cfg.hidden,
-            self.lane_layouts[0][0].rows(), self.lanes as usize))?)
+            self.unit_rows, self.lanes as usize))?)
     }
 
     pub(crate) fn working_set(&self) -> SparkWorkingSet {
@@ -208,6 +209,8 @@ impl<'a> Admission<'a> {
     /// replaced by an uncharged second allocation.
     pub(crate) fn waves(&self) -> usize { self.waves }
     pub(crate) fn unit_rows(&self) -> usize { self.unit_rows }
+    /// Rows of one prefill call: the lane's row planes (`waves` units).
+    pub(crate) fn lane_rows(&self) -> usize { self.lane_layouts[0][0].rows() }
 
     pub(crate) fn connect_spark(&mut self, library: &'a std::sync::Arc<cuteafd_ffi::NativeLibrary>,
         local: &LocalLane<'a>,
@@ -321,7 +324,8 @@ impl<'a> Admission<'a> {
         ensure!(!self.rtx_loaded, "Kimi TP2 experts already loaded");
         self.rtx_loaded = true;
         let Some((layers, budgets, package)) = rtx else { return Ok([None, None]) };
-        let rows = self.lane_layouts[0][0].rows();
+        // A TP2 FFN completes inside one unit's hook.
+        let rows = self.unit_rows;
         let geometry = cuteafd_core::ExpertGeometry::KIMI_K3;
         let pair = match pushed {
             Some(ranks) => {
@@ -534,7 +538,7 @@ pub(crate) fn admit<'a>(mut inputs: Inputs<'_>) -> Result<Admission<'a>> {
     let spark_budget = inputs.spark_budget.take();
     let draft = inputs.draft.clone();
     let graph_reserve = inputs.startup.iter().any(|d| d.group == super::graphs::RESERVE);
-    let graph_rows = inputs.rows;
+    let graph_rows = unit_rows;
     let graph_slots = inputs.state_slots;
     let graph_verify = inputs.verify_rows;
     let mut request = request(inputs)?;
@@ -653,8 +657,11 @@ fn request(i: Inputs<'_>) -> Result<PlacementRequest> {
     ensure!(i.devices.iter().all(|device| *device >= 0) && i.devices[0] != i.devices[1],
         "Kimi admitted devices must be distinct CUDA ordinals");
     ensure!(i.attention != Some(AttentionPlacement::Context), "Kimi context attention has no query/LSE exchange ABI");
-    ensure!((1..=64).contains(&i.state_slots) && i.prefix_marks > 0 && (1..=4096).contains(&i.rows)
+    ensure!((1..=64).contains(&i.state_slots) && i.prefix_marks > 0
+        && (1..=cuteafd_loader::families::kimi_k3::allocation::LANE_ROWS_MAX).contains(&i.rows)
         && (1..=2).contains(&i.lanes), "Kimi native admission slot/prefix/row/lane geometry");
+    let unit = cuteafd_loader::families::kimi_k3::allocation::prefill_shape_with(i.rows, i.waves, i.unit_rows)?
+        .unit_rows as usize;
     ensure!(cfg.kda_heads == 96 && cfg.kda_head_dim == 128 && cfg.kda_conv == 4
         && cfg.mla_record_values() * 2 == MLA_RECORD_BYTES, "Kimi native state/cache geometry");
     ensure!(i.gpus.iter().all(|gpu| matches!(gpu.baseline, Baseline::Measured { .. })),
@@ -667,7 +674,8 @@ fn request(i: Inputs<'_>) -> Result<PlacementRequest> {
                 && d.lifetime == cuteafd_core::memory_layout::ItemLifetime::ReadyResident)))
         && i.pool_bounded.iter().all(|d| d.gpu < 2 && d.basis != Basis::Estimated),
         "Kimi runtime admission allows estimates only for its named startup graph reserve");
-    ensure!(i.lane_layouts.len() == i.lanes && i.lane_layouts.iter().flatten().all(|layout| layout.rows() == i.rows),
+    ensure!(i.lane_layouts.len() == i.lanes && i.lane_layouts.iter().flatten()
+        .all(|layout| layout.rows() == i.rows && layout.unit == unit),
         "Kimi lane operand layouts differ from executor geometry");
     let context = i.lane_layouts[0][0].max_context();
     ensure!(i.lane_layouts.iter().flatten().all(|layout| layout.max_context() == context),
@@ -777,12 +785,17 @@ fn request(i: Inputs<'_>) -> Result<PlacementRequest> {
                 .filter(|(kind, _, _)| cfg.attention.contains(kind))
                 .map(|(_, class, placement)| (class, placement)).collect(),
             ..Default::default() },
-        hops: hop_spec(cfg.hidden, i.rows, i.lanes), executor: EXECUTOR })
+        hops: hop_spec(cfg.hidden, unit, i.lanes), executor: EXECUTOR })
 }
 
 #[cfg(test)]
 pub(super) mod tests {
     use super::*;
+
+    /// The unit admission derives for these test inputs.
+    pub(in crate::families::kimi_k3) fn test_unit(rows: usize, waves: usize, unit: Option<usize>) -> usize {
+        cuteafd_loader::families::kimi_k3::allocation::prefill_shape_with(rows, waves, unit).unwrap().unit_rows as usize
+    }
 
     #[test]
     #[ignore = "CPU-only receipt replay; requires CUTEAFD_KIMI_MODEL, CUTEAFD_KIMI_DRAFT and CUTEAFD_KIMI_EXL3_PACKAGE"]
@@ -817,11 +830,11 @@ pub(super) mod tests {
                 i.gpus = std::array::from_fn(|rank| GpuBudget { capacity_bytes: total[rank],
                     headroom_bytes: 2 << 30, baseline: Baseline::Measured { free_bytes: free[rank] } });
                 i.state_slots = 8; i.prefix_marks = 1; i.lanes = 1; i.requested_pool = Some(1 << 20);
-                i.lane_layouts = vec![std::array::from_fn(|_| LaneLayout::new(&cfg, 4096, context, scratch).unwrap())];
+                i.lane_layouts = vec![std::array::from_fn(|_| LaneLayout::new(&cfg, 4096, 4096, context, scratch).unwrap())];
                 i.fixed = startup::exchange_demands(4096, false, false)?;
                 for rank in 0..2 { i.fixed.push(startup::code_demand(rank, 71_303_168, 71_303_168, 1)?); }
                 if enabled {
-                    i.fixed.extend(super::super::draft::bridge_demands(&draft)?);
+                    i.fixed.extend(super::super::draft::bridge_demands(&draft, i.rows)?);
                     i.fixed.push(cuteafd_loader::families::kimi_k3::draft_probe_demand(cfg.layers, cfg.topk, 64)?);
                     i.draft = Some(draft.with_pool_tokens(1 << 20)?);
                 }
@@ -929,7 +942,7 @@ pub(super) mod tests {
             baseline: Baseline::Measured { free_bytes: 96 << 30 } }; 2], devices: [0, 1], peer_access: true, spark_ranks: 6,
             attention: None, requested_pool: None, state_slots: 2, prefix_marks: 2, rows: 4096, lanes: 2, waves: 2, unit_rows: None,
             lane_layouts: vec![std::array::from_fn(|_| LaneLayout::new(
-                &KimiK3Config::from_hf(&cuteafd_loader::plan::testing::kimi_k3_config()).unwrap(), 4096, 1_048_576,
+                &KimiK3Config::from_hf(&cuteafd_loader::plan::testing::kimi_k3_config()).unwrap(), 4096, 2048, 1_048_576,
                 super::super::device::NativeScratch { kda: 1024, mla: [512, 0, 1024] }).unwrap()); 2],
             fixed: (0..2).map(|rank| Demand::new(rank, Category::Workspace, "native engine buffers", 1 << 20, Basis::Exact)).collect(),
             startup: vec![], pool_bounded: vec![], rtx: None, spark_budget: None, draft: None, verify_rows: 0 }
@@ -964,7 +977,7 @@ pub(super) mod tests {
         let full = KimiK3Config::from_hf(&cuteafd_loader::plan::testing::kimi_k3_config())?;
         for context in [262144, 1048576] {
             let mut i = inputs(&cfg);
-            i.lane_layouts = vec![std::array::from_fn(|_| LaneLayout::new(&full, i.rows, context,
+            i.lane_layouts = vec![std::array::from_fn(|_| LaneLayout::new(&full, i.rows, test_unit(i.rows, i.waves, i.unit_rows), context,
                 super::super::device::NativeScratch { kda: 1024, mla: [512, 0, 1024] }).unwrap()); i.lanes];
             let layout = draft_layout(i.state_slots, i.state_slots, context);
             let (demand, peak) = layout.demands(1)?;
@@ -974,7 +987,7 @@ pub(super) mod tests {
             assert!(request.startup.contains(&peak));
             assert!(!request.fixed.iter().any(|d| d.group == peak.group));
             let mut i = inputs(&cfg);
-            i.lane_layouts = vec![std::array::from_fn(|_| LaneLayout::new(&full, i.rows, context,
+            i.lane_layouts = vec![std::array::from_fn(|_| LaneLayout::new(&full, i.rows, test_unit(i.rows, i.waves, i.unit_rows), context,
                 super::super::device::NativeScratch { kda: 1024, mla: [512, 0, 1024] }).unwrap()); i.lanes];
             i.draft = Some(layout.clone());
             let mut admitted = admit(i)?;
@@ -1114,7 +1127,7 @@ pub(super) mod tests {
         }
         let mut i = inputs(&cfg);
         let full = KimiK3Config::from_hf(&cuteafd_loader::plan::testing::kimi_k3_config())?;
-        i.lane_layouts[1][1] = LaneLayout::new(&full, i.rows, 524_288,
+        i.lane_layouts[1][1] = LaneLayout::new(&full, i.rows, test_unit(i.rows, i.waves, i.unit_rows), 524_288,
             super::super::device::NativeScratch { kda: 1024, mla: [512, 0, 1024] })?;
         assert!(request(i).is_err());
         Ok(())
@@ -1159,13 +1172,16 @@ pub(super) mod tests {
             let memory = report.memory_layout.context("installed Kimi planner ledger")?;
             let catalog = cuteafd_loader::read_expert_catalog(snapshot.path())?;
             let package = allocation::expert_package(&manifest_path)?;
-            let mut rtx = plan_rtx(&cfg, &catalog, package, rows, 92)?;
+            // Startup charges hook-local owners (TP2 workspace, Spark endpoint,
+            // peer exchange, graphs) at the unit; row planes at the lane.
+            let unit = test_unit(rows, 2, None);
+            let mut rtx = plan_rtx(&cfg, &catalog, package, unit, 92)?;
             rtx.layers = Onboard::Auto;
             let working = SparkWorkingSet { rtx_layers: vec![], spark_layers: (1..93).collect(),
                 spark_ranks: 6, prefill_lanes: 1 };
             let rings = cuteafd_loader::plan::layout::spark_ring_geometry(1);
             let spark = SparkBudgetInventory::exl3(&catalog, &working,
-                &[cuteafd_core::SparkEndpoint { ring_depth: None, capacity: rows as u32, ingress: cuteafd_core::SparkIngress::Fp8K32 }],
+                &[cuteafd_core::SparkEndpoint { ring_depth: None, capacity: unit as u32, ingress: cuteafd_core::SparkIngress::Fp8K32 }],
                 cuteafd_core::SparkRings { max_frame_bytes: rings.max_frame_bytes, depth: rings.depth,
                     slot_bytes: rings.slot_bytes, alignment: rings.alignment }, spark_bytes,
                 cuteafd_loader::families::kimi_k3::SPARK_ESTIMATED_RESERVE_BYTES)?;
@@ -1174,11 +1190,11 @@ pub(super) mod tests {
             let mut i = inputs(&cfg);
             i.cache_format = format;
             i.rows = rows; i.lanes = 1; i.state_slots = slots as usize; i.prefix_marks = marks as usize;
-            i.lane_layouts = vec![std::array::from_fn(|_| LaneLayout::new(&cfg, rows, context,
+            i.lane_layouts = vec![std::array::from_fn(|_| LaneLayout::new(&cfg, rows, test_unit(rows, i.waves, i.unit_rows), context,
                 allocation::NativeScratch::from_manifest(&manifest).unwrap()).unwrap())];
-            i.fixed = super::super::startup::exchange_demands(rows, false, false)?;
+            i.fixed = super::super::startup::exchange_demands(unit, false, false)?;
             i.startup = (0..2).map(|rank| super::super::graphs::demand(
-                &super::super::graphs::owned_inventory(&cfg, 1, rows, slots as usize, 0).unwrap().inventory, rank)).collect();
+                &super::super::graphs::owned_inventory(&cfg, 1, unit, slots as usize, 0).unwrap().inventory, rank)).collect();
             for rank in 0..2 {
                 let code = cuteafd_loader::placement::inventory::loaded_code_allowance(
                     "kimik3", "exl3", true, rank as u8, arch, Some(&programs));
@@ -1230,7 +1246,7 @@ pub(super) mod tests {
                 let mut i = inputs(&cfg);
                 i.cache_format = args.kv_cache;
                 i.requested_pool = args.pool_tokens;
-                i.lane_layouts = vec![std::array::from_fn(|_| LaneLayout::new(&cfg, i.rows, args.max_context.unwrap(),
+                i.lane_layouts = vec![std::array::from_fn(|_| LaneLayout::new(&cfg, i.rows, test_unit(i.rows, i.waves, i.unit_rows), args.max_context.unwrap(),
                     super::super::device::NativeScratch { kda: 1024, mla: [512, 0, 1024] }).unwrap()); i.lanes];
                 lane_bytes.push(i.lane_layouts[0][0].bytes()?);
                 let mut under = request(i)?;
@@ -1245,7 +1261,7 @@ pub(super) mod tests {
                 i.requested_pool = Some(context);
                 for layouts in &mut i.lane_layouts {
                     for layout in layouts {
-                        *layout = LaneLayout::new(&cfg, i.rows, context as usize,
+                        *layout = LaneLayout::new(&cfg, i.rows, test_unit(i.rows, i.waves, i.unit_rows), context as usize,
                             super::super::device::NativeScratch { kda: 1024, mla: [512, 0, 1024] })?;
                     }
                 }
@@ -1293,7 +1309,7 @@ pub(super) mod tests {
         for format in [cuteafd_core::MlaCacheFormat::Bf16, cuteafd_core::MlaCacheFormat::Fp8] {
             let mut i = inputs(&cfg);
             i.cache_format = format;
-            i.lane_layouts = vec![std::array::from_fn(|_| LaneLayout::new(&cfg, i.rows, DEFAULT_CONTEXT,
+            i.lane_layouts = vec![std::array::from_fn(|_| LaneLayout::new(&cfg, i.rows, test_unit(i.rows, i.waves, i.unit_rows), DEFAULT_CONTEXT,
                 super::super::device::NativeScratch { kda: 1024, mla: [512, 0, 1024] }).unwrap()); i.lanes];
             let request = request(i)?;
             assert_eq!(request.pool.floor, DEFAULT_CONTEXT as u64);

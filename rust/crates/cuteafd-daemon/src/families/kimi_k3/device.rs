@@ -165,18 +165,19 @@ impl<'a> NativePrograms<'a> {
         super::admission::check_prefix(&self.w8.cfg, cfg)
     }
 
-    pub(crate) fn lane_layout(&self, cfg: &KimiK3Config, rows: usize, max_context: usize) -> Result<LaneLayout> {
+    /// `rows` lane rows of units of at most `unit` rows (the programs' launch capacity).
+    pub(crate) fn lane_layout(&self, cfg: &KimiK3Config, rows: usize, unit: usize, max_context: usize) -> Result<LaneLayout> {
         self.check_config(cfg)?;
         ensure!(self.mla.iter().all(|p| [p.decode.max_context(), p.verify.max_context(), p.extend.max_context()]
             .into_iter().all(|capacity| max_context <= capacity)), "Kimi lane context exceeds native programs");
-        let mut layout=LaneLayout::new(cfg, rows, max_context, self.scratch)?;
+        let mut layout=LaneLayout::new(cfg, rows, unit, max_context, self.scratch)?;
         if let Some(core)=&self.core {
             layout.core=Some(core.layout.clone());
             // Split producers consume the same named scratch planes as fused
             // producers; admission retains the larger exact requirement.
             let kda=core.kda.iter().map(|p|p.scratch_bytes()).max().unwrap_or(0);
             let mla=core.mla.values().map(|p|p.scratch_bytes()).max().unwrap_or(0);
-            let stages = cuteafd_loader::families::kimi_k3::core::lane_extents(rows,
+            let stages = cuteafd_loader::families::kimi_k3::core::lane_extents(rows, unit,
                 layout.operands["KDA scratch"],layout.operands["MLA producer scratch"],kda,mla)?;
             layout.base = layout.base.with_core_stages(stages)?;
             layout.bytes()?;
@@ -203,10 +204,10 @@ impl std::ops::DerefMut for LaneLayout {
 }
 
 impl LaneLayout {
-    pub(crate) fn new(cfg: &KimiK3Config, rows: usize, max_context: usize,
+    pub(crate) fn new(cfg: &KimiK3Config, rows: usize, unit: usize, max_context: usize,
         scratch: NativeScratch) -> Result<Self> {
         Ok(Self { base: cuteafd_loader::families::kimi_k3::allocation::NativeLaneLayout::new(
-            cfg, rows, max_context, scratch)?, core: None })
+            cfg, rows, unit, max_context, scratch)?, core: None })
     }
 
     pub(crate) fn bytes(&self) -> Result<usize> {
@@ -443,7 +444,7 @@ impl<'a> LocalLane<'a> {
         self.attention = None;
         ensure!(!pool.is_parity() && pool.capacity().checked_add(pool.reserved()) == Some(self.mla.pages()),
             "Kimi metadata page pool differs from admitted MLA bank");
-        let metadata = AttentionRows::new(sequences, self.lane.rows(), self.kda.slots(),
+        let metadata = AttentionRows::new(sequences, self.lane.layout.unit, self.kda.slots(),
             self.lane.layout.max_context, pool)?;
         self.lane.upload_attention(&metadata)?;
         self.attention = Some(AttentionShape { rows: metadata.rows, sequences: metadata.sequences });
@@ -911,7 +912,7 @@ impl AttentionRows {
     }
 
     fn check_layout(&self, layout: &LaneLayout) -> Result<()> {
-        ensure!(self.rows <= layout.rows && self.width == layout.max_context.div_ceil(64),
+        ensure!(self.rows <= layout.unit && self.width == layout.max_context.div_ceil(64),
             "Kimi metadata differs from admitted row capacity/page stride");
         for (name, bytes) in self.uploads() {
             ensure!(layout.operands.get(name).is_some_and(|capacity| bytes.len() <= *capacity),
@@ -940,7 +941,8 @@ pub(crate) struct IoLayout {
 impl IoLayout {
     pub(crate) fn new(cfg: &KimiK3Config, rank: usize, rows: usize) -> Result<Self> {
         ensure!(cfg.hidden == 7168 && cfg.vocab_size == 163840, "Kimi native IO hidden/vocabulary geometry");
-        ensure!(rank < 2 && (1..=4096).contains(&rows), "Kimi IO rank/row geometry");
+        ensure!(rank < 2 && (1..=cuteafd_loader::families::kimi_k3::allocation::LANE_ROWS_MAX).contains(&rows),
+            "Kimi IO rank/row geometry");
         Ok(Self { rank, rows, hidden: cfg.hidden, vocab: cfg.vocab_size, core_head:false })
     }
 
@@ -1128,7 +1130,7 @@ mod tests {
     #[test]
     fn subwave_views_partition_persistent_rows_and_preserve_residual_planes() -> Result<()> {
         let cfg = KimiK3Config::from_hf(&cuteafd_loader::plan::testing::kimi_k3_config())?;
-        let layout = LaneLayout::new(&cfg, 4096, 1_048_576, NativeScratch { kda: 16, mla: [16; 3] })?;
+        let layout = LaneLayout::new(&cfg, 4096, 4096, 1_048_576, NativeScratch { kda: 16, mla: [16; 3] })?;
         let windows = crate::shared::prefill_pipeline::prefill_units(4096, 1408, 1, 256)?;
         assert_eq!(windows.len(), 3);
         for (&name, &bytes) in &layout.operands {
@@ -1174,12 +1176,12 @@ mod tests {
         for row in 3..5 { assert_eq!(&table[row * 4..row * 4 + 4], &[b[0] as i32, 0, 0, 0]); }
         let cfg = cuteafd_loader::families::kimi_k3::config::KimiK3Config::from_hf(
             &cuteafd_loader::plan::testing::kimi_k3_config())?;
-        let layout = LaneLayout::new(&cfg, 64, 256, NativeScratch { kda: 16, mla: [16; 3] })?;
+        let layout = LaneLayout::new(&cfg, 64, 64, 256, NativeScratch { kda: 16, mla: [16; 3] })?;
         metadata.check_layout(&layout)?;
         for (name, bytes) in metadata.uploads() { assert!(bytes.len() <= layout.operands[name]); }
-        let narrow = LaneLayout::new(&cfg, 64, 128, NativeScratch { kda: 16, mla: [16; 3] })?;
+        let narrow = LaneLayout::new(&cfg, 64, 64, 128, NativeScratch { kda: 16, mla: [16; 3] })?;
         assert!(metadata.check_layout(&narrow).is_err());
-        let short = LaneLayout::new(&cfg, 4, 256, NativeScratch { kda: 16, mla: [16; 3] })?;
+        let short = LaneLayout::new(&cfg, 4, 4, 256, NativeScratch { kda: 16, mla: [16; 3] })?;
         assert!(metadata.check_layout(&short).is_err());
         let single = AttentionRows::new(&[SequenceRows { slot: 0, start: 60, rows: 5, pages: &a }],
             64, 4, 256, &pool)?;
@@ -1246,7 +1248,7 @@ mod tests {
         let library = fixture.load()?;
         let device = Device { library: &library, id: 1 };
         let cfg = KimiK3Config::from_hf(&cuteafd_loader::plan::testing::kimi_k3_config())?;
-        let mut layout = LaneLayout::new(&cfg, 64, 128, NativeScratch { kda: 16, mla: [16; 3] })?;
+        let mut layout = LaneLayout::new(&cfg, 64, 64, 128, NativeScratch { kda: 16, mla: [16; 3] })?;
         layout.operands.retain(|name, _| ATTENTION_METADATA.contains(name));
         layout.arena_offsets.clear();
         layout.arena_bytes = 0;
@@ -1328,7 +1330,7 @@ mod tests {
             operands: BTreeMap::from([("delta", Allocation::new(device, 16)?)]),
             arena: Some(Allocation::new(device, 32)?),
             layout: LaneLayout { base: cuteafd_loader::families::kimi_k3::allocation::NativeLaneLayout {
-                rows: 1, max_context: 64, operands: BTreeMap::from([("delta", 16)]),
+                rows: 1, unit: 1, max_context: 64, operands: BTreeMap::from([("delta", 16)]),
                 arena_offsets: BTreeMap::new(), arena_bytes: 32 }, core: None }, window: None, core: None };
         assert!(!fixture.events()?.contains('d'));
         drop(lane);
@@ -1409,7 +1411,8 @@ mod tests {
                 assert!(rank.demand(2).is_err());
             }
         }
-        for (rank, rows) in [(2, 1), (0, 0), (1, 4097)] {
+        assert!(IoLayout::new(&cfg, 0, 8192).is_ok(), "token ids span a two-unit lane");
+        for (rank, rows) in [(2, 1), (0, 0), (1, 8193)] {
             assert!(IoLayout::new(&cfg, rank, rows).is_err());
         }
         let source = include_str!("device.rs").split("#[cfg(test)]").next().unwrap();
@@ -1551,7 +1554,7 @@ mod tests {
         let cfg = KimiK3Config::from_hf(&cuteafd_loader::plan::testing::kimi_k3_config())?;
         let scratch = NativeScratch { kda: 4096, mla: [512, 0, 1024] };
         for rows in [1, 16, 4096] {
-            let layout = LaneLayout::new(&cfg, rows, 1_048_576, scratch)?;
+            let layout = LaneLayout::new(&cfg, rows, (rows).min(4096), 1_048_576, scratch)?;
             assert_eq!(layout.operands["residual arena"], KimiResidual::arena_bytes(rows)?);
             assert_eq!(layout.operands["gate-up"], rows * 2 * 16896 * 2);
             assert_eq!(layout.operands["MLA page table"], rows.min(64) * 16384 * 4);
@@ -1582,10 +1585,13 @@ mod tests {
             assert!(layout.demand(2, 0).is_err());
             assert!(layout.demand(0, 2).is_err());
         }
-        for (rows, context) in [(0, 1), (4097, 1), (1, 0), (1, 1_048_577)] {
-            assert!(LaneLayout::new(&cfg, rows, context, scratch).is_err());
+        for (rows, context) in [(0, 1), (8193, 1), (1, 0), (1, 1_048_577)] {
+            assert!(LaneLayout::new(&cfg, rows, (rows).min(4096), context, scratch).is_err());
         }
-        assert!(LaneLayout::new(&cfg, 1, 1, NativeScratch { kda: usize::MAX, mla: [0; 3] }).is_err());
+        // Lanes hold up to two 4096-row units; a unit never exceeds 4096 rows.
+        assert!(LaneLayout::new(&cfg, 8192, 4096, 1_048_576, scratch).is_ok());
+        assert!(LaneLayout::new(&cfg, 8192, 4097, 1_048_576, scratch).is_err());
+        assert!(LaneLayout::new(&cfg, 1, 1, 1, NativeScratch { kda: usize::MAX, mla: [0; 3] }).is_err());
         Ok(())
     }
 
@@ -1630,7 +1636,7 @@ mod tests {
         }
         let cfg = KimiK3Config::from_hf(&cuteafd_loader::plan::testing::kimi_k3_config())?;
         for rows in [1, 4, 16, 64, 4096] {
-            let layout = LaneLayout::new(&cfg, rows, 1_048_576,
+            let layout = LaneLayout::new(&cfg, rows, (rows).min(4096), 1_048_576,
                 NativeScratch { kda: 4096, mla: [1024, 8192, 4096] })?;
             let make = || Schedule { layout: &layout, clocks: [[0; 2]; 2], uses: Vec::new() };
             // Walk every layer, including both attention kinds, dense and routed
@@ -1690,11 +1696,11 @@ mod tests {
         // Installed-package peaks; the split KDA recurrence is larger than fused.
         let scratch = NativeScratch { kda: 629_464_064,
             mla: [168_296_448, 101_056_512, 201_326_592] };
-        for rows in [1, 4, 16, 63, 64, 4096] {
+        for (rows, unit) in [(1, 1), (4, 4), (16, 16), (63, 63), (64, 64), (4096, 4096), (8192, 4096)] {
             for larger in [false, true] {
                 let split = if larger { 630_905_856 } else { scratch.kda };
-                let stages = lane_extents(rows, scratch.kda, scratch.mla[0], split, 0)?;
-                let base = LaneLayout::new(&cfg, rows, 1_048_576, scratch)?;
+                let stages = lane_extents(rows, unit, scratch.kda, scratch.mla[0], split, 0)?;
+                let base = LaneLayout::new(&cfg, rows, unit, 1_048_576, scratch)?;
                 let shared = base.base.clone().with_core_stages(stages.clone())?;
                 for (&name, &offset) in &base.arena_offsets {
                     assert_eq!(shared.arena_offsets[name], offset, "BF16 offset {name}");
@@ -1716,14 +1722,17 @@ mod tests {
                         }
                     }
                 }
-                if rows == 4096 && larger {
+                if unit == 4096 && larger {
+                    // Hook-local scratch serves one unit: the 8192-row lane
+                    // keeps the 4096-row arena; only row planes double.
                     assert_eq!(base.arena_bytes, 1_340_473_344);
                     assert_eq!(shared.arena_bytes, base.arena_bytes);
+                    // Added bytes: the three FP32 meet planes over the lane.
+                    let meets = CORE_MEET_PLANES.len() * rows * 7168 * 4;
                     let old = stages.values().sum::<usize>();
                     let added = shared.bytes()? - base.bytes()?;
-                    assert_eq!(old, 1_554_701_312);
-                    assert_eq!(added, 352_321_536);
-                    assert_eq!(old - added, 1_202_379_776);
+                    assert_eq!(old - meets, 1_554_701_312 - 352_321_536);
+                    assert_eq!(added, meets);
                 }
             }
         }
@@ -1776,11 +1785,11 @@ mod tests {
             }
         }
         let cfg = KimiK3Config::from_hf(&cuteafd_loader::plan::testing::kimi_k3_config())?;
-        for rows in [1, 4, 16, 64, 4096] {
+        for (rows, unit) in [(1, 1), (4, 4), (16, 16), (64, 64), (4096, 4096), (8192, 4096)] {
             let scratch = NativeScratch { kda: 629_464_064,
                 mla: [168_296_448, 101_056_512, 201_326_592] };
-            let layout = LaneLayout::new(&cfg, rows, 1_048_576, scratch)?.base.with_core_stages(
-                lane_extents(rows, scratch.kda, scratch.mla[0], 630_905_856, 0)?)?;
+            let layout = LaneLayout::new(&cfg, rows, unit, 1_048_576, scratch)?.base.with_core_stages(
+                lane_extents(rows, unit, scratch.kda, scratch.mla[0], 630_905_856, 0)?)?;
             let phases = layout.core_phases();
             let make = || Schedule { layout: &layout, clocks: [[0; 2]; 2], uses: Vec::new() };
             let mut captured = make();

@@ -29,9 +29,18 @@ impl NativeScratch {
     }
 }
 
+/// Most rows one kernel launch (one prefill unit) handles.
+pub const UNIT_ROWS_MAX: usize = 4096;
+/// Most rows a lane holds: two units of the largest size in flight.
+pub const LANE_ROWS_MAX: usize = 2 * UNIT_ROWS_MAX;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NativeLaneLayout {
+    /// Lane rows: the call's row planes, each unit owning its rows of them.
     pub rows: usize,
+    /// Unit rows: hook-local scratch (the phase arena, K6 stages, attention
+    /// metadata) serves one unit's kernel launch at a time.
+    pub unit: usize,
     pub max_context: usize,
     pub operands: BTreeMap<&'static str, usize>,
     pub arena_offsets: BTreeMap<&'static str, usize>,
@@ -63,11 +72,12 @@ pub const CORE_MEET_PLANES: [&str; 3] = ["K6 attention partial", "K6 FFN partial
 pub const ARENA_ALIGNMENT: usize = 1024;
 
 impl NativeLaneLayout {
-    pub fn new(cfg: &KimiK3Config, rows: usize, max_context: usize,
+    /// `rows` lane rows hold units of at most `unit` rows; one-unit lanes pass `unit == rows`.
+    pub fn new(cfg: &KimiK3Config, rows: usize, unit: usize, max_context: usize,
         scratch: NativeScratch) -> Result<Self> {
         cfg.release_geometry()?;
-        ensure!((1..=4096).contains(&rows) && (1..=1_048_576).contains(&max_context),
-            "Kimi lane row/context capacity");
+        ensure!((1..=LANE_ROWS_MAX).contains(&rows) && (1..=UNIT_ROWS_MAX.min(rows)).contains(&unit)
+            && (1..=1_048_576).contains(&max_context), "Kimi lane row/unit/context capacity");
         let mut operands = BTreeMap::new();
         let mut plane = |name, shape: &[usize]| -> Result<()> {
             let bytes = shape.iter().try_fold(1usize, |n, size| n.checked_mul(*size)
@@ -81,24 +91,26 @@ impl NativeLaneLayout {
             plane(name, &hidden)?;
         }
         let intermediate = (cfg.dense_intermediate / 2).max(cfg.moe_intermediate * cfg.shared_experts / 2);
-        plane("gate-up", &[rows, 2, intermediate, 2])?;
-        plane("activated", &[rows, intermediate, 2])?;
+        plane("gate-up", &[unit, 2, intermediate, 2])?;
+        plane("activated", &[unit, intermediate, 2])?;
         for name in ["latent input", "expert combined", "latent normalized"] {
             plane(name, &[rows, cfg.latent, 2])?;
         }
         plane("router logits", &[rows, cfg.experts, 4])?;
         for name in ["route ids", "route weights"] { plane(name, &[rows, cfg.topk, 4])?; }
         plane("expert wire", &[rows, (3584 + 3584 / 32)])?;
-        plane("KDA normalized", &[rows, 48, 128, 2])?;
-        for name in ["KDA slots", "KDA first"] { plane(name, &[rows, 4])?; }
-        plane("MLA slots", &[rows, 8])?;
-        plane("MLA query", &[rows, cfg.heads, 576, 2])?;
-        plane("MLA q residual", &[rows, cfg.q_lora_rank, 2])?;
-        plane("MLA attention", &[rows, cfg.heads, 512, 2])?;
-        plane("MLA LSE", &[rows, cfg.heads, 4])?;
+        // Phase-arena operands and attention metadata are rewritten inside each
+        // unit's hook: one unit's rows.
+        plane("KDA normalized", &[unit, 48, 128, 2])?;
+        for name in ["KDA slots", "KDA first"] { plane(name, &[unit, 4])?; }
+        plane("MLA slots", &[unit, 8])?;
+        plane("MLA query", &[unit, cfg.heads, 576, 2])?;
+        plane("MLA q residual", &[unit, cfg.q_lora_rank, 2])?;
+        plane("MLA attention", &[unit, cfg.heads, 512, 2])?;
+        plane("MLA LSE", &[unit, cfg.heads, 4])?;
         // Decode/verify permits one request per row, at most the 64-row
         // specialization. Wide prefill is one sequence. Cache pages live outside.
-        let requests = rows.min(64);
+        let requests = unit.min(64);
         plane("MLA page table", &[requests, max_context.div_ceil(64), 4])?;
         plane("MLA lengths", &[requests, 4])?;
         plane("MLA query offsets", &[requests + 1, 4])?;
@@ -119,7 +131,7 @@ impl NativeLaneLayout {
             }
             arena_bytes = arena_bytes.max(end);
         }
-        let layout = Self { rows, max_context, operands, arena_offsets, arena_bytes };
+        let layout = Self { rows, unit, max_context, operands, arena_offsets, arena_bytes };
         layout.bytes()?;
         Ok(layout)
     }
@@ -224,7 +236,7 @@ pub fn graph_rows(verify: usize, capacity: usize) -> Vec<usize> {
 
 pub fn graphs(cfg: &KimiK3Config, lanes: usize, capacity: usize, slots: usize, verify: usize,
     resident: impl Fn(usize, usize) -> bool) -> Result<GraphSet> {
-    ensure!((1..=2).contains(&lanes) && (1..=4096).contains(&capacity)
+    ensure!((1..=2).contains(&lanes) && (1..=UNIT_ROWS_MAX).contains(&capacity)
         && (1..=64).contains(&slots) && verify <= 64, "Kimi graph geometry");
     let mut counts = [0; 2];
     for (rank, count) in counts.iter_mut().enumerate() {
@@ -295,7 +307,7 @@ pub fn prefill_shape(rows: usize, waves: usize) -> Result<crate::serving_capacit
 pub fn prefill_shape_with(rows: usize, waves: usize, unit: Option<usize>)
     -> Result<crate::serving_capacity::PrefillShape> {
     ensure!(waves > 0 && rows >= 64 * waves, "Kimi lane rows {rows} hold fewer than {waves} units");
-    let derived = if waves == 1 { rows.next_multiple_of(64).min(4096) } else { rows / waves / 64 * 64 };
+    let derived = if waves == 1 { rows.next_multiple_of(64).min(UNIT_ROWS_MAX) } else { rows / waves / 64 * 64 };
     let unit = unit.unwrap_or(derived);
     ensure!(unit * waves <= rows.next_multiple_of(64), "Kimi lane rows {rows} hold fewer than {waves} units of {unit}");
     crate::serving_capacity::PrefillShape { unit_rows: unit as u64, waves: waves as u64 }.validate()
@@ -314,7 +326,8 @@ pub fn code_demand(rank: usize, pending: u64, cublas_bytes: u64, lanes: usize) -
     Ok(Demand::new(rank as u8, Category::Workspace, "Kimi future loaded code and private head handles", bytes, Basis::Formula))
 }
 
-/// Exact FirstCapacity TP2 owner, using the shared EXL3 capacity arenas.
+/// Exact FirstCapacity TP2 owner, using the shared EXL3 capacity arenas. A
+/// TP2 FFN completes inside one unit's hook: `rows` is the unit.
 pub fn expert_workspace(package: &std::path::Path, rows: usize) -> Result<u64> {
     let capacities = cuteafd_core::Exl3RowPolicy::for_geometry(cuteafd_core::ExpertGeometry::KIMI_K3)
         .capacities(rows)?;
@@ -336,15 +349,24 @@ pub fn expert_package(manifest: &std::path::Path) -> Result<std::path::PathBuf> 
         .find(|path| path.is_dir()).context("Kimi installed TP2 expert workspace manifests missing")
 }
 
+/// Kimi's default prefill units (PLAN "Prefill contract"). Serving and the
+/// planner share it.
+pub const DEFAULT_PREFILL_UNIT_ROWS: usize = 2048;
+pub const DEFAULT_PREFILL_WAVES: usize = 2;
+
+/// `shape.waves` units of `shape.unit_rows` on one lane of `unit x waves` rows.
 pub fn baseline_demands(cfg: &KimiK3Config, manifest: &serde_json::Value,
-    rows: usize, context: usize, slots: usize, verify: usize, core: &super::core::CoreInventory,
-    heads: bool) -> Result<Vec<Demand>> {
-    let layout = NativeLaneLayout::new(cfg, rows, context, NativeScratch::from_manifest(manifest)?)?;
+    shape: crate::serving_capacity::PrefillShape, context: usize, slots: usize, verify: usize,
+    core: &super::core::CoreInventory, heads: bool) -> Result<Vec<Demand>> {
+    let shape = shape.validate()?;
+    let unit = usize::try_from(shape.unit_rows)?;
+    let rows = unit.checked_mul(usize::try_from(shape.waves)?).context("Kimi lane rows overflow")?;
+    let layout = NativeLaneLayout::new(cfg, rows, unit, context, NativeScratch::from_manifest(manifest)?)?;
     let owners = crate::placement::attention::alternating_owners(
         cfg.attention.iter().map(|kind| (*kind == KimiAttention::Mla, None)), 0)?;
-    let graphs = graphs(cfg, 1, rows, slots, verify, |rank, layer| cfg.attention[layer] == KimiAttention::Kda
+    let graphs = graphs(cfg, 1, unit, slots, verify, |rank, layer| cfg.attention[layer] == KimiAttention::Kda
         || heads || rank == usize::from(owners[layer]))?;
-    let mut demands = vec![spark_demand(prefill_shape(rows, 2)?, 0)];
+    let mut demands = vec![spark_demand(shape, 0)];
     for rank in 0..2 {
         demands.push(Demand::new(rank as u8, Category::Workspace, "Kimi lane 0 native operands",
             layout.bytes()? as u64, Basis::Exact));
@@ -352,10 +374,54 @@ pub fn baseline_demands(cfg: &KimiK3Config, manifest: &serde_json::Value,
             io_extents(cfg.vocab_size, rank, rows, core.get_weight("language_model.lm_head").is_some())
                 .into_iter().sum::<usize>() as u64, Basis::Exact));
         demands.push(graph_demand(&graphs, rank));
-        demands.push(exchange_demand(rows, rank as u8, super::core::needs_f32_partials(cfg, core), 0)?);
+        demands.push(exchange_demand(unit, rank as u8, super::core::needs_f32_partials(cfg, core), 0)?);
         // Active state and retained marks are charged by the caller's mark policy.
         demands.extend(kda_demands(cfg, slots, 1, 1, rank as u8)?.into_iter()
             .filter(|d| d.category == Category::Workspace));
     }
     Ok(demands)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cfg() -> KimiK3Config {
+        KimiK3Config::from_hf(&crate::plan::testing::kimi_k3_config()).unwrap()
+    }
+
+    #[test]
+    fn two_unit_lane_doubles_row_planes_and_keeps_unit_scratch() -> Result<()> {
+        let cfg = cfg();
+        let scratch = NativeScratch { kda: 1024, mla: [512, 0, 1024] };
+        let one = NativeLaneLayout::new(&cfg, 4096, 4096, 1_048_576, scratch)?;
+        let two = NativeLaneLayout::new(&cfg, 8192, 4096, 1_048_576, scratch)?;
+        assert_eq!(two.arena_bytes, one.arena_bytes, "hook-local scratch serves one unit");
+        assert_eq!(two.arena_offsets, one.arena_offsets);
+        for name in ["residual arena", "delta", "normalized", "ffn output", "expert combined",
+            "router logits", "route ids", "expert wire"] {
+            assert_eq!(two.operands[name], 2 * one.operands[name], "{name} spans the lane");
+        }
+        for name in ["gate-up", "activated", "KDA normalized", "KDA slots", "KDA first", "MLA slots",
+            "MLA query", "MLA attention", "MLA page table", "MLA lengths"] {
+            assert_eq!(two.operands[name], one.operands[name], "{name} is one unit's");
+        }
+        // Units never exceed the kernels' 4096 rows nor the lane; lanes hold two.
+        for (rows, unit) in [(8193, 4096), (8192, 4097), (2048, 4096), (4096, 0)] {
+            assert!(NativeLaneLayout::new(&cfg, rows, unit, 1_048_576, scratch).is_err(), "{rows}/{unit}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn prefill_shapes_derive_units_up_to_4096() -> Result<()> {
+        let unit = |rows, waves, explicit| prefill_shape_with(rows, waves, explicit).map(|s| s.unit_rows);
+        assert_eq!(unit(8192, 2, None)?, 4096);
+        assert_eq!(unit(8192, 2, Some(4096))?, 4096);
+        assert_eq!(unit(4096, 2, None)?, 2048);
+        assert_eq!(unit(8192, 1, None)?, 4096);
+        assert!(unit(8192, 2, Some(8192)).is_err(), "a unit is at most 4096 rows");
+        assert!(unit(4096, 2, Some(4096)).is_err(), "the lane holds both units");
+        Ok(())
+    }
 }

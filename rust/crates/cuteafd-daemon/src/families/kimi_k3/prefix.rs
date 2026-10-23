@@ -441,7 +441,7 @@ mod tests {
             for layouts in &mut inputs.lane_layouts {
                 for layout in layouts {
                     *layout = super::super::device::LaneLayout::new(
-                        &KimiK3Config::from_hf(&cuteafd_loader::plan::testing::kimi_k3_config())?, inputs.rows, context,
+                        &KimiK3Config::from_hf(&cuteafd_loader::plan::testing::kimi_k3_config())?, inputs.rows, (inputs.rows).min(4096), context,
                         super::super::device::NativeScratch { kda: 1024, mla: [512, 0, 1024] })?;
                 }
             }

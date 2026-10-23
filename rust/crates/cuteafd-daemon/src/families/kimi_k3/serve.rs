@@ -35,11 +35,13 @@ pub(crate) struct ServeArgs {
     /// Fixed draft depth; absent lets the shared policy choose up to the checkpoint width.
     #[arg(long, requires = "draft", value_parser = clap::value_parser!(u8).range(1..=7))]
     pub draft_fixed: Option<u8>,
-    /// Prefill unit rows (PLAN "Prefill contract"); the lane holds
-    /// `--prefill-waves` units, at most 4096 rows.
-    #[arg(long, default_value_t = 2048)] pub prefill_rows: usize,
+    /// Prefill unit rows (PLAN "Prefill contract"), at most 4096; the lane
+    /// holds `--prefill-waves` units, at most 8192 rows.
+    #[arg(long, default_value_t = cuteafd_loader::families::kimi_k3::allocation::DEFAULT_PREFILL_UNIT_ROWS)]
+    pub prefill_rows: usize,
     /// Prefill units in flight: Spark waves outstanding on the one transport.
-    #[arg(long, default_value_t = 2, value_parser = clap::value_parser!(u8).range(1..=4))]
+    #[arg(long, default_value_t = cuteafd_loader::families::kimi_k3::allocation::DEFAULT_PREFILL_WAVES as u8,
+        value_parser = clap::value_parser!(u8).range(1..=4))]
     pub prefill_waves: u8,
     #[command(flatten)] pub prefix: PrefixArgs,
     #[command(flatten)] pub decode_share: crate::shared::prefill_share::DecodeShareArgs,
@@ -67,8 +69,10 @@ impl ServeArgs {
             "Kimi context exceeds the compiled 1M extent");
         ensure!(self.spark_budget_gib.is_none_or(|gib| gib.is_finite() && gib > 0.0),
             "Kimi requires a finite positive estimated --spark-budget-gib");
-        ensure!(self.prefill_rows % 64 == 0 && (256..=4096).contains(&(self.prefill_rows * usize::from(self.prefill_waves))),
-            "Kimi --prefill-rows x --prefill-waves must be page aligned and hold 256..=4096 lane rows");
+        use cuteafd_loader::families::kimi_k3::allocation::{LANE_ROWS_MAX, UNIT_ROWS_MAX};
+        ensure!(self.prefill_rows % 64 == 0 && self.prefill_rows <= UNIT_ROWS_MAX
+            && (256..=LANE_ROWS_MAX).contains(&(self.prefill_rows * usize::from(self.prefill_waves))),
+            "Kimi --prefill-rows must be page aligned and at most {UNIT_ROWS_MAX}, and x --prefill-waves hold 256..={LANE_ROWS_MAX} lane rows");
         ensure!(self.prefix.prefix_partial == crate::shared::prefix::Toggle::Off,
             "Kimi serving requires exact prefix frontiers");
         ensure!(matches!(self.token_io.embed_placement, crate::shared::token_io::EmbedPlacement::Gpu),

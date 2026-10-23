@@ -244,7 +244,8 @@ fn full_run(args: GoldenArgs) -> Result<()> {
 }
 
 fn forward_chunks(tokens: usize, capacity: usize) -> Result<Vec<std::ops::Range<usize>>> {
-    ensure!((2..=16384).contains(&tokens) && (1..=4096).contains(&capacity),
+    ensure!((2..=16384).contains(&tokens)
+        && (1..=cuteafd_loader::families::kimi_k3::allocation::LANE_ROWS_MAX).contains(&capacity),
         "Kimi causal window/chunk extent differs");
     let count = tokens - 1;
     Ok((0..count).step_by(capacity).map(|first| first..(first + capacity).min(count)).collect())
@@ -414,8 +415,12 @@ fn native(args: &GoldenArgs, checkpoint: &cuteafd_loader::plan::Checkpoint,
     // SAFETY: sealed runner supplies the DSO; all borrowing owners drop before it.
     let library = Arc::new(unsafe { cuteafd_ffi::NativeLibrary::load(args.native_lib.as_ref().context("--native-lib required")?)? });
     let programs = library.programs()?.with_manifest(&args.manifest)?;
+    // Lane rows: the longest scored chunk, at most `waves` units (an explicit
+    // unit) or one 4096-row unit.
+    use cuteafd_loader::families::kimi_k3::allocation::UNIT_ROWS_MAX;
+    let lane = args.prefill_rows.map_or(UNIT_ROWS_MAX, |unit| unit * usize::from(args.prefill_waves));
     let rows = scoring.map_or(reference.tokens.len(), |windows| windows.iter().map(|w| w.tokens.len() - 1)
-        .max().unwrap_or(1).min(4096));
+        .max().unwrap_or(1).min(lane));
     let verify = args.verify_rows.map(usize::from);
     let graphs = verify.is_some() && args.graphs == "on";
     let super::startup::Loaded { engine, admission_free, admitted_bytes } = super::startup::load(
@@ -618,7 +623,7 @@ mod tests {
             scored += count;
         }
         assert_eq!(scored, 4096);
-        for (tokens, capacity) in [(1, 1), (16385, 4096), (513, 0), (513, 4097)] {
+        for (tokens, capacity) in [(1, 1), (16385, 4096), (513, 0), (513, 8193)] {
             assert!(forward_chunks(tokens, capacity).is_err());
         }
         Ok(())
@@ -799,7 +804,7 @@ mod tests {
             baseline: cuteafd_loader::placement::Baseline::Measured { free_bytes: (96 << 30) - reserve } }; 2],
             devices: [0, 1], peer_access: true, spark_ranks: 6, attention: None,
             requested_pool: Some(1_048_576), state_slots: slots, prefix_marks: marks, rows, lanes: 1, waves: 2, unit_rows: None,
-            lane_layouts: vec![std::array::from_fn(|_| super::super::device::LaneLayout::new(&cfg, rows,
+            lane_layouts: vec![std::array::from_fn(|_| super::super::device::LaneLayout::new(&cfg, rows, (rows).min(4096),
                 1048576, native_scratch).unwrap())], fixed,
             startup: (0..2).map(|rank| super::super::graphs::demand(&graph_set.inventory, rank)).collect(),
             pool_bounded: vec![], rtx: Some(rtx), spark_budget: Some(spark.clone()), draft: None, verify_rows: 0 })?;

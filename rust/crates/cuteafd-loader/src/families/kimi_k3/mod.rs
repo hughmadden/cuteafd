@@ -26,10 +26,9 @@ pub const SPARK_ESTIMATED_WORKSPACE_BYTES: u64 = 512 << 20;
 pub const SPARK_ESTIMATED_RESERVE_BYTES: u64 =
     cuteafd_core::memory_layout::SPARK_RUNTIME_RESIDUAL_BYTES + SPARK_ESTIMATED_WORKSPACE_BYTES;
 
-/// Target waves remain wide while the common MLA drafter consumes 2048-row slices.
-pub const DRAFT_TARGET_TAP_ROWS: usize = 4096;
-
-pub fn draft_bridge_demands(layout: &crate::formats::dflash::MlaDraftRuntimeLayout)
+/// Target taps for one prefill call (`rows` lane rows) while the common MLA
+/// drafter consumes 2048-row slices.
+pub fn draft_bridge_demands(layout: &crate::formats::dflash::MlaDraftRuntimeLayout, rows: usize)
     -> anyhow::Result<Vec<crate::placement::Demand>> {
     use anyhow::Context;
     let mut demands = crate::placement::draft::remote_dflash_bridge_demands(
@@ -37,7 +36,7 @@ pub fn draft_bridge_demands(layout: &crate::formats::dflash::MlaDraftRuntimeLayo
         layout.target_taps().len() as u64, layout.capacity().block_rows as u64, 1)?.demands;
     let taps = demands.iter_mut().find(|d| d.group == "DFlash bridge taps")
         .context("Kimi bridge tap inventory missing")?;
-    taps.bytes = (DRAFT_TARGET_TAP_ROWS * layout.target_taps().len() * layout.target_hidden() * 2) as u64;
+    taps.bytes = (rows * layout.target_taps().len() * layout.target_hidden() * 2) as u64;
     Ok(demands)
 }
 

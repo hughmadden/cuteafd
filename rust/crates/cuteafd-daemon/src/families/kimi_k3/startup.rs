@@ -60,8 +60,13 @@ pub(crate) fn load<'a>(library: &'a Arc<cuteafd_ffi::NativeLibrary>,
     ensure!(crate::shared::peer_split::probed_device(library, options.devices[0], Some(options.devices[1]))?
         == Some(options.devices[1]), "Kimi TP2 requires bidirectional peer access");
     let devices = [options.devices[0], options.devices[1]].map(|id| Device { library, id });
+    let rows = options.rows;
+    // Lane rows hold `waves` units; every kernel launch, hook-local scratch,
+    // peer exchange, hop and Spark wave serves one unit.
+    let unit = cuteafd_loader::families::kimi_k3::allocation::prefill_shape_with(rows, options.waves,
+        options.prefill_rows)?.unit_rows as usize;
     let native = devices.map(|device| NativePrograms::load_with_core(device, full, programs, options.ffn_mode,
-        options.cache_format, &core, options.rows).map(Rc::new));
+        options.cache_format, &core, unit).map(Rc::new));
     let [zero, one] = native;
     let native = [zero?, one?];
     let draft_layout = options.draft.as_ref().map(|draft| devices[1].run(||
@@ -72,10 +77,6 @@ pub(crate) fn load<'a>(library: &'a Arc<cuteafd_ffi::NativeLibrary>,
         Ok([MlaDraft::load(programs, "kimik3", MlaDraftWindow::Full, options.cache_format)?,
             MlaDraft::load(programs, "kimik3", MlaDraftWindow::Sliding4096, options.cache_format)?])
     })).transpose()?;
-    let rows = options.rows;
-    // The widest prefill wave is one unit; the workers' rings are sized for it.
-    let unit = cuteafd_loader::families::kimi_k3::allocation::prefill_shape_with(rows, options.waves,
-        options.prefill_rows)?.unit_rows as usize;
     let spark_budget_gib = options.spark_budget_gib.unwrap_or(
         cuteafd_loader::families::kimi_k3::SPARK_DEFAULT_BUDGET_BYTES as f64 / (1u64 << 30) as f64);
     ensure!(spark_budget_gib.is_finite() && spark_budget_gib > 0.0
@@ -95,15 +96,15 @@ pub(crate) fn load<'a>(library: &'a Arc<cuteafd_ffi::NativeLibrary>,
         let tiers = catalog.exl3().context("Kimi TP2 experts require EXL3 checkpoint")?.decoder_tiers();
         let package = crate::shared::experts::exl3::aot_layout_directory(
             options.native_lib, tiers, "rtx-tp2");
-        let mut inventory = admission::plan_rtx(cfg, &catalog, package, rows, routed)?;
+        let mut inventory = admission::plan_rtx(cfg, &catalog, package, unit, routed)?;
         inventory.layers = options.rtx_expert_layers;
         Some(inventory)
     };
     let expert_modules = if let Some(inventory) = &rtx {
         use crate::shared::experts::rtx::{exl3::Exl3Tp2, RtxSelectionPolicy};
-        [Some(Exl3Tp2::preload_tp2_modules(devices[0], &inventory.package, rows,
+        [Some(Exl3Tp2::preload_tp2_modules(devices[0], &inventory.package, unit,
             ExpertGeometry::KIMI_K3, RtxSelectionPolicy::FirstCapacity)?),
-         Some(Exl3Tp2::preload_tp2_modules(devices[1], &inventory.package, rows,
+         Some(Exl3Tp2::preload_tp2_modules(devices[1], &inventory.package, unit,
             ExpertGeometry::KIMI_K3, RtxSelectionPolicy::FirstCapacity)?)]
     } else { [None, None] };
     let diagnostics = std::env::var("CUTEAFD_PEER_WAIT_DIAGNOSTICS").is_ok_and(|v| v == "1");
@@ -115,16 +116,16 @@ pub(crate) fn load<'a>(library: &'a Arc<cuteafd_ffi::NativeLibrary>,
         library.v41_compact_reducer()?.require_plane_reduction(6)?;
         Ok(())
     })?;
-    let lane_layouts = vec![[native[0].lane_layout(full, rows, options.max_context)?,
-        native[1].lane_layout(full, rows, options.max_context)?]];
+    let lane_layouts = vec![[native[0].lane_layout(full, rows, unit, options.max_context)?,
+        native[1].lane_layout(full, rows, unit, options.max_context)?]];
     let verify_rows = match options.verify_rows {
         0 => options.draft.as_ref().map(super::draft::Options::verify_rows).transpose()?.unwrap_or(0),
         rows => rows,
     };
-    let graph_set = options.graphs.then(|| super::graphs::owned_inventory(cfg, 1, rows, options.slots, verify_rows)).transpose()?;
-    let mut fixed = exchange_demands(rows, diagnostics, f32_partials)?;
+    let graph_set = options.graphs.then(|| super::graphs::owned_inventory(cfg, 1, unit, options.slots, verify_rows)).transpose()?;
+    let mut fixed = exchange_demands(unit, diagnostics, f32_partials)?;
     if let Some(layout) = &draft_layout {
-        fixed.extend(super::draft::bridge_demands(layout)?);
+        fixed.extend(super::draft::bridge_demands(layout, rows)?);
         fixed.push(cuteafd_loader::families::kimi_k3::draft_probe_demand(cfg.layers, cfg.topk, rows.min(64))?);
         if core.projections.contains_key("language_model.lm_head") {
             fixed.extend(cuteafd_loader::families::kimi_k3::core::draft_head_demand(&core,
@@ -171,7 +172,7 @@ pub(crate) fn load<'a>(library: &'a Arc<cuteafd_ffi::NativeLibrary>,
         .collect::<Vec<_>>();
     let streams = [Rc::new(Stream::new(devices[0])?), Rc::new(Stream::new(devices[1])?)];
     let ranks = streams.each_ref().map(|s| RankDevice { device: s.device.id, stream: s.raw });
-    let peer = devices[0].run(|| PeerExchange::new_abortable(library, ranks, 1, exchange_recv_bytes(rows,f32_partials)?))?;
+    let peer = devices[0].run(|| PeerExchange::new_abortable(library, ranks, 1, exchange_recv_bytes(unit,f32_partials)?))?;
     let mut hops = devices[0].run(|| HopLink::new(library, ranks, plan.hops(), plan.spec()))?;
     hops.attach_abort([peer.abort_word(0)?.context("Kimi missing abort owner")?,
         peer.abort_word(1)?.context("Kimi missing abort owner")?])?;

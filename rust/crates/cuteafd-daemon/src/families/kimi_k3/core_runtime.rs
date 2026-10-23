@@ -345,33 +345,34 @@ mod runtime_layout_tests {
         }
         let metadata=serde_json::json!({"abi_version":1,"row_policies":policies});
         let manifest=serde_json::json!({"programs":programs,"families":{"kimi_k6_dense":metadata}});
-        for rows in [1,16,63,64,4096] {
+        // `rows` lane rows of `unit`-row units: one-unit lanes and the 4096 x 2 lane.
+        for (rows,unit) in [(1,1),(16,16),(63,63),(64,64),(4096,4096),(8192,4096)] {
             for on in [false,true] {
                 let empty=CoreInventory::default();
                 let core=if on {&inventory}else{&empty};
-                let charged=CoreCharges::from_package(&cfg,core,rows,&manifest)?;
+                let charged=CoreCharges::from_package(&cfg,core,rows,unit,&manifest)?;
                 let mut runtime:Option<ProjectionLayout>=None;
                 if on {
                     for ((k,n,side,_),()) in &geometries {
-                        let live=if *n==cfg.vocab_size {rows.min(64)}else{rows};
+                        let live=if *n==cfg.vocab_size {unit.min(64)}else{unit};
                         let w=DenseTrellisGeometry{input:*k,output:*n,bits:6,side:*side,rows:live,
                             input_dtype:TrellisDType::Bf16,output_dtype:TrellisDType::Bf16}.workspace()?;
                         let extents=BTreeMap::from([("rotated",w.rotated),("table",w.pointer_table),
                             ("scales",w.block_scales),("partial",w.partial),("accumulator",w.accumulator)]);
-                        let layout=ProjectionLayout{extents,rows};
+                        let layout=ProjectionLayout{extents,rows:unit};
                         if let Some(runtime)=&mut runtime {runtime.merge(&layout)?;}else{runtime=Some(layout);}
                     }
                 }
                 assert_eq!(charged.projection.as_ref().map(|p|&p.extents),runtime.as_ref().map(|p|&p.extents));
-                assert_eq!(charged.receive,super::super::startup::exchange_demands(rows,false,on)?[0].bytes as usize
+                assert_eq!(charged.receive,super::super::startup::exchange_demands(unit,false,on)?[0].bytes as usize
                     -256-256-(((cuteafd_loader::placement::HOP_SLOTS+1)*16)as usize).max(256));
-                let expected_stages=if on {core::lane_extents(rows,1024,4096,2048,2048)?}else{BTreeMap::new()};
+                let expected_stages=if on {core::lane_extents(rows,unit,1024,4096,2048,2048)?}else{BTreeMap::new()};
                 assert_eq!(charged.stages,expected_stages);
                 let sum=charged.demands()?.iter().filter(|d|d.gpu==0).map(|d|d.bytes).sum::<u64>();
                 assert_eq!(sum,runtime.as_ref().map_or(Ok(0),|p|p.bytes())? as u64
                     +charged.stage_bytes as u64+charged.receive as u64);
                 if on {
-                    let base = cuteafd_loader::families::kimi_k3::allocation::NativeLaneLayout::new(&cfg, rows,
+                    let base = cuteafd_loader::families::kimi_k3::allocation::NativeLaneLayout::new(&cfg, rows, unit,
                         1_048_576, cuteafd_loader::families::kimi_k3::allocation::NativeScratch::from_manifest(&manifest)?)?;
                     assert_eq!(charged.stage_bytes, base.clone().with_core_stages(expected_stages)?.bytes()? - base.bytes()?);
                 }
@@ -381,7 +382,7 @@ mod runtime_layout_tests {
         let mut duplicate=manifest.clone();
         let first=duplicate["families"]["kimi_k6_dense"]["row_policies"][0].clone();
         duplicate["families"]["kimi_k6_dense"]["row_policies"].as_array_mut().unwrap().push(first);
-        assert!(CoreCharges::from_package(&cfg,&inventory,64,&duplicate).is_err());
+        assert!(CoreCharges::from_package(&cfg,&inventory,64,64,&duplicate).is_err());
         Ok(())
     }
 

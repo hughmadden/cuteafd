@@ -372,13 +372,16 @@ impl<'a> Engine<'a> {
             let metadata = sequences.iter().map(|(placement, tokens)| SequenceRows {
                 slot: placement.slot, start: placement.len, rows: tokens.len(), pages: &placement.units,
             }).collect::<Vec<_>>();
-            for local in &mut lanes.local[0] { local.stage_attention(&metadata, pool)?; }
+            // Unit calls stage each unit's metadata inside its hooks; a single
+            // pass stages its whole step (at most one unit) here.
+            let unit_call = !speculative && sequences.len() == 1 && rows > 64;
+            if !unit_call { for local in &mut lanes.local[0] { local.stage_attention(&metadata, pool)?; } }
             let tokens = sequences.iter().flat_map(|(_, tokens)| tokens.iter().copied()).collect::<Vec<_>>();
             lanes.io[0][0].embed(&tokens, lanes.local[0][0].buffer("delta")?)?;
             let Lanes { local, routed, io, experts } = &mut *lanes;
             for binding in &mut local[0] { binding.enable_replay(graphed); }
             let units = self.prefill_units(rows)?;
-            let result = if !speculative && sequences.len() == 1 && rows > 64 {
+            let result = if unit_call {
                 self.execution.run_units(scope, &self.peer, &self.hops, &mut local[0],
                     &mut routed[0], &mut experts[0], &units, self.prefill.waves, &metadata[0], pool,
                     self.draft.as_deref()).map(|output| vec![output])
@@ -508,7 +511,8 @@ impl<'a> Engine<'a> {
         ensure!(self.provisional.borrow().is_none(), "Kimi diagnostic cannot overwrite pending verify");
         submit_scoped(|| self.peer.require_live(), || self.shutdown(), |scope| {
             let mut lanes = self.lanes.try_borrow_mut()?;
-            ensure!(!tokens.is_empty(), "Kimi diagnostic prefix has no tokens");
+            ensure!(!tokens.is_empty() && tokens.len() <= self.prefill.unit_rows,
+                "Kimi diagnostic prefix has no tokens or exceeds one prefill unit");
             let sequences = [SequenceRows { slot: 0, start: 0, rows: tokens.len(), pages }];
             for local in &mut lanes.local[0] { local.stage_attention(&sequences, pool)?; }
             lanes.io[0][0].embed(tokens, lanes.local[0][0].buffer("delta")?)?;
@@ -558,17 +562,19 @@ impl<'a> Engine<'a> {
             ensure!(!tokens.is_empty() && tokens.len() == sequences.len() && tokens.len() <= lanes.local.len(),
                 "Kimi forward token/sequence lane count");
             let rows = tokens.iter().map(Vec::len).collect::<Vec<_>>();
+            let unit_call = tokens.len() == 1 && sequences[0].len() == 1 && rows[0] > 64;
             for (lane, ids) in tokens.iter().enumerate() {
                 ensure!(!ids.is_empty(), "Kimi forward has an empty lane");
                 for local in &mut lanes.local[lane] {
                     ensure!(sequences[lane].iter().map(|sequence| sequence.rows).sum::<usize>() == ids.len(),
                         "Kimi forward sequence rows differ from tokens");
-                    local.stage_attention(&sequences[lane], pool)?;
+                    // Unit calls stage each unit's metadata inside its hooks.
+                    if !unit_call { local.stage_attention(&sequences[lane], pool)?; }
                 }
                 lanes.io[lane][0].embed(ids, lanes.local[lane][0].buffer("delta")?)?;
             }
             let Lanes { local, routed, io, experts } = &mut *lanes;
-            let normalized = if tokens.len() == 1 && sequences[0].len() == 1 && rows[0] > 64 {
+            let normalized = if unit_call {
                 let units = self.prefill_units(rows[0])?;
                 vec![self.execution.run_units(scope, &self.peer, &self.hops, &mut local[0],
                     &mut routed[0], &mut experts[0], &units, self.prefill.waves, &sequences[0][0], pool, None)?]
