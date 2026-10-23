@@ -181,6 +181,9 @@ struct MainExecution<'e, 'a> {
     runtime: tokio::runtime::Runtime,
     routed_reply: Allocation<'a>,
     pinned: Vec<RefCell<HostAllocation<'a>>>,
+    /// Per rank: recorded after the route copies into `pinned`; the host waits
+    /// on it alone, never the stream (another unit's work may be queued behind).
+    routes_ready: Vec<RefCell<crate::shared::memory::device::Event<'a>>>,
     rows: usize,
     inventory: Vec<Inventory>,
     requests: Cell<u64>,
@@ -409,6 +412,8 @@ impl<'e, 'a> MainExecution<'e, 'a> {
         let bytes = RouteStaging::new(usize::try_from(ownership.execution().spec().rows)?, 8, H * 2)?.bytes;
         let pinned = devices.iter().map(|device| HostAllocation::new(device.library, bytes).map(RefCell::new))
             .collect::<Result<Vec<_>>>()?;
+        let routes_ready = devices.iter().map(|&device| crate::shared::memory::device::Event::new(device).map(RefCell::new))
+            .collect::<Result<Vec<_>>>()?;
         let mut inventory = Vec::new();
         for layer in 0..count {
             let mut state = Inventory { weights: Vec::new(), kv: Vec::new(),
@@ -462,7 +467,7 @@ impl<'e, 'a> MainExecution<'e, 'a> {
         let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
         let execution = Self { ownership, native, caches, stages, exchange,
             sequence: RefCell::new(HeadSequence::new(0)?), pending_wave: RefCell::new(std::collections::VecDeque::new()), transport: RefCell::new(transport), runtime, routed_reply,
-            pinned, rows, inventory, requests: Cell::new(0), placement_version,
+            pinned, routes_ready, rows, inventory, requests: Cell::new(0), placement_version,
             terminal_output: Cell::new(None), poison_scratch: Cell::new(false),
             diagnostic_outputs: RefCell::new(std::collections::BTreeMap::new()) };
         if count == 92 { execution.validate_replications()?; }
@@ -991,15 +996,23 @@ impl<E: CopyEngine> PipelineKernels for Bindings<'_, '_, '_, '_, '_, E> {
                         ensure!(wave.is_none(), "Step-5 duplicate routed Spark wave");
                         let layout = RouteStaging::new(self.rows(), 8, H * 2)?;
                         let host = execution.pinned[rank].borrow();
+                        let mut ready = execution.routes_ready[rank].borrow_mut();
                         self.step.compose(rank, ffn, |ffn, meta| {
                             meta.stream.device.run(|| {
-                                // SAFETY: pinned arena belongs to this rank; next write follows wait and consumed-event drainage.
+                                // SAFETY: pinned arena belongs to this rank; its previous bytes were
+                                // copied into an owned request before the previous dispatch returned.
                                 unsafe { layout.enqueue(meta.stream.device.library, host.buffer, ffn.wave_inputs(), meta.stream.raw) }
                             })?;
-                            // Both head publications were queued before either merge. No future
-                            // publication is needed for this stream's staging completion.
-                            meta.stream.drain()
+                            ready.record(meta.stream)
                         })?;
+                        // The shared expert queues behind the route copies and runs
+                        // while the host builds and dispatches the request.
+                        self.step.compose(rank, ffn, |ffn, meta| ffn.shared_on(meta.rows, meta.stream))?;
+                        // Wait for this unit's route copies only, never the stream:
+                        // another unit's queued work must not serialize the wave.
+                        // SAFETY: the event was recorded on this rank's lane stream above.
+                        ready.device.run(|| unsafe { ready.device.library.cuda_event_synchronize(ready.raw) })?;
+                        drop(ready);
                         let routes = layout.routes(host.bytes())?;
                         let wire = bytes::Bytes::copy_from_slice(layout.wire(host.bytes())?);
                         let descriptors = self.step.expert_rows(self.kind)?;
@@ -1015,10 +1028,11 @@ impl<E: CopyEngine> PipelineKernels for Bindings<'_, '_, '_, '_, '_, E> {
                         let ticket = device.run(|| link.get_mut().dispatch(&request))?;
                         execution.pending_wave.borrow_mut().push_back(ticket);
                         wave = Some(rank);
+                    } else {
+                        self.step.compose(rank, ffn, |ffn, meta| {
+                            ffn.shared_on(meta.rows, meta.stream)
+                        })?;
                     }
-                    self.step.compose(rank, ffn, |ffn, meta| {
-                        ffn.shared_on(meta.rows, meta.stream)
-                    })?;
                 }
             }
             self.current[rank] = Some(local.output());
