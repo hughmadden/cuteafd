@@ -357,6 +357,12 @@ pub(crate) struct PlanArgs {
     pub(crate) full_prefill_logits: bool,
     /// Prefill units in flight for --layout (0: the family default).
     #[arg(long, default_value_t = 0)]
+<<<<<<< HEAD
+=======
+    pub(crate) prefill_lanes: u64,
+    /// Continuous prefill waves on one transport (Qwen).
+    #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u64).range(1..=4))]
+>>>>>>> db53024d1 (Bind Qwen Spark prefill units to shared hooks and admission)
     pub(crate) prefill_waves: u64,
     /// Rows one continuous prefill call streams for --layout (0: the family
     /// default). Shared by every units-span family (launcher PREFILL_SPAN_ROWS).
