@@ -2473,6 +2473,9 @@ impl VerbsHostProtocolV2PersistentClientSession {
         config: &TcpTransportConfig,
         timing_enabled: bool,
     ) -> Result<bool> {
+        if let Some(ring) = &mut self.retained_response_ring {
+            ring.drain(&self.endpoint, self.response_ring)?;
+        }
         let poll_started = timing_enabled.then(Instant::now);
         let stats = self.endpoint.try_poll(
             self.request_send_in_flight as u32,
@@ -2591,8 +2594,11 @@ impl VerbsHostProtocolV2PersistentClientSession {
         let copy_recv_ms = elapsed_ms_optional(copy_started);
         let post_recv_started = timing_enabled.then(Instant::now);
         if !matches!(&response_frame, VerbsHostProtocolV2ResponseFrame::Registered(_)) {
-            self.endpoint.post_recv_at(response_recv_offset, self.response_ring.slot_capacity_bytes,
-                                      VERBS_HOST_RECV_WR_ID + response_recv_slot as u64)?;
+            match &mut self.retained_response_ring {
+                Some(ring) => ring.copied(&self.endpoint, self.response_ring, response_recv_slot)?,
+                None => self.endpoint.post_recv_at(response_recv_offset, self.response_ring.slot_capacity_bytes,
+                    VERBS_HOST_RECV_WR_ID + response_recv_slot as u64)?,
+            }
         }
         self.response_recv_sequence = self.response_recv_sequence.wrapping_add(1);
         let post_recv_ms = elapsed_ms_optional(post_recv_started);

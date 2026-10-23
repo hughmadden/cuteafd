@@ -631,6 +631,9 @@ impl<'a> V41Tp4Planes<'a> {
 mod tcp_tests;
 
 #[cfg(test)]
+pub(crate) fn test_request(rows: u32) -> crate::ExpertProtocolV2Request { tests::request(rows) }
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::{
@@ -839,7 +842,7 @@ mod tests {
         Ok(())
     }
 
-    pub(super) fn request(rows: u32) -> ExpertProtocolV2Request {
+    pub(crate) fn request(rows: u32) -> ExpertProtocolV2Request {
         let mut request = ExpertProtocolV2Request::new(
             91,
             17,

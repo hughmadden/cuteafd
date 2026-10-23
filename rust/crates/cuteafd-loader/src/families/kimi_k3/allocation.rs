@@ -276,9 +276,29 @@ pub fn io_extents(vocab: usize, rank: usize, rows: usize, core_head: bool) -> [u
     else { [0, rows.min(64) * vocab * 4, if core_head { 0 } else { 4 << 20 }] }
 }
 
-pub fn spark_demand(rows: usize, lane: usize) -> Demand {
+/// One return slot per prefill wave in flight, each a unit of latent rows
+/// from all six ranks (`prefill_return_bytes`).
+pub fn spark_demand(shape: crate::serving_capacity::PrefillShape, lane: usize) -> Demand {
     Demand::new(1, Category::Workspace, format!("Kimi Spark lane {lane} latent intake"),
-        crate::serving_capacity::spark_intake_bytes(1, 6, rows as u64, 3584), Basis::Exact)
+        crate::serving_capacity::prefill_return_bytes(shape.waves, shape.unit_rows, 6, 3584), Basis::Exact)
+}
+
+/// Kimi's lane operands are row planes of one prefill call: each unit owns its
+/// rows of them. With `waves` in flight a unit is at most `rows / waves` rows
+/// (page aligned), and each in-flight wave holds one return slot of that size.
+pub fn prefill_shape(rows: usize, waves: usize) -> Result<crate::serving_capacity::PrefillShape> {
+    prefill_shape_with(rows, waves, None)
+}
+
+/// `unit` overrides the derived unit rows; it must be page aligned and the
+/// lane must hold `waves` of them (one wave of up to the lane is always valid).
+pub fn prefill_shape_with(rows: usize, waves: usize, unit: Option<usize>)
+    -> Result<crate::serving_capacity::PrefillShape> {
+    ensure!(waves > 0 && rows >= 64 * waves, "Kimi lane rows {rows} hold fewer than {waves} units");
+    let derived = if waves == 1 { rows.next_multiple_of(64).min(4096) } else { rows / waves / 64 * 64 };
+    let unit = unit.unwrap_or(derived);
+    ensure!(unit * waves <= rows.next_multiple_of(64), "Kimi lane rows {rows} hold fewer than {waves} units of {unit}");
+    crate::serving_capacity::PrefillShape { unit_rows: unit as u64, waves: waves as u64 }.validate()
 }
 
 pub fn exchange_demand(rows: usize, rank: u8, f32_partials: bool, progress: usize) -> Result<Demand> {
@@ -324,7 +344,7 @@ pub fn baseline_demands(cfg: &KimiK3Config, manifest: &serde_json::Value,
         cfg.attention.iter().map(|kind| (*kind == KimiAttention::Mla, None)), 0)?;
     let graphs = graphs(cfg, 1, rows, slots, verify, |rank, layer| cfg.attention[layer] == KimiAttention::Kda
         || heads || rank == usize::from(owners[layer]))?;
-    let mut demands = vec![spark_demand(rows, 0)];
+    let mut demands = vec![spark_demand(prefill_shape(rows, 2)?, 0)];
     for rank in 0..2 {
         demands.push(Demand::new(rank as u8, Category::Workspace, "Kimi lane 0 native operands",
             layout.bytes()? as u64, Basis::Exact));

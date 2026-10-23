@@ -8,6 +8,7 @@ use crate::{
     TcpTransportConfig, VerbsHostProtocolV2ResponsePayload,
 };
 use anyhow::{ensure, Result};
+use std::collections::VecDeque;
 use std::net::SocketAddr;
 
 fn poll_quantum(rows: &[ExpertProtocolV2RowDescriptor]) -> std::time::Duration {
@@ -27,8 +28,10 @@ pub struct SparkExperts {
     capacity: u32,
     max_frame_bytes: usize,
     world: SparkWorld,
-    /// A [`SparkExpertWave`] was dispatched and not yet received.
-    wave_open: bool,
+    /// [`SparkExpertWave`]s dispatched and not yet received, oldest first by
+    /// sequence; at most the clients' admitted wave count.
+    open_waves: VecDeque<u64>,
+    wave_sequence: u64,
     /// The opt-in route log (`PROFILE=expert-routes`); `None` when off.
     route_tap: Option<crate::route_log::Tap>,
 }
@@ -41,6 +44,7 @@ pub struct SparkExperts {
 pub struct SparkExpertWave {
     receiver: V41Tp4ChunkReceiver,
     poll_quantum: std::time::Duration,
+    sequence: u64,
 }
 
 /// How a received wave's rank planes arrived.
@@ -108,7 +112,8 @@ impl SparkExperts {
             capacity,
             max_frame_bytes: config.max_frame_bytes,
             world,
-            wave_open: false,
+            open_waves: VecDeque::new(),
+            wave_sequence: 0,
             route_tap: crate::route_log::Tap::from_global(),
         })
     }
@@ -118,6 +123,14 @@ impl SparkExperts {
     pub fn world_size(&self) -> usize {
         self.executors.len()
     }
+    /// Admit up to `waves` outstanding [`SparkExpertWave`]s, received oldest
+    /// first. The workers already serve each QP's requests in post order.
+    pub fn set_max_waves(&mut self, waves: usize) -> Result<()> {
+        ensure!(self.open_waves.is_empty(), "cannot change wave admission with waves in flight");
+        self.clients.set_max_waves(waves)
+    }
+    pub fn max_waves(&self) -> usize { self.clients.max_waves() }
+    pub fn open_waves(&self) -> usize { self.open_waves.len() }
     /// Immutable metadata returned by the workers' completed persistent bootstrap.
     pub fn installed_grouping(&self) -> Result<Vec<crate::worker_selection::InstalledExpertGrouping>> {
         self.clients.installed_grouping()
@@ -132,7 +145,7 @@ impl SparkExperts {
     /// transport will dispatch — the same one its start-up warm-up sends. Only
     /// the control bootstrap reaches a worker; the rows are never sent.
     pub fn bootstrap(&mut self, request: &ExpertProtocolV2Request) -> Result<()> {
-        ensure!(!self.wave_open, "cannot bootstrap a Spark transport with a wave in flight");
+        ensure!(self.open_waves.is_empty(), "cannot bootstrap a Spark transport with a wave in flight");
         ensure!(request.header.row_count <= self.capacity,
             "Spark bootstrap request of {} rows exceeds the transport's {}-row capacity",
             request.header.row_count, self.capacity);
@@ -183,7 +196,7 @@ impl SparkExperts {
             }
             None => vec![None; world],
         };
-        self.wave_open = false;
+        self.open_waves.clear();
         self.clients.set_landing(landing)
     }
 
@@ -204,13 +217,14 @@ impl SparkExperts {
             }
             None => vec![None; world],
         };
-        self.wave_open = false;
+        self.open_waves.clear();
         self.clients.set_write_targets(write)
     }
 
     /// Write mode: posts `request` to every rank without waiting for anything.
     pub fn post_written(&mut self, request: &ExpertProtocolV2Request) -> Result<()> {
-        if std::mem::take(&mut self.wave_open) {
+        if !self.open_waves.is_empty() {
+            self.open_waves.clear();
             self.reset_connections();
         }
         ensure!((request.header.flags & V41_NATIVE_GROUP_REQUEST_FLAG != 0)
@@ -235,7 +249,7 @@ impl SparkExperts {
     /// `stagger`: post the ranks' requests one after another, each once the
     /// previous rank's has left, instead of all at once.
     pub fn enable_egress(&mut self, bytes: usize, stagger: bool) -> Result<cuteafd_ffi::CuteafdHostBuffer> {
-        self.wave_open = false;
+        self.open_waves.clear();
         self.clients.enable_egress(bytes, stagger)
     }
 
@@ -277,6 +291,9 @@ impl SparkExperts {
         &'c mut self,
         request: &'r ExpertProtocolV2Request,
     ) -> Result<SparkExpertPending<'c, 'r>> {
+        ensure!(self.open_waves.is_empty() || self.clients.max_waves() == 1,
+            "a borrowed Spark dispatch cannot follow outstanding waves");
+        if !self.open_waves.is_empty() { self.open_waves.clear(); self.reset_connections(); }
         let receiver = self.post(request)?;
         Ok(SparkExpertPending {
             receiver,
@@ -289,10 +306,12 @@ impl SparkExperts {
 
     /// [`Self::dispatch`] returning an owned [`SparkExpertWave`]. The clients
     /// keep their own copy of the request, so it need not outlive the wave.
+    /// Up to [`Self::max_waves`] may be outstanding; receive them in dispatch order.
     pub fn dispatch_wave(&mut self, request: &ExpertProtocolV2Request) -> Result<SparkExpertWave> {
         let receiver = self.post(request)?;
-        self.wave_open = true;
-        Ok(SparkExpertWave { receiver, poll_quantum: poll_quantum(&request.rows) })
+        self.wave_sequence += 1;
+        self.open_waves.push_back(self.wave_sequence);
+        Ok(SparkExpertWave { receiver, poll_quantum: poll_quantum(&request.rows), sequence: self.wave_sequence })
     }
 
     /// Accepts every row of `wave`, which this transport dispatched; the sink
@@ -312,6 +331,8 @@ impl SparkExperts {
     where
         F: FnMut(usize, u32, VerbsHostProtocolV2ResponsePayload) -> Result<()>,
     {
+        ensure!(self.open_waves.front() == Some(&wave.sequence),
+            "Spark waves must be received in dispatch order");
         // Keep the polling loop in this owned receive future: decode previously
         // lost ~3% when an extra drain future sat on this hot path. All shared
         // Spark intakes use this path, including device-landing receipts.
@@ -354,15 +375,24 @@ impl SparkExperts {
         };
         if let Err(error) = &result {
             crate::health::record_failure(format!("expert receive failed: {error:#}"));
+            self.open_waves.clear();
             self.reset_connections();
+        } else {
+            self.open_waves.pop_front();
         }
-        self.wave_open = false;
         result
     }
 
     fn post(&mut self, request: &ExpertProtocolV2Request) -> Result<V41Tp4ChunkReceiver> {
         crate::health::ensure_available()?;
-        if std::mem::take(&mut self.wave_open) {
+        // A dropped wave is not received; at single-wave admission the next
+        // post resets its QPs as before. Past the admitted count, refuse.
+        if !self.open_waves.is_empty() && self.open_waves.len() >= self.clients.max_waves() {
+            if self.clients.max_waves() > 1 {
+                anyhow::bail!("Spark transport has {} outstanding waves, the admitted maximum",
+                    self.open_waves.len());
+            }
+            self.open_waves.clear();
             self.reset_connections();
         }
         let flagged = request.header.flags & V41_NATIVE_GROUP_REQUEST_FLAG != 0;
