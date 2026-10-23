@@ -1,7 +1,8 @@
 //! Native serving allocation ledger when program metadata is available;
 //! otherwise an explicitly unqualified checkpoint-header lower bound.
 use super::{admission, Model};
-use crate::families::{minimax_m3::{cache::MiniMaxCacheLayout, config::MiniMaxM3Config}, qwen4::Qwen4KvCache};
+use crate::families::{minimax_m3::{cache::MiniMaxCacheLayout, config::MiniMaxM3Config,
+    dspark::{DraftMemory, DsparkContract}}, qwen4::Qwen4KvCache};
 use crate::placement::{ArchContext, AttentionPlacement};
 use crate::plan::{Component, ExpertPlacement, Hint, MediaMode, PlanReport};
 use crate::plan::encoder::{encoder_placement, EncoderGpuBudget, EncoderHardware, EncoderKind, EncoderSparkBudget};
@@ -215,7 +216,7 @@ fn exact_layout(model: &Model, input: &crate::plan::PlanInput, report: &mut Plan
     ensure!(model.complete, "MiniMax native admission requires complete checkpoint headers");
     ensure!(opts.rtx_bytes.len() == 1, AdmissionError::Unsupported("two-GPU serving"));
     ensure!(!opts.host_embedding, AdmissionError::Unsupported("host embedding"));
-    ensure!(opts.native_mtp_layers == 0 && opts.drafter_bytes == 0, AdmissionError::Unsupported("speculation; select off"));
+    ensure!(opts.drafter_bytes == 0, AdmissionError::Unsupported("external drafter; use the bundled DSpark"));
     ensure!(report.requested_attention.is_none_or(|p| p == AttentionPlacement::Heads), AdmissionError::Unsupported("attention placement"));
     ensure!(report.audio == MediaMode::Off, AdmissionError::Unsupported("audio"));
     let cfg = model.cfg();
@@ -225,6 +226,11 @@ fn exact_layout(model: &Model, input: &crate::plan::PlanInput, report: &mut Plan
         cfg.max_position as u64 } else { opts.context_tokens }, spark_ranks: requested.spark_ranks() };
     sizing.validate(cfg)?;
     ensure!(opts.state_slots.is_none_or(|n| n == sequences as u64), AdmissionError::Unsupported("sequence-slot mismatch"));
+    let arch = ArchContext::coordinator(opts.rtx_bytes[0], None);
+    let draft = if opts.native_mtp_layers > 0 {
+        let contract = DsparkContract::open(&input.checkpoint().snapshot).context("MiniMax bundled DSpark")?;
+        Some(DraftMemory::new(&contract, sequences, rows, opts.physical_sms.unwrap_or(arch.sms) as usize)?)
+    } else { None };
     let manifest: serde_json::Value = serde_json::from_slice(&std::fs::read(path).context("MiniMax PROGRAMS.json")?)?;
     let programs = admission::ProgramSizes::from_manifest(&manifest, sizing)?;
     let ledger = RuntimeLedger::new(cfg, sizing, &programs)?;
@@ -276,10 +282,10 @@ fn exact_layout(model: &Model, input: &crate::plan::PlanInput, report: &mut Plan
     let local = onboarding.local_bytes;
     let local_scratch = if onboard > 0 { admission::expert_workspace(package.as_ref()
         .context("MiniMax onboarded layers require fp8-minimax-nvfp4a4/manifest.json")?, 1, rows)? } else { 0 };
-    let arch = ArchContext::coordinator(opts.rtx_bytes[0], None);
     let program_set = ProgramSet::from_manifest(&manifest, &["minimax"]);
     let code = inventory::loaded_code_allowance("minimax", "fp8-minimax-nvfp4a4", false, 0, &arch, Some(&program_set)).bytes;
-    let mut reservations = Reservations { weights: weights.resident_bytes, local_experts: local,
+    let mut reservations = Reservations { weights: weights.resident_bytes.checked_add(draft.as_ref().map_or(0, |d| d.bytes))
+            .context("MiniMax drafter reservation overflow")?, local_experts: local,
         expert_workspace: local_scratch, pending_code: code, runtime_baseline: arch.context_bytes,
         headroom: opts.headroom_bytes, ..Default::default() };
     let fixed = reservations.fixed_bytes(&ledger)?;
@@ -308,6 +314,12 @@ fn exact_layout(model: &Model, input: &crate::plan::PlanInput, report: &mut Plan
     ];
     for allocation in &ledger.allocations { items.push(Item::new(Category::Workspace,
         format!("MiniMax {}", allocation.name), "native allocation", allocation.bytes, Basis::Exact)); }
+    if let Some(draft) = &draft {
+        items.push(Item::new(Category::Drafter, "MiniMax DSpark weights", "MXFP8 + BF16", draft.weights_bytes, Basis::Exact));
+        items.push(Item::new(Category::Drafter, "MiniMax DSpark context rings", "BF16 K/V", draft.ring_bytes, Basis::Exact));
+        for (&name, &bytes) in &draft.buffers { items.push(Item::new(Category::Drafter,
+            format!("MiniMax DSpark {name}"), "native allocation", bytes as u64, Basis::Exact)); }
+    }
     if local > 0 {
         items.push(Item::new(Category::Experts, "onboarded bottom routed layers TP1", "NVFP4 W4A4", local, Basis::Exact));
         items.push(Item::new(Category::Workspace, "local expert package scratch", "exported capacity", local_scratch, Basis::Exact));
@@ -320,11 +332,13 @@ fn exact_layout(model: &Model, input: &crate::plan::PlanInput, report: &mut Plan
     items.push(Item::new(Category::Kv, "separate FP8 K/V planes + packed MSA index", "64-token pages", admitted.cache_bytes, Basis::Exact));
     let mut memory = MemoryLayout { devices: vec![DeviceLayout { kind: DeviceKind::Rtx, index: 0,
         capacity_bytes: opts.rtx_bytes[0], items, kv_tokens: admitted.pool_tokens }], pool_tokens: admitted.pool_tokens,
-        waste: vec![], notes: vec!["MiniMax coordinator native allocation ledger; causal paged MSA tiles; zero graphs; speculation off".into(),
+        waste: vec![], notes: vec![format!("MiniMax coordinator native allocation ledger; causal paged MSA tiles; zero graphs; speculation {}",
+            if draft.is_some() { "bundled DSpark" } else { "off" }),
             "Offline CUDA/code baselines remain estimates; serving re-admits measured free memory before allocation".into(),
             format!("{onboard} routed layers on the RTX ({:.1} GiB), {} on {} Sparks", local as f64 / GIB as f64, layers.len() - onboard, sizing.spark_ranks)] };
     report.bytes_by_owner.clear();
     report.bytes_by_owner.insert("coordinator text weights".into(), weights.resident_bytes);
+    if let Some(draft) = &draft { report.bytes_by_owner.insert("bundled DSpark weights".into(), draft.weights_bytes); }
     report.bytes_by_owner.insert("local routed expert weights".into(), local);
     let recipe = crate::plan::experts::checkpoint_spark_recipe(input.checkpoint(), sizing.spark_ranks, &layers[onboard..])?;
     for rank in 0..sizing.spark_ranks {

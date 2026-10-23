@@ -278,9 +278,9 @@ impl Family for MiniMaxM3 {
                 how: "Compile the MiniMax D80 vision attention export and qualify the native BF16 tower and language-model feature injection against the CPU reference. Video input is unsupported.".into(),
             }),
             Component::Speculator => Some(Hint {
-                what: "MiniMax M3 DSpark drafting is not wired".into(),
-                how: "Bind the bundled dspark/ drafter (5 dense sliding-4096 layers, block 7, Markov rank 256, confidence head) \
-                    to target taps 3/17/31/45/59 through the shared block dSpark verifier; serve without speculation until then.".into(),
+                what: "MiniMax M3 DSpark drafting awaits device qualification".into(),
+                how: "The bundled dspark/ drafter uses native MXFP8 layers, target taps 3/17/31/45/59 and target verification. \
+                    Qualify real-weight attention, Markov/confidence heads and acceptance before changing the launcher default from off.".into(),
             }),
             _ => None,
         }

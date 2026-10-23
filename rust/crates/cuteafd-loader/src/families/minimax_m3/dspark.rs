@@ -26,6 +26,8 @@ pub enum DsparkError {
     UnexpectedTensor(String),
     #[error("MiniMax DSpark head arithmetic: {0}")]
     Arithmetic(&'static str),
+    #[error("MiniMax DSpark memory: {0}")]
+    Memory(&'static str),
 }
 
 #[derive(Debug, Clone)]
@@ -43,6 +45,61 @@ pub struct DsparkContract {
     /// The MiniMax DSpark architecture defaults to noncausal draft blocks.
     pub causal: bool,
     pub sample_from_anchor: bool,
+}
+
+/// The drafter's own allocations; target step scratch and the borrowed head
+/// and embedding remain in the target ledger.
+#[derive(Debug, Clone)]
+pub struct DraftMemory {
+    pub buffers: std::collections::BTreeMap<&'static str, usize>,
+    pub weights_bytes: u64,
+    pub scratch_bytes: u64,
+    pub ring_bytes: u64,
+    pub ring_plane_bytes: usize,
+    pub bytes: u64,
+    pub sequences: usize,
+    pub slots: usize,
+    pub rows: usize,
+}
+
+impl DraftMemory {
+    pub fn new(contract: &DsparkContract, slots: usize, rows: usize, sms: usize) -> Result<Self, DsparkError> {
+        if !(1..=64).contains(&slots) || !(7..=4096).contains(&rows) || !(1..=(i32::MAX / 2) as usize).contains(&sms) {
+            return Err(DsparkError::Memory("requires 1..64 slots, 7..4096 rows and a positive SM count"));
+        }
+        let cfg = &contract.config;
+        let g = contract.geometry;
+        let sequences = slots.min(32).min(rows / cfg.block);
+        let r = sequences * cfg.block;
+        // Native draft_attention.cu allocates the larger WMMA/scalar layout.
+        // Each 32-query slice owns one partial output and two softmax scalars.
+        let slices = (g.query_heads / g.kv_heads * cfg.block).div_ceil(32);
+        let max_keys = cfg.sliding_window + cfg.block;
+        let partitions = max_keys.div_ceil(32).min((2 * sms).div_ceil(g.kv_heads * slices));
+        let scalar_rows = if g.qk_dim == 64 { 32 } else { 16 };
+        let partial_rows = (slices * partitions * 32).max(max_keys.min(1024 + 16).div_ceil(128) * scalar_rows);
+        let attention_workspace = sequences * g.kv_heads * partial_rows * (g.qk_dim + 2) * 4;
+        // glmf_dspark.cu: 296 FP32 maxima/uint32 ids per sequence plus
+        // one uint32 scratch token for every drafted row.
+        let markov_workspace = sequences * 296 * 8 + sequences * cfg.block * 4;
+        let h = contract.hidden;
+        let buffers = std::collections::BTreeMap::from([
+            ("taps", rows * TARGET_LAYERS.len() * h * 2), ("tap", rows * h * 2),
+            ("input", r * h * 2), ("ids", r * 4), ("tables", 3 * sequences * 4),
+            ("anchors", sequences * 4), ("tokens", r * 4), ("confidence", r * 4),
+            ("markov_norms", contract.vocab_size * 4), ("markov_workspace", markov_workspace),
+            ("attention_workspace", attention_workspace),
+        ]).into_iter().map(|(name, bytes)| (name, bytes.max(256))).collect::<std::collections::BTreeMap<_, _>>();
+        let ring_plane_bytes = slots * cfg.sliding_window * g.kv_heads * g.qk_dim * 2;
+        let ring_bytes = (cfg.layers * 2 * ring_plane_bytes) as u64;
+        let scratch_bytes = buffers.values().map(|&n| n as u64).sum::<u64>();
+        // Every fused matrix already exceeds the allocation floor; only the
+        // confidence bias pads from two bytes to 256.
+        let weights_bytes = contract.weights.resident_bytes;
+        let bytes = weights_bytes.checked_add(scratch_bytes).and_then(|n| n.checked_add(ring_bytes))
+            .ok_or(DsparkError::Memory("allocation sum overflow"))?;
+        Ok(Self { buffers, weights_bytes, scratch_bytes, ring_bytes, ring_plane_bytes, bytes, sequences, slots, rows })
+    }
 }
 
 fn require(value: &Value, key: &str, expected: Value) -> Result<(), DsparkError> {
@@ -221,6 +278,34 @@ mod tests {
         assert_eq!(contract.activation, FfnActivation::SwigluOai { alpha: 1.702, limit: 7.0 });
         assert!(!contract.causal);
         assert!(contract.sample_from_anchor);
+    }
+
+    #[test]
+    fn draft_memory_matches_native_slices_padding_and_ring_planes() {
+        let (_dir, checkpoint) = checkpoint();
+        let contract = DsparkContract::from_checkpoint(&checkpoint).unwrap();
+        let layout = DraftMemory::new(&contract, 16, 256, 188).unwrap();
+        assert_eq!((layout.sequences, layout.slots, layout.rows), (16, 16, 256));
+        assert_eq!(layout.weights_bytes, 2_301_852_928);
+        assert_eq!(layout.buffers["attention_workspace"], 16 * 4 * (4 * 24 * 32) * 130 * 4);
+        assert_eq!(layout.buffers["markov_workspace"], 16 * (296 * 8 + 7 * 4));
+        assert_eq!(layout.buffers["taps"], 256 * 5 * 6144 * 2);
+        assert_eq!(layout.buffers["tables"], 256);
+        assert_eq!(layout.buffers["anchors"], 256);
+        assert_eq!(layout.ring_plane_bytes, 16 * 4096 * 512 * 2);
+        assert_eq!(layout.ring_bytes, 10 * layout.ring_plane_bytes as u64);
+        assert_eq!(layout.bytes, layout.weights_bytes + layout.scratch_bytes + layout.ring_bytes);
+        assert_eq!(layout.scratch_bytes, layout.buffers.values().map(|&b| b as u64).sum::<u64>());
+        let smaller = DraftMemory::new(&contract, 16, 256, 170).unwrap();
+        assert_eq!(smaller.buffers["attention_workspace"], 16 * 4 * (4 * 22 * 32) * 130 * 4);
+        assert_eq!(layout.bytes - smaller.bytes, 8_519_680);
+        let scalar = DraftMemory::new(&contract, 1, 7, 1).unwrap();
+        assert_eq!(scalar.buffers["attention_workspace"], 4 * (9 * 16) * 130 * 4);
+        assert_eq!(DraftMemory::new(&contract, 64, 4096, 188).unwrap().sequences, 32);
+        assert_eq!(DraftMemory::new(&contract, 64, 13, 188).unwrap().sequences, 1);
+        assert!(DraftMemory::new(&contract, 16, 6, 188).is_err());
+        assert!(DraftMemory::new(&contract, 0, 256, 188).is_err());
+        assert!(DraftMemory::new(&contract, 16, 256, 0).is_err());
     }
 
     #[test]

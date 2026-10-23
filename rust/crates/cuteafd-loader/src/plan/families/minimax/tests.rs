@@ -176,6 +176,69 @@ fn native_manifest_uses_shared_allocation_ledger() {
 }
 
 #[test]
+fn native_manifest_admits_bundled_dspark_and_charges_its_full_layout() {
+    use crate::families::minimax_m3::dspark::{DraftMemory, DsparkContract};
+    use cuteafd_core::memory_layout::Category;
+    let dir = snapshot(false, true);
+    let programs = dir.path().join("PROGRAMS.json");
+    std::fs::write(&programs, admission::tests::programs_manifest().to_string()).unwrap();
+    let mut options = with_layout(PRO_TOTAL_BYTES, 3);
+    let layout = options.layout.as_mut().unwrap();
+    layout.workspace_manifest = Some(programs);
+    layout.prefill_rows = 256;
+    layout.concurrency = 16;
+    layout.pool_tokens = Some(16384);
+    layout.physical_sms = Some(188);
+    layout.native_mtp_layers = 0;
+    let off = plan::plan(dir.path(), &options).unwrap();
+    assert!(off.placement_supported, "{:?}", off.hints);
+    options.layout.as_mut().unwrap().native_mtp_layers = 5;
+    let on = plan::plan(dir.path(), &options).unwrap();
+    assert!(on.placement_supported && on.wip_launchable(), "{:?}", on.hints);
+    let contract = DsparkContract::open(dir.path()).unwrap();
+    let draft = DraftMemory::new(&contract, 16, 256, 188).unwrap();
+    let rtx = |report: &crate::plan::PlanReport| report.memory_layout.as_ref().unwrap().devices.iter()
+        .find(|d| d.kind == DeviceKind::Rtx).unwrap().clone();
+    let (off_rtx, on_rtx) = (rtx(&off), rtx(&on));
+    assert!(off_rtx.items.iter().all(|i| i.category != Category::Drafter));
+    assert_eq!(on_rtx.used_bytes() - off_rtx.used_bytes(), draft.bytes);
+    assert_eq!(on_rtx.items.iter().filter(|i| i.category == Category::Drafter).map(|i| i.bytes).sum::<u64>(), draft.bytes);
+    assert_eq!(on.bytes_by_owner["bundled DSpark weights"], draft.weights_bytes);
+    assert_eq!(on.memory_layout.as_ref().unwrap().pool_tokens, 16384);
+    assert!(on.memory_layout.as_ref().unwrap().notes.iter().any(|n| n.ends_with("speculation bundled DSpark")));
+    assert!(off.memory_layout.as_ref().unwrap().notes.iter().any(|n| n.ends_with("speculation off")));
+    options.layout.as_mut().unwrap().physical_sms = Some(170);
+    let smaller = plan::plan(dir.path(), &options).unwrap();
+    assert!(smaller.placement_supported, "{:?}", smaller.hints);
+    assert_eq!(on_rtx.used_bytes() - rtx(&smaller).used_bytes(), 8_519_680);
+    options.layout.as_mut().unwrap().prefill_rows = 6;
+    options.layout.as_mut().unwrap().concurrency = 1;
+    let refused = plan::plan(dir.path(), &options).unwrap();
+    assert!(!refused.placement_supported);
+    assert!(refused.hints.iter().any(|h| h.what.contains("7..4096 rows")), "{:?}", refused.hints);
+    options.layout.as_mut().unwrap().prefill_rows = 256;
+    options.layout.as_mut().unwrap().concurrency = 16;
+    options.layout.as_mut().unwrap().drafter_bytes = 1;
+    let refused = plan::plan(dir.path(), &options).unwrap();
+    assert!(!refused.placement_supported);
+    assert!(refused.hints.iter().any(|h| h.what.contains("external drafter")), "{:?}", refused.hints);
+}
+
+#[test]
+fn native_dspark_requires_a_bundled_checkpoint() {
+    let dir = snapshot(false, false);
+    let programs = dir.path().join("PROGRAMS.json");
+    std::fs::write(&programs, admission::tests::programs_manifest().to_string()).unwrap();
+    let mut options = with_layout(PRO_TOTAL_BYTES, 3);
+    let layout = options.layout.as_mut().unwrap();
+    layout.workspace_manifest = Some(programs);
+    layout.native_mtp_layers = 5;
+    let refused = plan::plan(dir.path(), &options).unwrap();
+    assert!(!refused.placement_supported);
+    assert!(refused.hints.iter().any(|h| h.what.contains("MiniMax bundled DSpark")), "{:?}", refused.hints);
+}
+
+#[test]
 fn explicit_missing_native_manifest_does_not_fall_back_to_headers() {
     let dir = snapshot(false, false);
     let mut options = with_layout(PRO_TOTAL_BYTES, 3);
