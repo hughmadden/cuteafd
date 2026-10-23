@@ -14,6 +14,7 @@ use cuteafd_ffi::NativeLibrary;
 use cuteafd_loader::families::glm5::GlmDsaConfig;
 use crate::shared::spark_intake::SparkLink;
 
+use std::ffi::c_void;
 use std::path::PathBuf;
 use std::time::Instant;
 
@@ -538,7 +539,7 @@ impl Opened {
             let heads = self.cfg.heads / if split { 2 } else { 1 };
             let inter = self.cfg.dense_intermediate / if split { 2 } else { 1 };
             let lanes = glm::prefill_lanes(args.peers.as_deref().map_or(0, |p| p.split(',').count()),
-                engine::configured_lanes() as u64) as usize;
+                u64::from(args.prefill_waves)) as usize;
             let per_gpu = engine::native_dense::scratch_bytes(&self.cfg, heads, inter, engine::DECODE_ROWS)
                 + lanes * engine::native_dense::scratch_bytes(&self.cfg, heads, inter, args.prefill_rows);
             vec![per_gpu as u64; devices.len()]
