@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Layer-major MiniMax M3 text golden: native served QDQ or BF16-activation diagnostic.
+"""Layer-major MiniMax M3 text golden: served-cache, served QDQ or BF16 diagnostic.
 
 Only one packed layer and one window are resident. Resume reads hash-sealed
-BF16 layer checkpoints and requires identical source, snapshot, set and arm.
+layer checkpoints and requires identical source, snapshot, set and arm.
 The CLI always qualifies byte-identical common-prefix logits before scoring.
 Vision and the bundled drafter are excluded.
 """
@@ -43,7 +43,8 @@ ARITHMETIC = {
     "nvfp4_scale_policy": "vLLM B12X/CUTLASS per expert; gate/up use min checkpoint input globals; equal gate/up weight globals required; down uses its own globals",
     "boundaries": "FP32 GEMM accumulation and sparse attention; BF16 projection, norm, RoPE, SwiGLU, residual and head outputs; FP32 sigmoid router and expert combine",
     "selection": "BF16 index Q/K; FP32 dot products; causal block max; forced local blocks; stable lower-id ties; ascending selected block ids",
-    "limitations": "Format-level QDQ oracle, not bitwise CUDA reduction/rcp.approx or fused norm/RoPE/activation emulation; no FP8 KV/index cache; no FlashInfer global-across-experts scale reduction",
+    "served_cache": "E4M3 RN-even/satfinite K/V with descale1; index row FP32 amax/448 (zero=>1), RN reciprocal then multiply and E4M3; dot * (q_scale/sqrt(dim)) * k_scale; FP32 residual and head outputs, BF16 norms and routed/shared combine",
+    "limitations": "Format-level QDQ oracle, not bitwise CUDA reductions, rsqrt/exp approximations or fused RoPE emulation; served/bf16 arms omit FP8 caches; no FlashInfer global-across-experts scale reduction",
 }
 
 
@@ -55,6 +56,11 @@ def source_identity():
     return {"transformers": {"revision": model.TRANSFORMERS_REVISION, "sha256": model.SOURCE_PINS},
             "vllm": {"revision": VLLM_REVISION,
                      "files": {p: {"sha256": pin, "lines": lines} for p, (pin, lines) in VLLM_SOURCE_PINS.items()}},
+            "cache_program_sha256": {name: digest(ROOT / "third_party/sparkinfer/b12x" / name)
+                                     for name in ("integration/cuteafd/_minimax_kernels.py",
+                                                  "integration/cuteafd/_glm_kernels.py",
+                                                  "integration/cuteafd/minimax_indexer.py",
+                                                  "integration/cuteafd/pointwise.py", "_lib/intrinsics.py")},
             "model_sha256": digest(Path(model.__file__)), "golden_sha256": digest(Path(__file__)),
             "shared_sha256": {name: digest(ROOT / "python/reference" / name)
                               for name in ("shape_invariant.py", "fidelity_windows.py")}}
@@ -85,11 +91,15 @@ def run_layers(snapshot, manifest, out, *, device="cpu", activation="served", re
     windows = manifest["windows"]
     if any(w.get("media") for w in windows):
         raise ValueError("MiniMax reference is text-only")
-    shapes = {w["id"]: [len(w["tokens"]), cfg.hidden_size] for w in windows}
+    residual_dtype = torch.float32 if activation == "served-cache" else torch.bfloat16
+    # The shared checkpoint writer seals uint16 words; FP32 uses two words.
+    words = 2 if activation == "served-cache" else 1
+    shapes = {w["id"]: [len(w["tokens"]), cfg.hidden_size * words] for w in windows}
     binding = {"set_sha256": manifest["set_sha256"], "source": source_identity(),
                "config_sha256": digest(snapshot / "config.json"),
                "index_sha256": digest(snapshot / "model.safetensors.index.json"),
                "snapshot_revision": snapshot.name, "activation": activation,
+               "residual_storage": "fp32" if words == 2 else "bf16",
                "arithmetic": ARITHMETIC, "torch": torch.__version__, "device": str(weights.device),
                "image_sha256": os.environ.get("CUTEAFD_REFERENCE_IMAGE_SHA256", ""),
                "tokens": {w["id"]: hashlib.sha256(canonical(w["tokens"])).hexdigest() for w in windows},
@@ -115,7 +125,7 @@ def run_layers(snapshot, manifest, out, *, device="cpu", activation="served", re
             states = []
             for window in windows:
                 ids = torch.tensor(window["tokens"], device=weights.device)
-                hidden = F.embedding(ids, embedding)
+                hidden = F.embedding(ids, embedding).to(residual_dtype)
                 states.append(state.write_window(folder, window["id"], hidden.cpu().view(torch.uint16).numpy()))
             del embedding, hidden, ids
             weights.close()
@@ -131,7 +141,7 @@ def run_layers(snapshot, manifest, out, *, device="cpu", activation="served", re
             folder = state.begin(index)
             next_states = []
             for window, previous in zip(windows, states, strict=True):
-                hidden = torch.from_numpy(previous.load()).view(torch.bfloat16).to(weights.device)
+                hidden = torch.from_numpy(previous.load()).view(residual_dtype).to(weights.device)
                 hidden = model.layer_forward(hidden, layer, cfg, index, activation)
                 if not torch.isfinite(hidden).all():
                     raise ValueError(f"non-finite MiniMax hidden at layer {index}")
@@ -171,7 +181,7 @@ def execute(args):
                           "activation": args.activation, "arithmetic": ARITHMETIC}))
         return
     probing = getattr(args, "_prefix_probe", False)
-    # A deliberate early stop writes only resumable state, never golden metadata.
+    # Early stops emit a partial reference, never completed golden metadata.
     proof = qualify(args, manifest, execute) if args.stop_after_layer is None else None
     if args.prefix_only and not probing:
         return
@@ -179,17 +189,39 @@ def execute(args):
                               activation=args.activation, resume=None if probing else args.resume,
                               stop_after_layer=args.stop_after_layer, layers=args.layers)
     if args.stop_after_layer is not None:
+        entries = []
+        dtype = torch.float32 if args.activation == "served-cache" else torch.bfloat16
+        for window, state in zip(manifest["windows"], states, strict=True):
+            directory = args.out / "windows" / window["id"]
+            directory.mkdir(parents=True, exist_ok=True)
+            filename = f"layer{args.stop_after_layer:02d}.bin"
+            torch.from_numpy(state.load()).view(dtype).float().numpy().astype("<f4").tofile(directory / filename)
+            torch.tensor(window["tokens"], dtype=torch.int32).numpy().astype("<i4").tofile(directory / "tokens.bin")
+            entries.append(dict(id=window["id"], path=f"windows/{window['id']}", vocab=cfg.vocab_size,
+                                positions=list(range(window["score_from"], len(window["tokens"]))),
+                                sha256={name: digest(directory / name) for name in (filename, "tokens.bin")}))
+        (args.out / "windows.json").write_bytes(canonical(manifest) + b"\n")
+        partial = dict(schema="cuteafd.minimax.partial-reference/1", family="minimax_m3",
+                       checkpoint=model.CHECKPOINT, snapshot_identity=identity, set_sha256=manifest["set_sha256"],
+                       activation=args.activation, last_layer=args.stop_after_layer, complete_model=False,
+                       mtp=False, source_pin=source_identity(), arithmetic=ARITHMETIC, windows=entries)
+        (args.out / "partial.json").write_bytes(canonical(partial) + b"\n")
         return
     admission(weights, cfg, max(len(w["tokens"]) for w in manifest["windows"]))
     with torch.inference_mode():
         norm = weights.tensor(model.TEXT + "norm.weight")
         head = weights.tensor(model.HEAD)
+        if args.activation == "served-cache":
+            head = head.float()
         weights.close()
         entries = []
         for window, state in zip(manifest["windows"], states, strict=True):
-            hidden = torch.from_numpy(state.load()).view(torch.bfloat16).to(weights.device)
+            dtype = torch.float32 if args.activation == "served-cache" else torch.bfloat16
+            hidden = torch.from_numpy(state.load()).view(dtype).to(weights.device)
             selected = hidden[window["score_from"] - 1:len(window["tokens"]) - 1]
-            logits = linear(model.gemma_norm(selected, norm, cfg.rms_norm_eps), head).float()
+            normalized = model.gemma_norm(selected, norm, cfg.rms_norm_eps).bfloat16()
+            logits = (linear(normalized.float(), head) if args.activation == "served-cache"
+                      else linear(normalized, head).float())
             entry = write_scored_logits(args.out, window, logits.cpu().numpy())
             (args.out / entry["path"] / "meta.json").write_bytes(canonical(entry) + b"\n")
             entries.append(entry)
@@ -201,6 +233,7 @@ def execute(args):
                   source_pin=source_identity(), prefix_qualification=proof,
                   reference="independent MiniMax M3 text; native weight QDQ; fixed-M128",
                   activation=args.activation, diagnostic_only=args.activation == "bf16",
+                  cache_format="fp8_e4m3" if args.activation == "served-cache" else "bf16",
                   arithmetic=ARITHMETIC, dtype="bf16", attention="eager_fp32",
                   mtp=False, use_cache=False, fixed_rows=128, torch=torch.__version__,
                   nll=sum(e["nll"] * e["scored_tokens"] for e in entries) / total,
@@ -214,7 +247,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     for name in ("snapshot", "windows", "out"):
         parser.add_argument("--" + name, type=Path, required=True)
-    parser.add_argument("--activation", choices=("served", "bf16"), default="served")
+    parser.add_argument("--activation", choices=("served-cache", "served", "bf16"), default="served")
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--resume", type=Path, help="previous run's state directory; use a fresh output")
     parser.add_argument("--stop-after-layer", type=int)

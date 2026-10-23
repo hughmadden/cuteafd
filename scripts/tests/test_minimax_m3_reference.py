@@ -211,21 +211,24 @@ def forward(snapshot, tokens, activation):
         for index in range(2):
             hidden = model.layer_forward(hidden, weights.load_layer(index, cfg), cfg, index, activation=activation)
             states.append(hidden.clone())
-        hidden = model.gemma_norm(hidden, weights.tensor("language_model.model.norm.weight"), 1e-6)
-        logits = torch.nn.functional.linear(hidden, weights.tensor("language_model.lm_head.weight"))
+        hidden = model.gemma_norm(hidden, weights.tensor("language_model.model.norm.weight"), 1e-6).bfloat16()
+        head = weights.tensor("language_model.lm_head.weight")
+        logits = torch.nn.functional.linear(hidden.float(), head.float()) if activation == "served-cache" else torch.nn.functional.linear(hidden, head)
         return states, logits
     finally:
         weights.close()
 
 
-@pytest.mark.parametrize("activation", ["served", "bf16"])
+@pytest.mark.parametrize("activation", ["served", "served-cache", "bf16"])
 def test_two_layer_cpu_forward_dense_sparse_moe_and_prefix(snapshot, activation):
     tokens = torch.tensor([1, 7, 3, 9, 11, 5, 2])
     states, logits = forward(snapshot, tokens, activation)
-    assert logits.shape == (7, 64) and logits.dtype == torch.bfloat16
+    dtype = torch.float32 if activation == "served-cache" else torch.bfloat16
+    assert logits.shape == (7, 64) and logits.dtype == dtype
     assert torch.isfinite(logits).all()
     for before, after in zip(states, states[1:]):
-        assert after.dtype == torch.bfloat16 and torch.isfinite(after).all()
+        dtype = torch.float32 if activation == "served-cache" else torch.bfloat16
+        assert after.dtype == dtype and torch.isfinite(after).all()
         assert not torch.equal(before, after)
     prefix_states, prefix_logits = forward(snapshot, tokens[:5], activation)
     for whole, prefix in zip(states, prefix_states):
@@ -249,7 +252,7 @@ def panel(tokens):
     return result
 
 
-@pytest.mark.parametrize("activation", ["served", "bf16"])
+@pytest.mark.parametrize("activation", ["served", "served-cache", "bf16"])
 def test_layer_resume_is_byte_exact_and_loads_only_remaining_layer(snapshot, tmp_path, monkeypatch, activation):
     from families.minimax_m3.golden import run_layers
     manifest = panel([1, 7, 3, 9, 11, 5, 2])
@@ -354,7 +357,7 @@ def test_family_registrations_are_present():
             assert value["minimax"] == "minimax-golden"
 
 
-@pytest.mark.parametrize("activation", ["served", "bf16"])
+@pytest.mark.parametrize("activation", ["served", "served-cache", "bf16"])
 def test_cpu_golden_scores_and_qualifies_real_fidelity_contract(snapshot, tmp_path, monkeypatch, activation):
     from types import SimpleNamespace
     import numpy as np
@@ -389,3 +392,173 @@ def test_cpu_golden_scores_and_qualifies_real_fidelity_contract(snapshot, tmp_pa
     assert np.isfinite(logits).all()
     np.testing.assert_array_equal(np.fromfile(out / entry["path"] / "tokens.bin", dtype="<i4"), manifest["windows"][0]["tokens"])
     assert len(meta["seconds_per_layer"]) == 2
+
+
+def test_cache_e4m3_rounds_ties_even_saturates_and_preserves_sign():
+    values = torch.tensor([0., -0., 1.0625, 1.1875, -1.0625, -1.1875,
+                           2. ** -10, 3. * 2. ** -10, 480., -480., float("inf"), -float("inf")])
+    expected = [0x00, 0x80, 0x38, 0x3a, 0xb8, 0xba, 0x00, 0x02, 0x7e, 0xfe, 0x7e, 0xfe]
+    assert model.cache_e4m3(values).view(torch.uint8).tolist() == expected
+
+
+def test_index_e4m3_uses_fp32_scale_and_reciprocal_then_multiply():
+    values = torch.tensor([[[0., -0., 1.0625, 448.], [0., 3., -1., .5]],
+                           [[0., 0., 0., 0.], [-224., 1.1875, 3., 7.]]], dtype=torch.bfloat16)
+    packed, scale = model.index_e4m3(values)
+    expected_scale = torch.tensor([[1., 3. / 448.], [1., .5]], dtype=torch.float32)
+    assert scale.dtype == torch.float32 and torch.equal(scale, expected_scale)
+    inverse = torch.ones_like(expected_scale) / expected_scale
+    expected = (values.float() * inverse[..., None]).clamp(-448, 448).to(torch.float8_e4m3fn)
+    assert torch.equal(packed.view(torch.uint8), expected.view(torch.uint8))
+    assert packed.view(torch.uint8)[0, 0].tolist() == [0, 128, 56, 126]
+    assert torch.count_nonzero(packed[1, 0].float()) == 0
+
+
+def test_index_reciprocal_rounding_differs_from_direct_division():
+    values = torch.tensor([[49., 203. / 1024.]], dtype=torch.bfloat16)
+    packed, scale = model.index_e4m3(values)
+    assert scale.item() == 7. / 64.
+    # RN(64/7) * (203/1024) lands above the 1.8125 E4M3 tie.
+    assert packed.view(torch.uint8).tolist() == [[0x7e, 0x3f]]
+    direct = (values.float() / scale[:, None]).to(torch.float8_e4m3fn)
+    assert direct.view(torch.uint8).tolist() == [[0x7e, 0x3e]]
+
+
+def test_index_scores_apply_scales_after_accumulation():
+    q = torch.tensor([[[1., 2., -1., 3.], [-2., 1., 4., 0.]]]).to(torch.float8_e4m3fn)
+    k = torch.tensor([[[2., 1., -1., 0.], [1., -3., 2., 4.]]]).to(torch.float8_e4m3fn)
+    qs, ks = torch.tensor([[.3, .7]]), torch.tensor([[.2, .9]])
+    expected = (torch.tensor([[[5., 5.], [-7., 3.]]]) * (qs * .5)[..., None]) * ks[..., None, :]
+    assert torch.equal(model.index_scores(q, qs, k, ks), expected)
+
+
+def test_served_cache_arm_changes_values_and_retains_fp32_residual(snapshot):
+    cfg = model.Config.from_dict(tiny_config())
+    weights = model.Weights(snapshot)
+    hidden = weights.tensor("language_model.model.embed_tokens.weight")[:7]
+    layer = weights.load_layer(0, cfg)
+    trace = {}
+    cached = model.layer_forward(hidden, layer, cfg, 0, "served-cache", trace)
+    original = model.layer_forward(hidden, layer, cfg, 0, "served")
+    assert cached.dtype == torch.float32 and trace["norm"].dtype == torch.bfloat16
+    assert not torch.equal(cached, original.float())
+    assert not torch.equal(cached, cached.bfloat16().float())
+    assert trace["q2k"].shape == (7, 1, 2)
+    assert trace["k_fp8"].dtype == torch.uint8
+    assert torch.equal(trace["k_fp8"], model.cache_e4m3(trace["k"]).view(torch.uint8))
+
+
+@pytest.mark.parametrize("layer", [0, 1])
+def test_layer_diagnostic_roundtrip_and_exact_selection_gate(snapshot, tmp_path, layer):
+    from families.minimax_m3 import diagnostic
+    cfg = model.Config.from_dict(tiny_config())
+    weights = model.Weights(snapshot)
+    hidden = weights.tensor("language_model.model.embed_tokens.weight")[:7].float()
+    hidden[0, 0] += 2. ** -18
+    trace = {}
+    model.layer_forward(hidden, weights.load_layer(layer, cfg), cfg, layer, "served-cache", trace)
+    dump = tmp_path / "dump"
+    diagnostic.write_dump(dump, layer, trace)
+    result = diagnostic.compare(snapshot, dump, reference_out=tmp_path / "reference")
+    assert result["passed"] and result["first_failure"] is None
+    assert all(entry["mismatches"] == 0 for entry in result["tensors"])
+    import numpy as np
+    selected = np.fromfile(dump / "q2k.bin", dtype="<i4")
+    selected[0] += 1
+    selected.tofile(dump / "q2k.bin")
+    result = diagnostic.compare(snapshot, dump, rtol=100., atol=100.)
+    assert not result["passed"] and result["first_failure"] == "q2k"
+
+
+def test_layer_diagnostic_combines_causal_history_and_rejects_holes(snapshot, tmp_path):
+    from families.minimax_m3 import diagnostic
+    cfg = model.Config.from_dict(tiny_config())
+    weights = model.Weights(snapshot)
+    hidden = weights.tensor("language_model.model.embed_tokens.weight")[:7].float()
+    trace = {}
+    model.layer_forward(hidden, weights.load_layer(0, cfg), cfg, 0, "served-cache", trace)
+    dump = tmp_path / "dump"
+    dump.mkdir()
+    manifests = []
+    for index, (start, end) in enumerate(((0, 3), (3, 7))):
+        folder = dump / str(index)
+        diagnostic.write_dump(folder, 0, {name: tensor[start:end] for name, tensor in trace.items()})
+        step = json.loads((folder / "manifest.json").read_text())["steps"][0]
+        step["positions"] = list(range(start, end))
+        for descriptor in step["tensors"].values():
+            descriptor["path"] = f"{index}/" + descriptor["path"]
+        manifests.append(step)
+    manifest = dict(schema=diagnostic.SCHEMA, activation="served-cache", layer=0, steps=manifests)
+    (dump / "manifest.json").write_text(json.dumps(manifest))
+    assert diagnostic.compare(snapshot, dump)["passed"]
+    manifest["steps"][1]["positions"][0] = 4
+    (dump / "manifest.json").write_text(json.dumps(manifest))
+    with pytest.raises(ValueError, match="contiguous causal history"):
+        diagnostic.compare(snapshot, dump)
+
+
+def test_layer_diagnostic_rejects_bad_cache_payload_and_nonfinite(snapshot, tmp_path):
+    from families.minimax_m3 import diagnostic
+    cfg = model.Config.from_dict(tiny_config())
+    weights = model.Weights(snapshot)
+    hidden = weights.tensor("language_model.model.embed_tokens.weight")[:7].float()
+    trace = {}
+    model.layer_forward(hidden, weights.load_layer(0, cfg), cfg, 0, "served-cache", trace)
+    trace["index_k_fp8"][0, 0, 0] ^= 1
+    dump = tmp_path / "dump"
+    diagnostic.write_dump(dump, 0, trace)
+    result = diagnostic.compare(snapshot, dump)
+    assert not result["passed"] and result["first_failure"] == "index_k_fp8"
+    entry = diagnostic.difference("x", torch.tensor([float("nan")]), torch.ones(1), rtol=1., atol=1.)
+    assert not entry["passed"] and not entry["finite"] and entry["max_abs"] is None
+
+
+@pytest.mark.parametrize("field", ["hash", "dtype", "activation"])
+def test_layer_diagnostic_validates_tensor_identity(snapshot, tmp_path, field):
+    from families.minimax_m3 import diagnostic
+    cfg = model.Config.from_dict(tiny_config())
+    weights = model.Weights(snapshot)
+    hidden = weights.tensor("language_model.model.embed_tokens.weight")[:7].float()
+    trace = {}
+    model.layer_forward(hidden, weights.load_layer(0, cfg), cfg, 0, "served-cache", trace)
+    dump = tmp_path / "dump"
+    diagnostic.write_dump(dump, 0, trace)
+    manifest = json.loads((dump / "manifest.json").read_bytes())
+    if field == "hash":
+        manifest["steps"][0]["tensors"]["q2k"]["sha256"] = "0" * 64
+    elif field == "dtype":
+        manifest["steps"][0]["tensors"]["q2k"]["dtype"] = "f32"
+    else:
+        manifest["activation"] = "served"
+    (dump / "manifest.json").write_text(json.dumps(manifest))
+    with pytest.raises(ValueError, match="hash differs|dtype differs|manifest"):
+        diagnostic.compare(snapshot, dump)
+
+
+def test_partial_reference_emits_only_sealed_layer_output(snapshot, tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    from tokenizers import Tokenizer
+    from tokenizers.models import WordLevel
+    from families.minimax_m3.golden import execute
+    import hashlib
+    import numpy as np
+    Tokenizer(WordLevel({str(i): i for i in range(64)}, unk_token="0")).save(str(snapshot / "tokenizer.json"))
+    monkeypatch.setattr(model, "REVISION", snapshot.name)
+    windows = tmp_path / "windows.json"
+    windows.write_text(json.dumps(panel([1, 7, 3, 9, 11, 5, 2])))
+    out = tmp_path / "partial"
+    args = SimpleNamespace(snapshot=snapshot, windows=windows, out=out, device="cpu", activation="served-cache",
+                           resume=None, stop_after_layer=0, layers=None, prefix_only=False, check_only=False)
+    execute(args)
+    partial = json.loads((out / "partial.json").read_bytes())
+    assert partial["schema"] == "cuteafd.minimax.partial-reference/1"
+    assert partial["last_layer"] == 0 and not partial["complete_model"] and not (out / "meta.json").exists()
+    entry = partial["windows"][0]
+    folder = out / entry["path"]
+    assert set(entry["sha256"]) == {"layer00.bin", "tokens.bin"}
+    for name, digest in entry["sha256"].items():
+        assert hashlib.sha256((folder / name).read_bytes()).hexdigest() == digest
+    hidden = np.fromfile(folder / "layer00.bin", dtype="<f4").reshape(7, 32)
+    state = np.fromfile(out / "state/layer00/sample.bin", dtype="<f4").reshape(7, 32)
+    np.testing.assert_array_equal(hidden, state)
+    assert (out / "windows.json").is_file()

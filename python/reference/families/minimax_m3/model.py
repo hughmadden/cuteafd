@@ -4,6 +4,7 @@ Served activations model vLLM's B12X/CUTLASS per-expert NVFP4 scale policy.
 GEMMs accumulate decoded operands in FP32 and narrow outputs to BF16. This is
 an arithmetic oracle, not an emulator of tensor-core reductions or approximate
 CUDA reciprocals. BF16 activations are an explicitly diagnostic second arm.
+The served-cache arm adds the native E4M3 cache and FP32 residual boundaries.
 """
 from __future__ import annotations
 
@@ -164,6 +165,36 @@ def quantize_nvfp4(x, global_scale):
     return (rounded * scale / global_scale).reshape(x.shape)
 
 
+def cache_e4m3(x):
+    """kv_pack: FP32 multiply by reciprocal descale=1, RN-even/satfinite E4M3."""
+    return x.float().clamp(-448., 448.).to(torch.float8_e4m3fn)
+
+
+def index_e4m3(x):
+    """index_{k_pack,q_quant}: row amax/448, RN reciprocal, multiply, E4M3.
+
+    Both divisions and the product materialize FP32. Dividing x by scale
+    directly changes rounding. An all-zero row stores scale=1, not zero.
+    """
+    value = x.float()
+    maximum = value.abs().amax(-1, keepdim=True)
+    scale = torch.where(maximum > 0., maximum / 448., torch.ones_like(maximum))
+    inverse = torch.ones_like(scale) / scale
+    return cache_e4m3(value * inverse), scale.squeeze(-1)
+
+
+def index_scores(query, query_scale, key, key_scale):
+    """Native indexer scales the FP32 dot product, not its E4M3 operands."""
+    dot = torch.matmul(query.float(), key.float().transpose(-1, -2))
+    weight = query_scale.float() * query.shape[-1] ** -.5
+    return (dot * weight[..., None]) * key_scale.float()[..., None, :]
+
+
+def record(trace, name, value):
+    if trace is not None:
+        trace[name] = value.detach().clone()
+
+
 def msa_select(scores, positions, block=128, topk=16, local=1):
     """Rust reference.rs contract: causal maxima, forced locals, stable low-id ties."""
     keys = torch.arange(scores.shape[-1], device=scores.device)
@@ -291,20 +322,20 @@ class Weights:
 
 
 def project(x, weights, stem, activation, input_scale=None):
-    if activation not in ("served", "bf16"):
+    if activation not in ("served", "served-cache", "bf16"):
         raise ValueError("unknown activation arm")
     if stem + ".weight_packed" in weights:
         weight = dequant_nvfp4(weights[stem + ".weight_packed"], weights[stem + ".weight_scale"],
                                weights[stem + ".weight_global_scale"])
         scale = weights[stem + ".input_global_scale"] if input_scale is None else input_scale
-        operand = quantize_nvfp4(x, scale) if activation == "served" else x.float()
+        operand = quantize_nvfp4(x, scale) if activation != "bf16" else x.float()
     else:
         weight = dequant_mxfp8(weights[stem + ".weight"], weights[stem + ".weight_scale_inv"])
-        operand = quantize_mxfp8(x) if activation == "served" else x.float()
+        operand = quantize_mxfp8(x) if activation != "bf16" else x.float()
     return linear(operand, weight).to(torch.bfloat16)
 
 
-def attention(hidden, weights, cfg, index, activation):
+def attention(hidden, weights, cfg, index, activation, trace=None):
     p = "self_attn."
     length, dim = len(hidden), cfg.head_dim
     positions = torch.arange(length, device=hidden.device)
@@ -315,11 +346,29 @@ def attention(hidden, weights, cfg, index, activation):
     q = normalized("q_proj", "q_norm", cfg.num_attention_heads, dim)
     k = normalized("k_proj", "k_norm", cfg.num_key_value_heads, dim)
     v = project(hidden, weights, p + "v_proj", activation).reshape(length, cfg.num_key_value_heads, dim)
+    for name, value in (("q", q), ("k", k), ("v", v)):
+        record(trace, name, value)
+    if activation == "served-cache":
+        k, v = cache_e4m3(k), cache_e4m3(v)
+        record(trace, "k_fp8", k.view(torch.uint8))
+        record(trace, "v_fp8", v.view(torch.uint8))
+        k, v = k.float(), v.float()
     sparse = cfg.msa["sparse_attention_freq"][index]
     if sparse:
         iq = normalized("index_q_proj", "index_q_norm", cfg.num_key_value_heads, cfg.msa["sparse_index_dim"])
         ik = normalized("index_k_proj", "index_k_norm", 1, cfg.msa["sparse_index_dim"])
+        record(trace, "index_q", iq)
+        record(trace, "index_k", ik)
+        if activation == "served-cache":
+            iq, iqs = index_e4m3(iq)
+            ik, iks = index_e4m3(ik)
+            record(trace, "index_q_fp8", iq.view(torch.uint8))
+            record(trace, "index_k_fp8", ik.view(torch.uint8))
+            record(trace, "index_q_scales", iqs)
+            record(trace, "index_k_scales", iks)
+            iq, ik = iq.float(), ik.float()
     outputs = []
+    selections = []
     group = cfg.num_attention_heads // cfg.num_key_value_heads
     for start in range(0, length, ROWS):
         count, extent = min(ROWS, length - start), start + ROWS
@@ -331,9 +380,16 @@ def attention(hidden, weights, cfg, index, activation):
         keys = torch.arange(extent, device=hidden.device)
         causal = (keys[None] <= pos[:, None]) & (keys[None] < length)
         if sparse:
-            scores = torch.matmul(query(iq), key(ik).transpose(-1, -2))
+            if activation == "served-cache":
+                qs = F.pad(iqs[start:start + ROWS], (0, 0, 0, ROWS - count), value=1.).T
+                ks = F.pad(iks[:extent], (0, 0, 0, max(0, extent - length)), value=1.).T
+                scores = index_scores(query(iq), qs, key(ik), ks)
+            else:
+                scores = torch.matmul(query(iq), key(ik).transpose(-1, -2))
             selected = msa_select(scores, pos, cfg.msa["sparse_block_size"],
                                   cfg.msa["sparse_topk_blocks"], cfg.msa["sparse_local_block"])
+            if trace is not None:
+                selections.append(selected[:, :count].transpose(0, 1))
             keep = (keys[None, None, :, None] // cfg.msa["sparse_block_size"]
                     == selected[:, :, None, :]).any(-1) & causal[None]
         groups = []
@@ -345,10 +401,16 @@ def attention(hidden, weights, cfg, index, activation):
             score.masked_fill_(~mask[None], -float("inf"))
             groups.append(torch.matmul(score.softmax(-1), vs).transpose(0, 1)[:count])
         outputs.append(torch.cat(groups, 1).reshape(count, -1).to(torch.bfloat16))
-    return project(torch.cat(outputs), weights, p + "o_proj", activation)
+    joined = torch.cat(outputs)
+    record(trace, "attention", joined.reshape(length, cfg.num_attention_heads, dim))
+    if selections:
+        record(trace, "q2k", torch.cat(selections))
+    projected = project(joined, weights, p + "o_proj", activation)
+    record(trace, "attention_projected", projected)
+    return projected
 
 
-def feed_forward(hidden, weights, cfg, index, activation):
+def feed_forward(hidden, weights, cfg, index, activation, trace=None):
     def mlp(x, stem, expert=False):
         gate, up, down = ("w1", "w3", "w2") if expert else ("gate_proj", "up_proj", "down_proj")
         scale = None
@@ -366,6 +428,8 @@ def feed_forward(hidden, weights, cfg, index, activation):
     logits = linear(hidden.float(), weights[stem + ".gate.weight"].float())
     ids, scales = route(logits, weights[stem + ".e_score_correction_bias"],
                         cfg.num_experts_per_tok, cfg.routed_scaling_factor)
+    record(trace, "router_ids", ids.to(torch.int32))
+    record(trace, "router_weights", scales)
     # Ascending expert order fixes accumulation independently of suffix routing.
     output = torch.zeros_like(hidden, dtype=torch.float32)
     for expert in range(cfg.num_local_experts):
@@ -374,11 +438,26 @@ def feed_forward(hidden, weights, cfg, index, activation):
             value = mlp(hidden[rows], f"{stem}.experts.{expert}", True)
             output[rows] += value.float() * scales[rows, slots, None]
     shared = mlp(hidden, stem + ".shared_experts")
+    record(trace, "shared", shared)
+    if activation == "served-cache":
+        output = output.to(torch.bfloat16).float()
     return (output + shared.float()).to(hidden.dtype)
 
 
-def layer_forward(hidden, weights, cfg, index, activation="served"):
+def layer_forward(hidden, weights, cfg, index, activation="served", trace=None):
+    if activation == "served-cache":
+        hidden = hidden.float()
+    record(trace, "input", hidden)
     normalized = gemma_norm(hidden, weights["input_layernorm.weight"], cfg.rms_norm_eps)
-    hidden = hidden + attention(normalized, weights, cfg, index, activation)
+    if activation == "served-cache":
+        normalized = normalized.bfloat16()
+    record(trace, "norm", normalized)
+    hidden = hidden + attention(normalized, weights, cfg, index, activation, trace)
+    record(trace, "post_attention", hidden)
     normalized = gemma_norm(hidden, weights["post_attention_layernorm.weight"], cfg.rms_norm_eps)
-    return hidden + feed_forward(normalized, weights, cfg, index, activation)
+    if activation == "served-cache":
+        normalized = normalized.bfloat16()
+    record(trace, "ffn_norm", normalized)
+    hidden = hidden + feed_forward(normalized, weights, cfg, index, activation, trace)
+    record(trace, "residual", hidden)
+    return hidden
