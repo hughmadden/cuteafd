@@ -51,7 +51,7 @@ pub fn select_prefill_shape<T>(
     is_fit_error: impl Fn(&anyhow::Error) -> bool,
 ) -> anyhow::Result<(PrefillShape, T)> {
     use anyhow::Context;
-    use crate::placement::pool::AGENTIC_FLOOR_TOKENS;
+    use crate::placement::AGENTIC_FLOOR_TOKENS;
     let mut failure = None;
     for candidate in shape.validate()?.ladder() {
         let error = match admit(candidate) {
@@ -92,7 +92,7 @@ mod tests {
 
     #[test]
     fn automatic_pool_steps_down_but_explicit_pool_keeps_the_largest_unit() {
-        use crate::placement::pool::AGENTIC_FLOOR_TOKENS;
+        use crate::placement::AGENTIC_FLOOR_TOKENS;
         for automatic_pool in [true, false] {
             let mut tried = Vec::new();
             let (selected, pool) = select_prefill_shape(PrefillShape { unit_rows: 4096, waves: 2 },
