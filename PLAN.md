@@ -5440,55 +5440,50 @@ Ideas TJ wants kept for later; not v2 work.
 
 ## Prefill contract (TJ, 2026-10-23)
 
-Every family that sends experts to Sparks overlaps prefill the same way: while
-the Sparks run one row window's experts, the GPU runs the next window's
-attention. Audit on 2026-10-23: each family had its own chunk size, lane count
-and scratch scheme. Step-5 and Qwen 4 had no overlap at all.
+Every family that sends experts to Sparks prefills the same way.
 
-- **Mechanism:** one lane, one transport and one full-chunk workspace per
-  prefill, cut into row windows, with up to N windows' expert waves in flight.
-  Today `shared/prefill_pipeline.rs` holds two pieces:
-  - `subwave_ranges`/`subwave_actions`: windows inside one chunk, one lane,
-    one wave in flight (Kimi K3).
-  - `PipelineOrder`: whole chunks alternating over two lanes, each with its
-    own pass, workspace and transport, staggered per layer (V4.1). This is
-    lanes-style, like GLM 5.3, GLM Flash and MiMo.
-  The target merges them: Kimi's single workspace plus V4.1's waves in flight.
-  Step-5 and Qwen 4 start on sub-waves. V4.1, GLM 5.3, GLM Flash and MiMo
-  move off per-lane workspaces and transports after v4; their lane count is
-  the starting value for their waves in flight.
-- **Scratch:** each window owns its own row range of a full-chunk workspace
-  (Kimi's `subwave_extent`). Windows never share bytes, so no schedule can
-  overwrite live rows. No per-family arena relayouts.
-- **Head:** prefill computes logits only for the rows serving needs (the last
-  row, or the requested logit rows), never for every chunk row.
-- **Chunk size:** the planner picks the largest chunk, up to the 4096-row AOT
-  capacity, that admits without giving up an onboard expert layer or pool
-  capacity. V4.1 at 2048 is this rule applied by hand: on 1 RTX its two
-  lanes' workspaces went 21.08 → 11.01 GiB and RTX expert layers 5 → 6. Families don't hardcode
-  their own value.
-- **One lane, several waves:** a prefill chunk runs in one lane with one
-  transport. The pipeline may keep up to N windows' expert waves in flight at
-  once. That's lanes' overlap without duplicating workspaces or transports.
-  Each in-flight window needs only its own return buffer; its scratch rows are
-  already its own. No second workspace exists: the only memory added per
-  extra wave is that return buffer (window rows × hidden × intake planes),
-  and admission charges it before allocation. Default N=1. Raise it where a profile shows the Sparks
-  idling between waves (Spark-bound prefill). Keep it at 1 where the GPU is
-  the bound.
-- **Windows:** at most 3, at least 256 rows each, 64-row page aligned, until
-  the sweep below sets a shared rule. MiMo's measurement suggests the best
-  count follows expert size: Pro (TP6) is faster with 3, Flash (TP4) with 2.
-- **Gates for each family:** byte-identical logits and KV between 1 window and
-  N windows at fixed chunking, exact prefix cache, and one card with 8K
-  prefill and TTFT.
-- **Follow-up:** one sweep of windows {2,3} × waves in flight {1,2,3} ×
-  chunk {1024,2048,4096} on a big-expert family and a small-expert family,
-  including one family's old lanes against the shared pipeline. Then set the
-  shared defaults. GLM's and MiMo's measured lane counts are the starting
-  values for their waves in flight.
-  Defaults today: GLM 5.3 3 lanes, GLM Flash 2, MiMo 3/2 by size (measured),
-  V4.1 2 lanes, Kimi ≤3 windows. Only MiMo's default was measured.
+- **Units:** the prompt runs as a continuous stream of row units, 2048 rows by
+  default, with 2 units in flight. A family may override both in its own
+  default, tuned on its minimum-Spark config with 1 RTX. If the default
+  doesn't fit (5090), step down 2048 → 1024 → 512; there is no optimizing
+  chooser.
+- **One transport, N waves:** each unit's expert wave goes out on one
+  transport that admits N outstanding waves, each with its own return slot.
+  The Spark side already pipelines (rings 8 deep, in order); only the
+  coordinator held one wave per link. With N ≥ 2 the next unit's wave is
+  queued on every Spark when the current one finishes.
+- **Row ownership:** each in-flight unit owns its slice of every buffer that
+  stays live across a hook (residual, FFN output, layer input, return slot),
+  at `unit_slot × rows × stride` in one allocation, never at offset 0.
+  Scratch used inside one hook is shared and sized for one unit. Arenas reused
+  across layer kinds keep attention and FFN regions disjoint, with residual
+  and output planes at fixed offsets.
+- **Ordering:** V4.1's `PipelineOrder`, generalized. Unit k+1's attention at
+  layer L waits for unit k's KV at L, and units commit in order. There are no
+  chunk boundaries, so the Sparks don't drain between units.
+- **Head:** logits only for the rows serving needs. Prefix snapshots happen at
+  the unit boundary that carries the prompt or turn end.
+- **Admission:** N × unit rows × row-owned bytes, plus one unit of scratch,
+  plus N return slots, charged before allocation.
+- **Why units and not windows inside a chunk:** per-row workspace dominates
+  (V4.1 max: 8.0 / 5.8 GiB for 2 × 2048 rows, ~2 MiB/row). Lanes and windows
+  cost the same memory for the same rows in flight. Units keep full-size
+  expert batches and never drain the Sparks at chunk ends.
+- **Gates per family:** byte-identical logits and KV at N=1 vs N, exact
+  prefix cache, and an A/B card against work/p0 with the same config:
+  - 8K and TTFT ≥ 0.98×, decode ≥ 0.95×, KL identical;
+  - a 64K row, reported;
+  - Spark busy fraction, reported;
+  - a per-buffer workspace breakdown, reported.
+- **Today (audit 2026-10-23):**
+  - GLM 5.3 runs 3 lanes, GLM Flash 2, MiMo 3/2 (measured), V4 2 and V4.1 2
+    on `PipelineOrder`;
+  - Kimi runs one lane with windows at 1 wave;
+  - Step-5 and Qwen 4 have no overlap.
+
+  Every family moves onto the shared executor. The full review and per-family
+  checklists are in the executor agent's proposal
+  (codex-runs/v4/prefill-shared-executor/prefill-contract-proposal.md).
 
 ### Prefill migration plan (cross-family, TJ 2026-10-23)
 
