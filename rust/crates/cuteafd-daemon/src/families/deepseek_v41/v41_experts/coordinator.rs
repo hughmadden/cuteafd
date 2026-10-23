@@ -1036,7 +1036,7 @@ mod replicated_tests {
             let legacy = NativeTp4Wave::device_bytes(capacity).unwrap();
             assert_eq!(legacy, NativeTp4Wave::device_bytes_for(capacity, 4).unwrap());
             assert_eq!(legacy, capacity as usize * 6 * 10240);
-            for ranks in [2usize, 3, 4, 6] {
+            for ranks in 1usize..=8 {
                 let expected = capacity as usize * (ranks * 10240 + 20480);
                 assert_eq!(NativeTp4Wave::device_bytes_for(capacity, ranks).unwrap(), expected);
                 assert!(expected >= capacity as usize * ranks * 10240);
@@ -1046,7 +1046,7 @@ mod replicated_tests {
                 NativeTp4Wave::device_bytes_for(capacity, 6).unwrap() > legacy
             );
         }
-        for (capacity, ranks) in [(0u32, 6usize), (4097, 6), (80, 0), (80, 1), (80, 5), (80, 8)] {
+        for (capacity, ranks) in [(0u32, 6usize), (4097, 6), (80, 0), (80, 9)] {
             assert!(NativeTp4Wave::device_bytes_for(capacity, ranks).is_err(), "{capacity}/{ranks}");
         }
     }

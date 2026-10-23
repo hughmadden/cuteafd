@@ -665,7 +665,7 @@ pub fn spark_resident_bytes(catalog: &crate::OfficialV41Catalog, layers: &[usize
         return Ok(Vec::new());
     }
     let shape = catalog.routed_experts();
-    anyhow::ensure!(matches!(ranks, 2 | 3 | 4 | 6) && shape.hidden == 6144
+    anyhow::ensure!((1..=8).contains(&ranks) && shape.hidden == 6144
         && shape.intermediate == 2048 && shape.experts == 256 && shape.topk == 8
         && shape.layers > shape.first_layer && layers.last() == Some(&(shape.layers - 1))
         && layers.iter().all(|&layer| (shape.first_layer..shape.layers).contains(&layer))
@@ -952,11 +952,11 @@ mod tests {
         assert!(request(&invalid).is_err());
         let mut pair = native.clone(); pair.gpus.push(pair.gpus[0]);
         assert!(request(&pair).is_ok());
-        for ranks in 1..=6 {
+        for ranks in 1..=8 {
             let mut supported = pair.clone(); supported.spark_ranks = ranks;
             assert!(request(&supported).is_ok());
         }
-        let mut invalid = pair; invalid.spark_ranks = 7;
+        let mut invalid = pair; invalid.spark_ranks = 9;
         assert!(request(&invalid).is_err());
     }
 

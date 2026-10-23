@@ -635,7 +635,7 @@ mod tests {
         for padded in [false, true] {
             let root = tempfile::tempdir().unwrap();
             fixture(root.path(), padded);
-            for world in 1..=6 {
+            for world in 1..=8 {
                 for set in [ExpertSet::Routed, ExpertSet::Shared] {
                     let mut owners = BTreeSet::new();
                     for rank in 0..world {

@@ -1646,7 +1646,7 @@ if [[ "$family" == qwen3_5 ]]; then
 fi
 if [[ "$family" == kimi_k3 ]]; then
   [[ "$backend" != local && "$ranks" == 6 ]] ||
-    release_die "Kimi K3 serves its routed experts on exactly six Spark ranks (TP6), not $ranks; set SPARK_COUNT=6"
+    release_die "Kimi K3 TP$ranks has no installed kimik3:exl3-k23 Spark recipe or rank-sized intake/admission; export balanced H128 widths and parameterize the Kimi executor (currently TP6 width 512)"
 fi
 if [[ "$family" == step5 ]]; then
   step5_kv_cache="$(get KV_CACHE fp8)"

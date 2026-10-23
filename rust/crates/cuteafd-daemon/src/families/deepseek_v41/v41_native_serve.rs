@@ -133,14 +133,14 @@ fn start(mut args: crate::cli::NativeServeArgs, http: bool) -> Result<Started> {
         Ok(report) => tracing::info!(target: "cuteafd::fabric", rails = report.rails.use_rails, "{}", report.summary()),
         Err(error) => tracing::warn!(target: "cuteafd::fabric", "fabric discovery failed: {error:#}"),
     }
-    let topology = crate::shared::spark_topology::resolve(
+    crate::shared::spark_topology::resolve(
         args.spark_tp,
         args.spark_ep,
         args.peers.len(),
         "serve-native",
     )?;
-    ensure!(topology.is_some() || matches!(args.peers.len(), 2 | 3 | 4 | 6),
-        "unsupported V4.1 Spark count {}; supported counts: 2, 3, 4, 6", args.peers.len());
+    ensure!((1..=8).contains(&args.peers.len()),
+        "V4.1 Spark transport requires 1..=8 peers, got {}", args.peers.len());
     if args.pool_tokens == Some(0) && args.memory_reservation.is_none() {
         args.memory_reservation = Some("97%".parse()?);
     }

@@ -151,7 +151,7 @@ pub(crate) fn run_plan(mut args: PlanArgs) -> Result<()> {
     }
     if args.config.is_some() {
         let cfg = launch_config(args.config.as_deref())?;
-        args.available_sparks = (0..6).take_while(|rank|
+        args.available_sparks = (0..8).take_while(|rank|
             cfg.get(&format!("SPARK_{rank}_HOST")).is_some_and(|host| !host.is_empty())).count();
         if args.spark_ranks.is_none() {
             let count = cfg.get("SPARK_COUNT").filter(|v| !v.is_empty())
@@ -404,7 +404,7 @@ fn launch_config(path: Option<&std::path::Path>) -> Result<std::collections::BTr
 
 fn spark_hosts_count(cfg: &std::collections::BTreeMap<String, String>) -> Result<Option<usize>> {
     let Some(hosts) = cfg.get("SPARK_HOSTS").filter(|value| !value.is_empty()) else { return Ok(None) };
-    let configured: std::collections::BTreeSet<&str> = (0..6)
+    let configured: std::collections::BTreeSet<&str> = (0..8)
         .filter_map(|rank| cfg.get(&format!("SPARK_{rank}_HOST")).map(String::as_str)).collect();
     let pool = ["ostrich", "dodo", "emu", "kiwi", "rhea", "moa"];
     let mut seen = std::collections::BTreeSet::new();
@@ -1256,6 +1256,9 @@ mod tests {
         let cfg = |hosts: &str| std::collections::BTreeMap::from([
             ("SPARK_HOSTS".into(), hosts.into()), ("SPARK_0_HOST".into(), "custom".into())]);
         assert_eq!(spark_hosts_count(&cfg("ostrich,custom")).unwrap(), Some(2));
+        let mut eight = cfg("worker0,worker1,worker2,worker3,worker4,worker5,worker6,worker7");
+        for rank in 0..8 { eight.insert(format!("SPARK_{rank}_HOST"), format!("worker{rank}")); }
+        assert_eq!(spark_hosts_count(&eight).unwrap(), Some(8));
         for hosts in ["ostrich,ostrich", "ostrich,", ",ostrich", "ostrich, emu", "unknown"] {
             assert!(spark_hosts_count(&cfg(hosts)).is_err(), "{hosts}");
         }
