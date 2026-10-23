@@ -1644,6 +1644,29 @@ fn deepseek_v4_plan_reads_the_runtime_config_source() {
 }
 
 #[test]
+fn v4_plan_shared_span_is_independent_of_unit_rows_and_waves() {
+    let dir = v4_snapshot();
+    for unit in [2048, 4096] {
+        for waves in [1, 2, 3] {
+            let reports: Vec<_> = [None, Some(2048), Some(32768)].into_iter().map(|span| {
+                let report = plan(dir.path(), &PlanOptions { layout: Some(layout::LayoutOptions {
+                    host_memory: Some((128 << 30, 128 << 30)), host_cache_bytes: Some(0),
+                    prefill_rows: unit, prefill_unit_rows: Some(unit), prefill_waves: waves,
+                    prefill_span_rows: span, pool_tokens: Some(32768), ..Default::default()
+                }), ..sparks(4) }).unwrap();
+                assert_eq!(report.prefill_span_rows, Some(span.unwrap_or(16384)));
+                report
+            }).collect();
+            let device_items = |report: &PlanReport| report.memory_layout.as_ref().unwrap().devices.iter()
+                .map(|device| device.items.iter().map(|item| (item.group.clone(), item.bytes)).collect::<Vec<_>>())
+                .collect::<Vec<_>>();
+            assert_eq!(device_items(&reports[0]), device_items(&reports[1]));
+            assert_eq!(device_items(&reports[0]), device_items(&reports[2]));
+        }
+    }
+}
+
+#[test]
 fn v4_workspace_plan_matches_runtime_below_compiled_context() {
     use crate::serving_capacity::{compiled_c128_width, deepseek_v4_workspace_geometry,
         deepseek_v4_workspace_scratch};

@@ -34,6 +34,8 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyMo
         ShapePolicy { all_native_stages: true, ..ShapePolicy::manifest_bounded() });
     shape.prefill_rows = options.prefill_unit_rows.unwrap_or(shape.prefill_rows);
     options.prefill_unit_rows = Some(shape.prefill_rows);
+    // Continuous spans do not change the slot-owned workspace geometry.
+    report.prefill_span_rows = Some(options.prefill_span_rows.unwrap_or(16384));
     let gpus = options.rtx_bytes.len().clamp(1, 2);
     let split = gpus == 2 && options.head_split;
     let ranks = if split { 2 } else { 1 };
