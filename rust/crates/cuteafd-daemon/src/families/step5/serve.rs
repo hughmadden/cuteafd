@@ -151,6 +151,7 @@ fn with_backend<T>(args: &ServeArgs,
     let mut inputs = RuntimeInputs { kv_format: args.kv_cache, inventory: Inventory { gpus: measured.baselines(&[]).into_iter()
         .map(|(capacity_bytes, baseline)| GpuBudget { capacity_bytes, baseline, headroom_bytes: headroom }).collect(),
         spark_ranks: args.peers.len(), peer_access: ids.len() == 2 }, rows: args.prefill_rows as usize,
+        full_prefill_logits: args.full_prefill_logits,
         sequences: usize::from(args.max_sequences), context: args.max_context,
         requested_pool: args.pool_tokens,
         marks: admission::prefix_marks(&args.prefix, usize::from(args.max_sequences)),
@@ -179,7 +180,8 @@ fn with_backend<T>(args: &ServeArgs,
             spark_rings(config.max_frame_bytes)?, clients)?)?;
     let available = inputs.inventory.gpus.iter().map(GpuBudget::available).collect::<Vec<_>>();
     let reserves = (0..ids.len()).map(|rank| {
-        let native = Execution::serving_admission(&programs, &checkpoint, &admission.ownership, rank, inputs.rows)?;
+        let native = Execution::serving_admission(&programs, &checkpoint, &admission.ownership, rank, inputs.rows,
+            inputs.logit_rows())?;
         let mut native = native;
         if rank == usize::from(admission.ownership.execution().spec().head_gpu) {
             native.workspace = native.workspace.max(
@@ -228,7 +230,7 @@ fn with_backend<T>(args: &ServeArgs,
     if push {
         let recorder = crate::shared::experts::rtx::dense::Recorder::start(true)?.context("dense recorder")?;
         let loaded = Execution::load_native(&programs, &checkpoint, &ownership, &caches_ref, &stages_ref,
-            inputs.rows, &available, &reserves, 92);
+            inputs.rows, inputs.logit_rows(), &available, &reserves, 92);
         let records = recorder.finish();
         native = Some(loaded?);
         let planned = (|| -> Result<_> {
@@ -270,6 +272,7 @@ fn with_backend<T>(args: &ServeArgs,
             match native {
                 Some(native) => Ok(native),
                 None => Execution::load_native(&programs, &checkpoint, &ownership, &caches_ref, &stages_ref, inputs.rows,
+                    inputs.logit_rows(),
                     &available, &reserves, 92),
             }
         })
@@ -288,7 +291,8 @@ fn with_backend<T>(args: &ServeArgs,
     let mtp = predictor_budget.map(|(available, reserved)| super::mtp::Runtime::load(
         &execution, &programs, &checkpoint, &caches[head_rank].borrow(),
         usize::from(args.mtp), inputs.rows, available, &[reserved])).transpose()?;
-    let backend = Step5Backend::new(&execution, caches.iter().collect(), &embedding, &target_input)?;
+    let backend = Step5Backend::new(&execution, caches.iter().collect(), &embedding, &target_input)?
+        .with_full_prefill_logits(args.full_prefill_logits);
     let backend = if let Some(mtp) = &mtp { backend.with_mtp(mtp) } else { backend };
     library.cuda_set_device(args.device)?;
     tracing::info!(rows=inputs.rows, sequences=inputs.sequences, mtp=args.mtp,
@@ -436,7 +440,7 @@ mod tests {
             inventory: Inventory { gpus: vec![GpuBudget { capacity_bytes: capacity,
                 baseline: Baseline::Measured { free_bytes: capacity - arch.context_bytes },
                 headroom_bytes: LayoutOptions::default().headroom_bytes }; 2], spark_ranks: 6, peer_access: true },
-            rows: 256, sequences: 16, context: args.max_context, requested_pool: None,
+            rows: 256, full_prefill_logits: false, sequences: 16, context: args.max_context, requested_pool: None,
             marks: admission::prefix_marks(&args.prefix, 16), peer_diagnostics: false,
             pending_code: (0..2).map(|rank| placement::inventory::loaded_code_allowance(
                 "step5", &format.package_name("step5"), true, rank, &arch, Some(&selected)).bytes).collect(),
@@ -462,7 +466,7 @@ mod tests {
             let head_rank = usize::from(admitted.ownership.execution().spec().head_gpu);
             for rank in 0..2 {
                 let mut native = Execution::serving_admission(&programs, &checkpoint,
-                    &admitted.ownership, rank, inputs.rows)?;
+                    &admitted.ownership, rank, inputs.rows, inputs.logit_rows())?;
                 if rank == head_rank {
                     native.workspace = native.workspace.max(
                         plan::families::step5::native::mtp_forecast_workspace(inputs.rows, usize::from(depth), inputs.kv_format)?);
@@ -480,7 +484,8 @@ mod tests {
                 "predictor runtime exceeds admitted owners/cache");
             for stage in 0..usize::from(depth) {
                 super::super::mtp::InputPlan::prepare(&programs, &checkpoint, stage, inputs.rows)?;
-                super::super::head::HeadPlan::for_mtp_stage(&programs, &checkpoint, stage, inputs.rows)?;
+                super::super::head::HeadPlan::for_mtp_stage(&programs, &checkpoint, stage,
+                    plan::families::step5::native::head_rows(inputs.rows, false))?;
                 super::super::ffn::DensePlan::for_mtp_stage(&programs, &checkpoint,
                     stage, inputs.rows, u64::MAX, &[])?;
             }

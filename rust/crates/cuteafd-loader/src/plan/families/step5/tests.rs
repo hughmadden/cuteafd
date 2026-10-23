@@ -192,7 +192,7 @@ fn full_context_mtp_forecast_charges_private_predictors_before_allocation() -> a
             inventory: Inventory { gpus: vec![GpuBudget { capacity_bytes: capacity,
                 baseline: Baseline::Planned { context_bytes: arch.context_bytes, loaded_bytes: 0 },
                 headroom_bytes: 1 << 30 }; 2], spark_ranks: 6, peer_access: true },
-            rows: 256, sequences: 16, context: 1_048_576,
+            rows: 256, full_prefill_logits: false, sequences: 16, context: 1_048_576,
             requested_pool: Some(1_048_576),
             marks: MarkRule { lanes: 16, entries: 20, budget_bytes: 2 << 30, host: true },
             pending_code: (0..2).map(|rank| inventory::loaded_code_allowance(
@@ -208,7 +208,7 @@ fn full_context_mtp_forecast_charges_private_predictors_before_allocation() -> a
             assert!(admitted.cache.ranks[1].mtp_stage_hidden.is_empty());
             let weights = coordinator::RankWeightLayout::for_mtp(&cp, depth)?.resident_bytes;
             for rank in 0..2 {
-                let target = native::rank_admission(&cp, &admitted.ownership, rank, inputs.rows)?;
+                let target = native::rank_admission(&cp, &admitted.ownership, rank, inputs.rows, inputs.logit_rows())?;
                 let item = |group| admitted.fixed.iter().find(|item| item.gpu == rank as u8 && item.group == group)
                     .expect("native charge").bytes;
                 assert_eq!(item("Step-5 native target and head"), target.immutable + if rank == 0 { weights } else { 0 });
@@ -307,14 +307,17 @@ fn execution_owners_bind_native_weights_cache_and_exact_snapshots() {
             let weights: Vec<_> = (0..ranks).map(|rank| RankWeightLayout::for_execution(&cp, rank, &owners).unwrap()).collect();
             for rank in 0..ranks {
                 let rows = owners.execution().spec().rows as usize;
-                let layer_bytes = (0..cfg.layers).filter_map(|layer| {
+                let attention = (0..cfg.layers).filter_map(|layer| {
                     let local = owners.layer(layer, rank).unwrap();
-                    (local.query_heads > 0).then(|| native::layer_workspace(
-                        rows, cfg.full[layer], local.query_heads, cfg.moe[layer]).unwrap())
+                    (local.query_heads > 0).then(|| native::attention_bytes(
+                        rows, cfg.full[layer], local.query_heads).unwrap())
                 }).collect::<Vec<_>>();
-                let head_bytes = if rank == usize::from(head) { native::plane_bytes(&native::head_planes(rows).unwrap()).unwrap() } else { 0 };
+                let layer_bytes = attention.iter().map(|bytes| bytes + native::ffn_region_bytes(rows).unwrap())
+                    .collect::<Vec<_>>();
+                let logits = native::head_rows(rows, false);
+                let head_bytes = if rank == usize::from(head) { native::plane_bytes(&native::head_planes(logits).unwrap()).unwrap() } else { 0 };
                 let expected = layer_bytes.iter().copied().max().unwrap_or(0).max(head_bytes);
-                assert_eq!(native::rank_admission(&cp, &owners, rank, rows).unwrap().workspace, expected);
+                assert_eq!(native::rank_admission(&cp, &owners, rank, rows, logits).unwrap().workspace, expected);
                 if layer_bytes.len() > 1 { assert!(expected < layer_bytes.iter().sum::<u64>() + head_bytes); }
             }
             for (layer, &mode) in modes.iter().enumerate() {
@@ -770,7 +773,10 @@ fn nvfp4_min_card_admits_native_w4a4_and_bf16_root_stays_reference_only() {
             assert_eq!(roomy.memory_layout.unwrap().pool_tokens, target);
         }
         assert!(memory.devices.iter().all(|d| d.used_bytes() <= d.capacity_bytes));
-        let endpoint = cuteafd_core::SparkEndpoint { capacity: 256, ingress: cuteafd_core::SparkIngress::Bf16 };
+        // The endpoint holds the planner's automatic prefill unit.
+        let rows = result.prefill_rows.expect("planned prefill rows");
+        assert!([2048, 1024, 512].contains(&rows), "{rows}");
+        let endpoint = cuteafd_core::SparkEndpoint { capacity: rows as u32, ingress: cuteafd_core::SparkIngress::Bf16 };
         let rings = cuteafd_core::SparkRings { max_frame_bytes: 64 << 20,
             depth: 8, slot_bytes: 8 << 20, alignment: 4096 };
         let lane_rings = endpoint.ring_bytes(cuteafd_core::ExpertGeometry::STEP5, rings).unwrap();
@@ -1175,6 +1181,45 @@ fn nvfp4_routed_admission_rechecks_packing_scales_and_role() {
         for role in [TensorRole::layer(Component::RoutedExpert, 4),
             TensorRole::layer(Component::RoutedExpert, 88), TensorRole::layer(Component::DenseFfn, 3)] {
             assert!(model.accepts(&role, &stem, &mut operand.clone()).is_err());
+        }
+    }
+}
+
+/// Startup validates that the peer's replicated routed reply never lands in
+/// storage a previous replication used without a head exchange in between.
+/// The shared FFN region must keep that true for every owner pattern the
+/// planner can produce (contiguous and alternating CSA owners).
+#[test]
+fn shared_ffn_region_keeps_replicated_replies_apart() {
+    use crate::placement::{FfnMode, LayerMode};
+    use super::ownership::{self, ExecutionOwnership};
+    let dir = snapshot("fp8");
+    let cp = Checkpoint::open(dir.path()).unwrap();
+    let cfg = Config::parse(&cp).unwrap();
+    let csa: Vec<usize> = (0..cfg.layers).filter(|&l| cfg.full[l]).collect();
+    for contiguous in [true, false] {
+        let modes: Vec<_> = (0..cfg.layers).map(|layer| if !cfg.full[layer] { LayerMode::HeadSplit } else {
+            let ordinal = csa.iter().position(|&l| l == layer).unwrap();
+            let gpu = if contiguous { u8::from(ordinal >= csa.len() / 2) } else { (ordinal % 2) as u8 };
+            LayerMode::Whole { gpu, ffn: FfnMode::Owner }
+        }).collect();
+        let owners = ExecutionOwnership::new(&cfg, 2, ownership::plan(&modes, 0, 0)).unwrap();
+        for rows in [256, 2048] {
+            let mut copies = owners.routed_replications().unwrap();
+            for (layer, copy) in copies.iter_mut().enumerate() {
+                if let Some(copy) = copy {
+                    let destination = 1 - usize::from(copy.source);
+                    let base = native::rank_attention_bytes(&cfg, &owners, destination, rows).unwrap() as usize;
+                    // Live binding: the destination layer's ROUTED plane in its arena.
+                    copy.storage = 1 + base + native::routed_layout(rows, cfg.full[layer]).unwrap()[9].0;
+                }
+            }
+            owners.execution().validate_routed_replications(&copies)
+                .unwrap_or_else(|error| panic!("contiguous={contiguous} rows={rows}: {error}"));
+            // A single reply plane would reuse storage across a CSA/SWA boundary.
+            let mut collapsed = copies.clone();
+            for copy in collapsed.iter_mut().flatten() { copy.storage = 1; }
+            assert!(owners.execution().validate_routed_replications(&collapsed).is_err());
         }
     }
 }

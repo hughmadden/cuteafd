@@ -14,6 +14,30 @@ use cuteafd_core::memory_layout::{Basis, Category, DeviceKind, DeviceLayout, Ite
 #[error("Step-5 layout is unqualified: {0}; use WIP FP8 on 2 RTX PRO 6000 + 6 Sparks or NVFP4 on 1 RTX PRO 6000 + 4 Sparks")]
 struct Unqualified(&'static str);
 
+/// Prefill units: 2048 rows by default, stepping down when the larger unit
+/// would cost pool capacity. An explicit --prefill-rows is never changed.
+const DEFAULT_ROWS: [usize; 3] = [2048, 1024, 512];
+
+fn default_rows(inputs: &mut RuntimeInputs,
+    mut admit: impl FnMut(&RuntimeInputs) -> Result<admission::Admission>) -> Result<(usize, admission::Admission)> {
+    // The smallest unit's pool is the reference: a larger unit is taken only
+    // when it admits the same pool (its extra rows cost no KV capacity).
+    let smallest = *DEFAULT_ROWS.last().expect("default prefill units");
+    inputs.rows = smallest;
+    let reference = admit(inputs)?;
+    for rows in DEFAULT_ROWS {
+        if rows == smallest { break; }
+        inputs.rows = rows;
+        if let Ok(admitted) = admit(inputs) {
+            if admitted.placement.pool_tokens >= reference.placement.pool_tokens {
+                return Ok((rows, admitted));
+            }
+        }
+    }
+    inputs.rows = smallest;
+    Ok((smallest, reference))
+}
+
 pub(super) fn layout(
     model: &Model,
     input: &PlanInput,
@@ -58,11 +82,8 @@ pub(super) fn layout(
             && opts.local_expert_layers.is_none_or(|n| n == 0),
         Unqualified("coordinator-local routed experts")
     );
-    let rows = usize::try_from(if opts.prefill_rows == 0 {
-        256
-    } else {
-        opts.prefill_rows
-    })?;
+    let explicit_rows = usize::try_from(opts.prefill_rows)?;
+    let checked_rows = if explicit_rows == 0 { DEFAULT_ROWS[0] } else { explicit_rows };
 
     let sequences = usize::try_from(if opts.concurrency == 0 {
         16
@@ -130,8 +151,8 @@ pub(super) fn layout(
             ensure!(
                 entry["capacity_rows"]
                     .as_u64()
-                    .is_some_and(|n| n >= rows as u64),
-                "Step-5 export {name} cannot hold live rows {rows}"
+                    .is_some_and(|n| n >= checked_rows as u64),
+                "Step-5 export {name} cannot hold live rows {checked_rows}"
             );
         }
     }
@@ -168,10 +189,11 @@ pub(super) fn layout(
         spark_ranks,
         peer_access: coordinators == 2,
     };
-    let inputs = RuntimeInputs {
+    let mut inputs = RuntimeInputs {
                 kv_format: opts.step5_kv,
         inventory,
-        rows,
+        rows: if explicit_rows == 0 { DEFAULT_ROWS[0] } else { explicit_rows },
+        full_prefill_logits: opts.full_prefill_logits,
         sequences,
         context,
         requested_pool: opts.pool_tokens,
@@ -185,7 +207,15 @@ pub(super) fn layout(
         pending_code: code,
         startup: vec![],
     };
-    let admitted = admission::forecast_mtp(input.checkpoint(), &inputs, opts.native_mtp_layers)?;
+    let admitted = if explicit_rows != 0 {
+        admission::forecast_mtp(input.checkpoint(), &inputs, opts.native_mtp_layers)?
+    } else {
+        let (rows, admitted) = default_rows(&mut inputs, |inputs|
+            admission::forecast_mtp(input.checkpoint(), inputs, opts.native_mtp_layers))?;
+        report.prefill_selection = Some(format!("Step-5 automatic prefill selected {rows} rows"));
+        admitted
+    };
+    let rows = inputs.rows;
     report.prefill_rows = Some(rows as u64);
     report.attention_placement = admitted.placement.attention_placement;
     report.bytes_by_owner.clear();

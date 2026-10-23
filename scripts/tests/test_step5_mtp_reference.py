@@ -30,7 +30,7 @@ def test_mtp_shared_arena_target_history_and_logits_retire_before_prefill_draft(
     ordered(execute, "self.execution.enqueue(", "self.execution.terminal_output()?",
             "cache.request_component(history, sequence.sequence)?",
             "super::mtp::slice(output,", "cuda_f32_to_bf16_async(source, destination,",
-            "head.device_logits_on(output, meta.rows, meta.stream)", "Ok((step, logits))")
+            "head.device_logits_on(input, rows, meta.stream)", "Ok((step, logits))")
     immediate = backend.split("    fn immediate(", 1)[1].split("impl Drop", 1)[0]
     ordered(immediate, "self.execute(", "step.publish_wave(&mut accepted)?", "Ok(logits)")
     prefill = backend.split("    fn prefill_device(", 1)[1].split("    fn verify_device(", 1)[0]

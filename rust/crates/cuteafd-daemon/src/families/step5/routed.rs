@@ -41,6 +41,8 @@ struct Admission {
     rows: usize,
     planes: [usize; 14],
     bytes: u64,
+    /// A whole-owned (CSA) layer takes the second replicated-reply plane.
+    full: bool,
 }
 impl Admission {
     fn new(
@@ -72,6 +74,7 @@ impl Admission {
             rows,
             planes,
             bytes,
+            full: false,
         })
     }
 }
@@ -218,7 +221,8 @@ impl RoutedPlan {
                 && programs.spec("step5_residual_f32")?.geometry["width"] == H,
             "Step-5 routed pointwise geometry"
         );
-        let admission = Admission::new(rows, &weights, available, reservations)?;
+        let mut admission = Admission::new(rows, &weights, available, reservations)?;
+        admission.full = contract.layers[layer].sliding.is_none();
         Ok(Self {
             layer,
             layout,
@@ -311,7 +315,10 @@ impl<'a> RoutedFfn<'a> {
     fn workspace(device: Device<'a>, admission: Admission,
         immutable: std::rc::Rc<RoutedWeights<'a>>, arena: Option<(&Arena<'a>, usize)>) -> Result<Self> {
         let _scope = cuteafd_ffi::memory_ledger::scope("step5_routed_workspace");
-        let planes = scratch::planes(device, &admission.planes, arena)?;
+        let spans = cuteafd_loader::plan::families::step5::native::routed_layout(admission.rows, admission.full)?;
+        ensure!(spans.iter().zip(&admission.planes).all(|(span, &bytes)| span.1 == bytes),
+            "Step-5 routed region layout differs from admission");
+        let planes = scratch::region_planes(device, &spans, arena)?;
         let stream = Stream::new(device)?;
         Ok(Self { stream, planes, admission, immutable })
     }

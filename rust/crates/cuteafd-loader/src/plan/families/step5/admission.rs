@@ -165,6 +165,9 @@ pub struct RuntimeInputs {
     pub kv_format: crate::families::qwen4::Qwen4KvCache,
     pub inventory: Inventory,
     pub rows: usize,
+    /// All-row prefill scoring was admitted at launch; otherwise the head holds
+    /// only the decode/verify width (prefill needs its last row).
+    pub full_prefill_logits: bool,
     pub sequences: usize,
     pub context: u64,
     pub requested_pool: Option<u64>,
@@ -197,6 +200,10 @@ fn scaled(bytes: u64, count: usize) -> Result<u64> {
 }
 
 impl RuntimeInputs {
+    pub fn logit_rows(&self) -> usize {
+        super::native::head_rows(self.rows, self.full_prefill_logits)
+    }
+
     pub fn validate(&self, cfg: &Config) -> Result<()> {
         let ranks = self.inventory.gpus.len();
         ensure!(
@@ -309,7 +316,7 @@ pub fn admit(checkpoint: &Checkpoint, inputs: &RuntimeInputs) -> Result<Admissio
     let cfg = Config::parse(checkpoint)?;
     admit_with(&cfg, inputs, |ownership| {
         (0..ownership.ranks())
-            .map(|rank| super::native::rank_admission(checkpoint, ownership, rank, inputs.rows))
+            .map(|rank| super::native::rank_admission(checkpoint, ownership, rank, inputs.rows, inputs.logit_rows()))
             .collect()
     })
 }
@@ -331,7 +338,8 @@ pub fn admit_mtp(checkpoint: &Checkpoint, inputs: &RuntimeInputs, depth: usize) 
     let workspace = super::native::mtp_forecast_workspace(inputs.rows, depth, inputs.kv_format)?;
     admit_depth_with(&cfg, inputs, depth, |ownership| {
         (0..ownership.ranks()).map(|rank| {
-            let mut native = super::native::rank_admission(checkpoint, ownership, rank, inputs.rows)?;
+            let mut native = super::native::rank_admission(checkpoint, ownership, rank, inputs.rows,
+                inputs.logit_rows())?;
             if rank == usize::from(ownership.execution().spec().head_gpu) {
                 native.immutable = native.immutable.checked_add(weights)
                     .context("Step-5 predictor weight forecast overflow")?;
@@ -670,6 +678,7 @@ mod tests {
     fn inputs(ranks: usize) -> RuntimeInputs {
         RuntimeInputs {
                 kv_format: crate::families::qwen4::Qwen4KvCache::Bf16,
+            full_prefill_logits: false,
             inventory: Inventory {
                 gpus: vec![
                     GpuBudget {
