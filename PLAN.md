@@ -5460,14 +5460,24 @@ and scratch scheme. Step-5 and Qwen 4 had no overlap at all.
   capacity. V4.1 at 2048 is this rule applied by hand: on 1 RTX, workspaces
   went 21.08 → 11.01 GiB and RTX expert layers 5 → 6. Families don't hardcode
   their own value.
+- **One lane, several waves:** a prefill chunk runs in one lane with one
+  transport. The pipeline may keep up to N windows' expert waves in flight at
+  once. That's lanes' overlap without duplicating workspaces or transports.
+  Each in-flight window needs only its own return buffer; its scratch rows are
+  already its own. Default N=1. Raise it where a profile shows the Sparks
+  idling between waves (Spark-bound prefill). Keep it at 1 where the GPU is
+  the bound.
 - **Windows:** at most 3, at least 256 rows each, 64-row page aligned, until
   the sweep below sets a shared rule. MiMo's measurement suggests the best
   count follows expert size: Pro (TP6) is faster with 3, Flash (TP4) with 2.
 - **Gates for each family:** byte-identical logits and KV between 1 window and
   N windows at fixed chunking, exact prefix cache, and one card with 8K
   prefill and TTFT.
-- **Follow-up:** one sweep of windows {2,3} × chunk {1024,2048,4096} on a
-  big-expert family and a small-expert family, then set the shared default.
+- **Follow-up:** one sweep of windows {2,3} × waves in flight {1,2,3} ×
+  chunk {1024,2048,4096} on a big-expert family and a small-expert family,
+  including one family's old lanes against the shared pipeline. Then set the
+  shared defaults. GLM's and MiMo's measured lane counts are the starting
+  values for their waves in flight.
   Defaults today: GLM 5.3 3 lanes, GLM Flash 2, MiMo 3/2 by size (measured),
   V4.1 2, Kimi ≤3 windows. Only MiMo's default was measured.
 
