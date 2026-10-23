@@ -14,7 +14,8 @@ fn host_ledger_charges_resolved_quota_and_reports_other_owners_and_refusal() {
     for (total, expected) in [(183u64, 32u64), (64, 16)] {
         let mut report = input.plan(&PlanOptions::default()).unwrap();
         let mut options = layout::LayoutOptions { host_memory: Some((total << 30, total << 30)),
-            full_prefill_logits: true, context_tokens: 1 << 40, ..Default::default() };
+            full_prefill_logits: true, context_tokens: 1 << 40,
+            prefill_unit_rows: Some(4096), ..Default::default() };
         layout::charge_host(&mut report, &options, input.checkpoint(), false).unwrap();
         let host = report.host_ledger.as_ref().unwrap();
         assert_eq!(report.host_budget_bytes, expected << 30);
@@ -177,7 +178,8 @@ fn host_automatic_quota_depends_on_concurrency_not_device_entries() {
             rows, page, mark.max(1), 0, chunk).unwrap().min(32 << 30);
         for entries in [1, 2000] {
             let options = layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)),
-                context_tokens: 1 << 20, concurrency, mimo_prefix_entries: entries, ..Default::default() };
+                context_tokens: 1 << 20, concurrency, mimo_prefix_entries: entries,
+                prefill_unit_rows: Some(4096), ..Default::default() };
             layout::charge_host(&mut report, &options, input.checkpoint(), false).unwrap();
             assert_eq!(report.host_budget_bytes, expected);
         }
@@ -190,7 +192,7 @@ fn host_media_quota_is_charged_only_for_supported_loaded_towers() {
     let input = PlanInput::open(dir.path()).unwrap();
     let mut report = input.plan(&PlanOptions::default()).unwrap();
     let mut options = layout::LayoutOptions { host_memory: Some((64 << 30, 64 << 30)),
-        host_cache_bytes: Some(0), ..Default::default() };
+        host_cache_bytes: Some(0), prefill_unit_rows: Some(4096), ..Default::default() };
     for (vision, audio, quota, expected) in [
         (MediaMode::Rtx(Some(0)), MediaMode::Off, None, (64u64 << 30) / 20),
         (MediaMode::Spark(Some(0)), MediaMode::Off, Some(2 << 30), 2 << 30),
@@ -218,7 +220,8 @@ fn host_full_logits_charge_gather_and_live_lane_but_not_mimo_pipeline() {
     let mut report = input.plan(&PlanOptions::default()).unwrap();
     report.prefill_rows = Some(4096);
     let options = layout::LayoutOptions { host_memory: Some((183 << 30, 183 << 30)),
-        host_cache_bytes: Some(0), prefill_lanes: 3, full_prefill_logits: true, ..Default::default() };
+        host_cache_bytes: Some(0), prefill_lanes: 3, full_prefill_logits: true,
+        prefill_unit_rows: Some(4096), ..Default::default() };
     let vocab = report.spec.as_ref().unwrap().vocab as u64;
     for (family, rows) in [("mimo_v2", 4096u64), ("glm5_flash", 4096 * 4), ("glm5", 4096 * 4)] {
         report.family = Some(family.into());

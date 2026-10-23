@@ -1193,7 +1193,7 @@ pub(crate) fn charge_host(report: &mut PlanReport, options: &LayoutOptions, chec
     } else {
         crate::serving_capacity::PrefillShape { unit_rows, waves: options.prefill_waves }.validate()?.slot_rows()
     };
-    let lanes = match family {
+    let lanes = if let Some(lanes) = report.prefill_lanes { lanes } else { match family {
         "glm5" => if options.prefill_lanes > 0 { options.prefill_lanes } else {
             glm_prefill_lanes(std::env::var("CUTEAFD_GLM_PREFILL_LANES").ok().as_deref()) as u64 },
         "glm5_flash" => if options.prefill_lanes > 0 { options.prefill_lanes }
@@ -1206,8 +1206,7 @@ pub(crate) fn charge_host(report: &mut PlanReport, options: &LayoutOptions, chec
                 cfg.program_family()?, configured.as_deref())? as u64
         }
         _ => 1,
-    };
-    let lanes = report.prefill_lanes.unwrap_or(lanes);
+    }};
     let hidden = spec.hidden as u64;
     let topk = spec.moe.as_ref().map_or(0, |m| m.top_k as u64);
     let mut items = Vec::new();
