@@ -29,6 +29,9 @@ typedef struct {
   uint64_t patch_bias, pos_embed, merger_norm_bias, merger_fc1_bias, merger_fc2_bias;
   uint64_t merger_extra[8];
   uint64_t norm1_bias[28], norm2_bias[28], q_norm[28], k_norm[28];
+  /* ABI 3, reserved=4: MiniMax. ABI 2 ends before this suffix. */
+  cuteafd_vision_block blocks_extra[4];
+  uint64_t norm1_bias_extra[4], norm2_bias_extra[4];
 } cuteafd_vision_spec;
 
 typedef struct {
@@ -38,7 +41,8 @@ typedef struct {
 /* Probe-only observer: stage 0 patch, 1..28 blocks, 29 merger norm, 30 output.
  * data is device FP32 (stage 30 is BF16); column_order applies to block rows.
  * The observer must not retain data past its return, and must propagate errors.
- * Owner remains alive until all queued CUDA work has drained, including errors. */
+ * Owner remains alive until all queued CUDA work has drained, including errors.
+ * ABI 3: stage 0 pre-LN, 1..32 blocks, 33 BF16 output. */
 typedef int32_t (*cuteafd_vision_observer)(void*, int32_t stage, const void* data,
                                          int32_t rows, int32_t width, int32_t column_order);
 
@@ -54,6 +58,11 @@ int32_t cuteafd_vision_encode(void* owner, const uint8_t* rgb, uint64_t rgb_byte
                              const float* lut, int32_t grid_h, int32_t grid_w,
                              uint16_t* output, uint64_t output_bytes,
                              cuteafd_vision_observer observer, void* observer_context);
+/* ABI 3 MiniMax: RGB8 contains 2*grid_t contiguous frames (at most four).
+ * The coordinator repeats the final frame for an odd frame count. */
+int32_t cuteafd_vision_encode_frames(void* owner, const uint8_t* rgb, uint64_t rgb_bytes,
+                                    const float* lut, int32_t grid_t, int32_t grid_h, int32_t grid_w,
+                                    uint16_t* output, uint64_t output_bytes);
 int32_t cuteafd_vision_get_ledger(void* owner, cuteafd_vision_ledger*);
 int32_t cuteafd_vision_destroy(void* owner);
 

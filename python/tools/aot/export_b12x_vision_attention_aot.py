@@ -67,7 +67,7 @@ def main():
 
     destination = args.output_dir
     destination.mkdir(parents=True, exist_ok=True)
-    for dim in (64, 72):
+    for dim in (64, 72, 80):
         stem = f"vision_attention_d{dim}"
         symbol = "cuteafd_" + stem
         manifest_path = destination / (stem + ".json")

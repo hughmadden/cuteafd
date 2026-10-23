@@ -114,3 +114,27 @@ fn card_layouts_on_5090_and_pro_6000() {
     let refused = plan::plan(dir.path(), &with_layout(RTX_5090, 2)).unwrap();
     assert!(!refused.fits && refused.hints.iter().any(|h| h.what.contains("below one 256K request")), "{:?}", refused.hints);
 }
+
+#[test]
+fn vision_uses_encoder_owner_and_reserves_weights_and_scratch() {
+    use crate::plan::{encoder::EncoderKind, MediaMode};
+    let dir = snapshot(true, false);
+    for (mode, expected) in [(MediaMode::Rtx(Some(1)), EncoderKind::Rtx { gpu: 1 }),
+        (MediaMode::Spark(Some(2)), EncoderKind::Spark { rank: 2 }), (MediaMode::Off, EncoderKind::Off)] {
+        let mut options = with_layout(PRO_TOTAL_BYTES, 4);
+        options.layout.as_mut().unwrap().rtx_bytes = vec![PRO_TOTAL_BYTES; 2];
+        options.vision = mode;
+        let report = plan::plan(dir.path(), &options).unwrap();
+        let encoder = report.encoder.as_ref().unwrap();
+        assert_eq!(encoder.kind, expected);
+        let items: Vec<_> = report.memory_layout.as_ref().unwrap().devices.iter().flat_map(|d| &d.items)
+            .filter(|i| i.group.starts_with("vision")).collect();
+        if expected == EncoderKind::Off { assert!(items.is_empty()); assert_eq!(encoder.admitted_bytes(), 0); }
+        else {
+            assert_eq!(items.len(), 2);
+            assert_eq!(encoder.scratch, 762_383_616);
+            assert!(encoder.weights > report.components.iter().find(|c| c.component == Component::Vision).unwrap().bytes);
+            assert_eq!(items.iter().map(|i| i.bytes).sum::<u64>(), encoder.admitted_bytes());
+        }
+    }
+}
