@@ -5485,6 +5485,62 @@ Every family that sends experts to Sparks prefills the same way.
   checklists are in the executor agent's proposal
   (codex-runs/v4/prefill-shared-executor/prefill-contract-proposal.md).
 
+### Prefill executor API (shared, 2026-10-23)
+
+`shared/prefill_pipeline.rs` owns the schedule. A family implements
+`PrefillHooks` on its binding and calls `run_prefill_units(hooks, units, waves)`:
+
+- `route(layer)`: `Local` (dense or RTX-resident experts, completed inside one
+  hook) or `Spark` (a wave sent in one hook, landed in a later one);
+- `begin_unit`, `attention(layer, unit)`, `local_ffn(layer, unit)`,
+  `send_experts(layer, unit) -> Ticket`, `land_experts(layer, unit, ticket)`,
+  `end_unit` (exit hops, norm, requested head rows) and `commit_unit` (in
+  order).
+
+`prefill_units(span, unit_rows, waves, 256)` cuts equal, page-aligned units in
+multiples of `waves`. `prefill_schedule` is the pure order the executor and
+the CPU tests share:
+- units enter free slots in order and are served round-robin;
+- unit k+1 attends layer L only after unit k attended L;
+- waves land in dispatch order, and units commit in order;
+- a new unit is served before older units land again, so its first wave
+  queues behind theirs.
+
+Tests: contract rules with a stale-row detector over random routes, units,
+sequences and barriers; Spark occupancy (no idle within a unit; at a boundary
+only the new unit's GPU-only lead beyond one wave); error injection.
+
+Transport: `SparkLink::new_waves(.., waves, wave_rows)` admits `waves`
+outstanding waves on one link:
+- `LocalTp4Client` keeps a per-wave FIFO;
+- `SparkExperts` receives in dispatch order;
+- `SparkIntake` has one return slot per wave, each with its own consumed event;
+- retained receive slots repost in consumption order.
+
+Several waves take the pinned intake (GPU landing has one range per rank).
+
+Context-split staging (GLM 5.3 port; GLM Flash and V4 have the same shape):
+today only the first lane gathers each layer's history into that layer
+parity's staging view, and later lanes reuse it. Units can run ahead (dense
+leading layers, or a new unit entering mid-call), so another unit's gather for
+the same parity can land before a unit reads the view. Rule: every unit
+records its whole history. At its attention it reuses the parity view only
+when the last attention on that view was its predecessor's at the same layer;
+otherwise it gathers its own history. Steady state keeps the single gather;
+only the ramp re-gathers. Per-unit gather and commit plans are indexed by
+unit, workspaces and exchange lanes by slot. A slot reused mid-call uploads
+its tables in stream order (`copy_h2d_ordered`), and rank 0 waits on rank 1's
+progress before rewriting that slot's peer workspace.
+
+Buffer rule from the Step-5 port: two replicated replies with no head exchange
+between them never share a reply plane. Keep one fixed reply plane per
+replication kind (head-split routed reply, owned-layer reply), sliced per
+unit, and check it in every family with TP2 or head-split replication.
+Admission charges `prefill_return_bytes(waves, unit_rows, ranks, hidden)`;
+`PrefillShape::ladder` steps 2048 → 1024 → 512. Kimi K3 is the reference port
+(`kimi_k3/layers.rs` `UnitHooks`). The per-family checklists are in the
+executor agent's proposal.
+
 ### Prefill migration plan (cross-family, TJ 2026-10-23)
 
 Process (TJ, 2026-10-23):

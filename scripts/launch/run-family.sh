@@ -221,7 +221,7 @@ PROFILE_SPARK_NCU_SET
 PROFILE_SPARK_NCU_SKIP
 PROFILE_SPARK_NSYS_GPU_METRICS
 EOF
-    [[ "$1" != kimi_k3 ]] || printf '%s\n' KV_CACHE RTX_EXPERT_LAYERS SPECULATOR_MODEL_ID SPECULATOR_MODEL_REVISION SPECULATOR_DRAFTS
+    [[ "$1" != kimi_k3 ]] || printf '%s\n' KV_CACHE RTX_EXPERT_LAYERS SPECULATOR_MODEL_ID SPECULATOR_MODEL_REVISION SPECULATOR_DRAFTS PREFILL_ROWS PREFILL_WAVES
     [[ "$1" != step5 ]] || printf '%s\n' SPECULATOR_DEPTH KV_CACHE PREFILL_BATCH_TOKENS FULL_PREFILL_LOGITS
     _spark_slot_keys HOST LANE_A
     return
@@ -2059,6 +2059,10 @@ if [[ $family == kimi_k3 ]]; then
   [[ "$local_layers" == auto || "$local_layers" =~ ^[0-9]+$ ]] ||
     release_die "Kimi K3 RTX_EXPERT_LAYERS is auto or a fixed routed-layer count, not $local_layers"
   family_args+=(--rtx-expert-layers "$local_layers")
+  # PREFILL_ROWS/PREFILL_WAVES: the shared prefill units (rows each, units in
+  # flight on the one Spark transport); unset takes the family default.
+  [[ -z "$(get PREFILL_ROWS)" ]] || family_args+=(--prefill-rows "$(get PREFILL_ROWS)")
+  [[ -z "$(get PREFILL_WAVES)" ]] || family_args+=(--prefill-waves "$(get PREFILL_WAVES)")
   # Header-native EXL3 K6 core tensors are served natively (Kimi slots always
   # package the K6 programs).
 fi

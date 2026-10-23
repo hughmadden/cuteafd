@@ -48,6 +48,11 @@ pub(crate) struct Inputs<'a> {
     pub prefix_marks: usize,
     pub rows: usize,
     pub lanes: usize,
+    /// Prefill units in flight on the lane: `rows` holds `waves` units, and
+    /// the Spark transport admits that many waves (one return slot each).
+    pub waves: usize,
+    /// Explicit unit rows (else `rows / waves`).
+    pub unit_rows: Option<usize>,
     pub lane_layouts: Vec<[LaneLayout; 2]>,
     pub fixed: Vec<Demand>,
     pub startup: Vec<Demand>,
@@ -102,6 +107,8 @@ pub(crate) struct Admission<'a> {
     local_bound: Vec<[bool; 2]>,
     devices: [i32; 2],
     lanes: u64,
+    waves: usize,
+    unit_rows: usize,
     lane_layouts: Vec<[LaneLayout; 2]>,
     lane_allocated: Vec<[bool; 2]>,
     lane_readers: Vec<[Weak<Stream<'a>>; 2]>,
@@ -199,6 +206,9 @@ impl<'a> Admission<'a> {
     /// The caller completes shared SparkAdmission reconciliation first. Keep
     /// one transport/intake owner per admitted lane; expired owners cannot be
     /// replaced by an uncharged second allocation.
+    pub(crate) fn waves(&self) -> usize { self.waves }
+    pub(crate) fn unit_rows(&self) -> usize { self.unit_rows }
+
     pub(crate) fn connect_spark(&mut self, library: &'a std::sync::Arc<cuteafd_ffi::NativeLibrary>,
         local: &LocalLane<'a>,
         world: cuteafd_transport::expert::SparkWorld, peers: Vec<std::net::SocketAddr>,
@@ -206,7 +216,8 @@ impl<'a> Admission<'a> {
         let lane = local.lane_index();
         let expected = self.check_spark(lane)?;
         ensure!(Rc::ptr_eq(&expected, local.stream()), "Kimi Spark lane differs from admitted GPU1 intake owner");
-        let routed = super::spark::RoutedLane::connect(library, local, &self.placement, world, peers, config)?;
+        let routed = super::spark::RoutedLane::connect(library, local, &self.placement, world, peers, config,
+            self.waves, self.unit_rows)?;
         self.spark_connected[lane] = true;
         Ok(routed)
     }
@@ -508,6 +519,9 @@ pub(crate) fn admit<'a>(mut inputs: Inputs<'_>) -> Result<Admission<'a>> {
     let core = inputs.core.clone();
     let devices = inputs.devices;
     let lanes = inputs.lanes as u64;
+    let inputs_waves = inputs.waves;
+    let unit_rows = cuteafd_loader::families::kimi_k3::allocation::prefill_shape_with(inputs.rows, inputs.waves,
+        inputs.unit_rows)?.unit_rows as usize;
     let lane_layouts = inputs.lane_layouts.clone();
     let state_slots = inputs.state_slots;
     let legacy_marks = inputs.prefix_marks;
@@ -610,7 +624,7 @@ pub(crate) fn admit<'a>(mut inputs: Inputs<'_>) -> Result<Admission<'a>> {
     let lane_readers = (0..lane_layouts.len()).map(|_| std::array::from_fn(|_| Weak::new())).collect();
     let mla_layouts = [CacheLayout::new(cfg, &placement, 0, cache_format)?, CacheLayout::new(cfg, &placement, 1, cache_format)?];
     let admission = Admission { placement, mark_selection, graph_set, rtx, rtx_loaded: false, draft, draft_allocated: false, draft_marks_allocated: false, cfg: cfg.clone(), core, layouts, layer_owners, layer_uploaded, local_bound,
-        devices, lanes, lane_layouts, lane_allocated, lane_readers,
+        devices, lanes, waves: inputs_waves, unit_rows, lane_layouts, lane_allocated, lane_readers,
         kda_layout, kda_allocated: [false; 2], kda_owners: std::array::from_fn(|_| Weak::new()),
         mla_layouts, mla_allocated: [false; 2], mla_owners: std::array::from_fn(|_| Weak::new()),
         global_layouts, global_uploaded: [false; 2], global_owners: std::array::from_fn(|_| Weak::new()),
@@ -694,7 +708,7 @@ fn request(i: Inputs<'_>) -> Result<PlacementRequest> {
         }
     }
     for lane in 0..i.lanes {
-        let demand = super::spark::demand(i.rows, lane)?;
+        let demand = super::spark::demand_with(i.rows, i.waves, i.unit_rows, lane)?;
         ensure!(!fixed.iter().chain(&i.startup).any(|item| item.gpu == demand.gpu && item.group == demand.group),
             "Kimi Spark intake charge supplied twice");
         fixed.push(demand);
@@ -913,7 +927,7 @@ pub(super) mod tests {
     pub(in crate::families::kimi_k3) fn inputs(cfg: &KimiK3Config) -> Inputs<'_> {
         Inputs { cfg, core: Default::default(), cache_format: cuteafd_core::MlaCacheFormat::Bf16, gpus: [GpuBudget { capacity_bytes: 96 << 30, headroom_bytes: 2 << 30,
             baseline: Baseline::Measured { free_bytes: 96 << 30 } }; 2], devices: [0, 1], peer_access: true, spark_ranks: 6,
-            attention: None, requested_pool: None, state_slots: 2, prefix_marks: 2, rows: 4096, lanes: 2,
+            attention: None, requested_pool: None, state_slots: 2, prefix_marks: 2, rows: 4096, lanes: 2, waves: 2, unit_rows: None,
             lane_layouts: vec![std::array::from_fn(|_| LaneLayout::new(
                 &KimiK3Config::from_hf(&cuteafd_loader::plan::testing::kimi_k3_config()).unwrap(), 4096, 1_048_576,
                 super::super::device::NativeScratch { kda: 1024, mla: [512, 0, 1024] }).unwrap()); 2],
@@ -1668,7 +1682,7 @@ pub(super) mod tests {
         let lanes = i.lanes;
         let admitted = admit(i)?;
         for lane in 0..lanes {
-            let demand = super::super::spark::demand(rows, lane)?;
+            let demand = super::super::spark::demand(rows, 2, lane)?;
             let items = admitted.placement.items[1].iter().filter(|item| item.group == demand.group).collect::<Vec<_>>();
             assert_eq!(items.len(), 1);
             assert_eq!(items[0].bytes, (6 * rows * 3584 * 2) as u64);
@@ -1677,7 +1691,7 @@ pub(super) mod tests {
             assert!(!admitted.placement.items[0].iter().any(|item| item.group == demand.group));
         }
         let mut duplicate = inputs(&cfg);
-        duplicate.fixed.push(super::super::spark::demand(rows, 0)?);
+        duplicate.fixed.push(super::super::spark::demand(rows, 2, 0)?);
         assert!(admit(duplicate).is_err());
         Ok(())
     }

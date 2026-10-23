@@ -1129,7 +1129,8 @@ mod tests {
     fn subwave_views_partition_persistent_rows_and_preserve_residual_planes() -> Result<()> {
         let cfg = KimiK3Config::from_hf(&cuteafd_loader::plan::testing::kimi_k3_config())?;
         let layout = LaneLayout::new(&cfg, 4096, 1_048_576, NativeScratch { kda: 16, mla: [16; 3] })?;
-        let windows = crate::shared::prefill_pipeline::subwave_ranges(4096, 3, 64, 256)?;
+        let windows = crate::shared::prefill_pipeline::prefill_units(4096, 1408, 1, 256)?;
+        assert_eq!(windows.len(), 3);
         for (&name, &bytes) in &layout.operands {
             if layout.arena_offsets.contains_key(name) || ATTENTION_METADATA.contains(&name) { continue; }
             let mut end = 0;

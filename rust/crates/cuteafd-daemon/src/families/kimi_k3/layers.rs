@@ -98,66 +98,28 @@ impl<'a> Execution<'a> {
         bindings.iter_mut().map(|binding| binding.output(output)).collect()
     }
 
-    /// Ordered row windows share the one admitted main lane and Spark link.
-    /// Only the previous FFN waits; the next window's attention runs first.
-    pub(crate) fn run_subwaves(&self, scope: &SubmissionScope<'_>, peer: &PeerExchange<'a>,
+    /// One sequence's prefill as row units on the single admitted lane and
+    /// Spark link (PLAN "Prefill contract"): up to `waves` units' expert waves
+    /// in flight, each unit owning its rows of every lane operand.
+    pub(crate) fn run_units(&self, scope: &SubmissionScope<'_>, peer: &PeerExchange<'a>,
         hops: &HopLink<'a>, local: &mut [LocalLane<'a>; 2], routed: &mut RoutedLane<'a>,
-        experts: &mut [Option<Exl3Tp2<'a>>; 2], windows: &[std::ops::Range<usize>],
+        experts: &mut [Option<Exl3Tp2<'a>>; 2], units: &[crate::shared::prefill_pipeline::Unit], waves: usize,
         sequence: &super::device::SequenceRows<'_>, pool: &cuteafd_engine::prefix::RefPagePool,
         draft: Option<&super::draft::NativeDraft<'a>>) -> Result<CuteafdDeviceBuffer> {
-        use crate::shared::{prefill_pipeline::{subwave_actions, SubwaveAction},
-            peer_split::attention::{pipeline_attention, pipeline_hops}};
         let protocol = self.protocol(peer, hops)?;
         let mut binding = Bindings::new(local, routed, experts, self, peer, hops, scope, 0,
-            windows[0].len(), false)?;
+            units[0].rows.len(), false)?;
         binding.draft = draft;
         binding.defer_publication = true;
-        tracing::info!(start = sequence.start, rows = sequence.rows, subwaves = windows.len(),
-            sizes = ?windows.iter().map(|window| window.len()).collect::<Vec<_>>(),
-            "Kimi prefill sub-wave pipeline");
-        let mut completed = vec![0; windows.len()];
-        let mut consumed = vec![vec![0; self.plan.hops().len()]; windows.len()];
-        let mut pending = None;
-        for action in subwave_actions(self.plan.modes().len(), windows.len()) {
-            let (layer, wave) = match action {
-                SubwaveAction::Attention { layer, wave } | SubwaveAction::Begin { layer, wave }
-                    | SubwaveAction::Finish { layer, wave } => (layer, wave),
-            };
-            let window = &windows[wave];
-            for local in binding.local.iter_mut() { local.select_subwave(Some(window.clone()))?; }
-            binding.rows = window.len();
-            binding.completed = completed[wave];
-            binding.tap_first = window.start;
-            match action {
-                SubwaveAction::Attention { .. } => {
-                    binding.pending = None;
-                    let metadata = [super::device::SequenceRows { slot: sequence.slot,
-                        start: sequence.start + window.start, rows: window.len(), pages: sequence.pages }];
-                    for local in binding.local.iter_mut() { local.stage_attention(&metadata, pool)?; }
-                    pipeline_attention(&protocol, &self.plan, layer, 0, window.len(),
-                        &mut binding, &mut consumed[wave])?;
-                }
-                SubwaveAction::Begin { .. } => {
-                    binding.pending = None;
-                    pending = Some(binding.begin_ffn(layer, None)?);
-                }
-                SubwaveAction::Finish { .. } => {
-                    let ticket = pending.take().context("Kimi missing sub-wave FFN ticket")?;
-                    binding.pending = Some(ticket);
-                    binding.finish_ffn(layer, ticket)?;
-                    completed[wave] += 1;
-                }
-            }
-        }
-        for (wave, window) in windows.iter().enumerate() {
-            binding.rows = window.len();
-            binding.completed = completed[wave];
-            for local in binding.local.iter_mut() { local.select_subwave(Some(window.clone()))?; }
-            pipeline_hops(&protocol, &self.plan, HopPoint::Exit, 0, window.len(),
-                &mut binding, &mut consumed[wave])?;
-            binding.output(Output::Normalized)?;
-        }
-        ensure!(consumed.iter().flatten().all(|&count| count == 1), "Kimi sub-wave hop inventory");
+        tracing::info!(start = sequence.start, rows = sequence.rows, units = units.len(), waves,
+            sizes = ?units.iter().map(|unit| unit.rows.len()).collect::<Vec<_>>(),
+            "Kimi prefill units");
+        let mut hooks = UnitHooks { binding, protocol: &protocol, sequence, pool,
+            state: units.iter().map(|_| UnitState::default()).collect(), consumed:
+                vec![vec![0; self.plan.hops().len()]; units.len()] };
+        crate::shared::prefill_pipeline::run_prefill_units(&mut hooks, units, waves)?;
+        let UnitHooks { mut binding, consumed, .. } = hooks;
+        ensure!(consumed.iter().flatten().all(|&count| count == 1), "Kimi unit hop inventory");
         for local in binding.local.iter_mut() { local.select_subwave(None)?; }
         binding.local[1].buffer("normalized")
     }
@@ -708,6 +670,93 @@ impl PipelineKernels for Bindings<'_, '_, '_> {
         })?;
         self.pending = None;
         self.completed += 1;
+        Ok(())
+    }
+}
+
+#[derive(Default, Clone, Copy)]
+struct UnitState { completed: usize }
+
+/// Each unit owns its rows of the lane's operands: selecting a unit points
+/// every row plane (residual arena, delta, outputs, router/wire, K6 partials)
+/// at its rows, so another unit's hooks never touch them. Attention metadata
+/// and the phase arena are restaged or rewritten inside each hook.
+struct UnitHooks<'h, 'e, 'a, 's, 'p> {
+    binding: Bindings<'e, 'a, 's>,
+    protocol: &'h Protocol<'e, 'a>,
+    sequence: &'h super::device::SequenceRows<'p>,
+    pool: &'h cuteafd_engine::prefix::RefPagePool,
+    state: Vec<UnitState>,
+    consumed: Vec<Vec<usize>>,
+}
+
+impl UnitHooks<'_, '_, '_, '_, '_> {
+    fn select(&mut self, unit: &crate::shared::prefill_pipeline::Unit) -> Result<()> {
+        for local in self.binding.local.iter_mut() { local.select_subwave(Some(unit.rows.clone()))?; }
+        self.binding.rows = unit.rows.len();
+        self.binding.completed = self.state[unit.index].completed;
+        self.binding.tap_first = unit.rows.start;
+        Ok(())
+    }
+}
+
+impl crate::shared::prefill_pipeline::PrefillHooks for UnitHooks<'_, '_, '_, '_, '_> {
+    type Ticket = FfnTicket;
+    fn route(&self, layer: usize) -> crate::shared::prefill_pipeline::FfnRoute {
+        // Dense and RTX-resident layers complete inside one hook; the Spark
+        // ones hold a wave across hooks.
+        let cfg = self.binding.local[0].config();
+        let rtx = self.binding.experts.iter().any(|expert| expert.as_ref().is_some_and(|e| e.layers().contains(&layer)));
+        if cfg.dense[layer] || rtx { crate::shared::prefill_pipeline::FfnRoute::Local }
+        else { crate::shared::prefill_pipeline::FfnRoute::Spark }
+    }
+    fn begin_unit(&mut self, unit: &crate::shared::prefill_pipeline::Unit) -> Result<()> {
+        ensure!(unit.layers.start == 0 && unit.sequence == 0, "Kimi units run every layer of one sequence");
+        Ok(())
+    }
+    fn attention(&mut self, layer: usize, unit: &crate::shared::prefill_pipeline::Unit) -> Result<()> {
+        self.select(unit)?;
+        self.binding.pending = None;
+        let metadata = [super::device::SequenceRows { slot: self.sequence.slot,
+            start: self.sequence.start + unit.rows.start, rows: unit.rows.len(), pages: self.sequence.pages }];
+        for local in self.binding.local.iter_mut() { local.stage_attention(&metadata, self.pool)?; }
+        crate::shared::peer_split::attention::pipeline_attention(self.protocol, &self.binding.protocol.execution.plan,
+            layer, 0, unit.rows.len(), &mut self.binding, &mut self.consumed[unit.index])?;
+        Ok(())
+    }
+    fn local_ffn(&mut self, layer: usize, unit: &crate::shared::prefill_pipeline::Unit) -> Result<()> {
+        self.select(unit)?;
+        self.binding.pending = None;
+        let ticket = self.binding.begin_ffn(layer, None)?;
+        self.binding.finish_ffn(layer, ticket)?;
+        self.state[unit.index].completed += 1;
+        Ok(())
+    }
+    fn send_experts(&mut self, layer: usize, unit: &crate::shared::prefill_pipeline::Unit) -> Result<FfnTicket> {
+        self.select(unit)?;
+        self.binding.pending = None;
+        let ticket = self.binding.begin_ffn(layer, None)?;
+        self.binding.pending = None;
+        Ok(ticket)
+    }
+    fn land_experts(&mut self, layer: usize, unit: &crate::shared::prefill_pipeline::Unit, ticket: FfnTicket)
+        -> Result<()> {
+        self.select(unit)?;
+        self.binding.pending = Some(ticket);
+        self.binding.finish_ffn(layer, ticket)?;
+        self.state[unit.index].completed += 1;
+        Ok(())
+    }
+    fn end_unit(&mut self, unit: &crate::shared::prefill_pipeline::Unit) -> Result<()> {
+        self.select(unit)?;
+        crate::shared::peer_split::attention::pipeline_hops(self.protocol, &self.binding.protocol.execution.plan,
+            HopPoint::Exit, 0, unit.rows.len(), &mut self.binding, &mut self.consumed[unit.index])?;
+        self.binding.output(Output::Normalized)?;
+        Ok(())
+    }
+    fn commit_unit(&mut self, _: &crate::shared::prefill_pipeline::Unit) -> Result<()> {
+        // KDA state and MLA records were written in attention; the caller
+        // commits the frontier once for the whole call.
         Ok(())
     }
 }
