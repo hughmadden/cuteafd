@@ -5579,6 +5579,35 @@ and 3 are gated on one lane family showing a win on the executor (GLM 5.3,
 #660, TJ 2026-10-23), not on the release: once it does, every lane family
 ports for v4.
 
+## Release v4 cards (TJ, 2026-10-24)
+
+The README keeps one card per checkpoint in the three columns (5090, 1× RTX,
+2× RTX) for every model that ships in v4, plus these additions:
+
+| Model · checkpoint | 1× RTX (min) | 2× RTX (max) | Notes |
+|---|---|---|---|
+| DeepSeek V4.1 Flash | 1 RTX + 3 Sparks | 2 RTX + 6 Sparks, **plus a 1 RTX + 4 Sparks reference** | V4.1's TP4 reference |
+| DeepSeek V4 Flash | min | max, **plus a 1 RTX + 4 Sparks reference** | TJ: "Deep seek flash gets a 1+4 reference too" |
+| GLM 5.3 EXLR8 (native dense) | 1 RTX + 4 Sparks | 2 RTX + 6 Sparks | TJ: "EXLR8 max and min do 4 and 6 sparks" |
+| Kimi K3 (EXL3 K2 + Core-K6) | — | 2 RTX + 6 Sparks | DFlash2 |
+| Step-5 | NVFP4 1 RTX + 4 Sparks | FP8 2 RTX + 6 Sparks | RTX PRO only |
+| Dense Qwen 3.8 27B (BF16, FP8) | 1 RTX | — | RTX only; min only, no TP2 card (TJ) |
+
+**Retired section** (new, below the main table): every model that no longer
+ships keeps its last Release-smoke row, one card per row with its config and
+the release version it came from. It doesn't use the three-column layout.
+It includes:
+- the cards cut from the v3 matrix: GLM 5.3 EXL3 max and NVFP4 max, GLM 5.3
+  Flash NVFP4 max and TR3 max, MiMo Pro min, MiMo Flash max, Qwen 3.8 EXL3 max
+  and NVFP4 max, V4 Flash max, V4 Pro EXL3 min (each from its last smoke run);
+- models retired since: the GLM 5.3 Flash non-core FP8 configs
+  (`glm53-flash-fp8-min/max`, `zai-org/GLM-5.3-Flash`), last smoke 2026-10-14;
+  the GLM 5.3 Flash EXL3 BF16-dense `-v1` card, replaced by
+  `GLM-5.3-Flash-EXL3-K3.25-Core-FP8`.
+
+`cuteafd bench publish` builds both sections from the smoke exports plus a
+retired list in the matrix file.
+
 ## Backlog (lowest priority: only when nothing planned is left)
 
 - Qwen 3.8 Flash Next NVFP4 without Sparks, competitive with vLLM on one
