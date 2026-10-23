@@ -34,6 +34,7 @@ FAMILIES = {
     "step5_vl": "step5",
     "step5": "step5",
     "kimi_k3": "kimi_k3",
+    "minimax_m3_vl": "minimax_m3",
 }
 
 
@@ -91,7 +92,7 @@ def describe(config: dict) -> tuple[str, str, int, int]:
     if family is None:
         raise SystemExit(f"unsupported model_type {kind!r}; known: {', '.join(sorted(FAMILIES))}")
     first, last = 0, -1
-    if family in ("glm5", "glm5_flash", "mimo_v2", "qwen4", "qwen3_5", "kimi_k3"):
+    if family in ("glm5", "glm5_flash", "mimo_v2", "qwen4", "qwen3_5", "kimi_k3", "minimax_m3"):
         layers = text.get("num_hidden_layers")
         if not isinstance(layers, int) or layers <= 0:
             raise SystemExit("config lacks num_hidden_layers")
@@ -119,6 +120,12 @@ def describe(config: dict) -> tuple[str, str, int, int]:
         if dense is None:
             dense = [layer == 0 for layer in range(layers)]
         first = dense.index(False) if False in dense else layers
+    elif family == "minimax_m3":
+        routed = _pattern(text, layers, {"moe_layer_freq": {0: False, 1: True}})
+        if routed is None:
+            raise SystemExit("config lacks moe_layer_freq")
+        first = routed.index(True) if True in routed else layers
+        last = layers - 1
     elif family == "kimi_k3":
         # Dense prefix first_k_dense_replace (layer 0), then every layer routed.
         first = text.get("first_k_dense_replace", 0)
@@ -156,6 +163,8 @@ def routed_layers(config: dict) -> int | None:
         return layers - first
     if family == "glm5_flash":
         # Reuse the runtime-equivalent pattern checks, including agreement.
+        describe(config)
+    if family == "minimax_m3":
         describe(config)
     if family == "kimi_k3":
         _, _, first, last = describe(config)

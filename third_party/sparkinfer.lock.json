@@ -1,6 +1,6 @@
 {
   "schema": 1,
-  "repository": "https://github.com/tpurtell/sparkinfer-glmrt.git",
-  "revision": "56ec22d09ba0416756c4f9fef5363bdc52cc9382",
-  "source_tree_sha256": "54855d30e31c6dbee2f1fbf4e66fcf116ece60ed512798b54f6a8788b3e45386"
+  "repository": "https://github.com/hughmadden/sparkinfer-glmrt.git",
+  "revision": "f279952f46fe89b73b922d424c68c96b9b2d575a",
+  "source_tree_sha256": "392f3669a08ebfcb438f0d25a70eb483bef3378698b29ca0f8d5a18952050df5"
 }

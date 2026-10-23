@@ -39,6 +39,10 @@ docker_args=(
   -v "$hf_home:/root/.cache/huggingface:ro"
   -e HF_HOME="$hf_home"
 )
+if [[ "$role" == cpu ]]; then
+  # NGC shell startup files probe GPUs before the requested command runs.
+  docker_args+=(-e BASH_ENV= -e ENV= -e NVIDIA_VISIBLE_DEVICES=void -e CUDA_VISIBLE_DEVICES=)
+fi
 # The host hub is usually a symlink into the shared store; mount its target too,
 # or the link dangles inside the container.
 if [[ -L "$hf_home/hub" ]]; then

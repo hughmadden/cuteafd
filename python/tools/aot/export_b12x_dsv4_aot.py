@@ -47,6 +47,7 @@ CHECKPOINT_CONTEXTS = {
     "qwen38": ("Qwen/Qwen3.8-27B", 262144),
     "step5": ("stepfun-ai/Step-5-Preview", 1048576),
     "kimik3": ("moonshotai/Kimi-K3", 1048576),
+    "minimax": ("MiniMaxAI/MiniMax-M3.1-Flash", 1048576),
 }
 
 
@@ -808,7 +809,7 @@ def main() -> None:
                              "glmf (GLM 5.3 Flash), glmf2 (GLM 5.3 Flash, one GPU of a two-GPU head split), "
                              "qwen4 (Qwen 3.8 Flash Next), qwen35 (Qwen 3.5 9B), qwen38 (Qwen 3.8 27B), "
                              "kimik3 (Kimi K3 KDA, 48 heads per TP2 rank), "
-                             "step5/step52 (Step-5 full/two-GPU head split), exlr8 (the fork's EXLR8 programs "
+                             "minimax (MiniMax M3), step5/step52 (Step-5 full/two-GPU head split), exlr8 (the fork's EXLR8 programs "
                              "for --exlr8-role, after every other family), exlr8_dense (shared native dense operands), "
                              "glm_stage/glm2_stage (dormant full/TP2 GLM primitive boundaries), "
                              "kimi_k6_dense (native K6 core projections)")
@@ -840,9 +841,9 @@ def main() -> None:
 
     geometries = [name.strip() for name in args.geometry.split(",") if name.strip()]
     if not geometries or any(name not in ("flash", "flash2", "pro", "pro2", "glm", "glm2", "mimo", "mimo2", "mimop",
-                                          "mimop2", "mimof", "mimof2", "glmf", "glmf2", "qwen4", "qwen35", "qwen38", "step5", "step52", "exlr8", "exlr8_dense", "glm_stage", "glm2_stage", "kimi_k6_dense", "kimi_split", "kimik3") for name in geometries):
+                                          "mimop2", "mimof", "mimof2", "glmf", "glmf2", "qwen4", "qwen35", "qwen38", "step5", "step52", "exlr8", "exlr8_dense", "glm_stage", "glm2_stage", "kimi_k6_dense", "kimi_split", "kimik3", "minimax") for name in geometries):
         raise SystemExit("--geometry takes flash, flash2, pro, pro2, glm, glm2, mimo, mimo2, mimop, mimop2, mimof, mimof2, "
-                         "glmf, glmf2, qwen4, qwen35, qwen38, step5, step52, exlr8, exlr8_dense, glm_stage, glm2_stage, kimi_k6_dense, kimi_split and/or kimik3")
+                         "glmf, glmf2, qwen4, qwen35, qwen38, step5, step52, exlr8, exlr8_dense, glm_stage, glm2_stage, kimi_k6_dense, kimi_split, kimik3 and/or minimax")
     if args.context_split_only and any(name not in ("flash", "pro", "glm", "glmf") for name in geometries):
         raise SystemExit("--context-split-only takes flash, pro, glm and/or glmf")
     kimi_kda = None
@@ -895,6 +896,14 @@ def main() -> None:
             continue
         if name == "exlr8":
             continue  # appended after every other family, below
+        if name == "minimax":
+            from export_b12x_minimax_aot import programs as minimax_programs
+            extent = geometry_context(name, args.max_context)
+            manifest["families"][name] = {"hidden": 6144, "heads": 64, "kv_heads": 4, "head_dim": 128,
+                                          "page_rows": 64, "block_size": 128, "topk_blocks": 16}
+            manifest["family_capacities"][name] = {"max_context": extent}
+            work += [(name, *item) for item in minimax_programs(args.prefill_rows, extent, args.decode_rows)]
+            continue
         if name in ("step5", "step52"):
             from export_b12x_step5_aot import programs as step5_programs
             heads = 64 if name == "step5" else 32

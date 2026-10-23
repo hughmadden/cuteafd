@@ -17,7 +17,7 @@ DEFAULT_MODEL_ID = 'deepseek-ai/DeepSeek-V4.1-Flash-1017'
 # Official V4.1 releases, for builds whose checkpoint metadata is not local.
 V41_RELEASES = ('deepseek-ai/DeepSeek-V4.1-Flash', 'deepseek-ai/DeepSeek-V4.1-Flash-1017')
 PROGRAM_SWITCHES = dict(deepseek_v4='DSV4', glm5='GLM', glm5_flash='GLMF', mimo_v2='MIMO', qwen4='QWEN4',
-                        qwen3_5='QWEN_DENSE', step5='STEP5', kimi_k3='KIMIK3')
+                        qwen3_5='QWEN_DENSE', step5='STEP5', kimi_k3='KIMIK3', minimax_m3='MINIMAX')
 
 
 def require_mapping(family):
@@ -80,6 +80,11 @@ def family_scopes(cards, config_reader):
             env['CUTEAFD_WIP_' + PROGRAM_SWITCHES[family] + '_AOT'] = 'ON'
             if 'exl3' in card['name']:
                 scopes.add(tag + ':exl3-k23')
+        if family == 'minimax_m3':
+            env['CUTEAFD_WIP_MINIMAX_AOT'] = 'ON'
+            scopes.add('minimax:nvfp4a4')
+            if count:
+                counts.add(f"minimax={int(values.get('SPARK_TP', count))}")
         if family == 'kimi_k3':
             # The max card only: TP6 width 512 EXL3 K2 experts (#273); no local-only layout.
             tp = int(values.get('SPARK_TP', count))
