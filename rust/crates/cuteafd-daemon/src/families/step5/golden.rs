@@ -817,6 +817,10 @@ fn split_run(args: &GoldenArgs, checkpoint: &Checkpoint, cfg: &Config,
         None => (rows, 1),
     };
     ensure!(unit > 0 && unit <= rows && (unit == rows || unit % 64 == 0), "Step-5 golden prefill units");
+    // Per-layer retention reads one whole-step output; units score logits only.
+    ensure!(args.prefill_units.is_none() || (args.compare_layers.is_empty() && args.dump_layers.is_empty()
+        && reference.hidden.is_empty()),
+        "Step-5 golden prefill units compare logits, not retained per-layer hidden states");
     let ownership = split_ownership_lanes(cfg, unit, waves as u64)?;
     let layout = Step5CacheLayout::for_execution(cfg, &ownership, rows as u64, 0, rows as u64, args.kv_cache)?;
     if args.check_headers { println!("Step-5 shared headers/reference validated: rows={rows} ranks=2; no CUDA or numerical qualification"); return Ok(()); }
