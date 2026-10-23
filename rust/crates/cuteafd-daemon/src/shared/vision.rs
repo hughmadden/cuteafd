@@ -2,6 +2,7 @@
 //! MiMo arithmetic/order is ported from Hugh Madden's mimo26f-afd v1.3.0,
 //! crates/mimo26-coordinator/src/vision.rs; weights are resident, never transient.
 mod glm_flash;
+mod minimax;
 mod qwen;
 pub mod local;
 pub mod remote;
@@ -137,7 +138,7 @@ pub struct TowerSpec {
     pub native: VisionSpec,
     reads: Vec<TensorRead>,
 }
-fn tower_catalog(snapshot: &Path, prefix: &str) -> Result<BTreeMap<String, (PathBuf, SafetensorsTensorMetadata)>> {
+fn tower_catalog(snapshot: &Path, prefixes: &[&str]) -> Result<BTreeMap<String, (PathBuf, SafetensorsTensorMetadata)>> {
     let mut files = BTreeSet::new();
     let index_path = snapshot.join("model.safetensors.index.json");
     if index_path.exists() {
@@ -146,7 +147,7 @@ fn tower_catalog(snapshot: &Path, prefix: &str) -> Result<BTreeMap<String, (Path
         .as_object()
         .ok_or_else(|| VisionError::Unsupported("safetensors weight_map absent".into()))?;
         for (name, file) in map {
-        if name.starts_with(prefix) {
+        if prefixes.iter().any(|prefix| name.starts_with(prefix)) {
             let file = file.as_str().ok_or_else(|| {
             VisionError::Unsupported(format!("invalid file for {name}"))
             })?;
@@ -176,7 +177,7 @@ fn tower_catalog(snapshot: &Path, prefix: &str) -> Result<BTreeMap<String, (Path
         for metadata in read_safetensors_metadata(&path)
         .map_err(|e| VisionError::Unsupported(e.to_string()))?
         {
-        if metadata.name.starts_with(prefix) {
+        if prefixes.iter().any(|prefix| metadata.name.starts_with(prefix)) {
             let name = metadata.name.clone();
             if tensors
             .insert(name.clone(), (path.clone(), metadata))
@@ -197,6 +198,7 @@ impl TowerSpec {
             Some("mimo_v2") => Self::mimo(snapshot, max_tokens),
             Some("qwen4_exp") => Self::qwen(snapshot, max_tokens.min(cuteafd_loader::media::QWEN_MAX_IMAGE_TOKENS)),
             Some("glm5_next") => Self::glm_flash(snapshot, max_tokens),
+            Some("minimax_m3_vl") => Self::minimax(snapshot, max_tokens),
             kind => Err(VisionError::Unsupported(format!("tower model_type {kind:?}; add a tower exporter/kernel"))),
         }
     }
@@ -205,13 +207,14 @@ impl TowerSpec {
         match self.native.reserved {
             2 => ImageFamily::Qwen,
             3 => ImageFamily::GlmFlash,
+            4 => ImageFamily::Minimax,
             _ => ImageFamily::Mimo,
         }
     }
     pub fn mimo(snapshot: &Path, max_tokens: usize) -> Result<Self> {
         let cfg: MimoConfig = serde_json::from_reader(File::open(snapshot.join("config.json"))?)?;
         cfg.validate(max_tokens)?;
-        let tensors = tower_catalog(snapshot, "visual.")?;
+        let tensors = tower_catalog(snapshot, &["visual."])?;
         for bias in [
             "visual.merger.ln_q.bias",
             "visual.merger.mlp.0.bias",
@@ -322,6 +325,7 @@ impl TowerSpec {
             cuteafd_loader::media::ImageFamily::Mimo => "mimo_v2",
             cuteafd_loader::media::ImageFamily::Qwen => "qwen4",
             cuteafd_loader::media::ImageFamily::GlmFlash => "glm5_flash",
+            cuteafd_loader::media::ImageFamily::Minimax => "minimax_m3",
         };
         cuteafd_loader::media::EncoderId::derive(family, revision, &headers, 1, sm)
     }
@@ -345,7 +349,8 @@ impl TowerSpec {
                 file.read_exact(&mut weights[start..start + m.byte_length as usize])?;
             }
         }
-        let frequencies = if self.native.abi_version == 2 { self.native.head_dim as usize / 4 } else { 16 };
+        let frequencies = if self.native.reserved == 4 { 13 }
+            else if self.native.abi_version == 2 { self.native.head_dim as usize / 4 } else { 16 };
         for i in 0..frequencies {
             let value = 1.0f32 / 10000f32.powf(i as f32 / frequencies as f32);
             let start = self.native.inv_freq as usize + i * 4;
@@ -357,6 +362,10 @@ impl TowerSpec {
 
 /// Matches the CPU reference's f64 rescale followed by f32 normalize, without FMA.
 pub fn normalization_lut(config: &cuteafd_loader::media::ProcessorConfig) -> Arc<[f32; 768]> {
+    if config.family == cuteafd_loader::media::ImageFamily::Minimax {
+        let table = config.normalization_lut();
+        return Arc::new(std::array::from_fn(|i| table[i / 256][i % 256]));
+    }
     Arc::new(std::array::from_fn(|i| {
         let c = i / 256;
         let pixel = ((i % 256) as f64 * (1.0 / 255.0)) as f32;
@@ -403,6 +412,12 @@ pub struct EncodeJob {
     pub lut: Arc<[f32; 768]>,
     pub output: Vec<u16>,
 }
+pub struct VideoEncodeJob {
+    pub rgb: Arc<[u8]>,
+    pub grid: [usize; 3],
+    pub lut: Arc<[f32; 768]>,
+    pub output: Vec<u16>,
+}
 pub struct EncoderTicket {
     result: mpsc::Receiver<Result<Vec<u16>>>,
     cancelled: Arc<AtomicBool>,
@@ -426,6 +441,7 @@ impl Drop for EncoderTicket {
 }
 enum EncoderJob {
     Vision(EncodeJob),
+    Video(VideoEncodeJob),
     Audio(audio::AudioEncodeJob),
 }
 struct Work {
@@ -567,6 +583,12 @@ impl EncoderService {
                                 Some(runtime) => runtime.encode(job),
                                 None => Err(VisionError::Unsupported("audio encoder is not loaded".into())),
                             },
+                            EncoderJob::Video(mut job) => match runtime.as_mut() {
+                                Some(runtime) => runtime.native.encode_frames_into(
+                                    &job.rgb, job.grid, &job.lut, &mut job.output,
+                                ).map(|()| job.output).map_err(VisionError::Native),
+                                None => Err(VisionError::Unsupported("vision encoder is not loaded".into())),
+                            },
                         };
                         encoded.and_then(|output| {
                             if work.cancelled.load(Ordering::Acquire) {
@@ -607,6 +629,9 @@ impl EncoderService {
     pub fn health_handle(&self) -> Arc<AtomicBool> { self.healthy.clone() }
     pub fn submit(&self, job: EncodeJob) -> Result<EncoderTicket> {
         self.submit_job(EncoderJob::Vision(job))
+    }
+    pub fn submit_video(&self, job: VideoEncodeJob) -> Result<EncoderTicket> {
+        self.submit_job(EncoderJob::Video(job))
     }
     pub fn submit_audio(&self, job: audio::AudioEncodeJob) -> Result<EncoderTicket> {
         if self.audio_ledger.is_none() {
@@ -720,6 +745,7 @@ mod tests {
             while let Ok(work) = jobs.recv() {
                 let (kind, output) = match work.job {
                     EncoderJob::Vision(job) => ("vision", job.output),
+                    EncoderJob::Video(job) => ("video", job.output),
                     EncoderJob::Audio(job) => ("audio", job.output),
                 };
                 seen.lock().unwrap().push(kind);
@@ -736,8 +762,11 @@ mod tests {
         gate.send(()).unwrap();
         assert!(image.result.recv().unwrap().is_ok());
         assert!(matches!(audio.result.recv().unwrap(), Err(VisionError::Cancelled)));
+        let video = service.submit_video(VideoEncodeJob { rgb: vec![0; 2*28*28*3].into(),
+            grid: [1,2,2], lut: Arc::new([0.0; 768]), output: vec![0; 6144] }).unwrap();
+        assert_eq!(video.result.recv().unwrap().unwrap().len(), 6144);
         drop(service);
-        assert_eq!(*observed.lock().unwrap(), ["vision", "audio"]);
+        assert_eq!(*observed.lock().unwrap(), ["vision", "audio", "video"]);
     }
     #[test]
     fn reject_unimplemented_geometry_before_weights() {

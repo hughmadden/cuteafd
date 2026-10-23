@@ -273,9 +273,8 @@ impl Family for MiniMaxM3 {
                     input_global_scale into the launch scalars.".into(),
             }),
             Component::Vision => Some(Hint {
-                what: "MiniMax M3 vision execution is not implemented".into(),
-                how: "Add the bundled tower: Conv3d (2x14x14) patch embed, pre-LayerNorm, 32 CLIP layers with 3D axial RoPE \
-                    (26 channels per axis of 80), then the GELU projector to 6144 and the 2x2 patch-merge GELU MLP.".into(),
+                what: "MiniMax M3 vision awaits GPU qualification and language-model integration".into(),
+                how: "Compile the MiniMax D80 vision attention export and qualify the native BF16 tower against the CPU reference; wire its features to the MiniMax language-model path.".into(),
             }),
             Component::Speculator => Some(Hint {
                 what: "MiniMax M3 DSpark drafting is not wired".into(),

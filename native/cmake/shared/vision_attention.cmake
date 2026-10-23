@@ -10,7 +10,7 @@ else()
 endif()
 set(CUTEAFD_VISION_ATTENTION_DIR "${CMAKE_CURRENT_BINARY_DIR}/vision_attention")
 set(CUTEAFD_VISION_ATTENTION_OUTPUTS)
-foreach(dim 64 72)
+foreach(dim 64 72 80)
   foreach(ext json h o)
     list(APPEND CUTEAFD_VISION_ATTENTION_OUTPUTS "${CUTEAFD_VISION_ATTENTION_DIR}/vision_attention_d${dim}.${ext}")
   endforeach()
@@ -26,7 +26,7 @@ add_custom_command(
     --output-dir "${CUTEAFD_VISION_ATTENTION_DIR}" --capability ${CUTEAFD_VISION_CAPABILITY}
   DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/aot/export_b12x_vision_attention_aot.py"
     ${CUTEAFD_SPARKINFER_PROVENANCE_INPUTS} ${CUTEAFD_SPARKINFER_EXPORT_INPUTS}
-  COMMENT "Exporting full-image head64/head72 BF16 vision attention offline"
+  COMMENT "Exporting full-image head64/head72/head80 BF16 vision attention offline"
   VERBATIM)
 add_custom_target(cuteafd_vision_attention_export DEPENDS ${CUTEAFD_VISION_ATTENTION_OUTPUTS})
 add_dependencies(cuteafd_vision_attention_export cuteafd_verify_sparkinfer_source)

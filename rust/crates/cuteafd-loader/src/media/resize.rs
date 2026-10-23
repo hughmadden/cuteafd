@@ -50,6 +50,7 @@ fn bicubic(x: f64) -> f64 {
 
 /// Per-output-pixel taps: first input index, fixed-point weights.
 struct Coeffs {
+    precision: u32,
     ksize: usize,
     bounds: Vec<(usize, usize)>, // (xmin, count)
     k: Vec<i32>,                 // out_size * ksize
@@ -95,15 +96,57 @@ fn precompute(in_size: usize, out_size: usize) -> Coeffs {
         }
         bounds.push((xmin as usize, count));
     }
-    Coeffs { ksize, bounds, k }
+    Coeffs { precision: PRECISION_BITS, ksize, bounds, k }
 }
 
 #[inline(always)]
-fn clip8(v: i32) -> u8 {
-    (v >> PRECISION_BITS).clamp(0, 255) as u8
+fn clip8(v: i32, precision: u32) -> u8 {
+    (v >> precision).clamp(0, 255) as u8
 }
 
 pub(crate) fn resize_bicubic(img: &RgbImage, width: u32, height: u32) -> RgbImage {
+    resize_bicubic_impl(img, width, height, false)
+}
+
+/// PyTorch CPU uint8 antialiased bicubic uses int16 coefficients with
+/// per-axis adaptive precision (UpSampleKernel.cpp).
+pub(crate) fn resize_bicubic_torch(img: &RgbImage, width: u32, height: u32) -> RgbImage {
+    resize_bicubic_impl(img, width, height, true)
+}
+
+fn precompute_torch(in_size: usize, out_size: usize) -> Coeffs {
+    let scale = in_size as f64 / out_size as f64;
+    let support = 2.0 * scale.max(1.0);
+    let ksize = support.ceil() as usize * 2 + 1;
+    let mut bounds = Vec::with_capacity(out_size);
+    let mut weights = vec![0.0f64; out_size * ksize];
+    let mut maximum = 0.0f64;
+    for xx in 0..out_size {
+        let center = scale * (xx as f64 + 0.5);
+        let xmin = ((center - support + 0.5) as i64).max(0) as usize;
+        let xmax = ((center + support + 0.5) as usize).min(in_size);
+        let count = (xmax - xmin).min(ksize);
+        let row = &mut weights[xx * ksize..xx * ksize + count];
+        let mut total = 0.0;
+        for (j, weight) in row.iter_mut().enumerate() {
+            *weight = bicubic((j as f64 + xmin as f64 - center + 0.5) * (1.0 / scale.max(1.0)));
+            total += *weight;
+        }
+        if total != 0.0 { for weight in row { *weight /= total; maximum = maximum.max(*weight); } }
+        bounds.push((xmin, count));
+    }
+    let mut precision = 0;
+    while precision < 22 && ((0.5 + maximum * (1u32 << (precision + 1)) as f64) as i32) < 1 << 15 {
+        precision += 1;
+    }
+    let k = weights.into_iter().map(|weight| {
+        let value = weight * (1u32 << precision) as f64;
+        (if value < 0.0 { value - 0.5 } else { value + 0.5 }) as i32
+    }).collect();
+    Coeffs { precision, ksize, bounds, k }
+}
+
+fn resize_bicubic_impl(img: &RgbImage, width: u32, height: u32, torch: bool) -> RgbImage {
     let (iw, ih) = (img.width as usize, img.height as usize);
     let (ow, oh) = (width as usize, height as usize);
     if ow == 0 || oh == 0 {
@@ -140,14 +183,15 @@ pub(crate) fn resize_bicubic(img: &RgbImage, width: u32, height: u32) -> RgbImag
     }
     let need_h = ow != iw;
     let need_v = oh != ih;
-    let cv = precompute(ih, oh);
+    let compute = if torch { precompute_torch } else { precompute };
+    let cv = compute(ih, oh);
     let ybox_first = cv.bounds[0].0;
     let (lx, lc) = cv.bounds[oh - 1];
     let ybox_last = lx + lc;
 
     // Horizontal pass over input rows [ybox_first, ybox_last).
     let (tmp, tmp_w, row_off) = if need_h {
-        let ch = precompute(iw, ow);
+        let ch = compute(iw, ow);
         let rows = ybox_last - ybox_first;
         let mut t = vec![0u8; ow * rows * 3];
         for y in 0..rows {
@@ -174,7 +218,7 @@ pub(crate) fn resize_bicubic(img: &RgbImage, width: u32, height: u32) -> RgbImag
         let (ymin, cnt) = cv.bounds[yy];
         let ymin = ymin - row_off;
         let kk = &cv.k[yy * cv.ksize..yy * cv.ksize + cnt];
-        acc.fill(1 << (PRECISION_BITS - 1));
+        acc.fill(1 << (cv.precision - 1));
         for (j, &kw) in kk.iter().enumerate() {
             let r = &hsrc[(ymin + j) * rowlen..(ymin + j + 1) * rowlen];
             for (a, &p) in acc.iter_mut().zip(r) {
@@ -182,7 +226,7 @@ pub(crate) fn resize_bicubic(img: &RgbImage, width: u32, height: u32) -> RgbImag
             }
         }
         for (d, &a) in out[yy * rowlen..(yy + 1) * rowlen].iter_mut().zip(&acc) {
-            *d = clip8(a);
+            *d = clip8(a, cv.precision);
         }
     }
     RgbImage {
@@ -196,7 +240,7 @@ fn horizontal_row(s: &[u8], d: &mut [u8], c: &Coeffs) {
     for (xx, px) in d.chunks_exact_mut(3).enumerate() {
         let (xmin, cnt) = c.bounds[xx];
         let kk = &c.k[xx * c.ksize..xx * c.ksize + cnt];
-        let base = 1i32 << (PRECISION_BITS - 1);
+        let base = 1i32 << (c.precision - 1);
         let (mut s0, mut s1, mut s2) = (base, base, base);
         for (x, &kw) in kk.iter().enumerate() {
             let p = (xmin + x) * 3;
@@ -204,15 +248,35 @@ fn horizontal_row(s: &[u8], d: &mut [u8], c: &Coeffs) {
             s1 = s1.wrapping_add((s[p + 1] as i32).wrapping_mul(kw));
             s2 = s2.wrapping_add((s[p + 2] as i32).wrapping_mul(kw));
         }
-        px[0] = clip8(s0);
-        px[1] = clip8(s1);
-        px[2] = clip8(s2);
+        px[0] = clip8(s0, c.precision);
+        px[1] = clip8(s1, c.precision);
+        px[2] = clip8(s2, c.precision);
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn torch_uint8_antialiased_bicubic_matches_cpu_reference() {
+        use sha2::{Digest, Sha256};
+        // torch 2.8 CPU interpolate(mode="bicubic", align_corners=False, antialias=True).
+        for (iw, ih, ow, oh, expected) in [
+            (37,59,56,84,"387ecc751b91aa035cdd183852f8509164b22c1ede63719b3b0a77b7944e01e4"),
+            (1008,672,812,532,"99d94ead507ea6846d130a34094233263b57182912358b19caf97870a3cc2dfb"),
+            (19,31,56,56,"31b8d76da4ef9f557aac71bc3636b2d5ae0be4450c6f53e08938e3c8e71a990c"),
+            (128,99,84,56,"52d8cab52651adb6a8332f7064ff1f96a0a2a7da0172ab1d792ad91d882ed44b"),
+            (56,56,56,56,"d54bb962452bcc9bfafce83eea69a8df17c1a967c47b58a236df0e21d58a9b0d"),
+            (1,1,56,56,"294cd6182c19878407fafefbb1e7d06cadbd725706a7bdb1cc234ed6b9b079d5"),
+            (3,501,28,1008,"2a30d74e60e1e2c0f862ff2852cc6f3cb975e2996458bc534d181e65169aada1"),
+        ] {
+            let image = RgbImage { width:iw, height:ih,
+                data:(0..iw as usize*ih as usize*3).map(|i| ((i*37+11)%256) as u8).collect() };
+            let resized = resize_bicubic_torch(&image,ow,oh);
+            assert_eq!(format!("{:x}",Sha256::digest(&resized.data)), expected, "{iw}x{ih} -> {ow}x{oh}");
+        }
+    }
 
     #[test]
     fn identity_and_degenerate_sizes() {

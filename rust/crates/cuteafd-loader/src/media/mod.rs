@@ -3,6 +3,7 @@ pub mod audio;
 pub mod audio_tower;
 mod decode;
 mod exif;
+pub mod minimax;
 mod resize;
 mod spans;
 
@@ -84,6 +85,7 @@ pub enum ImageFamily {
     Mimo,
     Qwen,
     GlmFlash,
+    Minimax,
 }
 /// Reference processor parameters; all identity-affecting choices live here.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -110,6 +112,7 @@ impl ProcessorConfig {
             ImageFamily::Mimo => (16, 3136, 12_845_056, CLIP_MEAN, CLIP_STD),
             ImageFamily::Qwen => (16, 65_536, 16_777_216, [0.5; 3], [0.5; 3]),
             ImageFamily::GlmFlash => (14, 16, 8000, CLIP_MEAN, CLIP_STD),
+            ImageFamily::Minimax => (14, 3136, 451_584, CLIP_MEAN, CLIP_STD),
         };
         Self {
             family,
@@ -120,7 +123,11 @@ impl ProcessorConfig {
             std,
             min_pixels,
             max_pixels,
-            max_image_tokens: if family == ImageFamily::Qwen { QWEN_MAX_IMAGE_TOKENS } else { 4096 },
+            max_image_tokens: match family {
+                ImageFamily::Qwen => QWEN_MAX_IMAGE_TOKENS,
+                ImageFamily::Minimax => 576,
+                _ => 4096,
+            },
             decode: DecodePolicy::default(),
         }
     }
@@ -196,6 +203,7 @@ impl ProcessorConfig {
                 "only the gated Pillow bicubic resampler is supported".into(),
             ));
         }
+        if family == ImageFamily::Minimax { minimax::validate_config(&config, value)?; }
         config.validate()?;
         Ok(config)
     }
@@ -244,7 +252,21 @@ impl ProcessorConfig {
         let mut hash = Sha256::new();
         hash.update(b"cuteafd-preprocess-v1:pillow-bicubic");
         hash.update(serde_json::to_vec(self).expect("processor parameters serialize"));
+        if self.family == ImageFamily::Minimax {
+            for (_, digest) in minimax::PROCESSOR_SOURCES { field(&mut hash, digest.as_bytes()); }
+        }
         PreprocessId(hash.finalize().into())
+    }
+    /// The fast MiniMax processor fuses rescale into the FP32 mean and standard deviation.
+    pub fn normalization_lut(&self) -> [[f32; 256]; 3] {
+        std::array::from_fn(|c| std::array::from_fn(|v| {
+            if self.family == ImageFamily::Minimax {
+                (v as f32 - self.mean[c] as f32 * 255.0) / (self.std[c] as f32 * 255.0)
+            } else {
+                let x = (v as f64 * (1.0 / 255.0)) as f32;
+                (x - self.mean[c] as f32) / self.std[c] as f32
+            }
+        }))
     }
     pub fn resize_shape(&self, height: u32, width: u32) -> Result<(u32, u32)> {
         self.validate()?;
@@ -254,7 +276,9 @@ impl ProcessorConfig {
             ));
         }
         let factor = self.patch * self.merge;
-        if self.family == ImageFamily::GlmFlash {
+        if self.family == ImageFamily::Minimax {
+            minimax::resize_shape(height, width, factor, self.min_pixels, self.effective_max())
+        } else if self.family == ImageFamily::GlmFlash {
             glm_resize(height, width, factor, self.min_pixels, self.effective_max())
         } else {
             qwen_resize(height, width, factor, self.min_pixels, self.effective_max())
@@ -358,6 +382,8 @@ impl ImageProcessor for ProcessorConfig {
                 height,
                 data,
             }
+        } else if self.family == ImageFamily::Minimax {
+            resize::resize_bicubic_torch(&image, width, height)
         } else {
             resize::resize_bicubic(&image, width, height)
         };
@@ -404,12 +430,7 @@ impl PreparedImage {
         {
             return Err(invalid("patch grid and RGB byte extent differ"));
         }
-        let lut: [[f32; 256]; 3] = std::array::from_fn(|c| {
-            std::array::from_fn(|v| {
-                let x = (v as f64 * (1.0 / 255.0)) as f32;
-                (x - config.mean[c] as f32) / config.std[c] as f32
-            })
-        });
+        let lut = config.normalization_lut();
         let mut out = Vec::with_capacity(gh * gw * 3 * t * p * p);
         for bh in 0..gh / m {
             for bw in 0..gw / m {

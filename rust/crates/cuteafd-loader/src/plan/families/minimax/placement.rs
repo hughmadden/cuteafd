@@ -8,6 +8,7 @@ use super::Model;
 use crate::families::{minimax_m3::{cache::MiniMaxCacheLayout, config::MiniMaxM3Config}, qwen4::Qwen4KvCache};
 use crate::placement::{ArchContext, AttentionPlacement};
 use crate::plan::{Component, ExpertPlacement, Hint, MediaMode, PlanReport};
+use crate::plan::encoder::{encoder_placement, EncoderGpuBudget, EncoderHardware, EncoderKind, EncoderSparkBudget};
 use crate::serving_capacity::{CacheGeometryError, CacheOptions, FamilyCacheGeometry};
 use cuteafd_core::memory_layout::{Basis, Category, DeviceKind, DeviceLayout, Item, MemoryLayout};
 
@@ -78,8 +79,15 @@ pub(super) fn layout(model: &Model, report: &mut PlanReport, opts: &crate::plan:
     let replicated = edge(Component::Router) + edge(Component::Norm) + edge(Component::Indexer) / 5;
     let drafter = if opts.native_mtp_layers > 0 { edge(Component::Speculator) } else { 0 };
     let vision = edge(Component::Vision);
-    let vision_rtx = matches!(report.vision, MediaMode::Rtx(_)) && vision > 0;
+    let vision_scratch = if vision > 0 { 762_383_616 } else { 0 };
+    // Every official tensor/vector extent is 256-byte aligned; BF16 vectors
+    // expand to FP32, followed by thirteen FP32 rotary frequencies.
+    let vector_bytes: u64 = model.contracts.values().filter(|c| c.role.component == Component::Vision)
+        .map(|c| if c.shape.len() == 1 { c.shape[0] as u64 * 2 } else { 0 }
+            + if c.bias { c.shape[0] as u64 * 2 } else { 0 }).sum();
+    let vision_weights = if vision > 0 { vision + vector_bytes + 52 } else { 0 };
     let vision_spark = matches!(report.vision, MediaMode::Spark(_) | MediaMode::Auto) && vision > 0;
+    let vision_reserve = vision_weights + vision_scratch + GIB;
     let experts = edge(Component::RoutedExpert);
     report.bytes_by_owner.insert("coordinator text weights".into(), body + head + if opts.host_embedding { 0 } else { embedding });
     report.bytes_by_owner.insert("routed expert weights".into(), experts);
@@ -94,7 +102,7 @@ pub(super) fn layout(model: &Model, report: &mut PlanReport, opts: &crate::plan:
     let onboard = match opts.onboard {
         Some(crate::placement::Onboard::Layers(n)) => n.min(layers.len()),
         _ => (0..=layers.len()).find(|&n| rank_bytes(n) + SPARK_RESERVE_BYTES
-            + if vision_spark { vision } else { 0 } <= budget).unwrap_or(layers.len()),
+            + if vision_spark { vision_reserve } else { 0 } <= budget).unwrap_or(layers.len()),
     };
     let local: u64 = layers[..onboard].iter().map(|(_, b)| b).sum();
     report.min_spark_ranks = crate::plan::experts::spark_worlds(super::PACKAGE, cfg.moe_intermediate).into_iter()
@@ -114,13 +122,37 @@ pub(super) fn layout(model: &Model, report: &mut PlanReport, opts: &crate::plan:
         if gpu == 0 && !opts.host_embedding { items.push(Item::new(Category::Embedding, "token embedding", "bf16", embedding, Basis::Exact)); }
         if gpu + 1 == gpus { items.push(Item::new(Category::Weights, "lm head", "bf16", head, Basis::Exact)); }
         if gpu == 0 && drafter > 0 { items.push(Item::new(Category::Drafter, "bundled DSpark drafter (5 layers)", "mxfp8", drafter, Basis::Exact)); }
-        if gpu == 0 && vision_rtx { items.push(Item::new(Category::Weights, "vision tower + projector", "bf16", vision, Basis::Exact)); }
         if local > 0 { items.push(Item::new(Category::Experts, "onboarded bottom routed layers (TP1)", "nvfp4 W4A4", share(local), Basis::Exact)); }
+        items
+    };
+    let token = per_token(cfg, gpus, opts.minimax_kv);
+    let hardware = EncoderHardware {
+        v41: false,
+        gpus: (0..gpus).map(|gpu| EncoderGpuBudget {
+            free_bytes: opts.rtx_bytes[gpu].saturating_sub(gpu_items(gpu, local).iter().map(|i| i.bytes).sum()),
+            kv_target_bytes: token * opts.pool_tokens.unwrap_or(POOL_FLOOR_TOKENS),
+        }).collect(),
+        sparks: (0..ranks).map(|rank| EncoderSparkBudget {
+            rank, host: String::new(), idle: false, expert_bytes: rank_bytes(onboard),
+            free_bytes: budget.saturating_sub(rank_bytes(onboard) + SPARK_RESERVE_BYTES),
+        }).collect(),
+    };
+    let encoder = encoder_placement(report.vision, &hardware, vision_weights, vision_scratch, opts.vision_replicas);
+    if encoder.kind == EncoderKind::Off && matches!(report.vision, MediaMode::Rtx(_) | MediaMode::Spark(_)) {
+        refusal(report, format!("MiniMax vision placement unavailable: {} (shortfall {} bytes)", encoder.reason, encoder.shortfall),
+            "Select an encoder device with tower/scratch/KV headroom, or use --vision off.");
+    }
+    let add_vision = |items: &mut Vec<Item>| {
+        items.push(Item::new(Category::Weights, "vision tower + projector", "BF16 + F32 conv/vectors", encoder.weights, Basis::Formula));
+        items.push(Item::new(Category::Workspace, "vision scratch", "resident; 4096 merged tokens", encoder.scratch, Basis::Formula));
+    };
+    let gpu_items = |gpu, local| {
+        let mut items = gpu_items(gpu, local);
+        if encoder.kind == (EncoderKind::Rtx { gpu }) { add_vision(&mut items); }
         items
     };
     // An explicit onboard that overflows the GPU is refused below; an automatic
     // one is what the Sparks need, so the GPU check reports the shortfall.
-    let token = per_token(cfg, gpus, opts.minimax_kv);
     let free = |local: u64| (0..gpus).map(|gpu| {
         let used: u64 = gpu_items(gpu, local).iter().map(|item| item.bytes).sum();
         opts.rtx_bytes[gpu].saturating_sub(used)
@@ -145,7 +177,7 @@ pub(super) fn layout(model: &Model, report: &mut PlanReport, opts: &crate::plan:
             cuteafd_core::memory_layout::spark_runtime_residual(),
             Item::new(Category::Workspace, "NVFP4 package workspace (unmeasured)", "", 512 << 20, Basis::Estimated),
         ];
-        if rank == 0 && vision_spark { items.push(Item::new(Category::Weights, "vision tower + projector", "bf16", vision, Basis::Exact)); }
+        if encoder.spark_ranks().contains(&rank) { add_vision(&mut items); }
         memory.devices.push(DeviceLayout { kind: DeviceKind::Spark, index: rank as u32, capacity_bytes: budget, items, kv_tokens: 0 });
     }
     let gib = |b: u64| b as f64 / GIB as f64;
@@ -153,9 +185,9 @@ pub(super) fn layout(model: &Model, report: &mut PlanReport, opts: &crate::plan:
         onboard, gib(local), layers.len() - onboard, gib(per_rank), gib(budget)));
     memory.notes.push(format!("pool {pool_tokens} tokens ({:.2} full 1M-token contexts) at {token} B/token per GPU; vision {}; drafter {}",
         pool_tokens as f64 / cfg.max_position as f64,
-        if vision == 0 { "absent" } else if vision_rtx { "on rtx0" } else if vision_spark { "on spark0" } else { "off" },
+        format!("{:?} ({} bytes admitted)", encoder.kind, encoder.admitted_bytes()),
         if drafter > 0 { "on rtx0" } else { "off" }));
-    if per_rank + SPARK_RESERVE_BYTES + if vision_spark { vision } else { 0 } > budget {
+    if per_rank + SPARK_RESERVE_BYTES + if encoder.spark_ranks().is_empty() { 0 } else { encoder.admitted_bytes() } > budget {
         refusal(report, format!("MiniMax M3 TP{ranks} Spark ranks need {:.1} GiB with {onboard} onboarded layers, over the {:.0} GiB budget",
             gib(per_rank + SPARK_RESERVE_BYTES), gib(budget)),
             "Onboard more bottom routed layers to the RTX (--rtx-expert-layers), add Spark ranks, or raise --spark-budget-gib after a load census.");
@@ -168,5 +200,6 @@ pub(super) fn layout(model: &Model, report: &mut PlanReport, opts: &crate::plan:
                 or add Spark ranks so fewer routed layers onboard.".into(),
         });
     }
+    report.encoder = Some(encoder);
     memory
 }

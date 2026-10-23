@@ -121,6 +121,7 @@ def test_head72_uses_the_b12x_le128_tile():
     export = module("python/tools/aot/export_b12x_vision_attention_aot.py", "vision_export")
     assert export.tile_for_head_dim(64) == (128,128)
     assert export.tile_for_head_dim(72) == (128,64)
+    assert export.tile_for_head_dim(80) == (128,64)
     assert export.tile_for_head_dim(128) == (128,64)
     for dim in (0,73,136):
         with pytest.raises(ValueError): export.tile_for_head_dim(dim)

@@ -5616,3 +5616,30 @@ Independent focused validation passed 64 CPU cases and 24 RTX CUDA cases,
 covering FP16/BF16/FP32 inputs, bias and batches 1/33. The production native
 loader already supported this geometry. Recovery of the completed producer
 uses its recorded commit; a new producer pin requires fresh admission evidence.
+
+### MiniMax M3 bundled vision CPU bring-up
+
+The shared owner has a MiniMax ABI3 variant: header-only admission for all
+523 tower/projector tensors, F32 Conv3d, BF16 32-layer CLIP tower, D80 full
+attention with 78-channel axial RoPE, per-patch projector and merge-four MLP.
+ABI1/2 layouts and arithmetic remain unchanged. The encoder planner charges
+resident weights plus the 4096-token scratch to the selected RTX or Spark.
+The native owner accepts still images and paired-frame segments; the HTTP and
+remote media protocols still reject video, so video preparation is not an
+end-to-end serving claim. MiniMax language-model feature injection belongs to
+the family runtime integration.
+
+The pinned release's executable image processor uses smart resize at a 672²
+pixel cap, Torch uint8 antialiased bicubic and fused CLIP normalization. Its
+legacy pinpoint/tiling fields are inactive. Images repeat the temporal sample;
+video segments group at most four frames and repeat an odd final frame. Frame
+sampling is disabled by default; the optional sampling helper pins the compatible
+Transformers implementation because the checkpoint does not pin that dependency
+consistently. Processor hashes participate in preprocessing identity.
+
+CPU gates cover resizing pixels/counts, normalization, merge order, positions,
+BF16 reference layers, tensor contracts, placement and native admission. CUDA
+translation units compile without a device. Remaining gates: full D80 AOT
+export/link, real-weight encoder parity on both architectures, end-to-end media
+injection/cache behavior and performance. No GPU qualification or serving
+promotion follows from the CPU checks.
