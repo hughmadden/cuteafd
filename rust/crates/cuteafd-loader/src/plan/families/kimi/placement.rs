@@ -135,8 +135,12 @@ pub(super) fn layout(model: &Model, report: &mut PlanReport, opts: &crate::plan:
     if let Some(manifest) = &manifest {
         let extra = (|| -> anyhow::Result<_> {
             use crate::families::kimi_k3::{allocation, core};
+            // Speculative verify graphs replay at each exact width up to the drafter's block.
+            let verify = opts.kimi_drafter_snapshot.as_ref().map(|snapshot|
+                crate::formats::dflash::MlaDflashConfig::read(snapshot).map(|draft| draft.block))
+                .transpose()?.unwrap_or(0);
             let mut demands = allocation::baseline_demands(cfg, manifest, rows, context as usize,
-                usize::try_from(slots)?, &model.core, report.requested_attention == Some(AttentionPlacement::Heads))?;
+                usize::try_from(slots)?, verify, &model.core, report.requested_attention == Some(AttentionPlacement::Heads))?;
             let families = if model.core.projections.is_empty() { &["kimik3"][..] } else { &["kimik3", "kimi"][..] };
             let programs = ProgramSet::from_manifest(manifest, families);
             for rank in 0..2 {

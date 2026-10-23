@@ -6,6 +6,11 @@ Whole/replicated MLA and latent operands retain their full dimensions. kv_a
 requires a stored N640 tensor and a caller-side N576 trim; unpadded N576 is
 not a supported native trellis geometry. Independently calibrated projections
 are never concatenated. One fixed arithmetic covers rows 1 through 4096.
+
+KDA q/k/v/g share one activation: below the 64-row chunk threshold they also
+run as one grouped launch per H128 stage (input, core, output), each
+projection keeping its own payload, scales and rotation. The grouped core is
+bitwise-equal to the four standalone launches; it is decode-only (max 64 rows).
 """
 from __future__ import annotations
 
@@ -37,6 +42,9 @@ TRELLIS_SHAPES = (
 
 
 CHUNK_WEIGHT_LIMIT_BYTES = 256 * 1024 * 1024
+# Projections sharing one activation and geometry, launched as one group of four.
+GROUPED_SHAPES = {"kda_qkvg_tp2": 4}
+GROUPED_MAX_ROWS = 64
 
 
 def chunk_columns(k, n):
@@ -64,8 +72,17 @@ def row_policies():
                 output_program=f"trellis_output_n{n}_{'f32' if n == 163840 else 'bf16'}",
                 chunk_columns=columns, weight_scratch_bytes=columns*k*2,
                 chunk_output_dtype="f32", chunk_output_scratch_bytes_per_row=columns*4,
-                stitch_before_output_transform=True))
+                stitch_before_output_transform=True,
+                **({"grouped": grouped_policy(name, k, n, book)} if name in GROUPED_SHAPES else {})))
     return result
+
+
+def grouped_policy(name, k, n, book):
+    groups = GROUPED_SHAPES[name]
+    return dict(groups=groups, max_rows=GROUPED_MAX_ROWS,
+                native_program=f"trellis_{name}_{book}_g{groups}",
+                native_input=f"trellis_input_k{k}_bf16_g{groups}",
+                output_program=f"trellis_output_n{n}_bf16_g{groups}")
 
 
 def programs():
@@ -111,6 +128,22 @@ def programs_for_shapes(shapes, *, max_rows=4096, include_chunk=True, f32_output
         dtype = "f32" if n in f32_outputs else "bf16"
         params = dict(features=n, output_dtype=dtype, max_rows=max_rows)
         result.append((f"trellis_output_n{n}_{dtype}", "trellis_output", params,
+                       partial(compile_trellis_output_aot, **params)))
+    for name, k, n, side in shapes:
+        groups = GROUPED_SHAPES.get(name)
+        if not groups:
+            continue
+        rows = min(max_rows, GROUPED_MAX_ROWS)
+        for codebook in ("mcg", "mul1"):
+            params = dict(input_features=k, output_features=n, bits=6, codebook=codebook,
+                          sharded_side=side, rotation_count=groups, max_rows=rows, groups=groups)
+            result.append((f"trellis_{name}_{codebook}_g{groups}", "trellis_linear", params,
+                           partial(compile_trellis_linear_aot, **params)))
+        params = dict(features=k, input_dtype="bf16", max_rows=rows, groups=groups)
+        result.append((f"trellis_input_k{k}_bf16_g{groups}", "trellis_input", params,
+                       partial(compile_trellis_input_aot, **params)))
+        params = dict(features=n, output_dtype="bf16", max_rows=rows, groups=groups)
+        result.append((f"trellis_output_n{n}_bf16_g{groups}", "trellis_output", params,
                        partial(compile_trellis_output_aot, **params)))
     return result
 

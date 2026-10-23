@@ -27,6 +27,8 @@ pub(crate) struct Options<'a> {
     pub ffn_mode: cuteafd_ffi::KimiFfnMode,
     pub hosted_layers: Option<Vec<usize>>,
     pub draft: Option<super::draft::Options>,
+    /// Exact speculative verify widths given startup graphs; 0 = the drafter's block.
+    pub verify_rows: usize,
 }
 
 pub(crate) struct Loaded<'a> {
@@ -107,7 +109,11 @@ pub(crate) fn load<'a>(library: &'a Arc<cuteafd_ffi::NativeLibrary>,
     })?;
     let lane_layouts = vec![[native[0].lane_layout(full, rows, options.max_context)?,
         native[1].lane_layout(full, rows, options.max_context)?]];
-    let graph_set = options.graphs.then(|| super::graphs::owned_inventory(cfg, 1, rows, options.slots)).transpose()?;
+    let verify_rows = match options.verify_rows {
+        0 => options.draft.as_ref().map(super::draft::Options::verify_rows).transpose()?.unwrap_or(0),
+        rows => rows,
+    };
+    let graph_set = options.graphs.then(|| super::graphs::owned_inventory(cfg, 1, rows, options.slots, verify_rows)).transpose()?;
     let mut fixed = exchange_demands(rows, diagnostics, f32_partials)?;
     if let Some(layout) = &draft_layout {
         fixed.extend(super::draft::bridge_demands(layout)?);
@@ -135,7 +141,7 @@ pub(crate) fn load<'a>(library: &'a Arc<cuteafd_ffi::NativeLibrary>,
         state_slots: options.slots, prefix_marks: options.marks, rows, lanes: 1, lane_layouts, fixed,
         startup: graph_set.as_ref().map_or_else(Vec::new, |set|
             (0..2).map(|rank| super::graphs::demand(&set.inventory, rank)).collect()), pool_bounded: vec![], rtx,
-        spark_budget: Some(spark_budget), draft: draft_layout.clone() })?;
+        spark_budget: Some(spark_budget), draft: draft_layout.clone(), verify_rows })?;
     let graph_set = admitted.graph_set.take();
     if let Some(expected) = options.hosted_layers.as_ref() {
         ensure!(admitted.working_set().spark_layers == *expected,

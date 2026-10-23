@@ -286,6 +286,15 @@ impl<'a> Engine<'a> {
         Ok(())
     }
 
+    pub(crate) fn graph_replays(&self) -> Result<u64> {
+        Ok(self.lanes.try_borrow()?.local.iter().flatten().map(LocalLane::graph_replays).sum())
+    }
+
+    pub(crate) fn set_grouped_kda(&self, enabled: bool) -> Result<()> {
+        for local in self.lanes.try_borrow()?.local.iter().flatten() { local.set_grouped_kda(enabled)?; }
+        Ok(())
+    }
+
     pub(crate) fn warm_graphs(&self, keys: &[super::graphs::Key]) -> Result<()> {
         ensure!(self.startup_captures.get().is_none(), "Kimi startup graphs already sealed");
         let mut lanes = self.lanes.try_borrow_mut()?;

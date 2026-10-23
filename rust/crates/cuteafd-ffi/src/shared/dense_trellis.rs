@@ -553,3 +553,206 @@ mod reduction_tests {
         assert!(order.borrow().is_empty());
     }
 }
+
+/// Package-owned grouped launch for projections sharing one activation and
+/// geometry (Kimi KDA q/k/v/g). Each member keeps its own payload, suh/svh and
+/// block scales; one input, core and output launch cover all members, and
+/// each member's result is bitwise-equal to its standalone native launch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GroupedPolicy { pub groups: usize, pub max_rows: usize,
+    pub native: String, pub native_input: String, pub output_program: String }
+impl GroupedPolicy {
+    pub fn parse(value: &serde_json::Value) -> Result<Option<Self>> {
+        let Some(grouped) = value.get("grouped") else { return Ok(None) };
+        let integer = |key: &str| grouped[key].as_u64().and_then(|v| usize::try_from(v).ok())
+            .ok_or(DenseTrellisError::Invalid("grouped integer"));
+        let text = |key: &str| grouped[key].as_str().filter(|v| !v.is_empty())
+            .map(|name| format!("kimi_k6_dense_{name}")).ok_or(DenseTrellisError::Invalid("grouped program"));
+        let policy = Self { groups: integer("groups")?, max_rows: integer("max_rows")?,
+            native: text("native_program")?, native_input: text("native_input")?, output_program: text("output_program")? };
+        if policy.groups != GROUPS || policy.max_rows != 64 {
+            return Err(DenseTrellisError::Invalid("grouped groups/rows"));
+        }
+        Ok(Some(policy))
+    }
+}
+
+impl GroupedPolicy {
+    /// The grouped launch of the single policy matching this exact geometry, if any.
+    pub fn from_package_geometry(programs: &Programs<'_>, input: usize, output: usize, side: usize,
+        codebook: &str) -> Result<Option<Self>> {
+        let family = programs.family_metadata("kimi_k6_dense")?;
+        let entries = family["row_policies"].as_array().ok_or(DenseTrellisError::Invalid("row-policy list"))?;
+        let mut matches = entries.iter().filter(|p| p["input_features"].as_u64() == Some(input as u64)
+            && p["output_features"].as_u64() == Some(output as u64)
+            && p["sharded_side"].as_u64() == Some(side as u64) && p["codebook"].as_str() == Some(codebook));
+        let selected = matches.next().ok_or(DenseTrellisError::Invalid("missing row policy"))?;
+        if matches.next().is_some() { return Err(DenseTrellisError::Invalid("duplicate row policy")); }
+        Self::parse(selected)
+    }
+}
+
+pub const GROUPS: usize = 4;
+const GROUPED_INPUT: &[&str] = &["input", "q_suh", "k_suh", "v_suh", "g_suh", "q_rotated", "k_rotated",
+    "v_rotated", "g_rotated", "q_input_block_scales", "k_input_block_scales", "v_input_block_scales",
+    "g_input_block_scales"];
+const GROUPED_CORE: &[&str] = &["rotated_inputs", "q_payload", "k_payload", "v_payload", "g_payload",
+    "q_input_block_scales", "k_input_block_scales", "v_input_block_scales", "g_input_block_scales",
+    "partial", "q_output", "k_output", "v_output", "g_output"];
+const GROUPED_OUTPUT: &[&str] = &["q_input", "k_input", "v_input", "g_input", "q_svh", "k_svh", "v_svh",
+    "g_svh", "q_output", "k_output", "v_output", "g_output"];
+
+/// Minimum grouped scratch at `rows` (< 64) live rows. Callers place each
+/// member in a fixed quarter of the lane's (larger, merged) scratch owners, so
+/// the pointer table and captured graphs never depend on live rows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GroupedWorkspace {
+    pub rotated: usize, pub pointer_table: usize, pub block_scales: usize,
+    pub partial: usize, pub accumulator: usize,
+}
+impl GroupedWorkspace {
+    pub fn new(input: usize, output: usize, rows: usize) -> Result<Self> {
+        if !(1..64).contains(&rows) { return Err(DenseTrellisError::Invalid("grouped rows")); }
+        let single = DenseTrellisGeometry { input, output, bits: 6, side: 1, rows,
+            input_dtype: TrellisDType::Bf16, output_dtype: TrellisDType::Bf16 }.workspace()?;
+        let times = |bytes: usize| bytes.checked_mul(GROUPS).ok_or(DenseTrellisError::Invalid("grouped overflow"));
+        Ok(Self { rotated: times(single.rotated)?, pointer_table: GROUPS * 8,
+            block_scales: times(single.block_scales)?, partial: times(single.partial)?,
+            accumulator: times(single.accumulator)? })
+    }
+    /// Member `index`'s fixed quarter of a grouped owner.
+    pub fn slice(buffer: Buffer, index: usize) -> Result<Buffer> {
+        if index >= GROUPS || buffer.bytes % (GROUPS * 16) != 0 {
+            return Err(DenseTrellisError::Invalid("grouped slice"));
+        }
+        let each = buffer.bytes / GROUPS;
+        // SAFETY: offset stays inside the parent extent.
+        Ok(Buffer { ptr: unsafe { buffer.ptr.cast::<u8>().add(index * each).cast() }, bytes: each, ..buffer })
+    }
+    /// Little-endian pointer table naming each member's rotated quarter.
+    pub fn pointer_table(rotated: Buffer) -> Result<Vec<u8>> {
+        (0..GROUPS).map(|i| Self::slice(rotated, i).map(|b| (b.ptr as u64).to_le_bytes()))
+            .collect::<Result<Vec<_>>>().map(|v| v.concat())
+    }
+}
+
+/// One member's resident storage (payload and its own calibration vectors).
+#[derive(Debug, Clone, Copy)]
+pub struct GroupedMember { pub payload: Buffer, pub suh: Buffer, pub svh: Buffer, pub output: Buffer }
+
+pub struct GroupedTrellis<'a> {
+    input: Program<'a>, core: Program<'a>, output: Program<'a>,
+    k: usize, n: usize, ctas: i32,
+}
+impl<'a> GroupedTrellis<'a> {
+    /// Resolved before capture beside the member's standalone dispatch.
+    pub fn load(programs: &'a Programs<'a>, base: &DenseTrellisPolicy, grouped: &GroupedPolicy) -> Result<Self> {
+        let (k, n) = (base.input, base.output);
+        let [input, core, output] = [&grouped.native_input, &grouped.native, &grouped.output_program]
+            .map(|name| programs.spec(name));
+        let (input, core, output) = (input?, core?, output?);
+        let splits = k.div_ceil(1024);
+        let capacity = grouped.max_rows as u32;
+        if base.side != 1 || [input, core, output].iter().any(|spec| spec.capacity_rows != capacity
+            || spec.geometry["max_rows"].as_u64() != Some(capacity as u64)
+            || spec.geometry["groups"].as_u64() != Some(GROUPS as u64))
+            || input.scalar_kinds != b"ii" || core.scalar_kinds != b"iii" || output.scalar_kinds != b"ii"
+            || !input.scratch.is_empty() || !output.scratch.is_empty()
+            || input.geometry["features"].as_u64() != Some(k as u64) || input.geometry["input_dtype"].as_str() != Some("bf16")
+            || input.geometry.get("output_dtype").is_some()
+            || output.geometry["features"].as_u64() != Some(n as u64) || output.geometry["output_dtype"].as_str() != Some("bf16")
+            || core.geometry["codebook"].as_str() != Some(base.codebook.as_str())
+            || [("abi_version", 1), ("input_features", k), ("output_features", n), ("bits", 6), ("sharded_side", 1),
+                ("rotation_count", GROUPS), ("split_k_blocks", 8), ("splits", splits), ("ctas_per_sm", 4)]
+                .iter().any(|&(key, value)| core.geometry[key].as_u64() != Some(value as u64))
+            || core.scratch.get("partial").copied() != Some((GROUPS * grouped.max_rows * splits * n * 4) as u64) {
+            return Err(DenseTrellisError::Invalid("grouped manifest geometry/ABI"));
+        }
+        let ctas = programs.library().sm_count()?.checked_mul(4)
+            .and_then(|v| i32::try_from(v).ok()).filter(|&v| v > 0)
+            .ok_or(DenseTrellisError::Invalid("runtime SM count"))?;
+        Ok(Self { input: programs.program(&grouped.native_input, GROUPED_INPUT)?,
+            core: programs.program(&grouped.native, GROUPED_CORE)?,
+            output: programs.program(&grouped.output_program, GROUPED_OUTPUT)?, k, n, ctas })
+    }
+
+    pub fn geometry(&self) -> (usize, usize) { (self.k, self.n) }
+
+    /// Input H128 (per-member suh), grouped core, then per-member svh egress.
+    /// `pointer_table` must already hold [`GroupedWorkspace::pointer_table`] of
+    /// `rotated`; rotated, scales and accumulator are used by fixed quarters.
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch(&self, rows: usize, input: Buffer, members: [GroupedMember; GROUPS],
+        rotated: Buffer, pointer_table: Buffer, scales: Buffer, partial: Buffer, accumulator: Buffer,
+        stream: *mut c_void) -> Result<()> {
+        let (k, n) = (self.k, self.n);
+        let w = GroupedWorkspace::new(k, n, rows)?;
+        let mut checked = vec![(input, rows*k*2), (rotated, w.rotated), (pointer_table, w.pointer_table),
+            (scales, w.block_scales), (partial, w.partial), (accumulator, w.accumulator)];
+        for m in &members {
+            checked.extend([(m.payload, k*n*6/8), (m.suh, k*2), (m.svh, n*2), (m.output, rows*n*2)]);
+        }
+        buffers(&checked)?;
+        disjoint(&checked.iter().map(|(b, _)| *b).collect::<Vec<_>>())?;
+        let quarters = |buffer: Buffer, need: usize| -> Result<Vec<Buffer>> {
+            let parts = (0..GROUPS).map(|i| GroupedWorkspace::slice(buffer, i)).collect::<Result<Vec<_>>>()?;
+            if parts[0].bytes < need { return Err(DenseTrellisError::Invalid("grouped quarter extent")); }
+            Ok(parts)
+        };
+        let rot = quarters(rotated, rows*k*2)?;
+        let sc = quarters(scales, k/128*2)?;
+        let acc = quarters(accumulator, rows*n*4)?;
+        let scalars = [Scalar::I32(rows as i32), Scalar::I32(self.ctas)];
+        // SAFETY: every member extent, device, alignment and nonaliasing is
+        // checked above; quarters are fixed offsets inside checked owners. The
+        // caller retains all storage and the table through completion/replay.
+        unsafe {
+            let mut p = vec![input.ptr];
+            p.extend(members.iter().map(|m| m.suh.ptr));
+            p.extend(rot.iter().map(|b| b.ptr));
+            p.extend(sc.iter().map(|b| b.ptr));
+            self.input.launch(&p, &scalars, stream)?;
+            let mut p = vec![pointer_table.ptr];
+            p.extend(members.iter().map(|m| m.payload.ptr));
+            p.extend(sc.iter().map(|b| b.ptr));
+            p.push(partial.ptr);
+            p.extend(acc.iter().map(|b| b.ptr));
+            self.core.launch(&p, &[Scalar::I32(rows as i32), Scalar::I32(0), Scalar::I32(self.ctas)], stream)?;
+            let mut p = acc.iter().map(|b| b.ptr).collect::<Vec<_>>();
+            p.extend(members.iter().map(|m| m.svh.ptr));
+            p.extend(members.iter().map(|m| m.output.ptr));
+            self.output.launch(&p, &scalars, stream)?;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod grouped_tests {
+    use super::*;
+    #[test]
+    fn grouped_policy_and_workspace_use_fixed_capacity_slices() {
+        let value = serde_json::json!({"grouped":{"groups":4,"max_rows":64,"native_program":"trellis_kda_qkvg_tp2_mcg_g4",
+            "native_input":"trellis_input_k7168_bf16_g4","output_program":"trellis_output_n6144_bf16_g4"}});
+        let p = GroupedPolicy::parse(&value).unwrap().unwrap();
+        assert_eq!(p.native, "kimi_k6_dense_trellis_kda_qkvg_tp2_mcg_g4");
+        assert!(GroupedPolicy::parse(&serde_json::json!({})).unwrap().is_none());
+        for (key, bad) in [("groups", 2), ("max_rows", 4096)] {
+            let mut v = value.clone(); v["grouped"][key] = serde_json::json!(bad);
+            assert!(GroupedPolicy::parse(&v).is_err(), "{key}");
+        }
+        let w = GroupedWorkspace::new(7168, 6144, 63).unwrap();
+        assert_eq!((w.rotated, w.pointer_table, w.block_scales, w.partial, w.accumulator),
+            (4*63*7168*2, 32, 4*56*2, 4*63*7*6144*4, 4*63*6144*4));
+        assert!(GroupedWorkspace::new(7168, 6144, 64).is_err());
+        let b = Buffer { ptr: 0x10000 as *mut c_void, bytes: w.rotated, device_id: 0, flags: 0 };
+        let s = GroupedWorkspace::slice(b, 3).unwrap();
+        assert_eq!((s.ptr as usize, s.bytes), (0x10000 + 3*63*7168*2, 63*7168*2));
+        assert!(GroupedWorkspace::slice(b, 4).is_err());
+        assert!(GroupedWorkspace::slice(Buffer { bytes: 72, ..b }, 0).is_err());
+        let table = GroupedWorkspace::pointer_table(b).unwrap();
+        assert_eq!(table.len(), 32);
+        assert_eq!(u64::from_le_bytes(table[..8].try_into().unwrap()), 0x10000);
+        assert_eq!(u64::from_le_bytes(table[24..].try_into().unwrap()), (0x10000 + 3*63*7168*2) as u64);
+    }
+}

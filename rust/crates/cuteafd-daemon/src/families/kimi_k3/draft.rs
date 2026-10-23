@@ -21,6 +21,9 @@ impl Options {
         if self.fp8 { GlmDraftRepresentation::Fp8Only } else { GlmDraftRepresentation::Bf16Only }
     }
 
+    /// Exact verify widths with startup graphs: anchor plus a full draft block.
+    pub(crate) fn verify_rows(&self) -> Result<usize> { Ok(MlaDflashConfig::read(&self.snapshot)?.block) }
+
     pub(crate) fn layout(&self, slots: usize, context: usize, sms: usize) -> Result<MlaDraftRuntimeLayout> {
         let cfg = MlaDflashConfig::read(&self.snapshot)?;
         cfg.runtime_layout(self.representation(), GlmDraftCapacity::new(slots, slots.min(8), cfg.block)?,
@@ -447,7 +450,7 @@ mod tests {
             rows: TARGET_TAP_ROWS, slots: 1, marks: 1, max_context: 524_288,
             pool_tokens: Some(524_288), graphs: true, ffn_mode: cuteafd_ffi::KimiFfnMode::default(),
             hosted_layers: Some(hosted_layers),
-            draft: Some(Options { snapshot: drafter, fp8: true, cache_format }),
+            draft: Some(Options { snapshot: drafter, fp8: true, cache_format }), verify_rows: 0,
         })?;
         let engine = &loaded.engine;
         let backend = KimiBackend::new(engine)?;

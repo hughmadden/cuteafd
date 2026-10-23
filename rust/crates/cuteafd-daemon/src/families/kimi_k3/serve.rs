@@ -111,7 +111,7 @@ pub(crate) async fn run(args: ServeArgs) -> Result<()> {
                 rows: 4096, slots, marks,
                 max_context: worker_args.max_context(&cuteafd_loader::plan::families::kimi::core_inventory(&checkpoint)?),
                 pool_tokens: worker_args.pool_tokens.filter(|&tokens| tokens > 0), graphs: true,
-                ffn_mode: cuteafd_ffi::KimiFfnMode::default(), hosted_layers: None, draft,
+                ffn_mode: cuteafd_ffi::KimiFfnMode::default(), hosted_layers: None, draft, verify_rows: 0,
             })?;
             crate::shared::memory_report::release_load_staging(&library);
             let backend = KimiBackend::new(&loaded.engine)?;
