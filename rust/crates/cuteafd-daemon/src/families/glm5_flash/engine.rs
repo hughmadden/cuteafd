@@ -3147,8 +3147,12 @@ impl<'a> GlmfEngine<'a> {
         let row = self.cfg.hidden * 2;
         let t = tokens.len();
         let host = std::time::Instant::now();
+        // A fixed [rows, H] view of the second stream buffer: the ordered staging is
+        // sized once by it (the whole [rows, 4, H] buffer would pin 4x as much).
+        let staged = cuteafd_ffi::CuteafdDeviceBuffer { bytes: w.rows * row, ..w.streams[1].buffer };
+        ensure!(staged.bytes <= w.streams[1].buffer.bytes, "embedding staging view exceeds its stream buffer");
         // SAFETY: embedding scratch is read/written only on the engine stream.
-        unsafe { self.library.copy_h2d_ordered(w.streams[1].buffer, &embed, self.stream)?; }
+        unsafe { self.library.copy_h2d_ordered(staged, &embed, self.stream)?; }
         self.host_op("host: embedding upload", host);
         self.timed("stream expansion", || {
             for s in 0..HC {
@@ -3160,7 +3164,7 @@ impl<'a> GlmfEngine<'a> {
                 };
                 // SAFETY: both buffers are live workspace buffers of at least `t` pitched
                 // rows; the upload precedes these copies on the same stream.
-                unsafe { self.library.copy_device_rows_async(dst, w.streams[1].buffer, row, t, HC * row, row, self.stream)? };
+                unsafe { self.library.copy_device_rows_async(dst, staged, row, t, HC * row, row, self.stream)? };
             }
             Ok(())
         })
