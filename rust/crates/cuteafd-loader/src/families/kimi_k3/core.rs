@@ -109,6 +109,23 @@ impl ProjectionScratchLayout {
         layout.bytes()?;
         Ok(layout)
     }
+    /// A grouped decode launch (KDA q/k/v/g) below the 64-row chunk threshold:
+    /// each member uses a fixed quarter of rotated/scales/accumulator, the
+    /// table names the quarters, and the core indexes one shared partial.
+    pub fn grouped(k: usize, n: usize, rows: usize, groups: usize) -> Result<Self> {
+        ensure!((1..=4096).contains(&rows) && groups == 4 && k > 0 && n > 0 && k % 128 == 0 && n % 128 == 0,
+            "Kimi K6 grouped scratch geometry");
+        let live = rows.min(63);
+        let product = |values: &[usize]| values.iter().try_fold(1usize, |a, b| a.checked_mul(*b))
+            .context("Kimi K6 grouped scratch overflow");
+        let layout = Self { rows, extents: BTreeMap::from([
+            ("rotated", product(&[groups, live, k, 2])?), ("table", groups * 8),
+            ("scales", groups * k / 128 * 2), ("partial", product(&[groups, live, k.div_ceil(1024), n, 4])?),
+            ("accumulator", product(&[groups, live, n, 4])?),
+        ]) };
+        layout.bytes()?;
+        Ok(layout)
+    }
     pub fn merge(&mut self, other: &Self) -> Result<()> {
         ensure!(self.rows == other.rows, "Kimi K6 scratch row capacities differ");
         for (&name, &bytes) in &other.extents {
@@ -272,6 +289,11 @@ pub fn projection_scratch(cfg: &KimiK3Config, core: &CoreInventory, rows: usize,
             let mut layout = ProjectionScratchLayout::new(k,n,if head {rows.min(64)} else {rows},
                 chunk,integer("weight_scratch_bytes")?)?;
             layout.rows = rows;
+            if let Some(grouped) = policy.get("grouped") {
+                let groups = grouped["groups"].as_u64().and_then(|v| usize::try_from(v).ok())
+                    .context("Kimi K6 grouped row-policy groups")?;
+                layout.merge(&ProjectionScratchLayout::grouped(k, n, rows, groups)?)?;
+            }
             if let Some(combined) = &mut combined { combined.merge(&layout)?; } else { combined = Some(layout); }
         }
     }
@@ -505,6 +527,23 @@ mod scratch_admission_tests {
             assert_eq!(exchange_recv_bytes(rows,false)?,rows*7168*2);
         }
         assert!(ProjectionScratchLayout::new(7168,6144,0,6144,7168*6144*2).is_err());
+        // Grouped KDA: four fixed quarters of the live (<64-row) extents, one table entry each.
+        let grouped=ProjectionScratchLayout::grouped(7168,6144,4096,4)?;
+        assert_eq!(grouped.extents["rotated"],4*63*7168*2);
+        assert_eq!(grouped.extents["table"],32);
+        assert_eq!(grouped.extents["partial"],4*63*7*6144*4);
+        assert_eq!(grouped.extents["accumulator"],4*63*6144*4);
+        assert!(!grouped.extents.contains_key("chunk weights"));
+        let mut merged=ProjectionScratchLayout::new(7168,6144,4096,6144,7168*6144*2)?;
+        let single=merged.clone();
+        merged.merge(&grouped)?;
+        assert_eq!(merged.extents["rotated"],single.extents["rotated"]);
+        assert_eq!(merged.extents["accumulator"],single.extents["accumulator"]);
+        assert_eq!(merged.extents["table"],32);
+        assert_eq!(merged.storage()?.owners["route arena"],single.storage()?.owners["route arena"]);
+        let small=ProjectionScratchLayout::grouped(7168,6144,8,4)?;
+        assert_eq!(small.extents["rotated"],4*8*7168*2);
+        assert!(ProjectionScratchLayout::grouped(7168,6144,8,2).is_err());
         assert!(ProjectionScratchLayout::new(7168,6144,64,128,1).is_err());
         Ok(())
     }

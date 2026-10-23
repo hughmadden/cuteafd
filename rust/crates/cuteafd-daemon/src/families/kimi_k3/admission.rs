@@ -55,6 +55,8 @@ pub(crate) struct Inputs<'a> {
     pub rtx: Option<RtxInventory>,
     pub spark_budget: Option<SparkBudgetInventory>,
     pub draft: Option<MlaDraftRuntimeLayout>,
+    /// Exact speculative verify widths with startup graphs: the drafter's block, else 0.
+    pub verify_rows: usize,
 }
 
 /// CPU-planned native residency; no backend owner allocates before solve.
@@ -520,6 +522,7 @@ pub(crate) fn admit<'a>(mut inputs: Inputs<'_>) -> Result<Admission<'a>> {
     let graph_reserve = inputs.startup.iter().any(|d| d.group == super::graphs::RESERVE);
     let graph_rows = inputs.rows;
     let graph_slots = inputs.state_slots;
+    let graph_verify = inputs.verify_rows;
     let mut request = request(inputs)?;
     if let Some(layout) = &draft {
         let demand = Demand::new(1, Category::Prefix, DRAFT_MARKS, layout.window_mark_bytes()? as u64, Basis::Exact);
@@ -552,7 +555,7 @@ pub(crate) fn admit<'a>(mut inputs: Inputs<'_>) -> Result<Admission<'a>> {
                 if selected { layer.modes = vec![LayerMode::Whole { gpu: owner, ffn: FfnMode::Split }]; }
             }
             let graphs = graph_reserve.then(|| super::graphs::inventory(cfg, lanes as usize, graph_rows,
-                graph_slots, |rank, layer| !groups[layer].0 || usize::from(owners[layer]) == rank)).transpose()?;
+                graph_slots, graph_verify, |rank, layer| !groups[layer].0 || usize::from(owners[layer]) == rank)).transpose()?;
             candidate.fixed.retain(|d| d.group != super::graphs::RESERVE);
             if let Some(graphs) = &graphs {
                 candidate.fixed.extend((0..2).map(|rank| super::graphs::demand(&graphs.inventory, rank)));
@@ -814,7 +817,7 @@ pub(super) mod tests {
             automatic.requested_pool = None; automatic.prefix_marks = 2;
             automatic.spark_budget = Some(spark.clone());
             automatic.rtx = Some(plan_rtx(&cfg, &catalog, package.clone(), 4096, 5)?);
-            let graphs = graphs::owned_inventory(&cfg, 1, 4096, 8)?;
+            let graphs = graphs::owned_inventory(&cfg, 1, 4096, 8, 0)?;
             automatic.startup = (0..2).map(|rank| graphs::demand(&graphs.inventory, rank)).collect();
             match admit(automatic) {
                 Ok(admitted) => println!("automatic context={context} draft={enabled} pool={} owners={}/{} marks={}",
@@ -848,7 +851,7 @@ pub(super) mod tests {
                     for (index, layer) in candidate.layers.iter_mut().enumerate() {
                         if groups[index].0 { layer.modes = vec![LayerMode::Whole { gpu: u8::from(index >= boundary), ffn: FfnMode::Split }]; }
                     }
-                    let set = graphs::inventory(&cfg, 1, 4096, 8,
+                    let set = graphs::inventory(&cfg, 1, 4096, 8, 0,
                         |rank, layer| !groups[layer].0 || usize::from(layer >= boundary) == rank)?;
                     candidate.fixed.extend((0..2).map(|rank| graphs::demand(&set.inventory, rank)));
                     let rank0 = groups[..boundary].iter().filter(|g| g.0).count();
@@ -915,7 +918,7 @@ pub(super) mod tests {
                 &KimiK3Config::from_hf(&cuteafd_loader::plan::testing::kimi_k3_config()).unwrap(), 4096, 1_048_576,
                 super::super::device::NativeScratch { kda: 1024, mla: [512, 0, 1024] }).unwrap()); 2],
             fixed: (0..2).map(|rank| Demand::new(rank, Category::Workspace, "native engine buffers", 1 << 20, Basis::Exact)).collect(),
-            startup: vec![], pool_bounded: vec![], rtx: None, spark_budget: None, draft: None }
+            startup: vec![], pool_bounded: vec![], rtx: None, spark_budget: None, draft: None, verify_rows: 0 }
     }
 
     fn draft_layout(slots: usize, sequences: usize, context: usize) -> MlaDraftRuntimeLayout {
@@ -983,7 +986,7 @@ pub(super) mod tests {
     fn owned_candidates_keep_matching_graphs_and_shared_draft_pool() -> Result<()> {
         let cfg = cfg();
         let mut i = inputs(&cfg);
-        let seed = super::super::graphs::owned_inventory(&cfg, i.lanes, i.rows, i.state_slots)?;
+        let seed = super::super::graphs::owned_inventory(&cfg, i.lanes, i.rows, i.state_slots, i.verify_rows)?;
         i.startup = (0..2).map(|rank| super::super::graphs::demand(&seed.inventory, rank)).collect();
         i.draft = Some(draft_layout(i.state_slots, i.state_slots, 1048576));
         let admitted = admit(i)?;
@@ -1161,7 +1164,7 @@ pub(super) mod tests {
                 allocation::NativeScratch::from_manifest(&manifest).unwrap()).unwrap())];
             i.fixed = super::super::startup::exchange_demands(rows, false, false)?;
             i.startup = (0..2).map(|rank| super::super::graphs::demand(
-                &super::super::graphs::owned_inventory(&cfg, 1, rows, slots as usize).unwrap().inventory, rank)).collect();
+                &super::super::graphs::owned_inventory(&cfg, 1, rows, slots as usize, 0).unwrap().inventory, rank)).collect();
             for rank in 0..2 {
                 let code = cuteafd_loader::placement::inventory::loaded_code_allowance(
                     "kimik3", "exl3", true, rank as u8, arch, Some(&programs));
@@ -1703,7 +1706,7 @@ pub(super) mod tests {
     #[test]
     fn only_named_startup_graph_reserve_may_be_estimated() -> Result<()> {
         let cfg = cfg();
-        let inventory = super::super::graphs::owned_inventory(&cfg, 1, 64, 4)?;
+        let inventory = super::super::graphs::owned_inventory(&cfg, 1, 64, 4, 0)?;
         let reserve = super::super::graphs::demand(&inventory.inventory, 0);
         let mut i = inputs(&cfg);
         i.startup.push(reserve.clone());

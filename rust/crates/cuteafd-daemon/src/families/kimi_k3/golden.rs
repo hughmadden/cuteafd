@@ -51,6 +51,17 @@ pub(crate) struct GoldenArgs {
     compensated_ffn: bool,
     /// All-layer logits scored against the immutable F32 reference quick subset.
     #[arg(long, requires_all = ["golden", "save_logits"], conflicts_with_all = ["reference_state", "last_layer", "windows"])] nll: bool,
+    /// Score the windows as teacher-forced speculative verify cycles of this
+    /// many rows (2..=64; all rows accepted) instead of prefill-shaped chunks:
+    /// the C1 serving verify shape, with the prompt prefilled up to score_from.
+    #[arg(long, requires = "nll", value_parser = clap::value_parser!(u16).range(2..=64))] verify_rows: Option<u16>,
+    /// With --verify-rows: replay startup verify graphs (on) or run eagerly (off).
+    #[arg(long, requires = "verify_rows", default_value = "on", value_parser = ["on", "off"])] graphs: String,
+    /// Grouped K6 KDA q/k/v/g input launch (on) or the four standalone launches
+    /// (off; eager scoring only, since startup graphs capture the grouped launch).
+    #[arg(long, default_value = "on", value_parser = ["on", "off"])] grouped_kda: String,
+    /// With --verify-rows: score only the first N verify rows of each window.
+    #[arg(long, requires = "verify_rows")] verify_limit: Option<usize>,
 }
 
 struct Reference { tokens: Vec<u32>, hidden: Vec<f32> }
@@ -64,7 +75,9 @@ impl GoldenArgs {
     fn provenance(&self) -> Value {
         serde_json::json!({"schema": "cuteafd.kimi.run/1", "ffn_mode": self.ffn_mode().name(), "kv_cache": self.kv_cache.label(),
             "gate_up_programs": ([3072, 16896].map(|width| self.ffn_mode().gate_up_stem(width))),
-            "rtx_expert_layers":self.rtx_expert_layers, "window": self.window, "last_layer": self.last_layer, "diagnostic_only": !self.nll})
+            "rtx_expert_layers":self.rtx_expert_layers, "window": self.window, "last_layer": self.last_layer, "diagnostic_only": !self.nll,
+            "verify_rows": self.verify_rows, "graphs": self.verify_rows.map(|_| &self.graphs), "grouped_kda": self.grouped_kda,
+            "verify_limit": self.verify_limit})
     }
 }
 
@@ -297,6 +310,96 @@ fn score_windows(args: &GoldenArgs, engine: &Engine<'_>, pool: &mut cuteafd_engi
     Ok(())
 }
 
+/// Decode-shaped scoring: prefill each window to score_from, then verify
+/// `verify` teacher-forced rows per cycle and accept them all, exactly the
+/// serving speculative path (replay records, verify MLA, KDA commit). With
+/// startup graphs on, every exact width up to `verify` replays; the final
+/// shorter cycle uses its own exact width.
+fn score_verify(args: &GoldenArgs, engine: &Engine<'_>, pool: &mut cuteafd_engine::prefix::RefPagePool,
+    windows: &[cuteafd_bench::reference::Window], capacity: usize, verify: usize, graphs: bool) -> Result<()> {
+    use cuteafd_api::openai::probe::{Probe, ProbeSpec};
+    use cuteafd_bench::{fidelity_rows, reference::Fidelity};
+    use cuteafd_engine::prefix::PrefixFamily;
+    use std::io::Write;
+    let root = args.save_logits.as_deref().context("--nll requires --save-logits")?;
+    std::fs::create_dir(root).context("Kimi logits output must be a new directory")?;
+    let family = engine.prefix_family()?;
+    let library = engine.library();
+    let mut records = Vec::new();
+    let captures = cuteafd_ffi::graph_captures();
+    for window in windows {
+        let count = window.tokens.len() - 1;
+        let end = args.verify_limit.map_or(count, |limit| count.min(window.score_from - 1 + limit));
+        let units = pool.alloc(window.tokens.len().div_ceil(cuteafd_ffi::MLA_PAGE_ROWS))?;
+        let mut placement = super::prefix::Placement { units: units.clone(), slot: 0, len: 0, state_len: 0 };
+        family.bind(&mut placement).map_err(|error| anyhow::anyhow!("{error}"))?;
+        let dump = root.join(&window.id);
+        let probe = Probe::new(ProbeSpec { cold: true, no_speculation: true,
+            prompt_ids: Some(window.tokens.clone()), score_from: Some(window.score_from),
+            score_positions: Some(window.positions.iter().map(|p| p.pos)
+                .filter(|&pos| pos <= end).collect()),
+            top_k: 32, want: window.want(), dump_rows: Some(dump.clone()), ..Default::default() });
+        probe.admitted("kimi_k3", &window.tokens, 0);
+        probe.selected_score_path(if graphs { "verify-graphs" } else { "verify-eager" });
+        probe.provenance(args.provenance());
+        // Prompt prefix: rows 0..score_from-1, chunked at the lane capacity.
+        let prefix = window.score_from - 1;
+        for first in (0..prefix).step_by(capacity) {
+            let chunk = &window.tokens[first..(first + capacity).min(prefix)];
+            engine.step_device(&mut [(&mut placement, chunk)], pool, 1, true)?;
+        }
+        let mut first = prefix;
+        while first < end {
+            let rows = &window.tokens[first..(first + verify).min(end)];
+            let start = placement.len;
+            let logits = engine.verify_device(&mut [(&mut placement, rows)], pool, graphs)?;
+            library.cuda_set_device(args.split_device)?;
+            let values = logits.to_host(library)?;
+            for (row, logits) in values.chunks_exact(163840).enumerate() {
+                let position = first + row + 1;
+                if position >= window.score_from { probe.row(position, logits); }
+            }
+            let mut seq = super::backend::DraftState::default();
+            placement.len = start + rows.len();
+            engine.accept_provisional::<_, ()>(&mut [crate::shared::qwen::scheduler::Verified {
+                placement: &mut placement, seq: &mut seq, start, history: (), rows,
+                first_row: 0, kept: Some((rows.len(), 0)), finished: false, neural: false }])?;
+            first += rows.len();
+        }
+        let record = probe.record();
+        ensure!(record.error.is_none(), "Kimi row dump failed: {:?}", record.error);
+        let mut scored = window.clone();
+        scored.positions.retain(|p| p.pos <= end);
+        let mut score = scored.score(&record.rows);
+        ensure!(score.missing == 0 && score.non_finite == 0 && score.records.len() == scored.positions.len(),
+            "Kimi verify scoring did not cover every finite scored row");
+        fidelity_rows::score_compact(163840, &scored, &dump, &mut score)?;
+        println!("Kimi window {} verify={verify} graphs={graphs}: rows={} top-1={:.4}% mean NLL={:.8} mean KL(top1024+tail)={:.8}",
+            window.id, score.positions, score.top1 * 100.0, score.nll, score.kl);
+        let mut out = std::fs::OpenOptions::new().write(true).create_new(true).open(root.join(format!("{}.json", window.id)))?;
+        serde_json::to_writer(&mut out, &serde_json::json!({"probe":record,"score":score}))?;
+        out.write_all(b"\n")?;
+        records.extend(score.records);
+        family.drain().map_err(|error| anyhow::anyhow!("{error}"))?;
+        family.discard(&mut placement).map_err(|error| anyhow::anyhow!("{error}"))?;
+        pool.release(&units);
+    }
+    let steady = cuteafd_ffi::graph_captures() - captures;
+    ensure!(steady == 0, "Kimi verify scoring captured {steady} graphs after startup");
+    let replays = engine.graph_replays()?;
+    let score = Fidelity::from_records(records);
+    println!("Kimi verify logits: verify={verify} graphs={graphs} replays={replays} steady_captures={steady} rows={} top-1 agreement {:.4}% | mean NLL engine {:.8} | mean KL(top1024+tail) {:.8}",
+        score.positions, score.top1 * 100.0, score.nll, score.kl);
+    let out = std::fs::OpenOptions::new().write(true).create_new(true).open(root.join("fidelity.json"))?;
+    serde_json::to_writer(out, &serde_json::json!({"schema":"cuteafd.kimi.golden/1",
+        "reference_config":cuteafd_bench::fidelity_dataset::KIMI_K3_CONFIG,
+        "reference_revision":cuteafd_bench::fidelity_dataset::KIMI_K3_REVISION,
+        "reference_manifest_sha256":cuteafd_bench::fidelity_dataset::KIMI_K3_MANIFEST_SHA256,
+        "path_shape":"verify-shaped","kl_kind":"top1024+tail","provenance":args.provenance(),
+        "graph_replays":replays,"score":score}))?;
+    Ok(())
+}
+
 fn native(args: &GoldenArgs, checkpoint: &cuteafd_loader::plan::Checkpoint,
     full: &KimiK3Config, cfg: &KimiK3Config, reference: Reference,
     scoring: Option<&[cuteafd_bench::reference::Window]>) -> Result<()> {
@@ -308,15 +411,20 @@ fn native(args: &GoldenArgs, checkpoint: &cuteafd_loader::plan::Checkpoint,
     let programs = library.programs()?.with_manifest(&args.manifest)?;
     let rows = scoring.map_or(reference.tokens.len(), |windows| windows.iter().map(|w| w.tokens.len() - 1)
         .max().unwrap_or(1).min(4096));
+    let verify = args.verify_rows.map(usize::from);
+    let graphs = verify.is_some() && args.graphs == "on";
     let super::startup::Loaded { engine, admission_free, admitted_bytes } = super::startup::load(
         &library, &programs, checkpoint, full, cfg, super::startup::Options {
             cache_format: args.kv_cache,
             devices: [args.device, args.split_device], native_lib: args.native_lib.as_deref().context("--native-lib required")?,
             peers: args.peers.clone(), rtx_expert_layers: cuteafd_loader::placement::Onboard::Layers(args.rtx_expert_layers),
             spark_budget_gib: args.spark_budget_gib,
-            rows, slots: 1, marks: 1, max_context: cuteafd_loader::families::kimi_k3::COMPILED_CONTEXT, pool_tokens: Some(1_048_576), graphs: false,
+            rows, slots: 1, marks: 1, max_context: cuteafd_loader::families::kimi_k3::COMPILED_CONTEXT, pool_tokens: Some(1_048_576), graphs,
             draft: None, ffn_mode: args.ffn_mode(), hosted_layers: Some(hosted_layers(&std::env::var("CUTEAFD_GOLDEN_EXPERT_LAYERS")?)?),
+            verify_rows: verify.unwrap_or(0),
         })?;
+    // Diagnostic A/B: the four standalone launches; refused once graphs are captured.
+    if args.grouped_kda == "off" { engine.set_grouped_kda(false)?; }
     use cuteafd_engine::prefix::PrefixFamily;
     let pages = engine.prefix_family()?.layout().pages;
     let loaded = RuntimeInventory::measure(&library, &[args.device, args.split_device], InventoryPhase::PostLoad, |_| Ok(()))?;
@@ -328,7 +436,11 @@ fn native(args: &GoldenArgs, checkpoint: &cuteafd_loader::plan::Checkpoint,
     }
     let mut pool = cuteafd_engine::prefix::RefPagePool::new(pages, cuteafd_ffi::MLA_PAGE_ROWS);
     let actual = if let Some(windows) = scoring {
-        score_windows(args, &engine, &mut pool, windows, rows)?;
+        if let Some(verify) = verify {
+            score_verify(args, &engine, &mut pool, windows, rows, verify, graphs)?;
+        } else {
+            score_windows(args, &engine, &mut pool, windows, rows)?;
+        }
         None
     } else {
         let allocated = pool.alloc(rows.div_ceil(cuteafd_ffi::MLA_PAGE_ROWS))?;
@@ -472,6 +584,15 @@ mod tests {
             assert!(crate::cli::Cli::try_parse_from(args.into_iter().chain(tail)).is_err());
         }
         assert!(crate::cli::Cli::try_parse_from(args.into_iter().chain(["--window", "legacy"])).is_ok());
+        let crate::cli::Commands::KimiGolden(verify) = crate::cli::Cli::try_parse_from(args.into_iter()
+            .chain(["--verify-rows", "8", "--graphs", "off", "--verify-limit", "64"]))?.command else { panic!("Kimi command"); };
+        assert_eq!((verify.verify_rows, verify.graphs.as_str(), verify.verify_limit), (Some(8), "off", Some(64)));
+        assert_eq!(verify.provenance()["graphs"], "off");
+        assert_eq!(parsed.provenance()["graphs"], serde_json::Value::Null);
+        for bad in [&["--verify-rows", "1"][..], &["--verify-rows", "65"], &["--graphs", "off"], &["--verify-limit", "4"],
+            &["--grouped-kda", "maybe"]] {
+            assert!(crate::cli::Cli::try_parse_from(args.into_iter().chain(bad.iter().copied())).is_err(), "{bad:?}");
+        }
         Ok(())
     }
 
@@ -666,7 +787,7 @@ mod tests {
             crate::shared::placement::spark_rings(cuteafd_transport::TcpTransportConfig::default().max_frame_bytes)?,
             cuteafd_loader::families::kimi_k3::SPARK_DEFAULT_BUDGET_BYTES,
             cuteafd_loader::families::kimi_k3::SPARK_ESTIMATED_RESERVE_BYTES)?;
-        let graph_set = super::super::graphs::owned_inventory(&cfg, 1, rows, slots)?;
+        let graph_set = super::super::graphs::owned_inventory(&cfg, 1, rows, slots, 0)?;
         let admitted = admission::admit(admission::Inputs { cfg: &cfg, core: Default::default(), cache_format: cuteafd_core::MlaCacheFormat::Bf16, gpus: [GpuBudget {
             capacity_bytes: 96 << 30, headroom_bytes: 2 << 30,
             baseline: cuteafd_loader::placement::Baseline::Measured { free_bytes: (96 << 30) - reserve } }; 2],
@@ -675,7 +796,7 @@ mod tests {
             lane_layouts: vec![std::array::from_fn(|_| super::super::device::LaneLayout::new(&cfg, rows,
                 1048576, native_scratch).unwrap())], fixed,
             startup: (0..2).map(|rank| super::super::graphs::demand(&graph_set.inventory, rank)).collect(),
-            pool_bounded: vec![], rtx: Some(rtx), spark_budget: Some(spark.clone()), draft: None })?;
+            pool_bounded: vec![], rtx: Some(rtx), spark_budget: Some(spark.clone()), draft: None, verify_rows: 0 })?;
         let onboard = admitted.placement.onboard_layers;
         assert!(onboard >= spark.minimum_rtx_layers()?);
         assert_eq!(admitted.working_set().rtx_layers, (1..=onboard).collect::<Vec<_>>());

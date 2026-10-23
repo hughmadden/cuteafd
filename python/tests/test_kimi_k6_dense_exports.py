@@ -47,8 +47,20 @@ def test_only_shared_native_compiler_and_both_codebooks(monkeypatch):
     for fake_module in (dequant, projection, torch):
         monkeypatch.setitem(sys.modules, fake_module.__name__, fake_module)
     programs = module["programs"]()
-    assert len(programs) == 87
+    assert len(programs) == 91
     assert len({name for name, *_ in programs}) == len(programs)
+    grouped = [item for item in programs if item[2].get("groups")]
+    assert {name for name, *_ in grouped} == {
+        "trellis_kda_qkvg_tp2_mcg_g4", "trellis_kda_qkvg_tp2_mul1_g4",
+        "trellis_input_k7168_bf16_g4", "trellis_output_n6144_bf16_g4"}
+    for name, op, params, compile_program in grouped:
+        assert params["groups"] == 4 and params["max_rows"] == 64
+        assert compile_program() == params
+        if op == "trellis_linear":
+            assert params["rotation_count"] == 4 and params["sharded_side"] == 1 and params["bits"] == 6
+        elif op == "trellis_output":
+            assert params["output_dtype"] == "bf16"
+    programs = [item for item in programs if not item[2].get("groups")]
     core = [item for item in programs if item[1] == "trellis_linear"]
     assert len(core) == 2 * len(module["TRELLIS_SHAPES"])
     for _, op, params, compile_program in core:
@@ -76,10 +88,16 @@ def test_only_shared_native_compiler_and_both_codebooks(monkeypatch):
             assert name == f"trellis_output_n{params['features']}_{dtype}"
     for _, op, params, compile_program in programs:
         assert compile_program() == params
-    names = {name for name, *_ in programs}
+    names = {name for name, *_ in programs} | {name for name, *_ in grouped}
     for policy in module["row_policies"]():
         for field in ("native_program", "native_input", "wide_input", "dequant_program", "projection_program", "output_program"):
             assert policy[field] in names
+        if "grouped" in policy:
+            assert policy["shape"] == "kda_qkvg_tp2"
+            assert policy["grouped"]["native_program"] == f"trellis_kda_qkvg_tp2_{policy['codebook']}_g4"
+            for field in ("native_program", "native_input", "output_program"):
+                assert policy["grouped"][field] in names
+    assert sum("grouped" in policy for policy in module["row_policies"]()) == 2
     fixture = module["programs_for_shapes"]((("s1", 128, 256, 1), ("s2", 128, 256, 2)),
         max_rows=64, include_chunk=False, f32_outputs=(256,))
     assert {name for name, *_ in fixture} == {

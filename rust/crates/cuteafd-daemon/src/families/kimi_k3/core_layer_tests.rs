@@ -160,7 +160,7 @@ fn kda_layer(device:Device<'_>,base:&Programs<'_>,programs:&Programs<'_>,source:
         let scratch=zero(device,split.scratch_bytes())?;let scratch_ref=zero(device,fused.scratch_bytes())?;
         let slots=zero(device,rows*4)?;let first=zero(device,rows*4)?;
         let result=device.run(|| {
-            super::core_runtime::kda_projected(&split,std::array::from_fn(|i|projections[i].projected()),
+            super::core_runtime::kda_projected(&split,std::array::from_fn(|i|projections[i].projected()),None,
                 KimiKdaCoreWeights{fab:fab.buffer,forget:w("forget"),convolution:w("conv"),a_log:w("a_log"),dt_bias:w("dt_bias"),norm:w("norm")},
                 KimiKdaCoreBatch{rows,sequences:1,state_slots:1,speculative:false,input:x.buffer,q:planes[0].buffer,k:planes[1].buffer,
                     v:planes[2].buffer,gate:planes[3].buffer,conv_state:conv.buffer,state:state.buffer,slots:slots.buffer,first:first.buffer,

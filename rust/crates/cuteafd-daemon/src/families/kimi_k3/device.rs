@@ -461,9 +461,9 @@ impl<'a> LocalLane<'a> {
             match key.op {
                 Op::Residual(site) => { self.residual(site, key.rows)?; }
                 Op::Ffn(layer) => { self.ffn(layer, key.rows)?; }
-                Op::Attention { layer, sequences } => {
+                Op::Attention { layer, sequences, speculative } => {
                     self.attention = Some(AttentionShape { rows: key.rows, sequences });
-                    self.attention(layer, key.rows, false)?;
+                    self.attention(layer, key.rows, speculative)?;
                 }
             }
             Ok(())
@@ -501,6 +501,13 @@ impl<'a> LocalLane<'a> {
     }
 
     pub(crate) fn enable_replay(&mut self, enabled: bool) { self.replay_enabled = enabled; }
+    pub(crate) fn graph_replays(&self) -> u64 { self.graphs.as_ref().map_or(0, |graphs| graphs.replays()) }
+    /// Diagnostic A/B only, before startup graphs are captured.
+    pub(crate) fn set_grouped_kda(&self, enabled: bool) -> Result<()> {
+        ensure!(self.graphs.is_none(), "Kimi grouped KDA selection after graph capture");
+        if let Some(core) = &self.programs.core { core.set_grouped(enabled); }
+        Ok(())
+    }
 
     fn replay(&mut self, rows: usize, op: super::graphs::Op) -> Result<bool> {
         if !self.replay_enabled || self.lane.window.is_some() { return Ok(false); }
@@ -519,7 +526,9 @@ impl<'a> LocalLane<'a> {
         let sequences = if self.cfg.attention[layer] == cuteafd_loader::families::kimi_k3::config::KimiAttention::Kda {
             shape.sequences
         } else { 1 };
-        if !speculative && self.replay(rows, super::graphs::Op::Attention { layer, sequences })? {
+        // Speculative keys replay the verify programs (replay records, verify MLA);
+        // slots, pages and frontiers are device metadata staged outside capture.
+        if self.replay(rows, super::graphs::Op::Attention { layer, sequences, speculative })? {
             return self.attention_result(layer,rows);
         }
         let weights = self.layer(layer)?;
@@ -598,7 +607,7 @@ impl<'a> LocalLane<'a> {
                         dt_bias:weights.buffer("kda.dt_bias")?,norm:weights.buffer("kda.norm")?};
                     super::core_runtime::kda_projected(&programs.kda[usize::from(rows>64)],
                         [projected("kda.q")?,projected("kda.k")?,projected("kda.v")?,projected("kda.gate")?],
-                        core_weights,batch,stream.raw)?;
+                        programs.grouped(weights.core("kda.q")?),core_weights,batch,stream.raw)?;
                     "kda.output"
                 }
                 KimiAttention::Mla=> {

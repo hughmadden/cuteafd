@@ -204,18 +204,39 @@ impl NativeScratch {
 pub const GRAPH_RESERVE: &str = "Kimi startup graph reserve";
 pub const GRAPH_ROWS: [usize; 5] = [1, 4, 16, 64, 4096];
 
-pub fn graphs(cfg: &KimiK3Config, lanes: usize, capacity: usize, slots: usize,
+/// Speculative verify rows replay at their exact width (no padding: every
+/// row writes KDA replay records and MLA cache slots). `verify` is the
+/// drafter's block (anchor + drafts), 0 without speculation.
+pub fn verify_graph_rows(verify: usize, capacity: usize) -> std::ops::RangeInclusive<usize> {
+    2..=verify.min(64).min(capacity)
+}
+
+/// Every captured row count: the plain buckets plus each exact verify width.
+/// Plain attention (and multi-sequence KDA) keys stay on the plain buckets; the
+/// added widths capture speculative single-sequence attention, residual and FFN.
+pub fn graph_rows(verify: usize, capacity: usize) -> Vec<usize> {
+    let mut rows = GRAPH_ROWS.into_iter().chain(verify_graph_rows(verify, capacity))
+        .filter(|&r| r <= capacity).collect::<Vec<_>>();
+    rows.sort_unstable();
+    rows.dedup();
+    rows
+}
+
+pub fn graphs(cfg: &KimiK3Config, lanes: usize, capacity: usize, slots: usize, verify: usize,
     resident: impl Fn(usize, usize) -> bool) -> Result<GraphSet> {
     ensure!((1..=2).contains(&lanes) && (1..=4096).contains(&capacity)
-        && (1..=64).contains(&slots), "Kimi graph geometry");
+        && (1..=64).contains(&slots) && verify <= 64, "Kimi graph geometry");
     let mut counts = [0; 2];
     for (rank, count) in counts.iter_mut().enumerate() {
-        for rows in GRAPH_ROWS.into_iter().filter(|&r| r <= capacity) {
+        for rows in graph_rows(verify, capacity) {
             *count += (3 * cfg.layers + usize::from(rank == 1)) as u64;
             for layer in 0..cfg.layers {
                 if resident(rank, layer) {
-                    *count += 1 + u64::from(cfg.attention[layer] == KimiAttention::Kda
-                        && (2..=slots).contains(&rows));
+                    if GRAPH_ROWS.contains(&rows) {
+                        *count += 1 + u64::from(cfg.attention[layer] == KimiAttention::Kda
+                            && (2..=slots).contains(&rows));
+                    }
+                    *count += u64::from(verify_graph_rows(verify, capacity).contains(&rows));
                 }
             }
         }
@@ -296,12 +317,12 @@ pub fn expert_package(manifest: &std::path::Path) -> Result<std::path::PathBuf> 
 }
 
 pub fn baseline_demands(cfg: &KimiK3Config, manifest: &serde_json::Value,
-    rows: usize, context: usize, slots: usize, core: &super::core::CoreInventory,
+    rows: usize, context: usize, slots: usize, verify: usize, core: &super::core::CoreInventory,
     heads: bool) -> Result<Vec<Demand>> {
     let layout = NativeLaneLayout::new(cfg, rows, context, NativeScratch::from_manifest(manifest)?)?;
     let owners = crate::placement::attention::alternating_owners(
         cfg.attention.iter().map(|kind| (*kind == KimiAttention::Mla, None)), 0)?;
-    let graphs = graphs(cfg, 1, rows, slots, |rank, layer| cfg.attention[layer] == KimiAttention::Kda
+    let graphs = graphs(cfg, 1, rows, slots, verify, |rank, layer| cfg.attention[layer] == KimiAttention::Kda
         || heads || rank == usize::from(owners[layer]))?;
     let mut demands = vec![spark_demand(rows, 0)];
     for rank in 0..2 {

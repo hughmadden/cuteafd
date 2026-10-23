@@ -8,31 +8,39 @@ use cuteafd_loader::{families::kimi_k3::config::{KimiAttention, KimiK3Config},
     placement::inventory::StartupGraphs};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub(crate) enum Op { Residual(MixSite), Attention { layer: usize, sequences: usize }, Ffn(usize) }
+pub(crate) enum Op { Residual(MixSite), Attention { layer: usize, sequences: usize, speculative: bool }, Ffn(usize) }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct Key { pub lane: usize, pub rank: usize, pub rows: usize, pub op: Op }
 
 pub(crate) use cuteafd_loader::families::kimi_k3::allocation::{GRAPH_RESERVE as RESERVE,
-    GRAPH_ROWS as ROWS, graph_demand as demand};
+    graph_demand as demand};
+use cuteafd_loader::families::kimi_k3::allocation::{graph_rows, verify_graph_rows};
 
 /// An estimated reserve until the first real serving census qualifies its bytes.
 /// The exact same key set is charged by admission and sealed by each binding.
-pub(crate) fn inventory(cfg: &KimiK3Config, lanes: usize, capacity: usize, slots: usize,
+/// `verify` (the drafter's block, 0 without one) adds every exact verify width
+/// with its speculative single-sequence attention, the C1 verify shape.
+pub(crate) fn inventory(cfg: &KimiK3Config, lanes: usize, capacity: usize, slots: usize, verify: usize,
     resident: impl Fn(usize, usize) -> bool) -> Result<StartupGraphs<Key>> {
     ensure!((1..=2).contains(&lanes) && (1..=4096).contains(&capacity) && (1..=64).contains(&slots), "Kimi graph lane/row capacity");
     let mut keys = Vec::new();
     for lane in 0..lanes {
         for rank in 0..2 {
-            for rows in ROWS.into_iter().filter(|&rows| rows <= capacity) {
+            for rows in graph_rows(verify, capacity) {
                 for layer in 0..cfg.layers {
                     keys.push(Key { lane, rank, rows, op: Op::Residual(MixSite::Attention(layer)) });
                     keys.push(Key { lane, rank, rows, op: Op::Residual(MixSite::Ffn(layer)) });
                     keys.push(Key { lane, rank, rows, op: Op::Ffn(layer) });
                     if resident(rank, layer) {
-                        keys.push(Key { lane, rank, rows, op: Op::Attention { layer, sequences: 1 } });
-                        if cfg.attention[layer] == KimiAttention::Kda && (2..=slots).contains(&rows) {
-                            keys.push(Key { lane, rank, rows, op: Op::Attention { layer, sequences: rows } });
+                        if cuteafd_loader::families::kimi_k3::allocation::GRAPH_ROWS.contains(&rows) {
+                            keys.push(Key { lane, rank, rows, op: Op::Attention { layer, sequences: 1, speculative: false } });
+                            if cfg.attention[layer] == KimiAttention::Kda && (2..=slots).contains(&rows) {
+                                keys.push(Key { lane, rank, rows, op: Op::Attention { layer, sequences: rows, speculative: false } });
+                            }
+                        }
+                        if verify_graph_rows(verify, capacity).contains(&rows) {
+                            keys.push(Key { lane, rank, rows, op: Op::Attention { layer, sequences: 1, speculative: true } });
                         }
                     }
                 }
@@ -40,17 +48,17 @@ pub(crate) fn inventory(cfg: &KimiK3Config, lanes: usize, capacity: usize, slots
             }
         }
     }
-    cuteafd_loader::families::kimi_k3::allocation::graphs(cfg, lanes, capacity, slots, resident)?
+    cuteafd_loader::families::kimi_k3::allocation::graphs(cfg, lanes, capacity, slots, verify, resident)?
         .startup(keys).map_err(anyhow::Error::msg)
 }
 
 /// Use the solver's alternating selected-layer helper, not layer parity: KDA
 /// gaps must not alter the MLA owner's ordinal.
-pub(crate) fn owned_inventory(cfg: &KimiK3Config, lanes: usize, rows: usize, slots: usize)
+pub(crate) fn owned_inventory(cfg: &KimiK3Config, lanes: usize, rows: usize, slots: usize, verify: usize)
     -> Result<StartupGraphs<Key>> {
     let owners = cuteafd_loader::placement::attention::alternating_owners(
         cfg.attention.iter().map(|kind| (*kind == KimiAttention::Mla, None)), 0)?;
-    inventory(cfg, lanes, rows, slots, |rank, layer|
+    inventory(cfg, lanes, rows, slots, verify, |rank, layer|
         cfg.attention[layer] == KimiAttention::Kda || rank == usize::from(owners[layer]))
 }
 
@@ -78,7 +86,7 @@ pub(crate) fn check_placement(cfg: &KimiK3Config, placement: &cuteafd_loader::pl
     Ok(())
 }
 
-pub(crate) struct Graphs<'a> { bank: GraphBank<Key, GraphOwner<'a, ()>> }
+pub(crate) struct Graphs<'a> { bank: GraphBank<Key, GraphOwner<'a, ()>>, replays: u64 }
 
 impl<'a> Graphs<'a> {
     pub(crate) fn capture(stream: &Stream<'a>, keys: &[Key],
@@ -108,8 +116,10 @@ impl<'a> Graphs<'a> {
                 (Ok(()), Err(error)) => Err(error),
             }
         }))?;
-        Ok(Self { bank })
+        Ok(Self { bank, replays: 0 })
     }
+
+    pub(crate) fn replays(&self) -> u64 { self.replays }
 
     pub(crate) fn launch(&mut self, key: Key, stream: &Stream<'a>) -> Result<bool> {
         let (decision, owner) = self.bank.enqueue(&key);
@@ -121,6 +131,7 @@ impl<'a> Graphs<'a> {
                     // SAFETY: binding owns immutable capture pointers and this exact stream.
                     unsafe { stream.device.library.cuda_graph_launch(owner.raw, stream.raw) }
                 })?;
+                self.replays += 1;
                 Ok(true)
             }
             GraphDecision::Eager => Ok(false),
@@ -142,7 +153,7 @@ mod tests {
     fn owned_keys_match_shared_admission_and_reject_wrong_residency() -> Result<()> {
         let cfg = KimiK3Config::from_hf(&cuteafd_loader::plan::testing::kimi_k3_config())?;
         let mut inputs = super::super::admission::tests::inputs(&cfg);
-        let provisional = owned_inventory(&cfg, inputs.lanes, inputs.rows, inputs.state_slots)?;
+        let provisional = owned_inventory(&cfg, inputs.lanes, inputs.rows, inputs.state_slots, inputs.verify_rows)?;
         inputs.startup.extend((0..2).map(|rank| demand(&provisional.inventory, rank)));
         let admitted = super::super::admission::admit(inputs)?;
         let inventory = admitted.graph_set.as_ref().expect("winning owner graph inventory");
@@ -162,7 +173,7 @@ mod tests {
     #[test]
     fn startup_inventory_is_exact_and_partition_sensitive() -> Result<()> {
         let cfg = KimiK3Config::from_hf(&cuteafd_loader::plan::testing::kimi_k3_config())?;
-        let admitted = inventory(&cfg, 2, 4096, 16, |rank, layer|
+        let admitted = inventory(&cfg, 2, 4096, 16, 0, |rank, layer|
             cfg.attention[layer] == KimiAttention::Kda || rank == (layer % 2))?;
         let unique = admitted.keys.iter().collect::<std::collections::HashSet<_>>();
         assert_eq!(unique.len(), admitted.keys.len());
@@ -177,14 +188,29 @@ mod tests {
         }
         let layer = cfg.attention.iter().position(|kind| *kind == KimiAttention::Kda).unwrap();
         for sequences in [1, 16] {
-            assert!(unique.contains(&Key { lane: 1, rank: 1, rows: 16, op: Op::Attention { layer, sequences } }));
+            assert!(unique.contains(&Key { lane: 1, rank: 1, rows: 16, op: Op::Attention { layer, sequences, speculative: false } }));
         }
-        let small = inventory(&cfg, 1, 4096, 4, |_, _| true)?;
+        let small = inventory(&cfg, 1, 4096, 4, 0, |_, _| true)?;
         assert!(!small.keys.iter().any(|key| matches!(key.op,
             Op::Attention { sequences, .. } if sequences > 4)));
         for (lanes, rows, slots) in [(0, 1, 1), (1, 0, 1), (1, 4097, 1), (1, 1, 0), (1, 1, 65)] {
-            assert!(inventory(&cfg, lanes, rows, slots, |_, _| true).is_err());
+            assert!(inventory(&cfg, lanes, rows, slots, 0, |_, _| true).is_err());
         }
+        // Verify widths add exact rows and speculative single-sequence attention only.
+        let verify = inventory(&cfg, 1, 4096, 4, 8, |_, _| true)?;
+        let unique = verify.keys.iter().collect::<std::collections::HashSet<_>>();
+        assert_eq!(unique.len(), verify.keys.len());
+        for rows in 2..=8 {
+            assert!(unique.contains(&Key { lane: 0, rank: 0, rows, op: Op::Ffn(0) }));
+            assert!(unique.contains(&Key { lane: 0, rank: 1, rows, op: Op::Attention { layer, sequences: 1, speculative: true } }));
+        }
+        assert!(!verify.keys.iter().any(|key| matches!(key.op, Op::Attention { speculative: true, sequences, .. } if sequences > 1)));
+        assert!(!verify.keys.iter().any(|key| key.rows > 8 && matches!(key.op, Op::Attention { speculative: true, .. })));
+        for rank in 0..2 {
+            assert_eq!(verify.inventory.ranks[rank].executables,
+                verify.keys.iter().filter(|key| key.rank == rank).count() as u64);
+        }
+        assert!(verify.keys.len() > small.keys.len());
         check_captures(19, 19)?;
         assert!(check_captures(19, 20).is_err());
         Ok(())
