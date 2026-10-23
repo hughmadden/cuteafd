@@ -40,6 +40,39 @@ impl PrefillShape {
     }
 }
 
+/// Select the largest admitting unit without changing the number of waves.
+/// Only fully automatic context/pool choices enforce the agentic pool floor;
+/// explicit requests retain the family's strict admission behavior.
+pub fn select_prefill_shape<T>(
+    shape: PrefillShape,
+    automatic_pool: bool,
+    mut admit: impl FnMut(PrefillShape) -> anyhow::Result<T>,
+    pool_tokens: impl Fn(&T) -> u64,
+    is_fit_error: impl Fn(&anyhow::Error) -> bool,
+) -> anyhow::Result<(PrefillShape, T)> {
+    use anyhow::Context;
+    use crate::placement::pool::AGENTIC_FLOOR_TOKENS;
+    let mut failure = None;
+    for candidate in shape.validate()?.ladder() {
+        let error = match admit(candidate) {
+            Ok(result) => {
+                let pool = pool_tokens(&result);
+                if !automatic_pool || pool >= AGENTIC_FLOOR_TOKENS {
+                    return Ok((candidate, result));
+                }
+                anyhow::anyhow!("prefill {} rows x {} waves admits an automatic pool of {pool} tokens, below the {AGENTIC_FLOOR_TOKENS}-token agentic floor",
+                    candidate.unit_rows, candidate.waves)
+            }
+            Err(error) if is_fit_error(&error) => error,
+            Err(error) => return Err(error),
+        };
+        tracing::info!(unit_rows = candidate.unit_rows, waves = candidate.waves, %error,
+            "prefill shape did not admit; trying the next shared ladder unit");
+        failure = Some(error);
+    }
+    Err(failure.context("prefill admission ladder is empty")?)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -55,6 +88,42 @@ mod tests {
     fn two_2048_row_return_slots_cost_one_4096_row_intake() {
         assert_eq!(prefill_return_bytes(2, 2048, 6, 3584), spark_intake_bytes(1, 6, 4096, 3584));
         assert_eq!(PrefillShape::DEFAULT.slot_rows(), 4096);
+    }
+
+    #[test]
+    fn automatic_pool_steps_down_but_explicit_pool_keeps_the_largest_unit() {
+        use crate::placement::pool::AGENTIC_FLOOR_TOKENS;
+        for automatic_pool in [true, false] {
+            let mut tried = Vec::new();
+            let (selected, pool) = select_prefill_shape(PrefillShape { unit_rows: 4096, waves: 2 },
+                automatic_pool, |shape| {
+                    tried.push(shape);
+                    Ok(if shape.unit_rows == 4096 { 200_000 } else { AGENTIC_FLOOR_TOKENS })
+                }, |&pool| pool, |_| false).unwrap();
+            let expected = if automatic_pool { 2048 } else { 4096 };
+            assert_eq!(selected, PrefillShape { unit_rows: expected, waves: 2 });
+            assert_eq!(pool, if automatic_pool { AGENTIC_FLOOR_TOKENS } else { 200_000 });
+            assert_eq!(tried.len(), if automatic_pool { 2 } else { 1 });
+        }
+    }
+
+    #[test]
+    fn automatic_floor_exhaustion_and_non_fit_errors_fail_closed() {
+        let mut tried = Vec::new();
+        let error = select_prefill_shape(PrefillShape { unit_rows: 4096, waves: 3 }, true,
+            |shape| { tried.push(shape); Ok(200_000) }, |&pool| pool, |_| false).unwrap_err();
+        assert!(error.to_string().contains("262144-token agentic floor"));
+        assert_eq!(tried.iter().map(|shape| shape.unit_rows).collect::<Vec<_>>(), [4096, 2048, 1024, 512]);
+        assert!(tried.iter().all(|shape| shape.waves == 3));
+        for automatic_pool in [true, false] {
+            let mut calls = 0;
+            let error = select_prefill_shape(PrefillShape::DEFAULT, automatic_pool, |_| {
+                calls += 1;
+                Err::<u64, _>(anyhow::anyhow!("explicit pool does not fit"))
+            }, |&pool| pool, |_| false).unwrap_err();
+            assert_eq!(calls, 1);
+            assert_eq!(error.to_string(), "explicit pool does not fit");
+        }
     }
 
     #[test]
