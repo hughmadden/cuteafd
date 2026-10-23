@@ -131,14 +131,17 @@ fn native_layout(cfg: &crate::families::qwen3_5::Qwen35Config, input: &crate::pl
         .context("dense native admission requires its PROGRAMS.json manifest")?)?;
     let set = ProgramSet::from_manifest(&manifest, &[prefix]);
     let entries = manifest["programs"].as_array().context("native manifest lacks programs")?;
+    let fp8 = input.checkpoint().tensors.iter().any(|t|
+        t.meta.name == "model.language_model.layers.0.mlp.gate_proj.weight" && t.meta.dtype == cuteafd_core::DType::F8E4M3);
     let mut scratch = 0;
     let mut norm = None;
     for (op, rows) in [("norm", 0), ("add", 0), ("gdn_commit", 0)].into_iter().chain(
         [64, 4096].into_iter().flat_map(|rows| ["gdn", "attn_producer", "full_gqa", "attn_o", "ffn"].map(|op| (op, rows)))) {
-        let name = placement::families::qwen3_5::program_name(prefix, op, rows, options.dense_qwen_kv);
+        let name = placement::families::qwen3_5::native_program_name(prefix, op, rows, options.dense_qwen_kv, fp8);
         let entry = entries.iter().find(|entry| entry["name"] == name)
             .with_context(|| format!("missing native dense program {name}"))?;
         let spec = placement::families::qwen3_5::NativeProgram::from_manifest(entry)?;
+        placement::families::qwen3_5::validate_projection_format(op, fp8, &spec)?;
         placement::families::qwen3_5::validate(cfg, op, rows, options.dense_qwen_kv, &spec)?;
         placement::families::qwen3_5::validate_abi(op, rows, &spec)?;
         scratch = scratch.max(spec.scratch.values().copied().max().unwrap_or(0));
@@ -155,7 +158,7 @@ fn native_layout(cfg: &crate::families::qwen3_5::Qwen35Config, input: &crate::pl
     let marks = options.prefix_slots.unwrap_or_else(|| cuteafd_core::prefix::mark_slots_with_host(slots as u64,
         options.mimo_prefix_entries, mark as u64, options.mimo_prefix_mark_bytes, options.host_cache_bytes != Some(0)));
     let buffers = NativeBuffers::new(cfg, scratch as usize, slots, usize::try_from(marks)?, options.full_prefill_logits)?;
-    let weights = NativeWeights::bf16(input.checkpoint(), cfg, norm.context("missing GDN precision")?)?;
+    let weights = NativeWeights::native(input.checkpoint(), cfg, norm.context("missing GDN precision")?)?;
     let (layers, fixed) = weights.demands(cfg, &buffers, slots);
     let capacity = options.rtx_bytes[0];
     let context = ArchContext::coordinator(capacity, None).context_bytes + set.module_bytes();
