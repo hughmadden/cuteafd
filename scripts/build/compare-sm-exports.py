@@ -24,7 +24,7 @@ import time
 
 ROOT = Path(os.environ.get("CUTEAFD_SOURCE_ROOT", Path(__file__).resolve().parents[2])).resolve()
 GEOMETRIES = ("flash", "pro", "flash2", "pro2", "glm", "glm2", "glmf", "glmf2",
-              "mimo", "mimo2", "mimop", "mimop2", "mimof", "mimof2", "qwen4", "qwen35", "qwen38", "step5", "step52")
+              "mimo", "mimo2", "mimop", "mimop2", "mimof", "mimof2", "qwen4", "qwen35", "qwen38", "step5", "step52", "minimax")
 CAPACITIES = "1,16,80,256,1024,4096"
 ROUTED_GEOMETRIES = ("mimo", "mimop", "mimof", "glm", "glmf", "qwen4",
                      "glm_nvfp4", "glmf_nvfp4", "qwen4_nvfp4", "glmfdense_nvfp4",
@@ -95,6 +95,10 @@ def jobs(scope):
                    ["--geometry", "kimik3", "--only", "router_scores,expert_input_quant"]))
     if scope == "suspects":
         return result
+    result.extend((f"minimax-{group}", "export_b12x_minimax_aot.py", ["--group", group])
+                  for group in ("pointwise", "projections", "indexer", "attention"))
+    result.append(("routed-minimax", "package_fp8_moe_aot.py",
+                   ["--geometry", "minimax_nvfp4", "--capacities", "1,16,256", "--layouts", "tp1,tp2,tp4,tp6"]))
     result.append(("kimi-split", "export_b12x_kimi_split_aot.py", []))
     result.extend((geometry, "export_b12x_dsv4_aot.py", ["--geometry", geometry])
                   for geometry in GEOMETRIES)

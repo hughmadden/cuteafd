@@ -10,7 +10,7 @@
 # (the Spark expert build) its routed serving programs alone.
 set(CUTEAFD_FAMILY_PROGRAMS OFF)
 if(CUTEAFD_ENABLE_DSV4_AOT OR CUTEAFD_ENABLE_GLM_AOT OR CUTEAFD_ENABLE_MIMO_AOT OR CUTEAFD_ENABLE_GLMF_AOT OR
-   CUTEAFD_ENABLE_QWEN4_AOT OR CUTEAFD_ENABLE_QWEN_DENSE_AOT OR CUTEAFD_ENABLE_STEP5_AOT OR CUTEAFD_ENABLE_KIMIK3_AOT)
+   CUTEAFD_ENABLE_QWEN4_AOT OR CUTEAFD_ENABLE_QWEN_DENSE_AOT OR CUTEAFD_ENABLE_STEP5_AOT OR CUTEAFD_ENABLE_KIMIK3_AOT OR CUTEAFD_ENABLE_MINIMAX_AOT)
   set(CUTEAFD_FAMILY_PROGRAMS ON)
 endif()
 if(CUTEAFD_CUDA_ARCHITECTURES MATCHES "^120")
@@ -80,6 +80,13 @@ if(CUTEAFD_ENABLE_KIMIK3_AOT)
     set(CUTEAFD_PROGRAM_GEOMETRY "${CUTEAFD_PROGRAM_GEOMETRY},kimik3,kimi_k6_dense,kimi_split")
   endif()
 endif()
+if(CUTEAFD_ENABLE_MINIMAX_AOT)
+  if(CUTEAFD_PROGRAM_GEOMETRY STREQUAL "")
+    set(CUTEAFD_PROGRAM_GEOMETRY "minimax")
+  else()
+    set(CUTEAFD_PROGRAM_GEOMETRY "${CUTEAFD_PROGRAM_GEOMETRY},minimax")
+  endif()
+endif()
 if(CUTEAFD_ENABLE_EXLR8_AOT)
   # Last: every family program keeps its object and table index.
   if(CUTEAFD_PROGRAM_GEOMETRY STREQUAL "")
@@ -117,6 +124,7 @@ add_custom_command(
   COMMAND sh -c "${CMAKE_AR} qcs '${CUTEAFD_DSV4_ARCHIVE}' '${CUTEAFD_DSV4_DIR}'/*.o"
   DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/aot/export_b12x_dsv4_aot.py" "${stamp}"
     "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/aot/export_b12x_step5_aot.py"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/aot/export_b12x_minimax_aot.py"
     "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/aot/export_b12x_exlr8_aot.py"
     "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/aot/export_b12x_kimi_k6_dense_aot.py"
     "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/aot/export_b12x_kimi_split_aot.py"
