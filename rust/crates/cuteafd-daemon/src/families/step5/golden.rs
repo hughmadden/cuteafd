@@ -818,7 +818,7 @@ fn split_run(args: &GoldenArgs, checkpoint: &Checkpoint, cfg: &Config,
     let mut reservations = [0u64; 2];
     for rank in 0..2 {
         available[rank] = devices[rank].run(|| library.cuda_memory_info()).map(|(free, _)| free as u64)?;
-        let admission = Execution::serving_admission(&programs, checkpoint, &ownership, rank, rows)?;
+        let admission = Execution::serving_admission(&programs, checkpoint, &ownership, rank, rows, rows)?;
         chain_bytes[rank] = admission.check( u64::MAX, &[])?;
         cache_bytes[rank] = Some(layout.ranks[rank].bytes)
             .and_then(|active| layout.geometry.ranks[rank].persistent_unit_bytes.checked_mul(pages)

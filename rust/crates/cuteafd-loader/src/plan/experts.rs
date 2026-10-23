@@ -15,11 +15,11 @@
 //!   6 when the intermediate has at least six 128-row blocks; Qwen also has TP1.
 //! - DeepSeek native experts (expertd-native MXFP4 / EXL3): 2, 3, 4 and 6.
 //!
-//! The expert transport (RoCE verbs, TCP) runs one through six Spark ranks.
+//! The expert transport (RoCE verbs, TCP) runs one through eight Spark ranks.
 //! Package coverage below is independent of transport capacity.
 
 /// Spark worlds the expert transport runs.
-pub const TRANSPORT_WORLDS: [usize; 6] = [1, 2, 3, 4, 5, 6];
+pub const TRANSPORT_WORLDS: [usize; 8] = [1, 2, 3, 4, 5, 6, 7, 8];
 
 /// Default Spark layouts of an FP8 (E4M3, 128x128 scales) expert package.
 pub fn fp8_spark_worlds(intermediate: usize) -> Vec<usize> {
@@ -134,9 +134,9 @@ impl SparkRecipe {
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum SparkRecipeRefusal {
-    #[error("geometry-invalid: intermediate {intermediate} cannot give {world} ranks nonempty whole-{block} row slices")]
+    #[error("geometry-invalid: intermediate {intermediate} cannot give {world} ranks nonempty whole-{block} row slices; native MXFP4 requires equal whole-K32 shards: add per-rank adjacent-width staging and matching native Spark role exports before admitting unequal widths")]
     GeometryInvalid { intermediate: usize, world: usize, block: usize },
-    #[error("missing Spark package recipe: {package} TP{world}")]
+    #[error("missing Spark package recipe: {package} TP{world}; export its balanced per-rank widths in package_exl3_aot.py (EXL3) or package_fp8_moe_aot.py (FP8/NVFP4), register spark_recipe, and include those layouts in the Spark image")]
     MissingPackage { package: String, world: usize },
     #[error("unknown Spark package recipe: {0}")]
     UnknownPackage(String),
@@ -205,7 +205,7 @@ pub fn checkpoint_spark_recipe(checkpoint: &super::Checkpoint, world: usize, lay
 
 /// Registered recipes only: optional installation checks cannot widen this set.
 /// Step-5 TP6 geometry is registered for qualification; its hardware gate is pending.
-/// TP5 support is added per format only after its hardware gate passes.
+/// Package availability is separate from the CPU-qualified transport range.
 pub fn spark_recipe(package: &str, intermediate: usize, world: usize) -> Result<SparkRecipe, SparkRecipeRefusal> {
     use crate::formats::fp8_experts::Slicing;
     let key = package.split_whitespace().next().unwrap_or(package);
@@ -226,8 +226,13 @@ pub fn spark_recipe(package: &str, intermediate: usize, world: usize) -> Result<
         return Err(SparkRecipeRefusal::MissingPackage { package: key.into(), world });
     }
     let block = if nvfp4 { 16 } else if mxfp4 { 32 } else { 128 };
-    if !(1..=6).contains(&world) || intermediate == 0 || intermediate % block != 0 || intermediate / block < world {
+    if !(1..=8).contains(&world) || intermediate == 0 || intermediate % block != 0 || intermediate / block < world {
         return Err(SparkRecipeRefusal::GeometryInvalid { intermediate, world, block });
+    }
+    // Native family roles and staging require equal whole-K32 shards. Generic
+    // MXFP4 tail exports do not make those native roles executable by themselves.
+    if native && mxfp4 && (intermediate % world != 0 || intermediate / world % 32 != 0) {
+        return Err(SparkRecipeRefusal::GeometryInvalid { intermediate, world, block: 32 });
     }
     let packaged = if family == "step5" { matches!(world, 4 | 6) }
         else if native { matches!(world, 2 | 3 | 4 | 6) }
@@ -237,11 +242,6 @@ pub fn spark_recipe(package: &str, intermediate: usize, world: usize) -> Result<
         else { matches!(world, 2 | 4 | 6) && (intermediate % (128 * world) == 0 || world == 6) };
     if !packaged {
         return Err(SparkRecipeRefusal::MissingPackage { package: key.into(), world });
-    }
-    // Native family roles and staging require equal whole-K32 shards. Generic
-    // MXFP4 tail exports do not make those native roles executable by themselves.
-    if native && mxfp4 && (intermediate % world != 0 || intermediate / world % 32 != 0) {
-        return Err(SparkRecipeRefusal::GeometryInvalid { intermediate, world, block: 32 });
     }
     let compact = exl3 && intermediate / block % world != 0;
     // EXL3 gathers whole trellis units per expert. Fixed-width kernels instead
@@ -433,7 +433,12 @@ mod tests {
         assert_eq!(spark_worlds("v41:nvfp4", 2304), [2, 3, 4, 6]);
         for package in ["qwen4:nvfp4", "qwen4:exl3-k45", "qwen4:fp8"] {
             for world in [7, 8] {
-                assert!(matches!(spark_recipe(package, 640, world), Err(SparkRecipeRefusal::GeometryInvalid { .. })));
+                let refusal = spark_recipe(package, 640, world).unwrap_err();
+                if package == "qwen4:nvfp4" {
+                    assert!(matches!(refusal, SparkRecipeRefusal::MissingPackage { .. }));
+                } else {
+                    assert!(matches!(refusal, SparkRecipeRefusal::GeometryInvalid { .. }));
+                }
             }
             assert!(matches!(spark_recipe(package, 640, 5), Err(SparkRecipeRefusal::MissingPackage { .. })));
         }

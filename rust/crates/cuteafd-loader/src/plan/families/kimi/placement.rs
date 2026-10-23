@@ -56,9 +56,9 @@ pub(super) fn layout(model: &Model, report: &mut PlanReport, opts: &crate::plan:
     let replicated_rotations = cfg.experts as u64 * 3 * cfg.latent as u64 * 2;
     let rank_layer = |world: u64| (layer_bytes - replicated_rotations).div_ceil(world) + replicated_rotations;
     if ranks != 6 {
-        refusal(report, format!("Kimi K3 needs the max card's 6 Spark ranks (requested {ranks}): TP{ranks} routed experts \
+        refusal(report, format!("Kimi K3 missing Spark recipe kimik3:exl3-k23 TP{ranks}: estimated routed experts \
             need {:.1} GiB/rank", (rank_layer(ranks.max(1) as u64) * routed_layers) as f64 / GIB as f64),
-            "Serve Kimi K3 on 2 RTX PRO 6000 + 6 Sparks (TP6 width 512); no other card column is targeted.");
+            "Export balanced H128 widths in package_exl3_aot.py, register spark_recipe, and parameterize Kimi Spark intake/admission by rank count; TP6 width 512 is currently installed.");
         return memory;
     }
     if gpus != 2 || !opts.head_split {

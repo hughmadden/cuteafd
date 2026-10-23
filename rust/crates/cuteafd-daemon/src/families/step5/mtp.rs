@@ -205,7 +205,9 @@ impl<'a> StageOwner<'a> {
         rope: Rc<super::rope::TargetTables<'a>>, available: u64, reservations: &[u64],
         arena: &Arena<'a>, stream: Rc<Stream<'a>>, kv_format: Qwen4KvCache) -> Result<Self> {
         let input = InputPlan::prepare(programs, checkpoint, stage, rows)?;
-        let head = super::head::HeadPlan::for_mtp_stage(programs, checkpoint, stage, rows)?;
+        // A stage proposes at most depth + 1 rows: its head holds the verify width only.
+        let head = super::head::HeadPlan::for_mtp_stage(programs, checkpoint, stage,
+            native::head_rows(rows, false))?;
         let immutable = RankWeightLayout::for_mtp_stage(checkpoint, stage)?.resident_bytes;
         let total = reservations.iter().try_fold(immutable, |n, bytes| n.checked_add(*bytes))
             .context("Step-5 predictor owner admission overflow")?;
@@ -962,8 +964,8 @@ mod tests {
             let metadata = native::mtp_metadata_planes(rows)?;
             assert!(metadata.iter().all(|n| *n >= 256));
             let input = native::plane_bytes(&planes(rows)?)?;
-            let layer = native::layer_workspace(rows, false, 64, false)?;
-            let head = native::plane_bytes(&native::head_planes(rows)?)?;
+            let layer = native::layer_workspace(rows, false, 64)?;
+            let head = native::plane_bytes(&native::head_planes(native::head_rows(rows, false))?)?;
             let core = native::mtp_scratch_core(rows, kv_format)?;
             assert_eq!(native::mtp_input_offset(rows)?, layer);
             assert_eq!(native::mtp_metadata_offset(rows)?, layer + input);

@@ -77,8 +77,8 @@ pub struct SparkWorld {
 impl SparkWorld {
     pub fn new(topology: SparkTopology, wire: SparkWire) -> Result<Self> {
         ensure!(
-            topology.world_size() <= 6,
-            "Spark worlds above six ranks have no qualified package"
+            topology.world_size() <= cuteafd_core::MAX_SPARK_WORLD,
+            "Spark world exceeds physical rank ceiling"
         );
         ensure!(
             wire != SparkWire::NativeOwnership
@@ -471,17 +471,17 @@ impl<'a> BackboneRequest<'a> {
 
 // Fixed-size rank identities keep per-wave validation allocation-free.
 struct V41Executors {
-    ids: [u64; 8],
+    ids: [u64; cuteafd_core::MAX_SPARK_WORLD],
     len: usize,
 }
 impl V41Executors {
     fn new(executors: &[u64]) -> Result<Self> {
         ensure!(
-            (1..=6).contains(&executors.len()),
-            "native TP/EP requires 1..=6 executors, got {}",
+            (1..=cuteafd_core::MAX_SPARK_WORLD).contains(&executors.len()),
+            "native TP/EP requires 1..=8 executors, got {}",
             executors.len()
         );
-        let mut ids = [0; 8];
+        let mut ids = [0; cuteafd_core::MAX_SPARK_WORLD];
         ids[..executors.len()].copy_from_slice(executors);
         Ok(Self {
             ids,
@@ -497,7 +497,7 @@ impl V41Executors {
 }
 
 /// Collects complete native rank planes in rank order, independently of arrival
-/// order, for every validated world size (1..=6). Payloads are borrowed;
+/// order, for every validated world size (1..=8). Payloads are borrowed;
 /// keep their frame storage alive until GPU copies finish. Request IDs must
 /// uniquely identify in-flight waves within a placement version.
 pub struct V41Tp4Planes<'a> {
@@ -509,13 +509,13 @@ pub struct V41Tp4Planes<'a> {
     partial_flag: u32,
     output_dtype: ExpertV2Dtype,
     output_row_bytes: u32,
-    planes: [Option<&'a [u8]>; 8],
+    planes: [Option<&'a [u8]>; cuteafd_core::MAX_SPARK_WORLD],
 }
 impl<'a> V41Tp4Planes<'a> {
     pub fn new(request: &BackboneRequest<'_>, executors: [u64; 4]) -> Result<Self> {
         Self::from_header(&request.view.header, executors)
     }
-    /// Generic constructor for the validated physical rank counts 1..=6.
+    /// Generic constructor for the validated physical rank counts 1..=8.
     pub fn new_ranks(request: &BackboneRequest<'_>, executors: &[u64]) -> Result<Self> {
         if let Some(topology) = request.native_topology() {
             ensure!(
@@ -533,8 +533,8 @@ impl<'a> V41Tp4Planes<'a> {
         executors: &[u64],
     ) -> Result<Self> {
         ensure!(
-            (1..=6).contains(&executors.len()),
-            "native TP/EP requires 1..=6 executors"
+            (1..=cuteafd_core::MAX_SPARK_WORLD).contains(&executors.len()),
+            "native TP/EP requires 1..=8 executors"
         );
         for (rank, id) in executors.iter().enumerate() {
             ensure!(
@@ -552,7 +552,7 @@ impl<'a> V41Tp4Planes<'a> {
             output_dtype: ExpertV2Dtype::Bf16,
             output_row_bytes: cuteafd_core::expert_geometry().hidden.checked_mul(2)
                 .context("native output row bytes overflow")?,
-            planes: [None; 8],
+            planes: [None; cuteafd_core::MAX_SPARK_WORLD],
         })
     }
     /// Rejections leave the collection unchanged.
@@ -708,12 +708,12 @@ mod tests {
 
     #[test]
     fn declared_worlds_reject_unqualified_topologies() -> Result<()> {
-        for ranks in 1..=6 {
+        for ranks in 1..=cuteafd_core::MAX_SPARK_WORLD {
             let world = SparkWorld::canonical(ranks)?;
             assert_eq!(world.topology().world_size(), ranks);
             assert_eq!(world.wire(), SparkWire::Canonical);
         }
-        for ranks in [0, 7, 8, 9, usize::MAX] {
+        for ranks in [0, 9, usize::MAX] {
             assert!(SparkWorld::canonical(ranks).is_err(), "TP{ranks}");
         }
         for (tp, ep) in [(1, 1), (5, 1)] {
@@ -740,7 +740,7 @@ mod tests {
         assert_eq!(world.topology(), SparkTopology::NATIVE_TP6_EP1);
         assert_eq!(world.topology().executor_ids(), [27, 28, 29, 30, 31, 32]);
         assert_eq!(world.ownership_topology(), None);
-        for ranks in 1..=6 {
+        for ranks in 1..=cuteafd_core::MAX_SPARK_WORLD {
             assert_eq!(SparkWorld::canonical(ranks)?.supports_device_exchange(), matches!(ranks, 4 | 6));
         }
         for (tp, ep) in [(2, 1), (3, 1), (4, 1), (6, 1), (2, 2), (3, 2), (2, 3)] {

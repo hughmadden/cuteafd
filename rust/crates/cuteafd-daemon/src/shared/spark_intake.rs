@@ -380,7 +380,7 @@ impl<'a> SparkIntake<'a> {
     pub(crate) fn with_waves(library: &'a NativeLibrary, mode: IntakeMode, ranks: usize, rows: usize,
         row_bytes: usize, waves: usize) -> Result<Self> {
         let _memory_scope = cuteafd_ffi::memory_ledger::scope("spark-intake");
-        ensure!((1..=6).contains(&ranks), "{ranks} Spark ranks are outside the qualified one-through-six worlds");
+        ensure!((1..=8).contains(&ranks), "{ranks} Spark ranks are outside the one-through-eight transport worlds");
         ensure!((1..=4).contains(&waves), "Spark intake admits 1..=4 return slots");
         ensure!(waves == 1 || mode != IntakeMode::Gpu, "GPU landing has one landing range per rank");
         let plane_bytes = rows * row_bytes;

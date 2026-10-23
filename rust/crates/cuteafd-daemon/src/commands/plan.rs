@@ -139,6 +139,7 @@ fn validate_glmf_precision(args: &PlanArgs, family: &str) -> Result<(), PlanErro
 }
 
 pub(crate) fn run_plan(mut args: PlanArgs) -> Result<()> {
+    if args.spark_range { args.layout = true; }
     if args.deployment {
         args.layout = true;
         if let Some(value) = &args.kv_pool_size {
@@ -150,7 +151,7 @@ pub(crate) fn run_plan(mut args: PlanArgs) -> Result<()> {
     }
     if args.config.is_some() {
         let cfg = launch_config(args.config.as_deref())?;
-        args.available_sparks = (0..6).take_while(|rank|
+        args.available_sparks = (0..8).take_while(|rank|
             cfg.get(&format!("SPARK_{rank}_HOST")).is_some_and(|host| !host.is_empty())).count();
         if args.spark_ranks.is_none() {
             let count = cfg.get("SPARK_COUNT").filter(|v| !v.is_empty())
@@ -192,6 +193,10 @@ pub(crate) fn run_plan(mut args: PlanArgs) -> Result<()> {
             .with_context(|| format!("no snapshot of {} under {}", args.model, hf_home.display()))?
     };
     if cuteafd_loader::plan::exlr8::recognizes(&snapshot)? {
+        if args.spark_range {
+            return Err(PlanError::InvalidOption { option: "--spark-range", reason:
+                "EXLR8 range geometry requires its native manifest and dense companion planner".into() }.into());
+        }
         anyhow::ensure!(!(args.files || args.fetch || args.role.is_some()),
             "EXLR8 file manifests and fetching are not supported");
         let dense = args.exlr8_dense_from.as_deref().map(|source| -> Result<PathBuf> {
@@ -336,6 +341,12 @@ pub(crate) fn run_plan(mut args: PlanArgs) -> Result<()> {
         return Ok(());
     }
     options.vision = glm_flash_vision(&args, family, &snapshot);
+    if args.spark_range {
+        let columns = cuteafd_loader::plan::PlanInput::open(&snapshot)?.spark_ranges(&options)?;
+        if args.json { println!("{}", serde_json::to_string_pretty(&columns)?); }
+        else { print!("{}", cuteafd_loader::plan::spark_range::render(&columns)); }
+        return Ok(());
+    }
     let report = plan_spark_count(&snapshot, &options, args.available_sparks, args.spark_ranks)?;
     if args.json || args.deployment {
         if let Some(warning) = &report.spark_count_warning { eprintln!("warning: {warning}"); }
@@ -393,7 +404,7 @@ fn launch_config(path: Option<&std::path::Path>) -> Result<std::collections::BTr
 
 fn spark_hosts_count(cfg: &std::collections::BTreeMap<String, String>) -> Result<Option<usize>> {
     let Some(hosts) = cfg.get("SPARK_HOSTS").filter(|value| !value.is_empty()) else { return Ok(None) };
-    let configured: std::collections::BTreeSet<&str> = (0..6)
+    let configured: std::collections::BTreeSet<&str> = (0..8)
         .filter_map(|rank| cfg.get(&format!("SPARK_{rank}_HOST")).map(String::as_str)).collect();
     let pool = ["ostrich", "dodo", "emu", "kiwi", "rhea", "moa"];
     let mut seen = std::collections::BTreeSet::new();
@@ -791,6 +802,7 @@ mod tests {
             hf_home: None,
             spark_ranks: Some(spark_ranks),
             available_sparks: 6,
+            spark_range: false,
             spark_budget_gib: Some(100.0),
             coordinator_weight_budget_gib: 80.0,
             json: true,
@@ -1177,6 +1189,17 @@ mod tests {
     }
 
     #[test]
+    fn spark_range_cli_is_header_only_and_excludes_other_output_modes() {
+        use clap::Parser;
+        let cli = crate::cli::Cli::try_parse_from(["cuteafd", "plan", "/not-read", "--spark-range", "--json"]).unwrap();
+        let crate::cli::Commands::Plan(args) = cli.command else { panic!("plan") };
+        assert!(args.spark_range && args.json);
+        for mode in ["--deployment", "--files", "--fetch"] {
+            assert!(crate::cli::Cli::try_parse_from(["cuteafd", "plan", "/not-read", "--spark-range", mode]).is_err());
+        }
+    }
+
+    #[test]
     fn replicas_require_an_explicit_layout_inventory() {
         let mut request = args(std::path::Path::new("/not-read"), 4, false);
         request.layout = false;
@@ -1233,6 +1256,9 @@ mod tests {
         let cfg = |hosts: &str| std::collections::BTreeMap::from([
             ("SPARK_HOSTS".into(), hosts.into()), ("SPARK_0_HOST".into(), "custom".into())]);
         assert_eq!(spark_hosts_count(&cfg("ostrich,custom")).unwrap(), Some(2));
+        let mut eight = cfg("worker0,worker1,worker2,worker3,worker4,worker5,worker6,worker7");
+        for rank in 0..8 { eight.insert(format!("SPARK_{rank}_HOST"), format!("worker{rank}")); }
+        assert_eq!(spark_hosts_count(&eight).unwrap(), Some(8));
         for hosts in ["ostrich,ostrich", "ostrich,", ",ostrich", "ostrich, emu", "unknown"] {
             assert!(spark_hosts_count(&cfg(hosts)).is_err(), "{hosts}");
         }

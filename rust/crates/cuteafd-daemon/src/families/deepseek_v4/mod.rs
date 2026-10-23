@@ -347,7 +347,7 @@ pub(crate) fn with_engine<T>(
     if skip {
         tracing::warn!("--skip-routed-experts: MoE layers run the shared expert alone (outputs do not match the model)");
     } else {
-        ensure!(matches!(peers.len(), 2 | 3 | 4 | 6), "DeepSeek V4 serves 2, 3, 4 or 6 Spark ranks, got {}", peers.len());
+        ensure!((1..=8).contains(&peers.len()), "DeepSeek V4 Spark transport requires 1..=8 peers, got {}", peers.len());
         loaded.library.v41_compact_reducer()?.require_rank_count(peers.len() as u32)?;
     }
     // Resolve once: the admitted endpoint set and the constructed links must agree.

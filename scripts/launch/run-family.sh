@@ -218,7 +218,7 @@ PROFILE_SPARK_NCU_SKIP
 PROFILE_SPARK_NSYS_GPU_METRICS
 EOF
     [[ "$1" != kimi_k3 ]] || printf '%s\n' KV_CACHE RTX_EXPERT_LAYERS SPECULATOR_MODEL_ID SPECULATOR_MODEL_REVISION SPECULATOR_DRAFTS PREFILL_ROWS PREFILL_WAVES
-    [[ "$1" != step5 ]] || printf '%s\n' SPECULATOR_DEPTH KV_CACHE
+    [[ "$1" != step5 ]] || printf '%s\n' SPECULATOR_DEPTH KV_CACHE PREFILL_BATCH_TOKENS FULL_PREFILL_LOGITS
     _spark_slot_keys HOST LANE_A
     return
   fi
@@ -479,7 +479,7 @@ EOF
 vision="$(get VISION auto)"
 audio="$(get AUDIO auto)"
 vision_replicas="$(get VISION_REPLICAS 1)"
-[[ "$vision_replicas" =~ ^[1-6]$ ]] || release_die "VISION_REPLICAS must be 1..6"
+[[ "$vision_replicas" =~ ^[1-8]$ ]] || release_die "VISION_REPLICAS must be 1..8"
 [[ "$vision" =~ ^(auto|off|rtx|spark)(:[0-9]+)?$ && ( "$vision" != auto:* && "$vision" != off:* ) ]] || release_die "VISION must be auto, off, rtx[:gpu] or spark[:rank]"
 [[ "$audio" =~ ^(auto|off|rtx|spark)(:[0-9]+)?$ && ( "$audio" != auto:* && "$audio" != off:* ) ]] || release_die "AUDIO must be auto, off, rtx[:gpu] or spark[:rank]"
 coordinator_budget="$(get COORDINATOR_GPU_BUDGET_GIB)"
@@ -1653,7 +1653,7 @@ if [[ "$family" == qwen3_5 ]]; then
 fi
 if [[ "$family" == kimi_k3 ]]; then
   [[ "$backend" != local && "$ranks" == 6 ]] ||
-    release_die "Kimi K3 serves its routed experts on exactly six Spark ranks (TP6), not $ranks; set SPARK_COUNT=6"
+    release_die "Kimi K3 TP$ranks has no installed kimik3:exl3-k23 Spark recipe or rank-sized intake/admission; export balanced H128 widths and parameterize the Kimi executor (currently TP6 width 512)"
 fi
 if [[ "$family" == step5 ]]; then
   step5_kv_cache="$(get KV_CACHE fp8)"
@@ -1730,7 +1730,7 @@ if [[ -n "$exlr8_manifest$exlr8_dense" ]]; then
   [[ "$exlr8_manifest" == up1 || "$exlr8_manifest" == bit325 ]] || release_die "EXLR8_MANIFEST must be up1 or bit325"
   [[ -n "$exlr8_dense" ]] || release_die "EXLR8_DENSE_FROM must name the compatible official GLM-5.3 FP8 snapshot"
   exlr8_gpu_count="$(get RTX_GPUS 1)"
-  [[ ( "$exlr8_gpu_count" == 1 || "$exlr8_gpu_count" == 2 ) && "$ranks" -ge 1 && "$ranks" -le 6 ]] || release_die "EXLR8 requires 1..2 RTX GPUs and 1..6 canonical Spark ranks"
+  [[ ( "$exlr8_gpu_count" == 1 || "$exlr8_gpu_count" == 2 ) && "$ranks" -ge 1 && "$ranks" -le 8 ]] || release_die "EXLR8 requires 1..2 RTX GPUs and 1..8 canonical Spark ranks"
   [[ "$(get SPECULATOR dflash2)" == off || "$(get SPECULATOR dflash2)" == dflash2 ]] || release_die "EXLR8 supports SPECULATOR=off or dflash2"
   [[ "$(get RTX_EXPERT_LAYERS 0)" == 0 ]] || release_die "EXLR8 cannot onboard routed experts"
   exlr8_attention=heads
@@ -2707,6 +2707,12 @@ audio_encoder_hash=""
   # admission policy and endpoints come from the typed deployment above.
   deployment_json="$plan_json"
   plan_json="$(jq -c '.report' <<<"$deployment_json")"
+  # Step-5 serves the planner's prefill unit (2048 rows by default, stepped down
+  # only to keep pool capacity; PREFILL_BATCH_TOKENS is the explicit override).
+  if [[ "$family" == step5 ]]; then
+    family_args+=(--prefill-rows "$(jq -er '.prefill_rows | select(type == "number" and . > 0)' <<<"$deployment_json")") ||
+      release_die "the Step-5 deployment plan names no prefill rows"
+  fi
   [[ -n "$budget" ]] || budget="$(jq -er '.spark_budget_bytes | select(type == "number" and . > 0)' <<<"$plan_json")" ||
     release_die "the deployment plan names no Spark budget"
 # Check the admitted count's images before --restart or weight loading. The worker's

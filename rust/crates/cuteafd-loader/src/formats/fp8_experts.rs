@@ -1692,7 +1692,7 @@ mod tests {
         ] {
             for intermediate in [640, 1536, 2048, 2304, 3072] {
                 let mut tensors = catalog(format, intermediate);
-                for world in 1..=6 {
+                for world in 1..=8 {
                     let Ok(recipe) = spark_recipe(package, intermediate, world) else { continue };
                     let root = tempfile::tempdir()?;
                     let directory = root.path().join(format!("tp{world}"));

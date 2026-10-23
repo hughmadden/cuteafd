@@ -78,8 +78,8 @@ impl SparkExperts {
         mut clients: LocalTp4Client,
         world: SparkWorld,
     ) -> Result<Self> {
-        ensure!(peers.len() == executors.len() && (1..=6).contains(&peers.len()),
-            "native TP/EP requires 1..=6 matching peers and executors");
+        ensure!(peers.len() == executors.len() && (1..=cuteafd_core::MAX_SPARK_WORLD).contains(&peers.len()),
+            "native TP/EP requires 1..=8 matching peers and executors");
         if let Some(topology) = world.ownership_topology() {
             ensure!(
                 peers.len() == topology.world_size(),
@@ -782,6 +782,31 @@ mod tests {
         host.landed = false;
         let mut fresh = V41Tp4ChunkReceiver::new(&native, [1, 2, 3, 4], 200_000)?;
         assert!(fresh.push_landed(&host).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn eight_rank_landed_receipt_uses_all_bits_without_overflow() -> Result<()> {
+        let request = super::super::tests::request(2);
+        let frame = request.encode()?;
+        let native = BackboneRequest::parse(&frame, 2)?;
+        let executors = super::SparkWorld::canonical(cuteafd_core::MAX_SPARK_WORLD)?.topology().executor_ids();
+        let mut receiver = V41Tp4ChunkReceiver::new_ranks(&native, &executors, 200_000)?;
+        let plane = vec![7u8; native.plane_bytes()?];
+        let mut receipt = WaveReceipt::default();
+        for rank in (0..executors.len()).rev() {
+            let encoded = native.response(executors[rank], &plane)?.to_owned()?.encode()?;
+            let header = crate::ExpertProtocolV2ResponseView::parse_landed_header(
+                &encoded[..crate::EXPERT_PROTOCOL_V2_RESPONSE_HEADER_LEN])?;
+            let chunk = VerbsHostProtocolV2ResponseChunk { stream_id: rank, header, row_indices: None,
+                partial_output_payload: VerbsHostProtocolV2ResponsePayload::from_owned(Vec::new()),
+                wire_bytes: encoded.len(), landed: true };
+            let selected = receiver.push_landed(&chunk)?;
+            assert_eq!(selected, rank);
+            receipt.landed |= 1 << selected;
+        }
+        assert!(receiver.complete());
+        assert_eq!(receipt.landed, u8::MAX);
         Ok(())
     }
 

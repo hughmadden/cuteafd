@@ -252,10 +252,10 @@ pub fn request(inputs: &GlmInputs<'_>) -> Result<PlacementRequest, PlacementErro
         || inputs.prefill_rows == 0 || inputs.prefill_rows > 4096 || inputs.max_context == 0 {
         return Err(PlacementError::Inventory("GLM rank/lane/step/context geometry"));
     }
-    if inputs.native_experts && (inputs.spark_ranks == 0 || inputs.spark_ranks > 6 || inputs.skip_routed_experts
+    if inputs.native_experts && (inputs.spark_ranks == 0 || inputs.spark_ranks > 8 || inputs.skip_routed_experts
         || !inputs.experts.is_empty() || inputs.scratch.is_none()
         || inputs.native_workspace == 0) {
-        return Err(PlacementError::Inventory("EXLR8 requires measured workspaces, real Spark experts and 1..=6 ranks"));
+        return Err(PlacementError::Inventory("EXLR8 requires measured workspaces, real Spark experts and 1..=8 ranks"));
     }
     let geometry = glm_cache_geometry(cfg, inputs.layers, gpus)
         .map_err(|_| PlacementError::Inventory("GLM cache geometry"))?;
@@ -665,7 +665,7 @@ pub fn spark_resident_bytes(catalog: &crate::OfficialV41Catalog, layers: &[usize
         return Ok(Vec::new());
     }
     let shape = catalog.routed_experts();
-    anyhow::ensure!(matches!(ranks, 2 | 3 | 4 | 6) && shape.hidden == 6144
+    anyhow::ensure!((1..=8).contains(&ranks) && shape.hidden == 6144
         && shape.intermediate == 2048 && shape.experts == 256 && shape.topk == 8
         && shape.layers > shape.first_layer && layers.last() == Some(&(shape.layers - 1))
         && layers.iter().all(|&layer| (shape.first_layer..shape.layers).contains(&layer))
@@ -952,11 +952,11 @@ mod tests {
         assert!(request(&invalid).is_err());
         let mut pair = native.clone(); pair.gpus.push(pair.gpus[0]);
         assert!(request(&pair).is_ok());
-        for ranks in 1..=6 {
+        for ranks in 1..=8 {
             let mut supported = pair.clone(); supported.spark_ranks = ranks;
             assert!(request(&supported).is_ok());
         }
-        let mut invalid = pair; invalid.spark_ranks = 7;
+        let mut invalid = pair; invalid.spark_ranks = 9;
         assert!(request(&invalid).is_err());
     }
 
@@ -1487,7 +1487,7 @@ mod tests {
         let catalog = extend_routed_fixture(&catalog, nvfp4_checkpoint_tensors());
         let scalars = 3 * 256 * 8;
         let bytes = |width| 3 * 256 * 6144 * width * (8 + 1) / 16 + scalars;
-        for ranks in [2, 3, 4, 6] {
+        for ranks in 1..=8 {
             for slicing in [Slicing::Blocks(16), Slicing::Blocks(128), Slicing::Padded] {
                 let whole_suffix = spark_resident_bytes(&catalog, &[1, 2, 3], ranks, slicing).unwrap();
                 let selected = spark_resident_bytes(&catalog, &[2, 3], ranks, slicing).unwrap();
@@ -1517,7 +1517,7 @@ mod tests {
         assert_eq!(exact.iter().sum::<u64>(), bytes(2048) + 5 * scalars);
         assert!(spark_resident_bytes(&catalog, &[], 0, Slicing::Padded).unwrap().is_empty());
         for (layers, ranks) in [(vec![], 4), (vec![1], 4), (vec![3, 2], 4),
-            (vec![1, 3], 4), (vec![2, 3], 0), (vec![2, 3], 5), (vec![4], 4)] {
+            (vec![1, 3], 4), (vec![2, 3], 0), (vec![2, 3], 9), (vec![4], 4)] {
             assert!(spark_resident_bytes(&catalog, &layers, ranks, Slicing::Padded).is_err());
         }
     }

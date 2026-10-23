@@ -73,8 +73,8 @@ impl V41BackboneTpGeometry {
         rank: usize,
     ) -> Result<Self> {
         ensure!(
-            matches!(world, 2 | 3 | 4 | 6),
-            "backbone TP world must be 2, 3, 4 or 6, got {world}"
+            (1..=8).contains(&world),
+            "backbone TP world must be 1 through 8, got {world}"
         );
         ensure!(
             rank < world,

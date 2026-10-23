@@ -124,8 +124,8 @@ fn native_activation(args: &EngineArgs, first_moe: usize, layers: usize, serving
     ensure!(matches!(args.exlr8_manifest.as_deref(), Some("up1" | "bit325")),
         "EXLR8 full execution currently admits up1 or bit325 only");
     ensure!(args.split_device.is_none_or(|device| device != args.device)
-        && (1..=6).contains(&peers.split(',').count()) && args.layers.is_none_or(|count| count == layers),
-        "EXLR8 full execution requires one or two distinct coordinators, 1..=6 Spark ranks and all backbone layers");
+        && (1..=8).contains(&peers.split(',').count()) && args.layers.is_none_or(|count| count == layers),
+        "EXLR8 full execution requires one or two distinct coordinators, 1..=8 Spark ranks and all backbone layers");
     let attention = cuteafd_loader::placement::attention::parse(&args.attention_placement)
         .map_err(anyhow::Error::msg)?;
     let expected = if args.split_device.is_some() { AttentionPlacement::Context } else { AttentionPlacement::Heads };
@@ -222,9 +222,11 @@ mod draft_cli_tests {
             assert!(native_activation(&one, 3, 78, true).is_ok());
             assert!(native_activation(&one, 3, 78, false).is_ok());
         }
-        let mut six = args.clone();
-        six.peers = Some("a:1,b:1,c:1,d:1,e:1,f:1".into());
-        assert!(native_activation(&six, 3, 78, true).is_ok());
+        for ranks in 1..=8 {
+            let mut candidate = args.clone();
+            candidate.peers = Some((0..ranks).map(|rank| format!("worker{rank}:1")).collect::<Vec<_>>().join(","));
+            assert!(native_activation(&candidate, 3, 78, true).is_ok(), "TP{ranks}");
+        }
         let mut drafting = args.clone();
         drafting.draft = Some("/draft".into());
         assert!(native_activation(&drafting, 3, 78, true).is_ok());
@@ -234,7 +236,7 @@ mod draft_cli_tests {
                 0 => candidate.exlr8_manifest = Some("home".into()),
                 1 => candidate.split_device = None,
                 2 => candidate.split_device = Some(0),
-                3 => candidate.peers = Some("a:1,b:1,c:1,d:1,e:1,f:1,g:1".into()),
+                3 => candidate.peers = Some("a:1,b:1,c:1,d:1,e:1,f:1,g:1,h:1,i:1".into()),
                 4 => candidate.layers = Some(4),
                 5 => candidate.attention_placement = "heads".into(),
                 6 => candidate.exlr8_manifest = None,

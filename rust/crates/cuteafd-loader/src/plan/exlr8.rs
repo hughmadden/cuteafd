@@ -78,8 +78,8 @@ pub fn native_plan(snapshot: &Path, selected: &str, dense: &Path,
     use super::{ExpertPlacement, Status, RuntimeStatus, spec::Component};
     ensure!(matches!(selected, "up1" | "bit325"), "EXLR8 native manifest must be up1 or bit325");
     let world = match options.placement {
-        ExpertPlacement::Sparks { ranks } if (1..=6).contains(&ranks) => ranks,
-        _ => anyhow::bail!("EXLR8 native deployment requires canonical Sparks with 1..=6 ranks"),
+        ExpertPlacement::Sparks { ranks } if (1..=8).contains(&ranks) => ranks,
+        _ => anyhow::bail!("EXLR8 native deployment requires canonical Sparks with 1..=8 ranks"),
     };
     ensure!(matches!(speculator, "off" | "dflash2"), "EXLR8 native deployment supports off or dflash2 speculation");
     let mut resolved_layout = options.layout.clone().context("EXLR8 native deployment requires --layout")?;
@@ -1134,7 +1134,7 @@ mod tests {
         options.placement = super::super::ExpertPlacement::Sparks { ranks:6 };
         assert!(!error(&options,"up1","off").contains("canonical Sparks"));
         options.placement = super::super::ExpertPlacement::Sparks { ranks:7 };
-        assert!(error(&options,"up1","off").contains("1..=6"));
+        assert!(!error(&options,"up1","off").contains("canonical Sparks"));
         options.placement = super::super::ExpertPlacement::Sparks { ranks:4 };
         for gpus in 0..=3 {
             options.layout.as_mut().unwrap().rtx_bytes = vec![96 << 30; gpus];

@@ -456,7 +456,7 @@ mod tests {
         catalog.select_draft(cuteafd_loader::plan::spec::DraftOwnership::None)?;
         let shape = catalog.routed_experts();
         let selected = [shape.first_layer];
-        for ranks in 1..=6 {
+        for ranks in 1..=8 {
             crate::shared::spark_topology::require_world(
                 cuteafd_transport::expert::SparkWorld::canonical(ranks)?, &catalog, &selected)?;
         }

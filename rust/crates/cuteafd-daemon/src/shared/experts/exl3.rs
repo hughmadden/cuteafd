@@ -81,8 +81,8 @@ fn residency_selection(layer: ExpertLayer) -> Result<(V41Exl3Layer, usize, usize
         // directly. The two- and four-rank native layers stay untouched above.
         ExpertLayer::BackboneExl3Tp { layer, rank, world } => {
             ensure!(
-                (1..=6).contains(&world) && rank < world,
-                "EXL3 Spark shards require TP1..6 and rank below world, got TP{world} rank {rank}"
+                (1..=8).contains(&world) && rank < world,
+                "EXL3 Spark shards require TP1..8 and rank below world, got TP{world} rank {rank}"
             );
             (V41Exl3Layer::Backbone(layer), world, rank)
         }
@@ -506,7 +506,7 @@ mod tests {
 
     #[test]
     fn declared_shard_residency_selection_admits_whole_experts() -> Result<()> {
-        for world in 1..=6 {
+        for world in 1..=8 {
             for rank in 0..world {
                 let (layer, selected_world, selected_rank) = residency_selection(
                     ExpertLayer::BackboneExl3Tp { layer: 7, rank, world })?;
@@ -515,7 +515,7 @@ mod tests {
             }
             assert!(residency_selection(ExpertLayer::BackboneExl3Tp { layer: 7, rank: world, world }).is_err());
         }
-        for world in [0, 7, 8, 9] {
+        for world in [0, 9] {
             assert!(residency_selection(ExpertLayer::BackboneExl3Tp { layer: 7, rank: 0, world }).is_err());
         }
         assert!(matches!(residency_selection(ExpertLayer::BackboneTp2 { layer: 7, rank: 1 })?,
