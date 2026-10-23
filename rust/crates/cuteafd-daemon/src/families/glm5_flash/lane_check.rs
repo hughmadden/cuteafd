@@ -40,7 +40,7 @@ pub(crate) fn lane_check(engine: &GlmfEngine<'_>, tokens: &[u32]) -> Result<()> 
     ensure!(engine.full_prefill_logits, "--lane-check needs every prefill row's logits");
     let n = tokens.len().min(engine.prefill_capacity());
     let cuts = engine.prefill_cuts(n)?;
-    ensure!(engine.prefill_capacity() > engine.prefill_rows || engine.prefill_lane_count == 1,
+    ensure!(engine.prefill_capacity() > engine.prefill_rows || engine.prefill_waves == 1,
         "--lane-check needs admitted pipelined prefill lanes (every layer)");
     let mut allocator = Allocator::for_engine(engine);
     let (mut lanes, mut serial) = (allocator.admit(n)?, allocator.admit(n)?);
@@ -63,7 +63,7 @@ pub(crate) fn lane_check(engine: &GlmfEngine<'_>, tokens: &[u32]) -> Result<()> 
     let paged = unit_bytes(engine, &lanes)? == unit_bytes(engine, &serial)?;
     let verdict = |same: bool| if same { "identical" } else { "DIFFER" };
     println!("lane check: {n} tokens in {} lanes of up to {} rows (cuts {cuts:?}): logits {}, KDA state {}, paged \
-        units {} (lanes {:.0} ms, serial passes {:.0} ms)", engine.prefill_lane_count, engine.prefill_rows,
+        units {} (lanes {:.0} ms, serial passes {:.0} ms)", engine.prefill_waves, engine.prefill_rows,
         verdict(logits), verdict(state), verdict(paged), 1e3 * lane_seconds, 1e3 * serial_seconds);
     allocator.release(serial);
     allocator.release(lanes);

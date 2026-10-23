@@ -93,7 +93,7 @@ impl<'a> GlmfContextSplit<'a> {
     pub fn new(engine: &GlmfEngine<'a>, context: GlmfAttention, extent: usize, manifest: &serde_json::Value,
         abort: Option<[*const u32; 2]>) -> Result<Self> {
         let cfg = &engine.cfg;
-        let (rows, lanes) = (engine.prefill_rows as u64, engine.prefill_lane_count as u64);
+        let (rows, lanes) = (engine.prefill_rows as u64, engine.prefill_waves as u64);
         let buffers = context_buffers(cfg, extent as u64, rows, lanes, context);
         let ranks = [RankDevice { device: engine.device, stream: engine.stream_of(0) },
             RankDevice { device: engine.peer()?.device, stream: engine.stream_of(1) }];

@@ -111,9 +111,9 @@ pub(crate) struct EngineArgs {
     /// Lanes a Spark prefill chunk runs in, each with its own Spark transport and exchange in
     /// flight while the other lanes' GPU layers run (1 to 4): a chunk of up to lanes x
     /// --prefill-rows rows. The lanes share one set of attention temporaries.
-    #[arg(long = "prefill-waves", default_value_t = engine::DEFAULT_PREFILL_LANES,
-        value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..=engine::MAX_PREFILL_LANES as u64))]
-    pub prefill_lanes: usize,
+    #[arg(long = "prefill-waves", default_value_t = engine::DEFAULT_PREFILL_WAVES,
+        value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..=engine::MAX_PREFILL_WAVES as u64))]
+    pub prefill_waves: usize,
     /// GPU memory (GiB) an automatic pool leaves free for growth the start-up cannot measure
     /// (lazily loaded kernels, cuBLAS, allocator rounding), when every other allocation precedes
     /// the pool (one GPU, Spark experts): the pool takes the rest, less the graph reserve and the
@@ -850,9 +850,9 @@ mod draft_cli_tests {
     #[test]
     fn prefill_lanes_default_to_two_of_4096_rows_and_take_one_to_four() {
         let defaults = parse(&[]);
-        assert_eq!((defaults.prefill_lanes, defaults.prefill_rows), (2, 4096));
+        assert_eq!((defaults.prefill_waves, defaults.prefill_rows), (2, 4096));
         let four = parse(&["--prefill-waves", "4", "--prefill-rows", "2048"]);
-        assert_eq!((four.prefill_lanes, four.prefill_rows), (4, 2048));
+        assert_eq!((four.prefill_waves, four.prefill_rows), (4, 2048));
         assert_eq!(parse(&["--prefill-rows", "2048"]).prefill_rows, 2048);
         for lanes in ["0", "5"] {
             assert!(Parse::try_parse_from(["test", "--snapshot", "/checkpoint", "--native-lib", "/native",
@@ -1252,7 +1252,7 @@ impl EngineArgs {
 /// keeps for `--prefill-rows` rows. `ranks` Spark ranks, one transport per prefill lane.
 fn wide_intake_bytes(args: &EngineArgs, ranks: usize, hidden: usize) -> u64 {
     use cuteafd_loader::serving_capacity::spark_intake_bytes;
-    let at = |rows: usize| spark_intake_bytes(args.prefill_lanes as u64, ranks as u64, rows as u64, hidden as u64);
+    let at = |rows: usize| spark_intake_bytes(args.prefill_waves as u64, ranks as u64, rows as u64, hidden as u64);
     at(args.expert_rows()) - at(args.prefill_rows)
 }
 
@@ -1447,7 +1447,7 @@ impl Opened {
                 args.token_io.embed_placement, engine::GlmfAttention { first_owner: 1 - attention.first_owner, ..attention }))
             .transpose()?;
         let spark_ranks = args.peers.as_deref().map_or(0, |p| p.split(',').count());
-        let lanes = engine::configured_prefill_lanes(layers == self.cfg.layers, args.prefill_lanes);
+        let lanes = engine::configured_prefill_waves(layers == self.cfg.layers, args.prefill_waves);
         let lookup = |name: &str| programs.spec(name).ok().map(|p| p.scratch.get("scratch").copied().unwrap_or(0));
         let scratch = GlmfScratchOptions { split, kda_w8: representation.kda_fp8,
             kda_fp32_partials: args.kda_fp32_partials, kda_output_shard: args.kda_output_shard,
@@ -1748,7 +1748,7 @@ impl Opened {
         if draft_gpu == 0 { drop(prepared_draft.take()); }
         probe("admission-programs")?;
         let mut selected_args = args.clone();
-        selected_args.prefill_lanes = usize::try_from(working.prefill_lanes)?;
+        selected_args.prefill_waves = usize::try_from(working.prefill_lanes)?;
         let args = &selected_args;
 
         let spark_layers = admitted_spark_layers(&self.cfg, &placement.layers, args.skip_experts)?;
@@ -1980,14 +1980,14 @@ impl Opened {
             let mut settings = step_settings(args, index_cache, self.checkpoint.spark_input_is_bf16());
             settings.max_context = max_context;
             let plan = engine::StepPlan::new(&self.library, &programs, &self.cfg, &model.layers, step_experts, settings);
-            let lanes = engine::configured_prefill_lanes(layers == self.cfg.layers, args.prefill_lanes);
+            let lanes = engine::configured_prefill_waves(layers == self.cfg.layers, args.prefill_waves);
             Some(engine::StepWorkspaces::allocate(&plan, args.prefill_rows, lanes)?)
         } else { None };
         let records = early_workspaces.as_ref().map(|w| w.prefill_scratch()
             .context("shared replay records need prefill lanes")).transpose()?;
         let pages = (pool_tokens + reserved_units as usize * engine::UNIT_ROWS).div_ceil(engine::PAGE_ROWS);
         let mut engine = engine::GlmfEngine::new(&self.library, &programs, self.cfg.clone(), model, stream,
-            max_context, args.prefill_rows, args.prefill_lanes, pages, args.slots, embedding, index_cache,
+            max_context, args.prefill_rows, args.prefill_waves, pages, args.slots, embedding, index_cache,
             args.kda_state, args.decode_rows, records, context_mode, args.prefix_marks == prefix::PrefixMarks::Pool,
             &execution, step_experts)?;
         engine.attention_plan = attention_plan;
@@ -2190,7 +2190,7 @@ impl Opened {
         let mut transports = vec![crate::shared::spark_intake::SparkLink::new_waves(&self.library,
             spark_world, &peers, u32::try_from(args.expert_rows())?, cuteafd_transport::TcpTransportConfig { timing: false,
                 timeout: std::time::Duration::from_secs(120), max_frame_bytes: 64 << 20 }, self.cfg.hidden * 2,
-            args.prefill_lanes, u32::try_from(args.prefill_rows)?)?];
+            args.prefill_waves, u32::try_from(args.prefill_rows)?)?];
         for link in &mut transports { link.enable_terminal_ownership(self.library.clone())?; }
         crate::shared::memory_report::release_load_staging(&self.library);
         let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;

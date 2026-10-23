@@ -2,6 +2,8 @@
 use super::*;
 use crate::shared::prefill_pipeline::{FfnRoute, PrefillHooks, Unit, run_prefill_units};
 
+enum Ticket { Spark(SparkExpertWave), Mixed(layers::Ticket) }
+
 struct UnitHooks<'e, 'a, 'w> {
     engine: &'e GlmfEngine<'a>,
     steps: &'w [(StepTables, &'w [u32])],
@@ -9,6 +11,7 @@ struct UnitHooks<'e, 'a, 'w> {
     work: &'w [Workspace<'a>],
     peer: Option<&'w PeerWorkspaces<'w, 'a>>,
     released: Vec<Option<crate::shared::memory::device::Event<'a>>>,
+    consumed: Vec<Vec<usize>>,
     waves: usize,
     total: usize,
     wanted: usize,
@@ -18,9 +21,9 @@ struct UnitHooks<'e, 'a, 'w> {
     media: Option<&'w cuteafd_engine::media::RequestMedia>,
 }
 
-impl UnitHooks<'_, '_, '_> {
+impl<'a> UnitHooks<'_, 'a, '_> {
     fn rows(&self, unit: &Unit) -> usize { unit.rows.len() }
-    fn peer(&self, unit: &Unit) -> Result<Option<&Workspace<'_>>> {
+    fn peer(&self, unit: &Unit) -> Result<Option<&Workspace<'a>>> {
         self.peer.map(|p| p.get(unit.slot)).transpose()
     }
     fn post(&self, layer: usize, unit: &Unit) -> Result<()> {
@@ -30,7 +33,7 @@ impl UnitHooks<'_, '_, '_> {
         let rows = Scalar::I32(t as i32);
         // Publish rank 1's retained FFN partial only when this unit lands.
         if let Some(w1) = self.peer(unit)? {
-            if !e.tp2_layer(layer) {
+            if e.layer_execution.is_none() && !e.tp2_layer(layer) {
                 e.exchange_push(e.exchange()?, "main", 1, slot(layer, true, unit.slot),
                     GlmfEngine::peer_ffn_out(w1, &e.peer()?.layers[layer])?, t * e.cfg.hidden * 2)?;
             }
@@ -54,7 +57,7 @@ impl UnitHooks<'_, '_, '_> {
 }
 
 impl PrefillHooks for UnitHooks<'_, '_, '_> {
-    type Ticket = SparkExpertWave;
+    type Ticket = Ticket;
     fn route(&self, layer: usize) -> FfnRoute {
         if !self.engine.weights.layers[layer].dense
             && matches!(self.engine.routed_experts(layer), Some(Experts::Spark { .. })) {
@@ -98,11 +101,15 @@ impl PrefillHooks for UnitHooks<'_, '_, '_> {
         let layer = &e.weights.layers[index];
         let rows = Scalar::I32(unit.rows.len() as i32);
         e.context_unit.set(unit.index);
-        if layer.attention == GlmNextAttention::Mla {
+        if e.context.is_some() && layer.attention == GlmNextAttention::Mla {
             let parity = e.caches.mla_ordinal[index].context("MLA ordinal")? % 2;
             let mut owners = e.staging_owner.borrow_mut();
             e.context_reuse.set(unit.index > 0 && owners[parity] == Some((index, unit.index - 1)));
             owners[parity] = Some((index, unit.index));
+        }
+        if e.layer_execution.is_some() {
+            return e.unit_attention([w, self.peer(unit)?.context("owned peer slot")?],
+                &self.ranked[unit.index], unit, index, self.total, &mut self.consumed[unit.index]);
         }
         if let Some(w1) = self.peer(unit)? {
             e.peer_attention(index, unit.slot, w1, unit.rows.len(), PREFILL_CAP, &self.ranked[unit.index][1])?;
@@ -117,6 +124,12 @@ impl PrefillHooks for UnitHooks<'_, '_, '_> {
         let w = &self.work[unit.slot];
         let layer = &e.weights.layers[index];
         let rows = Scalar::I32(unit.rows.len() as i32);
+        if e.layer_execution.is_some() {
+            let work = [w, self.peer(unit)?.context("owned peer slot")?];
+            let ticket = e.unit_ffn_begin(work, &self.ranked[unit.index], unit, index, self.total)?;
+            e.unit_ffn_finish(work, &self.ranked[unit.index], unit, index, self.total, ticket)?;
+            return self.post(index, unit);
+        }
         if layer.dense {
             e.ffn(w, layer, e.cfg.dense_intermediate, PREFILL_CAP, w.delta.buffer.ptr, rows)?;
         } else {
@@ -137,16 +150,25 @@ impl PrefillHooks for UnitHooks<'_, '_, '_> {
         let w = &self.work[unit.slot];
         let layer = &e.weights.layers[index];
         let rows = Scalar::I32(unit.rows.len() as i32);
+        if e.layer_execution.is_some() {
+            return Ok(Ticket::Mixed(e.unit_ffn_begin([w, self.peer(unit)?.context("owned peer slot")?],
+                &self.ranked[unit.index], unit, index, self.total)?));
+        }
         e.moe_front(w, index, layer, unit.rows.len(), rows, PREFILL_CAP,
             &[Span { first: 0, rows: unit.rows.len() }])?;
         let Some(Experts::Spark { transports, .. }) = e.routed_experts(index) else {
             anyhow::bail!("Spark unit without its link");
         };
         e.spark_dispatch(w, index, unit.rows.len(), false, &mut transports.borrow_mut()[0], ||
-            e.ffn(w, layer, e.cfg.moe_intermediate, PREFILL_CAP, w.shared.buffer.ptr, rows))
+            e.ffn(w, layer, e.cfg.moe_intermediate, PREFILL_CAP, w.shared.buffer.ptr, rows)).map(Ticket::Spark)
     }
     fn land_experts(&mut self, layer: usize, unit: &Unit, wave: Self::Ticket) -> Result<()> {
-        self.engine.spark_land_lane(&self.work[unit.slot], unit.rows.len(), 0, wave)?;
+        match wave {
+            Ticket::Spark(wave) => self.engine.spark_land_lane(&self.work[unit.slot], unit.rows.len(), 0, wave)?,
+            Ticket::Mixed(ticket) => self.engine.unit_ffn_finish(
+                [&self.work[unit.slot], self.peer(unit)?.context("owned peer slot")?],
+                &self.ranked[unit.index], unit, layer, self.total, ticket)?,
+        }
         self.post(layer, unit)
     }
     fn end_unit(&mut self, unit: &Unit) -> Result<()> {
@@ -173,10 +195,8 @@ impl<'a> GlmfEngine<'a> {
     pub(super) fn step_units_inner(&self, scope: &crate::shared::experts::rtx::pair::SubmissionScope<'_>,
         steps: &[(StepTables, &[u32])], logit_rows: usize, device: bool,
         media: Option<&cuteafd_engine::media::RequestMedia>) -> Result<Option<StepLogits>> {
-        // The mixed-owned path is migrated independently of context/head-split execution.
-        if self.layer_execution.is_some() { return self.layer_steps(scope, steps, logit_rows, device, media); }
-        let waves = self.prefill_lane_count.min(steps.len()).max(1);
-        let work = self.prefill_lanes_of(0, waves)?;
+        let waves = self.prefill_waves.min(steps.len()).max(1);
+        let work = self.prefill_slots_of(0, waves)?;
         let peer = self.peer_workspaces(false, Some(waves))?;
         for rank in 0..self.ranks() {
             // SAFETY: one call-boundary drain, never a per-dispatch stream wait.
@@ -212,6 +232,8 @@ impl<'a> GlmfEngine<'a> {
             self.prepare_route_checks(&steps.iter().map(|(t, _)| t.positions.len()).collect::<Vec<_>>())?;
         }
         let mut hooks = UnitHooks { engine: self, steps, ranked, work: &work, peer: peer.as_ref(), released,
+            consumed: (0..steps.len()).map(|_| vec![0; self.layer_execution.as_ref()
+                .map_or(0, |execution| execution.plan.hops().len())]).collect(),
             waves, total, wanted: logit_rows, device, logits: Vec::new(), result: None, media };
         let outcome = run_prefill_units(&mut hooks, &units, waves);
         self.unit_prefill.set(false);
