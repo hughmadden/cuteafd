@@ -1286,6 +1286,19 @@ pub(crate) fn charge_host(report: &mut PlanReport, options: &LayoutOptions, chec
             .context("Qwen host staging overflow")?;
     }
     push(Category::Staging, "staging/tables-and-sync", "row metadata", staging, Basis::Estimated);
+    if family == "qwen4" && ranks > 0 && options.prefill_waves > 1 {
+        use crate::families::qwen4::{Qwen4Config, StepTableBytes};
+        use crate::serving_capacity::qwen_graphs::{qwen_pool_pages, QWEN_UNIT_PAGES};
+        let cfg = Qwen4Config::from_hf(&checkpoint.config)?;
+        let pool = usize::try_from(report.memory_layout.as_ref().context("Qwen ordered tables need a KV layout")?.pool_tokens)?;
+        let pages = qwen_pool_pages(pool).context("Qwen host page tables overflow")?.max(QWEN_UNIT_PAGES);
+        let tables = StepTableBytes::new(usize::try_from(unit_rows)?, false, pages, pages / QWEN_UNIT_PAGES, cfg.ple_rows())?;
+        // One unit workspace owns these destinations, shared by both waves.
+        // Mapped PLE uploads gathered rows, not the separate PLE-ID table.
+        let ple_ids = !cfg.ple_layers.first().is_some_and(|&layer| layer < spec.layers.len());
+        push(Category::Staging, "staging/ordered-tables", "full destination extents",
+            tables.ordered_bytes(ple_ids)?, Basis::Formula);
+    }
     let score_lanes = if matches!(family, "glm5" | "glm5_flash") { lanes } else { 1 };
     let score_rows = if options.full_prefill_logits { rows.checked_mul(score_lanes).context("host scoring rows overflow")? }
         else if family == "deepseek_v41" { rows.max(256) } else { 64 };

@@ -8,6 +8,38 @@ pub use rope::{ImageSpan, RopeError, RopePositions};
 pub use config::{Qwen4Attention, Qwen4Config};
 pub use ngram::{NgramHasher, NgramHistory};
 
+/// Destination extents shared by workspace allocation and ordered H2D admission.
+#[derive(Debug)]
+pub struct StepTableBytes {
+    pub positions: usize, pub rope_positions: usize, pub block_rope_positions: usize,
+    pub kv_slots: usize, pub slots: usize, pub seq_first: usize, pub pool_slots: usize,
+    pub cache_lengths: usize, pub page_table: usize, pub pool_table: usize,
+    pub ids: usize, pub ple_ids: usize,
+}
+
+impl StepTableBytes {
+    pub fn new(rows: usize, decode: bool, pages: usize, pool_pages: usize, ple_rows: usize) -> anyhow::Result<Self> {
+        use anyhow::Context;
+        let mul = |a: usize, b: usize| a.checked_mul(b).context("Qwen host table size overflow");
+        let table_rows = if decode { rows } else { 1 };
+        Ok(Self { positions: mul(rows, 8)?, rope_positions: mul(rows, 12)?,
+            block_rope_positions: mul(rows, 12)?, kv_slots: mul(rows, 8)?,
+            slots: mul(rows, 4)?, seq_first: mul(rows, 4)?, pool_slots: mul(rows, 8)?,
+            cache_lengths: mul(rows, 4)?, page_table: mul(mul(table_rows, pages)?, 4)?,
+            pool_table: mul(mul(table_rows, pool_pages)?, 4)?, ids: mul(rows, 4)?,
+            ple_ids: mul(mul(rows, ple_rows)?, 8)? })
+    }
+
+    pub fn ordered_bytes(&self, ple_ids: bool) -> anyhow::Result<u64> {
+        use anyhow::Context;
+        [self.positions, self.rope_positions, self.block_rope_positions, self.kv_slots,
+            self.slots, self.seq_first, self.pool_slots, self.cache_lengths,
+            self.page_table, self.pool_table, self.ids].into_iter()
+            .chain(ple_ids.then_some(self.ple_ids)).try_fold(0u64, |total, bytes|
+                total.checked_add(bytes.max(256) as u64).context("Qwen ordered table size overflow"))
+    }
+}
+
 /// Immutable full-attention records. Index keys remain BF16 in either format.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
