@@ -69,9 +69,10 @@ impl RouteIdentity {
 /// for every slot before any peer waits are queued; begin/finish never replace
 /// those pinned allocations. The `finish` callback drains both producer streams,
 /// then trims each buffer to the unit's actual rows before returning RouteChecks.
-/// Always call `finish_span`, including before propagating an executor error;
-/// strict mode rejects a begun unit that never finished. An error does not prove
-/// device work drained: the owner's submission guard still owns abort and teardown.
+/// Always call `finish_span`, including before propagating an executor error.
+/// Any unfinished slot rejects release, regardless of strictness. Retain this
+/// owner until the submission guard drains or aborts all device work; only a
+/// successful `finish` drain permits a slot to retire during normal execution.
 #[derive(Debug)]
 pub(crate) struct SlotRouteChecks<T> {
     slots: Vec<(T, Option<CheckedUnit>)>,
@@ -99,12 +100,11 @@ impl<T> SlotRouteChecks<T> {
         Ok(())
     }
 
-    /// Call at span end, including error unwinding before the owner drops storage.
+    /// Call at span end, including error unwinding. On error, retain this owner
+    /// through submission teardown: non-strict comparison is not a drain proof.
     pub(crate) fn finish_span(&self) -> anyhow::Result<()> {
-        if self.strict {
-            if let Some((slot, (_, Some(active)))) = self.slots.iter().enumerate().find(|(_, (_, active))| active.is_some()) {
-                anyhow::bail!("unfinished route diagnostics in unit {}, slot {slot}", active.unit);
-            }
+        if let Some((slot, (_, Some(active)))) = self.slots.iter().enumerate().find(|(_, (_, active))| active.is_some()) {
+            anyhow::bail!("unfinished route diagnostics in unit {}, slot {slot}", active.unit);
         }
         Ok(())
     }
@@ -215,6 +215,34 @@ mod tests {
         checks.finish(0, 7, |storage, _| Ok(storage.clone())).unwrap();
         checks.finish_span().unwrap();
         assert!(checks.finish(0, 7, |_, _| unreachable!()).is_err());
+    }
+
+    #[test]
+    fn non_strict_executor_errors_retain_storage_until_drain() {
+        use std::{cell::Cell, rc::Rc};
+        struct PinnedOwner(Rc<Cell<usize>>);
+        impl Drop for PinnedOwner {
+            fn drop(&mut self) { self.0.set(self.0.get() + 1); }
+        }
+        let drops = Rc::new(Cell::new(0));
+        let mut owner = Some(SlotRouteChecks::new(vec![PinnedOwner(drops.clone())], false).unwrap());
+        let checks = owner.as_mut().unwrap();
+        checks.begin(0, 5, 1, true).unwrap();
+        assert!(checks.finish(0, 5, |_, _| anyhow::bail!("producer failed before drain")).is_err());
+        // The adapter may release only after a successful span check.
+        if checks.finish_span().is_ok() { owner = None; }
+        assert!(owner.is_some());
+        assert_eq!(drops.get(), 0);
+        assert!(owner.as_mut().unwrap().begin(0, 6, 1, true).is_err());
+        let drained = Cell::new(false);
+        owner.as_mut().unwrap().finish(0, 5, |_, _| {
+            drained.set(true);
+            Ok(vec![check(1, 1, vec![0; 16], vec![0; 16])])
+        }).unwrap();
+        assert!(drained.get());
+        owner.as_ref().unwrap().finish_span().unwrap();
+        drop(owner.take());
+        assert_eq!(drops.get(), 1);
     }
 
     #[test]
