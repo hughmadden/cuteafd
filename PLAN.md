@@ -5464,7 +5464,9 @@ and scratch scheme. Step-5 and Qwen 4 had no overlap at all.
   transport. The pipeline may keep up to N windows' expert waves in flight at
   once. That's lanes' overlap without duplicating workspaces or transports.
   Each in-flight window needs only its own return buffer; its scratch rows are
-  already its own. Default N=1. Raise it where a profile shows the Sparks
+  already its own. No second workspace exists: the only memory added per
+  extra wave is that return buffer (window rows × hidden × intake planes),
+  and admission charges it before allocation. Default N=1. Raise it where a profile shows the Sparks
   idling between waves (Spark-bound prefill). Keep it at 1 where the GPU is
   the bound.
 - **Windows:** at most 3, at least 256 rows each, 64-row page aligned, until
