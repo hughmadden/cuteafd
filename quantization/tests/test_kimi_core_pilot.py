@@ -1,5 +1,6 @@
 """CPU contracts for the bounded shared codebook pilot (no model imports)."""
 from pathlib import Path
+import json
 import sys
 
 import pytest
@@ -35,6 +36,11 @@ def test_default_pilot_is_bounded_and_has_no_full_quant_or_head_switch():
 def test_reject_unbounded_or_ambiguous_selection(extra):
     with pytest.raises(ValueError):
         pilot.configuration(arguments(*extra))
+
+
+def test_storage_identity_survives_json_round_trip():
+    identity = pilot.selection_identity(pilot.configuration(arguments()))
+    assert json.loads(json.dumps(identity)) == identity
 
 
 def test_subset_preserves_whole_original_prompts_and_order():

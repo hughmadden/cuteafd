@@ -47,6 +47,11 @@ def configuration(argv=None):
     return args
 
 
+def selection_identity(args):
+    # Storage compares identities after JSON reload; tuples would become lists.
+    return dict(schema=SCHEMA, layers=list(args.layers), arms=list(args.arms))
+
+
 def subset(records, budget):
     """Deterministic original-order prefix of complete, unmodified prompts."""
     selected, count = [], 0
@@ -106,7 +111,7 @@ def main(argv=None):
     if {row["id"] for row in calibration} & {row["id"] for row in heldout}:
         raise ValueError("pilot calibration and held-out prompt IDs overlap")
     token_hash = lambda rows: hashlib.sha256(run.canonical(rows).encode()).hexdigest()
-    identity = dict(schema=SCHEMA, layers=args.layers, arms=args.arms,
+    identity = dict(**selection_identity(args),
                     calibration_tokens=sum(len(row["input_ids"]) for row in calibration),
                     heldout_tokens=sum(len(row["input_ids"]) for row in heldout),
                     calibration_sha256=token_hash(calibration), heldout_sha256=token_hash(heldout),
