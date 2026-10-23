@@ -168,7 +168,8 @@ def test_v4_prefill_units_reach_plan_serve_and_container(tmp_path: Path, rows: i
     assert result.returncode == 0, result.stderr
     plan = next(line for line in result.stderr.splitlines() if "cuteafd plan" in line)
     assert f"--prefill-rows {rows}" in plan
-    assert f"--prefill-lanes {waves}" in plan
+    assert f"--prefill-waves {waves}" in plan
+    assert "--prefill-lanes" not in plan
     serve = next(line for line in result.stderr.splitlines() if "serve-dsv4" in line)
     assert f"--prefill-rows {rows}" in serve
     assert f"--prefill-waves {waves}" in serve
