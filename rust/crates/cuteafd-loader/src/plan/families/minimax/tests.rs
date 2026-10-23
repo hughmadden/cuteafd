@@ -422,9 +422,11 @@ fn minimax_paged_cache_obeys_explicit_pool_host_and_spark_budgets() {
     let layout = options.layout.as_mut().unwrap();
     layout.minimax_5090 = true;
     layout.host_embedding = true;
+    layout.context_tokens = 4096;
     layout.minimax_cache = CachePlan { backing: KvBacking::Host, host_bytes: 64 << 20, ..Default::default() };
     let host = plan::plan(dir.path(), &options).unwrap();
     let host_pool = host.memory_layout.as_ref().unwrap().pool_tokens;
+    assert!(host.memory_layout.as_ref().unwrap().notes.iter().any(|n| n.contains("per-sequence context cap 4096")));
     assert_eq!(host_pool, (64u64 << 20) / 61_440 / 128 * 128);
     assert_eq!(host.bytes_by_owner["proposed host KV backing"], host_pool * 61_440);
     options.layout.as_mut().unwrap().pool_tokens = Some(128);

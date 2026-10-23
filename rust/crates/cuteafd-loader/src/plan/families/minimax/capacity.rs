@@ -120,7 +120,7 @@ pub(super) fn apply(cfg: &MiniMaxM3Config, memory: &mut MemoryLayout, report: &m
     report.hints.push(Hint { what: "MiniMax proposed cache execution is not implemented".into(),
         how: "Add and qualify NVFP4 pack/attention and/or device-driven selected-block paging; this capacity estimate cannot admit serving.".into() });
     memory.notes.push(format!("NOT IMPLEMENTED: {:?} backing, {} K/V B/token + {} index B/token; {} global bytes; {} hot-cache bytes; {} backing bytes; {} pool tokens (aggregate, per-sequence context cap {})",
-        options.backing, records.kv, records.index, records.globals, result.hot_bytes, result.backing_bytes, result.tokens, cfg.max_position));
+        options.backing, records.kv, records.index, records.globals, result.hot_bytes, result.backing_bytes, result.tokens, if opts.context_tokens == 0 { cfg.max_position as u64 } else { opts.context_tokens }));
     if options.backing != KvBacking::Gpu {
         memory.notes.push(format!("Paging estimate includes {} B/token device directory; hot-cache budget includes slot metadata; no hit-rate or performance claim. Spark backing requires an unqualified device-initiated transport; GeForce GPUDirect RDMA is not assumed.", records.directory));
     }
