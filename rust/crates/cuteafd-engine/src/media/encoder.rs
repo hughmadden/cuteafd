@@ -4,6 +4,8 @@ use std::{collections::HashMap, sync::Arc};
 #[derive(Clone, Debug, PartialEq)]
 pub enum EncodeInput {
     Image { grid: [u32; 3], rgb8: Arc<[u8]> },
+    /// MiniMax paired RGB frames; the temporal grid counts frame pairs.
+    Video { grid: [u32; 3], rgb8: Arc<[u8]> },
     /// One complete clip of canonical finite mono FP32 PCM at 24 kHz.
     Audio { pcm: Arc<[f32]> },
 }
@@ -24,6 +26,9 @@ impl EncodeJob {
     pub fn image(key: ImageKey, grid: [u32; 3], rgb8: Arc<[u8]>, tokens: usize, hidden_width: usize) -> Self {
         Self { key: key.into(), input: EncodeInput::Image { grid, rgb8 }, tokens, hidden_width }
     }
+    pub fn video(key: ImageKey, grid: [u32; 3], rgb8: Arc<[u8]>, tokens: usize, hidden_width: usize) -> Self {
+        Self { key: key.into(), input: EncodeInput::Video { grid, rgb8 }, tokens, hidden_width }
+    }
     pub fn audio(key: AudioKey, pcm: Arc<[f32]>, tokens: usize, hidden_width: usize) -> Self {
         Self { key: key.into(), input: EncodeInput::Audio { pcm }, tokens, hidden_width }
     }
@@ -35,6 +40,8 @@ impl EncodeJob {
         self.feature_bytes()?;
         match (&self.key, &self.input) {
             (MediaKey::Image(_), EncodeInput::Image { grid, rgb8 }) if !grid.contains(&0) && !rgb8.is_empty() => Ok(()),
+            (MediaKey::Image(_), EncodeInput::Video { grid, rgb8 })
+                if !grid.contains(&0) && grid[0] <= 2 && !rgb8.is_empty() => Ok(()),
             (MediaKey::Audio(_), EncodeInput::Audio { pcm }) => {
                 if !(481..=7_200_000).contains(&pcm.len()) || pcm.iter().any(|x| !x.is_finite()) {
                     return Err(MediaError::Features);
@@ -120,5 +127,28 @@ impl EncoderClient for FakeEncoder {
     }
     fn cancel(&mut self, ticket: EncoderTicket) {
         if self.jobs.remove(&ticket).is_some() { self.cancelled += 1; }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn video_jobs_keep_visual_keys_and_validate_before_fake_encoding() {
+        let job = EncodeJob::video(ImageKey([7; 32]), [2, 2, 2], vec![1; 4 * 28 * 28 * 3].into(), 2, 3);
+        assert!(job.image_input().is_err());
+        let mut encoder = FakeEncoder::default();
+        let ticket = encoder.submit(job.clone()).unwrap();
+        let output = encoder.poll(ticket).unwrap().unwrap();
+        assert_eq!(output.key, job.key);
+        assert_eq!(output.features, FakeEncoder::features(&job).unwrap());
+        for grid in [[0, 2, 2], [3, 2, 2], [1, 0, 2]] {
+            let mut invalid = job.clone();
+            invalid.input = EncodeInput::Video { grid, rgb8: vec![1].into() };
+            assert!(encoder.submit(invalid).is_err());
+        }
+        let mut invalid = job;
+        invalid.key = AudioKey([7; 32]).into();
+        assert!(encoder.submit(invalid).is_err());
     }
 }
