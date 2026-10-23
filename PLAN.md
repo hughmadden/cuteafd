@@ -5445,7 +5445,7 @@ Every family that sends experts to Sparks prefills the same way.
 - **Units:** the prompt runs as a continuous stream of row units, 2 units in
   flight, each unit the family's largest supported size (TJ, 2026-10-24:
   "2 × max size basically always wins"). The max is the family's expert-kernel
-  capacity, typically 4096 rows. Bigger units mean more rows per expert,
+  capacity, capped at 4096 rows (TJ, 2026-10-24: no larger units for now). Bigger units mean more rows per expert,
   hence more reuse of each decoded weight and less per-wave overhead; GLM 5.3
   measured 4096×2 about 18% over 2048×2 on 8K. If the default doesn't fit
   (5090, tight pool), step down 4096 → 2048 → 1024 → 512; there is no
