@@ -32,6 +32,8 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyMo
     let checkpoint = input.checkpoint();
     let mut shape = Shape::resolve(report, model, options,
         ShapePolicy { all_native_stages: true, ..ShapePolicy::manifest_bounded() });
+    shape.prefill_rows = options.prefill_unit_rows.unwrap_or(shape.prefill_rows);
+    options.prefill_unit_rows = Some(shape.prefill_rows);
     let gpus = options.rtx_bytes.len().clamp(1, 2);
     let split = gpus == 2 && options.head_split;
     let ranks = if split { 2 } else { 1 };
@@ -60,14 +62,13 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyMo
         devices[0].items.push(Item::new(Category::Drafter, "drafter", "", options.drafter_bytes, Basis::Estimated));
     }
     let id = if model.spec().hidden == 4096 { "dsv4f" } else { "dsv4p" };
-    report.prefill_lanes = Some(if options.prefill_lanes > 0 { options.prefill_lanes } else { v4::PREFILL_WAVES });
     let workspace = (|| {
         let manifest = shape.manifest.as_ref()?;
         let cfg = DeepseekV4Config::read(&checkpoint.snapshot, shape.native_layers).ok()?;
         let scratch = crate::serving_capacity::deepseek_v4_workspace_scratch(manifest, id, split,
             shape.prefill_rows, shape.decode_rows).ok()?;
         crate::serving_capacity::deepseek_v4_workspace_geometry(&cfg, shape.prefill_rows, shape.decode_rows,
-            crate::serving_capacity::compiled_c128_width(manifest, id).ok()?.checked_mul(128)?, ranks, if options.prefill_lanes > 0 { options.prefill_lanes } else { v4::PREFILL_WAVES }, scratch).ok()
+            crate::serving_capacity::compiled_c128_width(manifest, id).ok()?.checked_mul(128)?, ranks, options.prefill_waves, scratch).ok()
     })();
     if workspace.is_none() {
         notes.push("V4 workspace allowance is estimated without a matching PROGRAMS.json; use --workspace-manifest for Flash/Pro allocation geometry".into());
@@ -195,7 +196,7 @@ fn solve(report: &PlanReport, input: &super::super::PlanInput, options: &LayoutO
         weights: crate::families::deepseek_v4::resident::WeightInventory::from_headers(&cfg, devices.len(),
             shape.native_layers > 0, checkpoint.tensors.iter().map(|t| &t.meta))?,
         cache_stages: shape.native_layers, gpus, headroom_floor: options.headroom_bytes,
-        spark_ranks, sequences: shape.concurrency, prefill_rows: shape.prefill_rows, prefill_waves: if options.prefill_lanes > 0 { options.prefill_lanes } else { v4::PREFILL_WAVES }, decode_rows: shape.decode_rows,
+        spark_ranks, sequences: shape.concurrency, prefill_rows: shape.prefill_rows, prefill_waves: options.prefill_waves, decode_rows: shape.decode_rows,
         max_context: shape.context_tokens, reserve_bytes: v4::RESERVE_BYTES, mark_slots, workspace,
         experts, draft, expert_workspace, first_routed: routed.first_layer,
         experts_half: if tp2_workspace.is_some() { v4::expert_half_costs(catalog)? } else { Vec::new() },
