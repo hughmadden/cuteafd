@@ -53,9 +53,17 @@ pub enum ModelEncoding {
     Qwen(Arc<qwen4::QwenEncoding>),
     Kimi(Arc<kimi::KimiEncoding>),
     Step5(Arc<step5::Step5Encoding>),
+    MiniMaxM3(Arc<minimax_m3::MiniMaxEncoding>),
 }
 
 impl ModelEncoding {
+    /// Select the M3 API family from checkpoint architecture metadata.
+    /// Other architectures remain owned by their existing serving adapters.
+    pub fn from_architecture(architecture: &str, snapshot: &std::path::Path) -> anyhow::Result<Option<Self>> {
+        if architecture != minimax_m3::ARCHITECTURE { return Ok(None); }
+        Ok(Some(Self::MiniMaxM3(Arc::new(minimax_m3::MiniMaxEncoding::from_snapshot(snapshot)?))))
+    }
+
     /// Whether the active chat renderer can render a thinking-off request.
     pub fn supports_thinking_off(&self) -> bool {
         match self {
@@ -72,6 +80,7 @@ impl ModelEncoding {
             Self::Qwen(encoding) => encoding.tokens().eos.clone(),
             Self::Kimi(encoding) => encoding.eos_token_ids(),
             Self::Step5(encoding) => encoding.tokens().eos.clone(),
+            Self::MiniMaxM3(encoding) => encoding.tokens().eos.clone(),
         }
     }
 
@@ -82,6 +91,7 @@ impl ModelEncoding {
             Self::Qwen(encoding) => Some(encoding.tokens().think_close),
             Self::Kimi(_) => None,
             Self::Step5(encoding) => Some(encoding.tokens().think_close),
+            Self::MiniMaxM3(encoding) => Some(encoding.tokens().think_close),
         }
     }
 }
@@ -206,7 +216,7 @@ impl ModelProfile {
                 ids.dedup();
                 ids
             }
-            ModelEncoding::DeepseekV4 | ModelEncoding::DeepseekV41 | ModelEncoding::Kimi(_) => self.eos_token_ids.clone(),
+            ModelEncoding::DeepseekV4 | ModelEncoding::DeepseekV41 | ModelEncoding::Kimi(_) | ModelEncoding::MiniMaxM3(_) => self.eos_token_ids.clone(),
         }
     }
 }
@@ -223,7 +233,7 @@ mod admission;
 mod constraints;
 mod tools;
 pub mod chat;
-use chat::{deepseek, glm5, kimi, qwen4, step5};
+use chat::{deepseek, glm5, kimi, qwen4, step5, minimax_m3};
 pub use constraints::NativeConstraint;
 mod images;
 pub mod media;
@@ -563,6 +573,7 @@ enum Templated {
     Qwen(Arc<qwen4::QwenEncoding>),
     Kimi(Arc<kimi::KimiEncoding>),
     Step5(Arc<step5::Step5Encoding>),
+    MiniMaxM3(Arc<minimax_m3::MiniMaxEncoding>),
 }
 
 impl Templated {
@@ -572,7 +583,7 @@ impl Templated {
     fn thinking(&self, body: &Value) -> Result<glm5::GlmThinking, String> {
         match self {
             Self::Glm(encoding) => glm5::resolve_glm_thinking(body, encoding.thinking_off()),
-            Self::Qwen(_) | Self::Kimi(_) => Ok(glm5::GlmThinking { enabled: glm5::resolve_thinking(body)?, effort: None }),
+            Self::Qwen(_) | Self::Kimi(_) | Self::MiniMaxM3(_) => Ok(glm5::GlmThinking { enabled: glm5::resolve_thinking(body)?, effort: None }),
             Self::Step5(_) => {
                 step5::prompt::validate_thinking(body)?;
                 Ok(glm5::GlmThinking { enabled: true, effort: None })
@@ -588,6 +599,7 @@ enum OutputProcessor {
     Qwen(glm5::GlmStreamProcessor<ChatGenerator, qwen4::QwenOutputParser>),
     Kimi(glm5::GlmStreamProcessor<ChatGenerator, kimi::KimiOutputParser>),
     Step5(glm5::GlmStreamProcessor<ChatGenerator, step5::Step5OutputParser>),
+    MiniMaxM3(glm5::GlmStreamProcessor<ChatGenerator, minimax_m3::MiniMaxOutputParser>),
 }
 
 impl OutputProcessor {
@@ -598,6 +610,7 @@ impl OutputProcessor {
             Self::Qwen(processor) => Box::pin(processor.process(input)),
             Self::Kimi(processor) => Box::pin(processor.process(input)),
             Self::Step5(processor) => Box::pin(processor.process(input)),
+            Self::MiniMaxM3(processor) => Box::pin(processor.process(input)),
         }
     }
 }
@@ -735,6 +748,7 @@ pub(crate) fn build(profile: &ModelProfile, limits: NativeLimits, headers: &axum
         ModelEncoding::Qwen(encoding) => Some(Templated::Qwen(encoding.clone())),
         ModelEncoding::Kimi(encoding) => Some(Templated::Kimi(encoding.clone())),
         ModelEncoding::Step5(encoding) => Some(Templated::Step5(encoding.clone())),
+        ModelEncoding::MiniMaxM3(encoding) => Some(Templated::MiniMaxM3(encoding.clone())),
         ModelEncoding::DeepseekV4 | ModelEncoding::DeepseekV41 => None,
     };
     let assistance = match body.get("tool_decoding_assistance") {
@@ -775,6 +789,11 @@ pub(crate) fn build(profile: &ModelProfile, limits: NativeLimits, headers: &axum
     // Keep the original format for enforcement and render it as ordinary text.
     if response_format.as_ref().and_then(|v| v.get("type")).and_then(Value::as_str) == Some("regex") {
         body["response_format"] = json!({"type":"text"});
+    }
+    if matches!(profile.encoding, ModelEncoding::MiniMaxM3(_)) {
+        for (key, value) in [("temperature", 1.0), ("top_p", 0.95)] {
+            if body.get(key).is_none_or(Value::is_null) { body[key] = json!(value); }
+        }
     }
     let sampling = request_target_sampling(&body).map_err(Rejection::bad)?;
     // V4.1's checkpoint encoder also takes a numeric budget (1-100), which the
@@ -845,17 +864,20 @@ pub(crate) fn build(profile: &ModelProfile, limits: NativeLimits, headers: &axum
         Some((Templated::Glm(_), _, _)) => tools::ToolSyntax::GlmXml,
         Some((Templated::Qwen(_), _, _)) | Some((Templated::Step5(_), _, _)) => tools::ToolSyntax::QwenXml,
         Some((Templated::Kimi(_), _, _)) => tools::ToolSyntax::KimiXtml,
+        Some((Templated::MiniMaxM3(_), _, _)) => tools::ToolSyntax::MiniMaxM3,
         None => tools::ToolSyntax::Dsml,
     };
     let tool_constraints = tools::ToolConstraints::new(&converted.conversation.tools,
         converted.conversation.tool_choice, selection.required, parallel,
         assistance || response_format.as_ref().is_some_and(|v| v["type"] != "text"), syntax).map_err(Rejection::bad)?;
-    let constraint = match profile.encoding.think_close_token_id() {
+    let constraint = if matches!(profile.encoding, ModelEncoding::MiniMaxM3(_)) {
+        minimax_m3::grammar::response(response_format.clone(), converted.conversation.thinking_mode, tool_constraints.as_ref())
+    } else { match profile.encoding.think_close_token_id() {
         Some(token) => constraints::response_constraint(response_format.clone(), converted.conversation.thinking_mode,
             tool_constraints.as_ref(), token),
         None => constraints::kimi_response_constraint(response_format.clone(), converted.conversation.thinking_mode,
             tool_constraints.as_ref()),
-    }.map_err(Rejection::bad)?;
+    }}.map_err(Rejection::bad)?;
     let validator = tools::CompletionValidator::new(response_validator, tool_constraints);
     let tools_declared = !converted.conversation.tools.is_empty();
     let stop_token_ids = profile.stop_token_ids(tools_declared);
@@ -901,6 +923,16 @@ pub(crate) fn build(profile: &ModelProfile, limits: NativeLimits, headers: &axum
                 tools: tools_declared.then(|| converted.conversation.tools.clone()),
                 stop_sequences: converted.parsing_options.stop_sequences.clone(), id: id.clone() });
             (prompt, Vec::new(), OutputProcessor::Glm(glm5::GlmStreamProcessor::new(generator, parser)))
+        }
+        Some((Templated::MiniMaxM3(encoding), mut raw, _thinking)) => {
+            raw["response_format"] = response_format.unwrap_or(Value::Null);
+            let names = converted.conversation.tools.iter().map(|t| t.name.clone()).collect::<Vec<_>>();
+            let prompt = encoding.render(&raw, &names).map_err(Rejection::bad)?;
+            let parser = minimax_m3::MiniMaxOutputParser::new(minimax_m3::MiniMaxParserOptions {
+                tools: (tools_declared && converted.conversation.tool_choice != deepseek_recipe_core::tools::ToolChoice::None)
+                    .then(|| converted.conversation.tools.clone()),
+                stop_sequences: converted.parsing_options.stop_sequences.clone() });
+            (prompt, Vec::new(), OutputProcessor::MiniMaxM3(glm5::GlmStreamProcessor::new(generator, parser)))
         }
         Some((Templated::Step5(encoding), raw, _thinking)) => {
             let tool_choice = match (selection.name(), selection.required) {

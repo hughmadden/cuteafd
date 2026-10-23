@@ -93,7 +93,7 @@ pub(crate) fn system_placement(profile: &ModelProfile) -> SystemPlacement {
             reasoning_effort: None, tool_names: Vec::new(), tool_choice: super::glm5::GlmToolChoice::Auto, response_format: None }).is_err(),
         ModelEncoding::Step5(encoding) => encoding.render(&body, &super::step5::Step5PromptOptions {
             tool_names: Vec::new(), tool_choice: super::step5::Step5ToolChoice::Auto, response_format: None }).is_err(),
-        ModelEncoding::DeepseekV4 | ModelEncoding::DeepseekV41 | ModelEncoding::Kimi(_) => false,
+        ModelEncoding::DeepseekV4 | ModelEncoding::DeepseekV41 | ModelEncoding::Kimi(_) | ModelEncoding::MiniMaxM3(_) => false,
     };
     if rejects { SystemPlacement::FirstOnly } else { SystemPlacement::Anywhere }
 }
@@ -422,6 +422,11 @@ fn chat_body_with(turn: &TurnRequest, profile: &ModelProfile, names: &ToolNames,
             if enabled { if let Some(e) = effort.filter(|e| !matches!(*e, "none")) { body["reasoning_effort"] = json!(e); } }
         }
         None => if let Some(e) = effort { body["reasoning_effort"] = json!(e); },
+    }
+    if matches!(profile.encoding, ModelEncoding::MiniMaxM3(_)) && effort.is_none() && turn.reasoning.enabled != Some(false) {
+        if let Some(budget) = turn.reasoning.budget_tokens {
+            body["reasoning_effort"] = json!(super::minimax_m3::prompt::budget_effort(budget));
+        }
     }
     if let Some(max) = turn.max_output_tokens { body["max_tokens"] = json!(max); }
     if let Some(t) = turn.sampling.temperature { body["temperature"] = json!(t); }

@@ -1,0 +1,814 @@
+[
+ {
+  "name": "single_user",
+  "context": {
+   "add_generation_prompt": true,
+   "messages": [
+    {
+     "role": "user",
+     "content": "What is 2 + 2?"
+    }
+   ]
+  },
+  "expected": "]~!b[]~b]system\nYour model version is MiniMax-M3.1, developed by MiniMax. Knowledge cutoff: January 2026. Founded in early 2022, MiniMax is a global AI foundation model company committed to advancing the frontiers of AI towards AGI.\n\n<thinking_instructions>\nYou have a thinking capability that allows you to reason step by step before responding. When thinking is enabled, wrap your reasoning in <mm:think></mm:think> tags before your response. When thinking is disabled, begin your response directly after the </mm:think> prefix. When thinking is adaptive, decide on your own whether to think for the current turn.\nCurrent thinking mode: adaptive. You are encouraged to think for complex decision-making, multi-step reasoning, or when analyzing function/tool results.\n</thinking_instructions>\n\n<model_id>8bb8149fe</model_id>[e~[\n]~b]developer\nYou are a helpful assistant.[e~[\n]~b]user\nWhat is 2 + 2?[e~[\n]~b]ai\n"
+ },
+ {
+  "name": "system_user",
+  "context": {
+   "add_generation_prompt": true,
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are terse."
+    },
+    {
+     "role": "user",
+     "content": "What is 2 + 2?"
+    }
+   ]
+  },
+  "expected": "]~!b[]~b]system\nYour model version is MiniMax-M3.1, developed by MiniMax. Knowledge cutoff: January 2026. Founded in early 2022, MiniMax is a global AI foundation model company committed to advancing the frontiers of AI towards AGI.\n\n<thinking_instructions>\nYou have a thinking capability that allows you to reason step by step before responding. When thinking is enabled, wrap your reasoning in <mm:think></mm:think> tags before your response. When thinking is disabled, begin your response directly after the </mm:think> prefix. When thinking is adaptive, decide on your own whether to think for the current turn.\nCurrent thinking mode: adaptive. You are encouraged to think for complex decision-making, multi-step reasoning, or when analyzing function/tool results.\n</thinking_instructions>\n\n<model_id>8bb8149fe</model_id>[e~[\n]~b]developer\nYou are terse.[e~[\n]~b]user\nWhat is 2 + 2?[e~[\n]~b]ai\n"
+ },
+ {
+  "name": "developer_user",
+  "context": {
+   "add_generation_prompt": true,
+   "messages": [
+    {
+     "role": "developer",
+     "content": "Answer in French."
+    },
+    {
+     "role": "user",
+     "content": "What is 2 + 2?"
+    }
+   ]
+  },
+  "expected": "]~!b[]~b]system\nYour model version is MiniMax-M3.1, developed by MiniMax. Knowledge cutoff: January 2026. Founded in early 2022, MiniMax is a global AI foundation model company committed to advancing the frontiers of AI towards AGI.\n\n<thinking_instructions>\nYou have a thinking capability that allows you to reason step by step before responding. When thinking is enabled, wrap your reasoning in <mm:think></mm:think> tags before your response. When thinking is disabled, begin your response directly after the </mm:think> prefix. When thinking is adaptive, decide on your own whether to think for the current turn.\nCurrent thinking mode: adaptive. You are encouraged to think for complex decision-making, multi-step reasoning, or when analyzing function/tool results.\n</thinking_instructions>\n\n<model_id>8bb8149fe</model_id>[e~[\n]~b]developer\nAnswer in French.[e~[\n]~b]user\nWhat is 2 + 2?[e~[\n]~b]ai\n"
+ },
+ {
+  "name": "root_and_system",
+  "context": {
+   "add_generation_prompt": true,
+   "messages": [
+    {
+     "role": "root",
+     "content": "Platform rules.",
+     "current_date": "2026-10-23",
+     "current_location": "Paris"
+    },
+    {
+     "role": "system",
+     "content": "You are terse."
+    },
+    {
+     "role": "user",
+     "content": "What is 2 + 2?"
+    }
+   ]
+  },
+  "expected": "]~!b[]~b]system\nPlatform rules.\nCurrent date: 2026-10-23\nCurrent location: Paris\n\n<thinking_instructions>\nYou have a thinking capability that allows you to reason step by step before responding. When thinking is enabled, wrap your reasoning in <mm:think></mm:think> tags before your response. When thinking is disabled, begin your response directly after the </mm:think> prefix. When thinking is adaptive, decide on your own whether to think for the current turn.\nCurrent thinking mode: adaptive. You are encouraged to think for complex decision-making, multi-step reasoning, or when analyzing function/tool results.\n</thinking_instructions>\n\n<model_id>8bb8149fe</model_id>[e~[\n]~b]developer\nYou are terse.[e~[\n]~b]user\nWhat is 2 + 2?[e~[\n]~b]ai\n"
+ },
+ {
+  "name": "root_only",
+  "context": {
+   "add_generation_prompt": true,
+   "messages": [
+    {
+     "role": "root",
+     "content": "Platform rules."
+    },
+    {
+     "role": "user",
+     "content": "What is 2 + 2?"
+    }
+   ]
+  },
+  "expected": "]~!b[]~b]system\nPlatform rules.\n\n<thinking_instructions>\nYou have a thinking capability that allows you to reason step by step before responding. When thinking is enabled, wrap your reasoning in <mm:think></mm:think> tags before your response. When thinking is disabled, begin your response directly after the </mm:think> prefix. When thinking is adaptive, decide on your own whether to think for the current turn.\nCurrent thinking mode: adaptive. You are encouraged to think for complex decision-making, multi-step reasoning, or when analyzing function/tool results.\n</thinking_instructions>\n\n<model_id>8bb8149fe</model_id>[e~[\n]~b]developer\nYou are a helpful assistant.[e~[\n]~b]user\nWhat is 2 + 2?[e~[\n]~b]ai\n"
+ },
+ {
+  "name": "model_identity_kwarg",
+  "context": {
+   "add_generation_prompt": true,
+   "messages": [
+    {
+     "role": "user",
+     "content": "What is 2 + 2?"
+    }
+   ],
+   "model_identity": "You are Sol."
+  },
+  "expected": "]~!b[]~b]system\nYour model version is MiniMax-M3.1, developed by MiniMax. Knowledge cutoff: January 2026. Founded in early 2022, MiniMax is a global AI foundation model company committed to advancing the frontiers of AI towards AGI.\n\n<thinking_instructions>\nYou have a thinking capability that allows you to reason step by step before responding. When thinking is enabled, wrap your reasoning in <mm:think></mm:think> tags before your response. When thinking is disabled, begin your response directly after the </mm:think> prefix. When thinking is adaptive, decide on your own whether to think for the current turn.\nCurrent thinking mode: adaptive. You are encouraged to think for complex decision-making, multi-step reasoning, or when analyzing function/tool results.\n</thinking_instructions>\n\n<model_id>8bb8149fe</model_id>[e~[\n]~b]developer\nYou are Sol.[e~[\n]~b]user\nWhat is 2 + 2?[e~[\n]~b]ai\n"
+ },
+ {
+  "name": "effort_kwarg",
+  "context": {
+   "add_generation_prompt": true,
+   "messages": [
+    {
+     "role": "user",
+     "content": "What is 2 + 2?"
+    }
+   ],
+   "effort": "high"
+  },
+  "expected": "]~!b[]~b]system\nYour model version is MiniMax-M3.1, developed by MiniMax. Knowledge cutoff: January 2026. Founded in early 2022, MiniMax is a global AI foundation model company committed to advancing the frontiers of AI towards AGI.\n\n<thinking_instructions>\nYou have a thinking capability that allows you to reason step by step before responding. When thinking is enabled, wrap your reasoning in <mm:think></mm:think> tags before your response. When thinking is disabled, begin your response directly after the </mm:think> prefix. When thinking is adaptive, decide on your own whether to think for the current turn.\nCurrent thinking mode: adaptive. You are encouraged to think for complex decision-making, multi-step reasoning, or when analyzing function/tool results.\n</thinking_instructions>\n\n<model_id>8bb8149fe</model_id>\n\n<effort>high</effort>[e~[\n]~b]developer\nYou are a helpful assistant.[e~[\n]~b]user\nWhat is 2 + 2?[e~[\n]~b]ai\n"
+ },
+ {
+  "name": "multi_turn_earlier_reasoning",
+  "context": {
+   "add_generation_prompt": true,
+   "messages": [
+    {
+     "role": "user",
+     "content": "Pick a number."
+    },
+    {
+     "role": "assistant",
+     "content": " 7 ",
+     "reasoning_content": "Any number works."
+    },
+    {
+     "role": "user",
+     "content": "Another?"
+    },
+    {
+     "role": "assistant",
+     "content": "Nine.",
+     "reasoning_content": ""
+    },
+    {
+     "role": "user",
+     "content": "And one more?"
+    },
+    {
+     "role": "assistant",
+     "content": "Eleven."
+    },
+    {
+     "role": "user",
+     "content": "Thanks."
+    }
+   ]
+  },
+  "expected": "]~!b[]~b]system\nYour model version is MiniMax-M3.1, developed by MiniMax. Knowledge cutoff: January 2026. Founded in early 2022, MiniMax is a global AI foundation model company committed to advancing the frontiers of AI towards AGI.\n\n<thinking_instructions>\nYou have a thinking capability that allows you to reason step by step before responding. When thinking is enabled, wrap your reasoning in <mm:think></mm:think> tags before your response. When thinking is disabled, begin your response directly after the </mm:think> prefix. When thinking is adaptive, decide on your own whether to think for the current turn.\nCurrent thinking mode: adaptive. You are encouraged to think for complex decision-making, multi-step reasoning, or when analyzing function/tool results.\n</thinking_instructions>\n\n<model_id>8bb8149fe</model_id>[e~[\n]~b]developer\nYou are a helpful assistant.[e~[\n]~b]user\nPick a number.[e~[\n]~b]ai\n<mm:think>Any number works.</mm:think> 7 [e~[\n]~b]user\nAnother?[e~[\n]~b]ai\n</mm:think>Nine.[e~[\n]~b]user\nAnd one more?[e~[\n]~b]ai\n</mm:think>Eleven.[e~[\n]~b]user\nThanks.[e~[\n]~b]ai\n"
+ },
+ {
+  "name": "inline_think_in_content",
+  "context": {
+   "add_generation_prompt": true,
+   "messages": [
+    {
+     "role": "user",
+     "content": "q"
+    },
+    {
+     "role": "assistant",
+     "content": "<mm:think>\nhidden\n</mm:think>\n\nvisible answer\n"
+    },
+    {
+     "role": "user",
+     "content": "q2"
+    },
+    {
+     "role": "assistant",
+     "content": "only closer</mm:think>\nanswer"
+    },
+    {
+     "role": "user",
+     "content": "q3"
+    }
+   ]
+  },
+  "expected": "]~!b[]~b]system\nYour model version is MiniMax-M3.1, developed by MiniMax. Knowledge cutoff: January 2026. Founded in early 2022, MiniMax is a global AI foundation model company committed to advancing the frontiers of AI towards AGI.\n\n<thinking_instructions>\nYou have a thinking capability that allows you to reason step by step before responding. When thinking is enabled, wrap your reasoning in <mm:think></mm:think> tags before your response. When thinking is disabled, begin your response directly after the </mm:think> prefix. When thinking is adaptive, decide on your own whether to think for the current turn.\nCurrent thinking mode: adaptive. You are encouraged to think for complex decision-making, multi-step reasoning, or when analyzing function/tool results.\n</thinking_instructions>\n\n<model_id>8bb8149fe</model_id>[e~[\n]~b]developer\nYou are a helpful assistant.[e~[\n]~b]user\nq[e~[\n]~b]ai\n<mm:think>hidden</mm:think>visible answer[e~[\n]~b]user\nq2[e~[\n]~b]ai\n<mm:think>only closer</mm:think>answer[e~[\n]~b]user\nq3[e~[\n]~b]ai\n"
+ },
+ {
+  "name": "mid_conversation_system",
+  "context": {
+   "add_generation_prompt": true,
+   "messages": [
+    {
+     "role": "user",
+     "content": "What is 2 + 2?"
+    },
+    {
+     "role": "assistant",
+     "content": "4"
+    },
+    {
+     "role": "system",
+     "content": "Now be verbose."
+    },
+    {
+     "role": "user",
+     "content": "And 3 + 3?"
+    }
+   ]
+  },
+  "expected": "]~!b[]~b]system\nYour model version is MiniMax-M3.1, developed by MiniMax. Knowledge cutoff: January 2026. Founded in early 2022, MiniMax is a global AI foundation model company committed to advancing the frontiers of AI towards AGI.\n\n<thinking_instructions>\nYou have a thinking capability that allows you to reason step by step before responding. When thinking is enabled, wrap your reasoning in <mm:think></mm:think> tags before your response. When thinking is disabled, begin your response directly after the </mm:think> prefix. When thinking is adaptive, decide on your own whether to think for the current turn.\nCurrent thinking mode: adaptive. You are encouraged to think for complex decision-making, multi-step reasoning, or when analyzing function/tool results.\n</thinking_instructions>\n\n<model_id>8bb8149fe</model_id>[e~[\n]~b]developer\nYou are a helpful assistant.[e~[\n]~b]user\nWhat is 2 + 2?[e~[\n]~b]ai\n</mm:think>4[e~[\n]~b]developer\nNow be verbose.[e~[\n]~b]user\nAnd 3 + 3?[e~[\n]~b]ai\n"
+ },
+ {
+  "name": "images_and_videos",
+  "context": {
+   "add_generation_prompt": true,
+   "messages": [
+    {
+     "role": "system",
+     "content": [
+      {
+       "type": "text",
+       "text": "sys "
+      },
+      {
+       "type": "text",
+       "text": "parts"
+      }
+     ]
+    },
+    {
+     "role": "user",
+     "content": [
+      {
+       "type": "text",
+       "text": "Look: "
+      },
+      {
+       "type": "image",
+       "image": "a.png"
+      },
+      {
+       "type": "text",
+       "text": " and "
+      },
+      {
+       "type": "video",
+       "video": "b.mp4"
+      },
+      {
+       "type": "image",
+       "image": "c.png"
+      },
+      {
+       "type": "text",
+       "text": " describe."
+      }
+     ]
+    }
+   ]
+  },
+  "expected": "]~!b[]~b]system\nYour model version is MiniMax-M3.1, developed by MiniMax. Knowledge cutoff: January 2026. Founded in early 2022, MiniMax is a global AI foundation model company committed to advancing the frontiers of AI towards AGI.\n\n<thinking_instructions>\nYou have a thinking capability that allows you to reason step by step before responding. When thinking is enabled, wrap your reasoning in <mm:think></mm:think> tags before your response. When thinking is disabled, begin your response directly after the </mm:think> prefix. When thinking is adaptive, decide on your own whether to think for the current turn.\nCurrent thinking mode: adaptive. You are encouraged to think for complex decision-making, multi-step reasoning, or when analyzing function/tool results.\n</thinking_instructions>\n\n<model_id>8bb8149fe</model_id>[e~[\n]~b]developer\nsys parts[e~[\n]~b]user\nLook: ]<]image[>[ and ]<]video[>[]<]image[>[ describe.[e~[\n]~b]ai\n"
+ },
+ {
+  "name": "tools_declared",
+  "context": {
+   "add_generation_prompt": true,
+   "messages": [
+    {
+     "role": "user",
+     "content": "Weather in Taipei?"
+    }
+   ],
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "get_weather",
+      "description": "Current weather for a city (°C).",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "city": {
+         "type": "string",
+         "description": "City name, e.g. 台北"
+        },
+        "days": {
+         "type": "integer",
+         "minimum": 1
+        },
+        "units": {
+         "type": "string",
+         "enum": [
+          "c",
+          "f"
+         ]
+        }
+       },
+       "required": [
+        "city"
+       ]
+      }
+     }
+    },
+    {
+     "type": "function",
+     "function": {
+      "name": "refresh"
+     }
+    },
+    {
+     "type": "function",
+     "function": {
+      "name": "write_file",
+      "description": "Write \"text\" to a path.\nOverwrites.",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "path": {
+         "type": "string"
+        },
+        "text": {
+         "type": "string"
+        },
+        "mode": {
+         "type": "object",
+         "properties": {
+          "append": {
+           "type": "boolean"
+          }
+         }
+        },
+        "tags": {
+         "type": "array",
+         "items": {
+          "type": "string"
+         }
+        }
+       },
+       "required": [
+        "path",
+        "text"
+       ],
+       "additionalProperties": false
+      }
+     }
+    }
+   ]
+  },
+  "expected": "]~!b[]~b]system\nYour model version is MiniMax-M3.1, developed by MiniMax. Knowledge cutoff: January 2026. Founded in early 2022, MiniMax is a global AI foundation model company committed to advancing the frontiers of AI towards AGI.\n\n<thinking_instructions>\nYou have a thinking capability that allows you to reason step by step before responding. When thinking is enabled, wrap your reasoning in <mm:think></mm:think> tags before your response. When thinking is disabled, begin your response directly after the </mm:think> prefix. When thinking is adaptive, decide on your own whether to think for the current turn.\nCurrent thinking mode: adaptive. You are encouraged to think for complex decision-making, multi-step reasoning, or when analyzing function/tool results.\n</thinking_instructions>\n\n<model_id>8bb8149fe</model_id>[e~[\n]~b]developer\nYou are a helpful assistant.\n\n# Tools\nYou may call one or more tools to assist with the user query.\nHere are the tools available in JSONSchema format:\n\n<tools>\n<tool>{\"name\": \"get_weather\", \"description\": \"Current weather for a city (°C).\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City name, e.g. 台北\"}, \"days\": {\"type\": \"integer\", \"minimum\": 1}, \"units\": {\"type\": \"string\", \"enum\": [\"c\", \"f\"]}}, \"required\": [\"city\"]}}</tool>\n<tool>{\"name\": \"refresh\"}</tool>\n<tool>{\"name\": \"write_file\", \"description\": \"Write \\\"text\\\" to a path.\\nOverwrites.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"path\": {\"type\": \"string\"}, \"text\": {\"type\": \"string\"}, \"mode\": {\"type\": \"object\", \"properties\": {\"append\": {\"type\": \"boolean\"}}}, \"tags\": {\"type\": \"array\", \"items\": {\"type\": \"string\"}}}, \"required\": [\"path\", \"text\"], \"additionalProperties\": false}}</tool>\n</tools>\n\nTo call tools, wrap all invocations in a single ]<]minimax[>[<tool_call>]<]minimax[>[</tool_call> block. Parameter values containing nested objects or arrays are recursively expanded into XML elements. Example:\n\n]<]minimax[>[<tool_call>\n]<]minimax[>[<invoke name=\"tool-name-1\">]<]minimax[>[<param-1>value-1]<]minimax[>[</param-1>]<]minimax[>[<param-2>]<]minimax[>[<item>]<]minimax[>[<key-a>val-a]<]minimax[>[</key-a>]<]minimax[>[<key-b>val-b]<]minimax[>[</key-b>]<]minimax[>[</item>]<]minimax[>[</param-2>]<]minimax[>[</invoke>\n]<]minimax[>[<invoke name=\"tool-name-2\">]<]minimax[>[<param-1>value-1]<]minimax[>[</param-1>]<]minimax[>[</invoke>\n]<]minimax[>[</tool_call>[e~[\n]~b]user\nWeather in Taipei?[e~[\n]~b]ai\n"
+ },
+ {
+  "name": "tool_round_trip",
+  "context": {
+   "add_generation_prompt": true,
+   "messages": [
+    {
+     "role": "system",
+     "content": "Use tools when helpful."
+    },
+    {
+     "role": "user",
+     "content": "Weather in Taipei and Oslo, then save it."
+    },
+    {
+     "role": "assistant",
+     "content": "",
+     "reasoning_content": "Two lookups.",
+     "tool_calls": [
+      {
+       "id": "call_a",
+       "type": "function",
+       "function": {
+        "name": "get_weather",
+        "arguments": {
+         "city": "Taipei",
+         "days": 2,
+         "units": "c"
+        }
+       }
+      },
+      {
+       "id": "call_b",
+       "type": "function",
+       "function": {
+        "name": "get_weather",
+        "arguments": {
+         "city": "Oslo",
+         "days": 1
+        }
+       }
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "tool_call_id": "call_a",
+     "content": "{\"temp\": 31}"
+    },
+    {
+     "role": "tool",
+     "tool_call_id": "call_b",
+     "content": "{\"temp\": -3}"
+    },
+    {
+     "role": "assistant",
+     "content": "Saving.",
+     "tool_calls": [
+      {
+       "id": "call_c",
+       "type": "function",
+       "function": {
+        "name": "write_file",
+        "arguments": {
+         "path": "/tmp/w.txt",
+         "text": "Taipei 31 \"hot\"\nOslo -3 ❄ <b>&</b>",
+         "mode": {
+          "append": false
+         },
+         "tags": [
+          "天气",
+          "weather"
+         ]
+        }
+       }
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "tool_call_id": "call_c",
+     "content": [
+      {
+       "type": "text",
+       "text": "ok"
+      }
+     ]
+    },
+    {
+     "role": "assistant",
+     "content": "Done: Taipei 31°C, Oslo -3°C.",
+     "reasoning_content": "Report."
+    },
+    {
+     "role": "user",
+     "content": "Thanks, and now Paris?"
+    }
+   ],
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "get_weather",
+      "description": "Current weather for a city (°C).",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "city": {
+         "type": "string",
+         "description": "City name, e.g. 台北"
+        },
+        "days": {
+         "type": "integer",
+         "minimum": 1
+        },
+        "units": {
+         "type": "string",
+         "enum": [
+          "c",
+          "f"
+         ]
+        }
+       },
+       "required": [
+        "city"
+       ]
+      }
+     }
+    },
+    {
+     "type": "function",
+     "function": {
+      "name": "write_file",
+      "description": "Write \"text\" to a path.\nOverwrites.",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "path": {
+         "type": "string"
+        },
+        "text": {
+         "type": "string"
+        },
+        "mode": {
+         "type": "object",
+         "properties": {
+          "append": {
+           "type": "boolean"
+          }
+         }
+        },
+        "tags": {
+         "type": "array",
+         "items": {
+          "type": "string"
+         }
+        }
+       },
+       "required": [
+        "path",
+        "text"
+       ],
+       "additionalProperties": false
+      }
+     }
+    }
+   ],
+   "reasoning_effort": "high"
+  },
+  "expected": "]~!b[]~b]system\nYour model version is MiniMax-M3.1, developed by MiniMax. Knowledge cutoff: January 2026. Founded in early 2022, MiniMax is a global AI foundation model company committed to advancing the frontiers of AI towards AGI.\n\n<thinking_instructions>\nYou have a thinking capability that allows you to reason step by step before responding. When thinking is enabled, wrap your reasoning in <mm:think></mm:think> tags before your response. When thinking is disabled, begin your response directly after the </mm:think> prefix. When thinking is adaptive, decide on your own whether to think for the current turn.\nCurrent thinking mode: adaptive. You are encouraged to think for complex decision-making, multi-step reasoning, or when analyzing function/tool results.\n</thinking_instructions>\n\n<model_id>8bb8149fe</model_id>\n\n<effort>high</effort>[e~[\n]~b]developer\nUse tools when helpful.\n\n# Tools\nYou may call one or more tools to assist with the user query.\nHere are the tools available in JSONSchema format:\n\n<tools>\n<tool>{\"name\": \"get_weather\", \"description\": \"Current weather for a city (°C).\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City name, e.g. 台北\"}, \"days\": {\"type\": \"integer\", \"minimum\": 1}, \"units\": {\"type\": \"string\", \"enum\": [\"c\", \"f\"]}}, \"required\": [\"city\"]}}</tool>\n<tool>{\"name\": \"write_file\", \"description\": \"Write \\\"text\\\" to a path.\\nOverwrites.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"path\": {\"type\": \"string\"}, \"text\": {\"type\": \"string\"}, \"mode\": {\"type\": \"object\", \"properties\": {\"append\": {\"type\": \"boolean\"}}}, \"tags\": {\"type\": \"array\", \"items\": {\"type\": \"string\"}}}, \"required\": [\"path\", \"text\"], \"additionalProperties\": false}}</tool>\n</tools>\n\nTo call tools, wrap all invocations in a single ]<]minimax[>[<tool_call>]<]minimax[>[</tool_call> block. Parameter values containing nested objects or arrays are recursively expanded into XML elements. Example:\n\n]<]minimax[>[<tool_call>\n]<]minimax[>[<invoke name=\"tool-name-1\">]<]minimax[>[<param-1>value-1]<]minimax[>[</param-1>]<]minimax[>[<param-2>]<]minimax[>[<item>]<]minimax[>[<key-a>val-a]<]minimax[>[</key-a>]<]minimax[>[<key-b>val-b]<]minimax[>[</key-b>]<]minimax[>[</item>]<]minimax[>[</param-2>]<]minimax[>[</invoke>\n]<]minimax[>[<invoke name=\"tool-name-2\">]<]minimax[>[<param-1>value-1]<]minimax[>[</param-1>]<]minimax[>[</invoke>\n]<]minimax[>[</tool_call>[e~[\n]~b]user\nWeather in Taipei and Oslo, then save it.[e~[\n]~b]ai\n<mm:think>Two lookups.</mm:think>]<]minimax[>[<tool_call>\n]<]minimax[>[<invoke name=\"get_weather\">]<]minimax[>[<city>Taipei]<]minimax[>[</city>]<]minimax[>[<days>2]<]minimax[>[</days>]<]minimax[>[<units>c]<]minimax[>[</units>]<]minimax[>[</invoke>\n]<]minimax[>[<invoke name=\"get_weather\">]<]minimax[>[<city>Oslo]<]minimax[>[</city>]<]minimax[>[<days>1]<]minimax[>[</days>]<]minimax[>[</invoke>\n]<]minimax[>[</tool_call>[e~[\n]~b]tool\n<response>{\"temp\": 31}</response>\n<response>{\"temp\": -3}</response>[e~[\n]~b]ai\n</mm:think>Saving.]<]minimax[>[<tool_call>\n]<]minimax[>[<invoke name=\"write_file\">]<]minimax[>[<path>/tmp/w.txt]<]minimax[>[</path>]<]minimax[>[<text>Taipei 31 \"hot\"\nOslo -3 ❄ <b>&</b>]<]minimax[>[</text>]<]minimax[>[<mode>]<]minimax[>[<append>false]<]minimax[>[</append>]<]minimax[>[</mode>]<]minimax[>[<tags>]<]minimax[>[<item>天气]<]minimax[>[</item>]<]minimax[>[<item>weather]<]minimax[>[</item>]<]minimax[>[</tags>]<]minimax[>[</invoke>\n]<]minimax[>[</tool_call>[e~[\n]~b]tool\n<response>ok</response>[e~[\n]~b]ai\n<mm:think>Report.</mm:think>Done: Taipei 31°C, Oslo -3°C.[e~[\n]~b]user\nThanks, and now Paris?[e~[\n]~b]ai\n"
+ },
+ {
+  "name": "tool_results_with_media",
+  "context": {
+   "add_generation_prompt": true,
+   "messages": [
+    {
+     "role": "user",
+     "content": "Refresh twice."
+    },
+    {
+     "role": "assistant",
+     "content": "",
+     "tool_calls": [
+      {
+       "id": "r1",
+       "type": "function",
+       "function": {
+        "name": "refresh",
+        "arguments": {}
+       }
+      },
+      {
+       "id": "r2",
+       "type": "function",
+       "function": {
+        "name": "refresh",
+        "arguments": {}
+       }
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "tool_call_id": "r1",
+     "content": [
+      {
+       "type": "text",
+       "text": "shot "
+      },
+      {
+       "type": "image",
+       "image": "x.png"
+      },
+      {
+       "type": "video",
+       "video": "y.mp4"
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "tool_call_id": "r2",
+     "content": ""
+    },
+    {
+     "role": "user",
+     "content": "Again."
+    }
+   ],
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "refresh"
+     }
+    }
+   ]
+  },
+  "expected": "]~!b[]~b]system\nYour model version is MiniMax-M3.1, developed by MiniMax. Knowledge cutoff: January 2026. Founded in early 2022, MiniMax is a global AI foundation model company committed to advancing the frontiers of AI towards AGI.\n\n<thinking_instructions>\nYou have a thinking capability that allows you to reason step by step before responding. When thinking is enabled, wrap your reasoning in <mm:think></mm:think> tags before your response. When thinking is disabled, begin your response directly after the </mm:think> prefix. When thinking is adaptive, decide on your own whether to think for the current turn.\nCurrent thinking mode: adaptive. You are encouraged to think for complex decision-making, multi-step reasoning, or when analyzing function/tool results.\n</thinking_instructions>\n\n<model_id>8bb8149fe</model_id>[e~[\n]~b]developer\nYou are a helpful assistant.\n\n# Tools\nYou may call one or more tools to assist with the user query.\nHere are the tools available in JSONSchema format:\n\n<tools>\n<tool>{\"name\": \"refresh\"}</tool>\n</tools>\n\nTo call tools, wrap all invocations in a single ]<]minimax[>[<tool_call>]<]minimax[>[</tool_call> block. Parameter values containing nested objects or arrays are recursively expanded into XML elements. Example:\n\n]<]minimax[>[<tool_call>\n]<]minimax[>[<invoke name=\"tool-name-1\">]<]minimax[>[<param-1>value-1]<]minimax[>[</param-1>]<]minimax[>[<param-2>]<]minimax[>[<item>]<]minimax[>[<key-a>val-a]<]minimax[>[</key-a>]<]minimax[>[<key-b>val-b]<]minimax[>[</key-b>]<]minimax[>[</item>]<]minimax[>[</param-2>]<]minimax[>[</invoke>\n]<]minimax[>[<invoke name=\"tool-name-2\">]<]minimax[>[<param-1>value-1]<]minimax[>[</param-1>]<]minimax[>[</invoke>\n]<]minimax[>[</tool_call>[e~[\n]~b]user\nRefresh twice.[e~[\n]~b]ai\n</mm:think>]<]minimax[>[<tool_call>\n]<]minimax[>[<invoke name=\"refresh\">]<]minimax[>[</invoke>\n]<]minimax[>[<invoke name=\"refresh\">]<]minimax[>[</invoke>\n]<]minimax[>[</tool_call>[e~[\n]~b]tool\n<response>shot ]<]image[>[]<]video[>[</response>\n<response></response>[e~[\n]~b]user\nAgain.[e~[\n]~b]ai\n"
+ },
+ {
+  "name": "tool_without_prior_call_raises",
+  "context": {
+   "add_generation_prompt": true,
+   "messages": [
+    {
+     "role": "user",
+     "content": "x"
+    },
+    {
+     "role": "tool",
+     "tool_call_id": "z",
+     "content": "orphan"
+    }
+   ]
+  },
+  "error": "Message has tool role, but there was no previous assistant message with a tool call!"
+ },
+ {
+  "name": "arguments_nesting_and_scalars",
+  "context": {
+   "add_generation_prompt": true,
+   "messages": [
+    {
+     "role": "user",
+     "content": "Numbers"
+    },
+    {
+     "role": "assistant",
+     "content": "",
+     "tool_calls": [
+      {
+       "id": "n1",
+       "type": "function",
+       "function": {
+        "name": "calc",
+        "arguments": {
+         "a": 1e+16,
+         "b": 1.5e-05,
+         "c": 0.0001,
+         "d": -0.0,
+         "e": 123456789.125,
+         "f": 12345678901234567890,
+         "g": null,
+         "h": [
+          1,
+          2.5,
+          "x\ty\u0001 "
+         ],
+         "i": {
+          "k": "💡",
+          "z": null,
+          "t": true,
+          "f": false
+         },
+         "j": [
+          [
+           1,
+           2
+          ],
+          {
+           "deep": [
+            null,
+            "v"
+           ]
+          }
+         ],
+         "k": [],
+         "l": {},
+         "m": "plain & <tag>"
+        }
+       }
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "tool_call_id": "n1",
+     "content": "ok"
+    }
+   ]
+  },
+  "expected": "]~!b[]~b]system\nYour model version is MiniMax-M3.1, developed by MiniMax. Knowledge cutoff: January 2026. Founded in early 2022, MiniMax is a global AI foundation model company committed to advancing the frontiers of AI towards AGI.\n\n<thinking_instructions>\nYou have a thinking capability that allows you to reason step by step before responding. When thinking is enabled, wrap your reasoning in <mm:think></mm:think> tags before your response. When thinking is disabled, begin your response directly after the </mm:think> prefix. When thinking is adaptive, decide on your own whether to think for the current turn.\nCurrent thinking mode: adaptive. You are encouraged to think for complex decision-making, multi-step reasoning, or when analyzing function/tool results.\n</thinking_instructions>\n\n<model_id>8bb8149fe</model_id>[e~[\n]~b]developer\nYou are a helpful assistant.[e~[\n]~b]user\nNumbers[e~[\n]~b]ai\n</mm:think>]<]minimax[>[<tool_call>\n]<]minimax[>[<invoke name=\"calc\">]<]minimax[>[<a>1e+16]<]minimax[>[</a>]<]minimax[>[<b>1.5e-05]<]minimax[>[</b>]<]minimax[>[<c>0.0001]<]minimax[>[</c>]<]minimax[>[<d>-0.0]<]minimax[>[</d>]<]minimax[>[<e>123456789.125]<]minimax[>[</e>]<]minimax[>[<f>12345678901234567890]<]minimax[>[</f>]<]minimax[>[<h>]<]minimax[>[<item>1]<]minimax[>[</item>]<]minimax[>[<item>2.5]<]minimax[>[</item>]<]minimax[>[<item>x\ty\u0001 ]<]minimax[>[</item>]<]minimax[>[</h>]<]minimax[>[<i>]<]minimax[>[<k>💡]<]minimax[>[</k>]<]minimax[>[<t>true]<]minimax[>[</t>]<]minimax[>[<f>false]<]minimax[>[</f>]<]minimax[>[</i>]<]minimax[>[<j>]<]minimax[>[<item>]<]minimax[>[<item>1]<]minimax[>[</item>]<]minimax[>[<item>2]<]minimax[>[</item>]<]minimax[>[</item>]<]minimax[>[<item>]<]minimax[>[<deep>]<]minimax[>[<item>]<]minimax[>[</item>]<]minimax[>[<item>v]<]minimax[>[</item>]<]minimax[>[</deep>]<]minimax[>[</item>]<]minimax[>[</j>]<]minimax[>[<k>]<]minimax[>[</k>]<]minimax[>[<l>]<]minimax[>[</l>]<]minimax[>[<m>plain & <tag>]<]minimax[>[</m>]<]minimax[>[</invoke>\n]<]minimax[>[</tool_call>[e~[\n]~b]tool\n<response>ok</response>[e~[\n]~b]ai\n"
+ },
+ {
+  "name": "string_content_items",
+  "context": {
+   "add_generation_prompt": true,
+   "messages": [
+    {
+     "role": "user",
+     "content": [
+      "raw ",
+      {
+       "type": "text",
+       "text": "mapped"
+      }
+     ]
+    }
+   ]
+  },
+  "expected": "]~!b[]~b]system\nYour model version is MiniMax-M3.1, developed by MiniMax. Knowledge cutoff: January 2026. Founded in early 2022, MiniMax is a global AI foundation model company committed to advancing the frontiers of AI towards AGI.\n\n<thinking_instructions>\nYou have a thinking capability that allows you to reason step by step before responding. When thinking is enabled, wrap your reasoning in <mm:think></mm:think> tags before your response. When thinking is disabled, begin your response directly after the </mm:think> prefix. When thinking is adaptive, decide on your own whether to think for the current turn.\nCurrent thinking mode: adaptive. You are encouraged to think for complex decision-making, multi-step reasoning, or when analyzing function/tool results.\n</thinking_instructions>\n\n<model_id>8bb8149fe</model_id>[e~[\n]~b]developer\nYou are a helpful assistant.[e~[\n]~b]user\nraw mapped[e~[\n]~b]ai\n"
+ },
+ {
+  "name": "no_generation_prompt",
+  "context": {
+   "messages": [
+    {
+     "role": "user",
+     "content": "What is 2 + 2?"
+    },
+    {
+     "role": "assistant",
+     "content": "4"
+    }
+   ],
+   "add_generation_prompt": false
+  },
+  "expected": "]~!b[]~b]system\nYour model version is MiniMax-M3.1, developed by MiniMax. Knowledge cutoff: January 2026. Founded in early 2022, MiniMax is a global AI foundation model company committed to advancing the frontiers of AI towards AGI.\n\n<thinking_instructions>\nYou have a thinking capability that allows you to reason step by step before responding. When thinking is enabled, wrap your reasoning in <mm:think></mm:think> tags before your response. When thinking is disabled, begin your response directly after the </mm:think> prefix. When thinking is adaptive, decide on your own whether to think for the current turn.\nCurrent thinking mode: adaptive. You are encouraged to think for complex decision-making, multi-step reasoning, or when analyzing function/tool results.\n</thinking_instructions>\n\n<model_id>8bb8149fe</model_id>[e~[\n]~b]developer\nYou are a helpful assistant.[e~[\n]~b]user\nWhat is 2 + 2?[e~[\n]~b]ai\n</mm:think>4[e~[\n"
+ },
+ {
+  "name": "effort_low",
+  "context": {
+   "add_generation_prompt": true,
+   "messages": [
+    {
+     "role": "system",
+     "content": "Be brief."
+    },
+    {
+     "role": "user",
+     "content": "What is 2 + 2?"
+    }
+   ],
+   "reasoning_effort": "low"
+  },
+  "expected": "]~!b[]~b]system\nYour model version is MiniMax-M3.1, developed by MiniMax. Knowledge cutoff: January 2026. Founded in early 2022, MiniMax is a global AI foundation model company committed to advancing the frontiers of AI towards AGI.\n\n<thinking_instructions>\nYou have a thinking capability that allows you to reason step by step before responding. When thinking is enabled, wrap your reasoning in <mm:think></mm:think> tags before your response. When thinking is disabled, begin your response directly after the </mm:think> prefix. When thinking is adaptive, decide on your own whether to think for the current turn.\nCurrent thinking mode: adaptive. You are encouraged to think for complex decision-making, multi-step reasoning, or when analyzing function/tool results.\n</thinking_instructions>\n\n<model_id>8bb8149fe</model_id>\n\n<effort>low</effort>[e~[\n]~b]developer\nBe brief.[e~[\n]~b]user\nWhat is 2 + 2?[e~[\n]~b]ai\n"
+ },
+ {
+  "name": "effort_medium",
+  "context": {
+   "add_generation_prompt": true,
+   "messages": [
+    {
+     "role": "system",
+     "content": "Be brief."
+    },
+    {
+     "role": "user",
+     "content": "What is 2 + 2?"
+    }
+   ],
+   "reasoning_effort": "medium"
+  },
+  "expected": "]~!b[]~b]system\nYour model version is MiniMax-M3.1, developed by MiniMax. Knowledge cutoff: January 2026. Founded in early 2022, MiniMax is a global AI foundation model company committed to advancing the frontiers of AI towards AGI.\n\n<thinking_instructions>\nYou have a thinking capability that allows you to reason step by step before responding. When thinking is enabled, wrap your reasoning in <mm:think></mm:think> tags before your response. When thinking is disabled, begin your response directly after the </mm:think> prefix. When thinking is adaptive, decide on your own whether to think for the current turn.\nCurrent thinking mode: adaptive. You are encouraged to think for complex decision-making, multi-step reasoning, or when analyzing function/tool results.\n</thinking_instructions>\n\n<model_id>8bb8149fe</model_id>\n\n<effort>medium</effort>[e~[\n]~b]developer\nBe brief.[e~[\n]~b]user\nWhat is 2 + 2?[e~[\n]~b]ai\n"
+ },
+ {
+  "name": "effort_high",
+  "context": {
+   "add_generation_prompt": true,
+   "messages": [
+    {
+     "role": "system",
+     "content": "Be brief."
+    },
+    {
+     "role": "user",
+     "content": "What is 2 + 2?"
+    }
+   ],
+   "reasoning_effort": "high"
+  },
+  "expected": "]~!b[]~b]system\nYour model version is MiniMax-M3.1, developed by MiniMax. Knowledge cutoff: January 2026. Founded in early 2022, MiniMax is a global AI foundation model company committed to advancing the frontiers of AI towards AGI.\n\n<thinking_instructions>\nYou have a thinking capability that allows you to reason step by step before responding. When thinking is enabled, wrap your reasoning in <mm:think></mm:think> tags before your response. When thinking is disabled, begin your response directly after the </mm:think> prefix. When thinking is adaptive, decide on your own whether to think for the current turn.\nCurrent thinking mode: adaptive. You are encouraged to think for complex decision-making, multi-step reasoning, or when analyzing function/tool results.\n</thinking_instructions>\n\n<model_id>8bb8149fe</model_id>\n\n<effort>high</effort>[e~[\n]~b]developer\nBe brief.[e~[\n]~b]user\nWhat is 2 + 2?[e~[\n]~b]ai\n"
+ },
+ {
+  "name": "effort_xhigh",
+  "context": {
+   "add_generation_prompt": true,
+   "messages": [
+    {
+     "role": "system",
+     "content": "Be brief."
+    },
+    {
+     "role": "user",
+     "content": "What is 2 + 2?"
+    }
+   ],
+   "reasoning_effort": "xhigh"
+  },
+  "expected": "]~!b[]~b]system\nYour model version is MiniMax-M3.1, developed by MiniMax. Knowledge cutoff: January 2026. Founded in early 2022, MiniMax is a global AI foundation model company committed to advancing the frontiers of AI towards AGI.\n\n<thinking_instructions>\nYou have a thinking capability that allows you to reason step by step before responding. When thinking is enabled, wrap your reasoning in <mm:think></mm:think> tags before your response. When thinking is disabled, begin your response directly after the </mm:think> prefix. When thinking is adaptive, decide on your own whether to think for the current turn.\nCurrent thinking mode: adaptive. You are encouraged to think for complex decision-making, multi-step reasoning, or when analyzing function/tool results.\n</thinking_instructions>\n\n<model_id>8bb8149fe</model_id>\n\n<effort>xhigh</effort>[e~[\n]~b]developer\nBe brief.[e~[\n]~b]user\nWhat is 2 + 2?[e~[\n]~b]ai\n"
+ },
+ {
+  "name": "effort_max",
+  "context": {
+   "add_generation_prompt": true,
+   "messages": [
+    {
+     "role": "system",
+     "content": "Be brief."
+    },
+    {
+     "role": "user",
+     "content": "What is 2 + 2?"
+    }
+   ],
+   "reasoning_effort": "max"
+  },
+  "expected": "]~!b[]~b]system\nYour model version is MiniMax-M3.1, developed by MiniMax. Knowledge cutoff: January 2026. Founded in early 2022, MiniMax is a global AI foundation model company committed to advancing the frontiers of AI towards AGI.\n\n<thinking_instructions>\nYou have a thinking capability that allows you to reason step by step before responding. When thinking is enabled, wrap your reasoning in <mm:think></mm:think> tags before your response. When thinking is disabled, begin your response directly after the </mm:think> prefix. When thinking is adaptive, decide on your own whether to think for the current turn.\nCurrent thinking mode: adaptive. You are encouraged to think for complex decision-making, multi-step reasoning, or when analyzing function/tool results.\n</thinking_instructions>\n\n<model_id>8bb8149fe</model_id>\n\n<effort>max</effort>[e~[\n]~b]developer\nBe brief.[e~[\n]~b]user\nWhat is 2 + 2?[e~[\n]~b]ai\n"
+ },
+ {
+  "name": "effort_and_kwarg_precedence",
+  "context": {
+   "add_generation_prompt": true,
+   "messages": [
+    {
+     "role": "user",
+     "content": "What is 2 + 2?"
+    }
+   ],
+   "reasoning_effort": "low",
+   "effort": "max"
+  },
+  "expected": "]~!b[]~b]system\nYour model version is MiniMax-M3.1, developed by MiniMax. Knowledge cutoff: January 2026. Founded in early 2022, MiniMax is a global AI foundation model company committed to advancing the frontiers of AI towards AGI.\n\n<thinking_instructions>\nYou have a thinking capability that allows you to reason step by step before responding. When thinking is enabled, wrap your reasoning in <mm:think></mm:think> tags before your response. When thinking is disabled, begin your response directly after the </mm:think> prefix. When thinking is adaptive, decide on your own whether to think for the current turn.\nCurrent thinking mode: adaptive. You are encouraged to think for complex decision-making, multi-step reasoning, or when analyzing function/tool results.\n</thinking_instructions>\n\n<model_id>8bb8149fe</model_id>\n\n<effort>low</effort>[e~[\n]~b]developer\nYou are a helpful assistant.[e~[\n]~b]user\nWhat is 2 + 2?[e~[\n]~b]ai\n"
+ }
+]
