@@ -69,7 +69,7 @@ pub struct V4WorkspaceRank {
     /// Everything except the pool-unit-sized C4 page tables.
     pub fixed_device_bytes: u64,
     pub prefill_waves: u64,
-    /// C4 page tables: one row/unit entry in each persistent workspace lane.
+    /// C4 page tables: one request list per prefill slot, one list per decode row.
     pub pool_unit_device_bytes: u64,
     /// Pinned router staging, reported outside GPU admission.
     pub pinned_host_bytes: u64,
@@ -194,13 +194,10 @@ pub fn deepseek_v4_workspace_geometry(
                 fixed_device_bytes: sum("V4 prefill/decode workspaces", &[prefill.0, decode.0])?,
                 pool_unit_device_bytes: sum(
                     "V4 prefill/decode table slope",
-                    &[prefill.1, decode.1],
+                    &[product("V4 prefill table slope", &[waves, 4])?, decode.1],
                 )?,
                 pinned_host_bytes: sum("V4 prefill/decode pinned staging", &[prefill.2, decode.2])?,
-                prefill_lane_table_unit_bytes: product(
-                    "V4 prefill table slope",
-                    &[prefill_rows, 4],
-                )?,
+                prefill_lane_table_unit_bytes: 4,
                 decode_lane_table_unit_bytes: product("V4 decode table slope", &[decode_rows, 4])?,
             })
         })
@@ -370,9 +367,9 @@ mod tests {
         };
         let flash =
             deepseek_v4_workspace_geometry(&config(false), 4096, 64, 131072, 2, 2, scratch).unwrap();
-        assert_eq!(flash[0].device_bytes(1032).unwrap(), 3_711_427_504);
-        assert_eq!(flash[1].device_bytes(1032).unwrap(), 3_364_218_800);
-        assert_eq!(flash[0].pool_unit_device_bytes, (4096 * 2 + 64) * 4);
+        assert_eq!(flash[0].device_bytes(1032).unwrap(), 3_677_619_184);
+        assert_eq!(flash[1].device_bytes(1032).unwrap(), 3_330_410_480);
+        assert_eq!(flash[0].pool_unit_device_bytes, (2 + 64) * 4);
         let pro = deepseek_v4_workspace_geometry(
             &config(true),
             4096,
@@ -386,8 +383,8 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!(pro[0].device_bytes(1032).unwrap(), 4_940_200_880);
-        assert_eq!(pro[1].device_bytes(1032).unwrap(), 4_320_362_416);
+        assert_eq!(pro[0].device_bytes(1032).unwrap(), 4_906_392_560);
+        assert_eq!(pro[1].device_bytes(1032).unwrap(), 4_286_554_096);
         assert_eq!(
             pro[0].device_bytes(1033).unwrap() - pro[0].device_bytes(1032).unwrap(),
             pro[0].pool_unit_device_bytes

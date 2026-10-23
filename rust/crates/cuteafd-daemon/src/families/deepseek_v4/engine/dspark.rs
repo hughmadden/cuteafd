@@ -112,7 +112,7 @@ impl<'a> Engine<'a> {
         let rows = draft_rows(requests.len(), block, self.cfg.dspark_block_size, self.decode_rows, inputs.len())?;
         let slot = &self.decode_workspace;
         if slot.borrow().is_none() {
-            *slot.borrow_mut() = Some(self.workspace(self.decode_rows, 1)?);
+            *slot.borrow_mut() = Some(self.workspace(self.decode_rows, 1, false)?);
         }
         let workspace = slot.borrow();
         let w = workspace.as_ref().context("workspace")?;

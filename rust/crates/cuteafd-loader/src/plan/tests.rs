@@ -1673,7 +1673,7 @@ fn v4_workspace_plan_matches_runtime_below_compiled_context() {
             let notes = layout.notes.clone();
             let device = layout.devices.remove(0);
             let steps = device.items.iter().find(|i| i.group == "steps").unwrap_or_else(|| panic!("{gib} {context}: {notes:?}"));
-            let intake = 2 * 2 * 4096 * cfg.dim as u64 * 2;
+            let intake = (2 * 4096 + 64) * 2 * cfg.dim as u64 * 2;
             assert_eq!((steps.bytes, steps.basis), (runtime[0].fixed_device_bytes + intake, Basis::Formula));
             let graph = crate::placement::families::deepseek_v4::GRAPH_BYTES[0];
             // The PRO envelope covers the measured loaded code as well (`V4Inputs::code_bytes`).

@@ -566,20 +566,66 @@ mod tests {
         s
     }
 
+    fn unit_schedule(layers: usize, local: usize, waves: usize, broadcast: bool) -> Result<Schedule> {
+        use crate::shared::prefill_pipeline::{self, FfnRoute, Step};
+        let routes: Vec<_> = (0..layers).map(|layer| if layer < local {
+            FfnRoute::Local
+        } else { FfnRoute::Spark }).collect();
+        let units = prefill_pipeline::sequence_units(6 * 4096, 4096, waves, layers)?;
+        let mut schedule = Schedule::default();
+        for step in prefill_pipeline::prefill_schedule(&routes, &units, waves)? {
+            match step {
+                Step::Begin { unit } => schedule.push(0, "entry", slot(0, false, units[unit].slot), "unit residual"),
+                Step::Attention { layer, unit } => {
+                    let lane = units[unit].slot;
+                    // UnitHooks queues rank 0, then rank 1 of this same layer.
+                    schedule.push(0, "attention", slot(layer, false, lane), "attention partial");
+                    schedule.wait(0, "attention", slot(layer, false, lane), "attention sum");
+                    if layer == 0 { schedule.wait(1, "entry", slot(0, false, lane), "unit residual"); }
+                    schedule.push(1, "attention", slot(layer, false, lane), "peer attention partial");
+                    schedule.wait(1, "attention", slot(layer, false, lane), "peer attention sum");
+                    if broadcast && layer < local {
+                        schedule.wait(1, "routes", 2 * lane + layer % 2, "canonical routes");
+                    }
+                    schedule.push(1, "ffn", slot(layer, true, lane), "peer FFN payload");
+                }
+                Step::Local { layer, unit } | Step::Land { layer, unit } => {
+                    let lane = units[unit].slot;
+                    if broadcast && layer < local {
+                        schedule.push(0, "routes", 2 * lane + layer % 2, "canonical routes");
+                    }
+                    if layer + 1 < layers {
+                        schedule.push(0, "ffn", slot(layer, true, lane), "FFN payload");
+                    }
+                    schedule.wait(0, "ffn", slot(layer, true, lane), "FFN sum");
+                    if layer + 1 < layers {
+                        schedule.wait(1, "ffn", slot(layer, true, lane), "peer FFN sum");
+                    }
+                }
+                Step::Commit { .. } => {
+                    schedule.push(1, "unit-commit", DIRECT, "peer final reader complete");
+                    schedule.wait(0, "unit-commit", DIRECT, "join peer before slot reuse");
+                }
+                Step::Send { .. } | Step::End { .. } => {}
+            }
+        }
+        Ok(schedule)
+    }
+
     #[test]
-    fn tp2_two_lane_and_decode_push_wait_schedules_drain() {
-        // Runtime startup also records the engine's actual calls and checks them,
-        // so this CPU mirror cannot silently qualify a different enqueue order.
-        for layers in [1, 2, 6] {
-            for local in 1..=layers {
+    fn tp2_continuous_unit_and_decode_push_wait_schedules_drain() -> Result<()> {
+        // Startup also records actual engine calls; the CPU mirror uses the executor's order.
+        for layers in [1, 2, 6, 43, 61] {
+            for local in [0, 1, layers / 2, layers] {
                 for broadcast in [false, true] {
-                    for lanes in [1, 2] {
-                        assert_eq!(order::check_submission_faults(&schedule(layers, local, lanes, false, broadcast)), Ok(()));
+                    for waves in [1, 2, 3] {
+                        assert_eq!(order::check_submission_faults(&unit_schedule(layers, local, waves, broadcast)?), Ok(()));
                     }
                     assert_eq!(order::check_submission_faults(&schedule(layers, local, 1, true, broadcast)), Ok(()));
                 }
             }
         }
+        Ok(())
     }
 
     #[test]
@@ -602,7 +648,7 @@ mod tests {
         // Prewarm and capture-only graphs precede the first peer wait and queue
         // no peer operations. Hardware also checks the actual identity steps.
         for broadcast in [false, true] {
-            let mut startup = schedule(43, 8, 2, false, broadcast);
+            let mut startup = unit_schedule(43, 8, 2, broadcast).unwrap();
             let decode = schedule(43, 8, 1, true, broadcast);
             for (prefill, decode) in startup.streams.iter_mut().zip(decode.streams) {
                 prefill.extend(decode);

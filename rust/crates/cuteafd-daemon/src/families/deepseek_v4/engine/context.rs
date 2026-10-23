@@ -132,6 +132,15 @@ impl<'a> V4ContextSplit<'a> {
                 let _scope = cuteafd_ffi::memory_ledger::scope("context-staging");
                 let view = staging_units * (metadata::compressed_page_bytes(4) + INDEX_PAGE_BYTES);
                 let staging = [engine.alloc(view)?, engine.alloc(view)?];
+                let half = staging_units.div_ceil(2);
+                for slot in 0..lanes as usize {
+                    for owner in 0..2 {
+                        engine.prime_upload(super::context::view(&gather, (slot * 2 + owner) * half * 4, half * 4)?)?;
+                    }
+                    engine.prime_upload(commit[slot].buffer)?;
+                }
+                // SAFETY: startup has no peer waits and staging retains every source.
+                unsafe { engine.library.cuda_stream_synchronize(engine.stream_of(rank))?; }
                 Ok(ContextRank { candidates, own, peer, topk_scratch, partial_scratch, gather, local_lengths,
                     empty_window, commit, staging })
             })

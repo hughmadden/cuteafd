@@ -607,25 +607,64 @@ impl<'a> Engine<'a> {
     /// All-row diagnostics reuse the admitted bounded head buffer, downloading
     /// its rows in LOGIT_ROWS batches; no vocabulary-sized GPU buffer is added.
     pub fn prepare_scoring_prefill(&mut self) -> Result<()> {
-        *self.prefill_workspace.borrow_mut() = Some(self.workspace(self.prefill_rows, self.prefill_waves)?);
-        if let Some(peer) = &self.peer {
-            *peer.prefill_workspace.borrow_mut() = Some(self.workspace_on(1, self.prefill_rows, self.prefill_waves)?);
-        }
+        self.prepare_prefill_workspaces()?;
         self.full_prefill_logits = true;
         Ok(())
     }
 
-    fn workspace(&self, t: usize, lanes: usize) -> Result<Workspace<'a>> {
-        self.workspace_on(0, t, lanes)
+    /// Reserve every upload source before any peer wait can be queued. Growing
+    /// pinned storage later may implicitly synchronize the device and deadlock.
+    fn prime_upload(&self, buffer: cuteafd_ffi::CuteafdDeviceBuffer) -> Result<()> {
+        if buffer.bytes > 0 { self.upload(buffer, &vec![0u8; buffer.bytes])?; }
+        Ok(())
+    }
+
+    fn prime_slot_uploads(&self, lane: &UnitSlot<'_>, lead: bool) -> Result<()> {
+        let tables = &lane.tables;
+        for buffer in [&lane.tokens, &tables.positions, &tables.main_slots,
+            &tables.swa_indices, &tables.swa_lengths, &tables.c4_page_table,
+            &tables.c4_visible, &tables.c4_indexed_lengths, &tables.c128_indices,
+            &tables.c128_lengths].into_iter().chain(&tables.c4).chain(&tables.c128) {
+            self.prime_upload(buffer.buffer)?;
+        }
+        if lead && !self.embedding.device_gather() { self.prime_upload(lane.stream_a.buffer)?; }
+        // SAFETY: startup-only uploads have no peer waits and retain their source storage.
+        unsafe { self.library.cuda_stream_synchronize(if lead { self.stream } else { self.peer()?.stream }) }
+    }
+
+    pub fn prepare_prefill_workspaces(&self) -> Result<()> {
+        if self.prefill_workspace.borrow().is_none() {
+            *self.prefill_workspace.borrow_mut() = Some(self.workspace(self.prefill_rows, self.prefill_waves, true)?);
+        }
+        if let Some(peer) = &self.peer {
+            if peer.prefill_workspace.borrow().is_none() {
+                *peer.prefill_workspace.borrow_mut() = Some(self.workspace_on(1, self.prefill_rows, self.prefill_waves, true)?);
+            }
+        }
+        Ok(())
+    }
+
+    pub fn drain_state(&self) -> Result<()> {
+        for rank in 0..self.ranks() {
+            self.on(rank, || {
+                // SAFETY: all hooks completed and every peer wait has its publication queued.
+                unsafe { self.library.cuda_stream_synchronize(self.stream_of(rank)) }
+            })?;
+        }
+        Ok(())
+    }
+
+    fn workspace(&self, t: usize, lanes: usize, shared_page_list: bool) -> Result<Workspace<'a>> {
+        self.workspace_on(0, t, lanes, shared_page_list)
     }
 
     /// Rank `rank`'s workspace (rank 1 has router replicas but no drafter or
     /// vocabulary head buffers), allocated on that rank's GPU.
-    fn workspace_on(&self, rank: usize, t: usize, lanes: usize) -> Result<Workspace<'a>> {
-        self.on(rank, || self.workspace_here(rank, t, lanes))
+    fn workspace_on(&self, rank: usize, t: usize, lanes: usize, shared_page_list: bool) -> Result<Workspace<'a>> {
+        self.on(rank, || self.workspace_here(rank, t, lanes, shared_page_list))
     }
 
-    fn workspace_here(&self, rank: usize, t: usize, lanes: usize) -> Result<Workspace<'a>> {
+    fn workspace_here(&self, rank: usize, t: usize, lanes: usize, shared_page_list: bool) -> Result<Workspace<'a>> {
         let _memory_scope = cuteafd_ffi::memory_ledger::scope("workspace");
         let lead = rank == 0;
         let lead_only = |bytes: usize| if lead { bytes } else { 256 };
@@ -650,7 +689,7 @@ impl<'a> Engine<'a> {
         let shared = plane(t * h * 2)?;
         let payload = self.split_family.map(|_| plane(t * h * 4)).transpose()?;
         let lane = |index: usize| -> Result<UnitSlot<'a>> {
-            Ok(UnitSlot {
+            let slot = UnitSlot {
                 index,
                 payload: payload.as_ref().map(|p| p.rows(index, t * h * 4)),
                 stream_a: stream_a.rows(index, t * 4 * h * 2),
@@ -659,9 +698,11 @@ impl<'a> Engine<'a> {
                 comb: comb.rows(index, t * 16 * 4),
                 tokens: self.alloc(t * 4)?,
                 shared: shared.rows(index, t * h * 2),
-                tables: self.step_buffers(t)?,
+                tables: self.step_buffers(t, if shared_page_list { 1 } else { t })?,
                 taps: self.alloc(draft_bytes(t.min(TAP_ROWS) * self.cfg.dspark_target_layer_ids.len() * h * 2))?,
-            })
+            };
+            self.prime_slot_uploads(&slot, lead)?;
+            Ok(slot)
         };
         Ok(Workspace {
             slots: (0..lanes).map(lane).collect::<Result<_>>()?,
@@ -703,7 +744,7 @@ impl<'a> Engine<'a> {
     }
 
     /// Persistent table buffers for up to `rows` rows.
-    fn step_buffers(&self, rows: usize) -> Result<StepBuffers<'a>> {
+    fn step_buffers(&self, rows: usize, page_lists: usize) -> Result<StepBuffers<'a>> {
         let _memory_scope = cuteafd_ffi::memory_ledger::scope("workspace/step");
         let ints = |count: usize| self.alloc(count * 4);
         let metadata = |_: usize| -> Result<Vec<Dev<'a>>> { (0..9).map(|_| ints(rows + 2)).collect() };
@@ -718,7 +759,8 @@ impl<'a> Engine<'a> {
             c4_page_table: {
                 // Pool-following tables are KV records, matching placement::solve.
                 let _memory_scope = cuteafd_ffi::memory_ledger::scope("kv/records");
-                ints(rows.max(1) * self.shape.units)?
+                // Prefill units share one request list (stride zero); decode owns one per row.
+                ints(page_lists * self.shape.units)?
             },
             c4_visible: ints(rows)?,
             c4_indexed_lengths: ints(rows)?,
@@ -961,7 +1003,7 @@ impl<'a> Engine<'a> {
             "single-step requires one decode batch");
         ensure!(on_layer.is_none() && !download, "decode returns device logits");
         if self.decode_workspace.borrow().is_none() {
-            *self.decode_workspace.borrow_mut() = Some(self.workspace(self.decode_rows, 1)?);
+            *self.decode_workspace.borrow_mut() = Some(self.workspace(self.decode_rows, 1, false)?);
         }
         let workspace = self.decode_workspace.borrow();
         let w = workspace.as_ref().context("decode workspace")?;
@@ -980,7 +1022,7 @@ impl<'a> Engine<'a> {
         let peer_workspace = match &self.peer {
             Some(peer) => {
                 if peer.decode_workspace.borrow().is_none() {
-                    *peer.decode_workspace.borrow_mut() = Some(self.workspace_on(1, self.decode_rows, 1)?);
+                    *peer.decode_workspace.borrow_mut() = Some(self.workspace_on(1, self.decode_rows, 1, false)?);
                 }
                 Some(peer.decode_workspace.borrow())
             }
@@ -1880,11 +1922,11 @@ impl<'a> Engine<'a> {
     pub fn warm_local_graphs(&self) -> Result<()> {
         if self.local_layers() == 0 { return Ok(()); }
         if self.decode_workspace.borrow().is_none() {
-            *self.decode_workspace.borrow_mut() = Some(self.workspace(self.decode_rows, 1)?);
+            *self.decode_workspace.borrow_mut() = Some(self.workspace(self.decode_rows, 1, false)?);
         }
         if let Some(peer) = &self.peer {
             if peer.decode_workspace.borrow().is_none() {
-                *peer.decode_workspace.borrow_mut() = Some(self.workspace_on(1, self.decode_rows, 1)?);
+                *peer.decode_workspace.borrow_mut() = Some(self.workspace_on(1, self.decode_rows, 1, false)?);
             }
         }
         self.warm_tp2_routers()?;

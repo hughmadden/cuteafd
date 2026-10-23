@@ -19,11 +19,11 @@ impl<'a> Engine<'a> {
                     placement.len + unit.rows.start, unit.rows.len(), self.cfg.index_topk, self.c128_width))
                     .collect::<Result<Vec<_>>>()?;
                 if self.prefill_workspace.borrow().is_none() {
-                    *self.prefill_workspace.borrow_mut() = Some(self.workspace(self.prefill_rows, self.prefill_waves)?);
+                    *self.prefill_workspace.borrow_mut() = Some(self.workspace(self.prefill_rows, self.prefill_waves, true)?);
                 }
                 if let Some(peer) = &self.peer {
                     if peer.prefill_workspace.borrow().is_none() {
-                        *peer.prefill_workspace.borrow_mut() = Some(self.workspace_on(1, self.prefill_rows, self.prefill_waves)?);
+                        *peer.prefill_workspace.borrow_mut() = Some(self.workspace_on(1, self.prefill_rows, self.prefill_waves, true)?);
                     }
                 }
                 let workspace = self.prefill_workspace.borrow();

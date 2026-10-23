@@ -118,12 +118,15 @@ fn parse_plan_rows(text: &str) -> std::result::Result<PlanRows, String> {
 pub(crate) struct GoldenArgs {
     #[command(flatten)]
     pub engine: EngineArgs,
-    /// Directory with tokens.bin, layerNN.bin and logits.bin from golden.py.
+    /// Published shared fidelity directory, or tokens.bin/layerNN.bin/logits.bin from golden.py.
     #[arg(long)]
     pub golden: PathBuf,
     /// Score every prefill row: mean next-token NLL, top-1 agreement and KL against golden.
     #[arg(long)]
     pub nll: bool,
+    /// One window from the published sealed quick subset (default: all eight).
+    #[arg(long)]
+    pub window: Option<String>,
     /// Save tokens.bin and F32 logits.bin for a reference run: with --nll every prefill row,
     /// with --prefill N only the decode/verify rows (positions N.., tokens.bin from N), so two
     /// runs compare exactly the rows the decode path produced.
@@ -618,6 +621,7 @@ pub(crate) fn with_engine<T>(
                 TcpTransportConfig { timing: false, timeout: Duration::from_secs(120), max_frame_bytes: 64 << 20 })?;
             tracing::info!(elapsed_ms = started.elapsed().as_millis() as u64, "decode and verify waves use the device exchange");
         }
+        engine.prepare_prefill_workspaces()?;
         if args.full_prefill_logits { engine.prepare_scoring_prefill()?; }
         engine.warm_local_graphs()?;
         engine.check_routes(&mut transports, &runtime)?;
@@ -648,19 +652,34 @@ pub(crate) fn with_engine<T>(
 }
 
 fn golden(args: GoldenArgs) -> Result<()> {
+    let shared = args.golden.join("manifest.json").try_exists()?;
+    if shared {
+        ensure!(args.nll && args.save_logits.is_some(), "shared V4 fidelity needs --nll --save-logits DIR");
+        ensure!(args.prefill.is_none() && !args.draft && args.verify_rows.is_none()
+            && args.token_check.is_none() && args.resume_at.is_empty() && args.layers.is_none(),
+            "shared V4 fidelity cannot be combined with legacy golden diagnostics");
+        let output = args.save_logits.as_deref().unwrap();
+        ensure!(!output.try_exists()? && output.parent().is_some_and(std::path::Path::is_dir),
+            "V4 fidelity output needs an existing parent and a new directory");
+    } else {
+        ensure!(args.window.is_none(), "--window needs a published shared fidelity set");
+    }
     let started = Instant::now();
     let loaded = load(&args.engine)?;
     let cfg = loaded.cfg.clone();
+    let windows = if shared { Some(fidelity_windows(&args.golden, loaded.family, args.window.as_deref())?) } else { None };
     with_engine(&loaded, &args.engine, None, |_| Ok(0), |engine, transports, runtime| {
         let before = engine.graph_capture_counts();
         println!("golden ready: {:.3} s | graph captures {} | TP2 expert graph captures {}",
             started.elapsed().as_secs_f64(), before.0, before.1);
-        let result = match args.token_check {
+        let result = if let Some(windows) = &windows {
+            score_fidelity(&args, engine, transports, runtime, windows)
+        } else { match args.token_check {
             Some(steps) => token_check(&args, &loaded, engine, transports, runtime, steps),
             None if !args.resume_at.is_empty() => resume(&args, engine, transports, runtime),
             None if args.nll => nll_run(&args, &cfg, engine, transports, runtime),
             None => golden_run(&args, &cfg, engine, transports, runtime),
-        };
+        } };
         let after = engine.graph_capture_counts();
         println!("golden post-ready captures: all {} | TP2 experts {}", after.0 - before.0, after.1 - before.1);
         for setting in cuteafd_bench::context::get().settings.into_iter().filter(|s| s.name.starts_with("route-")) {
@@ -668,6 +687,106 @@ fn golden(args: GoldenArgs) -> Result<()> {
         }
         result
     })
+}
+
+fn fidelity_publication(family: &str) -> Result<(&'static str, &'static str, &'static str)> {
+    use cuteafd_bench::fidelity_dataset;
+    Ok(match family {
+        "dsv4f" => (fidelity_dataset::V4FLASH_CONFIG, fidelity_dataset::V4FLASH_REVISION,
+            "0566bf91385805a7ab98f850e066c173b467db8bdf574240edee854290d33100"),
+        "dsv4p" => (fidelity_dataset::V4PRO_CONFIG, fidelity_dataset::V4PRO_REVISION,
+            "7b4fd7b51670ff03fbfab6a21b72d999163ddee9bd3eec34c89f1d6c2f83488f"),
+        _ => anyhow::bail!("no shared V4 fidelity publication for {family}"),
+    })
+}
+
+fn fidelity_windows(root: &std::path::Path, family: &str, selected: Option<&str>)
+    -> Result<Vec<cuteafd_bench::reference::Window>> {
+    use cuteafd_bench::fidelity_dataset;
+    use sha2::{Digest, Sha256};
+    let (config, _, hash) = fidelity_publication(family)?;
+    let bytes = std::fs::read(root.join("manifest.json"))?;
+    ensure!(format!("{:x}", Sha256::digest(&bytes)) == hash,
+        "V4 fidelity manifest differs from immutable publication");
+    let manifest: serde_json::Value = serde_json::from_slice(&bytes)?;
+    ensure!(manifest["config"] == config && manifest["vocab"] == 129280,
+        "V4 fidelity config/vocabulary differs");
+    let reference = fidelity_dataset::load(root, &manifest)?;
+    let mut windows = fidelity_dataset::quick_windows(&reference)?;
+    if let Some(id) = selected {
+        windows.retain(|window| window.id == id);
+        ensure!(windows.len() == 1, "V4 fidelity window must belong to the sealed quick subset");
+    }
+    ensure!(windows.iter().all(|window| window.media.is_empty() && window.tokens.len() <= 16384
+        && window.score_from > 0 && window.score_from < window.tokens.len()),
+        "V4 fidelity requires text-only bounded causal windows");
+    Ok(windows)
+}
+
+fn fidelity_chunks(tokens: usize, capacity: usize) -> Result<Vec<std::ops::Range<usize>>> {
+    ensure!((2..=16384).contains(&tokens) && capacity > 0, "V4 fidelity causal window/chunk extent differs");
+    let count = tokens - 1;
+    Ok((0..count).step_by(capacity).map(|first| first..(first + capacity).min(count)).collect())
+}
+
+fn score_fidelity(args: &GoldenArgs, engine: &engine::Engine<'_>, transports: &mut [SparkLink<'_>],
+    runtime: &tokio::runtime::Runtime, windows: &[cuteafd_bench::reference::Window]) -> Result<()> {
+    use cuteafd_api::openai::probe::{Probe, ProbeSpec};
+    use cuteafd_bench::{fidelity_rows, reference::Fidelity};
+    let (config, revision, hash) = fidelity_publication(engine.family)?;
+    ensure!(engine.weights.layers.len() == engine.cfg.n_layers && engine.cfg.vocab_size == 129280
+        && !args.engine.skip_routed_experts, "V4 fidelity needs every target layer, routed experts and published vocabulary");
+    let root = args.save_logits.as_deref().context("shared V4 fidelity requires --save-logits")?;
+    std::fs::create_dir(root).context("V4 fidelity output must be a new directory with an existing parent")?;
+    let chunk_rows = args.chunk.unwrap_or(engine.prefill_capacity()).min(engine.prefill_capacity());
+    ensure!(chunk_rows > 0, "V4 fidelity chunk must be positive");
+    let provenance = serde_json::json!({"prefill_rows":engine.prefill_rows,
+        "prefill_waves":engine.prefill_waves,"prefill_span_rows":chunk_rows});
+    let mut allocator = pool::PoolAllocator::for_engine(engine)?;
+    let mut records = Vec::new();
+    let vocab = engine.cfg.vocab_size;
+    for window in windows {
+        let mut placement = allocator.admit(window.tokens.len() - 1)?;
+        let dump = root.join(&window.id);
+        let probe = Probe::new(ProbeSpec { cold: true, no_speculation: true,
+            prompt_ids: Some(window.tokens.clone()), score_from: Some(window.score_from),
+            score_positions: Some(window.positions.iter().map(|p| p.pos).collect()), top_k: 32,
+            want: window.want(), dump_rows: Some(dump.clone()), ..Default::default() });
+        probe.admitted("deepseek_v4", &window.tokens, 0);
+        probe.selected_score_path("prefill");
+        probe.provenance(provenance.clone());
+        for chunk in fidelity_chunks(window.tokens.len(), chunk_rows)? {
+            let first_scored = chunk.start.max(window.score_from - 1).min(chunk.end);
+            let wanted = chunk.end - first_scored;
+            let logits = engine.prefill(&mut placement, &window.tokens[chunk.clone()], transports, runtime, wanted, None)?;
+            ensure!(logits.len() == wanted * vocab, "V4 fidelity logits shape differs");
+            for (row, logits) in logits.chunks_exact(vocab).enumerate() {
+                probe.row(first_scored + row + 1, logits);
+            }
+            if wanted > 0 { probe.scored_prefill_chunk(first_scored + 1, wanted); }
+        }
+        let record = probe.record();
+        ensure!(record.error.is_none(), "V4 fidelity row dump failed: {:?}", record.error);
+        let mut score = window.score(&record.rows);
+        ensure!(score.missing == 0 && score.non_finite == 0 && score.records.len() == window.positions.len(),
+            "V4 fidelity did not cover every finite scored row");
+        fidelity_rows::score_compact(vocab, window, &dump, &mut score)?;
+        println!("V4 window {}: rows={} top-1={:.4}% mean NLL={:.8} mean KL(top1024+tail)={:.8}",
+            window.id, score.positions, score.top1 * 100.0, score.nll, score.kl);
+        let file = std::fs::OpenOptions::new().write(true).create_new(true).open(root.join(format!("{}.json", window.id)))?;
+        serde_json::to_writer(file, &serde_json::json!({"probe":record,"score":score}))?;
+        records.extend(score.records);
+        engine.drain_state()?;
+        allocator.release(placement);
+    }
+    let score = Fidelity::from_records(records);
+    println!("V4 prefill logits: rows={} top-1 agreement {:.4}% | mean NLL engine {:.8} | mean KL(top1024+tail) {:.8}",
+        score.positions, score.top1 * 100.0, score.nll, score.kl);
+    let file = std::fs::OpenOptions::new().write(true).create_new(true).open(root.join("fidelity.json"))?;
+    serde_json::to_writer(file, &serde_json::json!({"schema":"cuteafd.deepseek_v4.golden/1",
+        "reference_config":config,"reference_revision":revision,"reference_manifest_sha256":hash,
+        "path_shape":"prefill-shaped","kl_kind":"top1024+tail","provenance":provenance,"score":score}))?;
+    Ok(())
 }
 
 /// `--nll` scores the complete prompt with prefill-shaped kernels, never decode fallbacks.
@@ -908,6 +1027,56 @@ fn token_check(args: &GoldenArgs, loaded: &Loaded, engine: &engine::Engine<'_>, 
 }
 
 #[cfg(test)]
+mod fidelity_tests {
+    use super::*;
+
+    #[test]
+    fn published_fidelity_identity_is_family_specific() {
+        let (flash, flash_revision, flash_hash) = fidelity_publication("dsv4f").unwrap();
+        let (pro, pro_revision, pro_hash) = fidelity_publication("dsv4p").unwrap();
+        assert_ne!(flash, pro);
+        assert_ne!(flash_revision, pro_revision);
+        assert_ne!(flash_hash, pro_hash);
+        assert_eq!(flash_hash.len(), 64);
+        assert_eq!(pro_hash.len(), 64);
+        assert!(fidelity_publication("dsv4f2").is_err());
+    }
+
+    #[test]
+    fn fidelity_chunks_predict_each_next_token_once_without_final_token_input() -> Result<()> {
+        for tokens in [2, 513, 576, 2011, 4610, 11284, 16384] {
+            for capacity in [512, 4096, 8192, 16384] {
+                let chunks = fidelity_chunks(tokens, capacity)?;
+                assert_eq!(chunks.first().unwrap().start, 0);
+                assert_eq!(chunks.last().unwrap().end, tokens - 1);
+                assert_eq!(chunks.iter().map(|chunk| chunk.len()).sum::<usize>(), tokens - 1);
+                assert!(chunks.iter().all(|chunk| !chunk.is_empty() && chunk.len() <= capacity));
+                assert!(chunks.windows(2).all(|pair| pair[0].end == pair[1].start));
+            }
+        }
+        assert!(fidelity_chunks(1, 4096).is_err());
+        assert!(fidelity_chunks(16385, 4096).is_err());
+        assert!(fidelity_chunks(513, 0).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn common_span_preserves_unit_cuts_at_one_and_two_waves() -> Result<()> {
+        use crate::shared::prefill_pipeline::prefill_units;
+        // Full spans have an even unit count; tiny tails cannot split below the floor.
+        for rows in [4096, 2048, 1024, 512] {
+            for span in [8192, 16384, 256] {
+                assert_eq!(prefill_units(span, rows, 1, 256)?, prefill_units(span, rows, 2, 256)?);
+            }
+        }
+        for (span, rows) in [(4609, 4096), (4613, 4096), (11283, 2048), (11136, 2048)] {
+            assert_eq!(prefill_units(span, rows, 1, 256)?, prefill_units(span, rows, 2, 256)?);
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
 mod program_selection_tests {
     use cuteafd_core::coordinator_programs::{AttentionReductionPlan, CoordinatorPrograms};
 
@@ -955,7 +1124,11 @@ mod program_selection_tests {
                             for attention in ["win", "c4", "c128"] {
                                 for ratio in ["4", "128"] {
                                     for program in ["prefill", "continuation"] {
-                                        let suffix = template.replace("{cap}", cap).replace("{mode}", mode)
+                                        if template.contains("{}") {
+                                            assert!(line.contains("self.kernel_rows(cap)"),
+                                                "unrecognized positional dispatch capacity: {line}");
+                                        }
+                                        let suffix = template.replace("{cap}", cap).replace("{}", cap).replace("{mode}", mode)
                                             .replace("{attention}", attention).replace("{ratio}", ratio)
                                             .replace("{program}", program);
                                         let name = format!("{family}_{suffix}");
