@@ -226,7 +226,7 @@ impl<'e, 'a> Backend<'a> for DenseBackend<'e, 'a> {
                 let mut first = 0;
                 for (placement, tokens) in sequences {
                     let width = engine.cfg.hidden * 2;
-                    let hidden = CuteafdDeviceBuffer { ptr: tap.ptr.cast::<u8>().wrapping_add(first * width).cast_mut(),
+                    let hidden = CuteafdDeviceBuffer { ptr: tap.ptr.cast::<u8>().wrapping_add(first * width).cast_mut().cast(),
                         bytes: tokens.len() * width, device_id: self.library.cuda_get_device()?, ..Default::default() };
                     mtp.update(&mut engine, placement.slot, placement.len - tokens.len(), tokens, hidden)?;
                     first += tokens.len();
@@ -326,7 +326,7 @@ impl<'e, 'a> Backend<'a> for DenseBackend<'e, 'a> {
                 let count = if speculative { sequence.kept.map_or(0, |(rows, _)| rows) } else { sequence.rows.len() };
                 if count > 0 {
                     let hidden = CuteafdDeviceBuffer { ptr: tap.ptr.cast::<u8>()
-                        .wrapping_add(sequence.first_row * width).cast_mut(), bytes: count * width,
+                        .wrapping_add(sequence.first_row * width).cast_mut().cast(), bytes: count * width,
                         device_id: self.library.cuda_get_device()?, ..Default::default() };
                     mtp.update(&mut engine, sequence.placement.slot, sequence.start, &sequence.rows[..count], hidden)?;
                 }
@@ -595,6 +595,43 @@ mod tests {
         let mut backend = DenseBackend::new(&engine, &library);
         backend.drafter = Some(draft);
         super::super::engine::prefix::check_backend_frontiers(&engine, &[1, 2, 3, 4], &backend, family, true)
+    }
+
+    #[test]
+    #[ignore = "requires dense MTP checkpoint, matching native library and allocated GPU"]
+    fn dense_mtp_serving_prefix_frontiers_are_byte_exact() -> Result<()> {
+        use cuteafd_loader::{families::qwen3_5::Qwen35Config, plan::checkpoint::Checkpoint};
+        use super::super::engine::mtp::{Admission, MtpCache};
+        let snapshot = std::path::PathBuf::from(std::env::var("CUTEAFD_DENSE_TEST_SNAPSHOT")?);
+        let manifest = std::path::PathBuf::from(std::env::var("CUTEAFD_DENSE_TEST_MANIFEST")?);
+        // SAFETY: the library outlives every stream, program and allocation owner.
+        let library = unsafe { NativeLibrary::load(std::env::var("CUTEAFD_NATIVE_LIB")?)? };
+        library.cuda_set_device(0)?;
+        let programs = library.programs()?.with_manifest(&manifest)?;
+        let cfg = Qwen35Config::read(&snapshot)?;
+        let checkpoint = Checkpoint::open(&snapshot)?;
+        let reader = crate::shared::qwen::weights::WeightReader { library: &library, checkpoint: &checkpoint };
+        let admission = Admission::new(&reader, &cfg, &programs)?;
+        let engine = RefCell::new(DenseEngine::with_prefix(&library, &programs, &checkpoint, cfg,
+            Some(262144), Some(admission.bytes), 4, Some(crate::shared::prefix::MarkRule {
+                lanes: 4, entries: 4, budget_bytes: 1 << 30, host: false }),
+            std::env::var("CUTEAFD_DENSE_TEST_KV_CACHE").unwrap_or_else(|_| "fp8".into()).parse()?, false)?);
+        let mtp = Rc::new(MtpCache::load(&engine.borrow(), &reader, admission)?);
+        let family = DensePrefix::with_mtp(&engine, mtp.clone())?;
+        let mut backend = DenseBackend::new(&engine, &library);
+        backend.mtp = Some(mtp);
+        backend.selector = RefCell::new(Some(crate::shared::token_io::TokenSelector::new(&library,
+            crate::shared::token_io::SelectPlacement::Device, engine.borrow().cfg.vocab, 1)?));
+        super::super::engine::prefix::check_backend_frontiers(&engine, &[1, 2, 3, 4], &backend, family, true)
+    }
+
+    #[test]
+    fn native_mtp_is_opt_in_and_excludes_external_drafting() {
+        let base = ["dense", "--snapshot", "checkpoint", "--native-lib", "native.so"];
+        assert_eq!(Cli::try_parse_from(base).unwrap().serve.mtp, 0);
+        assert_eq!(Cli::try_parse_from(base.into_iter().chain(["--mtp", "1"])).unwrap().serve.mtp, 1);
+        assert!(Cli::try_parse_from(base.into_iter().chain(["--mtp", "2"])).is_err());
+        assert!(Cli::try_parse_from(base.into_iter().chain(["--mtp", "1", "--draft", "external"])).is_err());
     }
 
     #[test]

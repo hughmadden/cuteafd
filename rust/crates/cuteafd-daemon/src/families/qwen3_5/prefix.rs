@@ -174,9 +174,13 @@ pub(crate) fn check_backend_frontiers(engine: &RefCell<DenseEngine<'_>>, tokens:
         }).collect::<Result<Vec<_>>>()?;
         if let Some(saved) = family.capture_draft_pages(placement, placement.len).map_err(boxed)? {
             for (index, &page) in saved.pages.iter().enumerate() {
-                let rows = (saved.frontier - index * 64).min(64);
-                for segment in family.draft_page_segments(page) {
-                    let segment_bytes = segment.bytes / 64 * rows;
+                let initialized = saved.frontier - usize::from(family.mtp.is_some());
+                let rows = initialized.saturating_sub(index * 64).min(64);
+                for (part, segment) in family.draft_page_segments(page).into_iter().enumerate() {
+                    // Native MTP owns only the final page's pending-hidden sidecar.
+                    if family.mtp.is_some() && part > 0 && index + 1 != saved.pages.len() { continue; }
+                    let segment_bytes = if family.mtp.is_some() && part > 0 { segment.bytes }
+                        else { segment.bytes / 64 * rows };
                     let mut data = vec![0; segment_bytes];
                     library.copy_d2h(&mut data, CuteafdDeviceBuffer { ptr: segment.addr as *mut _,
                         bytes: segment_bytes, device_id: library.cuda_get_device()?, ..Default::default() })?;
@@ -188,6 +192,14 @@ pub(crate) fn check_backend_frontiers(engine: &RefCell<DenseEngine<'_>>, tokens:
         Ok(bytes)
     };
     let decode = |placement: &mut Placement, inputs: &[u32]| -> Result<Vec<f32>> {
+        if family.mtp.is_some() {
+            use crate::shared::qwen::scheduler::{DraftSeq, DraftState, DraftTiming};
+            let mut state = super::super::serve::DraftState::default();
+            state.close(inputs[0]);
+            let proposed = backend.draft(&mut [DraftSeq { placement, seq: &mut state, depth: 1 }],
+                &mut DraftTiming::default())?;
+            ensure!(proposed.len() == 1 && proposed[0].len() == 1, "native serving draft produced no token");
+        }
         let start = placement.len;
         let logits = backend.verify_device(&mut [(placement, inputs)], speculative, &pool)?
             .context("dense direct prefix check requires logits")?.to_host(library)?;
