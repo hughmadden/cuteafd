@@ -968,7 +968,8 @@ impl Opened {
         let world = devices.len();
         let started = Instant::now();
         self.library.cuda_set_device(devices[0])?;
-        let available = engine::exlr8::host_available()?;
+        let (_, available) = cuteafd_loader::formats::mapped_preload::host_memory()?;
+        let available = usize::try_from(available)?;
         let vocabulary = NativeVocabulary::load(&self.library, programs,
             VocabularyPlan::new(records, world, 0, self.cfg.hidden, self.cfg.vocab_size)?, available, 0, 0)?
             .context("rank 0 owns the native vocabulary")?;
