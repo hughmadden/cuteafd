@@ -169,8 +169,8 @@ fn validate_manifest(specs: [&ProgramSpec; 3], g: DenseTrellisGeometry, codebook
     let input = &specs[0].geometry;
     let core = &specs[1].geometry;
     let output = &specs[2].geometry;
-    if input["features"].as_u64() != Some(g.input as u64) || input["input_dtype"].as_str() != Some(g.input_dtype.name())
-        || input.get("output_dtype").is_some_and(|value| value.as_str() != Some("f16"))
+    if !matching_rotated_dtype(input, core)
+        || input["features"].as_u64() != Some(g.input as u64) || input["input_dtype"].as_str() != Some(g.input_dtype.name())
         || output["features"].as_u64() != Some(g.output as u64) || output["output_dtype"].as_str() != Some(g.output_dtype.name())
         || !specs[0].scratch.is_empty() || !specs[2].scratch.is_empty() || specs[1].scratch.len() != 1
         || core["codebook"].as_str() != Some(codebook)
@@ -183,6 +183,12 @@ fn validate_manifest(specs: [&ProgramSpec; 3], g: DenseTrellisGeometry, codebook
         return Err(DenseTrellisError::Invalid("manifest geometry/dtype/scratch"));
     }
     Ok(())
+}
+
+fn matching_rotated_dtype(input: &serde_json::Value, core: &serde_json::Value) -> bool {
+    let input_dtype = input.get("output_dtype").map_or(Some("f16"), serde_json::Value::as_str);
+    let core_dtype = core.get("input_dtype").map_or(Some("f16"), serde_json::Value::as_str);
+    matches!(input_dtype, Some("f16" | "bf16")) && input_dtype == core_dtype
 }
 
 fn buffers(items: &[(Buffer, usize)]) -> Result<()> {
@@ -274,6 +280,23 @@ mod tests {
         assert!(bad.workspace().is_ok());
         bad.input = usize::MAX;
         assert!(bad.workspace().is_err());
+    }
+    #[test]
+    fn rotated_dtype_is_validated_between_input_and_core() {
+        let g = geometry();
+        for dtype in ["f16", "bf16"] {
+            let mut s = specs(g);
+            s[0].geometry["output_dtype"] = json!(dtype);
+            s[1].geometry["input_dtype"] = json!(dtype);
+            validate_manifest([&s[0], &s[1], &s[2]], g, "mcg", g.workspace().unwrap()).unwrap();
+            s[1].geometry["input_dtype"] = json!(if dtype == "f16" { "bf16" } else { "f16" });
+            assert!(validate_manifest([&s[0], &s[1], &s[2]], g, "mcg", g.workspace().unwrap()).is_err());
+            for invalid in [json!("f32"), json!(null), json!(17)] {
+                s[0].geometry["output_dtype"] = invalid.clone();
+                s[1].geometry["input_dtype"] = invalid;
+                assert!(validate_manifest([&s[0], &s[1], &s[2]], g, "mcg", g.workspace().unwrap()).is_err());
+            }
+        }
     }
     #[test]
     fn rejects_aliases_short_buffers_and_wrong_devices() {
@@ -590,7 +613,7 @@ impl<'a> GroupedTrellis<'a> {
             || input.scalar_kinds != b"ii" || core.scalar_kinds != b"iii" || output.scalar_kinds != b"ii"
             || !input.scratch.is_empty() || !output.scratch.is_empty()
             || input.geometry["features"].as_u64() != Some(k as u64) || input.geometry["input_dtype"].as_str() != Some("bf16")
-            || input.geometry.get("output_dtype").is_some()
+            || !matching_rotated_dtype(&input.geometry, &core.geometry)
             || output.geometry["features"].as_u64() != Some(n as u64) || output.geometry["output_dtype"].as_str() != Some("bf16")
             || core.geometry["codebook"].as_str() != Some(base.codebook.as_str())
             || [("abi_version", 1), ("input_features", k), ("output_features", n), ("bits", 6), ("sharded_side", 1),

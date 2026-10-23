@@ -66,26 +66,30 @@ def grouped_policy(name, k, n, book):
                 output_program=f"trellis_output_n{n}_bf16_g{groups}")
 
 
-def programs():
-    return programs_for_shapes(TRELLIS_SHAPES)
+def programs(*, input_dtype="f16"):
+    return programs_for_shapes(TRELLIS_SHAPES, input_dtype=input_dtype)
 
 
-def programs_for_shapes(shapes, *, max_rows=4096, f32_outputs=(163840,)):
+def programs_for_shapes(shapes, *, max_rows=4096, f32_outputs=(163840,), input_dtype="f16"):
     """Explicit-shape hook for small native fixture packages; production uses the table."""
     from b12x.integration.cuteafd.trellis_linear import compile_trellis_linear_aot
     from b12x.integration.cuteafd.trellis_transform import (
         compile_trellis_input_aot, compile_trellis_output_aot,
     )
+    if input_dtype not in ("f16", "bf16"):
+        raise ValueError("trellis input dtype must be f16 or bf16")
+    core_dtype = {"input_dtype": "bf16"} if input_dtype == "bf16" else {}
+    ingress_dtype = {"output_dtype": "bf16"} if input_dtype == "bf16" else {}
     result = []
     for name, k, n, side in shapes:
         for codebook in ("mcg", "mul1"):
             params = dict(input_features=k, output_features=n, bits=6,
                           codebook=codebook, sharded_side=side,
-                          rotation_count=1, max_rows=max_rows)
+                          rotation_count=1, max_rows=max_rows, **core_dtype)
             result.append((f"trellis_{name}_{codebook}", "trellis_linear", params,
                            partial(compile_trellis_linear_aot, **params)))
     for k in sorted({k for _, k, _, _ in shapes}):
-        params = dict(features=k, input_dtype="bf16", max_rows=max_rows)
+        params = dict(features=k, input_dtype="bf16", max_rows=max_rows, **ingress_dtype)
         result.append((f"trellis_input_k{k}_bf16", "trellis_input", params,
                        partial(compile_trellis_input_aot, **params)))
     for n in sorted({n for _, _, n, _ in shapes}):
@@ -100,10 +104,10 @@ def programs_for_shapes(shapes, *, max_rows=4096, f32_outputs=(163840,)):
         rows = min(max_rows, GROUPED_MAX_ROWS)
         for codebook in ("mcg", "mul1"):
             params = dict(input_features=k, output_features=n, bits=6, codebook=codebook,
-                          sharded_side=side, rotation_count=groups, max_rows=rows, groups=groups)
+                          sharded_side=side, rotation_count=groups, max_rows=rows, groups=groups, **core_dtype)
             result.append((f"trellis_{name}_{codebook}_g{groups}", "trellis_linear", params,
                            partial(compile_trellis_linear_aot, **params)))
-        params = dict(features=k, input_dtype="bf16", max_rows=rows, groups=groups)
+        params = dict(features=k, input_dtype="bf16", max_rows=rows, groups=groups, **ingress_dtype)
         result.append((f"trellis_input_k{k}_bf16_g{groups}", "trellis_input", params,
                        partial(compile_trellis_input_aot, **params)))
         params = dict(features=n, output_dtype="bf16", max_rows=rows, groups=groups)

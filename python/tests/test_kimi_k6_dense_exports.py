@@ -118,3 +118,28 @@ def test_native_only_policy_has_no_dequant_scratch(monkeypatch):
             assert policy["grouped"]["max_rows"] == 4096
     head = next(p for p in policies if p["shape"] == "lm_head")
     assert head["output_program"].endswith("_f32")
+
+
+def test_bf16_diagnostic_specialization_preserves_stems_and_default(monkeypatch):
+    module = load_exporter(monkeypatch)
+    fake = ModuleType("b12x.integration.cuteafd.trellis_linear")
+    fake.compile_trellis_linear_aot = lambda **params: params
+    monkeypatch.setitem(sys.modules, fake.__name__, fake)
+    transforms = ModuleType("b12x.integration.cuteafd.trellis_transform")
+    transforms.compile_trellis_input_aot = lambda **params: params
+    transforms.compile_trellis_output_aot = lambda **params: params
+    monkeypatch.setitem(sys.modules, transforms.__name__, transforms)
+    default = module["programs"]()
+    bf16 = module["programs"](input_dtype="bf16")
+    assert [p[0] for p in default] == [p[0] for p in bf16]
+    assert all(a[:3] == b[:3] for a, b in zip(default, module["programs"](input_dtype="f16")))
+    for (_, op, params, thunk), (_, _, original, _) in zip(bf16, default):
+        assert thunk() == params
+        if op == "trellis_linear":
+            assert params["input_dtype"] == "bf16"
+            assert original.get("input_dtype", "f16") == "f16"
+        elif op == "trellis_input":
+            assert params["output_dtype"] == "bf16"
+            assert original.get("output_dtype", "f16") == "f16"
+        else:
+            assert params == original
