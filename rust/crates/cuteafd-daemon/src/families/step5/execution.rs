@@ -76,14 +76,14 @@ struct NativeOwners<'a> {
 }
 impl<'a> NativeOwners<'a> {
     fn load(programs: &'a Programs<'a>, checkpoint: &'a Checkpoint,
-        ownership: &ExecutionOwnership, devices: &[Device<'a>], rows: usize,
+        ownership: &ExecutionOwnership, devices: &[Device<'a>], rows: usize, logits: usize,
         count: usize, available: &[u64], reservations: &[u64], depth: usize, kv_format: Qwen4KvCache) -> Result<Self> {
         validate_rank_inventory(ownership.ranks(), &[devices.len(), available.len(), reservations.len()])?;
         ensure!(matches!(count, 1 | 92), "Step-5 native layer inventory");
         let head_rank = ownership.execution().spec().head_gpu as usize;
         ensure!(head_rank < ownership.ranks(), "Step-5 final head rank");
         let head_plan = (count == 92).then(||
-            super::head::HeadPlan::for_execution(programs, checkpoint, rows, ownership)).transpose()?;
+            super::head::HeadPlan::for_execution(programs, checkpoint, logits, ownership)).transpose()?;
         let mut admission = vec![RankAdmission { immutable: 0, workspace: 0 }; ownership.ranks()];
         for (rank, plan) in admission.iter_mut().enumerate() {
             *plan = Execution::rank_admission(programs, checkpoint, ownership, rank, rows, count)?;
@@ -98,6 +98,8 @@ impl<'a> NativeOwners<'a> {
             let mut ranks: Vec<Vec<Option<Layer<'a>>>> = (0..ownership.ranks()).map(|_| Vec::new()).collect();
             let mut arenas = Vec::with_capacity(ownership.ranks());
             let mut tables = Vec::with_capacity(ownership.ranks());
+            let ffn_offset = (0..ownership.ranks()).map(|rank| ffn_offset(checkpoint, ownership, rank, rows, count))
+                .collect::<Result<Vec<_>>>()?;
             for rank in 0..ownership.ranks() {
                 let device = devices[rank];
                 let arena = Arena::new(device, usize::try_from(admission[rank].workspace)?)?;
@@ -112,12 +114,10 @@ impl<'a> NativeOwners<'a> {
                         Attention::Sparse(CsaLayer::for_execution(device, programs, checkpoint, layer,
                             rows, Some(rope.clone()), available[rank], &[], rank, &arena, ownership, kv_format)?)
                     };
-                    let offset = usize::try_from(match &attention {
-                        Attention::Sliding(_) => cuteafd_loader::plan::families::step5::native::plane_bytes(
-                            &cuteafd_loader::plan::families::step5::native::swa_planes(rows, ownership.layer(layer, rank)?.query_heads)?)?,
-                        Attention::Sparse(_) => cuteafd_loader::plan::families::step5::native::plane_bytes(
-                            &cuteafd_loader::plan::families::step5::native::csa_planes(rows)?)?,
-                    })?;
+                    // Every FFN kind lives in one region after this rank's largest
+                    // attention region: no attention or other FFN kind overwrites a
+                    // pending FFN's live rows (native::routed_layout/dense_layout).
+                    let offset = usize::try_from(ffn_offset[rank])?;
                     let ffn = if contract.layers[layer].dense_activation.is_some() {
                         let plan = DensePlan::for_execution(programs, checkpoint, layer, rows, u64::MAX, &[], rank, ownership)?;
                         Ffn::Dense(DenseFfn::load_plan_in(device, programs, checkpoint, plan, Some((&arena, offset)))?)
@@ -134,6 +134,18 @@ impl<'a> NativeOwners<'a> {
             Ok(Self { ranks, head, arenas, rope: tables })
         })
     }
+}
+
+/// The rank's FFN region starts after its largest loaded attention region.
+fn ffn_offset(checkpoint: &Checkpoint, ownership: &ExecutionOwnership, rank: usize, rows: usize,
+    count: usize) -> Result<u64> {
+    use cuteafd_loader::plan::families::step5::{native, Config};
+    let cfg = Config::parse(checkpoint)?;
+    if count == 92 { return native::rank_attention_bytes(&cfg, ownership, rank, rows); }
+    ensure!(count == 1, "Step-5 native layer inventory");
+    let local = ownership.layer(0, rank)?;
+    if local.query_heads == 0 { return Ok(0); }
+    native::attention_bytes(rows, cfg.full[0], local.query_heads)
 }
 
 fn validate_rank_inventory(ranks: usize, lengths: &[usize]) -> Result<()> {
@@ -242,11 +254,13 @@ impl<'e, 'a> Execution<'e, 'a> {
 
     /// Includes the vocabulary head on its owning rank. Call for every rank before
     /// allocating native owners; cache, staging, input, transport and code are reserves.
+    /// `logits` is the head's row capacity (`native::head_rows`), not the chunk rows.
     pub(super) fn serving_admission(programs: &'a Programs<'a>, checkpoint: &'a Checkpoint,
-        ownership: &ExecutionOwnership, rank: usize, rows: usize) -> Result<RankAdmission> {
+        ownership: &ExecutionOwnership, rank: usize, rows: usize, logits: usize) -> Result<RankAdmission> {
+        ensure!((1..=rows).contains(&logits), "Step-5 head rows outside the chunk");
         let admission = Self::rank_admission(programs, checkpoint, ownership, rank, rows, 92)?;
         if rank == ownership.execution().spec().head_gpu as usize {
-            admission.with_head(&super::head::HeadPlan::for_execution(programs, checkpoint, rows, ownership)?)
+            admission.with_head(&super::head::HeadPlan::for_execution(programs, checkpoint, logits, ownership)?)
         } else { Ok(admission) }
     }
 
@@ -259,22 +273,27 @@ impl<'e, 'a> Execution<'e, 'a> {
         let immutable = layout.operands.iter().filter(|w| (0..count).any(|layer| w.name.starts_with(&format!("model.layers.{layer}."))))
             .try_fold(contract.rope_tables.allocation_bytes, |n, w| n.checked_add(w.allocation_bytes))
             .context("Step-5 native rank weight overflow")?;
-        let mut workspace = 0u64;
+        // Plans validate every owned layer's ABI and shapes; the arena is one
+        // attention region plus one FFN region shared by every FFN kind.
+        let mut owned = false;
         for layer in 0..count {
             if ownership.layer(layer, rank)?.query_heads == 0 { continue; }
-            let attention = if contract.layers[layer].sliding.is_some() {
-                cuteafd_loader::plan::families::step5::native::plane_bytes(
-                            &cuteafd_loader::plan::families::step5::native::swa_planes(rows, ownership.layer(layer, rank)?.query_heads)?)? }
-                else { cuteafd_loader::plan::families::step5::native::plane_bytes(
-                            &cuteafd_loader::plan::families::step5::native::csa_planes(rows)?)? };
-            let ffn = if contract.layers[layer].dense_activation.is_some() {
-                DensePlan::for_execution(programs, checkpoint, layer, rows, u64::MAX, &[], rank, ownership)?.workspace_bytes()
+            owned = true;
+            let (planes, ffn) = if contract.layers[layer].dense_activation.is_some() {
+                let plan = DensePlan::for_execution(programs, checkpoint, layer, rows, u64::MAX, &[], rank, ownership)?;
+                (plan.workspace_bytes(), "dense")
             } else {
-                RoutedPlan::for_execution(programs, checkpoint, layer, rows, u64::MAX, &[], rank, ownership)?.workspace_bytes()
+                let plan = RoutedPlan::for_execution(programs, checkpoint, layer, rows, u64::MAX, &[], rank, ownership)?;
+                (plan.workspace_bytes(), "routed")
             };
-            workspace = workspace.max(attention.checked_add(ffn)
-                .context("Step-5 native rank workspace overflow")?);
+            ensure!(planes <= cuteafd_loader::plan::families::step5::native::ffn_region_bytes(rows)?,
+                "Step-5 {ffn} FFN planes exceed the shared FFN region");
         }
+        let workspace = if !owned { 0 } else {
+            ffn_offset(checkpoint, ownership, rank, rows, count)?
+                .checked_add(cuteafd_loader::plan::families::step5::native::ffn_region_bytes(rows)?)
+                .context("Step-5 native rank workspace overflow")?
+        };
         Ok(RankAdmission { immutable, workspace })
     }
 
@@ -293,7 +312,8 @@ impl<'e, 'a> Execution<'e, 'a> {
         stages: Vec<&'e Staging<'a>>, rows: usize, available: Vec<u64>,
         reservations: Vec<u64>, transport: Option<DeviceOwner<'a, SparkLink<'a>>>,
         count: usize, placement_version: u64) -> Result<Self> {
-        let native = Self::load_native(programs, checkpoint, &ownership, &caches, &stages, rows, &available,
+        // Diagnostic goldens score every row: their head holds the whole chunk.
+        let native = Self::load_native(programs, checkpoint, &ownership, &caches, &stages, rows, rows, &available,
             &reservations, count)?;
         Self::bind_native(checkpoint, ownership, native, caches, stages, rows, transport, count, placement_version)
     }
@@ -303,8 +323,9 @@ impl<'e, 'a> Execution<'e, 'a> {
     #[allow(clippy::too_many_arguments)]
     pub(super) fn load_native(programs: &'a Programs<'a>, checkpoint: &'a Checkpoint,
         ownership: &ExecutionOwnership, caches: &[&'e RefCell<CacheRank<'a>>], stages: &[&'e Staging<'a>],
-        rows: usize, available: &[u64], reservations: &[u64], count: usize) -> Result<LoadedNative<'a>> {
+        rows: usize, logits: usize, available: &[u64], reservations: &[u64], count: usize) -> Result<LoadedNative<'a>> {
         ensure!(matches!(count, 1 | 92), "Step-5 execution count must be layer-zero diagnostic or full target");
+        ensure!((1..=rows).contains(&logits), "Step-5 head rows outside the chunk");
         validate_rank_inventory(ownership.ranks(), &[caches.len(), stages.len(), available.len(), reservations.len()])?;
         let kv_format = caches[0].borrow().layout().kv_format;
         for rank in 0..ownership.ranks() {
@@ -320,7 +341,7 @@ impl<'e, 'a> Execution<'e, 'a> {
                 && devices[..rank].iter().all(|other| other.id != device.id)), "Step-5 rank devices/library differ");
         let depth = caches[ownership.execution().spec().head_gpu as usize].borrow()
             .layout().ranks[ownership.execution().spec().head_gpu as usize].mtp_lengths.len();
-        Ok(LoadedNative(NativeOwners::load(programs, checkpoint, ownership, &devices, rows, count, available,
+        Ok(LoadedNative(NativeOwners::load(programs, checkpoint, ownership, &devices, rows, logits, count, available,
             reservations, depth, kv_format)?))
     }
 
@@ -1173,5 +1194,220 @@ mod admission_tests {
         assert!(plan.check(120, &[1]).is_err());
         assert!(plan.check(u64::MAX, &[u64::MAX]).is_err());
         assert!(RankAdmission { immutable: u64::MAX, workspace: 1 }.bytes().is_err());
+    }
+}
+
+/// Unit schedules against the real per-rank arena layout. Units own disjoint
+/// rows of every per-row plane (the shared prefill contract); hooks write
+/// their own planes, and one unit's live bytes must survive every other
+/// unit's hooks: attention planes until its own begin, a routed wave's INPUT,
+/// SHARED and ROUTED (including the peer's replicated reply) until its
+/// finish, and each layer's OUTPUT until its next attention.
+#[cfg(test)]
+mod unit_overwrite_tests {
+    use cuteafd_loader::plan::families::step5::native;
+    use std::ops::Range;
+
+    const CHUNK: usize = 2048;
+    const LAYERS: usize = 92;
+
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    enum Mode { Split, Whole(usize) }
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    enum Hook { Attention, Begin, Finish, Head }
+
+    fn full(layer: usize) -> bool { layer % 4 == 3 }
+    fn routed(layer: usize) -> bool { (3..91).contains(&layer) }
+    fn heads(mode: Mode) -> usize { if mode == Mode::Split { 32 } else { 64 } }
+    fn owns(mode: Mode, rank: usize) -> bool { mode == Mode::Split || mode == Mode::Whole(rank) }
+
+    /// Byte ranges in one rank's arena, per row when the plane scales with rows.
+    #[derive(Clone)]
+    struct Plane { offset: usize, bytes: usize, stride: Option<usize> }
+    impl Plane {
+        fn rows(&self, rows: &Range<usize>) -> Range<usize> {
+            match self.stride {
+                Some(stride) => self.offset + rows.start * stride..self.offset + rows.end * stride,
+                None => self.offset..self.offset + self.bytes,
+            }
+        }
+    }
+
+    fn planes(layout: &[(usize, usize)], base: usize, half: &[(usize, usize)]) -> Vec<Plane> {
+        layout.iter().zip(half).map(|(&(offset, bytes), &(_, small))|
+            Plane { offset: base + offset, bytes, stride: (bytes == 2 * small).then(|| bytes / CHUNK) }).collect()
+    }
+
+    fn sequential(sizes: &[usize]) -> Vec<(usize, usize)> {
+        let mut next = 0;
+        sizes.iter().map(|&bytes| { let at = next; next = (next + bytes).div_ceil(16) * 16; (at, bytes) }).collect()
+    }
+
+    fn attention(layer: usize, mode: Mode, rows: usize) -> Vec<usize> {
+        if full(layer) { native::csa_planes(rows).unwrap().to_vec() }
+        else { native::swa_planes(rows, heads(mode)).unwrap().to_vec() }
+    }
+
+    /// Per rank and layer: attention planes and FFN planes with the
+    /// routed live indices (OUTPUT, INPUT, SHARED, ROUTED) or dense (OUTPUT, INPUT).
+    struct Layout { attention: Vec<Vec<Vec<Plane>>>, ffn: Vec<Vec<Vec<Plane>>>, head: Vec<Plane> }
+
+    fn layout(modes: &[Mode], shared_region: bool) -> Layout {
+        let mut out = Layout { attention: vec![vec![]; 2], ffn: vec![vec![]; 2], head: vec![] };
+        for rank in 0..2 {
+            let largest = (0..LAYERS).filter(|&l| owns(modes[l], rank))
+                .map(|l| native::attention_bytes(CHUNK, full(l), heads(modes[l])).unwrap() as usize).max().unwrap();
+            for (layer, &mode) in modes.iter().enumerate() {
+                let sizes = attention(layer, mode, CHUNK);
+                let half = attention(layer, mode, CHUNK / 2);
+                out.attention[rank].push(planes(&sequential(&sizes), 0, &sequential(&half)));
+                let own = native::plane_bytes(&sizes).unwrap() as usize;
+                let (ffn, ffn_half) = match (routed(layer), shared_region) {
+                    (true, true) => (native::routed_layout(CHUNK).unwrap().to_vec(), native::routed_layout(CHUNK / 2).unwrap().to_vec()),
+                    (false, true) => (native::dense_layout(CHUNK).unwrap().to_vec(), native::dense_layout(CHUNK / 2).unwrap().to_vec()),
+                    (true, false) => (sequential(&native::routed_planes(CHUNK).unwrap()), sequential(&native::routed_planes(CHUNK / 2).unwrap())),
+                    (false, false) => (sequential(&native::dense_planes(CHUNK).unwrap()), sequential(&native::dense_planes(CHUNK / 2).unwrap())),
+                };
+                out.ffn[rank].push(planes(&ffn, if shared_region { largest } else { own }, &ffn_half));
+            }
+        }
+        let rows = native::head_rows(CHUNK, false);
+        out.head = planes(&sequential(&native::head_planes(rows).unwrap()), 0, &sequential(&native::head_planes(rows).unwrap()));
+        out
+    }
+
+    const ROUTED_LIVE: [usize; 3] = [0, 8, 9];
+    const OUTPUT: [usize; 2] = [13, 5];
+
+    /// Units stream through layers with up to `inflight` routed waves open;
+    /// a unit's previous FFN finishes before its own next attention, and its
+    /// attention is followed by its own begin before any other attention.
+    fn schedule(units: usize, inflight: usize) -> Vec<(Hook, usize, usize)> {
+        let mut actions = Vec::new();
+        let mut pending: std::collections::VecDeque<(usize, usize)> = Default::default();
+        for layer in 0..LAYERS {
+            for unit in 0..units {
+                if let Some(at) = pending.iter().position(|&(l, u)| u == unit && l + 1 == layer) {
+                    for (l, u) in pending.drain(..=at) { actions.push((Hook::Finish, l, u)); }
+                }
+                actions.push((Hook::Attention, layer, unit));
+                if routed(layer) && pending.len() == inflight {
+                    let (l, u) = pending.pop_front().unwrap();
+                    actions.push((Hook::Finish, l, u));
+                }
+                actions.push((Hook::Begin, layer, unit));
+                if routed(layer) { pending.push_back((layer, unit)); } else { actions.push((Hook::Finish, layer, unit)); }
+            }
+        }
+        actions.extend(pending.drain(..).map(|(l, u)| (Hook::Finish, l, u)));
+        actions.push((Hook::Head, LAYERS, units - 1));
+        actions
+    }
+
+    fn overlaps(a: &Range<usize>, b: &Range<usize>) -> bool { a.start < b.end && b.start < a.end }
+
+    /// First hazard: a write by one unit over another unit's live bytes.
+    fn replay(modes: &[Mode], layout: &Layout, units: usize, inflight: usize) -> Option<String> {
+        let width = CHUNK / units;
+        let rows = |unit: usize| unit * width..(unit + 1) * width;
+        // Per rank: (unit, live byte range, what).
+        let mut live: Vec<Vec<(usize, Range<usize>, String)>> = vec![vec![]; 2];
+        for (hook, layer, unit) in schedule(units, inflight) {
+            let span = rows(unit);
+            let mut writes: Vec<(usize, Range<usize>)> = Vec::new();
+            let mut keep: Vec<(usize, Range<usize>, String)> = Vec::new();
+            for rank in 0..2 {
+                if hook == Hook::Head {
+                    if rank == 0 { writes.extend(layout.head.iter().map(|p| (0, p.offset..p.offset + p.bytes))); }
+                    continue;
+                }
+                if !owns(modes[layer], rank) { continue; }
+                let attention = &layout.attention[rank][layer];
+                let ffn = &layout.ffn[rank][layer];
+                match hook {
+                    Hook::Attention => {
+                        live[rank].retain(|(u, _, what)| *u != unit || !what.starts_with("output"));
+                        writes.extend(attention.iter().map(|p| (rank, p.rows(&span))));
+                        keep.extend(attention.iter().enumerate().map(|(i, p)| (rank, p.rows(&span), format!("attention {layer} plane {i}"))));
+                    }
+                    Hook::Begin => {
+                        live[rank].retain(|(u, _, what)| *u != unit || !what.starts_with("attention"));
+                        let local: Vec<usize> = if routed(layer) { vec![0, 1, 2, 3, 4, 5, 6, 7, 8] } else { (0..6).collect() };
+                        writes.extend(local.iter().map(|&i| (rank, ffn[i].rows(&span))));
+                        if routed(layer) {
+                            keep.extend(ROUTED_LIVE.iter().map(|&i| (rank, ffn[i].rows(&span), format!("wave {layer} plane {i}"))));
+                        } else {
+                            keep.push((rank, ffn[5].rows(&span), format!("output {layer}")));
+                        }
+                    }
+                    Hook::Finish if routed(layer) => {
+                        live[rank].retain(|(u, _, what)| *u != unit || !what.starts_with(&format!("wave {layer} ")));
+                        // ROUTED lands from the intake or the peer's replication.
+                        writes.extend([9, 10, 11, 12, 13].iter().map(|&i| (rank, ffn[i].rows(&span))));
+                        keep.push((rank, ffn[OUTPUT[0]].rows(&span), format!("output {layer}")));
+                    }
+                    Hook::Finish | Hook::Head => {}
+                }
+            }
+            for (rank, range) in &writes {
+                if let Some((other, _, what)) = live[*rank].iter().find(|(u, held, _)| *u != unit && overlaps(held, range)) {
+                    return Some(format!("{hook:?} layer {layer} unit {unit} rank {rank} overwrites unit {other} {what}"));
+                }
+            }
+            live.iter_mut().for_each(|rank| rank.retain(|(u, _, what)| *u != unit
+                || !(hook == Hook::Attention && what.starts_with("attention"))));
+            for (rank, range, what) in keep { live[rank].push((unit, range, what)); }
+        }
+        None
+    }
+
+    fn modes(contiguous: bool) -> Vec<Mode> {
+        let csa: Vec<usize> = (0..LAYERS).filter(|&l| full(l)).collect();
+        (0..LAYERS).map(|layer| if !full(layer) { Mode::Split } else {
+            let ordinal = csa.iter().position(|&l| l == layer).unwrap();
+            Mode::Whole(if contiguous { usize::from(ordinal >= csa.len() / 2) } else { ordinal % 2 })
+        }).collect()
+    }
+
+    #[test]
+    fn shared_ffn_region_survives_csa_transitions_and_replicated_replies() {
+        for contiguous in [true, false] {
+            let modes = modes(contiguous);
+            let shared = layout(&modes, true);
+            for (units, inflight) in [(1, 1), (2, 1), (3, 1), (2, 2), (3, 2), (4, 2), (4, 3)] {
+                assert_eq!(replay(&modes, &shared, units, inflight), None,
+                    "{units} units, {inflight} in flight, contiguous={contiguous}");
+            }
+            // The per-kind layout (FFN after each layer's own attention) loses
+            // live rows as soon as two units interleave across layer kinds.
+            let old = layout(&modes, false);
+            assert_eq!(replay(&modes, &old, 1, 1), None);
+            let hazard = replay(&modes, &old, 2, 1).expect("per-kind offsets must be caught");
+            assert!(hazard.contains("overwrites unit"), "{hazard}");
+        }
+    }
+
+    #[test]
+    fn schedule_finishes_each_unit_before_its_next_attention() {
+        for (units, inflight) in [(1, 1), (3, 1), (3, 2), (4, 3)] {
+            let mut done = vec![vec![false; LAYERS]; units];
+            let mut open = 0usize;
+            let mut last_attention: Option<usize> = None;
+            for (hook, layer, unit) in schedule(units, inflight) {
+                match hook {
+                    Hook::Attention => {
+                        assert!(layer == 0 || done[unit][layer - 1]);
+                        assert!(last_attention.is_none(), "attention before the previous unit's begin");
+                        last_attention = Some(unit);
+                    }
+                    Hook::Begin => {
+                        assert_eq!(last_attention.take(), Some(unit));
+                        if routed(layer) { open += 1; assert!(open <= inflight); }
+                    }
+                    Hook::Finish => { if routed(layer) { open -= 1; } done[unit][layer] = true; }
+                    Hook::Head => assert!(done.iter().all(|unit| unit.iter().all(|&d| d))),
+                }
+            }
+        }
     }
 }

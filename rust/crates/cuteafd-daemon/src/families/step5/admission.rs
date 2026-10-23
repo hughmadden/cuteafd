@@ -34,12 +34,13 @@ pub(super) fn admit_mtp<'a>(
     let ownership = &admitted.ownership;
     for rank in 0..ownership.ranks() {
         let native =
-            Execution::serving_admission(programs, checkpoint, ownership, rank, inputs.rows)?;
+            Execution::serving_admission(programs, checkpoint, ownership, rank, inputs.rows, inputs.logit_rows())?;
         let shared = cuteafd_loader::plan::families::step5::native::rank_admission(
             checkpoint,
             ownership,
             rank,
             inputs.rows,
+            inputs.logit_rows(),
         )?;
         ensure!(
             native.immutable == shared.immutable && native.workspace == shared.workspace,
@@ -210,6 +211,13 @@ mod tests {
             assert_eq!(report.wip_launchable(), launchable,
                 "nvfp4={nvfp4} context={context} pool={pool:?} host={host:?} entries={entries}: {:?}", report.hints);
             assert!(!report.executable());
+            // The planner's automatic prefill unit (2048, or the step-down that
+            // keeps its pool) is what the daemon admits.
+            let rows = report.prefill_rows.unwrap_or(2048) as usize;
+            if launchable {
+                assert!([2048, 1024, 512].contains(&rows), "{rows}");
+                assert!(report.prefill_selection.as_deref().is_some_and(|s| s.contains(&format!("{rows} rows"))));
+            }
             let mut code = Vec::new();
             let gpus = opts
                 .rtx_bytes
@@ -244,7 +252,8 @@ mod tests {
                     spark_ranks: sparks,
                     peer_access: ranks == 2,
                 },
-                rows: 256,
+                rows,
+                full_prefill_logits: false,
                 sequences: 16,
                 context,
                 requested_pool: pool,

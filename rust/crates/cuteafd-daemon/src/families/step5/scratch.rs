@@ -140,15 +140,14 @@ mod tests {
             let metadata_offset = usize::try_from(native::mtp_metadata_offset(rows)?)?;
             let core = usize::try_from(native::mtp_scratch_core(rows, kv_format)?)?;
             let attention = view_layout(predictor, &attention_sizes, 0)?;
-            let dense = view_layout(predictor, &native::dense_planes(rows)?, attention_bytes)?;
+            let dense = native::dense_layout(rows)?.map(|(offset, bytes)| (attention_bytes + offset, bytes)).to_vec();
             let inputs = view_layout(predictor, &native::mtp_input_planes(rows)?, input_offset)?;
             let metadata_sizes = native::mtp_metadata_planes(rows)?;
             let metadata = view_layout(predictor, &metadata_sizes[..4], metadata_offset)?;
-            let head = view_layout(predictor, &native::head_planes(rows)?, 0)?;
+            let head = view_layout(predictor, &native::head_planes(native::head_rows(rows, false))?, 0)?;
             let selected = (0..3).map(|stage| view_layout(predictor, &metadata_sizes[4..],
                 core + stage * 256).map(|views| views[0])).collect::<Result<Vec<_>>>()?;
-            assert_eq!(input_offset, attention_bytes
-                + usize::try_from(native::plane_bytes(&native::dense_planes(rows)?)?)?);
+            assert_eq!(input_offset, attention_bytes + usize::try_from(native::ffn_region_bytes(rows)?)?);
             let compact = if kv_format == Qwen4KvCache::Fp8 {
                 view_layout(predictor, &native::mtp_compact_planes(rows, kv_format)?,
                     usize::try_from(native::mtp_compact_offset(rows)?)?)?
@@ -160,7 +159,7 @@ mod tests {
                 assert!(live_core[i + 1..].iter().all(|&b| disjoint(a, b)));
             }
             // FFN consumes attention POST before writing its own disjoint output.
-            let output = *dense.last().unwrap();
+            let output = dense[5];
             assert!(attention.iter().all(|&span| disjoint(output, span)));
             // Head reads the F32 output before its later logits overwrite scratch.
             assert!(head[..2].iter().all(|&span| disjoint(output, span)));
@@ -170,8 +169,8 @@ mod tests {
             }
             // Target outputs can alias predictor scratch only after the backend's
             // history copy and the scheduler's logit selection have retired them.
-            for (full, heads, routed) in [(false, 32, false), (false, 64, true), (true, 64, true)] {
-                let target = usize::try_from(native::layer_workspace(rows, full, heads, routed)?)?;
+            for (full, heads) in [(false, 32), (false, 64), (true, 64)] {
+                let target = usize::try_from(native::layer_workspace(rows, full, heads)?)?;
                 let capacity = target.max(predictor);
                 for &(offset, bytes) in live_core.iter().chain(&head).chain(&selected) {
                     assert!(offset + bytes <= capacity);
@@ -207,26 +206,30 @@ mod tests {
 
     #[test]
     fn arena_views_match_admission_and_preserve_residual_until_consumed() -> Result<()> {
-        for rows in [1, 3, 16, 63, 64, 65, 256, 640, 1025, 4095, 4096] {
+        for rows in [1, 3, 16, 63, 64, 65, 256, 640, 1025, 2048, 4095, 4096] {
             let residual = rows * 4096 * 4;
+            let largest = usize::try_from(native::attention_bytes(rows, true, 64)?)?;
+            let region = usize::try_from(native::ffn_region_bytes(rows)?)?;
             for attention in [native::swa_planes(rows, 32)?.to_vec(),
                 native::swa_planes(rows, 64)?.to_vec(), native::csa_planes(rows)?.to_vec()] {
                 let attention_bytes = usize::try_from(native::plane_bytes(&attention)?)?;
-                for ffn in [native::dense_planes(rows)?.to_vec(), native::routed_planes(rows)?.to_vec()] {
-                    let capacity = attention_bytes + usize::try_from(native::plane_bytes(&ffn)?)?;
-                    let attention_views = view_layout(capacity, &attention, 0)?;
-                    let ffn_views = view_layout(capacity, &ffn, attention_bytes)?;
-                    assert_eq!(attention_views[0], (0, residual));
-                    assert!(attention_views.iter().all(|&(offset, bytes)| offset + bytes <= attention_bytes));
-                    assert!(ffn_views.iter().all(|&(offset, _)| offset >= attention_bytes));
-                    let output = ffn_views.last().unwrap();
-                    // The next layer copies this residual to offset zero before any reuse.
-                    assert!(output.0 >= residual);
-                    assert_eq!(output.1, residual);
-                    // The head narrows into planes 0/1 before logits may overwrite the residual.
-                    let head = native::head_planes(rows)?;
-                    assert!(head[0] + head[1] <= output.0);
-                }
+                assert!(attention_bytes <= largest);
+                let attention_views = view_layout(largest + region, &attention, 0)?;
+                assert_eq!(attention_views[0], (0, residual));
+                // Attention never reaches the shared FFN region at the rank's offset.
+                assert!(attention_views.iter().all(|&(offset, bytes)| offset + bytes <= largest));
+            }
+            for ffn in [native::dense_layout(rows)?.to_vec(), native::routed_layout(rows)?.to_vec()] {
+                let views = ffn.iter().map(|&(offset, bytes)| (largest + offset, bytes)).collect::<Vec<_>>();
+                assert!(views.iter().all(|&(offset, bytes)| offset >= largest && offset + bytes <= largest + region));
+                // Every kind's OUTPUT is the region's first plane.
+                let output = *views.iter().min().unwrap();
+                assert_eq!(output, (largest, residual));
+                // The next layer copies this residual to offset zero before any reuse.
+                assert!(output.0 >= residual);
+                // The head narrows into planes 0/1 before logits may overwrite the residual.
+                let head = native::head_planes(native::head_rows(rows, false))?;
+                assert!(head[0] + head[1] <= output.0);
             }
         }
         assert!(view_layout(1024, &[1025], 0).is_err());
@@ -234,6 +237,24 @@ mod tests {
         assert!(view_layout(usize::MAX, &[usize::MAX], 0).is_err());
         Ok(())
     }
+}
+
+/// FFN planes at the shared region offsets (`native::dense_layout`/`routed_layout`)
+/// when arena-backed, so every FFN kind keeps its live planes at common offsets.
+pub(super) fn region_planes<'a>(device: Device<'a>, spans: &[(usize, usize)],
+    arena: Option<(&Arena<'a>, usize)>) -> Result<Vec<Plane<'a>>> {
+    let Some((arena, base)) = arena else {
+        return planes(device, &spans.iter().map(|&(_, bytes)| bytes).collect::<Vec<_>>(), None);
+    };
+    ensure!(device.id == arena.0.device.id && std::ptr::eq(device.library, arena.0.device.library),
+        "Step-5 scratch device mismatch");
+    spans.iter().map(|&(offset, bytes)| {
+        let start = base.checked_add(offset).context("Step-5 region view overflow")?;
+        ensure!(start % 16 == 0 && start.checked_add(bytes).is_some_and(|end| end <= arena.0.buffer.bytes),
+            "Step-5 region view extent");
+        Ok(Plane { buffer: CuteafdDeviceBuffer { ptr: arena.0.buffer.ptr.wrapping_byte_add(start), bytes,
+            ..arena.0.buffer }, _owner: arena.0.clone() })
+    }).collect()
 }
 
 pub(super) fn planes<'a>(device: Device<'a>, sizes: &[usize],
