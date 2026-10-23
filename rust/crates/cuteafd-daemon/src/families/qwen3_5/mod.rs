@@ -58,6 +58,9 @@ pub(crate) struct GoldenArgs {
     /// Compare this many plain and policy-selected speculative greedy tokens.
     #[arg(long, requires = "draft")]
     pub spec_decode: Option<usize>,
+    /// Compare the native checkpoint MTP layer with an independent teacher-forced oracle.
+    #[arg(long, conflicts_with_all = ["draft", "spec_decode", "verify_check", "prefix_check"])]
+    pub mtp_golden: Option<PathBuf>,
     /// Maximum absolute mean-NLL difference from the supplied reference.
     #[arg(long, default_value_t = 0.01)]
     pub nll_tolerance: f64,
@@ -92,6 +95,9 @@ pub(crate) async fn run_golden(args: GoldenArgs) -> Result<()> {
     let library = unsafe { cuteafd_ffi::NativeLibrary::load(native)? };
     library.cuda_set_device(args.device)?;
     let programs = library.programs()?.with_manifest(&args.manifest)?;
+    if let Some(reference) = &args.mtp_golden {
+        return engine::mtp::oracle(&args, &library, &programs, &checkpoint, cfg, &directory, reference, &tokens);
+    }
     if let Some(count) = args.spec_decode {
         return dspark::spec_decode(&args, &library, &programs, &checkpoint, cfg, &tokens, count);
     }
@@ -201,6 +207,17 @@ fn reference_window(root: &std::path::Path, window: &str, snapshot: &std::path::
 #[cfg(test)]
 mod tests {
     use clap::Parser;
+    #[test]
+    fn mtp_oracle_is_explicit_and_excludes_other_draft_modes() {
+        #[derive(clap::Parser)]
+        struct Cli { #[command(flatten)] args: super::GoldenArgs }
+        let parsed = Cli::try_parse_from(["test", "--snapshot", "model", "--mtp-golden", "oracle"]).unwrap();
+        assert_eq!(parsed.args.mtp_golden.as_deref(), Some(std::path::Path::new("oracle")));
+        for flag in ["--verify-check", "--prefix-check"] {
+            assert!(Cli::try_parse_from(["test", "--snapshot", "model", "--mtp-golden", "oracle", flag]).is_err());
+        }
+        assert!(Cli::try_parse_from(["test", "--snapshot", "model", "--mtp-golden", "oracle", "--draft", "draft"]).is_err());
+    }
     #[test]
     fn scored_window_rows_predict_the_token_at_position_not_after_it() {
         let logits = [4.0, 0.0, 0.0, 4.0, 9.0, -9.0];
