@@ -535,7 +535,10 @@ fn prefill_lanes_byte_exact(total: usize, chunk: usize) -> Result<()> {
                 let last = (batch + 1) * LANES >= shape.len();
                 eprintln!("EXLR8 lane golden pipeline total={total} batch={batch} rows={:?}",
                     chunks.iter().map(|chunk| chunk.len()).collect::<Vec<_>>());
-                let logits = engine.host_logits(engine.step_lanes(tables, chunks, usize::from(last))?)?;
+                let mut link = engine.prefill_link.borrow_mut();
+                let link = link.as_mut().context("EXLR8 lane golden needs the prefill link")?;
+                let runtime = engine.prefill_runtime.as_ref().context("prefill runtime")?;
+                let logits = engine.host_logits(engine.step_lanes(tables, chunks, usize::from(last), link, runtime)?)?;
                 if last { pipelined = logits; }
                 else { ensure!(logits.is_none(), "zero-row pipeline prefill returned logits"); }
             }

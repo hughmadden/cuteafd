@@ -321,9 +321,14 @@ pub fn request(inputs: &GlmInputs<'_>) -> Result<PlacementRequest, PlacementErro
                     Basis::Formula)));
             }
             if inputs.spark_ranks > 0 {
-                let endpoints = 1 + if inputs.prefill_lanes > 1 { inputs.prefill_lanes } else { 0 };
+                // The decode link's 4096-row planes, plus the prefill link's return
+                // slots: one unit of `prefill_rows` per wave in flight.
+                let prefill = if inputs.prefill_lanes > 1 {
+                    crate::serving_capacity::prefill_return_bytes(inputs.prefill_lanes, inputs.prefill_rows,
+                        inputs.spark_ranks as u64, cfg.hidden as u64)
+                } else { 0 };
                 rows.push(GlmBufferRow::new(GlmComponent::SparkExperts, Demand::new(gpu, Category::Transport, "Spark intake planes",
-                    endpoints * inputs.spark_ranks as u64 * 4096 * cfg.hidden as u64 * 2, Basis::Formula)));
+                    inputs.spark_ranks as u64 * 4096 * cfg.hidden as u64 * 2 + prefill, Basis::Formula)));
             }
         }
         pool_overhead.push(table_bytes);
@@ -930,9 +935,9 @@ mod tests {
             let mut ordinary = base.clone(); ordinary.prefill_lanes = lanes;
             assert_eq!(term(&request(&parallel).unwrap(), "steps")
                 - term(&request(&ordinary).unwrap(), "steps"), (1 + lanes) * 123456);
-            let endpoints = 1 + if lanes > 1 { lanes } else { 0 };
+            let prefill = if lanes > 1 { lanes * 4 * parallel.prefill_rows * h * 2 } else { 0 };
             assert_eq!(term(&request(&parallel).unwrap(), "Spark intake planes"),
-                endpoints * 4 * 4096 * h * 2);
+                4 * 4096 * h * 2 + prefill);
         }
         for gpus in 1..=2 {
             let mut drafting = native.clone();
@@ -1086,7 +1091,8 @@ mod tests {
             assert!(working.spark.includes(WorkingSetComponent::SparkExperts));
             assert_eq!(working.tp2_workspace, if n == 0 { [0; 2] } else { input.tp2_workspace });
             let intake = p.items[0].iter().find(|item| item.group == "Spark intake planes").unwrap();
-            assert_eq!(intake.bytes, 4 * 4 * 4096 * 6144 * 2);
+            // Decode's 4096-row planes plus three prefill return slots of a unit each.
+            assert_eq!(intake.bytes, 4 * 4096 * 6144 * 2 + 3 * 4 * input.prefill_rows * 6144 * 2);
         }
     }
 

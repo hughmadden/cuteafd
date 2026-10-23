@@ -293,9 +293,26 @@ pub(crate) struct GlmEngine<'a> {
     /// GPU work. Without lane transports, or with CUTEAFD_GLM_PREFILL_LANES=1,
     /// prefill is serial on the caller's transport.
     lane_workspaces: RefCell<Vec<Workspace<'a>>>,
-    /// Lanes a long prefill chunk splits into.
+    /// Prefill units in flight on the one Spark transport (PLAN "Prefill
+    /// contract"): each unit owns a prefill workspace slot (`lane_workspaces`).
     prefill_lanes: usize,
+    /// Recorded after a unit's route/wire copies to its pinned staging: the
+    /// host waits for these copies only, never the whole stream.
+    staged: Cell<*mut c_void>,
+    /// Under context, per staging parity: the (layer, unit) whose attention
+    /// last filled it. A unit reuses the view only when its same-sequence
+    /// predecessor filled it at this layer; otherwise it gathers its history.
+    staging_owner: RefCell<[Option<(usize, usize)>; 2]>,
+    /// Set by [`Self::context_unit_turn`] for the attention about to run.
+    context_reuse: Cell<bool>,
+    /// Legacy per-lane transport threads; prefill no longer creates them.
     pub lanes: RefCell<Vec<SparkLane<'a>>>,
+    /// The one prefill transport: every unit's waves, up to `prefill_lanes`
+    /// outstanding, each landing in its own return slot. Decode keeps its own
+    /// link (its captured graphs bake one intake's planes).
+    pub prefill_link: RefCell<Option<SparkLink<'a>>>,
+    /// Its tokio runtime (receives poll on the engine thread).
+    pub prefill_runtime: Option<tokio::runtime::Runtime>,
     terminal: Cell<crate::shared::peer_split::TerminalState>,
     /// Prefill steps keep every row's logits (golden scoring); otherwise the
     /// prefill workspace holds logits for at most `DECODE_ROWS` rows.
@@ -399,7 +416,8 @@ impl<'a> GlmEngine<'a> {
         Ok(Self { quantize_grid, device, native_experts: Vec::new(), peer: None, exchange: None, tp2: None, tp2_exchange: ExchangeDtype::Bf16, force_route_check: Cell::new(false), context_mode, context: None, layer_execution: None,
             context_units: RefCell::new(Vec::new()), library, programs, cfg, weights, stream, max_context, prefill_rows, pages, kv, index, cos_sin,
             decode_workspace: RefCell::new(None), lane_workspaces: RefCell::new(Vec::new()),
-            prefill_lanes,
+            prefill_lanes, staged: Cell::new(library.cuda_event_create_ordering()?),
+            staging_owner: RefCell::new([None; 2]), context_reuse: Cell::new(false), prefill_link: RefCell::new(None), prefill_runtime: None,
             attention_plan: cuteafd_core::coordinator_programs::AttentionReductionPlan::new(DECODE_ROWS, None, None)?,
             lanes: RefCell::new(Vec::new()), terminal: Cell::new(crate::shared::peer_split::TerminalState::Active), spark_bf16: false, full_prefill_logits: false, skip: None, l2: None, profile: RefCell::new([0.0; 3]),
             exchange_host: RefCell::new([0.0; 4]), draft_probe: RefCell::new(None),
@@ -729,8 +747,7 @@ impl<'a> GlmEngine<'a> {
 
     /// Whether a Spark prefill runs as lanes (a lane transport, every layer resident).
     fn pipelined(&self) -> bool {
-        self.prefill_lanes > 1 && self.lanes.borrow().len() >= self.prefill_lanes
-            && self.weights.layers.len() == self.cfg.layers
+        self.prefill_lanes > 1 && self.weights.layers.len() == self.cfg.layers && self.prefill_link.borrow().is_some()
     }
 
     /// Longest chunk one prefill call takes (a lane of `prefill_rows` each when pipelined).
@@ -781,7 +798,10 @@ impl<'a> GlmEngine<'a> {
                 chunks.push(&tokens[first..first + n]);
                 first += n;
             }
-            let logits = self.step_lanes(&lanes, &chunks, logit_rows)?;
+            let mut link = self.prefill_link.borrow_mut();
+            let link = link.as_mut().context("GLM prefill units need the prefill link")?;
+            let runtime = self.prefill_runtime.as_ref().context("GLM prefill runtime")?;
+            let logits = self.step_lanes(&lanes, &chunks, logit_rows, link, runtime)?;
             placement.len += t;
             return Ok(logits);
         }
@@ -1573,7 +1593,10 @@ impl<'a> GlmEngine<'a> {
             layout.enqueue(self.library, staging.buffer,
                 [w.route_ids.buffer, w.route_weights.buffer,
                     if self.spark_bf16 { w.x.buffer } else { w.wire.buffer }], self.stream)?;
-            self.library.cuda_stream_synchronize(self.stream)?;
+            // Wait for this unit's copies only: other units' queued work keeps
+            // the GPU busy while the host builds and posts the request.
+            self.library.cuda_event_record(self.staged.get(), self.stream)?;
+            self.library.cuda_event_synchronize(self.staged.get())?;
         }
         self.profile.borrow_mut()[0] += timer.elapsed().as_secs_f64();
         if let Some((ordinal, rows, pinned)) = sample {
@@ -1671,16 +1694,19 @@ impl<'a> GlmEngine<'a> {
     /// own workspace kept from its last full layer. A lane's request is built,
     /// posted and received on its thread while this thread queues the other
     /// lanes' GPU layers. Returns the last `logit_rows` rows' logits.
-    fn step_lanes(&self, lanes: &[StepTables], chunks: &[&[u32]], logit_rows: usize) -> Result<Option<StepLogits>> {
+    fn step_lanes(&self, lanes: &[StepTables], chunks: &[&[u32]], logit_rows: usize,
+        link: &mut SparkLink<'_>, runtime: &tokio::runtime::Runtime) -> Result<Option<StepLogits>> {
         crate::shared::experts::rtx::pair::submit_scoped(
             || self.require_live(), || {
                 crate::shared::decode_graph::fatal_drain(self.retire_tp2(), "GLM submission shutdown");
                 Ok(())
             },
-            |scope| self.step_lanes_inner(scope, lanes, chunks, logit_rows))
+            |scope| self.step_lanes_inner(scope, lanes, chunks, logit_rows, link, runtime))
     }
 
-    fn step_lanes_inner(&self, scope: &crate::shared::experts::rtx::pair::SubmissionScope<'_>, lanes: &[StepTables], chunks: &[&[u32]], logit_rows: usize) -> Result<Option<StepLogits>> {
+    fn step_lanes_inner(&self, scope: &crate::shared::experts::rtx::pair::SubmissionScope<'_>, lanes: &[StepTables],
+        chunks: &[&[u32]], logit_rows: usize, link: &mut SparkLink<'_>, runtime: &tokio::runtime::Runtime)
+        -> Result<Option<StepLogits>> {
         {
             let mut slots = self.lane_workspaces.borrow_mut();
             while slots.len() < lanes.len() {
@@ -1689,9 +1715,8 @@ impl<'a> GlmEngine<'a> {
         }
         let owned = self.lane_workspaces.borrow();
         let workspaces: Vec<&Workspace<'_>> = owned.iter().collect();
-        let mut transports = self.lanes.borrow_mut();
-        let planes: Vec<[*const u16; crate::shared::spark_intake::MAX_INTAKE_RANKS]> = transports.iter().map(|lane| lane.intake.pointers()).collect();
-        ensure!(transports.len() >= lanes.len(), "{} lanes need as many lane transports", lanes.len());
+        ensure!(lanes.len() <= link.waves().max(1) || link.waves() == 1,
+            "{} prefill units exceed the link's {} waves in flight", lanes.len(), link.waves());
         let counts: Vec<usize> = lanes.iter().map(|l| l.positions.len()).collect();
         let starts: Vec<usize> = counts.iter().scan(0, |first, &n| {
             let here = *first;
@@ -1715,9 +1740,8 @@ impl<'a> GlmEngine<'a> {
             self.embedding.embed(tokens, w.ids.buffer, 1, w.h.buffer, self.stream)?;
         }
         if self.layer_execution.is_some() {
-            drop(transports);
             return self.layer_prefill(scope, &workspaces[..lanes.len()],
-                peer_workspaces.as_ref().context("owned attention lanes")?, &ranked, logit_rows);
+                peer_workspaces.as_ref().context("owned attention lanes")?, &ranked, logit_rows, link, runtime);
         }
         let layers = &self.weights.layers;
         let cap = "m4096";
@@ -1725,16 +1749,16 @@ impl<'a> GlmEngine<'a> {
         let bytes_of_lane = |lane: usize| counts[lane] * self.cfg.hidden * 2;
         // Transfer embeddings in DIRECT publication order. Attention is paired per unit.
         if let Some(peers) = &peer_workspaces {
-            // Only this step's lanes (the workspace list keeps every lane ever used).
             for (lane, w) in workspaces.iter().take(lanes.len()).enumerate() {
                 let w1 = peers.get(lane)?;
                 self.exchange()?.push_to(0, DIRECT, w.h.buffer.ptr, w1.h.buffer.ptr, bytes_of_lane(lane))?;
             }
         }
-        // The drafter taps the chunk's last TAP_ROWS rows: each lane's part of
+        // The drafter taps the chunk's last TAP_ROWS rows: each unit's part of
         // that window, at its offset among the tap rows.
         let window = total - total.min(crate::shared::speculation::dflash::TAP_ROWS);
-        let attention = |(index, lane): (usize, usize)| -> Result<()> {
+        *self.staging_owner.borrow_mut() = [None; 2];
+        let attention = |index: usize, lane: usize| -> Result<()> {
             if let Some(peers) = &peer_workspaces {
                 self.peer_attention(index, lane, peers.get(lane)?, rows_of(lane), cap,
                     &ranked[lane], bytes_of_lane(lane))?;
@@ -1767,10 +1791,10 @@ impl<'a> GlmEngine<'a> {
             }
         };
         // h += ffn (routed partials reduced first); x = the next input norm.
-        let post = |(index, lane): (usize, usize), ranks: Option<usize>| -> Result<()> {
+        let post = |index: usize, lane: usize, planes: Option<([*const u16; MAX_RANKS], usize)>| -> Result<()> {
             let (w, rows) = (workspaces[lane], rows_of(lane));
-            if let Some(ranks) = ranks {
-                self.reduce(planes[lane], w, ranks, counts[lane])?;
+            if let Some((planes, ranks)) = planes {
+                self.reduce(planes, w, ranks, counts[lane])?;
             }
             let weight = match layers.get(index + 1) {
                 Some(next) => next.ptr("input_norm")?,
@@ -1780,7 +1804,7 @@ impl<'a> GlmEngine<'a> {
                 // Rank 1's dense partial or shared-expert half in; the routed + shared sum out
                 // first (not after the last layer).
                 let ffn = slot(index, true, lane);
-                if ranks.is_some() && index + 1 < layers.len() {
+                if planes.is_some() && index + 1 < layers.len() {
                     self.exchange()?.push(0, ffn, w.delta.buffer.ptr, bytes_of_lane(lane))?;
                 }
                 self.peer_post(index, lane, peer_workspaces.as_ref().context("peer workspaces")?.get(lane)?,
@@ -1802,46 +1826,14 @@ impl<'a> GlmEngine<'a> {
             }
             Ok(())
         };
-        let count = lanes.len();
-        let units: Vec<(usize, usize)> = (0..layers.len()).flat_map(|l| (0..count).map(move |k| (l, k))).collect();
-        // Waves in flight, oldest first. A unit's request goes out as soon as
-        // its routes are down; waves land (and post) only when the next
-        // unit's attention needs its lane's previous layer, so up to
-        // `lanes - 1` waves overlap the GPU's other lanes.
-        let mut inflight: std::collections::VecDeque<(usize, usize)> = std::collections::VecDeque::new();
-        let land = |unit: (usize, usize), transports: &mut Vec<SparkLane<'_>>| -> Result<()> {
-            let ranks = self.lane_land(counts[unit.1], &mut transports[unit.1])?;
-            post(unit, Some(ranks))
-        };
-        attention(units[0])?;
-        for (position, &unit) in units.iter().enumerate() {
-            let (index, lane) = unit;
-            if layers[index].dense {
-                post(unit, None)?;
-            } else if self.tp2_layer(index) {
-                let w1 = peer_workspaces.as_ref().context("TP2 peer workspaces")?.get(lane)?;
-                self.tp2_pair(index, lane, workspaces[lane], w1, counts[lane], cap)?;
-                post(unit, None)?;
-            } else {
-                self.moe_stage(workspaces[lane], index, &layers[index], counts[lane], cap)?;
-                self.lane_send(workspaces[lane], index, counts[lane], &mut transports[lane])?;
-                inflight.push_back(unit);
-            }
-            match units.get(position + 1).copied() {
-                Some(next) => {
-                    while inflight.iter().any(|u| u.1 == next.1) {
-                        let oldest = inflight.pop_front().context("in-flight waves")?;
-                        land(oldest, &mut transports)?;
-                    }
-                    attention(next)?;
-                }
-                None => {
-                    while let Some(oldest) = inflight.pop_front() {
-                        land(oldest, &mut transports)?;
-                    }
-                }
-            }
-        }
+        // Units of this call: one per workspace slot, every layer, one sequence.
+        let unit_list: Vec<crate::shared::prefill_pipeline::Unit> = (0..lanes.len()).map(|lane| {
+            crate::shared::prefill_pipeline::Unit { index: lane, sequence: 0,
+                rows: starts[lane]..starts[lane] + counts[lane], layers: 0..layers.len(), slot: lane, barrier: false }
+        }).collect();
+        let mut hooks = UnitHooks { engine: self, workspaces: &workspaces, layers, counts: &counts,
+            attention: &attention, post: &post, link, runtime, cap };
+        crate::shared::prefill_pipeline::run_prefill_units(&mut hooks, &unit_list, link_waves(lanes.len()))?;
         if let Some(pair) = &self.tp2 { pair.finish_checks()?; }
         self.prefill_logits(&workspaces[..lanes.len()], &counts, logit_rows)
     }
@@ -1890,6 +1882,19 @@ impl<'a> GlmEngine<'a> {
             &[rows, Scalar::I32(deltas)])
     }
 
+    /// Before unit `lane`'s attention at `index` under context: it reuses the layer
+    /// parity's staging view when the last attention on it was the previous unit's
+    /// at this same layer (that one gathered the history and wrote its rows
+    /// there); otherwise it gathers its own whole history. Units of a call are one
+    /// sequence in order, so unit `lane - 1` is the predecessor.
+    pub(super) fn context_unit_turn(&self, index: usize, lane: usize) -> Result<()> {
+        let mut owner = self.staging_owner.borrow_mut();
+        let view = &mut owner[index % 2];
+        self.context_reuse.set(lane > 0 && *view == Some((index, lane - 1)));
+        *view = Some((index, lane));
+        Ok(())
+    }
+
     /// Layer `index`'s attention on `rank` for one unit: `heads` over this rank's
     /// replicated pools, or under context the decode exchange / prefill gather (`lane`
     /// picks the prefill lane's commit blocks).
@@ -1903,7 +1908,12 @@ impl<'a> GlmEngine<'a> {
         if tables.decode {
             return self.context_decode_attention(rank, w, index, layer, rows, tables.positions.len(), tables);
         }
-        let unit = self.context_units.borrow().get(lane).context("context prefill unit")?[rank];
+        let mut unit = self.context_units.borrow().get(lane).context("context prefill unit")?[rank];
+        if self.context_reuse.get() {
+            // The staging view already holds this unit's history: its predecessor
+            // gathered it at this layer and wrote its own rows there.
+            unit.shards = [0; 2];
+        }
         self.context_prefill_attention(rank, w, index, layer, rows, cap, tables, lane, unit)
     }
 
@@ -1922,14 +1932,17 @@ impl<'a> GlmEngine<'a> {
         }
         let mut out = Vec::new();
         let mut context_units = Vec::new();
+        // Gather lists are one buffer per rank and every unit's history is a prefix
+        // of the sequence's pages: upload the units in order so the last (longest)
+        // list stays, and each unit's shard counts select its own prefix of it.
         for (lane, (&(w, w1, tables), pages)) in units.iter().zip(pages).enumerate() {
             let ranked = if self.context.is_some() {
                 let start = tables.positions.first().map_or(0, |&p| p as usize);
                 if !tables.decode {
-                    // Gather once per layer, by the step's first lane (later lanes' history
-                    // is earlier lanes' rows, already in the same staging view).
-                    let history = if lane == 0 { start } else { 0 };
-                    context_units.push([0, 1].map(|rank| self.context_prefill_tables(rank, lane, history,
+                    // Each unit records its full history; at its attention it gathers it
+                    // only when its predecessor's rows are not already in the staging view
+                    // ([`Self::context_unit_turn`]).
+                    context_units.push([0, 1].map(|rank| self.context_prefill_tables(rank, lane, start,
                         start, tables.positions.len(), pages)).into_iter().collect::<Result<Vec<_>>>()?
                         .try_into().map_err(|_| anyhow::anyhow!("two ranks"))?);
                 }
@@ -2157,6 +2170,66 @@ pub(crate) fn print_mla_check(layer: usize, stats: &[[f64; 3]; 5]) {
 }
 
 /// Prefill lanes: CUTEAFD_GLM_PREFILL_LANES (1 = serial), default 3.
+/// Waves in flight for a call of `units` units: all of them (each unit is one
+/// slot; the link admitted at least this many at startup).
+fn link_waves(units: usize) -> usize { units.max(1) }
+
+/// GLM's per-unit hooks over the unchanged lane arithmetic. Each unit owns
+/// one prefill workspace slot (rank 0's and rank 1's) and one exchange-slot
+/// lane; its Spark waves go out on the serving link, one return slot each.
+struct UnitHooks<'h, 'e, 'a, 'l, 'r, A, P> {
+    engine: &'h GlmEngine<'a>,
+    workspaces: &'h [&'h Workspace<'e>],
+    layers: &'h [GlmLayer<'a>],
+    counts: &'h [usize],
+    attention: &'h A,
+    post: &'h P,
+    link: &'h mut SparkLink<'l>,
+    runtime: &'r tokio::runtime::Runtime,
+    cap: &'static str,
+}
+
+impl<A, P> crate::shared::prefill_pipeline::PrefillHooks for UnitHooks<'_, '_, '_, '_, '_, A, P>
+where A: Fn(usize, usize) -> Result<()>,
+      P: Fn(usize, usize, Option<([*const u16; MAX_RANKS], usize)>) -> Result<()> {
+    type Ticket = SparkExpertWave;
+    fn route(&self, layer: usize) -> crate::shared::prefill_pipeline::FfnRoute {
+        if self.layers[layer].dense || self.engine.tp2_layer(layer) {
+            crate::shared::prefill_pipeline::FfnRoute::Local
+        } else { crate::shared::prefill_pipeline::FfnRoute::Spark }
+    }
+    fn begin_unit(&mut self, _: &crate::shared::prefill_pipeline::Unit) -> Result<()> { Ok(()) }
+    fn attention(&mut self, layer: usize, unit: &crate::shared::prefill_pipeline::Unit) -> Result<()> {
+        self.engine.context_unit_turn(layer, unit.slot)?;
+        (self.attention)(layer, unit.slot)
+    }
+    fn local_ffn(&mut self, layer: usize, unit: &crate::shared::prefill_pipeline::Unit) -> Result<()> {
+        let lane = unit.slot;
+        if self.engine.tp2_layer(layer) {
+            let peers = self.engine.peer_workspaces(false, lane + 1)?;
+            let w1 = peers.as_ref().context("TP2 peer workspaces")?.get(lane)?;
+            self.engine.tp2_pair(layer, lane, self.workspaces[lane], w1, self.counts[lane], self.cap)?;
+        }
+        (self.post)(layer, lane, None)
+    }
+    fn send_experts(&mut self, layer: usize, unit: &crate::shared::prefill_pipeline::Unit) -> Result<SparkExpertWave> {
+        let (lane, w) = (unit.slot, self.workspaces[unit.slot]);
+        self.engine.moe_stage(w, layer, &self.layers[layer], self.counts[lane], self.cap)?;
+        self.engine.moe_send(w, layer, self.counts[lane], false, self.link)
+    }
+    fn land_experts(&mut self, layer: usize, unit: &crate::shared::prefill_pipeline::Unit, wave: SparkExpertWave)
+        -> Result<()> {
+        let lane = unit.slot;
+        let ranks = self.runtime.block_on(self.engine.moe_land(self.counts[lane], self.link, wave))?;
+        // The reduce reads the return slot this wave just landed in; the slot is
+        // reused (dispatch waits on this) only after that reduce.
+        (self.post)(layer, lane, Some((self.link.intake.pointers(), ranks)))?;
+        self.link.intake.consumed(self.engine.stream)
+    }
+    fn end_unit(&mut self, _: &crate::shared::prefill_pipeline::Unit) -> Result<()> { Ok(()) }
+    fn commit_unit(&mut self, _: &crate::shared::prefill_pipeline::Unit) -> Result<()> { Ok(()) }
+}
+
 pub(crate) fn configured_lanes() -> usize {
     cuteafd_loader::plan::layout::glm_prefill_lanes(
         std::env::var("CUTEAFD_GLM_PREFILL_LANES").ok().as_deref())

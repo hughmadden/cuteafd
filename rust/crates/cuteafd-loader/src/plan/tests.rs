@@ -63,14 +63,15 @@ fn native_host_ledger_charges_six_spark_ranks_without_spark_device_entries() {
     let (request, response) = endpoint.wire_bytes(geometry).unwrap();
     let rings = SparkRings { max_frame_bytes: (64 << 20).max(request).max(response),
         depth: 8, slot_bytes: 8 << 20, alignment: 4096 };
-    let expected = endpoint.ring_bytes(geometry, rings).unwrap() as u64 * 4 * 6;
+    // Two endpoints per rank (decode link + one prefill link) over six ranks.
+    let expected = endpoint.ring_bytes(geometry, rings).unwrap() as u64 * 2 * 6;
     layout::charge_host(&mut report, &options, input.checkpoint(), true).unwrap();
     let host = report.host_ledger.as_ref().unwrap();
     let registered = host.items.iter().find(|i| i.group == "transport/rdma-rings").unwrap();
     assert_eq!(registered.bytes, expected);
     assert_eq!(registered.lifetime, ItemLifetime::PostReadyReserve);
     let intake = host.items.iter().find(|i| i.group == "spark-intake").unwrap();
-    assert_eq!(intake.bytes, 4096 * geometry.hidden as u64 * 4 * 4 * 6);
+    assert_eq!(intake.bytes, 4096 * geometry.hidden as u64 * 4 * 2 * 6);
     assert_eq!(host.shortfall_bytes, 0);
     report.spark_ranks = 0;
     layout::charge_host(&mut report, &options, input.checkpoint(), true).unwrap();

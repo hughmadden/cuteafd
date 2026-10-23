@@ -327,7 +327,8 @@ mod scoring_workspace_tests {
 pub fn spark_endpoints(family: &str, lanes: u64) -> usize {
     match family {
         "deepseek_v41" | "deepseek_v4" => 2,
-        "glm5" => 1 + if lanes > 1 { lanes as usize } else { 0 },
+        // The decode link and one prefill link (its waves share that endpoint's rings).
+        "glm5" => 1 + usize::from(lanes > 1),
         "glm5_flash" => 1,
         "mimo_v2" => lanes as usize,
         "qwen4" => 1,
@@ -382,7 +383,8 @@ mod selected_spark_io_tests {
         for (family, geometry, lanes, expected) in [
             ("deepseek_v4", ExpertGeometry::DEEPSEEK_V4_FLASH, 2, 821428224),
             ("deepseek_v4", ExpertGeometry::DEEPSEEK_V4_PRO, 2, 1431699456),
-            ("glm5", ExpertGeometry::GLM5, 3, 2459697152),
+            // Decode link + one prefill link (formerly one endpoint per lane: 2459697152).
+            ("glm5", ExpertGeometry::GLM5, 3, 1229848576),
             ("mimo_v2", ExpertGeometry::MIMO_V26_PRO, 3, 1844772864),
         ] {
             let working = SparkWorkingSet { spark_layers: vec![3], spark_ranks: 4,
@@ -425,7 +427,7 @@ mod selected_spark_io_tests {
             assert!(device.items.is_empty());
         }
         let glm = crate::placement::families::glm5::prefill_lanes(4, glm_prefill_lanes(None) as u64);
-        assert_eq!(spark_endpoints("glm5", glm), 4);
+        assert_eq!(spark_endpoints("glm5", glm), 2);
         assert_eq!(spark_endpoints("glm5", crate::placement::families::glm5::prefill_lanes(0, 3)), 1);
     }
 }

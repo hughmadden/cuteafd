@@ -11,7 +11,7 @@ pub(crate) mod weights;
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::NativeLibrary;
 use cuteafd_loader::families::glm5::GlmDsaConfig;
-use crate::shared::spark_intake::{SparkLane, SparkLink};
+use crate::shared::spark_intake::SparkLink;
 use std::ffi::c_void;
 use std::path::PathBuf;
 use std::time::Instant;
@@ -145,7 +145,8 @@ fn spark_model(lanes: usize, bf16: bool, native: bool) -> Result<cuteafd_transpo
     ensure!(lanes > 0, "GLM Spark admission requires at least one prefill lane");
     let ingress = if native { cuteafd_core::SparkIngress::Fp8K32 }
         else if bf16 { cuteafd_core::SparkIngress::Bf16 } else { cuteafd_core::SparkIngress::Fp8K32 };
-    let endpoints = 1 + if lanes > 1 { lanes } else { 0 };
+    // The decode link, plus one prefill link carrying `lanes` waves in flight.
+    let endpoints = 1 + usize::from(lanes > 1);
     Ok(cuteafd_transport::worker_selection::ModelAdmission {
         capacity: 4096, compiled_capacity: 4096,
         endpoints: vec![cuteafd_core::SparkEndpoint { ring_depth: None, capacity: 4096, ingress }; endpoints],
@@ -170,7 +171,8 @@ mod draft_cli_tests {
             for bf16 in [false, true] {
                 let model = spark_model(lanes, bf16, false)?;
                 model.validate(cuteafd_core::ExpertGeometry::GLM5)?;
-                assert_eq!(model.endpoints.len(), if lanes == 1 { 1 } else { lanes + 1 });
+                // The decode link and one prefill link carrying every wave in flight.
+                assert_eq!(model.endpoints.len(), if lanes == 1 { 1 } else { 2 });
                 assert!(model.endpoints.iter().all(|endpoint| endpoint.capacity == 4096
                     && endpoint.ingress == if bf16 { cuteafd_core::SparkIngress::Bf16 }
                         else { cuteafd_core::SparkIngress::Fp8K32 }));
@@ -179,7 +181,7 @@ mod draft_cli_tests {
         for lanes in 1..=4 {
             let native = spark_model(lanes, false, true)?;
             native.validate(cuteafd_core::ExpertGeometry::GLM5)?;
-            assert_eq!(native.endpoints.len(), if lanes == 1 { 1 } else { lanes + 1 });
+            assert_eq!(native.endpoints.len(), if lanes == 1 { 1 } else { 2 });
             assert!(native.endpoints.iter().all(|endpoint|
                 endpoint.ingress == cuteafd_core::SparkIngress::Fp8K32));
             assert_eq!(native.rings.max_frame_bytes,
@@ -844,13 +846,17 @@ impl Opened {
             link.bootstrap(&warm()?)?;
             Ok(link)
         }).transpose()?;
-        // One transport thread per prefill lane (their waves fly beside each other's).
-        let mut lanes = match selected_peers {
-            Some(peers) => (0..prefill_lanes).filter(|_| prefill_lanes > 1).map(|_| {
+        // One prefill transport with `prefill_lanes` waves in flight (PLAN "Prefill
+        // contract"): each in-flight unit lands in its own return slot.
+        let mut prefill_link = match selected_peers.filter(|_| prefill_lanes > 1) {
+            Some(peers) => {
                 let (peers, world) = ranks(peers)?;
-                SparkLane::new(&self.library, world, peers, 4096, config.clone(), row_bytes)
-            }).collect::<Result<Vec<_>>>()?,
-            None => Vec::new(),
+                let mut link = SparkLink::new_waves(&self.library, world, &peers, 4096, config.clone(), row_bytes,
+                    prefill_lanes, u32::try_from(args.prefill_rows)?)?;
+                link.bootstrap(&warm()?)?;
+                Some(link)
+            }
+            None => None,
         };
         let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
         let started = Instant::now();
@@ -861,19 +867,21 @@ impl Opened {
                 transport.receive(wave, rows, stream).await
             })?;
         }
-        for lane in &mut lanes {
-            lane.submit(rows, Box::new(warm))?;
-        }
-        for lane in &mut lanes {
-            lane.wait(rows, std::time::Duration::from_secs(120), stream)?;
+        if let Some(link) = prefill_link.as_mut() {
+            let request = warm()?;
+            runtime.block_on(async {
+                let wave = link.dispatch(&request)?;
+                link.receive(wave, rows, stream).await
+            })?;
         }
         // SAFETY: the engine's stream; the warm waves' intake waits drain here.
         unsafe { self.library.cuda_stream_synchronize(stream)? };
         if transport.is_some() {
-            tracing::info!(elapsed_ms = started.elapsed().as_millis() as u64, lanes = lanes.len(),
+            tracing::info!(elapsed_ms = started.elapsed().as_millis() as u64, prefill_waves = prefill_lanes,
                 "Spark expert transports warm");
         }
-        *engine.lanes.borrow_mut() = lanes;
+        *engine.prefill_link.borrow_mut() = prefill_link;
+        engine.prefill_runtime = Some(tokio::runtime::Builder::new_current_thread().enable_all().build()?);
         if let Some(budget) = args.l2.budget(&self.library, crate::shared::l2_prefetch::GLM_DEFAULT)? {
             engine.l2 = Some(crate::shared::l2_prefetch::L2Prefetch::new(&self.library, budget, &engine.decode_read_order())?);
             if engine.ranks() > 1 {

@@ -282,6 +282,8 @@ EOF
       ;;
     glm5)
       cat <<'EOF'
+PREFILL_ROWS
+PREFILL_WAVES
 EXLR8_MANIFEST
 EXLR8_DENSE_FROM
 RTX_EXPERT_PEER
@@ -2057,6 +2059,9 @@ fi
 # pool admitted only seven 4096-output requests, below the default eight
 # serving lanes; DeepSeek V4's former engine default was 262144 tokens (v2.0.0
 # cards: 650K-1.3M tokens with auto).
+if [[ $family == glm5 && -n "$(get PREFILL_ROWS)" ]]; then
+  family_args+=(--prefill-rows "$(get PREFILL_ROWS)")
+fi
 if [[ $family =~ ^(glm5|qwen4|qwen3_5|deepseek_v4)$ ]]; then
   pool="$(get POOL_TOKENS auto)"
   if [[ "$pool" == auto ]]; then
@@ -2551,7 +2556,8 @@ lane_env_args=()
 case "$family" in
   deepseek_v4) ;;
   glm5)
-    selected_lanes="${CUTEAFD_GLM_PREFILL_LANES:-3}"
+    # PREFILL_WAVES (shared prefill units in flight) wins over the legacy lane key.
+    selected_lanes="$(get PREFILL_WAVES "${CUTEAFD_GLM_PREFILL_LANES:-3}")"
     [[ "$selected_lanes" =~ ^[1-4]$ ]] || { echo "CUTEAFD_GLM_PREFILL_LANES must be 1 to 4" >&2; exit 2; }
     if [[ "$ranks" == 0 ]]; then
       selected_lanes=1
