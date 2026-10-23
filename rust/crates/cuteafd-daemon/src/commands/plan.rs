@@ -412,6 +412,7 @@ fn resolve_speculator(args: &mut PlanArgs, snapshot: &std::path::Path, family: &
         "mimo_v2" if snapshot.join("dflash").is_dir() => "dflash2",
         "mimo_v2" | "qwen4" | "step5" if args.native_mtp_layers > 0 => "mtp",
         "deepseek_v4" | "deepseek_v41" if args.native_mtp_layers > 0 => "dspark",
+        "minimax_m3" if snapshot.join("dspark").is_dir() && args.native_mtp_layers > 0 => "dspark",
         _ => "off",
     };
     if args.speculator == "auto" {
@@ -436,7 +437,7 @@ fn resolve_speculator(args: &mut PlanArgs, snapshot: &std::path::Path, family: &
     let enabled = match (family, args.speculator.as_str()) {
         (_, "off") | ("kimi_k3", "dflash2") | ("glm5", "dflash2") | ("glm5_flash", "dflash2" | "dspark")
         | ("mimo_v2", "dflash2" | "mtp") | ("qwen4" | "step5", "mtp")
-        | ("deepseek_v4" | "deepseek_v41", "dspark") => true,
+        | ("deepseek_v4" | "deepseek_v41" | "minimax_m3", "dspark") => true,
         _ => false,
     };
     anyhow::ensure!(enabled, "SPECULATOR={} does not apply to {family}", args.speculator);

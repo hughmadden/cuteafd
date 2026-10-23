@@ -930,3 +930,118 @@ pub fn write_kimi_installed_inventory(root: &std::path::Path, spark: bool) -> st
         "sparkinfer_revision":revision,"variants":variants}).to_string()).unwrap();
     path
 }
+
+/// MXFP8 `[n, k]`: E4M3 with UE8M0 U8 scales per row and 32 columns.
+pub fn mxfp8(name: &str, n: usize, k: usize) -> Vec<Tensor> {
+    vec![t(format!("{name}.weight"), "F8_E4M3", &[n, k]), t(format!("{name}.weight_scale_inv"), "U8", &[n, k / 32])]
+}
+
+/// Compressed-tensors NVFP4 `[n, k]` (`nvfp4-pack-quantized`): packed codes,
+/// E4M3 per-16 scales and FP32 scalar divisor global/input scales.
+pub fn compressed_nvfp4(name: &str, n: usize, k: usize) -> Vec<Tensor> {
+    vec![
+        t(format!("{name}.weight_packed"), "U8", &[n, k / 2]),
+        t(format!("{name}.weight_scale"), "F8_E4M3", &[n, k / 16]),
+        t(format!("{name}.weight_global_scale"), "F32", &[]),
+        t(format!("{name}.input_global_scale"), "F32", &[]),
+    ]
+}
+
+/// MiniMax-M3.1-Flash's own config.json.
+pub fn minimax_m3_config() -> Value {
+    serde_json::from_str(include_str!("../families/minimax_m3/fixtures/config.json")).unwrap()
+}
+
+/// The release's text (and optionally vision) tensors at real geometry.
+pub fn minimax_m3_tensors(vision: bool) -> Vec<Tensor> {
+    let (h, v) = (6144, 200064);
+    let text = "language_model.model";
+    let mut out = vec![t(format!("{text}.embed_tokens.weight"), "BF16", &[v, h]),
+        t("language_model.lm_head.weight", "BF16", &[v, h]), t(format!("{text}.norm.weight"), "BF16", &[h])];
+    for layer in 0..60 {
+        let base = format!("{text}.layers.{layer}");
+        for norm in ["input_layernorm", "post_attention_layernorm"] { out.push(t(format!("{base}.{norm}.weight"), "BF16", &[h])); }
+        let a = format!("{base}.self_attn");
+        for (proj, n, k) in [("q", 8192, h), ("k", 512, h), ("v", 512, h), ("o", h, 8192), ("index_q", 512, h), ("index_k", 128, h)] {
+            out.extend(mxfp8(&format!("{a}.{proj}_proj"), n, k));
+        }
+        for norm in ["q_norm", "k_norm", "index_q_norm", "index_k_norm"] { out.push(t(format!("{a}.{norm}.weight"), "BF16", &[128])); }
+        if layer < 3 {
+            for (proj, n, k) in [("gate", 12288, h), ("up", 12288, h), ("down", h, 12288)] { out.extend(mxfp8(&format!("{base}.mlp.{proj}_proj"), n, k)); }
+            continue;
+        }
+        let m = format!("{base}.block_sparse_moe");
+        out.push(t(format!("{m}.gate.weight"), "F32", &[128, h]));
+        out.push(t(format!("{m}.e_score_correction_bias"), "F32", &[128]));
+        for (proj, n, k) in [("gate", 3072, h), ("up", 3072, h), ("down", h, 3072)] { out.extend(mxfp8(&format!("{m}.shared_experts.{proj}_proj"), n, k)); }
+        for expert in 0..128 {
+            for (proj, n, k) in [("w1", 3072, h), ("w2", h, 3072), ("w3", 3072, h)] {
+                out.extend(compressed_nvfp4(&format!("{m}.experts.{expert}.{proj}"), n, k));
+            }
+        }
+    }
+    if vision {
+        let tower = "vision_tower.vision_model";
+        out.push(t(format!("{tower}.embeddings.patch_embedding.weight"), "F32", &[1280, 3, 2, 14, 14]));
+        let linear = |out: &mut Vec<Tensor>, stem: String, n: usize, k: usize| {
+            out.push(t(format!("{stem}.weight"), "BF16", &[n, k]));
+            out.push(t(format!("{stem}.bias"), "BF16", &[n]));
+        };
+        for suffix in ["weight", "bias"] { out.push(t(format!("{tower}.pre_layrnorm.{suffix}"), "BF16", &[1280])); }
+        for layer in 0..32 {
+            let base = format!("{tower}.encoder.layers.{layer}");
+            for norm in ["layer_norm1", "layer_norm2"] { for suffix in ["weight", "bias"] {
+                out.push(t(format!("{base}.{norm}.{suffix}"), "BF16", &[1280]));
+            }}
+            for proj in ["q_proj", "k_proj", "v_proj", "out_proj"] { linear(&mut out, format!("{base}.self_attn.{proj}"), 1280, 1280); }
+            linear(&mut out, format!("{base}.mlp.fc1"), 5120, 1280);
+            linear(&mut out, format!("{base}.mlp.fc2"), 1280, 5120);
+        }
+        linear(&mut out, "multi_modal_projector.linear_1".into(), 6144, 1280);
+        linear(&mut out, "multi_modal_projector.linear_2".into(), 6144, 6144);
+        linear(&mut out, "patch_merge_mlp.linear_1".into(), 6144, 24576);
+        linear(&mut out, "patch_merge_mlp.linear_2".into(), 6144, 6144);
+    }
+    out
+}
+
+/// The bundled `dspark/` drafter's tensors.
+pub fn minimax_m3_dspark_tensors() -> Vec<Tensor> {
+    let (h, d) = (6144, "language_model.model.dspark");
+    let mut out = vec![t(format!("{d}.fc.weight"), "BF16", &[h, 5 * h]), t(format!("{d}.final_norm.weight"), "BF16", &[h]),
+        t(format!("{d}.hidden_norm.weight"), "BF16", &[h]), t(format!("{d}.confidence_head.proj.weight"), "BF16", &[1, h + 256]),
+        t(format!("{d}.confidence_head.proj.bias"), "BF16", &[1])];
+    for w in ["markov_w1", "markov_w2"] { out.push(t(format!("{d}.markov_head.{w}.weight"), "BF16", &[200064, 256])); }
+    for layer in 0..5 {
+        let base = format!("{d}.layers.{layer}.decoder_layer");
+        for norm in ["input_layernorm", "post_attention_layernorm"] { out.push(t(format!("{base}.{norm}.weight"), "BF16", &[h])); }
+        for norm in ["q_norm", "k_norm"] { out.push(t(format!("{base}.self_attn.{norm}.weight"), "BF16", &[128])); }
+        for (proj, n, k) in [("q", 8192, h), ("k", 512, h), ("v", 512, h), ("o", h, 8192)] { out.extend(mxfp8(&format!("{base}.self_attn.{proj}_proj"), n, k)); }
+        for (proj, n, k) in [("gate", 12288, h), ("up", 12288, h), ("down", h, 12288)] { out.extend(mxfp8(&format!("{base}.mlp.{proj}_proj"), n, k)); }
+    }
+    out
+}
+
+/// Real MiniMax geometry, one sparse shard per layer, with the drafter in `dspark/`.
+pub fn write_minimax_m3_snapshot(dir: &Path, vision: bool, draft: bool) {
+    let mut config = minimax_m3_config();
+    if !vision { config.as_object_mut().unwrap().remove("vision_config"); }
+    let mut shards = std::collections::BTreeMap::<usize, Vec<Tensor>>::new();
+    for tensor in minimax_m3_tensors(vision) {
+        let shard = tensor.0.split(".layers.").nth(1).and_then(|tail| tail.split('.').next())
+            .and_then(|layer| layer.parse::<usize>().ok()).filter(|_| tensor.0.starts_with("language_model.")).map_or(0, |layer| layer + 1);
+        shards.entry(shard).or_default().push(tensor);
+    }
+    let mut weight_map = serde_json::Map::new();
+    for (index, tensors) in shards {
+        let file = format!("model-{index:05}.safetensors");
+        write_safetensors(&dir.join(&file), &tensors);
+        for (name, ..) in tensors { weight_map.insert(name, Value::String(file.clone())); }
+    }
+    fs::write(dir.join("config.json"), config.to_string()).unwrap();
+    fs::write(dir.join("model.safetensors.index.json"), json!({"weight_map": weight_map}).to_string()).unwrap();
+    if draft {
+        let dspark: Value = serde_json::from_str(include_str!("../families/minimax_m3/fixtures/dspark-config.json")).unwrap();
+        write_snapshot(&dir.join("dspark"), &dspark, &minimax_m3_dspark_tensors(), None);
+    }
+}

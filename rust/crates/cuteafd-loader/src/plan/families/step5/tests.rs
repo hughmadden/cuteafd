@@ -127,7 +127,7 @@ fn native_mtp_contract_accepts_only_validated_predictor_headers() -> anyhow::Res
         let cp = Checkpoint::coordinator(path, false, true)?;
         let model = Model::open(&cp)?;
         let groups = format::group_by_stem(&cp.tensors);
-        let scale = format::TensorScale { encoding: format::ScaleEncoding::F32 };
+        let scale = format::TensorScale::multiply(format::ScaleEncoding::F32);
         let mut count = 0;
         for (stem, members) in &groups {
             let Some(role) = STEP5.classify(model.spec(), stem) else { continue; };

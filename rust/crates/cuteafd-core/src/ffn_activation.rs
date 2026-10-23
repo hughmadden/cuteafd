@@ -13,6 +13,10 @@ pub enum FfnActivation {
     /// `beta*tanh(gate/beta)*sigmoid(gate) * linear_beta*tanh(up/linear_beta)`,
     /// rounded once to BF16. `linear_beta` absent leaves `up` unbounded.
     Situ { beta: f32, linear_beta: Option<f32> },
+    /// MiniMax M3 / GPT-OSS SwiGLU (`swigluoai_uninterleave`): in FP32,
+    /// `g * sigmoid(alpha * g) * (u + 1)` with `g = gate.min(limit)` and
+    /// `u = up.clamp(-limit, limit)`, rounded once to BF16.
+    SwigluOai { alpha: f32, limit: f32 },
 }
 
 impl FfnActivation {
@@ -25,6 +29,8 @@ impl FfnActivation {
                 Err("FFN activation limit must be finite and positive"),
             Self::Situ { beta, linear_beta } if bad(beta) || linear_beta.is_some_and(bad) =>
                 Err("Situ beta values must be finite and positive"),
+            Self::SwigluOai { alpha, limit } if bad(alpha) || bad(limit) =>
+                Err("SwiGLU-OAI alpha and limit must be finite and positive"),
             _ => Ok(self),
         }
     }
@@ -45,6 +51,10 @@ impl FfnActivation {
                 let gate = beta * (gate / beta).tanh() / (1.0 + (-gate).exp());
                 let up = linear_beta.map_or(up, |b| b * (up / b).tanh());
                 bf16(gate * up)
+            }
+            Self::SwigluOai { alpha, limit } => {
+                let gate = gate.min(limit);
+                bf16(gate / (1.0 + (-alpha * gate).exp()) * (up.clamp(-limit, limit) + 1.0))
             }
         }
     }

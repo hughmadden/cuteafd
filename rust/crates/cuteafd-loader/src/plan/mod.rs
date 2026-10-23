@@ -633,7 +633,7 @@ fn plan_of(input: &PlanInput, options: &PlanOptions) -> Result<PlanReport, PlanE
         let native = options.layout.as_ref().is_none_or(|layout| layout.native_mtp_layers > 0);
         spec::DraftOwnership::selected(family.id(), if !native { "off" }
             else if family.id() == "mimo_v2" && checkpoint.snapshot.join("dflash").is_dir() { "dflash2" }
-            else if matches!(family.id(), "deepseek_v4" | "deepseek_v41") { "dspark" }
+            else if matches!(family.id(), "deepseek_v4" | "deepseek_v41" | "minimax_m3") { "dspark" }
             else { "mtp" })
     });
     if !checkpoint.missing_shards.is_empty() {
@@ -1219,6 +1219,8 @@ pub fn render(report: &PlanReport) -> String {
                     }
                     AttentionKind::MlaDsa { indexer } => format!("mla-dsa{}", if *indexer { "+idx" } else { "(shared idx)" }),
                     AttentionKind::Gqa { heads, kv_heads, head_dim } => format!("gqa {heads}/{kv_heads}x{head_dim}"),
+                    AttentionKind::BlockSparseGqa { heads, kv_heads, head_dim, block, topk_blocks, .. } =>
+                        format!("msa-gqa {heads}/{kv_heads}x{head_dim} top{topk_blocks}x{block}"),
                     AttentionKind::SlidingGqa { window, sinks, .. } => {
                         format!("swa-gqa w{window}{}", if *sinks { "+sink" } else { "" })
                     }

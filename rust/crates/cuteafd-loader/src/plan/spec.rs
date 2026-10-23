@@ -11,6 +11,10 @@ pub enum AttentionKind {
     MlaDsa { indexer: bool },
     /// Grouped-query attention over the full context.
     Gqa { heads: usize, kv_heads: usize, head_dim: usize },
+    /// Grouped-query attention over `topk_blocks` blocks of `block` keys that a
+    /// lightning indexer selects per query row and KV head (MiniMax Sparse
+    /// Attention: `index_heads` == `kv_heads`, one shared `index_dim` key).
+    BlockSparseGqa { heads: usize, kv_heads: usize, head_dim: usize, block: usize, topk_blocks: usize, index_dim: usize },
     /// Grouped-query sliding-window attention.
     SlidingGqa { heads: usize, kv_heads: usize, head_dim: usize, window: usize, sinks: bool },
     /// Full causal MLA without an indexer (Kimi K3: no RoPE, sigmoid output gate).
@@ -81,7 +85,7 @@ impl DraftOwnership {
     pub fn selected(family: &str, speculator: &str) -> Self {
         match (family, speculator) {
             ("mimo_v2" | "qwen4" | "step5", "mtp") => Self::NativeMtp,
-            ("deepseek_v4" | "deepseek_v41", "dspark") => Self::BundledDspark,
+            ("deepseek_v4" | "deepseek_v41" | "minimax_m3", "dspark") => Self::BundledDspark,
             _ => Self::None,
         }
     }

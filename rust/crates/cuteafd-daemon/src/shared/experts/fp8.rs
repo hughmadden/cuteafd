@@ -47,6 +47,8 @@ pub(super) fn validate_checkpoint_contract(info: &Fp8MoeInfo, tensors: &Fp8Exper
                 (Fp8MoeActivation::SiluPostClampFp32Product, limit),
             cuteafd_core::FfnActivation::Situ { .. } =>
                 anyhow::bail!("expert layer {layer}: native FP8 packages do not export the checkpoint's Situ activation"),
+            cuteafd_core::FfnActivation::SwigluOai { .. } =>
+                anyhow::bail!("expert layer {layer}: native FP8 packages do not export the checkpoint's SwiGLU-OAI activation yet"),
         };
         info.validate_activation(mode, limit, Fp8MoeProjection::Bf16)
             .with_context(|| format!("expert layer {layer}"))?;

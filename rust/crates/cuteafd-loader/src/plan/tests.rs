@@ -243,7 +243,8 @@ fn step5_mtp_selection_leaves_other_family_ownership_unchanged() {
         for selected in ["off", "mtp", "dspark", "dflash2", "unknown"] {
             let previous = match (family.id(), selected) {
                 ("mimo_v2" | "qwen4", "mtp") => DraftOwnership::NativeMtp,
-                ("deepseek_v4" | "deepseek_v41", "dspark") => DraftOwnership::BundledDspark,
+                // MiniMax M3 bundles its drafter in dspark/ (not a Step-5 change).
+                ("deepseek_v4" | "deepseek_v41" | "minimax_m3", "dspark") => DraftOwnership::BundledDspark,
                 _ => DraftOwnership::None,
             };
             assert_eq!(DraftOwnership::selected(family.id(), selected), previous,
