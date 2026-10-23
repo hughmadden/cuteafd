@@ -27,16 +27,14 @@ pub const PUSH_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 pub const PUSH_START_TIMEOUT: Duration = Duration::from_secs(1200);
 const HOSTS_XATTR: &str = "user.sparknest.hosts";
 
-/// A file a push source can stream: SparkNest names at least one host with a
-/// live copy. An archive-only file (empty hosts) cannot be pushed (the hub
-/// refuses it: "no live copy"), so planning offers mount for it before any
-/// group forms. Missing/unsupported attributes, access errors and oversized
-/// values also mean the mount path. Follows HF snapshot symlinks like the
-/// tensor reader.
+/// A SparkNest file a push source can stream: the hosts attribute is present.
+/// Since SparkNest 0.6.5 (ADR-069) an archive-only file (empty hosts) is
+/// pushable too: the hub streams it from the archive. Missing/unsupported
+/// attributes, access errors and oversized values mean the mount path.
+/// Follows HF snapshot symlinks like the tensor reader.
 pub fn is_push_shard(shard: &Path) -> bool {
     let mut value = [0u8; 65536];
-    rustix::fs::getxattr(shard, HOSTS_XATTR, &mut value[..])
-        .is_ok_and(|length| value[..length].iter().any(|b| !b.is_ascii_whitespace() && !b"[],".contains(b)))
+    rustix::fs::getxattr(shard, HOSTS_XATTR, &mut value[..]).is_ok()
 }
 
 /// Discover the namespace root and this host from ADR-064, never from a

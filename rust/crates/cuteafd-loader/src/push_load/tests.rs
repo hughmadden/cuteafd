@@ -127,7 +127,7 @@ fn absent_attribute_missing_file_and_empty_group_use_mount_without_push() {
 }
 
 #[test]
-fn archive_only_files_are_not_pushed_and_snapshot_symlinks_are_followed() {
+fn archive_only_files_are_pushed_and_snapshot_symlinks_are_followed() {
     let shard = push_shard();
     let directory = tempfile::tempdir().unwrap();
     let link = directory.path().join("shard");
@@ -140,8 +140,13 @@ fn archive_only_files_are_not_pushed_and_snapshot_symlinks_are_followed() {
         rustix::fs::XattrFlags::empty(),
     )
     .unwrap();
-    assert!(!is_push_shard(shard.path()), "no live copy: the hub refuses it");
-    assert!(!is_push_shard(&link));
+    // SparkNest 0.6.5 (ADR-069) streams archive-only files: empty hosts still push.
+    assert!(is_push_shard(shard.path()), "archive-only files are pushable");
+    assert!(is_push_shard(&link));
+    for value in [&b"[]"[..], b" , "] {
+        rustix::fs::setxattr(shard.path(), HOSTS_XATTR, value, rustix::fs::XattrFlags::empty()).unwrap();
+        assert!(is_push_shard(shard.path()), "{value:?}");
+    }
 }
 
 #[test]
