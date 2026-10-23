@@ -114,6 +114,10 @@ pub(crate) struct EngineArgs {
     #[arg(long = "prefill-waves", default_value_t = engine::DEFAULT_PREFILL_WAVES,
         value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..=engine::MAX_PREFILL_WAVES as u64))]
     pub prefill_waves: usize,
+    /// Maximum rows of a continuous prefill call; units recycle the admitted slots.
+    #[arg(long, default_value_t = 16384,
+        value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..))]
+    pub prefill_span_rows: usize,
     /// GPU memory (GiB) an automatic pool leaves free for growth the start-up cannot measure
     /// (lazily loaded kernels, cuBLAS, allocator rounding), when every other allocation precedes
     /// the pool (one GPU, Spark experts): the pool takes the rest, less the graph reserve and the
@@ -860,6 +864,14 @@ mod draft_cli_tests {
             assert!(Parse::try_parse_from(["test", "--snapshot", "/checkpoint", "--native-lib", "/native",
                 "--prefill-waves", lanes]).is_err());
         }
+    }
+
+    #[test]
+    fn prefill_span_is_an_explicit_positive_engine_flag() {
+        assert_eq!(parse(&[]).prefill_span_rows, 16384);
+        assert_eq!(parse(&["--prefill-span-rows", "32768"]).prefill_span_rows, 32768);
+        assert!(Parse::try_parse_from(["test", "--snapshot", "/checkpoint", "--native-lib", "/native",
+            "--prefill-span-rows", "0"]).is_err());
     }
 
     #[test]
@@ -2003,7 +2015,7 @@ impl Opened {
             .context("shared replay records need prefill lanes")).transpose()?;
         let pages = (pool_tokens + reserved_units as usize * engine::UNIT_ROWS).div_ceil(engine::PAGE_ROWS);
         let mut engine = engine::GlmfEngine::new(&self.library, &programs, self.cfg.clone(), model, stream,
-            max_context, args.prefill_rows, args.prefill_waves, pages, args.slots, embedding, index_cache,
+            max_context, args.prefill_rows, args.prefill_waves, args.prefill_span_rows, pages, args.slots, embedding, index_cache,
             args.kda_state, args.decode_rows, records, context_mode, args.prefix_marks == prefix::PrefixMarks::Pool,
             &execution, step_experts)?;
         engine.attention_plan = attention_plan;

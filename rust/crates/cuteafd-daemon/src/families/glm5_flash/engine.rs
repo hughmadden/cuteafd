@@ -1336,6 +1336,8 @@ pub(crate) struct GlmfEngine<'a> {
     pub prefill_rows: usize,
     /// Prefill lanes (1..=[`MAX_PREFILL_WAVES`]): a Spark prefill chunk runs in up to this many.
     pub prefill_waves: usize,
+    /// Requested continuous-call span, bounded by context and floored at the live slots' rows.
+    prefill_span_rows: usize,
     pub pages: usize,
     pub slots: usize,
     /// The most rows of one decode or verify step (`--decode-rows`): [`DECODE_ROWS`], or
@@ -1707,7 +1709,7 @@ impl<'a> GlmfEngine<'a> {
     /// rows of one decode or verify step, [`DECODE_ROWS`] or [`WIDE_DECODE_ROWS`].
     #[allow(clippy::too_many_arguments)]
     pub fn new(library: &'a NativeLibrary, programs: &'a Programs<'a>, cfg: GlmNextConfig, weights: GlmfWeights<'a>,
-        stream: *mut c_void, max_context: usize, prefill_rows: usize, prefill_waves: usize, pages: usize,
+        stream: *mut c_void, max_context: usize, prefill_rows: usize, prefill_waves: usize, prefill_span_rows: usize, pages: usize,
         slots: usize, embedding: TokenEmbedding<'a>, index_cache: IndexCache, kda_state: KdaState, decode_rows: usize,
         records: Option<PrefillScratch<'a>>, context_mode: Option<GlmfAttention>, pool_marks: bool,
         execution: &cuteafd_loader::placement::LayerExecutionPlan, step_experts: StepExperts) -> Result<Self> {
@@ -1721,6 +1723,7 @@ impl<'a> GlmfEngine<'a> {
         ensure!(embedding.hidden() == cfg.hidden, "embedding rows of {} for hidden {}", embedding.hidden(), cfg.hidden);
         ensure!((1..=MAX_PREFILL_WAVES).contains(&prefill_waves) && prefill_rows > 0,
             "{prefill_waves} prefill lanes of {prefill_rows} rows (1 to {MAX_PREFILL_WAVES} lanes)");
+        ensure!(prefill_span_rows > 0, "prefill span must contain at least one row");
         ensure!(cfg.hc_mult == HC && cfg.kv_lora_rank == 512 && cfg.kda_head_dim == 128 && cfg.heads == 64,
             "the glmf programs are built for 4 mHC streams, a 512 latent, 64 MLA heads and 128-wide KDA heads");
         // Whole allocation units: four MLA pages and one pool page each.
@@ -1763,7 +1766,7 @@ impl<'a> GlmfEngine<'a> {
         let (table_pages, table_pool_pages) = glmf_table_pages(max_context as u64);
         let (table_pages, table_pool_pages) = (usize::try_from(table_pages)?, usize::try_from(table_pool_pages)?);
         Ok(Self { step_experts, quantize_grid, library, programs, cfg, weights, stream, max_context, prefill_rows, prefill_waves,
-            pages, slots, decode_rows, verify_rows,
+            prefill_span_rows, pages, slots, decode_rows, verify_rows,
             attention_plan: cuteafd_core::coordinator_programs::AttentionReductionPlan::new(DECODE_ROWS, None, None)?,
             buckets: DecodeBuckets::new(verify_rows),
             replay_rows: std::cell::Cell::new(DECODE_ROWS),
@@ -3387,8 +3390,7 @@ impl<'a> GlmfEngine<'a> {
     /// The continuous span may reuse all admitted slots within a call.
     pub fn prefill_capacity(&self) -> usize {
         if self.pipelined() {
-            std::env::var("CUTEAFD_PREFILL_SPAN_ROWS").ok().and_then(|v| v.parse::<usize>().ok())
-                .unwrap_or(16384).max(self.prefill_rows * self.prefill_waves).min(self.max_context)
+            self.prefill_span_rows.max(self.prefill_rows * self.prefill_waves).min(self.max_context)
         } else { self.prefill_rows }
     }
 
