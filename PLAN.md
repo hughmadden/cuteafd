@@ -5593,13 +5593,18 @@ The README keeps one card per checkpoint in the three columns (5090, 1× RTX,
 | Step-5 | NVFP4 1 RTX + 4 Sparks | FP8 2 RTX + 6 Sparks | RTX PRO only |
 | Dense Qwen 3.8 27B (BF16, FP8) | 1 RTX | — | RTX only; min only, no TP2 card (TJ) |
 
+GLM 5.3 EXL3 K4 max (2 RTX + 6 Sparks) also ships, matching EXLR8 max
+for the same-layout comparison. Qwen 3.8 Flash Next NVFP4 is retired entirely;
+its min, max and 5090 cards move below. The Qwen Flash Next 5090 card is
+EXL3 only: 1 RTX 5090 + 1 Spark, unchanged from v3.
+
 **Retired section** (new, below the main table): every model that no longer
 ships keeps its last Release-smoke row, one card per row with its config and
 the release version it came from. It doesn't use the three-column layout.
 It includes:
-- the cards cut from the v3 matrix: GLM 5.3 EXL3 max and NVFP4 max, GLM 5.3
+- the cards cut from the v3 matrix: GLM 5.3 NVFP4 max, GLM 5.3
   Flash NVFP4 max and TR3 max, MiMo Pro min, MiMo Flash max, Qwen 3.8 EXL3 max
-  and NVFP4 max, V4 Flash max, V4 Pro EXL3 min (each from its last smoke run);
+  and NVFP4 min/max/5090, V4 Flash max, V4 Pro EXL3 min (each from its last smoke run);
 - models retired since: the GLM 5.3 Flash non-core FP8 configs
   (`glm53-flash-fp8-min/max`, `zai-org/GLM-5.3-Flash`), last smoke 2026-10-14;
   the GLM 5.3 Flash EXL3 BF16-dense `-v1` card, replaced by

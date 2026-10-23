@@ -58,6 +58,9 @@ pub struct Matrix {
     #[serde(default)]
     pub defaults: Entry,
     pub entries: Vec<Entry>,
+    /// Historical exports only; never scheduled as launches.
+    #[serde(default)]
+    pub retired: Vec<crate::publish::Retired>,
 }
 
 /// One launch. Unset fields come from the matrix defaults.
@@ -691,6 +694,7 @@ fn check_post_load(entry: &Entry) -> Result<()> {
 pub fn run(args: SmokeArgs) -> Result<()> {
     let matrix: Matrix = serde_json::from_str(&std::fs::read_to_string(&args.matrix)
         .with_context(|| format!("{}", args.matrix.display()))?).context("parsing the matrix")?;
+    crate::publish::validate_retired(&matrix.retired)?;
     let repo = args.repo.canonicalize().context("--repo")?;
     // ./run.sh runs inside --repo: every path handed to it must be absolute.
     let out_root = std::path::absolute(args.out_root.clone().unwrap_or_else(|| repo.clone())).context("--out-root")?;
@@ -1258,7 +1262,7 @@ mod tests {
     fn release_smoke_entries_all_serve_an_api_key() {
         use super::*;
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
-        for matrix in ["scripts/bench/release-smoke-v3.json", "scripts/bench/release-smoke.example.json"] {
+        for matrix in ["scripts/bench/release-smoke-v3.json", "scripts/bench/release-smoke-v4.json", "scripts/bench/release-smoke.example.json"] {
             let matrix: Matrix = serde_json::from_str(&std::fs::read_to_string(root.join(matrix)).unwrap()).unwrap();
             let mut entries: Vec<Entry> = matrix.entries.iter().map(|e| e.merged(&matrix.defaults)).collect();
             let state = tempfile::tempdir().unwrap();

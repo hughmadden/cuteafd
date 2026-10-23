@@ -831,7 +831,12 @@ class V10BuildTargetTest(unittest.TestCase):
             with self.subTest(example=path.name):
                 text = path.read_text()
                 self.assertIn(f"COORDINATOR_DOCKER_INFERENCE={coordinator}", text)
-                self.assertIn(f"SPARK_EXPERT_DOCKER_INFERENCE={spark}", text)
+                values = dict(line.split("=", 1) for line in self.assignments(path))
+                # RTX-only launchers need no expert image and may reject its key.
+                if "SPARK_EXPERT_DOCKER_INFERENCE" not in values:
+                    self.assertEqual(values.get("SPARK_COUNT"), "0")
+                else:
+                    self.assertIn(f"SPARK_EXPERT_DOCKER_INFERENCE={spark}", text)
 
 
 class V11ReleaseBuildTargetTest(unittest.TestCase):
