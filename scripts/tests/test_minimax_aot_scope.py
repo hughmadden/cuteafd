@@ -31,8 +31,8 @@ def test_native_minimax_scopes_use_explicit_tp(tp):
     family, scopes = aot.config_scopes(dict(FAMILY="minimax_m3", SPARK_COUNT="6", SPARK_TP=str(tp)))
     assert family == "minimax_m3"
     assert scopes["CUTEAFD_WIP_MINIMAX_AOT"] == "ON"
-    assert scopes["CUTEAFD_WIP_COORDINATOR_EXPERT_FAMILIES"] == "minimax:nvfp4a4"
-    assert scopes["CUTEAFD_WIP_EXPERT_FAMILIES"] == "minimax:nvfp4a4"
+    assert scopes["CUTEAFD_WIP_COORDINATOR_EXPERT_FAMILIES"] == "minimax:nvfp4"
+    assert scopes["CUTEAFD_WIP_EXPERT_FAMILIES"] == "minimax:nvfp4"
     assert scopes["CUTEAFD_WIP_GENERIC_SPARK_COUNTS"] == f"minimax={tp}"
 
 
@@ -73,3 +73,10 @@ def test_model_context_and_comparison_jobs_include_minimax():
     jobs = {name: (exporter, args) for name, exporter, args in module.jobs("all")}
     assert {"minimax", "minimax-pointwise", "minimax-projections", "minimax-indexer", "minimax-attention", "routed-minimax"} <= jobs.keys()
     assert jobs["minimax"][1] == ["--geometry", "minimax"]
+
+
+def test_minimax_expert_scope_is_a_cmake_entry():
+    cmake = (ROOT / "native/cmake/shared/fp8_moe.cmake").read_text()
+    family, scopes = aot.config_scopes(dict(FAMILY="minimax_m3", SPARK_COUNT="2", SPARK_TP="2"))
+    for entry in scopes["CUTEAFD_WIP_EXPERT_FAMILIES"].split(","):
+        assert f'entry STREQUAL "{entry}"' in cmake, entry

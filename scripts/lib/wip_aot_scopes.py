@@ -82,7 +82,7 @@ def family_scopes(cards, config_reader):
                 scopes.add(tag + ':exl3-k23')
         if family == 'minimax_m3':
             env['CUTEAFD_WIP_MINIMAX_AOT'] = 'ON'
-            scopes.add('minimax:nvfp4a4')
+            scopes.add('minimax:nvfp4')
             if count:
                 counts.add(f"minimax={int(values.get('SPARK_TP', count))}")
         if family == 'kimi_k3':
