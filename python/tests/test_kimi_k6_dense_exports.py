@@ -113,7 +113,7 @@ def test_only_shared_native_compiler_and_both_codebooks(monkeypatch):
 def test_comparison_group_is_opt_in():
     groups = runpy.run_path(str(ROOT / "scripts/build/compare-sm-exports.py"))["jobs"]("all")
     group = next(row for row in groups if row[0] == "kimi-k6-dense")
-    assert group[1:] == ("export_b12x_dsv4_aot.py", ["--geometry", "kimi_k6_dense"])
+    assert group[1:] == ("export_b12x_dsv4_aot.py", ["--geometry", "kimi_k6_dense,kimi_split"])
 
 
 def test_chunk_route_policy_and_scratch(monkeypatch):
