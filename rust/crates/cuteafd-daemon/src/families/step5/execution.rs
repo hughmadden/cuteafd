@@ -1636,3 +1636,112 @@ mod unit_overwrite_tests {
         }
     }
 }
+
+/// The real executor schedule (`prefill_schedule`) against the real unit
+/// layout: attention and FFN scratch are hook-local (one unit, offset zero),
+/// live FFN planes hold every unit's rows at its offset, and each unit slot
+/// owns a hop lane. No hook writes bytes another unit still needs: live FFN
+/// rows between a send and its land, and a unit's residual (its FFN OUTPUT
+/// rows, or its hop receive slot) until its next attention copies it out.
+#[cfg(test)]
+mod executor_schedule_tests {
+    use crate::shared::prefill_pipeline::{prefill_schedule, prefill_units, FfnRoute, Step, Unit};
+    use cuteafd_loader::plan::families::step5::native;
+    use std::ops::Range;
+
+    const LAYERS: usize = 92;
+    fn full(layer: usize) -> bool { layer % 4 == 3 }
+    fn routed(layer: usize) -> bool { (3..91).contains(&layer) }
+
+    fn overlaps(a: &Range<usize>, b: &Range<usize>) -> bool { a.start < b.end && b.start < a.end }
+
+    /// One rank's arena: [attention region | FFN region]; hop receive slots by
+    /// (lane, parity) are separate buffers, keyed past the arena.
+    /// Planes are admitted for `unit_rows x waves`; a call may run a shorter span.
+    fn check(unit_rows: usize, waves: usize, rows: usize) -> Result<(), String> {
+        check_with(unit_rows, waves, rows, true, true)
+    }
+
+    /// `hop_lanes`: one hop lane per unit slot; `unit_rows_live`: live FFN planes
+    /// addressed at the unit's rows. Either off is a known hazard (controls).
+    fn check_with(unit_rows: usize, waves: usize, rows: usize, hop_lanes: bool, unit_rows_live: bool)
+        -> Result<(), String> {
+        let span = unit_rows * waves;
+        let attention = native::attention_bytes(unit_rows, true, 64).unwrap() as usize;
+        let ffn = |layer: usize| if routed(layer) {
+            native::routed_layout(unit_rows, span, full(layer)).unwrap().to_vec()
+        } else { native::dense_layout(unit_rows, span).unwrap().to_vec() };
+        let live = |layer: usize, plane: usize| if routed(layer) { native::routed_live(plane) } else { native::dense_live(plane) };
+        let rows_of = |layer: usize, plane: usize, range: &Range<usize>, bytes: usize| -> Range<usize> {
+            let base = attention + ffn(layer)[plane].0;
+            if live(layer, plane) && unit_rows_live { let stride = bytes / span; base + range.start * stride..base + range.end * stride }
+            else if live(layer, plane) { let stride = bytes / span; base..base + range.len() * stride }
+            else { base..base + bytes }
+        };
+        let units = prefill_units(rows, unit_rows, waves, 64).map_err(|e| e.to_string())?.into_iter().enumerate()
+            .map(|(index, rows)| Unit { index, sequence: 0, rows, layers: 0..LAYERS, slot: index % waves, barrier: false })
+            .collect::<Vec<_>>();
+        let routes = (0..LAYERS).map(|l| if routed(l) { FfnRoute::Spark } else { FfnRoute::Local }).collect::<Vec<_>>();
+        let steps = prefill_schedule(&routes, &units, waves).map_err(|e| e.to_string())?;
+        // (unit, bytes, what) held live across hooks.
+        let mut held: Vec<(usize, Range<usize>, String)> = Vec::new();
+        let hop = |slot: usize, parity: usize| { let at = 1 << 40 | (slot << 8 | parity) << 24; at..at + unit_rows * 16384 };
+        let mut hop_parity = vec![0usize; units.len()];
+        for step in steps {
+            let (unit, writes, keep, release): (usize, Vec<Range<usize>>, Vec<(Range<usize>, String)>, &str) = match step {
+                Step::Attention { layer, unit } => {
+                    let u = &units[unit];
+                    // Copy the residual into hook-local attention input; a hop
+                    // before a head-split group lands in this unit's lane.
+                    let mut writes = vec![0..attention];
+                    let mut keep = Vec::new();
+                    if layer % 4 == 0 && layer > 0 {
+                        let slot = hop(if hop_lanes { u.slot } else { 0 }, hop_parity[unit] % 2);
+                        hop_parity[unit] += 1;
+                        writes.push(slot.clone());
+                        keep.push((slot, format!("hop {layer}")));
+                    }
+                    (unit, writes, keep, "output")
+                }
+                Step::Local { layer, unit } | Step::Send { layer, unit } => {
+                    let u = &units[unit];
+                    let planes = ffn(layer);
+                    let writes = (0..planes.len()).map(|p| rows_of(layer, p, &u.rows, planes[p].1)).collect::<Vec<_>>();
+                    let keep = if matches!(step, Step::Send { .. }) {
+                        [0usize, 8, 9].iter().map(|&p| (rows_of(layer, p, &u.rows, planes[p].1), format!("wave {layer}"))).collect()
+                    } else { vec![(rows_of(layer, 5, &u.rows, planes[5].1), format!("output {layer}"))] };
+                    (unit, writes, keep, "attention")
+                }
+                Step::Land { layer, unit } => {
+                    let u = &units[unit];
+                    let planes = ffn(layer);
+                    let writes = (9..14).map(|p| rows_of(layer, p, &u.rows, planes[p].1)).collect::<Vec<_>>();
+                    (unit, writes, vec![(rows_of(layer, 13, &u.rows, planes[13].1), format!("output {layer}"))], "wave")
+                }
+                Step::Begin { .. } | Step::End { .. } | Step::Commit { .. } => continue,
+            };
+            held.retain(|(owner, _, what)| *owner != unit || !what.starts_with(release)
+                && !(release == "output" && what.starts_with("hop")));
+            for range in &writes {
+                if let Some((other, _, what)) = held.iter().find(|(owner, bytes, _)| *owner != unit && overlaps(bytes, range)) {
+                    return Err(format!("{step:?} overwrites unit {other} {what}"));
+                }
+            }
+            held.extend(keep.into_iter().map(|(bytes, what)| (unit, bytes, what)));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn real_schedule_never_overwrites_another_units_live_rows() {
+        for (unit, waves) in [(256, 1), (256, 2), (512, 2), (1024, 2), (2048, 2), (512, 4), (1024, 3)] {
+            for span in [unit * waves, unit * waves - 64 * waves] {
+                check(unit, waves, span).unwrap_or_else(|error| panic!("unit {unit} x {waves}, span {span}: {error}"));
+            }
+        }
+        // Controls: a shared hop lane, or live rows at offset zero, are caught.
+        assert!(check_with(512, 2, 1024, false, true).unwrap_err().contains("hop"));
+        assert!(check_with(512, 2, 1024, true, false).unwrap_err().contains("overwrites"));
+        assert!(check_with(512, 1, 512, false, false).is_ok());
+    }
+}
