@@ -526,7 +526,22 @@ impl<'e, 'a> MainExecution<'e, 'a> {
         })
     }
 
+    /// Whole steps and replication checks address the live FFN planes from
+    /// row zero; a previous prefill's last unit must not stay selected.
+    fn reset_units(&self) -> Result<()> {
+        for layers in &self.native.ranks {
+            for layer in layers.iter().flatten() {
+                match &layer.ffn {
+                    Ffn::Dense(ffn) => ffn.select_unit(0, 1)?,
+                    Ffn::Routed(ffn) => ffn.select_unit(0, 1)?,
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn validate_replications(&self) -> Result<()> {
+        self.reset_units()?;
         let mut copies = self.ownership.routed_replications()?;
         for (layer, copy) in copies.iter_mut().enumerate() {
             if let Some(copy) = copy {
@@ -702,6 +717,7 @@ impl<'e, 'a> Execution<'e, 'a> {
             crate::shared::prefill_pipeline::run_prefill_units(&mut hooks, units, waves)?;
             ensure!(hooks.consumed.iter().flatten().all(|&count| count == 1), "Step-5 unit hop inventory");
             hooks.binding.step.finish_units();
+            main.reset_units()?;
             main.terminal_output.set(Some(input.buffer));
             collect_lane_results(main.stages.iter().map(|stage| stage.stream.drain()))
         }))
@@ -1757,5 +1773,24 @@ mod executor_schedule_tests {
         assert!(check_with(512, 2, 1024, false, true).unwrap_err().contains("hop"));
         assert!(check_with(512, 2, 1024, true, false).unwrap_err().contains("overwrites"));
         assert!(check_with(512, 1, 512, false, false).is_ok());
+    }
+}
+
+/// A prefill's last unit must not stay selected on the FFN owners: whole steps
+/// and the replication check address the live planes from row zero.
+#[cfg(test)]
+mod unit_selection_reset_tests {
+    #[test]
+    fn whole_steps_and_unit_prefills_reset_the_unit_selection() {
+        let source = include_str!("execution.rs");
+        let body = |name: &str| { let start = source.find(name).unwrap();
+            &source[start..start + source[start..].find("\n    }\n").unwrap()] };
+        let validate = body("fn validate_replications(&self)");
+        assert!(validate.contains("self.reset_units()?;"));
+        let enqueue = body("pub fn enqueue<'s");
+        assert!(enqueue.contains("main.validate_replications()?;"));
+        let units = body("pub fn enqueue_units<'s");
+        let finish = units.find("finish_units()").unwrap();
+        assert!(units[finish..].contains("main.reset_units()?;"));
     }
 }
