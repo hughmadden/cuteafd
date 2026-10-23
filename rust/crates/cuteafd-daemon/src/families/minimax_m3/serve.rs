@@ -118,7 +118,7 @@ fn worker(args: &ServeArgs, receive: &mut tokio::sync::mpsc::Receiver<cuteafd_ap
     cfg.release_geometry()?;
     cuteafd_core::set_expert_geometry(ExpertGeometry::MINIMAX_M3)
         .map_err(|_| MiniMaxError::Invalid("expert geometry already installed"))?;
-    let library = cuteafd_ffi::minimax::load_library(&args.native_lib)?;
+    let library = Arc::new(cuteafd_ffi::minimax::load_library(&args.native_lib)?);
     library.cuda_set_device(args.device)?;
     let programs = library.programs()?.with_manifest(&args.manifest)?;
     programs.load_matching(|name| name.starts_with("minimax_"))?;
@@ -199,23 +199,8 @@ fn worker(args: &ServeArgs, receive: &mut tokio::sync::mpsc::Receiver<cuteafd_ap
     cache.context = cache.context.min(admitted.cache.pool_tokens as usize);
     cuteafd_transport::worker_selection::require_peer_clients(&args.peers, endpoint, 1)?;
     let world = SparkWorld::canonical(args.peers.len())?;
-    let spark = if let Some(&first) = admitted.spark_layers.first() {
-        let routes = (0..sizing.rows * 4).map(|i| cuteafd_transport::ExpertProtocolV2RouteEntry {
-            row_index: (i / 4) as u32, expert_id: (i % 128) as u32, gate_weight: 0.0 }).collect();
-        let warm = request(1, first, sizing.rows, routes, vec![0; sizing.rows * 6144 * 2].into(), cuteafd_transport::ExpertV2SourceKind::Prefill)?;
-        let mut identity = 1u64;
-        let build: cuteafd_transport::expert::DeviceBuild = Box::new(move |wave, routes, wire| {
-            let kind = match wave.kind {
-                1 => cuteafd_transport::ExpertV2SourceKind::Decode,
-                2 => cuteafd_transport::ExpertV2SourceKind::Prefill,
-                _ => return Err(MiniMaxError::Invalid("Spark wave source kind").into()),
-            };
-            identity = identity.checked_add(1).ok_or(MiniMaxError::Overflow("Spark wave identity"))?;
-            request(identity, wave.layer as usize, wave.rows as usize, routes, wire, kind)
-        });
-        Some(SparkDeviceLink::new(&library, args.device, world, &args.peers, sizing.rows, 4, 6144 * 2,
-            6144 * 2, config, Some(warm), build)?)
-    } else {None};
+    let spark = admitted.spark_layers.first().map(|&first| super::routed::Spark::connect(&library, args.device, world,
+        &args.peers, sizing.rows, config, first, request)).transpose()?;
     let expander = vision.as_ref().map(|_| cuteafd_loader::media::minimax::span_expander(&args.snapshot, cfg.vocab_size as u32, false)).transpose()?;
     let backend = MiniMaxBackend { execution: &execution, cache: &cache, embedding: &embedding, token_ids, embedded,
         experts: RefCell::new(Routed::new(local, spark)?), rows: sizing.rows, vocabulary: cfg.vocab_size, expander,

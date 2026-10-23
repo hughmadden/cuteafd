@@ -7,7 +7,7 @@ use super::Model;
 use crate::formats::native_dense::NativeDenseLayout;
 use crate::plan::{checkpoint::{Checkpoint, CheckpointTensor}, spec::Component};
 use anyhow::{ensure, Context, Result};
-use cuteafd_core::dense_attention::{GqaGeometry, NormWeight, RotaryArithmetic, RouterBiasOrder, SigmoidRouter};
+use cuteafd_core::dense_attention::{GqaGeometry, NormWeight, RouterBiasOrder, SigmoidRouter};
 use cuteafd_core::{DType, FfnActivation};
 
 #[derive(Debug, Clone)]

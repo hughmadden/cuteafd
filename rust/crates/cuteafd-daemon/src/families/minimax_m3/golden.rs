@@ -468,7 +468,7 @@ pub(crate) async fn run_golden(args: GoldenArgs) -> Result<()> {
     let native = args.native_lib.as_ref().context("MiniMax golden requires --native-lib")?;
     cuteafd_core::set_expert_geometry(ExpertGeometry::MINIMAX_M3)
         .map_err(|_| MiniMaxError::Invalid("expert geometry already installed"))?;
-    let library = cuteafd_ffi::minimax::load_library(native)?;
+    let library = std::sync::Arc::new(cuteafd_ffi::minimax::load_library(native)?);
     library.cuda_set_device(args.device)?;
     let programs = library.programs()?.with_manifest(&args.manifest)?;
     programs.load_matching(|name| name.starts_with("minimax_"))?;
@@ -526,18 +526,8 @@ pub(crate) async fn run_golden(args: GoldenArgs) -> Result<()> {
         admitted.cache_bytes.checked_add(256).context("cache admission overflow")?)?;
     let spark = if let Some(&first) = remote.first() {
         cuteafd_transport::worker_selection::require_peer_clients(&args.peers, endpoint, 1)?;
-        let routes = (0..sizing.rows * 4).map(|i| cuteafd_transport::ExpertProtocolV2RouteEntry {
-            row_index:(i / 4) as u32, expert_id:(i % 128) as u32, gate_weight:0.0}).collect();
-        let warm = request(1, first, sizing.rows, routes, vec![0; sizing.rows * 6144 * 2].into(), ExpertV2SourceKind::Prefill)?;
-        let mut identity = 1u64;
-        let build: cuteafd_transport::expert::DeviceBuild = Box::new(move |wave, routes, wire| {
-            identity = identity.checked_add(1).ok_or(MiniMaxError::Overflow("golden wave identity"))?;
-            let kind = match wave.kind {1 => ExpertV2SourceKind::Decode, 2 => ExpertV2SourceKind::Prefill,
-                _ => return Err(MiniMaxError::Invalid("golden expert source kind").into())};
-            request(identity, wave.layer as usize, wave.rows as usize, routes, wire, kind)
-        });
-        Some(SparkDeviceLink::new(&library, args.device, SparkWorld::canonical(args.peers.len())?, &args.peers,
-            sizing.rows, 4, 6144 * 2, 6144 * 2, config, Some(warm), build)?)
+        Some(super::routed::Spark::connect(&library, args.device, SparkWorld::canonical(args.peers.len())?, &args.peers,
+            sizing.rows, config, first, request)?)
     } else {None};
     let experts: Box<dyn ExpertExecutor<'_>> = if local.is_none() && spark.is_none() {Box::new(DenseOnly)}
         else {Box::new(Routed::new(local, spark)?)};
