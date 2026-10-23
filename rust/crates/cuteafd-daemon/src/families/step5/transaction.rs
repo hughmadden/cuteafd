@@ -376,9 +376,14 @@ pub(super) struct Step<'e, 'a, E: CopyEngine> {
     sequences: Vec<Sequence>,
     live: bool,
     active: bool,
-    complete: Vec<BTreeSet<usize>>,
-    projected: Vec<BTreeSet<usize>>,
-    attended: Vec<BTreeSet<usize>>,
+    /// Per rank: (layer, unit) pairs staged, projected and attended.
+    complete: Vec<BTreeSet<(usize, usize)>>,
+    projected: Vec<BTreeSet<(usize, usize)>>,
+    attended: Vec<BTreeSet<(usize, usize)>>,
+    /// Prefill units of one sequence's span (PLAN "Prefill contract"); one
+    /// whole-step unit otherwise. `unit` is the selected one.
+    units: Vec<std::ops::Range<usize>>,
+    unit: usize,
     rows: usize,
     base: usize,
     extent: usize,
@@ -389,6 +394,44 @@ pub(super) struct Step<'e, 'a, E: CopyEngine> {
 
 impl<'e, 'a, E: CopyEngine> Step<'e, 'a, E> {
     pub(super) fn rows(&self) -> usize { self.rows }
+
+    /// Rows of the selected unit (the whole step when it is one unit).
+    pub(super) fn unit_rows(&self) -> std::ops::Range<usize> { self.units[self.unit].clone() }
+
+    /// Cuts this single-sequence step into prefill units. Each unit's hooks
+    /// project, stage and attend only its rows, in unit order per layer.
+    pub(super) fn set_units(&mut self, units: Vec<std::ops::Range<usize>>) -> Result<()> {
+        ensure!(self.sequences.len() == 1 && !units.is_empty() && units[0].start == 0
+            && units.windows(2).all(|pair| pair[0].end == pair[1].start && pair[0].start < pair[0].end)
+            && units.last().is_some_and(|unit| unit.end == self.rows && unit.start < unit.end)
+            && self.complete.iter().all(BTreeSet::is_empty),
+            "Step-5 prefill units must partition one fresh single-sequence step");
+        self.units = units;
+        self.unit = 0;
+        Ok(())
+    }
+
+    pub(super) fn select_unit(&mut self, unit: usize) -> Result<()> {
+        ensure!(unit < self.units.len(), "Step-5 prefill unit outside the step");
+        self.unit = unit;
+        Ok(())
+    }
+
+    /// Positions and request ids of the selected unit's rows.
+    fn unit_inputs<'s>(&self, stage: &'s Staging<'a>, rows: usize, heads: usize,
+        kv_format: cuteafd_loader::families::qwen4::Qwen4KvCache) -> Result<StepInputs<'s, 'a>> {
+        let window = self.unit_rows();
+        Ok(StepInputs {
+            stream: &stage.stream,
+            positions: view(stage.positions.buffer, window.start * 8, stage.positions.buffer.bytes - window.start * 8)?,
+            requests: view(stage.requests.buffer, window.start * 4, stage.requests.buffer.bytes - window.start * 4)?,
+            rows,
+            base: self.base + window.start,
+            extent: self.base + window.end,
+            heads,
+            kv_format,
+        })
+    }
 
     pub(super) fn expert_rows(&self, kind: cuteafd_transport::ExpertV2SourceKind)
         -> Result<Vec<cuteafd_transport::ExpertProtocolV2RowDescriptor>> {
@@ -491,7 +534,7 @@ impl<'e, 'a, E: CopyEngine> Step<'e, 'a, E> {
         let complete = vec![BTreeSet::new(); ranks.len()];
         let mut step = Self { ranks, staging, lease, base: sequences[0].base, extent,
             sequences, live: true, active: false, projected: complete.clone(), attended: complete.clone(),
-            complete, rows, failed: false, inputs: Vec::new(),
+            complete, units: vec![0..rows], unit: 0, rows, failed: false, inputs: Vec::new(),
             submission: Rc::new(Cell::new(false)) };
         for (owner, stage) in step.ranks.iter().zip(&step.staging) {
             let cache = owner.borrow();
@@ -560,7 +603,7 @@ impl<'e, 'a, E: CopyEngine> Step<'e, 'a, E> {
             "Step-5 projection layer"
         );
         ensure!(
-            self.projected[rank].insert(layer),
+            self.projected[rank].insert((layer, self.unit)),
             "Step-5 duplicate projection"
         );
         self.failed = true;
@@ -568,8 +611,10 @@ impl<'e, 'a, E: CopyEngine> Step<'e, 'a, E> {
             .stream
             .cancellation_guard("Step-5 projection callback");
         guard.complete = self.submission.get();
-        let result = work(
-            input_owner,
+        let inputs = if self.units.len() > 1 {
+            self.unit_inputs(stage, self.unit_rows().len(), cache.layout().query_heads(rank, layer)?,
+                cache.layout().kv_format)?
+        } else {
             StepInputs {
                 stream: &stage.stream,
                 positions: stage.positions.buffer,
@@ -579,8 +624,9 @@ impl<'e, 'a, E: CopyEngine> Step<'e, 'a, E> {
                 extent: self.extent,
                 heads: cache.layout().query_heads(rank, layer)?,
                 kv_format: cache.layout().kv_format,
-            },
-        );
+            }
+        };
+        let result = work(input_owner, inputs);
         if result.is_ok() {
             self.failed = false;
             guard.complete = true;
@@ -601,16 +647,21 @@ impl<'e, 'a, E: CopyEngine> Step<'e, 'a, E> {
         let stage = self.staging[rank];
         let mut guard = stage.stream.cancellation_guard("Step-5 composition callback");
         guard.complete = self.submission.get();
-        let result = work(owner, StepInputs {
-            stream: &stage.stream,
-            positions: stage.positions.buffer,
-            requests: stage.requests.buffer,
-            rows: self.rows,
-            base: self.base,
-            extent: self.extent,
-            heads: 64 / self.ranks.len(),
-            kv_format: cache.layout().kv_format,
-        });
+        let inputs = if self.units.len() > 1 {
+            self.unit_inputs(stage, self.unit_rows().len(), 64 / self.ranks.len(), cache.layout().kv_format)?
+        } else {
+            StepInputs {
+                stream: &stage.stream,
+                positions: stage.positions.buffer,
+                requests: stage.requests.buffer,
+                rows: self.rows,
+                base: self.base,
+                extent: self.extent,
+                heads: 64 / self.ranks.len(),
+                kv_format: cache.layout().kv_format,
+            }
+        };
+        let result = work(owner, inputs);
         if result.is_ok() {
             self.failed = false;
             guard.complete = true;
@@ -630,7 +681,7 @@ impl<'e, 'a, E: CopyEngine> Step<'e, 'a, E> {
                 && self
                     .complete
                     .get(rank)
-                    .is_some_and(|layers| layers.contains(&layer)),
+                    .is_some_and(|layers| layers.contains(&(layer, self.unit))),
             "Step-5 attention requires a successfully staged layer"
         );
         let cache = self.ranks[rank].borrow();
@@ -654,14 +705,22 @@ impl<'e, 'a, E: CopyEngine> Step<'e, 'a, E> {
                     (key, value, summary, view(stage.page_table.buffer, index * bytes, bytes)?,
                         usize::try_from(cache.page_count())?)
                 };
-            work(input_owner, AttentionRead { inputs: StepInputs {
-                stream: &stage.stream, positions: stage.positions.buffer, requests: stage.requests.buffer,
-                rows: sequence.rows, base: sequence.base, extent: sequence.base + sequence.rows,
-                heads: cache.layout().query_heads(rank, layer)?,
-                kv_format: cache.layout().kv_format,
-            }, start: sequence.start, key, value, summaries, table, table_width: stage.table_width, pages })?;
+            // A unit's rows start at row zero of its hook-local attention planes.
+            let (inputs, start) = if self.units.len() > 1 {
+                (self.unit_inputs(stage, self.unit_rows().len(), cache.layout().query_heads(rank, layer)?,
+                    cache.layout().kv_format)?, 0)
+            } else {
+                (StepInputs {
+                    stream: &stage.stream, positions: stage.positions.buffer, requests: stage.requests.buffer,
+                    rows: sequence.rows, base: sequence.base, extent: sequence.base + sequence.rows,
+                    heads: cache.layout().query_heads(rank, layer)?,
+                    kv_format: cache.layout().kv_format,
+                }, sequence.start)
+            };
+            work(input_owner, AttentionRead { inputs, start, key, value, summaries, table,
+                table_width: stage.table_width, pages })?;
         }
-        self.attended[rank].insert(layer);
+        self.attended[rank].insert((layer, self.unit));
         self.failed = false;
         guard.complete = true;
         Ok(())
@@ -678,8 +737,9 @@ impl<'e, 'a, E: CopyEngine> Step<'e, 'a, E> {
         index: Option<(&'e dyn BufferOwner, &'e dyn BufferOwner)>,
     ) -> Result<()> {
         ensure!(
-            rank < self.ranks.len() && !self.complete[rank].contains(&layer),
-            "Step-5 duplicate or invalid staged layer"
+            rank < self.ranks.len() && !self.complete[rank].contains(&(layer, self.unit))
+                && (self.unit == 0 || self.complete[rank].contains(&(layer, self.unit - 1))),
+            "Step-5 duplicate, out-of-order or invalid staged layer"
         );
         ensure!(!self.failed, "Step-5 failed step cannot be reused");
         self.failed = true;
@@ -695,14 +755,24 @@ impl<'e, 'a, E: CopyEngine> Step<'e, 'a, E> {
         let mut guard = stage.stream.cancellation_guard("Step-5 staged layer");
         guard.complete = self.submission.get();
         let heads = cache.layout().query_heads(rank, layer)?;
-        let source_bytes = self.rows * (heads / 16) * 192 * 2;
+        // A unit stages only its rows; its projections start at row zero.
+        let window = self.unit_rows();
+        let unit_rows = window.len();
+        let source_bytes = unit_rows * (heads / 16) * 192 * 2;
         for source in [key, value] { self.validate_source(&cache, source, source_bytes)?; }
         // Projections remain BF16; only the selected compact outputs use the
         // retained cache's byte stride. The pair is reused in lane-stream order.
         let [key, value] = if let Some(compact) = &stage.compact {
-            compact.enqueue(&stage.stream, [key, value], self.rows, heads)?
+            compact.enqueue(&stage.stream, [key, value], unit_rows, heads)?
         } else { [key, value] };
-        for sequence in &self.sequences {
+        let units = self.units.len() > 1;
+        for whole in &self.sequences {
+            let sequence = &if units {
+                Sequence { start: 0, rows: unit_rows, base: whole.base + window.start, ..whole.clone() }
+            } else { whole.clone() };
+            // The span's raw indexer rows: the committed pending tail, then
+            // every unit's rows at its offset (identical to one whole step).
+            let (span_pending, span_offset) = (whole.base % 8, if units { window.start } else { 0 });
             let kv_row = cache.layout().ranks[rank].sliding.iter().find(|r| r.layer == layer && !r.mtp)
                 .map(|ring| ring.key.bytes as usize / cache.layout().ring.rows as usize)
                 .or_else(|| state.regions.iter().find(|r| r.layer == layer).map(|region| region.page_bytes as usize / 64))
@@ -752,21 +822,23 @@ impl<'e, 'a, E: CopyEngine> Step<'e, 'a, E> {
                 for source in [ik, iz] {
                     self.validate_source(&cache, source, sequence.rows * 512)?;
                 }
-                let pending = sequence.base % 8;
+                let plan = csa_unit_plan(span_pending, span_offset, sequence.rows);
                 let old = cache.pending(layer, sequence.sequence, false)?;
-                let raw = [view(stage.raw[at].0.buffer, sequence.raw * 512, (pending + sequence.rows) * 512)?,
-                    view(stage.raw[at].1.buffer, sequence.raw * 512, (pending + sequence.rows) * 512)?];
+                let span_raw = |plane: CuteafdDeviceBuffer| view(plane, sequence.raw * 512,
+                    (span_pending + span_offset + sequence.rows) * 512);
+                let raw = [span_raw(stage.raw[at].0.buffer)?, span_raw(stage.raw[at].1.buffer)?];
                 for ((target, previous), source) in raw.into_iter().zip([old.0, old.1]).zip([ik, iz]) {
-                    if pending > 0 {
+                    // The committed pending tail precedes the span's first unit only.
+                    if plan.carry > 0 {
                         copy(
                             &stage.stream,
-                            view(target, 0, pending * 512)?,
-                            view(previous, 0, pending * 512)?,
+                            view(target, 0, plan.carry * 512)?,
+                            view(previous, 0, plan.carry * 512)?,
                         )?;
                     }
                     copy(
                         &stage.stream,
-                        view(target, pending * 512, sequence.rows * 512)?,
+                        view(target, plan.first_row * 512, sequence.rows * 512)?,
                         view(source, 0, sequence.rows * 512)?,
                     )?;
                 }
@@ -784,11 +856,16 @@ impl<'e, 'a, E: CopyEngine> Step<'e, 'a, E> {
                     }
                     position += count;
                 }
-                let completed = (pending + sequence.rows) / 8;
+                // Each region reads only its own eight raw rows, so compressing
+                // the regions this unit completes, at their raw offset, writes
+                // the same bytes as one whole-span compression.
+                let completed = plan.regions.len();
                 if let Some(summary) = region.summaries.filter(|_| completed > 0) {
-                    ensure!(completed <= stage.regions, "Step-5 staged summary capacity");
+                    ensure!(plan.regions.end <= stage.regions, "Step-5 staged summary capacity");
                     let target = cache.request_component(summary, sequence.sequence)?;
-                    let output = view(target, sequence.base / 8 * 256, completed * 256)?;
+                    let output = view(target, (whole.base / 8 + plan.regions.start) * 256, completed * 256)?;
+                    let raw = [view(raw[0], plan.regions.start * 8 * 512, (plan.raw_end - plan.regions.start * 8) * 512)?,
+                        view(raw[1], plan.regions.start * 8 * 512, (plan.raw_end - plan.regions.start * 8) * 512)?];
                     let sparse = stage.sparse.as_ref().context("Step-5 CSA compressor owner")?;
                     stage.stream.device.run(|| {
                         // SAFETY: admitted raw staging, immutable metadata, summary suffix and
@@ -805,7 +882,7 @@ impl<'e, 'a, E: CopyEngine> Step<'e, 'a, E> {
                                 ],
                                 &[
                                     Scalar::I32(completed as i32),
-                                    Scalar::I64((pending + sequence.rows) as i64),
+                                    Scalar::I64((plan.raw_end - plan.regions.start * 8) as i64),
                                 ],
                                 stage.stream.raw,
                             )
@@ -815,7 +892,7 @@ impl<'e, 'a, E: CopyEngine> Step<'e, 'a, E> {
             }
         }
         guard.complete = true;
-        self.complete[rank].insert(layer);
+        self.complete[rank].insert((layer, self.unit));
         self.failed = false;
         Ok(())
     }
@@ -843,7 +920,7 @@ impl<'e, 'a, E: CopyEngine> Step<'e, 'a, E> {
             ensure!(self.projected[rank].is_subset(&self.attended[rank]),
                 "Step-5 cannot publish projected layers without attention");
             ensure!(self.complete[rank].len()
-                == state.sliding.iter().filter(|s| !s.mtp).count() + state.regions.len(),
+                == (state.sliding.iter().filter(|s| !s.mtp).count() + state.regions.len()) * self.units.len(),
                 "Step-5 cannot publish an incomplete target step");
         }
         Ok(())
@@ -928,6 +1005,28 @@ impl<'e, 'a, E: CopyEngine> Step<'e, 'a, E> {
     }
 }
 
+/// Raw indexer staging for one prefill unit of a span based at `pending`
+/// (`base % 8`) committed rows past a region boundary. The span's raw rows
+/// are the committed tail, then every unit's rows at `pending + offset`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct CsaUnitPlan {
+    /// Committed pending rows copied ahead of this unit (first unit only).
+    pub carry: usize,
+    /// Raw row of this unit's first row.
+    pub first_row: usize,
+    /// End of the raw rows written so far (exclusive).
+    pub raw_end: usize,
+    /// Regions completed by this unit, in span order.
+    pub regions: std::ops::Range<usize>,
+}
+
+pub(super) fn csa_unit_plan(pending: usize, offset: usize, rows: usize) -> CsaUnitPlan {
+    let first_row = pending + offset;
+    let raw_end = first_row + rows;
+    CsaUnitPlan { carry: if offset == 0 { pending } else { 0 }, first_row, raw_end,
+        regions: first_row / 8..raw_end / 8 }
+}
+
 pub(super) fn validate_active_rows(rows: usize, capacity: usize) -> Result<()> {
     ensure!(rows > 0 && rows <= capacity, "Step-5 active rows outside admitted capacity");
     Ok(())
@@ -1001,6 +1100,50 @@ fn zero(stream: &Stream<'_>, target: CuteafdDeviceBuffer) -> Result<()> {
 #[cfg(test)]
 pub(super) mod tests {
     use super::*;
+
+    /// Units stage the span's raw indexer rows exactly as one whole step: the
+    /// committed tail (rows % 8 before the span) carries only into the first
+    /// unit, every unit lands at pending + offset, and per-unit compression of
+    /// the regions each unit completes equals one whole-span compression.
+    #[test]
+    fn csa_unit_tail_carry_and_regions_match_the_whole_span() {
+        // Each raw row is its position's id; a region "summary" is its eight ids.
+        let compress = |raw: &[i64], regions: std::ops::Range<usize>, base: usize, limit: usize|
+            regions.map(|region| { let start = region * 8 - base;
+                assert!(start + 8 <= limit); raw[start..start + 8].to_vec() }).collect::<Vec<_>>();
+        for pending in 0..8 {
+            for span in [8usize, 9, 15, 16, 64, 71, 512, 1024, 2048] {
+                for units in 1..=4usize {
+                    let width = span.div_ceil(units).max(1);
+                    let cuts = (0..span).step_by(width).map(|first| first..span.min(first + width)).collect::<Vec<_>>();
+                    // Whole span: committed tail ids are negative, new rows 0..span.
+                    let mut whole = (0..pending as i64).map(|i| -1 - i).collect::<Vec<_>>();
+                    whole.extend(0..span as i64);
+                    let whole_regions = compress(&whole, 0..(pending + span) / 8, 0, whole.len());
+                    let mut raw = vec![i64::MIN; pending + span];
+                    let mut summaries = Vec::new();
+                    for cut in &cuts {
+                        let plan = csa_unit_plan(pending, cut.start, cut.len());
+                        assert_eq!(plan.carry, if cut.start == 0 { pending } else { 0 });
+                        for i in 0..plan.carry { raw[i] = -1 - i as i64; }
+                        for i in 0..cut.len() { raw[plan.first_row + i] = (cut.start + i) as i64; }
+                        // Compression reads only rows written by this or earlier units.
+                        let base = plan.regions.start * 8;
+                        assert!(raw[base..plan.raw_end].iter().all(|&id| id != i64::MIN));
+                        summaries.extend(compress(&raw[base..], plan.regions.clone(), base, plan.raw_end - base));
+                    }
+                    assert_eq!(raw, whole, "pending={pending} span={span} units={units}");
+                    assert_eq!(summaries, whole_regions, "pending={pending} span={span} units={units}");
+                }
+            }
+        }
+        // Unit ends leaving 0, 1, 7 and 8 trailing rows past a region boundary.
+        for (pending, unit, tail) in [(0usize, 2048usize, 0usize), (1, 2048, 1), (7, 2048, 7), (0, 2040, 0)] {
+            assert_eq!(csa_unit_plan(pending, 0, unit).raw_end % 8, tail);
+            // Tail 8 is a full region: it completes in this unit, nothing carries.
+            assert_eq!(csa_unit_plan(pending, 0, unit + 8).regions.end - csa_unit_plan(pending, 0, unit).regions.end, 1);
+        }
+    }
     use cuteafd_engine::prefix::{BoxError, PrefixConfig, PrefixFamily};
     use cuteafd_hostcache::copy::StubCopyEngine;
 
