@@ -74,7 +74,10 @@ fn options(args: &PlanArgs) -> Result<PlanOptions, PlanError> {
                 context_tokens: args.context_tokens,
                 prefill_rows: args.prefill_rows,
                 full_prefill_logits: args.full_prefill_logits,
+                // Lane families still read prefill_lanes until their unit ports land.
                 prefill_lanes: args.prefill_waves,
+                prefill_waves: args.prefill_waves.max(1),
+                prefill_span_rows: (args.prefill_span_rows > 0).then_some(args.prefill_span_rows),
                 glmf_decode_rows: args.decode_rows,
                 glmf_representation: cuteafd_loader::families::glm5_flash::resident::GlmfRepresentation {
                     kda_fp8: args.kda_fp8 != crate::families::glm5_flash::fp8::KdaFp8::Off,
@@ -725,6 +728,20 @@ mod tests {
         write_snapshot};
 
     #[test]
+    fn plan_prefill_waves_and_span_reach_both_layout_fields() {
+        use clap::Parser;
+        let parse = |argv: &[&str]| match crate::cli::Cli::try_parse_from(argv).unwrap().command {
+            crate::cli::Commands::Plan(args) => options(&args).unwrap().layout.unwrap(),
+            _ => panic!("expected plan command"),
+        };
+        let layout = parse(&["cuteafd", "plan", "model", "--layout", "--prefill-waves", "2",
+            "--prefill-span-rows", "8192"]);
+        assert_eq!((layout.prefill_lanes, layout.prefill_waves, layout.prefill_span_rows), (2, 2, Some(8192)));
+        let default = parse(&["cuteafd", "plan", "model", "--layout"]);
+        assert_eq!((default.prefill_lanes, default.prefill_waves, default.prefill_span_rows), (0, 1, None));
+    }
+
+    #[test]
     fn exlr8_native_cli_resolves_default_config_and_opt_out_before_admission() {
         let dir = tempfile::tempdir().unwrap();
         let experts = dir.path().join("experts");
@@ -847,7 +864,7 @@ mod tests {
             context_tokens: 262144,
             prefill_rows: 4096,
             full_prefill_logits: false,
-            prefill_waves: 0,
+            prefill_waves: 0, prefill_span_rows: 0,
             decode_rows: 64,
             index_cache: crate::families::glm5_flash::engine::IndexCache::Keys,
             headroom_gib: 2.0,

@@ -118,7 +118,7 @@ def test_exlr8_forwards_native_selection_without_dense_worker_flags(manifest: st
     assert plan[plan.index("--exlr8-manifest") + 1] == manifest
     dense = plan[plan.index("--exlr8-dense-from") + 1]
     assert dense.startswith("<root>/hf/hub/models--deepseek-ai--DeepSeek-V4.1-Flash/snapshots/")
-    assert "CUTEAFD_GLM_PREFILL_LANES=3" in plan
+    assert "--prefill-lanes" not in plan and "CUTEAFD_GLM_PREFILL_LANES=2" not in plan
     assert len(result["containers"]) == 5
     for run in result["containers"]:
         parsed = parse_run(run["argv"])
@@ -126,25 +126,21 @@ def test_exlr8_forwards_native_selection_without_dense_worker_flags(manifest: st
         assert command[command.index("--exlr8-manifest") + 1] == manifest
         if "serve-glm" in command:
             assert command[command.index("--exlr8-dense-from") + 1] == dense
-            assert parsed["env"]["CUTEAFD_GLM_PREFILL_LANES"] == "3"
+            assert command[command.index("--prefill-waves") + 1] == "2"
+            assert "CUTEAFD_GLM_PREFILL_LANES" not in parsed["env"]
         else:
             assert "expertd-native" in command
             assert "--exlr8-dense-from" not in command
 
 
-@pytest.mark.parametrize("lanes", ["1", "2", "3", "4"])
-def test_exlr8_launcher_preserves_explicit_prefill_lanes(lanes: str, tmp_path: Path) -> None:
-    source = ROOT / "scripts/launch/run-family.sh"
-    launcher = tmp_path / "run-family.sh"
-    launcher.write_text(source.read_text().replace(
-        '    selected_lanes="${CUTEAFD_GLM_PREFILL_LANES:-3}"',
-        f'    CUTEAFD_GLM_PREFILL_LANES={lanes}\n'
-        '    selected_lanes="${CUTEAFD_GLM_PREFILL_LANES:-3}"'))
-    result = capture(ROOT, f"exlr8-lanes-{lanes}", release_entry=exlr8_entry(),
-        launcher_source=launcher)
-    assert f"CUTEAFD_GLM_PREFILL_LANES={lanes}" in result["plans"][0]
+@pytest.mark.parametrize("waves", ["1", "2", "3", "4"])
+def test_exlr8_launcher_preserves_explicit_prefill_waves(waves: str) -> None:
+    result = capture(ROOT, f"exlr8-waves-{waves}", release_entry=exlr8_entry(PREFILL_WAVES=waves))
+    plan = result["plans"][0]
+    assert plan[plan.index("--prefill-waves") + 1] == waves
     coordinator = parse_run(result["containers"][0]["argv"])
-    assert coordinator["env"]["CUTEAFD_GLM_PREFILL_LANES"] == lanes
+    assert coordinator["command"][coordinator["command"].index("--prefill-waves") + 1] == waves
+    assert "CUTEAFD_GLM_PREFILL_LANES" not in coordinator["env"]
 
 
 @pytest.mark.parametrize("gpus,attention", [("1", "auto"), ("1", "heads"), ("2", "auto"), ("2", "context")])

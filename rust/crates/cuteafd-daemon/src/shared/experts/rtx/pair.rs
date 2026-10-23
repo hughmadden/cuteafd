@@ -2,7 +2,7 @@
 use crate::shared::experts::exl3::execution::Exl3Modules;
 use super::{
     ExchangeDtype, ExpertInput, FusedCombine, PartialDtype, RouteCheck, RouteIdentity, RouteSource,
-    Routes, RtxExpertLayer, RtxShard,
+    Routes, RtxExpertLayer, RtxShard, routes::SlotRouteChecks,
 };
 use crate::shared::{
     memory::HostAllocation,
@@ -21,7 +21,7 @@ use std::{
 /// A failed drain may return only if the caller retains every queued owner;
 /// callers without quarantine ownership must terminate in shutdown instead.
 #[derive(Debug, thiserror::Error)]
-#[error("submission failed permanently: {cause}; {drain}")]
+#[error("submission failed permanently: {cause:#}; {drain}")]
 pub(crate) struct TerminalStepError {
     #[source]
     cause: anyhow::Error,
@@ -207,8 +207,14 @@ pub(crate) struct Pair<'a> {
     pub combine: FusedCombine<'a>,
     pub routes: PeerExchange<'a>,
     source: Cell<RouteSource>,
-    checks: RefCell<BTreeMap<(usize, usize), (usize, [HostAllocation<'a>; 2])>>,
+    /// Per-slot max-row pinned route copies per layer, allocated before a
+    /// call's first peer wait and retained (never replaced) across units.
+    checks: RefCell<Option<SlotRouteChecks<BTreeMap<usize, [HostAllocation<'a>; 2]>>>>,
+    /// The unit each slot's live diagnostics belong to (`enqueue` knows only the slot).
+    active: RefCell<Vec<Option<usize>>>,
     checking: Cell<bool>,
+    lanes: usize,
+    max_rows: usize,
     interval: usize,
     steps: Cell<usize>,
     library: &'a NativeLibrary,
@@ -270,8 +276,11 @@ impl<'a> Pair<'a> {
             combine: FusedCombine::new(library, exchange)?,
             routes,
             source: Cell::new(RouteSource::Replicated),
-            checks: RefCell::new(BTreeMap::new()),
+            checks: RefCell::new(None),
+            active: RefCell::new(vec![None; lanes]),
             checking: Cell::new(false),
+            lanes,
+            max_rows,
             interval,
             steps: Cell::new(0),
             library,
@@ -303,34 +312,79 @@ impl<'a> Pair<'a> {
         Ok(*bytes.iter().max().context("installed TP2 ranks missing")?)
     }
 
-    pub(crate) fn begin_checks(&self, rows: &[usize], force: bool) -> Result<()> {
+    /// Starts a call's route diagnostics: whether this call checks (`force` or
+    /// the CUTEAFD_ROUTE_CHECK interval). When it does, every slot's max-row
+    /// pinned storage exists before the caller queues any peer wait; strict
+    /// (forced) checks fail on a mismatch, interval checks fall back to broadcast.
+    pub(crate) fn start_checks(&self, force: bool) -> Result<bool> {
         let steps = self.steps.get() + 1;
         self.steps.set(steps);
         let check = force || (self.interval > 0 && steps % self.interval == 0);
         self.checking.set(check);
-        if !check {
-            return Ok(());
-        }
+        if !check { return Ok(false); }
         let mut checks = self.checks.borrow_mut();
-        ensure!(checks.is_empty(), "undrained TP2 route diagnostics");
-        for &layer in &self.layers {
-            for (lane, &rows) in rows.iter().enumerate() {
-                let hosts = (0..2)
-                    .map(|rank| {
-                        self.routes.on(rank, || {
-                            HostAllocation::new(self.library, rows * self.topk * 8)
-                        })
-                    })
-                    .collect::<Result<Vec<_>>>()?;
-                checks.insert(
-                    (layer, lane),
-                    (
-                        rows,
-                        hosts.try_into().map_err(|_| anyhow::anyhow!("two ranks"))?,
-                    ),
-                );
+        // The previous span finished (drained) or failed terminally (the
+        // submission teardown drained it), so its storage is released here,
+        // before this call queues anything.
+        ensure!(self.active.borrow().iter().all(Option::is_none), "undrained TP2 route diagnostics");
+        let storage = (0..self.lanes).map(|_| self.layers.iter().map(|&layer| {
+            let hosts = (0..2).map(|rank| self.routes.on(rank, ||
+                HostAllocation::new(self.library, self.max_rows * self.topk * 8))).collect::<Result<Vec<_>>>()?;
+            Ok((layer, hosts.try_into().map_err(|_| anyhow::anyhow!("two ranks"))?))
+        }).collect::<Result<BTreeMap<_, _>>>()).collect::<Result<Vec<_>>>()?;
+        *checks = Some(SlotRouteChecks::new(storage, force)?);
+        Ok(true)
+    }
+
+    /// One unit's diagnostics on `slot` (its rows of every TP2 layer).
+    pub(crate) fn begin_unit(&self, slot: usize, unit: usize, rows: usize) -> Result<()> {
+        if !self.checking.get() { return Ok(()); }
+        ensure!(rows <= self.max_rows, "route diagnostic rows {rows} exceed {}", self.max_rows);
+        let mut checks = self.checks.borrow_mut();
+        checks.as_mut().context("route diagnostics not started")?.begin(slot, unit, rows, true)?;
+        *self.active.borrow_mut().get_mut(slot).context("route diagnostic slot")? = Some(unit);
+        Ok(())
+    }
+
+    /// Drains both producer streams, then compares the unit's routes trimmed
+    /// to its rows. A mismatch switches to broadcast (strict: an error).
+    pub(crate) fn finish_unit(&self, slot: usize, unit: usize) -> Result<()> {
+        if !self.checking.get() { return Ok(()); }
+        let mut checks = self.checks.borrow_mut();
+        let checks = checks.as_mut().context("route diagnostics not started")?;
+        let topk = self.topk;
+        let identity = checks.finish(slot, unit, |storage, rows| {
+            for rank in 0..2 {
+                // SAFETY: every producer of this unit's copies is already queued.
+                self.routes.on(rank, || unsafe {
+                    self.library.cuda_stream_synchronize(self.devices[rank].stream)
+                })?;
             }
-        }
+            let section = rows * topk * 4;
+            let full = self.max_rows * topk * 4;
+            Ok(storage.iter().map(|(&layer, hosts)| RouteCheck { layer, rows, topk,
+                ranks: hosts.each_ref().map(|h| {
+                    let bytes = h.bytes();
+                    [&bytes[..section], &bytes[full..full + section]].concat()
+                }) }).collect())
+        })?;
+        *self.active.borrow_mut().get_mut(slot).context("route diagnostic slot")? = None;
+        if let Some(identity) = identity { self.publish_identity(&identity); }
+        Ok(())
+    }
+
+    /// Ends a call's diagnostics; always called, also before propagating an
+    /// executor error (strict checks reject a unit that never finished).
+    pub(crate) fn finish_span(&self) -> Result<()> {
+        if !self.checking.replace(false) { return Ok(()); }
+        let checks = self.checks.borrow();
+        checks.as_ref().context("route diagnostics not started")?.finish_span()
+    }
+
+    /// A single-pass call: each lane is one unit on its own slot.
+    pub(crate) fn begin_checks(&self, rows: &[usize], force: bool) -> Result<()> {
+        if !self.start_checks(force)? { return Ok(()); }
+        for (lane, &rows) in rows.iter().enumerate() { self.begin_unit(lane, lane, rows)?; }
         Ok(())
     }
 
@@ -338,27 +392,17 @@ impl<'a> Pair<'a> {
         self.checking.get()
     }
 
+    /// Completes a single-pass call's lanes, then its span.
     pub(crate) fn finish_checks(&self) -> Result<()> {
-        if !self.checking.replace(false) {
-            return Ok(());
-        }
-        for rank in 0..2 {
-            // SAFETY: every producer/wait for the completed step is already queued.
-            self.routes.on(rank, || unsafe {
-                self.library
-                    .cuda_stream_synchronize(self.devices[rank].stream)
-            })?;
-        }
-        let checks = std::mem::take(&mut *self.checks.borrow_mut())
-            .into_iter()
-            .map(|((layer, _), (rows, hosts))| RouteCheck {
-                layer,
-                rows,
-                topk: self.topk,
-                ranks: hosts.map(|h| h.bytes().to_vec()),
-            })
-            .collect::<Vec<_>>();
-        let identity = RouteIdentity::check(&checks);
+        if !self.checking.get() { return Ok(()); }
+        let live = self.active.borrow().iter().enumerate()
+            .filter_map(|(slot, unit)| unit.map(|unit| (slot, unit))).collect::<Vec<_>>();
+        let result = live.into_iter().try_for_each(|(slot, unit)| self.finish_unit(slot, unit));
+        let span = self.finish_span();
+        result.and(span)
+    }
+
+    fn publish_identity(&self, identity: &RouteIdentity) {
         if identity.source() == RouteSource::Broadcast {
             self.source.set(RouteSource::Broadcast);
         }
@@ -372,7 +416,6 @@ impl<'a> Pair<'a> {
                 "replicated"
             },
         );
-        Ok(())
     }
 
     /// Resolve all lazy backend capacities before either rank queues a peer wait.
@@ -469,14 +512,16 @@ impl<'a> Pair<'a> {
         let result = self.routes.on(rank, || {
             let stream = self.devices[rank].stream;
             let packed = PackedRoutes::new(rows, self.topk);
-            if self.checking.get() {
-                let checks = self.checks.borrow();
-                let (expected, hosts) = checks
-                    .get(&(layer, lane))
-                    .context("route diagnostics not prepared")?;
-                ensure!(*expected == rows, "route diagnostic row count changed");
-                let host = hosts[rank].buffer;
-                // SAFETY: prepared pinned storage stays live through finish_checks' stream drains.
+            let unit = if self.checking.get() { self.active.borrow().get(lane).copied().flatten() } else { None };
+            if let Some(unit) = unit {
+                let mut checks = self.checks.borrow_mut();
+                let storage = checks.as_mut().context("route diagnostics not started")?
+                    .storage(lane, unit)?.context("route diagnostics disabled for a live unit")?;
+                let host = storage.get(&layer).context("route diagnostics omit a TP2 layer")?[rank].buffer;
+                ensure!(rows <= self.max_rows, "route diagnostic row count exceeds its storage");
+                let full = self.max_rows * self.topk * 4;
+                // SAFETY: the slot's pinned storage is retained (never replaced)
+                // until finish_unit drains both producer streams.
                 unsafe {
                     self.library.copy_d2h_host_buffer_async(
                         host,
@@ -488,9 +533,10 @@ impl<'a> Pair<'a> {
                         packed.section,
                         stream,
                     )?;
+                    // Weights at the fixed max-row offset; finish trims both sections.
                     self.library.copy_d2h_host_buffer_async(
                         CuteafdHostBuffer {
-                            ptr: host.ptr.cast::<u8>().add(packed.section).cast(),
+                            ptr: host.ptr.cast::<u8>().add(full).cast(),
                             bytes: packed.section,
                             ..host
                         },

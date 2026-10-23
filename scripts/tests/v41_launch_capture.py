@@ -131,6 +131,11 @@ if tool == "docker":
                 unit = int(value("--prefill-rows", "0")) or 2048
                 waves = int(value("--prefill-waves", "0")) or 2
                 response.update(prefill_unit_rows=unit, prefill_waves=waves, prefill_span_rows=unit * waves)
+            elif family == "glm5":
+                unit = int(value("--prefill-rows", "0")) or 4096
+                waves = 1 if int(ranks) == 0 else int(value("--prefill-waves", "0")) or 2
+                span = int(value("--prefill-span-rows", "0")) or 16384
+                response.update(prefill_unit_rows=unit, prefill_waves=waves, prefill_span_rows=span)
             report = dict(response)
             exl3 = os.environ.get("CAPTURE_EXL3") == "1"
             explicit_topology = "--spark-tp" in args or family == "deepseek_v41" and (int(ranks) == 3 if exl3 else int(ranks) not in (0, 4))

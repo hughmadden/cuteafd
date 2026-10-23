@@ -361,6 +361,10 @@ pub(crate) struct PlanArgs {
     /// Prefill units in flight for --layout (0: the family default).
     #[arg(long, default_value_t = 0)]
     pub(crate) prefill_waves: u64,
+    /// Rows one continuous prefill call streams for --layout (0: the family
+    /// default). Shared by every units-span family (launcher PREFILL_SPAN_ROWS).
+    #[arg(long, default_value_t = 0)]
+    pub(crate) prefill_span_rows: u64,
     /// Decode and verify step rows for --layout (GLM 5.3 Flash's --decode-rows: 64, or 128 with the
     /// wide programs on one GPU): its decode workspace, token selector and replay records.
     #[arg(long, default_value_t = 64, value_parser = plan_decode_rows)]
@@ -921,6 +925,16 @@ mod tests {
         };
         assert_eq!(args.prefill_waves, 2);
         assert!(Cli::try_parse_from(["cuteafd", "plan", "model", "--prefill-lanes", "2"]).is_err());
+    }
+
+    #[test]
+    fn plan_prefill_span_rows_is_one_shared_option() {
+        let span = |argv: &[&str]| match Cli::try_parse_from(argv).unwrap().command {
+            Commands::Plan(args) => args.prefill_span_rows,
+            _ => panic!("expected plan command"),
+        };
+        assert_eq!(span(&["cuteafd", "plan", "model"]), 0, "0 selects the family default");
+        assert_eq!(span(&["cuteafd", "plan", "model", "--prefill-span-rows", "8192"]), 8192);
     }
 
     #[test]

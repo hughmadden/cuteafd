@@ -55,6 +55,8 @@ pub struct LayoutOptions {
     pub prefill_lanes: u64,
     /// Family-resolved rows per wave, independent of the admitted span.
     pub prefill_unit_rows: Option<u64>,
+    /// Requested rows per continuous prefill call (units-span families).
+    pub prefill_span_rows: Option<u64>,
     /// Continuous row-unit waves on one transport.
     pub prefill_waves: u64,
     /// Rows of a GLM 5.3 Flash decode or verify step (`--decode-rows`): 64, or 128 with the wide
@@ -191,6 +193,7 @@ impl Default for LayoutOptions {
             full_prefill_logits: false,
             prefill_lanes: 0,
             prefill_unit_rows: None,
+            prefill_span_rows: None,
             prefill_waves: 1,
             glmf_decode_rows: crate::serving_capacity::GLMF_DECODE_ROWS,
             glmf_representation: Default::default(),
@@ -253,17 +256,21 @@ impl Default for LayoutOptions {
     }
 }
 
-/// Shared with the GLM runtime so admission and allocation use the same lanes.
+/// GLM prefill units in flight: the default (None) or a parsed value, clamped
+/// to 1..=4. Default: 2 units of 4096 rows (PLAN "Prefill contract"); serve-glm
+/// takes `--prefill-waves`, the planner `--prefill-lanes`.
+pub const GLM_DEFAULT_PREFILL_SPAN_ROWS: u64 = 16384;
+
 pub fn glm_prefill_lanes(value: Option<&str>) -> usize {
-    value.and_then(|v| v.parse().ok()).unwrap_or(3).clamp(1, 4)
+    value.and_then(|v| v.parse().ok()).unwrap_or(2).clamp(1, 4)
 }
 
 /// Additional lead-GPU output bytes for admitted all-row fidelity probes.
-/// GLM uses its configured lanes; GLM Flash's lanes (a serial prefill runs in
+/// GLM uses its default waves (a planner `--prefill-lanes` selects others); GLM Flash's lanes (a serial prefill runs in
 /// the first) share one set of temporaries and so one logits buffer.
 /// V4 reuses its bounded head buffer; V4.1 already supports prefill scoring.
 pub fn full_prefill_logits_bytes(family: &str, rows: u64, vocab: u64) -> u64 {
-    let lanes = glm_prefill_lanes(std::env::var("CUTEAFD_GLM_PREFILL_LANES").ok().as_deref());
+    let lanes = glm_prefill_lanes(None);
     full_prefill_logits_bytes_with_lanes(family, rows, vocab, lanes)
 }
 
@@ -300,7 +307,7 @@ mod scoring_workspace_tests {
         assert!(!LayoutOptions::default().full_prefill_logits);
         assert_eq!(full_prefill_logits_bytes("mimo_v2", 128, 1000), 127 * 1000 * 4);
         assert_eq!(full_prefill_logits_bytes("qwen4", 128, 1000), 127 * (1000 * 4 + 16));
-        assert_eq!(glm_prefill_lanes(None), 3);
+        assert_eq!(glm_prefill_lanes(None), 2);
         for lanes in 1..=4 {
             assert_eq!(glm_prefill_lanes(Some(&lanes.to_string())), lanes);
             assert_eq!(full_prefill_logits_bytes_with_lanes("glm5", 128, 1000, lanes),
@@ -308,7 +315,7 @@ mod scoring_workspace_tests {
         }
         assert_eq!(glm_prefill_lanes(Some("0")), 1);
         assert_eq!(glm_prefill_lanes(Some("9")), 4);
-        assert_eq!(glm_prefill_lanes(Some("invalid")), 3);
+        assert_eq!(glm_prefill_lanes(Some("invalid")), 2);
         assert_eq!(full_prefill_logits_bytes("glm5_flash", 128, 1000), 64 * 1000 * 4);
         for family in ["deepseek_v4", "deepseek_v41"] {
             assert_eq!(full_prefill_logits_bytes(family, 2048, 1000), 0);
@@ -327,7 +334,8 @@ mod scoring_workspace_tests {
 pub fn spark_endpoints(family: &str, lanes: u64) -> usize {
     match family {
         "deepseek_v41" | "deepseek_v4" => 2,
-        "glm5" => 1 + if lanes > 1 { lanes as usize } else { 0 },
+        // The decode link and one prefill link (its waves share that endpoint's rings).
+        "glm5" => 1 + usize::from(lanes > 1),
         "glm5_flash" => 1,
         "mimo_v2" => lanes as usize,
         "qwen4" => 1,
@@ -382,7 +390,8 @@ mod selected_spark_io_tests {
         for (family, geometry, lanes, expected) in [
             ("deepseek_v4", ExpertGeometry::DEEPSEEK_V4_FLASH, 2, 821428224),
             ("deepseek_v4", ExpertGeometry::DEEPSEEK_V4_PRO, 2, 1431699456),
-            ("glm5", ExpertGeometry::GLM5, 3, 2459697152),
+            // Decode link + one prefill link (formerly one endpoint per lane: 2459697152).
+            ("glm5", ExpertGeometry::GLM5, 3, 1229848576),
             ("mimo_v2", ExpertGeometry::MIMO_V26_PRO, 3, 1844772864),
         ] {
             let working = SparkWorkingSet { spark_layers: vec![3], spark_ranks: 4,
@@ -425,7 +434,7 @@ mod selected_spark_io_tests {
             assert!(device.items.is_empty());
         }
         let glm = crate::placement::families::glm5::prefill_lanes(4, glm_prefill_lanes(None) as u64);
-        assert_eq!(spark_endpoints("glm5", glm), 4);
+        assert_eq!(spark_endpoints("glm5", glm), 2);
         assert_eq!(spark_endpoints("glm5", crate::placement::families::glm5::prefill_lanes(0, 3)), 1);
     }
 }
@@ -1205,7 +1214,7 @@ pub(crate) fn charge_host(report: &mut PlanReport, options: &LayoutOptions, chec
         Some(transports) => transports,
         None => match family {
             "glm5" => if options.prefill_lanes > 0 { options.prefill_lanes } else {
-                glm_prefill_lanes(std::env::var("CUTEAFD_GLM_PREFILL_LANES").ok().as_deref()) as u64 },
+                glm_prefill_lanes(None) as u64 },
             "glm5_flash" => if options.prefill_lanes > 0 { options.prefill_lanes }
                 else { crate::serving_capacity::GLMF_DEFAULT_PREFILL_LANES },
             "mimo_v2" => {

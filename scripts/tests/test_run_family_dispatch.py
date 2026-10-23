@@ -803,13 +803,15 @@ report.update(spark_ranks=ranks)
 gpus = int(value("--rtx", "1"))
 placement_ready = report.get("placement_supported", True) and report.get("fits", True)
 shared = family in {"step5", "kimi_k3"}
+glm = family == "glm5"
 unit = int(value("--prefill-rows", "0")) or (2048 if shared else 4096)
-waves = int(value("--prefill-waves", "0")) or (2 if shared else 1)
-report.update(prefill_unit_rows=unit, prefill_waves=waves, prefill_span_rows=unit * waves, prefill_transports=1)
+waves = 1 if glm and ranks == 0 else int(value("--prefill-waves", "0")) or (2 if shared or glm else 1)
+span = int(value("--prefill-span-rows", "0")) or 16384 if glm else unit * waves
+report.update(prefill_unit_rows=unit, prefill_waves=waves, prefill_span_rows=span, prefill_transports=1)
 deployment = dict(version=1, family=family, executable=family != "qwen3_5" and placement_ready, wip_launchable=placement_ready, rtx_gpus=gpus, spark_ranks=ranks,
     topology=dict(tp=tp, ep=ep,
                   wire="native_ownership" if explicit else "canonical"), peers=peers,
-    speculator=value("--speculator", "off"), prefill_unit_rows=unit, prefill_waves=waves, prefill_span_rows=unit * waves,
+    speculator=value("--speculator", "off"), prefill_unit_rows=unit, prefill_waves=waves, prefill_span_rows=span,
     admission=dict(kv_pool_size=value("--kv-pool-size"), memory_reservation=value("--memory-reservation")),
     spark_admission="coordinator_authoritative",
     launch=dict(family=family, first_expert_layer=int(first), last_expert_layer=None if last == "-1" else int(last)),
@@ -906,7 +908,6 @@ def test_shared_prefill_launcher_forwards_resolved_units_without_span(
     {"model_type": "qwen4_exp", "text_config": {"num_hidden_layers": 2,
      "mtp_num_hidden_layers": 1, "layer_types": ["linear_attention", "full_attention"]}},
     {"model_type": "deepseek_v4", "num_hidden_layers": 61},
-    {"model_type": "glm_moe_dsa", "num_hidden_layers": 4, "first_k_dense_replace": 3},
     {"model_type": "mimo_v2_flash", "num_hidden_layers": 2, "moe_layer_freq": [0, 1]},
 ])
 def test_legacy_prefill_launcher_does_not_forward_typed_shape(tmp_path: Path, family_config: dict) -> None:
@@ -1190,8 +1191,8 @@ def test_mimo_transport_timing_is_resolved_once_for_all_prefill_lanes():
 @pytest.mark.parametrize("config,keys,env,endpoints", [
     ({"model_type": "deepseek_v4"}, "", {}, 2),
     ({"model_type": "glm_moe_dsa", "num_hidden_layers": 4, "first_k_dense_replace": 3}, "", {}, 4),
-    ({"model_type": "glm_moe_dsa", "num_hidden_layers": 4, "first_k_dense_replace": 3}, "", {"CUTEAFD_GLM_PREFILL_LANES": "1"}, 1),
-    ({"model_type": "glm_moe_dsa", "num_hidden_layers": 4, "first_k_dense_replace": 3}, "", {"CUTEAFD_GLM_PREFILL_LANES": "4"}, 5),
+    ({"model_type": "glm_moe_dsa", "num_hidden_layers": 4, "first_k_dense_replace": 3}, "PREFILL_WAVES=1\n", {}, 1),
+    ({"model_type": "glm_moe_dsa", "num_hidden_layers": 4, "first_k_dense_replace": 3}, "PREFILL_WAVES=4\n", {}, 5),
     ({"model_type": "glm5_next"}, "", {}, 1),
     ({"model_type": "glm5_next"}, "PREFILL_WAVES=4\n", {}, 1),
     ({"model_type": "qwen4_exp"}, "", {}, 1),
@@ -1344,6 +1345,28 @@ def test_glm53_honors_explicit_tp2_expert_limit(tmp_path, value):
         assert f"--rtx-expert-layers {expected}" in launch
 
 
+@pytest.mark.parametrize("explicit", [False, True])
+def test_glm53_units_span_forwards_the_planned_units_waves_and_span(tmp_path, explicit):
+    keys = "PREFILL_ROWS=2048\nPREFILL_WAVES=3\nPREFILL_SPAN_ROWS=8192\n" if explicit else ""
+    result = _family_launch_result(tmp_path, {
+        "model_type": "glm_moe_dsa", "num_hidden_layers": 9, "first_k_dense_replace": 3,
+    }, "test/glm", keys)
+    assert result.returncode == 0, result.stderr
+    plan = next(shlex.split(line) for line in result.stderr.splitlines()
+                if "cuteafd plan" in line and "--deployment" in line)
+    unit, waves, span = (2048, 3, 8192) if explicit else (4096, 2, 16384)
+    if explicit:
+        for flag, value in [("--prefill-rows", unit), ("--prefill-waves", waves), ("--prefill-span-rows", span)]:
+            assert plan[plan.index(flag) + 1] == str(value)
+    assert "--prefill-lanes" not in plan
+    serve = next(shlex.split(line) for line in result.stderr.splitlines()
+                 if "docker run -d" in line and "serve-glm" in line)
+    for flag, value in [("--prefill-rows", unit), ("--prefill-waves", waves), ("--prefill-span-rows", span)]:
+        assert serve.count(flag) == 1 and serve[serve.index(flag) + 1] == str(value)
+    assert not any("CUTEAFD_PREFILL_SPAN_ROWS" in arg or "CUTEAFD_GLM_PREFILL_LANES" in arg for arg in serve)
+    assert f"Resolved prefill: PREFILL_ROWS={unit} PREFILL_WAVES={waves} PREFILL_SPAN_ROWS={span}" in result.stdout
+
+
 def test_glm53_all_local_two_rtx_launch_has_no_spark_peers(tmp_path):
     result = _family_launch_result(tmp_path, {
         "model_type": "glm_moe_dsa", "num_hidden_layers": 4, "first_k_dense_replace": 3,
@@ -1355,7 +1378,7 @@ def test_glm53_all_local_two_rtx_launch_has_no_spark_peers(tmp_path):
     assert "--peers" not in launch
     assert "cuteafd expertd-native" not in result.stderr
     assert "--local-experts" not in launch
-    assert "CUTEAFD_GLM_PREFILL_LANES=1" in launch
+    assert "--prefill-waves 1" in launch and "CUTEAFD_GLM_PREFILL_LANES" not in launch
     assert "--rdma-endpoints" not in result.stderr
 
 

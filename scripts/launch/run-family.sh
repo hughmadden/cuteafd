@@ -282,6 +282,9 @@ EOF
       ;;
     glm5)
       cat <<'EOF'
+PREFILL_ROWS
+PREFILL_WAVES
+PREFILL_SPAN_ROWS
 EXLR8_MANIFEST
 EXLR8_DENSE_FROM
 RTX_EXPERT_PEER
@@ -382,6 +385,7 @@ EOF
 family_prefill_mode() {
   case "$1" in
     step5|kimi_k3) echo units ;;
+    glm5) echo units-span ;;
     *) echo legacy ;;
   esac
 }
@@ -2551,12 +2555,8 @@ lane_env_args=()
 case "$family" in
   deepseek_v4) ;;
   glm5)
-    selected_lanes="${CUTEAFD_GLM_PREFILL_LANES:-3}"
-    [[ "$selected_lanes" =~ ^[1-4]$ ]] || { echo "CUTEAFD_GLM_PREFILL_LANES must be 1 to 4" >&2; exit 2; }
-    if [[ "$ranks" == 0 ]]; then
-      selected_lanes=1
-    fi
-    lane_env_args+=(-e "CUTEAFD_GLM_PREFILL_LANES=$selected_lanes") ;;
+    # Prefill units, waves and span come from the deployment plan (units-span).
+    ;;
   glm5_flash)
     # Planner and server must offer the same conditional drafter homes.
     # Explicit config overrides the legacy process-wide diagnostic switch.
@@ -2683,6 +2683,11 @@ audio_encoder_hash=""
   fi
   if [[ "$family" == glm5 || "$family" == glm5_flash || "$family" == mimo_v2 ]]; then
     plan_draft_args+=(--draft-kv-cache "$draft_kv_cache")
+  fi
+  if [[ "$family" == glm5 ]]; then
+    [[ -z "$(get PREFILL_ROWS)" ]] || plan_draft_args+=(--prefill-rows "$(get PREFILL_ROWS)")
+    [[ -z "$(get PREFILL_WAVES)" ]] || plan_draft_args+=(--prefill-waves "$(get PREFILL_WAVES)")
+    [[ -z "$(get PREFILL_SPAN_ROWS)" ]] || plan_draft_args+=(--prefill-span-rows "$(get PREFILL_SPAN_ROWS)")
   fi
   if [[ "$family" == qwen4 ]]; then
     plan_draft_args+=(--kv-cache "$kv_cache")

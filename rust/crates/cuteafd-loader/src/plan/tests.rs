@@ -63,14 +63,15 @@ fn native_host_ledger_charges_six_spark_ranks_without_spark_device_entries() {
     let (request, response) = endpoint.wire_bytes(geometry).unwrap();
     let rings = SparkRings { max_frame_bytes: (64 << 20).max(request).max(response),
         depth: 8, slot_bytes: 8 << 20, alignment: 4096 };
-    let expected = endpoint.ring_bytes(geometry, rings).unwrap() as u64 * 4 * 6;
+    // Two endpoints per rank (decode link + one prefill link) over six ranks.
+    let expected = endpoint.ring_bytes(geometry, rings).unwrap() as u64 * 2 * 6;
     layout::charge_host(&mut report, &options, input.checkpoint(), true).unwrap();
     let host = report.host_ledger.as_ref().unwrap();
     let registered = host.items.iter().find(|i| i.group == "transport/rdma-rings").unwrap();
     assert_eq!(registered.bytes, expected);
     assert_eq!(registered.lifetime, ItemLifetime::PostReadyReserve);
     let intake = host.items.iter().find(|i| i.group == "spark-intake").unwrap();
-    assert_eq!(intake.bytes, 4096 * geometry.hidden as u64 * 4 * 4 * 6);
+    assert_eq!(intake.bytes, 4096 * geometry.hidden as u64 * 4 * 2 * 6);
     assert_eq!(host.shortfall_bytes, 0);
     report.spark_ranks = 0;
     layout::charge_host(&mut report, &options, input.checkpoint(), true).unwrap();
@@ -710,6 +711,10 @@ fn glm5_layout_matches_runtime_request_from_header_baseline() {
             let report = plan(dir.path(), &PlanOptions { layout: Some(options.clone()),
                 attention_placement: Some(crate::placement::AttentionPlacement::Heads), ..Default::default() }).unwrap();
             assert!(report.executable(), "{}", render(&report));
+            // The planner publishes the units serving runs: rows each, waves in
+            // flight (one without Sparks), and the default continuous span.
+            assert_eq!((report.prefill_unit_rows, report.prefill_waves, report.prefill_span_rows),
+                (Some(4096), Some(if report.spark_ranks == 0 { 1 } else { 3 }), Some(16384)));
             let memory = report.memory_layout.unwrap();
             let gpus = memory.devices.iter().filter(|d| d.kind == cuteafd_core::memory_layout::DeviceKind::Rtx)
                 .map(|d| (d.capacity_bytes, Baseline::Measured { free_bytes: d.capacity_bytes - d.items.iter()
@@ -745,6 +750,24 @@ fn glm5_layout_matches_runtime_request_from_header_baseline() {
             }
         }
     }
+}
+
+#[test]
+fn glm5_layout_publishes_an_explicit_span_without_charging_it() {
+    let dir = snapshot(glm5_config(), &glm5_tensors(|name, n, k| fp8(name, n, k, None)));
+    let plan_with = |span| {
+        let options = layout::LayoutOptions { rtx_bytes: vec![96 << 30], context_tokens: 65536,
+            prefill_rows: 4096, prefill_lanes: 2, prefill_span_rows: span, glm5_drafter_disabled: true,
+            host_memory: Some((128 << 30, 128 << 30)), ..Default::default() };
+        plan(dir.path(), &PlanOptions { layout: Some(options),
+            attention_placement: Some(crate::placement::AttentionPlacement::Heads), ..sparks(4) }).unwrap()
+    };
+    let (default, explicit) = (plan_with(None), plan_with(Some(8192)));
+    assert_eq!(default.prefill_span_rows, Some(16384));
+    assert_eq!((explicit.prefill_unit_rows, explicit.prefill_waves, explicit.prefill_span_rows),
+        (Some(4096), Some(2), Some(8192)));
+    assert_eq!(default.memory_layout.unwrap().pool_tokens, explicit.memory_layout.unwrap().pool_tokens,
+        "workspaces are per unit slot; the span charges nothing");
 }
 
 #[test]
