@@ -128,6 +128,13 @@ impl SparkExperts {
     pub fn world_size(&self) -> usize {
         self.executors.len()
     }
+    /// Bind this transport to one immutable ModelAdmission endpoint on every
+    /// rank before bootstrap or dispatch. Reconnect retains the same identity;
+    /// missing, incompatible or busy endpoints fail without automatic fallback.
+    pub fn bind_model_endpoint(&mut self, endpoint: u32) -> Result<()> {
+        ensure!(self.open_waves.is_empty(), "cannot bind endpoint with waves in flight");
+        self.clients.bind_model_endpoint(endpoint)
+    }
     /// Admit up to `waves` outstanding [`SparkExpertWave`]s, received oldest
     /// first. The workers already serve each QP's requests in post order.
     pub fn set_max_waves(&mut self, waves: usize) -> Result<()> {

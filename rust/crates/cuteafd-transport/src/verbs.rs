@@ -2050,7 +2050,7 @@ impl VerbsHostProtocolV2PersistentClientSession {
         execution_lane: u32,
         cq_harvester: Option<Arc<VerbsHostProtocolV2CqHarvester>>,
     ) -> Result<Self> {
-        Self::connect_impl(addr, config, request, execution_lane, cq_harvester, false, None, false, None, None, 0, None)
+        Self::connect_impl(addr, config, request, execution_lane, cq_harvester, false, None, false, None, None, 0, None, None)
     }
 
     /// `flow_label`: both QPs' RoCE v2 flow label (0: the kernel's own).
@@ -2058,9 +2058,10 @@ impl VerbsHostProtocolV2PersistentClientSession {
     fn connect_local(addr: SocketAddr, config: &TcpTransportConfig,
                      request: &ExpertProtocolV2Request, landing: Option<DeviceLanding>,
                      egress: Option<&Arc<egress::EgressBuffer>>, write: Option<DeviceWriteTarget>,
-                     terminal_owner: Option<Arc<AtomicBool>>, flow_label: u32, capacity: Option<u32>) -> Result<Self> {
+                     terminal_owner: Option<Arc<AtomicBool>>, flow_label: u32, capacity: Option<u32>,
+                     model_endpoint: Option<u32>) -> Result<Self> {
         let mut session = Self::connect_impl(addr, config, request, 0, None, true, landing, egress.is_some(), write,
-            terminal_owner, flow_label, capacity)?;
+            terminal_owner, flow_label, capacity, model_endpoint)?;
         if let Some(buffer) = egress {
             let host = buffer.host();
             // SAFETY: the buffer is pinned host memory kept alive by the Arc
@@ -2080,9 +2081,9 @@ impl VerbsHostProtocolV2PersistentClientSession {
                     cq_harvester: Option<Arc<VerbsHostProtocolV2CqHarvester>>,
                     retain_final_response: bool, landing: Option<DeviceLanding>, gathered_sends: bool,
                     write: Option<DeviceWriteTarget>, terminal_owner: Option<Arc<AtomicBool>>,
-                    flow_label: u32, capacity: Option<u32>)
+                    flow_label: u32, capacity: Option<u32>, model_endpoint: Option<u32>)
                     -> Result<Self> {
-        let admitted = crate::worker_selection::reserve_peer_endpoint(addr, &request.header, capacity)?;
+        let admitted = crate::worker_selection::reserve_peer_endpoint(addr, &request.header, capacity, model_endpoint)?;
         verbs_host_preflight()?;
         let native_path = verbs_host_native_library_path().context(
             "native library not found; set CUTEAFD_NATIVE_LIB or build native/libcuteafd_native.so with RDMA",
