@@ -150,9 +150,10 @@ def test_lan_seed_locks_are_known_and_ordered_after_serving_then_export_turns():
     # GPU-export turn after every lease: a build holds its lease when it queues
     # for the export, so the turn must come later in the one canonical order.
     assert hwlock.LAN_SEEDS == ('kakapo', 'cassowary')
-    assert hwlock.ORDER[-4:] == ('kakapo', 'cassowary', 'kakapo-export', 'cassowary-export')
+    assert hwlock.ORDER[-5:] == ('kakapo', 'cassowary', 'kakapo-export', 'cassowary-export', 'oliver')
     assert hwlock.canonical(['cassowary-export', 'kakapo', 'moa', 'sparks', 'gpu1', 'cassowary', 'rhea', 'gpu0']) == \
         ['sparks', 'gpu0', 'gpu1', 'rhea', 'moa', 'kakapo', 'cassowary', 'cassowary-export']
+    assert hwlock.canonical(['oliver', 'gpu0']) == ['gpu0', 'oliver']
 
 
 def test_hold_stops_waiting_when_cancelled(lockdir, monkeypatch):
