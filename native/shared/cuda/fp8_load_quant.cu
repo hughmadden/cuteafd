@@ -98,6 +98,18 @@ __global__ void absorb_kernel(const uint16_t* kv_b, uint16_t* uk, uint16_t* uv, 
     else uv[i - nk] = lq::absorb_uv(kv_b, h0, nope, v, lat, i - nk);
   }
 }
+__global__ void product_kernel(const uint16_t* a, const uint16_t* b, uint32_t* dst, int64_t n) {
+  for (int64_t i = int64_t(blockIdx.x) * blockDim.x + threadIdx.x; i < n; i += int64_t(gridDim.x) * blockDim.x)
+    dst[i] = lq::product_bf16_f32(a[i], b[i]);
+}
+__global__ void trellis_tiles_kernel(const uint4* src, uint4* dst, int64_t rows, int64_t k0, int64_t tiles,
+                                     int64_t words, int32_t side, int64_t k16) {
+  const int64_t n = rows * tiles * words;
+  for (int64_t i = int64_t(blockIdx.x) * blockDim.x + threadIdx.x; i < n; i += int64_t(gridDim.x) * blockDim.x) {
+    const int64_t tile = i / words, r = tile / tiles, c = tile % tiles;
+    dst[lq::trellis_tile(side, k0 + r, c, tiles, k16) * words + i % words] = src[i];
+  }
+}
 unsigned grid_for(int64_t n) {
   int device = 0, sms = 0;
   cudaGetDevice(&device);
@@ -129,6 +141,25 @@ extern "C" int32_t cuteafd_load_kvb_absorb(const void* kv_b, void* uk, void* uv,
   absorb_kernel<<<grid_for(heads * (nope + v) * lat), 256, 0, static_cast<cudaStream_t>(stream)>>>(
       static_cast<const uint16_t*>(kv_b), static_cast<uint16_t*>(uk), static_cast<uint16_t*>(uv), h0, heads, nope,
       v, lat);
+  return cudaGetLastError();
+}
+
+// BF16 `a` x `b` promoted to F32 products in `dst`, n values (see fp8_load_quant.h).
+extern "C" int32_t cuteafd_load_bf16_product_f32(const void* a, const void* b, void* dst, int64_t n, void* stream) {
+  if (n < 1) return cudaErrorInvalidValue;
+  product_kernel<<<grid_for(n), 256, 0, static_cast<cudaStream_t>(stream)>>>(
+      static_cast<const uint16_t*>(a), static_cast<const uint16_t*>(b), static_cast<uint32_t*>(dst), n);
+  return cudaGetLastError();
+}
+
+// Staged EXL3 trellis rows reordered into a native shard (see fp8_load_quant.h).
+extern "C" int32_t cuteafd_load_trellis_tiles(const void* src, void* dst, int64_t rows, int64_t k0, int64_t tiles,
+                                              int64_t tile_bytes, int32_t side, int64_t k16, void* stream) {
+  if (rows < 1 || k0 < 0 || tiles < 1 || tile_bytes < 16 || tile_bytes % 16 != 0 || (side != 0 && side != 1)
+      || k0 + rows > k16 || (side == 1 && tiles % 8 != 0) || (side == 0 && tiles % 8 != 0)) return cudaErrorInvalidValue;
+  const int64_t words = tile_bytes / 16;
+  trellis_tiles_kernel<<<grid_for(rows * tiles * words), 256, 0, static_cast<cudaStream_t>(stream)>>>(
+      static_cast<const uint4*>(src), static_cast<uint4*>(dst), rows, k0, tiles, words, side, k16);
   return cudaGetLastError();
 }
 

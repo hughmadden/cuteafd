@@ -264,7 +264,7 @@ fn installed_pushed_coordinator_operands_match_the_mount_golden() -> Result<()> 
     let mut pushed = Vec::new();
     for (gpu, plan) in plans.into_iter().enumerate() {
         let started = std::time::Instant::now();
-        pushed.push(crate::shared::experts::rtx::push::tests::receive_pushed(devices[gpu], &catalog, &root,
+        pushed.push(crate::shared::experts::rtx::push::tests::receive_pushed(devices[gpu], Some(&catalog), &root,
             socket_dir.path(), &records, (layers > 0).then_some(plan), 4, gpu)?);
         eprintln!("gpu{gpu} rank pushed in {:.2} s", started.elapsed().as_secs_f64());
         rss_guard(32)?;

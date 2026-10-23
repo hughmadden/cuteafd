@@ -1,7 +1,7 @@
 //! Native coordinator inventory passed to the shared startup solver, before
 //! weights, recurrent state or cache owners allocate. This is not the header
 //! lower bound exposed by `plan` and does not admit Spark workers by itself.
-use super::{device::{IoLayout, TokenIo, Lane, LaneLayout, LocalLane, NativePrograms}, mla::{CacheBank, CacheLayout}, state::{KdaBank, KdaLayout}, weights::{GlobalLayout, GlobalWeights, PackedGlobal, LayerLayout, LayerWeights, PackedLayer}};
+use super::{device::{IoLayout, TokenIo, Lane, LaneLayout, LocalLane, NativePrograms}, mla::{CacheBank, CacheLayout}, state::{KdaBank, KdaLayout}, weights::{GlobalLayout, GlobalWeights, LayerLayout, LayerWeights}};
 use crate::shared::memory::device::{Device, DeviceOwner, Stream};
 use crate::shared::speculation::dflash::DflashDrafter;
 use cuteafd_loader::formats::dflash::MlaDraftRuntimeLayout;
@@ -194,32 +194,6 @@ impl<'a> Admission<'a> {
             spark_ranks: 6, prefill_lanes: self.lanes }
     }
 
-    pub(crate) fn load_rtx(&mut self, devices: [Device<'a>; 2],
-        catalog: &cuteafd_loader::OfficialV41Catalog)
-        -> Result<[Option<crate::shared::experts::rtx::exl3::Exl3Tp2Weights<'a>>; 2]> {
-        use crate::shared::experts::rtx::{exl3::Exl3Tp2, RtxSelectionPolicy};
-        ensure!(!self.rtx_loaded, "Kimi TP2 experts already loaded");
-        self.rtx_loaded = true;
-        let mut owners = [None, None];
-        let Some(inventory) = &self.rtx else { return Ok(owners); };
-        let layers = self.working_set().rtx_layers;
-        if layers.is_empty() { return Ok(owners); }
-        let mut budgets = [0; 2];
-        for rank in 0..2 {
-            ensure!(devices[rank].id == self.devices[rank], "Kimi TP2 expert device differs from admission");
-            let charged = usize::try_from(self.placement.tp2.as_ref()
-                .context("Kimi missing admitted TP2 arena")?.peak_bytes[rank])?;
-            let other_lanes = inventory.workspace.checked_mul(self.lanes as usize - 1)
-                .context("Kimi TP2 lane workspace overflow")?;
-            budgets[rank] = charged.checked_sub(other_lanes).context("Kimi TP2 workspace exceeds charge")?;
-        }
-        let pair = Exl3Tp2::load_pair_weights(devices, catalog, cuteafd_core::ExpertGeometry::KIMI_K3,
-            [&inventory.package, &inventory.package], layers, self.lane_layouts[0][0].rows(),
-            budgets, RtxSelectionPolicy::FirstCapacity)?;
-        owners = pair.map(Some);
-        Ok(owners)
-    }
-
     /// The caller completes shared SparkAdmission reconciliation first. Keep
     /// one transport/intake owner per admitted lane; expired owners cannot be
     /// replaced by an uncharged second allocation.
@@ -241,40 +215,149 @@ impl<'a> Admission<'a> {
         self.lane_readers[lane][1].upgrade().context("Kimi Spark requires admitted GPU1 intake stream")
     }
 
-    /// Stream one packed layer pair at a time after shared admission. Each
-    /// source tensor is read once for both ranks; no routed experts are loaded.
-    pub(crate) fn load_weights(&mut self, devices: [Device<'a>; 2],
-        checkpoint: &cuteafd_loader::plan::Checkpoint) -> Result<LoadedWeights<'a>> {
+    /// Starts the Spark admission and loads every coordinator weight inside it:
+    /// the dense operands (shared records) and the admitted TP2 expert halves
+    /// join the Spark push group as two coordinator ranks when the admission
+    /// pushes, planned from headers before membership (a planning error offers
+    /// no coordinator ranks: the Sparks still push, the coordinator mounts).
+    /// Returns the pending admission with the loaded owners.
+    pub(crate) fn start_and_load(&mut self, spark: crate::shared::placement::SparkAdmission,
+        peers: &[std::net::SocketAddr], devices: [Device<'a>; 2], checkpoint: &cuteafd_loader::plan::Checkpoint,
+        catalog: &cuteafd_loader::OfficialV41Catalog, streams: [*mut std::ffi::c_void; 2])
+        -> Result<(crate::shared::placement::PendingSparkAdmission,
+            [Option<crate::shared::experts::rtx::exl3::Exl3Tp2Weights<'a>>; 2], LoadedWeights<'a>)> {
+        use crate::shared::experts::rtx::{dense::{self, DenseLoad}, push::{CoordinatorExperts, CoordinatorPush}};
         check_prefix(&KimiK3Config::from_hf(&checkpoint.config)?, &self.cfg)?;
         for rank in 0..2 {
+            ensure!(devices[rank].id == self.devices[rank], "Kimi load device differs from admission");
             self.check_global(rank, devices[rank].id)?;
             for layer in 0..self.cfg.layers { self.check_layer(rank, layer, devices[rank].id)?; }
         }
-        let mut global = Vec::new();
-        for rank in 0..2 {
-            let packed = self.global_layouts[rank].pack(&self.cfg,
-                |name| super::weights::read_tensor(checkpoint, name))?;
-            global.push(self.upload_global(devices[rank], rank, packed)?);
-        }
-        let mut layers = Vec::new();
-        for layer in 0..self.cfg.layers {
-            let packed = PackedLayer::pair_with_core(&self.cfg, layer, self.placement.layers[layer].mode, &self.core,
-                |name| super::weights::read_tensor(checkpoint, name))?;
-            let [zero, one] = packed;
-            layers.push([self.upload(devices[0], 0, layer, zero)?, self.upload(devices[1], 1, layer, one)?]);
-        }
-        Ok(LoadedWeights { global: global.try_into().map_err(|_| anyhow::anyhow!("Kimi global rank count"))?, layers })
+        let streams = [(devices[0].id, streams[0]), (devices[1].id, streams[1])];
+        let rtx = self.rtx_plan(devices)?;
+        let load = DenseLoad::push(devices[0].library);
+        // Dense owners and records, planned before membership.
+        let planned = if spark.coordinator_pushes() { (|| -> Result<_> {
+            let owners = self.record(devices, checkpoint, &load, streams)?;
+            let records = load.sink.as_ref().context("push sink")?.take_all();
+            let (landed, operands, staged, steps, largest, finishes) = records.summary();
+            tracing::info!(landed, operands, staged, steps, largest_step_bytes = largest, finishes,
+                "Kimi coordinator dense records planned");
+            let dense = dense::plan_records(&checkpoint.snapshot, records.clone(), &devices, peers.len())?;
+            let experts = rtx.as_ref().map(|(layers, budgets, _)| CoordinatorExperts::Tp2 { layers: layers.clone(),
+                budgets: budgets.to_vec() });
+            let prepared = CoordinatorPush::prepare(&checkpoint.snapshot, Some(catalog), 2, experts)?;
+            Ok((prepared, owners, records, dense))
+        })().map_err(|error| tracing::info!(%error, "Kimi coordinator push unavailable; mount")).ok() } else { None };
+        let (planned, ranks) = match planned {
+            Some(((push, streams, ranks), owners, records, dense)) => (Some((push, owners, records, dense)), Some((streams, ranks))),
+            None => (None, None),
+        };
+        let pending = spark.start_with(peers, ranks)?;
+        let started = std::time::Instant::now();
+        let (weights, pushed) = match planned {
+            Some((push, owners, records, dense)) => {
+                let (pushed, ()) = push.receive_with(devices.to_vec(), Some(catalog), peers.len(), Some(Ok(dense)), || ());
+                let pushed = pushed?;
+                if pushed.is_none() {
+                    dense::fill_records_by_mount(devices[0].library, &records, |device| streams.iter()
+                        .find(|(id, _)| *id == device).map_or(std::ptr::null_mut(), |(_, s)| *s))?;
+                }
+                tracing::info!(pushed = pushed.is_some(), operands = records.operands.len(), steps = records.steps.len(),
+                    elapsed_ms = started.elapsed().as_millis() as u64, "Kimi coordinator dense operands landed");
+                (owners, pushed)
+            }
+            None => {
+                let mount = DenseLoad::mount(devices[0].library);
+                let owners = self.record(devices, checkpoint, &mount, streams)?;
+                mount.release();
+                tracing::info!(elapsed_ms = started.elapsed().as_millis() as u64, "Kimi coordinator dense operands mounted");
+                (owners, None)
+            }
+        };
+        let experts = self.finish_rtx(devices, catalog, rtx, pushed)?;
+        Ok((pending, experts, self.register(devices, weights)?))
     }
 
-    /// No caller-supplied byte count: upload uses the immutable native layout
-    /// reconciled against the shared solver's accepted weight ledger.
-    pub(crate) fn upload(&mut self, device: Device<'a>, rank: usize, layer: usize,
-        packed: PackedLayer) -> Result<Rc<LayerWeights<'a>>> {
-        let layout = self.check_layer(rank, layer, device.id)?;
-        let weights = Rc::new(LayerWeights::upload(device, packed, layout, layout.bytes()?)?);
-        self.layer_owners[layer][rank] = Rc::downgrade(&weights);
-        self.layer_uploaded[layer][rank] = true;
-        Ok(weights)
+    /// The admitted TP2 expert layers and per-rank weight budgets (workspace
+    /// excluded), or none.
+    #[allow(clippy::type_complexity)]
+    fn rtx_plan(&self, devices: [Device<'a>; 2]) -> Result<Option<(Vec<usize>, [usize; 2], std::path::PathBuf)>> {
+        let Some(inventory) = &self.rtx else { return Ok(None) };
+        let layers = self.working_set().rtx_layers;
+        if layers.is_empty() { return Ok(None); }
+        let mut budgets = [0; 2];
+        for rank in 0..2 {
+            ensure!(devices[rank].id == self.devices[rank], "Kimi TP2 expert device differs from admission");
+            let charged = usize::try_from(self.placement.tp2.as_ref()
+                .context("Kimi missing admitted TP2 arena")?.peak_bytes[rank])?;
+            let other_lanes = inventory.workspace.checked_mul(self.lanes as usize - 1)
+                .context("Kimi TP2 lane workspace overflow")?;
+            budgets[rank] = charged.checked_sub(other_lanes).context("Kimi TP2 workspace exceeds charge")?;
+        }
+        Ok(Some((layers, budgets, inventory.package.clone())))
+    }
+
+    /// Publishes the pushed TP2 halves, or loads them through the mount.
+    #[allow(clippy::type_complexity)]
+    fn finish_rtx(&mut self, devices: [Device<'a>; 2], catalog: &cuteafd_loader::OfficialV41Catalog,
+        rtx: Option<(Vec<usize>, [usize; 2], std::path::PathBuf)>,
+        pushed: Option<Vec<crate::shared::experts::rtx::push::PushedExperts<'a>>>)
+        -> Result<[Option<crate::shared::experts::rtx::exl3::Exl3Tp2Weights<'a>>; 2]> {
+        use crate::shared::experts::rtx::{exl3::Exl3Tp2, RtxSelectionPolicy};
+        ensure!(!self.rtx_loaded, "Kimi TP2 experts already loaded");
+        self.rtx_loaded = true;
+        let Some((layers, budgets, package)) = rtx else { return Ok([None, None]) };
+        let rows = self.lane_layouts[0][0].rows();
+        let geometry = cuteafd_core::ExpertGeometry::KIMI_K3;
+        let pair = match pushed {
+            Some(ranks) => {
+                let ranks = ranks.into_iter().map(|r| r.exl3()).collect::<Result<Vec<_>>>()?;
+                let pushed: [_; 2] = ranks.try_into().map_err(|_| anyhow::anyhow!("two coordinator GPUs"))?;
+                Exl3Tp2::pushed_pair_weights(devices, catalog, geometry, [&package, &package], layers, rows, budgets,
+                    RtxSelectionPolicy::FirstCapacity, pushed)?
+            }
+            None => Exl3Tp2::load_pair_weights(devices, catalog, geometry, [&package, &package], layers, rows, budgets,
+                RtxSelectionPolicy::FirstCapacity)?,
+        };
+        Ok(pair.map(Some))
+    }
+
+    /// Every global and layer owner through the shared records on `load`.
+    #[allow(clippy::type_complexity)]
+    fn record(&self, devices: [Device<'a>; 2], checkpoint: &cuteafd_loader::plan::Checkpoint,
+        load: &crate::shared::experts::rtx::dense::DenseLoad<'a>, streams: [(i32, *mut std::ffi::c_void); 2])
+        -> Result<([GlobalWeights<'a>; 2], Vec<[LayerWeights<'a>; 2]>)> {
+        let _memory_scope = cuteafd_ffi::memory_ledger::scope("weights");
+        let records = super::weights::records::KimiRecords { checkpoint, cfg: &self.cfg, core: &self.core, dense: load, streams };
+        let global = [records.global(devices[0], &self.global_layouts[0])?, records.global(devices[1], &self.global_layouts[1])?];
+        let layers = (0..self.cfg.layers).map(|layer| records.layer(devices, layer, &self.layouts[layer]))
+            .collect::<Result<Vec<_>>>()?;
+        Ok((global, layers))
+    }
+
+    /// Registers loaded owners once, as the host-pack uploads do.
+    fn register(&mut self, devices: [Device<'a>; 2], (global, layers): ([GlobalWeights<'a>; 2], Vec<[LayerWeights<'a>; 2]>))
+        -> Result<LoadedWeights<'a>> {
+        let mut out = Vec::new();
+        for (rank, weights) in global.into_iter().enumerate() {
+            self.check_global(rank, devices[rank].id)?;
+            let weights = Rc::new(weights);
+            self.global_owners[rank] = Rc::downgrade(&weights);
+            self.global_uploaded[rank] = true;
+            out.push(weights);
+        }
+        let mut owned = Vec::new();
+        for (layer, pair) in layers.into_iter().enumerate() {
+            let pair = pair.map(Rc::new);
+            for rank in 0..2 {
+                self.check_layer(rank, layer, devices[rank].id)?;
+                self.layer_owners[layer][rank] = Rc::downgrade(&pair[rank]);
+                self.layer_uploaded[layer][rank] = true;
+            }
+            owned.push(pair);
+        }
+        Ok(LoadedWeights { global: out.try_into().map_err(|_| anyhow::anyhow!("Kimi global rank count"))?, layers: owned })
     }
 
     fn check_layer(&self, rank: usize, layer: usize, device: i32) -> Result<&LayerLayout> {
@@ -301,14 +384,6 @@ impl<'a> Admission<'a> {
         let binding = LocalLane::new(allocated, programs, self.cfg.clone(), layers, global, lane, rank, kda, mla)?;
         self.local_bound[lane][rank] = true;
         Ok(binding)
-    }
-
-    pub(crate) fn upload_global(&mut self, device: Device<'a>, rank: usize, packed: PackedGlobal) -> Result<Rc<GlobalWeights<'a>>> {
-        let layout = self.check_global(rank, device.id)?;
-        let weights = Rc::new(layout.upload(device, packed)?);
-        self.global_owners[rank] = Rc::downgrade(&weights);
-        self.global_uploaded[rank] = true;
-        Ok(weights)
     }
 
     pub(crate) fn allocate_io(&mut self, device: Device<'a>, rank: usize, lane: usize) -> Result<TokenIo<'a>> {
@@ -1487,7 +1562,7 @@ pub(super) mod tests {
         assert!(admitted.layer_owners[0][1].upgrade().is_none());
         assert!(admitted.check_layer(1, 0, 1).is_err());
         let source = include_str!("admission.rs").split("#[cfg(test)]").next().unwrap();
-        let bind = source.split("pub(crate) fn bind_local").nth(1).unwrap().split("pub(crate) fn upload_global").next().unwrap();
+        let bind = source.split("pub(crate) fn bind_local").nth(1).unwrap().split("pub(crate) fn allocate_io").next().unwrap();
         assert!(bind.contains("programs.check_inventory(&self.cfg)?"));
         assert!(bind.contains("Rc::ptr_eq(&expected, &allocated.stream)"));
         assert!(bind.contains("self.layer_owners.iter()"));

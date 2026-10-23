@@ -185,7 +185,7 @@ fn installed_pushed_coordinator_operands_match_the_mount_golden() -> Result<()> 
     for gpu in 0..2 {
         let started = std::time::Instant::now();
         crate::shared::experts::rtx::push::tests::receive_pushed(Device { library: &library, id: gpu as i32 },
-            &cuteafd_loader::read_expert_catalog(&snapshot)?, &root, sockets.path(), &records, None, 6, gpu)?;
+            None, &root, sockets.path(), &records, None, 6, gpu)?;
         eprintln!("gpu{gpu} rank pushed in {:.2} s", started.elapsed().as_secs_f64());
     }
     split.release_transient();

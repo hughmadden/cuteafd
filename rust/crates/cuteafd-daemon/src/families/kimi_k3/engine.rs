@@ -127,10 +127,12 @@ impl<'a> Engine<'a> {
             endpoints, rings: spark_rings(config.max_frame_bytes)? };
         model.validate(ExpertGeometry::KIMI_K3)?;
         let catalog = cuteafd_loader::read_expert_catalog(&checkpoint.snapshot)?;
-        let pending = SparkAdmission::plan(&checkpoint.snapshot, ExpertGeometry::KIMI_K3,
-            Some(&catalog), &admission.working_set(), 6, None, model)?.start(&peers)?;
-        let expert_weights = admission.load_rtx(devices, &catalog)?;
-        let weights = admission.load_weights(devices, checkpoint)?;
+        let spark = SparkAdmission::plan(&checkpoint.snapshot, ExpertGeometry::KIMI_K3,
+            Some(&catalog), &admission.working_set(), 6, None, model)?;
+        // Dense operands and TP2 halves land inside the Spark load (pushed as
+        // coordinator ranks when the group pushes, else through the mount).
+        let (pending, expert_weights, weights) = admission.start_and_load(spark, &peers, devices, checkpoint, &catalog,
+            [exchange_streams[0].raw, exchange_streams[1].raw])?;
         let lanes = usize::try_from(plan.spec().lanes)?;
         let mut allocated = (0..lanes).map(|lane| Ok([
             admission.allocate_lane_on(devices[0], 0, lane, lane_streams[0].clone())?,

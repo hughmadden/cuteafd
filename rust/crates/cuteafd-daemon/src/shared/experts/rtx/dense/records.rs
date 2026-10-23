@@ -109,6 +109,16 @@ pub(crate) enum Job {
     /// into `q` [rows, cols] and `scale` [rows, cols / 128].
     RowQuant { rows: usize, cols: usize, rule: crate::shared::fp8_linear::Fp8Scales, q: CuteafdDeviceBuffer,
         scale: CuteafdDeviceBuffer, block: bool },
+    /// Staged BF16 `norm` (`at..at + bytes`) and `proj` (`with..with + bytes`)
+    /// promoted to F32 and multiplied once per element into `dst` (the Kimi
+    /// residual score weight).
+    Product { at: usize, with: usize, bytes: usize, dst: CuteafdDeviceBuffer },
+    /// Staged EXL3 trellis rows (`rows` K16 rows from local row `k0`, `tiles`
+    /// 16x16 tiles of `tile_bytes` each, checkpoint order) reordered into the
+    /// native shard `dst` of `k16` K16 rows; `input` selects the input-side
+    /// layout. Every tile moves whole: no bit of the payload changes.
+    TrellisTiles { rows: usize, k0: usize, tiles: usize, tile_bytes: usize, k16: usize, input: bool,
+        dst: CuteafdDeviceBuffer },
     /// One raw UE8M0 rectangle, checked and coded directly from pinned staging.
     /// `rect` retains the checkpoint tensor and original row for refusals.
     ScaleCodes { rect: usize, at: usize, stored_rows: usize, start_row: usize, dst: CuteafdDeviceBuffer },
@@ -301,6 +311,30 @@ impl Step {
                         destination: dst, stored_rows, start_row,
                     };
                     load_timing::quantize(source.bytes(), || kernels.scale_codes_from(&[target], stream))?;
+                }
+                Job::Product { at, with, bytes, dst } => {
+                    ensure!(at + bytes <= staged.len() && with + bytes <= staged.len() && bytes % 2 == 0
+                        && dst.bytes >= bytes * 2, "product outside its step or operand");
+                    // SAFETY: both staged ranges lie in pinned, device-mapped memory the
+                    // caller keeps alive until the drain below; `dst` holds bytes * 2.
+                    load_timing::quantize(bytes * 2, || unsafe {
+                        library.load_bf16_product_f32(staged[at..].as_ptr().cast(), staged[with..].as_ptr().cast(),
+                            dst.ptr, bytes / 2, stream)?;
+                        library.cuda_stream_synchronize(stream)
+                    })?;
+                }
+                Job::TrellisTiles { rows, k0, tiles, tile_bytes, k16, input, dst } => {
+                    let bytes = rows * tiles * tile_bytes;
+                    ensure!(bytes <= self.bytes() && k0 + rows <= k16 && dst.bytes >= k16 * tiles * tile_bytes,
+                        "trellis tiles outside their step or shard");
+                    let source = device_copy(scratch)?;
+                    // SAFETY: the staged rows are in the live device scratch and `dst`
+                    // holds the whole shard (checked above); drained before return.
+                    load_timing::quantize(bytes, || unsafe {
+                        library.load_trellis_tiles(source.cast(), dst.ptr, rows, k0, tiles, tile_bytes,
+                            i32::from(input), k16, stream)?;
+                        library.cuda_stream_synchronize(stream)
+                    })?;
                 }
                 Job::NativePlane { intermediate, plane, at, bytes, dst } => {
                     ensure!(at + bytes <= self.bytes() && at % 4 == 0, "native plane outside its step");

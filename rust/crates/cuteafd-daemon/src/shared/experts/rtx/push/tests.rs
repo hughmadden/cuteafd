@@ -588,7 +588,7 @@ fn sparknest_model_one_coordinator_rank_beside_spark_ranks() {
 /// the group driver lays them out) received through a ring from a fake
 /// SparkNest that streams the rank's checked plan in plan order, then
 /// committed. For installed-checkpoint goldens on real or fake devices.
-pub(crate) fn receive_pushed<'a>(device: Device<'a>, catalog: &cuteafd_loader::OfficialV41Catalog,
+pub(crate) fn receive_pushed<'a>(device: Device<'a>, catalog: Option<&cuteafd_loader::OfficialV41Catalog>,
     root: &std::path::Path, socket_dir: &std::path::Path, records: &crate::shared::experts::rtx::dense::Records,
     tp2: Option<CoordinatorExpertPlan>, sparks: usize, gpu: usize) -> Result<PushedExperts<'a>> {
     use crate::shared::experts::rtx::dense::RankLayout;
@@ -605,7 +605,7 @@ pub(crate) fn receive_pushed<'a>(device: Device<'a>, catalog: &cuteafd_loader::O
         arenas[rank] = total;
         let mut builder = Builder::new(root, arenas);
         (dense_plan.append)(&mut builder, rank as u32, host_base)?;
-        if let Some(plan) = &tp2 { plan.append_at(&mut builder, catalog, rank as u32, base)?; }
+        if let Some(plan) = &tp2 { plan.append_at(&mut builder, catalog.context("TP2 replay needs the expert catalog")?, rank as u32, base)?; }
         Ok(builder.finish()?)
     };
     let checked = build()?;
@@ -674,8 +674,8 @@ pub(crate) fn receive_pushed<'a>(device: Device<'a>, catalog: &cuteafd_loader::O
     });
     let client = PushClient::at(socket.clone(), Duration::from_secs(600))?;
     // As the group driver: the TP2 arena's own checked entries (from offset 0).
-    let tp2_checked = tp2.as_ref().map(|plan| plan.checked(catalog, root, sparks + 2, rank)).transpose()?;
-    let tp2 = tp2.zip(tp2_checked.as_ref()).map(|(plan, checked)| (catalog, plan, checked));
+    let tp2_checked = tp2.as_ref().map(|plan| plan.checked(catalog.context("TP2 replay needs the expert catalog")?, root, sparks + 2, rank)).transpose()?;
+    let tp2 = match (tp2, tp2_checked.as_ref()) { (Some(plan), Some(checked)) => Some((catalog.context("TP2 catalog")?, plan, checked)), _ => None };
     let received = receive_rank(device, tp2, Some(DenseRank { destination: dense, base }), rank, &client,
         &mut worker, (7, 11), 8, DEFAULT_SLOT_BYTES);
     if !server.is_finished() {
@@ -726,7 +726,7 @@ fn receive_pushed_replays_dense_records_and_tp2_halves() -> Result<()> {
         jobs: vec![Job::Upload { at: 0, bytes: dense[1].bytes(), dst: allocations[1].buffer }] });
     let plan = CoordinatorExpertPlan::new(&catalog, &[0, 1], 0, usize::MAX)?;
     let sockets = tempfile::tempdir_in(fixture.directory())?;
-    let pushed = receive_pushed(device, &catalog, root.path(), sockets.path(), &records, Some(plan), 1, 0)?;
+    let pushed = receive_pushed(device, Some(&catalog), root.path(), sockets.path(), &records, Some(plan), 1, 0)?;
     assert_eq!(pushed.exl3()?.len(), 2);
     for (rect, allocation) in dense.iter().zip(&allocations) {
         let mut expected = vec![0; rect.bytes()];
@@ -799,7 +799,7 @@ fn scales_first_shard_keeps_one_open_step_per_source() -> Result<()> {
         mixed.steps.push(Step { device: 0, rects: vec![rect(scale_at(e), scale), rect(weight_at(e), weight)],
             jobs: vec![Job::Upload { at: 0, bytes: scale + weight, dst }] });
     }
-    let refused = receive_pushed(device, &catalog, root.path(), sockets.path(), &mixed, None, 1, 0);
+    let refused = receive_pushed(device, Some(&catalog), root.path(), sockets.path(), &mixed, None, 1, 0);
     anyhow::ensure!(refused.is_err(), "interleaved steps must be refused by the staging bound");
     PEAKS.with(|p| p.take());
     // New shape: weights-only steps, scales as operands.
@@ -815,7 +815,7 @@ fn scales_first_shard_keeps_one_open_step_per_source() -> Result<()> {
         split.steps.push(Step { device: 0, rects: vec![rect(weight_at(e), weight)],
             jobs: vec![Job::Upload { at: 0, bytes: weight, dst: at(&weights, e * weight, weight) }] });
     }
-    receive_pushed(device, &catalog, root.path(), sockets.path(), &split, None, 1, 0)?;
+    receive_pushed(device, Some(&catalog), root.path(), sockets.path(), &split, None, 1, 0)?;
     let peaks = PEAKS.with(|p| p.take());
     assert_eq!(peaks.len(), 1);
     let (staged, pinned) = peaks[0];
@@ -1043,7 +1043,7 @@ fn coordinator_exl3_layers_push_byte_exact_at_world_one_and_two() -> Result<()> 
     ];
     for (plan, gpu) in plans {
         let world = plan.residencies[0].world;
-        let pushed = receive_pushed(Device { library: &library, id: gpu as i32 }, &catalog, root.path(), sockets.path(),
+        let pushed = receive_pushed(Device { library: &library, id: gpu as i32 }, Some(&catalog), root.path(), sockets.path(),
             &records, Some(plan), 0, gpu)?.exl3()?;
         assert_eq!(pushed.len(), 2, "world {world}");
         for weight in &pushed {

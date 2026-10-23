@@ -577,6 +577,39 @@ impl NativeLibrary {
         Ok(())
     }
 
+    /// `n` BF16 pairs `a[i]`, `b[i]` (device-visible) promoted to F32 and
+    /// multiplied once into `dst` (F32) on the current device.
+    ///
+    /// # Safety
+    /// `a` and `b` hold `n` BF16 and `dst` room for `n` F32, live through the stream.
+    pub unsafe fn load_bf16_product_f32(&self, a: *const c_void, b: *const c_void, dst: *mut c_void, n: usize,
+        stream: *mut c_void) -> Result<()> {
+        type Product = unsafe extern "C" fn(*const c_void, *const c_void, *mut c_void, i64, *mut c_void) -> i32;
+        let f = *unsafe { self.lib.get::<Product>(b"cuteafd_load_bf16_product_f32") }?;
+        let status = unsafe { f(a, b, dst, i64::try_from(n)?, stream) };
+        ensure!(status == 0, "BF16 load product failed with {status}");
+        Ok(())
+    }
+
+    /// Staged EXL3 trellis rows (`rows` K16 rows of `tiles` 16x16 tiles of
+    /// `tile_bytes`, checkpoint order) reordered into a native shard `dst` of
+    /// `k16` K16 rows at local row `k0`: `side` 0 output [N128][K16][8],
+    /// 1 input [K128][N128][8][8] (`cuteafd_load_quant::trellis_tile`).
+    ///
+    /// # Safety
+    /// `src` (device-visible) holds the staged rows and `dst` (current device)
+    /// the whole shard, both live until the stream drains.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn load_trellis_tiles(&self, src: *const c_void, dst: *mut c_void, rows: usize, k0: usize,
+        tiles: usize, tile_bytes: usize, side: i32, k16: usize, stream: *mut c_void) -> Result<()> {
+        type Tiles = unsafe extern "C" fn(*const c_void, *mut c_void, i64, i64, i64, i64, i32, i64, *mut c_void) -> i32;
+        let f = *unsafe { self.lib.get::<Tiles>(b"cuteafd_load_trellis_tiles") }?;
+        let status = unsafe { f(src, dst, i64::try_from(rows)?, i64::try_from(k0)?, i64::try_from(tiles)?,
+            i64::try_from(tile_bytes)?, side, i64::try_from(k16)?, stream) };
+        ensure!(status == 0, "EXL3 trellis tile reorder failed with {status}");
+        Ok(())
+    }
+
     /// MLA `kv_b` [heads * (nope + v), lat] (BF16, device-visible) absorbed per head
     /// into `uk` [heads][lat][nope] and `uv` [heads][v][lat] for heads `h0..h0 + heads`.
     ///
