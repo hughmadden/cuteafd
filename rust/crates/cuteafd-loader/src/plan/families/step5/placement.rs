@@ -17,11 +17,10 @@ struct Unqualified(&'static str);
 /// Prefill units (PLAN "Prefill contract"): 2048 rows with two in flight by
 /// default, stepping down 2048 -> 1024 -> 512 when the larger unit would cost
 /// pool capacity. Explicit --prefill-rows / --prefill-lanes (waves) are never
-/// changed. NVFP4 min keeps one wave: its pool loses capacity with every
-/// extra in-flight unit, and its overlap gain is measured separately.
+/// changed. Two units in flight everywhere: NVFP4 min's 8K prefill gained
+/// 1.47x at 512 x 2 for a smaller pool (measured 2026-10-23).
 const DEFAULT_ROWS: [usize; 3] = [2048, 1024, 512];
-
-fn default_waves(nvfp4: bool) -> usize { if nvfp4 { 1 } else { 2 } }
+const DEFAULT_WAVES: usize = 2;
 
 fn default_rows(inputs: &mut RuntimeInputs, waves: usize,
     mut admit: impl FnMut(&RuntimeInputs) -> Result<admission::Admission>) -> Result<(usize, admission::Admission)> {
@@ -90,7 +89,7 @@ pub(super) fn layout(
         Unqualified("coordinator-local routed experts")
     );
     let explicit_rows = usize::try_from(opts.prefill_rows)?;
-    let waves = if opts.prefill_lanes == 0 { default_waves(nvfp4) } else { usize::try_from(opts.prefill_lanes)? };
+    let mut waves = if opts.prefill_lanes == 0 { DEFAULT_WAVES } else { usize::try_from(opts.prefill_lanes)? };
     ensure!((1..=4).contains(&waves), "Step-5 prefill waves must be 1..=4");
     let checked_rows = if explicit_rows == 0 { DEFAULT_ROWS[0] } else { explicit_rows };
     ensure!(checked_rows * waves <= 4096, "Step-5 prefill span {checked_rows} x {waves} exceeds 4096 rows");
@@ -221,8 +220,16 @@ pub(super) fn layout(
     let admitted = if explicit_rows != 0 {
         admission::forecast_mtp(input.checkpoint(), &inputs, opts.native_mtp_layers)?
     } else {
-        let (unit, admitted) = default_rows(&mut inputs, waves, |inputs|
-            admission::forecast_mtp(input.checkpoint(), inputs, opts.native_mtp_layers))?;
+        // Default waves step down to one when the in-flight span does not admit
+        // (e.g. device-only prefix retention at full context); explicit waves never do.
+        let mut selected = default_rows(&mut inputs, waves, |inputs|
+            admission::forecast_mtp(input.checkpoint(), inputs, opts.native_mtp_layers));
+        if selected.is_err() && opts.prefill_lanes == 0 && waves > 1 {
+            waves = 1;
+            selected = default_rows(&mut inputs, waves, |inputs|
+                admission::forecast_mtp(input.checkpoint(), inputs, opts.native_mtp_layers));
+        }
+        let (unit, admitted) = selected?;
         report.prefill_selection = Some(format!("Step-5 automatic prefill selected {unit} rows x {waves} waves"));
         admitted
     };

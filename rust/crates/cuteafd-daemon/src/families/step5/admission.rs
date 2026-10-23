@@ -221,7 +221,9 @@ mod tests {
             let rows = unit * waves;
             if launchable {
                 assert!([2048, 1024, 512].contains(&unit), "{unit}");
-                assert_eq!(waves, if nvfp4 { 1 } else { 2 });
+                // Two in flight unless device-only retention at full context
+                // forces the default down to one.
+                assert!(waves == 2 || (waves == 1 && host == Some(0)), "waves {waves}");
                 assert!(report.prefill_selection.as_deref().is_some_and(|s|
                     s.contains(&format!("{unit} rows x {waves} waves"))));
             }
