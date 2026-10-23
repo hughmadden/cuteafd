@@ -5438,6 +5438,39 @@ Ideas TJ wants kept for later; not v2 work.
   FUSE mincore misses are approximate residency observations, not physical
   I/O, and must not be compared as device reads between implementations.
 
+## Prefill contract (TJ, 2026-10-23)
+
+Every family that sends experts to Sparks overlaps prefill the same way: while
+the Sparks run one row window's experts, the GPU runs the next window's
+attention. Audit on 2026-10-23: each family had its own chunk size, lane count
+and scratch scheme. Step-5 and Qwen 4 had no overlap at all.
+
+- **Mechanism:** the shared sub-wave pipeline
+  (`shared/prefill_pipeline.rs`, `subwave_ranges`/`subwave_actions`), as
+  Kimi K3 and V4.1 use it. GLM 5.3, GLM Flash and MiMo still run their own
+  per-lane workspaces and transports. They get migrated after v4, not as a
+  special case.
+- **Scratch:** each window owns its own row range of a full-chunk workspace
+  (Kimi's `subwave_extent`). Windows never share bytes, so no schedule can
+  overwrite live rows. No per-family arena relayouts.
+- **Head:** prefill computes logits only for the rows serving needs (the last
+  row, or the requested logit rows), never for every chunk row.
+- **Chunk size:** the planner picks the largest chunk, up to the 4096-row AOT
+  capacity, that admits without giving up an onboard expert layer or pool
+  capacity. V4.1 at 2048 is this rule applied by hand: on 1 RTX, workspaces
+  went 21.08 → 11.01 GiB and RTX expert layers 5 → 6. Families don't hardcode
+  their own value.
+- **Windows:** at most 3, at least 256 rows each, 64-row page aligned, until
+  the sweep below sets a shared rule. MiMo's measurement suggests the best
+  count follows expert size: Pro (TP6) is faster with 3, Flash (TP4) with 2.
+- **Gates for each family:** byte-identical logits and KV between 1 window and
+  N windows at fixed chunking, exact prefix cache, and one card with 8K
+  prefill and TTFT.
+- **Follow-up:** one sweep of windows {2,3} × chunk {1024,2048,4096} on a
+  big-expert family and a small-expert family, then set the shared default.
+  Defaults today: GLM 5.3 3 lanes, GLM Flash 2, MiMo 3/2 by size (measured),
+  V4.1 2, Kimi ≤3 windows. Only MiMo's default was measured.
+
 ## Backlog (lowest priority: only when nothing planned is left)
 
 - Qwen 3.8 Flash Next NVFP4 without Sparks, competitive with vLLM on one
