@@ -46,8 +46,8 @@ impl RuntimeSizing {
         if self.context == 0 || self.context > cfg.max_position as u64 {
             return Err(AdmissionError::Unsupported("context outside the checkpoint extent"));
         }
-        if !matches!(self.spark_ranks, 2 | 3 | 4) {
-            return Err(AdmissionError::Unsupported("Spark world outside TP2, TP3 or TP4"));
+        if !matches!(self.spark_ranks, 0 | 2 | 3 | 4) {
+            return Err(AdmissionError::Unsupported("expert world outside local, TP2, TP3 or TP4"));
         }
         cfg.release_geometry().map_err(|e| manifest(e.to_string()))
     }
@@ -332,6 +332,17 @@ pub(crate) mod tests {
         assert_eq!(ledger.fixed_bytes, ledger.allocations.iter().map(|a| a.bytes).sum::<u64>());
         assert!(ledger.allocations.iter().all(|a| a.bytes >= 256));
         assert!(ledger.allocations.iter().all(|a| !a.name.contains("contiguous")));
+    }
+
+    #[test]
+    fn minimax_local_golden_admits_no_transport_storage() {
+        let local = RuntimeSizing { spark_ranks: 0, ..sizing() };
+        let programs = ProgramSizes::from_manifest(&programs_manifest(), local).unwrap();
+        let ledger = RuntimeLedger::new(&config(), local, &programs).unwrap();
+        assert_eq!(ledger.bytes("spark_intake"), Some(256));
+        for spark_ranks in [1, 5, 6] {
+            assert!(RuntimeSizing { spark_ranks, ..local }.validate(&config()).is_err());
+        }
     }
 
     #[test]

@@ -91,6 +91,9 @@ pub(crate) enum Commands {
     /// Qualify a native Step-5 target prefix with real Spark experts.
     #[command(hide = true)]
     Step5Golden(crate::families::step5::golden::GoldenArgs),
+    /// Qualify native MiniMax M3 execution and exact prefix pages.
+    #[command(hide = true)]
+    MinimaxGolden(crate::families::minimax_m3::golden::GoldenArgs),
     /// Compare a cold Kimi decoder prefix against a flagged residual state.
     #[command(hide = true)]
     KimiGolden(crate::families::kimi_k3::golden::GoldenArgs),

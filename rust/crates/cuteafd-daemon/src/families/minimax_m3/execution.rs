@@ -1,5 +1,5 @@
 //! One device, one append-only paged MSA pipeline, native checkpoint arithmetic.
-use super::{MiniMaxError, ffn, head::TargetHeadOwner, scratch::Scratch, weights::Weights};
+use super::{MiniMaxError, diagnostics::{Diagnostics, StepDump}, ffn, head::TargetHeadOwner, scratch::Scratch, weights::Weights};
 use crate::shared::{memory::device::Device, token_io::DeviceLogits};
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::{minimax::{Buffer, Commands}, programs::{Programs,Scalar}};
@@ -75,11 +75,13 @@ pub(super) struct Execution<'a> {
     decode_rows:usize,
     table_stride:usize,
     poisoned:std::cell::Cell<bool>,
+    diagnostics:std::cell::RefCell<Option<Diagnostics>>,
 }
 impl<'a> Execution<'a> {
     pub fn load(device:Device<'a>, programs:&'a Programs<'a>, checkpoint:&Checkpoint,
         cfg:&MiniMaxM3Config, ledger:&RuntimeLedger) -> Result<Self> {
         cfg.release_geometry()?;
+        let diagnostics=std::cell::RefCell::new(Diagnostics::from_env(cfg.layers)?);
         ensure!(cfg.rms_norm_eps==1e-6 && cfg.swiglu_alpha==1.702 && cfg.swiglu_limit==7.0
             && cfg.routed_scale==2.0,MiniMaxError::Unsupported("compiled norm, activation or route arithmetic"));
         ensure!(cfg.moe[..3].iter().all(|v|!*v) && cfg.moe[3..].iter().all(|v|*v),
@@ -104,13 +106,25 @@ impl<'a> Execution<'a> {
         commands.drain()?;
         let head=TargetHeadOwner::new(&commands,&scratch,rows,cfg.vocab_size)?;
         Ok(Self{commands,head,weights,scratch,cfg:cfg.clone(),rows,context,decode_rows,table_stride,
-            poisoned:std::cell::Cell::new(false)})
+            poisoned:std::cell::Cell::new(false),diagnostics})
     }
     pub fn stream(&self)->*mut std::ffi::c_void { self.commands.raw() }
     pub fn drain(&self)->Result<()> { self.commands.drain() }
     pub fn execute(&self, embedded:&Buffer<'a>, batch:&BatchView, caches:&[LayerCache<'a>],
         experts:&mut dyn ExpertExecutor<'a>, kind:ExpertV2SourceKind) -> Result<DeviceLogits> {
+        self.execute_through(embedded,batch,caches,experts,kind,self.cfg.layers-1)?
+            .context("MiniMax complete execution has no logits")
+    }
+    pub fn hidden(&self,rows:usize)->Result<Buffer<'a>> {
+        ensure!(rows>0 && rows<=self.rows,MiniMaxError::Invalid("hidden row extent"));
+        self.scratch.get("residual")?.view(0,rows*6144*4)
+    }
+    pub fn execute_through(&self, embedded:&Buffer<'a>, batch:&BatchView, caches:&[LayerCache<'a>],
+        experts:&mut dyn ExpertExecutor<'a>, kind:ExpertV2SourceKind, last_layer:usize) -> Result<Option<DeviceLogits>> {
         ensure!(!self.poisoned.get(),MiniMaxError::Invalid("previous native execution failure; restart required"));
+        ensure!(last_layer<self.cfg.layers,MiniMaxError::Invalid("last execution layer"));
+        let mut diagnostics=self.diagnostics.borrow_mut();
+        ensure!(diagnostics.as_ref().is_none_or(|d|d.layer<=last_layer),MiniMaxError::Invalid("diagnostic layer not executed"));
         ensure!(matches!(kind,ExpertV2SourceKind::Decode|ExpertV2SourceKind::Prefill),
             MiniMaxError::Unsupported("expert source kind"));
         let rows=batch.validate(self.rows,self.context)?;
@@ -119,26 +133,39 @@ impl<'a> Execution<'a> {
             && cache.value.raw().bytes>=batch.pool_pages*32768 && cache.index.raw().bytes>=batch.pool_pages*8448,
             MiniMaxError::Invalid("physical cache extent")); }
         let result=(||{
-            experts.begin(self.cfg.moe_layers(),kind)?;
+            experts.begin(self.cfg.moe[..=last_layer].iter().filter(|&&moe|moe).count(),kind)?;
             self.commands.upload(self.scratch.get("positions")?,&batch.positions.iter().flat_map(|v|v.to_le_bytes()).collect::<Vec<_>>())?;
             self.commands.upload(self.scratch.get("slots")?,&batch.slots.iter().flat_map(|v|v.to_le_bytes()).collect::<Vec<_>>())?;
             self.commands.widen(embedded,self.scratch.get("residual")?,rows*6144)?;
-            for (layer,cache) in caches.iter().enumerate() {
-                self.attention(layer,rows,batch,cache)?;
+            for (layer,cache) in caches.iter().enumerate().take(last_layer+1) {
+                let mut dump=diagnostics.as_ref().filter(|d|d.layer==layer).map(|d|d.begin(batch)).transpose()?;
+                if let Some(d)=&mut dump { d.tensor(&self.commands,"input","f32",&[rows,6144],self.scratch.get("residual")?)?; }
+                self.attention(layer,rows,batch,cache,dump.as_mut())?;
                 ffn::norm(&self.commands,self.scratch.get("residual")?,self.weights.layer(layer,"post_attention_layernorm.weight")?,self.scratch.get("norm")?,rows)?;
+                if let Some(d)=&mut dump { d.tensor(&self.commands,"ffn_norm","bf16",&[rows,6144],self.scratch.get("norm")?)?; }
                 if self.cfg.moe[layer] {
                     self.commands.launch("minimax_router_scores", &[self.scratch.get("norm")?,
                         self.weights.layer(layer,"block_sparse_moe.gate.weight")?,self.scratch.get("router_logits")?], &[Scalar::I32(rows as i32)])?;
                     self.commands.launch("minimax_route", &[self.scratch.get("router_logits")?,
                         self.weights.layer(layer,"block_sparse_moe.e_score_correction_bias")?,self.scratch.get("route_ids")?,self.scratch.get("route_weights")?], &[Scalar::I32(rows as i32)])?;
+                    if let Some(d)=&mut dump {
+                        d.tensor(&self.commands,"router_ids","i32",&[rows,4],self.scratch.get("route_ids")?)?;
+                        d.tensor(&self.commands,"router_weights","f32",&[rows,4],self.scratch.get("route_weights")?)?;
+                    }
                     experts.dispatch(layer,rows,self.scratch.get("route_ids")?,self.scratch.get("route_weights")?,self.scratch.get("norm")?,&self.commands)?;
                     ffn::dense(&self.commands,&self.weights,&self.scratch,layer,rows,true)?;
+                    if let Some(d)=&mut dump { d.tensor(&self.commands,"shared","bf16",&[rows,6144],self.scratch.get("shared")?)?; }
                     experts.collect(layer,rows,self.scratch.get("routed")?,&self.commands)?;
                     self.commands.add_bf16(self.scratch.get("shared")?,self.scratch.get("routed")?,self.scratch.get("delta")?,rows*6144)?;
                 } else { ffn::dense(&self.commands,&self.weights,&self.scratch,layer,rows,false)?; }
                 self.residual(rows)?;
+                if let Some(mut d)=dump {
+                    d.tensor(&self.commands,"residual","f32",&[rows,6144],self.scratch.get("residual")?)?;
+                    diagnostics.as_mut().context("MiniMax diagnostic owner")?.finish(d)?;
+                }
             }
-            self.head.logits(&self.commands,&self.weights,&self.scratch,rows)
+            if last_layer+1==self.cfg.layers { self.head.logits(&self.commands,&self.weights,&self.scratch,rows).map(Some) }
+            else { Ok(None) }
         })();
         // All device/cache/expert borrows end only after queued work retires.
         let drained=self.commands.drain();
@@ -150,9 +177,10 @@ impl<'a> Execution<'a> {
     fn residual(&self,rows:usize)->Result<()> {
         self.commands.launch("minimax_residual", &[self.scratch.get("residual")?,self.scratch.get("delta")?,self.scratch.get("residual")?], &[Scalar::I32(rows as i32)])
     }
-    fn attention(&self, layer:usize,rows:usize,batch:&BatchView,cache:&LayerCache<'a>)->Result<()> {
+    fn attention(&self, layer:usize,rows:usize,batch:&BatchView,cache:&LayerCache<'a>,mut dump:Option<&mut StepDump>)->Result<()> {
         let s=&self.scratch;
         ffn::norm(&self.commands,s.get("residual")?,self.weights.layer(layer,"input_layernorm.weight")?,s.get("norm")?,rows)?;
+        if let Some(d)=dump.as_deref_mut() { d.tensor(&self.commands,"norm","bf16",&[rows,6144],s.get("norm")?)?; }
         for (projection,stem,out) in [("q","q","q"),("kv","kv","kv"),("index_q","index_q","index_q"),("index_k","index_k","index_k")] {
             ffn::linear(&self.commands,&self.weights,s,layer,projection,&format!("self_attn.{stem}_proj"),s.get("norm")?,s.get(out)?,rows)?;
         }
@@ -161,9 +189,23 @@ impl<'a> Execution<'a> {
             let weight=self.weights.layer(layer,&format!("self_attn.{stem}_norm.weight"))?;
             self.commands.launch(&format!("minimax_{stem}_norm_rope"), &[s.get(stem)?,weight,weight,s.get("cos")?,s.get("sin")?,s.get("positions")?,s.get(&format!("{stem}_norm"))?], &[Scalar::I32(rows as i32)])?;
         }
+        if let Some(d)=dump.as_deref_mut() {
+            for (name,source,heads) in [("q","q_norm",64),("k","k_norm",4),("v","v",4),("index_q","index_q_norm",4),("index_k","index_k_norm",1)] {
+                d.tensor(&self.commands,name,"bf16",&[rows,heads,128],s.get(source)?)?;
+            }
+        }
         self.commands.launch("minimax_index_k_pack", &[s.get("index_k_norm")?,s.get("slots")?,&cache.index,s.get("index_q_scales")?], &[Scalar::I32(rows as i32)])?;
         self.commands.launch("minimax_kv_pack", &[s.get("k_norm")?,s.get("v")?,s.get("slots")?,s.get("batch_ids")?,s.get("k_descale")?,s.get("v_descale")?,&cache.key,&cache.value], &[Scalar::I32(rows as i32)])?;
         self.commands.launch("minimax_index_q_quant", &[s.get("index_q_norm")?,s.get("slots")?,s.get("index_q_fp8")?,s.get("index_q_scales")?], &[Scalar::I32(rows as i32)])?;
+        if let Some(d)=dump.as_deref_mut() {
+            d.tensor(&self.commands,"index_q_fp8","u8",&[rows,4,128],s.get("index_q_fp8")?)?;
+            d.tensor(&self.commands,"index_q_scales","f32",&[rows,4],s.get("index_q_scales")?)?;
+            d.cache_rows(&self.commands,"index_k_fp8","u8",&[rows,1,128],&cache.index,&batch.slots,8448,0,128)?;
+            d.cache_rows(&self.commands,"index_k_scales","f32",&[rows,1],&cache.index,&batch.slots,8448,8192,4)?;
+            for (name,source) in [("k_fp8",&cache.key),("v_fp8",&cache.value)] {
+                d.cache_rows(&self.commands,name,"u8",&[rows,4,128],source,&batch.slots,32768,0,512)?;
+            }
+        }
         // Every tile treats its queries as independent causal requests. It
         // reads the exact paged prefix, including prefixes from prior chunks.
         for start in (0..rows).step_by(self.decode_rows) {
@@ -185,13 +227,21 @@ impl<'a> Execution<'a> {
             self.commands.launch("minimax_index_decode", &[&s.get("index_q_fp8")?.view(start*512,count*512)?,
                 &s.get("index_q_scales")?.view(start*16,count*16)?,&cache.index,s.get("page_table")?,s.get("cache_lengths")?,s.get("q2k")?,s.get("scratch")?], &[
                 Scalar::I32(count as i32),Scalar::I32(stride as i32),Scalar::I32(stride as i32),Scalar::I64(batch.pool_pages as i64)])?;
+            if let Some(d)=dump.as_deref_mut() { d.selection(&self.commands,s.get("q2k")?,count,self.decode_rows)?; }
             self.commands.launch("minimax_attention_decode", &[&s.get("q_norm")?.view(start*16384,count*16384)?,&cache.key,&cache.value,
                 s.get("k_descale")?,s.get("v_descale")?,s.get("page_table")?,s.get("cache_lengths")?,s.get("cu_seqlens_q")?,s.get("q2k")?,
                 &s.get("attention")?.view(start*16384,count*16384)?,s.get("lse")?,s.get("scratch")?], &[
                 Scalar::I32(count as i32),Scalar::I32(count as i32),Scalar::I32(stride as i32),Scalar::I64(batch.pool_pages as i64)])?;
         }
+        if let Some(d)=dump.as_deref_mut() {
+            d.finish_selection()?;
+            d.tensor(&self.commands,"attention","bf16",&[rows,64,128],s.get("attention")?)?;
+        }
         ffn::linear(&self.commands,&self.weights,s,layer,"o","self_attn.o_proj",s.get("attention")?,s.get("delta")?,rows)?;
-        self.residual(rows)
+        if let Some(d)=dump.as_deref_mut() { d.tensor(&self.commands,"attention_projected","bf16",&[rows,6144],s.get("delta")?)?; }
+        self.residual(rows)?;
+        if let Some(d)=dump { d.tensor(&self.commands,"post_attention","f32",&[rows,6144],s.get("residual")?)?; }
+        Ok(())
     }
 }
 

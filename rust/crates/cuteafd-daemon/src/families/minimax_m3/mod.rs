@@ -2,8 +2,10 @@
 mod admission;
 mod backend;
 mod cache;
+mod diagnostics;
 mod execution;
 mod ffn;
+pub(crate) mod golden;
 mod head;
 mod media;
 mod prefix;
