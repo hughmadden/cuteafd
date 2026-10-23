@@ -5519,6 +5519,19 @@ outstanding waves on one link:
 
 Several waves take the pinned intake (GPU landing has one range per rank).
 
+Context-split staging (GLM 5.3 port; GLM Flash and V4 have the same shape):
+today only the first lane gathers each layer's history into that layer
+parity's staging view, and later lanes reuse it. Units can run ahead (dense
+leading layers, or a new unit entering mid-call), so another unit's gather for
+the same parity can land before a unit reads the view. Rule: every unit
+records its whole history. At its attention it reuses the parity view only
+when the last attention on that view was its predecessor's at the same layer;
+otherwise it gathers its own history. Steady state keeps the single gather;
+only the ramp re-gathers. Per-unit gather and commit plans are indexed by
+unit, workspaces and exchange lanes by slot. A slot reused mid-call uploads
+its tables in stream order (`copy_h2d_ordered`), and rank 0 waits on rank 1's
+progress before rewriting that slot's peer workspace.
+
 Buffer rule from the Step-5 port: two replicated replies with no head exchange
 between them never share a reply plane. Keep one fixed reply plane per
 replication kind (head-split routed reply, owned-layer reply), sliced per
@@ -5558,8 +5571,10 @@ Each port:
 3. gates on 1-window/N=1 vs W-window/N byte-identity, exact prefix cache, and one card (8K, TTFT, memory, KL);
 4. reports the onboard layers or pool the freed workspace bought.
 
-Phases 1 and 2 can run in parallel once phase 0's API is fixed. Phase 3
-follows the release.
+Phases 1 and 2 can run in parallel once phase 0's API is fixed. Phases 2
+and 3 are gated on one lane family showing a win on the executor (GLM 5.3,
+#660, TJ 2026-10-23), not on the release: once it does, every lane family
+ports for v4.
 
 ## Backlog (lowest priority: only when nothing planned is left)
 

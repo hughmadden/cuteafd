@@ -1124,3 +1124,9 @@ mod tests {
         assert!(cfg.context_row(0, 0, 2, 0).is_err());
     }
 }
+
+impl crate::shared::prefix::cuda_copy::SnapshotOwner for DsparkDrafter<'_> {
+    fn snapshot_buffers(&self) -> Result<Vec<cuteafd_ffi::CuteafdDeviceBuffer>> {
+        Ok(self.layers.iter().flat_map(|layer| [layer.k_ring.buffer, layer.v_ring.buffer]).collect())
+    }
+}

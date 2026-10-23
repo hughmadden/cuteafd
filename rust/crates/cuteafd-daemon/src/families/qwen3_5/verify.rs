@@ -343,6 +343,8 @@ impl<'a> DenseEngine<'a> {
             vocab: self.cfg.vocab, stride: self.cfg.vocab, stream: self.stream.raw, greedy: None })
     }
 
+    pub(crate) fn verify_taps(&self) -> &[HiddenTap] { &self.verification.taps }
+
     fn verify_rows(&mut self, plan: rows::Rows, rows: usize, layers: &[usize], speculative: bool) -> Result<()> {
         self.stream.drain()?;
         self.healthy = false;

@@ -166,10 +166,14 @@ GATEWAY
 EOF
   if [[ "$1" == qwen3_5 ]]; then
     cat <<'EOF'
+SPECULATOR_MODEL_ID
+SPECULATOR_MODEL_REVISION
+SPECULATOR_DRAFTS
 KV_CACHE
 FULL_PREFILL_LOGITS
 PREFIX_CACHE_MARK_MIB
 PREFIX_POINT_BOUNDARIES
+SPECULATION_TRACE
 PROFILE
 PROFILE_DIR
 PROFILE_NCU_KERNEL
@@ -1814,6 +1818,10 @@ if [[ -z "$speculator" ]]; then
     speculator=dspark
     echo "note: DeepSeek V4 drafts with its bundled dSpark; SPECULATOR=off disables it" >&2
   fi
+  if [[ $speculator == off && $family == qwen3_5 ]] &&
+      python3 -c 'import json,sys; c=json.load(open(sys.argv[1])); sys.exit(c.get("text_config",c).get("hidden_size") != 5120)' "$root/snapshots/$revision/config.json"; then
+    speculator=dspark default_drafter=RadixArk/Qwen3.8-27B-DSpark
+  fi
   if [[ $speculator == off && $family == step5 ]]; then
     speculator=mtp
     echo "note: Step-5 drafts with native MTP (default depth 3); SPECULATOR=off disables it" >&2
@@ -1828,7 +1836,7 @@ if [[ -z "$speculator" ]]; then
 fi
 case "$family:$speculator" in
   qwen4:mtp) ;; # The MTP layer's experts stay local even with Spark backbone experts.
-  *:off|glm5:dflash2|glm5_flash:dflash2|glm5_flash:dspark|mimo_v2:dflash2|mimo_v2:mtp|kimi_k3:dflash2|step5:mtp|deepseek_v4:dspark) ;;
+  *:off|qwen3_5:dspark|glm5:dflash2|glm5_flash:dflash2|glm5_flash:dspark|mimo_v2:dflash2|mimo_v2:mtp|kimi_k3:dflash2|step5:mtp|deepseek_v4:dspark) ;;
   *) echo "SPECULATOR=$speculator does not apply to $family" >&2; exit 2 ;;
 esac
 draft_args=()
@@ -1903,10 +1911,15 @@ case "$speculator" in
   dflash2|dspark)
     drafter="$(get SPECULATOR_MODEL_ID)"
     [[ -n "$drafter" ]] || drafter="$default_drafter"
+    [[ "$family:$speculator" != qwen3_5:dspark || -n "$drafter" ]] || drafter=RadixArk/Qwen3.8-27B-DSpark
     if [[ $speculator == dspark && $family == deepseek_v4 ]]; then
       dspark_args=(--dspark)
     elif [[ -n "$drafter" ]]; then
-      draft_snapshot="$(snapshot_of "$drafter" "$(get SPECULATOR_MODEL_REVISION)")" ||
+      draft_revision="$(get SPECULATOR_MODEL_REVISION)"
+      if [[ -z "$draft_revision" && $family:$speculator == qwen3_5:dspark && $drafter == RadixArk/Qwen3.8-27B-DSpark ]]; then
+        draft_revision=85ef153be924f17ce4bf62726954eeaa4a73e854
+      fi
+      draft_snapshot="$(snapshot_of "$drafter" "$draft_revision")" ||
         { [[ -z "$default_drafter" ]] || echo "download it (hf download $drafter) or set SPECULATOR=off" >&2; exit 1; }
       draft_args=(--draft "$draft_snapshot")
       [[ "$family" != kimi_k3 ]] || draft_args+=(--draft-fp8 true)
@@ -1925,8 +1938,8 @@ esac
 # (DFlash2 on GLM 5.x, GLM 5.3 Flash and MiMo V2; dSpark on GLM 5.3 Flash), for policy A/B runs.
 drafts="$(get SPECULATOR_DRAFTS adaptive)"
 if [[ "$drafts" != adaptive ]]; then
-  [[ "$drafts" =~ ^[0-9]+$ && ($speculator == dflash2 || $family:$speculator == glm5_flash:dspark) ]] ||
-    { echo "SPECULATOR_DRAFTS must be adaptive or a draft count, with SPECULATOR=dflash2 (or dspark on GLM 5.3 Flash)" >&2; exit 2; }
+  [[ "$drafts" =~ ^[0-9]+$ && ($speculator == dflash2 || $family:$speculator == glm5_flash:dspark || $family:$speculator == qwen3_5:dspark) ]] ||
+    { echo "SPECULATOR_DRAFTS must be adaptive or a draft count, with SPECULATOR=dflash2 (or dspark on GLM 5.3 Flash or dense Qwen)" >&2; exit 2; }
   draft_args+=(--draft-fixed "$drafts")
 fi
 # Prefix cache (MiMo, GLM 5.3, GLM 5.3 Flash, Qwen 3.8, DeepSeek V4): PREFIX_CACHE_ENTRIES
@@ -2578,6 +2591,9 @@ audio_encoder_hash=""
     plan_gib="$(python3 -c 'import sys;f,t,b=map(float,sys.argv[1:]);print(max(0,b-(t-f)/1024))' "$free_mib" "$total_mib" "$profile_gib")"
   fi
   plan_draft_args=(--concurrency "$effective_concurrency" --mapped-scale-preload-gib "$(get MAPPED_SCALE_PRELOAD_GIB 0)")
+  if [[ "$family:$speculator" == qwen3_5:dspark ]]; then
+    plan_draft_args+=(--drafter-snapshot "$draft_snapshot")
+  fi
   if [[ "$family:$speculator" == kimi_k3:dflash2 ]]; then
     plan_draft_args+=(--drafter-snapshot "$draft_snapshot" --draft-fp8 true)
   fi

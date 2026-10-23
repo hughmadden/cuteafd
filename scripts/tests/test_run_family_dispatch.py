@@ -290,6 +290,37 @@ DENSE_CONFIG = {"model_type": "qwen3_5", "text_config": {
 }}
 
 
+@pytest.mark.parametrize("model", ["Qwen/Qwen3.8-27B", "Qwen/Qwen3.8-27B-FP8"])
+@pytest.mark.parametrize("selection", [None, "off", "dspark"])
+@pytest.mark.parametrize("revision", [None, "explicit-revision"])
+def test_dense_27b_dspark_default_and_explicit_disable(tmp_path, model, selection, revision):
+    config = {**DENSE_CONFIG, "text_config": {**DENSE_CONFIG["text_config"], "hidden_size": 5120}}
+    drafter = "RadixArk/Qwen3.8-27B-DSpark"
+    selected_revision = revision or "85ef153be924f17ce4bf62726954eeaa4a73e854"
+    _snapshot(tmp_path / "hf", drafter, {"speculators_model_type": "dspark"}, selected_revision)
+    # A moving main ref must not replace the qualified default or an explicit revision.
+    (tmp_path / "hf" / "hub" / f"models--{drafter.replace('/', '--')}" / "refs" / "main").write_text("unavailable-main")
+    keys = "SPARK_COUNT=0\n" + (f"SPECULATOR={selection}\n" if selection else "")
+    if revision:
+        keys += f"SPECULATOR_MODEL_REVISION={revision}\n"
+    if selection == "dspark":
+        keys += "SPECULATOR_DRAFTS=3\n"
+    result = _family_launch_result(tmp_path, config, model, keys,
+        extra_args=("--wip", "dense-test"),
+        encoder_plan={"placement_supported": True, "fits": True, "spark_ranks": 0})
+    assert result.returncode == 0, result.stderr
+    launch = shlex.split(next(line for line in result.stderr.splitlines() if "serve-qwen35 --snapshot" in line))
+    plan = shlex.split(next(line for line in result.stderr.splitlines() if "cuteafd plan " in line))
+    assert ("--draft" in launch) == (selection != "off")
+    assert ("--drafter-snapshot" in plan) == (selection != "off")
+    if selection != "off":
+        snapshot = str(tmp_path / "hf" / "hub" / f"models--{drafter.replace('/', '--')}" / "snapshots" / selected_revision)
+        assert launch[launch.index("--draft") + 1] == snapshot
+        assert plan[plan.index("--drafter-snapshot") + 1] == snapshot
+    if selection == "dspark":
+        assert launch[launch.index("--draft-fixed") + 1] == "3"
+
+
 @pytest.mark.parametrize("cache_keys,entries,boundaries", [
     ("", 20, 1),
     ("PREFIX_CACHE_ENTRIES=4\nPREFIX_CACHE_MARK_MIB=1024\nPREFIX_POINT_BOUNDARIES=2\n", 4, 2),
@@ -3323,7 +3354,7 @@ def test_generic_family_checkpoint_context_default_and_override(tmp_path, family
         keys += f"MAX_CONTEXT_TOKENS={context}\n"
     result = _family_launch_result(tmp_path, config, "test/model", keys)
     assert result.returncode == 0, result.stderr
-    launch = next(line for line in result.stderr.splitlines() if " --snapshot " in line and "serve-" in line)
+    launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-" in line)
     assert f"--max-context {context or 0}" in launch
 
 
@@ -3582,3 +3613,17 @@ def test_dense_full_prefill_logits_reaches_serve_and_plan(tmp_path, full, kv):
     expected_kv = kv or "fp8"
     assert f"--kv-cache {expected_kv}" in launch
     assert f"--kv-cache {expected_kv}" in plan
+
+
+def test_dense_qwen_forwards_speculation_trace(tmp_path: Path) -> None:
+    # Dense Qwen writes the trace through the shared Qwen scheduler; the card's
+    # --trace sets SPECULATION_TRACE, which the launcher must mount and pass on.
+    trace = tmp_path / "trace" / "speculation-trace.jsonl"
+    result = _family_launch_result(tmp_path, DENSE_CONFIG, "Qwen/Qwen3.5-9B",
+        f"SPARK_COUNT=0\nSPECULATION_TRACE={trace}\n",
+        extra_args=("--wip", "dense-test"),
+        encoder_plan={"placement_supported": True, "fits": True, "spark_ranks": 0})
+    assert result.returncode == 0, result.stderr
+    launch = next(line for line in result.stderr.splitlines() if "serve-qwen35 --snapshot" in line)
+    assert f"CUTEAFD_SPECULATION_TRACE={trace}" in launch
+    assert f"{trace.parent}:{trace.parent}" in launch
