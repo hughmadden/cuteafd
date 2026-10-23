@@ -71,26 +71,10 @@ pub(crate) fn eviction_headroom(layout: FamilyLayout, tokens: u64) -> Result<[u6
     Ok([pages, marks, draft, 0])
 }
 
-/// The live ledger is attribution only: those pinned bytes are already absent
-/// from MemAvailable. Deferred scoring and the reserve still need admission.
+/// Resident pinned bytes are attribution only; the host cache, deferred scoring
+/// and reserve use the same admission ledger as future named host tables.
 pub(crate) fn admit(bytes: u64, deferred: u64, headroom: u64) -> Result<cuteafd_core::memory_layout::HostLayout> {
-    use cuteafd_core::memory_layout::{Basis, Category, HostLayout, Item, ItemLifetime};
-    let memory = host_memory()?;
-    let snapshot = cuteafd_ffi::memory_ledger::snapshot();
-    let mut items: Vec<_> = snapshot.by_scope(cuteafd_ffi::memory_ledger::Space::Pinned, -1).into_iter()
-        .map(|(scope, bytes)| Item::new(Category::of_scope(scope), scope, "pinned", bytes as u64, Basis::Exact))
-        .collect();
-    items.push(Item::new(Category::Workspace, "scoring/full-logits", "FP32", deferred, Basis::Formula)
-        .with_lifetime(ItemLifetime::PostReadyReserve));
-    let ledger = HostLayout::new(memory.total, memory.available, headroom.max(memory.total / 10), bytes, items)
-        .context("host admission byte count overflow")?;
-    ensure!(ledger.shortfall_bytes == 0,
-        "coordinator host memory cannot admit prefix cache {} plus deferred consumers {} and reserve {}: available {}, total {}, resident {}, shortfall {} bytes",
-        bytes, ledger.deferred_bytes, ledger.reserve_bytes, memory.available, memory.total,
-        ledger.resident_bytes, ledger.shortfall_bytes);
-    tracing::info!(host_budget_bytes = bytes, host_ledger = %serde_json::to_string(&ledger)?,
-        "coordinator host memory admitted");
-    Ok(ledger)
+    crate::shared::memory::budget::admit_host_memory(bytes, &[], deferred, headroom)
 }
 
 #[cfg(test)]

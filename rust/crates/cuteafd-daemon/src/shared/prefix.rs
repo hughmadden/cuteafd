@@ -123,10 +123,22 @@ impl PrefixArgs {
         Ok((prefix, usize::try_from(bytes)?))
     }
 
-    /// Resolve the host quota once, before pinned allocation. Call only when
-    /// this family's copy engine can restore every rank's snapshot exactly.
-    /// Host prefix bytes are not active device KV capacity.
+    /// Resolve and admit a host quota when no other future host consumers need
+    /// joint admission. Call only when this family's copy engine restores every
+    /// rank exactly; these bytes are not active device KV capacity.
     pub fn host_config(&self, layout: FamilyLayout, max_context: usize, concurrency: usize)
+        -> Result<Option<cuteafd_hostcache::config::Config>> {
+        let config = self.resolve_host_config(layout, max_context, concurrency)?;
+        if let Some(config) = &config {
+            budget::admit(config.bytes, self.scoring_host_bytes, self.host_cache_headroom_bytes)?;
+        }
+        Ok(config)
+    }
+
+    /// Resolve and validate the host quota without admission or allocation.
+    /// Pass the returned quota alongside every future table to one complete
+    /// `memory::budget::admit_host_memory` call, then retain this exact config.
+    pub fn resolve_host_config(&self, layout: FamilyLayout, max_context: usize, concurrency: usize)
         -> Result<Option<cuteafd_hostcache::config::Config>> {
         if self.prefix_cache_entries == 0 || !self.host_cache_bytes.enabled() {
             return Ok(None);
@@ -147,7 +159,6 @@ impl PrefixArgs {
         };
         anyhow::ensure!(bytes > 0,
             "host prefix quota resolves to zero; provide a positive quota or disable it explicitly for device retention");
-        budget::admit(bytes, self.scoring_host_bytes, self.host_cache_headroom_bytes)?;
         let config = cuteafd_hostcache::config::Config {
             bytes,
             eviction_headroom: budget::eviction_headroom(layout, self.host_cache_evict_tokens)?,
@@ -295,6 +306,24 @@ mod tests {
         assert_eq!(parse_bytes("123"), Ok(123));
         assert!(parse_bytes("12 parsecs").is_err() && parse_bytes("-1").is_err());
         assert!(parse_bytes("NaN").is_err() && parse_bytes("inf").is_err());
+    }
+
+    #[test]
+    fn resolve_host_config_defers_admission_but_still_validates_geometry() {
+        let prefix = Cli::parse_from(["serve", "--host-cache-bytes", "1MiB"]).prefix;
+        let layout = FamilyLayout { page_rows: 64, pages: 1024, page_bytes: 65536, mark_bytes: 4096,
+            draft_bytes: 0, rule: cuteafd_core::prefix::ReuseRule::EXACT,
+            mark_store: Default::default(), page_owners: Default::default() };
+        let mut impossible = prefix.clone();
+        impossible.scoring_host_bytes = u64::MAX;
+        let config = impossible.resolve_host_config(layout, 32768, 1).unwrap().unwrap();
+        assert_eq!((config.bytes, config.max_tokens), (1 << 20, 32768));
+        assert!(impossible.host_config(layout, 32768, 1).is_err());
+        let admitted = prefix.host_config(layout, 32768, 1).unwrap().unwrap();
+        assert_eq!(config, admitted);
+        assert!(impossible.resolve_host_config(layout, 0, 1).is_err());
+        impossible.prefix_cache_entries = 0;
+        assert!(impossible.resolve_host_config(layout, 0, 1).unwrap().is_none());
     }
 
     #[test]
