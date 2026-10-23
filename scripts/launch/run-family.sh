@@ -371,6 +371,8 @@ KV_CACHE
 QWEN_FP8_DECODE
 QWEN_FP8_HEAD
 QWEN_STARTUP_GRAPHS
+PREFILL_ROWS
+PREFILL_WAVES
 SPECULATOR_DEPTH
 SPECULATOR_FP8
 MEDIA_CACHE_BYTES
@@ -383,7 +385,7 @@ EOF
 # Each shared-executor port opts in here after its serve CLI accepts the shape.
 family_prefill_mode() {
   case "$1" in
-    step5|kimi_k3) echo units ;;
+    step5|kimi_k3|qwen4) echo units ;;
     glm5) echo units-span ;;
     *) echo legacy ;;
   esac
@@ -2677,6 +2679,8 @@ audio_encoder_hash=""
   fi
   if [[ "$family" == qwen4 ]]; then
     plan_draft_args+=(--kv-cache "$kv_cache")
+    [[ -z "$(get PREFILL_ROWS)" ]] || plan_draft_args+=(--prefill-rows "$(get PREFILL_ROWS)")
+    [[ -z "$(get PREFILL_WAVES)" ]] || plan_draft_args+=(--prefill-waves "$(get PREFILL_WAVES)")
     for key in FP8_DECODE:--fp8-decode FP8_HEAD:--mtp-fp8-head; do
       case "$(get "QWEN_${key%%:*}")" in
         on) plan_draft_args+=("${key#*:}" true) ;;

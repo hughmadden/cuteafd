@@ -28,9 +28,68 @@ pub(super) fn inputs<'a>(args: &EngineArgs, cfg: &'a Qwen4Config, layers: usize,
     let marks = args.planner_prefix_bytes.unwrap_or(geometry.ranks[0].retained_mark_bytes * qwen4::DEFAULT_MARK_SLOTS);
     let logits = if args.full_prefill_logits { cuteafd_loader::plan::layout::full_prefill_logits_bytes(
         "qwen4", args.prefill_rows as u64, cfg.vocab_size as u64) } else { 0 };
-    Ok(QwenAdmissionInputs { cfg, layers, mtp, kv_format: args.kv_format, manifest, prefill_rows: args.prefill_rows as u64,
+    Ok(QwenAdmissionInputs { prefill_shape: args.prefill_shape()?, cfg, layers, mtp, kv_format: args.kv_format, manifest, prefill_rows: args.prefill_rows as u64,
         slots: args.slots as u64, mark_bytes: marks, full_prefill_logits: logits, ple, future_expert_bytes,
         headroom: cuteafd_loader::plan::layout::LayoutOptions::default().headroom_bytes.max(3 << 30) })
+}
+
+/// Destination extents used by both workspace allocation and ordered H2D admission.
+#[derive(Debug)]
+pub(super) struct StepTableBytes {
+    pub positions: usize, pub rope_positions: usize, pub block_rope_positions: usize,
+    pub kv_slots: usize, pub slots: usize, pub seq_first: usize, pub pool_slots: usize,
+    pub cache_lengths: usize, pub page_table: usize, pub pool_table: usize,
+    pub ids: usize, pub ple_ids: usize,
+}
+
+impl StepTableBytes {
+    pub fn new(rows: usize, decode: bool, pages: usize, pool_pages: usize, ple_rows: usize) -> Result<Self> {
+        use anyhow::Context;
+        let mul = |a: usize, b: usize| a.checked_mul(b).context("Qwen host table size overflow");
+        let table_rows = if decode { rows } else { 1 };
+        Ok(Self { positions: mul(rows, 8)?, rope_positions: mul(rows, 12)?,
+            block_rope_positions: mul(rows, 12)?, kv_slots: mul(rows, 8)?,
+            slots: mul(rows, 4)?, seq_first: mul(rows, 4)?, pool_slots: mul(rows, 8)?,
+            cache_lengths: mul(rows, 4)?, page_table: mul(mul(table_rows, pages)?, 4)?,
+            pool_table: mul(mul(table_rows, pool_pages)?, 4)?, ids: mul(rows, 4)?,
+            ple_ids: mul(mul(rows, ple_rows)?, 8)? })
+    }
+
+    pub fn ordered_bytes(&self, ple_ids: bool) -> Result<u64> {
+        use anyhow::Context;
+        [self.positions, self.rope_positions, self.block_rope_positions, self.kv_slots,
+            self.slots, self.seq_first, self.pool_slots, self.cache_lengths,
+            self.page_table, self.pool_table, self.ids].into_iter()
+            .chain(ple_ids.then_some(self.ple_ids)).try_fold(0u64, |total, bytes|
+                total.checked_add(bytes.max(256) as u64).context("Qwen ordered table size overflow"))
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(super) struct HostWorkspaceBytes {
+    pub router: u64,
+    pub staging: u64,
+    pub ordered: u64,
+    pub logits: u64,
+}
+
+impl HostWorkspaceBytes {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(cfg: &Qwen4Config, rows: usize, decode: bool, pages: usize, pool_pages: usize,
+        spark: bool, bf16: bool, ordered: bool, ple_ids: bool, logits: usize) -> Result<Self> {
+        use anyhow::Context;
+        let mul = |a: usize, b: usize| a.checked_mul(b).context("Qwen host workspace size overflow");
+        let add = |a: usize, b: usize| a.checked_add(b).context("Qwen host workspace size overflow");
+        let table_rows = if decode { rows } else { 1 };
+        let router = if spark { mul(rows, add(mul(cfg.topk, 8)?,
+            if bf16 { mul(cfg.hidden, 2)? } else { add(cfg.hidden, cfg.hidden / 32)? })?)? } else { 256 };
+        let row = add(8 * 3 + 4 * 4 + 24, add(mul(cfg.ple_rows(), 8)?, mul(5, mul(cfg.hidden, 2)?)?)?)?;
+        let staging = add(add(256, mul(rows, row)?)?, mul(mul(table_rows, add(pages, pool_pages)?)?, 4)?)?;
+        Ok(Self { router: router as u64, staging: staging as u64,
+            ordered: if ordered { StepTableBytes::new(rows, decode, pages, pool_pages, cfg.ple_rows())?
+                .ordered_bytes(ple_ids)? } else { 0 },
+            logits: mul(mul(logits, cfg.vocab_size)?, 4)? as u64 })
+    }
 }
 
 /// Admission follows the selected executor, not unused configured peers.
@@ -78,7 +137,7 @@ pub(super) fn pool_tokens(library: &NativeLibrary, args: &EngineArgs, inputs: &Q
     let sample = library.cuda_memory_info();
     library.cuda_set_device(current)?;
     let (available, total) = sample?;
-    let admission = QwenAdmissionInputs { cfg: inputs.cfg, layers: inputs.layers, mtp: inputs.mtp, kv_format: inputs.kv_format,
+    let admission = QwenAdmissionInputs { prefill_shape: inputs.prefill_shape, cfg: inputs.cfg, layers: inputs.layers, mtp: inputs.mtp, kv_format: inputs.kv_format,
         manifest: inputs.manifest, prefill_rows: inputs.prefill_rows, slots: inputs.slots,
         mark_bytes: inputs.mark_bytes, full_prefill_logits: inputs.full_prefill_logits,
         ple: inputs.ple, future_expert_bytes: inputs.future_expert_bytes, headroom: inputs.headroom };
@@ -176,6 +235,54 @@ mod tests {
     use cuteafd_loader::serving_capacity::qwen_graphs::*;
 
     #[test]
+    fn host_tables_match_full_destination_extents_and_minimum_allocations() -> anyhow::Result<()> {
+        for rows in [1usize, 64, 512, 4096] {
+            for decode in [false, true] {
+                let tables = super::StepTableBytes::new(rows, decode, 32768, 8192, 9)?;
+                let table_rows = if decode { rows } else { 1 };
+                let expected: usize = [rows * 8, rows * 12, rows * 12, rows * 8,
+                    rows * 4, rows * 4, rows * 8, rows * 4,
+                    table_rows * 32768 * 4, table_rows * 8192 * 4, rows * 4]
+                    .into_iter().map(|n| n.max(256)).sum();
+                assert_eq!(tables.ordered_bytes(false)?, expected as u64);
+                assert_eq!(tables.ordered_bytes(true)?, (expected + (rows * 9 * 8).max(256)) as u64);
+            }
+        }
+        assert!(super::StepTableBytes::new(usize::MAX, false, 1, 1, 1).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn host_workspace_charges_all_lazy_consumers_for_serial_and_spark_owners() -> anyhow::Result<()> {
+        use super::HostWorkspaceBytes;
+        let cfg = cuteafd_loader::families::qwen4::Qwen4Config::from_hf(
+            &cuteafd_loader::plan::testing::qwen4_config(48))?;
+        let (pages, pools) = (32768usize, 8192usize);
+        for rows in [64usize, 512, 4096] {
+            for decode in [false, true] {
+                for spark in [false, true] {
+                    for bf16 in [false, true] {
+                        let host = HostWorkspaceBytes::new(&cfg, rows, decode, pages, pools,
+                            spark, bf16, !decode && spark, false, if decode { 64 } else { 1 })?;
+                        let table_rows = if decode { rows } else { 1 };
+                        assert_eq!(host.staging as usize, 256 + rows * (8 * 3 + 4 * 4 + 24
+                            + cfg.ple_rows() * 8 + 5 * cfg.hidden * 2) + table_rows * (pages + pools) * 4);
+                        assert_eq!(host.router as usize, if spark { rows * (cfg.topk * 8
+                            + if bf16 { cfg.hidden * 2 } else { cfg.hidden + cfg.hidden / 32 }) } else { 256 });
+                        assert_eq!(host.logits as usize, (if decode { 64 } else { 1 }) * cfg.vocab_size * 4);
+                        assert_eq!(host.ordered > 0, !decode && spark);
+                    }
+                }
+            }
+        }
+        let full = HostWorkspaceBytes::new(&cfg, 4096, false, pages, pools, true, true, true, false, 8192)?;
+        assert_eq!(full.logits, 8192 * cfg.vocab_size as u64 * 4);
+        assert!(HostWorkspaceBytes::new(&cfg, usize::MAX, false, pages, pools,
+            true, true, true, false, 1).is_err());
+        Ok(())
+    }
+
+    #[test]
     fn spark_contract_matches_single_link_capacity_and_checkpoint_ingress() -> anyhow::Result<()> {
         for rows in [64, 2048, 4096] {
             for bf16 in [false, true] {
@@ -268,7 +375,7 @@ mod tests {
             for onboard in [Onboard::Auto, Onboard::ExpertsFirst { pool_floor: 2 << 20 }] {
                 let mut inputs = qwen4::QwenDualInputs { automatic_context: false,
                     owner_manifests: [None; 2],
-                    admission: QwenAdmissionInputs { cfg: &cfg, layers: 48, mtp: false,
+                    admission: QwenAdmissionInputs { prefill_shape: None, cfg: &cfg, layers: 48, mtp: false,
                         kv_format: Qwen4KvCache::Bf16, manifest: None, prefill_rows: 4096,
                         slots: 16, mark_bytes: 0, full_prefill_logits: 0,
                         ple: Some((resident.ple_row_bytes, false)), future_expert_bytes: 0, headroom: 3 << 30 },
@@ -628,11 +735,10 @@ mod tests {
         assert_eq!(spark.code_key(), "none");
         // The selected transport's actual world, not the configured two peers.
         assert_eq!(input(&with_peers, spark, 0)?.spark_ranks, 4);
-        // Spark serving charges the intake's per-rank BF16 planes at prefill width.
+        // Runtime's measured baseline already includes the selected transport.
         let request = qwen4::request(&input(&with_peers, spark, 0)?, 0)?;
-        let intake = request.fixed.iter().find(|d| d.group == "Spark intake planes").expect("intake charge");
-        assert_eq!(intake.bytes, cuteafd_loader::serving_capacity::spark_intake_bytes(4, 1, 1, 1)
-            * with_peers.prefill_rows.max(64) as u64 * cfg.hidden as u64);
+        assert!(matches!(request.inventory.gpus[0].baseline, cuteafd_loader::placement::Baseline::Measured { .. }));
+        assert!(request.fixed.iter().all(|d| d.group != "Spark intake planes"));
         assert!(qwen4::request(&input(&local, ExpertSource::LocalExl3, 0)?, 0)?.fixed.iter()
             .all(|d| d.group != "Spark intake planes"));
         assert_eq!(ExpertSource::selected(None)?, ExpertSource::None);
