@@ -204,6 +204,28 @@ def test_pool_following_v4_page_tables_use_the_planners_kv_records_scope(tmp_pat
     assert categories.get("workspace", 0) == 0
 
 
+def test_v4_admits_tables_and_frozen_prefix_quota_before_first_reservation():
+    root = Path(__file__).parents[2] / "rust/crates/cuteafd-daemon/src/families/deepseek_v4"
+    startup = (root / "mod.rs").read_text().split("pub(crate) fn with_engine", 1)[1]
+    assert startup.index("engine.attach_peer(") < startup.index("admission::host_memory(")
+    assert startup.index("admission::host_memory(") < startup.index("engine.attach_context(")
+    assert startup.index("admission::host_memory(") < startup.index("engine.prepare_workspaces()")
+    assert "body(&engine, &mut transports, &runtime, host_config)" in startup
+    admission = (root / "admission.rs").read_text().split("pub(crate) fn host_memory(", 1)[1]
+    admission = admission.split("pub(crate) fn request(", 1)[0]
+    assert admission.count("resolve_host_config(") == 1
+    assert admission.count("admit_host_memory(") == 1
+    assert "config.as_ref().map_or(0, |c| c.bytes)" in admission
+    assert "&tables, logits" in admission
+    serve = (root / "serve.rs").read_text()
+    cache = serve.split("fn prefix_cache", 1)[1].split("/// Gives a finished", 1)[0]
+    assert "host_config.map(|config|" in cache
+    assert ".host_config(" not in cache
+    assert ".host_tier(" not in cache
+    assert "resolve_host_config(" not in cache
+    assert "prefix_cache(engine, prefix, host_config)?" in serve
+
+
 def test_glmf_kda_only_pool_backing_uses_the_planners_prefix_scope():
     source = (Path(__file__).parents[2] / "rust/crates/cuteafd-daemon/src/families/glm5_flash/engine.rs").read_text()
     allocation = source.split("let pool_mark_backing = if pool_mark_unit_bytes > 0 {", 1)[1].split("} else { None };", 1)[0]

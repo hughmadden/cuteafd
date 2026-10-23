@@ -301,7 +301,8 @@ pub(crate) fn with_engine<T>(
     args: &EngineArgs,
     prefix: Option<&crate::shared::prefix::PrefixArgs>,
     held: impl FnOnce(&engine::Engine<'_>) -> Result<usize>,
-    body: impl FnOnce(&engine::Engine<'_>, &mut [SparkLink<'_>], &tokio::runtime::Runtime) -> Result<T>,
+    body: impl FnOnce(&engine::Engine<'_>, &mut [SparkLink<'_>], &tokio::runtime::Runtime,
+        Option<cuteafd_hostcache::config::Config>) -> Result<T>,
 ) -> Result<T> {
     let programs = loaded.library.programs()?.with_manifest(&args.manifest)?;
     let caps = &loaded.manifest["capacities"];
@@ -532,6 +533,9 @@ pub(crate) fn with_engine<T>(
         if let Some((device, stream)) = peer_stream {
             engine.attach_peer(device, stream, shares.pop().context("head-split shares")?, engine::PeerParts { shape, tp2: placement.tp2.as_ref().is_some_and(|t| t.layers > 0) })?;
         }
+        // Freeze the prefix quota and admit it together with every future table before
+        // attach_context or workspace preparation can reserve ordered-upload staging.
+        let host_config = admission::host_memory(&engine, args, prefix, context_extent)?;
         let held = held(&engine)?;
         let _ = held; // Prefix bytes were reserved before placement.
         let started = Instant::now();
@@ -629,7 +633,7 @@ pub(crate) fn with_engine<T>(
         tracing::info!(graphs0, graphs1, captures, units = engine.shape.units,
             classes = metadata::c4_width_classes(engine.shape.units).len(), "V4 decode graph inventory");
         let _coverage_session = engine.graph_coverage.session();
-        body(&engine, &mut transports, &runtime)
+        body(&engine, &mut transports, &runtime, host_config)
     })();
     crate::shared::decode_graph::fatal_drain(engine.shutdown_submission(&mut transports), "V4 RTX engine retirement");
     if let Err(error) = &result {
@@ -668,7 +672,7 @@ fn golden(args: GoldenArgs) -> Result<()> {
     let loaded = load(&args.engine)?;
     let cfg = loaded.cfg.clone();
     let windows = if shared { Some(fidelity_windows(&args.golden, loaded.family, args.window.as_deref())?) } else { None };
-    with_engine(&loaded, &args.engine, None, |_| Ok(0), |engine, transports, runtime| {
+    with_engine(&loaded, &args.engine, None, |_| Ok(0), |engine, transports, runtime, _host_config| {
         let before = engine.graph_capture_counts();
         println!("golden ready: {:.3} s | graph captures {} | TP2 expert graph captures {}",
             started.elapsed().as_secs_f64(), before.0, before.1);
