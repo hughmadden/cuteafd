@@ -5445,11 +5445,18 @@ the Sparks run one row window's experts, the GPU runs the next window's
 attention. Audit on 2026-10-23: each family had its own chunk size, lane count
 and scratch scheme. Step-5 and Qwen 4 had no overlap at all.
 
-- **Mechanism:** the shared sub-wave pipeline
-  (`shared/prefill_pipeline.rs`, `subwave_ranges`/`subwave_actions`), as
-  Kimi K3 and V4.1 use it. GLM 5.3, GLM Flash and MiMo still run their own
-  per-lane workspaces and transports. They get migrated after v4, not as a
-  special case.
+- **Mechanism:** one lane, one transport and one full-chunk workspace per
+  prefill, cut into row windows, with up to N windows' expert waves in flight.
+  Today `shared/prefill_pipeline.rs` holds two pieces:
+  - `subwave_ranges`/`subwave_actions`: windows inside one chunk, one lane,
+    one wave in flight (Kimi K3).
+  - `PipelineOrder`: whole chunks alternating over two lanes, each with its
+    own pass, workspace and transport, staggered per layer (V4.1). This is
+    lanes-style, like GLM 5.3, GLM Flash and MiMo.
+  The target merges them: Kimi's single workspace plus V4.1's waves in flight.
+  Step-5 and Qwen 4 start on sub-waves. V4.1, GLM 5.3, GLM Flash and MiMo
+  move off per-lane workspaces and transports after v4; their lane count is
+  the starting value for their waves in flight.
 - **Scratch:** each window owns its own row range of a full-chunk workspace
   (Kimi's `subwave_extent`). Windows never share bytes, so no schedule can
   overwrite live rows. No per-family arena relayouts.
@@ -5457,8 +5464,8 @@ and scratch scheme. Step-5 and Qwen 4 had no overlap at all.
   row, or the requested logit rows), never for every chunk row.
 - **Chunk size:** the planner picks the largest chunk, up to the 4096-row AOT
   capacity, that admits without giving up an onboard expert layer or pool
-  capacity. V4.1 at 2048 is this rule applied by hand: on 1 RTX, workspaces
-  went 21.08 → 11.01 GiB and RTX expert layers 5 → 6. Families don't hardcode
+  capacity. V4.1 at 2048 is this rule applied by hand: on 1 RTX its two
+  lanes' workspaces went 21.08 → 11.01 GiB and RTX expert layers 5 → 6. Families don't hardcode
   their own value.
 - **One lane, several waves:** a prefill chunk runs in one lane with one
   transport. The pipeline may keep up to N windows' expert waves in flight at
@@ -5481,7 +5488,7 @@ and scratch scheme. Step-5 and Qwen 4 had no overlap at all.
   shared defaults. GLM's and MiMo's measured lane counts are the starting
   values for their waves in flight.
   Defaults today: GLM 5.3 3 lanes, GLM Flash 2, MiMo 3/2 by size (measured),
-  V4.1 2, Kimi ≤3 windows. Only MiMo's default was measured.
+  V4.1 2 lanes, Kimi ≤3 windows. Only MiMo's default was measured.
 
 ## Backlog (lowest priority: only when nothing planned is left)
 
