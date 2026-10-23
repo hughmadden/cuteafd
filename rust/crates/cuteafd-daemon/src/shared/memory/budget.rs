@@ -127,7 +127,7 @@ impl FromStr for LocalLayers {
 pub(crate) fn admit_host_memory(cache: u64, tables: &[(&str, u64)], deferred_logits: u64, headroom: u64)
     -> Result<cuteafd_core::memory_layout::HostLayout> {
     use cuteafd_core::memory_layout::{Basis, Category, Item};
-    let memory = crate::shared::prefix::budget::host_memory()?;
+    let memory = cuteafd_loader::formats::mapped_preload::host_memory()?;
     let snapshot = cuteafd_ffi::memory_ledger::snapshot();
     let resident = snapshot.by_scope(cuteafd_ffi::memory_ledger::Space::Pinned, -1).into_iter()
         .map(|(scope, bytes)| Item::new(Category::of_scope(scope), scope, "pinned", bytes as u64, Basis::Exact))
@@ -138,7 +138,7 @@ pub(crate) fn admit_host_memory(cache: u64, tables: &[(&str, u64)], deferred_log
     Ok(ledger)
 }
 
-fn host_admission(memory: crate::shared::prefix::budget::HostMemory,
+fn host_admission((total, available): (u64, u64),
     mut resident: Vec<cuteafd_core::memory_layout::Item>, cache: u64,
     tables: &[(&str, u64)], deferred_logits: u64, headroom: u64)
     -> Result<cuteafd_core::memory_layout::HostLayout> {
@@ -148,11 +148,11 @@ fn host_admission(memory: crate::shared::prefix::budget::HostMemory,
     resident.extend(tables.iter().map(|&(name, bytes)| host_table_item(name, bytes)));
     resident.push(Item::new(Category::Workspace, "scoring/full-logits", "FP32", deferred_logits, Basis::Formula)
         .with_lifetime(ItemLifetime::PostReadyReserve));
-    let ledger = HostLayout::new(memory.total, memory.available, headroom.max(memory.total / 10), cache, resident)
+    let ledger = HostLayout::new(total, available, headroom.max(total / 10), cache, resident)
         .context("host admission byte count overflow")?;
     ensure!(ledger.shortfall_bytes == 0,
         "coordinator host memory cannot admit host cache {} plus deferred consumers {} and reserve {}: available {}, total {}, resident {}, shortfall {} bytes",
-        cache, ledger.deferred_bytes, ledger.reserve_bytes, memory.available, memory.total,
+        cache, ledger.deferred_bytes, ledger.reserve_bytes, available, total,
         ledger.resident_bytes, ledger.shortfall_bytes);
     Ok(ledger)
 }
@@ -160,12 +160,11 @@ fn host_admission(memory: crate::shared::prefix::budget::HostMemory,
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::shared::prefix::budget::HostMemory;
     use cuteafd_core::memory_layout::{Basis, Category, Item, ItemLifetime};
 
     #[test]
     fn named_pinned_tables_are_admitted_without_a_prefix_cache() -> Result<()> {
-        let memory = HostMemory { total: 1000, available: 800 };
+        let memory = (1000, 800);
         let resident = vec![Item::new(Category::Weights, "resident/weight", "pinned", 200, Basis::Exact)];
         let ledger = host_admission(memory, resident, 0,
             &[("synthetic/ordered-table", 300), ("synthetic/other-gpu", 200)], 100, 0)?;
@@ -183,7 +182,7 @@ mod tests {
 
     #[test]
     fn host_admission_charges_future_tables_and_prefix_once_but_not_resident_twice() -> Result<()> {
-        let memory = HostMemory { total: 1000, available: 700 };
+        let memory = (1000, 700);
         let resident = vec![Item::new(Category::Staging, "resident/table", "pinned", 300, Basis::Exact)];
         let ledger = host_admission(memory, resident, 100, &[("synthetic/table", 200)], 100, 150)?;
         assert_eq!((ledger.resident_bytes, ledger.deferred_bytes, ledger.headroom_bytes), (300, 300, 150));
@@ -194,7 +193,7 @@ mod tests {
 
     #[test]
     fn tables_and_prefix_must_be_admitted_in_one_complete_working_set() -> Result<()> {
-        let memory = HostMemory { total: 1000, available: 600 };
+        let memory = (1000, 600);
         let tables = [("synthetic/table", 300)];
         assert!(host_admission(memory, vec![], 300, &[], 0, 0).is_ok());
         assert!(host_admission(memory, vec![], 0, &tables, 0, 0).is_ok());
@@ -205,14 +204,14 @@ mod tests {
 
     #[test]
     fn host_admission_refuses_available_total_and_arithmetic_shortfalls() {
-        let memory = HostMemory { total: 1000, available: 300 };
+        let memory = (1000, 300);
         let error = host_admission(memory, vec![], 0, &[("synthetic/table", 201)], 0, 0).unwrap_err();
         assert!(error.to_string().contains("shortfall 1 bytes"), "{error}");
         let resident = vec![Item::new(Category::Staging, "resident/table", "pinned", 800, Basis::Exact)];
-        let error = host_admission(HostMemory { total: 1000, available: 1000 }, resident, 0,
+        let error = host_admission((1000, 1000), resident, 0,
             &[("synthetic/table", 101)], 0, 0).unwrap_err();
         assert!(error.to_string().contains("shortfall 1 bytes"), "{error}");
-        let memory = HostMemory { total: u64::MAX, available: u64::MAX };
+        let memory = (u64::MAX, u64::MAX);
         for (cache, tables, logits, headroom) in [
             (0, vec![("synthetic/a", u64::MAX), ("synthetic/b", 1)], 0, 0),
             (1, vec![("synthetic/a", u64::MAX)], 0, 0),
