@@ -489,7 +489,7 @@ mod draft_prefix_tests {
                 "selector_top_k":16, "target_layer_ids":[0,1], "mask_token_id":163592}});
         std::fs::write(draft.path().join("config.json"), config.to_string())?;
         for format in [cuteafd_core::MlaCacheFormat::Bf16, cuteafd_core::MlaCacheFormat::Fp8] {
-            let mut options = LayoutOptions { rtx_bytes: vec![96 << 30; 2], concurrency: 2,
+            let mut options = LayoutOptions { host_memory: Some((128 << 30, 128 << 30)), rtx_bytes: vec![96 << 30; 2], concurrency: 2,
                 mla_kv: format, prefix_slots: Some(2), host_cache_bytes: Some(0),
                 onboard: Some(crate::placement::Onboard::Layers(5)), ..Default::default() };
             let mut report = plan::plan(target.path(), &PlanOptions {
@@ -1175,8 +1175,15 @@ pub(crate) fn charge_host(report: &mut PlanReport, options: &LayoutOptions, chec
     use cuteafd_core::memory_layout::{HostLayout, ItemLifetime, host_logits_bytes};
     let Some(spec) = report.spec.as_ref() else { return Ok(()) };
     let family = report.family.as_deref().unwrap_or("");
-    let (total, available) = options.host_memory.map_or_else(
-        crate::formats::mapped_preload::host_memory, Ok)?;
+    let (total, available) = match options.host_memory {
+        Some(memory) => memory,
+        None => {
+            #[cfg(test)]
+            panic!("planner tests must inject LayoutOptions.host_memory");
+            #[cfg(not(test))]
+            crate::formats::mapped_preload::host_memory()?
+        }
+    };
     // Native plans keep only coordinator devices in their memory layout.
     let ranks = report.spark_ranks;
     let rows = report.prefill_span_rows.unwrap_or(options.prefill_rows.max(4096));

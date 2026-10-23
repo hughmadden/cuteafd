@@ -38,6 +38,8 @@ fn options(args: &PlanArgs) -> Result<PlanOptions, PlanError> {
                 return Err(PlanError::InvalidOption { option: "--rtx", reason: "1 or 2 coordinator GPUs".into() });
             }
             Ok(cuteafd_loader::plan::layout::LayoutOptions {
+                #[cfg(test)]
+                host_memory: Some((128 << 30, 128 << 30)),
                 host_cache_bytes: match args.host_cache_bytes {
                     crate::shared::prefix::HostBudget::Auto => None,
                     crate::shared::prefix::HostBudget::Bytes(bytes) => Some(bytes),
@@ -1248,7 +1250,7 @@ mod tests {
     #[test]
     fn v41_prefix_and_worker_layout_match_launch_arguments() {
         let mut args = args(std::path::Path::new("/not-read"), 4, false);
-        let mut layout = cuteafd_loader::plan::layout::LayoutOptions::default();
+        let mut layout = cuteafd_loader::plan::layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)), ..Default::default() };
         for entries in [0, 1, 20, 128] {
             let slots = cuteafd_core::prefix::mark_slots_with_host(0, entries as u64, 1, u64::MAX,
                 layout.host_cache_bytes != Some(0));

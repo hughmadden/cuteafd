@@ -492,7 +492,7 @@ mod tests {
             args.token_io.embed_placement = if host { crate::shared::token_io::EmbedPlacement::Host }
                 else { crate::shared::token_io::EmbedPlacement::Gpu };
             let report = plan(dir.path(), &PlanOptions { placement: ExpertPlacement::Local,
-                layout: Some(LayoutOptions { rtx_bytes: capacities.to_vec(),
+                layout: Some(LayoutOptions { host_memory: Some((128 << 30, 128 << 30)), rtx_bytes: capacities.to_vec(),
                     context_tokens: 131072, prefill_rows: 16, concurrency: 8, state_slots: Some(8),
                     prefix_slots: Some(0), native_mtp_layers: args.mtp, host_embedding: host,
                     qwen_attention_plan_rows: attention_rows,
@@ -562,7 +562,7 @@ mod tests {
                 let context = pool.unwrap_or(131072);
                 let report = plan(snapshot.path(), &PlanOptions {
                     placement: ExpertPlacement::Local,
-                    layout: Some(LayoutOptions { rtx_bytes: vec![capacity], context_tokens: context,
+                    layout: Some(LayoutOptions { host_memory: Some((128 << 30, 128 << 30)), rtx_bytes: vec![capacity], context_tokens: context,
                         pool_tokens: pool, qwen_kv: kv_format, concurrency: 8, state_slots: Some(8), prefix_slots: Some(0),
                         ..Default::default() }), ..Default::default()
                 })?;

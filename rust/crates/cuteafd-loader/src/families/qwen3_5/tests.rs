@@ -101,7 +101,7 @@ fn native_planner_fixture() -> (tempfile::TempDir, PlanOptions, crate::placement
     let exports = json!({"programs":programs});
     std::fs::write(&manifest, serde_json::to_vec(&exports).unwrap()).unwrap();
     let options = PlanOptions { placement: ExpertPlacement::Local, vision: plan::MediaMode::Off,
-        audio: plan::MediaMode::Off, layout: Some(plan::layout::LayoutOptions {
+        audio: plan::MediaMode::Off, layout: Some(plan::layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)),
             rtx_bytes: vec![96 << 30], concurrency: 4, prefix_slots: Some(10), native_mtp_layers: 0,
             pool_tokens: Some(262144), workspace_manifest: Some(manifest.clone()),
             dense_qwen_kv: crate::families::qwen4::Qwen4KvCache::Bf16, ..Default::default() }),

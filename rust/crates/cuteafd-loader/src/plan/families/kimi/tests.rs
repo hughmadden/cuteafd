@@ -16,7 +16,7 @@ fn snapshot(all: bool) -> tempfile::TempDir {
 
 fn with_layout(ranks: usize, budget: Option<u64>) -> PlanOptions {
     PlanOptions { placement: ExpertPlacement::from_spark_ranks(ranks), spark_budget_bytes: budget,
-        layout: Some(layout::LayoutOptions { rtx_bytes: vec![crate::placement::inventory::PRO_TOTAL_BYTES; 2],
+        layout: Some(layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)), rtx_bytes: vec![crate::placement::inventory::PRO_TOTAL_BYTES; 2],
             // The text card retains device snapshots; host spilling is disabled.
             host_cache_bytes: Some(0), spark_allocation_budget_bytes: budget, ..Default::default() }), ..Default::default() }
 }
@@ -167,7 +167,7 @@ fn release_headers_classify_native_text_without_installed_artifacts() {
 #[test]
 fn planned_headers_supply_range_geometry_without_claiming_fit() {
     let dir = snapshot(false);
-    let columns = PlanInput::open(dir.path()).unwrap().spark_ranges(&PlanOptions::default()).unwrap();
+    let columns = PlanInput::open(dir.path()).unwrap().spark_ranges(&PlanOptions { layout: Some(layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)), ..Default::default() }), ..Default::default() }).unwrap();
     assert_eq!(columns.len(), 2);
     for column in columns {
         assert_eq!(column.package, PACKAGE);
@@ -528,11 +528,11 @@ fn default_context_follows_the_checkpoint_core() -> Result<()> {
         assert_eq!(default_context(&Model::open(&checkpoint)?.core), expected);
         // The planner's unset context selects the same extent; an explicit one wins.
         let report = plan::plan(dir, &PlanOptions { placement: ExpertPlacement::Sparks { ranks: 6 },
-            layout: Some(plan::layout::LayoutOptions { rtx_bytes: vec![96 << 30; 2], ..Default::default() }), ..Default::default() })?;
+            layout: Some(plan::layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)), rtx_bytes: vec![96 << 30; 2], ..Default::default() }), ..Default::default() })?;
         let notes = report.memory_layout.as_ref().map(|m| m.notes.join("\n")).unwrap_or_default();
         assert!(notes.contains(&format!("Kimi API max context: {expected} tokens")), "{notes}");
         let explicit = plan::plan(dir, &PlanOptions { placement: ExpertPlacement::Sparks { ranks: 6 },
-            layout: Some(plan::layout::LayoutOptions { rtx_bytes: vec![96 << 30; 2], context_tokens: 262_144, ..Default::default() }),
+            layout: Some(plan::layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)), rtx_bytes: vec![96 << 30; 2], context_tokens: 262_144, ..Default::default() }),
             ..Default::default() })?;
         let notes = explicit.memory_layout.as_ref().map(|m| m.notes.join("\n")).unwrap_or_default();
         assert!(notes.contains("Kimi API max context: 262144 tokens"), "{notes}");

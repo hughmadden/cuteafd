@@ -1148,7 +1148,7 @@ pub(super) mod tests {
             let marks = prefix_slots.unwrap_or_else(|| rule.slots(usize::try_from(mark_bytes).unwrap()) as u64);
             assert_eq!(marks, if entries == 0 { 0 } else if rule.host { 2 } else { 1 });
             let options = PlanOptions { placement: ExpertPlacement::Sparks { ranks: 6 },
-                layout: Some(LayoutOptions { rtx_bytes: vec![capacity; 2], prefill_rows: rows as u64 / 2, prefill_lanes: 2,
+                layout: Some(LayoutOptions { host_memory: Some((128 << 30, 128 << 30)), rtx_bytes: vec![capacity; 2], prefill_rows: rows as u64 / 2, prefill_lanes: 2,
                     concurrency: slots, state_slots: Some(slots), prefix_slots,
                     mimo_prefix_entries: entries as u64, mimo_prefix_mark_bytes: rule.budget_bytes,
                     context_tokens: context as u64, host_cache_bytes, mla_kv: format,
@@ -1251,7 +1251,7 @@ pub(super) mod tests {
                 }
                 let admitted = admit(i)?;
                 let mut options = PlanOptions { placement: ExpertPlacement::Sparks { ranks: 6 },
-                    layout: Some(LayoutOptions { rtx_bytes: vec![96 << 30; 2], concurrency: 2,
+                    layout: Some(LayoutOptions { host_memory: Some((128 << 30, 128 << 30)), rtx_bytes: vec![96 << 30; 2], concurrency: 2,
                         mla_kv: format, context_tokens: context, pool_tokens: Some(context), prefix_slots: Some(2),
                         host_cache_bytes: Some(0), onboard: Some(Onboard::Layers(5)), ..Default::default() }),
                     ..Default::default() };
@@ -1302,7 +1302,7 @@ pub(super) mod tests {
             assert!(solve(&request)?.pool_tokens > request.pool.floor);
             let report = plan::plan(snapshot.path(), &PlanOptions {
                 placement: ExpertPlacement::Sparks { ranks: 6 },
-                layout: Some(LayoutOptions { rtx_bytes: vec![96 << 30; 2], concurrency: 2,
+                layout: Some(LayoutOptions { host_memory: Some((128 << 30, 128 << 30)), rtx_bytes: vec![96 << 30; 2], concurrency: 2,
                     mla_kv: format, prefix_slots: Some(2), host_cache_bytes: Some(0),
                     onboard: Some(Onboard::Layers(5)), ..Default::default() }),
                 ..Default::default()

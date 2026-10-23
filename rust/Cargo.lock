@@ -829,6 +829,7 @@ dependencies = [
  "base64 0.22.1",
  "claxon",
  "cuteafd-core",
+ "cuteafd-ffi",
  "daachorse",
  "hound",
  "image",
