@@ -758,7 +758,7 @@ fn glm5_layout_publishes_an_explicit_span_without_charging_it() {
     let plan_with = |span| {
         let options = layout::LayoutOptions { rtx_bytes: vec![96 << 30], context_tokens: 65536,
             prefill_rows: 4096, prefill_lanes: 2, prefill_span_rows: span, glm5_drafter_disabled: true,
-            ..Default::default() };
+            host_memory: Some((128 << 30, 128 << 30)), ..Default::default() };
         plan(dir.path(), &PlanOptions { layout: Some(options),
             attention_placement: Some(crate::placement::AttentionPlacement::Heads), ..sparks(4) }).unwrap()
     };
