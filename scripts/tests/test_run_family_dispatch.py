@@ -160,6 +160,23 @@ def test_v4_rejects_removed_draft_switches_as_unknown_keys(tmp_path: Path, key: 
     assert f"unknown configuration key: {key}" in result.stderr
 
 
+@pytest.mark.parametrize("rows,waves", [(4096, 2), (2048, 1), (512, 3)])
+def test_v4_prefill_units_reach_plan_serve_and_container(tmp_path: Path, rows: int, waves: int) -> None:
+    result = _family_launch_result(tmp_path, {"model_type": "deepseek_v4"}, "test/model",
+        f"RTX_GPUS=1\nSPECULATOR=off\nVISION=off\nAUDIO=off\nPREFILL_ROWS={rows}\n"
+        f"PREFILL_WAVES={waves}\nPREFILL_SPAN_ROWS=16384\n")
+    assert result.returncode == 0, result.stderr
+    plan = next(line for line in result.stderr.splitlines() if "cuteafd plan" in line)
+    assert f"--prefill-rows {rows}" in plan
+    assert f"--prefill-waves {waves}" in plan
+    assert "--prefill-lanes" not in plan
+    serve = next(line for line in result.stderr.splitlines() if "serve-dsv4" in line)
+    assert f"--prefill-rows {rows}" in serve
+    assert f"--prefill-waves {waves}" in serve
+    assert "CUTEAFD_PREFILL_SPAN_ROWS=16384" in result.stderr
+    assert "--prefill-lanes" not in serve
+
+
 @pytest.mark.parametrize("value", [None, "auto", "1", "8", "64"])
 @pytest.mark.parametrize("config,model", [
     ({"model_type": "glm_moe_dsa", "num_hidden_layers": 4, "first_k_dense_replace": 3}, "zai-org/GLM-5.3"),
@@ -805,8 +822,8 @@ placement_ready = report.get("placement_supported", True) and report.get("fits",
 shared = family in {"step5", "kimi_k3"}
 glm = family == "glm5"
 unit = int(value("--prefill-rows", "0")) or (2048 if shared else 4096)
-waves = 1 if glm and ranks == 0 else int(value("--prefill-waves", "0")) or (2 if shared or glm else 1)
-span = int(value("--prefill-span-rows", "0")) or 16384 if glm else unit * waves
+waves = 1 if glm and ranks == 0 else int(value("--prefill-waves", "0")) or (2 if shared or glm or family == "deepseek_v4" else 1)
+span = int(value("--prefill-span-rows", "0")) or 16384 if glm or family == "deepseek_v4" else unit * waves
 report.update(prefill_unit_rows=unit, prefill_waves=waves, prefill_span_rows=span, prefill_transports=1)
 deployment = dict(version=1, family=family, executable=family != "qwen3_5" and placement_ready, wip_launchable=placement_ready, rtx_gpus=gpus, spark_ranks=ranks,
     topology=dict(tp=tp, ep=ep,
@@ -872,6 +889,7 @@ print(json.dumps(deployment))
     ({"model_type": "qwen4_exp", "text_config": {"num_hidden_layers": 2,
       "mtp_num_hidden_layers": 1, "layer_types": ["linear_attention", "full_attention"]}},
      "test/Qwen4", "PREFILL_ROWS", 1, 4),
+    ({"model_type": "deepseek_v4", "num_hidden_layers": 61}, "test/V4", "PREFILL_ROWS", 1, 4),
 ])
 @pytest.mark.parametrize("explicit", [False, True])
 def test_shared_prefill_launcher_forwards_resolved_units_without_span(
@@ -883,7 +901,7 @@ def test_shared_prefill_launcher_forwards_resolved_units_without_span(
                     for rank in range(1, ranks))
     if explicit:
         keys += f"{row_key}=1024\nPREFILL_WAVES=2\n"
-    unit, waves = (1024, 2) if explicit else (2048, 2)
+    unit, waves = (1024, 2) if explicit else (4096 if family_config["model_type"] == "deepseek_v4" else 2048, 2)
     result = _family_launch_result(tmp_path, family_config, model, keys,
         extra_args=("--wip", "prefill-shape"),
         encoder_plan={"placement_supported": True, "fits": True, "spark_budget_bytes": 108 << 30},
@@ -896,7 +914,7 @@ def test_shared_prefill_launcher_forwards_resolved_units_without_span(
         assert plan[plan.index("--prefill-rows") + 1] == str(unit)
         assert plan[plan.index("--prefill-waves") + 1] == str(waves)
     assert "--prefill-lanes" not in plan
-    command_name = {"kimi_k3": "serve-kimi", "qwen4_exp": "serve-qwen4"}.get(
+    command_name = {"kimi_k3": "serve-kimi", "qwen4_exp": "serve-qwen4", "deepseek_v4": "serve-dsv4"}.get(
         family_config["model_type"], "serve-step5")
     serve = next(shlex.split(line) for line in result.stderr.splitlines()
                  if "docker run -d" in line and command_name in line)
@@ -909,7 +927,6 @@ def test_shared_prefill_launcher_forwards_resolved_units_without_span(
 
 
 @pytest.mark.parametrize("family_config", [
-    {"model_type": "deepseek_v4", "num_hidden_layers": 61},
     {"model_type": "mimo_v2_flash", "num_hidden_layers": 2, "moe_layer_freq": [0, 1]},
 ])
 def test_legacy_prefill_launcher_does_not_forward_typed_shape(tmp_path: Path, family_config: dict) -> None:
