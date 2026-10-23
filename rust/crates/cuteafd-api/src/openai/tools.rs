@@ -42,6 +42,7 @@ pub(super) enum ToolSyntax {
     QwenXml,
     /// Kimi XTML; assisted decoding uses its native JSON-object call form.
     KimiXtml,
+    MiniMaxM3,
 }
 
 pub(super) struct ToolConstraints {
@@ -71,6 +72,7 @@ impl ToolConstraints {
                 .with_context(|| format!("invalid parameters for tool {}", tool.name))?) } else { None };
             validators.insert(tool.name.clone(), validator);
             tags.push(match syntax {
+                ToolSyntax::MiniMaxM3 => super::minimax_m3::grammar::invocation(&tool.name),
                 ToolSyntax::KimiXtml => json!({"type":"tag",
                     "begin":format!("<|open|>call tool=\"{}\" index=\"", tool.name.replace('&', "&amp;").replace('"', "&quot;")),
                     "content":{"type":"sequence", "elements":[
@@ -101,6 +103,7 @@ impl ToolConstraints {
             return Ok(Some(Self { required, format: None, triggered: None, parallel, validators }));
         }
         let (format, triggered) = match syntax {
+            ToolSyntax::MiniMaxM3 => super::minimax_m3::grammar::calls(tags, parallel),
             ToolSyntax::KimiXtml => {
                 let calls = json!({"type":"tag", "begin":"<|open|>tools<|sep|>",
                     "content":{"type":"tags_with_separator", "tags":tags, "separator":"",
