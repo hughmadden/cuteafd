@@ -1344,6 +1344,28 @@ def test_glm53_honors_explicit_tp2_expert_limit(tmp_path, value):
         assert f"--rtx-expert-layers {expected}" in launch
 
 
+@pytest.mark.parametrize("value", [None, "16384", "8192"])
+def test_glm53_forwards_shared_prefill_span_rows(tmp_path, value):
+    keys = "" if value is None else f"PREFILL_SPAN_ROWS={value}\n"
+    result = _family_launch_result(tmp_path, {
+        "model_type": "glm_moe_dsa", "num_hidden_layers": 9, "first_k_dense_replace": 3,
+    }, "test/glm", keys)
+    assert result.returncode == 0, result.stderr
+    launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-glm " in line)
+    if value is None:
+        assert "CUTEAFD_PREFILL_SPAN_ROWS" not in launch
+    else:
+        assert f"CUTEAFD_PREFILL_SPAN_ROWS={value}" in launch
+
+
+def test_glm53_refuses_a_malformed_prefill_span(tmp_path):
+    result = _family_launch_result(tmp_path, {
+        "model_type": "glm_moe_dsa", "num_hidden_layers": 9, "first_k_dense_replace": 3,
+    }, "test/glm", "PREFILL_SPAN_ROWS=0\n")
+    assert result.returncode != 0
+    assert "PREFILL_SPAN_ROWS" in result.stderr
+
+
 def test_glm53_all_local_two_rtx_launch_has_no_spark_peers(tmp_path):
     result = _family_launch_result(tmp_path, {
         "model_type": "glm_moe_dsa", "num_hidden_layers": 4, "first_k_dense_replace": 3,

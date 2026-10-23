@@ -284,6 +284,7 @@ EOF
       cat <<'EOF'
 PREFILL_ROWS
 PREFILL_WAVES
+PREFILL_SPAN_ROWS
 EXLR8_MANIFEST
 EXLR8_DENSE_FROM
 RTX_EXPERT_PEER
@@ -2562,7 +2563,13 @@ case "$family" in
     if [[ "$ranks" == 0 ]]; then
       selected_lanes=1
     fi
-    lane_env_args+=(-e "CUTEAFD_GLM_PREFILL_LANES=$selected_lanes") ;;
+    lane_env_args+=(-e "CUTEAFD_GLM_PREFILL_LANES=$selected_lanes")
+    # PREFILL_SPAN_ROWS: rows per continuous prefill span (shared prefill key).
+    span_rows="$(get PREFILL_SPAN_ROWS)"
+    if [[ -n "$span_rows" ]]; then
+      [[ "$span_rows" =~ ^[1-9][0-9]*$ ]] || { echo "PREFILL_SPAN_ROWS must be a positive row count" >&2; exit 2; }
+      lane_env_args+=(-e "CUTEAFD_PREFILL_SPAN_ROWS=$span_rows")
+    fi ;;
   glm5_flash)
     # Planner and server must offer the same conditional drafter homes.
     # Explicit config overrides the legacy process-wide diagnostic switch.

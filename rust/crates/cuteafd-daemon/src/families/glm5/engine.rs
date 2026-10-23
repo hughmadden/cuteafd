@@ -1132,8 +1132,8 @@ impl<'a> GlmEngine<'a> {
         let put = |dev: &Dev<'_>, bytes: &[u8]| -> Result<()> {
             ensure!(bytes.len() <= dev.buffer.bytes, "table exceeds its buffer");
             // SAFETY: a live buffer of this rank; ordered after earlier readers on its stream.
-            self.on(rank, || unsafe { self.library.copy_h2d_ordered(
-                cuteafd_ffi::CuteafdDeviceBuffer { bytes: bytes.len(), ..dev.buffer }, bytes, stream) })
+            // The whole buffer: its ordered staging is sized once, never regrown mid-call.
+            self.on(rank, || unsafe { self.library.copy_h2d_ordered(dev.buffer, bytes, stream) })
         };
         put(&w.positions, bytes_of(&tables.positions))?;
         put(&w.slots, bytes_of(&tables.slots))?;
@@ -1845,9 +1845,8 @@ impl<'a> GlmEngine<'a> {
                 }
             }
             self.embedding.embed(chunks[unit], w.ids.buffer, 1, w.h.buffer, self.stream)?;
-            if let Some(peers) = &peer_workspaces {
-                self.exchange()?.push_to(0, DIRECT, w.h.buffer.ptr, peers.get(slot)?.h.buffer.ptr, bytes_of_unit(unit))?;
-            }
+            // The rank-1 entry copy is published in this unit's first attention,
+            // next to its DIRECT wait: Begin admits several slots before any attention.
             Ok(())
         };
         let attention = |index: usize, unit: usize| -> Result<()> {
@@ -1855,6 +1854,11 @@ impl<'a> GlmEngine<'a> {
             // Both ranks' context attention below read this unit's gather/commit plan.
             self.context_unit.set(unit);
             if let Some(peers) = &peer_workspaces {
+                if index == 0 {
+                    // Publish the DIRECT mailbox only here, right before rank 1's wait on it.
+                    self.exchange()?.push_to(0, DIRECT, workspaces[slot].h.buffer.ptr, peers.get(slot)?.h.buffer.ptr,
+                        bytes_of_unit(unit))?;
+                }
                 self.peer_attention(index, slot, peers.get(slot)?, rows_of(unit), cap,
                     &ranked[unit], bytes_of_unit(unit))?;
             }
@@ -2512,5 +2516,24 @@ mod prefill_unit_tests {
         assert!(set < peer && set < own, "the plan is selected before either rank's attention");
         let tables = source.split("fn step_tables(").nth(1).unwrap().split("\n    }\n").next().unwrap();
         assert!(tables.contains("self.context_unit.set(usize::MAX)"), "single-pass steps reset the unit cursor");
+    }
+
+    #[test]
+    fn unit_entry_is_published_in_its_first_attention_not_at_begin() {
+        // The schedule emits Begin for every live slot before any attention; one
+        // DIRECT flag sequence serves all slots, so an entry pushed at Begin could
+        // satisfy an earlier unit's wait. Publish beside rank 1's wait instead.
+        let source = include_str!("engine.rs");
+        let begin = source.split("let begin = |unit: usize|").nth(1).unwrap()
+            .split("let attention = |index: usize, unit: usize|").next().unwrap();
+        assert!(!begin.contains("DIRECT"), "Begin publishes no DIRECT mailbox");
+        let attention = source.split("let attention = |index: usize, unit: usize|").nth(1).unwrap()
+            .split("let post = |index").next().unwrap();
+        let first = attention.find("if index == 0 {").expect("first-layer entry publish");
+        let push = attention.find("push_to(0, DIRECT").expect("unit entry pushed in attention");
+        let wait = attention.find("self.peer_attention(").expect("rank 1 waits in peer_attention");
+        assert!(first < push && push < wait, "entry push precedes rank 1's wait, inside the first layer only");
+        let peer = source.split("fn peer_attention(").nth(1).unwrap().split("\n    }\n").next().unwrap();
+        assert!(peer.find("exchange.wait(1, DIRECT)").is_some_and(|w| w < peer.find("attention_unit(1,").unwrap()));
     }
 }

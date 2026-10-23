@@ -187,7 +187,9 @@ impl<'a> GlmEngine<'a> {
             let local = local_pages(&pages[..history], owner)?;
             *shard = local.len();
             if !local.is_empty() {
-                upload(view(&own.gather, owner * half * 4, local.len() * 4)?, bytes_of(&local))?;
+                // The owner's whole list region: ordered uploads size their staging
+                // once per destination and never regrow it mid-call.
+                upload(view(&own.gather, owner * half * 4, half * 4)?, bytes_of(&local))?;
             }
         }
         let limit = context_commit_pages(self.prefill_rows as u64) as usize;
