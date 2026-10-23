@@ -201,28 +201,21 @@ pub(crate) fn run_plan(mut args: PlanArgs) -> Result<()> {
     if cuteafd_loader::plan::exlr8::recognizes(&snapshot)? {
         if args.spark_range {
             return Err(PlanError::InvalidOption { option: "--spark-range", reason:
-                "EXLR8 range geometry requires its native manifest and dense companion planner".into() }.into());
+                "EXLR8 range geometry requires its native manifest planner".into() }.into());
         }
         anyhow::ensure!(!(args.files || args.fetch || args.role.is_some()),
             "EXLR8 file manifests and fetching are not supported");
-        let dense = args.exlr8_dense_from.as_deref().map(|source| -> Result<PathBuf> {
-            if PathBuf::from(source).is_dir() { return Ok(PathBuf::from(source)); }
-            let home = args.hf_home.clone().unwrap_or_else(default_hf_home);
-            resolve_snapshot_at_revision(source, Some(&home), None)?.snapshot_path
-                .with_context(|| format!("no local snapshot for dense source {source}"))
-        }).transpose()?;
         if args.layout {
             use cuteafd_loader::plan::deployment::{AdmissionArgs, DeploymentOptions, DeploymentSpec};
             anyhow::ensure!(args.spark_tp.is_none() && args.spark_ep.is_none(),
                 "EXLR8 requires canonical Spark wire, not explicit ownership topology");
-            let dense = dense.as_deref().context("EXLR8 native layout requires --exlr8-dense-from")?;
             let cfg = launch_config(args.config.as_deref())?;
             resolve_speculator(&mut args, &snapshot, "glm5", &cfg)?;
             let mut native_options = options.clone();
             native_options.placement = ExpertPlacement::from_spark_ranks(args.spark_ranks.unwrap_or(args.available_sparks));
             let native = cuteafd_loader::plan::exlr8::native_plan(&snapshot,
                 args.exlr8_manifest.as_deref().context("EXLR8 native layout requires --exlr8-manifest up1|bit325")?,
-                dense, &native_options, &args.speculator)?;
+                &native_options, &args.speculator)?;
             if args.deployment {
                 let deployment = DeploymentOptions { rtx_gpus: args.rtx, spark_tp: None, spark_ep: None,
                     peers: args.deployment_peers.clone(), speculator: args.speculator.clone(),
@@ -237,7 +230,7 @@ pub(crate) fn run_plan(mut args: PlanArgs) -> Result<()> {
             return Ok(());
         }
         let report = cuteafd_loader::plan::exlr8::inspect(&snapshot,
-            args.exlr8_manifest.as_deref().unwrap_or("bit325"), dense.as_deref(),
+            args.exlr8_manifest.as_deref().unwrap_or("bit325"),
             args.spark_ranks.unwrap_or(args.available_sparks), args.rtx,
             options.spark_budget(), options.coordinator_budget_bytes)?;
         if args.json { println!("{}", serde_json::to_string_pretty(&report)?); }
@@ -245,8 +238,8 @@ pub(crate) fn run_plan(mut args: PlanArgs) -> Result<()> {
         anyhow::ensure!(!args.require_ready, "EXLR8 is unsupported: add the kernels listed in the plan");
         return Ok(());
     }
-    anyhow::ensure!(args.exlr8_manifest.is_none() && args.exlr8_dense_from.is_none(),
-        "--exlr8-manifest/--exlr8-dense-from require an EXLR8 checkpoint");
+    anyhow::ensure!(args.exlr8_manifest.is_none(),
+        "--exlr8-manifest requires an EXLR8 checkpoint");
     let inventory = cuteafd_loader::plan::Checkpoint::inventory(&snapshot)?;
     let family = cuteafd_loader::plan::family::detect(&inventory).map_or("", |family| family.id());
     validate_glmf_precision(&args, family)?;
@@ -762,7 +755,6 @@ mod tests {
         ] {
             let mut request = args(dir.path(), 4, false);
             request.exlr8_manifest = Some("up1".into());
-            request.exlr8_dense_from = Some(dir.path().display().to_string());
             // Stop before checkpoint payload validation after speculator admission succeeds.
             request.embedding_placement = Some(crate::shared::token_io::EmbedPlacement::Host);
             request.speculator = selected.into();
@@ -823,7 +815,6 @@ mod tests {
         PlanArgs {
             draft_kv_cache: cuteafd_loader::families::qwen4::Qwen4KvCache::Bf16,
             exlr8_manifest: None,
-            exlr8_dense_from: None,
             mapped_scale_preload_gib: 0.0,
             vision_replicas: 1,
             vision: cuteafd_loader::plan::MediaMode::Auto,

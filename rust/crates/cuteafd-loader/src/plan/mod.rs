@@ -520,10 +520,8 @@ fn plan_of(input: &PlanInput, options: &PlanOptions) -> Result<PlanReport, PlanE
     Ok(report)
 }
 
-fn plan_unrestricted(input: &PlanInput, options: &PlanOptions) -> Result<PlanReport, PlanError> {
-    options.validate()?;
-    let checkpoint = input.checkpoint();
-    let mut report = PlanReport {
+pub(crate) fn empty_report(checkpoint: &Checkpoint, options: &PlanOptions) -> anyhow::Result<PlanReport> {
+    Ok(PlanReport {
         mapped_placement: Default::default(),
         host_budget_bytes: 0,
         host_ledger: None,
@@ -574,7 +572,13 @@ fn plan_unrestricted(input: &PlanInput, options: &PlanOptions) -> Result<PlanRep
         hints: Vec::new(),
         memory_layout: None,
         solver_placement: None,
-    };
+    })
+}
+
+fn plan_unrestricted(input: &PlanInput, options: &PlanOptions) -> Result<PlanReport, PlanError> {
+    options.validate()?;
+    let checkpoint = input.checkpoint();
+    let mut report = empty_report(checkpoint, options)?;
     // ModelOpt exports describe what they quantized; each weight's tensors
     // must agree with that description.
     let modelopt = match crate::formats::modelopt::ModelOpt::read(&checkpoint.snapshot, &checkpoint.config) {

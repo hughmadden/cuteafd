@@ -39,6 +39,9 @@ pub(crate) struct GlmLayer<'a> {
     /// Whole attention and its cache exist only on this rank when present.
     pub attention_owner: Option<u8>,
     operands: HashMap<&'static str, DeviceAllocation<'a>>,
+    /// The EXLR8 checkpoint's own dense operands (`native_dense::key`), when
+    /// the layer runs natively; empty on the official path.
+    pub(crate) native: HashMap<String, DeviceAllocation<'a>>,
 }
 
 /// The `{w}_fp8` / `{w}_scale` operand names of an FP8 weight, and its
@@ -69,14 +72,72 @@ impl GlmLayer<'_> {
 
     /// Device bytes of the layer's operands.
     pub fn bytes(&self) -> usize {
-        self.operands.values().map(|a| a.buffer.bytes).sum()
+        self.operands.values().chain(self.native.values()).map(|a| a.buffer.bytes).sum()
     }
+
+    /// A native operand's device buffer.
+    pub fn native(&self, key: &str) -> Result<CuteafdDeviceBuffer> {
+        Ok(self.native.get(key).with_context(|| format!("layer has no native operand {key}"))?.buffer)
+    }
+
+    /// The native encoding of `projection` (from its stored components).
+    pub fn native_encoding(&self, projection: &str) -> Result<cuteafd_loader::plan::exlr8::dense::DenseEncoding> {
+        use cuteafd_loader::plan::exlr8::dense::DenseEncoding;
+        let has = |c: &str| self.native.contains_key(&super::native_dense::key(projection, c));
+        Ok(if has("trellis") { DenseEncoding::Trellis { bits: 4 } } else if has("q4") { DenseEncoding::Int4G32 }
+            else if has("e8m0") { DenseEncoding::Mxfp8 } else if has("bf16") { DenseEncoding::Bf16 }
+            else { anyhow::bail!("layer has no native {projection}") })
+    }
+
+    /// Whether the layer runs the checkpoint's native dense operands.
+    pub fn is_native(&self) -> bool { !self.native.is_empty() }
 }
 
 pub(crate) struct GlmWeights<'a> {
     pub layers: Vec<GlmLayer<'a>>,
     pub norm: DeviceAllocation<'a>,
-    pub head: DeviceAllocation<'a>,
+    pub head: GlmHead<'a>,
+}
+
+/// The vocabulary head rank 0 owns: the checkpoint's BF16 head (the shared
+/// tensor-core route), or an EXLR8 checkpoint's row-FP8 head (its own program).
+pub(crate) enum GlmHead<'a> {
+    Bf16(DeviceAllocation<'a>),
+    /// Shared with the token embedding (one rank-0 owner of both tables).
+    RowFp8(std::rc::Rc<crate::shared::token_io::native::NativeVocabulary<'a>>),
+}
+
+impl<'a> GlmHead<'a> {
+    /// Device bytes of the head (and, for row-FP8, the embedding the same owner holds).
+    pub fn bytes(&self) -> usize {
+        match self { Self::Bf16(head) => head.buffer.bytes, Self::RowFp8(owner) => owner.bytes() }
+    }
+
+    /// The device range the L2 prefetch reads after the last layer.
+    pub fn range(&self) -> crate::shared::l2_prefetch::Range {
+        match self {
+            Self::Bf16(head) => (head.buffer.ptr.cast_const(), head.buffer.bytes),
+            Self::RowFp8(owner) => (owner.head.payload().ptr.cast_const(), owner.head.payload().bytes),
+        }
+    }
+
+    /// The BF16 head, for diagnostics that read it directly.
+    pub fn bf16(&self) -> Result<&DeviceAllocation<'a>> {
+        match self { Self::Bf16(head) => Ok(head),
+            Self::RowFp8(_) => anyhow::bail!("this diagnostic reads a BF16 head; the EXLR8 checkpoint's head is row-FP8") }
+    }
+
+    /// The head the DFlash2 drafter borrows (its only resident copy).
+    pub fn target(&self) -> crate::shared::speculation::dflash::TargetHead<'_> {
+        use crate::shared::speculation::dflash::TargetHead;
+        match self {
+            Self::Bf16(head) => TargetHead::Bf16(head),
+            // SAFETY (inside): the drafter passes its live normed rows and logits on its stream.
+            Self::RowFp8(owner) => TargetHead::Launch(Box::new(move |x, logits, rows, stream| unsafe {
+                owner.head_logits(x, logits, rows, stream)
+            })),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -840,7 +901,8 @@ impl<'a> GlmLoader<'a> {
                 && operands.contains_key("w_down_tscale")),
                 "{mlp}: declared W8A8 needs native per-tensor activation scales");
         }
-        Ok(ops.into_iter().map(|operands| GlmLayer { dense, full_indexer, mlp_numerics, split: ranks > 1, attention_split: ranks > 1 && owner.is_none(), attention_owner: owner, operands }).collect())
+        Ok(ops.into_iter().map(|operands| GlmLayer { dense, full_indexer, mlp_numerics, split: ranks > 1, attention_split: ranks > 1 && owner.is_none(), attention_owner: owner, operands,
+            native: HashMap::new() }).collect())
     }
 
     /// Layers `0..layers` (all of them unless the caller stops early): rank 0's
@@ -863,10 +925,75 @@ impl<'a> GlmLoader<'a> {
         let weights = GlmWeights {
             layers: shares.next().context("rank 0")?,
             norm: self.one("model.norm.weight")?,
-            head: self.one("lm_head.weight")?,
+            head: GlmHead::Bf16(self.one("lm_head.weight")?),
         };
         crate::shared::memory::staging::release_staging();
         split.log("glm5 dense");
+        Ok((weights, shares.collect()))
+    }
+
+    /// An EXLR8 checkpoint's own dense operands (no official snapshot):
+    /// `records[rank]` for each head-split rank, filled through `load` (mount
+    /// now, or recorded for the push group), the final norm on rank 0 and the
+    /// row-FP8 `vocabulary` owner (shared with the token embedding) as the head.
+    /// Routed experts and the shared expert stay on their native owners.
+    #[allow(clippy::type_complexity)]
+    pub fn native_model(&self, cfg: &GlmDsaConfig, layers: usize,
+        records: &[super::native_dense::NativeDenseRecords], load: &crate::shared::experts::rtx::dense::DenseLoad<'a>,
+        vocabulary: std::rc::Rc<crate::shared::token_io::native::NativeVocabulary<'a>>)
+        -> Result<(GlmWeights<'a>, Vec<Vec<GlmLayer<'a>>>)> {
+        let ranks = self.ranks();
+        ensure!(records.len() == ranks && cfg.heads % ranks == 0, "native GLM records per coordinator rank");
+        let split = crate::shared::memory::load_timing::Split::start();
+        let heads = cfg.heads / ranks;
+        let mut shares: Vec<Vec<GlmLayer<'a>>> = (0..ranks).map(|_| Vec::new()).collect();
+        for layer in 0..layers.min(cfg.layers) {
+            for (rank, share) in shares.iter_mut().enumerate() {
+                let layer_records = records[rank].layers.get(layer).context("native layer records")?;
+                let part = self.on_rank(rank, |stream| -> Result<GlmLayer<'a>> {
+                    let _memory_format = cuteafd_ffi::memory_ledger::format("native");
+                    let mut native = super::native_dense::load_layer(self.library, load, layer_records, cfg.heads,
+                        rank * heads, heads, cfg.qk_nope_head_dim, cfg.v_head_dim, cfg.kv_lora_rank, stream)?;
+                    let p = format!("model.layers.{layer}");
+                    let mut operands: HashMap<&'static str, DeviceAllocation<'a>> = HashMap::new();
+                    for (key, name) in [("w_uk_fp8", "w_uk_fp8"), ("w_uk_scale", "w_uk_scale"), ("w_uv_fp8", "w_uv_fp8"),
+                        ("w_uv_scale", "w_uv_scale")] {
+                        operands.insert(key, native.remove(name).context("native kv_b split")?);
+                    }
+                    for (key, tensor) in [("input_norm", "input_layernorm.weight"), ("post_norm", "post_attention_layernorm.weight"),
+                        ("q_a_norm", "self_attn.q_a_layernorm.weight"), ("kv_a_norm", "self_attn.kv_a_layernorm.weight"),
+                        ("k_norm_w", "self_attn.indexer.k_norm.weight"), ("k_norm_b", "self_attn.indexer.k_norm.bias"),
+                        ("gate.bias", "mlp.gate.e_score_correction_bias")] {
+                        if let Some(allocation) = native.remove(&format!("{p}.{tensor}")) { operands.insert(key, allocation); }
+                    }
+                    // The router (BF16 record) on rank 0, as on the official path.
+                    if let Some(gate) = native.remove(&super::native_dense::key("router", "bf16")) {
+                        operands.insert("gate", gate);
+                    }
+                    let dense = layer < cfg.first_moe_layer;
+                    ensure!(operands.contains_key("input_norm") && operands.contains_key("post_norm")
+                        && (dense || rank != 0 || (operands.contains_key("gate") && operands.contains_key("gate.bias"))),
+                        "{p}: native layer operands incomplete on rank {rank}");
+                    Ok(GlmLayer { dense, full_indexer: cfg.indexers[layer] == GlmIndexer::Full,
+                        mlp_numerics: cuteafd_loader::plan::checkpoint::ModuleNumerics::CheckpointPrecision,
+                        split: ranks > 1, attention_split: ranks > 1, attention_owner: None, operands, native })
+                })?;
+                share.push(part);
+            }
+        }
+        let norm = {
+            let component = &records[0].norm;
+            let allocation = DeviceAllocation::new(self.library, component.source.bytes.max(256))?;
+            load.operand(crate::shared::experts::rtx::dense::Operand { device: self.library.cuda_get_device()?,
+                buffer: allocation.buffer, bytes: component.source.bytes,
+                lands: vec![(crate::shared::experts::rtx::dense::Rect { name: "model.norm.weight".into(),
+                    path: component.source.path.clone(), base: component.source.offset, row_bytes: component.source.bytes,
+                    rows: 0..1, cols: 0..component.source.bytes }, 0)] })?;
+            allocation
+        };
+        let mut shares = shares.into_iter();
+        let weights = GlmWeights { layers: shares.next().context("rank 0")?, norm, head: GlmHead::RowFp8(vocabulary) };
+        split.log("glm5 native dense");
         Ok((weights, shares.collect()))
     }
 }

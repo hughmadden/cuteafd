@@ -36,7 +36,9 @@ fn geometry(spec: &ProgramSpec) -> Result<DenseGeometry> {
         .name
         .strip_prefix("exlr8_dense_")
         .ok_or_else(|| invalid("program is not a native dense operand"))?;
-    let (encoding, k, n, side) = match name {
+    let bf16_input = name.ends_with("_bf16");
+    let shape = name.strip_suffix("_bf16").unwrap_or(name);
+    let (encoding, k, n, side) = match shape {
         "trellis_q_b" => (Encoding::Trellis, 2048, 16384, 1),
         "trellis_o" => (Encoding::Trellis, 16384, 6144, 2),
         "trellis_gate_up" => (Encoding::Trellis, 6144, 12288, 1),
@@ -62,6 +64,9 @@ fn geometry(spec: &ProgramSpec) -> Result<DenseGeometry> {
             )));
         }
     };
+    if bf16_input && encoding != Encoding::Trellis {
+        return Err(invalid("BF16 core suffix requires trellis encoding"));
+    }
     let g = &spec.geometry;
     let field = |key: &str, expected| -> Result<()> {
         if g[key].as_u64() != Some(expected) {
@@ -86,6 +91,10 @@ fn geometry(spec: &ProgramSpec) -> Result<DenseGeometry> {
         field("sharded_side", side)?;
         field("ctas_per_sm", 4)?;
         if encoding == Encoding::Trellis {
+            let expected_dtype = if bf16_input { "bf16" } else { "f16" };
+            if g["input_dtype"].as_str().unwrap_or("f16") != expected_dtype {
+                return Err(invalid("native trellis input dtype disagrees with program name"));
+            }
             field("bits", 4)?;
             field("rotation_count", 4)?;
             field("split_k_blocks", 8)?;
@@ -137,6 +146,13 @@ impl DenseGeometry {
         } else {
             0
         })
+    }
+
+    /// Exact E4M3 prefill reduces split-K on chip; metadata retains the ABI's
+    /// conservative capacity so older manifests remain independently verifiable.
+    fn launch_scratch_bytes(self, rows: u32) -> Result<u64> {
+        let bytes = self.scratch_bytes(rows)?;
+        Ok(if self.encoding == Encoding::Trellis && rows > 64 { 0 } else { bytes })
     }
 
     fn pointers(self) -> &'static [&'static str] {
@@ -330,7 +346,7 @@ impl<'a> DenseLinear<'a> {
         rotation: u32,
         stream: *mut c_void,
     ) -> Result<()> {
-        let required = self.geometry.scratch_bytes(rows)?;
+        let required = self.geometry.launch_scratch_bytes(rows)?;
         let trellis = self.geometry.encoding == Encoding::Trellis;
         if partial_bytes < required
             || (required > 0 && partial.is_null())
@@ -478,10 +494,33 @@ mod tests {
         assert_eq!(g.encoding, Encoding::Trellis);
         assert_eq!(g.scratch_bytes(1).unwrap(), 65536);
         assert_eq!(g.scratch_bytes(4096).unwrap(), 268435456);
+        for rows in [1, 16, 64] {
+            assert_eq!(g.launch_scratch_bytes(rows).unwrap(), g.scratch_bytes(rows).unwrap());
+        }
+        for rows in [65, 80, 127, 128, 129, 130, 4096] {
+            assert_eq!(g.launch_scratch_bytes(rows).unwrap(), 0);
+        }
+        assert!(g.launch_scratch_bytes(0).is_err());
+        assert!(g.launch_scratch_bytes(4097).is_err());
         assert!(g.scratch_bytes(0).is_err());
         assert!(g.scratch_bytes(4097).is_err());
         // Dense ABI v1 is deliberately not the routed expert ABI.
         assert!(super::super::exlr8::validate_entry(&spec, &entry).is_err());
+    }
+
+    #[test]
+    fn native_dense_bf16_program_requires_matching_static_dtype() {
+        let (mut spec, mut entry) = trellis();
+        spec.name.push_str("_bf16");
+        assert!(validate_entry(&spec, &entry).is_err());
+        spec.geometry["input_dtype"] = json!("bf16");
+        entry["geometry"]["input_dtype"] = json!("bf16");
+        assert!(validate_entry(&spec, &entry).is_ok());
+        spec.geometry["input_dtype"] = json!("fp8");
+        assert!(validate_entry(&spec, &entry).is_err());
+        spec.name = spec.name.trim_end_matches("_bf16").to_owned();
+        spec.geometry["input_dtype"] = json!("bf16");
+        assert!(validate_entry(&spec, &entry).is_err());
     }
 
     #[test]
