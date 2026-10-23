@@ -99,15 +99,20 @@ impl<'a> Mtp<'a> {
     /// Hidden rows are already target-final-normalized, as specified by vLLM.
     fn step(&mut self, engine: &mut DenseEngine<'_>, hidden: CuteafdDeviceBuffer,
         tokens: &[u32], start: usize) -> Result<Vec<f32>> {
+        self.step_device(engine, hidden, tokens, start)?.to_host(self.library)
+    }
+
+    fn step_device(&mut self, engine: &mut DenseEngine<'_>, hidden: CuteafdDeviceBuffer,
+        tokens: &[u32], start: usize) -> Result<crate::shared::token_io::DeviceLogits> {
         let rows = tokens.len();
         ensure!((1..=HEAD_ROWS).contains(&rows), "dense MTP rows exceed shared target head");
         ensure!(self.pool.frontier(self.binding)?.1 == start, "dense MTP canonical frontier differs");
         engine.embedding.check(tokens)?;
         let reservation = self.pool.reserve(self.binding, start, rows)?;
-        let result = (|| -> Result<Vec<f32>> {
+        let result = (|| -> Result<crate::shared::token_io::DeviceLogits> {
             let kv = self.pool.destinations(reservation)?;
             let pages = self.pool.page_table(reservation)?;
-            self.pairs(engine, hidden, tokens, start, kv, pages)
+            self.pairs_device(engine, hidden, tokens, start, kv, pages)
         })();
         // No provisional destination is recycled before all producer reads/writes retire.
         engine.stream.drain()?;
@@ -115,8 +120,8 @@ impl<'a> Mtp<'a> {
         result
     }
 
-    fn pairs(&self, engine: &mut DenseEngine<'_>, hidden: CuteafdDeviceBuffer, tokens: &[u32],
-        start: usize, kv: Vec<i64>, pages: Vec<i32>) -> Result<Vec<f32>> {
+    fn pairs_device(&self, engine: &mut DenseEngine<'_>, hidden: CuteafdDeviceBuffer, tokens: &[u32],
+        start: usize, kv: Vec<i64>, pages: Vec<i32>) -> Result<crate::shared::token_io::DeviceLogits> {
         let rows = tokens.len();
         ensure!((1..=HEAD_ROWS).contains(&rows), "dense MTP pairs exceed shared target head");
         engine.embedding.check(tokens)?;
@@ -145,9 +150,7 @@ impl<'a> Mtp<'a> {
         blocks.run(0, &self.layer, p, Some(self.kv.buffer), &Step {
             rows, capacity: HEAD_ROWS, table_stride: 0, splits: 1, speculative: false })?;
         self.norm(engine, p.residual, self.norm.buffer, p.norm, rows)?;
-        let logits = engine.target_head(p.norm, engine.logits.buffer, rows)?;
-        engine.stream.drain()?;
-        logits.to_host(engine.stream.device.library)
+        engine.target_head(p.norm, engine.logits.buffer, rows)
     }
 
     fn sidecar(&self, page: usize) -> Result<CuteafdDeviceBuffer> {
@@ -173,11 +176,16 @@ impl<'a> Mtp<'a> {
     }
 
     fn resolve_pending(&self, engine: &mut DenseEngine<'_>, token: u32, frontier: usize) -> Result<Vec<f32>> {
+        self.resolve_pending_device(engine, token, frontier)?.to_host(self.library)
+    }
+
+    fn resolve_pending_device(&self, engine: &mut DenseEngine<'_>, token: u32, frontier: usize)
+        -> Result<crate::shared::token_io::DeviceLogits> {
         ensure!(self.pool.frontier(self.binding)?.1 == frontier, "dense MTP pending frontier differs");
         let pages = self.pool.committed_page_table(self.binding)?;
         let position = frontier.checked_sub(1).context("dense MTP has no pending row")?;
         let destination = pages[position / 64] as i64 * 64 + (position % 64) as i64;
-        self.pairs(engine, self.tail_hidden(frontier)?, &[token], position, vec![destination], pages)
+        self.pairs_device(engine, self.tail_hidden(frontier)?, &[token], position, vec![destination], pages)
     }
 
     fn copy_pages(&self, copies: &[cuteafd_engine::prefix::TailCopy]) -> Result<()> {
@@ -340,6 +348,8 @@ mod tests {
             std::env::var("CUTEAFD_DENSE_TEST_KV_CACHE").unwrap_or_else(|_| "fp8".into()).parse()?, false)?);
         let mut mtp = Mtp::load(&engine.borrow(), &reader, format, admitted, fixed)?;
         let input = Allocation::new(engine.borrow().stream.device, HEAD_ROWS * layout.hidden_bytes)?;
+        let selector = RefCell::new(crate::shared::token_io::TokenSelector::new(&library,
+            crate::shared::token_io::SelectPlacement::Device, cfg.vocab, 1)?);
         let family = prefix::DensePrefix::new(&engine)?;
         let boxed = |error: cuteafd_engine::prefix::BoxError| anyhow::anyhow!("dense MTP boundary: {error}");
         let download = |buffer: CuteafdDeviceBuffer| -> Result<Vec<u8>> {
@@ -402,7 +412,14 @@ mod tests {
             mtp.copy_pages(&copies)?;
             let continue_from = |mtp: &mut Mtp<'_>| -> Result<(Vec<f32>, Vec<f32>, Vec<f32>)> {
                 let mut target = engine.borrow_mut();
-                let first = mtp.resolve_pending(&mut target, anchor, frontier)?;
+                let device = mtp.resolve_pending_device(&mut target, anchor, frontier)?;
+                let batch = crate::shared::token_io::SelectBatch { rows: vec![crate::shared::token_io::RowSelect {
+                    sampling: cuteafd_core::TargetSamplingParams::greedy(), position: frontier as u64,
+                    mask: None, logprob: false }] };
+                let selected = selector.borrow_mut().select(&device, &batch)?.into_iter().next()
+                    .context("dense MTP selection returned no row")??;
+                let first = device.to_host(&library)?;
+                assert_eq!(selected.token, argmax(&first), "native MTP device/host prediction at {frontier}");
                 let logits = target.prefill_tapped(0, &[anchor], 1, |layer, hidden| {
                     if layer + 1 == cfg.attention.len() {
                         // SAFETY: capture target hidden on its producer stream before MTP reuses planes.
