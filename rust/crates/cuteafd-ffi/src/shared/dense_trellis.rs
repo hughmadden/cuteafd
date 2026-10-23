@@ -345,8 +345,8 @@ impl DenseTrellisPolicy {
     fn from_metadata(family:&serde_json::Value,shape:&str,codebook:&str)->Result<Self> {
         Self::select_metadata(family, |p| p["shape"].as_str()==Some(shape) && p["codebook"].as_str()==Some(codebook))
     }
-    /// Resolve the base FP16 pipeline by geometry. MLA TP2 g/o share KDA
-    /// geometries; callers bind activation-range alternatives separately.
+    /// Projection labels do not affect arithmetic. In particular, MLA TP2 g/o
+    /// share the KDA TP2 geometries; select exactly one policy, never the first.
     pub fn from_package_geometry(programs:&Programs<'_>,input:usize,output:usize,side:usize,codebook:&str)->Result<Self> {
         Self::from_geometry_metadata(programs.family_metadata("kimi_k6_dense")?,input,output,side,codebook)
     }
@@ -376,7 +376,7 @@ impl DenseTrellisPolicy {
 /// Programs are resolved before capture. Scratch is caller-owned and reusable
 /// only on the serialized lane; the native core writes F32 before one egress.
 pub struct DenseTrellisDispatch<'a> {
-    native: DenseTrellis<'a>, prefill: Option<DenseTrellis<'a>>, policy: DenseTrellisPolicy,
+    native: DenseTrellis<'a>, policy: DenseTrellisPolicy,
 }
 #[derive(Debug, Clone, Copy)]
 pub struct DenseTrellisBuffers {
@@ -392,37 +392,7 @@ impl<'a> DenseTrellisDispatch<'a> {
         let native=DenseTrellis::load(programs,[&policy.native_input,&policy.native,&policy.output_program],
             DenseTrellisGeometry{input:policy.input,output:policy.output,bits:6,side:policy.side,rows,
                 input_dtype:TrellisDType::Bf16,output_dtype},&policy.codebook)?;
-        Ok(Self {native,prefill:None,policy})
-    }
-    /// Bind a wide-range variant only for projections whose activation is unbounded.
-    /// Narrow launches retain the original ingress and core bit for bit.
-    pub fn with_bf16_prefill(mut self, programs: &'a Programs<'a>, rows: usize,
-        output_dtype: TrellisDType) -> Result<Self> {
-        let p=&self.policy;
-        let family=programs.family_metadata("kimi_k6_dense")?;
-        let entries=family["row_policies"].as_array().ok_or(DenseTrellisError::Invalid("row-policy list"))?;
-        let entry=entries.iter().find(|entry|entry["shape"].as_str()==Some(&p.shape)
-            && entry["codebook"].as_str()==Some(&p.codebook))
-            .ok_or(DenseTrellisError::Invalid("missing BF16 prefill policy"))?;
-        let route=&entry["bf16_prefill"];
-        let name=|key:&str|route[key].as_str().filter(|name|!name.is_empty())
-            .map(|name|format!("kimi_k6_dense_{name}"))
-            .ok_or(DenseTrellisError::Invalid("BF16 prefill program"));
-        let input=name("native_input")?;let core=name("native_program")?;
-        if programs.spec(&input)?.geometry["output_dtype"].as_str()!=Some("bf16")
-            || programs.spec(&core)?.geometry["input_dtype"].as_str()!=Some("bf16") {
-            return Err(DenseTrellisError::Invalid("BF16 prefill dtype"));
-        }
-        let prefill=DenseTrellis::load(programs,[&input,&core,&p.output_program],
-            DenseTrellisGeometry{input:p.input,output:p.output,bits:6,side:p.side,rows,
-                input_dtype:TrellisDType::Bf16,output_dtype},&p.codebook)?;
-        if prefill.workspace()!=self.native.workspace() {
-            return Err(DenseTrellisError::Invalid("BF16 prefill workspace"));
-        }
-        self.prefill=Some(prefill);Ok(self)
-    }
-    fn native_for_rows(&self, rows: usize) -> &DenseTrellis<'a> {
-        if bf16_prefill_rows(self.prefill.is_some(),rows) {self.prefill.as_ref().unwrap()} else {&self.native}
+        Ok(Self {native,policy})
     }
     pub fn workspace(&self) -> DenseTrellisWorkspace { self.native.workspace() }
     pub fn policy(&self) -> &DenseTrellisPolicy { &self.policy }
@@ -435,26 +405,16 @@ impl<'a> DenseTrellisDispatch<'a> {
             (b.partial,rows.min(TRELLIS_PARTIAL_ROWS)*p.input.div_ceil(1024)*p.output*4),
             (b.accumulator,rows*p.output*4)])?;
         disjoint(&[b.input,b.suh,b.rotated,b.pointer_table,b.payload,b.scales,b.partial,b.accumulator])?;
-        let native=self.native_for_rows(rows);
-        native.input(rows,b.input,b.suh,b.rotated,b.scales,stream)?;
-        native.core(rows,b.pointer_table,b.payload,b.scales,b.partial,b.accumulator,stream)
+        self.native.input(rows,b.input,b.suh,b.rotated,b.scales,stream)?;
+        self.native.core(rows,b.pointer_table,b.payload,b.scales,b.partial,b.accumulator,stream)
     }
     pub fn output(&self, rows: usize, accumulator: Buffer, svh: Buffer, output: Buffer,
         stream: *mut c_void) -> Result<()> { self.native.output(rows,accumulator,svh,output,stream) }
 }
 
-fn bf16_prefill_rows(enabled:bool,rows:usize)->bool { enabled && rows>TRELLIS_PARTIAL_ROWS }
-
 #[cfg(test)]
 mod policy_tests {
     use super::*;
-    #[test]
-    fn bf16_prefill_preserves_all_narrow_rows() {
-        for rows in [1,16,64,128,129,130,131,257,4096] {
-            assert!(!bf16_prefill_rows(false,rows));
-            assert_eq!(bf16_prefill_rows(true,rows),rows>=130);
-        }
-    }
     fn policy() -> serde_json::Value {
         serde_json::json!({"shape":"test","input_features":128,"output_features":256,"sharded_side":2,
             "codebook":"mcg","native_program":"core","native_input":"input","output_program":"output"})

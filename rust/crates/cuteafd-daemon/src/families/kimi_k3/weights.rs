@@ -169,12 +169,7 @@ impl LayerLayout {
             operands: layout.operands,
             attention: match layout.attention { WeightAttention::Absent => AttentionShare::Absent,
                 WeightAttention::Whole => AttentionShare::Whole, WeightAttention::Split => AttentionShare::Split },
-            core: layout.core.into_iter().map(|(name, layout)| {
-                let mut weight=CoreWeightLayout::from_shared(layout);
-                // KDA-o shares MLA-o geometry, but its input is bounded.
-                weight.bf16_prefill=matches!(name,"ffn.down"|"mla.output");
-                (name,weight)
-            }).collect(),
+            core: layout.core.into_iter().map(|(name, layout)| (name, CoreWeightLayout::from_shared(layout))).collect(),
         }))
     }
 
@@ -754,13 +749,13 @@ mod tests {
 /// The caller selects ownership from the shared layer placement before packing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CoreWeightLayout {
-    pub stem: String, pub bf16_prefill: bool, pub side: cuteafd_loader::formats::dense_trellis::TrellisSide,
+    pub stem: String, pub side: cuteafd_loader::formats::dense_trellis::TrellisSide,
     pub rank: usize, pub ranks: usize, pub shape: [usize;2], pub bytes: usize,
     pub codebook: cuteafd_loader::formats::exl3_storage::Exl3Codebook,
 }
 impl CoreWeightLayout {
     fn from_shared(layout: cuteafd_loader::families::kimi_k3::weight_layout::CoreWeightLayout) -> Self {
-        Self { stem: layout.stem, bf16_prefill:false, side: layout.side, rank: layout.rank, ranks: layout.ranks,
+        Self { stem: layout.stem, side: layout.side, rank: layout.rank, ranks: layout.ranks,
             shape: layout.shape, bytes: layout.bytes, codebook: layout.codebook }
     }
     pub(crate) fn new(projection: &cuteafd_loader::families::kimi_k3::core::CoreProjection,
@@ -823,11 +818,10 @@ impl CoreWeightLayout {
             Ok(owner)
         };
         Ok(CoreWeights{payload:upload(&shard.payload)?,suh:upload(&shard.suh)?,svh:upload(&shard.svh)?,
-            shape:self.shape,side:self.side,codebook:self.codebook,bf16_prefill:self.bf16_prefill})
+            shape:self.shape,side:self.side,codebook:self.codebook})
     }
 }
 pub(crate) struct CoreWeights<'a> {
-    pub bf16_prefill:bool,
     pub payload:Allocation<'a>, pub suh:Allocation<'a>, pub svh:Allocation<'a>,
     pub shape:[usize;2], pub side:cuteafd_loader::formats::dense_trellis::TrellisSide,
     pub codebook:cuteafd_loader::formats::exl3_storage::Exl3Codebook,
@@ -865,32 +859,6 @@ mod core_owner_tests {
                 source_bytes: 0 };
             (stem, projection)
         }).collect() }
-    }
-
-    #[test]
-    fn bf16_prefill_range_is_semantic_not_geometry() -> Result<()> {
-        let mut cfg=KimiK3Config::from_hf(&cuteafd_loader::plan::testing::kimi_k3_config())?;
-        let layer=1;
-        let core=inventory(layer,&[("self_attn.o_proj",[7168,12288]),
-            ("block_sparse_moe.shared_experts.down_proj",[7168,cfg.moe_intermediate*cfg.shared_experts])]);
-        for attention in [cuteafd_loader::families::kimi_k3::config::KimiAttention::Kda,
-            cuteafd_loader::families::kimi_k3::config::KimiAttention::Mla] {
-            cfg.attention[layer]=attention;
-            let pair=LayerLayout::pair_with_core(&cfg,layer,LayerMode::HeadSplit,&core)?;
-            for layout in pair {
-                assert!(layout.core["ffn.down"].bf16_prefill);
-                let name=if attention==cuteafd_loader::families::kimi_k3::config::KimiAttention::Mla {
-                    "mla.output"
-                } else {"kda.output"};
-                let output=&layout.core[name];
-                assert_eq!(output.shape,[7168,6144]);
-                assert_eq!(output.bf16_prefill,name=="mla.output");
-            }
-        }
-        let head=inventory(layer,&[("self_attn.o_proj",[7168,12288])]);
-        let direct=CoreWeightLayout::new(head.projections.values().next().unwrap(),TrellisSide::Output,0,1)?;
-        assert!(!direct.bf16_prefill);
-        Ok(())
     }
 
     #[test]

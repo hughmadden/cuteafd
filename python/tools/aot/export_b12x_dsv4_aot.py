@@ -893,13 +893,14 @@ def main() -> None:
                      for suffix, thunk, capacity in kimi_split_programs()]
             continue
         if name == "kimi_k6_dense":
-            from export_b12x_kimi_k6_dense_aot import selective_programs as kimi_dense_programs, row_policies
+            from export_b12x_kimi_k6_dense_aot import programs as kimi_dense_programs, row_policies
             manifest["families"][name] = {
                 "abi_version": 1,
                 "row_policies": row_policies(),
                 "measured_not_exported": ["tiled_mcg"],
             }
-            work += [(name, *item) for item in kimi_dense_programs()]
+            # Diagnostic only: isolate activation range from native T2 integration.
+            work += [(name, *item) for item in kimi_dense_programs(input_dtype="bf16")]
             continue
         if name == "exlr8_dense":
             from export_b12x_exlr8_dense_aot import programs as dense_programs

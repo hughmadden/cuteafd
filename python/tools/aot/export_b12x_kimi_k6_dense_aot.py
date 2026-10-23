@@ -5,8 +5,7 @@ Dimensions are local [K,N] after TP2 placement, not the full checkpoint sizes.
 Whole/replicated MLA and latent operands retain their full dimensions. kv_a
 requires a stored N640 tensor and a caller-side N576 trim; unpadded N576 is
 not a supported native trellis geometry. Independently calibrated projections
-are never concatenated. Unbounded shared-down/MLA-o inputs use BF16
-rotation/core only at prefill widths; narrow rows retain FP16 arithmetic.
+are never concatenated. One fixed arithmetic covers rows 1 through 4096.
 
 KDA q/k/v/g share one activation and run as one grouped launch per H128
 stage. Each projection retains its own payload, scales and rotation. Native
@@ -45,9 +44,6 @@ TRELLIS_SHAPES = (
 GROUPED_SHAPES = {"kda_qkvg_tp2": 4}
 GROUPED_MAX_ROWS = 4096
 
-# MLA TP2 output shares KDA-o geometry, but only MLA binds this wide variant.
-BF16_PREFILL_SHAPES = {"shared_down_tp2", "kda_o_tp2", "mla_o_owned"}
-
 
 def row_policies():
     result = []
@@ -58,11 +54,7 @@ def row_policies():
                 native_program=f"trellis_{name}_{book}",
                 native_input=f"trellis_input_k{k}_bf16",
                 output_program=f"trellis_output_n{n}_{'f32' if n == 163840 else 'bf16'}",
-                **({"grouped": grouped_policy(name, k, n, book)} if name in GROUPED_SHAPES else {}),
-                **({"bf16_prefill": dict(
-                    native_program=f"trellis_{name}_{book}_prefill_bf16",
-                    native_input=f"trellis_input_k{k}_bf16_prefill_bf16")}
-                   if name in BF16_PREFILL_SHAPES else {})))
+                **({"grouped": grouped_policy(name, k, n, book)} if name in GROUPED_SHAPES else {})))
     return result
 
 
@@ -76,16 +68,6 @@ def grouped_policy(name, k, n, book):
 
 def programs(*, input_dtype="f16"):
     return programs_for_shapes(TRELLIS_SHAPES, input_dtype=input_dtype)
-
-
-def selective_programs():
-    """Keep base FP16 programs and add package-owned wide-range alternatives."""
-    result = programs()
-    shapes = tuple(shape for shape in TRELLIS_SHAPES if shape[0] in BF16_PREFILL_SHAPES)
-    for name, op, params, thunk in programs_for_shapes(shapes, input_dtype="bf16"):
-        if op != "trellis_output":
-            result.append((f"{name}_prefill_bf16", op, params, thunk))
-    return result
 
 
 def programs_for_shapes(shapes, *, max_rows=4096, f32_outputs=(163840,), input_dtype="f16"):
