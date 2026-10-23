@@ -120,8 +120,8 @@ fn native_layout(cfg: &crate::families::qwen3_5::Qwen35Config, input: &crate::pl
     ensure!(!options.host_embedding, "dense Qwen requires device token embedding");
     ensure!(report.vision == crate::plan::MediaMode::Off && report.audio == crate::plan::MediaMode::Off,
         "dense Qwen media execution is not qualified");
-    ensure!(options.native_mtp_layers == 0 && options.drafter_bytes == 0,
-        "dense native planner requires checkpoint-native dSpark admission (native MTP is not qualified)");
+    ensure!(options.drafter_bytes == 0 && !(options.dense_qwen_mtp && options.dense_qwen_drafter_snapshot.is_some()),
+        "dense native planner requires one checkpoint-native drafter admission");
     let prefix = match (cfg.hidden, cfg.intermediate, cfg.heads, cfg.gdn.value_heads) {
         (4096, 12288, 16, 32) => "qwen35", (5120, 17408, 24, 48) => "qwen38",
         _ => anyhow::bail!("dense Qwen geometry lacks native exports"),
@@ -170,6 +170,9 @@ fn native_layout(cfg: &crate::families::qwen3_5::Qwen35Config, input: &crate::pl
         placement::families::qwen3_5::DrafterBytes::block_dspark(&config, slots,
             options.physical_sms.unwrap_or_else(|| ArchContext::coordinator(capacity, None).sms) as u64, cfg.max_context)
     }).transpose()?;
+    let drafter = if options.dense_qwen_mtp {
+        Some(placement::families::qwen3_5::DrafterBytes::native_mtp(input.checkpoint(), cfg)?)
+    } else { drafter };
     let result = placement::families::qwen3_5::placement(DenseInputs { cfg,
         gpu: GpuBudget { capacity_bytes: capacity, headroom_bytes: 1 << 30,
             baseline: Baseline::Planned { context_bytes: context, loaded_bytes: 0 } },

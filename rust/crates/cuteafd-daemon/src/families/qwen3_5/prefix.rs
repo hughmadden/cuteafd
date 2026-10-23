@@ -26,6 +26,7 @@ pub(crate) struct DensePrefix<'e, 'a> {
     layout: FamilyLayout,
     mark: MarkLayout,
     drafter: Option<Rc<crate::shared::speculation::block_dspark::DsparkDrafter<'a>>>,
+    mtp: Option<Rc<super::mtp::MtpCache<'a>>>,
 }
 
 impl<'e, 'a> DensePrefix<'e, 'a> {
@@ -47,7 +48,13 @@ impl<'e, 'a> DensePrefix<'e, 'a> {
             mark_bytes: mark.bytes, draft_bytes: 0, rule: ReuseRule::EXACT,
             mark_store: MarkStore::Arena, page_owners: Default::default() };
         drop(target);
-        Ok(Self { engine, layout, mark, drafter })
+        Ok(Self { engine, layout, mark, drafter, mtp: None })
+    }
+
+    pub(crate) fn with_mtp(engine: &'e RefCell<DenseEngine<'a>>, mtp: Rc<super::mtp::MtpCache<'a>>) -> Result<Self> {
+        let mut family = Self::new(engine)?;
+        family.mtp = Some(mtp);
+        Ok(family)
     }
 
     pub fn slots(&self) -> usize { self.engine.borrow().prefix_marks }
@@ -232,32 +239,47 @@ pub(crate) fn check_backend_frontiers(engine: &RefCell<DenseEngine<'_>>, tokens:
 impl PrefixFamily for DensePrefix<'_, '_> {
     type Placement = Placement;
 
-    fn draft_page_bytes(&self) -> usize { self.drafter.as_ref().map_or(0, |draft| draft.page_bytes()) }
+    fn draft_page_bytes(&self) -> usize {
+        self.mtp.as_ref().map_or_else(|| self.drafter.as_ref().map_or(0, |draft| draft.page_bytes()), |mtp| mtp.page_bytes())
+    }
     fn admit_draft_pages(&self, placement: &mut Placement, capacity: usize) -> Result<(), BoxError> {
+        if let Some(mtp) = &self.mtp { mtp.admit_pages(placement.slot, capacity)?; }
         if let Some(draft) = &self.drafter { draft.admit_pages(placement.slot, capacity)?; }
         Ok(())
     }
     fn draft_pages_valid(&self, attachment: &cuteafd_engine::prefix::DraftPageAttachment) -> bool {
-        self.drafter.as_ref().is_some_and(|draft| draft.pages_valid(attachment))
+        self.mtp.as_ref().is_some_and(|mtp| mtp.pages_valid(attachment))
+            || self.drafter.as_ref().is_some_and(|draft| draft.pages_valid(attachment))
     }
     fn draft_pages_revocable(&self, attachment: &cuteafd_engine::prefix::DraftPageAttachment) -> bool {
-        self.drafter.as_ref().is_some_and(|draft| draft.pages_revocable(attachment))
+        self.mtp.as_ref().is_some_and(|mtp| mtp.pages_revocable(attachment))
+            || self.drafter.as_ref().is_some_and(|draft| draft.pages_revocable(attachment))
     }
     fn retain_draft_pages(&self, attachment: &cuteafd_engine::prefix::DraftPageAttachment) -> Result<(), BoxError> {
+        if let Some(mtp) = &self.mtp { mtp.retain_pages(attachment)?; return Ok(()); }
         self.drafter.as_ref().context("dense prefix has no drafter")?.retain_pages(attachment)?;
         Ok(())
     }
     fn capture_draft_pages(&self, placement: &Placement, len: usize)
         -> Result<Option<cuteafd_engine::prefix::DraftPageAttachment>, BoxError> {
+        if let Some(mtp) = &self.mtp { return Ok(Some(mtp.capture_pages(placement.slot, len)?)); }
         self.drafter.as_ref().map(|draft| draft.capture_pages(placement.slot, len, len))
             .transpose().map_err(Into::into)
     }
     fn release_draft_pages(&self, attachment: &cuteafd_engine::prefix::DraftPageAttachment) -> Result<(), BoxError> {
+        if let Some(mtp) = &self.mtp { mtp.release_pages(attachment)?; return Ok(()); }
         self.drafter.as_ref().context("dense prefix has no drafter")?.release_pages(attachment)?;
         Ok(())
     }
     fn restore_draft_pages(&self, attachment: Option<&cuteafd_engine::prefix::DraftPageAttachment>,
         placement: &mut Placement, frontier: usize) -> Result<(), BoxError> {
+        if let Some(mtp) = &self.mtp {
+            if let Some(attachment) = attachment { mtp.restore_pages(placement.slot, attachment, frontier)?; }
+            else {
+                if frontier != 0 { return Err("dense MTP requires an exact prefix attachment".into()); }
+                mtp.reset_context(placement.slot)?;
+            }
+        }
         if let Some(draft) = &self.drafter {
             if let Some(attachment) = attachment {
                 if attachment.origin != 0 || attachment.frontier != frontier {
@@ -273,9 +295,11 @@ impl PrefixFamily for DensePrefix<'_, '_> {
     }
     fn promote_draft_pages(&self, saved: &cuteafd_engine::prefix::DraftPageAttachment)
         -> Result<cuteafd_engine::prefix::DraftPageAttachment, BoxError> {
+        if let Some(mtp) = &self.mtp { return Ok(mtp.promote_pages(saved)?); }
         Ok(self.drafter.as_ref().context("dense prefix has no drafter")?.promote_pages(saved)?)
     }
     fn draft_page_segments(&self, page: cuteafd_engine::prefix::DraftPageId) -> Vec<DeviceRange> {
+        if let Some(mtp) = &self.mtp { return mtp.page_segments(page).expect("admitted dense MTP page"); }
         self.drafter.as_ref().map_or_else(Vec::new, |draft| draft.page_segments(page).expect("admitted dense draft page"))
     }
 
@@ -293,6 +317,7 @@ impl PrefixFamily for DensePrefix<'_, '_> {
         let mut target = self.engine.borrow_mut();
         target.reset_slot(placement.slot)?;
         target.bind_slot(placement.slot, &placement.units)?;
+        if let Some(mtp) = &self.mtp { mtp.reset_context(placement.slot)?; }
         if let Some(draft) = &self.drafter { draft.reset_context(placement.slot, 0)?; }
         placement.state_len = 0;
         Ok(())
@@ -300,6 +325,7 @@ impl PrefixFamily for DensePrefix<'_, '_> {
 
     fn discard(&self, placement: &mut Placement) -> Result<(), BoxError> {
         self.engine.borrow_mut().reset_slot(placement.slot)?;
+        if let Some(mtp) = &self.mtp { mtp.discard_context(placement.slot)?; }
         if let Some(draft) = &self.drafter { draft.discard_context(placement.slot)?; }
         placement.len = 0;
         placement.state_len = 0;

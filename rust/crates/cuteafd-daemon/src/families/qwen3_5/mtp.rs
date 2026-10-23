@@ -29,6 +29,8 @@ struct Mtp<'a> {
     norm_embedding: Allocation<'a>,
     norm: Allocation<'a>,
     concat: Allocation<'a>,
+    hidden: Allocation<'a>,
+    logits: Allocation<'a>,
     kv: Allocation<'a>,
     sidecars: Allocation<'a>,
     layout: PageLayout,
@@ -81,7 +83,8 @@ fn fixed_bytes(reader: &WeightReader<'_>, cfg: &Qwen35Config, format: DenseForma
             "mtp.{name}: expected native BF16 {shape:?}");
         bytes = bytes.checked_add(tensor.byte_length.max(256)).context("dense MTP inventory overflow")?;
     }
-    Ok(bytes + (HEAD_ROWS * 2 * cfg.hidden * 2) as u64)
+    // Preserve target hidden rows and keep draft logits separate from target prefill logits.
+    Ok(bytes + ((HEAD_ROWS * 2 + ROWS) * cfg.hidden * 2 + HEAD_ROWS * cfg.vocab * 4) as u64)
 }
 
 impl<'a> Mtp<'a> {
@@ -103,11 +106,14 @@ impl<'a> Mtp<'a> {
             fc: reader.bf16("mtp.fc.weight")?, norm_hidden: reader.bf16("mtp.pre_fc_norm_hidden.weight")?,
             norm_embedding: reader.bf16("mtp.pre_fc_norm_embedding.weight")?, norm: reader.bf16("mtp.norm.weight")?,
             concat: Allocation::new(device, HEAD_ROWS * 2 * cfg.hidden * 2)?,
+            hidden: Allocation::new(device, ROWS * cfg.hidden * 2)?,
+            logits: Allocation::new(device, HEAD_ROWS * cfg.vocab * 4)?,
             kv: Allocation::new(device, engine.pool_tokens * layout.record_bytes)?,
             sidecars: Allocation::new(device, engine.pool_tokens.div_ceil(64) * layout.hidden_bytes)?,
             layout, programs, cfg, homes, pool, binding, bindings,
         };
-        let actual = out.layer.bytes() + [&out.fc, &out.norm_hidden, &out.norm_embedding, &out.norm, &out.concat]
+        let actual = out.layer.bytes() + [&out.fc, &out.norm_hidden, &out.norm_embedding, &out.norm, &out.concat,
+            &out.hidden, &out.logits]
             .iter().map(|allocation| allocation.buffer.bytes).sum::<usize>();
         ensure!(actual as u64 == expected, "dense MTP admitted fixed bytes differ from allocations");
         Ok(out)
@@ -177,7 +183,7 @@ impl<'a> Mtp<'a> {
         blocks.run(0, &self.layer, p, Some(self.kv.buffer), &Step {
             rows, capacity: HEAD_ROWS, table_stride: 0, splits: 1, speculative: false })?;
         self.norm(engine, p.residual, self.norm.buffer, p.norm, rows)?;
-        engine.target_head(p.norm, engine.logits.buffer, rows)
+        engine.target_head(p.norm, self.logits.buffer, rows)
     }
 
     fn sidecar(&self, page: usize) -> Result<CuteafdDeviceBuffer> {
@@ -234,18 +240,103 @@ impl<'a> Mtp<'a> {
 
 /// Native cache ownership uses the same aggregate page credits and typed
 /// attachments as block drafting; hidden sidecars travel with their KV page.
-struct MtpCache<'a>(std::cell::RefCell<Mtp<'a>>);
+pub(crate) struct MtpCache<'a>(std::cell::RefCell<Mtp<'a>>);
+
+pub(crate) struct Admission {
+    format: DenseFormat,
+    programs: DensePrograms,
+    fixed: u64,
+    pub(crate) bytes: DrafterBytes,
+}
+
+impl Admission {
+    pub(crate) fn new(reader: &WeightReader<'_>, cfg: &Qwen35Config, programs: &Programs<'_>) -> Result<Self> {
+        let format = format(reader)?;
+        let programs = DensePrograms::new(cfg, programs, Qwen4KvCache::Bf16, format)?;
+        let fixed = fixed_bytes(reader, cfg, format)?;
+        let layout = PageLayout { record_bytes: Qwen4KvCache::Bf16.record_bytes(cfg.kv_heads, cfg.head_dim),
+            hidden_bytes: cfg.hidden * 2 };
+        let bytes = DrafterBytes::native_mtp(reader.checkpoint, cfg)?;
+        ensure!(bytes.owned == fixed + 12 && bytes.pool_unit == layout.bytes() as u64,
+            "native MTP planner and runtime inventory differ");
+        Ok(Self { format, programs, fixed, bytes })
+    }
+}
+
+impl<'a> MtpCache<'a> {
+    pub(crate) fn load(engine: &DenseEngine<'a>, reader: &WeightReader<'a>, admission: Admission) -> Result<Self> {
+        ensure!(engine.planes.scratch.bytes >= admission.programs.scratch_bytes,
+            "MTP scratch exceeds shared target admission");
+        Ok(Self(std::cell::RefCell::new(Mtp::load(engine, reader, admission.format,
+            admission.programs, admission.fixed)?)))
+    }
+
+    /// Retain canonical INPUT rows only; the sampled bonus has no target hidden yet.
+    pub(crate) fn update(&self, engine: &mut DenseEngine<'a>, slot: usize, start: usize,
+        tokens: &[u32], target_hidden: CuteafdDeviceBuffer) -> Result<()> {
+        ensure!(!tokens.is_empty() && tokens.len() <= HEAD_ROWS, "dense MTP update rows outside admission");
+        let mut mtp = self.0.borrow_mut();
+        mtp.select_slot(slot)?;
+        ensure!(mtp.pool.frontier(mtp.binding)?.1 == start, "dense MTP update differs from target frontier");
+        let bytes = tokens.len() * mtp.layout.hidden_bytes;
+        ensure!(target_hidden.bytes >= bytes, "dense MTP target hidden extent differs");
+        // SAFETY: copy on the target producer stream before MTP reuses shared residual/norm planes.
+        if mtp.hidden.buffer.ptr != target_hidden.ptr {
+            unsafe { mtp.library.copy_d2d_async(mtp.hidden.buffer, target_hidden, bytes, mtp.stream)?; }
+        }
+        mtp.norm(engine, mtp.hidden.buffer, engine.weights.norm.buffer, mtp.hidden.buffer, tokens.len())?;
+        if start > 0 { mtp.resolve_pending_device(engine, tokens[0], start)?; }
+        if tokens.len() > 1 {
+            let hidden = mtp.hidden.buffer;
+            mtp.step_device(engine, hidden, &tokens[1..], start)?;
+        }
+        let tail = crate::shared::prefix::view(mtp.hidden.buffer, (tokens.len() - 1) * mtp.layout.hidden_bytes,
+            mtp.layout.hidden_bytes)?;
+        mtp.pending(engine, tail, start + tokens.len())
+    }
+
+    pub(crate) fn capture_hidden(&self, source: CuteafdDeviceBuffer, rows: usize) -> Result<()> {
+        let mtp = self.0.borrow();
+        let bytes = rows * mtp.layout.hidden_bytes;
+        ensure!(rows > 0 && bytes <= mtp.hidden.buffer.bytes && bytes <= source.bytes,
+            "dense MTP hidden capture exceeds admission");
+        // SAFETY: source is a live target producer plane; destination remains owned through stream drain.
+        unsafe { mtp.library.copy_d2d_async(mtp.hidden.buffer, source, bytes, mtp.stream) }
+    }
+
+    pub(crate) fn update_captured(&self, engine: &mut DenseEngine<'a>, slot: usize, start: usize,
+        tokens: &[u32]) -> Result<()> {
+        for first in (0..tokens.len()).step_by(HEAD_ROWS) {
+            let end = (first + HEAD_ROWS).min(tokens.len());
+            let hidden = {
+                let mtp = self.0.borrow();
+                crate::shared::prefix::view(mtp.hidden.buffer, first * mtp.layout.hidden_bytes,
+                    (end - first) * mtp.layout.hidden_bytes)?
+            };
+            self.update(engine, slot, start + first, &tokens[first..end], hidden)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn draft_device(&self, engine: &mut DenseEngine<'a>, slot: usize, anchor: u32,
+        frontier: usize) -> Result<crate::shared::token_io::DeviceLogits> {
+        let mut mtp = self.0.borrow_mut();
+        mtp.select_slot(slot)?;
+        mtp.resolve_pending_device(engine, anchor, frontier)
+    }
+}
+
 
 impl MtpCache<'_> {
-    fn reset_context(&self, slot: usize) -> Result<()> { self.0.borrow_mut().reset_slot(slot) }
-    fn discard_context(&self, slot: usize) -> Result<()> { self.0.borrow_mut().discard_slot(slot) }
-    fn admit_pages(&self, slot: usize, end: usize) -> Result<()> {
+    pub(crate) fn reset_context(&self, slot: usize) -> Result<()> { self.0.borrow_mut().reset_slot(slot) }
+    pub(crate) fn discard_context(&self, slot: usize) -> Result<()> { self.0.borrow_mut().discard_slot(slot) }
+    pub(crate) fn admit_pages(&self, slot: usize, end: usize) -> Result<()> {
         let mut mtp = self.0.borrow_mut();
         mtp.select_slot(slot)?;
         let binding = mtp.binding;
         Ok(mtp.pool.admit(binding, end, 2)?)
     }
-    fn capture_pages(&self, slot: usize, frontier: usize) -> Result<DraftPageAttachment> {
+    pub(crate) fn capture_pages(&self, slot: usize, frontier: usize) -> Result<DraftPageAttachment> {
         let mut mtp = self.0.borrow_mut();
         mtp.select_slot(slot)?;
         ensure!(mtp.pool.frontier(mtp.binding)?.1 == frontier && frontier > 0,
@@ -263,29 +354,29 @@ impl MtpCache<'_> {
         }
         Ok(mtp.pool.attachment(snapshot)?)
     }
-    fn pages_valid(&self, saved: &DraftPageAttachment) -> bool {
+    pub(crate) fn pages_valid(&self, saved: &DraftPageAttachment) -> bool {
         self.0.borrow().pool.check_attachment(saved).is_ok()
     }
-    fn pages_revocable(&self, saved: &DraftPageAttachment) -> bool {
+    pub(crate) fn pages_revocable(&self, saved: &DraftPageAttachment) -> bool {
         let mtp = self.0.borrow();
         mtp.pool.check_attachment(saved).is_ok() && mtp.pool.snapshot_revocable(saved.snapshot)
     }
-    fn retain_pages(&self, saved: &DraftPageAttachment) -> Result<()> {
+    pub(crate) fn retain_pages(&self, saved: &DraftPageAttachment) -> Result<()> {
         let mut mtp = self.0.borrow_mut();
         mtp.pool.check_attachment(saved)?;
         Ok(mtp.pool.retain_snapshot(saved.snapshot)?)
     }
-    fn release_pages(&self, saved: &DraftPageAttachment) -> Result<()> {
+    pub(crate) fn release_pages(&self, saved: &DraftPageAttachment) -> Result<()> {
         let mut mtp = self.0.borrow_mut();
         // SAFETY: host-copy readers are retired by the caller before releasing their attachment.
         unsafe { mtp.library.cuda_stream_synchronize(mtp.stream)?; }
         mtp.pool.check_attachment(saved)?;
         Ok(mtp.pool.release_snapshot(saved.snapshot)?)
     }
-    fn promote_pages(&self, saved: &DraftPageAttachment) -> Result<DraftPageAttachment> {
+    pub(crate) fn promote_pages(&self, saved: &DraftPageAttachment) -> Result<DraftPageAttachment> {
         Ok(self.0.borrow_mut().pool.promote(saved)?)
     }
-    fn restore_pages(&self, slot: usize, saved: &DraftPageAttachment, frontier: usize) -> Result<()> {
+    pub(crate) fn restore_pages(&self, slot: usize, saved: &DraftPageAttachment, frontier: usize) -> Result<()> {
         ensure!(frontier > 0 && saved.origin == 0 && saved.frontier == frontier,
             "dense MTP restore differs from target frontier");
         let mut mtp = self.0.borrow_mut();
@@ -310,8 +401,8 @@ impl MtpCache<'_> {
         mtp.pool.unpin_snapshot(saved.snapshot)?;
         result
     }
-    fn page_bytes(&self) -> usize { self.0.borrow().layout.bytes() }
-    fn page_segments(&self, page: DraftPageId) -> Result<Vec<DeviceRange>> {
+    pub(crate) fn page_bytes(&self) -> usize { self.0.borrow().layout.bytes() }
+    pub(crate) fn page_segments(&self, page: DraftPageId) -> Result<Vec<DeviceRange>> {
         let mtp = self.0.borrow();
         ensure!((page.index as usize) < mtp.pool.capacity(), "dense MTP page outside admitted pool");
         let bytes = 64 * mtp.layout.record_bytes;
