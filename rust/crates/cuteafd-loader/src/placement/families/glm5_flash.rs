@@ -497,9 +497,8 @@ impl GlmfWorkingSetExt for GlmfWorkingSet {
         let spark_layers = routed[n..].to_vec();
         let spark_ranks = if spark_layers.is_empty() { 0 } else { i.spark_ranks };
         let prefill_lanes = i.prefill_lanes;
-        if prefill_lanes == 0 || (i.attention.mode == AttentionPlacement::Layers
-            && super::super::validate_layer_pipeline_lanes(prefill_lanes, prefill_lanes as usize).is_err()) {
-            return Err(PlacementError::Inventory("GLM Flash layers executor needs one or two admitted prefill lanes"));
+        if !(1..=4).contains(&prefill_lanes) {
+            return Err(PlacementError::Inventory("GLM Flash executor needs one to four admitted prefill units"));
         }
         Ok(Self { rtx_layers: routed[..n].to_vec(), spark_layers, spark_ranks, prefill_lanes })
     }

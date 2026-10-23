@@ -456,7 +456,7 @@ pub(crate) enum Experts<'a> {
     LocalExl3(LocalExl3<'a>),
     /// Spark ranks serving the routed experts over RoCE (one BF16 partial per
     /// rank); one transport per prefill lane (decode uses the first).
-    Spark { transports: RefCell<Vec<SparkLink<'a>>>, runtime: tokio::runtime::Runtime },
+    Spark { transport: RefCell<SparkLink<'a>>, runtime: tokio::runtime::Runtime },
     /// Profiling only: the router, the wire rows and the shared expert run,
     /// the routed experts contribute nothing (the coordinator's own work).
     Skip,
@@ -2006,10 +2006,9 @@ impl<'a> GlmfEngine<'a> {
 
     fn terminal_links(&self, mut action: impl FnMut(&mut SparkLink<'a>) -> Result<()>) -> Result<()> {
         let mut failures = Vec::new();
-        if let Some(Experts::Spark { transports, .. }) = &self.experts {
-            for link in transports.try_borrow_mut()?.iter_mut() {
-                if let Err(error) = action(link) { failures.push(format!("{error:#}")); }
-            }
+        if let Some(Experts::Spark { transport, .. }) = &self.experts {
+            let mut link = transport.try_borrow_mut()?;
+            if let Err(error) = action(&mut link) { failures.push(format!("{error:#}")); }
         }
         ensure!(failures.is_empty(), "{}", failures.join("; ")); Ok(())
     }
@@ -2281,8 +2280,7 @@ impl<'a> GlmfEngine<'a> {
         extension: usize) -> Result<cuteafd_core::PolicyGeometry> {
         use crate::shared::draft::resource::{self, LayerHome};
         let remote = match &self.experts {
-            Some(Experts::Spark { transports, .. }) => transports.borrow().first()
-                .context("no installed GLM Flash Spark transport")?.transport.installed_grouping()?,
+            Some(Experts::Spark { transport, .. }) => transport.borrow().transport.installed_grouping()?,
             _ => Vec::new(),
         };
         let homes = self.weights.layers.iter().enumerate().map(|(layer, weights)| {
@@ -4897,12 +4895,11 @@ impl<'a> GlmfEngine<'a> {
                 }
                 return Ok(());
             }
-            Experts::Spark { transports, runtime } => {
+            Experts::Spark { transport, runtime } => {
                 // The compact reducer adds the shared expert plane to the rank partials.
-                let mut transports = transports.borrow_mut();
-                let transport = transports.first_mut().context("no Spark transport")?;
-                let wave = self.spark_dispatch(w, index, t, decode, transport, shared)?;
-                return runtime.block_on(self.spark_land(w, t, transport, wave));
+                let mut transport = transport.borrow_mut();
+                let wave = self.spark_dispatch(w, index, t, decode, &mut transport, shared)?;
+                return runtime.block_on(self.spark_land(w, t, &mut transport, wave));
             }
         }
         self.run("add", &[("a", w.routed_ptr()?), ("b", w.shared.buffer.ptr), ("out", w.delta.buffer.ptr)], &[rows])
@@ -5022,13 +5019,12 @@ impl<'a> GlmfEngine<'a> {
         unsafe { transport.reduce(w.shared.buffer.ptr.cast(), w.delta.buffer.ptr.cast(), t, self.stream) }
     }
 
-    fn spark_land_lane(&self, w: &Workspace<'_>, rows: usize, lane: usize, wave: SparkExpertWave) -> Result<()> {
-        let Some(Experts::Spark { transports, runtime }) = &self.experts else {
+    fn spark_land_unit(&self, w: &Workspace<'_>, rows: usize, wave: SparkExpertWave) -> Result<()> {
+        let Some(Experts::Spark { transport, runtime }) = &self.experts else {
             anyhow::bail!("Spark completion without its installed backend");
         };
-        let mut transports = transports.borrow_mut();
-        let transport = transports.first_mut().context("Spark completion link")?;
-        runtime.block_on(self.spark_land(w, rows, transport, wave))
+        let mut transport = transport.borrow_mut();
+        runtime.block_on(self.spark_land(w, rows, &mut transport, wave))
     }
 
     /// Pipelined prefill of consecutive-row lanes of one sequence (each
@@ -6235,10 +6231,6 @@ mod spark_warmup_tests {
         }
     }
 
-    /// Start-up warms each transport a prefill runs on (`configured_prefill_waves`, which agrees with
-    /// `GlmfEngine::pipelined`): every lane's while lanes run (1 to 4), else transport 0, which also
-    /// carries decode, verify and serial chunks. No chunk the engine takes uses another transport or
-    /// puts more rows on one than the warm-up sent.
 
 }
 

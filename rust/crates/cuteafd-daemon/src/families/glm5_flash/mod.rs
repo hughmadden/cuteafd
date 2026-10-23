@@ -2185,44 +2185,31 @@ impl Opened {
         let remote = selected;
         let peers = peers.split(',').map(str::parse).collect::<std::result::Result<Vec<std::net::SocketAddr>, _>>()?;
         let spark_world = cuteafd_transport::expert::SparkWorld::canonical(peers.len())?;
-        // One transport per prefill lane: each lane's wave stays in flight on its own QPs. Each takes
-        // waves of the widest step (`expert_rows`): a verify step may be wider than a prefill lane.
-        let mut transports = vec![crate::shared::spark_intake::SparkLink::new_waves(&self.library,
+        // One link retains independent intake planes for every outstanding unit wave.
+        let mut transport = crate::shared::spark_intake::SparkLink::new_waves(&self.library,
             spark_world, &peers, u32::try_from(args.expert_rows())?, cuteafd_transport::TcpTransportConfig { timing: false,
                 timeout: std::time::Duration::from_secs(120), max_frame_bytes: 64 << 20 }, self.cfg.hidden * 2,
-            args.prefill_waves, u32::try_from(args.prefill_rows)?)?];
-        for link in &mut transports { link.enable_terminal_ownership(self.library.clone())?; }
+            args.prefill_waves, u32::try_from(args.prefill_rows)?)?;
+        transport.enable_terminal_ownership(self.library.clone())?;
         crate::shared::memory_report::release_load_staging(&self.library);
         let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
-        // Connect every rank and register full-size buffers now, as GLM-5, MiMo and DeepSeek V4 do: a
-        // rank's session fits the request that opened it, and a request that does not fit reconnects
-        // the rank first (`LocalTp4Client::post`). A lane's rows follow the prompt, so each new longest
-        // prompt would reconnect four ranks mid-prefill, and the first request would open transport 0.
-        // Every transport a prefill runs on (transport 0 also carries decode, verify and serial chunks)
-        // is warmed with `expert_rows` rows, the most any of its waves carries.
-        let warmed = 1;
         let warm_rows = args.expert_rows();
         let warm = engine::spark_warmup_request(&self.cfg, warm_rows, remote[0], self.checkpoint.spark_input_is_bf16())?;
-        // Connect every warmed rank now and publish its installed expert
-        // grouping: the draft planner prices the workers before any wave opens a
-        // session, and the warm-up below then reuses these sessions.
-        for link in &mut transports[..warmed] { link.bootstrap(&warm)?; }
+        // Publish grouping before the draft planner prices the installed workers.
+        transport.bootstrap(&warm)?;
         let rings = || cuteafd_ffi::memory_ledger::snapshot().by_scope(cuteafd_ffi::memory_ledger::Space::Pinned, -1)
             .get("transport/rdma-rings").copied().unwrap_or(0);
         let (started, before) = (Instant::now(), rings());
-        // Drained and destroyed on every way out, before the transports drop.
         let warm_stream = crate::shared::spark_intake::WarmStream::new(self.library.as_ref())?;
-        for (index, transport) in transports[..warmed].iter_mut().enumerate() {
-            runtime.block_on(async {
-                let wave = transport.dispatch(&warm)?;
-                transport.receive(wave, warm_rows, warm_stream.raw()).await
-            }).with_context(|| format!("warming Spark expert transport {index} with {warm_rows} rows"))?;
-        }
+        runtime.block_on(async {
+            let wave = transport.dispatch(&warm)?;
+            transport.receive(wave, warm_rows, warm_stream.raw()).await
+        }).with_context(|| format!("warming Spark expert transport with {warm_rows} rows"))?;
         warm_stream.finish()?;
-        tracing::info!(transports = warmed, lanes = transports.len(), ranks = peers.len(), rows = warm_rows,
+        tracing::info!(waves = args.prefill_waves, ranks = peers.len(), rows = warm_rows,
             ring_bytes = rings().saturating_sub(before), elapsed_ms = started.elapsed().as_millis() as u64,
-            "Spark expert transports warm");
-        Ok(Some(engine::Experts::Spark { transports: std::cell::RefCell::new(transports), runtime }))
+            "Spark expert transport warm");
+        Ok(Some(engine::Experts::Spark { transport: std::cell::RefCell::new(transport), runtime }))
     }
 }
 

@@ -108,7 +108,8 @@ impl PrefillHooks for UnitHooks<'_, '_, '_> {
             owners[parity] = Some((index, unit.index));
         }
         if e.layer_execution.is_some() {
-            return e.unit_attention([w, self.peer(unit)?.context("owned peer slot")?],
+            let w1 = self.peer.context("owned peer slots")?.get(unit.slot)?;
+            return e.unit_attention([w, w1],
                 &self.ranked[unit.index], unit, index, self.total, &mut self.consumed[unit.index]);
         }
         if let Some(w1) = self.peer(unit)? {
@@ -156,15 +157,15 @@ impl PrefillHooks for UnitHooks<'_, '_, '_> {
         }
         e.moe_front(w, index, layer, unit.rows.len(), rows, PREFILL_CAP,
             &[Span { first: 0, rows: unit.rows.len() }])?;
-        let Some(Experts::Spark { transports, .. }) = e.routed_experts(index) else {
+        let Some(Experts::Spark { transport, .. }) = e.routed_experts(index) else {
             anyhow::bail!("Spark unit without its link");
         };
-        e.spark_dispatch(w, index, unit.rows.len(), false, &mut transports.borrow_mut()[0], ||
+        e.spark_dispatch(w, index, unit.rows.len(), false, &mut transport.borrow_mut(), ||
             e.ffn(w, layer, e.cfg.moe_intermediate, PREFILL_CAP, w.shared.buffer.ptr, rows)).map(Ticket::Spark)
     }
     fn land_experts(&mut self, layer: usize, unit: &Unit, wave: Self::Ticket) -> Result<()> {
         match wave {
-            Ticket::Spark(wave) => self.engine.spark_land_lane(&self.work[unit.slot], unit.rows.len(), 0, wave)?,
+            Ticket::Spark(wave) => self.engine.spark_land_unit(&self.work[unit.slot], unit.rows.len(), wave)?,
             Ticket::Mixed(ticket) => self.engine.unit_ffn_finish(
                 [&self.work[unit.slot], self.peer(unit)?.context("owned peer slot")?],
                 &self.ranked[unit.index], unit, layer, self.total, ticket)?,
@@ -192,7 +193,7 @@ impl PrefillHooks for UnitHooks<'_, '_, '_> {
 }
 
 impl<'a> GlmfEngine<'a> {
-    pub(super) fn step_units_inner(&self, scope: &crate::shared::experts::rtx::pair::SubmissionScope<'_>,
+    pub(super) fn step_units_inner(&self, _scope: &crate::shared::experts::rtx::pair::SubmissionScope<'_>,
         steps: &[(StepTables, &[u32])], logit_rows: usize, device: bool,
         media: Option<&cuteafd_engine::media::RequestMedia>) -> Result<Option<StepLogits>> {
         let waves = self.prefill_waves.min(steps.len()).max(1);

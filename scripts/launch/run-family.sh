@@ -2326,20 +2326,18 @@ if [[ $family == glm5_flash ]]; then
     compact) family_args+=(--index-cache compact) ;;
     *) echo "GLM5_FLASH_INDEX_CACHE must be keys or compact" >&2; exit 2 ;;
   esac
-  # PREFILL_WAVES (1-4) lanes of PREFILL_ROWS rows (whole 64-row
-  # pages up to 4096) take each Spark prefill chunk, every lane with its own exchange in flight;
-  # unset keeps the engine's two lanes of 4096.
-  prefill_lanes="$(get PREFILL_WAVES)"
-  if [[ -n "$prefill_lanes" ]]; then
-    [[ "$prefill_lanes" =~ ^[1-4]$ ]] || { echo "PREFILL_WAVES must be 1 to 4" >&2; exit 2; }
-    family_args+=(--prefill-waves "$prefill_lanes")
+  # Continuous row units share one Spark link; every in-flight wave owns an intake plane.
+  prefill_waves="$(get PREFILL_WAVES)"
+  if [[ -n "$prefill_waves" ]]; then
+    [[ "$prefill_waves" =~ ^[1-4]$ ]] || { echo "PREFILL_WAVES must be 1 to 4" >&2; exit 2; }
+    family_args+=(--prefill-waves "$prefill_waves")
   fi
-  lane_rows="$(get PREFILL_ROWS)"
-  if [[ -n "$lane_rows" ]]; then
-    if ! [[ "$lane_rows" =~ ^[1-9][0-9]*$ ]] || ((lane_rows > 4096 || lane_rows % 64 != 0)); then
+  unit_rows="$(get PREFILL_ROWS)"
+  if [[ -n "$unit_rows" ]]; then
+    if ! [[ "$unit_rows" =~ ^[1-9][0-9]*$ ]] || ((unit_rows > 4096 || unit_rows % 64 != 0)); then
       echo "PREFILL_ROWS must be a multiple of 64 up to 4096" >&2; exit 2
     fi
-    family_args+=(--prefill-rows "$lane_rows")
+    family_args+=(--prefill-rows "$unit_rows")
   fi
   # GLM5_FLASH_HEADROOM_GIB: GPU memory an automatic pool leaves free for runtime growth when
   # every other allocation precedes it (unset: the engine's 2 GiB; a 32 GB card takes 1).
@@ -2700,6 +2698,10 @@ audio_encoder_hash=""
   if ((count_explicit)) || [[ "$backend" == local ]]; then count_args+=(--spark-ranks "$ranks"); fi
   # The plan charges the drafter this launch actually serves (SPECULATOR=off charges none).
   count_args+=(--speculator "$speculator")
+  if [[ "$family" == glm5_flash ]]; then
+    [[ -z "$(get PREFILL_WAVES)" ]] || plan_draft_args+=(--prefill-lanes "$(get PREFILL_WAVES)")
+    [[ -z "$(get PREFILL_ROWS)" ]] || plan_draft_args+=(--prefill-rows "$(get PREFILL_ROWS)")
+  fi
   if [[ "$family" == step5 ]]; then
     [[ -z "$(get PREFILL_WAVES)" ]] || plan_draft_args+=(--prefill-waves "$(get PREFILL_WAVES)")
     plan_mtp_depth=0

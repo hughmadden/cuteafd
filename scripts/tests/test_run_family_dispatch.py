@@ -1188,9 +1188,8 @@ def test_mimo_transport_timing_is_resolved_once_for_all_prefill_lanes():
     ({"model_type": "glm_moe_dsa", "num_hidden_layers": 4, "first_k_dense_replace": 3}, "", {}, 4),
     ({"model_type": "glm_moe_dsa", "num_hidden_layers": 4, "first_k_dense_replace": 3}, "", {"CUTEAFD_GLM_PREFILL_LANES": "1"}, 1),
     ({"model_type": "glm_moe_dsa", "num_hidden_layers": 4, "first_k_dense_replace": 3}, "", {"CUTEAFD_GLM_PREFILL_LANES": "4"}, 5),
-    ({"model_type": "glm5_next"}, "", {}, 2),
-    ({"model_type": "glm5_next"}, "GLM5_FLASH_PREFILL_LANES=4\n", {}, 4),
-    ({"model_type": "glm5_next"}, "GLM5_FLASH_PREFILL_LANES=4\n", {"CUTEAFD_GLMF_PREFILL_LANES": "1"}, 1),
+    ({"model_type": "glm5_next"}, "", {}, 1),
+    ({"model_type": "glm5_next"}, "PREFILL_WAVES=4\n", {}, 1),
     ({"model_type": "qwen4_exp"}, "", {}, 1),
     ({"model_type": "mimo_v2_flash"}, "", {}, 2),
     ({"model_type": "mimo_v2", "hidden_size": 6144}, "", {}, 3),
@@ -1709,14 +1708,14 @@ def test_glmf_index_cache_is_forwarded_only_when_compact(tmp_path, keys, compact
 
 
 @pytest.mark.parametrize("keys,expected,absent", [
-    ("", [], ["--prefill-lanes", "--prefill-lane-rows", "--headroom-gib", "--graph-budget-mib"]),
-    ("GLM5_FLASH_PREFILL_LANES=4\nGLM5_FLASH_PREFILL_LANE_ROWS=2048\n",
-     ["--prefill-lanes 4", "--prefill-lane-rows 2048"], []),
-    ("GLM5_FLASH_PREFILL_LANES=1\n", ["--prefill-lanes 1"], ["--prefill-lane-rows"]),
-    ("GLM5_FLASH_HEADROOM_GIB=1\n", ["--headroom-gib 1"], ["--prefill-lanes"]),
+    ("", [], ["--prefill-waves", "--prefill-rows", "--headroom-gib", "--graph-budget-mib"]),
+    ("PREFILL_WAVES=4\nPREFILL_ROWS=2048\n",
+     ["--prefill-waves 4", "--prefill-rows 2048"], []),
+    ("PREFILL_WAVES=1\n", ["--prefill-waves 1"], ["--prefill-rows"]),
+    ("GLM5_FLASH_HEADROOM_GIB=1\n", ["--headroom-gib 1"], ["--prefill-waves"]),
     ("GLM5_FLASH_GRAPH_BUDGET_MIB=512\n", ["--graph-budget-mib 512"], ["--headroom-gib"]),
 ])
-def test_glmf_lanes_and_headroom_are_forwarded_only_when_set(tmp_path, keys, expected, absent):
+def test_glmf_units_and_headroom_are_forwarded_only_when_set(tmp_path, keys, expected, absent):
     config = {"model_type": "glm5_next", "num_hidden_layers": 2,
               "mlp_layer_types": ["sparse"] * 2,
               "layer_types": ["linear_attention", "deepseek_sparse_attention"]}
@@ -1730,16 +1729,16 @@ def test_glmf_lanes_and_headroom_are_forwarded_only_when_set(tmp_path, keys, exp
 
 
 @pytest.mark.parametrize("key,value,message", [
-    ("GLM5_FLASH_PREFILL_LANES", "0", "GLM5_FLASH_PREFILL_LANES must be 1 to 4"),
-    ("GLM5_FLASH_PREFILL_LANES", "5", "GLM5_FLASH_PREFILL_LANES must be 1 to 4"),
-    ("GLM5_FLASH_PREFILL_LANE_ROWS", "2000", "GLM5_FLASH_PREFILL_LANE_ROWS must be a multiple of 64"),
-    ("GLM5_FLASH_PREFILL_LANE_ROWS", "8192", "GLM5_FLASH_PREFILL_LANE_ROWS must be a multiple of 64"),
-    ("GLM5_FLASH_PREFILL_LANE_ROWS", "0", "GLM5_FLASH_PREFILL_LANE_ROWS must be a multiple of 64"),
+    ("PREFILL_WAVES", "0", "PREFILL_WAVES must be 1 to 4"),
+    ("PREFILL_WAVES", "5", "PREFILL_WAVES must be 1 to 4"),
+    ("PREFILL_ROWS", "2000", "PREFILL_ROWS must be a multiple of 64"),
+    ("PREFILL_ROWS", "8192", "PREFILL_ROWS must be a multiple of 64"),
+    ("PREFILL_ROWS", "0", "PREFILL_ROWS must be a multiple of 64"),
     ("GLM5_FLASH_HEADROOM_GIB", "-1", "GLM5_FLASH_HEADROOM_GIB must be a non-negative size"),
     ("GLM5_FLASH_HEADROOM_GIB", "1GiB", "GLM5_FLASH_HEADROOM_GIB must be a non-negative size"),
     ("GLM5_FLASH_GRAPH_BUDGET_MIB", "0", "GLM5_FLASH_GRAPH_BUDGET_MIB must be a positive whole number"),
 ])
-def test_glmf_invalid_lanes_or_headroom_fail_before_workers_launch(tmp_path, key, value, message):
+def test_glmf_invalid_units_or_headroom_fail_before_workers_launch(tmp_path, key, value, message):
     config = {"model_type": "glm5_next", "num_hidden_layers": 2,
               "mlp_layer_types": ["sparse"] * 2,
               "layer_types": ["linear_attention", "deepseek_sparse_attention"]}
