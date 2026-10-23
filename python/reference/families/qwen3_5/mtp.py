@@ -83,7 +83,7 @@ def main():
 
     import numpy as np
     import torch
-    from transformers import AutoConfig
+    from transformers import AutoConfig, DynamicCache
     from transformers.masking_utils import create_causal_mask
     from transformers.models.qwen3_5 import modeling_qwen3_5 as ref
 
@@ -153,8 +153,9 @@ def main():
         position_embeddings = rotary(h, positions[None].expand(3, -1, -1))
         causal = create_causal_mask(config=config, inputs_embeds=h, attention_mask=None,
                                     past_key_values=None, position_ids=positions, allow_is_causal_skip=False)
+        canonical_cache = DynamicCache(config=config)
         output = layer(h, position_embeddings=position_embeddings, attention_mask=causal,
-                       position_ids=positions, past_key_values=None)[0]
+                       position_ids=positions, past_key_values=canonical_cache)[0]
         feedback = norm(output, "mtp.norm.weight")
         logits = feedback.float() @ weights.get("lm_head.weight").float().T
         if not torch.isfinite(logits).all() or not torch.isfinite(feedback).all():
@@ -163,13 +164,52 @@ def main():
         scored = rows - 1
         accuracy = (argmax[:scored] == ids[2:]).float().mean().item()
         nll = torch.nn.functional.cross_entropy(logits[:scored].double(), ids[2:]).item()
-        selected = logit_rows(rows, args.logit_every)
+        selected = sorted(set(logit_rows(rows, args.logit_every))
+                          | {row for row in range(rows) if row % 64 in (62, 63, 0)})
         args.out.mkdir(parents=True, exist_ok=True)
         feedback.contiguous().view(torch.int16).cpu().numpy().astype("<i2").tofile(args.out / "mtp_streams.bin")
         argmax.to(torch.int32).cpu().numpy().astype("<i4").tofile(args.out / "mtp_argmax.bin")
         logits[selected].contiguous().cpu().numpy().astype("<f4").tofile(args.out / "mtp_logits.bin")
+        embedding_weight = weights.get("model.language_model.embed_tokens.weight")
+        fc_weight = weights.get("mtp.fc.weight")
+        head_weight = weights.get("lm_head.weight").float()
+        chain_logits, chain_feedback, chain_tokens = [], [], []
+        for row in selected:
+            cache = copy.deepcopy(canonical_cache)
+            cache.crop(row + 1)
+            state = feedback[row:row + 1]
+            scores = logits[row:row + 1]
+            row_logits, row_feedback, row_tokens = [], [], []
+            for step in range(3):
+                row_logits.append(scores[0].clone())
+                row_feedback.append(state[0].clone())
+                token = scores.argmax(-1)
+                row_tokens.append(token[0])
+                if step == 2:
+                    break
+                target = norm(state, "mtp.pre_fc_norm_hidden.weight")
+                embedding = norm(torch.nn.functional.embedding(token, embedding_weight),
+                                 "mtp.pre_fc_norm_embedding.weight")
+                chained = torch.nn.functional.linear(torch.cat([embedding, target], dim=-1), fc_weight)[None]
+                position = torch.tensor([[row + step + 1]], device="cuda")
+                rotary_pair = rotary(chained, position[None].expand(3, -1, -1))
+                causal = create_causal_mask(config=config, inputs_embeds=chained, attention_mask=None,
+                                            past_key_values=cache, position_ids=position,
+                                            allow_is_causal_skip=False)
+                output = layer(chained, position_embeddings=rotary_pair, attention_mask=causal,
+                               position_ids=position, past_key_values=cache)[0]
+                state = norm(output, "mtp.norm.weight")
+                scores = state.float() @ head_weight.T
+            chain_logits.append(torch.stack(row_logits))
+            chain_feedback.append(torch.stack(row_feedback))
+            chain_tokens.append(torch.stack(row_tokens))
+        torch.stack(chain_logits).cpu().numpy().astype("<f4").tofile(args.out / "mtp_chain_logits.bin")
+        torch.stack(chain_feedback).view(torch.int16).cpu().numpy().astype("<i2").tofile(args.out / "mtp_chain_streams.bin")
+        torch.stack(chain_tokens).to(torch.int32).cpu().numpy().astype("<i4").tofile(args.out / "mtp_chain_argmax.bin")
     meta = {"family": "qwen3_5", "rows": rows, "hidden": hidden, "vocab": config.vocab_size,
-            "logit_rows": selected, "draft_accuracy": accuracy, "mean_nll": nll,
+            "logit_rows": selected, "chain_rows": selected, "chain_depth": 3,
+            "chain_feedback": "post-mtp.norm", "chain_layer": 0,
+            "draft_accuracy": accuracy, "mean_nll": nll,
             "scored_tokens": scored, "feedback": "post-mtp.norm", "target_hidden": "post-final-norm",
             "concat": ["embedding", "hidden"], "position": "target", "head": "fp32",
             "reference": "vLLM Qwen3_5MultiTokenPredictor contract, locked Transformers block math",

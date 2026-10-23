@@ -221,6 +221,43 @@ impl<'a> Mtp<'a> {
         self.pairs_device(engine, self.tail_hidden(frontier)?, &[token], position, vec![destination], pages)
     }
 
+    fn draft_chain(&mut self, engine: &mut DenseEngine<'_>, anchor: u32, frontier: usize,
+        depth: usize, select: impl FnMut(crate::shared::token_io::DeviceLogits, usize) -> Result<u32>)
+        -> Result<Vec<u32>> {
+        ensure!((1..=3).contains(&depth), "dense MTP chain depth outside 1..=3");
+        let logits = self.resolve_pending_device(engine, anchor, frontier)?;
+        self.chain_from_logits(engine, logits, frontier, depth, select)
+    }
+
+    fn chain_from_logits(&mut self, engine: &mut DenseEngine<'_>,
+        logits: crate::shared::token_io::DeviceLogits, frontier: usize, depth: usize,
+        mut select: impl FnMut(crate::shared::token_io::DeviceLogits, usize) -> Result<u32>) -> Result<Vec<u32>> {
+        ensure!((1..=3).contains(&depth), "dense MTP chain depth outside 1..=3");
+        let reservation = if depth > 1 { Some(self.pool.reserve(self.binding, frontier, depth - 1)?) } else { None };
+        let result = (|| -> Result<Vec<u32>> {
+            let mut tokens = vec![select(logits, 0)?];
+            if let Some(reservation) = reservation {
+                let destinations = self.pool.destinations(reservation)?;
+                let pages = self.pool.page_table(reservation)?;
+                for step in 1..depth {
+                    // pairs_device reuses norm for embeddings; preserve normalized MTP feedback first.
+                    // SAFETY: the owned hidden row and norm plane remain live on the same producer stream.
+                    unsafe { self.library.copy_d2d_async(self.hidden.buffer, engine.planes.norm,
+                        self.layout.hidden_bytes, self.stream)?; }
+                    let logits = self.pairs_device(engine, self.hidden.buffer, &[tokens[step - 1]],
+                        frontier + step - 1, vec![destinations[step - 1]], pages.clone())?;
+                    tokens.push(select(logits, step)?);
+                }
+            }
+            Ok(tokens)
+        })();
+        // Recursive feedback is not canonical target hidden, even when its token is accepted.
+        // Retire every producer before recycling the provisional suffix; update() recomputes it.
+        engine.stream.drain()?;
+        if let Some(reservation) = reservation { self.pool.commit(reservation, 0)?; }
+        result
+    }
+
     fn copy_pages(&self, copies: &[cuteafd_engine::prefix::TailCopy]) -> Result<()> {
         for copy in copies {
             let bytes = 64 * self.layout.record_bytes;
@@ -316,6 +353,14 @@ impl<'a> MtpCache<'a> {
             self.update(engine, slot, start + first, &tokens[first..end], hidden)?;
         }
         Ok(())
+    }
+
+    pub(crate) fn draft_chain(&self, engine: &mut DenseEngine<'a>, slot: usize, anchor: u32,
+        frontier: usize, depth: usize,
+        select: impl FnMut(crate::shared::token_io::DeviceLogits, usize) -> Result<u32>) -> Result<Vec<u32>> {
+        let mut mtp = self.0.borrow_mut();
+        mtp.select_slot(slot)?;
+        mtp.draft_chain(engine, anchor, frontier, depth, select)
     }
 
     pub(crate) fn draft_device(&self, engine: &mut DenseEngine<'a>, slot: usize, anchor: u32,
@@ -517,6 +562,49 @@ pub(crate) fn oracle<'a>(args: &super::super::GoldenArgs, library: &'a NativeLib
             }
         }
     }
+    ensure!(meta["chain_depth"] == 3 && meta["chain_layer"] == 0
+        && meta["chain_feedback"] == "post-mtp.norm" && meta["chain_rows"] == meta["logit_rows"],
+        "dense MTP recursive reference contract differs");
+    let chain_logits = std::fs::read(reference.join("mtp_chain_logits.bin"))?;
+    let chain_hidden = std::fs::read(reference.join("mtp_chain_streams.bin"))?;
+    let chain_best = std::fs::read(reference.join("mtp_chain_argmax.bin"))?;
+    let chains = selected.len() * 3;
+    ensure!(chain_logits.len() == chains * cfg.vocab * 4 && chain_hidden.len() == chains * width
+        && chain_best.len() == chains * 4, "dense MTP recursive reference shape differs");
+    let chain_logits = chain_logits.chunks_exact(4)
+        .map(|v| f32::from_le_bytes(v.try_into().unwrap())).collect::<Vec<_>>();
+    let chain_best = chain_best.chunks_exact(4)
+        .map(|v| u32::from_le_bytes(v.try_into().unwrap())).collect::<Vec<_>>();
+    mtp.reset_slot(0)?;
+    mtp.pool.admit(mtp.binding, rows + 2, 3)?;
+    let (mut chain_hidden_min, mut chain_logit_min, mut chain_agree) = (1.0f64, 1.0f64, 0usize);
+    for position in 0..rows {
+        library.copy_h2d(input.buffer, &source[position * width..(position + 1) * width])?;
+        mtp.norm(&engine, input.buffer, engine.weights.norm.buffer, input.buffer, 1)?;
+        let logits = mtp.step_device(&mut engine, input.buffer, &tokens[position + 1..position + 2], position)?;
+        if let Ok(index) = selected.binary_search(&position) {
+            let feedback = CuteafdDeviceBuffer { bytes: width, ..engine.planes.norm };
+            mtp.chain_from_logits(&mut engine, logits, position + 1, 3, |logits, step| {
+                let scores = logits.to_host(library)?;
+                let row = index * 3 + step;
+                chain_logit_min = chain_logit_min.min(cosine(&scores,
+                    &chain_logits[row * cfg.vocab..(row + 1) * cfg.vocab])?);
+                let mut bytes = vec![0; width];
+                library.copy_d2h(&mut bytes, feedback)?;
+                chain_hidden_min = chain_hidden_min.min(cosine(&bf16(&bytes),
+                    &bf16(&chain_hidden[row * width..(row + 1) * width]))?);
+                let best = scores.iter().enumerate()
+                    .max_by(|(i, a), (j, b)| a.total_cmp(b).then_with(|| j.cmp(i))).unwrap().0 as u32;
+                chain_agree += usize::from(best == chain_best[row]);
+                Ok(best)
+            })?;
+            ensure!(mtp.pool.frontier(mtp.binding)?.1 == position + 1,
+                "dense MTP recursive proposal changed canonical frontier");
+        }
+    }
+    println!("dense MTP chain depths 1/2/3: {chains} rows, hidden cosine worst {chain_hidden_min:.8}, logits cosine worst {chain_logit_min:.8}, greedy agreement {chain_agree}/{chains}");
+    ensure!(chain_hidden_min >= 0.99 && chain_logit_min >= 0.99 && chain_agree == chains,
+        "dense MTP independent recursive oracle failed");
     let hidden_min = hidden_cos.into_iter().fold(1., f64::min);
     let logit_min = logit_cos.into_iter().fold(1., f64::min);
     let nll = nll / (rows - 1) as f64;

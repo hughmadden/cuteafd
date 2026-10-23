@@ -196,9 +196,14 @@ pub(crate) fn check_backend_frontiers(engine: &RefCell<DenseEngine<'_>>, tokens:
             use crate::shared::qwen::scheduler::{DraftSeq, DraftState, DraftTiming};
             let mut state = super::super::serve::DraftState::default();
             state.close(inputs[0]);
-            let proposed = backend.draft(&mut [DraftSeq { placement, seq: &mut state, depth: 1 }],
-                &mut DraftTiming::default())?;
-            ensure!(proposed.len() == 1 && proposed[0].len() == 1, "native serving draft produced no token");
+            let mut previous = Vec::new();
+            for depth in 1..=3 {
+                let proposed = backend.draft(&mut [DraftSeq { placement, seq: &mut state, depth }],
+                    &mut DraftTiming::default())?;
+                ensure!(proposed.len() == 1 && proposed[0].len() == depth
+                    && proposed[0].starts_with(&previous), "native serving recursive draft differs by depth");
+                previous = proposed[0].clone();
+            }
         }
         let start = placement.len;
         let logits = backend.verify_device(&mut [(placement, inputs)], speculative, &pool)?

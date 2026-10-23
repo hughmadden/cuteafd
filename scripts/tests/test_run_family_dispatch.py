@@ -322,7 +322,7 @@ def test_dense_27b_dspark_default_and_explicit_disable(tmp_path, model, selectio
 
 
 @pytest.mark.parametrize("model", ["Qwen/Qwen3.8-27B", "Qwen/Qwen3.8-27B-FP8"])
-@pytest.mark.parametrize("depth", [None, 1])
+@pytest.mark.parametrize("depth", [None, 1, 2, 3])
 def test_dense_27b_native_mtp_needs_no_external_checkpoint(tmp_path, model, depth):
     config = {**DENSE_CONFIG, "text_config": {**DENSE_CONFIG["text_config"],
         "hidden_size": 5120, "mtp_num_hidden_layers": 1}}
@@ -335,7 +335,7 @@ def test_dense_27b_native_mtp_needs_no_external_checkpoint(tmp_path, model, dept
     assert result.returncode == 0, result.stderr
     launch = shlex.split(next(line for line in result.stderr.splitlines() if "serve-qwen35 --snapshot" in line))
     plan = shlex.split(next(line for line in result.stderr.splitlines() if "cuteafd plan " in line))
-    assert launch[launch.index("--mtp") + 1] == "1"
+    assert launch[launch.index("--mtp") + 1] == str(depth or 1)
     assert plan[plan.index("--speculator") + 1] == "mtp"
     assert "--draft" not in launch and "--drafter-snapshot" not in plan
     assert "cuteafd expertd-native" not in result.stderr

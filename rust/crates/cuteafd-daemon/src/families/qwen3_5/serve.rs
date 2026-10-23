@@ -245,7 +245,7 @@ impl<'e, 'a> Backend<'a> for DenseBackend<'e, 'a> {
     }
     fn draft_geometry(&self, _snapshot: &Path, width: usize) -> Result<cuteafd_core::PolicyGeometry> {
         if self.mtp.is_some() {
-            ensure!(width == 1, "dense native MTP currently proposes one token");
+            ensure!((1..=3).contains(&width), "dense native MTP chain depth outside 1..=3");
             let engine = self.engine.borrow();
             return Ok(draft_geometry(engine.cfg.attention.len(), engine.slot_count(), engine.decode_rows(), width));
         }
@@ -272,13 +272,14 @@ impl<'e, 'a> Backend<'a> for DenseBackend<'e, 'a> {
             let mut selector = self.selector.borrow_mut();
             let selector = selector.as_mut().context("dense MTP selector was not admitted")?;
             for (index, sequence) in sequences.iter().enumerate().filter(|(_, sequence)| sequence.depth > 0) {
-                let logits = mtp.draft_device(&mut engine, sequence.placement.slot,
-                    sequence.seq.anchor.context("dense MTP has no anchor")?, sequence.placement.len)?;
-                let batch = SelectBatch { rows: vec![RowSelect { sampling: cuteafd_core::TargetSamplingParams::greedy(),
-                    position: sequence.placement.len as u64, mask: None, logprob: false }] };
-                let selected = selector.select(&logits, &batch)?.into_iter().next()
-                    .context("dense MTP selector returned no row")??;
-                output[index].push(selected.token);
+                output[index] = mtp.draft_chain(&mut engine, sequence.placement.slot,
+                    sequence.seq.anchor.context("dense MTP has no anchor")?, sequence.placement.len,
+                    sequence.depth, |logits, step| {
+                        let batch = SelectBatch { rows: vec![RowSelect { sampling: cuteafd_core::TargetSamplingParams::greedy(),
+                            position: (sequence.placement.len + step) as u64, mask: None, logprob: false }] };
+                        Ok(selector.select(&logits, &batch)?.into_iter().next()
+                            .context("dense MTP selector returned no row")??.token)
+                    })?;
             }
             timing.steps += 1;
             timing.seconds += begin.elapsed().as_secs_f64();
@@ -404,7 +405,7 @@ pub(crate) struct ServeArgs {
     #[arg(long)]
     pub draft_fixed: Option<usize>,
     /// Checkpoint-native one-layer MTP; external dSpark remains the default.
-    #[arg(long, default_value_t = 0, value_parser = clap::value_parser!(u8).range(0..=1), conflicts_with = "draft")]
+    #[arg(long, default_value_t = 0, value_parser = clap::value_parser!(u8).range(0..=3), conflicts_with = "draft")]
     pub mtp: u8,
     #[arg(long, default_value = "0.0.0.0:8000")]
     pub listen: String,
@@ -486,7 +487,7 @@ pub(crate) async fn run_serve(args: ServeArgs) -> Result<()> {
                 backend.mtp = Some(Rc::new(super::engine::mtp::MtpCache::load(&engine.borrow(), &reader, admission)?));
                 backend.selector = RefCell::new(Some(crate::shared::token_io::TokenSelector::new(&library,
                     crate::shared::token_io::SelectPlacement::Device, engine.borrow().cfg.vocab, 1)?));
-                scheduler::Drafts::Neural { depth: 1, fixed: false }
+                scheduler::Drafts::Neural { depth: usize::from(engine_args.mtp), fixed: false }
             } else { scheduler::Drafts::None };
             scheduler::schedule(&backend, &engine_args.snapshot, &mut receive, &worker_stats, lanes,
                 drafts, eos, engine_args.decode_share, &engine_args.prefix,
@@ -629,8 +630,11 @@ mod tests {
     fn native_mtp_is_opt_in_and_excludes_external_drafting() {
         let base = ["dense", "--snapshot", "checkpoint", "--native-lib", "native.so"];
         assert_eq!(Cli::try_parse_from(base).unwrap().serve.mtp, 0);
-        assert_eq!(Cli::try_parse_from(base.into_iter().chain(["--mtp", "1"])).unwrap().serve.mtp, 1);
-        assert!(Cli::try_parse_from(base.into_iter().chain(["--mtp", "2"])).is_err());
+        for depth in ["1", "2", "3"] {
+            assert_eq!(Cli::try_parse_from(base.into_iter().chain(["--mtp", depth])).unwrap().serve.mtp,
+                depth.parse::<u8>().unwrap());
+        }
+        assert!(Cli::try_parse_from(base.into_iter().chain(["--mtp", "4"])).is_err());
         assert!(Cli::try_parse_from(base.into_iter().chain(["--mtp", "1", "--draft", "external"])).is_err());
     }
 
