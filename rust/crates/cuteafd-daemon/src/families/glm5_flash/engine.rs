@@ -439,6 +439,17 @@ struct Tp2Experts<'a> {
     interval: usize,
     steps: Cell<usize>,
     schedule: RefCell<Option<crate::shared::peer_split::order::Schedule>>,
+    unit_checks: RefCell<Option<UnitRouteChecks<'a>>>,
+}
+
+struct RouteHosts<'a> {
+    hosts: [HostAllocation<'a>; 2],
+    collected: [bool; 2],
+}
+
+struct UnitRouteChecks<'a> {
+    slots: crate::shared::experts::rtx::routes::SlotRouteChecks<std::collections::BTreeMap<usize, RouteHosts<'a>>>,
+    units: Vec<usize>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1991,7 +2002,7 @@ impl<'a> GlmfEngine<'a> {
             .transpose().context("CUTEAFD_ROUTE_CHECK must be a nonnegative step interval")?.unwrap_or(0);
         self.tp2 = Some(Tp2Experts { layers, ranks: ranks.map(RefCell::new), combine, routes,
             source: Cell::new(RouteSource::Replicated), checking: Cell::new(false), checks: RefCell::new(Default::default()),
-            interval, steps: Cell::new(0), schedule: RefCell::new(None) });
+            interval, steps: Cell::new(0), schedule: RefCell::new(None), unit_checks: RefCell::new(None) });
         Ok(())
     }
 
@@ -2394,13 +2405,93 @@ impl<'a> GlmfEngine<'a> {
         Ok(())
     }
 
+    fn prepare_unit_route_checks(&self, waves: usize) -> Result<()> {
+        let Some(tp2) = &self.tp2 else { return Ok(()) };
+        ensure!(tp2.unit_checks.borrow().is_none(), "undrained unit route diagnostics");
+        if tp2.interval == 0 || self.warming_graphs.get() { return Ok(()) }
+        let mut storage = Vec::with_capacity(waves);
+        // Pinned allocation may synchronize: reserve every live slot before any peer waits.
+        for _ in 0..waves {
+            let mut layers = std::collections::BTreeMap::new();
+            for &layer in &tp2.layers {
+                let bytes = self.prefill_rows * self.cfg.topk * 8;
+                layers.insert(layer, RouteHosts { hosts: [
+                    self.on(0, || HostAllocation::new(self.library, bytes))?,
+                    self.on(1, || HostAllocation::new(self.library, bytes))?], collected: [false; 2] });
+            }
+            storage.push(layers);
+        }
+        *tp2.unit_checks.borrow_mut() = Some(UnitRouteChecks {
+            slots: crate::shared::experts::rtx::routes::SlotRouteChecks::new(storage, true)?,
+            units: vec![usize::MAX; waves] });
+        Ok(())
+    }
+
+    fn begin_unit_route_checks(&self, unit: &crate::shared::prefill_pipeline::Unit) -> Result<()> {
+        let Some(tp2) = &self.tp2 else { return Ok(()) };
+        let mut checks = tp2.unit_checks.borrow_mut();
+        let Some(checks) = checks.as_mut() else { return Ok(()) };
+        let step = tp2.steps.get() + 1;
+        tp2.steps.set(step);
+        checks.slots.begin(unit.slot, unit.index, unit.rows.len(), step % tp2.interval == 0)?;
+        checks.units[unit.slot] = unit.index;
+        if let Some(layers) = checks.slots.storage(unit.slot, unit.index)? {
+            for hosts in layers.values_mut() { hosts.collected = [false; 2]; }
+        }
+        Ok(())
+    }
+
+    fn finish_unit_route_checks(&self, unit: &crate::shared::prefill_pipeline::Unit) -> Result<()> {
+        let Some(tp2) = &self.tp2 else { return Ok(()) };
+        let mut checks = tp2.unit_checks.borrow_mut();
+        let Some(checks) = checks.as_mut() else { return Ok(()) };
+        let identity = checks.slots.finish(unit.slot, unit.index, |layers, rows| {
+            self.synchronize()?;
+            layers.iter().map(|(&layer, hosts)| {
+                ensure!(hosts.collected == [true; 2], "unit {} missing route collection at layer {layer}", unit.index);
+                let bytes = rows * self.cfg.topk * 8;
+                Ok(RouteCheck { layer, rows, topk: self.cfg.topk,
+                    ranks: std::array::from_fn(|rank| hosts.hosts[rank].bytes()[..bytes].to_vec()) })
+            }).collect()
+        })?;
+        if let Some(identity) = identity {
+            tracing::info!(unit = unit.index, slot = unit.slot, layers_checked = identity.layers_checked,
+                rows_checked = identity.rows_checked, "GLM Flash unit route identity");
+        }
+        Ok(())
+    }
+
+    fn finish_unit_route_span(&self) -> Result<()> {
+        if let Some(tp2) = &self.tp2 {
+            let mut checks = tp2.unit_checks.borrow_mut();
+            if let Some(active) = checks.as_ref() { active.slots.finish_span()?; }
+            // Every enabled unit drained before finish; disabled units queued no staging writes.
+            *checks = None;
+        }
+        Ok(())
+    }
+
     fn collect_tp2_routes(&self, rank: usize, layer: usize, lane: usize, w: &Workspace<'_>, rows: usize) -> Result<()> {
         let tp2 = self.tp2.as_ref().context("TP2 experts")?;
+        if self.unit_prefill.get() {
+            let mut checks = tp2.unit_checks.borrow_mut();
+            let Some(checks) = checks.as_mut() else { return Ok(()) };
+            let unit = *checks.units.get(lane).context("route diagnostic slot")?;
+            let Some(layers) = checks.slots.storage(lane, unit)? else { return Ok(()) };
+            let hosts = layers.get_mut(&layer).context("unit route diagnostic layer")?;
+            ensure!(!hosts.collected[rank], "unit {unit} duplicate rank {rank} route collection at layer {layer}");
+            self.copy_route_check(rank, &hosts.hosts[rank], w, rows)?;
+            hosts.collected[rank] = true;
+            return Ok(());
+        }
         if !tp2.checking.get() || self.warming_graphs.get() { return Ok(()) }
         let checks = tp2.checks.borrow();
         let (expected, hosts) = checks.get(&(layer, lane)).context("route diagnostics not prepared")?;
         ensure!(*expected == rows, "route diagnostics width changed");
-        let host = &hosts[rank];
+        self.copy_route_check(rank, &hosts[rank], w, rows)
+    }
+
+    fn copy_route_check(&self, rank: usize, host: &HostAllocation<'_>, w: &Workspace<'_>, rows: usize) -> Result<()> {
         let bytes = rows * self.cfg.topk * 4;
         self.on(rank, || {
             // SAFETY: the pinned pair stays live until both streams finish this step.

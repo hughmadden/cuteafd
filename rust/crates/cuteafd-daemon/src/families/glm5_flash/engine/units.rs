@@ -75,6 +75,7 @@ impl PrefillHooks for UnitHooks<'_, '_, '_> {
     fn begin_unit(&mut self, unit: &Unit) -> Result<()> {
         let e = self.engine;
         let w = &self.work[unit.slot];
+        e.begin_unit_route_checks(unit)?;
         if unit.index >= self.waves {
             if let Some(event) = &self.released[unit.slot] {
                 // SAFETY: both streams and the per-slot event outlive this call.
@@ -201,7 +202,7 @@ impl PrefillHooks for UnitHooks<'_, '_, '_> {
         }
         Ok(())
     }
-    fn commit_unit(&mut self, _: &Unit) -> Result<()> { Ok(()) }
+    fn commit_unit(&mut self, unit: &Unit) -> Result<()> { self.engine.finish_unit_route_checks(unit) }
 }
 
 impl<'a> GlmfEngine<'a> {
@@ -239,11 +240,7 @@ impl<'a> GlmfEngine<'a> {
         let released = (0..waves).map(|_| self.peer.as_ref().map(|p|
             crate::shared::memory::device::Event::new(crate::shared::memory::device::Device {
                 library: self.library, id: p.device })).transpose()).collect::<Result<_>>()?;
-        // Route diagnostics retain per-slot staging until the call ends: do not alias it
-        // across a slot reuse. Normal routing and the expert requests remain checked.
-        if steps.len() <= waves {
-            self.prepare_route_checks(&steps.iter().map(|(t, _)| t.positions.len()).collect::<Vec<_>>())?;
-        }
+        self.prepare_unit_route_checks(waves)?;
         let mut hooks = UnitHooks { engine: self, steps, ranked, work: &work, peer: peer.as_ref(), released,
             consumed: (0..steps.len()).map(|_| vec![0; self.layer_execution.as_ref()
                 .map_or(0, |execution| execution.plan.hops().len())]).collect(),
@@ -252,8 +249,14 @@ impl<'a> GlmfEngine<'a> {
         self.unit_prefill.set(false);
         self.context_unit.set(0);
         self.context_reuse.set(false);
-        outcome?;
-        if steps.len() <= waves { self.finish_route_checks()?; }
+        let complete = self.finish_unit_route_span();
+        if let Err(error) = outcome {
+            return match complete {
+                Ok(()) => Err(error),
+                Err(unfinished) => Err(error.context(format!("{unfinished:#}"))),
+            };
+        }
+        complete?;
         if logit_rows == 0 { self.synchronize()?; return Ok(None); }
         Ok(Some(if device { StepLogits::Device(hooks.result.context("last-unit logits")?) }
             else { StepLogits::Host(hooks.logits) }))
