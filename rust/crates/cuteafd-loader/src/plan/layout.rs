@@ -253,18 +253,19 @@ impl Default for LayoutOptions {
     }
 }
 
-/// Shared with the GLM runtime so admission and allocation use the same lanes.
-/// Default: 2 units of 4096 rows in flight (PLAN "Prefill contract").
+/// GLM prefill units in flight: the default (None) or a parsed value, clamped
+/// to 1..=4. Default: 2 units of 4096 rows (PLAN "Prefill contract"); serve-glm
+/// takes `--prefill-waves`, the planner `--prefill-lanes`.
 pub fn glm_prefill_lanes(value: Option<&str>) -> usize {
     value.and_then(|v| v.parse().ok()).unwrap_or(2).clamp(1, 4)
 }
 
 /// Additional lead-GPU output bytes for admitted all-row fidelity probes.
-/// GLM uses its configured lanes; GLM Flash's lanes (a serial prefill runs in
+/// GLM uses its default waves (a planner `--prefill-lanes` selects others); GLM Flash's lanes (a serial prefill runs in
 /// the first) share one set of temporaries and so one logits buffer.
 /// V4 reuses its bounded head buffer; V4.1 already supports prefill scoring.
 pub fn full_prefill_logits_bytes(family: &str, rows: u64, vocab: u64) -> u64 {
-    let lanes = glm_prefill_lanes(std::env::var("CUTEAFD_GLM_PREFILL_LANES").ok().as_deref());
+    let lanes = glm_prefill_lanes(None);
     full_prefill_logits_bytes_with_lanes(family, rows, vocab, lanes)
 }
 
@@ -309,7 +310,7 @@ mod scoring_workspace_tests {
         }
         assert_eq!(glm_prefill_lanes(Some("0")), 1);
         assert_eq!(glm_prefill_lanes(Some("9")), 4);
-        assert_eq!(glm_prefill_lanes(Some("invalid")), 3);
+        assert_eq!(glm_prefill_lanes(Some("invalid")), 2);
         assert_eq!(full_prefill_logits_bytes("glm5_flash", 128, 1000), 64 * 1000 * 4);
         for family in ["deepseek_v4", "deepseek_v41"] {
             assert_eq!(full_prefill_logits_bytes(family, 2048, 1000), 0);
@@ -1208,7 +1209,7 @@ pub(crate) fn charge_host(report: &mut PlanReport, options: &LayoutOptions, chec
         Some(transports) => transports,
         None => match family {
             "glm5" => if options.prefill_lanes > 0 { options.prefill_lanes } else {
-                glm_prefill_lanes(std::env::var("CUTEAFD_GLM_PREFILL_LANES").ok().as_deref()) as u64 },
+                glm_prefill_lanes(None) as u64 },
             "glm5_flash" => if options.prefill_lanes > 0 { options.prefill_lanes }
                 else { crate::serving_capacity::GLMF_DEFAULT_PREFILL_LANES },
             "mimo_v2" => {

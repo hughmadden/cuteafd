@@ -61,6 +61,10 @@ pub(crate) struct EngineArgs {
     /// "Prefill contract"); `waves x prefill_rows` restores fixed chunks.
     #[arg(long, default_value_t = engine::DEFAULT_PREFILL_SPAN_ROWS)]
     pub prefill_span_rows: usize,
+    /// Prefill units in flight on the one Spark transport (1 = serial).
+    #[arg(long, default_value_t = cuteafd_loader::plan::layout::glm_prefill_lanes(None) as u8,
+        value_parser = clap::value_parser!(u8).range(1..=4))]
+    pub prefill_waves: u8,
     /// Pool-first by default; local requests require an exported RTX backend.
     #[arg(long, env = "RTX_EXPERT_LAYERS", default_value = "auto")]
     pub rtx_expert_layers: cuteafd_loader::placement::Onboard,
@@ -580,7 +584,7 @@ impl Opened {
             self.library.cuda_set_device(args.device)?;
             context.partial_scratch = selected_scratch?.into_iter().max().unwrap_or(0);
         }
-        let prefill_lanes = glm::prefill_lanes(spark_ranks, engine::configured_lanes() as u64) as usize;
+        let prefill_lanes = glm::prefill_lanes(spark_ranks, u64::from(args.prefill_waves)) as usize;
         let prefill_lanes = if owners.is_some() { prefill_lanes.min(2) } else { prefill_lanes };
         let exchange_f32 = glm::local_exchange_f32()?;
         let local = glm::select_local_inventory(&self.catalog, manifest_path, layers, devices.len(),

@@ -1190,8 +1190,8 @@ def test_mimo_transport_timing_is_resolved_once_for_all_prefill_lanes():
 @pytest.mark.parametrize("config,keys,env,endpoints", [
     ({"model_type": "deepseek_v4"}, "", {}, 2),
     ({"model_type": "glm_moe_dsa", "num_hidden_layers": 4, "first_k_dense_replace": 3}, "", {}, 4),
-    ({"model_type": "glm_moe_dsa", "num_hidden_layers": 4, "first_k_dense_replace": 3}, "", {"CUTEAFD_GLM_PREFILL_LANES": "1"}, 1),
-    ({"model_type": "glm_moe_dsa", "num_hidden_layers": 4, "first_k_dense_replace": 3}, "", {"CUTEAFD_GLM_PREFILL_LANES": "4"}, 5),
+    ({"model_type": "glm_moe_dsa", "num_hidden_layers": 4, "first_k_dense_replace": 3}, "PREFILL_WAVES=1\n", {}, 1),
+    ({"model_type": "glm_moe_dsa", "num_hidden_layers": 4, "first_k_dense_replace": 3}, "PREFILL_WAVES=4\n", {}, 5),
     ({"model_type": "glm5_next"}, "", {}, 1),
     ({"model_type": "glm5_next"}, "PREFILL_WAVES=4\n", {}, 1),
     ({"model_type": "qwen4_exp"}, "", {}, 1),
@@ -1378,7 +1378,7 @@ def test_glm53_all_local_two_rtx_launch_has_no_spark_peers(tmp_path):
     assert "--peers" not in launch
     assert "cuteafd expertd-native" not in result.stderr
     assert "--local-experts" not in launch
-    assert "CUTEAFD_GLM_PREFILL_LANES=1" in launch
+    assert "--prefill-waves 1" in launch and "CUTEAFD_GLM_PREFILL_LANES" not in launch
     assert "--rdma-endpoints" not in result.stderr
 
 

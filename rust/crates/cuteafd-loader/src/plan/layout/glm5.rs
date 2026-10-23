@@ -54,7 +54,7 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyMod
             local_package(report), split, index, options.rtx_bytes[index]));
     }
     let lanes = if options.prefill_lanes > 0 { options.prefill_lanes }
-        else { glm_prefill_lanes(std::env::var("CUTEAFD_GLM_PREFILL_LANES").ok().as_deref()) as u64 };
+        else { glm_prefill_lanes(None) as u64 };
     let spark_ranks = match report.placement { ExpertPlacement::Sparks { ranks } => ranks, ExpertPlacement::Local => 0 };
     let mut working = crate::placement::SparkWorkingSet { rtx_layers: Vec::new(),
         spark_layers: if spark_ranks > 0 { (0..model.spec().layers.len()).collect() } else { Vec::new() },
@@ -275,7 +275,7 @@ fn placement(report: &PlanReport, input: &crate::plan::PlanInput, options: &Layo
     let cfg = crate::families::glm5::GlmDsaConfig::from_hf(&checkpoint.config)?;
     let spark_ranks = match report.placement { ExpertPlacement::Sparks { ranks } => ranks, ExpertPlacement::Local => 0 };
     let mut lanes = glm::prefill_lanes(spark_ranks, if options.prefill_lanes > 0 { options.prefill_lanes }
-        else { glm_prefill_lanes(std::env::var("CUTEAFD_GLM_PREFILL_LANES").ok().as_deref()) as u64 });
+        else { glm_prefill_lanes(None) as u64 });
     if report.requested_attention == Some(crate::placement::AttentionPlacement::Layers) { lanes = lanes.min(2); }
     let (draft, draft_staging, active_drafts) = drafter_admission(options)?;
     let attention_plan = cuteafd_core::coordinator_programs::AttentionReductionPlan::new(
@@ -370,7 +370,7 @@ pub fn native_layout(checkpoint: &Checkpoint, options: &LayoutOptions, shared_by
         headroom_bytes: options.headroom_bytes, spark_ranks, native_experts: true,
         native_workspace: workspace, skip_routed_experts: false, prefill_rows: rows,
         prefill_lanes: glm::prefill_lanes(spark_ranks, if options.prefill_lanes > 0 { options.prefill_lanes }
-            else { glm_prefill_lanes(std::env::var("CUTEAFD_GLM_PREFILL_LANES").ok().as_deref()) as u64 }),
+            else { glm_prefill_lanes(None) as u64 }),
         max_context: context, automatic_context: false, scratch: Some(scratch), drafter_bytes: draft,
         drafter_staging: draft_staging, pending_code: Vec::new(), experts: Vec::new(), expert_workspace: 0,
         tp2_workspace: [0; 2], requested_pool: Some(requested_pool), onboard: Onboard::Layers(0),

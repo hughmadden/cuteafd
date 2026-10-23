@@ -2562,13 +2562,15 @@ lane_env_args=()
 case "$family" in
   deepseek_v4) ;;
   glm5)
-    # PREFILL_WAVES (shared prefill units in flight) wins over the legacy lane key.
-    selected_lanes="$(get PREFILL_WAVES "${CUTEAFD_GLM_PREFILL_LANES:-2}")"
-    [[ "$selected_lanes" =~ ^[1-4]$ ]] || { echo "CUTEAFD_GLM_PREFILL_LANES must be 1 to 4" >&2; exit 2; }
+    # PREFILL_WAVES: shared prefill units in flight (default 2; one with no
+    # Sparks). The planner and serve-glm both take it as a flag.
+    selected_lanes="$(get PREFILL_WAVES 2)"
+    [[ "$selected_lanes" =~ ^[1-4]$ ]] || { echo "PREFILL_WAVES must be 1 to 4" >&2; exit 2; }
     if [[ "$ranks" == 0 ]]; then
       selected_lanes=1
     fi
-    lane_env_args+=(-e "CUTEAFD_GLM_PREFILL_LANES=$selected_lanes") ;;
+    glm_prefill_waves="$selected_lanes"
+    family_args+=(--prefill-waves "$selected_lanes") ;;
   glm5_flash)
     # Planner and server must offer the same conditional drafter homes.
     # Explicit config overrides the legacy process-wide diagnostic switch.
@@ -2620,6 +2622,7 @@ audio_encoder_hash=""
     plan_gib="$(python3 -c 'import sys;f,t,b=map(float,sys.argv[1:]);print(max(0,b-(t-f)/1024))' "$free_mib" "$total_mib" "$profile_gib")"
   fi
   plan_draft_args=(--concurrency "$effective_concurrency" --mapped-scale-preload-gib "$(get MAPPED_SCALE_PRELOAD_GIB 0)")
+  [[ -z "${glm_prefill_waves:-}" ]] || plan_draft_args+=(--prefill-lanes "$glm_prefill_waves")
   if [[ "$family:$speculator" == qwen3_5:dspark ]]; then
     plan_draft_args+=(--drafter-snapshot "$draft_snapshot")
   fi

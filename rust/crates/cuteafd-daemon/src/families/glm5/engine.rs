@@ -61,8 +61,8 @@ const MAX_RANKS: usize = crate::shared::spark_intake::MAX_INTAKE_RANKS;
 const SKIP_RANKS: usize = cuteafd_loader::placement::families::glm5::SKIP_RANKS;
 /// Rows of the decode-route programs (`_m64`).
 pub(crate) const DECODE_ROWS: usize = 64;
-/// Most lanes a long Spark prefill chunk splits into (CUTEAFD_GLM_PREFILL_LANES,
-/// default 3; 1 is the serial path), and the fewest rows per
+/// Most lanes a long Spark prefill chunk splits into (serve `--prefill-waves`,
+/// default 2; 1 is the serial path), and the fewest rows per
 /// lane worth another exchange per layer.
 pub(crate) const PREFILL_LANES: usize = 4;
 const MIN_LANE_ROWS: usize = 256;
@@ -299,7 +299,7 @@ pub(crate) struct GlmEngine<'a> {
     /// One prefill workspace per lane (a serial prefill uses the first) and
     /// one Spark transport thread per lane: a lane's request assembly,
     /// post, polling and partial copies run there while this thread queues
-    /// GPU work. Without lane transports, or with CUTEAFD_GLM_PREFILL_LANES=1,
+    /// GPU work. Without lane transports, or with `--prefill-waves 1`,
     /// prefill is serial on the caller's transport.
     lane_workspaces: RefCell<Vec<Workspace<'a>>>,
     /// Prefill units in flight on the one Spark transport (PLAN "Prefill
@@ -1783,12 +1783,9 @@ impl<'a> GlmEngine<'a> {
             } else { [tables.clone(), tables.clone()] });
         }
         *self.context_units.borrow_mut() = vec![[context::ContextUnit::default(); 2]; lanes.len()];
-        // TP2 route diagnostics key their staging by (layer, lane): only calls whose
-        // units each own a slot take part (others leave `checking` off).
-        let route_checks = lanes.len() <= waves;
-        if let (Some(pair), true) = (&self.tp2, route_checks) { pair.begin_checks(&counts, self.force_route_check.get())?; }
         if self.layer_execution.is_some() {
             ensure!(lanes.len() <= waves, "owned-attention prefill takes one unit per slot");
+            if let Some(pair) = &self.tp2 { pair.begin_checks(&counts, self.force_route_check.get())?; }
             for (unit, w) in workspaces.iter().enumerate() {
                 self.put_tables(w, &ranked[unit][0])?;
                 if let Some(peers) = &peer_workspaces { self.on(1, || self.put_tables(peers.get(unit)?, &ranked[unit][1]))?; }
@@ -1933,8 +1930,12 @@ impl<'a> GlmEngine<'a> {
             .map(|p| p.get(slot)).transpose()).collect::<Result<_>>()?;
         let mut hooks = UnitHooks { engine: self, workspaces: &workspaces, peers: &peers, layers, counts: &counts,
             begin: &begin, attention: &attention, post: &post, link, runtime, cap, waves };
-        crate::shared::prefill_pipeline::run_prefill_units(&mut hooks, &unit_list, waves)?;
-        if let (Some(pair), true) = (&self.tp2, route_checks) { pair.finish_checks()?; }
+        // TP2 route diagnostics: every unit checks its own rows on its own slot
+        // (slot storage exists before any peer wait); the span always closes,
+        // also before an executor error propagates.
+        if let Some(pair) = &self.tp2 { pair.start_checks(self.force_route_check.get())?; }
+        let ran = crate::shared::prefill_pipeline::run_prefill_units(&mut hooks, &unit_list, waves);
+        if let Some(pair) = &self.tp2 { ran.and(pair.finish_span())?; } else { ran?; }
         // The last unit's workspace holds the call's last rows.
         let last = lanes.len() - 1;
         self.prefill_logits(&[workspaces[last % waves]], &[counts[last]], logit_rows)
@@ -2277,7 +2278,6 @@ pub(crate) fn print_mla_check(layer: usize, stats: &[[f64; 3]; 5]) {
         .collect::<Vec<_>>().join(" | "));
 }
 
-/// Prefill lanes: CUTEAFD_GLM_PREFILL_LANES (1 = serial), default 3.
 /// GLM's per-unit hooks over the unchanged lane arithmetic. Unit `u` holds
 /// workspace slot `u % waves` (rank 0's and rank 1's) and that slot's
 /// exchange lane; its Spark waves go out on the prefill link, one return slot each.
@@ -2308,6 +2308,7 @@ where B: Fn(usize) -> Result<()>,
         } else { crate::shared::prefill_pipeline::FfnRoute::Spark }
     }
     fn begin_unit(&mut self, unit: &crate::shared::prefill_pipeline::Unit) -> Result<()> {
+        if let Some(pair) = &self.engine.tp2 { pair.begin_unit(unit.slot, unit.index, self.counts[unit.index])?; }
         (self.begin)(unit.index)
     }
     fn attention(&mut self, layer: usize, unit: &crate::shared::prefill_pipeline::Unit) -> Result<()> {
@@ -2336,17 +2337,17 @@ where B: Fn(usize) -> Result<()>,
         (self.post)(layer, unit.index, Some((self.link.intake.pointers(), ranks)))?;
         self.link.intake.consumed(self.engine.stream)
     }
-    fn end_unit(&mut self, _: &crate::shared::prefill_pipeline::Unit) -> Result<()> { Ok(()) }
+    fn end_unit(&mut self, unit: &crate::shared::prefill_pipeline::Unit) -> Result<()> {
+        // Drains (diagnostics only) and compares this unit's routes before its slot is reused.
+        if let Some(pair) = &self.engine.tp2 { pair.finish_unit(unit.slot, unit.index)?; }
+        Ok(())
+    }
     fn commit_unit(&mut self, _: &crate::shared::prefill_pipeline::Unit) -> Result<()> { Ok(()) }
 }
 
 /// Default rows per continuous prefill span (shared PREFILL_SPAN_ROWS key).
 pub(crate) const DEFAULT_PREFILL_SPAN_ROWS: usize = 16384;
 
-pub(crate) fn configured_lanes() -> usize {
-    cuteafd_loader::plan::layout::glm_prefill_lanes(
-        std::env::var("CUTEAFD_GLM_PREFILL_LANES").ok().as_deref())
-}
 
 /// The expert request of `t` staged rows: expert ids (U32) and gate
 /// weights (F32) `[t, topk]`, then the FP8 wire rows, as `moe_stage` lays
@@ -2520,6 +2521,68 @@ mod prefill_unit_tests {
         assert!(set < peer && set < own, "the plan is selected before either rank's attention");
         let tables = source.split("fn step_tables(").nth(1).unwrap().split("\n    }\n").next().unwrap();
         assert!(tables.contains("self.context_unit.set(usize::MAX)"), "single-pass steps reset the unit cursor");
+    }
+
+    /// GLM's hook mapping for TP2 route diagnostics (begin at Begin on the
+    /// unit's slot, capture in the TP2 local FFN, finish at End, span closed
+    /// after the executor) over the real executor on a long span: every unit
+    /// is checked, including units on recycled slots, and a later unit's
+    /// corruption fails strict checks naming that unit and slot.
+    #[test]
+    fn route_checks_cover_every_unit_on_recycled_slots() {
+        use crate::shared::experts::rtx::{routes::SlotRouteChecks, RouteCheck};
+        use crate::shared::prefill_pipeline::{run_prefill_units, sequence_units, FfnRoute, PrefillHooks, Unit};
+        struct Hooks { checks: SlotRouteChecks<Vec<RouteCheck>>, corrupt: Option<usize>, checked: Vec<usize> }
+        impl PrefillHooks for Hooks {
+            type Ticket = ();
+            fn route(&self, layer: usize) -> FfnRoute { if layer % 2 == 0 { FfnRoute::Local } else { FfnRoute::Spark } }
+            fn begin_unit(&mut self, unit: &Unit) -> anyhow::Result<()> {
+                self.checks.begin(unit.slot, unit.index, unit.rows.len(), true)
+            }
+            fn attention(&mut self, _: usize, _: &Unit) -> anyhow::Result<()> { Ok(()) }
+            fn local_ffn(&mut self, layer: usize, unit: &Unit) -> anyhow::Result<()> {
+                let rows = unit.rows.len();
+                let ids = vec![0u8; rows * 2 * 8];
+                let mut peer = ids.clone();
+                if self.corrupt == Some(unit.index) && layer == 2 { peer[3 * 8] ^= 1; }
+                self.checks.storage(unit.slot, unit.index)?.unwrap()
+                    .push(RouteCheck { layer, rows, topk: 2, ranks: [ids, peer] });
+                Ok(())
+            }
+            fn send_experts(&mut self, _: usize, _: &Unit) -> anyhow::Result<()> { Ok(()) }
+            fn land_experts(&mut self, _: usize, _: &Unit, _: ()) -> anyhow::Result<()> { Ok(()) }
+            fn end_unit(&mut self, unit: &Unit) -> anyhow::Result<()> {
+                let identity = self.checks.finish(unit.slot, unit.index,
+                    |storage, rows| { assert!(storage.iter().all(|c| c.rows == rows)); Ok(std::mem::take(storage)) })?;
+                assert_eq!(identity.unwrap().layers_checked, 2);
+                self.checked.push(unit.index);
+                Ok(())
+            }
+            fn commit_unit(&mut self, _: &Unit) -> anyhow::Result<()> { Ok(()) }
+        }
+        let run = |corrupt| {
+            let units = sequence_units(16384, 4096, 2, 4).unwrap();
+            assert!(units.len() > 2 && units.iter().any(|u| u.index >= 2 && u.slot == u.index % 2));
+            let mut hooks = Hooks { checks: SlotRouteChecks::new(vec![Vec::new(), Vec::new()], true).unwrap(),
+                corrupt, checked: Vec::new() };
+            let ran = run_prefill_units(&mut hooks, &units, 2);
+            let result = ran.and(hooks.checks.finish_span());
+            (result, hooks.checked)
+        };
+        let (result, checked) = run(None);
+        result.unwrap();
+        assert_eq!(checked, vec![0, 1, 2, 3], "every unit, including those on recycled slots, is checked");
+        let (result, checked) = run(Some(3));
+        let error = result.unwrap_err().to_string();
+        assert!(error.contains("unit 3, slot 1, layer 2, row 3"), "{error}");
+        assert_eq!(checked, vec![0, 1, 2]);
+        // The engine wires that mapping, with no single-slot-only gate.
+        let source = include_str!("engine.rs");
+        assert!(!source.contains(concat!("route_checks = lanes.len() ", "<= waves")));
+        let hooks = source.split("impl<B, A, P> crate::shared::prefill_pipeline::PrefillHooks").nth(1).unwrap();
+        assert!(hooks.contains("pair.begin_unit(unit.slot, unit.index"));
+        assert!(hooks.contains("pair.finish_unit(unit.slot, unit.index)"));
+        assert!(source.contains("ran.and(pair.finish_span())"), "the span closes even when the executor fails");
     }
 
     #[test]
