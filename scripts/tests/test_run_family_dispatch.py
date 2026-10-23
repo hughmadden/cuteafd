@@ -581,7 +581,7 @@ def test_glmf_selection_starts_after_solve_and_seals_before_opening_lanes() -> N
     assert body.index("load_while_admitting(admission,") < body.index("TokenEmbedding::load(")
     assert body.index("TokenEmbedding::load(") < body.index("engine::GlmfEngine::new(")
     assert "let spark = !spark_layers.is_empty();" in body
-    assert "selected_args.prefill_lanes = usize::try_from(working.prefill_lanes)?;" in body
+    assert "selected_args.prefill_waves = usize::try_from(working.prefill_lanes)?;" in body
     assert body.index("working.prefill_lanes") < body.index("TokenEmbedding::load(")
     assert "spark_layers == working.spark_layers" in body
     assert "rtx_layers == working.rtx_layers" in body

@@ -4,6 +4,14 @@ use crate::shared::prefill_pipeline::{FfnRoute, PrefillHooks, Unit, run_prefill_
 
 enum Ticket { Spark(SparkExpertWave), Mixed(layers::Ticket) }
 
+/// The MLA ordinal, not the absolute layer, selects Flash's two staging views.
+fn staging_turn(owners: &mut [Option<(usize, usize)>; 2], ordinal: usize, layer: usize, unit: usize) -> bool {
+    let owner = &mut owners[ordinal % 2];
+    let reuse = unit > 0 && *owner == Some((layer, unit - 1));
+    *owner = Some((layer, unit));
+    reuse
+}
+
 struct UnitHooks<'e, 'a, 'w> {
     engine: &'e GlmfEngine<'a>,
     steps: &'w [(StepTables, &'w [u32])],
@@ -102,10 +110,8 @@ impl PrefillHooks for UnitHooks<'_, '_, '_> {
         let rows = Scalar::I32(unit.rows.len() as i32);
         e.context_unit.set(unit.index);
         if e.context.is_some() && layer.attention == GlmNextAttention::Mla {
-            let parity = e.caches.mla_ordinal[index].context("MLA ordinal")? % 2;
-            let mut owners = e.staging_owner.borrow_mut();
-            e.context_reuse.set(unit.index > 0 && owners[parity] == Some((index, unit.index - 1)));
-            owners[parity] = Some((index, unit.index));
+            let ordinal = e.caches.mla_ordinal[index].context("MLA ordinal")?;
+            e.context_reuse.set(staging_turn(&mut e.staging_owner.borrow_mut(), ordinal, index, unit.index));
         }
         if e.layer_execution.is_some() {
             let w1 = self.peer.context("owned peer slots")?.get(unit.slot)?;
@@ -175,6 +181,10 @@ impl PrefillHooks for UnitHooks<'_, '_, '_> {
     fn end_unit(&mut self, unit: &Unit) -> Result<()> {
         let e = self.engine;
         let w = &self.work[unit.slot];
+        if e.layer_execution.is_some() {
+            let w1 = self.peer.context("owned peer slots")?.get(unit.slot)?;
+            e.unit_exit([w, w1], &self.ranked[unit.index], unit, self.total, &mut self.consumed[unit.index])?;
+        }
         if let Some(w1) = self.peer(unit)? { e.replicate_terminal(w, w1, 0, unit.rows.len())?; }
         let wanted = unit.rows.end.saturating_sub((self.total - self.wanted).max(unit.rows.start));
         if wanted > 0 {
@@ -245,5 +255,111 @@ impl<'a> GlmfEngine<'a> {
         if logit_rows == 0 { self.synchronize()?; return Ok(None); }
         Ok(Some(if device { StepLogits::Device(hooks.result.context("last-unit logits")?) }
             else { StepLogits::Host(hooks.logits) }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::shared::prefill_pipeline::{prefill_schedule, sequence_units, Step};
+    use std::collections::VecDeque;
+
+    #[test]
+    fn mla_staging_requires_same_layer_immediate_predecessor() {
+        let mut owners = [None; 2];
+        assert!(!staging_turn(&mut owners, 0, 3, 0));
+        assert!(staging_turn(&mut owners, 0, 3, 1));
+        // All Flash MLA layers have odd absolute parity, but adjacent MLA
+        // ordinals use different views. KDA layers do not touch either view.
+        assert!(!staging_turn(&mut owners, 1, 7, 0));
+        assert!(staging_turn(&mut owners, 0, 3, 2));
+        assert!(!staging_turn(&mut owners, 2, 11, 0));
+        assert!(!staging_turn(&mut owners, 0, 3, 3));
+        assert!(!staging_turn(&mut owners, 0, 3, 5));
+    }
+
+    fn routes(onboard: usize) -> Vec<FfnRoute> {
+        (0..45).map(|layer| if layer < 3 + onboard { FfnRoute::Local } else { FfnRoute::Spark }).collect()
+    }
+
+    #[test]
+    fn flash_units_keep_kda_and_mla_causal_across_slot_reuse() -> Result<()> {
+        for waves in 1..=4 {
+            let units = sequence_units(65536, 4096, waves, 45)?;
+            for onboard in [0, 7, 42] {
+                let routes = routes(onboard);
+                let steps = prefill_schedule(&routes, &units, waves)?;
+                let mut slots = vec![None; waves];
+                let mut attention = vec![0; 45];
+                let mut pending = VecDeque::new();
+                let mut committed = 0;
+                for step in steps {
+                    match step {
+                        Step::Begin { unit } => {
+                            assert!(slots[units[unit].slot].replace(unit).is_none());
+                        }
+                        Step::Attention { layer, unit } => {
+                            assert_eq!(slots[units[unit].slot], Some(unit));
+                            assert_eq!(attention[layer], unit);
+                            attention[layer] += 1;
+                        }
+                        Step::Send { layer, unit } => {
+                            assert_eq!(routes[layer], FfnRoute::Spark);
+                            pending.push_back((layer, unit));
+                            assert!(pending.len() <= waves);
+                        }
+                        Step::Land { layer, unit } => assert_eq!(pending.pop_front(), Some((layer, unit))),
+                        Step::Commit { unit } => {
+                            assert_eq!(unit, committed);
+                            assert_eq!(slots[units[unit].slot].take(), Some(unit));
+                            committed += 1;
+                        }
+                        _ => {}
+                    }
+                }
+                assert_eq!(committed, units.len());
+                assert!(pending.is_empty());
+                assert_eq!(attention, vec![units.len(); 45]);
+            }
+        }
+        Ok(())
+    }
+
+    fn occupancy(steps: &[Step]) -> (f64, f64) {
+        let (mut gpu, mut free, mut idle) = (0.0_f64, 0.0_f64, 0.0_f64);
+        let mut pending = VecDeque::new();
+        let mut sent = false;
+        for step in steps {
+            match step {
+                Step::Attention { .. } | Step::Local { .. } => gpu += 4.0,
+                Step::Send { .. } => {
+                    gpu += 1.0;
+                    let start = gpu.max(free);
+                    if sent { idle += start - free; }
+                    sent = true;
+                    free = start + 10.0;
+                    pending.push_back(free);
+                }
+                Step::Land { .. } => gpu = gpu.max(pending.pop_front().unwrap()) + 1.0,
+                _ => {}
+            }
+        }
+        (gpu, idle)
+    }
+
+    #[test]
+    fn flash_two_wave_occupancy_only_pays_the_new_units_local_lead() -> Result<()> {
+        let units = sequence_units(65536, 4096, 2, 45)?;
+        for onboard in [0, 3, 7] {
+            let routes = routes(onboard);
+            let two = prefill_schedule(&routes, &units, 2)?;
+            let one = prefill_schedule(&routes, &sequence_units(65536, 4096, 1, 45)?, 1)?;
+            let (time, idle) = occupancy(&two);
+            let (serial_time, serial_idle) = occupancy(&one);
+            let lead = 4.0 * (2 * (3 + onboard) + 1) as f64 + 2.0;
+            assert!(idle <= (units.len() - 1) as f64 * (lead - 10.0).max(0.0) + 1e-9);
+            assert!(time < serial_time && idle < serial_idle);
+        }
+        Ok(())
     }
 }

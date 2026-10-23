@@ -89,7 +89,8 @@ impl<'a> GlmfEngine<'a> {
         // Context tables currently describe one global unit partition, not per-layer geometry.
         ensure!(self.context.is_none() && !plan.modes().contains(&LayerMode::ContextSplit),
             "GLM mixed context execution requires per-layer paging tables");
-        cuteafd_loader::placement::validate_layer_pipeline_lanes(plan.spec().lanes, self.prefill_waves)?;
+        ensure!(plan.spec().lanes == self.prefill_waves as u64 && (1..=4).contains(&self.prefill_waves),
+            "GLM Flash hop slots must match admitted unit slots");
         ensure!(plan.modes().iter().all(|mode| !matches!(mode,
             LayerMode::Whole { ffn: FfnMode::Owner, .. })), "GLM layer executor requires split FFNs");
         let exchange = self.exchange()?;
@@ -194,6 +195,18 @@ impl<'a> GlmfEngine<'a> {
     pub(super) fn unit_ffn_finish(&self, work: [&Workspace<'a>; 2], tables: &[StepTables; 2],
         unit: &crate::shared::prefill_pipeline::Unit, layer: usize, total: usize, ticket: Ticket) -> Result<()> {
         self.unit_binding(work, tables, unit, total, Some(layer)).finish_ffn(layer, ticket)
+    }
+
+    pub(super) fn unit_exit(&self, work: [&Workspace<'a>; 2], tables: &[StepTables; 2],
+        unit: &crate::shared::prefill_pipeline::Unit, total: usize, consumed: &mut [usize]) -> Result<()> {
+        let execution = self.layer_execution.as_ref().context("per-layer execution")?;
+        let exchange = RecordedExchange { engine: self, execution, entry: Cell::new(None) };
+        let mut binding = self.unit_binding(work, tables, unit, total, Some(unit.layers.end));
+        attention::pipeline_hops(&exchange, &execution.plan, HopPoint::Exit, unit.slot, unit.rows.len(),
+            &mut binding, consumed)?;
+        ensure!(consumed.len() == execution.plan.hops().len() && consumed.iter().all(|&count| count == 1),
+            "planned unit hop missing or duplicated");
+        Ok(())
     }
 
     pub(super) fn layer_head(&self, w: &Workspace<'_>, rows: usize, wanted: usize) -> Result<()> {

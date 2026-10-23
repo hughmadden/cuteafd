@@ -1544,7 +1544,7 @@ mod tests {
     }
 
     #[test]
-    fn layers_admission_rejects_four_lanes_without_changing_the_spark_only_path() {
+    fn unit_admission_preserves_all_four_slots_for_every_attention_mode() {
         let cfg = GlmNextConfig::from_hf(&crate::plan::testing::glm5_flash_config(45)).unwrap();
         let mut input = inputs(&cfg, 2, inventory::PRO_TOTAL_BYTES);
         input.prefill_lanes = 4;
@@ -1553,12 +1553,12 @@ mod tests {
             assert_eq!(GlmfWorkingSet::candidate(&input, 0).unwrap().prefill_lanes, 4);
         }
         input.attention.mode = AttentionPlacement::Layers;
-        assert!(GlmfWorkingSet::candidate(&input, 0).is_err());
-        for lanes in [1, 2] {
+        assert_eq!(GlmfWorkingSet::candidate(&input, 0).unwrap().prefill_lanes, 4);
+        for lanes in [1, 2, 3, 4] {
             input.prefill_lanes = lanes;
             assert_eq!(GlmfWorkingSet::candidate(&input, 0).unwrap().prefill_lanes, lanes);
         }
-        assert_eq!(GlmfWorkingSet::candidate(&input, input.experts.len()).unwrap().prefill_lanes, 2);
+        assert_eq!(GlmfWorkingSet::candidate(&input, input.experts.len()).unwrap().prefill_lanes, 4);
     }
 
     #[test]

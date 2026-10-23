@@ -97,6 +97,7 @@ mod layers;
 mod units;
 pub(crate) use cuteafd_loader::placement::families::glm5_flash::GlmfAttention;
 
+const HC: usize = 4;
 pub(crate) const PAGE_ROWS: usize = 64;
 /// Rows of the decode-route programs (`_m64`).
 pub(crate) const DECODE_ROWS: usize = 64;
@@ -1023,7 +1024,7 @@ impl<'a> StepPlan<'_, 'a> {
     /// All live prefill rows share one allocation; hook-local scratch stays separate.
     fn slots(&self, rank: usize, rows: usize, count: usize) -> Result<Vec<Workspace<'a>>> {
         let _scope = cuteafd_ffi::memory_ledger::scope("workspace");
-        let bytes = glmf_lane_bytes(self.cfg, rows as u64, false, &self.shape(rank)).device_bytes();
+        let bytes = glmf_lane_bytes(self.cfg, rows as u64, false, &self.shape(rank)).arena_bytes();
         let owner = Rc::new(DeviceAllocation::new(self.library,
             usize::try_from(bytes)?.checked_mul(count).context("prefill arena overflow")?)?);
         let temps = Rc::new(self.temporaries(rank, rows, false)?);
@@ -1031,7 +1032,7 @@ impl<'a> StepPlan<'_, 'a> {
         (0..count).map(|_| self.slot(rank, rows, false, temps.clone(), &mut |bytes| {
             let bytes = usize::try_from(bytes)?.max(256);
             let view = Dev::view(owner.clone(), offset, bytes)?;
-            offset += bytes;
+            offset += bytes.next_multiple_of(256);
             Ok(view)
         })).collect()
     }
@@ -3302,14 +3303,12 @@ impl<'a> GlmfEngine<'a> {
             self.prefill_waves, UNIT_ROWS)?.into_iter().map(|r| r.len()).collect())
     }
 
-    /// Whether prefill runs in admitted lanes (a transport per lane only for Spark homes).
-    /// CUTEAFD_GLMF_PREFILL_LANES=1 keeps the serial one-workspace prefill (A/B runs).
+    /// Complete models use the shared unit executor; diagnostic layer prefixes stay serial.
     fn pipelined(&self) -> bool {
         self.weights.layers.len() == self.cfg.layers
     }
 
-    /// Longest chunk one prefill call takes: a lane of `prefill_rows` rows
-    /// each when Spark prefill is pipelined.
+    /// The continuous span may reuse all admitted slots within a call.
     pub fn prefill_capacity(&self) -> usize {
         if self.pipelined() {
             std::env::var("CUTEAFD_PREFILL_SPAN_ROWS").ok().and_then(|v| v.parse::<usize>().ok())
@@ -3317,13 +3316,11 @@ impl<'a> GlmfEngine<'a> {
         } else { self.prefill_rows }
     }
 
-    /// A Spark prefill chunk as up to `prefill_waves` lanes of consecutive
-    /// rows (see [`Self::step_lanes`]).
+    /// A continuous span, split into page-aligned units with at most `prefill_waves` live.
     fn prefill_units(&self, placement: &mut GlmfPlacement, tokens: &[u32], all_logits: bool, device: bool, media: Option<&cuteafd_engine::media::RequestMedia>)
         -> Result<Option<StepLogits>> {
         let (start, t) = (placement.len, tokens.len());
-        // Lanes split at a multiple of 64 rows (an MLA page), so each lane's
-        // pools and pages start where the previous lane's end.
+        // Cuts preserve MLA page alignment and recurrent state order.
         let cuts = self.prefill_cuts(t)?;
         ensure!(t > 0 && cuts.iter().all(|&n| n <= self.prefill_rows) && start + t <= self.max_context,
             "prefill of {t} rows at {start} exceeds {} rows per lane or the context", self.prefill_rows);
@@ -3339,7 +3336,7 @@ impl<'a> GlmfEngine<'a> {
             steps.push((tables, &tokens[first..first + n]));
             first += n;
         }
-        let logits = self.step_lanes(&steps, if all_logits { t } else { 1 }, device, media)?;
+        let logits = self.step_units(&steps, if all_logits { t } else { 1 }, device, media)?;
         placement.len += t;
         placement.kda_len = placement.len;
         Ok(logits)
@@ -5027,26 +5024,12 @@ impl<'a> GlmfEngine<'a> {
         runtime.block_on(self.spark_land(w, rows, &mut transport, wave))
     }
 
-    /// Pipelined prefill of consecutive-row lanes of one sequence (each
-    /// with its own workspace and, for Spark homes only, transport). Units (layer, lane) run
-    /// layer-major: a lane's attention needs its own previous layer posted and
-    /// the previous lane's same layer done, which stream order gives (KDA
-    /// state and conv windows, MLA records and DSA token/pool keys all pass
-    /// through the engine's caches). Each lane's Spark wave stays in flight
-    /// while the other lane's GPU layers run and is received after the next
-    /// wave is dispatched, so the ranks hold the next request when they finish
-    /// one. Returns the logits of the last `logit_rows` rows across the lanes.
-    fn step_lanes(&self, lanes: &[(StepTables, &[u32])], logit_rows: usize, device: bool, media: Option<&cuteafd_engine::media::RequestMedia>)
-        -> Result<Option<StepLogits>> {
+    /// Execute one continuous span with retained per-unit slots.
+    fn step_units(&self, units: &[(StepTables, &[u32])], logit_rows: usize, device: bool,
+        media: Option<&cuteafd_engine::media::RequestMedia>) -> Result<Option<StepLogits>> {
         crate::shared::experts::rtx::pair::submit_scoped(
             || self.require_live(), || self.shutdown_submission(),
-            |scope| self.step_lanes_inner(scope, lanes, logit_rows, device, media))
-    }
-
-    fn step_lanes_inner(&self, scope: &crate::shared::experts::rtx::pair::SubmissionScope<'_>,
-        lanes: &[(StepTables, &[u32])], logit_rows: usize, device: bool, media: Option<&cuteafd_engine::media::RequestMedia>)
-        -> Result<Option<StepLogits>> {
-        self.step_units_inner(scope, lanes, logit_rows, device, media)
+            |scope| self.step_units_inner(scope, units, logit_rows, device, media))
     }
 }
 
