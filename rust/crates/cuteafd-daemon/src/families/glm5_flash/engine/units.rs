@@ -12,7 +12,7 @@ fn staging_turn(owners: &mut [Option<(usize, usize)>; 2], ordinal: usize, layer:
     reuse
 }
 
-struct UnitHooks<'e, 'a, 'w, 'd> {
+struct UnitHooks<'e, 'a, 'w, 'd, 'f> {
     engine: &'e GlmfEngine<'a>,
     steps: &'w [(StepTables, &'w [u32])],
     ranked: Vec<[StepTables; 2]>,
@@ -28,10 +28,10 @@ struct UnitHooks<'e, 'a, 'w, 'd> {
     result: Option<DeviceLogits>,
     media: Option<&'w cuteafd_engine::media::RequestMedia>,
     on_layer: Option<&'d mut dyn FnMut(usize, &[u8]) -> Result<()>>,
-    forced: Option<&'d dyn Fn(usize) -> Option<Vec<u8>>>,
+    forced: Option<&'f dyn Fn(usize) -> Option<Vec<u8>>>,
 }
 
-impl<'a> UnitHooks<'_, 'a, '_, '_> {
+impl<'a> UnitHooks<'_, 'a, '_, '_, '_> {
     fn rows(&self, unit: &Unit) -> usize { unit.rows.len() }
     fn peer(&self, unit: &Unit) -> Result<Option<&Workspace<'a>>> {
         self.peer.map(|p| p.get(unit.slot)).transpose()
@@ -90,7 +90,7 @@ impl<'a> UnitHooks<'_, 'a, '_, '_> {
     }
 }
 
-impl PrefillHooks for UnitHooks<'_, '_, '_, '_> {
+impl PrefillHooks for UnitHooks<'_, '_, '_, '_, '_> {
     type Ticket = Ticket;
     fn route(&self, layer: usize) -> FfnRoute {
         if !self.engine.weights.layers[layer].dense
