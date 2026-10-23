@@ -12,6 +12,7 @@ use cuteafd_core::FfnActivation;
 use crate::families::minimax_m3::config::{MiniMaxM3Config, MiniMaxM3DsparkConfig, MiniMaxM3VisionConfig};
 use crate::plan::{checkpoint::Checkpoint, family::*, format::{self, QuantOperand, ScaleEncoding}, names::indexed, spec::*};
 
+pub mod coordinator;
 mod placement;
 #[cfg(test)]
 mod tests;

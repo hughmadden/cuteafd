@@ -29,11 +29,12 @@ pub(crate) fn tensor<'a>(
     let element_bytes = match t.meta.dtype {
         DType::Bf16 => 2,
         DType::F32 => 4,
-        DType::F8E4M3 => 1,
+        // U8: UE8M0 block-scale codes beside E4M3 payloads (MXFP8).
+        DType::F8E4M3 | DType::U8 => 1,
         _ => {
             return Err(CacheGeometryError::ResidentTensor {
                 name: name.into(),
-                what: "resident size requires BF16, FP32 or E4M3".into(),
+                what: "resident size requires BF16, FP32, E4M3 or U8 scale codes".into(),
             })
         }
     };
