@@ -133,7 +133,7 @@ fn score(serve: crate::cli::NativeServeArgs, spec: ProbeSpec, dump: &std::path::
             constraint: None,
             images: Vec::new(),
             media: Vec::new(),
-            audio: Vec::new(),
+            videos: Vec::new(), audio: Vec::new(),
             max_tokens: 1,
             sampling: cuteafd_core::TargetSamplingParams::greedy(),
             stop_token_ids: Vec::new(),

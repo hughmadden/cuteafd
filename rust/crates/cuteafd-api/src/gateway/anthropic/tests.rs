@@ -1003,3 +1003,18 @@ fn claude_code_billing_header_is_not_part_of_the_system_prompt() {
             {"type":"text","text":"Use tools."}]}), true).unwrap();
     assert_eq!(turn.system.as_deref(), Some("Keep answers short.\nUse tools."), "instructions after the header line stay");
 }
+
+#[test]
+fn video_blocks_normalize_to_a_native_video_source() {
+    let body = json!({"model":"test", "max_tokens":8, "messages":[{"role":"user", "content":[
+        {"type":"text", "text":"describe"},
+        {"type":"video", "source":{"type":"frames", "frames":["https://example.com/a.png"]},
+            "source_fps":24, "do_sample_frames":true, "num_frames":1, "do_resize":false}
+    ]}]});
+    let (turn, _) = super::request::parse(&body, true).unwrap();
+    let Item::Message { content, .. } = &turn.items[0] else { panic!("expected message") };
+    assert_eq!(content[1], Part::Video { source: json!({"frames":["https://example.com/a.png"],
+        "source_fps":24, "do_sample_frames":true, "num_frames":1, "do_resize":false}) });
+    let mut invalid = body; invalid["messages"][0]["content"][1]["source"]["frames"] = json!([]);
+    assert!(super::request::parse(&invalid, true).is_err());
+}

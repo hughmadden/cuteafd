@@ -32,6 +32,8 @@ pub enum ImageSource {
 pub enum Part {
     Text { text: String },
     Image { source: ImageSource, #[serde(default, skip_serializing_if = "Option::is_none")] detail: Option<String> },
+    /// Canonical video URL or frame sequence with processor options.
+    Video { source: Value },
     /// Base64 audio (`format`: `wav`, `mp3`, `pcm16` at 24 kHz mono, ...).
     Audio { format: String, data: String },
     /// A document/file the backend cannot read natively; front ends may

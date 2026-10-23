@@ -487,3 +487,14 @@ fn no_forced_tool_choice_sends_the_named_tool_alone_with_auto() {
     assert_eq!(request["tool_choice"], "auto");
     assert_eq!(request["tools"].as_array().unwrap().len(), 2);
 }
+
+#[test]
+fn upstream_video_is_refused_for_both_wire_flavors() {
+    let mut turn = turn();
+    turn.items.push(Item::Message { role: Role::User, content: vec![Part::Video {
+        source: json!({"frames":["https://example.com/a.png"]}) }] });
+    for flavor in [Flavor::OpenaiChat, Flavor::Anthropic] {
+        let error = backend(flavor).map_request(&turn).unwrap_err();
+        assert_eq!(error.status(), 400); assert!(error.message.contains("video"));
+    }
+}

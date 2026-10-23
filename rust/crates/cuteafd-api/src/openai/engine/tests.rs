@@ -824,3 +824,14 @@ async fn responses_history_follows_the_1017_drop_thinking_rule() {
     assert_eq!(status, StatusCode::OK, "{text}");
     assert!(worker.prompts.lock().unwrap()[0].contains("<think>r1</think>a1"));
 }
+
+#[test]
+fn gateway_video_reaches_native_chat_with_all_processor_options() {
+    let source = json!({"frames":["https://example.com/a.png"], "source_fps":24,
+        "do_sample_frames":true, "num_frames":1, "do_resize":false});
+    let turn = TurnRequest { items: vec![Item::Message { role: Role::User,
+        content: vec![Part::text("describe"), Part::Video { source: source.clone() }] }], ..Default::default() };
+    let profile = ModelProfile::new("test-minimax", ModelEncoding::MiniMaxM3(Arc::new(minimax_m3::fixtures::encoding())));
+    let body = chat_body(&turn, &profile).unwrap();
+    assert_eq!(body["messages"][0]["content"][1], json!({"type":"video_url", "video_url":source}));
+}

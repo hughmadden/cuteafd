@@ -5624,10 +5624,11 @@ The shared owner has a MiniMax ABI3 variant: header-only admission for all
 attention with 78-channel axial RoPE, per-patch projector and merge-four MLP.
 ABI1/2 layouts and arithmetic remain unchanged. The encoder planner charges
 resident weights plus the 4096-token scratch to the selected RTX or Spark.
-The native owner accepts still images and paired-frame segments; the HTTP and
-remote media protocols still reject video, so video preparation is not an
-end-to-end serving claim. MiniMax language-model feature injection belongs to
-the family runtime integration.
+The native owner accepts still images and paired-frame segments. MiniMax Chat
+Completions accepts `video_url` with a URL or an object containing `frames`
+(image URLs); Messages `video` and Responses `input_video` use the same path.
+Other families retain their video rejection. The remote encoder negotiates a
+MiniMax-specific protocol; existing image/audio wire formats are unchanged.
 
 The pinned release's executable image processor uses smart resize at a 672²
 pixel cap, Torch uint8 antialiased bicubic and fused CLIP normalization. Its
@@ -5637,9 +5638,22 @@ sampling is disabled by default; the optional sampling helper pins the compatibl
 Transformers implementation because the checkpoint does not pin that dependency
 consistently. Processor hashes participate in preprocessing identity.
 
+Video options are `source_fps`, `do_sample_frames` (false), `num_frames` or
+`fps`, and `do_resize` (false). Defaults retain every frame and require dimensions
+aligned to 28, matching the bundled processor. URLs use the existing fetch policy;
+CPU ffmpeg/ffprobe decode bounded files, while frame arrays need no video decoder.
+Video admission bounds source frames to 768, decoded video bytes to 64 MiB, each segment
+to the loaded encoder capacity, and all video features to 57,600 tokens. Sampling
+does not bypass source decode limits. Media count-token/probe overrides remain
+unsupported. Image start/end wrapping happens after literal shielding. Video
+placeholders preserve sampled timestamps and each pair's own delimiters; separated
+spans share a complete segment embedding with explicit row offsets.
+
 CPU gates cover resizing pixels/counts, normalization, merge order, positions,
-BF16 reference layers, tensor contracts, placement and native admission. CUDA
-translation units compile without a device. Remaining gates: full D80 AOT
-export/link, real-weight encoder parity on both architectures, end-to-end media
-injection/cache behavior and performance. No GPU qualification or serving
-promotion follows from the CPU checks.
+BF16 reference layers, tensor contracts, placement, native admission, bounded video
+decoding and HTTP-to-feature injection with a fake encoder. D80 AOT export and
+native linking compile without a device for SM120 and SM121; D64/D72 exports stay
+byte-identical. SM121 AOT objects also cross-compile for AArch64. Remaining gates:
+complete native AArch64 linking, real-weight encoder parity on both architectures,
+on-device injection/cache behavior and performance. No GPU qualification or
+serving promotion follows from the CPU checks.
