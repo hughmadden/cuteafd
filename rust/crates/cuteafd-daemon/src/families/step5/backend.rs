@@ -146,6 +146,8 @@ pub(super) struct Step5Backend<'e, 'a> {
     library: &'a NativeLibrary,
     mtp: Option<&'e super::mtp::Runtime<'a>>,
     full_prefill_logits: bool,
+    /// Prefill unit rows and units in flight (PLAN "Prefill contract").
+    prefill: (usize, usize),
 }
 
 impl<'e, 'a> Step5Backend<'e, 'a> {
@@ -178,7 +180,15 @@ impl<'e, 'a> Step5Backend<'e, 'a> {
         };
         Ok(Self { state: BackendState::new(fail_verify_once), execution, ranks, embedding, inputs,
             profile: RefCell::new([0.0; 2]), rows, context, sequences, library, mtp: None,
-            full_prefill_logits: false })
+            full_prefill_logits: false, prefill: (rows, 1) })
+    }
+
+    /// Prefill unit rows and units in flight; the step's rows are their product.
+    pub(super) fn with_prefill_units(mut self, unit: usize, waves: usize) -> Result<Self> {
+        ensure!(waves > 0 && unit * waves == self.rows && (waves == 1 || unit % 64 == 0),
+            "Step-5 prefill units differ from the admitted span");
+        self.prefill = (unit, waves);
+        Ok(self)
     }
 
     /// The head was admitted at chunk width: all-row prefill scoring is served.
@@ -251,7 +261,19 @@ impl<'e, 'a> Step5Backend<'e, 'a> {
                     input.residual.buffer, meta.rows * H, meta.stream.raw)
             }
         }))?;
-        self.execution.enqueue(&mut step, &input.residual, kind)?;
+        // One sequence's prefill longer than a unit runs as row units with
+        // waves in flight; every other step runs whole (at most one unit).
+        let (unit, waves) = self.prefill;
+        if kind == cuteafd_transport::ExpertV2SourceKind::Prefill && descriptors.len() == 1 && first_row > unit {
+            let units = crate::shared::prefill_pipeline::prefill_units(first_row, unit, waves, 64)?.into_iter()
+                .enumerate().map(|(index, rows)| crate::shared::prefill_pipeline::Unit { index, sequence: 0, rows,
+                    layers: 0..92, slot: index % waves, barrier: false }).collect::<Vec<_>>();
+            self.execution.enqueue_units(&mut step, &input.residual, kind, &units, waves)?;
+        } else {
+            // Each return slot and hop lane holds one unit.
+            ensure!(first_row <= unit, "Step-5 {first_row}-row step exceeds one prefill unit of {unit}");
+            self.execution.enqueue(&mut step, &input.residual, kind)?;
+        }
         let (device, output) = self.execution.terminal_output()?;
         let head_rank = self.execution.ownership().execution().spec().head_gpu as usize;
         let head = self.execution.head()?;

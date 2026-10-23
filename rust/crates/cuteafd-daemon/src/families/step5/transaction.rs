@@ -384,6 +384,8 @@ pub(super) struct Step<'e, 'a, E: CopyEngine> {
     /// whole-step unit otherwise. `unit` is the selected one.
     units: Vec<std::ops::Range<usize>>,
     unit: usize,
+    /// After every unit ran: compose (head, MTP history) sees the whole span.
+    finished_units: bool,
     rows: usize,
     base: usize,
     extent: usize,
@@ -412,10 +414,15 @@ impl<'e, 'a, E: CopyEngine> Step<'e, 'a, E> {
     }
 
     pub(super) fn select_unit(&mut self, unit: usize) -> Result<()> {
-        ensure!(unit < self.units.len(), "Step-5 prefill unit outside the step");
+        ensure!(unit < self.units.len() && !self.finished_units, "Step-5 prefill unit outside the step");
         self.unit = unit;
         Ok(())
     }
+
+    /// Every unit ran: later compositions (head, histories) cover the span.
+    pub(super) fn finish_units(&mut self) { self.finished_units = true; }
+
+    fn unit_mode(&self) -> bool { self.units.len() > 1 && !self.finished_units }
 
     /// Positions and request ids of the selected unit's rows.
     fn unit_inputs<'s>(&self, stage: &'s Staging<'a>, rows: usize, heads: usize,
@@ -433,9 +440,15 @@ impl<'e, 'a, E: CopyEngine> Step<'e, 'a, E> {
         })
     }
 
+    /// Row descriptors of the selected unit (the whole step when it is one):
+    /// rows are unit-relative, positions absolute.
     pub(super) fn expert_rows(&self, kind: cuteafd_transport::ExpertV2SourceKind)
         -> Result<Vec<cuteafd_transport::ExpertProtocolV2RowDescriptor>> {
-        expert_rows(&self.sequences, kind)
+        if self.units.len() == 1 { return expert_rows(&self.sequences, kind); }
+        let window = self.unit_rows();
+        let unit = Sequence { start: 0, rows: window.len(), base: self.sequences[0].base + window.start,
+            ..self.sequences[0].clone() };
+        expert_rows(std::slice::from_ref(&unit), kind)
     }
 
     pub fn validate_binding(&self, ranks: &[&RefCell<CacheRank<'a>>],
@@ -534,7 +547,7 @@ impl<'e, 'a, E: CopyEngine> Step<'e, 'a, E> {
         let complete = vec![BTreeSet::new(); ranks.len()];
         let mut step = Self { ranks, staging, lease, base: sequences[0].base, extent,
             sequences, live: true, active: false, projected: complete.clone(), attended: complete.clone(),
-            complete, units: vec![0..rows], unit: 0, rows, failed: false, inputs: Vec::new(),
+            complete, units: vec![0..rows], unit: 0, finished_units: false, rows, failed: false, inputs: Vec::new(),
             submission: Rc::new(Cell::new(false)) };
         for (owner, stage) in step.ranks.iter().zip(&step.staging) {
             let cache = owner.borrow();
@@ -611,7 +624,7 @@ impl<'e, 'a, E: CopyEngine> Step<'e, 'a, E> {
             .stream
             .cancellation_guard("Step-5 projection callback");
         guard.complete = self.submission.get();
-        let inputs = if self.units.len() > 1 {
+        let inputs = if self.unit_mode() {
             self.unit_inputs(stage, self.unit_rows().len(), cache.layout().query_heads(rank, layer)?,
                 cache.layout().kv_format)?
         } else {
@@ -647,7 +660,7 @@ impl<'e, 'a, E: CopyEngine> Step<'e, 'a, E> {
         let stage = self.staging[rank];
         let mut guard = stage.stream.cancellation_guard("Step-5 composition callback");
         guard.complete = self.submission.get();
-        let inputs = if self.units.len() > 1 {
+        let inputs = if self.unit_mode() {
             self.unit_inputs(stage, self.unit_rows().len(), 64 / self.ranks.len(), cache.layout().kv_format)?
         } else {
             StepInputs {
@@ -706,7 +719,7 @@ impl<'e, 'a, E: CopyEngine> Step<'e, 'a, E> {
                         usize::try_from(cache.page_count())?)
                 };
             // A unit's rows start at row zero of its hook-local attention planes.
-            let (inputs, start) = if self.units.len() > 1 {
+            let (inputs, start) = if self.unit_mode() {
                 (self.unit_inputs(stage, self.unit_rows().len(), cache.layout().query_heads(rank, layer)?,
                     cache.layout().kv_format)?, 0)
             } else {
@@ -765,7 +778,7 @@ impl<'e, 'a, E: CopyEngine> Step<'e, 'a, E> {
         let [key, value] = if let Some(compact) = &stage.compact {
             compact.enqueue(&stage.stream, [key, value], unit_rows, heads)?
         } else { [key, value] };
-        let units = self.units.len() > 1;
+        let units = self.unit_mode();
         for whole in &self.sequences {
             let sequence = &if units {
                 Sequence { start: 0, rows: unit_rows, base: whole.base + window.start, ..whole.clone() }

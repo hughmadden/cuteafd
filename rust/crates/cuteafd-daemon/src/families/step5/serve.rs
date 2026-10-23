@@ -69,8 +69,6 @@ impl ServeArgs {
     fn span(&self) -> u32 { self.prefill_rows * u32::from(self.prefill_waves) }
 
     fn validate(&self) -> Result<()> {
-        // WIP: the PrefillHooks port lands in later commits of this branch.
-        ensure!(self.prefill_waves == 1, "Step-5 prefill waves > 1 need the shared executor port (in progress)");
         ensure!(self.span() <= 4096 && (self.prefill_waves == 1 || self.prefill_rows % 64 == 0),
             "Step-5 --prefill-rows x --prefill-waves must hold at most 4096 page-aligned rows");
         ensure!(self.device >= 0 && self.split_device.is_none_or(|d| d >= 0 && d != self.device),
@@ -193,8 +191,8 @@ fn with_backend<T>(args: &ServeArgs,
             spark_rings(config.max_frame_bytes)?, clients)?)?;
     let available = inputs.inventory.gpus.iter().map(GpuBudget::available).collect::<Vec<_>>();
     let reserves = (0..ids.len()).map(|rank| {
-        let native = Execution::serving_admission(&programs, &checkpoint, &admission.ownership, rank, inputs.rows,
-            inputs.logit_rows())?;
+        let native = Execution::serving_admission(&programs, &checkpoint, &admission.ownership, rank, inputs.unit_rows(),
+            inputs.rows, inputs.logit_rows())?;
         let mut native = native;
         if rank == usize::from(admission.ownership.execution().spec().head_gpu) {
             native.workspace = native.workspace.max(
@@ -243,7 +241,7 @@ fn with_backend<T>(args: &ServeArgs,
     if push {
         let recorder = crate::shared::experts::rtx::dense::Recorder::start(true)?.context("dense recorder")?;
         let loaded = Execution::load_native(&programs, &checkpoint, &ownership, &caches_ref, &stages_ref,
-            inputs.rows, inputs.logit_rows(), &available, &reserves, 92);
+            inputs.unit_rows(), inputs.rows, inputs.logit_rows(), &available, &reserves, 92);
         let records = recorder.finish();
         native = Some(loaded?);
         let planned = (|| -> Result<_> {
@@ -284,8 +282,8 @@ fn with_backend<T>(args: &ServeArgs,
             }
             match native {
                 Some(native) => Ok(native),
-                None => Execution::load_native(&programs, &checkpoint, &ownership, &caches_ref, &stages_ref, inputs.rows,
-                    inputs.logit_rows(),
+                None => Execution::load_native(&programs, &checkpoint, &ownership, &caches_ref, &stages_ref,
+                    inputs.unit_rows(), inputs.rows, inputs.logit_rows(),
                     &available, &reserves, 92),
             }
         })
@@ -293,7 +291,11 @@ fn with_backend<T>(args: &ServeArgs,
     cuteafd_transport::worker_selection::require_peer_clients(&args.peers, endpoint, clients)?;
     let world = SparkWorld::canonical(args.peers.len())?;
     let transport = devices[0].own(|| {
-        let mut link = SparkLink::new(&library, world, &args.peers, args.span(), config, 4096 * 2)?;
+        // One return slot per prefill unit in flight, each holding one unit.
+        let mut link = if args.prefill_waves > 1 {
+            SparkLink::new_waves(&library, world, &args.peers, args.span(), config, 4096 * 2,
+                usize::from(args.prefill_waves), args.prefill_rows)?
+        } else { SparkLink::new(&library, world, &args.peers, args.span(), config, 4096 * 2)? };
         link.enable_terminal_ownership(library.clone())?;
         link.bootstrap(&super::execution::bootstrap_request(inputs.rows, 1)?)?;
         Ok(link)
@@ -305,7 +307,8 @@ fn with_backend<T>(args: &ServeArgs,
         &execution, &programs, &checkpoint, &caches[head_rank].borrow(),
         usize::from(args.mtp), inputs.rows, available, &[reserved])).transpose()?;
     let backend = Step5Backend::new(&execution, caches.iter().collect(), &embedding, &target_input)?
-        .with_full_prefill_logits(args.full_prefill_logits);
+        .with_full_prefill_logits(args.full_prefill_logits)
+        .with_prefill_units(args.prefill_rows as usize, usize::from(args.prefill_waves))?;
     let backend = if let Some(mtp) = &mtp { backend.with_mtp(mtp) } else { backend };
     library.cuda_set_device(args.device)?;
     tracing::info!(rows=inputs.rows, sequences=inputs.sequences, mtp=args.mtp,
@@ -479,7 +482,7 @@ mod tests {
             let head_rank = usize::from(admitted.ownership.execution().spec().head_gpu);
             for rank in 0..2 {
                 let mut native = Execution::serving_admission(&programs, &checkpoint,
-                    &admitted.ownership, rank, inputs.rows, inputs.logit_rows())?;
+                    &admitted.ownership, rank, inputs.unit_rows(), inputs.rows, inputs.logit_rows())?;
                 if rank == head_rank {
                     native.workspace = native.workspace.max(
                         plan::families::step5::native::mtp_forecast_workspace(inputs.rows, usize::from(depth), inputs.kv_format)?);

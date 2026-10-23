@@ -76,7 +76,7 @@ struct NativeOwners<'a> {
 }
 impl<'a> NativeOwners<'a> {
     fn load(programs: &'a Programs<'a>, checkpoint: &'a Checkpoint,
-        ownership: &ExecutionOwnership, devices: &[Device<'a>], rows: usize, logits: usize,
+        ownership: &ExecutionOwnership, devices: &[Device<'a>], rows: usize, span: usize, logits: usize,
         count: usize, available: &[u64], reservations: &[u64], depth: usize, kv_format: Qwen4KvCache) -> Result<Self> {
         validate_rank_inventory(ownership.ranks(), &[devices.len(), available.len(), reservations.len()])?;
         ensure!(matches!(count, 1 | 92), "Step-5 native layer inventory");
@@ -86,11 +86,11 @@ impl<'a> NativeOwners<'a> {
             super::head::HeadPlan::for_execution(programs, checkpoint, logits, ownership)).transpose()?;
         let mut admission = vec![RankAdmission { immutable: 0, workspace: 0 }; ownership.ranks()];
         for (rank, plan) in admission.iter_mut().enumerate() {
-            *plan = Execution::rank_admission(programs, checkpoint, ownership, rank, rows, count)?;
+            *plan = Execution::rank_admission(programs, checkpoint, ownership, rank, rows, span, count)?;
             if rank == head_rank {
                 if let Some(head) = &head_plan { *plan = plan.with_head(head)?; }
                 plan.workspace = plan.workspace.max(
-                    cuteafd_loader::plan::families::step5::native::mtp_forecast_workspace(rows, depth, kv_format)?);
+                    cuteafd_loader::plan::families::step5::native::mtp_forecast_workspace(span, depth, kv_format)?);
             }
         }
         admit_native(&admission, available, reservations, || {
@@ -119,10 +119,12 @@ impl<'a> NativeOwners<'a> {
                     // pending FFN's live rows (native::routed_layout/dense_layout).
                     let offset = usize::try_from(ffn_offset[rank])?;
                     let ffn = if contract.layers[layer].dense_activation.is_some() {
-                        let plan = DensePlan::for_execution(programs, checkpoint, layer, rows, u64::MAX, &[], rank, ownership)?;
+                        let plan = DensePlan::for_execution(programs, checkpoint, layer, rows, u64::MAX, &[], rank, ownership)?
+                            .with_span(span)?;
                         Ffn::Dense(DenseFfn::load_plan_in(device, programs, checkpoint, plan, Some((&arena, offset)))?)
                     } else {
-                        let plan = RoutedPlan::for_execution(programs, checkpoint, layer, rows, u64::MAX, &[], rank, ownership)?;
+                        let plan = RoutedPlan::for_execution(programs, checkpoint, layer, rows, u64::MAX, &[], rank, ownership)?
+                            .with_span(span)?;
                         Ffn::Routed(RoutedFfn::load_in(device, programs, checkpoint, layer, plan, Some((&arena, offset)))?)
                     };
                     ranks[rank].push(Some(Layer { attention, ffn }));
@@ -173,7 +175,8 @@ struct MainExecution<'e, 'a> {
     stages: Vec<&'e Staging<'a>>,
     exchange: Exchange<'a>,
     sequence: RefCell<HeadSequence>,
-    pending_wave: RefCell<Option<cuteafd_transport::expert::SparkExpertWave>>,
+    /// Dispatched Spark waves, oldest first (one per in-flight prefill unit).
+    pending_wave: RefCell<std::collections::VecDeque<cuteafd_transport::expert::SparkExpertWave>>,
     transport: RefCell<Option<DeviceOwner<'a, SparkLink<'a>>>>,
     runtime: tokio::runtime::Runtime,
     routed_reply: Allocation<'a>,
@@ -248,7 +251,7 @@ impl<'e, 'a> Execution<'e, 'a> {
         ownership: &ExecutionOwnership, rank: usize, rows: usize, count: usize) -> Result<u64> {
         ensure!(matches!(count, 1 | 92), "Step-5 diagnostic layer count");
         ensure!(matches!(ownership.ranks(), 1 | 2), "Step-5 shared execution rank count");
-        Self::rank_admission(programs, checkpoint, ownership, rank, rows, count)?
+        Self::rank_admission(programs, checkpoint, ownership, rank, rows, rows, count)?
             .bytes()
     }
 
@@ -256,16 +259,16 @@ impl<'e, 'a> Execution<'e, 'a> {
     /// allocating native owners; cache, staging, input, transport and code are reserves.
     /// `logits` is the head's row capacity (`native::head_rows`), not the chunk rows.
     pub(super) fn serving_admission(programs: &'a Programs<'a>, checkpoint: &'a Checkpoint,
-        ownership: &ExecutionOwnership, rank: usize, rows: usize, logits: usize) -> Result<RankAdmission> {
-        ensure!((1..=rows).contains(&logits), "Step-5 head rows outside the chunk");
-        let admission = Self::rank_admission(programs, checkpoint, ownership, rank, rows, 92)?;
+        ownership: &ExecutionOwnership, rank: usize, rows: usize, span: usize, logits: usize) -> Result<RankAdmission> {
+        ensure!((1..=span).contains(&logits), "Step-5 head rows outside the span");
+        let admission = Self::rank_admission(programs, checkpoint, ownership, rank, rows, span, 92)?;
         if rank == ownership.execution().spec().head_gpu as usize {
             admission.with_head(&super::head::HeadPlan::for_execution(programs, checkpoint, logits, ownership)?)
         } else { Ok(admission) }
     }
 
     fn rank_admission(programs: &'a Programs<'a>, checkpoint: &'a Checkpoint,
-        ownership: &ExecutionOwnership, rank: usize, rows: usize, count: usize) -> Result<RankAdmission> {
+        ownership: &ExecutionOwnership, rank: usize, rows: usize, span: usize, count: usize) -> Result<RankAdmission> {
         ensure!(matches!(count, 1 | 92) && rank < ownership.ranks(), "Step-5 native rank/layer admission");
         ensure!(rows as u64 <= ownership.execution().spec().rows, "Step-5 native row admission");
         let contract = CoordinatorContract::from_checkpoint(checkpoint)?;
@@ -280,18 +283,20 @@ impl<'e, 'a> Execution<'e, 'a> {
             if ownership.layer(layer, rank)?.query_heads == 0 { continue; }
             owned = true;
             let (planes, ffn) = if contract.layers[layer].dense_activation.is_some() {
-                let plan = DensePlan::for_execution(programs, checkpoint, layer, rows, u64::MAX, &[], rank, ownership)?;
+                let plan = DensePlan::for_execution(programs, checkpoint, layer, rows, u64::MAX, &[], rank, ownership)?
+                    .with_span(span)?;
                 (plan.workspace_bytes(), "dense")
             } else {
-                let plan = RoutedPlan::for_execution(programs, checkpoint, layer, rows, u64::MAX, &[], rank, ownership)?;
+                let plan = RoutedPlan::for_execution(programs, checkpoint, layer, rows, u64::MAX, &[], rank, ownership)?
+                    .with_span(span)?;
                 (plan.workspace_bytes(), "routed")
             };
-            ensure!(planes <= cuteafd_loader::plan::families::step5::native::ffn_region_bytes(rows, rows)?,
+            ensure!(planes <= cuteafd_loader::plan::families::step5::native::ffn_region_bytes(rows, span)?,
                 "Step-5 {ffn} FFN planes exceed the shared FFN region");
         }
         let workspace = if !owned { 0 } else {
             ffn_offset(checkpoint, ownership, rank, rows, count)?
-                .checked_add(cuteafd_loader::plan::families::step5::native::ffn_region_bytes(rows, rows)?)
+                .checked_add(cuteafd_loader::plan::families::step5::native::ffn_region_bytes(rows, span)?)
                 .context("Step-5 native rank workspace overflow")?
         };
         Ok(RankAdmission { immutable, workspace })
@@ -306,6 +311,19 @@ impl<'e, 'a> Execution<'e, 'a> {
             reservations, transport, 92, placement_version)
     }
 
+    /// The full target with prefill units of `unit` rows inside `span`-row steps.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn load_units(programs: &'a Programs<'a>, checkpoint: &'a Checkpoint,
+        ownership: ExecutionOwnership, caches: Vec<&'e RefCell<CacheRank<'a>>>,
+        stages: Vec<&'e Staging<'a>>, unit: usize, span: usize, available: Vec<u64>,
+        reservations: Vec<u64>, transport: Option<DeviceOwner<'a, SparkLink<'a>>>,
+        placement_version: u64) -> Result<Self> {
+        // Diagnostic goldens score every row: their head holds the whole span.
+        let native = Self::load_native(programs, checkpoint, &ownership, &caches, &stages, unit, span, span, &available,
+            &reservations, 92)?;
+        Self::bind_native(checkpoint, ownership, native, caches, stages, span, transport, 92, placement_version)
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(super) fn load_count(programs: &'a Programs<'a>, checkpoint: &'a Checkpoint,
         ownership: ExecutionOwnership, caches: Vec<&'e RefCell<CacheRank<'a>>>,
@@ -313,7 +331,7 @@ impl<'e, 'a> Execution<'e, 'a> {
         reservations: Vec<u64>, transport: Option<DeviceOwner<'a, SparkLink<'a>>>,
         count: usize, placement_version: u64) -> Result<Self> {
         // Diagnostic goldens score every row: their head holds the whole chunk.
-        let native = Self::load_native(programs, checkpoint, &ownership, &caches, &stages, rows, rows, &available,
+        let native = Self::load_native(programs, checkpoint, &ownership, &caches, &stages, rows, rows, rows, &available,
             &reservations, count)?;
         Self::bind_native(checkpoint, ownership, native, caches, stages, rows, transport, count, placement_version)
     }
@@ -323,9 +341,9 @@ impl<'e, 'a> Execution<'e, 'a> {
     #[allow(clippy::too_many_arguments)]
     pub(super) fn load_native(programs: &'a Programs<'a>, checkpoint: &'a Checkpoint,
         ownership: &ExecutionOwnership, caches: &[&'e RefCell<CacheRank<'a>>], stages: &[&'e Staging<'a>],
-        rows: usize, logits: usize, available: &[u64], reservations: &[u64], count: usize) -> Result<LoadedNative<'a>> {
+        rows: usize, span: usize, logits: usize, available: &[u64], reservations: &[u64], count: usize) -> Result<LoadedNative<'a>> {
         ensure!(matches!(count, 1 | 92), "Step-5 execution count must be layer-zero diagnostic or full target");
-        ensure!((1..=rows).contains(&logits), "Step-5 head rows outside the chunk");
+        ensure!(rows <= span && (1..=span).contains(&logits), "Step-5 unit or head rows outside the span");
         validate_rank_inventory(ownership.ranks(), &[caches.len(), stages.len(), available.len(), reservations.len()])?;
         let kv_format = caches[0].borrow().layout().kv_format;
         for rank in 0..ownership.ranks() {
@@ -341,7 +359,7 @@ impl<'e, 'a> Execution<'e, 'a> {
                 && devices[..rank].iter().all(|other| other.id != device.id)), "Step-5 rank devices/library differ");
         let depth = caches[ownership.execution().spec().head_gpu as usize].borrow()
             .layout().ranks[ownership.execution().spec().head_gpu as usize].mtp_lengths.len();
-        Ok(LoadedNative(NativeOwners::load(programs, checkpoint, ownership, &devices, rows, logits, count, available,
+        Ok(LoadedNative(NativeOwners::load(programs, checkpoint, ownership, &devices, rows, span, logits, count, available,
             reservations, depth, kv_format)?))
     }
 
@@ -372,9 +390,12 @@ impl<'e, 'a> MainExecution<'e, 'a> {
         let exchange = if ownership.ranks() == 2 {
             let native_ranks = std::array::from_fn(|rank| RankDevice { device: devices[rank].id,
                 stream: stages[rank].stream.raw });
-            let peer = devices[0].run(|| PeerExchange::new_abortable(devices[0].library, native_ranks, 8, rows * H * 4))?;
-            let mut hops = devices[0].run(|| HopLink::new_private_lane(devices[0].library, native_ranks,
-                ownership.execution().hops(), ownership.execution().spec(), 0))?;
+            // Peer partials and replications complete inside one unit's hook.
+            let unit = usize::try_from(ownership.execution().spec().rows)?;
+            let peer = devices[0].run(|| PeerExchange::new_abortable(devices[0].library, native_ranks, 8, unit * H * 4))?;
+            // One hop lane per prefill unit slot (spec lanes = waves in flight).
+            let mut hops = devices[0].run(|| HopLink::new(devices[0].library, native_ranks,
+                ownership.execution().hops(), ownership.execution().spec()))?;
             hops.attach_abort([peer.abort_word(0)?.context("Step-5 lead abort")?,
                 peer.abort_word(1)?.context("Step-5 peer abort")?])?;
             hops.validate_binding(ownership.execution(), &peer)?;
@@ -384,7 +405,8 @@ impl<'e, 'a> MainExecution<'e, 'a> {
             Exchange::Local(Cell::new(TerminalState::Active))
         };
         let ranks = &native.ranks;
-        let bytes = RouteStaging::new(rows, 8, H * 2)?.bytes;
+        // Route staging is drained into an owned request before dispatch returns.
+        let bytes = RouteStaging::new(usize::try_from(ownership.execution().spec().rows)?, 8, H * 2)?.bytes;
         let pinned = devices.iter().map(|device| HostAllocation::new(device.library, bytes).map(RefCell::new))
             .collect::<Result<Vec<_>>>()?;
         let mut inventory = Vec::new();
@@ -439,7 +461,7 @@ impl<'e, 'a> MainExecution<'e, 'a> {
         let routed_reply = Allocation::new(devices[entry], rows * H * 2)?;
         let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
         let execution = Self { ownership, native, caches, stages, exchange,
-            sequence: RefCell::new(HeadSequence::new(0)?), pending_wave: RefCell::new(None), transport: RefCell::new(transport), runtime, routed_reply,
+            sequence: RefCell::new(HeadSequence::new(0)?), pending_wave: RefCell::new(std::collections::VecDeque::new()), transport: RefCell::new(transport), runtime, routed_reply,
             pinned, rows, inventory, requests: Cell::new(0), placement_version,
             terminal_output: Cell::new(None), poison_scratch: Cell::new(false),
             diagnostic_outputs: RefCell::new(std::collections::BTreeMap::new()) };
@@ -490,7 +512,7 @@ impl<'e, 'a> MainExecution<'e, 'a> {
                 attention::replicate_terminal(self.exchange.peer()?, input.buffer, self.layer(1, 0)?.input(), step.rows() * H * 4)?;
                 let mut binding = Bindings { execution: self, step, scope,
                     current: vec![None, Some(self.layer(1, 0)?.input())], input: input.buffer,
-                    kind: ExpertV2SourceKind::Benchmark, layer: 0, diagnostic: Some(directory) };
+                    kind: ExpertV2SourceKind::Benchmark, layer: 0, diagnostic: Some(directory), units: false };
                 binding.heads(0)?;
                 binding.ffn(0, None)?;
                 for stage in &self.stages { stage.stream.drain()?; }
@@ -628,7 +650,7 @@ impl<'e, 'a> Execution<'e, 'a> {
         pair::submit_scoped(|| main.exchange.require_live(), || main.shutdown(), |scope| step.in_submission(scope, |step| {
             step.compose(main.ownership.execution().spec().entry_gpu as usize, input, |_, _| Ok(()))?;
             let mut binding = Bindings { execution: main, step, scope, current: vec![None; main.ownership.ranks()],
-                input: input.buffer, kind, layer: 0, diagnostic: None };
+                input: input.buffer, kind, layer: 0, diagnostic: None, units: false };
             let rows = binding.step.rows();
             attention::layer_pipeline_with(scope, main.ownership.execution(), &main.exchange,
                 LaneOrder::Independent, &[rows], std::slice::from_mut(&mut binding))?;
@@ -639,6 +661,143 @@ impl<'e, 'a> Execution<'e, 'a> {
             collect_lane_results(main.stages.iter().map(|stage| stage.stream.drain()))
         }))
     }
+}
+
+impl<'e, 'a> Execution<'e, 'a> {
+    /// One sequence's prefill as row units on the single lane and Spark link
+    /// (PLAN "Prefill contract"): up to `waves` units' Spark waves in flight.
+    /// The terminal residual of every unit lands in its rows of `input`.
+    pub fn enqueue_units<'s, E: CopyEngine>(&'s self, step: &mut Step<'s, 'a, E>,
+        input: &'s Allocation<'a>, kind: ExpertV2SourceKind, units: &[crate::shared::prefill_pipeline::Unit],
+        waves: usize) -> Result<()> {
+        let main = &self.main;
+        main.terminal_output.set(None);
+        step.validate_binding(&main.caches, &main.stages, main.rows)?;
+        if let Exchange::Pair { peer, hops } = &main.exchange {
+            hops.validate_binding(main.ownership.execution(), peer)?;
+        }
+        main.validate_replications()?;
+        let spec = main.ownership.execution().spec();
+        let (entry, head) = (usize::from(spec.entry_gpu), usize::from(spec.head_gpu));
+        ensure!(entry == head, "Step-5 prefill units collect terminal rows on the entry GPU");
+        ensure!(waves as u64 <= spec.lanes && units.iter().all(|unit| unit.slot < waves && unit.sequence == 0
+            && unit.layers == (0..main.inventory.len())), "Step-5 prefill units outside admitted lanes/layers");
+        ensure!(input.buffer.device_id == main.device(entry)?.id && input.buffer.bytes >= step.rows() * H * 4,
+            "Step-5 live input allocation");
+        step.set_units(units.iter().map(|unit| unit.rows.clone()).collect())?;
+        tracing::info!(rows = step.rows(), units = units.len(), waves,
+            sizes = ?units.iter().map(|unit| unit.rows.len()).collect::<Vec<_>>(), "Step-5 prefill units");
+        pair::submit_scoped(|| main.exchange.require_live(), || main.shutdown(), |scope| step.in_submission(scope, |step| {
+            step.compose(entry, input, |_, _| Ok(()))?;
+            let binding = Bindings { execution: main, step, scope, current: vec![None; main.ownership.ranks()],
+                input: input.buffer, kind, layer: 0, diagnostic: None, units: true };
+            let mut hooks = UnitHooks { binding, span: input.buffer,
+                current: units.iter().map(|_| vec![None; main.ownership.ranks()]).collect(),
+                consumed: vec![vec![0; main.ownership.execution().hops().len()]; units.len()] };
+            crate::shared::prefill_pipeline::run_prefill_units(&mut hooks, units, waves)?;
+            ensure!(hooks.consumed.iter().flatten().all(|&count| count == 1), "Step-5 unit hop inventory");
+            hooks.binding.step.finish_units();
+            main.terminal_output.set(Some(input.buffer));
+            collect_lane_results(main.stages.iter().map(|stage| stage.stream.drain()))
+        }))
+    }
+}
+
+/// Each unit owns its rows of the step input, the live FFN planes and the
+/// entry routed reply, plus one hop lane and one Spark return slot. Its
+/// residual pointer per rank is kept here between hooks. Attention and FFN
+/// scratch are hook-local and rewritten inside each hook.
+struct UnitHooks<'s, 'b, 'e, 'a, 'g, E: CopyEngine> {
+    binding: Bindings<'s, 'b, 'e, 'a, 'g, E>,
+    span: CuteafdDeviceBuffer,
+    current: Vec<Vec<Option<CuteafdDeviceBuffer>>>,
+    consumed: Vec<Vec<usize>>,
+}
+
+impl<E: CopyEngine> UnitHooks<'_, '_, '_, '_, '_, E> {
+    fn select(&mut self, unit: &crate::shared::prefill_pipeline::Unit) -> Result<()> {
+        self.binding.step.select_unit(unit.index)?;
+        let offset = unit.rows.start * H * 4;
+        self.binding.input = CuteafdDeviceBuffer { ptr: self.span.ptr.wrapping_byte_add(offset),
+            bytes: self.span.bytes - offset, ..self.span };
+        self.binding.current = std::mem::take(&mut self.current[unit.index]);
+        Ok(())
+    }
+    fn release(&mut self, unit: &crate::shared::prefill_pipeline::Unit) {
+        self.current[unit.index] = std::mem::take(&mut self.binding.current);
+    }
+}
+
+impl<E: CopyEngine> crate::shared::prefill_pipeline::PrefillHooks for UnitHooks<'_, '_, '_, '_, '_, E> {
+    type Ticket = Option<usize>;
+    fn route(&self, layer: usize) -> crate::shared::prefill_pipeline::FfnRoute {
+        let routed = (0..self.binding.execution.ownership.ranks()).any(|rank|
+            self.binding.execution.ownership.layer(layer, rank).is_ok_and(|local| local.routed_wave));
+        if routed { crate::shared::prefill_pipeline::FfnRoute::Spark } else { crate::shared::prefill_pipeline::FfnRoute::Local }
+    }
+    fn begin_unit(&mut self, _: &crate::shared::prefill_pipeline::Unit) -> Result<()> { Ok(()) }
+    fn attention(&mut self, layer: usize, unit: &crate::shared::prefill_pipeline::Unit) -> Result<()> {
+        self.select(unit)?;
+        let plan = self.binding.execution.ownership.execution();
+        let rows = unit.rows.len();
+        let result = attention::pipeline_attention(&self.binding.execution.exchange, plan, layer, unit.slot, rows,
+            &mut self.binding, &mut self.consumed[unit.index]).map(|_| ());
+        self.release(unit);
+        result
+    }
+    fn local_ffn(&mut self, layer: usize, unit: &crate::shared::prefill_pipeline::Unit) -> Result<()> {
+        self.select(unit)?;
+        let owner = owner_of(self.binding.execution, layer)?;
+        let result = self.binding.begin_ffn(layer, owner).and_then(|ticket| {
+            ensure!(ticket.is_none(), "Step-5 local FFN dispatched a Spark wave");
+            self.binding.finish_ffn(layer, ticket)
+        });
+        self.release(unit);
+        result
+    }
+    fn send_experts(&mut self, layer: usize, unit: &crate::shared::prefill_pipeline::Unit) -> Result<Option<usize>> {
+        self.select(unit)?;
+        let owner = owner_of(self.binding.execution, layer)?;
+        let result = self.binding.begin_ffn(layer, owner);
+        self.release(unit);
+        result
+    }
+    fn land_experts(&mut self, layer: usize, unit: &crate::shared::prefill_pipeline::Unit, ticket: Option<usize>)
+        -> Result<()> {
+        self.select(unit)?;
+        let result = self.binding.finish_ffn(layer, ticket);
+        self.release(unit);
+        result
+    }
+    fn end_unit(&mut self, unit: &crate::shared::prefill_pipeline::Unit) -> Result<()> {
+        self.select(unit)?;
+        let plan = self.binding.execution.ownership.execution();
+        let result = (|| {
+            attention::pipeline_hops(&self.binding.execution.exchange, plan, HopPoint::Exit, unit.slot,
+                unit.rows.len(), &mut self.binding, &mut self.consumed[unit.index])?;
+            let head = usize::from(plan.spec().head_gpu);
+            let output = self.binding.current[head].context("Step-5 unit omitted its terminal residual")?;
+            // Collect the unit's terminal rows into its rows of the step input,
+            // free since its first attention copied them out.
+            let destination = self.binding.input;
+            self.binding.copy(head, destination, output)
+        })();
+        self.release(unit);
+        result
+    }
+    fn commit_unit(&mut self, _: &crate::shared::prefill_pipeline::Unit) -> Result<()> {
+        // KV, rings and summaries were staged per unit; the step publishes once.
+        Ok(())
+    }
+}
+
+/// The attention owner of a whole-owned layer, or None for head split.
+fn owner_of(execution: &MainExecution<'_, '_>, layer: usize) -> Result<Option<usize>> {
+    Ok(match execution.ownership.execution().mode(layer)? {
+        LayerMode::Whole { gpu, .. } => Some(usize::from(gpu)),
+        LayerMode::HeadSplit => None,
+        LayerMode::ContextSplit => anyhow::bail!("Step-5 context split has no unit binding"),
+    })
 }
 
 fn expert_request(identity: u64, placement_version: u64, layer: usize,
@@ -678,8 +837,36 @@ struct Bindings<'s, 'b, 'e, 'a, 'g, E: CopyEngine> {
     scope: &'g SubmissionScope<'g>, current: Vec<Option<CuteafdDeviceBuffer>>,
     input: CuteafdDeviceBuffer, kind: ExpertV2SourceKind, layer: usize,
     diagnostic: Option<&'s std::path::Path>,
+    /// Prefill units: residuals and hop landings are slot-owned per unit.
+    units: bool,
 }
 impl<'s, E: CopyEngine> Bindings<'s, '_, '_, '_, '_, E> {
+    /// Rows of the selected unit: every hook runs these, never the span.
+    fn rows(&self) -> usize { self.step.unit_rows().len() }
+
+    /// Points every FFN owner's live planes, and the entry routed reply, at the
+    /// selected unit's rows.
+    fn select_ffn(&self, layer: usize) -> Result<()> {
+        let window = self.step.unit_rows();
+        for rank in 0..self.execution.ownership.ranks() {
+            if let Ok(local) = self.execution.layer(rank, layer) {
+                match &local.ffn {
+                    Ffn::Dense(ffn) => ffn.select_unit(window.start, window.len())?,
+                    Ffn::Routed(ffn) => ffn.select_unit(window.start, window.len())?,
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// The entry rank's routed reply plane for a non-entry owner, at the unit's rows.
+    fn routed_reply(&self) -> Result<CuteafdDeviceBuffer> {
+        let reply = self.execution.routed_reply.buffer;
+        let offset = self.step.unit_rows().start * H * 2;
+        ensure!(offset + self.rows() * H * 2 <= reply.bytes, "Step-5 routed reply outside the span");
+        Ok(CuteafdDeviceBuffer { ptr: reply.ptr.wrapping_byte_add(offset), bytes: reply.bytes - offset, ..reply })
+    }
+
     fn retain_diagnostic_output(&self, layer: usize) -> Result<()> {
         if !self.execution.diagnostic_outputs.borrow().contains_key(&layer) { return Ok(()); }
         let (device, output) = self.execution.output(layer)?;
@@ -689,7 +876,7 @@ impl<'s, E: CopyEngine> Bindings<'s, '_, '_, '_, '_, E> {
             LayerMode::ContextSplit => anyhow::bail!("Step-5 context diagnostic unsupported"),
         };
         self.execution.stages[rank].stream.drain()?;
-        let mut bytes = vec![0; self.step.rows() * H * 4];
+        let mut bytes = vec![0; self.rows() * H * 4];
         device.run(|| device.library.copy_d2h(&mut bytes, output))?;
         self.execution.diagnostic_outputs.borrow_mut().insert(layer, bytes);
         Ok(())
@@ -698,7 +885,7 @@ impl<'s, E: CopyEngine> Bindings<'s, '_, '_, '_, '_, E> {
     fn copy(&mut self, rank: usize, destination: CuteafdDeviceBuffer, source: CuteafdDeviceBuffer) -> Result<()> {
         ensure!(destination.device_id == self.execution.device(rank)?.id
             && source.device_id == destination.device_id && !source.ptr.is_null() && !destination.ptr.is_null()
-            && source.bytes >= self.step.rows() * H * 4 && destination.bytes >= self.step.rows() * H * 4,
+            && source.bytes >= self.rows() * H * 4 && destination.bytes >= self.rows() * H * 4,
             "Step-5 residual copy live rank extent");
         if source.ptr == destination.ptr { return Ok(()); }
         self.step.compose(rank, self.execution, |_, meta| meta.stream.device.run(|| {
@@ -712,7 +899,7 @@ impl<'s, E: CopyEngine> Bindings<'s, '_, '_, '_, '_, E> {
         self.copy(rank, owner.input(), source)?;
         if self.execution.poison_scratch.get() {
             self.execution.stages[rank].stream.drain()?;
-            self.execution.native.arenas[rank].poison_after(self.step.rows() * H * 4)?;
+            self.execution.native.arenas[rank].poison_after(self.rows() * H * 4)?;
         }
         match &owner.attention {
             Attention::Sliding(owner) => owner.enqueue_attention_step(self.step, rank),
@@ -725,14 +912,21 @@ impl<E: CopyEngine> LayerKernels for Bindings<'_, '_, '_, '_, '_, E> {
         Ok(self.current[hop.from as usize].unwrap_or(self.input).ptr.cast_const())
     }
     fn entry_destination(&mut self, rank: usize) -> Result<*mut c_void> {
-        // Entry hops land directly in the first layer's owned input.
+        // A whole step's entry hop lands directly in the first layer's input.
+        // A unit's lands in its own rows of layer 0's live FFN input: the
+        // hook-local attention input may still be read by another unit's
+        // merge on that GPU, a slot-owned row never is.
+        if self.units {
+            self.select_ffn(0)?;
+            return Ok(self.execution.layer(rank, 0)?.ffn_input().ptr);
+        }
         Ok(self.execution.layer(rank, 0)?.input().ptr)
     }
     fn adopt(&mut self, hop: Hop, residual: *mut c_void) -> Result<()> {
         ensure!(matches!(hop.at, HopPoint::Entry | HopPoint::BeforeLayer(_) | HopPoint::Exit),
             "Step-5 whole native FFN never broadcasts after attention");
         self.current[hop.to as usize] = Some(CuteafdDeviceBuffer { ptr: residual,
-            bytes: self.step.rows() * H * 4, device_id: self.execution.device(hop.to as usize)?.id, flags: 0 });
+            bytes: self.rows() * H * 4, device_id: self.execution.device(hop.to as usize)?.id, flags: 0 });
         Ok(())
     }
     fn heads(&mut self, layer: usize) -> Result<()> {
@@ -746,14 +940,14 @@ impl<E: CopyEngine> LayerKernels for Bindings<'_, '_, '_, '_, '_, E> {
                 let (owner, _) = self.execution.diagnostic_layer0(rank)?;
                 let device = self.execution.caches[rank].borrow().stream.device;
                 super::golden::dump_plane(directory, &format!("rank{rank}-attention_input"), device,
-                    owner.diagnostic_norm(), self.step.rows(), true)?;
+                    owner.diagnostic_norm(), self.rows(), true)?;
                 super::golden::dump_plane(directory, &format!("rank{rank}-o_partial"), device,
-                    owner.projection_partial()?, self.step.rows(), false)?;
+                    owner.projection_partial()?, self.rows(), false)?;
             }
         }
         let execution = self.execution;
         attention::head_partials(self.scope, execution.exchange.peer()?, &mut execution.sequence.borrow_mut(),
-            self.step.rows() * H, HeadPrecision::F32, self)
+            self.rows() * H, HeadPrecision::F32, self)
     }
     fn context(&mut self, _layer: usize, _ordinal: usize) -> Result<()> {
         anyhow::bail!("Step-5 context split has no qualified binding")
@@ -777,6 +971,7 @@ impl<E: CopyEngine> PipelineKernels for Bindings<'_, '_, '_, '_, '_, E> {
     }
     fn begin_ffn(&mut self, layer: usize, owner: Option<usize>) -> Result<Self::FfnTicket> {
         let execution = self.execution;
+        self.select_ffn(layer)?;
         let mut wave = None;
         for rank in 0..execution.ownership.ranks() {
             if owner.is_some_and(|owner| owner != rank) { continue; }
@@ -794,7 +989,7 @@ impl<E: CopyEngine> PipelineKernels for Bindings<'_, '_, '_, '_, '_, E> {
                     })?;
                     if dispatch {
                         ensure!(wave.is_none(), "Step-5 duplicate routed Spark wave");
-                        let layout = RouteStaging::new(self.step.rows(), 8, H * 2)?;
+                        let layout = RouteStaging::new(self.rows(), 8, H * 2)?;
                         let host = execution.pinned[rank].borrow();
                         self.step.compose(rank, ffn, |ffn, meta| {
                             meta.stream.device.run(|| {
@@ -815,9 +1010,10 @@ impl<E: CopyEngine> PipelineKernels for Bindings<'_, '_, '_, '_, '_, E> {
                         let identity = request_identity(ordinal)?;
                         execution.requests.set(identity);
                         let request = expert_request(identity, execution.placement_version, layer, descriptors, routes, wire)?;
-                        ensure!(execution.pending_wave.borrow().is_none(), "Step-5 main wave already pending");
+                        ensure!(execution.pending_wave.borrow().len() < link.get_mut().waves(),
+                            "Step-5 Spark waves in flight exceed the transport's return slots");
                         let ticket = device.run(|| link.get_mut().dispatch(&request))?;
-                        *execution.pending_wave.borrow_mut() = Some(ticket);
+                        execution.pending_wave.borrow_mut().push_back(ticket);
                         wave = Some(rank);
                     }
                     self.step.compose(rank, ffn, |ffn, meta| {
@@ -832,11 +1028,13 @@ impl<E: CopyEngine> PipelineKernels for Bindings<'_, '_, '_, '_, '_, E> {
     fn finish_ffn(&mut self, layer: usize, ticket: Self::FfnTicket) -> Result<()> {
         let execution = self.execution;
         let Some(rank) = ticket else { return self.retain_diagnostic_output(layer); };
-        let wave = execution.pending_wave.borrow_mut().take().context("Step-5 main wave absent")?;
+        self.select_ffn(layer)?;
+        // Waves land in dispatch order: the executor lands the oldest first.
+        let wave = execution.pending_wave.borrow_mut().pop_front().context("Step-5 main wave absent")?;
         let entry = usize::from(execution.ownership.execution().spec().entry_gpu);
         let Ffn::Routed(ffn) = &execution.layer(rank, layer)?.ffn else { anyhow::bail!("Step-5 routed completion owner"); };
         let split = execution.ownership.execution().mode(layer)? == LayerMode::HeadSplit;
-        let output = if rank == entry { ffn.routed_output() } else { execution.routed_reply.buffer };
+        let output = if rank == entry { ffn.routed_output() } else { self.routed_reply()? };
         self.step.compose(entry, &execution.routed_reply, |_, meta| {
             let mut transport = execution.transport.borrow_mut();
             let link = transport.as_mut().context("Step-5 main transport missing")?;
@@ -855,7 +1053,7 @@ impl<E: CopyEngine> PipelineKernels for Bindings<'_, '_, '_, '_, '_, E> {
             let Ffn::Routed(destination) = &execution.layer(destination_rank, layer)?.ffn else { anyhow::bail!("Step-5 routed receive owner"); };
             let binding = execution.ownership.routed_replications()?[layer].context("Step-5 routed publication binding")?;
             attention::replicate_result(self.scope, execution.exchange.peer()?, entry, binding.slot,
-                output, destination.routed_output(), self.step.rows() * H * 2)?;
+                output, destination.routed_output(), self.rows() * H * 2)?;
         }
         for at in 0..execution.ownership.ranks() {
             if !split && at != rank { continue; }

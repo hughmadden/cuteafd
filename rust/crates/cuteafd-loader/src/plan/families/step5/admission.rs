@@ -256,7 +256,7 @@ impl RuntimeInputs {
             storage: HopStorage::ReceiveSlots,
             row_bytes: 4096 * 4,
             rows: self.unit_rows() as u64,
-            lanes: 1,
+            lanes: self.waves as u64,
             entry_gpu: 0,
             head_gpu: 0,
             terminal: TerminalHome::AttentionOwner,

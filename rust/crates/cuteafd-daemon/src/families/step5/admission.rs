@@ -34,12 +34,13 @@ pub(super) fn admit_mtp<'a>(
     let ownership = &admitted.ownership;
     for rank in 0..ownership.ranks() {
         let native =
-            Execution::serving_admission(programs, checkpoint, ownership, rank, inputs.rows, inputs.logit_rows())?;
+            Execution::serving_admission(programs, checkpoint, ownership, rank, inputs.unit_rows(), inputs.rows,
+                inputs.logit_rows())?;
         let shared = cuteafd_loader::plan::families::step5::native::rank_admission(
             checkpoint,
             ownership,
             rank,
-            inputs.rows,
+            inputs.unit_rows(),
             inputs.rows,
             inputs.logit_rows(),
         )?;
