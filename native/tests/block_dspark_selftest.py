@@ -21,6 +21,8 @@ def bind(path):
         "cuteafd_block_dspark_attention_workspace": ([I] * 6, C.c_uint64),
         "cuteafd_block_dspark_attention": ([P] * 10 + [I] * 8 + [F, P], I),
         "cuteafd_block_dspark_attention_paged": ([P] * 11 + [I] * 9 + [F, P], I),
+        "cuteafd_block_dspark_attention_fp8": ([P] * 10 + [I] * 8 + [F, P], I),
+        "cuteafd_block_dspark_attention_paged_fp8": ([P] * 11 + [I] * 9 + [F, P], I),
         "cuteafd_glmf_dspark_attention_workspace": ([I] * 3, C.c_uint64),
         "cuteafd_glmf_dspark_attention": ([P] * 10 + [I] * 7 + [F, P], I),
     }
@@ -131,6 +133,18 @@ def attention_check(lib):
                         padded_v = torch.nn.functional.pad(vc[slot], (0, 0, 0, 0, 0, width * 64 - capacity))
                         kp[page_ids.reshape(sequences, width)[slot].long()] = padded_k.reshape(width, 64, kvh, dim)
                         vp[page_ids.reshape(sequences, width)[slot].long()] = padded_v.reshape(width, 64, kvh, dim)
+                    from draft_kv_selftest import pack
+                    compact_k = pack(kc.reshape(-1, kvh, dim))
+                    compact_v = pack(vc.reshape(-1, kvh, dim))
+                    compact_kp = torch.zeros(sequences * width, 64, compact_k.shape[-1],
+                                             device="cuda", dtype=torch.uint8)
+                    compact_vp = torch.zeros_like(compact_kp)
+                    for slot in range(sequences):
+                        for logical in range(width):
+                            first, end = logical * 64, min((logical + 1) * 64, capacity)
+                            physical = page_ids.reshape(sequences, width)[slot, logical].long()
+                            compact_kp[physical, :end - first] = compact_k[slot * capacity + first:slot * capacity + end]
+                            compact_vp[physical, :end - first] = compact_v[slot * capacity + first:slot * capacity + end]
                     for amplitude in (1., 8.):
                         query = (q.float() * amplitude).bfloat16()
                         contiguous = torch.empty_like(q)
@@ -143,6 +157,16 @@ def attention_check(lib):
                             scratch.data_ptr(), *geometry, dim, width, dim ** -0.5, stream) == 0
                         torch.cuda.synchronize()
                         assert torch.equal(contiguous, paged), "fragmented pages changed attention bytes"
+                        assert lib.cuteafd_block_dspark_attention_fp8(query.data_ptr(), k.data_ptr(), v.data_ptr(),
+                            compact_k.data_ptr(), compact_v.data_ptr(), slots.data_ptr(), lengths.data_ptr(),
+                            ends.data_ptr(), contiguous.data_ptr(), scratch.data_ptr(), *geometry, dim,
+                            dim ** -0.5, stream) == 0
+                        assert lib.cuteafd_block_dspark_attention_paged_fp8(query.data_ptr(), k.data_ptr(), v.data_ptr(),
+                            compact_kp.data_ptr(), compact_vp.data_ptr(), slots.data_ptr(), lengths.data_ptr(),
+                            ends.data_ptr(), page_tables.data_ptr(), paged.data_ptr(), scratch.data_ptr(),
+                            *geometry, dim, width, dim ** -0.5, stream) == 0
+                        torch.cuda.synchronize()
+                        assert torch.equal(contiguous, paged), "fragmented FP8 pages changed attention bytes"
                     if dim == 64:
                         legacy_size = lib.cuteafd_glmf_dspark_attention_workspace(16, kvh, max_keys)
                         assert size == legacy_size

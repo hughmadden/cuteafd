@@ -714,6 +714,8 @@ impl<'a> DsparkDrafter<'a> {
             }
             return Err(error);
         }
+        // SAFETY: snapshot consumers may run on a different stream after publication.
+        unsafe { self.library.cuda_stream_synchronize(self.stream)?; }
         Ok(attachment)
     }
 
