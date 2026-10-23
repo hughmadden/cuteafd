@@ -1263,7 +1263,8 @@ mod unit_overwrite_tests {
                 out.attention[rank].push(planes(&sequential(&sizes), 0, &sequential(&half)));
                 let own = native::plane_bytes(&sizes).unwrap() as usize;
                 let (ffn, ffn_half) = match (routed(layer), shared_region) {
-                    (true, true) => (native::routed_layout(CHUNK).unwrap().to_vec(), native::routed_layout(CHUNK / 2).unwrap().to_vec()),
+                    (true, true) => (native::routed_layout(CHUNK, full(layer)).unwrap().to_vec(),
+                        native::routed_layout(CHUNK / 2, full(layer)).unwrap().to_vec()),
                     (false, true) => (native::dense_layout(CHUNK).unwrap().to_vec(), native::dense_layout(CHUNK / 2).unwrap().to_vec()),
                     (true, false) => (sequential(&native::routed_planes(CHUNK).unwrap()), sequential(&native::routed_planes(CHUNK / 2).unwrap())),
                     (false, false) => (sequential(&native::dense_planes(CHUNK).unwrap()), sequential(&native::dense_planes(CHUNK / 2).unwrap())),
@@ -1384,6 +1385,31 @@ mod unit_overwrite_tests {
             assert_eq!(replay(&modes, &old, 1, 1), None);
             let hazard = replay(&modes, &old, 2, 1).expect("per-kind offsets must be caught");
             assert!(hazard.contains("overwrites unit"), "{hazard}");
+        }
+    }
+
+    /// The executor's startup check: the peer's replicated routed reply never
+    /// lands in storage a previous replication used without a head exchange
+    /// in between. Region offsets must keep CSA and head-split replies apart.
+    #[test]
+    fn replicated_replies_never_reuse_storage_without_a_head_exchange() {
+        for contiguous in [true, false] {
+            let modes = modes(contiguous);
+            for (shared, expect) in [(true, true), (false, true)] {
+                let layout = layout(&modes, shared);
+                let mut pending: Vec<(usize, usize, usize)> = Vec::new(); // (layer, destination rank, offset)
+                let mut ok = true;
+                for (layer, &mode) in modes.iter().enumerate() {
+                    if mode == Mode::Split { pending.clear(); }
+                    if !routed(layer) { continue; }
+                    // Entry is GPU0: head-split layers and GPU1-owned layers replicate to GPU1.
+                    let destination = match mode { Mode::Split => 1, Mode::Whole(1) => 1, _ => continue };
+                    let offset = layout.ffn[destination][layer][9].offset;
+                    if pending.iter().any(|&(_, rank, at)| rank == destination && at == offset) { ok = false; }
+                    pending.push((layer, destination, offset));
+                }
+                assert_eq!(ok, expect, "shared={shared} contiguous={contiguous}");
+            }
         }
     }
 

@@ -120,9 +120,12 @@ pub fn dense_planes(rows: usize) -> Result<[usize; 6]> {
 }
 
 /// Planes live from an FFN's begin to its finish (or to the next attention),
-/// in FFN-region order: OUTPUT, INPUT, SHARED, ROUTED. Every FFN kind keeps
-/// them at these offsets, so one kind's scratch never overwrites another
-/// kind's pending rows, and attention never touches the FFN region.
+/// in FFN-region order: OUTPUT, INPUT, SHARED, then two ROUTED reply planes.
+/// Every FFN kind keeps them at these offsets, so one kind's scratch never
+/// overwrites another kind's pending rows, and attention never touches the
+/// FFN region. Head-split (SWA) and whole-owned (CSA) layers receive the
+/// peer's replicated reply in different planes: two replications with no head
+/// exchange between them never share storage (`validate_routed_replications`).
 const ROUTED_LIVE: [usize; 4] = [13, 0, 8, 9];
 const DENSE_LIVE: [usize; 2] = [5, 0];
 
@@ -137,24 +140,28 @@ fn region(sizes: &[usize], order: &[usize], start: usize) -> Result<(Vec<(usize,
     Ok((layout, next))
 }
 
+/// End of the live prefix: OUTPUT, INPUT, SHARED and both reply planes.
 fn live_prefix(rows: usize) -> Result<usize> {
     let routed = routed_planes(rows)?;
-    Ok(region(&routed, &ROUTED_LIVE, 0)?.1)
+    let (_, end) = region(&routed, &ROUTED_LIVE, 0)?;
+    end.checked_add(routed[9]).and_then(|n| n.checked_add(15)).map(|n| n / 16 * 16)
+        .context("Step-5 FFN region overflow")
 }
 
 /// (offset, bytes) per routed plane, in the routed owner's plane-index order,
-/// relative to the rank's FFN region.
-pub fn routed_layout(rows: usize) -> Result<[(usize, usize); 14]> {
+/// relative to the rank's FFN region. `full` (CSA) layers use the second reply plane.
+pub fn routed_layout(rows: usize, full: bool) -> Result<[(usize, usize); 14]> {
     let sizes = routed_planes(rows)?;
-    let (mut layout, prefix) = region(&sizes, &ROUTED_LIVE, 0)?;
+    let (mut layout, swa_end) = region(&sizes, &ROUTED_LIVE, 0)?;
+    if full { layout[9].0 = swa_end; }
     let local = (0..14).filter(|plane| !ROUTED_LIVE.contains(plane)).collect::<Vec<_>>();
-    let (tail, _) = region(&sizes, &local, prefix)?;
+    let (tail, _) = region(&sizes, &local, live_prefix(rows)?)?;
     for &plane in &local { layout[plane] = tail[plane]; }
     Ok(layout.try_into().expect("routed plane count"))
 }
 
 /// Dense OUTPUT and INPUT share the routed offsets; its scratch follows the
-/// whole live prefix, including the routed-only SHARED and ROUTED planes.
+/// whole live prefix, including the routed-only SHARED and reply planes.
 pub fn dense_layout(rows: usize) -> Result<[(usize, usize); 6]> {
     let sizes = dense_planes(rows)?;
     let (mut layout, _) = region(&sizes, &DENSE_LIVE, 0)?;
@@ -168,7 +175,8 @@ pub fn dense_layout(rows: usize) -> Result<[(usize, usize); 6]> {
 pub fn ffn_region_bytes(rows: usize) -> Result<u64> {
     let end = |layout: &[(usize, usize)]| layout.iter().map(|&(offset, bytes)| offset + bytes)
         .max().unwrap_or(0);
-    let bytes = end(&routed_layout(rows)?).max(end(&dense_layout(rows)?));
+    let bytes = end(&routed_layout(rows, false)?).max(end(&routed_layout(rows, true)?))
+        .max(end(&dense_layout(rows)?));
     Ok(u64::try_from(bytes.div_ceil(16) * 16)?)
 }
 
@@ -308,8 +316,13 @@ mod tests {
     #[test]
     fn ffn_region_keeps_live_planes_at_common_offsets_for_every_kind() -> Result<()> {
         for rows in [1, 16, 64, 256, 512, 1024, 2048, 4096] {
-            let routed = routed_layout(rows)?;
+            let routed = routed_layout(rows, false)?;
+            let csa = routed_layout(rows, true)?;
             let dense = dense_layout(rows)?;
+            // Head-split and whole-owned replies never share storage; every
+            // other plane is identical between the two routed kinds.
+            assert!(routed[9].0 + routed[9].1 <= csa[9].0);
+            assert!((0..14).filter(|&p| p != 9).all(|p| routed[p] == csa[p]));
             let region = usize::try_from(ffn_region_bytes(rows)?)?;
             // OUTPUT first, then INPUT, in both kinds.
             assert_eq!((routed[13].0, dense[5].0), (0, 0));
@@ -317,7 +330,7 @@ mod tests {
             assert_eq!((routed[13].1, routed[0].1), (dense[5].1, dense[0].1));
             // Every plane of every kind is 16-byte aligned, disjoint inside
             // its kind, and inside the one region.
-            for layout in [&routed[..], &dense[..]] {
+            for layout in [&routed[..], &csa[..], &dense[..]] {
                 assert!(end(layout) <= region);
                 for (i, a) in layout.iter().enumerate() {
                     assert_eq!(a.0 % 16, 0);
@@ -326,12 +339,14 @@ mod tests {
             }
             // Dense scratch never touches a pending routed wave's live planes
             // (OUTPUT, INPUT, SHARED, ROUTED), nor routed scratch dense's.
-            let live = ROUTED_LIVE.map(|plane| routed[plane]);
+            let live = ROUTED_LIVE.map(|plane| routed[plane]).into_iter().chain([csa[9]]).collect::<Vec<_>>();
             for plane in [1, 2, 3, 4] {
                 assert!(live.iter().all(|b| dense[plane].0 >= b.0 + b.1));
             }
-            for plane in (0..14).filter(|plane| !ROUTED_LIVE.contains(plane)) {
-                assert!(DENSE_LIVE.iter().all(|&live| routed[plane].0 >= dense[live].0 + dense[live].1));
+            for kind in [&routed, &csa] {
+                for plane in (0..14).filter(|plane| !ROUTED_LIVE.contains(plane)) {
+                    assert!(live.iter().all(|b| kind[plane].0 >= b.0 + b.1));
+                }
             }
             assert_eq!(region % 16, 0);
             assert!(region < usize::try_from(plane_bytes(&routed_planes(rows)?)? + plane_bytes(&dense_planes(rows)?)?)?);

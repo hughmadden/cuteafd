@@ -219,7 +219,8 @@ mod tests {
                 // Attention never reaches the shared FFN region at the rank's offset.
                 assert!(attention_views.iter().all(|&(offset, bytes)| offset + bytes <= largest));
             }
-            for ffn in [native::dense_layout(rows)?.to_vec(), native::routed_layout(rows)?.to_vec()] {
+            for ffn in [native::dense_layout(rows)?.to_vec(), native::routed_layout(rows, false)?.to_vec(),
+                native::routed_layout(rows, true)?.to_vec()] {
                 let views = ffn.iter().map(|&(offset, bytes)| (largest + offset, bytes)).collect::<Vec<_>>();
                 assert!(views.iter().all(|&(offset, bytes)| offset >= largest && offset + bytes <= largest + region));
                 // Every kind's OUTPUT is the region's first plane.

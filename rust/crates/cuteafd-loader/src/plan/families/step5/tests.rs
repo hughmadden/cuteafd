@@ -1184,3 +1184,42 @@ fn nvfp4_routed_admission_rechecks_packing_scales_and_role() {
         }
     }
 }
+
+/// Startup validates that the peer's replicated routed reply never lands in
+/// storage a previous replication used without a head exchange in between.
+/// The shared FFN region must keep that true for every owner pattern the
+/// planner can produce (contiguous and alternating CSA owners).
+#[test]
+fn shared_ffn_region_keeps_replicated_replies_apart() {
+    use crate::placement::{FfnMode, LayerMode};
+    use super::ownership::{self, ExecutionOwnership};
+    let dir = snapshot("fp8");
+    let cp = Checkpoint::open(dir.path()).unwrap();
+    let cfg = Config::parse(&cp).unwrap();
+    let csa: Vec<usize> = (0..cfg.layers).filter(|&l| cfg.full[l]).collect();
+    for contiguous in [true, false] {
+        let modes: Vec<_> = (0..cfg.layers).map(|layer| if !cfg.full[layer] { LayerMode::HeadSplit } else {
+            let ordinal = csa.iter().position(|&l| l == layer).unwrap();
+            let gpu = if contiguous { u8::from(ordinal >= csa.len() / 2) } else { (ordinal % 2) as u8 };
+            LayerMode::Whole { gpu, ffn: FfnMode::Owner }
+        }).collect();
+        let owners = ExecutionOwnership::new(&cfg, 2, ownership::plan(&modes, 0, 0)).unwrap();
+        for rows in [256, 2048] {
+            let mut copies = owners.routed_replications().unwrap();
+            for (layer, copy) in copies.iter_mut().enumerate() {
+                if let Some(copy) = copy {
+                    let destination = 1 - usize::from(copy.source);
+                    let base = native::rank_attention_bytes(&cfg, &owners, destination, rows).unwrap() as usize;
+                    // Live binding: the destination layer's ROUTED plane in its arena.
+                    copy.storage = 1 + base + native::routed_layout(rows, cfg.full[layer]).unwrap()[9].0;
+                }
+            }
+            owners.execution().validate_routed_replications(&copies)
+                .unwrap_or_else(|error| panic!("contiguous={contiguous} rows={rows}: {error}"));
+            // A single reply plane would reuse storage across a CSA/SWA boundary.
+            let mut collapsed = copies.clone();
+            for copy in collapsed.iter_mut().flatten() { copy.storage = 1; }
+            assert!(owners.execution().validate_routed_replications(&collapsed).is_err());
+        }
+    }
+}
