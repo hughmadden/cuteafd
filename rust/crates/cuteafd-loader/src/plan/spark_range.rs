@@ -7,9 +7,9 @@ use std::sync::OnceLock;
 
 pub use cuteafd_core::MAX_SPARK_WORLD as MAX_SPARKS;
 pub const EXPERT_BYTES_PER_SPARK: u64 = 16 << 30;
-pub const MIN_UNITS_PER_SPARK: usize = 2;
+pub const MIN_COLUMNS_PER_SPARK: usize = 256;
 
-/// Existing releases are a compatibility floor, not a second range policy.
+/// Historical package coverage is diagnostic only, never a policy override.
 pub fn shipped_worlds(package: &str) -> Vec<usize> {
     static FLOOR: OnceLock<BTreeMap<String, Vec<usize>>> = OnceLock::new();
     let floor = FLOOR.get_or_init(|| serde_json::from_str(include_str!(
@@ -54,12 +54,11 @@ impl SparkRange {
             return Err(RangeRefusal::Geometry("invalid minimum, shipped ceiling or recipe units".into()));
         }
         let size_cap = ((routed_bytes / EXPERT_BYTES_PER_SPARK) as usize).clamp(MIN_SIZE_CAP, MAX_SPARKS);
-        let width_cap = intermediate / unit_columns / MIN_UNITS_PER_SPARK;
+        let width_cap = intermediate / MIN_COLUMNS_PER_SPARK;
         let formula_maximum = MAX_SPARKS.min(size_cap).min(width_cap);
-        let maximum = minimum.max(shipped_maximum).max(formula_maximum);
+        let maximum = minimum.max(formula_maximum);
         let mut binding = Vec::new();
         if minimum == maximum && minimum > formula_maximum { binding.push(BindingCap::Minimum); }
-        if shipped_maximum == maximum && shipped_maximum > formula_maximum { binding.push(BindingCap::Shipped); }
         if maximum == formula_maximum {
             if size_cap == maximum { binding.push(BindingCap::Size); }
             if width_cap == maximum { binding.push(BindingCap::Width); }
@@ -254,7 +253,7 @@ impl PlanInput {
                     counts.push(CountLayout { sparks, units_per_expert: classes, unit_columns: count_unit,
                         source_block_columns, rule, expert_bytes_per_rank,
                         resolved_width_columns: recipe.map(|recipe| recipe.widths), padded,
-                        shipped_exception: sparks > range.formula_maximum && sparks <= shipped_maximum,
+                        shipped_exception: false,
                         currently_launchable: reports[sparks].wip_launchable(),
                         executable_blockers: if reports[sparks].wip_launchable() { vec![] }
                             else { reports[sparks].hints.iter().map(|hint| hint.what.clone()).collect() } });
@@ -388,12 +387,12 @@ mod tests {
     }
 
     #[test]
-    fn shipped_qwen_exceptions_keep_native_padded_geometry() {
-        for (package, maximum) in [("qwen4:exl3-k45", 4), ("qwen4:nvfp4", 6)] {
+    fn historical_packages_do_not_override_the_checkpoint_width_cap() {
+        for package in ["qwen4:exl3-k45", "qwen4:nvfp4"] {
             let shipped = shipped_worlds(package).into_iter().max().unwrap();
             let range = SparkRange::new(0, 16 << 30, 640, 128, shipped).unwrap();
-            assert_eq!((range.width_cap, range.maximum), (2, maximum));
-            assert_eq!(range.binding, [BindingCap::Shipped]);
+            assert_eq!((range.width_cap, range.maximum), (2, 2));
+            assert_eq!(range.binding, [BindingCap::Width]);
             for world in range.counts().filter(|world| *world > 0) {
                 if let Ok(recipe) = super::super::experts::spark_recipe(package, 640, world) {
                     assert!(recipe.widths.iter().all(|width| *width > 0));
@@ -446,4 +445,34 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn balanced_ownership_covers_every_checkpoint_column_once_through_eight() {
+        use cuteafd_core::tp_units::RankUnits;
+        for (intermediate, unit) in [(640, 128), (1536, 128), (2048, 128),
+            (2304, 128), (3072, 128), (2048, 32), (2304, 32), (2048, 16)] {
+            for world in 1..=MAX_SPARKS.min(intermediate / unit) {
+                let rule = balanced_rule(intermediate, unit, world);
+                let classes = width_classes(intermediate, unit, world).unwrap();
+                for layer in [0, 3, 77] {
+                    let maps = (0..world).map(|rank| RankUnits::new(rule, 7,
+                        intermediate, unit, layer, world, rank).unwrap()).collect::<Vec<_>>();
+                    for expert in 0..7 {
+                        let mut covered = vec![0usize; intermediate];
+                        let mut widths = Vec::new();
+                        for map in &maps {
+                            let ranges = map.column_ranges(expert).unwrap();
+                            let width = ranges.iter().map(|range| range.len()).sum::<usize>();
+                            widths.push(width / unit);
+                            assert!(classes.contains(&(width / unit)));
+                            for range in ranges { for column in range { covered[column] += 1; } }
+                        }
+                        assert!(covered.iter().all(|owners| *owners == 1));
+                        assert!(widths.iter().max().unwrap() - widths.iter().min().unwrap() <= 1);
+                    }
+                }
+            }
+        }
+    }
+
 }

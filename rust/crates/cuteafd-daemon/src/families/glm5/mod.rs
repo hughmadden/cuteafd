@@ -124,8 +124,8 @@ fn native_activation(args: &EngineArgs, first_moe: usize, layers: usize, serving
     ensure!(matches!(args.exlr8_manifest.as_deref(), Some("up1" | "bit325")),
         "EXLR8 full execution currently admits up1 or bit325 only");
     ensure!(args.split_device.is_none_or(|device| device != args.device)
-        && (1..=6).contains(&peers.split(',').count()) && args.layers.is_none_or(|count| count == layers),
-        "EXLR8 full execution requires one or two distinct coordinators, 1..=6 Spark ranks and all backbone layers");
+        && (1..=8).contains(&peers.split(',').count()) && args.layers.is_none_or(|count| count == layers),
+        "EXLR8 full execution requires one or two distinct coordinators, 1..=8 Spark ranks and all backbone layers");
     let attention = cuteafd_loader::placement::attention::parse(&args.attention_placement)
         .map_err(anyhow::Error::msg)?;
     let expected = if args.split_device.is_some() { AttentionPlacement::Context } else { AttentionPlacement::Heads };

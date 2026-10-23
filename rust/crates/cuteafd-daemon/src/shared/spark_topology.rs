@@ -88,7 +88,7 @@ pub(crate) fn require_wire(world: SparkWorld, catalog: &OfficialV41Catalog) -> R
     if catalog.format() == cuteafd_loader::plan::checkpoint::CheckpointFormat::Exlr8 {
         ensure!(world.ownership_topology().is_none(),
             "EXLR8 unit ownership requires canonical Spark wire");
-        ensure!((1..=6).contains(&world.topology().world_size()), "EXLR8 requires 1..=6 ranks");
+        ensure!((1..=8).contains(&world.topology().world_size()), "EXLR8 requires 1..=8 ranks");
         return Ok(());
     }
     require_supported(world.ownership_topology(), catalog)?;

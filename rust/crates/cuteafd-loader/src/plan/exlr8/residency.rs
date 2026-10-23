@@ -217,8 +217,8 @@ impl Residency {
         set: ExpertSet,
     ) -> anyhow::Result<Self> {
         ensure!(
-            (1..=6).contains(&world) && rank < world,
-            "expected TP1..6 and rank below world"
+            (1..=8).contains(&world) && rank < world,
+            "expected TP1..8 and rank below world"
         );
         let config = read_json(&snapshot.join("config.json"))?;
         ensure!(

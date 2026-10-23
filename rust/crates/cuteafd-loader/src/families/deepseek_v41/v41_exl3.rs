@@ -94,7 +94,7 @@ impl V41Exl3Projection {
     /// padding and no duplicated boundary block.
     pub fn intermediate_partition(&self, world: usize, rank: usize) -> Result<Range<usize>> {
         ensure!(
-            (1..=6).contains(&world) && rank < world,
+            (1..=8).contains(&world) && rank < world,
             "invalid EXL3 TP rank/world"
         );
         let intermediate = match self.kind {

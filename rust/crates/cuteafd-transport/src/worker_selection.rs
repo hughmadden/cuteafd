@@ -1640,7 +1640,7 @@ mod tests {
                 let mut client = TcpStream::connect(listener.local_addr()?)?;
                 let (server, _) = listener.accept()?;
                 write(&mut client, &Start { message: "worker_selection_start".into(), rank,
-                    selection: selection.clone(), digest: selection.digest()? })?;
+                    selection: selection.clone(), digest: selection.digest()?, admission_timeout_ms: 3000 })?;
                 assert_eq!(receive_worker_selection(&server, rank, Duration::from_secs(3))?, selection);
             }
         }

@@ -362,7 +362,7 @@ impl<'a> SparkIntake<'a> {
     pub(crate) fn new(library: &'a NativeLibrary, mode: IntakeMode, ranks: usize, rows: usize, row_bytes: usize)
         -> Result<Self> {
         let _memory_scope = cuteafd_ffi::memory_ledger::scope("spark-intake");
-        ensure!((1..=6).contains(&ranks), "{ranks} Spark ranks are outside the qualified one-through-six worlds");
+        ensure!((1..=8).contains(&ranks), "{ranks} Spark ranks are outside the one-through-eight transport worlds");
         let plane_bytes = rows * row_bytes;
         let planes = (0..ranks).map(|_| DeviceAllocation::new(library, plane_bytes.max(256)))
             .collect::<Result<Vec<_>>>()?;

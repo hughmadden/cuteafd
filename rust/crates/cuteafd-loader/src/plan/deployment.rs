@@ -122,9 +122,9 @@ impl<'a> DeploymentSpec<'a> {
             ep: options.spark_ep.unwrap_or(1),
             wire: if explicit { SparkWire::NativeOwnership } else { SparkWire::Canonical } };
         if explicit {
-            ensure!(ranks > 0 && topology.tp > 0 && topology.tp <= 6 && topology.ep > 0
+            ensure!(ranks > 0 && topology.tp > 0 && topology.tp <= 8 && topology.ep > 0
                 && topology.ep <= 3 && topology.tp * topology.ep == ranks,
-                "Spark topology {}x{} must match selected physical rank count {ranks} (TP 1..6, EP 1..3)",
+                "Spark topology {}x{} must match selected physical rank count {ranks} (TP 1..8, EP 1..3)",
                 topology.tp, topology.ep);
             ensure!(topology.ep == 1 || matches!((topology.tp, topology.ep), (2, 2) | (3, 2) | (2, 3)),
                 "unsupported replicated Spark topology {}x{}; supported: TP2EP2, TP3EP2, TP2EP3",
@@ -135,16 +135,12 @@ impl<'a> DeploymentSpec<'a> {
         if ranks > 0 {
             ensure!(!explicit || family == "deepseek_v41",
                 "native ownership wire requires V4.1 experts");
-            ensure!(!explicit || matches!((topology.tp, topology.ep),
-                (2, 1) | (3, 1) | (4, 1) | (6, 1) | (2, 2) | (3, 2) | (2, 3)),
-                "unqualified Spark ownership topology {}x{}; supported: TP2EP1, TP3EP1, TP4EP1, TP6EP1, TP2EP2, TP3EP2, TP2EP3",
-                topology.tp, topology.ep);
-            ensure!(ranks <= 6, "Spark worlds above six ranks have no qualified package");
+            ensure!(ranks <= 8, "Spark transport supports at most eight ranks");
             let experts = report.experts.as_ref().context("Spark deployment requires an expert package")?;
             let intermediate = report.spec.as_ref().and_then(|spec| spec.moe.as_ref())
                 .context("Spark deployment requires routed expert geometry")?.intermediate;
             if native.is_none() { super::experts::spark_recipe(&experts.package, intermediate, topology.tp)?; }
-            else { ensure!(family == "glm5" && (1..=6).contains(&ranks) && experts.package == "glm:exlr8",
+            else { ensure!(family == "glm5" && (1..=8).contains(&ranks) && experts.package == "glm:exlr8",
                 "EXLR8 deployment requires GLM native canonical Sparks"); }
         }
         ensure!(options.peers.is_empty() || options.peers.len() >= ranks,
@@ -422,8 +418,8 @@ mod tests {
         report.spark_ranks = 1;
         let options = DeploymentOptions { spark_tp: Some(1), ..options };
         let error = DeploymentSpec::from_report(&report, &options).unwrap_err().to_string();
-        assert!(error.contains("ownership topology 1x1"), "{error}");
-        assert!(error.contains("supported: TP2EP1, TP3EP1, TP4EP1, TP6EP1"), "{error}");
+        assert!(error.contains("missing Spark package recipe"), "{error}");
+        assert!(error.contains("TP1"), "{error}");
     }
 
     #[test]

@@ -305,8 +305,8 @@ impl<'a> NativeTp4Wave<'a> {
             "invalid native TP wave capacity"
         );
         ensure!(
-            matches!(ranks, 2 | 3 | 4 | 6),
-            "native TP wave requires two, three, four or six ranks"
+            (1..=8).contains(&ranks),
+            "native TP wave requires one through eight ranks"
         );
         (capacity as usize)
             .checked_mul(ranks * V41_PARTIAL_ROW_BYTES as usize + 2 * 5120 * 2)
@@ -324,8 +324,8 @@ impl<'a> NativeTp4Wave<'a> {
         tracing::info!(mode = choice.mode.name(), reason = %choice.reason,
             "V4.1 Spark intake probe (host lane uses pinned uploads)");
         ensure!(
-            matches!(world_size, 2 | 3 | 4 | 6),
-            "native TP wave requires two, three, four or six ranks"
+            (1..=8).contains(&world_size),
+            "native TP wave requires one through eight ranks"
         );
         ensure!(
             Self::device_bytes_for(capacity, world_size)? <= available_bytes,

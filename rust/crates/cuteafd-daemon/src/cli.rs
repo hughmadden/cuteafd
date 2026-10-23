@@ -171,7 +171,7 @@ pub(crate) struct PlanArgs {
     /// Host RAM cap for all separate per-row mapped-table scales; 0 keeps all mapped.
     #[arg(long, default_value_t = 0.0, value_parser = parse_scale_preload_gib)]
     pub mapped_scale_preload_gib: f64,
-    #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..=6))]
+    #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..=8))]
     pub(crate) vision_replicas: u32,
     /// Vision policy (auto does not imply an implemented encoder).
     #[arg(skip = cuteafd_loader::plan::MediaMode::Auto)]
@@ -215,7 +215,7 @@ pub(crate) struct PlanArgs {
     /// Emit typed launch decisions; live artifact verification stays with the launcher.
     #[arg(long, conflicts_with_all = ["files", "fetch", "role", "file_layout"])]
     pub(crate) deployment: bool,
-    #[arg(long, requires = "deployment", requires = "spark_ep", value_parser = clap::value_parser!(u8).range(1..=6))]
+    #[arg(long, requires = "deployment", requires = "spark_ep", value_parser = clap::value_parser!(u8).range(1..=8))]
     pub(crate) spark_tp: Option<u8>,
     #[arg(long, requires = "deployment", requires = "spark_tp", value_parser = clap::value_parser!(u8).range(1..=3))]
     pub(crate) spark_ep: Option<u8>,
@@ -523,10 +523,10 @@ pub(crate) struct NativeExpertDaemonArgs {
     /// Override the FP8 expert package layout directory (`fp8-<family>/tp<world>`).
     #[arg(long)]
     pub(crate) fp8_package: Option<PathBuf>,
-    #[arg(long, value_parser = clap::value_parser!(u32).range(0..6))]
+    #[arg(long, value_parser = clap::value_parser!(u32).range(0..8))]
     pub(crate) rank: u32,
     /// Spark tensor-parallel world; one rank supports whole Qwen EXL3 experts.
-    #[arg(long, default_value_t = 4, value_parser = clap::value_parser!(u32).range(1..=6))]
+    #[arg(long, default_value_t = 4, value_parser = clap::value_parser!(u32).range(1..=8))]
     pub(crate) world: u32,
     /// Replicated-group tensor-parallel degree inside one group (opt-in; all-or-none with --spark-ep).
     #[arg(long, requires = "spark_ep", value_parser = parse_spark_tp)]
@@ -970,7 +970,7 @@ mod tests {
             assert!(Cli::try_parse_from(serve.into_iter().chain(flags.clone())).is_err());
             assert!(Cli::try_parse_from(expert.into_iter().chain(flags)).is_err());
         }
-        for (tp, ep) in [("1", "2"), ("5", "1"), ("2", "0"), ("2", "4")] {
+        for (tp, ep) in [("1", "2"), ("9", "1"), ("2", "0"), ("2", "4")] {
             let flags = ["--spark-tp", tp, "--spark-ep", ep];
             assert!(Cli::try_parse_from(serve.into_iter().chain(flags)).is_err(), "{tp}x{ep}");
             assert!(Cli::try_parse_from(expert.into_iter().chain(flags)).is_err(), "{tp}x{ep}");
@@ -981,7 +981,7 @@ mod tests {
         let cli = Cli::try_parse_from(one.into_iter().chain(["1"])).unwrap();
         let Commands::Expertd(args) = cli.command else { panic!("expertd-native") };
         assert_eq!((args.rank, args.world), (0, 1));
-        for invalid in ["0", "7"] {
+        for invalid in ["0", "9"] {
             assert!(Cli::try_parse_from(one.into_iter().chain([invalid])).is_err());
         }
         // The worker world range also admits the six-rank layouts.
@@ -991,8 +991,7 @@ mod tests {
         let Commands::Expertd(args) = cli.command else { panic!("expertd-native") };
         assert_eq!((args.rank, args.world), (5, 6));
 
-        // Pure TP6EP1 is a real shard family on both processes. Five is not a
-        // family and stays rejected even though it is inside the numeric range.
+        // Pure TP6EP1 parses on both processes; TP9 is outside transport capacity.
         let six_expert = ["cuteafd", "expertd-native", "--snapshot", "/model", "--native-lib",
             "/native.so", "--device-budget-bytes", "1000", "--rank", "5", "--world", "6"];
         for command in [&serve[..], &six_expert[..]] {
@@ -1004,9 +1003,9 @@ mod tests {
                 other => panic!("unexpected command {other:?}"),
             }
             let error = Cli::try_parse_from(command.iter().copied()
-                .chain(["--spark-tp", "5", "--spark-ep", "1"]))
-                .expect_err("TP5 has no shard family");
-            assert!(error.to_string().contains("expected 2, 3, 4 or 6"), "{error}");
+                .chain(["--spark-tp", "9", "--spark-ep", "1"]))
+                .expect_err("TP9 exceeds transport capacity");
+            assert!(error.to_string().contains("expected 2 through 8"), "{error}");
         }
     }
 }
@@ -1172,17 +1171,15 @@ pub(crate) struct NativeServeArgs {
     pub spark_ep: Option<u8>,
 }
 
-/// Spark TP degrees with a native shard family: 2/3 replicated-group shards,
-/// 4 the legacy grouped layout, and 6 the pure unreplicated `TP6EP1` slices.
-/// Five has no artifact family, so it is rejected here rather than at load time.
+/// Parse transport geometry; checkpoint admission checks native package coverage.
 fn parse_spark_tp(value: &str) -> Result<u8, String> {
     let value: u8 = value
         .parse()
-        .map_err(|_| "expected a Spark TP degree between 2 and 6".to_string())?;
+        .map_err(|_| "expected a Spark TP degree between 2 and 8".to_string())?;
     match value {
-        2 | 3 | 4 | 6 => Ok(value),
+        2..=8 => Ok(value),
         _ => Err(format!(
-            "unsupported Spark TP degree {value}; expected 2, 3, 4 or 6"
+            "unsupported Spark TP degree {value}; expected 2 through 8"
         )),
     }
 }
