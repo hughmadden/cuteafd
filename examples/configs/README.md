@@ -59,7 +59,7 @@ step S5 unifies this default with the other families'.
 
 ## Families under qualification
 
-These have no release card yet. `run-family.sh` serves them only from a
+Kimi K3 and Step-5 have no release card yet. `run-family.sh` serves them only from a
 `./wip.sh` slot whose binary has the family's serve command (`--wip SLOT`),
 and refuses a release image or an older slot. Text only, no drafter, automatic
 attention placement.
@@ -70,6 +70,23 @@ attention placement.
 | Kimi K3 · EXL3 K2 + K6 core (#273) | [max](kimi-k3-exl3-k6-max.config) | 2 RTX (TP2 attention) + 6 Spark (TP6 experts), 12 routed layers on the RTX, full 1M context, DFlash2 |
 | Step-5-Preview · FP8 (#274) | [max](step5-fp8-max.config) | 2 RTX + 6 Spark |
 | Step-5-Preview · NVFP4 (#274) | [min](step5-nvfp4-min.config) | 1 RTX + 4 Spark |
+
+MiniMax-M3.1-Flash uses one coordinator with native NVFP4 W4A4 experts and
+MXFP8 linears. Select images containing `serve-minimax` and the
+`fp8-minimax-nvfp4a4` package, or a matching WIP slot. These configurations
+still require device qualification; their CPU-only `--dry-run` reads checkpoint
+headers using `CUTEAFD_PLAN_BIN`, which must name a built `cuteafd` executable.
+`MODEL_ID` may name a local snapshot directory for this check.
+
+| Coordinator | Spark TP2 | Spark TP3 | Spark TP4 |
+| --- | --- | --- | --- |
+| RTX 5090 | [TP2](minimax-m31-flash-nvfp4-5090-tp2.config) | [TP3](minimax-m31-flash-nvfp4-5090-tp3.config) | [TP4](minimax-m31-flash-nvfp4-5090-tp4.config) |
+| RTX PRO 6000 | [TP2](minimax-m31-flash-nvfp4-pro6000-tp2.config) | [TP3](minimax-m31-flash-nvfp4-pro6000-tp3.config) | [TP4](minimax-m31-flash-nvfp4-pro6000-tp4.config) |
+
+The 5090 TP2 example limits live prefill to 1024 rows to leave space for
+onboarded experts; the other examples use 4096. Native exports retain their
+4096-row capacity. Speculation is off, expert loading uses mounted checkpoints,
+and two-GPU head splits are refused.
 
 ## TP x EP layout examples (DeepSeek V4.1)
 

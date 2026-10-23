@@ -991,7 +991,9 @@ release_config_family() {
   dir="$hub/models--${model//\//--}"
   [[ -n "$revision" || ! -f "$dir/refs/main" ]] || revision="$(<"$dir/refs/main")"
   local described=""
-  if [[ -n "$revision" && -f "$dir/snapshots/$revision/config.json" ]]; then
+  if [[ -d "$model" && -f "$model/config.json" ]]; then
+    described="$(python3 "$(dirname "${BASH_SOURCE[0]}")/checkpoint-family.py" "$model/config.json" 2>/dev/null)" || described=""
+  elif [[ -n "$revision" && -f "$dir/snapshots/$revision/config.json" ]]; then
     described="$(python3 "$(dirname "${BASH_SOURCE[0]}")/checkpoint-family.py" \
       "$dir/snapshots/$revision/config.json" 2>/dev/null)" || described=""
   fi

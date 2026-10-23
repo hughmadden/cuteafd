@@ -22,9 +22,11 @@ STARTING = re.compile(r"^(?P<model>[a-z0-9.-]+)-(?P<profile>min|max)\.config$")
 TP_EP = {"tp2ep2-native.config", "tp2ep3-native.config", "tp3ep1-native.config",
          "tp3ep2-native.config", "tp4ep1-explicit-native.config", "tp6ep1-native.config",
          "exl3-compact-tp3.config"}
-# WIP qualification configs for families without a release card yet (#273, #274):
-# served from ./wip.sh slots only, checked by test_serve_launch_new_families.py.
+# Qualification configs have dedicated launcher tests in
+# test_serve_launch_new_families.py and test_minimax_launch.py.
 QUALIFICATION = {"kimi-k3-exl3-max.config", "kimi-k3-exl3-k6-max.config", "step5-fp8-max.config", "step5-nvfp4-min.config"}
+QUALIFICATION |= {f"minimax-m31-flash-nvfp4-{card}-tp{tp}.config"
+                  for card in ("5090", "pro6000") for tp in (2, 3, 4)}
 PRIVATE = ("raptor", "ostrich", "dodo", "emu", "kiwi", "rhea", "moa", "10.55.", "/home/", "/mnt/",
            "sparknest")
 

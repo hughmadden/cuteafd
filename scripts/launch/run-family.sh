@@ -182,9 +182,8 @@ EOF
     _spark_slot_keys HOST LANE_A
     return
   fi
-  # Kimi K3 and Step-5 (WIP slots only): the shared serve contract and Spark
-  # workers, no media or family modes yet; Step-5 takes an opt-in MTP depth.
-  if [[ "$1" == kimi_k3 || "$1" == step5 ]]; then
+  # Shared coordinator/Spark controls; family-specific modes follow below.
+  if [[ "$1" == kimi_k3 || "$1" == step5 || "$1" == minimax_m3 ]]; then
     cat <<'EOF'
 ATTENTION_PLACEMENT
 SPARK_EXPERT_DOCKER_INFERENCE
@@ -219,6 +218,7 @@ PROFILE_SPARK_NSYS_GPU_METRICS
 EOF
     [[ "$1" != kimi_k3 ]] || printf '%s\n' KV_CACHE RTX_EXPERT_LAYERS SPECULATOR_MODEL_ID SPECULATOR_MODEL_REVISION SPECULATOR_DRAFTS
     [[ "$1" != step5 ]] || printf '%s\n' SPECULATOR_DEPTH KV_CACHE
+    [[ "$1" != minimax_m3 ]] || printf '%s\n' KV_CACHE RTX_EXPERT_LAYERS PREFILL_BATCH_TOKENS MEDIA_CACHE_BYTES VISION_REPLICAS
     _spark_slot_keys HOST LANE_A
     return
   fi
@@ -1547,19 +1547,40 @@ coordinator_name="cuteafd-coordinator${instance:+-$instance}"
 model="$(get MODEL_ID)"
 revision="$(get MODEL_REVISION)"
 hf_home="${HF_HOME:-$namespace_root/hf-home}"
-hub="$(readlink -f "$hf_home/hub")"
-root="$hub/models--${model//\//--}"
-[[ -n "$revision" ]] || revision="$(<"$root/refs/main")"
-snapshot="$(readlink -f "$root/snapshots/$revision")"
-[[ -d "$root/snapshots/$revision" ]] || { echo "missing snapshot $model@$revision" >&2; exit 1; }
+if [[ "$family" == minimax_m3 && -d "$model" && "$dry_run" == 1 ]]; then
+  snapshot="$(readlink -f "$model")"
+else
+  hub="$(readlink -f "$hf_home/hub")"
+  root="$hub/models--${model//\//--}"
+  [[ -n "$revision" ]] || revision="$(<"$root/refs/main")"
+  snapshot="$(readlink -f "$root/snapshots/$revision")"
+  [[ -d "$snapshot" ]] || { echo "missing snapshot $model@$revision" >&2; exit 1; }
+fi
 # Family, the serving command and the layers with routed experts.
-described="$(python3 "$repo_root/scripts/lib/checkpoint-family.py" "$root/snapshots/$revision/config.json")" || exit 2
+described="$(python3 "$repo_root/scripts/lib/checkpoint-family.py" "$snapshot/config.json")" || exit 2
 read -r detected model_type first_layer last_layer <<<"$described"
 [[ -z "$family" || "$family" == "$detected" ]] ||
   { echo "--family $family does not match the checkpoint ($detected, model_type $model_type)" >&2; exit 2; }
 family="$detected"
+if [[ "$family" == minimax_m3 ]]; then
+  minimax_kv_cache="$(get KV_CACHE fp8)"
+  case "$minimax_kv_cache" in bf16|fp8) ;; *) release_die "KV_CACHE must be bf16 or fp8" ;; esac
+  minimax_local_layers="$(get RTX_EXPERT_LAYERS auto)"
+  [[ "$minimax_local_layers" == auto || "$minimax_local_layers" =~ ^[0-9]+$ ]] ||
+    release_die "MiniMax RTX_EXPERT_LAYERS must be auto or a fixed routed-layer count"
+  [[ "$(get SPECULATOR off)" == off ]] || release_die "MiniMax supports only SPECULATOR=off"
+  case "$(get RTX_GPUS auto)" in auto|1|2) ;; *) release_die "RTX_GPUS must be auto, 1 or 2" ;; esac
+  case "$(get COORDINATOR_SPLIT auto)" in auto|off|heads) ;; *) release_die "COORDINATOR_SPLIT must be auto, heads or off" ;; esac
+  minimax_coordinator_gpus="$(get COORDINATOR_GPUS "$(get COORDINATOR_GPU 0)")"
+  [[ "$minimax_coordinator_gpus" =~ ^[0-9]+(,[0-9]+)?$ ]] ||
+    release_die "COORDINATOR_GPUS must name one or two GPU indices"
+  [[ "$(get RTX_GPUS auto)" != 2 && "$minimax_coordinator_gpus" != *,* && "$(get COORDINATOR_SPLIT auto)" != heads ]] ||
+    release_die "MiniMax two-GPU head split is not implemented; select one coordinator GPU"
+  [[ "$(get EMBEDDING gpu)" == gpu ]] || release_die "MiniMax requires EMBEDDING=gpu"
+  [[ -z "${CUTEAFD_PUSH_SOCKET:-}" ]] || release_die "MiniMax requires mount-loaded Spark experts; push loading does not support divisor scales"
+fi
 if [[ -n "$(get RTX_EXPERT_LAYERS)" ]]; then
-  cfg[RTX_EXPERT_LAYERS]="$(release_onboard "$(get RTX_EXPERT_LAYERS)" "$model" "$revision")" || exit 2
+  cfg[RTX_EXPERT_LAYERS]="$(python3 "$repo_root/scripts/lib/checkpoint-family.py" --onboard "$(get RTX_EXPERT_LAYERS)" "$snapshot/config.json")" || exit 2
 fi
 attention_placement="$(get ATTENTION_PLACEMENT auto)"
 # auto is the family's recorded default (GLM 5.3 and GLM 5.3 Flash: context where the image
@@ -1567,8 +1588,8 @@ attention_placement="$(get ATTENTION_PLACEMENT auto)"
 # executor exists.
 case "$attention_placement:$family" in
   # Families under qualification run only their recorded automatic placement.
-  auto:kimi_k3|auto:step5) ;;
-  *:kimi_k3|*:step5) release_die "$family supports only ATTENTION_PLACEMENT=auto" ;;
+  auto:kimi_k3|auto:step5|auto:minimax_m3) ;;
+  *:kimi_k3|*:step5|*:minimax_m3) release_die "$family supports only ATTENTION_PLACEMENT=auto" ;;
   auto:*|heads:*|context:glm5|context:glm5_flash|context:deepseek_v4|layers:qwen4) ;;
   # K4/P7 qualified explicit layers; context remains the recorded auto default.
   # The planner still requires the selected image's executor and native programs.
@@ -1586,7 +1607,8 @@ case "$family" in
   qwen3_5) serve=serve-qwen35 ;;
   kimi_k3) serve=serve-kimi ;;
   step5) serve=serve-step5 ;;
-  *) echo "run-family.sh serves DeepSeek V4, GLM 5.x, GLM 5.3 Flash, MiMo V2, Qwen 3.8, Kimi K3 and Step-5 checkpoints, not $family (./run.sh serves DeepSeek V4.1)" >&2; exit 2 ;;
+  minimax_m3) serve=serve-minimax ;;
+  *) echo "run-family.sh serves DeepSeek V4, GLM 5.x, GLM 5.3 Flash, MiMo V2, Qwen 3.8, Kimi K3, Step-5 and MiniMax checkpoints, not $family (./run.sh serves DeepSeek V4.1)" >&2; exit 2 ;;
 esac
 # Kimi K3 (#273) and Step-5 (#274) are under qualification: WIP slots only,
 # automatic attention placement, text only (their bundled vision towers are not
@@ -1615,7 +1637,7 @@ fi
 # none and serves text only.
 # Only snapshots shipping qualified MiMo audio opt into Spark-first auto.
 release_validate_verbs_device_map
-audio="$(release_resolve_audio_mode "$audio" "$root/snapshots/$revision")"
+audio="$(release_resolve_audio_mode "$audio" "$snapshot")"
 # Auto/spark placement is resolved by the encoder plan below.
 # An explicit count or host list is exact. Unspecified means the entire inventory.
 available_sparks=0
@@ -1660,6 +1682,43 @@ if [[ "$family" == step5 ]]; then
   case "$step5_kv_cache" in bf16|fp8) ;; *) release_die "KV_CACHE must be bf16 or fp8" ;; esac
   [[ "$backend" != local && "$ranks" != 0 ]] ||
     release_die "Step-5 has no local-expert layout; its routed experts need Spark ranks (FP8: 6, NVFP4: 4 or 6)"
+fi
+if [[ "$family" == minimax_m3 ]]; then
+  [[ "$backend" != local && "$ranks" =~ ^[234]$ ]] ||
+    release_die "MiniMax requires Spark TP2, TP3 or TP4"
+  minimax_concurrency="$(get CONCURRENCY 64)"
+  minimax_prefill_rows="$(get PREFILL_BATCH_TOKENS 4096)"
+  [[ "$minimax_concurrency" =~ ^[1-9][0-9]*$ && "$minimax_concurrency" -le 64 ]] ||
+    release_die "MiniMax CONCURRENCY must be 1..64"
+  [[ "$minimax_prefill_rows" =~ ^[1-9][0-9]*$ && "$minimax_prefill_rows" -le 4096 ]] ||
+    release_die "MiniMax PREFILL_BATCH_TOKENS must be 1..4096"
+  [[ "$minimax_concurrency" -le "$minimax_prefill_rows" ]] ||
+    release_die "MiniMax CONCURRENCY must not exceed PREFILL_BATCH_TOKENS"
+  minimax_context="$(get MAX_CONTEXT_TOKENS 0)"
+  [[ "$minimax_context" =~ ^(0|[1-9][0-9]{0,6})$ && "$minimax_context" -le 1048576 ]] ||
+    release_die "MiniMax MAX_CONTEXT_TOKENS must be 0 (automatic) or 1..1048576"
+  if ((dry_run)); then
+    # Header-only CPU admission: no device probes, image access or remote staging.
+    release_reject_unused_keys "$family" $(_family_allowed_keys "$family")
+    planner="${CUTEAFD_PLAN_BIN:-cuteafd}"
+    command -v "$planner" >/dev/null || release_die "MiniMax CPU dry run needs CUTEAFD_PLAN_BIN pointing to a built cuteafd executable"
+    minimax_budget="$(get COORDINATOR_GPU_BUDGET_GIB 95.5)"
+    minimax_pool="$(get POOL_TOKENS auto)"; [[ "$minimax_pool" != auto ]] || minimax_pool=0
+    minimax_plan_args=(--deployment --rtx 1 --spark-ranks "$ranks" --available-sparks "$ranks"
+      --attention-placement auto --speculator off --kv-cache "$minimax_kv_cache"
+      --coordinator-gpu-budget-gib "$minimax_budget" --coordinator-weight-budget-gib "$minimax_budget"
+      --concurrency "$minimax_concurrency" --prefill-rows "$minimax_prefill_rows"
+      --mapped-scale-preload-gib "$(get MAPPED_SCALE_PRELOAD_GIB 0)"
+      --prefix-cache-entries "$(get PREFIX_CACHE_ENTRIES 20)" --host-cache-bytes "$(get HOST_CACHE_BYTES 0)"
+      --pool-tokens "$minimax_pool" --context-tokens "$minimax_context"
+      --vision "$vision" --audio "$audio" --vision-replicas "$vision_replicas")
+    [[ "$minimax_local_layers" == auto ]] || minimax_plan_args+=(--rtx-expert-layers "$minimax_local_layers")
+    [[ -z "$(get SPARK_DEVICE_BUDGET_BYTES)" ]] || minimax_plan_args+=(--spark-budget-gib "$(python3 -c 'import sys;print(int(sys.argv[1])/2**30)' "$(get SPARK_DEVICE_BUDGET_BYTES)")")
+    [[ -z "$(get MEDIA_CACHE_BYTES)" ]] || minimax_plan_args+=(--media-cache-bytes "$(get MEDIA_CACHE_BYTES)")
+    echo "MiniMax CPU dry run: header admission only; runtime artifacts and device execution remain unverified" >&2
+    "$planner" plan "$snapshot" "${minimax_plan_args[@]}"
+    exit $?
+  fi
 fi
 coordinator_image="$(get COORDINATOR_DOCKER_INFERENCE)"
 # --wip SLOT serves a ./wip.sh slot: the development images run its artifacts, staged from
@@ -1840,6 +1899,7 @@ profile_bytes="$(release_cuda_total_bytes "$profile_uuid")" || release_die "cann
 profile="$(release_coordinator_profile "$profile_bytes" "$coordinator_budget")" || release_die "cannot resolve coordinator capacity profile"
 read -r profile_gib default_concurrency <<<"$profile"
 [[ "$family" != qwen3_5 ]] || default_concurrency=4
+[[ "$family" != minimax_m3 ]] || default_concurrency="$minimax_concurrency"
 effective_concurrency="$(get CONCURRENCY "$default_concurrency")"
 if [[ "$family" == mimo_v2 ]]; then
   if python3 -c 'import sys; sys.exit(not(float(sys.argv[1]) <= 32))' "$profile_gib"; then
@@ -1934,11 +1994,13 @@ fi
 # retention (auto by default, e.g. 64GiB explicitly; 0 = off). POOL_TOKENS: paged KV tokens shared by
 # live sequences and retained snapshots.
 case $family in
+  minimax_m3)
+    family_args+=(--prefix-cache-entries "$(get PREFIX_CACHE_ENTRIES 20)" --host-cache-bytes "$(get HOST_CACHE_BYTES 0)") ;;
   mimo_v2|glm5|glm5_flash|qwen4|qwen3_5|deepseek_v4|kimi_k3|step5)
     family_args+=(--prefix-cache-entries "$(get PREFIX_CACHE_ENTRIES 20)")
     [[ "$(get HOST_CACHE_BYTES auto)" == 0 ]] || family_args+=(--host-cache-bytes "$(get HOST_CACHE_BYTES auto)") ;;
 esac
-if [[ ( $family == mimo_v2 || $family == qwen4 || $family == glm5_flash ) && $vision != off ]]; then
+if [[ ( $family == mimo_v2 || $family == qwen4 || $family == glm5_flash || $family == minimax_m3 ) && $vision != off ]]; then
   # Text-only frozen daemons can predate the optional media-cache flag.
   [[ -z "$(get MEDIA_CACHE_BYTES)" ]] || family_args+=(--media-cache-bytes "$(get MEDIA_CACHE_BYTES)")
 fi
@@ -2034,9 +2096,13 @@ fi
 if [[ "$family" == step5 ]]; then
   family_args+=(--kv-cache "$step5_kv_cache")
 fi
-if ((qualifying)); then
+if ((qualifying)) || [[ "$family" == minimax_m3 ]]; then
   pool="$(get POOL_TOKENS auto)"
   [[ "$pool" == auto ]] || family_args+=(--pool-tokens "$pool")
+fi
+if [[ "$family" == minimax_m3 ]]; then
+  family_args+=(--kv-cache "$minimax_kv_cache" --rtx-expert-layers "$minimax_local_layers"
+    --speculator off --prefill-batch-tokens "$minimax_prefill_rows")
 fi
 if [[ $family == kimi_k3 ]]; then
   kv_cache="$(get KV_CACHE fp8)"
@@ -2143,6 +2209,7 @@ addr="$(get ADDR 0.0.0.0:8000)"
 # family's own (the plan's spark_budget_bytes then reaches every worker).
 budget_default=107374182400
 ((qualifying == 0)) || budget_default=""
+[[ "$family" != minimax_m3 ]] || budget_default=""
 budget="$(get SPARK_DEVICE_BUDGET_BYTES "$budget_default")"
 spark_budget_args=()
 [[ -z "$budget" ]] || spark_budget_args=(--spark-budget-gib "$(python3 -c 'import sys;print(int(sys.argv[1])/2**30)' "$budget")")
@@ -2531,7 +2598,7 @@ case "$family" in
       off) lane_env_args+=(-e CUTEAFD_GLMF_REMOTE_DFLASH=0) ;;
       "") [[ -z "${CUTEAFD_GLMF_REMOTE_DFLASH:-}" ]] || lane_env_args+=(-e "CUTEAFD_GLMF_REMOTE_DFLASH=$CUTEAFD_GLMF_REMOTE_DFLASH") ;;
     esac ;;
-  qwen4|qwen3_5|kimi_k3|step5) ;;
+  qwen4|qwen3_5|kimi_k3|step5|minimax_m3) ;;
   mimo_v2)
     hidden="$(python3 -c 'import json,sys; c=json.load(open(sys.argv[1])); t=c.get("text_config", c); print(t.get("hidden_size", 4096 if t.get("model_type") == "mimo_v2_flash" else 6144))' "$root/snapshots/$revision/config.json")"
     selected_lanes="${CUTEAFD_MIMO_PREFILL_LANES:-$([[ "$hidden" == 4096 ]] && printf 2 || printf 3)}"
@@ -2642,6 +2709,9 @@ audio_encoder_hash=""
   if [[ "$family" == kimi_k3 ]]; then
     plan_draft_args+=(--kv-cache "$kv_cache")
   fi
+  if [[ "$family" == minimax_m3 ]]; then
+    plan_draft_args+=(--kv-cache "$minimax_kv_cache" --prefill-rows "$minimax_prefill_rows")
+  fi
   if [[ "$family" == glm5 || "$family" == glm5_flash || "$family" == mimo_v2 ]]; then
     plan_draft_args+=(--draft-kv-cache "$draft_kv_cache")
   fi
@@ -2705,6 +2775,7 @@ audio_encoder_hash=""
   plan_json="$(jq -c '.report' <<<"$deployment_json")"
   [[ -n "$budget" ]] || budget="$(jq -er '.spark_budget_bytes | select(type == "number" and . > 0)' <<<"$plan_json")" ||
     release_die "the deployment plan names no Spark budget"
+  [[ "$family" != minimax_m3 ]] || family_args+=(--spark-budget-bytes "$budget")
 # Check the admitted count's images before --restart or weight loading. The worker's
 # resident admission validates the sibling for its full 4096-row workspace even
 # when only decode requests use BF16, so this preflight requires the same coverage.
@@ -2731,7 +2802,7 @@ if [[ -n "$expert_input" && "$expert_input" != fp8 ]]; then
     fi
   done
 fi
-if { [[ ( "$family" == mimo_v2 || "$family" == qwen4 || "$family" == glm5_flash ) && "$vision" != off ]] &&
+if { [[ ( "$family" == mimo_v2 || "$family" == qwen4 || "$family" == glm5_flash || "$family" == minimax_m3 ) && "$vision" != off ]] &&
    python3 -c 'import json,sys; sys.exit(0 if json.load(open(sys.argv[1])).get("vision_config") else 1)' "$root/snapshots/$revision/config.json"; } ||
    [[ "$family" == mimo_v2 && "$audio" != off ]]; then
   selected="$(python3 -c '
