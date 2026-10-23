@@ -5442,11 +5442,14 @@ Ideas TJ wants kept for later; not v2 work.
 
 Every family that sends experts to Sparks prefills the same way.
 
-- **Units:** the prompt runs as a continuous stream of row units, 2048 rows by
-  default, with 2 units in flight. A family may override both in its own
-  default, tuned on its minimum-Spark config with 1 RTX. If the default
-  doesn't fit (5090), step down 2048 → 1024 → 512; there is no optimizing
-  chooser.
+- **Units:** the prompt runs as a continuous stream of row units, 2 units in
+  flight, each unit the family's largest supported size (TJ, 2026-10-24:
+  "2 × max size basically always wins"). The max is the family's expert-kernel
+  capacity, typically 4096 rows. Bigger units mean more rows per expert,
+  hence more reuse of each decoded weight and less per-wave overhead; GLM 5.3
+  measured 4096×2 about 18% over 2048×2 on 8K. If the default doesn't fit
+  (5090, tight pool), step down 4096 → 2048 → 1024 → 512; there is no
+  optimizing chooser.
 - **One transport, N waves:** each unit's expert wave goes out on one
   transport that admits N outstanding waves, each with its own return slot.
   The Spark side already pipelines (rings 8 deep, in order); only the
