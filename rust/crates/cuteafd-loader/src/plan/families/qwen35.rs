@@ -141,6 +141,7 @@ fn native_layout(cfg: &crate::families::qwen3_5::Qwen35Config, input: &crate::pl
         let entry = entries.iter().find(|entry| entry["name"] == name)
             .with_context(|| format!("missing native dense program {name}"))?;
         let spec = placement::families::qwen3_5::NativeProgram::from_manifest(entry)?;
+        placement::families::qwen3_5::validate_projection_format(op, fp8, &spec)?;
         placement::families::qwen3_5::validate(cfg, op, rows, options.dense_qwen_kv, &spec)?;
         placement::families::qwen3_5::validate_abi(op, rows, &spec)?;
         scratch = scratch.max(spec.scratch.values().copied().max().unwrap_or(0));

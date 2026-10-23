@@ -171,7 +171,7 @@ impl NativeBuffers {
     }
 }
 
-/// Header-only packed native BF16 allocations, including widened small GDN operands.
+/// Header-only native BF16/E4M3 allocations, including exact block scales and widened GDN operands.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NativeWeights {
     pub layers: Vec<u64>,
@@ -328,6 +328,18 @@ pub fn native_program_name(prefix: &str, op: &str, rows: usize,
     else { program_name(prefix, &op, rows, kv) }
 }
 
+pub fn validate_projection_format(op: &str, fp8: bool, spec: &NativeProgram) -> Result<()> {
+    if matches!(op, "gdn" | "attn_producer" | "attn_o" | "ffn") {
+        ensure!((spec.geometry["fp8_weights"] == "only") == fp8,
+            "{}: checkpoint projection format mismatch", spec.name);
+        if fp8 {
+            ensure!(spec.geometry["weight_block"] == serde_json::json!([128, 128]),
+                "{}: invalid FP8 block geometry", spec.name);
+        }
+    }
+    Ok(())
+}
+
 pub fn validate(cfg: &Qwen35Config, op: &str, rows: usize, format: crate::families::qwen4::Qwen4KvCache, spec: &NativeProgram) -> Result<()> {
     if rows > 0 {
         ensure!(spec.capacity_rows as usize >= rows, "{} capacity is smaller than {rows}", spec.name);
@@ -456,6 +468,86 @@ mod tests {
             fixed: vec![Demand::new(0, Category::Workspace, "native AOT scratch", scratch, Basis::Exact)],
             drafter: None, requested_pool: None, max_context: 262144, record_bytes: 4096,
             pool_overhead: 4, pool_bounded: Vec::new() }
+    }
+
+    #[test]
+    fn native_fp8_header_inventory_charges_scales_and_keeps_bf16_gates() -> Result<()> {
+        use crate::plan::checkpoint::{Checkpoint, CheckpointTensor};
+        let cfg = cfg();
+        let mut checkpoint = Checkpoint { snapshot: Default::default(), config: serde_json::json!({}),
+            quantize_config: None, weight_map: Default::default(), tensors: vec![], missing_shards: vec![], shard_bytes: 0 };
+        let mut add = |name: String, dtype, shape: Vec<usize>, byte_length| checkpoint.tensors.push(CheckpointTensor {
+            shard: "model.safetensors".into(), meta: crate::SafetensorsTensorMetadata {
+                name, dtype, shape, byte_offset: 0, byte_length } });
+        for name in ["embed_tokens.weight", "norm.weight"] {
+            add(format!("model.language_model.{name}"), DType::Bf16, vec![128], 256);
+        }
+        add("lm_head.weight".into(), DType::Bf16, vec![128], 256);
+        for (index, kind) in cfg.attention.iter().enumerate() {
+            let prefix = format!("model.language_model.layers.{index}.");
+            let mut ordinary = vec!["input_layernorm.weight", "post_attention_layernorm.weight"];
+            let mut projections = vec!["mlp.down_proj", "mlp.gate_proj", "mlp.up_proj"];
+            if *kind == HybridAttention::Gdn {
+                ordinary.extend(["linear_attn.in_proj_b.weight", "linear_attn.in_proj_a.weight",
+                    "linear_attn.conv1d.weight", "linear_attn.A_log", "linear_attn.dt_bias", "linear_attn.norm.weight"]);
+                projections.extend(["linear_attn.in_proj_qkv", "linear_attn.in_proj_z", "linear_attn.out_proj"]);
+            } else {
+                ordinary.extend(["self_attn.q_norm.weight", "self_attn.k_norm.weight"]);
+                projections.extend(["self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj", "self_attn.o_proj"]);
+            }
+            for name in ordinary { add(format!("{prefix}{name}"), DType::Bf16, vec![128], 256); }
+            for name in projections {
+                add(format!("{prefix}{name}.weight"), DType::F8E4M3, vec![128, 128], 16384);
+                add(format!("{prefix}{name}.weight_scale_inv"), DType::Bf16, vec![1, 1], 2);
+            }
+        }
+        let inventory = NativeWeights::native(&checkpoint, &cfg, DType::Bf16)?;
+        assert_eq!(inventory.layers, [6 * 16384 + 4 * 256 + 2 * 256 + 2 * 256 + 3 * 512 + 256,
+            7 * 16384 + 4 * 256 + 4 * 256]);
+        for tensor in &mut checkpoint.tensors {
+            if tensor.meta.name.ends_with("weight_scale_inv") {
+                tensor.meta.dtype = DType::F32;
+                tensor.meta.byte_length = 4;
+            }
+        }
+        assert_eq!(NativeWeights::native(&checkpoint, &cfg, DType::Bf16)?, inventory);
+        let scale = checkpoint.tensors.iter().position(|tensor| tensor.meta.name.ends_with("weight_scale_inv")).unwrap();
+        checkpoint.tensors[scale].meta.shape = vec![2, 1];
+        assert!(NativeWeights::native(&checkpoint, &cfg, DType::Bf16).is_err());
+        checkpoint.tensors[scale].meta.shape = vec![1, 1];
+        let gate = checkpoint.tensors.iter().position(|tensor| tensor.meta.name.ends_with("in_proj_a.weight")).unwrap();
+        checkpoint.tensors[gate].meta.dtype = DType::F8E4M3;
+        assert!(NativeWeights::native(&checkpoint, &cfg, DType::Bf16).is_err());
+        checkpoint.tensors[gate].meta.dtype = DType::Bf16;
+        checkpoint.tensors.remove(scale);
+        assert!(NativeWeights::native(&checkpoint, &cfg, DType::Bf16).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn native_fp8_names_and_block_contract_match_offline_and_runtime_admission() -> Result<()> {
+        use crate::families::qwen4::Qwen4KvCache::{Bf16, Fp8};
+        for rows in [64, 4096] {
+            assert_eq!(native_program_name("qwen38", "attn_producer", rows, Fp8, true),
+                format!("qwen38_attn_producer_fp8_kv_fp8_m{rows}"));
+            assert_eq!(native_program_name("qwen38", "full_gqa", rows, Fp8, true),
+                format!("qwen38_full_gqa_kv_fp8_m{rows}"));
+            assert_eq!(native_program_name("qwen38", "gdn", rows, Bf16, true),
+                format!("qwen38_gdn_fp8_m{rows}"));
+            for op in ["gdn", "attn_producer", "attn_o", "ffn"] {
+                let mut spec = NativeProgram { name: op.into(), geometry: serde_json::json!({
+                    "fp8_weights":"only", "weight_block":[128,128]}), capacity_rows: rows as u64,
+                    pointers: vec![], scalar_kinds: vec![], scratch: Default::default() };
+                validate_projection_format(op, true, &spec)?;
+                assert!(validate_projection_format(op, false, &spec).is_err());
+                spec.geometry["weight_block"] = serde_json::json!([64, 128]);
+                assert!(validate_projection_format(op, true, &spec).is_err());
+                spec.geometry["fp8_weights"] = serde_json::json!(false);
+                validate_projection_format(op, false, &spec)?;
+                assert!(validate_projection_format(op, true, &spec).is_err());
+            }
+        }
+        Ok(())
     }
 
     #[test]

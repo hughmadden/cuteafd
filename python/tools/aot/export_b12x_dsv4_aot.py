@@ -750,6 +750,9 @@ def qwen_dense_programs(g, decode_rows: int, prefill_rows: int, max_context: int
             ]:
                 out.append((f"{op}_fp8_m{rows}", op, {"max_rows": rows, "fp8_weights": "only"},
                             lambda r=rows, fn=compile_fn: fn(g, max_rows=r)))
+            out.append((f"attn_producer_fp8_kv_fp8_m{rows}", "attn_producer",
+                        {"max_rows": rows, "fp8_weights": "only", "kv_format": "fp8"},
+                        lambda r=rows: native.compile_qwen_dense_producer_fp8_aot(g, max_rows=r, kv_format="fp8")))
     return out
 
 

@@ -123,6 +123,7 @@ def test_dense_qwen_exports_only_native_dense_programs(exporter, name, norm_dtyp
     calls = {stem: (op, params, thunk()) for stem, op, params, thunk in programs}
     caps = set((decode_rows, prefill_rows))
     fp8 = {f"{op}_fp8_m{cap}" for cap in caps for op in ("gdn", "attn_producer", "attn_o", "ffn")}
+    fp8 |= {f"attn_producer_fp8_kv_fp8_m{cap}" for cap in caps}
     if name != "qwen38_27b":
         fp8 = set()
     assert len(calls) == len(programs) == 3 + 7 * len(caps) + len(fp8)
@@ -142,6 +143,8 @@ def test_dense_qwen_exports_only_native_dense_programs(exporter, name, norm_dtyp
             assert function == f"compile_qwen_dense_{expected_function}_aot"
             assert params == {k: str(v) if k == "norm_dtype" else v for k, v in kwargs.items()}
     for cap in caps:
+        if name == "qwen38_27b":
+            assert calls[f"attn_producer_fp8_kv_fp8_m{cap}"][2][3] == {"max_rows": cap, "kv_format": "fp8"}
         assert calls[f"gdn_m{cap}"][2][3] == {"max_rows": cap, "norm_dtype": norm_dtype}
         assert calls[f"attn_producer_m{cap}"][2][3] == {"max_rows": cap}
         assert calls[f"full_gqa_m{cap}"][2][3] == {"max_rows": cap, "max_splits": 32}

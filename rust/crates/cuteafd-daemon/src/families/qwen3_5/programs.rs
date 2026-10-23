@@ -49,10 +49,7 @@ impl DensePrograms {
                 ["gdn", "attn_producer", "full_gqa", "attn_o", "ffn"].map(|op| (op, rows)))) {
             let name = cuteafd_loader::placement::families::qwen3_5::native_program_name(prefix, op, rows, kv_format, format.fp8());
             let spec = programs.spec(&name)?;
-            if matches!(op, "gdn" | "attn_producer" | "attn_o" | "ffn") {
-                ensure!((spec.geometry["fp8_weights"] == "only") == format.fp8(), "{name}: checkpoint projection format mismatch");
-                if format.fp8() { ensure!(spec.geometry["weight_block"] == serde_json::json!([128, 128]), "{name}: invalid FP8 block geometry"); }
-            }
+            cuteafd_loader::placement::families::qwen3_5::validate_projection_format(op, format.fp8(), &native(spec))?;
             validate(cfg, op, rows, kv_format, spec)?;
             validate_abi(op, rows, spec)?;
             if op == "gdn" {
