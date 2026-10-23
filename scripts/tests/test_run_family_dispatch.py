@@ -164,7 +164,7 @@ def test_v4_rejects_removed_draft_switches_as_unknown_keys(tmp_path: Path, key: 
 def test_v4_prefill_units_reach_plan_serve_and_container(tmp_path: Path, rows: int, waves: int) -> None:
     result = _family_launch_result(tmp_path, {"model_type": "deepseek_v4"}, "test/model",
         f"RTX_GPUS=1\nSPECULATOR=off\nVISION=off\nAUDIO=off\nPREFILL_ROWS={rows}\n"
-        f"PREFILL_WAVES={waves}\nCUTEAFD_PREFILL_SPAN_ROWS=16384\n")
+        f"PREFILL_WAVES={waves}\nPREFILL_SPAN_ROWS=16384\n")
     assert result.returncode == 0, result.stderr
     plan = next(line for line in result.stderr.splitlines() if "cuteafd plan" in line)
     assert f"--prefill-rows {rows}" in plan

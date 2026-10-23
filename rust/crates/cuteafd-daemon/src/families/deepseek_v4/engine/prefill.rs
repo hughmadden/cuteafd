@@ -37,7 +37,7 @@ impl<'a> Engine<'a> {
                 self.prepare_route_checks(&units.iter().map(|u| u.rows.len()).collect::<Vec<_>>())?;
                 let mut links = transports.borrow_mut();
                 let mut hooks = UnitHooks { engine: self, placement, tokens, tables: &tables, w, w1,
-                    transport: links.first_mut(), runtime, logit_rows, download, on_layer,
+                    transport: links.get_mut(1), runtime, logit_rows, download, on_layer,
                     logits: Vec::new(), landed: 0 };
                 prefill_pipeline::run_prefill_units(&mut hooks, &units, waves)?;
                 self.finish_route_step()?;

@@ -203,7 +203,8 @@ pub fn fixed_demands(inputs: &V4Inputs<'_>) -> Result<(Vec<Demand>, Vec<u64>, Ve
             + cache.fixed_state_bytes + cache.speculative_replay_bytes + mul(table_bytes, inputs.sequences, "V4 tables")?;
         let context = mul(cache.context_table_bytes_per_token, inputs.max_context, "V4 RoPE tables")?;
         let intake = if rank == 0 && inputs.spark_ranks > 0 {
-            inputs.prefill_waves * inputs.spark_ranks as u64 * inputs.prefill_rows.max(inputs.decode_rows) * hidden * 2
+            (inputs.prefill_waves * inputs.prefill_rows + inputs.decode_rows)
+                * inputs.spark_ranks as u64 * hidden * 2
         } else { 0 };
         let exchange = if gpus == 2 {
             deepseek_v4_expert_exchange_bytes(hidden, topk, inputs.prefill_rows, inputs.decode_rows, rank, inputs.prefill_waves)
@@ -229,7 +230,7 @@ pub fn fixed_demands(inputs: &V4Inputs<'_>) -> Result<(Vec<Demand>, Vec<u64>, Ve
         demands.push(Demand::new(gpu, Category::Workspace, "steps", workspace, basis));
         if rank == 0 && inputs.spark_ranks > 0 {
             demands.push(Demand::new(gpu, Category::Transport, "Spark egress",
-                inputs.prefill_rows.max(inputs.decode_rows) * (hidden + hidden / 32), Basis::Formula));
+                (4096 + inputs.decode_rows) * hidden * 2, Basis::Formula));
         }
         demands.push(GraphSet::budget(&[GRAPH_BYTES[role]]).demand(0).on(gpu));
         if gpus == 2 {

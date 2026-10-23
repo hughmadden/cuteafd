@@ -277,7 +277,7 @@ EOF
       cat <<'EOF'
 PREFILL_ROWS
 PREFILL_WAVES
-CUTEAFD_PREFILL_SPAN_ROWS
+PREFILL_SPAN_ROWS
 RTX_EXPERT_PEER
 SPECULATOR_MODEL_ID
 SPECULATOR_MODEL_REVISION
@@ -2545,7 +2545,7 @@ fi
 lane_env_args=()
 case "$family" in
   deepseek_v4)
-    [[ -z "$(get CUTEAFD_PREFILL_SPAN_ROWS)" ]] || lane_env_args+=(-e "CUTEAFD_PREFILL_SPAN_ROWS=$(get CUTEAFD_PREFILL_SPAN_ROWS)")
+    [[ -z "$(get PREFILL_SPAN_ROWS)" ]] || lane_env_args+=(-e "CUTEAFD_PREFILL_SPAN_ROWS=$(get PREFILL_SPAN_ROWS)")
     ;;
   glm5)
     # Prefill units, waves and span come from the deployment plan (units-span).

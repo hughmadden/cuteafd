@@ -41,9 +41,9 @@ mod spark_tests {
                 let model = super::spark_model(decode_rows, device)?;
                 model.validate(cuteafd_core::ExpertGeometry::DEEPSEEK_V4_FLASH)?;
                 assert_eq!((model.capacity, model.compiled_capacity), (4096, 4096));
-                assert_eq!(model.endpoints.len(), 1 + usize::from(device));
-                assert!(model.endpoints[..1].iter()
-                    .all(|endpoint| endpoint.capacity == 4096));
+                assert_eq!(model.endpoints.len(), 2 + usize::from(device));
+                assert_eq!(model.endpoints[0].capacity, decode_rows as u32);
+                assert_eq!(model.endpoints[1].capacity, 4096);
                 if device { assert_eq!(model.endpoints.last().unwrap().capacity, decode_rows as u32); }
                 assert!(model.endpoints.iter().all(|endpoint| endpoint.ingress == cuteafd_core::SparkIngress::Fp8K32));
             }
@@ -55,7 +55,10 @@ mod spark_tests {
 pub(crate) fn spark_model(decode_rows: usize, device_exchange: bool)
     -> Result<cuteafd_transport::worker_selection::ModelAdmission> {
     use cuteafd_core::{SparkEndpoint, SparkIngress};
-    let mut endpoints = vec![SparkEndpoint { ring_depth: None, capacity: 4096, ingress: SparkIngress::Fp8K32 }; 1];
+    let mut endpoints = vec![
+        SparkEndpoint { ring_depth: None, capacity: u32::try_from(decode_rows)?, ingress: SparkIngress::Fp8K32 },
+        SparkEndpoint { ring_depth: None, capacity: 4096, ingress: SparkIngress::Fp8K32 },
+    ];
     if device_exchange {
         endpoints.push(SparkEndpoint { ring_depth: None, capacity: u32::try_from(decode_rows)?, ingress: SparkIngress::Fp8K32 });
     }

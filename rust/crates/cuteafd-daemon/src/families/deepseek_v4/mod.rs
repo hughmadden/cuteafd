@@ -572,27 +572,36 @@ pub(crate) fn with_engine<T>(
             elapsed_ms = started.elapsed().as_millis() as u64, "DeepSeek V4 expert layers resident on coordinator GPUs");
         // Declare rank ownership once for every transport and device lane.
         let spark_world = (!peers.is_empty()).then(|| cuteafd_transport::expert::SparkWorld::canonical(peers.len())).transpose()?;
-        // One connection set, N FIFO waves, N independently consumed return slots.
+        // Decode graphs retain fixed reply pointers; prefill alone rotates N
+        // FIFO return slots on its separate connection set.
         if !skip {
+            transports.push(SparkLink::new(&loaded.library,
+                spark_world.context("Spark transport needs a declared world")?, &peers, engine.decode_rows as u32,
+                TcpTransportConfig { timing: false, timeout: Duration::from_secs(120), max_frame_bytes: 64 << 20 },
+                loaded.cfg.dim * 2)?);
             transports.push(SparkLink::new_waves(&loaded.library,
                 spark_world.context("Spark transport needs a declared world")?, &peers, 4096,
                 TcpTransportConfig { timing: false, timeout: Duration::from_secs(120), max_frame_bytes: 64 << 20 },
-                loaded.cfg.dim * 2, engine.prefill_waves, engine.prefill_rows.max(engine.decode_rows) as u32)?);
+                loaded.cfg.dim * 2, engine.prefill_waves, engine.prefill_rows as u32)?);
         }
         for transport in &mut transports { transport.enable_terminal_ownership(loaded.library.clone())?; }
         // Every rank's persistent bootstrap runs before the warm-up wave does,
         // so the workers' installed grouping is readable at any later point.
-        // Each lane's session is sized by the same prefill-sized request the
-        // warm-up below dispatches.
-        let warm = engine.warm_request()?;
-        for transport in &mut transports { transport.bootstrap(&warm)?; }
+        let warm_shape = |index| if index == 0 {
+            (engine.decode_rows, cuteafd_transport::ExpertV2SourceKind::Decode)
+        } else { (engine.prefill_rows, cuteafd_transport::ExpertV2SourceKind::Prefill) };
+        for (index, transport) in transports.iter_mut().enumerate() {
+            let (rows, kind) = warm_shape(index);
+            transport.bootstrap(&engine.warm_request(rows, kind)?)?;
+        }
         crate::shared::memory_report::release_load_staging(&loaded.library);
         let started = Instant::now();
         let identity = if skip { None } else { Some(cuteafd_transport::worker_selection::WorkerIdentity::from_snapshot(
             &loaded.snapshot, loaded.catalog.routed_experts().geometry()?, spark_world.context("worker identity needs a declared world")?)?) };
         let mut installed = None;
-        for transport in &mut transports {
-            engine.warm_transport(transport, &runtime)?;
+        for (index, transport) in transports.iter_mut().enumerate() {
+            let (rows, kind) = warm_shape(index);
+            engine.warm_transport(transport, &runtime, rows, kind)?;
             let reports = transport.transport.installed_grouping()?;
             for (rank, report) in reports.iter().enumerate() {
                 report.validate_for(identity.as_ref().context("Spark worker identity")?, rank,
@@ -680,7 +689,7 @@ fn nll_run(args: &GoldenArgs, cfg: &DeepseekV4Config, engine: &engine::Engine<'_
     };
     let mut allocator = pool::PoolAllocator::for_engine(engine)?;
     let mut placement = allocator.admit(tokens.len())?;
-    let chunk = args.chunk.unwrap_or(engine.prefill_rows).min(engine.prefill_rows);
+    let chunk = args.chunk.unwrap_or(engine.prefill_capacity()).min(engine.prefill_capacity());
     ensure!(chunk > 0, "prefill chunk must be positive");
     let started = Instant::now();
     let mut logits = Vec::new();
@@ -760,7 +769,7 @@ fn golden_run(
     let prefill = args.prefill.unwrap_or(tokens.len()).min(tokens.len());
     let mut allocator = pool::PoolAllocator::for_engine(engine)?;
     let mut placement = allocator.admit(tokens.len())?;
-    let chunk = args.chunk.unwrap_or(engine.prefill_rows).min(engine.prefill_rows);
+    let chunk = args.chunk.unwrap_or(engine.prefill_capacity()).min(engine.prefill_capacity());
     let mut logits = Vec::new();
     let mut offset = 0;
     while offset < prefill {
