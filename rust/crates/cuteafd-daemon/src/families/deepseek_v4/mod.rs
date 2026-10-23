@@ -49,6 +49,12 @@ pub(crate) struct EngineArgs {
     /// Optional expert-input quantizer SM ceiling (default: this device's SM count).
     #[arg(long)]
     pub sms: Option<usize>,
+    /// Rows per prefill unit; defaults to the export's maximum capacity.
+    #[arg(long)]
+    pub prefill_rows: Option<usize>,
+    /// Independently outstanding units on one Spark transport.
+    #[arg(long, default_value_t = engine::PREFILL_WAVES)]
+    pub prefill_waves: usize,
     /// Sequences that can be resident at once (compressor state slots).
     #[arg(long, default_value_t = 8)]
     pub max_sequences: usize,
@@ -339,7 +345,10 @@ pub(crate) fn with_engine<T>(
     };
     let mut max_context = crate::shared::context::checkpoint_context(
         &args.snapshot, &args.manifest, "deepseek_v4", args.max_context)?;
-    let prefill_rows = caps["prefill_rows"].as_u64().context("prefill_rows")? as usize;
+    let prefill_rows = args.prefill_rows.unwrap_or(caps["prefill_rows"].as_u64().context("prefill_rows")? as usize);
+    ensure!(prefill_rows > 0 && prefill_rows % 64 == 0
+        && prefill_rows <= caps["prefill_rows"].as_u64().context("prefill_rows")? as usize
+        && (1..=3).contains(&args.prefill_waves), "V4 prefill needs page-aligned rows within the export capacity and 1..=3 waves");
     let decode_rows = caps["decode_rows"].as_u64().context("decode_rows")? as usize;
     let skip = args.skip_routed_experts;
     let peers = args.peers.split(',').filter(|p| !p.is_empty()).map(str::parse)
@@ -423,7 +432,7 @@ pub(crate) fn with_engine<T>(
                     (home.experts == ExpertHome::Spark).then_some(layer)).collect(),
                 rtx_layers: placement.layers.iter().enumerate().filter_map(|(layer, home)|
                     matches!(home.experts, ExpertHome::RtxWhole { .. } | ExpertHome::RtxTp2).then_some(layer)).collect(),
-                spark_ranks: peers.len(), prefill_lanes: engine::PREFILL_LANES as u64,
+                spark_ranks: peers.len(), prefill_lanes: 1,
             };
             crate::shared::placement::SparkAdmission::plan(&loaded.snapshot,
                 loaded.catalog.routed_experts().geometry()?, Some(&loaded.catalog), &working,
@@ -499,7 +508,8 @@ pub(crate) fn with_engine<T>(
         weights: model,
         family: loaded.family,
         decode_rows: caps["decode_rows"].as_u64().context("decode_rows")? as usize,
-        prefill_rows: caps["prefill_rows"].as_u64().context("prefill_rows")? as usize,
+        prefill_rows,
+        prefill_waves: args.prefill_waves,
         c128_width: usize::try_from(cuteafd_loader::serving_capacity::compiled_c128_width(&loaded.manifest, loaded.family)?)?,
         max_context,
         stream,
@@ -560,13 +570,13 @@ pub(crate) fn with_engine<T>(
             elapsed_ms = started.elapsed().as_millis() as u64, "DeepSeek V4 expert layers resident on coordinator GPUs");
         // Declare rank ownership once for every transport and device lane.
         let spark_world = (!peers.is_empty()).then(|| cuteafd_transport::expert::SparkWorld::canonical(peers.len())).transpose()?;
-        // One transport (connection set) per prefill lane, so each lane can keep
-        // a Spark wave in flight; decode uses the first.
-        let lanes = if skip { 0 } else { engine::PREFILL_LANES };
-        transports = (0..lanes).map(|_| SparkLink::new(&loaded.library, spark_world.context("Spark transport needs a declared world")?, &peers, 4096,
-            TcpTransportConfig { timing: false, timeout: Duration::from_secs(120), max_frame_bytes: 64 << 20 },
-            loaded.cfg.dim * 2))
-            .collect::<Result<Vec<_>>>()?;
+        // One connection set, N FIFO waves, N independently consumed return slots.
+        if !skip {
+            transports.push(SparkLink::new_waves(&loaded.library,
+                spark_world.context("Spark transport needs a declared world")?, &peers, 4096,
+                TcpTransportConfig { timing: false, timeout: Duration::from_secs(120), max_frame_bytes: 64 << 20 },
+                loaded.cfg.dim * 2, engine.prefill_waves, engine.prefill_rows.max(engine.decode_rows) as u32)?);
+        }
         for transport in &mut transports { transport.enable_terminal_ownership(loaded.library.clone())?; }
         // Every rank's persistent bootstrap runs before the warm-up wave does,
         // so the workers' installed grouping is readable at any later point.
@@ -587,7 +597,7 @@ pub(crate) fn with_engine<T>(
                     engine.decode_rows, engine.local_layers()..loaded.cfg.n_layers)?;
             }
             if let Some(previous) = &installed {
-                ensure!(previous == &reports, "Spark prefill lanes report different installed expert packages");
+                ensure!(previous == &reports, "Spark transports report different installed expert packages");
             } else { installed = Some(reports); }
         }
         tracing::info!(elapsed_ms = started.elapsed().as_millis() as u64, "Spark expert transport warm");

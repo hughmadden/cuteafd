@@ -96,7 +96,7 @@ impl<'a> V4ContextSplit<'a> {
     pub fn new(engine: &Engine<'a>, context: V4Context, extent: usize, manifest: &serde_json::Value,
         abort: Option<[*const u32; 2]>, plan: &AttentionReductionPlan) -> Result<Self> {
         let cfg = &engine.cfg;
-        let (prefill, decode, lanes) = (engine.prefill_rows as u64, engine.decode_rows as u64, PREFILL_LANES as u64);
+        let (prefill, decode, lanes) = (engine.prefill_rows as u64, engine.decode_rows as u64, engine.prefill_waves as u64);
         let buffers = context_buffers(cfg, extent as u64, prefill, decode, lanes, context);
         let ranks = [RankDevice { device: engine.device, stream: engine.stream_of(0) },
             RankDevice { device: engine.peer()?.device, stream: engine.stream_of(1) }];
@@ -227,7 +227,7 @@ impl<'a> Engine<'a> {
                 let local = local_pages(&units[..history], owner)?;
                 *count = local.len();
                 if !local.is_empty() {
-                    self.on(rank, || self.library.copy_h2d(view(&own.gather, owner * half * 4, local.len() * 4)?,
+                    self.on(rank, || self.library.copy_h2d(view(&own.gather, (index * 2 + owner) * half * 4, local.len() * 4)?,
                         bytes_of(&local)))?;
                 }
             }
@@ -267,9 +267,9 @@ impl<'a> Engine<'a> {
     /// this rank's head-split `wo` partial in `delta`, as [`Self::attention_front`] does.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn context_decode_front(&self, rank: usize, layer: usize, weights: &LayerWeights<'_>,
-        tables: &StepTables, lane: &Lane<'_>, w: &Workspace<'_>, rows: Scalar, cap: usize) -> Result<()> {
+        tables: &StepTables, lane: &UnitSlot<'_>, w: &Workspace<'_>, rows: Scalar, cap: usize) -> Result<()> {
         struct Bindings<'e, 'a, 'w, 'l> {
-            engine: &'e Engine<'a>, weights: &'e LayerWeights<'l>, tables: &'e StepTables, lane: &'e Lane<'w>,
+            engine: &'e Engine<'a>, weights: &'e LayerWeights<'l>, tables: &'e StepTables, lane: &'e UnitSlot<'w>,
             w: &'e Workspace<'w>, rank: usize, layer: usize, ordinal: usize, rows: Scalar, cap: usize, t: usize,
         }
         impl ContextKernels for Bindings<'_, '_, '_, '_> {
@@ -355,7 +355,7 @@ impl<'a> Engine<'a> {
     /// GPU's completed groups into its pools. Leaves the `wo` partial in `delta`.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn context_prefill_front(&self, rank: usize, layer: usize, weights: &LayerWeights<'_>,
-        tables: &StepTables, lane: &Lane<'_>, index: usize, w: &Workspace<'_>, rows: Scalar, cap: usize,
+        tables: &StepTables, lane: &UnitSlot<'_>, index: usize, w: &Workspace<'_>, rows: Scalar, cap: usize,
         unit: &ContextUnit) -> Result<()> {
         let split = self.context()?;
         let ordinal = split.ordinal(layer).context("context attention on a non-C4 layer")?;
@@ -367,7 +367,7 @@ impl<'a> Engine<'a> {
         let half = split.staging_units.div_ceil(2);
         for (owner, &count) in unit.shards.iter().enumerate().filter(|(_, &n)| n > 0) {
             let (pool, pool_keys) = self.c4_pools(owner, layer)?;
-            let table = view(&own.gather, owner * half * 4, count * 4)?.ptr;
+            let table = view(&own.gather, (index * 2 + owner) * half * 4, count * 4)?.ptr;
             // Whole pages (payload, footer, padding), staged at logical unit 2i + owner.
             let gather = |name: &str, pool: *mut c_void, staging: *mut c_void| self.run_on(rank, false, name,
                 &[("pool", pool), ("table", table), ("staging", staging)],
@@ -432,12 +432,12 @@ mod tests {
             let cfg = cfg(heads, topk, ratios);
             let c4 = cfg.compress_ratios.iter().filter(|&&r| r == 4).count();
             let context = V4Context { topk_scratch: 9_178_112, partial_scratch: 4_000_000 };
-            let list = context_workspace(&cfg, 1 << 20, 4096, 64, PREFILL_LANES as u64, context);
+            let list = context_workspace(&cfg, 1 << 20, 4096, 64, PREFILL_WAVES as u64, context);
             let charged: u64 = list.iter().map(|&(_, b)| b.max(256)).sum();
             let allocated: u64 = list.iter().filter(|(n, _)| !n.starts_with("C4 scratch")).map(|&(_, b)| b.max(256)).sum();
             let in_pools = (c4 * metadata::C4_SCRATCH_UNITS * (metadata::compressed_page_bytes(4) + INDEX_PAGE_BYTES)) as u64;
             assert_eq!(allocated + in_pools, charged, "{heads} heads");
-            assert_eq!(context_buffers(&cfg, 1 << 20, 4096, 64, PREFILL_LANES as u64, context).workspace_bytes, charged);
+            assert_eq!(context_buffers(&cfg, 1 << 20, 4096, 64, PREFILL_WAVES as u64, context).workspace_bytes, charged);
             // The listed order the engine binds: 8 shared buffers, then one commit list per lane.
             let names: Vec<_> = list.iter().map(|(n, _)| *n).filter(|n| !n.starts_with("C4 scratch")).collect();
             assert_eq!(names, ["candidates", "own-head partial", "peer-head partial", "scored top-k scratch",

@@ -41,8 +41,8 @@ mod spark_tests {
                 let model = super::spark_model(decode_rows, device)?;
                 model.validate(cuteafd_core::ExpertGeometry::DEEPSEEK_V4_FLASH)?;
                 assert_eq!((model.capacity, model.compiled_capacity), (4096, 4096));
-                assert_eq!(model.endpoints.len(), super::super::engine::PREFILL_LANES + usize::from(device));
-                assert!(model.endpoints[..super::super::engine::PREFILL_LANES].iter()
+                assert_eq!(model.endpoints.len(), 1 + usize::from(device));
+                assert!(model.endpoints[..1].iter()
                     .all(|endpoint| endpoint.capacity == 4096));
                 if device { assert_eq!(model.endpoints.last().unwrap().capacity, decode_rows as u32); }
                 assert!(model.endpoints.iter().all(|endpoint| endpoint.ingress == cuteafd_core::SparkIngress::Fp8K32));
@@ -55,8 +55,7 @@ mod spark_tests {
 pub(crate) fn spark_model(decode_rows: usize, device_exchange: bool)
     -> Result<cuteafd_transport::worker_selection::ModelAdmission> {
     use cuteafd_core::{SparkEndpoint, SparkIngress};
-    let mut endpoints = vec![SparkEndpoint { ring_depth: None, capacity: 4096, ingress: SparkIngress::Fp8K32 };
-        super::engine::PREFILL_LANES];
+    let mut endpoints = vec![SparkEndpoint { ring_depth: None, capacity: 4096, ingress: SparkIngress::Fp8K32 }; 1];
     if device_exchange {
         endpoints.push(SparkEndpoint { ring_depth: None, capacity: u32::try_from(decode_rows)?, ingress: SparkIngress::Fp8K32 });
     }
@@ -103,7 +102,7 @@ pub(crate) fn request(args: &EngineArgs, inputs: &Inputs<'_>) -> Result<Placemen
     let scratch = cuteafd_loader::serving_capacity::deepseek_v4_workspace_scratch(
         inputs.manifest, inputs.family, gpus == 2, prefill, decode)?;
     let workspace = cuteafd_loader::serving_capacity::deepseek_v4_workspace_geometry(&cache_cfg, prefill, decode,
-        cuteafd_loader::serving_capacity::compiled_c128_width(inputs.manifest, inputs.family)? * 128, gpus, scratch)?;
+        cuteafd_loader::serving_capacity::compiled_c128_width(inputs.manifest, inputs.family)? * 128, gpus, args.prefill_waves as u64, scratch)?;
     let onboard = args.onboard()?;
     let stages = if args.dspark && !args.skip_routed_experts { inputs.cache_stages } else { 0 };
     let routed = *inputs.catalog.routed_experts();
@@ -134,7 +133,7 @@ pub(crate) fn request(args: &EngineArgs, inputs: &Inputs<'_>) -> Result<Placemen
     let spark_ranks = if args.skip_routed_experts { 0 } else { args.peers.split(',').filter(|p| !p.is_empty()).count() };
     let request = v4::request(&v4::V4Inputs { automatic_context: args.max_context == 0, cfg: &cache_cfg, weights, cache_stages: inputs.cache_stages,
         gpus: baselines, headroom_floor: 0, spark_ranks,
-        sequences: args.max_sequences as u64, prefill_rows: prefill, decode_rows: decode,
+        sequences: args.max_sequences as u64, prefill_rows: prefill, prefill_waves: args.prefill_waves as u64, decode_rows: decode,
         max_context: inputs.max_context as u64, reserve_bytes: (args.reserve_gib as u64) << 30, mark_slots,
         workspace: Some(workspace), experts, draft, expert_workspace, first_routed: routed.first_layer,
         experts_half, tp2_workspace, exchange_f32: inputs.exchange_f32,

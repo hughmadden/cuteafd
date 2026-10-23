@@ -275,6 +275,9 @@ EOF
   case "$1" in
     deepseek_v4)
       cat <<'EOF'
+PREFILL_ROWS
+PREFILL_WAVES
+CUTEAFD_PREFILL_SPAN_ROWS
 RTX_EXPERT_PEER
 SPECULATOR_MODEL_ID
 SPECULATOR_MODEL_REVISION
@@ -2541,7 +2544,9 @@ fi
 # the Spark world size. Forward the resolved lane policy to the coordinator.
 lane_env_args=()
 case "$family" in
-  deepseek_v4) ;;
+  deepseek_v4)
+    [[ -z "$(get CUTEAFD_PREFILL_SPAN_ROWS)" ]] || lane_env_args+=(-e "CUTEAFD_PREFILL_SPAN_ROWS=$(get CUTEAFD_PREFILL_SPAN_ROWS)")
+    ;;
   glm5)
     # Prefill units, waves and span come from the deployment plan (units-span).
     ;;
@@ -2697,6 +2702,10 @@ audio_encoder_hash=""
     [[ -z "$(get PREFILL_WAVES)" ]] || plan_draft_args+=(--prefill-lanes "$(get PREFILL_WAVES)")
     [[ -z "$(get PREFILL_ROWS)" ]] || plan_draft_args+=(--prefill-rows "$(get PREFILL_ROWS)")
   fi
+  if [[ "$family" == deepseek_v4 ]]; then
+    [[ -z "$(get PREFILL_ROWS)" ]] || plan_draft_args+=(--prefill-rows "$(get PREFILL_ROWS)")
+    [[ -z "$(get PREFILL_WAVES)" ]] || plan_draft_args+=(--prefill-lanes "$(get PREFILL_WAVES)")
+  fi
   if [[ "$family" == step5 ]]; then
     [[ -z "$(get PREFILL_WAVES)" ]] || plan_draft_args+=(--prefill-waves "$(get PREFILL_WAVES)")
     plan_mtp_depth=0
@@ -2748,6 +2757,10 @@ audio_encoder_hash=""
   esac
   if [[ "$(family_prefill_mode "$family")" == units-span ]]; then
     family_args+=(--prefill-span-rows "$PREFILL_SPAN_ROWS")
+  fi
+  if [[ "$family" == deepseek_v4 ]]; then
+    family_args+=(--prefill-rows "$(get PREFILL_ROWS "$(jq -er '.prefill_rows' <<<"$deployment_json")")")
+    family_args+=(--prefill-waves "$(get PREFILL_WAVES "$(jq -er '.report.prefill_lanes // 2' <<<"$deployment_json")")")
   fi
   [[ -n "$budget" ]] || budget="$(jq -er '.spark_budget_bytes | select(type == "number" and . > 0)' <<<"$plan_json")" ||
     release_die "the deployment plan names no Spark budget"

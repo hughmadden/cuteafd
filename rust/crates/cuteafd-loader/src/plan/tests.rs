@@ -1661,7 +1661,7 @@ fn v4_workspace_plan_matches_runtime_below_compiled_context() {
     let cfg = crate::families::deepseek_v4::DeepseekV4Config::read(dir.path(), 0).unwrap();
     let scratch = deepseek_v4_workspace_scratch(&manifest, "dsv4f", false, 4096, 64).unwrap();
     let runtime = deepseek_v4_workspace_geometry(&cfg, 4096, 64,
-        compiled_c128_width(&manifest, "dsv4f").unwrap() * 128, 1, scratch).unwrap();
+        compiled_c128_width(&manifest, "dsv4f").unwrap() * 128, 1, 2, scratch).unwrap();
     for gib in [31.8, 95.5] {
         let total = cuteafd_core::serving_capacity::GpuMemoryBudget::from_gib(gib).unwrap().0;
         for context in [16384, 32512, 32768] {
