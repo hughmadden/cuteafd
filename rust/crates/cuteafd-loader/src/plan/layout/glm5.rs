@@ -56,6 +56,10 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyMod
     let lanes = if options.prefill_lanes > 0 { options.prefill_lanes }
         else { glm_prefill_lanes(None) as u64 };
     let spark_ranks = match report.placement { ExpertPlacement::Sparks { ranks } => ranks, ExpertPlacement::Local => 0 };
+    // Publish the actual prefill units: `prefill_rows` each, `lanes` in flight
+    // on the one prefill transport (one with no Sparks).
+    options.prefill_unit_rows = Some(shape.prefill_rows);
+    options.prefill_waves = if spark_ranks == 0 { 1 } else { lanes };
     let mut working = crate::placement::SparkWorkingSet { rtx_layers: Vec::new(),
         spark_layers: if spark_ranks > 0 { (0..model.spec().layers.len()).collect() } else { Vec::new() },
         spark_ranks, prefill_lanes: lanes };

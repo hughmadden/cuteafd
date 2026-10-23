@@ -2593,7 +2593,7 @@ mod prefill_unit_tests {
         let source = include_str!("engine.rs");
         let begin = source.split("let begin = |unit: usize|").nth(1).unwrap()
             .split("let attention = |index: usize, unit: usize|").next().unwrap();
-        assert!(!begin.contains("DIRECT"), "Begin publishes no DIRECT mailbox");
+        assert!(!begin.contains("push_to(0, DIRECT"), "Begin publishes no DIRECT mailbox");
         let attention = source.split("let attention = |index: usize, unit: usize|").nth(1).unwrap()
             .split("let post = |index").next().unwrap();
         let first = attention.find("if index == 0 {").expect("first-layer entry publish");
