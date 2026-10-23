@@ -5492,8 +5492,19 @@ and scratch scheme. Step-5 and Qwen 4 had no overlap at all.
 
 ### Prefill migration plan (cross-family, TJ 2026-10-23)
 
-One owner holds `shared/prefill_pipeline.rs` and builds the shared executor.
-Each family's port is then a separate, mechanical task.
+Process (TJ, 2026-10-23):
+1. One Opus agent reviews every family's prefill and proposes the contract:
+   the hook trait, ordering, admission, chunk rule, extra hooks for drafter
+   taps, head split, Engram and vision, and a per-family port checklist.
+2. TJ approves the contract.
+3. The Opus agent builds the shared executor with Kimi as the reference port.
+4. One DeepSeek agent per family ports it from the checklist, with a
+   same-config A/B against work/p0 that proves no regression: 8K prefill and
+   TTFT ≥ 0.98×, decode ≥ 0.95×, KL identical, freed memory reported.
+5. The Opus agent reviews each port for conformance.
+
+One owner holds `shared/prefill_pipeline.rs`; each family port is a separate
+task.
 
 | Phase | Work | Families | Bar |
 |---|---|---|---|
