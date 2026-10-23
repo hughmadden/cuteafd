@@ -31,6 +31,8 @@ def command(arguments, *, name, fork=None, memory_gib=None, build_root=None):
         "--mount", f"type=bind,src={home},dst={home}",
         "--mount", "type=bind,src=/usr/local/cuda-13.4,dst=/usr/local/cuda-13.4,readonly",
         "--entrypoint", str(REPO/".venv/bin/python")]
+    if Path("/mnt/sparknest").is_dir():
+        result += ["--mount", "type=bind,src=/mnt/sparknest,dst=/mnt/sparknest,readonly"]
     if memory_gib is not None:
         if memory_gib <= 0:
             raise ValueError("positive container memory cap required")

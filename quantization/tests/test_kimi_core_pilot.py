@@ -126,6 +126,17 @@ def test_format_table_ratios_and_duplicates():
         pilot.markdown(rows + rows[:1])
 
 
+@pytest.mark.parametrize('present', [False, True])
+def test_container_mounts_sparknest_readonly_when_present(monkeypatch, present):
+    original = Path.is_dir
+    monkeypatch.setattr(Path, 'is_dir', lambda path: present if str(path) == '/mnt/sparknest' else original(path))
+    argv = command(['-m', 'pilot'], name='pilot')
+    mount = 'type=bind,src=/mnt/sparknest,dst=/mnt/sparknest,readonly'
+    assert (mount in argv) == present
+    if present:
+        assert argv[argv.index(mount) - 1] == '--mount'
+
+
 def test_container_cap_and_private_compiler_directory():
     argv = command(['-m', 'quantization.kimi_k3.core_k6.pilot'], name='pilot',
                    memory_gib=50, build_root=Path('/build/pilot'))
