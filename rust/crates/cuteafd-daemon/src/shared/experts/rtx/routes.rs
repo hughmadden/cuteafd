@@ -65,12 +65,178 @@ impl RouteIdentity {
     }
 }
 
+/// Retained diagnostic buffers for live prefill slots. Allocate max-row buffers
+/// for every slot before any peer waits are queued; begin/finish never replace
+/// those pinned allocations. The `finish` callback drains both producer streams,
+/// then trims each buffer to the unit's actual rows before returning RouteChecks.
+/// Always call `finish_span`, including before propagating an executor error;
+/// strict mode rejects a begun unit that never finished. An error does not prove
+/// device work drained: the owner's submission guard still owns abort and teardown.
+#[derive(Debug)]
+pub(crate) struct SlotRouteChecks<T> {
+    slots: Vec<(T, Option<CheckedUnit>)>,
+    strict: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CheckedUnit {
+    unit: usize,
+    rows: usize,
+    enabled: bool,
+}
+
+impl<T> SlotRouteChecks<T> {
+    /// Explicit opt-in diagnostics use `strict`; startup checks keep broadcast fallback.
+    pub(crate) fn new(storage: Vec<T>, strict: bool) -> anyhow::Result<Self> {
+        anyhow::ensure!(!storage.is_empty(), "route diagnostics need at least one slot");
+        Ok(Self { slots: storage.into_iter().map(|storage| (storage, None)).collect(), strict })
+    }
+
+    pub(crate) fn begin(&mut self, slot: usize, unit: usize, rows: usize, enabled: bool) -> anyhow::Result<()> {
+        let (_, active) = self.slots.get_mut(slot).ok_or_else(|| anyhow::anyhow!("route diagnostic slot {slot}"))?;
+        anyhow::ensure!(rows > 0 && active.is_none(), "route diagnostic slot {slot} still live or empty unit {unit}");
+        *active = Some(CheckedUnit { unit, rows, enabled });
+        Ok(())
+    }
+
+    /// Call at span end, including error unwinding before the owner drops storage.
+    pub(crate) fn finish_span(&self) -> anyhow::Result<()> {
+        if self.strict {
+            if let Some((slot, (_, Some(active)))) = self.slots.iter().enumerate().find(|(_, (_, active))| active.is_some()) {
+                anyhow::bail!("unfinished route diagnostics in unit {}, slot {slot}", active.unit);
+            }
+        }
+        Ok(())
+    }
+
+    /// A disabled unit never writes diagnostics left in a recycled slot.
+    pub(crate) fn storage(&mut self, slot: usize, unit: usize) -> anyhow::Result<Option<&mut T>> {
+        let (storage, active) = self.slots.get_mut(slot).ok_or_else(|| anyhow::anyhow!("route diagnostic slot {slot}"))?;
+        let active = active.as_ref().ok_or_else(|| anyhow::anyhow!("route diagnostic slot {slot} is idle"))?;
+        anyhow::ensure!(active.unit == unit, "route diagnostic slot {slot}: expected unit {}, got {unit}", active.unit);
+        Ok(active.enabled.then_some(storage))
+    }
+
+    pub(crate) fn finish(&mut self, slot: usize, unit: usize,
+        read_after_drain: impl FnOnce(&mut T, usize) -> anyhow::Result<Vec<RouteCheck>>)
+        -> anyhow::Result<Option<RouteIdentity>> {
+        let (storage, active) = self.slots.get_mut(slot).ok_or_else(|| anyhow::anyhow!("route diagnostic slot {slot}"))?;
+        let checked = *active.as_ref().ok_or_else(|| anyhow::anyhow!("route diagnostic slot {slot} is idle"))?;
+        anyhow::ensure!(checked.unit == unit,
+            "route diagnostic slot {slot}: expected unit {}, got {unit}", checked.unit);
+        if !checked.enabled { *active = None; return Ok(None); }
+        // On a failed drain keep the slot live: its buffers must not be reused.
+        let checks = read_after_drain(storage, checked.rows)?;
+        anyhow::ensure!(!checks.is_empty(), "unit {unit} route diagnostics checked no layers");
+        for check in &checks {
+            let bytes = check.rows.checked_mul(check.topk).and_then(|n| n.checked_mul(8));
+            anyhow::ensure!(check.rows == checked.rows && check.topk > 0
+                && check.ranks.iter().all(|rank| Some(rank.len()) == bytes),
+                "unit {unit} route diagnostic shape differs at layer {}", check.layer);
+        }
+        let identity = RouteIdentity::check(&checks);
+        *active = None;
+        if self.strict {
+            if let Some((layer, row)) = identity.first_mismatch {
+                anyhow::bail!("route mismatch in unit {unit}, slot {slot}, layer {layer}, row {row}");
+            }
+        }
+        Ok(Some(identity))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn check(layer: usize, rows: usize, a: Vec<u8>, b: Vec<u8>) -> RouteCheck {
         RouteCheck { layer, rows, topk: 2, ranks: [a, b] }
+    }
+
+    struct MockPair {
+        checks: SlotRouteChecks<Vec<RouteCheck>>,
+        verified: Vec<usize>,
+        corrupt: Option<usize>,
+    }
+
+    impl MockPair {
+        fn run(&mut self) -> anyhow::Result<()> {
+            use crate::shared::prefill_pipeline::{prefill_schedule, sequence_units, FfnRoute, Step};
+            let units = sequence_units(4096 * 8, 4096, 2, 4)?;
+            assert!(units.len() > 2);
+            let outcome = (|| {
+                for step in prefill_schedule(&[FfnRoute::Local; 4], &units, 2)? {
+                    match step {
+                        Step::Begin { unit } => self.checks.begin(units[unit].slot, unit, units[unit].rows.len(), true)?,
+                        Step::Local { layer, unit } => {
+                            let rows = units[unit].rows.len();
+                            let bytes = vec![0; rows * 2 * 8];
+                            let mut peer = bytes.clone();
+                            if self.corrupt == Some(unit) && layer == 3 { peer[rows * 8 + 2 * 8] ^= 1; }
+                            self.checks.storage(units[unit].slot, unit)?.unwrap().push(check(layer, rows, bytes, peer));
+                        }
+                        Step::End { unit } => {
+                            let identity = self.checks.finish(units[unit].slot, unit, |storage, _| Ok(std::mem::take(storage)))?.unwrap();
+                            assert_eq!(identity.layers_checked, 4);
+                            self.verified.push(unit);
+                        }
+                        _ => {}
+                    }
+                }
+                Ok(())
+            })();
+            let complete = self.checks.finish_span();
+            outcome.and(complete)
+        }
+    }
+
+    #[test]
+    fn recycled_slots_check_every_unit_and_later_corruption_fails() {
+        let mut pair = MockPair { checks: SlotRouteChecks::new(vec![Vec::new(), Vec::new()], true).unwrap(),
+            verified: Vec::new(), corrupt: None };
+        pair.run().unwrap();
+        assert_eq!(pair.verified, (0..8).collect::<Vec<_>>());
+        pair.verified.clear();
+        pair.corrupt = Some(5);
+        let error = pair.run().unwrap_err().to_string();
+        assert!(error.contains("unit 5, slot 1, layer 3, row 2"), "{error}");
+        assert_eq!(pair.verified, (0..5).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn live_slot_guards_and_failed_drains_require_span_completion() {
+        let mut checks = SlotRouteChecks::new(vec![vec![check(1, 1, vec![0; 16], vec![0; 16])]], true).unwrap();
+        checks.begin(0, 7, 1, true).unwrap();
+        assert!(checks.begin(0, 8, 1, true).is_err());
+        assert!(checks.storage(0, 8).is_err());
+        assert!(checks.finish(0, 8, |_, _| unreachable!()).is_err());
+        assert!(checks.finish(0, 7, |_, _| anyhow::bail!("drain failed")).is_err());
+        assert!(checks.finish_span().unwrap_err().to_string().contains("unit 7, slot 0"));
+        checks.finish(0, 7, |storage, _| Ok(storage.clone())).unwrap();
+        checks.finish_span().unwrap();
+        assert!(checks.finish(0, 7, |_, _| unreachable!()).is_err());
+    }
+
+    #[test]
+    fn disabled_checks_skip_reads_and_normal_mismatches_keep_broadcast() {
+        let mut checks = SlotRouteChecks::new(vec![vec![check(1, 1, vec![0; 16], vec![1; 16])]], false).unwrap();
+        checks.begin(0, 0, 1, false).unwrap();
+        assert!(checks.storage(0, 0).unwrap().is_none());
+        assert!(checks.finish(0, 0, |_, _| unreachable!()).unwrap().is_none());
+        checks.begin(0, 1, 1, true).unwrap();
+        let identity = checks.finish(0, 1, |storage, _| Ok(storage.clone())).unwrap().unwrap();
+        assert_eq!(identity.source(), RouteSource::Broadcast);
+        checks.finish_span().unwrap();
+    }
+
+    #[test]
+    fn invalid_route_shapes_fail_without_releasing_the_slot() {
+        let mut checks = SlotRouteChecks::new(vec![()], true).unwrap();
+        checks.begin(0, 0, 1, true).unwrap();
+        assert!(checks.finish(0, 0, |_, _| Ok(vec![check(1, 1, vec![], vec![])])).is_err());
+        assert!(checks.finish_span().is_err());
+        assert!(checks.storage(1, 0).is_err());
+        assert!(SlotRouteChecks::<()>::new(vec![], true).is_err());
     }
 
     #[test]
