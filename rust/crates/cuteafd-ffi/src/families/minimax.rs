@@ -1,4 +1,6 @@
 //! Retained device operands for the MiniMax coordinator ABI.
+mod dspark;
+
 use crate::{CuteafdDeviceBuffer, NativeLibrary, programs::{Program, ProgramSpec, Programs, Scalar, VocabularyHead}};
 use anyhow::{ensure, Context, Result};
 use std::{cell::RefCell, collections::BTreeMap, ffi::c_void, path::Path, rc::Rc};
