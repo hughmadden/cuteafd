@@ -305,7 +305,7 @@
   {
    "name": "kimi-k3-max",
    "family": "kimi_k3",
-   "config": "examples/configs/kimi-k3-exl3-max.config",
+   "config": "examples/configs/kimi-k3-exl3-k6-max.config",
    "gpus": [
     0,
     1
