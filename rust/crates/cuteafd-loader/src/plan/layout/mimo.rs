@@ -5,7 +5,7 @@ use crate::families::mimo_v2::{admission::*, capacity::*, resident::MimoResident
 use anyhow::{Context, Result};
 
 pub(crate) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyModel,
-    input: &super::super::PlanInput, options: &LayoutOptions) -> MemoryLayout {
+    input: &super::super::PlanInput, options: &mut LayoutOptions) -> MemoryLayout {
     let shape = Shape::resolve(report, model, options,
         ShapePolicy { context: ContextPolicy::Checkpoint, ..ShapePolicy::manifest_bounded() });
     let (rows, concurrency, context, manifest) = (shape.prefill_rows, shape.concurrency, shape.context_tokens,

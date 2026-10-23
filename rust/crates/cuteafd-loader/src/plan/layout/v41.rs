@@ -16,8 +16,9 @@ const SPARK: SparkCharges = SparkCharges {
 };
 
 pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyModel,
-    input: &crate::plan::PlanInput, options: &LayoutOptions) -> Result<MemoryLayout> {
+    input: &crate::plan::PlanInput, options: &mut LayoutOptions) -> Result<MemoryLayout> {
     let checkpoint = input.checkpoint();
+    let explicit_unit = options.prefill_unit_rows.is_some();
     let shape = Shape::resolve(report, model, options, ShapePolicy {
         context: ContextPolicy::Checkpoint, prefill_rows: Some(2048), all_native_stages: false,
     });
@@ -26,6 +27,7 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyMod
     ensure!((1..=16).contains(&shape.concurrency), "V4.1 concurrency must be 1..16");
     let rows = u64::from(cuteafd_core::coordinator_programs::v41_live_rows(
         u32::try_from(shape.prefill_rows)?).context("invalid V4.1 prefill rows")?);
+    if options.prefill_waves == 1 && !explicit_unit { options.prefill_unit_rows = Some(rows); }
     let marks = options.prefix_slots.unwrap_or_else(|| cuteafd_core::prefix::mark_slots_with_host(0, options.mimo_prefix_entries, 1, u64::MAX, options.host_cache_bytes != Some(0)));
     ensure!(marks == 0 || (marks >= 2 && marks % 2 == 0 && marks <= 258),
         "V4.1 prefix slots must be zero or 2 * retained turns + 2 (at most 258)");

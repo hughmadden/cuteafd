@@ -14,7 +14,8 @@ fn host_ledger_charges_resolved_quota_and_reports_other_owners_and_refusal() {
     for (total, expected) in [(183u64, 32u64), (64, 16)] {
         let mut report = input.plan(&PlanOptions::default()).unwrap();
         let mut options = layout::LayoutOptions { host_memory: Some((total << 30, total << 30)),
-            full_prefill_logits: true, context_tokens: 1 << 40, ..Default::default() };
+            full_prefill_logits: true, context_tokens: 1 << 40,
+            prefill_unit_rows: Some(4096), ..Default::default() };
         layout::charge_host(&mut report, &options, input.checkpoint(), false).unwrap();
         let host = report.host_ledger.as_ref().unwrap();
         assert_eq!(report.host_budget_bytes, expected << 30);
@@ -53,7 +54,7 @@ fn native_host_ledger_charges_six_spark_ranks_without_spark_device_entries() {
         kind: DeviceKind::Rtx, index: 0, capacity_bytes: 96 << 30, items: vec![], kv_tokens: 0,
     }], pool_tokens: 0, waste: vec![], notes: vec![] });
     let options = layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)),
-        host_cache_bytes: Some(0), ..Default::default() };
+        host_cache_bytes: Some(0), prefill_unit_rows: Some(4096), ..Default::default() };
     let spec = report.spec.as_ref().unwrap();
     let moe = spec.moe.as_ref().unwrap();
     let geometry = ExpertGeometry { hidden: spec.hidden as u32, experts: moe.experts as u32,
@@ -75,6 +76,73 @@ fn native_host_ledger_charges_six_spark_ranks_without_spark_device_entries() {
     layout::charge_host(&mut report, &options, input.checkpoint(), true).unwrap();
     assert!(!report.host_ledger.as_ref().unwrap().items.iter()
         .any(|i| matches!(i.group.as_str(), "transport/rdma-rings" | "spark-intake")));
+}
+
+#[test]
+fn host_prefill_waves_keep_unit_scratch_and_independent_return_slots() {
+    use cuteafd_core::{ExpertGeometry, SparkEndpoint, SparkIngress, SparkRings};
+    let dir = snapshot(mimo_flash_config(), &mimo_flash_tensors());
+    let input = PlanInput::open(dir.path()).unwrap();
+    let mut report = input.plan(&sparks(4)).unwrap();
+    let spec = report.spec.as_ref().unwrap();
+    let moe = spec.moe.as_ref().unwrap();
+    let geometry = ExpertGeometry { hidden: spec.hidden as u32, experts: moe.experts as u32,
+        topk: moe.top_k as u32, intermediate: moe.intermediate as u32, layers: spec.layers.len() as u32 };
+    let vocab = spec.vocab as u64;
+    let mut options = layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)),
+        host_cache_bytes: Some(0), full_prefill_logits: true, prefill_lanes: 1,
+        prefill_rows: 4096, ..Default::default() };
+    report.prefill_lanes = Some(1);
+    for native in [false, true] {
+        for (unit, waves, span) in [(4096, 1, 4096), (4096, 2, 8192), (4096, 2, 16384), (2048, 2, 16384), (4096, 2, 2048)] {
+            options.prefill_rows = span;
+            options.prefill_unit_rows = Some(unit);
+            options.prefill_waves = waves;
+            report.prefill_rows = Some(span);
+            for family in ["mimo_v2", "deepseek_v41"] {
+                report.family = Some(family.into());
+                layout::charge_host(&mut report, &options, input.checkpoint(), native).unwrap();
+                assert_eq!(report.prefill_rows, Some(span));
+                let host = report.host_ledger.as_ref().unwrap();
+                let bytes = |name| host.items.iter().find(|i| i.group == name).unwrap().bytes;
+                let endpoints = layout::spark_endpoints(family, 1) as u64;
+                let endpoint = SparkEndpoint { capacity: unit as u32, ingress: SparkIngress::Fp8K32 };
+                let (request, response) = endpoint.wire_bytes(geometry).unwrap();
+                let rings = SparkRings { max_frame_bytes: (64 << 20).max(request).max(response),
+                    depth: 8, slot_bytes: 8 << 20, alignment: 4096 };
+                assert_eq!(bytes("transport/rdma-rings"), endpoint.ring_bytes(geometry, rings).unwrap() as u64
+                    * endpoints * 4, "{family} {unit}x{waves}");
+                assert_eq!(bytes("spark-intake"), unit * waves * geometry.hidden as u64
+                    * if native { 4 } else { 2 } * endpoints * 4);
+                assert_eq!(bytes("workspace/router"), (unit + 64)
+                    * (geometry.hidden as u64 * 2 + geometry.topk as u64 * 8));
+                assert_eq!(bytes("staging/tables-and-sync"), (unit + 64) * geometry.hidden as u64 * 8 + (2 << 20));
+                assert_eq!(bytes("scoring/full-logits"), span * vocab * 4);
+            }
+        }
+    }
+}
+
+#[test]
+fn spark_host_layout_requires_explicit_family_unit_even_for_one_wave() {
+    let dir = snapshot(mimo_flash_config(), &mimo_flash_tensors());
+    let input = PlanInput::open(dir.path()).unwrap();
+    for native in [false, true] {
+        for waves in [1, 2] {
+            let mut report = input.plan(&sparks(4)).unwrap();
+            report.prefill_rows = Some(16384);
+            let mut options = layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)),
+                host_cache_bytes: Some(0), prefill_rows: 4096, prefill_waves: waves, ..Default::default() };
+            let error = layout::charge_host(&mut report, &options, input.checkpoint(), native).unwrap_err();
+            assert!(error.to_string().contains("requires family-resolved prefill_unit_rows"), "{error:#}");
+            assert_eq!(report.prefill_rows, Some(16384));
+            options.prefill_unit_rows = Some(0);
+            assert!(layout::charge_host(&mut report, &options, input.checkpoint(), native).is_err());
+            options.prefill_unit_rows = Some(2048);
+            layout::charge_host(&mut report, &options, input.checkpoint(), native).unwrap();
+            assert_eq!(report.prefill_rows, Some(16384));
+        }
+    }
 }
 
 #[test]
@@ -110,7 +178,8 @@ fn host_automatic_quota_depends_on_concurrency_not_device_entries() {
             rows, page, mark.max(1), 0, chunk).unwrap().min(32 << 30);
         for entries in [1, 2000] {
             let options = layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)),
-                context_tokens: 1 << 20, concurrency, mimo_prefix_entries: entries, ..Default::default() };
+                context_tokens: 1 << 20, concurrency, mimo_prefix_entries: entries,
+                prefill_unit_rows: Some(4096), ..Default::default() };
             layout::charge_host(&mut report, &options, input.checkpoint(), false).unwrap();
             assert_eq!(report.host_budget_bytes, expected);
         }
@@ -123,7 +192,7 @@ fn host_media_quota_is_charged_only_for_supported_loaded_towers() {
     let input = PlanInput::open(dir.path()).unwrap();
     let mut report = input.plan(&PlanOptions::default()).unwrap();
     let mut options = layout::LayoutOptions { host_memory: Some((64 << 30, 64 << 30)),
-        host_cache_bytes: Some(0), ..Default::default() };
+        host_cache_bytes: Some(0), prefill_unit_rows: Some(4096), ..Default::default() };
     for (vision, audio, quota, expected) in [
         (MediaMode::Rtx(Some(0)), MediaMode::Off, None, (64u64 << 30) / 20),
         (MediaMode::Spark(Some(0)), MediaMode::Off, Some(2 << 30), 2 << 30),
@@ -151,7 +220,8 @@ fn host_full_logits_charge_gather_and_live_lane_but_not_mimo_pipeline() {
     let mut report = input.plan(&PlanOptions::default()).unwrap();
     report.prefill_rows = Some(4096);
     let options = layout::LayoutOptions { host_memory: Some((183 << 30, 183 << 30)),
-        host_cache_bytes: Some(0), prefill_lanes: 3, full_prefill_logits: true, ..Default::default() };
+        host_cache_bytes: Some(0), prefill_lanes: 3, full_prefill_logits: true,
+        prefill_unit_rows: Some(4096), ..Default::default() };
     let vocab = report.spec.as_ref().unwrap().vocab as u64;
     for (family, rows) in [("mimo_v2", 4096u64), ("glm5_flash", 4096 * 4), ("glm5", 4096 * 4)] {
         report.family = Some(family.into());
@@ -167,7 +237,7 @@ fn family_native_placement_bypasses_legacy_layout_and_refuses_closed() {
     struct Native { spec: spec::ModelSpec, refuse: bool }
     impl FamilyModel for Native {
         fn spec(&self) -> &spec::ModelSpec { &self.spec }
-        fn placement(&self, _: &PlanInput, _: &mut PlanReport, _: &layout::LayoutOptions, _: ExpertPlacement)
+        fn placement(&self, _: &PlanInput, _: &mut PlanReport, _: &mut layout::LayoutOptions, _: ExpertPlacement)
             -> Option<anyhow::Result<cuteafd_core::memory_layout::MemoryLayout>> {
             Some(if self.refuse { Err(anyhow::anyhow!("native test refusal")) } else {
                 Ok(cuteafd_core::memory_layout::MemoryLayout { devices: vec![], pool_tokens: 123456,
@@ -182,12 +252,12 @@ fn family_native_placement_bypasses_legacy_layout_and_refuses_closed() {
     // An unknown family has no adapter of its own. The sentinel can only
     // come from the hook, independent of any registered family's dispatch.
     report.family = Some("test_native_placement".into());
-    let options = layout::LayoutOptions::default();
-    let memory = family_layout(&native, &input, &mut report, &options, ExpertPlacement::Local).unwrap();
+    let mut options = layout::LayoutOptions::default();
+    let memory = family_layout(&native, &input, &mut report, &mut options, ExpertPlacement::Local).unwrap();
     assert_eq!(memory.pool_tokens, 123456);
     assert_eq!(memory.notes, ["native hook sentinel"]);
     let refusal = Native { refuse: true, ..native };
-    let memory = family_layout(&refusal, &input, &mut report, &options, ExpertPlacement::Local).unwrap();
+    let memory = family_layout(&refusal, &input, &mut report, &mut options, ExpertPlacement::Local).unwrap();
     assert!(memory.devices.is_empty());
     assert!(!report.fits && !report.placement_supported);
     assert!(report.hints.iter().any(|hint| hint.what.contains("native test refusal")));

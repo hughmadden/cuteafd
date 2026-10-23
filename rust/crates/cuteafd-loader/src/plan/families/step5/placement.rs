@@ -48,7 +48,7 @@ pub(super) fn layout(
     model: &Model,
     input: &PlanInput,
     report: &mut PlanReport,
-    opts: &LayoutOptions,
+    opts: &mut LayoutOptions,
     requested: ExpertPlacement,
 ) -> Result<MemoryLayout> {
     ensure!(
@@ -234,10 +234,10 @@ pub(super) fn layout(
         admitted
     };
     let rows = inputs.rows;
-    // The reported shape is the unit and the units in flight (serve-step5's
-    // --prefill-rows and --prefill-waves); the span is their product.
     report.prefill_rows = Some(inputs.unit_rows() as u64);
     report.prefill_lanes = Some(waves as u64);
+    opts.prefill_unit_rows = Some(inputs.unit_rows() as u64);
+    opts.prefill_waves = waves as u64;
     report.attention_placement = admitted.placement.attention_placement;
     report.bytes_by_owner.clear();
     report.bytes_by_owner.insert(

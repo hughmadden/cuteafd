@@ -53,6 +53,10 @@ pub struct LayoutOptions {
     pub full_prefill_logits: bool,
     /// Prefill lanes (GLM 5.3 Flash); 0 selects the family default.
     pub prefill_lanes: u64,
+    /// Family-resolved rows per wave, independent of the admitted span.
+    pub prefill_unit_rows: Option<u64>,
+    /// Continuous row-unit waves on one transport.
+    pub prefill_waves: u64,
     /// Rows of a GLM 5.3 Flash decode or verify step (`--decode-rows`): 64, or 128 with the wide
     /// `_m128` programs (one GPU). The decode workspace, the token selector and the speculative
     /// replay records hold this many rows.
@@ -186,6 +190,8 @@ impl Default for LayoutOptions {
             prefill_rows: 0,
             full_prefill_logits: false,
             prefill_lanes: 0,
+            prefill_unit_rows: None,
+            prefill_waves: 1,
             glmf_decode_rows: crate::serving_capacity::GLMF_DECODE_ROWS,
             glmf_representation: Default::default(),
             glmf_kda_state: Default::default(),
@@ -563,7 +569,7 @@ pub struct Shape {
 }
 
 impl Shape {
-    pub fn resolve(report: &mut PlanReport, model: &dyn super::FamilyModel, options: &LayoutOptions,
+    pub fn resolve(report: &mut PlanReport, model: &dyn super::FamilyModel, options: &mut LayoutOptions,
         policy: ShapePolicy) -> Self {
         let discovered = match model.spec().speculator.as_ref() {
             Some(super::spec::SpeculatorSpec::Dspark { stages, .. }) => *stages,
@@ -581,6 +587,11 @@ impl Shape {
             else if let Some(rows) = policy.prefill_rows { rows }
             else { manifest.as_ref().and_then(|m| m["capacities"]["prefill_rows"].as_u64()).unwrap_or(4096) };
         report.prefill_rows = Some(prefill_rows);
+        // Legacy one-wave adapters use their resolved step as the unit.
+        // Continuous adapters must supply their actual unit before host admission.
+        if options.prefill_waves == 1 && options.prefill_unit_rows.is_none() {
+            options.prefill_unit_rows = Some(prefill_rows);
+        }
         let decode_rows = manifest.as_ref().and_then(|m| m["capacities"]["decode_rows"].as_u64()).unwrap_or(64);
         let concurrency = if options.concurrency > 0 { options.concurrency }
             else { cuteafd_core::serving_capacity::default_concurrency(options.rtx_bytes.first().copied().unwrap_or(0)) };
@@ -1081,7 +1092,7 @@ fn selected_host_geometry(report: &mut PlanReport, options: &LayoutOptions, chec
         all_native_stages: id == "deepseek_v4",
     };
     let admitted_rows = report.prefill_rows;
-    let shape = Shape::resolve(report, model.as_ref(), options, policy);
+    let shape = Shape::resolve(report, model.as_ref(), &mut options.clone(), policy);
     report.prefill_rows = admitted_rows;
     let ranks = if id == "deepseek_v41" || options.head_split { options.rtx_bytes.len().clamp(1, 2) } else { 1 };
     let selected = CacheOptions { coordinator_ranks: ranks,
@@ -1166,13 +1177,22 @@ pub(crate) fn charge_host(report: &mut PlanReport, options: &LayoutOptions, chec
     let family = report.family.as_deref().unwrap_or("");
     let (total, available) = options.host_memory.map_or_else(
         crate::formats::mapped_preload::host_memory, Ok)?;
-    let rows = if family == "deepseek_v41" {
-        let requested = if options.prefill_rows == 0 { 2048 } else { options.prefill_rows };
-        u64::from(cuteafd_core::coordinator_programs::v41_live_rows(u32::try_from(requested)?)
-            .context("invalid V4.1 live prefill rows for host admission")?)
-    } else { report.prefill_rows.unwrap_or(options.prefill_rows.max(4096)) };
     // Native plans keep only coordinator devices in their memory layout.
     let ranks = report.spark_ranks;
+    let rows = report.prefill_rows.unwrap_or(options.prefill_rows.max(4096));
+    // Scoring retains the span; wire/router scratch serves one explicit unit.
+    // The live return slots alone multiply by the number of waves.
+    ensure!(ranks == 0 || options.prefill_unit_rows.is_some(),
+        "{family} Spark host admission requires family-resolved prefill_unit_rows (span {rows}, waves {})",
+        options.prefill_waves);
+    let unit_rows = options.prefill_unit_rows.unwrap_or(rows);
+    let intake_rows = if options.prefill_waves == 1 {
+        ensure!(ranks == 0 || (1..=4096).contains(&unit_rows),
+            "{family} Spark host admission needs prefill_unit_rows in 1..=4096, got {unit_rows}");
+        unit_rows
+    } else {
+        crate::serving_capacity::PrefillShape { unit_rows, waves: options.prefill_waves }.validate()?.slot_rows()
+    };
     let lanes = match family {
         "glm5" => if options.prefill_lanes > 0 { options.prefill_lanes } else {
             glm_prefill_lanes(std::env::var("CUTEAFD_GLM_PREFILL_LANES").ok().as_deref()) as u64 },
@@ -1204,7 +1224,7 @@ pub(crate) fn charge_host(report: &mut PlanReport, options: &LayoutOptions, chec
         let bf16 = native || matches!(family, "glm5" | "qwen4");
         let ingress = if native { SparkIngress::Fp8K32 } else if bf16 { SparkIngress::Bf16 }
             else { SparkIngress::Fp8K32 };
-        let endpoint = SparkEndpoint { capacity: u32::try_from(rows)?, ingress };
+        let endpoint = SparkEndpoint { capacity: u32::try_from(unit_rows)?, ingress };
         let (request, response) = endpoint.wire_bytes(geometry).context("host wire size overflow")?;
         let rings = SparkRings { max_frame_bytes: (64 << 20).max(request).max(response),
             depth: 8, slot_bytes: 8 << 20, alignment: 4096 };
@@ -1213,12 +1233,12 @@ pub(crate) fn charge_host(report: &mut PlanReport, options: &LayoutOptions, chec
             .context("coordinator host rings overflow")?;
         push(Category::Transport, "transport/rdma-rings", "registered", bytes, Basis::Formula);
         // Host-mode intake is the upper bound; auto/GPU landing can use less.
-        let intake = rows.checked_mul(hidden).and_then(|n| n.checked_mul(if native { 4 } else { 2 }))
+        let intake = intake_rows.checked_mul(hidden).and_then(|n| n.checked_mul(if native { 4 } else { 2 }))
             .and_then(|n| n.checked_mul(ranks as u64)).and_then(|n| n.checked_mul(endpoints as u64))
             .context("coordinator intake overflow")?;
         push(Category::Transport, "spark-intake", "host-mode upper bound", intake, Basis::Estimated);
     }
-    let work_rows = rows.checked_mul(lanes).and_then(|n| n.checked_add(64)).context("host workspace rows overflow")?;
+    let work_rows = unit_rows.checked_mul(lanes).and_then(|n| n.checked_add(64)).context("host workspace rows overflow")?;
     let router = work_rows.checked_mul(hidden.checked_mul(2).and_then(|n| n.checked_add(topk * 8))
         .context("host routing stride overflow")?).context("host routing workspace overflow")?;
     push(Category::Workspace, "workspace/router", "BF16 upper bound", router, Basis::Estimated);

@@ -84,6 +84,10 @@ pub fn native_plan(snapshot: &Path, selected: &str, dense: &Path,
     ensure!(matches!(speculator, "off" | "dflash2"), "EXLR8 native deployment supports off or dflash2 speculation");
     let mut resolved_layout = options.layout.clone().context("EXLR8 native deployment requires --layout")?;
     resolved_layout.glm5_drafter_disabled = speculator == "off";
+    if resolved_layout.prefill_waves == 1 && resolved_layout.prefill_unit_rows.is_none() {
+        resolved_layout.prefill_unit_rows = Some(if resolved_layout.prefill_rows == 0 { 4096 }
+            else { resolved_layout.prefill_rows });
+    }
     let layout = &resolved_layout;
     let gpu_count = layout.rtx_bytes.len();
     ensure!((1..=2).contains(&gpu_count), "EXLR8 native deployment requires 1..=2 RTX GPUs");

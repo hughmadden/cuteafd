@@ -11,7 +11,7 @@ use super::*;
 const SPARK: SparkCharges = SparkCharges { host_bytes: None, wave_bytes: gib(190), basis: Basis::Calibrated };
 
 pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyModel,
-    input: &crate::plan::PlanInput, options: &LayoutOptions) -> MemoryLayout {
+    input: &crate::plan::PlanInput, options: &mut LayoutOptions) -> MemoryLayout {
     let checkpoint = input.checkpoint();
     let mut shape = Shape::resolve(report, model, options, ShapePolicy::manifest_bounded());
     let gpus = options.rtx_bytes.len().clamp(1, 2);

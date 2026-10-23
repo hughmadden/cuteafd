@@ -4,7 +4,7 @@ use crate::placement::{self, families::glm5_flash as glmf, Baseline, Onboard};
 use crate::families::glm5_flash::{GlmNextConfig, resident};
 
 pub(crate) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyModel,
-    input: &super::super::PlanInput, options: &LayoutOptions) -> MemoryLayout {
+    input: &super::super::PlanInput, options: &mut LayoutOptions) -> MemoryLayout {
     let shape = Shape::resolve(report, model, options, ShapePolicy::manifest_bounded());
     let (manifest, rows, sequences, context, weight_budget) = (shape.manifest.as_ref(), shape.prefill_rows,
         shape.concurrency, shape.context_tokens, options.weight_budget_bytes);
