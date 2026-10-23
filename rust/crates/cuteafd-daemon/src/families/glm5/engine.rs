@@ -1775,7 +1775,10 @@ impl<'a> GlmEngine<'a> {
             } else { [tables.clone(), tables.clone()] });
         }
         *self.context_units.borrow_mut() = vec![[context::ContextUnit::default(); 2]; lanes.len()];
-        if let Some(pair) = &self.tp2 { pair.begin_checks(&counts, self.force_route_check.get())?; }
+        // TP2 route diagnostics key their staging by (layer, lane): only calls whose
+        // units each own a slot take part (others leave `checking` off).
+        let route_checks = lanes.len() <= waves;
+        if let (Some(pair), true) = (&self.tp2, route_checks) { pair.begin_checks(&counts, self.force_route_check.get())?; }
         if self.layer_execution.is_some() {
             ensure!(lanes.len() <= waves, "owned-attention prefill takes one unit per slot");
             for (unit, w) in workspaces.iter().enumerate() {
@@ -1913,10 +1916,12 @@ impl<'a> GlmEngine<'a> {
             crate::shared::prefill_pipeline::Unit { index: unit, sequence: 0,
                 rows: starts[unit]..starts[unit] + counts[unit], layers: 0..layers.len(), slot: unit % waves, barrier: false }
         }).collect();
-        let mut hooks = UnitHooks { engine: self, workspaces: &workspaces, layers, counts: &counts,
+        let peers: Vec<Option<&Workspace<'_>>> = (0..waves).map(|slot| peer_workspaces.as_ref()
+            .map(|p| p.get(slot)).transpose()).collect::<Result<_>>()?;
+        let mut hooks = UnitHooks { engine: self, workspaces: &workspaces, peers: &peers, layers, counts: &counts,
             begin: &begin, attention: &attention, post: &post, link, runtime, cap, waves };
         crate::shared::prefill_pipeline::run_prefill_units(&mut hooks, &unit_list, waves)?;
-        if let Some(pair) = &self.tp2 { pair.finish_checks()?; }
+        if let (Some(pair), true) = (&self.tp2, route_checks) { pair.finish_checks()?; }
         // The last unit's workspace holds the call's last rows.
         let last = lanes.len() - 1;
         self.prefill_logits(&[workspaces[last % waves]], &[counts[last]], logit_rows)
@@ -2260,6 +2265,8 @@ pub(crate) fn print_mla_check(layer: usize, stats: &[[f64; 3]; 5]) {
 struct UnitHooks<'h, 'e, 'a, 'l, 'r, B, A, P> {
     engine: &'h GlmEngine<'a>,
     workspaces: &'h [&'h Workspace<'e>],
+    /// Rank 1's workspace per slot (borrowed once for the call).
+    peers: &'h [Option<&'h Workspace<'e>>],
     layers: &'h [GlmLayer<'a>],
     counts: &'h [usize],
     begin: &'h B,
@@ -2291,8 +2298,7 @@ where B: Fn(usize) -> Result<()>,
     fn local_ffn(&mut self, layer: usize, unit: &crate::shared::prefill_pipeline::Unit) -> Result<()> {
         let slot = unit.index % self.waves;
         if self.engine.tp2_layer(layer) {
-            let peers = self.engine.peer_workspaces(false, self.waves)?;
-            let w1 = peers.as_ref().context("TP2 peer workspaces")?.get(slot)?;
+            let w1 = self.peers[slot].context("TP2 peer workspaces")?;
             self.engine.tp2_pair(layer, slot, self.workspaces[slot], w1, self.counts[unit.index], self.cap)?;
         }
         (self.post)(layer, unit.index, None)
