@@ -8,25 +8,56 @@ use cuteafd_api::openai::NativeRequest;
 use cuteafd_engine::{media::{EncodeJob, EmbeddingCache, MediaAdmission, MediaKeys, RequestMedia},
     prefix::{PrefixCache, PrefixConfig, PrefixFamily}};
 use cuteafd_ffi::NativeLibrary;
-use std::{cell::RefCell, path::Path};
+use std::{cell::RefCell, path::Path, rc::Rc};
+use crate::shared::{fp8_linear::{Fp8Rows, Fp8Scales}, speculation::{
+    block_dspark::{self, DsparkDrafter}, dflash::{ContextRow, DraftSeq, TargetHead, TAP_ROWS}}};
+use cuteafd_ffi::CuteafdDeviceBuffer;
+
+fn draft_geometry(layers: usize, slots: usize, rows: usize, width: usize) -> cuteafd_core::PolicyGeometry {
+    cuteafd_core::PolicyGeometry {
+        layers: vec![cuteafd_core::LayerResource { class: None, slice_bytes: 0., group_rows: 1, timed: false }; layers],
+        group_rows_by_rows: vec![vec![1; layers]; rows + 1], experts: 0, topk: 0, max_requests: slots,
+        max_positions: rows, widths: vec![width], classes: vec![cuteafd_core::ResourceClass::rtx()], regimes: 1,
+    }
+}
 
 #[derive(Default)]
-pub(crate) struct DraftState;
+struct DenseProbe { routes: Option<RoundRoutes> }
+impl DenseProbe {
+    fn arm(&mut self, layers: usize) { self.routes = Some(RoundRoutes::new(layers, 0)); }
+    fn begin(&mut self, rows: usize) {
+        if let Some(routes) = &mut self.routes {
+            routes.begin(rows);
+            for layer in 0..routes.layers() { routes.dense(layer).expect("admitted dense layer"); }
+        }
+    }
+    fn finish<T>(&self, observe: impl FnOnce(&RoundRoutes, &[Option<f64>]) -> T) -> Option<T> {
+        // Dense layers have no expert timings: the complete measured round
+        // teaches the shared policy's bucket-local verifier residual instead.
+        self.routes.as_ref().map(|routes| observe(routes, &[]))
+    }
+}
+
+#[derive(Default)]
+pub(crate) struct DraftState { anchor: Option<u32> }
 impl scheduler::DraftState for DraftState {
     fn pending_rows(&self) -> usize { 0 }
-    fn close(&mut self, _token: u32) {}
+    fn close(&mut self, token: u32) { self.anchor = Some(token); }
 }
 
 pub(crate) struct DenseBackend<'e, 'a> {
     pub engine: &'e RefCell<DenseEngine<'a>>,
     pub library: &'a NativeLibrary,
+    drafter: Option<Rc<DsparkDrafter<'a>>>,
     profile: RefCell<[f64; 2]>,
     pending: RefCell<Option<DenseMark<'a>>>,
+    probe: RefCell<DenseProbe>,
 }
 
 impl<'e, 'a> DenseBackend<'e, 'a> {
     pub fn new(engine: &'e RefCell<DenseEngine<'a>>, library: &'a NativeLibrary) -> Self {
-        Self { engine, library, profile: RefCell::new([0.0; 2]), pending: RefCell::new(None) }
+        Self { engine, library, drafter: None, profile: RefCell::new([0.0; 2]), pending: RefCell::new(None),
+            probe: RefCell::new(DenseProbe::default()) }
     }
 }
 
@@ -42,22 +73,23 @@ impl<'e, 'a> Backend<'a> for DenseBackend<'e, 'a> {
     fn geometry(&self) -> scheduler::Geometry {
         let engine = self.engine.borrow();
         scheduler::Geometry { family: "qwen3_5", vocab_size: engine.cfg.vocab, max_context: engine.cfg.max_context,
-            slots: engine.slot_count(), prefill_rows: 4096, decode_rows: engine.decode_rows(), full_prefill_logits: engine.full_prefill_logits() }
+            slots: engine.slot_count(), prefill_rows: if self.drafter.is_some() { TAP_ROWS } else { 4096 }, decode_rows: engine.decode_rows(), full_prefill_logits: engine.full_prefill_logits() }
     }
     fn library(&self) -> &'a NativeLibrary { self.library }
     fn profile(&self) -> &RefCell<[f64; 2]> { &self.profile }
     fn prefix_cache(&self, args: &PrefixArgs, lanes: usize) -> Result<(Self::Prefix, PrefixCache<CudaCopyEngine<'a>>)> {
         ensure!(args.prefix_partial == Toggle::Off, "dense Qwen supports exact prefix frontiers only");
-        let family = DensePrefix::new(self.engine)?;
+        let family = DensePrefix::with_draft(self.engine, self.drafter.clone())?;
         let layout = family.layout();
         let shape = self.geometry();
         let args = &args.with_scoring(if shape.full_prefill_logits { shape.prefill_rows } else { shape.decode_rows },
             shape.prefill_rows, shape.vocab_size)?;
         let host = args.host_config(layout, shape.max_context, lanes)?.map(|config|
-            CudaCopyEngine::registered_owned(self.library, family.snapshot_owners()).map(|copy| (config, copy))).transpose()?;
+            CudaCopyEngine::registered_retained(self.library, family.snapshot_owners(),
+                self.drafter.iter().cloned().map(|draft| draft as Rc<dyn crate::shared::prefix::cuda_copy::SnapshotOwner + 'a>).collect()).map(|copy| (config, copy))).transpose()?;
         let config = PrefixConfig { entries: args.prefix_cache_entries, mark_slots: family.slots(),
             keep_logits: true, min_tokens: args.prefix_cache_min_tokens };
-        let cache = PrefixCache::new(layout, config, host)?;
+        let cache = PrefixCache::new_with_draft_pages(layout, config, host, family.draft_page_bytes())?;
         Ok((family, cache))
     }
     fn prepare(&self, job: NativeRequest, tokens: Vec<u32>) -> Result<(scheduler::Prompt, RequestMedia, Vec<EncodeJob>)> {
@@ -97,7 +129,29 @@ impl<'e, 'a> Backend<'a> for DenseBackend<'e, 'a> {
         let mut engine = self.engine.borrow_mut();
         ensure!(engine.slot_position(placement.slot)? == placement.len, "dense prefill placement/state frontier differs");
         engine.bind_slot(placement.slot, &placement.units)?;
-        let output = engine.prefill_device(placement.slot, tokens, logit_rows)?;
+        let mut output = None;
+        // Each tap tile is consumed before the target reuses its residual plane.
+        let tile = if self.drafter.is_some() { TAP_ROWS } else { tokens.len() };
+        for (index, chunk) in tokens.chunks(tile).enumerate() {
+            let first = index * tile;
+            let end = first + chunk.len();
+            let head_first = tokens.len() - logit_rows;
+            ensure!(logit_rows <= chunk.len() || head_first >= end,
+                "dense tapped prefill requires bounded scoring rows");
+            output = Some(engine.prefill_tapped(placement.slot, chunk,
+                if end == tokens.len() { logit_rows } else { 0 }, |layer, hidden| {
+                    if let Some(draft) = &self.drafter {
+                        draft.tap_streams_at(layer, hidden.ptr, 1, 0, chunk.len(), 0)?;
+                    }
+                    Ok(())
+                })?);
+            if let Some(draft) = &self.drafter {
+                let rows = (0..chunk.len()).map(|tap_row| ContextRow { tap_row, slot: placement.slot,
+                    position: placement.len + first + tap_row }).collect::<Vec<_>>();
+                draft.update(&rows)?;
+            }
+        }
+        let output = output.context("empty dense prefill")?;
         placement.len += tokens.len();
         placement.state_len = placement.len;
         Ok((logit_rows > 0).then_some(output))
@@ -114,17 +168,28 @@ impl<'e, 'a> Backend<'a> for DenseBackend<'e, 'a> {
             rows.extend(tokens.iter().enumerate().map(|(offset, &token)| VerifyRow {
                 slot: placement.slot, position: placement.len + offset, token: Some(token) }));
         }
-        let request = VerifyRequest { rows: &rows, tap_layers: &[] };
+        let request = VerifyRequest { rows: &rows,
+            tap_layers: self.drafter.as_ref().map_or(&[], |draft| draft.cfg.taps.as_slice()) };
         let output = if speculative {
             let mark = engine.checkpoint(&slots)?;
             let output = match engine.verify(&mark, request) {
-                Ok(output) => output.logits,
+                Ok(output) => {
+                    if let Some(draft) = &self.drafter {
+                        // SAFETY: enqueue reads on the producer stream before commit invalidates taps.
+                        unsafe { draft.capture_target_taps(output.taps, 0, rows.len(), 0)?; }
+                    }
+                    output.logits
+                },
                 Err(error) => { engine.restore(&mark)?; return Err(error); }
             };
             *self.pending.borrow_mut() = Some(mark);
             output
         } else {
             let output = engine.decode_device(&slots, request)?;
+            if let Some(draft) = &self.drafter {
+                // SAFETY: the target retains these taps until its next mutable operation.
+                unsafe { draft.capture_target_taps(engine.verify_taps(), 0, rows.len(), 0)?; }
+            }
             for (placement, tokens) in sequences {
                 placement.len += tokens.len();
                 placement.state_len = placement.len;
@@ -134,24 +199,84 @@ impl<'e, 'a> Backend<'a> for DenseBackend<'e, 'a> {
         Ok(Some(output))
     }
     fn verify_device_ungraphed(&self, sequences: &mut [(&mut Placement, &[u32])], speculative: bool,
-        _kind: scheduler::UngraphedKind, pool: &cuteafd_engine::prefix::RefPagePool) -> Result<Option<DeviceLogits>> {
-        self.verify_device(sequences, speculative, pool)
+        kind: scheduler::UngraphedKind, pool: &cuteafd_engine::prefix::RefPagePool) -> Result<Option<DeviceLogits>> {
+        let rows = sequences.iter().flat_map(|(placement, tokens)|
+            tokens.iter().enumerate().map(|(offset, _)| (placement.slot, placement.len + offset))).collect::<Vec<_>>();
+        let output = self.verify_device(sequences, speculative, pool)?;
+        if kind == scheduler::UngraphedKind::Scoring {
+            ensure!(!speculative, "dense scoring cannot leave speculative state");
+            if let Some(draft) = &self.drafter {
+                draft.update(&rows.into_iter().enumerate().map(|(tap_row, (slot, position))|
+                    ContextRow { tap_row, slot, position }).collect::<Vec<_>>())?;
+            }
+        }
+        Ok(output)
     }
     fn verify_bucket_rows(&self, rows: usize, _speculative: bool, _diagnostic: bool) -> usize { rows }
     fn verify_attention_trace(&self, contexts: &[Vec<usize>], rows: usize) -> serde_json::Value {
         serde_json::json!({"kind":"causal_gqa", "rows":rows, "contexts":contexts})
     }
-    fn draft_geometry(&self, _snapshot: &Path, _width: usize) -> Result<cuteafd_core::PolicyGeometry> {
-        anyhow::bail!("dense drafter adapter is not yet qualified")
+    fn draft_geometry(&self, _snapshot: &Path, width: usize) -> Result<cuteafd_core::PolicyGeometry> {
+        let draft = self.drafter.as_ref().context("dense serving has no drafter")?;
+        ensure!(width <= draft.cfg.drafts(), "dense draft width exceeds checkpoint");
+        let engine = self.engine.borrow();
+        Ok(draft_geometry(engine.cfg.attention.len(), draft.max_sequences, engine.decode_rows(), width))
     }
-    fn arm_draft_probe(&self) -> Result<()> { anyhow::bail!("dense drafter adapter is not yet qualified") }
-    fn prefill_draft(&self, _placement: &Placement, _start: usize, _chunk: &[u32], _next: Option<u32>, _draft: &mut DraftState) -> Result<()> {
-        anyhow::bail!("dense drafter adapter is not yet qualified")
+    fn arm_draft_probe(&self) -> Result<()> {
+        self.probe.borrow_mut().arm(self.engine.borrow().cfg.attention.len());
+        Ok(())
     }
-    fn draft(&self, _sequences: &mut [scheduler::DraftSeq<'_, Placement, DraftState>], _timing: &mut scheduler::DraftTiming)
-        -> Result<Vec<Vec<u32>>> { anyhow::bail!("dense drafter adapter is not yet qualified") }
+    fn prefill_draft(&self, _placement: &Placement, _start: usize, _chunk: &[u32], next: Option<u32>, draft: &mut DraftState) -> Result<()> {
+        draft.anchor = next;
+        Ok(())
+    }
+    fn draft(&self, sequences: &mut [scheduler::DraftSeq<'_, Placement, DraftState>], timing: &mut scheduler::DraftTiming)
+        -> Result<Vec<Vec<u32>>> {
+        let draft = self.drafter.as_ref().context("dense serving has no drafter")?;
+        let mut proposed = vec![Vec::new(); sequences.len()];
+        let selected = sequences.iter().enumerate().filter(|(_, sequence)| sequence.depth > 0).collect::<Vec<_>>();
+        if selected.is_empty() { return Ok(proposed); }
+        let rows = selected.iter().map(|(_, sequence)| Ok(DraftSeq {
+            slot: sequence.placement.slot, anchor: sequence.seq.anchor.context("dense draft has no anchor")?,
+            position: sequence.placement.len, valid_from: 0,
+        })).collect::<Result<Vec<_>>>()?;
+        let engine = self.engine.borrow();
+        let start = std::time::Instant::now();
+        let device_id = engine.target_stream().device.id;
+        let head = TargetHead::Launch(Box::new(|hidden, logits, rows, stream| {
+            ensure!(stream == engine.target_stream().raw, "dense draft head stream differs");
+            for first in (0..rows).step_by(64) {
+                let count = (rows - first).min(64);
+                engine.target_head(CuteafdDeviceBuffer {
+                    ptr: hidden.cast::<u8>().wrapping_add(first * engine.cfg.hidden * 2).cast_mut().cast(),
+                    bytes: count * engine.cfg.hidden * 2, device_id, ..Default::default()
+                }, CuteafdDeviceBuffer {
+                    ptr: logits.wrapping_add(first * engine.cfg.vocab).cast(),
+                    bytes: count * engine.cfg.vocab * 4, device_id, ..Default::default()
+                }, count)?;
+            }
+            Ok(())
+        }));
+        let output = draft.draft_device(&rows, engine.token_embedding(), head)?;
+        timing.steps += 1;
+        timing.seconds += start.elapsed().as_secs_f64();
+        for ((index, sequence), output) in selected.into_iter().zip(output) {
+            proposed[index] = output.tokens.into_iter().take(sequence.depth).collect();
+        }
+        Ok(proposed)
+    }
     fn accept(&self, verified: &mut [scheduler::Verified<'_, Placement, DraftState, ()>], speculative: bool) -> Result<()> {
-        ensure!(!verified.iter().any(|v| v.neural), "dense drafter adapter is not yet qualified");
+        if let Some(draft) = &self.drafter {
+            let rows = verified.iter().flat_map(|sequence| {
+                let count = if speculative { sequence.kept.map_or(0, |(rows, _)| rows) } else { sequence.rows.len() };
+                (0..count).map(move |offset| ContextRow { tap_row: sequence.first_row + offset,
+                    slot: sequence.placement.slot, position: sequence.start + offset })
+            }).collect::<Vec<_>>();
+            draft.update(&rows)?;
+            for sequence in verified.iter_mut() {
+                if let Some((_, token)) = sequence.kept { sequence.seq.anchor = Some(token); }
+            }
+        }
         if !speculative {
             ensure!(self.pending.borrow().is_none(), "dense plain accept has pending speculative state");
             for sequence in verified {
@@ -175,9 +300,16 @@ impl<'e, 'a> Backend<'a> for DenseBackend<'e, 'a> {
         }
         Ok(())
     }
-    fn probe_begin(&self, _rows: usize) {}
+    fn cancel(&self, placement: &Placement) -> Result<()> {
+        self.require_live()?;
+        if let Some(draft) = &self.drafter { draft.discard_context(placement.slot)?; }
+        Ok(())
+    }
+    fn probe_begin(&self, rows: usize) { self.probe.borrow_mut().begin(rows); }
     fn probe_end(&self) {}
-    fn probe_finish<T>(&self, _observe: impl FnOnce(&RoundRoutes, &[Option<f64>]) -> T) -> Option<T> { None }
+    fn probe_finish<T>(&self, observe: impl FnOnce(&RoundRoutes, &[Option<f64>]) -> T) -> Option<T> {
+        self.probe.borrow().finish(observe)
+    }
 }
 
 #[derive(Debug, Clone, clap::Args)]
@@ -198,6 +330,11 @@ pub(crate) struct ServeArgs {
     /// Admit a full prefill batch of vocabulary logits for quality scoring.
     #[arg(long)]
     pub full_prefill_logits: bool,
+    /// External checkpoint-native BF16 block dSpark; the launcher resolves its default.
+    #[arg(long)]
+    pub draft: Option<std::path::PathBuf>,
+    #[arg(long)]
+    pub draft_fixed: Option<usize>,
     #[arg(long, default_value = "0.0.0.0:8000")]
     pub listen: String,
     #[arg(long, default_value_t = 32768)]
@@ -246,11 +383,32 @@ pub(crate) async fn run_serve(args: ServeArgs) -> Result<()> {
             library.cuda_set_device(engine_args.device)?;
             let programs = library.programs()?.with_manifest(&engine_args.manifest)?;
             let lanes = usize::from(engine_args.max_sequences);
+            let draft_config = engine_args.draft.as_ref().map(|snapshot| {
+                block_dspark::check_checkpoint(snapshot, header.config.hidden, header.config.vocab, header.config.attention.len())?;
+                let config = serde_json::from_slice(&std::fs::read(snapshot.join("config.json"))?)?;
+                super::engine::DrafterBytes::block_dspark(&config, lanes, library.sm_count()? as u64, header.config.max_context)
+            }).transpose()?;
+            ensure!(engine_args.draft_fixed.is_none() || engine_args.draft.is_some(), "--draft-fixed requires --draft");
             let engine = RefCell::new(DenseEngine::with_prefix(&library, &programs, &checkpoint,
-                header.config, engine_args.pool_tokens.filter(|&tokens| tokens > 0), None, lanes, Some(engine_args.prefix.mark_rule(lanes)), engine_args.kv_cache, engine_args.full_prefill_logits)?);
-            let backend = DenseBackend::new(&engine, &library);
+                header.config, engine_args.pool_tokens.filter(|&tokens| tokens > 0), draft_config, lanes, Some(engine_args.prefix.mark_rule(lanes)), engine_args.kv_cache, engine_args.full_prefill_logits)?);
+            let mut backend = DenseBackend::new(&engine, &library);
+            let drafts = if let Some(snapshot) = &engine_args.draft {
+                let target = engine.borrow();
+                let config = block_dspark::DsparkConfig::read(snapshot)?;
+                let weights = block_dspark::prefetch(snapshot).join().map_err(|_| anyhow::anyhow!("draft loader panicked"))??;
+                let mask = target.token_embedding().host_rows(&[config.mask_token])?;
+                let draft = Rc::new(DsparkDrafter::load_paged(&library, snapshot, weights, target.target_stream().raw,
+                    lanes, lanes, mask, cuteafd_loader::families::glm5::draft_representation::GlmDraftRepresentation::Bf16Only,
+                    Fp8Scales::Amax, Fp8Rows::W8a16, target.cfg.max_context, target.pool_tokens,
+                    cuteafd_loader::families::qwen4::Qwen4KvCache::Bf16)?);
+                draft.prepare_workspace()?;
+                let depth = engine_args.draft_fixed.unwrap_or(config.drafts());
+                ensure!(depth <= config.drafts(), "--draft-fixed exceeds checkpoint draft block");
+                backend.drafter = Some(draft);
+                scheduler::Drafts::Neural { depth, fixed: engine_args.draft_fixed.is_some() }
+            } else { scheduler::Drafts::None };
             scheduler::schedule(&backend, &engine_args.snapshot, &mut receive, &worker_stats, lanes,
-                scheduler::Drafts::None, eos, engine_args.decode_share, &engine_args.prefix,
+                drafts, eos, engine_args.decode_share, &engine_args.prefix,
                 engine_args.token_io.token_select, &mut text_media(), None, || {
                     if let Some(ready) = ready.take() {
                         let _ = ready.send(Ok(backend.geometry().max_context));
@@ -293,6 +451,43 @@ mod tests {
     struct Cli {
         #[command(flatten)]
         serve: ServeArgs,
+    }
+
+    #[test]
+    fn dense_probe_observes_acceptance_and_costs_only_in_its_concurrency_bucket() {
+        use crate::shared::draft::{clock::RoundTimes, evidence::DraftSource, resource};
+        let mut policy = cuteafd_core::DraftPolicy::seeded(draft_geometry(64, 16, 64, 7),
+            cuteafd_core::PolicySeed::weak(7)).unwrap();
+        let mut probe = DenseProbe::default();
+        assert!(probe.finish(|_, _| ()).is_none());
+        probe.arm(64);
+        for concurrency in [1, 4, 16] {
+            let other = [1, 4, 16].into_iter().filter(|&n| n != concurrency)
+                .map(|n| (n, policy.cost_snapshot(false, n), policy.calibration(n))).collect::<Vec<_>>();
+            let before = policy.cost_snapshot(false, concurrency);
+            let calibration = policy.calibration(concurrency);
+            probe.begin(concurrency * 3);
+            let requests = (0..concurrency).map(|id| resource::Verified { id: id as u64, rows: 3,
+                accepted: 2, source: DraftSource::Neural, prior: Some(&[0.8, 0.8]), features: None,
+                censor: None }).collect::<Vec<_>>();
+            probe.finish(|routes, times| {
+                assert!(routes.flat().is_empty());
+                routes.complete().unwrap();
+                resource::observe_drafted(&mut policy, &requests, routes, times,
+                    RoundTimes { total_us: 2000 * concurrency as u64, draft_us: Some(300) },
+                    7, None, Some(concurrency)).unwrap();
+            }).unwrap();
+            assert_ne!(policy.cost_snapshot(false, concurrency).round, before.round);
+            assert_ne!(policy.cost_snapshot(false, concurrency).draft, before.draft);
+            assert_ne!(policy.calibration(concurrency), calibration);
+            for (n, costs, calibration) in other {
+                assert_eq!(policy.cost_snapshot(false, n), costs);
+                assert_eq!(policy.calibration(n), calibration);
+            }
+        }
+        assert_eq!(policy.stats().rounds, 3);
+        assert_eq!(policy.stats().verified_drafts, 42);
+        assert_eq!(policy.stats().accepted_drafts, 21);
     }
 
     #[test]

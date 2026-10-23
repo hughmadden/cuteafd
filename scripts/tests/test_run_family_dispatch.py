@@ -290,6 +290,31 @@ DENSE_CONFIG = {"model_type": "qwen3_5", "text_config": {
 }}
 
 
+@pytest.mark.parametrize("model", ["Qwen/Qwen3.8-27B", "Qwen/Qwen3.8-27B-FP8"])
+@pytest.mark.parametrize("selection", [None, "off", "dspark"])
+def test_dense_27b_dspark_default_and_explicit_disable(tmp_path, model, selection):
+    config = {**DENSE_CONFIG, "text_config": {**DENSE_CONFIG["text_config"], "hidden_size": 5120}}
+    drafter = "RadixArk/Qwen3.8-27B-DSpark"
+    _snapshot(tmp_path / "hf", drafter, {"speculators_model_type": "dspark"})
+    keys = "SPARK_COUNT=0\n" + (f"SPECULATOR={selection}\n" if selection else "")
+    if selection == "dspark":
+        keys += "SPECULATOR_DRAFTS=3\n"
+    result = _family_launch_result(tmp_path, config, model, keys,
+        extra_args=("--wip", "dense-test"),
+        encoder_plan={"placement_supported": True, "fits": True, "spark_ranks": 0})
+    assert result.returncode == 0, result.stderr
+    launch = shlex.split(next(line for line in result.stderr.splitlines() if "serve-qwen35 --snapshot" in line))
+    plan = shlex.split(next(line for line in result.stderr.splitlines() if "cuteafd plan " in line))
+    assert ("--draft" in launch) == (selection != "off")
+    assert ("--drafter-snapshot" in plan) == (selection != "off")
+    if selection != "off":
+        snapshot = str(tmp_path / "hf" / "hub" / f"models--{drafter.replace('/', '--')}" / "snapshots" / "abc")
+        assert launch[launch.index("--draft") + 1] == snapshot
+        assert plan[plan.index("--drafter-snapshot") + 1] == snapshot
+    if selection == "dspark":
+        assert launch[launch.index("--draft-fixed") + 1] == "3"
+
+
 @pytest.mark.parametrize("cache_keys,entries,boundaries", [
     ("", 20, 1),
     ("PREFIX_CACHE_ENTRIES=4\nPREFIX_CACHE_MARK_MIB=1024\nPREFIX_POINT_BOUNDARIES=2\n", 4, 2),

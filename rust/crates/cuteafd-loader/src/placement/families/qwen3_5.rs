@@ -26,9 +26,24 @@ pub struct LayerBytes {
 pub struct DrafterBytes {
     pub owned: u64,
     pub scratch: u64,
+    /// Full-context draft K/V per target pool page, not per sequence/context.
+    pub pool_unit: u64,
 }
 
 impl DrafterBytes {
+    pub fn block_dspark(config: &serde_json::Value, slots: usize, sms: u64, context: usize)
+        -> anyhow::Result<Self> {
+        use crate::families::glm5::draft_representation::{block_dspark_paged_resident_bytes, GlmDraftRepresentation};
+        use crate::families::qwen4::Qwen4KvCache;
+        let cfg = crate::formats::block_dspark::BlockDsparkConfig::from_json(config)?;
+        ensure!(cfg.window.is_none(), "dense dSpark requires full-context cache");
+        let layout = cfg.paged_cache_layout(slots, context, PAGE_ROWS as usize, Qwen4KvCache::Bf16)?;
+        let (owned, scratch) = block_dspark_paged_resident_bytes(config, slots, slots, sms,
+            GlmDraftRepresentation::Bf16Only, 0, context, PAGE_ROWS as usize, Qwen4KvCache::Bf16)?;
+        Ok(Self { owned: owned.checked_sub(layout.full_bytes).ok_or_else(|| anyhow::anyhow!("draft inventory underflow"))?,
+            scratch, pool_unit: layout.full_bytes })
+    }
+
     fn movable(self) -> Result<Movable, PlacementError> {
         crate::placement::draft::DrafterDemand::local(MovableId::Drafter, vec![Bytes2 { resident: self.owned, staging: 0 },
             Bytes2 { resident: self.scratch, staging: 0 }], 0).movable(1)
@@ -51,13 +66,18 @@ pub struct DenseInputs<'a> {
     pub pool_bounded: Vec<BoundedDemand>,
 }
 
-pub fn request(inputs: DenseInputs<'_>) -> Result<PlacementRequest> {
+pub fn request(mut inputs: DenseInputs<'_>) -> Result<PlacementRequest> {
     ensure!(!inputs.cfg.attention.is_empty() && inputs.layers.len() == inputs.cfg.attention.len(),
         "dense Qwen layer byte inventory differs from checkpoint");
     ensure!(inputs.record_bytes > 0 && inputs.max_context > 0, "invalid dense Qwen cache geometry");
     ensure!(inputs.fixed.iter().all(|item| item.gpu == 0)
         && inputs.pool_bounded.iter().all(|item| item.gpu == 0),
         "single-device dense Qwen demand names a peer");
+    if let Some(draft) = inputs.drafter.filter(|draft| draft.pool_unit > 0) {
+        inputs.pool_bounded.push(BoundedDemand { gpu: 0, category: Category::Drafter,
+            group: "full-context dSpark KV".into(), bytes_per_unit: draft.pool_unit,
+            offset_units: 0, cap_units: u64::MAX, basis: Basis::Exact });
+    }
     let layers = inputs.cfg.attention.iter().zip(inputs.layers).map(|(&kind, bytes)| {
         ensure!(bytes.weights > 0, "dense Qwen layer has no native weight admission");
         let mut extra = Vec::new();
@@ -578,7 +598,7 @@ mod tests {
             LayerBytes { weights: 1 << 30, state: 0, replay: 0, prefix: 0 }];
         let base = solve(&request(inputs(&cfg, &layers, 2 << 30))?)?;
         let mut with_draft = inputs(&cfg, &layers, 2 << 30);
-        with_draft.drafter = Some(DrafterBytes { owned: 3 << 30, scratch: 1 << 30 });
+        with_draft.drafter = Some(DrafterBytes { owned: 3 << 30, scratch: 1 << 30, ..Default::default() });
         let placement = solve(&request(with_draft)?)?;
         assert_eq!(placement.movables, [(MovableId::Drafter, 0)]);
         assert!(placement.pool_tokens < base.pool_tokens && placement.pool_tokens >= 262144);
@@ -586,12 +606,33 @@ mod tests {
             .map(|item| item.bytes).sum();
         assert_eq!(charged, 4 << 30);
         let mut explicit = inputs(&cfg, &layers, 2 << 30);
-        explicit.drafter = Some(DrafterBytes { owned: 3 << 30, scratch: 1 << 30 });
+        explicit.drafter = Some(DrafterBytes { owned: 3 << 30, scratch: 1 << 30, ..Default::default() });
         explicit.requested_pool = Some(base.pool_tokens);
         assert!(solve(&request(explicit)?).is_err());
         let mut overflow = inputs(&cfg, &layers, 0);
-        overflow.drafter = Some(DrafterBytes { owned: u64::MAX, scratch: 1 });
+        overflow.drafter = Some(DrafterBytes { owned: u64::MAX, scratch: 1, ..Default::default() });
         assert!(solve(&request(overflow)?).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn full_context_drafter_kv_tracks_aggregate_pool_pages() -> Result<()> {
+        let cfg = cfg();
+        let layers = [LayerBytes { weights: 1 << 30, state: 1 << 20, replay: 1 << 20, prefix: 0 },
+            LayerBytes { weights: 1 << 30, state: 0, replay: 0, prefix: 0 }];
+        for tokens in [262144, 524288] {
+            let mut input = inputs(&cfg, &layers, 0);
+            input.requested_pool = Some(tokens);
+            input.drafter = Some(DrafterBytes { owned: 1 << 30, scratch: 1 << 20, pool_unit: 64 * 20480 });
+            let req = request(input)?;
+            assert_eq!(req.pool_bounded.len(), 1);
+            assert_eq!(req.pool_bounded[0].bytes(tokens / PAGE_ROWS)?, tokens * 20480);
+            let placement = solve(&req)?;
+            assert_eq!(placement.pool_tokens, tokens);
+            let charged: u64 = placement.items[0].iter().filter(|item| item.category == Category::Drafter)
+                .map(|item| item.bytes).sum();
+            assert_eq!(charged, (1 << 30) + (1 << 20) + tokens * 20480);
+        }
         Ok(())
     }
 
