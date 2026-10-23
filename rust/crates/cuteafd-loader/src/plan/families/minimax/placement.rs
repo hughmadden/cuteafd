@@ -40,8 +40,22 @@ pub(super) fn cache_geometry(cfg: &MiniMaxM3Config, options: CacheOptions) -> Re
 pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut PlanReport,
     opts: &crate::plan::layout::LayoutOptions, requested: ExpertPlacement) -> anyhow::Result<MemoryLayout> {
     let path = opts.workspace_manifest.as_deref().unwrap_or_else(|| std::path::Path::new("/opt/cuteafd/share/PROGRAMS.json"));
-    if opts.workspace_manifest.is_none() && !path.is_file() { return Ok(header_layout(model, report, opts, requested)); }
-    exact_layout(model, input, report, opts, requested, path)
+    if opts.workspace_manifest.is_none() && !path.is_file() {
+        anyhow::ensure!(!opts.minimax_cache.proposed() && !opts.minimax_5090,
+            "MiniMax cache proposals and 5090 profile require --workspace-manifest");
+        return Ok(header_layout(model, report, opts, requested));
+    }
+    let mut base = opts.clone();
+    if opts.minimax_5090 {
+        anyhow::ensure!(opts.native_mtp_layers > 0, "MiniMax 5090 profile requires the bundled DSpark");
+        if base.prefill_rows == 0 { base.prefill_rows = 256; }
+        if base.concurrency == 0 { base.concurrency = 1; }
+    }
+    if opts.minimax_cache.proposed() { base.pool_tokens = None; }
+    let mut memory = exact_layout(model, input, report, &base, requested, path)?;
+    if opts.minimax_5090 { memory.notes.push("Opt-in 5090 C1 sizing: prefill rows and sequence slots only; DSpark stays on; C1 performance unmeasured".into()); }
+    if opts.minimax_cache.proposed() { super::capacity::apply(model.cfg(), &mut memory, report, opts)?; }
+    Ok(memory)
 }
 
 fn header_layout(model: &Model, report: &mut PlanReport, opts: &crate::plan::layout::LayoutOptions,
@@ -215,7 +229,6 @@ fn exact_layout(model: &Model, input: &crate::plan::PlanInput, report: &mut Plan
     use admission::{AdmissionError, Reservations, RuntimeLedger, RuntimeSizing};
     ensure!(model.complete, "MiniMax native admission requires complete checkpoint headers");
     ensure!(opts.rtx_bytes.len() == 1, AdmissionError::Unsupported("two-GPU serving"));
-    ensure!(!opts.host_embedding, AdmissionError::Unsupported("host embedding"));
     ensure!(opts.drafter_bytes == 0, AdmissionError::Unsupported("external drafter; use the bundled DSpark"));
     ensure!(report.requested_attention.is_none_or(|p| p == AttentionPlacement::Heads), AdmissionError::Unsupported("attention placement"));
     ensure!(report.audio == MediaMode::Off, AdmissionError::Unsupported("audio"));
@@ -226,6 +239,8 @@ fn exact_layout(model: &Model, input: &crate::plan::PlanInput, report: &mut Plan
         cfg.max_position as u64 } else { opts.context_tokens }, spark_ranks: requested.spark_ranks() };
     sizing.validate(cfg)?;
     ensure!(opts.state_slots.is_none_or(|n| n == sequences as u64), AdmissionError::Unsupported("sequence-slot mismatch"));
+    ensure!(opts.draft_context_slots.is_none_or(|n| n == sequences as u64),
+        AdmissionError::Unsupported("draft context slots must equal max sequences; rings use scheduler slot IDs"));
     let arch = ArchContext::coordinator(opts.rtx_bytes[0], None);
     let draft = if opts.native_mtp_layers > 0 {
         let contract = DsparkContract::open(&input.checkpoint().snapshot).context("MiniMax bundled DSpark")?;
@@ -248,6 +263,7 @@ fn exact_layout(model: &Model, input: &crate::plan::PlanInput, report: &mut Plan
         .transpose()?.unwrap_or(512 << 20);
     let spark_scratch_basis = if spark_manifest.is_some() { Basis::Exact } else { Basis::Estimated };
     let weights = super::coordinator::RankWeightLayout::from_checkpoint(input.checkpoint(), 0, 1)?;
+    let weights = if opts.host_embedding { weights.with_host_embedding(input.checkpoint())? } else { weights };
     let catalog = input.expert_catalog()?;
     let layers = cfg.moe.iter().enumerate().filter_map(|(l, &m)| m.then_some(l)).collect::<Vec<_>>();
     let resident = |selected: &[usize], world, rank| -> anyhow::Result<u64> {
@@ -355,6 +371,12 @@ fn exact_layout(model: &Model, input: &crate::plan::PlanInput, report: &mut Plan
         ensure!(used <= budget, "MiniMax Spark rank {rank} needs {used} bytes, budget {budget}");
         *report.bytes_by_owner.entry("routed expert weights".into()).or_default() += assigned.resident_bytes;
         memory.devices.push(DeviceLayout { kind: DeviceKind::Spark, index: rank as u32, capacity_bytes: budget, items, kv_tokens: 0 });
+    }
+    memory.notes.push(format!("MiniMax shape: prefill {rows}, sequences {sequences}, decode tile {}, context {}; exported scratch is not scaled by runtime rows",
+        programs.decode_capacity(), sizing.context));
+    if opts.host_embedding {
+        report.bytes_by_owner.insert("host-mapped embedding".into(), edge(Component::Embedding));
+        memory.notes.push("embedding placement: host (mapped BF16); untied LM head remains on GPU".into());
     }
     report.prefill_rows = Some(rows as u64);
     report.attention_placement = AttentionPlacement::Heads;

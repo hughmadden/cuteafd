@@ -47,23 +47,29 @@ fn options(args: &PlanArgs) -> Result<PlanOptions, PlanError> {
                 spark_allocation_budget_bytes: args.spark_budget_gib
                     .map(|gib| budget_bytes("--spark-budget-gib", gib)).transpose()?,
                 pool_tokens: args.pool_tokens,
-                dense_qwen_kv: args.kv_format.map(|format| match format {
+                dense_qwen_kv: args.kv_format.map(|format| match format.resident() {
                     cuteafd_core::MlaCacheFormat::Bf16 => cuteafd_loader::families::qwen4::Qwen4KvCache::Bf16,
                     cuteafd_core::MlaCacheFormat::Fp8 => cuteafd_loader::families::qwen4::Qwen4KvCache::Fp8,
                 }).unwrap_or(cuteafd_loader::families::qwen4::Qwen4KvCache::Fp8),
-                qwen_kv: args.kv_format.map(|format| match format {
+                qwen_kv: args.kv_format.map(|format| match format.resident() {
                     cuteafd_core::MlaCacheFormat::Bf16 => cuteafd_loader::families::qwen4::Qwen4KvCache::Bf16,
                     cuteafd_core::MlaCacheFormat::Fp8 => cuteafd_loader::families::qwen4::Qwen4KvCache::Fp8,
                 }).unwrap_or_default(),
-                step5_kv: args.kv_format.map(|format| match format {
+                step5_kv: args.kv_format.map(|format| match format.resident() {
                     cuteafd_core::MlaCacheFormat::Bf16 => cuteafd_loader::families::qwen4::Qwen4KvCache::Bf16,
                     cuteafd_core::MlaCacheFormat::Fp8 => cuteafd_loader::families::qwen4::Qwen4KvCache::Fp8,
                 }).unwrap_or_default(),
-                minimax_kv: args.kv_format.map(|format| match format {
+                minimax_kv: args.kv_format.map(|format| match format.resident() {
                     cuteafd_core::MlaCacheFormat::Bf16 => cuteafd_loader::families::qwen4::Qwen4KvCache::Bf16,
                     cuteafd_core::MlaCacheFormat::Fp8 => cuteafd_loader::families::qwen4::Qwen4KvCache::Fp8,
                 }).unwrap_or(cuteafd_loader::families::qwen4::Qwen4KvCache::Fp8),
-                mla_kv: args.kv_format.unwrap_or_default(),
+                minimax_cache: cuteafd_loader::plan::families::minimax::capacity::CachePlan {
+                    nvfp4: args.kv_format == Some(crate::cli::PlanKvFormat::Nvfp4), backing: args.kv_placement,
+                    hot_bytes: budget_bytes("--kv-hot-cache-gib", args.kv_hot_cache_gib)?,
+                    host_bytes: budget_bytes("--kv-host-budget-gib", args.kv_host_budget_gib)?,
+                },
+                minimax_5090: args.minimax_profile == "rtx5090",
+                mla_kv: args.kv_format.map(|f| f.resident()).unwrap_or_default(),
                 qwen_representation: cuteafd_loader::families::qwen4::resident::Qwen4Representation {
                     fp8_projections: args.fp8_decode, fp8_head: args.mtp_fp8_head },
                 qwen_attention_plan_rows: args.attention_plan_rows,
@@ -243,6 +249,12 @@ pub(crate) fn run_plan(mut args: PlanArgs) -> Result<()> {
     let inventory = cuteafd_loader::plan::Checkpoint::inventory(&snapshot)?;
     let family = cuteafd_loader::plan::family::detect(&inventory).map_or("", |family| family.id());
     validate_glmf_precision(&args, family)?;
+    anyhow::ensure!(family == "minimax_m3" || (args.kv_format != Some(crate::cli::PlanKvFormat::Nvfp4)
+        && args.kv_placement == cuteafd_loader::plan::families::minimax::capacity::KvBacking::Gpu
+        && args.minimax_profile == "default"), "NVFP4 KV, KV backing and the 5090 profile are MiniMax planning options");
+    anyhow::ensure!(args.layout || (args.kv_format != Some(crate::cli::PlanKvFormat::Nvfp4)
+        && args.kv_placement == cuteafd_loader::plan::families::minimax::capacity::KvBacking::Gpu
+        && args.minimax_profile == "default"), "MiniMax cache/profile options require --layout");
     let cfg = launch_config(args.config.as_deref())?;
     resolve_speculator(&mut args, &snapshot, family, &cfg)?;
     options.draft_ownership = Some(cuteafd_loader::plan::spec::DraftOwnership::selected(family, &args.speculator));
@@ -764,7 +776,7 @@ mod tests {
         assert_eq!(options(&args).unwrap().layout.unwrap().step5_kv, Qwen4KvCache::Fp8);
         for (selected, format) in [(cuteafd_core::MlaCacheFormat::Bf16, Qwen4KvCache::Bf16),
             (cuteafd_core::MlaCacheFormat::Fp8, Qwen4KvCache::Fp8)] {
-            args.kv_format = Some(selected);
+            args.kv_format = Some(selected.into());
             assert_eq!(options(&args).unwrap().layout.unwrap().step5_kv, format);
         }
     }
@@ -775,7 +787,7 @@ mod tests {
         let mut args = args(std::path::Path::new("/model"), 6, false);
         assert_eq!(options(&args).unwrap().layout.unwrap().mla_kv, MlaCacheFormat::Fp8);
         for format in [MlaCacheFormat::Bf16, MlaCacheFormat::Fp8] {
-            args.kv_format = Some(format);
+            args.kv_format = Some(format.into());
             assert_eq!(options(&args).unwrap().layout.unwrap().mla_kv, format);
         }
     }
@@ -811,6 +823,8 @@ mod tests {
             coordinator_gpu_budget_gib: None,
             pool_tokens: None,
             kv_format: Default::default(),
+            kv_placement: Default::default(), kv_hot_cache_gib: 1.0, kv_host_budget_gib: 192.0,
+            minimax_profile: "default".into(),
             fp8_decode: false, mtp_fp8_head: true, attention_plan_rows: None,
             kda_fp8: crate::families::glm5_flash::fp8::KdaFp8::Row128,
             kda_state: crate::families::glm5_flash::engine::KdaState::F32,

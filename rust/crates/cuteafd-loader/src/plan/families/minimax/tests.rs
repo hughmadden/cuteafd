@@ -285,3 +285,171 @@ fn native_tp2_auto_vision_preserves_text_admission() {
     assert!(!refused.fits && !refused.placement_supported);
     assert!(refused.hints.iter().any(|h| h.what.contains("MiniMax allocation needs")));
 }
+
+fn native_5090_options(dir: &std::path::Path, ranks: usize) -> PlanOptions {
+    let programs = dir.join("PROGRAMS.json");
+    std::fs::write(&programs, admission::tests::programs_manifest().to_string()).unwrap();
+    let experts = dir.join("fp8/fp8-minimax-nvfp4a4");
+    std::fs::create_dir_all(&experts).unwrap();
+    std::fs::write(experts.join("manifest.json"), admission::tests::expert_manifest().to_string()).unwrap();
+    let mut options = with_layout(RTX_5090, ranks);
+    options.vision = crate::plan::MediaMode::Off;
+    let layout = options.layout.as_mut().unwrap();
+    layout.workspace_manifest = Some(programs);
+    layout.physical_sms = Some(170);
+    layout.native_mtp_layers = 5;
+    options
+}
+
+#[test]
+fn minimax_5090_profile_and_host_embedding_preserve_draft_and_increase_pool() {
+    use cuteafd_core::memory_layout::Category;
+    let dir = snapshot(false, true);
+    let options = native_5090_options(dir.path(), 4);
+    let baseline = plan::plan(dir.path(), &options).unwrap();
+    assert!(baseline.placement_supported, "{:?}", baseline.hints);
+    let mut profile = options.clone();
+    profile.layout.as_mut().unwrap().minimax_5090 = true;
+    let sized = plan::plan(dir.path(), &profile).unwrap();
+    assert!(sized.placement_supported, "{:?}", sized.hints);
+    assert_eq!(sized.prefill_rows, Some(256));
+    assert!(sized.memory_layout.as_ref().unwrap().notes.iter().any(|n| n.contains("sequences 1")));
+    let mut mapped = options.clone();
+    mapped.layout.as_mut().unwrap().host_embedding = true;
+    let host = plan::plan(dir.path(), &mapped).unwrap();
+    assert!(host.placement_supported, "{:?}", host.hints);
+    let embedding = 200064 * 6144 * 2;
+    assert_eq!(host.bytes_by_owner["host-mapped embedding"], embedding);
+    assert_eq!(baseline.bytes_by_owner["coordinator text weights"] - host.bytes_by_owner["coordinator text weights"], embedding);
+    let pool = |r: &crate::plan::PlanReport| r.memory_layout.as_ref().unwrap().pool_tokens;
+    assert!(pool(&sized) > pool(&baseline));
+    assert!(pool(&host) > pool(&baseline));
+    for ranks in [2, 3, 4] {
+        let mut combined = native_5090_options(dir.path(), ranks);
+        let layout = combined.layout.as_mut().unwrap();
+        layout.minimax_5090 = true;
+        layout.host_embedding = true;
+        let report = plan::plan(dir.path(), &combined).unwrap();
+        assert!(report.placement_supported, "TP{ranks}: {:?}", report.hints);
+        assert!(pool(&report) > 0);
+        let memory = report.memory_layout.as_ref().unwrap();
+        assert!(memory.devices.iter().all(|d| d.used_bytes() <= d.capacity_bytes));
+        let draft: u64 = memory.devices.iter().flat_map(|d| &d.items)
+            .filter(|i| i.category == Category::Drafter).map(|i| i.bytes).sum();
+        assert!(draft > report.bytes_by_owner["bundled DSpark weights"]);
+        assert_eq!(report.bytes_by_owner["bundled DSpark weights"], baseline.bytes_by_owner["bundled DSpark weights"]);
+        if ranks == 4 { assert!(pool(&report) > pool(&sized) && pool(&report) > pool(&host)); }
+    }
+}
+
+#[test]
+fn minimax_5090_profile_honors_explicit_shapes_and_requires_draft_and_manifest() {
+    let dir = snapshot(false, true);
+    let mut options = native_5090_options(dir.path(), 4);
+    let layout = options.layout.as_mut().unwrap();
+    layout.minimax_5090 = true;
+    layout.prefill_rows = 512;
+    layout.concurrency = 4;
+    layout.draft_context_slots = Some(4);
+    let report = plan::plan(dir.path(), &options).unwrap();
+    assert!(report.placement_supported, "{:?}", report.hints);
+    assert_eq!(report.prefill_rows, Some(512));
+    assert!(report.memory_layout.as_ref().unwrap().notes.iter().any(|n| n.contains("sequences 4")));
+    options.layout.as_mut().unwrap().draft_context_slots = Some(1);
+    let refused = plan::plan(dir.path(), &options).unwrap();
+    assert!(!refused.placement_supported && refused.hints.iter().any(|h| h.what.contains("draft context slots")));
+    options.layout.as_mut().unwrap().draft_context_slots = Some(4);
+    options.layout.as_mut().unwrap().native_mtp_layers = 0;
+    let refused = plan::plan(dir.path(), &options).unwrap();
+    assert!(!refused.placement_supported && refused.hints.iter().any(|h| h.what.contains("requires the bundled DSpark")));
+    options.layout.as_mut().unwrap().native_mtp_layers = 5;
+    options.layout.as_mut().unwrap().workspace_manifest = Some(dir.path().join("missing.json"));
+    let refused = plan::plan(dir.path(), &options).unwrap();
+    assert!(!refused.placement_supported && refused.hints.iter().any(|h| h.what.contains("PROGRAMS.json")));
+    assert!(refused.memory_layout.unwrap().devices.is_empty());
+}
+
+#[test]
+fn minimax_cache_proposals_keep_draft_and_never_admit_execution() {
+    use capacity::{CachePlan, KvBacking};
+    use cuteafd_core::memory_layout::{Basis, Category};
+    let dir = snapshot(false, true);
+    let mut options = native_5090_options(dir.path(), 4);
+    let layout = options.layout.as_mut().unwrap();
+    layout.minimax_5090 = true;
+    layout.host_embedding = true;
+    let baseline = plan::plan(dir.path(), &options).unwrap();
+    let baseline_pool = baseline.memory_layout.as_ref().unwrap().pool_tokens;
+    for backing in [KvBacking::Gpu, KvBacking::Host, KvBacking::Spark] {
+        for nvfp4 in [false, true] {
+            if backing == KvBacking::Gpu && !nvfp4 { continue; }
+            options.layout.as_mut().unwrap().minimax_cache = CachePlan { backing, nvfp4, ..Default::default() };
+            let report = plan::plan(dir.path(), &options).unwrap();
+            assert!(!report.placement_supported && !report.wip_launchable() && !report.executable());
+            assert!(report.hints.iter().any(|h| h.what.contains("execution is not implemented")), "{:?}", report.hints);
+            assert_eq!(report.bytes_by_owner["bundled DSpark weights"], baseline.bytes_by_owner["bundled DSpark weights"]);
+            let memory = report.memory_layout.as_ref().unwrap();
+            assert!(memory.pool_tokens > baseline_pool, "{backing:?}, NVFP4={nvfp4}");
+            assert!(memory.devices.iter().all(|d| d.used_bytes() <= d.capacity_bytes));
+            let gpu = memory.devices.iter().find(|d| d.kind == DeviceKind::Rtx).unwrap();
+            assert!(gpu.items.iter().filter(|i| i.category == Category::Kv).all(|i| i.basis == Basis::Estimated));
+            let kv = if nvfp4 { 34_560 } else { 61_440 };
+            if backing == KvBacking::Host {
+                assert_eq!(report.bytes_by_owner["proposed host KV backing"], memory.pool_tokens * kv);
+            }
+            if backing == KvBacking::Spark {
+                let remote: u64 = memory.devices.iter().filter(|d| d.kind == DeviceKind::Spark)
+                    .flat_map(|d| &d.items).filter(|i| i.category == Category::Kv).map(|i| i.bytes).sum();
+                assert_eq!(remote, memory.pool_tokens * kv);
+            }
+        }
+    }
+    options.layout.as_mut().unwrap().native_mtp_layers = 0;
+    let refused = plan::plan(dir.path(), &options).unwrap();
+    assert!(!refused.placement_supported && refused.hints.iter().any(|h| h.what.contains("requires the bundled DSpark")));
+    options.layout.as_mut().unwrap().native_mtp_layers = 5;
+    options.layout.as_mut().unwrap().minimax_5090 = false;
+    options.layout.as_mut().unwrap().workspace_manifest = Some(dir.path().join("missing.json"));
+    let refused = plan::plan(dir.path(), &options).unwrap();
+    assert!(!refused.placement_supported && refused.memory_layout.unwrap().devices.is_empty());
+}
+
+#[test]
+fn minimax_paged_cache_obeys_explicit_pool_host_and_spark_budgets() {
+    use capacity::{CachePlan, KvBacking};
+    let dir = snapshot(false, true);
+    let mut options = native_5090_options(dir.path(), 3);
+    let layout = options.layout.as_mut().unwrap();
+    layout.minimax_5090 = true;
+    layout.host_embedding = true;
+    layout.context_tokens = 4096;
+    layout.minimax_cache = CachePlan { backing: KvBacking::Host, host_bytes: 64 << 20, ..Default::default() };
+    let host = plan::plan(dir.path(), &options).unwrap();
+    let host_pool = host.memory_layout.as_ref().unwrap().pool_tokens;
+    assert!(host.memory_layout.as_ref().unwrap().notes.iter().any(|n| n.contains("per-sequence context cap 4096")));
+    assert_eq!(host_pool, (64u64 << 20) / 61_440 / 128 * 128);
+    assert_eq!(host.bytes_by_owner["proposed host KV backing"], host_pool * 61_440);
+    options.layout.as_mut().unwrap().pool_tokens = Some(128);
+    let explicit = plan::plan(dir.path(), &options).unwrap();
+    assert_eq!(explicit.memory_layout.unwrap().pool_tokens, 128);
+    options.layout.as_mut().unwrap().pool_tokens = Some(host_pool + 128);
+    let refused = plan::plan(dir.path(), &options).unwrap();
+    assert!(refused.hints.iter().any(|h| h.what.contains("GPU/backing budgets")), "{:?}", refused.hints);
+    let layout = options.layout.as_mut().unwrap();
+    layout.pool_tokens = None;
+    layout.minimax_cache = CachePlan::default();
+    let baseline = plan::plan(dir.path(), &options).unwrap();
+    let used = baseline.memory_layout.as_ref().unwrap().devices.iter().filter(|d| d.kind == DeviceKind::Spark)
+        .map(|d| d.used_bytes()).max().unwrap();
+    let layout = options.layout.as_mut().unwrap();
+    layout.onboard = Some(crate::placement::Onboard::Layers(0));
+    layout.spark_allocation_budget_bytes = Some(used + 61_440 / 3 * 2048);
+    layout.minimax_cache = CachePlan { backing: KvBacking::Spark, ..Default::default() };
+    let spark = plan::plan(dir.path(), &options).unwrap();
+    let memory = spark.memory_layout.as_ref().unwrap();
+    assert_eq!(memory.pool_tokens, 2048, "{:?}", spark.hints);
+    assert!(memory.devices.iter().all(|d| d.used_bytes() <= d.capacity_bytes));
+    options.layout.as_mut().unwrap().pool_tokens = Some(2176);
+    let refused = plan::plan(dir.path(), &options).unwrap();
+    assert!(refused.hints.iter().any(|h| h.what.contains("GPU/backing budgets")), "{:?}", refused.hints);
+}

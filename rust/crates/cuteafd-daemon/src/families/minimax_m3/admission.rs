@@ -18,6 +18,7 @@ pub(super) struct Request {
     pub spark_budget: u64,
     pub headroom: u64,
     pub draft_bytes: u64,
+    pub host_embedding: bool,
 }
 
 pub(super) struct Admitted {
@@ -49,6 +50,7 @@ pub(super) fn solve(checkpoint: &Checkpoint, programs: &serde_json::Value,
     let programs = ProgramSizes::from_manifest(programs, request.sizing)?;
     let ledger = RuntimeLedger::new(&cfg, request.sizing, &programs)?;
     let weights = RankWeightLayout::from_checkpoint(checkpoint, 0, 1)?;
+    let weights = if request.host_embedding { weights.with_host_embedding(checkpoint)? } else { weights };
     let catalog = cuteafd_loader::read_expert_catalog(&checkpoint.snapshot)?;
     let layers = cfg.moe.iter().enumerate().filter_map(|(layer, &moe)| moe.then_some(layer)).collect();
     let working = SparkWorkingSet { rtx_layers: vec![], spark_layers: layers,
@@ -97,6 +99,15 @@ mod tests {
 
     #[test]
     fn minimax_runtime_and_manifest_plan_share_allocation_bytes() -> Result<()> {
+        runtime_and_manifest_plan_share_allocation_bytes(false)
+    }
+
+    #[test]
+    fn minimax_host_embedding_runtime_and_manifest_plan_share_allocation_bytes() -> Result<()> {
+        runtime_and_manifest_plan_share_allocation_bytes(true)
+    }
+
+    fn runtime_and_manifest_plan_share_allocation_bytes(host_embedding: bool) -> Result<()> {
         let dir = tempfile::tempdir()?;
         testing::write_minimax_m3_snapshot(dir.path(), false, false);
         let checkpoint = Checkpoint::open(dir.path())?;
@@ -104,7 +115,7 @@ mod tests {
         let path = dir.path().join("PROGRAMS.json");
         std::fs::write(&path, programs.to_string())?;
         let options = LayoutOptions { workspace_manifest: Some(path), prefill_rows: 256, concurrency: 16,
-            context_tokens: 4096, pool_tokens: Some(4096), headroom_bytes: 0, native_mtp_layers: 0, ..Default::default() };
+            context_tokens: 4096, pool_tokens: Some(4096), headroom_bytes: 0, native_mtp_layers: 0, host_embedding, ..Default::default() };
         let report = plan::plan(dir.path(), &PlanOptions { placement: ExpertPlacement::Sparks { ranks: 3 },
             layout: Some(options.clone()), ..Default::default() })?;
         ensure!(report.placement_supported, "{:?}", report.hints);
@@ -115,10 +126,12 @@ mod tests {
         let mut live = solve(&checkpoint, &programs, None, Request {
             sizing: RuntimeSizing { rows: 256, decode_rows: 64, sequences: 16, context: 4096, spark_ranks: 3 },
             available: options.rtx_bytes[0] - measured_baseline, requested_pool: Some(4096),
-            kv_format: Qwen4KvCache::Fp8, onboard: None, spark_budget: 108 << 30, headroom: 0, draft_bytes:0,
+            kv_format: Qwen4KvCache::Fp8, onboard: None, spark_budget: 108 << 30, headroom: 0, draft_bytes:0, host_embedding,
         })?;
         assert_eq!(live.cache.total_bytes + measured_baseline, device.used_bytes());
         assert_eq!(live.cache.pool_tokens, memory.pool_tokens);
+        assert_eq!(live.weights.operands.iter().any(|o| o.name.ends_with("embed_tokens.weight")), !host_embedding);
+        assert!(live.weights.operands.iter().any(|o| o.name == "language_model.lm_head.weight"));
         assert!(live.local_layers.is_empty());
         assert_eq!(live.spark_layers, (3..60).collect::<Vec<_>>());
         assert_eq!(live.ledger.bytes("head_workspace"), Some(cuteafd_ffi::programs::VOCABULARY_HEAD_WORKSPACE as u64));
