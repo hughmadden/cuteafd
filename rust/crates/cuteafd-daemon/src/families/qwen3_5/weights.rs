@@ -147,10 +147,31 @@ impl<'a> WeightReader<'a> {
         self.dense_bytes(cfg, norm_dtype, format)?;
         let norm_name = format!("{PREFIX}norm.weight");
         let head_name = if cfg.tied_embeddings { format!("{PREFIX}embed_tokens.weight") } else { "lm_head.weight".into() };
-        let specs = cfg.attention.iter().enumerate().map(|(layer, &kind)|
-            native_operands(&format!("{PREFIX}layers.{layer}"), kind, format));
-        let layers = cfg.attention.iter().zip(specs).map(|(&attention, specs)| {
-            let operands = specs.into_iter().map(|spec| {
+        let layers = cfg.attention.iter().enumerate().map(|(index, &kind)|
+            self.dense_layer(&format!("{PREFIX}layers.{index}"), kind, format)).collect::<Result<_>>()?;
+        Ok(DenseWeights { layers, norm: self.bf16(&norm_name)?, head: self.bf16(&head_name)? })
+    }
+
+    pub(crate) fn dense_layer_bytes(&self, prefix: &str, attention: HybridAttention, format: DenseFormat) -> Result<u64> {
+        native_operands(prefix, attention, format).into_iter().try_fold(0u64, |total, spec| {
+            let bytes = spec.tensors.iter().try_fold(0u64, |bytes, name| {
+                let tensor = &self.tensor(name)?.meta;
+                ensure!(match spec.storage {
+                    Storage::Bf16 => tensor.dtype == DType::Bf16,
+                    Storage::F32 | Storage::Scales => matches!(tensor.dtype, DType::Bf16 | DType::F32),
+                    Storage::Fp8 => tensor.dtype == DType::F8E4M3,
+                    Storage::NativeNorm => matches!(tensor.dtype, DType::Bf16 | DType::F32),
+                }, "{name}: native dense operand dtype differs from admitted projection format");
+                let widen = matches!(spec.storage, Storage::F32 | Storage::Scales) && tensor.dtype == DType::Bf16;
+                Ok::<_, anyhow::Error>(bytes + tensor.byte_length * if widen { 2 } else { 1 })
+            })?;
+            Ok(total + bytes.max(256))
+        })
+    }
+
+    /// MTP and target blocks share the checkpoint-native projection packing.
+    pub(crate) fn dense_layer(&self, prefix: &str, attention: HybridAttention, format: DenseFormat) -> Result<DenseLayer<'a>> {
+        let operands = native_operands(prefix, attention, format).into_iter().map(|spec| {
                 let weight = match spec.storage {
                     Storage::Bf16 if spec.tensors.len() > 1 => self.rows(&spec.tensors, 0)?,
                     Storage::Bf16 => self.bf16(&spec.tensors[0])?,
@@ -164,11 +185,9 @@ impl<'a> WeightReader<'a> {
                         self.upload(&bytes)?
                     }
                 };
-                Ok((spec.name, weight))
-            }).collect::<Result<_>>()?;
-            Ok(DenseLayer { attention, operands })
+            Ok((spec.name, weight))
         }).collect::<Result<_>>()?;
-        Ok(DenseWeights { layers, norm: self.bf16(&norm_name)?, head: self.bf16(&head_name)? })
+        Ok(DenseLayer { attention, operands })
     }
 }
 

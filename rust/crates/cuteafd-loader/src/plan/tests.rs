@@ -237,12 +237,12 @@ fn qwen_snapshot(bits: usize) -> tempfile::TempDir {
 }
 
 #[test]
-fn step5_mtp_selection_leaves_other_family_ownership_unchanged() {
+fn native_mtp_selection_preserves_checkpoint_ownership() {
     use spec::DraftOwnership;
     for family in family::registry().iter().filter(|family| family.id() != "step5") {
         for selected in ["off", "mtp", "dspark", "dflash2", "unknown"] {
             let previous = match (family.id(), selected) {
-                ("mimo_v2" | "qwen4", "mtp") => DraftOwnership::NativeMtp,
+                ("mimo_v2" | "qwen4" | "qwen3_5", "mtp") => DraftOwnership::NativeMtp,
                 ("deepseek_v4" | "deepseek_v41", "dspark") => DraftOwnership::BundledDspark,
                 _ => DraftOwnership::None,
             };

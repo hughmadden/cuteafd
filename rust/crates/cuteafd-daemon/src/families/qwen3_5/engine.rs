@@ -19,6 +19,8 @@ const PREFIX: &str = "model.language_model.";
 mod verify;
 #[path = "rows.rs"]
 mod rows;
+#[path = "mtp.rs"]
+pub(crate) mod mtp;
 #[path = "prefix.rs"]
 pub(crate) mod prefix;
 pub(crate) use verify::DenseMark;

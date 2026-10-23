@@ -31,6 +31,51 @@ pub struct DrafterBytes {
 }
 
 impl DrafterBytes {
+    /// Native MTP owns one dense block, bounded hidden/logit planes and pooled KV sidecars.
+    pub fn native_mtp(checkpoint: &crate::plan::checkpoint::Checkpoint, cfg: &Qwen35Config) -> anyhow::Result<Self> {
+        use anyhow::Context;
+        ensure!(cfg.mtp_layers == 1, "dense MTP requires one checkpoint-native layer");
+        let tensor = |name: &str| checkpoint.tensors.iter().find(|t| t.meta.name == name)
+            .with_context(|| format!("dense MTP tensor missing: {name}"));
+        let fp8 = tensor("mtp.layers.0.mlp.gate_proj.weight")?.meta.dtype == DType::F8E4M3;
+        let mut groups = vec![vec!["input_layernorm.weight"], vec!["post_attention_layernorm.weight"],
+            vec!["mlp.down_proj.weight"], vec!["mlp.gate_proj.weight", "mlp.up_proj.weight"],
+            vec!["self_attn.q_proj.weight", "self_attn.k_proj.weight", "self_attn.v_proj.weight"],
+            vec!["self_attn.q_norm.weight"], vec!["self_attn.k_norm.weight"], vec!["self_attn.o_proj.weight"]];
+        let mut owned = 0u64;
+        for group in groups.drain(..) {
+            let projection = group[0].starts_with("mlp.") || matches!(group[0], "self_attn.q_proj.weight" | "self_attn.o_proj.weight");
+            let mut bytes = 0;
+            let mut scales = 0;
+            for name in group {
+                let full = format!("mtp.layers.0.{name}");
+                let value = &tensor(&full)?.meta;
+                ensure!(value.dtype == if fp8 && projection { DType::F8E4M3 } else { DType::Bf16 },
+                    "{full}: unsupported native MTP dtype");
+                bytes += value.byte_length;
+                if fp8 && projection {
+                    let scale = &tensor(&format!("{full}_scale_inv"))?.meta;
+                    ensure!(matches!(scale.dtype, DType::Bf16 | DType::F32), "{full}: unsupported scale dtype");
+                    scales += scale.byte_length * if scale.dtype == DType::Bf16 { 2 } else { 1 };
+                }
+            }
+            owned += bytes.max(256);
+            if fp8 && projection { owned += scales.max(256); }
+        }
+        for (name, shape) in [("fc", vec![cfg.hidden, 2 * cfg.hidden]), ("norm", vec![cfg.hidden]),
+            ("pre_fc_norm_hidden", vec![cfg.hidden]), ("pre_fc_norm_embedding", vec![cfg.hidden])] {
+            let full = format!("mtp.{name}.weight");
+            let value = &tensor(&full)?.meta;
+            ensure!(value.dtype == DType::Bf16 && value.shape == shape, "{full}: native MTP shape/dtype differs");
+            owned += value.byte_length.max(256);
+        }
+        owned += ((64 * 2 + 4096) * cfg.hidden * 2 + 64 * cfg.vocab * 4) as u64;
+        // The independent greedy selector owns one ID/status/log-probability row.
+        owned += 12;
+        let record = crate::families::qwen4::Qwen4KvCache::Bf16.record_bytes(cfg.kv_heads, cfg.head_dim);
+        Ok(Self { owned, scratch: 0, pool_unit: (64 * record + cfg.hidden * 2) as u64 })
+    }
+
     pub fn block_dspark(config: &serde_json::Value, slots: usize, sms: u64, context: usize)
         -> anyhow::Result<Self> {
         use crate::families::glm5::draft_representation::{block_dspark_paged_resident_bytes, GlmDraftRepresentation};

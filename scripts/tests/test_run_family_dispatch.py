@@ -321,6 +321,26 @@ def test_dense_27b_dspark_default_and_explicit_disable(tmp_path, model, selectio
         assert launch[launch.index("--draft-fixed") + 1] == "3"
 
 
+@pytest.mark.parametrize("model", ["Qwen/Qwen3.8-27B", "Qwen/Qwen3.8-27B-FP8"])
+@pytest.mark.parametrize("depth", [None, 1, 2, 3])
+def test_dense_27b_native_mtp_needs_no_external_checkpoint(tmp_path, model, depth):
+    config = {**DENSE_CONFIG, "text_config": {**DENSE_CONFIG["text_config"],
+        "hidden_size": 5120, "mtp_num_hidden_layers": 1}}
+    keys = "SPARK_COUNT=0\nSPECULATOR=mtp\n"
+    if depth is not None:
+        keys += f"SPECULATOR_DEPTH={depth}\n"
+    result = _family_launch_result(tmp_path, config, model, keys,
+        extra_args=("--wip", "dense-test"),
+        encoder_plan={"placement_supported": True, "fits": True, "spark_ranks": 0})
+    assert result.returncode == 0, result.stderr
+    launch = shlex.split(next(line for line in result.stderr.splitlines() if "serve-qwen35 --snapshot" in line))
+    plan = shlex.split(next(line for line in result.stderr.splitlines() if "cuteafd plan " in line))
+    assert launch[launch.index("--mtp") + 1] == str(depth or 1)
+    assert plan[plan.index("--speculator") + 1] == "mtp"
+    assert "--draft" not in launch and "--drafter-snapshot" not in plan
+    assert "cuteafd expertd-native" not in result.stderr
+
+
 @pytest.mark.parametrize("cache_keys,entries,boundaries", [
     ("", 20, 1),
     ("PREFIX_CACHE_ENTRIES=4\nPREFIX_CACHE_MARK_MIB=1024\nPREFIX_POINT_BOUNDARIES=2\n", 4, 2),
@@ -393,7 +413,6 @@ def test_deployment_wip_still_requires_matching_launch_family(tmp_path, family, 
     ("SPARK_COUNT=0\nVISION=rtx\n", "media execution is not qualified"),
     ("SPARK_COUNT=0\nEMBEDDING=host\n", "requires device token embedding"),
     ("SPARK_COUNT=0\nMAX_CONTEXT_TOKENS=4096\n", "unused configuration key"),
-    ("SPARK_COUNT=0\nSPECULATOR=mtp\n", "does not apply to qwen3_5"),
 ])
 def test_dense_qwen_refuses_unqualified_configuration(tmp_path: Path, keys: str, diagnostic: str) -> None:
     result = _family_launch_result(tmp_path, DENSE_CONFIG, "Qwen/Qwen3.5-9B", keys,

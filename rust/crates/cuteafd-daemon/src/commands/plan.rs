@@ -252,7 +252,8 @@ pub(crate) fn run_plan(mut args: PlanArgs) -> Result<()> {
         if !options.draft_ownership.unwrap().uses_checkpoint() { layout.native_mtp_layers = 0; }
         layout.glmf_drafter_disabled = args.speculator == "off";
         layout.glm5_drafter_disabled = args.speculator == "off";
-        if family == "qwen3_5" && args.speculator != "off" {
+        if family == "qwen3_5" { layout.dense_qwen_mtp = args.speculator == "mtp"; }
+        if family == "qwen3_5" && args.speculator == "dspark" {
             let resolved = file_args(args.clone(), &snapshot)?;
             layout.dense_qwen_drafter_snapshot = Some(resolved.drafter_snapshot
                 .context("dense dSpark planning requires its checkpoint")?);
@@ -453,7 +454,7 @@ fn resolve_speculator(args: &mut PlanArgs, snapshot: &std::path::Path, family: &
         anyhow::ensure!(args.speculator != "off", "this family has no default speculator");
     }
     let enabled = match (family, args.speculator.as_str()) {
-        (_, "off") | ("qwen3_5", "dspark") | ("kimi_k3", "dflash2") | ("glm5", "dflash2") | ("glm5_flash", "dflash2" | "dspark")
+        (_, "off") | ("qwen3_5", "dspark" | "mtp") | ("kimi_k3", "dflash2") | ("glm5", "dflash2") | ("glm5_flash", "dflash2" | "dspark")
         | ("mimo_v2", "dflash2" | "mtp") | ("qwen4" | "step5", "mtp")
         | ("deepseek_v4" | "deepseek_v41", "dspark") => true,
         _ => false,
