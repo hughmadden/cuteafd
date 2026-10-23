@@ -100,6 +100,9 @@ pub(crate) enum Commands {
     /// Serve an eager native Step-5 target with real Spark experts.
     #[command(hide = true)]
     ServeStep5(crate::families::step5::serve::ServeArgs),
+    /// Serve MiniMax M3 with one coordinator and native NVFP4 Spark experts.
+    #[command(name = "serve-minimax", hide = true)]
+    ServeMiniMax(crate::families::minimax_m3::serve::ServeArgs),
     /// Serve dense Qwen BF16 through the shared Qwen scheduler.
     #[command(hide = true)]
     ServeQwen35(crate::families::qwen3_5::serve::ServeArgs),

@@ -1,0 +1,287 @@
+//! Single coordinator startup: validate, admit, load, bind, schedule.
+use super::{admission::{self, RuntimeSizing}, backend::MiniMaxBackend, cache::Cache,
+    execution::Execution, media::{ReadyVision, RemoteVision}, routed::Routed, MiniMaxError};
+use crate::shared::{memory::device::Device, placement::{SparkAdmission, spark_rings},
+    prefix::PrefixArgs, qwen::{Encoder, scheduler::{self, Backend}},
+    spark_intake::SparkDeviceLink, token_io::{EmbedPlacement, EmbedSource, TokenEmbedding, TokenIoArgs}};
+use anyhow::{Context, Result};
+use cuteafd_core::{ExpertGeometry, SparkEndpoint, SparkIngress};
+use cuteafd_loader::{families::{minimax_m3::config::MiniMaxM3Config, qwen4::Qwen4KvCache},
+    plan::{checkpoint::Checkpoint, MediaMode}, placement::SparkWorkingSet};
+use cuteafd_transport::{expert::SparkWorld, worker_selection::ModelAdmission, TcpTransportConfig};
+use std::{cell::RefCell, net::SocketAddr, path::PathBuf, sync::{Arc, Mutex}};
+
+#[derive(Debug, Clone, clap::Args)]
+pub(crate) struct ServeArgs {
+    #[arg(long)]
+    snapshot: PathBuf,
+    #[arg(long, env = "CUTEAFD_NATIVE_LIB")]
+    native_lib: PathBuf,
+    #[arg(long, default_value = "/opt/cuteafd/share/PROGRAMS.json")]
+    manifest: PathBuf,
+    #[arg(long, default_value_t = 0)]
+    device: i32,
+    #[arg(long)]
+    split_device: Option<i32>,
+    #[arg(long, value_delimiter = ',')]
+    peers: Vec<SocketAddr>,
+    #[arg(long, default_value_t = 108 << 30)]
+    spark_budget_bytes: u64,
+    #[arg(long)]
+    pool_tokens: Option<u64>,
+    #[arg(long, default_value = "fp8")]
+    kv_cache: Qwen4KvCache,
+    #[arg(long, default_value_t = 0)]
+    max_context: u64,
+    #[arg(long, alias = "prefill-batch-tokens", default_value_t = 4096, value_parser = clap::value_parser!(u32).range(1..=4096))]
+    prefill_rows: u32,
+    #[arg(long, default_value = "auto")]
+    rtx_expert_layers: String,
+    #[arg(long, default_value = "off")]
+    speculator: String,
+    #[arg(long, default_value = "0.0.0.0:8000")]
+    listen: String,
+    #[arg(long, default_value_t = 32768)]
+    max_output: u32,
+    #[arg(long, default_value_t = 64, value_parser = clap::value_parser!(u8).range(1..=64))]
+    max_sequences: u8,
+    #[arg(long)]
+    model_id: Option<String>,
+    #[arg(long)]
+    full_prefill_logits: bool,
+    #[arg(skip = MediaMode::Auto)]
+    pub(crate) vision: MediaMode,
+    #[arg(long)]
+    vision_peers: Option<String>,
+    #[arg(long)]
+    encoder_plan_hash: Option<String>,
+    #[arg(long)]
+    encoder_revision: Option<String>,
+    #[arg(long)]
+    media_cache_bytes: Option<u64>,
+    #[command(flatten)]
+    prefix: PrefixArgs,
+    #[command(flatten)]
+    decode_share: crate::shared::prefill_share::DecodeShareArgs,
+    #[command(flatten)]
+    token_io: TokenIoArgs,
+    #[command(flatten)]
+    api: crate::shared::api::ApiArgs,
+}
+impl ServeArgs {
+    pub(crate) fn validate(&self) -> Result<Option<usize>> {
+        if self.split_device.is_some() { return Err(MiniMaxError::Unsupported("two-GPU head split").into()); }
+        if self.device < 0 || !matches!(self.peers.len(), 2 | 3 | 4)
+            || self.peers.iter().enumerate().any(|(i, p)| self.peers[..i].contains(p)) {
+            return Err(MiniMaxError::Invalid("one coordinator and distinct TP2/TP3/TP4 peers required").into());
+        }
+        if self.kv_cache != Qwen4KvCache::Fp8 { return Err(MiniMaxError::Unsupported("BF16 KV has no exported MiniMax kernel").into()); }
+        if self.speculator != "off" { return Err(MiniMaxError::Unsupported("speculation; use --speculator off").into()); }
+        if matches!(std::env::var("CUTEAFD_SPARK_WRITE").as_deref(), Ok("1" | "on")) {
+            return Err(MiniMaxError::Unsupported("Spark write mode has no MiniMax allocation ledger").into());
+        }
+        if self.token_io.embed_placement != EmbedPlacement::Gpu { return Err(MiniMaxError::Unsupported("host token embeddings").into()); }
+        if self.max_sequences as u32 > self.prefill_rows || self.max_context > 1_048_576 {
+            return Err(MiniMaxError::Invalid("request context or row capacity").into());
+        }
+        if self.prefix.prefix_partial != crate::shared::prefix::Toggle::Off {
+            return Err(MiniMaxError::Unsupported("partial prefix reuse").into());
+        }
+        if self.rtx_expert_layers == "auto" { return Ok(None); }
+        let count = self.rtx_expert_layers.parse::<usize>().map_err(|_| MiniMaxError::Invalid("RTX expert layers: use auto or N"))?;
+        if count > 57 { return Err(MiniMaxError::Invalid("RTX expert layers exceed routed layer count").into()); }
+        Ok(Some(count))
+    }
+}
+
+fn request(identity: u64, layer: usize, rows: usize, routes: Vec<cuteafd_transport::ExpertProtocolV2RouteEntry>,
+    wire: bytes::Bytes, kind: cuteafd_transport::ExpertV2SourceKind) -> Result<cuteafd_transport::ExpertProtocolV2Request> {
+    use cuteafd_transport::{ExpertProtocolV2Request, ExpertProtocolV2RowDescriptor, ExpertV2Dtype};
+    if identity == 0 || !(3..60).contains(&layer) || !(1..=4096).contains(&rows) {
+        return Err(MiniMaxError::Invalid("Spark request identity or extent").into());
+    }
+    let mut request = ExpertProtocolV2Request::new_bytes(identity, 1, layer as u32, 6144,
+        ExpertV2Dtype::Bf16, (0..rows as u32).map(|row| ExpertProtocolV2RowDescriptor {
+            row_id: row as u64, source_kind: kind, source_request_id: identity, token_position: row as u64,
+            route_offset: row * 4, route_count: 4 }).collect(), routes, wire)?;
+    request.header.flags |= cuteafd_transport::expert::EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16;
+    Ok(request)
+}
+
+type Ready = (usize, Option<Arc<cuteafd_api::openai::media::MediaPreparer>>);
+
+fn worker(args: &ServeArgs, receive: &mut tokio::sync::mpsc::Receiver<cuteafd_api::openai::NativeRequest>,
+    stats: &Arc<Mutex<serde_json::Value>>, eos: Vec<u32>, initialized: impl FnOnce(Ready) -> Result<()>) -> Result<()> {
+    let onboard = args.validate()?;
+    let checkpoint = Checkpoint::coordinator(&args.snapshot, false, false)?;
+    let cfg = MiniMaxM3Config::from_hf(&checkpoint.config)?;
+    cfg.release_geometry()?;
+    cuteafd_core::set_expert_geometry(ExpertGeometry::MINIMAX_M3)
+        .map_err(|_| MiniMaxError::Invalid("expert geometry already installed"))?;
+    let library = cuteafd_ffi::minimax::load_library(&args.native_lib)?;
+    library.cuda_set_device(args.device)?;
+    let programs = library.programs()?.with_manifest(&args.manifest)?;
+    programs.load_matching(|name| name.starts_with("minimax_"))?;
+    let sizing = RuntimeSizing { rows: args.prefill_rows as usize, decode_rows: (args.prefill_rows as usize).min(64),
+        sequences: args.max_sequences as usize, context: if args.max_context == 0 {cfg.max_position as u64} else {args.max_context},
+        spark_ranks: args.peers.len() };
+    let manifest = cuteafd_loader::plan::checkpoint::read_json(&args.manifest)?;
+    let package = crate::shared::experts::fp8::package_directory(&args.native_lib, 1,
+        cuteafd_loader::formats::fp8_experts::ExpertFormat::Nvfp4);
+    let local_package = package.join("manifest.json");
+    let local_package = local_package.is_file().then(|| cuteafd_loader::plan::checkpoint::read_json(&local_package)).transpose()?;
+    let available = || -> Result<u64> {
+        library.cuda_set_device(args.device)?;
+        let (free, total) = library.cuda_memory_info()?;
+        Ok(cuteafd_ffi::coordinator_gpu_budget().map_or(free as u64, |b|
+            (free as u64).min(b.0.saturating_sub((total - free) as u64))))
+    };
+    let remote = RemoteVision::parse(args.vision_peers.as_deref(), args.encoder_plan_hash.as_deref(), args.encoder_revision.as_deref())?;
+    let (vision_mode, text_admission) = if args.vision == MediaMode::Auto && remote.is_none() {
+        let free = available()?;
+        let text = admission::solve(&checkpoint, &manifest, local_package.as_ref(), admission::Request {
+            sizing, available: free, requested_pool: None, kv_format: args.kv_cache, onboard,
+            spark_budget: args.spark_budget_bytes, headroom: 2 << 30 })?;
+        let vision_bytes = ReadyVision::local_bytes(&args.snapshot, &args.native_lib)?;
+        let cache_target = args.pool_tokens.filter(|n| *n > 0).unwrap_or(262_144)
+            .checked_mul(text.cache.cache.token_bytes(0)).context("MiniMax vision cache target overflow")?;
+        let mode = super::media::local_auto_mode(free, text.cache.fixed_bytes, vision_bytes, cache_target)?;
+        tracing::info!(?mode, vision_bytes, cache_target, "MiniMax automatic vision placement preserves text admission");
+        (mode, Some(text))
+    } else { (args.vision, None) };
+    let (vision, prefix) = ReadyVision::load(&args.snapshot, &args.native_lib, &library, args.device,
+        vision_mode, &args.prefix, args.media_cache_bytes, remote)?;
+    let available = available()?;
+    let admitted = if let Some(mut text) = text_admission {
+        text.readmit(&cfg, sizing, available, args.pool_tokens, args.kv_cache)?;
+        text
+    } else {
+        let remote_reserve = vision.as_ref().map_or(0, |v| v.spark_reserve_bytes);
+        admission::solve(&checkpoint, &manifest, local_package.as_ref(), admission::Request {
+            sizing, available, requested_pool: args.pool_tokens, kv_format: args.kv_cache, onboard,
+            spark_budget: args.spark_budget_bytes.saturating_sub(remote_reserve), headroom: 2 << 30 })?
+    };
+    let mut catalog = cuteafd_loader::read_expert_catalog(&args.snapshot)?;
+    catalog.select_draft(cuteafd_loader::plan::spec::DraftOwnership::None)?;
+    let endpoint = SparkEndpoint { capacity: args.prefill_rows, ingress: SparkIngress::Bf16 };
+    let config = TcpTransportConfig::default();
+    let working = SparkWorkingSet { rtx_layers: admitted.local_layers.clone(), spark_layers: admitted.spark_layers.clone(),
+        spark_ranks: args.peers.len(), prefill_lanes: 1 };
+    let pending = SparkAdmission::plan(&args.snapshot, ExpertGeometry::MINIMAX_M3, Some(&catalog), &working,
+        args.peers.len(), None, ModelAdmission::for_clients(ExpertGeometry::MINIMAX_M3, endpoint,
+            admitted.spark_capacity as u32, spark_rings(config.max_frame_bytes)?, 1)?)?.start(&args.peers)?;
+    let device = Device { library: &library, id: args.device };
+    let cache_bytes = admitted.cache.cache_bytes.checked_add(256).context("MiniMax cache reserve overflow")?;
+    let token_ids = cuteafd_ffi::minimax::Buffer::new(&library, args.device, admitted.ledger.bytes("token_ids").unwrap() as usize)?;
+    let embedded = cuteafd_ffi::minimax::Buffer::new(&library, args.device, admitted.ledger.bytes("embedded").unwrap() as usize)?;
+    let tensor = checkpoint.tensors.iter().find(|t| t.meta.name == "language_model.model.embed_tokens.weight")
+        .context("MiniMax embedding header missing")?;
+    let source = EmbedSource::new(&args.snapshot, &tensor.shard, &tensor.meta, cfg.hidden)?;
+    let (embedding, (execution, local)) = crate::shared::placement::load_while_admitting(Some(pending), || {
+        TokenEmbedding::load(&library, source, EmbedPlacement::Gpu, || {
+            let execution = Execution::load(device, &programs, &checkpoint, &cfg, &admitted.ledger)?;
+            let local = if admitted.local_layers.is_empty() {None} else {
+                let tensors = catalog.fp8().context("MiniMax native expert catalog missing")?.for_coordinator();
+                Some(crate::shared::experts::fp8::Fp8Experts::load(&library, &tensors, &package,
+                    &admitted.local_layers, 1, 0, sizing.rows, available as usize)?)
+            };
+            Ok((execution, local))
+        })
+    })?;
+    let mut cache = Cache::new(&library, args.device, &admitted.cache.cache, admitted.cache.pool_pages as usize,
+        sizing.sequences, cache_bytes)?;
+    cache.context = cache.context.min(admitted.cache.pool_tokens as usize);
+    cuteafd_transport::worker_selection::require_peer_clients(&args.peers, endpoint, 1)?;
+    let world = SparkWorld::canonical(args.peers.len())?;
+    let spark = if let Some(&first) = admitted.spark_layers.first() {
+        let routes = (0..sizing.rows * 4).map(|i| cuteafd_transport::ExpertProtocolV2RouteEntry {
+            row_index: (i / 4) as u32, expert_id: (i % 128) as u32, gate_weight: 0.0 }).collect();
+        let warm = request(1, first, sizing.rows, routes, vec![0; sizing.rows * 6144 * 2].into(), cuteafd_transport::ExpertV2SourceKind::Prefill)?;
+        let mut identity = 1u64;
+        let build: cuteafd_transport::expert::DeviceBuild = Box::new(move |wave, routes, wire| {
+            let kind = match wave.kind {
+                1 => cuteafd_transport::ExpertV2SourceKind::Decode,
+                2 => cuteafd_transport::ExpertV2SourceKind::Prefill,
+                _ => return Err(MiniMaxError::Invalid("Spark wave source kind").into()),
+            };
+            identity = identity.checked_add(1).ok_or(MiniMaxError::Overflow("Spark wave identity"))?;
+            request(identity, wave.layer as usize, wave.rows as usize, routes, wire, kind)
+        });
+        Some(SparkDeviceLink::new(&library, args.device, world, &args.peers, sizing.rows, 4, 6144 * 2,
+            6144 * 2, config, Some(warm), build)?)
+    } else {None};
+    let expander = vision.as_ref().map(|_| cuteafd_loader::media::minimax::span_expander(&args.snapshot, cfg.vocab_size as u32, false)).transpose()?;
+    let backend = MiniMaxBackend { execution: &execution, cache: &cache, embedding: &embedding, token_ids, embedded,
+        experts: RefCell::new(Routed::new(local, spark)?), rows: sizing.rows, vocabulary: cfg.vocab_size, expander,
+        pending: RefCell::new(None), timing: RefCell::new([0.0; 2]) };
+    let (encoder, preparer, media_bytes) = vision.map_or((Encoder::Off, None, 0), |v| (v.encoder, Some(v.preparer), v.cache_bytes));
+    let mut media = cuteafd_engine::media::MediaAdmission::new(cuteafd_engine::media::EmbeddingCache::new(media_bytes), encoder, 16);
+    tracing::info!(pool_tokens=admitted.cache.pool_tokens, context=cache.context, local_layers=?admitted.local_layers,
+        rows=sizing.rows, "MiniMax native eager target; prefill uses causal paged MSA tiles");
+    scheduler::schedule(&backend, &args.snapshot, receive, stats, sizing.sequences, scheduler::Drafts::None,
+        eos, args.decode_share, &prefix, args.token_io.token_select, &mut media, None,
+        || initialized((backend.geometry().max_context, preparer)))
+}
+
+pub(crate) async fn run_serve(args: ServeArgs) -> Result<()> {
+    use cuteafd_api::openai::{ModelEncoding, ModelProfile, NativeLimits};
+    args.validate()?;
+    let snapshot = args.snapshot.clone();
+    let config = cuteafd_loader::plan::checkpoint::read_json(&snapshot.join("config.json"))?;
+    let architecture = config["architectures"][0].as_str().context("MiniMax architecture missing")?;
+    let encoding = ModelEncoding::from_architecture(architecture, &snapshot)?.context("MiniMax API architecture unsupported")?;
+    let eos = encoding.eos_token_ids();
+    let model = args.model_id.clone().or_else(|| cuteafd_api::openai::snapshot_model_id(&snapshot))
+        .context("MiniMax requires --model-id for a snapshot without HF identity")?;
+    let mut profile = ModelProfile::new(model, encoding).with_tokenizer(&snapshot)?;
+    let api = args.api.load()?;
+    let (queue, mut receive) = tokio::sync::mpsc::channel(16);
+    let stats = Arc::new(Mutex::new(serde_json::Value::Null));
+    let worker_stats = stats.clone();
+    let engine_args = args.clone();
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<Result<Ready>>();
+    let handle = tokio::task::spawn_blocking(move || {
+        let mut ready = Some(ready_tx);
+        let result = worker(&engine_args, &mut receive, &worker_stats, eos, |state| {
+            if let Some(ready) = ready.take() { let _ = ready.send(Ok(state)); } Ok(())
+        });
+        if let Some(ready) = ready.take() {
+            let _ = ready.send(Err(anyhow::anyhow!("MiniMax initialization failed: {:#}",
+                result.as_ref().err().context("worker exited before readiness")?)));
+        }
+        result
+    });
+    let (context, vision) = ready_rx.await.context("MiniMax worker exited before readiness")??;
+    if let Some(preparer) = vision { profile = profile.with_loaded_vision(preparer); }
+    let limits = NativeLimits::new(u32::try_from(context)?, args.max_output.min(context as u32))?;
+    let hub = crate::shared::console::hub(false, || Ok(crate::shared::console::Layout::new("minimax_m3", profile.id.clone(), snapshot.clone())));
+    let router = cuteafd_api::openai::router_for_model(queue, limits, stats, std::time::Duration::from_secs(25),
+        hub.clone(), api.serve(profile, &snapshot)?);
+    let listener = tokio::net::TcpListener::bind(&args.listen).await?;
+    cuteafd_bench::ready(&listener);
+    tokio::select! {
+        served = axum::serve(listener, api.app(router, hub).into_make_service_with_connect_info::<SocketAddr>()) => served?,
+        _ = crate::shared::api::watch_scheduler(handle) => unreachable!(),
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+    fn args() -> ServeArgs {
+        let cli = crate::cli::Cli::try_parse_from(["cuteafd", "serve-minimax", "--snapshot", "/model",
+            "--native-lib", "/lib.so", "--peers", "127.0.0.1:1,127.0.0.1:2"]).unwrap();
+        let crate::cli::Commands::ServeMiniMax(args) = cli.command else {panic!("MiniMax dispatch")}; args
+    }
+    #[test]
+    fn minimax_unsupported_modes_fail_before_native_load() {
+        assert_eq!(args().validate().unwrap(), None);
+        let mut a=args(); a.split_device=Some(1); assert!(a.validate().unwrap_err().downcast_ref::<MiniMaxError>().is_some());
+        let mut a=args(); a.kv_cache=Qwen4KvCache::Bf16; assert!(a.validate().is_err());
+        let mut a=args(); a.speculator="dspark".into(); assert!(a.validate().is_err());
+        let mut a=args(); a.rtx_expert_layers="58".into(); assert!(a.validate().is_err());
+        let mut a=args(); a.rtx_expert_layers="3".into(); assert_eq!(a.validate().unwrap(),Some(3));
+    }
+}

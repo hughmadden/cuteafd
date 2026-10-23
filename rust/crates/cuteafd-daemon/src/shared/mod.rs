@@ -18,6 +18,7 @@ pub(crate) mod launch_grid;
 pub(crate) mod mapped_table;
 pub(crate) mod memory;
 pub(crate) mod memory_report;
+pub(crate) mod minimax_ffi;
 pub(crate) mod peer_probe;
 pub(crate) mod peer_split;
 pub(crate) mod placement;

@@ -94,7 +94,7 @@ impl SparkAdmission {
                     .with_context(|| format!("Spark admission rank {rank} checkpoint assignment"))
             }).collect::<Result<Vec<_>>>()?
         };
-        let push_snapshot = if catalog.is_some_and(|c|
+        let push_snapshot = if geometry != ExpertGeometry::MINIMAX_M3 && catalog.is_some_and(|c|
             c.format() != cuteafd_loader::plan::checkpoint::CheckpointFormat::Exlr8 || manifest.is_some())
             && !working.spark_layers.is_empty() && assignments.iter().all(|a| a.resident_bytes > 0)
             && topology.is_none_or(|t| t.tp() as usize == world)
@@ -591,6 +591,26 @@ mod tests {
                     ..Default::default() }, 4, None, Some("up1"))?;
             }
         }
+        Ok(())
+    }
+
+    #[test]
+    fn minimax_admission_keeps_divisor_scales_on_mount_loading() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        cuteafd_loader::plan::testing::write_minimax_m3_snapshot(root.path(), false, false);
+        mark_namespace(root.path())?;
+        let mut catalog = cuteafd_loader::read_expert_catalog(root.path())?;
+        catalog.select_draft(cuteafd_loader::plan::spec::DraftOwnership::None)?;
+        let mut model = fixture_model();
+        for endpoint in &mut model.endpoints { endpoint.ingress = SparkIngress::Bf16; }
+        let working = SparkWorkingSet { rtx_layers: vec![3], spark_layers: (4..60).collect(),
+            spark_ranks: 3, prefill_lanes: 1 };
+        let plan = SparkAdmission::plan(root.path(), ExpertGeometry::MINIMAX_M3, Some(&catalog),
+            &working, 3, None, model)?;
+        assert!(!plan.pushes());
+        assert!(!plan.coordinator_pushes());
+        assert_eq!(plan.assignments.len(), 3);
+        assert!(plan.assignments.iter().all(|rank| rank.resident_bytes > 0));
         Ok(())
     }
 
