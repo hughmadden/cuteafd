@@ -64,7 +64,7 @@ fn report_context(dir: &std::path::Path, gpus: usize, gib: u64, ranks: usize, po
     let manifest = native_manifest(dir);
     plan::plan(dir, &PlanOptions { placement: ExpertPlacement::from_spark_ranks(ranks),
         draft_ownership: Some(spec::DraftOwnership::None),
-        layout: Some(layout::LayoutOptions { rtx_bytes: vec![gib<<30;gpus], pool_tokens: pool, context_tokens: context,
+        layout: Some(layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)), rtx_bytes: vec![gib<<30;gpus], pool_tokens: pool, context_tokens: context,
             workspace_manifest: Some(manifest), ..Default::default() }),
         ..Default::default() }).unwrap()
 }
@@ -222,7 +222,7 @@ fn full_context_mtp_forecast_charges_private_predictors_before_allocation() -> a
             let planned = plan::plan(&checkpoint_path, &PlanOptions {
                 placement: ExpertPlacement::from_spark_ranks(6),
                 draft_ownership: if depth == 0 { Some(spec::DraftOwnership::None) } else { None },
-                layout: Some(layout::LayoutOptions {
+                layout: Some(layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)),
                     rtx_bytes: vec![capacity; 2], pool_tokens: inputs.requested_pool, step5_kv: kv_format,
                     context_tokens: inputs.context, concurrency: inputs.sequences as u64,
                     prefill_rows: inputs.rows as u64, prefill_lanes: inputs.waves as u64, headroom_bytes: 1 << 30,
@@ -880,7 +880,7 @@ fn missing_headers_stale_index_and_direct_text_detection() {
     cp.tensors.retain(|t|t.meta.name != "model.layers.3.moe.gate_proj.weight");
     let input = PlanInput::from_checkpoint(cp);
     let result = input.plan(&PlanOptions { placement:ExpertPlacement::Sparks { ranks:6 },
-        layout:Some(Default::default()), ..Default::default() }).unwrap();
+        layout:Some(layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)), ..Default::default() }), ..Default::default() }).unwrap();
     assert!(!result.executable() && !result.wip_launchable() && !result.native_serving_admitted);
     assert!(result.hints.iter().any(|h| h.what.contains("missing safetensors headers")));
 }
@@ -895,7 +895,7 @@ fn unknown_tensor_and_context_ownership_fail_closed() {
     let dir = snapshot("fp8");
     let r = plan::plan(dir.path(), &PlanOptions { placement:ExpertPlacement::Sparks { ranks:6 },
         attention_placement:Some(crate::placement::AttentionPlacement::Context),
-        layout:Some(layout::LayoutOptions { rtx_bytes:vec![96<<30;2], ..Default::default() }),
+        layout:Some(layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)), rtx_bytes:vec![96<<30;2], ..Default::default() }),
         ..Default::default() }).unwrap();
     assert!(!r.wip_launchable() && !r.native_serving_admitted);
     assert!(r.config_error.as_deref().is_some_and(|e| e.contains("context")));
@@ -912,7 +912,7 @@ fn planner_rejects_all_whole_swa_before_serving_admission() {
             placement: ExpertPlacement::Sparks { ranks: 6 },
             draft_ownership: Some(spec::DraftOwnership::None),
             attention_placement: attention,
-            layout: Some(layout::LayoutOptions { rtx_bytes: vec![96 << 30; 2],
+            layout: Some(layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)), rtx_bytes: vec![96 << 30; 2],
                 head_split, workspace_manifest: Some(manifest.clone()), ..Default::default() }),
             ..Default::default()
         }).unwrap();

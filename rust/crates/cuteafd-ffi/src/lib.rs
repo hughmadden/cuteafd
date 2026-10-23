@@ -126,19 +126,47 @@ fn memory_cgroup_paths(membership: &str) -> Vec<(std::path::PathBuf, bool)> {
     paths
 }
 
-fn cgroup_allocatable_bytes(mut available: usize, membership: &str,
-    read: impl Fn(&Path) -> Result<Option<String>>) -> Result<usize> {
+fn cgroup_memory_limits(mut total: u64, mut available: u64, membership: &str,
+    read: impl Fn(&Path) -> Result<Option<String>>) -> Result<(u64, u64)> {
     for (path, v2) in memory_cgroup_paths(membership) {
-        let (limit_file, current_file) = if v2 { ("memory.max", "memory.current") }
-            else { ("memory.limit_in_bytes", "memory.usage_in_bytes") };
+        let (limit_file, current_file, inactive_key) = if v2 {
+            ("memory.max", "memory.current", "inactive_file")
+        } else { ("memory.limit_in_bytes", "memory.usage_in_bytes", "total_inactive_file") };
         let Some(limit) = read(&path.join(limit_file))? else { continue };
         if limit.trim() == "max" { continue }
         let limit: u64 = limit.trim().parse().context("invalid cgroup memory limit")?;
         let current = read(&path.join(current_file))?.context("missing cgroup memory usage")?;
         let current: u64 = current.trim().parse().context("invalid cgroup memory usage")?;
-        available = available.min(usize::try_from(limit.saturating_sub(current)).unwrap_or(usize::MAX));
+        let stat = read(&path.join("memory.stat"))?.unwrap_or_default();
+        let inactive = stat.lines().find_map(|line| {
+            let mut fields = line.split_whitespace();
+            (fields.next() == Some(inactive_key)).then(|| fields.next())
+        }).flatten().map(str::parse::<u64>).transpose()?.unwrap_or(0);
+        // Only inactive file cache is reclaimable working-set headroom.
+        let working_set = current.saturating_sub(inactive);
+        total = total.min(limit);
+        available = available.min(limit.saturating_sub(working_set));
     }
-    Ok(available)
+    Ok((total, available))
+}
+
+fn cgroup_allocatable_bytes(available: usize, membership: &str,
+    read: impl Fn(&Path) -> Result<Option<String>>) -> Result<usize> {
+    let (_, available) = cgroup_memory_limits(u64::MAX, available as u64, membership, read)?;
+    Ok(usize::try_from(available).unwrap_or(usize::MAX))
+}
+
+/// Live MemAvailable bounded by every visible cgroup's reclaimable working set.
+/// The total remains bounded by hard limits for fractional host-cache sizing.
+pub fn host_memory() -> Result<(u64, u64)> {
+    let text = std::fs::read_to_string("/proc/meminfo")?;
+    let total = text.lines().find_map(|line| line.strip_prefix("MemTotal:"))
+        .context("missing MemTotal")?.split_whitespace().next().context("missing MemTotal value")?
+        .parse::<u64>()?.checked_mul(1024).context("MemTotal overflow")?;
+    let available = parse_mem_available(&text)? as u64;
+    anyhow::ensure!(total > 0 && available <= total, "invalid MemTotal/MemAvailable");
+    let membership = std::fs::read_to_string("/proc/self/cgroup")?;
+    cgroup_memory_limits(total, available, &membership, read_cgroup_file)
 }
 
 fn read_cgroup_file(path: &Path) -> Result<Option<String>> {
@@ -289,6 +317,49 @@ mod allocatable_memory_tests {
         assert!(cgroup_allocatable_bytes(90, "0::/", |p| Ok(
             p.ends_with("memory.max").then(|| "30".into()))).is_err());
         assert!(cgroup_allocatable_bytes(90, "0::/", |_| anyhow::bail!("denied")).is_err());
+    }
+
+    #[test]
+    fn cgroup_working_set_reclaims_only_inactive_file_cache() {
+        let files = std::collections::HashMap::from([
+            ("/sys/fs/cgroup/team/worker/memory.max", "48"),
+            ("/sys/fs/cgroup/team/worker/memory.current", "44"),
+            ("/sys/fs/cgroup/team/worker/memory.stat", "inactive_file 8\nactive_file 30\n"),
+            ("/sys/fs/cgroup/team/memory.max", "64"),
+            ("/sys/fs/cgroup/team/memory.current", "60"),
+            ("/sys/fs/cgroup/team/memory.stat", "inactive_file 40\n"),
+            ("/sys/fs/cgroup/memory.max", "max"),
+        ]);
+        let read = |p: &std::path::Path| Ok(files.get(p.to_str().unwrap()).map(|s| s.to_string()));
+        assert_eq!(super::cgroup_memory_limits(128, 96, "0::/team/worker", read).unwrap(), (48, 12));
+        assert_eq!(cgroup_allocatable_bytes(5, "0::/team/worker", read).unwrap(), 5);
+        let root = |p: &std::path::Path| Ok(match p.to_str().unwrap() {
+            "/sys/fs/cgroup/memory.max" => Some("30".into()),
+            "/sys/fs/cgroup/memory.current" => Some("40".into()),
+            "/sys/fs/cgroup/memory.stat" => Some("inactive_file 25\n".into()),
+            _ => None,
+        });
+        assert_eq!(cgroup_allocatable_bytes(90, "0::/hidden/host/path", root).unwrap(), 15);
+        let legacy = |p: &std::path::Path| Ok(match p.to_str().unwrap() {
+            "/sys/fs/cgroup/memory/memory.limit_in_bytes" => Some("32".into()),
+            "/sys/fs/cgroup/memory/memory.usage_in_bytes" => Some("28".into()),
+            "/sys/fs/cgroup/memory/memory.stat" => Some("inactive_file 1\ntotal_inactive_file 16\n".into()),
+            _ => None,
+        });
+        assert_eq!(cgroup_allocatable_bytes(90, "7:memory:/", legacy).unwrap(), 20);
+        for (current, stat, expected) in [("40", "inactive_file 0", 0),
+            ("4", "inactive_file 8", 32), ("28", "active_file 16", 4)] {
+            let fixture = |p: &std::path::Path| Ok(match p.file_name().and_then(|n| n.to_str()) {
+                Some("memory.max") => Some("32".into()),
+                Some("memory.current") => Some(current.into()),
+                Some("memory.stat") => Some(stat.into()),
+                _ => None,
+            });
+            assert_eq!(cgroup_allocatable_bytes(90, "0::/", fixture).unwrap(), expected);
+        }
+        assert!(cgroup_allocatable_bytes(90, "0::/", |p| Ok(Some(match p.file_name().unwrap().to_str().unwrap() {
+            "memory.stat" => "inactive_file invalid", _ => "32"
+        }.into()))).is_err());
     }
 
     #[test]

@@ -509,7 +509,7 @@ mod tests {
                 cuteafd_loader::families::mimo_v2::MimoExpertInput::Bf16] {
                 let report = cuteafd_loader::plan::plan(dir.path(), &PlanOptions {
                     placement: ExpertPlacement::Sparks { ranks },
-                    layout: Some(LayoutOptions { pool_tokens: Some(32768), concurrency: 4, mimo_expert_input: input,
+                    layout: Some(LayoutOptions { host_memory: Some((128 << 30, 128 << 30)), pool_tokens: Some(32768), concurrency: 4, mimo_expert_input: input,
                         onboard: Some(cuteafd_loader::placement::Onboard::Layers(0)), ..Default::default() }),
                     ..Default::default() }).unwrap();
                 let layout = report.memory_layout.unwrap();

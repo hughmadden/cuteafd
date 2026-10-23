@@ -191,7 +191,7 @@ mod tests {
         let report = plan_spark_count(dir.path(), &PlanOptions {
             placement: ExpertPlacement::from_spark_ranks(ranks),
             vision: crate::plan::MediaMode::Off, audio: crate::plan::MediaMode::Off,
-            layout: Some(LayoutOptions { rtx_bytes: vec![96 << 30; gpus],
+            layout: Some(LayoutOptions { host_memory: Some((128 << 30, 128 << 30)), rtx_bytes: vec![96 << 30; gpus],
                 workspace_manifest: Some(manifest), pool_tokens: Some(0),
                 prefill_rows: 256, context_tokens: 262_144, ..Default::default() }),
             ..Default::default()

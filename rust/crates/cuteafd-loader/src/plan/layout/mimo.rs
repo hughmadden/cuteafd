@@ -450,7 +450,7 @@ mod tests {
                     for (graphs, expert_input) in [false, true].into_iter().flat_map(|graphs|
                         [MimoExpertInput::Fp8, MimoExpertInput::Bf16, MimoExpertInput::Bf16Decode]
                             .map(|input| (graphs, input))) {
-                        let opts = LayoutOptions { rtx_bytes: vec![95 * GIB; ranks], concurrency: 4,
+                        let opts = LayoutOptions { host_memory: Some((128 << 30, 128 << 30)), rtx_bytes: vec![95 * GIB; ranks], concurrency: 4,
                             pool_tokens: Some(32768), mimo_decode_graphs: graphs, mimo_swa_kv: swa,
                             mimo_expert_input: expert_input, ..Default::default() };
                         let planned = profile(&checkpoint, &opts, ranks, 4, 4096, 4, 32768, None).unwrap();
@@ -518,7 +518,7 @@ mod tests {
         for (total, baseline) in [(101_973_491_712u64, 586_416_128u64),
             (101_970_345_984, 586_416_128), (34_144_990_003, 596_901_888)] {
             let baseline = baseline + 35_651_584;
-            let opts = LayoutOptions { rtx_bytes: vec![total], headroom_bytes: 0, concurrency: 4, ..Default::default() };
+            let opts = LayoutOptions { host_memory: Some((128 << 30, 128 << 30)), rtx_bytes: vec![total], headroom_bytes: 0, concurrency: 4, ..Default::default() };
             let mut profile = profile(&checkpoint, &opts, 1, 2, 4096, 4, 1 << 20, None).unwrap();
             let cublas = crate::placement::inventory::ArchContext::for_device("sm_120", total).cublas_bytes;
             profile.steady.devices[0].reservations.push(cuteafd_core::serving_capacity::MemoryReservation {
@@ -606,7 +606,7 @@ mod tests {
                     }}})).unwrap()).unwrap();
                     let context = 256 << 10;
                     let sparks = if pro { 6 } else if ranks == 1 { 2 } else { 4 };
-                    let opts = LayoutOptions { rtx_bytes: totals.clone(), head_split: ranks == 2, mimo_swa_kv: sliding,
+                    let opts = LayoutOptions { host_memory: Some((128 << 30, 128 << 30)), rtx_bytes: totals.clone(), head_split: ranks == 2, mimo_swa_kv: sliding,
                         pool_tokens: Some(2 << 20), concurrency: 16, host_cache_bytes: Some(0), mimo_expert_manifest: Some(package),
                         ..Default::default() };
                     let costs = profile(&checkpoint, &opts, ranks, sparks, 4096, 16, context, None).unwrap();
@@ -706,7 +706,7 @@ mod tests {
         let checkpoint = input.checkpoint();
         let catalog = crate::read_expert_catalog(&checkpoint.snapshot).unwrap();
         let tensors = catalog.fp8().unwrap();
-        let options = LayoutOptions { workspace_manifest: Some(dir.path().join("share/PROGRAMS.json")),
+        let options = LayoutOptions { host_memory: Some((128 << 30, 128 << 30)), workspace_manifest: Some(dir.path().join("share/PROGRAMS.json")),
             ..Default::default() };
         assert!(!crate::placement::inventory::image_lib(options.workspace_manifest.as_deref()).exists());
         let recipe = super::super::super::experts::spark_recipe("mimop:fp8", 2048, 6).unwrap();
@@ -743,7 +743,7 @@ mod tests {
             let cfg = MimoV2Config::from_hf(&config).unwrap();
             for ranks in [1, 2] {
                 let manifest = dir.path().join(format!("spark-free-tp{ranks}.json"));
-                let mut options = LayoutOptions { rtx_bytes: vec![32 * GIB; ranks],
+                let mut options = LayoutOptions { host_memory: Some((128 << 30, 128 << 30)), rtx_bytes: vec![32 * GIB; ranks],
                     head_split: ranks == 2, concurrency: 4,
                     mimo_expert_manifest: Some(manifest.clone()), ..Default::default() };
                 let devices = || (0..ranks).map(|rank| DeviceLayout {

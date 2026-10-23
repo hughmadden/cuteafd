@@ -119,7 +119,7 @@ mod draft_prefix_tests {
         std::fs::write(dir.path().join("dflash/config.json"),
             r#"{"num_hidden_layers":5,"num_key_value_heads":8,"head_dim":128}"#).unwrap();
         let cfg = MimoV2Config::from_hf(&config).unwrap();
-        assert_eq!(LayoutOptions::default().mimo_swa_kv, MimoKvFormats::default().sliding);
+        assert_eq!(LayoutOptions { host_memory: Some((128 << 30, 128 << 30)), ..Default::default() }.mimo_swa_kv, MimoKvFormats::default().sliding);
         for sliding in [MimoKvCache::Bf16, MimoKvCache::Int8, MimoKvCache::Fp8] {
             let cache = cuteafd_loader::serving_capacity::mimo_cache_geometry(
                 &cfg, cfg.layers, 1, MimoKvFormats { full: MimoKvCache::Int8, sliding }, 0).unwrap();
@@ -136,7 +136,7 @@ mod draft_prefix_tests {
                             let slots = mark_slots(&cli.prefix, concurrency,
                                 aggregate_mark_bytes(target, draft, enabled).unwrap() as usize).unwrap() as u64;
                             let layout = plan(dir.path(), &PlanOptions {
-                                layout: Some(LayoutOptions {
+                                layout: Some(LayoutOptions { host_memory: Some((128 << 30, 128 << 30)),
                                     concurrency: concurrency as u64, mimo_prefix_draft: enabled, draft_kv_cache,
                                     mimo_swa_kv: sliding,
                                     mimo_prefix_mark_bytes: mib << 20, host_cache_bytes: Some(0), ..Default::default()

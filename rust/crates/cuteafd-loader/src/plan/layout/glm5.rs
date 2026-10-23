@@ -430,10 +430,10 @@ mod tests {
             }
             for context in [1 << 20, default + 128] {
                 for pool_tokens in [None, Some(0)] {
-                    let options = LayoutOptions { rtx_bytes: vec![96 << 30; gpus],
+                    let options = LayoutOptions { host_memory: Some((128 << 30, 128 << 30)), rtx_bytes: vec![96 << 30; gpus],
                         context_tokens: context, pool_tokens, glm5_drafter_disabled: true, ..Default::default() };
                     let (memory, placement) = native_layout(&checkpoint, &options, &vec![256; gpus], 256, 4, &manifest).unwrap();
-                    let drafting = LayoutOptions { glm5_drafter_disabled: false,
+                    let drafting = LayoutOptions { host_memory: Some((128 << 30, 128 << 30)), glm5_drafter_disabled: false,
                         drafter_bytes: 1 << 30, ..options.clone() };
                     let (_, draft_placement) = native_layout(&checkpoint, &drafting,
                         &vec![256; gpus], 256, 4, &manifest).unwrap();
@@ -447,13 +447,13 @@ mod tests {
                         else { crate::placement::AttentionPlacement::Heads });
                 }
             }
-            let options = LayoutOptions { rtx_bytes: vec![96 << 30; gpus],
+            let options = LayoutOptions { host_memory: Some((128 << 30, 128 << 30)), rtx_bytes: vec![96 << 30; gpus],
                 context_tokens: default + 128, pool_tokens: Some(default), glm5_drafter_disabled: true, ..Default::default() };
             let error = native_layout(&checkpoint, &options, &vec![256; gpus], 256, 4, &manifest).unwrap_err();
             assert_eq!(error.downcast_ref::<PlacementError>(), Some(&PlacementError::RequestedBelowContext {
                 requested: default, floor: default + 128,
             }));
-            let options = LayoutOptions { rtx_bytes: vec![1 << 30; gpus],
+            let options = LayoutOptions { host_memory: Some((128 << 30, 128 << 30)), rtx_bytes: vec![1 << 30; gpus],
                 context_tokens: 1 << 20, pool_tokens: Some(1 << 20), glm5_drafter_disabled: true, ..Default::default() };
             assert!(native_layout(&checkpoint, &options, &vec![256; gpus], 256, 4, &manifest).is_err());
             assert!(native_layout(&checkpoint, &options, &[], 256, 4, &manifest).is_err());

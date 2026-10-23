@@ -70,18 +70,8 @@ impl NativePlan {
     }
 
     pub(crate) fn admit_host(&self) -> Result<()> {
-        let text = std::fs::read_to_string("/proc/meminfo")?;
-        let available = text
-            .lines()
-            .find_map(|line| line.strip_prefix("MemAvailable:"))
-            .context("EXLR8 host admission needs MemAvailable")?
-            .split_whitespace()
-            .next()
-            .context("EXLR8 host memory value")?
-            .parse::<usize>()?
-            .checked_mul(1024)
-            .context("EXLR8 host memory overflow")?;
-        let available = cuteafd_ffi::cgroup_memory_headroom(available)?;
+        let (_, available) = cuteafd_loader::formats::mapped_preload::host_memory()?;
+        let available = usize::try_from(available)?;
         ensure!(
             self.host_peak <= available,
             "EXLR8 coordinator host peak {} exceeds available {available}",
