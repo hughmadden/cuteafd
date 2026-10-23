@@ -108,9 +108,9 @@ pub(crate) struct EngineArgs {
     /// Numerical decode/verify reduction rows, independent of execution capacity.
     #[arg(long, env = "CUTEAFD_ATTENTION_PLAN_ROWS")]
     pub attention_plan_rows: Option<usize>,
-    /// Lanes a Spark prefill chunk runs in, each with its own Spark transport and exchange in
-    /// flight while the other lanes' GPU layers run (1 to 4): a chunk of up to lanes x
-    /// --prefill-rows rows. The lanes share one set of attention temporaries.
+    /// Maximum live prefill units on one Spark transport (1 to 4; mixed layer ownership caps
+    /// this at 2). Units retain their own operands and share attention temporaries; long
+    /// spans reuse slots continuously. --prefill-rows bounds each unit's rows.
     #[arg(long = "prefill-waves", default_value_t = engine::DEFAULT_PREFILL_WAVES,
         value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..=engine::MAX_PREFILL_WAVES as u64))]
     pub prefill_waves: usize,
@@ -791,14 +791,16 @@ mod draft_cli_tests {
         let sized = ["args.expert", "_rows()"].concat();
         assert!(dense.contains(&["DenseNvfp4::load(&self.library, &directory, &self.cfg, ", &sized, ")?"].concat()));
         // FP8 experts, EXL3 experts and the Spark transports, each with the rows among its arguments.
-        for site in ["Fp8Experts::load(", "max_rows: ", "SparkLink::new("] {
+        for site in ["Fp8Experts::load(", "max_rows: ", "SparkLink::new_waves("] {
             let at = experts.find(site).unwrap_or_else(|| panic!("{site}"));
             let arguments: String = experts[at..].chars().take(200).collect();
             assert!(arguments.contains(&sized), "{site}");
         }
         assert_eq!(experts.matches(&sized).count(), 4);
         let lane = ["args.prefill", "_rows"].concat();
-        assert!(!dense.contains(&lane) && !experts.contains(&lane));
+        assert!(!dense.contains(&lane));
+        // Only the intake plane uses the unit width; all expert math holds expert_rows.
+        assert_eq!(experts.matches(&lane).count(), 1);
     }
 
     #[test]
@@ -984,8 +986,8 @@ pub(crate) enum Fp8PrefillGroup {
 pub(crate) struct GoldenArgs {
     #[command(flatten)]
     pub engine: EngineArgs,
-    /// Directory with tokens.bin, layerNN.bin and logits.bin from
-    /// python/reference/families/glm5_flash/golden.py.
+    /// Directory with tokens.bin, layerNN.bin and logits.bin from the family reference;
+    /// token-only diagnostics also accept the published Flash fidelity dataset's quick windows.
     #[arg(long)]
     pub golden: PathBuf,
     /// Prefill only the first N tokens, then feed the rest through decode
@@ -1122,7 +1124,7 @@ pub(crate) struct GoldenArgs {
     pub resume_poison_unit0: bool,
     /// Prefill lanes against serial passes: one pipelined chunk of the golden prompt (--prefill N
     /// truncates it) through the lanes, and through serial passes over the same cuts; every row's
-    /// logits, the KDA state and every paged byte must be identical. Needs Spark --peers.
+    /// logits, the KDA state and every paged byte must be identical. Local or Spark experts.
     #[arg(long)]
     pub lane_check: bool,
     /// Packed prefill against each sequence's own pass: N (2 to 10) sequences of mixed lengths cut
@@ -1448,6 +1450,7 @@ impl Opened {
             .transpose()?;
         let spark_ranks = args.peers.as_deref().map_or(0, |p| p.split(',').count());
         let lanes = engine::configured_prefill_waves(layers == self.cfg.layers, args.prefill_waves);
+        let lanes = usize::try_from(admission::admitted_prefill_waves(attention.mode, lanes as u64))?;
         let lookup = |name: &str| programs.spec(name).ok().map(|p| p.scratch.get("scratch").copied().unwrap_or(0));
         let scratch = GlmfScratchOptions { split, kda_w8: representation.kda_fp8,
             kda_fp32_partials: args.kda_fp32_partials, kda_output_shard: args.kda_output_shard,
@@ -2340,14 +2343,12 @@ fn golden_run(args: &GoldenArgs, opened: &Opened, engine: &engine::GlmfEngine<'_
         return speculate::bench_verify(args, engine, rows);
     }
     if args.upload_check {
-        let tokens: Vec<u32> = std::fs::read(args.golden.join("tokens.bin"))?
-            .chunks_exact(4).map(|b| u32::from_le_bytes(b.try_into().unwrap())).collect();
+        let tokens = lane_check::input_tokens(&args.golden, engine.cfg.vocab_size)?;
         let n = args.prefill.unwrap_or(tokens.len()).min(tokens.len());
         return prefix::upload_check(engine, &tokens[..n], args.prefill_chunk.unwrap_or(256));
     }
     if let Some(at) = args.resume_at {
-        let tokens: Vec<u32> = std::fs::read(args.golden.join("tokens.bin"))?
-            .chunks_exact(4).map(|b| u32::from_le_bytes(b.try_into().unwrap())).collect();
+        let tokens = lane_check::input_tokens(&args.golden, engine.cfg.vocab_size)?;
         let n = args.prefill.unwrap_or(tokens.len()).min(tokens.len());
         return prefix::resume_check(engine, &tokens, at, n,
             args.prefill_chunk.unwrap_or(engine.prefill_rows), args.resume_decode, args.resume_cold,
@@ -2357,14 +2358,12 @@ fn golden_run(args: &GoldenArgs, opened: &Opened, engine: &engine::GlmfEngine<'_
         return token_check(args, opened, engine, steps);
     }
     if args.lane_check {
-        let tokens: Vec<u32> = std::fs::read(args.golden.join("tokens.bin"))?
-            .chunks_exact(4).map(|b| u32::from_le_bytes(b.try_into().unwrap())).collect();
+        let tokens = lane_check::input_tokens(&args.golden, engine.cfg.vocab_size)?;
         let n = args.prefill.unwrap_or(tokens.len()).min(tokens.len());
         return lane_check::lane_check(engine, &tokens[..n]);
     }
     if let Some(sequences) = args.packed_check {
-        let tokens: Vec<u32> = std::fs::read(args.golden.join("tokens.bin"))?
-            .chunks_exact(4).map(|b| u32::from_le_bytes(b.try_into().unwrap())).collect();
+        let tokens = lane_check::input_tokens(&args.golden, engine.cfg.vocab_size)?;
         return packed_check::packed_check(engine, &tokens, sequences);
     }
     if engine.drafter.is_some() {

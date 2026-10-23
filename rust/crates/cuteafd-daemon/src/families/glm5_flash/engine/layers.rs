@@ -89,8 +89,9 @@ impl<'a> GlmfEngine<'a> {
         // Context tables currently describe one global unit partition, not per-layer geometry.
         ensure!(self.context.is_none() && !plan.modes().contains(&LayerMode::ContextSplit),
             "GLM mixed context execution requires per-layer paging tables");
-        ensure!(plan.spec().lanes == self.prefill_waves as u64 && (1..=4).contains(&self.prefill_waves),
+        ensure!(plan.spec().lanes == self.prefill_waves as u64,
             "GLM Flash hop slots must match admitted unit slots");
+        cuteafd_loader::placement::validate_layer_pipeline_lanes(plan.spec().lanes, self.prefill_waves)?;
         ensure!(plan.modes().iter().all(|mode| !matches!(mode,
             LayerMode::Whole { ffn: FfnMode::Owner, .. })), "GLM layer executor requires split FFNs");
         let exchange = self.exchange()?;

@@ -5509,8 +5509,8 @@ mod prefill_lane_tests {
         let spark = GlmfStepShape { local_experts: false, spark: true, ..shape };
         assert_eq!(glmf_step_workspaces(&cfg, 2, 4096, 64, &spark, decode, prefill).device_bytes(), 2_882_837_760);
         let reserve = super::workspace_reserve_bytes(shared, 2, true);
-        assert_eq!(reserve, shared + 4 * super::WORKSPACE_RUNTIME_OVERHEAD_BYTES);
-        assert!(reserve >= shared + 3 * 71_942_144 + 68_269_888);
+        assert_eq!(reserve, shared + 3 * super::WORKSPACE_RUNTIME_OVERHEAD_BYTES);
+        assert!(reserve >= shared + 2 * 71_942_144 + 68_269_888);
         // The programs' scratch keeps its capacity whatever a lane's rows.
         for rows in [1, 64, 512, 4096] {
             let temps = glmf_temporary_bytes(&cfg, rows, false, &shape, prefill);
@@ -5530,10 +5530,10 @@ mod prefill_lane_tests {
             < glmf_lane_bytes(&cfg, 4096, false, &shape).device_bytes());
         // Scoring's exact union (`--full-prefill-logits`): the same lanes, a serial prefill in lane 0,
         // the all-row logits once in their shared temporaries. Whole workspaces held them three
-        // times (a serial workspace and two lanes) at four runtime allowances.
+        // times (a serial workspace and two lanes). Runtime now owns decode and one arena.
         let scoring = glmf_step_workspaces(&cfg, 2, 4096, 64, &full, decode, prefill).device_bytes();
         assert_eq!(scoring - shared, (4096 - 64) * 154_880 * 4);
-        assert_eq!(super::workspace_reserve_bytes(scoring, 2, false), scoring + 3 * super::WORKSPACE_RUNTIME_OVERHEAD_BYTES);
+        assert_eq!(super::workspace_reserve_bytes(scoring, 2, false), scoring + 2 * super::WORKSPACE_RUNTIME_OVERHEAD_BYTES);
     }
 
     #[test]

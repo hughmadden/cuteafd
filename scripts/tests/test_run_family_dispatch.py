@@ -606,14 +606,18 @@ def test_glmf_selection_starts_after_solve_and_seals_before_opening_lanes() -> N
     admission = source[source.index("    fn admit("):source.index("    pub fn with_engine<")]
     assert "solve_attention_working_set_with_graphs(" in admission
     assert "let local_workspace = workspaces(false, lanes);" in admission
-    assert "configured_prefill_lanes(layers == self.cfg.layers, args.prefill_lanes)" in admission
+    assert "configured_prefill_waves(layers == self.cfg.layers, args.prefill_waves)" in admission
+    assert "admitted_prefill_waves(attention.mode, lanes as u64)" in admission
     engine = (ROOT / "rust/crates/cuteafd-daemon/src/families/glm5_flash/engine.rs").read_text()
-    pipeline = engine.split("    fn pipelined(&self)", 1)[1].split("    /// Longest chunk", 1)[0]
-    assert "prefill_pipeline_available(" in pipeline and "_ => None" in pipeline
-    lane_step = engine.split("    fn step_lanes_inner(", 1)[1].split("    ///", 1)[0]
-    assert "pipelined prefill needs Spark experts" not in lane_step
-    assert "self.spark_land_lane(" in lane_step
-    assert "Some(Experts::Skip)" in lane_step
+    pipeline = engine.split("    fn pipelined(&self)", 1)[1].split("    /// The continuous span", 1)[0]
+    assert "self.weights.layers.len() == self.cfg.layers" in pipeline
+    units = (ROOT / "rust/crates/cuteafd-daemon/src/families/glm5_flash/engine/units.rs").read_text()
+    assert "run_prefill_units(&mut hooks, &units, waves)" in units
+    assert "spark_land_unit(" in units and "unit_ffn_finish(" in units
+    begin = units.split("    fn begin_unit(", 1)[1].split("    fn attention(", 1)[0]
+    attention = units.split("    fn attention(", 1)[1].split("    fn local_ffn(", 1)[0]
+    assert "exchange_direct(" not in begin
+    assert attention.index("return e.unit_attention(") < attention.index("e.exchange_direct(") < attention.index("e.peer_attention(")
     layout = (ROOT / "rust/crates/cuteafd-loader/src/plan/layout/glm5_flash.rs").read_text()
     assert "step_workspace(&ExpertPlacement::Local, lanes)" in layout
     assert "local_workspace = Some(estimate(lanes))" in layout
@@ -632,7 +636,7 @@ def test_glmf_selection_starts_after_solve_and_seals_before_opening_lanes() -> N
     assert "GlmfComponent::SparkExperts, gpu, Category::Transport, \"Spark intake\"" in request
     expert = source[source.index("    fn experts_for_layers<"):source.index("impl Opened {\n    /// The checkpoint's `embed_tokens`")]
     assert expert.index("validate_expert_layers(&self.cfg, served, selected)?;") < expert.index("if selected.is_empty() { return Ok(None); }")
-    assert expert.index("if selected.is_empty() { return Ok(None); }") < expert.index("Fp8Experts::load(") < expert.index("SparkLink::new(")
+    assert expert.index("if selected.is_empty() { return Ok(None); }") < expert.index("Fp8Experts::load(") < expert.index("SparkLink::new_waves(")
     assert "tensors, &directory, selected, 1, 0," in expert
     assert "layers: selected.to_vec()" in expert
     assert "spark_warmup_request(&self.cfg, warm_rows, remote[0], self.checkpoint.spark_input_is_bf16())" in expert

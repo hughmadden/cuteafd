@@ -29,8 +29,8 @@
 //! pooled keys bit for bit); then the chunk's rows on this GPU's units go into its pools. Goldens
 //! and exact prefix restores therefore do not depend on chunking or ownership.
 //!
-//! **Tables.** A step's per-rank tables are built on the host and uploaded once at the step's
-//! start, after both streams drained, so no queued kernel reads a table the host rewrites.
+//! **Tables.** Stream-ordered uploads retain their pinned sources until completion. Gather
+//! maps grow by identical prefixes; commit maps belong to each retained live-unit slot.
 use super::*;
 use crate::shared::peer_split::context::{commit_blocks, local_pages, page_owner,
     CommitPlane, ContextExchange};
@@ -198,10 +198,9 @@ impl<'a> GlmfEngine<'a> {
         rank_tables(tables, rank, self.pool_pages)
     }
 
-    /// Uploads a prefill unit's gather tables and commit blocks for `rank` (its stream is idle:
-    /// called with the step's other tables). The unit gathers the units holding rows `[0, gather)`
-    /// (0: the step's first lane gathers for every lane) and commits rows `[start, start + rows)`
-    /// of `units` (the sequence's unit ids).
+    /// Enqueues `rank`'s gather tables and slot-owned commit blocks with its other tables.
+    /// The unit gathers history `[0, gather)` and commits `[start, start + rows)` of `units`
+    /// (the sequence's unit ids); uploads follow earlier consumers on the same stream.
     pub(super) fn context_prefill_tables(&self, rank: usize, lane: usize, gather: usize, start: usize, rows: usize,
         units: &[u32]) -> Result<ContextUnit> {
         let split = self.context.as_ref().context("context split")?;
@@ -386,8 +385,8 @@ impl<'a> GlmfEngine<'a> {
         let copy = |kind: usize, source: CuteafdDeviceBuffer, pool: &Dev<'_>| -> Result<()> {
             if unit.commits[kind] == 0 { return Ok(()); }
             // SAFETY: staging and pool are this GPU's live buffers; each listed block lies inside
-            // both (built from the units in `context_prefill_tables`), and the lists stay unchanged
-            // until the next step, which follows a drain of this stream.
+            // both (built from the units in `context_prefill_tables`). Slot reuse enqueues the
+            // next table upload after these consumers on this rank's stream.
             self.on(rank, || unsafe { self.library.cuda_kv_cache_write_blocks_async(source.ptr, pool.buffer.ptr,
                 list(kind, 0)?, list(kind, 1)?, list(kind, 2)?, unit.commits[kind], self.stream_of(rank)) })
         };

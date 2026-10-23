@@ -97,10 +97,6 @@ impl PrefillHooks for UnitHooks<'_, '_, '_> {
         e.load_streams(w, tokens, false)?;
         e.inject_media(w, tables, self.media)?;
         if self.media.is_some_and(|m| !m.spans().is_empty()) { e.put(&w.ids, tokens)?; }
-        if let Some(w1) = self.peer(unit)? {
-            e.exchange_direct(w.streams[0].buffer.ptr, w1.streams[0].buffer.ptr,
-                unit.rows.len() * HC * e.cfg.hidden * 2)?;
-        }
         Ok(())
     }
     fn attention(&mut self, index: usize, unit: &Unit) -> Result<()> {
@@ -119,6 +115,12 @@ impl PrefillHooks for UnitHooks<'_, '_, '_> {
                 &self.ranked[unit.index], unit, index, self.total, &mut self.consumed[unit.index]);
         }
         if let Some(w1) = self.peer(unit)? {
+            // Begin admits several slots before attention runs. Publish the single
+            // DIRECT mailbox only here, next to its wait; mixed Entry owns its copy.
+            if index == 0 {
+                e.exchange_direct(w.streams[0].buffer.ptr, w1.streams[0].buffer.ptr,
+                    unit.rows.len() * HC * e.cfg.hidden * 2)?;
+            }
             e.peer_attention(index, unit.slot, w1, unit.rows.len(), PREFILL_CAP, &self.ranked[unit.index][1])?;
         }
         if index == 0 { e.pre(w, &w.streams[0], layer, rows)?; }

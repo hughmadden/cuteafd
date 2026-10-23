@@ -1182,7 +1182,7 @@ mod tests {
             ),
             (
                 include_str!("../../../families/glm5_flash/engine.rs"),
-                "step_lanes",
+                "step_units",
                 "replay_on",
             ),
             (

@@ -7,6 +7,29 @@
 use super::engine::{Allocator, GlmfEngine, GlmfPlacement};
 use anyhow::{ensure, Context, Result};
 
+/// Token-only diagnostics may consume the shared, checksum-validated quick fidelity windows.
+pub(crate) fn input_tokens(root: &std::path::Path, vocab: usize) -> Result<Vec<u32>> {
+    let path = root.join("tokens.bin");
+    let tokens: Vec<u32> = if path.is_file() {
+        let bytes = std::fs::read(path)?;
+        ensure!(bytes.len() % 4 == 0, "golden token bytes must be u32-aligned");
+        bytes.chunks_exact(4).map(|b| u32::from_le_bytes(b.try_into().unwrap())).collect()
+    } else {
+        use cuteafd_bench::fidelity_dataset;
+        let manifest: serde_json::Value = serde_json::from_slice(&std::fs::read(root.join("manifest.json"))?)?;
+        ensure!(manifest["config"] == fidelity_dataset::GLMF_CONFIG && manifest["vocab"].as_u64() == Some(vocab as u64),
+            "Flash golden fidelity config or vocabulary differs");
+        let reference = fidelity_dataset::load(root, &manifest)?;
+        let windows = fidelity_dataset::quick_windows(&reference)?;
+        ensure!(windows.iter().all(|w| w.media.is_empty()), "Flash unit golden requires text-only windows");
+        println!("unit golden input: sealed quick windows {:?}; set {} (concatenated only for same-cut execution identity)",
+            windows.iter().map(|w| &w.id).collect::<Vec<_>>(), reference.set_sha256);
+        windows.into_iter().flat_map(|w| w.tokens).collect()
+    };
+    ensure!(!tokens.is_empty() && tokens.iter().all(|&t| (t as usize) < vocab), "invalid golden tokens");
+    Ok(tokens)
+}
+
 /// Every paged byte of `placement`'s units, unit by unit, buffer by buffer (each paged buffer
 /// holds one equal slice per allocation unit).
 pub(crate) fn unit_bytes(engine: &GlmfEngine<'_>, placement: &GlmfPlacement) -> Result<Vec<u8>> {
@@ -79,6 +102,18 @@ fn local_unit(global: u32, rank: usize, context: bool) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn token_only_diagnostics_reject_truncated_or_out_of_vocabulary_inputs() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tokens.bin");
+        std::fs::write(&path, [1, 0, 0]).unwrap();
+        assert!(input_tokens(dir.path(), 10).is_err());
+        std::fs::write(&path, 10u32.to_le_bytes()).unwrap();
+        assert!(input_tokens(dir.path(), 10).is_err());
+        std::fs::write(&path, 9u32.to_le_bytes()).unwrap();
+        assert_eq!(input_tokens(dir.path(), 10).unwrap(), vec![9]);
+    }
+
     #[test]
     fn diagnostics_visit_each_owner_local_unit_once() {
         for global in 0..8 {
