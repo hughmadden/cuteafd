@@ -248,7 +248,7 @@ def test_kimi_gate_card_lists_and_generates_a_wip_launch(tmp_path: Path) -> None
     assert card["family"] == "kimi_k3" and card["gpus"] == [0, 1]
     assert card["sparks"] == ["ostrich", "dodo", "emu", "kiwi", "rhea", "moa"]
     assert card["profile"] == "smoke"
-    assert cards.config(card["config"])["MODEL_ID"] == KIMI_ID
+    assert cards.config(card["config"])["MODEL_ID"] == "wrldsuksgo2mars/Kimi-K3-EXL3-K2-Core-K6"
     assert cards.slot_needs(card)["coordinator"] == cards.slot_needs(card)["spark"] == ["exl3/exl3-kimik3-k23"]
     key = tmp_path / "key"
     key.write_text("k" * 64 + "\n")
@@ -256,7 +256,7 @@ def test_kimi_gate_card_lists_and_generates_a_wip_launch(tmp_path: Path) -> None
     job = cards.generate(card, "cand", {"instance": "t", "slot": "s"}, tmp_path, key, {}, {"fabric"}, None, 1)
     values = cards.config(Path(job["entry"]["config"]))
     assert job["entry"]["run_args"] == ["--wip", "s"]
-    assert (values["SPARK_COUNT"], values["RTX_GPUS"], values["SPECULATOR"]) == ("6", "2", "off")
+    assert (values["SPARK_COUNT"], values["RTX_GPUS"], values["SPECULATOR"]) == ("6", "2", "dflash2")
     assert not any(key.endswith("_LANE_B") for key in values)
 
 
