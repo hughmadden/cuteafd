@@ -138,7 +138,7 @@ impl<'a> NativeDraft<'a> {
         self.target_streams[0].device.run(|| {
             // SAFETY: all target operands and this exact stream survive the draft's drain.
             unsafe {
-                draft.device.library.copy_h2d_ordered(ids, &data, self.bridge.exchange.stream(0))?;
+                draft.device.library.copy_h2d_ordered(self.ids.buffer, &data, self.bridge.exchange.stream(0))?;
                 draft.device.library.cuda_embedding_lookup_bf16_async(table, ids, output, tokens.len(),
                     draft.cfg.vocab, draft.cfg.hidden, self.bridge.exchange.stream(0))
             }

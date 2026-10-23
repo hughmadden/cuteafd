@@ -36,6 +36,51 @@ fn ordered_upload_retains_each_source_until_its_copy_event() -> Result<()> {
 
 #[test]
 #[ignore = "requires an allocated CPU build slot and explicit NVMe fixture directory"]
+fn ordered_upload_sizes_staging_once_and_refuses_growth() -> Result<()> {
+    // Pinned staging is created once per destination at the destination's whole
+    // extent. A later upload never frees/reallocates it: cudaFreeHost would
+    // synchronize the device while a peer wait may be queued (slot reuse).
+    let fixture = Fixture::build()?;
+    let library = fixture.load()?;
+    let mut a = library.alloc_device_buffer(16)?;
+    let mut b = library.alloc_device_buffer(16)?;
+    let stream = 1usize as *mut c_void;
+    let allocations = |events: &str| events.matches('A').count();
+    // SAFETY: the CPU fixture owns both buffers and accepts a synthetic stream.
+    unsafe {
+        let before = allocations(&fixture.events()?);
+        library.copy_h2d_ordered(a, &[1; 4], stream)?;
+        let first = allocations(&fixture.events()?);
+        assert_eq!(first, before + 1, "first upload creates the destination's staging");
+        library.copy_h2d_ordered(a, &[2; 16], stream)?;
+        assert_eq!(allocations(&fixture.events()?), first, "a longer source reuses whole-extent staging");
+        // A view narrowed below the first source's extent shares the key but not the size.
+        let narrow = CuteafdDeviceBuffer { bytes: 4, ..b };
+        library.copy_h2d_ordered(narrow, &[3; 4], stream)?;
+        let events = fixture.events()?;
+        let error = library.copy_h2d_ordered(b, &[4; 16], stream).unwrap_err().to_string();
+        assert!(error.contains("exceeds the 4-byte staging"), "{error}");
+        assert_eq!(fixture.events()?, events, "a refused grow neither frees nor allocates host memory");
+        // Reservation before readiness sizes the staging with no copy.
+        let mut c = library.alloc_device_buffer(32)?;
+        library.reserve_h2d_ordered(c, stream)?;
+        let reserved = fixture.events()?;
+        library.reserve_h2d_ordered(c, stream)?;
+        library.copy_h2d_ordered(CuteafdDeviceBuffer { bytes: 8, ..c }, &[5; 8], stream)?;
+        library.copy_h2d_ordered(c, &[6; 32], stream)?;
+        assert_eq!(allocations(&fixture.events()?), allocations(&reserved), "reserved staging is never replaced");
+        assert!(!fixture.events()?[reserved.len()..].contains('F'));
+        library.release_ordered_h2d_staging()?;
+        assert_eq!(std::slice::from_raw_parts(c.ptr.cast::<u8>(), 32), &[6; 32]);
+        library.free_device_buffer(&mut c)?;
+    }
+    library.free_device_buffer(&mut a)?;
+    library.free_device_buffer(&mut b)?;
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires an allocated CPU build slot and explicit NVMe fixture directory"]
 fn ordered_upload_failed_fence_retains_sources_and_module() -> Result<()> {
     let fixture = Fixture::build()?;
     let library = fixture.load()?;

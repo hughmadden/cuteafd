@@ -222,10 +222,12 @@ impl<'a> GlmfEngine<'a> {
                 if page_owner(unit) == owner { ((units[unit] >> 1) as usize * UNIT_PAGES + page % UNIT_PAGES) as i32 }
                 else { -1 }
             }).collect();
-            self.put_at(rank, view(&own.gather, records, pages.len() * 4)?, bytes_of(&pages))?;
+            // Whole regions, not views narrowed to this history: the ordered upload
+            // sizes each destination's staging once (it never regrows mid-call).
+            self.put_at(rank, view(&own.gather, records, split.staging_units * UNIT_PAGES * 4)?, bytes_of(&pages))?;
             if !local.is_empty() {
                 let list: Vec<i32> = local.iter().map(|&l| l as i32).collect();
-                self.put_at(rank, view(&own.gather, pools, list.len() * 4)?, bytes_of(&list))?;
+                self.put_at(rank, view(&own.gather, pools, split.staging_units.div_ceil(2) * 4)?, bytes_of(&list))?;
             }
         }
         let limit = context_commit_units(self.prefill_rows as u64) as usize;

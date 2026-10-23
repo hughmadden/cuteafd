@@ -484,7 +484,7 @@ impl<'a> LocalLane<'a> {
         stream.device.run(|| {
             // SAFETY: ordered copy fence, not a compute drain. The admitted table
             // and replay remain live on the exact producer/commit stream.
-            unsafe { stream.device.library.copy_h2d_ordered(view(table, 0, bytes.len())?, &bytes, stream.raw)?; }
+            unsafe { stream.device.library.copy_h2d_ordered(table, &bytes, stream.raw)?; }
             self.programs.commit.launch(tables.len() / 3, layers, self.kda.slots(),
                 state, conv, replay, table, stream.raw)?;
             Ok(())
@@ -1026,7 +1026,7 @@ impl TokenIo<'_> {
         let data = tokens.iter().flat_map(|id| id.to_le_bytes()).collect::<Vec<_>>();
         self.stream.device.run(|| {
             // SAFETY: ordered staging retains host data; this owner retains IDs, table and stream.
-            unsafe { self.stream.device.library.copy_h2d_ordered(view(ids, 0, data.len())?, &data, self.stream.raw)?; }
+            unsafe { self.stream.device.library.copy_h2d_ordered(ids, &data, self.stream.raw)?; }
             // SAFETY: checked IDs, table and output extents; caller retains output through the lane drain.
             unsafe { self.stream.device.library.cuda_embedding_lookup_bf16_async(table, ids, output,
                 tokens.len(), self.layout.vocab, self.layout.hidden, self.stream.raw) }
