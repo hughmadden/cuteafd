@@ -18,7 +18,12 @@ pub(crate) struct Options<'a> {
     pub peers: Vec<SocketAddr>,
     pub rtx_expert_layers: cuteafd_loader::placement::Onboard,
     pub spark_budget_gib: Option<f64>,
+    /// Lane rows: `waves` prefill units of `rows / waves` each.
     pub rows: usize,
+    /// Prefill units in flight (Spark waves outstanding, one return slot each).
+    pub waves: usize,
+    /// Explicit unit rows; unset takes `rows / waves`.
+    pub prefill_rows: Option<usize>,
     pub slots: usize,
     pub marks: usize,
     pub max_context: usize,
@@ -68,6 +73,9 @@ pub(crate) fn load<'a>(library: &'a Arc<cuteafd_ffi::NativeLibrary>,
             MlaDraft::load(programs, "kimik3", MlaDraftWindow::Sliding4096, options.cache_format)?])
     })).transpose()?;
     let rows = options.rows;
+    // The widest prefill wave is one unit; the workers' rings are sized for it.
+    let unit = cuteafd_loader::families::kimi_k3::allocation::prefill_shape_with(rows, options.waves,
+        options.prefill_rows)?.unit_rows as usize;
     let spark_budget_gib = options.spark_budget_gib.unwrap_or(
         cuteafd_loader::families::kimi_k3::SPARK_DEFAULT_BUDGET_BYTES as f64 / (1u64 << 30) as f64);
     ensure!(spark_budget_gib.is_finite() && spark_budget_gib > 0.0
@@ -80,7 +88,7 @@ pub(crate) fn load<'a>(library: &'a Arc<cuteafd_ffi::NativeLibrary>,
         spark_layers: cfg.dense.iter().enumerate().filter_map(|(layer, dense)| (!dense).then_some(layer)).collect(),
         spark_ranks: 6, prefill_lanes: 1 };
     let spark_budget = cuteafd_loader::placement::SparkBudgetInventory::exl3(&catalog, &working,
-        &[cuteafd_core::SparkEndpoint { capacity: u32::try_from(rows)?, ingress: cuteafd_core::SparkIngress::Fp8K32 }],
+        &[cuteafd_core::SparkEndpoint { capacity: u32::try_from(unit)?, ingress: cuteafd_core::SparkIngress::Fp8K32 }],
         model, (spark_budget_gib * (1u64 << 30) as f64) as u64,
         cuteafd_loader::families::kimi_k3::SPARK_ESTIMATED_RESERVE_BYTES)?;
     let rtx = if options.rtx_expert_layers.layers(routed) == Some(0) { None } else {
@@ -138,7 +146,8 @@ pub(crate) fn load<'a>(library: &'a Arc<cuteafd_ffi::NativeLibrary>,
     }).collect::<Vec<_>>().try_into().map_err(|_| anyhow::anyhow!("Kimi GPU sample count"))?;
     let mut admitted = admission::admit(admission::Inputs { cfg, core, cache_format: options.cache_format, gpus, devices: [options.devices[0], options.devices[1]],
         peer_access: true, spark_ranks: 6, attention: None, requested_pool: options.pool_tokens,
-        state_slots: options.slots, prefix_marks: options.marks, rows, lanes: 1, lane_layouts, fixed,
+        state_slots: options.slots, prefix_marks: options.marks, rows, lanes: 1, waves: options.waves,
+        unit_rows: options.prefill_rows, lane_layouts, fixed,
         startup: graph_set.as_ref().map_or_else(Vec::new, |set|
             (0..2).map(|rank| super::graphs::demand(&set.inventory, rank)).collect()), pool_bounded: vec![], rtx,
         spark_budget: Some(spark_budget), draft: draft_layout.clone(), verify_rows })?;

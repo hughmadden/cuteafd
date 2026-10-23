@@ -14,7 +14,7 @@ use thiserror::Error;
 mod deepseek;
 pub mod step5;
 mod spark_intake;
-pub use spark_intake::spark_intake_bytes;
+pub use spark_intake::{prefill_return_bytes, spark_intake_bytes, PrefillShape};
 mod exl3_workspace;
 pub use exl3_workspace::exl3_workspace_bytes;
 pub mod glm_graphs;

@@ -23,6 +23,11 @@ const SOURCE: [(&str, &str); 3] = [
 #[derive(Debug, clap::Args)]
 pub(crate) struct GoldenArgs {
     #[arg(long, default_value = "fp8")] kv_cache: cuteafd_core::MlaCacheFormat,
+    /// Prefill unit rows for scoring chunks; unset keeps whole chunks as one unit.
+    #[arg(long)] prefill_rows: Option<usize>,
+    /// Prefill units in flight while scoring (N=1 against N=2 at the same
+    /// units is byte-identical).
+    #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u8).range(1..=4))] prefill_waves: u8,
     #[arg(long)] snapshot: PathBuf,
     #[arg(long, env = "CUTEAFD_NATIVE_LIB")] native_lib: Option<PathBuf>,
     #[arg(long, default_value = "/opt/cuteafd/share/PROGRAMS.json")] manifest: PathBuf,
@@ -77,7 +82,7 @@ impl GoldenArgs {
             "gate_up_programs": ([3072, 16896].map(|width| self.ffn_mode().gate_up_stem(width))),
             "rtx_expert_layers":self.rtx_expert_layers, "window": self.window, "last_layer": self.last_layer, "diagnostic_only": !self.nll,
             "verify_rows": self.verify_rows, "graphs": self.verify_rows.map(|_| &self.graphs), "grouped_kda": self.grouped_kda,
-            "verify_limit": self.verify_limit})
+            "verify_limit": self.verify_limit, "prefill_rows": self.prefill_rows, "prefill_waves": self.prefill_waves})
     }
 }
 
@@ -419,7 +424,8 @@ fn native(args: &GoldenArgs, checkpoint: &cuteafd_loader::plan::Checkpoint,
             devices: [args.device, args.split_device], native_lib: args.native_lib.as_deref().context("--native-lib required")?,
             peers: args.peers.clone(), rtx_expert_layers: cuteafd_loader::placement::Onboard::Layers(args.rtx_expert_layers),
             spark_budget_gib: args.spark_budget_gib,
-            rows, slots: 1, marks: 1, max_context: cuteafd_loader::families::kimi_k3::COMPILED_CONTEXT, pool_tokens: Some(1_048_576), graphs,
+            rows, waves: usize::from(args.prefill_waves), prefill_rows: args.prefill_rows,
+            slots: 1, marks: 1, max_context: cuteafd_loader::families::kimi_k3::COMPILED_CONTEXT, pool_tokens: Some(1_048_576), graphs,
             draft: None, ffn_mode: args.ffn_mode(), hosted_layers: Some(hosted_layers(&std::env::var("CUTEAFD_GOLDEN_EXPERT_LAYERS")?)?),
             verify_rows: verify.unwrap_or(0),
         })?;
@@ -792,7 +798,7 @@ mod tests {
             capacity_bytes: 96 << 30, headroom_bytes: 2 << 30,
             baseline: cuteafd_loader::placement::Baseline::Measured { free_bytes: (96 << 30) - reserve } }; 2],
             devices: [0, 1], peer_access: true, spark_ranks: 6, attention: None,
-            requested_pool: Some(1_048_576), state_slots: slots, prefix_marks: marks, rows, lanes: 1,
+            requested_pool: Some(1_048_576), state_slots: slots, prefix_marks: marks, rows, lanes: 1, waves: 2, unit_rows: None,
             lane_layouts: vec![std::array::from_fn(|_| super::super::device::LaneLayout::new(&cfg, rows,
                 1048576, native_scratch).unwrap())], fixed,
             startup: (0..2).map(|rank| super::super::graphs::demand(&graph_set.inventory, rank)).collect(),

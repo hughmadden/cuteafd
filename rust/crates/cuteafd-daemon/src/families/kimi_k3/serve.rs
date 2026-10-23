@@ -35,6 +35,12 @@ pub(crate) struct ServeArgs {
     /// Fixed draft depth; absent lets the shared policy choose up to the checkpoint width.
     #[arg(long, requires = "draft", value_parser = clap::value_parser!(u8).range(1..=7))]
     pub draft_fixed: Option<u8>,
+    /// Prefill unit rows (PLAN "Prefill contract"); the lane holds
+    /// `--prefill-waves` units, at most 4096 rows.
+    #[arg(long, default_value_t = 2048)] pub prefill_rows: usize,
+    /// Prefill units in flight: Spark waves outstanding on the one transport.
+    #[arg(long, default_value_t = 2, value_parser = clap::value_parser!(u8).range(1..=4))]
+    pub prefill_waves: u8,
     #[command(flatten)] pub prefix: PrefixArgs,
     #[command(flatten)] pub decode_share: crate::shared::prefill_share::DecodeShareArgs,
     #[command(flatten)] pub token_io: crate::shared::token_io::TokenIoArgs,
@@ -61,6 +67,8 @@ impl ServeArgs {
             "Kimi context exceeds the compiled 1M extent");
         ensure!(self.spark_budget_gib.is_none_or(|gib| gib.is_finite() && gib > 0.0),
             "Kimi requires a finite positive estimated --spark-budget-gib");
+        ensure!(self.prefill_rows % 64 == 0 && (256..=4096).contains(&(self.prefill_rows * usize::from(self.prefill_waves))),
+            "Kimi --prefill-rows x --prefill-waves must be page aligned and hold 256..=4096 lane rows");
         ensure!(self.prefix.prefix_partial == crate::shared::prefix::Toggle::Off,
             "Kimi serving requires exact prefix frontiers");
         ensure!(matches!(self.token_io.embed_placement, crate::shared::token_io::EmbedPlacement::Gpu),
@@ -108,7 +116,8 @@ pub(crate) async fn run(args: ServeArgs) -> Result<()> {
                 devices: [worker_args.device, worker_args.split_device], native_lib: &worker_args.native_lib,
                 peers: worker_args.peers.clone(), rtx_expert_layers: worker_args.rtx_expert_layers,
                 spark_budget_gib: worker_args.spark_budget_gib,
-                rows: 4096, slots, marks,
+                rows: worker_args.prefill_rows * usize::from(worker_args.prefill_waves),
+                waves: usize::from(worker_args.prefill_waves), prefill_rows: Some(worker_args.prefill_rows), slots, marks,
                 max_context: worker_args.max_context(&cuteafd_loader::plan::families::kimi::core_inventory(&checkpoint)?),
                 pool_tokens: worker_args.pool_tokens.filter(|&tokens| tokens > 0), graphs: true,
                 ffn_mode: cuteafd_ffi::KimiFfnMode::default(), hosted_layers: None, draft, verify_rows: 0,
