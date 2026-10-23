@@ -322,6 +322,8 @@ def test_cpu_dev_shell_has_no_gpu_or_cache_requirement(tmp_path):
     result = subprocess.run(["bash", str(ROOT / "scripts/build/cuteafd-dev.sh"), "cpu", "--", "true"],
                             env=env, text=True, capture_output=True, check=True)
     assert "--gpus" not in result.stdout
+    for setting in ("BASH_ENV=", "ENV=", "NVIDIA_VISIBLE_DEVICES=void", "CUDA_VISIBLE_DEVICES="):
+        assert setting in result.stdout.splitlines()
     assert "/opt/cuteafd-kache" not in result.stdout
     assert result.stdout.splitlines()[-2:] == ["cuteafd-coordinator-dev", "true"]
 
