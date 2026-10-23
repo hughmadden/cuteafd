@@ -10,6 +10,7 @@ use crate::{
 use anyhow::{ensure, Result};
 use std::collections::VecDeque;
 use std::net::SocketAddr;
+use std::sync::Arc;
 
 fn poll_quantum(rows: &[ExpertProtocolV2RowDescriptor]) -> std::time::Duration {
     let decode = !rows.is_empty()
@@ -32,6 +33,8 @@ pub struct SparkExperts {
     /// sequence; at most the clients' admitted wave count.
     open_waves: VecDeque<u64>,
     wave_sequence: u64,
+    /// Detached receivers must be dropped before cancelled queues can be reset.
+    wave_tickets: Arc<()>,
     /// The opt-in route log (`PROFILE=expert-routes`); `None` when off.
     route_tap: Option<crate::route_log::Tap>,
 }
@@ -45,6 +48,7 @@ pub struct SparkExpertWave {
     receiver: V41Tp4ChunkReceiver,
     poll_quantum: std::time::Duration,
     sequence: u64,
+    _ticket: Arc<()>,
 }
 
 /// How a received wave's rank planes arrived.
@@ -114,6 +118,7 @@ impl SparkExperts {
             world,
             open_waves: VecDeque::new(),
             wave_sequence: 0,
+            wave_tickets: Arc::new(()),
             route_tap: crate::route_log::Tap::from_global(),
         })
     }
@@ -156,10 +161,29 @@ impl SparkExperts {
     pub fn ownership_topology(&self) -> Option<SparkTopology> {
         self.world.ownership_topology()
     }
-    /// Reset persistent QPs before a new admission. Pending dispatches borrow this
-    /// owner exclusively, so an in-flight wave cannot be reset through this API.
+    /// Reset persistent QPs. Detached wave queue entries are retained; reusable
+    /// intake owners use `reset_drained` after dropping every detached ticket.
     pub fn reset_connections(&mut self) {
         self.clients.reset();
+    }
+
+    /// Checks that cancelled detached waves no longer have live receivers.
+    /// Terminal-owned transports require terminal quiescence/release, not reuse.
+    pub fn require_drained_reset(&self) -> Result<()> {
+        ensure!(Arc::strong_count(&self.wave_tickets) == 1,
+            "cannot reset a Spark transport with outstanding wave tickets");
+        ensure!(!self.terminal_owned(), "terminal-owned Spark transport cannot be reset for reuse");
+        Ok(())
+    }
+
+    /// Reset after all CPU/GPU consumers have drained. Dropped unread waves may
+    /// leave queue entries, but a live ticket makes this a non-mutating error.
+    pub fn reset_drained(&mut self) -> Result<()> {
+        self.require_drained_reset()?;
+        self.clients.reset();
+        self.open_waves.clear();
+        self.wave_sequence = 0;
+        Ok(())
     }
 
     /// Opt-in owner contract for a terminal engine. Error paths retain pending
@@ -311,7 +335,8 @@ impl SparkExperts {
         let receiver = self.post(request)?;
         self.wave_sequence += 1;
         self.open_waves.push_back(self.wave_sequence);
-        Ok(SparkExpertWave { receiver, poll_quantum: poll_quantum(&request.rows), sequence: self.wave_sequence })
+        Ok(SparkExpertWave { receiver, poll_quantum: poll_quantum(&request.rows), sequence: self.wave_sequence,
+            _ticket: self.wave_tickets.clone() })
     }
 
     /// Accepts every row of `wave`, which this transport dispatched; the sink
@@ -526,6 +551,47 @@ mod tests {
         assert_eq!(client.world_size(), 2);
         assert!(SparkExperts::new_world(crate::expert::SparkWorld::canonical((&[peers[0]; 2]).len())?, &[peers[0]; 2], 2, config.clone()).is_err());
         assert_eq!(client.world().topology().executor_ids(), [5, 6]);
+        Ok(())
+    }
+
+    #[test]
+    fn drained_reset_refuses_live_waves_but_recovers_dropped_unread_waves() -> Result<()> {
+        let peers = ["127.0.0.1:19441".parse()?, "127.0.0.1:19442".parse()?];
+        let config = TcpTransportConfig { timing: false,
+            timeout: std::time::Duration::from_secs(1), max_frame_bytes: 200_000 };
+        let request = super::super::tests::request(2);
+        for waves in 1..=4 {
+            let mut client = SparkExperts::new_world(SparkWorld::canonical(2)?, &peers, 2, config.clone())?;
+            client.set_max_waves(waves)?;
+            let mut unread = Vec::new();
+            for sequence in 1..=waves as u64 {
+                // Build the real detached tickets without opening hardware sessions.
+                let receiver = V41Tp4ChunkReceiver::from_owned_ranks(&request, 2, &client.executors, 200_000)?;
+                client.open_waves.push_back(sequence);
+                client.wave_sequence = sequence;
+                unread.push(SparkExpertWave { receiver, poll_quantum: poll_quantum(&request.rows),
+                    sequence, _ticket: client.wave_tickets.clone() });
+            }
+            assert!(client.require_drained_reset().is_err());
+            assert!(client.reset_drained().is_err());
+            assert_eq!(client.open_waves(), waves);
+            assert_eq!(client.wave_sequence, waves as u64);
+            let last = unread.pop().unwrap();
+            drop(unread);
+            assert!(client.reset_drained().is_err(), "one live ticket must still block reuse");
+            drop(last);
+            client.reset_drained()?;
+            assert_eq!(client.open_waves(), 0);
+            assert_eq!(client.wave_sequence, 0);
+            assert_eq!(client.max_waves(), waves);
+            assert_eq!(client.capacity(), 2);
+            client.set_max_waves(waves)?;
+            client.reset_drained()?;
+        }
+        let mut terminal = SparkExperts::new_world(SparkWorld::canonical(2)?, &peers, 2, config)?;
+        terminal.enable_terminal_ownership()?;
+        assert!(terminal.reset_drained().is_err(), "terminal owners must quiesce/release, never reset for reuse");
+        assert!(terminal.terminal_ready_for_test());
         Ok(())
     }
 
