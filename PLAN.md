@@ -5518,6 +5518,11 @@ outstanding waves on one link:
 - retained receive slots repost in consumption order.
 
 Several waves take the pinned intake (GPU landing has one range per rank).
+
+Buffer rule from the Step-5 port: two replicated replies with no head exchange
+between them never share a reply plane. Keep one fixed reply plane per
+replication kind (head-split routed reply, owned-layer reply), sliced per
+unit, and check it in every family with TP2 or head-split replication.
 Admission charges `prefill_return_bytes(waves, unit_rows, ranks, hidden)`;
 `PrefillShape::ladder` steps 2048 → 1024 → 512. Kimi K3 is the reference port
 (`kimi_k3/layers.rs` `UnitHooks`). The per-family checklists are in the
