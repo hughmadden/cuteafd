@@ -12,7 +12,7 @@ fn staging_turn(owners: &mut [Option<(usize, usize)>; 2], ordinal: usize, layer:
     reuse
 }
 
-struct UnitHooks<'e, 'a, 'w> {
+struct UnitHooks<'e, 'a, 'w, 'd> {
     engine: &'e GlmfEngine<'a>,
     steps: &'w [(StepTables, &'w [u32])],
     ranked: Vec<[StepTables; 2]>,
@@ -27,14 +27,16 @@ struct UnitHooks<'e, 'a, 'w> {
     logits: Vec<f32>,
     result: Option<DeviceLogits>,
     media: Option<&'w cuteafd_engine::media::RequestMedia>,
+    on_layer: Option<&'d mut dyn FnMut(usize, &[u8]) -> Result<()>>,
+    forced: Option<&'d dyn Fn(usize) -> Option<Vec<u8>>>,
 }
 
-impl<'a> UnitHooks<'_, 'a, '_> {
+impl<'a> UnitHooks<'_, 'a, '_, '_> {
     fn rows(&self, unit: &Unit) -> usize { unit.rows.len() }
     fn peer(&self, unit: &Unit) -> Result<Option<&Workspace<'a>>> {
         self.peer.map(|p| p.get(unit.slot)).transpose()
     }
-    fn post(&self, layer: usize, unit: &Unit) -> Result<()> {
+    fn post(&mut self, layer: usize, unit: &Unit) -> Result<()> {
         let e = self.engine;
         let w = &self.work[unit.slot];
         let t = self.rows(unit);
@@ -62,20 +64,33 @@ impl<'a> UnitHooks<'_, 'a, '_> {
                     drafter.tap_streams_at(layer, w.streams[0].buffer.ptr, HC,
                         s.end_row() - s.tap_rows, s.tap_rows, s.tap_offset)?;
                 }
-                return Ok(());
-            }
-            let window = self.total.saturating_sub(crate::shared::speculation::dflash::TAP_ROWS);
-            let from = unit.rows.start.max(window);
-            if from < unit.rows.end {
-                drafter.tap_streams_at(layer, w.streams[0].buffer.ptr, HC,
-                    from - unit.rows.start, unit.rows.end - from, from - window)?;
+            } else {
+                let window = self.total.saturating_sub(crate::shared::speculation::dflash::TAP_ROWS);
+                let from = unit.rows.start.max(window);
+                if from < unit.rows.end {
+                    drafter.tap_streams_at(layer, w.streams[0].buffer.ptr, HC,
+                        from - unit.rows.start, unit.rows.end - from, from - window)?;
+                }
             }
         }
+        if let Some(on_layer) = self.on_layer.as_mut() {
+            on_layer(layer, &e.download(&w.streams[0], t * HC * e.cfg.hidden * 2)?)?;
+        }
+        if let Some(forced) = self.forced.and_then(|f| f(layer)) {
+            ensure!(forced.len() == t * HC * e.cfg.hidden * 2, "teacher-forced streams of the wrong size");
+            e.library.copy_h2d(cuteafd_ffi::CuteafdDeviceBuffer { bytes: forced.len(),
+                ..w.streams[0].buffer }, &forced)?;
+            if let Some(next) = e.weights.layers.get(layer + 1) {
+                e.pre(w, &w.streams[0], next, Scalar::I32(t as i32))?;
+            }
+        }
+        crate::shared::console::layer_mark(layer);
+        e.probe_mark(layer)?;
         Ok(())
     }
 }
 
-impl PrefillHooks for UnitHooks<'_, '_, '_> {
+impl PrefillHooks for UnitHooks<'_, '_, '_, '_> {
     type Ticket = Ticket;
     fn route(&self, layer: usize) -> FfnRoute {
         if !self.engine.weights.layers[layer].dense
@@ -206,6 +221,7 @@ impl PrefillHooks for UnitHooks<'_, '_, '_> {
             e.unit_exit([w, w1], &self.ranked[unit.index], unit, self.total, &mut self.consumed[unit.index])?;
         }
         if let Some(w1) = self.peer(unit)? { e.replicate_terminal(w, w1, 0, unit.rows.len())?; }
+        if e.weights.layers.len() < e.cfg.layers { return Ok(()); }
         if !self.steps[unit.index].0.segments.is_empty() {
             // Packed consumers project each sequence's last normalized row later.
             e.run("head", &[("streams", w.streams[0].buffer.ptr), ("weight", e.weights.norm.buffer.ptr),
@@ -231,8 +247,13 @@ impl PrefillHooks for UnitHooks<'_, '_, '_> {
 impl<'a> GlmfEngine<'a> {
     pub(super) fn step_units_inner(&self, _scope: &crate::shared::experts::rtx::pair::SubmissionScope<'_>,
         steps: &[(StepTables, &[u32])], logit_rows: usize, device: bool,
-        media: Option<&cuteafd_engine::media::RequestMedia>) -> Result<Option<StepLogits>> {
-        let waves = self.prefill_waves.min(steps.len()).max(1);
+        media: Option<&cuteafd_engine::media::RequestMedia>, max_waves: usize,
+        on_layer: Option<&mut dyn FnMut(usize, &[u8]) -> Result<()>>,
+        forced: Option<&dyn Fn(usize) -> Option<Vec<u8>>>) -> Result<Option<StepLogits>> {
+        let waves = max_waves.min(self.prefill_waves).min(steps.len()).max(1);
+        ensure!(on_layer.is_none() && forced.is_none() || waves == 1,
+            "prefill diagnostics require executor N=1");
+        ensure!(forced.is_none() || self.peer.is_none(), "teacher forcing runs without a head split");
         let work = self.prefill_slots_of(0, waves)?;
         let peer = self.peer_workspaces(false, Some(waves))?;
         for rank in 0..self.ranks() {
@@ -267,7 +288,7 @@ impl<'a> GlmfEngine<'a> {
         let mut hooks = UnitHooks { engine: self, steps, ranked, work: &work, peer: peer.as_ref(), released,
             consumed: (0..steps.len()).map(|_| vec![0; self.layer_execution.as_ref()
                 .map_or(0, |execution| execution.plan.hops().len())]).collect(),
-            waves, total, wanted: logit_rows, device, logits: Vec::new(), result: None, media };
+            waves, total, wanted: logit_rows, device, logits: Vec::new(), result: None, media, on_layer, forced };
         let outcome = run_prefill_units(&mut hooks, &units, waves);
         self.unit_prefill.set(false);
         self.context_unit.set(0);
@@ -280,7 +301,7 @@ impl<'a> GlmfEngine<'a> {
             };
         }
         complete?;
-        if logit_rows == 0 { self.synchronize()?; return Ok(None); }
+        if logit_rows == 0 || self.weights.layers.len() < self.cfg.layers { self.synchronize()?; return Ok(None); }
         Ok(Some(if device { StepLogits::Device(hooks.result.context("last-unit logits")?) }
             else { StepLogits::Host(hooks.logits) }))
     }
