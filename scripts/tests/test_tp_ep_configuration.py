@@ -1422,13 +1422,17 @@ class PublishedImageReferenceTest(unittest.TestCase):
                                         "SPARK_EXPERT_DOCKER_INFERENCE="))
                 )
                 self.assertEqual(values.get("COORDINATOR_DOCKER_INFERENCE"), coordinator)
-                self.assertEqual(values.get("SPARK_EXPERT_DOCKER_INFERENCE"), spark)
-                # One release, one tag: a mixed pair fails the launcher's engine
-                # identity check at startup.
-                self.assertEqual(
-                    values["COORDINATOR_DOCKER_INFERENCE"].rsplit(":", 1)[1],
-                    values["SPARK_EXPERT_DOCKER_INFERENCE"].rsplit(":", 1)[1],
-                )
+                if "SPARK_EXPERT_DOCKER_INFERENCE" not in values:
+                    # RTX-only launchers need no expert image and may reject its key.
+                    self.assertIn("SPARK_COUNT=0", path.read_text().splitlines())
+                else:
+                    self.assertEqual(values["SPARK_EXPERT_DOCKER_INFERENCE"], spark)
+                    # One release, one tag: a mixed pair fails the launcher's engine
+                    # identity check at startup.
+                    self.assertEqual(
+                        values["COORDINATOR_DOCKER_INFERENCE"].rsplit(":", 1)[1],
+                        values["SPARK_EXPERT_DOCKER_INFERENCE"].rsplit(":", 1)[1],
+                    )
 
     def test_no_example_pins_an_unpublished_candidate_tag(self) -> None:
         for path in sorted(EXAMPLES.glob("*.config")):
