@@ -57,6 +57,10 @@ pub(crate) struct EngineArgs {
     pub pool_tokens: usize,
     #[arg(long, default_value_t = 4096)]
     pub prefill_rows: usize,
+    /// Rows one pipelined prefill call streams through its units (PLAN
+    /// "Prefill contract"); `waves x prefill_rows` restores fixed chunks.
+    #[arg(long, default_value_t = engine::DEFAULT_PREFILL_SPAN_ROWS)]
+    pub prefill_span_rows: usize,
     /// Pool-first by default; local requests require an exported RTX backend.
     #[arg(long, env = "RTX_EXPERT_LAYERS", default_value = "auto")]
     pub rtx_expert_layers: cuteafd_loader::placement::Onboard,
@@ -778,6 +782,7 @@ impl Opened {
         engine.native_experts = native_owners;
         engine.spark_bf16 = spark_bf16;
         engine.full_prefill_logits = args.full_prefill_logits;
+        engine.prefill_span_rows = args.prefill_span_rows;
         engine.attention_plan = attention_plan;
         if tp2_range.is_some() && exchange_f32 {
             engine.set_tp2_exchange(crate::shared::experts::rtx::ExchangeDtype::F32);

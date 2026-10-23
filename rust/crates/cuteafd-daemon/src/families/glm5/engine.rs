@@ -328,6 +328,8 @@ pub(crate) struct GlmEngine<'a> {
     /// Prefill steps keep every row's logits (golden scoring); otherwise the
     /// prefill workspace holds logits for at most `DECODE_ROWS` rows.
     pub full_prefill_logits: bool,
+    /// Rows one pipelined prefill call streams through its units (`--prefill-span-rows`).
+    pub prefill_span_rows: usize,
     /// Benchmarks: MoE layers skip the Spark exchange (see
     /// `EngineArgs::skip_routed_experts`) and reduce zero partials of
     /// [`SKIP_RANKS`] ranks uploaded through this host-mode intake.
@@ -430,7 +432,7 @@ impl<'a> GlmEngine<'a> {
             prefill_lanes, staged: Cell::new(library.cuda_event_create_ordering()?),
             staging_owner: RefCell::new([None; 2]), context_reuse: Cell::new(false), context_unit: Cell::new(0), prefill_link: RefCell::new(None), prefill_runtime: None,
             attention_plan: cuteafd_core::coordinator_programs::AttentionReductionPlan::new(DECODE_ROWS, None, None)?,
-            lanes: RefCell::new(Vec::new()), terminal: Cell::new(crate::shared::peer_split::TerminalState::Active), spark_bf16: false, full_prefill_logits: false, skip: None, l2: None, profile: RefCell::new([0.0; 3]),
+            lanes: RefCell::new(Vec::new()), terminal: Cell::new(crate::shared::peer_split::TerminalState::Active), spark_bf16: false, full_prefill_logits: false, prefill_span_rows: DEFAULT_PREFILL_SPAN_ROWS, skip: None, l2: None, profile: RefCell::new([0.0; 3]),
             exchange_host: RefCell::new([0.0; 4]), draft_probe: RefCell::new(None),
             graphs: RefCell::new(std::collections::HashMap::new()), graphs_warmed: Cell::new(false), graphs_warming: Cell::new(false), graph_misses: Cell::new(0), drafter: None, embedding, prefill_w8a8: true })
     }
@@ -770,10 +772,9 @@ impl<'a> GlmEngine<'a> {
     }
 
     /// Rows one pipelined prefill call streams through its units
-    /// (`CUTEAFD_PREFILL_SPAN_ROWS`; `waves x unit` restores fixed chunks).
+    /// (`--prefill-span-rows`; `waves x unit` restores fixed chunks).
     fn prefill_span_rows(&self) -> usize {
-        std::env::var("CUTEAFD_PREFILL_SPAN_ROWS").ok().and_then(|v| v.parse().ok())
-            .unwrap_or(16384).clamp(256, self.max_context.max(256))
+        self.prefill_span_rows.clamp(256, self.max_context.max(256))
     }
 
     fn prefill_tables(&self, placement: &GlmPlacement, start: usize, t: usize) -> Result<StepTables> {
@@ -2338,6 +2339,9 @@ where B: Fn(usize) -> Result<()>,
     fn end_unit(&mut self, _: &crate::shared::prefill_pipeline::Unit) -> Result<()> { Ok(()) }
     fn commit_unit(&mut self, _: &crate::shared::prefill_pipeline::Unit) -> Result<()> { Ok(()) }
 }
+
+/// Default rows per continuous prefill span (shared PREFILL_SPAN_ROWS key).
+pub(crate) const DEFAULT_PREFILL_SPAN_ROWS: usize = 16384;
 
 pub(crate) fn configured_lanes() -> usize {
     cuteafd_loader::plan::layout::glm_prefill_lanes(

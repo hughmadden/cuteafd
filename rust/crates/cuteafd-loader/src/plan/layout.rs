@@ -254,8 +254,9 @@ impl Default for LayoutOptions {
 }
 
 /// Shared with the GLM runtime so admission and allocation use the same lanes.
+/// Default: 2 units of 4096 rows in flight (PLAN "Prefill contract").
 pub fn glm_prefill_lanes(value: Option<&str>) -> usize {
-    value.and_then(|v| v.parse().ok()).unwrap_or(3).clamp(1, 4)
+    value.and_then(|v| v.parse().ok()).unwrap_or(2).clamp(1, 4)
 }
 
 /// Additional lead-GPU output bytes for admitted all-row fidelity probes.
@@ -300,7 +301,7 @@ mod scoring_workspace_tests {
         assert!(!LayoutOptions::default().full_prefill_logits);
         assert_eq!(full_prefill_logits_bytes("mimo_v2", 128, 1000), 127 * 1000 * 4);
         assert_eq!(full_prefill_logits_bytes("qwen4", 128, 1000), 127 * (1000 * 4 + 16));
-        assert_eq!(glm_prefill_lanes(None), 3);
+        assert_eq!(glm_prefill_lanes(None), 2);
         for lanes in 1..=4 {
             assert_eq!(glm_prefill_lanes(Some(&lanes.to_string())), lanes);
             assert_eq!(full_prefill_logits_bytes_with_lanes("glm5", 128, 1000, lanes),

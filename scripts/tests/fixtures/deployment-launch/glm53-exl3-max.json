@@ -52,7 +52,7 @@
       "-e",
       "CUTEAFD_CONSOLE_TEXT=true",
       "-e",
-      "CUTEAFD_GLM_PREFILL_LANES=3",
+      "CUTEAFD_GLM_PREFILL_LANES=2",
       "-e",
       "CUTEAFD_THERMAL=on",
       "-v",

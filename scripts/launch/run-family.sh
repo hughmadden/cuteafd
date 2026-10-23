@@ -2063,6 +2063,11 @@ fi
 if [[ $family == glm5 && -n "$(get PREFILL_ROWS)" ]]; then
   family_args+=(--prefill-rows "$(get PREFILL_ROWS)")
 fi
+# PREFILL_SPAN_ROWS: rows per continuous prefill span (shared prefill key).
+if [[ $family == glm5 && -n "$(get PREFILL_SPAN_ROWS)" ]]; then
+  [[ "$(get PREFILL_SPAN_ROWS)" =~ ^[1-9][0-9]*$ ]] || release_die "PREFILL_SPAN_ROWS must be a positive row count"
+  family_args+=(--prefill-span-rows "$(get PREFILL_SPAN_ROWS)")
+fi
 if [[ $family =~ ^(glm5|qwen4|qwen3_5|deepseek_v4)$ ]]; then
   pool="$(get POOL_TOKENS auto)"
   if [[ "$pool" == auto ]]; then
@@ -2558,18 +2563,12 @@ case "$family" in
   deepseek_v4) ;;
   glm5)
     # PREFILL_WAVES (shared prefill units in flight) wins over the legacy lane key.
-    selected_lanes="$(get PREFILL_WAVES "${CUTEAFD_GLM_PREFILL_LANES:-3}")"
+    selected_lanes="$(get PREFILL_WAVES "${CUTEAFD_GLM_PREFILL_LANES:-2}")"
     [[ "$selected_lanes" =~ ^[1-4]$ ]] || { echo "CUTEAFD_GLM_PREFILL_LANES must be 1 to 4" >&2; exit 2; }
     if [[ "$ranks" == 0 ]]; then
       selected_lanes=1
     fi
-    lane_env_args+=(-e "CUTEAFD_GLM_PREFILL_LANES=$selected_lanes")
-    # PREFILL_SPAN_ROWS: rows per continuous prefill span (shared prefill key).
-    span_rows="$(get PREFILL_SPAN_ROWS)"
-    if [[ -n "$span_rows" ]]; then
-      [[ "$span_rows" =~ ^[1-9][0-9]*$ ]] || { echo "PREFILL_SPAN_ROWS must be a positive row count" >&2; exit 2; }
-      lane_env_args+=(-e "CUTEAFD_PREFILL_SPAN_ROWS=$span_rows")
-    fi ;;
+    lane_env_args+=(-e "CUTEAFD_GLM_PREFILL_LANES=$selected_lanes") ;;
   glm5_flash)
     # Planner and server must offer the same conditional drafter homes.
     # Explicit config overrides the legacy process-wide diagnostic switch.

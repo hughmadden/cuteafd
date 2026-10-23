@@ -1353,9 +1353,10 @@ def test_glm53_forwards_shared_prefill_span_rows(tmp_path, value):
     assert result.returncode == 0, result.stderr
     launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-glm " in line)
     if value is None:
-        assert "CUTEAFD_PREFILL_SPAN_ROWS" not in launch
+        assert "--prefill-span-rows" not in launch
     else:
-        assert f"CUTEAFD_PREFILL_SPAN_ROWS={value}" in launch
+        assert f"--prefill-span-rows {value}" in launch
+    assert "CUTEAFD_PREFILL_SPAN_ROWS" not in launch
 
 
 def test_glm53_refuses_a_malformed_prefill_span(tmp_path):
