@@ -54,8 +54,8 @@ def test_minimax_launch_matches_planner(tmp_path, ranks, kv):
     ("COORDINATOR_GPUS=0,1\n", "two-GPU head split is not implemented"),
     ("COORDINATOR_GPU=0,1\n", "two-GPU head split is not implemented"),
     ("COORDINATOR_SPLIT=heads\n", "two-GPU head split is not implemented"),
-    ("SPECULATOR=mtp\n", "supports only SPECULATOR=off"),
-    ("SPECULATOR=dflash2\n", "supports only SPECULATOR=off"),
+    ("SPECULATOR=mtp\n", "supports SPECULATOR=dspark or off"),
+    ("SPECULATOR=dflash2\n", "supports SPECULATOR=dspark or off"),
     ("RTX_EXPERT_LAYERS=max\n", "must be auto or a fixed routed-layer count"),
     ("RTX_EXPERT_LAYERS=25%\n", "must be auto or a fixed routed-layer count"),
     ("RTX_EXPERT_LAYERS=58\n", "checkpoint has 57 routed layers"),
@@ -168,3 +168,12 @@ def test_minimax_forwards_explicit_spark_budget_to_plan_and_runtime(tmp_path):
     assert float(_flag(plan, "--spark-budget-gib")) == 106
     workers = [line for line in result.stderr.splitlines() if "cuteafd expertd-native" in line]
     assert workers and all(f"--device-budget-bytes {budget}" in line for line in workers)
+
+
+def test_minimax_bundled_dspark_is_explicit(tmp_path):
+    result = _launch(tmp_path, "SPECULATOR=dspark\n")
+    assert result.returncode == 0, result.stderr
+    serve = _line(result, "serve-minimax --snapshot")
+    plan = _line(result, "cuteafd plan")
+    assert _flag(serve, "--speculator") == _flag(plan, "--speculator") == "dspark"
+    assert "--draft " not in serve

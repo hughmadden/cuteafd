@@ -4,6 +4,7 @@
 //! bundled CLIP-style vision tower and a bundled DSpark drafter.
 pub mod cache;
 pub mod config;
+pub mod dspark;
 pub mod reference;
 
 /// The release's compiled context (`max_position_embeddings`).

@@ -51,8 +51,31 @@ fn load_operand<'a>(device: Device<'a>, checkpoint: &Checkpoint, operand: &Weigh
 impl<'a> Weights<'a> {
     pub fn load(device: Device<'a>, checkpoint: &Checkpoint, commands: &Commands<'a>) -> Result<Self> {
         let layout = RankWeightLayout::from_checkpoint(checkpoint, 0, 1)?;
+        Self::load_layout(device, checkpoint, commands, &layout)
+    }
+    pub fn draft_layout(contract: &cuteafd_loader::families::minimax_m3::dspark::DsparkContract) -> Result<RankWeightLayout> {
+        let tensors = &contract.weights.tensors;
+        let mut operands = Vec::new();
+        for source in tensors {
+            if source.meta.name.contains(".up_proj.") { continue; }
+            let mut sources = vec![source.clone()];
+            let mut name = source.meta.name.clone();
+            let mut shape = source.meta.shape.clone();
+            if name.contains(".gate_proj.") {
+                let up = name.replace(".gate_proj.", ".up_proj.");
+                sources.push(tensors.iter().find(|t| t.meta.name == up).context("MiniMax draft gate without up")?.clone());
+                name = name.replace(".gate_proj.", ".gate_up_proj.");
+                shape[0] *= 2;
+            }
+            let allocation_bytes = sources.iter().map(|t| t.meta.byte_length).sum::<u64>().max(256);
+            operands.push(WeightOperand { name, sources, shape, dtype: source.meta.dtype.clone(),
+                slice: WeightSlice::Replicated, allocation_bytes });
+        }
+        Ok(RankWeightLayout { rank:0, ranks:1, resident_bytes:operands.iter().map(|o|o.allocation_bytes).sum(), operands })
+    }
+    pub fn load_layout(device: Device<'a>, checkpoint: &Checkpoint, commands: &Commands<'a>, layout: &RankWeightLayout) -> Result<Self> {
         let mut operands = BTreeMap::new();
-        for operand in fuse_kv(&layout)? {
+        for operand in fuse_kv(layout)? {
             if operand.name == EMBEDDING { continue; }
             cuteafd_ffi::memory_ledger::tensor(&operand.name);
             let source = load_operand(device, checkpoint, &operand)?;
@@ -79,6 +102,33 @@ impl<'a> Weights<'a> {
 mod tests {
     use super::*;
     use cuteafd_loader::plan::testing;
+    #[test] fn minimax_draft_fusion_preserves_native_headers_and_allocation_bytes() -> Result<()> {
+        use cuteafd_loader::families::minimax_m3::dspark::{DsparkContract,PREFIX};
+        let dir=tempfile::tempdir()?;
+        testing::write_minimax_m3_snapshot(dir.path(),false,true);
+        let contract=DsparkContract::open(dir.path())?;
+        let layout=Weights::draft_layout(&contract)?;
+        let fused=fuse_kv(&layout)?;
+        assert_eq!(fused.len(),77);
+        assert_eq!(layout.resident_bytes,2_301_852_928);
+        assert_eq!(layout.resident_bytes,fused.iter().map(|w|w.allocation_bytes).sum::<u64>());
+        for operand in &fused {
+            assert_eq!(operand.allocation_bytes,operand.sources.iter().map(|s|s.meta.byte_length).sum::<u64>().max(256));
+            assert!(operand.sources.iter().all(|s|s.meta.dtype==operand.dtype));
+            assert_eq!(operand.slice,WeightSlice::Replicated);
+        }
+        for layer in 0..5 { for suffix in ["weight","weight_scale_inv"] {
+            for (stem,first,second,rows) in [("self_attn.kv_proj",".k_proj.",".v_proj.",1024),
+                ("mlp.gate_up_proj",".gate_proj.",".up_proj.",24576)] {
+                let operand=fused.iter().find(|w|w.name==format!("{PREFIX}.layers.{layer}.decoder_layer.{stem}.{suffix}")).unwrap();
+                assert_eq!(operand.sources.len(),2);
+                assert!(operand.sources[0].meta.name.contains(first));
+                assert!(operand.sources[1].meta.name.contains(second));
+                assert_eq!(operand.shape[0],rows);
+            }
+        } }
+        Ok(())
+    }
     #[test] fn minimax_fused_kv_and_ffn_preserve_checkpoint_order_and_bytes() -> Result<()> {
         let dir = tempfile::tempdir()?;
         testing::write_minimax_m3_snapshot(dir.path(), true, true);
