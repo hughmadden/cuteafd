@@ -26,6 +26,21 @@ fn installed_inventory(root: &std::path::Path, spark: bool) -> std::path::PathBu
 }
 
 #[test]
+fn planner_publishes_kimi_runtime_default_and_explicit_units() {
+    let dir = snapshot(true);
+    for (unit, waves, expected) in [(0, 0, (2048, 2, 4096)), (1024, 2, (1024, 2, 2048)), (4096, 1, (4096, 1, 4096))] {
+        let mut options = with_layout(6, None);
+        let layout = options.layout.as_mut().unwrap();
+        layout.prefill_rows = unit;
+        layout.prefill_lanes = waves;
+        layout.host_memory = Some((128 << 30, 128 << 30));
+        let report = plan::plan(dir.path(), &options).unwrap();
+        assert_eq!((report.prefill_unit_rows.unwrap(), report.prefill_waves.unwrap(), report.prefill_span_rows.unwrap()), expected);
+        assert_eq!(report.prefill_transports, Some(1));
+    }
+}
+
+#[test]
 fn coordinator_inventory_requires_exact_tp2_exports() {
     use serde_json::json;
     for corruption in ["missing-layout", "missing-capacity", "missing-object", "width", "dtype", "capacity", "hidden", "activation"] {

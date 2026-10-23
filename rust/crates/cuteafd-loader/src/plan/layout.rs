@@ -586,7 +586,7 @@ impl Shape {
         let prefill_rows = if options.prefill_rows > 0 { options.prefill_rows }
             else if let Some(rows) = policy.prefill_rows { rows }
             else { manifest.as_ref().and_then(|m| m["capacities"]["prefill_rows"].as_u64()).unwrap_or(4096) };
-        report.prefill_rows = Some(prefill_rows);
+        report.prefill_span_rows = Some(prefill_rows);
         // Legacy one-wave adapters use their resolved step as the unit.
         // Continuous adapters must supply their actual unit before host admission.
         if options.prefill_waves == 1 && options.prefill_unit_rows.is_none() {
@@ -1091,9 +1091,9 @@ fn selected_host_geometry(report: &mut PlanReport, options: &LayoutOptions, chec
         prefill_rows: (id == "deepseek_v41").then_some(2048),
         all_native_stages: id == "deepseek_v4",
     };
-    let admitted_rows = report.prefill_rows;
+    let admitted_rows = report.prefill_span_rows;
     let shape = Shape::resolve(report, model.as_ref(), &mut options.clone(), policy);
-    report.prefill_rows = admitted_rows;
+    report.prefill_span_rows = admitted_rows;
     let ranks = if id == "deepseek_v41" || options.head_split { options.rtx_bytes.len().clamp(1, 2) } else { 1 };
     let selected = CacheOptions { coordinator_ranks: ranks,
         attention_placement: Some(report.attention_placement),
@@ -1179,7 +1179,7 @@ pub(crate) fn charge_host(report: &mut PlanReport, options: &LayoutOptions, chec
         crate::formats::mapped_preload::host_memory, Ok)?;
     // Native plans keep only coordinator devices in their memory layout.
     let ranks = report.spark_ranks;
-    let rows = report.prefill_rows.unwrap_or(options.prefill_rows.max(4096));
+    let rows = report.prefill_span_rows.unwrap_or(options.prefill_rows.max(4096));
     // Scoring retains the span; wire/router scratch serves one explicit unit.
     // The live return slots alone multiply by the number of waves.
     ensure!(ranks == 0 || options.prefill_unit_rows.is_some(),
@@ -1193,21 +1193,24 @@ pub(crate) fn charge_host(report: &mut PlanReport, options: &LayoutOptions, chec
     } else {
         crate::serving_capacity::PrefillShape { unit_rows, waves: options.prefill_waves }.validate()?.slot_rows()
     };
-    let lanes = match family {
-        "glm5" => if options.prefill_lanes > 0 { options.prefill_lanes } else {
-            glm_prefill_lanes(std::env::var("CUTEAFD_GLM_PREFILL_LANES").ok().as_deref()) as u64 },
-        "glm5_flash" => if options.prefill_lanes > 0 { options.prefill_lanes }
-            else { crate::serving_capacity::GLMF_DEFAULT_PREFILL_LANES },
-        "mimo_v2" => {
-            let cfg = crate::families::mimo_v2::MimoV2Config::from_hf(&checkpoint.config)?;
-            let configured = if options.prefill_lanes > 0 { Some(options.prefill_lanes.to_string()) }
-                else { std::env::var("CUTEAFD_MIMO_PREFILL_LANES").ok() };
-            crate::families::mimo_v2::admission::resolve_transport_lanes(ranks > 0,
-                cfg.program_family()?, configured.as_deref())? as u64
-        }
-        _ => 1,
+    let lanes = match report.prefill_transports {
+        Some(transports) => transports,
+        None => match family {
+            "glm5" => if options.prefill_lanes > 0 { options.prefill_lanes } else {
+                glm_prefill_lanes(std::env::var("CUTEAFD_GLM_PREFILL_LANES").ok().as_deref()) as u64 },
+            "glm5_flash" => if options.prefill_lanes > 0 { options.prefill_lanes }
+                else { crate::serving_capacity::GLMF_DEFAULT_PREFILL_LANES },
+            "mimo_v2" => {
+                let cfg = crate::families::mimo_v2::MimoV2Config::from_hf(&checkpoint.config)?;
+                let configured = if options.prefill_lanes > 0 { Some(options.prefill_lanes.to_string()) }
+                    else { std::env::var("CUTEAFD_MIMO_PREFILL_LANES").ok() };
+                crate::families::mimo_v2::admission::resolve_transport_lanes(ranks > 0,
+                    cfg.program_family()?, configured.as_deref())? as u64
+            }
+            _ => 1,
+        },
     };
-    let lanes = report.prefill_lanes.unwrap_or(lanes);
+    report.prefill_transports = Some(lanes);
     let hidden = spec.hidden as u64;
     let topk = spec.moe.as_ref().map_or(0, |m| m.top_k as u64);
     let mut items = Vec::new();

@@ -70,7 +70,9 @@ pub struct DeploymentSpec<'a> {
     pub snapshot: &'a str,
     pub rtx_gpus: usize,
     pub spark_ranks: usize,
-    pub prefill_rows: u64,
+    pub prefill_unit_rows: u64,
+    pub prefill_waves: u64,
+    pub prefill_span_rows: u64,
     pub topology: Topology,
     pub roles: Vec<SparkRole>,
     pub peers: Vec<String>,
@@ -158,7 +160,9 @@ impl<'a> DeploymentSpec<'a> {
             .then(|| format!("tp{}", topology.tp));
         Ok(Self { version: 1, family, snapshot: &report.snapshot,
             rtx_gpus: options.rtx_gpus, spark_ranks: ranks,
-            prefill_rows: report.prefill_rows.unwrap_or(0), topology, roles, peers,
+            prefill_unit_rows: report.prefill_unit_rows.unwrap_or(0),
+            prefill_waves: report.prefill_waves.unwrap_or(0),
+            prefill_span_rows: report.prefill_span_rows.unwrap_or(0), topology, roles, peers,
             speculator: &options.speculator, admission: &options.admission,
             spark_admission: SparkAdmission::CoordinatorAuthoritative,
             launch: report.launch.as_ref(), exlr8: native.map(|n| &n.selection),
@@ -221,6 +225,32 @@ mod tests {
             assert_eq!(value["artifact_requirements"]["verify_live_identity"], true);
             assert!(value.get("native_library_sha256").is_none());
             assert!(value.get("resolved_config_fingerprint").is_none());
+        }
+    }
+
+    #[test]
+    fn deployment_preserves_independent_unit_wave_span_and_transport_geometry() {
+        for (gpus, ranks) in [(1, 4), (2, 6)] {
+            let (_dir, mut report) = fixture(gpus, ranks);
+            for family in ["deepseek_v41", "deepseek_v4", "glm5", "glm5_flash", "mimo_v2", "qwen4", "kimi_k3", "step5"] {
+                report.family = Some(family.into());
+                for (unit, waves, span, transports) in [(2048, 2, 16384, 1), (4096, 2, 8192, 3), (4096, 1, 16384, 2)] {
+                    report.prefill_unit_rows = Some(unit);
+                    report.prefill_waves = Some(waves);
+                    report.prefill_span_rows = Some(span);
+                    report.prefill_transports = Some(transports);
+                    let options = DeploymentOptions { rtx_gpus: gpus, ..Default::default() };
+                    let deployment = DeploymentSpec::from_report(&report, &options).unwrap();
+                    assert_eq!((deployment.prefill_unit_rows, deployment.prefill_waves, deployment.prefill_span_rows),
+                        (unit, waves, span), "{family} {gpus}+{ranks}");
+                    let value = serde_json::to_value(deployment).unwrap();
+                    assert_eq!(value["report"]["prefill_transports"], transports);
+                    for legacy in ["prefill_rows", "prefill_lanes"] {
+                        assert!(value.get(legacy).is_none());
+                        assert!(value["report"].get(legacy).is_none());
+                    }
+                }
+            }
         }
     }
 

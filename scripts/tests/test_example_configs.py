@@ -200,6 +200,7 @@ def _coordinator(result: subprocess.CompletedProcess[str]) -> str:
 
 # Encoder plans for families with towers: Spark-first vision on rank 0, or off.
 SPARK_PLAN = {"placement_supported": True, "fits": True, "spark_ranks": 2, "encoder_plan_hash": "ab" * 32,
+              "prefill_unit_rows": 4096, "prefill_waves": 1, "prefill_span_rows": 4096,
               "encoder": {"kind": {"kind": "spark", "rank": 0}, "replicas": []},
               "audio_encoder": {"kind": {"kind": "off"}, "replicas": []}}
 LOCAL_PLAN = {**SPARK_PLAN, "spark_ranks": 0, "encoder": {"kind": {"kind": "off"}, "replicas": []}}

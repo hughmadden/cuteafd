@@ -773,11 +773,11 @@ fn nvfp4_min_card_admits_native_w4a4_and_bf16_root_stays_reference_only() {
             assert_eq!(roomy.memory_layout.unwrap().pool_tokens, target);
         }
         assert!(memory.devices.iter().all(|d| d.used_bytes() <= d.capacity_bytes));
-        // The endpoint holds the planner's automatic prefill unit.
-        // The endpoint holds the planner's whole span: unit rows x waves.
-        let rows = result.prefill_rows.expect("planned prefill rows");
+        // The endpoint holds the planner's whole intake span.
+        let rows = result.prefill_unit_rows.expect("planned prefill unit rows");
         assert!([2048, 1024, 512].contains(&rows), "{rows}");
-        let span = rows * result.prefill_lanes.expect("planned prefill waves");
+        let span = result.prefill_span_rows.expect("planned prefill span rows");
+        assert_eq!(span, rows * result.prefill_waves.expect("planned prefill waves"));
         let endpoint = cuteafd_core::SparkEndpoint { capacity: span as u32, ingress: cuteafd_core::SparkIngress::Bf16 };
         let rings = cuteafd_core::SparkRings { max_frame_bytes: 64 << 20,
             depth: 8, slot_bytes: 8 << 20, alignment: 4096 };
