@@ -5473,11 +5473,20 @@ Every family that sends experts to Sparks prefills the same way.
   cost the same memory for the same rows in flight. Units keep full-size
   expert batches and never drain the Sparks at chunk ends.
 - **Gates per family:** byte-identical logits and KV at N=1 vs N, exact
-  prefix cache, and an A/B card against work/p0 with the same config:
-  - 8K and TTFT ≥ 0.98×, decode ≥ 0.95×, KL identical;
-  - a 64K row, reported;
-  - Spark busy fraction, reported;
-  - a per-buffer workspace breakdown, reported.
+  prefix cache, and an A/B card against work/p0 with the same config.
+  - Run every N=1 and N arm on the same Spark intake and egress mode
+    (`CUTEAFD_SPARK_INTAKE=pinned`, copied egress): `SparkLink::new_waves`
+    picks probed intake at N=1 and pinned at N>1, so unpinned arms compare
+    different exchange paths.
+  - Families whose Spark exports accumulate FP32 with atomics at capacity
+    ≥256 (V4, V4.1: `--atomic-min-capacity 256`; see "Cold prefill is not
+    bit-reproducible") can't be byte-identical in prefill. Gate their N=1
+    vs N on KL, top-1 and greedy-16 within a same-day N=1-vs-N=1 noise
+    envelope; decode stays byte-exact after exact cache restores. Families
+    with ordered FP32 combines (MiMo's FP8 MoE, GLM, Kimi) keep the
+    byte-identity gate.
+  - Card bars: 8K and TTFT ≥ 0.98×, decode ≥ 0.95×, KL identical. Report a
+    64K row, the Spark busy fraction and a per-buffer workspace breakdown.
 - **Today (audit 2026-10-23):**
   - GLM 5.3 runs 3 lanes, GLM Flash 2, MiMo 3/2 (measured), V4 2 and V4.1 2
     on `PipelineOrder`;
