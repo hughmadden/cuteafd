@@ -584,3 +584,35 @@ extern "C" int32_t cuteafd_glmf_dspark_attention_fp8(const void* q, const void* 
       ctx_lengths, ctx_ends, nullptr, out, workspace, sequences, block_rows, heads, kv_heads,
       ring, max_keys, 0, causal != 0, kHeadDim, 1, true, scale, static_cast<cudaStream_t>(stream));
 }
+
+// Paged context positions are relative to the binding origin; RoPE remains absolute.
+extern "C" int32_t cuteafd_block_dspark_attention_paged(const void* q, const void* k_block,
+    const void* v_block, const void* k_context, const void* v_context, const void* slots,
+    const void* lengths, const void* ends, const void* pages, void* out, void* workspace,
+    int32_t sequences, int32_t block_rows, int32_t heads, int32_t kv_heads, int32_t capacity,
+    int32_t max_keys, int32_t causal, int32_t head_dim, int32_t table_width, float scale, void* stream) {
+  if (!pages || heads < 1 || kv_heads < 1 || heads % kv_heads || block_rows < 1)
+    return cudaErrorInvalidValue;
+  const int64_t queries = int64_t(heads / kv_heads) * block_rows;
+  if (queries > INT32_MAX - 31) return cudaErrorInvalidValue;
+  return cuteafd::draft_attention::launch(q, k_block, v_block, k_context, v_context, slots,
+      lengths, ends, nullptr, out, workspace, sequences, block_rows, heads, kv_heads, capacity,
+      max_keys, 0, causal != 0, head_dim, int((queries + 31) / 32), false, scale,
+      static_cast<cudaStream_t>(stream), static_cast<const int32_t*>(pages), table_width);
+}
+
+// Paged context positions are relative to the binding origin; RoPE remains absolute.
+extern "C" int32_t cuteafd_block_dspark_attention_paged_fp8(const void* q, const void* k_block,
+    const void* v_block, const void* k_context, const void* v_context, const void* slots,
+    const void* lengths, const void* ends, const void* pages, void* out, void* workspace,
+    int32_t sequences, int32_t block_rows, int32_t heads, int32_t kv_heads, int32_t capacity,
+    int32_t max_keys, int32_t causal, int32_t head_dim, int32_t table_width, float scale, void* stream) {
+  if (!pages || heads < 1 || kv_heads < 1 || heads % kv_heads || block_rows < 1)
+    return cudaErrorInvalidValue;
+  const int64_t queries = int64_t(heads / kv_heads) * block_rows;
+  if (queries > INT32_MAX - 31) return cudaErrorInvalidValue;
+  return cuteafd::draft_attention::launch(q, k_block, v_block, k_context, v_context, slots,
+      lengths, ends, nullptr, out, workspace, sequences, block_rows, heads, kv_heads, capacity,
+      max_keys, 0, causal != 0, head_dim, int((queries + 31) / 32), true, scale,
+      static_cast<cudaStream_t>(stream), static_cast<const int32_t*>(pages), table_width);
+}

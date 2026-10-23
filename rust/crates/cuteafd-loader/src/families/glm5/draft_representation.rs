@@ -324,6 +324,27 @@ pub fn block_dspark_resident_bytes(config: &serde_json::Value, slots: usize, seq
     Ok((sum([weights,owned,workspace])?,add(scratch,attention_scratch)?))
 }
 
+/// Shared-pool inventory: replace the legacy slot-local full-context planes
+/// with the target-token-sized cache and its immutable page-table allocation.
+#[allow(clippy::too_many_arguments)]
+pub fn block_dspark_paged_resident_bytes(config: &serde_json::Value, slots: usize, sequences: usize,
+    sms: u64, representation: GlmDraftRepresentation, mode: u8, context: usize,
+    target_tokens: usize, kv: crate::families::qwen4::Qwen4KvCache)
+    -> Result<(u64, u64), GlmDraftStorageError> {
+    let cfg = crate::formats::block_dspark::BlockDsparkConfig::from_json(config)
+        .map_err(|_| GlmDraftStorageError::Unsupported("invalid dSpark checkpoint"))?;
+    let layout = cfg.paged_cache_layout(slots, context, target_tokens, kv)
+        .map_err(|_| GlmDraftStorageError::Unsupported("invalid dSpark paged admission"))?;
+    let (owned, scratch) = block_dspark_resident_bytes(config, slots, sequences, sms,
+        representation, mode, context, kv)?;
+    if cfg.window.is_some() { return Ok((owned, scratch)); }
+    let old = mul(mul(mul(slots as u64, context as u64)?, cfg.layers as u64)?,
+        mul(2, kv.plane_record_bytes(cfg.kv_heads, cfg.head_dim) as u64)?)?;
+    let tables = layout.page_table_bytes.max(256);
+    Ok((add(owned.checked_sub(old).ok_or(GlmDraftStorageError::Overflow)?,
+        add(layout.full_bytes, tables)?)?, scratch))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
