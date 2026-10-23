@@ -1637,7 +1637,10 @@ mod tests {
                 // six whole blocks with no padding or duplicated boundary.
                 (3, vec![768, 768, 768]),
                 (4, vec![640, 640, 512, 512]),
+                (5, vec![512, 512, 512, 384, 384]),
                 (6, vec![384; 6]),
+                (7, vec![384, 384, 384, 384, 256, 256, 256]),
+                (8, vec![384, 384, 256, 256, 256, 256, 256, 256]),
             ] {
                 let mut cursor = 0;
                 for (rank, width) in widths.into_iter().enumerate() {
@@ -1650,7 +1653,7 @@ mod tests {
                 assert!(p.intermediate_partition(world, world).is_err());
             }
             // Unadmitted worlds and empty shards fail closed.
-            for world in [0usize, 7, 8, 9, 19] {
+            for world in [0usize, 9, 19] {
                 assert!(
                     p.intermediate_partition(world, 0).is_err(),
                     "EXL3 world {world} must stay unadmitted"

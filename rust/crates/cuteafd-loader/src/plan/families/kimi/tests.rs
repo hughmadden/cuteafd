@@ -293,7 +293,7 @@ fn max_card_jointly_selects_tp2_layers_marks_and_complete_spark_budget() {
     assert!(!refused.fits);
     // Other card columns are refused by name.
     let refused = plan::plan(dir.path(), &with_layout(4, None)).unwrap();
-    assert!(refused.hints.iter().any(|h| h.what.contains("6 Spark ranks")));
+    assert!(refused.hints.iter().any(|h| h.what.contains("missing Spark recipe kimik3:exl3-k23 TP4")));
 }
 
 #[test]

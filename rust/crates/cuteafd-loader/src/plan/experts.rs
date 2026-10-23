@@ -433,7 +433,12 @@ mod tests {
         assert_eq!(spark_worlds("v41:nvfp4", 2304), [2, 3, 4, 6]);
         for package in ["qwen4:nvfp4", "qwen4:exl3-k45", "qwen4:fp8"] {
             for world in [7, 8] {
-                assert!(matches!(spark_recipe(package, 640, world), Err(SparkRecipeRefusal::GeometryInvalid { .. })));
+                let refusal = spark_recipe(package, 640, world).unwrap_err();
+                if package == "qwen4:nvfp4" {
+                    assert!(matches!(refusal, SparkRecipeRefusal::MissingPackage { .. }));
+                } else {
+                    assert!(matches!(refusal, SparkRecipeRefusal::GeometryInvalid { .. }));
+                }
             }
             assert!(matches!(spark_recipe(package, 640, 5), Err(SparkRecipeRefusal::MissingPackage { .. })));
         }

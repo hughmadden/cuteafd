@@ -1487,7 +1487,7 @@ mod tests {
         let catalog = extend_routed_fixture(&catalog, nvfp4_checkpoint_tensors());
         let scalars = 3 * 256 * 8;
         let bytes = |width| 3 * 256 * 6144 * width * (8 + 1) / 16 + scalars;
-        for ranks in [2, 3, 4, 6] {
+        for ranks in 1..=8 {
             for slicing in [Slicing::Blocks(16), Slicing::Blocks(128), Slicing::Padded] {
                 let whole_suffix = spark_resident_bytes(&catalog, &[1, 2, 3], ranks, slicing).unwrap();
                 let selected = spark_resident_bytes(&catalog, &[2, 3], ranks, slicing).unwrap();
@@ -1517,7 +1517,7 @@ mod tests {
         assert_eq!(exact.iter().sum::<u64>(), bytes(2048) + 5 * scalars);
         assert!(spark_resident_bytes(&catalog, &[], 0, Slicing::Padded).unwrap().is_empty());
         for (layers, ranks) in [(vec![], 4), (vec![1], 4), (vec![3, 2], 4),
-            (vec![1, 3], 4), (vec![2, 3], 0), (vec![2, 3], 5), (vec![4], 4)] {
+            (vec![1, 3], 4), (vec![2, 3], 0), (vec![2, 3], 9), (vec![4], 4)] {
             assert!(spark_resident_bytes(&catalog, &layers, ranks, Slicing::Padded).is_err());
         }
     }

@@ -9,7 +9,7 @@ pub use cuteafd_core::MAX_SPARK_WORLD as MAX_SPARKS;
 pub const EXPERT_BYTES_PER_SPARK: u64 = 16 << 30;
 pub const MIN_COLUMNS_PER_SPARK: usize = 256;
 
-/// Historical package coverage is diagnostic only, never a policy override.
+/// Qualified release counts are compatibility floors, independent of installation.
 pub fn shipped_worlds(package: &str) -> Vec<usize> {
     static FLOOR: OnceLock<BTreeMap<String, Vec<usize>>> = OnceLock::new();
     let floor = FLOOR.get_or_init(|| serde_json::from_str(include_str!(
@@ -56,9 +56,10 @@ impl SparkRange {
         let size_cap = ((routed_bytes / EXPERT_BYTES_PER_SPARK) as usize).clamp(MIN_SIZE_CAP, MAX_SPARKS);
         let width_cap = intermediate / MIN_COLUMNS_PER_SPARK;
         let formula_maximum = MAX_SPARKS.min(size_cap).min(width_cap);
-        let maximum = minimum.max(formula_maximum);
+        let maximum = minimum.max(shipped_maximum).max(formula_maximum);
         let mut binding = Vec::new();
         if minimum == maximum && minimum > formula_maximum { binding.push(BindingCap::Minimum); }
+        if shipped_maximum == maximum && shipped_maximum > formula_maximum { binding.push(BindingCap::Shipped); }
         if maximum == formula_maximum {
             if size_cap == maximum { binding.push(BindingCap::Size); }
             if width_cap == maximum { binding.push(BindingCap::Width); }
@@ -253,7 +254,7 @@ impl PlanInput {
                     counts.push(CountLayout { sparks, units_per_expert: classes, unit_columns: count_unit,
                         source_block_columns, rule, expert_bytes_per_rank,
                         resolved_width_columns: recipe.map(|recipe| recipe.widths), padded,
-                        shipped_exception: false,
+                        shipped_exception: sparks > range.formula_maximum && shipped_worlds(package).contains(&sparks),
                         currently_launchable: reports[sparks].wip_launchable(),
                         executable_blockers: if reports[sparks].wip_launchable() { vec![] }
                             else { reports[sparks].hints.iter().map(|hint| hint.what.clone()).collect() } });
@@ -387,22 +388,20 @@ mod tests {
     }
 
     #[test]
-    fn historical_packages_do_not_override_the_checkpoint_width_cap() {
-        for package in ["qwen4:exl3-k45", "qwen4:nvfp4"] {
+    fn qualified_counts_preserve_release_support_without_extending_the_exception() {
+        for (package, expected) in [("qwen4:exl3-k45", 4), ("qwen4:nvfp4", 6)] {
             let shipped = shipped_worlds(package).into_iter().max().unwrap();
             let range = SparkRange::new(0, 16 << 30, 640, 128, shipped).unwrap();
-            assert_eq!((range.width_cap, range.maximum), (2, 2));
-            assert_eq!(range.binding, [BindingCap::Width]);
-            for world in range.counts().filter(|world| *world > 0) {
-                if let Ok(recipe) = super::super::experts::spark_recipe(package, 640, world) {
-                    assert!(recipe.widths.iter().all(|width| *width > 0));
-                    if world == 6 {
-                        assert_eq!(recipe.slicing, crate::formats::fp8_experts::Slicing::Padded);
-                        assert_eq!(recipe.widths, [128; 6]);
-                    }
-                }
+            assert_eq!((range.width_cap, range.formula_maximum, range.maximum), (2, 2, expected));
+            assert_eq!(range.binding, [BindingCap::Shipped]);
+            range.admit(expected).unwrap();
+            for count in expected + 1..=MAX_SPARKS {
+                assert!(matches!(range.admit(count), Err(RangeRefusal::Unsupported { .. })));
             }
         }
+        let unqualified = SparkRange::new(0, 16 << 30, 640, 128, 0).unwrap();
+        assert_eq!(unqualified.maximum, 2);
+        assert_eq!(unqualified.binding, [BindingCap::Width]);
     }
 
     #[test]

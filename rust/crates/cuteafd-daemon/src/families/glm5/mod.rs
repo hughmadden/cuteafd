@@ -222,9 +222,11 @@ mod draft_cli_tests {
             assert!(native_activation(&one, 3, 78, true).is_ok());
             assert!(native_activation(&one, 3, 78, false).is_ok());
         }
-        let mut six = args.clone();
-        six.peers = Some("a:1,b:1,c:1,d:1,e:1,f:1".into());
-        assert!(native_activation(&six, 3, 78, true).is_ok());
+        for ranks in 1..=8 {
+            let mut candidate = args.clone();
+            candidate.peers = Some((0..ranks).map(|rank| format!("worker{rank}:1")).collect::<Vec<_>>().join(","));
+            assert!(native_activation(&candidate, 3, 78, true).is_ok(), "TP{ranks}");
+        }
         let mut drafting = args.clone();
         drafting.draft = Some("/draft".into());
         assert!(native_activation(&drafting, 3, 78, true).is_ok());
@@ -234,7 +236,7 @@ mod draft_cli_tests {
                 0 => candidate.exlr8_manifest = Some("home".into()),
                 1 => candidate.split_device = None,
                 2 => candidate.split_device = Some(0),
-                3 => candidate.peers = Some("a:1,b:1,c:1,d:1,e:1,f:1,g:1".into()),
+                3 => candidate.peers = Some("a:1,b:1,c:1,d:1,e:1,f:1,g:1,h:1,i:1".into()),
                 4 => candidate.layers = Some(4),
                 5 => candidate.attention_placement = "heads".into(),
                 6 => candidate.exlr8_manifest = None,

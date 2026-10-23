@@ -756,7 +756,7 @@ mod tests {
                 .contains("outside its projection")
         );
         assert!(Residency::plan(root.path(), "../mixed", 3, 1, 0, ExpertSet::Routed).is_err());
-        assert!(Residency::plan(root.path(), "mixed", 3, 7, 0, ExpertSet::Routed).is_err());
+        assert!(Residency::plan(root.path(), "mixed", 3, 9, 0, ExpertSet::Routed).is_err());
     }
 
     #[test]
