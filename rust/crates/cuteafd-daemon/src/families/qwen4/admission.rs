@@ -33,37 +33,7 @@ pub(super) fn inputs<'a>(args: &EngineArgs, cfg: &'a Qwen4Config, layers: usize,
         headroom: cuteafd_loader::plan::layout::LayoutOptions::default().headroom_bytes.max(3 << 30) })
 }
 
-/// Destination extents used by both workspace allocation and ordered H2D admission.
-#[derive(Debug)]
-pub(super) struct StepTableBytes {
-    pub positions: usize, pub rope_positions: usize, pub block_rope_positions: usize,
-    pub kv_slots: usize, pub slots: usize, pub seq_first: usize, pub pool_slots: usize,
-    pub cache_lengths: usize, pub page_table: usize, pub pool_table: usize,
-    pub ids: usize, pub ple_ids: usize,
-}
-
-impl StepTableBytes {
-    pub fn new(rows: usize, decode: bool, pages: usize, pool_pages: usize, ple_rows: usize) -> Result<Self> {
-        use anyhow::Context;
-        let mul = |a: usize, b: usize| a.checked_mul(b).context("Qwen host table size overflow");
-        let table_rows = if decode { rows } else { 1 };
-        Ok(Self { positions: mul(rows, 8)?, rope_positions: mul(rows, 12)?,
-            block_rope_positions: mul(rows, 12)?, kv_slots: mul(rows, 8)?,
-            slots: mul(rows, 4)?, seq_first: mul(rows, 4)?, pool_slots: mul(rows, 8)?,
-            cache_lengths: mul(rows, 4)?, page_table: mul(mul(table_rows, pages)?, 4)?,
-            pool_table: mul(mul(table_rows, pool_pages)?, 4)?, ids: mul(rows, 4)?,
-            ple_ids: mul(mul(rows, ple_rows)?, 8)? })
-    }
-
-    pub fn ordered_bytes(&self, ple_ids: bool) -> Result<u64> {
-        use anyhow::Context;
-        [self.positions, self.rope_positions, self.block_rope_positions, self.kv_slots,
-            self.slots, self.seq_first, self.pool_slots, self.cache_lengths,
-            self.page_table, self.pool_table, self.ids].into_iter()
-            .chain(ple_ids.then_some(self.ple_ids)).try_fold(0u64, |total, bytes|
-                total.checked_add(bytes.max(256) as u64).context("Qwen ordered table size overflow"))
-    }
-}
+pub(super) use cuteafd_loader::families::qwen4::StepTableBytes;
 
 #[derive(Debug, PartialEq, Eq)]
 pub(super) struct HostWorkspaceBytes {
@@ -249,6 +219,52 @@ mod tests {
             }
         }
         assert!(super::StepTableBytes::new(usize::MAX, false, 1, 1, 1).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn public_planner_ordered_tables_equal_runtime_at_forced_32gib() -> anyhow::Result<()> {
+        use cuteafd_loader::plan::{plan, testing, ExpertPlacement, PlanOptions};
+        use cuteafd_loader::plan::layout::LayoutOptions;
+        use cuteafd_loader::serving_capacity::qwen_graphs::{qwen_pool_pages, QWEN_UNIT_PAGES};
+        for mapped_ple in [false, true] {
+            let dir = tempfile::tempdir()?;
+            let mut config = testing::qwen4_config(4);
+            if mapped_ple {
+                config["text_config"]["ple_layer_ids"] = serde_json::json!([2]);
+                config["text_config"]["ple_embed_dim"] = 2560.into();
+                config["text_config"]["ngram_size"] = 3.into();
+                config["text_config"]["heads_per_ngram"] = 8.into();
+            }
+            let cfg = cuteafd_loader::families::qwen4::Qwen4Config::from_hf(&config)?;
+            let mut tensors = testing::qwen4_coordinator(&config, false);
+            if mapped_ple {
+                tensors.push(testing::t("model.language_model.layers.1.ple.ple_embedding.ngram_embedding.shard_0.weight",
+                    "F8_E4M3", &[100, 160]));
+            }
+            testing::write_snapshot(dir.path(), &config, &tensors, None);
+            for waves in [1, 2] {
+                let report = plan(dir.path(), &PlanOptions {
+                    placement: ExpertPlacement::Sparks { ranks: 4 },
+                    layout: Some(LayoutOptions { rtx_bytes: vec![32 << 30], prefill_rows: 4096,
+                        prefill_waves: waves, context_tokens: 32768, prefix_slots: Some(0),
+                        host_cache_bytes: Some(0), host_memory: Some((128 << 30, 128 << 30)),
+                        ..Default::default() }), ..Default::default()
+                })?;
+                assert!(report.solver_placement.is_some(), "{}", cuteafd_loader::plan::render(&report));
+                assert_eq!((report.prefill_unit_rows, report.prefill_waves, report.prefill_span_rows),
+                    (Some(4096), Some(waves), Some(4096 * waves)));
+                let pool = usize::try_from(report.memory_layout.as_ref().unwrap().pool_tokens)?;
+                let pages = qwen_pool_pages(pool).unwrap().max(QWEN_UNIT_PAGES);
+                let runtime = super::HostWorkspaceBytes::new(&cfg, 4096, false, pages, pages / QWEN_UNIT_PAGES,
+                    true, false, waves > 1, !mapped_ple, 1)?;
+                let items: Vec<_> = report.host_ledger.as_ref().unwrap().items.iter()
+                    .filter(|item| item.group == "staging/ordered-tables").collect();
+                assert_eq!(items.len(), usize::from(waves > 1));
+                assert_eq!(items.iter().map(|item| item.bytes).sum::<u64>(), runtime.ordered,
+                    "4096x{waves}, mapped PLE {mapped_ple}");
+            }
+        }
         Ok(())
     }
 
