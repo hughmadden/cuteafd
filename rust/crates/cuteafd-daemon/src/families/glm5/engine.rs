@@ -251,6 +251,13 @@ fn slot(index: usize, ffn: bool, lane: usize) -> usize {
 
 fn slot_of(index: usize, ffn: bool, lane: usize) -> usize { slot(index, ffn, lane) }
 
+/// The context prefill plan an attention uses: a unit-driven call selects its
+/// unit explicitly (set before either rank's attention for that unit); a
+/// single-pass step (`usize::MAX`, set by `step_tables`) uses its lane's plan.
+fn context_plan_index(unit: usize, lane: usize) -> usize {
+    if unit == usize::MAX { lane } else { unit }
+}
+
 /// Borrowed workspaces of the head split's second GPU.
 enum PeerWorkspaces<'e, 'a> {
     Decode(std::cell::Ref<'e, Option<Workspace<'a>>>),
@@ -1845,6 +1852,8 @@ impl<'a> GlmEngine<'a> {
         };
         let attention = |index: usize, unit: usize| -> Result<()> {
             let slot = unit % waves;
+            // Both ranks' context attention below read this unit's gather/commit plan.
+            self.context_unit.set(unit);
             if let Some(peers) = &peer_workspaces {
                 self.peer_attention(index, slot, peers.get(slot)?, rows_of(unit), cap,
                     &ranked[unit], bytes_of_unit(unit))?;
@@ -1853,7 +1862,6 @@ impl<'a> GlmEngine<'a> {
             if index == 0 {
                 self.norm(w, layer, "input_norm", 0, rows)?;
             }
-            self.context_unit.set(unit);
             self.attention_unit(0, w, index, layer, rows, cap, &ranked[unit], slot)?;
             if split {
                 let attended = slot_of(index, false, slot);
@@ -1997,7 +2005,11 @@ impl<'a> GlmEngine<'a> {
         if tables.decode {
             return self.context_decode_attention(rank, w, index, layer, rows, tables.positions.len(), tables);
         }
-        let mut unit = self.context_units.borrow().get(self.context_unit.get()).context("context prefill unit")?[rank];
+        let index_of = context_plan_index(self.context_unit.get(), lane);
+        let units = self.context_units.borrow();
+        let mut unit = units.get(index_of).copied().with_context(|| format!(
+            "context prefill unit {index_of} of {} (lane {lane})", units.len()))?[rank];
+        drop(units);
         if self.context_reuse.get() {
             // The staging view already holds this unit's history: its predecessor
             // gathered it at this layer and wrote its own rows there.
@@ -2046,6 +2058,8 @@ impl<'a> GlmEngine<'a> {
             out.push(ranked);
         }
         *self.context_units.borrow_mut() = context_units;
+        // A single-pass step's lanes index their own plans (`attention_unit`'s `lane`).
+        self.context_unit.set(usize::MAX);
         Ok(out)
     }
 
@@ -2477,5 +2491,26 @@ impl Drop for GlmEngine<'_> {
                 self.library.cuda_stream_synchronize(self.stream)
             }, "GLM EXLR8 engine retirement");
         }
+    }
+}
+
+#[cfg(test)]
+mod prefill_unit_tests {
+    #[test]
+    fn context_plans_follow_the_unit_for_both_ranks_and_reset_for_single_steps() {
+        // A unit-driven call selects the unit on both ranks; a single-pass step
+        // falls back to its lane, whatever an earlier call left behind.
+        assert_eq!(super::context_plan_index(3, 1), 3);
+        assert_eq!(super::context_plan_index(usize::MAX, 0), 0);
+        assert_eq!(super::context_plan_index(usize::MAX, 2), 2);
+        let source = include_str!("engine.rs");
+        let body = source.split("let attention = |index: usize, unit: usize|").nth(1).unwrap()
+            .split("let post = |index").next().unwrap();
+        let set = body.find("self.context_unit.set(unit)").expect("unit attention selects its plan");
+        let peer = body.find("self.peer_attention(").expect("rank 1 attention");
+        let own = body.find("self.attention_unit(0,").expect("rank 0 attention");
+        assert!(set < peer && set < own, "the plan is selected before either rank's attention");
+        let tables = source.split("fn step_tables(").nth(1).unwrap().split("\n    }\n").next().unwrap();
+        assert!(tables.contains("self.context_unit.set(usize::MAX)"), "single-pass steps reset the unit cursor");
     }
 }

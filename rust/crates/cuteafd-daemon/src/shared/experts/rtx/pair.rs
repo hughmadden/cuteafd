@@ -21,7 +21,7 @@ use std::{
 /// A failed drain may return only if the caller retains every queued owner;
 /// callers without quarantine ownership must terminate in shutdown instead.
 #[derive(Debug, thiserror::Error)]
-#[error("submission failed permanently: {cause}; {drain}")]
+#[error("submission failed permanently: {cause:#}; {drain}")]
 pub(crate) struct TerminalStepError {
     #[source]
     cause: anyhow::Error,
