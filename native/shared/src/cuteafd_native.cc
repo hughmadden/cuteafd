@@ -1436,6 +1436,92 @@ extern "C" cuteafd_status_t cuteafd_cuda_event_query(void* cuda_event, int32_t* 
 #endif
 }
 
+#if CUTEAFD_NATIVE_ENABLE_CUDA
+namespace {
+// The device alias of a mapped pinned host word, on the current device.
+cuteafd_status_t mapped_word(const uint32_t* word, CUdeviceptr* out) {
+  if (word == nullptr || (reinterpret_cast<uintptr_t>(word) & 3) != 0) {
+    return fail(CUTEAFD_STATUS_INVALID_ARGUMENT, "stream value word must be a non-null aligned u32");
+  }
+  void* device = nullptr;
+  const cudaError_t err = cudaHostGetDevicePointer(&device, const_cast<uint32_t*>(word), 0);
+  if (err != cudaSuccess) {
+    return fail_cuda(CUTEAFD_STATUS_INVALID_ARGUMENT,
+                     "stream value word is not mapped pinned host memory", err);
+  }
+  *out = reinterpret_cast<CUdeviceptr>(device);
+  return ok();
+}
+
+// Whether the current device can flush GPUDirect RDMA writes behind a wait,
+// queried once per device ordinal.
+bool flushes_remote_writes() {
+  static std::atomic<int8_t> cached[64] = {};
+  int device = 0;
+  if (cudaGetDevice(&device) != cudaSuccess || device < 0 || device >= 64) return false;
+  int8_t known = cached[device].load(std::memory_order_relaxed);
+  if (known == 0) {
+    CUdevice handle = 0;
+    int flush = 0;
+    if (cuDeviceGet(&handle, device) == CUDA_SUCCESS) {
+      cuDeviceGetAttribute(&flush, CU_DEVICE_ATTRIBUTE_CAN_FLUSH_REMOTE_WRITES, handle);
+    }
+    known = flush ? 1 : -1;
+    cached[device].store(known, std::memory_order_relaxed);
+  }
+  return known > 0;
+}
+}  // namespace
+#endif
+
+extern "C" cuteafd_status_t cuteafd_cuda_stream_wait_value32(void* cuda_stream, const uint32_t* word,
+                                                             uint32_t value) {
+  if (cuda_stream == nullptr) {
+    return fail(CUTEAFD_STATUS_INVALID_ARGUMENT, "cuteafd_cuda_stream_wait_value32 requires a stream");
+  }
+#if CUTEAFD_NATIVE_ENABLE_CUDA
+  CUdeviceptr address = 0;
+  const cuteafd_status_t status = mapped_word(word, &address);
+  if (status != CUTEAFD_STATUS_OK) return status;
+  const unsigned flags = CU_STREAM_WAIT_VALUE_GEQ | (flushes_remote_writes() ? CU_STREAM_WAIT_VALUE_FLUSH : 0);
+  const CUresult result = cuStreamWaitValue32(reinterpret_cast<CUstream>(cuda_stream), address, value, flags);
+  if (result != CUDA_SUCCESS) {
+    return fail(CUTEAFD_STATUS_INTERNAL_ERROR,
+                "cuStreamWaitValue32 failed (" + std::to_string(static_cast<int>(result)) + ")");
+  }
+  return ok();
+#else
+  (void)word;
+  (void)value;
+  return fail(CUTEAFD_STATUS_CUDA_UNAVAILABLE, "stream memory operations are unavailable in this build");
+#endif
+}
+
+extern "C" cuteafd_status_t cuteafd_cuda_stream_write_value32(void* cuda_stream, uint32_t* word,
+                                                              uint32_t value) {
+  if (cuda_stream == nullptr) {
+    return fail(CUTEAFD_STATUS_INVALID_ARGUMENT, "cuteafd_cuda_stream_write_value32 requires a stream");
+  }
+#if CUTEAFD_NATIVE_ENABLE_CUDA
+  CUdeviceptr address = 0;
+  const cuteafd_status_t status = mapped_word(word, &address);
+  if (status != CUTEAFD_STATUS_OK) return status;
+  // The default flag fences the stream's earlier writes (host copies
+  // included) before the store, so a host reader acquiring `value` sees them.
+  const CUresult result = cuStreamWriteValue32(reinterpret_cast<CUstream>(cuda_stream), address, value,
+                                               CU_STREAM_WRITE_VALUE_DEFAULT);
+  if (result != CUDA_SUCCESS) {
+    return fail(CUTEAFD_STATUS_INTERNAL_ERROR,
+                "cuStreamWriteValue32 failed (" + std::to_string(static_cast<int>(result)) + ")");
+  }
+  return ok();
+#else
+  (void)word;
+  (void)value;
+  return fail(CUTEAFD_STATUS_CUDA_UNAVAILABLE, "stream memory operations are unavailable in this build");
+#endif
+}
+
 extern "C" cuteafd_status_t cuteafd_cuda_event_synchronize(void* cuda_event) {
   if (cuda_event == nullptr) {
     return fail(CUTEAFD_STATUS_INVALID_ARGUMENT,

@@ -1173,6 +1173,8 @@ type CudaEventRecordFn =
     unsafe extern "C" fn(cuda_event: *mut c_void, cuda_stream: *mut c_void) -> CuteafdStatus;
 type CudaEventSynchronizeFn = unsafe extern "C" fn(cuda_event: *mut c_void) -> CuteafdStatus;
 type CudaEventQueryFn = unsafe extern "C" fn(cuda_event: *mut c_void, ready: *mut i32) -> CuteafdStatus;
+type CudaStreamWaitValue32Fn = unsafe extern "C" fn(cuda_stream: *mut c_void, word: *const u32, value: u32) -> CuteafdStatus;
+type CudaStreamWriteValue32Fn = unsafe extern "C" fn(cuda_stream: *mut c_void, word: *mut u32, value: u32) -> CuteafdStatus;
 type CudaEventElapsedMsFn = unsafe extern "C" fn(
     start_event: *mut c_void,
     end_event: *mut c_void,
@@ -2482,6 +2484,34 @@ impl NativeLibrary {
         self.status_to_result("cuteafd_cuda_event_query", status)?;
         anyhow::ensure!(ready == 0 || ready == 1, "invalid CUDA event query result");
         Ok(ready == 1)
+    }
+
+    /// Queues on `cuda_stream` a wait until the mapped pinned host word
+    /// `word` reaches `value` (cyclic `>=`); later work on the stream starts
+    /// after it. Captures into graphs.
+    ///
+    /// # Safety
+    /// `cuda_stream` is live on the current device and `word` is an aligned
+    /// u32 of a live mapped host allocation (`alloc_host_buffer`) that outlives
+    /// every queued wait. Some host thread must eventually store a satisfying
+    /// value, or the stream never drains.
+    pub unsafe fn cuda_stream_wait_value32(&self, cuda_stream: *mut c_void, word: *const u32, value: u32)
+        -> Result<()> {
+        let wait_fn: Symbol<CudaStreamWaitValue32Fn> = unsafe { self.lib.get(b"cuteafd_cuda_stream_wait_value32")? };
+        let status = unsafe { wait_fn(cuda_stream, word, value) };
+        self.status_to_result("cuteafd_cuda_stream_wait_value32", status)
+    }
+
+    /// Queues on `cuda_stream` a store of `value` to the mapped pinned host
+    /// word `word`, after (and fenced behind) the stream's earlier work.
+    ///
+    /// # Safety
+    /// As [`Self::cuda_stream_wait_value32`]; the word outlives the queued store.
+    pub unsafe fn cuda_stream_write_value32(&self, cuda_stream: *mut c_void, word: *mut u32, value: u32)
+        -> Result<()> {
+        let write_fn: Symbol<CudaStreamWriteValue32Fn> = unsafe { self.lib.get(b"cuteafd_cuda_stream_write_value32")? };
+        let status = unsafe { write_fn(cuda_stream, word, value) };
+        self.status_to_result("cuteafd_cuda_stream_write_value32", status)
     }
 
     pub unsafe fn cuda_event_elapsed_ms(

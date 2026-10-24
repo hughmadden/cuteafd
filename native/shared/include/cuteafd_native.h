@@ -325,6 +325,17 @@ cuteafd_status_t cuteafd_cuda_event_synchronize(void* cuda_event);
 // Returns immediately: ready=0 means the event's work is pending; asynchronous
 // errors remain errors. Safe from any host thread on the event's device.
 cuteafd_status_t cuteafd_cuda_event_query(void* cuda_event, int32_t* ready);
+// Stream memory operations on one u32 word of mapped pinned host memory
+// (`cuteafd_alloc_host_buffer`): a host thread and the GPU exchange sequence
+// numbers through it with no host wait. `word` is the host address; the call
+// resolves its device alias on the stream's device.
+// wait: later work on `cuda_stream` starts only once (int32_t)(*word - value)
+// >= 0 (cyclic, wraparound-safe). Where the device can flush remote writes
+// the wait also orders GPUDirect RDMA writes that preceded the host's store.
+cuteafd_status_t cuteafd_cuda_stream_wait_value32(void* cuda_stream, const uint32_t* word, uint32_t value);
+// write: stores `value` to `word` once `cuda_stream`'s earlier work (copies
+// into host memory included) is complete and visible to the host.
+cuteafd_status_t cuteafd_cuda_stream_write_value32(void* cuda_stream, uint32_t* word, uint32_t value);
 cuteafd_status_t cuteafd_cuda_event_elapsed_ms(void* start_event, void* end_event, float* out_ms);
 // Opt-in census spans never synchronize. Completed device timings are drained
 // at later span calls; the bounded pending queue drops samples under overload.
