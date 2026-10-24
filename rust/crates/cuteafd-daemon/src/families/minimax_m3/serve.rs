@@ -250,7 +250,6 @@ fn worker(args: &ServeArgs, receive: &mut tokio::sync::mpsc::Receiver<cuteafd_ap
     })?;
     let mut cache = Cache::new(&library, args.device, &admitted.cache.cache, admitted.cache.pool_pages as usize,
         admitted.cache.resident_pages as usize, sizing.sequences,
-        admitted.ledger.bytes("page_table").context("MiniMax page-table admission")? as usize,
         CacheBudget { gpu: cache_bytes, host: admitted.cache.host_bytes })?;
     cache.context = cache.context.min(admitted.cache.pool_tokens as usize);
     cuteafd_transport::worker_selection::require_peer_clients(&args.peers, endpoint, 1)?;
@@ -262,8 +261,7 @@ fn worker(args: &ServeArgs, receive: &mut tokio::sync::mpsc::Receiver<cuteafd_ap
         experts: RefCell::new(Routed::new(local, spark)?), rows: sizing.rows, vocabulary: cfg.vocab_size, expander,
         pending: RefCell::new(None), timing: RefCell::new([0.0; 2]), probe: RefCell::new(crate::shared::draft::routes::RoundRoutes::new(1,4)),
         rings: RefCell::new(super::backend::Rings::new(sizing.sequences, rings)), full_prefill_logits: args.full_prefill_logits,
-        trace: RefCell::new(super::diagnostics::LogitTrace::from_env()?),
-        stage_stats: matches!(std::env::var("CUTEAFD_MINIMAX_STAGE_STATS").as_deref(), Ok("1" | "on")) };
+        trace: RefCell::new(super::diagnostics::LogitTrace::from_env()?) };
     let (encoder, preparer, media_bytes) = vision.map_or((Encoder::Off, None, 0), |v| (v.encoder, Some(v.preparer), v.cache_bytes));
     let mut media = cuteafd_engine::media::MediaAdmission::new(cuteafd_engine::media::EmbeddingCache::new(media_bytes), encoder, 16);
     tracing::info!(pool_tokens=admitted.cache.pool_tokens, resident_pages=admitted.cache.resident_pages,

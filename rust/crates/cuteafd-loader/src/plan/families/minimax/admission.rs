@@ -288,8 +288,7 @@ pub fn admit(cfg: &MiniMaxM3Config, sizing: RuntimeSizing, ledger: &RuntimeLedge
             let pages = requested.unwrap_or(fitting.min(i32::MAX as u64));
             (pages, pages, product(&[pages, page_bytes])?, 0)
         }
-        Tiering::Host(tier) => host_pool(&cache, sizing, available - fixed_bytes, requested, tier,
-            ledger.bytes("page_table").ok_or_else(|| manifest("page-table allocation missing"))?)?,
+        Tiering::Host(tier) => host_pool(&cache, sizing, available - fixed_bytes, requested, tier)?,
     };
     if pool_pages == 0 || pool_pages > i32::MAX as u64 { return Err(AdmissionError::Unsupported("physical page count outside Int32")); }
     let total_bytes = sum([fixed_bytes, cache_bytes])?;
@@ -301,27 +300,22 @@ pub fn admit(cfg: &MiniMaxM3Config, sizing: RuntimeSizing, ledger: &RuntimeLedge
 /// Host placement in `free` GPU bytes: (pool pages, resident pages, GPU bytes,
 /// host bytes). An automatic pool covers every sequence slot at full context as
 /// far as the index pages and host budget allow, but is never smaller than the
-/// GPU-only pool; resident pages take the GPU bytes the index pages and the
-/// staging (with its translated `table_bytes` page table) leave, in whole tier
-/// parts. The GPU total is checked by the caller.
+/// GPU-only pool; resident pages take the GPU bytes the index pages leave, in
+/// whole tier parts. The GPU total is checked by the caller.
 fn host_pool(cache: &MiniMaxCacheLayout, sizing: RuntimeSizing, free: u64, requested: Option<u64>,
-    tier: HostTier, table_bytes: u64) -> Result<(u64, u64, u64, u64)> {
-    use crate::families::minimax_m3::cache::STAGING_PAGES;
+    tier: HostTier) -> Result<(u64, u64, u64, u64)> {
     let rank = &cache.ranks[0];
     let unit = cache.tier_unit_pages(0);
     let kv = 2 * cache.layers as u64 * rank.kv_page_bytes;
-    // Index pages and the staging slot map scale with the pool; the staging
-    // pages, masks, counters and translated table are bounded.
-    let index = rank.page_bytes - kv + 4;
-    let staged = free.saturating_sub(2 * STAGING_PAGES * rank.kv_page_bytes + 4 * STAGING_PAGES + 512 + table_bytes);
+    let index = rank.page_bytes - kv;
     let parts = |bytes: u64| bytes / kv / unit * unit;
-    let resident_for = |pages: u64| parts(staged.saturating_sub(pages.saturating_mul(index)));
+    let resident_for = |pages: u64| parts(free.saturating_sub(pages.saturating_mul(index)));
     let pages = match requested {
         Some(pages) => pages,
         None => {
             let floor = parts(tier.resident_bytes.unwrap_or(HOT_FLOOR_BYTES));
             let target = (sizing.sequences as u64).saturating_mul(sizing.context.div_ceil(PAGE_ROWS));
-            let by_index = staged.saturating_sub(floor.saturating_mul(kv)) / index;
+            let by_index = free.saturating_sub(floor.saturating_mul(kv)) / index;
             let by_host = floor.saturating_add(tier.host_bytes / (unit * kv) * unit);
             let pages = target.min(by_index).min(by_host).min(i32::MAX as u64);
             let gpu_only = free / rank.page_bytes;
@@ -333,7 +327,6 @@ fn host_pool(cache: &MiniMaxCacheLayout, sizing: RuntimeSizing, free: u64, reque
     if resident >= pages { return Ok((pages, pages, product(&[pages, rank.page_bytes])?, 0)); }
     let (gpu, host) = cache.tiered_bytes(0, pages, resident)?;
     if host > tier.host_bytes { return Err(AdmissionError::HostBudget { needed: host, available: tier.host_bytes }); }
-    let gpu = sum([gpu, cache.staging_bytes(0, pages, resident), table_bytes])?;
     Ok((pages, resident, gpu, host))
 }
 
@@ -538,36 +531,27 @@ pub(crate) mod tests {
         assert_eq!(gpu.pool_pages, (4u64 << 30) / page);
         // Automatic: one slot at 1M context (16,384 pages) fits beside the index pages;
         // every remaining GPU byte holds resident K/V in 2 MiB parts.
-        // Staging: 4096 K and V pages, the translated page table and per-page slot map.
-        let table = ledger.bytes("page_table").unwrap();
-        let reserve = 2 * 4096 * 32768 + 4 * 4096 + 512 + table;
-        let staging = |pages: u64, resident: u64| {
-            let s = ((pages - resident).div_ceil(64) * 64).min(4096);
-            2 * s * 32768 + (pages * 4).next_multiple_of(16) + (s * 4).next_multiple_of(16) + 16 + 256 + table
-        };
         let wide = fixed + (12u64 << 30);
         let auto = admit(&cfg, sizing, &ledger, reservations, wide, None, Qwen4KvCache::Fp8, host(None, 192 << 30)).unwrap();
         assert_eq!(auto.pool_pages, 16_384);
         assert!(auto.tiered());
-        assert_eq!(auto.resident_pages, ((12u64 << 30) - reserve - 16_384 * (index + 4)) / kv / unit * unit);
-        assert_eq!(auto.cache_bytes, 16_384 * index + auto.resident_pages * kv + staging(16_384, auto.resident_pages));
+        assert_eq!(auto.resident_pages, ((12u64 << 30) - 16_384 * index) / kv / unit * unit);
+        assert_eq!(auto.cache_bytes, 16_384 * index + auto.resident_pages * kv);
         assert_eq!(auto.host_bytes, (16_384 - auto.resident_pages).div_ceil(unit) * unit * kv);
         assert!(auto.total_bytes <= wide);
         // 4 GiB cannot index 1M tokens: the automatic pool is index-limited beside a 1 GiB floor.
         let limited = admit(&cfg, sizing, &ledger, reservations, available, None, Qwen4KvCache::Fp8, host(None, 192 << 30)).unwrap();
-        assert_eq!((limited.pool_pages, limited.resident_pages), (((4u64 << 30) - reserve - 256 * kv) / (index + 4), 256));
-        assert!(limited.total_bytes <= available);
+        assert_eq!((limited.pool_pages, limited.resident_pages), (((4u64 << 30) - 256 * kv) / index, 256));
         // An exact resident tier, and an explicit pool that is not a whole number of parts.
         let exact = admit(&cfg, sizing, &ledger, reservations, available, Some(7_000 * 64), Qwen4KvCache::Fp8,
             host(Some(kv * 100), 192 << 30)).unwrap();
         assert_eq!((exact.pool_pages, exact.resident_pages), (7_000, 64));
         assert_eq!(exact.host_bytes, (7_000u64 - 64).div_ceil(64) * 64 * kv);
-        assert_eq!(exact.cache_bytes, 7_000 * index + 64 * kv + staging(7_000, 64));
+        assert_eq!(exact.cache_bytes, 7_000 * index + 64 * kv);
         // The host budget bounds the automatic pool to whole parts beyond the floor ...
         let small = admit(&cfg, sizing, &ledger, reservations, available, None, Qwen4KvCache::Fp8,
             host(Some(0), 20 * unit * kv)).unwrap();
         assert_eq!((small.pool_pages, small.resident_pages, small.host_bytes), (1280, 0, 1280 * kv));
-        assert_eq!(small.cache_bytes, 1280 * index + staging(1280, 0));
         // ... and never leaves a smaller pool than GPU placement.
         let tiny = admit(&cfg, sizing, &ledger, reservations, available, None, Qwen4KvCache::Fp8,
             host(Some(0), 10 * unit * kv)).unwrap();

@@ -94,7 +94,7 @@ pub fn load_library(path: &Path) -> Result<NativeLibrary> {
     { let programs = native("program inventory",library.programs())?;
         for (name, _) in definitions() { programs.spec(name).map_err(|_|MiniMaxNativeError::Program {
             program:name.into(),reason:"missing coordinator export" })?; } }
-    for name in ["cuteafd_cuda_accumulate_bf16_to_f32_async", "cuteafd_add_tp2_shared_async", INDEX_STAGE, KV_STAGE, KV_TRANSLATE,
+    for name in ["cuteafd_cuda_accumulate_bf16_to_f32_async", "cuteafd_add_tp2_shared_async", INDEX_STAGE,
         "cuteafd_vocabulary_head_create_vocab", "cuteafd_vocabulary_head_launch_width",
         "cuteafd_vocabulary_head_launch_tensor_invariant", "cuteafd_v41_markov_destroy"] {
         // SAFETY: lookup verifies symbol presence only; this uncalled address
@@ -106,32 +106,6 @@ pub fn load_library(path: &Path) -> Result<NativeLibrary> {
 }
 
 const INDEX_STAGE: &str = "cuteafd_minimax_index_stage_async";
-const KV_STAGE: &str = "cuteafd_minimax_kv_stage_async";
-const KV_TRANSLATE: &str = "cuteafd_minimax_kv_translate_async";
-
-/// Staging scratch of a host-placed cache (`minimax_kv_stage.cu`): one slot-map
-/// entry per pool page, one head mask per staging page and a 16-byte counter.
-pub fn kv_stage_scratch_bytes(pool_pages: usize, staging_pages: usize) -> usize {
-    (pool_pages * 4).next_multiple_of(16) + (staging_pages * 4).next_multiple_of(16) + 16
-}
-
-/// One layer's staging of host K/V pages ([`Commands::kv_stage`]).
-#[derive(Debug, Clone, Copy)]
-pub struct KvStage {
-    /// Selection rows the q2k buffer is laid out for (the export's capacity).
-    pub q2k_rows: usize,
-    pub rows: usize,
-    /// Decode: one table and visible length per row; extend: one shared table
-    /// and the cache length after the rows.
-    pub per_row: bool,
-    pub stride: usize,
-    /// Page ids below this are device memory.
-    pub resident: usize,
-    pub pool_pages: usize,
-    /// Staging page ids `base..base + capacity` of every plane.
-    pub base: usize,
-    pub capacity: usize,
-}
 
 pub fn definitions() -> Vec<(&'static str, &'static [&'static str])> {
     let norm: &[&str] = &["x", "weight", "bias", "cos", "sin", "positions", "out"];
@@ -414,64 +388,6 @@ impl<'a> Commands<'a> {
         let status = on_device(self.library, self.device, || Ok(unsafe {
             stage(cache.view.ptr, pages.view.ptr.cast(), count as u32, keys.view.ptr, scales.view.ptr, self.stream) }))?;
         ensure!(status == 0, MiniMaxNativeError::Runtime { operation: "index stage".into(),
-            source: anyhow::anyhow!("CUDA status {status}") });
-        Ok(())
-    }
-    /// Copies the head slices of every host page (id >= `stage.resident`) the
-    /// layer's selections read into the staging pages of `key`/`value`
-    /// (`minimax_kv_stage.cu`). `scratch` ([`kv_stage_scratch_bytes`]) is zero
-    /// on entry; `stats` (two u64) accumulates copied slices and host reads.
-    #[allow(clippy::too_many_arguments)]
-    pub fn kv_stage(&self, stage: KvStage, q2k: &Buffer<'a>, table: &Buffer<'a>, lengths: &Buffer<'a>,
-        key: &Buffer<'a>, value: &Buffer<'a>, scratch: &Buffer<'a>, stats: &Buffer<'a>) -> Result<()> {
-        let tables = if stage.per_row { stage.rows } else { 1 };
-        let plane = stage.base.checked_add(stage.capacity).and_then(|n| n.checked_mul(32768));
-        ensure!(stage.rows > 0 && stage.rows <= stage.q2k_rows && stage.stride > 0 && stage.capacity > 0
-            && stage.resident <= stage.pool_pages && stage.pool_pages <= stage.base && stage.base + stage.capacity <= i32::MAX as usize
-            && q2k.view.bytes >= 4 * stage.q2k_rows * 16 * 4 && table.view.bytes >= tables * stage.stride * 4
-            && lengths.view.bytes >= tables * 4 && plane.is_some_and(|n| key.view.bytes >= n && value.view.bytes >= n)
-            && scratch.view.bytes >= kv_stage_scratch_bytes(stage.pool_pages, stage.capacity) && stats.view.bytes >= 16,
-            MiniMaxNativeError::Operand("kv stage extents"));
-        ensure!([q2k, table, lengths, key, value, scratch, stats].iter().all(|b| b.view.ptr as usize % 16 == 0),
-            MiniMaxNativeError::Operand("program operand is not 16-byte aligned"));
-        self.keep(&[q2k, table, lengths, key, value, scratch, stats])?;
-        type Stage = unsafe extern "C" fn(*const i32, u32, u32, *const i32, u32, i32, *const i32, *mut c_void,
-            *mut c_void, i32, i32, i32, *mut i32, *mut i32, *mut i32, *mut u64, *mut c_void) -> i32;
-        // SAFETY: the symbol's C ABI is fixed by minimax_kv_stage.cu; load_library required it.
-        let call = unsafe { self.library.lib.get::<Stage>(KV_STAGE.as_bytes()) }
-            .map_err(|_| MiniMaxNativeError::Program { program: KV_STAGE.into(), reason: "missing shared execution export" })?;
-        let map = scratch.view.ptr.cast::<i32>();
-        // SAFETY: the scratch layout matches kv_stage_scratch_bytes (16-byte aligned parts).
-        let heads = unsafe { map.byte_add((stage.pool_pages * 4).next_multiple_of(16)) };
-        // SAFETY: as above; the counter follows the head masks.
-        let count = unsafe { heads.byte_add((stage.capacity * 4).next_multiple_of(16)) };
-        // SAFETY: checked extents and alignment; every operand is retained until drain.
-        let status = on_device(self.library, self.device, || Ok(unsafe { call(q2k.view.ptr.cast(), stage.q2k_rows as u32,
-            stage.rows as u32, table.view.ptr.cast(), stage.stride as u32, i32::from(stage.per_row), lengths.view.ptr.cast(),
-            key.view.ptr, value.view.ptr, stage.resident as i32, stage.base as i32, stage.capacity as i32, map, heads, count,
-            stats.view.ptr.cast(), self.stream) }))?;
-        ensure!(status == 0, MiniMaxNativeError::Runtime { operation: "kv stage".into(),
-            source: anyhow::anyhow!("CUDA status {status}") });
-        Ok(())
-    }
-    /// `out[i]` = the staging page of `table[i]` when [`Commands::kv_stage`]
-    /// copied it this layer, else `table[i]`.
-    pub fn kv_translate(&self, table: &Buffer<'a>, out: &Buffer<'a>, entries: usize, scratch: &Buffer<'a>,
-        resident: usize, base: usize, pool_pages: usize) -> Result<()> {
-        ensure!(entries > 0 && table.view.bytes >= entries * 4 && out.view.bytes >= entries * 4
-            && scratch.view.bytes >= pool_pages * 4 && resident <= pool_pages && pool_pages <= base && base <= i32::MAX as usize,
-            MiniMaxNativeError::Operand("kv translate extents"));
-        ensure!([table, out, scratch].iter().all(|b| b.view.ptr as usize % 16 == 0),
-            MiniMaxNativeError::Operand("program operand is not 16-byte aligned"));
-        self.keep(&[table, out, scratch])?;
-        type Translate = unsafe extern "C" fn(*const i32, *mut i32, u64, *const i32, i32, i32, *mut c_void) -> i32;
-        // SAFETY: the symbol's C ABI is fixed by minimax_kv_stage.cu; load_library required it.
-        let call = unsafe { self.library.lib.get::<Translate>(KV_TRANSLATE.as_bytes()) }
-            .map_err(|_| MiniMaxNativeError::Program { program: KV_TRANSLATE.into(), reason: "missing shared execution export" })?;
-        // SAFETY: checked extents and alignment; every operand is retained until drain.
-        let status = on_device(self.library, self.device, || Ok(unsafe { call(table.view.ptr.cast(), out.view.ptr.cast(),
-            entries as u64, scratch.view.ptr.cast(), resident as i32, base as i32, self.stream) }))?;
-        ensure!(status == 0, MiniMaxNativeError::Runtime { operation: "kv translate".into(),
             source: anyhow::anyhow!("CUDA status {status}") });
         Ok(())
     }

@@ -2,33 +2,13 @@
 use super::{MiniMaxError, diagnostics::{Diagnostics, StepDump}, ffn, head::TargetHeadOwner, scratch::Scratch, weights::Weights};
 use crate::shared::{memory::device::Device, token_io::DeviceLogits};
 use anyhow::{ensure, Context, Result};
-use cuteafd_ffi::{minimax::{Buffer, Commands, KvStage}, programs::{Programs,Scalar}};
+use cuteafd_ffi::{minimax::{Buffer, Commands}, programs::{Programs,Scalar}};
 use cuteafd_transport::ExpertV2SourceKind;
 use cuteafd_loader::{families::minimax_m3::config::MiniMaxM3Config,
     plan::{checkpoint::Checkpoint,families::minimax::admission::RuntimeLedger}};
 
 #[derive(Clone)]
-pub(super) struct LayerCache<'a> { pub key: Buffer<'a>, pub value: Buffer<'a>, pub index: Buffer<'a>,
-    pub stage: Option<KvStaging<'a>> }
-
-/// Host K/V placement: before each attention launch, the host pages its
-/// selections read are copied once into staging pages `base..base + capacity`
-/// of every plane, and attention reads a translated page table
-/// (`minimax_kv_stage.cu`). Shared by every layer.
-#[derive(Clone)]
-pub(super) struct KvStaging<'a> {
-    pub resident: usize,
-    pub pool_pages: usize,
-    pub base: usize,
-    pub capacity: usize,
-    pub scratch: Buffer<'a>,
-    pub stats: Buffer<'a>,
-    pub table: Buffer<'a>,
-}
-impl KvStaging<'_> {
-    /// Page ids the attention kernels may address: pool, padding and staging.
-    pub fn plane_pages(&self) -> usize { self.base + self.capacity }
-}
+pub(super) struct LayerCache<'a> { pub key: Buffer<'a>, pub value: Buffer<'a>, pub index: Buffer<'a> }
 #[derive(Debug,Clone)]
 pub(super) struct RequestView { pub row_start:usize, pub rows:usize, pub start_position:usize, pub pages:Vec<i32> }
 #[derive(Debug,Clone)]
@@ -296,23 +276,6 @@ impl<'a> Execution<'a> {
         if result.is_err() { self.poisoned.set(true); experts.abort(); }
         result
     }
-    /// Host K/V placement: stage the host pages this launch's selections read
-    /// and translate its page table (rows from `table_offset` bytes). Returns
-    /// the table attention reads and the page extent it addresses; without
-    /// host placement, `table` and the pool.
-    #[allow(clippy::too_many_arguments)]
-    fn stage(&self, cache:&LayerCache<'a>, q2k:&Buffer<'a>, q2k_rows:usize, rows:usize, per_row:bool, stride:usize,
-        table:&Buffer<'a>, lengths:&Buffer<'a>, table_offset:usize, pool_pages:usize) -> Result<(Buffer<'a>,usize)> {
-        let Some(stage)=&cache.stage else { return Ok((table.clone(),pool_pages)) };
-        ensure!(stage.pool_pages==pool_pages,MiniMaxError::Invalid("staged pool extent"));
-        self.commands.zero(&stage.scratch)?;
-        self.commands.kv_stage(KvStage{q2k_rows,rows,per_row,stride,resident:stage.resident,pool_pages,base:stage.base,
-            capacity:stage.capacity},q2k,table,lengths,&cache.key,&cache.value,&stage.scratch,&stage.stats)?;
-        let entries=if per_row {rows*stride} else {stride};
-        let out=stage.table.view(table_offset,entries*4)?;
-        self.commands.kv_translate(table,&out,entries,&stage.scratch,stage.resident,stage.base,pool_pages)?;
-        Ok((out,stage.plane_pages()))
-    }
     fn residual(&self,rows:usize)->Result<()> {
         self.commands.launch("minimax_residual", &[self.scratch.get("residual")?,self.scratch.get("delta")?,self.scratch.get("residual")?], &[Scalar::I32(rows as i32)])
     }
@@ -373,12 +336,10 @@ impl<'a> Execution<'a> {
                     &s.get("index_q_scales")?.view(0,rows*16)?,&cache.index,s.get("page_table")?,s.get("cache_lengths")?,s.get("q2k")?,s.get("scratch")?], &[
                     Scalar::I32(rows as i32),Scalar::I32(stride as i32),Scalar::I32(stride as i32),Scalar::I64(batch.pool_pages as i64)])?;
                 if let Some(d)=dump.as_deref_mut() { d.selection(&self.commands,s.get("q2k")?,rows,self.decode_rows)?; }
-                let (table,pages)=self.stage(cache,s.get("q2k")?,self.decode_rows,rows,true,stride,
-                    s.get("page_table")?,s.get("cache_lengths")?,0,batch.pool_pages)?;
                 self.commands.launch("minimax_attention_decode", &[&s.get("q_norm")?.view(0,rows*16384)?,&cache.key,&cache.value,
-                    s.get("k_descale")?,s.get("v_descale")?,&table,s.get("cache_lengths")?,s.get("cu_seqlens_q")?,s.get("q2k")?,
+                    s.get("k_descale")?,s.get("v_descale")?,s.get("page_table")?,s.get("cache_lengths")?,s.get("cu_seqlens_q")?,s.get("q2k")?,
                     &s.get("attention")?.view(0,rows*16384)?,s.get("lse")?,s.get("scratch")?], &[
-                    Scalar::I32(rows as i32),Scalar::I32(rows as i32),Scalar::I32(stride as i32),Scalar::I64(pages as i64)])?;
+                    Scalar::I32(rows as i32),Scalar::I32(rows as i32),Scalar::I32(stride as i32),Scalar::I64(batch.pool_pages as i64)])?;
             }
             // Each request's index keys through this step are staged as the
             // contiguous rows the prefill scorer reads; its tiles then select
@@ -399,14 +360,11 @@ impl<'a> Execution<'a> {
                         &bounds.view(0,n*4)?,&bounds.view(launch.bounds*4,n*4)?,s.get("q2k_extend")?,s.get("scratch")?], &[
                         Scalar::I32(n as i32),Scalar::I32((request.start_position+launch.first+n) as i32)])?;
                     if let Some(d)=dump.as_deref_mut() { d.selection(&self.commands,s.get("q2k_extend")?,n,tile)?; }
-                    let lengths=s.get("cache_lengths")?.view(launch.slot*16,16)?;
-                    let (kv_table,pages)=self.stage(cache,s.get("q2k_extend")?,tile,n,false,stride,&table,&lengths,
-                        launch.slot*stride*4,batch.pool_pages)?;
                     self.commands.launch("minimax_attention_extend", &[&s.get("q_norm")?.view(row*16384,n*16384)?,&cache.key,&cache.value,
-                        s.get("k_descale")?,s.get("v_descale")?,&kv_table,&lengths,
+                        s.get("k_descale")?,s.get("v_descale")?,&table,&s.get("cache_lengths")?.view(launch.slot*16,16)?,
                         &s.get("cu_seqlens_q")?.view(launch.slot*16,16)?,s.get("q2k_extend")?,
                         &s.get("attention")?.view(row*16384,n*16384)?,s.get("lse")?,s.get("scratch")?], &[
-                        Scalar::I32(n as i32),Scalar::I32(1),Scalar::I32(stride as i32),Scalar::I64(pages as i64)])?;
+                        Scalar::I32(n as i32),Scalar::I32(1),Scalar::I32(stride as i32),Scalar::I64(batch.pool_pages as i64)])?;
                 }
             }
         }

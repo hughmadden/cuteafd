@@ -450,13 +450,11 @@ fn minimax_host_kv_placement_admits_serving_and_charges_exact_host_pages() {
     let gpu = memory.devices.iter().find(|d| d.kind == DeviceKind::Rtx).unwrap();
     assert!(gpu.used_bytes() <= gpu.capacity_bytes);
     let items: Vec<_> = gpu.items.iter().filter(|i| i.category == Category::Kv).collect();
-    assert_eq!(items.len(), 3);
+    assert_eq!(items.len(), 2);
     assert!(items.iter().all(|i| i.basis == Basis::Exact));
     assert_eq!(items[0].bytes, 16_384 * index);
     let resident = items[1].bytes / kv;
     assert!(resident >= 1024 && resident % 64 == 0 && items[1].bytes == resident * kv, "{resident}");
-    // 4096 K and V staging pages beside the slot map and the translated page table.
-    assert!(items[2].bytes > 2 * 4096 * 32768 && items[2].bytes < 2 * 4096 * 32768 + (16 << 20), "{}", items[2].bytes);
     let pinned = report.bytes_by_owner["pinned host K/V pages"];
     assert_eq!(pinned, (16_384 - resident).div_ceil(64) * 64 * kv);
     let ledger = report.host_ledger.as_ref().unwrap();

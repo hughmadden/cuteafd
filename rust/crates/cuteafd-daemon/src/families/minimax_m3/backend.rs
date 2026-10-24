@@ -76,8 +76,6 @@ pub(super) struct MiniMaxBackend<'e, 'a> {
     pub rings: RefCell<Rings>,
     pub full_prefill_logits: bool,
     pub trace: RefCell<Option<super::diagnostics::LogitTrace>>,
-    /// `CUTEAFD_MINIMAX_STAGE_STATS=1`: log host K/V staging counters after every step.
-    pub stage_stats: bool,
 }
 impl<'e, 'a> MiniMaxBackend<'e, 'a> {
     /// One step; the head projects only the batch rows in `logits`.
@@ -128,13 +126,6 @@ impl<'e, 'a> MiniMaxBackend<'e, 'a> {
         let logits = result?;
         if let (Some(trace), Some(device)) = (self.trace.borrow_mut().as_mut(), logits.as_ref()) {
             trace.record(prefill, &batch.positions[rows], &device.to_host(library)?, device.vocab)?;
-        }
-        if self.stage_stats {
-            if let Some((slices, direct)) = self.cache.stage_stats()? {
-                tracing::info!(target: "cuteafd::minimax::stage", prefill, rows = batch.positions.len(),
-                    seconds = started.elapsed().as_secs_f64(), slices, direct,
-                    "host K/V staging totals (16 KiB per head slice copied; direct = host page reads left in place)");
-            }
         }
         self.timing.borrow_mut()[usize::from(!prefill)] += started.elapsed().as_secs_f64();
         step.completed();
