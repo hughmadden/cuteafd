@@ -20,6 +20,18 @@ pub(crate) fn deprecated_budget_flags(args: impl IntoIterator<Item = impl AsRef<
     replacements
 }
 
+/// A Spark chunk size: `none`/`0` (never split) or bytes (NKiB/NMiB), in range.
+/// TEMPORARY: remove after PFC test (TJ 2026-10-25).
+fn parse_chunk_bytes(text: &str) -> std::result::Result<ChunkBytes, String> {
+    let bytes = cuteafd_transport::SparkChunking::parse_bytes(text).map_err(|error| format!("{error:#}"))?;
+    cuteafd_transport::SparkChunking::new(bytes, None).map_err(|error| format!("{error:#}"))?;
+    Ok(ChunkBytes(bytes))
+}
+
+/// A parsed Spark chunk size (`None`: never split). TEMPORARY: remove after PFC test (TJ 2026-10-25).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ChunkBytes(pub(crate) Option<usize>);
+
 #[derive(Debug, Parser)]
 #[command(name = "cuteafd", about = "CUTEAFD phase0 runtime CLI")]
 pub(crate) struct Cli {
@@ -37,6 +49,21 @@ pub(crate) struct Cli {
     /// graphs and drafts); leaves physical GPU capacity/SM/L2 unchanged.
     #[arg(long, global = true, aliases = ["rtx-budget-gib", "rtx-gib"])]
     pub(crate) coordinator_gpu_budget_gib: Option<f64>,
+    /// Spark request WRITE chunk: requests above this many bytes send their
+    /// tail as RDMA WRITEs of at most this size, then the head SEND. `none` (or
+    /// 0) sends every request as one SEND; bytes or NKiB/NMiB, 4KiB..=64MiB.
+    /// The coordinator sends it to every Spark worker. TEMPORARY: remove after
+    /// PFC test (TJ 2026-10-25).
+    #[arg(long, global = true, env = "CUTEAFD_SPARK_REQUEST_CHUNK_BYTES", default_value = "256KiB",
+        value_parser = parse_chunk_bytes)]
+    pub(crate) spark_request_chunk_bytes: ChunkBytes,
+    /// Spark reply WRITE chunk: replies above this many bytes WRITE their tail
+    /// into the coordinator's receive, then SEND the head. `none` (default, or
+    /// 0) sends every reply as one SEND. The coordinator sends it to every Spark
+    /// worker. TEMPORARY: remove after PFC test (TJ 2026-10-25).
+    #[arg(long, global = true, env = "CUTEAFD_SPARK_REPLY_CHUNK_BYTES", default_value = "none",
+        value_parser = parse_chunk_bytes)]
+    pub(crate) spark_reply_chunk_bytes: ChunkBytes,
     #[command(subcommand)]
     pub(crate) command: Commands,
 }
@@ -623,6 +650,18 @@ pub(crate) struct TransportCapabilitiesArgs {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn spark_chunk_flags_default_to_request_256k_and_whole_replies() {
+        // TEMPORARY: remove after PFC test (TJ 2026-10-25).
+        let cli = Cli::try_parse_from(["cuteafd", "plan", "/model"]).unwrap();
+        assert_eq!((cli.spark_request_chunk_bytes, cli.spark_reply_chunk_bytes), (ChunkBytes(Some(256 << 10)), ChunkBytes(None)));
+        let cli = Cli::try_parse_from(["cuteafd", "plan", "/model", "--spark-request-chunk-bytes", "none",
+            "--spark-reply-chunk-bytes", "1MiB"]).unwrap();
+        assert_eq!((cli.spark_request_chunk_bytes, cli.spark_reply_chunk_bytes), (ChunkBytes(None), ChunkBytes(Some(1 << 20))));
+        assert!(Cli::try_parse_from(["cuteafd", "plan", "/model", "--spark-reply-chunk-bytes", "64"]).is_err());
+        assert!(Cli::try_parse_from(["cuteafd", "plan", "/model", "--spark-request-chunk-bytes", "128MiB"]).is_err());
+    }
+
     #[test]
     fn retained_draft_kv_defaults_to_fp8_and_preserves_explicit_bf16() {
         use clap::Parser;

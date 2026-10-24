@@ -1377,8 +1377,12 @@ fn log_transfer_plan(mode: IntakeMode, ranks: usize) {
         Ok(report) => {
             let ports = report.rails.rails.iter().map(|rail| format!("{}@{} {:.0}G", rail.device, rail.address,
                 rail.effective_gbps)).collect::<Vec<_>>().join(", ");
-            tracing::info!(ranks, intake = mode.name(),
-                coordinator_rails = %ports, "Spark transfer plan: every rank on the first coordinator rail");
+            // Chunk sizes: TEMPORARY, remove after PFC test (TJ 2026-10-25).
+            let chunking = cuteafd_transport::spark_chunking();
+            tracing::info!(ranks, intake = mode.name(), coordinator_rails = %ports,
+                request_chunk_bytes = %cuteafd_transport::SparkChunking::describe(chunking.request),
+                reply_chunk_bytes = %cuteafd_transport::SparkChunking::describe(chunking.reply),
+                "Spark transfer plan: every rank on the first coordinator rail");
         }
         Err(error) => tracing::warn!("Spark transfer plan: fabric discovery failed: {error:#}"),
     });

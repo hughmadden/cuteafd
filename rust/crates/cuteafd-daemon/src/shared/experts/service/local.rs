@@ -320,6 +320,9 @@ pub(super) fn run(mut config: NativeExpertServiceConfig, listen: &str) -> Result
     // over the shared resident weights and sized for the largest admitted
     // unit: a request takes any free slot, whichever endpoint sent it.
     let slots = execution_slots(config.model_admission.as_ref());
+    // EXLR8: one slot. Its slot memory is not yet calibrated in the planner
+    // (`spark_slot_bytes`); one deferred slot already keeps the owner thread
+    // out of every stream sync.
     if slots > 1 && config.exlr8_manifest.is_some() {
         let error = anyhow::anyhow!("EXLR8 Spark workers serve one execution slot; admitted {slots}");
         let _ = cuteafd_transport::worker_selection::reject_worker_selection(&mut stream, &error);
@@ -336,7 +339,10 @@ pub(super) fn run(mut config: NativeExpertServiceConfig, listen: &str) -> Result
                     if slot == 0 { "experts/workspace" } else { "experts/workspace/slot" });
                 weights.execution(&library, &config, budget, &mut modules)?
             };
-            if slots > 1 { execution.defer()?; }
+            // Every slot, one included, returns mapped requests with their
+            // work queued: the owner emits each once its stream drained, so
+            // it never blocks in a stream sync between requests.
+            execution.defer()?;
             let used = cuteafd_ffi::memory_ledger::snapshot().total(cuteafd_ffi::memory_ledger::Space::Device, device)
                 .saturating_sub(before);
             budget = budget.checked_sub(used).context("Spark execution slots exceed the admitted workspace")?;
@@ -561,23 +567,15 @@ pub(super) fn run(mut config: NativeExpertServiceConfig, listen: &str) -> Result
             let mut serve = Serve { config: &config, executor_id, spark_world: &spark_world, resident: &resident,
                 weights: &weights, exchange: &mut exchange, row_indices: &mut row_indices, skip_compute,
                 log_ingress: pending_steady_log };
-            let result = if slots == 1 {
-                // One execution slot: serve each request to completion in the poll.
-                connections[index].poll(wait, |view, mapped, emit| {
-                    let served = serve.request(&mut executions[0], view, mapped, emit);
-                    execution_failed = served.as_ref().is_err_and(|failure| failure.execution);
-                    executed = served.as_ref().is_ok_and(|served| served.executed);
-                    served.map(|_| ()).map_err(|failure| failure.error)
-                })
-            } else {
+            let result = {
                 // Emit this connection's oldest request once its slot drained;
                 // the transport held both of its ring slots until now.
                 let finished = match holding[index].front().copied() {
                     Some(slot) => match executions[slot].stream_idle() {
-                        Ok(true) => connections[index].finish_deferred(|view, mapped, emit| {
+                        Ok(true) => executions[slot].complete().and_then(|()| connections[index].finish_deferred(|view, mapped, emit| {
                             let response = Serve::device_response(view, mapped, executor_id, &config, &spark_world)?;
                             emit(ProtocolV2ExecutorResponseRef::Device(response))
-                        }).map(|()| {
+                        })).map(|()| {
                             holding[index].pop_front();
                             busy[slot] = false;
                             executed = true;
@@ -611,6 +609,7 @@ pub(super) fn run(mut config: NativeExpertServiceConfig, listen: &str) -> Result
                             Ok(Some(false)) => (|| -> Result<bool> {
                                 while let Some(earlier) = holding[index].pop_front() {
                                     while !executions[earlier].stream_idle()? { std::hint::spin_loop(); }
+                                    executions[earlier].complete()?;
                                     connections[index].finish_deferred(|view, mapped, emit| {
                                         let response = Serve::device_response(view, mapped, executor_id, &config, &spark_world)?;
                                         emit(ProtocolV2ExecutorResponseRef::Device(response))
@@ -666,6 +665,7 @@ pub(super) fn run(mut config: NativeExpertServiceConfig, listen: &str) -> Result
                         while !executions[slot].stream_idle().context("draining a removed peer's slot")? {
                             std::hint::spin_loop();
                         }
+                        executions[slot].complete()?;
                         busy[slot] = false;
                     }
                     tracing::warn!(%error, "native RoCE peer removed");
@@ -862,5 +862,32 @@ mod slot_tests {
         assert_eq!(next_slot(&busy), None, "a full pool receives nothing");
         busy[1] = false;
         assert_eq!(next_slot(&busy), Some(1), "a drained slot serves the next request");
+    }
+}
+
+#[cfg(test)]
+mod deferred_owner_tests {
+    /// The owner loop has one shape for every slot count: each slot defers
+    /// (mapped requests return with their work queued), a request is emitted
+    /// only after its slot's stream is idle and `complete` ran, and no path
+    /// serves a request to completion inside a blocking poll.
+    #[test]
+    fn every_slot_defers_and_completes_before_emission() {
+        let file = include_str!("local.rs");
+        let joined = |parts: &[&str]| parts.concat();
+        let source = &file[file.find(&joined(&["pub(super) fn ", "run("])).unwrap()
+            ..file.find(&joined(&["fn execution_", "slots("])).unwrap()];
+        assert!(source.contains(&joined(&["execution.", "defer()?;"])));
+        assert!(!source.contains(&joined(&["if slots > 1 { execution.", "defer"])), "single slots must defer too");
+        assert!(!source.contains(&joined(&["if slots ", "== 1"])), "no separate single-slot serving path");
+        assert!(!source.contains(&joined(&["connections[index].", "poll("])), "no blocking serve-to-completion poll");
+        // Every emission of a launched request follows its slot's completion.
+        let finishes = source.matches(&joined(&["Serve::", "device_response("])).count();
+        let completes = source.matches(&joined(&[".complete()"])).count();
+        assert!(finishes >= 2 && completes >= finishes, "{completes} completes for {finishes} deferred emissions");
+        let idle = source.find(&joined(&["executions[slot].", "stream_idle() {"])).unwrap();
+        let complete = source[idle..].find(&joined(&["executions[slot].", "complete()"])).unwrap();
+        let emit = source[idle..].find(&joined(&["finish_", "deferred("])).unwrap();
+        assert!(complete < emit, "the oldest request's slot completes before its response is emitted");
     }
 }

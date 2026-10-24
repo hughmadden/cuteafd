@@ -629,6 +629,7 @@ mod tests {
             flow_label,
             worker_selection_digest: None,
             model_endpoint: None,
+            chunking: super::super::request_write::SparkChunking::default(),
         }
     }
 

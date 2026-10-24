@@ -333,17 +333,24 @@ impl<'w, 'a> Execution<'w, 'a> {
             Self::Exlr8(execution) => execution.grouping(loaded, rank).map(Some),
         }
     }
-    /// Lane-owned mode on a multi-lane rank: mapped requests return with their
-    /// work queued; the owner emits once [`Self::stream_idle`] holds. EXLR8
-    /// has no deferred path and is served on lane zero only.
+    /// Lane-owned mode: mapped requests return with their work queued; the
+    /// owner emits once [`Self::stream_idle`] holds, after [`Self::complete`].
     pub(super) fn defer(&mut self) -> Result<()> {
         match self {
             Self::Full(execution) => execution.defer(),
             Self::Exl3(execution) => execution.defer(),
             Self::Fp8(groups) => groups.workers.iter_mut().for_each(Fp8Worker::defer),
-            Self::Exlr8(_) => anyhow::bail!("EXLR8 Spark workers have one execution lane"),
+            Self::Exlr8(execution) => execution.defer(),
         }
         Ok(())
+    }
+    /// A deferred request's stream drained ([`Self::stream_idle`]): finish its
+    /// host bookkeeping (EXLR8 publishes its timing here) before emission.
+    pub(super) fn complete(&mut self) -> Result<()> {
+        match self {
+            Self::Exlr8(execution) => execution.complete(),
+            Self::Full(_) | Self::Exl3(_) | Self::Fp8(_) => Ok(()),
+        }
     }
     /// Whether every request this execution queued has completed.
     pub(super) fn stream_idle(&self) -> Result<bool> {
@@ -351,7 +358,7 @@ impl<'w, 'a> Execution<'w, 'a> {
             Self::Full(execution) => execution.stream_idle(),
             Self::Exl3(execution) => execution.stream_idle(),
             Self::Fp8(groups) => groups.stream_idle(),
-            Self::Exlr8(_) => Ok(true),
+            Self::Exlr8(execution) => execution.stream_idle(),
         }
     }
     pub(super) fn bind_layer(&mut self, weights: &'w Weights<'a>, index: usize) -> Result<()> {
