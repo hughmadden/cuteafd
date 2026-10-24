@@ -498,7 +498,7 @@ impl TensorSource {
     pub fn names(&self) -> impl Iterator<Item = &str> { self.tensors.keys().map(String::as_str) }
     pub fn shape(&self, name: &str) -> Option<&[usize]> { self.tensors.get(name).map(|(_, m)| m.shape.as_slice()) }
 
-    fn bytes(&self, name: &str) -> Result<(Vec<u8>, &crate::SafetensorsTensorMetadata)> {
+    pub(crate) fn bytes(&self, name: &str) -> Result<(Vec<u8>, &crate::SafetensorsTensorMetadata)> {
         let (path, meta) = self.tensors.get(name).with_context(|| format!("tensor {name} is not in this source"))?;
         let file = std::fs::File::open(path).with_context(|| format!("opening {}", path.display()))?;
         // Header offsets are absolute file offsets (`read_safetensors_metadata` adds the data start).
@@ -688,6 +688,10 @@ pub fn derive_variant(served: &Path, served_id: &str, index: u8, spec: &cuteafd_
     let started = std::time::Instant::now();
     let config = crate::plan::checkpoint::read_json(&served.join("config.json"))?;
     let family = family_variants(&config, spec.mode.as_deref())?;
+    // DeepSeek V4.1 serves its own recipe on top of the shared fit; plan reports exactly that.
+    if family.family == "deepseek_v41" {
+        return crate::families::deepseek_v41::v41_variant::derive_v41_outcome(served, served_id, index, spec).map(|(o, _)| o);
+    }
     let base_path = spec.base.as_deref().map_or_else(|| served.to_path_buf(), PathBuf::from);
     let variant = open_source(Path::new(&spec.source), "variant", family.wants)?;
     let base = open_source(&base_path, "variant-base", family.wants)?;

@@ -30,7 +30,7 @@ pub use families::deepseek_v41::v41_config::{
     V41TextConfig, V41VisionConfig,
 };
 pub use families::deepseek_v41::engram_tokenizer::EngramTokenMap;
-pub use families::deepseek_v41::v41_variant::{derive_v41_variant, read_fp8_block32, Fp8Block32, TensorBytes, V41Derivation, V41SiteReport, V41VariantOpts, V41VariantSource};
+pub use families::deepseek_v41::v41_variant::{derive_v41_outcome, derive_v41_variant, read_fp8_block32, Fp8Block32, TensorBytes, V41Derivation, V41SiteReport, V41VariantOpts, V41VariantSource};
 pub use families::deepseek_v41::engram_prefetch::{EngramEncoding, EngramPrefetcher, EngramTable, PrefetchOutcome, PrefetchTicket};
 pub use formats::mapped_table::{
     AdviseRows, GatherFailure, GatherLease, GatherPool, GatherPoll, GatherReport, GatherTicket, GatherTiming,
