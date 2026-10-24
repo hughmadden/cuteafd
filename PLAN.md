@@ -5897,8 +5897,8 @@ explicit in the candidate configuration. Keep DFlash2 available and test its
 target verification. Retain Romeo's one coordinator GPU with experts placed
 across all six Sparks;
 the unsupported coordinator head-split, TP2, layer-owner and EXLR8 native-dense
-paths remain gated. Combined `ffn` steering is a separate explicit policy,
-not evidence of reproducing the alternate weights checkpoint's edited tensor scope.
+paths remain gated. A shared-derived `mode=ffn` is unavailable until routed
+expert equivalence is verified; it must not serve with only a warning.
 
 Romeo was inspected read-only on 2026-10-24. It has one RTX PRO 6000 Max-Q
 96 GB, full-model configurations at `/srv/cuteafd/romeo-glm53-k4.config`,
@@ -5973,6 +5973,13 @@ quality/tool-use and behavior smoke. Only then run the warmed C1/C16 and
 Use the same checkpoint, draft and workload settings across arms and current
 work/p0 for the shared-path comparison. Hardware leases, preflight and cleanup
 follow AGENTS.md. Stop owned test services when finished.
+
+Reuse the existing `lossless_set` benchmark panel for cold DFlash2-on versus
+drafts-off token and row comparisons, and `prefix_cache` for retained turns.
+Select each exact public ID with `cuteafd bench --model`; the run request,
+all probes and the exported identity must agree. An unready/unlisted ID or a
+server that ignored the requested ID must fail instead of producing a base
+measurement labelled as the alternate layer.
 
 ## Backlog (lowest priority: only when nothing planned is left)
 
