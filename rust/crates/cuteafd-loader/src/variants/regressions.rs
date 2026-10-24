@@ -48,6 +48,42 @@ fn fp8_exl3_wrapper_uses_original_quantization_config_for_dense_blocks() {
 }
 
 #[test]
+fn fp8_external_declaration_is_not_masked_by_exl3_config_and_conflicts_reject() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("config.json");
+    std::fs::write(&config,r#"{"quantization_config":{"quant_method":"exl3","bits":4}}"#).unwrap();
+    std::fs::write(dir.path().join("quantize_config.json"),r#"{"quant_method":"exl3","original_quantization_config":{"weight_block_size":[128,2]}}"#).unwrap();
+    write_safetensors(&dir.path().join("model.safetensors"),&[
+        ("w.weight","F8_E4M3",vec![129,2],vec![0x38;129*2]),
+        ("w.weight_scale_inv","F32",vec![2,1],[2f32,5.0].into_iter().flat_map(f32::to_le_bytes).collect()),
+    ]);
+    let open = || TensorSource::from_checkpoint(&crate::plan::checkpoint::Checkpoint::open_for_role(dir.path(),"test", |_| true).unwrap());
+    let matrix = open().matrix("w.weight").unwrap();
+    assert_eq!((matrix.data[127*2],matrix.data[128*2]),(2.0,5.0));
+    std::fs::write(&config,r#"{"quantization_config":{"weight_block_size":[64,2]}}"#).unwrap();
+    assert!(open().matrix("w.weight").unwrap_err().to_string().contains("disagree"));
+}
+
+#[test]
+fn metadata_free_fully_tiled_fp8_uses_exact_source_header_ratios() {
+    let dir = tempfile::tempdir().unwrap();
+    // The served Romeo K4 config has this EXL3-only declaration. Its FP32
+    // dense scale headers describe full tiles; no engine sidecar is needed.
+    std::fs::write(dir.path().join("config.json"),r#"{"quantization_config":{"bits":4,"checkpoint_format":"exl3","format":"exl3","quant_method":"exl3"}}"#).unwrap();
+    let file = dir.path().join("model.safetensors");
+    for (rows,cols,srows,scols) in [(256,384,2,3),(96,128,3,4)] {
+        let scales: Vec<f32> = (1..=srows*scols).map(|n| n as f32).collect();
+        write_safetensors(&file,&[("w.weight","F8_E4M3",vec![rows,cols],vec![0x38;rows*cols]),
+            ("w.weight_scale_inv","F32",vec![srows,scols],scales.iter().flat_map(|v| v.to_le_bytes()).collect())]);
+        let source = TensorSource::from_files([file.clone()]).unwrap();
+        let matrix = source.matrix("w.weight").unwrap();
+        for r in 0..rows { for c in 0..cols {
+            assert_eq!(matrix.data[r*cols+c],scales[(r/(rows/srows))*scols+c/(cols/scols)]);
+        }}
+    }
+}
+
+#[test]
 fn fp8_bad_layout_and_short_scales_return_typed_errors() {
     let dir = tempfile::tempdir().unwrap();
     let file = dir.path().join("model.safetensors");
