@@ -80,7 +80,7 @@ def test_default_prints_ordered_schedule_and_checks_only_local_files(ready):
     stages = ["1. Plan", "2. Build", "3. Single-layer", "4. Golden", "Spark TP4", "TP4 serve", "Spark TP2", "Spark TP3"]
     assert [result.stdout.index(stage) for stage in stages] == sorted(result.stdout.index(stage) for stage in stages)
     assert result.stdout.index("5090: 1.") > result.stdout.index("pro6000: TP3 serve")
-    for text in ("top-1 >=90%", "KL <=0.06 nat", "byte-exact prefix restore", "MSA selection", "remain unverified"):
+    for text in ("top-1 >=94%", "KL <=0.03 nat", "byte-exact prefix restore", "MSA selection", "remain unverified"):
         assert text in result.stdout
 
 

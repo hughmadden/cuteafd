@@ -188,10 +188,19 @@ impl Scores {
     }
 }
 
+/// Full-model gates over the generated-role rows, from the first real-weight run (standard set v1,
+/// 13,534 rows, TP2; decode- and prefill-shaped scoring: top-1 0.955/0.957, KL 0.0186, NLL 0.2519
+/// against the served-cache reference's 0.2536), with margin for kernel route and chunk changes.
+const TOP1_MIN: f64 = 0.94;
+const KL_MAX: f64 = 0.03;
+const NLL_EXCESS_MAX: f64 = 0.01;
+
 fn verdict(result: &Value, full: bool) -> Result<()> {
     let number = |key| result[key].as_f64().filter(|v| v.is_finite()).with_context(|| format!("missing finite {key}"));
-    if full { ensure!(number("top1")? >= 0.90 && number("mean_kl")? <= 0.06,
-        "MiniMax fidelity failed: top-1 must be >= 0.90 and KL <= 0.06 nat"); }
+    if full { ensure!(number("top1")? >= TOP1_MIN && number("mean_kl")? <= KL_MAX
+            && number("nll")? - number("reference_nll")? <= NLL_EXCESS_MAX,
+        "MiniMax fidelity failed: top-1 >= {TOP1_MIN}, KL <= {KL_MAX} nat and NLL at most {NLL_EXCESS_MAX} nat \
+         above the reference required"); }
     else { ensure!(number("cosine")? >= 0.99 && number("relative_l2")? <= 0.05,
         "MiniMax partial hidden failed: cosine >= 0.99 and relative L2 <= 0.05 required"); }
     Ok(())
@@ -604,9 +613,13 @@ mod tests {
         assert!(Scores::default().result().is_err());
         assert!(scores.add(&[f32::NAN, 0.], &[0., 1.], 0).is_err());
         assert!(scores.add(&[0., 1.], &[0., 1.], 2).is_err());
-        verdict(&json!({"top1":0.9,"mean_kl":0.06}), true)?;
-        for invalid in [json!({"top1":0.89,"mean_kl":0.0}), json!({"top1":1.,"mean_kl":0.061}),
-            json!({"top1":null,"mean_kl":0.0})] {assert!(verdict(&invalid, true).is_err());}
+        verdict(&json!({"top1":0.94,"mean_kl":0.03,"nll":0.255,"reference_nll":0.25}), true)?;
+        for invalid in [json!({"top1":0.939,"mean_kl":0.0,"nll":0.25,"reference_nll":0.25}),
+            json!({"top1":1.,"mean_kl":0.031,"nll":0.25,"reference_nll":0.25}),
+            json!({"top1":1.,"mean_kl":0.0,"nll":0.27,"reference_nll":0.25}),
+            json!({"top1":1.,"mean_kl":0.0,"nll":0.25}), json!({"top1":null,"mean_kl":0.0})] {
+            assert!(verdict(&invalid, true).is_err());
+        }
         verdict(&json!({"cosine":0.99,"relative_l2":0.05}), false)?;
         assert!(verdict(&json!({"cosine":0.98,"relative_l2":0.0}), false).is_err());
         Ok(())

@@ -78,7 +78,7 @@ schedule() {
     step "$selected: 4. Golden through layer 5 with local RTX experts, no Sparks" 'cosine >=0.99; relative L2 <=0.05; byte-exact prefix restore (partial-model diagnostic, no NLL claim)'
     show minimax-golden --last-layer 5 --expert-layers 3,4,5 --check-prefix
     for tp in 4 2 3; do
-      step "$selected: Spark TP$tp full golden" 'top-1 >=90%; KL <=0.06 nat; byte-exact prefix restore'
+      step "$selected: Spark TP$tp full golden" 'top-1 >=94%; KL <=0.03 nat; NLL <=0.01 nat above reference; byte-exact prefix restore'
       show minimax-golden --peers '{peers}' --check-prefix
       step "$selected: TP$tp serve and api-smoke" 'HTTP success; nonempty completion; no API error; owned containers stopped before lock release'
       show run.sh --wip qualification --config "CONFIG_DIR/minimax-m31-flash-nvfp4-$selected-tp$tp.config"
