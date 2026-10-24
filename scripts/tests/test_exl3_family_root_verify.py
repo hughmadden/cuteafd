@@ -243,15 +243,16 @@ def test_only_measured_spark_decode_profiles_default_to_pure_hint(geometry, prof
     assert tool.default_decode_schedule(geometry, "spark", profile, 1, [2, 3, 4]) is None
 
 
-def test_only_measured_flash_coordinator_capacities_default_to_pure_hint():
+@pytest.mark.parametrize("geometry,bits", [("glm", [4, 5]), ("glmf", [3, 4])])
+def test_only_measured_coordinator_capacities_default_to_pure_hint(geometry, bits):
     tool = load_tool()
     for capacity in [1, 16, 80, 256, 1024, 4096]:
         expected = tool.PURE_EVICT_FIRST if capacity in [1, 80] else None
-        assert tool.default_decode_schedule("glmf", "coordinator", "rtx-tp2", capacity, [3, 4]) == expected
-        for geometry, profile, bits in [("glm", "rtx-tp2", [4, 5]),
-                                        ("glmf", "rtx-tp1", [3, 4]),
-                                        ("glmf", "rtx-tp2", [4, 5])]:
-            assert tool.default_decode_schedule(geometry, "coordinator", profile, capacity, bits) is None
+        assert tool.default_decode_schedule(geometry, "coordinator", "rtx-tp2", capacity, bits) == expected
+        assert tool.default_decode_schedule(geometry, "coordinator", "rtx-tp1", capacity, bits) is None
+        for other_bits in ([2, 3], [3, 4], [4, 5], [3, 4, 5]):
+            if other_bits != bits:
+                assert tool.default_decode_schedule(geometry, "coordinator", "rtx-tp2", capacity, other_bits) is None
 
 
 @pytest.mark.parametrize("schedule,allowed", [(None, True), ("l2=2,pf1=0,pf2=0,pdl=1", True),

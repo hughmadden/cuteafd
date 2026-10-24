@@ -483,7 +483,8 @@ def default_decode_schedule(geometry: str, role: str, profile: str,
     (.997..1.001); Qwen compact TP4 1.003..1.094x (1.000..1.004); Kimi TP6
     1.020..1.107x (.991..1.004). Compact m16 rows 2/4/8/16: GLM
     1.067..1.119x (.995..1.003), Qwen 1.019..1.083x (.989..1.002).
-    RTX Flash TP2 m1/m80: median 1.015..1.144x (control .995..1.016).
+    RTX TP2 m1/m80: Flash median 1.015..1.144x (control .995..1.016),
+    GLM median 1.014..1.037x (.999..1.005), finite normalized fixtures.
     Tiles, occupancy and arithmetic unchanged.
     """
     measured = {
@@ -498,7 +499,8 @@ def default_decode_schedule(geometry: str, role: str, profile: str,
     if role == 'spark' and ((capacity in (1, 80) and identity in measured)
                             or (capacity == 16 and identity in measured_m16)):
         return PURE_EVICT_FIRST
-    if role == 'coordinator' and capacity in (1, 80) and identity == ('glmf', 'rtx-tp2', (3, 4)):
+    measured_rtx = {('glm', 'rtx-tp2', (4, 5)), ('glmf', 'rtx-tp2', (3, 4))}
+    if role == 'coordinator' and capacity in (1, 80) and identity in measured_rtx:
         return PURE_EVICT_FIRST
     return None
 
