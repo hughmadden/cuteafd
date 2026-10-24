@@ -5648,9 +5648,12 @@ Video options are `source_fps`, `do_sample_frames`, `num_frames` or `fps`, and
 `do_resize`; `false` keeps every frame or the source size (aligned to 28). Timestamps
 come from the sampled source indices. URLs use the existing fetch policy;
 CPU ffmpeg/ffprobe decode bounded files, while frame arrays need no video decoder.
-Video admission bounds source frames to 768, decoded video bytes to 64 MiB, each segment
-to the loaded encoder capacity, and all video features to 57,600 tokens. Sampling
-does not bypass source decode limits. Media count-token/probe overrides remain
+ffprobe counts the frames the decoder emits (packets no edit list discards, as
+torchcodec's exact scan does); ffmpeg then selects the sampled frames, converts them to
+RGB and scales them (bicubic B=0, C=0.5: torch's antialiased Keys cubic) inside the
+decoder, so the decoded budget covers kept frames only. Video admission bounds
+sampled frames to 768, decoded video bytes to 64 MiB, each segment to the loaded
+encoder capacity, and all video features to 57,600 tokens. Media count-token/probe overrides remain
 unsupported. Image start/end wrapping happens after literal shielding. Video
 placeholders preserve sampled timestamps and each pair's own delimiters; separated
 spans share a complete segment embedding with explicit row offsets.

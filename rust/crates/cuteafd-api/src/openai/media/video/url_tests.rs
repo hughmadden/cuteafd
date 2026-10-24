@@ -94,6 +94,34 @@ fn defaults_follow_the_serving_sampler_frame_size_and_timestamps() {
 }
 
 #[test]
+fn ten_second_720p_clip_fits_the_decoded_budget_by_default() {
+    // At source size the 64 MiB budget held 24 frames (0.8 s); sampled and scaled
+    // inside ffmpeg, 1 fps keeps 11 frames of 756x448.
+    let source = unset(generated("testsrc=size=1280x720:rate=30:duration=10"));
+    let prepared = preparer(ImageUrlFetch::Off).prepare_videos(&source).unwrap();
+    assert_eq!(prepared[0].segments.iter().map(|s| (s.grid.t, s.source_frames, s.tokens)).collect::<Vec<_>>(),
+        [(4, 8, 1728), (2, 3, 864)]);
+    for time in ["0.0", "2.0", "4.0", "6.0", "8.0", "10.0"] {
+        assert_eq!(prepared[0].placeholder.matches(&format!("]<]{time} seconds[>[")).count(), 1, "{time}");
+    }
+    assert_eq!(prepared[0].placeholder.matches("seconds").count(), 6);
+}
+
+#[test]
+fn explicit_options_keep_every_frame_and_smart_resize_in_the_decoder() {
+    let url = format!("data:video/x-matroska;base64,{}", STANDARD.encode(VIDEO));
+    let mut body = json!({"messages":[{"role":"user","content":[{"type":"video_url","video_url":{
+        "url":url,"do_sample_frames":false,"do_resize":true}}]}]});
+    let prepared = preparer(ImageUrlFetch::Off).prepare_videos(&take_sources(&mut body).unwrap()).unwrap();
+    let segment = &prepared[0].segments[0];
+    // Smart resize lifts 28x28 to its 3,136-pixel floor, 56x56.
+    assert_eq!((segment.grid.t, segment.grid.h, segment.grid.w, segment.tokens), (4, 4, 4, 16));
+    for (value, frame) in segment.rgb8.chunks_exact(56 * 56 * 3).enumerate() {
+        assert!(frame.iter().all(|&pixel| pixel == value as u8), "frame {value}");
+    }
+}
+
+#[test]
 fn segments_are_bounded_by_tower_capacity_not_the_image_cap() {
     let mut low = preparer(ImageUrlFetch::Off);
     low.config.max_image_tokens = 1;
