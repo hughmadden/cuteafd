@@ -53,6 +53,12 @@ pub struct LayoutOptions {
     pub full_prefill_logits: bool,
     /// Prefill lanes (GLM 5.3 Flash); 0 selects the family default.
     pub prefill_lanes: u64,
+    /// Family-resolved rows per wave, independent of the admitted span.
+    pub prefill_unit_rows: Option<u64>,
+    /// Requested rows per continuous prefill call (units-span families).
+    pub prefill_span_rows: Option<u64>,
+    /// Continuous row-unit waves on one transport.
+    pub prefill_waves: u64,
     /// Rows of a GLM 5.3 Flash decode or verify step (`--decode-rows`): 64, or 128 with the wide
     /// `_m128` programs (one GPU). The decode workspace, the token selector and the speculative
     /// replay records hold this many rows.
@@ -87,6 +93,8 @@ pub struct LayoutOptions {
     pub pool_ceiling_at_target: bool,
     /// External drafter resident bytes on the lead GPU (DFlash), if any.
     pub drafter_bytes: u64,
+    pub dense_qwen_drafter_snapshot: Option<std::path::PathBuf>,
+    pub dense_qwen_mtp: bool,
     /// Explicitly disable GLM Flash external speculation and its arenas.
     pub glmf_drafter_disabled: bool,
     /// GLM Flash external draft checkpoint; absent resolves the launcher default from HF_HOME.
@@ -98,6 +106,10 @@ pub struct LayoutOptions {
     pub glm5_drafter_disabled: bool,
     pub glm5_draft_bf16: bool,
     pub glm5_attention_plan_rows: Option<usize>,
+    /// Kimi MLA DFlash is opt-in and charged from its native checkpoint headers.
+    pub kimi_drafter_snapshot: Option<std::path::PathBuf>,
+    pub kimi_draft_fp8: bool,
+    pub mla_kv: cuteafd_core::MlaCacheFormat,
     /// Keep this much of every GPU free for runtime growth.
     pub headroom_bytes: u64,
     /// Concurrent sequences (state slots = concurrency + 2).
@@ -117,10 +129,14 @@ pub struct LayoutOptions {
     pub mimo_prefix_draft: bool,
     /// MiMo target rings (serving default: 16, at least concurrency).
     pub mimo_rings: u64,
+    /// Sliding/native-MTP ring storage, independent of the full-attention pool.
+    pub mimo_swa_kv: crate::families::mimo_v2::MimoKvCache,
     /// MiMo Spark activation format, matching serving's --expert-input.
     pub mimo_expert_input: crate::families::mimo_v2::MimoExpertInput,
     /// MiMo drafter batch limit (serving raises it to concurrency).
     pub draft_sequences: u64,
+    /// Shared GQA drafter rings, independent of target KV and weight precision.
+    pub draft_kv_cache: crate::families::qwen4::Qwen4KvCache,
     /// Explicit MiMo DFlash context arena; does not widen its draft batch.
     pub draft_context_slots: Option<u64>,
     /// MiMo segmented decode graphs (runtime default: off).
@@ -136,7 +152,9 @@ pub struct LayoutOptions {
     /// Resident native drafter stages (zero disables optional native MTP).
     pub native_mtp_layers: usize,
     /// Qwen full-attention record format; index keys remain BF16.
+    pub dense_qwen_kv: crate::families::qwen4::Qwen4KvCache,
     pub qwen_kv: crate::families::qwen4::Qwen4KvCache,
+    pub step5_kv: crate::families::qwen4::Qwen4KvCache,
     /// Selected Qwen projection/head residency, matching serve-qwen4.
     pub qwen_representation: crate::families::qwen4::resident::Qwen4Representation,
     /// Qwen immutable attention scratch override.
@@ -174,6 +192,9 @@ impl Default for LayoutOptions {
             prefill_rows: 0,
             full_prefill_logits: false,
             prefill_lanes: 0,
+            prefill_unit_rows: None,
+            prefill_span_rows: None,
+            prefill_waves: 1,
             glmf_decode_rows: crate::serving_capacity::GLMF_DECODE_ROWS,
             glmf_representation: Default::default(),
             glmf_kda_state: Default::default(),
@@ -187,6 +208,8 @@ impl Default for LayoutOptions {
             target_pool_tokens: cuteafd_core::serving_capacity::DEFAULT_GPU_KV_TOKENS,
             pool_ceiling_at_target: false,
             drafter_bytes: 0,
+            dense_qwen_drafter_snapshot: None,
+            dense_qwen_mtp: false,
             glmf_drafter_disabled: false,
             glmf_drafter_snapshot: None,
             glmf_dense_manifest: None,
@@ -194,6 +217,9 @@ impl Default for LayoutOptions {
             glm5_drafter_disabled: false,
             glm5_draft_bf16: false,
             glm5_attention_plan_rows: None,
+            kimi_drafter_snapshot: None,
+            kimi_draft_fp8: false,
+            mla_kv: Default::default(),
             headroom_bytes: 2 * GIB,
             concurrency: 0,
             state_slots: None,
@@ -203,8 +229,10 @@ impl Default for LayoutOptions {
             mimo_prefix_mark_bytes: 2 * GIB,
             mimo_prefix_draft: false,
             mimo_rings: 16,
+            mimo_swa_kv: crate::families::mimo_v2::MimoKvFormats::default().sliding,
             mimo_expert_input: Default::default(),
             draft_sequences: 4,
+            draft_kv_cache: crate::families::qwen4::Qwen4KvCache::Fp8,
             draft_context_slots: None,
             mimo_decode_graphs: false,
             physical_sms: None,
@@ -212,7 +240,9 @@ impl Default for LayoutOptions {
             mimo_expert_manifest: None,
             context_tokens: 0,
             native_mtp_layers: 3,
+            dense_qwen_kv: crate::families::qwen4::Qwen4KvCache::Fp8,
             qwen_kv: Default::default(),
+            step5_kv: crate::families::qwen4::Qwen4KvCache::Fp8,
             qwen_representation: crate::families::qwen4::resident::Qwen4Representation {
                 fp8_projections: false, fp8_head: true },
             qwen_attention_plan_rows: None,
@@ -226,17 +256,21 @@ impl Default for LayoutOptions {
     }
 }
 
-/// Shared with the GLM runtime so admission and allocation use the same lanes.
+/// GLM prefill units in flight: the default (None) or a parsed value, clamped
+/// to 1..=4. Default: 2 units of 4096 rows (PLAN "Prefill contract"); serve-glm
+/// takes `--prefill-waves`, the planner `--prefill-lanes`.
+pub const GLM_DEFAULT_PREFILL_SPAN_ROWS: u64 = 16384;
+
 pub fn glm_prefill_lanes(value: Option<&str>) -> usize {
-    value.and_then(|v| v.parse().ok()).unwrap_or(3).clamp(1, 4)
+    value.and_then(|v| v.parse().ok()).unwrap_or(2).clamp(1, 4)
 }
 
 /// Additional lead-GPU output bytes for admitted all-row fidelity probes.
-/// GLM uses its configured lanes; GLM Flash's lanes (a serial prefill runs in
+/// GLM uses its default waves (a planner `--prefill-lanes` selects others); GLM Flash's lanes (a serial prefill runs in
 /// the first) share one set of temporaries and so one logits buffer.
 /// V4 reuses its bounded head buffer; V4.1 already supports prefill scoring.
 pub fn full_prefill_logits_bytes(family: &str, rows: u64, vocab: u64) -> u64 {
-    let lanes = glm_prefill_lanes(std::env::var("CUTEAFD_GLM_PREFILL_LANES").ok().as_deref());
+    let lanes = glm_prefill_lanes(None);
     full_prefill_logits_bytes_with_lanes(family, rows, vocab, lanes)
 }
 
@@ -273,7 +307,7 @@ mod scoring_workspace_tests {
         assert!(!LayoutOptions::default().full_prefill_logits);
         assert_eq!(full_prefill_logits_bytes("mimo_v2", 128, 1000), 127 * 1000 * 4);
         assert_eq!(full_prefill_logits_bytes("qwen4", 128, 1000), 127 * (1000 * 4 + 16));
-        assert_eq!(glm_prefill_lanes(None), 3);
+        assert_eq!(glm_prefill_lanes(None), 2);
         for lanes in 1..=4 {
             assert_eq!(glm_prefill_lanes(Some(&lanes.to_string())), lanes);
             assert_eq!(full_prefill_logits_bytes_with_lanes("glm5", 128, 1000, lanes),
@@ -281,7 +315,7 @@ mod scoring_workspace_tests {
         }
         assert_eq!(glm_prefill_lanes(Some("0")), 1);
         assert_eq!(glm_prefill_lanes(Some("9")), 4);
-        assert_eq!(glm_prefill_lanes(Some("invalid")), 3);
+        assert_eq!(glm_prefill_lanes(Some("invalid")), 2);
         assert_eq!(full_prefill_logits_bytes("glm5_flash", 128, 1000), 64 * 1000 * 4);
         for family in ["deepseek_v4", "deepseek_v41"] {
             assert_eq!(full_prefill_logits_bytes(family, 2048, 1000), 0);
@@ -300,8 +334,10 @@ mod scoring_workspace_tests {
 pub fn spark_endpoints(family: &str, lanes: u64) -> usize {
     match family {
         "deepseek_v41" | "deepseek_v4" => 2,
-        "glm5" => 1 + if lanes > 1 { lanes as usize } else { 0 },
-        "glm5_flash" | "mimo_v2" => lanes as usize,
+        // The decode link and one prefill link (its waves share that endpoint's rings).
+        "glm5" => 1 + usize::from(lanes > 1),
+        "glm5_flash" => 1,
+        "mimo_v2" => lanes as usize,
         "qwen4" => 1,
         _ => 0,
     }
@@ -354,7 +390,8 @@ mod selected_spark_io_tests {
         for (family, geometry, lanes, expected) in [
             ("deepseek_v4", ExpertGeometry::DEEPSEEK_V4_FLASH, 2, 821428224),
             ("deepseek_v4", ExpertGeometry::DEEPSEEK_V4_PRO, 2, 1431699456),
-            ("glm5", ExpertGeometry::GLM5, 3, 2459697152),
+            // Decode link + one prefill link (formerly one endpoint per lane: 2459697152).
+            ("glm5", ExpertGeometry::GLM5, 3, 1229848576),
             ("mimo_v2", ExpertGeometry::MIMO_V26_PRO, 3, 1844772864),
         ] {
             let working = SparkWorkingSet { spark_layers: vec![3], spark_ranks: 4,
@@ -397,7 +434,7 @@ mod selected_spark_io_tests {
             assert!(device.items.is_empty());
         }
         let glm = crate::placement::families::glm5::prefill_lanes(4, glm_prefill_lanes(None) as u64);
-        assert_eq!(spark_endpoints("glm5", glm), 4);
+        assert_eq!(spark_endpoints("glm5", glm), 2);
         assert_eq!(spark_endpoints("glm5", crate::placement::families::glm5::prefill_lanes(0, 3)), 1);
     }
 }
@@ -406,12 +443,10 @@ const fn gib(hundredths: u64) -> u64 {
     hundredths * GIB / 100
 }
 
-fn mimo_draft_prefix_bytes(config: &serde_json::Value, marks: u64, rings: u64) -> Result<(u64, u64), String> {
+fn mimo_draft_prefix_bytes(config: &serde_json::Value, marks: u64, rings: u64, kv_cache: crate::families::qwen4::Qwen4KvCache) -> Result<(u64, u64), String> {
     let field = |name| config[name].as_u64().filter(|&n| n > 0)
         .ok_or_else(|| format!("missing or zero {name}"));
-    let width = field("num_key_value_heads")?.checked_mul(field("head_dim")?)
-        .ok_or("DFlash KV width overflow")?;
-    let mark = crate::families::mimo_v2::draft_representation::mimo_draft_mark_bytes(field("num_hidden_layers")?, width)
+    let mark = crate::families::mimo_v2::draft_representation::mimo_draft_mark_bytes(field("num_hidden_layers")?, field("num_key_value_heads")?, field("head_dim")?, kv_cache)
         .map_err(|e| e.to_string())?;
     Ok((mark.checked_mul(marks).ok_or("DFlash marks overflow")?,
         rings.checked_mul(8).ok_or("DFlash floors overflow")?))
@@ -440,12 +475,63 @@ mod draft_prefix_tests {
     }
 
     #[test]
+    fn kimi_host_snapshots_use_serve_context_and_selected_draft_record() -> anyhow::Result<()> {
+        use crate::plan::{self, testing, ExpertPlacement, PlanOptions};
+        let target = tempfile::tempdir()?;
+        testing::write_kimi_snapshot(target.path(), true);
+        let checkpoint = super::super::Checkpoint::open(target.path())?;
+        let draft = tempfile::tempdir()?;
+        let config = serde_json::json!({"architectures":["DFlash2DraftModel"], "hidden_size":7168,
+            "intermediate_size":14336, "num_hidden_layers":5, "num_attention_heads":64,
+            "num_key_value_heads":64, "q_lora_rank":1536, "kv_lora_rank":512,
+            "qk_nope_head_dim":128, "qk_rope_head_dim":64, "v_head_dim":128,
+            "rms_norm_eps":1e-5, "vocab_size":163840, "draft_vocab_size":163840,
+            "max_position_embeddings":1048576, "num_target_layers":93,
+            "layer_types":["sliding_attention","sliding_attention","sliding_attention",
+                "sliding_attention","full_attention"], "sliding_window":4096,
+            "use_sliding_window":true, "is_causal":false, "mla_use_output_gate":false,
+            "attention_bias":false, "hidden_act":"silu", "fc_norm":false,
+            "rope_parameters":{"rope_type":"yarn", "rope_theta":50000.0, "factor":32.0,
+                "original_max_position_embeddings":32768, "beta_fast":32, "beta_slow":1,
+                "mscale":1.0, "mscale_all_dim":1.0},
+            "dflash_config":{"attention_mode":"mla", "block_size":8,
+                "conv_kernel_size":2, "conv_group_size":16, "selector_rank":256,
+                "selector_top_k":16, "target_layer_ids":[0,1], "mask_token_id":163592}});
+        std::fs::write(draft.path().join("config.json"), config.to_string())?;
+        for format in [cuteafd_core::MlaCacheFormat::Bf16, cuteafd_core::MlaCacheFormat::Fp8] {
+            let mut options = LayoutOptions { host_memory: Some((128 << 30, 128 << 30)), rtx_bytes: vec![96 << 30; 2], concurrency: 2,
+                mla_kv: format, prefix_slots: Some(2), host_cache_bytes: Some(0),
+                onboard: Some(crate::placement::Onboard::Layers(5)), ..Default::default() };
+            let mut report = plan::plan(target.path(), &PlanOptions {
+                placement: ExpertPlacement::Sparks { ranks: 6 }, layout: Some(options.clone()),
+                ..Default::default()
+            })?;
+            let (base, context, concurrency) = selected_host_geometry(&mut report, &options, &checkpoint)?;
+            assert_eq!(context, crate::families::kimi_k3::DEFAULT_CONTEXT as u64);
+            assert_eq!(concurrency, 2);
+            assert_eq!(base.page_bytes, 24 * 64 * format.record_bytes() as u64);
+            options.kimi_drafter_snapshot = Some(draft.path().to_path_buf());
+            let (with_draft, _, _) = selected_host_geometry(&mut report, &options, &checkpoint)?;
+            assert_eq!(with_draft.mark_bytes - base.mark_bytes, 4 * 4160 * format.record_bytes() as u64);
+            assert_eq!(with_draft.page_bytes, base.page_bytes);
+            for context in [262_144, 524_288, 1_048_576] {
+                options.context_tokens = context;
+                let (_, selected, _) = selected_host_geometry(&mut report, &options, &checkpoint)?;
+                assert_eq!(selected, context);
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
     fn draft_prefix_reserves_marks_and_all_ring_floors() {
         let config = serde_json::json!({"num_hidden_layers": 5, "num_key_value_heads": 8, "head_dim": 128});
-        assert_eq!(mimo_draft_prefix_bytes(&config, 42, 18).unwrap(), ((20 * MIB + 8) * 42, 144));
-        assert!(mimo_draft_prefix_bytes(&config, u64::MAX, 18).is_err());
-        assert!(mimo_draft_prefix_bytes(&config, 42, u64::MAX).is_err());
-        assert!(mimo_draft_prefix_bytes(&serde_json::json!({}), 42, 18).is_err());
+        assert_eq!(mimo_draft_prefix_bytes(&config, 42, 18, crate::families::qwen4::Qwen4KvCache::Bf16).unwrap(), ((20 * MIB + 8) * 42, 144));
+        assert_eq!(mimo_draft_prefix_bytes(&config, 42, 18, crate::families::qwen4::Qwen4KvCache::Fp8).unwrap(),
+            ((5 * 1024 * 2 * 1056 + 8) * 42, 144));
+        assert!(mimo_draft_prefix_bytes(&config, u64::MAX, 18, crate::families::qwen4::Qwen4KvCache::Bf16).is_err());
+        assert!(mimo_draft_prefix_bytes(&config, 42, u64::MAX, crate::families::qwen4::Qwen4KvCache::Bf16).is_err());
+        assert!(mimo_draft_prefix_bytes(&serde_json::json!({}), 42, 18, crate::families::qwen4::Qwen4KvCache::Bf16).is_err());
     }
 }
 
@@ -493,7 +579,7 @@ pub struct Shape {
 }
 
 impl Shape {
-    pub fn resolve(report: &mut PlanReport, model: &dyn super::FamilyModel, options: &LayoutOptions,
+    pub fn resolve(report: &mut PlanReport, model: &dyn super::FamilyModel, options: &mut LayoutOptions,
         policy: ShapePolicy) -> Self {
         let discovered = match model.spec().speculator.as_ref() {
             Some(super::spec::SpeculatorSpec::Dspark { stages, .. }) => *stages,
@@ -510,7 +596,12 @@ impl Shape {
         let prefill_rows = if options.prefill_rows > 0 { options.prefill_rows }
             else if let Some(rows) = policy.prefill_rows { rows }
             else { manifest.as_ref().and_then(|m| m["capacities"]["prefill_rows"].as_u64()).unwrap_or(4096) };
-        report.prefill_rows = Some(prefill_rows);
+        report.prefill_span_rows = Some(prefill_rows);
+        // Legacy one-wave adapters use their resolved step as the unit.
+        // Continuous adapters must supply their actual unit before host admission.
+        if options.prefill_waves == 1 && options.prefill_unit_rows.is_none() {
+            options.prefill_unit_rows = Some(prefill_rows);
+        }
         let decode_rows = manifest.as_ref().and_then(|m| m["capacities"]["decode_rows"].as_u64()).unwrap_or(64);
         let concurrency = if options.concurrency > 0 { options.concurrency }
             else { cuteafd_core::serving_capacity::default_concurrency(options.rtx_bytes.first().copied().unwrap_or(0)) };
@@ -1010,13 +1101,16 @@ fn selected_host_geometry(report: &mut PlanReport, options: &LayoutOptions, chec
         prefill_rows: (id == "deepseek_v41").then_some(2048),
         all_native_stages: id == "deepseek_v4",
     };
-    let admitted_rows = report.prefill_rows;
-    let shape = Shape::resolve(report, model.as_ref(), options, policy);
-    report.prefill_rows = admitted_rows;
+    let admitted_rows = report.prefill_span_rows;
+    let shape = Shape::resolve(report, model.as_ref(), &mut options.clone(), policy);
+    report.prefill_span_rows = admitted_rows;
     let ranks = if id == "deepseek_v41" || options.head_split { options.rtx_bytes.len().clamp(1, 2) } else { 1 };
     let selected = CacheOptions { coordinator_ranks: ranks,
+        attention_placement: Some(report.attention_placement),
         native_mtp_layers: if matches!(id, "deepseek_v4" | "qwen4") { shape.native_layers } else { 0 },
-        qwen_kv: options.qwen_kv, prefill_rows: admitted_rows.unwrap_or(shape.prefill_rows),
+        mimo_kv: crate::families::mimo_v2::MimoKvFormats { full: crate::families::mimo_v2::MimoKvCache::Int8, sliding: options.mimo_swa_kv },
+        dense_qwen_kv: options.dense_qwen_kv, qwen_kv: options.qwen_kv, mla_kv: options.mla_kv,
+        step5_kv: options.step5_kv, prefill_rows: admitted_rows.unwrap_or(shape.prefill_rows),
         glmf_index: options.glmf_index, kda_state_bytes: options.glmf_kda_state.bytes(),
         glmf_decode_rows: options.glmf_decode_rows, ..Default::default() };
     // Qwen's dual-owner layout partitions whole layers. Its host snapshot
@@ -1049,19 +1143,31 @@ fn selected_host_geometry(report: &mut PlanReport, options: &LayoutOptions, chec
         ensure!(shape.native_layers == 3, "V4.1 dSpark retains all three stages");
         mark_bytes = mark_bytes.checked_add(3 * 128 * 528).context("dSpark mark overflow")?;
     }
+    let mut context = shape.context_tokens;
+    if id == "kimi_k3" {
+        if options.context_tokens == 0 {
+            context = crate::families::kimi_k3::default_context(
+                &crate::plan::families::kimi::core_inventory(checkpoint)?) as u64;
+        }
+        if let Some(snapshot) = &options.kimi_drafter_snapshot {
+            let draft = crate::formats::dflash::MlaDflashConfig::read(snapshot)?;
+            let windows = draft.paged_cache_layout(1, usize::try_from(context)?,
+                usize::try_from(context)?, options.mla_kv)?.window_bytes;
+            mark_bytes = mark_bytes.checked_add(windows).context("Kimi draft mark overflow")?;
+        }
+    }
     if id == "mimo_v2" && options.mimo_prefix_draft {
         let dir = checkpoint.snapshot.join("dflash");
         let draft = if dir.join("dflash_draft_model.safetensors").is_file() {
             let cfg = crate::families::mimo_v2::draft_config::DflashConfig::read(&dir)?;
-            crate::families::mimo_v2::draft_representation::mimo_draft_mark_bytes(cfg.layers as u64, cfg.kv_width() as u64)?
+            crate::families::mimo_v2::draft_representation::mimo_draft_mark_bytes(cfg.layers as u64, cfg.kv_heads as u64, cfg.head_dim as u64, options.draft_kv_cache)?
         } else if dir.join("config.json").is_file() {
             let config = serde_json::from_slice(&std::fs::read(dir.join("config.json"))?)?;
-            mimo_draft_prefix_bytes(&config, 1, options.mimo_rings.max(shape.concurrency))
+            mimo_draft_prefix_bytes(&config, 1, options.mimo_rings.max(shape.concurrency), options.draft_kv_cache)
                 .map_err(anyhow::Error::msg)?.0
         } else { 0 };
         mark_bytes = mark_bytes.checked_add(draft).context("MiMo draft mark overflow")?;
     }
-    let mut context = shape.context_tokens;
     if id == "deepseek_v4" && options.context_tokens == 0 {
         if let Some(memory) = &report.memory_layout {
             if memory.pool_tokens < context { context = memory.pool_tokens.saturating_sub(256); }
@@ -1079,31 +1185,49 @@ pub(crate) fn charge_host(report: &mut PlanReport, options: &LayoutOptions, chec
     use cuteafd_core::memory_layout::{HostLayout, ItemLifetime, host_logits_bytes};
     let Some(spec) = report.spec.as_ref() else { return Ok(()) };
     let family = report.family.as_deref().unwrap_or("");
-    let (total, available) = options.host_memory.map_or_else(
-        crate::formats::mapped_preload::host_memory, Ok)?;
-    let rows = if family == "deepseek_v41" {
-        let requested = if options.prefill_rows == 0 { 2048 } else { options.prefill_rows };
-        u64::from(cuteafd_core::coordinator_programs::v41_live_rows(u32::try_from(requested)?)
-            .context("invalid V4.1 live prefill rows for host admission")?)
-    } else { report.prefill_rows.unwrap_or(options.prefill_rows.max(4096)) };
-    let ranks = report.memory_layout.as_ref().map_or(0, |m| m.devices.iter()
-        .filter(|d| d.kind == DeviceKind::Spark).count());
-    let lanes = match family {
-        "glm5" if native => 1,
-        "glm5" => if options.prefill_lanes > 0 { options.prefill_lanes } else {
-            glm_prefill_lanes(std::env::var("CUTEAFD_GLM_PREFILL_LANES").ok().as_deref()) as u64 },
-        "glm5_flash" => if options.prefill_lanes > 0 { options.prefill_lanes }
-            else { crate::serving_capacity::GLMF_DEFAULT_PREFILL_LANES },
-        "mimo_v2" => {
-            let cfg = crate::families::mimo_v2::MimoV2Config::from_hf(&checkpoint.config)?;
-            let configured = if options.prefill_lanes > 0 { Some(options.prefill_lanes.to_string()) }
-                else { std::env::var("CUTEAFD_MIMO_PREFILL_LANES").ok() };
-            crate::families::mimo_v2::admission::resolve_transport_lanes(ranks > 0,
-                cfg.program_family()?, configured.as_deref())? as u64
+    let (total, available) = match options.host_memory {
+        Some(memory) => memory,
+        None => {
+            #[cfg(test)]
+            panic!("planner tests must inject LayoutOptions.host_memory");
+            #[cfg(not(test))]
+            crate::formats::mapped_preload::host_memory()?
         }
-        _ => 1,
     };
-    let lanes = report.prefill_lanes.unwrap_or(lanes);
+    // Native plans keep only coordinator devices in their memory layout.
+    let ranks = report.spark_ranks;
+    let rows = report.prefill_span_rows.unwrap_or(options.prefill_rows.max(4096));
+    // Scoring retains the span; wire/router scratch serves one explicit unit.
+    // The live return slots alone multiply by the number of waves.
+    ensure!(ranks == 0 || options.prefill_unit_rows.is_some(),
+        "{family} Spark host admission requires family-resolved prefill_unit_rows (span {rows}, waves {})",
+        options.prefill_waves);
+    let unit_rows = options.prefill_unit_rows.unwrap_or(rows);
+    let intake_rows = if options.prefill_waves == 1 {
+        ensure!(ranks == 0 || (1..=4096).contains(&unit_rows),
+            "{family} Spark host admission needs prefill_unit_rows in 1..=4096, got {unit_rows}");
+        unit_rows
+    } else {
+        crate::serving_capacity::PrefillShape { unit_rows, waves: options.prefill_waves }.validate()?.slot_rows()
+    };
+    let lanes = match report.prefill_transports {
+        Some(transports) => transports,
+        None => match family {
+            "glm5" => if options.prefill_lanes > 0 { options.prefill_lanes } else {
+                glm_prefill_lanes(None) as u64 },
+            "glm5_flash" => if options.prefill_lanes > 0 { options.prefill_lanes }
+                else { crate::serving_capacity::GLMF_DEFAULT_PREFILL_LANES },
+            "mimo_v2" => {
+                let cfg = crate::families::mimo_v2::MimoV2Config::from_hf(&checkpoint.config)?;
+                let configured = if options.prefill_lanes > 0 { Some(options.prefill_lanes.to_string()) }
+                    else { std::env::var("CUTEAFD_MIMO_PREFILL_LANES").ok() };
+                crate::families::mimo_v2::admission::resolve_transport_lanes(ranks > 0,
+                    cfg.program_family()?, configured.as_deref())? as u64
+            }
+            _ => 1,
+        },
+    };
+    report.prefill_transports = Some(lanes);
     let hidden = spec.hidden as u64;
     let topk = spec.moe.as_ref().map_or(0, |m| m.top_k as u64);
     let mut items = Vec::new();
@@ -1120,7 +1244,7 @@ pub(crate) fn charge_host(report: &mut PlanReport, options: &LayoutOptions, chec
         let bf16 = native || matches!(family, "glm5" | "qwen4");
         let ingress = if native { SparkIngress::Fp8K32 } else if bf16 { SparkIngress::Bf16 }
             else { SparkIngress::Fp8K32 };
-        let endpoint = SparkEndpoint { capacity: u32::try_from(rows)?, ingress };
+        let endpoint = SparkEndpoint { ring_depth: None, capacity: u32::try_from(unit_rows)?, ingress };
         let (request, response) = endpoint.wire_bytes(geometry).context("host wire size overflow")?;
         let rings = SparkRings { max_frame_bytes: (64 << 20).max(request).max(response),
             depth: 8, slot_bytes: 8 << 20, alignment: 4096 };
@@ -1129,18 +1253,22 @@ pub(crate) fn charge_host(report: &mut PlanReport, options: &LayoutOptions, chec
             .context("coordinator host rings overflow")?;
         push(Category::Transport, "transport/rdma-rings", "registered", bytes, Basis::Formula);
         // Host-mode intake is the upper bound; auto/GPU landing can use less.
-        let intake = rows.checked_mul(hidden).and_then(|n| n.checked_mul(if native { 4 } else { 2 }))
+        let intake = intake_rows.checked_mul(hidden).and_then(|n| n.checked_mul(if native { 4 } else { 2 }))
             .and_then(|n| n.checked_mul(ranks as u64)).and_then(|n| n.checked_mul(endpoints as u64))
             .context("coordinator intake overflow")?;
         push(Category::Transport, "spark-intake", "host-mode upper bound", intake, Basis::Estimated);
     }
-    let work_rows = rows.checked_mul(lanes).and_then(|n| n.checked_add(64)).context("host workspace rows overflow")?;
+    let work_rows = unit_rows.checked_mul(lanes).and_then(|n| n.checked_add(64)).context("host workspace rows overflow")?;
     let router = work_rows.checked_mul(hidden.checked_mul(2).and_then(|n| n.checked_add(topk * 8))
         .context("host routing stride overflow")?).context("host routing workspace overflow")?;
     push(Category::Workspace, "workspace/router", "BF16 upper bound", router, Basis::Estimated);
     let mut staging = work_rows.checked_mul(hidden).and_then(|n| n.checked_mul(8))
         .and_then(|n| n.checked_add(2 << 20)).context("host staging overflow")?;
     if family == "qwen4" {
+        // A local owner has workspace tables even without a Spark transport.
+        let lanes = lanes.max(1);
+        let work_rows = unit_rows.checked_mul(lanes).and_then(|n| n.checked_add(64))
+            .context("Qwen host workspace rows overflow")?;
         let cfg = crate::families::qwen4::Qwen4Config::from_hf(&checkpoint.config)?;
         let pool = report.memory_layout.as_ref().map_or(0, |m| m.pool_tokens);
         // Decode owns a table per row; prefill owns one. Charge the full
@@ -1158,6 +1286,19 @@ pub(crate) fn charge_host(report: &mut PlanReport, options: &LayoutOptions, chec
             .context("Qwen host staging overflow")?;
     }
     push(Category::Staging, "staging/tables-and-sync", "row metadata", staging, Basis::Estimated);
+    if family == "qwen4" && ranks > 0 && options.prefill_waves > 1 {
+        use crate::families::qwen4::{Qwen4Config, StepTableBytes};
+        use crate::serving_capacity::qwen_graphs::{qwen_pool_pages, QWEN_UNIT_PAGES};
+        let cfg = Qwen4Config::from_hf(&checkpoint.config)?;
+        let pool = usize::try_from(report.memory_layout.as_ref().context("Qwen ordered tables need a KV layout")?.pool_tokens)?;
+        let pages = qwen_pool_pages(pool).context("Qwen host page tables overflow")?.max(QWEN_UNIT_PAGES);
+        let tables = StepTableBytes::new(usize::try_from(unit_rows)?, false, pages, pages / QWEN_UNIT_PAGES, cfg.ple_rows())?;
+        // One unit workspace owns these destinations, shared by both waves.
+        // Mapped PLE uploads gathered rows, not the separate PLE-ID table.
+        let ple_ids = !cfg.ple_layers.first().is_some_and(|&layer| layer < spec.layers.len());
+        push(Category::Staging, "staging/ordered-tables", "full destination extents",
+            tables.ordered_bytes(ple_ids)?, Basis::Formula);
+    }
     let score_lanes = if matches!(family, "glm5" | "glm5_flash") { lanes } else { 1 };
     let score_rows = if options.full_prefill_logits { rows.checked_mul(score_lanes).context("host scoring rows overflow")? }
         else if family == "deepseek_v41" { rows.max(256) } else { 64 };

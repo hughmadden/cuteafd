@@ -25,8 +25,16 @@ use cuteafd_core::DType;
 use serde_json::Value;
 use std::collections::BTreeMap;
 
-/// The MCG codebook multiplier, the only one the trellis decoders implement.
+/// Marker multipliers implemented by the native trellis decoders.
 pub const EXL3_MCG_MULTIPLIER: u64 = 0xcbac_1fed;
+pub const EXL3_MUL1_MULTIPLIER: u64 = 0x83dc_d12d;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Exl3Codebook { Mcg, Mul1 }
+impl Exl3Codebook {
+    pub fn marker(self) -> &'static str { match self { Self::Mcg => "mcg", Self::Mul1 => "mul1" } }
+    pub fn multiplier(self) -> u32 { match self { Self::Mcg => EXL3_MCG_MULTIPLIER as u32, Self::Mul1 => EXL3_MUL1_MULTIPLIER as u32 } }
+}
 
 /// Tensor suffixes that belong to an EXL3 module (`bias` aside).
 pub const EXL3_SUFFIXES: [&str; 7] = ["trellis", "suh", "svh", "mcg", "mul1", "su", "sv"];
@@ -59,13 +67,14 @@ pub struct Exl3StoredTensor {
     pub shape: Vec<usize>,
 }
 
-/// One EXL3 module as stored: MCG codebook, unpacked rotations.
+/// One EXL3 module as stored: marker-selected codebook, unpacked rotations.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Exl3Module {
+    pub codebook: Exl3Codebook,
     pub bits: usize,
     pub input_features: usize,
     pub output_features: usize,
-    /// `trellis`, `suh`, `svh` and `mcg`, by suffix.
+    /// `trellis`, `suh`, `svh` and the selected codebook marker, by suffix.
     pub tensors: BTreeMap<String, Exl3StoredTensor>,
 }
 
@@ -78,7 +87,7 @@ pub enum Exl3StorageError {
     #[error("{tensor}: {reason}")]
     Malformed { tensor: String, reason: String },
     /// A well-formed exllamav3 variant this build has no kernels for.
-    #[error("{tensor}: {variant} (this build runs the MCG codebook with unpacked suh/svh)")]
+    #[error("{tensor}: {variant} (expected MCG/MUL1 with unpacked suh/svh)")]
     Unsupported { tensor: String, variant: String },
     /// `config.json` declares a contract this build does not run.
     #[error("config.json quantization_config.{key}={value}: {reason}")]
@@ -114,9 +123,13 @@ pub fn exl3_module<'a>(
         tensor: name(suffix),
         variant: variant.to_owned(),
     };
-    if member("mul1").is_some() {
-        return Err(unsupported("mul1", "EXL3 MUL1 codebook marker"));
-    }
+    let codebook = match (member("mcg").is_some(), member("mul1").is_some()) {
+        (true, false) => Exl3Codebook::Mcg,
+        (false, true) => Exl3Codebook::Mul1,
+        (true, true) => return Err(malformed("mul1", "multiple EXL3 codebook markers".into())),
+        (false, false) => Exl3Codebook::Mcg, // Missing marker gets a named 3INST error below.
+    };
+    let marker = codebook.marker();
     if let Some(suffix) = ["su", "sv"].into_iter().find(|s| member(s).is_some()) {
         return Err(unsupported(suffix, "packed EXL3 sign bitfield (su/sv, written by exllamav3 before suh/svh)"));
     }
@@ -145,18 +158,18 @@ pub fn exl3_module<'a>(
     for (suffix, dtype, shape, bytes) in [
         ("suh", DType::F16, vec![k], 2 * k as u64),
         ("svh", DType::F16, vec![n], 2 * n as u64),
-        ("mcg", DType::I32, vec![], 4),
+        (marker, DType::I32, vec![], 4),
     ] {
         let Some(tensor) = member(suffix) else {
-            return Err(if suffix == "mcg" {
+            return Err(if suffix == marker {
                 unsupported("trellis", "EXL3 3INST codebook (no .mcg or .mul1 marker)")
             } else {
-                malformed(suffix, "missing EXL3 companion (a trellis needs suh, svh and mcg)".into())
+                malformed(suffix, "missing EXL3 companion (a trellis needs suh, svh and a codebook marker)".into())
             });
         };
-        let shape_ok = if suffix == "mcg" { mcg_marker_shape(&tensor.shape) } else { tensor.shape == shape };
+        let shape_ok = if suffix == marker { mcg_marker_shape(&tensor.shape) } else { tensor.shape == shape };
         if tensor.dtype != dtype || !shape_ok || tensor.byte_length != bytes {
-            let expected = if suffix == "mcg" { "i32 [] or [1]".to_owned() } else {
+            let expected = if suffix == marker { "i32 [] or [1]".to_owned() } else {
                 format!("{} {shape:?}", dtype_label(&dtype))
             };
             return Err(malformed(suffix, format!("{} {:?} {} bytes (expected {expected}, {bytes} bytes)",
@@ -164,14 +177,14 @@ pub fn exl3_module<'a>(
         }
         tensors.insert(suffix.to_owned(), Exl3StoredTensor { dtype, shape: tensor.shape.clone() });
     }
-    if let Some(extra) = suffixes.iter().find(|s| !["trellis", "suh", "svh", "mcg"].contains(s)) {
+    if let Some(extra) = suffixes.iter().find(|s| !["trellis", "suh", "svh", marker].contains(s)) {
         return Err(if *extra == "bias" {
             unsupported("bias", "EXL3 projection bias")
         } else {
             malformed(extra, format!("unexpected member .{extra} beside an EXL3 trellis"))
         });
     }
-    Ok(Exl3Module { bits, input_features: k, output_features: n, tensors })
+    Ok(Exl3Module { codebook, bits, input_features: k, output_features: n, tensors })
 }
 
 /// The storage map of every EXL3 module in `headers`: each stem with an EXL3
@@ -195,6 +208,90 @@ pub fn derive_storage_map<'a>(
         map.insert(stem.to_owned(), exl3_module(stem, &suffixes, |suffix| members.get(suffix).copied())?);
     }
     Ok(map)
+}
+
+/// Keep compact configuration fields, streaming the per-tensor map instead of
+/// retaining its million-node JSON tree. When supplied, headers remain the authority.
+pub(crate) fn read_storage_metadata(path: &std::path::Path, limit: u64,
+    derived: Option<&Exl3StorageMap>) -> anyhow::Result<Value> {
+    use anyhow::{ensure, Context};
+    use serde::de::{DeserializeSeed, IgnoredAny, MapAccess, Visitor, Error};
+    use std::io::Read;
+    struct Storage<'a> { file: &'a str, derived: &'a Exl3StorageMap }
+    impl<'de> DeserializeSeed<'de> for Storage<'_> {
+        type Value = ();
+        fn deserialize<D: serde::Deserializer<'de>>(self, de: D) -> Result<(), D::Error> {
+            de.deserialize_map(self)
+        }
+    }
+    impl<'de> Visitor<'de> for Storage<'_> {
+        type Value = ();
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result { f.write_str("EXL3 tensor_storage map") }
+        fn visit_map<M: MapAccess<'de>>(self, mut map: M) -> Result<(), M::Error> {
+            let mut seen = std::collections::BTreeSet::new();
+            let mut entries = 0;
+            while let Some(name) = map.next_key::<String>()? {
+                let entry: Value = map.next_value()?;
+                entries += 1;
+                let declared = parse_storage_map(self.file, &serde_json::json!({&name: entry}))
+                    .map_err(M::Error::custom)?;
+                if let Some(value) = declared.get(&name) {
+                    let Some((key, actual)) = self.derived.get_key_value(&name) else {
+                        return Err(M::Error::custom(format!("{} disagrees with the safetensors headers at {name}: the map lists this module; the checkpoint has no such EXL3 tensors", self.file)));
+                    };
+                    if !seen.insert(key.as_str()) { return Err(M::Error::custom(format!("duplicate EXL3 module {name}"))); }
+                    if value != actual {
+                        return Err(M::Error::custom(format!("{} disagrees with the safetensors headers at {name}: map {}, headers {}",
+                            self.file, describe_module(value), describe_module(actual))));
+                    }
+                }
+            }
+            if entries == 0 { return Err(M::Error::custom("tensor_storage missing or empty")); }
+            if let Some(name) = self.derived.keys().find(|name| !seen.contains(name.as_str())) {
+                return Err(M::Error::custom(format!("{} disagrees with the safetensors headers at {name}: the checkpoint stores this EXL3 module; the map does not list it", self.file)));
+            }
+            Ok(())
+        }
+    }
+    struct Metadata<'a> { file: &'a str, derived: Option<&'a Exl3StorageMap> }
+    impl<'de> Visitor<'de> for Metadata<'_> {
+        type Value = Value;
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result { f.write_str("quantization metadata object") }
+        fn visit_map<M: MapAccess<'de>>(self, mut map: M) -> Result<Value, M::Error> {
+            let mut fields = serde_json::Map::new();
+            let mut storage = false;
+            while let Some(key) = map.next_key::<String>()? {
+                if key == "tensor_storage" {
+                    if storage { return Err(M::Error::custom("duplicate tensor_storage")); }
+                    storage = true;
+                    if let Some(derived) = self.derived {
+                        map.next_value_seed(Storage { file: self.file, derived })?;
+                        fields.insert(key, Value::Bool(true));
+                    } else { map.next_value::<IgnoredAny>()?; }
+                } else {
+                    let value = map.next_value()?;
+                    if fields.insert(key.clone(), value).is_some() {
+                        return Err(M::Error::custom(format!("duplicate metadata key {key}")));
+                    }
+                }
+            }
+            if self.derived.is_some() && !storage { return Err(M::Error::custom("missing tensor_storage")); }
+            Ok(Value::Object(fields))
+        }
+    }
+    let file = std::fs::File::open(path).with_context(|| format!("opening {}", path.display()))?;
+    let size = file.metadata()?.len();
+    ensure!(size <= limit, "{} exceeds metadata size limit", path.display());
+    // Slice parsing avoids serde_json's per-byte Read adapter; no JSON tree is retained.
+    let mut bytes = Vec::with_capacity(usize::try_from(size)?.checked_add(1).context("metadata size overflow")?);
+    file.take(limit.checked_add(1).context("metadata limit overflow")?).read_to_end(&mut bytes)?;
+    ensure!(bytes.len() as u64 <= limit, "{} exceeds metadata size limit", path.display());
+    let mut de = serde_json::Deserializer::from_slice(&bytes);
+    let label = path.file_name().and_then(|s| s.to_str()).unwrap_or("metadata");
+    let result = serde::Deserializer::deserialize_map(&mut de, Metadata { file: label, derived })
+        .with_context(|| format!("parsing {}", path.display()))?;
+    de.end()?;
+    Ok(result)
 }
 
 fn dtype_from_map(value: &str) -> Option<DType> {
@@ -240,11 +337,10 @@ pub fn parse_storage_map(file: &str, storage: &Value) -> Result<Exl3StorageMap, 
                 });
             }
         }
-        if entry.get("mul1_multiplier").is_some() {
-            return Err(Exl3StorageError::Unsupported {
-                tensor: format!("{module}.mul1"),
-                variant: "EXL3 MUL1 codebook marker".into(),
-            });
+        if let Some(multiplier) = entry.get("mul1_multiplier") {
+            if multiplier.as_u64() != Some(EXL3_MUL1_MULTIPLIER) {
+                return Err(map_error(module, format!("unsupported MUL1 multiplier {multiplier}")));
+            }
         }
         let stored = entry.get("stored_tensors").and_then(Value::as_object)
             .ok_or_else(|| map_error(module, "no stored_tensors".into()))?;
@@ -275,6 +371,10 @@ pub fn parse_storage_map(file: &str, storage: &Value) -> Result<Exl3StorageMap, 
         }
         let suffixes: Vec<&str> = headers.keys().map(String::as_str).collect();
         let parsed = exl3_module(module, &suffixes, |suffix| headers.get(suffix))?;
+        if (entry.get("mcg_multiplier").is_some() && parsed.codebook != Exl3Codebook::Mcg)
+            || (entry.get("mul1_multiplier").is_some() && parsed.codebook != Exl3Codebook::Mul1) {
+            return Err(map_error(module, "declared multiplier disagrees with header codebook marker".into()));
+        }
         let declared = entry.get("bits_per_weight").and_then(Value::as_u64);
         if declared != Some(parsed.bits as u64) {
             return Err(map_error(module, format!("bits_per_weight {} but its trellis is K{}",
@@ -383,6 +483,34 @@ mod tests {
     }
 
     #[test]
+    fn streaming_metadata_checks_each_module_and_keeps_only_compact_fields() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("quantize_config.json");
+        let derived = derive_storage_map(&projection("m.up_proj", 256, 512, 4, &[1])).unwrap();
+        let document = serde_json::json!({"quant_method": "exl3", "bits": 4,
+            "tensor_storage": {"m.up_proj": gptqmodel_entry("m.up_proj", 4, 512, 256, serde_json::json!([1]))}});
+        std::fs::write(&path, serde_json::to_vec(&document).unwrap()).unwrap();
+        let compact = read_storage_metadata(&path, 1 << 20, None).unwrap();
+        assert_eq!(compact, serde_json::json!({"quant_method": "exl3", "bits": 4}));
+        let checked = read_storage_metadata(&path, 1 << 20, Some(&derived)).unwrap();
+        assert_eq!(checked["tensor_storage"], true);
+        assert!(read_storage_metadata(&path, 4, None).is_err());
+        for bad in [
+            serde_json::json!({"tensor_storage": {}}),
+            serde_json::json!({"quant_method": "exl3"}),
+            serde_json::json!({"tensor_storage": {"m.up_proj": gptqmodel_entry("m.up_proj", 3, 512, 256, serde_json::json!([1]))}}),
+            serde_json::json!({"tensor_storage": {"m.extra": gptqmodel_entry("m.extra", 4, 512, 256, serde_json::json!([1]))}}),
+        ] {
+            std::fs::write(&path, serde_json::to_vec(&bad).unwrap()).unwrap();
+            assert!(read_storage_metadata(&path, 1 << 20, Some(&derived)).is_err());
+        }
+        for bad in ["{\"bits\":4,\"bits\":3}", "{\"tensor_storage\":{},\"tensor_storage\":{}}", "{} trailing"] {
+            std::fs::write(&path, bad).unwrap();
+            assert!(read_storage_metadata(&path, 1 << 20, None).is_err());
+        }
+    }
+
+    #[test]
     fn scalar_and_vector_markers_derive_the_same_module() {
         let scalar = derive_storage_map(&projection("e.gate_proj", 256, 512, 4, &[])).unwrap();
         let vector = derive_storage_map(&projection("e.gate_proj", 256, 512, 4, &[1])).unwrap();
@@ -409,7 +537,7 @@ mod tests {
         bias.push(header("p.bias", DType::F16, &[32]));
         let orphan = vec![header("p.svh", DType::F16, &[32])];
         for (headers, tensor, text) in [
-            (mul1, "p.mul1", "MUL1 codebook"),
+            ({ mul1.push(header("p.mcg", DType::I32, &[])); mul1 }, "p.mul1", "multiple EXL3 codebook markers"),
             (packed, "p.su", "packed EXL3 sign bitfield"),
             (three_inst, "p.trellis", "3INST codebook"),
             (wide, "p.mcg", "expected i32 [] or [1]"),
@@ -431,6 +559,33 @@ mod tests {
                 format!("{stem}.suh"): {"torch_dtype": "float16", "shape": [k]},
                 format!("{stem}.svh"): {"torch_dtype": "float16", "shape": [n]},
                 format!("{stem}.mcg"): {"torch_dtype": "int32", "shape": mcg}}})
+    }
+
+    #[test]
+    fn mul1_headers_and_declared_multiplier_agree() {
+        let mut headers = projection("core.q_proj", 256, 128, 6, &[]);
+        headers[3].name = "core.q_proj.mul1".into();
+        let derived = derive_storage_map(&headers).unwrap();
+        assert_eq!(derived["core.q_proj"].codebook, Exl3Codebook::Mul1);
+        let mut entry = gptqmodel_entry("core.q_proj", 6, 128, 256, serde_json::json!([]));
+        let object = entry.as_object_mut().unwrap();
+        object.remove("mcg_multiplier");
+        object.insert("mul1_multiplier".into(), serde_json::json!(EXL3_MUL1_MULTIPLIER));
+        let tensors = object["stored_tensors"].as_object().unwrap().clone();
+        let mut tensors = tensors;
+        let marker = tensors.remove("core.q_proj.mcg").unwrap();
+        tensors.insert("core.q_proj.mul1".into(), marker);
+        object.insert("stored_tensors".into(), Value::Object(tensors));
+        let map = serde_json::json!({"core.q_proj": entry});
+        let declared = parse_storage_map("q", &map).unwrap();
+        verify_storage_map("q", &declared, &derived).unwrap();
+        let mut corrupt = map.clone();
+        corrupt["core.q_proj"]["mul1_multiplier"] = serde_json::json!(1);
+        assert!(parse_storage_map("q", &corrupt).unwrap_err().to_string().contains("MUL1 multiplier"));
+        let mut wrong_book = map;
+        wrong_book["core.q_proj"].as_object_mut().unwrap().remove("mul1_multiplier");
+        wrong_book["core.q_proj"]["mcg_multiplier"] = serde_json::json!(EXL3_MCG_MULTIPLIER);
+        assert!(parse_storage_map("q", &wrong_book).unwrap_err().to_string().contains("disagrees"));
     }
 
     #[test]

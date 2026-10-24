@@ -211,6 +211,7 @@ pub fn configuration(context: &ServerContext, hardware: &Hardware) -> Configurat
     let settings = context.settings.clone();
     let quant = context.snapshot.as_deref().map(|s| quant(s, hardware.sparks.len())).unwrap_or_default();
     Configuration {
+        supports_thinking_off: context.supports_thinking_off,
         snapshot: context.snapshot.as_ref().map(|p| p.display().to_string()),
         quant,
         speculator: speculator(context.family.as_deref(), &settings),
@@ -253,6 +254,8 @@ pub fn fingerprint(info: &ServerInfo) -> String {
         hasher.update(value.as_bytes());
         hasher.update(b"\n");
     };
+    if !info.configuration.supports_thinking_off() { line("thinking", info.configuration.thinking_label()); }
+    line("prompt_content", crate::text::PROMPT_CONTENT);
     line("model", &info.model);
     line("revision", info.revision.as_deref().unwrap_or(""));
     line("build", &info.build.label());
@@ -306,6 +309,19 @@ mod tests {
         info.configuration.settings[0].value = Some("4096".into());
         assert_ne!(fingerprint(&info), base);
         assert_eq!(base.len(), 16);
+    }
+
+    #[test]
+    fn renderer_capability_reaches_configuration_and_separates_baselines() {
+        let context = ServerContext { supports_thinking_off: Some(false), ..Default::default() };
+        let config = configuration(&context, &Hardware::default());
+        assert_eq!(config.supports_thinking_off, Some(false));
+        let mut info = ServerInfo::default();
+        let legacy = fingerprint(&info);
+        info.configuration.supports_thinking_off = Some(true);
+        assert_eq!(fingerprint(&info), legacy);
+        info.configuration = config;
+        assert_ne!(fingerprint(&info), legacy);
     }
 
     #[test]

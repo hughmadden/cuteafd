@@ -76,17 +76,34 @@ impl Fixture {
             .arg(&module)
             .status()?;
         anyhow::ensure!(status.success(), "fixture module filesystem check failed");
+        let fixtures = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+        let (c_object, cc_object) = (directory.join("fixture.o"), directory.join("kernels.o"));
         let status = Command::new("cc")
-            .args(["-shared", "-fPIC", "-O0", "-Wall", "-Wextra", "-Werror"])
-            .arg(
-                PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                    .join("tests/fixtures/native_library_lifetime.c"),
-            )
+            .args(["-c", "-fPIC", "-O0", "-Wall", "-Wextra", "-Werror"])
+            .arg(fixtures.join("native_library_lifetime.c"))
+            .arg("-o")
+            .arg(&c_object)
+            .env("TMPDIR", &directory)
+            .status()?;
+        anyhow::ensure!(status.success(), "building CPU lifetime fixture failed");
+        // Load-only kernels run the shared CUDA rule on the CPU.
+        let status = Command::new("c++")
+            .args(["-std=c++17", "-c", "-fPIC", "-O1", "-Wall", "-Wextra", "-Werror"])
+            .arg(fixtures.join("native_library_kernels.cc"))
+            .arg("-o")
+            .arg(&cc_object)
+            .env("TMPDIR", &directory)
+            .status()?;
+        anyhow::ensure!(status.success(), "building CPU fixture kernels failed");
+        let status = Command::new("c++")
+            .args(["-shared", "-fPIC"])
+            .arg(&c_object)
+            .arg(&cc_object)
             .arg("-o")
             .arg(&module)
             .env("TMPDIR", &directory)
             .status()?;
-        anyhow::ensure!(status.success(), "building CPU lifetime fixture failed");
+        anyhow::ensure!(status.success(), "linking CPU lifetime fixture failed");
         Ok(Self {
             module,
             events: directory.join("events"),
@@ -106,6 +123,16 @@ impl Fixture {
         Ok(library)
     }
 
+    pub fn quiet_events(&self, library: &NativeLibrary, quiet: bool) -> Result<()> {
+        // SAFETY: this export belongs to the CPU-only fixture loaded above.
+        unsafe {
+            let configure: Symbol<unsafe extern "C" fn(i32)> =
+                library.lib.get(b"fixture_quiet_events")?;
+            configure(i32::from(quiet));
+        }
+        Ok(())
+    }
+
     pub fn resident(&self) -> Result<bool> {
         Ok(fs::read_to_string("/proc/self/maps")?
             .lines()
@@ -114,6 +141,17 @@ impl Fixture {
 
     pub fn events(&self) -> Result<String> {
         Ok(fs::read_to_string(&self.events)?)
+    }
+
+    /// CPU byte-roundtrip mode; ordinary lifetime fixtures retain deferred uploads.
+    pub fn immediate_copies(&self, library: &NativeLibrary) -> Result<()> {
+        // SAFETY: this export belongs only to the CPU fixture loaded above.
+        unsafe {
+            let configure: Symbol<unsafe extern "C" fn()> =
+                library.lib.get(b"fixture_configure_immediate_copies")?;
+            configure();
+        }
+        Ok(())
     }
 
     pub fn configure_memory(&self, library: &NativeLibrary, device: i32, total: usize) -> Result<()> {
@@ -145,11 +183,25 @@ impl Fixture {
         Ok(())
     }
 
+    pub fn finish_ordered_uploads(&self, library: &NativeLibrary) -> Result<()> {
+        library.release_ordered_h2d_staging()
+    }
+
     pub fn configure_drain_after(&self, library: &NativeLibrary, completed: i32) -> Result<()> {
         // SAFETY: this export belongs to the CPU-only fixture loaded above.
         unsafe {
             let configure: Symbol<unsafe extern "C" fn(i32)> =
                 library.lib.get(b"fixture_configure_drain_after")?;
+            configure(completed);
+        }
+        Ok(())
+    }
+
+    pub fn configure_bind_after(&self, library: &NativeLibrary, completed: i32) -> Result<()> {
+        // SAFETY: this export belongs to the CPU-only fixture loaded above.
+        unsafe {
+            let configure: Symbol<unsafe extern "C" fn(i32)> =
+                library.lib.get(b"fixture_configure_bind_after")?;
             configure(completed);
         }
         Ok(())

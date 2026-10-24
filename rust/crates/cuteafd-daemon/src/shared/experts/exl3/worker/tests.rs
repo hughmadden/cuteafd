@@ -76,13 +76,13 @@ fn compact_tp3_ownership_preserves_fp8_routes_and_rejects_canonical_frames() -> 
 
 #[test]
 fn exl3_worker_rank_bounds_include_tp1() -> Result<()> {
-    for world in 1..=6 {
+    for world in 1..=8 {
         for rank in 0..world {
             Exl3Worker::validate_rank(world, rank)?;
         }
         assert!(Exl3Worker::validate_rank(world, world).is_err());
     }
-    for world in [0, 7, 8, 9] {
+    for world in [0, 9] {
         assert!(Exl3Worker::validate_rank(world, 0).is_err());
     }
     Ok(())
@@ -92,7 +92,7 @@ fn sparse_layout(layer: cuteafd_loader::V41Exl3Layer) -> cuteafd_loader::V41Exl3
     cuteafd_loader::V41Exl3Residency {
         layer, world: 4, rank: 3,
         intermediate_start: 1536, experts: 256, intermediate: 512, tiers: vec![4],
-        projection_counts: vec![[256; 3]], buffers: vec![], loads: vec![],
+        projection_counts: vec![[256; 3]], unit_map: None, buffers: vec![], loads: vec![],
     }
 }
 
@@ -380,5 +380,50 @@ fn gb10_schedule_runs_the_glm_flash_decode_exports_and_refuses_mislabels() -> Re
     assert!(default.check_export(root.path(), 1).is_err());
     std::fs::remove_dir_all(root.path().join("m1-gb10"))?;
     assert!(gb10.check_export(root.path(), 1).is_err());
+    Ok(())
+}
+
+#[test]
+fn packaged_schedule_identity_matches_exact_variant_without_a_policy_allowlist() -> Result<()> {
+    let package = tempfile::tempdir()?;
+    let root = package.path().join("tp6-compact-rank0");
+    let directory = root.join("m80");
+    std::fs::create_dir_all(&directory)?;
+    let manifest = package.path().join("manifest.json");
+    let export = directory.join("v41_exl3.json");
+    let write = |recorded: Option<&str>, actual: Option<&str>, label: Option<&str>| -> Result<()> {
+        std::fs::write(&manifest, serde_json::to_vec(&serde_json::json!({
+            "schema": "cuteafd.exl3-package.v1",
+            "variants": [{"directory": "tp6-compact-rank0/m80",
+                "schedule": label, "decode_schedule": recorded}]
+        }))?)?;
+        std::fs::write(&export, serde_json::to_vec(&serde_json::json!({
+            "decode_schedule": actual
+        }))?)?;
+        Ok(())
+    };
+    let schedule = Exl3Schedule::Default;
+    for identity in [None, Some("l2=2,pf1=0,pf2=0,pdl=1"), Some("other-package-policy")] {
+        write(identity, identity, None)?;
+        schedule.check_export(&root, 80)?;
+    }
+    for (recorded, actual) in [(None, Some("hint")), (Some("hint"), None),
+        (Some("hint"), Some("different"))] {
+        write(recorded, actual, None)?;
+        assert!(schedule.check_export(&root, 80).is_err());
+    }
+    write(Some("hint"), Some("hint"), Some("gb10"))?;
+    assert!(schedule.check_export(&root, 80).is_err());
+    write(Some("hint"), Some("hint"), None)?;
+    let mut duplicate: serde_json::Value = serde_json::from_slice(&std::fs::read(&manifest)?)?;
+    let variant = duplicate["variants"][0].clone();
+    duplicate["variants"].as_array_mut().unwrap().push(variant);
+    std::fs::write(&manifest, serde_json::to_vec(&duplicate)?)?;
+    assert!(schedule.check_export(&root, 80).is_err());
+    std::fs::write(&manifest, br#"{"schema":"cuteafd.exl3-package.v1","variants":[]}"#)?;
+    assert!(schedule.check_export(&root, 80).is_err());
+    // Explicit standalone roots still reject a labelled default export.
+    std::fs::remove_file(manifest)?;
+    assert!(schedule.check_export(&root, 80).is_err());
     Ok(())
 }

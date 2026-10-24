@@ -1,0 +1,112 @@
+use super::*;
+use cuteafd_loader::plan::testing::exlr8::fixture;
+use std::{fs::File, os::unix::fs::FileExt};
+
+#[test]
+fn mixed_rank_plans_land_mount_bytes_and_reject_changed_placement() -> Result<()> {
+    for padded in [false, true] {
+        let root = tempfile::tempdir()?;
+        fixture(root.path(), padded);
+        for world in [4, 6] {
+            for rank in 0..world {
+                let plan = RankPlan::new(root.path(), "mixed", &[3], world, rank, usize::MAX)?;
+                let checked = plan.checked(root.path(), root.path(), world, rank)?;
+                let mut landed = vec![0; plan.layout.bytes()];
+                let mut coverage = vec![false; landed.len()];
+                for entry in &checked.plan.entries {
+                    let pattern = &checked.plan.patterns[entry.pattern as usize];
+                    let file = File::open(root.path().join(&checked.plan.files[entry.file as usize]))?;
+                    for (source, destination) in pattern.runs() {
+                        let first = (entry.dst_base + destination) as usize;
+                        let bytes = pattern.run as usize;
+                        assert!(coverage[first..first + bytes].iter().all(|v| !v));
+                        coverage[first..first + bytes].fill(true);
+                        file.read_exact_at(&mut landed[first..first + bytes], entry.src_base + source)?;
+                    }
+                }
+                let residency = &plan.residencies[0];
+                for unit in &residency.loads {
+                    let mut mount = vec![0; unit.staging_bytes()];
+                    unit.read(&mut mount)?;
+                    let mut cursor = 0;
+                    for (source, &destination) in unit.source.iter().zip(&unit.destination) {
+                        assert_eq!(landed[destination..destination + source.bytes], mount[cursor..cursor + source.bytes]);
+                        cursor += source.bytes;
+                    }
+                }
+                let assignment = cuteafd_loader::placement::SparkAssignment {
+                    rank: rank as u32, resident_bytes: plan.layout.bytes() as u64,
+                    slices: plan.placement.iter().map(|p| p.slice.clone()).collect(), io: Default::default(),
+                };
+                let mut offer = Offer { rank, host: "fixture".into(), arena_bytes: plan.layout.logical_bytes() as u64,
+                    placement: plan.placement.clone() };
+                super::super::push_exl3::validate_offer(&offer, rank, &assignment, &plan.placement, offer.arena_bytes)?;
+                offer.placement[0].fingerprint.push('0');
+                assert!(super::super::push_exl3::validate_offer(&offer, rank, &assignment,
+                    &plan.placement, offer.arena_bytes).is_err());
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn installed_exlr8_rank_plans_match_admission_when_supplied() -> Result<()> {
+    let Some(snapshot) = std::env::var_os("CUTEAFD_PUSH_EXLR8") else { return Ok(()); };
+    let snapshot = Path::new(&snapshot);
+    for world in [4, 6] {
+        for rank in 0..world {
+            let plan = RankPlan::new(snapshot, "up1", &[3], world, rank, usize::MAX)?;
+            let checked = plan.checked(snapshot, snapshot, world, rank)?;
+            ensure!(!checked.plan.entries.is_empty(), "installed EXLR8 plan is empty");
+            assert_eq!(plan.layout.bytes(), plan.residencies[0].resident_bytes);
+            eprintln!("EXLR8 TP{world} rank {rank}: resident={} entries={} patterns={}",
+                plan.layout.bytes(), checked.plan.entries.len(), checked.plan.patterns.len());
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn coordinator_suffix_preserves_mixed_exlr8_spark_plans() -> Result<()> {
+    for padded in [false, true] {
+        let root = tempfile::tempdir()?;
+        fixture(root.path(), padded);
+        let catalog = fixture_catalog(root.path())?;
+        for world in [4, 6] {
+            let plans = (0..world).map(|rank| {
+                let plan = RankPlan::new(root.path(), "mixed", &[3], world, rank, usize::MAX)?;
+                Ok((plan.layout.bytes() as u64, plan.placement.clone(),
+                    plan.checked(root.path(), root.path(), world, rank)?))
+            }).collect::<Result<Vec<_>>>()?;
+            super::super::push_exl3::tests::coordinator_suffix(root.path(), &catalog, &plans,
+                |assignments, offers, coordinator| checked_plan(root.path(), root.path(), &catalog,
+                    "mixed", &[3], assignments, offers, coordinator))?;
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn fixture_catalog(root: &Path) -> Result<cuteafd_loader::OfficialV41Catalog> {
+    use std::io::Write;
+    // Inventory needs a dense native header as well as the routed index.
+    std::fs::create_dir(root.join("dense"))?;
+    let header = serde_json::to_vec(&serde_json::json!({
+        "__metadata__": {"format": "exlr8-v2", "scheme": "exlr8-e4m3-v2"},
+        "norm": {"dtype": "BF16", "shape": [1], "data_offsets": [0, 2]}
+    }))?;
+    let mut file = File::create(root.join("dense/exlr8-dense-000.safetensors"))?;
+    file.write_all(&(header.len() as u64).to_le_bytes())?;
+    file.write_all(&header)?;
+    file.write_all(&[0, 0])?;
+    let mut config = cuteafd_loader::plan::testing::glm5_config();
+    for (key, value) in [("hidden_size", 128), ("moe_intermediate_size", 384),
+        ("n_routed_experts", 2), ("num_experts_per_tok", 1), ("num_hidden_layers", 4),
+        ("first_k_dense_replace", 3)] { config[key] = value.into(); }
+    config["indexer_types"] = serde_json::json!(["full", "full", "full", "full"]);
+    config["mlp_layer_types"] = serde_json::json!(["dense", "dense", "dense", "sparse"]);
+    std::fs::write(root.join("config.json"), serde_json::to_vec(&config)?)?;
+    let catalog = cuteafd_loader::read_expert_catalog(root)?;
+    assert!(matches!(catalog.format(), cuteafd_loader::plan::checkpoint::CheckpointFormat::Exlr8));
+    Ok(catalog)
+}

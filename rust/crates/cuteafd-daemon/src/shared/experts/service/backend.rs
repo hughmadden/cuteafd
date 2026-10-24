@@ -100,7 +100,7 @@ impl<'a> Weights<'a> {
                 };
                 resident = resident.checked_add(u64::try_from(weight.resident_bytes())?)
                     .context("EXL3 resident sum overflow")?;
-                slices.push(SparkSlice { unit_map: None, layer: u32::try_from(layer)?,
+                slices.push(SparkSlice { unit_map: plan.unit_map.as_ref().map(|map| map.fingerprint()), layer: u32::try_from(layer)?,
                     first: u32::try_from(plan.intermediate_start)?, width: u32::try_from(plan.intermediate)?,
                     stored_width: u32::try_from(plan.intermediate)?,
                     tiers: plan.tiers.iter().copied().map(u32::try_from).collect::<Result<_, _>>()?,
@@ -189,12 +189,10 @@ impl<'a> Weights<'a> {
                 let mut execution = Exl3Worker::with_modules(
                     library,
                     weights.clone(),
-                    &config.exl3_directory_for(
-                        weights
-                            .first()
-                            .map(|weight| weight.layout.tiers.as_slice())
-                            .unwrap_or(&[]),
-                    ),
+                    &{
+                        let plan = &weights.first().context("EXL3 worker has no resident weights")?.layout;
+                        config.exl3_directory_for(&plan.tiers, &plan.aot_layout())
+                    },
                     config.capacity,
                     remaining,
                     config.exl3_schedule,
@@ -298,14 +296,17 @@ pub(super) fn conservative_grouping(loaded: cuteafd_transport::worker_selection:
 }
 
 #[derive(Default)]
-struct ExpertGroupBytes { resident: usize, scratch: usize, transient: usize }
+struct ExpertGroupBytes { resident: usize, scratch: usize, host: usize, pinned: usize }
 impl ExpertGroupBytes {
-    fn add(&mut self, layer_bytes: usize, layers: usize, scratch: usize, transient: usize) -> Result<()> {
+    fn add(&mut self, layer_bytes: usize, layers: usize, scratch: usize) -> Result<()> {
         self.resident = self.resident.checked_add(layer_bytes.checked_mul(layers)
             .context("expert resident overflow")?).context("expert resident sum overflow")?;
         self.scratch = self.scratch.checked_add(scratch.max(256)).context("expert scratch sum overflow")?;
-        self.transient = self.transient.max(transient);
         Ok(())
+    }
+    fn load(&mut self, load: cuteafd_loader::formats::fp8_experts::Fp8LayerLoad) {
+        self.host = self.host.max(load.host);
+        self.pinned = self.pinned.max(load.pinned);
     }
     fn permanent(&self) -> Result<usize> {
         self.resident.checked_add(self.scratch).context("expert permanent overflow")
@@ -428,7 +429,7 @@ mod admission_tests {
     fn mixed_ingress_requires_both_backends_even_at_full_decode_extent() {
         use cuteafd_core::{SparkEndpoint, SparkIngress};
         for rows in [16, 80] {
-            let endpoint = SparkEndpoint { capacity: 80, ingress: SparkIngress::Bf16Decode { rows } };
+            let endpoint = SparkEndpoint { ring_depth: None, capacity: 80, ingress: SparkIngress::Bf16Decode { rows } };
             for (fp8, bf16) in [(false, false), (false, true), (true, false), (true, true)] {
                 assert_eq!(super::supports_ingress(endpoint.ingress, fp8, bf16), fp8 && bf16);
             }
@@ -442,13 +443,37 @@ mod admission_tests {
     #[test]
     fn group_admission_sums_retained_storage_but_maxes_load_transients() {
         let mut bytes = super::ExpertGroupBytes::default();
-        bytes.add(1000, 3, 100, 2000).unwrap();
-        bytes.add(2000, 2, 500, 1500).unwrap();
+        use cuteafd_loader::formats::fp8_experts::Fp8LayerLoad;
+        bytes.add(1000, 3, 100).unwrap();
+        bytes.load(Fp8LayerLoad { resident: 1000, host: 2000, pinned: 1000 });
+        bytes.add(2000, 2, 500).unwrap();
+        bytes.load(Fp8LayerLoad { resident: 2000, host: 1500, pinned: 2000 });
         assert_eq!(bytes.resident, 7000);
         assert_eq!(bytes.scratch, 756);
-        assert_eq!(bytes.transient, 2000);
+        assert_eq!((bytes.host, bytes.pinned), (2000, 2000));
         assert_eq!(bytes.permanent().unwrap(), 7756);
-        assert!(bytes.add(usize::MAX, 2, 0, 0).is_err());
+        assert!(bytes.add(usize::MAX, 2, 0).is_err());
+    }
+
+    #[test]
+    fn step5_mixed_load_projection_owners_fit_unchanged_100_gib_budget() {
+        use cuteafd_loader::formats::fp8_experts::Fp8LayerLoad;
+        let mut bytes = super::ExpertGroupBytes::default();
+        // The rejected max-card receipt: remove only its old fictitious load
+        // transient and retain the identical native resident/scratch owners.
+        let permanent = 100_826_826_752usize;
+        bytes.load(Fp8LayerLoad { resident: 1_107_566_592,
+            host: 469_860_352, pinned: 369_098_752 });
+        bytes.load(Fp8LayerLoad { resident: 2_214_592_512,
+            host: 738_197_504, pinned: 738_197_504 });
+        let headroom = cuteafd_core::memory_layout::SPARK_RUNTIME_RESIDUAL_BYTES as usize;
+        let peak = permanent + bytes.host + bytes.pinned + headroom;
+        assert_eq!(peak, 104_987_576_320);
+        assert!(peak < 100 << 30);
+        // The pinned owner from the larger group must survive even if a later
+        // group has smaller host buffers.
+        bytes.load(Fp8LayerLoad { resident: 10, host: 1, pinned: 2 });
+        assert_eq!((bytes.host, bytes.pinned), (738_197_504, 738_197_504));
     }
 }
 
@@ -479,9 +504,10 @@ pub(super) fn validate_fp8_recipe(package: &str, intermediate: usize, world: usi
 /// this rank's intermediate slice, run by the `fp8-<family>` package.
 pub(super) fn load_fp8<'a>(
     library: &'a NativeLibrary,
-    _catalog: &OfficialV41Catalog,
+    catalog: &OfficialV41Catalog,
     config: &NativeExpertServiceConfig,
-    groups: Vec<super::modules::Fp8Group>,
+    mut groups: Vec<super::modules::Fp8Group>,
+    push: Option<&mut std::net::TcpStream>,
 ) -> Result<(Weights<'a>, usize)> {
     ensure!(!groups.is_empty(), "native expert worker has no resident groups");
     let workspace = fp8_worker_workspace(config)?.checked_mul(groups.len())
@@ -489,45 +515,62 @@ pub(super) fn load_fp8<'a>(
     let mut totals = ExpertGroupBytes::default();
     let mut budgets = Vec::with_capacity(groups.len());
     for group in &groups {
-        let bytes = crate::shared::experts::fp8::Fp8Layer::bytes_for(&group.tensors,
-            config.world, config.rank, group.slicing)?;
-        let reader = bytes.checked_mul(config.world).and_then(|n| n.checked_mul(16))
-            .context("expert reader scratch overflow")?.div_ceil(group.tensors.shape().experts);
-        let transient = bytes.checked_mul(2).and_then(|n| n.checked_add(reader))
-            .context("expert host staging overflow")?;
-        totals.add(bytes, group.layers.len(), group.scratch, transient)?;
-        budgets.push(bytes.checked_mul(group.layers.len()).and_then(|n| n.checked_add(group.scratch))
-            .context("expert group budget overflow")?);
+        let mut resident = 0usize;
+        for &layer in &group.layers {
+            let tensors = group.tensors.for_layer_metadata(layer)?;
+            let load = tensors.layer_load(layer, config.world, config.rank, group.slicing)?;
+            resident = resident.checked_add(load.resident).context("expert group resident overflow")?;
+            totals.load(load);
+        }
+        // Upload staging survives projection/group boundaries until the worker
+        // releases it before execution arenas are allocated.
+        totals.add(resident, 1, group.scratch)?;
+        budgets.push(resident.checked_add(group.scratch).context("expert group budget overflow")?);
     }
     let permanent = totals.permanent()?;
-    let peak = spark_admission_budget(config, permanent, 0, totals.transient, 0, workspace)?;
+    let peak = spark_admission_budget(config, permanent, 0, totals.pinned, totals.host, workspace)?;
     ensure!(peak.load_peak <= config.device_budget && peak.serve_peak <= config.device_budget,
         "native expert groups exceed budget: load {} serve {} budget {}",
         peak.load_peak, peak.serve_peak, config.device_budget);
     admit_worker_peak(library, peak.load_peak, peak.serve_peak)?;
     tracing::info!(groups = groups.len(), resident = totals.resident, scratch = totals.scratch,
-        transient = totals.transient, workspace, "native expert groups admitted before allocation");
+        host = totals.host, pinned = totals.pinned, workspace, "native expert groups admitted before allocation");
     let mut owners = Vec::with_capacity(groups.len());
-    for (group, budget) in groups.into_iter().zip(budgets) {
-        owners.push(Rc::new(Fp8Experts::load_with_modules(library, &group.tensors, &group.directory,
+    for (group, budget) in groups.iter_mut().zip(budgets) {
+        owners.push(Fp8Experts::prepare_with_modules(library, &group.tensors, &group.directory,
             group.bf16_directory.as_deref(), &group.layers, config.world, config.rank,
-            config.capacity as usize, budget, Some(group.modules.context("native group modules already consumed")?))?));
+            config.capacity as usize, budget, Some(group.modules.take()
+                .context("native group modules already consumed")?))?);
     }
-    Ok((Weights::Fp8(owners), config.device_budget - permanent))
+    let pushed = push.map(|stream| super::push_fp8::load(library, catalog, config, &groups,
+        totals.resident, stream)).transpose()?.flatten();
+    if let Some(layers) = pushed {
+        // Match the prepared package groups without ever allocating mount weights.
+        for layer in layers {
+            let group = groups.iter().position(|group| group.layers.contains(&layer.layer))
+                .context("native push layer has no prepared package")?;
+            owners[group].layers.push(layer);
+        }
+    } else {
+        // Failed candidates have crossed the all-rank drain barrier. Reuse the
+        // original modules/scratch; no second package preparation on fallback.
+        for (owner, group) in owners.iter_mut().zip(&groups) {
+            owner.load_mount(library, &group.tensors, &group.layers, group.slicing)?;
+        }
+    }
+    Ok((Weights::Fp8(owners.into_iter().map(Rc::new).collect()), config.device_budget - permanent))
 }
 
 pub(super) fn load_exl3<'a>(
     library: &'a NativeLibrary,
     catalog: &OfficialV41Catalog,
     config: &NativeExpertServiceConfig,
+    push: Option<&mut std::net::TcpStream>,
 ) -> Result<(Weights<'a>, usize)> {
-    let exl3_tiers: &[usize] = catalog
-        .exl3()
-        .map(|manifest| manifest.decoder_tiers())
-        .unwrap_or(&[]);
-    let exl3_directory = config.exl3_directory_for(exl3_tiers);
+    let exl3_directory = config.exl3_directory(catalog)?;
     Exl3Worker::validate_exports(&exl3_directory, config.capacity, config.rank,
         config.exl3_schedule)?;
+    config.validate_exl3_residency(catalog, &exl3_directory)?;
 
     let workspace = Exl3Worker::plan(&exl3_directory, config.capacity, config.exl3_schedule)
         .context("EXL3 checkpoint requires matching native AOT artifacts; set --exl3-aot-dir for a custom export")?;
@@ -559,11 +602,18 @@ pub(super) fn load_exl3<'a>(
     let pinned = plans.iter().map(|p| p.pinned_host_bytes).max().unwrap_or(0);
     let scratch = plans.iter().map(|p| p.read_scratch_bytes).max().unwrap_or(0);
     let peak = spark_admission_budget(config, resident, staging, pinned, scratch, workspace)?;
+    tracing::info!(rank=config.rank, resident_bytes=resident, device_staging_bytes=staging,
+        pinned_host_bytes=pinned, read_scratch_bytes=scratch, load_peak_bytes=peak.load_peak,
+        serve_peak_bytes=peak.serve_peak, "EXL3 Spark admitted loader peak");
     admit_worker_peak(library, peak.load_peak, peak.serve_peak)?;
-    let mut weights = Vec::with_capacity(plans.len());
+    if let Some(stream) = push {
+        if let Some(weights) = super::push::load(library, catalog, config, &layers, &plans, resident, stream)? {
+            return Ok((Weights::Exl3(Rc::new(weights)), config.device_budget - resident));
+        }
+    }
     let mut remaining = config.device_budget;
-    for (index, plan) in plans.iter().enumerate() {
-        let layer = layers[index];
+    let weights = crate::shared::experts::load_in_rank_order(&layers, config.rank, |index, layer| {
+        let plan = &plans[index];
         let started = std::time::Instant::now();
         let weight = Exl3Weights::load(
             library,
@@ -581,8 +631,8 @@ pub(super) fn load_exl3<'a>(
             elapsed_ms = started.elapsed().as_millis() as u64,
             "compressed EXL3 expert layer loaded"
         );
-        weights.push(weight);
-    }
+        Ok(weight)
+    })?;
     Ok((Weights::Exl3(Rc::new(weights)), remaining))
 }
 

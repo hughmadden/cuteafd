@@ -27,7 +27,7 @@ impl RemoteVision {
             "--vision-peers requires Spark/auto vision placement");
         let addresses = peers.split(',').map(|peer| peer.trim().parse()
             .context("vision peer must be an IP:port")).collect::<Result<Vec<_>>>()?;
-        anyhow::ensure!((1..=6).contains(&addresses.len()), "vision needs 1..6 replicas");
+        anyhow::ensure!((1..=8).contains(&addresses.len()), "vision needs 1..8 replicas");
         let plan_hash = crate::shared::vision::worker::parse_plan_hash(args.encoder_plan_hash.as_deref()
             .context("--vision-peers requires --encoder-plan-hash")?)?;
         let revision = args.encoder_revision.clone().context("--vision-peers requires --encoder-revision")?;
@@ -53,7 +53,7 @@ impl RemoteAudio {
             "--audio-peers requires Spark/auto audio placement");
         let addresses = peers.split(',').map(|peer| peer.trim().parse()
             .context("audio peer must be an IP:port")).collect::<Result<Vec<_>>>()?;
-        anyhow::ensure!((1..=6).contains(&addresses.len()), "audio needs 1..6 replicas");
+        anyhow::ensure!((1..=8).contains(&addresses.len()), "audio needs 1..8 replicas");
         let plan_hash = crate::shared::vision::worker::parse_plan_hash(args.audio_encoder_plan_hash.as_deref()
             .context("--audio-peers requires --audio-encoder-plan-hash")?)?;
         let revision = args.audio_encoder_revision.clone().context("--audio-peers requires --audio-encoder-revision")?;
@@ -628,7 +628,7 @@ mod tests {
             cuteafd_api::openai::NativeFailure::Unavailable(message) if message == "vision encoder unavailable"));
     }
     fn request(images: Vec<Arc<PreparedImage>>) -> NativeRequest {
-        NativeRequest { prefix_cache_source: Default::default(), literal_spans: Vec::new(), prompt: String::new(), constraint: None, images: Vec::new(), media: images, audio: Vec::new(),
+        NativeRequest { variant: 0, prefix_cache_source: Default::default(), literal_spans: Vec::new(), prompt: String::new(), constraint: None, images: Vec::new(), media: images, audio: Vec::new(),
             max_tokens: 8, sampling: TargetSamplingParams::default(), stop_token_ids: Vec::new(),
             events: tokio::sync::mpsc::unbounded_channel().0, usage: None, probe: None }
     }

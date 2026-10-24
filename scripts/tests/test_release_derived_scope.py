@@ -338,7 +338,7 @@ def test_step5_release_derives_native_mixed_packages(tmp_path, monkeypatch, quan
     root = tmp_path / 'image'
     write_json(root / 'share/PROGRAMS.json', dict(programs=[dict(family=family) for family in requirement['programs']]))
     SCOPE.check_inventory(root, 'coordinator', [requirement], symbols=set())
-    suffix = '' if quant == 'fp8' else '-nvfp4'
+    suffix = '' if quant == 'fp8' else '-nvfp4a4'
     assert sorted(checked) == sorted([(f'fp8/fp8-step5{suffix}', ['tp1', 'tp2'] if gpus == 2 else ['tp1']),
                                       ('fp8/fp8-step5-bf16-weights', ['tp1', 'tp2'] if gpus == 2 else ['tp1'])])
     checked.clear()
@@ -357,7 +357,7 @@ def test_kimi_release_derives_coordinator_programs(tmp_path, monkeypatch):
     derived, _ = SCOPE.derive(tmp_path, matrix, 'kimi', {})
     assert derived[P + 'KIMIK3_AOT'] == 'ON'
     assert derived[P + 'STEP5_AOT'] == 'OFF'
-    assert SCOPE.requirements(tmp_path, matrix, 'kimi')[0]['programs'] == ['kimik3']
+    assert SCOPE.requirements(tmp_path, matrix, 'kimi')[0]['programs'] == ['kimi_k6_dense', 'kimi_split', 'kimik3']
 
 
 def test_unrelated_release_keeps_kimi_disabled(tmp_path, monkeypatch):

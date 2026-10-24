@@ -1,6 +1,6 @@
 //! MiMo admission over its exact allocation profile. Both planner and runtime
 //! supply the same retained representations; only the GPU baseline differs.
-use crate::families::mimo_v2::{admission::headroom_bytes, MimoAttention, MimoKvCache, MimoV2Config};
+use crate::families::mimo_v2::{admission::headroom_bytes, MimoAttention, MimoKvFormats, MimoV2Config};
 use crate::placement::*;
 use crate::serving_capacity::{mimo_cache_geometry, CacheGeometryError};
 use cuteafd_core::memory_layout::{Basis, Category, Item};
@@ -13,7 +13,7 @@ pub struct MimoInputs<'a> {
     pub cfg: &'a MimoV2Config,
     pub profile: &'a CapacityProfile,
     pub layers: usize,
-    pub kv: MimoKvCache,
+    pub kv: MimoKvFormats,
     pub mtp_stages: usize,
     /// Physical totals and baselines, in logical rank order. MiMo samples
     /// before weights, so every retained representation is still a demand.
@@ -168,11 +168,7 @@ pub fn spark_package_directory(lib: &std::path::Path, cfg: &MimoV2Config,
         ("mimo", ExpertFormat::Mxfp4) => "mimof",
         (family, _) => family,
     };
-    let root = lib.join("fp8");
-    let a4 = root.join(format!("fp8-{family}-nvfp4a4"));
-    let package = if format == ExpertFormat::Nvfp4
-        && std::env::var("CUTEAFD_NVFP4_ACTIVATIONS").as_deref() != Ok("a16") && a4.join(format!("tp{tp}")).is_dir() { a4 }
-        else { root.join(format!("fp8-{family}{}", format.package_suffix())) };
+    let package = lib.join("fp8").join(format.package_name(family));
     Ok(package.join(format!("tp{tp}")))
 }
 
@@ -221,7 +217,7 @@ mod tests {
         cfg.dense = vec![true, false, false, false];
         cfg.attention = vec![MimoAttention::Full; 4];
         for ranks in [1, 2] {
-            let cache = mimo_cache_geometry(&cfg, 4, ranks, MimoKvCache::Int8, 0).unwrap();
+            let cache = mimo_cache_geometry(&cfg, 4, ranks, MimoKvFormats::default(), 0).unwrap();
             let profile = |spark| CapacityProfile {
                 context: ContextLimits { checkpoint_max_tokens: 1 << 20, compiled_index_max_tokens: None },
                 pool_unit_rows: cache.logical_unit_rows, host_prefix_bytes: 0,
@@ -235,7 +231,7 @@ mod tests {
             let local = profile(false);
             let cost = ExpertCost { whole: Bytes2 { resident: 1 << 30, staging: 0 },
                 half: [Bytes2 { resident: 512 << 20, staging: 0 }; 2], tp2: ranks == 2, spark_ok: true };
-            let inputs = MimoInputs { automatic_context: false, cfg: &cfg, profile: &spark, layers: 4, kv: MimoKvCache::Int8,
+            let inputs = MimoInputs { automatic_context: false, cfg: &cfg, profile: &spark, layers: 4, kv: MimoKvFormats::default(),
                 mtp_stages: 0, gpus: vec![(96 << 30, Baseline::Measured { free_bytes: 90 << 30 }); ranks],
                 headroom_floor: 0, spark_ranks: 6, startup_probe_bytes: 64 << 20, context: 256 << 10,
                 requested_pool: Some(2 << 20), pool_ceiling_at_target: false, onboard: Onboard::Auto,
@@ -332,7 +328,7 @@ mod tests {
         cfg.dense = vec![true, false, false, false];
         cfg.attention = vec![MimoAttention::Full; 4];
         for ranks in [1, 2] {
-            let cache = mimo_cache_geometry(&cfg, 4, ranks, MimoKvCache::Int8, 0).unwrap();
+            let cache = mimo_cache_geometry(&cfg, 4, ranks, MimoKvFormats::default(), 0).unwrap();
             let mut drafts = vec![("draft.weights.fp8_values", 1400u64 << 20), ("draft.fp8_scratch", 16 << 20),
                 ("draft.layer0.k_ring", 32 << 20), ("workspace.local", 1 << 30)];
             let profile = CapacityProfile {
@@ -347,7 +343,7 @@ mod tests {
             let cost = ExpertCost { whole: Bytes2 { resident: 1 << 30, staging: 0 },
                 half: [Bytes2 { resident: 512 << 20, staging: 0 }; 2], tp2: ranks == 2, spark_ok: true };
             for onboard in [Onboard::Auto, Onboard::Layers(2)] {
-                let inputs = MimoInputs { automatic_context: false, cfg: &cfg, profile: &profile, layers: 4, kv: MimoKvCache::Int8,
+                let inputs = MimoInputs { automatic_context: false, cfg: &cfg, profile: &profile, layers: 4, kv: MimoKvFormats::default(),
                     mtp_stages: 0, gpus: vec![(96 << 30, Baseline::Measured { free_bytes: 90 << 30 }); ranks],
                     headroom_floor: 0, spark_ranks: 6, startup_probe_bytes: 64 << 20, context: 256 << 10,
                     requested_pool: None, pool_ceiling_at_target: false, onboard,

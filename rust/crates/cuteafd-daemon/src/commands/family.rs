@@ -15,12 +15,15 @@ pub(crate) const FAMILIES: &[(&str, &str, Option<&str>)] = &[
     ("glm5_flash", "serve-glmf", Some("glmf-golden")),
     ("mimo_v2", "serve-mimo", Some("mimo-golden")),
     ("qwen4", "serve-qwen4", Some("qwen4-golden")),
+    ("qwen3_5", "serve-qwen35", Some("qwen35-golden")),
+    ("kimi_k3", "serve-kimi", Some("kimi-golden")),
+    ("step5", "serve-step5", Some("step5-golden")),
 ];
 
 #[derive(Debug, clap::Args)]
 #[command(disable_help_flag = true)]
 pub(crate) struct FamilyArgs {
-    /// Family id: deepseek_v41, deepseek_v4, glm5, glm5_flash, mimo_v2 or qwen4.
+    /// Family id: deepseek_v41, deepseek_v4, glm5, glm5_flash, mimo_v2, qwen4, qwen3_5, kimi_k3 or step5.
     /// Detected from --snapshot's config.json when omitted.
     #[arg(long)]
     pub(crate) family: Option<String>,
@@ -112,6 +115,12 @@ mod tests {
         let argv = argv_golden("qwen4");
         assert_eq!(argv[1], "qwen4-golden");
         assert_eq!(argv_golden("deepseek_v41")[1], "v41-golden");
+        assert_eq!(argv_golden("step5")[1], "step5-golden");
+        assert_eq!(argv_golden("qwen3_5")[1], "qwen35-golden");
+        assert_eq!(super::argv(Kind::Serve, args(Some("qwen3_5"), &["--snapshot", "/m"]))
+            .unwrap().unwrap(), ["cuteafd", "serve-qwen35", "--snapshot", "/m"]);
+        assert_eq!(super::argv(Kind::Serve, args(Some("step5"), &["--snapshot", "/m"]))
+            .unwrap().unwrap(), ["cuteafd", "serve-step5", "--snapshot", "/m"]);
         assert!(super::argv(Kind::Serve, args(Some("nope"), &[])).is_err());
     }
 
@@ -136,6 +145,9 @@ mod tests {
                 "--coordinator-gpu-budget-gib", "32"];
             if matches!(*serve, "serve-native" | "serve-mimo" | "serve-glm" | "serve-dsv4") {
                 argv.extend(["--peers", "127.0.0.1:9,127.0.0.1:10"]);
+            }
+            if *serve == "serve-step5" {
+                argv.extend(["--peers", "127.0.0.1:1,127.0.0.1:2,127.0.0.1:3,127.0.0.1:4"]);
             }
             let cli = crate::cli::Cli::try_parse_from(argv).unwrap();
             assert_eq!(cli.coordinator_gpu_budget_gib, Some(32.0), "{serve}");

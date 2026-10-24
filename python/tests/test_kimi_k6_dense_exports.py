@@ -1,0 +1,145 @@
+"""CPU-only contracts for local Kimi core shapes and shared ABI exports."""
+import ast
+from pathlib import Path
+import runpy
+import sys
+from types import ModuleType
+
+ROOT = Path(__file__).resolve().parents[2]
+EXPORTER = ROOT / "python/tools/aot/export_b12x_kimi_k6_dense_aot.py"
+
+
+def load_exporter(monkeypatch):
+    monkeypatch.setitem(sys.modules, "_pinned_sparkinfer", ModuleType("_pinned_sparkinfer"))
+    # The exporter prepends its lib path like every standalone AOT entry point.
+    monkeypatch.setattr(sys, "path", list(sys.path))
+    return runpy.run_path(str(EXPORTER))
+
+
+def test_local_shapes_and_sides(monkeypatch):
+    shapes = load_exporter(monkeypatch)["TRELLIS_SHAPES"]
+    assert len({name for name, *_ in shapes}) == len(shapes)
+    assert {(k, n, side) for _, k, n, side in shapes} == {
+        (7168, 6144, 1), (6144, 7168, 2), (7168, 3072, 1), (3072, 7168, 2),
+        (7168, 3584, 1), (3584, 7168, 1), (7168, 1536, 1), (7168, 640, 1),
+        (1536, 18432, 1), (1536, 9216, 1), (7168, 12288, 1),
+        (12288, 7168, 1), (7168, 163840, 1),
+    }
+    assert all(k % 128 == n % 128 == 0 for _, k, n, _ in shapes)
+    assert not any(n == 576 or k == 1792 or n == 1792 for _, k, n, _ in shapes)
+
+
+def test_only_shared_native_compiler_and_both_codebooks(monkeypatch):
+    module = load_exporter(monkeypatch)
+    fake = ModuleType("b12x.integration.cuteafd.trellis_linear")
+    fake.compile_trellis_linear_aot = lambda **params: params
+    monkeypatch.setitem(sys.modules, fake.__name__, fake)
+    transforms = ModuleType("b12x.integration.cuteafd.trellis_transform")
+    transforms.compile_trellis_input_aot = lambda **params: params
+    transforms.compile_trellis_output_aot = lambda **params: params
+    monkeypatch.setitem(sys.modules, transforms.__name__, transforms)
+    programs = module["programs"]()
+    assert len(programs) == 46
+    assert len({name for name, *_ in programs}) == len(programs)
+    grouped = [item for item in programs if item[2].get("groups")]
+    assert {name for name, *_ in grouped} == {
+        "trellis_kda_qkvg_tp2_mcg_g4", "trellis_kda_qkvg_tp2_mul1_g4",
+        "trellis_input_k7168_bf16_g4", "trellis_output_n6144_bf16_g4"}
+    for name, op, params, compile_program in grouped:
+        assert params["groups"] == 4 and params["max_rows"] == 4096
+        assert compile_program() == params
+        if op == "trellis_linear":
+            assert params["rotation_count"] == 4 and params["sharded_side"] == 1 and params["bits"] == 6
+        elif op == "trellis_output":
+            assert params["output_dtype"] == "bf16"
+    programs = [item for item in programs if not item[2].get("groups")]
+    core = [item for item in programs if item[1] == "trellis_linear"]
+    assert len(core) == 2 * len(module["TRELLIS_SHAPES"])
+    for _, op, params, compile_program in core:
+        assert op == "trellis_linear"
+        assert params["bits"] == 6
+        assert params["codebook"] in ("mcg", "mul1")
+        assert params["max_rows"] == 4096
+        assert params["rotation_count"] == 1
+        assert compile_program() == params
+    ingress = [item for item in programs if item[1] == "trellis_input"]
+    egress = [item for item in programs if item[1] == "trellis_output"]
+    assert len(ingress) == 6
+    assert {params["features"] for _, _, params, _ in ingress} == {1536, 3072, 3584, 6144, 7168, 12288}
+    assert {params["features"] for _, _, params, _ in egress} == {640, 1536, 3072, 3584, 6144, 7168, 9216, 12288, 18432, 163840}
+    for name, op, params, compile_program in ingress + egress:
+        assert params["max_rows"] == 4096
+        assert compile_program() == params
+        if op == "trellis_input":
+            assert params["input_dtype"] == "bf16"
+            suffix = "_rotated_bf16" if params.get("output_dtype") == "bf16" else ""
+            assert name == f"trellis_input_k{params['features']}_bf16{suffix}"
+        else:
+            dtype = "f32" if params["features"] == 163840 else "bf16"
+            assert params["output_dtype"] == dtype
+            assert name == f"trellis_output_n{params['features']}_{dtype}"
+    for _, op, params, compile_program in programs:
+        assert compile_program() == params
+    names = {name for name, *_ in programs} | {name for name, *_ in grouped}
+    for policy in module["row_policies"]():
+        for field in ("native_program", "native_input", "output_program"):
+            assert policy[field] in names
+        if "grouped" in policy:
+            assert policy["shape"] == "kda_qkvg_tp2"
+            assert policy["grouped"]["native_program"] == f"trellis_kda_qkvg_tp2_{policy['codebook']}_g4"
+            for field in ("native_program", "native_input", "output_program"):
+                assert policy["grouped"][field] in names
+    assert sum("grouped" in policy for policy in module["row_policies"]()) == 2
+    fixture = module["programs_for_shapes"]((("s1", 128, 256, 1), ("s2", 128, 256, 2)),
+        max_rows=64, f32_outputs=(256,))
+    assert {name for name, *_ in fixture} == {
+        "trellis_s1_mcg", "trellis_s1_mul1", "trellis_s2_mcg", "trellis_s2_mul1",
+        "trellis_input_k128_bf16", "trellis_output_n256_f32"}
+    assert all(params["max_rows"] == 64 for _, _, params, _ in fixture)
+    imports = [node.module for node in ast.walk(ast.parse(EXPORTER.read_text()))
+               if isinstance(node, ast.ImportFrom)]
+    assert "b12x.gemm.trellis_linear" not in imports
+    assert "b12x.integration.cuteafd.trellis_linear" in imports
+
+
+def test_comparison_group_is_opt_in():
+    groups = runpy.run_path(str(ROOT / "scripts/build/compare-sm-exports.py"))["jobs"]("all")
+    group = next(row for row in groups if row[0] == "kimi-k6-dense")
+    assert group[1:] == ("export_b12x_dsv4_aot.py", ["--geometry", "kimi_k6_dense,kimi_split"])
+
+
+def test_native_only_policy_has_no_dequant_scratch(monkeypatch):
+    policies = load_exporter(monkeypatch)["row_policies"]()
+    assert len(policies) == 26
+    for policy in policies:
+        assert not any("chunk" in key or "dequant" in key or "scratch" in key for key in policy)
+        assert "wide_input" not in policy
+        if "grouped" in policy:
+            assert policy["grouped"]["max_rows"] == 4096
+    head = next(p for p in policies if p["shape"] == "lm_head")
+    assert head["output_program"].endswith("_f32")
+
+
+def test_bf16_diagnostic_specialization_preserves_stems_and_default(monkeypatch):
+    module = load_exporter(monkeypatch)
+    fake = ModuleType("b12x.integration.cuteafd.trellis_linear")
+    fake.compile_trellis_linear_aot = lambda **params: params
+    monkeypatch.setitem(sys.modules, fake.__name__, fake)
+    transforms = ModuleType("b12x.integration.cuteafd.trellis_transform")
+    transforms.compile_trellis_input_aot = lambda **params: params
+    transforms.compile_trellis_output_aot = lambda **params: params
+    monkeypatch.setitem(sys.modules, transforms.__name__, transforms)
+    default = module["programs"]()
+    bf16 = module["programs"](input_dtype="bf16")
+    assert [p[0] for p in default] == [p[0] for p in bf16]
+    assert all(a[:3] == b[:3] for a, b in zip(default, module["programs"](input_dtype="f16")))
+    for (_, op, params, thunk), (_, _, original, _) in zip(bf16, default):
+        assert thunk() == params
+        if op == "trellis_linear":
+            assert params["input_dtype"] == "bf16"
+            assert original.get("input_dtype", "f16") == "f16"
+        elif op == "trellis_input":
+            assert params["output_dtype"] == "bf16"
+            assert original.get("output_dtype", "f16") == "f16"
+        else:
+            assert params == original

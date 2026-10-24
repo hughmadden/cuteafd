@@ -87,7 +87,7 @@ def test_wip_passes_the_switch_to_both_legs_and_seals_only_when_on():
     finalize = (ROOT / 'scripts/build/finalize-wip-slot.sh').read_text()
     assert 'if [[ "${CUTEAFD_WIP_EXLR8_AOT:-OFF}" == ON ]]; then' in finalize
     assert 'programs-check --native-lib' in finalize and '--exlr8-role' in finalize
-    # The check runs after checksum verification and before the slot is staged.
+    # The check runs after the bounded source read and before the slot is staged.
     assert finalize.index('sha256sum -c ARTIFACT_SHA256SUMS') < finalize.index('programs-check') < finalize.index('mkdir -p "$incoming')
 
 
@@ -250,8 +250,8 @@ def test_kimi_switch_is_forwarded_to_coordinator_and_native_dispatch():
     assert '${CUTEAFD_WIP_KIMIK3_AOT:-OFF}' in dispatch
     cmake = (ROOT / 'native/cmake/shared/dsv4_programs.cmake').read_text()
     block = cmake.split('if(CUTEAFD_ENABLE_KIMIK3_AOT)', 1)[1].split('if(CUTEAFD_ENABLE_EXLR8_AOT)', 1)[0]
-    assert 'set(CUTEAFD_PROGRAM_GEOMETRY "kimik3")' in block
-    assert 'set(CUTEAFD_PROGRAM_GEOMETRY "${CUTEAFD_PROGRAM_GEOMETRY},kimik3")' in block
+    assert 'set(CUTEAFD_PROGRAM_GEOMETRY "kimik3,kimi_k6_dense,kimi_split")' in block
+    assert 'set(CUTEAFD_PROGRAM_GEOMETRY "${CUTEAFD_PROGRAM_GEOMETRY},kimik3,kimi_k6_dense,kimi_split")' in block
 
 
 def test_kimi_native_key_preserves_off_and_keys_on():

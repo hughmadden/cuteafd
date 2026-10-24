@@ -1,11 +1,12 @@
 //! Append-only target steps: mutable proposal rows never overlap the old frontier.
 use super::{
+    scratch::{BufferOwner, CompactKv},
     cache::CacheRank,
     prefix::{Frontier, Placement, Step5Prefix},
 };
 use crate::shared::memory::device::{Allocation, Device, Stream};
 use anyhow::{ensure, Context, Result};
-use cuteafd_engine::prefix::PrefixCache;
+use cuteafd_engine::prefix::{PrefixCache, RefPagePool};
 use cuteafd_ffi::{
     programs::{Program, Programs, Scalar},
     CuteafdDeviceBuffer,
@@ -42,6 +43,7 @@ pub(super) struct Staging<'a> {
     pub stream: Rc<Stream<'a>>,
     raw: Vec<(Allocation<'a>, Allocation<'a>)>,
     sparse: Option<RegionScratch<'a>>,
+    compact: Option<CompactKv<'a>>,
     rows: usize,
     regions: usize,
     bytes: usize,
@@ -52,6 +54,7 @@ pub(super) struct Staging<'a> {
     ring_table: Allocation<'a>,
     page_table: Allocation<'a>,
     table_width: usize,
+    sequences: usize,
 }
 
 pub(super) struct StepInputs<'s, 'a> {
@@ -60,13 +63,16 @@ pub(super) struct StepInputs<'s, 'a> {
     pub requests: CuteafdDeviceBuffer,
     pub rows: usize,
     pub base: usize,
+    pub extent: usize,
     pub heads: usize,
+    pub kv_format: cuteafd_loader::families::qwen4::Qwen4KvCache,
 }
 
 /// Borrowed only inside the transaction callback, after this layer was staged.
 /// The transaction retains page leases, staging metadata and all queued inputs.
 pub(super) struct AttentionRead<'s, 'a> {
     pub inputs: StepInputs<'s, 'a>,
+    pub start: usize,
     pub key: CuteafdDeviceBuffer,
     pub value: CuteafdDeviceBuffer,
     pub summaries: Option<CuteafdDeviceBuffer>,
@@ -75,42 +81,29 @@ pub(super) struct AttentionRead<'s, 'a> {
     pub pages: usize,
 }
 
+// Every sequence can prepend seven committed CSA rows. Keep each prefix
+// disjoint until acceptance, while compressor scratch is reused in stream order.
+fn retained_wave_rows(rows: usize, sequences: usize) -> Result<usize> {
+    ensure!(rows > 0 && sequences > 0, "Step-5 staging requires rows and sequences");
+    rows.checked_add(sequences.min(rows).checked_mul(7)
+        .context("Step-5 retained pending rows overflow")?)
+        .context("Step-5 retained wave rows overflow")
+}
+
 impl<'a> Staging<'a> {
     pub fn bytes(
         layout: &cuteafd_loader::serving_capacity::step5::Step5CacheLayout,
         rank: usize,
     ) -> Result<usize> {
-        let layers = layout
-            .ranks
-            .get(rank)
-            .context("Step-5 staging rank")?
-            .regions
-            .len();
-        let rows = usize::try_from(layout.ring.step)?
-            .checked_add(7)
-            .context("Step-5 staging rows")?;
-        let regions = rows / 8;
-        let metadata = regions
-            .checked_mul(4)
-            .context("Step-5 region metadata overflow")?
-            .max(256);
-        let scratch = regions
-            .checked_mul(256 * 4)
-            .context("Step-5 region scratch overflow")?
-            .max(256);
-        let step = usize::try_from(layout.ring.step)?;
-        let table = usize::try_from(layout.context.div_ceil(64))?
-            .checked_mul(4)
-            .context("Step-5 attention table overflow")?
-            .max(256);
-        rows.checked_mul(256 * 2 * 2)
-            .and_then(|n| n.checked_mul(layers))
-            .and_then(|n| n.checked_add(if layers == 0 { 0 } else { metadata.checked_mul(2)? }))
-            .and_then(|n| n.checked_add(if layers == 0 { 0 } else { scratch }))
-            .and_then(|n| n.checked_add(step.checked_mul(8)?.max(256)))
-            .and_then(|n| n.checked_add(step.checked_mul(4)?.max(256)))
-            .and_then(|n| n.checked_add(table.checked_mul(2)?))
-            .context("Step-5 staging bytes overflow")
+        Self::bytes_for_sequences(layout, rank, 1)
+    }
+
+    pub(super) fn bytes_for_sequences(
+        layout: &cuteafd_loader::serving_capacity::step5::Step5CacheLayout,
+        rank: usize,
+        sequences: usize,
+    ) -> Result<usize> {
+        cuteafd_loader::plan::families::step5::admission::staging_bytes(layout, rank, sequences)
     }
 
     pub fn new(
@@ -119,7 +112,19 @@ impl<'a> Staging<'a> {
         cache: &CacheRank<'a>,
         available: usize,
     ) -> Result<Self> {
-        let bytes = Self::bytes(cache.layout(), cache.rank())?;
+        Self::new_for_sequences(device, programs, cache, available, 1)
+    }
+
+    pub(super) fn new_for_sequences(
+        device: Device<'a>,
+        programs: &'a Programs<'a>,
+        cache: &CacheRank<'a>,
+        available: usize,
+        sequences: usize,
+    ) -> Result<Self> {
+        ensure!(sequences <= usize::try_from(cache.sequences())?,
+            "Step-5 staging sequence capacity exceeds cache admission");
+        let bytes = Self::bytes_for_sequences(cache.layout(), cache.rank(), sequences)?;
         ensure!(
             device.id == cache.stream.device.id
                 && std::ptr::eq(device.library, cache.stream.device.library),
@@ -130,6 +135,7 @@ impl<'a> Staging<'a> {
             "Step-5 staging needs {bytes} bytes, admitted only {available}"
         );
         let rows = usize::try_from(cache.layout().ring.step)?;
+        let retained = retained_wave_rows(rows, sequences)?;
         let regions = (rows + 7) / 8;
         let sparse = if cache.layout().ranks[cache.rank()].regions.is_empty() { None } else {
             let spec = programs.spec("step5_region_compress")?;
@@ -150,23 +156,33 @@ impl<'a> Staging<'a> {
             .iter()
             .map(|_| {
                 Ok((
-                    Allocation::new(device, (rows + 7) * 256 * 2)?,
-                    Allocation::new(device, (rows + 7) * 256 * 2)?,
+                    Allocation::new(device, retained * 256 * 2)?,
+                    Allocation::new(device, retained * 256 * 2)?,
                 ))
             })
             .collect::<Result<Vec<_>>>()?;
         let table_width = usize::try_from(cache.layout().context.div_ceil(64))?;
+        let sizes = cache.layout().target_pack_planes(cache.rank())?;
+        let compact = if sizes[0] == 0 { None } else {
+            let state = &cache.layout().ranks[cache.rank()];
+            let heads = state.sliding.iter().filter(|s| !s.mtp).map(|s| s.query_heads)
+                .chain(state.regions.iter().map(|s| s.query_heads)).collect::<BTreeSet<_>>()
+                .into_iter().collect::<Vec<_>>();
+            Some(CompactKv::new(device, programs, rows, &heads, sizes, None)?)
+        };
         let stream = Rc::new(Stream::new(device)?);
         cache.register_lane(&stream)?;
         let owner = Self {
             stream,
             raw,
             sparse,
+            compact,
             positions: Allocation::new(device, (rows * 8).max(256))?,
             requests: Allocation::new(device, (rows * 4).max(256))?,
             ring_table: Allocation::new(device, (table_width * 4).max(256))?,
-            page_table: Allocation::new(device, (table_width * 4).max(256))?,
+            page_table: Allocation::new(device, (table_width * 4).max(256) * sequences)?,
             table_width,
+            sequences,
             rows,
             regions,
             bytes,
@@ -193,6 +209,8 @@ impl<'a> Staging<'a> {
         device.run(|| device.library.copy_h2d(owner.ring_table.buffer, &table))?;
         Ok(owner)
     }
+    pub(super) fn positions(&self) -> CuteafdDeviceBuffer { self.positions.buffer }
+
     pub fn allocation_bytes(&self) -> usize {
         self.bytes
     }
@@ -211,6 +229,92 @@ impl<'a> Staging<'a> {
                 .and_then(|index| self.raw.get(index))
                 .is_some_and(|(key, logits)| !key.buffer.ptr.is_null() && !logits.buffer.ptr.is_null())
     }
+}
+
+/// One contiguous query slice with its own native state slot and admitted pages.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct SequenceRows<'p> {
+    pub sequence: u64,
+    pub start: usize,
+    pub rows: usize,
+    pub base: usize,
+    pub pages: &'p [u32],
+}
+
+pub(super) fn validate_wave(sequences: &[SequenceRows<'_>], pool: &RefPagePool,
+    slots: usize, capacity: usize, context: usize, pages: usize,
+) -> Result<usize> {
+    ensure!(!sequences.is_empty() && !pool.is_parity() && pool.page_rows() == 64
+        && pool.capacity().checked_add(pool.reserved()) == Some(pages),
+        "Step-5 wave pool geometry differs from native admission");
+    let mut slots_seen = BTreeSet::new();
+    let mut referenced = BTreeSet::new();
+    let mut writable = BTreeSet::new();
+    let mut total = 0usize;
+    for sequence in sequences {
+        ensure!(sequence.sequence < slots as u64 && slots_seen.insert(sequence.sequence),
+            "Step-5 wave duplicate or unadmitted sequence slot");
+        let end = sequence.base.checked_add(sequence.rows).context("Step-5 wave frontier overflow")?;
+        ensure!(sequence.rows > 0 && sequence.start == total && end <= context,
+            "Step-5 wave row slice or context extent");
+        total = total.checked_add(sequence.rows).context("Step-5 wave rows overflow")?;
+        ensure!(total <= capacity && end.div_ceil(64) <= sequence.pages.len()
+            && sequence.pages.len() <= context.div_ceil(64),
+            "Step-5 wave exceeds row or page-table admission");
+        let mut unique = BTreeSet::new();
+        for (logical, &page) in sequence.pages.iter().enumerate() {
+            // RefPagePool::refs indexes directly, so bounds precede every read.
+            ensure!((page as usize) >= pool.reserved() && (page as usize) < pages
+                && unique.insert(page), "Step-5 wave invalid or duplicate physical page");
+            let refs = pool.refs(page);
+            ensure!(refs > 0, "Step-5 wave references an unallocated page");
+            let write = logical >= sequence.base / 64;
+            ensure!(!writable.contains(&page) && (!write || (!referenced.contains(&page) && refs == 1)),
+                "Step-5 wave writable page is shared or aliases another sequence");
+            referenced.insert(page);
+            if write { writable.insert(page); }
+        }
+    }
+    Ok(total)
+}
+
+#[derive(Debug, Clone)]
+struct Sequence {
+    sequence: u64,
+    start: usize,
+    rows: usize,
+    base: usize,
+    raw: usize,
+    pages: Vec<u32>,
+}
+
+fn retain_wave(sequences: &[SequenceRows<'_>]) -> Result<Vec<Sequence>> {
+    let mut raw = 0usize;
+    sequences.iter().map(|sequence| {
+        let kept = Sequence { sequence: sequence.sequence, start: sequence.start,
+            rows: sequence.rows, base: sequence.base, raw, pages: sequence.pages.to_vec() };
+        raw = raw.checked_add(sequence.base % 8).and_then(|n| n.checked_add(sequence.rows))
+            .context("Step-5 retained sequence rows overflow")?;
+        Ok(kept)
+    }).collect()
+}
+
+fn expert_rows(sequences: &[Sequence], kind: cuteafd_transport::ExpertV2SourceKind)
+    -> Result<Vec<cuteafd_transport::ExpertProtocolV2RowDescriptor>> {
+    let mut rows = Vec::new();
+    for sequence in sequences {
+        ensure!(sequence.start == rows.len(), "Step-5 expert row slice differs from native Step");
+        let end = sequence.base.checked_add(sequence.rows).context("Step-5 expert position overflow")?;
+        for position in sequence.base..end {
+            let row = u32::try_from(rows.len())?;
+            rows.push(cuteafd_transport::ExpertProtocolV2RowDescriptor {
+                row_id: u64::from(row), source_kind: kind,
+                source_request_id: sequence.sequence, token_position: u64::try_from(position)?,
+                route_offset: row.checked_mul(8).context("Step-5 expert route offset overflow")?, route_count: 8,
+            });
+        }
+    }
+    Ok(rows)
 }
 
 // Only these scoped operations borrow the shared allocator. A live Step owns
@@ -235,28 +339,122 @@ fn abort<E: CopyEngine>(pool: &RefCell<PrefixCache<E, Frontier>>,
     release_at_publish(pool, family, pages)
 }
 
-/// Exclusively borrows the placement and lane through preparation, publication,
-/// or Drop. Shared prefix allocation owns every proposal page reference.
+/// Shared by the serving backend and prefix adapter. Taking before dropping
+/// avoids holding the RefCell borrow while an abandoned Step drains its owners.
+pub(super) struct Pending<T>(Rc<RefCell<Option<T>>>);
+
+impl<T> Clone for Pending<T> {
+    fn clone(&self) -> Self { Self(self.0.clone()) }
+}
+
+impl<T> Default for Pending<T> {
+    fn default() -> Self { Self(Rc::new(RefCell::new(None))) }
+}
+
+impl<T> Pending<T> {
+    pub(super) fn retire(&self) { drop(self.take()); }
+
+    pub(super) fn take(&self) -> Option<T> { self.0.borrow_mut().take() }
+
+    /// Verification cannot touch a reused slot until stale evidence is drained.
+    pub(super) fn verify<O>(&self, work: impl FnOnce() -> Result<(T, O)>) -> Result<O> {
+        self.retire();
+        let (evidence, output) = work()?;
+        let mut pending = self.0.borrow_mut();
+        ensure!(pending.is_none(), "Step-5 pending evidence already occupied");
+        *pending = Some(evidence);
+        Ok(output)
+    }
+}
+
+/// Exclusively borrows native lane owners through preparation, publication or
+/// Drop. Diagnostic steps also borrow a placement and shared page lease.
 pub(super) struct Step<'e, 'a, E: CopyEngine> {
     ranks: Vec<&'e RefCell<CacheRank<'a>>>,
     staging: Vec<&'e Staging<'a>>,
-    pool: &'e RefCell<PrefixCache<E, Frontier>>,
-    placement: &'e mut Placement,
-    pages: Option<Vec<u32>>,
-    complete: Vec<BTreeSet<usize>>,
-    projected: Vec<BTreeSet<usize>>,
-    attended: Vec<BTreeSet<usize>>,
+    lease: Option<(&'e RefCell<PrefixCache<E, Frontier>>, &'e mut Placement)>,
+    sequences: Vec<Sequence>,
+    live: bool,
+    active: bool,
+    /// Per rank: (layer, unit) pairs staged, projected and attended.
+    complete: Vec<BTreeSet<(usize, usize)>>,
+    projected: Vec<BTreeSet<(usize, usize)>>,
+    attended: Vec<BTreeSet<(usize, usize)>>,
+    /// Prefill units of one sequence's span (PLAN "Prefill contract"); one
+    /// whole-step unit otherwise. `unit` is the selected one.
+    units: Vec<std::ops::Range<usize>>,
+    unit: usize,
+    /// After every unit ran: compose (head, MTP history) sees the whole span.
+    finished_units: bool,
     rows: usize,
     base: usize,
+    extent: usize,
     failed: bool,
-    inputs: Vec<&'e Allocation<'a>>,
+    inputs: Vec<&'e dyn BufferOwner>,
     submission: Rc<Cell<bool>>,
 }
 
 impl<'e, 'a, E: CopyEngine> Step<'e, 'a, E> {
+    pub(super) fn rows(&self) -> usize { self.rows }
+
+    /// Rows of the selected unit (the whole step when it is one unit).
+    pub(super) fn unit_rows(&self) -> std::ops::Range<usize> { self.units[self.unit].clone() }
+
+    /// Cuts this single-sequence step into prefill units. Each unit's hooks
+    /// project, stage and attend only its rows, in unit order per layer.
+    pub(super) fn set_units(&mut self, units: Vec<std::ops::Range<usize>>) -> Result<()> {
+        ensure!(self.sequences.len() == 1 && !units.is_empty() && units[0].start == 0
+            && units.windows(2).all(|pair| pair[0].end == pair[1].start && pair[0].start < pair[0].end)
+            && units.last().is_some_and(|unit| unit.end == self.rows && unit.start < unit.end)
+            && self.complete.iter().all(BTreeSet::is_empty),
+            "Step-5 prefill units must partition one fresh single-sequence step");
+        self.units = units;
+        self.unit = 0;
+        Ok(())
+    }
+
+    pub(super) fn select_unit(&mut self, unit: usize) -> Result<()> {
+        ensure!(unit < self.units.len() && !self.finished_units, "Step-5 prefill unit outside the step");
+        self.unit = unit;
+        Ok(())
+    }
+
+    /// Every unit ran: later compositions (head, histories) cover the span.
+    pub(super) fn finish_units(&mut self) { self.finished_units = true; }
+
+    fn unit_mode(&self) -> bool { self.units.len() > 1 && !self.finished_units }
+
+    /// Positions and request ids of the selected unit's rows.
+    fn unit_inputs<'s>(&self, stage: &'s Staging<'a>, rows: usize, heads: usize,
+        kv_format: cuteafd_loader::families::qwen4::Qwen4KvCache) -> Result<StepInputs<'s, 'a>> {
+        let window = self.unit_rows();
+        Ok(StepInputs {
+            stream: &stage.stream,
+            positions: view(stage.positions.buffer, window.start * 8, stage.positions.buffer.bytes - window.start * 8)?,
+            requests: view(stage.requests.buffer, window.start * 4, stage.requests.buffer.bytes - window.start * 4)?,
+            rows,
+            base: self.base + window.start,
+            extent: self.base + window.end,
+            heads,
+            kv_format,
+        })
+    }
+
+    /// Row descriptors of the selected unit (the whole step when it is one):
+    /// rows are unit-relative, positions absolute.
+    pub(super) fn expert_rows(&self, kind: cuteafd_transport::ExpertV2SourceKind)
+        -> Result<Vec<cuteafd_transport::ExpertProtocolV2RowDescriptor>> {
+        if self.units.len() == 1 { return expert_rows(&self.sequences, kind); }
+        let window = self.unit_rows();
+        let unit = Sequence { start: 0, rows: window.len(), base: self.sequences[0].base + window.start,
+            ..self.sequences[0].clone() };
+        expert_rows(std::slice::from_ref(&unit), kind)
+    }
+
     pub fn validate_binding(&self, ranks: &[&RefCell<CacheRank<'a>>],
         stages: &[&Staging<'a>], rows: usize) -> Result<()> {
-        ensure!(!self.failed && self.rows == rows && ranks.len() == self.ranks.len()
+        validate_active_rows(self.rows, rows)?;
+        ensure!(!self.failed && ranks.len() == self.ranks.len()
             && stages.len() == self.staging.len()
             && self.ranks.iter().zip(ranks).all(|(actual, expected)| std::ptr::eq(*actual, *expected))
             && self.staging.iter().zip(stages).all(|(actual, expected)| std::ptr::eq(*actual, *expected)),
@@ -272,20 +470,6 @@ impl<'e, 'a, E: CopyEngine> Step<'e, 'a, E> {
         let _mode = SubmissionMode::enter(self.submission.clone())?;
         let result = work(self);
         if result.is_err() { self.failed = true; }
-        result
-    }
-
-    pub(super) fn in_submissions<T>(
-        _scope: &crate::shared::experts::rtx::pair::SubmissionScope<'_>,
-        steps: &mut [&mut Self],
-        work: impl FnOnce(&mut [&mut Self]) -> Result<T>,
-    ) -> Result<T> {
-        let _modes = steps.iter().map(|step| SubmissionMode::enter(step.submission.clone()))
-            .collect::<Result<Vec<_>>>()?;
-        let result = work(steps);
-        if result.is_err() {
-            for step in steps { step.failed = true; }
-        }
         result
     }
 
@@ -323,58 +507,88 @@ impl<'e, 'a, E: CopyEngine> Step<'e, 'a, E> {
             );
         }
         let pages = fork_at_begin(pool, &family, &placement.pages, base, end)?;
-        for (cache, stage) in ranks.iter().zip(&staging) {
-            cache.borrow().busy[placement.sequence as usize].set(true);
+        let admitted = (|| {
+            let cache = ranks[0].borrow();
+            let shared = pool.try_borrow().context("Step-5 prefix pool already borrowed")?;
+            validate_wave(&[SequenceRows { sequence: placement.sequence, start: 0, rows, base, pages: &pages }],
+                shared.pool(), usize::try_from(cache.sequences())?, staging[0].rows,
+                usize::try_from(cache.layout().context)?, usize::try_from(cache.page_count())?)
+        })();
+        if let Err(error) = admitted {
+            abort(pool, &family, &pages)?;
+            return Err(error);
+        }
+        let sequences = retain_wave(&[SequenceRows { sequence: placement.sequence,
+            start: 0, rows, base, pages: &pages }])?;
+        Self::prepare(ranks, staging, sequences, Some((pool, placement)))
+    }
+
+    /// The scheduler owns these page references. Retain only descriptors, never
+    /// its placements or allocator borrow, across verification and acceptance.
+    pub(super) fn begin_wave(
+        ranks: Vec<&'e RefCell<CacheRank<'a>>>, staging: Vec<&'e Staging<'a>>,
+        sequences: &[SequenceRows<'_>], pool: &RefPagePool,
+    ) -> Result<Self> {
+        Step5Prefix::new(ranks.clone())?;
+        ensure!(ranks.len() == staging.len(), "Step-5 wave rank inventory");
+        let cache = ranks[0].borrow();
+        validate_wave(sequences, pool, usize::try_from(cache.sequences())?, staging[0].rows,
+            usize::try_from(cache.layout().context)?, usize::try_from(cache.page_count())?)?;
+        drop(cache);
+        Self::prepare(ranks, staging, retain_wave(sequences)?, None)
+    }
+
+    fn prepare(ranks: Vec<&'e RefCell<CacheRank<'a>>>, staging: Vec<&'e Staging<'a>>,
+        sequences: Vec<Sequence>, lease: Option<(&'e RefCell<PrefixCache<E, Frontier>>, &'e mut Placement)>,
+    ) -> Result<Self> {
+        let rows = sequences.iter().map(|sequence| sequence.rows).sum();
+        let extent = sequences.iter().map(|sequence| sequence.base + sequence.rows).max()
+            .context("Step-5 empty wave")?;
+        let complete = vec![BTreeSet::new(); ranks.len()];
+        let mut step = Self { ranks, staging, lease, base: sequences[0].base, extent,
+            sequences, live: true, active: false, projected: complete.clone(), attended: complete.clone(),
+            complete, units: vec![0..rows], unit: 0, finished_units: false, rows, failed: false, inputs: Vec::new(),
+            submission: Rc::new(Cell::new(false)) };
+        for (owner, stage) in step.ranks.iter().zip(&step.staging) {
+            let cache = owner.borrow();
+            stage.validate_cache(&cache)?;
+            ensure!(!cache.poisoned.get() && !stage.busy.get() && rows <= stage.rows
+                && step.sequences.len() <= stage.sequences && extent as u64 <= cache.layout().context,
+                "Step-5 wave outside admitted lane capacity");
+            for sequence in &step.sequences {
+                ensure!(sequence.sequence < cache.sequences()
+                    && !cache.busy[sequence.sequence as usize].get(),
+                    "Step-5 wave sequence unavailable");
+            }
+        }
+        for (owner, stage) in step.ranks.iter().zip(&step.staging) {
+            for sequence in &step.sequences { owner.borrow().busy[sequence.sequence as usize].set(true); }
             stage.busy.set(true);
         }
-        let complete = vec![BTreeSet::new(); ranks.len()];
-        let step = Self {
-            ranks,
-            staging,
-            pool,
-            placement,
-            pages: Some(pages),
-            projected: complete.clone(),
-            attended: complete.clone(),
-            complete,
-            rows,
-            base,
-            failed: false,
-            inputs: Vec::new(),
-            submission: Rc::new(Cell::new(false)),
-        };
-        let positions: Vec<u8> = (base..end).flat_map(|p| (p as i64).to_le_bytes()).collect();
-        let table: Vec<u8> = step
-            .pages()
-            .iter()
-            .flat_map(|p| (*p as i32).to_le_bytes())
-            .collect();
+        step.active = true;
+        let positions: Vec<u8> = step.sequences.iter().flat_map(|sequence|
+            (sequence.base..sequence.base + sequence.rows).flat_map(|p| (p as i64).to_le_bytes())).collect();
         for stage in &step.staging {
-            ensure!(
-                step.pages().len() <= stage.table_width,
-                "Step-5 proposal table capacity"
-            );
             stage.stream.device.run(|| {
-                // SAFETY: the step owns metadata until its Drop drain; ordered uploads retain sources.
-                unsafe {
-                    stage.stream.device.library.copy_h2d_ordered(
-                        stage.positions.buffer,
-                        &positions,
-                        stage.stream.raw,
-                    )?;
-                    stage.stream.device.library.copy_h2d_ordered(
-                        stage.page_table.buffer,
-                        &table,
-                        stage.stream.raw,
-                    )
-                }
+                // SAFETY: owned metadata and lane allocations survive the Drop drain.
+                unsafe { stage.stream.device.library.copy_h2d_ordered(
+                    stage.positions.buffer, &positions, stage.stream.raw) }
             })?;
+            for (index, sequence) in step.sequences.iter().enumerate() {
+                let table: Vec<u8> = sequence.pages.iter().flat_map(|p| (*p as i32).to_le_bytes()).collect();
+                let bytes = (stage.table_width * 4).max(256);
+                let target = view(stage.page_table.buffer, index * bytes, bytes)?;
+                stage.stream.device.run(|| {
+                    // SAFETY: sequence-local tables are disjoint; ordered uploads retain sources.
+                    unsafe { stage.stream.device.library.copy_h2d_ordered(target, &table, stage.stream.raw) }
+                })?;
+            }
         }
         Ok(step)
     }
 
     pub fn pages(&self) -> &[u32] {
-        self.pages.as_deref().expect("unpublished Step-5 step")
+        &self.sequences[0].pages
     }
 
     /// Every producer/consumer uses its private lane stream. Failure poisons this
@@ -402,7 +616,7 @@ impl<'e, 'a, E: CopyEngine> Step<'e, 'a, E> {
             "Step-5 projection layer"
         );
         ensure!(
-            self.projected[rank].insert(layer),
+            self.projected[rank].insert((layer, self.unit)),
             "Step-5 duplicate projection"
         );
         self.failed = true;
@@ -410,17 +624,22 @@ impl<'e, 'a, E: CopyEngine> Step<'e, 'a, E> {
             .stream
             .cancellation_guard("Step-5 projection callback");
         guard.complete = self.submission.get();
-        let result = work(
-            input_owner,
+        let inputs = if self.unit_mode() {
+            self.unit_inputs(stage, self.unit_rows().len(), cache.layout().query_heads(rank, layer)?,
+                cache.layout().kv_format)?
+        } else {
             StepInputs {
                 stream: &stage.stream,
                 positions: stage.positions.buffer,
                 requests: stage.requests.buffer,
                 rows: self.rows,
                 base: self.base,
+                extent: self.extent,
                 heads: cache.layout().query_heads(rank, layer)?,
-            },
-        );
+                kv_format: cache.layout().kv_format,
+            }
+        };
+        let result = work(input_owner, inputs);
         if result.is_ok() {
             self.failed = false;
             guard.complete = true;
@@ -441,14 +660,21 @@ impl<'e, 'a, E: CopyEngine> Step<'e, 'a, E> {
         let stage = self.staging[rank];
         let mut guard = stage.stream.cancellation_guard("Step-5 composition callback");
         guard.complete = self.submission.get();
-        let result = work(owner, StepInputs {
-            stream: &stage.stream,
-            positions: stage.positions.buffer,
-            requests: stage.requests.buffer,
-            rows: self.rows,
-            base: self.base,
-            heads: 64 / self.ranks.len(),
-        });
+        let inputs = if self.unit_mode() {
+            self.unit_inputs(stage, self.unit_rows().len(), 64 / self.ranks.len(), cache.layout().kv_format)?
+        } else {
+            StepInputs {
+                stream: &stage.stream,
+                positions: stage.positions.buffer,
+                requests: stage.requests.buffer,
+                rows: self.rows,
+                base: self.base,
+                extent: self.extent,
+                heads: 64 / self.ranks.len(),
+                kv_format: cache.layout().kv_format,
+            }
+        };
+        let result = work(owner, inputs);
         if result.is_ok() {
             self.failed = false;
             guard.complete = true;
@@ -456,80 +682,61 @@ impl<'e, 'a, E: CopyEngine> Step<'e, 'a, E> {
         result
     }
 
-    pub fn attend<O, T>(
+    pub fn attend<O>(
         &mut self,
         rank: usize,
         layer: usize,
         input_owner: &'e O,
-        work: impl FnOnce(&'e O, AttentionRead<'_, 'a>) -> Result<T>,
-    ) -> Result<T> {
+        mut work: impl FnMut(&'e O, AttentionRead<'_, 'a>) -> Result<()>,
+    ) -> Result<()> {
         ensure!(
             !self.failed
                 && self
                     .complete
                     .get(rank)
-                    .is_some_and(|layers| layers.contains(&layer)),
+                    .is_some_and(|layers| layers.contains(&(layer, self.unit))),
             "Step-5 attention requires a successfully staged layer"
         );
         let cache = self.ranks[rank].borrow();
         let state = &cache.layout().ranks[rank];
         let stage = self.staging[rank];
-        let (key, value, summaries, table, pages) =
-            if let Some(ring) = state.sliding.iter().find(|r| r.layer == layer && !r.mtp) {
-                (
-                    cache.request_component(ring.key, self.placement.sequence)?,
-                    cache.request_component(ring.value, self.placement.sequence)?,
-                    None,
-                    stage.ring_table.buffer,
-                    usize::try_from(cache.layout().ring.rows / 64)?,
-                )
-            } else {
-                let region = state
-                    .regions
-                    .iter()
-                    .find(|r| r.layer == layer)
-                    .context("Step-5 attention layer")?;
-                let (key, value) = cache.csa_planes(layer)?;
-                let summary = region
-                    .summaries
-                    .map(|s| cache.request_component(s, self.placement.sequence))
-                    .transpose()?;
-                (
-                    key,
-                    value,
-                    summary,
-                    stage.page_table.buffer,
-                    usize::try_from(cache.page_count())?,
-                )
-            };
         self.failed = true;
         let mut guard = stage.stream.cancellation_guard("Step-5 attention callback");
         guard.complete = self.submission.get();
-        let result = work(
-            input_owner,
-            AttentionRead {
-                inputs: StepInputs {
-                    stream: &stage.stream,
-                    positions: stage.positions.buffer,
-                    requests: stage.requests.buffer,
-                    rows: self.rows,
-                    base: self.base,
+        for (index, sequence) in self.sequences.iter().enumerate() {
+            let (key, value, summaries, table, pages) =
+                if let Some(ring) = state.sliding.iter().find(|r| r.layer == layer && !r.mtp) {
+                    (cache.request_component(ring.key, sequence.sequence)?,
+                        cache.request_component(ring.value, sequence.sequence)?, None,
+                        stage.ring_table.buffer, usize::try_from(cache.layout().ring.rows / 64)?)
+                } else {
+                    let region = state.regions.iter().find(|r| r.layer == layer)
+                        .context("Step-5 attention layer")?;
+                    let (key, value) = cache.csa_planes(layer)?;
+                    let summary = region.summaries.map(|s| cache.request_component(s, sequence.sequence)).transpose()?;
+                    let bytes = (stage.table_width * 4).max(256);
+                    (key, value, summary, view(stage.page_table.buffer, index * bytes, bytes)?,
+                        usize::try_from(cache.page_count())?)
+                };
+            // A unit's rows start at row zero of its hook-local attention planes.
+            let (inputs, start) = if self.unit_mode() {
+                (self.unit_inputs(stage, self.unit_rows().len(), cache.layout().query_heads(rank, layer)?,
+                    cache.layout().kv_format)?, 0)
+            } else {
+                (StepInputs {
+                    stream: &stage.stream, positions: stage.positions.buffer, requests: stage.requests.buffer,
+                    rows: sequence.rows, base: sequence.base, extent: sequence.base + sequence.rows,
                     heads: cache.layout().query_heads(rank, layer)?,
-                },
-                key,
-                value,
-                summaries,
-                table,
-                table_width: stage.table_width,
-                pages,
-            },
-        );
-        if result.is_ok() {
-            self.attended[rank].insert(layer);
-            self.failed = false;
-            guard.complete = true;
+                    kv_format: cache.layout().kv_format,
+                }, sequence.start)
+            };
+            work(input_owner, AttentionRead { inputs, start, key, value, summaries, table,
+                table_width: stage.table_width, pages })?;
         }
-        result
+        self.attended[rank].insert((layer, self.unit));
+        self.failed = false;
+        guard.complete = true;
+        Ok(())
     }
 
     /// BF16 projections are ordered on the lane stream. Borrowed allocations
@@ -538,13 +745,14 @@ impl<'e, 'a, E: CopyEngine> Step<'e, 'a, E> {
         &mut self,
         rank: usize,
         layer: usize,
-        key: &'e Allocation<'a>,
-        value: &'e Allocation<'a>,
-        index: Option<(&'e Allocation<'a>, &'e Allocation<'a>)>,
+        key: &'e dyn BufferOwner,
+        value: &'e dyn BufferOwner,
+        index: Option<(&'e dyn BufferOwner, &'e dyn BufferOwner)>,
     ) -> Result<()> {
         ensure!(
-            rank < self.ranks.len() && !self.complete[rank].contains(&layer),
-            "Step-5 duplicate or invalid staged layer"
+            rank < self.ranks.len() && !self.complete[rank].contains(&(layer, self.unit))
+                && (self.unit == 0 || self.complete[rank].contains(&(layer, self.unit - 1))),
+            "Step-5 duplicate, out-of-order or invalid staged layer"
         );
         ensure!(!self.failed, "Step-5 failed step cannot be reused");
         self.failed = true;
@@ -552,117 +760,152 @@ impl<'e, 'a, E: CopyEngine> Step<'e, 'a, E> {
         if let Some((key, z)) = index {
             self.inputs.extend([key, z]);
         }
-        let (key, value) = (key.buffer, value.buffer);
-        let index = index.map(|(key, z)| (key.buffer, z.buffer));
+        let (key, value) = (key.buffer(), value.buffer());
+        let index = index.map(|(key, z)| (key.buffer(), z.buffer()));
         let cache = self.ranks[rank].borrow();
         let state = &cache.layout().ranks[rank];
-        let sequence = self.placement.sequence;
         let stage = self.staging[rank];
         let mut guard = stage.stream.cancellation_guard("Step-5 staged layer");
         guard.complete = self.submission.get();
-        if let Some(ring) = state.sliding.iter().find(|r| r.layer == layer && !r.mtp) {
-            ensure!(index.is_none(), "SWA must not carry indexer state");
-            let row = ring.key.bytes as usize / cache.layout().ring.rows as usize;
-            let targets = [
-                cache.request_component(ring.key, sequence)?,
-                cache.request_component(ring.value, sequence)?,
-            ];
-            let sources = [key, value];
-            for source in sources {
-                self.validate_source(&cache, source, self.rows * row)?;
-            }
-            for run in cache
-                .layout()
-                .ring
-                .proposal(self.base as u64, self.rows as u64)
-                .context("Step-5 ring proposal")?
-            {
-                for (target, source) in targets.into_iter().zip(sources) {
-                    copy(
-                        &stage.stream,
-                        view(target, run.slot as usize * row, run.rows as usize * row)?,
-                        view(source, run.offset as usize * row, run.rows as usize * row)?,
-                    )?;
+        let heads = cache.layout().query_heads(rank, layer)?;
+        // A unit stages only its rows; its projections start at row zero.
+        let window = self.unit_rows();
+        let unit_rows = window.len();
+        let source_bytes = unit_rows * (heads / 16) * 192 * 2;
+        for source in [key, value] { self.validate_source(&cache, source, source_bytes)?; }
+        // Projections remain BF16; only the selected compact outputs use the
+        // retained cache's byte stride. The pair is reused in lane-stream order.
+        let [key, value] = if let Some(compact) = &stage.compact {
+            compact.enqueue(&stage.stream, [key, value], unit_rows, heads)?
+        } else { [key, value] };
+        let units = self.unit_mode();
+        for whole in &self.sequences {
+            let sequence = &if units {
+                Sequence { start: 0, rows: unit_rows, base: whole.base + window.start, ..whole.clone() }
+            } else { whole.clone() };
+            // The span's raw indexer rows: the committed pending tail, then
+            // every unit's rows at its offset (identical to one whole step).
+            let (span_pending, span_offset) = (whole.base % 8, if units { window.start } else { 0 });
+            let kv_row = cache.layout().ranks[rank].sliding.iter().find(|r| r.layer == layer && !r.mtp)
+                .map(|ring| ring.key.bytes as usize / cache.layout().ring.rows as usize)
+                .or_else(|| state.regions.iter().find(|r| r.layer == layer).map(|region| region.page_bytes as usize / 64))
+                .context("Step-5 staged layer geometry")?;
+            let key = view(key, sequence.start * kv_row, sequence.rows * kv_row)?;
+            let value = view(value, sequence.start * kv_row, sequence.rows * kv_row)?;
+            let index = index.map(|(key, z)| -> Result<_> { Ok((view(key, sequence.start * 512, sequence.rows * 512)?,
+                view(z, sequence.start * 512, sequence.rows * 512)?)) }).transpose()?;
+            if let Some(ring) = state.sliding.iter().find(|r| r.layer == layer && !r.mtp) {
+                ensure!(index.is_none(), "SWA must not carry indexer state");
+                let row = ring.key.bytes as usize / cache.layout().ring.rows as usize;
+                let targets = [
+                    cache.request_component(ring.key, sequence.sequence)?,
+                    cache.request_component(ring.value, sequence.sequence)?,
+                ];
+                let sources = [key, value];
+                for source in sources {
+                    self.validate_source(&cache, source, sequence.rows * row)?;
                 }
-            }
-        } else {
-            let at = state
-                .regions
-                .iter()
-                .position(|r| r.layer == layer)
-                .context("Step-5 target layer")?;
-            let region = &state.regions[at];
-            let stage = self.staging[rank];
-            let row = usize::try_from(region.page_bytes / 64)?;
-            for source in [key, value] {
-                self.validate_source(&cache, source, self.rows * row)?;
-            }
-            let (ik, iz) = index.context("CSA requires indexer K/Z")?;
-            for source in [ik, iz] {
-                self.validate_source(&cache, source, self.rows * 512)?;
-            }
-            let pending = self.base % 8;
-            let old = cache.pending(layer, sequence, false)?;
-            let raw = [stage.raw[at].0.buffer, stage.raw[at].1.buffer];
-            for ((target, previous), source) in raw.into_iter().zip([old.0, old.1]).zip([ik, iz]) {
-                if pending > 0 {
-                    copy(
-                        &stage.stream,
-                        view(target, 0, pending * 512)?,
-                        view(previous, 0, pending * 512)?,
-                    )?;
-                }
-                copy(
-                    &stage.stream,
-                    view(target, pending * 512, self.rows * 512)?,
-                    view(source, 0, self.rows * 512)?,
-                )?;
-            }
-            let targets = cache.csa_planes(layer)?;
-            let mut position = self.base;
-            while position < self.base + self.rows {
-                let page = self.pages()[position / 64] as usize;
-                let count = (64 - position % 64).min(self.base + self.rows - position);
-                for (target, source) in [targets.0, targets.1].into_iter().zip([key, value]) {
-                    copy(
-                        &stage.stream,
-                        view(target, (page * 64 + position % 64) * row, count * row)?,
-                        view(source, (position - self.base) * row, count * row)?,
-                    )?;
-                }
-                position += count;
-            }
-            let completed = (pending + self.rows) / 8;
-            if let Some(summary) = region.summaries.filter(|_| completed > 0) {
-                ensure!(completed <= stage.regions, "Step-5 staged summary capacity");
-                let target = cache.request_component(summary, sequence)?;
-                let output = view(target, self.base / 8 * 256, completed * 256)?;
-                let sparse = stage.sparse.as_ref().context("Step-5 CSA compressor owner")?;
-                stage.stream.device.run(|| {
-                    // SAFETY: admitted raw staging, immutable metadata, summary suffix and
-                    // scratch belong to this lane; no old visible summary is overwritten.
-                    unsafe {
-                        sparse.compress.launch(
-                            &[
-                                raw[0].ptr,
-                                raw[1].ptr,
-                                sparse.starts.buffer.ptr,
-                                sparse.counts.buffer.ptr,
-                                output.ptr,
-                                sparse.unrounded.buffer.ptr,
-                            ],
-                            &[
-                                Scalar::I32(completed as i32),
-                                Scalar::I64((pending + self.rows) as i64),
-                            ],
-                            stage.stream.raw,
-                        )
+                for run in cache
+                    .layout()
+                    .ring
+                    .proposal(sequence.base as u64, sequence.rows as u64)
+                    .context("Step-5 ring proposal")?
+                {
+                    for (target, source) in targets.into_iter().zip(sources) {
+                        copy(
+                            &stage.stream,
+                            view(target, run.slot as usize * row, run.rows as usize * row)?,
+                            view(source, run.offset as usize * row, run.rows as usize * row)?,
+                        )?;
                     }
-                })?;
+                }
+            } else {
+                let at = state
+                    .regions
+                    .iter()
+                    .position(|r| r.layer == layer)
+                    .context("Step-5 target layer")?;
+                let region = &state.regions[at];
+                let stage = self.staging[rank];
+                let row = usize::try_from(region.page_bytes / 64)?;
+                for source in [key, value] {
+                    self.validate_source(&cache, source, sequence.rows * row)?;
+                }
+                let (ik, iz) = index.context("CSA requires indexer K/Z")?;
+                for source in [ik, iz] {
+                    self.validate_source(&cache, source, sequence.rows * 512)?;
+                }
+                let plan = csa_unit_plan(span_pending, span_offset, sequence.rows);
+                let old = cache.pending(layer, sequence.sequence, false)?;
+                let span_raw = |plane: CuteafdDeviceBuffer| view(plane, sequence.raw * 512,
+                    (span_pending + span_offset + sequence.rows) * 512);
+                let raw = [span_raw(stage.raw[at].0.buffer)?, span_raw(stage.raw[at].1.buffer)?];
+                for ((target, previous), source) in raw.into_iter().zip([old.0, old.1]).zip([ik, iz]) {
+                    // The committed pending tail precedes the span's first unit only.
+                    if plan.carry > 0 {
+                        copy(
+                            &stage.stream,
+                            view(target, 0, plan.carry * 512)?,
+                            view(previous, 0, plan.carry * 512)?,
+                        )?;
+                    }
+                    copy(
+                        &stage.stream,
+                        view(target, plan.first_row * 512, sequence.rows * 512)?,
+                        view(source, 0, sequence.rows * 512)?,
+                    )?;
+                }
+                let targets = cache.csa_planes(layer)?;
+                let mut position = sequence.base;
+                while position < sequence.base + sequence.rows {
+                    let page = sequence.pages[position / 64] as usize;
+                    let count = (64 - position % 64).min(sequence.base + sequence.rows - position);
+                    for (target, source) in [targets.0, targets.1].into_iter().zip([key, value]) {
+                        copy(
+                            &stage.stream,
+                            view(target, (page * 64 + position % 64) * row, count * row)?,
+                            view(source, (position - sequence.base) * row, count * row)?,
+                        )?;
+                    }
+                    position += count;
+                }
+                // Each region reads only its own eight raw rows, so compressing
+                // the regions this unit completes, at their raw offset, writes
+                // the same bytes as one whole-span compression.
+                let completed = plan.regions.len();
+                if let Some(summary) = region.summaries.filter(|_| completed > 0) {
+                    ensure!(plan.regions.end <= stage.regions, "Step-5 staged summary capacity");
+                    let target = cache.request_component(summary, sequence.sequence)?;
+                    let output = view(target, (whole.base / 8 + plan.regions.start) * 256, completed * 256)?;
+                    let raw = [view(raw[0], plan.regions.start * 8 * 512, (plan.raw_end - plan.regions.start * 8) * 512)?,
+                        view(raw[1], plan.regions.start * 8 * 512, (plan.raw_end - plan.regions.start * 8) * 512)?];
+                    let sparse = stage.sparse.as_ref().context("Step-5 CSA compressor owner")?;
+                    stage.stream.device.run(|| {
+                        // SAFETY: admitted raw staging, immutable metadata, summary suffix and
+                        // scratch belong to this lane; no old visible summary is overwritten.
+                        unsafe {
+                            sparse.compress.launch(
+                                &[
+                                    raw[0].ptr,
+                                    raw[1].ptr,
+                                    sparse.starts.buffer.ptr,
+                                    sparse.counts.buffer.ptr,
+                                    output.ptr,
+                                    sparse.unrounded.buffer.ptr,
+                                ],
+                                &[
+                                    Scalar::I32(completed as i32),
+                                    Scalar::I64((plan.raw_end - plan.regions.start * 8) as i64),
+                                ],
+                                stage.stream.raw,
+                            )
+                        }
+                    })?;
+                }
             }
         }
         guard.complete = true;
-        self.complete[rank].insert(layer);
+        self.complete[rank].insert((layer, self.unit));
         self.failed = false;
         Ok(())
     }
@@ -682,81 +925,124 @@ impl<'e, 'a, E: CopyEngine> Step<'e, 'a, E> {
         Ok(())
     }
 
-    pub fn publish(mut self, accepted: usize) -> Result<()> {
-        ensure!(
-            !self.failed && accepted <= self.rows,
-            "Step-5 failed step or invalid accepted count"
-        );
-        if accepted == 0 {
-            return Ok(());
-        }
-        let end = self.base + accepted;
+    fn validate_complete(&self) -> Result<()> {
+        ensure!(!self.failed, "Step-5 failed step cannot publish");
         for (rank, owner) in self.ranks.iter().enumerate() {
             let cache = owner.borrow();
             let state = &cache.layout().ranks[rank];
-            ensure!(
-                self.projected[rank].is_subset(&self.attended[rank]),
-                "Step-5 cannot publish projected layers without attention"
-            );
-            ensure!(
-                self.complete[rank].len()
-                    == state.sliding.iter().filter(|s| !s.mtp).count() + state.regions.len(),
-                "Step-5 cannot publish an incomplete target step"
-            );
+            ensure!(self.projected[rank].is_subset(&self.attended[rank]),
+                "Step-5 cannot publish projected layers without attention");
+            ensure!(self.complete[rank].len()
+                == (state.sliding.iter().filter(|s| !s.mtp).count() + state.regions.len()) * self.units.len(),
+                "Step-5 cannot publish an incomplete target step");
         }
+        Ok(())
+    }
+
+    fn prepare_publication(&self, accepted: &[usize]) -> Result<()> {
+        self.validate_complete()?;
+        ensure!(accepted.len() == self.sequences.len()
+            && accepted.iter().zip(&self.sequences).all(|(&rows, sequence)| rows <= sequence.rows),
+            "Step-5 accepted wave extent");
         for (rank, owner) in self.ranks.iter().enumerate() {
             let cache = owner.borrow();
             let stage = self.staging[rank];
-            let mut guard = stage
-                .stream
-                .cancellation_guard("Step-5 prepare publication");
+            let mut guard = stage.stream.cancellation_guard("Step-5 prepare publication");
             guard.complete = self.submission.get();
-            let sequence = self.placement.sequence;
-            let raw_offset = (self.base % 8 + accepted) / 8 * 8;
-            let tail = end % 8;
-            for (at, region) in cache.layout().ranks[rank].regions.iter().enumerate() {
-                let targets = cache.pending(region.layer, sequence, true)?;
-                for (target, source) in [targets.0, targets.1].into_iter().zip([
-                    self.staging[rank].raw[at].0.buffer,
-                    self.staging[rank].raw[at].1.buffer,
-                ]) {
-                    zero(&stage.stream, target)?;
-                    if tail > 0 {
-                        copy(
-                            &stage.stream,
-                            view(target, 0, tail * 512)?,
-                            view(source, raw_offset * 512, tail * 512)?,
-                        )?;
+            for (sequence, &accepted) in self.sequences.iter().zip(accepted) {
+                if accepted == 0 { continue; }
+                let end = sequence.base + accepted;
+                let raw_offset = sequence.raw + (sequence.base % 8 + accepted) / 8 * 8;
+                let tail = end % 8;
+                for (at, region) in cache.layout().ranks[rank].regions.iter().enumerate() {
+                    let targets = cache.pending(region.layer, sequence.sequence, true)?;
+                    for (target, source) in [targets.0, targets.1].into_iter().zip([
+                        stage.raw[at].0.buffer, stage.raw[at].1.buffer,
+                    ]) {
+                        zero(&stage.stream, target)?;
+                        if tail > 0 {
+                            copy(&stage.stream, view(target, 0, tail * 512)?,
+                                view(source, raw_offset * 512, tail * 512)?)?;
+                        }
                     }
                 }
+                let target = cache.length(sequence.sequence, true)?;
+                stage.stream.device.run(|| {
+                    // SAFETY: private length bank and retained source survive lane drainage.
+                    unsafe { stage.stream.device.library.copy_h2d_ordered(
+                        target, &(end as u64).to_le_bytes(), stage.stream.raw) }
+                })?;
             }
-            let target = cache.length(sequence, true)?;
-            stage.stream.device.run(|| {
-                // SAFETY: private length bank on this stream; source is retained by the library.
-                unsafe {
-                    stage.stream.device.library.copy_h2d_ordered(
-                        target,
-                        &(end as u64).to_le_bytes(),
-                        stage.stream.raw,
-                    )
-                }
-            })?;
             guard.complete = true;
         }
-        for stage in &self.staging {
-            stage.stream.drain()?;
-        }
+        super::execution::collect_lane_results(self.staging.iter().map(|stage| stage.stream.drain()))
+    }
+
+    pub fn publish(mut self, accepted: usize) -> Result<()> {
+        ensure!(self.lease.is_some() && accepted <= self.rows,
+            "Step-5 diagnostic publication requires an owned page lease");
+        if accepted == 0 { return Ok(()); }
+        self.prepare_publication(&[accepted])?;
         let family = Step5Prefix::new(self.ranks.clone())?;
-        // Release can fail only before the selector changes. Both leases are
-        // retained until all device work is known complete.
-        release_at_publish(self.pool, &family, &self.placement.pages)?;
-        for owner in &self.ranks {
-            owner.borrow().publish_bank(self.placement.sequence);
-        }
-        self.placement.pages = self.pages.take().expect("unpublished Step-5 pages");
-        self.placement.committed = end;
+        let (pool, placement) = self.lease.as_mut().context("Step-5 page lease absent")?;
+        // No active bank changes until all writes drain and the old lease releases.
+        release_at_publish(pool, &family, &placement.pages)?;
+        for owner in &self.ranks { owner.borrow().publish_bank(placement.sequence); }
+        placement.pages = std::mem::take(&mut self.sequences[0].pages);
+        placement.committed = self.base + accepted;
+        self.live = false;
         Ok(())
     }
+
+    /// Scheduler-owned pages are never released or replaced here. All native
+    /// banks publish together after every rank has prepared and drained.
+    pub(super) fn publish_wave(mut self, placements: &mut [(&mut Placement, usize)]) -> Result<()> {
+        ensure!(self.lease.is_none() && placements.len() == self.sequences.len(),
+            "Step-5 scheduler publication inventory");
+        for ((placement, accepted), sequence) in placements.iter().zip(&self.sequences) {
+            ensure!(placement.sequence == sequence.sequence && placement.pages == sequence.pages
+                && *accepted <= sequence.rows
+                && (placement.committed == sequence.base || placement.committed == sequence.base + *accepted),
+                "Step-5 scheduler publication frontier differs from retained evidence");
+        }
+        let accepted: Vec<_> = placements.iter().map(|(_, rows)| *rows).collect();
+        self.prepare_publication(&accepted)?;
+        for ((placement, accepted), sequence) in placements.iter_mut().zip(&self.sequences) {
+            if *accepted > 0 {
+                for owner in &self.ranks { owner.borrow().publish_bank(sequence.sequence); }
+            }
+            placement.committed = sequence.base + *accepted;
+        }
+        self.live = false;
+        Ok(())
+    }
+}
+
+/// Raw indexer staging for one prefill unit of a span based at `pending`
+/// (`base % 8`) committed rows past a region boundary. The span's raw rows
+/// are the committed tail, then every unit's rows at `pending + offset`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct CsaUnitPlan {
+    /// Committed pending rows copied ahead of this unit (first unit only).
+    pub carry: usize,
+    /// Raw row of this unit's first row.
+    pub first_row: usize,
+    /// End of the raw rows written so far (exclusive).
+    pub raw_end: usize,
+    /// Regions completed by this unit, in span order.
+    pub regions: std::ops::Range<usize>,
+}
+
+pub(super) fn csa_unit_plan(pending: usize, offset: usize, rows: usize) -> CsaUnitPlan {
+    let first_row = pending + offset;
+    let raw_end = first_row + rows;
+    CsaUnitPlan { carry: if offset == 0 { pending } else { 0 }, first_row, raw_end,
+        regions: first_row / 8..raw_end / 8 }
+}
+
+pub(super) fn validate_active_rows(rows: usize, capacity: usize) -> Result<()> {
+    ensure!(rows > 0 && rows <= capacity, "Step-5 active rows outside admitted capacity");
+    Ok(())
 }
 
 struct SubmissionMode(Rc<Cell<bool>>);
@@ -773,24 +1059,22 @@ impl Drop for SubmissionMode {
 
 impl<E: CopyEngine> Drop for Step<'_, '_, E> {
     fn drop(&mut self) {
-        if self.pages.is_some() {
-            for stage in &self.staging {
-                stage.stream.drain_or_abort("Step-5 abandoned proposal");
+        if self.live && self.active {
+            for stage in &self.staging { stage.stream.drain_or_abort("Step-5 abandoned proposal"); }
+        }
+        if self.active {
+            for (owner, stage) in self.ranks.iter().zip(&self.staging) {
+                for sequence in &self.sequences { owner.borrow().busy[sequence.sequence as usize].set(false); }
+                stage.busy.set(false);
             }
         }
-        for (owner, stage) in self.ranks.iter().zip(&self.staging) {
-            owner.borrow().busy[self.placement.sequence as usize].set(false);
-            stage.busy.set(false);
-        }
-        let Some(pages) = self.pages.take() else {
-            return;
-        };
-        if let Ok(family) = Step5Prefix::new(self.ranks.clone()) {
-            if let Err(error) = abort(self.pool, &family, &pages) {
-                for owner in &self.ranks {
-                    owner.borrow().poisoned.set(true);
+        if !self.live { return; }
+        if let Some((pool, _)) = &self.lease {
+            if let Ok(family) = Step5Prefix::new(self.ranks.clone()) {
+                if let Err(error) = abort(pool, &family, &self.sequences[0].pages) {
+                    for owner in &self.ranks { owner.borrow().poisoned.set(true); }
+                    tracing::error!(%error, "Step-5 aborted page lease quarantined");
                 }
-                tracing::error!(%error, "Step-5 aborted page lease quarantined");
             }
         }
     }
@@ -829,8 +1113,272 @@ fn zero(stream: &Stream<'_>, target: CuteafdDeviceBuffer) -> Result<()> {
 #[cfg(test)]
 pub(super) mod tests {
     use super::*;
+
+    /// Units stage the span's raw indexer rows exactly as one whole step: the
+    /// committed tail (rows % 8 before the span) carries only into the first
+    /// unit, every unit lands at pending + offset, and per-unit compression of
+    /// the regions each unit completes equals one whole-span compression.
+    #[test]
+    fn csa_unit_tail_carry_and_regions_match_the_whole_span() {
+        // Each raw row is its position's id; a region "summary" is its eight ids.
+        let compress = |raw: &[i64], regions: std::ops::Range<usize>, base: usize, limit: usize|
+            regions.map(|region| { let start = region * 8 - base;
+                assert!(start + 8 <= limit); raw[start..start + 8].to_vec() }).collect::<Vec<_>>();
+        for pending in 0..8 {
+            for span in [8usize, 9, 15, 16, 64, 71, 512, 1024, 2048] {
+                for units in 1..=4usize {
+                    let width = span.div_ceil(units).max(1);
+                    let cuts = (0..span).step_by(width).map(|first| first..span.min(first + width)).collect::<Vec<_>>();
+                    // Whole span: committed tail ids are negative, new rows 0..span.
+                    let mut whole = (0..pending as i64).map(|i| -1 - i).collect::<Vec<_>>();
+                    whole.extend(0..span as i64);
+                    let whole_regions = compress(&whole, 0..(pending + span) / 8, 0, whole.len());
+                    let mut raw = vec![i64::MIN; pending + span];
+                    let mut summaries = Vec::new();
+                    for cut in &cuts {
+                        let plan = csa_unit_plan(pending, cut.start, cut.len());
+                        assert_eq!(plan.carry, if cut.start == 0 { pending } else { 0 });
+                        for i in 0..plan.carry { raw[i] = -1 - i as i64; }
+                        for i in 0..cut.len() { raw[plan.first_row + i] = (cut.start + i) as i64; }
+                        // Compression reads only rows written by this or earlier units.
+                        let base = plan.regions.start * 8;
+                        assert!(raw[base..plan.raw_end].iter().all(|&id| id != i64::MIN));
+                        summaries.extend(compress(&raw[base..], plan.regions.clone(), base, plan.raw_end - base));
+                    }
+                    assert_eq!(raw, whole, "pending={pending} span={span} units={units}");
+                    assert_eq!(summaries, whole_regions, "pending={pending} span={span} units={units}");
+                }
+            }
+        }
+        // Unit ends leaving 0, 1, 7 and 8 trailing rows past a region boundary.
+        for (pending, unit, tail) in [(0usize, 2048usize, 0usize), (1, 2048, 1), (7, 2048, 7), (0, 2040, 0)] {
+            assert_eq!(csa_unit_plan(pending, 0, unit).raw_end % 8, tail);
+            // Tail 8 is a full region: it completes in this unit, nothing carries.
+            assert_eq!(csa_unit_plan(pending, 0, unit + 8).regions.end - csa_unit_plan(pending, 0, unit).regions.end, 1);
+        }
+    }
     use cuteafd_engine::prefix::{BoxError, PrefixConfig, PrefixFamily};
     use cuteafd_hostcache::copy::StubCopyEngine;
+
+    #[test]
+    fn failed_selection_retires_pending_before_same_slot_verification() -> Result<()> {
+        #[derive(Default)]
+        struct DeviceWork {
+            queued: Vec<u32>,
+            writes: Vec<u32>,
+            events: Vec<&'static str>,
+            busy: bool,
+            released: bool,
+        }
+        struct Evidence(Rc<RefCell<DeviceWork>>);
+        impl Drop for Evidence {
+            fn drop(&mut self) {
+                let mut work = self.0.borrow_mut();
+                // A Step may synchronize stale evidence, but never enqueue a
+                // write or release scheduler-owned page references on Drop.
+                assert!(work.queued.is_empty() || !work.released);
+                let queued = std::mem::take(&mut work.queued);
+                work.writes.extend(queued);
+                work.busy = false;
+                work.events.push("retire");
+            }
+        }
+        let pending = Pending::default();
+        let device = Rc::new(RefCell::new(DeviceWork::default()));
+        let mut pool = RefPagePool::new(1, 64);
+        let first = pool.alloc(1)?;
+        pending.verify(|| {
+            let mut work = device.borrow_mut();
+            work.busy = true;
+            work.queued.push(first[0]);
+            work.events.push("verify");
+            Ok((Evidence(device.clone()), ()))
+        })?;
+        // Selection fails before synchronization. The scheduler's failure path
+        // drains the family, then releases pages and the native sequence slot.
+        {
+            let mut work = device.borrow_mut();
+            work.events.push("selection failed");
+            let queued = std::mem::take(&mut work.queued);
+            work.writes.extend(queued);
+            work.events.push("family drain");
+        }
+        pool.release(&first);
+        device.borrow_mut().released = true;
+        device.borrow_mut().events.push("scheduler release");
+        let reused = pool.alloc(1)?;
+        assert_eq!(first, reused);
+        pending.verify(|| {
+            let mut work = device.borrow_mut();
+            assert!(!work.busy);
+            assert_eq!(work.writes, first);
+            assert_eq!(work.events.last(), Some(&"retire"));
+            work.released = false;
+            work.busy = true;
+            work.queued.push(reused[0]);
+            work.events.push("verify reused");
+            Ok((Evidence(device.clone()), ()))
+        })?;
+        assert_eq!(device.borrow().events, ["verify", "selection failed", "family drain",
+            "scheduler release", "retire", "verify reused"]);
+        assert_eq!(device.borrow().writes, first);
+        pending.retire();
+        assert_eq!(device.borrow().writes, [first[0], reused[0]]);
+        pool.release(&reused);
+        assert_eq!(pool.free(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn expert_descriptors_follow_owned_sequence_positions_and_explicit_kind() -> Result<()> {
+        use cuteafd_transport::ExpertV2SourceKind;
+        let kept = retain_wave(&[
+            SequenceRows { sequence: 7, start: 0, rows: 2, base: 65, pages: &[4, 5] },
+            SequenceRows { sequence: 2, start: 2, rows: 1, base: 91, pages: &[4, 6] },
+        ])?;
+        for kind in [ExpertV2SourceKind::Prefill, ExpertV2SourceKind::Decode, ExpertV2SourceKind::MtpVerify] {
+            let rows = expert_rows(&kept, kind)?;
+            assert_eq!(rows.iter().map(|row| (row.source_request_id, row.token_position)).collect::<Vec<_>>(),
+                [(7, 65), (7, 66), (2, 91)]);
+            for (index, row) in rows.iter().enumerate() {
+                assert_eq!(row.row_id, index as u64);
+                assert_eq!(row.source_kind, kind);
+                assert_eq!((row.route_offset, row.route_count), (index as u32 * 8, 8));
+            }
+        }
+        let mut invalid = kept.clone();
+        invalid[1].start = 1;
+        assert!(expert_rows(&invalid, ExpertV2SourceKind::Decode).is_err());
+        invalid[1].start = 2;
+        invalid[1].base = usize::MAX;
+        assert!(expert_rows(&invalid, ExpertV2SourceKind::Decode).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn retained_wave_owns_descriptors_and_disjoint_pending_prefixes() {
+        let mut first = vec![4, 5];
+        let second = vec![4, 6];
+        let kept = retain_wave(&[
+            SequenceRows { sequence: 7, start: 0, rows: 17, base: 65, pages: &first },
+            SequenceRows { sequence: 2, start: 17, rows: 3, base: 71, pages: &second },
+        ]).unwrap();
+        first.fill(99);
+        assert_eq!(kept[0].pages, [4, 5]);
+        assert_eq!(kept[1].pages, [4, 6]);
+        assert_eq!((kept[0].sequence, kept[0].start, kept[0].raw), (7, 0, 0));
+        assert_eq!((kept[1].sequence, kept[1].start, kept[1].raw), (2, 17, 18));
+        assert_eq!(kept[1].raw + kept[1].base % 8 + kept[1].rows, 28);
+        for sequences in 1..=16 {
+            let pages = [0];
+            let rows: Vec<_> = (0..sequences).map(|sequence| SequenceRows {
+                sequence: sequence as u64, start: sequence, rows: 1, base: 7, pages: &pages,
+            }).collect();
+            let kept = retain_wave(&rows).unwrap();
+            for (index, sequence) in kept.iter().enumerate() { assert_eq!(sequence.raw, index * 8); }
+            assert_eq!(kept.last().unwrap().raw + 8, retained_wave_rows(sequences, sequences).unwrap());
+        }
+        assert!(retain_wave(&[SequenceRows { sequence: 0, start: 0, rows: usize::MAX,
+            base: 7, pages: &[] }]).is_err());
+    }
+
+    #[test]
+    fn wave_admission_shares_only_immutable_pages_and_preserves_row_slices() {
+        let mut pool = RefPagePool::new(16, 64);
+        let source = pool.alloc(2).unwrap();
+        let first = pool.fork(&source, 65, 3).unwrap();
+        let second = pool.fork(&source, 65, 3).unwrap();
+        let sequences = [
+            SequenceRows { sequence: 3, start: 0, rows: 1, base: 65, pages: &first.pages },
+            SequenceRows { sequence: 1, start: 1, rows: 17, base: 65, pages: &second.pages },
+        ];
+        assert_eq!(validate_wave(&sequences, &pool, 4, 18, 192, 16).unwrap(), 18);
+        assert_eq!(first.pages[0], second.pages[0]);
+        assert_ne!(first.pages[1], second.pages[1]);
+        assert!(first.copy.is_some() && second.copy.is_some());
+        let mut invalid = sequences;
+        invalid[1].pages = &first.pages;
+        assert!(validate_wave(&invalid, &pool, 4, 18, 192, 16).is_err());
+        let readonly = SequenceRows { sequence: 0, start: 0, rows: 1, base: 128, pages: &first.pages };
+        let writer = SequenceRows { sequence: 1, start: 1, rows: 1, base: 65, pages: &first.pages };
+        assert!(validate_wave(&[readonly, writer], &pool, 4, 18, 192, 16).is_err());
+        assert!(validate_wave(&[SequenceRows { start: 0, ..writer }, SequenceRows { start: 1, ..readonly }],
+            &pool, 4, 18, 192, 16).is_err());
+        let reversed = [SequenceRows { start: 0, ..sequences[1] }, SequenceRows { start: 17, ..sequences[0] }];
+        assert_eq!(validate_wave(&reversed, &pool, 4, 18, 192, 16).unwrap(), 18);
+        pool.release(&source);
+        pool.release(&first.pages);
+        pool.release(&second.pages);
+        assert_eq!(pool.free(), 16);
+    }
+
+    #[test]
+    fn wave_admission_rejects_invalid_inventory_before_pool_indexing() {
+        let mut pool = RefPagePool::new(8, 64);
+        let pages = pool.alloc(3).unwrap();
+        let valid = SequenceRows { sequence: 0, start: 0, rows: 2, base: 63, pages: &pages };
+        assert_eq!(validate_wave(&[valid], &pool, 2, 16, 192, 8).unwrap(), 2);
+        for invalid in [
+            SequenceRows { sequence: 2, ..valid },
+            SequenceRows { start: 1, ..valid },
+            SequenceRows { rows: 0, ..valid },
+            SequenceRows { rows: 17, ..valid },
+            SequenceRows { base: usize::MAX, ..valid },
+            SequenceRows { base: 191, ..valid },
+            SequenceRows { pages: &pages[..1], ..valid },
+            SequenceRows { pages: &[0, 0], ..valid },
+            SequenceRows { pages: &[0, 7], ..valid },
+            SequenceRows { pages: &[0, 8], ..valid },
+            SequenceRows { pages: &[0, u32::MAX], ..valid },
+        ] {
+            assert!(validate_wave(&[invalid], &pool, 2, 16, 192, 8).is_err(), "{invalid:?}");
+        }
+        assert!(validate_wave(&[], &pool, 2, 16, 192, 8).is_err());
+        assert!(validate_wave(&[valid], &pool, 2, 16, 192, 9).is_err());
+        assert!(validate_wave(&[valid, SequenceRows { start: 2, ..valid }], &pool, 2, 16, 192, 8).is_err());
+        pool.share(&pages[1..2]);
+        assert!(validate_wave(&[valid], &pool, 2, 16, 192, 8).is_err());
+        pool.release(&pages[1..2]);
+        let mut reserved = RefPagePool::with_reserved(8, 64, 1);
+        let allocation = reserved.alloc(2).unwrap();
+        let reserved_valid = SequenceRows { pages: &allocation, ..valid };
+        validate_wave(&[reserved_valid], &reserved, 2, 16, 192, 8).unwrap();
+        assert!(validate_wave(&[SequenceRows { pages: &[0, 1], ..valid }], &reserved, 2, 16, 192, 8).is_err());
+        let wrong_rows = RefPagePool::new(8, 32);
+        assert!(validate_wave(&[valid], &wrong_rows, 2, 16, 192, 8).is_err());
+        let parity = RefPagePool::parity(8, 64, 0);
+        assert!(validate_wave(&[valid], &parity, 2, 16, 192, 8).is_err());
+    }
+
+    #[test]
+    fn staging_wave_admission_retains_each_pending_prefix_and_page_table() {
+        for rows in [1usize, 16, 64, 513, 4096] {
+            let layout = super::super::cache::tests::layout_for(8192, 2, 0, rows as u64);
+            let single = Staging::bytes(&layout, 0).unwrap();
+            let table = (8192usize.div_ceil(64) * 4).max(256);
+            for sequences in [1usize, 2, 4, 16, 64] {
+                let retained = rows + 7 * sequences.min(rows);
+                assert_eq!(retained_wave_rows(rows, sequences).unwrap(), retained);
+                let extra_raw = (retained - (rows + 7)) * 512 * 2 * 23;
+                assert_eq!(Staging::bytes_for_sequences(&layout, 0, sequences).unwrap(),
+                    single + extra_raw + table * (sequences - 1));
+            }
+        }
+        for (rows, sequences) in [(0, 1), (1, 0), (usize::MAX, 1), (usize::MAX, usize::MAX)] {
+            assert!(retained_wave_rows(rows, sequences).is_err());
+        }
+    }
+
+    #[test]
+    fn active_rows_do_not_require_a_full_admitted_bucket() {
+        for capacity in [1, 16, 64, 640, 4096] {
+            for rows in 1..=capacity { validate_active_rows(rows, capacity).unwrap(); }
+            for rows in [0, capacity + 1, usize::MAX] {
+                assert!(validate_active_rows(rows, capacity).is_err());
+            }
+        }
+        assert!(validate_active_rows(1, 0).is_err());
+    }
 
     #[test]
     fn submission_mode_resets_on_success_error_and_unwind_without_nested_reset() {
@@ -882,8 +1430,8 @@ pub(super) mod tests {
     pub(in crate::families::step5) fn stage_other_layers<'e, 'a>(
         step: &mut Step<'e, 'a, StubCopyEngine>,
         selected: usize,
-        key: &'e Allocation<'a>,
-        value: &'e Allocation<'a>,
+        key: &'e dyn BufferOwner,
+        value: &'e dyn BufferOwner,
         ik: &'e Allocation<'a>,
         iz: &'e Allocation<'a>,
     ) -> Result<()> {
@@ -892,6 +1440,25 @@ pub(super) mod tests {
                 step.stage(0, layer, key, value, (layer % 4 == 3).then_some((ik, iz)))?;
             }
         }
+        Ok(())
+    }
+
+    #[test]
+    fn compact_staging_is_one_pair_per_lane_not_per_layer_or_sequence() -> Result<()> {
+        use cuteafd_loader::families::qwen4::Qwen4KvCache;
+        for ranks in [1, 2] { for rows in [1, 64, 513, 4096] {
+            let bf16 = super::super::cache::tests::layout_with_format(8192, ranks, 3, rows, Qwen4KvCache::Bf16);
+            let fp8 = super::super::cache::tests::layout_with_format(8192, ranks, 3, rows, Qwen4KvCache::Fp8);
+            for rank in 0..ranks {
+                let expected = rows as usize * Qwen4KvCache::Fp8.plane_record_bytes(4 / ranks, 192);
+                assert_eq!(bf16.target_pack_planes(rank)?, [0; 2]);
+                assert_eq!(fp8.target_pack_planes(rank)?, [expected; 2]);
+                for sequences in [1, 4, 16] {
+                    assert_eq!(Staging::bytes_for_sequences(&fp8, rank, sequences)?
+                        - Staging::bytes_for_sequences(&bf16, rank, sequences)?, 2 * expected);
+                }
+            }
+        }}
         Ok(())
     }
 
@@ -910,6 +1477,99 @@ pub(super) mod tests {
             assert_eq!(Staging::bytes(&layout, 1).unwrap(), expected);
             assert!(Staging::bytes(&layout, 2).is_err());
         }
+    }
+
+    #[test]
+    #[ignore = "requires CUTEAFD_NATIVE_LIB, CUTEAFD_PROGRAM_MANIFEST and CUDA"]
+    fn native_scheduler_wave_matches_owned_single_sequence_publication() -> Result<()> {
+        // SAFETY: the explicitly selected artifact implements the CUDA ABI.
+        let library = unsafe { cuteafd_ffi::NativeLibrary::load(std::env::var("CUTEAFD_NATIVE_LIB")?)? };
+        let device = crate::shared::memory::device::cache_test_device(&library)?;
+        let programs = library.programs()?.with_manifest(std::path::Path::new(
+            &std::env::var("CUTEAFD_PROGRAM_MANIFEST")?))?;
+        let layout = super::super::cache::tests::layout_for(256, 1, 0, 64);
+        let batched = RefCell::new(CacheRank::new(device, layout.clone(), 0, 2, 2, 16, usize::MAX)?);
+        let serial = RefCell::new(CacheRank::new(device, layout, 0, 2, 2, 16, usize::MAX)?);
+        let wave_stage = Staging::new_for_sequences(device, &programs, &batched.borrow(), usize::MAX, 2)?;
+        let serial_stage = Staging::new(device, &programs, &serial.borrow(), usize::MAX)?;
+        let wave_family = Step5Prefix::new(vec![&batched])?;
+        let serial_family = Step5Prefix::new(vec![&serial])?;
+        let config = PrefixConfig { entries: 0, mark_slots: 2, keep_logits: false, min_tokens: 1 };
+        let mut wave_pool = PrefixCache::<StubCopyEngine, Frontier>::new(wave_family.layout(), config.clone(), None)?;
+        let serial_pool = RefCell::new(PrefixCache::<StubCopyEngine, Frontier>::new(serial_family.layout(), config, None)?);
+        let mut wave_placements = Vec::new();
+        let mut serial_placements = Vec::new();
+        for sequence in 0..2 {
+            wave_placements.push(wave_pool.admit_cold(&wave_family, 1, 64,
+                |pages| Placement { pages, sequence, committed: 0 })?.placement);
+            serial_placements.push(serial_pool.borrow_mut().admit_cold(&serial_family, 1, 64,
+                |pages| Placement { pages, sequence, committed: 0 })?.placement);
+        }
+        for (pass, (counts, accepted)) in [([7usize, 3], [7usize, 3]), ([17, 5], [9, 4])].into_iter().enumerate() {
+            let total: usize = counts.iter().sum();
+            let make = |stride: usize, start: usize, rows: usize, salt: usize| -> Result<Allocation<'_>> {
+                let allocation = Allocation::new(device, (rows * stride).max(256))?;
+                let bytes: Vec<u8> = (start..start + rows).flat_map(|row|
+                    std::iter::repeat_n(((row + pass * 13 + salt) % 31 + 1) as u8, stride)).collect();
+                device.run(|| library.copy_h2d(allocation.buffer, &bytes))?;
+                Ok(allocation)
+            };
+            let key = make(4 * 192 * 2, 0, total, 0)?;
+            let value = make(4 * 192 * 2, 0, total, 3)?;
+            let ik = make(512, 0, total, 7)?;
+            let iz = make(512, 0, total, 11)?;
+            let descriptors = [
+                SequenceRows { sequence: 0, start: 0, rows: counts[0], base: wave_placements[0].committed,
+                    pages: &wave_placements[0].pages },
+                SequenceRows { sequence: 1, start: counts[0], rows: counts[1], base: wave_placements[1].committed,
+                    pages: &wave_placements[1].pages },
+            ];
+            let mut wave = Step::<StubCopyEngine>::begin_wave(vec![&batched], vec![&wave_stage], &descriptors, wave_pool.pool())?;
+            // No scheduler placement or allocator borrow remains in the proposal.
+            let owned_pages: Vec<_> = wave_placements.iter().map(|placement| placement.pages.clone()).collect();
+            for layer in 0..92 {
+                wave.stage(0, layer, &key, &value, (layer % 4 == 3).then_some((&ik, &iz)))?;
+            }
+            for placement in &mut wave_placements { placement.committed += accepted[placement.sequence as usize]; }
+            let mut publications: Vec<_> = wave_placements.iter_mut().zip(accepted).collect();
+            wave.publish_wave(&mut publications)?;
+            for (placement, pages) in wave_placements.iter().zip(owned_pages) { assert_eq!(placement.pages, pages); }
+            let mut start = 0;
+            for sequence in 0..2 {
+                let key = make(4 * 192 * 2, start, counts[sequence], 0)?;
+                let value = make(4 * 192 * 2, start, counts[sequence], 3)?;
+                let ik = make(512, start, counts[sequence], 7)?;
+                let iz = make(512, start, counts[sequence], 11)?;
+                let mut step = Step::begin(vec![&serial], vec![&serial_stage], &serial_pool,
+                    &mut serial_placements[sequence], counts[sequence])?;
+                for layer in 0..92 {
+                    step.stage(0, layer, &key, &value, (layer % 4 == 3).then_some((&ik, &iz)))?;
+                }
+                step.publish(accepted[sequence])?;
+                let frontier = wave_placements[sequence].committed;
+                assert_eq!(frontier, serial_placements[sequence].committed);
+                assert_eq!(mark(&batched, sequence as u64, sequence as u64, frontier)?,
+                    mark(&serial, sequence as u64, sequence as u64, frontier)?);
+                for layer in (3..92).step_by(4) {
+                    let wave_planes = batched.borrow().csa_planes(layer)?;
+                    let serial_planes = serial.borrow().csa_planes(layer)?;
+                    for (wave_plane, serial_plane) in [wave_planes.0, wave_planes.1].into_iter()
+                        .zip([serial_planes.0, serial_planes.1]) {
+                        let bytes = frontier * 4 * 192 * 2;
+                        assert_eq!(read(device, view(wave_plane,
+                            wave_placements[sequence].pages[0] as usize * 64 * 4 * 192 * 2, bytes)?)?,
+                            read(device, view(serial_plane,
+                            serial_placements[sequence].pages[0] as usize * 64 * 4 * 192 * 2, bytes)?)?);
+                    }
+                }
+                start += counts[sequence];
+            }
+        }
+        for placement in wave_placements { wave_pool.release(&wave_family, &placement.pages)?; }
+        for placement in serial_placements { serial_pool.borrow_mut().release(&serial_family, &placement.pages)?; }
+        assert_eq!(wave_pool.pool().free(), 16);
+        assert_eq!(serial_pool.borrow().pool().free(), 16);
+        Ok(())
     }
 
     #[test]
@@ -1020,7 +1680,7 @@ pub(super) mod tests {
             // Seed arbitrary old visible bytes, including pending and summary state.
             for owner in &owners {
                 let cache = owner.borrow();
-                for span in layout.snapshot_spans(cache.rank(), base as u64)? {
+                for span in layout.snapshot_spans(cache.rank(), base as u64, &[])? {
                     let state = &layout.ranks[cache.rank()];
                     let component = std::iter::once(state.length)
                         .chain(state.sliding.iter().flat_map(|r| [r.key, r.value]))

@@ -106,9 +106,8 @@ for bf16_family in "${bf16_family_list[@]}"; do
   [[ ";$expert_families;" == *";$bf16_family:fp8;"* ]] ||
     { echo "CUTEAFD_RELEASE_FP8_MOE_BF16_FAMILIES=$bf16_family needs $bf16_family:fp8 in CUTEAFD_RELEASE_EXPERT_FAMILIES" >&2; exit 2; }
 done
-# v7 ships both EXL3 decoder families by default: the uniform K=2 raw
-# publication family (2,3) and the staged K3.25 family (3,4).
-exl3_bit_families="${CUTEAFD_RELEASE_EXL3_BIT_FAMILIES:-2,3;3,4}"
+# Package each supported checkpoint decoder family, including K4/K5.
+exl3_bit_families="${CUTEAFD_RELEASE_EXL3_BIT_FAMILIES:-2,3;3,4;4,5}"
 [[ "$cuda_arch" =~ ^[0-9]+$ ]] || {
   echo "CUDA_ARCH must be numeric" >&2
   exit 2
@@ -231,6 +230,7 @@ cmake \
   -DCMAKE_BUILD_TYPE=Release \
   -DCUTEAFD_ENABLE_CUDA=ON \
   -DCUTEAFD_ENABLE_VISION_ATTENTION_AOT="${CUTEAFD_RELEASE_VISION_ATTENTION_AOT:-ON}" \
+  -DCUTEAFD_ENABLE_STEER_ROWS_AOT="${CUTEAFD_RELEASE_STEER_ROWS_AOT:-ON}" \
   -DCUTEAFD_ENABLE_AUDIO_AOT="$audio_aot" \
   -DCUTEAFD_ENABLE_V41_EXPERT_AOT=ON \
   -DCUTEAFD_SPARK_TP_ROLES="$spark_tp_roles" \
@@ -321,6 +321,7 @@ for release_family in "${release_family_list[@]}"; do
   case "$release_family" in
     *:fp8) release_package="fp8-${release_family%%:*}" ;;
     step5:bf16) release_package="fp8-step5-bf16-weights" ;;
+    step5:nvfp4) release_package="fp8-step5-nvfp4a4" ;;
     # ModelOpt NVFP4 calibrated W4A4 share the fp8_moe programs.
     *:nvfp4|*:nvfp4a4) release_package="fp8-${release_family%%:*}-${release_family#*:}" ;;
     *) continue ;;

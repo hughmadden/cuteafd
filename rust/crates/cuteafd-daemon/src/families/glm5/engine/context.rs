@@ -157,6 +157,24 @@ impl<'a> GlmEngine<'a> {
     /// `[start, start + rows)` of `pages` (the sequence's page ids).
     pub(super) fn context_prefill_tables(&self, rank: usize, lane: usize, gather: usize, start: usize, rows: usize,
         pages: &[u32]) -> Result<ContextUnit> {
+        self.context_prefill_tables_on(rank, lane, gather, start, rows, pages, false)
+    }
+
+    /// [`Self::context_prefill_tables`]; `ordered` queues the uploads on `rank`'s stream
+    /// (a prefill unit reusing a workspace slot mid-call: earlier units' queued
+    /// kernels keep reading their own lists until the stream reaches these copies).
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn context_prefill_tables_on(&self, rank: usize, lane: usize, gather: usize, start: usize, rows: usize,
+        pages: &[u32], ordered: bool) -> Result<ContextUnit> {
+        let upload = |buffer: CuteafdDeviceBuffer, bytes: &[u8]| -> Result<()> {
+            if ordered {
+                // SAFETY: a live buffer of this rank; the helper keeps the pinned source
+                // until the stream passes the copy and orders it after earlier work.
+                self.on(rank, || unsafe { self.library.copy_h2d_ordered(buffer, bytes, self.stream_of(rank)) })
+            } else {
+                self.on(rank, || self.library.copy_h2d(buffer, bytes))
+            }
+        };
         let split = self.context.as_ref().context("context split")?;
         let own = &split.ranks[rank];
         ensure!((start + rows).div_ceil(PAGE_ROWS) <= pages.len(), "prefill past the sequence's pages");
@@ -169,14 +187,15 @@ impl<'a> GlmEngine<'a> {
             let local = local_pages(&pages[..history], owner)?;
             *shard = local.len();
             if !local.is_empty() {
-                self.on(rank, || self.library.copy_h2d(view(&own.gather, owner * half * 4, local.len() * 4)?,
-                    bytes_of(&local)))?;
+                // The owner's whole list region: ordered uploads size their staging
+                // once per destination and never regrow it mid-call.
+                upload(view(&own.gather, owner * half * 4, half * 4)?, bytes_of(&local))?;
             }
         }
         let limit = context_commit_pages(self.prefill_rows as u64) as usize;
         let (table, commits) = commit_blocks(rank, start, rows, pages, limit)?;
         let commit = own.commit.get(lane).context("commit lane")?;
-        self.on(rank, || self.library.copy_h2d(commit.buffer, bytes_of(&table)))?;
+        upload(commit.buffer, bytes_of(&table))?;
         Ok(ContextUnit { history, shards, commits })
     }
 
@@ -252,7 +271,7 @@ impl<'a> GlmEngine<'a> {
         let split = self.context.as_ref().context("context split")?;
         context_decode(&split.exchange, rank, index, 0, t,
             &mut Bindings { engine: self, w, layer, tables, rank, index, rows, t })?;
-        self.o_proj(rank, w, layer, "m64", rows)
+        self.o_proj(rank, w, index, layer, "m64", rows)
     }
 
     /// Prefill attention of layer `index` on `rank` under context (module docs): gather the
@@ -318,7 +337,7 @@ fn rank_tables(tables: &StepTables, rank: usize, pages: usize) -> Result<StepTab
     let mut out = StepTables { decode: tables.decode, positions: tables.positions.clone(), slots: Vec::new(),
         page_table: Vec::new(), table_width: tables.table_width, table_stride: tables.table_stride,
         cache_lengths: tables.cache_lengths.clone(), lengths: tables.lengths.clone(),
-        exchange_rows: tables.exchange_rows };
+        exchange_rows: tables.exchange_rows, variants: tables.variants.clone() };
     if !tables.decode {
         out.slots = tables.positions.clone();
         out.page_table = (0..tables.table_width as i32).collect();
@@ -401,7 +420,7 @@ mod tests {
         let width = 16;
         let mut tables = StepTables { decode: true, positions: vec![299, 300], slots: Vec::new(),
             page_table: Vec::new(), table_width: width, table_stride: width, cache_lengths: vec![300, 301],
-            lengths: vec![300, 301], exchange_rows: 2 };
+            lengths: vec![300, 301], exchange_rows: 2, variants: vec![1, 0] };
         for &p in &tables.positions.clone() {
             let page = seq[p as usize / PAGE_ROWS] as i64;
             tables.slots.push(page * PAGE_ROWS as i64 + p % PAGE_ROWS as i64);
@@ -440,9 +459,10 @@ mod tests {
         let seq = ids(9, 1);
         let tables = StepTables { decode: false, positions: (100..550).collect(), slots: vec![0; 450],
             page_table: seq.iter().map(|&p| p as i32).collect(), table_width: 9, table_stride: 0,
-            cache_lengths: vec![0; 450], lengths: vec![0; 450], exchange_rows: 450 };
+            cache_lengths: vec![0; 450], lengths: vec![0; 450], exchange_rows: 450, variants: vec![2; 450] };
         let r = rank_tables(&tables, 1, 64).unwrap();
         assert_eq!(r.slots, tables.positions);
+        assert_eq!(r.variants, tables.variants, "rank tables keep each row's variant");
         assert_eq!(r.page_table, (0..9).collect::<Vec<_>>());
         let limit = context_commit_pages(512) as usize;
         let mut covered = vec![0u8; 550];

@@ -123,7 +123,7 @@ model_config() { # model_config glmf|pro ARM FILE
   local model="$1" arm="$2" file="$3" count port image intake=auto
   case "$model" in
     glmf) count=4; port=19495
-      printf '%s\n' MODEL_ID=wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K3.25-v1 ADDR=0.0.0.0:8600 > "$file" ;;
+      printf '%s\n' MODEL_ID=wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K3.25-Core-FP8 ADDR=0.0.0.0:8600 > "$file" ;;
     pro) count="${PRO_RANKS:-6}"; port=19441
       printf '%s\n' MODEL_ID=wrldsuksgo2mars/DeepSeek-V4-Pro-0813-EXL3-K2-calibrated-v1 ADDR=0.0.0.0:8600 > "$file" ;;
   esac

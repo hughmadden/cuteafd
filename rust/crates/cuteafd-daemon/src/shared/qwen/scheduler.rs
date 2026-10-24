@@ -13,6 +13,13 @@ pub(crate) enum Drafts {
     Neural { depth: usize, fixed: bool },
 }
 
+/// Ungraphed rows can replay prompt tokens or advance a live decode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UngraphedKind {
+    Scoring,
+    Decode,
+}
+
 pub(crate) struct Geometry {
     pub family: &'static str,
     pub vocab_size: usize,
@@ -44,6 +51,7 @@ pub(crate) trait Placement: Clone {
 pub(crate) trait DraftState: Default {
     fn pending_rows(&self) -> usize;
     fn close(&mut self, token: u32);
+    fn restored(&mut self, _frontier: usize) {}
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -67,6 +75,17 @@ pub(crate) struct Verified<'p, P, D, H> {
     pub first_row: usize,
     pub kept: Option<(usize, u32)>,
     pub finished: bool,
+    pub neural: bool,
+}
+
+impl<P, D, H> Verified<'_, P, D, H> {
+    pub(crate) fn neural_kept(&self) -> Option<(usize, u32)> {
+        self.kept.filter(|_| self.neural)
+    }
+}
+
+fn effective_neural(configured: bool, probe: &probe::ProbeRef) -> bool {
+    configured && !probe::no_speculation(probe)
 }
 
 /// The scheduler owns admission, batching, token selection and publication.
@@ -92,8 +111,15 @@ pub(crate) trait Backend<'a> {
     fn coordinates(&self, tokens: &[u32], job: &NativeRequest, media: &RequestMedia) -> Result<Self::Coordinates>;
     fn placement(&self, units: Vec<u32>, slot: i32) -> Self::Placement;
     fn bind_request(&self, placement: &mut Self::Placement, coordinates: Self::Coordinates,
-        media: RequestMedia, tokens: &[u32], resume: usize);
+        media: RequestMedia, tokens: &[u32], resume: usize) -> Result<()>;
     fn history(&self, placement: &Self::Placement) -> Self::History;
+    fn restore_draft(&self, _placement: &Self::Placement, frontier: usize, _tokens: &[u32],
+        draft: &mut Self::Draft) -> Result<()> {
+        draft.restored(frontier);
+        Ok(())
+    }
+    fn needs_snapshot_filter(&self, _neural: bool) -> bool { false }
+    fn snapshot_compatible(&self, _saved: &Self::Meta, _frontier: usize, _neural: bool) -> bool { true }
     fn prefetch(&self, tokens: &[u32], next: &[u32]);
     fn require_live(&self) -> Result<()>;
     fn log_table_stats(&self, phase: &str);
@@ -105,7 +131,7 @@ pub(crate) trait Backend<'a> {
         pool: &cuteafd_engine::prefix::RefPagePool)
         -> Result<Option<DeviceLogits>>;
     fn verify_device_ungraphed(&self, sequences: &mut [(&mut Self::Placement, &[u32])], speculative: bool,
-        pool: &cuteafd_engine::prefix::RefPagePool)
+        kind: UngraphedKind, pool: &cuteafd_engine::prefix::RefPagePool)
         -> Result<Option<DeviceLogits>>;
     fn verify_bucket_rows(&self, rows: usize, speculative: bool, diagnostic: bool) -> usize;
     fn verify_attention_trace(&self, contexts: &[Vec<usize>], rows: usize) -> serde_json::Value;
@@ -116,7 +142,9 @@ pub(crate) trait Backend<'a> {
     fn draft(&self, sequences: &mut [DraftSeq<'_, Self::Placement, Self::Draft>], timing: &mut DraftTiming)
         -> Result<Vec<Vec<u32>>>;
     fn accept(&self, verified: &mut [Verified<'_, Self::Placement, Self::Draft, Self::History>],
-        speculative: bool, draft: bool) -> Result<()>;
+        speculative: bool) -> Result<()>;
+    /// Drop any unaccepted replay owned by this request before its storage is released.
+    fn cancel(&self, _placement: &Self::Placement) -> Result<()> { Ok(()) }
     fn probe_begin(&self, rows: usize);
     fn probe_end(&self);
     fn probe_finish<T>(&self, observe: impl FnOnce(&RoundRoutes, &[Option<f64>]) -> T) -> Option<T>;
@@ -296,12 +324,32 @@ impl Trace {
 }
 
 /// Gives a finished or failed sequence's units and state slot back.
-fn release<P: Placement, M: Clone + Default, F: PrefixFamily<M, Placement = P>>(family: &F, cache: &mut PrefixCache<CudaCopyEngine<'_>, M>, slots: &mut Vec<i32>,
-    placement: &P, family_name: &str) {
+fn release<P: Placement, M: Clone + Default, F: PrefixFamily<M, Placement = P>,
+    E: cuteafd_hostcache::copy::CopyEngine>(family: &F, cache: &mut PrefixCache<E, M>, slots: &mut Vec<i32>,
+    placement: &P, family_name: &str, cancel: impl FnOnce() -> Result<()>) {
+    if let Err(error) = cancel() {
+        tracing::error!(%error, family = family_name, "cancel failed; sequence units and state slot quarantined");
+        return;
+    }
     if let Err(error) = cache.release(family, placement.units()) {
         tracing::error!(%error, family = family_name, "releasing sequence units");
+        return;
     }
     slots.push(placement.slot());
+}
+
+/// Binding follows prefix restore but precedes Ready. Failed bindings never
+/// publish success, and only the existing cancellation/release path recycles them.
+fn bound_before_ready(bound: Result<()>, release: impl FnOnce(),
+    events: &mpsc::UnboundedSender<std::result::Result<InferenceChunk, NativeFailure>>) -> bool {
+    match bound {
+        Ok(()) => true,
+        Err(error) => {
+            release();
+            let _ = events.send(Err(NativeFailure::Worker(format!("request binding: {error:#}"))));
+            false
+        }
+    }
 }
 
 /// Verify and selection can fail before synchronizing their streams. Cache
@@ -309,7 +357,11 @@ fn release<P: Placement, M: Clone + Default, F: PrefixFamily<M, Placement = P>>(
 /// On either failure, retain both the page references and the state slot.
 fn release_failed<P: Placement, M: Clone + Default, F: PrefixFamily<M, Placement = P>,
     E: cuteafd_hostcache::copy::CopyEngine>(family: &F, cache: &mut PrefixCache<E, M>,
-    slots: &mut Vec<i32>, placement: &P) -> std::result::Result<(), cuteafd_engine::prefix::PrefixError> {
+    slots: &mut Vec<i32>, placement: &P, cancel: impl FnOnce() -> Result<()>)
+    -> std::result::Result<(), cuteafd_engine::prefix::PrefixError> {
+    cancel().map_err(|source| cuteafd_engine::prefix::PrefixError::Family {
+        what: "failed step cancel", source: source.into(),
+    })?;
     family.drain().map_err(|source| cuteafd_engine::prefix::PrefixError::Family {
         what: "failed step drain", source,
     })?;
@@ -430,6 +482,43 @@ fn initialize<T>(init: impl FnOnce() -> Result<T>, ready: impl FnOnce() -> Resul
 mod readiness_tests {
     use super::*;
     use std::cell::Cell;
+
+    #[test]
+    fn ungraphed_callers_distinguish_scoring_replay_from_live_decode() {
+        let source = include_str!("scheduler.rs").split_once("\npub(crate) fn schedule").unwrap().1;
+        let calls = source.split("engine.verify_device_ungraphed(").skip(1)
+            .map(|call| call.split_once("cache.pool()").unwrap().0
+                .chars().filter(|c| !c.is_whitespace()).collect::<String>())
+            .collect::<Vec<_>>();
+        assert_eq!(calls, [
+            // Teacher-forced rows, then decode-shaped cold prompt replay.
+            "&mut[(placement,chunk)],false,UngraphedKind::Scoring,",
+            "&mut[(&mutp.placement,chunk)],false,UngraphedKind::Scoring,",
+            // Only the live diagnostic decode advances generated rows.
+            "&mutrows,spec,UngraphedKind::Decode,",
+        ]);
+    }
+
+    #[test]
+    fn scheduler_cancels_every_request_release_and_failed_accept() {
+        let source = include_str!("scheduler.rs").split_once("\npub(crate) fn schedule").unwrap().1;
+        let source = source.split_once("\nfn media_failure").unwrap().0;
+        let releases = source.lines().filter(|line| line.contains("release(&family,")
+            || line.contains("release_failed(&family,")).collect::<Vec<_>>();
+        assert_eq!(releases.len(), 9);
+        assert!(releases.iter().all(|line| line.contains("|| engine.cancel(")));
+        assert!(source.contains("for request in &active { engine.cancel(&request.placement)?; }"));
+    }
+
+    #[test]
+    fn restored_request_binding_failure_precedes_ready_and_reports_to_client() {
+        let source = include_str!("scheduler.rs").split_once("\npub(crate) fn schedule").unwrap().1;
+        let bound = source.find("let bound = engine.bind_request(").unwrap();
+        let guarded = source[bound..].find("if !bound_before_ready(").unwrap() + bound;
+        let ready = source[bound..].find("InferenceChunk::Ready").unwrap() + bound;
+        assert!(bound < guarded && guarded < ready);
+        assert!(source[guarded..ready].contains("}, &job.events) { continue; }"));
+    }
 
     #[test]
     fn scheduler_prefix_cache_is_initialized_before_readiness() {
@@ -607,7 +696,10 @@ pub(crate) fn schedule<'a, B: Backend<'a>>(engine: &B, snapshot: &std::path::Pat
                             continue;
                         }
                         let resume = if probe::cold(&prompt.job.probe) { 0 }
-                            else { cache.peek_media(prompt.keys.tokens(), prompt.keys.spans(), true) };
+                            else if engine.needs_snapshot_filter(effective_neural(neural, &prompt.job.probe)) {
+                                cache.peek_media_compatible(prompt.keys.tokens(), prompt.keys.spans(), true,
+                                    &|saved, frontier| engine.snapshot_compatible(saved, frontier, true))
+                            } else { cache.peek_media(prompt.keys.tokens(), prompt.keys.spans(), true) };
                         let waiter = MediaWaiter::new(prompt, request_media, jobs, resume)?;
                         if let Err((_, error)) = media.enqueue(waiter) {
                             let _ = events.send(Err(media_failure(error)));
@@ -650,8 +742,13 @@ pub(crate) fn schedule<'a, B: Backend<'a>>(engine: &B, snapshot: &std::path::Pat
             // room for the rows a verify may write past the last kept one.
             let build = |units| engine.placement(units, slot);
             let extent = (capacity + geometry.decode_rows).min(geometry.max_context);
+            let request_neural = effective_neural(neural, &ready.job().job.probe);
+            let compatible = |saved: &B::Meta, frontier| engine.snapshot_compatible(saved, frontier, request_neural);
             let admission = if cold { cache.admit_cold(&family, ready.job().tokens.len(), extent, build) }
-                else { cache.admit_media(&family, ready.job().keys.tokens(), ready.job().keys.spans(), extent, true, build) };
+                else if engine.needs_snapshot_filter(request_neural) {
+                    cache.admit_native_compatible(&family, ready.job().keys.tokens(), ready.job().tokens.as_slice(),
+                        ready.job().keys.spans(), extent, true, Some(&compatible), build)
+                } else { cache.admit_media(&family, ready.job().keys.tokens(), ready.job().keys.spans(), extent, true, build) };
             let admitted = match admission {
                 Ok(admitted) => admitted,
                 Err(error) => {
@@ -667,7 +764,7 @@ pub(crate) fn schedule<'a, B: Backend<'a>>(engine: &B, snapshot: &std::path::Pat
             let ready = match ready.reconcile(resume) {
                 Ok(ready) => ready,
                 Err(waiter) => {
-                    release(&family, &mut cache, &mut free_slots, &admitted.placement, geometry.family);
+                    release(&family, &mut cache, &mut free_slots, &admitted.placement, geometry.family, || engine.cancel(&admitted.placement));
                     let events = waiter.job.job.events.clone();
                     if let Err((_, error)) = media.enqueue(waiter) {
                         let _ = events.send(Err(media_failure(error)));
@@ -679,7 +776,13 @@ pub(crate) fn schedule<'a, B: Backend<'a>>(engine: &B, snapshot: &std::path::Pat
             admissions += 1;
             let mut placement = admitted.placement;
             // Native ids and this request's grids rebuild positions on EVERY restore.
-            engine.bind_request(&mut placement, rope, request_media, &tokens, resume);
+            let mut seq = B::Draft::default();
+            let bound = engine.bind_request(&mut placement, rope, request_media, &tokens, resume)
+                .and_then(|()| if request_neural { engine.restore_draft(&placement, resume, &tokens, &mut seq) }
+                    else { Ok(()) });
+            if !bound_before_ready(bound, || {
+                release(&family, &mut cache, &mut free_slots, &placement, geometry.family, || engine.cancel(&placement));
+            }, &job.events) { continue; }
             job.prefix_cache_source.set(resume, admitted.source.as_ref().is_some_and(|source| source.host));
             probe::admitted(&job.probe, geometry.family, &tokens, resume);
             let _ = job.events.send(Ok(InferenceChunk::Ready {
@@ -692,13 +795,14 @@ pub(crate) fn schedule<'a, B: Backend<'a>>(engine: &B, snapshot: &std::path::Pat
                     geometry.decode_rows, probe::verify_rows(&job.probe), geometry.full_prefill_logits, &mut placement,
                     |placement, chunk, rows| Ok(engine.prefill_device(placement, chunk, rows, cache.pool())?
                         .map(probe::ScoreLogits::Device)),
-                    |placement, chunk| engine.verify_device_ungraphed(&mut [(placement, chunk)], false, cache.pool())?
+                    |placement, chunk| engine.verify_device_ungraphed(&mut [(placement, chunk)], false,
+                        UngraphedKind::Scoring, cache.pool())?
                         .context("scoring needs every layer"));
                 match scored {
                     Ok(_) => { let _ = job.events.send(Ok(InferenceChunk::Finish { finish_reason: InferenceFinishReason::Length })); }
                     Err(error) => { let _ = job.events.send(Err(NativeFailure::Worker(format!("scoring: {error:#}")))); }
                 }
-                release(&family, &mut cache, &mut free_slots, &placement, geometry.family);
+                release(&family, &mut cache, &mut free_slots, &placement, geometry.family, || engine.cancel(&placement));
                 continue;
             }
             let ticket = console::admit(tokens.len(), resume, job.max_tokens, constraint.is_some(), job.media.len(),
@@ -730,7 +834,7 @@ pub(crate) fn schedule<'a, B: Backend<'a>>(engine: &B, snapshot: &std::path::Pat
                 engine.prefetch(&tokens[..resume], &tokens[resume..end]);
             }
             prefills.push(Prefill { job, constraint, tokens, keys, done: resume, resume, plan, chunks: 0, cancelled: false,
-                placement, capacity, seq: B::Draft::default(), logits, first: None, prompt_row: None,
+                placement, capacity, seq, logits, first: None, prompt_row: None,
                 started: Instant::now(), busy: 0.0, phases: [0.0; 2], id: admissions, ticket });
         }
         if prefills.due(!active.is_empty()) {
@@ -757,7 +861,8 @@ pub(crate) fn schedule<'a, B: Backend<'a>>(engine: &B, snapshot: &std::path::Pat
                     let decode = p.job.probe.as_ref().and_then(|probe| probe.spec.cold_steps.get(p.chunks))
                         .is_some_and(|step| step.decode);
                     let logits = if decode {
-                        engine.verify_device_ungraphed(&mut [(&mut p.placement, chunk)], false, cache.pool())?
+                        engine.verify_device_ungraphed(&mut [(&mut p.placement, chunk)], false,
+                            UngraphedKind::Scoring, cache.pool())?
                     } else { engine.prefill_device(&mut p.placement, chunk, 1, cache.pool())? };
                     if end == p.tokens.len() {
                         // The first token, while this prompt's logits are the workspace's.
@@ -780,7 +885,7 @@ pub(crate) fn schedule<'a, B: Backend<'a>>(engine: &B, snapshot: &std::path::Pat
                         let selected = selector.select(&logits, &batch)?;
                         p.first = Some(take(p.constraint.as_mut(), &selected[0])?);
                     }
-                    if neural && !probe::no_speculation(&p.job.probe) {
+                    if effective_neural(neural, &p.job.probe) {
                         engine.prefill_draft(&p.placement, start, chunk, p.tokens.get(end).copied(),
                             &mut p.seq)?;
                     }
@@ -818,7 +923,7 @@ pub(crate) fn schedule<'a, B: Backend<'a>>(engine: &B, snapshot: &std::path::Pat
                         tracing::warn!("prefill failed: {error:#}");
                         let _ = p.job.events.send(Err(NativeFailure::Worker(format!("{error:#}"))));
                     }
-                    release(&family, &mut cache, &mut free_slots, &placement, geometry.family);
+                    release(&family, &mut cache, &mut free_slots, &placement, geometry.family, || engine.cancel(&placement));
                     continue;
                 }
                 // A whole-prompt hit selects from its retained logits; a prefill selected already.
@@ -836,7 +941,7 @@ pub(crate) fn schedule<'a, B: Backend<'a>>(engine: &B, snapshot: &std::path::Pat
                     Ok(first) => first,
                     Err(error) => {
                         tracing::warn!("{error:#}");
-                        release(&family, &mut cache, &mut free_slots, &placement, geometry.family);
+                        release(&family, &mut cache, &mut free_slots, &placement, geometry.family, || engine.cancel(&placement));
                         continue;
                     }
                 };
@@ -873,7 +978,9 @@ pub(crate) fn schedule<'a, B: Backend<'a>>(engine: &B, snapshot: &std::path::Pat
                         ticket: p.ticket,
                     };
                     request.next = first;
-                    request.draft.close(request.next);
+                    if effective_neural(neural, &request.job.probe) {
+                        request.draft.close(request.next);
+                    }
                     Ok(request)
                 })();
                 match admitted {
@@ -890,7 +997,7 @@ pub(crate) fn schedule<'a, B: Backend<'a>>(engine: &B, snapshot: &std::path::Pat
                                     let _ = request.job.events.send(Err(NativeFailure::Worker(format!("{error:#}"))));
                                 }
                                 request.ticket.done(request.generated);
-                                release(&family, &mut cache, &mut free_slots, &request.placement, geometry.family)
+                                release(&family, &mut cache, &mut free_slots, &request.placement, geometry.family, || engine.cancel(&request.placement))
                             }
                         }
                     }
@@ -898,7 +1005,7 @@ pub(crate) fn schedule<'a, B: Backend<'a>>(engine: &B, snapshot: &std::path::Pat
                         tracing::warn!("admission failed: {error:#}");
                         let _ = job_events.send(Err(NativeFailure::Worker(format!("{error:#}"))));
                         retain_prompt(&mut cache, &placement);
-                        release(&family, &mut cache, &mut free_slots, &placement, geometry.family);
+                        release(&family, &mut cache, &mut free_slots, &placement, geometry.family, || engine.cancel(&placement));
                     }
                 }
             }
@@ -1005,7 +1112,7 @@ pub(crate) fn schedule<'a, B: Backend<'a>>(engine: &B, snapshot: &std::path::Pat
         let timer = Instant::now();
         engine.probe_begin(tokens.len());
         let step = if diagnostic {
-            engine.verify_device_ungraphed(&mut rows, spec, cache.pool())
+            engine.verify_device_ungraphed(&mut rows, spec, UngraphedKind::Decode, cache.pool())
         } else {
             engine.verify_device(&mut rows, spec, cache.pool())
         }.and_then(|logits| logits.context("decode needs every layer"))
@@ -1029,7 +1136,7 @@ pub(crate) fn schedule<'a, B: Backend<'a>>(engine: &B, snapshot: &std::path::Pat
                 for request in active.drain(..) {
                     if let Some(shared) = shared.as_mut() { shared.release(request.ticket.id()); }
                     let _ = request.job.events.send(Err(NativeFailure::Worker(format!("{error:#}"))));
-                    if let Err(error) = release_failed(&family, &mut cache, &mut free_slots, &request.placement) {
+                    if let Err(error) = release_failed(&family, &mut cache, &mut free_slots, &request.placement, || engine.cancel(&request.placement)) {
                         tracing::error!(%error, family = geometry.family, slot = request.placement.slot(),
                             "failed step units and state slot quarantined");
                     }
@@ -1108,11 +1215,16 @@ pub(crate) fn schedule<'a, B: Backend<'a>>(engine: &B, snapshot: &std::path::Pat
         for ((((request, rows), (&start, history)), kept), &finished) in active.iter_mut().zip(&sequences)
             .zip(starts.iter().zip(histories)).zip(&kept).zip(&finished) {
             verified.push(Verified { placement: &mut request.placement, seq: &mut request.draft, start, history,
-                rows, first_row, kept: *kept, finished });
+                rows, first_row, kept: *kept, finished,
+                neural: effective_neural(neural, &request.job.probe) });
             first_row += rows.len();
         }
-        engine.accept(&mut verified, spec, neural)?;
+        let accepted = engine.accept(&mut verified, spec);
         drop(verified);
+        if let Err(error) = accepted {
+            for request in &active { engine.cancel(&request.placement)?; }
+            return Err(error);
+        }
         let commit_us = console::us(commit_timer);
         if let Some(shared) = shared.as_mut() {
             let requests: Vec<_> = active.iter().enumerate().map(|(i, a)| {
@@ -1185,7 +1297,7 @@ pub(crate) fn schedule<'a, B: Backend<'a>>(engine: &B, snapshot: &std::path::Pat
                     tracing::warn!("turn snapshot not retained: {error:#}");
                 }
             }
-            release(&family, &mut cache, &mut free_slots, &request.placement, geometry.family);
+            release(&family, &mut cache, &mut free_slots, &request.placement, geometry.family, || engine.cancel(&request.placement));
         }
         cache.tick();
         publish(stats, requests, generated_total, active.len(), prefills.len(), &cache, media, preparer, &verify_stats);
@@ -1228,18 +1340,35 @@ mod failed_release_tests {
         landed: RefCell<Vec<u32>>,
         drains: Cell<usize>,
         fail_on: Cell<usize>,
+        mark_bytes: Cell<usize>,
+        marks: RefCell<std::collections::BTreeMap<MarkSlot, u64>>,
+        live: Cell<Option<(i32, u64)>>,
+        restores: Cell<usize>,
     }
     impl PrefixFamily for Queued {
         type Placement = Placed;
         fn layout(&self) -> FamilyLayout {
-            FamilyLayout { page_rows: 64, pages: 2, page_bytes: 64, mark_bytes: 0,
+            FamilyLayout { page_rows: 64, pages: 2, page_bytes: 64, mark_bytes: self.mark_bytes.get(),
                 draft_bytes: 0, rule: ReuseRule::EXACT, mark_store: MarkStore::Arena,
                 page_owners: PageOwners::Uniform }
         }
         fn pages<'p>(&self, placement: &'p Placed) -> &'p [u32] { &placement.pages }
         fn commit_point(&self, _: &Placed) -> usize { 64 }
-        fn capture(&self, _: MarkSlot, _: &Placed, _: usize) -> Result<(), BoxError> { Ok(()) }
-        fn restore(&self, _: Option<MarkSlot>, _: &mut Placed, _: usize) -> Result<(), BoxError> { Ok(()) }
+        fn capture(&self, mark: MarkSlot, placement: &Placed, _: usize) -> Result<(), BoxError> {
+            if self.mark_bytes.get() == 0 { return Ok(()); }
+            let (slot, value) = self.live.get().ok_or("missing request state")?;
+            assert_eq!(slot, placement.slot);
+            self.marks.borrow_mut().insert(mark, value);
+            Ok(())
+        }
+        fn restore(&self, mark: Option<MarkSlot>, placement: &mut Placed, _: usize) -> Result<(), BoxError> {
+            if let Some(mark) = mark {
+                let value = *self.marks.borrow().get(&mark).ok_or("missing retained mark")?;
+                self.live.set(Some((placement.slot, value)));
+                self.restores.set(self.restores.get() + 1);
+            }
+            Ok(())
+        }
         fn copy_rows(&self, _: TailCopy) -> Result<(), BoxError> { Ok(()) }
         fn drain(&self) -> Result<(), BoxError> {
             let call = self.drains.get() + 1;
@@ -1262,6 +1391,74 @@ mod failed_release_tests {
     }
 
     #[test]
+    fn bind_failure_after_restore_cancels_request_but_preserves_snapshot_and_slot_reuse() {
+        let family = Queued::default();
+        family.mark_bytes.set(8);
+        let mut cache = PrefixCache::<StubCopyEngine>::new(family.layout(), PrefixConfig {
+            entries: 1, mark_slots: 1, keep_logits: false, min_tokens: 0,
+        }, None).unwrap();
+        let mut slots = vec![7];
+        let tokens = vec![1; 64];
+        let original = cache.admit_cold(&family, 64, 64,
+            |pages| Placed { pages, slot: slots.pop().unwrap() }).unwrap().placement;
+        family.live.set(Some((7, 0x1234)));
+        assert!(cache.capture(&family, SnapshotKind::Prompt, &tokens, &original,
+            After { greedy: Some(2), logits: None }).unwrap());
+        release(&family, &mut cache, &mut slots, &original, "test", || {
+            family.live.set(None);
+            Ok(())
+        });
+        let retained = family.marks.borrow().clone();
+        assert_eq!(cache.arena().in_use(), 1);
+        let restored = cache.admit(&family, &tokens, 128, false,
+            |pages| Placed { pages, slot: slots.pop().unwrap() }).unwrap();
+        assert_eq!(restored.resume, 64);
+        assert!(restored.source.is_some());
+        assert_eq!(family.live.get(), Some((7, 0x1234)));
+        let placement = restored.placement;
+        let private = placement.pages[1];
+        assert_eq!(cache.pool().refs(private), 1);
+        let (events, mut client) = mpsc::unbounded_channel();
+        let cancelled = Cell::new(false);
+        let bound: Result<()> = (|| {
+            family.live.set(Some((7, 0xbad)));
+            anyhow::bail!("injected bind failure after restore");
+        })();
+        assert!(!bound_before_ready(bound, || {
+            release(&family, &mut cache, &mut slots, &placement, "test", || {
+                assert_eq!(family.live.take(), Some((7, 0xbad)));
+                cancelled.set(true);
+                Ok(())
+            });
+        }, &events));
+        assert!(cancelled.get());
+        assert_eq!(family.live.get(), None);
+        assert_eq!(slots, [7]);
+        assert_eq!(cache.pool().refs(private), 0);
+        assert_eq!(cache.pool().refs(original.pages[0]), 1);
+        assert_eq!(cache.arena().in_use(), 1, "retained mark is not request-owned");
+        assert_eq!(*family.marks.borrow(), retained);
+        assert!(matches!(client.try_recv().unwrap(), Err(NativeFailure::Worker(message))
+            if message.contains("injected bind failure")));
+        assert!(client.try_recv().is_err(), "failed binding must not publish Ready");
+        let next = cache.admit(&family, &tokens, 128, false,
+            |pages| Placed { pages, slot: slots.pop().unwrap() }).unwrap();
+        assert_eq!(next.resume, 64);
+        assert_eq!(next.placement.slot, 7);
+        assert_eq!(family.restores.get(), 2);
+        assert_eq!(family.live.get(), Some((7, 0x1234)));
+        assert!(bound_before_ready(Ok(()), || panic!("successful bind released"), &events));
+        assert!(client.try_recv().is_err());
+        release(&family, &mut cache, &mut slots, &next.placement, "test", || {
+            family.live.set(None);
+            Ok(())
+        });
+        cache.clear(&family).unwrap();
+        assert_eq!(cache.arena().in_use(), 0);
+        assert_eq!(cache.pool().free(), 2);
+    }
+
+    #[test]
     fn failed_step_drains_backend_writes_with_a_clean_prefix_cache_before_reuse() {
         let family = Queued::default();
         let (mut cache, placement) = admit(&family);
@@ -1269,7 +1466,7 @@ mod failed_release_tests {
         family.writes.borrow_mut().extend(&placement.pages);
         assert_eq!(family.drains.get(), 0);
         assert_eq!(cache.pool().refs(placement.pages[0]), 1);
-        release_failed(&family, &mut cache, &mut slots, &placement).unwrap();
+        release_failed(&family, &mut cache, &mut slots, &placement, || Ok(())).unwrap();
         assert_eq!(family.drains.get(), 1);
         assert!(family.writes.borrow().is_empty());
         assert_eq!(*family.landed.borrow(), placement.pages);
@@ -1282,13 +1479,53 @@ mod failed_release_tests {
     }
 
     #[test]
+    fn verify_then_selection_failure_cancels_replay_before_release_and_slot_reuse() {
+        let family = Queued::default();
+        let (mut cache, placement) = admit(&family);
+        let mut slots = Vec::new();
+        let pending = Cell::new(false);
+        let selected: Result<()> = (|| {
+            assert!(!pending.replace(true));
+            family.writes.borrow_mut().extend(&placement.pages);
+            anyhow::bail!("injected token selection failure");
+        })();
+        assert!(selected.is_err());
+        let cache_refs_before_release = cache.pool().refs(placement.pages[0]);
+        release_failed(&family, &mut cache, &mut slots, &placement, || {
+            assert!(pending.replace(false));
+            assert_eq!(family.drains.get(), 0);
+            assert_eq!(cache_refs_before_release, 1);
+            Ok(())
+        }).unwrap();
+        assert!(!pending.get());
+        assert_eq!(family.drains.get(), 1);
+        let next = cache.admit_cold(&family, 64, 64, |pages| Placed { pages, slot: slots.pop().unwrap() })
+            .unwrap().placement;
+        assert_eq!(next.pages, placement.pages);
+        assert_eq!(next.slot, placement.slot);
+        assert!(!pending.replace(true), "next verify must not inherit failed replay");
+    }
+
+    #[test]
+    fn cancellation_failure_quarantines_without_releasing_or_draining() {
+        let family = Queued::default();
+        let (mut cache, placement) = admit(&family);
+        let mut slots = vec![9];
+        assert!(release_failed(&family, &mut cache, &mut slots, &placement,
+            || anyhow::bail!("injected replay identity failure")).is_err());
+        assert_eq!(family.drains.get(), 0);
+        assert_eq!(slots, [9]);
+        assert_eq!(cache.pool().refs(placement.pages[0]), 1);
+    }
+
+    #[test]
     fn failed_step_quarantines_pages_and_slot_when_unconditional_drain_fails() {
         let family = Queued::default();
         let (mut cache, placement) = admit(&family);
         let mut slots = vec![9];
         family.writes.borrow_mut().extend(&placement.pages);
         family.fail_on.set(1);
-        assert!(release_failed(&family, &mut cache, &mut slots, &placement).is_err());
+        assert!(release_failed(&family, &mut cache, &mut slots, &placement, || Ok(())).is_err());
         assert_eq!(family.drains.get(), 1);
         assert_eq!(*family.writes.borrow(), placement.pages);
         assert!(family.landed.borrow().is_empty());
@@ -1310,7 +1547,7 @@ mod failed_release_tests {
         assert_eq!(cache.pool().refs(placement.pages[0]), 2);
         family.fail_on.set(2);
         let mut slots = vec![9];
-        assert!(release_failed(&family, &mut cache, &mut slots, &placement).is_err());
+        assert!(release_failed(&family, &mut cache, &mut slots, &placement, || Ok(())).is_err());
         assert_eq!(family.drains.get(), 2);
         assert_eq!(slots, [9]);
         assert_eq!(cache.pool().refs(placement.pages[0]), 2);
@@ -1335,5 +1572,33 @@ mod media_failure_tests {
     fn encoder_failure_does_not_expose_internal_error() {
         assert!(matches!(super::media_failure(cuteafd_engine::media::MediaError::Encoder("socket died".into())),
             cuteafd_api::openai::NativeFailure::Unavailable(message) if message == "vision encoder unavailable"));
+    }
+}
+
+#[cfg(test)]
+mod request_neural_tests {
+    use super::*;
+    use cuteafd_api::openai::probe::{Probe, ProbeSpec};
+
+    #[test]
+    fn mixed_wave_keeps_target_acceptance_but_never_advances_probe_predictors() {
+        let probe = Some(Probe::new(ProbeSpec { no_speculation: true, ..ProbeSpec::default() }));
+        for configured in [false, true] {
+            let mut placements = [0usize; 3];
+            let mut states = [0usize; 3];
+            let rows = [11, 13];
+            let probes = [None, probe.clone(), None];
+            let mut wave: Vec<_> = placements.iter_mut().zip(&mut states).zip(&probes)
+                .map(|((placement, seq), probe)| Verified { placement, seq, start: 255,
+                    history: (), rows: &rows, first_row: 0, kept: Some((2, 17)), finished: false,
+                    neural: effective_neural(configured, probe) }).collect();
+            for v in &mut wave {
+                *v.placement = v.start + v.kept.unwrap().0;
+                if let Some((kept, _)) = v.neural_kept() { *v.seq += kept; }
+            }
+            drop(wave);
+            assert_eq!(placements, [257; 3]);
+            assert_eq!(states, if configured { [2, 0, 2] } else { [0; 3] });
+        }
     }
 }

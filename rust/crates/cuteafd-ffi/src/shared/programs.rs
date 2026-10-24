@@ -130,6 +130,7 @@ pub struct Programs<'a> {
     programs: HashMap<String, (u32, ProgramSpec)>,
     card_specs: HashMap<String, [ProgramSpec; 2]>,
     capacities: ProgramCapacities,
+    families: serde_json::Value,
 }
 
 impl NativeLibrary {
@@ -160,7 +161,7 @@ impl NativeLibrary {
             };
             programs.insert(name, (index, spec));
         }
-        Ok(Programs { library: self, load, launch, programs, card_specs: HashMap::new(), capacities: ProgramCapacities::default() })
+        Ok(Programs { library: self, load, launch, programs, card_specs: HashMap::new(), capacities: ProgramCapacities::default(), families: serde_json::Value::Null })
     }
 }
 
@@ -183,6 +184,7 @@ impl<'a> Programs<'a> {
                 self.library.sm_count()?.try_into().context("runtime SM count exceeds u32")?)?;
         }
         self.capacities = ProgramCapacities::from_manifest(&manifest)?;
+        self.families = manifest.get("families").cloned().unwrap_or_default();
         let entries = manifest["programs"].as_array().context("manifest has no programs")?;
         ensure!(entries.len() == self.programs.len(), "manifest lists {} programs, the library {}",
             entries.len(), self.programs.len());
@@ -211,7 +213,17 @@ impl<'a> Programs<'a> {
                 }
                 self.card_specs.insert(name.to_string(), specs);
             }
-            if name.starts_with("exlr8_") {
+            if name.starts_with("glm_stage_") || name.starts_with("glm2_stage_") {
+                super::glm_stage::validate_entry(spec, entry)?;
+            } else if name.starts_with("exlr8_dense_") {
+                // Companions (transforms, unpack, prefill GEMM, glue) by their op; the
+                // ABI-v1 linears and the embedding gather by name.
+                if super::native_dense_glue::op_of(entry)?.is_some() {
+                    super::native_dense_glue::validate_entry(spec, entry)?;
+                } else {
+                    super::native_dense::validate_entry(spec, entry)?;
+                }
+            } else if name.starts_with("exlr8_") {
                 super::exlr8::validate_entry(spec, entry)?;
                 let expected: &[(&str, &str)] = match name {
                     "exlr8_a16_grouped" => &[("rows", "int32"), ("cta_limit", "int32"), ("unit_limit", "int32")],
@@ -287,6 +299,12 @@ impl<'a> Programs<'a> {
 
     pub fn capacities(&self) -> ProgramCapacities {
         self.capacities
+    }
+
+    /// Package-owned policies accompany the program table; callers validate
+    /// their schema and linked program geometry before allocating or capturing.
+    pub fn family_metadata(&self, family: &str) -> Result<&serde_json::Value> {
+        self.families.get(family).with_context(|| format!("manifest has no family metadata for {family}"))
     }
 
     /// Resolves a program and loads its kernels on the current device.
@@ -518,6 +536,167 @@ impl NativeLibrary {
         let f = *unsafe { self.lib.get::<Dequant>(b"cuteafd_fp8_block_dequant") }?;
         let status = unsafe { f(w, scale, out, i32::try_from(rows)?, i32::try_from(cols)?, stream) };
         ensure!(status == 0, "FP8 block dequantization failed with {status}");
+        Ok(())
+    }
+
+    /// Load-time BF16 -> E4M3 quantization of `count` scale units (the `Job`
+    /// ABI of native/shared/cuda/fp8_load_quant.h), each reading device-visible
+    /// (pinned or mapped host) source fragments and writing its final rows and
+    /// scales; bit-for-bit the coordinator loaders' host rule.
+    ///
+    /// # Safety
+    /// `jobs` holds `count` valid jobs in device-visible memory; every source,
+    /// value and scale pointer they name stays live and unaliased until the
+    /// stream drains. Values and scales are on the stream's device.
+    pub unsafe fn fp8_load_quant(&self, jobs: *const c_void, count: usize, stream: *mut c_void) -> Result<()> {
+        type Quant = unsafe extern "C" fn(*const c_void, i32, *mut c_void) -> i32;
+        let f = *unsafe { self.lib.get::<Quant>(b"cuteafd_fp8_load_quant") }?;
+        let status = unsafe { f(jobs, i32::try_from(count)?, stream) };
+        ensure!(status == 0, "FP8 load quantization failed with {status}");
+        Ok(())
+    }
+
+    /// BF16 `src` (device-visible, e.g. pinned host) widened to F32 `dst` (exact).
+    ///
+    /// # Safety
+    /// `src` holds `n` BF16 values and `dst` `n` F32 on the stream's device, live until it drains.
+    pub unsafe fn load_widen_bf16_f32(&self, src: *const c_void, dst: *mut c_void, n: usize, stream: *mut c_void)
+        -> Result<()> {
+        type Widen = unsafe extern "C" fn(*const c_void, *mut c_void, i64, *mut c_void) -> i32;
+        let f = *unsafe { self.lib.get::<Widen>(b"cuteafd_load_widen_bf16_f32") }?;
+        let status = unsafe { f(src, dst, i64::try_from(n)?, stream) };
+        ensure!(status == 0, "BF16 load widening failed with {status}");
+        Ok(())
+    }
+
+    /// `n` F32 values in `src` (device-visible) narrowed to BF16 (round to
+    /// nearest even, NaN quieted) into `dst` on the current device.
+    ///
+    /// # Safety
+    /// `src` holds `n` F32 and `dst` room for `n` BF16, live through the stream.
+    pub unsafe fn load_narrow_f32_bf16(&self, src: *const c_void, dst: *mut c_void, n: usize, stream: *mut c_void)
+        -> Result<()> {
+        type Narrow = unsafe extern "C" fn(*const c_void, *mut c_void, i64, *mut c_void) -> i32;
+        let f = *unsafe { self.lib.get::<Narrow>(b"cuteafd_load_narrow_f32_bf16") }?;
+        let status = unsafe { f(src, dst, i64::try_from(n)?, stream) };
+        ensure!(status == 0, "F32 load narrowing failed with {status}");
+        Ok(())
+    }
+
+    /// `n` BF16 pairs `a[i]`, `b[i]` (device-visible) promoted to F32 and
+    /// multiplied once into `dst` (F32) on the current device.
+    ///
+    /// # Safety
+    /// `a` and `b` hold `n` BF16 and `dst` room for `n` F32, live through the stream.
+    pub unsafe fn load_bf16_product_f32(&self, a: *const c_void, b: *const c_void, dst: *mut c_void, n: usize,
+        stream: *mut c_void) -> Result<()> {
+        type Product = unsafe extern "C" fn(*const c_void, *const c_void, *mut c_void, i64, *mut c_void) -> i32;
+        let f = *unsafe { self.lib.get::<Product>(b"cuteafd_load_bf16_product_f32") }?;
+        let status = unsafe { f(a, b, dst, i64::try_from(n)?, stream) };
+        ensure!(status == 0, "BF16 load product failed with {status}");
+        Ok(())
+    }
+
+    /// Staged EXL3 trellis rows (`rows` K16 rows of `tiles` 16x16 tiles of
+    /// `tile_bytes`, checkpoint order) reordered into a native shard `dst` of
+    /// `k16` K16 rows at local row `k0`: `side` 0 output [N128][K16][8],
+    /// 1 input [K128][N128][8][8] (`cuteafd_load_quant::trellis_tile`).
+    ///
+    /// # Safety
+    /// `src` (device-visible) holds the staged rows and `dst` (current device)
+    /// the whole shard, both live until the stream drains.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn load_trellis_tiles(&self, src: *const c_void, dst: *mut c_void, rows: usize, k0: usize,
+        tiles: usize, tile_bytes: usize, side: i32, k16: usize, stream: *mut c_void) -> Result<()> {
+        type Tiles = unsafe extern "C" fn(*const c_void, *mut c_void, i64, i64, i64, i64, i32, i64, *mut c_void) -> i32;
+        let f = *unsafe { self.lib.get::<Tiles>(b"cuteafd_load_trellis_tiles") }?;
+        let status = unsafe { f(src, dst, i64::try_from(rows)?, i64::try_from(k0)?, i64::try_from(tiles)?,
+            i64::try_from(tile_bytes)?, side, i64::try_from(k16)?, stream) };
+        ensure!(status == 0, "EXL3 trellis tile reorder failed with {status}");
+        Ok(())
+    }
+
+    /// MLA `kv_b` [heads * (nope + v), lat] (BF16, device-visible) absorbed per head
+    /// into `uk` [heads][lat][nope] and `uv` [heads][v][lat] for heads `h0..h0 + heads`.
+    ///
+    /// # Safety
+    /// `kv_b` holds the whole tensor; `uk`/`uv` hold `heads` heads on the stream's
+    /// device; all live until the stream drains.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn load_kvb_absorb(&self, kv_b: *const c_void, uk: *mut c_void, uv: *mut c_void, h0: usize,
+        heads: usize, nope: usize, v: usize, lat: usize, stream: *mut c_void) -> Result<()> {
+        type Absorb = unsafe extern "C" fn(*const c_void, *mut c_void, *mut c_void, i64, i64, i64, i64, i64, *mut c_void) -> i32;
+        let f = *unsafe { self.lib.get::<Absorb>(b"cuteafd_load_kvb_absorb") }?;
+        let status = unsafe { f(kv_b, uk, uv, i64::try_from(h0)?, i64::try_from(heads)?, i64::try_from(nope)?,
+            i64::try_from(v)?, i64::try_from(lat)?, stream) };
+        ensure!(status == 0, "kv_b load absorption failed with {status}");
+        Ok(())
+    }
+
+    /// FP8 MLA `kv_b` rows of `heads` heads (E4M3 `[heads * (nope + v), lat]`, the
+    /// first at kv_b row `row0`) with the whole tensor's FP32 128x128 `grid` (both
+    /// device-visible) split per head into the GLM FP8 programs' `uk`
+    /// `[heads][lat][nope]` + `uk_scale` `[heads][lat][nope / 64]` and `uv`
+    /// `[heads][v][lat]` + `uv_scale` `[heads][v][lat / 64]`: bytes unchanged,
+    /// scales the grid entry of each 64-wide tile.
+    ///
+    /// # Safety
+    /// `kv_b` holds the staged heads' rows and `grid` the whole grid; the four outputs hold `heads`
+    /// heads on the stream's device; all live until the stream drains.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn load_kvb_split_fp8(&self, kv_b: *const c_void, grid: *const c_void, uk: *mut c_void,
+        uk_scale: *mut c_void, uv: *mut c_void, uv_scale: *mut c_void, row0: usize, heads: usize, nope: usize,
+        v: usize, lat: usize, stream: *mut c_void) -> Result<()> {
+        type Split = unsafe extern "C" fn(*const c_void, *const c_void, *mut c_void, *mut c_void, *mut c_void,
+            *mut c_void, i64, i64, i64, i64, i64, *mut c_void) -> i32;
+        let f = *unsafe { self.lib.get::<Split>(b"cuteafd_load_kvb_split_fp8") }?;
+        let status = unsafe { f(kv_b, grid, uk, uk_scale, uv, uv_scale, i64::try_from(row0)?, i64::try_from(heads)?,
+            i64::try_from(nope)?, i64::try_from(v)?, i64::try_from(lat)?, stream) };
+        ensure!(status == 0, "FP8 kv_b split failed with {status}");
+        Ok(())
+    }
+
+    /// The load-quantization `Job` ABI: (job bytes, segment bytes, max columns).
+    pub fn fp8_load_quant_abi(&self) -> Result<(u64, u64, u64)> {
+        type Abi = unsafe extern "C" fn(*mut u64, *mut u64, *mut u64) -> i32;
+        let f = *unsafe { self.lib.get::<Abi>(b"cuteafd_fp8_load_quant_abi") }?;
+        let (mut job, mut segment, mut cols) = (0, 0, 0);
+        // SAFETY: three writable u64 outputs.
+        let status = unsafe { f(&mut job, &mut segment, &mut cols) };
+        ensure!(status == 0, "FP8 load quantization ABI query failed with {status}");
+        Ok((job, segment, cols))
+    }
+
+    /// FP32 128x128 block `grid` [ceil(rows/128), kb] widened to per-row scales
+    /// stored K-block major, `kmajor` [kb, rows] (exact gather).
+    ///
+    /// # Safety
+    /// Both pointers are live device memory of those shapes on the stream's device.
+    pub unsafe fn fp8_grid_kmajor(&self, grid: *const c_void, kmajor: *mut c_void, rows: usize, kb: usize,
+        stream: *mut c_void) -> Result<()> {
+        type Widen = unsafe extern "C" fn(*const c_void, *mut c_void, i64, i64, *mut c_void) -> i32;
+        let f = *unsafe { self.lib.get::<Widen>(b"cuteafd_fp8_grid_kmajor") }?;
+        let status = unsafe { f(grid, kmajor, i64::try_from(rows)?, i64::try_from(kb)?, stream) };
+        ensure!(status == 0, "FP8 K-major grid widening failed with {status}");
+        Ok(())
+    }
+
+    /// Per-row FP32 scales gathered from `grid` [*, grid_cols] (columns
+    /// `col0..col0 + kb` of row `index[r]`, or zero for `u32::MAX`) into
+    /// `row_major` [rows, kb] and/or `k_major` [kb, rows] (null to skip).
+    ///
+    /// # Safety
+    /// Every non-null pointer is a live device buffer of its shape (`index`:
+    /// `rows` u32) on the stream's device.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn load_scale_gather(&self, grid: *const c_void, index: *const c_void, row_major: *mut c_void,
+        k_major: *mut c_void, rows: usize, kb: usize, grid_cols: usize, col0: usize, stream: *mut c_void) -> Result<()> {
+        type Gather = unsafe extern "C" fn(*const c_void, *const c_void, *mut c_void, *mut c_void, i64, i64, i64, i64,
+            *mut c_void) -> i32;
+        let f = *unsafe { self.lib.get::<Gather>(b"cuteafd_load_scale_gather") }?;
+        let status = unsafe { f(grid, index, row_major, k_major, i64::try_from(rows)?, i64::try_from(kb)?,
+            i64::try_from(grid_cols)?, i64::try_from(col0)?, stream) };
+        ensure!(status == 0, "load-time scale gather failed with {status}");
         Ok(())
     }
 

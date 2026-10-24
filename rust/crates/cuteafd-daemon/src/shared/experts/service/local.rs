@@ -56,7 +56,7 @@ mod selection_tests {
             snapshot: dir.path().into(), exlr8_manifest: None, rank: 0, world: 6, model_admission: None, selected_layers: None, capacity: 4096, device_budget: 121 << 30, max_frame_bytes: 64 << 20,
             rdma_endpoints: 3, declared_world: cuteafd_transport::expert::SparkWorld::canonical(6).unwrap(), native_spark_tp2: false, bf16_ingress: false };
         let model = cuteafd_transport::worker_selection::ModelAdmission { capacity: 80, compiled_capacity: 80,
-            endpoints: vec![cuteafd_core::SparkEndpoint { capacity: 80,
+            endpoints: vec![cuteafd_core::SparkEndpoint { ring_depth: None, capacity: 80,
                 ingress: cuteafd_core::SparkIngress::Bf16Decode { rows: 16 } }],
             rings: cuteafd_core::SparkRings { max_frame_bytes: 32 << 20, depth: 2,
                 slot_bytes: 1 << 20, alignment: 4096 } };
@@ -159,7 +159,7 @@ impl Drop for Admission {
 
 pub(super) fn run(mut config: NativeExpertServiceConfig, listen: &str) -> Result<()> {
     ensure!(
-        config.rank < config.world && (1..=6).contains(&config.world),
+        config.rank < config.world && (1..=8).contains(&config.world),
         "native rank must be below the launched Spark world"
     );
     // The checkpoint fixes the process expert geometry before the native
@@ -182,6 +182,7 @@ pub(super) fn run(mut config: NativeExpertServiceConfig, listen: &str) -> Result
     cuteafd_core::set_expert_geometry(geometry).map_err(|fixed| {
         anyhow::anyhow!("expert geometry is already {fixed:?}; the checkpoint needs {geometry:?}")
     })?;
+    drop(inventory);
     let mut census = super::census::Census::new();
     census.sample("before_native_library", None)?;
     // SAFETY: this owner outlives media, weights, retained modules and executions.
@@ -296,8 +297,10 @@ pub(super) fn run(mut config: NativeExpertServiceConfig, listen: &str) -> Result
     census.sample("after_expert_modules_before_weights", Some(&library))?;
     let loaded = {
         let _memory_scope = cuteafd_ffi::memory_ledger::scope("experts/weights");
-        load_weights(&library, &catalog, &config, &mut modules)
+        load_weights(&library, &catalog, &config, &mut modules,
+            selection.push_weights().then_some(&mut stream))
     };
+    catalog.finish_expert_reads();
     let (weights, remaining) = match loaded {
         Ok(loaded) => loaded,
         Err(error) => {

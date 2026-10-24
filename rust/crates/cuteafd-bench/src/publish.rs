@@ -4,7 +4,7 @@
 //! under `benchmarks/<family>/<date>-<profile>-<hardware>/`.
 use crate::report::{CheckStatus, Report};
 use anyhow::{bail, Context, Result};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
@@ -159,6 +159,41 @@ impl MatrixRow {
 #[derive(Debug, Clone)]
 pub struct Matrix {
     pub rows: Vec<MatrixRow>,
+    pub retired: Vec<Retired>,
+}
+
+/// A historical card, pinned independently of the current three-column set.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct Retired {
+    pub name: String,
+    pub config: PathBuf,
+    pub report: PathBuf,
+    pub release: String,
+    pub release_note: String,
+}
+
+pub fn validate_retired(entries: &[Retired]) -> Result<()> {
+    let mut names = BTreeSet::new();
+    for entry in entries {
+        if entry.name.trim().is_empty() || !names.insert(&entry.name) {
+            bail!("retired cards need nonempty, unique names");
+        }
+        let normal = |path: &Path| path.components().all(|p| matches!(p, std::path::Component::Normal(_)));
+        if !normal(&entry.report) || entry.report.components().count() != 3
+            || !entry.report.starts_with("benchmarks") {
+            bail!("retired report must be benchmarks/<family>/<directory>");
+        }
+        if !normal(&entry.config) || entry.config.components().count() != 3
+            || !entry.config.starts_with("examples/configs") || entry.config.extension().is_none_or(|e| e != "config") {
+            bail!("retired config must be examples/configs/<name>.config");
+        }
+        if entry.release.trim().is_empty() || entry.release.chars().any(char::is_control)
+            || entry.release_note.trim().is_empty() {
+            bail!("retired cards need a build version label and an explicit provenance note");
+        }
+    }
+    Ok(())
 }
 
 #[derive(Deserialize)]
@@ -166,6 +201,8 @@ pub struct Matrix {
 struct RawMatrix {
     schema: String,
     cells: Vec<RawRow>,
+    #[serde(default)]
+    retired: Vec<Retired>,
 }
 
 #[derive(Deserialize)]
@@ -238,7 +275,8 @@ impl Matrix {
             rows.push(MatrixRow::new(&row.family, &row.checkpoint,
                 cells.try_into().map_err(|_| anyhow::anyhow!("three cells per row"))?));
         }
-        Ok(Matrix { rows })
+        validate_retired(&raw.retired)?;
+        Ok(Matrix { rows, retired: raw.retired })
     }
 }
 
@@ -274,7 +312,7 @@ fn cell(column: Column, raw: RawCell, family: &str, checkpoint: &str) -> Result<
 /// A one-row matrix: the table and page renderers' test scaffolding.
 #[cfg(test)]
 pub fn one_row(family: &str, checkpoint: &str, cells: [Cell; 3]) -> Matrix {
-    Matrix { rows: vec![MatrixRow::new(family, checkpoint, cells)] }
+    Matrix { rows: vec![MatrixRow::new(family, checkpoint, cells)], retired: Vec::new() }
 }
 
 /// Re-renders the images a published run already carries from its own
@@ -545,8 +583,9 @@ fn grid_cell(cell: &Resolved) -> String {
 /// benchmarks index for everything older.
 pub fn results(placed: &[Placed], matrix: &Matrix) -> Result<String> {
     let rows = select(placed, matrix)?;
+    let retired = retired_results(placed, &matrix.retired)?;
     if rows.is_empty() {
-        return Ok("_Pending the first published run._\n".into());
+        return Ok(format!("_Pending the first published run._\n{retired}"));
     }
     let mut out = String::from("<table>\n<tr><th>Model · quant</th><th>5090</th><th>1× RTX</th><th>2× RTX</th></tr>\n");
     for row in &rows {
@@ -568,6 +607,34 @@ pub fn results(placed: &[Placed], matrix: &Matrix) -> Result<String> {
     out.push_str("Each card is one launch of the basic profile: tok/s for C1 decode and concurrent code with thinking \
         off, cold 8K prefill, logit fidelity against the family golden reference, prefix-cache restore exactness \
         and lossless speculation. Older releases, other profiles and every report: [benchmarks](benchmarks/README.md).\n");
+    out.push_str(&retired);
+    Ok(out)
+}
+
+fn retired_results(placed: &[Placed], entries: &[Retired]) -> Result<String> {
+    validate_retired(entries)?;
+    if entries.is_empty() { return Ok(String::new()); }
+    let escape = crate::render::svg::escape;
+    let mut out = String::from("\n### Retired\n\nLast Release-smoke cards for retired configurations; no new measurements. \
+        Version labels identify the actual tagged or development build recorded by each report; hover for provenance.\n\n\
+        <table>\n<tr><th>Model</th><th>Config</th><th>Version</th><th>Last card</th></tr>\n");
+    for entry in entries {
+        let p = placed.iter().find(|p| p.dir == entry.report)
+            .with_context(|| format!("{}: missing retired report {}", entry.name, entry.report.display()))?;
+        if p.report.profile != "smoke" || p.report.baseline.is_none() {
+            bail!("{}: retired card must pin a measured Release-smoke report", entry.name);
+        }
+        let build = &p.report.server.build;
+        let provenance = format!("build {}; commit {}; {}", build.label(),
+            build.commit.as_deref().unwrap_or("unknown"), entry.release_note);
+        let card = escape(&link(&p.dir, "card.svg"));
+        out.push_str(&format!("<tr><td>{}</td><td><a href=\"{}\">{}</a><br><sub>{}</sub></td>\
+            <td title=\"{}\">{}</td><td><a href=\"{card}\"><img width=\"360\" src=\"{card}\" alt=\"{}\"></a>{}{}</td></tr>\n",
+            escape(&p.report.server.checkpoint()), escape(&entry.config.to_string_lossy()),
+            escape(&entry.name), escape(&short_hardware(&p.report)),
+            escape(&provenance), escape(&entry.release), escape(&entry.name), quality_note(p), caveat(p)));
+    }
+    out.push_str("</table>\n");
     Ok(out)
 }
 
@@ -728,6 +795,8 @@ pub fn publish(root: &Path, dirs: &[PathBuf], matrix_path: &Path) -> Result<(Pat
     // Resolve first: a missing pinned report must fail before any file is touched.
     // Superseded exports remain archived unchanged, including their images.
     let rows = select(&placed, &matrix)?;
+    // Validate historical pins before touching any generated document or image.
+    retired_results(&placed, &matrix.retired)?;
     for row in &rows {
         for cell in &row.cells {
             if let Resolved::Card(p) = cell {
@@ -767,7 +836,7 @@ pub fn one_row_of(placed: &Placed) -> Matrix {
     };
     let cells = [cell(Column::Rtx5090), cell(Column::OneRtx), cell(Column::TwoRtx)];
     Matrix { rows: vec![MatrixRow::new(report.server.family.as_deref().unwrap_or("unknown"),
-        &report.server.checkpoint(), cells)] }
+        &report.server.checkpoint(), cells)], retired: Vec::new() }
 }
 
 #[cfg(test)]
@@ -862,7 +931,7 @@ mod tests {
         assert!(!html.contains("older/card.svg"));
         assert!(index(&reports).contains("older/report.svg"));
         // An empty matrix publishes nothing, and says so.
-        assert_eq!(results(&reports, &Matrix { rows: Vec::new() }).unwrap(), "_Pending the first published run._\n");
+        assert_eq!(results(&reports, &Matrix { rows: Vec::new(), retired: Vec::new() }).unwrap(), "_Pending the first published run._\n");
     }
 
     #[test]
@@ -1030,7 +1099,7 @@ mod tests {
             } },
         ];
         let matrix = Matrix { rows: vec![MatrixRow::new("mimo_v2", "XiaomiMiMo/MiMo-V2.6-Flash-MOPD",
-            [Cell::pending("no 5090 card yet"), Cell::current(), Cell::pending("no two-RTX card")])] };
+            [Cell::pending("no 5090 card yet"), Cell::current(), Cell::pending("no two-RTX card")])], retired: Vec::new() };
         let rows = select(&placed, &matrix).unwrap();
         assert_eq!(rows.len(), 1);
         assert!(!rows.iter().any(|row| row.label.contains("MiMo-V2-Flash")));
@@ -1118,6 +1187,71 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         assert!(Matrix::load(&root.path().join("absent.json")).is_err());
         assert!(Matrix::load(root.path()).is_err());
+    }
+
+    #[test]
+    fn retired_schema_and_rendering_are_pinned_and_escaped() {
+        let mut p = marked("old", 1, None);
+        p.report.profile = "smoke".into();
+        p.report.server.build.commit = Some("abc123".into());
+        let entry = Retired { name: "old<&".into(), config: "examples/configs/old.config".into(),
+            report: p.dir.clone(), release: "v3 dev 2026-10-14 <local>".into(), release_note: "actual <build>".into() };
+        let doc = serde_json::json!({"schema": MATRIX_SCHEMA, "cells": [], "retired": [entry]});
+        let matrix = Matrix::parse(&doc.to_string()).unwrap();
+        let html = results(&[p.clone()], &matrix).unwrap();
+        assert!(html.contains("### Retired"));
+        assert!(html.contains("old&lt;&amp;"));
+        assert!(html.contains("abc123; actual &lt;build&gt;"));
+        assert!(html.contains("v3 dev 2026-10-14 &lt;local&gt;</td>"));
+        let mut tagged = doc.clone();
+        tagged["retired"][0]["release"] = "v3.0.0-rc5".into();
+        let tagged = Matrix::parse(&tagged.to_string()).unwrap();
+        assert!(results(&[p.clone()], &tagged).unwrap().contains("v3.0.0-rc5</td>"));
+        assert!(html.contains("benchmarks/deepseek_v41/old/card.svg"));
+        assert!(!html.contains("<th>5090</th>"));
+        let newer = marked("newer", 1, None);
+        assert!(results(&[newer], &matrix).unwrap_err().to_string().contains("missing retired report"));
+        p.report.profile = "speed".into();
+        assert!(results(&[p], &matrix).is_err());
+        for (key, bad) in [("report", "../escape"), ("config", "examples/configs/../bad.config"),
+            ("release", ""), ("release", " \t"), ("release", "v3\ninvalid"), ("release_note", ""), ("name", "")] {
+            let mut invalid = doc.clone();
+            invalid["retired"][0][key] = bad.into();
+            assert!(Matrix::parse(&invalid.to_string()).is_err(), "{key}");
+        }
+        let mut duplicate = doc.clone();
+        duplicate["retired"].as_array_mut().unwrap().push(doc["retired"][0].clone());
+        assert!(Matrix::parse(&duplicate.to_string()).is_err());
+        let mut unknown = doc;
+        unknown["retired"][0]["typo"] = true.into();
+        assert!(Matrix::parse(&unknown.to_string()).is_err());
+    }
+
+    #[test]
+    fn current_exports_dry_render_only_adds_retired_section() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
+        let matrix = Matrix::load(&root.join(MATRIX_FILE)).unwrap();
+        let placed = scan(&root).unwrap();
+        let rendered = results(&placed, &matrix).unwrap();
+        let readme = std::fs::read_to_string(root.join("README.md")).unwrap();
+        let existing = readme.split_once(RESULTS_BEGIN).unwrap().1.split_once(RESULTS_END).unwrap().0.trim();
+        let current = rendered.split_once("\n### Retired").unwrap().0.trim();
+        // Once the generated README carries Retired, compare the same main section.
+        assert_eq!(current, existing.split_once("\n### Retired").map_or(existing, |(main, _)| main).trim());
+        assert_eq!(matrix.retired.len(), 14);
+        let retired = rendered.split_once("\n### Retired").unwrap().1;
+        assert!(!retired.contains("nearest final release"));
+        for entry in &matrix.retired {
+            let report = &placed.iter().find(|p| p.dir == entry.report).unwrap().report;
+            let expected = report.server.build.release.clone()
+                .unwrap_or_else(|| format!("v3 dev {}", &report.created[..10]));
+            assert_eq!(entry.release, expected, "{} must name the actual build", entry.name);
+            assert!(retired.contains(&format!(">{}</td>", crate::render::svg::escape(&expected))));
+            assert!(retired.contains(report.server.build.commit.as_deref().unwrap()));
+        }
+        let smoke: crate::smoke::Matrix = serde_json::from_str(&std::fs::read_to_string(
+            root.join("scripts/bench/release-smoke-v4.json")).unwrap()).unwrap();
+        assert_eq!(serde_json::to_value(&matrix.retired).unwrap(), serde_json::to_value(&smoke.retired).unwrap());
     }
 
     /// Writes `benchmarks/current-matrix.json` from rows: the real file, re-parsed by the real loader.

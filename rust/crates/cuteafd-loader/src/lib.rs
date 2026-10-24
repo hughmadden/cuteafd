@@ -1,3 +1,5 @@
+mod expert_reader;
+pub use expert_reader::EXPERT_READ_WINDOW_BYTES;
 pub mod kda;
 pub mod families;
 pub mod media;
@@ -10,11 +12,11 @@ pub use families::deepseek_v41::engram_gather::{
 pub use families::deepseek_v41::engram_staging::{EngramBatchStaging, EngramGatherView};
 pub use families::deepseek_v41::v41_expert_staging::{V41ExpertSelection, V41ExpertStaging};
 pub use families::deepseek_v41::v41_catalog::{
-    read_expert_catalog, read_official_v41_catalog, read_official_v41_spark_catalog, read_qwen4_mtp_expert_catalog, OfficialV41Catalog, RoutedExpertShape,
+    read_expert_catalog, read_official_v41_catalog, read_official_v41_role_catalog, read_official_v41_spark_catalog, read_qwen4_mtp_expert_catalog, OfficialV41Catalog, RoutedExpertShape,
     V41StorageBudget, V41Tensor, V41TensorPlacement, V41CoordinatorTensorReader,
 };
 pub use families::deepseek_v41::v41_exl3_residency::{V41Exl3Layer, V41Exl3Load, V41Exl3Residency, V41Exl3ResidentBuffer};
-pub use families::deepseek_v41::v41_exl3_staging::V41Exl3TensorSlice;
+pub use families::deepseek_v41::v41_exl3_staging::{V41Exl3TensorGather, V41Exl3TensorSlice};
 pub use families::deepseek_v41::v41_exl3::{read_v41_exl3_manifest, V41Exl3Manifest, V41Exl3Naming, V41Exl3Projection,
     V41Exl3ProjectionKind, V41_EXL3_SCHEMA};
 pub use families::deepseek_v41::v41_nvfp4::{
@@ -39,7 +41,9 @@ mod snapshot;
 mod tensors;
 mod tokenizer;
 pub mod plan;
+pub mod variants;
 pub mod placement;
+pub mod push_load;
 
 pub use formats::attention_format::{
     native_deepseek_v4_attention_tensor_specs, validate_native_deepseek_v4_attention_catalog,
@@ -83,7 +87,7 @@ pub use tensors::{
     LoadedTensorSummary, TensorLoadOptions,
 };
 pub use tokenizer::{
-    decode_tokenizer_ids, encode_tokenizer_text, encode_tokenizer_prompt, streaming_token_decoder, LoadedTokenizer,
+    cached_tokenizer, decode_tokenizer_ids, encode_tokenizer_text, encode_tokenizer_prompt, streaming_token_decoder, LoadedTokenizer,
     LiteralSpans, LiteralTokens,
     StreamingTokenDecoder, TokenizerDecodeSummary, TokenizerEncodingSummary,
 };

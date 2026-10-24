@@ -179,7 +179,7 @@ fn walk(model: &str, snapshot: Option<&Path>, hub: &Path, depth: usize,
         for mut chain in ancestry { chain.insert(0, model.into()); chains.push(chain); }
     }
     let publication = publication.unwrap();
-    if let Some((revision, config)) = dataset::default_publication(model) {
+    if let Some((revision, config)) = dataset::named_publication(model) {
         ensure!(revision == publication.revision && config == publication.config,
             "base_model and name match disagree for {model}: {} vs {config}", publication.config);
     }
@@ -208,7 +208,7 @@ pub fn resolve_in(model: &str, snapshot: Option<&Path>, hub: &Path) -> Result<Re
         return Ok(Resolution::new("base_model", p, chains));
     }
     let publication = official(model).or_else(|| {
-        let (revision, config) = dataset::default_publication(model)?;
+        let (revision, config) = dataset::named_publication(model)?;
         PUBLICATIONS.iter().find(|p| p.revision == revision && p.config == config)
     }).with_context(|| format!("no verified published fidelity config for {model}; missing base_model card"))?;
     let chain = if model == publication.root { vec![model.into()] } else { vec![model.into(), publication.root.into()] };
@@ -400,7 +400,7 @@ mod tests {
             ("nvidia/DeepSeek-V4.1-Flash-NVFP4", "base_model: [deepseek-ai/DeepSeek-V4.1-Flash]", dataset::CONFIG),
             ("wrldsuksgo2mars/DeepSeek-V4.1-EXL3-K3.25-v1", "base_model: deepseek-ai/DeepSeek-V4.1-Flash", dataset::CONFIG),
             ("diffbot/DeepSeek-V4.1-Flash-EXL3-2.0bpw-test", "base_model: deepseek-ai/DeepSeek-V4.1-Flash\nbase_model_relation: quantized", dataset::CONFIG),
-            ("wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K3.25-v1", "base_model: zai-org/GLM-5.3-Flash-BF16", dataset::GLMF_CONFIG),
+            ("wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K3.25-Core-FP8", "base_model: zai-org/GLM-5.3-Flash-BF16", dataset::GLMF_CONFIG),
             ("wrldsuksgo2mars/Qwen3.8-Flash-Next-EXL3-K4.25-PLE-FP8-v1", "base_model: [wrldsuksgo2mars/Qwen3.8-Flash-Next-EXL3-K4.25-v1, nvidia/Qwen3.8-Flash-Next-NVFP4]\nbase_model_relation: merge", dataset::QWEN_CONFIG),
         ];
         add(hub, "wrldsuksgo2mars/Qwen3.8-Flash-Next-EXL3-K4.25-v1", "base_model: Qwen/Qwen3.8-Flash-Next-FP8");

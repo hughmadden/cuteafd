@@ -675,7 +675,7 @@ mod tests {
 
     #[test]
     fn missing_saved_fidelity_pair_is_explicit_and_updates_partial_only() {
-        let mut report = Report { schema: crate::report::SCHEMA.into(), id: "current".into(),
+        let mut report = Report { schema: crate::report::SCHEMA.into(), prompt_content: Some(crate::text::PROMPT_CONTENT.into()), id: "current".into(),
             created: String::new(), finished: None, status: crate::report::RunStatus::Running,
             profile: "fidelity".into(), plan: vec![], server: Default::default(), fingerprint: String::new(),
             baseline: None, panels: vec![crate::report::PanelResult {

@@ -15,13 +15,13 @@ use super::format::{
 };
 
 pub mod residency;
+pub mod dense;
 
 /// Native selection is distinct from the ordinary GLM launch description.
 #[derive(Debug, Clone, Serialize)]
 pub struct NativeSelection {
     pub manifest: String,
     pub set_id: String,
-    pub dense_from: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -72,37 +72,41 @@ pub struct NativePlan {
 }
 
 /// Full-forward native admission, deliberately narrower than format inventory.
-pub fn native_plan(snapshot: &Path, selected: &str, dense: &Path,
+pub fn native_plan(snapshot: &Path, selected: &str,
     options: &super::PlanOptions, speculator: &str) -> Result<NativePlan> {
     use super::{ExpertPlacement, Status, RuntimeStatus, spec::Component};
     ensure!(matches!(selected, "up1" | "bit325"), "EXLR8 native manifest must be up1 or bit325");
     let world = match options.placement {
-        ExpertPlacement::Sparks { ranks } if (1..=6).contains(&ranks) => ranks,
-        _ => anyhow::bail!("EXLR8 native deployment requires canonical Sparks with 1..=6 ranks"),
+        ExpertPlacement::Sparks { ranks } if (1..=8).contains(&ranks) => ranks,
+        _ => anyhow::bail!("EXLR8 native deployment requires canonical Sparks with 1..=8 ranks"),
     };
-    ensure!(speculator == "off", "EXLR8 native deployment requires --speculator off");
-    ensure!(matches!(options.attention_placement, None | Some(crate::placement::AttentionPlacement::Context)),
-        "EXLR8 native deployment requires context attention");
-    let layout = options.layout.as_ref().context("EXLR8 native deployment requires --layout")?;
-    ensure!(layout.rtx_bytes.len() == 2, "EXLR8 native deployment requires two RTX GPUs");
-    ensure!(layout.local_expert_layers.is_none_or(|n| n == 0)
-        && layout.onboard.is_none_or(|n| n == crate::placement::Onboard::Layers(0)),
+    ensure!(matches!(speculator, "off" | "dflash2"), "EXLR8 native deployment supports off or dflash2 speculation");
+    let mut resolved_layout = options.layout.clone().context("EXLR8 native deployment requires --layout")?;
+    resolved_layout.glm5_drafter_disabled = speculator == "off";
+    let gpu_count = resolved_layout.rtx_bytes.len();
+    ensure!((1..=2).contains(&gpu_count), "EXLR8 native deployment requires 1..=2 RTX GPUs");
+    let attention = if gpu_count == 2 { crate::placement::AttentionPlacement::Context }
+        else { crate::placement::AttentionPlacement::Heads };
+    ensure!(options.attention_placement.is_none_or(|requested| requested == attention),
+        "EXLR8 native deployment with {gpu_count} RTX GPUs requires {attention} attention");
+    ensure!(resolved_layout.local_expert_layers.is_none_or(|n| n == 0)
+        && resolved_layout.onboard.is_none_or(|n| n == crate::placement::Onboard::Layers(0)),
         "EXLR8 native deployment cannot onboard routed experts");
-    ensure!(!layout.host_embedding && layout.drafter_bytes == 0, "EXLR8 requires GPU embedding and no drafter");
-    validate_dense_source(snapshot, dense)?;
-    let checkpoint = super::Checkpoint::coordinator(dense, false, false)?;
-    ensure!(checkpoint.config["quantization_config"]["quant_method"] == "fp8"
-        && checkpoint.config["quantization_config"]["weight_block_size"] == serde_json::json!([128,128]),
-        "EXLR8 dense source requires official compatible GLM-5.3 block-FP8 [128,128]");
+    ensure!(!resolved_layout.host_embedding, "EXLR8 requires GPU embedding");
+    let checkpoint = super::Checkpoint::open(snapshot)?;
+    let mut report = super::empty_report(&checkpoint, options)?;
+    let rows = if resolved_layout.prefill_rows == 0 { 4096 } else { resolved_layout.prefill_rows };
+    super::layout::glm5::resolve_prefill(&mut report, &mut resolved_layout, rows, world);
+    let layout = &resolved_layout;
     let cfg = crate::families::glm5::GlmDsaConfig::from_hf(&checkpoint.config)?;
     ensure!(cfg.hidden == 6144 && cfg.layers == 78 && cfg.first_moe_layer == 3,
         "EXLR8 native full-forward requires GLM-5.3 78 layers/hidden6144/first routed3");
     let (_, set_id) = manifest_identity(snapshot, selected)?;
-    let mut shared = vec![0u64; 2];
+    let mut shared = vec![0u64; gpu_count];
     let mut residents = vec![0u64; world];
     for layer in cfg.first_moe_layer..cfg.layers {
         for (rank, resident) in shared.iter_mut().enumerate() {
-            let plan = residency::Residency::plan(snapshot, selected, layer, 2, rank, residency::ExpertSet::Shared)?;
+            let plan = residency::Residency::plan(snapshot, selected, layer, gpu_count, rank, residency::ExpertSet::Shared)?;
             *resident = resident.checked_add(plan.resident_bytes as u64).context("EXLR8 shared residency overflow")?;
         }
         for (rank, resident) in residents.iter_mut().enumerate() {
@@ -116,33 +120,36 @@ pub fn native_plan(snapshot: &Path, selected: &str, dense: &Path,
         .unwrap_or_else(|| Path::new("/opt/cuteafd/share/PROGRAMS.json")))?;
     let workspace = shared_workspace(&programs)?;
     let (memory, placement) = super::layout::glm5::native_layout(&checkpoint, layout, &shared, workspace, world, &programs)?;
-    let mut dense_options = options.clone();
-    dense_options.layout = None;
-    // This pass classifies dense operands only; native_layout already admitted context TP2.
-    dense_options.attention_placement = None;
-    dense_options.draft_ownership = Some(super::spec::DraftOwnership::selected("glm5", "off"));
-    let mut report = super::plan(dense, &dense_options)?;
-    ensure!(report.config_error.is_none() && report.unclassified.is_empty()
-        && report.missing_shards.is_empty(), "EXLR8 dense source is not fully recognized: {:?}", report.hints);
-    for component in &mut report.components {
-        if matches!(component.component, Component::RoutedExpert | Component::SharedExpert) {
-            component.status = Status::Planned;
-            component.rejected = 0;
-            component.rejections.clear();
-            component.bytes = if component.component == Component::SharedExpert { shared.iter().sum() } else { residents.iter().sum() };
-            component.formats = BTreeMap::from([("exlr8".into(), component.tensors)]);
-        }
+    let family = super::family::detect(&checkpoint).context("EXLR8 family is not recognized")?;
+    let model = family.open(&checkpoint)?;
+    let records = dense::DenseRecord::inventory(snapshot)?;
+    report.family = Some(family.id().into());
+    report.spec = Some(model.spec().clone());
+    report.cache_requirements = crate::serving_capacity::cache_requirements(model.as_ref(), &checkpoint.config)?;
+    let mut components = BTreeMap::<Component, (usize, u64)>::new();
+    for record in &records {
+        let role = family.classify(model.spec(), &record.tensor)
+            .with_context(|| format!("unclassified EXLR8 dense operand {}", record.tensor))?;
+        let entry = components.entry(role.component).or_default();
+        entry.0 += 1;
+        entry.1 = entry.1.checked_add(record.components.iter().map(|c| c.source.bytes as u64).sum())
+            .context("EXLR8 dense component bytes overflow")?;
     }
-    ensure!(report.components.iter().filter(|c| !matches!(c.component, Component::RoutedExpert | Component::SharedExpert))
-        .all(|c| matches!(c.status, Status::Ready | Status::Unused | Status::Disabled)),
-        "EXLR8 dense source has unsupported coordinator operands");
+    for (component, bytes) in [(Component::SharedExpert, shared.iter().sum()),
+        (Component::RoutedExpert, residents.iter().sum())] {
+        components.insert(component, (cfg.layers - cfg.first_moe_layer, bytes));
+    }
+    report.components = components.into_iter().map(|(component, (tensors, bytes))| super::ComponentPlan {
+        component, owner: if component == Component::RoutedExpert { super::Owner::SparkSliced }
+            else { super::Owner::Rtx }, tensors, bytes, formats: BTreeMap::from([("exlr8".into(), tensors)]),
+        status: Status::Planned, rejected: 0, rejections: Vec::new(),
+    }).collect();
     report.snapshot = snapshot.display().to_string();
     report.runtime = Some(RuntimeStatus::Planned);
     report.native_serving_admitted = true;
     report.placement_supported = true;
     report.fits = true;
-    report.attention_placement = crate::placement::AttentionPlacement::Context;
-    report.prefill_rows = Some(if layout.prefill_rows == 0 { 4096 } else { layout.prefill_rows });
+    report.attention_placement = attention;
     report.experts = Some(super::family::ExpertContract { package: "glm:exlr8".into(), block: 128,
         spark_worlds: vec![world], local: Err("EXLR8 coordinator-local routed experts are unsupported".into()) });
     report.hints = vec![super::Hint { what: "EXLR8 native runtime is WIP admitted, not quality-qualified".into(),
@@ -158,8 +165,7 @@ pub fn native_plan(snapshot: &Path, selected: &str, dense: &Path,
     report.memory_layout = Some(memory);
     report.solver_placement = Some(placement);
     super::layout::charge_host(&mut report, layout, &checkpoint, true)?;
-    Ok(NativePlan { report, selection: NativeSelection { manifest: selected.into(), set_id,
-        dense_from: dense.display().to_string() }, sparks: SparkRequirements { resident_bytes_per_rank: residents,
+    Ok(NativePlan { report, selection: NativeSelection { manifest: selected.into(), set_id }, sparks: SparkRequirements { resident_bytes_per_rank: residents,
         k1_workspace: "checked_by_worker_live_admission" } })
 }
 
@@ -874,70 +880,9 @@ fn geometry(
     Ok(layers)
 }
 
-fn dense_source_members<'a>(
-    group: &BTreeMap<String, &'a super::checkpoint::CheckpointTensor>,
-    suffix: &str,
-) -> Result<BTreeMap<String, &'a super::checkpoint::CheckpointTensor>> {
-    ensure!(
-        group.contains_key(suffix),
-        "missing source tensor suffix {suffix}"
-    );
-    // Bias vectors have their own inventory rows; do not count them with weights
-    // or accidentally decode a sibling weight when replacing the bias row.
-    Ok(group
-        .iter()
-        .filter(|(key, _)| {
-            if suffix == "bias" {
-                key.as_str() == "bias"
-            } else {
-                key.as_str() != "bias"
-            }
-        })
-        .map(|(key, tensor)| (key.clone(), *tensor))
-        .collect())
-}
-
-/// Validate official dense replacement headers without running layout estimates or
-/// reading any expert payload. Serving and inspection share this exact contract.
-pub fn validate_dense_source(snapshot: &Path, source: &Path) -> Result<()> {
-    let config = read_json(&snapshot.join("config.json"))?;
-    let dense = dense_operands(snapshot, number(&config, "num_hidden_layers")?)?;
-    replacement_dense(&config, &dense, &super::Checkpoint::coordinator(source, false, false)?)?;
-    Ok(())
-}
-
-fn replacement_dense(config: &Value, dense: &[DenseOperand], original: &super::Checkpoint)
-    -> Result<Vec<DenseOperand>> {
-    // Identity/serialization metadata may differ; architecture equality alone is insufficient.
-    for (key, value) in config.as_object().context("config must be an object")? {
-        if key.starts_with('_') || ["quantization_config", "torch_dtype", "dtype",
-            "transformers_version", "base_model", "base_model_name_or_path"].contains(&key.as_str()) {
-            continue;
-        }
-        ensure!(original.config.get(key) == Some(value), "dense source architecture mismatch at {key}");
-    }
-    let groups = super::format::group_by_stem(&original.tensors);
-    dense.iter().map(|item| {
-        let (stem, suffix) = super::format::split_stem(&item.tensor);
-        let group = groups.get(stem).with_context(|| format!("dense source missing {stem}"))?;
-        let members = dense_source_members(group, suffix)
-            .with_context(|| format!("dense source missing {}", item.tensor))?;
-        let operand = super::format::detect(&members)?;
-        ensure!(operand.logical == item.shape, "dense source shape mismatch for {stem}");
-        Ok(DenseOperand {
-            tensor: item.tensor.clone(), shard: members.values().next().unwrap().shard.clone(),
-            encoding: operand.encoding, scale: operand.scale, shape: operand.logical,
-            bytes: members.values().map(|m| m.meta.byte_length).sum(),
-            sharded_side: item.sharded_side, channels_per_shard: item.channels_per_shard,
-            rotation: None, kernel: None,
-        })
-    }).collect()
-}
-
 pub fn inspect(
     snapshot: &Path,
     selected: &str,
-    dense_from: Option<&Path>,
     sparks: usize,
     rtx: usize,
     spark_budget: u64,
@@ -976,14 +921,8 @@ pub fn inspect(
         count,
         first,
     )?;
-    let mut dense = dense_operands(snapshot, count)?;
-    let dense_source = if let Some(source) = dense_from {
-        let original = super::Checkpoint::open(source)?;
-        dense = replacement_dense(&config, &dense, &original)?;
-        "official checkpoint config/headers (architecture matched)".to_owned()
-    } else {
-        "checkpoint native EXLR8 records (no BF16 conversion)".to_owned()
-    };
+    let dense = dense_operands(snapshot, count)?;
+    let dense_source = "checkpoint native EXLR8 records (no BF16 conversion)".to_owned();
     let mut names = BTreeSet::from([selected.to_string(), "bit325".into(), "up1".into()]);
     let mut manifests = Vec::new();
     for name in std::mem::take(&mut names) {
@@ -1116,22 +1055,35 @@ mod tests {
     #[test]
     fn native_refuses_unqualified_combinations_before_checkpoint_reads() {
         let mut options = super::super::PlanOptions { placement: super::super::ExpertPlacement::Sparks { ranks:4 },
-            layout: Some(super::super::layout::LayoutOptions { rtx_bytes: vec![96 << 30;2], ..Default::default() }),
+            layout: Some(super::super::layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)), rtx_bytes: vec![96 << 30;2], ..Default::default() }),
             ..Default::default() };
         let missing = Path::new("/no-native-checkpoint");
-        let error = |o: &super::super::PlanOptions, manifest, draft| native_plan(missing, manifest, missing, o, draft)
+        let error = |o: &super::super::PlanOptions, manifest, draft| native_plan(missing, manifest, o, draft)
             .err().unwrap().to_string();
         assert!(!error(&options,"up1","off").contains("rotation"));
         assert!(error(&options,"other","off").contains("manifest"));
-        assert!(error(&options,"up1","dflash2").contains("speculator off"));
+        assert!(!error(&options,"up1","dflash2").contains("speculation"));
+        assert!(error(&options,"up1","mtp").contains("off or dflash2"));
         options.placement = super::super::ExpertPlacement::Sparks { ranks:6 };
         assert!(!error(&options,"up1","off").contains("canonical Sparks"));
         options.placement = super::super::ExpertPlacement::Sparks { ranks:7 };
-        assert!(error(&options,"up1","off").contains("1..=6"));
+        assert!(!error(&options,"up1","off").contains("canonical Sparks"));
         options.placement = super::super::ExpertPlacement::Sparks { ranks:4 };
-        options.layout.as_mut().unwrap().rtx_bytes.truncate(1);
-        assert!(error(&options,"up1","off").contains("two RTX"));
-        options.layout.as_mut().unwrap().rtx_bytes.push(96 << 30);
+        for gpus in 0..=3 {
+            options.layout.as_mut().unwrap().rtx_bytes = vec![96 << 30; gpus];
+            assert_eq!(error(&options,"up1","off").contains("1..=2 RTX"), !(1..=2).contains(&gpus));
+            if !(1..=2).contains(&gpus) { continue; }
+            for attention in [None, Some(crate::placement::AttentionPlacement::Heads),
+                Some(crate::placement::AttentionPlacement::Context), Some(crate::placement::AttentionPlacement::Layers)] {
+                options.attention_placement = attention;
+                let expected = if gpus == 2 { crate::placement::AttentionPlacement::Context }
+                    else { crate::placement::AttentionPlacement::Heads };
+                assert_eq!(error(&options,"up1","off").contains("attention"),
+                    attention.is_some_and(|a| a != expected), "{gpus} GPUs, {attention:?}");
+            }
+            options.attention_placement = None;
+        }
+        options.layout.as_mut().unwrap().rtx_bytes = vec![96 << 30; 2];
         for lanes in 1..=4 {
             options.layout.as_mut().unwrap().prefill_lanes = lanes;
             assert!(!error(&options,"up1","off").contains("serial"));
@@ -1277,62 +1229,6 @@ mod tests {
     }
 
     #[test]
-    fn official_dense_weight_and_bias_are_independent_native_operands() {
-        use super::super::testing::{t, write_snapshot};
-        let temp = tempfile::tempdir().unwrap();
-        write_snapshot(
-            temp.path(),
-            &json!({}),
-            &[
-                t("norm.weight", "BF16", &[128]),
-                t("norm.bias", "F32", &[128]),
-                t("proj.weight", "F8_E4M3", &[128, 128]),
-                t("proj.weight_scale_inv", "F32", &[1, 1]),
-                t("proj.bias", "BF16", &[128]),
-            ],
-            None,
-        );
-        let source = super::super::Checkpoint::open(temp.path()).unwrap();
-        let groups = super::super::format::group_by_stem(&source.tensors);
-        for (name, encoding, bytes) in [
-            ("norm.weight", Encoding::Bf16, 256),
-            ("norm.bias", Encoding::F32, 512),
-            ("proj.weight", Encoding::E4m3, 16388),
-            ("proj.bias", Encoding::Bf16, 256),
-        ] {
-            let (stem, suffix) = super::super::format::split_stem(name);
-            let members = dense_source_members(&groups[stem], suffix).unwrap();
-            let operand = super::super::format::detect(&members).unwrap();
-            assert_eq!(operand.encoding, encoding);
-            assert_eq!(
-                members.values().map(|m| m.meta.byte_length).sum::<u64>(),
-                bytes
-            );
-            assert!(operand.companions.is_empty() || suffix == "bias");
-        }
-        assert!(dense_source_members(&groups["norm"], "scale").is_err());
-    }
-
-    #[test]
-    fn replacement_dense_checks_architecture_and_logical_shape() {
-        use super::super::testing::{t, write_snapshot};
-        let temp = tempfile::tempdir().unwrap();
-        write_snapshot(temp.path(), &json!({"hidden_size":128}),
-            &[t("norm.weight", "BF16", &[128])], None);
-        let checkpoint = super::super::Checkpoint::open(temp.path()).unwrap();
-        let mut dense = vec![DenseOperand { tensor: "norm.weight".into(), shard: "native".into(),
-            encoding: Encoding::Bf16, scale: None, shape: vec![128], bytes: 256,
-            sharded_side: 0, channels_per_shard: 0, rotation: None, kernel: None }];
-        assert!(replacement_dense(&json!({"hidden_size":128,"torch_dtype":"float16"}),
-            &dense, &checkpoint).is_ok());
-        assert!(replacement_dense(&json!({"hidden_size":256}), &dense, &checkpoint)
-            .unwrap_err().to_string().contains("architecture mismatch"));
-        dense[0].shape = vec![64];
-        assert!(replacement_dense(&json!({"hidden_size":128}), &dense, &checkpoint)
-            .unwrap_err().to_string().contains("shape mismatch"));
-    }
-
-    #[test]
     fn ownership_rotates_every_layer_and_balances_all_units() {
         for n in 3..=7 {
             for layer in [3, 40, 77] {
@@ -1364,7 +1260,7 @@ mod mounted_tests {
         };
         let root = std::path::Path::new(&snapshot);
         assert!(super::recognizes(root).unwrap());
-        let report = super::inspect(root, "bit325", None, 6, 2, 100 << 30, 80 << 30).unwrap();
+        let report = super::inspect(root, "bit325", 6, 2, 100 << 30, 80 << 30).unwrap();
         assert!(!report.supported);
         assert!(report.selected_weights_fit);
         assert_eq!(report.fit.len(), 32);
@@ -1389,21 +1285,6 @@ mod mounted_tests {
                 report.render(),
             )
             .unwrap();
-        }
-        if let Some(dense) = std::env::var_os("CUTEAFD_EXLR8_TEST_DENSE") {
-            super::validate_dense_source(root, std::path::Path::new(&dense)).unwrap();
-            let official = super::inspect(
-                root,
-                "up1",
-                Some(std::path::Path::new(&dense)),
-                4,
-                1,
-                100 << 30,
-                80 << 30,
-            )
-            .unwrap();
-            assert!(official.dense_source.contains("official"));
-            assert!(official.dense_bytes > report.dense_bytes);
         }
     }
 }

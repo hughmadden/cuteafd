@@ -49,7 +49,8 @@ pub(super) struct Worker<'w, 'a> {
 }
 
 pub(super) fn load<'a>(library: &'a NativeLibrary, catalog: &OfficialV41Catalog,
-    config: &NativeExpertServiceConfig, programs: &'a Programs<'a>)
+    config: &NativeExpertServiceConfig, programs: &'a Programs<'a>,
+    push: Option<&mut std::net::TcpStream>)
     -> Result<(backend::Weights<'a>, usize)> {
     let manifest = config.exlr8_manifest.as_deref().context("EXLR8 worker requires a manifest")?;
     let model = config.model_admission.as_ref().context("EXLR8 requires model admission")?;
@@ -58,8 +59,9 @@ pub(super) fn load<'a>(library: &'a NativeLibrary, catalog: &OfficialV41Catalog,
         "EXLR8 worker requires standard FP8 K32 ingress and BF16 partials");
     let rows = config.capacity as usize;
     let fallback_staging = rows.checked_mul({ let h = catalog.routed_experts().geometry()?.hidden as usize; h + h / 32 }).context("EXLR8 fallback staging overflow")?;
-    let plans = config.resident_layers(catalog.routed_experts().layers)?.into_iter()
-        .map(|layer| Residency::plan(&config.snapshot, manifest, layer, config.world,
+    let layers = config.resident_layers(catalog.routed_experts().layers)?;
+    let plans = layers.iter()
+        .map(|&layer| Residency::plan(&config.snapshot, manifest, layer, config.world,
             config.rank, ExpertSet::Routed).map_err(anyhow::Error::from))
         .collect::<Result<Vec<_>>>()?;
     let unit_limit = plans.iter().map(Residency::compact_unit_limit).max().context("EXLR8 has no resident plans")?;
@@ -81,13 +83,21 @@ pub(super) fn load<'a>(library: &'a NativeLibrary, catalog: &OfficialV41Catalog,
         "EXLR8 admission exceeds budget: load {} serve {} budget {}",
         peak.load_peak, peak.serve_peak, config.device_budget);
     admit_worker_peak(library, peak.load_peak, peak.serve_peak)?;
-    let mut weights = Vec::with_capacity(plans.len());
-    let mut remaining = config.device_budget;
-    for plan in plans {
-        let bytes = plan.resident_bytes;
-        weights.push(Exlr8Weights::load(library, plan, remaining - workspace)?);
-        remaining = remaining.checked_sub(bytes).context("EXLR8 resident budget exhausted")?;
+    if let Some(stream) = push {
+        if let Some(weights) = super::push_exlr8::load(library, config, &plans, &budgets,
+            resident, workspace, retained_host, descriptors, stream)? {
+            return Ok((backend::Weights::Exlr8(weights), config.device_budget - resident - retained_host));
+        }
     }
+    let mut plans: Vec<_> = plans.into_iter().map(Some).collect();
+    let mut remaining = config.device_budget;
+    let weights = crate::shared::experts::load_in_rank_order(&layers, config.rank, |index, _| {
+        let plan = plans[index].take().context("EXLR8 resident plan loaded twice")?;
+        let bytes = plan.resident_bytes;
+        let weight = Exlr8Weights::load(library, plan, remaining - workspace)?;
+        remaining = remaining.checked_sub(bytes).context("EXLR8 resident budget exhausted")?;
+        Ok(weight)
+    })?;
     tracing::info!(rank = config.rank, resident, workspace, k1_workspace_bytes, fallback_staging, retained_host,
         load_peak = peak.load_peak, serve_peak = peak.serve_peak, "EXLR8 worker admitted");
     Ok((backend::Weights::Exlr8(weights), remaining - retained_host))
@@ -255,6 +265,16 @@ unsafe fn library_copy(library: &NativeLibrary, target: CuteafdDeviceBuffer,
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn exlr8_load_order_starts_after_peak_admission() {
+        let source = include_str!("exlr8.rs").split("#[cfg(test)]").next().unwrap();
+        let admission = source.find("admit_worker_peak(library, peak.load_peak, peak.serve_peak)?").unwrap();
+        let order = source.find("crate::shared::experts::load_in_rank_order(&layers, config.rank").unwrap();
+        let take = source.find("plans[index].take()").unwrap();
+        let upload = source.find("Exlr8Weights::load(library, plan, remaining - workspace)?").unwrap();
+        assert!(admission < order && order < take && take < upload);
+    }
+
     #[test]
     fn exlr8_traffic_bound_charges_each_route_not_one_layer_per_route() -> Result<()> {
         use cuteafd_transport::worker_selection::{WorkerIdentity, WorkerSelection};

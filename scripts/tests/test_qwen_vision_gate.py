@@ -107,7 +107,11 @@ def test_qwen_bucket_projection_registry_matches_pinned_fork():
     tables = {node.targets[0].id: ast.literal_eval(node.value) for node in skinny.body
               if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name)
               and node.targets[0].id in ("DECODE_TMA_TILES", "SKINNY_TILES_BY_ROWS")}
-    assert set(tables["DECODE_TMA_TILES"]) == {(2560, 6144), (16480, 2560), (13952, 2560), (2560, 640), (10240, 320)}
+    # Qwen's row-tiled shapes are pinned exactly; other families' keys (Step-5's, fork #71)
+    # must not alias a Qwen [N, K].
+    qwen_tiles = {(2560, 6144), (16480, 2560), (13952, 2560), (2560, 640), (10240, 320)}
+    step5_tiles = {(4096, 12288), (4096, 6144), (384, 4096), (3072, 4096)}
+    assert set(tables["DECODE_TMA_TILES"]) == qwen_tiles | step5_tiles
     for (n, k), entries in tables["SKINNY_TILES_BY_ROWS"].items():
         assert len({t for _, _, _, t in entries}) == 1
         assert entries[-1][0] == scalar_rule(n, k)
@@ -194,6 +198,75 @@ def test_qwen_cold_replay_echo_has_validated_prefill_decode_execution():
     assert "} else { engine.prefill_device(&mut p.placement, chunk, 1, cache.pool())? };" in serve
     assert 'matches!(engine, "mimo_v2" | "glm5_flash" | "qwen4" | "deepseek_v41")' in api
     assert "else if logits.is_some() { PointPlan::default() } else { plan }" in serve
+
+
+def test_qwen_unit_table_uploads_are_reserved_at_full_extent_before_startup_body():
+    root = ROOT / "rust/crates/cuteafd-daemon/src/families/qwen4"
+    engine = (root / "engine.rs").read_text()
+    family = (root / "mod.rs").read_text()
+    startup = family[family.index("pub fn with_engine<T>"):family.index("    fn experts<'s>")]
+    assert startup.index("engine.prepare_scoring_prefill()?") < startup.index("engine.prepare_prefill_units()?")
+    assert startup.index("engine.prepare_prefill_units()?") < startup.index("let result = body(&engine);")
+
+    prepare = engine[engine.index("    pub(crate) fn prepare_prefill_units("):engine.index("    fn reserve_prefill_tables(")]
+    assert "let Some(shape) = self.prefill_shape else { return Ok(()) };" in prepare
+    assert "self.workspace_rows(shape.unit_rows as usize, false," in prepare
+    assert "shape.slot_rows() as usize" in prepare
+    assert "if self.full_prefill_logits { self.prefill_rows } else { 1 }" in prepare
+    assert prepare.index("self.workspace_rows(") < prepare.index("self.reserve_prefill_tables(")
+
+    destinations = engine[engine.index("    fn ordered_prefill_tables("):engine.index("    fn live_buffer(")]
+    stage = engine[engine.index("    fn stage_step_tables("):engine.index("    /// Unfused ownership transitions:")]
+    embedding = engine[engine.index("    fn stage_embedding("):engine.index("    /// Queues `bytes`")]
+    uploads = set(re.findall(r"self\.stage_table\(w, &w\.(\w+),", stage + embedding))
+    assert set(re.findall(r"&self\.(\w+)", destinations)) == uploads
+    assert "ple_ids.then_some(&self.ple_ids)" in destinations
+    assert ".map(|table| table.buffer)" in destinations
+    assert ".filter(|buffer| buffer.bytes > 0)" in destinations
+    assert "live_buffer" not in destinations and "region(" not in destinations
+    reserve = engine[engine.index("    fn reserve_prefill_tables("):engine.index("    /// Pre-capture every reachable")]
+    assert "self.ple.as_ref().map(|ple| ple.mapped()).is_none()" in reserve
+    assert "workspace.ordered_prefill_tables(ple_ids)" in reserve
+    assert "self.library.reserve_h2d_ordered(destination, self.execution_stream())?" in reserve
+
+    units = engine[engine.index("    fn prefill_units("):engine.index("    pub(crate) fn mtp_prefill_rows(")]
+    assert units.index("self.prepare_prefill_units()?") < units.index("run_prefill_units(&mut hooks")
+
+
+def test_qwen_joint_host_admission_precedes_lazy_allocations_on_every_layout():
+    root = ROOT / "rust/crates/cuteafd-daemon/src/families/qwen4"
+    engine = (root / "engine.rs").read_text()
+    for filename in ["mod.rs", "dual.rs"]:
+        startup = (root / filename).read_text()
+        assert startup.count("engine.admit_host_memory(args)?;") == 1
+        assert startup.index("engine.admit_host_memory(args)?;") < startup.index("engine.prepare_scoring_prefill()?")
+        assert startup.index("engine.admit_host_memory(args)?;") < startup.index("let result = body(&engine);")
+
+    admit = engine[engine.index("    pub(super) fn admit_host_memory("):engine.index("    fn future_host_workspaces(")]
+    assert "!self.host_memory_admitted" in admit
+    assert "prefix.resolve_host_config(layout, self.max_context, *lanes)?" in admit
+    assert admit.index("self.future_host_workspaces(") < admit.index("budget::admit_host_memory(")
+    assert "config.as_ref().map_or(0, |c| c.bytes)" in admit
+    assert admit.index("budget::admit_host_memory(") < admit.index("self.host_prefix_config = config;")
+    assert "self.host_memory_admitted = true;" in admit
+
+    future = engine[engine.index("    fn future_host_workspaces("):engine.index("    /// Size every unit-table upload")]
+    assert "for owner in 0..self.gdn_banks.len()" in future
+    assert "for decode in [false, true]" in future
+    assert "self.workspace_slot(owner, decode)?.borrow().is_some() { continue; }" in future
+    for field in ["host.router", "host.staging", "host.ordered", "host.logits"]:
+        assert field in future
+    assert "self.mtp_prefill_workspace.borrow().is_none()" in future
+    assert "self.mtp_prefill_rows()" in future
+    assert "ple.mapped()" in future
+    assert "HostAllocation::new" not in future
+
+    serve = (root / "serve.rs").read_text()
+    assert "args.planner_host_prefix = Some((prefix.clone(), max_sequences.min(DECODE_ROWS)));" in serve
+    cache = serve[serve.index("fn prefix_cache"):]
+    assert "engine.host_prefix_config.clone().map(|config|" in cache
+    assert ".host_config(" not in cache and ".resolve_host_config(" not in cache
+    assert ".with_scoring(" not in cache
 
 
 def test_qwen_graph_stats_are_published_before_ready_and_on_every_update():

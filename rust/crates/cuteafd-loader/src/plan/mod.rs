@@ -14,6 +14,7 @@ pub mod layout;
 pub mod names;
 pub mod rope;
 pub mod spec;
+pub mod spark_range;
 #[doc(hidden)]
 pub mod testing;
 
@@ -146,6 +147,8 @@ impl ExpertPlacement {
 /// Planning options that cannot describe a deployment.
 #[derive(Debug, thiserror::Error)]
 pub enum PlanError {
+    #[error(transparent)]
+    SparkRange(#[from] spark_range::RangeRefusal),
     #[error("invalid {option}: {reason}")]
     InvalidOption { option: &'static str, reason: String },
     #[error(transparent)]
@@ -220,12 +223,21 @@ pub struct PlanReport {
     /// A single diagnostic when an unspecified Spark count falls back.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub spark_count_warning: Option<String>,
-    /// Resolved prefill shape, including V4.1 automatic capacity admission.
+    /// Policy refusal, distinct from absent executable packages.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub prefill_rows: Option<u64>,
-    /// Solver-selected GLM prefill lanes, shared by device and host admission.
+    pub spark_range_refusal: Option<spark_range::RangeRefusal>,
+    /// Resolved retained prefill span, not the row count of an individual unit.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub prefill_lanes: Option<u64>,
+    pub prefill_span_rows: Option<u64>,
+    /// Family-resolved rows per unit; never inferred from the retained span.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prefill_unit_rows: Option<u64>,
+    /// Family-resolved units in flight on each transport.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prefill_waves: Option<u64>,
+    /// Solver-selected transport count, independent of units in flight.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prefill_transports: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prefill_selection: Option<String>,
     /// The package and layouts that serve this checkpoint's routed experts.
@@ -320,15 +332,14 @@ impl PlanOptions {
         }
     }
 
-    /// Rejects options that describe no deployment: Spark worlds the
-    /// transport does not run (it runs 1 through 6; 0 is the local-only
-    /// placement) and empty budgets.
+    /// Rejects counts outside the shared world ceiling and empty budgets.
+    /// Zero is the local-only placement.
     pub fn validate(&self) -> Result<(), PlanError> {
         if let ExpertPlacement::Sparks { ranks } = self.placement {
-            if !experts::TRANSPORT_WORLDS.contains(&ranks) {
+            if !(1..=cuteafd_core::MAX_SPARK_WORLD).contains(&ranks) {
                 return Err(PlanError::InvalidOption {
                     option: "spark ranks",
-                    reason: format!("{ranks}: the expert transport runs 1 through 6 Spark ranks \
+                    reason: format!("{ranks}: the expert transport runs 1 through 8 Spark ranks \
                         (0 places every routed expert on the coordinator)"),
                 });
             }
@@ -459,7 +470,7 @@ pub fn plan(snapshot: &Path, options: &PlanOptions) -> Result<PlanReport, PlanEr
 }
 
 fn family_layout(model: &dyn FamilyModel, input: &PlanInput, report: &mut PlanReport,
-    options: &layout::LayoutOptions, requested: ExpertPlacement)
+    options: &mut layout::LayoutOptions, requested: ExpertPlacement)
     -> anyhow::Result<cuteafd_core::memory_layout::MemoryLayout> {
     match model.placement(input, report, options, requested) {
         Some(Ok(memory)) => {
@@ -495,9 +506,22 @@ fn family_layout(model: &dyn FamilyModel, input: &PlanInput, report: &mut PlanRe
 }
 
 fn plan_of(input: &PlanInput, options: &PlanOptions) -> Result<PlanReport, PlanError> {
-    options.validate()?;
-    let checkpoint = input.checkpoint();
-    let mut report = PlanReport {
+    let mut report = plan_unrestricted(input, options)?;
+    match spark_range::admit(input, options, &report) {
+        Ok(()) => {},
+        Err(PlanError::SparkRange(refusal)) => {
+            report.placement_supported = false;
+            report.hints.push(Hint { what: refusal.to_string(),
+                how: "Choose a Spark count within the checkpoint's supported range.".into() });
+            report.spark_range_refusal = Some(refusal);
+        },
+        Err(error) => return Err(error),
+    }
+    Ok(report)
+}
+
+pub(crate) fn empty_report(checkpoint: &Checkpoint, options: &PlanOptions) -> anyhow::Result<PlanReport> {
+    Ok(PlanReport {
         mapped_placement: Default::default(),
         host_budget_bytes: 0,
         host_ledger: None,
@@ -532,8 +556,11 @@ fn plan_of(input: &PlanInput, options: &PlanOptions) -> Result<PlanReport, PlanE
         placement: options.placement,
         spark_ranks: options.placement.spark_ranks(),
         spark_count_warning: None,
-        prefill_rows: None,
-        prefill_lanes: None,
+        spark_range_refusal: None,
+        prefill_span_rows: None,
+        prefill_unit_rows: None,
+        prefill_waves: None,
+        prefill_transports: None,
         prefill_selection: None,
         experts: None,
         placement_supported: true,
@@ -545,7 +572,13 @@ fn plan_of(input: &PlanInput, options: &PlanOptions) -> Result<PlanReport, PlanE
         hints: Vec::new(),
         memory_layout: None,
         solver_placement: None,
-    };
+    })
+}
+
+fn plan_unrestricted(input: &PlanInput, options: &PlanOptions) -> Result<PlanReport, PlanError> {
+    options.validate()?;
+    let checkpoint = input.checkpoint();
+    let mut report = empty_report(checkpoint, options)?;
     // ModelOpt exports describe what they quantized; each weight's tensors
     // must agree with that description.
     let modelopt = match crate::formats::modelopt::ModelOpt::read(&checkpoint.snapshot, &checkpoint.config) {
@@ -590,6 +623,8 @@ fn plan_of(input: &PlanInput, options: &PlanOptions) -> Result<PlanReport, PlanE
         match executor.check_attention(options.attention_placement, gpus, peer) {
             Ok(mode) => report.attention_placement = mode,
             Err(error) => {
+                report.fits = false;
+                report.placement_supported = false;
                 report.config_error = Some(error.to_string());
                 report.hints.push(Hint { what: error.to_string(),
                     how: format!("Implement the {} attention executor before enabling this placement; use --attention-placement heads today.", family.id()) });
@@ -601,7 +636,10 @@ fn plan_of(input: &PlanInput, options: &PlanOptions) -> Result<PlanReport, PlanE
         report.max_image_tokens = Some(crate::media::QWEN_MAX_IMAGE_TOKENS);
     }
     report.runtime = Some(family.runtime());
-    let model = match family.open(&checkpoint) {
+    let model = match family.open(&checkpoint).and_then(|mut model| {
+        model.configure(options)?;
+        Ok(model)
+    }) {
         Ok(model) => model,
         Err(error) => {
             report.hints.push(Hint {
@@ -797,7 +835,9 @@ fn plan_of(input: &PlanInput, options: &PlanOptions) -> Result<PlanReport, PlanE
         let mut layout_options = layout_options.clone();
         if !ownership.uses_checkpoint() { layout_options.native_mtp_layers = 0; }
         layout_options.weight_budget_bytes = options.coordinator_budget_bytes;
-        let memory = family_layout(model.as_ref(), input, &mut report, &layout_options, options.placement)?;
+        let memory = family_layout(model.as_ref(), input, &mut report, &mut layout_options, options.placement)?;
+        report.prefill_unit_rows = layout_options.prefill_unit_rows;
+        report.prefill_waves = Some(layout_options.prefill_waves);
         if layout_options.host_embedding {
             for note in memory.notes.iter().filter(|n| n.starts_with("host embedding ineligible:")) {
                 report.fits = false;
@@ -816,8 +856,9 @@ fn plan_of(input: &PlanInput, options: &PlanOptions) -> Result<PlanReport, PlanE
                 });
             }
         }
+        let refused = !report.placement_supported && memory.devices.is_empty();
         report.memory_layout = Some(memory);
-        layout::charge_host(&mut report, &layout_options, checkpoint, false)?;
+        if !refused { layout::charge_host(&mut report, &layout_options, checkpoint, false)?; }
     }
     if !report.unclassified.is_empty() {
         report.hints.push(Hint {
@@ -838,11 +879,13 @@ fn plan_of(input: &PlanInput, options: &PlanOptions) -> Result<PlanReport, PlanE
     }
     if options.layout.is_none() {
         // A tensor-only inventory does not request an external speculation checkpoint.
-        let inventory = layout::LayoutOptions { rtx_bytes: vec![options.coordinator_budget_bytes], spark_bytes: options.spark_budget(),
+        let mut inventory = layout::LayoutOptions { rtx_bytes: vec![options.coordinator_budget_bytes], spark_bytes: options.spark_budget(),
             spark_allocation_budget_bytes: Some(options.spark_budget()), glm5_drafter_disabled: true,
             glmf_drafter_disabled: true, native_mtp_layers: if ownership.uses_checkpoint() { 3 } else { 0 },
             weight_budget_bytes: options.coordinator_budget_bytes, ..Default::default() };
-        let _ = family_layout(model.as_ref(), input, &mut report, &inventory, options.placement)?;
+        let _ = family_layout(model.as_ref(), input, &mut report, &mut inventory, options.placement)?;
+        report.prefill_unit_rows = inventory.prefill_unit_rows;
+        report.prefill_waves = Some(inventory.prefill_waves);
     }
     if let Some(encoder) = &report.encoder {
         let owner = match &encoder.kind {
@@ -1060,7 +1103,7 @@ fn plan_spark_count_of(input: &PlanInput, options: &PlanOptions, available: usiz
             return Ok(report);
         }
         let rows = candidate.layout.as_ref().unwrap().prefill_rows;
-        report.prefill_rows = Some(if rows == 0 { 2048 } else { rows });
+        report.prefill_span_rows = Some(if rows == 0 { 2048 } else { rows });
         if rows != 0 {
             if !report.executable() {
                 report.hints.push(Hint {
@@ -1078,7 +1121,7 @@ fn plan_spark_count_of(input: &PlanInput, options: &PlanOptions, available: usiz
                 layout.prefill_rows = rows;
                 layout.spark_capacity_rows = rows;
                 let mut smaller = input.plan(&candidate)?;
-                smaller.prefill_rows = Some(rows);
+                smaller.prefill_span_rows = Some(rows);
                 if smaller.executable() {
                     smaller.prefill_selection = Some(format!(
                         "V4.1 automatic prefill selected {rows} rows (2048 refused: {reason})"));

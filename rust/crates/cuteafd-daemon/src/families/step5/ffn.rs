@@ -1,4 +1,5 @@
 //! Admitted post-attention dense FFN. This is not a serving executor.
+use super::scratch::{self, Arena, Plane};
 use super::weights::load_operand;
 use crate::shared::memory::device::{Allocation, Device, Stream};
 use anyhow::{ensure, Context, Result};
@@ -6,7 +7,7 @@ use cuteafd_core::{DType, FfnActivation};
 use cuteafd_ffi::programs::{Program, Programs, Scalar};
 use cuteafd_loader::plan::{
     checkpoint::Checkpoint,
-    families::step5::coordinator::{CoordinatorContract, RankWeightLayout, WeightOperand},
+    families::step5::{Config, coordinator::{LayerContract, RankWeightLayout, WeightOperand}},
 };
 
 const HIDDEN: usize = 4096;
@@ -15,6 +16,8 @@ const DENSE: usize = 13824;
 #[derive(Debug, Clone)]
 struct Admission {
     rows: usize,
+    /// Rows of every in-flight unit held by the live planes (`span >= rows`).
+    span: usize,
     planes: [usize; 6],
     bytes: u64,
 }
@@ -30,26 +33,9 @@ impl Admission {
             rows > 0 && rows <= 4096,
             "Step-5 dense row capacity must be 1..=4096"
         );
-        let shapes = [
-            (HIDDEN, 4),
-            (HIDDEN, 2),
-            (2 * DENSE, 2),
-            (DENSE, 2),
-            (HIDDEN, 2),
-            (HIDDEN, 4),
-        ];
-        let mut planes = [0; 6];
-        let mut bytes = 0u64;
-        for (plane, (width, elem)) in planes.iter_mut().zip(shapes) {
-            *plane = rows
-                .checked_mul(width)
-                .and_then(|n| n.checked_mul(elem))
-                .context("dense workspace overflow")?
-                .max(256);
-            bytes = bytes
-                .checked_add(*plane as u64)
-                .context("dense workspace overflow")?;
-        }
+        let planes = cuteafd_loader::plan::families::step5::native::dense_planes(rows)?;
+        let mut bytes = planes.iter().try_fold(0u64, |n, &v| n.checked_add(v as u64))
+            .context("dense workspace overflow")?;
         for weight in weights {
             bytes = bytes
                 .checked_add(weight.allocation_bytes)
@@ -65,6 +51,7 @@ impl Admission {
         );
         Ok(Self {
             rows,
+            span: rows,
             planes,
             bytes,
         })
@@ -80,9 +67,11 @@ struct DenseWeights<'a> {
 pub(super) struct DenseFfn<'a> {
     // Fields drop in declaration order: drain before storage or programs retire.
     stream: Stream<'a>,
-    planes: Vec<Allocation<'a>>,
+    planes: Vec<Plane<'a>>,
     admission: Admission,
     immutable: std::rc::Rc<DenseWeights<'a>>,
+    /// Row offset of the selected prefill unit inside the live planes.
+    unit: std::cell::Cell<usize>,
 }
 
 pub(super) struct DensePlan {
@@ -99,7 +88,20 @@ impl DensePlan {
     }
 
     pub fn workspace_bytes(&self) -> u64 {
-        self.admission.planes.iter().map(|&n| n as u64).sum()
+        cuteafd_loader::plan::families::step5::native::plane_bytes(&self.admission.planes).expect("admitted planes")
+    }
+
+    /// Live planes hold `span` rows (every in-flight unit); scratch holds one.
+    pub(super) fn with_span(mut self, span: usize) -> Result<Self> {
+        ensure!(span >= self.admission.rows && span <= 4096, "Step-5 dense span outside 1..=4096");
+        let live = cuteafd_loader::plan::families::step5::native::dense_planes(span)?;
+        for plane in 0..6 {
+            if cuteafd_loader::plan::families::step5::native::dense_live(plane) {
+                self.admission.planes[plane] = live[plane];
+            }
+        }
+        self.admission.span = span;
+        Ok(self)
     }
 
     pub fn prepare(
@@ -129,6 +131,16 @@ impl DensePlan {
             RankWeightLayout::for_execution(checkpoint, rank, ownership)?)
     }
 
+    pub(super) fn for_mtp_stage(
+        programs: &Programs<'_>, checkpoint: &Checkpoint, stage: usize, rows: usize,
+        available: u64, reservations: &[u64],
+    ) -> Result<Self> {
+        let layout = RankWeightLayout::for_mtp_stage(checkpoint, stage)?;
+        let cfg = Config::parse(checkpoint)?;
+        Self::prepare_layout(programs, checkpoint, cfg.layers + stage, rows, available,
+            reservations, layout)
+    }
+
     fn prepare_layout(
         programs: &Programs<'_>,
         checkpoint: &Checkpoint,
@@ -138,15 +150,12 @@ impl DensePlan {
         reservations: &[u64],
         layout: RankWeightLayout,
     ) -> Result<Self> {
-        let contract = CoordinatorContract::from_checkpoint(checkpoint)?;
-        let layer_contract = contract
-            .layers
-            .get(layer)
-            .context("dense target layer out of range")?;
+        let cfg = Config::parse(checkpoint)?;
+        let layer_contract = LayerContract::from_config(&cfg, layer)?;
         let Some(FfnActivation::SiluPostClampFp32Product { limit }) =
             layer_contract.dense_activation
         else {
-            anyhow::bail!("Step-5 dense chain requires a dense target layer");
+            anyhow::bail!("Step-5 dense chain requires a dense layer");
         };
         ensure!(
             limit == 7.0 || limit == 10.0,
@@ -239,12 +248,17 @@ impl DensePlan {
             weights,
             admission,
             activation,
-            epsilon: contract.norms.post_attention,
+            epsilon: cfg.norm_eps,
         })
     }
 }
 
 impl<'a> DenseFfn<'a> {
+    pub(super) fn workspace_bytes(&self) -> u64 {
+        cuteafd_loader::plan::families::step5::native::plane_bytes(&self.admission.planes).expect("admitted planes")
+    }
+
+
     pub fn load(
         device: Device<'a>,
         programs: &'a Programs<'a>,
@@ -267,6 +281,16 @@ impl<'a> DenseFfn<'a> {
         programs: &'a Programs<'a>,
         checkpoint: &'a Checkpoint,
         plan: DensePlan,
+    ) -> Result<Self> {
+        Self::load_plan_in(device, programs, checkpoint, plan, None)
+    }
+
+    pub(super) fn load_plan_in(
+        device: Device<'a>,
+        programs: &'a Programs<'a>,
+        checkpoint: &'a Checkpoint,
+        plan: DensePlan,
+        arena: Option<(&Arena<'a>, usize)>,
     ) -> Result<Self> {
         let DensePlan {
             layout,
@@ -296,21 +320,23 @@ impl<'a> DenseFfn<'a> {
             .collect::<Result<Vec<_>>>()?;
         Self::workspace(device, admission, std::rc::Rc::new(DenseWeights {
             weights: loaded, programs: resolved, epsilon,
-        }))
+        }), arena)
     }
 
     /// The caller admits all lanes together before creating any workspace.
     pub(super) fn new_lane(&self) -> Result<Self> {
-        Self::workspace(self.stream.device, self.admission.clone(), self.immutable.clone())
+        Self::workspace(self.stream.device, self.admission.clone(), self.immutable.clone(), None)
     }
 
     fn workspace(device: Device<'a>, admission: Admission,
-        immutable: std::rc::Rc<DenseWeights<'a>>) -> Result<Self> {
+        immutable: std::rc::Rc<DenseWeights<'a>>, arena: Option<(&Arena<'a>, usize)>) -> Result<Self> {
         let _scope = cuteafd_ffi::memory_ledger::scope("step5_dense_workspace");
-        let planes = admission.planes.iter().map(|&bytes| Allocation::new(device, bytes))
-            .collect::<Result<Vec<_>>>()?;
+        let spans = cuteafd_loader::plan::families::step5::native::dense_layout(admission.rows, admission.span)?;
+        ensure!(spans.iter().zip(&admission.planes).all(|(span, &bytes)| span.1 == bytes),
+            "Step-5 dense region layout differs from admission");
+        let planes = scratch::region_planes(device, &spans, arena)?;
         let stream = Stream::new(device)?;
-        Ok(Self { stream, planes, admission, immutable })
+        Ok(Self { stream, planes, admission, immutable, unit: std::cell::Cell::new(0) })
     }
 
     pub fn enqueue(&mut self, rows: usize) -> Result<()> {
@@ -328,11 +354,27 @@ impl<'a> DenseFfn<'a> {
         super::weights::validate_live_weights(device.id, &self.immutable.weights)
     }
 
+    /// Live planes (INPUT, OUTPUT) are viewed at the selected unit's rows.
+    fn plane(&self, index: usize) -> cuteafd_ffi::CuteafdDeviceBuffer {
+        let buffer = self.planes[index].buffer;
+        if !cuteafd_loader::plan::families::step5::native::dense_live(index) { return buffer; }
+        let offset = self.unit.get() * (buffer.bytes / self.admission.span);
+        cuteafd_ffi::CuteafdDeviceBuffer { ptr: buffer.ptr.wrapping_byte_add(offset), bytes: buffer.bytes - offset, ..buffer }
+    }
+
+    /// Selects a prefill unit's rows of the live planes; whole steps use row 0.
+    pub(super) fn select_unit(&self, start: usize, rows: usize) -> Result<()> {
+        ensure!(start.checked_add(rows).is_some_and(|end| end <= self.admission.span) && rows <= self.admission.rows,
+            "Step-5 dense unit rows outside admitted span");
+        self.unit.set(start);
+        Ok(())
+    }
+
     pub fn input(&self) -> cuteafd_ffi::CuteafdDeviceBuffer {
-        self.planes[0].buffer
+        self.plane(0)
     }
     pub fn output(&self) -> cuteafd_ffi::CuteafdDeviceBuffer {
-        self.planes[5].buffer
+        self.plane(5)
     }
 
     pub(super) fn diagnostic_planes(&self) -> [(cuteafd_ffi::CuteafdDeviceBuffer, bool); 4] {
@@ -379,9 +421,7 @@ impl<'a> DenseFfn<'a> {
                     .is_some_and(|end| end <= self.admission.rows),
             "dense stage/capacity mismatch"
         );
-        let p = self
-            .planes
-            .iter()
+        let p = (0..6).map(|index| self.plane(index))
             .zip([
                 HIDDEN * 4,
                 HIDDEN * 2,
@@ -390,7 +430,7 @@ impl<'a> DenseFfn<'a> {
                 HIDDEN * 2,
                 HIDDEN * 4,
             ])
-            .map(|(a, stride)| a.buffer.ptr.wrapping_byte_add(start * stride))
+            .map(|(a, stride)| a.ptr.wrapping_byte_add(start * stride))
             .collect::<Vec<_>>();
         let w = self
             .immutable

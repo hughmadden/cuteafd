@@ -104,12 +104,14 @@ impl ApiPolicy {
     /// Install the gateway mount on a family's profile (`--gateway on`).
     /// `snapshot` holds the tokenizer `count_tokens` uses.
     pub(crate) fn serve(&self, profile: ModelProfile, snapshot: &std::path::Path) -> anyhow::Result<ModelProfile> {
+        cuteafd_bench::context::set_thinking_off(profile.encoding.supports_thinking_off());
         let profile = if snapshot.join("tokenizer.json").is_file() { profile.with_tokenizer(snapshot)? } else { profile };
         let mut profile = profile_with_health(profile);
         if let Some(policy) = &self.gateway {
             use cuteafd_api::gateway::ModelMap;
             let mut models = if policy.official { ModelMap::official_names(profile.id.clone()) } else { ModelMap::single(profile.id.clone()) };
             if let Some(text) = &policy.names_file { models.apply_names_file(text).map_err(anyhow::Error::msg)?; }
+            models.variants = profile.variants.iter().map(|v| (v.public_id.clone(), v.index)).collect();
             let snapshot = snapshot.join("tokenizer.json").is_file().then(|| snapshot.to_path_buf());
             profile.gateway = Some(Arc::new(cuteafd_api::openai::GatewayMount { models, snapshot,
                 options: cuteafd_api::openai::engine::EngineOptions {

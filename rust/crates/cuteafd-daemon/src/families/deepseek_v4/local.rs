@@ -226,11 +226,8 @@ impl<'a> LocalExperts<'a> {
             return Ok(None);
         }
         let capacities = capacities(max_rows);
-        if let Some(manifest) = catalog.exl3() {
-            let directory = aot_layout_directory(native_lib, manifest.decoder_tiers(), "rtx-tp1");
-            let row_policy = Exl3RowPolicy::active();
-            let capacities = row_policy.capacities(max_rows)?;
-            return Self::load_exl3(library, catalog, &directory, &capacities, row_policy, draft_stages, backbone, max_rows, budget);
+        if catalog.exl3().is_some() {
+            return Self::load_exl3(library, native_lib, catalog, draft_stages, backbone, max_rows, budget);
         }
         let mut states = Vec::new();
         let mut scratch_bytes = 0usize;
@@ -293,58 +290,75 @@ impl<'a> LocalExperts<'a> {
         }))
     }
 
-    /// EXL3 residency: whole-intermediate (world 1) layers bound to the
-    /// coordinator package's capacities, which share one scratch arena.
-    #[allow(clippy::too_many_arguments)]
-    fn load_exl3(
-        library: &'a NativeLibrary,
-        catalog: &OfficialV41Catalog,
-        directory: &Path,
-        capacities: &[u32],
-        row_policy: Exl3RowPolicy,
-        draft_stages: usize,
-        backbone: &[usize],
-        max_rows: usize,
-        budget: usize,
-    ) -> Result<Option<Self>> {
-        let _memory_scope = cuteafd_ffi::memory_ledger::scope("local-experts");
-        let shape = *catalog.routed_experts();
+    /// The coordinator EXL3 package's directories and capacities for `max_rows`,
+    /// or None when this image has no package for the checkpoint's tiers.
+    fn exl3_package(native_lib: &Path, catalog: &OfficialV41Catalog, max_rows: usize)
+        -> Result<Option<(Vec<std::path::PathBuf>, Vec<u32>, Exl3RowPolicy)>> {
+        let manifest = catalog.exl3().context("EXL3 local experts need an EXL3 checkpoint")?;
+        let directory = aot_layout_directory(native_lib, manifest.decoder_tiers(), "rtx-tp1");
+        let row_policy = Exl3RowPolicy::active();
+        let capacities = row_policy.capacities(max_rows)?;
         let directories: Vec<_> = capacities.iter().map(|c| directory.join(format!("m{c}"))).collect();
         if let Some(missing) = directories.iter().find(|d| !d.join("v41_exl3.json").is_file()) {
             tracing::warn!(package = %missing.display(), "no coordinator EXL3 package for this geometry; \
                 build with CUTEAFD_*_EXPERT_FAMILIES=<family>:exl3-k<tiers> to keep layers local");
             return Ok(None);
         }
-        let output_bytes = max_rows * shape.hidden * 2;
-        let reduction_plan = Exl3ReductionPlan::new(&directories)?;
+        Ok(Some((directories, capacities, row_policy)))
+    }
+
+    /// The whole (world 1) EXL3 layers [`Self::load`] keeps resident within
+    /// `budget`, from headers before any allocation: the draft stages, then
+    /// backbone layers in order while each one's peak fits what is left.
+    /// None when no coordinator package exists for this checkpoint.
+    /// Also returns the budget left for weights after the shared workspace.
+    pub fn exl3_selections(native_lib: &Path, catalog: &OfficialV41Catalog, draft_stages: usize,
+        backbone: &[usize], max_rows: usize, budget: usize) -> Result<Option<(Vec<ExpertLayer>, usize)>> {
+        let shape = *catalog.routed_experts();
+        validate_backbone(backbone, shape.first_layer, shape.layers)?;
+        let Some((directories, _, _)) = Self::exl3_package(native_lib, catalog, max_rows)? else { return Ok(None) };
         let workspace = Exl3Workspace::plan(&directories, Exl3InputFormat::Fp8K32)?
-            .checked_add(output_bytes).context("local EXL3 workspace overflow")?;
+            .checked_add(max_rows * shape.hidden * 2).context("local EXL3 workspace overflow")?;
         ensure!(budget > workspace, "local EXL3 experts need {workspace} workspace bytes, budget is {budget}");
-        let mut remaining = budget - workspace;
-        tracing::info!(budget, workspace, package = %directory.display(), "loading coordinator EXL3 expert layers");
-        let mut weights = Vec::new();
+        let weights_budget = budget - workspace;
+        let mut remaining = weights_budget;
+        let mut selections = Vec::new();
         for stage in 0..draft_stages {
-            let weight = Exl3Weights::load(library, catalog, ExpertLayer::Dspark { stage }, remaining)
+            let selection = ExpertLayer::Dspark { stage };
+            let resident = Exl3Weights::plan(catalog, selection)?.resident_bytes;
+            remaining = remaining.checked_sub(resident)
                 .with_context(|| format!("dSpark stage {stage} EXL3 experts with {remaining} bytes left"))?;
-            remaining -= weight.budget.resident_bytes;
-            weights.push(weight);
+            selections.push(selection);
         }
-        let mut layers = 0;
         for &layer in backbone {
             let selection = ExpertLayer::BackboneFull { layer };
-            if Exl3Weights::plan(catalog, selection)?.peak_device_bytes()? > remaining {
-                break;
-            }
-            let weight = Exl3Weights::load(library, catalog, selection, remaining)
-                .with_context(|| format!("coordinator EXL3 expert layer {layer} with {remaining} bytes left"))?;
-            remaining -= weight.budget.resident_bytes;
-            tracing::debug!(layer, resident = weight.budget.resident_bytes, remaining, "coordinator EXL3 layer resident");
-            weights.push(weight);
-            layers += 1;
+            let plan = Exl3Weights::plan(catalog, selection)?;
+            if plan.peak_device_bytes()? > remaining { break; }
+            remaining -= plan.resident_bytes;
+            selections.push(selection);
         }
-        if weights.is_empty() {
-            return Ok(None);
-        }
+        Ok(Some((selections, weights_budget)))
+    }
+
+    /// Coordinator-local EXL3 experts over already resident `weights` (mounted
+    /// or pushed), in [`Self::exl3_selections`] order: the draft stages, then
+    /// the backbone layers.
+    pub fn from_exl3_weights(library: &'a NativeLibrary, native_lib: &Path, catalog: &OfficialV41Catalog,
+        selections: &[ExpertLayer], weights: Vec<Exl3Weights<'a>>, max_rows: usize) -> Result<Option<Self>> {
+        ensure!(selections.len() == weights.len(), "local EXL3 weights differ from their selections");
+        if weights.is_empty() { return Ok(None); }
+        let Some((directories, capacities, row_policy)) = Self::exl3_package(native_lib, catalog, max_rows)?
+            else { anyhow::bail!("local EXL3 weights without a coordinator package") };
+        let shape = *catalog.routed_experts();
+        let stages = selections.iter().filter(|s| matches!(s, ExpertLayer::Dspark { .. })).count();
+        ensure!(selections[..stages].iter().all(|s| matches!(s, ExpertLayer::Dspark { .. })),
+            "local EXL3 draft stages precede the backbone layers");
+        let layers = selections[stages..].iter().map(|s| match s {
+            ExpertLayer::BackboneFull { layer } => Ok(*layer),
+            other => anyhow::bail!("local EXL3 backbone takes whole layers, not {other:?}"),
+        }).collect::<Result<Vec<_>>>()?;
+        let output_bytes = max_rows * shape.hidden * 2;
+        let reduction_plan = Exl3ReductionPlan::new(&directories)?;
         let weights = Rc::new(weights);
         let arena = Exl3Workspace::new(library, &directories)?;
         let mut executions = Vec::with_capacity(capacities.len());
@@ -361,12 +375,33 @@ impl<'a> LocalExperts<'a> {
             executions.push(execution);
         }
         Ok(Some(Self {
-            backend: Backend::Exl3 { executions, row_policy, reduction_plan, stages: draft_stages, layers: backbone[..layers].to_vec() },
+            backend: Backend::Exl3 { executions, row_policy, reduction_plan, stages, layers },
             reducer: library.v41_local_expert_reducer()?,
             output: DeviceAllocation::new(library, output_bytes)?,
             topk: shape.topk,
             device: library.cuda_get_device()?,
         }))
+    }
+
+    /// EXL3 residency: whole-intermediate (world 1) layers bound to the
+    /// coordinator package's capacities, which share one scratch arena.
+    fn load_exl3(library: &'a NativeLibrary, native_lib: &Path, catalog: &OfficialV41Catalog, draft_stages: usize,
+        backbone: &[usize], max_rows: usize, budget: usize) -> Result<Option<Self>> {
+        let _memory_scope = cuteafd_ffi::memory_ledger::scope("local-experts");
+        let Some((selections, weights_budget)) = Self::exl3_selections(native_lib, catalog, draft_stages, backbone,
+            max_rows, budget)? else { return Ok(None) };
+        let directory = catalog.exl3().map(|m| aot_layout_directory(native_lib, m.decoder_tiers(), "rtx-tp1"));
+        tracing::info!(budget, package = ?directory, layers = selections.len(), "loading coordinator EXL3 expert layers");
+        let mut remaining = weights_budget;
+        let mut weights = Vec::with_capacity(selections.len());
+        for &selection in &selections {
+            let weight = Exl3Weights::load(library, catalog, selection, remaining)
+                .with_context(|| format!("coordinator EXL3 {selection:?} with {remaining} bytes left"))?;
+            remaining -= weight.budget.resident_bytes;
+            tracing::debug!(?selection, resident = weight.budget.resident_bytes, remaining, "coordinator EXL3 layer resident");
+            weights.push(weight);
+        }
+        Self::from_exl3_weights(library, native_lib, catalog, &selections, weights, max_rows)
     }
 
     pub fn group_rows(&self, rows: usize) -> Result<usize> {

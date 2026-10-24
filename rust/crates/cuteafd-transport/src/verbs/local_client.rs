@@ -17,10 +17,15 @@ pub(crate) struct LocalTp4Client {
     retired: Vec<TcpStream>,
     retirement_error: Option<String>,
     capacity: Option<u32>,
+    /// Explicit immutable ModelAdmission endpoint; survives every QP reconnect.
+    model_endpoint: Option<u32>,
     pending: Vec<VecDeque<VerbsHostProtocolV2PendingChunkRoundtrip>>,
-    chunks: Option<tokio::sync::mpsc::UnboundedReceiver<VerbsHostProtocolV2ResponseChunk>>,
-    done: Vec<tokio::sync::oneshot::Receiver<Result<VerbsHostProtocolV2ResponseStreamStats>>>,
-    deadline: Option<Instant>,
+    /// Dispatched waves, oldest first. Every rank serves its requests in post
+    /// order, so the oldest wave completes first on each rank; `poll` serves
+    /// only the front and later waves' chunks wait in their own channels.
+    waves: VecDeque<OpenWave>,
+    /// Most waves outstanding at once (1 unless raised by the owner).
+    max_waves: usize,
     /// Per-rank device ranges response payloads land in (GPU landing).
     landing: Vec<Option<DeviceLanding>>,
     /// Per-rank write targets: responses are RDMA-written there (write mode).
@@ -58,10 +63,10 @@ impl LocalTp4Client {
             retired: Vec::new(),
             retirement_error: None,
             capacity: None,
+            model_endpoint: None,
             pending: (0..world).map(|_| VecDeque::with_capacity(1)).collect(),
-            chunks: None,
-            done: Vec::with_capacity(world),
-            deadline: None,
+            waves: VecDeque::with_capacity(1),
+            max_waves: 1,
             landing: vec![None; world],
             write: vec![None; world],
             egress: None,
@@ -73,6 +78,24 @@ impl LocalTp4Client {
         }
     }
     pub(crate) fn set_capacity(&mut self, capacity: u32) { self.capacity = Some(capacity); }
+    pub(crate) fn bind_model_endpoint(&mut self, endpoint: u32) -> Result<()> {
+        anyhow::ensure!(endpoint < 8, "ModelAdmission endpoint index must be below eight");
+        anyhow::ensure!(self.model_endpoint.is_none(), "ModelAdmission endpoint already bound");
+        anyhow::ensure!(self.sessions.iter().all(Option::is_none)
+            && self.expert_grouping.iter().all(Option::is_none) && self.waves.is_empty(),
+            "ModelAdmission endpoint must be bound before bootstrap or dispatch");
+        self.model_endpoint = Some(endpoint);
+        Ok(())
+    }
+    /// Admit up to `waves` outstanding waves. Raising it requires no open wave.
+    pub(crate) fn set_max_waves(&mut self, waves: usize) -> Result<()> {
+        anyhow::ensure!((1..=4).contains(&waves), "Spark transport admits 1..=4 outstanding waves");
+        anyhow::ensure!(self.waves.is_empty(), "cannot change wave admission with waves in flight");
+        self.max_waves = waves;
+        Ok(())
+    }
+    pub(crate) fn max_waves(&self) -> usize { self.max_waves }
+    pub(crate) fn open_waves(&self) -> usize { self.waves.len() }
 
     pub(crate) fn installed_grouping(&self) -> Result<Vec<crate::worker_selection::InstalledExpertGrouping>> {
         let reports = self.expert_grouping.iter().enumerate().map(|(rank, report)|
@@ -119,7 +142,7 @@ impl LocalTp4Client {
         self.sessions[rank] = Some(VerbsHostProtocolV2PersistentClientSession::connect_local(
             self.peers[rank], &self.config, request, landing,
             if egress { self.egress.as_ref() } else { None },
-            self.write[rank], self.terminal_owner.clone(), flow_label, capacity)?);
+            self.write[rank], self.terminal_owner.clone(), flow_label, capacity, self.model_endpoint)?);
         self.retain_grouping(rank)
     }
 
@@ -217,7 +240,7 @@ impl LocalTp4Client {
     /// reaped as send slots are reused.
     pub(crate) fn post_written(&mut self, request: &ExpertProtocolV2Request) -> Result<()> {
         crate::health::ensure_available()?;
-        anyhow::ensure!(self.deadline.is_none(), "a received wave is pending on this transport");
+        anyhow::ensure!(self.waves.is_empty(), "a received wave is pending on this transport");
         self.flows.ensure_all(&self.peers)?;
         for rank in 0..self.peers.len() {
             anyhow::ensure!(self.write[rank].is_some(), "rank {rank} has no write target");
@@ -249,8 +272,7 @@ impl LocalTp4Client {
     }
     fn reset_storage(&mut self) {
         // Drop queued payloads before sessions unregister their receive rings.
-        self.chunks = None;
-        self.done.clear();
+        self.waves.clear();
         for pending in &mut self.pending {
             pending.clear();
         }
@@ -259,13 +281,13 @@ impl LocalTp4Client {
                 crate::health::record_failure(format!("expert session teardown failed: {error:#}"));
             }
         }
-        self.deadline = None;
     }
     pub(crate) fn dispatch(&mut self, request: &ExpertProtocolV2Request) -> Result<()> {
         crate::health::ensure_available()?;
         anyhow::ensure!(!self.terminal_failed && !self.terminal_quiesced,
             "terminal-owned Spark transport cannot be reused after failure or quiescence");
-        anyhow::ensure!(self.deadline.is_none(), "local TP4 request already pending");
+        anyhow::ensure!(self.waves.len() < self.max_waves,
+            "Spark transport already has {} of {} admitted waves pending", self.waves.len(), self.max_waves);
         let result = self.post(request);
         if let Err(error) = &result {
             crate::health::record_failure(format!("expert dispatch failed: {error:#}"));
@@ -277,16 +299,18 @@ impl LocalTp4Client {
         // Any rank still unplaced is measured before this wave's requests go out.
         self.flows.ensure_all(&self.peers)?;
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        self.chunks = Some(rx);
+        let mut done = Vec::with_capacity(self.peers.len());
         for rank in 0..self.peers.len() {
+            anyhow::ensure!(self.waves.is_empty() || self.sessions[rank].is_some(),
+                "a Spark session must stay open while earlier waves are outstanding");
             if self.sessions[rank]
                 .as_ref()
                 .map(|s| s.fits(request))
                 .transpose()?
                 == Some(false)
             {
-                anyhow::ensure!(self.terminal_owner.is_none(),
-                    "terminal-owned Spark request exceeds its prewarmed session capacity; reconnect is unsupported");
+                anyhow::ensure!(self.terminal_owner.is_none() && self.waves.is_empty(),
+                    "Spark request exceeds its prewarmed session capacity; reconnect is unsupported here");
                 self.retire_session(rank)?;
             }
             if self.sessions[rank].is_none() {
@@ -317,21 +341,19 @@ impl LocalTp4Client {
                 },
                 timing,
             ));
-            self.done.push(response_rx);
+            done.push(response_rx);
         }
         // The same-thread channels adapt the existing assembler; they never
         // wake or hand off work to another thread. Each sink takes ownership of its chunk; retained pinned frames
         // return to the session pool only after the owner releases them.
-        self.deadline = Some(
-            Instant::now()
-                .checked_add(self.config.timeout)
-                .context("local TP4 deadline overflow")?,
-        );
+        // Each wave's deadline counts from when it becomes the oldest, so a
+        // queued wave is not charged for the waves ahead of it.
+        self.waves.push_back(OpenWave { chunks: rx, done, deadline: None });
         Ok(())
     }
 
     pub(crate) fn enable_terminal_ownership(&mut self) -> Result<()> {
-        anyhow::ensure!(self.sessions.iter().all(Option::is_none) && self.deadline.is_none(),
+        anyhow::ensure!(self.sessions.iter().all(Option::is_none) && self.waves.is_empty(),
             "terminal Spark ownership must precede connection/bootstrap");
         self.terminal_owner = Some(Arc::new(AtomicBool::new(false)));
         Ok(())
@@ -382,7 +404,9 @@ impl LocalTp4Client {
     where
         F: FnMut(VerbsHostProtocolV2ResponseChunk) -> Result<()>,
     {
-        let deadline = self.deadline.context("local TP4 has no pending request")?;
+        let timeout = self.config.timeout;
+        let wave = self.waves.front_mut().context("local TP4 has no pending request")?;
+        let deadline = *wave.deadline.get_or_insert_with(|| Instant::now() + timeout);
         anyhow::ensure!(
             Instant::now() < deadline,
             "local TP4 response deadline expired"
@@ -394,27 +418,37 @@ impl LocalTp4Client {
                     .context("local TP4 session missing")?
                     .try_progress_chunk_requests(&mut self.pending[rank], &self.config)?;
             }
-            let chunks = self
-                .chunks
-                .as_mut()
-                .context("local TP4 response queue missing")?;
+            let chunks = &mut self.waves.front_mut().context("local TP4 response queue missing")?.chunks;
             while let Ok(chunk) = chunks.try_recv() {
                 sink(chunk)?;
             }
         }
-        if self.pending.iter().any(|p| !p.is_empty()) {
-            return Ok(false);
+        // The oldest wave is complete once every rank's completion arrived;
+        // later waves' requests may still be pending on the same ranks.
+        let wave = self.waves.front_mut().context("local TP4 response queue missing")?;
+        let mut index = 0;
+        while index < wave.done.len() {
+            match wave.done[index].try_recv() {
+                Ok(result) => { result?; wave.done.swap_remove(index); }
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty) => index += 1,
+                Err(error) => return Err(error).context("local TP4 completion missing"),
+            }
         }
+        if !wave.done.is_empty() { return Ok(false); }
+        let mut wave = self.waves.pop_front().expect("front wave present");
         // Final validation and completion publication happen synchronously in
-        // accept_chunk_response_frame before it removes a pending request.
-        for done in &mut self.done {
-            done.try_recv().context("local TP4 completion missing")??;
-        }
-        self.done.clear();
-        self.chunks = None;
-        self.deadline = None;
+        // accept_chunk_response_frame before it removes a pending request, so
+        // every chunk of this wave was already queued.
+        anyhow::ensure!(wave.chunks.try_recv().is_err(), "local TP4 chunk arrived after its completion");
         Ok(true)
     }
+}
+
+/// One dispatched wave's response chunks and per-rank completions.
+struct OpenWave {
+    chunks: tokio::sync::mpsc::UnboundedReceiver<VerbsHostProtocolV2ResponseChunk>,
+    done: Vec<tokio::sync::oneshot::Receiver<Result<VerbsHostProtocolV2ResponseStreamStats>>>,
+    deadline: Option<Instant>,
 }
 
 fn quiesce_all<T>(owners: &[Option<T>], mut quiesce: impl FnMut(&T)->Result<()>) -> Result<()> {
@@ -437,8 +471,7 @@ impl Drop for LocalTp4Client {
                 // external GPU landing/queued-upload owner via the witness.
                 std::mem::forget(std::mem::take(&mut self.sessions));
                 std::mem::forget(std::mem::take(&mut self.pending));
-                std::mem::forget(self.chunks.take());
-                std::mem::forget(std::mem::take(&mut self.done));
+                std::mem::forget(std::mem::take(&mut self.waves));
                 std::mem::forget(self.egress.take());
                 tracing::error!(%error,"retaining terminal Spark client owners");
             }
@@ -577,6 +610,26 @@ mod tests {
     }
 
     #[test]
+    fn explicit_model_endpoint_is_immutable_and_survives_reset() -> Result<()> {
+        let peer = "127.0.0.1:19453".parse()?;
+        let mut client = LocalTp4Client::new_ranks(vec![peer], TcpTransportConfig::default());
+        assert!(client.bind_model_endpoint(8).is_err());
+        assert!(client.model_endpoint.is_none());
+        client.bind_model_endpoint(2)?;
+        assert!(client.bind_model_endpoint(0).is_err());
+        client.reset();
+        assert_eq!(client.model_endpoint, Some(2));
+        assert!(client.bind_model_endpoint(1).is_err());
+        let mut unbound = LocalTp4Client::new_ranks(vec![peer], TcpTransportConfig::default());
+        let (_sender, chunks) = tokio::sync::mpsc::unbounded_channel();
+        let (_done, completed) = tokio::sync::oneshot::channel();
+        unbound.waves.push_back(OpenWave { chunks, done: vec![completed], deadline: None });
+        assert!(unbound.bind_model_endpoint(2).is_err());
+        assert!(unbound.model_endpoint.is_none());
+        Ok(())
+    }
+
+    #[test]
     fn configured_sim_capacity_fits_two_endpoints_on_first_connect() -> Result<()> {
         let (request, response) = crate::protocol_v2::compact_expert_wire_bytes(
             cuteafd_core::ExpertGeometry::DEEPSEEK_V41, 1024, false)?;
@@ -590,6 +643,42 @@ mod tests {
         Ok(())
     }
 
+    const STATS: VerbsHostProtocolV2ResponseStreamStats =
+        VerbsHostProtocolV2ResponseStreamStats { response_frames: 1, response_wire_bytes: 0, response_executor_id: 1 };
+
+    #[test]
+    fn waves_are_admitted_up_to_the_limit_and_served_oldest_first() -> Result<()> {
+        let peers = ["127.0.0.1:19443".parse()?];
+        let mut client = LocalTp4Client::new_ranks(peers.to_vec(), TcpTransportConfig { timing: false,
+            timeout: std::time::Duration::from_secs(1), max_frame_bytes: 200_000 });
+        assert!(client.set_max_waves(0).is_err() && client.set_max_waves(5).is_err());
+        client.set_max_waves(2)?;
+        let mut senders = Vec::new();
+        for _ in 0..2 {
+            let (chunks, receiver) = tokio::sync::mpsc::unbounded_channel();
+            let (done, completed) = tokio::sync::oneshot::channel();
+            client.waves.push_back(OpenWave { chunks: receiver, done: vec![completed], deadline: None });
+            senders.push((chunks, done));
+        }
+        assert_eq!(client.open_waves(), 2);
+        assert!(client.set_max_waves(3).is_err(), "admission changed with waves in flight");
+        // A third dispatch is refused before any session or request is touched.
+        let request = crate::expert::test_request(1);
+        let error = client.dispatch(&request).unwrap_err().to_string();
+        assert!(error.contains("2 of 2 admitted waves"), "{error}");
+        // The second wave's completion does not complete the first.
+        let (first, second) = (senders.remove(0), senders.remove(0));
+        second.1.send(Ok(STATS)).ok();
+        assert!(!client.poll(|_| Ok(()))?, "a later wave completed the oldest");
+        first.1.send(Ok(STATS)).ok();
+        assert!(client.poll(|_| Ok(()))?);
+        assert_eq!(client.open_waves(), 1);
+        assert!(client.poll(|_| Ok(()))?);
+        assert_eq!(client.open_waves(), 0);
+        drop((first.0, second.0));
+        Ok(())
+    }
+
     #[test]
     fn tp2_reset_retains_only_two_actual_peer_slots() -> Result<()> {
         let peers = ["127.0.0.1:19441".parse()?, "127.0.0.1:19442".parse()?];
@@ -598,16 +687,14 @@ mod tests {
         });
         let (_sender, receiver) = tokio::sync::mpsc::unbounded_channel();
         let (_completion, completed) = tokio::sync::oneshot::channel();
-        client.chunks = Some(receiver);
-        client.done.push(completed);
-        client.deadline = Some(Instant::now());
+        client.waves.push_back(OpenWave { chunks: receiver, done: vec![completed], deadline: Some(Instant::now()) });
         client.reset();
         assert_eq!(client.peers, peers);
         assert_eq!(client.sessions.len(), 2);
         assert_eq!(client.pending.len(), 2);
         assert!(client.sessions.iter().all(Option::is_none));
         assert!(client.pending.iter().all(VecDeque::is_empty));
-        assert!(client.chunks.is_none() && client.done.is_empty() && client.deadline.is_none());
+        assert!(client.waves.is_empty());
         Ok(())
     }
 }

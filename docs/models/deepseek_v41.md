@@ -36,8 +36,9 @@ placeholder Spark hosts and addresses): Official MXFP4 [min](../../examples/conf
   FP4 pages, a copied SWA "front", pinned-host tier in `cuteafd-hostcache`.
 - RTX/Spark layouts: the v2 native MXFP4 minimum is 1 RTX + 3 Sparks;
   the v2 NVFP4 cards use 4 Sparks. Current MXFP4 and NVFP4 support TP3 as a
-  fit-minimum option; TP4 remains the serving default (see the TP3 decision in
-  `PLAN.md`). The v2 maximum is 2 RTX + 4 Sparks. V4.1 keeps the coordinator layer-range split by default — the
+  fit-minimum option (see the TP3 decision in `PLAN.md`). The current MXFP4
+  maximum is 2 RTX + 6 Sparks; 2 RTX + 4 Sparks is a reference layout.
+  V4.1 keeps the coordinator layer-range split by default — the
   measured head-split hop cost on this fabric does not clear the bar its
   attention weights would need to win (see `PLAN.md` Phase 6).
 - Vocabulary head: RC1 and RC2 default to `CUTEAFD_V41_FP8_HEAD=all`, one
@@ -50,6 +51,8 @@ placeholder Spark hosts and addresses): Official MXFP4 [min](../../examples/conf
   `vision_config`.
 
 ## Known limits
+
+- Opt-in `L2_PREFETCH=auto`: Hugh Madden measured +2.4% C1 on a 5090; no clear gain on the RTX PRO 6000. The default remains off.
 
 <!-- release-v2-limits -->
 - **V4.1 NVFP4 (`nvidia/DeepSeek-V4.1-Flash-NVFP4`): current calibrated W4A4.** Per-expert FC1 calibration replaced the old layer-maximum scale in `268e2ebd`; native W4A4 runs at every row count. [The fidelity policy (#230)](https://github.com/tpurtell/cuteafd/pull/230) treats absolute BF16-root KL/top-1 as informational for this calibrated checkpoint, not a pass/fail bar. The 2026-10-15 cards at `bac064ac` report KL 0.06235 / top-1 93.79% (one RTX + four Sparks) and KL 0.06551 / top-1 93.60% (two RTX + four Sparks); both pass exact cache and lossless speculation. See the [minimum report](../../benchmarks/deepseek_v41/2026-10-15-smoke-deepseek-v4-1-flash-nvfp4-1rtx-4spark-v41-flash-nvfp4-min/report.svg) and [maximum report](../../benchmarks/deepseek_v41/2026-10-15-smoke-deepseek-v4-1-flash-nvfp4-2rtx-4spark-v41-flash-nvfp4-max/report.svg). This is not a claim of BF16 parity or batch invariance.

@@ -1,11 +1,13 @@
 //! Device-owned TP2 shared-expert weights and one rank's lane workspace.
-use crate::shared::memory::{HostAllocation, device::{Allocation, Device, Event, PeerTransfer, Stream}};
+use crate::shared::memory::device::{Allocation, Device, Event, PeerTransfer, Stream};
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::{CuteafdDeviceBuffer, Bf16Add, V41Fp8Plan, V41SharedSwiGlu};
 use cuteafd_loader::OfficialV41Catalog;
 use std::rc::Rc;
 
-struct Matrix<'a> { weight: Allocation<'a>, scales: Allocation<'a> }
+/// The packed weight and scales; the raw scales live until their pack ran
+/// (a push lands them and packs at Done), then [`Weights::release_raw_scales`].
+struct Matrix<'a> { weight: Allocation<'a>, scales: Allocation<'a>, source_scales: Option<Allocation<'a>> }
 
 /// Complete shared TP2 operation for one lane, with either GPU as destination.
 pub(crate) struct Wave<'a> {
@@ -91,14 +93,16 @@ pub(crate) struct Weights<'a> {
 }
 impl<'a> Weights<'a> {
     pub fn device(&self) -> Device<'a> { self.device }
+    /// Frees raw scales kept for a recorded scale pack (after it ran).
+    pub fn release_raw_scales(&mut self) { for m in &mut self.matrices { drop(m.source_scales.take()); } }
     pub fn device_bytes() -> usize { 3 * (5120 * 1152 + 5120 * 1152 / 32) }
-    pub fn load_peak_device_bytes() -> usize { Self::device_bytes() + 5120 * 1152 / 1024 }
+    /// Including every matrix's raw scales (resident until their pack ran).
+    pub fn load_peak_device_bytes() -> usize { Self::device_bytes() + 3 * (5120 * 1152 / 1024) }
     pub fn load(device: Device<'a>, catalog: &OfficialV41Catalog, layer: usize, budget: usize) -> Result<Self> {
         ensure!(layer < 40 && matches!(device.id, 0 | 1) && budget >= Self::load_peak_device_bytes(),
             "invalid TP2 shared weight layer, rank, or budget");
         let stream = Stream::new(device)?;
-        let mut staging = HostAllocation::new(device.library, 5120 * 1152)?;
-        let mut scratch = vec![0u8; 2304 * 64];
+        let dense = crate::shared::experts::rtx::dense::DenseLoad::mount(device.library);
         let mut matrices = Vec::with_capacity(3);
         for name in ["w1", "w3", "w2"] {
             let (axis, k, n) = if name == "w2" { (1, 1152, 5120) } else { (0, 5120, 1152) };
@@ -108,15 +112,18 @@ impl<'a> Weights<'a> {
             let scales = Allocation::new(device, (k*n/32) as usize)?;
             let source_scales = Allocation::new(device, (k*n/1024) as usize)?;
             for (suffix, target) in [("weight", &weight), ("scale", &source_scales)] {
-                let bytes = catalog.read_coordinator_tp2_into(&format!("{prefix}.{suffix}"), axis,
-                    device.id as usize, staging.bytes_mut(), &mut scratch)?;
-                ensure!(bytes == target.buffer.bytes, "shared TP2 tensor has unexpected size");
-                device.run(|| device.library.copy_h2d(target.buffer, &staging.bytes_mut()[..bytes]))?;
+                let rect = super::super::v41_tensors::half(catalog, &format!("{prefix}.{suffix}"), axis, device.id as usize)?;
+                ensure!(rect.bytes() == target.buffer.bytes, "shared TP2 tensor has unexpected size");
+                dense.operand(crate::shared::experts::rtx::dense::Operand { device: device.id, buffer: target.buffer,
+                    lands: vec![(rect, 0)], bytes: target.buffer.bytes })?;
             }
-            let packed = device.run(|| unsafe { kernel.pack_scales(source_scales.buffer, scales.buffer, stream.raw) });
+            let packed = device.run(|| unsafe { crate::shared::experts::rtx::dense::v41_pack_scales(&kernel,
+                source_scales.buffer, scales.buffer, stream.raw) });
             let drained = stream.drain();
             packed.and(drained)?;
-            matrices.push(Matrix { weight, scales });
+            // Through the mount the pack already drained: release the raw scales now.
+            let source_scales = crate::shared::experts::rtx::dense::is_recording().then_some(source_scales);
+            matrices.push(Matrix { weight, scales, source_scales });
         }
         Ok(Self { device, layer, matrices: matrices.try_into().ok().unwrap() })
     }
@@ -292,5 +299,16 @@ mod tests {
             assert_eq!(lib.cuda_get_device()?, 0);
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+impl Weights<'_> {
+    pub(crate) fn visit(&self, f: &mut dyn FnMut(String, cuteafd_ffi::CuteafdDeviceBuffer)) {
+        for (name, m) in ["w1", "w3", "w2"].iter().zip(&self.matrices) {
+            let p = format!("gpu{}.shared_tp2.layers.{}.{name}.", self.device.id, self.layer);
+            f(format!("{p}weight"), m.weight.buffer);
+            f(format!("{p}packed_scale"), m.scales.buffer);
+        }
     }
 }

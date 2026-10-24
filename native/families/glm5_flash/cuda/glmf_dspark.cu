@@ -1,4 +1,5 @@
 #include "../../../shared/cuda/draft_attention.cuh"
+#include "../../../shared/cuda/draft_kv.cuh"
 // dSpark drafter for GLM 5.3 Flash (RedHatAI/GLM-5.3-Flash-speculator.dspark-preview):
 // the non-GEMM pieces of the context update, the Qwen3 block body (64-wide
 // heads, causal inside the block) and the Markov / confidence heads.
@@ -28,6 +29,7 @@ constexpr int kHeadDim = 64;
 // rotate_half RoPE at the row's position (lane holds elements lane and
 // lane + 32, a rotation pair); k and v rows go to `slots[row]` (row when
 // null, skipped when negative) of the [slot, kv_heads, 64] caches.
+template <bool fp8>
 __global__ void qk_rope_kernel(const bf16* qkv, const bf16* q_norm, const bf16* k_norm, const int64_t* positions,
                                const int32_t* slots, bf16* q_out, bf16* k_out, bf16* v_out, int rows, int heads,
                                int kv_heads, float theta, float eps) {
@@ -62,15 +64,23 @@ __global__ void qk_rope_kernel(const bf16* qkv, const bf16* q_norm, const bf16* 
   bf16* k = k_out + (uint64_t(slot) * kv_heads + kv) * kHeadDim;
   bf16* v = v_out + (uint64_t(slot) * kv_heads + kv) * kHeadDim;
   const bf16* v_in = qkv + row * width + uint64_t(heads + kv_heads + kv) * kHeadDim;
+  if constexpr (fp8) {
+    const float keys[2] = {y0, y1};
+    const float values[2] = {f(v_in[lane]), f(v_in[lane + 32])};
+    cuteafd::draft_kv::store<64>(k_out, slot, kv, kv_heads, keys);
+    cuteafd::draft_kv::store<64>(v_out, slot, kv, kv_heads, values);
+  } else {
   k[lane] = __float2bfloat16(y0);
   k[lane + 32] = __float2bfloat16(y1);
   v[lane] = v_in[lane];
   v[lane + 32] = v_in[lane + 32];
+  }
 }
 
 // The 128-wide checkpoint path keeps the legacy 64-wide kernel unchanged.
 // inv_freq contains the checkpoint's already-interpolated FP32 frequencies;
 // attention_factor scales cos/sin before their BF16 rounding (YaRN).
+template <bool fp8>
 __global__ void qk_rope128_kernel(const bf16* qkv, const bf16* q_norm, const bf16* k_norm,
                                   const int64_t* positions, const int32_t* slots, const float* inv_freq,
                                   bf16* q_out, bf16* k_out, bf16* v_out, int rows, int heads, int kv_heads,
@@ -97,22 +107,37 @@ __global__ void qk_rope128_kernel(const bf16* qkv, const bf16* q_norm, const bf1
   const float inv = rsqrtf(sum / dim + eps);
 #pragma unroll
   for (int i = 0; i < 4; ++i) x[i] = r(r(x[i] * inv) * f(norm[lane + i * 32]));
-  bf16* out = is_q ? q_out + (uint64_t(row) * heads + head) * dim
-                  : k_out + (uint64_t(slot) * kv_heads + head - heads) * dim;
+  float keys[4];
 #pragma unroll
   for (int i = 0; i < 2; ++i) {
     const int index = lane + i * 32;
     const float angle = float(positions[row]) * inv_freq[index];
     const float c = r(cosf(angle) * attention_factor), s = r(sinf(angle) * attention_factor);
-    out[index] = __float2bfloat16(r(r(x[i] * c) - r(x[i + 2] * s)));
-    out[index + 64] = __float2bfloat16(r(r(x[i + 2] * c) + r(x[i] * s)));
+    keys[i] = r(r(x[i] * c) - r(x[i + 2] * s));
+    keys[i + 2] = r(r(x[i + 2] * c) + r(x[i] * s));
   }
-  if (!is_q) {
-    const int kv = head - heads;
-    bf16* v = v_out + (uint64_t(slot) * kv_heads + kv) * dim;
-    const bf16* source = qkv + row * width + uint64_t(heads + kv_heads + kv) * dim;
+  if (is_q) {
+    bf16* out = q_out + (uint64_t(row) * heads + head) * dim;
 #pragma unroll
-    for (int i = 0; i < 4; ++i) v[lane + i * 32] = source[lane + i * 32];
+    for (int i = 0; i < 4; ++i) out[lane + i * 32] = __float2bfloat16(keys[i]);
+  } else {
+    const int kv = head - heads;
+    const bf16* source = qkv + row * width + uint64_t(heads + kv_heads + kv) * dim;
+    if constexpr (fp8) {
+      float values[4];
+#pragma unroll
+      for (int i = 0; i < 4; ++i) values[i] = f(source[lane + i * 32]);
+      cuteafd::draft_kv::store<128>(k_out, slot, kv, kv_heads, keys);
+      cuteafd::draft_kv::store<128>(v_out, slot, kv, kv_heads, values);
+    } else {
+      bf16* k = k_out + (uint64_t(slot) * kv_heads + kv) * dim;
+      bf16* v = v_out + (uint64_t(slot) * kv_heads + kv) * dim;
+#pragma unroll
+      for (int i = 0; i < 4; ++i) {
+        k[lane + i * 32] = __float2bfloat16(keys[i]);
+        v[lane + i * 32] = source[lane + i * 32];
+      }
+    }
   }
 }
 
@@ -357,7 +382,7 @@ extern "C" int32_t cuteafd_glmf_dspark_qk_rope(const void* qkv, const void* q_no
                                                float theta, float eps, void* stream) {
   if (rows < 1 || kv_heads < 1 || heads < 0) return cudaErrorInvalidValue;
   const int warps = rows * (heads + kv_heads);
-  qk_rope_kernel<<<(warps * 32 + 255) / 256, 256, 0, static_cast<cudaStream_t>(stream)>>>(
+  qk_rope_kernel<false><<<(warps * 32 + 255) / 256, 256, 0, static_cast<cudaStream_t>(stream)>>>(
       static_cast<const bf16*>(qkv), static_cast<const bf16*>(q_norm), static_cast<const bf16*>(k_norm),
       static_cast<const int64_t*>(positions), static_cast<const int32_t*>(slots), static_cast<bf16*>(q_out),
       static_cast<bf16*>(k_out), static_cast<bf16*>(v_out), rows, heads, kv_heads, theta, eps);
@@ -377,7 +402,7 @@ extern "C" int32_t cuteafd_block_dspark_qk_rope(const void* qkv, const void* q_n
     return cudaErrorInvalidValue;
   const int64_t warps = int64_t(rows) * (int64_t(heads) + kv_heads);
   if (warps > INT32_MAX / 32) return cudaErrorInvalidValue;
-  qk_rope128_kernel<<<(warps * 32 + 255) / 256, 256, 0, static_cast<cudaStream_t>(stream)>>>(
+  qk_rope128_kernel<false><<<(warps * 32 + 255) / 256, 256, 0, static_cast<cudaStream_t>(stream)>>>(
       static_cast<const bf16*>(qkv), static_cast<const bf16*>(q_norm), static_cast<const bf16*>(k_norm),
       static_cast<const int64_t*>(positions), static_cast<const int32_t*>(slots), static_cast<const float*>(inv_freq),
       static_cast<bf16*>(q_out), static_cast<bf16*>(k_out), static_cast<bf16*>(v_out), rows, heads, kv_heads,
@@ -407,7 +432,7 @@ extern "C" int32_t cuteafd_block_dspark_attention(const void* q, const void* k_b
   if (queries > INT32_MAX - 31) return cudaErrorInvalidValue;
   return cuteafd::draft_attention::launch(q, k_block, v_block, k_context, v_context, seq_slots,
       ctx_lengths, ctx_ends, nullptr, out, workspace, sequences, block_rows, heads, kv_heads,
-      capacity, max_keys, 0, causal != 0, head_dim, int((queries + 31) / 32), scale,
+      capacity, max_keys, 0, causal != 0, head_dim, int((queries + 31) / 32), false, scale,
       static_cast<cudaStream_t>(stream));
 }
 
@@ -430,7 +455,7 @@ extern "C" int32_t cuteafd_glmf_dspark_attention(const void* q, const void* k_bl
                                                  int32_t causal, float scale, void* stream) {
   return cuteafd::draft_attention::launch(q, k_block, v_block, k_ring, v_ring, seq_slots,
       ctx_lengths, ctx_ends, nullptr, out, workspace, sequences, block_rows, heads, kv_heads,
-      ring, max_keys, 0, causal != 0, kHeadDim, 1, scale, static_cast<cudaStream_t>(stream));
+      ring, max_keys, 0, causal != 0, kHeadDim, 1, false, scale, static_cast<cudaStream_t>(stream));
 }
 
 // residual_out = residual + delta (may alias residual), normalized = RMSNorm(residual_out) * w.
@@ -496,4 +521,98 @@ extern "C" int32_t cuteafd_glmf_dspark_confidence(const void* hidden, const void
       static_cast<const bf16*>(bias), static_cast<const uint32_t*>(anchors), static_cast<const uint32_t*>(drafts),
       static_cast<float*>(out), rows, block, width, rank);
   return cudaGetLastError();
+}
+
+
+extern "C" int32_t cuteafd_glmf_dspark_qk_rope_fp8(const void* qkv, const void* q_norm, const void* k_norm,
+                                               const void* positions, const void* slots, void* q_out, void* k_out,
+                                               void* v_out, int32_t rows, int32_t heads, int32_t kv_heads,
+                                               float theta, float eps, void* stream) {
+  if (rows < 1 || kv_heads < 1 || heads < 0) return cudaErrorInvalidValue;
+  const int warps = rows * (heads + kv_heads);
+  qk_rope_kernel<true><<<(warps * 32 + 255) / 256, 256, 0, static_cast<cudaStream_t>(stream)>>>(
+      static_cast<const bf16*>(qkv), static_cast<const bf16*>(q_norm), static_cast<const bf16*>(k_norm),
+      static_cast<const int64_t*>(positions), static_cast<const int32_t*>(slots), static_cast<bf16*>(q_out),
+      static_cast<bf16*>(k_out), static_cast<bf16*>(v_out), rows, heads, kv_heads, theta, eps);
+  return cudaGetLastError();
+}
+
+extern "C" int32_t cuteafd_block_dspark_qk_rope_fp8(const void* qkv, const void* q_norm, const void* k_norm,
+                                                const void* positions, const void* slots, const void* inv_freq,
+                                                void* q_out, void* k_out, void* v_out, int32_t rows,
+                                                int32_t heads, int32_t kv_heads, int32_t head_dim,
+                                                float theta, float attention_factor, float eps, void* stream) {
+  if (head_dim == 64 && inv_freq == nullptr && attention_factor == 1.0f)
+    return cuteafd_glmf_dspark_qk_rope_fp8(qkv, q_norm, k_norm, positions, slots, q_out, k_out, v_out,
+                                     rows, heads, kv_heads, theta, eps, stream);
+  if (head_dim != 128 || inv_freq == nullptr || rows < 1 || kv_heads < 1 || heads < 0 ||
+      !isfinite(attention_factor) || attention_factor <= 0 || !isfinite(eps) || eps <= 0)
+    return cudaErrorInvalidValue;
+  const int64_t warps = int64_t(rows) * (int64_t(heads) + kv_heads);
+  if (warps > INT32_MAX / 32) return cudaErrorInvalidValue;
+  qk_rope128_kernel<true><<<(warps * 32 + 255) / 256, 256, 0, static_cast<cudaStream_t>(stream)>>>(
+      static_cast<const bf16*>(qkv), static_cast<const bf16*>(q_norm), static_cast<const bf16*>(k_norm),
+      static_cast<const int64_t*>(positions), static_cast<const int32_t*>(slots), static_cast<const float*>(inv_freq),
+      static_cast<bf16*>(q_out), static_cast<bf16*>(k_out), static_cast<bf16*>(v_out), rows, heads, kv_heads,
+      attention_factor, eps);
+  return cudaGetLastError();
+}
+
+extern "C" int32_t cuteafd_block_dspark_attention_fp8(const void* q, const void* k_block, const void* v_block,
+                                                  const void* k_context, const void* v_context, const void* seq_slots,
+                                                  const void* ctx_lengths, const void* ctx_ends, void* out,
+                                                  void* workspace, int32_t sequences, int32_t block_rows,
+                                                  int32_t heads, int32_t kv_heads, int32_t capacity,
+                                                  int32_t max_keys, int32_t causal, int32_t head_dim,
+                                                  float scale, void* stream) {
+  if (heads < 1 || kv_heads < 1 || heads % kv_heads || block_rows < 1) return cudaErrorInvalidValue;
+  const int64_t queries = int64_t(heads / kv_heads) * block_rows;
+  if (queries > INT32_MAX - 31) return cudaErrorInvalidValue;
+  return cuteafd::draft_attention::launch(q, k_block, v_block, k_context, v_context, seq_slots,
+      ctx_lengths, ctx_ends, nullptr, out, workspace, sequences, block_rows, heads, kv_heads,
+      capacity, max_keys, 0, causal != 0, head_dim, int((queries + 31) / 32), true, scale,
+      static_cast<cudaStream_t>(stream));
+}
+
+extern "C" int32_t cuteafd_glmf_dspark_attention_fp8(const void* q, const void* k_block, const void* v_block,
+                                                 const void* k_ring, const void* v_ring, const void* seq_slots,
+                                                 const void* ctx_lengths, const void* ctx_ends, void* out,
+                                                 void* workspace, int32_t sequences, int32_t block_rows,
+                                                 int32_t heads, int32_t kv_heads, int32_t ring, int32_t max_keys,
+                                                 int32_t causal, float scale, void* stream) {
+  return cuteafd::draft_attention::launch(q, k_block, v_block, k_ring, v_ring, seq_slots,
+      ctx_lengths, ctx_ends, nullptr, out, workspace, sequences, block_rows, heads, kv_heads,
+      ring, max_keys, 0, causal != 0, kHeadDim, 1, true, scale, static_cast<cudaStream_t>(stream));
+}
+
+// Paged context positions are relative to the binding origin; RoPE remains absolute.
+extern "C" int32_t cuteafd_block_dspark_attention_paged(const void* q, const void* k_block,
+    const void* v_block, const void* k_context, const void* v_context, const void* slots,
+    const void* lengths, const void* ends, const void* pages, void* out, void* workspace,
+    int32_t sequences, int32_t block_rows, int32_t heads, int32_t kv_heads, int32_t capacity,
+    int32_t max_keys, int32_t causal, int32_t head_dim, int32_t table_width, float scale, void* stream) {
+  if (!pages || heads < 1 || kv_heads < 1 || heads % kv_heads || block_rows < 1)
+    return cudaErrorInvalidValue;
+  const int64_t queries = int64_t(heads / kv_heads) * block_rows;
+  if (queries > INT32_MAX - 31) return cudaErrorInvalidValue;
+  return cuteafd::draft_attention::launch(q, k_block, v_block, k_context, v_context, slots,
+      lengths, ends, nullptr, out, workspace, sequences, block_rows, heads, kv_heads, capacity,
+      max_keys, 0, causal != 0, head_dim, int((queries + 31) / 32), false, scale,
+      static_cast<cudaStream_t>(stream), static_cast<const int32_t*>(pages), table_width);
+}
+
+// Paged context positions are relative to the binding origin; RoPE remains absolute.
+extern "C" int32_t cuteafd_block_dspark_attention_paged_fp8(const void* q, const void* k_block,
+    const void* v_block, const void* k_context, const void* v_context, const void* slots,
+    const void* lengths, const void* ends, const void* pages, void* out, void* workspace,
+    int32_t sequences, int32_t block_rows, int32_t heads, int32_t kv_heads, int32_t capacity,
+    int32_t max_keys, int32_t causal, int32_t head_dim, int32_t table_width, float scale, void* stream) {
+  if (!pages || heads < 1 || kv_heads < 1 || heads % kv_heads || block_rows < 1)
+    return cudaErrorInvalidValue;
+  const int64_t queries = int64_t(heads / kv_heads) * block_rows;
+  if (queries > INT32_MAX - 31) return cudaErrorInvalidValue;
+  return cuteafd::draft_attention::launch(q, k_block, v_block, k_context, v_context, slots,
+      lengths, ends, nullptr, out, workspace, sequences, block_rows, heads, kv_heads, capacity,
+      max_keys, 0, causal != 0, head_dim, int((queries + 31) / 32), true, scale,
+      static_cast<cudaStream_t>(stream), static_cast<const int32_t*>(pages), table_width);
 }

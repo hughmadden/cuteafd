@@ -194,7 +194,7 @@ def requirements(repo, matrix, scope):
         elif family == 'step5':
             programs = {'step5', 'step52'} if dual else {'step5'}
         elif family == 'kimi_k3':
-            programs = {'kimik3'}
+            programs = {'kimik3', 'kimi_k6_dense', 'kimi_split'}
         result.append(dict(name=entry['name'], family=family, programs=sorted(programs),
                            experts=sorted(experts), spark_experts=sorted(tokens(scopes['CUTEAFD_WIP_EXPERT_FAMILIES'])),
                            spark_count=count, spark_tp=tp, dual=dual,
@@ -339,6 +339,8 @@ def check_inventory(root, role, wanted, symbols=None):
                     check_package(root, f'exl3/exl3-{family}-{kind[5:]}', layouts, role, verified)
                 elif kind in ('fp8', 'nvfp4', 'nvfp4a4') or item == 'step5:bf16':
                     suffix = '-bf16-weights' if item == 'step5:bf16' else '' if kind == 'fp8' else '-' + kind
+                    if item == 'step5:nvfp4':
+                        suffix = '-nvfp4a4'
                     layouts = [f'tp{entry["spark_tp"]}'] if role == 'expert' else ['tp1']
                     if role == 'coordinator' and entry['dual'] and family != 'glmfdense':
                         layouts.append('tp2')

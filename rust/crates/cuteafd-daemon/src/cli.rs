@@ -91,6 +91,15 @@ pub(crate) enum Commands {
     /// Qualify a native Step-5 target prefix with real Spark experts.
     #[command(hide = true)]
     Step5Golden(crate::families::step5::golden::GoldenArgs),
+    /// Compare a cold Kimi decoder prefix against a flagged residual state.
+    #[command(hide = true)]
+    KimiGolden(crate::families::kimi_k3::golden::GoldenArgs),
+    /// Serve Kimi K3 with TP2 attention and six real Spark expert ranks.
+    #[command(hide = true)]
+    ServeKimi(crate::families::kimi_k3::serve::ServeArgs),
+    /// Serve an eager native Step-5 target with real Spark experts.
+    #[command(hide = true)]
+    ServeStep5(crate::families::step5::serve::ServeArgs),
     /// Serve dense Qwen BF16 through the shared Qwen scheduler.
     #[command(hide = true)]
     ServeQwen35(crate::families::qwen3_5::serve::ServeArgs),
@@ -156,13 +165,10 @@ pub(crate) struct PlanArgs {
     /// Published EXLR8 manifest name (defaults to bit325).
     #[arg(long)]
     pub(crate) exlr8_manifest: Option<String>,
-    /// Native non-expert operands from an architecture-matched official checkpoint.
-    #[arg(long)]
-    pub(crate) exlr8_dense_from: Option<String>,
     /// Host RAM cap for all separate per-row mapped-table scales; 0 keeps all mapped.
     #[arg(long, default_value_t = 0.0, value_parser = parse_scale_preload_gib)]
     pub mapped_scale_preload_gib: f64,
-    #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..=6))]
+    #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..=8))]
     pub(crate) vision_replicas: u32,
     /// Vision policy (auto does not imply an implemented encoder).
     #[arg(skip = cuteafd_loader::plan::MediaMode::Auto)]
@@ -178,6 +184,10 @@ pub(crate) struct PlanArgs {
     /// Override automatic placement of the untied token embedding.
     #[arg(long, alias = "embed-placement", value_enum)]
     pub(crate) embedding_placement: Option<crate::shared::token_io::EmbedPlacement>,
+    /// Derive and verify weight variants against this snapshot and print only
+    /// their verdicts and table sizes (the serve flag's syntax).
+    #[command(flatten)]
+    pub(crate) variants: crate::shared::variants::VariantArgs,
     /// Hugging Face model id (resolved under HF_HOME) or a snapshot directory.
     pub(crate) model: String,
     #[arg(long)]
@@ -190,6 +200,9 @@ pub(crate) struct PlanArgs {
     /// Spark inventory available to automatic selection.
     #[arg(long, default_value_t = 6)]
     pub(crate) available_sparks: usize,
+    /// Header-only Spark count policy for both coordinator card columns.
+    #[arg(long, conflicts_with_all = ["deployment", "files", "fetch", "role"])]
+    pub(crate) spark_range: bool,
     /// Routed-expert weight budget per Spark rank, GiB (unset: the family's
     /// default, 100 GiB for most; Kimi K3 108 GiB).
     #[arg(long)]
@@ -203,7 +216,7 @@ pub(crate) struct PlanArgs {
     /// Emit typed launch decisions; live artifact verification stays with the launcher.
     #[arg(long, conflicts_with_all = ["files", "fetch", "role", "file_layout"])]
     pub(crate) deployment: bool,
-    #[arg(long, requires = "deployment", requires = "spark_ep", value_parser = clap::value_parser!(u8).range(1..=6))]
+    #[arg(long, requires = "deployment", requires = "spark_ep", value_parser = clap::value_parser!(u8).range(1..=8))]
     pub(crate) spark_tp: Option<u8>,
     #[arg(long, requires = "deployment", requires = "spark_tp", value_parser = clap::value_parser!(u8).range(1..=3))]
     pub(crate) spark_ep: Option<u8>,
@@ -264,6 +277,9 @@ pub(crate) struct PlanArgs {
     /// Separately configured drafter checkpoint to include in JSON inventory.
     #[arg(long)]
     pub(crate) drafter_snapshot: Option<PathBuf>,
+    /// Charge native MLA DFlash FP8 residency instead of BF16.
+    #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
+    pub(crate) draft_fp8: bool,
     /// Separately configured vision checkpoint to include in JSON inventory.
     #[arg(long)]
     pub(crate) vision_snapshot: Option<PathBuf>,
@@ -289,9 +305,9 @@ pub(crate) struct PlanArgs {
     /// Explicit KV pool tokens for --layout (0 or omitted: automatic).
     #[arg(long)]
     pub(crate) pool_tokens: Option<u64>,
-    /// Qwen full-attention KV format for --layout.
-    #[arg(long = "kv-cache", default_value_t = cuteafd_loader::families::qwen4::Qwen4KvCache::default())]
-    pub(crate) kv_format: cuteafd_loader::families::qwen4::Qwen4KvCache,
+    /// Full-attention KV format for --layout (family default when omitted).
+    #[arg(long = "kv-cache")]
+    pub(crate) kv_format: Option<cuteafd_core::MlaCacheFormat>,
     /// Qwen projection residency for --layout.
     #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
     pub(crate) fp8_decode: bool,
@@ -312,7 +328,7 @@ pub(crate) struct PlanArgs {
     pub(crate) target_head: Option<crate::shared::target_head::TargetHead>,
     /// GLM Flash draft head arithmetic; it borrows the target's resident copy.
     #[arg(long, value_enum, default_value = "exact")]
-    pub(crate) draft_head: crate::families::glm5::DraftHead,
+    pub(crate) draft_head: crate::shared::speculation::dflash::DraftHead,
     /// Immutable GLM/Qwen attention scratch override.
     #[arg(long, env = "CUTEAFD_ATTENTION_PLAN_ROWS")]
     pub(crate) attention_plan_rows: Option<usize>,
@@ -343,9 +359,13 @@ pub(crate) struct PlanArgs {
     /// Include the diagnostic all-row prefill head reservation in --layout.
     #[arg(long)]
     pub(crate) full_prefill_logits: bool,
-    /// Prefill lanes for --layout (GLM 5.3 Flash; 0: the family default).
+    /// Prefill units in flight for --layout (0: the family default).
     #[arg(long, default_value_t = 0)]
-    pub(crate) prefill_lanes: u64,
+    pub(crate) prefill_waves: u64,
+    /// Rows one continuous prefill call streams for --layout (0: the family
+    /// default). Shared by every units-span family (launcher PREFILL_SPAN_ROWS).
+    #[arg(long, default_value_t = 0)]
+    pub(crate) prefill_span_rows: u64,
     /// Decode and verify step rows for --layout (GLM 5.3 Flash's --decode-rows: 64, or 128 with the
     /// wide programs on one GPU): its decode workspace, token selector and replay records.
     #[arg(long, default_value_t = 64, value_parser = plan_decode_rows)]
@@ -398,12 +418,18 @@ pub(crate) struct PlanArgs {
     /// MiMo target ring count for --layout (at least concurrency).
     #[arg(long = "rings", default_value_t = 16)]
     pub(crate) mimo_rings: u64,
+    /// MiMo sliding and native-MTP ring format for --layout (matches serving).
+    #[arg(long, value_enum, default_value = "int8")]
+    pub(crate) mimo_swa_kv_cache: crate::families::mimo_v2::SwaKvCacheArg,
     /// MiMo Spark activation format for --layout (matches serve-mimo).
     #[arg(long, value_enum, default_value = "fp8")]
     pub(crate) expert_input: crate::families::mimo_v2::engine::ExpertInput,
     /// MiMo drafter batch sequences for --layout (serving raises to concurrency).
     #[arg(long, default_value_t = 4)]
     pub(crate) draft_sequences: u64,
+    /// Shared GQA drafter-ring format for layout admission.
+    #[arg(long, default_value = "fp8")]
+    pub(crate) draft_kv_cache: cuteafd_loader::families::qwen4::Qwen4KvCache,
     /// Explicit MiMo drafter context arena for --layout.
     #[arg(long)]
     pub(crate) draft_context_slots: Option<u64>,
@@ -502,10 +528,10 @@ pub(crate) struct NativeExpertDaemonArgs {
     /// Override the FP8 expert package layout directory (`fp8-<family>/tp<world>`).
     #[arg(long)]
     pub(crate) fp8_package: Option<PathBuf>,
-    #[arg(long, value_parser = clap::value_parser!(u32).range(0..6))]
+    #[arg(long, value_parser = clap::value_parser!(u32).range(0..8))]
     pub(crate) rank: u32,
     /// Spark tensor-parallel world; one rank supports whole Qwen EXL3 experts.
-    #[arg(long, default_value_t = 4, value_parser = clap::value_parser!(u32).range(1..=6))]
+    #[arg(long, default_value_t = 4, value_parser = clap::value_parser!(u32).range(1..=8))]
     pub(crate) world: u32,
     /// Replicated-group tensor-parallel degree inside one group (opt-in; all-or-none with --spark-ep).
     #[arg(long, requires = "spark_ep", value_parser = parse_spark_tp)]
@@ -599,6 +625,32 @@ pub(crate) struct TransportCapabilitiesArgs {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn retained_draft_kv_defaults_to_fp8_and_preserves_explicit_bf16() {
+        use clap::Parser;
+        use cuteafd_loader::families::qwen4::Qwen4KvCache;
+        for (flags, expected) in [(vec![], Qwen4KvCache::Fp8),
+            (vec!["--draft-kv-cache", "bf16"], Qwen4KvCache::Bf16),
+            (vec!["--draft-kv-cache", "fp8"], Qwen4KvCache::Fp8)] {
+            let super::Commands::Plan(args) = super::Cli::try_parse_from(
+                ["cuteafd", "plan", "/model"].into_iter().chain(flags.iter().copied()))
+                .unwrap().command else { panic!("expected plan"); };
+            assert_eq!(args.draft_kv_cache, expected);
+            for command in ["serve-glm", "serve-glmf", "serve-mimo"] {
+                let parsed = super::Cli::try_parse_from(
+                    ["cuteafd", command, "--snapshot", "/model", "--native-lib", "/native.so"]
+                        .into_iter().chain(flags.iter().copied())).unwrap();
+                let actual = match parsed.command {
+                    super::Commands::ServeGlm(args) => args.engine.draft_kv_cache,
+                    super::Commands::ServeGlmf(args) => args.engine.draft_kv_cache,
+                    super::Commands::ServeMimo(args) => args.engine.draft_kv_cache,
+                    _ => panic!("expected retained-ring family"),
+                };
+                assert_eq!(actual, expected, "{command}");
+            }
+        }
+    }
+
+    #[test]
     fn fabric_landing_diagnostics_are_bounded_and_opt_in() {
         use clap::Parser;
         let super::Commands::Fabric(args) = super::Cli::try_parse_from(["cuteafd", "fabric"]).unwrap().command
@@ -655,13 +707,15 @@ mod tests {
         use cuteafd_loader::families::qwen4::Qwen4KvCache;
         let base = ["cuteafd", "plan", "/model"];
         for (flags, expected) in [
-            (vec![], Qwen4KvCache::Fp8),
-            (vec!["--kv-cache", "bf16"], Qwen4KvCache::Bf16),
-            (vec!["--kv-cache", "fp8"], Qwen4KvCache::Fp8),
+            (vec![], None),
+            (vec!["--kv-cache", "bf16"], Some(Qwen4KvCache::Bf16)),
+            (vec!["--kv-cache", "fp8"], Some(Qwen4KvCache::Fp8)),
         ] {
             let super::Commands::Plan(args) = super::Cli::try_parse_from(
                 base.into_iter().chain(flags)).unwrap().command else { panic!("expected plan"); };
-            assert_eq!(args.kv_format, expected);
+            assert_eq!(args.kv_format.map(|format| match format {
+                cuteafd_core::MlaCacheFormat::Bf16 => Qwen4KvCache::Bf16,
+                cuteafd_core::MlaCacheFormat::Fp8 => Qwen4KvCache::Fp8 }), expected);
         }
         assert!(super::Cli::try_parse_from(base.into_iter().chain(["--kv-cache", "int8"])).is_err());
         assert!(super::Cli::try_parse_from(base.into_iter().chain(["--kv-format", "bf16"])).is_err());
@@ -824,7 +878,65 @@ mod tests {
             assert_eq!(super::Cli::try_parse_from(command).is_ok(), valid);
         }
     }
+
+    #[test]
+    fn native_l2_prefetch_is_the_shared_opt_in_flag() {
+        use clap::Parser;
+        let base = ["cuteafd", "serve-native", "--snapshot", "/model", "--native-lib", "/native.so",
+            "--peers", "127.0.0.1:19441"];
+        if std::env::var_os("CUTEAFD_L2_PREFETCH").is_none() {
+            let super::Commands::ServeNative(args) = super::Cli::try_parse_from(base).unwrap().command else {
+                panic!("expected native serving");
+            };
+            // Unset falls back to the family default, which is off for V4.1.
+            assert_eq!(args.l2.l2_prefetch, None);
+            assert_eq!(crate::shared::l2_prefetch::OTHER_DEFAULT, "off");
+        }
+        for value in ["off", "auto", "48"] {
+            let super::Commands::ServeNative(args) = super::Cli::try_parse_from(
+                base.into_iter().chain(["--l2-prefetch", value])).unwrap().command else {
+                panic!("expected native serving");
+            };
+            assert_eq!(args.l2.l2_prefetch.as_deref(), Some(value));
+        }
+    }
     use super::*;
+
+    #[test]
+    fn mimo_layout_swa_default_and_explicit_formats_match_serving() {
+        use cuteafd_loader::families::mimo_v2::MimoKvCache;
+        let parse = |extra: &[&str]| {
+            let Commands::Plan(args) = Cli::try_parse_from(
+                ["cuteafd", "plan", "model"].into_iter().chain(extra.iter().copied())).unwrap().command else {
+                panic!("expected plan command");
+            };
+            MimoKvCache::from(args.mimo_swa_kv_cache)
+        };
+        assert_eq!(parse(&[]), MimoKvCache::Int8);
+        for (flag, expected) in [("bf16", MimoKvCache::Bf16), ("int8", MimoKvCache::Int8), ("fp8", MimoKvCache::Fp8)] {
+            assert_eq!(parse(&["--mimo-swa-kv-cache", flag]), expected);
+        }
+    }
+
+    #[test]
+    fn plan_prefill_wave_option_has_no_lane_alias() {
+        let Commands::Plan(args) = Cli::try_parse_from([
+            "cuteafd", "plan", "model", "--prefill-waves", "2"]).unwrap().command else {
+            panic!("expected plan command");
+        };
+        assert_eq!(args.prefill_waves, 2);
+        assert!(Cli::try_parse_from(["cuteafd", "plan", "model", "--prefill-lanes", "2"]).is_err());
+    }
+
+    #[test]
+    fn plan_prefill_span_rows_is_one_shared_option() {
+        let span = |argv: &[&str]| match Cli::try_parse_from(argv).unwrap().command {
+            Commands::Plan(args) => args.prefill_span_rows,
+            _ => panic!("expected plan command"),
+        };
+        assert_eq!(span(&["cuteafd", "plan", "model"]), 0, "0 selects the family default");
+        assert_eq!(span(&["cuteafd", "plan", "model", "--prefill-span-rows", "8192"]), 8192);
+    }
 
     #[test]
     fn transport_benchmark_defaults_use_flash_geometry() {
@@ -883,7 +995,7 @@ mod tests {
             assert!(Cli::try_parse_from(serve.into_iter().chain(flags.clone())).is_err());
             assert!(Cli::try_parse_from(expert.into_iter().chain(flags)).is_err());
         }
-        for (tp, ep) in [("1", "2"), ("5", "1"), ("2", "0"), ("2", "4")] {
+        for (tp, ep) in [("1", "2"), ("9", "1"), ("2", "0"), ("2", "4")] {
             let flags = ["--spark-tp", tp, "--spark-ep", ep];
             assert!(Cli::try_parse_from(serve.into_iter().chain(flags)).is_err(), "{tp}x{ep}");
             assert!(Cli::try_parse_from(expert.into_iter().chain(flags)).is_err(), "{tp}x{ep}");
@@ -894,7 +1006,7 @@ mod tests {
         let cli = Cli::try_parse_from(one.into_iter().chain(["1"])).unwrap();
         let Commands::Expertd(args) = cli.command else { panic!("expertd-native") };
         assert_eq!((args.rank, args.world), (0, 1));
-        for invalid in ["0", "7"] {
+        for invalid in ["0", "9"] {
             assert!(Cli::try_parse_from(one.into_iter().chain([invalid])).is_err());
         }
         // The worker world range also admits the six-rank layouts.
@@ -904,8 +1016,7 @@ mod tests {
         let Commands::Expertd(args) = cli.command else { panic!("expertd-native") };
         assert_eq!((args.rank, args.world), (5, 6));
 
-        // Pure TP6EP1 is a real shard family on both processes. Five is not a
-        // family and stays rejected even though it is inside the numeric range.
+        // Pure TP6EP1 parses on both processes; TP9 is outside transport capacity.
         let six_expert = ["cuteafd", "expertd-native", "--snapshot", "/model", "--native-lib",
             "/native.so", "--device-budget-bytes", "1000", "--rank", "5", "--world", "6"];
         for command in [&serve[..], &six_expert[..]] {
@@ -917,9 +1028,9 @@ mod tests {
                 other => panic!("unexpected command {other:?}"),
             }
             let error = Cli::try_parse_from(command.iter().copied()
-                .chain(["--spark-tp", "5", "--spark-ep", "1"]))
-                .expect_err("TP5 has no shard family");
-            assert!(error.to_string().contains("expected 2, 3, 4 or 6"), "{error}");
+                .chain(["--spark-tp", "9", "--spark-ep", "1"]))
+                .expect_err("TP9 exceeds transport capacity");
+            assert!(error.to_string().contains("expected 2 through 8"), "{error}");
         }
     }
 }
@@ -1064,6 +1175,10 @@ pub(crate) struct NativeServeArgs {
     #[arg(long, env = "CUTEAFD_CONSOLE_TEXT", num_args = 0..=1, default_value = "true",
         default_missing_value = "true", value_parser = clap::builder::BoolishValueParser::new())]
     pub console_text: bool,
+    // `--l2-prefetch` (off by default for V4.1): one-lane decode/verify passes
+    // prefetch the next layer's weights into L2 while a layer's experts are out.
+    #[command(flatten)]
+    pub l2: crate::shared::l2_prefetch::L2PrefetchArgs,
     #[command(flatten)]
     pub api: crate::shared::api::ApiArgs,
 
@@ -1079,19 +1194,19 @@ pub(crate) struct NativeServeArgs {
     /// Number of replicated Spark expert groups, each holding all 384 experts (opt-in; all-or-none with --spark-tp).
     #[arg(long, requires = "spark_tp", value_parser = clap::value_parser!(u8).range(1..=3))]
     pub spark_ep: Option<u8>,
+    #[command(flatten)]
+    pub variants: crate::shared::variants::VariantArgs,
 }
 
-/// Spark TP degrees with a native shard family: 2/3 replicated-group shards,
-/// 4 the legacy grouped layout, and 6 the pure unreplicated `TP6EP1` slices.
-/// Five has no artifact family, so it is rejected here rather than at load time.
+/// Parse transport geometry; checkpoint admission checks native package coverage.
 fn parse_spark_tp(value: &str) -> Result<u8, String> {
     let value: u8 = value
         .parse()
-        .map_err(|_| "expected a Spark TP degree between 2 and 6".to_string())?;
+        .map_err(|_| "expected a Spark TP degree between 2 and 8".to_string())?;
     match value {
-        2 | 3 | 4 | 6 => Ok(value),
+        2..=8 => Ok(value),
         _ => Err(format!(
-            "unsupported Spark TP degree {value}; expected 2, 3, 4 or 6"
+            "unsupported Spark TP degree {value}; expected 2 through 8"
         )),
     }
 }

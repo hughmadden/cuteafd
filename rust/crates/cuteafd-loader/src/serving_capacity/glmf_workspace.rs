@@ -230,13 +230,21 @@ pub struct GlmfLaneBytes {
 }
 
 impl GlmfLaneBytes {
-    /// Device bytes, every allocation floored as the engine allocates it.
-    pub fn device_bytes(&self) -> u64 {
+    fn device_fields(&self) -> impl Iterator<Item = u64> {
         [self.streams, self.streams, self.post, self.comb, self.x, self.delta, self.shared, self.positions,
             self.kv_slots, self.kda_slots, self.seq_first, self.pool_slots, self.cache_lengths, self.page_table,
             self.pool_table, self.ids, self.select, self.router_logits, self.route_ids, self.route_weights, self.wire]
             .into_iter().chain([self.zero, self.sum, self.routed].into_iter().flatten())
-            .map(|bytes| bytes.max(FLOOR)).sum()
+    }
+
+    /// Separate decode allocations preserve their exact byte ledger.
+    pub fn device_bytes(&self) -> u64 {
+        self.device_fields().map(|bytes| bytes.max(FLOOR)).sum()
+    }
+
+    /// Packed prefill views keep every operand 256-byte aligned.
+    pub fn arena_bytes(&self) -> u64 {
+        self.device_fields().map(|bytes| bytes.max(FLOOR).next_multiple_of(FLOOR)).sum()
     }
 }
 
@@ -367,12 +375,6 @@ pub fn glmf_expert_rows(prefill_rows: u64, decode_rows: u64) -> u64 {
     prefill_rows.max(decode_rows)
 }
 
-/// Device bytes of GLM 5.3 Flash's Spark intake planes: one transport per prefill lane (decode
-/// reuses lane zero's), each with a plane of `rows` BF16 partial rows of `hidden` per Spark rank.
-pub fn glmf_spark_intake_bytes(lanes: u64, ranks: u64, rows: u64, hidden: u64) -> u64 {
-    lanes * ranks * rows * hidden * 2
-}
-
 /// The step workspaces of `lanes` prefill lanes of `lane_rows` rows and the decode workspace of
 /// `decode_rows` rows (the engine's `--decode-rows`), over the scratch of each step shape.
 pub fn glmf_step_workspaces(cfg: &GlmNextConfig, lanes: usize, lane_rows: u64, decode_rows: u64,
@@ -381,7 +383,7 @@ pub fn glmf_step_workspaces(cfg: &GlmNextConfig, lanes: usize, lane_rows: u64, d
     GlmfStepWorkspaces {
         decode: glmf_lane_bytes(cfg, rows, true, shape).device_bytes()
             + glmf_temporary_bytes(cfg, rows, true, shape, decode_scratch).device_bytes(),
-        lane: glmf_lane_bytes(cfg, lane_rows, false, shape).device_bytes(),
+        lane: glmf_lane_bytes(cfg, lane_rows, false, shape).arena_bytes(),
         lanes: lanes as u64,
         prefill_temporaries: glmf_temporary_bytes(cfg, lane_rows, false, shape, prefill_scratch).device_bytes(),
     }
@@ -502,13 +504,13 @@ mod tests {
         let workspaces = |lanes: usize, rows: u64| glmf_step_workspaces(&cfg, lanes, rows, GLMF_DECODE_ROWS, &shape,
             scratch(&cfg, 64, true), scratch(&cfg, rows, false));
         let two = workspaces(2, 4096);
-        assert_eq!((two.decode, two.lane, two.prefill_temporaries), (94_955_520, 391_914_540, 1_993_850_880));
-        assert_eq!(two.device_bytes(), 2_872_635_480);
+        assert_eq!((two.decode, two.lane, two.prefill_temporaries), (94_955_520, 391_914_752, 1_993_850_880));
+        assert_eq!(two.device_bytes(), 2_872_635_904);
         // Four lanes of 2,048 rows hold the same rows in flight; the per-row temporaries halve,
         // the programs' scratch (laid out for 4,096 rows) does not.
         let four = workspaces(4, 2048);
-        assert_eq!((four.lane, four.prefill_temporaries), (195_961_900, 1_688_969_216));
-        assert_eq!(four.device_bytes(), 2_567_772_336);
+        assert_eq!((four.lane, four.prefill_temporaries), (195_962_112, 1_688_969_216));
+        assert_eq!(four.device_bytes(), 2_567_773_184);
         assert_eq!(workspaces(1, 4096).device_bytes(), two.device_bytes() - two.lane);
     }
 

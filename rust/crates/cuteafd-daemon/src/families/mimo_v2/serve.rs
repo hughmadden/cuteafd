@@ -464,7 +464,7 @@ fn prefix_cache_with<'e, 'a>(engine: &'e MimoEngine<'a>, args: &PrefixArgs, conc
         pages = layout.pages, host_bytes, rule = ?layout.rule, points = ?args.points(),
         reach = family.capture_reach(), "MiMo prefix cache");
     cuteafd_bench::context::set_kv((layout.pages * layout.page_rows) as u64, layout.pages as u64,
-        &format!("{:?} full + BF16 SWA rings", engine.kv_cache()), host_bytes);
+        &format!("{:?} full + {:?} SWA rings", engine.kv_cache().full, engine.kv_cache().sliding), host_bytes);
     Ok((family, cache))
 }
 

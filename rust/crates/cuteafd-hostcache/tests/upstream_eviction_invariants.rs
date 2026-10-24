@@ -62,7 +62,7 @@ fn snap(
     page_ids: &[DevicePageId],
 ) -> DeviceSnapshot {
     let layout = layout();
-    let mut lists: [Vec<DevicePage>; COMPRESSORS] = std::array::from_fn(|_| Vec::new());
+    let mut lists: [Vec<DevicePage>; cuteafd_hostcache::PAGE_BANKS] = std::array::from_fn(|_| Vec::new());
     for &id in page_ids {
         lists[0].push(DevicePage {
             id,

@@ -1,104 +1,134 @@
 use super::*;
-use crate::plan::{self, checkpoint::Checkpoint, format, testing::{self, t, Tensor as FixtureTensor}, *};
+use crate::plan::{self, checkpoint::Checkpoint, format, testing::{self, t, kimi_k3_tensors as tensors}, *};
+use anyhow::Context;
 use serde_json::Value;
+use crate::families::kimi_k3::validate_expert_inventory;
 
 fn config() -> Value { crate::families::kimi_k3::config::tests::release_config() }
-
-/// The release's tensor headers (sparse payloads). `experts`: routed layers
-/// whose 896 experts are written; the rest are omitted from the shard and the
-/// index alike (a partial snapshot) unless `all`.
-fn tensors(all: bool) -> Vec<FixtureTensor> {
-    let cfg = KimiK3Config::from_hf(&config()).unwrap();
-    let mut out = Vec::new();
-    let p = TEXT;
-    out.push(t(format!("{p}embed_tokens.weight"), "BF16", &[163840, 7168]));
-    out.push(t(format!("{HEAD}weight"), "BF16", &[163840, 7168]));
-    for name in ["norm", "output_attn_res_norm"] { out.push(t(format!("{p}{name}.weight"), "BF16", &[7168])); }
-    out.push(t(format!("{p}output_attn_res_proj.weight"), "BF16", &[1, 7168]));
-    for layer in 0..93 {
-        let b = format!("{p}layers.{layer}");
-        for n in ["input_layernorm", "post_attention_layernorm", "self_attention_res_norm", "mlp_res_norm"] {
-            out.push(t(format!("{b}.{n}.weight"), "BF16", &[7168]));
-        }
-        for n in ["self_attention_res_proj", "mlp_res_proj"] { out.push(t(format!("{b}.{n}.weight"), "BF16", &[1, 7168])); }
-        let a = format!("{b}.self_attn");
-        out.push(t(format!("{a}.g_proj.weight"), "BF16", &[12288, 7168]));
-        out.push(t(format!("{a}.o_proj.weight"), "BF16", &[7168, 12288]));
-        if cfg.attention[layer] == KimiAttention::Kda {
-            for proj in ["q", "k", "v"] {
-                out.push(t(format!("{a}.{proj}_proj.weight"), "BF16", &[12288, 7168]));
-                out.push(t(format!("{a}.{proj}_conv1d.weight"), "F32", &[12288, 1, 4]));
-            }
-            out.push(t(format!("{a}.f_a_proj.weight"), "BF16", &[128, 7168]));
-            out.push(t(format!("{a}.f_b_proj.weight"), "BF16", &[12288, 128]));
-            out.push(t(format!("{a}.b_proj.weight"), "BF16", &[96, 7168]));
-            out.push(t(format!("{a}.A_log"), "F32", &[128]));
-            out.push(t(format!("{a}.dt_bias"), "F32", &[12288]));
-            out.push(t(format!("{a}.o_norm.weight"), "F32", &[128]));
-        } else {
-            out.push(t(format!("{a}.q_a_proj.weight"), "BF16", &[1536, 7168]));
-            out.push(t(format!("{a}.q_a_layernorm.weight"), "BF16", &[1536]));
-            out.push(t(format!("{a}.q_b_proj.weight"), "BF16", &[18432, 1536]));
-            out.push(t(format!("{a}.kv_a_proj_with_mqa.weight"), "BF16", &[576, 7168]));
-            out.push(t(format!("{a}.kv_a_layernorm.weight"), "BF16", &[512]));
-            out.push(t(format!("{a}.kv_b_proj.weight"), "BF16", &[24576, 512]));
-        }
-        if layer == 0 {
-            for (proj, n, k) in [("gate", 33792, 7168), ("up", 33792, 7168), ("down", 7168, 33792)] {
-                out.push(t(format!("{b}.mlp.{proj}_proj.weight"), "BF16", &[n, k]));
-            }
-            continue;
-        }
-        let m = format!("{b}.block_sparse_moe");
-        out.push(t(format!("{m}.gate.weight"), "BF16", &[896, 7168]));
-        out.push(t(format!("{m}.gate.e_score_correction_bias"), "F32", &[896]));
-        out.push(t(format!("{m}.routed_expert_down_proj.weight"), "BF16", &[3584, 7168]));
-        out.push(t(format!("{m}.routed_expert_up_proj.weight"), "BF16", &[7168, 3584]));
-        out.push(t(format!("{m}.routed_expert_norm.weight"), "BF16", &[3584]));
-        for (proj, n, k) in [("gate", 6144, 7168), ("up", 6144, 7168), ("down", 7168, 6144)] {
-            out.push(t(format!("{m}.shared_experts.{proj}_proj.weight"), "BF16", &[n, k]));
-        }
-        if all || layer == 1 {
-            for e in 0..896 {
-                for (w, n, k) in [("w1", 3072, 3584), ("w3", 3072, 3584), ("w2", 3584, 3072)] {
-                    out.extend(testing::exl3(&format!("{m}.experts.{e}.{w}"), n, k, 2));
-                }
-            }
-        }
-    }
-    out.push(t("vision_tower.encoder.blocks.0.wqkv.weight", "BF16", &[1536, 1024]));
-    out.push(t("mm_projector.proj.0.weight", "BF16", &[4096, 4096]));
-    out
-}
 
 /// One shard per layer, as the release (a single 990k-entry header would
 /// exceed the 64 MiB safetensors header bound).
 fn snapshot(all: bool) -> tempfile::TempDir {
     let dir = tempfile::tempdir().unwrap();
-    let tensors = tensors(all);
-    let shard = |name: &str| indexed(name.strip_prefix(TEXT).unwrap_or(""), "layers.").map_or(0, |(l, _)| l + 1);
-    let mut shards: BTreeMap<usize, Vec<FixtureTensor>> = BTreeMap::new();
-    for tensor in tensors { shards.entry(shard(&tensor.0)).or_default().push(tensor); }
-    let mut weight_map = serde_json::Map::new();
-    for (index, members) in &shards {
-        let file = format!("model-{index:05}.safetensors");
-        testing::write_safetensors(&dir.path().join(&file), members);
-        for (name, ..) in members { weight_map.insert(name.clone(), Value::String(file.clone())); }
-    }
-    std::fs::write(dir.path().join("config.json"), serde_json::to_vec(&config()).unwrap()).unwrap();
-    std::fs::write(dir.path().join("model.safetensors.index.json"),
-        serde_json::to_vec(&serde_json::json!({"weight_map": weight_map})).unwrap()).unwrap();
+    testing::write_kimi_snapshot(dir.path(), all);
     dir
 }
 
 fn with_layout(ranks: usize, budget: Option<u64>) -> PlanOptions {
     PlanOptions { placement: ExpertPlacement::from_spark_ranks(ranks), spark_budget_bytes: budget,
-        layout: Some(layout::LayoutOptions { rtx_bytes: vec![crate::placement::inventory::PRO_TOTAL_BYTES; 2],
-            spark_allocation_budget_bytes: budget, ..Default::default() }), ..Default::default() }
+        layout: Some(layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)), rtx_bytes: vec![crate::placement::inventory::PRO_TOTAL_BYTES; 2],
+            // The text card retains device snapshots; host spilling is disabled.
+            host_cache_bytes: Some(0), spark_allocation_budget_bytes: budget, ..Default::default() }), ..Default::default() }
+}
+
+fn installed_inventory(root: &std::path::Path, spark: bool) -> std::path::PathBuf {
+    testing::write_kimi_installed_inventory(root, spark)
 }
 
 #[test]
-fn release_headers_classify_and_name_every_missing_kernel() {
+fn planner_publishes_kimi_runtime_default_and_explicit_units() {
+    let dir = snapshot(true);
+    for (unit, waves, expected) in [(0, 0, (2048, 2, 4096)), (1024, 2, (1024, 2, 2048)), (4096, 1, (4096, 1, 4096))] {
+        let mut options = with_layout(6, None);
+        let layout = options.layout.as_mut().unwrap();
+        layout.prefill_rows = unit;
+        layout.prefill_lanes = waves;
+        layout.host_memory = Some((128 << 30, 128 << 30));
+        let report = plan::plan(dir.path(), &options).unwrap();
+        assert_eq!((report.prefill_unit_rows.unwrap(), report.prefill_waves.unwrap(), report.prefill_span_rows.unwrap()), expected);
+        assert_eq!(report.prefill_transports, Some(1));
+    }
+}
+
+#[test]
+fn coordinator_inventory_requires_exact_tp2_exports() {
+    use serde_json::json;
+    for corruption in ["missing-layout", "missing-capacity", "missing-object", "width", "dtype", "capacity", "hidden", "activation"] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = installed_inventory(dir.path(), false);
+        let package = dir.path().join("lib/exl3/exl3-kimik3-k23");
+        validate_expert_inventory(&path, &package).unwrap();
+        let manifest = package.join("manifest.json");
+        let mut inventory: Value = serde_json::from_slice(&std::fs::read(&manifest).unwrap()).unwrap();
+        match corruption {
+            "missing-layout" | "missing-capacity" => {
+                inventory["variants"].as_array_mut().unwrap().retain(|entry| {
+                    let name = entry["directory"].as_str().unwrap();
+                    if corruption == "missing-layout" { !name.starts_with("rtx-tp2/") }
+                    else { name != "rtx-tp2/m80" }
+                });
+                std::fs::write(&manifest, inventory.to_string()).unwrap();
+            }
+            "missing-object" => std::fs::remove_file(package.join("rtx-tp2/m80/libcuteafd_exl3.so")).unwrap(),
+            _ => {
+                let meta_path = package.join("rtx-tp2/m80/v41_exl3.json");
+                let mut meta: Value = serde_json::from_slice(&std::fs::read(&meta_path).unwrap()).unwrap();
+                let (key, value) = match corruption {
+                    "width" => ("intermediate", json!(3072)),
+                    "dtype" => ("output_dtype", json!("bf16")),
+                    "capacity" => ("capacity", json!(16)),
+                    "hidden" => ("hidden", json!(7168)),
+                    "activation" => ("activation", json!("silu")),
+                    _ => unreachable!(),
+                };
+                meta[key] = value;
+                std::fs::write(meta_path, meta.to_string()).unwrap();
+            }
+        }
+        assert!(validate_expert_inventory(&path, &package).is_err(), "accepted {corruption}");
+    }
+}
+
+#[test]
+fn header_acceptance_is_independent_of_runtime_inventory() {
+    let snapshot = snapshot(false);
+    let checkpoint = Checkpoint::open(snapshot.path()).unwrap();
+    let trellis = checkpoint.tensors.iter().filter(|t| t.meta.name.contains(".experts.0.w1.")).cloned().collect::<Vec<_>>();
+    let mut operand = format::detect(format::group_by_stem(&trellis).values().next().unwrap()).unwrap();
+    let stem = format!("{TEXT}layers.1.block_sparse_moe.experts.0.w1");
+    let role = TensorRole::layer(Component::RoutedExpert, 1);
+    let model = Model::open(&checkpoint).unwrap();
+    model.accepts(&role, &stem, &mut operand).unwrap();
+    assert_eq!(model.experts(&operand).unwrap().package, PACKAGE);
+    let mut malformed = operand.clone();
+    malformed.logical[0] += 128;
+    assert!(model.accepts(&role, &stem, &mut malformed).is_err());
+    let mut unsupported = operand.clone();
+    unsupported.encoding = format::Encoding::Exl3 { bits: 3 };
+    assert!(model.accepts(&role, &stem, &mut unsupported).is_err());
+    assert!(model.experts(&unsupported).is_none());
+    for spark in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = installed_inventory(dir.path(), spark);
+        let package = dir.path().join("lib/exl3/exl3-kimik3-k23");
+        assert!(!path.parent().unwrap().join("exl3").exists());
+        validate_expert_inventory(&path, &package).unwrap();
+        assert!(validate_expert_inventory(&path, &dir.path().join("absent-package")).is_err());
+        model.accepts(&role, &stem, &mut operand).unwrap();
+        if spark {
+            let meta_path = dir.path().join("lib/exl3/exl3-kimik3-k23/tp6-rank5/m4096/v41_exl3.json");
+            let mut meta: Value = serde_json::from_slice(&std::fs::read(&meta_path).unwrap()).unwrap();
+            meta["descriptor_bits"] = serde_json::json!(9);
+            std::fs::write(&meta_path, meta.to_string()).unwrap();
+        } else {
+            std::fs::remove_file(dir.path().join("lib/exl3/exl3-kimik3-k23/rtx-tp1/m80/libcuteafd_exl3.so")).unwrap();
+        }
+        assert!(validate_expert_inventory(&path, &package).is_err());
+        model.accepts(&role, &stem, &mut operand).unwrap();
+        assert_eq!(model.experts(&operand).unwrap().package, PACKAGE);
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let path = installed_inventory(dir.path(), false);
+    let mut inventory: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    inventory["programs"] = serde_json::json!([]);
+    std::fs::write(&path, inventory.to_string()).unwrap();
+    let package = dir.path().join("lib/exl3/exl3-kimik3-k23");
+    assert!(validate_expert_inventory(&path, &package).unwrap_err().to_string().contains("kimik3_router_scores"));
+    assert!(validate_expert_inventory(&dir.path().join("absent.json"), &package).is_err());
+}
+
+#[test]
+fn release_headers_classify_native_text_without_installed_artifacts() {
     let dir = snapshot(false);
     let report = plan::plan(dir.path(), &PlanOptions::default()).unwrap();
     assert_eq!(report.family.as_deref(), Some("kimi_k3"));
@@ -121,23 +151,43 @@ fn release_headers_classify_and_name_every_missing_kernel() {
     let operand = format::detect(format::group_by_stem(&trellis).values().next().unwrap()).unwrap();
     let contract = model.experts(&operand).unwrap();
     assert_eq!((contract.package.as_str(), contract.block, contract.spark_worlds.clone()), (PACKAGE, 128, vec![6]));
-    assert!(report.hints.iter().any(|h| h.what.contains("Kimi K3 attention") && h.how.contains("dense_mla")));
+    assert_eq!(experts.rejected, 0);
+    assert_eq!(report.experts.as_ref().unwrap().package, PACKAGE);
+    assert!(report.components.iter().filter(|c| c.component != Component::Vision).all(|c| c.rejected == 0));
+    assert!(!report.hints.iter().any(|h| h.what.contains("W9") || h.what.contains("Kimi K3 attention")));
     // The family's own Spark budget, shown in the report and its rendering.
     assert_eq!(report.spark_budget_bytes, SPARK_BUDGET_BYTES);
     assert!(!report.executable());
+    assert_eq!(model.vision_mode(MediaMode::Auto), MediaMode::Off);
+    let vision_report = plan::plan(dir.path(), &PlanOptions { vision: MediaMode::Rtx(None), ..Default::default() }).unwrap();
+    assert!(!vision_report.wip_launchable());
+    assert!(vision_report.hints.iter().any(|h| h.what.contains("vision execution is not implemented")));
 }
 
 #[test]
-fn context_names_the_missing_native_abi_instead_of_claiming_fit() {
+fn planned_headers_supply_range_geometry_without_claiming_fit() {
+    let dir = snapshot(false);
+    let columns = PlanInput::open(dir.path()).unwrap().spark_ranges(&PlanOptions { layout: Some(layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)), ..Default::default() }), ..Default::default() }).unwrap();
+    assert_eq!(columns.len(), 2);
+    for column in columns {
+        assert_eq!(column.package, PACKAGE);
+        assert_eq!((column.intermediate, column.unit_columns, column.policy.width_cap), (3072, 128, 12));
+        assert!(column.routed_expert_bytes > 0);
+        assert!(column.range.is_none() && column.executable_minimum.is_none());
+    }
+}
+
+#[test]
+fn context_refuses_the_missing_executor_instead_of_claiming_fit() {
     let dir = snapshot(false);
     let mut options = with_layout(6, None);
     options.attention_placement = Some(crate::placement::AttentionPlacement::Context);
     let report = plan::plan(dir.path(), &options).unwrap();
-    assert!(!report.placement_supported && !report.fits);
-    assert!(report.hints.iter().any(|h| h.what.contains("kimi_k3 host prefix cache unsupported")
-        && h.what.contains("auto bytes")), "{:?}", report.hints);
-    assert!(report.hints.iter().any(|h| h.what.contains("owned-page query exchange/LSE-combine ABI")), "{:?}", report.hints);
-    assert!(report.memory_layout.as_ref().unwrap().devices.is_empty());
+    assert!(!report.placement_supported && !report.fits && !report.executable());
+    let reason = report.config_error.as_deref().unwrap();
+    assert!(reason.contains("kimi_k3") && reason.contains("context")
+        && reason.contains("executor not implemented"), "{reason}");
+    assert!(report.memory_layout.is_none());
 }
 
 #[test]
@@ -183,81 +233,309 @@ fn category(d: &cuteafd_core::memory_layout::DeviceLayout, c: cuteafd_core::memo
 }
 
 #[test]
-fn max_card_charges_spark_runtime_and_onboards_layers_as_the_fallback() {
+fn direct_layout_uses_shared_host_mark_rule_and_preserves_overrides() {
     use cuteafd_core::memory_layout::{Category, DeviceKind};
     let dir = snapshot(true);
-    let gib = |b: u64| b as f64 / super::GIB as f64;
-    // Default: no routed expert on RTX. Weights fit the 108 GiB family budget,
-    // but weights + runtime residual + latent I/O + EXL3 workspace do not fit
-    // the device: an honest refusal naming the shortfall.
-    let report = plan::plan(dir.path(), &with_layout(6, None)).unwrap();
+    let mark_bytes = 449_372_160;
+    for (host, entries, explicit) in [
+        (Some(0), 20, None), (None, 20, None), (Some(32 << 30), 20, None),
+        (None, 0, None), (None, 20, Some(4)),
+    ] {
+        let mut options = with_layout(6, Some(108 << 30));
+        let layout = options.layout.as_mut().unwrap();
+        layout.rtx_bytes = vec![256 << 30; 2];
+        layout.context_tokens = 262_144;
+        layout.pool_tokens = Some(524_288);
+        layout.concurrency = 8;
+        layout.host_cache_bytes = host;
+        layout.host_memory = Some((128 << 30, 128 << 30));
+        layout.mimo_prefix_entries = entries;
+        layout.prefix_slots = explicit;
+        let expected = explicit.unwrap_or_else(|| cuteafd_core::prefix::mark_slots_with_host(
+            layout.concurrency, entries, mark_bytes, layout.mimo_prefix_mark_bytes, host != Some(0)));
+        let report = plan::plan(dir.path(), &options).unwrap();
+        assert!(report.fits, "host={host:?} entries={entries} explicit={explicit:?}: {:?}", report.hints);
+        let reserved = device(report.memory_layout.as_ref().unwrap(), DeviceKind::Rtx)
+            .into_iter().map(|gpu| category(gpu, Category::Prefix)).sum::<u64>();
+        assert_eq!(reserved, expected * mark_bytes,
+            "host={host:?} entries={entries} explicit={explicit:?}");
+    }
+}
+
+#[test]
+fn max_card_jointly_selects_tp2_layers_marks_and_complete_spark_budget() {
+    use cuteafd_core::memory_layout::{Category, DeviceKind};
+    let dir = snapshot(true);
+    let mut options = with_layout(6, Some(108 << 30));
+    let layout = options.layout.as_mut().unwrap();
+    layout.host_cache_bytes = None;
+    layout.host_memory = Some((128 << 30, 128 << 30));
+    layout.concurrency = 8;
+    layout.pool_tokens = Some(1_048_576);
+    layout.prefix_slots = Some(2);
+    layout.context_tokens = 262144;
+    let report = plan::plan(dir.path(), &options).unwrap();
+    assert!(report.fits && report.placement_supported, "{:#?}", report.hints);
     let memory = report.memory_layout.as_ref().unwrap();
+    assert_eq!(memory.pool_tokens, 1_048_576);
+    assert!(memory.notes.iter().any(|note| note.contains("API max context: 262144")
+        && note.contains("compiled max context: 1048576")), "{:?}", memory.notes);
+    assert!(memory.notes.iter().any(|note| note.contains("selected RTX expert layers:")
+        && note.contains("retained marks:")), "{:?}", memory.notes);
+    assert!(memory.notes.iter().any(|note| note.contains("estimated runtime/workspace reserve")));
     let sparks = device(memory, DeviceKind::Spark);
     assert_eq!(sparks.len(), 6);
-    assert!((gib(category(sparks[0], Category::Experts)) - 107.544).abs() < 0.01);
-    assert!(category(sparks[0], Category::Runtime) > 0 && category(sparks[0], Category::Transport) > 0);
-    assert!(!report.hints.iter().any(|h| h.what.contains("over the 108.00 GiB Spark budget")), "{:#?}", report.hints);
-    assert!(report.hints.iter().any(|h| h.what.starts_with("spark0 full memory layout needs")), "{:#?}", report.hints);
-    assert_eq!(report.attention_placement, crate::placement::AttentionPlacement::Layers);
+    for spark in &sparks {
+        assert!(spark.used_bytes() <= 108 << 30);
+        assert!(category(spark, Category::Runtime) > 0 && category(spark, Category::Transport) > 0);
+    }
     let rtx = device(memory, DeviceKind::Rtx);
+    assert_eq!(rtx.len(), 2);
     for gpu in &rtx {
-        assert_eq!(category(gpu, Category::Experts), 0);
-        assert!(gib(category(gpu, Category::Weights) + category(gpu, Category::Embedding)) > 55.0);
+        assert!(category(gpu, Category::Experts) > 0);
         assert_eq!(category(gpu, Category::Reserved), 2 * super::GIB);
-        assert!(gpu.free_bytes() >= 0);
-        assert_eq!(gpu.items.iter().find(|i| i.group == "layers").unwrap().bytes, 12 * 464_392_192);
     }
-    assert_eq!(rtx[0].used_bytes(), rtx[1].used_bytes());
-    assert_eq!(category(rtx[0], Category::Kv), category(rtx[1], Category::Kv));
-    for gpu in 0..2 {
-        let owners: Vec<_> = (0..24).filter(|ordinal| ordinal % 2 == gpu)
-            .map(|ordinal| if ordinal == 23 { 92 } else { ordinal * 4 + 3 }).collect();
-        assert!(memory.notes.iter().any(|n| n.starts_with(&format!("RTX{gpu}: owned MLA layers {owners:?};"))), "{:?}", memory.notes);
-    }
-    // Explicit heads keeps both full latent caches and replicates only low-rank operands.
-    let mut heads = with_layout(6, None);
-    heads.attention_placement = Some(crate::placement::AttentionPlacement::Heads);
-    heads.layout.as_mut().unwrap().pool_tokens = Some(262_144);
-    heads.layout.as_mut().unwrap().context_tokens = 262_144;
-    let heads_report = plan::plan(dir.path(), &heads).unwrap();
-    assert_eq!(heads_report.attention_placement, crate::placement::AttentionPlacement::Heads);
-    let head_gpus = device(heads_report.memory_layout.as_ref().unwrap(), DeviceKind::Rtx);
-    for gpu in 0..2 {
-        assert_eq!(category(head_gpus[gpu], Category::Weights) - category(rtx[gpu], Category::Weights), 363_380_736);
-        assert_eq!(head_gpus[gpu].items.iter().find(|i| i.group == "layers").unwrap().bytes, 5_936_087_040);
-    }
-    let mut owned = with_layout(6, None);
-    owned.attention_placement = Some(crate::placement::AttentionPlacement::Layers);
-    owned.layout.as_mut().unwrap().pool_tokens = Some(262_144);
-    owned.layout.as_mut().unwrap().context_tokens = 262_144;
-    let owned_report = plan::plan(dir.path(), &owned).unwrap();
-    let owned_gpus = device(owned_report.memory_layout.as_ref().unwrap(), DeviceKind::Rtx);
-    for gpu in 0..2 {
-        assert_eq!(category(head_gpus[gpu], Category::Kv) - category(owned_gpus[gpu], Category::Kv), 12 * 1152 * 262_144);
-    }
-    // Four onboarded layers (two per GPU, 6.92 GiB each) bring the Sparks under the device and keep >= 256K KV.
-    let mut options = with_layout(6, None);
-    options.layout.as_mut().unwrap().onboard = Some(crate::placement::Onboard::Layers(4));
-    let report = plan::plan(dir.path(), &options).unwrap();
-    let memory = report.memory_layout.as_ref().unwrap();
-    assert!(!report.hints.iter().any(|h| h.what.contains("full memory layout needs")), "{:#?}", report.hints);
-    for rtx in device(memory, DeviceKind::Rtx) { assert!((gib(category(rtx, Category::Experts)) - 13.848).abs() < 0.01); }
-    assert!((gib(category(device(memory, DeviceKind::Spark)[0], Category::Experts)) - 102.869).abs() < 0.01);
-    assert!(memory.pool_tokens >= 262_144, "pool {}", memory.pool_tokens);
-    // The shared 100 GiB budget refuses with the exact per-rank shortfall.
-    let report = plan::plan(dir.path(), &with_layout(6, Some(100 << 30))).unwrap();
-    assert!(!report.fits);
-    assert!(report.hints.iter().any(|h| h.what.contains("107.54 GiB/rank, 7.54 GiB over the 100.00 GiB")), "{:#?}", report.hints);
-    // Explicit ceiling replaces the old 108 GiB device estimate too; runtime
-    // remains unqualified even when this offline ledger fits.
-    let report = plan::plan(dir.path(), &with_layout(6, Some(112 << 30))).unwrap();
-    assert_eq!(report.spark_budget_bytes, 112 << 30);
-    let memory = report.memory_layout.as_ref().unwrap();
-    assert!(device(memory, DeviceKind::Spark).iter().all(|d| d.capacity_bytes == 112 << 30 && d.free_bytes() > 0));
-    assert!(!report.hints.iter().any(|h| h.what.contains("full memory layout needs")));
-    assert!(!report.fits && !report.placement_supported, "header fit is not W9 qualification");
-    assert!(memory.notes.iter().any(|n| n.contains("offline estimates")));
+    assert_eq!(category(rtx[0], Category::Experts), category(rtx[1], Category::Experts));
+    // Numeric overrides are strict, never silently increased to satisfy the workers.
+    options.layout.as_mut().unwrap().onboard = Some(crate::placement::Onboard::Layers(0));
+    let refused = plan::plan(dir.path(), &options).unwrap();
+    assert!(!refused.fits);
+    assert!(refused.hints.iter().any(|hint| hint.what.contains("explicit --rtx-expert-layers 0")));
+    // An impossible Spark ceiling must refuse instead of shrinking the 1M extent.
+    options.layout.as_mut().unwrap().onboard = None;
+    options.spark_budget_bytes = Some(1);
+    let refused = plan::plan(dir.path(), &options).unwrap();
+    assert!(!refused.fits);
     // Other card columns are refused by name.
-    let report = plan::plan(dir.path(), &with_layout(4, None)).unwrap();
-    assert!(report.hints.iter().any(|h| h.what.contains("6 Spark ranks")));
+    let refused = plan::plan(dir.path(), &with_layout(4, None)).unwrap();
+    assert!(refused.hints.iter().any(|h| h.what.contains("missing Spark recipe kimik3:exl3-k23 TP4")));
+}
+
+#[test]
+#[ignore = "requires CUTEAFD_KIMI_EXL3_SNAPSHOT; reads real headers only in a manifest-free process"]
+fn mounted_release_plan_is_manifest_independent_and_wip_only() -> anyhow::Result<()> {
+    let snapshot = std::env::var_os("CUTEAFD_KIMI_EXL3_SNAPSHOT").context("Kimi snapshot required")?;
+    ensure!(std::env::var_os("CUTEAFD_PROGRAM_MANIFEST").is_none(), "run with no installed manifest environment");
+    let checkpoint = Checkpoint::open(std::path::Path::new(&snapshot))?;
+    let stem = format!("{TEXT}layers.1.block_sparse_moe.experts.0.w1");
+    let members = checkpoint.tensors.iter().filter(|t| t.meta.name.starts_with(&format!("{stem}.")))
+        .cloned().collect::<Vec<_>>();
+    let mut operand = format::detect(format::group_by_stem(&members).values().next().context("real routed header")?)
+        .map_err(|e| anyhow::anyhow!("{e:?}"))?;
+    assert_eq!(operand.exl3_bits(), Some(2));
+    assert_eq!(operand.logical, [3072, 3584]);
+    let model = Model::open(&checkpoint)?;
+    model.accepts(&TensorRole::expert(Component::RoutedExpert, 1, 0), &stem, &mut operand)
+        .map_err(anyhow::Error::msg)?;
+    assert_eq!(model.experts(&operand).context("K2 package")?.package, PACKAGE);
+    drop(checkpoint);
+    let mut options = with_layout(6, Some(108 << 30));
+    options.vision = MediaMode::Off;
+    options.audio = MediaMode::Off;
+    options.draft_ownership = Some(spec::DraftOwnership::None);
+    let layout = options.layout.as_mut().unwrap();
+    layout.onboard = Some(crate::placement::Onboard::Layers(5));
+    // Match the serving card's automatic pool, not a forced 2M allocation.
+    layout.pool_tokens = None;
+    let report = plan::plan(std::path::Path::new(&snapshot), &options)?;
+    assert_eq!(report.experts.as_ref().context("deployment expert package")?.package, PACKAGE);
+    assert!(report.fits && report.placement_supported && report.wip_launchable(), "{:#?}", report.hints);
+    assert!(!report.executable(), "release readiness is not qualified by a header-only plan");
+    let deployment_options = crate::plan::deployment::DeploymentOptions { rtx_gpus: 2, speculator: "off".into(), ..Default::default() };
+    let deployment = crate::plan::deployment::DeploymentSpec::from_report(&report, &deployment_options);
+    assert!(deployment.is_ok(), "{deployment:?}");
+    Ok(())
+}
+
+#[test]
+fn cache_geometry_requires_tp2_and_preserves_physical_mla_copies() {
+    use crate::{placement::AttentionPlacement, serving_capacity::{CacheOptions, KvPlacement}};
+    let dir = snapshot(false);
+    let checkpoint = Checkpoint::open(dir.path()).unwrap();
+    let model = KIMI_K3.open(&checkpoint).unwrap();
+    assert!(model.cache_geometry(CacheOptions::default()).is_err());
+    for (attention, format) in [AttentionPlacement::Layers, AttentionPlacement::Heads].into_iter()
+        .flat_map(|attention| [cuteafd_core::MlaCacheFormat::Bf16, cuteafd_core::MlaCacheFormat::Fp8]
+            .map(|format| (attention, format))) {
+        let cache = model.cache_geometry(CacheOptions { coordinator_ranks: 2, mla_kv: format,
+            attention_placement: Some(attention), ..Default::default() }).unwrap().unwrap();
+        assert_eq!(cache.placement, KvPlacement::PartitionedLayers);
+        assert_eq!(cache.logical_unit_rows, 64);
+        assert_eq!(cache.ranks.len(), 2);
+        assert_eq!(cache.ranks[0].persistent_unit_bytes,
+            (12 * 64 * format.record_bytes()) as u64 * if attention == AttentionPlacement::Heads { 2 } else { 1 });
+        assert_eq!(cache.ranks[0], cache.ranks[1]);
+        assert_eq!(cache.ranks[0].retained_mark_bytes, 224_686_080);
+    }
+    assert!(model.cache_geometry(CacheOptions { coordinator_ranks: 2,
+        attention_placement: Some(AttentionPlacement::Context), ..Default::default() }).is_err());
+}
+
+#[test]
+fn core_k6_headers_charge_native_bytes_and_admit_native_operands() {
+    let dir = tempfile::tempdir().unwrap();
+    testing::write_kimi_core_snapshot(dir.path(), false);
+    let checkpoint = Checkpoint::open(dir.path()).unwrap();
+    let model = Model::open(&checkpoint).unwrap();
+    assert_eq!(model.core.projections.len(), 926);
+    assert!(model.native_serving_admission());
+    assert!(!dir.path().join("quantize_config.json").exists());
+    let source: u64 = model.core.projections.values().map(|p| p.source_bytes).sum();
+    assert_eq!(source, 40_323_110_520);
+    let kv_a = &model.core.projections[&format!("{TEXT}layers.3.self_attn.kv_a_proj_with_mqa")];
+    assert_eq!(kv_a.shape, [576, 7168]);
+    assert_eq!(kv_a.stored_outputs, 640);
+    let original = snapshot(false);
+    let bf16 = Model::open(&Checkpoint::open(original.path()).unwrap()).unwrap();
+    let weights = |model: &Model, gpu: usize| {
+        model.coordinator.split / 2 + model.coordinator.replicated - model.frontends[1 - gpu]
+            + model.mla.iter().enumerate().filter(|(layer, _)| model.cfg.attention[*layer] == KimiAttention::Mla)
+                .enumerate().filter(|(ordinal, _)| ordinal % 2 == gpu).map(|(_, (_, r))| r.split + r.replicated).sum::<u64>()
+            + if gpu == 0 { model.bytes[&Component::Embedding] } else {
+                model.core.projections.get("language_model.lm_head").map_or(model.bytes[&Component::LmHead],
+                    |p| p.resident_bytes(1).unwrap()) }
+    };
+    let freed = [weights(&bf16, 0) - weights(&model, 0), weights(&bf16, 1) - weights(&model, 1)];
+    assert_eq!(freed, [32_815_041_536, 34_282_705_920]);
+    for (stem, projection) in &model.core.projections {
+        let members = checkpoint.tensors.iter().filter(|t| format::split_stem(&t.meta.name).0 == stem)
+            .cloned().collect::<Vec<_>>();
+        let mut operand = format::detect(format::group_by_stem(&members).values().next().unwrap()).unwrap();
+        assert_eq!(operand.exl3_bits(), Some(6));
+        assert_eq!(operand.logical, [projection.stored_outputs, projection.shape[1]]);
+        let role = KIMI_K3.classify(&model.spec, &format!("{stem}.trellis")).unwrap();
+        model.accepts(&role, stem, &mut operand).unwrap();
+    }
+}
+
+#[test]
+fn core_index_only_native_inventory_reads_headers_and_admits_native_core() {
+    let dir = tempfile::tempdir().unwrap();
+    testing::write_kimi_core_snapshot(dir.path(), false);
+    let checkpoint = Checkpoint::inventory(dir.path()).unwrap();
+    assert!(checkpoint.tensors.is_empty());
+    let model = Model::open(&checkpoint).unwrap();
+    assert_eq!(model.core.projections.len(), 926);
+    assert!(model.native_serving_admission());
+    assert_eq!(model.core.projections.values().map(|p| p.source_bytes).sum::<u64>(), 40_323_110_520);
+    model.core.validate_runtime_groups(&model.cfg).unwrap();
+    let names = files::required_tensors(&checkpoint,
+        files::ReadRole::Coordinator { local_experts: false, speculator: false }).unwrap();
+    assert!(names.contains("language_model.lm_head.trellis"));
+    assert!(!names.contains("language_model.lm_head.weight"));
+    // Already-loaded core headers must not reopen a shard on the readiness path.
+    let loaded = Checkpoint::open(dir.path()).unwrap();
+    for shard in loaded.weight_map.values().collect::<std::collections::BTreeSet<_>>() {
+        std::fs::remove_file(dir.path().join(shard)).unwrap();
+    }
+    assert_eq!(Model::open(&loaded).unwrap().core.projections.len(), 926);
+}
+
+#[test]
+fn core_index_only_mixed_inventory_keeps_bf16_kda_and_opens_spark_role() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut mixed = Vec::new();
+    for tensor in tensors(false) {
+        let native = tensor.0.starts_with("language_model.model.layers.1.block_sparse_moe.shared_experts.")
+            || tensor.0.starts_with("language_model.model.layers.1.block_sparse_moe.routed_expert_")
+                && !tensor.0.contains("routed_expert_norm");
+        if native {
+            let stem = tensor.0.strip_suffix(".weight").unwrap();
+            mixed.extend(testing::exl3(stem, tensor.2[0], tensor.2[1], 6));
+        } else { mixed.push(tensor); }
+    }
+    testing::write_snapshot(dir.path(), &config(), &mixed, None);
+    let checkpoint = Checkpoint::inventory(dir.path()).unwrap();
+    assert!(checkpoint.tensors.is_empty());
+    let model = Model::open(&checkpoint).unwrap();
+    assert_eq!(model.core.projections.len(), 5);
+    model.core.validate_runtime_groups(&model.cfg).unwrap();
+    assert!(model.core.get_weight("language_model.model.layers.1.self_attn.q_proj.weight").is_none());
+    let role = files::ReadRole::Spark { rank: 0, world: 6 };
+    let spark = files::open_role(dir.path(), role).unwrap();
+    assert!(spark.tensors.iter().all(|tensor| tensor.meta.name.contains(".experts.")));
+    assert!(!spark.tensors.is_empty());
+    // Spark-only headers still discover core formats from the authoritative index.
+    assert_eq!(Model::open(&spark).unwrap().core.projections.len(), 5);
+}
+
+#[test]
+fn core_header_validation_rejects_wrong_bits_keep_list_and_duplicate_bf16() {
+    let dir = tempfile::tempdir().unwrap();
+    testing::write_kimi_core_snapshot(dir.path(), false);
+    let checkpoint = Checkpoint::open(dir.path()).unwrap();
+    for corruption in ["bits", "duplicate", "keep-list", "missing-scale", "shape", "codebook"] {
+        let mut changed = Checkpoint::open(dir.path()).unwrap();
+        let stem = format!("{TEXT}layers.0.self_attn.q_proj");
+        let trellis = changed.tensors.iter_mut().find(|t| t.meta.name == format!("{stem}.trellis")).unwrap();
+        match corruption {
+            "bits" => { trellis.meta.shape[2] = 80; trellis.meta.byte_length = trellis.meta.byte_length / 6 * 5; }
+            "duplicate" => {
+                let mut tensor = checkpoint.tensors[0].clone();
+                tensor.meta.name = format!("{stem}.weight");
+                changed.weight_map.insert(tensor.meta.name.clone(), tensor.shard.clone());
+                changed.tensors.push(tensor);
+            }
+            "keep-list" => {
+                for tensor in &mut changed.tensors {
+                    if tensor.meta.name.starts_with(&format!("{stem}.")) {
+                        tensor.meta.name = tensor.meta.name.replace("self_attn.q_proj", "self_attn.f_a_proj");
+                    }
+                }
+            }
+            "missing-scale" => changed.tensors.retain(|t| t.meta.name != format!("{stem}.svh")),
+            "shape" => trellis.meta.shape[0] -= 1,
+            "codebook" => {
+                let mut marker = changed.tensors.iter().find(|t| t.meta.name == format!("{stem}.mcg")).unwrap().clone();
+                marker.meta.name = format!("{stem}.mul1");
+                changed.tensors.push(marker);
+            }
+            _ => unreachable!(),
+        }
+        assert!(Model::open(&changed).is_err(), "accepted {corruption}");
+    }
+}
+
+#[test]
+fn header_native_k6_core_is_admitted_by_default() -> Result<()> {
+    let dir=tempfile::tempdir()?;
+    testing::write_kimi_core_snapshot(dir.path(),false);
+    let checkpoint=Checkpoint::open(dir.path())?;
+    let mut model=Model::open(&checkpoint)?;
+    let options=PlanOptions::default();
+    model.configure(&options).map_err(anyhow::Error::msg)?;
+    assert!(model.native_serving_admission());
+    for (stem,projection) in &model.core.projections {
+        let members=checkpoint.tensors.iter().filter(|t|format::split_stem(&t.meta.name).0==stem)
+            .cloned().collect::<Vec<_>>();
+        let mut operand=format::detect(format::group_by_stem(&members).values().next().unwrap())
+            .map_err(|error|anyhow::anyhow!("{error:?}"))?;
+        let role=KIMI_K3.classify(&model.spec,&format!("{stem}.trellis")).unwrap();
+        model.accepts(&role,stem,&mut operand).map_err(anyhow::Error::msg)?;
+        assert_eq!(operand.logical,[projection.stored_outputs,projection.shape[1]]);
+    }
+    Ok(())
+}
+
+#[test]
+fn default_context_follows_the_checkpoint_core() -> Result<()> {
+    use crate::families::kimi_k3::{default_context, COMPILED_CONTEXT, DEFAULT_CONTEXT};
+    let k6 = tempfile::tempdir()?;
+    testing::write_kimi_core_snapshot(k6.path(), false);
+    let bf16 = snapshot(false);
+    for (dir, expected) in [(k6.path(), COMPILED_CONTEXT), (bf16.path(), DEFAULT_CONTEXT)] {
+        let checkpoint = Checkpoint::open(dir)?;
+        assert_eq!(default_context(&Model::open(&checkpoint)?.core), expected);
+        // The planner's unset context selects the same extent; an explicit one wins.
+        let report = plan::plan(dir, &PlanOptions { placement: ExpertPlacement::Sparks { ranks: 6 },
+            layout: Some(plan::layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)), rtx_bytes: vec![96 << 30; 2], ..Default::default() }), ..Default::default() })?;
+        let notes = report.memory_layout.as_ref().map(|m| m.notes.join("\n")).unwrap_or_default();
+        assert!(notes.contains(&format!("Kimi API max context: {expected} tokens")), "{notes}");
+        let explicit = plan::plan(dir, &PlanOptions { placement: ExpertPlacement::Sparks { ranks: 6 },
+            layout: Some(plan::layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)), rtx_bytes: vec![96 << 30; 2], context_tokens: 262_144, ..Default::default() }),
+            ..Default::default() })?;
+        let notes = explicit.memory_layout.as_ref().map(|m| m.notes.join("\n")).unwrap_or_default();
+        assert!(notes.contains("Kimi API max context: 262144 tokens"), "{notes}");
+    }
+    Ok(())
 }

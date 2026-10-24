@@ -1,4 +1,5 @@
 //! Native router/shared expert bindings with transport-neutral wave boundaries.
+use super::scratch::{self, Arena, Plane};
 use super::weights::load_operand;
 use crate::shared::{
     memory::device::{Allocation, Device, Stream},
@@ -38,8 +39,12 @@ const OUTPUT: usize = 13;
 #[derive(Debug, Clone)]
 struct Admission {
     rows: usize,
+    /// Rows of every in-flight unit held by the live planes (`span >= rows`).
+    span: usize,
     planes: [usize; 14],
     bytes: u64,
+    /// A whole-owned (CSA) layer takes the second replicated-reply plane.
+    full: bool,
 }
 impl Admission {
     fn new(
@@ -52,23 +57,8 @@ impl Admission {
             (1..=4096).contains(&rows),
             "Step-5 routed rows must be 1..=4096"
         );
-        let planes = [
-            (H, 4),
-            (H, 2),
-            (E, 4),
-            (E, 4),
-            (K, 4),
-            (K, 4),
-            (2 * I, 2),
-            (I, 2),
-            (H, 2),
-            (H, 2),
-            (H, 4),
-            (H, 4),
-            (H, 4),
-            (H, 4),
-        ]
-        .map(|(width, element)| (rows * width * element).max(256));
+        let planes = cuteafd_loader::plan::families::step5::native::routed_planes(rows)?;
+        let span = rows;
         let bytes = planes
             .iter()
             .map(|&n| n as u64)
@@ -85,8 +75,10 @@ impl Admission {
         );
         Ok(Self {
             rows,
+            span,
             planes,
             bytes,
+            full: false,
         })
     }
 }
@@ -103,8 +95,21 @@ impl RoutedPlan {
     pub fn bytes(&self) -> u64 {
         self.admission.bytes
     }
+
+    /// Live planes hold `span` rows (every in-flight unit); scratch holds one.
+    pub(super) fn with_span(mut self, span: usize) -> Result<Self> {
+        ensure!(span >= self.admission.rows && span <= 4096, "Step-5 routed span outside 1..=4096");
+        let live = cuteafd_loader::plan::families::step5::native::routed_planes(span)?;
+        for plane in 0..14 {
+            if cuteafd_loader::plan::families::step5::native::routed_live(plane) {
+                self.admission.planes[plane] = live[plane];
+            }
+        }
+        self.admission.span = span;
+        Ok(self)
+    }
     pub fn workspace_bytes(&self) -> u64 {
-        self.admission.planes.iter().map(|&n| n as u64).sum()
+        cuteafd_loader::plan::families::step5::native::plane_bytes(&self.admission.planes).expect("admitted planes")
     }
 
     pub fn prepare(
@@ -233,7 +238,8 @@ impl RoutedPlan {
                 && programs.spec("step5_residual_f32")?.geometry["width"] == H,
             "Step-5 routed pointwise geometry"
         );
-        let admission = Admission::new(rows, &weights, available, reservations)?;
+        let mut admission = Admission::new(rows, &weights, available, reservations)?;
+        admission.full = contract.layers[layer].sliding.is_none();
         Ok(Self {
             layer,
             layout,
@@ -275,17 +281,35 @@ struct RoutedWeights<'a> {
 
 pub(super) struct RoutedFfn<'a> {
     stream: Stream<'a>,
-    planes: Vec<Allocation<'a>>,
+    planes: Vec<Plane<'a>>,
     admission: Admission,
     immutable: std::rc::Rc<RoutedWeights<'a>>,
+    /// Row offset of the selected prefill unit inside the live planes.
+    unit: std::cell::Cell<usize>,
 }
 impl<'a> RoutedFfn<'a> {
+    pub(super) fn workspace_bytes(&self) -> u64 {
+        cuteafd_loader::plan::families::step5::native::plane_bytes(&self.admission.planes).expect("admitted planes")
+    }
+
+
     pub fn load(
         device: Device<'a>,
         programs: &'a Programs<'a>,
         checkpoint: &'a Checkpoint,
         layer: usize,
         plan: RoutedPlan,
+    ) -> Result<Self> {
+        Self::load_in(device, programs, checkpoint, layer, plan, None)
+    }
+
+    pub(super) fn load_in(
+        device: Device<'a>,
+        programs: &'a Programs<'a>,
+        checkpoint: &'a Checkpoint,
+        layer: usize,
+        plan: RoutedPlan,
+        arena: Option<(&Arena<'a>, usize)>,
     ) -> Result<Self> {
         ensure!(layer == plan.layer, "Step-5 routed plan layer mismatch");
         let resolved = definitions(&plan.activation)
@@ -299,44 +323,57 @@ impl<'a> RoutedFfn<'a> {
             .collect::<Result<Vec<_>>>()?;
         Self::workspace(device, plan.admission, std::rc::Rc::new(RoutedWeights {
             weights, programs: resolved, epsilon: plan.epsilon, layer,
-        }))
+        }), arena)
     }
 
     /// Share only native weights/programs; route, reduction and zero planes are private.
     pub(super) fn new_lane(&self) -> Result<Self> {
-        Self::workspace(self.stream.device, self.admission.clone(), self.immutable.clone())
+        Self::workspace(self.stream.device, self.admission.clone(), self.immutable.clone(), None)
     }
 
     fn workspace(device: Device<'a>, admission: Admission,
-        immutable: std::rc::Rc<RoutedWeights<'a>>) -> Result<Self> {
+        immutable: std::rc::Rc<RoutedWeights<'a>>, arena: Option<(&Arena<'a>, usize)>) -> Result<Self> {
         let _scope = cuteafd_ffi::memory_ledger::scope("step5_routed_workspace");
-        let planes = admission.planes.iter().map(|&n| Allocation::new(device, n))
-            .collect::<Result<Vec<_>>>()?;
+        let spans = cuteafd_loader::plan::families::step5::native::routed_layout(admission.rows,
+            admission.span, admission.full)?;
+        let planes = scratch::region_planes(device, &spans, arena)?;
         let stream = Stream::new(device)?;
-        device.run(|| {
-            // SAFETY: private zero plane survives drainage and is never overwritten.
-            unsafe { device.library.cuda_zero_bytes_async(planes[ZERO].buffer,
-                planes[ZERO].buffer.bytes, stream.raw) }
-        })?;
-        stream.drain()?;
-        Ok(Self { stream, planes, admission, immutable })
+        Ok(Self { stream, planes, admission, immutable, unit: std::cell::Cell::new(0) })
     }
     pub fn validate_live_weights(&self, device: Device<'_>) -> Result<()> {
         super::weights::validate_live_weights(device.id, &self.immutable.weights)
     }
 
+    /// Live planes (OUTPUT, INPUT, SHARED, ROUTED) are viewed at the selected
+    /// unit's rows; hook-local scratch always starts at row zero.
+    fn plane(&self, index: usize) -> CuteafdDeviceBuffer {
+        let buffer = self.planes[index].buffer;
+        if !cuteafd_loader::plan::families::step5::native::routed_live(index) { return buffer; }
+        let stride = buffer.bytes / self.admission.span;
+        let offset = self.unit.get() * stride;
+        CuteafdDeviceBuffer { ptr: buffer.ptr.wrapping_byte_add(offset), bytes: buffer.bytes - offset, ..buffer }
+    }
+
+    /// Selects a prefill unit's rows of the live planes; whole steps use row 0.
+    pub(super) fn select_unit(&self, start: usize, rows: usize) -> Result<()> {
+        ensure!(start.checked_add(rows).is_some_and(|end| end <= self.admission.span) && rows <= self.admission.rows,
+            "Step-5 routed unit rows outside admitted span");
+        self.unit.set(start);
+        Ok(())
+    }
+
     pub fn input(&self) -> CuteafdDeviceBuffer {
-        self.planes[INPUT].buffer
+        self.plane(INPUT)
     }
     pub fn output(&self) -> CuteafdDeviceBuffer {
-        self.planes[OUTPUT].buffer
+        self.plane(OUTPUT)
     }
     pub fn bytes(&self) -> u64 {
         self.admission.bytes
     }
     #[cfg(test)]
     pub fn route_ids(&self) -> CuteafdDeviceBuffer {
-        self.planes[IDS].buffer
+        self.plane(IDS)
     }
 
     fn launch(
@@ -376,8 +413,8 @@ impl<'a> RoutedFfn<'a> {
         stream.device.run(|| {
             // SAFETY: the diagnostic owner retains normalized rows and routes through drainage.
             unsafe {
-                link.dispatch(self.immutable.layer, rows, kind, self.planes[IDS].buffer,
-                    self.planes[ROUTES].buffer, self.planes[NORM].buffer, stream.raw)
+                link.dispatch(self.immutable.layer, rows, kind, self.plane(IDS),
+                    self.plane(ROUTES), self.plane(NORM), stream.raw)
             }
         })?;
         self.shared_on(rows, stream)?;
@@ -385,18 +422,18 @@ impl<'a> RoutedFfn<'a> {
             // SAFETY: the retained diagnostic link orders collection before reduction.
             unsafe {
                 link.collect(stream.raw)?;
-                link.reduce(std::ptr::null(), self.planes[ROUTED].buffer.ptr.cast(), rows, stream.raw)
+                link.reduce(std::ptr::null(), self.plane(ROUTED).ptr.cast(), rows, stream.raw)
             }
         })?;
         self.finish_on(rows, stream)
     }
 
     pub fn wave_inputs(&self) -> [CuteafdDeviceBuffer; 3] {
-        [self.planes[IDS].buffer, self.planes[ROUTES].buffer, self.planes[NORM].buffer]
+        [self.plane(IDS), self.plane(ROUTES), self.plane(NORM)]
     }
 
     pub fn routed_output(&self) -> CuteafdDeviceBuffer {
-        self.planes[ROUTED].buffer
+        self.plane(ROUTED)
     }
 
     fn check_stream(&self, rows: usize, stream: &Stream<'a>) -> Result<()> {
@@ -410,7 +447,7 @@ impl<'a> RoutedFfn<'a> {
     /// A receiving replica needs the native shared expert, not another router/wave.
     pub fn normalize_on(&self, rows: usize, stream: &Stream<'a>) -> Result<()> {
         self.check_stream(rows, stream)?;
-        let p = |i: usize| self.planes[i].buffer.ptr;
+        let p = |i: usize| self.plane(i).ptr;
         let weight = self.immutable.weights[0].buffer.ptr;
         self.launch(0, &[p(INPUT), weight, weight, weight, weight, weight, p(NORM)], rows, stream)
     }
@@ -418,15 +455,15 @@ impl<'a> RoutedFfn<'a> {
     /// Produce native BF16 wire rows and biased top-8 routes without choosing a transport.
     pub fn frontend_on(&self, rows: usize, stream: &Stream<'a>) -> Result<()> {
         self.normalize_on(rows, stream)?;
-        let p = |i: usize| self.planes[i].buffer.ptr;
+        let p = |i: usize| self.plane(i).ptr;
         let w = |i: usize| self.immutable.weights[i].buffer.ptr;
         self.launch(1, &[p(NORM), w(1), p(LOGITS)], rows, stream)?;
         stream.device.run(|| {
             // SAFETY: disjoint admitted logits planes and routes remain live through the stream drain.
             unsafe {
                 stream.device.library.copy_d2d_async(
-                    self.planes[SELECT_LOGITS].buffer,
-                    self.planes[LOGITS].buffer,
+                    self.plane(SELECT_LOGITS),
+                    self.plane(LOGITS),
                     rows * E * 4,
                     stream.raw,
                 )?;
@@ -453,7 +490,7 @@ impl<'a> RoutedFfn<'a> {
 
     pub fn shared_on(&self, rows: usize, stream: &Stream<'a>) -> Result<()> {
         self.check_stream(rows, stream)?;
-        let p = |i: usize| self.planes[i].buffer.ptr;
+        let p = |i: usize| self.plane(i).ptr;
         let w = |i: usize| self.immutable.weights[i].buffer.ptr;
         self.launch(3, &[p(NORM), w(3), p(GATE_UP)], rows, stream)?;
         self.launch(4, &[p(GATE_UP), p(ACTIVATION)], rows, stream)?;
@@ -463,7 +500,12 @@ impl<'a> RoutedFfn<'a> {
     /// The caller orders a completed BF16 routed reduction before this native join.
     pub fn finish_on(&self, rows: usize, stream: &Stream<'a>) -> Result<()> {
         self.check_stream(rows, stream)?;
-        let p = |i: usize| self.planes[i].buffer.ptr;
+        let p = |i: usize| self.plane(i).ptr;
+        stream.device.run(|| {
+            // SAFETY: the reused zero plane is disjoint and ordered before its consumer.
+            unsafe { stream.device.library.cuda_zero_bytes_async(self.plane(ZERO),
+                rows * H * 4, stream.raw) }
+        })?;
         // Match residual + (float(routed) + float(shared)), not (residual + routed) + shared.
         self.launch(6, &[p(ZERO), p(ROUTED), p(WIDE)], rows, stream)?;
         self.launch(6, &[p(WIDE), p(SHARED), p(COMBINED)], rows, stream)?;

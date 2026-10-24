@@ -2050,7 +2050,7 @@ impl VerbsHostProtocolV2PersistentClientSession {
         execution_lane: u32,
         cq_harvester: Option<Arc<VerbsHostProtocolV2CqHarvester>>,
     ) -> Result<Self> {
-        Self::connect_impl(addr, config, request, execution_lane, cq_harvester, false, None, false, None, None, 0, None)
+        Self::connect_impl(addr, config, request, execution_lane, cq_harvester, false, None, false, None, None, 0, None, None)
     }
 
     /// `flow_label`: both QPs' RoCE v2 flow label (0: the kernel's own).
@@ -2058,9 +2058,10 @@ impl VerbsHostProtocolV2PersistentClientSession {
     fn connect_local(addr: SocketAddr, config: &TcpTransportConfig,
                      request: &ExpertProtocolV2Request, landing: Option<DeviceLanding>,
                      egress: Option<&Arc<egress::EgressBuffer>>, write: Option<DeviceWriteTarget>,
-                     terminal_owner: Option<Arc<AtomicBool>>, flow_label: u32, capacity: Option<u32>) -> Result<Self> {
+                     terminal_owner: Option<Arc<AtomicBool>>, flow_label: u32, capacity: Option<u32>,
+                     model_endpoint: Option<u32>) -> Result<Self> {
         let mut session = Self::connect_impl(addr, config, request, 0, None, true, landing, egress.is_some(), write,
-            terminal_owner, flow_label, capacity)?;
+            terminal_owner, flow_label, capacity, model_endpoint)?;
         if let Some(buffer) = egress {
             let host = buffer.host();
             // SAFETY: the buffer is pinned host memory kept alive by the Arc
@@ -2080,9 +2081,9 @@ impl VerbsHostProtocolV2PersistentClientSession {
                     cq_harvester: Option<Arc<VerbsHostProtocolV2CqHarvester>>,
                     retain_final_response: bool, landing: Option<DeviceLanding>, gathered_sends: bool,
                     write: Option<DeviceWriteTarget>, terminal_owner: Option<Arc<AtomicBool>>,
-                    flow_label: u32, capacity: Option<u32>)
+                    flow_label: u32, capacity: Option<u32>, model_endpoint: Option<u32>)
                     -> Result<Self> {
-        let admitted = crate::worker_selection::reserve_peer_endpoint(addr, &request.header, capacity)?;
+        let admitted = crate::worker_selection::reserve_peer_endpoint(addr, &request.header, capacity, model_endpoint)?;
         verbs_host_preflight()?;
         let native_path = verbs_host_native_library_path().context(
             "native library not found; set CUTEAFD_NATIVE_LIB or build native/libcuteafd_native.so with RDMA",
@@ -2097,7 +2098,7 @@ impl VerbsHostProtocolV2PersistentClientSession {
                 } else {
                     cuteafd_core::SparkIngress::Fp8K32
                 };
-                let (max_request, max_response) = cuteafd_core::SparkEndpoint { capacity: rows, ingress }
+                let (max_request, max_response) = cuteafd_core::SparkEndpoint { ring_depth: None, capacity: rows, ingress }
                     .wire_bytes(cuteafd_core::expert_geometry()).context("invalid expert endpoint wire geometry")?;
                 (request_wire_bytes.max(max_request), expected_response_wire_bytes.max(max_response))
             }
@@ -2473,6 +2474,9 @@ impl VerbsHostProtocolV2PersistentClientSession {
         config: &TcpTransportConfig,
         timing_enabled: bool,
     ) -> Result<bool> {
+        if let Some(ring) = &mut self.retained_response_ring {
+            ring.drain(&self.endpoint, self.response_ring)?;
+        }
         let poll_started = timing_enabled.then(Instant::now);
         let stats = self.endpoint.try_poll(
             self.request_send_in_flight as u32,
@@ -2591,8 +2595,11 @@ impl VerbsHostProtocolV2PersistentClientSession {
         let copy_recv_ms = elapsed_ms_optional(copy_started);
         let post_recv_started = timing_enabled.then(Instant::now);
         if !matches!(&response_frame, VerbsHostProtocolV2ResponseFrame::Registered(_)) {
-            self.endpoint.post_recv_at(response_recv_offset, self.response_ring.slot_capacity_bytes,
-                                      VERBS_HOST_RECV_WR_ID + response_recv_slot as u64)?;
+            match &mut self.retained_response_ring {
+                Some(ring) => ring.copied(&self.endpoint, self.response_ring, response_recv_slot)?,
+                None => self.endpoint.post_recv_at(response_recv_offset, self.response_ring.slot_capacity_bytes,
+                    VERBS_HOST_RECV_WR_ID + response_recv_slot as u64)?,
+            }
         }
         self.response_recv_sequence = self.response_recv_sequence.wrapping_add(1);
         let post_recv_ms = elapsed_ms_optional(post_recv_started);
@@ -5475,7 +5482,7 @@ mod persistent_tests {
             request.header.hidden_dtype = ExpertV2Dtype::Fp8E4m3Ue8m0K32;
             request.header.hidden_row_stride_bytes = geometry.hidden + geometry.hidden / 32;
             request.header.flags = crate::expert::EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16;
-            let endpoint = cuteafd_core::SparkEndpoint { capacity,
+            let endpoint = cuteafd_core::SparkEndpoint { ring_depth: None, capacity,
                 ingress: cuteafd_core::SparkIngress::Fp8K32 };
             let (_, response) = endpoint.wire_bytes(geometry).unwrap();
             for debug in [false, true] {

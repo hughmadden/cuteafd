@@ -12,9 +12,20 @@ const SPARK_HOST_BYTES: u64 = 13 * GIB;
 /// Qwen plan adapter: a dual 0-Spark layout runs whole-layer TP2 owners
 /// (`dual_layout`); every other layout serves on rtx0 (`single_layout`).
 pub(crate) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyModel,
-    input: &super::super::PlanInput, options: &LayoutOptions) -> MemoryLayout {
-    let shape = Shape::resolve(report, model, options, ShapePolicy::manifest_bounded());
-    if options.rtx_bytes.len() == 2 && options.head_split && report.placement == ExpertPlacement::Local {
+    input: &super::super::PlanInput, options: &mut LayoutOptions) -> MemoryLayout {
+    if options.prefill_lanes > 0 { options.prefill_waves = options.prefill_lanes; }
+    let local = report.placement == ExpertPlacement::Local;
+    let policy = ShapePolicy { prefill_rows: local.then_some(4096), ..ShapePolicy::manifest_bounded() };
+    let shape = Shape::resolve(report, model, options, policy);
+    // Local TP1/TP2 retain whole-step execution, not the Spark unit executor.
+    options.prefill_unit_rows = Some(shape.prefill_rows);
+    report.prefill_transports = Some(u64::from(!local));
+    if local && options.prefill_waves != 1 {
+        report.placement_supported = false;
+        report.hints.push(super::super::Hint { what: "Qwen local and dual prefill execute one whole-step wave".into(),
+            how: "Use --prefill-waves 1; continuous units require single-owner Spark experts.".into() });
+    }
+    if options.rtx_bytes.len() == 2 && options.head_split && local {
         return dual_layout(report, model, input, options, shape.prefill_rows, shape.concurrency,
             shape.context_tokens, shape.native_layers > 0, shape.manifest.as_ref());
     }
@@ -192,7 +203,16 @@ fn placement(input: &super::super::PlanInput, report: &mut PlanReport, options: 
     let mark = geometry.ranks[0].retained_mark_bytes;
     let marks = options.prefix_slots.unwrap_or_else(|| cuteafd_core::prefix::mark_slots_with_host(shape.concurrency,
         options.mimo_prefix_entries, mark, options.mimo_prefix_mark_bytes, options.host_cache_bytes != Some(0))) * mark;
-    let logits = if options.full_prefill_logits { full_prefill_logits_bytes("qwen4", shape.prefill_rows,
+    let prefill_shape = if options.prefill_waves > 1 {
+        anyhow::ensure!(matches!(report.placement, ExpertPlacement::Sparks { .. }),
+            "Qwen prefill waves require single-owner Spark experts");
+        let unit = if options.prefill_rows > 0 { options.prefill_rows } else { 4096 };
+        let units = crate::serving_capacity::PrefillShape { unit_rows: unit, waves: options.prefill_waves }.validate()?;
+        anyhow::ensure!(units.waves <= 2, "Qwen mapped PLE gathers admit at most two prefill waves");
+        Some(units)
+    } else { None };
+    let span = prefill_shape.map_or(shape.prefill_rows, |s| s.slot_rows());
+    let logits = if options.full_prefill_logits { full_prefill_logits_bytes("qwen4", span,
         cfg.vocab_size as u64) } else { 0 };
     // The PLE n-gram table is mapped (each step's rows uploaded): row width ple_dim / ple_rows, one byte
     // per value in E4M3, two in BF16 (`ple::PleTable::load`).
@@ -205,8 +225,8 @@ fn placement(input: &super::super::PlanInput, report: &mut PlanReport, options: 
     }
     let loaded_bytes = device.used_bytes();
     let inputs = crate::placement::families::qwen4::QwenInputs { automatic_context: options.context_tokens == 0,
-        admission: QwenAdmissionInputs { cfg: &cfg, layers: cfg.layers, mtp, kv_format: options.qwen_kv, manifest,
-            prefill_rows: shape.prefill_rows, slots: options.state_slots.unwrap_or(shape.concurrency), mark_bytes: marks,
+        admission: QwenAdmissionInputs { prefill_shape, cfg: &cfg, layers: cfg.layers, mtp, kv_format: options.qwen_kv, manifest,
+            prefill_rows: span, slots: options.state_slots.unwrap_or(shape.concurrency), mark_bytes: marks,
             full_prefill_logits: logits, ple, future_expert_bytes: 0, headroom: options.headroom_bytes.max(3 * GIB) },
         capacity_bytes: options.rtx_bytes[0],
         baseline: crate::placement::Baseline::Planned { context_bytes: 0, loaded_bytes },
@@ -216,6 +236,7 @@ fn placement(input: &super::super::PlanInput, report: &mut PlanReport, options: 
         startup_graph_modes: Some((shape.concurrency.min(16) as usize, true)),
     };
     let placement = crate::placement::families::qwen4::placement(&inputs)?;
+    report.prefill_span_rows = Some(span);
     device.items.extend(placement.items[0].iter().cloned());
     device.kv_tokens = placement.pool_tokens;
     let pool_tokens = placement.pool_tokens;
@@ -347,7 +368,7 @@ fn apply(input: &super::super::PlanInput, options: &LayoutOptions, devices: &mut
     let headroom = options.headroom_bytes.max(3 * GIB);
     let inputs = qwen4::QwenDualInputs { automatic_context: options.context_tokens == 0,
         owner_manifests,
-        admission: QwenAdmissionInputs { cfg: &cfg, layers: cfg.layers, mtp, kv_format: options.qwen_kv,
+        admission: QwenAdmissionInputs { prefill_shape: None, cfg: &cfg, layers: cfg.layers, mtp, kv_format: options.qwen_kv,
             manifest, prefill_rows: rows, slots: options.state_slots.unwrap_or(concurrency),
             mark_bytes: marks * geometry.ranks[0].retained_mark_bytes,
             full_prefill_logits: if options.full_prefill_logits { full_prefill_logits_bytes("qwen4", rows, cfg.vocab_size as u64) } else { 0 },

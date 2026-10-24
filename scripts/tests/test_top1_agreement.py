@@ -93,7 +93,7 @@ def test_mimo_serving_draft_head_is_separate_from_fixed_target_and_replay():
 
 def test_glm_serving_uses_shared_head_and_diagnostics_keep_explicit_routes():
     source = ROOT / 'rust/crates/cuteafd-daemon/src/families'
-    for path, variant in [('glm5/dflash.rs', 'HeadCall'), ('../shared/speculation/block_dspark.rs', 'HeadRef')]:
+    for path, variant in [('../shared/speculation/dflash.rs', 'HeadCall'), ('../shared/speculation/block_dspark.rs', 'HeadRef')]:
         text = (source / path).read_text()
         assert f'{variant}::Bf16(weight) if serving => crate::shared::draft::launch_bf16_head(' in text
         serving = text.split('pub fn draft_device(', 1)[1].split('pub fn draft_device_diagnostic(', 1)[0]
@@ -105,7 +105,10 @@ def test_glm_serving_uses_shared_head_and_diagnostics_keep_explicit_routes():
     diagnostic = wrapper.split('pub fn draft_device_diagnostic(', 1)[1].split('\n    }', 1)[0]
     assert 'Self::RemoteDflash(d) => d.draft_device_diagnostic(sequences, embedding, head)' in diagnostic
     remote = (source / 'glm5_flash/remote_dflash.rs').read_text()
-    remote_head = remote.split('fn launch_head(', 1)[1].split('\n    }', 1)[0]
+    adapter = remote.split('fn launch_head(', 1)[1].split('\n    }', 1)[0]
+    assert 'self.launch_head_at(head, self.target.hidden.buffer.ptr.cast_const(),' in adapter
+    assert 'self.target.logits.buffer.ptr, rows, serving, self.bridge.exchange.stream(0))' in adapter
+    remote_head = remote.split('fn launch_head_at(', 1)[1].split('\n    }', 1)[0]
     assert 'TargetHead::Bf16(weight) if serving =>' in remote_head
     assert 'crate::shared::draft::launch_bf16_head(' in remote_head
     assert 'self.draft.draft_head_mode()' in remote_head
@@ -113,7 +116,8 @@ def test_glm_serving_uses_shared_head_and_diagnostics_keep_explicit_routes():
     diagnostic = remote.split('pub fn draft_device_diagnostic(', 1)[1].split('\n    }', 1)[0]
     assert 'head, true)' in serving and 'head, false)' in diagnostic
     bridge = remote.split('fn draft_device_from(', 1)[1].split('\n    }', 1)[0]
-    assert 'self.launch_head(&head, rows, serving)' in bridge
+    assert 'self.bridge.round_trip_head(' in bridge
+    assert '|hidden, logits, stream| self.launch_head_at(&head, hidden, logits, rows, serving, stream)' in bridge
     for path in ['glm5/mod.rs', 'glm5_flash/speculate.rs']:
         text = (source / path).read_text()
         assert '.draft_device_diagnostic(' in text and '.draft_device(' not in text
@@ -138,9 +142,14 @@ def test_draft_attention_uses_one_shared_kernel_and_the_checked_timing_helper():
     assert 'constexpr int scalar_queries = 16;' in shared
     assert 'constexpr int scalar_context = 1024;' in shared
     assert 'queries <= scalar_queries && max_keys - block_rows <= scalar_context' in shared
-    assert 'scalar_partial_kernel<dim, windowed, has_sink>' in shared
-    assert 'dispatch_wmma<dim>' in shared
-    assert 'template <int dim, bool windowed, bool has_sink>' in shared
+    assert 'scalar_partial_kernel<dim, windowed, has_sink, fp8, paged>' in shared
+    assert 'dispatch_wmma<dim, fp8, paged>' in shared
+    assert 'template <int dim, bool windowed, bool has_sink, bool fp8, bool paged>' in shared
+    for dim in (64, 128):
+        for compact in ('false', 'true'):
+            for paged in ('false', 'true'):
+                assert f'return ROUTE({dim}, {compact}, {paged});' in shared
+    assert '#define ROUTE(D, F, P) route<D, F, P>(' in shared
     assert 'original_layout = dim == 64 && !windowed && !has_sink' in shared
     assert 'original_layout ? queries_per_slice : scalar_queries' in shared
     assert 'original_layout ? ctx + block_rows : min(ctx + block_rows, max_keys)' in shared
@@ -161,7 +170,7 @@ def test_draft_attention_uses_one_shared_kernel_and_the_checked_timing_helper():
     assert 'checked_launch' in names
     source = ROOT / 'rust/crates/cuteafd-daemon/src/families'
     for path, entry in [('mimo_v2/dflash.rs', 'fn draft_from('),
-                        ('glm5/dflash.rs', 'fn draft_from('),
+                        ('../shared/speculation/dflash.rs', 'fn draft_from('),
                         ('../shared/speculation/block_dspark.rs', 'fn draft_from(')]:
         text = (source / path).read_text()
         step = text.split(entry, 1)[1].split('l.cuda_stream_synchronize(s)?', 1)[0]

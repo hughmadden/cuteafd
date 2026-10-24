@@ -46,6 +46,7 @@ CHECKPOINT_CONTEXTS = {
     "qwen35": ("Qwen/Qwen3.5-9B", 262144),
     "qwen38": ("Qwen/Qwen3.8-27B", 262144),
     "step5": ("stepfun-ai/Step-5-Preview", 1048576),
+    "kimik3": ("moonshotai/Kimi-K3", 1048576),
 }
 
 
@@ -148,6 +149,31 @@ def head_split_programs(g, decode_rows: int, prefill_rows: int, max_context: int
     return [item for item in programs(g, decode_rows, prefill_rows, max_context) if item[0].startswith(keep)]
 
 
+def glm_stage_programs(g, decode_rows: int, prefill_rows: int):
+    """Dormant primitive boundaries; the official fused GLM table stays unchanged."""
+    from functools import partial
+    from b12x.integration.cuteafd.glm_attention import compile_glm_attention_stage_aot
+
+    out = []
+    for rows in (decode_rows, prefill_rows):
+        mode = "decode" if rows == decode_rows else "prefill"
+        for stage in ("rank_pack", "query_rope", "index_post", "absorb", "values"):
+            modes = (None, mode) if stage in ("absorb", "values") else (None,)
+            for weights in modes:
+                params = dict(stage=stage, max_rows=rows, fp8_only=weights)
+                suffix = "_bf16" if weights is None and stage in ("absorb", "values") else ""
+                out.append((f"{stage}{suffix}_m{rows}", "attention_stage", params,
+                            partial(compile_glm_attention_stage_aot, g, **params)))
+        if g.heads == 32:
+            for stage in ("query_rope", "absorb"):
+                params = dict(stage=stage, max_rows=rows, query_row=2 * g.heads * g.latent_dim)
+                if stage == "absorb":
+                    params["fp8_only"] = mode
+                out.append((f"{stage}_context_m{rows}", "attention_stage", params,
+                            partial(compile_glm_attention_stage_aot, g, **params)))
+    return out
+
+
 def glm_programs(g, decode_rows: int, prefill_rows: int, max_context: int):
     """GLM 5.x programs, same (stem suffix, op, params, thunk) shape as ``programs``."""
     from b12x.integration.cuteafd import glm_attention as attn
@@ -220,7 +246,9 @@ def glm_head_split_programs(g, decode_rows: int, prefill_rows: int, max_context:
 
 def mimo_programs(g, decode_rows: int, prefill_rows: int, max_context: int):
     """MiMo V2 programs, same (stem suffix, op, params, thunk) shape as ``programs``.
-    Full-attention producers and attention come in both KV record formats (BF16, int8 ``_kvint8``). qkv and the dense FFN take only the checkpoint's E4M3 weights (per-row x 128-K FP32
+    Full-attention producers and attention retain BF16 and int8 ``_kvint8``.
+    SWA additionally exports E4M3 ``_kvfp8`` with direct compact reads. QKV and
+    the dense FFN take only the checkpoint's E4M3 weights (per-row x 128-K FP32
     scales): decode rows up to ``fp8_rows`` on the GEMVs, W8A16 above; prefill W8A8
     (``fp8_rows`` nonzero) or W8A16. ``o_w8`` takes one E4M3 output weight for
     every row count, with no BF16 operand; its prefill activation precision is
@@ -245,12 +273,12 @@ def mimo_programs(g, decode_rows: int, prefill_rows: int, max_context: int):
             (f"ffn_m{rows}", "ffn", {"max_rows": rows, "inter": g.dense_inter, "fp8_only": mode},
              lambda r=rows, m=mode: ffn.compile_mimo_ffn_aot(g, max_rows=r, fp8_only=m)),
         ]
-        # KV records: BF16 (no tag) and, for the full-attention page pool, int8 (``_kvint8``: FP32
-        # scales per 32 dims). SWA rings stay BF16 (bounded per sequence; widening their 8-bit
-        # records costs a decode step ~1.3%). The fork's E4M3 records are not exported (golden KL
-        # +0.235 Flash / +0.012 V2.6 Pro over BF16).
+        # Compact SWA reads codes directly and commits the record bytes unchanged.
         for kind in ("full", "swa"):
-            for kv, tag in (("bf16", ""), ("int8", "_kvint8"))[:2 if kind == "full" else 1]:
+            formats = (("bf16", ""), ("int8", "_kvint8"))
+            if kind == "swa":
+                formats += (("fp8", "_kvfp8"),)
+            for kv, tag in formats:
                 out += [
                     (f"{kind}_producer{tag}_m{rows}", "producer",
                      {"kind": kind, "max_rows": rows, "fp8_only": mode, "kv": kv},
@@ -484,21 +512,52 @@ def kimi_kda_programs(g, decode_rows: int, prefill_rows: int, max_context: int):
         out.append((f"kda_m{rows}", "kda", params,
                     lambda kw=params: glmf.compile_glmf_kda_aot(g, **kw)))
     for heads in (48, 96):
-        mla = kimi_mla.KimiMlaGeometry(heads=heads)
         suffix = "" if heads == 48 else "_h96"
-        for rows in sorted({decode_rows, prefill_rows}):
-            for op, fn in (("mla_producer", kimi_mla.compile_kimi_mla_producer_aot),
-                           ("mla_output", kimi_mla.compile_kimi_mla_output_aot)):
-                out.append((f"{op}{suffix}_m{rows}", op, {"max_rows": rows, "heads": heads},
-                            lambda r=rows, g=mla, fn=fn: fn(g, max_rows=r)))
-        for mode, rows in (("decode", decode_rows), ("verify", decode_rows), ("extend", prefill_rows)):
-            out.append((f"dense_mla_{mode}{suffix}_m{rows}", "dense_mla",
-                        {"mode": mode, "max_rows": rows, "heads": heads},
-                        lambda m=mode, r=rows, g=mla: kimi_mla.compile_kimi_dense_mla_aot(
-                            g, max_rows=r, max_context=max_context, mode=m)))
+        for cache in ("bf16", "fp8"):
+            mla = kimi_mla.KimiMlaGeometry(heads=heads, kv_cache=cache)
+            cache_suffix = "" if cache == "bf16" else "_fp8"
+            for rows in sorted({decode_rows, prefill_rows}):
+                out.append((f"mla_producer{suffix}{cache_suffix}_m{rows}", "mla_producer",
+                            {"max_rows": rows, "heads": heads, "kv_cache": cache},
+                            lambda r=rows, g=mla: kimi_mla.compile_kimi_mla_producer_aot(g, max_rows=r)))
+                if cache == "bf16":
+                    out.append((f"mla_output{suffix}_m{rows}", "mla_output", {"max_rows": rows, "heads": heads},
+                                lambda r=rows, g=mla: kimi_mla.compile_kimi_mla_output_aot(g, max_rows=r)))
+            for mode, rows in (("decode", decode_rows), ("verify", decode_rows), ("extend", prefill_rows)):
+                out.append((f"dense_mla_{mode}{suffix}{cache_suffix}_m{rows}", "dense_mla",
+                            {"mode": mode, "max_rows": rows, "heads": heads, "kv_cache": cache},
+                            lambda m=mode, r=rows, g=mla: kimi_mla.compile_kimi_dense_mla_aot(
+                                g, max_rows=r, max_context=max_context, mode=m)))
     out.extend(kimi_w8_programs())
     out.extend(kimi_latent_programs())
     out.extend(kimi_route_programs())
+    out.extend(mla_draft_programs(decode_rows, max_context))
+    return out
+
+
+def mla_draft_programs(max_rows: int, max_context: int):
+    """Shared rotary MLA drafter; checkpoint scales are runtime ABI inputs."""
+    from b12x.integration.cuteafd import kimi_mla
+
+    def build(op, window=None, cache="bf16"):
+        g = kimi_mla.MlaDraftGeometry(window_size=window, kv_cache=cache)
+        fn = getattr(kimi_mla, f"compile_mla_draft_{op}_aot")
+        kwargs = {"max_rows": max_rows}
+        if op == "attention":
+            kwargs["max_context"] = max_context
+        return fn(g, **kwargs)
+
+    out = [(f"mla_draft_output_m{max_rows}", "mla_draft_output", {"max_rows": max_rows},
+            lambda: build("output"))]
+    for cache in ("bf16", "fp8"):
+        cache_suffix = "" if cache == "bf16" else "_fp8"
+        out.append((f"mla_draft_producer{cache_suffix}_m{max_rows}", "mla_draft_producer",
+                    {"max_rows": max_rows, "kv_cache": cache}, lambda c=cache: build("producer", cache=c)))
+        for window in (None, 4096):
+            suffix = "full" if window is None else f"w{window}"
+            out.append((f"mla_draft_attention_{suffix}{cache_suffix}_m{max_rows}", "mla_draft_attention",
+                        {"max_rows": max_rows, "window_size": window, "max_context": max_context, "kv_cache": cache},
+                        lambda w=window, c=cache: build("attention", w, c)))
     return out
 
 
@@ -568,6 +627,10 @@ def kimi_w8_programs():
                            ("down", {"width": width, "outputs": 7168})):
             out.append((f"ffn_{op}_i{width}", "bf16_projection", params,
                         lambda kw=params: build_projection(kw)))
+        # Speed-first default; compensation is for informational F32 comparisons.
+        params = {"width": 7168, "outputs": 2 * width, "compensated": True}
+        out.append((f"ffn_gate_up_i{width}_comp", "bf16_projection", params,
+                    lambda kw=params: build_projection(kw)))
     return out
 
 
@@ -650,7 +713,7 @@ def qwen4_programs(g, decode_rows: int, prefill_rows: int, max_context: int):
 
 
 def qwen_dense_programs(g, decode_rows: int, prefill_rows: int, max_context: int, *, norm_dtype):
-    """Ordinary residual, dense BF16 FFN and unrestricted causal hybrid attention."""
+    """Ordinary residual, native checkpoint projections and unrestricted full attention."""
     from b12x.integration.cuteafd import qwen_dense as dense
 
     out = [
@@ -671,6 +734,25 @@ def qwen_dense_programs(g, decode_rows: int, prefill_rows: int, max_context: int
             (f"ffn_m{rows}", "ffn", {"max_rows": rows},
              lambda r=rows: dense.compile_qwen_dense_ffn_aot(g, max_rows=r)),
         ]
+        out += [
+            (f"attn_producer_kv_fp8_m{rows}", "attn_producer", {"max_rows": rows, "kv_format": "fp8"},
+             lambda r=rows: dense.compile_qwen_dense_producer_aot(g, max_rows=r, kv_format="fp8")),
+            (f"full_gqa_kv_fp8_m{rows}", "full_gqa", {"max_rows": rows, "max_splits": 32, "kv_format": "fp8"},
+             lambda r=rows: dense.compile_qwen_dense_full_gqa_aot(g, max_rows=r, max_splits=32, kv_format="fp8")),
+        ]
+        if g.name == "qwen38_27b":
+            from b12x.integration.cuteafd import qwen_dense_fp8 as native
+            for op, compile_fn in [
+                ("gdn", native.compile_qwen_dense_gdn_fp8_aot),
+                ("attn_producer", native.compile_qwen_dense_producer_fp8_aot),
+                ("attn_o", native.compile_qwen_dense_attn_o_fp8_aot),
+                ("ffn", native.compile_qwen_dense_ffn_fp8_aot),
+            ]:
+                out.append((f"{op}_fp8_m{rows}", op, {"max_rows": rows, "fp8_weights": "only"},
+                            lambda r=rows, fn=compile_fn: fn(g, max_rows=r)))
+            out.append((f"attn_producer_fp8_kv_fp8_m{rows}", "attn_producer",
+                        {"max_rows": rows, "fp8_weights": "only", "kv_format": "fp8"},
+                        lambda r=rows: native.compile_qwen_dense_producer_fp8_aot(g, max_rows=r, kv_format="fp8")))
     return out
 
 
@@ -740,7 +822,9 @@ def main() -> None:
                              "qwen4 (Qwen 3.8 Flash Next), qwen35 (Qwen 3.5 9B), qwen38 (Qwen 3.8 27B), "
                              "kimik3 (Kimi K3 KDA, 48 heads per TP2 rank), "
                              "step5/step52 (Step-5 full/two-GPU head split), exlr8 (the fork's EXLR8 programs "
-                             "for --exlr8-role, after every other family), exlr8_dense (shared native dense operands)")
+                             "for --exlr8-role, after every other family), exlr8_dense (shared native dense operands), "
+                             "glm_stage/glm2_stage (dormant full/TP2 GLM primitive boundaries), "
+                             "kimi_k6_dense (native K6 core projections)")
     parser.add_argument("--exlr8-role", choices=("all", "coordinator", "spark"), default="all",
                         help="with exlr8: coordinator = shared-expert K1/grouping and rotated glue (beside the "
                              "family programs), spark = routed K1 serving and grouping, all = every program")
@@ -769,9 +853,9 @@ def main() -> None:
 
     geometries = [name.strip() for name in args.geometry.split(",") if name.strip()]
     if not geometries or any(name not in ("flash", "flash2", "pro", "pro2", "glm", "glm2", "mimo", "mimo2", "mimop",
-                                          "mimop2", "mimof", "mimof2", "glmf", "glmf2", "qwen4", "qwen35", "qwen38", "step5", "step52", "exlr8", "exlr8_dense", "kimik3") for name in geometries):
+                                          "mimop2", "mimof", "mimof2", "glmf", "glmf2", "qwen4", "qwen35", "qwen38", "step5", "step52", "exlr8", "exlr8_dense", "glm_stage", "glm2_stage", "kimi_k6_dense", "kimi_split", "kimik3") for name in geometries):
         raise SystemExit("--geometry takes flash, flash2, pro, pro2, glm, glm2, mimo, mimo2, mimop, mimop2, mimof, mimof2, "
-                         "glmf, glmf2, qwen4, qwen35, qwen38, step5, step52, exlr8, exlr8_dense and/or kimik3")
+                         "glmf, glmf2, qwen4, qwen35, qwen38, step5, step52, exlr8, exlr8_dense, glm_stage, glm2_stage, kimi_k6_dense, kimi_split and/or kimik3")
     if args.context_split_only and any(name not in ("flash", "pro", "glm", "glmf") for name in geometries):
         raise SystemExit("--context-split-only takes flash, pro, glm and/or glmf")
     kimi_kda = None
@@ -797,6 +881,27 @@ def main() -> None:
     entries, includes = [], []
     work = []
     for name in geometries:
+        if name in ("glm_stage", "glm2_stage"):
+            g = GLM53 if name == "glm_stage" else dataclasses.replace(GLM53, name="glm53_tp2", heads=32)
+            manifest["families"][name] = dataclasses.asdict(g)
+            work += [(name, *item) for item in glm_stage_programs(g, args.decode_rows, args.prefill_rows)]
+            continue
+        if name == "kimi_split":
+            from export_b12x_kimi_split_aot import programs as kimi_split_programs
+            manifest["families"][name] = {"abi_version": 1}
+            work += [(name, suffix, "kimi_split", {"max_rows": capacity}, thunk)
+                     for suffix, thunk, capacity in kimi_split_programs()]
+            continue
+        if name == "kimi_k6_dense":
+            from export_b12x_kimi_k6_dense_aot import programs as kimi_dense_programs, row_policies
+            manifest["families"][name] = {
+                "abi_version": 1,
+                "row_policies": row_policies(),
+                "measured_not_exported": ["tiled_mcg"],
+            }
+            # Diagnostic only: isolate activation range from native T2 integration.
+            work += [(name, *item) for item in kimi_dense_programs(input_dtype="bf16")]
+            continue
         if name == "exlr8_dense":
             from export_b12x_exlr8_dense_aot import programs as dense_programs
             manifest["families"][name] = {"abi_version": 1}
@@ -897,7 +1002,7 @@ def main() -> None:
     for family, suffix, op, params, thunk in work:
         if selected is not None and suffix not in selected:
             continue
-        stem = f"{family}_{suffix}"
+        stem = suffix if family == "kimi_split" else f"{family}_{suffix}"
         # Card-specific split/merge plans retain their numerics and matching
         # scratch layouts. Native load selects once, before graph capture.
         plan_sms = (170, 188) if props.minor == 0 and op == "sparse_mla" and params.get("route") == "decode" else (None,)

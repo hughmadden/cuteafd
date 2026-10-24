@@ -82,7 +82,7 @@ def load_config() -> dict[str, str]:
     """Load the profile through the real release loader (bash only, no hardware)."""
     probe = (
         'repo_root=$PWD; release_load_config "$1"; '
-        'read -r profile_gib default_concurrency <<<"$(release_coordinator_profile 97887 "$COORDINATOR_GPU_BUDGET_GIB")"; '
+        'read -r profile_gib default_concurrency <<<"$(release_coordinator_profile 102641958912 "$COORDINATOR_GPU_BUDGET_GIB")"; '
         '((RELEASE_CONCURRENCY_EXPLICIT)) || CONCURRENCY=$default_concurrency; '
         'printf "%s\\n" "$KV_POOL_SIZE" "$CONCURRENCY" "$PREFIX_CACHE_ENTRIES" '
         '"$MAX_CONTEXT_TOKENS" "$MAX_OUTPUT_TOKENS" "$PREFILL_BATCH_TOKENS" '

@@ -79,7 +79,7 @@ pub struct MarkRule {
 impl MarkRule {
     /// Slots of the arena for marks of `mark_bytes` (every rank's part): what the runtime
     /// allocates (`MarkArena::slots_for`) and what its planner reserves
-    /// ([`cuteafd_core::prefix::mark_slots_for`]). The budget holds whole marks, so the count
+    /// ([`cuteafd_core::prefix::mark_slots_with_host`]). The budget holds whole marks, so the count
     /// depends on the exact mark bytes: size both sides from the same mark.
     pub fn slots(self, mark_bytes: usize) -> usize {
         cuteafd_core::prefix::mark_slots_with_host(self.lanes as u64, self.entries as u64, mark_bytes as u64,
@@ -123,10 +123,22 @@ impl PrefixArgs {
         Ok((prefix, usize::try_from(bytes)?))
     }
 
-    /// Resolve the host quota once, before pinned allocation. Call only when
-    /// this family's copy engine can restore every rank's snapshot exactly.
-    /// Host prefix bytes are not active device KV capacity.
+    /// Resolve and admit a host quota when no other future host consumers need
+    /// joint admission. Call only when this family's copy engine restores every
+    /// rank exactly; these bytes are not active device KV capacity.
     pub fn host_config(&self, layout: FamilyLayout, max_context: usize, concurrency: usize)
+        -> Result<Option<cuteafd_hostcache::config::Config>> {
+        let config = self.resolve_host_config(layout, max_context, concurrency)?;
+        if let Some(config) = &config {
+            budget::admit(config.bytes, self.scoring_host_bytes, self.host_cache_headroom_bytes)?;
+        }
+        Ok(config)
+    }
+
+    /// Resolve and validate the host quota without admission or allocation.
+    /// Pass the returned quota alongside every future table to one complete
+    /// `memory::budget::admit_host_memory` call, then retain this exact config.
+    pub fn resolve_host_config(&self, layout: FamilyLayout, max_context: usize, concurrency: usize)
         -> Result<Option<cuteafd_hostcache::config::Config>> {
         if self.prefix_cache_entries == 0 || !self.host_cache_bytes.enabled() {
             return Ok(None);
@@ -147,7 +159,6 @@ impl PrefixArgs {
         };
         anyhow::ensure!(bytes > 0,
             "host prefix quota resolves to zero; provide a positive quota or disable it explicitly for device retention");
-        budget::admit(bytes, self.scoring_host_bytes, self.host_cache_headroom_bytes)?;
         let config = cuteafd_hostcache::config::Config {
             bytes,
             eviction_headroom: budget::eviction_headroom(layout, self.host_cache_evict_tokens)?,
@@ -180,14 +191,9 @@ impl PrefixArgs {
     }
 }
 
-/// Ids of the `markers` (message-start tokens such as `<|user|>`) that `tokenizer.json`'s added
-/// tokens define, for intermediate snapshot points at message boundaries.
+/// Explicit added-token message boundaries from the checkpoint's native tokenizer.
 pub(crate) fn marker_ids(snapshot: &std::path::Path, markers: &[&str]) -> Result<Vec<u32>> {
-    let text = std::fs::read_to_string(snapshot.join("tokenizer.json"))?;
-    let tokenizer: serde_json::Value = serde_json::from_str(&text)?;
-    let added = tokenizer["added_tokens"].as_array().map_or(&[][..], Vec::as_slice);
-    Ok(markers.iter().filter_map(|marker| added.iter().find(|t| t["content"] == *marker)
-        .and_then(|t| t["id"].as_u64()).map(|id| id as u32)).collect())
+    Ok(cuteafd_loader::cached_tokenizer(snapshot)?.added_token_ids(markers))
 }
 
 /// Positions of any of `markers` in `tokens` (message boundaries, in order).
@@ -236,6 +242,27 @@ mod tests {
     }
 
     #[test]
+    fn runtime_mark_rule_matches_shared_planner_and_arena_with_or_without_host() {
+        for host in ["0", "auto", "32GiB"] {
+            for entries in [0, 1, 20] {
+                let cli = Cli::parse_from(["serve", "--host-cache-bytes", host,
+                    "--prefix-cache-entries", &entries.to_string()]);
+                for lanes in [1, 16, 64] {
+                    // Paged MLA (no positional mark), dense/recurrent state, and SWA marks.
+                    for bytes in [0, 37_500_000, 147_619_840, 256 << 20] {
+                        let rule = cli.prefix.mark_rule(lanes);
+                        let planned = cuteafd_core::prefix::mark_slots_with_host(lanes as u64, entries,
+                            bytes as u64, rule.budget_bytes, host != "0") as usize;
+                        let arena = cuteafd_engine::prefix::MarkArena::slots_for(lanes, entries as usize, bytes,
+                            rule.budget_bytes as usize, host != "0");
+                        assert_eq!((rule.slots(bytes), arena), (planned, planned));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn mimo_prefix_marks_help_links_experimental_qualification() {
         use clap::CommandFactory;
         let help = Cli::command().render_long_help().to_string();
@@ -279,6 +306,24 @@ mod tests {
         assert_eq!(parse_bytes("123"), Ok(123));
         assert!(parse_bytes("12 parsecs").is_err() && parse_bytes("-1").is_err());
         assert!(parse_bytes("NaN").is_err() && parse_bytes("inf").is_err());
+    }
+
+    #[test]
+    fn resolve_host_config_defers_admission_but_still_validates_geometry() {
+        let prefix = Cli::parse_from(["serve", "--host-cache-bytes", "1MiB"]).prefix;
+        let layout = FamilyLayout { page_rows: 64, pages: 1024, page_bytes: 65536, mark_bytes: 4096,
+            draft_bytes: 0, rule: cuteafd_core::prefix::ReuseRule::EXACT,
+            mark_store: Default::default(), page_owners: Default::default() };
+        let mut impossible = prefix.clone();
+        impossible.scoring_host_bytes = u64::MAX;
+        let config = impossible.resolve_host_config(layout, 32768, 1).unwrap().unwrap();
+        assert_eq!((config.bytes, config.max_tokens), (1 << 20, 32768));
+        assert!(impossible.host_config(layout, 32768, 1).is_err());
+        let admitted = prefix.host_config(layout, 32768, 1).unwrap().unwrap();
+        assert_eq!(config, admitted);
+        assert!(impossible.resolve_host_config(layout, 0, 1).is_err());
+        impossible.prefix_cache_entries = 0;
+        assert!(impossible.resolve_host_config(layout, 0, 1).unwrap().is_none());
     }
 
     #[test]

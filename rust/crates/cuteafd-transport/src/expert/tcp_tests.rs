@@ -300,9 +300,9 @@ fn generic_tcp_constructors_validate_world_and_topology() -> Result<()> {
         assert_eq!(client.world_size(), world);
         assert_eq!(client.ownership_topology(), Some(topology));
     }
-    for world in 1..=6 {
+    for world in 1..=cuteafd_core::MAX_SPARK_WORLD {
         let topology = SparkTopology::new(world as u8, 1)?;
-        if !matches!(world, 1 | 5) {
+        if matches!(world, 2 | 3 | 4 | 6) {
             let client = V41Tp4Tcp::new_world(crate::expert::SparkWorld::owned(topology)?, &peers[..world], 80, config())?;
             assert_eq!(client.world_size(), world);
         }
@@ -323,8 +323,8 @@ fn generic_tcp_constructors_validate_world_and_topology() -> Result<()> {
 }
 
 #[tokio::test]
-async fn pure_tp_one_through_six_tcp_collects_every_rank() -> Result<()> {
-    for world in 1..=6 {
+async fn pure_tp_one_through_eight_tcp_collects_every_rank() -> Result<()> {
+    for world in 1..=cuteafd_core::MAX_SPARK_WORLD {
         let executors = SparkTopology::new(world as u8, 1)?.executor_ids();
         let mut peers = Vec::new();
         let mut servers = Vec::new();

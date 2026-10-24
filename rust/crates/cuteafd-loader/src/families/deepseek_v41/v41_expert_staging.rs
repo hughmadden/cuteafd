@@ -73,8 +73,8 @@ impl V41BackboneTpGeometry {
         rank: usize,
     ) -> Result<Self> {
         ensure!(
-            matches!(world, 2 | 3 | 4 | 6),
-            "backbone TP world must be 2, 3, 4 or 6, got {world}"
+            (1..=8).contains(&world),
+            "backbone TP world must be 1 through 8, got {world}"
         );
         ensure!(
             rank < world,
@@ -410,7 +410,6 @@ impl OfficialV41Catalog {
         dst: &mut [u8],
         scratch: &mut [u8],
     ) -> Result<usize> {
-        use std::os::unix::fs::FileExt;
         let tensor = self.tensor(name)?;
         let V41TensorPlacement::BackboneExpertTp4 { axis, .. } = tensor.placement else {
             anyhow::bail!("generic TP read requires a routed backbone expert tensor {name}");
@@ -427,7 +426,7 @@ impl OfficialV41Catalog {
             dst.len() >= bytes,
             "tensor staging buffer for {name} needs {bytes} bytes"
         );
-        let file = std::fs::File::open(self.snapshot().join(&tensor.shard))?;
+        let file = self.shard_file(&tensor.shard)?;
         match axis {
             0 => {
                 let offset = metadata
@@ -559,7 +558,7 @@ impl V41ExpertStaging<'_> {
                 // Strided W2 column slices touch the complete source row span.
                 _ => tensor.metadata.byte_length,
             };
-            let file = std::fs::File::open(self.catalog.snapshot().join(&tensor.shard))?;
+            let file = self.catalog.shard_file(&tensor.shard)?;
             let status = unsafe {
                 libc::posix_fadvise(
                     file.as_raw_fd(),
@@ -593,9 +592,8 @@ impl V41ExpertStaging<'_> {
         );
         for (slot, (name, range)) in self.names.iter().zip(&self.ranges).enumerate() {
             if matches!(self.selection, V41ExpertSelection::BackboneFull { .. }) {
-                use std::os::unix::fs::FileExt;
                 let tensor = self.catalog.tensor(name)?;
-                std::fs::File::open(self.catalog.snapshot().join(&tensor.shard))?
+                self.catalog.shard_file(&tensor.shard)?
                     .read_exact_at(&mut staging[range.clone()], tensor.metadata.byte_offset)
                     .with_context(|| format!("staging full official backbone expert tensor {name}"))?;
             } else if let V41ExpertSelection::BackboneTp2 { rank, .. } = self.selection {

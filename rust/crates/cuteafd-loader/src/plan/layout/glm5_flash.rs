@@ -4,7 +4,7 @@ use crate::placement::{self, families::glm5_flash as glmf, Baseline, Onboard};
 use crate::families::glm5_flash::{GlmNextConfig, resident};
 
 pub(crate) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyModel,
-    input: &super::super::PlanInput, options: &LayoutOptions) -> MemoryLayout {
+    input: &super::super::PlanInput, options: &mut LayoutOptions) -> MemoryLayout {
     let shape = Shape::resolve(report, model, options, ShapePolicy::manifest_bounded());
     let (manifest, rows, sequences, context, weight_budget) = (shape.manifest.as_ref(), shape.prefill_rows,
         shape.concurrency, shape.context_tokens, options.weight_budget_bytes);
@@ -26,6 +26,7 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyMo
         // keeps the compact index cache, heads on two GPUs the token keys.
         let attention = glmf::resolve_attention(report.requested_attention, ranks,
             manifest.and_then(glmf::manifest_context))?;
+        let lanes = glmf::admitted_prefill_waves(attention.mode, lanes);
         report.attention_placement = attention.mode;
         let index = match attention.mode {
             placement::AttentionPlacement::Context => crate::serving_capacity::GlmfIndexCache::Compact,
@@ -118,7 +119,7 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyMo
             let slots = options.draft_context_slots.unwrap_or(sequences.max(8)) as usize;
             let batch = options.draft_sequences.max(sequences).min(slots as u64) as usize;
             let (bytes, scratch) = glmf::drafter_inventory(&config, slots, batch,
-                &draft_sms, crate::families::glm5::draft_representation::GlmDraftRepresentation::Fp8Only, 2)?;
+                &draft_sms, crate::families::glm5::draft_representation::GlmDraftRepresentation::Fp8Only, 2, options.draft_kv_cache)?;
             let bridge = if ranks == 2 && glmf::remote_dflash_requested() {
                 glmf::drafter_bridge_inventory(&config, slots, batch)? } else { None };
             (bytes, scratch, bridge)

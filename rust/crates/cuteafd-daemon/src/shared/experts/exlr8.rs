@@ -11,9 +11,15 @@ pub(crate) use execution::Exlr8Execution;
 const BANKS: usize = 2;
 
 pub(crate) struct Exlr8Weights<'a> {
-    arena: DeviceAllocation<'a>,
+    buffer: CuteafdDeviceBuffer,
+    _arena: ArenaOwner<'a>,
     pub(crate) layout: Residency,
     pub(crate) budget: ExpertLoadBudget,
+}
+
+enum ArenaOwner<'a> {
+    Mount { _allocation: DeviceAllocation<'a> },
+    Push { _rank: std::rc::Rc<crate::shared::memory::weight_arena::ReadyArena<'a>> },
 }
 
 pub(crate) fn view(buffer: CuteafdDeviceBuffer, offset: usize, bytes: usize) -> Result<CuteafdDeviceBuffer> {
@@ -30,6 +36,22 @@ pub(crate) fn view(buffer: CuteafdDeviceBuffer, offset: usize, bytes: usize) -> 
 }
 
 impl<'a> Exlr8Weights<'a> {
+    #[cfg(test)]
+    pub(crate) fn image(&self) -> CuteafdDeviceBuffer { self.buffer }
+
+    pub(crate) fn from_push(
+        rank: std::rc::Rc<crate::shared::memory::weight_arena::ReadyArena<'a>>,
+        region: usize, layout: Residency, mut budget: ExpertLoadBudget,
+    ) -> Result<Self> {
+        let buffer = rank.region(region)?.buffer();
+        ensure!(buffer.bytes == layout.resident_bytes && buffer.bytes == budget.resident_bytes,
+            "pushed EXLR8 region differs from admission");
+        budget.device_staging_bytes = 0;
+        budget.pinned_host_bytes = 0;
+        budget.read_scratch_bytes = layout.host_bytes();
+        Ok(Self { buffer, _arena: ArenaOwner::Push { _rank: rank }, layout, budget })
+    }
+
     pub(crate) fn plan(layout: &Residency) -> Result<ExpertLoadBudget> {
         let descriptor_bytes = layout
             .experts
@@ -61,14 +83,14 @@ impl<'a> Exlr8Weights<'a> {
 
     pub(crate) fn pointers(&self) -> Result<CuteafdDeviceBuffer> {
         view(
-            self.arena.buffer,
+            self.buffer,
             self.layout.pointers_offset,
             self.layout.experts * self.layout.units * 3 * 3 * 8,
         )
     }
     pub(crate) fn bits(&self) -> Result<CuteafdDeviceBuffer> {
         view(
-            self.arena.buffer,
+            self.buffer,
             self.layout.bits_offset,
             self.layout.experts * self.layout.units * 3 * 4,
         )
@@ -76,12 +98,12 @@ impl<'a> Exlr8Weights<'a> {
     pub(crate) fn compact(&self) -> Result<[CuteafdDeviceBuffer; 2]> {
         ensure!(self.layout.set == cuteafd_loader::plan::exlr8::residency::ExpertSet::Routed,
             "compact descriptors require routed weights");
-        Ok([view(self.arena.buffer, self.layout.compact_offsets[0], self.layout.experts * 4)?,
-            view(self.arena.buffer, self.layout.compact_offsets[1], self.layout.experts * self.layout.units * 4)?])
+        Ok([view(self.buffer, self.layout.compact_offsets[0], self.layout.experts * 4)?,
+            view(self.buffer, self.layout.compact_offsets[1], self.layout.experts * self.layout.units * 4)?])
     }
     pub(crate) fn signs(&self, output: bool) -> Result<CuteafdDeviceBuffer> {
         view(
-            self.arena.buffer,
+            self.buffer,
             self.layout.signs_offsets[usize::from(output)],
             self.layout.hidden,
         )
@@ -153,7 +175,7 @@ impl<'a> Exlr8Weights<'a> {
                     .zip(&layout.loads[first..first + count])
                     .map(|(host, unit)| {
                         let bytes = &mut host.bytes_mut()[..unit.staging_bytes()];
-                        scope.spawn(move || unit.read_verified(bytes))
+                        scope.spawn(move || unit.read(bytes))
                     })
                     .collect::<Vec<_>>();
                 for reader in readers {
@@ -200,9 +222,10 @@ impl<'a> Exlr8Weights<'a> {
         tracing::info!(layer = layout.layer, rank = layout.rank, world = layout.world,
             manifest = %layout.manifest, payload_bytes = layout.payload_bytes,
             resident_bytes = layout.resident_bytes, seconds = started.elapsed().as_secs_f64(),
-            "EXLR8 native units loaded and checksums verified");
+            "EXLR8 native units loaded");
         Ok(Self {
-            arena,
+            buffer: arena.buffer,
+            _arena: ArenaOwner::Mount { _allocation: arena },
             layout,
             budget,
         })
@@ -229,9 +252,9 @@ mod tests {
             256 * 16 * 3 * (3 * 8 + 4) * 2 + 256 * 17 * 8);
         // Each bank must drain its previous DMA before readers overwrite it;
         // the final drain precedes returning the arena and dropping both banks.
-        let source = include_str!("exlr8.rs").split("#[cfg(test)]").next().unwrap();
+        let source = include_str!("exlr8.rs").split("\n#[cfg(test)]\nmod tests {").next().unwrap();
         let reuse = source.find("library.cuda_stream_synchronize(streams[bank].raw)").unwrap();
-        let readers = source.find("unit.read_verified(bytes)").unwrap();
+        let readers = source.find("unit.read(bytes)").unwrap();
         let upload = source.find("library.copy_host_buffer_h2d_async(").unwrap();
         let final_drain = source.find("library.cuda_stream_synchronize(stream.raw)").unwrap();
         assert!(reuse < readers && readers < upload && upload < final_drain);

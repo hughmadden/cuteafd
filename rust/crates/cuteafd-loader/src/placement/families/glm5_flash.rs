@@ -23,6 +23,11 @@ pub const CONTEXT_PROGRAMS: [&str; 6] = ["glmf_scored_index_topk_decode_m64", "g
     "glmf_lse_combine2", "glmf_paged_staging_gather_kv", "glmf_paged_staging_gather_index",
     "glmf_index_expand_owned"];
 
+/// Whole-owned MLA layers use the shared mixed executor's bounded hop slots.
+pub fn admitted_prefill_waves(mode: AttentionPlacement, requested: u64) -> u64 {
+    if mode == AttentionPlacement::Layers { requested.min(LAYER_PIPELINE_MAX_LANES) } else { requested }
+}
+
 /// The `context` programs (beside the split partials), for the fail-closed
 /// reason when a build's manifest lacks them (issue #202).
 pub fn context_program_list() -> String {
@@ -186,7 +191,7 @@ pub fn replicated_mla_bytes(cfg: &GlmNextConfig, index: cache::GlmfIndexCache,
 /// Shared checkpoint-derived inventory; linear/attention scratch follows the chosen GPU.
 pub fn drafter_inventory(config: &serde_json::Value, slots: usize, sequences: usize,
     sms: &[u64], representation: crate::families::glm5::draft_representation::GlmDraftRepresentation,
-    mode: u8) -> Result<(u64, Vec<u64>), crate::families::glm5::draft_representation::GlmDraftStorageError> {
+    mode: u8, kv_cache: crate::families::qwen4::Qwen4KvCache) -> Result<(u64, Vec<u64>), crate::families::glm5::draft_representation::GlmDraftStorageError> {
     use crate::families::glm5::draft_representation::{draft_resident_bytes_with_mode, GlmDraftStorageError};
     if ![1, 2].contains(&sms.len()) {
         return Err(GlmDraftStorageError::Unsupported("GLM Flash draft candidate inventory needs one or two GPUs"));
@@ -194,7 +199,7 @@ pub fn drafter_inventory(config: &serde_json::Value, slots: usize, sequences: us
     let mut owned = None;
     let mut scratch = Vec::with_capacity(sms.len());
     for &sms in sms {
-        let (bytes, workspace) = draft_resident_bytes_with_mode(config, slots, sequences, sms, representation, mode)?;
+        let (bytes, workspace) = draft_resident_bytes_with_mode(config, slots, sequences, sms, representation, mode, kv_cache)?;
         if owned.is_some_and(|previous| previous != bytes) {
             return Err(GlmDraftStorageError::Unsupported("GLM Flash owned draft bytes depend on SM count"));
         }
@@ -211,31 +216,7 @@ pub fn drafter_inventory(config: &serde_json::Value, slots: usize, sequences: us
 /// in the movable; publisher streams/modules belong to the sampled baseline.
 pub fn remote_dflash_bridge_demands(hidden: u64, vocab: u64, taps: u64, rows: u64)
     -> Result<MovableDemands, PlacementError> {
-    if hidden == 0 || vocab == 0 || taps == 0 || rows == 0 || rows > i32::MAX as u64 {
-        return Err(PlacementError::Inventory("GLM Flash remote DFlash bridge geometry"));
-    }
-    let mul = |a: u64, b: u64| a.checked_mul(b)
-        .ok_or(PlacementError::Overflow("GLM Flash remote DFlash bridge"));
-    let hidden_rows = mul(mul(rows, hidden)?, 2)?.max(256);
-    let bytes = [
-        ("DFlash bridge taps", mul(mul(mul(2048, taps)?, hidden)?, 2)?.max(256)),
-        ("DFlash bridge input ids", mul(rows, 4)?.max(256)),
-        ("DFlash bridge gathered input", hidden_rows),
-        ("DFlash bridge normalized hidden", hidden_rows),
-        ("DFlash bridge logits", mul(mul(rows, vocab)?, 4)?.max(256)),
-        ("DFlash bridge head scratch", 4 << 20),
-    ];
-    let mut demands: Vec<_> = bytes.into_iter().map(|(group, bytes)|
-        Demand::new(0, Category::Drafter, group, bytes, Basis::Formula)).collect();
-    for gpu in 0..2 {
-        demands.push(Demand::new(gpu, Category::Transport, "DFlash bridge exchange",
-            draft::BRIDGE_EXCHANGE_BYTES, Basis::Formula));
-    }
-    for gpu in 0..2 {
-        demands.iter().filter(|d| d.gpu == gpu).try_fold(0u64, |sum, d|
-            sum.checked_add(d.bytes).ok_or(PlacementError::Overflow("GLM Flash remote DFlash bridge")))?;
-    }
-    Ok(MovableDemands { placement_gpu: 1, demands })
+    draft::remote_dflash_bridge_demands(hidden, vocab, taps, rows, 0)
 }
 
 /// Opt-in until the remote executor's hardware gates qualify its default.
@@ -402,7 +383,7 @@ pub fn request_for_working_set(i: &GlmfInputs<'_>, working: &GlmfWorkingSet) -> 
                         - cache::glmf_selector_bytes(cache::GLMF_DECODE_ROWS, i.cfg.vocab_size as u64), Basis::Formula));
             }
             fixed.push(GlmfBufferDemand::new(GlmfComponent::SparkExperts, gpu, Category::Transport, "Spark intake",
-                cache::glmf_spark_intake_bytes(working.prefill_lanes, working.spark_ranks as u64,
+                cache::spark_intake_bytes(working.prefill_lanes, working.spark_ranks as u64,
                     cache::glmf_expert_rows(i.prefill_rows, i.decode_rows), i.cfg.hidden as u64), Basis::Formula));
             fixed.push(GlmfBufferDemand::new(GlmfComponent::Always, gpu, Category::Workspace, "probe prefill logits", i.full_prefill_logits, Basis::Formula));
         }
@@ -462,20 +443,9 @@ pub fn expert_costs(catalog: &crate::OfficialV41Catalog, tp2: bool) -> anyhow::R
         tp2, spark_ok: true })).collect()
 }
 
-/// Match the runtime's activation override: only `a16` disables native A4.
-pub fn nvfp4_a4() -> bool {
-    std::env::var("CUTEAFD_NVFP4_ACTIVATIONS").as_deref() != Ok("a16")
-}
-
 /// Exact compiled package arenas; missing packages fail closed, never become zero scratch.
 pub fn expert_workspace(catalog: &crate::OfficialV41Catalog, manifest: Option<&std::path::Path>, rows: u64,
     tp: usize) -> anyhow::Result<u64> {
-    expert_workspace_selected(catalog, manifest, rows, tp, nvfp4_a4())
-}
-
-/// Explicit activation selection for deterministic admission and package tests.
-pub fn expert_workspace_selected(catalog: &crate::OfficialV41Catalog, manifest: Option<&std::path::Path>, rows: u64,
-    tp: usize, a4: bool) -> anyhow::Result<u64> {
     anyhow::ensure!([1, 2].contains(&tp), "GLM Flash RTX experts need TP1 or TP2");
     anyhow::ensure!((1..=4096).contains(&rows), "GLM Flash expert capacity must be 1..=4096 rows");
     let shape = catalog.routed_experts();
@@ -499,11 +469,11 @@ pub fn expert_workspace_selected(catalog: &crate::OfficialV41Catalog, manifest: 
         return Ok(cache::exl3_workspace_bytes(&manifests, true)? + rows.max(1) * shape.hidden as u64 * if tp == 2 { 4 } else { 2 });
     }
     let fp8 = catalog.fp8().ok_or_else(|| anyhow::anyhow!("GLM Flash fp8moe catalog missing"))?;
-    let a4_name = "fp8-glmf-nvfp4a4";
-    let name = if a4 && fp8.format() == crate::formats::fp8_experts::ExpertFormat::Nvfp4
-        && lib.join("fp8").join(a4_name).join(format!("tp{tp}")).is_dir() {
-        a4_name.to_string()
-    } else { format!("fp8-glmf{}", fp8.format().package_suffix()) };
+    let name = fp8.format().package_name("glmf");
+    if fp8.format() == crate::formats::fp8_experts::ExpertFormat::Nvfp4 {
+        anyhow::ensure!(lib.join("fp8").join(&name).join(format!("tp{tp}")).is_dir(),
+            "missing GLM Flash {name}/tp{tp} package");
+    }
     let value: serde_json::Value = serde_json::from_slice(&std::fs::read(lib.join("fp8").join(&name).join("manifest.json"))?)?;
     let scratch = inventory::fp8moe_scratch_bytes(&value, &format!("tp{tp}"), rows)
         .ok_or_else(|| anyhow::anyhow!("missing GLM Flash tp{tp} scratch for {rows} rows"))?;
@@ -531,11 +501,10 @@ impl GlmfWorkingSetExt for GlmfWorkingSet {
         }
         let spark_layers = routed[n..].to_vec();
         let spark_ranks = if spark_layers.is_empty() { 0 } else { i.spark_ranks };
-        let prefill_lanes = i.prefill_lanes;
-        if prefill_lanes == 0 || (i.attention.mode == AttentionPlacement::Layers
-            && super::super::validate_layer_pipeline_lanes(prefill_lanes, prefill_lanes as usize).is_err()) {
-            return Err(PlacementError::Inventory("GLM Flash layers executor needs one or two admitted prefill lanes"));
+        if !(1..=4).contains(&i.prefill_lanes) {
+            return Err(PlacementError::Inventory("GLM Flash executor needs one to four admitted prefill units"));
         }
+        let prefill_lanes = admitted_prefill_waves(i.attention.mode, i.prefill_lanes);
         Ok(Self { rtx_layers: routed[..n].to_vec(), spark_layers, spark_ranks, prefill_lanes })
     }
 
@@ -1183,21 +1152,24 @@ mod tests {
     #[test]
     fn draft_inventory_keeps_owned_bytes_independent_and_scratch_candidate_local() {
         use crate::families::glm5::draft_representation::{draft_resident_bytes_with_mode, GlmDraftRepresentation};
+        use crate::families::qwen4::Qwen4KvCache;
         for mode in 0..=2 {
             for representation in [GlmDraftRepresentation::Fp8Only, GlmDraftRepresentation::Bf16Only] {
-                let (owned, scratch) = drafter_inventory(&draft_config(), 8, 8, &[188, 170], representation, mode).unwrap();
-                for (rank, sms) in [188, 170].into_iter().enumerate() {
-                    assert_eq!((owned, scratch[rank]), draft_resident_bytes_with_mode(&draft_config(), 8, 8,
-                        sms, representation, mode).unwrap());
+                for format in [Qwen4KvCache::Bf16, Qwen4KvCache::Fp8] {
+                    let (owned, scratch) = drafter_inventory(&draft_config(), 8, 8, &[188, 170], representation, mode, format).unwrap();
+                    for (rank, sms) in [188, 170].into_iter().enumerate() {
+                        assert_eq!((owned, scratch[rank]), draft_resident_bytes_with_mode(&draft_config(), 8, 8,
+                            sms, representation, mode, format).unwrap());
+                    }
+                    let attention: Vec<_> = [188, 170].into_iter().map(|sms|
+                        cache::draft_attention_workspace_bytes(8, 8, 2, 2056, 128, sms).unwrap()).collect();
+                    if representation == GlmDraftRepresentation::Bf16Only { assert_eq!(scratch, attention); }
+                    else { assert!(scratch.iter().zip(attention).all(|(&total, arena)| total > arena)); }
+                    assert!(scratch[0] > scratch[1]);
                 }
-                let attention: Vec<_> = [188, 170].into_iter().map(|sms|
-                    cache::draft_attention_workspace_bytes(8, 8, 2, 2056, 128, sms).unwrap()).collect();
-                if representation == GlmDraftRepresentation::Bf16Only { assert_eq!(scratch, attention); }
-                else { assert!(scratch.iter().zip(attention).all(|(&total, arena)| total > arena)); }
-                assert!(scratch[0] > scratch[1]);
             }
         }
-        let (owned, scratch) = drafter_inventory(&draft_config(), 8, 8, &[188, 170], GlmDraftRepresentation::Fp8Only, 2).unwrap();
+        let (owned, scratch) = drafter_inventory(&draft_config(), 8, 8, &[188, 170], GlmDraftRepresentation::Fp8Only, 2, crate::families::qwen4::Qwen4KvCache::Bf16).unwrap();
         let old_attention = 8 * 8 * 17 * 64 * 130 * 4;
         let attention: Vec<_> = [188, 170].into_iter().map(|sms|
             cache::draft_attention_workspace_bytes(8, 8, 2, 2056, 128, sms).unwrap()).collect();
@@ -1257,7 +1229,7 @@ mod tests {
     fn draft_inventory_rejects_bad_devices_and_orphan_or_overflow_scratch() {
         use crate::families::glm5::draft_representation::GlmDraftRepresentation;
         for sms in [vec![], vec![188, 170, 188], vec![0], vec![4097], vec![188, 0]] {
-            assert!(drafter_inventory(&draft_config(), 8, 8, &sms, GlmDraftRepresentation::Fp8Only, 2).is_err());
+            assert!(drafter_inventory(&draft_config(), 8, 8, &sms, GlmDraftRepresentation::Fp8Only, 2, crate::families::qwen4::Qwen4KvCache::Bf16).is_err());
         }
         let cfg = GlmNextConfig::from_hf(&crate::plan::testing::glm5_flash_config(2)).unwrap();
         let mut input = inputs(&cfg, 2, inventory::PRO_TOTAL_BYTES);
@@ -1281,7 +1253,7 @@ mod tests {
                 "num_key_value_heads":8, "head_dim":64, "vocab_size":154880, "rms_norm_eps":1e-6,
                 "rope_parameters":{"rope_type":"default","rope_theta":10000.0}, "hidden_act":"silu",
                 "layer_types":["sliding_attention","sliding_attention","sliding_attention"], "sliding_window":2048}});
-        let (owned, scratch) = drafter_inventory(&config, 8, 8, &[188, 170], GlmDraftRepresentation::Fp8Only, 2).unwrap();
+        let (owned, scratch) = drafter_inventory(&config, 8, 8, &[188, 170], GlmDraftRepresentation::Fp8Only, 2, crate::families::qwen4::Qwen4KvCache::Bf16).unwrap();
         let cfg = GlmNextConfig::from_hf(&crate::plan::testing::glm5_flash_config(2)).unwrap();
         let mut input = inputs(&cfg, 2, inventory::PRO_TOTAL_BYTES);
         input.drafter_bytes = owned;
@@ -1298,7 +1270,7 @@ mod tests {
         let config = draft_config();
         let cfg = GlmNextConfig::from_hf(&crate::plan::testing::glm5_flash_config(2)).unwrap();
         let mut input = inputs(&cfg, 2, inventory::PRO_TOTAL_BYTES);
-        let (owned, scratch) = drafter_inventory(&config, 8, 8, &[188, 170], GlmDraftRepresentation::Fp8Only, 2).unwrap();
+        let (owned, scratch) = drafter_inventory(&config, 8, 8, &[188, 170], GlmDraftRepresentation::Fp8Only, 2, crate::families::qwen4::Qwen4KvCache::Bf16).unwrap();
         input.drafter_bytes = owned;
         input.drafter_scratch = scratch;
         input.drafter_bridge = drafter_bridge_inventory(&config, 8, 8).unwrap();
@@ -1339,7 +1311,7 @@ mod tests {
             // Make one target rank heavier without forcing the Movable's home.
             planned.resident[1 - expected_home as usize].weights += 6 << 30;
             let (owned, scratch) = drafter_inventory(&draft_config(), 8, 8, &[188, 170],
-                GlmDraftRepresentation::Fp8Only, 2).unwrap();
+                GlmDraftRepresentation::Fp8Only, 2, crate::families::qwen4::Qwen4KvCache::Bf16).unwrap();
             planned.drafter_bytes = owned;
             planned.drafter_scratch = scratch;
             planned.drafter_bridge = drafter_bridge_inventory(&draft_config(), 8, 8).unwrap();
@@ -1493,7 +1465,7 @@ mod tests {
     }
 
     #[test]
-    fn glm5_flash_nvfp4_a4_and_a16_select_matching_package_scratch() {
+    fn glm5_flash_nvfp4_requires_native_a4_package_scratch() {
         use crate::plan::testing::{glm5_flash_config, glm5_flash_tensors, nvfp4, write_snapshot};
         let dir = tempfile::tempdir().unwrap();
         let mut config = glm5_flash_config(2);
@@ -1521,11 +1493,18 @@ mod tests {
         };
         package("fp8-glmf-nvfp4", 12345);
         let a4 = package("fp8-glmf-nvfp4a4", 67890);
+        // work/p0 at 2b373eeb29 defaulted A4 on and chose this installed
+        // directory before its obsolete weight-only fallback.
+        let baseline = if a4.join("tp2").is_dir() { a4.clone() }
+            else { dir.path().join("lib/fp8/fp8-glmf-nvfp4") };
+        let selected = dir.path().join("lib/fp8")
+            .join(catalog.fp8().unwrap().format().package_name("glmf"));
+        assert_eq!(selected.join("tp2"), baseline.join("tp2"));
+        assert_eq!(selected, a4);
         let output = 4096 * 4096 * 2;
-        assert_eq!(expert_workspace_selected(&catalog, Some(&manifest), 4096, 2, true).unwrap(), 67890 + output);
-        assert_eq!(expert_workspace_selected(&catalog, Some(&manifest), 4096, 2, false).unwrap(), 12345 + output);
+        assert_eq!(expert_workspace(&catalog, Some(&manifest), 4096, 2).unwrap(), 67890 + output);
         std::fs::remove_dir(a4.join("tp2")).unwrap();
-        assert_eq!(expert_workspace_selected(&catalog, Some(&manifest), 4096, 2, true).unwrap(), 12345 + output);
+        assert!(expert_workspace(&catalog, Some(&manifest), 4096, 2).is_err());
     }
 
     #[test]
@@ -1570,7 +1549,7 @@ mod tests {
     }
 
     #[test]
-    fn layers_admission_rejects_four_lanes_without_changing_the_spark_only_path() {
+    fn unit_admission_caps_mixed_hops_without_reducing_heads_or_context() {
         let cfg = GlmNextConfig::from_hf(&crate::plan::testing::glm5_flash_config(45)).unwrap();
         let mut input = inputs(&cfg, 2, inventory::PRO_TOTAL_BYTES);
         input.prefill_lanes = 4;
@@ -1579,12 +1558,18 @@ mod tests {
             assert_eq!(GlmfWorkingSet::candidate(&input, 0).unwrap().prefill_lanes, 4);
         }
         input.attention.mode = AttentionPlacement::Layers;
-        assert!(GlmfWorkingSet::candidate(&input, 0).is_err());
-        for lanes in [1, 2] {
+        assert_eq!(GlmfWorkingSet::candidate(&input, 0).unwrap().prefill_lanes, 2);
+        for lanes in [1, 2, 3, 4] {
             input.prefill_lanes = lanes;
-            assert_eq!(GlmfWorkingSet::candidate(&input, 0).unwrap().prefill_lanes, lanes);
+            let working = GlmfWorkingSet::candidate(&input, 0).unwrap();
+            assert_eq!(working.prefill_lanes, lanes.min(2));
+            validate_layer_pipeline_lanes(working.prefill_lanes, working.prefill_lanes as usize).unwrap();
         }
         assert_eq!(GlmfWorkingSet::candidate(&input, input.experts.len()).unwrap().prefill_lanes, 2);
+        for lanes in [0, 5] {
+            input.prefill_lanes = lanes;
+            assert!(GlmfWorkingSet::candidate(&input, 0).is_err());
+        }
     }
 
     #[test]

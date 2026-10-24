@@ -91,7 +91,9 @@ pub(crate) fn system_placement(profile: &ModelProfile) -> SystemPlacement {
             tool_names: Vec::new(), tool_choice: super::qwen4::prompt::QwenToolChoice::Auto, response_format: None }).is_err(),
         ModelEncoding::Glm(encoding) => encoding.render(&body, &super::glm5::GlmPromptOptions { thinking: false,
             reasoning_effort: None, tool_names: Vec::new(), tool_choice: super::glm5::GlmToolChoice::Auto, response_format: None }).is_err(),
-        ModelEncoding::DeepseekV4 | ModelEncoding::DeepseekV41 => false,
+        ModelEncoding::Step5(encoding) => encoding.render(&body, &super::step5::Step5PromptOptions {
+            tool_names: Vec::new(), tool_choice: super::step5::Step5ToolChoice::Auto, response_format: None }).is_err(),
+        ModelEncoding::DeepseekV4 | ModelEncoding::DeepseekV41 | ModelEncoding::Kimi(_) => false,
     };
     if rejects { SystemPlacement::FirstOnly } else { SystemPlacement::Anywhere }
 }
@@ -387,7 +389,9 @@ fn chat_body_with(turn: &TurnRequest, profile: &ModelProfile, names: &ToolNames,
             return Err(GatewayError::invalid(format!("tool_choice: no tool named '{name}' was specified")).with_param("tool_choice")),
         _ => {}
     }
-    let mut body = json!({"model": profile.id, "messages": messages, "stream": true,
+    // A resolved variant id selects that variant's weights on the chat path.
+    let model = if profile.variant_index(&turn.model).is_some() { &turn.model } else { &profile.id };
+    let mut body = json!({"model": model, "messages": messages, "stream": true,
         "stream_options": {"include_usage": true}});
     if !turn.tools.is_empty() && turn.tool_choice != ToolChoice::None {
         body["tools"] = Value::Array(turn.tools.iter().map(|tool| {
@@ -489,8 +493,14 @@ impl Backend for Engine {
 
     fn models(&self) -> Vec<ModelInfo> {
         let owner = self.profile().id.split_once('/').map_or("cuteafd", |(owner, _)| owner);
-        vec![ModelInfo { id: self.profile().id.clone(), context_tokens: Some(self.limits().context()),
-            max_output_tokens: Some(self.limits().output()), owned_by: owner.to_owned() }]
+        let base = ModelInfo { id: self.profile().id.clone(), context_tokens: Some(self.limits().context()),
+            max_output_tokens: Some(self.limits().output()), owned_by: owner.to_owned() };
+        let variants = self.profile().variants.iter().map(|v| ModelInfo { id: v.public_id.clone(), ..base.clone() }).collect::<Vec<_>>();
+        std::iter::once(base).chain(variants).collect()
+    }
+
+    fn variant_field(&self, id: &str) -> Option<Value> {
+        self.profile().variants.iter().find(|v| v.public_id == id).map(cuteafd_core::variants::VariantRecord::model_field)
     }
 
     fn model_metadata(&self) -> Option<Value> {

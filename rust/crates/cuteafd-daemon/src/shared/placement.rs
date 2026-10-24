@@ -21,6 +21,8 @@ fn admission_timeout(value: Option<&str>) -> Result<Duration> {
 pub(crate) struct SparkAdmission {
     selection: WorkerSelection,
     assignments: Vec<SparkAssignment>,
+    push_snapshot: Option<std::path::PathBuf>,
+    push_manifest: Option<String>,
 }
 
 impl SparkAdmission {
@@ -92,7 +94,15 @@ impl SparkAdmission {
                     .with_context(|| format!("Spark admission rank {rank} checkpoint assignment"))
             }).collect::<Result<Vec<_>>>()?
         };
-        Ok(Self { selection, assignments })
+        let push_snapshot = if catalog.is_some_and(|c|
+            c.format() != cuteafd_loader::plan::checkpoint::CheckpointFormat::Exlr8 || manifest.is_some())
+            && !working.spark_layers.is_empty() && assignments.iter().all(|a| a.resident_bytes > 0)
+            && topology.is_none_or(|t| t.tp() as usize == world)
+            && cuteafd_loader::push_load::namespace(snapshot).is_ok() {
+            Some(snapshot.to_path_buf())
+        } else { None };
+        let selection = if push_snapshot.is_some() { selection.with_push_weights() } else { selection };
+        Ok(Self { selection, assignments, push_snapshot, push_manifest: manifest.map(str::to_owned) })
     }
 
     fn reconcile(&self, reports: &[ModelAdmissionResponse]) -> Result<()> {
@@ -104,11 +114,61 @@ impl SparkAdmission {
     }
 
     pub(crate) fn start(self, peers: &[SocketAddr]) -> Result<PendingSparkAdmission> {
+        self.start_with(peers, None)
+    }
+
+    /// Whether this admission opens a push group (Spark experts on SparkNest).
+    pub(crate) fn pushes(&self) -> bool { self.push_snapshot.is_some() }
+
+    /// Whether coordinator GPUs may join this admission's push group as ranks:
+    /// every supported Spark format accepts coordinator entries after its own.
+    pub(crate) fn coordinator_pushes(&self) -> bool { self.pushes() }
+
+    /// `coordinator`: in-process coordinator-GPU ranks joining the Spark push
+    /// group (loopback streams in rank order, and their plan entries).
+    pub(crate) fn start_with(self, peers: &[SocketAddr],
+        coordinator: Option<(Vec<std::net::TcpStream>, super::memory::push_exl3::CoordinatorRanks)>)
+        -> Result<PendingSparkAdmission> {
+        ensure!(coordinator.is_none() || self.pushes(),
+            "coordinator push ranks without a Spark push group");
         let value = std::env::var(ADMISSION_TIMEOUT_ENV).ok();
         let timeout = admission_timeout(value.as_deref())?;
         let pending = cuteafd_transport::worker_selection::start_model_admission(
             peers, &self.selection, timeout)
             .with_context(|| format!("Spark worker admission start failed (timeout {} s)", timeout.as_secs()))?;
+        let pending = if let Some(snapshot) = self.push_snapshot.clone() {
+            let assignments = self.assignments.clone();
+            let layers = self.selection.layers();
+            let manifest = self.push_manifest.clone();
+            let cancel = pending.cancellation_streams()?;
+            let (streams, ranks) = match coordinator {
+                Some((streams, ranks)) => (streams, Some(ranks)),
+                None => (Vec::new(), None),
+            };
+            AdmissionWait::Push(PushAdmissionDriver { cancel, thread: Some(std::thread::spawn(move || {
+                let mut pending = pending;
+                pending.push_weights(streams, |offers| {
+                    let started = std::time::Instant::now();
+                    let catalog = cuteafd_loader::read_expert_catalog(&snapshot)?;
+                    tracing::info!(elapsed_ms = started.elapsed().as_millis(),
+                        "Spark push admission catalog opened");
+                    if let Some(manifest) = manifest.as_deref() {
+                        super::memory::push_exlr8::prepare(&snapshot, &catalog, manifest, &layers, &assignments, offers, ranks.as_ref())
+                    } else if catalog.exl3().is_some() {
+                        super::memory::push_exl3::prepare(&snapshot, &catalog, &layers, &assignments, offers, ranks.as_ref())
+                    } else if catalog.fp8().is_some() {
+                        super::memory::push_fp8::prepare(&snapshot, &catalog, &assignments, offers, ranks.as_ref())
+                    } else {
+                        super::memory::push_native::prepare(&snapshot, &catalog, &assignments, offers, ranks.as_ref())
+                    }
+                })?;
+                pending.wait()
+            })) })
+        } else {
+            // Callers add coordinator ranks only when this admission pushes.
+            ensure!(coordinator.is_none(), "coordinator push ranks without a Spark push group");
+            AdmissionWait::Mount(pending)
+        };
         Ok(PendingSparkAdmission { plan: self, pending, timeout })
     }
 
@@ -117,15 +177,40 @@ impl SparkAdmission {
     }
 }
 
+struct PushAdmissionDriver {
+    cancel: Vec<std::net::TcpStream>,
+    thread: Option<std::thread::JoinHandle<Result<Vec<ModelAdmissionResponse>>>>,
+}
+impl PushAdmissionDriver {
+    fn wait(mut self) -> Result<Vec<ModelAdmissionResponse>> {
+        self.thread.take().expect("owned admission driver").join()
+            .map_err(|_| anyhow::anyhow!("Spark push admission driver panicked"))?
+    }
+}
+impl Drop for PushAdmissionDriver {
+    fn drop(&mut self) {
+        for stream in &self.cancel { let _ = stream.shutdown(std::net::Shutdown::Both); }
+        if let Some(thread) = self.thread.take() { let _ = thread.join(); }
+    }
+}
+
+enum AdmissionWait {
+    Mount(cuteafd_transport::worker_selection::PendingModelAdmission),
+    Push(PushAdmissionDriver),
+}
+
 pub(crate) struct PendingSparkAdmission {
     plan: SparkAdmission,
-    pending: cuteafd_transport::worker_selection::PendingModelAdmission,
+    pending: AdmissionWait,
     timeout: Duration,
 }
 
 impl PendingSparkAdmission {
     pub(crate) fn wait(self) -> Result<()> {
-        let reports = self.pending.wait()
+        let reports = match self.pending {
+            AdmissionWait::Mount(pending) => pending.wait(),
+            AdmissionWait::Push(driver) => driver.wait(),
+        }
             .with_context(|| format!("Spark worker admission failed (timeout {} s)", self.timeout.as_secs()))?;
         self.plan.reconcile(&reports)?;
         for report in reports {
@@ -137,10 +222,140 @@ impl PendingSparkAdmission {
     }
 }
 
+/// Placement and reservations are final; only worker validation is pending.
+/// Keep loaded owners local until validation succeeds, before any serving pool or link.
+pub(crate) fn load_while_admitting<T>(pending: Option<PendingSparkAdmission>,
+    load: impl FnOnce() -> Result<T>) -> Result<T> {
+    let started = std::time::Instant::now();
+    tracing::info!(spark_pending = pending.is_some(), "loading admitted coordinator target weights");
+    let loaded = load()?;
+    tracing::info!(elapsed_ms = started.elapsed().as_millis() as u64,
+        "coordinator target weights loaded; awaiting Spark admission");
+    if let Some(pending) = pending { pending.wait()?; }
+    Ok(loaded)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use cuteafd_core::{RuntimeSample, SparkEndpoint, SparkIngress, SparkRuntimeInventory};
+
+    struct LoadedOwners(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+
+    impl Drop for LoadedOwners {
+        fn drop(&mut self) { self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst); }
+    }
+
+    fn pending_fixture() -> Result<(PendingSparkAdmission, Vec<std::net::TcpListener>)> {
+        let plan = idle_plan()?;
+        let listeners = (0..2).map(|_| std::net::TcpListener::bind("127.0.0.1:0"))
+            .collect::<std::io::Result<Vec<_>>>()?;
+        let peers = listeners.iter().map(|listener| listener.local_addr())
+            .collect::<std::io::Result<Vec<_>>>()?;
+        let timeout = Duration::from_secs(5);
+        let pending = cuteafd_transport::worker_selection::start_model_admission(
+            &peers, &plan.selection, timeout)?;
+        Ok((PendingSparkAdmission { plan, pending: AdmissionWait::Mount(pending), timeout }, listeners))
+    }
+
+    #[test]
+    fn coordinator_load_overlaps_slow_admission_and_returns_only_after_reconciliation() -> Result<()> {
+        let (pending, listeners) = pending_fixture()?;
+        let drops = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (loaded_tx, loaded_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let mut releases = Vec::new();
+        let mut workers = Vec::new();
+        for (rank, listener) in listeners.into_iter().enumerate() {
+            let (release, hold) = std::sync::mpsc::channel();
+            releases.push(release);
+            workers.push(std::thread::spawn(move || -> Result<()> {
+                let (mut stream, _) = listener.accept()?;
+                let selection = cuteafd_transport::worker_selection::receive_worker_selection(
+                    &stream, rank, Duration::from_secs(5))?;
+                hold.recv_timeout(Duration::from_secs(5))?;
+                cuteafd_transport::worker_selection::acknowledge_model_admission(
+                    &mut stream, rank, &selection, Some(&idle_report(rank as u32)))
+            }));
+        }
+        let owned_drops = drops.clone();
+        let coordinator = std::thread::spawn(move || {
+            let result = load_while_admitting(Some(pending), || {
+                loaded_tx.send(())?;
+                Ok(LoadedOwners(owned_drops))
+            });
+            done_tx.send(result).unwrap();
+        });
+        loaded_rx.recv_timeout(Duration::from_secs(5))?;
+        assert!(matches!(done_rx.try_recv(), Err(std::sync::mpsc::TryRecvError::Empty)));
+        assert_eq!(drops.load(std::sync::atomic::Ordering::SeqCst), 0);
+        for release in releases { release.send(())?; }
+        let owners = done_rx.recv_timeout(Duration::from_secs(5))??;
+        for worker in workers { worker.join().unwrap()?; }
+        coordinator.join().unwrap();
+        assert_eq!(drops.load(std::sync::atomic::Ordering::SeqCst), 0);
+        drop(owners);
+        assert_eq!(drops.load(std::sync::atomic::Ordering::SeqCst), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn admission_failure_after_load_drops_coordinator_owners_without_publishing() -> Result<()> {
+        for reject in [false, true] {
+            let (pending, listeners) = pending_fixture()?;
+            let drops = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let mut releases = Vec::new();
+            let workers = listeners.into_iter().enumerate().map(|(rank, listener)| {
+                let (release, hold) = std::sync::mpsc::channel();
+                releases.push(release);
+                std::thread::spawn(move || -> Result<()> {
+                    let (mut stream, _) = listener.accept()?;
+                    let selection = cuteafd_transport::worker_selection::receive_worker_selection(
+                        &stream, rank, Duration::from_secs(5))?;
+                    hold.recv_timeout(Duration::from_secs(5))?;
+                    if reject {
+                        cuteafd_transport::worker_selection::reject_worker_selection(
+                            &mut stream, &anyhow::anyhow!("fixture Spark load failed"))
+                    } else {
+                        let mut report = idle_report(rank as u32);
+                        report.resident_bytes = 1;
+                        cuteafd_transport::worker_selection::acknowledge_model_admission(
+                            &mut stream, rank, &selection, Some(&report))
+                    }
+                })
+            }).collect::<Vec<_>>();
+            let result = load_while_admitting(Some(pending), || {
+                let owners = LoadedOwners(drops.clone());
+                for release in releases { release.send(())?; }
+                Ok(owners)
+            });
+            assert!(result.is_err());
+            assert_eq!(drops.load(std::sync::atomic::Ordering::SeqCst), 1);
+            for worker in workers { worker.join().unwrap()?; }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn coordinator_load_failure_closes_pending_worker_connections() -> Result<()> {
+        let (pending, listeners) = pending_fixture()?;
+        assert!(load_while_admitting::<()>(Some(pending), || anyhow::bail!("load failed")).is_err());
+        for (rank, listener) in listeners.into_iter().enumerate() {
+            let (mut stream, _) = listener.accept()?;
+            cuteafd_transport::worker_selection::receive_worker_selection(
+                &stream, rank, Duration::from_secs(5))?;
+            let mut byte = [0];
+            assert_eq!(std::io::Read::read(&mut stream, &mut byte)?, 0);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn coordinator_only_load_needs_no_worker_admission() -> Result<()> {
+        assert_eq!(load_while_admitting(None, || Ok(42))?, 42);
+        assert!(load_while_admitting::<()>(None, || anyhow::bail!("load failed")).is_err());
+        Ok(())
+    }
 
     #[test]
     fn admission_timeout_uses_launch_bound_and_rejects_invalid_values() -> Result<()> {
@@ -169,7 +384,7 @@ mod tests {
         let timeout = Duration::from_secs(1);
         let pending = cuteafd_transport::worker_selection::start_model_admission(
             &peers, &plan.selection, timeout)?;
-        let result = PendingSparkAdmission { plan, pending, timeout }.wait();
+        let result = PendingSparkAdmission { plan, pending: AdmissionWait::Mount(pending), timeout }.wait();
         let _ = release.send(());
         worker.join().unwrap();
         let error = format!("{:#}", result.unwrap_err());
@@ -185,7 +400,7 @@ mod tests {
         SparkAdmission::plan(root.path(), ExpertGeometry::GLM5_FLASH, None,
             &SparkWorkingSet::default(), 2, None,
             ModelAdmission { capacity: 2048, compiled_capacity: 4096,
-                endpoints: vec![SparkEndpoint { capacity: 2048, ingress: SparkIngress::Fp8K32 }],
+                endpoints: vec![SparkEndpoint { ring_depth: None, capacity: 2048, ingress: SparkIngress::Fp8K32 }],
                 rings: SparkRings { max_frame_bytes: 64 << 20, depth: 8, slot_bytes: 8 << 20, alignment: 4096 } })
     }
 
@@ -200,8 +415,8 @@ mod tests {
 
     fn fixture_model() -> ModelAdmission {
         ModelAdmission { capacity: 80, compiled_capacity: 80,
-            endpoints: vec![SparkEndpoint { capacity: 80, ingress: SparkIngress::Fp8K32 },
-                SparkEndpoint { capacity: 16, ingress: SparkIngress::Fp8K32 }],
+            endpoints: vec![SparkEndpoint { ring_depth: None, capacity: 80, ingress: SparkIngress::Fp8K32 },
+                SparkEndpoint { ring_depth: None, capacity: 16, ingress: SparkIngress::Fp8K32 }],
             rings: SparkRings { max_frame_bytes: 64 << 20, depth: 2, slot_bytes: 1 << 20, alignment: 4096 } }
     }
 
@@ -241,7 +456,7 @@ mod tests {
         catalog.select_draft(cuteafd_loader::plan::spec::DraftOwnership::None)?;
         let shape = catalog.routed_experts();
         let selected = [shape.first_layer];
-        for ranks in 1..=6 {
+        for ranks in 1..=8 {
             crate::shared::spark_topology::require_world(
                 cuteafd_transport::expert::SparkWorld::canonical(ranks)?, &catalog, &selected)?;
         }
@@ -296,12 +511,87 @@ mod tests {
             fixture_model())?;
         assert_eq!(plan.selection.layers(), [1]);
         assert_eq!(plan.assignments.iter().map(|rank| rank.slices[0].stored_width).collect::<Vec<_>>(),
-            [384, 384, 384, 384, 256, 256]);
+            [256, 384, 384, 384, 384, 256]);
         for assignment in &plan.assignments {
             assert!(assignment.resident_bytes > 0 && assignment.io.mapped_rings > 0);
             assert_eq!(assignment.io.mapped_rings, fixture_model().ring_bytes(geometry)? as u64);
         }
         check_reports(&plan)
+    }
+
+    /// Marks `root` a SparkNest namespace with every file a hosted shard, so a
+    /// populated Spark admission opens a push group.
+    fn mark_namespace(root: &Path) -> Result<()> {
+        let mark = |path: &Path, name: &std::ffi::CStr, value: &[u8]| -> Result<()> {
+            let path = std::ffi::CString::new(path.as_os_str().as_encoded_bytes())?;
+            // SAFETY: both strings are NUL-terminated and live across the call; the
+            // value pointer and length describe one live buffer.
+            let status = unsafe { libc::setxattr(path.as_ptr(), name.as_ptr(), value.as_ptr().cast(), value.len(), 0) };
+            ensure!(status == 0, "setxattr: {}", std::io::Error::last_os_error());
+            Ok(())
+        };
+        mark(root, c"user.sparknest.cluster", br#"{"me":"coordinator"}"#)?;
+        for entry in std::fs::read_dir(root)? {
+            let path = entry?.path();
+            if path.extension().is_some_and(|e| e == "safetensors") { mark(&path, c"user.sparknest.hosts", b"coordinator")?; }
+        }
+        Ok(())
+    }
+
+    /// Every Spark push format accepts coordinator ranks after its Spark prefix.
+    #[test]
+    fn coordinator_ranks_join_every_spark_push_format() -> Result<()> {
+        use cuteafd_loader::plan::testing::{fp8, mimo_flash_config, qwen4_config, qwen4_exl3, write_snapshot,
+            write_v41_snapshot};
+        let check = |root: &Path, working: SparkWorkingSet, world: usize, geometry: Option<ExpertGeometry>,
+            manifest: Option<&str>| -> Result<()> {
+            let mut catalog = cuteafd_loader::read_expert_catalog(root)?;
+            if manifest.is_some() { catalog.select_draft(cuteafd_loader::plan::spec::DraftOwnership::None)?; }
+            let geometry = match geometry { Some(g) => g, None => catalog.routed_experts().geometry()? };
+            let mut model = fixture_model();
+            if manifest.is_some() { model.endpoints.iter_mut().for_each(|e| e.ingress = SparkIngress::Fp8K32); }
+            let plan = SparkAdmission::plan_manifest(root, geometry, Some(&catalog), &working, world, None, model,
+                manifest)?;
+            assert!(plan.pushes(), "{root:?}: the Spark ranks push");
+            assert!(plan.coordinator_pushes(), "{root:?}: coordinator ranks join the push group");
+            Ok(())
+        };
+        // EXL3: coordinator ranks join.
+        let root = tempfile::tempdir()?;
+        let (tensors, _) = qwen4_exl3(3, 4);
+        write_snapshot(root.path(), &qwen4_config(3), &tensors, None);
+        mark_namespace(root.path())?;
+        check(root.path(), SparkWorkingSet { spark_layers: vec![0, 2], spark_ranks: 3, prefill_lanes: 1,
+            ..Default::default() }, 3, None, None)?;
+        // FP8.
+        let root = tempfile::tempdir()?;
+        let mut tensors = Vec::new();
+        for expert in 0..256 {
+            for (name, rows, cols) in [("gate", 2048, 4096), ("up", 2048, 4096), ("down", 4096, 2048)] {
+                tensors.extend(fp8(&format!("model.layers.1.mlp.experts.{expert}.{name}_proj"), rows, cols, None));
+            }
+        }
+        write_snapshot(root.path(), &mimo_flash_config(), &tensors, None);
+        mark_namespace(root.path())?;
+        check(root.path(), SparkWorkingSet { spark_layers: vec![1], spark_ranks: 6, prefill_lanes: 1,
+            ..Default::default() }, 6, None, None)?;
+        // Native (V4.1 MXFP4).
+        let root = tempfile::tempdir()?;
+        write_v41_snapshot(root.path());
+        mark_namespace(root.path())?;
+        check(root.path(), SparkWorkingSet { spark_layers: vec![17, 39], spark_ranks: 4, prefill_lanes: 2,
+            ..Default::default() }, 4, Some(ExpertGeometry::DEEPSEEK_V41), None)?;
+        // EXLR8 (installed snapshot, read-only: its own namespace marks).
+        if let Some(snapshot) = std::env::var_os("CUTEAFD_EXLR8_TEST_SNAPSHOT") {
+            let snapshot = Path::new(&snapshot);
+            let catalog = cuteafd_loader::read_expert_catalog(snapshot)?;
+            let first = catalog.routed_experts().first_layer;
+            if cuteafd_loader::push_load::namespace(snapshot).is_ok() {
+                check(snapshot, SparkWorkingSet { spark_layers: vec![first], spark_ranks: 4, prefill_lanes: 1,
+                    ..Default::default() }, 4, None, Some("up1"))?;
+            }
+        }
+        Ok(())
     }
 
     #[test]
@@ -318,12 +608,66 @@ mod tests {
         assert_eq!(plan.selection.layers(), [0, 2]);
         for (rank, assignment) in plan.assignments.iter().enumerate() {
             assert_eq!(assignment.slices.iter().map(|slice| slice.layer).collect::<Vec<_>>(), [0, 2]);
-            let expected = catalog.exl3().unwrap().residency(cuteafd_loader::V41Exl3Layer::Backbone(0), 3, rank)?;
-            assert_eq!(assignment.resident_bytes, 2 * expected.device_arena_layout()?.1 as u64);
+            let expected = catalog.exl3().unwrap().balanced_residency(cuteafd_loader::V41Exl3Layer::Backbone(0), 3, rank)?;
+            let other = catalog.exl3().unwrap().balanced_residency(cuteafd_loader::V41Exl3Layer::Backbone(2), 3, rank)?;
+            assert_eq!(assignment.resident_bytes,
+                (expected.device_arena_layout()?.1 + other.device_arena_layout()?.1) as u64);
             assert_eq!(assignment.slices[0].tiers, expected.tiers.iter().map(|&tier| tier as u32).collect::<Vec<_>>());
             assert!(!assignment.slices[0].projection_counts.is_empty());
         }
         check_reports(&plan)
+    }
+
+    #[test]
+    fn kimi_tp6_push_plans_match_admitted_exl3_residency() -> Result<()> {
+        use crate::shared::{experts::{exl3::Exl3Weights, layer::ExpertLayer}, memory::push_exl3};
+        use cuteafd_transport::worker_selection::push::Offer;
+        let root = tempfile::tempdir()?;
+        cuteafd_loader::plan::testing::write_kimi_snapshot(root.path(), true);
+        let catalog = cuteafd_loader::read_expert_catalog(root.path())?;
+        let working = SparkWorkingSet { spark_layers: vec![1], spark_ranks: 6, prefill_lanes: 1,
+            ..Default::default() };
+        let admission = SparkAdmission::plan(root.path(), catalog.routed_experts().geometry()?,
+            Some(&catalog), &working, 6, None, fixture_model())?;
+        assert_eq!(admission.selection.layers(), [1]);
+        for (rank, assignment) in admission.assignments.iter().enumerate() {
+            assert_eq!(assignment.slices[0].width, 512);
+            let budget = Exl3Weights::plan(&catalog, ExpertLayer::BackboneExl3Tp { layer: 1, rank, world: 6 })?;
+            assert_eq!(assignment.resident_bytes, budget.resident_bytes as u64);
+            let plan = push_exl3::RankPlan::new(&catalog, &[1], 6, rank, budget.resident_bytes)?;
+            let offer = Offer { rank, host: format!("rank-{rank}"),
+                arena_bytes: plan.layout.logical_bytes() as u64, placement: plan.placement.clone() };
+            push_exl3::validate_offer(&offer, rank, assignment, &plan.placement, offer.arena_bytes)?;
+            let checked = plan.checked(&catalog, root.path(), 6, rank)?;
+            assert!(!checked.plan.entries.is_empty());
+            assert_eq!(checked.arenas[rank], offer.arena_bytes);
+            // Mount staging is not a push limit; service::push tests exercise
+            // independent ring admission against the actual allocatable pool.
+            let ring = cuteafd_ffi::push_ring::DEFAULT_SLOTS * cuteafd_ffi::push_ring::DEFAULT_SLOT_BYTES;
+            assert_eq!(ring, 134_217_728);
+            assert_eq!(budget.pinned_host_bytes, 44_826_624);
+            assert_eq!(budget.read_scratch_bytes, 268_435_456);
+            assert!(ring > budget.pinned_host_bytes, "Kimi push must admit its ring independently");
+            assert!(plan.validation.bytes() <= budget.read_scratch_bytes);
+        }
+        check_reports(&admission)?;
+        use cuteafd_loader::plan::testing::{exl3, glm5_config, write_snapshot};
+        let glm = tempfile::tempdir()?;
+        let tensors = (0..256).flat_map(|expert| [
+            ("gate_proj", 2048, 6144), ("up_proj", 2048, 6144), ("down_proj", 6144, 2048),
+        ].into_iter().flat_map(move |(projection, n, k)|
+            exl3(&format!("model.layers.1.mlp.experts.{expert}.{projection}"), n, k, 4))).collect::<Vec<_>>();
+        let mut config = glm5_config();
+        config["quantization_config"] = serde_json::json!({"quant_method": "exl3", "bits": 4.0,
+            "checkpoint_format": "exl3", "format": "exl3"});
+        write_snapshot(glm.path(), &config, &tensors, None);
+        let catalog = cuteafd_loader::read_expert_catalog(glm.path())?;
+        let budget = Exl3Weights::plan(&catalog, ExpertLayer::BackboneExl3Tp { layer: 1, rank: 0, world: 6 })?;
+        assert_eq!(budget.pinned_host_bytes, 114_499_584);
+        assert_eq!(budget.read_scratch_bytes, 268_435_456);
+        assert!(cuteafd_ffi::push_ring::DEFAULT_SLOTS * cuteafd_ffi::push_ring::DEFAULT_SLOT_BYTES
+            > budget.pinned_host_bytes, "GLM K4 push must admit its ring independently");
+        Ok(())
     }
 
     #[test]
@@ -377,9 +721,11 @@ mod tests {
         let plan = SparkAdmission::plan(root.path(), ExpertGeometry::DEEPSEEK_V41, Some(&catalog),
             &working, 4, None, fixture_model())?;
         for (rank, assignment) in plan.assignments.iter().enumerate() {
-            let expected = catalog.exl3().unwrap().residency(
-                cuteafd_loader::V41Exl3Layer::Backbone(17), 4, rank)?;
-            assert_eq!(assignment.resident_bytes, 2 * expected.device_arena_layout()?.1 as u64);
+            let expected = [17, 39].into_iter().map(|layer| -> Result<u64> {
+                catalog.exl3().unwrap().balanced_residency(
+                    cuteafd_loader::V41Exl3Layer::Backbone(layer), 4, rank).and_then(|plan| Ok(plan.device_arena_layout()?.1 as u64))
+            }).collect::<Result<Vec<_>>>()?;
+            assert_eq!(assignment.resident_bytes, expected.iter().sum::<u64>());
         }
         check_reports(&plan)
     }

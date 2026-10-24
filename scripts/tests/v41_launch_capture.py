@@ -38,9 +38,9 @@ CHECKPOINTS = {"deepseek-ai/DeepSeek-V4.1-Flash": {"model_type": "deepseek_v41"}
 GPU_UUIDS = ("GPU-00000000-0000-0000-0000-000000000000", "GPU-11111111-1111-1111-1111-111111111111")
 GPU_PCI = ("00000000:01:00.0", "00000000:02:00.0")
 HOSTS = ("ostrich", "dodo", "emu", "kiwi", "rhea", "moa")
-# The gate kit's two V4.1 cards (scripts/bench/kits/gate/matrix-gate.json), as
+# The gate kit's V4.1 cards (scripts/bench/kits/gate/matrix-gate.json), as
 # wip-cards.py generates their configs for a WIP arm.
-KIT_CARDS = ("v41-flash-max", "v41-flash-min")
+KIT_CARDS = ("v41-flash-max", "v41-flash-min", "v41-flash-ref-tp4")
 EXAMPLES = ("deepseek-v41-mxfp4-max", "deepseek-v41-mxfp4-min")
 CASES = EXAMPLES + KIT_CARDS
 WIP_SLOT = "gate"
@@ -118,7 +118,9 @@ if tool == "docker":
             ranks = args[args.index("--spark-ranks") + 1]
         rows = args[args.index("--prefill-rows") + 1] if "--prefill-rows" in args else "0"
         family = os.environ.get("CAPTURE_FAMILY", "deepseek_v41")
-        response = {"spark_ranks": int(ranks), "prefill_rows": int(rows) or 2048,
+        default_rows = 4096 if family == "qwen4" else 2048
+        response = {"spark_ranks": int(ranks), "prefill_unit_rows": int(rows) or default_rows,
+                    "prefill_waves": 1, "prefill_span_rows": int(rows) or default_rows,
                     "encoder": {"kind": {"kind": "spark", "rank": 0}, "replicas": []},
                     "encoder_plan_hash": "ab" * 32, "placement_supported": True, "fits": True}
         if "--deployment" in args:
@@ -126,6 +128,15 @@ if tool == "docker":
                 return args[args.index(flag) + 1] if flag in args else default
             tp = int(value("--spark-tp", ranks))
             ep = int(value("--spark-ep", "1"))
+            if family in {"step5", "kimi_k3"}:
+                unit = int(value("--prefill-rows", "0")) or 2048
+                waves = int(value("--prefill-waves", "0")) or 2
+                response.update(prefill_unit_rows=unit, prefill_waves=waves, prefill_span_rows=unit * waves)
+            elif family in {"glm5", "deepseek_v4"}:
+                unit = int(value("--prefill-rows", "0")) or 4096
+                waves = 1 if family == "glm5" and int(ranks) == 0 else int(value("--prefill-waves", "0")) or 2
+                span = int(value("--prefill-span-rows", "0")) or 16384
+                response.update(prefill_unit_rows=unit, prefill_waves=waves, prefill_span_rows=span)
             report = dict(response)
             exl3 = os.environ.get("CAPTURE_EXL3") == "1"
             explicit_topology = "--spark-tp" in args or family == "deepseek_v41" and (int(ranks) == 3 if exl3 else int(ranks) not in (0, 4))
@@ -321,10 +332,7 @@ def capture(launcher_root: Path, case: str, *, release_entry: dict | None = None
             revision = release_values["MODEL_REVISION"]
             checkpoint = release_checkpoint(release_entry["family"], model)
             checkpoints[model], revisions[model] = checkpoint, revision
-            if release_entry["family"] == "glm5_flash" and release_values.get("GLM5_FLASH_FP8_MODEL_ID") != "off":
-                checkpoints.setdefault("zai-org/GLM-5.3-Flash", {"model_type": "glm5_next"})
-                revisions.setdefault("zai-org/GLM-5.3-Flash", "companion-revision")
-            for key in ("SPECULATOR_MODEL_ID", "GLM5_FLASH_FP8_MODEL_ID", "CHAT_TEMPLATE_FROM"):
+            for key in ("SPECULATOR_MODEL_ID", "CHAT_TEMPLATE_FROM"):
                 companion = release_values.get(key)
                 if companion and companion != "off":
                     checkpoints.setdefault(companion, {"architectures": ["DFlash2DraftModel"]})
@@ -360,6 +368,8 @@ def capture(launcher_root: Path, case: str, *, release_entry: dict | None = None
         (repo / "scripts/build").mkdir(parents=True, exist_ok=True)
         (repo / "scripts/build/verify-sparkinfer-source.py").write_text(
             f"import sys\nprint({lock['revision']!r}) if '--print-revision' in sys.argv else None\n")
+        from launcher_sandbox import stub_cuda_capacity
+        stub_cuda_capacity(repo / "scripts/lib/release-common.sh", 97887 * 2**20)
         if launcher_source:
             shutil.copy(launcher_source, repo / "scripts/launch/run-family.sh")
             (repo / "scripts/launch/run-family.sh").chmod(0o755)
@@ -405,6 +415,15 @@ def capture(launcher_root: Path, case: str, *, release_entry: dict | None = None
         # Spark workers start in parallel: order by host, coordinator first.
         runs.sort(key=lambda run: (run["host"] != coordinator_host, run["host"]))
         return {"case": case, "containers": runs, "plans": plans}
+
+
+def namespace_launch_contract(run: dict) -> dict:
+    """Apply the explicit full-namespace migration to an old parsed capture."""
+    run["env"]["HF_HOME"] = "/mnt/sparknest/hf-home"
+    run["mounts"] = sorted("/mnt/sparknest:/mnt/sparknest:ro" if mount.endswith(":/hf/hub:ro")
+                           else mount for mount in run["mounts"])
+    run["command"] = [value.replace("/hf/hub/", "<root>/hf/hub/") for value in run["command"]]
+    return run
 
 
 def parse_run(argv: list[str]) -> dict:

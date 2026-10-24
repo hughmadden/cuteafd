@@ -44,7 +44,7 @@ impl EgressBuffer {
 
     /// No payload view is alive (requests holding one have been dropped).
     pub(crate) fn writable(&self) -> bool {
-        Arc::strong_count(&self.views) == 1
+        views_writable(&self.views)
     }
 
     /// The first `len` bytes as a request payload.
@@ -52,6 +52,39 @@ impl EgressBuffer {
         anyhow::ensure!(len <= self.host.bytes, "egress payload of {len} bytes exceeds the {}-byte buffer",
             self.host.bytes);
         Ok(Bytes::from_owner(EgressView { buffer: Arc::clone(self), _view: Arc::clone(&self.views), len }))
+    }
+}
+
+fn views_writable(views: &Arc<()>) -> bool {
+    Arc::strong_count(views) == 1
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct Payload {
+        bytes: Vec<u8>,
+        _view: Arc<()>,
+    }
+    impl AsRef<[u8]> for Payload {
+        fn as_ref(&self) -> &[u8] { &self.bytes }
+    }
+
+    #[test]
+    fn outstanding_request_clones_block_egress_reuse_until_last_reply() {
+        let views = Arc::new(());
+        assert!(views_writable(&views));
+        let request = Bytes::from_owner(Payload { bytes: vec![1; 16], _view: views.clone() });
+        let pending: Vec<_> = (0..4).map(|_| request.clone()).collect();
+        drop(request);
+        // Dropping the dispatch-local request does not release pending replies.
+        assert!(!views_writable(&views));
+        let mut pending = pending.into_iter();
+        for _ in 0..3 { drop(pending.next()); }
+        assert!(!views_writable(&views));
+        drop(pending);
+        assert!(views_writable(&views));
     }
 }
 

@@ -6,15 +6,15 @@ on raptor's RTX GPUs, optionally against real expert workers on Sparks.
       --model HF_ID_OR_SNAPSHOT_DIR --arm A=WIP_INSTANCE:SLOT [--arm B=...] \\
       [--arm-env A:KEY=VALUE] [--arm-arg A:TOKEN] [--env KEY=VALUE] [--gpus 0,1] [--repeats N] \\
       [--timeout SECONDS] [--preflight CMD] [--compare-logits A:B] \\
-      [--native-test TEST_EXECUTABLE | --command] [--fixtures DIR [--fixtures-writable]] \\
+      [--native-test TEST_EXECUTABLE | --command] [--fixtures DIR [--fixtures-writable]] [--rdma] \\
       [--spark-hosts H1,H2,... [--expert-layers 3,5-7] [--worker-env KEY=VALUE] [--arm-worker-env A:KEY=VALUE] [--worker-arg ARG]] \\
       -- ARGS...
 
 Each arm runs its slot's `cuteafd`, `libcuteafd_native.so`, `PROGRAMS.json` and expert
 packages, mounted read-only as /opt/cuteafd/{bin,lib,share} in the slot's own dev image
 (META base_image_id), with CDI `--device nvidia.com/gpu=N`, `--ipc host`, memlock
-unlimited, the host uid (release_serving_docker_args), the hub read-only at /hf/hub
-(HF_HOME=/hf) and /mnt/sparknest read-only. What runs:
+unlimited, the host uid (release_serving_docker_args), the full namespace read-only at /mnt/sparknest
+(HF_HOME=/mnt/sparknest/hf-home). What runs:
 
 - default: the family's golden subcommand (`glm-golden ARGS`, ...). The slot supplies
   --native-lib and --manifest; ARGS may not override them.
@@ -23,12 +23,14 @@ unlimited, the host uid (release_serving_docker_args), the hub read-only at /hf/
   read-only and run as `EXE ARGS` (e.g. `NAME --exact --ignored --nocapture`); green only
   when its `test result:` lines show at least one test passed and none failed.
 - --command: ARGS verbatim (e.g. `python3 -m pytest -q python/tests/...`).
+--rdma gives the container host networking and /dev/infiniband without Sparks (a
+same-host verbs loopback test); --spark-hosts implies it.
 Both raw modes run in the slot's sealed source tree, mounted read-only at
 /workspace/cuteafd (the working directory, PYTHONPATH with the reference packages,
 PYTHONDONTWRITEBYTECODE=1), with CUTEAFD_NATIVE_LIB and CUTEAFD_PROGRAM_MANIFEST set.
 
 Placeholders in ARGS and in --env/--arm-env values: {snapshot} (the checkpoint's
-container path), {hub} (/hf/hub), {out} (the run's writable output directory, e.g.
+container path), {hub} (the resolved host hub path), {out} (the run's writable output directory, e.g.
 `--save-logits {out}/logits`), {fixtures}, {peers} and {expert_layers}. Other existing
 absolute host paths in ARGS are mounted read-only at the same path. --fixtures DIR is
 mounted at its own path (read-only; --fixtures-writable for a fixture-generation run,
@@ -48,7 +50,7 @@ CUTEAFD_GOLDEN_EXPERT_LAYERS (expanded --expert-layers) and CUTEAFD_GOLDEN_SPARK
 (the workers' package manifest.json files, identical on every host, read-only under
 /opt/cuteafd/spark). A golden subcommand must take them as `--peers {peers}`. Workers are
 removed (logs kept) after every run, on failure, timeout and SIGTERM/SIGINT too, before
-the locks are released. oliver (reserved) and kakapo (build seed) are refused.
+the locks are released. oliver (reserved) and the LAN-only build seeds are refused.
 
 Hardware: the locks (sparks for dodo/emu, gpu0, gpu1, rhea, moa, in that order) are
 taken once through the fair queue (scripts/hw/hwlock.py) and every arm and repeat runs
@@ -65,9 +67,12 @@ workers/HOST.log} and whatever the run wrote to {out}; argv.json holds the exact
 and worker commands, image IDs, seal SHAs, env and the GPUs' power context (gpu-powerd
 state, sampled power limit and draw). summary.md lists exit codes and the key log lines
 (admission, logits digests, agreement/top-1, resume verdicts, test results, errors),
-the workers' readiness and errors, plus each --compare-logits A:B result: sha256
-byte-equality, then max |diff|, KL and top-1 over rows (vocab from the checkpoint's
-config.json, or --vocab).
+the workers' readiness and errors, plus each --compare-logits A:B result: byte
+equality, then max |diff|, KL and top-1 over rows (vocab from the checkpoint's
+config.json, or --vocab). Both layouts a golden writes are compared: a flat
+`*logits*.bin` dump and the per-row safetensors directory (row-NNNNNNNN.safetensors
+plus manifest.jsonl) that Kimi and the shared probe write; for the row layout the
+table names the row carrying the largest KL.
 """
 from __future__ import annotations
 
@@ -92,6 +97,7 @@ SUBCOMMANDS = {'dsv4': 'dsv4-golden', 'v41': 'v41-golden', 'glm': 'glm-golden', 
 # Families without a golden subcommand yet: native tests and commands only.
 RAW_FAMILIES = ('kimi',)
 NAME = re.compile(r'[A-Za-z0-9][A-Za-z0-9_.-]*\Z')
+ROW_FILE = re.compile(r'row-[0-9]+\.safetensors\Z')
 ENV_KEY = re.compile(r'[A-Za-z_][A-Za-z0-9_]*\Z')
 ANSI = re.compile(r'\x1b\[[0-9;]*m')
 # Key result lines across the families' goldens.
@@ -113,11 +119,16 @@ POWER_SAMPLE_S = 5.0
 SOURCE = '/workspace/cuteafd'
 TEST_DIR = '/opt/cuteafd/test'
 SPARK_PACKAGES = '/opt/cuteafd/spark'
-HUB = '/hf/hub'
+def namespace_root():
+    return str(Path(os.environ.get('CUTEAFD_NAMESPACE_ROOT', '/mnt/sparknest')).expanduser().resolve())
+
+
+HUB = '/mnt/sparknest/hf-home/hub'
 # Real experts. Hosts refused outright, with the reason (lift a refusal here once cleared).
 REFUSED_HOSTS = {
     'oliver': 'reserved for the Kimi F32 golden',
     'kakapo': 'build seed for the fidelity goldens, not a serving rank',
+    'cassowary': 'LAN-only build seed, not a serving rank',
     'raptor': 'the coordinator, not a Spark rank',
 }
 # Which hardware lock covers a Spark (scripts/hw/hwlock.py order; as `cuteafd bench smoke`).
@@ -256,7 +267,7 @@ def substitute(args, snapshot, out=OUT, **values):
 
 
 def placeholder_values(state):
-    return dict(fixtures=state.get('fixtures'), peers=state['sparks']['peers_csv'] if state.get('sparks') else None,
+    return dict(hub=str(state['hub']), fixtures=state.get('fixtures'), peers=state['sparks']['peers_csv'] if state.get('sparks') else None,
                 expert_layers=','.join(map(str, state['sparks']['layers'])) if state.get('sparks')
                 and state['sparks']['layers'] else None)
 
@@ -401,7 +412,7 @@ def check_spark(host, arm, state, coordinator, at_grant=True):
     in the fair queue may legitimately hold it."""
     root = coordinator.get('wip_root') or '-'
     snap = state['snapshot_container']
-    snap_rel = snap[len(HUB) + 1:] if snap.startswith(HUB + '/') else '-'
+    snap_rel = '-'
     names = json.dumps([worker_name(state['task'], arm, r) for r in range(len(state['sparks']['hosts']))])
     argv = ['python3', '-c', REMOTE_CHECK, root, coordinator['slot'], coordinator['instance'], '-',
             str(state['sparks']['port']) if at_grant else '-', names, snap_rel, snap if snap_rel == '-' else '-']
@@ -442,11 +453,13 @@ def worker_command(state, arm, rank, record):
         mounts.append((art / kind, f'{SLOT_LIB}/{kind}'))
     mounts += [(art, SLOT_SHARE), (root / 'workspace/docker/release-entrypoint.sh', ENTRYPOINT),
                (root / 'workspace/third_party/sparkinfer', '/source/third_party/sparkinfer'),
-               (record['hub'], HUB)]
-    if not record['snapshot'].startswith(record['hub'] + '/'):
-        mounts.append(('/mnt/sparknest', '/mnt/sparknest'))
-    snapshot = HUB + record['snapshot'][len(record['hub']):] if record['snapshot'].startswith(record['hub'] + '/') \
-        else record['snapshot']
+               (namespace_root(), namespace_root())]
+    snapshot = record['snapshot']
+    hub = Path(record['hub'])
+    if not hub.is_relative_to(namespace_root()):
+        mounts.append((hub, hub))
+    if not Path(snapshot).is_relative_to(namespace_root()) and not Path(snapshot).is_relative_to(hub):
+        mounts.append((snapshot, snapshot))
     cmd = ['docker', 'run', '-d', '--name', worker_name(state['task'], arm, rank), '--restart', 'no',
            '--label', f"{WORKER_LABEL}={state['task']}/{arm}", '--device', 'nvidia.com/gpu=all', '--network', 'host',
            '--ipc', 'host', '--ulimit', 'memlock=-1:-1', '--device=/dev/infiniband', *record['serving_args']]
@@ -458,7 +471,8 @@ def worker_command(state, arm, rank, record):
            'PYTHONPATH': '/source/third_party/sparkinfer', 'CUTEAFD_NATIVE_LIB': f'{SLOT_LIB}/libcuteafd_native.so',
            # As the coordinator gets it: workers resolve installed programs and packages from it.
            'CUTEAFD_PROGRAM_MANIFEST': f'{SLOT_SHARE}/PROGRAMS.json',
-           'RUST_LOG': 'info', **{k: os.environ[k] for k in RDMA_ENV if os.environ.get(k)}, **sparks['env'],
+           'RUST_LOG': 'info', 'HF_HOME': namespace_root() + '/hf-home',
+           **{k: os.environ[k] for k in ('CUTEAFD_PUSH_SOCKET',) if os.environ.get(k)}, **{k: os.environ[k] for k in RDMA_ENV if os.environ.get(k)}, **sparks['env'],
            **sparks.get('arm_env', {}).get(arm, {})}
     for key, value in env.items():
         cmd += ['-e', f'{key}={value}']
@@ -551,7 +565,8 @@ def stop_workers(state, arm, out_dir):
 # --------------------------------------------------------------------------- checkpoint
 
 def hub_root():
-    return Path(os.environ.get('CUTEAFD_HF_HUB', Path.home() / '.cache/huggingface/hub')).resolve()
+    default = Path(namespace_root()) / 'hf-home/hub' if os.environ.get('CUTEAFD_NAMESPACE_ROOT') else Path.home() / '.cache/huggingface/hub'
+    return Path(os.environ.get('CUTEAFD_HF_HUB', default)).resolve()
 
 
 def resolve_model(model, hub=None):
@@ -572,9 +587,7 @@ def resolve_model(model, hub=None):
     path = path.resolve()
     if not (path / 'config.json').is_file():
         raise ValueError(f'{path} has no config.json')
-    if path.is_relative_to(hub):
-        return path, '/hf/hub/' + str(path.relative_to(hub)), []
-    if path.is_relative_to('/mnt/sparknest'):
+    if path.is_relative_to(namespace_root()):
         return path, str(path), []
     return path, str(path), [str(path)]
 
@@ -747,9 +760,7 @@ def docker_command(state, name, arm, slot, out_dir, golden, packages=None):
     mounts += [(str(art), SLOT_SHARE),
                (str(root / 'workspace/docker/release-entrypoint.sh'), ENTRYPOINT),
                (str(root / 'workspace/third_party/sparkinfer'), '/source/third_party/sparkinfer'),
-               (str(state['hub']), '/hf/hub')]
-    if Path('/mnt/sparknest').is_dir():
-        mounts.append(('/mnt/sparknest', '/mnt/sparknest'))
+               (namespace_root(), namespace_root())]
     mounts += [(p, p) for p in state['extra_mounts']]
     if mode != 'golden':
         mounts.append((str(root / 'workspace'), SOURCE))
@@ -763,7 +774,9 @@ def docker_command(state, name, arm, slot, out_dir, golden, packages=None):
            '--label', f"cuteafd.golden-run={state['task']}/{name}",
            *state['serving_args'], *cards.cdi_gpu_args(gpus), '--ipc', 'host',
            '--ulimit', 'memlock=-1:-1']
-    if state.get('sparks'):
+    if state.get('memory'):  # cap the coordinator container's host memory, swap equally
+        cmd += ['--memory', str(state['memory']), '--memory-swap', str(state['memory'])]
+    if state.get('sparks') or state.get('rdma'):
         cmd += ['--network', 'host', '--device=/dev/infiniband']
     for source, target in mounts:
         cmd += ['-v', f'{source}:{target}:ro']
@@ -776,7 +789,10 @@ def docker_command(state, name, arm, slot, out_dir, golden, packages=None):
     # environment as well as from --manifest.
     env = {'PATH': f'{SLOT_BIN}:/usr/local/cuda/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin',
            'PYTHONPATH': '/source/third_party/sparkinfer', 'CUTEAFD_NATIVE_LIB': f'{SLOT_LIB}/libcuteafd_native.so',
-           'CUTEAFD_PROGRAM_MANIFEST': f'{SLOT_SHARE}/PROGRAMS.json', 'RUST_LOG': 'info'}
+           'CUTEAFD_PROGRAM_MANIFEST': f'{SLOT_SHARE}/PROGRAMS.json', 'RUST_LOG': 'info',
+           'HF_HOME': namespace_root() + '/hf-home'}
+    if os.environ.get('CUTEAFD_PUSH_SOCKET'):
+        env['CUTEAFD_PUSH_SOCKET'] = os.environ['CUTEAFD_PUSH_SOCKET']
     if mode != 'golden':
         env.update(PYTHONPATH=f'/source/third_party/sparkinfer:{SOURCE}/python/reference',
                    PYTHONDONTWRITEBYTECODE='1')
@@ -1008,6 +1024,16 @@ def logits_files(directory):
     return sorted(str(p.relative_to(directory)) for p in Path(directory).rglob('*logits*.bin') if p.is_file())
 
 
+def row_dump_dirs(directory):
+    """Relative directories holding a per-row safetensors dump (row-NNNNNNNN.safetensors).
+
+    Kimi and the shared probe write their logits this way: one F32 tensor per
+    row plus manifest.jsonl, instead of a single flat `.bin` file.
+    """
+    return sorted({str(p.parent.relative_to(directory)) for p in Path(directory).rglob('row-*.safetensors')
+                   if p.is_file() and ROW_FILE.fullmatch(p.name)})
+
+
 def compare_pairs(state, pairs, repeats):
     """Compare saved logits of arm pairs, per repeat, file by file."""
     results = []
@@ -1018,33 +1044,49 @@ def compare_pairs(state, pairs, repeats):
     for a, b in pairs:
         for repeat in range(1, repeats + 1):
             da, db = Path(state['root']) / a / f'r{repeat}', Path(state['root']) / b / f'r{repeat}'
+            dumped = False
             files = [f for f in logits_files(da) if (db / f).is_file()]
-            if not files:
-                results.append(dict(a=a, b=b, repeat=repeat, file=None, error='no saved logits common to both arms'))
-                continue
             for name in files:
+                dumped = True
                 out = Path(state['root']) / f'compare-{a}-{b}-r{repeat}-{name.replace("/", "_")}.json'
                 extra = []
                 tokens = (da / name).parent / 'tokens.bin'
                 if Path(name).name == 'logits.bin' and tokens.is_file():
                     extra = ['--tokens', str(tokens)]
                 args = [str(da / name), str(db / name), str(state['vocab']), *extra, '--json', str(out)]
-                if python:
-                    cmd = [*python, str(tool), *args]
-                else:  # the dev image has numpy; read-only views of the outputs
-                    image = state['slots'][a]['image_id']
-                    cmd = ['docker', 'run', '--rm', '--network', 'none', '--user', f'{os.getuid()}:{os.getgid()}',
-                           '-v', f'{tool}:{tool}:ro', '-v', f"{state['root']}:{state['root']}", '--entrypoint',
-                           'python3', image, str(tool), *args]
-                proc = subprocess.run(cmd, capture_output=True, text=True, timeout=3600)
-                if proc.returncode or not out.is_file():
+                results.append(compare_one(state, python, tool, args, out, dict(a=a, b=b, repeat=repeat, file=name)))
+            # Per-row dumps: each directory of row-NNNNNNNN.safetensors compares as
+            # one set, and the tool reports the row holding the largest KL.
+            dirs_b = set(row_dump_dirs(db)) if db.is_dir() else set()
+            for name in row_dump_dirs(da) if da.is_dir() else []:
+                dumped = True
+                if name not in dirs_b:
                     results.append(dict(a=a, b=b, repeat=repeat, file=name,
-                                        error=(proc.stderr.strip().splitlines() or ['compare failed'])[-1]))
+                                        error='row dump present in one arm only'))
                     continue
-                measured = json.loads(out.read_text())
-                results.append(dict(measured, a=a, b=b, repeat=repeat, file=name,
-                                    path_a=measured['a'], path_b=measured['b']))
+                out = Path(state['root']) / f'compare-{a}-{b}-r{repeat}-{name.replace("/", "_")}-rows.json'
+                args = [str(da / name), str(db / name), '--json', str(out)]
+                results.append(compare_one(state, python, tool, args, out, dict(a=a, b=b, repeat=repeat, file=name)))
+            if not dumped:
+                results.append(dict(a=a, b=b, repeat=repeat, file=None,
+                                    error='no saved logits common to both arms'))
     return results
+
+
+def compare_one(state, python, tool, args, out, record):
+    """Run compare-logits.py once and fold its JSON into a summary row."""
+    if python:
+        cmd = [*python, str(tool), *args]
+    else:  # the dev image has numpy; read-only views of the outputs
+        image = state['slots'][record['a']]['image_id']
+        cmd = ['docker', 'run', '--rm', '--network', 'none', '--user', f'{os.getuid()}:{os.getgid()}',
+               '-v', f'{tool}:{tool}:ro', '-v', f"{state['root']}:{state['root']}", '--entrypoint',
+               'python3', image, str(tool), *args]
+    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=3600)
+    if proc.returncode or not out.is_file():
+        return dict(record, error=(proc.stderr.strip().splitlines() or ['compare failed'])[-1])
+    measured = json.loads(out.read_text())
+    return dict(measured, **record, path_a=measured['a'], path_b=measured['b'])
 
 
 def write_summary(state, records, comparisons):
@@ -1075,17 +1117,18 @@ def write_summary(state, records, comparisons):
             lines += ['', f"workers (ready after {r.get('workers_ready_s', '-')} s):", '', '```',
                       *(worker_lines(run_dir / 'workers') or ['(no worker logs)']), '```']
     if comparisons:
-        lines += ['', '## Logits comparisons', '', '| a | b | repeat | file | byte-identical | rows | max abs diff | mean KL | max KL | top-1 |',
-                  '|---|---|---|---|---|---|---|---|---|---|']
+        lines += ['', '## Logits comparisons', '', '| a | b | repeat | file | byte-identical | rows | max abs diff | mean KL | max KL | top-1 | worst row |',
+                  '|---|---|---|---|---|---|---|---|---|---|---|']
         for c in comparisons:
             if c.get('error'):
-                lines.append(f"| {c['a']} | {c['b']} | {c['repeat']} | {c['file'] or '-'} | error: {c['error']} | | | | | |")
+                lines.append(f"| {c['a']} | {c['b']} | {c['repeat']} | {c['file'] or '-'} | error: {c['error']} | | | | | | |")
                 continue
+            worst = '-' if c['byte_identical'] or not c.get('worst_row') else c['worst_row']
             if not c['rows']:
-                lines.append(f"| {c['a']} | {c['b']} | {c['repeat']} | {c['file']} | {c['byte_identical']} | 0 | | | | |")
+                lines.append(f"| {c['a']} | {c['b']} | {c['repeat']} | {c['file']} | {c['byte_identical']} | 0 | | | | | {worst} |")
                 continue
             lines.append(f"| {c['a']} | {c['b']} | {c['repeat']} | {c['file']} | {c['byte_identical']} | {c['rows']} | "
-                         f"{c['max_abs_diff']:.4e} | {c['mean_kl']:.6f} | {c['max_kl']:.6f} | {100 * c['top1_agreement']:.2f}% |")
+                         f"{c['max_abs_diff']:.4e} | {c['mean_kl']:.6f} | {c['max_kl']:.6f} | {100 * c['top1_agreement']:.2f}% | {worst} |")
     text = '\n'.join(lines) + '\n'
     (Path(state['root']) / 'summary.md').write_text(text)
     return text
@@ -1161,12 +1204,15 @@ def build_state(args, arms):
             raise ValueError(f'--native-test {args.native_test} is not an executable file (an absolute path)')
         native_test, native_digest = str(test.resolve()), sha256_file(test)
     fixtures = resolve_fixtures(args, task_root)
-    covered = [hub, Path('/mnt/sparknest'), snapshot] + ([Path(fixtures)] if fixtures else [])
-    state = dict(task=args.task, family=args.family, root=str(task_root / 'golden'), gpus=parse_gpus(args.gpus),
+    if not hub.is_relative_to(namespace_root()):
+        extra = [str(hub)] + [path for path in extra if not Path(path).is_relative_to(hub)]
+    covered = [hub, Path(namespace_root()), snapshot] + ([Path(fixtures)] if fixtures else [])
+    state = dict(task=args.task, family=args.family, root=str(task_root / 'golden'), gpus=parse_gpus(args.gpus), memory=args.memory_bytes,
                  snapshot=str(snapshot), snapshot_container=container_path, hub=str(hub), timeout=args.timeout,
                  golden=golden, extra_mounts=extra + path_mounts(golden, covered + [Path(p) for p in extra]),
                  mode=mode, native_test=native_test, native_test_sha256=native_digest, fixtures=fixtures,
-                 fixtures_writable=bool(args.fixtures_writable), sparks=sparks)
+                 fixtures_writable=bool(args.fixtures_writable), sparks=sparks,
+                 rdma=bool(args.rdma))
     state['locks'] = locks_for(state['gpus'], sparks['hosts'] if sparks else ())
     state['vocab'] = args.vocab or (vocab_size(snapshot) if args.compare_logits else None)
     for arm in arms.values():
@@ -1206,6 +1252,8 @@ def main(argv=None):
     parser.add_argument('--fixtures', metavar='DIR', help='fixture directory, mounted at its own path; {fixtures}')
     parser.add_argument('--fixtures-writable', action='store_true',
                         help='mount --fixtures writable (a GPU-only fixture-generation run under the task)')
+    parser.add_argument('--rdma', action='store_true',
+                        help='host networking and /dev/infiniband without Sparks (same-host verbs loopback)')
     parser.add_argument('--spark-hosts', metavar='H1,H2,...', help='start real expert workers, rank = position')
     parser.add_argument('--expert-layers', metavar='LIST', help='expert layers the run exercises (e.g. 3 or 3,5-7); '
                         'CUTEAFD_GOLDEN_EXPERT_LAYERS and {expert_layers}')
@@ -1215,6 +1263,8 @@ def main(argv=None):
                         help='worker environment for one arm (repeatable; over --worker-env)')
     parser.add_argument('--worker-arg', action='append', default=[], metavar='ARG',
                         help='extra expertd-native argument (repeatable; e.g. --worker-arg=--exl3-schedule)')
+    parser.add_argument('--memory-bytes', type=int, metavar='N',
+                        help='host memory cap for the coordinator container (docker --memory/--memory-swap)')
     parser.add_argument('--worker-budget-bytes', type=int, default=DEFAULT_WORKER_BUDGET)
     parser.add_argument('--worker-memory-bytes', type=int, metavar='N',
                         help='container memory cap per worker (docker --memory/--memory-swap); above the device budget')

@@ -60,11 +60,13 @@ fn families() -> Vec<Family> {
 
 /// One scripted engine: records each job's prompt and answers with `reply`.
 #[derive(Clone, Default)]
-struct Worker { prompts: Arc<Mutex<Vec<String>>>, closed: Arc<Mutex<Vec<bool>>> }
+struct Worker { prompts: Arc<Mutex<Vec<String>>>, closed: Arc<Mutex<Vec<bool>>>, variants: Arc<Mutex<Vec<u8>>> }
 
 fn serve(mut profile: ModelProfile, snapshot: Option<std::path::PathBuf>, replies: Vec<&'static str>, hold: bool)
     -> (axum::Router, Worker) {
-    profile.gateway = Some(Arc::new(GatewayMount { models: crate::gateway::ModelMap::official_names(profile.id.clone()),
+    let mut models = crate::gateway::ModelMap::official_names(profile.id.clone());
+    models.variants = profile.variants.iter().map(|v| (v.public_id.clone(), v.index)).collect();
+    profile.gateway = Some(Arc::new(GatewayMount { models,
         snapshot, options: EngineOptions::default(), search: None, gate: None, origins: Default::default() }));
     let (tx, mut rx) = mpsc::channel::<NativeRequest>(4);
     let worker = Worker::default();
@@ -73,6 +75,7 @@ fn serve(mut profile: ModelProfile, snapshot: Option<std::path::PathBuf>, replie
         let mut replies = replies.into_iter();
         while let Some(job) = rx.recv().await {
             seen.prompts.lock().unwrap().push(job.prompt.clone());
+            seen.variants.lock().unwrap().push(job.variant);
             let reply = replies.next().unwrap_or("ok");
             let _ = job.events.send(Ok(InferenceChunk::Ready { system_fingerprint: None,
                 prompt_usage: PromptUsage { prompt_tokens: 11, prompt_cache_hit_tokens: 3 } }));
@@ -150,6 +153,36 @@ fn conversation(model: &str, thinking: bool, tools: bool, image: bool) -> Conver
         responses["tools"] = json!([{"type":"function","name":"read_file","description":"Read a file.","parameters":schema}]);
     }
     Conversation { chat, messages, responses }
+}
+
+#[tokio::test]
+async fn variant_model_ids_select_the_variant_on_every_protocol() {
+    let mut profile = ModelProfile::new("test-glm", ModelEncoding::Glm(Arc::new(glm5::fixtures::encoding())));
+    profile.variants = vec![cuteafd_core::variants::VariantRecord { index: 1, name: "abliterated".into(),
+        public_id: "test-glm-abliterated".into(), base: "test-glm".into(), sites: 96, k_max: 1, verify: json!({}) }];
+    let (app, worker) = serve(profile, None, vec![], false);
+    let mut expected = Vec::new();
+    for (model, variant) in [("test-glm", 0u8), ("test-glm-abliterated", 1), ("claude-sonnet-5", 0)] {
+        let mut c = conversation(model, false, false, false);
+        c.messages["model"] = json!(model);
+        c.responses["model"] = json!(model);
+        for (path, body) in [("/v1/chat/completions", &c.chat), ("/v1/messages", &c.messages), ("/v1/responses", &c.responses)] {
+            let (status, text) = post(&app, path, body.clone()).await;
+            assert_eq!(status, StatusCode::OK, "{model} {path}: {text}");
+            expected.push(variant);
+        }
+    }
+    assert_eq!(*worker.variants.lock().unwrap(), expected);
+    let listing = axum::http::Request::get("/v1/models").body(Body::empty()).unwrap();
+    let response = app.clone().oneshot(listing).await.unwrap();
+    let bytes = axum::body::to_bytes(response.into_body(), 1 << 24).await.unwrap();
+    let models: Value = serde_json::from_slice(&bytes).unwrap();
+    let ids: Vec<&str> = models["data"].as_array().unwrap().iter().filter_map(|m| m["id"].as_str()).collect();
+    assert!(ids.contains(&"test-glm-abliterated"), "{ids:?}");
+    let record = models["data"].as_array().unwrap().iter().find(|m| m["id"] == "test-glm-abliterated").unwrap();
+    assert_eq!(record["variant"]["name"], "abliterated");
+    assert_eq!(record["variant"]["base"], "test-glm");
+    assert!(models["data"][0].get("variant").is_none());
 }
 
 #[tokio::test]

@@ -1,6 +1,6 @@
 //! Dense-target binding of the shared block drafter and online draft policy.
 use super::{engine::{DenseEngine, DrafterBytes}, GoldenArgs};
-use crate::families::glm5::dflash::{ContextRow, DraftSeq, TargetHead, TAP_ROWS};
+use crate::shared::speculation::dflash::{ContextRow, DraftSeq, TargetHead, TAP_ROWS};
 use crate::shared::{draft::{binding, clock::RoundTimes, evidence::{Censor, DraftSource, Evidence}, routes::RoundRoutes},
     fp8_linear::{Fp8Rows, Fp8Scales}, speculation::{block_dspark::{self, DsparkConfig, DsparkDrafter},
         target::{verify_commit, AcceptedPrefix, VerifyRequest, VerifyRow}}};
@@ -8,7 +8,7 @@ use anyhow::{ensure, Context, Result};
 use cuteafd_core::{verify_dspark_greedy_vocab, DraftCandidate, DraftPolicy, LayerResource, PolicyGeometry,
     PolicySeed, ResourceClass};
 use cuteafd_ffi::{programs::Programs, CuteafdDeviceBuffer, NativeLibrary};
-use cuteafd_loader::{families::{glm5::draft_representation::{block_dspark_resident_bytes, GlmDraftRepresentation},
+use cuteafd_loader::{families::{glm5::draft_representation::{block_dspark_paged_resident_bytes, GlmDraftRepresentation},
     qwen3_5::Qwen35Config}, plan::checkpoint::Checkpoint};
 use std::time::{Duration, Instant};
 
@@ -36,6 +36,78 @@ fn top_margin(row: &[f32], best: u32) -> (f32, Vec<u32>) {
 
 fn micros(duration: Duration) -> u64 { duration.as_micros().min(u128::from(u64::MAX)) as u64 }
 
+fn tapped_rows(library: &NativeLibrary, drafter: &DsparkDrafter<'_>, rows: usize) -> Result<Vec<u8>> {
+    let bytes = rows * drafter.cfg.taps.len() * drafter.cfg.hidden * 2;
+    ensure!(rows <= TAP_ROWS, "dense draft tap read exceeds capacity");
+    let mut host = vec![0; bytes];
+    library.copy_d2h(&mut host, CuteafdDeviceBuffer { bytes, ..drafter.taps.buffer })?;
+    Ok(host)
+}
+
+/// Exercise the live cache hooks against cold replay of identical canonical taps
+/// and producer row shapes; cuBLAS projection rounding depends on the row count.
+fn check_draft_prefix(library: &NativeLibrary, drafter: &DsparkDrafter<'_>, taps: &[u8],
+    update_rows: &[usize], label: &str)
+    -> Result<()> {
+    let pitch = drafter.cfg.taps.len() * drafter.cfg.hidden * 2;
+    ensure!(!taps.is_empty() && taps.len() % pitch == 0, "dense draft prefix tap shape");
+    let frontier = taps.len() / pitch;
+    ensure!(update_rows.iter().all(|&rows| rows > 0 && rows <= TAP_ROWS)
+        && update_rows.iter().try_fold(0usize, |sum, &rows| sum.checked_add(rows)) == Some(frontier),
+        "dense draft prefix update groups differ from retained taps");
+    let saved = drafter.capture_pages(0, frontier, frontier)?;
+    let read = |attachment: &cuteafd_engine::prefix::DraftPageAttachment| -> Result<Vec<Vec<u8>>> {
+        let mut bytes = Vec::new();
+        for (index, &page) in attachment.pages.iter().enumerate() {
+            let rows = (attachment.frontier - attachment.origin - index * 64).min(64);
+            for segment in drafter.page_segments(page)? {
+                let len = segment.bytes / 64 * rows;
+                let mut host = vec![0; len];
+                library.copy_d2h(&mut host, CuteafdDeviceBuffer { ptr: segment.addr as *mut _,
+                    bytes: len, device_id: library.cuda_get_device()?, ..CuteafdDeviceBuffer::default() })?;
+                bytes.push(host);
+            }
+        }
+        Ok(bytes)
+    };
+    let expected = read(&saved)?;
+    drafter.reset_context(0, 0)?;
+    let mut position = 0;
+    for &count in update_rows {
+        drafter.put_taps(&taps[position * pitch..(position + count) * pitch])?;
+        let rows: Vec<_> = (0..count).map(|tap_row| ContextRow {
+            tap_row, slot: 0, position: position + tap_row }).collect();
+        drafter.update(&rows)?;
+        position += count;
+    }
+    let cold = drafter.capture_pages(0, frontier, frontier)?;
+    ensure!(read(&cold)? == expected, "dense {label} drafter same-shape cold bytes differ");
+    drafter.release_pages(&cold)?;
+    let continuation = &taps[..3.min(frontier) * pitch];
+    let append = || -> Result<cuteafd_engine::prefix::DraftPageAttachment> {
+        drafter.put_taps(continuation)?;
+        let rows: Vec<_> = (0..continuation.len() / pitch).map(|tap_row| ContextRow {
+            tap_row, slot: 0, position: frontier + tap_row }).collect();
+        drafter.update(&rows)?;
+        drafter.capture_pages(0, frontier + rows.len(), frontier + rows.len())
+    };
+    let grown = append()?;
+    let expected_grown = read(&grown)?;
+    drafter.release_pages(&grown)?;
+    drafter.restore_pages(0, &saved, frontier)?;
+    let restored = drafter.capture_pages(0, frontier, frontier)?;
+    ensure!(read(&restored)? == expected, "dense {label} restored draft bytes differ");
+    drafter.release_pages(&restored)?;
+    let grown = append()?;
+    ensure!(read(&grown)? == expected_grown && read(&saved)? == expected,
+        "dense {label} draft continuation changed bytes or overwrote snapshot tail");
+    drafter.release_pages(&grown)?;
+    drafter.restore_pages(0, &saved, frontier)?;
+    drafter.release_pages(&saved)?;
+    println!("dense {label} drafter prefix: {frontier} rows, same-shape cold replay, restore and continuation byte-identical");
+    Ok(())
+}
+
 /// Opt-in fixed-length numerical check, not a serving benchmark. Both arms
 /// deliberately continue through EOS so they compare exactly `count` tokens.
 #[allow(clippy::too_many_arguments)]
@@ -52,10 +124,11 @@ pub(super) fn spec_decode<'a>(args: &GoldenArgs, library: &'a NativeLibrary, pro
     let config = serde_json::from_slice(&std::fs::read(snapshot.join("config.json"))?)?;
     // Full checkpoint context is charged before target pool selection; no
     // diagnostic-sized truncation is allowed to masquerade as serving admission.
-    let (owned, scratch) = block_dspark_resident_bytes(&config, 1, 1, library.sm_count()? as u64,
-        GlmDraftRepresentation::Bf16Only, Fp8Rows::W8a16.code() as u8, cfg.max_context)?;
+    let (owned, scratch) = block_dspark_paged_resident_bytes(&config, 1, 1, library.sm_count()? as u64,
+        GlmDraftRepresentation::Bf16Only, Fp8Rows::W8a16.code() as u8, cfg.max_context,
+        cfg.max_context, cuteafd_loader::families::qwen4::Qwen4KvCache::Bf16)?;
     let mut engine = DenseEngine::with_prefix(library, programs, checkpoint, cfg.clone(), args.pool_tokens,
-        Some(DrafterBytes { owned, scratch }), 1, None)?;
+        Some(DrafterBytes { owned, scratch, ..Default::default() }), 1, None, args.kv_cache, false)?;
     ensure!(required <= engine.pool_tokens, "spec decode exceeds admitted target pool");
     if args.verify_check { engine.verify_check(prompt)?; }
     let plain = (|| -> Result<(Vec<u32>, Duration, Vec<(f32, Vec<u32>)>)> {
@@ -77,17 +150,19 @@ pub(super) fn spec_decode<'a>(args: &GoldenArgs, library: &'a NativeLibrary, pro
     // than reconstructing the recurrent state or reusing a stale mark.
     drop(engine);
     let mut engine = DenseEngine::with_prefix(library, programs, checkpoint, cfg.clone(), args.pool_tokens,
-        Some(DrafterBytes { owned, scratch }), 1, None)?;
+        Some(DrafterBytes { owned, scratch, ..Default::default() }), 1, None, args.kv_cache, false)?;
     let stream = engine.target_stream().raw;
     let weights = block_dspark::prefetch(snapshot);
     let mask = engine.token_embedding().host_rows(&[draft_cfg.mask_token])?;
     let drafter = DsparkDrafter::load_admitted(library, snapshot,
         weights.join().map_err(|_| anyhow::anyhow!("draft tensor loader panicked"))??,
         stream, 1, 1, mask, GlmDraftRepresentation::Bf16Only, Fp8Scales::Amax, Fp8Rows::W8a16,
-        cfg.max_context)?;
+        cfg.max_context, cuteafd_loader::families::qwen4::Qwen4KvCache::Bf16)?;
     drafter.prepare_workspace()?;
     let mut last = vec![];
     let mut position = 0;
+    let mut canonical_taps = Vec::new();
+    let mut update_rows = Vec::new();
     for chunk in prompt.chunks(args.prefill_chunk.min(TAP_ROWS)) {
         last = engine.evaluate(chunk, |layer, hidden| {
             if drafter.tap_index(layer).is_some() {
@@ -101,8 +176,13 @@ pub(super) fn spec_decode<'a>(args: &GoldenArgs, library: &'a NativeLibrary, pro
             position: position + tap_row }).collect();
         drafter.update(&rows)?;
         engine.target_stream().drain()?;
+        if args.prefix_check {
+            canonical_taps.extend(tapped_rows(library, &drafter, chunk.len())?);
+            update_rows.push(chunk.len());
+        }
         position += chunk.len();
     }
+    if args.prefix_check { check_draft_prefix(library, &drafter, &canonical_taps, &update_rows, "prompt")?; }
     let mut next = argmax(&last[last.len() - cfg.vocab..])?;
     let mut output = vec![next];
     let mut policy = policy(cfg.attention.len(), draft_cfg.block)?;
@@ -153,6 +233,11 @@ pub(super) fn spec_decode<'a>(args: &GoldenArgs, library: &'a NativeLibrary, pro
             position: position + tap_row }).collect();
         drafter.update(&context)?;
         engine.target_stream().drain()?;
+        if args.prefix_check && cycles == 0 {
+            canonical_taps.extend(tapped_rows(library, &drafter, retained)?);
+            update_rows.push(retained);
+            check_draft_prefix(library, &drafter, &canonical_taps, &update_rows, "turn")?;
+        }
         verify_time += verify_start.elapsed();
         proposed += want;
         accepted += retained - 1;

@@ -17,6 +17,7 @@ pub const BENCH_HEADER: &str = "x-cuteafd-bench";
 pub struct Client {
     pub base: String,
     pub model: String,
+    pub configuration: crate::report::Configuration,
     agent: ureq::Agent,
     fabric_enabled: bool,
     token: Option<String>,
@@ -65,7 +66,7 @@ impl Client {
     pub fn new(base: &str, token: Option<String>, cancel: Arc<AtomicBool>) -> Self {
         let agent = ureq::AgentBuilder::new().timeout_connect(Duration::from_secs(10))
             .timeout_read(Duration::from_secs(900)).build();
-        Self { base: base.trim_end_matches('/').to_string(), model: String::new(), agent, token, cancel, api_key: None, fabric_enabled: false }
+        Self { configuration: crate::report::Configuration::default(), base: base.trim_end_matches('/').to_string(), model: String::new(), agent, token, cancel, api_key: None, fabric_enabled: false }
     }
 
     pub fn with_api_key(mut self, key: Option<cuteafd_api::openai::auth::ApiKey>) -> Self {
@@ -102,9 +103,11 @@ impl Client {
     }
 
     /// The served model id and its `/v1/models` record; sets `self.model`.
+    /// `CUTEAFD_BENCH_MODEL` picks another listed id (a weight variant's, say).
     pub fn discover(&mut self) -> Result<Value> {
         let models = self.get("/v1/models")?;
-        let record = models["data"].get(0).cloned().context("/v1/models lists no model")?;
+        let record = pick_model(&models, std::env::var("CUTEAFD_BENCH_MODEL").ok().as_deref())?;
+        self.configuration.supports_thinking_off = record["supports_thinking_off"].as_bool();
         self.model = record["id"].as_str().context("model id")?.to_string();
         Ok(record)
     }
@@ -119,6 +122,7 @@ impl Client {
     /// HTTP media probes bypass the older in-process ProbeSpec registration shape.
     pub fn media_probe(&self, mut body: Value, spec: Value) -> Result<Value> {
         self.check()?;
+        crate::request::validate(&self.configuration, &body)?;
         body["model"] = json!(self.model);
         body["stream"] = json!(false);
         let mut request = self.agent.post(&format!("{}/v1/bench/probe", self.base))
@@ -233,6 +237,7 @@ impl Client {
     /// `probe` registers benchmark diagnostics for this request.
     pub fn chat(&self, mut body: Value, probe: Option<ProbeSpec>) -> Result<Chat> {
         self.check()?;
+        crate::request::validate(&self.configuration, &body)?;
         body["model"] = json!(self.model);
         body["stream"] = json!(true);
         body["stream_options"] = json!({"include_usage": true});
@@ -354,8 +359,27 @@ fn merge_tool_calls(calls: &mut Vec<Value>, deltas: &[Value]) {
     }
 }
 
+/// The `/v1/models` record to bench: the first, or the one named `wanted`.
+fn pick_model(models: &Value, wanted: Option<&str>) -> Result<Value> {
+    let data = models["data"].as_array().context("/v1/models lists no model")?;
+    match wanted.filter(|id| !id.is_empty()) {
+        None => data.first().cloned().context("/v1/models lists no model"),
+        Some(id) => data.iter().find(|m| m["id"] == id).cloned()
+            .with_context(|| format!("CUTEAFD_BENCH_MODEL={id} is not listed by /v1/models")),
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn bench_model_defaults_to_the_first_listed_id_or_the_named_one() {
+        let models = serde_json::json!({"data": [{"id": "base"}, {"id": "base-abliterated"}]});
+        assert_eq!(super::pick_model(&models, None).unwrap()["id"], "base");
+        assert_eq!(super::pick_model(&models, Some("")).unwrap()["id"], "base");
+        assert_eq!(super::pick_model(&models, Some("base-abliterated")).unwrap()["id"], "base-abliterated");
+        assert!(super::pick_model(&models, Some("missing")).is_err());
+    }
+
     use super::*;
 
     #[test]

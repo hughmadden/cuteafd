@@ -141,6 +141,16 @@ impl<'e, 'a> Dsv4Prefix<'e, 'a> {
         Ok(layer_buffers(engine)?.iter().map(Self::layer_mark_bytes).sum())
     }
 
+    /// Snapshot geometry before allocating any retained marks or host tables.
+    pub fn layout_of(engine: &Engine<'_>) -> Result<FamilyLayout> {
+        let layers = layer_buffers(engine)?;
+        Self::mirror_prefix(&layers)?;
+        let rank_marks: Vec<_> = (0..engine.ranks()).map(|rank| layers.iter().filter(|l| l.rank == rank)
+            .map(Self::layer_mark_bytes).sum()).collect();
+        let page_bytes = layers.iter().filter(|l| l.rank == 0).map(Self::layer_page_bytes).sum();
+        Ok(snapshot_layout(engine.shape.units, page_bytes, &rank_marks, engine.context_kv()))
+    }
+
     pub fn mark_bytes(&self) -> usize {
         self.mark_bytes
     }
@@ -148,11 +158,15 @@ impl<'e, 'a> Dsv4Prefix<'e, 'a> {
     pub fn page_bytes(&self) -> usize {
         // One rank's layers: under heads every GPU holds every page, under context a unit's C4
         // pages live on one GPU and its C128 pages are stored from GPU0.
-        self.layers.iter().filter(|l| l.rank == 0).map(|l| match l.compressed {
+        self.layers.iter().filter(|l| l.rank == 0).map(Self::layer_page_bytes).sum()
+    }
+
+    fn layer_page_bytes(layer: &LayerBuffers) -> usize {
+        match layer.compressed {
             Some((4, _)) => compressed_page_bytes(4) + INDEX_PAGE_BYTES,
             Some((ratio, _)) => compressed_page_bytes(ratio),
             None => 0,
-        }).sum()
+        }
     }
 
     pub fn slots(&self) -> usize {
@@ -653,6 +667,39 @@ fn resume_case(runner: &mut Runner<'_, '_, '_>, family: &Dsv4Prefix<'_, '_>, all
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retained_stage_window_rows_match_cold_prefill_at_page_and_ring_boundaries() {
+        use super::super::pool::PoolShape;
+        for chunk in [128usize, 256, 1024] {
+            let shape = PoolShape::new(2, chunk, 16);
+            let source = Placement::new(0, Vec::new());
+            let destination = Placement::new(1, Vec::new());
+            for end in [63usize, 64, 65, 127, 128, 129, 255, 256, 257, 4097] {
+                let first = end.saturating_sub(WINDOW);
+                let mut cold = vec![[0u8; 8]; shape.window_pages() * SOURCE_PAGE_TOKENS];
+                for position in first..end {
+                    cold[source.window_slot(&shape, position) as usize] = (position as u64 + 1).to_le_bytes();
+                }
+                let mark = (first..end).map(|p| cold[source.window_slot(&shape, p) as usize]).collect::<Vec<_>>();
+                let mut restored = vec![[0xa5; 8]; cold.len()];
+                for (offset, position) in (first..end).enumerate() {
+                    restored[destination.window_slot(&shape, position) as usize] = mark[offset];
+                }
+                for position in first..end {
+                    assert_eq!(restored[destination.window_slot(&shape, position) as usize],
+                        cold[source.window_slot(&shape, position) as usize]);
+                }
+                let next = (end as u64 + 1).to_le_bytes();
+                restored[destination.window_slot(&shape, end) as usize] = next;
+                cold[source.window_slot(&shape, end) as usize] = next;
+                for position in (end + 1).saturating_sub(WINDOW)..=end {
+                    assert_eq!(restored[destination.window_slot(&shape, position) as usize],
+                        cold[source.window_slot(&shape, position) as usize]);
+                }
+            }
+        }
+    }
 
     /// GPU1's mark is the prefix of GPU0's (the host tier restores GPU1 from it): the same
     /// backbone layers in the same order; GPU0 adds the dSpark stages' window rings after them.

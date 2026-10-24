@@ -86,15 +86,14 @@ def test_census_carries_the_startup_memory_probe_and_nothing_else_does():
 
 def test_family_launch_census_probe_reaches_coordinator_and_workers_only_when_asked(tmp_path):
     prof = tmp_path / 'prof'
-    config = 'GLM5_FLASH_FP8_MODEL_ID=off\n'
     (tmp_path / 'plain').mkdir()
     (tmp_path / 'census').mkdir()
-    plain = _family_launch_result(tmp_path / 'plain', GLMF_TWO_LAYER, 'test/glmf', config)
+    plain = _family_launch_result(tmp_path / 'plain', GLMF_TWO_LAYER, 'test/glmf', '')
     assert plain.returncode == 0, plain.stderr
     assert 'CUTEAFD_STARTUP_MEMORY_PROBE' not in plain.stderr
     assert 'CUTEAFD_PROFILE' not in plain.stderr
     census = _family_launch_result(tmp_path / 'census', GLMF_TWO_LAYER, 'test/glmf',
-                                   config + f'PROFILE=census\nPROFILE_DIR={prof}\n')
+                                   f'PROFILE=census\nPROFILE_DIR={prof}\n')
     assert census.returncode == 0, census.stderr
     lines = census.stderr.splitlines()
     coordinator = next(line for line in lines if 'cuteafd serve-glmf' in line)
@@ -217,13 +216,13 @@ def test_ncu_wraps_with_filter_count_and_set():
 
 
 @pytest.mark.parametrize('args,message', [
-    (('nsys', '/data/prof', 'kiwi', 'spark'), 'wraps the coordinator only'),
-    (('ncu', '/data/prof', 'kiwi', 'spark', 'gemm'), 'wraps the coordinator only'),
+    (('nsys', '/data/prof', 'kiwi', 'spark'), 'a Spark worker takes PROFILE_SPARK'),
+    (('ncu', '/data/prof', 'kiwi', 'spark', 'gemm'), 'a Spark worker takes PROFILE_SPARK'),
     (('ncu', '/data/prof', 'raptor', 'coordinator'), 'PROFILE=ncu needs PROFILE_NCU_KERNEL'),
     (('ncu', '/data/prof', 'raptor', 'coordinator', 'a b'), 'must not contain whitespace'),
     (('ncu', '/data/prof', 'raptor', 'coordinator', 'gemm', '0'), 'PROFILE_NCU_COUNT must be'),
     (('ncu', '/data/prof', 'raptor', 'coordinator', 'gemm', '5', 'Full;x'), 'PROFILE_NCU_SET must be'),
-    (('nsys', '/data/prof', 'raptor', 'coordinator', 'gemm'), 'need PROFILE=ncu'),
+    (('nsys', '/data/prof', 'raptor', 'coordinator', 'gemm'), 'NCU_KERNEL/COUNT/SET/SKIP need PROFILE=ncu'),
     (('census', '/data/prof', 'raptor', 'coordinator', 'gemm'), 'need PROFILE=ncu'),
 ])
 def test_wrapper_refuses_bad_values(args, message):
@@ -316,7 +315,7 @@ release_profile_exec "$@"
 @pytest.mark.parametrize('profile,directory,message', [
     ('census,flamegraph', '', 'unknown PROFILE switch flamegraph'),
     ('census;rm', '', 'PROFILE must be a comma list'),
-    ('', '/data/prof', 'PROFILE_DIR needs PROFILE'),
+    ('', '/data/prof', 'PROFILE_DIR needs PROFILE or PROFILE_SPARK'),
     ('census', 'relative', 'PROFILE_DIR must be an absolute directory'),
     ('nsys', '', 'PROFILE=nsys needs PROFILE_DIR'),
     ('ncu', '', 'PROFILE=ncu needs PROFILE_DIR'),
@@ -331,7 +330,7 @@ def test_helper_refuses_bad_values(profile, directory, message):
 def test_family_launch_forwards_profile_to_coordinator_and_each_worker(tmp_path):
     prof = tmp_path / 'prof'
     result = _family_launch_result(tmp_path, GLMF_TWO_LAYER, 'test/glmf',
-                                   f'GLM5_FLASH_FP8_MODEL_ID=off\nPROFILE=transport-timing,expert-timing,draft-timing\nPROFILE_DIR={prof}\n')
+                                   f'PROFILE=transport-timing,expert-timing,draft-timing\nPROFILE_DIR={prof}\n')
     assert result.returncode == 0, result.stderr
     lines = result.stderr.splitlines()
     coordinator = next(line for line in lines if 'cuteafd serve-glmf' in line)
@@ -348,7 +347,7 @@ def test_family_launch_forwards_profile_to_coordinator_and_each_worker(tmp_path)
 def test_family_launch_wraps_only_the_coordinator_under_nsys(tmp_path):
     prof = tmp_path / 'prof'
     result = _family_launch_result(tmp_path, GLMF_TWO_LAYER, 'test/glmf',
-                                   f'GLM5_FLASH_FP8_MODEL_ID=off\nPROFILE=nsys,expert-timing\nPROFILE_DIR={prof}\n')
+                                   f'PROFILE=nsys,expert-timing\nPROFILE_DIR={prof}\n')
     assert result.returncode == 0, result.stderr
     lines = result.stderr.splitlines()
     workers = [line for line in lines if 'cuteafd expertd-native' in line]
@@ -369,13 +368,13 @@ def test_family_launch_wraps_only_the_coordinator_under_nsys(tmp_path):
 
 def test_family_launch_ncu_without_filter_fails_closed(tmp_path):
     result = _family_launch_result(tmp_path, GLMF_TWO_LAYER, 'test/glmf',
-                                   f'GLM5_FLASH_FP8_MODEL_ID=off\nPROFILE=ncu\nPROFILE_DIR={tmp_path / "prof"}\n')
+                                   f'PROFILE=ncu\nPROFILE_DIR={tmp_path / "prof"}\n')
     assert result.returncode != 0 and 'PROFILE=ncu needs PROFILE_NCU_KERNEL' in result.stderr
     assert 'cuteafd serve-glmf' not in result.stderr
 
 
 def test_family_launch_without_profile_adds_nothing(tmp_path):
-    result = _family_launch_result(tmp_path, GLMF_TWO_LAYER, 'test/glmf', 'GLM5_FLASH_FP8_MODEL_ID=off\n')
+    result = _family_launch_result(tmp_path, GLMF_TWO_LAYER, 'test/glmf', '')
     assert result.returncode == 0, result.stderr
     assert 'CUTEAFD_PROFILE' not in result.stderr and 'CUTEAFD_EXPERT_TIMING' not in result.stderr
 
@@ -444,7 +443,7 @@ def test_expert_routes_switch_and_its_sample_cap():
 def test_family_launch_expert_routes_sample_reaches_only_the_coordinator(tmp_path):
     prof = tmp_path / 'prof'
     result = _family_launch_result(tmp_path, GLMF_TWO_LAYER, 'test/glmf',
-                                   f'GLM5_FLASH_FP8_MODEL_ID=off\nPROFILE=expert-routes\nPROFILE_DIR={prof}\n'
+                                   f'PROFILE=expert-routes\nPROFILE_DIR={prof}\n'
                                    'PROFILE_EXPERT_INPUT_SAMPLE=16\n')
     assert result.returncode == 0, result.stderr
     lines = result.stderr.splitlines()
@@ -455,5 +454,5 @@ def test_family_launch_expert_routes_sample_reaches_only_the_coordinator(tmp_pat
     assert all('CUTEAFD_EXPERT_INPUT_SAMPLE' not in w for w in workers)
     (tmp_path / 'refused').mkdir()
     refused = _family_launch_result(tmp_path / 'refused', GLMF_TWO_LAYER, 'test/glmf',
-                                    'GLM5_FLASH_FP8_MODEL_ID=off\nPROFILE_EXPERT_INPUT_SAMPLE=16\n')
+                                    'PROFILE_EXPERT_INPUT_SAMPLE=16\n')
     assert refused.returncode != 0 and 'PROFILE_EXPERT_INPUT_SAMPLE needs PROFILE=expert-routes' in refused.stderr

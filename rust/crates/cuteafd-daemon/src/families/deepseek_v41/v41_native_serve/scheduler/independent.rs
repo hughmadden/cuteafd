@@ -14,10 +14,9 @@ pub(super) fn run<'a, P: VerificationTarget<'a>, C: DraftChain<'a>>(runtime: &to
     let draft = RefCell::new(draft);
     let prefixes = RefCell::new(prefixes);
     let set = LaneSet::default();
-    // Do not cancel the peer future on error: it may own queued CUDA/RDMA work.
-    runtime.block_on(set.join(
-        set.lease(0).run(lane(set.lease(0), first, first_transport, &requests, &active, &draft, &prefixes, receive, wake)),
-        set.lease(1).run(lane(set.lease(1), second, second_transport, &requests, &active, &draft, &prefixes, receive, wake)),
+    runtime.block_on(set.run(
+        |lease| lane(lease, first, first_transport, &requests, &active, &draft, &prefixes, receive, wake),
+        |lease| lane(lease, second, second_transport, &requests, &active, &draft, &prefixes, receive, wake),
     ))
 }
 
@@ -172,6 +171,8 @@ async fn lane<'a, P: VerificationTarget<'a>, C: DraftChain<'a>>(lease: LaneLease
                 // Device-ordered passes only while the other lane is idle (two
                 // busy lanes interleave on host waits; see PLAN.md).
                 pass.set_device_order(!shared || crate::shared::memory::chain::device_with_lanes());
+                // The peer lane's work would fill this lane's exchanges and evict an L2 prefetch.
+                pass.set_l2_prefetch(!shared);
                 let current = batch.as_mut().unwrap();
                 let batch_id = current.cache()?.identity();
                 let selected: Vec<_> = (0..current.cache()?.positions().len()).collect();

@@ -24,6 +24,37 @@ uint32_t cuteafd_expert_hidden(void);
 int32_t cuteafd_expert_packed_sizes(uint32_t intermediate, uint64_t bytes[4]);
 int32_t cuteafd_pack_expert_async(const uint8_t* const sources[6],
     uint8_t* const destinations[4], uint32_t intermediate, void* stream);
+/* Payload-only form for packages that generate coded scales independently.
+ * Sources W1/W3/W2 and destinations W13/W2 use the same layouts and lifetimes. */
+int32_t cuteafd_pack_expert_weights_async(const uint8_t* const sources[3],
+    uint8_t* const destinations[2], uint32_t intermediate, void* stream);
+/* Zero disjoint row tails on the current device. pitch >= width; the full
+ * pitched extent must fit destination_bytes and stay live through completion. */
+int32_t cuteafd_zero_pitched_async(void* destination, uint64_t destination_bytes,
+    uint64_t pitch, uint64_t width, uint64_t rows, void* stream);
+
+/* Per-plane form of the same pack. W13/S13 sources are [up;gate] with
+ * independently zero-padded halves; W2/S2 sources retain logical K pitch.
+ * Plane is 0..3; byte extents and non-overlap are checked before launch. */
+int32_t cuteafd_pack_expert_plane_async(const uint8_t* source, uint64_t source_bytes,
+    uint8_t* destination, uint64_t destination_bytes, uint32_t intermediate,
+    uint32_t plane, void* stream);
+/* Load-time V4.1 scales: uint16 K128 offsets in N256 lane-major order,
+ * followed by stored_rows uint8 row bases. The caller zeros omitted rows.
+ * Sources are device-visible (device or mapped pinned memory); the jobs table
+ * is mapped pinned host memory. Output planes are device allocations; the
+ * uint64 error word is device-visible and read by the host only after draining.
+ * Initialize error to UINT64_MAX; on span >15 it receives the first
+ * (job_index << 32 | source_row). A failed load must never publish its output.
+ * No allocation or synchronization; all storage lives through completion. */
+typedef struct cuteafd_scale_code_job_t {
+  const uint8_t* source;
+  uint8_t* destination;
+  uint64_t source_bytes, destination_bytes, pitch;
+  uint32_t rows, columns, stored_rows, start_row;
+} cuteafd_scale_code_job_t;
+int32_t cuteafd_v41_pack_scale_codes_async(const cuteafd_scale_code_job_t* jobs,
+    uint32_t count, uint64_t* error, void* stream);
 /* Pointer slots follow the exported dynamic W4A8 C ABI; see the manifest. */
 typedef struct cuteafd_expert_launch_t {
   void* tensors[CUTEAFD_V41_EXPERT_POINTERS];

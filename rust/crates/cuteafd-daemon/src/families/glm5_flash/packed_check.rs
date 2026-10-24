@@ -7,7 +7,7 @@
 //! its units must agree bit for bit; the verdict, the largest logit difference and both arms'
 //! times are printed per sequence.
 use super::engine::{Allocator, GlmfEngine, GlmfPlacement};
-use super::lane_check::unit_bytes;
+use super::unit_check::unit_bytes;
 use anyhow::{ensure, Context, Result};
 
 /// Chunk lengths of the check's sequences, in order: short prompts under and over the 64-row

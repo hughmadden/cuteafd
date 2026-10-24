@@ -18,7 +18,7 @@ use cuteafd_loader::families::qwen4::resident::{self, fp8_operands, BF16_PROJECT
 use cuteafd_loader::families::qwen4::{Qwen4Attention, Qwen4Config};
 use std::collections::HashMap;
 use std::ffi::c_void;
-use crate::shared::qwen::weights::{f32_bytes, WeightReader};
+use crate::shared::qwen::weights::WeightReader;
 
 pub(crate) const PREFIX: &str = "model.language_model.";
 /// Rows of the shared expert's packed gate/up/gate-logit operand.
@@ -36,6 +36,12 @@ impl Qwen4Layer<'_> {
 
     pub fn has(&self, operand: &str) -> bool {
         self.operands.contains_key(operand)
+    }
+
+    /// Every operand by name (golden digests).
+    #[cfg(test)]
+    pub(crate) fn operands(&self) -> impl Iterator<Item = (&'static str, &Allocation<'_>)> {
+        self.operands.iter().map(|(name, allocation)| (*name, allocation))
     }
 
     /// The device range of `operand`, when the layer has it.
@@ -161,6 +167,7 @@ impl MtpWeights<'_> {
     }
 }
 
+#[derive(Clone)]
 pub(crate) struct Qwen4Loader<'a> {
     pub library: &'a NativeLibrary,
     pub checkpoint: &'a Checkpoint,
@@ -171,6 +178,9 @@ pub(crate) struct Qwen4Loader<'a> {
     /// Scale rule of the E4M3 copies (projections, head).
     pub fp8_scales: crate::shared::fp8_linear::Fp8Scales,
     pub stream: *mut c_void,
+    /// The coordinator's dense records: filled through the mount at once, or
+    /// recorded for a push group (every transform runs on the GPU either way).
+    pub dense: std::rc::Rc<crate::shared::experts::rtx::dense::DenseLoad<'a>>,
 }
 
 impl<'a> Qwen4Loader<'a> {
@@ -194,16 +204,120 @@ impl<'a> Qwen4Loader<'a> {
         self.reader().upload(bytes)
     }
 
+    /// Rows `rows` of a tensor (whole rows) as a landing rectangle.
+    fn rect(&self, name: &str, rows: Option<std::ops::Range<usize>>) -> Result<crate::shared::experts::rtx::dense::Rect> {
+        let tensor = self.tensor(name)?;
+        let total = if tensor.meta.shape.len() >= 2 { tensor.meta.shape[0] } else { 1 };
+        let row_bytes = usize::try_from(tensor.meta.byte_length)? / total;
+        Ok(crate::shared::experts::rtx::dense::Rect { name: name.into(), path: self.checkpoint.snapshot.join(&tensor.shard),
+            base: tensor.meta.byte_offset, row_bytes, rows: rows.unwrap_or(0..total), cols: 0..row_bytes })
+    }
+
+    /// An allocation of `size` bytes (zeroed with `zero`) whose `lands` fill
+    /// its first `bytes` unchanged (class 2); sizes match the mount loader's.
+    fn landed(&self, lands: Vec<(crate::shared::experts::rtx::dense::Rect, usize)>, bytes: usize, size: usize,
+        zero: bool) -> Result<Allocation<'a>> {
+        let device = self.device()?;
+        let allocation = Allocation::new(device, size)?;
+        if zero { self.library.cuda_zero_bytes(allocation.buffer, allocation.buffer.bytes)?; }
+        self.dense.operand(crate::shared::experts::rtx::dense::Operand { device: device.id, buffer: allocation.buffer,
+            lands, bytes })?;
+        Ok(allocation)
+    }
+
+    /// Records (or runs at once) one staged step on this GPU.
+    fn step(&self, rects: Vec<crate::shared::experts::rtx::dense::Rect>,
+        jobs: Vec<crate::shared::experts::rtx::dense::Job>) -> Result<()> {
+        let device = self.device()?.id;
+        self.dense.step(crate::shared::experts::rtx::dense::Step { device, rects, jobs }, self.stream)
+    }
+
+    /// BF16 matrices of `names` concatenated by rows, then `pad_rows` zero rows.
     fn rows(&self, names: &[String], pad_rows: usize) -> Result<Allocation<'a>> {
-        self.reader().rows(names, pad_rows)
+        let _memory_format = cuteafd_ffi::memory_ledger::format("bf16");
+        let (lands, bytes) = self.row_lands(names, pad_rows)?;
+        // As the reader: exactly the packed bytes, zeroed (padding rows stay zero).
+        let data = lands.iter().map(|(r, _)| r.bytes()).sum();
+        self.landed(lands, data, bytes, true)
+    }
+
+    fn row_lands(&self, names: &[String], pad_rows: usize)
+        -> Result<(Vec<(crate::shared::experts::rtx::dense::Rect, usize)>, usize)> {
+        let mut lands = Vec::new();
+        let (mut at, mut cols) = (0usize, None);
+        for name in names {
+            let tensor = self.tensor(name)?;
+            let shape = &tensor.meta.shape;
+            ensure!(tensor.meta.dtype == DType::Bf16 && shape.len() == 2 && shape[0] > 0
+                && cols.is_none_or(|c| c == shape[1]), "Qwen packed rows require BF16 matrices sharing columns ({name})");
+            cols = Some(shape[1]);
+            let rect = self.rect(name, None)?;
+            let bytes = rect.bytes();
+            lands.push((rect, at));
+            at += bytes;
+        }
+        let cols = cols.context("empty Qwen row concatenation")?;
+        Ok((lands, at + pad_rows * cols * 2))
     }
 
     fn one(&self, name: &str) -> Result<Allocation<'a>> {
-        self.reader().bf16(name)
+        let _memory_format = cuteafd_ffi::memory_ledger::format("bf16");
+        let tensor = self.tensor(name)?;
+        ensure!(tensor.meta.dtype == DType::Bf16, "{name}: expected BF16, found {:?}", tensor.meta.dtype);
+        let rect = self.rect(name, None)?;
+        let bytes = rect.bytes();
+        self.landed(vec![(rect, 0)], bytes, bytes.max(256), false)
     }
 
+    /// Native FP32 values land unchanged; BF16 values widen exactly on the GPU.
     fn f32(&self, name: &str) -> Result<Allocation<'a>> {
-        self.reader().f32(name)
+        let _memory_format = cuteafd_ffi::memory_ledger::format("f32");
+        let tensor = self.tensor(name)?;
+        let rect = self.rect(name, None)?;
+        match tensor.meta.dtype {
+            DType::F32 => { let bytes = rect.bytes(); self.landed(vec![(rect, 0)], bytes, bytes.max(256), false) }
+            DType::Bf16 => {
+                let width = rect.width();
+                let out = Allocation::new(self.device()?, (rect.bytes() * 2).max(256))?;
+                for (parts, window) in crate::shared::experts::rtx::dense::windows(&[rect], 1)? {
+                    let dst = cuteafd_ffi::CuteafdDeviceBuffer {
+                        // SAFETY: these rows' FP32 values lie inside `out` (twice the BF16 bytes).
+                        ptr: unsafe { out.buffer.ptr.cast::<u8>().add(window.start * width * 2) }.cast(),
+                        bytes: window.len() * width * 2, ..out.buffer };
+                    self.step(parts, vec![crate::shared::experts::rtx::dense::Job::Widen { at: 0,
+                        bytes: window.len() * width, dst }])?;
+                }
+                Ok(out)
+            }
+            ref other => anyhow::bail!("{name}: expected BF16 or FP32, found {other:?}"),
+        }
+    }
+
+    /// The row concatenation of BF16 `names` as E4M3 values and FP32 128x128
+    /// block scales, quantized on the GPU in whole 128-row windows (the BF16
+    /// copy is never resident).
+    fn block_fp8(&self, names: &[String], rows: usize, cols: usize) -> Result<(Allocation<'a>, Allocation<'a>)> {
+        let (lands, bytes) = self.row_lands(names, 0)?;
+        ensure!(bytes == resident::bf16_bytes(rows, cols), "{names:?}: BF16 [{rows}, {cols}] expected");
+        let device = self.device()?;
+        let q = Allocation::new(device, rows * cols)?;
+        let scale = Allocation::new(device, resident::fp8_block_scale_bytes(rows, cols))?;
+        let rects: Vec<_> = lands.into_iter().map(|(rect, _)| rect).collect();
+        let kb = cols.div_ceil(128);
+        for (parts, window) in crate::shared::experts::rtx::dense::windows_with_tail(&rects, 128)? {
+            ensure!(window.start % 128 == 0, "FP8 block windows start on 128-row blocks");
+            let n = window.len();
+            let qw = cuteafd_ffi::CuteafdDeviceBuffer {
+                // SAFETY: rows `window` of the E4M3 copy lie inside `q`.
+                ptr: unsafe { q.buffer.ptr.cast::<u8>().add(window.start * cols) }.cast(), bytes: n * cols, ..q.buffer };
+            let sw = cuteafd_ffi::CuteafdDeviceBuffer {
+                // SAFETY: these rows' 128-row block scales lie inside `scale`.
+                ptr: unsafe { scale.buffer.ptr.cast::<u8>().add(window.start / 128 * kb * 4) }.cast(),
+                bytes: n.div_ceil(128) * kb * 4, ..scale.buffer };
+            self.step(parts, vec![crate::shared::experts::rtx::dense::Job::RowQuant { rows: n, cols,
+                rule: self.fp8_scales, q: qw, scale: sw, block: true }])?;
+        }
+        Ok((q, scale))
     }
 
     fn hc(&self, prefix: &str, inject: bool) -> Result<[Allocation<'a>; 3]> {
@@ -228,29 +342,46 @@ impl<'a> Qwen4Loader<'a> {
                 ops.insert(name, value);
             }
         }
+        // The selectable projections' sources: BF16 operands, or with
+        // `fp8_decode` their only resident copy, E4M3 with 128x128 block scales.
+        let mut projections: Vec<(&'static str, Vec<String>)> = Vec::new();
         match attention {
             Qwen4Attention::Gdn => {
                 let a = |name: &str| format!("{p}.linear_attn.{name}");
-                ops.insert("w_in", self.rows(&["in_proj_qkv", "in_proj_z", "in_proj_b", "in_proj_a"]
-                    .map(|n| a(&format!("{n}.weight"))), 0)?);
+                projections.push(("w_in", ["in_proj_qkv", "in_proj_z", "in_proj_b", "in_proj_a"]
+                    .map(|n| a(&format!("{n}.weight"))).to_vec()));
                 // [10240, 1, 4] -> FP32 [10240, 4].
                 ops.insert("conv_w", self.f32(&a("conv1d.weight"))?);
                 ops.insert("a_log", self.f32(&a("A_log"))?);
                 ops.insert("dt_bias", self.f32(&a("dt_bias"))?);
                 ops.insert("norm_w", self.one(&a("norm.weight"))?);
-                ops.insert("w_out", self.one(&a("out_proj.weight"))?);
+                projections.push(("w_out", vec![a("out_proj.weight")]));
             }
             Qwen4Attention::Full => {
                 let a = |name: &str| format!("{p}.self_attn.{name}");
-                // (E4M3 copies of w_in / w_o are added below.)
-                ops.insert("w_in", self.rows(&[a("q_proj.weight"), a("k_proj.weight"), a("v_proj.weight"),
-                    a("indexer.index_qk_proj.weight")], 0)?);
+                projections.push(("w_in", vec![a("q_proj.weight"), a("k_proj.weight"), a("v_proj.weight"),
+                    a("indexer.index_qk_proj.weight")]));
                 ops.insert("q_norm", self.one(&a("q_norm.weight"))?);
                 ops.insert("k_norm", self.one(&a("k_norm.weight"))?);
                 ops.insert("iq_norm", self.one(&a("indexer.q_layernorm.weight"))?);
                 ops.insert("ik_norm", self.one(&a("indexer.k_layernorm.weight"))?);
-                ops.insert("w_o", self.one(&a("o_proj.weight"))?);
+                projections.push(("w_o", vec![a("o_proj.weight")]));
             }
+        }
+        if self.fp8_decode {
+            // One representation per weight: each projection's E4M3 copy is
+            // quantized on the GPU straight from staged BF16 rows.
+            for projection in resident::layer_projections(cfg, attention, None) {
+                let names = &projections.iter().find(|(operand, _)| *operand == projection.operand)
+                    .context("projection to quantize")?.1;
+                let (q, scale) = self.block_fp8(names, projection.rows, projection.cols)
+                    .with_context(|| format!("{p} {}", projection.operand))?;
+                let (fp8, scales) = resident::fp8_operands(projection.operand).context("projection operand")?;
+                ops.insert(fp8, q);
+                ops.insert(scales, scale);
+            }
+        } else {
+            for (operand, names) in &projections { ops.insert(operand, self.rows(names, 0)?); }
         }
         let m = |name: &str| format!("{p}.mlp.{name}");
         ops.insert("gate", self.one(&m("gate.weight"))?);
@@ -266,40 +397,6 @@ impl<'a> Qwen4Loader<'a> {
             ops.insert("ple.norm_query", self.one(&e("norm_query.weight"))?);
             ops.insert("ple.norm_conv", self.one(&e("norm_conv.weight"))?);
             ops.insert("ple.conv_w", self.f32(&e("conv1d.weight"))?);
-        }
-        if self.fp8_decode {
-            // One representation per weight: each BF16 projection is staging for its E4M3
-            // copy and is freed once the conversion has drained.
-            for projection in resident::layer_projections(cfg, attention, None) {
-                let (rows, cols) = (projection.rows, projection.cols);
-                let staging = ops.remove(projection.operand).context("projection to quantize")?;
-                ensure!(staging.buffer.bytes == resident::bf16_bytes(rows, cols),
-                    "{p} {}: BF16 [{rows}, {cols}] expected", projection.operand);
-                let q = Allocation::new(self.device()?, rows * cols)?;
-                let scale = Allocation::new(self.device()?, resident::fp8_block_scale_bytes(rows, cols))?;
-                // SAFETY: the BF16 staging weight, the E4M3 copy and the scales are live
-                // device buffers of these shapes; the stream drains before the staging
-                // buffer drops (on error the drain result decides, as below).
-                let launched = unsafe {
-                    self.library.fp8_quant_rule(staging.buffer.ptr, q.buffer.ptr, scale.buffer.ptr, rows, cols,
-                        false, self.fp8_scales.code(), self.stream)
-                };
-                // SAFETY: drains the conversion before its source and destinations can drop.
-                let drained = unsafe { self.library.cuda_stream_synchronize(self.stream) };
-                if let Err(drain) = drained {
-                    // Completion unknown: keep every buffer the conversion touches.
-                    self.library.quarantine_module_after_failed_drain();
-                    std::mem::forget(staging);
-                    std::mem::forget(q);
-                    std::mem::forget(scale);
-                    return Err(drain.context("FP8 projection conversion did not drain; buffers quarantined"));
-                }
-                launched?;
-                drop(staging);
-                let (fp8, scales) = resident::fp8_operands(projection.operand).context("projection operand")?;
-                ops.insert(fp8, q);
-                ops.insert(scales, scale);
-            }
         }
         Ok(Qwen4Layer { attention, operands: ops })
     }
@@ -321,26 +418,41 @@ impl<'a> Qwen4Loader<'a> {
         ensure!(ranks.iter().all(|(device, _)| std::ptr::eq(device.library, self.library)),
             "Qwen weight placement crosses native libraries");
         let _entry = ranks[0].0.enter()?;
-        let (head, dtype, shape) = self.raw("lm_head.weight")?;
-        ensure!(dtype == DType::Bf16 && shape == [cfg.vocab_size, cfg.hidden], "lm_head must be BF16 [vocab, hidden]");
+        let tensor = self.tensor("lm_head.weight")?;
+        ensure!(tensor.meta.dtype == DType::Bf16 && tensor.meta.shape == [cfg.vocab_size, cfg.hidden],
+            "lm_head must be BF16 [vocab, hidden]");
         let head = if fp8_head {
-            let started = std::time::Instant::now();
-            let (q, scales) = crate::families::glm5_flash::fp8::quantize(&head, cfg.vocab_size, cfg.hidden,
-                crate::families::glm5_flash::fp8::Layout::Row128, self.fp8_scales);
-            drop(head);
-            let head = Qwen4Head::Fp8 { values: self.upload(&q)?, scales: self.upload(&f32_bytes(&scales))? };
-            tracing::info!(elapsed_ms = started.elapsed().as_millis() as u64,
-                "LM head (target and MTP) quantized to E4M3; no BF16 head is resident");
-            head
+            // Per-row x 128-K E4M3 (Row128) quantized on the GPU from staged rows.
+            let (rows, cols) = (cfg.vocab_size, cfg.hidden);
+            ensure!(cols % 128 == 0, "the FP8 head needs whole 128-K scale blocks");
+            let device = self.device()?;
+            let values = Allocation::new(device, (rows * cols).max(256))?;
+            let scales = Allocation::new(device, (rows * (cols / 128) * 4).max(256))?;
+            let whole = self.rect("lm_head.weight", None)?;
+            for (parts, window) in crate::shared::experts::rtx::dense::windows(&[whole], 1)? {
+                let target = crate::shared::fp8_load_quant::Target {
+                    // SAFETY: rows `window` of the head's values and scales lie inside them.
+                    q: cuteafd_ffi::CuteafdDeviceBuffer { ptr: unsafe { values.buffer.ptr.cast::<u8>().add(window.start * cols) }
+                        .cast(), bytes: window.len() * cols, ..values.buffer },
+                    q_stride: cols,
+                    scales: cuteafd_ffi::CuteafdDeviceBuffer { ptr: unsafe { scales.buffer.ptr.cast::<u8>()
+                        .add(window.start * (cols / 128) * 4) }.cast(), bytes: window.len() * (cols / 128) * 4, ..scales.buffer },
+                    kmajor: None,
+                };
+                self.step(parts, vec![crate::shared::experts::rtx::dense::Job::Quant { rows: 0..window.len(), pitch: cols,
+                    col0: 0, cols, layout: crate::families::glm5_flash::fp8::Layout::Row128, rule: self.fp8_scales, target }])?;
+            }
+            tracing::info!("LM head (target and MTP) quantized to E4M3 on the GPU; no BF16 head is resident");
+            Qwen4Head::Fp8 { values, scales }
         } else {
-            Qwen4Head::Bf16(self.upload(&head)?)
+            Qwen4Head::Bf16(self.one("lm_head.weight")?)
         };
         let mtp = if mtp { Some(self.mtp(cfg)?) } else { None };
         Ok(Qwen4Weights {
             layers: owners.iter().enumerate().map(|(layer, &owner)| {
                 let (device, stream) = ranks[owner];
                 let loader = Qwen4Loader { library: self.library, checkpoint: self.checkpoint,
-                    fp8_decode: self.fp8_decode, fp8_scales: self.fp8_scales, stream };
+                    fp8_decode: self.fp8_decode, fp8_scales: self.fp8_scales, stream, dense: self.dense.clone() };
                 device.run(|| loader.layer(cfg, layer))
             }).collect::<Result<_>>()?,
             mixer: self.hc(&format!("{PREFIX}hyper_connection_mixer"), false)?,
@@ -362,6 +474,10 @@ impl<'a> Qwen4Loader<'a> {
         })
     }
 }
+
+#[cfg(test)]
+#[path = "coordinator_golden_tests.rs"]
+mod coordinator_golden_tests;
 
 #[cfg(test)]
 mod tests {

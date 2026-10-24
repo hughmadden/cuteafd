@@ -286,18 +286,71 @@ impl ExpertLoadBudget {
     }
 }
 
+/// A resident plane owns either its mount allocation or a completed rank arena.
+pub(crate) struct ResidentPlane<'a> {
+    pub(crate) library: &'a NativeLibrary,
+    pub(crate) buffer: cuteafd_ffi::CuteafdDeviceBuffer,
+    _owner: PlaneOwner<'a>,
+}
+enum PlaneOwner<'a> {
+    Mount { _allocation: DeviceAllocation<'a> },
+    Push { _rank: std::rc::Rc<crate::shared::memory::weight_arena::ReadyArena<'a>> },
+}
+impl<'a> From<DeviceAllocation<'a>> for ResidentPlane<'a> {
+    fn from(allocation: DeviceAllocation<'a>) -> Self {
+        Self { library: allocation.library, buffer: allocation.buffer,
+            _owner: PlaneOwner::Mount { _allocation: allocation } }
+    }
+}
+impl<'a> ResidentPlane<'a> {
+    fn pushed(library: &'a NativeLibrary,
+        rank: std::rc::Rc<crate::shared::memory::weight_arena::ReadyArena<'a>>,
+        region: usize, offset: usize, bytes: usize) -> Result<Self> {
+        let buffer = rank.region(region)?.subregion(offset, bytes)?.buffer();
+        Ok(Self { library, buffer, _owner: PlaneOwner::Push { _rank: rank } })
+    }
+}
+
 /// Resident packed weights borrow the native library; no logical layer copy remains.
 /// Captured graphs must be destroyed before this owner is dropped.
 pub(crate) struct ExpertWeights<'a> {
-    pub(crate) buffers: [DeviceAllocation<'a>; 4],
+    pub(crate) buffers: [ResidentPlane<'a>; 4],
     pub(crate) layer: ExpertLayer,
     experts: usize,
     pub(crate) budget: ExpertLoadBudget,
     /// W4A4 resident storage. `None` for the native and EXL3 families.
     nvfp4: Option<nvfp4::Nvfp4Side<'a>>,
     format: ExpertFormat,
+    /// A recorded load's raw scale images, until their Done finishes ran.
+    raw_scales: RawScales<'a>,
+}
+
+/// A recorded load's raw scale images (one device allocation), freed once its
+/// Done finishes ran, or with the layer. Covariant (no lifetime in a cell).
+pub(crate) struct RawScales<'a> {
+    library: Option<&'a NativeLibrary>,
+    buffer: std::cell::Cell<Option<cuteafd_ffi::CuteafdDeviceBuffer>>,
+}
+impl<'a> RawScales<'a> {
+    fn none() -> Self { Self { library: None, buffer: std::cell::Cell::new(None) } }
+    fn owned(allocation: DeviceAllocation<'a>) -> Self {
+        let allocation = std::mem::ManuallyDrop::new(allocation);
+        Self { library: Some(allocation.library), buffer: std::cell::Cell::new(Some(allocation.buffer)) }
+    }
+    /// Frees the images (their packs ran).
+    pub(crate) fn release(&self) {
+        if let (Some(library), Some(buffer)) = (self.library, self.buffer.take()) {
+            drop(DeviceAllocation { library, buffer });
+        }
+    }
+}
+impl Drop for RawScales<'_> {
+    fn drop(&mut self) { self.release(); }
 }
 impl<'a> ExpertWeights<'a> {
+    /// Frees raw scale images kept for recorded plane packs (after they ran).
+    pub(crate) fn release_raw_scales(&self) { self.raw_scales.release(); }
+
     fn layout(
         library: &NativeLibrary,
         catalog: &OfficialV41Catalog,
@@ -318,16 +371,25 @@ impl<'a> ExpertWeights<'a> {
         );
         let experts = info.experts as usize;
         let packer = library.v41_expert_packer(info.logical_intermediate)?;
-        let strides = packer.packed_bytes().map(usize::try_from);
+        let coded = catalog.mxfp4_scale_codes();
+        let strides = if coded {
+            cuteafd_loader::formats::scale_codes::expert_planes(info.hidden_size as usize,
+                info.logical_intermediate as usize, info.kernel_intermediate as usize)
+                .context("invalid coded expert geometry")?.map(|n| n as u64)
+        } else { packer.packed_bytes() };
         let mut sizes = [0usize; 4];
         for (size, stride) in sizes.iter_mut().zip(strides) {
-            *size = stride?
-                .checked_mul(experts)
+            *size = usize::try_from(stride)?.checked_mul(experts)
                 .context("resident expert allocation overflow")?;
         }
-        let resident_bytes = usize::try_from(
+        let resident_bytes = usize::try_from(if coded {
+            cuteafd_loader::formats::scale_codes::expert_bytes(experts as u64,
+                info.hidden_size as u64, info.logical_intermediate as u64)
+                .context("coded expert residency overflow")?
+        } else {
             cuteafd_loader::placement::families::deepseek_v41::resident_bytes(
-                info.hidden_size as u64, info.kernel_intermediate as u64, experts as u64, false)?)?;
+                info.hidden_size as u64, info.kernel_intermediate as u64, experts as u64, false)?
+        })?;
         ensure!(sizes.iter().sum::<usize>() == resident_bytes,
             "native packer planes disagree with shared resident demand");
         let budget = ExpertLoadBudget {
@@ -336,11 +398,13 @@ impl<'a> ExpertWeights<'a> {
             pinned_host_bytes: first
                 .staging_bytes()
                 .checked_mul(EXPERT_READ_LANES)
+                .and_then(|n| n.checked_add(if coded { 1 << 20 } else { 0 }))
                 .context("expert pinned staging overflow")?,
             read_scratch_bytes: first
                 .minimum_read_scratch_bytes()
                 .checked_mul(64 * EXPERT_READ_LANES)
-                .context("expert read scratch overflow")?,
+                .context("expert read scratch overflow")?
+                .max(cuteafd_loader::EXPERT_READ_WINDOW_BYTES * EXPERT_READ_LANES),
         };
         Ok((budget, sizes, info.logical_intermediate, experts))
     }
@@ -401,9 +465,31 @@ impl<'a> ExpertWeights<'a> {
         }
         let buffers: [DeviceAllocation<'a>; 4] =
             owned.try_into().ok().expect("four packed buffers");
+        if crate::shared::experts::rtx::dense::is_recording() {
+            // Recorded for the coordinator push group: one staged step per expert,
+            // packed on the GPU into its slice of the four planes.
+            let raw_scales = Self::record_steps(library, catalog, layer, intermediate, experts, &sizes, &buffers)?;
+            return Ok(Self { buffers: buffers.map(Into::into), layer, experts, budget, nvfp4: None,
+                format: ExpertFormat::of(catalog), raw_scales });
+        }
+        let mut scale_kernels = if catalog.mxfp4_scale_codes() {
+            Some(crate::shared::fp8_load_quant::LoadKernels::new(library)?)
+        } else { None };
+        if scale_kernels.is_some() {
+            // SAFETY: these unpublished planes are retained through this drain.
+            let queued = unsafe { (|| {
+                for i in [1, 3] { library.zero_pitched_async(buffers[i].buffer, sizes[i], sizes[i], 1,
+                    std::ptr::null_mut())?; }
+                Ok::<_, anyhow::Error>(())
+            })() };
+            let drained = unsafe { library.cuda_stream_synchronize(std::ptr::null_mut()) };
+            if drained.is_err() { library.quarantine_module_after_failed_drain(); }
+            drained?;
+            queued?;
+        }
         let device_staging = DeviceAllocation::new(library, budget.device_staging_bytes)?;
         let mut hosts = (0..EXPERT_READ_LANES)
-            .map(|_| HostAllocation::new(library, budget.pinned_host_bytes / EXPERT_READ_LANES))
+            .map(|_| HostAllocation::new(library, budget.device_staging_bytes))
             .collect::<Result<Vec<_>>>()?;
         let mut read_scratch = (0..EXPERT_READ_LANES)
             .map(|_| vec![0; budget.read_scratch_bytes / EXPERT_READ_LANES])
@@ -468,10 +554,45 @@ impl<'a> ExpertWeights<'a> {
                             .cast::<u8>()
                             .add(expert * (sizes[i] / experts))
                     });
-                    packer.pack(sources, destinations, stream.raw)?;
+                    if scale_kernels.is_some() {
+                        library.v41_pack_weights_async([sources[0], sources[1], sources[2]],
+                            [destinations[0], destinations[2]], intermediate, stream.raw)?;
+                    } else { packer.pack(sources, destinations, stream.raw)?; }
                     // The next copy reuses device staging on this same stream,
                     // after this pack. Distinct pinned inputs stay alive for the
                     // entire group. LoadStream::drop drains on partial failure.
+                }
+                if let Some(kernels) = &mut scale_kernels {
+                    use crate::shared::fp8_load_quant::ScaleCodeTarget;
+                    use cuteafd_loader::formats::scale_codes::Rows;
+                    let hidden = catalog.routed_experts().hidden;
+                    let logical = intermediate as usize;
+                    let stored = logical.div_ceil(128) * 128;
+                    let first_row = match plan.selection() {
+                        V41ExpertSelection::Backbone { rank, .. }
+                        | V41ExpertSelection::BackboneTp2 { rank, .. }
+                        | V41ExpertSelection::BackboneTp { rank, .. }
+                        | V41ExpertSelection::DsparkTp2 { rank, .. } => rank * logical,
+                        _ => 0,
+                    };
+                    let targets = [3usize, 4, 5].map(|slot| {
+                        let down = slot == 5;
+                        let plane = if down { 3 } else { 1 };
+                        let stride = sizes[plane] / experts;
+                        // SAFETY: this expert's slice lies in its admitted plane.
+                        let destination = cuteafd_ffi::CuteafdDeviceBuffer {
+                            ptr: unsafe { buffers[plane].buffer.ptr.cast::<u8>().add(expert * stride) }.cast(),
+                            bytes: stride, ..buffers[plane].buffer };
+                        ScaleCodeTarget { source: Rows { tensor: &plan.tensor_names()[slot],
+                            bytes: &host.bytes()[plan.tensor_ranges()[slot].clone()],
+                            rows: if down { hidden } else { logical },
+                            pitch: if down { logical / 32 } else { hidden / 32 },
+                            columns: if down { logical / 32 } else { hidden / 32 },
+                            first_row: if down { 0 } else { first_row } },
+                            destination, stored_rows: if down { hidden } else { 2 * stored },
+                            start_row: if slot == 3 { stored } else { 0 } }
+                    });
+                    kernels.scale_codes_from(&targets, stream.raw)?;
                 }
             }
             // Only CPU reuse of pinned staging requires host completion.
@@ -483,13 +604,106 @@ impl<'a> ExpertWeights<'a> {
             staging_bytes_per_expert = budget.device_staging_bytes,
             "native expert load timeline");
         Ok(Self {
-            buffers,
+            buffers: buffers.map(Into::into),
             layer,
             experts,
             budget,
             nvfp4: None,
-            format: ExpertFormat::of(catalog),
-        })
+            format: ExpertFormat::of(catalog), raw_scales: RawScales::none() })
+    }
+
+    /// A native layer's records for the coordinator push group, bounded per
+    /// source in file order: each expert's weights ([w3, w1, w2], one
+    /// contiguous file region) are one staged step packed into planes 0 and 2;
+    /// all scales (stored apart, at the shard's front) land class 2 in a
+    /// transient device image `raw` and finishes pack planes 1 and 3 at Done.
+    fn record_steps(library: &'a NativeLibrary, catalog: &OfficialV41Catalog, layer: ExpertLayer, intermediate: u32,
+        experts: usize, sizes: &[usize; 4], buffers: &[DeviceAllocation<'a>; 4]) -> Result<RawScales<'a>> {
+        use crate::shared::experts::rtx::dense::{DenseLoad, Finish, Job, Operand, Rect, Step, STEP_BYTES};
+        let dense = DenseLoad::mount(library);
+        let device = library.cuda_get_device()?;
+        let whole = |name: &str| -> Result<Rect> {
+            let tensor = catalog.tensor(name)?;
+            let bytes = usize::try_from(tensor.metadata.byte_length)?;
+            Ok(Rect { name: name.into(), path: catalog.snapshot().join(&tensor.shard), base: tensor.metadata.byte_offset,
+                row_bytes: bytes, rows: 0..1, cols: 0..bytes })
+        };
+        let plane = |i: usize, expert: usize| {
+            let stride = sizes[i] / experts;
+            // SAFETY (offset): expert `expert`'s slice lies inside plane `i`.
+            cuteafd_ffi::CuteafdDeviceBuffer { ptr: unsafe { buffers[i].buffer.ptr.cast::<u8>().add(expert * stride) }.cast(),
+                bytes: stride, ..buffers[i].buffer }
+        };
+        // Raw scale images, per expert: [w3 scale; w1 scale] then the w2 scale.
+        let first = catalog.expert_staging(layer.expert(0))?;
+        let names = first.tensor_names();
+        let (gate_scale, down_scale) = (2 * catalog.tensor(&names[3])?.metadata.byte_length as usize,
+            catalog.tensor(&names[5])?.metadata.byte_length as usize);
+        let per = (gate_scale + down_scale).next_multiple_of(256);
+        let raw = if catalog.mxfp4_scale_codes() {
+            // Generated planes must be initialized before independently ordered
+            // scale tensors arrive; a later up/gate job must never erase a peer.
+            // SAFETY: unpublished buffers remain owned through the drain.
+            let queued = unsafe { (|| {
+                for i in [1, 3] { library.zero_pitched_async(buffers[i].buffer, sizes[i], sizes[i], 1,
+                    std::ptr::null_mut())?; }
+                Ok::<_, anyhow::Error>(())
+            })() };
+            let drained = unsafe { library.cuda_stream_synchronize(std::ptr::null_mut()) };
+            if drained.is_err() { library.quarantine_module_after_failed_drain(); }
+            drained?;
+            queued?;
+            None
+        } else { Some(DeviceAllocation::new(library, per * experts)?) };
+        for expert in 0..experts {
+            let plan = catalog.expert_staging(layer.expert(expert))?;
+            ensure!(plan.tp_world().is_none() && !matches!(layer.expert(expert),
+                V41ExpertSelection::BackboneTp2 { .. } | V41ExpertSelection::DsparkTp2 { .. }),
+                "recorded native experts are whole tensors");
+            let n = plan.tensor_names();
+            // Weights: one contiguous step (bounded per open source).
+            let rects = vec![whole(&n[1])?, whole(&n[0])?, whole(&n[2])?];
+            let gate_bytes = rects[0].bytes() + rects[1].bytes();
+            let bytes = gate_bytes + rects[2].bytes();
+            ensure!(bytes <= STEP_BYTES, "native expert weights exceed one staged step");
+            dense.step(Step { device, rects, jobs: vec![
+                Job::NativePlane { intermediate, plane: 0, at: 0, bytes: gate_bytes, dst: plane(0, expert) },
+                Job::NativePlane { intermediate, plane: 2, at: gate_bytes, bytes: bytes - gate_bytes, dst: plane(2, expert) },
+            ] }, std::ptr::null_mut())?;
+            if catalog.mxfp4_scale_codes() {
+                let stored = (intermediate as usize).div_ceil(128) * 128;
+                let hidden = catalog.routed_experts().hidden;
+                for (slot, start_row) in [(4, 0), (3, stored), (5, 0)] {
+                    let tensor = catalog.tensor(&n[slot])?;
+                    let rows = tensor.metadata.shape[0];
+                    let columns = tensor.metadata.shape[1];
+                    let rect = Rect { name: n[slot].clone(), path: catalog.snapshot().join(&tensor.shard),
+                        base: tensor.metadata.byte_offset, row_bytes: columns, rows: 0..rows, cols: 0..columns };
+                    dense.step(Step { device, rects: vec![rect], jobs: vec![Job::ScaleCodes {
+                        rect: 0, at: 0, stored_rows: if slot == 5 { hidden } else { 2 * stored },
+                        start_row, dst: plane(if slot == 5 { 3 } else { 1 }, expert),
+                    }] }, std::ptr::null_mut())?;
+                }
+                continue;
+            }
+            // Other native packages retain their raw layout and post-Done pack.
+            let raw = raw.as_ref().context("raw scale image absent")?;
+            let (up, gate, down) = (whole(&n[4])?, whole(&n[3])?, whole(&n[5])?);
+            ensure!(up.bytes() + gate.bytes() == gate_scale && down.bytes() == down_scale, "native scale extents differ");
+            // SAFETY (offset): expert `expert`'s image lies inside `raw`.
+            let image = cuteafd_ffi::CuteafdDeviceBuffer { ptr: unsafe { raw.buffer.ptr.cast::<u8>().add(expert * per) }.cast(),
+                bytes: per, ..raw.buffer };
+            dense.operand(Operand { device, buffer: image, bytes: gate_scale + down_scale,
+                lands: vec![(up.clone(), 0), (gate, up.bytes()), (down, gate_scale)] })?;
+            // SAFETY (offsets): both halves lie inside this expert's image.
+            let at = |offset: usize, bytes: usize| cuteafd_ffi::CuteafdDeviceBuffer {
+                ptr: unsafe { image.ptr.cast::<u8>().add(offset) }.cast(), bytes, ..image };
+            dense.finish(Finish::NativePlane { intermediate, plane: 1, source: at(0, gate_scale), dst: plane(1, expert) },
+                std::ptr::null_mut())?;
+            dense.finish(Finish::NativePlane { intermediate, plane: 3, source: at(gate_scale, down_scale), dst: plane(3, expert) },
+                std::ptr::null_mut())?;
+        }
+        Ok(raw.map(RawScales::owned).unwrap_or_else(RawScales::none))
     }
 
     /// Read each native projection once for both GPUs. Eight readers in each
@@ -522,16 +736,44 @@ impl<'a> ExpertWeights<'a> {
                 devices[rank].run(|| {
                     let mut owned = Vec::with_capacity(4);
                     for bytes in sizes { owned.push(DeviceAllocation::new(devices[rank].library, bytes)?); }
-                    weights[rank].push(Self { buffers: owned.try_into().ok().expect("four native slabs"),
-                        layer: selection, experts, budget, nvfp4: None, format: ExpertFormat::Native });
+                    weights[rank].push(Self { buffers: <[DeviceAllocation<'a>; 4]>::try_from(owned).ok().expect("four native slabs").map(Into::into),
+                        layer: selection, experts, budget, nvfp4: None, format: ExpertFormat::Native, raw_scales: RawScales::none() });
                     Ok(())
                 })?;
             }
             pinned_admitted = pinned_admitted.max(pinned);
         }
+        let coded = catalog.mxfp4_scale_codes();
+        let mut scale_kernels = devices.map(|device| device.own(|| {
+            if coded { Ok(Some(crate::shared::fp8_load_quant::LoadKernels::new(device.library)?)) }
+            else { Ok(None) }
+        })).into_iter().collect::<Result<Vec<_>>>()?;
+        if coded {
+            for rank in 0..2 {
+                devices[rank].run(|| {
+                    // SAFETY: all planes are unpublished and retained through the drain.
+                    let queued = unsafe { (|| {
+                        for weight in weights[rank].iter() {
+                            for plane in [1, 3] {
+                                let dst = weight.buffers[plane].buffer;
+                                devices[rank].library.zero_pitched_async(dst, dst.bytes, dst.bytes, 1,
+                                    std::ptr::null_mut())?;
+                            }
+                        }
+                        Ok::<_, anyhow::Error>(())
+                    })() };
+                    let drained = unsafe { devices[rank].library.cuda_stream_synchronize(std::ptr::null_mut()) };
+                    if drained.is_err() { devices[rank].library.quarantine_module_after_failed_drain(); }
+                    drained?;
+                    queued
+                })?;
+            }
+        }
         let staging = [devices[0].own(|| DeviceAllocation::new(devices[0].library, staging_bytes[0]))?,
             devices[1].own(|| DeviceAllocation::new(devices[1].library, staging_bytes[1]))?];
-        let mut hosts = paired_load::banks(devices[0], lanes, full_bytes, pinned_admitted)?;
+        let table_bytes = if coded { 2 << 20 } else { 0 };
+        let bank_admitted = pinned_admitted.checked_sub(table_bytes).context("paired scale tables under-admitted")?;
+        let mut hosts = paired_load::banks(devices[0], lanes, full_bytes, bank_admitted)?;
         let mut fences = Fences::new(devices)?;
         // Last owners constructed: drain both streams before any bank/slab release.
         let streams = paired_load::streams(devices)?;
@@ -572,6 +814,7 @@ impl<'a> ExpertWeights<'a> {
                         for (lane, jobs) in plans.iter().enumerate() {
                             let ranges = rank_plans[rank][lane].tensor_ranges();
                             for (slot, job) in jobs.iter().enumerate() {
+                                if coded && slot >= 3 { continue; }
                                 let mut destination = staging[rank].buffer;
                                 // SAFETY: rank staging and tensor ranges were admitted before allocation.
                                 unsafe { destination.ptr = destination.ptr.cast::<u8>().add(ranges[slot].start).cast(); }
@@ -581,12 +824,44 @@ impl<'a> ExpertWeights<'a> {
                             // SAFETY: all sources/destinations belong to this rank; its
                             // serialized stream packs before the next staging overwrite.
                             unsafe {
-                                let strides = packer.packed_bytes();
                                 let sources = std::array::from_fn(|slot| staging[rank].buffer.ptr.cast::<u8>()
                                     .add(ranges[slot].start).cast_const());
                                 let destinations = std::array::from_fn(|slot| weight.buffers[slot].buffer.ptr.cast::<u8>()
-                                    .add((first + lane) * strides[slot] as usize));
-                                packer.pack(sources, destinations, streams[rank].raw)?;
+                                    .add((first + lane) * (weight.buffers[slot].buffer.bytes / experts)));
+                                if coded {
+                                    devices[rank].library.v41_pack_weights_async([sources[0], sources[1], sources[2]],
+                                        [destinations[0], destinations[2]], rank_plans[rank][lane].intermediate_size() as u32,
+                                        streams[rank].raw)?;
+                                } else { packer.pack(sources, destinations, streams[rank].raw)?; }
+                            }
+                            if let Some(kernels) = &mut *scale_kernels[rank] {
+                                use crate::shared::fp8_load_quant::ScaleCodeTarget;
+                                use cuteafd_loader::formats::scale_codes::Rows;
+                                let hidden = catalog.routed_experts().hidden;
+                                let logical = rank_plans[rank][lane].intermediate_size();
+                                let stored = logical.div_ceil(128) * 128;
+                                let targets = [3usize, 4, 5].map(|slot| {
+                                    let job = &jobs[slot];
+                                    let slice = job.slices[rank];
+                                    let down = slot == 5;
+                                    let plane = if down { 3 } else { 1 };
+                                    let stride = weight.buffers[plane].buffer.bytes / experts;
+                                    // SAFETY: this expert's view lies inside its admitted coded plane.
+                                    let destination = cuteafd_ffi::CuteafdDeviceBuffer {
+                                        ptr: unsafe { weight.buffers[plane].buffer.ptr.cast::<u8>()
+                                            .add((first + lane) * stride) }.cast(),
+                                        bytes: stride, ..weight.buffers[plane].buffer };
+                                    let start = job.offset + slice.column_start_bytes;
+                                    ScaleCodeTarget { source: Rows { tensor: &job.name,
+                                        bytes: &hosts[bank][lane].bytes()[start..job.offset + job.bytes],
+                                        rows: if down { hidden } else { logical },
+                                        pitch: if down { slice.source_row_bytes } else { hidden / 32 },
+                                        columns: if down { logical / 32 } else { hidden / 32 },
+                                        first_row: if down { 0 } else { rank * logical } },
+                                        destination, stored_rows: if down { hidden } else { 2 * stored },
+                                        start_row: if slot == 3 { stored } else { 0 } }
+                                });
+                                kernels.scale_codes_from(&targets, streams[rank].raw)?;
                             }
                         }
                         Ok(())
@@ -624,9 +899,34 @@ impl<'a> ExpertWeights<'a> {
             experts,
             budget,
             nvfp4: Some(side),
-            format: ExpertFormat::Nvfp4,
-        })
+            format: ExpertFormat::Nvfp4, raw_scales: RawScales::none() })
     }
+    pub(crate) fn from_push(library: &'a NativeLibrary,
+        rank: std::rc::Rc<crate::shared::memory::weight_arena::ReadyArena<'a>>,
+        region: usize, layer: ExpertLayer, layout: &cuteafd_loader::push_load::native::NativePlanes,
+        mut budget: ExpertLoadBudget) -> Result<Self> {
+        ensure!(rank.region(region)?.buffer().bytes == layout.bytes && layout.bytes == budget.resident_bytes,
+            "native pushed layer differs from admission");
+        let mut planes = Vec::new();
+        for (offset, bytes) in layout.planes {
+            planes.push(ResidentPlane::pushed(library, rank.clone(), region, offset, bytes)?);
+        }
+        let nvfp4 = if layout.nvfp4 {
+            let vector = |index: usize| {
+                let (offset, bytes) = layout.vectors[index];
+                ResidentPlane::pushed(library, rank.clone(), region, offset, bytes)
+            };
+            Some(nvfp4::Nvfp4Side { alphas: vector(0)?, down_alphas: vector(1)?,
+                input_scales: vector(2)?, down_input_scales: vector(3)? })
+        } else { None };
+        budget.device_staging_bytes = 0;
+        budget.pinned_host_bytes = 0;
+        budget.read_scratch_bytes = 0;
+        Ok(Self { buffers: planes.try_into().ok().expect("four native planes"), layer,
+            experts: layout.experts, budget, nvfp4,
+            format: if layout.nvfp4 { ExpertFormat::Nvfp4 } else { ExpertFormat::Native }, raw_scales: RawScales::none() })
+    }
+
     /// Intermediate values per expert held by this resident layer.
     ///
     /// Dimensional check: the W2 carrier for one expert is `hidden * intermediate

@@ -273,7 +273,8 @@ def test_env_per_arm_and_container_mounts(env, monkeypatch):
                 and call[i + 1].startswith('nvidia.com/gpu=')] == ['nvidia.com/gpu=0', 'nvidia.com/gpu=1']
         assert call[call.index('--ipc') + 1] == 'host' and 'memlock=-1:-1' in call
         mounts = [call[i + 1] for i, a in enumerate(call) if a == '-v']
-        assert f"{env['tmp']}/hub:/hf/hub:ro" in mounts
+        assert "/mnt/sparknest:/mnt/sparknest:ro" in mounts
+        assert f"{env['tmp'] / 'hub'}:{env['tmp'] / 'hub'}:ro" in mounts
         assert any(m.endswith(':/opt/cuteafd/lib/libcuteafd_native.so:ro') for m in mounts)
         assert any(m.endswith(':/opt/cuteafd/share:ro') for m in mounts)
         assert any(m.endswith(f'/gr/golden/{mode}/r1:/out') for m in mounts)
@@ -282,7 +283,7 @@ def test_env_per_arm_and_container_mounts(env, monkeypatch):
         assert (tail[-2:] == ['--trace', '/out/t']) == (mode == 'heads')
         if mode == 'heads':
             tail = tail[:-2]
-        assert tail[-8:] == ['glm-golden', '--snapshot', '/hf/hub/models--org--model/snapshots/rev1', '--device', '0',
+        assert tail[-8:] == ['glm-golden', '--snapshot', str(env['tmp'] / 'hub/models--org--model/snapshots/rev1'), '--device', '0',
                              '--split-device', '1', '--skip-routed-experts', '--nll'][-8:]
     out = env['home'] / '.cache/cuteafd/builds/gr/golden'
     record = json.loads((out / 'heads/r1/argv.json').read_text())
@@ -391,9 +392,85 @@ def test_compare_tool_on_synthetic_logits(tmp_path):
     assert cli.returncode == 0 and 'byte-identical: True' in cli.stdout
 
 
+def log_probs(values) -> np.ndarray:
+    """Row-wise log-softmax: the probe's `log_probs` tensor is already normalized."""
+    values = np.asarray(values, dtype=np.float64)
+    top = values.max(axis=-1, keepdims=True)
+    return (values - top - np.log(np.exp(values - top).sum(axis=-1, keepdims=True))).astype('<f4')
+
+
+def write_row(path: Path, values) -> None:
+    """One row as the probe writes it: the safetensors header from rows.rs."""
+    data = np.asarray(values, dtype='<f4').tobytes()
+    header = json.dumps({'log_probs': {'dtype': 'F32', 'shape': [len(values)],
+                                       'data_offsets': [0, len(data)]}}).encode()
+    header += b' ' * (-len(header) % 8)
+    path.write_bytes(len(header).to_bytes(8, 'little') + header + data)
+
+
+def test_compare_tool_reads_safetensors_rows(tmp_path):
+    rng = np.random.default_rng(1)
+    rows = log_probs(rng.normal(size=(3, 40)))
+    a, b = tmp_path / 'a', tmp_path / 'b'
+    a.mkdir()
+    b.mkdir()
+    for index, row in enumerate(rows):
+        write_row(a / f'row-{index:08}.safetensors', row)
+        write_row(b / f'row-{index:08}.safetensors', row)
+    same = compare.compare_paths(a, b)
+    assert same['layout'] == 'rows' and same['rows'] == 3 and same['byte_identical']
+    assert same['max_abs_diff'] == 0 and same['mean_kl'] == 0 and same['top1_agreement'] == 1
+    # Perturb one row into a new top-1: the row is named and its metrics are its own.
+    perturbed = rows[1].copy()
+    perturbed[3] = perturbed.max() + 2
+    write_row(b / 'row-00000001.safetensors', log_probs(perturbed))
+    diff = compare.compare_paths(a, b)
+    assert not diff['byte_identical'] and diff['rows'] == 3 and diff['vocab'] == 40
+    assert diff['worst_row'] == 'row-00000001.safetensors'
+    assert diff['worst_abs_diff_row'] == 'row-00000001.safetensors'
+    assert diff['top1_agreement'] == pytest.approx(2 / 3)
+    # Only one row moved, so its KL is the mean's three times over.
+    assert diff['mean_kl'] == pytest.approx(diff['max_kl'] / 3)
+    assert diff['max_kl'] > 0 and diff['max_abs_diff'] > 0
+    # A row only one side wrote is a difference, and a width mismatch names its row.
+    (b / 'row-00000002.safetensors').unlink()
+    missing = compare.compare_paths(a, b)
+    assert missing['only_a'] == 1 and missing['rows'] == 2 and not missing['byte_identical']
+    write_row(b / 'row-00000001.safetensors', np.zeros(39))
+    with pytest.raises(ValueError, match='widths differ'):
+        compare.compare_paths(a, b)
+    cli = subprocess.run([sys.executable, str(COMPARE), str(a), str(b)], capture_output=True, text=True)
+    assert cli.returncode == 2 and 'widths differ' in cli.stderr
+
+
+def test_compare_pairs_reads_safetensors_row_dumps(tmp_path):
+    root = tmp_path / 'golden'
+    rows = log_probs(np.random.default_rng(2).normal(size=(2, 24)))
+    for arm in ('a', 'b'):
+        (root / arm / 'r1' / 'logits').mkdir(parents=True)
+        for index, row in enumerate(rows):
+            write_row(root / arm / 'r1' / 'logits' / f'row-{index:08}.safetensors', row)
+    state = dict(root=str(root), task='t', family='kimi', snapshot='org/model', gpus='0', locks='gpu0',
+                 golden=['kimi-golden'], mode='golden', vocab=24, slots={})
+    results = golden.compare_pairs(state, [('a', 'b')], 1)
+    assert len(results) == 1 and not results[0].get('error')
+    assert results[0]['file'] == 'logits' and results[0]['rows'] == 2 and results[0]['byte_identical']
+    golden.write_summary(state, [], results)
+    assert '| a | b | 1 | logits | True | 2 |' in (root / 'summary.md').read_text()
+    bad = rows[1].copy()
+    bad[0] = bad.max() + 3
+    write_row(root / 'b/r1/logits/row-00000001.safetensors', log_probs(bad))
+    results = golden.compare_pairs(state, [('a', 'b')], 1)
+    assert results[0]['worst_row'] == 'row-00000001.safetensors'
+    golden.write_summary(state, [], results)
+    table = next(line for line in (root / 'summary.md').read_text().splitlines()
+                 if line.startswith('| a | b |') and 'repeat' not in line)
+    assert '| False |' in table and 'row-00000001.safetensors' in table
+
+
 def test_resolve_model_uses_hub_paths(env):
     host, container, extra = golden.resolve_model('org/model')
-    assert container == '/hf/hub/models--org--model/snapshots/rev1' and not extra
+    assert container == str(host) and extra == [str(host)]
     assert golden.vocab_size(host) == 8
 
 
@@ -565,7 +642,7 @@ def test_real_experts_start_before_and_stop_before_locks_release(spark_env, monk
     run_env = json.loads((env['tmp'] / 'run-env.json').read_text())
     assert run_env['CUTEAFD_GOLDEN_PEERS'] == '10.9.0.1:19451,10.9.0.2:19451,10.9.0.3:19451,10.9.0.4:19451'
     assert run_env['CUTEAFD_GOLDEN_SPARK_WORLD'] == '4' and run_env['CUTEAFD_GOLDEN_EXPERT_LAYERS'] == '3'
-    assert run_env['CUTEAFD_GOLDEN_SNAPSHOT'] == '/hf/hub/models--org--model/snapshots/rev1'
+    assert run_env['CUTEAFD_GOLDEN_SNAPSHOT'] == str(env['tmp'] / 'hub/models--org--model/snapshots/rev1')
     assert run_env['CUTEAFD_PROGRAM_MANIFEST'] == '/opt/cuteafd/share/PROGRAMS.json'
     assert run_env['CUTEAFD_GOLDEN_SPARK_PACKAGES'] == '/opt/cuteafd/spark'
     assert run_env['CUTEAFD_SPARK_ADMISSION_TIMEOUT_SECONDS'] == '2400'
@@ -720,8 +797,8 @@ def test_fixture_generation_command_mode(env, monkeypatch):
     assert call[-5:] == ['python3', '-m', 'pytest', '-q', 'python/tests/test_step5_chain_fixture.py']
     run_env = json.loads((env['tmp'] / 'run-env.json').read_text())
     assert run_env['CUTEAFD_STEP5_CHAIN_FIXTURE_DIR'] == str(fixtures) == run_env['CUTEAFD_GOLDEN_FIXTURES']
-    assert run_env['STEP5_QUANT_SNAPSHOT'] == '/hf/hub/models--org--model/snapshots/rev1'
-    assert run_env['STEP5_REFERENCE_SNAPSHOT'] == '/hf/hub/models--x/snapshots/r'
+    assert run_env['STEP5_QUANT_SNAPSHOT'] == str(env['tmp'] / 'hub/models--org--model/snapshots/rev1')
+    assert run_env['STEP5_REFERENCE_SNAPSHOT'] == str(env['tmp'] / 'hub/models--x/snapshots/r')
     assert run_env['PYTHONDONTWRITEBYTECODE'] == '1' and '/workspace/cuteafd/python/reference' in run_env['PYTHONPATH']
     assert 'CUTEAFD_GOLDEN_PEERS' not in run_env
 
@@ -777,6 +854,19 @@ def test_dense_native_test_without_sparks(env, monkeypatch):
     assert f'{fixtures}:{fixtures}:ro' in mounts and '--network' not in call
 
 
+def test_rdma_loopback_native_test_without_sparks(env, monkeypatch):
+    write_slot(env['home'], 'i1')
+    monkeypatch.setenv('STUB_RUN_OUTPUT', PASSED)
+    test = env['tmp'] / 'loopback-test'
+    test.write_text('#!/bin/sh\n')
+    test.chmod(0o755)
+    argv = SPARK_BASE + ['--model', 'org/model', '--arm', 'a=i1:s1', '--gpus', '1', '--native-test', str(test),
+                         '--rdma', '--', 'transport::tests::loopback', '--exact', '--ignored']
+    assert golden.main(argv) == 0
+    call = runs(env)[0]
+    assert '--network' in call and '--device=/dev/infiniband' in call
+
+
 def test_spark_port_checked_only_at_grant():
     """A run queued behind another golden must not fail preflight on its port."""
     import inspect
@@ -784,3 +874,17 @@ def test_spark_port_checked_only_at_grant():
     assert "if at_grant else '-'" in source
     assert "if port!='-':" in golden.REMOTE_CHECK
     assert inspect.signature(golden.preflight).parameters['at_grant'].default is True
+
+
+def test_namespace_root_keeps_mount_loading_paths_identical(env, monkeypatch):
+    root = env['tmp'] / 'namespace'
+    snapshot = root / 'hf-home/hub/models--org--model/snapshots/rev1'
+    snapshot.mkdir(parents=True)
+    (snapshot / 'config.json').write_text('{"vocab_size": 8}')
+    monkeypatch.setenv('CUTEAFD_NAMESPACE_ROOT', str(root))
+    monkeypatch.setenv('CUTEAFD_HF_HUB', str(root / 'hf-home/hub'))
+    host, container, extra = golden.resolve_model(str(snapshot))
+    assert str(host) == container == str(snapshot)
+    assert not extra
+    assert (Path(container) / 'config.json').read_bytes() == (host / 'config.json').read_bytes()
+    assert golden.hub_root() == root / 'hf-home/hub'

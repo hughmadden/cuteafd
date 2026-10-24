@@ -29,8 +29,8 @@
 //! pooled keys bit for bit); then the chunk's rows on this GPU's units go into its pools. Goldens
 //! and exact prefix restores therefore do not depend on chunking or ownership.
 //!
-//! **Tables.** A step's per-rank tables are built on the host and uploaded once at the step's
-//! start, after both streams drained, so no queued kernel reads a table the host rewrites.
+//! **Tables.** Stream-ordered uploads retain their pinned sources until completion. Gather
+//! maps grow by identical prefixes; commit maps belong to each retained live-unit slot.
 use super::*;
 use crate::shared::peer_split::context::{commit_blocks, local_pages, page_owner,
     CommitPlane, ContextExchange};
@@ -93,7 +93,7 @@ impl<'a> GlmfContextSplit<'a> {
     pub fn new(engine: &GlmfEngine<'a>, context: GlmfAttention, extent: usize, manifest: &serde_json::Value,
         abort: Option<[*const u32; 2]>) -> Result<Self> {
         let cfg = &engine.cfg;
-        let (rows, lanes) = (engine.prefill_rows as u64, engine.prefill_lane_count as u64);
+        let (rows, lanes) = (engine.prefill_rows as u64, engine.prefill_waves as u64);
         let buffers = context_buffers(cfg, extent as u64, rows, lanes, context);
         let ranks = [RankDevice { device: engine.device, stream: engine.stream_of(0) },
             RankDevice { device: engine.peer()?.device, stream: engine.stream_of(1) }];
@@ -198,10 +198,9 @@ impl<'a> GlmfEngine<'a> {
         rank_tables(tables, rank, self.pool_pages)
     }
 
-    /// Uploads a prefill unit's gather tables and commit blocks for `rank` (its stream is idle:
-    /// called with the step's other tables). The unit gathers the units holding rows `[0, gather)`
-    /// (0: the step's first lane gathers for every lane) and commits rows `[start, start + rows)`
-    /// of `units` (the sequence's unit ids).
+    /// Enqueues `rank`'s gather tables and slot-owned commit blocks with its other tables.
+    /// The unit gathers history `[0, gather)` and commits `[start, start + rows)` of `units`
+    /// (the sequence's unit ids); uploads follow earlier consumers on the same stream.
     pub(super) fn context_prefill_tables(&self, rank: usize, lane: usize, gather: usize, start: usize, rows: usize,
         units: &[u32]) -> Result<ContextUnit> {
         let split = self.context.as_ref().context("context split")?;
@@ -222,10 +221,12 @@ impl<'a> GlmfEngine<'a> {
                 if page_owner(unit) == owner { ((units[unit] >> 1) as usize * UNIT_PAGES + page % UNIT_PAGES) as i32 }
                 else { -1 }
             }).collect();
-            self.put_at(rank, view(&own.gather, records, pages.len() * 4)?, bytes_of(&pages))?;
+            // Whole regions, not views narrowed to this history: the ordered upload
+            // sizes each destination's staging once (it never regrows mid-call).
+            self.put_at(rank, view(&own.gather, records, split.staging_units * UNIT_PAGES * 4)?, bytes_of(&pages))?;
             if !local.is_empty() {
                 let list: Vec<i32> = local.iter().map(|&l| l as i32).collect();
-                self.put_at(rank, view(&own.gather, pools, list.len() * 4)?, bytes_of(&list))?;
+                self.put_at(rank, view(&own.gather, pools, split.staging_units.div_ceil(2) * 4)?, bytes_of(&list))?;
             }
         }
         let limit = context_commit_units(self.prefill_rows as u64) as usize;
@@ -354,7 +355,7 @@ impl<'a> GlmfEngine<'a> {
         let staging = &own.staging[ordinal % 2];
         let records = view(staging, 0, split.staging_units * UNIT_RECORD_BYTES)?;
         let pools = view(staging, records.bytes, split.staging_units * POOL_PAGE_BYTES)?;
-        for (owner, &shard) in unit.shards.iter().enumerate().filter(|(_, &n)| n > 0) {
+        for (owner, &shard) in unit.shards.iter().enumerate().filter(|(_, &n)| n > 0 && !self.context_reuse.get()) {
             let caches = self.caches_of(owner);
             let kv = caches.kv[index].as_ref().context("MLA layer without a record pool")?;
             let pool_keys = &caches.index[index].as_ref().context("MLA layer without an index cache")?.pools;
@@ -384,8 +385,8 @@ impl<'a> GlmfEngine<'a> {
         let copy = |kind: usize, source: CuteafdDeviceBuffer, pool: &Dev<'_>| -> Result<()> {
             if unit.commits[kind] == 0 { return Ok(()); }
             // SAFETY: staging and pool are this GPU's live buffers; each listed block lies inside
-            // both (built from the units in `context_prefill_tables`), and the lists stay unchanged
-            // until the next step, which follows a drain of this stream.
+            // both (built from the units in `context_prefill_tables`). Slot reuse enqueues the
+            // next table upload after these consumers on this rank's stream.
             self.on(rank, || unsafe { self.library.cuda_kv_cache_write_blocks_async(source.ptr, pool.buffer.ptr,
                 list(kind, 0)?, list(kind, 1)?, list(kind, 2)?, unit.commits[kind], self.stream_of(rank)) })
         };

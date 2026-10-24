@@ -93,11 +93,28 @@ and arms for cleanup. Source worktrees are retained for inspection.
   5.3 MoE input samples capped by `PROFILE_EXPERT_INPUT_SAMPLE`); a row whose
   log is missing or empty fails. Score it with
   `scripts/bench/expert-route-balance.py LOG --tp 4,6`.
+- `--set CARD:PROFILE_SPARK=nsys|ncu` wraps Spark expert workers in a profiler
+  in real serving, on the ranks in `PROFILE_SPARK_RANKS` (default `0`),
+  independently of the coordinator's `PROFILE` (the keys are documented at the
+  PROFILE comment in `scripts/launch/run-family.sh`). With nsys, the sweep
+  window opens and closes every wrapped worker's session together with the
+  coordinator's (pass `--levels`). With ncu, set `PROFILE_SPARK_NCU_KERNEL` and
+  usually `PROFILE_SPARK_NCU_SKIP` to get past readiness launches;
+  `PROFILE_NCU_SKIP` does the same for the coordinator. Reports come back as
+  `profile/<tool>-HOST-rankR.<nsys-rep|ncu-rep>`, and a selected rank without
+  one fails the row. Needs a smoke `--binary` that stops profiled workers
+  gracefully (wip-cards checks).
 - Preflight runs before any queue ticket and again at grant (smoke's prelaunch
-  hook): no serving container of ours exists, the arm is sealed on every host,
-  the slot holds the expert packages and audio entry the card needs (the same
-  derivation `--build` uses), and trace/profile directories are writable.
-  `--preflight-only` runs it alone, e.g. as `hwlock.py --preflight`.
+  hook): the arm is sealed on every host, the slot holds the expert packages and
+  audio entry the card needs (the same derivation `--build` uses), and
+  trace/profile directories are writable. Container absence is checked only at
+  grant, so a job may queue behind a running task that still holds a container
+  of the same name. `--preflight-only` runs the ticket-free checks alone, e.g.
+  as `hwlock.py --preflight`.
+- `--binary` defaults to `cuteafd` on PATH, else the arm's own sealed slot
+  binary (`<WIP_ROOT>/slots/<slot>/coordinator/workspace/.cuteafd-wip/cuteafd`),
+  resolved per arm, so a PATH without cuteafd needs no manual flag; a missing
+  slot binary names the path to build.
 - A state directory holds one run. `--resume` keeps passed jobs and reruns the
   failed or missing ones, moving the earlier attempt to `attempt-N/`. Without
   `--state`/`--task`, each run gets a fresh time-stamped state.

@@ -39,6 +39,8 @@ impl SparkWorkingSet {
         }
         let mut bytes = SparkIoBytes::default();
         for endpoint in endpoints {
+            let rings = endpoint.resolved_rings(rings)
+                .ok_or(PlacementError::Inventory("invalid Spark endpoint ring depth"))?;
             let ring = SparkRingGeometry { max_frame_bytes: rings.max_frame_bytes, depth: rings.depth,
                 slot_bytes: rings.slot_bytes, alignment: rings.alignment, endpoints: 1 };
             let bf16 = endpoint.ingress == cuteafd_core::SparkIngress::Bf16;
@@ -111,7 +113,7 @@ impl SparkWorkingSet {
             host_exchange: multiply(routes + hidden * 2)?,
             row_indices: multiply(4)?,
             mapped_rings: mapped as u64,
-            endpoint_staging: cuteafd_core::SparkEndpoint { capacity,
+            endpoint_staging: cuteafd_core::SparkEndpoint { ring_depth: None, capacity,
                 ingress: cuteafd_core::SparkIngress::Bf16 }.response_prefix_bytes()
                 .and_then(|bytes| bytes.checked_mul(rings.endpoints))
                 .ok_or(PlacementError::Overflow("Spark endpoint staging"))? as u64,
@@ -157,7 +159,8 @@ impl SparkAssignment {
             let resident = match layout {
                 SparkResidentLayout::Exl3 { world, rank } => {
                     let manifest = catalog.exl3().context("Spark EXL3 layout needs checkpoint trellis headers")?;
-                    let plan = manifest.residency(crate::V41Exl3Layer::Backbone(layer), world, rank)?;
+                    let plan = manifest.balanced_residency(crate::V41Exl3Layer::Backbone(layer), world, rank)?;
+                    slice.unit_map = plan.unit_map.as_ref().map(|map| map.fingerprint());
                     slice.first = u32::try_from(plan.intermediate_start)?;
                     slice.width = u32::try_from(plan.intermediate)?;
                     slice.stored_width = slice.width;
@@ -170,6 +173,15 @@ impl SparkAssignment {
                 SparkResidentLayout::Fp8 { world, rank, slicing } => {
                     let tensors = catalog.fp8().context("Spark FP8-family layout needs checkpoint weight/scale headers")?
                         .for_layer(layer)?;
+                    // Exact-even mixed layers share source ranges, but seal each
+                    // format's native units just as its independent worker group does.
+                    let slicing = match slicing {
+                        crate::formats::fp8_experts::Slicing::Blocks(block)
+                            if world > 0 && geometry.intermediate as usize % (block * world) == 0
+                                && geometry.intermediate as usize % (tensors.block() * world) == 0 =>
+                            tensors.exact_slicing(world),
+                        other => other,
+                    };
                     let (first, width) = tensors.rank_range_with(world, rank, slicing)?;
                     slice.unit_map = Some(tensors.unit_map(world, rank, slicing)?.fingerprint());
                     slice.first = u32::try_from(first)?;
@@ -205,8 +217,13 @@ impl SparkAssignment {
                     slice.first = u32::try_from(rank * width)?;
                     slice.width = u32::try_from(width)?;
                     slice.stored_width = u32::try_from(stored_width)?;
-                    super::families::deepseek_v41::resident_bytes(geometry.hidden as u64,
-                        slice.stored_width as u64, geometry.experts as u64, catalog.nvfp4().is_some())?
+                    if catalog.nvfp4().is_none() && catalog.mxfp4_scale_codes() {
+                        crate::formats::scale_codes::expert_bytes(geometry.experts as u64,
+                            geometry.hidden as u64, width as u64).context("coded Spark residency overflow")?
+                    } else {
+                        super::families::deepseek_v41::resident_bytes(geometry.hidden as u64,
+                            slice.stored_width as u64, geometry.experts as u64, catalog.nvfp4().is_some())?
+                    }
                 }
             };
             assignment.resident_bytes = assignment.resident_bytes.checked_add(resident)
@@ -248,6 +265,80 @@ impl SparkAssignment {
     }
 }
 
+/// Offline Spark ceiling: exact header arenas and endpoint allocations plus an
+/// explicitly estimated worker reserve. Feeds the existing pool-first solver's
+/// mandatory prefix; it does not choose RTX owners or allocate worker storage.
+#[derive(Debug, Clone)]
+pub struct SparkBudgetInventory {
+    pub layers: Vec<usize>,
+    pub resident: Vec<Vec<u64>>,
+    pub overhead: Vec<u64>,
+    pub budget: u64,
+}
+
+impl SparkBudgetInventory {
+    pub fn exl3(catalog: &crate::OfficialV41Catalog, working: &SparkWorkingSet,
+        endpoints: &[cuteafd_core::SparkEndpoint], rings: cuteafd_core::SparkRings,
+        budget: u64, estimated_reserve: u64) -> anyhow::Result<Self> {
+        use anyhow::Context;
+        let mut resident = Vec::new();
+        let mut overhead = Vec::new();
+        for rank in 0..working.spark_ranks {
+            let mut costs = Vec::new();
+            for &layer in &working.spark_layers {
+                let one = SparkWorkingSet { spark_layers: vec![layer], ..working.clone() };
+                costs.push(SparkAssignment::from_catalog(catalog, &one, rank,
+                    SparkResidentLayout::Exl3 { world: working.spark_ranks, rank }, endpoints, rings)?.resident_bytes);
+            }
+            let io = working.rank_endpoints_io(rank, catalog.routed_experts().geometry()?, endpoints, rings)?;
+            let bytes = [io.intake, io.host_exchange, io.row_indices, io.mapped_rings,
+                io.endpoint_staging, estimated_reserve].into_iter().try_fold(0u64, |sum, bytes|
+                    sum.checked_add(bytes).context("Spark estimated overhead overflow"))?;
+            resident.push(costs);
+            overhead.push(bytes);
+        }
+        Ok(Self { layers: working.spark_layers.clone(), resident, overhead, budget })
+    }
+
+    pub fn rank_bytes(&self, rank: usize, onboard: usize) -> anyhow::Result<u64> {
+        use anyhow::{ensure, Context};
+        ensure!(onboard <= self.layers.len() && self.resident.len() == self.overhead.len()
+            && self.resident.iter().all(|costs| costs.len() == self.layers.len()), "Spark budget inventory extent");
+        let costs = self.resident.get(rank).context("Spark budget rank outside inventory")?;
+        // An empty selected set allocates no worker storage or endpoint rings.
+        if onboard == self.layers.len() { return Ok(0); }
+        costs[onboard..].iter().try_fold(self.overhead[rank], |sum, bytes|
+            sum.checked_add(*bytes).context("Spark estimated retained bytes overflow"))
+    }
+
+    pub fn minimum_rtx_layers(&self) -> anyhow::Result<usize> {
+        anyhow::ensure!(self.budget > 0 && !self.resident.is_empty(), "Spark budget must be positive with selected ranks");
+        for count in 0..=self.layers.len() {
+            let fits = (0..self.resident.len()).map(|rank| self.rank_bytes(rank, count))
+                .collect::<anyhow::Result<Vec<_>>>()?.into_iter().all(|bytes| bytes <= self.budget);
+            if fits { return Ok(count); }
+        }
+        unreachable!("empty Spark working set has zero bytes")
+    }
+
+    pub fn constrain(&self, request: &mut super::PlacementRequest) -> anyhow::Result<()> {
+        let layers = request.layers.iter().enumerate().filter_map(|(layer, demand)|
+            demand.experts.is_some().then_some(layer)).collect::<Vec<_>>();
+        anyhow::ensure!(layers == self.layers, "Spark budget routed inventory differs from coordinator");
+        let minimum = self.minimum_rtx_layers()?;
+        if let super::Onboard::Layers(count) = request.onboard {
+            anyhow::ensure!(count <= layers.len(), "explicit --rtx-expert-layers {count} exceeds {} routed layers", layers.len());
+        }
+        if let Some(count) = request.onboard.layers(layers.len()) {
+            anyhow::ensure!(count >= minimum,
+                "explicit --rtx-expert-layers {count} is below {minimum} required by estimated --spark-budget-gib ({budget} bytes including reserve and I/O)",
+                budget = self.budget);
+        }
+        request.minimum_expert_layers = request.minimum_expert_layers.max(minimum);
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct SparkRingGeometry {
     pub max_frame_bytes: usize,
@@ -283,15 +374,25 @@ mod tests {
             let catalog = crate::read_expert_catalog(dir.path()).unwrap();
             let working = SparkWorkingSet { spark_layers: vec![0], spark_ranks: 4,
                 prefill_lanes: 1, ..Default::default() };
-            let endpoints = [SparkEndpoint { capacity: 80, ingress: SparkIngress::Fp8K32 }];
+            let endpoints = [SparkEndpoint { ring_depth: None, capacity: 80, ingress: SparkIngress::Fp8K32 }];
             let rings = SparkRings { max_frame_bytes: 64 << 20, depth: 8, slot_bytes: 8 << 20, alignment: 4096 };
             for stored_width in [576, 640] {
                 let assignment = SparkAssignment::from_catalog(&catalog, &working, 3,
                     SparkResidentLayout::Native { world: 4, rank: 3, stored_width }, &endpoints, rings).unwrap();
                 assert_eq!((assignment.slices[0].first, assignment.slices[0].width, assignment.slices[0].stored_width),
                     (1728, 576, stored_width as u32));
-                assert_eq!(assignment.resident_bytes, super::super::families::deepseek_v41::resident_bytes(
-                    5120, stored_width as u64, 384, nvfp4).unwrap());
+                let expected = if nvfp4 {
+                    super::super::families::deepseek_v41::resident_bytes(
+                        5120, stored_width as u64, 384, true).unwrap()
+                } else {
+                    // Coded packages pad each FC1 half to N128; FC2 keeps logical K576.
+                    let (hidden, logical, stored, experts) = (5120u64, 576u64, 640u64, 384u64);
+                    let payloads = hidden * stored + hidden * stored / 2;
+                    let gate_up = 2 * stored * (1 + 2 * (hidden / 128));
+                    let down = hidden * (1 + 2 * logical.div_ceil(128));
+                    experts * (payloads + gate_up + down)
+                };
+                assert_eq!(assignment.resident_bytes, expected);
             }
             for stored_width in [544, 577] {
                 assert!(SparkAssignment::from_catalog(&catalog, &working, 3,
@@ -320,15 +421,16 @@ mod tests {
         let catalog = crate::read_expert_catalog(dir.path()).unwrap();
         let working = SparkWorkingSet { spark_layers: vec![0], spark_ranks: 4,
             prefill_lanes: 1, ..Default::default() };
-        let endpoints = [SparkEndpoint { capacity: 80, ingress: SparkIngress::Fp8K32 }];
+        let endpoints = [SparkEndpoint { ring_depth: None, capacity: 80, ingress: SparkIngress::Fp8K32 }];
         let rings = SparkRings { max_frame_bytes: 64 << 20, depth: 8, slot_bytes: 8 << 20, alignment: 4096 };
         let assignment = SparkAssignment::from_catalog(&catalog, &working, 3,
             SparkResidentLayout::Exl3 { world: 4, rank: 3 },
             &endpoints, rings).unwrap();
-        let plan = catalog.exl3().unwrap().residency(crate::V41Exl3Layer::Backbone(0), 4, 3).unwrap();
+        let plan = catalog.exl3().unwrap().balanced_residency(crate::V41Exl3Layer::Backbone(0), 4, 3).unwrap();
         assert_eq!(assignment.resident_bytes, plan.device_arena_layout().unwrap().1 as u64);
         assert!(assignment.resident_bytes > plan.bytes() as u64);
-        assert_eq!((assignment.slices[0].first, assignment.slices[0].width), (512, 128));
+        assert_eq!(assignment.slices[0].unit_map, plan.unit_map.as_ref().map(|map| map.fingerprint()));
+        assert_eq!(assignment.slices[0].width, plan.intermediate as u32);
         assert_eq!(assignment.slices[0].tiers, plan.tiers.iter().map(|&tier| tier as u32).collect::<Vec<_>>());
         assert_eq!(assignment.slices[0].projection_counts,
             plan.projection_counts.iter().map(|row| row.map(|count| count as u32)).collect::<Vec<_>>());
@@ -355,13 +457,13 @@ mod tests {
             let catalog = crate::read_expert_catalog(dir.path()).unwrap();
             let working = SparkWorkingSet { spark_layers: vec![1], spark_ranks: 6,
                 prefill_lanes: 1, ..Default::default() };
-            let endpoints = [SparkEndpoint { capacity: 4096, ingress: SparkIngress::Fp8K32 }];
+            let endpoints = [SparkEndpoint { ring_depth: None, capacity: 4096, ingress: SparkIngress::Fp8K32 }];
             let rings = SparkRings { max_frame_bytes: 64 << 20, depth: 8, slot_bytes: 8 << 20, alignment: 4096 };
             let exact = SparkAssignment::from_catalog(&catalog, &working, 5,
                 SparkResidentLayout::Fp8 { world: 6, rank: 5, slicing: Slicing::Blocks(128) }, &endpoints, rings).unwrap();
             let padded = SparkAssignment::from_catalog(&catalog, &working, 5,
                 SparkResidentLayout::Fp8 { world: 6, rank: 5, slicing: Slicing::Padded }, &endpoints, rings).unwrap();
-            assert_eq!((exact.slices[0].first, exact.slices[0].width, exact.slices[0].stored_width), (1792, 256, 256));
+            assert_eq!((exact.slices[0].first, exact.slices[0].width, exact.slices[0].stored_width), (1536, 256, 256));
             assert_eq!(padded.slices[0].stored_width, 384);
             assert!(exact.resident_bytes < padded.resident_bytes);
             assert_eq!(exact.io, padded.io);
@@ -397,7 +499,7 @@ mod tests {
         }
         write_snapshot(dir.path(), &config, &tensors, None);
         let catalog = crate::read_expert_catalog(dir.path()).unwrap();
-        let endpoints = [SparkEndpoint { capacity: 64, ingress: SparkIngress::Bf16 }];
+        let endpoints = [SparkEndpoint { ring_depth: None, capacity: 64, ingress: SparkIngress::Bf16 }];
         let rings = SparkRings { max_frame_bytes: 64 << 20, depth: 8, slot_bytes: 8 << 20, alignment: 4096 };
         for world in [4, 6] {
             for rank in 0..world {
@@ -417,8 +519,10 @@ mod tests {
                 assert_eq!(bf16.resident_bytes, 3 * 4096 * u64::from(slice.stored_width) * 2 * 2);
                 assert_eq!(mixed.resident_bytes, fp8.resident_bytes + bf16.resident_bytes);
                 assert_eq!(mixed.slices, [fp8.slices[0].clone(), slice.clone()]);
+                let view = original.for_layer(2).unwrap();
+                let (first, width) = view.rank_range_with(world, rank, Slicing::Blocks(128)).unwrap();
                 assert_eq!((slice.first, slice.width, slice.stored_width),
-                    (fp8.slices[0].first, fp8.slices[0].width, fp8.slices[0].stored_width));
+                    (first as u32, width as u32, width as u32));
                 assert_eq!(mixed.io, bf16.io);
             }
         }
@@ -468,7 +572,7 @@ mod tests {
         let set = SparkWorkingSet { spark_layers: vec![3], spark_ranks: 4,
             ..Default::default() };
         let geometry = ExpertGeometry::GLM5;
-        let endpoint = SparkEndpoint { capacity: 64, ingress: SparkIngress::Fp8K32 };
+        let endpoint = SparkEndpoint { ring_depth: None, capacity: 64, ingress: SparkIngress::Fp8K32 };
         let rings = SparkRings { max_frame_bytes: 4 << 20, depth: 2,
             slot_bytes: 1 << 20, alignment: 4096 };
         let io = set.rank_endpoints_io(0, geometry, &[endpoint], rings).unwrap();
@@ -498,8 +602,8 @@ mod tests {
         let geometry = ExpertGeometry::MIMO_V26_PRO;
         let rings = SparkRings { max_frame_bytes: 64 << 20, depth: 8,
             slot_bytes: 8 << 20, alignment: 4096 };
-        let main = SparkEndpoint { capacity: 4096, ingress: SparkIngress::Bf16Decode { rows: 80 } };
-        let lane = SparkEndpoint { capacity: 1024, ingress: SparkIngress::Fp8K32 };
+        let main = SparkEndpoint { ring_depth: None, capacity: 4096, ingress: SparkIngress::Bf16Decode { rows: 80 } };
+        let lane = SparkEndpoint { ring_depth: None, capacity: 1024, ingress: SparkIngress::Fp8K32 };
         let io = set.rank_endpoints_io(0, geometry, &[main, lane], rings).unwrap();
         assert_eq!(io.mapped_rings, (main.ring_bytes(geometry, rings).unwrap()
             + lane.ring_bytes(geometry, rings).unwrap()) as u64);

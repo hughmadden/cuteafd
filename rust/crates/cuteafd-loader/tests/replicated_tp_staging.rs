@@ -136,7 +136,10 @@ fn tp3_covers_i768_shards() {
 /// represented are rejected before any read.
 #[test]
 fn explicit_tp_geometry_rejects_invalid_world_rank_and_shapes() {
-    for world in [0usize, 1, 5, 8, usize::MAX] {
+    for world in [1, 8] {
+        assert!(V41ExpertStaging::backbone_tp_geometry(INTERMEDIATE, HIDDEN, world, 0).is_ok());
+    }
+    for world in [0usize, 5, 7, 9, usize::MAX] {
         assert!(
             V41ExpertStaging::backbone_tp_geometry(INTERMEDIATE, HIDDEN, world, 0).is_err(),
             "world {world} must be rejected"
