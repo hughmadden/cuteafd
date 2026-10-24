@@ -476,13 +476,14 @@ PURE_EVICT_FIRST = 'l2=2,pf1=0,pf2=0,pdl=1'
 
 def default_decode_schedule(geometry: str, role: str, profile: str,
                             capacity: int, bits: list[int]) -> str | None:
-    """Only measured cooperative Spark profiles use the pure streaming hint.
+    """Only measured cooperative profiles use the pure streaming hint.
 
     GB10, default/control/hint, three alternating rounds, rows 1..80: GLM
     compact TP6 1.054..1.123x (control .997..1.002); Flash TP4 1.027..1.082x
     (.997..1.001); Qwen compact TP4 1.003..1.094x (1.000..1.004); Kimi TP6
     1.020..1.107x (.991..1.004). Compact m16 rows 2/4/8/16: GLM
     1.067..1.119x (.995..1.003), Qwen 1.019..1.083x (.989..1.002).
+    RTX Flash TP2 m1/m80: median 1.015..1.144x (control .995..1.016).
     Tiles, occupancy and arithmetic unchanged.
     """
     measured = {
@@ -496,6 +497,8 @@ def default_decode_schedule(geometry: str, role: str, profile: str,
                     ('qwen4', 'tp4-compact-width256', (4, 5))}
     if role == 'spark' and ((capacity in (1, 80) and identity in measured)
                             or (capacity == 16 and identity in measured_m16)):
+        return PURE_EVICT_FIRST
+    if role == 'coordinator' and capacity in (1, 80) and identity == ('glmf', 'rtx-tp2', (3, 4)):
         return PURE_EVICT_FIRST
     return None
 
