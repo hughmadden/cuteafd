@@ -89,6 +89,22 @@ pub(crate) fn request(configuration: &crate::report::Configuration, base: &Value
     body(configuration, json!(messages), output)
 }
 
+/// A client must check the returned evidence too: an older server may ignore the request option.
+pub(crate) fn validate_suffix(record: &Value, requested: u64) -> Result<(), String> {
+    if requested == 0 { return Ok(()); }
+    let error = || format!("server does not support context suffix: expected every measured request to report uncached_rows >= {requested}");
+    let points = record["points"].as_array().filter(|p| !p.is_empty()).ok_or_else(error)?;
+    for point in points {
+        let requests = point["requests"].as_array().filter(|r| !r.is_empty()).ok_or_else(error)?;
+        if point["status"] != "ok" || point["suffix_tokens"].as_u64() != Some(requested)
+            || point["c"].as_u64() != Some(requests.len() as u64)
+            || requests.iter().any(|r| r["uncached_rows"].as_u64().is_none_or(|rows| rows < requested)) {
+            return Err(error());
+        }
+    }
+    Ok(())
+}
+
 fn fit(
     pool: Option<u64>,
     slots: Option<u64>,
@@ -402,7 +418,9 @@ impl Panel for ContextLoad {
                 ctx.progress.partial(record(&bases, &points));
             }
         }
-        Ok(record(&bases, &points))
+        let result = record(&bases, &points);
+        validate_suffix(&result, options.suffix_tokens).map_err(anyhow::Error::msg)?;
+        Ok(result)
     }
 }
 
@@ -476,6 +494,19 @@ mod tests {
             }
         }
         assert_eq!(suffixes.len(), 32);
+    }
+    #[test]
+    fn suffix_evidence_fails_closed_for_old_or_underfilled_servers() {
+        let good = json!({"points": [{"status": "ok", "c": 2, "suffix_tokens": 512,
+            "requests": [{"uncached_rows": 570}, {"uncached_rows": 512}]}]});
+        assert!(validate_suffix(&good, 512).is_ok());
+        assert!(validate_suffix(&json!({}), 0).is_ok());
+        for bad in [json!({}), json!({"points": []}),
+            json!({"points": [{"status": "ok", "c": 1, "requests": [{}]}]}),
+            json!({"points": [{"status": "ok", "c": 1, "suffix_tokens": 512, "requests": [{"uncached_rows": 57}]}]}),
+            json!({"points": [{"status": "ok", "c": 2, "suffix_tokens": 512, "requests": [{"uncached_rows": 570}, {}]}]})] {
+            assert!(validate_suffix(&bad, 512).unwrap_err().contains("server does not support context suffix"));
+        }
     }
     #[test]
     fn pool_fit_uses_shared_not_copied_base() {
