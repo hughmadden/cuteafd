@@ -317,7 +317,8 @@ pub fn block_dspark_resident_bytes(config: &serde_json::Value, slots: usize, seq
     let attention_scratch = crate::serving_capacity::draft_attention_workspace_bytes(
         sequences as u64, kvh, (heads / kvh * block).div_ceil(32), add(capacity,block)?, dim, sms)
         .map_err(|_| GlmDraftStorageError::Overflow)?.max(256);
-    workspace = add(workspace,add(mul(sequences as u64,296*8)?,mul(rows,4)?)?.max(256))?;
+    workspace = add(workspace,crate::serving_capacity::draft_markov_workspace_bytes(sequences as u64, block)
+        .map_err(|_| GlmDraftStorageError::Overflow)?.max(256))?;
     let mut scratch_shapes = shapes.to_vec(); scratch_shapes.push((h,mul(2,kv)?));
     let scratch = if fp8 { scratch_shapes.iter().map(|&(k,n)|
         draft_fp8_scratch_bytes(rows.max(2048),k,n,sms,mode)).max().unwrap_or(256) } else { 0 };
