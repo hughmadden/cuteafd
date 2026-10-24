@@ -1538,8 +1538,10 @@ impl<'a> SparkLink<'a> {
         let geometry = crate::shared::spark_waves::Intake { ranks: intake.ranks(), rows: intake.rows(),
             row_bytes: intake.row_bytes(), waves, planes: (0..waves).map(|slot| intake.slot_buffers(slot)).collect(),
             landing: if intake.mode == IntakeMode::Gpu { landing } else { 0 }, next_slot: intake.dispatch_slot() };
-        self.exchange = Some(crate::shared::spark_waves::Waves::start(intake.library, geometry, transport, arenas,
-            self.timing)?);
+        // Read-only worker metadata, kept so callers need not reach the transport.
+        let grouping = transport.installed_grouping().unwrap_or_default();
+        self.exchange = Some(crate::shared::spark_waves::Waves::start(intake.library, geometry, transport, grouping,
+            arenas, self.timing)?);
         Ok(())
     }
 
@@ -1553,7 +1555,7 @@ impl<'a> SparkLink<'a> {
     /// the consuming streams drained.
     fn stop(&mut self) -> Result<()> {
         if let Some(exchange) = self.exchange.take() {
-            let (transport, next) = exchange.stop()?;
+            let (transport, next) = exchange.stop::<SparkExperts>()?;
             self.intake.resume_at(next);
             self.transport = Some(transport);
         }

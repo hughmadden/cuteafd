@@ -314,15 +314,45 @@ fn release_until_closed<B: Backend>(backend: &mut B, inbox: &mpsc::Receiver<Comm
     }
 }
 
+/// The Spark side of the worker: posts a request and progresses its wave.
+/// [`SparkExperts`] in serving; an in-process echo in the GPU exchange test.
+pub(crate) trait Transport: Send + 'static {
+    type Wave: Send;
+    fn dispatch(&mut self, request: &ExpertProtocolV2Request) -> Result<Self::Wave>;
+    /// One non-blocking pass: arrived rows go to `sink(rank, first row,
+    /// payload)`; `Some(landed ranks)` once every rank's rows arrived.
+    fn poll(&mut self, wave: &mut Self::Wave, sink: &mut dyn FnMut(usize, u32, &[u8]) -> Result<()>)
+        -> Result<Option<u8>>;
+    /// The response deadline every wave is held to.
+    fn timeout(&self) -> Duration;
+    /// Gives up every outstanding wave (after a failure).
+    fn abandon(&mut self);
+}
+
+impl Transport for SparkExperts {
+    type Wave = (SparkExpertWave, WaveReceipt);
+    fn dispatch(&mut self, request: &ExpertProtocolV2Request) -> Result<Self::Wave> {
+        Ok((self.dispatch_wave(request)?, WaveReceipt::default()))
+    }
+    fn poll(&mut self, wave: &mut Self::Wave, sink: &mut dyn FnMut(usize, u32, &[u8]) -> Result<()>)
+        -> Result<Option<u8>> {
+        let (wave, receipt) = wave;
+        let done = self.poll_wave(wave, receipt, |rank, first, payload| sink(rank, first, payload.as_ref()))?;
+        Ok(done.then_some(receipt.landed))
+    }
+    fn timeout(&self) -> Duration { SparkExperts::timeout(self) }
+    fn abandon(&mut self) { self.abandon_waves("Spark exchange failed with waves in flight"); }
+}
+
 /// One rank's landing destination in a slot: device plane, and the pinned
 /// staging its rows arrive in when the rank does not land in device memory.
 #[derive(Clone, Copy)]
 struct Plane { device: usize, host: usize, bytes: usize }
 
-/// The serving backend: the link's transport, its slots' request staging
+/// The worker's backend over a [`Transport`]: the slots' request staging
 /// and landing staging, and the control counters.
-struct Native {
-    transport: SparkExperts,
+struct Native<T> {
+    transport: T,
     arenas: Vec<StagingArena>,
     words: Words,
     /// Per slot, per rank.
@@ -331,11 +361,10 @@ struct Native {
     row_bytes: usize,
     /// Bit r: rank r lands in device memory; others arrive pinned.
     landing: u8,
-    receipt: WaveReceipt,
 }
 
-impl Backend for Native {
-    type Wave = SparkExpertWave;
+impl<T: Transport> Backend for Native<T> {
+    type Wave = T::Wave;
 
     fn counter(&self, counter: Counter) -> u32 { self.words.load(counter) }
 
@@ -355,32 +384,36 @@ impl Backend for Native {
                 build(routes, wire)?
             }
         };
-        self.receipt = WaveReceipt::default();
-        self.transport.dispatch_wave(&request)
+        self.transport.dispatch(&request)
     }
 
     fn poll(&mut self, wave: &mut Self::Wave, slot: usize, rows: usize) -> Result<bool> {
         let (planes, ranks, row_bytes) = (&self.planes[slot], self.ranks, self.row_bytes);
         let plane_bytes = rows * row_bytes;
-        let done = self.transport.poll_wave(wave, &mut self.receipt, |rank, first, payload| {
+        let landing = self.landing;
+        let done = self.transport.poll(wave, &mut |rank, first, payload| {
             let plane = planes.get(rank).copied().context("rank outside the intake planes")?;
-            ensure!(plane.host != 0, "rank {rank} arrived in host memory but its link lands it in device memory");
+            ensure!(plane.host != 0 && landing & (1 << rank) == 0,
+                "rank {rank} arrived in host memory but its link lands it in device memory");
             ensure!(plane_bytes <= plane.bytes, "wave of {rows} rows exceeds its return slot");
-            let bytes = payload.as_ref().len();
+            let bytes = payload.len();
             let offset = upload_offset(ranks, rank, first, row_bytes, bytes, plane_bytes)?;
             // SAFETY: the slot's landing staging holds `plane.bytes` for this
             // rank (checked above); the engine stream reads it only after this
             // wave's `landed`, and the slot's next wave is posted only after
             // that read (`consumed`), so nothing else touches it now.
             let target = unsafe { std::slice::from_raw_parts_mut((plane.host + offset) as *mut u8, bytes) };
-            copy_parallel(target, payload.as_ref());
+            copy_parallel(target, payload);
             Ok(())
         })?;
-        if done {
-            ensure!(self.receipt.landed == self.landing,
-                "ranks {:#b} landed in device memory; the link expects {:#b}", self.receipt.landed, self.landing);
+        match done {
+            Some(landed) => {
+                ensure!(landed == self.landing,
+                    "ranks {landed:#b} landed in device memory; the link expects {:#b}", self.landing);
+                Ok(true)
+            }
+            None => Ok(false),
         }
-        Ok(done)
     }
 
     fn publish(&mut self, sequence: u32) {
@@ -412,7 +445,7 @@ pub(crate) struct Waves<'a> {
     library: &'a NativeLibrary,
     /// Dropped first: closing it ends the worker, joined in `Drop`.
     jobs: Option<mpsc::Sender<Command>>,
-    worker: Option<std::thread::JoinHandle<(SparkExperts, Result<()>)>>,
+    worker: Option<std::thread::JoinHandle<(Box<dyn std::any::Any + Send>, Result<()>)>>,
     /// The counters; freed only after the worker joined.
     control: HostAllocation<'a>,
     words: Words,
@@ -442,7 +475,8 @@ pub(crate) struct Waves<'a> {
 impl<'a> Waves<'a> {
     /// Starts the worker on `transport` (bootstrapped; connections open) for
     /// `intake`'s slots, staging each wave's request in `arenas` (one per slot).
-    pub(crate) fn start(library: &'a NativeLibrary, intake: Intake, transport: SparkExperts,
+    pub(crate) fn start<T: Transport>(library: &'a NativeLibrary, intake: Intake, transport: T,
+        grouping: Vec<cuteafd_transport::worker_selection::InstalledExpertGrouping>,
         arenas: Vec<StagingArena>, timing: bool) -> Result<Self> {
         let _scope = cuteafd_ffi::memory_ledger::scope("spark-intake");
         let waves = intake.waves;
@@ -462,10 +496,8 @@ impl<'a> Waves<'a> {
                     .map_or(0, |staging| staging.buffer.ptr as usize + rank * plane_bytes) })
             .collect()).collect();
         let timeout = transport.timeout();
-        // Read-only worker metadata, kept so callers need not reach the transport.
-        let grouping = transport.installed_grouping().unwrap_or_default();
         let mut native = Native { transport, arenas: arenas.clone(), words, planes, ranks: intake.ranks,
-            row_bytes: intake.row_bytes, landing: intake.landing, receipt: WaveReceipt::default() };
+            row_bytes: intake.row_bytes, landing: intake.landing };
         tracing::info!(waves, ranks = intake.ranks, landing = format!("{:#b}", intake.landing),
             staging_bytes = arenas.first().map_or(0, StagingArena::bytes), "Spark exchange worker started");
         let (jobs, inbox) = mpsc::channel();
@@ -474,10 +506,10 @@ impl<'a> Waves<'a> {
             if let Err(error) = &result {
                 cuteafd_transport::health::record_failure(format!("Spark exchange: {error:#}"));
                 tracing::error!(error = %format!("{error:#}"), "Spark exchange failed");
-                native.transport.abandon_waves("Spark exchange failed with waves in flight");
+                native.transport.abandon();
                 release_until_closed(&mut native, &inbox, highest);
             }
-            (native.transport, result)
+            (Box::new(native.transport) as Box<dyn std::any::Any + Send>, result)
         })?;
         Ok(Self { library, jobs: Some(jobs), worker: Some(worker), control, words, arenas, landing_staging,
             landing: intake.landing, planes: intake.planes, layouts: vec![None; waves], unread: vec![false; waves],
@@ -652,14 +684,15 @@ impl<'a> Waves<'a> {
     /// Stops the worker and returns the transport (after a failure, with its
     /// waves abandoned) and the slot its next wave lands in. Every sent wave
     /// must have been landed and consumed, and the consuming streams drained.
-    pub(crate) fn stop(mut self) -> Result<(SparkExperts, usize)> {
+    pub(crate) fn stop<T: Transport>(mut self) -> Result<(T, usize)> {
         ensure!(self.outstanding.is_empty() && self.unread.iter().all(|unread| !unread),
             "Spark exchange stopped with waves not landed and consumed");
         drop(self.jobs.take());
         let worker = self.worker.take().context("Spark exchange already stopped")?;
         let (transport, result) = worker.join().map_err(|_| anyhow::anyhow!("Spark exchange worker panicked"))?;
         result?;
-        Ok((transport, self.next_slot))
+        let transport = transport.downcast::<T>().map_err(|_| anyhow::anyhow!("Spark exchange transport type differs"))?;
+        Ok((*transport, self.next_slot))
     }
 }
 

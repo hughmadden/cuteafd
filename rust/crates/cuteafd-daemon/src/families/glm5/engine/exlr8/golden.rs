@@ -286,7 +286,7 @@ fn native_layer3_same_quant() -> Result<()> {
     ])?
     .engine;
     let opened = crate::families::glm5::open(&args)?;
-    opened.with_engine(&args, |engine, transport, runtime| {
+    opened.with_engine(&args, |engine, transport, _runtime| {
         let transport = transport.context("native gate needs real workers")?;
         // Retain the admitted serial workspace and drain on both success and error
         // before with_engine drops transport or native owners.
@@ -466,7 +466,7 @@ fn prefill_lanes_byte_exact(total: usize, chunk: usize, waves: usize) -> Result<
         std::env::var_os("CUTEAFD_GOLDEN_PEERS").context("real worker peers")?,
     ])?.engine;
     let opened = crate::families::glm5::open(&args)?;
-    opened.with_engine(&args, |engine, transport, runtime| {
+    opened.with_engine(&args, |engine, transport, _runtime| {
         ensure!(engine.prefill_lanes == waves
             && engine.prefill_link.borrow().as_ref().is_some_and(|link| link.waves() == waves),
             "lane exactness gate requires exactly {waves} admitted waves on the prefill link");
