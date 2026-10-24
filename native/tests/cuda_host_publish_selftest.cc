@@ -60,6 +60,9 @@ int main() {
       for (size_t i = 0; i < host.size(); ++i) host[i] = pattern(wave, s, i);
       check(cudaMemcpy(source[s], host.data(), host.size(), cudaMemcpyHostToDevice) == cudaSuccess);
     }
+    // A pageable copy may return before its DMA lands, and the publish stream does
+    // not wait for the legacy stream: the sources must be complete first.
+    check(cudaDeviceSynchronize() == cudaSuccess);
   };
   const auto enqueue = [&](size_t layer, size_t rows) {
     const void* src[3] = {source[0], source[1], source[2]};
