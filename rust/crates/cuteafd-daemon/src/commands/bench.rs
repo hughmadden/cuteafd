@@ -62,6 +62,10 @@ pub(crate) struct RunArgs {
     /// Explicit panels instead of a profile, e.g. tool_eval,prefill.
     #[arg(long, value_delimiter = ',')]
     pub(crate) panels: Option<Vec<String>>,
+    /// The /v1/models id to measure, e.g. a ready weight variant's public id.
+    /// Unlisted, unready or alias ids are refused before the run starts.
+    #[arg(long, env = "CUTEAFD_BENCH_MODEL")]
+    pub(crate) model: Option<String>,
     /// Passes per panel, e.g. tool_eval=3 (the only way to repeat a panel).
     #[arg(long)]
     pub(crate) passes: Option<String>,
@@ -144,7 +148,7 @@ pub(crate) fn run(args: BenchArgs) -> Result<()> {
                 None => Vec::new(),
             };
             let lossless_set = run.lossless_set.as_deref().map(cuteafd_bench::panels::lossless::CaseSet::load).transpose()?;
-            let options = cuteafd_bench::cli::RunOptions { url: run.url, profile: run.profile, panels: run.panels,
+            let options = cuteafd_bench::cli::RunOptions { url: run.url, profile: run.profile, panels: run.panels, model: run.model,
                 passes, baseline: None, fabric: run.fabric, export: run.export, out: run.out, label: None, root: run.root, api_key: run.api_key, quiet: false, deadline: None,
                 lossless_set, lossless_dump: run.lossless_dump, context_lengths: run.context_lengths.as_deref().map(cuteafd_bench::sweep::parse_lengths).transpose().map_err(anyhow::Error::msg)?,
                 context_levels: run.context_levels.as_deref().map(cuteafd_bench::sweep::parse_levels).transpose().map_err(anyhow::Error::msg)? };

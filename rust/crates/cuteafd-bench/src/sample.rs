@@ -85,7 +85,7 @@ pub fn report(failed: bool) -> Report {
             build: BuildInfo { version: "0.1.0".into(), release: None, image: None,
                 remote: Some("https://github.com/tpurtell/cuteafd".into()),
                 commit: Some("8facee6a1b2c3d4e5f60718293a4b5c6d7e8f901".into()), dirty: Some(false) },
-            hardware, configuration, readiness_s: Some(112.4), started: Some("2026-10-02T10:10:07Z".into()) },
+            hardware, configuration, readiness_s: Some(112.4), started: Some("2026-10-02T10:10:07Z".into()), variant: None },
         fingerprint: "3f9a2c41d07be5a1".into(), baseline: Some(baseline),
         panels: vec![PanelResult { id: "hardware".into(), title: "Hardware".into(), status: PanelStatus::Done,
             passes: vec![serde_json::json!({})], ..PanelResult::default() }],

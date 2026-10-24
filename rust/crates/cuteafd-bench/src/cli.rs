@@ -36,6 +36,9 @@ pub struct RunOptions {
     pub lossless_dump: Option<crate::panels::lossless::RowDump>,
     pub context_lengths: Option<Vec<u64>>,
     pub context_levels: Option<Vec<usize>>,
+    /// The `/v1/models` id to measure (a ready weight variant's public id);
+    /// `None`: the server's default.
+    pub model: Option<String>,
 }
 
 fn agent() -> ureq::Agent {
@@ -133,6 +136,8 @@ pub fn run(options: &RunOptions) -> Result<(Report, PathBuf)> {
     if let Some(dump) = &options.lossless_dump { body["lossless_dump"] = json!(dump); }
     if let Some(lengths) = &options.context_lengths { body["context_lengths"] = json!(lengths); }
     if let Some(levels) = &options.context_levels { body["context_levels"] = json!(levels); }
+    let model = options.model.as_deref().filter(|id| !id.is_empty());
+    if let Some(model) = model { body["model"] = json!(model); }
     let response = authorize(agent.post(&format!("{base}/v1/bench/runs")), &options.api_key)
         .send_json(body);
     let id = match response {
@@ -168,6 +173,9 @@ pub fn run(options: &RunOptions) -> Result<(Report, PathBuf)> {
                 .with_context(|| format!("run {id} on {base}")),
         },
     };
+    // A server that predates `model` ignores it and measures its default:
+    // refuse that report rather than export it under the requested id.
+    measured(&report, model)?;
     let dir = options.out.clone().unwrap_or_else(|| labeled_dir(&options.root, &report, options.label.as_deref()));
     // The report this returns is read the way every surface reads it, so the
     // run's own gate check and a run recovered from the local store after the
@@ -185,6 +193,15 @@ pub fn run(options: &RunOptions) -> Result<(Report, PathBuf)> {
         _ => bail!("the run ended {:?}: {}", report.status, report.error.clone().unwrap_or_default()),
     }
     Ok((report, dir))
+}
+
+/// The finished report measured the requested model (when one was named).
+fn measured(report: &Report, model: Option<&str>) -> Result<()> {
+    match model {
+        Some(model) if report.server.model != model => bail!("run {} measured {:?}, not the requested model {model} \
+            (the server predates per-run model selection); no exports written", report.id, report.server.model),
+        _ => Ok(()),
+    }
 }
 
 /// A followed run passed its deadline.
@@ -311,5 +328,22 @@ mod tests {
         assert_eq!(a.parent(), base.parent());
         assert!(a.file_name().unwrap().to_string_lossy().ends_with("-glm53f-exl3-min"));
         assert_eq!(super::labeled_dir(root, &report, None), base);
+    }
+
+    #[test]
+    fn a_variant_run_is_named_and_checked_against_the_request() {
+        let mut report = crate::sample::report(false);
+        let root = std::path::Path::new("/r");
+        let base = super::default_dir(root, &report);
+        assert!(super::measured(&report, None).is_ok());
+        let served = report.server.model.clone();
+        assert!(super::measured(&report, Some(&served)).is_ok());
+        assert!(super::measured(&report, Some("glm-5.3-keys")).unwrap_err().to_string().contains("predates"));
+        report.server.model = "glm-5.3-keys".into();
+        report.server.variant = Some(serde_json::json!({"name": "keys", "availability": {"state": "ready"}}));
+        assert!(super::measured(&report, Some("glm-5.3-keys")).is_ok());
+        let variant = super::default_dir(root, &report);
+        assert_ne!(variant, base, "base and variant cards of one day never share a directory");
+        assert!(variant.file_name().unwrap().to_string_lossy().contains("glm-5-3-keys"));
     }
 }

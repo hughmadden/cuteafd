@@ -235,6 +235,7 @@ pub fn server_info(model: &str) -> ServerInfo {
         configuration,
         readiness_s: context::readiness_s(),
         started: Some(crate::report::rfc3339(context::started())),
+        variant: None,
     }
 }
 

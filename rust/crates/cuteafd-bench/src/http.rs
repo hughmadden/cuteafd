@@ -171,7 +171,12 @@ async fn start(State(bench): State<Arc<Bench>>, connect: Option<ConnectInfo<Sock
     if !authorized(&bench, peer(connect), &headers) {
         return forbidden();
     }
-    match bench.start(request) {
+    // A named model is checked against /v1/models over loopback: off the runtime.
+    let started = match tokio::task::spawn_blocking(move || bench.start(request)).await {
+        Ok(started) => started,
+        Err(error) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("{error}")).into_response(),
+    };
+    match started {
         Ok(id) => (StatusCode::ACCEPTED, Json(json!({"id": id}))).into_response(),
         Err(error @ StartError::Busy(_)) => (StatusCode::CONFLICT, Json(json!({"error": {"message": error.to_string(),
             "type": "busy"}}))).into_response(),
