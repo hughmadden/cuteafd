@@ -43,9 +43,11 @@ def load_prompts(path: Path, count: int) -> list[str]:
     return prompts[:count]
 
 
-def ask(url: str, model: str, prompt: str, max_tokens: int, key: str | None) -> str:
+def ask(url: str, model: str, prompt: str, max_tokens: int, key: str | None, thinking: bool = True) -> str:
     body = {"model": model, "messages": [{"role": "user", "content": prompt}], "temperature": 0,
             "max_tokens": max_tokens, "stream": False}
+    if not thinking:
+        body["thinking"] = {"type": "disabled"}
     request = urllib.request.Request(url.rstrip("/") + "/v1/chat/completions", data=json.dumps(body).encode(),
                                      headers={"content-type": "application/json",
                                               **({"authorization": f"Bearer {key}"} if key else {})})
@@ -65,6 +67,7 @@ def main() -> int:
     parser.add_argument("--count", type=int, default=50)
     parser.add_argument("--max-tokens", type=int, default=256)
     parser.add_argument("--api-key-file", type=Path)
+    parser.add_argument("--no-thinking", action="store_true", help="answer directly (the reply lands in content)")
     parser.add_argument("--out", type=Path)
     args = parser.parse_args()
     key = args.api_key_file.read_text().strip() if args.api_key_file else None
@@ -73,7 +76,7 @@ def main() -> int:
     for i, prompt in enumerate(prompts):
         row = {"index": i}
         for side, model, url in (("base", args.base, args.url), ("variant", args.variant, args.variant_url or args.url)):
-            text = ask(url, model, prompt, args.max_tokens, key)
+            text = ask(url, model, prompt, args.max_tokens, key, not args.no_thinking)
             row[side] = {"refused": refused(text), "text": text[:400]}
             counts[side] += row[side]["refused"]
         rows.append(row)
