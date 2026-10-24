@@ -559,6 +559,7 @@ fn constrained_calls_use_the_m3_namespace_form() {
     let tags = &format["content"]["elements"][1];
     assert_eq!((tags["type"].as_str(), tags["separator"].as_str(), tags["stop_after_first"].as_bool()),
         (Some("tags_with_separator"), Some("\n"), Some(false)));
+    for at in [0, 2] { assert_eq!(format["content"]["elements"][at]["pattern"], "[ \\n\\t]{0,16}"); }
     assert_eq!(tags["tags"][0]["begin"], "]<]minimax[>[<invoke name=\"get_weather\">");
     assert_eq!(tags["tags"][0]["end"], INVOKE_CLOSE);
     assert_eq!(tags["tags"][0]["content"]["type"], "grammar");

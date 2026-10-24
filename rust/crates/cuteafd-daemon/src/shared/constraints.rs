@@ -336,6 +336,87 @@ mod tests {
         }
     }
 
+    /// MiniMax M3's structural tags (namespaced invokes over generated EBNF, the
+    /// thinking-mode prefix, bounded block whitespace) compile in XGrammar and
+    /// accept the calls the checkpoint's own template renders, while keeping the
+    /// namespace out of values and refusing undeclared tools.
+    #[tokio::test]
+    async fn minimax_m3_constraints_compile_and_match_rendered_calls() {
+        use cuteafd_api::openai::{self, chat::minimax_m3::{MiniMaxEncoding, MiniMaxTokenIds, CALL_OPEN, CALL_CLOSE, NS},
+            ModelEncoding, ModelProfile, NativeLimits, NativeRequest};
+        use axum::{body::Body, http::Request};
+        use serde_json::{json, Value};
+        use tower::ServiceExt;
+        let Some(path) = std::env::var_os("CUTEAFD_NATIVE_LIB") else {
+            eprintln!("skipping: CUTEAFD_NATIVE_LIB is not set");
+            return;
+        };
+        // SAFETY: the test retains this native DSO until all matchers are gone.
+        let library = unsafe { NativeLibrary::load(path).unwrap() };
+        let goldens: Vec<Value> = serde_json::from_str(include_str!(concat!(env!("CARGO_MANIFEST_DIR"),
+            "/../cuteafd-api/src/openai/chat/minimax_m3/fixtures/template_goldens.json"))).unwrap();
+        let round_trip = goldens.iter().find(|case| case["name"] == "tool_round_trip").unwrap();
+        let rendered = round_trip["expected"].as_str().unwrap();
+        // After the system prompt's own example, the history holds two blocks:
+        // two parallel weather calls, then a file write.
+        let history = &rendered[rendered.find("]~b]ai\n").unwrap()..];
+        let blocks: Vec<&str> = history.match_indices(CALL_OPEN)
+            .map(|(at, _)| &history[at..at + history[at..].find(CALL_CLOSE).unwrap() + CALL_CLOSE.len()]).collect();
+        assert_eq!(blocks.len(), 2);
+        let (weather, write) = (blocks[0], blocks[1]);
+        // One token per character makes every namespace, tag and marker span tokens.
+        let mut chars: Vec<char> = (' '..='~').chain(['\n', '\t']).chain(rendered.chars()).collect();
+        chars.sort_unstable();
+        chars.dedup();
+        let eos = chars.len() as u32;
+        let mut vocab: serde_json::Map<String, Value> = chars.iter().enumerate().map(|(id, c)| (c.to_string(), json!(id))).collect();
+        vocab.insert("<eos>".into(), json!(eos));
+        let temp = tempfile::tempdir().unwrap();
+        let tokenizer = temp.path().join("tokenizer.json");
+        std::fs::write(&tokenizer, json!({"version":"1.0", "added_tokens":[],
+            "model":{"type":"WordLevel", "vocab":vocab, "unk_token":"?"}}).to_string()).unwrap();
+        let template = include_str!(concat!(env!("CARGO_MANIFEST_DIR"),
+            "/../cuteafd-api/src/openai/chat/minimax_m3/fixtures/chat_template.jinja"));
+        let encoding = Arc::new(MiniMaxEncoding::new(template, MiniMaxTokenIds { eos: vec![200_020], think_close: 200_060,
+            image: 200_025, video: 200_026, turn_markers: vec![200_019, 200_034] }).unwrap());
+        let padded = |n: usize| format!("{CALL_OPEN}{}{}", "\n".repeat(n), &weather[CALL_OPEN.len() + 1..]);
+        let in_value = weather.replacen("Taipei", &format!("Tai{NS}pei"), 1);
+        let undeclared = weather.replace("get_weather", "get_wether");
+        let cases = [
+            ("disabled", "required", vec![weather.to_owned(), write.to_owned(), padded(16)],
+                vec![format!("Checking.\n{weather}"), padded(17), in_value, undeclared.clone()]),
+            ("adaptive", "required", vec![weather.to_owned(), format!("</mm:think>{weather}"), format!("<mm:think>Two lookups.</mm:think>{write}")],
+                vec![format!("Two lookups.</mm:think>{weather}")]),
+            // The prompt opened the block: the output must close it before the calls.
+            ("enabled", "required", vec![format!("Two lookups.</mm:think>{weather}"), format!("</mm:think>{write}")],
+                vec![weather.to_owned()]),
+            ("adaptive", "auto", vec!["No tools needed.".to_owned(), format!("<mm:think>r</mm:think>Checking.\n{weather}")],
+                vec![format!("Checking.\n{undeclared}")]),
+        ];
+        let mut compiler = Compiler::with_vocab(&library, tokenizer, chars.len() + 1, vec![eos]);
+        for (thinking, choice, accepted, refused) in cases {
+            let (tx, mut rx) = tokio::sync::mpsc::channel::<NativeRequest>(1);
+            let profile = ModelProfile::new("minimax-fixture", ModelEncoding::MiniMaxM3(encoding.clone()));
+            let app = openai::router_for_model(tx, NativeLimits::default(), Arc::new(std::sync::Mutex::new(Value::Null)),
+                std::time::Duration::from_secs(25), openai::ConsoleHub::disabled(), profile);
+            let body = json!({"model":"minimax-fixture", "messages":[{"role":"user","content":"Weather?"}],
+                "tools":round_trip["context"]["tools"], "tool_choice":choice, "thinking":{"type":thinking},
+                "tool_decoding_assistance":true});
+            let task = tokio::spawn(async move { app.oneshot(Request::post("/v1/chat/completions")
+                .header("content-type","application/json").body(Body::from(body.to_string())).unwrap()).await.unwrap() });
+            let request = tokio::time::timeout(std::time::Duration::from_secs(10), rx.recv()).await.unwrap().unwrap();
+            let spec = request.constraint.as_ref().unwrap();
+            for (text, expected) in accepted.iter().map(|t| (t, true)).chain(refused.iter().map(|t| (t, false))) {
+                let mut state = compiler.matcher(spec).unwrap();
+                let matched = text.chars().all(|c| state.accept(chars.binary_search(&c).unwrap() as u32).is_ok())
+                    && state.matcher.is_completed().unwrap() && state.accept(eos).is_ok();
+                assert_eq!(matched, expected, "thinking={thinking} tool_choice={choice}: {text:?}");
+            }
+            task.abort();
+            let _ = task.await;
+        }
+    }
+
     /// The XGrammar matcher's mask buffer is reused across rows and
     /// `fill_bitmask` returns whether that row needs a mask at all. A row whose
     /// grammar allows every token must be recorded as `None`; recording the

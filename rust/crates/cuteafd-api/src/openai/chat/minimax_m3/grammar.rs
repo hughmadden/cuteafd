@@ -36,11 +36,12 @@ pub(crate) fn invocation(name: &str) -> Value {
         "content":{"type":"grammar","grammar":grammar},"end":INVOKE_CLOSE})
 }
 
+/// Whitespace inside the block is bounded as DSML's is, so greedy decoding cannot loop on it.
 pub(crate) fn calls(tags: Vec<Value>, parallel: bool) -> (Value, Value) {
     let calls = json!({"type":"tag","begin":CALL_OPEN,"content":{"type":"sequence","elements":[
-        {"type":"regex","pattern":"[ \\n\\t]*"},
+        {"type":"regex","pattern":"[ \\n\\t]{0,16}"},
         {"type":"tags_with_separator","tags":tags,"separator":"\n","at_least_one":true,"stop_after_first":!parallel},
-        {"type":"regex","pattern":"[ \\n\\t]*"}]},"end":CALL_CLOSE});
+        {"type":"regex","pattern":"[ \\n\\t]{0,16}"}]},"end":CALL_CLOSE});
     let triggered = json!({"type":"triggered_tags","triggers":[CALL_OPEN],"tags":[calls.clone()],
         "at_least_one":false,"stop_after_first":true});
     (calls, triggered)
