@@ -479,9 +479,8 @@ pub(crate) async fn run_golden(args: GoldenArgs) -> Result<()> {
         expert_workspace:workspace, headroom:2 << 30, ..Default::default()};
     reservations.startup = reservations.fixed_bytes(&ledger)?.checked_add(admission::scale_prep_staging_bytes(&weights))
         .context("MiniMax golden startup admission overflow")?;
-    let (free, total) = library.cuda_memory_info()?;
-    let available = cuteafd_ffi::coordinator_gpu_budget().map_or(free as u64,
-        |b| (free as u64).min(b.0.saturating_sub((total - free) as u64)));
+    // The coordinator GPU budget is already applied to the free bytes it reports.
+    let available = library.cuda_memory_info()?.0 as u64;
     let pool_tokens = if args.check_prefix {(context as u64).max(128) * 3 + 256} else {context as u64};
     let admitted = admission::admit(&cfg, sizing, &ledger, reservations, available, Some(pool_tokens), Qwen4KvCache::Fp8)?;
     if !remote.is_empty() {

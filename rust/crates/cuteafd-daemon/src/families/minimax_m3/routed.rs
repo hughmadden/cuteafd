@@ -181,11 +181,13 @@ impl<'a> ExpertExecutor<'a> for Routed<'a> {
 
 #[cfg(test)]
 mod tests {
-    use cuteafd_loader::families::minimax_m3::reference;
+    use cuteafd_core::dense_attention::{RouterBiasOrder, SigmoidRouter};
     #[test] fn minimax_router_selects_with_bias_and_weights_without_bias() {
         let logits=[-1.0f32,0.0,1.0,2.0,3.0];
         let bias=[10.0f32,0.0,0.0,0.0,0.0];
-        let selected=reference::route(&logits,&bias,4,2.0);
+        // The minimax_route program's arithmetic: plain-sum renormalization, routed scale 2.
+        let router=SigmoidRouter { topk:4, factor:2.0, epsilon:0.0, bias_order:RouterBiasOrder::GatherOriginal };
+        let selected=router.evaluate(&logits,&bias).unwrap();
         assert_eq!(selected.iter().map(|(id,_)|*id).collect::<Vec<_>>(),[0,4,3,2]);
         let scores:Vec<_>=logits.iter().map(|x|1.0/(1.0+(-x).exp())).collect();
         let total:f32=selected.iter().map(|(id,_)|scores[*id]).sum();

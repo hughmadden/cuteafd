@@ -192,7 +192,6 @@ pub(super) struct Execution<'a> {
     poisoned:std::cell::Cell<bool>,
     diagnostics:std::cell::RefCell<Option<Diagnostics>>,
     draft:Option<super::dspark::Dspark<'a>>,
-    draft_causal:bool,
     graphs:std::cell::RefCell<StepGraphs<'a>>,
 }
 impl<'a> Execution<'a> {
@@ -237,13 +236,13 @@ impl<'a> Execution<'a> {
             verify:matches!(std::env::var("CUTEAFD_MINIMAX_GRAPH_VERIFY").as_deref(),Ok("1")),replays:0});
         Ok(Self{native,head,weights,scratch,cfg:cfg.clone(),rows,lane_rows:sizing.rows,lanes:sizing.lanes,program_rows,
             logit_rows,context,decode_rows,extend_rows,table_stride,
-            poisoned:std::cell::Cell::new(false),diagnostics,draft:None,draft_causal:false,graphs})
+            poisoned:std::cell::Cell::new(false),diagnostics,draft:None,graphs})
     }
     pub fn load_draft(&mut self, contract:&cuteafd_loader::families::minimax_m3::dspark::DsparkContract,
         layout:super::dspark::Layout)->Result<()> {
+        // The released drafter attends its block noncausally from the anchor.
         ensure!(contract.sample_from_anchor && !contract.causal,MiniMaxError::Unsupported("draft mask or anchor mode"));
         self.draft=Some(self.native.device().run(|| super::dspark::Dspark::load(&self.native,contract,layout))?);
-        self.draft_causal=contract.causal;
         Ok(())
     }
     pub fn draft(&self)->Result<&super::dspark::Dspark<'a>> { self.draft.as_ref().context("MiniMax drafter not admitted") }
@@ -266,7 +265,7 @@ impl<'a> Execution<'a> {
             MiniMaxError::Invalid("draft RoPE extent"));
         self.native.device().run(|| {
             let mut guard=self.native.cancellation_guard("MiniMax draft step");
-            let result=self.draft()?.propose(&self.native,&self.scratch,embedding,&self.head,&self.weights,seqs,self.draft_causal);
+            let result=self.draft()?.propose(&self.native,&self.scratch,embedding,&self.head,&self.weights,seqs);
             if result.is_err() {
                 self.poisoned.set(true);
                 let drained=self.native.drain();

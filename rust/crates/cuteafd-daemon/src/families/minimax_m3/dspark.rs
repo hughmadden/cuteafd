@@ -158,7 +158,7 @@ impl<'a> Dspark<'a> {
     }
     #[allow(clippy::too_many_arguments)]
     pub fn propose(&self,n:&Native<'a>,s:&Scratch<'a>,embedding:&TokenEmbedding<'a>,head:&TargetHeadOwner<'a>,
-        target:&Weights<'a>,seqs:&[DraftSeq],causal:bool)->Result<Vec<Draft>> {
+        target:&Weights<'a>,seqs:&[DraftSeq])->Result<Vec<Draft>> {
         let count=seqs.len();
         ensure!(count>0 && count<=self.layout.sequences,MiniMaxError::Invalid("draft batch"));
         let rows=count*BLOCK;
@@ -190,7 +190,7 @@ impl<'a> Dspark<'a> {
             let max_keys=tables[count..2*count].iter().copied().max().unwrap() as usize+BLOCK;
             draft_attention(n,s.get("q_norm")?,s.get("k_norm")?,s.get("v")?,key.buffer,value.buffer,
                 (self.get("tables")?,&tables),s.get("attention")?,self.get("attention_workspace")?,count,BLOCK,
-                self.layout.slots,WINDOW,max_keys,causal)?;
+                self.layout.slots,WINDOW,max_keys)?;
             self.linear(n,s,layer,"o","self_attn.o_proj",s.get("attention")?,s.get("delta")?,rows)?;
             n.widen(self.get("input")?,s.get("residual")?,rows*H)?;
             n.launch("minimax_residual", &[s.get("residual")?,s.get("delta")?,s.get("residual")?], &[Scalar::I32(rows as i32)])?;
@@ -329,8 +329,7 @@ fn bf16_linear(n: &Native<'_>, input: CuteafdDeviceBuffer, weight: CuteafdDevice
 fn draft_attention(n: &Native<'_>, q: CuteafdDeviceBuffer, k: CuteafdDeviceBuffer, v: CuteafdDeviceBuffer,
     context_k: CuteafdDeviceBuffer, context_v: CuteafdDeviceBuffer, tables: (CuteafdDeviceBuffer, &[i32]),
     output: CuteafdDeviceBuffer, workspace: CuteafdDeviceBuffer, sequences: usize, block: usize, slots: usize,
-    capacity: usize, max_keys: usize, causal: bool) -> Result<()> {
-    ensure!(!causal, MiniMaxError::Invalid("MiniMax draft attention is noncausal"));
+    capacity: usize, max_keys: usize) -> Result<()> {
     attention_tables(tables.1,sequences,block,slots,capacity,max_keys)?;
     let rows=extent(&[sequences,block])?;
     let q_bytes=extent(&[rows,HEADS,HEAD_DIM,2])?;

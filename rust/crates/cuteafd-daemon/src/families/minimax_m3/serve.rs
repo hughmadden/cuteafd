@@ -21,8 +21,6 @@ pub(crate) struct ServeArgs {
     manifest: PathBuf,
     #[arg(long, default_value_t = 0)]
     device: i32,
-    #[arg(long)]
-    split_device: Option<i32>,
     #[arg(long, value_delimiter = ',')]
     peers: Vec<SocketAddr>,
     #[arg(long, default_value_t = 108 << 30)]
@@ -91,7 +89,6 @@ pub(crate) struct ServeArgs {
 }
 impl ServeArgs {
     pub(crate) fn validate(&self) -> Result<Option<usize>> {
-        if self.split_device.is_some() { return Err(MiniMaxError::Unsupported("two-GPU head split").into()); }
         if self.device < 0 || !matches!(self.peers.len(), 2 | 3 | 4)
             || self.peers.iter().enumerate().any(|(i, p)| self.peers[..i].contains(p)) {
             return Err(MiniMaxError::Invalid("one coordinator and distinct TP2/TP3/TP4 peers required").into());
@@ -249,11 +246,10 @@ fn worker(args: &ServeArgs, receive: &mut tokio::sync::mpsc::Receiver<cuteafd_ap
         cuteafd_loader::formats::fp8_experts::ExpertFormat::Nvfp4);
     let local_package = package.join("manifest.json");
     let local_package = local_package.is_file().then(|| cuteafd_loader::plan::checkpoint::read_json(&local_package)).transpose()?;
+    // The coordinator GPU budget is already applied to the free bytes it reports.
     let available = || -> Result<u64> {
         library.cuda_set_device(args.device)?;
-        let (free, total) = library.cuda_memory_info()?;
-        Ok(cuteafd_ffi::coordinator_gpu_budget().map_or(free as u64, |b|
-            (free as u64).min(b.0.saturating_sub((total - free) as u64))))
+        Ok(library.cuda_memory_info()?.0 as u64)
     };
     let remote = crate::shared::vision::startup::RemotePeers::parse(args.vision, args.vision_peers.as_deref(),
         args.encoder_plan_hash.as_deref(), args.encoder_revision.as_deref())?;
@@ -358,8 +354,7 @@ mod tests {
     #[test]
     fn minimax_unsupported_modes_fail_before_native_load() {
         assert_eq!(args().validate().unwrap(), None);
-        let mut a=args(); a.split_device=Some(1); assert!(a.validate().unwrap_err().downcast_ref::<MiniMaxError>().is_some());
-        let mut a=args(); a.kv_cache=Qwen4KvCache::Bf16; assert!(a.validate().is_err());
+        let mut a=args(); a.kv_cache=Qwen4KvCache::Bf16; assert!(a.validate().unwrap_err().downcast_ref::<MiniMaxError>().is_some());
         let mut a=args(); a.speculator="mtp".into(); assert!(a.validate().is_err());
         assert_eq!(args().speculator,"dspark");
         let mut a=args(); a.speculator="off".into(); assert!(a.validate().is_ok());

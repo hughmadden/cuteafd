@@ -5,7 +5,6 @@
 pub mod cache;
 pub mod config;
 pub mod dspark;
-pub mod reference;
 
 /// The release's compiled context (`max_position_embeddings`).
 pub const COMPILED_CONTEXT: usize = 1 << 20;
