@@ -183,7 +183,7 @@ impl ReplyPoster<'_> {
     /// Posts `reply`, the `sequence`-th frame that consumes a coordinator
     /// receive (write mode never does; its sequence is unused).
     fn post(&mut self, reply: Reply, sequence: u64) -> Result<()> {
-        self.sends.posted_request()?;
+        self.sends.posted_request(None)?;
         match reply {
             Reply::Send { offset, bytes, wr_id } => {
                 let (parts, chunked) = request_write::reply_parts(self.target.as_ref(), self.watermark, sequence,
@@ -1067,7 +1067,7 @@ mod deferred_tests {
         // owns one slot until its head is posted and every WR completed.
         let mut sends = SendQueue::default();
         for parts in [101, 1] {
-            sends.posted_request().unwrap();
+            sends.posted_request(None).unwrap();
             for part in 0..parts { sends.posted_part(part + 1 == parts).unwrap(); }
         }
         let free = |sends: &SendQueue, held: usize, depth: usize| sends.requests_in_flight() + held < depth;
