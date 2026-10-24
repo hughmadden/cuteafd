@@ -38,6 +38,8 @@ mod protocol_v2_tcp;
 mod synthetic;
 mod verbs;
 pub use verbs::set_verbs_host_native_library_path;
+pub use verbs::{set_spark_chunking, spark_chunking, SparkChunking, DEFAULT_REQUEST_CHUNK_BYTES, MAX_CHUNK_BYTES,
+    MIN_CHUNK_BYTES};
 
 pub use capabilities::{
     VERBS_HOST_APP_TRANSPORT_BLOCKER, VERBS_HOST_APP_TRANSPORT_STATUS,

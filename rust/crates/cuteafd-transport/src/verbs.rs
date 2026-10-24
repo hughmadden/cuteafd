@@ -1,5 +1,7 @@
 mod registered_response;
 mod request_write;
+pub use request_write::{set_spark_chunking, spark_chunking, SparkChunking, DEFAULT_REQUEST_CHUNK_BYTES,
+    MAX_CHUNK_BYTES, MIN_CHUNK_BYTES};
 mod landing;
 pub use landing::{gpu_landing_probe, DeviceLanding, DeviceWriteTarget, GpuLandingProbe};
 use registered_response::{RegisteredResponseFrame, RegisteredResponseRing};
@@ -30,7 +32,7 @@ use std::time::{Duration, Instant};
 use crate::synthetic::{expert_response_from_protocol_v2_response, protocol_v2_request_from_expert_request, ProtocolV2ExecutorResponseRef, ProtocolV2ExpertExecutor, ProtocolV2RequestDevicePayload, SyntheticRouteExecutor};
 use crate::{is_connection_closed, verbs_host_preflight, ExpertProtocolV2FrameBuffer, ExpertProtocolV2Request, ExpertProtocolV2RequestView, ExpertProtocolV2Response, ExpertProtocolV2ResponseHeader, ExpertProtocolV2ResponseView, ExpertProtocolV2Status, ExpertV2Dtype, TcpTransportConfig, EXPERT_PROTOCOL_V2_REQUEST_HEADER_LEN, EXPERT_PROTOCOL_V2_RESPONSE_DEBUG_HEADER_LEN, EXPERT_PROTOCOL_V2_RESPONSE_HEADER_LEN};
 
-const PERSISTENT_CONTROL_VERSION: u32 = 5;
+const PERSISTENT_CONTROL_VERSION: u32 = 6;
 const PERSISTENT_CONTROL_LIMIT: usize = 64 * 1024;
 
 fn decode_persistent_control<T: DeserializeOwned>(value: serde_json::Value) -> Result<T> {
@@ -1819,6 +1821,8 @@ struct VerbsHostProtocolV2PersistentClientSession {
     request_credits: request_write::Credits,
     /// The worker's request ring for WRITE tails (capacity above one chunk).
     request_target: Option<request_write::Target>,
+    /// The link's chunk sizes, sent to the worker in the persistent start.
+    chunking: request_write::SparkChunking,
     response_recv_sequence: usize,
     request_frame: ExpertProtocolV2FrameBuffer,
     response_frame_pool: Vec<Vec<u8>>,
@@ -2072,7 +2076,8 @@ impl VerbsHostProtocolV2PersistentClientSession {
         execution_lane: u32,
         cq_harvester: Option<Arc<VerbsHostProtocolV2CqHarvester>>,
     ) -> Result<Self> {
-        Self::connect_impl(addr, config, request, execution_lane, cq_harvester, false, None, false, None, None, 0, None, None)
+        Self::connect_impl(addr, config, request, execution_lane, cq_harvester, false, None, false, None, None, 0, None, None,
+            request_write::spark_chunking())
     }
 
     /// `flow_label`: both QPs' RoCE v2 flow label (0: the kernel's own).
@@ -2081,9 +2086,9 @@ impl VerbsHostProtocolV2PersistentClientSession {
                      request: &ExpertProtocolV2Request, landing: Option<DeviceLanding>,
                      egress: Option<&Arc<egress::EgressBuffer>>, write: Option<DeviceWriteTarget>,
                      terminal_owner: Option<Arc<AtomicBool>>, flow_label: u32, capacity: Option<u32>,
-                     model_endpoint: Option<u32>) -> Result<Self> {
+                     model_endpoint: Option<u32>, chunking: request_write::SparkChunking) -> Result<Self> {
         let mut session = Self::connect_impl(addr, config, request, 0, None, true, landing, egress.is_some(), write,
-            terminal_owner, flow_label, capacity, model_endpoint)?;
+            terminal_owner, flow_label, capacity, model_endpoint, chunking)?;
         if let Some(buffer) = egress {
             let host = buffer.host();
             // SAFETY: the buffer is pinned host memory kept alive by the Arc
@@ -2103,8 +2108,8 @@ impl VerbsHostProtocolV2PersistentClientSession {
                     cq_harvester: Option<Arc<VerbsHostProtocolV2CqHarvester>>,
                     retain_final_response: bool, landing: Option<DeviceLanding>, gathered_sends: bool,
                     write: Option<DeviceWriteTarget>, terminal_owner: Option<Arc<AtomicBool>>,
-                    flow_label: u32, capacity: Option<u32>, model_endpoint: Option<u32>)
-                    -> Result<Self> {
+                    flow_label: u32, capacity: Option<u32>, model_endpoint: Option<u32>,
+                    chunking: request_write::SparkChunking) -> Result<Self> {
         let admitted = crate::worker_selection::reserve_peer_endpoint(addr, &request.header, capacity, model_endpoint)?;
         verbs_host_preflight()?;
         let native_path = verbs_host_native_library_path().context(
@@ -2153,6 +2158,7 @@ impl VerbsHostProtocolV2PersistentClientSession {
                 // A landing receive scatters header and payload, a gathered
                 // send gathers them (two entries each).
                 if landing.is_some() || gathered_sends { 2 } else { 1 },
+                chunking.request,
             )?
         } else {
             NativeRdmaEndpoint::create_from_wire_bytes_on_device(
@@ -2186,6 +2192,7 @@ impl VerbsHostProtocolV2PersistentClientSession {
             flow_label,
             worker_selection_digest: crate::worker_selection::peer_selection_digest(addr)?,
             model_endpoint,
+            chunking,
         };
         write_control(&mut stream, &start)?;
         let ready: VerbsHostProtocolV2PersistentReady = decode_persistent_control(read_control_value(&mut reader)?)?;
@@ -2239,7 +2246,8 @@ impl VerbsHostProtocolV2PersistentClientSession {
                 ready.server_native_endpoint.status
             );
         }
-        anyhow::ensure!(ready.request_target.is_some() == request_write::needs_target(request_capacity_wire_bytes),
+        anyhow::ensure!(ready.request_target.is_some()
+            == request_write::needs_target(request_capacity_wire_bytes, chunking.request),
             "worker request WRITE target does not match request capacity {request_capacity_wire_bytes}");
         if let Some(target) = ready.request_target {
             anyhow::ensure!(target.address != 0, "worker exposed a null request WRITE target");
@@ -2264,7 +2272,7 @@ impl VerbsHostProtocolV2PersistentClientSession {
         // Replies above one chunk WRITE their tail into the receive they will
         // complete: tell the worker where receive `s` lands. Write mode has
         // no receives; its replies already go straight to the client's plane.
-        let reply_target = if !write_mode && request_write::needs_target(response_capacity_wire_bytes) {
+        let reply_target = if !write_mode && request_write::needs_target(response_capacity_wire_bytes, chunking.reply) {
             let (address, rkey) = library.rdma_rc_endpoint_request_target(endpoint.info.handle)?;
             let landing = match (gpu_landing, landing) {
                 (true, Some(landing)) => {
@@ -2304,6 +2312,7 @@ impl VerbsHostProtocolV2PersistentClientSession {
             request_sends: Default::default(),
             request_credits: Default::default(),
             request_target: ready.request_target,
+            chunking,
             response_recv_sequence: 0,
             request_frame: ExpertProtocolV2FrameBuffer::with_capacity(request_capacity_wire_bytes),
             response_frame_pool: vec![Vec::new()],
@@ -3345,6 +3354,10 @@ struct VerbsHostProtocolV2PersistentStart {
     /// Index in the coordinator's sealed endpoint set; not an execution lane.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     model_endpoint: Option<u32>,
+    /// The coordinator's request and reply chunk sizes: the worker sizes its
+    /// reply send queue and splits its replies with these, never its own.
+    /// TEMPORARY: remove after PFC test (TJ 2026-10-25).
+    chunking: request_write::SparkChunking,
 }
 
 /// Client to worker after the client QP is connected and its receives are
@@ -3467,6 +3480,7 @@ impl NativeRdmaEndpoint {
             VERBS_HOST_RDMA_RING_DEPTH as u32,
             rdma_device,
             1,
+            None,
         )
     }
 
@@ -3480,6 +3494,7 @@ impl NativeRdmaEndpoint {
         response_registered_span_bytes: usize,
         local_psn: u32,
         rdma_device: Option<&crate::fabric::RdmaSelection>,
+        send_chunk: Option<usize>,
     ) -> Result<Self> {
         Self::create_from_wire_bytes_with_buffer_flags(
             library,
@@ -3493,6 +3508,7 @@ impl NativeRdmaEndpoint {
             8,
             rdma_device,
             1,
+            send_chunk,
         )
     }
 
@@ -3508,6 +3524,7 @@ impl NativeRdmaEndpoint {
         ring_depth: usize,
         rdma_device: Option<&crate::fabric::RdmaSelection>,
         max_sge: u32,
+        send_chunk: Option<usize>,
     ) -> Result<Self> {
         let queue_depth = u32::try_from(ring_depth.max(VERBS_HOST_RDMA_RING_DEPTH))
             .context("mapped RDMA ring depth exceeds u32")?;
@@ -3523,6 +3540,7 @@ impl NativeRdmaEndpoint {
             queue_depth,
             rdma_device,
             max_sge,
+            send_chunk,
         )
     }
 
@@ -3539,6 +3557,7 @@ impl NativeRdmaEndpoint {
         queue_depth: u32,
         rdma_device: Option<&crate::fabric::RdmaSelection>,
         max_sge: u32,
+        send_chunk: Option<usize>,
     ) -> Result<Self> {
         let (send_frame_bytes, recv_frame_bytes, send_span, recv_span) = match role {
             "client" => (
@@ -3556,7 +3575,9 @@ impl NativeRdmaEndpoint {
             other => bail!("unsupported verbs-host RDMA endpoint role: {other}"),
         };
         let rdma_device = rdma_device.context("RDMA endpoint requires an address-selected device/port/GID")?;
-        let send_depth = request_write::send_queue_depth(queue_depth, send_frame_bytes)?;
+        // `send_chunk`: the WRITE part size of this endpoint's chunked send
+        // frames (requests on a client, replies on a server), `None` unchunked.
+        let send_depth = request_write::send_queue_depth(queue_depth, send_frame_bytes, send_chunk)?;
         let info = library.rdma_rc_endpoint_create_on_gid_with_buffer_flags(
             &rdma_device.device, rdma_device.port, rdma_device.gid_index, local_psn,
             send_frame_bytes, recv_frame_bytes, send_span, recv_span,
@@ -3922,7 +3943,7 @@ impl VerbsHostMappedRdmaRing {
         let endpoint = NativeRdmaEndpoint::create_from_wire_bytes_mapped_for_ring_on_device(
             Arc::clone(&library), "client", layout.slot_capacity_bytes, layout.slot_capacity_bytes,
             layout.registered_span_bytes, layout.registered_span_bytes, next_local_psn("client"),
-            layout.depth, rdma_device, 1,
+            layout.depth, rdma_device, 1, None,
         )?;
         let mut reader = BufReader::new(stream.try_clone()?);
         write_control(
@@ -3991,7 +4012,7 @@ impl VerbsHostMappedRdmaRing {
             layout.registered_span_bytes,
             next_local_psn("server"),
             layout.depth,
-            rdma_device.as_ref(), 1,
+            rdma_device.as_ref(), 1, None,
         )?;
         endpoint.connect(&start.client_native_endpoint)?;
         for slot in 0..layout.depth {

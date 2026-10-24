@@ -27,6 +27,9 @@ pub(crate) struct LocalTp4Client {
     /// Shared registered request buffer (zero-copy egress).
     egress: Option<Arc<super::egress::EgressBuffer>>,
     egress_slot: usize,
+    /// Request and reply chunk sizes every session of this client opens with
+    /// (the process's installed sizes). TEMPORARY: remove after PFC test (TJ 2026-10-25).
+    chunking: super::request_write::SparkChunking,
     /// Optional terminal contract. A failed temporary/persistent endpoint
     /// publishes into this witness before its external landing owner drops.
     terminal_owner: Option<Arc<AtomicBool>>,
@@ -63,6 +66,7 @@ impl LocalTp4Client {
             write: vec![None; world],
             egress: None,
             egress_slot: 0,
+            chunking: super::request_write::spark_chunking(),
             terminal_owner: None,
             terminal_failed: false,
             terminal_quiesced: false,
@@ -89,6 +93,11 @@ impl LocalTp4Client {
         Ok(())
     }
     pub(crate) fn max_waves(&self) -> usize { self.max_waves }
+    /// Sessions opened from here on use `chunking` (tests compare sizes on one process).
+    #[cfg(test)]
+    pub(crate) fn set_chunking(&mut self, chunking: super::request_write::SparkChunking) {
+        self.chunking = chunking;
+    }
     pub(crate) fn timeout(&self) -> Duration { self.config.timeout }
     pub(crate) fn open_waves(&self) -> usize { self.waves.len() }
 
@@ -137,7 +146,7 @@ impl LocalTp4Client {
         self.sessions[rank] = Some(VerbsHostProtocolV2PersistentClientSession::connect_local(
             self.peers[rank], &self.config, request, landing,
             if egress { self.egress.as_ref() } else { None },
-            self.write[rank], self.terminal_owner.clone(), flow_label, capacity, self.model_endpoint)?);
+            self.write[rank], self.terminal_owner.clone(), flow_label, capacity, self.model_endpoint, self.chunking)?);
         self.retain_grouping(rank)
     }
 

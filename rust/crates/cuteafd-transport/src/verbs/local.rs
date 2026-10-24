@@ -142,10 +142,11 @@ fn read_reply_target(reader: &mut BufReader<TcpStream>, start: &VerbsHostProtoco
     anyhow::ensure!(reply.message == "protocol_v2_reply_target", "expected protocol_v2_reply_target, got {}",
         reply.message);
     anyhow::ensure!(reply.target.is_some() == (start.write_target.is_none()
-        && request_write::needs_target(start.response_capacity_wire_bytes)),
+        && request_write::needs_target(start.response_capacity_wire_bytes, start.chunking.reply)),
         "coordinator reply target does not match response capacity {}", start.response_capacity_wire_bytes);
     if let Some(target) = &reply.target {
-        target.validate(response_ring.slot_capacity_bytes)?;
+        let chunk = start.chunking.reply.context("a reply target without a reply chunk size")?;
+        target.validate(response_ring.slot_capacity_bytes, chunk)?;
         anyhow::ensure!(target.depth == response_ring.depth, "coordinator reply ring depth differs from the start");
     }
     Ok(reply.target)
@@ -179,6 +180,8 @@ struct ReplyPoster<'a> {
     target: Option<request_write::ReplyTarget>,
     watermark: Option<u32>,
     capacity: usize,
+    /// The coordinator's reply chunk size (`None`: every reply one SEND).
+    chunk: Option<usize>,
     uncovered: &'a mut u64,
 }
 impl ReplyPoster<'_> {
@@ -205,8 +208,8 @@ impl ReplyPoster<'_> {
         match reply {
             Reply::Send { offset, bytes, wr_id } => {
                 let (parts, chunked) = request_write::reply_parts(self.target.as_ref(), self.watermark, sequence,
-                    bytes, self.capacity)?;
-                if !chunked && bytes > request_write::CHUNK_BYTES && self.target.is_some() {
+                    bytes, self.capacity, self.chunk)?;
+                if !chunked && self.chunk.is_some_and(|chunk| bytes > chunk) && self.target.is_some() {
                     *self.uncovered += 1;
                     if self.uncovered.is_power_of_two() {
                         tracing::debug!(uncovered = *self.uncovered, sequence, bytes,
@@ -238,8 +241,8 @@ impl ReplyPoster<'_> {
                 anyhow::ensure!(bytes as u64 <= target.plane_bytes, "written response exceeds the client's plane");
                 // Rows to the plane in chunks, then the flag alone, last: RC
                 // orders it behind every row WRITE on this QP.
-                for at in (0..bytes).step_by(request_write::CHUNK_BYTES) {
-                    let len = request_write::CHUNK_BYTES.min(bytes - at);
+                for at in (0..bytes).step_by(request_write::WRITE_PART_BYTES) {
+                    let len = request_write::WRITE_PART_BYTES.min(bytes - at);
                     self.room()?;
                     // SAFETY: the rows are staged at `offset` in this endpoint's
                     // registered send ring and stay unmodified until their WRs
@@ -486,6 +489,12 @@ impl LocalVerbsExpertConnection {
             start.response_registered_span_bytes,
             next_local_psn("server"),
             rdma_device.as_ref(),
+            // Replies are this endpoint's sends: chunked replies at the reply
+            // size, write-mode rows at the write part size.
+            match start.write_target {
+                Some(_) => Some(request_write::WRITE_PART_BYTES),
+                None => start.chunking.reply,
+            },
         )?;
         if let Some((rings, admitted)) = pending {
             endpoint.credits = EndpointCredits { rings: Some(rings), endpoint: admitted };
@@ -523,7 +532,7 @@ impl LocalVerbsExpertConnection {
         )?;
         endpoint.connect_with_flow_label(&start.client_native_endpoint, start.flow_label)?;
         // Frames above one chunk arrive as WRITE tails into the request ring.
-        let request_target = if request_write::needs_target(start.request_capacity_wire_bytes) {
+        let request_target = if request_write::needs_target(start.request_capacity_wire_bytes, start.chunking.request) {
             endpoint.traffic.receives_writes();
             let (address, rkey) = library.rdma_rc_endpoint_request_target(endpoint.info.handle)?;
             Some(request_write::Target { address, rkey })
@@ -667,7 +676,7 @@ impl LocalVerbsExpertConnection {
         let mut response_send_sequence = self.response_send_sequence;
         let mut poster = ReplyPoster { endpoint, sends: &mut self.response_sends, target: self.reply_target,
             watermark: self.reply_watermark, capacity: start.response_capacity_wire_bytes,
-            uncovered: &mut self.uncovered_replies };
+            chunk: self.start.chunking.reply, uncovered: &mut self.uncovered_replies };
         let reply_watermark = &mut self.reply_watermark;
         let result = (|| -> Result<()> {
             let poll_recv_ms = elapsed_ms_optional(poll_recv_started);
@@ -691,7 +700,7 @@ impl LocalVerbsExpertConnection {
             let copy_request_ms = 0.0_f64;
             // The head SEND only: the client counts its WRITE tail as written
             // bytes, which the fabric report adds for a `receives_writes` QP.
-            endpoint.traffic.received(request_wire_bytes.min(request_write::CHUNK_BYTES));
+            endpoint.traffic.received(request_write::head_bytes(request_wire_bytes, start.chunking.request));
             let mut post_recv_ms = 0.0_f64;
             let parse_started = timing_enabled.then(Instant::now);
             let request =
@@ -1003,7 +1012,7 @@ impl LocalVerbsExpertConnection {
         observe_watermark(&mut self.reply_watermark, &storage[..wire_bytes], request.header.flags)?;
         ReplyPoster { endpoint: &self.endpoint, sends: &mut self.response_sends, target: self.reply_target,
             watermark: self.reply_watermark, capacity: self.start.response_capacity_wire_bytes,
-            uncovered: &mut self.uncovered_replies }.reserve_slot(self.response_ring.depth, held)?;
+            chunk: self.start.chunking.reply, uncovered: &mut self.uncovered_replies }.reserve_slot(self.response_ring.depth, held)?;
         let response_slot = mapped_ring_slot(self.response_send_view, self.response_ring,
             (self.response_send_sequence + held) as u64)?;
         let payload = protocol_v2_request_device_payload(&storage[..wire_bytes], &request,
@@ -1296,7 +1305,8 @@ mod budget_tests {
             "request_capacity_wire_bytes": 4096, "response_capacity_wire_bytes": 4096,
             "request_registered_span_bytes": 32768, "response_registered_span_bytes": 32768,
             "ring_depth": 8, "request_slot_stride_bytes": 4096, "response_slot_stride_bytes": 4096,
-            "client_endpoint": endpoint, "client_native_endpoint": native
+            "client_endpoint": endpoint, "client_native_endpoint": native,
+            "chunking": {"request": 262144, "reply": null}
         });
         if let Some(digest) = digest { start["worker_selection_digest"] = digest.into(); }
         start
@@ -1307,7 +1317,8 @@ mod budget_tests {
     /// reads `protocol_v2_reply_target`, which the coordinator sends only
     /// after ready. A large-reply session must get a valid target for its
     /// ring; a small-reply or write-mode one must get none; anything else,
-    /// a wrong message or a stale control version, fails closed.
+    /// a wrong message or a stale control version, fails closed. With reply
+    /// chunking off (the default) no session takes a target.
     #[test]
     fn bootstrap_reads_the_reply_target_after_ready_and_fails_closed() -> Result<()> {
         let small = 64 << 10;
@@ -1341,6 +1352,7 @@ mod budget_tests {
             let (worker, _) = listener.accept()?;
             let mut start = placement_start(None, 0);
             start["response_capacity_wire_bytes"] = capacity.into();
+            start["chunking"]["reply"] = 262144.into();
             if write_mode {
                 start["write_target"] = serde_json::json!({"plane_addr": 1, "plane_bytes": capacity, "flag_addr": 2, "rkey": 4});
             }
@@ -1355,6 +1367,25 @@ mod budget_tests {
             let result = read_reply_target(&mut BufReader::new(worker), &start, ring(capacity)?);
             assert_eq!(result.is_ok(), accepted, "capacity {capacity} write {write_mode}: {reply} -> {result:?}");
             if let Ok(target) = result { assert_eq!(target.is_some(), capacity == large && !write_mode); }
+        }
+        // Reply chunking off: a large-reply session takes no target, and a
+        // coordinator offering one anyway is refused.
+        for (offered, accepted) in [(None, true), (Some(target(ring(large)?)), false)] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+            let mut coordinator = TcpStream::connect(listener.local_addr()?)?;
+            let (worker, _) = listener.accept()?;
+            let mut start = placement_start(None, 0);
+            start["response_capacity_wire_bytes"] = large.into();
+            write_control(&mut coordinator, &start)?;
+            let start: VerbsHostProtocolV2PersistentStart = decode_persistent_control(
+                read_control_value(&mut BufReader::new(worker.try_clone()?))?)?;
+            assert_eq!(start.chunking.reply, None);
+            write_control(&mut worker.try_clone()?, &serde_json::json!({"message": "protocol_v2_persistent_ready"}))?;
+            read_control_value(&mut BufReader::new(coordinator.try_clone()?))?;
+            write_control(&mut coordinator, &VerbsHostProtocolV2ReplyTarget { message: "protocol_v2_reply_target".into(),
+                wire_version: PERSISTENT_CONTROL_VERSION, target: offered })?;
+            let result = read_reply_target(&mut BufReader::new(worker), &start, ring(large)?);
+            assert_eq!(result.is_ok(), accepted, "reply chunking off, offered {offered:?}: {result:?}");
         }
         Ok(())
     }

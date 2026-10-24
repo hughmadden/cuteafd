@@ -203,6 +203,8 @@ HOST_ISA
 PROBE_DUMP_ROOT
 TARGET_HEAD
 SPARK_INTAKE
+SPARK_REQUEST_CHUNK_BYTES
+SPARK_REPLY_CHUNK_BYTES
 CONSOLE_TEXT
 FP8_EXPERT_PREFILL
 ATTENTION_PLAN_ROWS
@@ -252,6 +254,8 @@ DRAFT_ROW_COST
 SPECULATION_TRACE
 TARGET_HEAD
 SPARK_INTAKE
+SPARK_REQUEST_CHUNK_BYTES
+SPARK_REPLY_CHUNK_BYTES
 CONSOLE_TEXT
 FP8_EXPERT_PREFILL
 ATTENTION_PLAN_ROWS
@@ -498,6 +502,8 @@ SPARKINFER_EXL3
 SPECULATION_TRACE
 SPECULATOR
 SPARK_INTAKE
+SPARK_REQUEST_CHUNK_BYTES
+SPARK_REPLY_CHUNK_BYTES
 TARGET_HEAD
 THERMAL
 TP2_ATTENTION
@@ -620,6 +626,11 @@ thermal_args=(-e "CUTEAFD_THERMAL=$thermal")
 # (the former programs) or w8a8 (also quantizes the BF16 rows of experts on the
 # coordinator GPU). Spark workers and the coordinator both read it.
 # ATTENTION_PLACEMENT (validated per family before this) reaches the server too.
+# SPARK_REQUEST_CHUNK_BYTES / SPARK_REPLY_CHUNK_BYTES (TEMPORARY: remove after
+# PFC test, TJ 2026-10-25): request/reply frames above that many bytes go as
+# RDMA WRITE tails plus a head SEND; none (or 0) sends them whole; bytes or
+# NKiB/NMiB. Unset keeps the binary defaults (requests 256KiB, replies none).
+# The coordinator sends both to every Spark worker.
 shared_coordinator_env_args() {
 intake="$(get SPARK_INTAKE auto)"
 case "$intake" in auto|gpu|pinned|host) ;; *) echo "SPARK_INTAKE must be auto, gpu, pinned or host" >&2; exit 2 ;; esac
@@ -638,6 +649,14 @@ shared_env_args=(-e "HF_HOME=$namespace_hf_home" -e "CUTEAFD_SPARK_INTAKE=$intak
 if [[ $attention_plan_rows != auto ]]; then
   shared_env_args+=(-e "CUTEAFD_ATTENTION_PLAN_ROWS=$attention_plan_rows")
 fi
+for chunk_key in SPARK_REQUEST_CHUNK_BYTES SPARK_REPLY_CHUNK_BYTES; do
+  chunk="$(get "$chunk_key" "")"
+  [[ -z $chunk ]] && continue
+  if [[ ! $chunk =~ ^(none|0|[1-9][0-9]*(KiB|MiB)?)$ ]]; then
+    release_die "$chunk_key must be none, 0, bytes, NKiB or NMiB"
+  fi
+  shared_env_args+=(-e "CUTEAFD_$chunk_key=$chunk")
+done
 if [[ -n "${CUTEAFD_PUSH_SOCKET:-}" ]]; then
   shared_env_args+=(-e "CUTEAFD_PUSH_SOCKET=$CUTEAFD_PUSH_SOCKET")
 fi

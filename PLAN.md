@@ -5547,30 +5547,41 @@ FIFO order, and consumed events fence replacement requests. Registered request
 egress likewise owns N independent slots, charged from the widest bootstrap
 request geometry before allocation. Pinned intake remains an explicit mode.
 
-Request frames (every Spark link, decode and prefill): a frame of at most
-256 KiB is one RC SEND. A larger frame WRITEs every byte past its first
-256 KiB, in 256 KiB WRITEs round-robin across the wave's rank QPs, into the
-worker's request slot for that sequence, then SENDs its header-bearing first
-256 KiB on the same QP into the receive posted there; RC ordering completes
-that receive after every WRITE. The worker posts a request's final reply only
-after execute returns and the slot's receive is reposted, so a final reply
-is the client's credit to WRITE into that slot again. One large SEND per rank
-let RC go-back-N replay most of a 26.5 MB frame per loss (MiMo request
-wire/engine 1.04-3.2x); chunked WRITE measured 1.015x. Replies are still one
-large SEND per rank per wave.
+Request frames (every Spark link, decode and prefill): with request chunk
+size `c` (default 256 KiB), a frame of at most `c` is one RC SEND. A larger
+frame WRITEs every byte past its first `c`, in WRITEs of at most `c`
+round-robin across the wave's rank QPs, into the worker's request slot for
+that sequence, then SENDs its header-bearing first `c` on the same QP into
+the receive posted there; RC ordering completes that receive after every
+WRITE. The worker posts a request's final reply only after execute returns
+and the slot's receive is reposted, so a final reply is the client's credit
+to WRITE into that slot again. One large SEND per rank let RC go-back-N
+replay most of a 26.5 MB frame per loss (MiMo request wire/engine
+1.04-3.2x); chunked WRITE measured 1.015x.
 
-Reply frames mirror that rule. Every request header carries, in its last
-four bytes, the coordinator's count of receives posted on that QP (a 32-bit
-wrapping watermark; frame protocol 4, persistent control 5). Reply frame `s`
-completes the coordinator's `s`-th receive: host slot `s % depth`, and with
-GPU landing device slot `s % waves`, whose payload starts at frame byte 96.
-After the QP connects, the coordinator sends the worker its response ring and
-its GPU landing (separate strict, remote-writable MR) addresses and keys. A
-frame above 256 KiB whose receive the latest watermark covers WRITEs every
-byte past 256 KiB there, then SENDs its first 256 KiB on the same QP. Small
-frames and uncovered ones (a retained slot not yet reposted) are one SEND,
+Reply frames (reply chunk size, default none: every reply is one SEND). The
+tail-WRITE reply path (#714) raised worker retransmits about 8x on GLM 64K
+(single-shot, 2026-10-25), so it is off by default. When enabled it mirrors
+the request rule: every request header carries, in its last four bytes, the
+coordinator's count of receives posted on that QP (a 32-bit wrapping
+watermark). Reply frame `s` completes the coordinator's `s`-th receive: host
+slot `s % depth`, and with GPU landing device slot `s % waves`, whose payload
+starts at frame byte 96. After the QP connects, the coordinator sends the
+worker its response ring and its GPU landing (separate strict,
+remote-writable MR) addresses and keys. A frame above the reply chunk whose
+receive the latest watermark covers WRITEs every byte past it there, then
+SENDs its head on the same QP. Small frames and uncovered ones are one SEND,
 which RC holds until the receive is posted. Write mode sends its rows as
 256 KiB WRITEs and the flag alone, last.
+
+Both chunk sizes are TEMPORARY launch parameters for the PFC test (TJ
+2026-10-25; remove after it): `--spark-request-chunk-bytes` /
+`--spark-reply-chunk-bytes` (`SPARK_REQUEST_CHUNK_BYTES` /
+`SPARK_REPLY_CHUNK_BYTES` config keys; `none`, 0, bytes, NKiB, NMiB; 4 KiB
+to 64 MiB). Each size is both its direction's threshold and WRITE part size.
+The coordinator resolves them once at startup, logs them on the Spark
+transfer-plan line and sends them to every worker in the persistent start
+(control version 6), so both ends of a link always agree.
 
 Context-split staging (GLM 5.3 port; GLM Flash and V4 have the same shape):
 today only the first lane gathers each layer's history into that layer
