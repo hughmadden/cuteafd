@@ -419,7 +419,8 @@ mod tests {
         assert_eq!(send_queue_depth(8, CHUNK_BYTES + 1)?, 24);
         assert_eq!(send_queue_depth(8, 26_509_408)?, 8 * 103);
         // A full ring of full-capacity MiMo requests (26,509,408 B, 102 WRs
-        // each) posts in one pass: no part ever finds the queue full.
+        // each) or worker replies (33,816,672 B, 130 WRs each, the worker QP's
+        // send frame) posts in one pass: no part ever finds the queue full.
         for (depth, frame) in [(1u32, 26_509_408usize), (2, 26_509_408), (8, 26_509_408), (8, 33_816_672), (8, 96)] {
             let max = send_queue_depth(depth, frame)? as usize;
             let mut queue = SendQueue::default();
