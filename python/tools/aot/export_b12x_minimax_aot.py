@@ -38,8 +38,11 @@ def builders(group, max_rows=4096, max_context=1048576, decode_rows=64):
                 for mode in ("decode", "extend")}
     from b12x.integration.cuteafd import minimax as m
     if group == "projections":
-        return {f"mxfp8_{name}": (lambda name=name: m.compile_minimax_linear_aot(name, max_rows=max_rows))
-                for name in m.LINEAR_SHAPES}
+        # Decode rows fill one M tile, so their programs split K instead.
+        return {**{f"mxfp8_{name}": (lambda name=name: m.compile_minimax_linear_aot(name, max_rows=max_rows))
+                   for name in m.LINEAR_SHAPES},
+                **{f"mxfp8_{name}_decode": (lambda name=name: m.compile_minimax_linear_aot(
+                       name, max_rows=decode_rows, splits=m.DECODE_SPLITS[name])) for name in m.DECODE_SPLITS}}
     if group != "pointwise":
         raise ValueError(f"unknown MiniMax export group: {group}")
     result = {

@@ -2,9 +2,10 @@ use super::{scratch::Scratch, weights::Weights};
 use anyhow::Result;
 use cuteafd_ffi::{minimax::{Buffer,Commands}, programs::Scalar};
 
+/// Decode-sized rows take the projection's split-K program.
 pub(super) fn linear<'a>(commands: &Commands<'a>, weights: &Weights<'a>, scratch: &Scratch<'a>,
     layer: usize, projection: &str, stem: &str, input: &Buffer<'a>, output: &Buffer<'a>, rows: usize) -> Result<()> {
-    commands.launch(&format!("minimax_mxfp8_{projection}"), &[input,
+    commands.launch(&commands.projection(projection, rows), &[input,
         weights.layer(layer,&format!("{stem}.weight"))?, weights.layer(layer,&format!("{stem}.weight_scale_inv"))?,
         scratch.get("scratch")?,output], &[Scalar::I32(rows as i32),Scalar::I32(0)])
 }

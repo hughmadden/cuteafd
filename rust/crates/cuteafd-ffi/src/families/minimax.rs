@@ -99,8 +99,20 @@ pub fn definitions() -> Vec<(&'static str, &'static [&'static str])> {
         ("minimax_attention_extend", &["query", "key_cache", "value_cache", "k_descale", "v_descale", "page_table", "cache_lengths", "cu_seqlens_q", "q2k_indices", "output", "lse", "scratch"])];
     for name in ["minimax_mxfp8_q", "minimax_mxfp8_kv", "minimax_mxfp8_o", "minimax_mxfp8_index_q",
         "minimax_mxfp8_index_k", "minimax_mxfp8_shared_gate_up", "minimax_mxfp8_shared_down",
-        "minimax_mxfp8_dense_gate_up", "minimax_mxfp8_dense_down"] { v.push((name, linear)); }
+        "minimax_mxfp8_dense_gate_up", "minimax_mxfp8_dense_down",
+        // Decode rows fill one M tile; these split K across FP32 partial planes
+        // where an unsplit grid leaves the projection latency-bound.
+        "minimax_mxfp8_q_decode", "minimax_mxfp8_kv_decode", "minimax_mxfp8_index_q_decode",
+        "minimax_mxfp8_index_k_decode"] {
+        v.push((name, linear));
+    }
     v
+}
+
+/// A projection program's shape: `minimax_mxfp8_{projection}[_decode]`.
+fn projection_shape(name: &str) -> Option<(usize, usize)> {
+    let projection = name.strip_prefix("minimax_mxfp8_")?;
+    linear_shape(projection.strip_suffix("_decode").unwrap_or(projection))
 }
 
 fn scalar_kinds(name:&str)->&'static [u8] {
@@ -113,8 +125,8 @@ fn scalar_kinds(name:&str)->&'static [u8] {
 
 fn geometry(name:&str)->serde_json::Value {
     use serde_json::json;
-    if let Some(projection)=name.strip_prefix("minimax_mxfp8_") {
-        let (n,k)=linear_shape(projection).expect("fixed MiniMax projection inventory");
+    if name.starts_with("minimax_mxfp8_") {
+        let (n,k)=projection_shape(name).expect("fixed MiniMax projection inventory");
         return json!({"abi_version":2,"input_features":k,"output_features":n,"encoding":"mxfp8",
             "activation_encoding":"mxfp8","sharded_side":1,"core":"mxfp8_mma","scale_layout":"mma",
             "scale_block_size":32,"output_dtype":"bfloat16","grid":"runtime_num_sm"});
@@ -149,9 +161,12 @@ fn geometry(name:&str)->serde_json::Value {
 fn scratch_bytes(spec:&ProgramSpec)->Option<(&'static str,u64)> {
     let c=u64::from(spec.capacity_rows);
     let align=|n:u64,unit:u64|n.div_ceil(unit)*unit;
-    if let Some(projection)=spec.name.strip_prefix("minimax_mxfp8_") {
-        let (_,k)=linear_shape(projection)?; let k=k as u64;
-        return Some(("partial",align(c*k,1024)+align(c*k/32,1024)+align(c.div_ceil(128)*(k/128)*512,1024)+1024));
+    if spec.name.starts_with("minimax_mxfp8_") {
+        let (n,k)=projection_shape(&spec.name)?; let (n,k)=(n as u64,k as u64);
+        // Split-K programs add their FP32 partial planes after the stage scratch.
+        let splits=spec.geometry["splits"].as_u64().filter(|&s|s>0 && (k/128)%s==0)?;
+        let planes=if splits>1 {c*n*4*splits} else {0};
+        return Some(("partial",align(c*k,1024)+align(c*k/32,1024)+align(c.div_ceil(128)*(k/128)*512,1024)+1024+planes));
     }
     match spec.name.as_str() {
         "minimax_index_decode"=>{
@@ -245,6 +260,15 @@ impl<'a> Commands<'a> {
     pub fn capacity(&self, name: &str) -> Result<usize> {
         Ok(self.programs.get(name).context("missing MiniMax program")?.spec().capacity_rows as usize)
     }
+    /// `minimax_mxfp8_{projection}`, or its split-K decode program when it
+    /// has one and `rows` fit it.
+    pub fn projection(&self, projection: &str, rows: usize) -> String {
+        let decode = format!("minimax_mxfp8_{projection}_decode");
+        match self.programs.get(decode.as_str()) {
+            Some(program) if rows <= program.spec().capacity_rows as usize => decode,
+            _ => format!("minimax_mxfp8_{projection}"),
+        }
+    }
     pub fn launch(&self, name: &str, operands: &[&Buffer<'a>], scalars: &[Scalar]) -> Result<()> {
         let program = self.programs.get(name).ok_or_else(||MiniMaxNativeError::Program{program:name.into(),reason:"missing coordinator export"})?;
         let spec = program.spec();
@@ -266,8 +290,8 @@ impl<'a> Commands<'a> {
             let heads = if name == "minimax_q_norm_rope" { 64 } else if name == "minimax_index_k_norm_rope" { 1 } else { 4 };
             required[0] = rows * heads * 128 * 2; required[1] = 256; required[3]=64; required[4]=64;
             required[5] = rows * 8; required[6] = required[0];
-        } else if let Some(projection) = name.strip_prefix("minimax_mxfp8_") {
-            let (n,k) = linear_shape(projection).context("unknown MiniMax projection")?;
+        } else if name.starts_with("minimax_mxfp8_") {
+            let (n,k) = projection_shape(name).context("unknown MiniMax projection")?;
             required = vec![rows*k*2, n*k, n*k/32, 0, rows*n*2];
         } else { match name {
             "minimax_kv_split" => required = vec![rows*2048, rows*1024, rows*1024],
@@ -428,6 +452,7 @@ mod tests {
         spec.geometry["max_rows"]=capacity.into();
         if matches!(name,"minimax_index_decode"|"minimax_index_prefill") {spec.geometry["max_pages"]=16384.into();}
         if matches!(name,"minimax_attention_decode"|"minimax_attention_extend") {spec.geometry["max_batch"]=64.into();}
+        if name.starts_with("minimax_mxfp8_") {spec.geometry["splits"]=if name.ends_with("_decode") {4} else {1}.into();}
         if let Some((operand,bytes))=scratch_bytes(&spec) {spec.scratch.insert(operand.into(),bytes);}
         spec
     }
@@ -436,7 +461,9 @@ mod tests {
         assert_eq!(linear_shape("kv"),Some((1024,6144)));
         assert!(linear_shape("bf16").is_none());
         let names: std::collections::BTreeSet<_> = definitions().iter().map(|(n,_)|*n).collect();
-        assert_eq!(names.len(),29);
+        assert_eq!(names.len(),33);
+        assert_eq!(projection_shape("minimax_mxfp8_index_k_decode"),Some((128,6144)));
+        assert!(projection_shape("minimax_mxfp8_bf16_decode").is_none());
         assert!(names.iter().all(|name|name.starts_with("minimax_")));
     }
 
@@ -444,7 +471,9 @@ mod tests {
         for (name,pointers) in definitions() {validate_geometry(&spec(name,pointers))?;}
         for (name,bytes) in [("minimax_mxfp8_q",26_739_712),("minimax_mxfp8_dense_down",53_478_400),
             ("minimax_index_decode",25_202_688),("minimax_attention_decode",1_280),
-            ("minimax_index_prefill",134_799_872),("minimax_attention_extend",792_576)] {
+            ("minimax_index_prefill",134_799_872),("minimax_attention_extend",792_576),
+            // 64 rows: stage scratch plus four FP32 planes of 64 x 8192.
+            ("minimax_mxfp8_q_decode",393_216+12_288+24_576+1_024+64*8192*4*4)] {
             let mut program=spec(name,&[]);
             let (operand,actual)=scratch_bytes(&program).unwrap();assert_eq!(actual,bytes);
             program.scratch.insert(operand.into(),actual-1);assert!(validate_geometry(&program).is_err());

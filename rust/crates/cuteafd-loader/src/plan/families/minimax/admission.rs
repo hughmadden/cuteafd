@@ -69,6 +69,7 @@ pub const PROGRAM_NAMES: &[&str] = &[
     "route", "residual", "index_q_quant", "index_k_quant", "index_k_pack", "kv_pack",
     "mxfp8_q", "mxfp8_kv", "mxfp8_o", "mxfp8_index_q", "mxfp8_index_k",
     "mxfp8_shared_gate_up", "mxfp8_shared_down", "mxfp8_dense_gate_up", "mxfp8_dense_down",
+    "mxfp8_q_decode", "mxfp8_kv_decode", "mxfp8_index_q_decode", "mxfp8_index_k_decode",
     "index_decode", "index_prefill", "attention_decode", "attention_extend",
 ];
 

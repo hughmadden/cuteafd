@@ -101,7 +101,7 @@ impl<'a> Dspark<'a> {
     fn layer(&self,layer:usize,name:&str)->Result<&Buffer<'a>> { self.weight(&format!("layers.{layer}.decoder_layer.{name}")) }
     fn linear(&self,c:&Commands<'a>,s:&Scratch<'a>,layer:usize,projection:&str,stem:&str,
         input:&Buffer<'a>,output:&Buffer<'a>,rows:usize)->Result<()> {
-        c.launch(&format!("minimax_mxfp8_{projection}"), &[input,self.layer(layer,&format!("{stem}.weight"))?,
+        c.launch(&c.projection(projection,rows), &[input,self.layer(layer,&format!("{stem}.weight"))?,
             self.layer(layer,&format!("{stem}.weight_scale_inv"))?,s.get("scratch")?,output], &[Scalar::I32(rows as i32),Scalar::I32(0)])
     }
     pub fn tap(&self,c:&Commands<'a>,layer:usize,residual:&Buffer<'a>,rows:usize)->Result<()> {
