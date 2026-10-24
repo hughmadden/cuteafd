@@ -96,9 +96,13 @@ impl HugePagePinning {
             unsafe { libc::munmap(ptr, len) };
             error
         };
-        // SAFETY: the window is a live private mapping of `len` bytes.
-        if unsafe { libc::madvise(ptr, len, libc::MADV_HUGEPAGE) } != 0 {
-            return Err(unmap(anyhow!("madvise(MADV_HUGEPAGE) failed: {}", std::io::Error::last_os_error())));
+        // Hugepages for the faults below; and no copy into a forked child, which would
+        // otherwise duplicate the pinned pages eagerly.
+        for (advice, name) in [(libc::MADV_HUGEPAGE, "MADV_HUGEPAGE"), (libc::MADV_DONTFORK, "MADV_DONTFORK")] {
+            // SAFETY: the window is a live private mapping of `len` bytes.
+            if unsafe { libc::madvise(ptr, len, advice) } != 0 {
+                return Err(unmap(anyhow!("madvise({name}) failed: {}", std::io::Error::last_os_error())));
+            }
         }
         for offset in (0..len).step_by(self.huge_page) {
             // SAFETY: inside the writable window; one write faults (and zeroes) one hugepage.
