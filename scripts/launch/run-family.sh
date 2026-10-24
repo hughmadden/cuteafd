@@ -1561,7 +1561,7 @@ read -r detected model_type first_layer last_layer <<<"$described"
 family="$detected"
 # Push images copy scalar expert scales unchanged: compressed-tensors NVFP4 experts, whose global
 # scales are divisors, load from mounted checkpoints (the loader stages their reciprocals).
-if [[ -n "${CUTEAFD_PUSH_SOCKET:-}" ]] && python3 -c 'import json,sys; q=json.load(open(sys.argv[1])).get("quantization_config", {}); sys.exit(q.get("moe_quant_format", q.get("format")) != "nvfp4-pack-quantized")' "$snapshot/config.json"; then
+if [[ -n "${CUTEAFD_PUSH_SOCKET:-}" ]] && python3 -c 'import json,sys; c=json.load(open(sys.argv[1])); q=c.get("quantization_config") or (c.get("text_config") or {}).get("quantization_config") or {}; sys.exit(q.get("moe_quant_format") != "nvfp4-pack-quantized")' "$snapshot/config.json"; then
   release_die "compressed-tensors NVFP4 experts require mount-loaded Spark experts; push loading does not support divisor scales"
 fi
 if [[ "$family" == minimax_m3 ]]; then
