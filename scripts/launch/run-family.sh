@@ -1548,21 +1548,22 @@ coordinator_name="cuteafd-coordinator${instance:+-$instance}"
 model="$(get MODEL_ID)"
 revision="$(get MODEL_REVISION)"
 hf_home="${HF_HOME:-$namespace_root/hf-home}"
-if [[ "$family" == minimax_m3 && -d "$model" && "$dry_run" == 1 ]]; then
-  snapshot="$(readlink -f "$model")"
-else
-  hub="$(readlink -f "$hf_home/hub")"
-  root="$hub/models--${model//\//--}"
-  [[ -n "$revision" ]] || revision="$(<"$root/refs/main")"
-  snapshot="$(readlink -f "$root/snapshots/$revision")"
-  [[ -d "$snapshot" ]] || { echo "missing snapshot $model@$revision" >&2; exit 1; }
-fi
+hub="$(readlink -f "$hf_home/hub")"
+root="$hub/models--${model//\//--}"
+[[ -n "$revision" ]] || revision="$(<"$root/refs/main")"
+snapshot="$(readlink -f "$root/snapshots/$revision")"
+[[ -d "$snapshot" ]] || { echo "missing snapshot $model@$revision" >&2; exit 1; }
 # Family, the serving command and the layers with routed experts.
 described="$(python3 "$repo_root/scripts/lib/checkpoint-family.py" "$snapshot/config.json")" || exit 2
 read -r detected model_type first_layer last_layer <<<"$described"
 [[ -z "$family" || "$family" == "$detected" ]] ||
   { echo "--family $family does not match the checkpoint ($detected, model_type $model_type)" >&2; exit 2; }
 family="$detected"
+# Push images copy scalar expert scales unchanged: compressed-tensors NVFP4 experts, whose global
+# scales are divisors, load from mounted checkpoints (the loader stages their reciprocals).
+if [[ -n "${CUTEAFD_PUSH_SOCKET:-}" ]] && python3 -c 'import json,sys; c=json.load(open(sys.argv[1])); q=c.get("quantization_config") or (c.get("text_config") or {}).get("quantization_config") or {}; sys.exit(q.get("moe_quant_format") != "nvfp4-pack-quantized")' "$snapshot/config.json"; then
+  release_die "compressed-tensors NVFP4 experts require mount-loaded Spark experts; push loading does not support divisor scales"
+fi
 if [[ "$family" == minimax_m3 ]]; then
   minimax_kv_cache="$(get KV_CACHE fp8)"
   case "$minimax_kv_cache" in bf16|fp8) ;; *) release_die "KV_CACHE must be bf16 or fp8" ;; esac
@@ -1580,7 +1581,6 @@ if [[ "$family" == minimax_m3 ]]; then
   [[ "$(get RTX_GPUS auto)" != 2 && "$minimax_coordinator_gpus" != *,* && "$(get COORDINATOR_SPLIT auto)" != heads ]] ||
     release_die "MiniMax two-GPU head split is not implemented; select one coordinator GPU"
   [[ "$(get EMBEDDING gpu)" == gpu ]] || release_die "MiniMax requires EMBEDDING=gpu"
-  [[ -z "${CUTEAFD_PUSH_SOCKET:-}" ]] || release_die "MiniMax requires mount-loaded Spark experts; push loading does not support divisor scales"
 fi
 if [[ -n "$(get RTX_EXPERT_LAYERS)" ]]; then
   cfg[RTX_EXPERT_LAYERS]="$(python3 "$repo_root/scripts/lib/checkpoint-family.py" --onboard "$(get RTX_EXPERT_LAYERS)" "$snapshot/config.json")" || exit 2
@@ -1704,31 +1704,6 @@ if [[ "$family" == minimax_m3 ]]; then
   minimax_context="$(get MAX_CONTEXT_TOKENS 0)"
   [[ "$minimax_context" =~ ^(0|[1-9][0-9]{0,6})$ && "$minimax_context" -le 1048576 ]] ||
     release_die "MiniMax MAX_CONTEXT_TOKENS must be 0 (automatic) or 1..1048576"
-  if ((dry_run)); then
-    # Header-only CPU admission: no device probes, image access or remote staging.
-    release_reject_unused_keys "$family" $(_family_allowed_keys "$family")
-    planner="${CUTEAFD_PLAN_BIN:-cuteafd}"
-    command -v "$planner" >/dev/null || release_die "MiniMax CPU dry run needs CUTEAFD_PLAN_BIN pointing to a built cuteafd executable"
-    minimax_budget="$(get COORDINATOR_GPU_BUDGET_GIB 95.5)"
-    minimax_pool="$(get POOL_TOKENS auto)"; [[ "$minimax_pool" != auto ]] || minimax_pool=0
-    minimax_plan_args=(--deployment --rtx 1 --spark-ranks "$ranks" --available-sparks "$ranks"
-      --attention-placement auto --speculator off --kv-cache "$minimax_kv_cache"
-      --coordinator-gpu-budget-gib "$minimax_budget" --coordinator-weight-budget-gib "$minimax_budget"
-      --concurrency "$minimax_concurrency" --prefill-rows "$minimax_prefill_rows" --prefill-lanes "$minimax_prefill_lanes"
-      --mapped-scale-preload-gib "$(get MAPPED_SCALE_PRELOAD_GIB 0)"
-      --prefix-cache-entries "$(get PREFIX_CACHE_ENTRIES 20)" --host-cache-bytes "$(get HOST_CACHE_BYTES auto)"
-      --pool-tokens "$minimax_pool" --context-tokens "$minimax_context"
-      --vision "$vision" --audio "$audio" --vision-replicas "$vision_replicas")
-    [[ "$minimax_local_layers" == auto ]] || minimax_plan_args+=(--rtx-expert-layers "$minimax_local_layers")
-    [[ -z "$(get SPARK_DEVICE_BUDGET_BYTES)" ]] || minimax_plan_args+=(--spark-budget-gib "$(python3 -c 'import sys;print(int(sys.argv[1])/2**30)' "$(get SPARK_DEVICE_BUDGET_BYTES)")")
-    [[ -z "$(get MEDIA_CACHE_BYTES)" ]] || minimax_plan_args+=(--media-cache-bytes "$(get MEDIA_CACHE_BYTES)")
-    echo "MiniMax CPU dry run: header admission only; runtime artifacts and device execution remain unverified" >&2
-    plan_json="$("$planner" plan "$snapshot" "${minimax_plan_args[@]}")" || exit $?
-    # With --wip the dry run takes the launch's deployment guard, as other families' dry runs do.
-    [[ -z "$wip_slot" ]] || release_validate_deployment "$plan_json" "$family"
-    printf '%s\n' "$plan_json"
-    exit 0
-  fi
 fi
 coordinator_image="$(get COORDINATOR_DOCKER_INFERENCE)"
 # --wip SLOT serves a ./wip.sh slot: the development images run its artifacts, staged from

@@ -1,4 +1,4 @@
-//! Native source operands and CPU head arithmetic for the bundled MiniMax drafter.
+//! Native source operands and allocations of the bundled MiniMax drafter.
 use super::config::MiniMaxM3DsparkConfig;
 use crate::formats::native_dense::NativeDenseLayout;
 use crate::plan::checkpoint::Checkpoint;
@@ -24,8 +24,6 @@ pub enum DsparkError {
     Headers(#[from] CacheGeometryError),
     #[error("MiniMax DSpark unexpected tensor {0}")]
     UnexpectedTensor(String),
-    #[error("MiniMax DSpark head arithmetic: {0}")]
-    Arithmetic(&'static str),
     #[error("MiniMax DSpark memory: {0}")]
     Memory(&'static str),
 }
@@ -79,17 +77,14 @@ impl DraftMemory {
         let g = contract.geometry;
         let sequences = slots.min(32).min(rows / cfg.block);
         let r = sequences * cfg.block;
-        // Native draft_attention.cu allocates the larger WMMA/scalar layout.
-        // Each 32-query slice owns one partial output and two softmax scalars.
-        let slices = (g.query_heads / g.kv_heads * cfg.block).div_ceil(32);
-        let max_keys = cfg.sliding_window + cfg.block;
-        let partitions = max_keys.div_ceil(32).min((2 * sms).div_ceil(g.kv_heads * slices));
-        let scalar_rows = if g.qk_dim == 64 { 32 } else { 16 };
-        let partial_rows = (slices * partitions * 32).max(max_keys.min(1024 + 16).div_ceil(128) * scalar_rows);
-        let attention_workspace = sequences * g.kv_heads * partial_rows * (g.qk_dim + 2) * 4;
-        // glmf_dspark.cu: 296 FP32 maxima/uint32 ids per sequence plus
-        // one uint32 scratch token for every drafted row.
-        let markov_workspace = sequences * 296 * 8 + sequences * cfg.block * 4;
+        // The shared draft-attention arena (each 32-query slice owns one partial output and
+        // two softmax scalars) and the shared Markov head's scratch.
+        let arena = |bytes: Result<u64, CacheGeometryError>| bytes.ok().and_then(|n| usize::try_from(n).ok())
+            .ok_or(DsparkError::Memory("drafter arena geometry"));
+        let attention_workspace = arena(crate::serving_capacity::draft_attention_workspace_bytes(sequences as u64,
+            g.kv_heads as u64, (g.query_heads / g.kv_heads * cfg.block).div_ceil(32) as u64,
+            (cfg.sliding_window + cfg.block) as u64, g.qk_dim as u64, sms as u64))?;
+        let markov_workspace = arena(crate::serving_capacity::draft_markov_workspace_bytes(sequences as u64, cfg.block as u64))?;
         let h = contract.hidden;
         let buffers = std::collections::BTreeMap::from([
             ("taps", rows * TARGET_LAYERS.len() * h * 2), ("tap", rows * h * 2),
@@ -219,42 +214,6 @@ pub fn declarations() -> Vec<(String, Vec<usize>, DType)> {
     out
 }
 
-/// One slot's logits plus the vanilla Markov bias, without a scale or softmax.
-pub fn markov_logits(logits: &[f32], previous: &[f32], w2: &[f32]) -> Result<Vec<f32>, DsparkError> {
-    if logits.is_empty() || previous.is_empty() || logits.len().checked_mul(previous.len()) != Some(w2.len()) {
-        return Err(DsparkError::Arithmetic("Markov matrix shape"));
-    }
-    Ok(logits.iter().zip(w2.chunks_exact(previous.len())).map(|(logit, row)|
-        logit + previous.iter().zip(row).map(|(a, b)| a * b).sum::<f32>()).collect())
-}
-
-/// Slot zero conditions on the anchor; later slots condition on the prior draft.
-pub fn markov_greedy(logits: &[f32], vocab: usize, rank: usize, w1: &[f32], w2: &[f32], anchor: u32)
-    -> Result<Vec<u32>, DsparkError> {
-    if vocab == 0 || rank == 0 || vocab > u32::MAX as usize || logits.len() % vocab != 0
-        || vocab.checked_mul(rank) != Some(w1.len()) || w1.len() != w2.len() || anchor as usize >= vocab {
-        return Err(DsparkError::Arithmetic("Markov block shape or anchor"));
-    }
-    let mut previous = anchor as usize;
-    let mut tokens = Vec::with_capacity(logits.len() / vocab);
-    for row in logits.chunks_exact(vocab) {
-        let scores = markov_logits(row, &w1[previous * rank..(previous + 1) * rank], w2)?;
-        // Strict comparison preserves the first vocabulary id on ties.
-        previous = scores.iter().enumerate().fold(0, |best, (id, score)| if *score > scores[best] { id } else { best });
-        tokens.push(previous as u32);
-    }
-    Ok(tokens)
-}
-
-/// The hidden input is final-normalized; Markov features use the previous token.
-pub fn confidence(hidden: &[f32], previous: &[f32], weight: &[f32], bias: f32) -> Result<f32, DsparkError> {
-    if hidden.is_empty() || previous.is_empty() || hidden.len().checked_add(previous.len()) != Some(weight.len()) {
-        return Err(DsparkError::Arithmetic("confidence vector shape"));
-    }
-    let logit = hidden.iter().chain(previous).zip(weight).map(|(x, w)| x * w).sum::<f32>() + bias;
-    Ok(if logit >= 0.0 { 1.0 / (1.0 + (-logit).exp()) } else { let exp = logit.exp(); exp / (1.0 + exp) })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -369,38 +328,5 @@ mod tests {
         assert_eq!((contract.causal, contract.sample_from_anchor), (false, true));
         checkpoint.config["text_config"]["is_causal"] = true.into();
         assert!(matches!(DsparkContract::from_checkpoint(&checkpoint), Err(DsparkError::Config(_))));
-    }
-
-    #[test]
-    fn markov_bias_matches_scalar_reference() {
-        let (logits, previous, w2) = ([0.5, -1.0, 0.25], [2.0, -0.5], [0.25, 1.0, -2.0, 4.0, 1.0, -0.5]);
-        let got = markov_logits(&logits, &previous, &w2).unwrap();
-        assert_eq!(got, [0.5, -7.0, 2.5]);
-        for (v, actual) in got.into_iter().enumerate() {
-            let expected = logits[v] as f64 + (0..2).map(|r| previous[r] as f64 * w2[v * 2 + r] as f64).sum::<f64>();
-            assert!((actual as f64 - expected).abs() < 1e-7);
-        }
-        assert!(markov_logits(&logits, &[], &w2).is_err());
-    }
-
-    #[test]
-    fn markov_block_conditions_each_successor_on_its_predecessor() {
-        let w1 = [1.0, 2.0, -1.0];
-        let w2 = [0.0, 1.0, -1.0];
-        let logits = [0.0, 0.0, 0.0, 0.0, 0.0, 5.0, 0.0, 0.0, 0.0];
-        assert_eq!(markov_greedy(&logits, 3, 1, &w1, &w2, 0).unwrap(), [1, 2, 2]);
-        assert_eq!(markov_greedy(&[0.0; 3], 3, 1, &[0.0; 3], &w2, 2).unwrap(), [0]);
-        assert!(markov_greedy(&logits, 3, 1, &w1, &w2, 3).is_err());
-    }
-
-    #[test]
-    fn confidence_matches_scalar_reference_and_uses_markov_features() {
-        let (hidden, previous, weight, bias) = ([2.0, -1.0], [0.5, -2.0], [0.25, 1.0, 2.0, -0.5], -0.75);
-        let expected = 1.0 / (1.0 + (-0.75f64).exp());
-        assert!((confidence(&hidden, &previous, &weight, bias).unwrap() as f64 - expected).abs() < 1e-7);
-        assert_eq!(confidence(&hidden, &previous, &[0.0; 4], 0.0).unwrap(), 0.5);
-        assert_eq!(confidence(&hidden, &previous, &[0.0; 4], -1000.0).unwrap(), 0.0);
-        assert_eq!(confidence(&hidden, &previous, &[0.0; 4], 1000.0).unwrap(), 1.0);
-        assert!(confidence(&hidden, &previous, &[0.0; 3], bias).is_err());
     }
 }

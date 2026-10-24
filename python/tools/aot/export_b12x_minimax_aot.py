@@ -53,7 +53,6 @@ def builders(group, max_rows=4096, max_context=1048576, decode_rows=64):
         "residual": m.compile_minimax_residual_aot,
         "rope": m.compile_minimax_rope_tables_aot,
         "index_q_quant": lambda: m.compile_minimax_index_quant_aot(heads=4),
-        "index_k_quant": lambda: m.compile_minimax_index_quant_aot(heads=1),
         "index_k_pack": lambda: m.compile_minimax_index_quant_aot(heads=1, paged=True),
         "kv_pack": m.compile_minimax_kv_pack_aot,
         "kv_split": m.compile_minimax_kv_split_aot,

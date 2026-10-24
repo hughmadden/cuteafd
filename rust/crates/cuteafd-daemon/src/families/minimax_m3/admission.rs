@@ -1,11 +1,11 @@
-//! Measured pre-weight edge of the shared coordinator allocation recipe.
-use anyhow::{ensure, Context, Result};
+//! The server's edge of the shared coordinator allocation recipe: measured free memory, and the
+//! ring geometry its Spark links register.
+use anyhow::{ensure, Result};
 use cuteafd_loader::{
     families::{minimax_m3::config::MiniMaxM3Config, qwen4::Qwen4KvCache},
-    placement::SparkWorkingSet,
-    plan::{checkpoint::Checkpoint, families::minimax::{admission::{self, Reservations}, coordinator::RankWeightLayout}},
+    plan::{checkpoint::Checkpoint, families::minimax::admission::{self, Reservations}},
 };
-pub(super) use admission::{ProgramSizes, RuntimeLedger, RuntimeSizing};
+pub(super) use admission::{RuntimeLedger, RuntimeSizing};
 
 pub(super) struct Request {
     pub sizing: RuntimeSizing,
@@ -28,11 +28,8 @@ pub(super) struct Request {
 pub(super) struct Admitted {
     pub cache: admission::Admission,
     pub ledger: RuntimeLedger,
-    pub programs: ProgramSizes,
     pub local_layers: Vec<usize>,
     pub spark_layers: Vec<usize>,
-    pub weights: RankWeightLayout,
-    pub local_capacity: Option<usize>,
     /// Decode steps the warm-up records before ready; their bytes are reserved.
     pub graphs: cuteafd_loader::placement::inventory::StartupGraphs<usize>,
     reservations: Reservations,
@@ -49,57 +46,16 @@ impl Admitted {
 pub(super) fn solve(checkpoint: &Checkpoint, programs: &serde_json::Value,
     local_package: Option<&serde_json::Value>, request: Request) -> Result<Admitted> {
     let cfg = MiniMaxM3Config::from_hf(&checkpoint.config)?;
-    request.sizing.validate(&cfg)?;
-    cuteafd_loader::families::minimax_m3::cache::MiniMaxCacheLayout::for_runtime(
-        &cfg, 1, request.sizing.context, request.kv_format)?;
-    let programs = ProgramSizes::from_manifest(programs, request.sizing)?;
-    let ledger = RuntimeLedger::new(&cfg, request.sizing, &programs)?;
-    let weights = RankWeightLayout::from_checkpoint(checkpoint, 0, 1)?;
-    let weights = if request.host_embedding { weights.with_host_embedding(checkpoint)? } else { weights };
     let catalog = cuteafd_loader::read_expert_catalog(&checkpoint.snapshot)?;
-    let layers = cfg.moe.iter().enumerate().filter_map(|(layer, &moe)| moe.then_some(layer)).collect();
-    let working = SparkWorkingSet { rtx_layers: vec![], spark_layers: layers,
-        spark_ranks: request.sizing.spark_ranks, prefill_lanes: request.sizing.lanes as u64 };
-    let endpoint = cuteafd_core::SparkEndpoint { capacity: request.sizing.rows.try_into()?, ingress: cuteafd_core::SparkIngress::Bf16 };
-    let rings = cuteafd_core::SparkRings { max_frame_bytes: 64 << 20, depth: 8, slot_bytes: 8 << 20, alignment: 4096 };
-    let io = working.rank_endpoints_io(0, catalog.routed_experts().geometry()?, &vec![endpoint; request.sizing.lanes], rings)?;
-    // Remote code/scratch is architecture-specific. This selects owners only;
-    // measured worker admission remains mandatory before any transport launch.
-    let remote_reserved = [io.intake, io.host_exchange, io.row_indices, io.endpoint_staging, io.mapped_rings,
-        512 << 20, cuteafd_core::memory_layout::SPARK_RUNTIME_RESIDUAL_BYTES]
-        .into_iter().try_fold(0u64, |sum, b| sum.checked_add(b)).context("MiniMax remote reservation overflow")?;
-    let with_vision = remote_reserved.checked_add(request.spark_vision_bytes).context("MiniMax remote vision reservation overflow")?;
-    let onboard = admission::onboard_layers(&catalog, &cfg, request.sizing, request.spark_budget, with_vision, request.onboard);
-    if request.spark_vision_bytes > 0 && request.onboard.is_none() && onboard.as_ref().map_or(true, |o| !o.local_layers.is_empty()) {
-        // Every routed layer fits the Sparks without the tower: the tower is the cause, not onboarding.
-        if let Ok(all) = admission::onboard_layers(&catalog, &cfg, request.sizing, request.spark_budget, remote_reserved, Some(0)) {
-            let experts = all.spark_bytes.iter().copied().max().unwrap_or(0).saturating_add(remote_reserved);
-            let gb = |bytes: u64| bytes as f64 / 1e9;
-            anyhow::bail!("Spark-hosted vision needs {:.2} GB on every Spark rank, but each TP{} rank has {:.2} GB left \
-                after its experts ({:.2} of {:.2} GB): use the local tower (--vision auto or rtx, without --vision-peers) \
-                or more Spark ranks", gb(request.spark_vision_bytes), request.sizing.spark_ranks,
-                gb(request.spark_budget.saturating_sub(experts)), gb(experts), gb(request.spark_budget));
-        }
-    }
-    let onboard = onboard?;
-    let (expert_workspace, local_capacity) = if onboard.local_layers.is_empty() { (0, None) } else {
-        let package = local_package.context("MiniMax onboarded layers require the native TP1 expert package manifest")?;
-        let bytes = admission::expert_workspace(package, 1, request.sizing.rows)?;
-        let capacity = package["layouts"]["tp1"]["capacities"].as_array().context("MiniMax TP1 package capacities")?
-            .iter().filter_map(|c| c["capacity"].as_u64()).filter(|c| *c >= request.sizing.rows as u64)
-            .min().context("MiniMax TP1 package row capacity")?;
-        (bytes, Some(usize::try_from(capacity)?))
-    };
-    let graphs = admission::decode_graphs(request.sizing, request.draft_rings)?;
-    let mut reservations = Reservations { weights: weights.resident_bytes.checked_add(request.draft_bytes).context("MiniMax draft admission overflow")?, local_experts: onboard.local_bytes,
-        expert_workspace, headroom: request.headroom, graphs: graphs.inventory.bytes(0), ..Default::default() };
-    reservations.startup = reservations.fixed_bytes(&ledger)?.checked_add(admission::scale_prep_staging_bytes(&weights))
-        .context("MiniMax load peak overflow")?;
-    let cache = admission::admit(&cfg, request.sizing, &ledger, reservations, request.available,
-        request.requested_pool, request.kv_format)?;
+    let rings = crate::shared::placement::spark_rings(cuteafd_transport::TcpTransportConfig::default().max_frame_bytes)?;
+    let recipe = admission::Recipe::new(&cfg, checkpoint, &catalog, programs, local_package, admission::Request {
+        sizing: request.sizing, kv_format: request.kv_format, onboard: request.onboard, spark_budget: request.spark_budget,
+        spark_vision_bytes: request.spark_vision_bytes, headroom: request.headroom, draft_bytes: request.draft_bytes,
+        draft_rings: request.draft_rings, host_embedding: request.host_embedding, rings })?;
+    let (cache, reservations) = recipe.admit(&cfg, request.available, request.requested_pool)?;
     ensure!(cache.total_bytes <= request.available, "MiniMax admission exceeded its measured free bytes");
-    Ok(Admitted { cache, ledger, programs, local_layers: onboard.local_layers, spark_layers: onboard.spark_layers,
-        weights, local_capacity, graphs, reservations })
+    Ok(Admitted { cache, ledger: recipe.ledger, local_layers: recipe.onboarding.local_layers,
+        spark_layers: recipe.onboarding.spark_layers, graphs: recipe.graphs, reservations })
 }
 
 #[cfg(test)]
@@ -116,23 +72,43 @@ mod tests {
         }).collect::<Vec<_>>()})
     }
 
+    /// The native expert package beside PROGRAMS.json: TP1 for onboarded layers and, optionally,
+    /// the Spark world's layout with its exported scratch.
+    fn package(remote_scratch: Option<u64>) -> serde_json::Value {
+        let layout = |tp: usize, scratch: u64| serde_json::json!({"hidden":6144,"intermediate":3072,"experts":128,
+            "top_k":4,"tp":tp,"slice":3072 / tp,"input":"bf16","weights":"nvfp4","activation":"swigluoai_uninterleave",
+            "projection":"bf16","swiglu_limit":7.0,"abi_version":5,"capacities":[{"capacity":256,"scratch_bytes":scratch}]});
+        let mut layouts = serde_json::json!({"tp1": layout(1, 102_837_248)});
+        if let Some(scratch) = remote_scratch { layouts["tp3"] = layout(3, scratch); }
+        serde_json::json!({"layouts": layouts})
+    }
+
     #[test]
     fn minimax_runtime_and_manifest_plan_share_allocation_bytes() -> Result<()> {
-        runtime_and_manifest_plan_share_allocation_bytes(false)
+        runtime_and_manifest_plan_share_allocation_bytes(false, None)
     }
 
     #[test]
     fn minimax_host_embedding_runtime_and_manifest_plan_share_allocation_bytes() -> Result<()> {
-        runtime_and_manifest_plan_share_allocation_bytes(true)
+        runtime_and_manifest_plan_share_allocation_bytes(true, None)
     }
 
-    fn runtime_and_manifest_plan_share_allocation_bytes(host_embedding: bool) -> Result<()> {
+    /// An exported Spark scratch large enough to onboard layers moves both ledgers alike.
+    #[test]
+    fn minimax_exported_remote_scratch_onboards_alike_in_plan_and_server() -> Result<()> {
+        runtime_and_manifest_plan_share_allocation_bytes(false, Some(40 << 30))
+    }
+
+    fn runtime_and_manifest_plan_share_allocation_bytes(host_embedding: bool, remote_scratch: Option<u64>) -> Result<()> {
         let dir = tempfile::tempdir()?;
         testing::write_minimax_m3_snapshot(dir.path(), false, false);
         let checkpoint = Checkpoint::open(dir.path())?;
         let programs = manifest();
         let path = dir.path().join("PROGRAMS.json");
         std::fs::write(&path, programs.to_string())?;
+        let package = package(remote_scratch);
+        std::fs::create_dir_all(dir.path().join("fp8/fp8-minimax-nvfp4a4"))?;
+        std::fs::write(dir.path().join("fp8/fp8-minimax-nvfp4a4/manifest.json"), package.to_string())?;
         let options = LayoutOptions { workspace_manifest: Some(path), prefill_rows: 256, concurrency: 16,
             context_tokens: 4096, pool_tokens: Some(4096), headroom_bytes: 0, native_mtp_layers: 0, host_embedding, ..Default::default() };
         let report = plan::plan(dir.path(), &PlanOptions { placement: ExpertPlacement::Sparks { ranks: 3 },
@@ -145,7 +121,7 @@ mod tests {
         let graph_groups = ["graphs", cuteafd_loader::placement::inventory::GRAPH_GROWTH];
         let measured_baseline: u64 = device.items.iter().filter(|i| i.category == cuteafd_core::memory_layout::Category::Runtime
             && !graph_groups.contains(&i.group.as_str())).map(|i| i.bytes).sum();
-        let mut live = solve(&checkpoint, &programs, None, Request {
+        let mut live = solve(&checkpoint, &programs, Some(&package), Request {
             sizing: RuntimeSizing { rows: 256, decode_rows: 64, sequences: 16, context: 4096, spark_ranks: 3, logit_rows: 64,
                 lanes: cuteafd_loader::serving_capacity::prefill_lanes::DEFAULT_PREFILL_LANES, host_landing: false },
             available: options.rtx_bytes[0] - measured_baseline, requested_pool: Some(4096),
@@ -154,10 +130,11 @@ mod tests {
         })?;
         assert_eq!(live.cache.total_bytes + measured_baseline, device.used_bytes());
         assert_eq!(live.cache.pool_tokens, memory.pool_tokens);
-        assert_eq!(live.weights.operands.iter().any(|o| o.name.ends_with("embed_tokens.weight")), !host_embedding);
-        assert!(live.weights.operands.iter().any(|o| o.name == "language_model.lm_head.weight"));
-        assert!(live.local_layers.is_empty());
-        assert_eq!(live.spark_layers, (3..60).collect::<Vec<_>>());
+        let onboarded = memory.notes.iter().find_map(|n| n.split_once(" routed layers on the RTX")).unwrap().0;
+        assert_eq!(onboarded, live.local_layers.len().to_string());
+        assert_eq!(live.local_layers.is_empty(), remote_scratch.is_none());
+        assert_eq!(live.spark_layers, (3 + live.local_layers.len()..60).collect::<Vec<_>>());
+        if remote_scratch.is_some() { return Ok(()); }
         // The same decode graph keys are recorded by the server and charged by both ledgers.
         assert_eq!(live.graphs.keys, (1..=16).collect::<Vec<_>>());
         let charged: u64 = device.items.iter().filter(|i| graph_groups.contains(&i.group.as_str())).map(|i| i.bytes).sum();

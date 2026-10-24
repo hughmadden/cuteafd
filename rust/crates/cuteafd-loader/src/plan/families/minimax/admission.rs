@@ -77,7 +77,7 @@ impl RuntimeSizing {
 pub const PROGRAM_NAMES: &[&str] = &[
     "norm", "q_norm_rope", "k_norm_rope", "index_q_norm_rope", "index_k_norm_rope",
     "rope", "scale_prep", "kv_split", "swiglu_i3072", "swiglu_i12288", "router_scores",
-    "route", "residual", "index_q_quant", "index_k_quant", "index_k_pack", "kv_pack",
+    "route", "residual", "index_q_quant", "index_k_pack", "kv_pack",
     "mxfp8_q", "mxfp8_kv", "mxfp8_o", "mxfp8_index_q", "mxfp8_index_k",
     "mxfp8_shared_gate_up", "mxfp8_shared_down", "mxfp8_dense_gate_up", "mxfp8_dense_down",
     "mxfp8_q_decode", "mxfp8_kv_decode", "mxfp8_index_q_decode", "mxfp8_index_k_decode",
@@ -281,11 +281,11 @@ pub struct Admission {
 pub fn admit(cfg: &MiniMaxM3Config, sizing: RuntimeSizing, ledger: &RuntimeLedger, reservations: Reservations,
     available: u64, requested_pool: Option<u64>, kv_format: Qwen4KvCache) -> Result<Admission> {
     sizing.validate(cfg)?;
-    let cache = MiniMaxCacheLayout::for_runtime(cfg, 1, sizing.context, kv_format)?;
+    let cache = MiniMaxCacheLayout::new(cfg, sizing.context, kv_format)?;
     let fixed_bytes = reservations.fixed_bytes(ledger)?;
     let needed = fixed_bytes.max(reservations.startup);
     if needed > available { return Err(AdmissionError::Budget { needed, available }); }
-    let page_bytes = cache.ranks[0].page_bytes;
+    let page_bytes = cache.page_bytes;
     let fitting = (available - fixed_bytes) / page_bytes;
     let pool_pages = match requested_pool.filter(|n| *n > 0) {
         Some(tokens) if tokens % PAGE_ROWS != 0 => return Err(AdmissionError::Unsupported("pool not aligned to 64-token pages")),
@@ -357,6 +357,118 @@ pub fn onboard_layers(catalog: &crate::OfficialV41Catalog, cfg: &MiniMaxM3Config
         }
     }
     Err(AdmissionError::Budget { needed: shortfall, available: budget })
+}
+
+/// Expert package scratch per Spark rank when the coordinator's package manifest has no layout
+/// for the Spark world (remote packages are architecture-specific and need not be installed on
+/// the coordinator): an estimate, until measured worker admission replaces it.
+pub const REMOTE_SCRATCH_ESTIMATE_BYTES: u64 = 512 << 20;
+
+/// What one coordinator admits, beside its checkpoint and manifests.
+#[derive(Debug, Clone, Copy)]
+pub struct Request {
+    pub sizing: RuntimeSizing,
+    pub kv_format: Qwen4KvCache,
+    /// A fixed count of bottom routed layers on the coordinator; `None` onboards the fewest that fit.
+    pub onboard: Option<usize>,
+    pub spark_budget: u64,
+    /// What a Spark-hosted vision tower holds on every rank beside the experts (0 when local).
+    pub spark_vision_bytes: u64,
+    pub headroom: u64,
+    /// The bundled drafter's bytes (0 without it).
+    pub draft_bytes: u64,
+    /// Drafter context rings (0 without the drafter): bounds the verify rows.
+    pub draft_rings: usize,
+    pub host_embedding: bool,
+    /// The ring geometry every Spark link registers.
+    pub rings: cuteafd_core::SparkRings,
+}
+
+/// One coordinator's allocations before its KV pool, the one recipe the server admits into
+/// measured free memory and the planner into the card's budget (adding the CUDA context, code
+/// and an RTX-hosted tower that the server's sample already holds).
+#[derive(Debug, Clone)]
+pub struct Recipe {
+    pub request: Request,
+    pub cache: MiniMaxCacheLayout,
+    pub ledger: RuntimeLedger,
+    pub programs: ProgramSizes,
+    pub weights: RankWeightLayout,
+    pub onboarding: Onboarding,
+    /// Decode steps the warm-up records before ready; their bytes are reserved.
+    pub graphs: crate::placement::inventory::StartupGraphs<usize>,
+    /// One Spark endpoint per prefill lane.
+    pub endpoints: Vec<cuteafd_core::SparkEndpoint>,
+    /// The package scratch on each Spark rank, when the package exports the world's layout.
+    pub remote_scratch: Option<u64>,
+    /// Every Spark rank's bytes beside its experts: transport, package scratch and the runtime residual.
+    pub remote_reserved: u64,
+    pub reservations: Reservations,
+}
+
+impl Recipe {
+    pub fn new(cfg: &MiniMaxM3Config, checkpoint: &crate::plan::checkpoint::Checkpoint, catalog: &crate::OfficialV41Catalog,
+        programs: &Value, package: Option<&Value>, request: Request) -> anyhow::Result<Self> {
+        use anyhow::Context;
+        let sizing = request.sizing;
+        sizing.validate(cfg)?;
+        let cache = MiniMaxCacheLayout::new(cfg, sizing.context, request.kv_format)?;
+        let programs = ProgramSizes::from_manifest(programs, sizing)?;
+        let ledger = RuntimeLedger::new(cfg, sizing, &programs)?;
+        let weights = RankWeightLayout::from_checkpoint(checkpoint, 0, 1)?;
+        let weights = if request.host_embedding { weights.with_host_embedding(checkpoint)? } else { weights };
+        let endpoints = vec![cuteafd_core::SparkEndpoint { capacity: u32::try_from(sizing.rows)?,
+            ingress: cuteafd_core::SparkIngress::Bf16 }; sizing.lanes];
+        let all_remote = crate::placement::SparkWorkingSet { rtx_layers: vec![], spark_layers: cfg.moe.iter().enumerate()
+            .filter_map(|(layer, &moe)| moe.then_some(layer)).collect(), spark_ranks: sizing.spark_ranks, prefill_lanes: sizing.lanes as u64 };
+        let io = all_remote.rank_endpoints_io(0, catalog.routed_experts().geometry()?, &endpoints, request.rings)?;
+        let world = format!("tp{}", sizing.spark_ranks);
+        let remote_scratch = package.filter(|p| p["layouts"][&world].is_object())
+            .map(|p| expert_workspace(p, sizing.spark_ranks, sizing.rows)).transpose()?;
+        let remote_reserved = sum([io.intake, io.host_exchange, io.row_indices, io.endpoint_staging, io.mapped_rings,
+            remote_scratch.unwrap_or(REMOTE_SCRATCH_ESTIMATE_BYTES), cuteafd_core::memory_layout::SPARK_RUNTIME_RESIDUAL_BYTES])?;
+        let with_vision = remote_reserved.checked_add(request.spark_vision_bytes).context("MiniMax remote vision reservation overflow")?;
+        let onboarding = onboard_layers(catalog, cfg, sizing, request.spark_budget, with_vision, request.onboard);
+        if request.spark_vision_bytes > 0 && request.onboard.is_none() && onboarding.as_ref().map_or(true, |o| !o.local_layers.is_empty()) {
+            // Every routed layer fits the Sparks without the tower: the tower is the cause, not onboarding.
+            if let Ok(all) = onboard_layers(catalog, cfg, sizing, request.spark_budget, remote_reserved, Some(0)) {
+                let experts = all.spark_bytes.iter().copied().max().unwrap_or(0).saturating_add(remote_reserved);
+                let gb = |bytes: u64| bytes as f64 / 1e9;
+                anyhow::bail!("Spark-hosted vision needs {:.2} GB on every Spark rank, but each TP{} rank has {:.2} GB left \
+                    after its experts ({:.2} of {:.2} GB): use the local tower (--vision auto or rtx, without --vision-peers) \
+                    or more Spark ranks", gb(request.spark_vision_bytes), sizing.spark_ranks,
+                    gb(request.spark_budget.saturating_sub(experts)), gb(experts), gb(request.spark_budget));
+            }
+        }
+        let onboarding = onboarding?;
+        let expert_workspace = if onboarding.local_layers.is_empty() { 0 } else {
+            expert_workspace(package.context("MiniMax onboarded layers require the native expert package manifest \
+                (fp8-minimax-nvfp4a4/manifest.json)")?, 1, sizing.rows)?
+        };
+        let graphs = decode_graphs(sizing, request.draft_rings)?;
+        let reservations = Reservations { weights: weights.resident_bytes.checked_add(request.draft_bytes)
+                .context("MiniMax drafter reservation overflow")?, local_experts: onboarding.local_bytes,
+            expert_workspace, headroom: request.headroom, graphs: graphs.inventory.bytes(0), ..Default::default() };
+        Ok(Self { request, cache, ledger, programs, weights, onboarding, graphs, endpoints, remote_scratch, remote_reserved, reservations })
+    }
+
+    /// The Spark working set once onboarding chose the coordinator's routed layers.
+    pub fn working_set(&self) -> crate::placement::SparkWorkingSet {
+        crate::placement::SparkWorkingSet { rtx_layers: self.onboarding.local_layers.clone(),
+            spark_layers: self.onboarding.spark_layers.clone(), spark_ranks: self.request.sizing.spark_ranks,
+            prefill_lanes: self.request.sizing.lanes as u64 }
+    }
+
+    /// Admit the KV pool into `available` bytes beside the reservations. The load peak adds the
+    /// one source scale matrix staged at a time while the weights load; the returned reservations
+    /// admit the same recipe again.
+    pub fn admit(&self, cfg: &MiniMaxM3Config, available: u64, requested_pool: Option<u64>) -> Result<(Admission, Reservations)> {
+        let mut reservations = self.reservations;
+        reservations.startup = reservations.fixed_bytes(&self.ledger)?.checked_add(scale_prep_staging_bytes(&self.weights))
+            .ok_or(AdmissionError::Overflow("load peak"))?;
+        let admitted = admit(cfg, self.request.sizing, &self.ledger, reservations, available, requested_pool, self.request.kv_format)?;
+        Ok((admitted, reservations))
+    }
 }
 
 #[cfg(test)]

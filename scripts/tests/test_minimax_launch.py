@@ -1,9 +1,8 @@
-"""MiniMax launch arguments and CPU-only header admission."""
+"""MiniMax launch arguments, the shared dry run and the example configs."""
 from __future__ import annotations
 
 import json
-import os
-import subprocess
+import re
 from pathlib import Path
 
 import pytest
@@ -18,7 +17,8 @@ REVISION = "54e4e69dfc452b1e94a426c24a4fdeeaa8e3ad5e"
 CONFIG = {"model_type": "minimax_m3_vl", "text_config": {
     "model_type": "minimax_m3", "num_hidden_layers": 60,
     "moe_layer_freq": [0] * 3 + [1] * 57,
-}}
+}, "quantization_config": {"quant_method": "mxfp8", "moe_quant_algo": "NVFP4",
+                           "moe_quant_format": "nvfp4-pack-quantized", "group_size": 16}}
 PLANNED = {"placement_supported": True, "fits": True, "spark_budget_bytes": 108 << 30}
 
 
@@ -101,78 +101,50 @@ def test_minimax_refuses_push_loading(tmp_path):
     assert "docker run -d" not in result.stderr
 
 
-def _cpu_dry_run(tmp_path: Path, config_text: str, *args: str, plan: dict | None = None):
-    snapshot = tmp_path / "snapshot"
-    snapshot.mkdir()
-    (snapshot / "config.json").write_text(json.dumps(CONFIG))
-    config = tmp_path / "launch.config"
-    config.write_text(config_text + f"\nMODEL_ID={snapshot}\n")
-    tools = tmp_path / "bin"
-    tools.mkdir()
-    calls = tmp_path / "forbidden.calls"
-    for name in ("docker", "ssh", "nvidia-smi", "nest"):
-        tool = tools / name
-        tool.write_text('#!/usr/bin/env bash\nprintf "%s\\n" "$0 $*" >> "$FORBIDDEN_CALLS"\nexit 99\n')
-        tool.chmod(0o755)
-    planner = tools / "cuteafd-plan"
-    planner.write_text('''#!/usr/bin/env python3
-import json, os, sys
-print(os.environ.get("FAKE_PLAN") or json.dumps({"args": sys.argv[1:], "executable": False}))
-''')
-    planner.chmod(0o755)
-    env = {**os.environ, "PATH": f"{tools}:{os.environ['PATH']}",
-           "CUTEAFD_PLAN_BIN": str(planner), "FORBIDDEN_CALLS": str(calls)}
-    if plan is not None:
-        env["FAKE_PLAN"] = json.dumps(plan)
-    result = subprocess.run([str(ROOT / "run.sh"), "--config", str(config), *args, "--dry-run"],
-                            capture_output=True, text=True, env=env, timeout=30)
-    assert not calls.exists(), calls.read_text() if calls.exists() else ""
-    return result
+def test_minimax_dry_run_takes_the_shared_deployment_plan(tmp_path):
+    result = _launch(tmp_path, extra_args=("--wip", "qualification", "--dry-run"))
+    assert result.returncode == 0, result.stderr
+    # The last line is the deployment the launch would take (the slot's source check prints first).
+    deployment = json.loads(result.stdout.splitlines()[-1])
+    assert deployment["family"] == "minimax_m3" and deployment["wip_launchable"]
+    plan = _line(result, "cuteafd plan")
+    assert _flag(plan, "--spark-ranks") == "4" and "--deployment" in plan
+    assert "docker run -d" not in result.stderr and "serve-minimax --snapshot" not in result.stderr
 
 
-@pytest.mark.parametrize("card,budget", [("5090", "31.8"), ("pro6000", "95.5")])
+# The examples' cards, as CUDA reports them: an RTX 5090 and a PRO 6000 (PRO_TOTAL_BYTES).
+CARD_MIB = {"5090": 32607, "pro6000": 101_973_491_712 >> 20}
+
+
+def _example_launch(tmp_path, pairs, card, tp):
+    """The coordinator, plan and worker commands a WIP launch of these keys would start."""
+    keys = "".join(f"{key}={value}\n" for key, value in pairs if key not in ("MODEL_ID", "MODEL_REVISION"))
+    result = _family_launch_result(tmp_path, CONFIG, MODEL, keys + _hosts(4), encoder_plan=PLANNED,
+        gpu_total_mib=CARD_MIB[card], gpu_free_mib=CARD_MIB[card] - 500, extra_args=("--wip", "example"))
+    commands = [re.sub(r"/tmp/\S*?/(hf|home|repo)/", r"<\1>/", line.strip()) for line in result.stderr.splitlines()
+                if any(name in line for name in ("serve-minimax --snapshot", "cuteafd plan", "cuteafd expertd-native"))]
+    return result.returncode, sorted(commands)
+
+
+@pytest.mark.parametrize("card", ["5090", "pro6000"])
 @pytest.mark.parametrize("tp", [2, 3, 4])
-def test_minimax_examples_have_cpu_only_dry_run(tmp_path, card, budget, tp):
+def test_minimax_examples_state_only_what_differs_from_the_launcher(tmp_path, card, tp):
     example = ROOT / "examples/configs" / f"minimax-m31-flash-nvfp4-{card}-tp{tp}.config"
     text = example.read_text()
     assert all(needle not in text.lower() for needle in PRIVATE)
-    assert f"MODEL_ID={MODEL}\n" in text and f"MODEL_REVISION={REVISION}\n" in text
-    assert f"COORDINATOR_GPU_BUDGET_GIB={budget}\n" in text
-    assert f"RTX_EXPERT_LAYERS={'auto' if tp == 2 else '0'}\n" in text
-    result = _cpu_dry_run(tmp_path, text)
-    assert result.returncode == 0, result.stderr
-    output = json.loads(result.stdout)
-    assert not output["executable"]
-    args = output["args"]
-    prefill_rows = "1024" if (card, tp) == ("5090", 2) else "4096"
-    for flag, value in (("--spark-ranks", str(tp)), ("--rtx", "1"),
-                        ("--coordinator-gpu-budget-gib", budget), ("--speculator", "off"),
-                        ("--kv-cache", "fp8"), ("--prefill-rows", prefill_rows), ("--host-cache-bytes", "auto")):
-        assert args[args.index(flag) + 1] == value
-    assert "--require-ready" not in args
-    assert "header admission only" in result.stderr
-
-
-@pytest.mark.parametrize("launchable", [True, False])
-def test_minimax_wip_dry_run_takes_the_launch_deployment_guard(tmp_path, launchable):
-    text = (ROOT / "examples/configs/minimax-m31-flash-nvfp4-5090-tp2.config").read_text()
-    plan = {"version": 1, "family": "minimax_m3", "launch": {"family": "minimax_m3"},
-            "spark_admission": "coordinator_authoritative", "executable": False,
-            "wip_launchable": launchable, "report": {"hints": ["coordinator pool below one request"]}}
-    result = _cpu_dry_run(tmp_path, text, "--wip", "qualification", plan=plan)
-    if launchable:
-        assert result.returncode == 0, result.stderr
-        assert json.loads(result.stdout)["wip_launchable"]
-    else:
-        assert result.returncode != 0
-        assert "invalid deployment specification" in result.stderr
-        assert "coordinator pool below one request" in result.stderr
-
-
-def test_minimax_cpu_dry_run_checks_family_keys(tmp_path):
-    result = _cpu_dry_run(tmp_path, "SPARK_COUNT=4\nSPECULATOR_DEPTH=3\n")
-    assert result.returncode != 0
-    assert "unused configuration key: SPECULATOR_DEPTH" in result.stderr
+    assert f"./run.sh --config examples/configs/{example.name} --wip SLOT --dry-run" in text
+    pairs = re.findall(r"^([A-Z_0-9]+)=(.*)$", text, re.M)
+    assert dict(pairs)["MODEL_ID"] == MODEL and dict(pairs)["MODEL_REVISION"] == REVISION
+    assert dict(pairs)["SPARK_COUNT"] == str(tp)
+    code, commands = _example_launch(tmp_path / "example", pairs, card, tp)
+    assert code == 0 and len(commands) == tp + 2, commands
+    # Every key changes what the launcher starts: none restates a default. The release pair is
+    # the promoted one every example names; a WIP launch runs the slot instead.
+    for index, (key, value) in enumerate(pairs):
+        if key in ("MODEL_ID", "MODEL_REVISION", "COORDINATOR_DOCKER_INFERENCE", "SPARK_EXPERT_DOCKER_INFERENCE"):
+            continue
+        assert _example_launch(tmp_path / key, pairs[:index] + pairs[index + 1:], card, tp) != (code, commands), \
+            f"{key}={value} is the launcher's default"
 
 
 @pytest.mark.parametrize("kind", ["spark", "rtx"])

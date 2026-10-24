@@ -72,11 +72,11 @@ attention placement.
 | Step-5-Preview · NVFP4 (#274) | [min](step5-nvfp4-min.config) | 1 RTX + 4 Spark |
 
 MiniMax-M3.1-Flash uses one coordinator with native NVFP4 W4A4 experts and
-MXFP8 linears. Select images containing `serve-minimax` and the
-`fp8-minimax-nvfp4a4` package, or a matching WIP slot. These configurations
-still require device qualification; their CPU-only `--dry-run` reads checkpoint
-headers using `CUTEAFD_PLAN_BIN`, which must name a built `cuteafd` executable.
-`MODEL_ID` may name a local snapshot directory for this check.
+MXFP8 linears. It is under qualification too: serve it from a `./wip.sh` slot
+whose binary has `serve-minimax` (`--wip SLOT`; `--dry-run` plans the launch
+without starting it). Each file states only what differs from the launcher's
+defaults: the Spark world, the 5090's GPU budget, and at TP3/TP4 no routed
+layers on the RTX.
 
 | Coordinator | Spark TP2 | Spark TP3 | Spark TP4 |
 | --- | --- | --- | --- |

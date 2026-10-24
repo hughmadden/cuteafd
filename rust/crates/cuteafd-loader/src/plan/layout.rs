@@ -149,10 +149,6 @@ pub struct LayoutOptions {
     pub step5_kv: crate::families::qwen4::Qwen4KvCache,
     /// MiniMax M3 paged K/V storage (`--kv-cache`).
     pub minimax_kv: crate::families::qwen4::Qwen4KvCache,
-    /// Planning-only NVFP4 K/V (`--kv-cache nvfp4`): a proposal that never admits serving.
-    pub minimax_nvfp4_kv: bool,
-    /// Opt-in C1 profile: 256 prefill rows and one sequence, preserving DSpark.
-    pub minimax_5090: bool,
     /// Selected Qwen projection/head residency, matching serve-qwen4.
     pub qwen_representation: crate::families::qwen4::resident::Qwen4Representation,
     /// Qwen immutable attention scratch override.
@@ -237,8 +233,6 @@ impl Default for LayoutOptions {
             qwen_kv: Default::default(),
             step5_kv: crate::families::qwen4::Qwen4KvCache::Fp8,
             minimax_kv: crate::families::qwen4::Qwen4KvCache::Fp8,
-            minimax_nvfp4_kv: false,
-            minimax_5090: false,
             qwen_representation: crate::families::qwen4::resident::Qwen4Representation {
                 fp8_projections: false, fp8_head: true },
             qwen_attention_plan_rows: None,

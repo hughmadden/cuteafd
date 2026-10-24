@@ -253,6 +253,15 @@ pub fn draft_attention_workspace_bytes(sequences: u64, kv_heads: u64, slices: u6
         .try_fold(sequences, |bytes, n| bytes.checked_mul(n).ok_or_else(overflow))
 }
 
+/// The shared dSpark Markov head's scratch (`glmf_dspark.cu`): 296 FP32 maxima and uint32 ids
+/// per sequence, plus one uint32 scratch token for every drafted row of a `block`-row block.
+pub fn draft_markov_workspace_bytes(sequences: u64, block: u64) -> Result<u64, CacheGeometryError> {
+    sequences.checked_mul(296 * 8)
+        .zip(sequences.checked_mul(block).and_then(|rows| rows.checked_mul(4)))
+        .and_then(|(maxima, tokens)| maxima.checked_add(tokens))
+        .ok_or(CacheGeometryError::Overflow("draft Markov workspace"))
+}
+
 #[cfg(test)]
 mod draft_attention_tests {
     use super::*;
