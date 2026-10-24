@@ -26,6 +26,28 @@ fn fp8_partial_blocks_use_each_sources_own_metadata() {
 }
 
 #[test]
+fn fp8_exl3_wrapper_uses_original_quantization_config_for_dense_blocks() {
+    // Metadata shape in the recovered alternate weights revision: routed experts are EXL3,
+    // while retained dense FP8 operands keep the original HF block declaration.
+    let dir = tempfile::tempdir().unwrap();
+    let quantization = serde_json::json!({"quant_method":"exl3", "bits":4,
+        "weight_block_size":[7,7],
+        "original_quantization_config":{"quant_method":"fp8", "fmt":"e4m3", "weight_block_size":[128,128]}});
+    std::fs::write(dir.path().join("config.json"),serde_json::json!({"quantization_config":quantization}).to_string()).unwrap();
+    write_safetensors(&dir.path().join("model.safetensors"),&[
+        ("w.weight","F8_E4M3",vec![129,128],vec![0x38;129*128]),
+        ("w.weight_scale_inv","F32",vec![2,1],[2f32,5.0].into_iter().flat_map(f32::to_le_bytes).collect()),
+    ]);
+    for checkpoint in [false,true] {
+        let source = if checkpoint {
+            TensorSource::from_checkpoint(&crate::plan::checkpoint::Checkpoint::open_for_role(dir.path(),"test", |_| true).unwrap())
+        } else { TensorSource::from_files([dir.path().join("model.safetensors")]).unwrap() };
+        let matrix = source.matrix("w.weight").unwrap();
+        assert_eq!((matrix.data[127*128],matrix.data[128*128]),(2.0,5.0));
+    }
+}
+
+#[test]
 fn fp8_bad_layout_and_short_scales_return_typed_errors() {
     let dir = tempfile::tempdir().unwrap();
     let file = dir.path().join("model.safetensors");
