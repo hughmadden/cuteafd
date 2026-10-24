@@ -271,7 +271,7 @@ impl<'a> GlmEngine<'a> {
         let split = self.context.as_ref().context("context split")?;
         context_decode(&split.exchange, rank, index, 0, t,
             &mut Bindings { engine: self, w, layer, tables, rank, index, rows, t })?;
-        self.o_proj(rank, w, layer, "m64", rows)
+        self.o_proj(rank, w, index, layer, "m64", rows)
     }
 
     /// Prefill attention of layer `index` on `rank` under context (module docs): gather the
@@ -337,7 +337,7 @@ fn rank_tables(tables: &StepTables, rank: usize, pages: usize) -> Result<StepTab
     let mut out = StepTables { decode: tables.decode, positions: tables.positions.clone(), slots: Vec::new(),
         page_table: Vec::new(), table_width: tables.table_width, table_stride: tables.table_stride,
         cache_lengths: tables.cache_lengths.clone(), lengths: tables.lengths.clone(),
-        exchange_rows: tables.exchange_rows };
+        exchange_rows: tables.exchange_rows, variants: tables.variants.clone() };
     if !tables.decode {
         out.slots = tables.positions.clone();
         out.page_table = (0..tables.table_width as i32).collect();
@@ -420,7 +420,7 @@ mod tests {
         let width = 16;
         let mut tables = StepTables { decode: true, positions: vec![299, 300], slots: Vec::new(),
             page_table: Vec::new(), table_width: width, table_stride: width, cache_lengths: vec![300, 301],
-            lengths: vec![300, 301], exchange_rows: 2 };
+            lengths: vec![300, 301], exchange_rows: 2, variants: vec![1, 0] };
         for &p in &tables.positions.clone() {
             let page = seq[p as usize / PAGE_ROWS] as i64;
             tables.slots.push(page * PAGE_ROWS as i64 + p % PAGE_ROWS as i64);
@@ -459,9 +459,10 @@ mod tests {
         let seq = ids(9, 1);
         let tables = StepTables { decode: false, positions: (100..550).collect(), slots: vec![0; 450],
             page_table: seq.iter().map(|&p| p as i32).collect(), table_width: 9, table_stride: 0,
-            cache_lengths: vec![0; 450], lengths: vec![0; 450], exchange_rows: 450 };
+            cache_lengths: vec![0; 450], lengths: vec![0; 450], exchange_rows: 450, variants: vec![2; 450] };
         let r = rank_tables(&tables, 1, 64).unwrap();
         assert_eq!(r.slots, tables.positions);
+        assert_eq!(r.variants, tables.variants, "rank tables keep each row's variant");
         assert_eq!(r.page_table, (0..9).collect::<Vec<_>>());
         let limit = context_commit_pages(512) as usize;
         let mut covered = vec![0u8; 550];

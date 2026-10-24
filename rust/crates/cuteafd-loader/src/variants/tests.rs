@@ -340,3 +340,52 @@ fn glm_flash_alternate_reproduces_the_pilot() {
         }
     }
 }
+
+/// The CPU form of the hardware component test: base FP8 layer output, steered by the derived
+/// tables through the kernel's host reference (BF16 in and out), against the published
+/// variant's own output on the same activations. Error sits at the format floor; base rows
+/// stay bit-identical.
+#[test]
+#[ignore = "needs the GLM-5.3 FP8 dense tensors and the alternate-weight checkpoint (pg)"]
+fn glm53_steered_rows_match_the_published_variant() {
+    use cuteafd_core::variants::{bf16_rne, bf16_to_f32, site_tables, steer_rows_ref, VariantPlan};
+    let Some(base_dir) = fixture_dir("CUTEAFD_GLM53_FP8_DENSE", "/home/turq/.cache/weight-variants/glm53-fp8-dense") else { return };
+    let Some(pack) = fixture_dir("CUTEAFD_GLM53_VARIANT", "/home/turq/models/example-org/GLM-5.3-alternate-weights") else { return };
+    let base = TensorSource::from_files(safetensors_files(&base_dir).unwrap()).unwrap();
+    // Bars: the BF16 rounding of the row itself (measured per row below) plus the tensor's leftover
+    // (FP16 rounding for down_proj; the BF16-master-versus-FP8-base floor for o_proj).
+    for (name, kind, leftover) in [("model.layers.3.mlp.shared_experts.down_proj.weight", SiteKind::Ffn, 0.001f64),
+        ("model.layers.3.self_attn.o_proj.weight", SiteKind::Attn, 0.035)] {
+        let wanted = |n: &str| n == name;
+        let variant = TensorSource::from_checkpoint(&crate::plan::checkpoint::Checkpoint::open_for_role(&pack, "variant", wanted).unwrap());
+        let (w, v) = (base.matrix(name).unwrap(), variant.matrix(name).unwrap());
+        let (op, report) = derive_site(&w, &v, &crate::families::glm5::variants::variant_opts(name)).unwrap();
+        assert!(report.accept, "{report:?}");
+        let key = SiteKey { layer: 3, kind };
+        let plan = VariantPlan::new(1, "alternate", "glm-alternate", w.rows as u32, vec![(key, op)]).unwrap();
+        let (a, b, k, k_max) = site_tables(&[plan], key, w.rows);
+        // Eight activation rows (row 0 and 5 are base rows), y = W x and y_published = W' x.
+        let mut rng = Rng(31);
+        let rows = 8;
+        let xs: Vec<Vec<f32>> = (0..rows).map(|_| (0..w.cols).map(|_| rng.next()).collect()).collect();
+        let gemv = |m: &Matrix, x: &[f32]| -> Vec<f32> { (0..m.rows).map(|r| m.row(r).iter().zip(x).map(|(a, b)| a * b).sum()).collect() };
+        let mut y: Vec<u16> = xs.iter().flat_map(|x| gemv(&w, x)).map(bf16_rne).collect();
+        let before = y.clone();
+        let vidx: Vec<i32> = (0..rows as i32).map(|r| if r == 0 || r == 5 { 0 } else { 1 }).collect();
+        steer_rows_ref(&mut y, w.rows, rows, w.rows, &vidx, &a, &b, &k, k_max);
+        for r in 0..rows {
+            let row = &y[r * w.rows..][..w.rows];
+            if vidx[r] == 0 { assert_eq!(row, &before[r * w.rows..][..w.rows], "{name}: base row {r} changed"); continue; }
+            let published = gemv(&v, &xs[r]);
+            let (mut err, mut norm, mut floor) = (0f64, 0f64, 0f64);
+            for (s, p) in row.iter().zip(&published) {
+                err += (f64::from(bf16_to_f32(*s)) - f64::from(*p)).powi(2);
+                floor += (f64::from(bf16_to_f32(bf16_rne(*p))) - f64::from(*p)).powi(2);
+                norm += f64::from(*p).powi(2);
+            }
+            let (rel, floor) = ((err / norm).sqrt(), (floor / norm).sqrt());
+            eprintln!("{name} row {r}: relative error {rel:.5} (BF16 floor {floor:.5})");
+            assert!(rel <= 1.5 * floor + leftover, "{name} row {r}: {rel} against floor {floor}");
+        }
+    }
+}

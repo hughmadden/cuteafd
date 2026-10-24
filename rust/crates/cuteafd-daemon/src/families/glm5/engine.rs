@@ -115,6 +115,8 @@ struct StepTables {
     /// Leading rows that are real (the rest pad a decode step to its row
     /// bucket and write only the scratch page): the Spark exchange sends these.
     exchange_rows: usize,
+    /// Each row's weight variant (0 = base), aligned with `positions`; padded rows are 0.
+    variants: Vec<i32>,
 }
 
 impl StepTables {
@@ -125,6 +127,7 @@ impl StepTables {
             self.slots.push(i64::from(scratch) * PAGE_ROWS as i64);
             self.cache_lengths.push(1);
             self.lengths.push(1);
+            self.variants.push(0);
             self.page_table.extend(std::iter::repeat_n(scratch, self.table_width));
         }
     }
@@ -140,6 +143,8 @@ fn placement_pages(tables: &StepTables) -> Vec<u32> {
 pub(crate) struct GlmPlacement {
     pub pages: Vec<u32>,
     pub len: usize,
+    /// The sequence's weight variant (0 = base); every row it runs carries it.
+    pub variant: u8,
 }
 
 impl GlmPlacement {
@@ -170,7 +175,7 @@ impl PageAllocator {
     /// Reserves every page a sequence of up to `capacity` tokens needs.
     pub fn admit(&mut self, capacity: usize) -> Result<GlmPlacement> {
         let pages = self.pool.alloc(self.pool.pages_for(capacity)).context("cache pages exhausted")?;
-        Ok(GlmPlacement { pages, len: 0 })
+        Ok(GlmPlacement { pages, len: 0, variant: 0 })
     }
 
     /// A second sequence starting as `source`'s first `len` rows: full pages shared, the
@@ -178,7 +183,7 @@ impl PageAllocator {
     pub fn fork(&mut self, source: &GlmPlacement, len: usize, capacity: usize)
         -> Result<(GlmPlacement, Option<cuteafd_engine::prefix::TailCopy>)> {
         let fork = self.pool.fork(&source.pages, len, self.pool.pages_for(capacity)).context("cache pages exhausted")?;
-        Ok((GlmPlacement { pages: fork.pages, len: 0 }, fork.copy))
+        Ok((GlmPlacement { pages: fork.pages, len: 0, variant: source.variant }, fork.copy))
     }
 
     pub fn release(&mut self, placement: GlmPlacement) {
@@ -198,6 +203,8 @@ struct Workspace<'a> {
     lengths: Dev<'a>,
     attn: Dev<'a>,
     delta: Dev<'a>,
+    /// Each row's weight variant (i32), uploaded with the step's tables; steering reads it.
+    variants: Dev<'a>,
     positions: Dev<'a>,
     slots: Dev<'a>,
     page_table: Dev<'a>,
@@ -352,6 +359,11 @@ pub(crate) struct GlmEngine<'a> {
     graphs_warmed: Cell<bool>,
     graphs_warming: Cell<bool>,
     graph_misses: Cell<u64>,
+    /// Weight-variant site tables (`--variant`); `None` launches nothing.
+    pub(crate) variants: Option<super::variants::GlmVariantTables<'a>>,
+    /// The running step's variant when every row shares one (prefill: a base chunk launches
+    /// no steering); `None` for a decode step, whose captured graphs always launch.
+    step_variant: Cell<Option<u8>>,
     /// The DFlash2 drafter; every step taps its target layers.
     pub drafter: Option<crate::shared::speculation::dflash::DflashDrafter<'a>>,
     pub(super) attention_plan: cuteafd_core::coordinator_programs::AttentionReductionPlan,
@@ -441,7 +453,8 @@ impl<'a> GlmEngine<'a> {
             attention_plan: cuteafd_core::coordinator_programs::AttentionReductionPlan::new(DECODE_ROWS, None, None)?,
             lanes: RefCell::new(Vec::new()), terminal: Cell::new(crate::shared::peer_split::TerminalState::Active), spark_bf16: false, full_prefill_logits: false, prefill_span_rows: DEFAULT_PREFILL_SPAN_ROWS, skip: None, l2: None, profile: RefCell::new([0.0; 3]),
             exchange_host: RefCell::new([0.0; 4]), draft_probe: RefCell::new(None),
-            graphs: RefCell::new(std::collections::HashMap::new()), graphs_warmed: Cell::new(false), graphs_warming: Cell::new(false), graph_misses: Cell::new(0), drafter: None, embedding, prefill_w8a8: true })
+            graphs: RefCell::new(std::collections::HashMap::new()), graphs_warmed: Cell::new(false), graphs_warming: Cell::new(false), graph_misses: Cell::new(0), drafter: None, embedding, prefill_w8a8: true,
+            variants: None, step_variant: Cell::new(None) })
     }
 
     /// Arm after graph warmup; only explicit verify rounds record signals.
@@ -678,6 +691,8 @@ impl<'a> GlmEngine<'a> {
         let lengths: Vec<i32> = vec![self.cfg.index_topk as i32; t];
         let lengths_dev = self.alloc(t * 4)?;
         self.library.copy_h2d(lengths_dev.buffer, bytes_of(&lengths))?;
+        let variants = self.alloc(t * 4)?;
+        self.library.cuda_zero_bytes(variants.buffer, variants.buffer.bytes)?;
         Ok(Workspace {
             rows: t,
             h: self.alloc(t * h * 2)?,
@@ -690,6 +705,7 @@ impl<'a> GlmEngine<'a> {
             lengths: lengths_dev,
             attn: self.alloc(t * heads * 512 * 2)?,
             delta: self.alloc(t * h * 2)?,
+            variants,
             positions: self.alloc(t * 8)?,
             slots: self.alloc(t * 8)?,
             page_table: self.alloc(if decode { t * self.pages * 4 } else { self.pages * 4 })?,
@@ -802,6 +818,7 @@ impl<'a> GlmEngine<'a> {
             cache_lengths: (start..start + t).map(|p| (p + 1) as i32).collect(),
             lengths: (start..start + t).map(|p| (p + 1).min(self.cfg.index_topk) as i32).collect(),
             exchange_rows: t,
+            variants: vec![i32::from(placement.variant); t],
         })
     }
 
@@ -875,7 +892,8 @@ impl<'a> GlmEngine<'a> {
         }
         let width = self.table_width_bucket(needed);
         let mut tables = StepTables { decode: true, positions: Vec::new(), slots: Vec::new(), page_table: Vec::new(),
-            table_width: width, table_stride: width, cache_lengths: Vec::new(), lengths: Vec::new(), exchange_rows: rows };
+            table_width: width, table_stride: width, cache_lengths: Vec::new(), lengths: Vec::new(), exchange_rows: rows,
+            variants: Vec::new() };
         for (placement, count) in sequences.iter() {
             let pages = placement.pages.len().min(width);
             for position in placement.len..placement.len + count {
@@ -885,6 +903,7 @@ impl<'a> GlmEngine<'a> {
                 // The index top-k selects every earlier token up to its k,
                 // leading the row: the sparse MLA reads only those.
                 tables.lengths.push((position + 1).min(self.cfg.index_topk) as i32);
+                tables.variants.push(i32::from(placement.variant));
                 tables.page_table.extend(placement.table(pages));
                 tables.page_table.extend(std::iter::repeat_n(0, width - pages));
             }
@@ -942,7 +961,7 @@ impl<'a> GlmEngine<'a> {
             let (width, bucket) = (shape.table_width, shape.rows);
             let mut tables = StepTables { decode: true, positions: Vec::new(), slots: Vec::new(),
                 page_table: Vec::new(), table_width: width, table_stride: width, cache_lengths: Vec::new(),
-                lengths: Vec::new(), exchange_rows: 1 };
+                lengths: Vec::new(), exchange_rows: 1, variants: Vec::new() };
             self.pad_rows(&mut tables, bucket);
             let experts = experts.as_mut().map(|(link, runtime)| (&mut **link, *runtime));
             self.step(&tables, &vec![0; bucket], bucket, experts, None)?;
@@ -994,6 +1013,7 @@ impl<'a> GlmEngine<'a> {
         mut experts: Option<(&mut SparkLink<'_>, &tokio::runtime::Runtime)>,
         mut on_layer: Option<&mut dyn FnMut(usize, &[u8]) -> Result<()>>) -> Result<Option<DeviceLogits>> {
         let (h, t) = (self.cfg.hidden, tables.positions.len());
+        self.step_variant.set(if tables.decode { None } else { super::variants::uniform_variant(&tables.variants) });
         // Decode steps have their own workspace; a serial prefill uses the first lane's.
         if tables.decode && self.decode_workspace.borrow().is_none() {
             *self.decode_workspace.borrow_mut() = Some(self.workspace(DECODE_ROWS, true)?);
@@ -1069,6 +1089,7 @@ impl<'a> GlmEngine<'a> {
             }
             if layer.dense {
                 self.ffn(w, layer, self.cfg.dense_intermediate, cap, w.delta.buffer.ptr, rows)?;
+                self.steer(0, w, index, cuteafd_core::variants::SiteKind::DenseFfn, w.delta.buffer.ptr, t)?;
                 if w1.is_some() {
                     self.exchange()?.push(0, ffn, w.delta.buffer.ptr, bytes)?;
                 }
@@ -1078,7 +1099,7 @@ impl<'a> GlmEngine<'a> {
             } else if let Some(skip) = &self.skip {
                 self.moe_front(w, layer, t)?;
                 let ranks = self.moe_skip(w, index, layer, t, cap)?;
-                self.reduce(skip.pointers(), w, ranks, t)?;
+                self.reduce(skip.pointers(), w, ranks, t, index)?;
             } else {
                 let (transport, runtime) = experts.as_mut()
                     .with_context(|| format!("layer {index} is an MoE layer; pass Spark peers for its routed experts"))?;
@@ -1157,7 +1178,12 @@ impl<'a> GlmEngine<'a> {
         put(&w.slots, bytes_of(&tables.slots))?;
         put(&w.page_table, bytes_of(&tables.page_table))?;
         put(&w.cache_lengths, bytes_of(&tables.cache_lengths))?;
-        put(&w.lengths, bytes_of(&tables.lengths))
+        put(&w.lengths, bytes_of(&tables.lengths))?;
+        if self.variants.is_some() {
+            ensure!(tables.variants.len() == tables.positions.len(), "step variants do not match its rows");
+            put(&w.variants, bytes_of(&tables.variants))?;
+        }
+        Ok(())
     }
 
     /// Writes a step's tables into `w` (rank 0's).
@@ -1166,7 +1192,12 @@ impl<'a> GlmEngine<'a> {
         self.put(&w.slots, &tables.slots)?;
         self.put(&w.page_table, &tables.page_table)?;
         self.put(&w.cache_lengths, &tables.cache_lengths)?;
-        self.put(&w.lengths, &tables.lengths)
+        self.put(&w.lengths, &tables.lengths)?;
+        if self.variants.is_some() {
+            ensure!(tables.variants.len() == tables.positions.len(), "step variants do not match its rows");
+            self.put(&w.variants, &tables.variants)?;
+        }
+        Ok(())
     }
 
 
@@ -1305,7 +1336,8 @@ impl<'a> GlmEngine<'a> {
                     self.exchange()?.push_to(0, DIRECT, w.h.buffer.ptr, w1.h.buffer.ptr, bytes)?;
                 }
                 if let Previous::Planes(ranks) = previous {
-                    self.reduce(planes, w, ranks, t)?;
+                    // The previous layer's FFN: its reduce runs at the start of this segment.
+                    self.reduce(planes, w, ranks, t, index.checked_sub(1).context("reduce before the first layer")?)?;
                 }
                 let weight = match layer {
                     Some(layer) => layer.ptr("input_norm")?,
@@ -1354,6 +1386,7 @@ impl<'a> GlmEngine<'a> {
                 }
                 if layer.dense {
                     self.ffn(w, layer, self.cfg.dense_intermediate, "m64", w.delta.buffer.ptr, rows)?;
+                    self.steer(0, w, index, cuteafd_core::variants::SiteKind::DenseFfn, w.delta.buffer.ptr, t)?;
                     if w1.is_some() {
                         self.exchange()?.push(0, slot(index, true, 0), w.delta.buffer.ptr, bytes)?;
                     }
@@ -1546,10 +1579,12 @@ impl<'a> GlmEngine<'a> {
         rows: Scalar, cap: &str) -> Result<()> {
         if let Some(native) = self.native_experts.get(rank) {
             let Scalar::I32(rows) = rows else { anyhow::bail!("EXLR8 shared rows must be I32"); };
-            self.on(rank, || native.shared(self.library, index, w, rows as usize, self.stream_of(rank)))
+            self.on(rank, || native.shared(self.library, index, w, rows as usize, self.stream_of(rank)))?;
         } else {
-            self.ffn_on(rank, w, layer, self.cfg.moe_intermediate, cap, w.shared.buffer.ptr, rows)
+            self.ffn_on(rank, w, layer, self.cfg.moe_intermediate, cap, w.shared.buffer.ptr, rows)?;
         }
+        // `shared-only` variants: the shared expert alone, before the reduce adds it.
+        self.steer(rank, w, index, cuteafd_core::variants::SiteKind::SharedExpert, w.shared.buffer.ptr, scalar_rows(rows)?)
     }
 
     /// Router, shared expert and the Spark routed experts; leaves
@@ -1560,7 +1595,7 @@ impl<'a> GlmEngine<'a> {
         transport: &mut SparkLink<'_>, runtime: &tokio::runtime::Runtime) -> Result<()> {
         self.moe_front(w, layer, t)?;
         let ranks = self.moe_exchange(w, index, layer, t, cap, decode, transport, runtime)?;
-        self.reduce(transport.intake.pointers(), w, ranks, t)
+        self.reduce(transport.intake.pointers(), w, ranks, t, index)
     }
 
     /// Router scores, the sigmoid top-k selection and the wire rows (device only).
@@ -1764,6 +1799,8 @@ impl<'a> GlmEngine<'a> {
         // `lanes` are the call's units in order; at most `waves` are in flight,
         // unit `u` holding workspace slot `u % waves` on both ranks.
         let waves = self.prefill_lanes.min(lanes.len()).max(1);
+        let all: Vec<i32> = lanes.iter().flat_map(|l| l.variants.iter().copied()).collect();
+        self.step_variant.set(super::variants::uniform_variant(&all));
         ensure!(waves <= link.waves(), "{waves} prefill units in flight exceed the link's {} waves", link.waves());
         {
             let mut slots = self.lane_workspaces.borrow_mut();
@@ -1896,6 +1933,7 @@ impl<'a> GlmEngine<'a> {
             }
             if layer.dense {
                 self.ffn(w, layer, self.cfg.dense_intermediate, cap, w.delta.buffer.ptr, rows)?;
+                self.steer(0, w, index, cuteafd_core::variants::SiteKind::DenseFfn, w.delta.buffer.ptr, counts[unit])?;
                 if split {
                     self.exchange()?.push(0, slot_of(index, true, slot), w.delta.buffer.ptr, bytes_of_unit(unit))?;
                 }
@@ -1909,7 +1947,7 @@ impl<'a> GlmEngine<'a> {
             let slot = unit % waves;
             let (w, rows) = (workspaces[slot], rows_of(unit));
             if let Some((planes, ranks)) = planes {
-                self.reduce(planes, w, ranks, counts[unit])?;
+                self.reduce(planes, w, ranks, counts[unit], index)?;
             }
             let weight = match layers.get(index + 1) {
                 Some(next) => next.ptr("input_norm")?,
@@ -1984,16 +2022,28 @@ impl<'a> GlmEngine<'a> {
         }
     }
 
-    /// A transport's rank planes + shared expert into `delta`. The next
-    /// wave on that transport is dispatched only after its stage's stream
-    /// sync, which follows this reduce.
-    fn reduce(&self, planes: [*const u16; crate::shared::spark_intake::MAX_INTAKE_RANKS], w: &Workspace<'_>, ranks: usize, t: usize) -> Result<()> {
+    /// A transport's rank planes + shared expert into `delta` (layer `layer`'s FFN output,
+    /// steered at its `Ffn` site). The next wave on that transport is dispatched only after
+    /// its stage's stream sync, which follows this reduce.
+    fn reduce(&self, planes: [*const u16; crate::shared::spark_intake::MAX_INTAKE_RANKS], w: &Workspace<'_>, ranks: usize,
+        t: usize, layer: usize) -> Result<()> {
         // SAFETY: the transport's intake planes, shared and delta are live
         // [t, h] BF16 buffers ordered after the wave's intake.
         unsafe {
             self.library.v41_compact_reducer()?.reduce_planes(planes, ranks as u32, w.shared.buffer.ptr.cast(),
                 w.delta.buffer.ptr.cast(), t as u32, self.stream)
-        }
+        }?;
+        self.steer(0, w, layer, cuteafd_core::variants::SiteKind::Ffn, w.delta.buffer.ptr, t)
+    }
+
+    /// Weight-variant steering of `rows` BF16 rows at `x` (site `layer`/`kind`), before they
+    /// enter the residual norm. Launches only at configured sites; a base prefill chunk skips.
+    fn steer(&self, rank: usize, w: &Workspace<'_>, layer: usize, kind: cuteafd_core::variants::SiteKind,
+        x: *mut c_void, rows: usize) -> Result<()> {
+        let Some(tables) = &self.variants else { return Ok(()) };
+        let key = cuteafd_core::variants::SiteKey { layer: u16::try_from(layer)?, kind };
+        if rank != 0 || !tables.configured(key) || self.step_variant.get() == Some(0) { return Ok(()) }
+        tables.launch(self.library, key, x, rows, w.variants.buffer.ptr.cast_const(), self.stream)
     }
 
     fn norm(&self, w: &Workspace<'_>, layer: &GlmLayer<'_>, weight: &str, deltas: i32, rows: Scalar) -> Result<()> {
@@ -2143,7 +2193,7 @@ impl<'a> GlmEngine<'a> {
                 ("lengths", w.lengths.buffer.ptr), ("out", w.attn.buffer.ptr), ("scratch", w.scratch.buffer.ptr)],
                 scalars)?;
         }
-        self.o_proj(rank, w, layer, cap, rows)
+        self.o_proj(rank, w, index, layer, cap, rows)
     }
 
     /// Rank `rank`'s latent and (full-indexer layers) index-key pools of layer `index`, and its RoPE table.
@@ -2203,10 +2253,17 @@ impl<'a> GlmEngine<'a> {
     }
 
     /// W_UV + o_proj of this rank's heads over `attn` into `delta` (a partial sum under a split).
-    fn o_proj(&self, rank: usize, w: &Workspace<'_>, layer: &GlmLayer<'_>, cap: &str, rows: Scalar) -> Result<()> {
+    fn o_proj(&self, rank: usize, w: &Workspace<'_>, index: usize, layer: &GlmLayer<'_>, cap: &str, rows: Scalar)
+        -> Result<()> {
         if layer.is_native() {
-            return self.native_o_proj(rank, w, layer, scalar_rows(rows)?, cap);
+            self.native_o_proj(rank, w, layer, scalar_rows(rows)?, cap)?;
+        } else {
+            self.o_proj_official(rank, w, layer, cap, rows)?;
         }
+        self.steer(rank, w, index, cuteafd_core::variants::SiteKind::Attn, w.delta.buffer.ptr, scalar_rows(rows)?)
+    }
+
+    fn o_proj_official(&self, rank: usize, w: &Workspace<'_>, layer: &GlmLayer<'_>, cap: &str, rows: Scalar) -> Result<()> {
         let bf16 = layer.range("w_o").is_some();
         let mut o = vec![("attn", w.attn.buffer.ptr)];
         o.extend(weight(layer, "w_uv", cap)?);
@@ -2509,9 +2566,12 @@ mod long_graph_tests {
             let mut tables = StepTables { decode: true, positions: vec![200_000; real],
                 slots: vec![123 * PAGE_ROWS as i64; real], page_table: vec![123; real * width],
                 table_width: width, table_stride: width, cache_lengths: vec![200_001; real],
-                lengths: vec![2048; real], exchange_rows: real };
+                lengths: vec![2048; real], exchange_rows: real, variants: vec![3; real] };
             tables.pad_rows(pages, bucket);
             assert_eq!(tables.exchange_rows, real);
+            // Padded rows are base rows: steering never touches them.
+            assert_eq!(tables.variants.len(), bucket);
+            assert!(tables.variants[..real].iter().all(|&v| v == 3) && tables.variants[real..].iter().all(|&v| v == 0));
             assert_eq!(&tables.page_table[..real * width], vec![123; real * width]);
             assert_eq!(&tables.positions[..real], vec![200_000; real]);
             assert_eq!(tables.page_table.len(), bucket * width);
