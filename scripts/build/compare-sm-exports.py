@@ -213,6 +213,7 @@ def jobs(scope):
              + ["bf16_index_weights"])]),
         ("audio", "export_b12x_audio_aot.py", ["--capability", "120"]),
         ("vision-attention", "export_b12x_vision_attention_aot.py", ["--capability", "120"]),
+        ("steer-rows", "export_b12x_steer_rows_aot.py", ["--capability", "120"]),
     ])
     return result
 
@@ -384,7 +385,8 @@ def worker(payload):
         export_exl3_routes(payload["args"], output)
     else:
         sys.argv = [str(path), "--output-dir", str(output), *payload["args"]]
-        if payload["exporter"] in ("export_b12x_audio_aot.py", "export_b12x_vision_attention_aot.py"):
+        if payload["exporter"] in ("export_b12x_audio_aot.py", "export_b12x_vision_attention_aot.py",
+                                  "export_b12x_steer_rows_aot.py"):
             # Standalone exporters initialize a one-SM offline target themselves.
             # Retain this worker's synthetic target so the comparison is meaningful.
             from b12x._lib import compile_pool

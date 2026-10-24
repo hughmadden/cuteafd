@@ -11,6 +11,12 @@
 //! are vocabulary ids (< 2^31); media keys are only ever later positions in practice and are
 //! verified by their full SHA-256 anyway. The tag is the variant's index inside this process;
 //! the host tier lives in process memory, and a process's variant tables never change.
+//!
+//! **Process-local only.** An index means nothing to another process, or after a restart with a
+//! different `--variant` order or changed tables. If a host tier is ever shared across processes
+//! or persisted (e.g. a 512 GB L2 tier on another host), key variants by
+//! `VariantPlan.namespace` (the SHA-256 of their tables) instead, for example as a second
+//! namespaced token, and keep base keys unchanged.
 use std::borrow::Cow;
 
 /// Variant tags fit in seven bits; first tokens must fit below the tag field.
@@ -40,6 +46,17 @@ pub fn namespaced(tokens: &[u32], tag: u8) -> Result<Cow<'_, [u32]>, NamespaceEr
 mod tests {
     use super::*;
     use crate::prefix::page_chain;
+
+    #[test]
+    fn the_tag_is_the_process_local_variant_index() {
+        // The key carries exactly the index and the first token: nothing derived from the
+        // tables, so it is valid only inside the process that assigned the indices.
+        for tag in 1..=7u8 {
+            let key = namespaced(&[0x00ab_cdef, 9], tag).unwrap();
+            assert_eq!(key[0], 0x8000_0000 | (u32::from(tag) << 24) | 0x00ab_cdef);
+            assert_eq!((key[0] >> 24) & 0x7f, u32::from(tag));
+        }
+    }
 
     #[test]
     fn base_keys_and_chains_are_unchanged_and_variants_separate() {
