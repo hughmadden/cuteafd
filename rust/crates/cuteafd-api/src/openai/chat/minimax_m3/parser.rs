@@ -16,14 +16,17 @@ pub struct MiniMaxOutputParser {
     options: MiniMaxParserOptions,
     pending: String,
     reasoning: bool,
+    /// `pending` is a tool block from its opening tag; its first `scanned`
+    /// bytes hold no closing tag.
     block: bool,
+    scanned: usize,
     calls: usize,
     stop: Option<GlmStop>,
 }
 
 impl MiniMaxOutputParser {
     pub fn new(options: MiniMaxParserOptions) -> Self {
-        Self { options, pending: String::new(), reasoning: false, block: false, calls: 0, stop: None }
+        Self { options, pending: String::new(), reasoning: false, block: false, scanned: 0, calls: 0, stop: None }
     }
 
     fn emit(&self, text: String, out: &mut Vec<OutputChunk>) {
@@ -35,13 +38,17 @@ impl MiniMaxOutputParser {
         let mut out = Vec::new();
         while !self.pending.is_empty() && self.stop.is_none() {
             if self.block {
-                let Some(end) = self.pending.find(CALL_CLOSE) else {
+                // Search only the text a closing tag could still end in, so a long block stays linear.
+                let from = self.pending.floor_char_boundary(self.scanned);
+                let Some(end) = self.pending[from..].find(CALL_CLOSE).map(|i| from + i) else {
                     if final_chunk {
                         let text = std::mem::take(&mut self.pending);
                         self.emit(text, &mut out);
                     }
+                    self.scanned = self.pending.len().saturating_sub(CALL_CLOSE.len() - 1);
                     break;
                 };
+                self.scanned = 0;
                 let text: String = self.pending.drain(..end + CALL_CLOSE.len()).collect();
                 match parse_calls(&text[CALL_OPEN.len()..end], self.options.tools.as_deref().unwrap_or_default()) {
                     Some(calls) => for (name, arguments) in calls {

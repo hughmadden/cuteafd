@@ -391,6 +391,21 @@ fn turn_markers_and_client_stops_end_the_stream() {
 }
 
 #[test]
+fn long_arguments_parse_in_linear_time() {
+    // A held block used to be rescanned whole for its closing tag on every push.
+    let text = "x".repeat(256 << 10);
+    let stream = block(&[invoke("write_file", &[param("path", "a"), param("text", &text)])]);
+    let mut parser = MiniMaxOutputParser::new(options(Some(tools())));
+    let started = std::time::Instant::now();
+    let mut chunks = Vec::new();
+    for piece in stream.as_bytes().chunks(4) { chunks.extend(parser.push(std::str::from_utf8(piece).unwrap())); }
+    chunks.extend(parser.finish());
+    let elapsed = started.elapsed();
+    assert_eq!(project(&chunks, None).calls, vec![("write_file".into(), json!({"path": "a", "text": text}))]);
+    assert!(elapsed < std::time::Duration::from_secs(1), "256 KiB in 4-byte pushes took {elapsed:?}");
+}
+
+#[test]
 fn call_count_tracks_parsed_calls_only() {
     let mut parser = MiniMaxOutputParser::new(options(Some(tools())));
     let text = format!("{}{}", block(&[invoke("get_weather", &[param("city", "a")]), invoke("get_weather", &[param("city", "b")])]),
