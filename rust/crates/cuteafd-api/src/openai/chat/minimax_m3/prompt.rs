@@ -28,6 +28,8 @@ pub fn template_context(body: &Value, tool_names: &[String]) -> Result<Value, St
     let raw = body["messages"].as_array().ok_or("messages must be an array")?;
     if raw.is_empty() { return Err("messages must not be empty".into()); }
     let mut messages = raw.iter().enumerate().map(|(i, message)| {
+        // The template reads `root`, its high-priority system prompt, only first and drops it elsewhere.
+        if i > 0 && message["role"] == "root" { return Err("a root message must be the first message".to_owned()); }
         let mut out = template_message(message, i)?;
         for key in ["current_date", "current_location"] {
             if let Some(value) = message.get(key) { out[key] = value.clone(); }

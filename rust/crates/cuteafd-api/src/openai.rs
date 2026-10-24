@@ -837,6 +837,13 @@ pub(crate) fn build(profile: &ModelProfile, limits: NativeLimits, headers: &axum
         if glm_request.is_none() { return Err(Rejection::bad("audio requires a checkpoint chat template")); }
         media::audio::strip_adapter_audio(&mut body);
     }
+    // MiniMax's template renders `developer` and its own `root` from the raw
+    // body kept above; the adapter has neither role and checks them as system.
+    if matches!(profile.encoding, ModelEncoding::MiniMaxM3(_)) {
+        for message in body.get_mut("messages").and_then(Value::as_array_mut).into_iter().flatten() {
+            if matches!(message["role"].as_str(), Some("developer" | "root")) { message["role"] = json!("system"); }
+        }
+    }
     let mut parsed: ChatCompletionRequest = serde_json::from_value(body).map_err(Rejection::bad)?;
     let include_usage = parsed.include_usage();
     let parallel = parsed.parallel_tool_calls.unwrap_or(true);

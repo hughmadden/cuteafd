@@ -647,6 +647,31 @@ async fn system_items_follow_each_template_placement_rule() {
 }
 
 #[tokio::test]
+async fn chat_developer_and_root_roles_reach_only_the_minimax_template() {
+    // MiniMax's template renders `developer` (its low-priority system slot) and
+    // `root` (its high-priority one); the adapter's role enum, shared by every
+    // family, has neither, so the other families still refuse them.
+    for family in families() {
+        let minimax = matches!(family.profile.encoding, ModelEncoding::MiniMaxM3(_));
+        let (app, worker) = serve(family.profile.clone(), family.snapshot.clone(), vec![], false);
+        for role in ["developer", "root"] {
+            let body = json!({"model":family.profile.id,"stream":false,"max_tokens":8,"thinking":{"type":"disabled"},
+                "messages":[{"role":role,"content":"Answer in French."},{"role":"user","content":"hi"}]});
+            let (status, text) = post(&app, "/v1/chat/completions", body).await;
+            assert_eq!(status, if minimax { StatusCode::OK } else { StatusCode::BAD_REQUEST }, "{} {role}: {text}", family.name);
+        }
+        let prompts = worker.prompts.lock().unwrap().clone();
+        if !minimax { assert!(prompts.is_empty(), "{}", family.name); continue; }
+        assert!(prompts[0].contains("[e~[\n]~b]developer\nAnswer in French.[e~[\n]~b]user\nhi"), "{}", prompts[0]);
+        assert!(prompts[1].starts_with("]~!b[]~b]system\nAnswer in French.\n\n<thinking_instructions>"), "{}", prompts[1]);
+        assert!(prompts[1].contains("]~b]developer\nYou are a helpful assistant.[e~["), "{}", prompts[1]);
+        // The template drops a later `root`; refuse it rather than lose its text.
+        let body = json!({"model":family.profile.id,"messages":[{"role":"user","content":"hi"},{"role":"root","content":"x"}]});
+        assert_eq!(post(&app, "/v1/chat/completions", body).await.0, StatusCode::BAD_REQUEST);
+    }
+}
+
+#[tokio::test]
 async fn resent_web_search_call_without_results_keeps_the_session_valid() {
     // Codex over HTTP (store:false) resends its hosted web_search_call items
     // by value: action and status, never the sources. Every later turn must
