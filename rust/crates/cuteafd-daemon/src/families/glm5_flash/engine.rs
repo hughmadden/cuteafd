@@ -4493,7 +4493,7 @@ impl<'a> GlmfEngine<'a> {
             let input = input.with_context(|| format!("delta at {key}: the site tensor's input is not available"))?;
             variants.delta(self.library, key, input.cast_const(), rows, y, vidx, self.stream)?;
         }
-        variants.steer(self.library, key, y, rows, vidx, self.stream)
+        variants.steer(key, y, rows, vidx, self.stream)
     }
 
     /// Layer `index`'s KDA on rank `rank` (a head split: its heads and their state), over the
