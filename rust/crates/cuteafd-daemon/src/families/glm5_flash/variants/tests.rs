@@ -82,6 +82,34 @@ fn scratch_offsets_follow_the_program_layouts() {
     assert_eq!(ffn_hidden_offset(3, 12288), 3 * 4 * 12288);
 }
 
+/// A wide prefill chunk's one-pass delta (FP32 output, then the W8A8 workspace holding every
+/// row's E4M3 activations) fits in scratch the program has finished with, for every chunk size:
+/// the KDA in-projection rows (ahead of, never over, the gated-norm input) and the FFN scratch past
+/// its SwiGLU activation (the buffer is at least the KDA program's five row regions).
+#[test]
+fn a_wide_prefill_delta_fits_in_dead_scratch() {
+    let cfg = glm53_flash();
+    let (h, d) = (cfg.hidden, cfg.kda_heads * cfg.kda_head_dim);
+    let p = 3 * d + 2 * cfg.kda_head_dim + cfg.kda_heads;
+    let kda_floor = |rows: usize| kda_norm_offset(rows, p, d) + rows * 2 * d;
+    for rows in [65, 128, 257, 1024, 2048, 4096, 8192, 16384] {
+        let total = |k| { let (out, ws) = wide_delta_bytes(rows, h, k); out + ws };
+        // KDA o_proj (K = D): the in-projection rows.
+        assert!(total(d) <= kda_spare_bytes(rows, p), "KDA at {rows} rows");
+        assert!(kda_spare_bytes(rows, p) <= kda_norm_offset(rows, p, d), "the spare region ends before the input");
+        // Shared expert and dense MLP: past the activation, inside the KDA-sized scratch.
+        for inter in [cfg.moe_intermediate, cfg.dense_intermediate] {
+            assert!(ffn_spare_offset(rows, inter) + total(inter) <= kda_floor(rows), "FFN {inter} at {rows} rows");
+            assert!(ffn_spare_offset(rows, inter) >= ffn_hidden_offset(rows, inter) + rows * inter * 2);
+        }
+    }
+    // The reported bytes at a 4096-row chunk.
+    let mib = |b: usize| b as f64 / (1 << 20) as f64;
+    let (out, ws) = wide_delta_bytes(4096, h, d);
+    assert_eq!((mib(out), kda_spare_bytes(4096, p)), (64.0, 4096 * 24896 * 2), "194.5 MiB of in-projection rows");
+    assert!((33.0..35.0).contains(&mib(ws)), "{}", mib(ws));
+}
+
 #[test]
 fn only_decode_or_a_varied_prefill_launches() {
     assert!(launches(true, &[0, 0, 0]), "decode graphs keep one topology");
