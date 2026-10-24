@@ -470,7 +470,7 @@ pub fn f16_to_f32(bits: u16) -> f32 {
 pub struct TensorSource {
     tensors: BTreeMap<String, (PathBuf, crate::SafetensorsTensorMetadata)>,
     /// Metadata belongs to each source, never borrowed from the served base.
-    quantization: BTreeMap<PathBuf, Option<serde_json::Value>>,
+    quantization: BTreeMap<PathBuf, Vec<serde_json::Value>>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -494,7 +494,7 @@ impl TensorSource {
         for path in files {
             let directory = path.parent().unwrap_or_else(|| Path::new("."));
             if !directories.contains_key(directory) {
-                directories.insert(directory.to_path_buf(), crate::plan::checkpoint::read_quantization_config(directory)?);
+                directories.insert(directory.to_path_buf(), crate::plan::checkpoint::read_quantization_configs(directory)?);
             }
             quantization.insert(path.clone(), directories[directory].clone());
             for meta in crate::read_safetensors_metadata(&path)? {
@@ -508,7 +508,7 @@ impl TensorSource {
     pub fn from_checkpoint(checkpoint: &crate::plan::checkpoint::Checkpoint) -> Self {
         let tensors = checkpoint.tensors.iter()
             .map(|t| (t.meta.name.clone(), (checkpoint.snapshot.join(&t.shard), t.meta.clone()))).collect();
-        let quantization = checkpoint.tensors.iter().map(|t| (checkpoint.snapshot.join(&t.shard), checkpoint.quantization().cloned())).collect();
+        let quantization = checkpoint.tensors.iter().map(|t| (checkpoint.snapshot.join(&t.shard), checkpoint.quantizations().cloned().collect())).collect();
         Self { tensors, quantization }
     }
     pub fn contains(&self, name: &str) -> bool { self.tensors.contains_key(name) }
@@ -550,8 +550,8 @@ impl TensorSource {
             DType::Bf16 => bytes.par_chunks_exact(2).map(|b| f32::from_bits(u32::from(u16::from_le_bytes([b[0], b[1]])) << 16)).collect(),
             DType::F16 => bytes.par_chunks_exact(2).map(|b| f16_to_f32(u16::from_le_bytes([b[0], b[1]]))).collect(),
             DType::F8E4M3 => {
-                let (br, bc) = self.block_shape(name)?;
                 let (scale, srows, scols) = self.block_scale(name)?;
+                let (br, bc) = self.block_shape(name, rows, cols, srows, scols)?;
                 let expected = (rows.div_ceil(br), cols.div_ceil(bc));
                 if (srows, scols) != expected {
                     return Err(source_error(name, format!("scale grid {srows}x{scols}, expected {}x{} for blocks {br}x{bc}", expected.0, expected.1)));
@@ -571,33 +571,40 @@ impl TensorSource {
         Ok(Matrix::new(rows, cols, data))
     }
 
-    fn block_shape(&self, name: &str) -> Result<(usize, usize)> {
+    fn block_shape(&self, name: &str, rows: usize, cols: usize, srows: usize, scols: usize) -> Result<(usize, usize)> {
         let invalid = |reason: &str| TensorSourceError::Fp8Layout { tensor: name.into(), reason: reason.into() };
         let path = &self.tensors.get(name).ok_or_else(|| source_error(name, "missing source tensor"))?.0;
-        let quant = self.quantization.get(path).and_then(Option::as_ref)
-            .ok_or_else(|| invalid("source has no quantization metadata declaring weight_block_size"))?;
-        // EXL3 retains FP8 dense tensors and wraps their original HF metadata.
-        // The wrapper's own quantization concerns routed experts, not these
-        // dense blocks. Follow declarations only, never infer a block from a grid.
-        let mut declaration = quant;
-        for _ in 0..16 {
-            if let Some(original) = declaration.get("original_quantization_config") {
-                declaration = original;
-            } else if declaration.get("weight_block_size").is_some() {
-                break;
-            } else if let Some(inner) = declaration.get("quantization_config") {
-                declaration = inner;
-            } else { break; }
-        }
-        let shape = declaration.get("weight_block_size").and_then(serde_json::Value::as_array)
-            .ok_or_else(|| invalid("source quantization metadata has no weight_block_size pair"))?;
-        if shape.len() != 2 { return Err(invalid("weight_block_size must contain two positive integers").into()); }
-        let dim = |v: &serde_json::Value| -> Result<usize> {
-            let d = v.as_u64().and_then(|n| usize::try_from(n).ok()).filter(|&n| n > 0)
+        let mut declared = None;
+        for quant in self.quantization.get(path).into_iter().flatten() {
+            // EXL3 wraps the retained dense operands' original HF declaration.
+            let mut declaration = quant;
+            for _ in 0..16 {
+                if let Some(original) = declaration.get("original_quantization_config") { declaration = original; }
+                else if declaration.get("weight_block_size").is_some() { break; }
+                else if let Some(inner) = declaration.get("quantization_config") { declaration = inner; }
+                else { break; }
+            }
+            let Some(value) = declaration.get("weight_block_size") else { continue };
+            let shape = value.as_array().filter(|v| v.len() == 2)
                 .ok_or_else(|| invalid("weight_block_size must contain two positive integers"))?;
-            Ok(d)
-        };
-        Ok((dim(&shape[0])?, dim(&shape[1])?))
+            let dim = |v: &serde_json::Value| -> Result<usize> {
+                v.as_u64().and_then(|n| usize::try_from(n).ok()).filter(|&n| n > 0)
+                    .ok_or_else(|| invalid("weight_block_size must contain two positive integers").into())
+            };
+            let shape = (dim(&shape[0])?, dim(&shape[1])?);
+            if declared.is_some_and(|prior| prior != shape) {
+                return Err(invalid("source quantization declarations disagree on weight_block_size").into());
+            }
+            declared = Some(shape);
+        }
+        if let Some(shape) = declared { return Ok(shape); }
+        // Older standard EXL3 snapshots omit the original FP8 config. Fully
+        // tiled operands carry an exact grid-to-weight ratio in their own
+        // headers. Partial grids cannot establish block boundaries this way.
+        if srows > 0 && scols > 0 && rows % srows == 0 && cols % scols == 0 {
+            return Ok((rows / srows, cols / scols));
+        }
+        Err(invalid("source has no FP8 weight_block_size declaration and headers do not describe an exact full-tile grid").into())
     }
 
     fn block_scale(&self, name: &str) -> Result<(Vec<f32>, usize, usize)> {
