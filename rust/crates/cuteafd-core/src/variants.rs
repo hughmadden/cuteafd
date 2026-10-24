@@ -243,6 +243,67 @@ impl VariantRecord {
     }
 }
 
+/// Per-variant serving counters (contract §7), indexed by variant (0 = base).
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+pub struct VariantCounters {
+    pub requests: u64,
+    pub prompt_tokens: u64,
+    pub generated_tokens: u64,
+    /// Rows run with this variant's steering (prefill and decode/verify rows).
+    pub steered_rows: u64,
+    pub prefix_hits: u64,
+    pub prefix_lookups: u64,
+    pub drafted: u64,
+    pub accepted: u64,
+}
+
+/// `/v1/stats` `variants`: the configured variants' records and their counters, plus base.
+#[derive(Debug, Clone, Default)]
+pub struct VariantStats {
+    records: Vec<VariantRecord>,
+    counters: [VariantCounters; MAX_VARIANTS + 1],
+}
+impl VariantStats {
+    pub fn new(records: Vec<VariantRecord>) -> Self { Self { records, ..Self::default() } }
+    pub fn is_empty(&self) -> bool { self.records.is_empty() }
+    /// A variant's name for logs (`base` for 0 or an unknown index).
+    pub fn name(&self, index: u8) -> &str {
+        self.records.iter().find(|r| r.index == index).map_or("base", |r| r.name.as_str())
+    }
+    fn at(&mut self, index: u8) -> &mut VariantCounters { &mut self.counters[usize::from(index).min(MAX_VARIANTS)] }
+    pub fn admitted(&mut self, index: u8, prompt_tokens: usize, looked_up: bool, hit: bool) {
+        let c = self.at(index);
+        c.requests += 1;
+        c.prompt_tokens += prompt_tokens as u64;
+        c.prefix_lookups += u64::from(looked_up);
+        c.prefix_hits += u64::from(looked_up && hit);
+    }
+    pub fn steered(&mut self, index: u8, rows: usize) {
+        if index != 0 { self.at(index).steered_rows += rows as u64; }
+    }
+    pub fn finished(&mut self, index: u8, generated: usize, drafted: u64, accepted: u64) {
+        let c = self.at(index);
+        c.generated_tokens += generated as u64;
+        c.drafted += drafted;
+        c.accepted += accepted;
+    }
+    /// `{name: {requests, prompt_tokens, generated_tokens, steered_rows, prefix_hits,
+    /// prefix_lookups, draft_acceptance, sites, k_max}}`, base included for comparison.
+    pub fn json(&self) -> serde_json::Value {
+        let entry = |c: &VariantCounters, sites: usize, k_max: usize| serde_json::json!({
+            "requests": c.requests, "prompt_tokens": c.prompt_tokens, "generated_tokens": c.generated_tokens,
+            "steered_rows": c.steered_rows, "prefix_hits": c.prefix_hits, "prefix_lookups": c.prefix_lookups,
+            "draft_acceptance": (c.drafted > 0).then(|| c.accepted as f64 / c.drafted as f64),
+            "sites": sites, "k_max": k_max});
+        let mut out = serde_json::Map::new();
+        out.insert("base".into(), entry(&self.counters[0], 0, 0));
+        for record in &self.records {
+            out.insert(record.name.clone(), entry(&self.counters[usize::from(record.index)], record.sites, record.k_max));
+        }
+        serde_json::Value::Object(out)
+    }
+}
+
 /// BF16 round-to-nearest-even from FP32 (NaN stays NaN).
 pub fn bf16_rne(value: f32) -> u16 {
     let bits = value.to_bits();
@@ -357,6 +418,28 @@ mod tests {
         assert!(VariantPlan::new(1, "x", "x", 4, vec![(key(1, SiteKind::Attn), SiteOp::rank1(1.0, &r)),
             (key(1, SiteKind::Attn), SiteOp::rank1(2.0, &r))]).is_err());
         assert!(VariantPlan::new(1, "x", "x", 4, vec![(key(1, SiteKind::Attn), SiteOp::Delta {})]).is_err());
+    }
+
+    #[test]
+    fn stats_count_per_variant_and_report_base() {
+        let record = VariantRecord { index: 2, name: "alternate".into(), public_id: "m-alternate".into(), base: "m".into(),
+            sites: 96, k_max: 1, verify: serde_json::json!({}) };
+        let mut stats = VariantStats::new(vec![record]);
+        stats.admitted(2, 100, true, true);
+        stats.admitted(0, 50, true, false);
+        stats.steered(2, 99);
+        stats.steered(0, 7);
+        stats.finished(2, 20, 10, 6);
+        let json = stats.json();
+        assert_eq!(json["alternate"]["requests"], 1);
+        assert_eq!(json["alternate"]["steered_rows"], 99);
+        assert_eq!(json["alternate"]["prefix_hits"], 1);
+        assert_eq!(json["alternate"]["draft_acceptance"], 0.6);
+        assert_eq!(json["alternate"]["sites"], 96);
+        assert_eq!(json["base"]["steered_rows"], 0);
+        assert_eq!(json["base"]["prefix_hits"], 0);
+        assert!(json["base"]["draft_acceptance"].is_null());
+        assert_eq!((stats.name(2), stats.name(0), stats.name(5)), ("alternate", "base", "base"));
     }
 
     #[test]
