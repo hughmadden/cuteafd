@@ -260,63 +260,63 @@ fn derive_sites_skips_unchanged_and_reports_rejections() {
     assert!(rejection.starts_with("l3.weight (L3.attn)"), "{rejection}");
 }
 
-// ---- pilot fixtures (local tensors on pg; run with --release -- --ignored) --------------------
+// ---- pilot fixtures (local published tensors; run with --release -- --ignored) ---------------
+// Each reads its tensor locations from environment variables and skips when they are unset.
 
-fn fixture_dir(env: &str, default: &str) -> Option<PathBuf> {
-    let path = PathBuf::from(std::env::var(env).unwrap_or_else(|_| default.into()));
-    if path.exists() { Some(path) } else { eprintln!("skipping: {} is absent", path.display()); None }
+fn fixture_dir(env: &str) -> Option<PathBuf> {
+    match std::env::var(env) {
+        Ok(path) if Path::new(&path).exists() => Some(PathBuf::from(path)),
+        _ => { eprintln!("skipping: set {env} to the fixture's tensors"); None }
+    }
 }
-fn evidence(file: &str) -> Option<serde_json::Value> {
-    let dir = fixture_dir("CUTEAFD_VARIANT_EVIDENCE", "/home/turq/dev/recipes/cuteafd-upstream/evidence/2026-10-24-weight-variant-verify")?;
-    Some(serde_json::from_slice(&std::fs::read(dir.join(file)).unwrap()).unwrap())
-}
+
+/// The pilot's per-tensor measurements (2026-10-24, CPU torch on the same tensors):
+/// (tensor, alpha, top singular share, r_W, |cos|); `None` alpha marks the unedited control.
+const GLM53_PILOT: &[(&str, Option<f32>, f32, f32, f32)] = &[
+    ("model.layers.2.mlp.down_proj.weight", Some(2.9996), 0.99995, 0.000284, 1.0),
+    ("model.layers.2.self_attn.o_proj.weight", Some(3.0054), 0.92567, 0.026474, 0.999962),
+    ("model.layers.3.mlp.shared_experts.down_proj.weight", Some(2.9994), 0.99997, 0.000285, 1.0),
+    ("model.layers.3.self_attn.o_proj.weight", Some(3.0058), 0.93263, 0.026573, 0.999964),
+    ("model.layers.49.self_attn.o_proj.weight", Some(2.9992), 0.75536, 0.026508, 0.999855),
+    ("model.layers.50.self_attn.o_proj.weight", None, 0.0, 0.0, 0.0),
+];
 
 /// GLM-5.3 full: official FP8 dense tensors against the alternate-weight checkpoint's FP16 tensors
-/// (`glm53-variant-exl3-ablit.json`): α 3.0, down_proj leftover at FP16 rounding,
+/// (the pilot table above): α 3.0, down_proj leftover at FP16 rounding,
 /// o_proj leftover at the BF16-versus-FP8 floor, layer 50 unedited.
 #[test]
-#[ignore = "needs the GLM-5.3 FP8 dense tensors and the alternate-weight checkpoint (pg)"]
+#[ignore = "needs CUTEAFD_GLM53_FP8_DENSE (official FP8 dense shards) and CUTEAFD_GLM53_VARIANT (the alternate-weight checkpoint)"]
 fn glm53_variant_pack_reproduces_the_pilot() {
-    let Some(base_dir) = fixture_dir("CUTEAFD_GLM53_FP8_DENSE", "/home/turq/.cache/weight-variants/glm53-fp8-dense") else { return };
-    let Some(pack) = fixture_dir("CUTEAFD_GLM53_VARIANT", "/home/turq/models/example-org/GLM-5.3-alternate-weights") else { return };
-    let Some(pilot) = evidence("glm53-variant-exl3-ablit.json") else { return };
+    let Some(base_dir) = fixture_dir("CUTEAFD_GLM53_FP8_DENSE") else { return };
+    let Some(pack) = fixture_dir("CUTEAFD_GLM53_VARIANT") else { return };
     let base = TensorSource::from_files(safetensors_files(&base_dir).unwrap()).unwrap();
-    let names = ["model.layers.2.mlp.down_proj.weight", "model.layers.2.self_attn.o_proj.weight",
-        "model.layers.3.mlp.shared_experts.down_proj.weight", "model.layers.3.self_attn.o_proj.weight",
-        "model.layers.49.self_attn.o_proj.weight", "model.layers.50.self_attn.o_proj.weight"];
-    let wanted = |n: &str| names.contains(&n);
+    let wanted = |n: &str| GLM53_PILOT.iter().any(|(name, ..)| *name == n);
     let checkpoint = crate::plan::checkpoint::Checkpoint::open_for_role(&pack, "variant", wanted).unwrap();
     let variant = TensorSource::from_checkpoint(&checkpoint);
-    for name in names {
+    for &(name, alpha, top, r_w, cos) in GLM53_PILOT {
         let opts = crate::families::glm5::variants::variant_opts(name);
-        let w = base.matrix(name).unwrap();
-        let v = variant.matrix(name).unwrap();
-        let result = derive_site(&w, &v, &opts);
-        let row = pilot["rows"].as_array().unwrap().iter().find(|r| r["tensor"] == name).unwrap();
-        if name.contains(".50.") {
-            assert!(row["rel_dW"].as_f64().unwrap() < 0.001, "pilot control");
+        let result = derive_site(&base.matrix(name).unwrap(), &variant.matrix(name).unwrap(), &opts);
+        let Some(alpha) = alpha else {
             assert_eq!(result.unwrap_err(), VariantError::Unchanged, "{name}: the unedited control");
             continue;
-        }
+        };
         let (_, report) = result.unwrap();
         eprintln!("{name}: {report:?}");
         assert!(report.accept, "{name}: {report:?}");
-        let f = |key: &str| row[key].as_f64().unwrap() as f32;
-        assert!((report.alphas[0] - f("alpha")).abs() < 0.01, "{name}: alpha {} vs pilot {}", report.alphas[0], f("alpha"));
-        assert!((report.top_share - row["energy_top4"][0].as_f64().unwrap() as f32).abs() < 0.01, "{name}");
-        assert!((report.r_w / f("r_W") - 1.0).abs() < 0.15, "{name}: r_W {} vs pilot {}", report.r_w, f("r_W"));
-        assert!(report.proj_cos >= f("cos_uD_uW") - 1e-3, "{name}");
+        assert!((report.alphas[0] - alpha).abs() < 0.01, "{name}: alpha {} vs pilot {alpha}", report.alphas[0]);
+        assert!((report.top_share - top).abs() < 0.01, "{name}");
+        assert!((report.r_w / r_w - 1.0).abs() < 0.15, "{name}: r_W {} vs pilot {r_w}", report.r_w);
+        assert!(report.proj_cos >= cos - 1e-3, "{name}");
     }
 }
 
 /// GLM-5.3 Flash: official FP8 against example-org's alternate-weights-FP8
 /// (`glmf-alternate-rank.json`): BF16 L12 o_proj is rank 1; L44 o_proj is not low rank.
 #[test]
-#[ignore = "needs zai-org/GLM-5.3-Flash and example-org/GLM-5.3-Flash-alternate-weights (pg)"]
+#[ignore = "needs CUTEAFD_GLMF_BASE (zai-org/GLM-5.3-Flash) and CUTEAFD_GLMF_VARIANT (example-org/GLM-5.3-Flash-alternate-weights)"]
 fn glm_flash_alternate_reproduces_the_pilot() {
-    let Some(base_dir) = fixture_dir("CUTEAFD_GLMF_BASE", "/home/turq/models/zai-org/GLM-5.3-Flash") else { return };
-    let Some(variant_dir) = fixture_dir("CUTEAFD_GLMF_VARIANT", "/home/turq/models/example-org/GLM-5.3-Flash-alternate-weights") else { return };
-    let Some(pilot) = evidence("glmf-alternate-rank.json") else { return };
+    let Some(base_dir) = fixture_dir("CUTEAFD_GLMF_BASE") else { return };
+    let Some(variant_dir) = fixture_dir("CUTEAFD_GLMF_VARIANT") else { return };
     let names = ["model.language_model.layers.12.self_attn.o_proj.weight", "model.language_model.layers.44.self_attn.o_proj.weight"];
     let open = |dir: &Path| {
         let names = names.map(|n| n.to_string());
@@ -324,21 +324,16 @@ fn glm_flash_alternate_reproduces_the_pilot() {
         TensorSource::from_checkpoint(&crate::plan::checkpoint::Checkpoint::open_for_role(dir, "variant", wanted).unwrap())
     };
     let (base, variant) = (open(&base_dir), open(&variant_dir));
-    // BF16 bars from the contract: next share ≤ 0.01, leftover ≤ 0.2·‖ΔW‖.
+    // BF16 bars from the contract: next share <= 0.01, leftover <= 0.2·‖ΔW‖. Pilot for L12:
+    // alpha 1.0000, r_D 0.0772; L44 is not low rank (rank 48 still leaves 28%).
     let opts = DeriveOpts::default();
-    for name in names {
-        let row = pilot["rows"].as_array().unwrap().iter().find(|r| r["tensor"] == name).unwrap();
-        let (_, report) = derive_site(&base.matrix(name).unwrap(), &variant.matrix(name).unwrap(), &opts).unwrap();
-        eprintln!("{name}: {report:?}");
-        if name.contains(".44.") {
-            assert!(!report.accept, "L44 is not a low-rank edit: {report:?}");
-        } else {
-            assert!(report.accept, "{report:?}");
-            assert_eq!(report.k, 1);
-            assert!((report.alphas[0] - row["alpha"].as_f64().unwrap() as f32).abs() < 0.01, "{report:?}");
-            assert!((report.r_delta / row["r_D"].as_f64().unwrap() as f32 - 1.0).abs() < 0.15, "{report:?}");
-        }
-    }
+    let (_, l12) = derive_site(&base.matrix(names[0]).unwrap(), &variant.matrix(names[0]).unwrap(), &opts).unwrap();
+    eprintln!("L12: {l12:?}");
+    assert!(l12.accept && l12.k == 1, "{l12:?}");
+    assert!((l12.alphas[0] - 1.0).abs() < 0.01 && (l12.r_delta / 0.07716 - 1.0).abs() < 0.15, "{l12:?}");
+    let (_, l44) = derive_site(&base.matrix(names[1]).unwrap(), &variant.matrix(names[1]).unwrap(), &opts).unwrap();
+    eprintln!("L44: {l44:?}");
+    assert!(!l44.accept, "L44 is not a low-rank edit: {l44:?}");
 }
 
 /// The CPU form of the hardware component test: base FP8 layer output, steered by the derived
@@ -346,11 +341,11 @@ fn glm_flash_alternate_reproduces_the_pilot() {
 /// variant's own output on the same activations. Error sits at the format floor; base rows
 /// stay bit-identical.
 #[test]
-#[ignore = "needs the GLM-5.3 FP8 dense tensors and the alternate-weight checkpoint (pg)"]
+#[ignore = "needs CUTEAFD_GLM53_FP8_DENSE (official FP8 dense shards) and CUTEAFD_GLM53_VARIANT (the alternate-weight checkpoint)"]
 fn glm53_steered_rows_match_the_published_variant() {
     use cuteafd_core::variants::{bf16_rne, bf16_to_f32, site_tables, steer_rows_ref, VariantPlan};
-    let Some(base_dir) = fixture_dir("CUTEAFD_GLM53_FP8_DENSE", "/home/turq/.cache/weight-variants/glm53-fp8-dense") else { return };
-    let Some(pack) = fixture_dir("CUTEAFD_GLM53_VARIANT", "/home/turq/models/example-org/GLM-5.3-alternate-weights") else { return };
+    let Some(base_dir) = fixture_dir("CUTEAFD_GLM53_FP8_DENSE") else { return };
+    let Some(pack) = fixture_dir("CUTEAFD_GLM53_VARIANT") else { return };
     let base = TensorSource::from_files(safetensors_files(&base_dir).unwrap()).unwrap();
     // Bars: the BF16 rounding of the row itself (measured per row below) plus the tensor's leftover
     // (FP16 rounding for down_proj; the BF16-master-versus-FP8-base floor for o_proj).
