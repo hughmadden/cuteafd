@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import ast
 from datetime import datetime, timezone
 import gc
 import hashlib
@@ -70,6 +71,33 @@ def weighted_nmse(weight, candidate, hessian):
     if numerator < -1e-6*denominator:
         raise ValueError("heldout quadratic error is negative")
     return max(0., numerator)/denominator
+
+
+def mcg_candidate(weight, raw, arm, codec, quantizer):
+    # The pinned MCG codec predates the optional codebook keyword used by
+    # the newer Kimi E4M3 pilot. Its default is already standard MCG.
+    if arm == "mcg-k6":
+        return codec.quantize_core_projection(weight, raw)[0]
+    return quantize_candidate(weight, raw, arm, codec, quantizer)
+
+
+def validate_capture_basis(prior, current, old_code, new_code):
+    """Permit only a reviewed scoring change over unchanged captured inputs."""
+    relative="quantization/glm5/core_k6/pilot.py"
+    if hashlib.sha256(old_code.encode()).hexdigest() != prior["code"][relative]:
+        raise ValueError("original capture producer is not the recorded Git source")
+    def capture_nodes(code):
+        names={"modules", "Capture", "forward", "staged_forward", "capture_split", "compact", "commit_batch"}
+        return [ast.dump(node, include_attributes=False) for node in ast.parse(code).body
+                if isinstance(node,(ast.ClassDef,ast.FunctionDef)) and node.name in names]
+    if capture_nodes(old_code) != capture_nodes(new_code):
+        raise ValueError("capture implementation changed; recapture is required")
+    def inputs(record):
+        record=json.loads(json.dumps(record))
+        del record["code"][relative]
+        return record
+    if inputs(prior) != inputs(current):
+        raise ValueError("capture inputs or dependencies changed")
 
 
 class Capture:
@@ -249,9 +277,12 @@ def score(source, root, identity):
     from gptqmodel.utils import kimi_k3_core_format as codec
     from gptqmodel.exllamav3.modules.quant.exl3_lib import quantize as quantizer
     rows=[]
+    basis=identity.get("capture_basis")
+    capture_root=Path(basis["root"]) if basis else root
+    capture_identity=json.loads((capture_root/"plan.json").read_text()) if basis else identity
     for layer in LAYERS:
         for name in modules(layer):
-            raw = load_hessian(root, "calibration", layer, name, identity, "cuda:0")
+            raw = load_hessian(capture_root, "calibration", layer, name, capture_identity, "cuda:0")
             weight = source.tensor(name+".weight", "cuda:0")
             source.close()
             shape = tuple(weight.shape)
@@ -268,7 +299,7 @@ def score(source, root, identity):
                 else:
                     # A payload without its immutable receipt is an orphan.
                     path.unlink(missing_ok=True)
-                    packed=quantize_candidate(weight, dict(H=raw["H"], count=int(raw["count"]), finalized=False),
+                    packed=mcg_candidate(weight, dict(H=raw["H"], count=int(raw["count"]), finalized=False),
                                               arm, codec, quantizer)
                     size=sum(x.numel()*x.element_size() for x in packed.values())
                     if size != payload_bytes(arm, shape):
@@ -278,7 +309,7 @@ def score(source, root, identity):
                     del packed
                 progress(root, "candidate_committed", tensor=name, arm=arm)
             del raw
-            heldout=load_hessian(root, "heldout", layer, name, identity, "cuda:0")
+            heldout=load_hessian(capture_root, "heldout", layer, name, capture_identity, "cuda:0")
             for arm in ARMS:
                 if arm == "bf16":
                     dense=weight.float()
@@ -307,6 +338,7 @@ def main(argv=None):
         parser.add_argument("--"+arg, type=Path, required=True)
     parser.add_argument("--calibration-tokens", type=int, default=32768)
     parser.add_argument("--heldout-tokens", type=int, default=4096)
+    parser.add_argument("--capture-root", type=Path, help="reuse a complete, verified compatible pilot capture")
     parser.add_argument("--preflight", action="store_true")
     args=parser.parse_args(argv)
     if not 32768 <= args.calibration_tokens <= 65536 or not 4096 <= args.heldout_tokens <= 16384:
@@ -351,6 +383,22 @@ def main(argv=None):
         packages={p:importlib.metadata.version(p) for p in ("torch", "transformers", "safetensors")})
     # JSON round trip normalizes tuples for exact immutable comparisons.
     identity=json.loads(json.dumps(identity))
+    if args.capture_root:
+        args.capture_root=args.capture_root.resolve()
+        if args.capture_root == args.root.resolve():
+            raise ValueError("capture basis must be an independent immutable run")
+        prior=json.loads((args.capture_root/"plan.json").read_text())
+        old_code=subprocess.check_output(["git", "-C", str(REPO), "show",
+            "a6b1b22f7:quantization/glm5/core_k6/pilot.py"],text=True)
+        validate_capture_basis(prior,identity,old_code,Path(__file__).read_text())
+        for split in ("calibration", "heldout"):
+            for layer in LAYERS:
+                for name in modules(layer):
+                    raw=load_hessian(args.capture_root,split,layer,name,prior,"cpu")
+                    del raw
+        identity["capture_basis"]=dict(root=str(args.capture_root),
+            plan_sha256=sha256_file(args.capture_root/"plan.json"),
+            contract="unchanged-capture-AST-and-identical-input-dependencies-verified")
     args.root.mkdir(parents=True, exist_ok=True)
     if (args.root/"plan.json").exists() and json.loads((args.root/"plan.json").read_text()) != identity:
         raise ValueError("pilot identity differs; select a fresh run root")
@@ -368,7 +416,7 @@ def main(argv=None):
                 or {(row["tensor"],row["arm"]) for row in completed["results"]} != expected):
             raise ValueError("pilot completion inventory differs")
         for split in ("calibration", "heldout"):
-            frontier=args.root/split/"frontier"
+            frontier=(args.capture_root or args.root)/split/"frontier"
             if frontier.is_symlink():
                 raise ValueError("refuse symlink pilot frontier")
             if frontier.exists():
@@ -383,16 +431,19 @@ def main(argv=None):
     torch.cuda.set_per_process_memory_fraction(86*GIB/torch.cuda.get_device_properties(0).total_memory)
     with torch.inference_mode(), exclusive_run(args.root):
         atomic_json(args.root/"plan.json", identity)
-        for split, records in (("calibration", calibration), ("heldout", heldout)):
-            (args.root/split).mkdir(exist_ok=True)
-            capture_split(source, records, args.root/split, identity)
+        if not args.capture_root:
+            for split, records in (("calibration", calibration), ("heldout", heldout)):
+                (args.root/split).mkdir(exist_ok=True)
+                capture_split(source, records, args.root/split, identity)
         rows=score(source, args.root, identity)
         atomic_json(args.root/"summary.json", dict(identity=identity, results=rows,
             stop="pilot-only-await-recipe-decision", head_measured=False))
         # Keep candidates, Hessians, receipts and numerical evidence, but no
         # replay activations once every pilot result is durable.
         for split in ("calibration", "heldout"):
-            shutil.rmtree(args.root/split/"frontier")
+            frontier=(args.capture_root or args.root)/split/"frontier"
+            if frontier.exists():
+                shutil.rmtree(frontier)
         progress(args.root, "complete", results=len(rows))
     source.close()
 

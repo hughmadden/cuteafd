@@ -8,9 +8,32 @@ import torch
 from safetensors.torch import save_file
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from glm5.core_k6.pilot import commit_batch, modules, tp2_projection_bytes, weighted_nmse
+from glm5.core_k6.pilot import commit_batch, mcg_candidate, modules, tp2_projection_bytes, weighted_nmse, validate_capture_basis
 from glm5.core_k6.source import GlmBF16Source
 from kimi_k3.uniform_k2.storage import RollingBoundary
+
+
+def test_mcg_k6_uses_pinned_default_without_optional_codebook_keyword():
+    class Codec:
+        def quantize_core_projection(self, weight, raw):
+            assert weight == "weight" and raw == "raw"
+            return {"mcg":"standard"}, {"evidence":"ok"}
+    assert mcg_candidate("weight","raw","mcg-k6",Codec(),None) == {"mcg":"standard"}
+
+
+def test_capture_recovery_rejects_changed_capture_math_or_other_dependencies():
+    import hashlib
+    old="def forward(x):\n    return x + 1\n\ndef score():\n    return 1\n"
+    new=old.replace("return 1","return 2")
+    key="quantization/glm5/core_k6/pilot.py"
+    prior=dict(code={key:hashlib.sha256(old.encode()).hexdigest(),"source":"unchanged"},tokens=35229)
+    current=dict(code={key:hashlib.sha256(new.encode()).hexdigest(),"source":"unchanged"},tokens=35229)
+    validate_capture_basis(prior,current,old,new)
+    with pytest.raises(ValueError,match="implementation changed"):
+        validate_capture_basis(prior,current,old,new.replace("x + 1","x + 2"))
+    current["tokens"]=35230
+    with pytest.raises(ValueError,match="inputs or dependencies"):
+        validate_capture_basis(prior,current,old,new)
 
 
 def test_batch_receipts_publish_rolling_successor_and_retire_prior(tmp_path):
