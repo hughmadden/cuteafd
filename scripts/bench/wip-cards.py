@@ -2045,8 +2045,8 @@ def main():
         context_levels = [int(x) for x in parts]
     if args.panels is not None:
         selection = '' if args.panels.strip() == 'none' else args.panels.strip()
-        if not selection and not (levels or prefill_lengths):
-            parser.error('--panels none runs nothing without --levels or --prefill-lengths')
+        if not selection and not (levels or prefill_lengths or args.probe):
+            parser.error('--panels none runs nothing without --levels, --prefill-lengths or --probe')
         profile = 'panels:' + selection
         listed = requested_panels(profile)
         for card in cards:

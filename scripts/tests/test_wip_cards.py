@@ -1032,6 +1032,16 @@ def test_panels_levels_and_post_load_reach_every_job(entry, tmp_path, monkeypatc
         assert matrix['levels'] == [1, 16] and matrix['post_load_c1'] is True
 
 
+def test_panels_none_with_a_probe_is_a_readiness_run(entry, tmp_path, monkeypatch):
+    kit = _kit(tmp_path, entry)
+    state = tmp_path / 'state'
+    monkeypatch.setattr(sys, 'argv', ['wip-cards', '--kit', str(kit), '--cards', 'v41-min', '--matrix', '--arm', 'a=b:s',
+        '--state', str(state), '--panels', 'none', '--probe', 'v41-min:console', '--dry-run'])
+    assert cards.main() == 0
+    job = json.loads((state / 'plan.json').read_text())['jobs'][0]
+    assert json.loads((Path(job['state']) / 'matrix.json').read_text())['entries'][0]['profile'] == 'panels:'
+
+
 def test_post_load_repeat_reaches_every_job(entry, tmp_path, monkeypatch):
     kit = _kit(tmp_path, entry)
     state = tmp_path / 'state'
