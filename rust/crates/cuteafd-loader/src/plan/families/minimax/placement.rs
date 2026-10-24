@@ -350,11 +350,16 @@ fn exact_layout(model: &Model, input: &crate::plan::PlanInput, report: &mut Plan
     };
     if reservations.media > 0 { add_vision(&mut items); }
     if admitted.tiered() {
-        let index = admitted.pool_pages * (admitted.cache.ranks[0].page_bytes
-            - 2 * cfg.layers as u64 * admitted.cache.ranks[0].kv_page_bytes);
+        let rank = &admitted.cache.ranks[0];
+        let kv = 2 * cfg.layers as u64 * rank.kv_page_bytes;
+        let index = admitted.pool_pages * (rank.page_bytes - kv);
+        let resident = admitted.resident_pages * kv;
         items.push(Item::new(Category::Kv, "packed MSA index pages (whole pool)", "64-token pages", index, Basis::Exact));
         items.push(Item::new(Category::Kv, format!("resident FP8 K/V pages ({} of {})", admitted.resident_pages,
-            admitted.pool_pages), "64-token pages", admitted.cache_bytes - index, Basis::Exact));
+            admitted.pool_pages), "64-token pages", resident, Basis::Exact));
+        items.push(Item::new(Category::Kv, format!("host K/V staging ({} pages) + translated page table",
+            admitted.cache.staging_pages(0, admitted.pool_pages, admitted.resident_pages)), "64-token pages",
+            admitted.cache_bytes - index - resident, Basis::Exact));
     } else {
         items.push(Item::new(Category::Kv, "separate FP8 K/V planes + packed MSA index", "64-token pages", admitted.cache_bytes, Basis::Exact));
     }

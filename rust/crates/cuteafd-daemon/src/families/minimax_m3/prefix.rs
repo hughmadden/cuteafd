@@ -72,7 +72,7 @@ mod tests {
         let layout = MiniMaxCacheLayout { kv_format: Qwen4KvCache::Fp8, layers: 2, context: 256,
             ranks: vec![RankPages { first_kv_head: 0, kv_heads: 4, kv_page_bytes: KV_PAGE_BYTES as u64,
                 index_page_bytes: INDEX_PAGE_BYTES as u64, page_bytes: 2 * (2 * KV_PAGE_BYTES + INDEX_PAGE_BYTES) as u64 }] };
-        let cache = Cache::new(&library, 0, &layout, 16, 16, 2,
+        let cache = Cache::new(&library, 0, &layout, 16, 16, 2, 256,
             super::super::cache::CacheBudget { gpu: layout.ranks[0].page_bytes * 16 + 256, host: 0 })?;
         let family = MiniMaxPrefix { cache: &cache };
         let mut shared = PrefixCache::<StubCopyEngine>::new(family.layout(), PrefixConfig {

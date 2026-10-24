@@ -525,7 +525,8 @@ pub(crate) async fn run_golden(args: GoldenArgs) -> Result<()> {
         })
     })?;
     let cache = Cache::new(&library, args.device, &admitted.cache, admitted.pool_pages as usize,
-        admitted.resident_pages as usize, 1, super::cache::CacheBudget {
+        admitted.resident_pages as usize, 1, ledger.bytes("page_table").context("page-table admission")? as usize,
+        super::cache::CacheBudget {
             gpu: admitted.cache_bytes.checked_add(256).context("cache admission overflow")?, host: admitted.host_bytes })?;
     let spark = if let Some(&first) = remote.first() {
         cuteafd_transport::worker_selection::require_peer_clients(&args.peers, endpoint, 1)?;

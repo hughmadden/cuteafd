@@ -23,6 +23,9 @@ pub const INDEX_SCALE_OFFSET: u64 = 8192;
 /// Host K/V placement maps each K or V plane as one virtual range of device pages
 /// then host pages, in parts of this size (the CUDA VMM granularity on SM120).
 pub const TIER_GRANULE_BYTES: u64 = 2 << 20;
+/// Most staging pages host placement keeps: the K and V planes each alias one
+/// device allocation of this many pages into every layer.
+pub const STAGING_PAGES: u64 = 4096;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PagePlane {
@@ -122,6 +125,22 @@ impl MiniMaxCacheLayout {
         let gpu = resident.checked_mul(planes * r.kv_page_bytes).and_then(|kv| kv.checked_add(index)).ok_or(overflow.clone())?;
         let host = (pages - resident).div_ceil(unit).checked_mul(unit * planes * r.kv_page_bytes).ok_or(overflow)?;
         Ok((gpu, host))
+    }
+
+    /// Staging pages of a host-placed cache: every host page up to
+    /// [`STAGING_PAGES`], in whole tier parts.
+    pub fn staging_pages(&self, rank: usize, pages: u64, resident: u64) -> u64 {
+        let unit = self.tier_unit_pages(rank);
+        (pages.saturating_sub(resident).div_ceil(unit) * unit).min(STAGING_PAGES)
+    }
+
+    /// GPU bytes of host placement's staging (`minimax_kv_stage.cu`): the K and
+    /// V staging pages, one slot-map entry per pool page, one head mask per
+    /// staging page, the counters and the copy statistics.
+    pub fn staging_bytes(&self, rank: usize, pages: u64, resident: u64) -> u64 {
+        let staging = self.staging_pages(rank, pages, resident);
+        2 * staging * self.ranks[rank].kv_page_bytes + (pages * 4).next_multiple_of(16)
+            + (staging * 4).next_multiple_of(16) + 16 + 256
     }
 
     /// A layer owns contiguous K, V and packed-index planes, never interleaved K/V.
