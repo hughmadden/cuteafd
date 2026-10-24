@@ -13,11 +13,6 @@ mod chunks;
 pub use chunks::V41Tp4ChunkReceiver;
 mod roce;
 pub use roce::{SparkExpertPending, SparkExpertWave, SparkExperts, WaveReceipt};
-mod device;
-pub use device::{
-    DeviceBuild, DeviceLaneStats, DeviceWave, SparkDeviceLane, mailbox as device_mailbox,
-    stuck_report as device_stuck_report,
-};
 mod tcp;
 pub use tcp::{V41Tp4Pending, V41Tp4Tcp};
 mod native_group;
