@@ -329,6 +329,17 @@ pub fn expert_resident_bytes(catalog: &crate::OfficialV41Catalog, layers: &[usiz
     sum(bytes)
 }
 
+/// The routed layers the coordinator holds; the Sparks hold the rest.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LocalLayers {
+    /// The fewest bottom routed layers that leave every Spark rank within its budget.
+    Fewest,
+    /// This many bottom routed layers.
+    Bottom(usize),
+    /// Exactly these beside these Spark layers (golden's split of the layers it executes).
+    Exactly { local: Vec<usize>, spark: Vec<usize> },
+}
+
 #[derive(Debug, Clone)]
 pub struct Onboarding {
     pub local_layers: Vec<usize>,
@@ -336,24 +347,29 @@ pub struct Onboarding {
     pub local_bytes: u64,
     pub spark_bytes: Vec<u64>,
 }
-/// Minimum bottom routed prefix meeting every remote owner's allocation ceiling.
+/// The coordinator's routed layers `local`, meeting every remote owner's allocation ceiling.
 /// `remote_reserved` includes scratch, transport, runtime and any remote media.
 pub fn onboard_layers(catalog: &crate::OfficialV41Catalog, cfg: &MiniMaxM3Config, sizing: RuntimeSizing,
-    budget: u64, remote_reserved: u64, requested: Option<usize>) -> Result<Onboarding> {
+    budget: u64, remote_reserved: u64, local: &LocalLayers) -> Result<Onboarding> {
     sizing.validate(cfg)?;
     let layers = cfg.moe.iter().enumerate().filter_map(|(layer, &moe)| moe.then_some(layer)).collect::<Vec<_>>();
-    if requested.is_some_and(|n| n >= layers.len()) { return Err(AdmissionError::Unsupported("all-local or excessive routed layer count")); }
-    let candidates = requested.map_or_else(|| (0..layers.len()).collect(), |count| vec![count]);
+    let bottom = |count: usize| (layers[..count].to_vec(), layers[count..].to_vec());
+    let candidates: Vec<(Vec<usize>, Vec<usize>)> = match local {
+        LocalLayers::Fewest => (0..layers.len()).map(bottom).collect(),
+        LocalLayers::Bottom(count) if *count < layers.len() => vec![bottom(*count)],
+        LocalLayers::Bottom(_) => return Err(AdmissionError::Unsupported("all-local or excessive routed layer count")),
+        LocalLayers::Exactly { local, spark } => vec![(local.clone(), spark.clone())],
+    };
     let mut shortfall = remote_reserved;
-    for count in candidates {
-        let remote = (0..sizing.spark_ranks).map(|rank| expert_resident_bytes(catalog, &layers[count..], sizing.spark_ranks, rank))
+    for (local_layers, spark_layers) in candidates {
+        let spark_bytes = (0..sizing.spark_ranks).map(|rank| expert_resident_bytes(catalog, &spark_layers, sizing.spark_ranks, rank))
             .collect::<Result<Vec<_>>>()?;
-        let needed = remote.iter().map(|&bytes| sum([bytes, remote_reserved])).collect::<Result<Vec<_>>>()?
+        let needed = spark_bytes.iter().map(|&bytes| sum([bytes, remote_reserved])).collect::<Result<Vec<_>>>()?
             .into_iter().max().unwrap_or(remote_reserved);
         shortfall = needed;
         if needed <= budget {
-            return Ok(Onboarding { local_bytes: expert_resident_bytes(catalog, &layers[..count], 1, 0)?,
-                local_layers: layers[..count].to_vec(), spark_layers: layers[count..].to_vec(), spark_bytes: remote });
+            return Ok(Onboarding { local_bytes: expert_resident_bytes(catalog, &local_layers, 1, 0)?,
+                local_layers, spark_layers, spark_bytes });
         }
     }
     Err(AdmissionError::Budget { needed: shortfall, available: budget })
@@ -365,12 +381,12 @@ pub fn onboard_layers(catalog: &crate::OfficialV41Catalog, cfg: &MiniMaxM3Config
 pub const REMOTE_SCRATCH_ESTIMATE_BYTES: u64 = 512 << 20;
 
 /// What one coordinator admits, beside its checkpoint and manifests.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct Request {
     pub sizing: RuntimeSizing,
     pub kv_format: Qwen4KvCache,
-    /// A fixed count of bottom routed layers on the coordinator; `None` onboards the fewest that fit.
-    pub onboard: Option<usize>,
+    pub local_layers: LocalLayers,
+    /// Every Spark rank's allocation ceiling.
     pub spark_budget: u64,
     /// What a Spark-hosted vision tower holds on every rank beside the experts (0 when local).
     pub spark_vision_bytes: u64,
@@ -380,6 +396,8 @@ pub struct Request {
     /// Drafter context rings (0 without the drafter): bounds the verify rows.
     pub draft_rings: usize,
     pub host_embedding: bool,
+    /// Startup records the decode graphs (golden runs every step eagerly and records none).
+    pub startup_graphs: bool,
     /// The ring geometry every Spark link registers.
     pub rings: cuteafd_core::SparkRings,
 }
@@ -427,10 +445,11 @@ impl Recipe {
         let remote_reserved = sum([io.intake, io.host_exchange, io.row_indices, io.endpoint_staging, io.mapped_rings,
             remote_scratch.unwrap_or(REMOTE_SCRATCH_ESTIMATE_BYTES), cuteafd_core::memory_layout::SPARK_RUNTIME_RESIDUAL_BYTES])?;
         let with_vision = remote_reserved.checked_add(request.spark_vision_bytes).context("MiniMax remote vision reservation overflow")?;
-        let onboarding = onboard_layers(catalog, cfg, sizing, request.spark_budget, with_vision, request.onboard);
-        if request.spark_vision_bytes > 0 && request.onboard.is_none() && onboarding.as_ref().map_or(true, |o| !o.local_layers.is_empty()) {
+        let onboarding = onboard_layers(catalog, cfg, sizing, request.spark_budget, with_vision, &request.local_layers);
+        if request.spark_vision_bytes > 0 && request.local_layers == LocalLayers::Fewest
+            && onboarding.as_ref().map_or(true, |o| !o.local_layers.is_empty()) {
             // Every routed layer fits the Sparks without the tower: the tower is the cause, not onboarding.
-            if let Ok(all) = onboard_layers(catalog, cfg, sizing, request.spark_budget, remote_reserved, Some(0)) {
+            if let Ok(all) = onboard_layers(catalog, cfg, sizing, request.spark_budget, remote_reserved, &LocalLayers::Bottom(0)) {
                 let experts = all.spark_bytes.iter().copied().max().unwrap_or(0).saturating_add(remote_reserved);
                 let gb = |bytes: u64| bytes as f64 / 1e9;
                 anyhow::bail!("Spark-hosted vision needs {:.2} GB on every Spark rank, but each TP{} rank has {:.2} GB left \
@@ -444,7 +463,10 @@ impl Recipe {
             expert_workspace(package.context("MiniMax onboarded layers require the native expert package manifest \
                 (fp8-minimax-nvfp4a4/manifest.json)")?, 1, sizing.rows)?
         };
-        let graphs = decode_graphs(sizing, request.draft_rings)?;
+        let graphs = if request.startup_graphs { decode_graphs(sizing, request.draft_rings)? } else {
+            use crate::placement::inventory::{GraphSet, Lifetime, StartupGraphs};
+            StartupGraphs { inventory: GraphSet { ranks: Vec::new(), lifetime: Lifetime::Startup, shapes: 0 }, keys: Vec::new() }
+        };
         let reservations = Reservations { weights: weights.resident_bytes.checked_add(request.draft_bytes)
                 .context("MiniMax drafter reservation overflow")?, local_experts: onboarding.local_bytes,
             expert_workspace, headroom: request.headroom, graphs: graphs.inventory.bytes(0), ..Default::default() };
@@ -584,6 +606,33 @@ pub(crate) mod tests {
         for spark_ranks in [1, 5, 6] {
             assert!(RuntimeSizing { spark_ranks, ..local }.validate(&config()).is_err());
         }
+    }
+
+    /// Golden's recipe: exactly its layers, no Spark ceiling and no startup graphs, reserving
+    /// only the weights, its local experts, their package scratch and the headroom.
+    #[test]
+    fn exact_layers_without_startup_graphs_reserve_only_their_own_bytes() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        testing::write_minimax_m3_snapshot(dir.path(), false, false);
+        let checkpoint = Checkpoint::open(dir.path())?;
+        let cfg = MiniMaxM3Config::from_hf(&checkpoint.config)?;
+        let catalog = crate::read_expert_catalog(dir.path())?;
+        let ring = crate::plan::layout::spark_ring_geometry(1);
+        let sizing = RuntimeSizing { sequences: 1, context: 4096, spark_ranks: 2, logit_rows: 256, ..sizing() };
+        let (local, spark) = (vec![3, 5], vec![4, 6]);
+        let recipe = Recipe::new(&cfg, &checkpoint, &catalog, &programs_manifest(), Some(&expert_manifest()), Request {
+            sizing, kv_format: Qwen4KvCache::Fp8, local_layers: LocalLayers::Exactly { local: local.clone(), spark: spark.clone() },
+            spark_budget: u64::MAX, spark_vision_bytes: 0, headroom: 2 << 30, draft_bytes: 0, draft_rings: 0,
+            host_embedding: false, startup_graphs: false, rings: cuteafd_core::SparkRings { max_frame_bytes: ring.max_frame_bytes,
+                depth: ring.depth, slot_bytes: ring.slot_bytes, alignment: ring.alignment } })?;
+        assert_eq!((&recipe.onboarding.local_layers, &recipe.onboarding.spark_layers), (&local, &spark));
+        assert!(recipe.graphs.keys.is_empty() && recipe.graphs.inventory.bytes(0) == 0);
+        let weights = super::super::coordinator::resident_weights(&checkpoint, false)?;
+        let r = recipe.reservations;
+        assert_eq!((r.weights, r.local_experts, r.expert_workspace, r.headroom, r.graphs), (weights.resident_bytes,
+            expert_resident_bytes(&catalog, &local, 1, 0)?, expert_workspace(&expert_manifest(), 1, 256)?, 2 << 30, 0));
+        assert_eq!(r.media + r.pending_code + r.runtime_baseline + r.startup, 0);
+        Ok(())
     }
 
     #[test]

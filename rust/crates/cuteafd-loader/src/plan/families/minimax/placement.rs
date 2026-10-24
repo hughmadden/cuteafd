@@ -64,18 +64,18 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
     let vision_weights = if vision_source > 0 { vision_source + vector_bytes + 52 } else { 0 };
     let vision_scratch = if vision_source > 0 { crate::plan::layout::minimax_vision_scratch_bytes() } else { 0 };
     let budget = opts.spark_allocation_budget_bytes.unwrap_or(SPARK_BUDGET_BYTES);
-    let onboard = match opts.onboard.or(opts.local_expert_layers.map(Onboard::Layers)).unwrap_or(Onboard::Auto) {
-        Onboard::Layers(n) => Some(n),
-        Onboard::Auto => None,
+    let local_layers = match opts.onboard.or(opts.local_expert_layers.map(Onboard::Layers)).unwrap_or(Onboard::Auto) {
+        Onboard::Layers(n) => admission::LocalLayers::Bottom(n),
+        Onboard::Auto => admission::LocalLayers::Fewest,
         _ => return Err(AdmissionError::Unsupported("onboarding policy; use auto or a layer count").into()),
     };
     // The serving recipe, with the rings the launch's Spark links register by default.
     let ring = crate::plan::layout::spark_ring_geometry(lanes);
     let mut recipe = admission::Recipe::new(cfg, input.checkpoint(), catalog, &manifest, package.as_ref(), admission::Request {
-        sizing, kv_format: opts.minimax_kv, onboard, spark_budget: budget,
+        sizing, kv_format: opts.minimax_kv, local_layers, spark_budget: budget,
         spark_vision_bytes: if matches!(report.vision, MediaMode::Spark(_)) { vision_weights + vision_scratch + GIB } else { 0 },
         headroom: opts.headroom_bytes, draft_bytes: draft.as_ref().map_or(0, |d| d.bytes),
-        draft_rings: draft.as_ref().map_or(0, |d| d.slots), host_embedding: opts.host_embedding,
+        draft_rings: draft.as_ref().map_or(0, |d| d.slots), host_embedding: opts.host_embedding, startup_graphs: true,
         rings: cuteafd_core::SparkRings { max_frame_bytes: ring.max_frame_bytes, depth: ring.depth,
             slot_bytes: ring.slot_bytes, alignment: ring.alignment } })?;
     let local = recipe.onboarding.local_bytes;

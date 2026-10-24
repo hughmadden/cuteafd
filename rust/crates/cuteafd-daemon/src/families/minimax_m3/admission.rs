@@ -6,25 +6,7 @@ use cuteafd_loader::{
     plan::{checkpoint::Checkpoint, families::minimax::admission::{self, Reservations}},
 };
 use std::path::{Path, PathBuf};
-pub(super) use admission::{RuntimeLedger, RuntimeSizing};
-
-pub(super) struct Request {
-    pub sizing: RuntimeSizing,
-    /// Measured free bytes, already capped by the logical device budget, after
-    /// code/context/media allocation and before target weight allocation.
-    pub available: u64,
-    pub requested_pool: Option<u64>,
-    pub kv_format: Qwen4KvCache,
-    pub onboard: Option<usize>,
-    pub spark_budget: u64,
-    /// What a Spark-hosted vision tower holds on every rank beside the experts (0 when local).
-    pub spark_vision_bytes: u64,
-    pub headroom: u64,
-    pub draft_bytes: u64,
-    /// Drafter context rings (0 without the drafter): bounds the verify rows.
-    pub draft_rings: usize,
-    pub host_embedding: bool,
-}
+pub(super) use admission::{LocalLayers, Request, RuntimeLedger, RuntimeSizing};
 
 pub(super) struct Admitted {
     pub cache: admission::Admission,
@@ -54,17 +36,20 @@ pub(super) fn local_package(native_lib: &Path) -> Result<(PathBuf, Option<serde_
     Ok((directory, manifest))
 }
 
-pub(super) fn solve(checkpoint: &Checkpoint, programs: &serde_json::Value,
-    local_package: Option<&serde_json::Value>, request: Request) -> Result<Admitted> {
+/// The ring geometry the server's Spark links register.
+pub(super) fn spark_rings() -> Result<cuteafd_core::SparkRings> {
+    crate::shared::placement::spark_rings(cuteafd_transport::TcpTransportConfig::default().max_frame_bytes)
+}
+
+/// Admit `request` into `available` measured free bytes: already capped by the logical device
+/// budget, after code/context/media allocation and before target weight allocation.
+pub(super) fn solve(checkpoint: &Checkpoint, programs: &serde_json::Value, local_package: Option<&serde_json::Value>,
+    request: Request, available: u64, requested_pool: Option<u64>) -> Result<Admitted> {
     let cfg = MiniMaxM3Config::from_hf(&checkpoint.config)?;
     let catalog = cuteafd_loader::read_expert_catalog(&checkpoint.snapshot)?;
-    let rings = crate::shared::placement::spark_rings(cuteafd_transport::TcpTransportConfig::default().max_frame_bytes)?;
-    let recipe = admission::Recipe::new(&cfg, checkpoint, &catalog, programs, local_package, admission::Request {
-        sizing: request.sizing, kv_format: request.kv_format, onboard: request.onboard, spark_budget: request.spark_budget,
-        spark_vision_bytes: request.spark_vision_bytes, headroom: request.headroom, draft_bytes: request.draft_bytes,
-        draft_rings: request.draft_rings, host_embedding: request.host_embedding, rings })?;
-    let (cache, reservations) = recipe.admit(&cfg, request.available, request.requested_pool)?;
-    ensure!(cache.total_bytes <= request.available, "MiniMax admission exceeded its measured free bytes");
+    let recipe = admission::Recipe::new(&cfg, checkpoint, &catalog, programs, local_package, request)?;
+    let (cache, reservations) = recipe.admit(&cfg, available, requested_pool)?;
+    ensure!(cache.total_bytes <= available, "MiniMax admission exceeded its measured free bytes");
     Ok(Admitted { cache, ledger: recipe.ledger, local_layers: recipe.onboarding.local_layers,
         spark_layers: recipe.onboarding.spark_layers, graphs: recipe.graphs, reservations })
 }
@@ -148,13 +133,14 @@ mod tests {
         let graph_groups = ["graphs", cuteafd_loader::placement::inventory::GRAPH_GROWTH];
         let measured_baseline: u64 = device.items.iter().filter(|i| i.category == cuteafd_core::memory_layout::Category::Runtime
             && !graph_groups.contains(&i.group.as_str())).map(|i| i.bytes).sum();
-        let mut live = solve(&checkpoint, &programs, Some(&package), Request {
+        let request = Request {
             sizing: RuntimeSizing { rows: 256, decode_rows: 64, sequences: 16, context: 4096, spark_ranks: 3, logit_rows: 64,
                 lanes: cuteafd_loader::serving_capacity::prefill_lanes::DEFAULT_PREFILL_LANES, host_landing: false },
-            available: options.rtx_bytes[0] - measured_baseline, requested_pool: Some(4096),
-            kv_format: Qwen4KvCache::Fp8, onboard: None, spark_budget: 108 << 30, spark_vision_bytes: 0, headroom: 0,
-            draft_bytes:0, draft_rings: 0, host_embedding,
-        })?;
+            kv_format: Qwen4KvCache::Fp8, local_layers: LocalLayers::Fewest, spark_budget: 108 << 30, spark_vision_bytes: 0,
+            headroom: 0, draft_bytes: 0, draft_rings: 0, host_embedding, startup_graphs: true, rings: spark_rings()?,
+        };
+        let available = options.rtx_bytes[0] - measured_baseline;
+        let mut live = solve(&checkpoint, &programs, Some(&package), request.clone(), available, Some(4096))?;
         assert_eq!(live.cache.total_bytes + measured_baseline, device.used_bytes());
         assert_eq!(live.cache.pool_tokens, memory.pool_tokens);
         let onboarded = memory.notes.iter().find_map(|n| n.split_once(" routed layers on the RTX")).unwrap().0;
@@ -168,18 +154,10 @@ mod tests {
         assert_eq!(charged, live.graphs.inventory.bytes(0));
         assert_eq!(live.ledger.bytes("head_workspace"), Some(cuteafd_ffi::programs::VOCABULARY_HEAD_WORKSPACE as u64));
         let cfg = MiniMaxM3Config::from_hf(&checkpoint.config)?;
-        assert!(live.readmit(&cfg, RuntimeSizing { rows: 256, decode_rows: 64, sequences: 16, logit_rows: 64,
-            context: 4096, spark_ranks: 3, lanes: cuteafd_loader::serving_capacity::prefill_lanes::DEFAULT_PREFILL_LANES,
-            host_landing: false },
-            live.cache.total_bytes - 1, Some(4096), Qwen4KvCache::Fp8).is_err());
+        assert!(live.readmit(&cfg, request.sizing, live.cache.total_bytes - 1, Some(4096), Qwen4KvCache::Fp8).is_err());
         // A Spark-hosted tower that leaves no room for the experts is refused by name.
-        let refused = solve(&checkpoint, &programs, None, Request {
-            sizing: RuntimeSizing { rows: 256, decode_rows: 64, sequences: 16, context: 4096, spark_ranks: 3, logit_rows: 64,
-                lanes: cuteafd_loader::serving_capacity::prefill_lanes::DEFAULT_PREFILL_LANES, host_landing: false },
-            available: options.rtx_bytes[0] - measured_baseline, requested_pool: Some(4096),
-            kv_format: Qwen4KvCache::Fp8, onboard: None, spark_budget: 108 << 30, spark_vision_bytes: (108 << 30) - (1 << 20),
-            headroom: 0, draft_bytes: 0, draft_rings: 0, host_embedding,
-        }).err().map(|error| format!("{error:#}")).unwrap_or_default();
+        let refused = solve(&checkpoint, &programs, None, Request { spark_vision_bytes: (108 << 30) - (1 << 20), ..request },
+            available, Some(4096)).err().map(|error| format!("{error:#}")).unwrap_or_default();
         assert!(refused.starts_with("Spark-hosted vision needs 115.96 GB on every Spark rank, but each TP3 rank has"), "{refused}");
         Ok(())
     }

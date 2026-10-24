@@ -219,7 +219,7 @@ type Ready = (usize, Option<Arc<cuteafd_api::openai::media::MediaPreparer>>);
 
 fn worker(args: &ServeArgs, receive: &mut tokio::sync::mpsc::Receiver<cuteafd_api::openai::NativeRequest>,
     stats: &Arc<Mutex<serde_json::Value>>, eos: Vec<u32>, initialized: impl FnOnce(Ready) -> Result<()>) -> Result<()> {
-    let onboard = args.validate()?;
+    let local_layers = args.validate()?.map_or(admission::LocalLayers::Fewest, admission::LocalLayers::Bottom);
     let checkpoint = Checkpoint::coordinator(&args.snapshot, false, false)?;
     let cfg = MiniMaxM3Config::from_hf(&checkpoint.config)?;
     cfg.release_geometry()?;
@@ -257,11 +257,11 @@ fn worker(args: &ServeArgs, receive: &mut tokio::sync::mpsc::Receiver<cuteafd_ap
     let vision_mode = if auto_local && cuteafd_loader::families::minimax_m3::config::MiniMaxM3VisionConfig::read(&args.snapshot)?.is_none() {
         MediaMode::Off
     } else { args.vision };
+    let request = admission::Request { sizing, kv_format: args.kv_cache, local_layers, spark_budget: args.spark_budget_bytes,
+        spark_vision_bytes: 0, headroom, draft_bytes, draft_rings, host_embedding: args.token_io.embed_placement == EmbedPlacement::Host,
+        startup_graphs: true, rings: admission::spark_rings()? };
     let text_admission = (auto_local && vision_mode == MediaMode::Auto).then(|| -> Result<_> {
-        admission::solve(&checkpoint, &manifest, local_package.as_ref(), admission::Request {
-            sizing, available: available()?, requested_pool: None, kv_format: args.kv_cache, onboard,
-            spark_budget: args.spark_budget_bytes, spark_vision_bytes: 0, headroom, draft_bytes, draft_rings,
-            host_embedding: args.token_io.embed_placement == EmbedPlacement::Host })
+        admission::solve(&checkpoint, &manifest, local_package.as_ref(), request.clone(), available()?, None)
     }).transpose()?;
     let (vision, prefix) = ReadyVision::load(&args.snapshot, &args.native_lib, &library, args.device,
         vision_mode, &args.prefix, args.media_cache_bytes, remote)?;
@@ -277,10 +277,7 @@ fn worker(args: &ServeArgs, receive: &mut tokio::sync::mpsc::Receiver<cuteafd_ap
         text
     } else {
         admission::solve(&checkpoint, &manifest, local_package.as_ref(), admission::Request {
-            sizing, available, requested_pool: args.pool_tokens, kv_format: args.kv_cache, onboard,
-            spark_budget: args.spark_budget_bytes, spark_vision_bytes: vision.as_ref().map_or(0, |v| v.spark_reserve_bytes),
-            headroom, draft_bytes, draft_rings,
-            host_embedding: args.token_io.embed_placement == EmbedPlacement::Host })?
+            spark_vision_bytes: vision.as_ref().map_or(0, |v| v.spark_reserve_bytes), ..request }, available, args.pool_tokens)?
     };
     let mut catalog = cuteafd_loader::read_expert_catalog(&args.snapshot)?;
     catalog.select_draft(cuteafd_loader::plan::spec::DraftOwnership::None)?;

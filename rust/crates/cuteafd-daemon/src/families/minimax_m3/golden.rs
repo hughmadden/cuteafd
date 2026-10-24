@@ -9,7 +9,7 @@ use cuteafd_engine::{media::RequestMedia, prefix::{After, PrefixCache, PrefixCon
 use cuteafd_ffi::CuteafdDeviceBuffer;
 use cuteafd_hostcache::copy::StubCopyEngine;
 use cuteafd_loader::{families::{minimax_m3::config::MiniMaxM3Config, qwen4::Qwen4KvCache},
-    plan::{checkpoint::{read_json, Checkpoint}, families::minimax::{admission, coordinator}}};
+    plan::{checkpoint::{read_json, Checkpoint}, families::minimax::admission}};
 use cuteafd_transport::ExpertV2SourceKind;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -432,7 +432,6 @@ pub(crate) async fn run_golden(args: GoldenArgs) -> Result<()> {
     let checkpoint = Checkpoint::coordinator(&args.snapshot, false, false)?;
     let cfg = MiniMaxM3Config::from_hf(&checkpoint.config)?;
     cfg.release_geometry()?;
-    let weights = coordinator::resident_weights(&checkpoint, false)?;
     let mut catalog = cuteafd_loader::read_expert_catalog(&args.snapshot)?;
     catalog.select_draft(cuteafd_loader::plan::spec::DraftOwnership::None)?;
     if args.check_headers {
@@ -468,22 +467,17 @@ pub(crate) async fn run_golden(args: GoldenArgs) -> Result<()> {
     let sizing = admission::RuntimeSizing {rows:args.prefill_rows as usize, decode_rows:(args.prefill_rows as usize).min(64),
         sequences:1, context:context as u64, spark_ranks:args.peers.len(), logit_rows:args.prefill_rows as usize, lanes:1,
         host_landing:!args.peers.is_empty() && super::routed::host_landing(&library)?};
-    let program_sizes = admission::ProgramSizes::from_manifest(&read_json(&args.manifest)?, sizing)?;
-    let ledger = admission::RuntimeLedger::new(&cfg, sizing, &program_sizes)?;
     let (package, local_package) = super::admission::local_package(native)?;
-    let workspace = if args.expert_layers.is_empty() {0} else {
-        admission::expert_workspace(local_package.as_ref().context("MiniMax golden local experts need the native \
-            expert package manifest (fp8-minimax-nvfp4a4/manifest.json)")?, 1, sizing.rows)?
-    };
-    let mut reservations = admission::Reservations {weights:weights.resident_bytes,
-        local_experts:admission::expert_resident_bytes(&catalog, &args.expert_layers, 1, 0)?,
-        expert_workspace:workspace, headroom:2 << 30, ..Default::default()};
-    reservations.startup = reservations.fixed_bytes(&ledger)?.checked_add(admission::scale_prep_staging_bytes(&weights))
-        .context("MiniMax golden startup admission overflow")?;
     // The coordinator GPU budget is already applied to the free bytes it reports.
     let available = library.cuda_memory_info()?.0 as u64;
     let pool_tokens = if args.check_prefix {(context as u64).max(128) * 3 + 256} else {context as u64};
-    let admitted = admission::admit(&cfg, sizing, &ledger, reservations, available, Some(pool_tokens), Qwen4KvCache::Fp8)?;
+    // Serve's recipe for golden's layers, with no Spark ceiling (its workers admit their own
+    // layers) and no startup decode graphs (every step runs eagerly).
+    let admitted = super::admission::solve(&checkpoint, &read_json(&args.manifest)?, local_package.as_ref(), admission::Request {
+        sizing, kv_format: Qwen4KvCache::Fp8, local_layers: admission::LocalLayers::Exactly {
+            local: args.expert_layers.clone(), spark: remote.clone() }, spark_budget: u64::MAX, spark_vision_bytes: 0,
+        headroom: 2 << 30, draft_bytes: 0, draft_rings: 0, host_embedding: false, startup_graphs: false,
+        rings: super::admission::spark_rings()? }, available, Some(pool_tokens))?;
     if !remote.is_empty() {
         if let Ok(selected) = std::env::var("CUTEAFD_GOLDEN_EXPERT_LAYERS") {
             let selected = selected.split(',').map(str::parse::<usize>).collect::<std::result::Result<Vec<_>, _>>()?;
@@ -495,8 +489,8 @@ pub(crate) async fn run_golden(args: GoldenArgs) -> Result<()> {
     // (CUTEAFD_MINIMAX_GRAPH_VERIFY=1 checks replay against eager bit for bit).
     let super::serve::Runtime { execution, cache, embedding, token_ids, embedded, routed } =
         super::serve::start(&library, args.device, &programs, super::serve::Start {
-            snapshot: &args.snapshot, checkpoint: &checkpoint, cfg: &cfg, sizing, ledger: &ledger, cache: &admitted,
-            local_layers: &args.expert_layers, spark_layers: &remote, peers: &args.peers, catalog: &catalog,
+            snapshot: &args.snapshot, checkpoint: &checkpoint, cfg: &cfg, sizing, ledger: &admitted.ledger, cache: &admitted.cache,
+            local_layers: &admitted.local_layers, spark_layers: &admitted.spark_layers, peers: &args.peers, catalog: &catalog,
             package: &package, embed: EmbedPlacement::Gpu, available, draft: None })?;
     let experts: Box<dyn ExpertExecutor<'_>> = match routed { Some(routed) => Box::new(routed), None => Box::new(DenseOnly) };
     let mut runner = Runner {execution:&execution, cache:&cache, embedding:&embedding, ids:token_ids, embedded, experts,
