@@ -18,6 +18,7 @@ mod header;
 pub(crate) mod head;
 mod precision;
 pub(crate) mod weights;
+pub(crate) mod variants;
 
 /// Whether this launch's coordinator operands can join a push group: every
 /// representation the push path records (BF16 operands, GPU FP8 copies,
@@ -277,6 +278,12 @@ pub(crate) struct EngineArgs {
     /// Serving-only policy used to reserve the complete graph set before KV allocation.
     #[arg(skip)]
     pub serving_graph_policy: Option<(usize, bool)>,
+    /// Weight variants to derive and serve (`serve-glmf --variant`, indexed 1..=7).
+    #[arg(skip)]
+    pub variants: Vec<(u8, cuteafd_core::variants::VariantSpec)>,
+    /// The served model id the variants' public ids derive from.
+    #[arg(skip)]
+    pub served_id: String,
 }
 
 /// `--decode-rows`: the decode programs' 64 rows, or the wide programs' 128.
@@ -1289,7 +1296,7 @@ fn step_settings(args: &EngineArgs, index_cache: engine::IndexCache, spark_bf16:
     engine::StepSettings { spark_bf16, kda_fp32_partials: args.kda_fp32_partials, kda_output_shard: args.kda_output_shard,
         kda_prefill_expanded: args.kda_prefill_expanded, full_prefill_logits: args.full_prefill_logits,
         max_context: args.max_context, index_cache, kda_state: args.kda_state, replay_records: args.replay_records,
-        decode_rows: args.decode_rows }
+        decode_rows: args.decode_rows, variants: false }
 }
 
 /// Whether start-up loads program `name` for a GLM Flash engine: its own programs (`glmf_`), the
@@ -1443,7 +1450,8 @@ impl Opened {
     #[allow(clippy::too_many_arguments)]
     fn admit(&self, args: &EngineArgs, programs: &cuteafd_ffi::programs::Programs<'_>, layers: usize,
         index: engine::IndexCache, marks: usize, peer: Option<i32>, automatic_context: bool,
-        prepared_draft: Option<&crate::shared::draft::remote::Prepared<'_>>, attention: engine::GlmfAttention)
+        prepared_draft: Option<&crate::shared::draft::remote::Prepared<'_>>, attention: engine::GlmfAttention,
+        variant_bytes: u64)
         -> Result<(cuteafd_loader::placement::Placement, cuteafd_loader::placement::GraphSet,
             cuteafd_loader::placement::families::glm5_flash::GlmfWorkingSet)> {
         use cuteafd_loader::placement::{self, families::glm5_flash as admission};
@@ -1536,9 +1544,16 @@ impl Opened {
         } else { placement::GraphSet::budget(&vec![args.graph_budget_mib.map_or(1536 << 20, |mib| mib << 20); devices.len()]) };
         let onboard = args.rtx_expert_layers.unwrap_or_else(|| if args.local_experts {
             placement::Onboard::Layers(experts.len()) } else { admission::default_onboard() });
-        let inputs = admission::GlmfInputs { automatic_context: automatic_context, attention, cfg: &self.cfg, layers, local_tp2_exl3,
-            gpus: inventory.gpus.iter().map(|gpu| (gpu.total_bytes, placement::Baseline::Measured {
-                free_bytes: gpu.free_bytes + prepared_draft.map_or(0, crate::shared::draft::remote::Prepared::sampled_bytes) })).collect(),
+        // Weight variants live outside the weight ledger: their bytes leave the coordinator GPU
+        // before the pool is sized.
+        let measured = |charge: u64| -> Result<Vec<_>> { inventory.gpus.iter().enumerate().map(|(rank, gpu)| {
+            let free = gpu.free_bytes + prepared_draft.map_or(0, crate::shared::draft::remote::Prepared::sampled_bytes);
+            let free = free.checked_sub(if rank == 0 { charge } else { 0 })
+                .context("weight-variant tables and deltas exceed the coordinator GPU's free memory")?;
+            Ok((gpu.total_bytes, placement::Baseline::Measured { free_bytes: free }))
+        }).collect() };
+        let mut inputs = admission::GlmfInputs { automatic_context: automatic_context, attention, cfg: &self.cfg, layers, local_tp2_exl3,
+            gpus: measured(variant_bytes)?,
             pending_code, headroom_bytes: args.headroom_bytes()?, spark_ranks,
             prefill_lanes: lanes as u64, prefill_rows: args.prefill_rows as u64, decode_rows: args.decode_rows as u64,
             partial_bytes: if args.kda_fp32_partials { 4 } else { 2 }, max_context: args.max_context as u64,
@@ -1552,6 +1567,16 @@ impl Opened {
             args.max_context as u64, inputs.requested_pool, 256, spark_ranks == 0).target;
         let (placement, graphs, working) = admission::solve_attention_working_set_with_graphs(&inputs,
             alternate_resident.as_deref(), target, automatic_context, sms, true)?;
+        if variant_bytes > 0 {
+            // The pool cost: the same solve without the variants' charge.
+            inputs.gpus = measured(0)?;
+            let unvaried = admission::solve_attention_working_set_with_graphs(&inputs, alternate_resident.as_deref(),
+                target, automatic_context, sms, true).map(|(p, _, _)| p.pool_tokens);
+            tracing::info!(variant_mib = variant_bytes as f64 / (1u64 << 20) as f64, pool_tokens = placement.pool_tokens,
+                pool_tokens_without = ?unvaried.as_ref().ok(),
+                pool_cost_tokens = ?unvaried.as_ref().ok().map(|&t| t.saturating_sub(placement.pool_tokens)),
+                "GLM Flash weight variants charged before the KV pool");
+        }
         let attention = admission::placed_attention(attention, &placement);
         ensure!(placement.movables.iter().all(|(id, gpu)| *gpu == 0 || *id == placement::MovableId::Drafter),
             "GLM Flash placement has no matching movable executor");
@@ -1765,8 +1790,34 @@ impl Opened {
             },
             _ => None,
         };
+        // Weight variants: derived on the CPU before admission so their tables and deltas are
+        // charged before the KV pool is sized.
+        let variants = if args.variants.is_empty() { None } else {
+            ensure!(split_device.is_none() && !args.kda_output_shard && context_mode.is_none(),
+                "weight variants need one coordinator GPU (no head split, layer owners or context attention) for now");
+            let derived = variants::derive(&args.snapshot, &args.served_id, &args.variants, &self.cfg)?;
+            (!derived.plans.is_empty()).then_some(derived)
+        };
+        let variant_bytes = match &variants {
+            None => variants::VariantBytes::default(),
+            Some(derived) => {
+                let lanes = engine::configured_prefill_waves(layers == self.cfg.layers, args.prefill_waves);
+                // Every step workspace's rows: decode, the prefill lanes and a scoring or serving extra.
+                let table_rows: Vec<usize> = std::iter::once(args.decode_rows)
+                    .chain(std::iter::repeat_n(args.prefill_rows, lanes + 1)).collect();
+                variants::device_bytes(&derived.plans, self.cfg.hidden, args.decode_rows, &table_rows, |shapes| {
+                    shapes.iter().map(|&(k, n)| self.library.fp8_w8a16_workspace(args.decode_rows, k, n))
+                        .collect::<Result<Vec<_>>>().map(|v| v.into_iter().max().unwrap_or(0))
+                })?
+            }
+        };
+        if variants.is_some() {
+            tracing::info!(tables_kib = variant_bytes.tables.div_ceil(1024), deltas_mib = variant_bytes.deltas as f64 / (1u64 << 20) as f64,
+                workspace_mib = variant_bytes.workspace as f64 / (1u64 << 20) as f64, rows_kib = variant_bytes.rows.div_ceil(1024),
+                "GLM Flash weight-variant device bytes");
+        }
         let (placement, admitted_graphs, working) = self.admit(args, &programs, layers, index_cache, mark_slots,
-            split_device, automatic_context, prepared_draft.as_ref(), attention)?;
+            split_device, automatic_context, prepared_draft.as_ref(), attention, variant_bytes.total())?;
         cuteafd_loader::placement::families::GLM5_FLASH.check(&placement)?;
         let attention = cuteafd_loader::placement::families::glm5_flash::placed_attention(attention, &placement);
         ensure!(placement.attention_placement == attention.mode,
@@ -2007,6 +2058,7 @@ impl Opened {
         let early_workspaces = if args.replay_records == engine::ReplayRecords::Shared {
             let mut settings = step_settings(args, index_cache, self.checkpoint.spark_input_is_bf16());
             settings.max_context = max_context;
+            settings.variants = variants.is_some();
             let plan = engine::StepPlan::new(&self.library, &programs, &self.cfg, &model.layers, step_experts, settings);
             let lanes = engine::configured_prefill_waves(layers == self.cfg.layers, args.prefill_waves);
             Some(engine::StepWorkspaces::allocate(&plan, args.prefill_rows, lanes)?)
@@ -2020,6 +2072,18 @@ impl Opened {
             &execution, step_experts)?;
         engine.attention_plan = attention_plan;
         engine.spark_bf16 = self.checkpoint.spark_input_is_bf16();
+        if let Some(derived) = variants {
+            // Before any workspace: every one then holds its rows' variant ids.
+            for (key, _) in derived.plans.iter().flat_map(|p| &p.sites).filter(|(_, op)| op.is_delta()) {
+                ensure!(!engine.weights.layers.get(usize::from(key.layer)).is_some_and(|l| l.has("nvfp4_w1")),
+                    "weight variant delta at {key}: the ModelOpt NVFP4 dense MLP keeps its activation in its package");
+            }
+            let tables = variants::GlmfVariants::upload(&self.library, stream, derived.plans, derived.records,
+                self.cfg.hidden, args.decode_rows)?;
+            tracing::info!(sites = tables.site_count(), deltas = tables.delta_count(), variants = tables.records.len(),
+                bytes = variant_bytes.total(), "GLM Flash weight-variant sites resident");
+            engine.variants = Some(tables);
+        }
 
         if !startup_graphs {
             engine.capture_graphs_lazily();

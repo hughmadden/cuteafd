@@ -1,6 +1,7 @@
 //! GLM 5.3 Flash (glm5_next) family: configuration for the generic engine.
 pub mod config;
 pub mod resident;
+pub mod variants;
 pub use config::{GlmNextAttention, GlmNextConfig};
 
 /// The same projection contract drives native loading and offline checkpoint stitching.

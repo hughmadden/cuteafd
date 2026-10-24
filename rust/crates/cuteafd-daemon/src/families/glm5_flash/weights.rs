@@ -48,6 +48,8 @@ use cuteafd_loader::placement::{FfnMode, LayerExecutionPlan, LayerMode};
 pub(crate) const PREFIX: &str = "model.language_model.";
 
 pub(crate) struct GlmfLayer<'a> {
+    /// The checkpoint layer this is (weight-variant sites are keyed by it).
+    pub index: usize,
     pub attention: GlmNextAttention,
     pub dense: bool,
     /// FFN width; whole attention still retains a split FFN on two GPUs.
@@ -753,7 +755,7 @@ impl<'a> GlmfLoader<'a> {
             ops.insert("gate", self.one(&format!("{p}.mlp.gate.weight"))?);
             ops.insert("gate.bias", self.f32(&[format!("{p}.mlp.gate.e_score_correction_bias")])?);
         }
-        Ok(GlmfLayer { attention, dense, split: false, attention_share: AttentionShare::Whole, operands: ops })
+        Ok(GlmfLayer { index: layer, attention, dense, split: false, attention_share: AttentionShare::Whole, operands: ops })
     }
 
     /// GPUs of the head split this loader fills (1: no split).
@@ -1145,7 +1147,7 @@ impl<'a> GlmfLoader<'a> {
                 &[format!("{p}.mlp.gate.e_score_correction_bias")]))?);
         }
         Ok(ops.into_iter().zip(attention_shares).map(|(operands, attention_share)|
-            GlmfLayer { attention, dense, split: true, attention_share, operands }).collect())
+            GlmfLayer { index: layer, attention, dense, split: true, attention_share, operands }).collect())
     }
 
     /// The admitted layer plan: rank 0's weights (its

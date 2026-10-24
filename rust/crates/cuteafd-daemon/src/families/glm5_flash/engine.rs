@@ -69,6 +69,7 @@ use crate::shared::experts::rtx::{ExpertInput, PartialDtype, Routes, RtxExpertLa
     ExchangeDtype, FusedCombine, RouteCheck, RouteIdentity, RouteSource};
 use std::ffi::c_void;
 use std::rc::Rc;
+use cuteafd_core::variants::{SiteKey, SiteKind};
 
 /// A retained device allocation or a disjoint view of the prefill slot arena.
 struct Dev<'a> {
@@ -543,6 +544,8 @@ struct StepTables {
     /// runs once per segment over its rows, with its own tables. Empty: one sequence (or a decode
     /// step, whose programs take every row's sequence from the tables).
     segments: Vec<packing::Segment>,
+    /// Each row's weight variant (0 = base), aligned with `positions`; padded rows are 0.
+    variants: Vec<i32>,
 }
 
 /// A prefill step's sequence units (its pool table: one unit per pool page); empty for decode.
@@ -619,6 +622,8 @@ pub(crate) struct GlmfPlacement {
     /// Rows the KDA recurrent and conv state has consumed: `len` after a prefill or a plain
     /// verify; a speculative verify leaves it until the caller commits the kept rows.
     pub kda_len: usize,
+    /// The sequence's weight variant (0 = base); every row it runs carries it.
+    pub variant: u8,
 }
 
 impl GlmfPlacement {
@@ -627,7 +632,7 @@ impl GlmfPlacement {
         let pages = units.iter().flat_map(|&u| (0..UNIT_PAGES as i32).map(move |i| u as i32 * UNIT_PAGES as i32 + i))
             .collect();
         let pool_pages = units.iter().map(|&u| u as i32).collect();
-        Self { units, pages, pool_pages, slot, len: 0, kda_len: 0 }
+        Self { units, pages, pool_pages, slot, len: 0, kda_len: 0, variant: 0 }
     }
 
     pub fn record(&self, position: usize) -> Result<i64> {
@@ -693,7 +698,7 @@ impl Allocator {
         -> Result<(GlmfPlacement, Option<cuteafd_engine::prefix::TailCopy>)> {
         let slot = self.slots.pop().context("KDA state slots exhausted")?;
         match self.units.fork(&source.units, len, self.units.pages_for(capacity)) {
-            Ok(fork) => Ok((GlmfPlacement::new(fork.pages, slot), fork.copy)),
+            Ok(fork) => Ok((GlmfPlacement { variant: source.variant, ..GlmfPlacement::new(fork.pages, slot) }, fork.copy)),
             Err(error) => {
                 self.slots.push(slot);
                 Err(error).context("cache pages exhausted")
@@ -777,6 +782,12 @@ struct Workspace<'a> {
     cache_lengths: Dev<'a>,
     page_table: Dev<'a>,
     pool_table: Dev<'a>,
+    /// Each row's weight variant (i32), uploaded with the step's tables; only with `--variant`
+    /// (outside the lane arena: admission charges it with the variants).
+    variants: Option<Dev<'a>>,
+    /// The step in this workspace runs variant sites: always for decode (its graphs keep their
+    /// topology), and for a prefill only when a row is not base.
+    variant_active: Cell<bool>,
     /// The step's token ids (U32, gathered from the device embedding table).
     ids: Dev<'a>,
     /// Greedy selection of the logits rows inside the decode graph: U32 ids, then U32 statuses.
@@ -854,6 +865,8 @@ pub(crate) struct StepPlan<'p, 'a> {
     /// scratch is at least this large. 0 with records of their own.
     shared_records: u64,
     spark_bf16: bool,
+    /// Weight variants are configured: every workspace holds its rows' variant ids.
+    variants: bool,
 }
 
 /// Expert buffers required by the admitted routed-layer homes.
@@ -884,6 +897,8 @@ pub(crate) struct StepSettings {
     /// The most rows of one decode or verify step (`--decode-rows`: [`DECODE_ROWS`], or
     /// [`WIDE_DECODE_ROWS`] with the wide programs).
     pub decode_rows: usize,
+    /// Weight variants are configured (`--variant`).
+    pub variants: bool,
 }
 
 impl<'p, 'a> StepPlan<'p, 'a> {
@@ -924,6 +939,7 @@ impl<'p, 'a> StepPlan<'p, 'a> {
             decode_rows: settings.decode_rows,
             shared_records,
             spark_bf16: settings.spark_bf16,
+            variants: settings.variants,
         }
     }
 
@@ -943,15 +959,15 @@ impl<'p, 'a> StepPlan<'p, 'a> {
             decode_scratch, prefill_scratch).device_bytes())
     }
 
-    fn key(&self) -> (GlmfScratchOptions, GlmfStepShape, usize, u64) {
-        (self.scratch, self.shape, self.decode_rows, self.shared_records)
+    fn key(&self) -> (GlmfScratchOptions, GlmfStepShape, usize, u64, bool) {
+        (self.scratch, self.shape, self.decode_rows, self.shared_records, self.variants)
     }
 }
 
 /// A GPU's step workspaces allocated before its engine (eager start-up): the decode workspace and
 /// every prefill lane, so the KV pool is sized from the memory they leave.
 pub(crate) struct StepWorkspaces<'a> {
-    key: (GlmfScratchOptions, GlmfStepShape, usize, u64),
+    key: (GlmfScratchOptions, GlmfStepShape, usize, u64, bool),
     rows: usize,
     decode: Workspace<'a>,
     lanes: Vec<Workspace<'a>>,
@@ -1076,6 +1092,12 @@ impl<'a> StepPlan<'_, 'a> {
             cache_lengths: alloc(bytes.cache_lengths)?,
             page_table: alloc(bytes.page_table)?,
             pool_table: alloc(bytes.pool_table)?,
+            variants: self.variants.then(|| -> Result<_> {
+                let ids = self.alloc(rows as u64 * 4)?;
+                self.library.cuda_zero_bytes(ids.buffer, ids.buffer.bytes)?;
+                Ok(ids)
+            }).transpose()?,
+            variant_active: Cell::new(false),
             ids: alloc(bytes.ids)?,
             select: alloc(bytes.select)?,
             router_logits: alloc(bytes.router_logits)?,
@@ -1322,6 +1344,8 @@ fn output_rows(rows: usize, rank: usize) -> (usize, usize) {
 }
 
 pub(crate) struct GlmfEngine<'a> {
+    /// Weight-variant sites (`--variant`); `None` launches nothing. Set before any workspace exists.
+    pub(crate) variants: Option<super::variants::GlmfVariants<'a>>,
     /// The same admitted homes used to allocate early workspaces; validated against installed backends.
     step_experts: StepExperts,
     pub(crate) spark_bf16: bool,
@@ -1593,6 +1617,7 @@ fn pad_decode_tables(tables: &mut StepTables, bucket: usize) {
         tables.kda_slots.push(row.state_slot);
         tables.seq_first.push(row.seq_first);
         tables.cache_lengths.push(row.cache_length);
+        tables.variants.push(0);
         tables.page_table.extend(std::iter::repeat_n(0, tables.page_stride));
         tables.pool_table.extend(std::iter::repeat_n(0, tables.pool_stride));
     }
@@ -1765,7 +1790,7 @@ impl<'a> GlmfEngine<'a> {
         let device = library.cuda_get_device()?;
         let (table_pages, table_pool_pages) = glmf_table_pages(max_context as u64);
         let (table_pages, table_pool_pages) = (usize::try_from(table_pages)?, usize::try_from(table_pool_pages)?);
-        Ok(Self { step_experts, quantize_grid, library, programs, cfg, weights, stream, max_context, prefill_rows, prefill_waves,
+        Ok(Self { variants: None, step_experts, quantize_grid, library, programs, cfg, weights, stream, max_context, prefill_rows, prefill_waves,
             prefill_span_rows, pages, slots, decode_rows, verify_rows,
             attention_plan: cuteafd_core::coordinator_programs::AttentionReductionPlan::new(DECODE_ROWS, None, None)?,
             buckets: DecodeBuckets::new(verify_rows),
@@ -3138,7 +3163,7 @@ impl<'a> GlmfEngine<'a> {
             StepSettings { spark_bf16: self.spark_bf16, kda_fp32_partials: self.kda_fp32_partials, kda_output_shard: self.kda_output_shard,
                 kda_prefill_expanded: self.kda_prefill_expanded, full_prefill_logits: self.full_prefill_logits,
                 max_context: self.max_context, index_cache: self.index_cache, kda_state: self.kda_state,
-                replay_records: self.replay_records, decode_rows: self.decode_rows })
+                replay_records: self.replay_records, decode_rows: self.decode_rows, variants: self.variants.is_some() })
     }
 
     /// Installs step workspaces allocated before this engine (`StepWorkspaces`), which must be
@@ -3313,6 +3338,7 @@ impl<'a> GlmfEngine<'a> {
             tables.kv_slots.push(placement.record(position)?);
             tables.pool_slots.push(placement.pool_slot(position)?);
             tables.kda_slots.push(placement.slot);
+            tables.variants.push(i32::from(placement.variant));
             tables.seq_first.push(first);
             tables.cache_lengths.push(((position + 1) / KPOOL) as i32);
             tables.long |= position + 1 > self.cfg.dense_context();
@@ -3649,7 +3675,14 @@ impl<'a> GlmfEngine<'a> {
         self.put(&w.pool_slots, &tables.pool_slots)?;
         self.put(&w.cache_lengths, &tables.cache_lengths)?;
         self.put(&w.page_table, &tables.page_table)?;
-        self.put(&w.pool_table, &tables.pool_table)
+        self.put(&w.pool_table, &tables.pool_table)?;
+        if let Some(ids) = &w.variants {
+            ensure!(tables.variants.len() == tables.positions.len(), "step variants do not match its rows");
+            self.put(ids, &tables.variants)?;
+            // A base prefill chunk launches no variant work; decode graphs always launch.
+            w.variant_active.set(super::variants::launches(tables.decode, &tables.variants));
+        }
+        Ok(())
     }
 
     /// Upload rank 1's tables after its prior consumers on the peer stream.
@@ -4429,10 +4462,42 @@ impl<'a> GlmfEngine<'a> {
             GlmNextAttention::Kda => tables.spans().iter().try_for_each(|span| {
                 ensure!(span.first == 0 || (rank == 0 && self.peer.is_none()), "per-sequence rows run on one GPU");
                 self.kda_on(rank, w, index, layer, if tables.segments.is_empty() { rows } else { span.rows() },
-                    span.first, cap, tables.spec)
+                    span.first, cap, tables.spec)?;
+                // o_proj's input: the gated-norm output the program left in its scratch.
+                let d = self.caches_of(rank).kda_heads * self.cfg.kda_head_dim;
+                let in_width = 3 * d + 2 * self.cfg.kda_head_dim + self.caches_of(rank).kda_heads;
+                let input = w.scratch.buffer.ptr.wrapping_byte_add(super::variants::kda_norm_offset(span.rows, in_width, d));
+                // Dead once the program returns: its in-projection rows, ahead of the gated-norm input.
+                let spare = (w.scratch.buffer.ptr, super::variants::kda_spare_bytes(span.rows, in_width)
+                    .min(w.scratch.buffer.bytes));
+                self.variant_site(rank, w, layer, SiteKind::Attn, w.delta.buffer.ptr, span.first, span.rows,
+                    Some((input, spare)))
             }),
-            GlmNextAttention::Mla => self.mla_on(rank, w, index, layer, rows, cap, tables, trace),
+            GlmNextAttention::Mla => {
+                self.mla_on(rank, w, index, layer, rows, cap, tables, trace)?;
+                self.variant_site(rank, w, layer, SiteKind::Attn, w.delta.buffer.ptr, 0, tables.kv_slots.len(), None)
+            }
         }
+    }
+
+    /// Weight-variant site `kind` of `layer` over `rows` BF16 rows of `x` from row `first`
+    /// (rank 0 of one GPU only): the stored delta from the site tensor's `input` (that call's
+    /// rows from its first), then steering. Nothing without `--variant`, nothing for a prefill
+    /// chunk of base rows, and base rows are never written.
+    #[allow(clippy::too_many_arguments)]
+    fn variant_site(&self, rank: usize, w: &Workspace<'_>, layer: &GlmfLayer<'_>, kind: SiteKind, x: *mut c_void,
+        first: usize, rows: usize, input: Option<(*mut c_void, (*mut c_void, usize))>) -> Result<()> {
+        let (Some(variants), Some(ids)) = (&self.variants, &w.variants) else { return Ok(()) };
+        if !w.variant_active.get() || rows == 0 { return Ok(()) }
+        ensure!(rank == 0 && self.peer.is_none(), "weight variants run on one coordinator GPU");
+        let key = SiteKey { layer: u16::try_from(layer.index)?, kind };
+        let y = x.wrapping_byte_add(first * self.cfg.hidden * 2);
+        let vidx = ids.buffer.ptr.wrapping_byte_add(first * 4).cast_const();
+        if variants.has_delta(key) {
+            let (input, spare) = input.with_context(|| format!("delta at {key}: the site tensor's input is not available"))?;
+            variants.delta(self.library, key, input.cast_const(), rows, y, vidx, Some(spare), self.stream)?;
+        }
+        variants.steer(key, y, rows, vidx, self.stream)
     }
 
     /// Layer `index`'s KDA on rank `rank` (a head split: its heads and their state), over the
@@ -4550,9 +4615,11 @@ impl<'a> GlmfEngine<'a> {
             // SAFETY: the input rows, the layer's NVFP4 operands, the constant ids/weights
             // (the expert rows: the widest prefill lane or decode step), the output and the
             // scratch are live device buffers used on the engine stream.
-            return self.timed("ffn (NVFP4 dense)", || unsafe {
+            self.timed("ffn (NVFP4 dense)", || unsafe {
                 dense.module.launch(&pointers, usize::try_from(rows)?, self.stream)
-            });
+            })?;
+            // Its activation stays in the package's scratch: steering only (deltas are refused at load).
+            return self.variant_site(rank, w, layer, SiteKind::DenseFfn, out, 0, usize::try_from(rows)?, None);
         }
         let decode = is_decode(cap);
         let pointers = [("x", w.x.buffer.ptr), ("w_gate_up_fp8", layer.ptr("w_gate_up_fp8")?),
@@ -4561,7 +4628,16 @@ impl<'a> GlmfEngine<'a> {
         // FP8-only weights: decode rows up to `fp8_rows` on the GEMV; prefill W8A8 or W8A16.
         let inter = inter / if layer.split { 2 } else { 1 };
         self.run_on(rank, layer.split, &format!("ffn_i{inter}_{cap}"), &pointers,
-            &self.fp8_scalars(rows, decode, decode || self.fp8_prefill.ffn))
+            &self.fp8_scalars(rows, decode, decode || self.fp8_prefill.ffn))?;
+        let Scalar::I32(n) = rows else { anyhow::bail!("FFN row count scalar") };
+        let n = usize::try_from(n)?;
+        // down_proj's input: the SwiGLU activation the program left in its scratch.
+        let input = w.scratch.buffer.ptr.wrapping_byte_add(super::variants::ffn_hidden_offset(n, inter));
+        // Unwritten by the program: the scratch past its SwiGLU activation (sized by the widest program, KDA).
+        let start = super::variants::ffn_spare_offset(n, inter);
+        let spare = (w.scratch.buffer.ptr.wrapping_byte_add(start), w.scratch.buffer.bytes.saturating_sub(start));
+        self.variant_site(rank, w, layer, if layer.dense { SiteKind::DenseFfn } else { SiteKind::SharedExpert }, out, 0, n,
+            Some((input, spare)))
     }
 
     /// The rows and tables the DSA indexer, top-k and selection run over: each packed sequence's
@@ -5716,8 +5792,12 @@ mod prefill_lane_tests {
             let mut tables = super::StepTables { decode: true, page_stride: 8, pool_stride: 2,
                 positions: vec![17; rows], kv_slots: vec![19; rows], kda_slots: vec![2; rows],
                 seq_first: (0..rows as i32).collect(), pool_slots: vec![-1; rows], cache_lengths: vec![4; rows],
-                page_table: vec![3; rows * 8], pool_table: vec![1; rows * 2], ..Default::default() };
+                page_table: vec![3; rows * 8], pool_table: vec![1; rows * 2],
+                variants: (0..rows as i32).map(|i| i % 3).collect(), ..Default::default() };
             super::pad_decode_tables(&mut tables, bucket);
+            // Real rows keep their variants in row order; padded rows are base.
+            assert_eq!(tables.variants, (0..bucket as i32).map(|i| if (i as usize) < rows { i % 3 } else { 0 })
+                .collect::<Vec<_>>());
             assert_eq!(&tables.positions[..rows], vec![17; rows]);
             assert_eq!(&tables.kv_slots[..rows], vec![19; rows]);
             assert_eq!(&tables.positions[rows..], vec![-1; bucket - rows]);
