@@ -397,6 +397,119 @@ mod tests {
         assert!(invalid.placeholder(None,None).is_err());
     }
 
+    /// `processor-parity.py`'s integer pattern, so pinned vendor hashes need no fixture files.
+    fn formula(height: u32, width: u32, salt: u64) -> RgbImage {
+        let data = (0..u64::from(height)).flat_map(|y| (0..u64::from(width)).flat_map(move |x|
+            (0..3u64).map(move |c| ((x * 37 + y * 101 + c * 59 + x * y % 97 + salt * 13) % 256) as u8)))
+            .collect();
+        RgbImage { width, height, data }
+    }
+    fn f32_sha(values: &[f32]) -> String {
+        let bytes: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
+        format!("{:x}", Sha256::digest(&bytes))
+    }
+
+    #[test]
+    fn release_processor_patch_hashes_match_the_bundled_python_processor() {
+        // python/tools/qualify/minimax_m3/processor-parity.py: the release's own
+        // image_processor.py / video_processor.py on Transformers 5.14.0, torch 2.14.1 CPU.
+        let config = ProcessorConfig::for_family(ImageFamily::Minimax);
+        for (h, w, grid, sha) in [
+            (1080, 1920, (36, 64), "e5831b6ddc674249ecb85e88ee9aeb30d38a70f2ffde33e66b9349aa9c64e95a"),
+            (333, 777, (24, 56), "28c600049fa12945370205c806f7a168ffc381b6ef13e304b680b34e247fdb10"),
+            (100, 37, (8, 2), "0142e2010f5c0de5367be52218d740e442397f58bf74b7e9802958f77eab9a90"),
+        ] {
+            let image = config.prepare_rgb(formula(h, w, 0), EncoderId([0; 32])).unwrap();
+            assert_eq!((image.grid.t, image.grid.h, image.grid.w), (1, grid.0, grid.1), "{h}x{w}");
+            assert_eq!(f32_sha(&image.patches(&config).unwrap()), sha, "{h}x{w}");
+        }
+        for (count, h, w, sizing, grid, sha) in [
+            (9, 56, 112, VideoResize::Off, (5, 4, 8), "0e65e134d2175491cb906d4b5e79ceda33f72c27001e3a48b79f68f5ceff2cd5"),
+            (5, 360, 640, VideoResize::Smart, (3, 26, 46), "5569c6706e03d80144c69ea70445b516388d0418fe25596b4a6666d76a9fd241"),
+        ] {
+            let frames: Vec<_> = (0..count).map(|k| formula(h, w, k)).collect();
+            let segments = prepare_video_frames(&frames, EncoderId([0; 32]), sizing).unwrap();
+            assert_eq!(segments.iter().map(|s| s.grid.t).sum::<u32>(), grid.0);
+            assert!(segments.iter().all(|s| (s.grid.h, s.grid.w) == (grid.1, grid.2)));
+            let patches: Vec<f32> = segments.iter().flat_map(|s| s.patches().unwrap()).collect();
+            assert_eq!(f32_sha(&patches), sha, "{count}x{h}x{w}");
+        }
+    }
+
+    /// Full comparison against `processor-parity.py --out DIR` (images, frame lists,
+    /// prompt expansion, both samplers and both frame sizings), bit for bit.
+    #[test]
+    #[ignore = "set CUTEAFD_MINIMAX_PROCESSOR_PARITY to a processor-parity.py output directory"]
+    fn minimax_vendor_parity() {
+        let dir = std::path::PathBuf::from(std::env::var("CUTEAFD_MINIMAX_PROCESSOR_PARITY").unwrap());
+        let cases: serde_json::Value = serde_json::from_slice(&std::fs::read(dir.join("cases.json")).unwrap()).unwrap();
+        let config = ProcessorConfig::from_snapshot(&dir, ImageFamily::Minimax).unwrap();
+        let read_png = |name: &str| super::super::decode(&std::fs::read(dir.join(name)).unwrap(), config.decode).unwrap();
+        let expect = |name: &str, actual: &[f32]| {
+            let bytes = std::fs::read(dir.join(format!("{name}.f32"))).unwrap();
+            let vendor: Vec<f32> = bytes.chunks_exact(4).map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect();
+            assert_eq!(vendor.len(), actual.len(), "{name}: patch count");
+            let differing = vendor.iter().zip(actual).filter(|(a, b)| a.to_bits() != b.to_bits()).count();
+            let worst = vendor.iter().zip(actual).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+            assert_eq!(differing, 0, "{name}: {differing} of {} values differ, max |diff| {worst}", vendor.len());
+        };
+        let grid = |value: &serde_json::Value| -> Vec<u32> {
+            value.as_array().unwrap().iter().map(|v| v.as_u64().unwrap() as u32).collect()
+        };
+        for case in cases["images"].as_array().unwrap() {
+            let name = case["name"].as_str().unwrap();
+            let image = config.prepare_rgb(read_png(&format!("{name}.png")), EncoderId([0; 32])).unwrap();
+            assert_eq!(vec![image.grid.t, image.grid.h, image.grid.w], grid(&case["grid"]), "{name}");
+            assert_eq!(image.tokens as u64, case["tokens"].as_u64().unwrap(), "{name}");
+            expect(name, &image.patches(&config).unwrap());
+        }
+        for case in cases["videos"].as_array().unwrap() {
+            let name = case["name"].as_str().unwrap();
+            let count = case["frames"].as_u64().unwrap() as usize;
+            let frames: Vec<_> = (0..count).map(|k| read_png(&format!("{name}-{k}.png"))).collect();
+            let sizing = if case["do_resize"].as_bool().unwrap() { VideoResize::Smart } else { VideoResize::Off };
+            let segments = prepare_video_frames(&frames, EncoderId([0; 32]), sizing).unwrap();
+            let vendor = grid(&case["grid"]);
+            assert_eq!(segments.iter().map(|s| s.grid.t).sum::<u32>(), vendor[0], "{name}");
+            assert!(segments.iter().all(|s| (s.grid.h, s.grid.w) == (vendor[1], vendor[2])), "{name}");
+            expect(name, &segments.iter().flat_map(|s| s.patches().unwrap()).collect::<Vec<_>>());
+            let indices: Vec<usize> = (0..count).collect();
+            let (mut text, mut offset) = (String::new(), 0);
+            for segment in &segments {
+                text.push_str(&segment.placeholder(case["source_fps"].as_f64(),
+                    Some(&indices[offset..offset + segment.source_frames])).unwrap());
+                offset += segment.source_frames;
+            }
+            assert_eq!(text, case["placeholder"].as_str().unwrap(), "{name}");
+        }
+        let list = |value: &serde_json::Value| -> Vec<usize> {
+            value.as_array().unwrap().iter().map(|v| v.as_u64().unwrap() as usize).collect()
+        };
+        for case in cases["serving_sampler"].as_array().unwrap() {
+            let total = case["total"].as_u64().unwrap() as usize;
+            assert_eq!(constant_interval_indices(total, case["video_fps"].as_f64(), case["fps"].as_f64().unwrap()).unwrap(),
+                list(&case["indices"]), "{case}");
+        }
+        for case in cases["uniform_sampler"].as_array().unwrap() {
+            let total = case["total"].as_u64().unwrap() as usize;
+            assert_eq!(sample_frame_indices(total, case["video_fps"].as_f64(), true,
+                case["num_frames"].as_u64().map(|n| n as usize), case["fps"].as_f64()).unwrap(),
+                list(&case["indices"]), "{case}");
+        }
+        for (key, sizing) in [("serving_sizing", VideoResize::Vendor), ("smart_sizing", VideoResize::Smart)] {
+            for case in cases[key].as_array().unwrap() {
+                let (h, w) = (case["height"].as_u64().unwrap() as u32, case["width"].as_u64().unwrap() as u32);
+                match case["resized"].as_array() {
+                    Some(_) => {
+                        let (rh, rw) = sizing.shape(h, w).unwrap();
+                        assert_eq!(vec![rh, rw], grid(&case["resized"]), "{key} {h}x{w}");
+                    }
+                    None => assert!(sizing.shape(h, w).is_err(), "{key} {h}x{w}"),
+                }
+            }
+        }
+    }
+
     #[test]
     fn video_keeps_all_frames_segments_eight_and_pads_last() {
         let frames: Vec<_> = (0..11).map(|v| RgbImage { width:28, height:28, data:vec![v;28*28*3] }).collect();
