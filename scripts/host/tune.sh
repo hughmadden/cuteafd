@@ -339,14 +339,14 @@ swap_policy
 [[ $ACTION == report ]] || exit 0
 row vm.swappiness "$(read_value "$PROCFS/sys/vm/swappiness")" 'site policy (read-only)'
 if ((LIVE)); then
-    # likely DGX OS default; report only (configure through limits.d).
+    # Established cluster setting; report only (configure through limits.d).
     row 'memlock (report process, KiB)' "$(ulimit -l)" unlimited
     irqbalance=unknown
     if command -v systemctl >/dev/null 2>&1; then
         irqbalance=$(timeout 10s systemctl is-active irqbalance.service 2>/dev/null) || true
         [[ -n $irqbalance ]] || irqbalance=unknown
     fi
-    # likely DGX OS default; report only until disabling is qualified per role.
+    # Established cluster setting; report only until disabling is qualified per role.
     row irqbalance "$irqbalance" inactive
 else
     row memlock unknown unlimited

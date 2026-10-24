@@ -43,8 +43,8 @@ is claimed for this host-tuning change.
   does not, `[unknown]` means unavailable or no universal recommendation.
 - THP `enabled`/`defrag` `madvise` and `vm.zone_reclaim_mode=0`: likely
   Spark/DGX OS defaults, already set here; apply enforces them nonetheless.
-- Unlimited memlock and inactive irqbalance: likely Spark/DGX OS defaults,
-  already set here; report only. Memlock is the report process's limit;
+- Unlimited memlock and inactive irqbalance: established cluster settings,
+  not assumed universal OS defaults; report only. Memlock is the report process's limit;
   a running expert worker's limits are also shown. Service/container limits
   can differ from an interactive shell. For a human-installed
   `/etc/security/limits.d/90-cuteafd.conf`, use `* - memlock unlimited`
