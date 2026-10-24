@@ -62,6 +62,7 @@ impl V41SteerTables {
         let variants = plans.iter().map(|p| usize::from(p.index)).max().unwrap_or(0);
         Ok(Some(Self { tables, layers, variants }))
     }
+    #[cfg(test)]
     pub fn edits(&self, layer: usize) -> bool { self.layers.get(layer).is_some_and(Option::is_some) }
     /// Table bytes on a GPU holding the layers `holds` selects: each distinct
     /// table once. The planner charges this before sizing the KV pool.
@@ -143,10 +144,11 @@ pub(crate) fn load_variants(specs: &[(u8, cuteafd_core::variants::VariantSpec)],
 }
 
 /// One table resident on a GPU.
-struct DeviceTable<'a> { a: DeviceAllocation<'a>, b: DeviceAllocation<'a>, k: DeviceAllocation<'a>, k_max: i32 }
-/// The tables a GPU's layers use, uploaded once at load.
+struct DeviceTable<'a> { a: DeviceAllocation<'a>, b: DeviceAllocation<'a>, k: DeviceAllocation<'a>, k_max: usize, variants: usize }
+/// The tables a GPU's layers use, uploaded once at load, and the kernel bound on that GPU.
 pub(crate) struct V41SteerWeights<'a> {
     device: i32,
+    kernel: cuteafd_ffi::steer_rows::SteerRows<'a>,
     tables: Vec<Option<DeviceTable<'a>>>,
     layers: [Option<u16>; LAYERS],
     variants: usize,
@@ -173,9 +175,12 @@ impl<'a> V41SteerWeights<'a> {
                 Ok(allocation)
             };
             *slot = Some(DeviceTable { a: upload(as_bytes(&t.a))?, b: upload(as_bytes(&t.b))?, k: upload(as_bytes(&t.k))?,
-                k_max: i32::try_from(t.k_max)? });
+                k_max: t.k_max, variants: t.k.len() - 1 });
         }
-        Ok(Self { device, tables, layers, variants: host.variants })
+        // Loads the kernel's modules now: a launch inside graph capture never loads one.
+        let kernel = library.steer_rows()?;
+        ensure!(kernel.device() == device, "steer_rows bound on device {}, tables on {device}", kernel.device());
+        Ok(Self { device, kernel, tables, layers, variants: host.variants })
     }
     fn site(&self, layer: usize) -> Option<&DeviceTable<'a>> {
         self.layers.get(layer).copied().flatten().and_then(|i| self.tables[usize::from(i)].as_ref())
@@ -248,20 +253,12 @@ impl<'w, 'a> BlockSteer<'w, 'a> {
         ensure!(x.bytes == rows * V41_HIDDEN * 2 && x.device_id == self.weights.device, "steered wo_b rows differ");
         #[cfg(test)]
         self.launched.push((layer, rows));
-        unsafe {
-            steer_rows(self.vidx.library, x, V41_HIDDEN as i64, rows as i32, V41_HIDDEN as i32, self.vidx.buffer,
-                table.a.buffer, table.b.buffer, table.k.buffer, table.k_max, stream)
-        }
+        let shape = cuteafd_ffi::steer_rows::SteerRowsShape { rows, h: V41_HIDDEN, ld: V41_HIDDEN,
+            k_max: table.k_max, variants: table.variants };
+        // SAFETY: `x` and the mask are this lane's buffers on the binding device, ordered on
+        // `stream` (caller contract); the tables live as long as the weights.
+        unsafe { self.weights.kernel.launch(x, self.vidx.buffer, table.a.buffer, table.b.buffer, table.k.buffer, shape, stream) }
     }
-}
-
-/// `cuteafd_steer_rows` (contract §4). Stand-in until the `wv-kernel` binding
-/// lands in `cuteafd-ffi`: refuses loudly instead of serving unsteered rows.
-#[allow(clippy::too_many_arguments)]
-unsafe fn steer_rows(_library: &NativeLibrary, _x: CuteafdDeviceBuffer, _ld: i64, _rows: i32, _h: i32,
-    _vidx: CuteafdDeviceBuffer, _a: CuteafdDeviceBuffer, _b: CuteafdDeviceBuffer, _k: CuteafdDeviceBuffer,
-    _k_max: i32, _stream: *mut std::ffi::c_void) -> Result<()> {
-    bail!("cuteafd_steer_rows is not bound in cuteafd-ffi yet (wv-kernel); variant rows cannot be served")
 }
 
 #[cfg(test)]
@@ -429,7 +426,7 @@ mod tests {
             let mut reference = base_out.clone();
             let t = &tables.tables[0];
             let vidx: Vec<i32> = mask.iter().map(|&v| i32::from(v)).collect();
-            steer_rows_ref(&mut reference, V41_HIDDEN, rows, V41_HIDDEN, &vidx, &t.a, &t.b, &t.k, t.k_max);
+            cuteafd_core::steer_rows::steer_rows_ref(&mut reference, V41_HIDDEN, rows, V41_HIDDEN, &vidx, &t.a, &t.b, &t.k, t.k_max);
             let name = format!("layers.{layer}.attn.wo_b");
             let w = cuteafd_loader::read_fp8_block32(&catalog, &name)?.dequantize();
             let w_pub = cuteafd_loader::read_fp8_block32(&source, &name)?.dequantize();
@@ -440,8 +437,8 @@ mod tests {
                     ensure!(steered[span.clone()] == base_out[span.clone()], "layer {layer} base row {row} was written");
                     continue;
                 }
-                let ulp = steered[span.clone()].iter().zip(&reference[span.clone()]).map(|(a, b)| a.abs_diff(*b)).max().unwrap_or(0);
-                ensure!(ulp <= 1, "layer {layer} row {row}: kernel differs from the host reference by {ulp} BF16 ulp");
+                ensure!(steered[span.clone()] == reference[span.clone()],
+                    "layer {layer} row {row}: kernel differs from the bit-exact host reference");
                 let f = |bits: &[u16]| bits.iter().map(|&b| bf16_to_f32(b)).collect::<Vec<f32>>();
                 let zr = f(&z[row * 8192..(row + 1) * 8192]);
                 let (y_gpu, y_steered) = (f(&base_out[span.clone()]), f(&steered[span]));
