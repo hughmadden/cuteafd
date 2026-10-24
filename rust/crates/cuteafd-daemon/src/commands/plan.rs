@@ -145,7 +145,7 @@ fn validate_glmf_precision(args: &PlanArgs, family: &str) -> Result<(), PlanErro
 }
 
 /// `cuteafd plan --variant ...`: the shared CPU derivation, one verdict per site tensor.
-fn plan_variants(args: &PlanArgs, snapshot: &std::path::Path) -> Result<()> {
+fn derive_plan_variants(args: &PlanArgs, snapshot: &std::path::Path) -> Result<Vec<cuteafd_loader::variants::VariantOutcome>> {
     let served = if std::path::Path::new(&args.model).is_dir() {
         snapshot.file_name().and_then(|n| n.to_str()).unwrap_or("model").to_owned()
     } else { args.model.clone() };
@@ -154,18 +154,31 @@ fn plan_variants(args: &PlanArgs, snapshot: &std::path::Path) -> Result<()> {
     for (index, spec) in args.variants.indexed(&served)? {
         outcomes.push(cuteafd_loader::variants::derive_variant(snapshot, &served, index, &spec, parallel)?);
     }
-    if args.json {
-        let value: Vec<serde_json::Value> = outcomes.iter().map(|o| serde_json::json!({
-            "name": o.name, "id": o.public_id, "available": o.plan.is_some(), "rejection": o.rejection,
-            "sites": o.plan.as_ref().map(|p| p.sites.len()), "k_max": o.plan.as_ref().map(|p| p.k_max()),
-            "table_bytes": o.plan.as_ref().map(|p| p.table_bytes()),
-            "namespace": o.plan.as_ref().map(|p| format!("{:016x}", p.namespace)),
-            "verify": o.verify_summary(), "missing_in_base": o.missing_in_base, "verdicts": o.verdicts })).collect();
-        println!("{}", serde_json::to_string_pretty(&value)?);
-        return Ok(());
-    }
-    for outcome in &outcomes {
-        println!("variant {} ({}): {:.1} s", outcome.name, outcome.public_id, outcome.seconds);
+    Ok(outcomes)
+}
+
+fn variant_diagnostics(outcomes: &[cuteafd_loader::variants::VariantOutcome]) -> serde_json::Value {
+    use cuteafd_core::variants::{resident_table_bytes, table_layouts};
+    let plans: Vec<_> = outcomes.iter().filter_map(|o| o.plan.clone()).collect();
+    let hidden = plans.first().map_or(0, |p| p.hidden as usize);
+    let bytes = resident_table_bytes(&plans, hidden);
+    let layouts = table_layouts(&plans, hidden);
+    serde_json::json!(outcomes.iter().map(|o| serde_json::json!({
+        "name": o.name, "id": o.public_id, "mode": o.mode,
+        "availability": if o.plan.is_some() { serde_json::json!({"state":"ready"}) }
+            else { serde_json::json!({"state":"unavailable", "reason":o.rejection}) },
+        "available": o.plan.is_some(), "rejection": o.rejection, "rejection_kind": o.rejection_kind,
+        "sites": o.plan.as_ref().map(|p| p.sites.len()), "k_max": o.plan.as_ref().map(|p| p.k_max()),
+        "table_bytes": bytes, "table_bytes_scope": "launch", "site_tables": layouts,
+        "namespace": o.plan.as_ref().map(|p| format!("{:016x}", p.namespace)),
+        "verify": o.verify_summary(), "missing_in_base": o.missing_in_base, "verdicts": o.verdicts
+    })).collect::<Vec<_>>())
+}
+
+fn print_variants(outcomes: &[cuteafd_loader::variants::VariantOutcome]) {
+    let diagnostics = variant_diagnostics(outcomes);
+    for outcome in outcomes {
+        println!("variant {} ({}, mode {}): {:.1} s", outcome.name, outcome.public_id, outcome.mode, outcome.seconds);
         println!("  {:<18} {:<58} {:>2} {:>7} {:>6} {:>7} {:>7} {:>8}  verdict", "site", "tensor", "k", "alpha", "top", "next", "|cos|", "r_W");
         for verdict in &outcome.verdicts {
             match &verdict.report {
@@ -176,16 +189,28 @@ fn plan_variants(args: &PlanArgs, snapshot: &std::path::Path) -> Result<()> {
             }
         }
         if !outcome.missing_in_base.is_empty() {
-            println!("  note: {} site tensors are absent from the base and were not derived (first: {})",
+            println!("  rejected: {} site tensors are absent from the base (first: {})",
                 outcome.missing_in_base.len(), outcome.missing_in_base[0]);
         }
         match (&outcome.plan, &outcome.rejection) {
-            (Some(plan), _) => println!("  AVAILABLE: {} sites, k_max {}, tables {} KiB per GPU that owns them, namespace {:016x}",
-                plan.sites.len(), plan.k_max(), plan.table_bytes().div_ceil(1024), plan.namespace),
-            (None, Some(reason)) => println!("  UNAVAILABLE: {reason}; weight-set variant required. Base serving is unaffected."),
+            (Some(plan), _) => println!("  AVAILABLE: {} sites, k_max {}, tables {} KiB for this launch on coordinator 0, namespace {:016x}",
+                plan.sites.len(), plan.k_max(), diagnostics[0]["table_bytes"].as_u64().unwrap_or(0).div_ceil(1024), plan.namespace),
+            (None, Some(reason)) => println!("  UNAVAILABLE: {reason}. Base serving is unaffected."),
             (None, None) => unreachable!(),
         }
     }
+}
+
+/// Charge the same packed buffers that upload allocates before the layout
+/// solver selects local layers and the remaining KV pool.
+fn charge_plan_variants(options: &mut PlanOptions, outcomes: &[cuteafd_loader::variants::VariantOutcome]) -> Result<()> {
+    let layout = options.layout.as_mut().context("variant layout options")?;
+    anyhow::ensure!(layout.rtx_bytes.len() == 1
+        && options.attention_placement != Some(cuteafd_loader::placement::AttentionPlacement::Layers),
+        "weight variants require one coordinator without layer execution");
+    let plans: Vec<_> = outcomes.iter().filter_map(|o| o.plan.clone()).collect();
+    let hidden = plans.first().map_or(0, |p| p.hidden as usize);
+    layout.variant_table_bytes = cuteafd_core::variants::resident_table_bytes(&plans, hidden);
     Ok(())
 }
 
@@ -243,7 +268,16 @@ pub(crate) fn run_plan(mut args: PlanArgs) -> Result<()> {
             .snapshot_path
             .with_context(|| format!("no snapshot of {} under {}", args.model, hf_home.display()))?
     };
-    if !args.variants.variants.is_empty() { return plan_variants(&args, &snapshot); }
+    let variant_outcomes = if args.variants.variants.is_empty() { Vec::new() } else {
+        let outcomes = derive_plan_variants(&args, &snapshot)?;
+        if !args.layout {
+            if args.json { println!("{}", serde_json::to_string_pretty(&variant_diagnostics(&outcomes))?); }
+            else { print_variants(&outcomes); }
+            return Ok(());
+        }
+        charge_plan_variants(&mut options, &outcomes)?;
+        outcomes
+    };
     if cuteafd_loader::plan::exlr8::recognizes(&snapshot)? {
         if args.spark_range {
             return Err(PlanError::InvalidOption { option: "--spark-range", reason:
@@ -414,8 +448,11 @@ pub(crate) fn run_plan(mut args: PlanArgs) -> Result<()> {
         };
         println!("{}", serde_json::to_string_pretty(&DeploymentSpec::from_report(&report, &deployment)?)?);
     } else if args.json {
-        println!("{}", serde_json::to_string_pretty(&report)?);
+        let mut value = serde_json::to_value(&report)?;
+        if !variant_outcomes.is_empty() { value["variants"] = variant_diagnostics(&variant_outcomes); }
+        println!("{}", serde_json::to_string_pretty(&value)?);
     } else {
+        if !variant_outcomes.is_empty() { print_variants(&variant_outcomes); }
         print!("{}", render(&report));
         if let Some(layout) = &report.memory_layout {
             print!("\nmemory layout (planner)\n{}", layout.render());
@@ -765,6 +802,26 @@ mod tests {
     use super::*;
     use cuteafd_loader::plan::testing::{mimo_flash_config, mimo_flash_tensors, mimo_pro_config, mimo_pro_tensors,
         write_snapshot};
+
+    #[test]
+    fn variant_layout_charge_uses_launch_packing_with_holes_and_shared_kmax() {
+        use clap::Parser;
+        use cuteafd_core::variants::{SiteKey, SiteKind, SiteOp, VariantPlan};
+        let site = SiteKey {layer:1,kind:SiteKind::SharedExpert};
+        let plan = VariantPlan::new(7,"alternate","m-alternate",128,vec![(site,SiteOp::rank1(2.0,&vec![0.5;128]))]).unwrap();
+        let outcome = cuteafd_loader::variants::VariantOutcome {name:"alternate".into(),public_id:"m-alternate".into(),plan:Some(plan),
+            rejection:None,rejection_kind:None,mode:"shared-only".into(),verdicts:vec![],missing_in_base:vec![],seconds:0.0};
+        let cli = crate::cli::Cli::try_parse_from(["cuteafd","plan","/not-read","--layout"]).unwrap();
+        let crate::cli::Commands::Plan(args) = cli.command else {panic!()};
+        let mut selected = options(&args).unwrap();
+        charge_plan_variants(&mut selected, &[outcome.clone()]).unwrap();
+        let expected = 2*8*128*4 + 256;
+        assert_eq!(selected.layout.as_ref().unwrap().variant_table_bytes, expected);
+        let json = variant_diagnostics(&[outcome]);
+        assert_eq!(json[0]["table_bytes"],expected);
+        assert_eq!(json[0]["site_tables"][0]["slots"],8);
+        assert_eq!(json[0]["mode"],"shared-only");
+    }
 
     #[test]
     fn plan_prefill_waves_and_span_reach_both_layout_fields() {

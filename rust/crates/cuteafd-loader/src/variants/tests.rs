@@ -219,6 +219,7 @@ fn tensor_source_decodes_fp8_blocks_bf16_and_f16() {
         ("b.weight", "BF16", vec![rows, cols], bf16),
         ("h.weight", "F16", vec![rows, cols], f16),
     ]);
+    std::fs::write(dir.path().join("config.json"), r#"{"quantization_config":{"weight_block_size":[2,3]}}"#).unwrap();
     let source = TensorSource::from_files(safetensors_files(dir.path()).unwrap()).unwrap();
     let block = |r: usize, c: usize| (r / 2) * 2 + c / 3;
     let g = source.matrix("g.weight").unwrap();
@@ -384,3 +385,6 @@ fn glm53_steered_rows_match_the_published_variant() {
         }
     }
 }
+
+#[path = "regressions.rs"]
+mod regressions;

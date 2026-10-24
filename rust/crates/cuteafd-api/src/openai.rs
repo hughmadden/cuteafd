@@ -130,6 +130,7 @@ pub struct ModelProfile {
 }
 
 /// How the serving router mounts the gateway front ends over its engine.
+#[derive(Clone)]
 pub struct GatewayMount {
     pub models: crate::gateway::ModelMap,
     /// Tokenizer snapshot for exact `count_tokens`.
@@ -153,7 +154,16 @@ impl std::fmt::Debug for GatewayMount {
 impl ModelProfile {
     /// The variant index a public model id selects, if it names a configured variant.
     pub fn variant_index(&self, id: &str) -> Option<u8> {
-        self.variants.iter().find(|v| v.public_id == id).map(|v| v.index)
+        self.variants.iter().find(|v| v.public_id == id && v.is_ready()).map(|v| v.index)
+    }
+    /// Check reserved ids before any gateway alias or catch-all can select base.
+    pub fn check_variant(&self, id: &str) -> Result<(), crate::gateway::GatewayError> {
+        if let Some(record) = self.variants.iter().find(|v| v.public_id == id) {
+            if let Some(reason) = record.unavailable_reason() {
+                return Err(crate::gateway::GatewayError::model_unavailable(id, reason));
+            }
+        }
+        Ok(())
     }
     /// A variant's name (`base` for index 0), for logs and usage.
     pub fn variant_name(&self, index: u8) -> &str {
@@ -349,6 +359,9 @@ pub fn router_with_console(queue: mpsc::Sender<NativeRequest>, limits: NativeLim
 pub fn router_for_model(queue: mpsc::Sender<NativeRequest>, limits: NativeLimits,
     stats: SharedStats, wait: std::time::Duration, console: Arc<ConsoleHub>, profile: ModelProfile) -> Router {
     let mut profile = profile;
+    if let Some(mount) = &mut profile.gateway {
+        Arc::make_mut(mount).models.set_variants(&profile.variants);
+    }
     if let Some(&(vision, audio)) = MEDIA_INPUT_POLICY.get() {
         profile.capabilities.vision &= vision;
         profile.capabilities.audio &= audio;
@@ -421,6 +434,9 @@ async fn stats_route(State(state): State<NativeState>) -> Json<Value> {
     let mut value = state.stats.lock().map(|stats| stats.clone()).unwrap_or(Value::Null);
     if !value.is_object() { value = json!({}); }
     refresh_mapped_tables(&mut value, &state.tables);
+    if !state.profile.variants.is_empty() && value.get("variants").is_none() {
+        value["variants"] = cuteafd_core::variants::VariantStats::new(state.profile.variants.clone()).json();
+    }
     let object = value.as_object_mut().unwrap();
     object.extend(state.admission.metrics().as_object().unwrap().clone());
     object.insert("http_queue_len".into(), json!(state.queue.max_capacity() - state.queue.capacity()));
@@ -469,7 +485,7 @@ fn refresh_mapped_tables(value: &mut Value, reader: &cuteafd_loader::MappedTable
 async fn models(State(state): State<NativeState>) -> Json<Value> {
     let base = model_record(&state);
     let mut data = vec![base.clone()];
-    data.extend(state.profile.variants.iter().map(|variant| variant_record(&base, variant)));
+    data.extend(state.profile.variants.iter().filter(|v| v.is_ready()).map(|variant| variant_record(&base, variant)));
     Json(json!({"object":"list","data":data}))
 }
 /// A variant's `/v1/models` record: the base record under the variant's id, plus `"variant"`.
@@ -638,6 +654,10 @@ pub(crate) struct Rejection {
 }
 
 impl Rejection {
+    fn model_error(error: crate::gateway::GatewayError) -> Self {
+        Self { status: StatusCode::from_u16(error.status()).unwrap_or(StatusCode::SERVICE_UNAVAILABLE),
+            message: error.message.clone(), retry: false, response: Some(error.openai_response()) }
+    }
     fn new(status: StatusCode, message: impl ToString) -> Self {
         Self { status, message: message.to_string(), retry: false, response: None }
     }
@@ -857,14 +877,18 @@ pub(crate) fn build(profile: &ModelProfile, limits: NativeLimits, headers: &axum
     // lists or accepts, so every id /v1/models advertises also works here.
     // Responses echo the id the client sent, as the gateway's do.
     let requested = converted.model.clone().unwrap_or_default();
+    profile.check_variant(&requested).map_err(Rejection::model_error)?;
     let (model, variant) = if requested == profile.id { (requested, 0) }
         else if let Some(variant) = profile.variant_index(&requested) { (requested, variant) } else {
         match profile.gateway.as_ref().filter(|_| !requested.is_empty()).map(|mount| mount.models.resolve(&requested)) {
             Some(Ok(served)) if served == profile.id => (requested, 0),
-            Some(Ok(served)) => match profile.variant_index(&served) {
+            Some(Ok(served)) => {
+                profile.check_variant(&served).map_err(Rejection::model_error)?;
+                match profile.variant_index(&served) {
                 Some(variant) => (requested, variant),
                 None => return Err(Rejection::bad(format!("model must be {}", profile.id))),
-            },
+            }},
+            Some(Err(error)) => return Err(Rejection::model_error(error)),
             _ => return Err(Rejection::bad(format!("model must be {}", profile.id))),
         }
     };
