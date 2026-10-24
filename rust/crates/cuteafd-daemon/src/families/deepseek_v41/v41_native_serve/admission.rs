@@ -138,6 +138,7 @@ pub(super) fn admit_startup(
     lib: &cuteafd_ffi::NativeLibrary,
     catalog: &cuteafd_loader::OfficialV41Catalog,
     args: &crate::cli::NativeServeArgs,
+    variants: Option<&crate::families::deepseek_v41::v41_variants::V41SteerTables>,
 ) -> Result<()> {
     use super::*;
     let (_, total) = lib.cuda_memory_info()?;
@@ -154,6 +155,7 @@ pub(super) fn admit_startup(
             || embedding_placement(args.embedding_placement, total)
                 == crate::shared::memory::EmbedPlacement::Gpu)
         .map(|item| Demand::new(0, item.category, item.group, item.bytes, item.basis))
+        .chain(variants.into_iter().flat_map(|tables| tables.demands(0, |_| true, capacity as usize, 2)))
         .collect::<Vec<_>>();
     let manifest = owners::native_manifest(&args.native_lib, "V41_FP8_AOT.json")?;
     let programs = owners::NativePrograms::new(&manifest, u32::try_from(lib.sm_count()?)?)?;

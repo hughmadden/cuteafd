@@ -15,3 +15,4 @@ pub(crate) mod v41_expert_staging;
 pub(crate) mod v41_image;
 pub(crate) mod v41_nvfp4;
 pub(crate) mod v41_nvfp4_staging;
+pub(crate) mod v41_variant;

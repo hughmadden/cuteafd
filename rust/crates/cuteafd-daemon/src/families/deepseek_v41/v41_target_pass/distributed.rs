@@ -498,6 +498,8 @@ impl<'w, 'a> DistributedTargetPass<'w, 'a> {
         if !stage.is_encoder() {
             self.resources.taps.begin(guard.batch.cache()?)?;
         }
+        // Both GPUs' lanes steer their own layers' rows.
+        for lane in &mut self.resources.lanes { lane.get_mut().set_variant_rows(guard.batch.variant_rows())?; }
         let first = stage.windows().start;
         let gpu = self.resources.map.attention(first)?;
         let device = self.resources.lanes[gpu].device;
