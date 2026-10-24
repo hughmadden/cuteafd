@@ -124,6 +124,31 @@ impl StepDump {
     }
 }
 
+/// Opt-in (`CUTEAFD_MINIMAX_LOGITS_TRACE=FILE`): one JSON line per executed step
+/// with the SHA-256 and argmax of every projected logits row, so two serving
+/// configurations can be compared bit for bit. Downloads every row: diagnostic only.
+pub(super) struct LogitTrace { file: fs::File }
+
+impl LogitTrace {
+    pub fn from_env() -> Result<Option<Self>> {
+        let Some(path) = std::env::var_os("CUTEAFD_MINIMAX_LOGITS_TRACE") else { return Ok(None) };
+        let file = fs::OpenOptions::new().create_new(true).append(true).open(&path)
+            .with_context(|| format!("MiniMax logits trace {}", Path::new(&path).display()))?;
+        Ok(Some(Self { file }))
+    }
+    pub fn record(&mut self, prefill: bool, positions: &[i64], rows: &[f32], vocab: usize) -> Result<()> {
+        ensure!(vocab > 0 && rows.len() == positions.len() * vocab, MiniMaxError::Invalid("logits trace extent"));
+        let rows = rows.chunks_exact(vocab).map(|row| {
+            let bytes: Vec<u8> = row.iter().flat_map(|v| v.to_le_bytes()).collect();
+            let top = row.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).map_or(0, |(i, _)| i);
+            json!({"sha256": format!("{:x}", Sha256::digest(&bytes)), "top": top})
+        }).collect::<Vec<_>>();
+        let line = json!({"prefill": prefill, "positions": positions, "rows": rows});
+        writeln!(self.file, "{line}")?;
+        Ok(())
+    }
+}
+
 fn selection_rows(bytes: &[u8], rows: usize, capacity: usize) -> Result<Vec<u8>> {
     ensure!(rows > 0 && rows <= capacity && bytes.len() == 4 * capacity * 16 * 4,
         MiniMaxError::Invalid("diagnostic selection stride"));

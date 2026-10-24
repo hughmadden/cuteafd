@@ -75,6 +75,7 @@ pub(super) struct MiniMaxBackend<'e, 'a> {
     pub probe: RefCell<RoundRoutes>,
     pub rings: RefCell<Rings>,
     pub full_prefill_logits: bool,
+    pub trace: RefCell<Option<super::diagnostics::LogitTrace>>,
 }
 impl<'e, 'a> MiniMaxBackend<'e, 'a> {
     /// One step; the head projects only the batch rows in `logits`.
@@ -120,8 +121,12 @@ impl<'e, 'a> MiniMaxBackend<'e, 'a> {
         let started = std::time::Instant::now();
         let kind = if prefill { cuteafd_transport::ExpertV2SourceKind::Prefill }
             else { cuteafd_transport::ExpertV2SourceKind::Decode };
+        let rows = logits.clone();
         let result = self.execution.execute(&self.embedded, &batch, &self.cache.layers, &mut *self.experts.borrow_mut(), kind, logits);
         let logits = result?;
+        if let (Some(trace), Some(device)) = (self.trace.borrow_mut().as_mut(), logits.as_ref()) {
+            trace.record(prefill, &batch.positions[rows], &device.to_host(library)?, device.vocab)?;
+        }
         self.timing.borrow_mut()[usize::from(!prefill)] += started.elapsed().as_secs_f64();
         step.completed();
         Ok((step, logits))
