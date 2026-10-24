@@ -95,8 +95,6 @@ def jobs(scope):
                    ["--geometry", "kimik3", "--only", "router_scores,expert_input_quant"]))
     if scope == "suspects":
         return result
-    result.extend((f"minimax-{group}", "export_b12x_minimax_aot.py", ["--group", group])
-                  for group in ("pointwise", "projections", "indexer", "attention"))
     result.append(("routed-minimax", "package_fp8_moe_aot.py",
                    ["--geometry", "minimax_nvfp4", "--capacities", "1,16,256", "--layouts", "tp1,tp2,tp4,tp6"]))
     result.append(("kimi-split", "export_b12x_kimi_split_aot.py", []))
