@@ -2187,11 +2187,10 @@ impl Opened {
         let spark_world = cuteafd_transport::expert::SparkWorld::canonical(peers.len())?;
         // One transport per prefill lane: each lane's wave stays in flight on its own QPs. Each takes
         // waves of the widest step (`expert_rows`): a verify step may be wider than a prefill lane.
-        let mut transports = (0..args.prefill_lanes).map(|_| crate::shared::spark_intake::SparkLink::new(&self.library,
+        let mut transports = crate::shared::prefill_lanes::LaneLinks::connect(args.prefill_lanes, |_| crate::shared::spark_intake::SparkLink::new(&self.library,
             spark_world, &peers, u32::try_from(args.expert_rows())?, cuteafd_transport::TcpTransportConfig { timing: false,
-                timeout: std::time::Duration::from_secs(120), max_frame_bytes: 64 << 20 }, self.cfg.hidden * 2))
-            .collect::<Result<Vec<_>>>()?;
-        for link in &mut transports { link.enable_terminal_ownership(self.library.clone())?; }
+                timeout: std::time::Duration::from_secs(120), max_frame_bytes: 64 << 20 }, self.cfg.hidden * 2))?;
+        for link in transports.iter_mut() { link.enable_terminal_ownership(self.library.clone())?; }
         crate::shared::memory_report::release_load_staging(&self.library);
         let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
         // Connect every rank and register full-size buffers now, as GLM-5, MiMo and DeepSeek V4 do: a

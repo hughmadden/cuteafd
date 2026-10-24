@@ -19,7 +19,7 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyMo
     let admitted = (|| -> anyhow::Result<(placement::Placement, glmf::GlmfWorkingSet)> {
         let cfg = GlmNextConfig::from_hf(&checkpoint.config)?;
         let spark_ranks = match report.placement { ExpertPlacement::Local => 0, ExpertPlacement::Sparks { ranks } => ranks };
-        let lanes = if options.prefill_lanes > 0 { options.prefill_lanes } else { crate::serving_capacity::GLMF_DEFAULT_PREFILL_LANES };
+        let lanes = if options.prefill_lanes > 0 { options.prefill_lanes } else { crate::serving_capacity::prefill_lanes::DEFAULT_PREFILL_LANES as u64 };
         let decode_rows = options.glmf_decode_rows;
         anyhow::ensure!(ranks == 1 || decode_rows == 64, "a head split takes --decode-rows 64");
         // The MLA placement (auto: context where the build carries its programs on two GPUs); context

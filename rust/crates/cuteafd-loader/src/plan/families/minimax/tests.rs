@@ -163,7 +163,8 @@ fn native_manifest_uses_shared_allocation_ledger() {
     assert!(!memory.notes.iter().any(|n| n.contains("header lower bound")));
     let rtx = memory.devices.iter().find(|d| d.kind == DeviceKind::Rtx).unwrap();
     let item = |name: &str| rtx.items.iter().find(|i| i.group == name).unwrap();
-    assert_eq!(item("MiniMax residual").bytes, 256 * 6144 * 4);
+    // Two lanes of 256 rows by default: the per-row buffers hold their 512-row chunk.
+    assert_eq!(item("MiniMax residual").bytes, 2 * 256 * 6144 * 4);
     // Every program shares the scratch arena; the prefill scorer's is the largest.
     assert_eq!(item("MiniMax scratch").bytes, 134_799_872);
     assert!(rtx.used_bytes() <= PRO_TOTAL_BYTES);
@@ -197,8 +198,8 @@ fn native_manifest_admits_bundled_dspark_and_charges_its_full_layout() {
     let on = plan::plan(dir.path(), &options).unwrap();
     assert!(on.placement_supported && on.wip_launchable(), "{:?}", on.hints);
     let contract = DsparkContract::open(dir.path()).unwrap();
-    // Sixteen sequences share the default eight context rings.
-    let draft = DraftMemory::new(&contract, crate::families::minimax_m3::dspark::default_ring_slots(16), 256, 188).unwrap();
+    // Sixteen sequences share the default eight context rings; the taps hold a two-lane chunk.
+    let draft = DraftMemory::new(&contract, crate::families::minimax_m3::dspark::default_ring_slots(16), 2 * 256, 188).unwrap();
     assert_eq!(draft.slots, 8);
     let rtx = |report: &crate::plan::PlanReport| report.memory_layout.as_ref().unwrap().devices.iter()
         .find(|d| d.kind == DeviceKind::Rtx).unwrap().clone();
@@ -218,7 +219,7 @@ fn native_manifest_admits_bundled_dspark_and_charges_its_full_layout() {
     options.layout.as_mut().unwrap().concurrency = 1;
     let refused = plan::plan(dir.path(), &options).unwrap();
     assert!(!refused.placement_supported);
-    assert!(refused.hints.iter().any(|h| h.what.contains("7..4096 rows")), "{:?}", refused.hints);
+    assert!(refused.hints.iter().any(|h| h.what.contains("7..16384 rows")), "{:?}", refused.hints);
     options.layout.as_mut().unwrap().prefill_rows = 256;
     options.layout.as_mut().unwrap().concurrency = 16;
     options.layout.as_mut().unwrap().drafter_bytes = 1;
@@ -279,8 +280,10 @@ fn native_tp2_auto_vision_preserves_text_admission() {
     assert!(memory.devices.iter().all(|d| d.used_bytes() <= d.capacity_bytes));
     assert!(memory.notes.iter().any(|n| n.starts_with("2 routed layers on the RTX")));
     assert!(!report.hints.iter().any(|h| h.what.starts_with("routed experts need ")));
-    // Logits cover decode rows, not every prefill row, so 4096-row prefill fits too.
+    // Logits cover decode rows, not every prefill row, so a 4096-row prefill chunk fits too
+    // (one lane: two lanes of 4096 rows hold twice the per-row buffers).
     options.layout.as_mut().unwrap().prefill_rows = 4096;
+    options.layout.as_mut().unwrap().prefill_lanes = 1;
     let wide = plan::plan(dir.path(), &options).unwrap();
     assert!(wide.wip_launchable(), "{:?}", wide.hints);
     assert!(wide.memory_layout.as_ref().unwrap().pool_tokens < memory.pool_tokens);

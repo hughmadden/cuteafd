@@ -1,5 +1,7 @@
 use super::{MiniMaxError, execution::ExpertExecutor};
-use crate::shared::{experts::fp8::Fp8Experts,minimax_ffi,spark_intake::{self,IntakePreference,SparkDeviceLink}};
+use crate::shared::{experts::fp8::Fp8Experts,minimax_ffi,prefill_lanes::LaneLinks,
+    spark_intake::{self,IntakePreference,SparkDeviceLink}};
+use cuteafd_loader::serving_capacity::prefill_lanes::MAX_PREFILL_LANES;
 use anyhow::{ensure,Context,Result};
 use cuteafd_ffi::{NativeLibrary,minimax::{Buffer,Commands}};
 use cuteafd_transport::{ExpertProtocolV2Request,ExpertProtocolV2RouteEntry,ExpertV2SourceKind,TcpTransportConfig,
@@ -13,27 +15,23 @@ const TOPK:usize=4;
 pub(super) type Build=fn(u64,usize,usize,Vec<ExpertProtocolV2RouteEntry>,bytes::Bytes,ExpertV2SourceKind)
     ->Result<ExpertProtocolV2Request>;
 
-/// Prefill lanes at most (`--prefill-lanes`): one device link each.
-pub(super) const MAX_LANES:usize=2;
-
 /// Spark expert transport: the device-driven exchange, one link per prefill
 /// lane (each its own proxy, mailbox, egress, planes and rank connections,
-/// so two lanes' waves can be in flight at once; decode uses the first).
-/// Partials land in GPU memory where the NIC can write it (dma-buf),
-/// otherwise in pinned host planes the reducer reads in place (GeForce cards
-/// have no dma-buf); either way the stream never drains, and the inference
-/// thread never parses or copies, per routed layer.
-pub(super) struct Spark<'a>(Vec<Rc<SparkDeviceLink<'a>>>);
+/// so every lane's wave can be in flight at once). Partials land in GPU
+/// memory where the NIC can write it (dma-buf), otherwise in pinned host
+/// planes the reducer reads in place (GeForce cards have no dma-buf); either
+/// way the stream never drains, and the inference thread never parses or
+/// copies, per routed layer.
+pub(super) struct Spark<'a>(LaneLinks<Rc<SparkDeviceLink<'a>>>);
 
 impl<'a> Spark<'a> {
     /// `first` is a Spark layer for the warm wave that sizes every rank's rings.
     #[allow(clippy::too_many_arguments)]
     pub fn connect(library:&'a NativeLibrary,device:i32,world:SparkWorld,peers:&[SocketAddr],rows:usize,
         config:TcpTransportConfig,first:usize,build:Build,lanes:usize)->Result<Self> {
-        ensure!((1..=MAX_LANES).contains(&lanes),MiniMaxError::Invalid("Spark prefill lanes"));
         let host=!spark_intake::preferred_device_exchange_available(library,IntakePreference::Probed)?;
         if host { tracing::info!("MiniMax Spark partials land in pinned host planes (no GPU landing)"); }
-        let links=(0..lanes).map(|lane| {
+        Ok(Self(LaneLinks::connect(lanes,|lane| {
             let routes=(0..rows*TOPK).map(|i| ExpertProtocolV2RouteEntry {
                 row_index:(i/TOPK) as u32, expert_id:(i%128) as u32, gate_weight:0.0 }).collect();
             // Each link numbers its own waves; lanes keep apart in the high bits.
@@ -51,8 +49,7 @@ impl<'a> Spark<'a> {
             });
             Ok(Rc::new(SparkDeviceLink::new_zero_copy(library,device,world,peers,rows,TOPK,ROW,ROW,config.clone(),
                 Some(warm),wave_build,host)?))
-        }).collect::<Result<Vec<_>>>()?;
-        Ok(Self(links))
+        })?))
     }
 }
 
@@ -81,13 +78,12 @@ impl<'a> Routed<'a> {
         }
         if let Some(Spark(links))=&spark { ensure!(!links.is_empty() && links.iter().all(|l|matches!(l.world_size(),2|3|4)),
             MiniMaxError::Unsupported("Spark experts require TP2, TP3 or TP4")); }
-        // Local layers run on the stream at collect: lanes would only add launches.
-        let lanes=spark.as_ref().map_or(1,|Spark(links)|links.len());
+        // Local layers run on the stream at collect, in any lane.
+        let lanes=spark.as_ref().map_or(MAX_PREFILL_LANES,|Spark(links)|links.len());
         Ok(Self{local:local.map(Rc::new),spark,pending:(0..lanes).map(|_|None).collect(),kind:ExpertV2SourceKind::Decode,poisoned:false})
     }
     fn link(&self,lane:usize)->Result<&Rc<SparkDeviceLink<'a>>> {
-        let Spark(links)=self.spark.as_ref().context("MiniMax routed layer has neither local experts nor Spark transport")?;
-        links.get(lane).context("MiniMax Spark lane without a link")
+        self.spark.as_ref().context("MiniMax routed layer has neither local experts nor Spark transport")?.0.lane(lane)
     }
 }
 impl<'a> ExpertExecutor<'a> for Routed<'a> {
@@ -131,7 +127,7 @@ impl<'a> ExpertExecutor<'a> for Routed<'a> {
     }
     fn finish(&mut self)->Result<()> {
         ensure!(self.pending.iter().all(Option::is_none),MiniMaxError::Invalid("uncollected expert wave at step end"));
-        if let Some(Spark(links))=&self.spark { for link in links { link.check()?; } }
+        if let Some(Spark(links))=&self.spark { for link in links.iter() { link.check()?; } }
         Ok(())
     }
     fn abort(&mut self) {

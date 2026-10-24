@@ -23,8 +23,6 @@ pub const GLMF_WIDE_DECODE_ROWS: u64 = 128;
 pub const GLMF_SPARSE_TOPK: u64 = 2112;
 /// The vocabulary head's cuBLAS workspace (`cuteafd_ffi::programs::VOCABULARY_HEAD_WORKSPACE`).
 pub const GLMF_HEAD_WORKSPACE: u64 = 4 << 20;
-/// Prefill lanes by default (the engine's `--prefill-lanes`).
-pub const GLMF_DEFAULT_PREFILL_LANES: u64 = 2;
 /// mHC streams per row.
 const HC: u64 = 4;
 /// Tokens per DSA index pool.

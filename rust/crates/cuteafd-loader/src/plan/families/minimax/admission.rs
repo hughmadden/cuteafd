@@ -1,6 +1,7 @@
 //! Allocation recipe shared by native serving and manifest-backed planning.
 use std::collections::BTreeMap;
 use super::coordinator::RankWeightLayout;
+use crate::serving_capacity::{prefill_lanes::{lane_capacity, MAX_PREFILL_LANES}, spark_intake_bytes};
 use crate::families::minimax_m3::{cache::{MiniMaxCacheLayout, PAGE_ROWS}, config::MiniMaxM3Config};
 use crate::families::qwen4::Qwen4KvCache;
 use serde_json::Value;
@@ -31,6 +32,7 @@ fn product(values: &[u64]) -> Result<u64> {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RuntimeSizing {
+    /// Rows of one prefill lane (and of a serial chunk): the most rows any program launch takes.
     pub rows: usize,
     pub decode_rows: usize,
     pub sequences: usize,
@@ -40,8 +42,13 @@ pub struct RuntimeSizing {
     /// row when full prefill logits are served. Prefill otherwise projects
     /// only the rows whose logits a request needs.
     pub logit_rows: usize,
+    /// Prefill lanes (`--prefill-lanes`, `serving_capacity::prefill_lanes`): a chunk of up to
+    /// `lanes` x `rows` rows, one Spark endpoint per lane on every rank.
+    pub lanes: usize,
 }
 impl RuntimeSizing {
+    /// Rows of the longest prefill chunk, which the per-row buffers hold: lanes cut on KV pages.
+    pub fn chunk_rows(self) -> usize { lane_capacity(self.lanes, self.rows, PAGE_ROWS as usize) }
     /// Head rows for a server: every prefill row with full prefill logits,
     /// otherwise decode rows or the drafter's block rows, whichever is wider.
     pub fn head_rows(rows: usize, full_prefill_logits: bool, draft_rows: usize) -> usize {
@@ -49,8 +56,9 @@ impl RuntimeSizing {
     }
     pub fn validate(self, cfg: &MiniMaxM3Config) -> Result<()> {
         if !(1..=4096).contains(&self.rows) || !(1..=64).contains(&self.decode_rows)
+            || !(1..=MAX_PREFILL_LANES).contains(&self.lanes)
             || self.sequences == 0 || self.sequences > self.decode_rows || self.sequences > self.rows
-            || self.logit_rows < self.decode_rows || self.logit_rows > self.rows {
+            || self.logit_rows < self.decode_rows || self.logit_rows > self.chunk_rows() {
             return Err(AdmissionError::Unsupported("row capacity or sequence count"));
         }
         if self.context == 0 || self.context > cfg.max_position as u64 {
@@ -157,7 +165,7 @@ pub struct RuntimeLedger {
 impl RuntimeLedger {
     pub fn new(cfg: &MiniMaxM3Config, sizing: RuntimeSizing, programs: &ProgramSizes) -> Result<Self> {
         sizing.validate(cfg)?;
-        let (r, d, h) = (sizing.rows as u64, programs.decode_capacity(), cfg.hidden as u64);
+        let (r, d, h) = (sizing.chunk_rows() as u64, programs.decode_capacity(), cfg.hidden as u64);
         if d < sizing.decode_rows as u64 { return Err(manifest("decode capacity changed after validation")); }
         let mut allocations = Vec::new();
         let mut add = |name, dimensions: &[u64]| -> Result<()> {
@@ -189,7 +197,7 @@ impl RuntimeLedger {
         add("scratch", &[programs.workspace_bytes()])?;
         add("sampler", &[cuteafd_core::target_sampler_device_bytes(sizing.decode_rows, cfg.vocab_size) as u64])?;
         add("selector", &[sizing.decode_rows as u64, 12])?;
-        add("spark_intake", &[sizing.spark_ranks as u64, product(&[r, h, 2])?.max(256)])?;
+        add("spark_intake", &[spark_intake_bytes(sizing.lanes as u64, sizing.spark_ranks as u64, sizing.rows as u64, h)])?;
         let fixed_bytes = sum(allocations.iter().map(|a| a.bytes))?;
         Ok(Self { allocations, fixed_bytes })
     }
@@ -201,9 +209,9 @@ impl RuntimeLedger {
 pub fn extend_table_stride(context: u64) -> u64 { context.div_ceil(PAGE_ROWS).next_multiple_of(4) }
 
 /// Most extend launches one prefill step makes: each request's rows split
-/// into tiles of at most `tile` rows.
+/// into tiles of at most `tile` rows, and at each lane cut.
 pub fn extend_launches(sizing: RuntimeSizing, tile: u64) -> u64 {
-    sizing.sequences as u64 + (sizing.rows as u64).div_ceil(tile)
+    sizing.sequences as u64 + (sizing.chunk_rows() as u64).div_ceil(tile) + sizing.lanes as u64 - 1
 }
 
 /// Source scales are released after preparation completes; the MMA arrangement
@@ -352,7 +360,7 @@ pub(crate) mod tests {
             .collect::<serde_json::Map<_, _>>();
         serde_json::json!({"layouts":layouts})
     }
-    fn sizing() -> RuntimeSizing { RuntimeSizing { rows: 256, decode_rows: 64, sequences: 16, context: 1 << 20, spark_ranks: 3, logit_rows: 64 } }
+    fn sizing() -> RuntimeSizing { RuntimeSizing { rows: 256, decode_rows: 64, sequences: 16, context: 1 << 20, spark_ranks: 3, logit_rows: 64, lanes: 1 } }
     fn config() -> MiniMaxM3Config { MiniMaxM3Config::from_hf(&release_config()).unwrap() }
 
     #[test]
@@ -387,15 +395,22 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn minimax_row_buffers_hold_one_row_per_batch_row() {
-        let sizing = sizing();
-        let programs = ProgramSizes::from_manifest(&programs_manifest(), sizing).unwrap();
-        let ledger = RuntimeLedger::new(&config(), sizing, &programs).unwrap();
-        // Lane views stride these by row: each holds exactly rows x its row bytes.
-        for &(name, width, bytes) in ROW_BUFFERS {
-            assert_eq!(ledger.bytes(name), Some((sizing.rows as u64 * width * bytes).max(256)), "{name}");
+    fn minimax_row_buffers_hold_one_row_per_chunk_row() {
+        for lanes in [1, 2, 4] {
+            let sizing = RuntimeSizing { lanes, ..sizing() };
+            let programs = ProgramSizes::from_manifest(&programs_manifest(), sizing).unwrap();
+            let ledger = RuntimeLedger::new(&config(), sizing, &programs).unwrap();
+            // Lane views stride these by row: each holds exactly lanes x rows x its row bytes.
+            assert_eq!(sizing.chunk_rows(), lanes * 256);
+            for &(name, width, bytes) in ROW_BUFFERS {
+                assert_eq!(ledger.bytes(name), Some((sizing.chunk_rows() as u64 * width * bytes).max(256)), "{name}");
+            }
+            // Every lane's link holds one plane of a lane's rows per rank.
+            assert_eq!(ledger.bytes("spark_intake"), Some(lanes as u64 * 3 * 256 * 6144 * 2));
+            assert_eq!(extend_launches(sizing, 1024), 16 + 1 + lanes as u64 - 1);
         }
-        assert_eq!(ledger.bytes("norm"), Some(sizing.rows as u64 * config().hidden as u64 * 2));
+        assert!(RuntimeSizing { lanes: 0, ..sizing() }.validate(&config()).is_err());
+        assert!(RuntimeSizing { lanes: 5, ..sizing() }.validate(&config()).is_err());
     }
 
     #[test]

@@ -476,7 +476,7 @@ pub(crate) async fn run_golden(args: GoldenArgs) -> Result<()> {
     let context = windows.iter().map(|w| w.tokens.len()).max().unwrap().div_ceil(64) * 64;
     ensure!(!args.check_prefix || windows[0].tokens.len() >= 66, "prefix qualification needs 66 tokens in first window");
     let sizing = admission::RuntimeSizing {rows:args.prefill_rows as usize, decode_rows:(args.prefill_rows as usize).min(64),
-        sequences:1, context:context as u64, spark_ranks:args.peers.len(), logit_rows:args.prefill_rows as usize};
+        sequences:1, context:context as u64, spark_ranks:args.peers.len(), logit_rows:args.prefill_rows as usize, lanes:1};
     let program_sizes = admission::ProgramSizes::from_manifest(&read_json(&args.manifest)?, sizing)?;
     let ledger = admission::RuntimeLedger::new(&cfg, sizing, &program_sizes)?;
     let package = crate::shared::experts::fp8::package_directory(native, 1, cuteafd_loader::formats::fp8_experts::ExpertFormat::Nvfp4);
@@ -514,7 +514,7 @@ pub(crate) async fn run_golden(args: GoldenArgs) -> Result<()> {
     let source = EmbedSource::new(&args.snapshot, &tensor.shard, &tensor.meta, cfg.hidden)?;
     let (embedding, (execution, local)) = crate::shared::placement::load_while_admitting(pending, || {
         TokenEmbedding::load(&library, source, EmbedPlacement::Gpu, || {
-            let execution = Execution::load(device, &programs, &checkpoint, &cfg, &ledger)?;
+            let execution = Execution::load(device, &programs, &checkpoint, &cfg, &ledger, sizing)?;
             let local = if args.expert_layers.is_empty() {None} else {
                 let tensors = catalog.fp8().context("MiniMax expert catalog missing")?.for_coordinator();
                 Some(crate::shared::experts::fp8::Fp8Experts::load(&library, &tensors, &package,

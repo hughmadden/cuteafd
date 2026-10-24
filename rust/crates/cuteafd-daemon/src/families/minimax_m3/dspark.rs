@@ -115,6 +115,18 @@ impl<'a> Dspark<'a> {
     }
     pub fn update(&self,c:&Commands<'a>,s:&Scratch<'a>,rows:&[ContextRow])->Result<()> {
         if rows.is_empty() {return Ok(())}
+        // A program launch takes at most `capacity` rows: a prefill chunk of
+        // several lanes updates in pieces, in row order (each row is its own).
+        let capacity=c.capacity("minimax_kv_split")?;
+        let first=rows.iter().map(|r|r.tap_row).min().unwrap();
+        let last=rows.iter().map(|r|r.tap_row).max().unwrap();
+        for start in (first..=last).step_by(capacity) {
+            let piece=rows.iter().filter(|r|(start..start+capacity).contains(&r.tap_row)).copied().collect::<Vec<_>>();
+            if !piece.is_empty() { self.update_rows(c,s,&piece)?; }
+        }
+        Ok(())
+    }
+    fn update_rows(&self,c:&Commands<'a>,s:&Scratch<'a>,rows:&[ContextRow])->Result<()> {
         let first=rows.iter().map(|r|r.tap_row).min().unwrap();
         let last=rows.iter().map(|r|r.tap_row).max().unwrap();
         ensure!(last<self.layout.rows && rows.iter().all(|r|r.slot<self.layout.slots),MiniMaxError::Invalid("draft context rows"));

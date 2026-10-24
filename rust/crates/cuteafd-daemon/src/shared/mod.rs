@@ -22,6 +22,7 @@ pub(crate) mod minimax_ffi;
 pub(crate) mod peer_probe;
 pub(crate) mod peer_split;
 pub(crate) mod placement;
+pub(crate) mod prefill_lanes;
 pub(crate) mod prefill_pipeline;
 pub(crate) mod prefill_share;
 pub(crate) mod prefix;

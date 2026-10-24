@@ -4,8 +4,9 @@ use crate::shared::{memory::device::Device, token_io::DeviceLogits};
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::{minimax::{Buffer, Commands}, programs::{Programs,Scalar}};
 use cuteafd_transport::ExpertV2SourceKind;
-use cuteafd_loader::{families::minimax_m3::config::MiniMaxM3Config,
-    plan::{checkpoint::Checkpoint,families::minimax::admission::RuntimeLedger}};
+use cuteafd_loader::{families::minimax_m3::{cache::PAGE_ROWS,config::MiniMaxM3Config},
+    plan::{checkpoint::Checkpoint,families::minimax::admission::{RuntimeLedger,RuntimeSizing}},
+    serving_capacity::prefill_lanes as lane_plans};
 
 #[derive(Clone)]
 pub(super) struct LayerCache<'a> { pub key: Buffer<'a>, pub value: Buffer<'a>, pub index: Buffer<'a> }
@@ -66,9 +67,6 @@ struct Launch { request:usize, row:usize, first:usize, rows:usize, slot:usize, b
 /// the prefill scorer and the extend kernel.
 #[derive(Debug, PartialEq, Eq)]
 enum AttentionPlan { Decode { stride:usize }, Extend { launches:Vec<Launch> } }
-impl AttentionPlan {
-    fn launches(&self)->usize { match self { Self::Extend{launches}=>launches.len(), Self::Decode{..}=>0 } }
-}
 
 /// Decode metadata: per-row tables (-1 padded), lengths and packed offsets.
 fn decode_tables(batch:&BatchView)->Result<(usize,Vec<i32>,Vec<i32>,Vec<i32>)> {
@@ -86,19 +84,22 @@ fn decode_tables(batch:&BatchView)->Result<(usize,Vec<i32>,Vec<i32>,Vec<i32>)> {
     Ok((stride,tables,lengths,(0..=rows as i32).collect()))
 }
 
-/// Extend metadata: one launch per request tile of at most `tile` rows. Each
+/// Extend metadata: one launch per request tile of at most `tile` rows, and
+/// no tile across a prefill lane's first row (`cuts`, batch rows). Each
 /// launch's table row holds its request's pages through the step (padded
 /// with -1 to `stride`), its 16-byte entries hold the cache length after its
 /// rows and its packed offsets [0, rows], and `bounds` its rows' causal key
 /// ends after the `tile` leading zero key starts.
-fn extend_tables(batch:&BatchView,tile:usize,stride:usize)->Result<(Vec<Launch>,Vec<i32>,Vec<i32>,Vec<i32>,Vec<i32>)> {
+fn extend_tables(batch:&BatchView,tile:usize,stride:usize,cuts:&[usize])->Result<(Vec<Launch>,Vec<i32>,Vec<i32>,Vec<i32>,Vec<i32>)> {
     let (mut launches,mut tables,mut lengths,mut offsets,mut bounds)=(Vec::new(),Vec::new(),Vec::new(),Vec::new(),Vec::new());
     for (request,view) in batch.requests.iter().enumerate() {
         let end=view.start_position+view.rows;
         let width=end.div_ceil(64);
         ensure!(width<=stride,MiniMaxError::Invalid("extend page-table width"));
-        for first in (0..view.rows).step_by(tile) {
-            let rows=(view.rows-first).min(tile);
+        let mut first=0;
+        while first<view.rows {
+            let cut=cuts.iter().map(|&c|c.saturating_sub(view.row_start)).find(|&c|c>first).unwrap_or(view.rows);
+            let rows=(view.rows-first).min(tile).min(cut-first);
             launches.push(Launch{request,row:view.row_start+first,first,rows,slot:launches.len(),bounds:tile+bounds.len()});
             tables.extend_from_slice(&view.pages[..width]);
             tables.resize(launches.len()*stride,-1);
@@ -106,6 +107,7 @@ fn extend_tables(batch:&BatchView,tile:usize,stride:usize)->Result<(Vec<Launch>,
             offsets.extend([0,rows as i32,0,0]);
             bounds.extend((0..rows).map(|i|(view.start_position+first+i+1) as i32));
             bounds.resize(bounds.len().next_multiple_of(4),0);
+            first+=rows;
         }
     }
     Ok((launches,tables,lengths,offsets,bounds))
@@ -113,32 +115,36 @@ fn extend_tables(batch:&BatchView,tile:usize,stride:usize)->Result<(Vec<Launch>,
 
 fn le_bytes(values:&[i32])->Vec<u8> { values.iter().flat_map(|v|v.to_le_bytes()).collect() }
 
+/// The lane cuts (batch rows) of a step of `rows` rows in up to `lanes` lanes
+/// of `lane_rows`: one lane takes at most a program launch's `program_rows`.
+fn step_cuts(rows:usize,lanes:usize,lane_rows:usize,program_rows:usize,diagnostic:bool)->Result<Vec<usize>> {
+    if lanes<2 {
+        ensure!(rows<=program_rows,MiniMaxError::Invalid(if diagnostic {"a diagnostic runs one lane: --prefill-lanes 1"}
+            else {"one-lane step rows"}));
+        return Ok(Vec::new());
+    }
+    let sizes=lane_plans::lane_cuts(rows,lanes,lane_rows,PAGE_ROWS as usize)?;
+    Ok(sizes.iter().scan(0,|at,&n|{*at+=n; Some(*at)}).take(sizes.len()-1).collect())
+}
+
 /// Batch rows `first..first + rows` of a step and their extend launches (a
-/// range of the plan's; empty for a decode plan): one lane of the routed
-/// layers. Each lane has its own expert exchange in flight while the other
-/// lane's layer runs on the stream.
+/// range of the plan's; empty for a decode plan): one prefill lane
+/// (`serving_capacity::prefill_lanes`). Each lane has its own expert exchange
+/// in flight while another lane's layer runs on the stream.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Lane { first:usize, rows:usize, launches:std::ops::Range<usize> }
 
-/// A lane's fewest rows: a rank streams a layer's experts once per wave, so a
-/// smaller lane costs more Spark time than its overlap returns.
-const MIN_LANE_ROWS:usize=512;
-
-/// The step's lanes: one, or (an extend plan and `lanes` >= 2) two cut at the
-/// launch boundary nearest the middle that leaves both at least
-/// [`MIN_LANE_ROWS`]. Whole launches, so each lane runs the step's own
-/// attention launches, and 16-row aligned starts for the lane buffer views.
-fn plan_lanes(plan:&AttentionPlan,rows:usize,lanes:usize)->Vec<Lane> {
+/// The lanes of a step cut at `cuts` (each lane's first row after the first),
+/// with the launches of `plan` each holds (extend tiles never cross a cut).
+fn lanes_at(plan:&AttentionPlan,rows:usize,cuts:&[usize])->Vec<Lane> {
     let launches=match plan { AttentionPlan::Extend{launches}=>launches.as_slice(), AttentionPlan::Decode{..}=>&[] };
-    let one=vec![Lane{first:0,rows,launches:0..launches.len()}];
-    if lanes<2 { return one; }
-    let cut=(1..launches.len()).map(|i|(i,launches[i].row))
-        .filter(|&(_,row)|row%16==0 && row>=MIN_LANE_ROWS && rows-row>=MIN_LANE_ROWS)
-        .min_by_key(|&(_,row)|row.abs_diff(rows/2));
-    match cut {
-        Some((i,row))=>vec![Lane{first:0,rows:row,launches:0..i},Lane{first:row,rows:rows-row,launches:i..launches.len()}],
-        None=>one,
-    }
+    let mut bounds=vec![0]; bounds.extend_from_slice(cuts); bounds.push(rows);
+    let mut at=0;
+    bounds.windows(2).map(|w| {
+        let start=at;
+        while at<launches.len() && launches[at].row<w[1] { at+=1; }
+        Lane{first:w[0],rows:w[1]-w[0],launches:start..at}
+    }).collect()
 }
 
 pub(super) trait ExpertExecutor<'a> {
@@ -160,7 +166,12 @@ pub(super) struct Execution<'a> {
     weights: Weights<'a>,
     scratch: Scratch<'a>,
     cfg: MiniMaxM3Config,
+    /// Rows of the widest step (a prefill chunk of `lanes` lanes of `lane_rows`).
     rows:usize,
+    lane_rows:usize,
+    lanes:usize,
+    /// The most rows a program launch takes (the export's row capacity).
+    program_rows:usize,
     logit_rows:usize,
     context:usize,
     decode_rows:usize,
@@ -173,7 +184,7 @@ pub(super) struct Execution<'a> {
 }
 impl<'a> Execution<'a> {
     pub fn load(device:Device<'a>, programs:&'a Programs<'a>, checkpoint:&Checkpoint,
-        cfg:&MiniMaxM3Config, ledger:&RuntimeLedger) -> Result<Self> {
+        cfg:&MiniMaxM3Config, ledger:&RuntimeLedger, sizing:RuntimeSizing) -> Result<Self> {
         cfg.release_geometry()?;
         let diagnostics=std::cell::RefCell::new(Diagnostics::from_env(cfg.layers)?);
         ensure!(cfg.rms_norm_eps==1e-6 && cfg.swiglu_alpha==1.702 && cfg.swiglu_limit==7.0
@@ -190,6 +201,8 @@ impl<'a> Execution<'a> {
         let extend_rows=commands.capacity("minimax_index_prefill")?;
         ensure!(extend_rows>0 && extend_rows%4==0 && commands.capacity("minimax_attention_extend")?==extend_rows,
             MiniMaxError::Invalid("prefill index/attention capacity stride"));
+        let program_rows=commands.capacity("minimax_norm")?;
+        ensure!(rows==sizing.chunk_rows() && sizing.rows<=program_rows,MiniMaxError::Invalid("prefill lane rows"));
         let scratch=Scratch::new(device,ledger)?;
         let table_stride=usize::try_from(cuteafd_loader::plan::families::minimax::admission::extend_table_stride(context as u64))?;
         ensure!(scratch.get("page_table")?.raw().bytes>=decode_rows*table_stride*4,MiniMaxError::Invalid("page-table admission"));
@@ -205,7 +218,8 @@ impl<'a> Execution<'a> {
         commands.upload(scratch.get("index_bounds")?,&vec![0;extend_rows*4])?;
         commands.drain()?;
         let head=TargetHeadOwner::new(&commands,&scratch,logit_rows,cfg.vocab_size)?;
-        Ok(Self{commands,head,weights,scratch,cfg:cfg.clone(),rows,logit_rows,context,decode_rows,extend_rows,table_stride,
+        Ok(Self{commands,head,weights,scratch,cfg:cfg.clone(),rows,lane_rows:sizing.rows,lanes:sizing.lanes,program_rows,
+            logit_rows,context,decode_rows,extend_rows,table_stride,
             poisoned:std::cell::Cell::new(false),diagnostics,draft:None,draft_causal:false})
     }
     pub fn load_draft(&mut self, contract:&cuteafd_loader::families::minimax_m3::dspark::DsparkContract,
@@ -269,17 +283,17 @@ impl<'a> Execution<'a> {
         let result=(||{
             self.commands.upload(self.scratch.get("positions")?,&batch.positions.iter().flat_map(|v|v.to_le_bytes()).collect::<Vec<_>>())?;
             self.commands.upload(self.scratch.get("slots")?,&batch.slots.iter().flat_map(|v|v.to_le_bytes()).collect::<Vec<_>>())?;
-            let plan=self.plan_attention(batch,rows)?;
-            // A diagnostic dumps whole layers: one lane.
-            let lanes=plan_lanes(&plan,rows,if diagnostics.is_some() {1} else {experts.lanes()});
+            let cuts=self.lane_cuts(batch,rows,experts.lanes(),diagnostics.is_some())?;
+            let plan=self.plan_attention(batch,rows,&cuts)?;
+            let lanes=lanes_at(&plan,rows,&cuts);
             let views=lanes.iter().map(|lane|self.scratch.rows(lane.first,lane.rows)).collect::<Result<Vec<_>>>()?;
             lane_count=lanes.len();
             experts.begin(self.cfg.moe[..=last_layer].iter().filter(|&&moe|moe).count(),lanes.len(),kind)?;
             self.commands.widen(embedded,self.scratch.get("residual")?,rows*6144)?;
             // Each lane's routed layer runs its attention, router, dispatch and
             // shared expert, then the next lane's does; a lane collects its
-            // experts only after the other lane's half of the layer, so one
-            // lane's exchange is in flight while the other's GPU work runs.
+            // experts only after the other lanes' halves of the layer, so one
+            // lane's exchange is in flight while another's GPU work runs.
             // With one lane this is the layer's own order.
             let mut pending:Option<(usize,Option<StepDump>)>=None;
             for (layer,cache) in caches.iter().enumerate().take(last_layer+1) {
@@ -287,17 +301,19 @@ impl<'a> Execution<'a> {
                     if let Some((previous,dump))=pending.take() {
                         self.finish_routed(previous,rows,&lanes,&views,experts,dump,diagnostics.as_mut())?;
                     }
-                    let (lane,s)=(Lane{first:0,rows,launches:0..plan.launches()},self.scratch.rows(0,rows)?);
+                    // A dense layer runs lane after lane (a diagnostic's one lane).
                     let mut dump=diagnostics.as_ref().filter(|d|d.layer==layer).map(|d|d.begin(batch)).transpose()?;
-                    if let Some(d)=&mut dump { d.tensor(&self.commands,"input","f32",&[rows,6144],s.get("residual")?)?; }
-                    self.attention(layer,&lane,batch,cache,&plan,&s,dump.as_mut())?;
-                    ffn::norm(&self.commands,s.get("residual")?,self.weights.layer(layer,"post_attention_layernorm.weight")?,s.get("norm")?,rows)?;
-                    if let Some(d)=&mut dump { d.tensor(&self.commands,"ffn_norm","bf16",&[rows,6144],s.get("norm")?)?; }
-                    ffn::dense(&self.commands,&self.weights,&s,layer,rows,false)?;
-                    self.residual(&s,rows)?;
-                    if let Some(draft)=&self.draft { draft.tap(&self.commands,layer,s.get("residual")?,0,rows)?; }
+                    for (lane,s) in lanes.iter().zip(&views) {
+                        if let Some(d)=&mut dump { d.tensor(&self.commands,"input","f32",&[rows,6144],s.get("residual")?)?; }
+                        self.attention(layer,lane,batch,cache,&plan,s,dump.as_mut())?;
+                        ffn::norm(&self.commands,s.get("residual")?,self.weights.layer(layer,"post_attention_layernorm.weight")?,s.get("norm")?,lane.rows)?;
+                        if let Some(d)=&mut dump { d.tensor(&self.commands,"ffn_norm","bf16",&[rows,6144],s.get("norm")?)?; }
+                        ffn::dense(&self.commands,&self.weights,s,layer,lane.rows,false)?;
+                        self.residual(s,lane.rows)?;
+                        if let Some(draft)=&self.draft { draft.tap(&self.commands,layer,s.get("residual")?,lane.first,lane.rows)?; }
+                    }
                     if let Some(mut d)=dump {
-                        d.tensor(&self.commands,"residual","f32",&[rows,6144],s.get("residual")?)?;
+                        d.tensor(&self.commands,"residual","f32",&[rows,6144],self.scratch.get("residual")?)?;
                         diagnostics.as_mut().context("MiniMax diagnostic owner")?.finish(d)?;
                     }
                     continue;
@@ -382,8 +398,18 @@ impl<'a> Execution<'a> {
         }
         Ok(())
     }
-    /// Uploads the step's attention metadata (see [`AttentionPlan`]).
-    fn plan_attention(&self,batch:&BatchView,rows:usize)->Result<AttentionPlan> {
+    /// Where a step's lanes after the first start (batch rows): a one-request
+    /// prefill chunk runs in up to `lanes` lanes of `lane_rows` rows (at most
+    /// `links`, one Spark exchange each; `serving_capacity::prefill_lanes`,
+    /// cut on KV pages); decode, verify and packed steps run one lane, as
+    /// does a diagnostic, which dumps whole layers.
+    fn lane_cuts(&self,batch:&BatchView,rows:usize,links:usize,diagnostic:bool)->Result<Vec<usize>> {
+        let one=diagnostic || rows<=self.decode_rows || batch.requests.len()>1;
+        step_cuts(rows,if one {1} else {self.lanes.min(links)},self.lane_rows,self.program_rows,diagnostic)
+    }
+    /// Uploads the step's attention metadata (see [`AttentionPlan`]); extend
+    /// tiles end at the lane `cuts`.
+    fn plan_attention(&self,batch:&BatchView,rows:usize,cuts:&[usize])->Result<AttentionPlan> {
         let s=&self.scratch;
         if rows<=self.decode_rows {
             let (stride,tables,lengths,offsets)=decode_tables(batch)?;
@@ -393,7 +419,7 @@ impl<'a> Execution<'a> {
             self.commands.upload(s.get("cu_seqlens_q")?,&le_bytes(&offsets))?;
             return Ok(AttentionPlan::Decode{stride});
         }
-        let (launches,tables,lengths,offsets,bounds)=extend_tables(batch,self.extend_rows,self.table_stride)?;
+        let (launches,tables,lengths,offsets,bounds)=extend_tables(batch,self.extend_rows,self.table_stride,cuts)?;
         self.commands.upload(s.get("page_table")?,&le_bytes(&tables))?;
         self.commands.upload(s.get("cache_lengths")?,&le_bytes(&lengths))?;
         self.commands.upload(s.get("cu_seqlens_q")?,&le_bytes(&offsets))?;
@@ -522,14 +548,14 @@ mod tests {
         assert_eq!(lengths,[63,64,65,5]);
         assert_eq!(offsets,[0,1,2,3,4]);
         // A two-row tile splits the first request; launch metadata is 16-byte aligned.
-        let (launches,tables,lengths,offsets,bounds)=extend_tables(&batch,2,4)?;
+        let (launches,tables,lengths,offsets,bounds)=extend_tables(&batch,2,4,&[])?;
         assert_eq!(launches,[Launch{request:0,row:0,first:0,rows:2,slot:0,bounds:2},
             Launch{request:0,row:2,first:2,rows:1,slot:1,bounds:6},Launch{request:1,row:3,first:0,rows:1,slot:2,bounds:10}]);
         assert_eq!(tables,[0,2,-1,-1, 0,2,-1,-1, 4,-1,-1,-1]);
         assert_eq!(lengths,[64,0,0,0, 65,0,0,0, 5,0,0,0]);
         assert_eq!(offsets,[0,2,0,0, 0,1,0,0, 0,1,0,0]);
         assert_eq!(bounds,[63,64,0,0, 65,0,0,0, 5,0,0,0]);
-        assert!(extend_tables(&batch,2,1).is_err(),"a request wider than the admitted table is refused");
+        assert!(extend_tables(&batch,2,1,&[]).is_err(),"a request wider than the admitted table is refused");
         Ok(())
     }
 
@@ -546,25 +572,29 @@ mod tests {
         BatchView{positions,slots:vec![0;rows],requests,pool_pages:1<<20}
     }
 
-    #[test] fn minimax_prefill_lanes_cut_whole_launches_near_the_middle() -> Result<()> {
-        let lanes=|batch:&BatchView,want:usize|->Result<Vec<(usize,usize,std::ops::Range<usize>)>> {
+    #[test] fn minimax_prefill_lanes_end_extend_tiles_at_their_cuts() -> Result<()> {
+        let lanes=|batch:&BatchView,want:usize,lane_rows:usize|->Result<Vec<(usize,usize,Vec<(usize,usize)>)>> {
             let rows=batch.positions.len();
-            let (launches,..)=extend_tables(batch,1024,1<<12)?;
-            Ok(plan_lanes(&AttentionPlan::Extend{launches},rows,want).into_iter().map(|l|(l.first,l.rows,l.launches)).collect())
+            let cuts=step_cuts(rows,want,lane_rows,4096,false)?;
+            let (launches,..)=extend_tables(batch,1024,1<<12,&cuts)?;
+            let plan=AttentionPlan::Extend{launches:launches.clone()};
+            Ok(lanes_at(&plan,rows,&cuts).into_iter().map(|l|(l.first,l.rows,
+                launches[l.launches].iter().map(|t|(t.row,t.rows)).collect())).collect())
         };
-        // A full chunk splits evenly; a chunk's tail lane may be shorter.
-        assert_eq!(lanes(&chunk(8192,&[4096]),2)?,[(0,2048,0..2),(2048,2048,2..4)]);
-        assert_eq!(lanes(&chunk(12288,&[3712]),2)?,[(0,2048,0..2),(2048,1664,2..4)]);
-        assert_eq!(lanes(&chunk(0,&[2500]),2)?,[(0,1024,0..1),(1024,1476,1..3)]);
-        // No cut leaves both lanes MIN_LANE_ROWS: one lane, every launch.
-        assert_eq!(lanes(&chunk(0,&[1500]),2)?,[(0,1500,0..2)]);
-        assert_eq!(lanes(&chunk(0,&[900]),2)?,[(0,900,0..1)]);
-        assert_eq!(lanes(&chunk(0,&[4096]),1)?,[(0,4096,0..4)]);
-        // Request boundaries cut too, when 16-row aligned.
-        assert_eq!(lanes(&chunk(64,&[1024,1024]),2)?,[(0,1024,0..1),(1024,1024,1..2)]);
-        assert_eq!(lanes(&chunk(64,&[1000,1000]),2)?,[(0,2000,0..2)]);
+        // Two lanes of 4096 rows: a full chunk keeps the serial tiles.
+        assert_eq!(lanes(&chunk(8192,&[8192]),2,4096)?,[(0,4096,vec![(0,1024),(1024,1024),(2048,1024),(3072,1024)]),
+            (4096,4096,vec![(4096,1024),(5120,1024),(6144,1024),(7168,1024)])]);
+        // A page-aligned cut ends a tile early and the next lane's first tile starts there.
+        assert_eq!(lanes(&chunk(0,&[4412]),2,4096)?,[(0,2240,vec![(0,1024),(1024,1024),(2048,192)]),
+            (2240,2172,vec![(2240,1024),(3264,1024),(4288,124)])]);
+        // Short chunks and one lane keep one lane and the serial tiles.
+        assert_eq!(lanes(&chunk(64,&[300]),2,4096)?,[(0,300,vec![(0,300)])]);
+        assert_eq!(lanes(&chunk(0,&[4096]),1,4096)?,[(0,4096,vec![(0,1024),(1024,1024),(2048,1024),(3072,1024)])]);
+        assert!(step_cuts(8192,1,4096,4096,false).is_err(),"one lane holds at most a program launch");
+        assert!(step_cuts(4097,2,2048,4096,false).is_err(),"two lanes of 2048 rows hold 4096");
+        assert!(step_cuts(8192,1,4096,4096,true).unwrap_err().to_string().contains("--prefill-lanes 1"));
         // Decode plans keep one lane.
-        assert_eq!(plan_lanes(&AttentionPlan::Decode{stride:4},64,2),[Lane{first:0,rows:64,launches:0..0}]);
+        assert_eq!(lanes_at(&AttentionPlan::Decode{stride:4},64,&[]),[Lane{first:0,rows:64,launches:0..0}]);
         Ok(())
     }
 }
