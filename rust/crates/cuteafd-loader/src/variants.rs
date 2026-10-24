@@ -576,9 +576,20 @@ impl TensorSource {
         let path = &self.tensors.get(name).ok_or_else(|| source_error(name, "missing source tensor"))?.0;
         let quant = self.quantization.get(path).and_then(Option::as_ref)
             .ok_or_else(|| invalid("source has no quantization metadata declaring weight_block_size"))?;
-        let shape = quant.get("weight_block_size")
-            .or_else(|| quant.get("quantization_config").and_then(|q| q.get("weight_block_size")))
-            .and_then(serde_json::Value::as_array)
+        // EXL3 retains FP8 dense tensors and wraps their original HF metadata.
+        // The wrapper's own quantization concerns routed experts, not these
+        // dense blocks. Follow declarations only, never infer a block from a grid.
+        let mut declaration = quant;
+        for _ in 0..16 {
+            if let Some(original) = declaration.get("original_quantization_config") {
+                declaration = original;
+            } else if declaration.get("weight_block_size").is_some() {
+                break;
+            } else if let Some(inner) = declaration.get("quantization_config") {
+                declaration = inner;
+            } else { break; }
+        }
+        let shape = declaration.get("weight_block_size").and_then(serde_json::Value::as_array)
             .ok_or_else(|| invalid("source quantization metadata has no weight_block_size pair"))?;
         if shape.len() != 2 { return Err(invalid("weight_block_size must contain two positive integers").into()); }
         let dim = |v: &serde_json::Value| -> Result<usize> {
