@@ -39,6 +39,13 @@ pub(crate) struct ServeArgs {
     rtx_expert_layers: String,
     #[arg(long, default_value = "dspark", value_parser = ["dspark", "off"])]
     speculator: String,
+    /// Most DSpark drafts verified per sequence and step (the drafter's block is 7).
+    #[arg(long, default_value_t = 7, value_parser = clap::value_parser!(u8).range(1..=7))]
+    dspark_depth: u8,
+    /// Verify exactly --dspark-depth drafts per sequence where rows allow,
+    /// instead of the draft length policy (a measurement arm).
+    #[arg(long)]
+    dspark_fixed: bool,
     #[arg(long, default_value = "0.0.0.0:8000")]
     listen: String,
     #[arg(long, default_value_t = 32768)]
@@ -229,7 +236,9 @@ fn worker(args: &ServeArgs, receive: &mut tokio::sync::mpsc::Receiver<cuteafd_ap
     tracing::info!(pool_tokens=admitted.cache.pool_tokens, context=cache.context, local_layers=?admitted.local_layers,
         rows=sizing.rows, logit_rows=sizing.logit_rows, draft_rings,
         "MiniMax native eager target; prefill uses the MSA index-prefill and attention-extend kernels");
-    let drafts=if args.speculator=="dspark" {scheduler::Drafts::Neural {depth:7,fixed:false}} else {scheduler::Drafts::None};
+    let drafts=if args.speculator=="dspark" {
+        scheduler::Drafts::Neural {depth:usize::from(args.dspark_depth),fixed:args.dspark_fixed}
+    } else {scheduler::Drafts::None};
     scheduler::schedule(&backend, &args.snapshot, receive, stats, sizing.sequences, drafts,
         eos, args.decode_share, &prefix, args.token_io.token_select, &mut media, None,
         || initialized((backend.geometry().max_context, preparer)))
@@ -298,5 +307,14 @@ mod tests {
         let mut a=args(); a.token_io.embed_placement=EmbedPlacement::Host; assert!(a.validate().is_ok());
         let mut a=args(); a.rtx_expert_layers="58".into(); assert!(a.validate().is_err());
         let mut a=args(); a.rtx_expert_layers="3".into(); assert_eq!(a.validate().unwrap(),Some(3));
+        assert_eq!((args().dspark_depth, args().dspark_fixed), (7, false));
+    }
+    #[test]
+    fn minimax_dspark_depth_is_one_to_the_drafter_block() {
+        let parse = |depth: &str| crate::cli::Cli::try_parse_from(["cuteafd", "serve-minimax", "--snapshot", "/model",
+            "--native-lib", "/lib.so", "--peers", "127.0.0.1:1,127.0.0.1:2", "--dspark-depth", depth, "--dspark-fixed"]);
+        let Ok(crate::cli::Cli { command: crate::cli::Commands::ServeMiniMax(a), .. }) = parse("3") else { panic!("depth 3") };
+        assert_eq!((a.dspark_depth, a.dspark_fixed), (3, true));
+        assert!(parse("0").is_err() && parse("8").is_err());
     }
 }

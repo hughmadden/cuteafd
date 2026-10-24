@@ -208,12 +208,13 @@ impl<'e, 'a> Backend<'a> for MiniMaxBackend<'e, 'a> {
     }
     fn draft_geometry(&self, _: &Path, width: usize) -> Result<cuteafd_core::PolicyGeometry> {
         self.execution.draft()?;
-        ensure!(width==7, MiniMaxError::Invalid("draft policy width"));
+        // The drafter always runs its block of seven; `width` caps the verified drafts.
+        ensure!((1..=7).contains(&width), MiniMaxError::Invalid("draft policy width"));
         // Until per-layer probes are qualified, all measured cost belongs to
         // the shared policy's round fit; no synthetic expert routes are priced.
         Ok(cuteafd_core::PolicyGeometry { layers:vec![cuteafd_core::LayerResource {
             class:None,slice_bytes:0.,group_rows:1,timed:false }], experts:128,topk:4,
-            max_requests:self.rows.min(64),max_positions:7,widths:vec![7],
+            max_requests:self.rows.min(64),max_positions:width,widths:vec![width],
             classes:vec![cuteafd_core::ResourceClass::rtx()],group_rows_by_rows:vec![],regimes:1 })
     }
     fn arm_draft_probe(&self) -> Result<()> { self.execution.draft()?; Ok(()) }
