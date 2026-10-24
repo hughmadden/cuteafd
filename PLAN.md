@@ -5633,7 +5633,8 @@ MiniMax-specific protocol; existing image/audio wire formats are unchanged.
 The pinned release's executable image processor uses smart resize at a 672²
 pixel cap, Torch uint8 antialiased bicubic and fused CLIP normalization. Its
 legacy pinpoint/tiling fields are inactive. Images repeat the temporal sample;
-video segments group at most four frames and repeat an odd final frame. Frame
+video segments group at most eight frames (the vendor tower's four temporal
+patches, temporal positions restarting per segment) and repeat an odd final frame. Frame
 sampling is disabled by default; the optional sampling helper pins the compatible
 Transformers implementation because the checkpoint does not pin that dependency
 consistently. Processor hashes participate in preprocessing identity.

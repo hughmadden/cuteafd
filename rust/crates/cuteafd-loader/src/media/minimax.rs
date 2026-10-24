@@ -6,7 +6,9 @@ use std::{path::Path, sync::Arc};
 
 pub const IMAGE_TOKEN: u32 = 200_025;
 pub const VIDEO_TOKEN: u32 = 200_026;
-pub const MAX_SEGMENT_FRAMES: usize = 4;
+/// sglang `_apply_max_frames_limit` splits `grid_t` into runs of `vision_segment_max_frames`
+/// (4) temporal patches, each its own attention segment with positions 0..t: 8 frames.
+pub const MAX_SEGMENT_FRAMES: usize = 8;
 /// Compatible framework source for inherited sampling; the checkpoint does not pin it.
 pub const SAMPLING_REFERENCE: (&str, &str) = (
     "transformers/v4.57.1/src/transformers/video_processing_utils.py",
@@ -152,7 +154,7 @@ impl PreparedVideoSegment {
     pub fn placeholder(&self, fps: Option<f64>, frame_indices: Option<&[usize]>) -> Result<String> {
         let (t,h,w) = (self.grid.t as usize,self.grid.h as usize,self.grid.w as usize);
         let frame_tokens = h.checked_mul(w).ok_or_else(|| invalid("video grid overflows"))? / 4;
-        if t == 0 || t > 2 || h == 0 || w == 0 || h % 2 != 0 || w % 2 != 0
+        if t == 0 || t > MAX_SEGMENT_FRAMES / 2 || h == 0 || w == 0 || h % 2 != 0 || w % 2 != 0
             || frame_tokens.checked_mul(t) != Some(self.tokens) || self.tokens > 57_600 {
             return Err(invalid("video placeholder grid and token count differ"));
         }
@@ -176,7 +178,7 @@ impl PreparedVideoSegment {
     /// `[t, block_h, block_w, inner_h, inner_w, channel, temporal, py, px]`.
     pub fn patches(&self) -> Result<Vec<f32>> {
         let (t, h, w) = (self.grid.t as usize, self.grid.h as usize, self.grid.w as usize);
-        if t == 0 || t > 2 || h == 0 || w == 0 || h % 2 != 0 || w % 2 != 0
+        if t == 0 || t > MAX_SEGMENT_FRAMES / 2 || h == 0 || w == 0 || h % 2 != 0 || w % 2 != 0
             || self.rgb8.len() != t * 2 * h * w * 14 * 14 * 3 {
             return Err(invalid("video patch grid and RGB byte extent differ"));
         }
@@ -310,17 +312,22 @@ mod tests {
     }
 
     #[test]
-    fn video_keeps_all_frames_segments_four_and_pads_last() {
-        let frames: Vec<_> = (0..5).map(|v| RgbImage { width:28, height:28, data:vec![v;28*28*3] }).collect();
+    fn video_keeps_all_frames_segments_eight_and_pads_last() {
+        let frames: Vec<_> = (0..11).map(|v| RgbImage { width:28, height:28, data:vec![v;28*28*3] }).collect();
         let segments = prepare_video_frames(&frames, EncoderId([0;32]), false).unwrap();
         assert_eq!(segments.len(),2);
-        assert_eq!((segments[0].grid.t,segments[0].tokens,segments[0].source_frames),(2,2,4));
-        assert_eq!((segments[1].grid.t,segments[1].tokens,segments[1].source_frames),(1,1,1));
-        assert_eq!(&segments[1].rgb8[..28*28*3], &segments[1].rgb8[28*28*3..]);
+        assert_eq!((segments[0].grid.t,segments[0].tokens,segments[0].source_frames),(4,4,8));
+        assert_eq!((segments[1].grid.t,segments[1].tokens,segments[1].source_frames),(2,2,3));
+        let frame = 28*28*3;
+        assert_eq!(&segments[1].rgb8[2*frame..3*frame], &segments[1].rgb8[3*frame..]);
         let lut = ProcessorConfig::for_family(ImageFamily::Minimax).normalization_lut();
         let patches = segments[0].patches().unwrap();
-        assert_eq!(patches[0],lut[0][0]); assert_eq!(patches[196],lut[0][1]);
-        assert_eq!(patches[4*1176],lut[0][2]); assert_eq!(patches[4*1176+196],lut[0][3]);
+        for time in 0..4 {
+            assert_eq!(patches[time*4*1176],lut[0][time*2]); assert_eq!(patches[time*4*1176+196],lut[0][time*2+1]);
+        }
+        let mut wide = segments[0].clone();
+        (wide.grid.t, wide.tokens, wide.rgb8) = (5, 5, vec![0; 10*frame].into());
+        assert!(wide.patches().is_err() && wide.placeholder(None,None).is_err());
         assert!(prepare_video_frames(&[],EncoderId([0;32]),false).is_err());
         assert!(prepare_video_frames(&[RgbImage {width:29,height:28,data:vec![0;29*28*3]}],EncoderId([0;32]),false).is_err());
     }

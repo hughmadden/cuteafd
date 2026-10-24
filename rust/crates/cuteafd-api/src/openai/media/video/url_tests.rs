@@ -21,9 +21,8 @@ fn source(url: &str) -> Vec<VideoSource> {
 fn assert_sampled(prepared: &[PreparedVideo]) {
     assert_eq!(prepared.len(), 1);
     let segments = &prepared[0].segments;
-    assert_eq!(segments.len(), 2);
-    assert_eq!((segments[0].source_frames, segments[0].grid.t, segments[0].tokens), (4, 2, 2));
-    assert_eq!((segments[1].source_frames, segments[1].grid.t, segments[1].tokens), (1, 1, 1));
+    assert_eq!(segments.len(), 1);
+    assert_eq!((segments[0].source_frames, segments[0].grid.t, segments[0].tokens), (5, 3, 3));
     let frames = segments.iter().flat_map(|segment| segment.rgb8.chunks_exact(28 * 28 * 3)).collect::<Vec<_>>();
     assert_eq!(frames.len(), 6);
     for (frame, value) in frames.into_iter().zip([0, 1, 3, 4, 6, 6]) {

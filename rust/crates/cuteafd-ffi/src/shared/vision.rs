@@ -284,7 +284,7 @@ fn validate_frames(
     let [t, h, w] = grid;
     let patches = t.checked_mul(h).and_then(|n| n.checked_mul(w))
         .ok_or(VisionError::InvalidInput("vision temporal grid overflow"))?;
-    if !(1..=2).contains(&t) || h < 2 || w < 2 || h % 2 != 0 || w % 2 != 0
+    if !(1..=4).contains(&t) || h < 2 || w < 2 || h % 2 != 0 || w % 2 != 0
         || h > i32::MAX as usize || w > i32::MAX as usize
         || patches > max_tokens.saturating_mul(4)
         || patches.checked_mul(2 * 14 * 14 * 3) != Some(rgb_bytes)
@@ -431,6 +431,9 @@ mod tests {
         assert!(validate_frames([2, 2, 4], rgb / 2, 4 * 6144, 4, 6144).is_err());
         assert!(validate_frames([2, 2, 4], rgb, 2 * 6144, 4, 6144).is_err());
         assert!(validate_frames([2, 2, 4], rgb, 4 * 6144, 3, 6144).is_err());
+        // Up to four temporal patches (eight frames) form one segment.
+        assert!(validate_frames([4, 2, 4], rgb * 2, 8 * 6144, 8, 6144).is_ok());
+        assert!(validate_frames([5, 2, 4], rgb * 5 / 2, 10 * 6144, 10, 6144).is_err());
         for grid in [[0, 2, 4], [3, 2, 4], [2, 3, 4], [2, usize::MAX, 4]] {
             assert!(validate_frames(grid, rgb, 4 * 6144, 4, 6144).is_err());
         }

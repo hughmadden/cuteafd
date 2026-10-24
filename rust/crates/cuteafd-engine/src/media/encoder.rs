@@ -41,7 +41,7 @@ impl EncodeJob {
         match (&self.key, &self.input) {
             (MediaKey::Image(_), EncodeInput::Image { grid, rgb8 }) if !grid.contains(&0) && !rgb8.is_empty() => Ok(()),
             (MediaKey::Image(_), EncodeInput::Video { grid, rgb8 })
-                if !grid.contains(&0) && grid[0] <= 2 && !rgb8.is_empty() => Ok(()),
+                if !grid.contains(&0) && grid[0] <= 4 && !rgb8.is_empty() => Ok(()),
             (MediaKey::Audio(_), EncodeInput::Audio { pcm }) => {
                 if !(481..=7_200_000).contains(&pcm.len()) || pcm.iter().any(|x| !x.is_finite()) {
                     return Err(MediaError::Features);
@@ -142,11 +142,14 @@ mod tests {
         let output = encoder.poll(ticket).unwrap().unwrap();
         assert_eq!(output.key, job.key);
         assert_eq!(output.features, FakeEncoder::features(&job).unwrap());
-        for grid in [[0, 2, 2], [3, 2, 2], [1, 0, 2]] {
+        for grid in [[0, 2, 2], [5, 2, 2], [1, 0, 2]] {
             let mut invalid = job.clone();
             invalid.input = EncodeInput::Video { grid, rgb8: vec![1].into() };
             assert!(encoder.submit(invalid).is_err());
         }
+        let mut segment = job.clone();
+        segment.input = EncodeInput::Video { grid: [4, 2, 2], rgb8: vec![1; 8 * 28 * 28 * 3].into() };
+        assert!(segment.validate().is_ok());
         let mut invalid = job;
         invalid.key = AudioKey([7; 32]).into();
         assert!(encoder.submit(invalid).is_err());

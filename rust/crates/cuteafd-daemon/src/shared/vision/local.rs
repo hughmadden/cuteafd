@@ -46,7 +46,7 @@ impl LocalEncoder {
         let [t, h, w] = *grid;
         let patches = (h as usize).checked_mul(w as usize)
             .and_then(|n| n.checked_mul(t as usize)).ok_or(MediaError::Features)?;
-        if (!video && t != 1) || (video && !(1..=2).contains(&t))
+        if (!video && t != 1) || (video && !(1..=4).contains(&t))
             || h == 0 || w == 0 || h % 2 != 0 || w % 2 != 0
             || job.tokens != patches / 4 || job.tokens > self.max_tokens
             || self.patch_size.checked_mul(self.patch_size).and_then(|pixels| pixels.checked_mul(3))
@@ -156,6 +156,13 @@ mod tests {
                 let mut invalid = job.clone();
                 invalid.input = EncodeInput::Video { grid, rgb8: vec![0; 4*28*28*3].into() };
                 assert!(encoder.submit(invalid).is_err());
+            }
+            // Four temporal patches are one segment; a fifth is not.
+            let wide = LocalEncoder::new(EncoderService { queue: None, owner: None, ledger: Default::default(),
+                audio_ledger: None, healthy: Arc::new(std::sync::atomic::AtomicBool::new(true)) }, &config, 2, 8);
+            for t in [4, 5] {
+                let job = media::EncodeJob::video(ImageKey([4; 32]), [t, 2, 2], vec![0; t as usize*2*28*28*3].into(), t as usize, 2);
+                assert_eq!(wide.validate(&job).is_ok(), t == 4);
             }
             let ticket = encoder.submit(job).unwrap();
             let deadline = Instant::now() + std::time::Duration::from_secs(2);

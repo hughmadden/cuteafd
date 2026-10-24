@@ -116,7 +116,8 @@ pub(super) fn prepare(job: NativeRequest, tokens: Vec<u32>, expander: Option<&Sp
     let mut cursor = 0;
     for segment in &job.videos {
         let markers = expander.context("video requires the bundled encoder")?;
-        if segment.grid.t == 0 || segment.grid.t > 2 || segment.grid.h == 0 || segment.grid.w == 0
+        if segment.grid.t == 0 || segment.grid.t as usize > cuteafd_loader::media::minimax::MAX_SEGMENT_FRAMES / 2
+            || segment.grid.h == 0 || segment.grid.w == 0
             || segment.grid.h % 2 != 0 || segment.grid.w % 2 != 0 {
             return Err(MiniMaxError::Invalid("video segment grid").into());
         }

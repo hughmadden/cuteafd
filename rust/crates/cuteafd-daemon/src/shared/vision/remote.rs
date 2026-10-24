@@ -116,7 +116,7 @@ impl EncoderHandshake {
         let [t, h, w] = grid;
         let patches = u64::from(h).checked_mul(u64::from(w))
             .and_then(|n| n.checked_mul(u64::from(t))).ok_or(MediaError::Features)?;
-        if !(1..=2).contains(&t) || h == 0 || w == 0 || h % 2 != 0 || w % 2 != 0
+        if !(1..=4).contains(&t) || h == 0 || w == 0 || h % 2 != 0 || w % 2 != 0
             || patches > u64::from(self.max_patches) || tokens != patches / 4
             || len != self.input_bytes(patches).saturating_mul(2) {
             return Err(error("invalid video frame before allocation"));
@@ -954,7 +954,7 @@ mod tests {
         let owner = thread::spawn(move || {
             while let Ok(work) = jobs.recv() {
                 let super::super::EncoderJob::Video(mut job) = work.job else { panic!("expected video job") };
-                assert!(matches!(job.grid, [1 | 2, 2, 2]));
+                assert!(matches!(job.grid, [1..=4, 2, 2]));
                 assert_eq!(job.rgb.len(), job.grid[0] * 2 * 28 * 28 * 3);
                 assert!(job.rgb.iter().all(|&b| b == 6));
                 job.output.fill(0x3f80);
@@ -967,7 +967,7 @@ mod tests {
             Arc::new([0.0; 768]), Duration::from_secs(2)).unwrap();
         assert!(RemoteEncoder::connect(vec![server.address], minimax_handshake(), Duration::from_secs(2)).is_err());
         let mut client = RemoteEncoder::connect_minimax(vec![server.address], minimax_handshake(), Duration::from_secs(2)).unwrap();
-        for t in [1, 2] {
+        for t in [1, 2, 4] {
             let ticket = client.submit(video_job(t)).unwrap();
             let output = wait(&mut client, ticket).unwrap();
             assert_eq!(output.features.len(), t as usize * 6144 * 2);
@@ -985,13 +985,14 @@ mod tests {
     fn video_geometry_is_bounded_before_payload_allocation() {
         let h = minimax_handshake();
         for (grid, tokens, len) in [
-            ([0, 2, 2], 1, 4704), ([3, 2, 2], 3, 14112), ([1, 3, 2], 1, 7056),
+            ([0, 2, 2], 1, 4704), ([5, 2, 2], 5, 23520), ([1, 3, 2], 1, 7056),
             ([2, u32::MAX, u32::MAX], 2, u64::MAX), ([2, 256, 256], 32768, 154140672),
             ([1, 2, 2], 2, 4704), ([1, 2, 2], 1, u64::MAX),
         ] {
             assert!(h.validate_video_geometry(grid, tokens, len).is_err());
         }
         assert!(h.validate_video_geometry([1, 2, 2], 1, 4704).is_ok());
+        assert!(h.validate_video_geometry([4, 2, 2], 4, 18816).is_ok());
         let mut wrong = video_job(1); wrong.hidden_width -= 1;
         assert!(h.validate_minimax_job(&wrong).is_err());
         let mut wrong = h; wrong.output_width = 4096;

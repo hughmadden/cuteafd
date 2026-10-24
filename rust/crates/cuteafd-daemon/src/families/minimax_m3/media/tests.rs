@@ -115,10 +115,10 @@ impl EncoderClient for RowEncoder {
 async fn http_mixed_media_reaches_exact_feature_rows_with_literal_markers() {
     let (job, tokens) = routed_request().await;
     assert_eq!(job.media.len(), 2);
-    assert_eq!(job.videos.len(), 2);
+    assert_eq!(job.videos.len(), 1);
     assert_eq!(job.media.iter().map(|image| image.tokens).collect::<Vec<_>>(), [4, 4]);
     assert_eq!(job.videos.iter().map(|segment| (segment.grid.t, segment.tokens, segment.source_frames))
-        .collect::<Vec<_>>(), [(2, 8, 4), (1, 4, 1)]);
+        .collect::<Vec<_>>(), [(3, 12, 5)]);
     for time in ["0.0", "0.4", "0.8"] {
         assert_eq!(job.prompt.matches(&format!("]<]{time} seconds[>[")).count(), 1);
     }
@@ -126,18 +126,19 @@ async fn http_mixed_media_reaches_exact_feature_rows_with_literal_markers() {
     assert!(job.prompt.contains("Literal ]<]image[>[ and ]<]video[>[ remain text."));
     assert_eq!(tokens.iter().filter(|&&token| token == IMAGE_TOKEN).count(), 2);
     assert_eq!(tokens.iter().filter(|&&token| token == VIDEO_TOKEN).count(), 12);
-    let last = &job.videos[1];
+    let segment = &job.videos[0];
     let frame_bytes = 56 * 56 * 3;
-    assert_eq!(last.rgb8.len(), frame_bytes * 2);
-    assert_eq!(&last.rgb8[..frame_bytes], &last.rgb8[frame_bytes..]);
+    assert_eq!(segment.rgb8.len(), frame_bytes * 6);
+    assert_eq!(&segment.rgb8[frame_bytes * 4..frame_bytes * 5], &segment.rgb8[frame_bytes * 5..]);
     let (prompt, media, jobs) = prepare(job, tokens, Some(&expander()), VOCABULARY, 4096).unwrap();
-    assert_eq!(jobs.len(), 4);
+    assert_eq!(jobs.len(), 3);
     assert_eq!(media.spans().iter().map(|span| span.len).collect::<Vec<_>>(), [4; 5]);
     assert_eq!(media.spans()[0].key, media.spans()[4].key);
     assert_eq!(media.spans()[1].key, media.spans()[2].key);
-    assert_ne!(media.spans()[2].key, media.spans()[3].key);
+    assert_eq!(media.spans()[2].key, media.spans()[3].key);
+    assert_ne!(media.spans()[0].key, media.spans()[1].key);
     let mut expected = vec![None; prompt.tokens.len()];
-    for (span, first_row) in media.spans().iter().zip([1u8, 1, 5, 1, 1]) {
+    for (span, first_row) in media.spans().iter().zip([1u8, 1, 5, 9, 1]) {
         assert_eq!(prompt.tokens[span.start - 1], START);
         assert_eq!(prompt.tokens[span.start + span.len], END);
         for row in 0..span.len { expected[span.start + row] = Some(first_row + row as u8); }
@@ -154,7 +155,7 @@ async fn http_mixed_media_reaches_exact_feature_rows_with_literal_markers() {
         MediaPoll::Failed(_, error) => panic!("fake encoder admission failed: {error}"),
         MediaPoll::Empty => panic!("request vanished before media admission"),
     }).expect("fake encoder completes within bounded polls");
-    assert_eq!(admission.encoder().0.submitted, 3);
+    assert_eq!(admission.encoder().0.submitted, 2);
     assert_eq!(admission.encoder().0.pending(), 0);
     let media = ready.media();
     let mut ranges = vec![(0, expected.len())];
