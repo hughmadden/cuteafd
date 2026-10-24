@@ -104,8 +104,8 @@ impl V41Variant {
             .fold(if max { f32::MIN } else { f32::MAX }, if max { f32::max } else { f32::min });
         cuteafd_core::variants::VariantRecord::of(&self.plan, served, serde_json::json!({
             "alpha": d.alpha, "shared_direction": d.shared_direction, "direction_cos_min": d.direction_cos_min,
-            "second_share_max": fold(|s| s.second_share, true), "projection_cos_min": fold(|s| s.projection_cos, false),
-            "rebuild_exact_min": fold(|s| s.rebuild_exact, false)}))
+            "next_share_max": fold(|s| s.verify.next_share, true), "proj_cos_min": fold(|s| s.verify.proj_cos, false),
+            "rebuild_exact_min": fold(|s| s.rebuild_exact, false), "unchanged": d.unchanged.len()}))
     }
 }
 

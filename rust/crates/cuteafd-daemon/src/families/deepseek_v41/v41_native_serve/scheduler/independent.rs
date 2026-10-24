@@ -336,6 +336,7 @@ async fn retire<'a, C: DraftChain<'a>>(lane: usize, mut request: Active<'a>, req
             prefixes.borrow_mut().capture_session(request.job.usage.as_ref().map(|u| u.session_id().to_owned()));
             let id = super::super::prefix::draft_id(&*draft.borrow(), request.id());
             let keys = super::super::prefix::keyed(&request.image_keys, &request.tokens);
+            let keys = cuteafd_engine::prefix::namespaced(&keys, request.job.variant)?;
             let queued = prefixes.borrow_mut().queue_retain(lane, &mut requests.borrow_mut(),
                 draft.borrow_mut().as_deref_mut(), SnapshotKind::Turn, &keys, request.image_keys.spans(), next,
                 request.lease, id)?;
