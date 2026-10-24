@@ -1,45 +1,47 @@
 //! Unchanged MXFP8 payloads through the shared dense records, the shared
 //! gate/up and K/V fused layout, and load-time scale arrangement.
-use crate::shared::{memory::device::Device, experts::rtx::dense::load_records};
+use super::native::Native;
+use crate::shared::{memory::device::Allocation, experts::rtx::dense::load_records};
 use anyhow::{Context, Result};
-use cuteafd_ffi::{minimax::{Buffer, Commands}, programs::Scalar};
+use cuteafd_ffi::{programs::Scalar, CuteafdDeviceBuffer};
 use cuteafd_loader::formats::native_dense::RankWeightLayout;
 use cuteafd_loader::plan::{checkpoint::Checkpoint, families::minimax::coordinator};
 use std::collections::BTreeMap;
 
 pub(super) const EMBEDDING: &str = "language_model.model.embed_tokens.weight";
-pub(super) struct Weights<'a> { operands: BTreeMap<String, Buffer<'a>> }
+pub(super) struct Weights<'a> { operands: BTreeMap<String, Allocation<'a>> }
 
 impl<'a> Weights<'a> {
-    pub fn load(device: Device<'a>, checkpoint: &Checkpoint, commands: &Commands<'a>) -> Result<Self> {
+    pub fn load(native: &Native<'a>, checkpoint: &Checkpoint) -> Result<Self> {
         let layout = coordinator::RankWeightLayout::from_checkpoint(checkpoint, 0, 1)?;
-        Self::load_layout(device, checkpoint, commands, &layout)
+        Self::load_layout(native, checkpoint, &layout)
     }
     pub fn draft_layout(contract: &cuteafd_loader::families::minimax_m3::dspark::DsparkContract) -> Result<RankWeightLayout> {
         coordinator::single_gpu(&contract.weights)
     }
-    pub fn load_layout(device: Device<'a>, checkpoint: &Checkpoint, commands: &Commands<'a>, layout: &RankWeightLayout) -> Result<Self> {
+    pub fn load_layout(native: &Native<'a>, checkpoint: &Checkpoint, layout: &RankWeightLayout) -> Result<Self> {
+        let device = native.device();
         let mut operands = BTreeMap::new();
         for operand in &layout.operands {
             if operand.name == EMBEDDING { continue; }
             cuteafd_ffi::memory_ledger::tensor(&operand.name);
-            let source = Buffer::new(device.library, device.id, usize::try_from(operand.allocation_bytes)?)?;
-            load_records(device, &checkpoint.snapshot, layout, operand, source.raw())?;
+            let source = Allocation::new(device, usize::try_from(operand.allocation_bytes)?)?;
+            load_records(device, &checkpoint.snapshot, layout, operand, source.buffer)?;
             let resident = if operand.name.ends_with(".weight_scale_inv") {
-                let arranged = Buffer::new(device.library, device.id, operand.allocation_bytes as usize)?;
-                commands.launch("minimax_scale_prep", &[&source,&arranged], &[
+                let arranged = Allocation::new(device, operand.allocation_bytes as usize)?;
+                native.launch("minimax_scale_prep", &[source.buffer,arranged.buffer], &[
                     Scalar::I32(i32::try_from(operand.shape[0])?), Scalar::I32(i32::try_from(operand.shape[1])?)])?;
-                commands.drain()?;
+                native.drain()?;
                 arranged
             } else { source };
             operands.insert(operand.name.clone(), resident);
         }
         Ok(Self { operands })
     }
-    pub fn get(&self, name: &str) -> Result<&Buffer<'a>> {
-        self.operands.get(name).with_context(|| format!("MiniMax missing native operand {name}"))
+    pub fn get(&self, name: &str) -> Result<CuteafdDeviceBuffer> {
+        self.operands.get(name).map(|a| a.buffer).with_context(|| format!("MiniMax missing native operand {name}"))
     }
-    pub fn layer(&self, layer: usize, name: &str) -> Result<&Buffer<'a>> {
+    pub fn layer(&self, layer: usize, name: &str) -> Result<CuteafdDeviceBuffer> {
         self.get(&format!("language_model.model.layers.{layer}.{name}"))
     }
 }

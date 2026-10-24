@@ -1,11 +1,12 @@
 //! Teacher-forced qualification through the serving programs and paged cache.
 use super::{cache::{Cache, INDEX_PAGE_BYTES, KV_PAGE_BYTES}, execution::{BatchView, Execution, ExpertExecutor, RequestView},
-    prefix::{MiniMaxPrefix, Placement}, MiniMaxError};
-use crate::shared::{golden_scores::{scored_kl, scored_nll, HiddenMetrics}, token_io::{EmbedPlacement, TokenEmbedding}};
+    native::Native, prefix::{MiniMaxPrefix, Placement}, MiniMaxError};
+use crate::shared::{golden_scores::{scored_kl, scored_nll, HiddenMetrics}, memory::device::Allocation, prefix::view,
+    token_io::{EmbedPlacement, TokenEmbedding}};
 use anyhow::{ensure, Context, Result};
 use cuteafd_core::ExpertGeometry;
 use cuteafd_engine::{media::RequestMedia, prefix::{After, PrefixCache, PrefixConfig, PrefixFamily, SnapshotKind}};
-use cuteafd_ffi::minimax::{Buffer, Commands};
+use cuteafd_ffi::CuteafdDeviceBuffer;
 use cuteafd_hostcache::copy::StubCopyEngine;
 use cuteafd_loader::{families::{minimax_m3::config::MiniMaxM3Config, qwen4::Qwen4KvCache},
     plan::{checkpoint::{read_json, Checkpoint}, families::minimax::{admission, coordinator::RankWeightLayout}}};
@@ -257,17 +258,18 @@ fn completed(directory: &Path, binding: &Value, full: bool) -> Result<Option<Val
 
 struct DenseOnly;
 impl<'a> ExpertExecutor<'a> for DenseOnly {
-    fn dispatch(&mut self, _: usize, _: usize, _: usize, _: &Buffer<'a>, _: &Buffer<'a>, _: &Buffer<'a>, _: &Commands<'a>) -> Result<()> {
+    fn dispatch(&mut self, _: usize, _: usize, _: usize, _: CuteafdDeviceBuffer, _: CuteafdDeviceBuffer, _: CuteafdDeviceBuffer,
+        _: &Native<'a>) -> Result<()> {
         Err(MiniMaxError::Invalid("unexpected routed layer in dense-only golden").into())
     }
-    fn collect(&mut self, _: usize, _: usize, _: usize, _: &Buffer<'a>, _: &Commands<'a>) -> Result<()> {
+    fn collect(&mut self, _: usize, _: usize, _: usize, _: CuteafdDeviceBuffer, _: &Native<'a>) -> Result<()> {
         Err(MiniMaxError::Invalid("unexpected routed collect in dense-only golden").into())
     }
 }
 
 struct Runner<'e, 'a> {
     execution: &'e Execution<'a>, cache: &'e Cache<'a>, embedding: &'e TokenEmbedding<'a>,
-    ids: Buffer<'a>, embedded: Buffer<'a>, experts: Box<dyn ExpertExecutor<'a> + 'a>,
+    ids: Allocation<'a>, embedded: Allocation<'a>, experts: Box<dyn ExpertExecutor<'a> + 'a>,
     last_layer: usize, rows: usize,
 }
 impl Runner<'_, '_> {
@@ -277,16 +279,16 @@ impl Runner<'_, '_> {
             slots:(start..start + tokens.len()).map(|p| i64::from(placement.pages[p / 64]) * 64 + (p % 64) as i64).collect(),
             requests:vec![RequestView {row_start:0, rows:tokens.len(),start_position:start,
                 pages:placement.pages.iter().map(|&p| p as i32).collect()}], pool_pages:self.cache.pages };
-        let embedded = self.embedding.embed(tokens, self.ids.raw(), 1, self.embedded.raw(), self.execution.stream());
+        let embedded = self.embedding.embed(tokens, self.ids.buffer, 1, self.embedded.buffer, self.execution.stream());
         let drained = self.execution.drain();
         embedded?; drained?;
-        let output = self.execution.execute_through(&self.embedded, &batch, &self.cache.layers,
+        let output = self.execution.execute_through(self.embedded.buffer, &batch, &self.cache.layers,
             &mut *self.experts, if prefill {ExpertV2SourceKind::Prefill} else {ExpertV2SourceKind::Decode}, self.last_layer,
             0..tokens.len())?;
         let values = if let Some(logits) = output { logits.to_host(self.cache.library)? } else {
             let hidden = self.execution.hidden(tokens.len())?;
             let mut bytes = vec![0; tokens.len() * 6144 * 4];
-            self.cache.library.copy_d2h(&mut bytes, hidden.raw())?;
+            self.cache.library.copy_d2h(&mut bytes, hidden)?;
             floats(&bytes, tokens.len() * 6144)?
         };
         ensure!(values.iter().all(|v| v.is_finite()), "nonfinite native golden output");
@@ -312,7 +314,7 @@ fn state(cache: &Cache<'_>, p: &Placement, layers: usize) -> Result<Vec<u8>> {
                 (&layer.value, KV_PAGE_BYTES, 0, rows * 512), (&layer.index, INDEX_PAGE_BYTES, 0, rows * 128),
                 (&layer.index, INDEX_PAGE_BYTES, 8192, rows * 4)] {
                 let mut values = vec![0; bytes];
-                cache.library.copy_d2h(&mut values, plane.view(page as usize * stride + offset, bytes)?.raw())?;
+                cache.library.copy_d2h(&mut values, view(plane.buffer, page as usize * stride + offset, bytes)?)?;
                 output.extend(values);
             }
         }

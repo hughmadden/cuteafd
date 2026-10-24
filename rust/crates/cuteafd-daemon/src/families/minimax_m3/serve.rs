@@ -1,7 +1,7 @@
 //! Single coordinator startup: validate, admit, load, bind, schedule.
 use super::{admission::{self, RuntimeSizing}, backend::MiniMaxBackend, cache::Cache,
     execution::Execution, media::ReadyVision, routed::Routed, MiniMaxError};
-use crate::shared::{memory::device::Device, placement::{SparkAdmission, spark_rings},
+use crate::shared::{memory::device::{Allocation, Device}, placement::{SparkAdmission, spark_rings},
     prefix::PrefixArgs, qwen::{Encoder, scheduler::{self, Backend}},
     token_io::{EmbedPlacement, EmbedSource, TokenEmbedding, TokenIoArgs}};
 use anyhow::{Context, Result};
@@ -161,8 +161,8 @@ pub(super) struct Runtime<'a> {
     pub execution: Execution<'a>,
     pub cache: Cache<'a>,
     pub embedding: TokenEmbedding<'a>,
-    pub token_ids: cuteafd_ffi::minimax::Buffer<'a>,
-    pub embedded: cuteafd_ffi::minimax::Buffer<'a>,
+    pub token_ids: Allocation<'a>,
+    pub embedded: Allocation<'a>,
     /// RTX-local and Spark routed experts; `None` when the run executes no routed layer.
     pub routed: Option<Routed<'a>>,
 }
@@ -183,9 +183,9 @@ pub(super) fn start<'a>(library: &'a cuteafd_ffi::NativeLibrary, device: i32,
             ModelAdmission::for_clients(ExpertGeometry::MINIMAX_M3, endpoint, endpoint.capacity,
                 spark_rings(config.max_frame_bytes)?, sizing.lanes)?)?.start(peers)?)
     };
-    let buffer = |name: &str| -> Result<cuteafd_ffi::minimax::Buffer<'a>> {
+    let buffer = |name: &str| -> Result<Allocation<'a>> {
         let bytes = ledger.bytes(name).with_context(|| format!("MiniMax {name} admission"))?;
-        cuteafd_ffi::minimax::Buffer::new(library, device, usize::try_from(bytes)?)
+        Allocation::new(Device { library, id: device }, usize::try_from(bytes)?)
     };
     let (token_ids, embedded) = (buffer("token_ids")?, buffer("embedded")?);
     let tensor = checkpoint.tensors.iter().find(|t| t.meta.name == super::weights::EMBEDDING)
@@ -307,7 +307,7 @@ fn worker(args: &ServeArgs, receive: &mut tokio::sync::mpsc::Receiver<cuteafd_ap
     // Every decode row count the scheduler can form, recorded before ready
     // against these buffers and this expert owner (the admitted inventory).
     let graphs = &admitted.graphs;
-    let recorded = execution.warm_graphs(&graphs.keys, &backend.embedded, &cache.layers, cache.pages,
+    let recorded = execution.warm_graphs(&graphs.keys, backend.embedded.buffer, &cache.layers, cache.pages,
         &mut *backend.experts.borrow_mut())?;
     tracing::info!(executables = graphs.keys.len(), measured_bytes = recorded, reserved_bytes = graphs.inventory.bytes(0),
         bytes_per_executable = recorded.div_ceil(graphs.keys.len().max(1) as u64), reserve = "estimated",

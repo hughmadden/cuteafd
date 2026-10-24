@@ -1,16 +1,16 @@
 //! One device, one append-only paged MSA pipeline, native checkpoint arithmetic.
-use super::{MiniMaxError, diagnostics::{Diagnostics, StepDump}, ffn, head::TargetHeadOwner, scratch::Scratch, weights::Weights};
+use super::{MiniMaxError, diagnostics::{Diagnostics, StepDump}, ffn, head::TargetHeadOwner, native::Native,
+    scratch::{Rows, Scratch}, weights::Weights};
 use crate::shared::{decode_graph::{census, GraphBank, GraphDecision, GraphOwner, GraphPolicy},
-    memory::device::Device, token_io::DeviceLogits};
+    memory::device::{Allocation, Device}, prefix::view, token_io::DeviceLogits};
 use anyhow::{ensure, Context, Result};
-use cuteafd_ffi::{minimax::{Buffer, Commands, Retention}, programs::{Programs,Scalar}};
+use cuteafd_ffi::{programs::{Programs,Scalar}, CuteafdDeviceBuffer};
 use cuteafd_transport::ExpertV2SourceKind;
 use cuteafd_loader::{families::minimax_m3::{cache::PAGE_ROWS,config::MiniMaxM3Config},
     plan::{checkpoint::Checkpoint,families::minimax::admission::{RuntimeLedger,RuntimeSizing}},
     serving_capacity::prefill_lanes as lane_plans};
 
-#[derive(Clone)]
-pub(super) struct LayerCache<'a> { pub key: Buffer<'a>, pub value: Buffer<'a>, pub index: Buffer<'a> }
+pub(super) struct LayerCache<'a> { pub key: Allocation<'a>, pub value: Allocation<'a>, pub index: Allocation<'a> }
 #[derive(Debug,Clone)]
 pub(super) struct RequestView { pub row_start:usize, pub rows:usize, pub start_position:usize, pub pages:Vec<i32> }
 #[derive(Debug,Clone)]
@@ -98,10 +98,11 @@ const STEP_BANK: &std::ffi::CStr = c"minimax_step";
 struct Binding { embedded:usize, cache:usize, experts:usize, pool_pages:usize, stride:usize }
 
 /// Whole decode steps recorded at startup, one per admitted row count
-/// ([`Execution::warm_graphs`]); each owner keeps what its launches retained.
-/// Declared after `Execution::commands`, whose drop drains the stream first.
+/// ([`Execution::warm_graphs`]) against the [`Binding`] owners, which a
+/// replay borrows. Declared after `Execution::native`, whose drop drains the
+/// stream first.
 struct StepGraphs<'a> {
-    bank: GraphBank<usize, GraphOwner<'a, Retention<'a>>>,
+    bank: GraphBank<usize, GraphOwner<'a, ()>>,
     binding: Option<Binding>,
     /// `CUTEAFD_MINIMAX_GRAPH_VERIFY=1`: each replayed step runs again eagerly
     /// and the two steps' logits are compared bit for bit (a diagnostic).
@@ -184,16 +185,16 @@ pub(super) trait ExpertExecutor<'a> {
     /// collects are recorded, not run): announces nothing and drops what a
     /// failed recording left uncollected.
     fn record(&mut self, _kind:ExpertV2SourceKind) -> Result<()> { Ok(()) }
-    fn dispatch(&mut self, layer:usize, lane:usize, rows:usize, ids:&Buffer<'a>, weights:&Buffer<'a>,
-        input:&Buffer<'a>, commands:&Commands<'a>) -> Result<()>;
-    fn collect(&mut self, layer:usize, lane:usize, rows:usize, output:&Buffer<'a>, commands:&Commands<'a>) -> Result<()>;
+    fn dispatch(&mut self, layer:usize, lane:usize, rows:usize, ids:CuteafdDeviceBuffer, weights:CuteafdDeviceBuffer,
+        input:CuteafdDeviceBuffer, native:&Native<'a>) -> Result<()>;
+    fn collect(&mut self, layer:usize, lane:usize, rows:usize, output:CuteafdDeviceBuffer, native:&Native<'a>) -> Result<()>;
     fn finish(&mut self) -> Result<()> { Ok(()) }
     fn abort(&mut self) {}
 }
 
 pub(super) struct Execution<'a> {
     // Drain queued consumers before their programs and allocations are dropped.
-    commands: Commands<'a>,
+    native: Native<'a>,
     head: TargetHeadOwner<'a>,
     weights: Weights<'a>,
     scratch: Scratch<'a>,
@@ -227,50 +228,55 @@ impl<'a> Execution<'a> {
         let rows=usize::try_from(ledger.bytes("norm").context("MiniMax norm admission")? / (6144*2))?;
         let logit_rows=usize::try_from(ledger.bytes("logits").context("MiniMax logits admission")? / (cfg.vocab_size as u64*4))?;
         let context=usize::try_from(ledger.bytes("cos").context("MiniMax rope admission")? / 64)?;
-        let commands=Commands::new(device.library,device.id,programs)?;
-        let decode_rows=commands.capacity("minimax_index_decode")?;
-        ensure!(decode_rows>0 && decode_rows<=64 && commands.capacity("minimax_attention_decode")?==decode_rows,
+        let native=Native::new(device,programs)?;
+        let decode_rows=native.capacity("minimax_index_decode")?;
+        ensure!(decode_rows>0 && decode_rows<=64 && native.capacity("minimax_attention_decode")?==decode_rows,
             MiniMaxError::Invalid("index/attention capacity stride"));
-        let extend_rows=commands.capacity("minimax_index_prefill")?;
-        ensure!(extend_rows>0 && extend_rows%4==0 && commands.capacity("minimax_attention_extend")?==extend_rows,
+        let extend_rows=native.capacity("minimax_index_prefill")?;
+        ensure!(extend_rows>0 && extend_rows%4==0 && native.capacity("minimax_attention_extend")?==extend_rows,
             MiniMaxError::Invalid("prefill index/attention capacity stride"));
-        let program_rows=commands.capacity("minimax_norm")?;
+        let program_rows=native.capacity("minimax_norm")?;
         ensure!(rows==sizing.chunk_rows() && sizing.rows<=program_rows,MiniMaxError::Invalid("prefill lane rows"));
         let scratch=Scratch::new(device,ledger)?;
         let table_stride=usize::try_from(cuteafd_loader::plan::families::minimax::admission::extend_table_stride(context as u64))?;
-        ensure!(scratch.get("page_table")?.raw().bytes>=decode_rows*table_stride*4,MiniMaxError::Invalid("page-table admission"));
-        let weights=Weights::load(device,checkpoint,&commands)?;
-        commands.launch("minimax_rope", &[scratch.get("cos")?,scratch.get("sin")?], &[
-            Scalar::I32(context as i32),Scalar::F32(cfg.rope_theta as f32),Scalar::F32(1.0),
-            Scalar::F32(0.0),Scalar::F32(1.0),Scalar::F32(1.0)])?;
-        let ones=vec![1.0f32.to_le_bytes();decode_rows*4].concat();
-        commands.upload(scratch.get("k_descale")?,&ones)?;
-        commands.upload(scratch.get("v_descale")?,&ones)?;
-        commands.upload(scratch.get("batch_ids")?,&vec![0;rows*4])?;
-        // Extend launches read their key starts (all zero) from here.
-        commands.upload(scratch.get("index_bounds")?,&vec![0;extend_rows*4])?;
-        commands.drain()?;
-        let head=TargetHeadOwner::new(&commands,&scratch,logit_rows,cfg.vocab_size)?;
+        ensure!(scratch.get("page_table")?.bytes>=decode_rows*table_stride*4,MiniMaxError::Invalid("page-table admission"));
+        let (weights,head)=device.run(|| {
+            let weights=Weights::load(&native,checkpoint)?;
+            native.launch("minimax_rope", &[scratch.get("cos")?,scratch.get("sin")?], &[
+                Scalar::I32(context as i32),Scalar::F32(cfg.rope_theta as f32),Scalar::F32(1.0),
+                Scalar::F32(0.0),Scalar::F32(1.0),Scalar::F32(1.0)])?;
+            let ones=vec![1.0f32.to_le_bytes();decode_rows*4].concat();
+            native.upload(scratch.get("k_descale")?,&ones)?;
+            native.upload(scratch.get("v_descale")?,&ones)?;
+            native.upload(scratch.get("batch_ids")?,&vec![0;rows*4])?;
+            // Extend launches read their key starts (all zero) from here.
+            native.upload(scratch.get("index_bounds")?,&vec![0;extend_rows*4])?;
+            native.drain()?;
+            Ok((weights,TargetHeadOwner::new(&native,&scratch,logit_rows,cfg.vocab_size)?))
+        })?;
         let graphs=std::cell::RefCell::new(StepGraphs{bank:GraphBank::with_policy(GraphPolicy::FixedStartup),binding:None,
             verify:matches!(std::env::var("CUTEAFD_MINIMAX_GRAPH_VERIFY").as_deref(),Ok("1")),replays:0});
-        Ok(Self{commands,head,weights,scratch,cfg:cfg.clone(),rows,lane_rows:sizing.rows,lanes:sizing.lanes,program_rows,
+        Ok(Self{native,head,weights,scratch,cfg:cfg.clone(),rows,lane_rows:sizing.rows,lanes:sizing.lanes,program_rows,
             logit_rows,context,decode_rows,extend_rows,table_stride,
             poisoned:std::cell::Cell::new(false),diagnostics,draft:None,draft_causal:false,graphs})
     }
     pub fn load_draft(&mut self, contract:&cuteafd_loader::families::minimax_m3::dspark::DsparkContract,
         layout:super::dspark::Layout)->Result<()> {
         ensure!(contract.sample_from_anchor && !contract.causal,MiniMaxError::Unsupported("draft mask or anchor mode"));
-        self.draft=Some(super::dspark::Dspark::load(Device {library:self.commands.library(),id:self.commands.device()},
-            &self.commands,contract,layout)?);
+        self.draft=Some(self.native.device().run(|| super::dspark::Dspark::load(&self.native,contract,layout))?);
         self.draft_causal=contract.causal;
         Ok(())
     }
     pub fn draft(&self)->Result<&super::dspark::Dspark<'a>> { self.draft.as_ref().context("MiniMax drafter not admitted") }
     pub fn update_draft(&self,rows:&[crate::shared::speculation::dflash::ContextRow])->Result<()> {
         ensure!(!self.poisoned.get(),MiniMaxError::Invalid("previous native execution failure; restart required"));
-        let result=self.draft()?.update(&self.commands,&self.scratch,rows);
-        let drained=self.commands.drain();
-        let result=result.and(drained);
+        let result=self.native.device().run(|| {
+            let mut guard=self.native.cancellation_guard("MiniMax draft update");
+            let result=self.draft()?.update(&self.native,&self.scratch,rows);
+            let drained=self.native.drain();
+            guard.complete=true;
+            result.and(drained)
+        });
         if result.is_err() {self.poisoned.set(true);}
         result
     }
@@ -279,26 +285,39 @@ impl<'a> Execution<'a> {
         ensure!(!self.poisoned.get(),MiniMaxError::Invalid("previous native execution failure; restart required"));
         ensure!(seqs.iter().all(|s|s.position.checked_add(7).is_some_and(|end|end<=self.context)),
             MiniMaxError::Invalid("draft RoPE extent"));
-        let result=self.draft()?.propose(&self.commands,&self.scratch,embedding,&self.head,&self.weights,seqs,self.draft_causal);
-        if result.is_err() {
-            self.poisoned.set(true);
-            self.commands.drain()?;
-        }
-        result
+        self.native.device().run(|| {
+            let mut guard=self.native.cancellation_guard("MiniMax draft step");
+            let result=self.draft()?.propose(&self.native,&self.scratch,embedding,&self.head,&self.weights,seqs,self.draft_causal);
+            if result.is_err() {
+                self.poisoned.set(true);
+                let drained=self.native.drain();
+                guard.complete=true;
+                drained?;
+            }
+            // A proposal's readback drained the stream.
+            guard.complete=true;
+            result
+        })
     }
-    pub fn stream(&self)->*mut std::ffi::c_void { self.commands.raw() }
-    pub fn drain(&self)->Result<()> { self.commands.drain() }
+    pub fn stream(&self)->*mut std::ffi::c_void { self.native.raw() }
+    pub fn drain(&self)->Result<()> { self.native.drain() }
     /// Runs every layer; the head projects only `logits` (batch rows), and an
     /// empty range skips it.
-    pub fn execute(&self, embedded:&Buffer<'a>, batch:&BatchView, caches:&[LayerCache<'a>],
+    pub fn execute(&self, embedded:CuteafdDeviceBuffer, batch:&BatchView, caches:&[LayerCache<'a>],
         experts:&mut dyn ExpertExecutor<'a>, kind:ExpertV2SourceKind, logits:std::ops::Range<usize>) -> Result<Option<DeviceLogits>> {
         self.execute_through(embedded,batch,caches,experts,kind,self.cfg.layers-1,logits)
     }
-    pub fn hidden(&self,rows:usize)->Result<Buffer<'a>> {
+    pub fn hidden(&self,rows:usize)->Result<CuteafdDeviceBuffer> {
         ensure!(rows>0 && rows<=self.rows,MiniMaxError::Invalid("hidden row extent"));
-        self.scratch.get("residual")?.view(0,rows*6144*4)
+        view(self.scratch.get("residual")?,0,rows*6144*4)
     }
-    pub fn execute_through(&self, embedded:&Buffer<'a>, batch:&BatchView, caches:&[LayerCache<'a>],
+    pub fn execute_through(&self, embedded:CuteafdDeviceBuffer, batch:&BatchView, caches:&[LayerCache<'a>],
+        experts:&mut dyn ExpertExecutor<'a>, kind:ExpertV2SourceKind, last_layer:usize,
+        logits:std::ops::Range<usize>) -> Result<Option<DeviceLogits>> {
+        self.native.device().run(|| self.step(embedded,batch,caches,experts,kind,last_layer,logits))
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn step(&self, embedded:CuteafdDeviceBuffer, batch:&BatchView, caches:&[LayerCache<'a>],
         experts:&mut dyn ExpertExecutor<'a>, kind:ExpertV2SourceKind, last_layer:usize,
         logits:std::ops::Range<usize>) -> Result<Option<DeviceLogits>> {
         ensure!(!self.poisoned.get(),MiniMaxError::Invalid("previous native execution failure; restart required"));
@@ -311,18 +330,19 @@ impl<'a> Execution<'a> {
             MiniMaxError::Unsupported("expert source kind"));
         let rows=batch.validate(self.rows,self.context)?;
         ensure!(caches.len()==self.cfg.layers,MiniMaxError::Invalid("layer cache inventory"));
-        for cache in caches { ensure!(cache.key.raw().bytes>=batch.pool_pages*32768
-            && cache.value.raw().bytes>=batch.pool_pages*32768 && cache.index.raw().bytes>=batch.pool_pages*8448,
+        for cache in caches { ensure!(cache.key.buffer.bytes>=batch.pool_pages*32768
+            && cache.value.buffer.bytes>=batch.pool_pages*32768 && cache.index.buffer.bytes>=batch.pool_pages*8448,
             MiniMaxError::Invalid("physical cache extent")); }
         let waves=self.cfg.moe[..=last_layer].iter().filter(|&&moe|moe).count();
         // A full-model decode step replays the recording of its row count.
         let replay=(kind==ExpertV2SourceKind::Decode && rows<=self.decode_rows && last_layer+1==self.cfg.layers
             && logits==(0..rows)).then(|| self.binding(embedded,caches,batch.pool_pages,&*experts)).transpose()?.flatten();
+        let mut guard=self.native.cancellation_guard("MiniMax step");
         let result=(||{
             let cuts=self.lane_cuts(batch,rows,experts.lanes(),diagnostics.is_some())?;
             experts.begin(waves,cuts.len()+1,kind)?;
-            self.commands.upload(self.scratch.get("positions")?,&batch.positions.iter().flat_map(|v|v.to_le_bytes()).collect::<Vec<_>>())?;
-            self.commands.upload(self.scratch.get("slots")?,&batch.slots.iter().flat_map(|v|v.to_le_bytes()).collect::<Vec<_>>())?;
+            self.native.upload(self.scratch.get("positions")?,&batch.positions.iter().flat_map(|v|v.to_le_bytes()).collect::<Vec<_>>())?;
+            self.native.upload(self.scratch.get("slots")?,&batch.slots.iter().flat_map(|v|v.to_le_bytes()).collect::<Vec<_>>())?;
             let plan=self.plan_attention(batch,rows,&cuts)?;
             let lanes=lanes_at(&plan,rows,&cuts);
             if replay.is_some() {
@@ -331,19 +351,21 @@ impl<'a> Execution<'a> {
                     let raw=owner.raw;
                     graphs.replays+=1;
                     drop(graphs);
-                    // SAFETY: the bank keeps the executable and every operand it
-                    // recorded; this step's metadata uploads precede it on the stream.
-                    unsafe { census::dispatch(self.commands.library(),self.commands.raw(),STEP_BANK,rows,Some(raw),
+                    // SAFETY: the bank keeps the executable; the binding check
+                    // proved this step borrows the owners it recorded, and this
+                    // step's metadata uploads precede it on the stream.
+                    unsafe { census::dispatch(self.native.library(),self.native.raw(),STEP_BANK,rows,Some(raw),
                         || self.layers(embedded,Some(batch),batch.pool_pages,caches,experts,&plan,&lanes,rows,last_layer,
                             logits.clone(),&mut None).map(|_|()))? };
-                    return self.head.output(&self.commands,&self.scratch,rows).map(|logits|(Some(logits),true));
+                    return self.head.output(&self.native,&self.scratch,rows).map(|logits|(Some(logits),true));
                 }
             }
             self.layers(embedded,Some(batch),batch.pool_pages,caches,experts,&plan,&lanes,rows,last_layer,logits.clone(),
                 &mut diagnostics).map(|logits|(logits,false))
         })();
         // All device/cache/expert borrows end only after queued work retires.
-        let drained=self.commands.drain();
+        let drained=self.native.drain();
+        guard.complete=true;
         let finished=experts.finish();
         let result=result.and_then(|value|{drained?;finished?;Ok(value)});
         if result.is_err() { self.poisoned.set(true); experts.abort(); }
@@ -353,9 +375,9 @@ impl<'a> Execution<'a> {
     }
     /// The recordings' binding when this step's input, cache, expert owner and
     /// pool are theirs; `None` before the warm-up. Any other binding is refused.
-    fn binding(&self, embedded:&Buffer<'a>, caches:&[LayerCache<'a>], pool_pages:usize,
+    fn binding(&self, embedded:CuteafdDeviceBuffer, caches:&[LayerCache<'a>], pool_pages:usize,
         experts:&dyn ExpertExecutor<'a>) -> Result<Option<Binding>> {
-        let step=Binding { embedded:embedded.raw().ptr as usize, cache:caches[0].key.raw().ptr as usize,
+        let step=Binding { embedded:embedded.ptr as usize, cache:caches[0].key.buffer.ptr as usize,
             experts:std::ptr::from_ref(experts).cast::<()>() as usize, pool_pages, stride:self.table_stride.min(pool_pages) };
         match self.graphs.borrow().binding {
             None => Ok(None),
@@ -371,7 +393,7 @@ impl<'a> Execution<'a> {
     /// (its sequence numbers live in the pinned mailbox). Nothing executes; a
     /// replay follows each step's metadata uploads. Returns the device bytes
     /// the recordings took.
-    pub fn warm_graphs(&self, keys:&[usize], embedded:&Buffer<'a>, caches:&[LayerCache<'a>], pool_pages:usize,
+    pub fn warm_graphs(&self, keys:&[usize], embedded:CuteafdDeviceBuffer, caches:&[LayerCache<'a>], pool_pages:usize,
         experts:&mut dyn ExpertExecutor<'a>) -> Result<u64> {
         ensure!(!self.poisoned.get(),MiniMaxError::Invalid("previous native execution failure; restart required"));
         if self.diagnostics.borrow().is_some() {
@@ -381,51 +403,51 @@ impl<'a> Execution<'a> {
         ensure!(caches.len()==self.cfg.layers && keys.iter().all(|rows|(1..=self.decode_rows).contains(rows)),
             MiniMaxError::Invalid("decode graph inventory"));
         let stride=self.table_stride.min(pool_pages);
-        let binding=Binding { embedded:embedded.raw().ptr as usize, cache:caches[0].key.raw().ptr as usize,
+        let binding=Binding { embedded:embedded.ptr as usize, cache:caches[0].key.buffer.ptr as usize,
             experts:std::ptr::from_ref(&*experts).cast::<()>() as usize, pool_pages, stride };
-        let library=self.commands.library();
-        let device=Device { library, id:self.commands.device() };
-        self.commands.drain()?;
-        let (free,_)=library.cuda_memory_info()?;
-        let mut graphs=self.graphs.borrow_mut();
-        ensure!(graphs.binding.is_none(),MiniMaxError::Invalid("decode graphs already recorded"));
-        let started=std::time::Instant::now();
-        graphs.bank.warm(keys,|&rows| {
-            ensure!(self.commands.idle(),MiniMaxError::Invalid("recording on a busy stream"));
-            let (before,_)=library.cuda_memory_info()?;
-            experts.record(ExpertV2SourceKind::Decode)?;
-            // SAFETY: startup owns this drained stream; capture records and runs nothing.
-            device.run(|| unsafe { library.cuda_graph_begin_capture(self.commands.raw()) })?;
-            let queued=self.layers(embedded,None,pool_pages,caches,experts,&AttentionPlan::Decode{stride},&one_lane(rows),rows,
-                self.cfg.layers-1,0..rows,&mut None);
-            // SAFETY: ends the capture begun above, even when recording failed.
-            let ended=device.run(|| unsafe { library.cuda_graph_end_capture(self.commands.raw()) });
-            let pins=self.commands.take_retained();
-            let reset=experts.record(ExpertV2SourceKind::Decode);
-            match (queued,ended) {
-                (Ok(_),Ok(raw)) => {
-                    // SAFETY: the owner keeps every recorded operand; Execution
-                    // drains its stream before the bank (or the pins) go.
-                    let owner=unsafe { GraphOwner::new(library,device.id,raw,pins) }?;
-                    reset?;
-                    let (after,_)=library.cuda_memory_info()?;
-                    Ok((owner,Some(before.saturating_sub(after) as u64)))
+        let (library,device)=(self.native.library(),self.native.device());
+        device.run(|| {
+            self.native.drain()?;
+            let (free,_)=library.cuda_memory_info()?;
+            let mut graphs=self.graphs.borrow_mut();
+            ensure!(graphs.binding.is_none(),MiniMaxError::Invalid("decode graphs already recorded"));
+            let started=std::time::Instant::now();
+            graphs.bank.warm(keys,|&rows| {
+                let (before,_)=library.cuda_memory_info()?;
+                experts.record(ExpertV2SourceKind::Decode)?;
+                // SAFETY: startup owns this drained stream; capture records and runs nothing.
+                unsafe { library.cuda_graph_begin_capture(self.native.raw())? };
+                let queued=self.layers(embedded,None,pool_pages,caches,experts,&AttentionPlan::Decode{stride},&one_lane(rows),rows,
+                    self.cfg.layers-1,0..rows,&mut None);
+                // SAFETY: ends the capture begun above, even when recording failed.
+                let ended=unsafe { library.cuda_graph_end_capture(self.native.raw()) };
+                let reset=experts.record(ExpertV2SourceKind::Decode);
+                match (queued,ended) {
+                    (Ok(_),Ok(raw)) => {
+                        // SAFETY: a replay borrows the binding's owners (checked
+                        // before every replay); Execution drains its stream
+                        // before the bank goes.
+                        let owner=unsafe { GraphOwner::new(library,device.id,raw,()) }?;
+                        reset?;
+                        let (after,_)=library.cuda_memory_info()?;
+                        Ok((owner,Some(before.saturating_sub(after) as u64)))
+                    }
+                    (Err(error),Ok(raw)) => {
+                        // SAFETY: the failed recording was never launched.
+                        unsafe { library.cuda_graph_exec_destroy(raw)? };
+                        Err(error)
+                    }
+                    (Err(error),Err(ended)) => Err(error.context(format!("ending the failed recording: {ended:#}"))),
+                    (Ok(_),Err(error)) => Err(error),
                 }
-                (Err(error),Ok(raw)) => {
-                    // SAFETY: the failed recording was never launched.
-                    device.run(|| unsafe { library.cuda_graph_exec_destroy(raw) })?;
-                    Err(error)
-                }
-                (Err(error),Err(ended)) => Err(error.context(format!("ending the failed recording: {ended:#}"))),
-                (Ok(_),Err(error)) => Err(error),
-            }
-        })?;
-        graphs.binding=Some(binding);
-        let (after,_)=library.cuda_memory_info()?;
-        let bytes=free.saturating_sub(after) as u64;
-        tracing::info!(executables=keys.len(),bytes,ms=started.elapsed().as_secs_f64()*1e3,
-            "MiniMax decode steps recorded at startup");
-        Ok(bytes)
+            })?;
+            graphs.binding=Some(binding);
+            let (after,_)=library.cuda_memory_info()?;
+            let bytes=free.saturating_sub(after) as u64;
+            tracing::info!(executables=keys.len(),bytes,ms=started.elapsed().as_secs_f64()*1e3,
+                "MiniMax decode steps recorded at startup");
+            Ok(bytes)
+        })
     }
     /// The step body over its `lanes`: residual widening, every layer through
     /// `last_layer`, then the head over `logits` (an empty range skips it).
@@ -435,13 +457,13 @@ impl<'a> Execution<'a> {
     /// is in flight while another's GPU work runs. One lane (every decode step
     /// and recording) is the layer's own order.
     #[allow(clippy::too_many_arguments)]
-    fn layers(&self, embedded:&Buffer<'a>, batch:Option<&BatchView>, pool_pages:usize, caches:&[LayerCache<'a>],
+    fn layers(&self, embedded:CuteafdDeviceBuffer, batch:Option<&BatchView>, pool_pages:usize, caches:&[LayerCache<'a>],
         experts:&mut dyn ExpertExecutor<'a>, plan:&AttentionPlan, lanes:&[Lane], rows:usize, last_layer:usize,
         logits:std::ops::Range<usize>, diagnostics:&mut Option<Diagnostics>) -> Result<Option<DeviceLogits>> {
         let views=lanes.iter().map(|lane|self.scratch.rows(lane.first,lane.rows)).collect::<Result<Vec<_>>>()?;
         let begin=|layer:usize,diagnostics:&Option<Diagnostics>| diagnostics.as_ref().filter(|d|d.layer==layer)
             .map(|d|d.begin(batch.context("MiniMax diagnostic step needs its batch")?)).transpose();
-        self.commands.widen(embedded,self.scratch.get("residual")?,rows*6144)?;
+        self.native.widen(embedded,self.scratch.get("residual")?,rows*6144)?;
         let mut pending:Option<(usize,Option<StepDump>)>=None;
         for (layer,cache) in caches.iter().enumerate().take(last_layer+1) {
             if !self.cfg.moe[layer] {
@@ -451,16 +473,16 @@ impl<'a> Execution<'a> {
                 // A dense layer runs lane after lane (a diagnostic's one lane).
                 let mut dump=begin(layer,diagnostics)?;
                 for (lane,s) in lanes.iter().zip(&views) {
-                    if let Some(d)=&mut dump { d.tensor(&self.commands,"input","f32",&[rows,6144],s.get("residual")?)?; }
+                    if let Some(d)=&mut dump { d.tensor(&self.native,"input","f32",&[rows,6144],s.get("residual")?)?; }
                     self.attention(layer,lane,pool_pages,batch,cache,plan,s,dump.as_mut())?;
-                    ffn::norm(&self.commands,s.get("residual")?,self.weights.layer(layer,"post_attention_layernorm.weight")?,s.get("norm")?,lane.rows)?;
-                    if let Some(d)=&mut dump { d.tensor(&self.commands,"ffn_norm","bf16",&[rows,6144],s.get("norm")?)?; }
-                    ffn::dense(&self.commands,&self.weights,s,layer,lane.rows,false)?;
+                    ffn::norm(&self.native,s.get("residual")?,self.weights.layer(layer,"post_attention_layernorm.weight")?,s.get("norm")?,lane.rows)?;
+                    if let Some(d)=&mut dump { d.tensor(&self.native,"ffn_norm","bf16",&[rows,6144],s.get("norm")?)?; }
+                    ffn::dense(&self.native,&self.weights,s,layer,lane.rows,false)?;
                     self.residual(s,lane.rows)?;
-                    if let Some(draft)=&self.draft { draft.tap(&self.commands,layer,s.get("residual")?,lane.first,lane.rows)?; }
+                    if let Some(draft)=&self.draft { draft.tap(&self.native,layer,s.get("residual")?,lane.first,lane.rows)?; }
                 }
                 if let Some(mut d)=dump {
-                    d.tensor(&self.commands,"residual","f32",&[rows,6144],self.scratch.get("residual")?)?;
+                    d.tensor(&self.native,"residual","f32",&[rows,6144],self.scratch.get("residual")?)?;
                     diagnostics.as_mut().context("MiniMax diagnostic owner")?.finish(d)?;
                 }
                 continue;
@@ -470,13 +492,13 @@ impl<'a> Execution<'a> {
                 if let Some((previous,previous_dump))=&mut pending {
                     self.routed_back(*previous,index,lane,s,experts)?;
                     if let Some(mut d)=previous_dump.take() {
-                        d.tensor(&self.commands,"residual","f32",&[rows,6144],s.get("residual")?)?;
+                        d.tensor(&self.native,"residual","f32",&[rows,6144],s.get("residual")?)?;
                         diagnostics.as_mut().context("MiniMax diagnostic owner")?.finish(d)?;
                     }
                 }
                 if index==0 {
                     dump=begin(layer,diagnostics)?;
-                    if let Some(d)=&mut dump { d.tensor(&self.commands,"input","f32",&[rows,6144],s.get("residual")?)?; }
+                    if let Some(d)=&mut dump { d.tensor(&self.native,"input","f32",&[rows,6144],s.get("residual")?)?; }
                 }
                 self.routed_front(layer,index,lane,pool_pages,batch,cache,plan,s,experts,dump.as_mut())?;
             }
@@ -486,23 +508,25 @@ impl<'a> Execution<'a> {
             self.finish_routed(previous,rows,lanes,&views,experts,dump,diagnostics.as_mut())?;
         }
         if last_layer+1==self.cfg.layers && !logits.is_empty() {
-            self.head.logits(&self.commands,&self.weights,&self.scratch,logits).map(Some)
+            self.head.logits(&self.native,&self.weights,&self.scratch,logits).map(Some)
         } else { Ok(None) }
     }
     /// `CUTEAFD_MINIMAX_GRAPH_VERIFY=1`: runs the replayed step again eagerly
     /// (same inputs: the cache rows it appends are rewritten identically) and
     /// compares the logits bit for bit.
-    fn verify(&self, embedded:&Buffer<'a>, batch:&BatchView, caches:&[LayerCache<'a>],
+    fn verify(&self, embedded:CuteafdDeviceBuffer, batch:&BatchView, caches:&[LayerCache<'a>],
         experts:&mut dyn ExpertExecutor<'a>, waves:usize, last_layer:usize) -> Result<()> {
-        let library=self.commands.library();
+        let library=self.native.library();
         let rows=batch.positions.len();
-        let replayed=self.head.output(&self.commands,&self.scratch,rows)?.to_host(library)?;
+        let replayed=self.head.output(&self.native,&self.scratch,rows)?.to_host(library)?;
+        let mut guard=self.native.cancellation_guard("MiniMax verified step");
         let eager=(||{
             experts.begin(waves,1,ExpertV2SourceKind::Decode)?;
             self.layers(embedded,Some(batch),batch.pool_pages,caches,experts,&AttentionPlan::Decode{stride:self.decode_stride(batch)},
                 &one_lane(rows),rows,last_layer,0..rows,&mut None)?.context("MiniMax verified step has no logits")
         })();
-        let drained=self.commands.drain();
+        let drained=self.native.drain();
+        guard.complete=true;
         let finished=experts.finish();
         let eager=eager.and_then(|logits|{drained?;finished?;logits.to_host(library)});
         let eager=match eager { Ok(eager)=>eager, Err(error)=>{ self.poisoned.set(true); experts.abort(); return Err(error); } };
@@ -513,48 +537,48 @@ impl<'a> Execution<'a> {
         else { tracing::error!(rows,replays,differing,max_abs=max,"MiniMax decode graph replay differs from eager"); }
         Ok(())
     }
-    fn residual(&self,s:&Scratch<'a>,rows:usize)->Result<()> {
-        self.commands.launch("minimax_residual", &[s.get("residual")?,s.get("delta")?,s.get("residual")?], &[Scalar::I32(rows as i32)])
+    fn residual(&self,s:&Rows<'_>,rows:usize)->Result<()> {
+        self.native.launch("minimax_residual", &[s.get("residual")?,s.get("delta")?,s.get("residual")?], &[Scalar::I32(rows as i32)])
     }
     /// A routed layer's first half on one lane: attention, the router and the
     /// expert dispatch, then the shared expert while the experts run.
     #[allow(clippy::too_many_arguments)]
     fn routed_front(&self,layer:usize,index:usize,lane:&Lane,pool_pages:usize,batch:Option<&BatchView>,cache:&LayerCache<'a>,
-        plan:&AttentionPlan,s:&Scratch<'a>,experts:&mut dyn ExpertExecutor<'a>,mut dump:Option<&mut StepDump>)->Result<()> {
+        plan:&AttentionPlan,s:&Rows<'_>,experts:&mut dyn ExpertExecutor<'a>,mut dump:Option<&mut StepDump>)->Result<()> {
         let rows=lane.rows;
         self.attention(layer,lane,pool_pages,batch,cache,plan,s,dump.as_deref_mut())?;
-        ffn::norm(&self.commands,s.get("residual")?,self.weights.layer(layer,"post_attention_layernorm.weight")?,s.get("norm")?,rows)?;
-        if let Some(d)=dump.as_deref_mut() { d.tensor(&self.commands,"ffn_norm","bf16",&[rows,6144],s.get("norm")?)?; }
-        self.commands.launch("minimax_router_scores", &[s.get("norm")?,
+        ffn::norm(&self.native,s.get("residual")?,self.weights.layer(layer,"post_attention_layernorm.weight")?,s.get("norm")?,rows)?;
+        if let Some(d)=dump.as_deref_mut() { d.tensor(&self.native,"ffn_norm","bf16",&[rows,6144],s.get("norm")?)?; }
+        self.native.launch("minimax_router_scores", &[s.get("norm")?,
             self.weights.layer(layer,"block_sparse_moe.gate.weight")?,s.get("router_logits")?], &[Scalar::I32(rows as i32)])?;
-        self.commands.launch("minimax_route", &[s.get("router_logits")?,
+        self.native.launch("minimax_route", &[s.get("router_logits")?,
             self.weights.layer(layer,"block_sparse_moe.e_score_correction_bias")?,s.get("route_ids")?,s.get("route_weights")?], &[Scalar::I32(rows as i32)])?;
         if let Some(d)=dump.as_deref_mut() {
-            d.tensor(&self.commands,"router_ids","i32",&[rows,4],s.get("route_ids")?)?;
-            d.tensor(&self.commands,"router_weights","f32",&[rows,4],s.get("route_weights")?)?;
+            d.tensor(&self.native,"router_ids","i32",&[rows,4],s.get("route_ids")?)?;
+            d.tensor(&self.native,"router_weights","f32",&[rows,4],s.get("route_weights")?)?;
         }
-        experts.dispatch(layer,index,rows,s.get("route_ids")?,s.get("route_weights")?,s.get("norm")?,&self.commands)?;
-        ffn::dense(&self.commands,&self.weights,s,layer,rows,true)?;
-        if let Some(d)=dump { d.tensor(&self.commands,"shared","bf16",&[rows,6144],s.get("shared")?)?; }
+        experts.dispatch(layer,index,rows,s.get("route_ids")?,s.get("route_weights")?,s.get("norm")?,&self.native)?;
+        ffn::dense(&self.native,&self.weights,s,layer,rows,true)?;
+        if let Some(d)=dump { d.tensor(&self.native,"shared","bf16",&[rows,6144],s.get("shared")?)?; }
         Ok(())
     }
     /// Its second half: the lane's routed experts plus the shared expert into
     /// the residual, and the drafter's tap.
-    fn routed_back(&self,layer:usize,index:usize,lane:&Lane,s:&Scratch<'a>,experts:&mut dyn ExpertExecutor<'a>)->Result<()> {
-        experts.collect(layer,index,lane.rows,s.get("routed")?,&self.commands)?;
-        self.commands.add_bf16(s.get("shared")?,s.get("routed")?,s.get("delta")?,lane.rows*6144)?;
+    fn routed_back(&self,layer:usize,index:usize,lane:&Lane,s:&Rows<'_>,experts:&mut dyn ExpertExecutor<'a>)->Result<()> {
+        experts.collect(layer,index,lane.rows,s.get("routed")?,&self.native)?;
+        self.native.add_bf16(s.get("shared")?,s.get("routed")?,s.get("delta")?,lane.rows*6144)?;
         self.residual(s,lane.rows)?;
-        if let Some(draft)=&self.draft { draft.tap(&self.commands,layer,s.get("residual")?,lane.first,lane.rows)?; }
+        if let Some(draft)=&self.draft { draft.tap(&self.native,layer,s.get("residual")?,lane.first,lane.rows)?; }
         Ok(())
     }
     /// Every lane's second half of routed layer `layer`, then the end of its
     /// diagnostic dump (`rows`, one lane).
     #[allow(clippy::too_many_arguments)]
-    fn finish_routed(&self,layer:usize,rows:usize,lanes:&[Lane],views:&[Scratch<'a>],experts:&mut dyn ExpertExecutor<'a>,
+    fn finish_routed(&self,layer:usize,rows:usize,lanes:&[Lane],views:&[Rows<'_>],experts:&mut dyn ExpertExecutor<'a>,
         dump:Option<StepDump>,diagnostics:Option<&mut Diagnostics>)->Result<()> {
         for (index,(lane,s)) in lanes.iter().zip(views).enumerate() { self.routed_back(layer,index,lane,s,experts)?; }
         if let Some(mut d)=dump {
-            d.tensor(&self.commands,"residual","f32",&[rows,6144],self.scratch.get("residual")?)?;
+            d.tensor(&self.native,"residual","f32",&[rows,6144],self.scratch.get("residual")?)?;
             diagnostics.context("MiniMax diagnostic owner")?.finish(d)?;
         }
         Ok(())
@@ -578,16 +602,16 @@ impl<'a> Execution<'a> {
         if rows<=self.decode_rows {
             let stride=self.decode_stride(batch);
             let (tables,lengths,offsets)=decode_tables(batch,stride)?;
-            self.commands.upload(s.get("page_table")?,&le_bytes(&tables))?;
-            self.commands.upload(s.get("cache_lengths")?,&le_bytes(&lengths))?;
-            self.commands.upload(s.get("cu_seqlens_q")?,&le_bytes(&offsets))?;
+            self.native.upload(s.get("page_table")?,&le_bytes(&tables))?;
+            self.native.upload(s.get("cache_lengths")?,&le_bytes(&lengths))?;
+            self.native.upload(s.get("cu_seqlens_q")?,&le_bytes(&offsets))?;
             return Ok(AttentionPlan::Decode{stride});
         }
         let (launches,tables,lengths,offsets,bounds)=extend_tables(batch,self.extend_rows,self.table_stride,cuts)?;
-        self.commands.upload(s.get("page_table")?,&le_bytes(&tables))?;
-        self.commands.upload(s.get("cache_lengths")?,&le_bytes(&lengths))?;
-        self.commands.upload(s.get("cu_seqlens_q")?,&le_bytes(&offsets))?;
-        self.commands.upload(&s.get("index_bounds")?.view(self.extend_rows*4,bounds.len()*4)?,&le_bytes(&bounds))?;
+        self.native.upload(s.get("page_table")?,&le_bytes(&tables))?;
+        self.native.upload(s.get("cache_lengths")?,&le_bytes(&lengths))?;
+        self.native.upload(s.get("cu_seqlens_q")?,&le_bytes(&offsets))?;
+        self.native.upload(view(s.get("index_bounds")?,self.extend_rows*4,bounds.len()*4)?,&le_bytes(&bounds))?;
         Ok(AttentionPlan::Extend{launches})
     }
     /// One lane's attention for a layer: its rows (`s` views them) and its
@@ -595,35 +619,35 @@ impl<'a> Execution<'a> {
     /// which has neither extend launches nor dumps.
     #[allow(clippy::too_many_arguments)]
     fn attention(&self, layer:usize,lane:&Lane,pool_pages:usize,batch:Option<&BatchView>,cache:&LayerCache<'a>,
-        plan:&AttentionPlan,s:&Scratch<'a>,mut dump:Option<&mut StepDump>)->Result<()> {
+        plan:&AttentionPlan,s:&Rows<'_>,mut dump:Option<&mut StepDump>)->Result<()> {
         let rows=lane.rows;
         let step=|| batch.context("MiniMax extend launches and dumps need their batch");
-        ffn::norm(&self.commands,s.get("residual")?,self.weights.layer(layer,"input_layernorm.weight")?,s.get("norm")?,rows)?;
-        if let Some(d)=dump.as_deref_mut() { d.tensor(&self.commands,"norm","bf16",&[rows,6144],s.get("norm")?)?; }
+        ffn::norm(&self.native,s.get("residual")?,self.weights.layer(layer,"input_layernorm.weight")?,s.get("norm")?,rows)?;
+        if let Some(d)=dump.as_deref_mut() { d.tensor(&self.native,"norm","bf16",&[rows,6144],s.get("norm")?)?; }
         for (projection,stem,out) in [("q","q","q"),("kv","kv","kv"),("index_q","index_q","index_q"),("index_k","index_k","index_k")] {
-            ffn::linear(&self.commands,&self.weights,s,layer,projection,&format!("self_attn.{stem}_proj"),s.get("norm")?,s.get(out)?,rows)?;
+            ffn::linear(&self.native,&self.weights,s.get("scratch")?,layer,projection,&format!("self_attn.{stem}_proj"),s.get("norm")?,s.get(out)?,rows)?;
         }
-        self.commands.launch("minimax_kv_split", &[s.get("kv")?,s.get("k")?,s.get("v")?], &[Scalar::I32(rows as i32)])?;
+        self.native.launch("minimax_kv_split", &[s.get("kv")?,s.get("k")?,s.get("v")?], &[Scalar::I32(rows as i32)])?;
         for stem in ["q","k","index_q","index_k"] {
             let weight=self.weights.layer(layer,&format!("self_attn.{stem}_norm.weight"))?;
-            self.commands.launch(&format!("minimax_{stem}_norm_rope"), &[s.get(stem)?,weight,weight,s.get("cos")?,s.get("sin")?,s.get("positions")?,s.get(&format!("{stem}_norm"))?], &[Scalar::I32(rows as i32)])?;
+            self.native.launch(&format!("minimax_{stem}_norm_rope"), &[s.get(stem)?,weight,weight,s.get("cos")?,s.get("sin")?,s.get("positions")?,s.get(&format!("{stem}_norm"))?], &[Scalar::I32(rows as i32)])?;
         }
         if let Some(d)=dump.as_deref_mut() {
             for (name,source,heads) in [("q","q_norm",64),("k","k_norm",4),("v","v",4),("index_q","index_q_norm",4),("index_k","index_k_norm",1)] {
-                d.tensor(&self.commands,name,"bf16",&[rows,heads,128],s.get(source)?)?;
+                d.tensor(&self.native,name,"bf16",&[rows,heads,128],s.get(source)?)?;
             }
         }
-        self.commands.launch("minimax_index_k_pack", &[s.get("index_k_norm")?,s.get("slots")?,&cache.index,s.get("index_q_scales")?], &[Scalar::I32(rows as i32)])?;
-        self.commands.launch("minimax_kv_pack", &[s.get("k_norm")?,s.get("v")?,s.get("slots")?,s.get("batch_ids")?,s.get("k_descale")?,s.get("v_descale")?,&cache.key,&cache.value], &[Scalar::I32(rows as i32)])?;
-        self.commands.launch("minimax_index_q_quant", &[s.get("index_q_norm")?,s.get("slots")?,s.get("index_q_fp8")?,s.get("index_q_scales")?], &[Scalar::I32(rows as i32)])?;
+        self.native.launch("minimax_index_k_pack", &[s.get("index_k_norm")?,s.get("slots")?,cache.index.buffer,s.get("index_q_scales")?], &[Scalar::I32(rows as i32)])?;
+        self.native.launch("minimax_kv_pack", &[s.get("k_norm")?,s.get("v")?,s.get("slots")?,s.get("batch_ids")?,s.get("k_descale")?,s.get("v_descale")?,cache.key.buffer,cache.value.buffer], &[Scalar::I32(rows as i32)])?;
+        self.native.launch("minimax_index_q_quant", &[s.get("index_q_norm")?,s.get("slots")?,s.get("index_q_fp8")?,s.get("index_q_scales")?], &[Scalar::I32(rows as i32)])?;
         if let Some(d)=dump.as_deref_mut() {
-            d.tensor(&self.commands,"index_q_fp8","u8",&[rows,4,128],s.get("index_q_fp8")?)?;
-            d.tensor(&self.commands,"index_q_scales","f32",&[rows,4],s.get("index_q_scales")?)?;
+            d.tensor(&self.native,"index_q_fp8","u8",&[rows,4,128],s.get("index_q_fp8")?)?;
+            d.tensor(&self.native,"index_q_scales","f32",&[rows,4],s.get("index_q_scales")?)?;
             let slots=&step()?.slots;
-            d.cache_rows(&self.commands,"index_k_fp8","u8",&[rows,1,128],&cache.index,slots,8448,0,128)?;
-            d.cache_rows(&self.commands,"index_k_scales","f32",&[rows,1],&cache.index,slots,8448,8192,4)?;
-            for (name,source) in [("k_fp8",&cache.key),("v_fp8",&cache.value)] {
-                d.cache_rows(&self.commands,name,"u8",&[rows,4,128],source,slots,32768,0,512)?;
+            d.cache_rows(&self.native,"index_k_fp8","u8",&[rows,1,128],cache.index.buffer,slots,8448,0,128)?;
+            d.cache_rows(&self.native,"index_k_scales","f32",&[rows,1],cache.index.buffer,slots,8448,8192,4)?;
+            for (name,source) in [("k_fp8",cache.key.buffer),("v_fp8",cache.value.buffer)] {
+                d.cache_rows(&self.native,name,"u8",&[rows,4,128],source,slots,32768,0,512)?;
             }
         }
         match plan {
@@ -631,13 +655,13 @@ impl<'a> Execution<'a> {
             // paged prefix, including prefixes from prior chunks.
             AttentionPlan::Decode{stride} => {
                 let stride=*stride;
-                self.commands.launch("minimax_index_decode", &[&s.get("index_q_fp8")?.view(0,rows*512)?,
-                    &s.get("index_q_scales")?.view(0,rows*16)?,&cache.index,s.get("page_table")?,s.get("cache_lengths")?,s.get("q2k")?,s.get("scratch")?], &[
+                self.native.launch("minimax_index_decode", &[view(s.get("index_q_fp8")?,0,rows*512)?,
+                    view(s.get("index_q_scales")?,0,rows*16)?,cache.index.buffer,s.get("page_table")?,s.get("cache_lengths")?,s.get("q2k")?,s.get("scratch")?], &[
                     Scalar::I32(rows as i32),Scalar::I32(stride as i32),Scalar::I32(stride as i32),Scalar::I64(pool_pages as i64)])?;
-                if let Some(d)=dump.as_deref_mut() { d.selection(&self.commands,s.get("q2k")?,rows,self.decode_rows)?; }
-                self.commands.launch("minimax_attention_decode", &[&s.get("q_norm")?.view(0,rows*16384)?,&cache.key,&cache.value,
+                if let Some(d)=dump.as_deref_mut() { d.selection(&self.native,s.get("q2k")?,rows,self.decode_rows)?; }
+                self.native.launch("minimax_attention_decode", &[view(s.get("q_norm")?,0,rows*16384)?,cache.key.buffer,cache.value.buffer,
                     s.get("k_descale")?,s.get("v_descale")?,s.get("page_table")?,s.get("cache_lengths")?,s.get("cu_seqlens_q")?,s.get("q2k")?,
-                    &s.get("attention")?.view(0,rows*16384)?,s.get("lse")?,s.get("scratch")?], &[
+                    view(s.get("attention")?,0,rows*16384)?,s.get("lse")?,s.get("scratch")?], &[
                     Scalar::I32(rows as i32),Scalar::I32(rows as i32),Scalar::I32(stride as i32),Scalar::I64(pool_pages as i64)])?;
             }
             // Each request's index keys through this lane are staged as the
@@ -651,34 +675,34 @@ impl<'a> Execution<'a> {
                 let batch=step()?;
                 for (index,launch) in launches[lane.launches.clone()].iter().enumerate() {
                     let request=&batch.requests[launch.request];
-                    let table=tables.view(launch.slot*stride*4,stride*4)?;
+                    let table=view(tables,launch.slot*stride*4,stride*4)?;
                     if launch.first==0 || index==0 {
                         let end=(request.row_start+request.rows).min(lane.first+lane.rows)-request.row_start;
                         let pages=(request.start_position+end).div_ceil(64);
-                        self.commands.index_stage(&cache.index,&table.view(0,pages*4)?,pages,s.get("index_keys")?,s.get("index_scales")?)?;
+                        self.native.index_stage(cache.index.buffer,view(table,0,pages*4)?,pages,s.get("index_keys")?,s.get("index_scales")?)?;
                     }
                     let (row,n)=(launch.row-lane.first,launch.rows);
-                    self.commands.launch("minimax_index_prefill", &[&s.get("index_q_fp8")?.view(row*512,n*512)?,
-                        &s.get("index_q_scales")?.view(row*16,n*16)?,s.get("index_keys")?,s.get("index_scales")?,
-                        &bounds.view(0,n*4)?,&bounds.view(launch.bounds*4,n*4)?,s.get("q2k_extend")?,s.get("scratch")?], &[
+                    self.native.launch("minimax_index_prefill", &[view(s.get("index_q_fp8")?,row*512,n*512)?,
+                        view(s.get("index_q_scales")?,row*16,n*16)?,s.get("index_keys")?,s.get("index_scales")?,
+                        view(bounds,0,n*4)?,view(bounds,launch.bounds*4,n*4)?,s.get("q2k_extend")?,s.get("scratch")?], &[
                         Scalar::I32(n as i32),Scalar::I32((request.start_position+launch.first+n) as i32)])?;
-                    if let Some(d)=dump.as_deref_mut() { d.selection(&self.commands,s.get("q2k_extend")?,n,tile)?; }
-                    self.commands.launch("minimax_attention_extend", &[&s.get("q_norm")?.view(row*16384,n*16384)?,&cache.key,&cache.value,
-                        s.get("k_descale")?,s.get("v_descale")?,&table,&s.get("cache_lengths")?.view(launch.slot*16,16)?,
-                        &s.get("cu_seqlens_q")?.view(launch.slot*16,16)?,s.get("q2k_extend")?,
-                        &s.get("attention")?.view(row*16384,n*16384)?,s.get("lse")?,s.get("scratch")?], &[
+                    if let Some(d)=dump.as_deref_mut() { d.selection(&self.native,s.get("q2k_extend")?,n,tile)?; }
+                    self.native.launch("minimax_attention_extend", &[view(s.get("q_norm")?,row*16384,n*16384)?,cache.key.buffer,cache.value.buffer,
+                        s.get("k_descale")?,s.get("v_descale")?,table,view(s.get("cache_lengths")?,launch.slot*16,16)?,
+                        view(s.get("cu_seqlens_q")?,launch.slot*16,16)?,s.get("q2k_extend")?,
+                        view(s.get("attention")?,row*16384,n*16384)?,s.get("lse")?,s.get("scratch")?], &[
                         Scalar::I32(n as i32),Scalar::I32(1),Scalar::I32(stride as i32),Scalar::I64(pool_pages as i64)])?;
                 }
             }
         }
         if let Some(d)=dump.as_deref_mut() {
             d.finish_selection()?;
-            d.tensor(&self.commands,"attention","bf16",&[rows,64,128],s.get("attention")?)?;
+            d.tensor(&self.native,"attention","bf16",&[rows,64,128],s.get("attention")?)?;
         }
-        ffn::linear(&self.commands,&self.weights,s,layer,"o","self_attn.o_proj",s.get("attention")?,s.get("delta")?,rows)?;
-        if let Some(d)=dump.as_deref_mut() { d.tensor(&self.commands,"attention_projected","bf16",&[rows,6144],s.get("delta")?)?; }
+        ffn::linear(&self.native,&self.weights,s.get("scratch")?,layer,"o","self_attn.o_proj",s.get("attention")?,s.get("delta")?,rows)?;
+        if let Some(d)=dump.as_deref_mut() { d.tensor(&self.native,"attention_projected","bf16",&[rows,6144],s.get("delta")?)?; }
         self.residual(s,rows)?;
-        if let Some(d)=dump { d.tensor(&self.commands,"post_attention","f32",&[rows,6144],s.get("residual")?)?; }
+        if let Some(d)=dump { d.tensor(&self.native,"post_attention","f32",&[rows,6144],s.get("residual")?)?; }
         Ok(())
     }
 }

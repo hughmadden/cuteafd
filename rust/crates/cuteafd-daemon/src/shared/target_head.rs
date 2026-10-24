@@ -101,8 +101,8 @@ mod tests {
     }
 
     /// Every family's BF16 target logits take this route (GLM 5.3, GLM 5.3 Flash, MiMo, Qwen,
-    /// DeepSeek V4, V4.1 single-GPU and split vocabulary heads), and none launches its BF16 target
-    /// head on the pedantic GEMM directly.
+    /// DeepSeek V4, MiniMax M3, V4.1 single-GPU and split vocabulary heads), and none launches its
+    /// BF16 target head on the pedantic GEMM directly.
     #[test]
     fn every_family_target_head_takes_the_shared_route() {
         let sources = [
@@ -111,6 +111,7 @@ mod tests {
             ("mimo_v2/head.rs", include_str!("../families/mimo_v2/head.rs"), "shared::target_head::launch("),
             ("qwen4/engine.rs", include_str!("../families/qwen4/engine.rs"), "shared::target_head::launch("),
             ("deepseek_v4/engine.rs", include_str!("../families/deepseek_v4/engine.rs"), "shared::target_head::launch("),
+            ("minimax_m3/head.rs", include_str!("../families/minimax_m3/head.rs"), "target_head::launch(TargetHead::configured()"),
             ("deepseek_v41/v41_target_head.rs", include_str!("../families/deepseek_v41/v41_target_head.rs"),
                 "project_target_vocabulary("),
             ("deepseek_v41/v41_target_head/distributed.rs",

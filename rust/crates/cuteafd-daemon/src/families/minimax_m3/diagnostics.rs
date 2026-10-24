@@ -1,7 +1,8 @@
 //! Opt-in program boundaries, copied only after the native stream drains.
-use super::{execution::BatchView, MiniMaxError};
+use super::{execution::BatchView, native::Native, MiniMaxError};
+use crate::shared::prefix::view;
 use anyhow::{ensure, Context, Result};
-use cuteafd_ffi::minimax::{Buffer, Commands};
+use cuteafd_ffi::CuteafdDeviceBuffer;
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 use std::{fs, io::Write, path::{Path, PathBuf}};
@@ -87,21 +88,19 @@ impl StepDump {
             "sha256":format!("{:x}", Sha256::digest(bytes))}));
         Ok(())
     }
-    pub fn tensor(&mut self, commands: &Commands<'_>, name: &str, dtype: &str,
-        shape: &[usize], source: &Buffer<'_>) -> Result<()> {
-        commands.drain()?;
+    pub fn tensor(&mut self, native: &Native<'_>, name: &str, dtype: &str,
+        shape: &[usize], source: CuteafdDeviceBuffer) -> Result<()> {
+        native.drain()?;
         let mut bytes = vec![0; extent(dtype, shape)?];
-        commands.library().cuda_set_device(commands.device())?;
-        let source=source.view(0, bytes.len())?;
-        commands.library().copy_d2h(&mut bytes, source.raw())?;
+        let source = view(source, 0, bytes.len())?;
+        native.library().copy_d2h(&mut bytes, source)?;
         self.bytes(name, dtype, shape, &bytes)
     }
-    pub fn selection(&mut self, commands: &Commands<'_>, source: &Buffer<'_>, rows: usize,
+    pub fn selection(&mut self, native: &Native<'_>, source: CuteafdDeviceBuffer, rows: usize,
         capacity: usize) -> Result<()> {
-        commands.drain()?;
+        native.drain()?;
         let mut bytes = vec![0; 4 * capacity * 16 * 4];
-        commands.library().cuda_set_device(commands.device())?;
-        commands.library().copy_d2h(&mut bytes, source.raw())?;
+        native.library().copy_d2h(&mut bytes, source)?;
         self.q2k.extend(selection_rows(&bytes, rows, capacity)?);
         Ok(())
     }
@@ -109,16 +108,15 @@ impl StepDump {
         let bytes = std::mem::take(&mut self.q2k);
         self.bytes("q2k", "i32", &[self.positions.len(), 4, 16], &bytes)
     }
-    pub fn cache_rows(&mut self, commands: &Commands<'_>, name: &str, dtype: &str,
-        shape: &[usize], source: &Buffer<'_>, slots: &[i64], page_bytes: usize,
+    pub fn cache_rows(&mut self, native: &Native<'_>, name: &str, dtype: &str,
+        shape: &[usize], source: CuteafdDeviceBuffer, slots: &[i64], page_bytes: usize,
         plane_offset: usize, row_bytes: usize) -> Result<()> {
-        commands.drain()?;
-        commands.library().cuda_set_device(commands.device())?;
+        native.drain()?;
         let mut bytes = vec![0; slots.len() * row_bytes];
         for (&slot, out) in slots.iter().zip(bytes.chunks_exact_mut(row_bytes)) {
             let slot = usize::try_from(slot)?;
             let offset = slot / 64 * page_bytes + plane_offset + slot % 64 * row_bytes;
-            commands.library().copy_d2h(out, source.view(offset, row_bytes)?.raw())?;
+            native.library().copy_d2h(out, view(source, offset, row_bytes)?)?;
         }
         self.bytes(name, dtype, shape, &bytes)
     }

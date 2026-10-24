@@ -1,12 +1,12 @@
 use super::{cache::Cache, execution::{BatchView, Execution, RequestView}, prefix::{MiniMaxPrefix, Placement},
     routed::Routed, transaction::Step, MiniMaxError};
-use crate::shared::{draft::routes::RoundRoutes, prefix::{CudaCopyEngine, PrefixArgs, Toggle},
+use crate::shared::{draft::routes::RoundRoutes, memory::device::Allocation, prefix::{view, CudaCopyEngine, PrefixArgs, Toggle},
     qwen::{Encoder, scheduler::{self, Backend}}, token_io::{DeviceLogits, TokenEmbedding}};
 use anyhow::{ensure, Context, Result};
 use cuteafd_api::openai::NativeRequest;
 use cuteafd_engine::{media::{EncodeJob, EmbeddingCache, RequestMedia},
     prefix::{PrefixCache, PrefixConfig, PrefixFamily, RefPagePool}};
-use cuteafd_ffi::{minimax::Buffer, NativeLibrary};
+use cuteafd_ffi::NativeLibrary;
 use cuteafd_loader::media::SpanExpander;
 use std::{cell::RefCell, path::Path};
 
@@ -64,8 +64,8 @@ pub(super) struct MiniMaxBackend<'e, 'a> {
     pub execution: &'e Execution<'a>,
     pub cache: &'e Cache<'a>,
     pub embedding: &'e TokenEmbedding<'a>,
-    pub token_ids: Buffer<'a>,
-    pub embedded: Buffer<'a>,
+    pub token_ids: Allocation<'a>,
+    pub embedded: Allocation<'a>,
     pub experts: RefCell<Routed<'a>>,
     pub rows: usize,
     pub vocabulary: usize,
@@ -101,7 +101,7 @@ impl<'e, 'a> MiniMaxBackend<'e, 'a> {
         }
         let library = self.cache.library;
         library.cuda_set_device(self.cache.device)?;
-        let embedded = self.embedding.embed(&tokens, self.token_ids.raw(), 1, self.embedded.raw(), self.execution.stream());
+        let embedded = self.embedding.embed(&tokens, self.token_ids.buffer, 1, self.embedded.buffer, self.execution.stream());
         let mut chunks = Vec::with_capacity(requests.len());
         for (request, (p, _)) in requests.iter().zip(sequences.iter()) {
             let mut chunk = cuteafd_engine::media::MediaChunk::default();
@@ -122,9 +122,9 @@ impl<'e, 'a> MiniMaxBackend<'e, 'a> {
             while first < chunk.indices.len() {
                 let mut end = first + 1;
                 while end < chunk.indices.len() && chunk.indices[end] == chunk.indices[end - 1] + 1 { end += 1; }
-                let destination = self.embedded.view((request.row_start + chunk.indices[first] as usize) * ROW,
+                let destination = view(self.embedded.buffer, (request.row_start + chunk.indices[first] as usize) * ROW,
                     (end - first) * ROW)?;
-                library.copy_h2d(destination.raw(), &chunk.features[first * ROW..end * ROW])?;
+                library.copy_h2d(destination, &chunk.features[first * ROW..end * ROW])?;
                 first = end;
             }
         }
@@ -133,7 +133,7 @@ impl<'e, 'a> MiniMaxBackend<'e, 'a> {
         let kind = if prefill { cuteafd_transport::ExpertV2SourceKind::Prefill }
             else { cuteafd_transport::ExpertV2SourceKind::Decode };
         let rows = logits.clone();
-        let result = self.execution.execute(&self.embedded, &batch, &self.cache.layers, &mut *self.experts.borrow_mut(), kind, logits);
+        let result = self.execution.execute(self.embedded.buffer, &batch, &self.cache.layers, &mut *self.experts.borrow_mut(), kind, logits);
         let logits = result?;
         if let (Some(trace), Some(device)) = (self.trace.borrow_mut().as_mut(), logits.as_ref()) {
             trace.record(prefill, &batch.positions[rows], &device.to_host(library)?, device.vocab)?;

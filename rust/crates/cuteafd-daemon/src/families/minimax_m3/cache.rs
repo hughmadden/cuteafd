@@ -1,8 +1,8 @@
 //! Separate E4M3 K/V planes and packed index pages, with no positional marks.
 use super::{execution::LayerCache, MiniMaxError};
-use crate::shared::prefix::PagedPlane;
+use crate::shared::{memory::device::{Allocation, Device}, prefix::PagedPlane};
 use anyhow::Result;
-use cuteafd_ffi::{minimax::Buffer, CuteafdDeviceBuffer, NativeLibrary};
+use cuteafd_ffi::{CuteafdDeviceBuffer, NativeLibrary};
 use cuteafd_loader::families::minimax_m3::cache::{self as layout, MiniMaxCacheLayout};
 use cuteafd_engine::prefix::TailCopy;
 
@@ -33,7 +33,7 @@ pub(super) struct Cache<'a> {
     pub pages: usize,
     pub context: usize,
     pub sequences: usize,
-    pub tail: Buffer<'a>,
+    pub tail: Allocation<'a>,
     pub library: &'a NativeLibrary,
     pub device: i32,
 }
@@ -49,27 +49,28 @@ impl<'a> Cache<'a> {
         let required = layout.ranks[0].page_bytes.checked_mul(pages as u64)
             .and_then(|n| n.checked_add(256)).ok_or(MiniMaxError::Overflow("cache"))?;
         if required > admitted { return Err(MiniMaxError::Invalid("cache admission").into()); }
+        let owner = Device { library, id: device };
         let mut layers = Vec::with_capacity(layout.layers);
         for _ in 0..layout.layers {
             layers.push(LayerCache {
-                key: Buffer::new(library, device, pages * KV_PAGE_BYTES)?,
-                value: Buffer::new(library, device, pages * KV_PAGE_BYTES)?,
-                index: Buffer::new(library, device, pages * INDEX_PAGE_BYTES)?,
+                key: Allocation::new(owner, pages * KV_PAGE_BYTES)?,
+                value: Allocation::new(owner, pages * KV_PAGE_BYTES)?,
+                index: Allocation::new(owner, pages * INDEX_PAGE_BYTES)?,
             });
         }
-        let tail = Buffer::new(library, device, 256)?;
-        tail.upload(&[0; 256])?;
+        let tail = Allocation::new(owner, 256)?;
+        owner.run(|| library.copy_h2d(CuteafdDeviceBuffer { bytes: 256, ..tail.buffer }, &[0; 256]))?;
         Ok(Self { layers, pages, context: layout.context as usize, sequences, tail, library, device })
     }
 
     pub fn buffers(&self) -> Vec<CuteafdDeviceBuffer> {
-        self.layers.iter().flat_map(|l| [l.key.raw(), l.value.raw(), l.index.raw()])
-            .chain([self.tail.raw()]).collect()
+        self.layers.iter().flat_map(|l| [l.key.buffer, l.value.buffer, l.index.buffer])
+            .chain([self.tail.buffer]).collect()
     }
 
     /// Every layer's planes; page `p` of the prefix cache is page `p` of each.
     pub fn planes(&self) -> impl Iterator<Item = PagedPlane> + '_ {
-        self.layers.iter().flat_map(|l| planes(l.key.raw(), l.value.raw(), l.index.raw()))
+        self.layers.iter().flat_map(|l| planes(l.key.buffer, l.value.buffer, l.index.buffer))
     }
 
     pub fn copy_rows(&self, copy: TailCopy) -> Result<()> {

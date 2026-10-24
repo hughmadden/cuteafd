@@ -50,7 +50,7 @@ impl PrefixFamily for MiniMaxPrefix<'_, '_> {
     }
     fn mark_segments(&self, _: MarkSlot) -> Vec<DeviceRange> { Vec::new() }
     fn host_tail(&self) -> Vec<DeviceRange> {
-        vec![DeviceRange { addr: self.cache.tail.raw().ptr as u64, bytes: 1 }]
+        vec![DeviceRange { addr: self.cache.tail.buffer.ptr as u64, bytes: 1 }]
     }
 }
 
@@ -58,6 +58,7 @@ impl PrefixFamily for MiniMaxPrefix<'_, '_> {
 mod tests {
     use super::*;
     use super::super::cache::{INDEX_PAGE_BYTES, KV_PAGE_BYTES};
+    use crate::shared::prefix::view;
     use cuteafd_engine::prefix::{After, PrefixCache, PrefixConfig, SnapshotKind};
     use cuteafd_hostcache::copy::StubCopyEngine;
     use cuteafd_loader::families::{minimax_m3::cache::{MiniMaxCacheLayout, RankPages}, qwen4::Qwen4KvCache};
@@ -86,7 +87,7 @@ mod tests {
                 for (plane, bytes) in [(&layer.key, KV_PAGE_BYTES), (&layer.value, KV_PAGE_BYTES), (&layer.index, INDEX_PAGE_BYTES)] {
                     for (logical, &page) in source.pages.iter().enumerate() {
                         let data: Vec<_> = (0..bytes).map(|i| ((i * 7 + logical * 13) % 251) as u8).collect();
-                        library.copy_h2d(plane.view(page as usize * bytes, bytes)?.raw(), &data)?;
+                        library.copy_h2d(view(plane.buffer, page as usize * bytes, bytes)?, &data)?;
                     }
                 }
             }
@@ -108,8 +109,8 @@ mod tests {
                     ] {
                         for (offset, bytes) in spans {
                             let (mut a, mut b) = (vec![0; bytes], vec![0; bytes]);
-                            library.copy_d2h(&mut a, plane.view(from as usize * page_bytes + offset, bytes)?.raw())?;
-                            library.copy_d2h(&mut b, plane.view(to as usize * page_bytes + offset, bytes)?.raw())?;
+                            library.copy_d2h(&mut a, view(plane.buffer, from as usize * page_bytes + offset, bytes)?)?;
+                            library.copy_d2h(&mut b, view(plane.buffer, to as usize * page_bytes + offset, bytes)?)?;
                             assert_eq!(a, b, "restored KV and index scales match cold state");
                         }
                     }
