@@ -260,6 +260,38 @@ fn derive_sites_skips_unchanged_and_reports_rejections() {
     assert!(rejection.starts_with("l3.weight (L3.attn)"), "{rejection}");
 }
 
+#[test]
+fn delta_fallback_stores_a_rejected_tensor_as_its_bf16_difference() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut rng = Rng(91);
+    let (h, k) = (32usize, 48usize);
+    let w = rng.matrix(h, k);
+    let edited = project(&w, &[rng.unit(h)], &[1.5]);
+    let full = rng.matrix(h, k);
+    let general = Matrix::new(h, k, w.data.iter().zip(&full.data).map(|(a, b)| a + 0.05 * b).collect());
+    let bytes = |m: &Matrix| m.data.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>();
+    write_safetensors(&dir.path().join("base.safetensors"), &[("a.weight", "F32", vec![h, k], bytes(&w)),
+        ("b.weight", "F32", vec![h, k], bytes(&w))]);
+    write_safetensors(&dir.path().join("variant.safetensors"), &[("a.weight", "F32", vec![h, k], bytes(&edited)),
+        ("b.weight", "F32", vec![h, k], bytes(&general))]);
+    let base = TensorSource::from_files([dir.path().join("base.safetensors")]).unwrap();
+    let variant = TensorSource::from_files([dir.path().join("variant.safetensors")]).unwrap();
+    let opts = DeriveOpts { delta_fallback: true, ..DeriveOpts::default() };
+    let site = |layer: u16, name: &str| SiteTensor { key: SiteKey { layer, kind: SiteKind::Attn }, tensor: name.into(), opts: opts.clone() };
+    let (ops, verdicts) = derive_sites(&base, &variant, &[site(1, "a.weight"), site(2, "b.weight")], 2).unwrap();
+    assert!(first_rejection(&verdicts).is_none(), "a delta is not a rejection");
+    assert_eq!(verdicts.iter().map(|v| v.delta).collect::<Vec<_>>(), [false, true]);
+    assert!(!verdicts[1].report.as_ref().unwrap().accept, "the steering verdict stays on record");
+    assert!(matches!(ops[0].1, SiteOp::Steer { k: 1, .. }));
+    let SiteOp::Delta { rows, cols, weight } = &ops[1].1 else { panic!("{:?}", ops[1].1) };
+    assert_eq!((*rows as usize, *cols as usize), (h, k));
+    for i in 0..h * k { assert_eq!(weight[i], cuteafd_core::variants::bf16_rne(general.data[i] - w.data[i])); }
+    // Without the opt-in the same tensor makes the variant unavailable.
+    let strict = SiteTensor { key: SiteKey { layer: 2, kind: SiteKind::Attn }, tensor: "b.weight".into(), opts: DeriveOpts::default() };
+    let (ops, verdicts) = derive_sites(&base, &variant, &[strict], 1).unwrap();
+    assert!(ops.is_empty() && first_rejection(&verdicts).is_some());
+}
+
 // ---- pilot fixtures (local published tensors; run with --release -- --ignored) ---------------
 // Each reads its tensor locations from environment variables and skips when they are unset.
 
