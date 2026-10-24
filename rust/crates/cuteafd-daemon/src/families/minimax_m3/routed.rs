@@ -38,13 +38,10 @@ impl<'a> Spark<'a> {
             identity=identity.checked_add(1).ok_or(MiniMaxError::Overflow("Spark wave identity"))?;
             build(identity,wave.layer as usize,wave.rows as usize,routes,wire,kind)
         });
-        let link=if spark_intake::preferred_device_exchange_available(library,IntakePreference::Probed)? {
-            SparkDeviceLink::new(library,device,world,peers,rows,TOPK,ROW,ROW,config,Some(warm),wave_build)?
-        } else {
-            tracing::info!("MiniMax Spark partials land in pinned host planes (no GPU landing)");
-            SparkDeviceLink::new_host_landed(library,device,world,peers,rows,TOPK,ROW,ROW,config,Some(warm),wave_build)?
-        };
-        Ok(Self(Rc::new(link)))
+        let host=!spark_intake::preferred_device_exchange_available(library,IntakePreference::Probed)?;
+        if host { tracing::info!("MiniMax Spark partials land in pinned host planes (no GPU landing)"); }
+        Ok(Self(Rc::new(SparkDeviceLink::new_zero_copy(library,device,world,peers,rows,TOPK,ROW,ROW,config,
+            Some(warm),wave_build,host)?)))
     }
 }
 

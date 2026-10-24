@@ -111,6 +111,9 @@ pub struct SparkDeviceLane {
     shared: Arc<Shared>,
     thread: Option<std::thread::JoinHandle<()>>,
     world: usize,
+    /// Zero-copy egress: the GPU writes a wave's wire rows here (host address,
+    /// bytes) instead of into the mailbox; every rank's send reads them in place.
+    egress: Option<(usize, usize)>,
 }
 
 /// The pinned mailbox, carried across threads as an integer.
@@ -140,6 +143,14 @@ impl Mailbox {
 
     /// The published wave's descriptor, routes and wire rows.
     fn read(&self) -> Result<(DeviceWave, Vec<ExpertProtocolV2RouteEntry>, bytes::Bytes)> {
+        let (wave, routes) = self.routes()?;
+        let wire = bytes::Bytes::copy_from_slice(
+            self.bytes_at(mailbox::wire(self.capacity, self.topk), wave.rows as usize * self.wire_row_bytes)?);
+        Ok((wave, routes, wire))
+    }
+
+    /// The published wave's descriptor and routes (its wire rows are elsewhere).
+    fn routes(&self) -> Result<(DeviceWave, Vec<ExpertProtocolV2RouteEntry>)> {
         let d = |i: usize| self.word(mailbox::DESCRIPTOR + 4 * i).load(Ordering::Relaxed);
         let wave = DeviceWave { layer: d(0), rows: d(1), kind: d(2) };
         let topk = d(3) as usize;
@@ -154,9 +165,7 @@ impl Mailbox {
             expert_id: word(ids, i),
             gate_weight: f32::from_bits(word(weights, i)),
         }).collect();
-        let wire = bytes::Bytes::copy_from_slice(
-            self.bytes_at(mailbox::wire(self.capacity, topk), rows * self.wire_row_bytes)?);
-        Ok((wave, routes, wire))
+        Ok((wave, routes))
     }
 }
 
@@ -198,6 +207,11 @@ impl SparkDeviceLane {
     /// full-capacity request, is exchanged once at setup (connections and
     /// ring sizes; its partials land in the planes before the engine runs).
     ///
+    /// With `egress`, the transport's registered egress buffer
+    /// ([`Self::egress`]) takes the wire rows: no host copy, and every rank's
+    /// request is posted at once. The lane drains a wave's sends before it
+    /// publishes the completion, after which the GPU may rewrite the buffer.
+    ///
     /// # Safety
     /// The mailbox and every landing range stay allocated until this lane is
     /// dropped. The GPU publishes wave n+1 only after it waited for wave n's
@@ -206,7 +220,7 @@ impl SparkDeviceLane {
     pub unsafe fn spawn(world: SparkWorld, peers: Vec<SocketAddr>, capacity: u32, config: TcpTransportConfig,
         landing: Vec<DeviceLanding>, cuda_device: i32, mailbox_base: usize, mailbox_bytes: usize, topk: usize,
         wire_row_bytes: usize, warm: Option<ExpertProtocolV2Request>, write: Option<Vec<crate::DeviceWriteTarget>>,
-        mut build: DeviceBuild) -> Result<Self> {
+        egress: bool, mut build: DeviceBuild) -> Result<Self> {
         ensure!(world.wire() == super::SparkWire::Canonical, "device lanes require canonical Spark wire");
         ensure!(world.topology().world_size() == peers.len(), "device lane peer count differs from declared world");
         ensure!(landing.len() == peers.len(), "a device lane needs one landing range per rank");
@@ -228,7 +242,8 @@ impl SparkDeviceLane {
             build_post_ns: AtomicU64::new(0),
             receive_ns: AtomicU64::new(0),
         });
-        let (ready_tx, ready) = std::sync::mpsc::channel::<Result<usize>>();
+        ensure!(!(egress && write.is_some()), "device lane egress needs receive mode");
+        let (ready_tx, ready) = std::sync::mpsc::channel::<Result<(usize, Option<(usize, usize)>)>>();
         let state = Arc::clone(&shared);
         // A wave whose partials do not all arrive within this fails (and resets
         // the connections) instead of leaving the stream waiting forever.
@@ -241,6 +256,9 @@ impl SparkDeviceLane {
                     Some(targets) => unsafe { transport.set_write_targets(Some(targets.clone()))? },
                     None => unsafe { transport.set_gpu_landing(Some(landing.clone()))? },
                 }
+                // Registered by every session from the warm wave's connections on.
+                let egress = egress.then(|| transport.enable_egress(capacity as usize * wire_row_bytes, false))
+                    .transpose()?;
                 let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
                 let library = crate::verbs::load_verbs_host_native_library()?;
                 library.cuda_set_device(cuda_device)?;
@@ -260,16 +278,18 @@ impl SparkDeviceLane {
                     }
                     (None, _) => {}
                 }
-                Ok((transport, runtime, library))
+                // The GPU writes the first wave once no send reads the buffer.
+                if egress.is_some() { transport.egress_target()?; }
+                Ok((transport, runtime, library, egress))
             })();
-            let (mut transport, runtime, library) = match setup {
+            let (mut transport, runtime, library, egress) = match setup {
                 Ok(setup) => setup,
                 Err(error) => {
                     let _ = ready_tx.send(Err(error));
                     return;
                 }
             };
-            let _ = ready_tx.send(Ok(transport.world_size()));
+            let _ = ready_tx.send(Ok((transport.world_size(), egress.map(|b| (b.ptr as usize, b.bytes)))));
             let row_bytes = landing.first().map_or(0, |l| l.bytes / capacity as usize);
             let written = write.is_some();
             let ready_word = mailbox.word(mailbox::READY);
@@ -333,7 +353,11 @@ impl SparkDeviceLane {
                 let result = (|| -> Result<()> {
                     ensure!(published == expected.wrapping_add(1),
                         "device wave sequence {published} skipped past {}", expected.wrapping_add(1));
-                    let (wave, routes, wire) = mailbox.read()?;
+                    let (wave, routes, wire) = if egress.is_some() {
+                        let (wave, routes) = mailbox.routes()?;
+                        let wire = transport.egress_payload(wave.rows as usize * wire_row_bytes)?;
+                        (wave, routes, wire)
+                    } else { mailbox.read()? };
                     let mut request = build(wave, routes, wire)?;
                     if written {
                         // The ranks write their rows and then this id (its low 32
@@ -371,6 +395,10 @@ impl SparkDeviceLane {
                     state.receive_ns.fetch_add((finished - posted).as_nanos() as u64, Ordering::Relaxed);
                     Ok(())
                 })();
+                // The request's egress view is gone; once its sends drain, the
+                // GPU may write the next wave there (after the completion below).
+                let result = result.and_then(|()| if egress.is_some() { transport.egress_target().map(|_| ()) }
+                    else { Ok(()) });
                 if let Err(error) = result {
                     tracing::error!("device Spark wave failed: {error:#}");
                     let mut slot = state.error.lock().unwrap_or_else(|p| p.into_inner());
@@ -390,14 +418,20 @@ impl SparkDeviceLane {
                 last = Instant::now();
             }
         })?;
-        let world = ready.recv().map_err(|_| anyhow!("device lane thread exited during setup"))??;
+        let (world, egress) = ready.recv().map_err(|_| anyhow!("device lane thread exited during setup"))??;
         LANES.lock().unwrap_or_else(|p| p.into_inner())
             .push((Arc::downgrade(&shared), mailbox.base, mailbox.bytes));
-        Ok(Self { shared, thread: Some(thread), world })
+        Ok(Self { shared, thread: Some(thread), world, egress })
     }
 
     pub fn world_size(&self) -> usize {
         self.world
+    }
+
+    /// The zero-copy egress buffer (host address, bytes) the GPU writes each
+    /// wave's wire rows into, when the lane was spawned with egress.
+    pub fn egress(&self) -> Option<(usize, usize)> {
+        self.egress
     }
 
     /// Returns the error of an earlier wave, if any (before queuing a step).
@@ -469,7 +503,7 @@ mod tests {
         let world = SparkWorld::owned(super::super::SparkTopology::NATIVE_TP3_EP1)?;
         // SAFETY: ownership wire is rejected before any device pointer is inspected.
         let result = unsafe { SparkDeviceLane::spawn(world, vec![], 1,
-            TcpTransportConfig::default(), vec![], 0, 0, 0, 6, 0, None, None,
+            TcpTransportConfig::default(), vec![], 0, 0, 0, 6, 0, None, None, false,
             Box::new(|_, _, _| panic!("refused lane must not build requests"))) };
         assert_eq!(result.err().expect("ownership lane must refuse").to_string(),
             "device lanes require canonical Spark wire");
@@ -481,7 +515,7 @@ mod tests {
         let peers = (0..6).map(|rank| ([127, 0, 0, 1], 19000 + rank).into()).collect();
         // SAFETY: the missing landing planes are rejected before the mailbox is inspected.
         let result = unsafe { SparkDeviceLane::spawn(SparkWorld::canonical(6)?, peers, 64,
-            TcpTransportConfig::default(), vec![], 0, 0, 0, 8, 4096 * 2, None, None,
+            TcpTransportConfig::default(), vec![], 0, 0, 0, 8, 4096 * 2, None, None, false,
             Box::new(|_, _, _| panic!("refused lane must not build requests"))) };
         assert_eq!(result.err().expect("missing TP6 planes must refuse").to_string(),
             "a device lane needs one landing range per rank");

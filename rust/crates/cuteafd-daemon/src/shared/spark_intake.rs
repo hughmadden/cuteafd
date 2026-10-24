@@ -1436,27 +1436,37 @@ impl<'a> SparkDeviceLink<'a> {
         let choice = choose_mode(library)?;
         ensure!(device_choice_available(&choice),
             "the device Spark exchange needs GPU landing, but the intake is {} ({})", choice.mode.name(), choice.reason);
-        Self::connect(library, device, world, peers, capacity, topk, wire_row_bytes, row_bytes, config, warm, build, false)
+        Self::connect(library, device, world, peers, capacity, topk, wire_row_bytes, row_bytes, config, warm, build,
+            false, false)
     }
 
-    /// [`Self::new`] for a GPU the NIC cannot write (no dma-buf, as on
-    /// GeForce cards): partials land in pinned, device-mapped host planes the
-    /// reducer reads in place. The stream still never drains per wave and the
-    /// inference thread never parses or copies one.
+    /// [`Self::new`] for prefill-sized waves too: the GPU writes wire rows
+    /// straight into the transport's registered egress buffer and every
+    /// rank's request goes out from it at once (no host copy). With
+    /// `host_landing` (a GPU the NIC cannot write: no dma-buf, as on GeForce
+    /// cards) the partials land in pinned, device-mapped host planes the
+    /// reducer reads in place. Either way the stream never drains per wave
+    /// and the inference thread never parses or copies one.
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn new_host_landed(library: &'a NativeLibrary, device: i32, world: cuteafd_transport::expert::SparkWorld,
+    pub(crate) fn new_zero_copy(library: &'a NativeLibrary, device: i32, world: cuteafd_transport::expert::SparkWorld,
         peers: &[std::net::SocketAddr], capacity: usize, topk: usize, wire_row_bytes: usize, row_bytes: usize,
         config: cuteafd_transport::TcpTransportConfig, warm: Option<cuteafd_transport::ExpertProtocolV2Request>,
-        build: cuteafd_transport::expert::DeviceBuild) -> Result<Self> {
-        ensure!(!written_responses(), "Spark write mode needs GPU landing");
-        Self::connect(library, device, world, peers, capacity, topk, wire_row_bytes, row_bytes, config, warm, build, true)
+        build: cuteafd_transport::expert::DeviceBuild, host_landing: bool) -> Result<Self> {
+        ensure!(!written_responses(), "Spark write mode has no zero-copy egress");
+        if !host_landing {
+            let choice = choose_mode(library)?;
+            ensure!(device_choice_available(&choice),
+                "the device Spark exchange needs GPU landing, but the intake is {} ({})", choice.mode.name(), choice.reason);
+        }
+        Self::connect(library, device, world, peers, capacity, topk, wire_row_bytes, row_bytes, config, warm, build,
+            host_landing, true)
     }
 
     #[allow(clippy::too_many_arguments)]
     fn connect(library: &'a NativeLibrary, device: i32, world: cuteafd_transport::expert::SparkWorld, peers: &[std::net::SocketAddr],
         capacity: usize, topk: usize, wire_row_bytes: usize, row_bytes: usize,
         config: cuteafd_transport::TcpTransportConfig, warm: Option<cuteafd_transport::ExpertProtocolV2Request>,
-        build: cuteafd_transport::expert::DeviceBuild, host: bool) -> Result<Self> {
+        build: cuteafd_transport::expert::DeviceBuild, host: bool, egress: bool) -> Result<Self> {
         use cuteafd_transport::expert::device_mailbox;
         library.v41_compact_reducer()?.require_plane_reduction(peers.len() as u32)?;
         let intake = SparkIntake::new(library, IntakeMode::Gpu, peers.len(),
@@ -1490,10 +1500,10 @@ impl<'a> SparkDeviceLink<'a> {
         let lane = unsafe {
             cuteafd_transport::expert::SparkDeviceLane::spawn(world, peers.to_vec(), capacity as u32,
                 config, landing, device, mailbox.buffer.ptr as usize, mailbox.buffer.bytes, topk, wire_row_bytes,
-                warm, targets, build)?
+                warm, targets, egress, build)?
         };
         tracing::info!(ranks, capacity, written = written.is_some(), landing = if host { "host" } else { "gpu" },
-            "device-driven Spark exchange ready (proxy thread posts; the stream waits and reduces)");
+            egress, "device-driven Spark exchange ready (proxy thread posts; the stream waits and reduces)");
         Ok(Self { lane, intake, mailbox, written, hosted, library, capacity, topk, wire_row_bytes, row_bytes, ranks })
     }
 
@@ -1589,12 +1599,16 @@ impl<'a> SparkDeviceLink<'a> {
         let (route_bytes, wire_bytes) = (rows * self.topk * 4, rows * self.wire_row_bytes);
         // SAFETY: the mailbox ranges hold a full-capacity wave; the caller
         // vouches for the sources and their ordering.
+        // Zero-copy egress takes the wire rows in the transport's own buffer.
+        let wire_target = match self.lane.egress() {
+            Some((ptr, bytes)) => CuteafdHostBuffer { ptr: ptr as *mut c_void, bytes, ..self.mailbox.buffer },
+            None => self.mailbox_at(m::wire(self.capacity, self.topk)),
+        };
         unsafe {
             self.library.copy_d2h_host_buffer_async(self.mailbox_at(m::ROUTES), ids, route_bytes, stream)?;
             self.library.copy_d2h_host_buffer_async(self.mailbox_at(m::weights(self.capacity, self.topk)), weights,
                 route_bytes, stream)?;
-            self.library.copy_d2h_host_buffer_async(self.mailbox_at(m::wire(self.capacity, self.topk)), wire,
-                wire_bytes, stream)?;
+            self.library.copy_d2h_host_buffer_async(wire_target, wire, wire_bytes, stream)?;
             self.library.host_signal(self.mailbox_at(m::READY).ptr.cast(), self.mailbox_at(m::SEND_STATE).ptr.cast(),
                 self.mailbox_at(m::DESCRIPTOR).ptr.cast(), [layer as u32, rows as u32, kind, self.topk as u32], stream)
         }
