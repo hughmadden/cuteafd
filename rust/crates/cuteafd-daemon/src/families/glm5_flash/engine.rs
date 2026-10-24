@@ -5370,7 +5370,9 @@ mod prefill_lane_tests {
             // and cross-warp fold, hence the numerics), the head-split KDA tile (8, 2), the
             // projection routes and the capacity thresholds are unchanged; only the launch grid
             // partitions, so a shape outside the table keeps master's (warps, 4) bitwise.
-            ("integration/cuteafd/glmf.py", 0x3d18_c625_28d5_0755_u64),
+            // Fork #150 reads each GLM Flash projection's shipped warps from
+            // `fp8_gemv_shipped_warps`; a tuning entry moves only the grid, never the warps.
+            ("integration/cuteafd/glmf.py", 0xbf4c_38b6_94dd_20e8_u64),
             // b729115b uses canonical BF16 MMA at every positive row count.
             // Hugh Madden fork #30 (TMA fences before consumer_release): fence-only change.
             // Fork #136 adds only an optional weight TMA cache policy; MMA and K order are unchanged.
@@ -5380,7 +5382,9 @@ mod prefill_lane_tests {
             // grid partition (groups, cta_tiles). The (5120, 17408) wide tile's `nc` load path
             // (16-byte read-only loads, L1 evict, ping-pong widen) runs the same MMAs in the same
             // order with the same FP32 accumulation: bitwise-equal outputs at every row count.
-            ("integration/cuteafd/_fp8_weights.py", 0x8bca_9b91_3c5f_9e49),
+            // Fork #150 keys the tables by the warps each cell was measured at and applies an
+            // entry only when it matches the caller's warps, restoring callers #146 moved.
+            ("integration/cuteafd/_fp8_weights.py", 0x95f8_a0f4_d800_3c54),
             // 5dcdd837 opts decode mHC into partial-group fusion; projection thresholds and arithmetic stay unchanged.
             ("integration/cuteafd/dsv4_mhc.py", 0x978a_179d_ef8c_2101),
             // KDAGeometry import/export and signed-byte operand registration only;

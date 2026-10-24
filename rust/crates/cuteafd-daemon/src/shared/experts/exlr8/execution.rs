@@ -50,6 +50,20 @@ impl Variant {
     fn unit_tables(self) -> bool {
         matches!(self, Self::DecodeGrouped | Self::Prefill)
     }
+    /// Scratch the kernel addresses by owned-unit slot, so its arena may shrink
+    /// from the global unit count to `unit_limit`. FC2 never does. The routed
+    /// serving core indexes FC1 by live owned-unit task but writes and reads the
+    /// activation `intermediate` at `(group * units + unit)` over all global
+    /// units, so it keeps the full stride; the grouped instances index both by
+    /// `group * unit_limit + local`. Shrinking the routed core's intermediate
+    /// let TP6 steps with 96+ groups (12-15 rows) overwrite live FC2 partials.
+    fn owned_unit_scratch(self, name: &str) -> bool {
+        match self {
+            Self::DecodeCompact => name == "fc1",
+            Self::DecodeGrouped | Self::Prefill => name != "fc2",
+            Self::SharedDecode => false,
+        }
+    }
 }
 
 fn program_names(
@@ -138,7 +152,8 @@ struct Workspace {
     units: usize,
     unit_limit: usize,
     intermediate_bytes: usize,
-    /// Unit-scaled scratch under a compact arena: every owned-unit instance.
+    /// Owned-unit instance: FC1 (and, for grouped instances, the activation
+    /// scratch) scale with `unit_limit`; see `Variant::owned_unit_scratch`.
     compact: bool,
     /// Registers `unit_count`/`unit_map` and the `unit_limit` scalar.
     unit_tables: bool,
@@ -193,7 +208,7 @@ impl Workspace {
         ensure!(!compact || (1..=units).contains(&unit_limit), "invalid compact unit limit");
         let scratch = |name: &str| -> Result<usize> {
             let bytes = scratch(name)?;
-            if compact && name != "fc2" {
+            if compact && variant.owned_unit_scratch(name) {
                 ensure!(bytes % units == 0, "compact scratch must divide by global units");
                 (bytes / units).checked_mul(unit_limit).context("compact scratch overflow")
             } else { Ok(bytes) }
@@ -637,13 +652,17 @@ mod tests {
             assert_eq!(full.ranges[4].1, 512 * 4);
             assert_eq!(full.ranges[5].1, 512 * 16 * 4);
             assert_eq!(full.ranges[0].1, rows * 6336);
-            // The routed decode core admits the same streams and owned-unit
+            // The routed decode core admits the same streams and owned-unit FC1
             // scratch as the grouped instance at the same rows, without the
-            // unit tables.
+            // unit tables; its activation scratch keeps the global unit stride
+            // its kernels address.
             let routed = Workspace::plan(&compact, rows, ExpertSet::Routed,
                 Variant::DecodeCompact, 3, Exlr8PrefillActivations::A16).unwrap();
             assert!(routed.compact && !routed.unit_tables && routed.unit_limit == 3);
-            assert_eq!((routed.ranges, routed.bytes), (owned.ranges, owned.bytes));
+            assert_eq!(routed.ranges[..9], owned.ranges[..9]);
+            assert_eq!(routed.intermediate_bytes, full.intermediate_bytes);
+            assert_eq!(routed.ranges[9].1, full.ranges[9].1);
+            assert!(routed.bytes > owned.bytes && routed.bytes < full.bytes);
         }
         for rows in [0, 65] {
             assert!(Workspace::plan(&grouped, rows, ExpertSet::Routed, Variant::DecodeGrouped,
@@ -663,6 +682,55 @@ mod tests {
         // The shared set never admits a routed decode variant.
         assert!(Workspace::plan(&compact, 64, ExpertSet::Shared,
             Variant::DecodeCompact, 3, Exlr8PrefillActivations::A16).is_err());
+    }
+
+    /// Highest byte each decode kernel addresses in FC1 and in the activation
+    /// `intermediate`, as the fork's kernels index them (475ceec6 `exlr8.py`
+    /// `Exlr8RoutedServingKernel`, `exlr8_grouped.py`): the routed core stores
+    /// FC1 by live owned-unit task (`task < live_units * 2 * splits`) but the
+    /// activation write and FC2 read use `(group * units + unit)` over all
+    /// global units; the grouped instance uses `group * unit_limit + local`.
+    fn decode_scratch_extent(variant: Variant, groups: usize, live_units: usize,
+        unit_limit: usize, last_global_unit: usize) -> (usize, usize) {
+        const TILE_F32: usize = 16 * 128 * 4;
+        const TILE_F16: usize = 16 * 128 * 2;
+        let (units, splits) = (16, 6);
+        let fc1 = live_units * 2 * splits * TILE_F32;
+        let intermediate = match variant {
+            Variant::DecodeCompact => ((groups - 1) * units + last_global_unit + 1) * TILE_F16,
+            Variant::DecodeGrouped => groups * unit_limit * TILE_F16,
+            _ => unreachable!(),
+        };
+        (fc1, intermediate)
+    }
+
+    #[test]
+    fn decode_arenas_cover_every_tp4_and_tp6_owned_unit_kernel_address() {
+        // Fails before the fix: the routed core's activation scratch was cut to
+        // three owned units at TP6, so 96+ live groups (rows 12-15 below the
+        // 16-row grouped switch) wrote over FC2 partials and the next layer's
+        // router saw a non-finite gate weight.
+        let compact = compact_spec();
+        let grouped = grouped64_spec();
+        for (world, unit_limit) in [(4usize, 4usize), (6, 3), (6, 2)] {
+            let switch = grouped_decode_from_row(unit_limit);
+            for rows in 1..=64usize {
+                let variant = if rows >= switch { Variant::DecodeGrouped } else { Variant::DecodeCompact };
+                let spec = if variant == Variant::DecodeGrouped { &grouped } else { &compact };
+                let layout = Workspace::plan(spec, 64, ExpertSet::Routed, variant, unit_limit,
+                    Exlr8PrefillActivations::A16).unwrap();
+                // Distinct experts per route: the most groups this row count makes,
+                // each owning `unit_limit` units up to the highest global unit.
+                let groups = (rows * 8).min(512);
+                let (fc1, intermediate) = decode_scratch_extent(variant, groups,
+                    groups * unit_limit, unit_limit, 15);
+                assert!(fc1 <= layout.ranges[8].1,
+                    "TP{world} u={unit_limit} rows={rows}: FC1 {fc1} > {}", layout.ranges[8].1);
+                assert!(intermediate <= layout.intermediate_bytes,
+                    "TP{world} u={unit_limit} rows={rows} {variant:?}: intermediate {intermediate} > {}",
+                    layout.intermediate_bytes);
+            }
+        }
     }
 
     #[test]
