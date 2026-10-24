@@ -100,8 +100,10 @@ fn default_effort_adds_no_line_and_unsupported_levels_fail() {
 fn thinking_off_closes_the_reasoning_prefix() {
     let encoding = encoding();
     let user = json!([{"role": "user", "content": "Hi"}]);
+    // A budget sizes thinking: with thinking off it renders no effort line.
     for extra in [json!({"reasoning_effort": "none"}), json!({"enable_thinking": false}),
-        json!({"thinking": {"type": "disabled"}}), json!({"chat_template_kwargs": {"enable_thinking": false}})] {
+        json!({"thinking": {"type": "disabled"}}), json!({"chat_template_kwargs": {"enable_thinking": false}}),
+        json!({"thinking": {"type": "disabled", "budget_tokens": 20000}})] {
         let mut body = json!({"messages": user});
         body.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
         let rendered = encoding.render(&body, &[]).unwrap();
