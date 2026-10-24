@@ -5904,3 +5904,27 @@ Engine gaps are report-only in this task. Existing GLM native trellis support
 is K4-only and EXLR8-record based; K6 standard-HF discovery, BF16 kv_b/indexer,
 head/shared-FFN execution, padded output handling, DFlash2 head borrowing and
 MTP need scheduling before claiming this checkpoint is served by cuteafd.
+
+Step 1 completed on 2026-10-24: [results and engine audit](https://github.com/tpurtell/cuteafd/issues/713),
+[draft implementation](https://github.com/tpurtell/cuteafd/pull/711), reviewed recipe
+`~/glm53-core-quant.md`. All 110 measurements are durable: K6 selected-core
+heldout projection NMSE is 5.18–66.89 times lower than the block-128 FP8 RTN
+control on the same BF16 weights. This does not compare full-model quality
+against the vendor checkpoint. K5 dense-FFN NMSE is about 3.7 times K6 for
+only 81 MiB saved across the three dense layers; recommend the original K6
+scope. Head K6/K8 and independent long-context quality remain unmeasured.
+
+All native/staged boundaries through layers 0–6, including cal-1304, were
+byte-exact. The capture attempt completed both splits, then stopped on the
+reused E4M3 pilot helper's unsupported optional codebook keyword against the
+pinned MCG codec. Scoring-only recovery uses that codec's standard MCG default,
+requires identical inputs/dependencies and unchanged capture AST, verifies
+all Hessian receipts, and retains the original immutable capture plan. Final
+63 CPU checks pass; successful attempt `1792844246867467726` exits zero.
+Results are under `pilot-v2-score/`, capture evidence under `pilot-v1/`.
+Peak CUDA allocations were 22.02 GiB for native capture and 11.52 GiB for
+scoring, host RSS 3.71 GiB. Both containers are stopped, GPU ownership is
+released, and all rolling activation frontiers are retired. Oliver's complete
+sealed BF16 source replica is now ready. Full production awaits the explicit
+recipe decision required by the brief; the source checkpoint and final K4/K6
+payload together fit the root disk with room for bounded rolling state.
