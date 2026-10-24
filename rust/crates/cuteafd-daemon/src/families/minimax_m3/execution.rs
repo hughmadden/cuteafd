@@ -153,6 +153,8 @@ pub(super) struct Execution<'a> {
     extend_rows:usize,
     table_stride:usize,
     poisoned:std::cell::Cell<bool>,
+    /// This step reads a host-placed K/V page: attention launches stage first.
+    staging:std::cell::Cell<bool>,
     diagnostics:std::cell::RefCell<Option<Diagnostics>>,
     draft:Option<super::dspark::Dspark<'a>>,
     draft_causal:bool,
@@ -192,7 +194,7 @@ impl<'a> Execution<'a> {
         commands.drain()?;
         let head=TargetHeadOwner::new(&commands,&scratch,logit_rows,cfg.vocab_size)?;
         Ok(Self{commands,head,weights,scratch,cfg:cfg.clone(),rows,logit_rows,context,decode_rows,extend_rows,table_stride,
-            poisoned:std::cell::Cell::new(false),diagnostics,draft:None,draft_causal:false})
+            poisoned:std::cell::Cell::new(false),staging:std::cell::Cell::new(false),diagnostics,draft:None,draft_causal:false})
     }
     pub fn load_draft(&mut self, contract:&cuteafd_loader::families::minimax_m3::dspark::DsparkContract,
         layout:super::dspark::Layout)->Result<()> {
@@ -256,6 +258,9 @@ impl<'a> Execution<'a> {
             self.commands.upload(self.scratch.get("positions")?,&batch.positions.iter().flat_map(|v|v.to_le_bytes()).collect::<Vec<_>>())?;
             self.commands.upload(self.scratch.get("slots")?,&batch.slots.iter().flat_map(|v|v.to_le_bytes()).collect::<Vec<_>>())?;
             let plan=self.plan_attention(batch,rows)?;
+            // Steps whose pages are all device-resident read them in place.
+            self.staging.set(caches[0].stage.as_ref().is_some_and(|stage| batch.requests.iter().any(|r|
+                r.pages[..(r.start_position+r.rows).div_ceil(64)].iter().any(|&p| p as usize>=stage.resident))));
             self.commands.widen(embedded,self.scratch.get("residual")?,rows*6144)?;
             for (layer,cache) in caches.iter().enumerate().take(last_layer+1) {
                 let mut dump=diagnostics.as_ref().filter(|d|d.layer==layer).map(|d|d.begin(batch)).transpose()?;
@@ -303,7 +308,7 @@ impl<'a> Execution<'a> {
     #[allow(clippy::too_many_arguments)]
     fn stage(&self, cache:&LayerCache<'a>, q2k:&Buffer<'a>, q2k_rows:usize, rows:usize, per_row:bool, stride:usize,
         table:&Buffer<'a>, lengths:&Buffer<'a>, table_offset:usize, pool_pages:usize) -> Result<(Buffer<'a>,usize)> {
-        let Some(stage)=&cache.stage else { return Ok((table.clone(),pool_pages)) };
+        let Some(stage)=cache.stage.as_ref().filter(|_|self.staging.get()) else { return Ok((table.clone(),pool_pages)) };
         ensure!(stage.pool_pages==pool_pages,MiniMaxError::Invalid("staged pool extent"));
         self.commands.zero(&stage.scratch)?;
         self.commands.kv_stage(KvStage{q2k_rows,rows,per_row,stride,resident:stage.resident,pool_pages,base:stage.base,
