@@ -261,7 +261,7 @@ fn parse_everywhere(options: &MiniMaxParserOptions, text: &str) -> Projection {
 }
 
 fn options(tools: Option<Vec<ToolDefinition>>) -> MiniMaxParserOptions {
-    MiniMaxParserOptions { tools, stop_sequences: Vec::new() }
+    MiniMaxParserOptions { tools, ..Default::default() }
 }
 
 #[test]
@@ -289,7 +289,8 @@ fn calls_parse_with_schema_types_at_every_split() {
             param("mode", &format!("{NS}<append>false{NS}</append>")),
             param("rows", &format!("{NS}<item>{NS}<n>1{NS}</n>{NS}</item>{NS}<item>{NS}<n>2{NS}</n>{NS}</item>"))])]));
     let projection = parse_everywhere(&options(Some(tools())), &text);
-    assert_eq!(projection, Projection { reasoning: "Two lookups.".into(), content: "Checking.\n".into(),
+    // The whitespace before a parsed call is dropped, as glm5 drops it.
+    assert_eq!(projection, Projection { reasoning: "Two lookups.".into(), content: "Checking.".into(),
         calls: vec![
             ("get_weather".into(), json!({"city": "Taipei 台北", "days": 2, "metric": true, "ratio": 0.5, "tags": ["a", "b c"],
                 "range": {"lo": 1, "hi": 9}, "either": "7", "extra": "kept as text"})),
@@ -319,7 +320,7 @@ fn undeclared_tool_or_calls_without_tools_stay_visible_text() {
     // No tools declared: the block is plain content, the parser must not invent calls.
     // With no tools the call opener ends the turn, as GLM's disabled <tool_call> does.
     let projection = parse_everywhere(&options(None), &format!("hello {text}"));
-    assert_eq!((projection.content.as_str(), projection.stop), ("hello ", Some(GlmStop::Marker(CALL_OPEN.into()))));
+    assert_eq!((projection.content.as_str(), projection.stop), ("hello", Some(GlmStop::Marker(CALL_OPEN.into()))));
     assert!(projection.calls.is_empty());
     // A name outside the declared tools is still a well-formed call with untyped text values.
     let projection = parse_everywhere(&options(Some(tools())), &block(&[invoke("unknown", &[param("n", "1")])]));
@@ -340,8 +341,6 @@ fn malformed_calls_stay_visible_and_never_become_partial_calls() {
         block(&[invoke("get_weather", &[param("city", "a"), param("city", "b")])]),
         // wrongly typed integer
         block(&[invoke("get_weather", &[param("days", "two")])]),
-        // bare text between invokes
-        format!("{CALL_OPEN}\nnoise {good}{CALL_CLOSE}"),
         // empty block
         format!("{CALL_OPEN}\n{CALL_CLOSE}"),
         // missing name
@@ -349,13 +348,45 @@ fn malformed_calls_stay_visible_and_never_become_partial_calls() {
     ] {
         let projection = parse_everywhere(&options(Some(tools())), &format!("Plan. {text}"));
         assert!(projection.calls.is_empty(), "{text:?} -> {projection:?}");
-        assert_eq!(projection.content, format!("Plan. {text}"), "{text:?}");
+        assert_eq!(projection.content, format!("Plan. {}", text.trim_end()), "{text:?}");
     }
     let mut parser = MiniMaxOutputParser::new(options(Some(tools())));
     let mut chunks = parser.push(&format!("{CALL_OPEN}\n{INVOKE_OPEN}get_wea"));
     chunks.extend(parser.finish());
     assert_eq!(parser.tool_calls(), 0);
     assert_eq!(project(&chunks, None).content, format!("{CALL_OPEN}\n{INVOKE_OPEN}get_wea"));
+}
+
+#[test]
+fn one_broken_invoke_returns_alone_as_content() {
+    let (a, b) = (invoke("get_weather", &[param("city", "a")]), invoke("get_weather", &[param("city", "b")]));
+    let bad = invoke("get_weather", &[param("city", "c"), param("days", "two")]);
+    let text = format!("Three lookups.\n{}[e~[", block(&[a, bad.clone(), b]));
+    let projection = parse_everywhere(&options(Some(tools())), &text);
+    assert_eq!(projection.calls, vec![("get_weather".into(), json!({"city": "a"})), ("get_weather".into(), json!({"city": "b"}))]);
+    assert_eq!(projection.content, format!("Three lookups.\n{}", bad.trim_end()));
+    let mut parser = MiniMaxOutputParser::new(options(Some(tools())));
+    parser.push(&text);
+    assert_eq!(parser.tool_calls(), 2);
+    // Stray text between invokes, or an invoke cut short by the next one, returns the same way.
+    let good = invoke("get_weather", &[param("city", "Oslo")]);
+    let cut = format!("{INVOKE_OPEN}get_weather\">{}", param("city", "x"));
+    for (inner, content) in [(format!("noise {good}"), "noise".to_owned()), (format!("{cut}{good}"), cut.clone())] {
+        let projection = parse_everywhere(&options(Some(tools())), &format!("{CALL_OPEN}\n{inner}{CALL_CLOSE}"));
+        assert_eq!((projection.content, projection.calls), (content, vec![("get_weather".into(), json!({"city": "Oslo"}))]));
+    }
+}
+
+#[test]
+fn content_whitespace_and_text_after_calls_follow_glm() {
+    let call = block(&[invoke("get_weather", &[param("city", "Oslo")])]);
+    // `</tool_call>\n` before EOS must not open a trailing text block beside the call.
+    for tail in ["\n", "\n[e~[", "\nDone. More text.[e~["] {
+        let projection = parse_everywhere(&options(Some(tools())), &format!("\n\nChecking.  \n{call}{tail}"));
+        assert_eq!((projection.content.as_str(), projection.calls.len()), ("Checking.", 1), "{tail:?}");
+    }
+    let projection = parse_everywhere(&options(None), "<mm:think> r </mm:think>\n  Answer with  inner  space. \n");
+    assert_eq!((projection.reasoning.as_str(), projection.content.as_str()), (" r ", "Answer with  inner  space."));
 }
 
 #[test]
@@ -384,7 +415,7 @@ fn turn_markers_and_client_stops_end_the_stream() {
         let projection = parse_everywhere(&options(None), &format!("<mm:think>r</mm:think>answer{marker}after"));
         assert_eq!((projection.content.as_str(), projection.stop), ("answer", Some(GlmStop::Marker(marker.into()))));
     }
-    let with_stop = MiniMaxParserOptions { tools: Some(tools()), stop_sequences: vec!["STOP".into()] };
+    let with_stop = MiniMaxParserOptions { tools: Some(tools()), stop_sequences: vec!["STOP".into()], ..Default::default() };
     let projection = parse_everywhere(&with_stop, "<mm:think>STOP is reasoning</mm:think>answerSTOPignored");
     assert_eq!((projection.reasoning.as_str(), projection.content.as_str(), projection.stop),
         ("STOP is reasoning", "answer", Some(GlmStop::Sequence("STOP".into()))));
@@ -560,7 +591,8 @@ mod router {
 
     #[tokio::test]
     async fn chat_dispatch_uses_own_prompt_stops_sampling_and_parsers() {
-        let text = format!("<mm:think>Look it up.</mm:think>Checking.\n{}", block(&[invoke("get_weather",
+        // The newline after the block must not reach `content`.
+        let text = format!("<mm:think>Look it up.</mm:think>Checking.\n{}\n", block(&[invoke("get_weather",
             &[param("city", "Oslo"), param("days", "2")])]));
         for streaming in [false, true] {
             let body = json!({"model": MODEL, "stream": streaming, "tools": weather_tool(), "reasoning_effort": "high",
@@ -590,7 +622,7 @@ mod router {
                     serde_json::from_str(message["tool_calls"][0]["function"]["arguments"].as_str().unwrap()).unwrap(),
                     value["choices"][0]["finish_reason"].clone())
             };
-            assert_eq!((reasoning.as_str(), content.as_str(), reason.as_str()), ("Look it up.", "Checking.\n", Some("tool_calls")));
+            assert_eq!((reasoning.as_str(), content.as_str(), reason.as_str()), ("Look it up.", "Checking.", Some("tool_calls")));
             assert_eq!(calls, json!({"city": "Oslo", "days": 2}));
         }
     }

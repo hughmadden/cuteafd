@@ -939,7 +939,7 @@ pub(crate) fn build(profile: &ModelProfile, limits: NativeLimits, headers: &axum
             let parser = minimax_m3::MiniMaxOutputParser::new(minimax_m3::MiniMaxParserOptions {
                 tools: (tools_declared && converted.conversation.tool_choice != deepseek_recipe_core::tools::ToolChoice::None)
                     .then(|| converted.conversation.tools.clone()),
-                stop_sequences: converted.parsing_options.stop_sequences.clone() });
+                stop_sequences: converted.parsing_options.stop_sequences.clone(), id: id.clone() });
             (prompt, Vec::new(), OutputProcessor::MiniMaxM3(glm5::GlmStreamProcessor::new(generator, parser)))
         }
         Some((Templated::Step5(encoding), raw, _thinking)) => {

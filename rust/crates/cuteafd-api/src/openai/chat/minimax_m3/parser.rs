@@ -1,4 +1,9 @@
 //! Hold tool blocks until closed; malformed XML stays visible, never a partial call.
+//! A closed block sends each well-formed invoke as a call and returns the rest
+//! (a broken invoke, stray text) as content; a block with no well-formed
+//! invoke, or one never closed, returns whole. Each case is logged. Visible
+//! content follows glm5: no leading whitespace, trailing whitespace only
+//! before more content, and after the first call only returned tool XML.
 use deepseek_recipe::stream::OutputChunk;
 use deepseek_recipe_core::tools::ToolDefinition;
 use serde_json::{Map, Value};
@@ -9,6 +14,8 @@ use super::super::glm5::{parser::GlmStop, processor::TextParser};
 pub struct MiniMaxParserOptions {
     pub tools: Option<Vec<ToolDefinition>>,
     pub stop_sequences: Vec<String>,
+    /// The completion id, naming the request in log lines.
+    pub id: String,
 }
 
 #[derive(Debug)]
@@ -21,17 +28,66 @@ pub struct MiniMaxOutputParser {
     block: bool,
     scanned: usize,
     calls: usize,
+    content_started: bool,
+    /// Trailing content whitespace, sent only before more content.
+    held: String,
+    /// The whitespace held before the open block, kept if the block returns as content.
+    before: String,
     stop: Option<GlmStop>,
 }
 
 impl MiniMaxOutputParser {
     pub fn new(options: MiniMaxParserOptions) -> Self {
-        Self { options, pending: String::new(), reasoning: false, block: false, scanned: 0, calls: 0, stop: None }
+        Self { options, pending: String::new(), reasoning: false, block: false, scanned: 0, calls: 0,
+            content_started: false, held: String::new(), before: String::new(), stop: None }
     }
 
-    fn emit(&self, text: String, out: &mut Vec<OutputChunk>) {
+    fn emit(&mut self, text: String, out: &mut Vec<OutputChunk>) {
         if text.is_empty() { return; }
-        out.push(if self.reasoning { OutputChunk::Reasoning { content: text } } else { OutputChunk::Raw { content: text } });
+        if self.reasoning { out.push(OutputChunk::Reasoning { content: text }); }
+        else if self.calls == 0 { self.content(&text, out); }
+    }
+
+    /// glm5's `emit_content`: leading whitespace is dropped, trailing whitespace waits for more content.
+    fn content(&mut self, text: &str, out: &mut Vec<OutputChunk>) {
+        let text = if self.content_started { text } else { text.trim_start() };
+        if text.is_empty() { return; }
+        self.content_started = true;
+        let body = text.trim_end();
+        if !body.is_empty() { out.push(OutputChunk::Raw { content: std::mem::take(&mut self.held) + body }); }
+        self.held.push_str(&text[body.len()..]);
+    }
+
+    /// A closed block: each well-formed invoke is a call, the rest returns as content.
+    fn release(&mut self, block: &str, out: &mut Vec<OutputChunk>) {
+        let tools = self.options.tools.as_deref().unwrap_or_default();
+        let parts: Vec<_> = segments(&block[CALL_OPEN.len()..block.len() - CALL_CLOSE.len()]).into_iter()
+            .map(|text| (text, invoke(text, tools))).collect();
+        let before = std::mem::take(&mut self.before);
+        if !parts.iter().any(|(_, call)| call.is_ok()) {
+            let reason = parts.iter().find_map(|(_, call)| call.as_ref().err().copied()).unwrap_or("no invoke");
+            self.lose(block, before, reason, out);
+            return;
+        }
+        for (text, call) in parts {
+            match call {
+                Ok((name, arguments)) => {
+                    out.push(OutputChunk::ToolCall { tool_name: name, arguments: arguments.to_string() });
+                    self.calls += 1;
+                }
+                Err(reason) => {
+                    tracing::warn!(id = %self.options.id, reason, text = %excerpt(text), "MiniMax tool invoke returned as content");
+                    self.content(text, out);
+                }
+            }
+        }
+    }
+
+    /// Return a whole block as content, after the whitespace that preceded it.
+    fn lose(&mut self, text: &str, before: String, reason: &str, out: &mut Vec<OutputChunk>) {
+        tracing::warn!(id = %self.options.id, reason, text = %excerpt(text), "MiniMax tool block returned as content");
+        self.held = before;
+        self.content(text, out);
     }
 
     fn drain(&mut self, final_chunk: bool) -> Vec<OutputChunk> {
@@ -42,22 +98,16 @@ impl MiniMaxOutputParser {
                 let from = self.pending.floor_char_boundary(self.scanned);
                 let Some(end) = self.pending[from..].find(CALL_CLOSE).map(|i| from + i) else {
                     if final_chunk {
-                        let text = std::mem::take(&mut self.pending);
-                        self.emit(text, &mut out);
+                        let (text, before) = (std::mem::take(&mut self.pending), std::mem::take(&mut self.before));
+                        self.lose(&text, before, "closing tag missing", &mut out);
                     }
                     self.scanned = self.pending.len().saturating_sub(CALL_CLOSE.len() - 1);
                     break;
                 };
                 self.scanned = 0;
                 let text: String = self.pending.drain(..end + CALL_CLOSE.len()).collect();
-                match parse_calls(&text[CALL_OPEN.len()..end], self.options.tools.as_deref().unwrap_or_default()) {
-                    Some(calls) => for (name, arguments) in calls {
-                        out.push(OutputChunk::ToolCall { tool_name: name, arguments: arguments.to_string() });
-                        self.calls += 1;
-                    },
-                    None => self.emit(text, &mut out),
-                }
                 self.block = false;
+                self.release(&text, &mut out);
                 continue;
             }
             let mut markers = vec![THINK_CLOSE, "[e~[", "]~b]", "]~!b["];
@@ -70,7 +120,11 @@ impl MiniMaxOutputParser {
             if let Some((index, marker)) = found {
                 let text = self.pending.drain(..index).collect();
                 self.emit(text, &mut out);
-                if marker == CALL_OPEN && self.options.tools.is_some() { self.block = true; continue; }
+                if marker == CALL_OPEN && self.options.tools.is_some() {
+                    self.before = std::mem::take(&mut self.held);
+                    self.block = true;
+                    continue;
+                }
                 self.pending.drain(..marker.len());
                 match marker.as_str() {
                     THINK_OPEN => self.reasoning = true,
@@ -111,24 +165,45 @@ fn held_prefix(text: &str, marker: &str) -> usize {
     }).unwrap_or(0)
 }
 
-fn parse_calls(mut text: &str, tools: &[ToolDefinition]) -> Option<Vec<(String, Value)>> {
-    let mut calls = Vec::new();
-    while !text.trim().is_empty() {
-        text = text.trim_start().strip_prefix(INVOKE_OPEN)?;
-        let (name, rest) = text.split_once("\">")?;
-        if name.is_empty() || name.contains(['<', '>', '"', '\n']) { return None; }
-        let end = rest.find(INVOKE_CLOSE)?;
-        let schema = tools.iter().find(|t| t.name == name).map(|t| &t.parameters).unwrap_or(&Value::Null);
-        let nodes = nodes(&rest[..end], 0)?;
-        let mut arguments = Map::new();
-        for node in nodes {
-            let value = typed(&node, &schema["properties"][&node.name], schema, 0)?;
-            if arguments.insert(node.name, value).is_some() { return None; }
-        }
-        calls.push((name.to_owned(), arguments.into()));
-        text = &rest[end + INVOKE_CLOSE.len()..];
+/// A short excerpt of model text for a log line.
+fn excerpt(text: &str) -> String {
+    match text.char_indices().nth(80) {
+        Some((cut, _)) => format!("{:?}...", &text[..cut]),
+        None => format!("{text:?}"),
     }
-    (!calls.is_empty()).then_some(calls)
+}
+
+/// A block's invokes and the text between them, each with the whitespace before it.
+fn segments(mut text: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    while !text.trim().is_empty() {
+        let start = text.len() - text.trim_start().len();
+        let end = match text[start..].strip_prefix(INVOKE_OPEN) {
+            // An invoke runs through its closing tag, or up to the next invoke.
+            Some(rest) => {
+                let close = rest.find(INVOKE_CLOSE).map_or(rest.len(), |i| i + INVOKE_CLOSE.len());
+                start + INVOKE_OPEN.len() + rest[..close].find(INVOKE_OPEN).unwrap_or(close)
+            }
+            None => text[start..].find(INVOKE_OPEN).map_or(text.len(), |i| start + i),
+        };
+        out.push(&text[..end]);
+        text = &text[end..];
+    }
+    out
+}
+
+/// One invoke typed by its tool's schema, or why it cannot be read.
+fn invoke(text: &str, tools: &[ToolDefinition]) -> Result<(String, Value), &'static str> {
+    let text = text.trim_start().strip_prefix(INVOKE_OPEN).ok_or("text between invokes")?;
+    let (name, rest) = text.strip_suffix(INVOKE_CLOSE).ok_or("closing tag missing")?.split_once("\">").ok_or("unreadable name")?;
+    if name.is_empty() || name.contains(['<', '>', '"', '\n']) { return Err("unreadable name"); }
+    let schema = tools.iter().find(|t| t.name == name).map(|t| &t.parameters).unwrap_or(&Value::Null);
+    let mut arguments = Map::new();
+    for node in nodes(rest, 0).ok_or("malformed parameters")? {
+        let value = typed(&node, &schema["properties"][&node.name], schema, 0).ok_or("a value does not fit its schema")?;
+        if arguments.insert(node.name, value).is_some() { return Err("repeated parameter"); }
+    }
+    Ok((name.to_owned(), arguments.into()))
 }
 
 struct Node<'a> { name: String, raw: &'a str, children: Vec<Node<'a>> }
