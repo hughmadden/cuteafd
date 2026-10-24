@@ -344,7 +344,8 @@ mod tests {
     /// GPU, steered by the kernel, against the published W' applied exactly
     /// (FP8 values dequantized, FP32 accumulation). Base rows stay bit-identical,
     /// the kernel matches the host reference, and the steered rows land on W'x
-    /// within the GEMM's own error plus the FP8 requantization floor.
+    /// within the GEMM's own error and the FP8 requantization floor (root sum of squares),
+    /// and along the edited direction they close at least 80% of base's gap to W'x.
     ///   CUTEAFD_NATIVE_LIB=... CUTEAFD_SNAPSHOT=<stock 1017> CUTEAFD_VARIANT_SOURCE=<overlay> \
     ///   [CUTEAFD_VARIANT_LAYERS=10,22,35] TEST --exact --ignored --nocapture
     #[test]
@@ -394,7 +395,7 @@ mod tests {
         let norm = |v: &[f32]| v.iter().map(|x| f64::from(*x).powi(2)).sum::<f64>().sqrt();
         let rel = |a: &[f32], b: &[f32]| norm(&a.iter().zip(b).map(|(x, y)| x - y).collect::<Vec<_>>()) / norm(b);
         let dot = |a: &[f32], b: &[f32]| a.iter().zip(b).map(|(x, y)| f64::from(*x) * f64::from(*y)).sum::<f64>();
-        eprintln!("alpha={alpha:.4}  layer  gemm_floor  fp8_floor  base_vs_pub  steered_vs_pub  r_component_err");
+        eprintln!("alpha={alpha:.4}  layer  gemm_floor  fp8_floor  floor_rss  base_vs_pub  steered_vs_pub  r_err_steered  r_err_base");
         for layer in layers {
             let weights = device.own(|| AttentionOutputWeights::load(&library, &catalog, layer,
                 AttentionOutputWeights::device_bytes(&library, &catalog, layer)?, 1 << 20))?;
@@ -430,7 +431,10 @@ mod tests {
             let name = format!("layers.{layer}.attn.wo_b");
             let w = cuteafd_loader::read_fp8_block32(&catalog, &name)?.dequantize();
             let w_pub = cuteafd_loader::read_fp8_block32(&source, &name)?.dequantize();
-            let mut worst = [0f64; 5];
+            // Worst row for the vector errors; the r-component errors are aggregated over rows
+            // (a row whose r-component is near zero makes a per-row relative error meaningless).
+            let mut worst = [0f64; 4];
+            let (mut r_steer, mut r_base, mut r_pub) = (0f64, 0f64, 0f64);
             for row in 0..rows {
                 let span = row * V41_HIDDEN..(row + 1) * V41_HIDDEN;
                 if mask[row] == 0 {
@@ -444,15 +448,21 @@ mod tests {
                 let (y_gpu, y_steered) = (f(&base_out[span.clone()]), f(&steered[span]));
                 let (y_host, y_pub) = (gemv(&w, &zr), gemv(&w_pub, &zr));
                 let projected: Vec<f32> = { let c = dot(&r, &y_host) as f32; y_host.iter().zip(&r).map(|(y, r)| y - alpha * r * c).collect() };
-                let (c_s, c_pub) = (dot(&r, &y_steered), dot(&r, &y_pub));
-                let row_err = [rel(&y_gpu, &y_host), rel(&projected, &y_pub), rel(&y_gpu, &y_pub), rel(&y_steered, &y_pub),
-                    (c_s - c_pub).abs() / c_pub.abs().max(1e-12)];
+                let (c_s, c_b, c_pub) = (dot(&r, &y_steered), dot(&r, &y_gpu), dot(&r, &y_pub));
+                r_steer += (c_s - c_pub).powi(2); r_base += (c_b - c_pub).powi(2); r_pub += c_pub.powi(2);
+                let row_err = [rel(&y_gpu, &y_host), rel(&projected, &y_pub), rel(&y_gpu, &y_pub), rel(&y_steered, &y_pub)];
                 for (w, e) in worst.iter_mut().zip(row_err) { *w = w.max(e); }
             }
-            eprintln!("            {layer:>5}  {:.5}     {:.5}    {:.5}      {:.5}          {:.5}", worst[0], worst[1], worst[2], worst[3], worst[4]);
-            ensure!(worst[3] <= 1.1 * (worst[0] + worst[1]) + 1e-3,
-                "layer {layer}: steered rows miss W'x ({:.5}) beyond the GEMM ({:.5}) plus FP8 ({:.5}) floors", worst[3], worst[0], worst[1]);
-            ensure!(worst[3] < 0.5 * worst[2], "layer {layer}: steering does not move the output toward W'x");
+            let floor = (worst[0].powi(2) + worst[1].powi(2)).sqrt();
+            let (r_err_steered, r_err_base) = ((r_steer / r_pub).sqrt(), (r_base / r_pub).sqrt());
+            eprintln!("            {layer:>5}  {:.5}     {:.5}    {floor:.5}    {:.5}      {:.5}          {r_err_steered:.5}        {r_err_base:.5}",
+                worst[0], worst[1], worst[2], worst[3]);
+            // The GEMM's own error (FP8 activations) and the FP8 requantization floor are independent.
+            ensure!(worst[3] <= 1.1 * floor + 1e-3,
+                "layer {layer}: steered rows miss W'x ({:.5}) beyond the GEMM and FP8 floors ({floor:.5})", worst[3]);
+            ensure!(worst[3] < worst[2], "layer {layer}: steering does not move the output toward W'x");
+            ensure!(r_err_steered <= 0.2 * r_err_base,
+                "layer {layer}: the edited direction's component stays off W'x ({r_err_steered:.4} vs base {r_err_base:.4})");
         }
         Ok(())
     }
