@@ -35,8 +35,29 @@ pub(crate) struct BackboneLaneWeights<'a> {
     placement: Option<CachePlacement>,
     split_query_b: bool,
     split_output_b: bool,
+    /// Weight-variant `wo_b` tables, one owner per GPU holding an edited layer.
+    steer: Vec<crate::families::deepseek_v41::v41_variants::V41SteerWeights<'a>>,
 }
 impl<'a> BackboneLaneWeights<'a> {
+    /// Upload the variant tables to each GPU that holds an edited layer. Call
+    /// before any lane borrows these weights.
+    pub fn install_variants(&mut self, tables: &crate::families::deepseek_v41::v41_variants::V41SteerTables) -> Result<()> {
+        ensure!(self.steer.is_empty(), "variant tables already installed");
+        let mut devices: Vec<i32> = self.layers.iter().map(|l| l.device.id).collect();
+        devices.sort_unstable(); devices.dedup();
+        for id in devices {
+            let holds = |layer: usize| self.layers.get(layer).is_some_and(|l| l.device.id == id);
+            if tables.device_bytes(holds) == 0 { continue; }
+            let device = Device { library: self.library, id };
+            let weights = device.run(|| crate::families::deepseek_v41::v41_variants::V41SteerWeights::upload(
+                self.library, id, tables, holds))?;
+            self.steer.push(weights);
+        }
+        Ok(())
+    }
+    fn steer_on(&self, device: i32) -> Option<&crate::families::deepseek_v41::v41_variants::V41SteerWeights<'a>> {
+        self.steer.iter().find(|s| s.device() == device)
+    }
     fn layer_bytes(
         library: &NativeLibrary,
         catalog: &OfficialV41Catalog,
@@ -194,7 +215,8 @@ impl crate::families::deepseek_v41::v41_sparse_attention::AttentionGraphTail for
         identity.extend(self.block.chain_graph_identity()); identity.push(usize::from(self.split_output)); identity
     }
     unsafe fn prepare(&mut self, stream: *mut std::ffi::c_void) -> Result<()> {
-        unsafe { self.projection.prepare_chain_graph(self.tokens, stream) }
+        unsafe { self.projection.prepare_chain_graph(self.tokens, stream)?; }
+        unsafe { self.block.prepare_steer(self.tokens.len(), stream) }
     }
     unsafe fn enqueue(&mut self, attention: &crate::families::deepseek_v41::v41_sparse_attention::QueuedSparseAttention,
         stream: *mut std::ffi::c_void) -> Result<()> {
@@ -638,10 +660,16 @@ impl<'w, 'a> BackboneLane<'w, 'a> {
             "backbone lane requires all 40 layers"
         );
         let first = &weights.layers[first_layer];
+        let mut block = first.hc.block(capacity as usize, sizes[0])?;
+        if let Some(steer) = weights.steer_on(first.device.id) {
+            let mut steer = crate::families::deepseek_v41::v41_variants::BlockSteer::new(weights.library, steer, capacity as usize)?;
+            if weights.split_output_b { steer.capture_every_shape(); }
+            block.install_steer(steer);
+        }
         Ok(Self {
             tp2_ffn_graphs: weights.split_output_b.then(||Tp2FfnGraphs::new(first.device)),
             weights,
-            block: first.hc.block(capacity as usize, sizes[0])?,
+            block,
             query: first.query.wave(capacity, sizes[1])?,
             tp2_query: None,
             tp2_output: None,
@@ -696,6 +724,11 @@ impl<'w, 'a> BackboneLane<'w, 'a> {
     pub fn invalidate(&mut self) {
         self.phase = Phase::Invalid;
         self.block.reset();
+    }
+    /// This pass's per-row variant indices (the batch's row order). Every pass
+    /// sets them on every lane before its first layer when variants are served.
+    pub fn set_variant_rows(&mut self, rows: &[u8]) -> Result<()> {
+        match self.block.steer_mut() { Some(steer) => steer.set_rows(rows), None => Ok(()) }
     }
     /// Start a new sequence on the GPU owning layer zero after consumers drain.
     pub fn restart(&mut self) -> Result<()> {
@@ -1118,6 +1151,8 @@ impl<'w, 'a> BackboneLane<'w, 'a> {
         let source=Device { library:self.weights.library,id:self.query.input().device_id };
         let mut dual=crate::families::deepseek_v41::v41_sparse_attention::dual::DualAttentionWave::new([source,peer],self.capacity,budgets)?;
         if self.retain_small_shapes { dual.enable_small_graph_shapes(); }
+        // Dual-head tails capture every row count: the steering node must not depend on the batch.
+        if let Some(steer)=self.block.steer_mut() { steer.capture_every_shape(); }
         source.run(|| { self.sparse=None; Ok(()) })?;
         self.dual_sparse=Some(dual);Ok(())
     }
@@ -1263,6 +1298,7 @@ mod tests {
             placement: None,
             split_query_b: false,
             split_output_b: false,
+            steer: Vec::new(),
         };
         // Native AOT variants supply scratch extents; validate budget boundaries
         // against this library instead of totals from an older export build.

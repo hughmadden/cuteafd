@@ -335,7 +335,7 @@ fn worker(
         Ok(())
     })?;
     admission::startup_phase(&lib, "v41/after native preload", device_total)?;
-    admission::admit_startup(&lib, &catalog, &args)?;
+    admission::admit_startup(&lib, &catalog, &args, None)?;
     let start = Instant::now();
     cuteafd_ffi::memory_ledger::relabel_other("v41/startup");
     admission::startup_phase(&lib, "v41/startup", device_total)?;
