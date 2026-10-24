@@ -5874,6 +5874,24 @@ Planning, packaging and qualification must use that deployment. This milestone d
 depend on integrating the Flash or V4.1 adapters. The cross-family work order
 above remains the later integration plan.
 
+Implementation is authorized through end-to-end qualification (2026-10-24).
+Reuse the existing GLM DFlash2 verifier, `PrefixCache` and pinned-RAM host tier;
+do not introduce another cache, paging system or graph-selection axis. Both
+model IDs must work through a real agent client, including a tool round trip
+and a retained second turn. Exercise device eviction, host promotion and
+cancel/park/retry, with exact state restoration and no cross-model cache hits.
+Load the published Keys snapshot from its own metadata; the staged site
+extract is a cross-check, not the source contract.
+
+Performance acceptance requires beating the best comparable four-Spark
+full-GLM base configuration on Romeo. Warmed C1 code decode is the primary
+bar, with C16 aggregate throughput and 8K prefill also checked for regressions.
+Keep the base snapshot, drafter, workload, context and numerical policy fixed;
+report both base and alternate-layer traffic and thermal/readiness/headroom
+conditions. Published raptor results are historical references, not a
+hardware-matched baseline for Romeo's Max-Q card. An implementation that only
+builds or passes correctness is not complete under this acceptance criterion.
+
 Target the staged EXL3-K4 base plus the Keys overlay, with `shared-only`
 explicit in the candidate configuration. Keep DFlash2 available and test its
 target verification. Retain Romeo's one coordinator GPU with experts placed

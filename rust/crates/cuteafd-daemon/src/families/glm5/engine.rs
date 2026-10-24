@@ -205,8 +205,8 @@ struct Workspace<'a> {
     lengths: Dev<'a>,
     attn: Dev<'a>,
     delta: Dev<'a>,
-    /// Each row's weight variant (i32), uploaded with the step's tables; steering reads it.
-    variants: Dev<'a>,
+    /// Each row's weight variant (i32), allocated only when steering is configured.
+    variants: Option<Dev<'a>>,
     positions: Dev<'a>,
     slots: Dev<'a>,
     page_table: Dev<'a>,
@@ -461,6 +461,21 @@ impl<'a> GlmEngine<'a> {
             variants: None, step_variant: Cell::new(None), golden_variant: Cell::new(0) })
     }
 
+    /// Bind immutable steering tables before allocating row workspaces or capturing graphs.
+    pub(crate) fn bind_variants(&mut self, tables: super::variants::GlmVariantTables<'a>) -> Result<()> {
+        ensure!(self.ranks() == 1 && self.context_mode.is_none() && self.context.is_none()
+            && self.layer_execution.is_none() && self.tp2.is_none() && self.native_experts.is_empty()
+            && self.native_dense.iter().all(Option::is_none)
+            && self.weights.layers.iter().all(|layer| !layer.is_native()),
+            "weight variants require one coordinator GPU without split attention, layer owners or native dense/expert execution");
+        ensure!(self.variants.is_none() && self.decode_workspace.borrow().is_none()
+            && self.lane_workspaces.borrow().is_empty() && self.graphs.borrow().is_empty()
+            && !self.graphs_warmed.get() && !self.graphs_warming.get(),
+            "weight variants must be bound once before workspaces and graphs are created");
+        self.variants = Some(tables);
+        Ok(())
+    }
+
     /// Arm after graph warmup; only explicit verify rounds record signals.
     pub(crate) fn arm_draft_probe(&self) -> Result<()> {
         let dense = self.weights.layers.iter().map(|layer| layer.dense).collect();
@@ -695,8 +710,13 @@ impl<'a> GlmEngine<'a> {
         let lengths: Vec<i32> = vec![self.cfg.index_topk as i32; t];
         let lengths_dev = self.alloc(t * 4)?;
         self.library.copy_h2d(lengths_dev.buffer, bytes_of(&lengths))?;
-        let variants = self.alloc(t * 4)?;
-        self.library.cuda_zero_bytes(variants.buffer, variants.buffer.bytes)?;
+        let variants = if self.variants.is_some() {
+            let rows = self.alloc(t * 4)?;
+            self.library.cuda_zero_bytes(rows.buffer, rows.buffer.bytes)?;
+            Some(rows)
+        } else {
+            None
+        };
         Ok(Workspace {
             rows: t,
             h: self.alloc(t * h * 2)?,
@@ -1185,7 +1205,7 @@ impl<'a> GlmEngine<'a> {
         put(&w.lengths, bytes_of(&tables.lengths))?;
         if self.variants.is_some() {
             ensure!(tables.variants.len() == tables.positions.len(), "step variants do not match its rows");
-            put(&w.variants, bytes_of(&tables.variants))?;
+            put(w.variants.as_ref().context("steering requires a row-index workspace")?, bytes_of(&tables.variants))?;
         }
         Ok(())
     }
@@ -1199,7 +1219,7 @@ impl<'a> GlmEngine<'a> {
         self.put(&w.lengths, &tables.lengths)?;
         if self.variants.is_some() {
             ensure!(tables.variants.len() == tables.positions.len(), "step variants do not match its rows");
-            self.put(&w.variants, &tables.variants)?;
+            self.put(w.variants.as_ref().context("steering requires a row-index workspace")?, &tables.variants)?;
         }
         Ok(())
     }
@@ -2047,7 +2067,8 @@ impl<'a> GlmEngine<'a> {
         let Some(tables) = &self.variants else { return Ok(()) };
         let key = cuteafd_core::variants::SiteKey { layer: u16::try_from(layer)?, kind };
         if rank != 0 || !tables.configured(key) || self.step_variant.get() == Some(0) { return Ok(()) }
-        tables.launch(key, x, rows, w.variants.buffer.ptr.cast_const(), self.stream)
+        let variants = w.variants.as_ref().context("steering requires a row-index workspace")?;
+        tables.launch(key, x, rows, variants.buffer.ptr.cast_const(), self.stream)
     }
 
     fn norm(&self, w: &Workspace<'_>, layer: &GlmLayer<'_>, weight: &str, deltas: i32, rows: Scalar) -> Result<()> {
