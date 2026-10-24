@@ -40,7 +40,8 @@ use tokio::sync::{mpsc, oneshot};
 pub(crate) async fn run(args: crate::cli::NativeServeArgs) -> Result<()> {
     // Identify the checkpoint before loading it: an unidentifiable directory fails in seconds.
     let mut profile = served_profile(args.model_id.clone(), &args.snapshot)?;
-    let Started { send, readiness, worker_thread, stats, http } = start(args, true)?;
+    let Started { send, readiness, worker_thread, stats, http, variants } = start(args, true)?;
+    profile.variants = variants;
     let Http { api, listen, snapshot, limits, http_queue_wait, console_hub } = http.expect("serving start loads the API");
     let vision_health = readiness
         .await
@@ -105,6 +106,8 @@ struct Started {
     worker_thread: std::thread::JoinHandle<()>,
     stats: Stats,
     http: Option<Http>,
+    /// Derived weight variants, as `/v1/models` lists them.
+    variants: Vec<cuteafd_core::variants::VariantRecord>,
 }
 
 /// A worker serving requests from a queue, without the HTTP API (the golden).
@@ -145,6 +148,13 @@ fn start(mut args: crate::cli::NativeServeArgs, http: bool) -> Result<Started> {
         args.memory_reservation = Some("97%".parse()?);
     }
     args.host_cache_config()?;
+    // Weight variants are derived on the CPU before any CUDA work; a refused one is left out.
+    let (plans, variants) = if args.variants.variants.is_empty() { (Vec::new(), Vec::new()) } else {
+        let served = served_profile(args.model_id.clone(), &args.snapshot)?.id;
+        let loaded = super::v41_variants::load_variants(&args.variants.indexed(&served)?, &served, &args.snapshot)?;
+        let records = loaded.iter().map(|v| v.record(&served)).collect();
+        (loaded.into_iter().map(|v| v.plan).collect::<Vec<_>>(), records)
+    };
     // The golden runs the worker without the API, so it loads no keyed policy.
     let api = if http { Some(args.api.load()?) } else { None };
     let listen = args.listen.clone();
@@ -167,7 +177,7 @@ fn start(mut args: crate::cli::NativeServeArgs, http: bool) -> Result<Started> {
         .name("v41-target-cuda".into())
         .spawn(move || {
             let mut ready = Some(ready);
-            let result = crate::shared::api::catch_scheduler_panic(|| worker(args, receive, &mut ready, worker_stats));
+            let result = crate::shared::api::catch_scheduler_panic(|| worker(args, receive, &mut ready, worker_stats, plans));
             if let Some(ready) = ready.take() {
                 let _ = ready.send(Err(result
                     .as_ref()
@@ -180,7 +190,7 @@ fn start(mut args: crate::cli::NativeServeArgs, http: bool) -> Result<Started> {
             tracing::error!(%reason, "native target worker stopped");
             cuteafd_transport::health::record_failure(reason);
         })?;
-    Ok(Started { send, readiness, worker_thread, stats, http })
+    Ok(Started { send, readiness, worker_thread, stats, http, variants })
 }
 // Reserve a supported AOT capacity once; live prefill chunks retain the user's
 // requested size. All backbone/draft workspaces and transport share this bound.
@@ -262,6 +272,7 @@ fn worker(
     mut receive: mpsc::Receiver<NativeRequest>,
     ready: &mut Option<oneshot::Sender<std::result::Result<Option<std::sync::Arc<std::sync::atomic::AtomicBool>>, String>>>,
     stats: std::sync::Arc<std::sync::Mutex<serde_json::Value>>,
+    variants: Vec<cuteafd_core::variants::VariantPlan>,
 ) -> Result<()> {
     ensure!(!args.tp2_dspark_experts || (args.rtx_gpus==2 && args.dspark),
         "--tp2-dspark-experts requires --rtx-gpus 2 and --dspark");
@@ -279,7 +290,7 @@ fn worker(
             args.tp2_query_projection = false;
             args.tp2_attention = false;
         } else {
-            return distributed::worker(args, receive, ready, stats);
+            return distributed::worker(args, receive, ready, stats, variants);
         }
     }
     // SAFETY: the configured library remains owned by this worker until all CUDA work drains.
@@ -335,16 +346,19 @@ fn worker(
         Ok(())
     })?;
     admission::startup_phase(&lib, "v41/after native preload", device_total)?;
-    admission::admit_startup(&lib, &catalog, &args)?;
+    let steer = super::v41_variants::V41SteerTables::new(&variants)?;
+    admission::admit_startup(&lib, &catalog, &args, steer.as_ref())?;
     let start = Instant::now();
     cuteafd_ffi::memory_ledger::relabel_other("v41/startup");
     admission::startup_phase(&lib, "v41/startup", device_total)?;
-    let weights = BackboneLaneWeights::load(
+    let mut weights = BackboneLaneWeights::load(
         &lib,
         &catalog,
         BackboneLaneWeights::device_bytes(&lib, &catalog)?,
         16 * 1024 * 1024,
     )?;
+    if let Some(steer) = &steer { weights.install_variants(steer)?; }
+    let weights = weights;
     let producers = CacheProducerWeights::load(
         &lib,
         &catalog,

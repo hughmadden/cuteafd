@@ -14,6 +14,7 @@ mod draft;
 mod entry;
 mod family;
 mod marks;
+mod namespace;
 mod pages;
 mod points;
 #[cfg(test)]
@@ -31,5 +32,6 @@ pub use entry::{greedy, victim, After, EntryId, Mark};
 pub use family::{BoxError, CaptureTicket, Eviction, FamilyLayout, LaggedState, MarkStore, PageOwners, PrefixFamily, RestoreCandidate,
     RestoreContext, RestoreFidelity, RestorePlan};
 pub use marks::{ArenaExhausted, MarkArena, MarkSlot};
+pub use namespace::{namespaced, NamespaceError, MAX_NAMESPACE_TAG};
 pub use pages::{Fork, FreedPage, Need, PoolExhausted, RefPagePool, TailCopy};
 pub use points::{message_boundaries, plan as plan_points, plan_media as plan_media_points, PointPlan, PointPolicy};

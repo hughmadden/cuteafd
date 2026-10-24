@@ -61,6 +61,8 @@ pub(crate) struct BackboneBlockWave<'w, 'a> {
     capacity: usize,
     tokens: Vec<u64>,
     phase: Phase,
+    /// Weight-variant steering of the `wo_b` rows; None without variants.
+    steer: Option<crate::families::deepseek_v41::v41_variants::BlockSteer<'w, 'a>>,
 }
 impl<'w, 'a> BackboneBlockWave<'w, 'a> {
     #[cfg(test)]
@@ -156,7 +158,25 @@ impl<'w, 'a> BackboneBlockWave<'w, 'a> {
             capacity,
             tokens: Vec::with_capacity(capacity),
             phase: Phase::Idle,
+            steer: None,
         }
+    }
+    /// Install this lane's variant steering (startup, before any capture).
+    pub(crate) fn install_steer(&mut self, steer: crate::families::deepseek_v41::v41_variants::BlockSteer<'w, 'a>) {
+        self.steer = Some(steer);
+    }
+    pub(crate) fn steer_mut(&mut self) -> Option<&mut crate::families::deepseek_v41::v41_variants::BlockSteer<'w, 'a>> {
+        self.steer.as_mut()
+    }
+    /// # Safety
+    /// Same as [`BlockSteer::upload`](crate::families::deepseek_v41::v41_variants::BlockSteer::upload).
+    pub(crate) unsafe fn prepare_steer(&mut self, rows: usize, stream: *mut std::ffi::c_void) -> Result<()> {
+        match &mut self.steer { Some(steer) => unsafe { steer.upload(rows, stream) }, None => Ok(()) }
+    }
+    /// Variant rows' `wo_b` steering, in place before the attention mHC post
+    /// reads it: the one site for every attention path.
+    unsafe fn steer_projected(&mut self, projected: CuteafdDeviceBuffer, rows: usize, stream: *mut std::ffi::c_void) -> Result<()> {
+        match &mut self.steer { Some(steer) => unsafe { steer.enqueue(self.layer, projected, rows, stream) }, None => Ok(()) }
     }
     /// Residual [capacity,4,5120] and incoming FP32 pre [capacity,4]. Engram
     /// contributions and dSpark tap reads precede begin_attention at the caller.
@@ -398,6 +418,7 @@ impl<'w, 'a> BackboneBlockWave<'w, 'a> {
             );
             let stream = self.attention.stream_raw();
             let enqueued = (|| -> Result<CuteafdDeviceBuffer> {
+                unsafe { self.steer_projected(output.projected, rows, stream)?; }
                 unsafe { self.attention.enqueue_finish(Some(output.projected), stream)?; }
                 // Keep the existing residual/pre buffers, but copy on the same
                 // stream after attention post and before FFN pre/mixing.
@@ -455,6 +476,7 @@ impl<'w, 'a> BackboneBlockWave<'w, 'a> {
             && !projected.ptr.is_null() && projected.bytes == rows * 10240,
             "queued block attention result differs");
         self.phase = Phase::QueuedFfn(binding, rows);
+        unsafe { self.steer_projected(projected, rows, stream)?; }
         unsafe { self.attention.enqueue_finish(Some(projected), stream)?; }
         for ((dst, src), bytes) in self.ffn.inputs().into_iter()
             .zip(self.attention.output_storage()).zip([rows * 40960, rows * 16]) {
@@ -481,7 +503,8 @@ impl<'w, 'a> BackboneBlockWave<'w, 'a> {
         self.ffn.invalidate(); self.phase = Phase::Attention(binding, rows); Ok(())
     }
     pub fn chain_graph_identity(&self) -> Vec<usize> {
-        self.attention.graph_identity().into_iter().chain(self.ffn.graph_identity()).collect()
+        self.attention.graph_identity().into_iter().chain(self.ffn.graph_identity())
+            .chain(self.steer.iter().flat_map(|steer| steer.identity(self.layer))).collect()
     }
     pub fn graph_normalized_storage(&self, rows: usize) -> CuteafdDeviceBuffer {
         self.ffn.normalized_storage(rows)

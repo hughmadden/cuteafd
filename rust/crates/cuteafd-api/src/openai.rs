@@ -125,6 +125,8 @@ pub struct ModelProfile {
     pub gateway: Option<Arc<GatewayMount>>,
     /// V4.1 thinking-history rule, chosen from the served checkpoint's lineage.
     pub v41_turns: V41Turns,
+    /// Configured weight variants (`--variant`), each served under its own model id.
+    pub variants: Vec<cuteafd_core::variants::VariantRecord>,
 }
 
 /// How the serving router mounts the gateway front ends over its engine.
@@ -149,12 +151,20 @@ impl std::fmt::Debug for GatewayMount {
 }
 
 impl ModelProfile {
+    /// The variant index a public model id selects, if it names a configured variant.
+    pub fn variant_index(&self, id: &str) -> Option<u8> {
+        self.variants.iter().find(|v| v.public_id == id).map(|v| v.index)
+    }
+    /// A variant's name (`base` for index 0), for logs and usage.
+    pub fn variant_name(&self, index: u8) -> &str {
+        self.variants.iter().find(|v| v.index == index).map_or("base", |v| v.name.as_str())
+    }
     /// A profile whose EOS ids come from `encoding`.
     pub fn new(id: impl Into<String>, encoding: ModelEncoding) -> Self {
         let eos_token_ids = encoding.eos_token_ids();
         let capabilities = MediaCapabilities { vision: matches!(encoding, ModelEncoding::DeepseekV41), audio: false };
         Self { id: id.into(), encoding, eos_token_ids, capabilities, engine_health: None, media_preparer: None, vision_health: None,
-            audio_preparer: None, audio_health: None, gateway: None, v41_turns: V41Turns::default(),
+            audio_preparer: None, audio_health: None, gateway: None, v41_turns: V41Turns::default(), variants: Vec::new(),
             literal_tokens: Arc::new(cuteafd_loader::LiteralTokens::new([
                 "<｜deepseek_image｜>", "<｜begin▁of▁sentence｜>", "<｜end▁of▁sentence｜>",
                 "<｜User｜>", "<｜Assistant｜>", "<｜System｜>", "<think>", "</think>",
@@ -291,6 +301,8 @@ pub struct NativeRequest {
     pub probe: Option<Arc<probe::Probe>>,
     pub usage: Option<crate::usage::UsageHandle>,
     pub prefix_cache_source: PrefixCacheSource,
+    /// Weight variant: 0 is base, 1..=7 a configured variant in `--variant` order.
+    pub variant: u8,
 }
 impl NativeRequest {
     /// The single encoding boundary for every family's rendered chat requests.
@@ -455,7 +467,17 @@ fn refresh_mapped_tables(value: &mut Value, reader: &cuteafd_loader::MappedTable
 }
 
 async fn models(State(state): State<NativeState>) -> Json<Value> {
-    Json(json!({"object":"list","data":[model_record(&state)]}))
+    let base = model_record(&state);
+    let mut data = vec![base.clone()];
+    data.extend(state.profile.variants.iter().map(|variant| variant_record(&base, variant)));
+    Json(json!({"object":"list","data":data}))
+}
+/// A variant's `/v1/models` record: the base record under the variant's id, plus `"variant"`.
+pub(crate) fn variant_record(base: &Value, variant: &cuteafd_core::variants::VariantRecord) -> Value {
+    let mut record = base.clone();
+    record["id"] = json!(variant.public_id);
+    record["variant"] = variant.model_field();
+    record
 }
 async fn health(State(state): State<NativeState>) -> Response {
     if let Some(reason) = state.profile.engine_health.as_ref().and_then(health::HealthWitness::reason) {
@@ -659,6 +681,8 @@ pub(crate) struct Built {
     include_usage: bool,
     id: String,
     model: String,
+    /// The weight variant the requested model id selects (0 = base).
+    variant: u8,
     /// Client stop strings (the parser ends on them; the gateway reports which).
     pub(crate) stop_sequences: Vec<String>,
     tap: Arc<Mutex<Tap>>,
@@ -833,9 +857,14 @@ pub(crate) fn build(profile: &ModelProfile, limits: NativeLimits, headers: &axum
     // lists or accepts, so every id /v1/models advertises also works here.
     // Responses echo the id the client sent, as the gateway's do.
     let requested = converted.model.clone().unwrap_or_default();
-    let model = if requested == profile.id { requested } else {
+    let (model, variant) = if requested == profile.id { (requested, 0) }
+        else if let Some(variant) = profile.variant_index(&requested) { (requested, variant) } else {
         match profile.gateway.as_ref().filter(|_| !requested.is_empty()).map(|mount| mount.models.resolve(&requested)) {
-            Some(Ok(served)) if served == profile.id => requested,
+            Some(Ok(served)) if served == profile.id => (requested, 0),
+            Some(Ok(served)) => match profile.variant_index(&served) {
+                Some(variant) => (requested, variant),
+                None => return Err(Rejection::bad(format!("model must be {}", profile.id))),
+            },
             _ => return Err(Rejection::bad(format!("model must be {}", profile.id))),
         }
     };
@@ -970,7 +999,7 @@ pub(crate) fn build(profile: &ModelProfile, limits: NativeLimits, headers: &axum
     let (prompt, literal_spans) = shield.finish(prompt, matches!(profile.encoding, ModelEncoding::DeepseekV41));
     Ok(Built { prompt, literal_spans, constraint, max_tokens, sampling, stop_token_ids, processor, validator,
         work: MediaWork { images: image_sources, media: media_sources, audio: audio_sources },
-        probe, streaming, include_usage, id, model, stop_sequences, tap })
+        probe, streaming, include_usage, id, model, variant, stop_sequences, tap })
 }
 
 /// Prepared media for one request (decoded on blocking threads).
@@ -1095,7 +1124,7 @@ impl Submitter {
     pub(crate) async fn submit(&self, profile: &ModelProfile, built: Built, usage: Option<crate::usage::UsageHandle>,
         chat_accounting: bool) -> Result<Running, Rejection> {
         let Built { prompt, literal_spans, constraint, max_tokens, sampling, stop_token_ids, processor, mut validator, work, probe,
-            streaming, include_usage, id, model, tap, .. } = built;
+            streaming, include_usage, id, model, variant, tap, .. } = built;
         let queue_started = std::time::Instant::now();
         let permit = match self.admission.reserve(self.queue.clone()).await {
             Ok(permit) => permit,
@@ -1125,6 +1154,7 @@ impl Submitter {
             events,
             probe,
             usage: usage.clone(),
+            variant,
         };
         permit.send(job);
         // Admission errors must retain their cause and HTTP status, including for
@@ -1221,7 +1251,9 @@ async fn chat(State(state): State<NativeState>, headers: axum::http::HeaderMap,
     if let Some(usage) = &usage {
         usage.details(crate::usage::Details {
             model_requested: body["model"].as_str().map(str::to_owned),
-            model_served: Some(state.profile.id.clone()),
+            // A weight variant is served under its own id (usage groups by it).
+            model_served: Some(body["model"].as_str().filter(|id| state.profile.variant_index(id).is_some())
+                .unwrap_or(&state.profile.id).to_owned()),
             stream: body["stream"].as_bool().unwrap_or(false),
             n_items: body["messages"].as_array().map(|v| v.len() as u64),
             n_tools: body["tools"].as_array().map(|v| v.len() as u64),

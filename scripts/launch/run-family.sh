@@ -77,6 +77,49 @@ done < <(grep -E '^[A-Z_0-9]+=' "$config")
 [[ -z "${SPARK_COUNT:-}" ]] || { cfg[SPARK_COUNT]="$SPARK_COUNT"; cfg_file[SPARK_COUNT]=1; }
 [[ -z "${SPARK_HOSTS:-}" ]] || { cfg[SPARK_HOSTS]="$SPARK_HOSTS"; cfg_file[SPARK_HOSTS]=1; }
 get() { printf '%s' "${cfg[$1]:-${2:-}}"; }
+# VARIANTS=<name,...> (weight variants, contract §6) into variant_args (one --variant per name)
+# and variant_mounts (a read-only mount for a path outside the namespace). $1 is the hub the
+# containers see; $2 is `mode` where the family takes VARIANT_<n>_MODE, else `nomode`.
+variant_launch_args() {
+  local hub_dir="$1" modes="$2" variant key spec variant_source variant_base variant_resolved
+  local -a variant_names
+  variant_args=() variant_mounts=()
+  # Sets variant_resolved (and the read-only mount a path outside the namespace needs).
+  variant_path() {
+    local value="$1" revision="$2" dir
+    if [[ "$value" == /* ]]; then
+      [[ -e "$value" ]] || release_die "variant path $value does not exist"
+      [[ "$value" == "$namespace_root"/* ]] || variant_mounts+=(-v "$value:$value:ro")
+      variant_resolved="$value"
+    else
+      dir="$hub_dir/models--${value//\//--}"
+      [[ -n "$revision" || ! -f "$dir/refs/main" ]] || revision="$(<"$dir/refs/main")"
+      [[ -n "$revision" && -d "$dir/snapshots/$revision" ]] || release_die "missing variant snapshot $value"
+      variant_resolved="$(readlink -f "$dir/snapshots/$revision")"
+    fi
+  }
+  IFS=, read -ra variant_names <<<"$(get VARIANTS)"
+  ((${#variant_names[@]} <= 7)) || release_die "VARIANTS names at most 7 variants"
+  for variant in "${variant_names[@]}"; do
+    [[ "$variant" =~ ^[A-Za-z0-9_-]+$ ]] || release_die "VARIANTS names must be [A-Za-z0-9_-]"
+    key="${variant^^}"; key="VARIANT_${key//-/_}"
+    variant_source="$(get "${key}_SOURCE")"
+    [[ -n "$variant_source" ]] || release_die "${key}_SOURCE is required"
+    variant_path "$variant_source" "$(get "${key}_REVISION")"
+    spec="name=$variant,source=$variant_resolved"
+    variant_base="$(get "${key}_BASE")"
+    if [[ -n "$variant_base" ]]; then
+      variant_path "${variant_base%@*}" "$([[ "$variant_base" == *@* ]] && printf '%s' "${variant_base#*@}")"
+      spec+=",base=$variant_resolved"
+    fi
+    [[ -z "$(get "${key}_ID")" ]] || spec+=",id=$(get "${key}_ID")"
+    if [[ -n "$(get "${key}_MODE")" ]]; then
+      [[ "$modes" == mode ]] || release_die "${key}_MODE: this family has no variant modes"
+      spec+=",mode=$(get "${key}_MODE")"
+    fi
+    variant_args+=(--variant "$spec")
+  done
+}
 # Refused before anything starts: a release never serves pages from a checkout.
 case "$(get CONSOLE_ASSETS off)" in
   on) [[ -n "$wip_slot" ]] || release_die "CONSOLE_ASSETS=on serves pages from a checkout and needs --wip SLOT; release images serve their compiled-in pages" ;;
@@ -284,6 +327,13 @@ SPECULATOR_MODEL_REVISION
 EOF
       ;;
     glm5)
+      # Weight variants: VARIANTS plus each named variant's own keys.
+      printf '%s\n' VARIANTS
+      local variant
+      for variant in ${cfg[VARIANTS]:+${cfg[VARIANTS]//,/ }}; do
+        variant="${variant^^}"; variant="${variant//-/_}"
+        printf 'VARIANT_%s_%s\n' "$variant" SOURCE "$variant" REVISION "$variant" BASE "$variant" ID "$variant" MODE
+      done
       cat <<'EOF'
 PREFILL_ROWS
 PREFILL_WAVES
@@ -510,6 +560,13 @@ WIP_INSTANCE
 WIP_ROOT
 EOF
   _spark_slot_keys HOST LANE_A LANE_B
+  # Weight variants: VARIANTS plus each named variant's own keys (_MODE is refused at launch).
+  printf '%s\n' VARIANTS
+  local variant
+  for variant in ${cfg[VARIANTS]:+${cfg[VARIANTS]//,/ }}; do
+    variant="${variant^^}"; variant="${variant//-/_}"
+    printf 'VARIANT_%s_%s\n' "$variant" SOURCE "$variant" REVISION "$variant" BASE "$variant" ID "$variant" MODE
+  done
 }
 vision="$(get VISION auto)"
 audio="$(get AUDIO auto)"
@@ -1421,6 +1478,10 @@ local -a args=(--vision "$VISION" --audio "$AUDIO" serve-native "${vision_args[@
 [[ -z "${COORDINATOR_GPU_BUDGET_GIB:-}" ]] || args+=(--coordinator-gpu-budget-gib "$COORDINATOR_GPU_BUDGET_GIB")
 [[ -z "${SERVED_MODEL_ID:-}" ]] || args+=(--model-id "$SERVED_MODEL_ID")
 args+=("${api_args[@]}")
+# Weight variants (VARIANTS): serve-native --variant; V4.1 has no variant modes.
+variant_args=() variant_mounts=()
+[[ -z "${VARIANTS:-}" ]] || variant_launch_args "$hf_home/hub" nomode
+args+=(${variant_args[@]+"${variant_args[@]}"})
 args+=(--http-queue-depth "${HTTP_QUEUE_DEPTH:-$CONCURRENCY}" --http-queue-wait-ms "$HTTP_QUEUE_WAIT_MS")
 [[ "$RTX_EXPERT_LAYERS" == auto ]] || args+=(--rtx-expert-layers "$RTX_EXPERT_LAYERS")
 [[ "$HOST_CACHE_BYTES" == 0 ]] || args+=(--host-cache-bytes "$HOST_CACHE_BYTES")
@@ -1451,7 +1512,7 @@ docker run -d "${RELEASE_SERVING_ARGS[@]}" --name "$coordinator" --restart no "$
   -e "CUTEAFD_V41_IMAGE_ADMISSIONS=${CUTEAFD_V41_IMAGE_ADMISSIONS:-2}" \
   "${rdma_env_args[@]}" "${bench_nonce_env_args[@]}" "${trace_args[@]}" "${graph_census_args[@]}" ${profile_args[@]+"${profile_args[@]}"} \
   "${shared_env_args[@]}" "${thermal_args[@]}" "${probe_args[@]}" \
-  "${wip_mount_args[@]}" \
+  "${wip_mount_args[@]}" ${variant_mounts[@]+"${variant_mounts[@]}"} \
   "${api_mount_args[@]}" -e "CUTEAFD_IMAGE=$COORDINATOR_DOCKER_INFERENCE" -v "$bench_dir:/run/cuteafd/bench" -v "$fidelity_cache:/run/cuteafd/fidelity" -e CUTEAFD_FIDELITY_CACHE=/run/cuteafd/fidelity \
   ${profile_wrapper_args[@]+"${profile_wrapper_args[@]}"} \
   -v "$namespace_root:$namespace_root:ro" "$COORDINATOR_DOCKER_INFERENCE" ${profile_wrapper[@]+"${profile_wrapper[@]}"} cuteafd "${args[@]}" >/dev/null
@@ -2156,6 +2217,17 @@ fi
 served_args=()
 served="$(get SERVED_MODEL_ID)"
 [[ -z "$served" ]] || served_args=(--model-id "$served")
+# VARIANTS=<name,...>: weight variants served under their own model ids (serve-glm --variant).
+# Per name, keyed by the name in upper case with - as _ (abliterated: VARIANT_ABLITERATED_*):
+# _SOURCE (a Hugging Face id under this hub, with _REVISION, or an absolute path mounted
+# read-only), _BASE (the checkpoint the edit is measured against, id[@revision] or a path;
+# default the served snapshot), _ID (default <served id>-<name>) and _MODE (glm5: ffn or shared-only).
+variant_args=()
+variant_mounts=()
+if [[ -n "$(get VARIANTS)" ]]; then
+  [[ "$family" == glm5 ]] || release_die "VARIANTS is supported for glm5 and deepseek_v41 only"
+  variant_launch_args "$hub" mode
+fi
 shared_probe_args
 shared_trace_args
 # Qwen serving defaults to qualified startup graphs; preserve explicit overrides.
@@ -3033,11 +3105,11 @@ docker run -d "${RELEASE_SERVING_ARGS[@]}" --name "$coordinator_name" --restart 
   "${bond_args[@]}" "${bench_nonce_env_args[@]}" "${tp2_env_args[@]}" "${graph_census_args[@]}" "${lane_env_args[@]}" "${thermal_args[@]}" \
   "${shared_env_args[@]:4}" -e "CUTEAFD_IMAGE=$coordinator_image" "${wip_mount_args[@]}" "${device_map_args[@]}" \
   -v "$namespace_root:$namespace_root:ro" -v "$bench_dir:/run/cuteafd/bench" -v "$fidelity_cache:/run/cuteafd/fidelity" -e CUTEAFD_FIDELITY_CACHE=/run/cuteafd/fidelity \
-  "${api_mount_args[@]}" "${chat_template_mounts[@]}" "${trace_args[@]}" "${probe_args[@]}" ${profile_args[@]+"${profile_args[@]}"} ${profile_wrapper_args[@]+"${profile_wrapper_args[@]}"} "$coordinator_image" ${profile_wrapper[@]+"${profile_wrapper[@]}"} cuteafd "${coordinator_budget_args[@]}" $serve --snapshot "$snapshot" \
+  "${api_mount_args[@]}" "${chat_template_mounts[@]}" "${trace_args[@]}" "${probe_args[@]}" ${variant_mounts[@]+"${variant_mounts[@]}"} ${profile_args[@]+"${profile_args[@]}"} ${profile_wrapper_args[@]+"${profile_wrapper_args[@]}"} "$coordinator_image" ${profile_wrapper[@]+"${profile_wrapper[@]}"} cuteafd "${coordinator_budget_args[@]}" $serve --snapshot "$snapshot" \
   --native-lib /opt/cuteafd/lib/libcuteafd_native.so "${peer_args[@]}" --listen "$addr" \
   --max-sequences "$effective_concurrency" "${context_args[@]}" \
   --max-output "$(get MAX_OUTPUT_TOKENS 4096)" "${dspark_args[@]}" \
-  "${family_args[@]}" "${draft_args[@]}" "${served_args[@]}" >/dev/null
+  "${family_args[@]}" "${draft_args[@]}" "${served_args[@]}" ${variant_args[@]+"${variant_args[@]}"} >/dev/null
 url="http://127.0.0.1:${addr##*:}"
 ready_deadline=$((SECONDS + 900))
 until curl --max-time 5 -sf "$url/health" >/dev/null; do

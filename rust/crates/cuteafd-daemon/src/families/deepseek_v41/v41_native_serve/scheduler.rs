@@ -29,7 +29,7 @@ pub(crate) fn exercise_distributed_decode<'t, 'd, 'a: 'd>(lib: &'a NativeLibrary
     let mut prefixes = PrefixCache::disabled();
     let image_keys = super::prefix::media_keys(tokens, &[])?;
     let mut request = Active { constraint: None, ticket: console::Ticket::new(id, 0, None), lease,
-        job: NativeRequest { prefix_cache_source: Default::default(), literal_spans: Vec::new(), prompt: String::new(), constraint: None, images: Vec::new(), media: Vec::new(), audio: Vec::new(), max_tokens: 4, sampling: Default::default(), stop_token_ids: Vec::new(), events, usage: None, probe: None },
+        job: NativeRequest { variant: 0, prefix_cache_source: Default::default(), literal_spans: Vec::new(), prompt: String::new(), constraint: None, images: Vec::new(), media: Vec::new(), audio: Vec::new(), max_tokens: 4, sampling: Default::default(), stop_token_ids: Vec::new(), events, usage: None, probe: None },
         decoder: cuteafd_loader::streaming_token_decoder(snapshot, false)?, anchor,
         generated: 0, buffered: 0, finished: false, cacheable: false, failed: false,
         tokens: tokens.to_vec(), image_keys, next_after_commit: None };
@@ -146,9 +146,11 @@ fn retire_request<'a, C: DraftChain<'a>>(mut request: Active<'a>, requests: &mut
         && requests.cache().request_id(request.lease).is_ok() {
         prefixes.capture_session(request.job.usage.as_ref().map(|u| u.session_id().to_owned()));
         let id = draft_id(&draft, request.id());
+        let keys = keyed(&request.image_keys, &request.tokens);
         let retained = request.next_after_commit.as_ref().context("finished request has no retained logits")
-            .and_then(|next| prefixes.retain(requests, draft.as_deref_mut(), SnapshotKind::Turn,
-                &keyed(&request.image_keys, &request.tokens), request.image_keys.spans(), next, request.lease, id));
+            .and_then(|next| Ok((next, cuteafd_engine::prefix::namespaced(&keys, request.job.variant)?)))
+            .and_then(|(next, key)| prefixes.retain(requests, draft.as_deref_mut(), SnapshotKind::Turn,
+                &key, request.image_keys.spans(), next, request.lease, id));
         if let Err(error) = retained { tracing::warn!(%error, "completed request prefix was not retained"); }
     }
     // Release both owners even if one cleanup reports an error.
@@ -365,6 +367,7 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
             }
             id = id.checked_add(1).context("request ID exhausted")?;
             let lease = requests.admit(slot, id)?;
+            requests.set_variant(lease, prepared.job.variant)?;
             let events = prepared.job.events.clone();
             let admitted = (|| -> Result<_> {
                 let admission::Prepared { job, prompt, images } = &mut prepared;
@@ -378,9 +381,12 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
                 // best snapshot restored into them; every running request already owns its
                 // own lifetime units, so this is the whole capacity check.
                 let cold = crate::shared::probe::cold(&job.probe);
+                // A variant's cached state differs from base from its first edited layer:
+                // its prefix key carries the variant (contract §5); base keys are unchanged.
+                let key = cuteafd_engine::prefix::namespaced(image_keys.tokens(), job.variant)?;
                 let draft_id = draft_id(&draft, id);
                 let lifetime = |output: usize| prompt.len().saturating_add(output);
-                let restored = match prefixes.admit(requests, draft.as_deref_mut(), lease, draft_id, image_keys.tokens(),
+                let restored = match prefixes.admit(requests, draft.as_deref_mut(), lease, draft_id, &key,
                     prompt, image_keys.spans(), lifetime(job.max_tokens), cold) {
                     Err(error) if busy_slots == 0 && super::prefix::exhausted(&error) => {
                         // Idle and short: grant the longest output that fits the pool (every
@@ -391,7 +397,7 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
                         let granted = kv_waiter.shrink_output(&mut prefixes, requested,
                             |prefixes, output| Ok::<_, anyhow::Error>(prefixes.could_fit(units(output))), |_, _| Ok(()))?
                             .ok_or(error)?;
-                        let restored = prefixes.admit(requests, draft.as_deref_mut(), lease, draft_id, image_keys.tokens(),
+                        let restored = prefixes.admit(requests, draft.as_deref_mut(), lease, draft_id, &key,
                             prompt, image_keys.spans(), lifetime(granted), cold)?;
                         if granted < requested {
                             tracing::warn!(request_id=id, prompt_tokens=prompt.len(), cached_tokens=restored.cached,
@@ -497,7 +503,8 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
                 if cached != prompt.len() && !crate::shared::probe::cold(&job.probe) {
                   prefixes.capture_session(job.usage.as_ref().map(|u| u.session_id().to_owned()));
                   let draft_request = draft_id(&draft, id);
-                  if let Err(error) = prefixes.retain(requests, draft.as_deref_mut(), SnapshotKind::Prompt, image_keys.tokens(),
+                  let key = cuteafd_engine::prefix::namespaced(image_keys.tokens(), job.variant)?;
+                  if let Err(error) = prefixes.retain(requests, draft.as_deref_mut(), SnapshotKind::Prompt, &key,
                       image_keys.spans(), &scores, lease, draft_request) {
                     tracing::warn!(%error, "prompt prefix was not retained");
                   }
