@@ -163,7 +163,7 @@ fn worker(args: &ServeArgs, receive: &mut tokio::sync::mpsc::Receiver<cuteafd_ap
         let free = available()?;
         let text = admission::solve(&checkpoint, &manifest, local_package.as_ref(), admission::Request {
             sizing, available: free, requested_pool: None, kv_format: args.kv_cache, onboard,
-            spark_budget: args.spark_budget_bytes, headroom, draft_bytes,
+            spark_budget: args.spark_budget_bytes, spark_vision_bytes: 0, headroom, draft_bytes,
             host_embedding: args.token_io.embed_placement == EmbedPlacement::Host })?;
         let vision_bytes = ReadyVision::local_bytes(&args.snapshot, &args.native_lib)?;
         let cache_target = args.pool_tokens.filter(|n| *n > 0).unwrap_or(262_144)
@@ -179,10 +179,10 @@ fn worker(args: &ServeArgs, receive: &mut tokio::sync::mpsc::Receiver<cuteafd_ap
         text.readmit(&cfg, sizing, available, args.pool_tokens, args.kv_cache)?;
         text
     } else {
-        let remote_reserve = vision.as_ref().map_or(0, |v| v.spark_reserve_bytes);
         admission::solve(&checkpoint, &manifest, local_package.as_ref(), admission::Request {
             sizing, available, requested_pool: args.pool_tokens, kv_format: args.kv_cache, onboard,
-            spark_budget: args.spark_budget_bytes.saturating_sub(remote_reserve), headroom, draft_bytes,
+            spark_budget: args.spark_budget_bytes, spark_vision_bytes: vision.as_ref().map_or(0, |v| v.spark_reserve_bytes),
+            headroom, draft_bytes,
             host_embedding: args.token_io.embed_placement == EmbedPlacement::Host })?
     };
     let mut catalog = cuteafd_loader::read_expert_catalog(&args.snapshot)?;
