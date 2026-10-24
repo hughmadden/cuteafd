@@ -3,7 +3,7 @@ use super::MiniMaxError;
 use anyhow::{Context, Result};
 use cuteafd_api::openai::{media::MediaPreparer, NativeRequest};
 use cuteafd_engine::media::{EncodeJob, MediaKeys, RequestMedia};
-use cuteafd_loader::{media::{ImageFamily, ProcessorConfig, SpanExpander}, plan::MediaMode};
+use cuteafd_loader::{media::{ImageFamily, ProcessorConfig, SpanExpander, minimax::{ENCODER_TOKENS, MAX_SEGMENT_FRAMES}}, plan::MediaMode};
 use crate::shared::{prefix::PrefixArgs, qwen::{Encoder, scheduler::Prompt}, vision::{TowerSpec, EncoderService}};
 use std::{path::Path, sync::Arc};
 
@@ -33,7 +33,7 @@ impl RemoteVision {
 }
 impl ReadyVision {
     pub fn local_bytes(snapshot: &Path, native: &Path) -> Result<u64> {
-        let spec = TowerSpec::minimax(snapshot, 4096)?;
+        let spec = TowerSpec::minimax(snapshot, ENCODER_TOKENS)?;
         Ok(cuteafd_ffi::vision::NativeVision::required(native, &spec.native)?.total_bytes())
     }
     pub fn load(snapshot: &Path, native: &Path, library: &cuteafd_ffi::NativeLibrary, device: i32,
@@ -46,7 +46,7 @@ impl ReadyVision {
             if !matches!(mode, MediaMode::Auto | MediaMode::Spark(_)) {
                 return Err(MiniMaxError::Invalid("remote encoder placement").into());
             }
-            let spec = TowerSpec::minimax(snapshot, 4096)?;
+            let spec = TowerSpec::minimax(snapshot, ENCODER_TOKENS)?;
             let spark_reserve_bytes = spec.native.weight_bytes.checked_add(762_383_616 + (1 << 30))
                 .context("MiniMax remote vision reservation overflow")?;
             let processor = ProcessorConfig::from_snapshot(snapshot, ImageFamily::Minimax)?;
@@ -54,7 +54,7 @@ impl ReadyVision {
             let id = spec.encoder_id(&remote.revision, 121);
             let preparer = Arc::new(MediaPreparer::for_loaded_encoder(processor.clone(), id, 4)?);
             let expected = crate::shared::vision::remote::EncoderHandshake { encoder_id: id,
-                max_patches: 4096 * processor.merge.pow(2), output_width: 6144,
+                max_patches: ENCODER_TOKENS as u32 * processor.merge.pow(2), output_width: 6144,
                 patch_size: processor.patch, merge_size: processor.merge, plan_hash: remote.hash };
             let encoder = Encoder::Remote(crate::shared::vision::remote::RemoteEncoder::connect_minimax(remote.peers,
                 expected, std::time::Duration::from_secs(60))?);
@@ -64,7 +64,7 @@ impl ReadyVision {
             && mode != MediaMode::Rtx(Some(device as usize)) {
             return Err(MiniMaxError::Unsupported("vision must use the admitted coordinator GPU").into());
         }
-        let spec = TowerSpec::minimax(snapshot, 4096)?;
+        let spec = TowerSpec::minimax(snapshot, ENCODER_TOKENS)?;
         let processor = ProcessorConfig::from_snapshot(snapshot, ImageFamily::Minimax)?;
         let (prefix, cache_bytes) = prefix.with_media_headroom(requested_cache)?;
         let revision = snapshot.file_name().and_then(|n| n.to_str()).context("MiniMax snapshot revision")?;
@@ -80,7 +80,7 @@ impl ReadyVision {
             &[cuteafd_core::serving_capacity::MemoryReservation {
                 name: "minimax.vision".into(), bytes: ledger.total_bytes() }])?;
         let service = EncoderService::start(spec, native.to_path_buf(), device, ledger.total_bytes())?;
-        let encoder = Encoder::Local(crate::shared::vision::local::LocalEncoder::new(service, &processor, 6144, 4096));
+        let encoder = Encoder::Local(crate::shared::vision::local::LocalEncoder::new(service, &processor, 6144, ENCODER_TOKENS));
         Ok((Some(Self { encoder, preparer, cache_bytes, spark_reserve_bytes: 0 }), prefix))
     }
 }
@@ -116,7 +116,8 @@ pub(super) fn prepare(job: NativeRequest, tokens: Vec<u32>, expander: Option<&Sp
     let mut cursor = 0;
     for segment in &job.videos {
         let markers = expander.context("video requires the bundled encoder")?;
-        if segment.grid.t == 0 || segment.grid.t > 2 || segment.grid.h == 0 || segment.grid.w == 0
+        if segment.grid.t == 0 || segment.grid.t as usize > MAX_SEGMENT_FRAMES / 2
+            || segment.grid.h == 0 || segment.grid.w == 0
             || segment.grid.h % 2 != 0 || segment.grid.w % 2 != 0 {
             return Err(MiniMaxError::Invalid("video segment grid").into());
         }

@@ -5633,19 +5633,28 @@ MiniMax-specific protocol; existing image/audio wire formats are unchanged.
 The pinned release's executable image processor uses smart resize at a 672²
 pixel cap, Torch uint8 antialiased bicubic and fused CLIP normalization. Its
 legacy pinpoint/tiling fields are inactive. Images repeat the temporal sample;
-video segments group at most four frames and repeat an odd final frame. Frame
-sampling is disabled by default; the optional sampling helper pins the compatible
-Transformers implementation because the checkpoint does not pin that dependency
-consistently. Processor hashes participate in preprocessing identity.
+video segments group at most eight frames (the vendor tower's four temporal
+patches, temporal positions restarting per segment) and repeat an odd final frame. By
+default videos follow MiniMax's serving processor (sglang `minimax_m3_vl.py`): frames
+scale so the longer side is at most 756 with both sides rounded up to 28, and encoded
+videos sample at constant `1/fps` intervals (1 fps) that always keep the last frame;
+frame lists are taken as already sampled. The bundled processor's uniform sampler and
+602,112-pixel smart resize remain available through explicit `do_sample_frames` and
+`do_resize`; the sampler pins the compatible Transformers implementation because the
+checkpoint does not pin that dependency consistently. Processor hashes participate
+in preprocessing identity.
 
-Video options are `source_fps`, `do_sample_frames` (false), `num_frames` or
-`fps`, and `do_resize` (false). Defaults retain every frame and require dimensions
-aligned to 28, matching the bundled processor. URLs use the existing fetch policy;
+Video options are `source_fps`, `do_sample_frames`, `num_frames` or `fps`, and
+`do_resize`; `false` keeps every frame or the source size (aligned to 28). Timestamps
+come from the sampled source indices. URLs use the existing fetch policy;
 CPU ffmpeg/ffprobe decode bounded files, while frame arrays need no video decoder.
-Video admission bounds source frames to 768, decoded video bytes to 64 MiB, each segment
-to the loaded encoder capacity, and all video features to 57,600 tokens. Sampling
-does not bypass source decode limits. Media count-token/probe overrides remain
-unsupported. Image start/end wrapping happens after literal shielding. Video
+ffprobe counts the frames the decoder emits (packets no edit list discards, as
+torchcodec's exact scan does); ffmpeg then selects the sampled frames, converts them to
+RGB and scales them (bicubic B=0, C=0.5: torch's antialiased Keys cubic) inside the
+decoder, so the decoded budget covers kept frames only. Video admission bounds
+sampled frames to 768, decoded video bytes to 64 MiB, each segment to the loaded
+encoder capacity, and all video features to 57,600 tokens. Media count-token/probe
+overrides remain unsupported. Image start/end wrapping happens after literal shielding. Video
 placeholders preserve sampled timestamps and each pair's own delimiters; separated
 spans share a complete segment embedding with explicit row offsets.
 

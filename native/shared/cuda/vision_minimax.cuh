@@ -107,7 +107,7 @@ int minimax_patch_gemm(Owner* o,int rows,const float* x,float* y) {
 int encode_minimax(Owner* o,const uint8_t* rgb,uint64_t rgb_bytes,const float* lut,int gt,int gh,int gw,
   bool still,uint16_t* output,uint64_t output_bytes,cuteafd_vision_observer cb,void* ctx) {
   const auto& s=o->spec;
-  if(!o->uploaded || !rgb || !lut || !output || gt<1 || gt>2 || gh<2 || gw<2 || gh%2 || gw%2 ||
+  if(!o->uploaded || !rgb || !lut || !output || gt<1 || gt>4 || gh<2 || gw<2 || gh%2 || gw%2 ||
      (still && gt!=1))return cudaErrorInvalidValue;
   int64_t count=int64_t(gt)*gh*gw;
   if(count>int64_t(s.max_tokens)*4 || rgb_bytes!=uint64_t(count)*14*14*3*(still?1:2) ||

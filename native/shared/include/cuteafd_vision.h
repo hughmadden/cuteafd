@@ -58,7 +58,7 @@ int32_t cuteafd_vision_encode(void* owner, const uint8_t* rgb, uint64_t rgb_byte
                              const float* lut, int32_t grid_h, int32_t grid_w,
                              uint16_t* output, uint64_t output_bytes,
                              cuteafd_vision_observer observer, void* observer_context);
-/* ABI 3 MiniMax: RGB8 contains 2*grid_t contiguous frames (at most four).
+/* ABI 3 MiniMax: RGB8 contains 2*grid_t contiguous frames (at most eight).
  * The coordinator repeats the final frame for an odd frame count. */
 int32_t cuteafd_vision_encode_frames(void* owner, const uint8_t* rgb, uint64_t rgb_bytes,
                                     const float* lut, int32_t grid_t, int32_t grid_h, int32_t grid_w,

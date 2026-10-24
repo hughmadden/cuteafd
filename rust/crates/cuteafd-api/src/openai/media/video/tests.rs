@@ -26,7 +26,8 @@ fn extraction_normalizes_shapes_defaults_and_top_level_options() {
         json!({"type":"input_video", "frames":[FRAMES[0]]})] {
         let source = sources(part).remove(0);
         assert_eq!(source.frames, [FRAMES[0]]);
-        assert!(!source.sample && !source.resize);
+        assert!(source.sample.is_none() && source.resize.is_none());
+        assert_eq!(source.sizing(), VideoResize::Vendor);
         assert!(source.count.is_none() && source.source_fps.is_none() && source.fps.is_none());
     }
     for value in [json!("https://example.com/a.mp4"), json!({"url":"https://example.com/a.mp4"})] {
@@ -34,7 +35,8 @@ fn extraction_normalizes_shapes_defaults_and_top_level_options() {
             "source_fps":24, "num_frames":3, "do_resize":true}));
         let source = take_sources(&mut request).unwrap().remove(0);
         assert_eq!(source.url.as_deref(), Some("https://example.com/a.mp4"));
-        assert_eq!((source.sample, source.resize, source.count, source.source_fps), (true, true, Some(3), Some(24.0)));
+        assert_eq!((source.sample, source.resize, source.count, source.source_fps), (Some(true), Some(true), Some(3), Some(24.0)));
+        assert_eq!(source.sizing(), VideoResize::Smart);
         assert_eq!(request["messages"][0]["content"][0], json!({"type":"text", "text":"]<]video[>["}));
     }
 }
@@ -59,20 +61,26 @@ fn extraction_rejects_malformed_sources_options_and_request_counts() {
 }
 
 #[test]
-fn defaults_keep_all_frames_segment_four_and_repeat_the_odd_tail() {
-    let source = sources(json!({"type":"video", "frames":&FRAMES[..5], "num_frames":1}));
+fn defaults_keep_all_frames_segment_eight_and_repeat_the_odd_tail() {
+    let frames = [&FRAMES[..], &FRAMES[..3]].concat();
+    let source = sources(json!({"type":"video", "frames":frames, "num_frames":1}));
     let prepared = preparer().prepare_videos(&source).unwrap();
     let segments = &prepared[0].segments;
     assert_eq!(segments.len(), 2);
-    assert_eq!((segments[0].source_frames, segments[0].grid.t, segments[0].tokens), (4, 2, 2));
-    assert_eq!((segments[1].source_frames, segments[1].grid.t, segments[1].tokens), (1, 1, 1));
-    for (index, frame) in segments[0].rgb8.chunks_exact(28*28*3).enumerate() {
-        assert!(frame.iter().all(|&p| p == index as u8));
+    assert_eq!((segments[0].source_frames, segments[0].grid.t, segments[0].tokens), (8, 4, 4));
+    assert_eq!((segments[1].source_frames, segments[1].grid.t, segments[1].tokens), (3, 2, 2));
+    let rgb = segments.iter().flat_map(|segment| segment.rgb8.chunks_exact(28*28*3)).collect::<Vec<_>>();
+    assert_eq!(rgb.len(), 12);
+    for (frame, value) in rgb.into_iter().zip([0, 1, 2, 3, 4, 5, 6, 7, 0, 1, 2, 2]) {
+        assert!(frame.iter().all(|&p| p == value));
     }
-    assert!(segments[1].rgb8.iter().all(|&p| p == 4));
-    assert_eq!(segments[1].rgb8.len(), 2*28*28*3);
-    assert_eq!(prepared[0].placeholder.matches("]<]video[>[").count(), 3);
+    assert_eq!(prepared[0].placeholder.matches("]<]video[>[").count(), 6);
     assert!(!prepared[0].placeholder.contains("seconds"));
+    // Each temporal patch keeps its first frame's source time across the segment split.
+    let timed = preparer().prepare_videos(&sources(json!({"type":"video", "frames":frames, "source_fps":2}))).unwrap();
+    let expected = ["0.0", "1.0", "2.0", "3.0", "4.0", "5.0"].map(|time| format!(
+        "]<]{time} seconds[>[]<]start of image[>[]<]video[>[]<]end of image[>[")).concat();
+    assert_eq!(timed[0].placeholder, expected);
 }
 
 #[test]
@@ -105,8 +113,9 @@ fn decoded_prepared_encoded_and_encoder_limits_apply_to_video() {
     assert!(p.prepare_videos(&source).is_err());
     let mut p = preparer(); p.limits.encoded_bytes = 1;
     assert!(p.prepare_videos(&source).is_err());
+    // The image detail cap does not bound video segments; the tower's capacity does.
     let mut p = preparer(); p.config.max_image_tokens = 1;
-    assert!(p.prepare_videos(&source).unwrap_err().to_string().contains("token capacity"));
+    assert_eq!(p.prepare_videos(&source).unwrap()[0].segments[0].tokens, 3);
     let mut p = preparer(); p.limits.decoded_bytes = 3*28*28*3;
     let source = sources(json!({"type":"video", "frames":[FRAMES[0]]}));
     assert!(p.prepare_videos(&[source[0].clone(), source[0].clone()]).is_err());

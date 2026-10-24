@@ -6,12 +6,25 @@ use std::{path::Path, sync::Arc};
 
 pub const IMAGE_TOKEN: u32 = 200_025;
 pub const VIDEO_TOKEN: u32 = 200_026;
-pub const MAX_SEGMENT_FRAMES: usize = 4;
+/// sglang `_apply_max_frames_limit` splits `grid_t` into runs of `vision_segment_max_frames`
+/// (4) temporal patches, each its own attention segment with positions 0..t: 8 frames.
+pub const MAX_SEGMENT_FRAMES: usize = 8;
+/// Token capacity of the loaded tower (16,384 patches of scratch); one video segment
+/// must fit it whatever the image detail cap is.
+pub const ENCODER_TOKENS: usize = 4096;
 /// Compatible framework source for inherited sampling; the checkpoint does not pin it.
 pub const SAMPLING_REFERENCE: (&str, &str) = (
     "transformers/v4.57.1/src/transformers/video_processing_utils.py",
     "067dc959fe800d5a5a5ab39c54b53817a4b59424f31436767d7361c20b3ba409",
 );
+/// MiniMax's serving processor, the source of the default video sampling and sizing.
+pub const SERVING_REFERENCE: (&str, &str) = (
+    "sglang/python/sglang/srt/multimodal/processors/minimax_m3_vl.py",
+    "8e1f9b30d5cc845ec8c016719ebd68921b50dfe4b30e7d514d97ff4967079499",
+);
+/// The serving default rate; its frame cap is `isqrt(max_pixels)` floored to 28.
+pub const VIDEO_FPS: f64 = 1.0;
+const VIDEO_SIDE: u32 = 756;
 pub const PROCESSOR_SOURCES: [(&str, &str); 3] = [
     ("image_processor.py", "8218f98634c365608a98ea887bfebac37131ec2acdb8445188350490de7cf994"),
     ("video_processor.py", "ced0f8d85d73f8722fecb26033d2d91ecf4a4e5112c91ce1b1522ca7edd0943d"),
@@ -49,6 +62,30 @@ pub(super) fn resize_shape(height: u32, width: u32, factor: u32, min: u64, max: 
     Ok((rh as u32, rw as u32))
 }
 
+/// Video frame sizing: the serving default, the bundled processor's smart resize
+/// (`do_resize`) or none (`do_resize: false`; dimensions must already align to 28).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VideoResize { Vendor, Smart, Off }
+impl VideoResize {
+    pub fn shape(self, height: u32, width: u32) -> Result<(u32, u32)> {
+        match self {
+            // sglang `get_hw_multiple_of` with an integer cap: scale the longer side down
+            // to 756, round each side half to even, then up to 28; smaller frames only align.
+            Self::Vendor => {
+                if height == 0 || width == 0 { return Err(invalid("video dimensions must be positive")); }
+                let longer = height.max(width);
+                let ratio = if longer > VIDEO_SIDE { f64::from(VIDEO_SIDE) / f64::from(longer) } else { 1.0 };
+                let side = |n: u32| ((f64::from(n) * ratio).round_ties_even() as u32).div_ceil(28) * 28;
+                let (h, w) = (side(height), side(width));
+                if h == 0 || w == 0 { return Err(invalid("video aspect ratio leaves no merged patch")); }
+                Ok((h, w))
+            }
+            Self::Smart => resize_shape(height, width, 28, 3136, 602_112),
+            Self::Off => Ok((height, width)),
+        }
+    }
+}
+
 /// Resolve image delimiters from the bundled tokenizer, as MiniMaxVLProcessor does.
 pub fn span_expander(snapshot: &Path, vocabulary: u32, video: bool) -> Result<SpanExpander> {
     let bytes = std::fs::read(snapshot.join("tokenizer_config.json")).map_err(|e| MediaError::Config(e.to_string()))?;
@@ -78,8 +115,8 @@ pub struct PreparedVideoSegment {
     pub source_frames: usize,
 }
 
-/// Optional sampling inherited from Transformers 4.57.1 BaseVideoProcessor.
-/// With sampling disabled (the bundled default), every frame is retained.
+/// Explicit `do_sample_frames` sampling inherited from Transformers 4.57.1
+/// BaseVideoProcessor. With sampling disabled every frame is retained.
 /// The bundled `min_frames`/`max_frames` fields are not consulted by this method.
 pub fn sample_frame_indices(total: usize, source_fps: Option<f64>, sample: bool,
     num_frames: Option<usize>, fps: Option<f64>) -> Result<Vec<usize>> {
@@ -104,10 +141,28 @@ pub fn sample_frame_indices(total: usize, source_fps: Option<f64>, sample: bool,
     Ok(indices)
 }
 
-/// Input frames are already decoded/sampled. The bundled processor defaults to
-/// `do_sample_frames=False` and MiniMaxVLProcessor passes `do_resize=False`.
-/// Explicit resize uses the video processor's 602112-pixel per-frame budget.
-pub fn prepare_video_frames(frames: &[RgbImage], encoder: EncoderId, do_resize: bool) -> Result<Vec<PreparedVideoSegment>> {
+/// The serving sampler (sglang `_compute_sampled_frame_indices`, the training
+/// extractor's constant mode): frames at least `1/fps` apart from the first, then
+/// always the last. The serving path applies no frame cap by default.
+pub fn constant_interval_indices(total: usize, source_fps: Option<f64>, fps: f64) -> Result<Vec<usize>> {
+    if total == 0 || total > i32::MAX as usize { return Err(invalid("invalid video frame count")); }
+    let source = source_fps.filter(|n| n.is_finite() && *n > 0.0).ok_or_else(|| invalid("fps sampling requires source fps"))?;
+    if !fps.is_finite() || fps <= 0.0 { return Err(invalid("sampling fps must be positive")); }
+    const EPS: f64 = 1e-4;
+    let (mut indices, mut kept) = (vec![0usize], 0.0f64);
+    loop {
+        let next = (((kept + 1.0 / fps - EPS) * source).ceil() as usize).max(indices[indices.len() - 1] + 1);
+        if next >= total { break; }
+        indices.push(next);
+        kept = next as f64 / source;
+    }
+    if indices[indices.len() - 1] != total - 1 && (total - 1) as f64 / source - kept > EPS { indices.push(total - 1); }
+    Ok(indices)
+}
+
+/// Input frames are already decoded and sampled; `sizing` picks their size (see
+/// [`VideoResize`]). Odd segments repeat their last frame, as the processor pads.
+pub fn prepare_video_frames(frames: &[RgbImage], encoder: EncoderId, sizing: VideoResize) -> Result<Vec<PreparedVideoSegment>> {
     let first = frames.first().ok_or_else(|| invalid("video contains no frames"))?;
     if frames.len() > 768 { return Err(invalid("video exceeds 768 frames")); }
     if first.width == 0 || first.height == 0 || u64::from(first.width) * u64::from(first.height) > 64 << 20 {
@@ -117,8 +172,7 @@ pub fn prepare_video_frames(frames: &[RgbImage], encoder: EncoderId, do_resize: 
         || frame.data.len() != frame.width as usize * frame.height as usize * 3) {
         return Err(invalid("video frames must share dimensions and complete RGB extents"));
     }
-    let (height, width) = if do_resize { resize_shape(first.height, first.width, 28, 3136, 602_112)? }
-        else { (first.height, first.width) };
+    let (height, width) = sizing.shape(first.height, first.width)?;
     if height % 28 != 0 || width % 28 != 0 { return Err(invalid("unresized video dimensions must be multiples of 28")); }
     let frame_tokens = height as usize / 28 * (width as usize / 28);
     if frame_tokens.checked_mul(frames.len().div_ceil(2)).is_none_or(|n| n > 57_600) {
@@ -131,7 +185,7 @@ pub fn prepare_video_frames(frames: &[RgbImage], encoder: EncoderId, do_resize: 
         let mut rgb = Vec::with_capacity(grid.t as usize * 2 * height as usize * width as usize * 3);
         for index in 0..grid.t as usize * 2 {
             let frame = &frames[index.min(frames.len() - 1)];
-            if do_resize { rgb.extend(resize::resize_bicubic_torch(frame, width, height).data); }
+            if (frame.height, frame.width) != (height, width) { rgb.extend(resize::resize_bicubic_torch(frame, width, height).data); }
             else { rgb.extend_from_slice(&frame.data); }
         }
         let mut hash = Sha256::new();
@@ -152,7 +206,7 @@ impl PreparedVideoSegment {
     pub fn placeholder(&self, fps: Option<f64>, frame_indices: Option<&[usize]>) -> Result<String> {
         let (t,h,w) = (self.grid.t as usize,self.grid.h as usize,self.grid.w as usize);
         let frame_tokens = h.checked_mul(w).ok_or_else(|| invalid("video grid overflows"))? / 4;
-        if t == 0 || t > 2 || h == 0 || w == 0 || h % 2 != 0 || w % 2 != 0
+        if t == 0 || t > MAX_SEGMENT_FRAMES / 2 || h == 0 || w == 0 || h % 2 != 0 || w % 2 != 0
             || frame_tokens.checked_mul(t) != Some(self.tokens) || self.tokens > 57_600 {
             return Err(invalid("video placeholder grid and token count differ"));
         }
@@ -176,7 +230,7 @@ impl PreparedVideoSegment {
     /// `[t, block_h, block_w, inner_h, inner_w, channel, temporal, py, px]`.
     pub fn patches(&self) -> Result<Vec<f32>> {
         let (t, h, w) = (self.grid.t as usize, self.grid.h as usize, self.grid.w as usize);
-        if t == 0 || t > 2 || h == 0 || w == 0 || h % 2 != 0 || w % 2 != 0
+        if t == 0 || t > MAX_SEGMENT_FRAMES / 2 || h == 0 || w == 0 || h % 2 != 0 || w % 2 != 0
             || self.rgb8.len() != t * 2 * h * w * 14 * 14 * 3 {
             return Err(invalid("video patch grid and RGB byte extent differ"));
         }
@@ -291,9 +345,43 @@ mod tests {
     }
 
     #[test]
+    fn serving_sampler_keeps_constant_intervals_and_the_last_frame() {
+        // Expectations evaluated with sglang `_compute_sampled_frame_indices` (SERVING_REFERENCE).
+        let thirty = [0,30,60,90,120,150,180,210,240,270,299];
+        assert_eq!(constant_interval_indices(300,Some(30.0),VIDEO_FPS).unwrap(), thirty);
+        assert_eq!(constant_interval_indices(300,Some(30000.0/1001.0),VIDEO_FPS).unwrap(), thirty);
+        assert_eq!(constant_interval_indices(18,Some(5.0),1.0).unwrap(), [0,5,10,15,17]);
+        assert_eq!(constant_interval_indices(16,Some(5.0),1.0).unwrap(), [0,5,10,15]);
+        assert_eq!(constant_interval_indices(90,Some(30.0),2.0).unwrap(), [0,15,30,45,60,75,89]);
+        assert_eq!(constant_interval_indices(10,Some(4.0),8.0).unwrap(), (0..10).collect::<Vec<_>>());
+        assert_eq!(constant_interval_indices(1,Some(30.0),1.0).unwrap(), [0]);
+        assert!(constant_interval_indices(0,Some(30.0),1.0).is_err());
+        assert!(constant_interval_indices(10,None,1.0).is_err());
+        assert!(constant_interval_indices(10,Some(30.0),0.0).is_err());
+    }
+
+    #[test]
+    fn serving_sizing_caps_the_longer_side_at_756_and_aligns_to_28() {
+        // sglang `get_hw_multiple_of((w, h), 28, 756)`, written here as (height, width).
+        for ((h, w), expected) in [((720,1280),(448,756)), ((1080,1920),(448,756)), ((480,640),(504,644)),
+            ((1280,720),(756,448)), ((2160,3840),(448,756)), ((760,1000),(588,756)), ((28,28),(28,28)), ((1,1),(28,28))] {
+            assert_eq!(VideoResize::Vendor.shape(h,w).unwrap(), expected, "{h}x{w}");
+        }
+        assert!(VideoResize::Vendor.shape(1,2000).is_err());
+        assert_eq!(VideoResize::Smart.shape(720,1280).unwrap(), (560,1008));
+        assert_eq!(VideoResize::Off.shape(720,1280).unwrap(), (720,1280));
+        // 720p is 16 x 27 merged tokens per temporal patch; unresized it does not align.
+        let frame = RgbImage { width:1280, height:720, data:vec![9;1280*720*3] };
+        let segment = prepare_video_frames(&[frame.clone()],EncoderId([0;32]),VideoResize::Vendor).unwrap().remove(0);
+        assert_eq!((segment.grid.h, segment.grid.w, segment.tokens), (32, 54, 432));
+        assert!(segment.rgb8.iter().all(|&v| v == 9));
+        assert!(prepare_video_frames(&[frame],EncoderId([0;32]),VideoResize::Off).is_err());
+    }
+
+    #[test]
     fn video_placeholder_wraps_each_temporal_pair_and_keeps_sampled_timestamps() {
         let frames = vec![RgbImage {width:56,height:28,data:vec![0;56*28*3]};3];
-        let segment = prepare_video_frames(&frames,EncoderId([0;32]),false).unwrap().remove(0);
+        let segment = prepare_video_frames(&frames,EncoderId([0;32]),VideoResize::Off).unwrap().remove(0);
         let pair = "]<]start of image[>[".to_owned()
             + "]<]video[>[" + "]<]video[>[" + "]<]end of image[>[";
         assert_eq!(segment.placeholder(None,None).unwrap(),pair.repeat(2));
@@ -310,18 +398,23 @@ mod tests {
     }
 
     #[test]
-    fn video_keeps_all_frames_segments_four_and_pads_last() {
-        let frames: Vec<_> = (0..5).map(|v| RgbImage { width:28, height:28, data:vec![v;28*28*3] }).collect();
-        let segments = prepare_video_frames(&frames, EncoderId([0;32]), false).unwrap();
+    fn video_keeps_all_frames_segments_eight_and_pads_last() {
+        let frames: Vec<_> = (0..11).map(|v| RgbImage { width:28, height:28, data:vec![v;28*28*3] }).collect();
+        let segments = prepare_video_frames(&frames, EncoderId([0;32]), VideoResize::Off).unwrap();
         assert_eq!(segments.len(),2);
-        assert_eq!((segments[0].grid.t,segments[0].tokens,segments[0].source_frames),(2,2,4));
-        assert_eq!((segments[1].grid.t,segments[1].tokens,segments[1].source_frames),(1,1,1));
-        assert_eq!(&segments[1].rgb8[..28*28*3], &segments[1].rgb8[28*28*3..]);
+        assert_eq!((segments[0].grid.t,segments[0].tokens,segments[0].source_frames),(4,4,8));
+        assert_eq!((segments[1].grid.t,segments[1].tokens,segments[1].source_frames),(2,2,3));
+        let frame = 28*28*3;
+        assert_eq!(&segments[1].rgb8[2*frame..3*frame], &segments[1].rgb8[3*frame..]);
         let lut = ProcessorConfig::for_family(ImageFamily::Minimax).normalization_lut();
         let patches = segments[0].patches().unwrap();
-        assert_eq!(patches[0],lut[0][0]); assert_eq!(patches[196],lut[0][1]);
-        assert_eq!(patches[4*1176],lut[0][2]); assert_eq!(patches[4*1176+196],lut[0][3]);
-        assert!(prepare_video_frames(&[],EncoderId([0;32]),false).is_err());
-        assert!(prepare_video_frames(&[RgbImage {width:29,height:28,data:vec![0;29*28*3]}],EncoderId([0;32]),false).is_err());
+        for time in 0..4 {
+            assert_eq!(patches[time*4*1176],lut[0][time*2]); assert_eq!(patches[time*4*1176+196],lut[0][time*2+1]);
+        }
+        let mut wide = segments[0].clone();
+        (wide.grid.t, wide.tokens, wide.rgb8) = (5, 5, vec![0; 10*frame].into());
+        assert!(wide.patches().is_err() && wide.placeholder(None,None).is_err());
+        assert!(prepare_video_frames(&[],EncoderId([0;32]),VideoResize::Off).is_err());
+        assert!(prepare_video_frames(&[RgbImage {width:29,height:28,data:vec![0;29*28*3]}],EncoderId([0;32]),VideoResize::Off).is_err());
     }
 }
