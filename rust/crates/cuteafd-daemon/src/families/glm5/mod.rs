@@ -429,6 +429,11 @@ pub(crate) fn open(args: &EngineArgs) -> Result<Opened> {
     }
     let library = std::sync::Arc::new(unsafe { NativeLibrary::load(&args.native_lib) }?);
     library.cuda_set_device(args.device)?;
+    if !args.variants.is_empty() {
+        // Bind/version-check the native steering ABI before any model weights
+        // are read or allocated, including when every source later rejects.
+        let _ = library.steer_rows().context("weight variants require the supported steering native ABI")?;
+    }
     Ok(Opened { snapshot: args.snapshot.clone(), catalog, native, cfg, library })
 }
 
@@ -655,6 +660,10 @@ impl Opened {
         cuteafd_loader::placement::families::GLM5.check(&placement)?;
         tracing::info!(placement = %placement.summary(), "GLM admission");
         let tp2_range = placement.tp2.map(|p| p.first..p.first + p.layers);
+        if !args.variants.is_empty() {
+            ensure!(devices.len() == 1 && peer_stream.is_none() && tp2_range.is_none() && owners.is_none() && !native,
+                "weight variants require one coordinator, no peer, TP2 or layer execution, and non-native dense weights");
+        }
         let max_rows = args.prefill_rows.max(engine::DECODE_ROWS);
         let tp2_devices = || -> Result<[crate::shared::memory::device::Device<'_>; 2]> {
             Ok([crate::shared::memory::device::Device { library: &self.library, id: args.device },
@@ -834,7 +843,7 @@ impl Opened {
             let tables = variants::GlmVariantTables::upload(&self.library, derived.plans, derived.records, self.cfg.hidden)?;
             tracing::info!(sites = tables.site_count(), bytes = variant_bytes, variants = tables.records.len(),
                 "GLM weight-variant tables resident");
-            engine.variants = Some(tables);
+            engine.bind_variants(tables)?;
         }
         engine.full_prefill_logits = args.full_prefill_logits;
         engine.prefill_span_rows = args.prefill_span_rows;
@@ -1277,7 +1286,7 @@ fn golden(args: GoldenArgs) -> Result<()> {
 fn golden_run(args: &GoldenArgs, opened: &Opened, engine: &engine::GlmEngine<'_>, mut transport: Option<&mut SparkLink<'_>>,
     runtime: &tokio::runtime::Runtime) -> Result<()> {
     if args.golden_variant != 0 {
-        ensure!(engine.variants.as_ref().is_some_and(|v| v.records.iter().any(|r| r.index == args.golden_variant)),
+        ensure!(engine.variants.as_ref().is_some_and(|v| v.records.iter().any(|r| r.index == args.golden_variant && r.is_ready())),
             "--golden-variant {}: that variant did not verify, so it is unavailable", args.golden_variant);
     }
     engine.golden_variant.set(args.golden_variant);
