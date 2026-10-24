@@ -886,8 +886,13 @@ pub(crate) fn build(profile: &ModelProfile, limits: NativeLimits, headers: &axum
     let tool_constraints = tools::ToolConstraints::new(&converted.conversation.tools,
         converted.conversation.tool_choice, selection.required, parallel,
         assistance || response_format.as_ref().is_some_and(|v| v["type"] != "text"), syntax).map_err(Rejection::bad)?;
-    let constraint = if matches!(profile.encoding, ModelEncoding::MiniMaxM3(_)) {
-        minimax_m3::grammar::response(response_format.clone(), converted.conversation.thinking_mode, tool_constraints.as_ref())
+    // MiniMax tells adaptive from enabled thinking, which the switch above merges.
+    let minimax_thinking = match &glm_request {
+        Some((Templated::MiniMaxM3(_), raw, _)) => Some(minimax_m3::Thinking::of(raw).map_err(Rejection::bad)?),
+        _ => None,
+    };
+    let constraint = if let Some(thinking) = minimax_thinking {
+        minimax_m3::grammar::response(response_format.clone(), thinking, tool_constraints.as_ref())
     } else { match profile.encoding.think_close_token_id() {
         Some(token) => constraints::response_constraint(response_format.clone(), converted.conversation.thinking_mode,
             tool_constraints.as_ref(), token),
@@ -945,6 +950,7 @@ pub(crate) fn build(profile: &ModelProfile, limits: NativeLimits, headers: &axum
             let names = converted.conversation.tools.iter().map(|t| t.name.clone()).collect::<Vec<_>>();
             let prompt = encoding.render(&raw, &names).map_err(Rejection::bad)?;
             let parser = minimax_m3::MiniMaxOutputParser::new(minimax_m3::MiniMaxParserOptions {
+                thinking: minimax_thinking == Some(minimax_m3::Thinking::Enabled),
                 tools: (tools_declared && converted.conversation.tool_choice != deepseek_recipe_core::tools::ToolChoice::None)
                     .then(|| converted.conversation.tools.clone()),
                 stop_sequences: converted.parsing_options.stop_sequences.clone(), id: id.clone() });

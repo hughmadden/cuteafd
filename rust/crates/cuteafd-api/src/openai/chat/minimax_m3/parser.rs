@@ -12,6 +12,8 @@ use super::super::glm5::{parser::GlmStop, processor::TextParser};
 
 #[derive(Debug, Clone, Default)]
 pub struct MiniMaxParserOptions {
+    /// The prompt ends in `<mm:think>` (explicitly enabled thinking): output starts as reasoning.
+    pub thinking: bool,
     pub tools: Option<Vec<ToolDefinition>>,
     pub stop_sequences: Vec<String>,
     /// The completion id, naming the request in log lines.
@@ -38,7 +40,7 @@ pub struct MiniMaxOutputParser {
 
 impl MiniMaxOutputParser {
     pub fn new(options: MiniMaxParserOptions) -> Self {
-        Self { options, pending: String::new(), reasoning: false, block: false, scanned: 0, calls: 0,
+        Self { reasoning: options.thinking, options, pending: String::new(), block: false, scanned: 0, calls: 0,
             content_started: false, held: String::new(), before: String::new(), stop: None }
     }
 

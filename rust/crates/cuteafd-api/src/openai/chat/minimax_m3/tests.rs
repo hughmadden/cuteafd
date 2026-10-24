@@ -111,7 +111,25 @@ fn thinking_off_closes_the_reasoning_prefix() {
         assert!(!rendered.contains("<effort>"), "{extra}");
     }
     let on = encoding.render(&json!({"messages": user, "thinking": {"type": "enabled", "budget_tokens": 20000}}), &[]).unwrap();
-    assert!(on.ends_with("]~b]ai\n") && on.contains("<effort>xhigh</effort>"));
+    assert!(on.ends_with("]~b]ai\n<mm:think>") && on.contains("<effort>xhigh</effort>"), "{on:?}");
+}
+
+#[test]
+fn enabled_thinking_opens_the_block_and_adaptive_leaves_it_to_the_model() {
+    let encoding = encoding();
+    let user = json!([{"role": "user", "content": "Hi"}]);
+    for (extra, end) in [(json!({"thinking": {"type": "enabled"}}), "]~b]ai\n<mm:think>"),
+        (json!({"thinking": {"type": "Enabled"}, "enable_thinking": false}), "]~b]ai\n<mm:think>"),
+        (json!({}), "]~b]ai\n"), (json!({"thinking": {"type": "adaptive"}}), "]~b]ai\n"),
+        (json!({"reasoning_effort": "high"}), "]~b]ai\n"), (json!({"enable_thinking": true}), "]~b]ai\n")] {
+        let mut body = json!({"messages": user});
+        body.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+        assert!(encoding.render(&body, &[]).unwrap().ends_with(end), "{extra}");
+    }
+    // The prompt opened the block, so output starts as reasoning.
+    let enabled = MiniMaxParserOptions { thinking: true, ..Default::default() };
+    let projection = parse_everywhere(&enabled, "Think <b>first</b>.</mm:think>\nAnswer.[e~[");
+    assert_eq!((projection.reasoning.as_str(), projection.content.as_str()), ("Think <b>first</b>.", "Answer."));
 }
 
 #[test]
@@ -550,23 +568,29 @@ fn constrained_calls_use_the_m3_namespace_form() {
 }
 
 #[test]
-fn response_constraint_allows_adaptive_reasoning_prefix_only_while_thinking() {
+fn response_constraint_reasoning_prefix_follows_the_thinking_mode() {
     use crate::openai::tools::{ToolConstraints, ToolSyntax};
     use deepseek_recipe_core::tools::ToolChoice;
     let required = ToolConstraints::new(&tools(), ToolChoice::Auto, true, true, false, ToolSyntax::MiniMaxM3).unwrap();
-    let on: Value = serde_json::from_str(&grammar::response(None, true, required.as_ref()).unwrap().unwrap().0).unwrap();
+    let on: Value = serde_json::from_str(&grammar::response(None, Thinking::Adaptive, required.as_ref()).unwrap().unwrap().0).unwrap();
     assert_eq!(on["type"], "structural_tag");
     let elements = on["format"]["elements"].as_array().unwrap();
     assert_eq!(elements[0]["type"], "optional");
     assert_eq!(elements[0]["content"]["elements"][0]["value"], THINK_CLOSE);
     assert_eq!(elements[0]["content"]["elements"][1]["begin"], THINK_OPEN);
     assert_eq!(elements[1]["begin"], CALL_OPEN);
-    let off: Value = serde_json::from_str(&grammar::response(None, false, required.as_ref()).unwrap().unwrap().0).unwrap();
+    // Enabled thinking opened the block in the prompt: the output must close it.
+    let enabled: Value = serde_json::from_str(&grammar::response(None, Thinking::Enabled, required.as_ref()).unwrap().unwrap().0).unwrap();
+    let elements = enabled["format"]["elements"].as_array().unwrap();
+    assert_eq!((&elements[0]["type"], &elements[0]["excludes"]), (&json!("any_text"), &json!([THINK_CLOSE])));
+    assert_eq!((&elements[1]["type"], &elements[1]["value"]), (&json!("const_string"), &json!(THINK_CLOSE)));
+    assert_eq!(elements[2]["begin"], CALL_OPEN);
+    let off: Value = serde_json::from_str(&grammar::response(None, Thinking::Off, required.as_ref()).unwrap().unwrap().0).unwrap();
     assert_eq!(off["format"]["begin"], CALL_OPEN);
     // Unconstrained requests stay unconstrained.
     let optional = ToolConstraints::new(&tools(), ToolChoice::Auto, false, true, false, ToolSyntax::MiniMaxM3).unwrap();
-    assert!(grammar::response(None, true, optional.as_ref()).unwrap().is_none());
-    let json_mode = grammar::response(Some(json!({"type": "json_object"})), true, None).unwrap().unwrap();
+    assert!(grammar::response(None, Thinking::Enabled, optional.as_ref()).unwrap().is_none());
+    let json_mode = grammar::response(Some(json!({"type": "json_object"})), Thinking::Adaptive, None).unwrap().unwrap();
     assert!(json_mode.0.contains("ds41_json_schema") && json_mode.0.contains(THINK_OPEN));
 }
 
@@ -699,6 +723,22 @@ mod router {
             .map(|c| serde_json::from_str(c["function"]["arguments"].as_str().unwrap()).unwrap()).collect();
         assert_eq!(calls, [json!({"city": "Oslo", "days": 3, "unit": "c", "tags": ["a"]}),
             json!({"city": "Bergen", "days": null, "unit": null, "tags": null})]);
+    }
+
+    #[tokio::test]
+    async fn enabled_thinking_opens_the_block_and_requires_its_close() {
+        let body = json!({"model": MODEL, "thinking": {"type": "enabled"}, "tools": weather_tool(), "tool_choice": "required",
+            "messages": [{"role": "user", "content": "Weather in Oslo?"}]});
+        let reply = format!("Look it up.</mm:think>{}", block(&[invoke("get_weather", &[param("city", "Oslo")])]));
+        let (status, bytes, seen) = serve(body, &reply).await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&bytes));
+        assert!(seen.prompt.ends_with("]~b]ai\n<mm:think>"), "{}", seen.prompt);
+        let constraint: Value = serde_json::from_str(&seen.constraint.unwrap()).unwrap();
+        assert_eq!(constraint["format"]["elements"][0]["type"], "any_text");
+        let value: Value = serde_json::from_slice(&bytes).unwrap();
+        let message = &value["choices"][0]["message"];
+        assert_eq!((&message["reasoning_content"], &message["tool_calls"][0]["function"]["name"]),
+            (&json!("Look it up."), &json!("get_weather")));
     }
 
     #[tokio::test]

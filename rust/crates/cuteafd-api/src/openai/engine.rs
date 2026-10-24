@@ -419,7 +419,9 @@ fn chat_body_with(turn: &TurnRequest, profile: &ModelProfile, names: &ToolNames,
     });
     match turn.reasoning.enabled {
         Some(enabled) => {
-            body["thinking"] = json!({"type": if enabled { "enabled" } else { "disabled" }});
+            // Every chat template reads `adaptive` as `enabled` but MiniMax M3's.
+            let kind = match (enabled, turn.reasoning.adaptive) { (false, _) => "disabled", (true, true) => "adaptive", (true, false) => "enabled" };
+            body["thinking"] = json!({"type": kind});
             if enabled { if let Some(e) = effort.filter(|e| !matches!(*e, "none")) { body["reasoning_effort"] = json!(e); } }
         }
         None => if let Some(e) = effort { body["reasoning_effort"] = json!(e); },

@@ -742,8 +742,10 @@ async fn messages_without_thinking_do_not_reason_while_responses_and_chat_keep_d
 }
 
 /// MiniMax M3 reads one `<effort>` level from the system prompt: Anthropic
-/// budgets bucket into it, Responses/Chat efforts pass through, and the
-/// switches that turn thinking off close the reasoning prefix.
+/// budgets bucket into it, Responses/Chat efforts pass through, the switches
+/// that turn thinking off close the reasoning prefix, an explicit enable
+/// (Anthropic `enabled`, a Responses effort) opens it, and Anthropic
+/// `adaptive` or a bare chat effort leaves it to the model.
 #[tokio::test]
 async fn minimax_effort_levels_follow_each_protocols_thinking_controls() {
     let profile = ModelProfile::new("test-minimax", ModelEncoding::MiniMaxM3(Arc::new(minimax_m3::fixtures::encoding())));
@@ -755,6 +757,7 @@ async fn minimax_effort_levels_follow_each_protocols_thinking_controls() {
         ("/v1/messages", msg(json!({"type":"enabled","budget_tokens":8000}))),
         ("/v1/messages", msg(json!({"type":"enabled","budget_tokens":64000}))),
         ("/v1/messages", msg(json!({"type":"disabled"}))),
+        ("/v1/messages", msg(json!({"type":"adaptive","budget_tokens":8000}))),
         ("/v1/responses", json!({"model":"m","input":"hi","store":false,"reasoning":{"effort":"xhigh"}})),
         ("/v1/responses", json!({"model":"m","input":"hi","store":false,"reasoning":{"effort":"minimal"}})),
         ("/v1/responses", json!({"model":"m","input":"hi","store":false,"reasoning":{"effort":"none"}})),
@@ -766,11 +769,11 @@ async fn minimax_effort_levels_follow_each_protocols_thinking_controls() {
     }
     let prompts = worker.prompts.lock().unwrap().clone();
     let effort = |p: &str| p.split("<effort>").nth(1).and_then(|r| r.split("</effort>").next()).map(str::to_owned);
-    let closed = |p: &str| p.ends_with("</mm:think>");
-    let got: Vec<_> = prompts.iter().map(|p| (effort(p), closed(p))).collect();
-    let some = |level: &str, closed| (Some(level.to_owned()), closed);
-    assert_eq!(got, vec![(None, true), some("low", false), some("high", false), some("max", false), (None, true),
-        some("xhigh", false), some("low", false), (None, true), some("medium", false)]);
+    let mode = |p: &str| if p.ends_with("</mm:think>") { "off" } else if p.ends_with("<mm:think>") { "enabled" } else { "adaptive" };
+    let got: Vec<_> = prompts.iter().map(|p| (effort(p), mode(p))).collect();
+    let some = |level: &str, mode| (Some(level.to_owned()), mode);
+    assert_eq!(got, vec![(None, "off"), some("low", "enabled"), some("high", "enabled"), some("max", "enabled"), (None, "off"),
+        some("high", "adaptive"), some("xhigh", "enabled"), some("low", "enabled"), (None, "off"), some("medium", "adaptive")]);
 }
 
 #[tokio::test]

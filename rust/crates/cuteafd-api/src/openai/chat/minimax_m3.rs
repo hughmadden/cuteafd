@@ -21,6 +21,20 @@ pub const INVOKE_CLOSE: &str = "]<]minimax[>[</invoke>";
 pub const IMAGE: &str = "]<]image[>[";
 pub const VIDEO: &str = "]<]video[>[";
 
+/// The template's thinking modes. Adaptive, its default (and `thinking.type:
+/// adaptive`), lets the model decide; an explicit `thinking.type: enabled`
+/// opens the block in the prompt; off closes it there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Thinking { Off, Adaptive, Enabled }
+
+impl Thinking {
+    pub fn of(body: &Value) -> Result<Self, String> {
+        if !super::glm5::resolve_thinking(body)? { return Ok(Self::Off); }
+        let enabled = body.get("thinking").and_then(|v| v["type"].as_str()).is_some_and(|t| t.eq_ignore_ascii_case("enabled"));
+        Ok(if enabled { Self::Enabled } else { Self::Adaptive })
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MiniMaxTokenIds {
     pub eos: Vec<u32>,
@@ -94,7 +108,11 @@ impl MiniMaxEncoding {
     pub fn render(&self, body: &Value, tool_names: &[String]) -> Result<String, String> {
         let context = prompt::template_context(body, tool_names)?;
         let mut rendered = self.template.render(&context).map_err(|e| format!("MiniMax M3 chat template: {e:#}"))?;
-        if !super::glm5::resolve_thinking(body)? { rendered.push_str(THINK_CLOSE); }
+        match Thinking::of(body)? {
+            Thinking::Off => rendered.push_str(THINK_CLOSE),
+            Thinking::Enabled => rendered.push_str(THINK_OPEN),
+            Thinking::Adaptive => {}
+        }
         Ok(rendered)
     }
 }
