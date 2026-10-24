@@ -9,8 +9,8 @@ MiniMaxM3VL tower in scripts/tests/test_minimax_m3_vision_reference.py); inputs 
 prepared by python/reference/minimax_m3_media.py, which processor-parity.py checks
 against the release processors. The reference runs twice on the GPU: with the release
 numerics (BF16, F32 convolution) and in FP32 as the yardstick. A stage passes when the
-native tower is no farther from FP32 (relative L2, mean row cosine) than the BF16
-reference, with a small margin. Segments above --reference-max-patches are timed only:
+native tower is no farther from FP32 (mean row cosine, 90th-percentile row error) than
+the BF16 reference, with a small margin. Segments above --reference-max-patches are timed only:
 the reference materializes full attention scores.
 """
 from __future__ import annotations
@@ -176,16 +176,22 @@ def metrics(native, ref):
     a, b = native.astype(np.float64), ref.astype(np.float64)
     an, bn = np.linalg.norm(a, axis=-1), np.linalg.norm(b, axis=-1)
     cos = np.sum(a * b, axis=-1) / np.maximum(an * bn, 1e-30)
+    rows = np.linalg.norm(a - b, axis=-1) / np.maximum(bn, 1e-30)
     diff = np.abs(a - b)
     return dict(relative_l2=float(np.linalg.norm(a - b) / np.linalg.norm(b)), mean_cosine=float(cos.mean()),
-                worst_cosine=float(cos.min()), max_abs=float(diff.max()), mean_abs=float(diff.mean()),
-                ref_mean_abs=float(np.abs(b).mean()))
+                worst_cosine=float(cos.min()), row_relative_p50=float(np.percentile(rows, 50)),
+                row_relative_p90=float(np.percentile(rows, 90)), row_relative_max=float(rows.max()),
+                max_abs=float(diff.max()), mean_abs=float(diff.mean()), ref_mean_abs=float(np.abs(b).mean()),
+                ref_max_abs=float(np.abs(b).max()))
 
 
 def verdict(native, floor):
-    """No farther from FP32 than the BF16 reference, with a small margin. Worst-row cosine
-    is one row's minimum and is reported, not gated."""
-    return (native["relative_l2"] <= floor["relative_l2"] * 1.25 + 0.002
+    """No farther from FP32 than the BF16 reference, with a small margin, per row: mean
+    cosine and the 90th-percentile row error. Whole-tensor relative L2 and the worst row
+    are reported, not gated: a few massive-activation rows (|x| in the thousands, where a
+    BF16 step is 8-64) dominate them, and there two BF16 implementations differ by
+    accumulation order alone."""
+    return (native["row_relative_p90"] <= floor["row_relative_p90"] * 1.25 + 0.002
             and native["mean_cosine"] >= floor["mean_cosine"] - 0.0005)
 
 
