@@ -288,3 +288,183 @@ fn steer_rows_timing() -> Result<()> {
     }
     Ok(())
 }
+
+/// One `add_rows` case: variants 1 and 3 carry a delta, 2 does not.
+struct AddCase {
+    shape: super::AddRowsShape,
+    y: Vec<u16>,
+    d: Vec<f32>,
+    vidx: Vec<i32>,
+    on: Vec<i32>,
+}
+
+impl AddCase {
+    fn new(seed: u64, rows: usize, h: usize) -> Self {
+        let mut rng = Rng(seed);
+        let (ld_y, ld_d) = if rows % 2 == 1 { (h + 8, h + 4) } else { (h, h) };
+        let shape = super::AddRowsShape { rows, h, ld_y, ld_d, variants: 3 };
+        AddCase {
+            shape,
+            y: (0..rows * ld_y).map(|_| f32_to_bf16_rne(rng.unit() * 3.0)).collect(),
+            d: (0..rows * ld_d).map(|_| rng.unit() * 0.05).collect(),
+            vidx: (0..rows).map(|_| match rng.below(9) { 0 => -1, n => (n % 4) as i32 }).collect(),
+            on: vec![0, 1, 0, 1],
+        }
+    }
+
+    fn reference(&self) -> Vec<u16> {
+        let mut y = self.y.clone();
+        let s = self.shape;
+        cuteafd_core::steer_rows::add_rows_ref(&mut y, s.ld_y, &self.d, s.ld_d, s.rows, s.h, &self.vidx, &self.on);
+        y
+    }
+}
+
+struct AddDevice<'a> {
+    library: &'a NativeLibrary,
+    buffers: [CuteafdDeviceBuffer; 4],
+}
+
+impl<'a> AddDevice<'a> {
+    fn new(library: &'a NativeLibrary, case: &AddCase) -> Result<Self> {
+        let mut device = AddDevice { library, buffers: [CuteafdDeviceBuffer::default(); 4] };
+        let sizes = [case.y.len() * 2, case.d.len() * 4, case.vidx.len().max(1) * 4, case.on.len() * 4];
+        for (slot, bytes) in device.buffers.iter_mut().zip(sizes) {
+            *slot = library.alloc_device_buffer(bytes)?;
+        }
+        device.upload(case)?;
+        Ok(device)
+    }
+
+    fn upload(&self, case: &AddCase) -> Result<()> {
+        let [y, d, vidx, on] = self.buffers;
+        self.library.copy_h2d(y, &bytes(&case.y, u16::to_le_bytes))?;
+        self.library.copy_h2d(d, &bytes(&case.d, f32::to_le_bytes))?;
+        self.library.copy_h2d(vidx, &bytes(&case.vidx, i32::to_le_bytes))?;
+        self.library.copy_h2d(on, &bytes(&case.on, i32::to_le_bytes))
+    }
+
+    fn y(&self) -> Result<Vec<u16>> {
+        let mut raw = vec![0u8; self.buffers[0].bytes];
+        self.library.copy_d2h(&mut raw, self.buffers[0])?;
+        Ok(raw.chunks_exact(2).map(|p| u16::from_le_bytes([p[0], p[1]])).collect())
+    }
+
+    /// # Safety
+    /// `stream` is a live stream on this device.
+    unsafe fn launch(&self, add: &super::AddRows<'_>, shape: super::AddRowsShape, stream: *mut c_void) -> Result<()> {
+        let [y, d, vidx, on] = self.buffers;
+        // SAFETY: the buffers outlive the launch (callers synchronize before drop).
+        unsafe { add.launch(y, d, vidx, on, shape, stream) }
+    }
+}
+
+impl Drop for AddDevice<'_> {
+    fn drop(&mut self) {
+        for buffer in &mut self.buffers {
+            let _ = self.library.free_device_buffer(buffer);
+        }
+    }
+}
+
+#[test]
+#[ignore = "requires a CUDA GPU and CUTEAFD_NATIVE_LIB built with CUTEAFD_ENABLE_STEER_ROWS_AOT"]
+fn add_rows_matches_reference_and_replays() -> Result<()> {
+    let library = library()?;
+    let add = library.add_rows()?;
+    let stream = library.cuda_stream_create()?;
+    let mut cases = 0;
+    for h in [4096, 5120, 6144] {
+        for rows in [1, 7, 64, 2048, 4096] {
+            let case = AddCase::new((h + rows) as u64, rows, h);
+            let device = AddDevice::new(&library, &case)?;
+            // SAFETY: stream is live; synchronized before the buffers drop.
+            unsafe {
+                device.launch(&add, case.shape, stream)?;
+                library.cuda_stream_synchronize(stream)?;
+            }
+            let got = device.y()?;
+            if let Some(error) = first_mismatch(&got, &case.reference(), case.shape.ld_y) {
+                anyhow::bail!("add_rows h {h} rows {rows}: {error}");
+            }
+            for (r, &v) in case.vidx.iter().enumerate() {
+                let row = r * case.shape.ld_y..(r + 1) * case.shape.ld_y;
+                if v <= 0 || v == 2 {
+                    ensure!(got[row.clone()] == case.y[row], "add_rows h {h}: row {r} (vidx {v}) was written");
+                }
+            }
+            cases += 1;
+        }
+    }
+    // Graph replay with new rows, deltas, assignments and switches.
+    let first = AddCase::new(77, 64, 4096);
+    let device = AddDevice::new(&library, &first)?;
+    // SAFETY: stream is live; the graph is destroyed after a final synchronize.
+    unsafe {
+        library.cuda_graph_begin_capture(stream)?;
+        device.launch(&add, first.shape, stream)?;
+        let graph = library.cuda_graph_end_capture(stream)?;
+        library.cuda_graph_launch(graph, stream)?;
+        library.cuda_stream_synchronize(stream)?;
+        ensure!(device.y()? == first.reference(), "add_rows first replay differs");
+        let mut second = AddCase::new(78, 64, 4096);
+        second.on = vec![0, 0, 1, 1];
+        device.upload(&second)?;
+        library.cuda_graph_launch(graph, stream)?;
+        library.cuda_stream_synchronize(stream)?;
+        ensure!(device.y()? == second.reference(), "add_rows second replay differs");
+        library.cuda_graph_exec_destroy(graph)?;
+        library.cuda_stream_destroy(stream)?;
+    }
+    eprintln!("add_rows: {cases} cases bit-exact, graph replay ok");
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires a CUDA GPU and CUTEAFD_NATIVE_LIB built with CUTEAFD_ENABLE_STEER_ROWS_AOT"]
+fn add_rows_timing() -> Result<()> {
+    const NODES: usize = 200;
+    const REPLAYS: usize = 50;
+    let library = library()?;
+    let add = library.add_rows()?;
+    let stream = library.cuda_stream_create()?;
+    let (start, stop) = (library.cuda_event_create()?, library.cuda_event_create()?);
+    for rows in [1, 16, 64] {
+        for enabled in [true, false] {
+            let mut case = AddCase::new(9, rows, 4096);
+            case.shape.ld_y = 4096;
+            case.shape.ld_d = 4096;
+            case.vidx = vec![i32::from(enabled); rows];
+            let device = AddDevice::new(&library, &case)?;
+            // SAFETY: stream and events are live; synchronized before the buffers drop.
+            let micros = unsafe {
+                library.cuda_graph_begin_capture(stream)?;
+                for _ in 0..NODES {
+                    device.launch(&add, case.shape, stream)?;
+                }
+                let graph = library.cuda_graph_end_capture(stream)?;
+                for _ in 0..3 {
+                    library.cuda_graph_launch(graph, stream)?;
+                }
+                library.cuda_event_record(start, stream)?;
+                for _ in 0..REPLAYS {
+                    library.cuda_graph_launch(graph, stream)?;
+                }
+                library.cuda_event_record(stop, stream)?;
+                library.cuda_event_synchronize(stop)?;
+                let ms = library.cuda_event_elapsed_ms(start, stop)?;
+                library.cuda_graph_exec_destroy(graph)?;
+                f64::from(ms) * 1000.0 / (NODES * REPLAYS) as f64
+            };
+            let label = if enabled { "delta" } else { "base" };
+            println!("add_rows h=4096 rows={rows} {label}: {micros:.2} us/call");
+        }
+    }
+    // SAFETY: the last replay synchronized.
+    unsafe {
+        library.cuda_event_destroy(start)?;
+        library.cuda_event_destroy(stop)?;
+        library.cuda_stream_destroy(stream)?;
+    }
+    Ok(())
+}

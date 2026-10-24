@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""Export the weight-variant row steering programs (``y -= A (B^T y)``), offline.
+"""Export the weight-variant row programs, offline.
 
-Two programs from ``b12x.integration.cuteafd.steer_rows``: ``steer_rows_one``
-(k_max == 1) and ``steer_rows_general`` (k_max <= 32). Width, row stride,
-row count and k_max are launch scalars and the grid is one CTA per row, so
-the export holds no model geometry and no SM count.
+From ``b12x.integration.cuteafd.steer_rows``: ``steer_rows_one`` (k_max == 1)
+and ``steer_rows_general`` (k_max <= 32) for ``y -= A (B^T y)``, and
+``add_rows_f32`` for ``y += d`` (stored-delta sites). Widths, strides, row
+counts and k_max are launch scalars and the grid is one CTA per row, so the
+export holds no model geometry and no SM count.
 """
 from pathlib import Path
 import argparse
@@ -14,9 +15,14 @@ import os
 import re
 import sys
 
-FORMS = ("one", "general")
-POINTERS = ("x", "vidx", "a", "b", "k")
-SCALARS = (("ld", "int64_t"), ("rows", "int32_t"), ("h", "int32_t"), ("k_max", "int32_t"))
+STEER_POINTERS = ("x", "vidx", "a", "b", "k")
+STEER_SCALARS = (("ld", "int64_t"), ("rows", "int32_t"), ("h", "int32_t"), ("k_max", "int32_t"))
+ADD_POINTERS = ("y", "d", "vidx", "on")
+ADD_SCALARS = (("ld_y", "int64_t"), ("ld_d", "int64_t"), ("rows", "int32_t"), ("h", "int32_t"))
+# (stem, pointers, scalars); the BF16-delta add_rows form is compiled on request only.
+PROGRAMS = (("steer_rows_one", STEER_POINTERS, STEER_SCALARS),
+            ("steer_rows_general", STEER_POINTERS, STEER_SCALARS),
+            ("add_rows_f32", ADD_POINTERS, ADD_SCALARS))
 
 
 def main():
@@ -47,35 +53,40 @@ def main():
 
     destination = args.output_dir
     destination.mkdir(parents=True, exist_ok=True)
-    for form in FORMS:
-        stem = f"steer_rows_{form}"
+    for stem, pointer_names, scalar_types in PROGRAMS:
         symbol = "cuteafd_" + stem
         manifest_path = destination / (stem + ".json")
         manifest_path.unlink(missing_ok=True)
+        kind, form = stem.rsplit("_", 1)
+        if kind == "steer_rows":
+            operands, launch = steer_rows.OPERANDS, steer_rows.steer_rows_launch(form)
+            scalars = (cutlass.Int64(1), cutlass.Int32(1), cutlass.Int32(128), cutlass.Int32(1))
+            geometry = dict(form=form, threads=steer_rows.THREADS, max_hidden=steer_rows.MAX_HIDDEN,
+                            max_k=1 if form == "one" else steer_rows.MAX_K, hidden_multiple=128)
+        else:
+            operands, launch = steer_rows.add_rows_operands(form), steer_rows.add_rows_launch(form)
+            scalars = (cutlass.Int64(8), cutlass.Int64(8), cutlass.Int32(1), cutlass.Int32(8))
+            geometry = dict(form=form, threads=steer_rows.ADD_THREADS, hidden_multiple=8)
         pointers = [make_ptr(o.cute_dtype, 16, cute.AddressSpace.gmem, assumed_align=o.align)
-                    for o in steer_rows.OPERANDS]
-        program = b12x_compile(steer_rows.steer_rows_launch(form), *pointers,
-                               cutlass.Int64(1), cutlass.Int32(1), cutlass.Int32(128),
-                               cutlass.Int32(1), cuda.CUstream(0))
+                    for o in operands]
+        program = b12x_compile(launch, *pointers, *scalars, cuda.CUstream(0))
         program.export_to_c(str(destination), stem, symbol)
         header = (destination / (stem + ".h")).read_text()
         signature = re.search(r"static inline int32_t cute_dsl_" + symbol + r"_wrapper\(([^)]*)\)", header)
         if signature is None:
-            raise ValueError("missing generated steer_rows wrapper")
+            raise ValueError(f"missing generated {stem} wrapper")
         expected = [symbol + "_Kernel_Module_t *module"]
-        expected += ["void *" + name for name in POINTERS]
-        expected += [f"{ctype} {name}" for name, ctype in SCALARS]
+        expected += ["void *" + name for name in pointer_names]
+        expected += [f"{ctype} {name}" for name, ctype in scalar_types]
         expected += ["cudaStream_t stream"]
         if re.sub(r"\s+", "", signature[1]) != re.sub(r"\s+", "", ",".join(expected)):
-            raise ValueError("unexpected generated steer_rows ABI: " + signature[1])
+            raise ValueError(f"unexpected generated {stem} ABI: " + signature[1])
         artifacts = {p.name: hashlib.sha256(p.read_bytes()).hexdigest()
             for p in sorted(destination.glob(stem + ".*")) if p.is_file() and p != manifest_path}
         manifest = dict(schema=1, sparkinfer_revision=_pinned_sparkinfer.REVISION,
             source_tree_sha256=_pinned_sparkinfer.LOCK_DATA["source_tree_sha256"],
-            capability=list(capability),
-            geometry=dict(form=form, threads=steer_rows.THREADS, max_hidden=steer_rows.MAX_HIDDEN,
-                          max_k=1 if form == "one" else steer_rows.MAX_K, hidden_multiple=128),
-            abi=dict(pointers=list(POINTERS), scalars=[n for n, _ in SCALARS], stream="stream"),
+            capability=list(capability), geometry=geometry,
+            abi=dict(pointers=list(pointer_names), scalars=[n for n, _ in scalar_types], stream="stream"),
             artifacts=artifacts)
         manifest_path.write_text(json.dumps(manifest, indent=2) + "\n")
         print(manifest_path, flush=True)

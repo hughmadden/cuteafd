@@ -16,6 +16,9 @@
 //! - `s` starts at `+0` and takes `s = fma(a_j, t_j, s)` for `j` ascending.
 //!
 //! A row's result depends only on its own inputs (batch-invariant).
+//!
+//! [`add_rows_ref`] is the reference of `cuteafd_add_rows`, the stored-delta
+//! site: `y = bf16_rne(y + d)` on the rows of variants that carry a delta.
 
 /// Threads per row in the kernel.
 pub const STEER_THREADS: usize = 512;
@@ -145,6 +148,28 @@ pub fn steer_rows_ref(x: &mut [u16], ld: usize, rows: usize, h: usize, vidx: &[i
     }
 }
 
+/// Host reference of `cuteafd_add_rows`: `y[r][i] = bf16_rne(y[r][i] +
+/// d[r][i])` on the first `h` columns of each row with `v = vidx[r] > 0` and
+/// `on[v] != 0`; other rows are untouched. One FP32 add per element.
+///
+/// # Panics
+/// On short slices, `ld_y < h`, `ld_d < h`, or a `vidx` value at or beyond
+/// `on.len()`.
+#[allow(clippy::too_many_arguments)]
+pub fn add_rows_ref(y: &mut [u16], ld_y: usize, d: &[f32], ld_d: usize, rows: usize, h: usize,
+    vidx: &[i32], on: &[i32]) {
+    assert!(ld_y >= h && ld_d >= h && vidx.len() >= rows, "add_rows_ref shape");
+    for (r, &v) in vidx[..rows].iter().enumerate() {
+        if v <= 0 || on[v as usize] == 0 {
+            continue;
+        }
+        let delta = &d[r * ld_d..r * ld_d + h];
+        for (out, &dv) in y[r * ld_y..r * ld_y + h].iter_mut().zip(delta) {
+            *out = f32_to_bf16_rne(bf16_to_f32(*out) + dv);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -220,5 +245,24 @@ mod tests {
         steer_rows_ref(&mut clamped, h, 1, h, &[1], &table, &table, &[0, 9], k_max);
         steer_rows_ref(&mut exact, h, 1, h, &[1], &table, &table, &[0, 2], k_max);
         assert_eq!(clamped, exact);
+    }
+
+    #[test]
+    fn add_rows_adds_only_enabled_variant_rows() {
+        let (h, ld_y, ld_d) = (16, 24, 20);
+        let mut seed = 21;
+        let mut y: Vec<u16> = (0..4 * ld_y).map(|_| f32_to_bf16_rne(lcg(&mut seed))).collect();
+        let d: Vec<f32> = (0..4 * ld_d).map(|_| lcg(&mut seed) * 0.25).collect();
+        let original = y.clone();
+        // Row 0 base, row 1 variant 1 (on), row 2 variant 2 (off), row 3 negative.
+        add_rows_ref(&mut y, ld_y, &d, ld_d, 4, h, &[0, 1, 2, -1], &[0, 1, 0]);
+        for r in [0, 2, 3] {
+            assert_eq!(y[r * ld_y..(r + 1) * ld_y], original[r * ld_y..(r + 1) * ld_y]);
+        }
+        for i in 0..h {
+            let want = f32_to_bf16_rne(bf16_to_f32(original[ld_y + i]) + d[ld_d + i]);
+            assert_eq!(y[ld_y + i], want);
+        }
+        assert_eq!(y[ld_y + h..2 * ld_y], original[ld_y + h..2 * ld_y]);
     }
 }

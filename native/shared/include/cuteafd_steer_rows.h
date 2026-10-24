@@ -20,8 +20,9 @@
 extern "C" {
 #endif
 
-/* Loads both programs onto the current device. Call once per device before
- * any graph capture; cuteafd_steer_rows loads lazily only outside capture. */
+/* Loads the steering and delta programs onto the current device. Call once
+ * per device before any graph capture; the launches load lazily only
+ * outside capture. */
 int cuteafd_steer_rows_load(void);
 
 int cuteafd_steer_rows(
@@ -31,6 +32,19 @@ int cuteafd_steer_rows(
     const float* a, const float* b,
     const int32_t* k,
     int32_t k_max, cudaStream_t stream);
+
+/* Stored-delta sites: y[r][i] = bf16_rne(float(y[r][i]) + d[r][i]) on the
+ * first h columns when v = vidx[r] > 0 and on[v] != 0; every other row is
+ * not read or written. One FP32 add and one rounding per element.
+ * h is a multiple of 8 in 8..65536, ld_y >= h and ld_d >= h are multiples of
+ * 8 and 4, y and d are 16-byte aligned; anything else returns
+ * cudaErrorInvalidValue. rows == 0 launches nothing. */
+int cuteafd_add_rows(
+    __nv_bfloat16* y, int64_t ld_y,
+    const float* d, int64_t ld_d,
+    int32_t rows, int32_t h,
+    const int32_t* vidx, const int32_t* on,
+    cudaStream_t stream);
 
 #ifdef __cplusplus
 }
