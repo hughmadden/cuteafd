@@ -450,7 +450,8 @@ struct CuteafdRdmaRcEndpointHandle {
   size_t recv_registered_span_bytes = 0;
   uint64_t host_buffer_flags = CUTEAFD_HOST_BUFFER_FLAG_NONE;
   // GPU landing: receives scatter the first `landing_header_bytes` into the
-  // host slot and the rest into this dma-buf registered device range.
+  // host slot and the rest into this registered range (device memory over
+  // dma-buf, or pinned host memory where the GPU has no dma-buf).
   ibv_mr* landing_mr = nullptr;
   unsigned char* landing_ptr = nullptr;
   size_t landing_bytes = 0;
@@ -3709,7 +3710,7 @@ extern "C" cuteafd_status_t cuteafd_rdma_rc_endpoint_post_recv_at(
   recv_wr.sg_list = recv_sge;
   recv_wr.num_sge = 1;
   if (endpoint->landing_mr != nullptr) {
-    // Header to the host slot, payload straight into device memory.
+    // Header to the host slot, payload straight into the landing range.
     recv_sge[0].length = static_cast<uint32_t>(std::min(bytes, endpoint->landing_header_bytes));
     recv_sge[1].addr = reinterpret_cast<uintptr_t>(endpoint->landing_ptr);
     recv_sge[1].length = static_cast<uint32_t>(endpoint->landing_bytes);
@@ -3817,9 +3818,22 @@ extern "C" cuteafd_status_t cuteafd_rdma_rc_endpoint_set_recv_landing(
     return fail(CUTEAFD_STATUS_INVALID_ARGUMENT, "GPU landing extent is invalid");
   }
   ibv_mr* mr = nullptr;
-  const cuteafd_status_t status = register_device_dmabuf(endpoint->pd, device_ptr, bytes, &mr);
-  if (status != CUTEAFD_STATUS_OK) {
-    return status;
+  unsigned int memory_type = 0;
+  if (cuPointerGetAttribute(&memory_type, CU_POINTER_ATTRIBUTE_MEMORY_TYPE,
+                            reinterpret_cast<CUdeviceptr>(device_ptr)) == CUDA_SUCCESS &&
+      memory_type == CU_MEMORYTYPE_HOST) {
+    // Pinned, device-mapped host planes (GPUs without dma-buf): an ordinary
+    // MR, and the GPU reads the landed rows in place after its completion wait.
+    mr = ibv_reg_mr(endpoint->pd, device_ptr, bytes, IBV_ACCESS_LOCAL_WRITE);
+    if (mr == nullptr) {
+      return fail(CUTEAFD_STATUS_RDMA_UNAVAILABLE,
+                  std::string("ibv_reg_mr failed for host landing: ") + std::strerror(errno));
+    }
+  } else {
+    const cuteafd_status_t status = register_device_dmabuf(endpoint->pd, device_ptr, bytes, &mr);
+    if (status != CUTEAFD_STATUS_OK) {
+      return status;
+    }
   }
   endpoint->landing_mr = mr;
   endpoint->landing_ptr = static_cast<unsigned char*>(device_ptr);

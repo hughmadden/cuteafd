@@ -3,7 +3,8 @@
 //! rows into a pinned, device-mapped [`mailbox`] and publishes a sequence
 //! number there (`cuteafd_host_signal`); this lane's thread spins on it,
 //! builds and posts the request, receives every rank's partials straight
-//! into device memory (GPU landing) and publishes the wave's completion
+//! into their planes (device memory over dma-buf, or pinned device-mapped
+//! host memory on GPUs without it) and publishes the wave's completion
 //! sequence, which the stream waits on (`cuteafd_peer_wait`) before its
 //! reduce. The inference thread neither synchronizes nor parses per layer,
 //! and a step's layers can be queued (and captured) back to back.
@@ -192,7 +193,7 @@ impl SparkDeviceLane {
     /// Connects a [`SparkExperts::new_world`] transport on a new thread whose
     /// waves come from the GPU through `mailbox` (host address of
     /// [`mailbox::bytes`] pinned, device-mapped bytes, zeroed) and land in
-    /// `landing` (one device range per rank). A rank that does not land in
+    /// `landing` (one device or pinned host range per rank). A rank that does not land in
     /// device memory has its rows copied there on `cuda_device`. `warm`, a
     /// full-capacity request, is exchanged once at setup (connections and
     /// ring sizes; its partials land in the planes before the engine runs).
@@ -254,7 +255,7 @@ impl SparkDeviceLane {
                         let wave = transport.dispatch_wave(request)?;
                         let receipt = runtime.block_on(transport.receive_wave(wave, |_, _, _| Ok(())))?;
                         ensure!(receipt.landed.count_ones() as usize == transport.world_size(),
-                            "device lane warm-up: ranks {:#b} of {} landed in GPU memory", receipt.landed,
+                            "device lane warm-up: ranks {:#b} of {} landed in their planes", receipt.landed,
                             transport.world_size());
                     }
                     (None, _) => {}

@@ -2,7 +2,7 @@
 use super::{cache::{Cache, INDEX_PAGE_BYTES, KV_PAGE_BYTES}, execution::{BatchView, Execution, ExpertExecutor, RequestView},
     prefix::{MiniMaxPrefix, Placement}, routed::Routed, MiniMaxError};
 use crate::shared::{golden_scores::{scored_kl, scored_nll}, memory::device::Device,
-    placement::{spark_rings, SparkAdmission}, spark_intake::SparkDeviceLink,
+    placement::{spark_rings, SparkAdmission},
     token_io::{EmbedPlacement, EmbedSource, TokenEmbedding}};
 use anyhow::{ensure, Context, Result};
 use cuteafd_core::{ExpertGeometry, SparkEndpoint, SparkIngress};

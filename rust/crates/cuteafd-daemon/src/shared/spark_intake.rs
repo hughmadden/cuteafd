@@ -1394,6 +1394,10 @@ pub(crate) struct SparkDeviceLink<'a> {
     /// and completion flags here (planes, then one 64-byte flag line per rank);
     /// no receive and no host thread is involved in a wave's return.
     written: Option<DeviceAllocation<'a>>,
+    /// Host landing ([`Self::new_host_landed`]): every rank's partials land
+    /// in its plane of this pinned, device-mapped arena (planes as in write
+    /// mode), which the reducer reads in place after the completion wait.
+    hosted: Option<HostAllocation<'a>>,
     library: &'a NativeLibrary,
     capacity: usize,
     topk: usize,
@@ -1402,7 +1406,8 @@ pub(crate) struct SparkDeviceLink<'a> {
     ranks: usize,
 }
 
-/// Write mode: one plane per rank, then one 64-byte line per rank flag.
+/// Write mode and host landing: one plane per rank (write mode then adds one
+/// 64-byte line per rank flag).
 fn written_layout(ranks: usize, capacity: usize, row_bytes: usize) -> (usize, usize) {
     let plane = (capacity * row_bytes).next_multiple_of(256);
     (plane, ranks * plane)
@@ -1428,19 +1433,46 @@ impl<'a> SparkDeviceLink<'a> {
         capacity: usize, topk: usize, wire_row_bytes: usize, row_bytes: usize,
         config: cuteafd_transport::TcpTransportConfig, warm: Option<cuteafd_transport::ExpertProtocolV2Request>,
         build: cuteafd_transport::expert::DeviceBuild) -> Result<Self> {
-        use cuteafd_transport::expert::device_mailbox;
         let choice = choose_mode(library)?;
         ensure!(device_choice_available(&choice),
             "the device Spark exchange needs GPU landing, but the intake is {} ({})", choice.mode.name(), choice.reason);
+        Self::connect(library, device, world, peers, capacity, topk, wire_row_bytes, row_bytes, config, warm, build, false)
+    }
+
+    /// [`Self::new`] for a GPU the NIC cannot write (no dma-buf, as on
+    /// GeForce cards): partials land in pinned, device-mapped host planes the
+    /// reducer reads in place. The stream still never drains per wave and the
+    /// inference thread never parses or copies one.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new_host_landed(library: &'a NativeLibrary, device: i32, world: cuteafd_transport::expert::SparkWorld,
+        peers: &[std::net::SocketAddr], capacity: usize, topk: usize, wire_row_bytes: usize, row_bytes: usize,
+        config: cuteafd_transport::TcpTransportConfig, warm: Option<cuteafd_transport::ExpertProtocolV2Request>,
+        build: cuteafd_transport::expert::DeviceBuild) -> Result<Self> {
+        ensure!(!written_responses(), "Spark write mode needs GPU landing");
+        Self::connect(library, device, world, peers, capacity, topk, wire_row_bytes, row_bytes, config, warm, build, true)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn connect(library: &'a NativeLibrary, device: i32, world: cuteafd_transport::expert::SparkWorld, peers: &[std::net::SocketAddr],
+        capacity: usize, topk: usize, wire_row_bytes: usize, row_bytes: usize,
+        config: cuteafd_transport::TcpTransportConfig, warm: Option<cuteafd_transport::ExpertProtocolV2Request>,
+        build: cuteafd_transport::expert::DeviceBuild, host: bool) -> Result<Self> {
+        use cuteafd_transport::expert::device_mailbox;
         library.v41_compact_reducer()?.require_plane_reduction(peers.len() as u32)?;
-        let intake = SparkIntake::new(library, IntakeMode::Gpu, peers.len(), if written_responses() { 1 } else { capacity },
-            row_bytes)?;
+        let intake = SparkIntake::new(library, IntakeMode::Gpu, peers.len(),
+            if written_responses() || host { 1 } else { capacity }, row_bytes)?;
         let mailbox = HostAllocation::new(library, device_mailbox::bytes(capacity, topk, wire_row_bytes))?;
         library.peer_exchange_initialize()?;
-        let landing = intake.landing().context("GPU intake planes")?;
         let ranks = peers.len();
+        let (plane, planes) = written_layout(ranks, capacity, row_bytes);
+        let hosted = host.then(|| HostAllocation::named(library, planes, "spark-intake")).transpose()?;
+        let landing = match &hosted {
+            Some(arena) => (0..ranks).map(|rank| DeviceLanding { ptr: arena.buffer.ptr as usize + rank * plane,
+                bytes: capacity * row_bytes }).collect(),
+            None => intake.landing().context("GPU intake planes")?,
+        };
         let (written, targets) = if written_responses() {
-            let (plane, flags) = written_layout(ranks, capacity, row_bytes);
+            let flags = planes;
             // dma-buf export covers the whole allocation, which must be page-sized.
             let allocation = DeviceAllocation::new(library, (flags + ranks * 64).next_multiple_of(2 << 20))?;
             library.copy_h2d(cuteafd_ffi::CuteafdDeviceBuffer { ptr: unsafe { allocation.buffer.ptr.cast::<u8>()
@@ -1450,7 +1482,7 @@ impl<'a> SparkDeviceLink<'a> {
                 plane_bytes: capacity * row_bytes, flag_offset: flags + rank * 64 }).collect();
             (Some(allocation), Some(targets))
         } else { (None, None) };
-        // SAFETY: the mailbox and the intake planes are fields of this link,
+        // SAFETY: the mailbox and the landing planes are fields of this link,
         // dropped after the lane (which joins its thread first); the engine
         // publishes a wave only after it waited for the previous one and
         // reduced its planes (`dispatch` follows `collect` + `reduce` in
@@ -1460,9 +1492,9 @@ impl<'a> SparkDeviceLink<'a> {
                 config, landing, device, mailbox.buffer.ptr as usize, mailbox.buffer.bytes, topk, wire_row_bytes,
                 warm, targets, build)?
         };
-        tracing::info!(ranks, capacity, written = written.is_some(),
-            "device-driven Spark exchange ready (proxy thread posts; responses land in GPU memory)");
-        Ok(Self { lane, intake, mailbox, written, library, capacity, topk, wire_row_bytes, row_bytes, ranks })
+        tracing::info!(ranks, capacity, written = written.is_some(), landing = if host { "host" } else { "gpu" },
+            "device-driven Spark exchange ready (proxy thread posts; the stream waits and reduces)");
+        Ok(Self { lane, intake, mailbox, written, hosted, library, capacity, topk, wire_row_bytes, row_bytes, ranks })
     }
 
     pub(crate) fn world_size(&self) -> usize {
@@ -1471,18 +1503,19 @@ impl<'a> SparkDeviceLink<'a> {
 
     /// Plane pointers for the compact reducer.
     pub(crate) fn pointers(&self) -> [*const u16; MAX_INTAKE_RANKS] {
-        match &self.written {
-            Some(allocation) => {
-                let (plane, _) = written_layout(self.ranks, self.capacity, self.row_bytes);
-                let mut pointers = [std::ptr::null::<u16>(); MAX_INTAKE_RANKS];
-                for (rank, slot) in pointers.iter_mut().enumerate().take(self.ranks) {
-                    // SAFETY: rank planes lie inside the written allocation.
-                    *slot = unsafe { allocation.buffer.ptr.cast::<u8>().add(rank * plane) }.cast();
-                }
-                pointers
-            }
-            None => self.intake.pointers(),
+        let base = match (&self.written, &self.hosted) {
+            (Some(allocation), _) => allocation.buffer.ptr.cast::<u8>(),
+            (None, Some(arena)) => arena.buffer.ptr.cast::<u8>(),
+            (None, None) => return self.intake.pointers(),
+        };
+        let (plane, _) = written_layout(self.ranks, self.capacity, self.row_bytes);
+        let mut pointers = [std::ptr::null::<u16>(); MAX_INTAKE_RANKS];
+        for (rank, slot) in pointers.iter_mut().enumerate().take(self.ranks) {
+            // SAFETY: rank planes lie inside the written or hosted allocation
+            // (pinned host memory is device-mapped at the same address).
+            *slot = unsafe { base.add(rank * plane) }.cast();
         }
+        pointers
     }
 
     /// Before queuing a step's waves; returns an earlier wave's error.

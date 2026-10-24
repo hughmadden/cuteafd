@@ -3,7 +3,7 @@ use super::{admission::{self, RuntimeSizing}, backend::MiniMaxBackend, cache::Ca
     execution::Execution, media::{ReadyVision, RemoteVision}, routed::Routed, MiniMaxError};
 use crate::shared::{memory::device::Device, placement::{SparkAdmission, spark_rings},
     prefix::PrefixArgs, qwen::{Encoder, scheduler::{self, Backend}},
-    spark_intake::SparkDeviceLink, token_io::{EmbedPlacement, EmbedSource, TokenEmbedding, TokenIoArgs}};
+    token_io::{EmbedPlacement, EmbedSource, TokenEmbedding, TokenIoArgs}};
 use anyhow::{Context, Result};
 use cuteafd_core::{ExpertGeometry, SparkEndpoint, SparkIngress};
 use cuteafd_loader::{families::{minimax_m3::config::MiniMaxM3Config, qwen4::Qwen4KvCache},
