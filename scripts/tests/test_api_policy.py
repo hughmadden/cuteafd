@@ -197,3 +197,55 @@ def test_shared_stores_must_be_owned_by_the_launching_user(tmp_path):
     shared = family[family.index("shared_api_state() {"):]
     assert shared.index('release_require_owned_state "$bench_dir" "$fidelity_cache"') < shared.index('mkdir -p "$fidelity_cache"')
     assert 'release_require_writable_state "$bench_dir" "$fidelity_cache"' in shared
+
+
+def gateway_args(**config):
+    """run-family.sh's shared_gateway_args against a config, as its `get` reads it."""
+    family = (ROOT / "scripts/launch/run-family.sh").read_text()
+    start = family.index("shared_gateway_args() {")
+    body = family[start:family.index("\n}\n", start) + 3]
+    entries = " ".join(f"[{key}]={value}" for key, value in config.items())
+    script = f'''set -euo pipefail
+declare -A cfg=({entries})
+get() {{ printf '%s' "${{cfg[$1]:-${{2:-}}}}"; }}
+api_args=(--enable-bench)
+{body}
+shared_gateway_args
+printf '%s\\n' "${{api_args[@]}}"
+'''
+    return subprocess.run(["bash", "-c", script], capture_output=True, text=True)
+
+
+def test_client_protocol_policy_forwards_only_explicit_settings():
+    unset = gateway_args()
+    assert unset.returncode == 0, unset.stderr
+    assert unset.stdout.split() == ["--enable-bench"]  # binary defaults (on) stay in force
+    gated = gateway_args(GATEWAY="on", OFFICIAL_MODEL_NAMES="off")
+    assert gated.returncode == 0, gated.stderr
+    assert gated.stdout.split() == ["--enable-bench", "--gateway", "on", "--official-model-names", "off"]
+    assert gateway_args(OFFICIAL_MODEL_NAMES="on").stdout.split()[-2:] == ["--official-model-names", "on"]
+    for key in ("GATEWAY", "OFFICIAL_MODEL_NAMES"):
+        bad = gateway_args(**{key: "maybe"})
+        assert bad.returncode == 2 and f"{key} must be on or off" in bad.stderr
+    family = (ROOT / "scripts/launch/run-family.sh").read_text()
+    shared = family[family.index("shared_api_state() {"):family.index("shared_gateway_args() {")]
+    assert "\nshared_gateway_args\n}" in shared  # every family's serve path forwards it
+
+
+def test_official_model_names_key_is_accepted_by_every_launch_path(tmp_path):
+    config = tmp_path / "gate.config"
+    config.write_text((ROOT / "cuteafd.config").read_text() + "\nOFFICIAL_MODEL_NAMES=off\n")
+    script = f'''set -euo pipefail
+source "{COMMON}"
+release_known_key OFFICIAL_MODEL_NAMES
+release_load_config "{config}" stop
+'''
+    result = subprocess.run(["bash", "-c", script], capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+    family = (ROOT / "scripts/launch/run-family.sh").read_text()
+    for lister in ("_family_allowed_keys() {", "_v41_allowed_keys() {"):
+        listing = family[family.index(lister):]
+        assert "\nOFFICIAL_MODEL_NAMES\n" in listing[:listing.index("\nEOF") + 1]
+    # The daemon's flag this forwards, on by default in serving.
+    api = (ROOT / "rust/crates/cuteafd-daemon/src/shared/api.rs").read_text()
+    assert 'pub official_model_names: String' in api and 'official_model_names: "on".into()' in api
