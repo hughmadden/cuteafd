@@ -299,6 +299,13 @@ mod draft_cli_tests {
 pub(crate) struct GoldenArgs {
     #[command(flatten)]
     pub engine: EngineArgs,
+    /// Weight variants to configure (as serve-glm's --variant).
+    #[command(flatten)]
+    pub variants: crate::shared::variants::VariantArgs,
+    /// Run the golden's sequences as this --variant index; 0 runs base rows with the
+    /// variants configured but unused (the base byte-exactness gate).
+    #[arg(long, default_value_t = 0)]
+    pub golden_variant: u8,
     /// Directory with tokens.bin, layerNN.bin and logits.bin from
     /// python/reference/families/glm5/golden.py.
     #[arg(long)]
@@ -1066,6 +1073,10 @@ fn similarity(a: &[f32], b: &[f32]) -> (f64, f64) {
 
 pub(crate) async fn run_golden(mut args: GoldenArgs) -> Result<()> {
     args.engine.full_prefill_logits |= args.nll || args.resume_at.is_some();
+    args.engine.served_id = "golden".into();
+    args.engine.variants = args.variants.indexed(&args.engine.served_id)?;
+    ensure!(args.golden_variant == 0 || args.engine.variants.iter().any(|(index, _)| *index == args.golden_variant),
+        "--golden-variant {} names no --variant", args.golden_variant);
     tokio::task::spawn_blocking(move || golden(args)).await?
 }
 
@@ -1265,6 +1276,11 @@ fn golden(args: GoldenArgs) -> Result<()> {
 
 fn golden_run(args: &GoldenArgs, opened: &Opened, engine: &engine::GlmEngine<'_>, mut transport: Option<&mut SparkLink<'_>>,
     runtime: &tokio::runtime::Runtime) -> Result<()> {
+    if args.golden_variant != 0 {
+        ensure!(engine.variants.as_ref().is_some_and(|v| v.records.iter().any(|r| r.index == args.golden_variant)),
+            "--golden-variant {}: that variant did not verify, so it is unavailable", args.golden_variant);
+    }
+    engine.golden_variant.set(args.golden_variant);
     if let Some(dir) = &args.draft_oracle {
         return draft_oracle(args, opened, engine, dir);
     }
