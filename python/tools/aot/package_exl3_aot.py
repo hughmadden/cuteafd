@@ -360,9 +360,12 @@ def warp_specialized(geometry: str, role: str, width: int, capacity: int) -> boo
     GLM TP3 640 included) and at m128/m256. Decode capacities (<= 80 rows)
     keep the cooperative kernel.
     """
-    if role != 'spark' or geometry not in ('dsv4p', 'glm', 'glmf'):
+    if role != 'spark':
         return False
-    return capacity >= 256
+    if geometry == 'kimik3':
+        # Qualified ordinary TP6 slices; compact ownership and smaller packages stay off.
+        return width == 512 and capacity >= 1024
+    return geometry in ('dsv4p', 'glm', 'glmf') and capacity >= 256
 
 
 def compact_warp_specialized(geometry: str, role: str, width: int, capacity: int) -> bool:
@@ -821,6 +824,10 @@ def build(args: argparse.Namespace) -> None:
                                     and warp_specialized(geometry, args.role, width, capacity))
                 if ws:
                     block = 32 if compact_ws else 64
+                    if geometry == 'kimik3':
+                        # Existing policy-keyed directories contain cooperative exports.
+                        profile_dir = profile_dir.with_name(f'{profile_dir.name}+ws-m{block}')
+                        raw = profile_dir / f'm{capacity}'
                 if block != 8:
                     options['route_block'] = block
                 if ws:
