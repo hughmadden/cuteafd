@@ -103,11 +103,25 @@ Served at TP2 (spark7, spark8; RTX 5090 coordinator, FP8 KV, 4096 prefill
 rows, 16 sequences), the resident RTX tower takes 2.57 GB (its 2.50 GB ledger
 and module): at 1M context the largest admitted pool drops from 189,568 to
 152,512 tokens (-37,056), which is what the default serves, and the
-reference's 65,536-token pool fits either way. A Spark-hosted tower does not fit at TP2: it needs 3.57 GB per rank
+reference's 65,536-token pool fits either way.
+
+A Spark-hosted tower does not fit at TP2. It needs 3.57 GB per rank
 (weights, scratch, 1 GiB guard) beside 117.44 GB of experts, rings and
 workspace, against a 120.3-122.4 GB budget (MemAvailable - 3 GiB), and
-admission refuses it by name; the SM121 tower itself starts on the ranks.
-TP3 (spark7, spark8, spark10) has room and is not yet measured.
+admission refuses it by name. At TP3 (spark7, spark8, spark10, a tower on
+every rank, `--vision-peers` on the coordinator) all the live checks below
+pass, and the coordinator keeps the 2.57 GB. TTFT there, with text of the
+same length (two runs, no throttling):
+
+| TP3, Spark-hosted tower | Prompt tokens | s | text only, s |
+| --- | ---: | ---: | ---: |
+| one 672x672 image | 774 | 0.84-0.86 | 0.69-0.71 |
+| 6 s 640x480 MP4 | 1,892 | 1.82-1.85 | 1.18-1.19 |
+| the same 7 frames as PNGs | 1,892 | 1.71-1.72 | 1.18-1.19 |
+
+A remote image costs about 0.15 s over text there, against 0.06 s for the
+tower on the 5090: the GB10 encode and the round trip. Text TTFT is lower at
+TP3 because three ranks share the experts.
 
 The live checks (`scripts/qualify/minimax_m3/qualify-native-vision.py` on the
 `generate-media-fixtures.py --set semantics` fixtures) count and colour shapes,
