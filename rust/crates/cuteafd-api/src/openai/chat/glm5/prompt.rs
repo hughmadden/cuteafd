@@ -83,7 +83,7 @@ pub fn resolve_thinking(body: &Value) -> Result<bool, String> {
 
 /// The explicit switch: `thinking.type`, `enable_thinking`, then
 /// `chat_template_kwargs.enable_thinking`.
-fn thinking_switch(body: &Value) -> Result<Option<bool>, String> {
+pub(crate) fn thinking_switch(body: &Value) -> Result<Option<bool>, String> {
     if let Some(kind) = body.get("thinking").filter(|v| !v.is_null()).map(|v| &v["type"]) {
         return match kind.as_str().map(str::to_ascii_lowercase).as_deref() {
             Some("enabled" | "adaptive") => Ok(Some(true)),

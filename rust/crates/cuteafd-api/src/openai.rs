@@ -587,7 +587,9 @@ impl Templated {
     fn thinking(&self, body: &Value) -> Result<glm5::GlmThinking, String> {
         match self {
             Self::Glm(encoding) => glm5::resolve_glm_thinking(body, encoding.thinking_off()),
-            Self::Qwen(_) | Self::Kimi(_) | Self::MiniMaxM3(_) => Ok(glm5::GlmThinking { enabled: glm5::resolve_thinking(body)?, effort: None }),
+            Self::Qwen(_) | Self::Kimi(_) => Ok(glm5::GlmThinking { enabled: glm5::resolve_thinking(body)?, effort: None }),
+            Self::MiniMaxM3(_) => Ok(glm5::GlmThinking {
+                enabled: minimax_m3::Thinking::of(body)? != minimax_m3::Thinking::Off, effort: None }),
             Self::Step5(_) => {
                 step5::prompt::validate_thinking(body)?;
                 Ok(glm5::GlmThinking { enabled: true, effort: None })

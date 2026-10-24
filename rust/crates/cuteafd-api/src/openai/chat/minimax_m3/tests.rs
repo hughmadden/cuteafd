@@ -93,17 +93,24 @@ fn default_effort_adds_no_line_and_unsupported_levels_fail() {
     // Lowercased as every family does; unknown levels are the client's error.
     assert!(encoding.render(&json!({"messages": user, "reasoning_effort": "High"}), &[]).unwrap().contains("<effort>high</effort>"));
     assert!(encoding.render(&json!({"messages": user, "reasoning_effort": "turbo"}), &[]).is_err());
-    assert!(encoding.render(&json!({"messages": user, "reasoning_effort": "minimal"}), &[]).unwrap().contains("<effort>low</effort>"));
+    assert!(encoding.render(&json!({"messages": user, "reasoning_effort": "turbo", "thinking": {"type": "disabled"}}), &[]).is_err());
 }
 
 #[test]
 fn thinking_off_closes_the_reasoning_prefix() {
     let encoding = encoding();
     let user = json!([{"role": "user", "content": "Hi"}]);
-    // A budget sizes thinking: with thinking off it renders no effort line.
-    for extra in [json!({"reasoning_effort": "none"}), json!({"enable_thinking": false}),
+    // The vendor's spellings of off: a disabled switch, or effort none or minimal,
+    // which wins over a switch that says on (a Responses effort arrives as
+    // `enabled` plus the effort). With thinking off neither an effort nor a budget renders.
+    for extra in [json!({"reasoning_effort": "none"}), json!({"reasoning_effort": "minimal"}),
+        json!({"chat_template_kwargs": {"reasoning_effort": "minimal"}}), json!({"enable_thinking": false}),
         json!({"thinking": {"type": "disabled"}}), json!({"chat_template_kwargs": {"enable_thinking": false}}),
-        json!({"thinking": {"type": "disabled", "budget_tokens": 20000}})] {
+        json!({"thinking": {"type": "disabled", "budget_tokens": 20000}}),
+        json!({"thinking": {"type": "disabled"}, "reasoning_effort": "high"}),
+        json!({"enable_thinking": false, "reasoning_effort": "max"}),
+        json!({"thinking": {"type": "enabled"}, "reasoning_effort": "minimal"}),
+        json!({"thinking": {"type": "adaptive"}, "reasoning_effort": "none"})] {
         let mut body = json!({"messages": user});
         body.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
         let rendered = encoding.render(&body, &[]).unwrap();

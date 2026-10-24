@@ -754,8 +754,9 @@ async fn messages_without_thinking_do_not_reason_while_responses_and_chat_keep_d
 
 /// MiniMax M3 reads one `<effort>` level from the system prompt: Anthropic
 /// budgets bucket into it, Responses/Chat efforts pass through, the switches
-/// that turn thinking off close the reasoning prefix, an explicit enable
-/// (Anthropic `enabled`, a Responses effort) opens it, and Anthropic
+/// that turn thinking off and efforts none or minimal (as the vendor
+/// documents) close the reasoning prefix, an explicit enable (Anthropic
+/// `enabled`, a Responses effort of low or more) opens it, and Anthropic
 /// `adaptive` or a bare chat effort leaves it to the model.
 #[tokio::test]
 async fn minimax_effort_levels_follow_each_protocols_thinking_controls() {
@@ -773,6 +774,10 @@ async fn minimax_effort_levels_follow_each_protocols_thinking_controls() {
         ("/v1/responses", json!({"model":"m","input":"hi","store":false,"reasoning":{"effort":"minimal"}})),
         ("/v1/responses", json!({"model":"m","input":"hi","store":false,"reasoning":{"effort":"none"}})),
         ("/v1/chat/completions", json!({"model":"test-minimax","reasoning_effort":"medium","messages":[{"role":"user","content":"hi"}]})),
+        ("/v1/responses", json!({"model":"m","input":"hi","store":false,"reasoning":{"effort":"low"}})),
+        ("/v1/chat/completions", json!({"model":"test-minimax","reasoning_effort":"minimal","messages":[{"role":"user","content":"hi"}]})),
+        ("/v1/chat/completions", json!({"model":"test-minimax","reasoning_effort":"high","thinking":{"type":"disabled"},
+            "messages":[{"role":"user","content":"hi"}]})),
     ];
     for (path, body) in requests {
         let (status, text) = post(&app, path, body.clone()).await;
@@ -784,7 +789,8 @@ async fn minimax_effort_levels_follow_each_protocols_thinking_controls() {
     let got: Vec<_> = prompts.iter().map(|p| (effort(p), mode(p))).collect();
     let some = |level: &str, mode| (Some(level.to_owned()), mode);
     assert_eq!(got, vec![(None, "off"), some("low", "enabled"), some("high", "enabled"), some("max", "enabled"), (None, "off"),
-        some("high", "adaptive"), some("xhigh", "enabled"), some("low", "enabled"), (None, "off"), some("medium", "adaptive")]);
+        some("high", "adaptive"), some("xhigh", "enabled"), (None, "off"), (None, "off"), some("medium", "adaptive"),
+        some("low", "enabled"), (None, "off"), (None, "off")]);
 }
 
 #[tokio::test]

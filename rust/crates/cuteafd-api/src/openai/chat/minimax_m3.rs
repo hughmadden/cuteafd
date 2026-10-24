@@ -21,15 +21,21 @@ pub const INVOKE_CLOSE: &str = "]<]minimax[>[</invoke>";
 pub const IMAGE: &str = "]<]image[>[";
 pub const VIDEO: &str = "]<]video[>[";
 
-/// The template's thinking modes. Adaptive, its default (and `thinking.type:
-/// adaptive`), lets the model decide; an explicit `thinking.type: enabled`
-/// opens the block in the prompt; off closes it there.
+/// The template's thinking modes, as MiniMax's own serving documents them
+/// (SGLang cookbook): `thinking.type: enabled` always thinks (the prompt opens
+/// the block), `disabled` answers directly (the prompt closes it), and
+/// `adaptive`, the default, lets the model decide; `reasoning_effort` `none`
+/// or `minimal` turns thinking off, the same as `disabled`, and an effort is
+/// ignored while thinking is off. Either control saying off wins, so a
+/// Responses effort (sent as an enabled switch with that effort) and a chat
+/// effort agree.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Thinking { Off, Adaptive, Enabled }
 
 impl Thinking {
     pub fn of(body: &Value) -> Result<Self, String> {
-        if !super::glm5::resolve_thinking(body)? { return Ok(Self::Off); }
+        let lowest = matches!(super::glm5::prompt::reasoning_effort(body)?.as_deref(), Some("none" | "minimal"));
+        if super::glm5::prompt::thinking_switch(body)? == Some(false) || lowest { return Ok(Self::Off); }
         let enabled = body.get("thinking").and_then(|v| v["type"].as_str()).is_some_and(|t| t.eq_ignore_ascii_case("enabled"));
         Ok(if enabled { Self::Enabled } else { Self::Adaptive })
     }
