@@ -196,7 +196,9 @@ fn native_manifest_admits_bundled_dspark_and_charges_its_full_layout() {
     let on = plan::plan(dir.path(), &options).unwrap();
     assert!(on.placement_supported && on.wip_launchable(), "{:?}", on.hints);
     let contract = DsparkContract::open(dir.path()).unwrap();
-    let draft = DraftMemory::new(&contract, 16, 256, 188).unwrap();
+    // Sixteen sequences share the default eight context rings.
+    let draft = DraftMemory::new(&contract, crate::families::minimax_m3::dspark::default_ring_slots(16), 256, 188).unwrap();
+    assert_eq!(draft.slots, 8);
     let rtx = |report: &crate::plan::PlanReport| report.memory_layout.as_ref().unwrap().devices.iter()
         .find(|d| d.kind == DeviceKind::Rtx).unwrap().clone();
     let (off_rtx, on_rtx) = (rtx(&off), rtx(&on));
@@ -210,7 +212,7 @@ fn native_manifest_admits_bundled_dspark_and_charges_its_full_layout() {
     options.layout.as_mut().unwrap().physical_sms = Some(170);
     let smaller = plan::plan(dir.path(), &options).unwrap();
     assert!(smaller.placement_supported, "{:?}", smaller.hints);
-    assert_eq!(on_rtx.used_bytes() - rtx(&smaller).used_bytes(), 8_519_680);
+    assert_eq!(on_rtx.used_bytes() - rtx(&smaller).used_bytes(), 4_259_840);
     options.layout.as_mut().unwrap().prefill_rows = 6;
     options.layout.as_mut().unwrap().concurrency = 1;
     let refused = plan::plan(dir.path(), &options).unwrap();
@@ -276,9 +278,11 @@ fn native_tp2_auto_vision_preserves_text_admission() {
     assert!(memory.devices.iter().all(|d| d.used_bytes() <= d.capacity_bytes));
     assert!(memory.notes.iter().any(|n| n.starts_with("2 routed layers on the RTX")));
     assert!(!report.hints.iter().any(|h| h.what.starts_with("routed experts need ")));
+    // Logits cover decode rows, not every prefill row, so 4096-row prefill fits too.
     options.layout.as_mut().unwrap().prefill_rows = 4096;
-    let refused = plan::plan(dir.path(), &options).unwrap();
-    assert!(!refused.fits && !refused.placement_supported);
+    let wide = plan::plan(dir.path(), &options).unwrap();
+    assert!(wide.wip_launchable(), "{:?}", wide.hints);
+    assert!(wide.memory_layout.as_ref().unwrap().pool_tokens < memory.pool_tokens);
     options.layout.as_mut().unwrap().prefill_rows = 1024;
     options.layout.as_mut().unwrap().onboard = Some(crate::placement::Onboard::Layers(0));
     let refused = plan::plan(dir.path(), &options).unwrap();
@@ -356,6 +360,11 @@ fn minimax_5090_profile_honors_explicit_shapes_and_requires_draft_and_manifest()
     assert_eq!(report.prefill_rows, Some(512));
     assert!(report.memory_layout.as_ref().unwrap().notes.iter().any(|n| n.contains("sequences 4")));
     options.layout.as_mut().unwrap().draft_context_slots = Some(1);
+    let single = plan::plan(dir.path(), &options).unwrap();
+    assert!(single.placement_supported, "{:?}", single.hints);
+    let pool = |report: &crate::plan::PlanReport| report.memory_layout.as_ref().unwrap().pool_tokens;
+    assert!(pool(&single) > pool(&report), "fewer context rings leave more pool");
+    options.layout.as_mut().unwrap().draft_context_slots = Some(5);
     let refused = plan::plan(dir.path(), &options).unwrap();
     assert!(!refused.placement_supported && refused.hints.iter().any(|h| h.what.contains("draft context slots")));
     options.layout.as_mut().unwrap().draft_context_slots = Some(4);

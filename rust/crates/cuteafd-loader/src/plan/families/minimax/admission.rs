@@ -36,11 +36,21 @@ pub struct RuntimeSizing {
     pub sequences: usize,
     pub context: u64,
     pub spark_ranks: usize,
+    /// Rows one head launch projects: decode and draft rows, or every prefill
+    /// row when full prefill logits are served. Prefill otherwise projects
+    /// only the rows whose logits a request needs.
+    pub logit_rows: usize,
 }
 impl RuntimeSizing {
+    /// Head rows for a server: every prefill row with full prefill logits,
+    /// otherwise decode rows or the drafter's block rows, whichever is wider.
+    pub fn head_rows(rows: usize, full_prefill_logits: bool, draft_rows: usize) -> usize {
+        if full_prefill_logits { rows } else { rows.min(64).max(draft_rows).min(rows) }
+    }
     pub fn validate(self, cfg: &MiniMaxM3Config) -> Result<()> {
         if !(1..=4096).contains(&self.rows) || !(1..=64).contains(&self.decode_rows)
-            || self.sequences == 0 || self.sequences > self.decode_rows || self.sequences > self.rows {
+            || self.sequences == 0 || self.sequences > self.decode_rows || self.sequences > self.rows
+            || self.logit_rows < self.decode_rows || self.logit_rows > self.rows {
             return Err(AdmissionError::Unsupported("row capacity or sequence count"));
         }
         if self.context == 0 || self.context > cfg.max_position as u64 {
@@ -142,9 +152,9 @@ impl RuntimeLedger {
             ("shared", h, 2), ("routed", h, 2), ("router_logits", 128, 4), ("route_ids", 4, 4),
             ("route_weights", 4, 4), ("token_ids", 1, 4), ("positions", 1, 8), ("slots", 1, 8), ("batch_ids", 1, 4),
         ] { add(name, &[r, width, bytes])?; }
-        add("head_input", &[r, h, 2])?;
+        add("head_input", &[sizing.logit_rows as u64, h, 2])?;
         add("head_workspace", &[4 << 20])?;
-        add("logits", &[r, cfg.vocab_size as u64, 4])?;
+        add("logits", &[sizing.logit_rows as u64, cfg.vocab_size as u64, 4])?;
         add("q2k", &[4, d, 16, 4])?;
         add("lse", &[d, 64, 4])?;
         add("page_table", &[d, sizing.context.div_ceil(PAGE_ROWS), 4])?;
@@ -311,7 +321,7 @@ pub(crate) mod tests {
             .collect::<serde_json::Map<_, _>>();
         serde_json::json!({"layouts":layouts})
     }
-    fn sizing() -> RuntimeSizing { RuntimeSizing { rows: 256, decode_rows: 64, sequences: 16, context: 1 << 20, spark_ranks: 3 } }
+    fn sizing() -> RuntimeSizing { RuntimeSizing { rows: 256, decode_rows: 64, sequences: 16, context: 1 << 20, spark_ranks: 3, logit_rows: 64 } }
     fn config() -> MiniMaxM3Config { MiniMaxM3Config::from_hf(&release_config()).unwrap() }
 
     #[test]
@@ -320,7 +330,11 @@ pub(crate) mod tests {
         let programs = ProgramSizes::from_manifest(&programs_manifest(), sizing).unwrap();
         let ledger = RuntimeLedger::new(&config(), sizing, &programs).unwrap();
         assert_eq!(ledger.bytes("residual"), Some(256 * 6144 * 4));
-        assert_eq!(ledger.bytes("logits"), Some(256 * config().vocab_size as u64 * 4));
+        assert_eq!(ledger.bytes("logits"), Some(64 * config().vocab_size as u64 * 4));
+        assert_eq!(ledger.bytes("head_input"), Some(64 * 6144 * 2));
+        let full = RuntimeSizing { logit_rows: 256, ..sizing };
+        assert_eq!(RuntimeLedger::new(&config(), full, &programs).unwrap().bytes("logits"),
+            Some(256 * config().vocab_size as u64 * 4));
         assert_eq!(ledger.bytes("q2k"), Some(4 * 64 * 16 * 4));
         assert_eq!(ledger.bytes("page_table"), Some(64 * 16384 * 4));
         assert_eq!(ledger.bytes("scratch"), Some(53_478_400));

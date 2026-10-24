@@ -285,7 +285,8 @@ impl Runner<'_, '_> {
         let drained = self.execution.drain();
         embedded?; drained?;
         let output = self.execution.execute_through(&self.embedded, &batch, &self.cache.layers,
-            &mut *self.experts, if prefill {ExpertV2SourceKind::Prefill} else {ExpertV2SourceKind::Decode}, self.last_layer)?;
+            &mut *self.experts, if prefill {ExpertV2SourceKind::Prefill} else {ExpertV2SourceKind::Decode}, self.last_layer,
+            0..tokens.len())?;
         let values = if let Some(logits) = output { logits.to_host(self.cache.library)? } else {
             let hidden = self.execution.hidden(tokens.len())?;
             let mut bytes = vec![0; tokens.len() * 6144 * 4];
@@ -475,7 +476,7 @@ pub(crate) async fn run_golden(args: GoldenArgs) -> Result<()> {
     let context = windows.iter().map(|w| w.tokens.len()).max().unwrap().div_ceil(64) * 64;
     ensure!(!args.check_prefix || windows[0].tokens.len() >= 66, "prefix qualification needs 66 tokens in first window");
     let sizing = admission::RuntimeSizing {rows:args.prefill_rows as usize, decode_rows:(args.prefill_rows as usize).min(64),
-        sequences:1, context:context as u64, spark_ranks:args.peers.len()};
+        sequences:1, context:context as u64, spark_ranks:args.peers.len(), logit_rows:args.prefill_rows as usize};
     let program_sizes = admission::ProgramSizes::from_manifest(&read_json(&args.manifest)?, sizing)?;
     let ledger = admission::RuntimeLedger::new(&cfg, sizing, &program_sizes)?;
     let package = crate::shared::experts::fp8::package_directory(native, 1, cuteafd_loader::formats::fp8_experts::ExpertFormat::Nvfp4);

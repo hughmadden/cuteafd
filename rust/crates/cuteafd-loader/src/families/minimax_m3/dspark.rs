@@ -47,8 +47,14 @@ pub struct DsparkContract {
     pub sample_from_anchor: bool,
 }
 
+/// Drafter context rings when none are requested: a ring is assigned to a
+/// request for its life, and the draft policy stops paying past a few
+/// concurrent drafting sequences (expert fan-in grows with drafted rows).
+pub fn default_ring_slots(sequences: usize) -> usize { sequences.min(8) }
+
 /// The drafter's own allocations; target step scratch and the borrowed head
-/// and embedding remain in the target ledger.
+/// and embedding remain in the target ledger. `slots` counts context rings,
+/// which the server maps onto scheduler slots (at most one per request).
 #[derive(Debug, Clone)]
 pub struct DraftMemory {
     pub buffers: std::collections::BTreeMap<&'static str, usize>,

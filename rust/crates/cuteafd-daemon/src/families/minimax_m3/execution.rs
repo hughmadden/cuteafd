@@ -71,6 +71,7 @@ pub(super) struct Execution<'a> {
     scratch: Scratch<'a>,
     cfg: MiniMaxM3Config,
     rows:usize,
+    logit_rows:usize,
     context:usize,
     decode_rows:usize,
     table_stride:usize,
@@ -89,6 +90,7 @@ impl<'a> Execution<'a> {
         ensure!(cfg.moe[..3].iter().all(|v|!*v) && cfg.moe[3..].iter().all(|v|*v),
             MiniMaxError::Unsupported("dense/routed layer ordering"));
         let rows=usize::try_from(ledger.bytes("norm").context("MiniMax norm admission")? / (6144*2))?;
+        let logit_rows=usize::try_from(ledger.bytes("logits").context("MiniMax logits admission")? / (cfg.vocab_size as u64*4))?;
         let context=usize::try_from(ledger.bytes("cos").context("MiniMax rope admission")? / 64)?;
         let commands=Commands::new(device.library,device.id,programs)?;
         let decode_rows=commands.capacity("minimax_index_decode")?;
@@ -106,8 +108,8 @@ impl<'a> Execution<'a> {
         commands.upload(scratch.get("v_descale")?,&ones)?;
         commands.upload(scratch.get("batch_ids")?,&vec![0;rows*4])?;
         commands.drain()?;
-        let head=TargetHeadOwner::new(&commands,&scratch,rows,cfg.vocab_size)?;
-        Ok(Self{commands,head,weights,scratch,cfg:cfg.clone(),rows,context,decode_rows,table_stride,
+        let head=TargetHeadOwner::new(&commands,&scratch,logit_rows,cfg.vocab_size)?;
+        Ok(Self{commands,head,weights,scratch,cfg:cfg.clone(),rows,logit_rows,context,decode_rows,table_stride,
             poisoned:std::cell::Cell::new(false),diagnostics,draft:None,draft_causal:false})
     }
     pub fn load_draft(&mut self, contract:&cuteafd_loader::families::minimax_m3::dspark::DsparkContract,
@@ -141,19 +143,23 @@ impl<'a> Execution<'a> {
     }
     pub fn stream(&self)->*mut std::ffi::c_void { self.commands.raw() }
     pub fn drain(&self)->Result<()> { self.commands.drain() }
+    /// Runs every layer; the head projects only `logits` (batch rows), and an
+    /// empty range skips it.
     pub fn execute(&self, embedded:&Buffer<'a>, batch:&BatchView, caches:&[LayerCache<'a>],
-        experts:&mut dyn ExpertExecutor<'a>, kind:ExpertV2SourceKind) -> Result<DeviceLogits> {
-        self.execute_through(embedded,batch,caches,experts,kind,self.cfg.layers-1)?
-            .context("MiniMax complete execution has no logits")
+        experts:&mut dyn ExpertExecutor<'a>, kind:ExpertV2SourceKind, logits:std::ops::Range<usize>) -> Result<Option<DeviceLogits>> {
+        self.execute_through(embedded,batch,caches,experts,kind,self.cfg.layers-1,logits)
     }
     pub fn hidden(&self,rows:usize)->Result<Buffer<'a>> {
         ensure!(rows>0 && rows<=self.rows,MiniMaxError::Invalid("hidden row extent"));
         self.scratch.get("residual")?.view(0,rows*6144*4)
     }
     pub fn execute_through(&self, embedded:&Buffer<'a>, batch:&BatchView, caches:&[LayerCache<'a>],
-        experts:&mut dyn ExpertExecutor<'a>, kind:ExpertV2SourceKind, last_layer:usize) -> Result<Option<DeviceLogits>> {
+        experts:&mut dyn ExpertExecutor<'a>, kind:ExpertV2SourceKind, last_layer:usize,
+        logits:std::ops::Range<usize>) -> Result<Option<DeviceLogits>> {
         ensure!(!self.poisoned.get(),MiniMaxError::Invalid("previous native execution failure; restart required"));
         ensure!(last_layer<self.cfg.layers,MiniMaxError::Invalid("last execution layer"));
+        ensure!(logits.end<=batch.positions.len() && logits.len()<=self.logit_rows,
+            MiniMaxError::Invalid("head rows exceed the batch or the admitted logits"));
         let mut diagnostics=self.diagnostics.borrow_mut();
         ensure!(diagnostics.as_ref().is_none_or(|d|d.layer<=last_layer),MiniMaxError::Invalid("diagnostic layer not executed"));
         ensure!(matches!(kind,ExpertV2SourceKind::Decode|ExpertV2SourceKind::Prefill),
@@ -196,8 +202,9 @@ impl<'a> Execution<'a> {
                     diagnostics.as_mut().context("MiniMax diagnostic owner")?.finish(d)?;
                 }
             }
-            if last_layer+1==self.cfg.layers { self.head.logits(&self.commands,&self.weights,&self.scratch,rows).map(Some) }
-            else { Ok(None) }
+            if last_layer+1==self.cfg.layers && !logits.is_empty() {
+                self.head.logits(&self.commands,&self.weights,&self.scratch,logits).map(Some)
+            } else { Ok(None) }
         })();
         // All device/cache/expert borrows end only after queued work retires.
         let drained=self.commands.drain();

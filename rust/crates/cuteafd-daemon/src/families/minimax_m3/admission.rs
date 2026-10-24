@@ -124,7 +124,7 @@ mod tests {
         let measured_baseline: u64 = device.items.iter().filter(|i| i.category == cuteafd_core::memory_layout::Category::Runtime)
             .map(|i| i.bytes).sum();
         let mut live = solve(&checkpoint, &programs, None, Request {
-            sizing: RuntimeSizing { rows: 256, decode_rows: 64, sequences: 16, context: 4096, spark_ranks: 3 },
+            sizing: RuntimeSizing { rows: 256, decode_rows: 64, sequences: 16, context: 4096, spark_ranks: 3, logit_rows: 64 },
             available: options.rtx_bytes[0] - measured_baseline, requested_pool: Some(4096),
             kv_format: Qwen4KvCache::Fp8, onboard: None, spark_budget: 108 << 30, headroom: 0, draft_bytes:0, host_embedding,
         })?;
@@ -136,7 +136,7 @@ mod tests {
         assert_eq!(live.spark_layers, (3..60).collect::<Vec<_>>());
         assert_eq!(live.ledger.bytes("head_workspace"), Some(cuteafd_ffi::programs::VOCABULARY_HEAD_WORKSPACE as u64));
         let cfg = MiniMaxM3Config::from_hf(&checkpoint.config)?;
-        assert!(live.readmit(&cfg, RuntimeSizing { rows: 256, decode_rows: 64, sequences: 16,
+        assert!(live.readmit(&cfg, RuntimeSizing { rows: 256, decode_rows: 64, sequences: 16, logit_rows: 64,
             context: 4096, spark_ranks: 3 }, live.cache.total_bytes - 1, Some(4096), Qwen4KvCache::Fp8).is_err());
         Ok(())
     }

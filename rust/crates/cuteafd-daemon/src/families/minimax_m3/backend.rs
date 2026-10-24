@@ -22,16 +22,37 @@ fn accept_step(step: Step, verified: &mut [scheduler::Verified<'_, Placement, St
     Ok(())
 }
 
-fn accept_context(verified: &mut [scheduler::Verified<'_, Placement, State, ()>],
+/// Drafter context rings by scheduler slot: a request holds one for its life
+/// (bound at admission, released on cancel); requests admitted while every
+/// ring is taken decode target-only, their draft state never ready.
+#[derive(Debug)]
+pub(super) struct Rings { owner: Vec<Option<usize>>, free: Vec<usize> }
+impl Rings {
+    pub fn new(slots: usize, rings: usize) -> Self { Self { owner: vec![None; slots], free: (0..rings).rev().collect() } }
+    fn bind(&mut self, slot: usize) -> Result<()> {
+        self.release(slot)?;
+        if let Some(ring) = self.free.pop() { self.owner[slot] = Some(ring); }
+        Ok(())
+    }
+    fn release(&mut self, slot: usize) -> Result<()> {
+        let owner = self.owner.get_mut(slot).ok_or(MiniMaxError::Invalid("draft ring slot"))?;
+        if let Some(ring) = owner.take() { self.free.push(ring); }
+        Ok(())
+    }
+    fn of(&self, slot: usize) -> Option<usize> { self.owner.get(slot).copied().flatten() }
+}
+
+fn accept_context(verified: &mut [scheduler::Verified<'_, Placement, State, ()>], rings: &Rings,
     update: impl FnOnce(&[crate::shared::speculation::dflash::ContextRow])->Result<()>) -> Result<()> {
         let mut context=Vec::new();
         let mut states=Vec::new();
         for (index,v) in verified.iter().enumerate() {
             let Some((keep,after))=v.neural_kept() else {continue};
+            let Some(ring)=rings.of(v.placement.sequence) else {continue};
             ensure!(keep>0 && keep<=v.rows.len(),MiniMaxError::Invalid("draft accepted prefix"));
             let mut state=v.seq.clone(); state.advance(v.start,keep,Some(after))?;
             context.extend((0..keep).map(|offset|crate::shared::speculation::dflash::ContextRow {
-                tap_row:v.first_row+offset,slot:v.placement.sequence,position:v.start+offset }));
+                tap_row:v.first_row+offset,slot:ring,position:v.start+offset }));
             states.push((index,state));
         }
         if !context.is_empty() {update(&context)?;}
@@ -52,10 +73,13 @@ pub(super) struct MiniMaxBackend<'e, 'a> {
     pub pending: RefCell<Option<Step>>,
     pub timing: RefCell<[f64; 2]>,
     pub probe: RefCell<RoundRoutes>,
+    pub rings: RefCell<Rings>,
+    pub full_prefill_logits: bool,
 }
 impl<'e, 'a> MiniMaxBackend<'e, 'a> {
+    /// One step; the head projects only the batch rows in `logits`.
     fn execute(&self, sequences: &mut [(&mut Placement, &[u32])], pool: &RefPagePool,
-        prefill: bool) -> Result<(Step, DeviceLogits)> {
+        prefill: bool, logits: std::ops::Range<usize>) -> Result<(Step, Option<DeviceLogits>)> {
         self.pending.borrow_mut().take();
         let mut step = Step::begin(sequences, pool, self.cache.sequences, self.rows,
             self.cache.context, self.cache.pages)?;
@@ -90,7 +114,7 @@ impl<'e, 'a> MiniMaxBackend<'e, 'a> {
         let started = std::time::Instant::now();
         let kind = if prefill { cuteafd_transport::ExpertV2SourceKind::Prefill }
             else { cuteafd_transport::ExpertV2SourceKind::Decode };
-        let result = self.execution.execute(&self.embedded, &batch, &self.cache.layers, &mut *self.experts.borrow_mut(), kind);
+        let result = self.execution.execute(&self.embedded, &batch, &self.cache.layers, &mut *self.experts.borrow_mut(), kind, logits);
         let logits = result?;
         self.timing.borrow_mut()[usize::from(!prefill)] += started.elapsed().as_secs_f64();
         step.completed();
@@ -109,7 +133,8 @@ impl<'e, 'a> Backend<'a> for MiniMaxBackend<'e, 'a> {
 
     fn geometry(&self) -> scheduler::Geometry {
         scheduler::Geometry { family: "minimax_m3", vocab_size: self.vocabulary, max_context: self.cache.context,
-            slots: self.cache.sequences, prefill_rows: self.rows, decode_rows: self.rows.min(64), full_prefill_logits: true }
+            slots: self.cache.sequences, prefill_rows: self.rows, decode_rows: self.rows.min(64),
+            full_prefill_logits: self.full_prefill_logits }
     }
     fn message_starts(&self) -> &[&str] { &["]~b]"] }
     fn library(&self) -> &'a NativeLibrary { self.cache.library }
@@ -137,7 +162,9 @@ impl<'e, 'a> Backend<'a> for MiniMaxBackend<'e, 'a> {
             media: RequestMedia::new(Vec::new(), 6144, 0).expect("fixed text geometry") }
     }
     fn bind_request(&self, p: &mut Placement, _: (), media: RequestMedia, _: &[u32], resume: usize) -> Result<()> {
-        self.pending.borrow_mut().take(); p.media = media; p.committed = resume; Ok(())
+        self.pending.borrow_mut().take(); p.media = media; p.committed = resume;
+        if self.execution.draft().is_ok() { self.rings.borrow_mut().bind(p.sequence)?; }
+        Ok(())
     }
     fn history(&self, _: &Placement) {}
     fn prefetch(&self, _: &[u32], _: &[u32]) {}
@@ -146,28 +173,27 @@ impl<'e, 'a> Backend<'a> for MiniMaxBackend<'e, 'a> {
     fn prefill_device(&self, p: &mut Placement, tokens: &[u32], logit_rows: usize,
         pool: &RefPagePool) -> Result<Option<DeviceLogits>> {
         if logit_rows > tokens.len() { return Err(MiniMaxError::Invalid("prefill logits extent").into()); }
-        let (step, mut logits) = self.execute(&mut [(p, tokens)], pool, true)?;
+        let (step, logits) = self.execute(&mut [(p, tokens)], pool, true, tokens.len() - logit_rows..tokens.len())?;
         step.publish(&mut [(p, tokens.len())])?;
-        if logit_rows == 0 { return Ok(None); }
-        logits.ptr = logits.ptr.wrapping_byte_add((logits.rows - logit_rows) * logits.stride * 4);
-        logits.rows = logit_rows;
-        Ok(Some(logits))
+        Ok(logits)
     }
     fn verify_device(&self, sequences: &mut [(&mut Placement, &[u32])], speculative: bool,
         pool: &RefPagePool) -> Result<Option<DeviceLogits>> {
         let _ = speculative;
-        let (step, logits) = self.execute(sequences, pool, false)?;
+        let rows = sequences.iter().map(|(_, ids)| ids.len()).sum();
+        let (step, logits) = self.execute(sequences, pool, false, 0..rows)?;
         *self.pending.borrow_mut() = Some(step);
-        Ok(Some(logits))
+        Ok(logits)
     }
     fn verify_device_ungraphed(&self, sequences: &mut [(&mut Placement, &[u32])], speculative: bool,
         kind: scheduler::UngraphedKind, pool: &RefPagePool) -> Result<Option<DeviceLogits>> {
         if matches!(kind, scheduler::UngraphedKind::Decode) { return self.verify_device(sequences, speculative, pool); }
         if speculative { return Err(MiniMaxError::Unsupported("speculative scoring").into()); }
-        let (step, logits) = self.execute(sequences, pool, true)?;
+        let rows = sequences.iter().map(|(_, ids)| ids.len()).sum();
+        let (step, logits) = self.execute(sequences, pool, true, 0..rows)?;
         let mut publish = sequences.iter_mut().map(|(p, tokens)| (&mut **p, tokens.len())).collect::<Vec<_>>();
         step.publish(&mut publish)?;
-        Ok(Some(logits))
+        Ok(logits)
     }
     fn verify_bucket_rows(&self, rows: usize, _: bool, _: bool) -> usize { rows }
     fn verify_attention_trace(&self, contexts: &[Vec<usize>], rows: usize) -> serde_json::Value {
@@ -187,9 +213,11 @@ impl<'e, 'a> Backend<'a> for MiniMaxBackend<'e, 'a> {
     fn arm_draft_probe(&self) -> Result<()> { self.execution.draft()?; Ok(()) }
     fn prefill_draft(&self, p: &Placement, start: usize, chunk: &[u32], next: Option<u32>, state: &mut State) -> Result<()> {
         ensure!(start.checked_add(chunk.len())==Some(p.committed),MiniMaxError::Invalid("draft prefill frontier"));
+        // Without a ring the request never drafts: its state stays not ready.
+        let Some(ring)=self.rings.borrow().of(p.sequence) else { return Ok(()) };
         let mut next_state=state.clone(); next_state.advance(start,chunk.len(),next)?;
         let rows=(0..chunk.len()).map(|tap_row|crate::shared::speculation::dflash::ContextRow {
-            tap_row,slot:p.sequence,position:start+tap_row }).collect::<Vec<_>>();
+            tap_row,slot:ring,position:start+tap_row }).collect::<Vec<_>>();
         self.execution.update_draft(&rows)?;
         *state=next_state; Ok(())
     }
@@ -201,7 +229,8 @@ impl<'e, 'a> Backend<'a> for MiniMaxBackend<'e, 'a> {
             .map(|(index,s)| {
                 ensure!(s.seq.ready && s.seq.end==s.placement.committed && s.depth<=7,
                     MiniMaxError::Invalid("draft continuation"));
-                Ok((index,crate::shared::speculation::dflash::DraftSeq {slot:s.placement.sequence,
+                let slot=self.rings.borrow().of(s.placement.sequence).context("MiniMax drafting request holds no ring")?;
+                Ok((index,crate::shared::speculation::dflash::DraftSeq {slot,
                     position:s.placement.committed,valid_from:s.seq.valid_from,
                     anchor:s.seq.anchor.context("MiniMax draft anchor missing")?}))
             }).collect::<Result<Vec<_>>>()?;
@@ -224,9 +253,11 @@ impl<'e, 'a> Backend<'a> for MiniMaxBackend<'e, 'a> {
     fn accept(&self, verified: &mut [scheduler::Verified<'_, Placement, State, ()>], _: bool) -> Result<()> {
         let step = self.pending.borrow_mut().take().context("MiniMax accept has no completed wave")?;
         accept_step(step, verified)?;
-        accept_context(verified, |rows|self.execution.update_draft(rows))
+        accept_context(verified, &self.rings.borrow(), |rows|self.execution.update_draft(rows))
     }
-    fn cancel(&self, _: &Placement) -> Result<()> { self.pending.borrow_mut().take(); self.execution.drain() }
+    fn cancel(&self, p: &Placement) -> Result<()> {
+        self.pending.borrow_mut().take(); self.execution.drain()?; self.rings.borrow_mut().release(p.sequence)
+    }
     fn probe_begin(&self, rows: usize) {
         let mut probe=self.probe.borrow_mut(); probe.begin(rows); probe.dense(0).expect("one aggregate stage");
     }
@@ -261,7 +292,8 @@ mod tests {
                 rows:&rows,first_row:9,kept:Some((keep,99)),finished:false,neural:true}];
             accept_step(step,&mut verified)?;
             let mut fake=Vec::new();
-            accept_context(&mut verified,|rows| {
+            let mut rings=Rings::new(1,1); rings.bind(0)?;
+            accept_context(&mut verified,&rings,|rows| {
                 fake.extend(rows.iter().map(|r|(r.tap_row,r.slot,r.position))); Ok(())
             })?;
             assert_eq!(fake,(0..keep).map(|i|(9+i,0,63+i)).collect::<Vec<_>>());
@@ -279,8 +311,28 @@ mod tests {
         let mut state=State::default();
         let mut verified=[scheduler::Verified {placement:&mut p,seq:&mut state,start:0,history:(),
             rows:&[1,2,3],first_row:0,kept:Some((2,4)),finished:false,neural:true}];
-        assert!(accept_context(&mut verified,|_|Err(MiniMaxError::Invalid("fake executor failure").into())).is_err());
+        let mut rings=Rings::new(1,1); rings.bind(0)?;
+        assert!(accept_context(&mut verified,&rings,|_|Err(MiniMaxError::Invalid("fake executor failure").into())).is_err());
         assert!(!state.ready);
+        Ok(())
+    }
+
+    #[test]
+    fn minimax_ringless_requests_never_become_draft_ready() -> Result<()> {
+        let mut rings=Rings::new(3,1);
+        rings.bind(2)?; rings.bind(0)?;
+        assert_eq!((rings.of(2),rings.of(0)),(Some(0),None));
+        let mut p=Placement {pages:vec![],sequence:0,committed:2,media:RequestMedia::new(Vec::new(),6144,0)?};
+        let mut state=State::default();
+        let mut verified=[scheduler::Verified {placement:&mut p,seq:&mut state,start:0,history:(),
+            rows:&[1,2,3],first_row:0,kept:Some((2,4)),finished:false,neural:true}];
+        accept_context(&mut verified,&rings,|_|panic!("a ringless request updated draft context"))?;
+        assert!(!state.ready);
+        rings.release(2)?; rings.bind(0)?;
+        assert_eq!((rings.of(2),rings.of(0)),(None,Some(0)));
+        rings.bind(0)?;
+        assert_eq!(rings.of(0),Some(0),"rebinding a slot keeps one ring");
+        assert!(rings.bind(3).is_err());
         Ok(())
     }
 

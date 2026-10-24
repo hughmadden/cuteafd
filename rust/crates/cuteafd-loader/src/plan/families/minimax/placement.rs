@@ -235,17 +235,20 @@ fn exact_layout(model: &Model, input: &crate::plan::PlanInput, report: &mut Plan
     let cfg = model.cfg();
     let rows = if opts.prefill_rows == 0 { 4096 } else { usize::try_from(opts.prefill_rows)? };
     let sequences = if opts.concurrency == 0 { 64 } else { usize::try_from(opts.concurrency)? };
-    let sizing = RuntimeSizing { rows, decode_rows: rows.min(64), sequences, context: if opts.context_tokens == 0 {
-        cfg.max_position as u64 } else { opts.context_tokens }, spark_ranks: requested.spark_ranks() };
-    sizing.validate(cfg)?;
     ensure!(opts.state_slots.is_none_or(|n| n == sequences as u64), AdmissionError::Unsupported("sequence-slot mismatch"));
-    ensure!(opts.draft_context_slots.is_none_or(|n| n == sequences as u64),
-        AdmissionError::Unsupported("draft context slots must equal max sequences; rings use scheduler slot IDs"));
+    let rings = opts.draft_context_slots.map_or(Ok(crate::families::minimax_m3::dspark::default_ring_slots(sequences)),
+        usize::try_from)?;
+    ensure!((1..=sequences).contains(&rings), AdmissionError::Unsupported("draft context slots outside 1..=max sequences"));
     let arch = ArchContext::coordinator(opts.rtx_bytes[0], None);
     let draft = if opts.native_mtp_layers > 0 {
         let contract = DsparkContract::open(&input.checkpoint().snapshot).context("MiniMax bundled DSpark")?;
-        Some(DraftMemory::new(&contract, sequences, rows, opts.physical_sms.unwrap_or(arch.sms) as usize)?)
+        Some(DraftMemory::new(&contract, rings, rows, opts.physical_sms.unwrap_or(arch.sms) as usize)?)
     } else { None };
+    let draft_rows = draft.as_ref().map_or(0, |d| d.sequences * 7);
+    let sizing = RuntimeSizing { rows, decode_rows: rows.min(64), sequences, context: if opts.context_tokens == 0 {
+        cfg.max_position as u64 } else { opts.context_tokens }, spark_ranks: requested.spark_ranks(),
+        logit_rows: RuntimeSizing::head_rows(rows, opts.full_prefill_logits, draft_rows) };
+    sizing.validate(cfg)?;
     let manifest: serde_json::Value = serde_json::from_slice(&std::fs::read(path).context("MiniMax PROGRAMS.json")?)?;
     let programs = admission::ProgramSizes::from_manifest(&manifest, sizing)?;
     let ledger = RuntimeLedger::new(cfg, sizing, &programs)?;

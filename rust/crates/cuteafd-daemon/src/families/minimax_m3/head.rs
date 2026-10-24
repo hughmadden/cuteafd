@@ -8,9 +8,11 @@ impl<'a> TargetHeadOwner<'a> {
     pub fn new(commands: &Commands<'a>, scratch: &Scratch<'a>, rows: usize, vocab: usize) -> Result<Self> {
         Ok(Self { head: Head::new(commands,scratch.get("head_workspace")?.clone(),rows,vocab)?, vocab })
     }
-    pub fn logits(&self, commands: &Commands<'a>, weights: &Weights<'a>, scratch: &Scratch<'a>, rows: usize) -> Result<DeviceLogits> {
-        ffn::norm(commands,scratch.get("residual")?,weights.get("language_model.model.norm.weight")?,scratch.get("head_input")?,rows)?;
-        self.project(commands,weights,scratch,scratch.get("head_input")?,rows)
+    /// Final norm and head over residual `rows` only (prefill needs its last rows).
+    pub fn logits(&self, commands: &Commands<'a>, weights: &Weights<'a>, scratch: &Scratch<'a>, rows: std::ops::Range<usize>) -> Result<DeviceLogits> {
+        let residual=scratch.get("residual")?.view(rows.start*6144*4,rows.len()*6144*4)?;
+        ffn::norm(commands,&residual,weights.get("language_model.model.norm.weight")?,scratch.get("head_input")?,rows.len())?;
+        self.project(commands,weights,scratch,scratch.get("head_input")?,rows.len())
     }
     pub fn project(&self, commands: &Commands<'a>, weights: &Weights<'a>, scratch: &Scratch<'a>, input: &Buffer<'a>, rows: usize) -> Result<DeviceLogits> {
         let output = scratch.get("logits")?;

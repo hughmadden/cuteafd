@@ -47,8 +47,17 @@ pub(crate) struct ServeArgs {
     max_sequences: u8,
     #[arg(long)]
     model_id: Option<String>,
+    /// Project every prefill row's logits (prefill-shaped probe scoring);
+    /// otherwise prefill projects only the rows a request needs.
     #[arg(long)]
     full_prefill_logits: bool,
+    /// DSpark context rings (default: max sequences, at most 8). A request
+    /// admitted while every ring is taken decodes target-only.
+    #[arg(long)]
+    draft_context_slots: Option<usize>,
+    /// GPU memory (GiB) kept free for runtime growth, as the planner's --headroom-gib.
+    #[arg(long, default_value_t = 2.0)]
+    headroom_gib: f64,
     #[arg(skip = MediaMode::Auto)]
     pub(crate) vision: MediaMode,
     #[arg(long)]
@@ -83,6 +92,12 @@ impl ServeArgs {
         }
         if self.max_sequences as u32 > self.prefill_rows || self.max_context > 1_048_576 {
             return Err(MiniMaxError::Invalid("request context or row capacity").into());
+        }
+        if self.draft_context_slots.is_some_and(|n| n == 0 || n > self.max_sequences as usize) {
+            return Err(MiniMaxError::Invalid("draft context slots outside 1..=max sequences").into());
+        }
+        if !(self.headroom_gib.is_finite() && (0.0..=64.0).contains(&self.headroom_gib)) {
+            return Err(MiniMaxError::Invalid("headroom GiB").into());
         }
         if self.prefix.prefix_partial != crate::shared::prefix::Toggle::Off {
             return Err(MiniMaxError::Unsupported("partial prefix reuse").into());
@@ -122,12 +137,15 @@ fn worker(args: &ServeArgs, receive: &mut tokio::sync::mpsc::Receiver<cuteafd_ap
     library.cuda_set_device(args.device)?;
     let programs = library.programs()?.with_manifest(&args.manifest)?;
     programs.load_matching(|name| name.starts_with("minimax_"))?;
-    let sizing = RuntimeSizing { rows: args.prefill_rows as usize, decode_rows: (args.prefill_rows as usize).min(64),
-        sequences: args.max_sequences as usize, context: if args.max_context == 0 {cfg.max_position as u64} else {args.max_context},
-        spark_ranks: args.peers.len() };
+    let (rows, sequences) = (args.prefill_rows as usize, args.max_sequences as usize);
+    let rings = args.draft_context_slots.unwrap_or_else(|| cuteafd_loader::families::minimax_m3::dspark::default_ring_slots(sequences));
     let draft_contract=if args.speculator=="dspark" {Some(cuteafd_loader::families::minimax_m3::dspark::DsparkContract::open(&args.snapshot)?)} else {None};
-    let draft_layout=draft_contract.as_ref().map(|c|super::dspark::Layout::new(&library,c,sizing.sequences,sizing.rows)).transpose()?;
-    let draft_bytes=draft_layout.as_ref().map_or(0,|l|l.bytes);
+    let draft_layout=draft_contract.as_ref().map(|c|super::dspark::Layout::new(&library,c,rings,rows)).transpose()?;
+    let (draft_bytes,draft_rings)=draft_layout.as_ref().map_or((0,0),|l|(l.bytes,l.slots));
+    let sizing = RuntimeSizing { rows, decode_rows: rows.min(64), sequences,
+        context: if args.max_context == 0 {cfg.max_position as u64} else {args.max_context}, spark_ranks: args.peers.len(),
+        logit_rows: RuntimeSizing::head_rows(rows, args.full_prefill_logits, draft_layout.as_ref().map_or(0, |l| l.sequences * 7)) };
+    let headroom = (args.headroom_gib * (1u64 << 30) as f64) as u64;
     let manifest = cuteafd_loader::plan::checkpoint::read_json(&args.manifest)?;
     let package = crate::shared::experts::fp8::package_directory(&args.native_lib, 1,
         cuteafd_loader::formats::fp8_experts::ExpertFormat::Nvfp4);
@@ -144,7 +162,7 @@ fn worker(args: &ServeArgs, receive: &mut tokio::sync::mpsc::Receiver<cuteafd_ap
         let free = available()?;
         let text = admission::solve(&checkpoint, &manifest, local_package.as_ref(), admission::Request {
             sizing, available: free, requested_pool: None, kv_format: args.kv_cache, onboard,
-            spark_budget: args.spark_budget_bytes, headroom: 2 << 30, draft_bytes,
+            spark_budget: args.spark_budget_bytes, headroom, draft_bytes,
             host_embedding: args.token_io.embed_placement == EmbedPlacement::Host })?;
         let vision_bytes = ReadyVision::local_bytes(&args.snapshot, &args.native_lib)?;
         let cache_target = args.pool_tokens.filter(|n| *n > 0).unwrap_or(262_144)
@@ -163,7 +181,7 @@ fn worker(args: &ServeArgs, receive: &mut tokio::sync::mpsc::Receiver<cuteafd_ap
         let remote_reserve = vision.as_ref().map_or(0, |v| v.spark_reserve_bytes);
         admission::solve(&checkpoint, &manifest, local_package.as_ref(), admission::Request {
             sizing, available, requested_pool: args.pool_tokens, kv_format: args.kv_cache, onboard,
-            spark_budget: args.spark_budget_bytes.saturating_sub(remote_reserve), headroom: 2 << 30, draft_bytes,
+            spark_budget: args.spark_budget_bytes.saturating_sub(remote_reserve), headroom, draft_bytes,
             host_embedding: args.token_io.embed_placement == EmbedPlacement::Host })?
     };
     let mut catalog = cuteafd_loader::read_expert_catalog(&args.snapshot)?;
@@ -204,11 +222,13 @@ fn worker(args: &ServeArgs, receive: &mut tokio::sync::mpsc::Receiver<cuteafd_ap
     let expander = vision.as_ref().map(|_| cuteafd_loader::media::minimax::span_expander(&args.snapshot, cfg.vocab_size as u32, false)).transpose()?;
     let backend = MiniMaxBackend { execution: &execution, cache: &cache, embedding: &embedding, token_ids, embedded,
         experts: RefCell::new(Routed::new(local, spark)?), rows: sizing.rows, vocabulary: cfg.vocab_size, expander,
-        pending: RefCell::new(None), timing: RefCell::new([0.0; 2]), probe: RefCell::new(crate::shared::draft::routes::RoundRoutes::new(1,4)) };
+        pending: RefCell::new(None), timing: RefCell::new([0.0; 2]), probe: RefCell::new(crate::shared::draft::routes::RoundRoutes::new(1,4)),
+        rings: RefCell::new(super::backend::Rings::new(sizing.sequences, rings)), full_prefill_logits: args.full_prefill_logits };
     let (encoder, preparer, media_bytes) = vision.map_or((Encoder::Off, None, 0), |v| (v.encoder, Some(v.preparer), v.cache_bytes));
     let mut media = cuteafd_engine::media::MediaAdmission::new(cuteafd_engine::media::EmbeddingCache::new(media_bytes), encoder, 16);
     tracing::info!(pool_tokens=admitted.cache.pool_tokens, context=cache.context, local_layers=?admitted.local_layers,
-        rows=sizing.rows, "MiniMax native eager target; prefill uses causal paged MSA tiles");
+        rows=sizing.rows, logit_rows=sizing.logit_rows, draft_rings,
+        "MiniMax native eager target; prefill uses causal paged MSA tiles");
     let drafts=if args.speculator=="dspark" {scheduler::Drafts::Neural {depth:7,fixed:false}} else {scheduler::Drafts::None};
     scheduler::schedule(&backend, &args.snapshot, receive, stats, sizing.sequences, drafts,
         eos, args.decode_share, &prefix, args.token_io.token_select, &mut media, None,
