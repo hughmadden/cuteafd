@@ -374,7 +374,7 @@ impl<'w, 'a> DistributedTargetPass<'w, 'a> {
         let issued_us = timed.map(|t| t.elapsed().as_micros() as u64);
         let drained = self.drain_chain();
         let drained_us = timed.map(|t| t.elapsed().as_micros() as u64);
-        let result = result.and(drained).and_then(|()| transport.get().check_device());
+        let result = result.and(drained);
         if let (Some(t), Some(issued_us), Some(drained_us)) = (timed, issued_us, drained_us) {
             tracing::debug!(target: "cuteafd::timing", issued_us, drain_us=drained_us-issued_us,
                 check_us=t.elapsed().as_micros() as u64-drained_us, "distributed verification chain");
