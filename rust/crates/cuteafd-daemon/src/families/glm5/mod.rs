@@ -208,6 +208,58 @@ mod draft_cli_tests {
         assert_eq!(args.exlr8_manifest.as_deref(), Some("up1"));
     }
 
+    fn parse_resume(extra: &[&str]) -> std::result::Result<GoldenArgs, clap::Error> {
+        #[derive(Parser)]
+        struct Golden { #[command(flatten)] args: GoldenArgs }
+        Golden::try_parse_from(["test", "--snapshot", "/snapshot", "--native-lib", "/library", "--golden", "/golden"]
+            .into_iter().chain(extra.iter().copied())).map(|parsed| parsed.args)
+    }
+
+    #[test]
+    fn host_resume_cli_requires_resume_point_and_conflicts_with_cold() {
+        for extra in [
+            vec!["--resume-host", "--host-cache-bytes", "1GiB"],
+            vec!["--resume-host", "--resume-at", "513", "--host-cache-bytes", "1GiB", "--resume-cold"],
+        ] {
+            assert!(parse_resume(&extra).is_err(), "accepted {extra:?}");
+        }
+    }
+
+    #[test]
+    fn host_resume_cli_requires_positive_explicit_budget_and_retention() {
+        for budget in ["0", "auto"] {
+            let args = parse_resume(&["--resume-at", "513", "--resume-host", "--host-cache-bytes", budget]).unwrap();
+            assert!(args.validate_resume().is_err(), "accepted {budget}");
+        }
+        for extra in [
+            vec!["--resume-at", "513", "--resume-host", "--host-cache-bytes", "1GiB", "--prefix-cache-entries", "0"],
+            vec!["--resume-at", "511", "--resume-host", "--host-cache-bytes", "1GiB"],
+            vec!["--resume-at", "513", "--resume-host", "--host-cache-bytes", "1GiB", "--prefix-cache-min-tokens", "514"],
+        ] {
+            assert!(parse_resume(&extra).unwrap().validate_resume().is_err(), "accepted {extra:?}");
+        }
+    }
+
+    #[test]
+    fn host_resume_cli_preserves_device_cold_repeat_and_variant_options() {
+        let args = parse_resume(&["--resume-at", "513", "--resume-host", "--host-cache-bytes", "1GiB",
+            "--resume-repeat", "2", "--golden-variant", "1"]).unwrap();
+        args.validate_resume().unwrap();
+        assert_eq!((args.resume_repeat, args.golden_variant), (2, 1));
+        assert_eq!(args.prefix.host_cache_bytes.explicit_bytes(), 1 << 30);
+        let device = parse_resume(&["--resume-at", "65"]).unwrap();
+        assert!(!device.resume_host);
+        device.validate_resume().unwrap();
+        let cold = parse_resume(&["--resume-at", "65", "--resume-cold", "--resume-repeat", "3"]).unwrap();
+        cold.validate_resume().unwrap();
+        assert!(cold.resume_cold && !cold.resume_host);
+        assert_eq!(cold.resume_repeat, 3);
+        // Small tail-page tests may explicitly lower both production retention thresholds.
+        parse_resume(&["--resume-at", "17", "--resume-host", "--host-cache-bytes", "256MiB",
+            "--host-cache-min-tokens", "1", "--prefix-cache-min-tokens", "1"])
+            .unwrap().validate_resume().unwrap();
+    }
+
     #[test]
     fn native_full_activation_is_narrow_and_preserves_component_goldens() {
         let args = Parse::try_parse_from(["test", "--snapshot", "/native", "--native-lib", "/library",
@@ -380,6 +432,12 @@ pub(crate) struct GoldenArgs {
     /// compare every layer's rows, the logits and the paged rows byte for byte.
     #[arg(long)]
     pub resume_at: Option<usize>,
+    /// Restore through the production pinned RAM prefix tier, after releasing A and all
+    /// device snapshots. Requires an explicit positive --host-cache-bytes quota.
+    #[arg(long, requires_all = ["resume_at", "host_cache_bytes"], conflicts_with = "resume_cold")]
+    pub resume_host: bool,
+    #[command(flatten)]
+    pub prefix: crate::shared::prefix::PrefixArgs,
     /// Prefill chunk rows of --resume-at (default the engine's prefill rows).
     #[arg(long)]
     pub prefill_chunk: Option<usize>,
@@ -1080,7 +1138,24 @@ fn similarity(a: &[f32], b: &[f32]) -> (f64, f64) {
     (dot / (na.sqrt() * nb.sqrt()).max(f64::MIN_POSITIVE), diff.sqrt() / nb.sqrt().max(f64::MIN_POSITIVE))
 }
 
+impl GoldenArgs {
+    fn validate_resume(&self) -> Result<()> {
+        if self.resume_host {
+            ensure!(self.resume_at.is_some() && !self.resume_cold,
+                "--resume-host requires --resume-at and conflicts with --resume-cold");
+            ensure!(self.prefix.host_cache_bytes.explicit_bytes() > 0,
+                "--resume-host needs an explicit positive --host-cache-bytes quota (auto and 0 are unsupported)");
+            ensure!(self.prefix.prefix_cache_entries > 0, "--resume-host needs --prefix-cache-entries > 0");
+            let at = self.resume_at.unwrap();
+            ensure!(at >= self.prefix.prefix_cache_min_tokens && at >= self.prefix.host_cache_min_tokens as usize,
+                "--resume-at must meet --prefix-cache-min-tokens and --host-cache-min-tokens for --resume-host");
+        }
+        Ok(())
+    }
+}
+
 pub(crate) async fn run_golden(mut args: GoldenArgs) -> Result<()> {
+    args.validate_resume()?;
     args.engine.full_prefill_logits |= args.nll || args.resume_at.is_some();
     args.engine.served_id = "golden".into();
     args.engine.variants = args.variants.indexed(&args.engine.served_id)?;
@@ -1321,7 +1396,7 @@ fn golden_run(args: &GoldenArgs, opened: &Opened, engine: &engine::GlmEngine<'_>
         let n = args.prefill.unwrap_or(tokens.len()).min(tokens.len());
         return prefix::resume_check(engine, &tokens, at, n,
             args.prefill_chunk.unwrap_or(engine.prefill_rows), args.resume_decode, args.resume_cold,
-            args.resume_repeat, transport.map(|t| (t, runtime)));
+            args.resume_repeat, args.resume_host.then_some(&args.prefix), transport.map(|t| (t, runtime)));
     }
     if let Some(steps) = args.token_check {
         return token_check(args, opened, engine, transport, runtime, steps);
