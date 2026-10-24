@@ -384,10 +384,11 @@ fn score_window(runner: &mut Runner<'_, '_>, args: &GoldenArgs, window: &Window,
             else {runner.rows.min(if unscored {window.positions[0] - 1 - first} else {window.tokens.len() - first})};
         let count = count.min(window.tokens.len() - first);
         let values = runner.evaluate(&mut current, &window.tokens[first..first + count], unscored || args.score_shape == ScoreShape::Prefill)?;
-        file.write_all(&values.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>())?;
         if full {
             for (row, ours) in values.chunks_exact(vocab).enumerate() {
                 if let Ok(index) = window.positions.binary_search(&(first + row + 1)) {
+                    // Only scored rows are kept, as the reference stores them: row i predicts positions[i].
+                    file.write_all(&ours.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>())?;
                     scores.add(ours, &expected[index * vocab..(index + 1) * vocab], window.tokens[first + row + 1])?;
                     if window.generated[first + row + 1] {
                         generated.add(ours, &expected[index * vocab..(index + 1) * vocab], window.tokens[first + row + 1])?;
@@ -395,6 +396,7 @@ fn score_window(runner: &mut Runner<'_, '_>, args: &GoldenArgs, window: &Window,
                 }
             }
         } else {
+            file.write_all(&values.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>())?;
             for (&a, &b) in values.iter().zip(&expected[first * width..(first + count) * width]) {
                 let (a, b) = (a as f64, b as f64); dot += a * b; left += a * a; right += b * b; error += (a - b).powi(2);
             }
@@ -409,11 +411,12 @@ fn score_window(runner: &mut Runner<'_, '_>, args: &GoldenArgs, window: &Window,
         ensure!(left > 0.0 && right > 0.0, "zero partial hidden norm");
         json!({"cosine":dot / (left * right).sqrt(), "relative_l2":(error / right).sqrt()})
     };
-    result["schema"] = "cuteafd.minimax.golden.window/1".into();
+    result["schema"] = "cuteafd.minimax.golden.window/2".into();
     result["window"] = window.id.clone().into(); result["binding"] = binding.clone();
-    result["positions"] = json!(window.positions); result["rows"] = window.tokens.len().into();
+    result["positions"] = json!(window.positions); result["rows"] = expected_rows.into();
     result["width"] = width.into(); result["dtype"] = "F32".into(); result["byte_order"] = "little".into();
-    result["logits_row_target_offset"] = 1.into(); result["partial_target"] = (!full).into();
+    // Full: row i predicts positions[i]. Partial: row i is token i's hidden state.
+    result["row_targets"] = (if full {"positions"} else {"tokens"}).into(); result["partial_target"] = (!full).into();
     result["prefix_byte_exact"] = args.check_prefix.into();
     result["generated"] = if generated.rows > 0 {generated.result()?} else {Value::Null};
     seal_window(directory, &filename, &mut result)?;
@@ -640,9 +643,9 @@ mod tests {
         std::fs::write(directory.path().join("logits.bin"), &raw)?;
         std::fs::write(directory.path().join("tokens.bin"), [1u32, 0].into_iter().flat_map(u32::to_le_bytes).collect::<Vec<_>>())?;
         std::fs::write(directory.path().join("positions.bin"), 1u32.to_le_bytes())?;
-        let mut result = json!({"schema":"cuteafd.minimax.golden.window/1", "binding":binding,
+        let mut result = json!({"schema":"cuteafd.minimax.golden.window/2", "binding":binding,
             "top1":1.0,"mean_kl":0.0,"prefix_byte_exact":true,"rows":2,"width":2,
-            "dtype":"F32","byte_order":"little","positions":[1],"logits_row_target_offset":1});
+            "dtype":"F32","byte_order":"little","positions":[1],"row_targets":"positions"});
         seal_window(directory.path(), "logits.bin", &mut result)?;
         let read = completed(directory.path(), &binding, true)?.unwrap();
         assert_eq!(read, result);
