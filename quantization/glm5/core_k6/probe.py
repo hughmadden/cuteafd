@@ -113,7 +113,8 @@ def main():
             rss_gib=progress.process.memory_info().rss/run.GIB,
             note="bounded source-native numerical qualification; no full-model quality or serving measurement")
         run.atomic_json(args.output,report)
-        progress.emit("qualification_passed",**{k:v for k,v in report.items() if k!="identity"})
+        progress.emit("qualification_passed",**{k:v for k,v in report.items()
+            if k not in ("identity","gpu_peak_gib","rss_gib")})
 
 
 if __name__=="__main__":
