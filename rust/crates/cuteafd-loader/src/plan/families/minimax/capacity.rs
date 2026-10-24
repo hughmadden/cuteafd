@@ -1,5 +1,7 @@
-//! Planning contracts for cache paths that have no native executor yet.
-use super::admission::AdmissionError;
+//! Cache placements: FP8 host K/V placement is executable (see
+//! [`super::admission::Tiering`]); NVFP4 K/V and Spark backing remain planning
+//! contracts without a native executor.
+use super::admission::{AdmissionError, HostTier, Tiering};
 use crate::families::minimax_m3::{config::MiniMaxM3Config, reference};
 use crate::plan::{layout::LayoutOptions, Hint, PlanReport};
 use cuteafd_core::memory_layout::{Basis, Category, DeviceKind, Item, MemoryLayout};
@@ -18,16 +20,26 @@ impl std::str::FromStr for KvBacking {
 pub struct CachePlan {
     pub nvfp4: bool,
     pub backing: KvBacking,
-    /// Total hot-cache budget, including its slot metadata.
-    pub hot_bytes: u64,
+    /// GPU-resident K/V bytes (`--kv-hot-cache-gib`); `None` is automatic.
+    pub hot_bytes: Option<u64>,
     pub host_bytes: u64,
 }
 impl Default for CachePlan {
-    fn default() -> Self { Self { nvfp4: false, backing: KvBacking::Gpu, hot_bytes: 1 << 30, host_bytes: 192 << 30 } }
+    fn default() -> Self { Self { nvfp4: false, backing: KvBacking::Gpu, hot_bytes: None, host_bytes: 192 << 30 } }
 }
 impl CachePlan {
-    pub fn proposed(self) -> bool { self.nvfp4 || self.backing != KvBacking::Gpu }
+    /// Planning-only contracts that cannot admit execution (NVFP4 K/V, Spark backing).
+    pub fn proposed(self) -> bool { self.nvfp4 || self.backing == KvBacking::Spark }
+    /// The executable K/V placement (FP8 GPU or host).
+    pub fn tiering(self) -> Tiering {
+        if self.backing == KvBacking::Host && !self.nvfp4 {
+            Tiering::Host(HostTier { resident_bytes: self.hot_bytes, host_bytes: self.host_bytes })
+        } else { Tiering::Gpu }
+    }
 }
+
+/// Hot-cache budget of the NVFP4/Spark proposals when `--kv-hot-cache-gib` is omitted.
+const PROPOSED_HOT_BYTES: u64 = 1 << 30;
 
 #[derive(Debug, Clone, Copy)]
 pub struct Records {
@@ -60,7 +72,7 @@ pub struct Pool {
 /// `remote_bytes` is the total backing budget (host or all Spark ranks).
 pub fn pool(records: Records, options: CachePlan, available: u64, remote_bytes: u64,
     requested: Option<u64>) -> Result<Pool, AdmissionError> {
-    let hot = if options.backing == KvBacking::Gpu { 0 } else { options.hot_bytes };
+    let hot = if options.backing == KvBacking::Gpu { 0 } else { options.hot_bytes.unwrap_or(PROPOSED_HOT_BYTES) };
     let fixed = hot.checked_add(records.globals).ok_or(AdmissionError::Overflow("cache fixed bytes"))?;
     if fixed >= available { return Err(AdmissionError::Budget { needed: fixed + 1, available }); }
     let token_bytes = records.index + if options.backing == KvBacking::Gpu { records.kv } else { records.directory };
@@ -98,7 +110,7 @@ pub(super) fn apply(cfg: &MiniMaxM3Config, memory: &mut MemoryLayout, report: &m
         // metadata bytes per head block. This is a capacity bound, not a hit rate.
         let blocks = cfg.layers as u64 * cfg.kv_heads as u64 * (cfg.msa.topk_blocks + 1) as u64;
         let block_bytes = records.kv / cfg.layers as u64 / cfg.kv_heads as u64 * 128;
-        ensure!(options.hot_bytes >= blocks * (block_bytes + 32), "hot cache cannot hold one selected set per layer plus insertion blocks");
+        ensure!(options.hot_bytes.unwrap_or(PROPOSED_HOT_BYTES) >= blocks * (block_bytes + 32), "hot cache cannot hold one selected set per layer plus insertion blocks");
     }
     let result = pool(records, options, available, remote, opts.pool_tokens)?;
     gpu.kv_tokens = result.tokens;

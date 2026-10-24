@@ -18,6 +18,11 @@
 //! position alone, so a forked full page and a copied tail keep their position and therefore
 //! their GPU; a sequence of `n` pages takes `ceil(n/2)` pages of GPU0 and `floor(n/2)` of GPU1
 //! (at most one page of imbalance per placement or snapshot). Admission needs both halves.
+//!
+//! Tiered pools ([`RefPagePool::tiered`], MiniMax host K/V placement): one GPU, one id space
+//! whose ids below [`RefPagePool::resident`] are device-resident pages and the rest host pages.
+//! Two free lists; an allocation counts both and hands its fast pages to the highest logical
+//! positions it covers (the end a sequence writes next), so a short request is wholly fast.
 use thiserror::Error;
 
 /// Not enough free pages; nothing was allocated. In a parity pool the numbers are those of the
@@ -83,6 +88,8 @@ pub struct RefPagePool {
     /// local indices of each half (parity: ids `0..2 * reserved`).
     reserved: usize,
     parity: bool,
+    /// Tiered pool: ids below this are the fast tier (`free[0]`), the rest `free[1]`.
+    resident: Option<u32>,
     page_rows: usize,
     release_epoch: u64,
 }
@@ -90,6 +97,30 @@ pub struct RefPagePool {
 impl RefPagePool {
     pub fn new(pages: usize, page_rows: usize) -> Self {
         Self::with_reserved(pages, page_rows, 0)
+    }
+
+    /// A uniform pool whose ids `0..resident` are the fast tier and `resident..pages` the slow
+    /// one (see the module notes). Admission counts both tiers.
+    pub fn tiered(pages: usize, page_rows: usize, resident: usize) -> Self {
+        assert!(resident <= pages, "{resident} resident pages of {pages}");
+        let mut pool = Self::build(pages, page_rows, 0, false);
+        pool.free[0].retain(|&page| (page as usize) < resident);
+        pool.free[1] = (resident as u32..pages as u32).rev().collect();
+        pool.resident = Some(resident as u32);
+        pool
+    }
+
+    /// The fast tier's id bound in a tiered pool (every id in other pools).
+    pub fn resident(&self) -> usize {
+        self.resident.map_or(self.refs.len(), |r| r as usize)
+    }
+    /// Whether `page` is in the fast tier (always outside a tiered pool).
+    pub fn is_resident(&self, page: u32) -> bool {
+        self.resident.is_none_or(|r| page < r)
+    }
+    /// Free pages per tier, fast then slow (a pool without tiers counts all as fast).
+    pub fn free_tiers(&self) -> [usize; 2] {
+        if self.resident.is_some() { [self.free[0].len(), self.free[1].len()] } else { [self.free(), 0] }
     }
 
     /// A pool of `pages` page indices whose first `reserved` are never handed out (they keep
@@ -122,9 +153,15 @@ impl RefPagePool {
             free,
             reserved,
             parity,
+            resident: None,
             page_rows,
             release_epoch: 0,
         }
+    }
+
+    /// The free list a freed `page` returns to.
+    fn list(&self, page: u32) -> usize {
+        if self.parity { (page & 1) as usize } else { usize::from(!self.is_resident(page)) }
     }
 
     /// Whether this is a parity pool ([`RefPagePool::parity`]).
@@ -153,9 +190,9 @@ impl RefPagePool {
     pub fn free(&self) -> usize {
         self.free[0].len() + self.free[1].len()
     }
-    /// Free pages per half (a uniform pool's are all in `[0]`).
+    /// Free pages per half (a uniform or tiered pool's are all in `[0]`).
     pub fn free_halves(&self) -> [usize; 2] {
-        [self.free[0].len(), self.free[1].len()]
+        if self.resident.is_some() { [self.free(), 0] } else { [self.free[0].len(), self.free[1].len()] }
     }
     /// The free count a deferred admission compares against [`PoolExhausted::free`]: the whole
     /// pool's, or the scarcer half's in a parity pool.
@@ -168,7 +205,8 @@ impl RefPagePool {
     /// Allocated pages per half.
     pub fn used_halves(&self) -> [usize; 2] {
         let capacity = self.half_capacity();
-        [capacity[0] - self.free[0].len(), capacity[1] - self.free[1].len()]
+        let free = self.free_halves();
+        [capacity[0] - free[0], capacity[1] - free[1]]
     }
     pub fn page_rows(&self) -> usize {
         self.page_rows
@@ -208,9 +246,10 @@ impl RefPagePool {
         Need([even, n - even])
     }
 
-    /// Whether `need` fits the free pages of each half.
+    /// Whether `need` fits the free pages of each half (either tier of a tiered pool).
     pub fn fits(&self, need: Need) -> bool {
-        need.0[0] <= self.free[0].len() && need.0[1] <= self.free[1].len()
+        let free = self.free_halves();
+        need.0[0] <= free[0] && need.0[1] <= free[1]
     }
 
     /// `n` fresh pages for logical positions `0..n`, each with one reference; all or nothing.
@@ -219,15 +258,19 @@ impl RefPagePool {
     }
 
     /// Fresh pages for logical positions `positions` (a parity pool hands position `j` a page
-    /// of parity `j % 2`), each with one reference; all or nothing.
+    /// of parity `j % 2`; a tiered pool hands its fast pages to the highest positions), each
+    /// with one reference; all or nothing.
     pub fn alloc_for(&mut self, positions: std::ops::Range<usize>) -> Result<Vec<u32>, PoolExhausted> {
         let need = self.need_for(positions.clone());
         if !self.fits(need) {
             return Err(self.exhausted(need));
         }
-        let pages: Vec<u32> = positions
-            .map(|j| self.free[if self.parity { j % 2 } else { 0 }].pop().expect("checked"))
-            .collect();
+        let pages: Vec<u32> = if self.resident.is_some() {
+            let slow = positions.len().saturating_sub(self.free[0].len());
+            (0..positions.len()).map(|i| self.free[usize::from(i < slow)].pop().expect("checked")).collect()
+        } else {
+            positions.map(|j| self.free[if self.parity { j % 2 } else { 0 }].pop().expect("checked")).collect()
+        };
         for &page in &pages {
             debug_assert_eq!(self.refs[page as usize], 0);
             self.refs[page as usize] = 1;
@@ -255,7 +298,8 @@ impl RefPagePool {
             if *refs == 0 {
                 let generation = self.generation[page as usize];
                 self.generation[page as usize] = generation.wrapping_add(1);
-                self.free[if self.parity { (page & 1) as usize } else { 0 }].push(page);
+                let list = self.list(page);
+                self.free[list].push(page);
                 freed.push(FreedPage { index: page, generation });
             }
         }
@@ -311,7 +355,7 @@ impl RefPagePool {
 
     fn exhausted(&self, need: Need) -> PoolExhausted {
         if !self.parity {
-            return PoolExhausted { needed: need.0[0], free: self.free[0].len(), capacity: self.capacity() };
+            return PoolExhausted { needed: need.0[0], free: self.free(), capacity: self.capacity() };
         }
         let half = usize::from(need.0[0] <= self.free[0].len());
         PoolExhausted { needed: need.0[half], free: self.free[half].len(), capacity: self.capacity() / 2 }
@@ -373,6 +417,45 @@ mod tests {
         assert!(pool.fork(&owner, 64, 64).is_err());
         assert_eq!(pool.free(), before, "a failed fork holds nothing");
         assert_eq!(pool.refs(owner[0]), 4);
+    }
+}
+
+#[cfg(test)]
+mod tiered_tests {
+    use super::*;
+
+    #[test]
+    fn tiered_pool_counts_both_tiers_and_puts_fast_pages_at_the_written_end() {
+        let mut pool = RefPagePool::tiered(8, 64, 3);
+        assert_eq!((pool.capacity(), pool.free(), pool.free_tiers(), pool.free_halves()), (8, 8, [3, 5], [8, 0]));
+        assert!(!pool.is_parity() && pool.owner(5).is_none() && pool.resident() == 3);
+        // Short allocations are wholly resident.
+        let a = pool.alloc(2).unwrap();
+        assert_eq!(a, vec![0, 1]);
+        assert!(a.iter().all(|&p| pool.is_resident(p)));
+        // A longer one gets the remaining fast page at its highest position.
+        let b = pool.alloc_for(0..4).unwrap();
+        assert_eq!(b, vec![3, 4, 5, 2]);
+        assert_eq!(pool.free_tiers(), [0, 2]);
+        assert!(pool.fits(pool.need_for(0..2)) && !pool.fits(pool.need_for(0..3)));
+        assert_eq!(pool.alloc(3), Err(PoolExhausted { needed: 3, free: 2, capacity: 8 }));
+        assert_eq!(pool.used_halves(), [6, 0]);
+        // Freed pages return to their own tier.
+        pool.release(&b);
+        assert_eq!(pool.free_tiers(), [1, 5]);
+        let fork = pool.fork(&a, 100, 3).unwrap();
+        assert_eq!(&fork.pages[..1], &a[..1]);
+        assert!(pool.is_resident(fork.pages[2]) && !pool.is_resident(fork.pages[1]));
+        pool.release(&a);
+        pool.release(&fork.pages);
+        assert_eq!((pool.free(), pool.free_tiers()), (8, [3, 5]));
+        // Every page may be slow, or every page fast.
+        let mut slow = RefPagePool::tiered(4, 64, 0);
+        assert_eq!(slow.alloc(4).unwrap(), vec![0, 1, 2, 3]);
+        assert!(!slow.is_resident(0));
+        let fast = RefPagePool::tiered(4, 64, 4);
+        assert_eq!(fast.free_tiers(), [4, 0]);
+        assert_eq!(RefPagePool::new(4, 64).free_tiers(), [4, 0]);
     }
 }
 

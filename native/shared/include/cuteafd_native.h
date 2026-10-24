@@ -18,6 +18,7 @@ typedef enum cuteafd_status_t {
   CUTEAFD_STATUS_INTERNAL_ERROR = 6,
   CUTEAFD_STATUS_RDMA_UNAVAILABLE = 7,
   CUTEAFD_STATUS_NCCL_UNAVAILABLE = 8,
+  CUTEAFD_STATUS_UNSUPPORTED = 9,
 } cuteafd_status_t;
 
 typedef enum cuteafd_xgrammar_kind_t {
@@ -307,6 +308,20 @@ cuteafd_status_t cuteafd_free_host_buffer(cuteafd_host_buffer_t* buf);
 cuteafd_status_t cuteafd_alloc_device_buffer(size_t bytes, cuteafd_device_buffer_t* out);
 cuteafd_status_t cuteafd_alloc_managed_device_buffer(size_t bytes, cuteafd_device_buffer_t* out);
 cuteafd_status_t cuteafd_free_device_buffer(cuteafd_device_buffer_t* buf);
+// Tiered planes: `count` virtual ranges of one geometry on the current device.
+// Range i is `device_bytes` of device memory, then `host_bytes` of pinned host
+// memory on the device's host NUMA node, then `shared_bytes` of one device
+// allocation that every range maps (an alias, not a copy). Each range is
+// readable and writable by the device only. Sizes are multiples of
+// cuteafd_tiered_granularity. `out_bases` receives the `count` range starts;
+// `out_handle` owns them all until cuteafd_tiered_planes_destroy, which the
+// caller issues only after every reader and writer has completed.
+// CUTEAFD_STATUS_UNSUPPORTED: no virtual memory management or host NUMA
+// allocation on this device and driver.
+cuteafd_status_t cuteafd_tiered_granularity(size_t* out_bytes);
+cuteafd_status_t cuteafd_tiered_planes_create(size_t count, size_t device_bytes, size_t host_bytes,
+                                              size_t shared_bytes, void** out_bases, void** out_handle);
+cuteafd_status_t cuteafd_tiered_planes_destroy(void* handle);
 cuteafd_status_t cuteafd_cuda_stream_create(void** out_cuda_stream);
 cuteafd_status_t cuteafd_cuda_stream_destroy(void* cuda_stream);
 cuteafd_status_t cuteafd_cuda_stream_synchronize(void* cuda_stream);

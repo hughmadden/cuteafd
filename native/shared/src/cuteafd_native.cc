@@ -975,6 +975,193 @@ extern "C" cuteafd_status_t cuteafd_copy_device_rows_async(
 #endif
 }
 
+namespace {
+
+// Owner of tiered planes: the reserved ranges and every live mapping.
+struct TieredPlanes {
+  size_t bytes = 0;  // per range
+  std::vector<void*> bases;
+#if CUTEAFD_NATIVE_ENABLE_CUDA
+  std::vector<std::pair<CUdeviceptr, size_t>> mapped;
+#endif
+};
+
+#if CUTEAFD_NATIVE_ENABLE_CUDA
+cuteafd_status_t fail_cu(cuteafd_status_t status, const char* action, CUresult result) {
+  const char* name = nullptr;
+  cuGetErrorString(result, &name);
+  return fail(status, std::string(action) + ": " + (name ? name : "unknown CUDA driver error"));
+}
+
+void release_tiered(TieredPlanes* planes) {
+  for (auto it = planes->mapped.rbegin(); it != planes->mapped.rend(); ++it) cuMemUnmap(it->first, it->second);
+  planes->mapped.clear();
+  for (void* base : planes->bases) cuMemAddressFree(reinterpret_cast<CUdeviceptr>(base), planes->bytes);
+  planes->bases.clear();
+}
+
+// Device and host-NUMA allocation properties for the current device.
+cuteafd_status_t tiered_properties(CUmemAllocationProp* device, CUmemAllocationProp* host, size_t* granularity,
+                                   int* device_id) {
+  cudaError_t err = cudaGetDevice(device_id);
+  if (err != cudaSuccess) return fail_cuda(CUTEAFD_STATUS_CUDA_UNAVAILABLE, "cudaGetDevice failed", err);
+  // The runtime's primary context backs the driver calls below.
+  err = cudaFree(nullptr);
+  if (err != cudaSuccess) return fail_cuda(CUTEAFD_STATUS_CUDA_UNAVAILABLE, "CUDA context initialization failed", err);
+  CUdevice dev = 0;
+  CUresult result = cuDeviceGet(&dev, *device_id);
+  if (result != CUDA_SUCCESS) return fail_cu(CUTEAFD_STATUS_CUDA_UNAVAILABLE, "cuDeviceGet failed", result);
+  int vmm = 0;
+  result = cuDeviceGetAttribute(&vmm, CU_DEVICE_ATTRIBUTE_VIRTUAL_MEMORY_MANAGEMENT_SUPPORTED, dev);
+  if (result != CUDA_SUCCESS || vmm == 0) {
+    return fail(CUTEAFD_STATUS_UNSUPPORTED, "tiered planes need CUDA virtual memory management on this device");
+  }
+  *device = CUmemAllocationProp{};
+  device->type = CU_MEM_ALLOCATION_TYPE_PINNED;
+  device->location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+  device->location.id = *device_id;
+  *host = CUmemAllocationProp{};
+  host->type = CU_MEM_ALLOCATION_TYPE_PINNED;
+#if CUDA_VERSION >= 12020
+  int numa = -1;
+  result = cuDeviceGetAttribute(&numa, CU_DEVICE_ATTRIBUTE_HOST_NUMA_ID, dev);
+  if (result == CUDA_SUCCESS && numa >= 0) {
+    host->location.type = CU_MEM_LOCATION_TYPE_HOST_NUMA;
+    host->location.id = numa;
+  } else {
+    host->location.type = CU_MEM_LOCATION_TYPE_HOST;
+    host->location.id = 0;
+  }
+#else
+  return fail(CUTEAFD_STATUS_UNSUPPORTED, "tiered planes need CUDA 12.2 host-NUMA allocations");
+#endif
+  size_t device_granularity = 0, host_granularity = 0;
+  result = cuMemGetAllocationGranularity(&device_granularity, device, CU_MEM_ALLOC_GRANULARITY_MINIMUM);
+  if (result != CUDA_SUCCESS) return fail_cu(CUTEAFD_STATUS_UNSUPPORTED, "device allocation granularity", result);
+  result = cuMemGetAllocationGranularity(&host_granularity, host, CU_MEM_ALLOC_GRANULARITY_MINIMUM);
+  if (result != CUDA_SUCCESS) {
+    return fail_cu(CUTEAFD_STATUS_UNSUPPORTED, "host-NUMA allocations are unsupported by this driver", result);
+  }
+  *granularity = std::max(device_granularity, host_granularity);
+  return ok();
+}
+
+// Map one new physical allocation of `bytes` at `address` (handle released
+// at once: the mapping keeps the memory alive).
+cuteafd_status_t map_new(TieredPlanes* planes, CUdeviceptr address, size_t bytes, const CUmemAllocationProp& prop,
+                         const char* what) {
+  CUmemGenericAllocationHandle handle = 0;
+  CUresult result = cuMemCreate(&handle, bytes, &prop, 0);
+  if (result != CUDA_SUCCESS) return fail_cu(CUTEAFD_STATUS_ALLOCATION_FAILED, what, result);
+  result = cuMemMap(address, bytes, 0, handle, 0);
+  cuMemRelease(handle);
+  if (result != CUDA_SUCCESS) return fail_cu(CUTEAFD_STATUS_ALLOCATION_FAILED, "cuMemMap failed", result);
+  planes->mapped.emplace_back(address, bytes);
+  return ok();
+}
+#endif
+
+}  // namespace
+
+extern "C" cuteafd_status_t cuteafd_tiered_granularity(size_t* out_bytes) {
+  if (out_bytes == nullptr) return fail(CUTEAFD_STATUS_INVALID_ARGUMENT, "granularity output is null");
+#if CUTEAFD_NATIVE_ENABLE_CUDA
+  CUmemAllocationProp device{}, host{};
+  int device_id = -1;
+  cuteafd_status_t status = tiered_properties(&device, &host, out_bytes, &device_id);
+  return status;
+#else
+  *out_bytes = 2u << 20;
+  return ok();
+#endif
+}
+
+extern "C" cuteafd_status_t cuteafd_tiered_planes_create(size_t count, size_t device_bytes, size_t host_bytes,
+                                                         size_t shared_bytes, void** out_bases, void** out_handle) {
+  if (out_bases == nullptr || out_handle == nullptr || count == 0) {
+    return fail(CUTEAFD_STATUS_INVALID_ARGUMENT, "tiered planes need outputs and at least one range");
+  }
+  *out_handle = nullptr;
+  const size_t bytes = device_bytes + host_bytes + shared_bytes;
+  if (bytes == 0 || bytes < device_bytes || bytes - device_bytes < host_bytes) {
+    return fail(CUTEAFD_STATUS_INVALID_ARGUMENT, "tiered plane size is zero or overflows");
+  }
+  auto planes = std::make_unique<TieredPlanes>();
+  planes->bytes = bytes;
+#if CUTEAFD_NATIVE_ENABLE_CUDA
+  CUmemAllocationProp device{}, host{};
+  size_t granularity = 0;
+  int device_id = -1;
+  cuteafd_status_t status = tiered_properties(&device, &host, &granularity, &device_id);
+  if (status != CUTEAFD_STATUS_OK) return status;
+  if (device_bytes % granularity || host_bytes % granularity || shared_bytes % granularity) {
+    return fail(CUTEAFD_STATUS_INVALID_ARGUMENT, "tiered plane parts must be multiples of the allocation granularity");
+  }
+  CUmemGenericAllocationHandle shared = 0;
+  if (shared_bytes > 0) {
+    CUresult result = cuMemCreate(&shared, shared_bytes, &device, 0);
+    if (result != CUDA_SUCCESS) return fail_cu(CUTEAFD_STATUS_ALLOCATION_FAILED, "shared plane allocation", result);
+  }
+  CUmemAccessDesc access{};
+  access.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+  access.location.id = device_id;
+  access.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+  status = CUTEAFD_STATUS_OK;
+  for (size_t i = 0; i < count && status == CUTEAFD_STATUS_OK; ++i) {
+    CUdeviceptr base = 0;
+    CUresult result = cuMemAddressReserve(&base, bytes, granularity, 0, 0);
+    if (result != CUDA_SUCCESS) {
+      status = fail_cu(CUTEAFD_STATUS_ALLOCATION_FAILED, "cuMemAddressReserve failed", result);
+      break;
+    }
+    planes->bases.push_back(reinterpret_cast<void*>(base));
+    if (device_bytes > 0) status = map_new(planes.get(), base, device_bytes, device, "device plane allocation");
+    if (status == CUTEAFD_STATUS_OK && host_bytes > 0) {
+      status = map_new(planes.get(), base + device_bytes, host_bytes, host, "host-NUMA plane allocation");
+    }
+    if (status == CUTEAFD_STATUS_OK && shared_bytes > 0) {
+      result = cuMemMap(base + device_bytes + host_bytes, shared_bytes, 0, shared, 0);
+      if (result != CUDA_SUCCESS) status = fail_cu(CUTEAFD_STATUS_ALLOCATION_FAILED, "shared plane mapping", result);
+      else planes->mapped.emplace_back(base + device_bytes + host_bytes, shared_bytes);
+    }
+    if (status == CUTEAFD_STATUS_OK) {
+      result = cuMemSetAccess(base, bytes, &access, 1);
+      if (result != CUDA_SUCCESS) status = fail_cu(CUTEAFD_STATUS_ALLOCATION_FAILED, "cuMemSetAccess failed", result);
+    }
+  }
+  if (shared != 0) cuMemRelease(shared);
+  if (status != CUTEAFD_STATUS_OK) {
+    const std::string error = g_last_error;
+    release_tiered(planes.get());
+    return fail(status, error);
+  }
+#else
+  if (shared_bytes > 0) return fail(CUTEAFD_STATUS_UNSUPPORTED, "shared plane aliases need CUDA");
+  for (size_t i = 0; i < count; ++i) {
+    void* base = std::calloc(1, bytes);
+    if (base == nullptr) {
+      for (void* p : planes->bases) std::free(p);
+      return fail(CUTEAFD_STATUS_ALLOCATION_FAILED, "tiered plane host fallback allocation failed");
+    }
+    planes->bases.push_back(base);
+  }
+#endif
+  std::copy(planes->bases.begin(), planes->bases.end(), out_bases);
+  *out_handle = planes.release();
+  return ok();
+}
+
+extern "C" cuteafd_status_t cuteafd_tiered_planes_destroy(void* handle) {
+  if (handle == nullptr) return fail(CUTEAFD_STATUS_INVALID_ARGUMENT, "tiered planes handle is null");
+  std::unique_ptr<TieredPlanes> planes(static_cast<TieredPlanes*>(handle));
+#if CUTEAFD_NATIVE_ENABLE_CUDA
+  release_tiered(planes.get());
+#else
+  for (void* base : planes->bases) std::free(base);
+#endif
+  return ok();
+}
+
 extern "C" cuteafd_status_t cuteafd_alloc_device_buffer(size_t bytes, cuteafd_device_buffer_t* out) {
   if (out == nullptr) {
     return fail(CUTEAFD_STATUS_INVALID_ARGUMENT, "device buffer output pointer is null");

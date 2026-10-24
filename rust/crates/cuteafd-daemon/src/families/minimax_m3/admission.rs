@@ -5,7 +5,7 @@ use cuteafd_loader::{
     placement::SparkWorkingSet,
     plan::{checkpoint::Checkpoint, families::minimax::{admission::{self, Reservations}, coordinator::RankWeightLayout}},
 };
-pub(super) use admission::{ProgramSizes, RuntimeLedger, RuntimeSizing};
+pub(super) use admission::{HostTier, ProgramSizes, RuntimeLedger, RuntimeSizing, Tiering};
 
 pub(super) struct Request {
     pub sizing: RuntimeSizing,
@@ -19,6 +19,7 @@ pub(super) struct Request {
     pub headroom: u64,
     pub draft_bytes: u64,
     pub host_embedding: bool,
+    pub tiering: Tiering,
 }
 
 pub(super) struct Admitted {
@@ -31,12 +32,14 @@ pub(super) struct Admitted {
     pub local_capacity: Option<usize>,
     pub spark_capacity: usize,
     reservations: Reservations,
+    tiering: Tiering,
 }
 
 impl Admitted {
     pub fn readmit(&mut self, cfg: &MiniMaxM3Config, sizing: RuntimeSizing, available: u64,
         requested_pool: Option<u64>, kv_format: Qwen4KvCache) -> Result<()> {
-        self.cache = admission::admit(cfg, sizing, &self.ledger, self.reservations, available, requested_pool, kv_format)?;
+        self.cache = admission::admit(cfg, sizing, &self.ledger, self.reservations, available, requested_pool, kv_format,
+            self.tiering)?;
         Ok(())
     }
 }
@@ -77,10 +80,10 @@ pub(super) fn solve(checkpoint: &Checkpoint, programs: &serde_json::Value,
     reservations.startup = reservations.fixed_bytes(&ledger)?.checked_add(admission::scale_prep_staging_bytes(&weights))
         .context("MiniMax load peak overflow")?;
     let cache = admission::admit(&cfg, request.sizing, &ledger, reservations, request.available,
-        request.requested_pool, request.kv_format)?;
+        request.requested_pool, request.kv_format, request.tiering)?;
     ensure!(cache.total_bytes <= request.available, "MiniMax admission exceeded its measured free bytes");
     Ok(Admitted { cache, ledger, programs, local_layers: onboard.local_layers, spark_layers: onboard.spark_layers,
-        weights, local_capacity, spark_capacity: request.sizing.rows, reservations })
+        weights, local_capacity, spark_capacity: request.sizing.rows, reservations, tiering: request.tiering })
 }
 
 #[cfg(test)]
@@ -127,6 +130,7 @@ mod tests {
             sizing: RuntimeSizing { rows: 256, decode_rows: 64, sequences: 16, context: 4096, spark_ranks: 3, logit_rows: 64 },
             available: options.rtx_bytes[0] - measured_baseline, requested_pool: Some(4096),
             kv_format: Qwen4KvCache::Fp8, onboard: None, spark_budget: 108 << 30, headroom: 0, draft_bytes:0, host_embedding,
+            tiering: Tiering::Gpu,
         })?;
         assert_eq!(live.cache.total_bytes + measured_baseline, device.used_bytes());
         assert_eq!(live.cache.pool_tokens, memory.pool_tokens);

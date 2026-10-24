@@ -17,6 +17,8 @@ pub enum AdmissionError {
     Overflow(&'static str),
     #[error("MiniMax allocation needs {needed} bytes, available {available}")]
     Budget { needed: u64, available: u64 },
+    #[error("MiniMax host K/V tier needs {needed} pinned bytes, host budget {available}")]
+    HostBudget { needed: u64, available: u64 },
     #[error(transparent)]
     Cache(#[from] crate::serving_capacity::CacheGeometryError),
 }
@@ -228,17 +230,47 @@ impl Reservations {
     }
 }
 
+/// Where K/V pages live (`--kv-placement`). Index pages always stay on the GPU:
+/// every step's block selection scans all of them.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Tiering {
+    #[default]
+    Gpu,
+    /// K/V pages `[0, resident)` on the GPU, the rest in pinned host memory that
+    /// the attention kernels read over PCIe.
+    Host(HostTier),
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HostTier {
+    /// Device-resident K/V bytes (`--kv-hot-cache-gib`). `None`: every GPU byte
+    /// the pool's index pages leave, and at least [`HOT_FLOOR_BYTES`] when the
+    /// pool is sized automatically.
+    pub resident_bytes: Option<u64>,
+    /// Pinned host bytes the K/V host tier may take (`--kv-host-budget-gib`).
+    pub host_bytes: u64,
+}
+/// Resident K/V an automatically sized host-placed pool keeps.
+pub const HOT_FLOOR_BYTES: u64 = 1 << 30;
+
 #[derive(Debug, Clone)]
 pub struct Admission {
     pub cache: MiniMaxCacheLayout,
     pub pool_pages: u64,
     pub pool_tokens: u64,
+    /// K/V pages `[0, resident_pages)` are GPU memory (all of them without host placement).
+    pub resident_pages: u64,
+    /// GPU bytes of the cache: every index page plus the resident K/V pages.
     pub cache_bytes: u64,
+    /// Pinned host bytes of the non-resident K/V pages (0 without host placement).
+    pub host_bytes: u64,
     pub fixed_bytes: u64,
     pub total_bytes: u64,
 }
+impl Admission {
+    pub fn tiered(&self) -> bool { self.resident_pages < self.pool_pages }
+}
 pub fn admit(cfg: &MiniMaxM3Config, sizing: RuntimeSizing, ledger: &RuntimeLedger, reservations: Reservations,
-    available: u64, requested_pool: Option<u64>, kv_format: Qwen4KvCache) -> Result<Admission> {
+    available: u64, requested_pool: Option<u64>, kv_format: Qwen4KvCache, tiering: Tiering) -> Result<Admission> {
     sizing.validate(cfg)?;
     let cache = MiniMaxCacheLayout::for_runtime(cfg, 1, sizing.context, kv_format)?;
     let fixed_bytes = reservations.fixed_bytes(ledger)?;
@@ -246,16 +278,56 @@ pub fn admit(cfg: &MiniMaxM3Config, sizing: RuntimeSizing, ledger: &RuntimeLedge
     if needed > available { return Err(AdmissionError::Budget { needed, available }); }
     let page_bytes = cache.ranks[0].page_bytes;
     let fitting = (available - fixed_bytes) / page_bytes;
-    let pool_pages = match requested_pool.filter(|n| *n > 0) {
+    let requested = match requested_pool.filter(|n| *n > 0) {
         Some(tokens) if tokens % PAGE_ROWS != 0 => return Err(AdmissionError::Unsupported("pool not aligned to 64-token pages")),
-        Some(tokens) => tokens / PAGE_ROWS,
-        None => fitting.min(i32::MAX as u64),
+        Some(tokens) => Some(tokens / PAGE_ROWS),
+        None => None,
+    };
+    let (pool_pages, resident_pages, cache_bytes, host_bytes) = match tiering {
+        Tiering::Gpu => {
+            let pages = requested.unwrap_or(fitting.min(i32::MAX as u64));
+            (pages, pages, product(&[pages, page_bytes])?, 0)
+        }
+        Tiering::Host(tier) => host_pool(&cache, sizing, available - fixed_bytes, requested, tier)?,
     };
     if pool_pages == 0 || pool_pages > i32::MAX as u64 { return Err(AdmissionError::Unsupported("physical page count outside Int32")); }
-    let cache_bytes = product(&[pool_pages, page_bytes])?;
     let total_bytes = sum([fixed_bytes, cache_bytes])?;
     if total_bytes > available { return Err(AdmissionError::Budget { needed: total_bytes, available }); }
-    Ok(Admission { cache, pool_pages, pool_tokens: pool_pages * PAGE_ROWS, cache_bytes, fixed_bytes, total_bytes })
+    Ok(Admission { cache, pool_pages, pool_tokens: pool_pages * PAGE_ROWS, resident_pages, cache_bytes, host_bytes,
+        fixed_bytes, total_bytes })
+}
+
+/// Host placement in `free` GPU bytes: (pool pages, resident pages, GPU bytes,
+/// host bytes). An automatic pool covers every sequence slot at full context as
+/// far as the index pages and host budget allow, but is never smaller than the
+/// GPU-only pool; resident pages take the GPU bytes the index pages leave, in
+/// whole tier parts. The GPU total is checked by the caller.
+fn host_pool(cache: &MiniMaxCacheLayout, sizing: RuntimeSizing, free: u64, requested: Option<u64>,
+    tier: HostTier) -> Result<(u64, u64, u64, u64)> {
+    let rank = &cache.ranks[0];
+    let unit = cache.tier_unit_pages(0);
+    let kv = 2 * cache.layers as u64 * rank.kv_page_bytes;
+    let index = rank.page_bytes - kv;
+    let parts = |bytes: u64| bytes / kv / unit * unit;
+    let resident_for = |pages: u64| parts(free.saturating_sub(pages.saturating_mul(index)));
+    let pages = match requested {
+        Some(pages) => pages,
+        None => {
+            let floor = parts(tier.resident_bytes.unwrap_or(HOT_FLOOR_BYTES));
+            let target = (sizing.sequences as u64).saturating_mul(sizing.context.div_ceil(PAGE_ROWS));
+            let by_index = free.saturating_sub(floor.saturating_mul(kv)) / index;
+            let by_host = floor.saturating_add(tier.host_bytes / (unit * kv) * unit);
+            let pages = target.min(by_index).min(by_host).min(i32::MAX as u64);
+            let gpu_only = free / rank.page_bytes;
+            if pages <= gpu_only { return Ok((gpu_only, gpu_only, product(&[gpu_only, rank.page_bytes])?, 0)); }
+            pages
+        }
+    };
+    let resident = tier.resident_bytes.map_or_else(|| resident_for(pages), parts);
+    if resident >= pages { return Ok((pages, pages, product(&[pages, rank.page_bytes])?, 0)); }
+    let (gpu, host) = cache.tiered_bytes(0, pages, resident)?;
+    if host > tier.host_bytes { return Err(AdmissionError::HostBudget { needed: host, available: tier.host_bytes }); }
+    Ok((pages, resident, gpu, host))
 }
 
 /// The package manifest is selected explicitly; a missing capacity is refused.
@@ -430,17 +502,69 @@ pub(crate) mod tests {
         let fixed = ledger.fixed_bytes + 34_000;
         let page = 60 * (2 * 32768 + 8448);
         let available = fixed + 3 * page;
-        let admitted = admit(&cfg, sizing, &ledger, reservations, available, Some(192), Qwen4KvCache::Fp8).unwrap();
+        let admitted = admit(&cfg, sizing, &ledger, reservations, available, Some(192), Qwen4KvCache::Fp8, Tiering::Gpu).unwrap();
         assert_eq!((admitted.fixed_bytes, admitted.pool_pages, admitted.total_bytes), (fixed, 3, available));
         assert_eq!(admitted.cache_bytes, 3 * page);
-        let automatic = admit(&cfg, sizing, &ledger, reservations, available + 1, None, Qwen4KvCache::Fp8).unwrap();
+        let automatic = admit(&cfg, sizing, &ledger, reservations, available + 1, None, Qwen4KvCache::Fp8, Tiering::Gpu).unwrap();
         assert_eq!(automatic.pool_tokens, 192);
-        assert!(matches!(admit(&cfg, sizing, &ledger, reservations, available - 1, Some(192), Qwen4KvCache::Fp8),
+        assert!(matches!(admit(&cfg, sizing, &ledger, reservations, available - 1, Some(192), Qwen4KvCache::Fp8, Tiering::Gpu),
             Err(AdmissionError::Budget { .. })));
-        assert!(admit(&cfg, sizing, &ledger, reservations, available, Some(193), Qwen4KvCache::Fp8).is_err());
-        assert!(admit(&cfg, sizing, &ledger, reservations, available, Some(192), Qwen4KvCache::Bf16).is_err());
+        assert!(admit(&cfg, sizing, &ledger, reservations, available, Some(193), Qwen4KvCache::Fp8, Tiering::Gpu).is_err());
+        assert!(admit(&cfg, sizing, &ledger, reservations, available, Some(192), Qwen4KvCache::Bf16, Tiering::Gpu).is_err());
         assert!(matches!(admit(&cfg, sizing, &ledger, Reservations { startup: available + 1, ..reservations },
-            available, None, Qwen4KvCache::Fp8), Err(AdmissionError::Budget { .. })));
+            available, None, Qwen4KvCache::Fp8, Tiering::Gpu), Err(AdmissionError::Budget { .. })));
+    }
+
+    #[test]
+    fn host_placement_keeps_index_pages_on_gpu_and_pages_kv_in_whole_parts() {
+        let cfg = config();
+        let sizing = RuntimeSizing { sequences: 1, ..sizing() };
+        let programs = ProgramSizes::from_manifest(&programs_manifest(), sizing).unwrap();
+        let ledger = RuntimeLedger::new(&cfg, sizing, &programs).unwrap();
+        let reservations = Reservations::default();
+        let fixed = ledger.fixed_bytes;
+        let (kv, index, page) = (60 * 2 * 32768u64, 60 * 8448u64, 60 * (2 * 32768 + 8448u64));
+        let unit = 64;
+        let available = fixed + (4u64 << 30);
+        let host = |resident_bytes, host_bytes| Tiering::Host(HostTier { resident_bytes, host_bytes });
+        let gpu = admit(&cfg, sizing, &ledger, reservations, available, None, Qwen4KvCache::Fp8, Tiering::Gpu).unwrap();
+        assert_eq!(gpu.pool_pages, (4u64 << 30) / page);
+        // Automatic: one slot at 1M context (16,384 pages) fits beside the index pages;
+        // every remaining GPU byte holds resident K/V in 2 MiB parts.
+        let wide = fixed + (12u64 << 30);
+        let auto = admit(&cfg, sizing, &ledger, reservations, wide, None, Qwen4KvCache::Fp8, host(None, 192 << 30)).unwrap();
+        assert_eq!(auto.pool_pages, 16_384);
+        assert!(auto.tiered());
+        assert_eq!(auto.resident_pages, ((12u64 << 30) - 16_384 * index) / kv / unit * unit);
+        assert_eq!(auto.cache_bytes, 16_384 * index + auto.resident_pages * kv);
+        assert_eq!(auto.host_bytes, (16_384 - auto.resident_pages).div_ceil(unit) * unit * kv);
+        assert!(auto.total_bytes <= wide);
+        // 4 GiB cannot index 1M tokens: the automatic pool is index-limited beside a 1 GiB floor.
+        let limited = admit(&cfg, sizing, &ledger, reservations, available, None, Qwen4KvCache::Fp8, host(None, 192 << 30)).unwrap();
+        assert_eq!((limited.pool_pages, limited.resident_pages), (((4u64 << 30) - 256 * kv) / index, 256));
+        // An exact resident tier, and an explicit pool that is not a whole number of parts.
+        let exact = admit(&cfg, sizing, &ledger, reservations, available, Some(7_000 * 64), Qwen4KvCache::Fp8,
+            host(Some(kv * 100), 192 << 30)).unwrap();
+        assert_eq!((exact.pool_pages, exact.resident_pages), (7_000, 64));
+        assert_eq!(exact.host_bytes, (7_000u64 - 64).div_ceil(64) * 64 * kv);
+        assert_eq!(exact.cache_bytes, 7_000 * index + 64 * kv);
+        // The host budget bounds the automatic pool to whole parts beyond the floor ...
+        let small = admit(&cfg, sizing, &ledger, reservations, available, None, Qwen4KvCache::Fp8,
+            host(Some(0), 20 * unit * kv)).unwrap();
+        assert_eq!((small.pool_pages, small.resident_pages, small.host_bytes), (1280, 0, 1280 * kv));
+        // ... and never leaves a smaller pool than GPU placement.
+        let tiny = admit(&cfg, sizing, &ledger, reservations, available, None, Qwen4KvCache::Fp8,
+            host(Some(0), 10 * unit * kv)).unwrap();
+        assert_eq!((tiny.pool_pages, tiny.resident_pages, tiny.host_bytes), (gpu.pool_pages, gpu.pool_pages, 0));
+        assert!(matches!(admit(&cfg, sizing, &ledger, reservations, available, Some(7_000 * 64), Qwen4KvCache::Fp8,
+            host(Some(0), kv)), Err(AdmissionError::HostBudget { .. })));
+        // A pool the GPU holds outright needs no host part.
+        let fits = admit(&cfg, sizing, &ledger, reservations, available, Some(64 * 64), Qwen4KvCache::Fp8,
+            host(None, 192 << 30)).unwrap();
+        assert_eq!((fits.resident_pages, fits.host_bytes, fits.cache_bytes), (64, 0, 64 * page));
+        // Without host placement the automatic pool cannot exceed the GPU.
+        assert!(matches!(admit(&cfg, sizing, &ledger, reservations, available, Some(16_384 * 64), Qwen4KvCache::Fp8,
+            Tiering::Gpu), Err(AdmissionError::Budget { .. })));
     }
 
     #[test]
