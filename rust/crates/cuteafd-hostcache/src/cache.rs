@@ -349,7 +349,11 @@ impl<E: CopyEngine, P> HostCache<E, P> {
         let snapshots = if config.enabled() {
             let chunk_bytes = usize::try_from(config.chunk_bytes)
                 .map_err(|_| anyhow::anyhow!("chunk_bytes exceeds usize"))?;
+            let started = std::time::Instant::now();
             let pool = SlabPool::new(config.bytes, chunk_bytes, layout, &mut engine)?;
+            let (pinned, seconds) = (config.bytes / config.chunk_bytes * config.chunk_bytes, started.elapsed().as_secs_f64());
+            tracing::info!(target: "cuteafd::hostcache", pinned_bytes = pinned, chunk_bytes, seconds,
+                gb_per_s = pinned as f64 / seconds.max(1e-9) / 1e9, "host snapshot pool pinned");
             Some(Snapshots::with_rule(pool, rule, order))
         } else {
             None
