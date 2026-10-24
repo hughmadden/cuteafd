@@ -2,7 +2,7 @@
 //! Semantics: vllm PR 63232 at 306db61dc16a2c7d2655e4d2b29f7d6a6c4409d6.
 use super::{ffn, head::TargetHeadOwner, native::Native, scratch::Scratch, weights::Weights, MiniMaxError};
 use crate::shared::{memory::device::Allocation, prefix::view, qwen::scheduler,
-    speculation::dflash::{ContextRow, Draft, DraftSeq}, token_io::TokenEmbedding};
+    speculation::{block_dspark, dflash::{ContextRow, Draft, DraftSeq}}, token_io::TokenEmbedding};
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::{block_dspark::{check_operand as check, disjoint, extent, DraftHeads}, programs::Scalar,
     CuteafdDeviceBuffer, NativeLibrary};
@@ -40,13 +40,14 @@ impl State {
     }
 }
 
+/// Copies `(tap row - first, ring row, rows)` of the context `rows` (tap rows
+/// below `capacity`), runs that stay contiguous in both merged.
 fn context_spans(rows:&[ContextRow],first:usize,slots:usize,capacity:usize)->Result<Vec<(usize,usize,usize)>> {
     let mut spans:Vec<(usize,usize,usize)>=Vec::new();
     for row in rows {
-        ensure!(row.slot<slots && row.tap_row>=first && row.tap_row<capacity,
-            MiniMaxError::Invalid("draft context span"));
+        ensure!(row.tap_row>=first && row.tap_row<capacity, MiniMaxError::Invalid("draft context span"));
         let source=row.tap_row-first;
-        let destination=row.slot*WINDOW+row.position%WINDOW;
+        let destination=block_dspark::context_row(true,row.slot,row.position,slots,WINDOW)? as usize;
         if let Some((src,dst,n))=spans.last_mut() {
             if *src+*n==source && *dst+*n==destination && *dst/WINDOW==destination/WINDOW {
                 *n+=1; continue;

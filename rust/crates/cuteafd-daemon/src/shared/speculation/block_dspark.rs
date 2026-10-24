@@ -76,12 +76,7 @@ impl DsparkConfig {
     }
 
     fn context_row(&self, slot: usize, position: usize, slots: usize, capacity: usize) -> Result<i32> {
-        ensure!(slot < slots && capacity > 0, "dSpark context slot/capacity outside admission");
-        ensure!(self.window.is_some() || position < capacity,
-            "full-context dSpark position {position} exceeds admitted {capacity}");
-        let row = slot.checked_mul(capacity).and_then(|base| base.checked_add(position % capacity))
-            .context("dSpark context row overflow")?;
-        Ok(i32::try_from(row)?)
+        context_row(self.window.is_some(), slot, position, slots, capacity)
     }
 
     /// Drafted tokens per draft step (every block row predicts one).
@@ -100,6 +95,16 @@ impl DsparkConfig {
     pub(crate) fn qkv_width(&self) -> usize {
         self.q_width() + 2 * self.kv_width()
     }
+}
+
+/// The context ring row of `position` in `slot`'s ring of `capacity` rows: a
+/// sliding window wraps it, a full context refuses positions past its admission.
+pub(crate) fn context_row(sliding: bool, slot: usize, position: usize, slots: usize, capacity: usize) -> Result<i32> {
+    ensure!(slot < slots && capacity > 0, "dSpark context slot/capacity outside admission");
+    ensure!(sliding || position < capacity, "full-context dSpark position {position} exceeds admitted {capacity}");
+    let row = slot.checked_mul(capacity).and_then(|base| base.checked_add(position % capacity))
+        .context("dSpark context row overflow")?;
+    Ok(i32::try_from(row)?)
 }
 
 fn validate_target_taps(taps: &[super::target::HiddenTap], layers: &[usize], hidden: usize,
