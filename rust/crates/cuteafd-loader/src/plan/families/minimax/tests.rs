@@ -164,7 +164,8 @@ fn native_manifest_uses_shared_allocation_ledger() {
     let rtx = memory.devices.iter().find(|d| d.kind == DeviceKind::Rtx).unwrap();
     let item = |name: &str| rtx.items.iter().find(|i| i.group == name).unwrap();
     assert_eq!(item("MiniMax residual").bytes, 256 * 6144 * 4);
-    assert_eq!(item("MiniMax scratch").bytes, 53_478_400);
+    // Every program shares the scratch arena; the prefill scorer's is the largest.
+    assert_eq!(item("MiniMax scratch").bytes, 134_799_872);
     assert!(rtx.used_bytes() <= PRO_TOTAL_BYTES);
     options.layout.as_mut().unwrap().minimax_kv = crate::families::qwen4::Qwen4KvCache::Bf16;
     let refused = plan::plan(dir.path(), &options).unwrap();

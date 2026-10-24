@@ -12,19 +12,30 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
 import _pinned_sparkinfer
 
 
+# Prefill scorer/extend tile: the scorer's block scores scale with rows x
+# max_pages (539 MB at 4096 rows and 1M tokens), so prefill tiles a chunk.
+EXTEND_ROWS = 1024
+
+
+def capacity(name, max_rows=4096, decode_rows=64):
+    if name.endswith("_decode"):
+        return decode_rows
+    return min(max_rows, EXTEND_ROWS) if name in ("index_prefill", "attention_extend") else max_rows
+
+
 def builders(group, max_rows=4096, max_context=1048576, decode_rows=64):
     if min(max_rows, max_context, decode_rows) <= 0:
         raise ValueError("MiniMax capacities must be positive")
     if group == "indexer":
         from b12x.integration.cuteafd.minimax_indexer import compile_minimax_index_aot
-        return {f"index_{mode}": (lambda mode=mode, rows=rows: compile_minimax_index_aot(
-                    max_rows=rows, max_pages=(max_context + 63) // 64, mode=mode))
-                for mode, rows in (("decode", decode_rows), ("prefill", max_rows))}
+        return {f"index_{mode}": (lambda mode=mode: compile_minimax_index_aot(
+                    max_rows=capacity(f"index_{mode}", max_rows, decode_rows), max_pages=(max_context + 63) // 64,
+                    mode=mode)) for mode in ("decode", "prefill")}
     if group == "attention":
         from b12x.integration.cuteafd.minimax_attention import compile_minimax_attention_aot
-        return {f"attention_{mode}": (lambda mode=mode, rows=rows: compile_minimax_attention_aot(
-                    max_rows=rows, max_batch=decode_rows, mode=mode))
-                for mode, rows in (("decode", decode_rows), ("extend", max_rows))}
+        return {f"attention_{mode}": (lambda mode=mode: compile_minimax_attention_aot(
+                    max_rows=capacity(f"attention_{mode}", max_rows, decode_rows), max_batch=decode_rows, mode=mode))
+                for mode in ("decode", "extend")}
     from b12x.integration.cuteafd import minimax as m
     if group == "projections":
         return {f"mxfp8_{name}": (lambda name=name: m.compile_minimax_linear_aot(name, max_rows=max_rows))
@@ -53,7 +64,7 @@ def builders(group, max_rows=4096, max_context=1048576, decode_rows=64):
 
 def programs(max_rows, max_context, decode_rows=64):
     """Entries for the existing Programs dispatcher; capacities are planned bounds."""
-    return [(name, name, {"max_rows": decode_rows if name.endswith("_decode") else max_rows}, build)
+    return [(name, name, {"max_rows": capacity(name, max_rows, decode_rows)}, build)
             for group in ("pointwise", "projections", "indexer", "attention")
             for name, build in builders(group, max_rows, max_context, decode_rows).items()]
 
@@ -81,11 +92,11 @@ def main():
             program = build()
         program.export_to_c(str(destination), label, "cuteafd_" + label)
         validate_exported_header(program, destination / (label + ".h"), "cuteafd_" + label)
-        capacity = args.decode_rows if name.endswith("_decode") else args.max_rows
+        rows = capacity(name, args.max_rows, args.decode_rows)
         artifacts = {label + ext: hashlib.sha256((destination / (label + ext)).read_bytes()).hexdigest()
                      for ext in (".o", ".h")}
         records.append(dict(label=label, geometry=dict(program.geometry), abi=program.abi,
-                            capacity_rows=capacity, scratch_bytes_at_capacity=program.scratch_bytes(capacity),
+                            capacity_rows=rows, scratch_bytes_at_capacity=program.scratch_bytes(rows),
                             artifacts=artifacts))
         print(f"exported {label}", flush=True)
     manifest.write_text(json.dumps(dict(schema=1, sparkinfer=_pinned_sparkinfer.LOCK_DATA,

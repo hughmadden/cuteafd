@@ -67,7 +67,7 @@ pub fn load_library(path: &Path) -> Result<NativeLibrary> {
     { let programs = native("program inventory",library.programs())?;
         for (name, _) in definitions() { programs.spec(name).map_err(|_|MiniMaxNativeError::Program {
             program:name.into(),reason:"missing coordinator export" })?; } }
-    for name in ["cuteafd_cuda_accumulate_bf16_to_f32_async", "cuteafd_add_tp2_shared_async",
+    for name in ["cuteafd_cuda_accumulate_bf16_to_f32_async", "cuteafd_add_tp2_shared_async", INDEX_STAGE,
         "cuteafd_vocabulary_head_create_vocab", "cuteafd_vocabulary_head_launch_width",
         "cuteafd_vocabulary_head_launch_tensor_invariant", "cuteafd_v41_markov_destroy"] {
         // SAFETY: lookup verifies symbol presence only; this uncalled address
@@ -77,6 +77,8 @@ pub fn load_library(path: &Path) -> Result<NativeLibrary> {
     }
     Ok(library)
 }
+
+const INDEX_STAGE: &str = "cuteafd_minimax_index_stage_async";
 
 pub fn definitions() -> Vec<(&'static str, &'static [&'static str])> {
     let norm: &[&str] = &["x", "weight", "bias", "cos", "sin", "positions", "out"];
@@ -92,7 +94,9 @@ pub fn definitions() -> Vec<(&'static str, &'static [&'static str])> {
         ("minimax_index_k_pack", &["x", "slots", "values", "scales"]),
         ("minimax_kv_pack", &["k", "v", "slots", "batch_ids", "k_descale", "v_descale", "key_cache", "value_cache"]),
         ("minimax_index_decode", &["q_fp8", "q_scale", "index_k_cache", "page_table", "cache_lengths", "q2k_indices", "scratch"]),
-        ("minimax_attention_decode", &["query", "key_cache", "value_cache", "k_descale", "v_descale", "page_table", "cache_lengths", "cu_seqlens_q", "q2k_indices", "output", "lse", "scratch"])];
+        ("minimax_attention_decode", &["query", "key_cache", "value_cache", "k_descale", "v_descale", "page_table", "cache_lengths", "cu_seqlens_q", "q2k_indices", "output", "lse", "scratch"]),
+        ("minimax_index_prefill", &["q_fp8", "q_scale", "k_fp8", "k_scale", "k_start", "k_end", "q2k_indices", "scratch"]),
+        ("minimax_attention_extend", &["query", "key_cache", "value_cache", "k_descale", "v_descale", "page_table", "cache_lengths", "cu_seqlens_q", "q2k_indices", "output", "lse", "scratch"])];
     for name in ["minimax_mxfp8_q", "minimax_mxfp8_kv", "minimax_mxfp8_o", "minimax_mxfp8_index_q",
         "minimax_mxfp8_index_k", "minimax_mxfp8_shared_gate_up", "minimax_mxfp8_shared_down",
         "minimax_mxfp8_dense_gate_up", "minimax_mxfp8_dense_down"] { v.push((name, linear)); }
@@ -102,7 +106,8 @@ pub fn definitions() -> Vec<(&'static str, &'static [&'static str])> {
 fn scalar_kinds(name:&str)->&'static [u8] {
     if name=="minimax_rope" { b"ifffff" }
     else if name=="minimax_scale_prep" || name.starts_with("minimax_mxfp8_") { b"ii" }
-    else if matches!(name,"minimax_index_decode"|"minimax_attention_decode") { b"iiil" }
+    else if matches!(name,"minimax_index_decode"|"minimax_attention_decode"|"minimax_attention_extend") { b"iiil" }
+    else if name=="minimax_index_prefill" { b"ii" }
     else { b"i" }
 }
 
@@ -132,8 +137,11 @@ fn geometry(name:&str)->serde_json::Value {
         "minimax_index_k_pack"=>json!({"heads":1,"head_dim":128,"paged":true,"page_rows":64}),
         "minimax_kv_pack"=>json!({"heads":4,"head_dim":128,"page_rows":64}),
         "minimax_index_decode"=>json!({"heads":4,"head_dim":128,"block_tokens":128,"topk":16,"mode":"decode"}),
+        "minimax_index_prefill"=>json!({"heads":4,"head_dim":128,"block_tokens":128,"topk":16,"mode":"prefill"}),
         "minimax_attention_decode"=>json!({"page_rows":64,"query_heads":64,"kv_heads":4,"head_dim":128,
             "block_tokens":128,"topk":16,"mode":"decode","softmax_scale":128f64.powf(-0.5)}),
+        "minimax_attention_extend"=>json!({"page_rows":64,"query_heads":64,"kv_heads":4,"head_dim":128,
+            "block_tokens":128,"topk":16,"mode":"extend","softmax_scale":128f64.powf(-0.5)}),
         _=>unreachable!("fixed MiniMax program inventory"),
     }
 }
@@ -151,9 +159,20 @@ fn scratch_bytes(spec:&ProgramSpec)->Option<(&'static str,u64)> {
             Some(("scratch",[4*c*4,4*c*pages.div_ceil(2)*4,4*c*pages*4,4*c*4,4*c*4,
                 4*c*16*4,4*c*16*4,(c+1)*8,256].into_iter().map(|n|align(n,256)).sum()))
         }
+        "minimax_index_prefill"=>{
+            let pages=spec.geometry["max_pages"].as_u64().filter(|&p|p>0 && p<=16384)?;
+            Some(("scratch",[4*c*4,4*c*pages.div_ceil(2)*4,4*c*4,4*c*4,
+                4*c*16*4,4*c*16*4,(c+1)*8,256].into_iter().map(|n|align(n,256)).sum()))
+        }
         "minimax_attention_decode"=>{
             let batch=spec.geometry["max_batch"].as_u64().filter(|&b|b>0 && b<=64)?;
             Some(("scratch",[c*4,c*4,c.max(batch+1)*4,c*4].into_iter().map(|n|align(n,256)).sum()))
+        }
+        "minimax_attention_extend"=>{
+            let batch=spec.geometry["max_batch"].as_u64().filter(|&b|b>0 && b<=64)?;
+            let work=c.div_ceil(8)+batch;
+            Some(("scratch",[work*4,work*4,work.max(batch+1)*4,work*4,work*2048,work*2048,work*16]
+                .into_iter().map(|n|align(n,256)).sum()))
         }
         _=>None,
     }
@@ -163,7 +182,8 @@ fn validate_geometry(spec:&ProgramSpec)->Result<()> {
     let mismatch=||MiniMaxNativeError::Program{program:spec.name.clone(),reason:"incompatible native geometry or scratch"};
     ensure!(spec.capacity_rows>0 && spec.capacity_rows<=4096,mismatch());
     ensure!(geometry(&spec.name).as_object().unwrap().iter().all(|(key,value)|spec.geometry.get(key)==Some(value)),mismatch());
-    if spec.name.starts_with("minimax_mxfp8_") || spec.name.ends_with("_decode") {
+    let attention=matches!(spec.name.as_str(),"minimax_index_prefill"|"minimax_attention_extend") || spec.name.ends_with("_decode");
+    if spec.name.starts_with("minimax_mxfp8_") || attention {
         ensure!(spec.geometry["max_rows"].as_u64()==Some(u64::from(spec.capacity_rows)),mismatch());
         let (operand,required)=scratch_bytes(spec).ok_or_else(mismatch)?;
         ensure!(spec.scratch.get(operand).copied().unwrap_or(0)>=required,mismatch());
@@ -271,6 +291,19 @@ impl<'a> Commands<'a> {
                 required = vec![rows*16384,pages*32768,pages*32768,batch*16,batch*16,batch*stride*4,
                     batch*4,(batch+1)*4,4*spec.capacity_rows as usize*16*4,rows*16384,rows*256,0];
             }
+            "minimax_index_prefill" => {
+                let keys = scalar(1)?;
+                ensure!(keys <= spec.geometry["max_pages"].as_u64().unwrap() as usize*64, "MiniMax prefill key extent");
+                let padded = keys.next_multiple_of(256);
+                required = vec![rows*512, rows*16, padded*128, padded*4, rows*4, rows*4, 4*spec.capacity_rows as usize*16*4, 0];
+            }
+            "minimax_attention_extend" => {
+                let (batch,stride,pages) = (scalar(1)?,scalar(2)?,scalar(3)?);
+                ensure!(batch <= rows && batch as u64 <= spec.geometry["max_batch"].as_u64().unwrap()
+                    && pages<=i32::MAX as usize, "MiniMax extend batch extent");
+                required = vec![rows*16384,pages*32768,pages*32768,batch*16,batch*16,batch*stride*4,
+                    batch*4,(batch+1)*4,4*spec.capacity_rows as usize*16*4,rows*16384,rows*256,0];
+            }
             _ => anyhow::bail!("unsupported MiniMax operation: {name}"),
         } }
         for (i, operand) in operands.iter().enumerate() {
@@ -284,6 +317,28 @@ impl<'a> Commands<'a> {
         // SAFETY: family ABI and extents were checked; the stream retains the
         // actual allocation owners, including every sliced operand, until drain.
         native(name,on_device(self.library, self.device, || unsafe { program.launch(&pointers, scalars, self.stream) }))
+    }
+    /// Gathers `count` pages of an MSA index cache (their physical ids in
+    /// `pages`) into the contiguous key rows and FP32 scales the prefill
+    /// scorer reads: page j becomes rows [64j, 64j + 64).
+    pub fn index_stage(&self, cache: &Buffer<'a>, pages: &Buffer<'a>, count: usize,
+        keys: &Buffer<'a>, scales: &Buffer<'a>) -> Result<()> {
+        ensure!(count > 0 && count <= i32::MAX as usize && pages.view.bytes >= count * 4 && keys.view.bytes >= count * 8192
+            && scales.view.bytes >= count * 256 && cache.view.bytes % 8448 == 0, MiniMaxNativeError::Operand("index stage extents"));
+        ensure!([cache, pages, keys, scales].iter().all(|b| b.view.ptr as usize % 16 == 0),
+            MiniMaxNativeError::Operand("program operand is not 16-byte aligned"));
+        self.keep(&[cache, pages, keys, scales])?;
+        type Stage = unsafe extern "C" fn(*const c_void, *const i32, u32, *mut c_void, *mut c_void, *mut c_void) -> i32;
+        // SAFETY: the symbol's C ABI is fixed by minimax_index_stage.cu; load_library required it.
+        let stage = unsafe { self.library.lib.get::<Stage>(INDEX_STAGE.as_bytes()) }
+            .map_err(|_| MiniMaxNativeError::Program { program: INDEX_STAGE.into(), reason: "missing shared execution export" })?;
+        // SAFETY: checked extents and alignment; the page ids are the batch's
+        // validated pool pages, and every operand is retained until drain.
+        let status = on_device(self.library, self.device, || Ok(unsafe {
+            stage(cache.view.ptr, pages.view.ptr.cast(), count as u32, keys.view.ptr, scales.view.ptr, self.stream) }))?;
+        ensure!(status == 0, MiniMaxNativeError::Runtime { operation: "index stage".into(),
+            source: anyhow::anyhow!("CUDA status {status}") });
+        Ok(())
     }
     pub fn copy(&self, destination: &Buffer<'a>, source: &Buffer<'a>, bytes: usize) -> Result<()> {
         ensure!(bytes <= destination.view.bytes && bytes <= source.view.bytes, "MiniMax copy extent");
@@ -304,7 +359,9 @@ impl<'a> Commands<'a> {
             CuteafdDeviceBuffer { bytes: bytes.len(), ..buffer.raw() }, bytes, self.stream) })
     }
     pub fn widen(&self, source: &Buffer<'a>, destination: &Buffer<'a>, count: usize) -> Result<()> {
-        self.zero(destination)?; self.keep(&[source, destination])?;
+        // Only the live rows are accumulated into, so only they are cleared.
+        self.zero(&destination.view(0, count.checked_mul(4).context("MiniMax widen extent")?)?)?;
+        self.keep(&[source, destination])?;
         // SAFETY: the native routine checks both extents; retained distinct
         // allocations are initialized by the preceding stream operations.
         on_device(self.library, self.device, || unsafe { self.library.cuda_accumulate_bf16_to_f32_async(
@@ -365,12 +422,12 @@ impl<'a> Head<'a> {
 mod tests {
     use super::*;
     fn spec(name:&str,pointers:&[&str])->ProgramSpec {
-        let capacity=if name.ends_with("_decode") {64} else {4096};
+        let capacity=if name.ends_with("_decode") {64} else if matches!(name,"minimax_index_prefill"|"minimax_attention_extend") {1024} else {4096};
         let mut spec=ProgramSpec {name:name.into(),pointers:pointers.iter().map(|s|s.to_string()).collect(),
             scalar_kinds:scalar_kinds(name).to_vec(),scratch:Default::default(),capacity_rows:capacity,geometry:geometry(name)};
         spec.geometry["max_rows"]=capacity.into();
-        if name=="minimax_index_decode" {spec.geometry["max_pages"]=16384.into();}
-        if name=="minimax_attention_decode" {spec.geometry["max_batch"]=64.into();}
+        if matches!(name,"minimax_index_decode"|"minimax_index_prefill") {spec.geometry["max_pages"]=16384.into();}
+        if matches!(name,"minimax_attention_decode"|"minimax_attention_extend") {spec.geometry["max_batch"]=64.into();}
         if let Some((operand,bytes))=scratch_bytes(&spec) {spec.scratch.insert(operand.into(),bytes);}
         spec
     }
@@ -379,14 +436,15 @@ mod tests {
         assert_eq!(linear_shape("kv"),Some((1024,6144)));
         assert!(linear_shape("bf16").is_none());
         let names: std::collections::BTreeSet<_> = definitions().iter().map(|(n,_)|*n).collect();
-        assert_eq!(names.len(),27);
+        assert_eq!(names.len(),29);
         assert!(names.iter().all(|name|name.starts_with("minimax_")));
     }
 
     #[test] fn minimax_rejects_geometry_and_scratch_that_change_native_numerics() -> Result<()> {
         for (name,pointers) in definitions() {validate_geometry(&spec(name,pointers))?;}
         for (name,bytes) in [("minimax_mxfp8_q",26_739_712),("minimax_mxfp8_dense_down",53_478_400),
-            ("minimax_index_decode",25_202_688),("minimax_attention_decode",1_280)] {
+            ("minimax_index_decode",25_202_688),("minimax_attention_decode",1_280),
+            ("minimax_index_prefill",134_799_872),("minimax_attention_extend",792_576)] {
             let mut program=spec(name,&[]);
             let (operand,actual)=scratch_bytes(&program).unwrap();assert_eq!(actual,bytes);
             program.scratch.insert(operand.into(),actual-1);assert!(validate_geometry(&program).is_err());

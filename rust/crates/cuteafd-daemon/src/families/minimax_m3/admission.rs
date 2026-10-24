@@ -90,9 +90,9 @@ mod tests {
 
     fn manifest() -> serde_json::Value {
         serde_json::json!({"programs":admission::PROGRAM_NAMES.iter().map(|suffix| {
-            let rows = if suffix.ends_with("_decode") {64} else {4096};
+            let rows = if suffix.ends_with("_decode") {64} else if matches!(*suffix, "index_prefill" | "attention_extend") {1024} else {4096};
             serde_json::json!({"name":format!("minimax_{suffix}"),"capacity_rows":rows,
-                "scratch_bytes_at_capacity":{"scratch":if *suffix == "index_prefill" {539197952} else {53478400}},
+                "scratch_bytes_at_capacity":{"scratch":if *suffix == "index_prefill" {134799872} else {53478400}},
                 "geometry":{"max_pages":16384,"max_batch":64}})
         }).collect::<Vec<_>>()})
     }

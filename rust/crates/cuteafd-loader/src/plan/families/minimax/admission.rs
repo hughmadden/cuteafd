@@ -81,6 +81,7 @@ pub struct ProgramSize {
 pub struct ProgramSizes {
     pub programs: BTreeMap<String, ProgramSize>,
     decode_capacity: u64,
+    extend_capacity: u64,
     workspace_bytes: u64,
 }
 impl ProgramSizes {
@@ -94,7 +95,9 @@ impl ProgramSizes {
             let entry = matches[0];
             let capacity_rows = entry["capacity_rows"].as_u64().filter(|c| *c > 0)
                 .ok_or_else(|| manifest(format!("{name}: missing row capacity")))?;
-            let required = if suffix.ends_with("_decode") { sizing.decode_rows } else { sizing.rows } as u64;
+            // Prefill tiles any chunk through the scorer/extend tile, whatever its rows.
+            let required = if suffix.ends_with("_decode") { sizing.decode_rows }
+                else if matches!(*suffix, "index_prefill" | "attention_extend") { 1 } else { sizing.rows } as u64;
             if capacity_rows < required { return Err(manifest(format!("{name}: capacity {capacity_rows} is below {required}"))); }
             let scratch = entry["scratch_bytes_at_capacity"].as_object()
                 .ok_or_else(|| manifest(format!("{name}: missing scratch inventory")))?;
@@ -114,13 +117,17 @@ impl ProgramSizes {
         if decode_capacity > 64 || decode_capacity != programs["minimax_attention_decode"].capacity_rows {
             return Err(manifest("index/attention decode selection strides disagree"));
         }
-        // Prefill uses causal paged decode tiles; contiguous index/extend arenas
-        // have no owner in this executor and must not displace the KV pool.
-        let workspace_bytes = programs.iter().filter(|(name, _)| !matches!(name.as_str(),
-            "minimax_index_prefill" | "minimax_attention_extend")).map(|(_, p)| p.scratch_bytes).max().unwrap_or(0).max(256);
-        Ok(Self { programs, decode_capacity, workspace_bytes })
+        let extend_capacity = programs["minimax_index_prefill"].capacity_rows;
+        if extend_capacity != programs["minimax_attention_extend"].capacity_rows {
+            return Err(manifest("index/attention prefill selection strides disagree"));
+        }
+        // One stream runs every program, so they share one scratch arena.
+        let workspace_bytes = programs.values().map(|p| p.scratch_bytes).max().unwrap_or(0).max(256);
+        Ok(Self { programs, decode_capacity, extend_capacity, workspace_bytes })
     }
     pub fn decode_capacity(&self) -> u64 { self.decode_capacity }
+    /// Rows one prefill scorer/extend launch takes; prefill tiles larger chunks.
+    pub fn extend_capacity(&self) -> u64 { self.extend_capacity }
     pub fn workspace_bytes(&self) -> u64 { self.workspace_bytes }
 }
 
@@ -155,11 +162,20 @@ impl RuntimeLedger {
         add("head_input", &[sizing.logit_rows as u64, h, 2])?;
         add("head_workspace", &[4 << 20])?;
         add("logits", &[sizing.logit_rows as u64, cfg.vocab_size as u64, 4])?;
+        // Decode steps (at most `d` rows) give each row its own table; prefill
+        // launches one extend tile of at most `t` rows per request piece, each
+        // with a 16-byte aligned length, offset pair and causal key ends.
+        let (t, stride) = (programs.extend_capacity(), extend_table_stride(sizing.context));
+        let launches = extend_launches(sizing, t);
         add("q2k", &[4, d, 16, 4])?;
-        add("lse", &[d, 64, 4])?;
-        add("page_table", &[d, sizing.context.div_ceil(PAGE_ROWS), 4])?;
-        add("cache_lengths", &[d, 4])?;
-        add("cu_seqlens_q", &[d + 1, 4])?;
+        add("q2k_extend", &[4, t, 16, 4])?;
+        add("lse", &[d.max(t), 64, 4])?;
+        add("page_table", &[d.max(launches), stride, 4])?;
+        add("cache_lengths", &[d.max(4 * launches), 4])?;
+        add("cu_seqlens_q", &[(d + 1).max(4 * launches), 4])?;
+        add("index_bounds", &[t + r + 4 * launches, 4])?;
+        add("index_keys", &[sizing.context.next_multiple_of(256), 128])?;
+        add("index_scales", &[sizing.context.next_multiple_of(256), 4])?;
         add("k_descale", &[d, 4, 4])?;
         add("v_descale", &[d, 4, 4])?;
         add("prefix_tail", &[1])?;
@@ -173,6 +189,16 @@ impl RuntimeLedger {
         Ok(Self { allocations, fixed_bytes })
     }
     pub fn bytes(&self, name: &str) -> Option<u64> { self.allocations.iter().find(|a| a.name == name).map(|a| a.bytes) }
+}
+
+/// Page-table entries per extend launch: every page of the admitted context,
+/// padded so each launch's row starts 16-byte aligned.
+pub fn extend_table_stride(context: u64) -> u64 { context.div_ceil(PAGE_ROWS).next_multiple_of(4) }
+
+/// Most extend launches one prefill step makes: each request's rows split
+/// into tiles of at most `tile` rows.
+pub fn extend_launches(sizing: RuntimeSizing, tile: u64) -> u64 {
+    sizing.sequences as u64 + (sizing.rows as u64).div_ceil(tile)
 }
 
 /// Source scales are released after preparation completes; the MMA arrangement
@@ -299,13 +325,13 @@ pub(crate) mod tests {
 
     pub(crate) fn programs_manifest() -> Value {
         serde_json::json!({"programs": PROGRAM_NAMES.iter().map(|suffix| {
-            let rows = if suffix.ends_with("_decode") { 64 } else { 4096 };
+            let rows = if suffix.ends_with("_decode") { 64 } else if matches!(*suffix, "index_prefill" | "attention_extend") { 1024 } else { 4096 };
             let scratch = match *suffix {
                 "mxfp8_dense_down" => 53_478_400,
                 "index_decode" => 25_202_688,
-                "index_prefill" => 539_197_952,
+                "index_prefill" => 134_799_872,
                 "attention_decode" => 1_280,
-                "attention_extend" => 2_377_728,
+                "attention_extend" => 792_576,
                 _ => 0,
             };
             serde_json::json!({"name":format!("minimax_{suffix}"),"capacity_rows":rows,
@@ -336,8 +362,15 @@ pub(crate) mod tests {
         assert_eq!(RuntimeLedger::new(&config(), full, &programs).unwrap().bytes("logits"),
             Some(256 * config().vocab_size as u64 * 4));
         assert_eq!(ledger.bytes("q2k"), Some(4 * 64 * 16 * 4));
+        assert_eq!(ledger.bytes("q2k_extend"), Some(4 * 1024 * 16 * 4));
+        assert_eq!(ledger.bytes("lse"), Some(1024 * 64 * 4));
+        // 16 sequences + one 1024-row tile of a 256-row step.
         assert_eq!(ledger.bytes("page_table"), Some(64 * 16384 * 4));
-        assert_eq!(ledger.bytes("scratch"), Some(53_478_400));
+        assert_eq!(ledger.bytes("cache_lengths"), Some(4 * 17 * 4));
+        assert_eq!(ledger.bytes("index_bounds"), Some((1024 + 256 + 4 * 17) * 4));
+        assert_eq!(ledger.bytes("index_keys"), Some((1 << 20) * 128));
+        assert_eq!(ledger.bytes("index_scales"), Some((1 << 20) * 4));
+        assert_eq!(ledger.bytes("scratch"), Some(134_799_872));
         assert_eq!(ledger.bytes("head_workspace"), Some(4 << 20));
         assert_eq!(ledger.bytes("prefix_tail"), Some(256));
         assert_eq!(ledger.bytes("spark_intake"), Some(3 * 256 * 6144 * 2));
@@ -345,7 +378,7 @@ pub(crate) mod tests {
         assert_eq!(ledger.bytes("sampler"), Some(cuteafd_core::target_sampler_device_bytes(64, config().vocab_size) as u64));
         assert_eq!(ledger.fixed_bytes, ledger.allocations.iter().map(|a| a.bytes).sum::<u64>());
         assert!(ledger.allocations.iter().all(|a| a.bytes >= 256));
-        assert!(ledger.allocations.iter().all(|a| !a.name.contains("contiguous")));
+
     }
 
     #[test]

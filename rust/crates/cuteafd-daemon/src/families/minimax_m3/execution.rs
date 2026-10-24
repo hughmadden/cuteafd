@@ -54,6 +54,62 @@ impl BatchView {
     }
 }
 
+/// Rows `first..first + rows` of request `request` (step rows from `row`) as
+/// one extend launch; `slot` indexes its table, length and offset entries,
+/// `bounds` its causal key ends in the index bounds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Launch { request:usize, row:usize, first:usize, rows:usize, slot:usize, bounds:usize }
+
+/// A step's attention metadata, uploaded once before the layer loop: page
+/// tables do not change between layers. Decode steps give every row its own
+/// table for the decode programs; prefill steps tile each request through
+/// the prefill scorer and the extend kernel.
+#[derive(Debug, PartialEq, Eq)]
+enum AttentionPlan { Decode { stride:usize }, Extend { launches:Vec<Launch> } }
+
+/// Decode metadata: per-row tables (-1 padded), lengths and packed offsets.
+fn decode_tables(batch:&BatchView)->Result<(usize,Vec<i32>,Vec<i32>,Vec<i32>)> {
+    let rows=batch.positions.len();
+    let stride=batch.positions.iter().copied().max().context("MiniMax empty batch")? as usize/64+1;
+    let mut tables=vec![-1i32;rows*stride];
+    let mut lengths=Vec::with_capacity(rows);
+    for row in 0..rows {
+        let request=batch.request(row)?;
+        let length=batch.positions[row] as usize+1;
+        let width=length.div_ceil(64);
+        tables[row*stride..row*stride+width].copy_from_slice(&request.pages[..width]);
+        lengths.push(length as i32);
+    }
+    Ok((stride,tables,lengths,(0..=rows as i32).collect()))
+}
+
+/// Extend metadata: one launch per request tile of at most `tile` rows. Each
+/// launch's table row holds its request's pages through the step (padded
+/// with -1 to `stride`), its 16-byte entries hold the cache length after its
+/// rows and its packed offsets [0, rows], and `bounds` its rows' causal key
+/// ends after the `tile` leading zero key starts.
+fn extend_tables(batch:&BatchView,tile:usize,stride:usize)->Result<(Vec<Launch>,Vec<i32>,Vec<i32>,Vec<i32>,Vec<i32>)> {
+    let (mut launches,mut tables,mut lengths,mut offsets,mut bounds)=(Vec::new(),Vec::new(),Vec::new(),Vec::new(),Vec::new());
+    for (request,view) in batch.requests.iter().enumerate() {
+        let end=view.start_position+view.rows;
+        let width=end.div_ceil(64);
+        ensure!(width<=stride,MiniMaxError::Invalid("extend page-table width"));
+        for first in (0..view.rows).step_by(tile) {
+            let rows=(view.rows-first).min(tile);
+            launches.push(Launch{request,row:view.row_start+first,first,rows,slot:launches.len(),bounds:tile+bounds.len()});
+            tables.extend_from_slice(&view.pages[..width]);
+            tables.resize(launches.len()*stride,-1);
+            lengths.extend([(view.start_position+first+rows) as i32,0,0,0]);
+            offsets.extend([0,rows as i32,0,0]);
+            bounds.extend((0..rows).map(|i|(view.start_position+first+i+1) as i32));
+            bounds.resize(bounds.len().next_multiple_of(4),0);
+        }
+    }
+    Ok((launches,tables,lengths,offsets,bounds))
+}
+
+fn le_bytes(values:&[i32])->Vec<u8> { values.iter().flat_map(|v|v.to_le_bytes()).collect() }
+
 pub(super) trait ExpertExecutor<'a> {
     fn begin(&mut self, _waves:usize, _kind:ExpertV2SourceKind) -> Result<()> { Ok(()) }
     fn dispatch(&mut self, layer:usize, rows:usize, ids:&Buffer<'a>, weights:&Buffer<'a>,
@@ -74,6 +130,7 @@ pub(super) struct Execution<'a> {
     logit_rows:usize,
     context:usize,
     decode_rows:usize,
+    extend_rows:usize,
     table_stride:usize,
     poisoned:std::cell::Cell<bool>,
     diagnostics:std::cell::RefCell<Option<Diagnostics>>,
@@ -96,9 +153,12 @@ impl<'a> Execution<'a> {
         let decode_rows=commands.capacity("minimax_index_decode")?;
         ensure!(decode_rows>0 && decode_rows<=64 && commands.capacity("minimax_attention_decode")?==decode_rows,
             MiniMaxError::Invalid("index/attention capacity stride"));
+        let extend_rows=commands.capacity("minimax_index_prefill")?;
+        ensure!(extend_rows>0 && extend_rows%4==0 && commands.capacity("minimax_attention_extend")?==extend_rows,
+            MiniMaxError::Invalid("prefill index/attention capacity stride"));
         let scratch=Scratch::new(device,ledger)?;
-        let table_stride=scratch.get("page_table")?.raw().bytes/(decode_rows*4);
-        ensure!(table_stride>=context.div_ceil(64),MiniMaxError::Invalid("page-table admission"));
+        let table_stride=usize::try_from(cuteafd_loader::plan::families::minimax::admission::extend_table_stride(context as u64))?;
+        ensure!(scratch.get("page_table")?.raw().bytes>=decode_rows*table_stride*4,MiniMaxError::Invalid("page-table admission"));
         let weights=Weights::load(device,checkpoint,&commands)?;
         commands.launch("minimax_rope", &[scratch.get("cos")?,scratch.get("sin")?], &[
             Scalar::I32(context as i32),Scalar::F32(cfg.rope_theta as f32),Scalar::F32(1.0),
@@ -107,9 +167,11 @@ impl<'a> Execution<'a> {
         commands.upload(scratch.get("k_descale")?,&ones)?;
         commands.upload(scratch.get("v_descale")?,&ones)?;
         commands.upload(scratch.get("batch_ids")?,&vec![0;rows*4])?;
+        // Extend launches read their key starts (all zero) from here.
+        commands.upload(scratch.get("index_bounds")?,&vec![0;extend_rows*4])?;
         commands.drain()?;
         let head=TargetHeadOwner::new(&commands,&scratch,logit_rows,cfg.vocab_size)?;
-        Ok(Self{commands,head,weights,scratch,cfg:cfg.clone(),rows,logit_rows,context,decode_rows,table_stride,
+        Ok(Self{commands,head,weights,scratch,cfg:cfg.clone(),rows,logit_rows,context,decode_rows,extend_rows,table_stride,
             poisoned:std::cell::Cell::new(false),diagnostics,draft:None,draft_causal:false})
     }
     pub fn load_draft(&mut self, contract:&cuteafd_loader::families::minimax_m3::dspark::DsparkContract,
@@ -173,11 +235,12 @@ impl<'a> Execution<'a> {
             experts.begin(self.cfg.moe[..=last_layer].iter().filter(|&&moe|moe).count(),kind)?;
             self.commands.upload(self.scratch.get("positions")?,&batch.positions.iter().flat_map(|v|v.to_le_bytes()).collect::<Vec<_>>())?;
             self.commands.upload(self.scratch.get("slots")?,&batch.slots.iter().flat_map(|v|v.to_le_bytes()).collect::<Vec<_>>())?;
+            let plan=self.plan_attention(batch,rows)?;
             self.commands.widen(embedded,self.scratch.get("residual")?,rows*6144)?;
             for (layer,cache) in caches.iter().enumerate().take(last_layer+1) {
                 let mut dump=diagnostics.as_ref().filter(|d|d.layer==layer).map(|d|d.begin(batch)).transpose()?;
                 if let Some(d)=&mut dump { d.tensor(&self.commands,"input","f32",&[rows,6144],self.scratch.get("residual")?)?; }
-                self.attention(layer,rows,batch,cache,dump.as_mut())?;
+                self.attention(layer,rows,batch,cache,&plan,dump.as_mut())?;
                 ffn::norm(&self.commands,self.scratch.get("residual")?,self.weights.layer(layer,"post_attention_layernorm.weight")?,self.scratch.get("norm")?,rows)?;
                 if let Some(d)=&mut dump { d.tensor(&self.commands,"ffn_norm","bf16",&[rows,6144],self.scratch.get("norm")?)?; }
                 if self.cfg.moe[layer] {
@@ -216,7 +279,26 @@ impl<'a> Execution<'a> {
     fn residual(&self,rows:usize)->Result<()> {
         self.commands.launch("minimax_residual", &[self.scratch.get("residual")?,self.scratch.get("delta")?,self.scratch.get("residual")?], &[Scalar::I32(rows as i32)])
     }
-    fn attention(&self, layer:usize,rows:usize,batch:&BatchView,cache:&LayerCache<'a>,mut dump:Option<&mut StepDump>)->Result<()> {
+    /// Uploads the step's attention metadata (see [`AttentionPlan`]).
+    fn plan_attention(&self,batch:&BatchView,rows:usize)->Result<AttentionPlan> {
+        let s=&self.scratch;
+        if rows<=self.decode_rows {
+            let (stride,tables,lengths,offsets)=decode_tables(batch)?;
+            ensure!(stride<=self.table_stride,MiniMaxError::Invalid("live page-table width"));
+            self.commands.upload(s.get("page_table")?,&le_bytes(&tables))?;
+            self.commands.upload(s.get("cache_lengths")?,&le_bytes(&lengths))?;
+            self.commands.upload(s.get("cu_seqlens_q")?,&le_bytes(&offsets))?;
+            return Ok(AttentionPlan::Decode{stride});
+        }
+        let (launches,tables,lengths,offsets,bounds)=extend_tables(batch,self.extend_rows,self.table_stride)?;
+        self.commands.upload(s.get("page_table")?,&le_bytes(&tables))?;
+        self.commands.upload(s.get("cache_lengths")?,&le_bytes(&lengths))?;
+        self.commands.upload(s.get("cu_seqlens_q")?,&le_bytes(&offsets))?;
+        self.commands.upload(&s.get("index_bounds")?.view(self.extend_rows*4,bounds.len()*4)?,&le_bytes(&bounds))?;
+        Ok(AttentionPlan::Extend{launches})
+    }
+    fn attention(&self, layer:usize,rows:usize,batch:&BatchView,cache:&LayerCache<'a>,plan:&AttentionPlan,
+        mut dump:Option<&mut StepDump>)->Result<()> {
         let s=&self.scratch;
         ffn::norm(&self.commands,s.get("residual")?,self.weights.layer(layer,"input_layernorm.weight")?,s.get("norm")?,rows)?;
         if let Some(d)=dump.as_deref_mut() { d.tensor(&self.commands,"norm","bf16",&[rows,6144],s.get("norm")?)?; }
@@ -245,32 +327,46 @@ impl<'a> Execution<'a> {
                 d.cache_rows(&self.commands,name,"u8",&[rows,4,128],source,&batch.slots,32768,0,512)?;
             }
         }
-        // Every tile treats its queries as independent causal requests. It
-        // reads the exact paged prefix, including prefixes from prior chunks.
-        for start in (0..rows).step_by(self.decode_rows) {
-            let count=(rows-start).min(self.decode_rows);
-            let stride=batch.positions[start..start+count].iter().copied().max().unwrap() as usize/64+1;
-            ensure!(stride<=self.table_stride,MiniMaxError::Invalid("live page-table width"));
-            let mut tables=vec![-1i32;count*stride];
-            let mut lengths=Vec::with_capacity(count);
-            for row in 0..count {
-                let request=batch.request(start+row)?;
-                let length=batch.positions[start+row] as usize+1;
-                let width=length.div_ceil(64);
-                tables[row*stride..row*stride+width].copy_from_slice(&request.pages[..width]);
-                lengths.push(length as i32);
+        match plan {
+            // Every row is an independent causal decode request over the exact
+            // paged prefix, including prefixes from prior chunks.
+            AttentionPlan::Decode{stride} => {
+                let stride=*stride;
+                self.commands.launch("minimax_index_decode", &[&s.get("index_q_fp8")?.view(0,rows*512)?,
+                    &s.get("index_q_scales")?.view(0,rows*16)?,&cache.index,s.get("page_table")?,s.get("cache_lengths")?,s.get("q2k")?,s.get("scratch")?], &[
+                    Scalar::I32(rows as i32),Scalar::I32(stride as i32),Scalar::I32(stride as i32),Scalar::I64(batch.pool_pages as i64)])?;
+                if let Some(d)=dump.as_deref_mut() { d.selection(&self.commands,s.get("q2k")?,rows,self.decode_rows)?; }
+                self.commands.launch("minimax_attention_decode", &[&s.get("q_norm")?.view(0,rows*16384)?,&cache.key,&cache.value,
+                    s.get("k_descale")?,s.get("v_descale")?,s.get("page_table")?,s.get("cache_lengths")?,s.get("cu_seqlens_q")?,s.get("q2k")?,
+                    &s.get("attention")?.view(0,rows*16384)?,s.get("lse")?,s.get("scratch")?], &[
+                    Scalar::I32(rows as i32),Scalar::I32(rows as i32),Scalar::I32(stride as i32),Scalar::I64(batch.pool_pages as i64)])?;
             }
-            self.commands.upload(s.get("page_table")?,&tables.iter().flat_map(|v|v.to_le_bytes()).collect::<Vec<_>>())?;
-            self.commands.upload(s.get("cache_lengths")?,&lengths.iter().flat_map(|v|v.to_le_bytes()).collect::<Vec<_>>())?;
-            self.commands.upload(s.get("cu_seqlens_q")?,&(0..=count as i32).flat_map(|v|v.to_le_bytes()).collect::<Vec<_>>())?;
-            self.commands.launch("minimax_index_decode", &[&s.get("index_q_fp8")?.view(start*512,count*512)?,
-                &s.get("index_q_scales")?.view(start*16,count*16)?,&cache.index,s.get("page_table")?,s.get("cache_lengths")?,s.get("q2k")?,s.get("scratch")?], &[
-                Scalar::I32(count as i32),Scalar::I32(stride as i32),Scalar::I32(stride as i32),Scalar::I64(batch.pool_pages as i64)])?;
-            if let Some(d)=dump.as_deref_mut() { d.selection(&self.commands,s.get("q2k")?,count,self.decode_rows)?; }
-            self.commands.launch("minimax_attention_decode", &[&s.get("q_norm")?.view(start*16384,count*16384)?,&cache.key,&cache.value,
-                s.get("k_descale")?,s.get("v_descale")?,s.get("page_table")?,s.get("cache_lengths")?,s.get("cu_seqlens_q")?,s.get("q2k")?,
-                &s.get("attention")?.view(start*16384,count*16384)?,s.get("lse")?,s.get("scratch")?], &[
-                Scalar::I32(count as i32),Scalar::I32(count as i32),Scalar::I32(stride as i32),Scalar::I64(batch.pool_pages as i64)])?;
+            // Each request's index keys through this step are staged as the
+            // contiguous rows the prefill scorer reads; its tiles then select
+            // blocks and attend over the paged cache like the decode kernels.
+            AttentionPlan::Extend{launches} => {
+                let (stride,tile)=(self.table_stride,self.extend_rows);
+                let (tables,bounds)=(s.get("page_table")?,s.get("index_bounds")?);
+                for launch in launches {
+                    let request=&batch.requests[launch.request];
+                    let table=tables.view(launch.slot*stride*4,stride*4)?;
+                    if launch.first==0 {
+                        let pages=(request.start_position+request.rows).div_ceil(64);
+                        self.commands.index_stage(&cache.index,&table.view(0,pages*4)?,pages,s.get("index_keys")?,s.get("index_scales")?)?;
+                    }
+                    let (row,n)=(launch.row,launch.rows);
+                    self.commands.launch("minimax_index_prefill", &[&s.get("index_q_fp8")?.view(row*512,n*512)?,
+                        &s.get("index_q_scales")?.view(row*16,n*16)?,s.get("index_keys")?,s.get("index_scales")?,
+                        &bounds.view(0,n*4)?,&bounds.view(launch.bounds*4,n*4)?,s.get("q2k_extend")?,s.get("scratch")?], &[
+                        Scalar::I32(n as i32),Scalar::I32((request.start_position+launch.first+n) as i32)])?;
+                    if let Some(d)=dump.as_deref_mut() { d.selection(&self.commands,s.get("q2k_extend")?,n,tile)?; }
+                    self.commands.launch("minimax_attention_extend", &[&s.get("q_norm")?.view(row*16384,n*16384)?,&cache.key,&cache.value,
+                        s.get("k_descale")?,s.get("v_descale")?,&table,&s.get("cache_lengths")?.view(launch.slot*16,16)?,
+                        &s.get("cu_seqlens_q")?.view(launch.slot*16,16)?,s.get("q2k_extend")?,
+                        &s.get("attention")?.view(row*16384,n*16384)?,s.get("lse")?,s.get("scratch")?], &[
+                        Scalar::I32(n as i32),Scalar::I32(1),Scalar::I32(stride as i32),Scalar::I64(batch.pool_pages as i64)])?;
+                }
+            }
         }
         if let Some(d)=dump.as_deref_mut() {
             d.finish_selection()?;
@@ -303,6 +399,29 @@ mod tests {
         assert_eq!(shared.validate(64,128)?,2);
         assert!(batch.validate(2,128).is_err());
         assert!(batch.validate(64,64).is_err());
+        Ok(())
+    }
+
+    #[test] fn minimax_attention_metadata_is_built_once_per_step() -> Result<()> {
+        // Two requests: 3 rows from 62 (pages 0, 2) and 1 row at 4 (page 4).
+        let batch=BatchView {positions:vec![62,63,64,4],slots:vec![62,63,128,260],pool_pages:5,
+            requests:vec![RequestView{row_start:0,rows:3,start_position:62,pages:vec![0,2]},
+                RequestView{row_start:3,rows:1,start_position:4,pages:vec![4]}]};
+        batch.validate(64,128)?;
+        let (stride,tables,lengths,offsets)=decode_tables(&batch)?;
+        assert_eq!(stride,2);
+        assert_eq!(tables,[0,-1, 0,-1, 0,2, 4,-1]);
+        assert_eq!(lengths,[63,64,65,5]);
+        assert_eq!(offsets,[0,1,2,3,4]);
+        // A two-row tile splits the first request; launch metadata is 16-byte aligned.
+        let (launches,tables,lengths,offsets,bounds)=extend_tables(&batch,2,4)?;
+        assert_eq!(launches,[Launch{request:0,row:0,first:0,rows:2,slot:0,bounds:2},
+            Launch{request:0,row:2,first:2,rows:1,slot:1,bounds:6},Launch{request:1,row:3,first:0,rows:1,slot:2,bounds:10}]);
+        assert_eq!(tables,[0,2,-1,-1, 0,2,-1,-1, 4,-1,-1,-1]);
+        assert_eq!(lengths,[64,0,0,0, 65,0,0,0, 5,0,0,0]);
+        assert_eq!(offsets,[0,2,0,0, 0,1,0,0, 0,1,0,0]);
+        assert_eq!(bounds,[63,64,0,0, 65,0,0,0, 5,0,0,0]);
+        assert!(extend_tables(&batch,2,1).is_err(),"a request wider than the admitted table is refused");
         Ok(())
     }
 }
