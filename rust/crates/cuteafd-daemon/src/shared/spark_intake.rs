@@ -1869,6 +1869,27 @@ mod tests {
         Ok(())
     }
 
+    /// A prefill wave stages its route ids, gate weights and input rows in a
+    /// slot of the registered egress ring (spark_waves), so every family's
+    /// widest wave must fit the slot its widest bootstrap request sized.
+    #[test]
+    fn registered_egress_slots_hold_a_whole_prefill_wave_staging() -> Result<()> {
+        use cuteafd_core::ExpertGeometry as G;
+        for geometry in [G::DEEPSEEK_V41, G::DEEPSEEK_V4_FLASH, G::DEEPSEEK_V4_PRO, G::GLM5, G::GLM5_FLASH,
+            G::MIMO_V2_FLASH, G::MIMO_V26_PRO, G::QWEN4, G::KIMI_K3, G::STEP5] {
+            for rows in [1u32, 64, 1024, 4096] {
+                for bf16 in [false, true] {
+                    let (hidden, topk) = (geometry.hidden as usize, geometry.topk as usize);
+                    let wire = if bf16 { hidden * 2 } else { hidden + hidden / 32 };
+                    let staging = crate::shared::experts::staging::RouteStaging::new(rows as usize, topk, wire)?.bytes;
+                    let slot = geometry.compact_wire_bytes(rows, bf16).unwrap().0;
+                    assert!(staging <= slot, "{geometry:?} {rows} rows bf16={bf16}: {staging} > {slot}");
+                }
+            }
+        }
+        Ok(())
+    }
+
     #[test]
     fn upload_bounds_reject_missing_planes_and_overflow_before_pointer_arithmetic() {
         for rank in [0, 1, 2, 4, usize::MAX] {
