@@ -5974,7 +5974,7 @@ Use the same checkpoint, draft and workload settings across arms and current
 work/p0 for the shared-path comparison. Hardware leases, preflight and cleanup
 follow AGENTS.md. Stop owned test services when finished.
 
-Reuse the existing `lossless_set` benchmark panel for cold DFlash2-on versus
+Reuse the existing `spec_lossless_set` benchmark panel for cold DFlash2-on versus
 drafts-off token and row comparisons, and `prefix_cache` for retained turns.
 Select each exact public ID with `cuteafd bench --model`; the run request,
 all probes and the exported identity must agree. An unready/unlisted ID or a
