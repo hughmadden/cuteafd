@@ -559,6 +559,45 @@ fn the_same_tokens_in_different_namespaces_never_hit() {
 }
 
 #[test]
+fn variant_pages_restore_from_host_only_in_their_own_namespace() {
+    let mut fake = Fake::new(24, 4, 1);
+    fake.markless = true; // GLM full: the latent/index pages are the complete state.
+    let mut cache = cache(&fake, 4, 1 << 20);
+    let prompt = seq(100, 22); // Include a partial tail page.
+    let key = |tag| super::namespaced(&prompt, tag).unwrap().into_owned();
+    let admit = |cache: &mut PrefixCache<Shared>, tag| {
+        cache.admit(&fake, &key(tag), 40, false,
+            |pages| Placement { pages, ring: 0, len: 0, ring_from: 0 }).unwrap()
+    };
+    let mut original = admit(&mut cache, 1).placement;
+    let logits = fake.forward(&mut original, &prompt).unwrap();
+    cache.capture(&fake, SnapshotKind::Turn, &key(1), &original, After::from_logits(&logits, true)).unwrap();
+    fake.mem.borrow_mut().advance(10_000_000);
+    cache.tick();
+    assert_eq!(cache.stats().host.unwrap().stores_completed, 1);
+    cache.release(&fake, &original.pages).unwrap();
+    cache.clear(&fake).unwrap(); // Only the pinned-RAM copy remains.
+
+    for tag in [0, 2] {
+        let other = admit(&mut cache, tag);
+        assert_eq!(other.resume, 0, "another model must not promote the variant's host pages");
+        cache.release(&fake, &other.placement.pages).unwrap();
+    }
+    let restored = admit(&mut cache, 1);
+    assert_eq!(restored.resume, prompt.len());
+    assert!(restored.source.unwrap().host);
+    let mut placement = restored.placement;
+    let mut longer = prompt;
+    longer.extend(seq(900, 5));
+    // Every context byte, including the partial tail, must match a fresh prefill.
+    fake.forward(&mut placement, &longer).unwrap();
+    assert_eq!((cache.stats().promotions, cache.stats().host.unwrap().restores), (1, 1));
+    cache.release(&fake, &placement.pages).unwrap();
+    cache.clear(&fake).unwrap();
+    assert_eq!(cache.pool().free(), 24);
+}
+
+#[test]
 fn prompt_repeat_is_an_exact_hit_with_its_logits_and_no_forward() {
     let fake = Fake::new(64, 4, 8);
     let mut cache = cache(&fake, 4, 0);
