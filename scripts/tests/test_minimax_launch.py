@@ -47,6 +47,20 @@ def test_minimax_launch_matches_planner(tmp_path, ranks, kv):
     assert all(f"--world {ranks}" in line for line in workers)
 
 
+@pytest.mark.parametrize("keys,quota,store", [
+    ("", "auto", "on-evict"),
+    ("HOST_CACHE_STORE=on-retain\n", "auto", "on-retain"),
+    ("HOST_CACHE_BYTES=16GiB\n", "16GiB", "on-evict"),
+    ("HOST_CACHE_BYTES=0\nHOST_CACHE_STORE=on-retain\n", None, None),
+])
+def test_minimax_host_prefix_tier_defaults_on_and_stores_on_eviction(tmp_path, keys, quota, store):
+    result = _family_launch_result(tmp_path, CONFIG, MODEL,
+        "SPARK_COUNT=4\nRTX_GPUS=1\nVISION=off\nAUDIO=off\n" + _hosts(4) + keys, encoder_plan=PLANNED)
+    serve = _line(result, "serve-minimax --snapshot")
+    assert _flag(serve, "--host-cache-bytes") == quota
+    assert _flag(serve, "--host-cache-store") == store
+
+
 @pytest.mark.parametrize("keys,diagnostic", [
     ("RTX_GPUS=2\n", "two-GPU head split is not implemented"),
     ("RTX_GPUS=invalid\n", "RTX_GPUS must be auto, 1 or 2"),
@@ -60,6 +74,7 @@ def test_minimax_launch_matches_planner(tmp_path, ranks, kv):
     ("RTX_EXPERT_LAYERS=25%\n", "must be auto or a fixed routed-layer count"),
     ("RTX_EXPERT_LAYERS=58\n", "checkpoint has 57 routed layers"),
     ("KV_CACHE=int8\n", "KV_CACHE must be bf16 or fp8"),
+    ("HOST_CACHE_STORE=always\n", "HOST_CACHE_STORE must be on-evict or on-retain"),
     ("SPARK_COUNT=6\n", "requires Spark TP2, TP3 or TP4"),
     ("EXPERT_BACKEND=local\nSPARK_COUNT=0\n", "requires Spark TP2, TP3 or TP4"),
     ("CONCURRENCY=65\n", "CONCURRENCY must be 1..64"),
@@ -130,7 +145,7 @@ def test_minimax_examples_have_cpu_only_dry_run(tmp_path, card, budget, tp):
     prefill_rows = "1024" if (card, tp) == ("5090", 2) else "4096"
     for flag, value in (("--spark-ranks", str(tp)), ("--rtx", "1"),
                         ("--coordinator-gpu-budget-gib", budget), ("--speculator", "off"),
-                        ("--kv-cache", "fp8"), ("--prefill-rows", prefill_rows)):
+                        ("--kv-cache", "fp8"), ("--prefill-rows", prefill_rows), ("--host-cache-bytes", "auto")):
         assert args[args.index(flag) + 1] == value
     assert "--require-ready" not in args
     assert "header admission only" in result.stderr
@@ -169,7 +184,7 @@ def test_minimax_routes_bundled_vision_from_the_plan(tmp_path, kind):
         encoder_plan=plan)
     serve = _line(result, "serve-minimax --snapshot")
     assert _flag(serve, "--vision") == f"{kind}:0"
-    assert _flag(serve, "--host-cache-bytes") == "0"
+    assert _flag(serve, "--host-cache-bytes") == "auto"
     if kind == "spark":
         assert _flag(serve, "--encoder-plan-hash") == "ab" * 32
         workers = [line for line in result.stderr.splitlines() if "cuteafd expertd-native" in line]

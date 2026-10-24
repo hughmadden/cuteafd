@@ -106,9 +106,7 @@ impl MediaPreparer {
             let mut segments = Vec::new();
             let mut placeholder = String::new();
             let mut offset = 0;
-            for frames in frames.chunks(minimax::MAX_SEGMENT_FRAMES) {
-                let segment = minimax::prepare_video_frames(frames, self.encoder, sizing)?
-                    .pop().context("video segment is empty")?;
+            for segment in minimax::prepare_video_frames(&frames, self.encoder, sizing)? {
                 prepared_bytes = prepared_bytes.checked_add(segment.rgb8.len()).context("prepared video extent overflow")?;
                 ensure!(prepared_bytes <= self.limits.decoded_bytes, "prepared videos exceed request byte limit");
                 ensure!(segment.tokens <= minimax::ENCODER_TOKENS, "video segment exceeds encoder token capacity");

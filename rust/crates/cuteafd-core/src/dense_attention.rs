@@ -288,6 +288,8 @@ pub struct SigmoidRouter {
 impl SigmoidRouter {
     /// Ties use ascending expert id for determinism, not a torch.topk parity
     /// claim. Callers comparing official selected ids must exclude score ties.
+    /// `epsilon` may be zero (MiniMax M3 renormalizes by the plain sum); a
+    /// selection whose weights then sum to zero is refused.
     pub fn evaluate(
         self,
         logits: &[f32],
@@ -299,7 +301,7 @@ impl SigmoidRouter {
             || !self.factor.is_finite()
             || self.factor <= 0.0
             || !self.epsilon.is_finite()
-            || self.epsilon <= 0.0
+            || self.epsilon < 0.0
             || logits.iter().chain(bias).any(|v| !v.is_finite())
         {
             return Err(ContractError("router dimensions or values"));
@@ -324,6 +326,9 @@ impl SigmoidRouter {
             })
             .collect();
         let denominator = selected.iter().map(|(_, p)| p).sum::<f32>() + self.epsilon;
+        if denominator <= 0.0 {
+            return Err(ContractError("router selection weights sum to zero"));
+        }
         for (_, weight) in &mut selected {
             *weight = (*weight / denominator) * self.factor;
         }
@@ -571,6 +576,30 @@ mod tests {
         assert_eq!(step[0].1, 0.0);
         assert_ne!(legacy[0].1, step[0].1);
         assert!(router.evaluate(&[f32::NAN, 0.0], &[0.0, 0.0]).is_err());
+    }
+
+    #[test]
+    fn router_without_epsilon_renormalizes_by_the_plain_sum() {
+        // MiniMax M3: unbiased sigmoid weights of the biased selection, divided
+        // by their sum alone, times routed_scaling_factor.
+        let router = SigmoidRouter {
+            topk: 2,
+            factor: 2.0,
+            epsilon: 0.0,
+            bias_order: RouterBiasOrder::GatherOriginal,
+        };
+        let sigmoid = |x: f32| 1.0 / (1.0 + (-x).exp());
+        let routed = router.evaluate(&[0.0, 2.0, 1.0, -1.0], &[5.0, 0.0, 0.0, 0.0]).unwrap();
+        assert_eq!(routed.iter().map(|r| r.0).collect::<Vec<_>>(), [0, 1]);
+        assert_eq!(
+            routed[0].1.to_bits(),
+            ((sigmoid(0.0) / (sigmoid(0.0) + sigmoid(2.0))) * 2.0).to_bits()
+        );
+        // Ties keep the lower id; equal weights split the factor evenly.
+        assert_eq!(router.evaluate(&[0.0; 4], &[0.0; 4]).unwrap(), [(0, 1.0), (1, 1.0)]);
+        // Underflowed sigmoids leave nothing to renormalize by.
+        assert!(router.evaluate(&[-200.0, -200.0], &[0.0, 0.0]).is_err());
+        assert!(SigmoidRouter { epsilon: -1e-20, ..router }.evaluate(&[0.0; 4], &[0.0; 4]).is_err());
     }
 
     #[test]

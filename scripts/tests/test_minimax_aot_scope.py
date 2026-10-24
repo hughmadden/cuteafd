@@ -71,8 +71,10 @@ def test_model_context_and_comparison_jobs_include_minimax():
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     jobs = {name: (exporter, args) for name, exporter, args in module.jobs("all")}
-    assert {"minimax", "minimax-pointwise", "minimax-projections", "minimax-indexer", "minimax-attention", "routed-minimax"} <= jobs.keys()
-    assert jobs["minimax"][1] == ["--geometry", "minimax"]
+    assert {"minimax", "routed-minimax"} <= jobs.keys()
+    assert jobs["minimax"] == ("export_b12x_dsv4_aot.py", ["--geometry", "minimax"])
+    # The coordinator exporter is the only path to the MiniMax programs.
+    assert not any(exporter == "export_b12x_minimax_aot.py" for exporter, _ in jobs.values())
 
 
 def test_minimax_expert_scope_is_a_cmake_entry():

@@ -170,7 +170,7 @@ pub(crate) async fn run_serve(mut args: ServeArgs) -> Result<()> {
     let hub = console::hub(args.console.console_text, || Ok(console_layout(&args, &profile.id)));
     let vision = args.vision;
     let audio = args.audio;
-    let remote = super::media::RemoteVision::from_args(&args)?;
+    let remote = super::media::RemoteVision::parse(args.vision, args.vision_peers.as_deref(), args.encoder_plan_hash.as_deref(), args.encoder_revision.as_deref())?;
     let remote_audio = super::media::RemoteAudio::from_args(&args)?;
     let media_cache_bytes = args.media_cache_bytes;
     let worker = tokio::task::spawn_blocking(move ||

@@ -19,7 +19,6 @@ pub const PAGES_PER_BLOCK: u64 = 2;
 /// One E4M3 index row plus its FP32 scale.
 pub const INDEX_ROW_BYTES: u64 = 128 + 4;
 pub const INDEX_PAGE_BYTES: u64 = 8448;
-pub const INDEX_SCALE_OFFSET: u64 = 8192;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PagePlane {
@@ -128,7 +127,7 @@ impl MiniMaxCacheLayout {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::families::minimax_m3::{config::tests::release_config, reference};
+    use crate::families::minimax_m3::config::tests::release_config;
 
     #[test]
     fn release_page_bytes() {
@@ -136,7 +135,8 @@ mod tests {
         let one = MiniMaxCacheLayout::new(&cfg, 1, 1 << 20, Qwen4KvCache::Fp8).unwrap();
         assert_eq!(one.ranks[0].kv_page_bytes, 64 * 4 * 128);
         assert_eq!(one.ranks[0].index_page_bytes, 64 * 132);
-        assert_eq!(one.token_bytes(0), (reference::kv_bytes_per_token(&cfg, 1) + reference::index_bytes_per_token(&cfg)) as u64);
+        // K and V for every KV head of 60 layers, plus one 132-byte index row per layer.
+        assert_eq!(one.token_bytes(0), 60 * 2 * 4 * 128 + 60 * 132);
         assert_eq!(one.token_bytes(0), 69_360);
         let two = MiniMaxCacheLayout::new(&cfg, 2, 1 << 20, Qwen4KvCache::Bf16).unwrap();
         assert_eq!((two.ranks[1].first_kv_head, two.ranks[1].kv_heads), (2, 2));
@@ -157,7 +157,6 @@ mod tests {
         assert_eq!(p.value.offset, p.key.bytes);
         assert_eq!(p.index.offset, p.key.bytes + p.value.bytes);
         assert_eq!(p.index.bytes, 3 * INDEX_PAGE_BYTES);
-        assert_eq!(INDEX_SCALE_OFFSET + 64 * 4, INDEX_PAGE_BYTES);
         assert_eq!((p.index.offset + p.index.bytes) * 60, 3 * cache.ranks[0].page_bytes);
         assert!(cache.layer_planes(0, i32::MAX as u64 + 1).is_err());
         assert!(MiniMaxCacheLayout::for_runtime(&cfg, 2, 1024, Qwen4KvCache::Fp8).is_err());

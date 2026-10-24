@@ -75,6 +75,9 @@ pub(super) struct MiniMaxBackend<'e, 'a> {
     pub probe: RefCell<RoundRoutes>,
     pub rings: RefCell<Rings>,
     pub full_prefill_logits: bool,
+    pub trace: RefCell<Option<super::diagnostics::LogitTrace>>,
+    /// Graph captures once the startup recordings finished: serving adds none.
+    pub startup_captures: std::cell::Cell<Option<u64>>,
 }
 impl<'e, 'a> MiniMaxBackend<'e, 'a> {
     /// One step; the head projects only the batch rows in `logits`.
@@ -110,18 +113,31 @@ impl<'e, 'a> MiniMaxBackend<'e, 'a> {
         if embedded.is_err() || chunks.iter().any(|c| !c.features.is_empty()) { self.execution.drain()?; }
         embedded?;
         // Features are admitted host leases; injection precedes the device residual conversion.
+        // A span's rows are consecutive in both the chunk and its packed features, so each
+        // run is one copy (an image is one 7 MB copy, not 576 row copies).
+        const ROW: usize = 6144 * 2;
         for (request, chunk) in requests.iter().zip(&chunks) {
-            for (feature, &row) in chunk.features.chunks_exact(6144 * 2).zip(&chunk.indices) {
-                let destination = self.embedded.view((request.row_start + row as usize) * 6144 * 2, 6144 * 2)?;
-                library.copy_h2d(destination.raw(), feature)?;
+            ensure!(chunk.features.len() == chunk.indices.len() * ROW, "MiniMax media chunk feature extent");
+            let mut first = 0;
+            while first < chunk.indices.len() {
+                let mut end = first + 1;
+                while end < chunk.indices.len() && chunk.indices[end] == chunk.indices[end - 1] + 1 { end += 1; }
+                let destination = self.embedded.view((request.row_start + chunk.indices[first] as usize) * ROW,
+                    (end - first) * ROW)?;
+                library.copy_h2d(destination.raw(), &chunk.features[first * ROW..end * ROW])?;
+                first = end;
             }
         }
         let batch = BatchView { positions, slots, requests, pool_pages: self.cache.pages };
         let started = std::time::Instant::now();
         let kind = if prefill { cuteafd_transport::ExpertV2SourceKind::Prefill }
             else { cuteafd_transport::ExpertV2SourceKind::Decode };
+        let rows = logits.clone();
         let result = self.execution.execute(&self.embedded, &batch, &self.cache.layers, &mut *self.experts.borrow_mut(), kind, logits);
         let logits = result?;
+        if let (Some(trace), Some(device)) = (self.trace.borrow_mut().as_mut(), logits.as_ref()) {
+            trace.record(prefill, &batch.positions[rows], &device.to_host(library)?, device.vocab)?;
+        }
         self.timing.borrow_mut()[usize::from(!prefill)] += started.elapsed().as_secs_f64();
         step.completed();
         Ok((step, logits))
@@ -174,7 +190,14 @@ impl<'e, 'a> Backend<'a> for MiniMaxBackend<'e, 'a> {
     }
     fn history(&self, _: &Placement) {}
     fn prefetch(&self, _: &[u32], _: &[u32]) {}
-    fn require_live(&self) -> Result<()> { self.pending.borrow_mut().take(); self.execution.drain() }
+    fn require_live(&self) -> Result<()> {
+        self.pending.borrow_mut().take();
+        if let Some(startup) = self.startup_captures.get() {
+            let current = cuteafd_ffi::graph_captures();
+            ensure!(current == startup, "MiniMax zero-steady-capture contract: startup={startup}, current={current}");
+        }
+        self.execution.drain()
+    }
     fn log_table_stats(&self, _: &str) {}
     fn prefill_device(&self, p: &mut Placement, tokens: &[u32], logit_rows: usize,
         pool: &RefPagePool) -> Result<Option<DeviceLogits>> {

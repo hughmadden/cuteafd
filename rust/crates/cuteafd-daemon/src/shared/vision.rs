@@ -6,6 +6,7 @@ mod minimax;
 mod qwen;
 pub mod local;
 pub mod remote;
+pub mod startup;
 pub mod worker;
 pub mod audio;
 
@@ -360,17 +361,10 @@ impl TowerSpec {
     }
 }
 
-/// Matches the CPU reference's f64 rescale followed by f32 normalize, without FMA.
+/// The loader's per-family normalization table, flattened `[channel * 256 + rgb8]`.
 pub fn normalization_lut(config: &cuteafd_loader::media::ProcessorConfig) -> Arc<[f32; 768]> {
-    if config.family == cuteafd_loader::media::ImageFamily::Minimax {
-        let table = config.normalization_lut();
-        return Arc::new(std::array::from_fn(|i| table[i / 256][i % 256]));
-    }
-    Arc::new(std::array::from_fn(|i| {
-        let c = i / 256;
-        let pixel = ((i % 256) as f64 * (1.0 / 255.0)) as f32;
-        (pixel - config.mean[c] as f32) / config.std[c] as f32
-    }))
+    let table = config.normalization_lut();
+    Arc::new(std::array::from_fn(|i| table[i / 256][i % 256]))
 }
 
 pub struct VitRuntime {
@@ -391,14 +385,8 @@ impl VitRuntime {
         let native = NativeVision::load(library, &spec.native, device, admitted_bytes, &weights)?;
         Ok(Self { native, spec })
     }
-    pub fn encode_into(
-        &mut self,
-        rgb: &[u8],
-        grid: [usize; 2],
-        lut: &[f32; 768],
-        output: &mut [u16],
-    ) -> Result<()> {
-        self.native.encode_into(rgb, grid, lut, output)?;
+    pub fn encode_into(&mut self, job: &mut EncodeJob) -> Result<()> {
+        self.native.encode_into(&job.rgb, job.grid, job.video, &job.lut, &mut job.output)?;
         Ok(())
     }
     pub fn ledger(&self) -> Result<VisionLedger> {
@@ -406,15 +394,12 @@ impl VitRuntime {
     }
 }
 
+/// One tower invocation: a still image (`grid` `[1, h, w]`, one frame) or a MiniMax
+/// video segment (`video`, `t` temporal pairs of frames).
 pub struct EncodeJob {
     pub rgb: Arc<[u8]>,
-    pub grid: [usize; 2],
-    pub lut: Arc<[f32; 768]>,
-    pub output: Vec<u16>,
-}
-pub struct VideoEncodeJob {
-    pub rgb: Arc<[u8]>,
     pub grid: [usize; 3],
+    pub video: bool,
     pub lut: Arc<[f32; 768]>,
     pub output: Vec<u16>,
 }
@@ -441,7 +426,6 @@ impl Drop for EncoderTicket {
 }
 enum EncoderJob {
     Vision(EncodeJob),
-    Video(VideoEncodeJob),
     Audio(audio::AudioEncodeJob),
 }
 struct Work {
@@ -574,20 +558,12 @@ impl EncoderService {
                     } else {
                         let encoded = match work.job {
                             EncoderJob::Vision(mut job) => match runtime.as_mut() {
-                                Some(runtime) => runtime.encode_into(
-                                    &job.rgb, job.grid, &job.lut, &mut job.output,
-                                ).map(|()| job.output),
+                                Some(runtime) => runtime.encode_into(&mut job).map(|()| job.output),
                                 None => Err(VisionError::Unsupported("vision encoder is not loaded".into())),
                             },
                             EncoderJob::Audio(job) => match audio_runtime.as_mut() {
                                 Some(runtime) => runtime.encode(job),
                                 None => Err(VisionError::Unsupported("audio encoder is not loaded".into())),
-                            },
-                            EncoderJob::Video(mut job) => match runtime.as_mut() {
-                                Some(runtime) => runtime.native.encode_frames_into(
-                                    &job.rgb, job.grid, &job.lut, &mut job.output,
-                                ).map(|()| job.output).map_err(VisionError::Native),
-                                None => Err(VisionError::Unsupported("vision encoder is not loaded".into())),
                             },
                         };
                         encoded.and_then(|output| {
@@ -629,9 +605,6 @@ impl EncoderService {
     pub fn health_handle(&self) -> Arc<AtomicBool> { self.healthy.clone() }
     pub fn submit(&self, job: EncodeJob) -> Result<EncoderTicket> {
         self.submit_job(EncoderJob::Vision(job))
-    }
-    pub fn submit_video(&self, job: VideoEncodeJob) -> Result<EncoderTicket> {
-        self.submit_job(EncoderJob::Video(job))
     }
     pub fn submit_audio(&self, job: audio::AudioEncodeJob) -> Result<EncoderTicket> {
         if self.audio_ledger.is_none() {
@@ -744,8 +717,7 @@ mod tests {
             wait.recv().unwrap();
             while let Ok(work) = jobs.recv() {
                 let (kind, output) = match work.job {
-                    EncoderJob::Vision(job) => ("vision", job.output),
-                    EncoderJob::Video(job) => ("video", job.output),
+                    EncoderJob::Vision(job) => (if job.video { "video" } else { "vision" }, job.output),
                     EncoderJob::Audio(job) => ("audio", job.output),
                 };
                 seen.lock().unwrap().push(kind);
@@ -754,7 +726,7 @@ mod tests {
                 } else { Ok(output) });
             }
         }));
-        let image = service.submit(EncodeJob { rgb: vec![0; 3072].into(), grid: [2,2],
+        let image = service.submit(EncodeJob { rgb: vec![0; 3072].into(), grid: [1,2,2], video: false,
             lut: Arc::new([0.0; 768]), output: vec![0; 4096] }).unwrap();
         let audio = service.submit_audio(audio_job()).unwrap();
         assert!(matches!(service.submit_audio(audio_job()), Err(VisionError::QueueFull)));
@@ -762,8 +734,8 @@ mod tests {
         gate.send(()).unwrap();
         assert!(image.result.recv().unwrap().is_ok());
         assert!(matches!(audio.result.recv().unwrap(), Err(VisionError::Cancelled)));
-        let video = service.submit_video(VideoEncodeJob { rgb: vec![0; 2*28*28*3].into(),
-            grid: [1,2,2], lut: Arc::new([0.0; 768]), output: vec![0; 6144] }).unwrap();
+        let video = service.submit(EncodeJob { rgb: vec![0; 2*28*28*3].into(),
+            grid: [1,2,2], video: true, lut: Arc::new([0.0; 768]), output: vec![0; 6144] }).unwrap();
         assert_eq!(video.result.recv().unwrap().unwrap().len(), 6144);
         drop(service);
         assert_eq!(*observed.lock().unwrap(), ["vision", "audio", "video"]);
@@ -960,7 +932,8 @@ mod tests {
         let lut = Arc::new(std::array::from_fn(|i| (i % 256) as f32 / 127.5 - 1.0));
         let job = |grid: [usize; 2]| EncodeJob {
             rgb: vec![113; grid[0] * grid[1] * 768].into(),
-            grid,
+            grid: [1, grid[0], grid[1]],
+            video: false,
             lut: lut.clone(),
             output: vec![0; grid[0] * grid[1] / 4 * width],
         };

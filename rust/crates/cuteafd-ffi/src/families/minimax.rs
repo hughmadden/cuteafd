@@ -223,6 +223,15 @@ pub struct Commands<'a> {
 }
 trait Retained {}
 impl<T> Retained for T {}
+
+/// What a stream's launches retained since its last drain: every operand view
+/// and owner they read or write ([`Commands::take_retained`]). A graph recorded
+/// from those launches holds it, so the captured pointers outlive its replays.
+pub struct Retention<'a> {
+    _buffers: Vec<Buffer<'a>>,
+    _owners: Vec<Rc<dyn Retained + 'a>>,
+}
+
 impl<'a> Commands<'a> {
     pub fn new(library: &'a NativeLibrary, device: i32, programs: &'a Programs<'a>) -> Result<Self> {
         let loaded = on_device(library, device, || definitions().into_iter().map(|(name, pointers)| {
@@ -257,6 +266,14 @@ impl<'a> Commands<'a> {
             Ok(())
         })
     }
+    /// Hands over everything the launches since the last drain retained (a
+    /// recording: begin capture on [`Self::raw`] after a drain, enqueue, end).
+    pub fn take_retained(&self) -> Retention<'a> {
+        Retention { _buffers: std::mem::take(&mut *self.retained.borrow_mut()),
+            _owners: std::mem::take(&mut *self.owners.borrow_mut()) }
+    }
+    /// Nothing retained: the stream drained and nothing was queued since.
+    pub fn idle(&self) -> bool { self.retained.borrow().is_empty() && self.owners.borrow().is_empty() }
     pub fn capacity(&self, name: &str) -> Result<usize> {
         Ok(self.programs.get(name).context("missing MiniMax program")?.spec().capacity_rows as usize)
     }
@@ -543,6 +560,19 @@ mod tests {
         assert!(format!("{error:#}").contains("status 17"));
         STATUS.store(0,Ordering::Relaxed);
         commands.drain()?;
+        // A recording takes what its launches retained: a drain no longer releases it.
+        assert!(commands.idle());
+        let source=Buffer::new(&library,0,64)?;
+        let weak=Rc::downgrade(&source.storage);
+        commands.copy(&output,&source,64)?;
+        assert!(!commands.idle());
+        let retained=commands.take_retained();
+        assert!(commands.idle());
+        drop(source);
+        commands.drain()?;
+        assert!(weak.upgrade().is_some(),"recorded copy lost its source owner");
+        drop(retained);
+        assert!(weak.upgrade().is_none(),"released recording kept its operand");
         Ok(())
     }
 }

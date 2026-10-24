@@ -1,4 +1,4 @@
-// Exercise the production Qwen pointwise kernels beyond grid_for's block cap.
+// Exercise the production Qwen/MiniMax pointwise kernels and casts beyond grid_for's block cap.
 #include "../shared/cuda/vision_runtime.cu"
 #include <cstdio>
 #include <vector>
@@ -12,20 +12,20 @@ int main() {
   int devices=0;
   if(cudaGetDeviceCount(&devices)!=cudaSuccess || !devices)return 77;
   CHECK(cudaSetDevice(0));
-  constexpr size_t count=4096*256+1, width=1152, rows=(count+width-1)/width;
+  constexpr size_t count=4096*256+1, width=1152, rows=(count+width-1)/width, bias_width=1280;
   DeviceBuffer x,y,bias,table,indices,weights,out;
   CHECK(cudaMalloc(&x.ptr,count*sizeof(float)));
   CHECK(cudaMalloc(&y.ptr,count*sizeof(float)));
-  CHECK(cudaMalloc(&bias.ptr,width*sizeof(float)));
+  CHECK(cudaMalloc(&bias.ptr,bias_width*sizeof(float)));
   CHECK(cudaMalloc(&table.ptr,width*sizeof(uint16_t)));
   CHECK(cudaMalloc(&indices.ptr,rows*4*sizeof(int32_t)));
   CHECK(cudaMalloc(&weights.ptr,rows*4*sizeof(float)));
   CHECK(cudaMalloc(&out.ptr,count*sizeof(uint16_t)));
-  std::vector<float> ones(count,1.f), twos(width,2.f), taps(rows*4,0.f), actual(count);
+  std::vector<float> ones(count,1.f), twos(bias_width,2.f), taps(rows*4,0.f), actual(count);
   for(size_t row=0;row<rows;++row)taps[row*4]=1.f;
   std::vector<uint16_t> table_values(width,0x3f80), bits(count);
   CHECK(cudaMemcpy(y.ptr,ones.data(),count*4,cudaMemcpyHostToDevice));
-  CHECK(cudaMemcpy(bias.ptr,twos.data(),width*4,cudaMemcpyHostToDevice));
+  CHECK(cudaMemcpy(bias.ptr,twos.data(),bias_width*4,cudaMemcpyHostToDevice));
   CHECK(cudaMemcpy(table.ptr,table_values.data(),width*2,cudaMemcpyHostToDevice));
   CHECK(cudaMemset(indices.ptr,0,rows*4*4));
   CHECK(cudaMemcpy(weights.ptr,taps.data(),rows*4*4,cudaMemcpyHostToDevice));
@@ -34,7 +34,7 @@ int main() {
     CHECK(cudaMemset(out.ptr,0xff,count*2));
     if(mode==0)qwen_patch_position<<<grid_for(count),256>>>(static_cast<float*>(x.ptr),static_cast<float*>(bias.ptr),
       static_cast<uint16_t*>(table.ptr),static_cast<int32_t*>(indices.ptr),static_cast<float*>(weights.ptr),count);
-    if(mode==1)qwen_residual<<<grid_for(count),256>>>(static_cast<float*>(x.ptr),static_cast<float*>(y.ptr),static_cast<float*>(bias.ptr),count);
+    if(mode==1)qwen_residual<<<grid_for(count),256>>>(static_cast<float*>(x.ptr),static_cast<float*>(y.ptr),static_cast<float*>(bias.ptr),count,int(width));
     if(mode==2 || mode==3)qwen_biased_gelu<<<grid_for(count),256>>>(static_cast<float*>(x.ptr),static_cast<float*>(bias.ptr),
       static_cast<uint16_t*>(out.ptr),count,width,mode==2);
     if(mode==4)qwen_biased_cast<<<grid_for(count),256>>>(static_cast<float*>(x.ptr),static_cast<float*>(bias.ptr),
@@ -62,6 +62,31 @@ int main() {
   for(size_t i=0;i<count;++i)if(actual[i]!=3.f) {
     std::fprintf(stderr,"observer cast element %zu was not written: %g\n",i,actual[i]);return 1;
   }
-  std::printf("Qwen capped-launch pointwise coverage passed for all %zu elements\n",count);
+  // MiniMax launches: the residual at its 1280 width, the BF16 rounding of the patch
+  // embedding, and the cast feeding the projector (its old exact-grid assumption lost rows).
+  CHECK(cudaMemcpy(x.ptr,ones.data(),count*4,cudaMemcpyHostToDevice));
+  qwen_residual<<<grid_for(count),256>>>(static_cast<float*>(x.ptr),static_cast<float*>(y.ptr),static_cast<float*>(bias.ptr),count,1280);
+  CHECK(cudaGetLastError());CHECK(cudaDeviceSynchronize());
+  CHECK(cudaMemcpy(actual.data(),x.ptr,count*4,cudaMemcpyDeviceToHost));
+  for(size_t i=0;i<count;++i)if(actual[i]!=4.f) {
+    std::fprintf(stderr,"MiniMax residual element %zu was not written: %g\n",i,actual[i]);return 1;
+  }
+  std::vector<float> nudged(count,1.f+1.f/1024);
+  CHECK(cudaMemcpy(x.ptr,nudged.data(),count*4,cudaMemcpyHostToDevice));
+  minimax_round<<<grid_for(count),256>>>(static_cast<float*>(x.ptr),count);
+  CHECK(cudaGetLastError());CHECK(cudaDeviceSynchronize());
+  CHECK(cudaMemcpy(actual.data(),x.ptr,count*4,cudaMemcpyDeviceToHost));
+  for(size_t i=0;i<count;++i)if(actual[i]!=1.f) {
+    std::fprintf(stderr,"MiniMax rounding element %zu was not written: %g\n",i,actual[i]);return 1;
+  }
+  CHECK(cudaMemcpy(x.ptr,ones.data(),count*4,cudaMemcpyHostToDevice));
+  CHECK(cudaMemset(out.ptr,0xff,count*2));
+  cast_bf16<<<grid_for(count),256>>>(static_cast<float*>(x.ptr),static_cast<uint16_t*>(out.ptr),count);
+  CHECK(cudaGetLastError());CHECK(cudaDeviceSynchronize());
+  CHECK(cudaMemcpy(bits.data(),out.ptr,count*2,cudaMemcpyDeviceToHost));
+  for(size_t i=0;i<count;++i)if(bits[i]!=0x3f80) {
+    std::fprintf(stderr,"BF16 cast element %zu was not written: %04x\n",i,bits[i]);return 1;
+  }
+  std::printf("Qwen and MiniMax capped-launch pointwise coverage passed for all %zu elements\n",count);
   return 0;
 }

@@ -82,7 +82,6 @@ pub struct MiniMaxM3VisionConfig {
     pub layers: usize,
     pub intermediate: usize,
     pub patch: usize,
-    pub image_size: usize,
     pub rope_theta: f64,
     pub layer_norm_eps: f64,
     pub spatial_merge: usize,
@@ -91,17 +90,6 @@ pub struct MiniMaxM3VisionConfig {
     /// Text width the projector emits (the text hidden size).
     pub projection: usize,
     pub projector_hidden: usize,
-    pub image_token: u32,
-    pub video_token: u32,
-    /// `(height, width)` tilings `dynamic_res` chooses from.
-    pub grid_pinpoints: Vec<(usize, usize)>,
-}
-
-impl MiniMaxM3VisionConfig {
-    /// Patches of one `image_size` tile before the merge.
-    pub fn tile_patches(&self) -> usize { (self.image_size / self.patch).pow(2) }
-    /// Text tokens one tile becomes after the spatial merge.
-    pub fn tile_tokens(&self) -> usize { self.tile_patches() / (self.spatial_merge * self.spatial_merge) }
 }
 
 /// The bundled DSpark drafter (`dspark/config.json`).
@@ -258,19 +246,12 @@ impl MiniMaxM3VisionConfig {
             "MiniMax M3 vision features come from the last layer, every patch");
         let compression = &v["img_token_compression_config"];
         ensure!(compression["image_token_compression_method"] == "patch_merge", "MiniMax M3 vision merges patches");
-        let pinpoints = root["image_grid_pinpoints"].as_str().context("MiniMax M3 lacks image_grid_pinpoints")?;
-        let grid_pinpoints = pinpoints.trim_matches(|c| c == '[' || c == ']').split("),").map(|pair| {
-            let pair = pair.trim().trim_start_matches('(').trim_end_matches(')');
-            let (h, w) = pair.split_once(',').with_context(|| format!("image_grid_pinpoints entry {pair:?}"))?;
-            Ok((h.trim().parse()?, w.trim().parse()?))
-        }).collect::<Result<Vec<(usize, usize)>>>()?;
         let config = Self {
             hidden: int(v, "hidden_size")?,
             heads: int(v, "num_attention_heads")?,
             layers: int(v, "num_hidden_layers")?,
             intermediate: int(v, "intermediate_size")?,
             patch: int(v, "patch_size")?,
-            image_size: int(v, "image_size")?,
             rope_theta: float(v, "rope_theta")?,
             layer_norm_eps: float(v, "layer_norm_eps")?,
             spatial_merge: int(compression, "spatial_merge_size")?,
@@ -278,15 +259,8 @@ impl MiniMaxM3VisionConfig {
             max_segment_frames: int(v, "vision_segment_max_frames")?,
             projection: int(v, "projection_dim")?,
             projector_hidden: int(root, "projector_hidden_size")?,
-            image_token: int(root, "image_token_index")? as u32,
-            video_token: int(root, "video_token_index")? as u32,
-            grid_pinpoints,
         };
         ensure!(config.hidden % config.heads == 0, "vision hidden {} is not a multiple of heads {}", config.hidden, config.heads);
-        ensure!(config.image_size % (config.patch * config.spatial_merge) == 0,
-            "vision tile {} is not whole merged patches of {}x{}", config.image_size, config.patch, config.spatial_merge);
-        ensure!(config.grid_pinpoints.iter().all(|(h, w)| h % (config.image_size / 2) == 0 && w % (config.image_size / 2) == 0),
-            "image_grid_pinpoints must be multiples of half a tile");
         Ok(Some(config))
     }
 }
@@ -349,10 +323,6 @@ pub(crate) mod tests {
     fn release_vision_and_drafter() {
         let vision = MiniMaxM3VisionConfig::from_hf(&release_config()).unwrap().unwrap();
         assert_eq!((vision.hidden, vision.layers, vision.patch, vision.spatial_merge, vision.temporal_patch), (1280, 32, 14, 2, 2));
-        assert_eq!((vision.tile_patches(), vision.tile_tokens()), (2304, 576));
-        assert_eq!(vision.grid_pinpoints.len(), 36);
-        assert_eq!(vision.grid_pinpoints[1], (336, 672));
-        assert_eq!((vision.image_token, vision.video_token), (200_025, 200_026));
         let draft = MiniMaxM3DsparkConfig::from_hf(&release_dspark()).unwrap();
         assert_eq!(draft.target_layers, [3, 17, 31, 45, 59]);
         assert_eq!((draft.layers, draft.block, draft.markov_rank, draft.sliding_window), (5, 7, 256, 4096));

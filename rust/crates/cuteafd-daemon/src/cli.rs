@@ -324,15 +324,6 @@ pub(crate) struct PlanArgs {
     /// Full-attention KV format for --layout (family default when omitted).
     #[arg(long = "kv-cache", value_enum)]
     pub(crate) kv_format: Option<PlanKvFormat>,
-    /// MiniMax planning-only selected-block KV backing; execution is not implemented.
-    #[arg(long, default_value = "gpu")]
-    pub(crate) kv_placement: cuteafd_loader::plan::families::minimax::capacity::KvBacking,
-    /// MiniMax GPU hot K/V cache budget (excludes resident index keys).
-    #[arg(long, default_value_t = 1.0)]
-    pub(crate) kv_hot_cache_gib: f64,
-    /// MiniMax pinned host K/V backing budget, before other host consumers.
-    #[arg(long, default_value_t = 192.0)]
-    pub(crate) kv_host_budget_gib: f64,
     /// Opt-in C1 sizing; explicit prefill rows and concurrency override it.
     #[arg(long, value_parser = ["default", "rtx5090"], default_value = "default")]
     pub(crate) minimax_profile: String,
@@ -728,16 +719,12 @@ mod tests {
     #[test]
     fn minimax_planning_cache_options_do_not_enable_runtime_formats() {
         use clap::Parser;
-        for placement in ["gpu", "host", "spark"] {
-            let super::Commands::Plan(args) = super::Cli::try_parse_from(["cuteafd", "plan", "/model",
-                "--layout", "--kv-cache", "nvfp4", "--kv-placement", placement,
-                "--minimax-profile", "rtx5090"]).unwrap().command else { panic!("plan"); };
-            assert_eq!(args.kv_format, Some(super::PlanKvFormat::Nvfp4));
-            assert_eq!(args.minimax_profile, "rtx5090");
-        }
+        let super::Commands::Plan(args) = super::Cli::try_parse_from(["cuteafd", "plan", "/model",
+            "--layout", "--kv-cache", "nvfp4", "--minimax-profile", "rtx5090"]).unwrap().command else { panic!("plan"); };
+        assert_eq!(args.kv_format, Some(super::PlanKvFormat::Nvfp4));
+        assert_eq!(args.minimax_profile, "rtx5090");
         assert!(super::Cli::try_parse_from(["cuteafd", "serve-minimax", "--snapshot", "/model",
             "--native-lib", "/lib.so", "--kv-cache", "nvfp4"]).is_err());
-        assert!(super::Cli::try_parse_from(["cuteafd", "plan", "/model", "--kv-placement", "disk"]).is_err());
     }
 
     #[test]

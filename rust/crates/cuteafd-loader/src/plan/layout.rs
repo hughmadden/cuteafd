@@ -149,8 +149,8 @@ pub struct LayoutOptions {
     pub step5_kv: crate::families::qwen4::Qwen4KvCache,
     /// MiniMax M3 paged K/V storage (`--kv-cache`).
     pub minimax_kv: crate::families::qwen4::Qwen4KvCache,
-    /// Planning-only NVFP4 cache and selected-block backing options.
-    pub minimax_cache: super::families::minimax::capacity::CachePlan,
+    /// Planning-only NVFP4 K/V (`--kv-cache nvfp4`): a proposal that never admits serving.
+    pub minimax_nvfp4_kv: bool,
     /// Opt-in C1 profile: 256 prefill rows and one sequence, preserving DSpark.
     pub minimax_5090: bool,
     /// Selected Qwen projection/head residency, matching serve-qwen4.
@@ -237,7 +237,7 @@ impl Default for LayoutOptions {
             qwen_kv: Default::default(),
             step5_kv: crate::families::qwen4::Qwen4KvCache::Fp8,
             minimax_kv: crate::families::qwen4::Qwen4KvCache::Fp8,
-            minimax_cache: Default::default(),
+            minimax_nvfp4_kv: false,
             minimax_5090: false,
             qwen_representation: crate::families::qwen4::resident::Qwen4Representation {
                 fp8_projections: false, fp8_head: true },
@@ -283,6 +283,12 @@ pub fn full_prefill_logits_bytes_with_lanes(family: &str, rows: u64, vocab: u64,
 #[cfg(test)]
 mod scoring_workspace_tests {
     use super::*;
+
+    #[test]
+    fn minimax_vision_scratch_matches_the_native_ledger() {
+        // native/tests/vision_minimax_contract_selftest.cc: scratch 758,189,312 + 4 MiB BLAS.
+        assert_eq!(minimax_vision_scratch_bytes(), 758_189_312 + 4 * MIB);
+    }
 
     #[test]
     fn unknown_package_runtime_item_uses_manifest_formula() {
@@ -1071,6 +1077,16 @@ pub(crate) fn qwen_scratch_bytes(tokens: u64) -> u64 {
         .into_iter().map(|b| b.div_ceil(256)*256).sum()
 }
 
+/// Mirrors scratch_minimax at the tower's 4096-token capacity (16,384 patches), with the
+/// fixed 1024-row GEMM staging, LSE and the BLAS workspace: 762,383,616 bytes.
+pub fn minimax_vision_scratch_bytes() -> u64 {
+    let (n, chunk, tokens) = (4096 * 4, 1024, 4096);
+    [n*1280*4, n*1280*2, n*1176*4, n*1280*2, n*1280*2, n*1280*2, n*1280*2, tokens*6144*2, n*6144*2,
+     chunk*1280*3*4, chunk*1280*4, chunk*5120*4, chunk*5120*2, chunk*6144*4, chunk*6144*2, chunk*6144*4,
+     n*2*14*14*3, 768*4, n*3*4, 16384*16*4, 2*4, 4*MIB]
+        .into_iter().map(|b| b.div_ceil(256)*256).sum()
+}
+
 /// Resolve the serving representation, not the inventory's target-only defaults.
 fn selected_host_geometry(report: &mut PlanReport, options: &LayoutOptions, checkpoint: &super::Checkpoint)
     -> anyhow::Result<(cuteafd_core::prefix::HostCacheGeometry, u64, u64)> {
@@ -1267,9 +1283,6 @@ pub(crate) fn charge_host(report: &mut PlanReport, options: &LayoutOptions, chec
         let bytes = report.components.iter().filter(|c| c.component == Component::Embedding)
             .try_fold(0u64, |n, c| n.checked_add(c.bytes)).context("host embedding overflow")?;
         push(Category::Embedding, "embedding", "checkpoint", bytes, Basis::Exact);
-    }
-    if let Some(&bytes) = report.bytes_by_owner.get("proposed host KV backing") {
-        push(Category::Kv, "proposed pinned K/V backing (NOT IMPLEMENTED)", "payload", bytes, Basis::Estimated);
     }
     push(Category::Tables, "mapped-scales/preloaded", "checkpoint", report.mapped_placement.preloaded_bytes, Basis::Exact);
     let media_cache_loaded = (matches!(family, "mimo_v2" | "qwen4" | "glm5_flash")

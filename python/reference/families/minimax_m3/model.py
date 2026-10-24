@@ -196,7 +196,7 @@ def record(trace, name, value):
 
 
 def msa_select(scores, positions, block=128, topk=16, local=1):
-    """Rust reference.rs contract: causal maxima, forced locals, stable low-id ties."""
+    """The attention kernel's selection contract: causal maxima, forced locals, stable low-id ties."""
     keys = torch.arange(scores.shape[-1], device=scores.device)
     scores = scores.masked_fill(keys[None, None] > positions[None, :, None], -float("inf"))
     scores = F.pad(scores, (0, -scores.shape[-1] % block), value=-float("inf"))

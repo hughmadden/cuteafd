@@ -1,8 +1,9 @@
-"""CPU arithmetic contracts for the MiniMax image and video tower."""
+"""Arithmetic contracts for the MiniMax image and video tower and its preprocessing."""
 from __future__ import annotations
 
 import ast
 import hashlib
+import json
 import math
 from pathlib import Path
 import sys
@@ -11,6 +12,7 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "python/reference"))
+import minimax_m3_media as media
 import minimax_m3_vision as reference
 
 
@@ -75,14 +77,13 @@ def test_axial_rope_frequencies_and_passthrough(torch):
     torch.testing.assert_close(rotated, expected, rtol=0, atol=0)
 
 
-def test_bfloat16_rope_rounds_each_product(torch):
+def test_bfloat16_rope_rotates_in_fp32_and_rounds_once(torch):
     x = torch.linspace(-2, 2, 80, dtype=torch.bfloat16).reshape(1, 1, 80)
-    cos, sin = reference.rotary_factors([(1, 3, 7)], torch.bfloat16)
+    cos, sin = reference.rotary_factors([(1, 3, 7)], torch.float32)
     actual = reference.apply_rope(x, cos, sin)
-    a = (x[..., :39].float() * cos[:, None, :39].float()).bfloat16()
-    b = (x[..., 39:78].float() * sin[:, None, :39].float()).bfloat16()
+    expected = (x[..., :39].float() * cos[:, None, :39] - x[..., 39:78].float() * sin[:, None, :39]).bfloat16()
     assert actual.dtype == torch.bfloat16
-    assert torch.equal(actual[..., :39], a - b)
+    assert torch.equal(actual[..., :39], expected)
     assert torch.equal(actual[..., 78:], x[..., 78:])
 
 
@@ -168,3 +169,86 @@ def test_forward_rejects_wrong_patch_shape_and_checkpoint_dtype(torch, real_laye
     weights[key] = weights[key].float()
     with pytest.raises(ValueError, match="unexpected checkpoint dtype"):
         reference.forward(torch.zeros(4, 1176), [(1, 2, 2)], weights, layers=1, project=False)
+
+
+def test_reference_matches_transformers_tower(torch):
+    """Qualify the reference once against Transformers' MiniMaxM3VL tower and projector.
+
+    FP32 on random weights, three layers, an image grid and two video grids. Needs a
+    Transformers with the three-axis tower (5.14 or 5.19); the pinned third_party
+    revision's vision RoPE is two-axis, so it is not an oracle and the test skips.
+    """
+    hf = pytest.importorskip("transformers.models.minimax_m3_vl.modeling_minimax_m3_vl")
+    configuration = pytest.importorskip("transformers.models.minimax_m3_vl.configuration_minimax_m3_vl")
+    np = pytest.importorskip("numpy")
+    config = json.loads((ROOT / "rust/crates/cuteafd-loader/src/families/minimax_m3/fixtures/config.json").read_text())
+    config["vision_config"]["num_hidden_layers"] = 3
+    cfg = configuration.MiniMaxM3VLConfig(**{k: v for k, v in config.items() if k != "quantization_config"})
+    # 5.14 names it MiniMaxM3VL3DRotaryEmbedding; 5.19 computes 13 axial frequencies per axis
+    # for head_dim 80. The pinned revision computes 20 over H and W only.
+    rope = getattr(hf, "MiniMaxM3VLVisionRotaryEmbedding", None)
+    if not hasattr(hf, "MiniMaxM3VL3DRotaryEmbedding") and (
+            rope is None or rope.compute_axial_rope_parameters(cfg.vision_config)[0].numel() != 13):
+        pytest.skip("this Transformers has no three-axis MiniMax vision RoPE")
+    cfg.vision_config._attn_implementation = "eager"
+    torch.manual_seed(0)
+    tower = hf.MiniMaxM3VLVisionModel(cfg.vision_config).float().eval()
+    projector = hf.MiniMaxM3VLMultiModalProjector(cfg).float().eval()
+    weights = {}
+    with torch.no_grad():
+        for module in (tower, projector):
+            for name, parameter in module.named_parameters():
+                parameter.copy_(torch.randn_like(parameter) * (0.02 if parameter.dim() > 1 else 0.1)
+                                + (1.0 if "norm" in name and name.endswith("weight") else 0.0))
+    for name, parameter in tower.named_parameters():
+        name = name.replace("embeddings.proj.", "embeddings.patch_embedding.")
+        weights[reference.VISION_PREFIX + ("encoder." + name if name.startswith("layers.") else name)] = parameter.detach()
+    stems = {"linear_1": "multi_modal_projector.linear_1", "linear_2": "multi_modal_projector.linear_2",
+             "merge_linear_1": "patch_merge_mlp.linear_1", "merge_linear_2": "patch_merge_mlp.linear_2"}
+    for name, parameter in projector.named_parameters():
+        stem, kind = name.rsplit(".", 1)
+        weights[f"{stems[stem]}.{kind}"] = parameter.detach()
+    rng = np.random.default_rng(1)
+    for grid in [(1, 8, 12), (3, 4, 6), (4, 2, 2)]:
+        t, h, w = grid
+        frames = rng.integers(0, 256, size=(2 * t, h * 14, w * 14, 3)).astype(np.uint8)
+        pixels = torch.from_numpy(media.patches(frames))
+        with torch.no_grad():
+            ours = reference.forward(pixels, [grid], weights, layers=3, dtype=torch.float32)["features"]
+            hidden = tower(pixel_values=pixels, grid_thw=torch.tensor([list(grid)])).last_hidden_state
+            theirs = projector(hidden.squeeze(0))
+        assert ((ours - theirs).norm() / theirs.norm()).item() < 1e-5, grid
+
+
+def test_media_preprocessing_matches_release_cases():
+    # Expectations from the release processors and sglang (processor-parity.py), also
+    # pinned in the loader's Rust tests.
+    assert media.smart_resize(1080, 1920) == (504, 896)
+    assert media.smart_resize(1344, 1344) == (672, 672)
+    assert media.smart_resize(1, 1) == (56, 56)
+    assert media.smart_resize(720, 1280, max_pixels=media.VIDEO_MAX_PIXELS) == (560, 1008)
+    with pytest.raises(ValueError):
+        media.smart_resize(1, 201)
+    assert media.serving_frame_size(720, 1280) == (448, 756)
+    assert media.serving_frame_size(480, 640) == (504, 644)
+    assert media.serving_frame_size(1, 1) == (28, 28)
+    assert media.serving_frame_indices(300, 30.0) == [0, 30, 60, 90, 120, 150, 180, 210, 240, 270, 299]
+    assert media.serving_frame_indices(18, 5.0) == [0, 5, 10, 15, 17]
+    assert media.serving_frame_indices(16, 5.0) == [0, 5, 10, 15]
+
+
+def test_media_patches_follow_merge_window_positions():
+    np = pytest.importorskip("numpy")
+    t, h, w = 2, 4, 6
+    frames = np.zeros((2 * t, h * 14, w * 14, 3), np.uint8)
+    for k in range(2 * t):
+        for y in range(h):
+            for x in range(w):
+                frames[k, y * 14:(y + 1) * 14, x * 14:(x + 1) * 14] = (k * 40 + y * w + x, y, x)
+    rows = media.patches(frames)
+    lut = media.normalization_lut()
+    assert rows.shape == (t * h * w, 1176)
+    for row, (frame, y, x) in enumerate(reference.position_ids([(t, h, w)])):
+        for temporal in range(2):
+            assert rows[row, temporal * 196] == lut[0][(2 * frame + temporal) * 40 + y * w + x]
+        assert rows[row, 392] == lut[1][y] and rows[row, 784] == lut[2][x]

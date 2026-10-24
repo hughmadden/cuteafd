@@ -39,6 +39,8 @@ fn minimax_catalog_dispatches_before_generic_text_and_excludes_routed_weights() 
     assert_eq!(shape.geometry().unwrap(), cuteafd_core::ExpertGeometry::MINIMAX_M3);
     let tensors = catalog.fp8().unwrap();
     assert_eq!(tensors.format(), ExpertFormat::Nvfp4);
+    // The packed codes carry divisor scales, which push images cannot copy unchanged.
+    assert!(tensors.divisor_scales() && tensors.validate_push_scales().is_err());
     for layer in 3..60 { tensors.validate_layer(layer).unwrap(); }
     assert!(!tensors.has_layer(2) && !tensors.has_layer(60));
     assert!(catalog.tensors().iter().all(|t| !t.metadata.name.contains(".block_sparse_moe.experts.")));

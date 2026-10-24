@@ -1,15 +1,15 @@
-#!/usr/bin/env python3
-"""Export MiniMax M3 native coordinator programs and their named operand ABIs."""
+"""MiniMax M3 native coordinator programs for the coordinator exporter.
+
+`export_b12x_dsv4_aot.py --geometry minimax` exports them (the `minimax`
+family of the shared program archive); this module only lists them.
+"""
 from __future__ import annotations
 
-import argparse
-import hashlib
-import json
 from pathlib import Path
 import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
-import _pinned_sparkinfer
+import _pinned_sparkinfer  # noqa: F401  (verified SparkInfer source, pinned host target)
 
 
 # Prefill scorer/extend tile: the scorer's block scores scale with rows x
@@ -70,41 +70,3 @@ def programs(max_rows, max_context, decode_rows=64):
     return [(name, name, {"max_rows": capacity(name, max_rows, decode_rows)}, build)
             for group in ("pointwise", "projections", "indexer", "attention")
             for name, build in builders(group, max_rows, max_context, decode_rows).items()]
-
-
-def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--output-dir", type=Path, required=True)
-    parser.add_argument("--group", choices=("pointwise", "projections", "indexer", "attention"), default="pointwise")
-    parser.add_argument("--max-rows", type=int, default=4096)
-    parser.add_argument("--decode-rows", type=int, default=64)
-    parser.add_argument("--max-context", type=int, default=1048576)
-    args = parser.parse_args()
-    if min(args.max_rows, args.decode_rows, args.max_context) <= 0:
-        parser.error("capacities must be positive")
-    from b12x.integration.cuteafd import exportable_compilation, validate_exported_header
-
-    destination = args.output_dir
-    destination.mkdir(parents=True, exist_ok=True)
-    manifest = destination / f"minimax_{args.group}.json"
-    manifest.unlink(missing_ok=True)
-    records = []
-    for name, build in builders(args.group, args.max_rows, args.max_context, args.decode_rows).items():
-        label = "minimax_" + name
-        with exportable_compilation():
-            program = build()
-        program.export_to_c(str(destination), label, "cuteafd_" + label)
-        validate_exported_header(program, destination / (label + ".h"), "cuteafd_" + label)
-        rows = capacity(name, args.max_rows, args.decode_rows)
-        artifacts = {label + ext: hashlib.sha256((destination / (label + ext)).read_bytes()).hexdigest()
-                     for ext in (".o", ".h")}
-        records.append(dict(label=label, geometry=dict(program.geometry), abi=program.abi,
-                            capacity_rows=rows, scratch_bytes_at_capacity=program.scratch_bytes(rows),
-                            artifacts=artifacts))
-        print(f"exported {label}", flush=True)
-    manifest.write_text(json.dumps(dict(schema=1, sparkinfer=_pinned_sparkinfer.LOCK_DATA,
-                                        programs=records), indent=2) + "\n")
-
-
-if __name__ == "__main__":
-    main()

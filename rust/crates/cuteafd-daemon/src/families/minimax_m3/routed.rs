@@ -40,8 +40,13 @@ impl<'a> Spark<'a> {
         });
         let host=!spark_intake::preferred_device_exchange_available(library,IntakePreference::Probed)?;
         if host { tracing::info!("MiniMax Spark partials land in pinned host planes (no GPU landing)"); }
-        Ok(Self(Rc::new(SparkDeviceLink::new_zero_copy(library,device,world,peers,rows,TOPK,ROW,ROW,config,
-            Some(warm),wave_build,host)?)))
+        let link=SparkDeviceLink::new_zero_copy(library,device,world,peers,rows,TOPK,ROW,ROW,config,
+            Some(warm),wave_build,host)?;
+        // One- and two-row waves publish with one store kernel (CUTEAFD_SPARK_PUBLISH=copy: copy engine).
+        let kernel=!matches!(std::env::var("CUTEAFD_SPARK_PUBLISH").as_deref(),Ok("copy"));
+        link.publish_by_kernel(kernel);
+        tracing::info!(publish=if kernel {"kernel"} else {"copy"},"MiniMax Spark small decode waves publish from the stream");
+        Ok(Self(Rc::new(link)))
     }
 }
 
@@ -84,6 +89,13 @@ impl<'a> ExpertExecutor<'a> for Routed<'a> {
             let local=self.local.as_ref().map_or(0,|l|l.layers.len());
             spark.expect(waves.checked_sub(local).context("MiniMax expert inventory exceeds routed layers")? as u64);
         }
+        Ok(())
+    }
+    fn record(&mut self,kind:ExpertV2SourceKind)->Result<()> {
+        ensure!(!self.poisoned,MiniMaxError::Invalid("previous expert failure; restart required"));
+        // A recording queues nothing: an uncollected dispatch it left owns no work.
+        self.pending=None;
+        self.kind=kind;
         Ok(())
     }
     fn dispatch(&mut self,layer:usize,rows:usize,ids:&Buffer<'a>,weights:&Buffer<'a>,input:&Buffer<'a>,commands:&Commands<'a>)->Result<()> {
