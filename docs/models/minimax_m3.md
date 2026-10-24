@@ -187,32 +187,36 @@ segments (K, V and index planes of 60 layers, 4.44 MB per 64 tokens);
 snapshots under 512 tokens stay on the device.
 
 TP2 (RTX 5090 on PCIe Gen4 + 2 Sparks), speculator off, 131,072-token pool,
-16 sequences, 4096 prefill rows, one launch per arm, 24 Oct:
+16 sequences, 4096 prefill rows, one launch per arm, 24-25 Oct:
 
 | Host tier | Prefill 4.4K / 16K / 32K tok/s | Decode C1 / C4 / C16 tok/s | Ready after launch |
 | --- | --- | --- | --- |
-| off | 1492 / 1650 / 1621 | 26.6 / 50.2 / 78.4 | 62 s |
-| 32 GiB, on-evict | 1485 / 1652 / 1622 | 26.6 / 49.2 / 79.5 | 113 s |
-| 32 GiB, on-retain | 1488 / 1649 / 1623 | 26.6 / 48.7 / 78.7 | 93 s |
-| 16 GiB, on-evict | — | — | 82 s |
+| off | 1492 / 1650 / 1621 | 26.6 / 50.2 / 78.4 | 59.5 s |
+| 16 GiB, on-evict | — | — | 61.9 s |
+| 32 GiB, on-evict | 1485 / 1652 / 1622 | 26.6 / 49.2 / 79.5 | 65.9 s |
+| 32 GiB, on-retain | 1488 / 1649 / 1623 | 26.6 / 48.7 / 78.7 | — |
 
-Without page pressure both modes copied only the six snapshots the full banks
-evicted (3.5 GB); on-evict's evictions waited 25 ms in all. A churn of one
-59,460-token and six 15,000-token conversations (more than the pool holds),
-then each again, restored every return from RAM: identical greedy text, and
-bit-identical logits on all 192 decode steps after the restores.
+The pool pins its quota before serving, from transparent hugepages
+(`cudaHostRegister` of madvised anonymous memory; `cudaHostAlloc` where THP
+is off): 16 GiB in 1.7 s, 32 GiB in 7.1 s on this host, against 15 and 32-46 s
+through `cudaHostAlloc`. Without page pressure both modes copied only the six
+snapshots the full banks evicted (3.5 GB); on-evict's evictions waited 25 ms
+in all. A churn of one 59,460-token and six 15,000-token conversations (more
+than the pool holds), then each again, restored every return from RAM:
+identical greedy text, and bit-identical logits on all 192 decode steps after
+the restores.
 
-| Returning prompt | Prefill TTFT | Restore TTFT, on-evict | on-retain |
-| --- | ---: | ---: | ---: |
-| 59,460 tokens | 37.5 s | 0.41 s | 0.31 s |
-| 15,000 tokens | 9.1 s | 0.06-0.13 s | 0.06-0.08 s |
+| Returning prompt | Prefill TTFT | Restore TTFT, on-evict |
+| --- | ---: | ---: |
+| 59,460 tokens | 37.6 s | 0.26 s |
+| 15,000 tokens | 9.1 s | 0.05-0.10 s |
 
-On-retain returns faster under churn because its evictions find the copy
+Restores run at 25 GB/s (one contiguous copy of the same bytes: 27): the copy
+engine submits each plan in 1440-entry pieces, so the driver's ~0.85 us per
+entry overlaps the copies. On-retain returns faster under churn (0.31 against
+0.41 s at 59K before those copy changes) because its evictions find the copy
 done; on-evict copies nothing that stays on the device and keeps no device
-duplicates in the host quota. Restores average 16 GB/s; the copy engine
-alone moves a 929-page restore's 167,220 segments at 25.8 GB/s (one
-contiguous copy: 27.2). Readiness pays for pinning the quota up front, at
-about 1 GB/s on this host.
+duplicates in the host quota.
 
 ### Capacity summary (DSpark on in every cell)
 
