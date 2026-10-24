@@ -142,8 +142,8 @@ before → after tables with conditions.
   under-report usable unified memory. Remote exports reserve aggregate GPU
   and host RAM before container creation and release only after it stops.
 - Submodules are pinned with tree locks (`third_party/*.lock.json`).
-  Kernel changes go to `../sparkinfer-glmrt` master, quantizer changes to
-  `../GPTQModel` main; push there first, then bump pin and lock here.
+  Kernel changes go to `~/Developer/sparkinfer-glmrt` master, quantizer changes to
+  `~/Developer/GPTQModel` main; push there first, then bump pin and lock here.
   Dev images are toolchain-only and pin-independent: a SparkInfer bump
   needs only a new WIP slot build. Rebuild them with
   `scripts/build/build-dev-images.sh` only when the toolchain changes;
@@ -163,7 +163,7 @@ before → after tables with conditions.
   tier, not arbitrary ignored GPU/network tests. Add no failing ids.
 - Kernel/exporter pre-merge gate: CPU-only `scripts/build/compare-sm-exports.py --sms 188,170`; review object/cubin differences.
   From a git worktree, run it in `scripts/build/cuteafd-dev.sh cpu` by the worktree's real path
-  (`cd /home/tj/Developer/cuteafd-<task> && CUTEAFD_SOURCE_ROOT=$PWD ...`), not `/workspace/cuteafd`:
+  (`cd ~/Developer/cute-worktrees/cuteafd-<task> && CUTEAFD_SOURCE_ROOT=$PWD ...`), not `/workspace/cuteafd`:
   relative submodule gitfiles resolve only from the real path.
 - Release and WIP builds persist Cargo registry/git under
   `~/.cache/cuteafd/cargo-home/<arch>`, toolchain-keyed JIT caches under
