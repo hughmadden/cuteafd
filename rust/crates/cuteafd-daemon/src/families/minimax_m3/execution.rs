@@ -321,7 +321,10 @@ impl<'a> Execution<'a> {
     pub fn warm_graphs(&self, keys:&[usize], embedded:&Buffer<'a>, caches:&[LayerCache<'a>], pool_pages:usize,
         experts:&mut dyn ExpertExecutor<'a>) -> Result<u64> {
         ensure!(!self.poisoned.get(),MiniMaxError::Invalid("previous native execution failure; restart required"));
-        ensure!(self.diagnostics.borrow().is_none(),MiniMaxError::Unsupported("decode graphs beside diagnostic dumps"));
+        if self.diagnostics.borrow().is_some() {
+            tracing::warn!("MiniMax decode steps stay eager beside diagnostic dumps: nothing recorded");
+            return Ok(0);
+        }
         ensure!(caches.len()==self.cfg.layers && keys.iter().all(|rows|(1..=self.decode_rows).contains(rows)),
             MiniMaxError::Invalid("decode graph inventory"));
         let stride=self.table_stride.min(pool_pages);
