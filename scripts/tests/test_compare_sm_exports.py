@@ -413,7 +413,7 @@ def test_multitier_exports_do_not_use_two_tier_only_schedules(tmp_path, monkeypa
     monkeypatch.setitem(sys.modules, "package_exl3_aot", package)
     monkeypatch.setitem(sys.modules, "export_b12x_exl3_aot", SimpleNamespace(
         export=lambda *args, **kwargs: recorded.append((args, kwargs))))
-    compare_sm._export_exl3(["--geometry", "qwen4", "--capacities", "1024",
+    compare_sm._export_exl3(["--geometry", "qwen4", "--capacities", "1024", "--role", "spark",
                             "--bits", ",".join(map(str, bits))], tmp_path)
     assert len(recorded) == 1
     assert recorded[0][0][4] == bits

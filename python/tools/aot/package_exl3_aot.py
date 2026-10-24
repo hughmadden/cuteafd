@@ -347,8 +347,7 @@ def fused_input_rotation(geometry: str, role: str, width: int, capacity: int) ->
     return False
 
 
-def warp_specialized(geometry: str, role: str, width: int, capacity: int,
-                     bits: tuple[int, ...] = (4, 5)) -> bool:
+def warp_specialized(geometry: str, role: str, width: int, capacity: int) -> bool:
     """Whether a capacity exports the warp-specialized prefill kernels (b12x
     mixed_trellis_ws, 64-row route blocks): producer warps stream the Trellis
     weights and input rows and rotate FC1 inputs one block ahead, consumer
@@ -371,7 +370,7 @@ def warp_specialized(geometry: str, role: str, width: int, capacity: int,
     Other tier pairs, widths, families and unmeasured capacities stay off.
     """
     if role == 'coordinator':
-        return (geometry == 'glm' and tuple(bits) == (4, 5)
+        return (geometry == 'glm'
                 and ((width == 1024 and capacity in (256, 1024, 2752))
                      or (width == 2048 and capacity == 256)))
     if role != 'spark':
@@ -875,7 +874,8 @@ def build(args: argparse.Namespace) -> None:
                     options['hidden'] = hidden
                 block = route_block(geometry, capacity)
                 ws = compact_ws or (len(args.bits) == 2 and tile is None
-                                    and warp_specialized(geometry, args.role, width, capacity, tuple(args.bits)))
+                                    and (args.role != 'coordinator' or tuple(args.bits) == (4, 5))
+                                    and warp_specialized(geometry, args.role, width, capacity))
                 if ws:
                     block = 32 if compact_ws else 64
                     if geometry == 'kimik3' or args.role == 'coordinator':
