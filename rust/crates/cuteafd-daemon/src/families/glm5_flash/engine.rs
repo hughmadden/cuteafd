@@ -4467,7 +4467,11 @@ impl<'a> GlmfEngine<'a> {
                 let d = self.caches_of(rank).kda_heads * self.cfg.kda_head_dim;
                 let in_width = 3 * d + 2 * self.cfg.kda_head_dim + self.caches_of(rank).kda_heads;
                 let input = w.scratch.buffer.ptr.wrapping_byte_add(super::variants::kda_norm_offset(span.rows, in_width, d));
-                self.variant_site(rank, w, layer, SiteKind::Attn, w.delta.buffer.ptr, span.first, span.rows, Some(input))
+                // Dead once the program returns: its in-projection rows, ahead of the gated-norm input.
+                let spare = (w.scratch.buffer.ptr, super::variants::kda_spare_bytes(span.rows, in_width)
+                    .min(w.scratch.buffer.bytes));
+                self.variant_site(rank, w, layer, SiteKind::Attn, w.delta.buffer.ptr, span.first, span.rows,
+                    Some((input, spare)))
             }),
             GlmNextAttention::Mla => {
                 self.mla_on(rank, w, index, layer, rows, cap, tables, trace)?;
@@ -4482,7 +4486,7 @@ impl<'a> GlmfEngine<'a> {
     /// chunk of base rows, and base rows are never written.
     #[allow(clippy::too_many_arguments)]
     fn variant_site(&self, rank: usize, w: &Workspace<'_>, layer: &GlmfLayer<'_>, kind: SiteKind, x: *mut c_void,
-        first: usize, rows: usize, input: Option<*mut c_void>) -> Result<()> {
+        first: usize, rows: usize, input: Option<(*mut c_void, (*mut c_void, usize))>) -> Result<()> {
         let (Some(variants), Some(ids)) = (&self.variants, &w.variants) else { return Ok(()) };
         if !w.variant_active.get() || rows == 0 { return Ok(()) }
         ensure!(rank == 0 && self.peer.is_none(), "weight variants run on one coordinator GPU");
@@ -4490,8 +4494,8 @@ impl<'a> GlmfEngine<'a> {
         let y = x.wrapping_byte_add(first * self.cfg.hidden * 2);
         let vidx = ids.buffer.ptr.wrapping_byte_add(first * 4).cast_const();
         if variants.has_delta(key) {
-            let input = input.with_context(|| format!("delta at {key}: the site tensor's input is not available"))?;
-            variants.delta(self.library, key, input.cast_const(), rows, y, vidx, self.stream)?;
+            let (input, spare) = input.with_context(|| format!("delta at {key}: the site tensor's input is not available"))?;
+            variants.delta(self.library, key, input.cast_const(), rows, y, vidx, Some(spare), self.stream)?;
         }
         variants.steer(key, y, rows, vidx, self.stream)
     }
@@ -4629,8 +4633,11 @@ impl<'a> GlmfEngine<'a> {
         let n = usize::try_from(n)?;
         // down_proj's input: the SwiGLU activation the program left in its scratch.
         let input = w.scratch.buffer.ptr.wrapping_byte_add(super::variants::ffn_hidden_offset(n, inter));
+        // Unwritten by the program: the scratch past its SwiGLU activation (sized by the widest program, KDA).
+        let start = super::variants::ffn_spare_offset(n, inter);
+        let spare = (w.scratch.buffer.ptr.wrapping_byte_add(start), w.scratch.buffer.bytes.saturating_sub(start));
         self.variant_site(rank, w, layer, if layer.dense { SiteKind::DenseFfn } else { SiteKind::SharedExpert }, out, 0, n,
-            Some(input))
+            Some((input, spare)))
     }
 
     /// The rows and tables the DSA indexer, top-k and selection run over: each packed sequence's

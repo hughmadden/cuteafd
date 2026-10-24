@@ -9,10 +9,13 @@
 //!
 //! Two operators:
 //! - steering (`y -= A (Bᵀ y)`): `steer_rows` over the §4 tables;
-//! - a stored delta (`y += ΔW x`, dealignai L44): one FP8 W8A16 GEMV of ΔW on the
-//!   sublayer's input (KDA: the gated-norm output, `y` in the program's scratch;
-//!   FFN: the SwiGLU activation) for every row, in slices of [`GlmfVariants::slice_rows`],
-//!   then `add_rows` on the rows whose variant stores that delta.
+//! - a stored delta (`y += ΔW x`, dealignai L44): ΔW in FP8 on the sublayer's input
+//!   (KDA: the gated-norm output, `y` in the program's scratch; FFN: the SwiGLU
+//!   activation) for every row, FP32 out, then `add_rows` on the rows whose variant stores
+//!   that delta. A decode step (up to [`GlmfVariants::slice_rows`] rows) runs the W8A16
+//!   GEMV into its own stable buffers; a wider prefill chunk runs one whole-height W8A8 pass
+//!   (ΔW read once) with its output and workspace in scratch the program has finished with
+//!   ([`wide_delta_bytes`]), falling back to `slice_rows` slices only if that room is short.
 //!
 //! Table pointers and the per-row variant ids (`w.variants`, uploaded with the
 //! step's tables) have stable addresses, so captured decode graphs keep their keys
@@ -204,13 +207,33 @@ impl<'a> GlmfVariants<'a> {
     pub fn has_delta(&self, key: SiteKey) -> bool { self.deltas.contains_key(&key) }
 
     /// `y += ΔW x` on the rows whose variant stores the delta at `key`: `x` is `rows` BF16 rows
-    /// of the site tensor's input (row stride K), `y` the BF16 output (stride `hidden`).
+    /// of the site tensor's input (row stride K), `y` the BF16 output (stride `hidden`). `spare`
+    /// is device memory nothing reads until the next program (a wide chunk's output and
+    /// workspace go there).
+    #[allow(clippy::too_many_arguments)]
     pub fn delta(&self, library: &NativeLibrary, key: SiteKey, x: *const c_void, rows: usize, y: *mut c_void,
-        vidx: *const c_void, stream: *mut c_void) -> Result<()> {
+        vidx: *const c_void, spare: Option<(*mut c_void, usize)>, stream: *mut c_void) -> Result<()> {
         let Some(site) = self.deltas.get(&key) else { return Ok(()) };
-        let (out, scratch) = (self.out.as_ref().context("delta output")?, self.scratch.as_ref().context("delta scratch")?);
         let add = self.add_rows.as_ref().context("add_rows binding")?;
         let (h, k) = (self.hidden, site.weight.k);
+        let add_shape = |rows| cuteafd_ffi::steer_rows::AddRowsShape { rows, h, ld_y: h, ld_d: h, variants: self.slots };
+        if rows > self.slice_rows {
+            let (out_bytes, workspace) = wide_delta_bytes(rows, h, k);
+            if let Some((room, _)) = spare.filter(|&(room, len)| room as usize % 256 == 0 && out_bytes + workspace <= len) {
+                let (packed, scale) = site.weight.buffers();
+                // SAFETY: `room` holds `out_bytes` FP32 output rows then `workspace` bytes that no other
+                // work reads before the next program on this stream; `x`, `y` and `vidx` hold `rows`
+                // rows; the stream orders the pass before the add.
+                return unsafe {
+                    library.fp8_linear(x, packed.ptr.cast_const(), scale.ptr.cast_const(), room, true, rows, k, h,
+                        crate::shared::fp8_linear::Fp8Rows::W8a8.code(), room.byte_add(out_bytes), workspace, stream)?;
+                    add.launch_raw(y.cast(), room.cast_const().cast(), vidx.cast(), site.on.buffer.ptr.cast_const().cast(),
+                        add_shape(rows), stream)
+                }.with_context(|| format!("delta at {key} ({rows} rows, one pass)"));
+            }
+            tracing::debug!(%key, rows, "delta: no spare room for one pass; slices of {}", self.slice_rows);
+        }
+        let (out, scratch) = (self.out.as_ref().context("delta output")?, self.scratch.as_ref().context("delta scratch")?);
         for first in (0..rows).step_by(self.slice_rows) {
             let n = self.slice_rows.min(rows - first);
             // SAFETY: rows `first..first + n` of `x`, `y` and `vidx` lie inside the caller's buffers; `out`
@@ -219,12 +242,21 @@ impl<'a> GlmfVariants<'a> {
             unsafe {
                 site.weight.apply(library, x.byte_add(first * k * 2), out.buffer.ptr, true, n, 0, h, scratch, stream)?;
                 add.launch_raw(y.byte_add(first * h * 2).cast(), out.buffer.ptr.cast_const().cast(),
-                    vidx.byte_add(first * 4).cast(), site.on.buffer.ptr.cast_const().cast(),
-                    cuteafd_ffi::steer_rows::AddRowsShape { rows: n, h, ld_y: h, ld_d: h, variants: self.slots }, stream)
+                    vidx.byte_add(first * 4).cast(), site.on.buffer.ptr.cast_const().cast(), add_shape(n), stream)
             }.with_context(|| format!("delta at {key}"))?;
         }
         Ok(())
     }
+}
+
+/// A whole-height delta pass over `rows` rows of input width `k`: `(output, workspace)` bytes,
+/// the FP32 output (256-byte aligned) then the W8A8 workspace that holds every row's E4M3
+/// activations and per-128 scales at once, so `fp8_linear` reads ΔW in one tile (its fixed
+/// row-scale and maxima regions fit in the 1 MiB margin).
+pub(crate) fn wide_delta_bytes(rows: usize, hidden: usize, k: usize) -> (usize, usize) {
+    let tiled = rows.next_multiple_of(128);
+    ((rows * hidden * 4).next_multiple_of(256), (k * tiled).next_multiple_of(256) + (k / 128 * tiled * 4).next_multiple_of(256)
+        + (1 << 20))
 }
 
 /// Why a derived variant cannot serve on GLM Flash's sites (`None`: it can).
@@ -306,6 +338,19 @@ pub(crate) fn kda_norm_offset(rows: usize, in_width: usize, d: usize) -> usize {
 /// its scratch: after the gate|up rows, 1024-byte aligned.
 pub(crate) fn ffn_hidden_offset(rows: usize, inter: usize) -> usize {
     (rows * 4 * inter).next_multiple_of(1024)
+}
+
+/// Bytes at the start of the KDA program's scratch that are dead once it returns: its
+/// in-projection rows `[rows, P]` (BF16), read only inside the program. They end before the
+/// gated-norm output a delta reads.
+pub(crate) fn kda_spare_bytes(rows: usize, in_width: usize) -> usize {
+    rows * in_width * 2
+}
+
+/// Where the FFN program's scratch use ends: the SwiGLU activation's end, 1024-byte aligned.
+/// The program never writes past it.
+pub(crate) fn ffn_spare_offset(rows: usize, inter: usize) -> usize {
+    (ffn_hidden_offset(rows, inter) + rows * inter * 2).next_multiple_of(1024)
 }
 
 fn bytes_of<T: Copy>(values: &[T]) -> &[u8] {
