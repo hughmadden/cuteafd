@@ -89,6 +89,7 @@ impl LocalTp4Client {
         Ok(())
     }
     pub(crate) fn max_waves(&self) -> usize { self.max_waves }
+    pub(crate) fn timeout(&self) -> Duration { self.config.timeout }
     pub(crate) fn open_waves(&self) -> usize { self.waves.len() }
 
     pub(crate) fn installed_grouping(&self) -> Result<Vec<crate::worker_selection::InstalledExpertGrouping>> {
@@ -211,6 +212,12 @@ impl LocalTp4Client {
             session.drain_egress_reads(self.egress_slot, &self.config)?;
         }
         Ok(host)
+    }
+    /// Every slot of the registered request ring as a staging arena: requests
+    /// whose payload views one go out from it on every rank (no per-rank copy).
+    pub(crate) fn egress_arenas(&self) -> Result<Vec<super::StagingArena>> {
+        let Some(buffer) = self.egress.as_ref() else { return Ok(Vec::new()) };
+        (0..self.max_waves).map(|slot| super::StagingArena::of(buffer, slot)).collect()
     }
     /// The first `len` bytes of the egress buffer as a request payload.
     pub(crate) fn egress_payload(&self, len: usize) -> Result<bytes::Bytes> {

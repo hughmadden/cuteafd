@@ -73,6 +73,52 @@ impl EgressBuffer {
 
 }
 
+/// A pinned, device-mapped host region one prefill wave slot stages into:
+/// the engine's stream copies the wave's routes and expert input rows here,
+/// and the slot's transport worker builds the request from it, the hidden
+/// payload a view of the region. When the region is a slot of a link's
+/// registered egress ring, every rank sends (or RDMA-WRITEs) it straight from
+/// these bytes: no per-rank copy into a send ring. The region may be
+/// rewritten only once no request views it ([`Self::writable`]) and no send
+/// still reads it (the slot's wave landed, so every rank received it).
+#[derive(Clone)]
+pub struct StagingArena { buffer: Arc<EgressBuffer>, slot: usize }
+
+impl StagingArena {
+    /// A standalone pinned arena of `bytes` (not registered on any session).
+    pub fn new(bytes: usize) -> Result<Self> {
+        Ok(Self { buffer: EgressBuffer::new(bytes, 1)?, slot: 0 })
+    }
+    /// Slot `slot` of a link's registered egress ring.
+    pub(crate) fn of(buffer: &Arc<EgressBuffer>, slot: usize) -> Result<Self> {
+        anyhow::ensure!(slot < buffer.views.len(), "egress slot outside its ring");
+        Ok(Self { buffer: Arc::clone(buffer), slot })
+    }
+    pub fn host(&self) -> CuteafdHostBuffer {
+        self.buffer.target(self.slot).expect("validated egress slot")
+    }
+    pub fn bytes(&self) -> usize { self.buffer.slot_bytes }
+    /// No request payload views the arena.
+    pub fn writable(&self) -> bool { self.buffer.writable(self.slot) }
+    /// `len` bytes at `offset` as a request payload that keeps the arena alive.
+    pub fn payload(&self, offset: usize, len: usize) -> Result<Bytes> {
+        anyhow::ensure!(offset.checked_add(len).is_some_and(|end| end <= self.bytes()),
+            "payload of {len} bytes at {offset} exceeds the {}-byte arena", self.bytes());
+        Ok(Bytes::from_owner(EgressView { buffer: Arc::clone(&self.buffer),
+            _view: Arc::clone(&self.buffer.views[self.slot]), offset: self.slot * self.buffer.slot_bytes + offset, len }))
+    }
+    /// The arena's first `len` bytes.
+    ///
+    /// # Safety
+    /// The stream copies that wrote them completed and nothing writes the
+    /// arena while the slice lives.
+    pub unsafe fn read(&self, len: usize) -> Result<&[u8]> {
+        anyhow::ensure!(len <= self.bytes(), "arena read of {len} bytes exceeds the {}-byte arena", self.bytes());
+        // SAFETY: in bounds (checked); quiescence is the caller's contract.
+        Ok(unsafe { std::slice::from_raw_parts(self.host().ptr.cast::<u8>(), len) })
+    }
+}
+
 fn views_writable(views: &Arc<()>) -> bool {
     Arc::strong_count(views) == 1
 }
