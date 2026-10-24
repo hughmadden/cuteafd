@@ -962,9 +962,9 @@ impl Opened {
                 else { cuteafd_core::SparkIngress::Fp8K32 };
             let model = cuteafd_transport::worker_selection::ModelAdmission {
                 capacity, compiled_capacity: capacity,
-                endpoints: vec![cuteafd_core::SparkEndpoint { ring_depth: None, capacity, ingress, execution_lane: 0 };
+                endpoints: vec![cuteafd_core::SparkEndpoint { ring_depth: None, capacity, ingress };
                     usize::try_from(preflight.working_set.prefill_lanes)?],
-                rings: crate::shared::placement::spark_rings(64 << 20)?,
+                rings: crate::shared::placement::spark_rings(64 << 20)?, execution_slots: 1
             };
             let admission = crate::shared::placement::SparkAdmission::plan(&args.snapshot, geometry, self.catalog.as_ref(),
                 &preflight.working_set, peers.len(), None, model)?;
