@@ -435,6 +435,8 @@ impl<'w, 'a> TargetPass<'w, 'a> {
         let Some(handle) = self.begin_chain(verification)? else {
             let result = unsafe { self.execute_phase_inner(requests, batch, transport, placement, selected,
                 suffix, encoder, terminal).await };
+            // A failed Spark wire released its waits over garbage planes.
+            let result = result.and_then(|()| crate::shared::spark_waves::healthy());
             if result.is_ok() { self.resources.lane.drain_route_ring()?; }
             return result;
         };
@@ -443,7 +445,8 @@ impl<'w, 'a> TargetPass<'w, 'a> {
         // Every consumer after the pass (commit, dSpark, logits downloads) is
         // unscoped, so the chained work must be complete before returning.
         let drained = self.drain_chain();
-        let result = result.and(drained);
+        // A failed Spark wire released its waits over garbage planes.
+        let result = result.and(drained).and_then(|()| crate::shared::spark_waves::healthy());
         if result.is_ok() {
             // Device-read layers left their captured routes in the router's ring.
             self.resources.lane.drain_route_ring()?;
