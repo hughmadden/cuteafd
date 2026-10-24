@@ -485,14 +485,18 @@ fn source_error(name: &str, reason: impl Into<String>) -> anyhow::Error {
     TensorSourceError::Invalid { tensor: name.into(), reason: reason.into() }.into()
 }
 
-
 impl TensorSource {
     /// Every tensor of the given safetensors files (no index needed).
     pub fn from_files(files: impl IntoIterator<Item = PathBuf>) -> Result<Self> {
         let mut tensors = BTreeMap::new();
         let mut quantization = BTreeMap::new();
+        let mut directories = BTreeMap::new();
         for path in files {
-            quantization.insert(path.clone(), crate::plan::checkpoint::read_quantization_config(path.parent().unwrap_or_else(|| Path::new(".")))?);
+            let directory = path.parent().unwrap_or_else(|| Path::new("."));
+            if !directories.contains_key(directory) {
+                directories.insert(directory.to_path_buf(), crate::plan::checkpoint::read_quantization_config(directory)?);
+            }
+            quantization.insert(path.clone(), directories[directory].clone());
             for meta in crate::read_safetensors_metadata(&path)? {
                 ensure!(!tensors.contains_key(&meta.name), "duplicate tensor {} in source files", meta.name);
                 tensors.insert(meta.name.clone(), (path.clone(), meta));

@@ -820,6 +820,7 @@ mod tests {
         let json = variant_diagnostics(&[outcome]);
         assert_eq!(json[0]["table_bytes"],expected);
         assert_eq!(json[0]["site_tables"][0]["slots"],8);
+        assert_eq!(json[0]["site_tables"][0]["resident_bytes"],expected);
         assert_eq!(json[0]["mode"],"shared-only");
     }
 
