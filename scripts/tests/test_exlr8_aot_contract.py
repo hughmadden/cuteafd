@@ -42,6 +42,14 @@ def test_exlr8_has_separate_comparison_group():
     assert jobs == [("exlr8", "export_b12x_dsv4_aot.py", ["--geometry", "exlr8"])]
 
 
+def serving_default():
+    """The fork's routed serving default, read without importing CUDA."""
+    tree = ast.parse((FORK / "b12x/integration/cuteafd/exlr8.py").read_text())
+    return next(node.value.value for node in tree.body
+                if isinstance(node, ast.Assign)
+                and getattr(node.targets[0], "id", None) == "DEFAULT_SERVING_VARIANT")
+
+
 def test_serving_and_glue_export_inventory():
     tree = ast.parse((FORK / "b12x/integration/cuteafd/exlr8_glue.py").read_text())
     builder = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "exlr8_export_programs")
@@ -54,7 +62,13 @@ def test_serving_and_glue_export_inventory():
         assert shared["shared_expert"] is True
         assert shared["top_k"] == 1 and shared["max_groups"] == 4
     assert shared["experts"] == 1
-    namespace = {"compile_exlr8_group_aot": lambda **kwargs: kwargs, "compile_exlr8_a16_aot": lambda **kwargs: kwargs}
+    # The inventory reads the routed default from its function-local import,
+    # which the strip below removes; bind the fork's constant instead of
+    # hand-copying it, and pin the name the engine's variant contract accepts.
+    variant = serving_default()
+    assert variant == "k1_k23_coalesced"
+    namespace = {"compile_exlr8_group_aot": lambda **kwargs: kwargs, "compile_exlr8_a16_aot": lambda **kwargs: kwargs,
+                 "DEFAULT_SERVING_VARIANT": variant}
     # Drop the local CUDA-dependent import; constructing the lambdas compiles nothing.
     builder.body = [node for node in builder.body if not isinstance(node, ast.ImportFrom)]
     exec(compile(ast.Module(body=[builder], type_ignores=[]), "exlr8_inventory", "exec"), namespace)
@@ -77,10 +91,10 @@ def test_serving_and_glue_export_inventory():
     assert grouped64["max_groups"] == 512
     # Routed decode is the compact-unit routed serving core, declared by
     # variant, so a stale export cannot pass for it.
-    assert dict(spark[0][2]) == {"max_rows": 64, "serving_variant": "k1_reg_pair_b2"}
+    assert dict(spark[0][2]) == {"max_rows": 64, "serving_variant": "k1_k23_coalesced"}
     routed = spark[0][3]()
     assert routed["device_count"] is True
-    assert routed["serving_variant"] == "k1_reg_pair_b2"
+    assert routed["serving_variant"] == "k1_k23_coalesced"
     assert not routed.get("shared_expert") and not routed.get("grouped")
     assert [p[0] for p in inventory("coordinator")] == ["shared_a16_serving", "shared_group"]
     with pytest.raises(ValueError):

@@ -41,7 +41,7 @@ pub fn validate(spec: &ProgramSpec) -> Result<(), ManifestError> {
     // the compact-unit routed variants are accepted here.
     if spec.name == "exlr8_a16_serving" {
         let variant = spec.geometry.get("serving_variant").and_then(|v| v.as_str());
-        if !matches!(variant, Some("k1_compact_prefetch" | "k1_paired_fc1" | "k1_reg_pair_b2"))
+        if !matches!(variant, Some("k1_compact_prefetch" | "k1_paired_fc1" | "k1_k23_coalesced"))
         {
             return Err(invalid("routed serving requires a declared compact-unit variant"));
         }
@@ -442,7 +442,7 @@ mod tests {
         let mut s = spec();
         s.name = "exlr8_a16_serving".into();
         s.geometry["abi_version"] = serde_json::json!(3);
-        s.geometry["serving_variant"] = serde_json::json!("k1_reg_pair_b2");
+        s.geometry["serving_variant"] = serde_json::json!("k1_k23_coalesced");
         s.pointers.push("group_count".into());
         s.scalar_kinds = b"ii".to_vec();
         let mut e = entry();
@@ -535,7 +535,7 @@ mod tests {
             "name":"group_count", "shape":"[1]", "dtype":"int32", "role":"in"}));
         // The manifest must name the compact-unit variant it was built from.
         assert!(validate(&s).is_err());
-        s.geometry["serving_variant"] = serde_json::json!("k1_reg_pair_b2");
+        s.geometry["serving_variant"] = serde_json::json!("k1_k23_coalesced");
         validate_entry(&s, &e).unwrap();
         for variant in ["baseline", "k1_unknown", ""] {
             let mut bad = s.clone();
