@@ -5666,3 +5666,294 @@ byte-identical. SM121 AOT objects also cross-compile for AArch64. Remaining gate
 complete native AArch64 linking, real-weight encoder parity on both architectures,
 on-device injection/cache behavior and performance. No GPU qualification or
 serving promotion follows from the CPU checks.
+
+### MiniMax M3 prefill and whole-design review (2026-10-24, Kimi 3.1)
+
+Static review at `51f79cf68` found that slow prefill is primarily unfinished
+bring-up, not a regression from the two attention pin fixes (`5a5c4791f` and
+`51f79cf68`, both correctness changes). The original serving commit
+`453a2dc21` already said that prefill used causal paged decode tiles. No GPU
+timing was collected for this review; the operation counts below come directly
+from the serving loop.
+
+1. **Wire the real prefill path first.** `families/minimax_m3/execution.rs`
+   splits every chunk into 64-row tiles and calls `minimax_index_decode` plus
+   `minimax_attention_decode`, with each query represented as an independent
+   one-row causal request. A 4096-row chunk therefore launches 3840 decode
+   program pairs across 60 layers and performs 11,520 ordered page-table,
+   length and query-offset uploads. It also rereads selected K/V per query
+   instead of sharing the extend tile's union. The exporter already builds
+   `index_prefill` and `attention_extend`, but the FFI inventory and executor
+   bind only the decode variants. This is the main structural slowdown.
+2. **Stop projecting every prefill row through the vocabulary head.**
+   `Execution::execute_through` always requests all-row logits and the backend
+   hardcodes `full_prefill_logits: true`, although ordinary scheduler prefill
+   asks for one row. At 4096 rows and vocabulary 200064, every chunk performs
+   about 10.07 TFLOP of head GEMM and writes 3.05 GiB of logits, including
+   intermediate chunks whose logits are unused. The serving
+   `--full-prefill-logits` flag is declared but not consumed.
+3. **Bound decode-index clearing by live width.** The b12x MiniMax decode
+   indexer clears `rows * 4 * max_pages` on every invocation. Through the
+   current tiled-prefill path at the default 1M context, that is about 60 GiB
+   of padding writes per 4096-row chunk. Clear only the live width, or remove
+   the clear only after proving padded scores are never consumed. The real
+   prefill path makes this cost largely irrelevant to prefill, but decode still
+   benefits from bounding it.
+4. **Treat the 5090 pinned Spark exchange as a separate secondary cost.**
+   Commit `50ab9619a` selects this fallback where GPU landing is unavailable.
+   Each routed layer drains the compute stream, downloads routes and BF16
+   activations, copies the wire bytes on the host, then waits for replies. At
+   4096 rows this is 57 drains and 2.67 GiB of activation D2H per chunk before
+   reply traffic. Do not attribute this host fallback to the PRO 6000 device
+   path, and do not remove its lifetime barriers without replacement ownership.
+
+Implementation order and constraints:
+
+- Pass an explicit execution mode into MiniMax attention. Bind
+  `minimax_index_k_quant`, `minimax_index_prefill` and
+  `minimax_attention_extend`; retain the existing decode path for decode and
+  speculative verification. Do not merely rename the current calls.
+- Add contiguous index-K/scales staging for prefill. Respect the exported
+  contract: request starts are 128-token aligned, K is padded to 256 rows, and
+  `k_end` is each query's exclusive causal end. Allocate prefill-width `q2k`,
+  LSE and the actual index-prefill/attention-extend scratch through the normal
+  manifest and admission ledger; keep decode capacities independent.
+- Build extend metadata from packed request query ranges and final cache
+  lengths. Preserve forced local blocks, sorted deterministic selections,
+  causal tails and the eight-query union semantics. Exact prefix restore and
+  uncommitted speculative append rules remain unchanged.
+- Thread requested logit rows through execution. Ordinary non-final chunks
+  should skip the head; the final generation chunk needs only its last row,
+  while teacher-forced scoring retains all requested rows. Make admission and
+  the CLI flag describe the same behavior.
+- After those fixes, profile the 5090 pinned exchange before changing it.
+  Removing redundant host copies or synchronization must preserve stream
+  ordering, staged-request lifetime and terminal link ownership.
+
+Qualification: run the MiniMax first-window/layer diagnostics and golden NLL,
+compare greedy output before/after with DSpark off and on, and check exact
+prefix restore across chunk and 128-token block boundaries. Then run one warmed
+8K C1 A/B on the affected card, recording thermal windows. Chunk-size tuning is
+not a substitute for wiring the prefill kernels and bounding the head.
+
+Whole-design/decode additions from the same static review:
+
+- The index clear is a decode problem too, not only prefill amplification. At
+  the default 1M export it writes 15 MiB per C1 undrafted target round, 120 MiB
+  per eight-row full-DSpark verification and 960 MiB per 64-row verification,
+  regardless of the live context. Bound this before detailed decode tuning.
+- Adaptive DSpark currently cannot reduce its own compute. `Backend::draft`
+  selects every request with nonzero depth, `Dspark::propose` always executes
+  seven rows per request, and only then truncates tokens to the selected depth.
+  Preserve the seven-row contract where required, but do not describe this as
+  compute-adaptive drafting; add smaller qualified block shapes or a cost model
+  that charges the full seven rows.
+- The target is eager and single-coordinator. Normal and diagnostic decode use
+  the same `Execution::execute` loop, and `--split-device` is rejected. There is
+  no captured target verification path or two-GPU attention/head split. After
+  correctness and the index-clear fix, profile host launch gaps and dense/head
+  bandwidth before choosing whole-step graphs, a split, or both.
+- Partial-page prefix restore is exact but serial. `Cache::copy_rows` performs
+  K, V, index-payload and index-scale copies with synchronous `copy_d2d`: four
+  waits per layer, 240 over 60 layers. Full pages are shared and need no copy.
+  Batch these spans on an ordered copy stream with one completion barrier;
+  retain the existing visible-byte and CoW contracts.
+- No additional definite decode-correctness defect was established in this
+  static pass. The recent pins are mandatory baseline fixes, not optional
+  performance changes: `5a5c4791f` fixes dropped paged-attention state and
+  `51f79cf68` fixes the LSE layout. Do not qualify older pins as equivalent.
+- The branch's recorded evidence is not release qualification. Most commits
+  are CPU-only; later hardware evidence covers layer replay and basic served
+  answers. The branch still needs full-model golden NLL/logits, long and short
+  contexts, C1 and wide-batch verification, DSpark/off parity, ring wrap and
+  restart, exact prompt/turn/host prefix restore, remote and pinned transport,
+  and measured decode/prefill performance. Keep launcher promotion fail-closed
+  until those gates pass.
+
+The sound pieces to preserve are native MXFP8/NVFP4 arithmetic, checked native
+ABIs and allocation ledgers, deterministic MSA selection, private append tails,
+publication only after native completion, per-slot DSpark rings, and explicit
+refusal of unsupported KV, paging, audio and multi-GPU modes.
+
+### MiniMax M3 performance review (2026-10-24, astra 6 extra high)
+
+Author: **astra 6 extra high**. Reviewed `hugh/minimax-m3` at `51f79cf68`
+with SparkInfer pinned to `012972f7`. This is a source review plus inspection
+of saved trial evidence; no new hardware run or timing was collected. The
+costs below are operation counts, not measured latency contributions. Source
+line references refer to those pins. This independently confirms the prefill
+findings above and adds full-capacity residual clearing, score finishing and
+small-batch kernel parallelism findings.
+
+1. **[P1] Prefill computes vocabulary logits it immediately discards.**
+   `rust/crates/cuteafd-daemon/src/families/minimax_m3/backend.rs:146`
+   receives `logit_rows` but executes the complete head before slicing or
+   discarding its output. `execution.rs:199` calls `head.logits(rows)`;
+   `head.rs:11` normalizes and projects every row. At 4096 rows, hidden 6144
+   and vocabulary 200064, this is about 10.07 TFLOP and 3.05 GiB of logits
+   even when the caller needs one row. Backend geometry hardcodes
+   `full_prefill_logits: true`, and the declared serving flag is unused.
+   Thread requested rows into execution and select them before head norm
+   and projection; skip the head when no logits are requested. Preserve
+   all-row output for scoring and make allocation admission follow the mode.
+
+2. **[P1] Prefill runs through decode kernels and repeats metadata work.**
+   `rust/crates/cuteafd-daemon/src/families/minimax_m3/execution.rs:243`
+   splits each chunk into at most 64-row tiles, treating each query token
+   as an independent one-row causal request. A 4096-row chunk across 60
+   layers invokes 3840 index/attention program pairs and 11,520 ordered
+   metadata uploads, before counting internal kernel launches. Page tables,
+   lengths and query offsets are rebuilt despite being independent of
+   layer. Wire the exported index-prefill and attention-extend programs,
+   with their actual scratch and staging admitted. Preserve causal ends,
+   per-head selection, forced local blocks and prefix/append semantics.
+
+3. **[P1] Index housekeeping scales with exported capacity, not live context.**
+   In SparkInfer `b12x/integration/cuteafd/minimax_indexer.py:169`,
+   `clear_pages` writes `rows * 4 * self.pages`; `finish_scores` at line 101
+   additionally traverses every exported score block. The 1M-context
+   export has 16,384 pages. Across 60 layers, 4096 prompt tokens therefore
+   incur 60 GiB of clear stores plus 30 GiB of score stores, even with a
+   much shorter live context. These are logical global-memory stores:
+   scratch may remain in L2, so they are not a measured DRAM-traffic figure.
+   Bound both passes by live page/block widths while retaining capacity
+   strides and initializing every value the selector can consume. Reducing
+   the runtime context limit alone does not change the exported loops.
+
+4. **[P1] BF16-to-FP32 conversion clears the entire prefill-sized buffer.**
+   `rust/crates/cuteafd-ffi/src/families/minimax.rs:306` implements
+   `widen(count)` by zeroing the full destination and then accumulating only
+   `count` values. The residual allocation is `prefill_rows * 6144 * 4`,
+   so a 4096-row capacity clears 96 MiB even for a single live row. Target
+   execution calls this once. DSpark proposal calls it eleven times
+   (`dspark.rs:164`, plus lines 178 and 185 in each of five layers), and
+   accepted-context update once (`dspark.rs:124`). A target/propose/update
+   round clears 1.21875 GiB at that capacity, independently of live rows;
+   at the trial's 1024-row capacity it still clears 312 MiB. Clear only the
+   checked `count * 4` span, or use a direct native conversion. Keep the
+   stream ordering and operand lifetime checks.
+
+5. **[P2] Small-batch kernels expose too little parallel work.**
+   SparkInfer `b12x/integration/cuteafd/minimax_attention.py:47` selects
+   one query token per decode work item. The underlying
+   `b12x/attention/paged/forward_extend_generic.py:3285` disables split-KV,
+   and its launch at line 4306 is `(work, kv_heads, 1)`. C1 therefore has
+   only four attention CTAs; each head processes up to 32 selected 64-token
+   pages serially. Add and qualify a small-batch split over selected KV
+   blocks with a stable softmax/output reduction. Separately,
+   `b12x/integration/cuteafd/_mxfp8_linear.py:18` fixes one K slice and a
+   64x128 GEMM tile. For 1-64 live rows, index-K, index-Q and KV projections
+   offer only 1, 4 and 8 useful output tiles, respectively. Qualify native
+   MXFP8 small-row kernels or K splitting. Combining the four same-input
+   attention projections is another candidate: it can remove three repeat
+   activation quantizations and three GEMM launches per layer. Preserve
+   calibrated native arithmetic and measure before selecting a route.
+
+6. **[P2] The 5090 expert fallback adds a host barrier per remote layer.**
+   `rust/crates/cuteafd-daemon/src/families/minimax_m3/routed.rs:85`
+   stages routes and activations, drains the compute stream, copies the
+   wire payload on the CPU, then receives/uploads replies. With all routed
+   layers remote, there are 57 such boundaries per target pass. Target
+   decode is also eager rather than captured. Profile these costs and
+   remove redundant copies or improve overlap with explicit ownership;
+   do not remove the barriers without replacing their lifetime guarantees.
+   This is conditional on pinned-host intake and must not be attributed
+   to the PRO 6000 device-landing path.
+
+The saved TP3/TP4 trials show TP3 ahead, but do not establish a transport
+root cause. Both log every rank on the first coordinator rail. Trial thermal
+data is a final coordinator snapshot without complete interval or Spark
+coverage. The harness's C4 `aggregate_decode_tok_s` divides completion
+tokens by whole-request wall time, so it includes prefill; some short-prompt
+TP2 TTFT measurements are prefix hits. Treat these as exploratory observations,
+not a controlled decode-only comparison or evidence that throttling was absent.
+
+Suggested order: fix live-span clearing and requested-row logits first, wire
+real prefill next, then profile small-batch kernels and transport. Qualify
+native numerics, DSpark/off continuations and exact prefix restores across
+chunk and block boundaries. Follow with one warmed same-config A/B on the
+affected card, recording emitted throughput, prefill, memory and thermal
+windows. No numerical fallback was found in the routed expert path: preserve
+the existing NVFP4 W4A4 and MXFP8 checkpoint arithmetic throughout this work.
+
+### MiniMax M3 prefill design and implementation review (2026-10-24, Gemini 4 Argon)
+
+Full file-and-line review and ranked recommendations in
+[`docs/models/minimax_m3_prefill_review.md`](docs/models/minimax_m3_prefill_review.md).
+Key findings and additions beyond the summary above:
+
+1. **`_Prefill` (`minimax_index_prefill`) has the exact same static 1M-context (`16,384`-page / `8,192`-block) bug as `_Decode`.**
+   In `third_party/sparkinfer/b12x/integration/cuteafd/minimax_indexer.py:25-40, 137-250`,
+   `_Prefill.clear_pages` zeroes `rows * 4 * 16384` floats (`1.074 GiB`/layer =
+   `64.42 GiB` (`60.0 GiB`) across 60 layers at `rows = 4096`), `_Prefill.finish_scores`
+   loops `while block < 8192` across all `rows * 4` row-heads (`536.9 MiB`/layer =
+   `32.21 GiB` (`30.0 GiB`) across 60 layers), and `_Prefill.selector` (`DSATiledTopkKernel`)
+   scans stride `8192` across `16,384` CTAs/layer. Wiring up `minimax_index_prefill`
+   without bounding `clear_pages`, `finish_scores` and `selector` by live `width`
+   in **both** `_Prefill` and `_Decode` will still write `96.64 GiB` (`90.0 GiB`)
+   of dead `-inf` padding per 4096-row chunk. In `_Decode`, `init` also sets
+   `controls[1] = 1` (`use_scalar_k_load = 1` in `dsa_indexer/kernel.py:1834-1840`),
+   forcing 1-byte scalar `Uint8` loads instead of TMA.
+2. **Per-tile `copy_h2d_ordered` reuse forces ~11,520 host `cudaEventSynchronize` stalls per 4096-row chunk.**
+   In `execution.rs:243-267`, every 64-row tile uploads into the same three
+   device pointers (`page_table`, `cache_lengths`, `cu_seqlens_q`) via
+   `NativeLibrary::copy_h2d_ordered` (`cuteafd-ffi/src/lib.rs:2584-2612`), which
+   keys its single pinned staging buffer by `(device, stream, dst.ptr)`. Because
+   tile `t + 1` records `entry.event` on `self.stream` *after* tile `t`'s
+   compute kernels, tile `t + 2`'s `cuda_event_synchronize(entry.event)` blocks
+   the host CPU thread until tile `t`'s `minimax_index_decode` and
+   `minimax_attention_decode` kernels finish on the GPU. Even on decode-tiled
+   execution, hoisting page-table and length uploads out of the 60-layer loop
+   (built once per step) eliminates all 11,520 `copy_h2d_ordered` calls, their
+   host sync stalls, and 3,840 per-tile Rust heap allocations.
+3. **`minimax_attention_decode` (`qo_len = 1`, `msa_union_tile = False`) streams up to ~125.8 GiB of KV per 4096-row chunk.**
+   Passing `cu_seqlens_q = 0..=count` (`execution.rs:258`) gives each token its
+   own 16-head CTA (`cta_tile_q = 16`, `minimax_attention.py:49-61`), loading
+   16 × 128-token KV blocks (`512 KiB`/token/layer) with zero reuse across
+   adjacent tokens. `minimax_attention_extend` (`msa_union_tile = True`,
+   `cta_tile_q = 128`) groups 8 consecutive queries per CTA and loads their
+   deduplicated sparse KV block union once (up to 8× lower KV traffic). Note
+   `minimax_attention.py:59-61` also hardcodes `use_native_fp8_qk = False`,
+   `use_native_fp8_pv = False`, and `enable_paged_kv_tma = False`.
+4. **`PinnedSpark::dispatch` drains the GPU stream *before* `ffn::dense` (the shared expert) and copies `50.33 MiB` twice on the CPU per layer.**
+   In `execution.rs:186-190` and `routed.rs:80-101`, `PinnedSpark::dispatch`
+   calls `commands.drain()?` (`routed.rs:93`) *before* `ffn::dense` is queued,
+   leaving the GPU idle while the host thread copies `50.33 MiB` of BF16
+   activations via `Bytes::copy_from_slice` (`routed.rs:96`) and copies it a
+   second time inside `ExpertProtocolV2Request::new_bytes` (`serve.rs:103`,
+   `100.66 MiB`/layer = `5.74 GiB` of CPU `memcpy` across 57 MoE layers).
+   Launching `ffn::dense` before waiting on the D2H staging event overlaps the
+   shared expert with D2H + host framing; on both 5090 and PRO 6000,
+   `prefill_lanes = 1` (`admission.rs:57`, `serve.rs:166`) also precludes
+   two-wave sub-batch overlap.
+5. **Unconditional `[rows, 200064]` FP32 `lm_head` GEMM (`execution.rs:199`) and secondary kernel costs.**
+   Besides threading `logit_rows` into `execute_through` to avoid writing
+   `3.28 GiB` (`3.05 GiB`) / `10.07 TFLOPs` of unused prefill logits:
+   - `Commands::widen` (`cuteafd-ffi/src/families/minimax.rs:310-315`) calls
+     `self.zero(destination)` (`cudaMemsetAsync`) before
+     `cuda_accumulate_bf16_to_f32_async`, doubling memory traffic on every
+     BF16 -> FP32 cast (`execution.rs:170`, `dspark.rs:124, 164, 178, 185`).
+   - `minimax_router_scores` (`_minimax_kernels.py:45`) uses SIMT
+     `SmallNGemvKernel(128, 6144)` (`rows_per_tile = 8`) instead of a Tensor
+     Core GEMM at wide prefill row counts.
+   - `Execution::update_draft` (`execution.rs:121-128`, `dspark.rs:114-137`)
+     runs `[n, 30720] -> [n, 6144]` (`~1.55 TFLOPs` at 4096 rows) plus 5 draft
+     KV projections on all prefill rows (even rows that will be overwritten by
+     the `WINDOW = 4096` ring) and adds a second synchronous `commands.drain()`.
+
+### MiniMax M3 DRY review & shared-layer consolidation (2026-10-24, Gemini 4 Argon)
+
+Full review and file-by-file consolidation roadmap: `docs/models/minimax_m3_dry_review.md` (author: Gemini 4 Argon).
+
+1. **Retire parallel device/stream/head runtime in `cuteafd-ffi/src/families/minimax.rs` and `shared/minimax_ffi.rs` (P0):**
+   - Replace `cuteafd_ffi::minimax::{on_device, Storage, Buffer, Commands, Head}` (`rust/crates/cuteafd-ffi/src/families/minimax.rs:1873-2294`) with `shared::memory::device::{Device, Allocation, Stream}` and `shared::target_head::launch` (matching `step5`).
+   - Delete `rust/crates/cuteafd-daemon/src/shared/minimax_ffi.rs` (`local`, `dispatch`, `collect` type-erasure shim) and unify `minimax_m3/routed.rs` with `step5/routed.rs`.
+2. **Unify DSpark speculation FFI, ring state & workspace sizing (P0):**
+   - Promote the duplicated `block_dspark_*` / `glmf_dspark_*` FFI bindings (`rust/crates/cuteafd-ffi/src/families/minimax/dspark.rs:2471-2554` vs `glmf_dspark.rs:1429-1569`) into `cuteafd_ffi::shared::block_dspark`.
+   - Consolidate `minimax_m3/dspark.rs` + `minimax_m3/backend.rs` (`Rings`, `context_spans`, tap staging, Markov/confidence launches) with `shared::speculation::block_dspark`, and share loader workspace math (`cuteafd-loader/src/families/minimax_m3/dspark.rs:627-637`) with `glm5::draft_representation::block_dspark_resident_bytes`.
+3. **Deduplicate page-pool wave & COW validation (P1):**
+   - Move `Step::begin` (`minimax_m3/transaction.rs:5854-5888`), `BatchView::validate` (`minimax_m3/execution.rs:437-470`), and `validate_wave` (`step5/transaction.rs:6191-6226`) into a single `PagePool::validate_wave` method in `cuteafd-engine/src/prefix/pages.rs`.
+4. **Consolidate coordinator weight slicing, gate/up fusion & `DenseLoad` (P1):**
+   - Lift `WeightSlice`, `WeightOperand`, `RankWeightLayout`, `.gate_proj.`+`.up_proj.`->`.gate_up_proj.` fusion, and TP row/col slicing (`plan/families/minimax/coordinator.rs` vs `plan/families/step5/coordinator.rs` and `minimax_m3/weights.rs:7681-7700`) into `cuteafd-loader/src/plan/layout/`, and move `load_operand` / `load_records` into `shared::experts::rtx::dense`.
+5. **Consolidate `run_serve`, vision `ReadyVision::load` / `TowerSpec` packing, golden harness & XML tool parser helpers (P1-P2):**
+   - Extract shared `run_serve` (`minimax_m3/serve.rs` vs `step5/serve.rs`, `qwen4/serve.rs`, `mimo_v2/serve.rs`), `ReadyVision::load` + `TowerPacker` (`minimax_m3/media.rs` & `shared/vision/minimax.rs` vs `glm5_flash` & `qwen4`), golden panel/metric/prefix helpers (`minimax_m3/golden.rs` vs `step5/golden.rs`), and chat snapshot/XML parser helpers (`cuteafd-api/src/openai/chat/minimax_m3*` vs `step5`, `qwen4`, `glm5`).
