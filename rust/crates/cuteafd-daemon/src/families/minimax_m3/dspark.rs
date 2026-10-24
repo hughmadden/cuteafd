@@ -104,15 +104,29 @@ impl<'a> Dspark<'a> {
         c.launch(&c.projection(projection,rows), &[input,self.layer(layer,&format!("{stem}.weight"))?,
             self.layer(layer,&format!("{stem}.weight_scale_inv"))?,s.get("scratch")?,output], &[Scalar::I32(rows as i32),Scalar::I32(0)])
     }
-    pub fn tap(&self,c:&Commands<'a>,layer:usize,residual:&Buffer<'a>,rows:usize)->Result<()> {
+    /// Taps `rows` residual rows (batch rows from `first`) at a target layer.
+    pub fn tap(&self,c:&Commands<'a>,layer:usize,residual:&Buffer<'a>,first:usize,rows:usize)->Result<()> {
         let Some(index)=TARGET_LAYERS.iter().position(|&l|l==layer) else {return Ok(())};
-        ensure!(rows<=self.layout.rows,MiniMaxError::Invalid("draft tap capacity"));
+        ensure!(first+rows<=self.layout.rows,MiniMaxError::Invalid("draft tap capacity"));
         c.narrow(residual,self.get("tap")?,rows*H)?;
-        c.copy_rows(&self.get("taps")?.view(index*H*2,self.get("taps")?.raw().bytes-index*H*2)?,5*H*2,
+        let at=(first*5+index)*H*2;
+        c.copy_rows(&self.get("taps")?.view(at,self.get("taps")?.raw().bytes-at)?,5*H*2,
             self.get("tap")?,H*2,H*2,rows)
     }
     pub fn update(&self,c:&Commands<'a>,s:&Scratch<'a>,rows:&[ContextRow])->Result<()> {
         if rows.is_empty() {return Ok(())}
+        // A program launch takes at most `capacity` rows: a prefill chunk of
+        // several lanes updates in pieces, in row order (each row is its own).
+        let capacity=c.capacity("minimax_kv_split")?;
+        let first=rows.iter().map(|r|r.tap_row).min().unwrap();
+        let last=rows.iter().map(|r|r.tap_row).max().unwrap();
+        for start in (first..=last).step_by(capacity) {
+            let piece=rows.iter().filter(|r|(start..start+capacity).contains(&r.tap_row)).copied().collect::<Vec<_>>();
+            if !piece.is_empty() { self.update_rows(c,s,&piece)?; }
+        }
+        Ok(())
+    }
+    fn update_rows(&self,c:&Commands<'a>,s:&Scratch<'a>,rows:&[ContextRow])->Result<()> {
         let first=rows.iter().map(|r|r.tap_row).min().unwrap();
         let last=rows.iter().map(|r|r.tap_row).max().unwrap();
         ensure!(last<self.layout.rows && rows.iter().all(|r|r.slot<self.layout.slots),MiniMaxError::Invalid("draft context rows"));

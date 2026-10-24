@@ -315,47 +315,23 @@ impl RecordGuard {
 }
 
 const MAX_RANKS: usize = crate::shared::spark_intake::MAX_INTAKE_RANKS;
-/// Lanes a long Spark prefill chunk splits into by default, and at most (`--prefill-lanes`; each
-/// lane's GPU layers run while the other lanes' Spark waves are in flight, one transport per
-/// lane), and the fewest rows per lane worth another exchange per layer.
-pub(crate) const DEFAULT_PREFILL_LANES: usize = 2;
-pub(crate) const MAX_PREFILL_LANES: usize = 4;
-const MIN_LANE_ROWS: usize = 256;
+// Prefill lanes are shared with MiniMax M3 (`cuteafd_loader::serving_capacity::prefill_lanes`);
+// GLM's lanes cut on MLA pages.
+pub(crate) use cuteafd_loader::serving_capacity::prefill_lanes::{DEFAULT_PREFILL_LANES, MAX_PREFILL_LANES};
+use cuteafd_loader::serving_capacity::prefill_lanes::{self as lane_plans, single_pass_rows};
+// GLM's lane tests read the shared rule through these names.
+#[cfg_attr(not(test), allow(unused_imports))]
+use cuteafd_loader::serving_capacity::prefill_lanes::MIN_LANE_ROWS;
 
-/// The longest chunk `lanes` lanes of `rows` rows take. Multi-lane splits must land on MLA page
-/// boundaries. A narrow workspace still accepts a single unpadded tail, but cannot advertise
-/// unusable padding.
 fn prefill_lane_capacity(lanes: usize, rows: usize) -> usize {
-    rows.max(lanes * (rows / PAGE_ROWS) * PAGE_ROWS)
+    lane_plans::lane_capacity(lanes, rows, PAGE_ROWS)
 }
 
-/// How a chunk of `tokens` rows runs on up to `lanes` lanes of `rows` rows: (lanes, rows per
-/// lane). One lane per `MIN_LANE_ROWS` rows, at most `lanes`, and at least as many as the rows
-/// need once each lane's share is rounded up to whole MLA pages: every lane but the last holds
-/// the same number of pages, so each lane's pools and pages start where the previous lane's end.
-/// Two lanes keep the rule they always had: two from twice `MIN_LANE_ROWS` rows (or when one
-/// lane cannot hold the chunk), cut at the middle rounded up to a page.
+#[cfg_attr(not(test), allow(dead_code))]
 fn prefill_lane_plan(tokens: usize, lanes: usize, rows: usize) -> Result<(usize, usize)> {
-    ensure!(tokens > 0 && tokens <= prefill_lane_capacity(lanes, rows),
-        "prefill of {tokens} tokens exceeds {lanes} lanes of {rows} rows");
-    let mut wanted = (tokens / MIN_LANE_ROWS).clamp(1, lanes.max(1)).max(tokens.div_ceil(rows.max(1)));
-    let per_lane = loop {
-        let per_lane = if wanted == 1 { tokens } else { tokens.div_ceil(wanted).next_multiple_of(PAGE_ROWS) };
-        if per_lane <= rows || wanted >= lanes {
-            break per_lane;
-        }
-        wanted += 1;
-    };
-    ensure!(per_lane <= rows, "prefill lane of {per_lane} tokens exceeds {rows} rows");
-    Ok((tokens.div_ceil(per_lane), per_lane))
+    Ok(lane_plans::lane_plan(tokens, lanes, rows, PAGE_ROWS)?)
 }
 const HC: usize = 4;
-
-/// The longest chunk a lone prefill runs as one step: pipelined Spark lanes ([`prefill_lane_plan`])
-/// cut a chunk into two lanes from twice `MIN_LANE_ROWS` rows; a serial prefill takes `rows`.
-fn single_pass_rows(pipelined: bool, lanes: usize, rows: usize) -> usize {
-    if pipelined && lanes > 1 { (2 * MIN_LANE_ROWS - 1).min(rows) } else { rows }
-}
 
 /// What a packed pass's `on_logits` returns for one sequence ([`GlmfEngine::prefill_packed`]):
 /// `Err` is a failure the pass shares (the engine's), which ends it for every sequence;
@@ -488,7 +464,7 @@ pub(crate) enum Experts<'a> {
     LocalExl3(LocalExl3<'a>),
     /// Spark ranks serving the routed experts over RoCE (one BF16 partial per
     /// rank); one transport per prefill lane (decode uses the first).
-    Spark { transports: RefCell<Vec<SparkLink<'a>>>, runtime: tokio::runtime::Runtime },
+    Spark { transports: RefCell<crate::shared::prefill_lanes::LaneLinks<SparkLink<'a>>>, runtime: tokio::runtime::Runtime },
     /// Profiling only: the router, the wire rows and the shared expert run,
     /// the routed experts contribute nothing (the coordinator's own work).
     Skip,
@@ -3324,8 +3300,7 @@ impl<'a> GlmfEngine<'a> {
 
     /// The rows of each lane a pipelined prefill of `tokens` rows runs in, in order.
     pub(crate) fn prefill_cuts(&self, tokens: usize) -> Result<Vec<usize>> {
-        let (_, per_lane) = prefill_lane_plan(tokens, self.prefill_lane_count, self.prefill_rows)?;
-        Ok((0..tokens).step_by(per_lane).map(|first| per_lane.min(tokens - first)).collect())
+        Ok(lane_plans::lane_cuts(tokens, self.prefill_lane_count, self.prefill_rows, PAGE_ROWS)?)
     }
 
     /// Whether prefill runs in admitted lanes (a transport per lane only for Spark homes).

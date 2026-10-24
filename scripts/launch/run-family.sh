@@ -218,8 +218,8 @@ PROFILE_SPARK_NSYS_GPU_METRICS
 EOF
     [[ "$1" != kimi_k3 ]] || printf '%s\n' KV_CACHE RTX_EXPERT_LAYERS SPECULATOR_MODEL_ID SPECULATOR_MODEL_REVISION SPECULATOR_DRAFTS
     [[ "$1" != step5 ]] || printf '%s\n' SPECULATOR_DEPTH KV_CACHE
-    [[ "$1" != minimax_m3 ]] || printf '%s\n' KV_CACHE RTX_EXPERT_LAYERS PREFILL_BATCH_TOKENS MEDIA_CACHE_BYTES VISION_REPLICAS \
-      HOST_CACHE_STORE SPECULATOR_DRAFTS DRAFT_POLICY DRAFT_ROW_COST
+    [[ "$1" != minimax_m3 ]] || printf '%s\n' KV_CACHE RTX_EXPERT_LAYERS PREFILL_BATCH_TOKENS PREFILL_LANES MEDIA_CACHE_BYTES \
+      VISION_REPLICAS HOST_CACHE_STORE SPECULATOR_DRAFTS DRAFT_POLICY DRAFT_ROW_COST
     _spark_slot_keys HOST LANE_A
     return
   fi
@@ -1690,11 +1690,15 @@ if [[ "$family" == minimax_m3 ]]; then
   [[ "$backend" != local && "$ranks" =~ ^[234]$ ]] ||
     release_die "MiniMax requires Spark TP2, TP3 or TP4"
   minimax_concurrency="$(get CONCURRENCY 64)"
+  # PREFILL_LANES (1-4) lanes of PREFILL_BATCH_TOKENS rows take each prefill chunk, every lane
+  # with its own Spark exchange in flight (the engine's default: two lanes of 4096).
   minimax_prefill_rows="$(get PREFILL_BATCH_TOKENS 4096)"
+  minimax_prefill_lanes="$(get PREFILL_LANES 2)"
   [[ "$minimax_concurrency" =~ ^[1-9][0-9]*$ && "$minimax_concurrency" -le 64 ]] ||
     release_die "MiniMax CONCURRENCY must be 1..64"
   [[ "$minimax_prefill_rows" =~ ^[1-9][0-9]*$ && "$minimax_prefill_rows" -le 4096 ]] ||
     release_die "MiniMax PREFILL_BATCH_TOKENS must be 1..4096"
+  [[ "$minimax_prefill_lanes" =~ ^[1-4]$ ]] || release_die "MiniMax PREFILL_LANES must be 1 to 4"
   [[ "$minimax_concurrency" -le "$minimax_prefill_rows" ]] ||
     release_die "MiniMax CONCURRENCY must not exceed PREFILL_BATCH_TOKENS"
   minimax_context="$(get MAX_CONTEXT_TOKENS 0)"
@@ -1710,7 +1714,7 @@ if [[ "$family" == minimax_m3 ]]; then
     minimax_plan_args=(--deployment --rtx 1 --spark-ranks "$ranks" --available-sparks "$ranks"
       --attention-placement auto --speculator off --kv-cache "$minimax_kv_cache"
       --coordinator-gpu-budget-gib "$minimax_budget" --coordinator-weight-budget-gib "$minimax_budget"
-      --concurrency "$minimax_concurrency" --prefill-rows "$minimax_prefill_rows"
+      --concurrency "$minimax_concurrency" --prefill-rows "$minimax_prefill_rows" --prefill-lanes "$minimax_prefill_lanes"
       --mapped-scale-preload-gib "$(get MAPPED_SCALE_PRELOAD_GIB 0)"
       --prefix-cache-entries "$(get PREFIX_CACHE_ENTRIES 20)" --host-cache-bytes "$(get HOST_CACHE_BYTES auto)"
       --pool-tokens "$minimax_pool" --context-tokens "$minimax_context"
@@ -2110,7 +2114,7 @@ if ((qualifying)) || [[ "$family" == minimax_m3 ]]; then
 fi
 if [[ "$family" == minimax_m3 ]]; then
   family_args+=(--kv-cache "$minimax_kv_cache" --rtx-expert-layers "$minimax_local_layers"
-    --speculator "$speculator" --prefill-batch-tokens "$minimax_prefill_rows")
+    --speculator "$speculator" --prefill-batch-tokens "$minimax_prefill_rows" --prefill-lanes "$minimax_prefill_lanes")
 fi
 if [[ $family == kimi_k3 ]]; then
   kv_cache="$(get KV_CACHE fp8)"
@@ -2718,7 +2722,7 @@ audio_encoder_hash=""
     plan_draft_args+=(--kv-cache "$kv_cache")
   fi
   if [[ "$family" == minimax_m3 ]]; then
-    plan_draft_args+=(--kv-cache "$minimax_kv_cache" --prefill-rows "$minimax_prefill_rows")
+    plan_draft_args+=(--kv-cache "$minimax_kv_cache" --prefill-rows "$minimax_prefill_rows" --prefill-lanes "$minimax_prefill_lanes")
   fi
   if [[ "$family" == glm5 || "$family" == glm5_flash || "$family" == mimo_v2 ]]; then
     plan_draft_args+=(--draft-kv-cache "$draft_kv_cache")

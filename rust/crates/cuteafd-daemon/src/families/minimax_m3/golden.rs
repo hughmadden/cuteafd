@@ -260,10 +260,10 @@ fn completed(directory: &Path, binding: &Value, full: bool) -> Result<Option<Val
 
 struct DenseOnly;
 impl<'a> ExpertExecutor<'a> for DenseOnly {
-    fn dispatch(&mut self, _: usize, _: usize, _: &Buffer<'a>, _: &Buffer<'a>, _: &Buffer<'a>, _: &Commands<'a>) -> Result<()> {
+    fn dispatch(&mut self, _: usize, _: usize, _: usize, _: &Buffer<'a>, _: &Buffer<'a>, _: &Buffer<'a>, _: &Commands<'a>) -> Result<()> {
         Err(MiniMaxError::Invalid("unexpected routed layer in dense-only golden").into())
     }
-    fn collect(&mut self, _: usize, _: usize, _: &Buffer<'a>, _: &Commands<'a>) -> Result<()> {
+    fn collect(&mut self, _: usize, _: usize, _: usize, _: &Buffer<'a>, _: &Commands<'a>) -> Result<()> {
         Err(MiniMaxError::Invalid("unexpected routed collect in dense-only golden").into())
     }
 }
@@ -466,7 +466,8 @@ pub(crate) async fn run_golden(args: GoldenArgs) -> Result<()> {
     let context = windows.iter().map(|w| w.tokens.len()).max().unwrap().div_ceil(64) * 64;
     ensure!(!args.check_prefix || windows[0].tokens.len() >= 66, "prefix qualification needs 66 tokens in first window");
     let sizing = admission::RuntimeSizing {rows:args.prefill_rows as usize, decode_rows:(args.prefill_rows as usize).min(64),
-        sequences:1, context:context as u64, spark_ranks:args.peers.len(), logit_rows:args.prefill_rows as usize};
+        sequences:1, context:context as u64, spark_ranks:args.peers.len(), logit_rows:args.prefill_rows as usize, lanes:1,
+        host_landing:!args.peers.is_empty() && super::routed::host_landing(&library)?};
     let program_sizes = admission::ProgramSizes::from_manifest(&read_json(&args.manifest)?, sizing)?;
     let ledger = admission::RuntimeLedger::new(&cfg, sizing, &program_sizes)?;
     let package = crate::shared::experts::fp8::package_directory(native, 1, cuteafd_loader::formats::fp8_experts::ExpertFormat::Nvfp4);
@@ -504,7 +505,7 @@ pub(crate) async fn run_golden(args: GoldenArgs) -> Result<()> {
     let source = EmbedSource::new(&args.snapshot, &tensor.shard, &tensor.meta, cfg.hidden)?;
     let (embedding, (execution, local)) = crate::shared::placement::load_while_admitting(pending, || {
         TokenEmbedding::load(&library, source, EmbedPlacement::Gpu, || {
-            let execution = Execution::load(device, &programs, &checkpoint, &cfg, &ledger)?;
+            let execution = Execution::load(device, &programs, &checkpoint, &cfg, &ledger, sizing)?;
             let local = if args.expert_layers.is_empty() {None} else {
                 let tensors = catalog.fp8().context("MiniMax expert catalog missing")?.for_coordinator();
                 Some(crate::shared::experts::fp8::Fp8Experts::load(&library, &tensors, &package,
@@ -518,7 +519,7 @@ pub(crate) async fn run_golden(args: GoldenArgs) -> Result<()> {
     let spark = if let Some(&first) = remote.first() {
         cuteafd_transport::worker_selection::require_peer_clients(&args.peers, endpoint, 1)?;
         Some(super::routed::Spark::connect(&library, args.device, SparkWorld::canonical(args.peers.len())?, &args.peers,
-            sizing.rows, config, first, super::serve::request)?)
+            sizing.rows, config, first, super::serve::request, 1, sizing.host_landing)?)
     } else {None};
     let experts: Box<dyn ExpertExecutor<'_>> = if local.is_none() && spark.is_none() {Box::new(DenseOnly)}
         else {Box::new(Routed::new(local, spark)?)};

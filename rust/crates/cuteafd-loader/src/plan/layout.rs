@@ -333,7 +333,7 @@ pub fn spark_endpoints(family: &str, lanes: u64) -> usize {
     match family {
         "deepseek_v41" | "deepseek_v4" => 2,
         "glm5" => 1 + if lanes > 1 { lanes as usize } else { 0 },
-        "glm5_flash" | "mimo_v2" => lanes as usize,
+        "glm5_flash" | "mimo_v2" | "minimax_m3" => lanes as usize,
         "qwen4" => 1,
         _ => 0,
     }
@@ -1197,8 +1197,8 @@ pub(crate) fn charge_host(report: &mut PlanReport, options: &LayoutOptions, chec
     let lanes = match family {
         "glm5" => if options.prefill_lanes > 0 { options.prefill_lanes } else {
             glm_prefill_lanes(std::env::var("CUTEAFD_GLM_PREFILL_LANES").ok().as_deref()) as u64 },
-        "glm5_flash" => if options.prefill_lanes > 0 { options.prefill_lanes }
-            else { crate::serving_capacity::GLMF_DEFAULT_PREFILL_LANES },
+        "glm5_flash" | "minimax_m3" => if options.prefill_lanes > 0 { options.prefill_lanes }
+            else { crate::serving_capacity::prefill_lanes::DEFAULT_PREFILL_LANES as u64 },
         "mimo_v2" => {
             let cfg = crate::families::mimo_v2::MimoV2Config::from_hf(&checkpoint.config)?;
             let configured = if options.prefill_lanes > 0 { Some(options.prefill_lanes.to_string()) }
@@ -1222,7 +1222,7 @@ pub(crate) fn charge_host(report: &mut PlanReport, options: &LayoutOptions, chec
             topk: u32::try_from(topk)?, intermediate: u32::try_from(spec.moe.as_ref().unwrap().intermediate)?,
             layers: u32::try_from(spec.layers.len())? };
         let endpoints = spark_endpoints(family, lanes);
-        let bf16 = native || matches!(family, "glm5" | "qwen4");
+        let bf16 = native || matches!(family, "glm5" | "qwen4" | "minimax_m3");
         let ingress = if native { SparkIngress::Fp8K32 } else if bf16 { SparkIngress::Bf16 }
             else { SparkIngress::Fp8K32 };
         let endpoint = SparkEndpoint { capacity: u32::try_from(rows)?, ingress };

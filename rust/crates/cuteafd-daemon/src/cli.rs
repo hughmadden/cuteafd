@@ -378,7 +378,7 @@ pub(crate) struct PlanArgs {
     /// Include the diagnostic all-row prefill head reservation in --layout.
     #[arg(long)]
     pub(crate) full_prefill_logits: bool,
-    /// Prefill lanes for --layout (GLM 5.3 Flash; 0: the family default).
+    /// Prefill lanes for --layout (GLM 5.3 Flash, MiniMax M3; 0: the family default).
     #[arg(long, default_value_t = 0)]
     pub(crate) prefill_lanes: u64,
     /// Decode and verify step rows for --layout (GLM 5.3 Flash's --decode-rows: 64, or 128 with the

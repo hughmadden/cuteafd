@@ -234,20 +234,24 @@ fn exact_layout(model: &Model, input: &crate::plan::PlanInput, report: &mut Plan
     ensure!(report.audio == MediaMode::Off, AdmissionError::Unsupported("audio"));
     let cfg = model.cfg();
     let rows = if opts.prefill_rows == 0 { 4096 } else { usize::try_from(opts.prefill_rows)? };
+    let lanes = if opts.prefill_lanes == 0 { crate::serving_capacity::prefill_lanes::DEFAULT_PREFILL_LANES }
+        else { usize::try_from(opts.prefill_lanes)? };
     let sequences = if opts.concurrency == 0 { 64 } else { usize::try_from(opts.concurrency)? };
     ensure!(opts.state_slots.is_none_or(|n| n == sequences as u64), AdmissionError::Unsupported("sequence-slot mismatch"));
     let rings = opts.draft_context_slots.map_or(Ok(crate::families::minimax_m3::dspark::default_ring_slots(sequences)),
         usize::try_from)?;
     ensure!((1..=sequences).contains(&rings), AdmissionError::Unsupported("draft context slots outside 1..=max sequences"));
     let arch = ArchContext::coordinator(opts.rtx_bytes[0], None);
+    let chunk = crate::serving_capacity::prefill_lanes::lane_capacity(lanes, rows, crate::families::minimax_m3::cache::PAGE_ROWS as usize);
     let draft = if opts.native_mtp_layers > 0 {
         let contract = DsparkContract::open(&input.checkpoint().snapshot).context("MiniMax bundled DSpark")?;
-        Some(DraftMemory::new(&contract, rings, rows, opts.physical_sms.unwrap_or(arch.sms) as usize)?)
+        Some(DraftMemory::new(&contract, rings, chunk, opts.physical_sms.unwrap_or(arch.sms) as usize)?)
     } else { None };
     let draft_rows = draft.as_ref().map_or(0, |d| d.sequences * 7);
     let sizing = RuntimeSizing { rows, decode_rows: rows.min(64), sequences, context: if opts.context_tokens == 0 {
         cfg.max_position as u64 } else { opts.context_tokens }, spark_ranks: requested.spark_ranks(),
-        logit_rows: RuntimeSizing::head_rows(rows, opts.full_prefill_logits, draft_rows) };
+        logit_rows: RuntimeSizing::head_rows(chunk, opts.full_prefill_logits, draft_rows), lanes,
+        host_landing: !arch.gpu_landing };
     sizing.validate(cfg)?;
     let manifest: serde_json::Value = serde_json::from_slice(&std::fs::read(path).context("MiniMax PROGRAMS.json")?)?;
     let programs = admission::ProgramSizes::from_manifest(&manifest, sizing)?;
@@ -281,10 +285,10 @@ fn exact_layout(model: &Model, input: &crate::plan::PlanInput, report: &mut Plan
     let vision_scratch = if vision_source > 0 { crate::plan::layout::minimax_vision_scratch_bytes() } else { 0 };
     let spark_vision_reserve = if matches!(report.vision, MediaMode::Spark(_)) {
         vision_weights + vision_scratch + GIB } else { 0 };
-    let endpoints = [cuteafd_core::SparkEndpoint { capacity: u32::try_from(rows)?, ingress: cuteafd_core::SparkIngress::Bf16 }];
+    let endpoints = vec![cuteafd_core::SparkEndpoint { capacity: u32::try_from(rows)?, ingress: cuteafd_core::SparkIngress::Bf16 }; lanes];
     let rings = cuteafd_core::SparkRings { max_frame_bytes: 64 << 20, depth: 8, slot_bytes: 8 << 20, alignment: 4096 };
     let working = |onboard: usize| SparkWorkingSet { rtx_layers: layers[..onboard].to_vec(),
-        spark_layers: layers[onboard..].to_vec(), spark_ranks: sizing.spark_ranks, prefill_lanes: 1 };
+        spark_layers: layers[onboard..].to_vec(), spark_ranks: sizing.spark_ranks, prefill_lanes: lanes as u64 };
     let io = working(0).rank_endpoints_io(0, catalog.routed_experts().geometry()?, &endpoints, rings)?;
     let io_bytes = io.intake + io.host_exchange + io.row_indices + io.endpoint_staging + io.mapped_rings;
     let spark_overhead = io_bytes + spark_scratch + cuteafd_core::memory_layout::SPARK_RUNTIME_RESIDUAL_BYTES;
@@ -379,13 +383,14 @@ fn exact_layout(model: &Model, input: &crate::plan::PlanInput, report: &mut Plan
         *report.bytes_by_owner.entry("routed expert weights".into()).or_default() += assigned.resident_bytes;
         memory.devices.push(DeviceLayout { kind: DeviceKind::Spark, index: rank as u32, capacity_bytes: budget, items, kv_tokens: 0 });
     }
-    memory.notes.push(format!("MiniMax shape: prefill {rows}, sequences {sequences}, decode tile {}, context {}; exported scratch is not scaled by runtime rows",
-        programs.decode_capacity(), sizing.context));
+    memory.notes.push(format!("MiniMax shape: prefill {lanes} lanes of {rows} rows, sequences {sequences}, decode tile {}, context {}, Spark partials land in {}; exported scratch is not scaled by runtime rows",
+        programs.decode_capacity(), sizing.context, if sizing.host_landing { "pinned host planes" } else { "GPU planes" }));
     if opts.host_embedding {
         report.bytes_by_owner.insert("host-mapped embedding".into(), edge(Component::Embedding));
         memory.notes.push("embedding placement: host (mapped BF16); untied LM head remains on GPU".into());
     }
     report.prefill_rows = Some(rows as u64);
+    report.prefill_lanes = Some(lanes as u64);
     report.attention_placement = AttentionPlacement::Heads;
     report.encoder = Some(encoder);
     if spark_manifest.is_none() { memory.notes.push("Remote expert scratch reserves 512 MiB per rank until measured worker admission; it is not an exact remote allocation ledger".into()); }

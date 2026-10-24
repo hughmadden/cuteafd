@@ -163,7 +163,8 @@ fn native_manifest_uses_shared_allocation_ledger() {
     assert!(!memory.notes.iter().any(|n| n.contains("header lower bound")));
     let rtx = memory.devices.iter().find(|d| d.kind == DeviceKind::Rtx).unwrap();
     let item = |name: &str| rtx.items.iter().find(|i| i.group == name).unwrap();
-    assert_eq!(item("MiniMax residual").bytes, 256 * 6144 * 4);
+    // Two lanes of 256 rows by default: the per-row buffers hold their 512-row chunk.
+    assert_eq!(item("MiniMax residual").bytes, 2 * 256 * 6144 * 4);
     // Every program shares the scratch arena; the prefill scorer's is the largest.
     assert_eq!(item("MiniMax scratch").bytes, 134_799_872);
     assert!(rtx.used_bytes() <= PRO_TOTAL_BYTES);
@@ -197,8 +198,8 @@ fn native_manifest_admits_bundled_dspark_and_charges_its_full_layout() {
     let on = plan::plan(dir.path(), &options).unwrap();
     assert!(on.placement_supported && on.wip_launchable(), "{:?}", on.hints);
     let contract = DsparkContract::open(dir.path()).unwrap();
-    // Sixteen sequences share the default eight context rings.
-    let draft = DraftMemory::new(&contract, crate::families::minimax_m3::dspark::default_ring_slots(16), 256, 188).unwrap();
+    // Sixteen sequences share the default eight context rings; the taps hold a two-lane chunk.
+    let draft = DraftMemory::new(&contract, crate::families::minimax_m3::dspark::default_ring_slots(16), 2 * 256, 188).unwrap();
     assert_eq!(draft.slots, 8);
     let rtx = |report: &crate::plan::PlanReport| report.memory_layout.as_ref().unwrap().devices.iter()
         .find(|d| d.kind == DeviceKind::Rtx).unwrap().clone();
@@ -208,7 +209,7 @@ fn native_manifest_admits_bundled_dspark_and_charges_its_full_layout() {
     let graphs = |device: &cuteafd_core::memory_layout::DeviceLayout| device.items.iter()
         .filter(|i| ["graphs", crate::placement::inventory::GRAPH_GROWTH].contains(&i.group.as_str())).map(|i| i.bytes).sum::<u64>();
     let sizing = |sequences| admission::RuntimeSizing { rows: 256, decode_rows: 64, sequences, context: 1 << 20,
-        spark_ranks: 3, logit_rows: 64 };
+        spark_ranks: 3, logit_rows: 64, lanes: crate::serving_capacity::prefill_lanes::DEFAULT_PREFILL_LANES, host_landing: false };
     assert_eq!(graphs(&off_rtx), admission::decode_graphs(sizing(16), 0).unwrap().inventory.bytes(0));
     assert_eq!(graphs(&on_rtx), admission::decode_graphs(sizing(16), draft.slots).unwrap().inventory.bytes(0));
     assert_eq!(on_rtx.used_bytes() - off_rtx.used_bytes(), draft.bytes + graphs(&on_rtx) - graphs(&off_rtx));
@@ -225,7 +226,7 @@ fn native_manifest_admits_bundled_dspark_and_charges_its_full_layout() {
     options.layout.as_mut().unwrap().concurrency = 1;
     let refused = plan::plan(dir.path(), &options).unwrap();
     assert!(!refused.placement_supported);
-    assert!(refused.hints.iter().any(|h| h.what.contains("7..4096 rows")), "{:?}", refused.hints);
+    assert!(refused.hints.iter().any(|h| h.what.contains("7..16384 rows")), "{:?}", refused.hints);
     options.layout.as_mut().unwrap().prefill_rows = 256;
     options.layout.as_mut().unwrap().concurrency = 16;
     options.layout.as_mut().unwrap().drafter_bytes = 1;
@@ -286,8 +287,10 @@ fn native_tp2_auto_vision_preserves_text_admission() {
     assert!(memory.devices.iter().all(|d| d.used_bytes() <= d.capacity_bytes));
     assert!(memory.notes.iter().any(|n| n.starts_with("2 routed layers on the RTX")));
     assert!(!report.hints.iter().any(|h| h.what.starts_with("routed experts need ")));
-    // Logits cover decode rows, not every prefill row, so 4096-row prefill fits too.
+    // Logits cover decode rows, not every prefill row, so a 4096-row prefill chunk fits too
+    // (one lane: two lanes of 4096 rows hold twice the per-row buffers).
     options.layout.as_mut().unwrap().prefill_rows = 4096;
+    options.layout.as_mut().unwrap().prefill_lanes = 1;
     let wide = plan::plan(dir.path(), &options).unwrap();
     assert!(wide.wip_launchable(), "{:?}", wide.hints);
     assert!(wide.memory_layout.as_ref().unwrap().pool_tokens < memory.pool_tokens);
@@ -311,6 +314,35 @@ fn native_5090_options(dir: &std::path::Path, ranks: usize) -> PlanOptions {
     layout.physical_sms = Some(170);
     layout.native_mtp_layers = 5;
     options
+}
+
+/// The Spark intake each lane's device link allocates: GPU planes on a card the NIC can land in;
+/// on a GeForce card one GPU row per rank plus pinned host planes. Per rank these are the
+/// runtime's own memory ledger (24 Oct, TP2 on the 5090, one lane of 4096 rows): device
+/// `spark-intake` 24,576 B and pinned `spark-intake` 100,663,296 B for two ranks.
+#[test]
+fn spark_intake_is_charged_where_each_card_lands_it() {
+    let dir = snapshot(false, false);
+    let intake = |report: &crate::plan::PlanReport| {
+        assert!(report.placement_supported, "{:?}", report.hints);
+        let gpu = report.memory_layout.as_ref().unwrap().devices.iter().find(|d| d.kind == DeviceKind::Rtx).unwrap()
+            .items.iter().find(|i| i.group == "MiniMax spark_intake").unwrap().bytes;
+        let host = report.host_ledger.as_ref().unwrap().items.iter().find(|i| i.group == "spark-intake").unwrap().bytes;
+        (gpu, host)
+    };
+    let (ranks, gpu_row, host_plane) = (3, 24_576 / 2, 100_663_296 / 2);
+    for lanes in [1u64, 2] {
+        let mut options = native_5090_options(dir.path(), ranks);
+        let layout = options.layout.as_mut().unwrap();
+        (layout.prefill_rows, layout.prefill_lanes, layout.native_mtp_layers) = (4096, lanes, 0);
+        (layout.concurrency, layout.context_tokens, layout.pool_tokens) = (16, 65536, Some(65536));
+        let geforce = plan::plan(dir.path(), &options).unwrap();
+        assert_eq!(intake(&geforce), (lanes * ranks as u64 * gpu_row, lanes * ranks as u64 * host_plane),
+            "{lanes} lanes on the 5090");
+        options.layout.as_mut().unwrap().rtx_bytes = vec![PRO_TOTAL_BYTES];
+        let pro = plan::plan(dir.path(), &options).unwrap();
+        assert_eq!(intake(&pro).0, lanes * ranks as u64 * host_plane, "{lanes} lanes on the PRO 6000 land on the GPU");
+    }
 }
 
 #[test]
