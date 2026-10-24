@@ -7,6 +7,7 @@
 #include "steer_rows_one.h"
 #include <atomic>
 #include <mutex>
+#include <limits>
 
 namespace {
 constexpr int kDevices = 32;
@@ -61,21 +62,33 @@ int ensure_loaded(cudaStream_t stream) {
   return load_device(device);
 }
 
+// All device row offsets are signed Int64; validate before multiplication.
+bool row_span(int32_t rows, int64_t ld, int32_t h, int bytes) {
+  const int64_t max_elements = std::numeric_limits<int64_t>::max() / bytes;
+  return rows <= 1 || ld <= (max_elements - h) / (rows - 1);
+}
+
 bool aligned16(const void* p) { return (reinterpret_cast<uintptr_t>(p) & 15) == 0; }
 }  // namespace
 
-extern "C" int cuteafd_steer_rows_load(void) {
+extern "C" int cuteafd_steer_rows_abi_version(void) {
+  return CUTEAFD_STEER_ROWS_ABI_VERSION;
+}
+
+extern "C" int cuteafd_steer_rows_load_v2(void) {
   int device = -1;
   if (auto status = current_device(&device)) return status;
   return load_device(device);
 }
 
-extern "C" int cuteafd_steer_rows(__nv_bfloat16* x, int64_t ld, int32_t rows, int32_t h,
-    const int32_t* vidx, const float* a, const float* b, const int32_t* k, int32_t k_max,
+extern "C" int cuteafd_steer_rows_v2(__nv_bfloat16* x, int64_t ld, int32_t rows, int32_t h,
+    const int32_t* vidx, const float* a, const float* b, const int32_t* k, int32_t k_max, int32_t variants,
     cudaStream_t stream) {
   if (rows < 0 || h < 128 || h > 8192 || h % 128 || ld < h || ld % 8 || k_max < 1 || k_max > 32)
     return cudaErrorInvalidValue;
+  if (variants < 1 || variants > 7) return cudaErrorInvalidValue;
   if (rows == 0) return 0;
+  if (!row_span(rows, ld, h, 2)) return cudaErrorInvalidValue;
   if (!x || !vidx || !a || !b || !k || !aligned16(x) || !aligned16(a) || !aligned16(b))
     return cudaErrorInvalidValue;
   if (auto status = ensure_loaded(stream)) return status;
@@ -85,18 +98,20 @@ extern "C" int cuteafd_steer_rows(__nv_bfloat16* x, int64_t ld, int32_t rows, in
   auto* tb = const_cast<float*>(b);
   auto* tk = const_cast<int32_t*>(k);
   if (k_max == 1)
-    return cute_dsl_cuteafd_steer_rows_one_wrapper(&module_one, x, v, ta, tb, tk, ld, rows, h, k_max, stream);
+    return cute_dsl_cuteafd_steer_rows_one_wrapper(&module_one, x, v, ta, tb, tk, ld, rows, h, k_max, variants, stream);
   return cute_dsl_cuteafd_steer_rows_general_wrapper(&module_general, x, v, ta, tb, tk, ld, rows, h, k_max,
-      stream);
+      variants, stream);
 }
 
-extern "C" int cuteafd_add_rows(__nv_bfloat16* y, int64_t ld_y, const float* d, int64_t ld_d, int32_t rows,
-    int32_t h, const int32_t* vidx, const int32_t* on, cudaStream_t stream) {
+extern "C" int cuteafd_add_rows_v2(__nv_bfloat16* y, int64_t ld_y, const float* d, int64_t ld_d, int32_t rows,
+    int32_t h, const int32_t* vidx, const int32_t* on, int32_t variants, cudaStream_t stream) {
   if (rows < 0 || h < 8 || h > 65536 || h % 8 || ld_y < h || ld_y % 8 || ld_d < h || ld_d % 4)
     return cudaErrorInvalidValue;
+  if (variants < 1 || variants > 7) return cudaErrorInvalidValue;
   if (rows == 0) return 0;
+  if (!row_span(rows, ld_y, h, 2) || !row_span(rows, ld_d, h, 4)) return cudaErrorInvalidValue;
   if (!y || !d || !vidx || !on || !aligned16(y) || !aligned16(d)) return cudaErrorInvalidValue;
   if (auto status = ensure_loaded(stream)) return status;
   return cute_dsl_cuteafd_add_rows_f32_wrapper(&module_add, y, const_cast<float*>(d),
-      const_cast<int32_t*>(vidx), const_cast<int32_t*>(on), ld_y, ld_d, rows, h, stream);
+      const_cast<int32_t*>(vidx), const_cast<int32_t*>(on), ld_y, ld_d, rows, h, variants, stream);
 }

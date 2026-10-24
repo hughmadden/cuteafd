@@ -16,9 +16,9 @@ import re
 import sys
 
 STEER_POINTERS = ("x", "vidx", "a", "b", "k")
-STEER_SCALARS = (("ld", "int64_t"), ("rows", "int32_t"), ("h", "int32_t"), ("k_max", "int32_t"))
+STEER_SCALARS = (("ld", "int64_t"), ("rows", "int32_t"), ("h", "int32_t"), ("k_max", "int32_t"), ("variants", "int32_t"))
 ADD_POINTERS = ("y", "d", "vidx", "on")
-ADD_SCALARS = (("ld_y", "int64_t"), ("ld_d", "int64_t"), ("rows", "int32_t"), ("h", "int32_t"))
+ADD_SCALARS = (("ld_y", "int64_t"), ("ld_d", "int64_t"), ("rows", "int32_t"), ("h", "int32_t"), ("variants", "int32_t"))
 # (stem, pointers, scalars); the BF16-delta add_rows form is compiled on request only.
 PROGRAMS = (("steer_rows_one", STEER_POINTERS, STEER_SCALARS),
             ("steer_rows_general", STEER_POINTERS, STEER_SCALARS),
@@ -51,6 +51,8 @@ def main():
     from b12x._lib.compiler import compile as b12x_compile
     from b12x.integration.cuteafd import steer_rows
 
+    if steer_rows.ABI_VERSION != 2:
+        raise ValueError("steer_rows export requires bounded ABI v2")
     destination = args.output_dir
     destination.mkdir(parents=True, exist_ok=True)
     for stem, pointer_names, scalar_types in PROGRAMS:
@@ -60,13 +62,13 @@ def main():
         kind, form = stem.rsplit("_", 1)
         if kind == "steer_rows":
             operands, launch = steer_rows.OPERANDS, steer_rows.steer_rows_launch(form)
-            scalars = (cutlass.Int64(1), cutlass.Int32(1), cutlass.Int32(128), cutlass.Int32(1))
-            geometry = dict(form=form, threads=steer_rows.THREADS, max_hidden=steer_rows.MAX_HIDDEN,
+            scalars = (cutlass.Int64(1), cutlass.Int32(1), cutlass.Int32(128), cutlass.Int32(1), cutlass.Int32(1))
+            geometry = dict(abi_version=steer_rows.ABI_VERSION, form=form, threads=steer_rows.THREADS, max_hidden=steer_rows.MAX_HIDDEN,
                             max_k=1 if form == "one" else steer_rows.MAX_K, hidden_multiple=128)
         else:
             operands, launch = steer_rows.add_rows_operands(form), steer_rows.add_rows_launch(form)
-            scalars = (cutlass.Int64(8), cutlass.Int64(8), cutlass.Int32(1), cutlass.Int32(8))
-            geometry = dict(form=form, threads=steer_rows.ADD_THREADS, hidden_multiple=8)
+            scalars = (cutlass.Int64(8), cutlass.Int64(8), cutlass.Int32(1), cutlass.Int32(8), cutlass.Int32(1))
+            geometry = dict(abi_version=steer_rows.ABI_VERSION, form=form, threads=steer_rows.ADD_THREADS, hidden_multiple=8)
         pointers = [make_ptr(o.cute_dtype, 16, cute.AddressSpace.gmem, assumed_align=o.align)
                     for o in operands]
         program = b12x_compile(launch, *pointers, *scalars, cuda.CUstream(0))
@@ -86,7 +88,7 @@ def main():
         manifest = dict(schema=1, sparkinfer_revision=_pinned_sparkinfer.REVISION,
             source_tree_sha256=_pinned_sparkinfer.LOCK_DATA["source_tree_sha256"],
             capability=list(capability), geometry=geometry,
-            abi=dict(pointers=list(pointer_names), scalars=[n for n, _ in scalar_types], stream="stream"),
+            abi=dict(version=steer_rows.ABI_VERSION, pointers=list(pointer_names), scalars=[n for n, _ in scalar_types], stream="stream"),
             artifacts=artifacts)
         manifest_path.write_text(json.dumps(manifest, indent=2) + "\n")
         print(manifest_path, flush=True)

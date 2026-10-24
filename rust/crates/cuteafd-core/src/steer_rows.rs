@@ -1,7 +1,7 @@
 //! Host reference for the weight-variant row steering kernel
 //! (`cuteafd_steer_rows`, weight-variants contract section 4).
 //!
-//! For each row with `v = vidx[r] > 0` and `kv = min(k[v], k_max) > 0`:
+//! For each row with `0 < v = vidx[r] <= V` and `kv = min(k[v], k_max) > 0`:
 //! `t_j = sum_h b[v][j][h] x[h]`, then
 //! `x[h] = bf16_rne(x[h] - sum_j a[v][j][h] t_j)`. Other rows are untouched.
 //! The reduction order copies the SparkInfer export exactly, so the kernel
@@ -27,6 +27,7 @@ pub const STEER_MAX_HIDDEN: usize = 8192;
 pub const STEER_HIDDEN_MULTIPLE: usize = 128;
 /// Largest `k_max` (the `k_max == 1` export is the fast path).
 pub const STEER_MAX_K: usize = 32;
+pub const STEER_MAX_VARIANTS: usize = 7;
 
 const LANES: usize = 32;
 const WARPS: usize = STEER_THREADS / LANES;
@@ -104,11 +105,13 @@ fn dot(b: &[f32], x: &[f32], h: usize) -> f32 {
 }
 
 /// Applies the steering to `rows` BF16 rows of `x` (`[rows, ld]`, bits) in
-/// place. `a` and `b` are `[V+1][k_max][h]`, `k` is `[V+1]`; slot 0 is unused.
+/// place. `a` and `b` are `[V+1][k_max][h]`, `k` is exactly `[V+1]`;
+/// slice `k` to its initialized extent, excluding allocation padding. V is in
+/// 1..=7; slot 0 and holes are initialized. Invalid indices are no-ops before
+/// reading tables or row data.
 ///
 /// # Panics
-/// On a shape [`check_steer_shape`] rejects, a short slice, or a
-/// `vidx` value at or beyond `k.len()`.
+/// On a shape [`check_steer_shape`] rejects, an invalid table extent, or short slices.
 #[allow(clippy::too_many_arguments)]
 pub fn steer_rows_ref(x: &mut [u16], ld: usize, rows: usize, h: usize, vidx: &[i32],
     a: &[f32], b: &[f32], k: &[i32], k_max: usize) {
@@ -116,13 +119,14 @@ pub fn steer_rows_ref(x: &mut [u16], ld: usize, rows: usize, h: usize, vidx: &[i
         panic!("{err}");
     }
     assert!(vidx.len() >= rows, "vidx holds {} rows, needs {rows}", vidx.len());
+    assert!((2..=STEER_MAX_VARIANTS + 1).contains(&k.len()), "k must hold V+1 entries, V in 1..=7");
     let table = k.len() * k_max * h;
     assert!(a.len() >= table && b.len() >= table, "steer tables must hold [V+1][k_max][h]");
     debug_assert_eq!(WARPS * LANES, STEER_THREADS);
     let mut values = vec![0.0f32; h];
     let mut t = vec![0.0f32; k_max];
     for (r, &v) in vidx[..rows].iter().enumerate() {
-        if v <= 0 {
+        if v <= 0 || v as usize >= k.len() {
             continue;
         }
         let v = v as usize;
@@ -150,17 +154,18 @@ pub fn steer_rows_ref(x: &mut [u16], ld: usize, rows: usize, h: usize, vidx: &[i
 
 /// Host reference of `cuteafd_add_rows`: `y[r][i] = bf16_rne(y[r][i] +
 /// d[r][i])` on the first `h` columns of each row with `v = vidx[r] > 0` and
-/// `on[v] != 0`; other rows are untouched. One FP32 add per element.
+/// `v <= V` and `on[v] != 0`; other rows are untouched. One FP32 add per element.
+/// `on` is exactly `[V+1]`, V in 1..=7, excluding allocation padding.
 ///
 /// # Panics
-/// On short slices, `ld_y < h`, `ld_d < h`, or a `vidx` value at or beyond
-/// `on.len()`.
+/// On short slices, `ld_y < h`, `ld_d < h`, or an invalid `on` extent.
 #[allow(clippy::too_many_arguments)]
 pub fn add_rows_ref(y: &mut [u16], ld_y: usize, d: &[f32], ld_d: usize, rows: usize, h: usize,
     vidx: &[i32], on: &[i32]) {
     assert!(ld_y >= h && ld_d >= h && vidx.len() >= rows, "add_rows_ref shape");
+    assert!((2..=STEER_MAX_VARIANTS + 1).contains(&on.len()), "on must hold V+1 entries, V in 1..=7");
     for (r, &v) in vidx[..rows].iter().enumerate() {
-        if v <= 0 || on[v as usize] == 0 {
+        if v <= 0 || v as usize >= on.len() || on[v as usize] == 0 {
             continue;
         }
         let delta = &d[r * ld_d..r * ld_d + h];
@@ -264,5 +269,52 @@ mod tests {
             assert_eq!(y[ld_y + i], want);
         }
         assert_eq!(y[ld_y + h..2 * ld_y], original[ld_y + h..2 * ld_y]);
+    }
+
+    #[test]
+    fn invalid_indices_are_noops_before_table_or_row_access() {
+        let indices = [0, -1, i32::MIN, 2, 7, 8, 63, i32::MAX];
+        // Only V=1 is initialized. In particular 2 and 7 are invalid despite
+        // being in the supported maximum range. Empty rows prove they aren't read.
+        let table = vec![f32::NAN; 2 * 128];
+        steer_rows_ref(&mut [], 128, indices.len(), 128, &indices, &table, &table, &[99, 1], 1);
+        add_rows_ref(&mut [], 8, &[], 8, indices.len(), 8, &indices, &[99, 1]);
+    }
+
+    #[test]
+    fn invalid_and_base_rows_preserve_all_bf16_bits_in_mixed_batches() {
+        // Include signed zero, subnormals, infinities and NaN payloads. A
+        // floating-point roundtrip on an untouched row would change some bits.
+        for variants in [1, 3, 7] {
+            for k_max in [1, 2, 19, 32] {
+                let (h, ld) = (128, 136);
+                let indices = [0, -1, i32::MIN, variants as i32 + 1, 63, i32::MAX, 1];
+                let mut rows: Vec<u16> = (0..indices.len() * ld).map(|i| i as u16).collect();
+                for (i, bits) in [0x8000, 0x7f81, 0xffc3, 0x7f80, 0xff80].into_iter().enumerate() {
+                    rows[i * ld] = bits;
+                }
+                // Finite active row with an exactly representable edit.
+                rows[6 * ld..7 * ld].fill(0x3f80);
+                let original = rows.clone();
+                let table = vec![0.125; (variants + 1) * k_max * h];
+                let mut k = vec![0; variants + 1];
+                k[0] = i32::MAX; // slot 0 must be ignored, even when nonzero
+                k[1] = i32::MAX; // clamp, while retaining the k_max table stride
+                steer_rows_ref(&mut rows, ld, indices.len(), h, &indices, &table, &table, &k, k_max);
+                assert_eq!(rows[..6 * ld], original[..6 * ld]);
+                assert_eq!(rows[6 * ld + h..], original[6 * ld + h..]);
+                assert_ne!(rows[6 * ld..6 * ld + h], original[6 * ld..6 * ld + h]);
+
+                let mut added = original.clone();
+                let mut on = vec![0; variants + 1];
+                on[0] = 99;
+                on[1] = -1; // any nonzero switch enables a delta
+                add_rows_ref(&mut added, ld, &vec![0.5; indices.len() * ld], ld,
+                    indices.len(), h, &indices, &on);
+                assert_eq!(added[..6 * ld], original[..6 * ld]);
+                assert_eq!(added[6 * ld + h..], original[6 * ld + h..]);
+                assert!(added[6 * ld..6 * ld + h].iter().all(|&x| x == 0x3fc0));
+            }
+        }
     }
 }

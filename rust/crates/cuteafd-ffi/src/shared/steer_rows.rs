@@ -10,10 +10,37 @@ use cuteafd_core::steer_rows::check_steer_shape;
 use std::ffi::c_void;
 
 type LoadFn = unsafe extern "C" fn() -> i32;
+type AbiFn = unsafe extern "C" fn() -> i32;
+pub const STEER_ROWS_ABI_VERSION: i32 = 2;
 type SteerFn = unsafe extern "C" fn(*mut u16, i64, i32, i32, *const i32, *const f32, *const f32,
-    *const i32, i32, *mut c_void) -> i32;
+    *const i32, i32, i32, *mut c_void) -> i32;
 type AddFn = unsafe extern "C" fn(*mut u16, i64, *const f32, i64, i32, i32, *const i32, *const i32,
-    *mut c_void) -> i32;
+    i32, *mut c_void) -> i32;
+
+// Resolve identity before calling a loader or accepting any launch entry point.
+fn check_abi(library: &libloading::Library) -> Result<()> {
+    // SAFETY: the identity entry point has no arguments and returns an integer.
+    let version = unsafe {
+        library.get::<AbiFn>(b"cuteafd_steer_rows_abi_version")
+            .context("native library lacks bounded steer_rows ABI v2; rebuild with CUTEAFD_ENABLE_STEER_ROWS_AOT")?()
+    };
+    check_abi_version(version)
+}
+
+fn check_abi_version(version: i32) -> Result<()> {
+    ensure!(version == STEER_ROWS_ABI_VERSION,
+        "native steer_rows ABI {version}, expected {STEER_ROWS_ABI_VERSION}; rebuild the native library");
+    Ok(())
+}
+
+fn check_row_span(rows: usize, ld: usize, h: usize, bytes: usize) -> Result<()> {
+    ensure!(i64::try_from(ld).is_ok(), "row stride exceeds the native Int64 ABI");
+    let span = if rows == 0 { Some(0) } else {
+        (rows - 1).checked_mul(ld).and_then(|v| v.checked_add(h)).and_then(|v| v.checked_mul(bytes))
+    };
+    ensure!(span.is_some_and(|v| i64::try_from(v).is_ok()), "row byte span exceeds the native Int64 ABI");
+    Ok(())
+}
 
 /// The launch shape: `rows` rows of `x` (`[rows, ld]` BF16, first `h`
 /// columns), tables `[variants + 1][k_max][h]` FP32 and `k` `[variants + 1]`.
@@ -23,7 +50,8 @@ pub struct SteerRowsShape {
     pub h: usize,
     pub ld: usize,
     pub k_max: usize,
-    /// Configured variants V (table slots 1..=V; slot 0 is base).
+    /// Actual initialized variants V, never rounded allocation capacity.
+    /// Table slots 0..=V (including holes) are initialized before binding.
     pub variants: usize,
 }
 
@@ -47,6 +75,7 @@ impl SteerRowsShape {
         ensure!((1..=7).contains(&self.variants), "steer_rows variants={} must be in 1..=7", self.variants);
         ensure!(i32::try_from(self.rows).is_ok() && i64::try_from(self.ld).is_ok(),
             "steer_rows rows={} ld={} exceed the native ABI", self.rows, self.ld);
+        check_row_span(self.rows, self.ld, self.h, 2)?;
         Ok(())
     }
 }
@@ -62,11 +91,12 @@ impl NativeLibrary {
     /// Binds the steering kernel and loads it onto the current device, so a
     /// later launch never loads a module (safe inside graph capture).
     pub fn steer_rows(&self) -> Result<SteerRows<'_>> {
+        check_abi(&self.lib)?;
         // SAFETY: symbol types match native/shared/include/cuteafd_steer_rows.h.
         let (load, steer) = unsafe {
-            (*self.lib.get::<LoadFn>(b"cuteafd_steer_rows_load")
+            (*self.lib.get::<LoadFn>(b"cuteafd_steer_rows_load_v2")
                 .context("native library lacks cuteafd_steer_rows_load (CUTEAFD_ENABLE_STEER_ROWS_AOT)")?,
-             *self.lib.get::<SteerFn>(b"cuteafd_steer_rows")
+             *self.lib.get::<SteerFn>(b"cuteafd_steer_rows_v2")
                 .context("native library lacks cuteafd_steer_rows (CUTEAFD_ENABLE_STEER_ROWS_AOT)")?)
         };
         // SAFETY: the loader takes no arguments and only loads static modules.
@@ -88,7 +118,8 @@ impl SteerRows<'_> {
     /// # Safety
     /// `stream` is a live stream on the binding device, current when called.
     /// The buffers stay allocated until the stream passes this launch, and
-    /// `x` does not overlap the other operands.
+    /// `x` does not overlap the other operands. Tables and shape metadata stay
+    /// immutable through graph retirement; only `vidx` changes between replays.
     #[allow(clippy::too_many_arguments)]
     pub unsafe fn launch(&self, x: CuteafdDeviceBuffer, vidx: CuteafdDeviceBuffer, a: CuteafdDeviceBuffer,
         b: CuteafdDeviceBuffer, k: CuteafdDeviceBuffer, shape: SteerRowsShape, stream: *mut c_void) -> Result<()> {
@@ -118,7 +149,7 @@ impl SteerRows<'_> {
         // SAFETY: the caller's contract; the native entry point re-checks shape and alignment.
         let status = unsafe {
             (self.steer)(x, shape.ld as i64, shape.rows as i32, shape.h as i32, vidx, a, b, k,
-                shape.k_max as i32, stream)
+                shape.k_max as i32, shape.variants as i32, stream)
         };
         ensure!(status == 0, "cuteafd_steer_rows ({} rows, h {}, k_max {}) failed with CUDA status {status}",
             shape.rows, shape.h, shape.k_max);
@@ -151,6 +182,8 @@ impl AddRowsShape {
             "add_rows ld_y={} (>= h, multiple of 8) or ld_d={} (>= h, multiple of 4) is invalid", self.ld_y, self.ld_d);
         ensure!((1..=7).contains(&self.variants), "add_rows variants={} must be in 1..=7", self.variants);
         ensure!(i32::try_from(self.rows).is_ok(), "add_rows rows={} exceeds the native ABI", self.rows);
+        check_row_span(self.rows, self.ld_y, self.h, 2)?;
+        check_row_span(self.rows, self.ld_d, self.h, 4)?;
         Ok(())
     }
 }
@@ -166,11 +199,12 @@ impl NativeLibrary {
     /// Binds the delta add and loads the weight-variant programs onto the
     /// current device (safe inside a later graph capture).
     pub fn add_rows(&self) -> Result<AddRows<'_>> {
+        check_abi(&self.lib)?;
         // SAFETY: symbol types match native/shared/include/cuteafd_steer_rows.h.
         let (load, add) = unsafe {
-            (*self.lib.get::<LoadFn>(b"cuteafd_steer_rows_load")
+            (*self.lib.get::<LoadFn>(b"cuteafd_steer_rows_load_v2")
                 .context("native library lacks cuteafd_steer_rows_load (CUTEAFD_ENABLE_STEER_ROWS_AOT)")?,
-             *self.lib.get::<AddFn>(b"cuteafd_add_rows")
+             *self.lib.get::<AddFn>(b"cuteafd_add_rows_v2")
                 .context("native library lacks cuteafd_add_rows (CUTEAFD_ENABLE_STEER_ROWS_AOT)")?)
         };
         // SAFETY: the loader takes no arguments and only loads static modules.
@@ -191,7 +225,8 @@ impl AddRows<'_> {
     /// # Safety
     /// `stream` is a live stream on the binding device, current when called;
     /// the buffers stay allocated until the stream passes this launch, and
-    /// `y` does not overlap the other operands.
+    /// `y` does not overlap the other operands. `on`, the initialized bound V
+    /// and layout metadata remain immutable through graph retirement.
     pub unsafe fn launch(&self, y: CuteafdDeviceBuffer, d: CuteafdDeviceBuffer, vidx: CuteafdDeviceBuffer,
         on: CuteafdDeviceBuffer, shape: AddRowsShape, stream: *mut c_void) -> Result<()> {
         shape.check()?;
@@ -216,7 +251,8 @@ impl AddRows<'_> {
         shape.check()?;
         // SAFETY: the caller's contract; the native entry point re-checks shape and alignment.
         let status = unsafe {
-            (self.add)(y, shape.ld_y as i64, d, shape.ld_d as i64, shape.rows as i32, shape.h as i32, vidx, on, stream)
+            (self.add)(y, shape.ld_y as i64, d, shape.ld_d as i64, shape.rows as i32, shape.h as i32,
+                vidx, on, shape.variants as i32, stream)
         };
         ensure!(status == 0, "cuteafd_add_rows ({} rows, h {}) failed with CUDA status {status}", shape.rows, shape.h);
         Ok(())
@@ -249,6 +285,37 @@ mod tests {
         assert!(AddRowsShape { h: 4100, ..shape }.check().is_err());
         assert!(AddRowsShape { ld_d: 4098, ..shape }.check().is_err());
         assert!(AddRowsShape { ld_y: 4100, ..shape }.check().is_err());
+        assert!(AddRowsShape { variants: 0, ..shape }.check().is_err());
+        assert!(AddRowsShape { variants: 8, ..shape }.check().is_err());
+    }
+
+    #[test]
+    fn shapes_reject_unrepresentable_device_offsets() {
+        let huge = (i64::MAX as usize) & !7;
+        let steer = SteerRowsShape { rows: 2, h: 128, ld: huge, k_max: 1, variants: 1 };
+        assert!(steer.check().is_err());
+        assert!(SteerRowsShape { rows: i32::MAX as usize + 1, ld: 128, ..steer }.check().is_err());
+        let add = AddRowsShape { rows: 2, h: 8, ld_y: 8, ld_d: 8, variants: 1 };
+        assert!(AddRowsShape { ld_y: huge, ..add }.check().is_err());
+        assert!(AddRowsShape { ld_d: huge, ..add }.check().is_err());
+    }
+
+    #[test]
+    fn only_bounded_abi_v2_is_accepted() {
+        for version in [-1, 0, 1, 3, i32::MAX] {
+            assert!(check_abi_version(version).is_err());
+        }
+        assert!(check_abi_version(STEER_ROWS_ABI_VERSION).is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn missing_abi_identity_is_rejected_before_loading_modules() {
+        // The test executable exports no native steering ABI. Opening it does
+        // not initialize CUDA and must fail on the version check itself.
+        let library: libloading::Library = libloading::os::unix::Library::this().into();
+        let error = check_abi(&library).unwrap_err();
+        assert!(error.to_string().contains("lacks bounded steer_rows ABI v2"));
     }
 }
 
