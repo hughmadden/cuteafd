@@ -85,12 +85,13 @@ __global__ void minimax_rope(const float* qkv,const float* bias,const int32_t* t
     if(d<78) {
       int pair=d%39,other=i+(d<39?39:-39);
       float angle=float(thw[global*3+pair/13])*inv[pair%13];
-      float co=round_bf16(cosf(angle)),si=round_bf16(sinf(angle)),sign=d<39?-1.f:1.f;
+      float co=cosf(angle),si=sinf(angle),sign=d<39?-1.f:1.f;
       float aq=round_bf16(src[other]+bias[other]);
       float bk=round_bf16(src[1280+other]+bias[1280+other]);
-      // The official BF16 rotary computes two rounded products, then their sum.
-      a=round_bf16(__fmul_rn(a,co))+round_bf16(__fmul_rn(sign*aq,si));
-      b=round_bf16(__fmul_rn(b,co))+round_bf16(__fmul_rn(sign*bk,si));
+      // MiniMax's serving applier (sglang _minimax_rope_applier) rotates the BF16 q/k in
+      // FP32 with FP32 cos/sin and rounds once, at the store below.
+      a=a*co+sign*aq*si;
+      b=b*co+sign*bk*si;
     }
     q[size_t(global)*1280+i]=bf16_bits(a);k[size_t(global)*1280+i]=bf16_bits(b);
     v[size_t(global)*1280+i]=bf16_bits(src[2560+i]+bias[2560+i]);

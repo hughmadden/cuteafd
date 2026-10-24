@@ -75,14 +75,13 @@ def test_axial_rope_frequencies_and_passthrough(torch):
     torch.testing.assert_close(rotated, expected, rtol=0, atol=0)
 
 
-def test_bfloat16_rope_rounds_each_product(torch):
+def test_bfloat16_rope_rotates_in_fp32_and_rounds_once(torch):
     x = torch.linspace(-2, 2, 80, dtype=torch.bfloat16).reshape(1, 1, 80)
-    cos, sin = reference.rotary_factors([(1, 3, 7)], torch.bfloat16)
+    cos, sin = reference.rotary_factors([(1, 3, 7)], torch.float32)
     actual = reference.apply_rope(x, cos, sin)
-    a = (x[..., :39].float() * cos[:, None, :39].float()).bfloat16()
-    b = (x[..., 39:78].float() * sin[:, None, :39].float()).bfloat16()
+    expected = (x[..., :39].float() * cos[:, None, :39] - x[..., 39:78].float() * sin[:, None, :39]).bfloat16()
     assert actual.dtype == torch.bfloat16
-    assert torch.equal(actual[..., :39], a - b)
+    assert torch.equal(actual[..., :39], expected)
     assert torch.equal(actual[..., 78:], x[..., 78:])
 
 

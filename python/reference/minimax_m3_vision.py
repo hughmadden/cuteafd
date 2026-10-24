@@ -50,13 +50,18 @@ def rotary_factors(positions, dtype, head_dim=80, theta=10000.0):
 
 
 def apply_rope(x, cos, sin):
-    """Rotate all 78 leading channels as two halves; preserve the two-channel tail."""
+    """Rotate all 78 leading channels as two halves; preserve the two-channel tail.
+
+    MiniMax's serving applier (sglang ``_minimax_rope_applier``) rotates in FP32 with
+    FP32 cos/sin and rounds the result once to the activation dtype.
+    """
     import torch
     _cpu(x, cos, sin)
     width = cos.shape[-1]
-    first, second = x[..., :width // 2], x[..., width // 2:width]
+    rot = x[..., :width].float()
+    first, second = rot[..., :width // 2], rot[..., width // 2:]
     rotated = torch.cat((-second, first), dim=-1)
-    return torch.cat((x[..., :width] * cos[:, None, :] + rotated * sin[:, None, :],
+    return torch.cat(((rot * cos.float()[:, None, :] + rotated * sin.float()[:, None, :]).to(x.dtype),
                       x[..., width:]), dim=-1)
 
 
@@ -86,7 +91,7 @@ def encoder_layer(hidden, weights, positions, *, heads=16, eps=1e-5):
     norm = _norm(hidden, weights, "layer_norm1", eps)
     q, k, v = (_linear(norm, weights, "self_attn." + name + "_proj")
                .reshape(tokens, heads, width // heads) for name in ("q", "k", "v"))
-    cos, sin = rotary_factors(positions, hidden.dtype, width // heads)
+    cos, sin = rotary_factors(positions, torch.float32, width // heads)
     q, k = apply_rope(q, cos, sin), apply_rope(k, cos, sin)
     scores = (q.transpose(0, 1) @ k.transpose(0, 1).transpose(-1, -2)) / math.sqrt(width // heads)
     probabilities = torch.softmax(scores.float(), dim=-1).to(hidden.dtype)
