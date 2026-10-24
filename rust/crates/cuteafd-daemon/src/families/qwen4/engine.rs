@@ -1803,6 +1803,12 @@ impl<'a> Qwen4Engine<'a> {
         owners
     }
 
+    /// Every execution owner's (device, stream): the streams that read and write its KV pages
+    /// and GDN state (prefix copies fence against them).
+    pub(crate) fn owner_streams(&self) -> Vec<(i32, *mut c_void)> {
+        self.gdn_banks.iter().map(|bank| (bank.device.id, bank.stream)).collect()
+    }
+
     pub(crate) fn state_stream(&self, device: i32) -> Result<*mut c_void> {
         self.gdn_banks.iter().find(|bank| bank.device.id == device)
             .map(|bank| bank.stream).context("Qwen snapshot device without an execution stream")
