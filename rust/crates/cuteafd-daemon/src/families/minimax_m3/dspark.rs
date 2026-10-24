@@ -4,7 +4,8 @@ use super::{ffn, head::TargetHeadOwner, native::Native, scratch::Scratch, weight
 use crate::shared::{memory::device::Allocation, prefix::view, qwen::scheduler,
     speculation::dflash::{ContextRow, Draft, DraftSeq}, token_io::TokenEmbedding};
 use anyhow::{ensure, Context, Result};
-use cuteafd_ffi::{programs::Scalar, CuteafdDeviceBuffer, NativeLibrary};
+use cuteafd_ffi::{block_dspark::{check_operand as check, disjoint, extent, DraftHeads}, programs::Scalar,
+    CuteafdDeviceBuffer, NativeLibrary};
 use cuteafd_loader::{families::minimax_m3::dspark::{DraftMemory, DsparkContract, PREFIX, TARGET_LAYERS},
     plan::checkpoint::Checkpoint};
 use std::collections::BTreeMap;
@@ -93,7 +94,10 @@ impl<'a> Dspark<'a> {
         let caches=(0..5).map(|_|Ok((Allocation::new(device,layout.ring_plane_bytes)?,
             Allocation::new(device,layout.ring_plane_bytes)?))).collect::<Result<_>>()?;
         let draft=Self {weights,buffers,caches,layout};
-        draft_markov_norms(native,draft.weight("markov_head.markov_w2.weight")?,draft.get("markov_norms")?,VOCAB)?;
+        let (w2,norms)=(draft.weight("markov_head.markov_w2.weight")?,draft.get("markov_norms")?);
+        native.check_device(&[w2,norms])?;
+        // SAFETY: the drafter owns both buffers; the drain below completes the kernel.
+        unsafe { native.library().dspark_markov_norms(w2,norms,VOCAB,native.raw())? };
         native.drain()?;
         Ok(draft)
     }
@@ -204,9 +208,11 @@ impl<'a> Dspark<'a> {
         }
         ffn::norm(n,s.get("residual")?,self.weight("final_norm.weight")?,s.get("norm")?,rows)?;
         head.project(n,target,s,s.get("norm")?,rows)?;
-        draft_heads(n,s.get("logits")?,self.weight("markov_head.markov_w1.weight")?,self.weight("markov_head.markov_w2.weight")?,
-            self.get("markov_norms")?,s.get("norm")?,self.weight("confidence_head.proj.weight")?,self.weight("confidence_head.proj.bias")?,
-            (self.get("anchors")?,&anchors),self.get("tokens")?,self.get("markov_workspace")?,self.get("confidence")?,count,BLOCK,VOCAB)?;
+        let heads=DraftHeads { w1:self.weight("markov_head.markov_w1.weight")?, w2:self.weight("markov_head.markov_w2.weight")?,
+            norms:self.get("markov_norms")?, weight:self.weight("confidence_head.proj.weight")?,
+            bias:self.weight("confidence_head.proj.bias")? };
+        draft_heads(n,&heads,s.get("logits")?,s.get("norm")?,(self.get("anchors")?,&anchors),self.get("tokens")?,
+            self.get("markov_workspace")?,self.get("confidence")?,count)?;
         let tokens=download(n,self.get("tokens")?,rows*4)?;
         let confidence=download(n,self.get("confidence")?,rows*4)?;
         let tokens=tokens.chunks_exact(4).map(|b|u32::from_le_bytes(b.try_into().unwrap())).collect::<Vec<_>>();
@@ -217,38 +223,13 @@ impl<'a> Dspark<'a> {
     }
 }
 
-const HIDDEN: usize = H;
-const RANK: usize = 256;
 const HEADS: usize = 64;
 const KV_HEADS: usize = 4;
 const HEAD_DIM: usize = 128;
 
-fn extent(factors: &[usize]) -> Result<usize> {
-    factors.iter().try_fold(1usize, |n, &factor| n.checked_mul(factor)
-        .ok_or_else(|| MiniMaxError::Invalid("draft extent overflow").into()))
-}
-
 fn scalar(value: usize) -> Result<()> {
     ensure!(value > 0 && value <= i32::MAX as usize,
         MiniMaxError::Invalid("draft scalar is outside the native range"));
-    Ok(())
-}
-
-fn check(buffer: CuteafdDeviceBuffer, bytes: usize, alignment: usize) -> Result<()> {
-    ensure!(bytes <= buffer.bytes && (bytes == 0 || !buffer.ptr.is_null()),
-        MiniMaxError::Invalid("draft buffer extent"));
-    ensure!(buffer.ptr as usize % alignment == 0,
-        MiniMaxError::Invalid("draft buffer alignment"));
-    ensure!((buffer.ptr as usize).checked_add(bytes).is_some(),
-        MiniMaxError::Invalid("draft pointer extent overflow"));
-    Ok(())
-}
-
-fn disjoint(a: CuteafdDeviceBuffer, a_bytes: usize, b: CuteafdDeviceBuffer, b_bytes: usize) -> Result<()> {
-    check(a,a_bytes,1)?; check(b,b_bytes,1)?;
-    let (a_start,b_start)=(a.ptr as usize,b.ptr as usize);
-    ensure!(a_bytes == 0 || b_bytes == 0 || a_start+a_bytes <= b_start || b_start+b_bytes <= a_start,
-        MiniMaxError::Invalid("draft buffers overlap"));
     Ok(())
 }
 
@@ -353,48 +334,20 @@ fn draft_attention(n: &Native<'_>, q: CuteafdDeviceBuffer, k: CuteafdDeviceBuffe
         sequences,block,HEADS,KV_HEADS,capacity,max_keys,WINDOW,(HEAD_DIM as f32).sqrt().recip(),false,n.raw()) }
 }
 
-fn draft_markov_norms(n: &Native<'_>, w2: CuteafdDeviceBuffer, norms: CuteafdDeviceBuffer, vocab: usize) -> Result<()> {
-    draft_rows(1,1,vocab)?;
-    let (weight_bytes,norm_bytes)=(extent(&[vocab,RANK,2])?,extent(&[vocab,4])?);
-    check(w2,weight_bytes,16)?; check(norms,norm_bytes,4)?;
-    disjoint(w2,weight_bytes,norms,norm_bytes)?;
-    n.check_device(&[w2,norms])?;
-    // SAFETY: the fixed rank, native grid bound and distinct live extents are checked.
-    unsafe { n.library().glmf_dspark_markov_norms(w2.ptr,norms.ptr,vocab,RANK,n.raw()) }
-}
-
-/// Run both heads together so confidence consumes only the bounded Markov result.
+/// The shared draft heads over the block's `sequences * 7` rows, from each
+/// sequence's (checked, then uploaded) anchor.
 #[allow(clippy::too_many_arguments)]
-fn draft_heads(n: &Native<'_>, logits: CuteafdDeviceBuffer, w1: CuteafdDeviceBuffer, w2: CuteafdDeviceBuffer,
-    norms: CuteafdDeviceBuffer, hidden: CuteafdDeviceBuffer, weight: CuteafdDeviceBuffer, bias: CuteafdDeviceBuffer,
+fn draft_heads(n: &Native<'_>, heads: &DraftHeads, logits: CuteafdDeviceBuffer, hidden: CuteafdDeviceBuffer,
     anchors: (CuteafdDeviceBuffer, &[u32]), tokens: CuteafdDeviceBuffer, workspace: CuteafdDeviceBuffer,
-    output: CuteafdDeviceBuffer, sequences: usize, block: usize, vocab: usize) -> Result<()> {
-    let rows=draft_rows(sequences,block,vocab)?;
-    anchor_ids(anchors.1,sequences,vocab)?;
-    let library=n.library();
-    let workspace_bytes=library.glmf_dspark_markov_workspace(sequences,block)?;
-    let operands=[logits,w1,w2,norms,hidden,weight,bias,anchors.0,tokens,workspace,output];
-    let sizes=[extent(&[rows,vocab,4])?,extent(&[vocab,RANK,2])?,extent(&[vocab,RANK,2])?,
-        extent(&[vocab,4])?,extent(&[rows,HIDDEN,2])?,(HIDDEN+RANK)*2,2,sequences*4,rows*4,
-        workspace_bytes,rows*4];
-    for (i,buffer) in operands.iter().enumerate() {
-        let alignment=match i {1|2=>16,4..=6=>2,_=>4};
-        check(*buffer,sizes[i],alignment)?;
-    }
-    for out in 7..operands.len() { for input in 0..out {
-        disjoint(operands[out],sizes[out],operands[input],sizes[input])?;
-    } }
-    n.check_device(&operands)?;
+    confidence: CuteafdDeviceBuffer, sequences: usize) -> Result<()> {
+    draft_rows(sequences,BLOCK,VOCAB)?;
+    anchor_ids(anchors.1,sequences,VOCAB)?;
+    n.check_device(&[logits,heads.w1,heads.w2,heads.norms,hidden,heads.weight,heads.bias,anchors.0,tokens,workspace,confidence])?;
     n.upload(anchors.0,&anchors.1.iter().flat_map(|value|value.to_ne_bytes()).collect::<Vec<_>>())?;
-    // SAFETY: checked anchors and native token bounds guard every indexed read; all buffers are live.
-    // Invalid proposals fall back to a bounded token before the confidence launch.
-    unsafe { library.glmf_dspark_markov(logits.ptr,
-        w1.ptr,w2.ptr,norms.ptr,anchors.0.ptr,tokens.ptr,workspace.ptr,
-        sequences,block,vocab,RANK,n.raw())? };
-    // SAFETY: the live Markov result bounds previous-token reads; checked anchors and fixed widths agree.
-    unsafe { library.glmf_dspark_confidence(hidden.ptr,
-        w1.ptr,weight.ptr,bias.ptr,anchors.0.ptr,tokens.ptr,output.ptr,
-        sequences,block,HIDDEN,RANK,n.raw()) }
+    // SAFETY: the drafter and scratch own every operand through the readback's
+    // drain; the anchors were checked against the vocabulary.
+    unsafe { n.library().dspark_draft_heads(heads,logits,hidden,anchors.0,tokens,workspace,confidence,
+        sequences,BLOCK,VOCAB,H,n.raw()) }
 }
 
 fn download(n: &Native<'_>, buffer: CuteafdDeviceBuffer, bytes: usize) -> Result<Vec<u8>> {
@@ -428,21 +381,6 @@ mod tests {
         state.advance(4096,2,Some(6))?;
         assert_eq!((state.valid_from,state.end),(4090,4098));
         assert!(state.advance(4098,0,Some(7)).is_err());
-        Ok(())
-    }
-
-    fn buffer(address: usize, bytes: usize) -> CuteafdDeviceBuffer {
-        CuteafdDeviceBuffer{ptr:address as *mut _,bytes,device_id:0,flags:0}
-    }
-
-    #[test] fn draft_extents_reject_overflow_short_buffers_and_aliases() -> Result<()> {
-        assert_eq!(extent(&[7,64,128,2])?,114688);
-        assert!(extent(&[usize::MAX,2]).is_err());
-        assert!(check(buffer(16,16),17,16).is_err());
-        assert!(check(buffer(17,16),16,16).is_err());
-        assert!(check(buffer(usize::MAX,1),1,1).is_err());
-        assert!(disjoint(buffer(16,16),16,buffer(24,16),16).is_err());
-        disjoint(buffer(16,16),16,buffer(32,16),16)?;
         Ok(())
     }
 

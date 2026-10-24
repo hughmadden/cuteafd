@@ -1,6 +1,8 @@
 //! Bindings every family uses (program table, expert kernels, FP8 GEMV/MoE,
-//! L2 prefetch, vocabulary head, peer copy, EXL3 wire and packages).
+//! L2 prefetch, vocabulary head, peer copy, EXL3 wire and packages, block
+//! dSpark drafter kernels).
 
+pub mod block_dspark;
 pub(crate) mod fp8_gemv;
 pub mod fp8_moe;
 pub mod programs;

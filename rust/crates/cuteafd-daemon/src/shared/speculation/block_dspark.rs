@@ -7,6 +7,7 @@ use crate::shared::fp8_linear::{self, Fp8Weight};
 use crate::shared::memory::DeviceAllocation;
 use crate::shared::token_io::TokenEmbedding;
 use anyhow::{ensure, Context, Result};
+use cuteafd_ffi::block_dspark::DraftHeads;
 use cuteafd_ffi::programs::{VocabularyHead, VOCABULARY_HEAD_WORKSPACE};
 use cuteafd_ffi::{CuteafdDeviceBuffer, NativeLibrary};
 use cuteafd_loader::read_safetensors_metadata;
@@ -18,7 +19,7 @@ use std::path::Path;
 type Dev<'a> = DeviceAllocation<'a>;
 
 /// Most sequences one draft step takes (the Markov kernel's limit).
-pub(crate) const MAX_SEQUENCES: usize = 32;
+pub(crate) const MAX_SEQUENCES: usize = cuteafd_ffi::block_dspark::MARKOV_SEQUENCES;
 
 /// Whether `snapshot` holds a Speculators dSpark checkpoint.
 pub(crate) fn is_dspark(snapshot: &Path) -> Result<bool> {
@@ -393,8 +394,7 @@ impl<'a> DsparkDrafter<'a> {
         let markov_w2 = tensor("markov_head.markov_w2.weight", &[cfg.vocab, cfg.rank])?;
         let markov_norms = DeviceAllocation::new(library, cfg.vocab * 4)?;
         // SAFETY: both buffers hold `vocab` rows; the stream orders the kernel before any draft.
-        unsafe { library.glmf_dspark_markov_norms(markov_w2.buffer.ptr, markov_norms.buffer.ptr, cfg.vocab, cfg.rank,
-            stream)? };
+        unsafe { library.dspark_markov_norms(markov_w2.buffer, markov_norms.buffer, cfg.vocab, stream)? };
         Ok(Self {
             kv_cache,
             library,
@@ -721,12 +721,10 @@ impl<'a> DsparkDrafter<'a> {
                     weight, w.logits.buffer.ptr.cast(), rows, h, c.vocab, s, self.head_mode.get())?,
                 HeadRef::Launch(launch) => launch(w.n.buffer.ptr.cast_const(), w.logits.buffer.ptr.cast(), rows, s)?,
             }
-            l.glmf_dspark_markov(w.logits.buffer.ptr, self.markov_w1.buffer.ptr, self.markov_w2.buffer.ptr,
-                self.markov_norms.buffer.ptr, w.anchors.buffer.ptr, w.tokens.buffer.ptr, w.markov_workspace.buffer.ptr, s_count, block, c.vocab,
-                c.rank, s)?;
-            l.glmf_dspark_confidence(w.n.buffer.ptr, self.markov_w1.buffer.ptr, self.confidence_w.buffer.ptr,
-                self.confidence_b.buffer.ptr, w.anchors.buffer.ptr, w.tokens.buffer.ptr, w.confidence.buffer.ptr,
-                s_count, block, h, c.rank, s)?;
+            let heads = DraftHeads { w1: self.markov_w1.buffer, w2: self.markov_w2.buffer, norms: self.markov_norms.buffer,
+                weight: self.confidence_w.buffer, bias: self.confidence_b.buffer };
+            l.dspark_draft_heads(&heads, w.logits.buffer, w.n.buffer, w.anchors.buffer, w.tokens.buffer,
+                w.markov_workspace.buffer, w.confidence.buffer, s_count, block, c.vocab, h, s)?;
             l.cuda_stream_synchronize(s)?;
         }
         let mut tokens = vec![0u8; rows * 4];
