@@ -223,6 +223,28 @@ pub struct Commands<'a> {
 }
 trait Retained {}
 impl<T> Retained for T {}
+
+/// A recorded stream segment ([`Commands::capture`]): the executable and
+/// every operand and owner its launches retained, so each captured pointer
+/// outlives every replay. A replay retains the graph until its stream drains.
+pub struct Graph<'a> {
+    library: &'a NativeLibrary,
+    device: i32,
+    exec: *mut c_void,
+    stream: Rc<()>,
+    _retained: Vec<Buffer<'a>>,
+    _owners: Vec<Rc<dyn Retained + 'a>>,
+}
+impl Drop for Graph<'_> {
+    fn drop(&mut self) {
+        // As Storage: an unproved drain may leave a replay running.
+        if self.library.is_quarantined_after_failed_drain() { return; }
+        // SAFETY: replays retain this owner until their stream drained.
+        if let Err(error) = on_device(self.library, self.device, || unsafe { self.library.cuda_graph_exec_destroy(self.exec) }) {
+            tracing::error!(%error, "destroying MiniMax graph executable");
+        }
+    }
+}
 impl<'a> Commands<'a> {
     pub fn new(library: &'a NativeLibrary, device: i32, programs: &'a Programs<'a>) -> Result<Self> {
         let loaded = on_device(library, device, || definitions().into_iter().map(|(name, pointers)| {
@@ -256,6 +278,41 @@ impl<'a> Commands<'a> {
             self.owners.borrow_mut().clear();
             Ok(())
         })
+    }
+    /// Records what `enqueue` queues on this stream as a graph instead of
+    /// running it. The stream must be drained, so everything retained while
+    /// recording belongs to the graph (which then owns it).
+    pub fn capture(&self, enqueue: impl FnOnce() -> Result<()>) -> Result<Graph<'a>> {
+        ensure!(self.retained.borrow().is_empty() && self.owners.borrow().is_empty(),
+            MiniMaxNativeError::Operand("graph capture needs a drained stream"));
+        // SAFETY: this owner created the idle stream; capture records and runs nothing.
+        native("begin capture", on_device(self.library, self.device, || unsafe {
+            self.library.cuda_graph_begin_capture(self.stream) }))?;
+        let queued = enqueue();
+        // SAFETY: ends the capture begun above, even when enqueueing failed.
+        let ended = native("end capture", on_device(self.library, self.device, || unsafe {
+            self.library.cuda_graph_end_capture(self.stream) }));
+        let retained = std::mem::take(&mut *self.retained.borrow_mut());
+        let owners = std::mem::take(&mut *self.owners.borrow_mut());
+        match (queued, ended) {
+            (Ok(()), Ok(exec)) => Ok(Graph { library: self.library, device: self.device, exec,
+                stream: self.identity.clone(), _retained: retained, _owners: owners }),
+            (Err(error), Ok(exec)) => {
+                // SAFETY: the executable was never launched.
+                on_device(self.library, self.device, || unsafe { self.library.cuda_graph_exec_destroy(exec) })?;
+                Err(error)
+            }
+            (Ok(()), Err(error)) | (Err(error), Err(_)) => Err(error),
+        }
+    }
+    /// Queues a replay of `graph` (captured on this stream); the stream
+    /// retains it until the next drain.
+    pub fn replay(&self, graph: &Rc<Graph<'a>>) -> Result<()> {
+        ensure!(Rc::ptr_eq(&graph.stream, &self.identity), MiniMaxNativeError::Operand("graph captured on another stream"));
+        self.retain_owner(graph.clone());
+        // SAFETY: the graph owns every captured operand; its stream is this one.
+        native("graph launch", on_device(self.library, self.device, || unsafe {
+            self.library.cuda_graph_launch(graph.exec, self.stream) }))
     }
     pub fn capacity(&self, name: &str) -> Result<usize> {
         Ok(self.programs.get(name).context("missing MiniMax program")?.spec().capacity_rows as usize)
@@ -543,6 +600,29 @@ mod tests {
         assert!(format!("{error:#}").contains("status 17"));
         STATUS.store(0,Ordering::Relaxed);
         commands.drain()?;
+        // A capture owns what its launches retained; a replay retains the graph until drain.
+        let source=Buffer::new(&library,0,64)?;
+        let weak=Rc::downgrade(&source.storage);
+        fixture.quiet_events(&library,false)?;
+        let before=fixture.events()?.len();
+        assert!(commands.capture(||Ok(())).is_ok());
+        commands.copy(&output,&source,64)?;
+        assert!(commands.capture(||Ok(())).is_err(),"capture on a stream with queued work");
+        commands.drain()?;
+        let graph=Rc::new(commands.capture(||commands.copy(&output,&source,64))?);
+        drop(source);
+        commands.drain()?;
+        assert!(weak.upgrade().is_some(),"recorded copy lost its source owner");
+        commands.replay(&graph)?;
+        let weak_graph=Rc::downgrade(&graph);
+        drop(graph);
+        assert!(weak_graph.upgrade().is_some(),"queued replay lost its graph");
+        commands.drain()?;
+        assert!(weak_graph.upgrade().is_none() && weak.upgrade().is_none(),"drained replay kept its graph or operands");
+        assert!(commands.capture(||anyhow::bail!("recording failed")).is_err());
+        let events=fixture.events()?;
+        assert_eq!(events[before..].chars().filter(|c|"CGLg".contains(*c)).collect::<String>(),"CGgCGLgCGg",
+            "begin, end, launch and destroy order: {}",&events[before..]);
         Ok(())
     }
 }

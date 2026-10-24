@@ -86,6 +86,13 @@ impl<'a> ExpertExecutor<'a> for Routed<'a> {
         }
         Ok(())
     }
+    fn record(&mut self,kind:ExpertV2SourceKind)->Result<()> {
+        ensure!(!self.poisoned,MiniMaxError::Invalid("previous expert failure; restart required"));
+        // A recording queues nothing: an uncollected dispatch it left owns no work.
+        self.pending=None;
+        self.kind=kind;
+        Ok(())
+    }
     fn dispatch(&mut self,layer:usize,rows:usize,ids:&Buffer<'a>,weights:&Buffer<'a>,input:&Buffer<'a>,commands:&Commands<'a>)->Result<()> {
         ensure!(self.pending.is_none(),MiniMaxError::Invalid("overlapping expert waves"));
         if let Some(index)=self.local.as_ref().and_then(|l|l.index_of(layer).ok()) {

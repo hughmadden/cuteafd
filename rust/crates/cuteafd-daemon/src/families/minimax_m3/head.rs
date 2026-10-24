@@ -15,9 +15,13 @@ impl<'a> TargetHeadOwner<'a> {
         self.project(commands,weights,scratch,scratch.get("head_input")?,rows.len())
     }
     pub fn project(&self, commands: &Commands<'a>, weights: &Weights<'a>, scratch: &Scratch<'a>, input: &Buffer<'a>, rows: usize) -> Result<DeviceLogits> {
-        let output = scratch.get("logits")?;
         self.head.launch(commands,input,weights.get("language_model.lm_head.weight")?,
-            output,rows,TargetHead::configured().tensor_cores())?;
+            scratch.get("logits")?,rows,TargetHead::configured().tensor_cores())?;
+        self.output(commands,scratch,rows)
+    }
+    /// The logits `rows` projections leave (a replayed step's, too).
+    pub fn output(&self, commands: &Commands<'a>, scratch: &Scratch<'a>, rows: usize) -> Result<DeviceLogits> {
+        let output = scratch.get("logits")?;
         Ok(DeviceLogits { ptr: output.raw().ptr.cast_const(), rows, vocab:self.vocab,
             stride:self.vocab,stream:commands.raw(),greedy:None })
     }

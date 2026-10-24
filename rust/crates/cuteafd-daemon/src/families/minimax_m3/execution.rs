@@ -2,7 +2,7 @@
 use super::{MiniMaxError, diagnostics::{Diagnostics, StepDump}, ffn, head::TargetHeadOwner, scratch::Scratch, weights::Weights};
 use crate::shared::{memory::device::Device, token_io::DeviceLogits};
 use anyhow::{ensure, Context, Result};
-use cuteafd_ffi::{minimax::{Buffer, Commands}, programs::{Programs,Scalar}};
+use cuteafd_ffi::{minimax::{Buffer, Commands, Graph}, programs::{Programs,Scalar}};
 use cuteafd_transport::ExpertV2SourceKind;
 use cuteafd_loader::{families::minimax_m3::config::MiniMaxM3Config,
     plan::{checkpoint::Checkpoint,families::minimax::admission::RuntimeLedger}};
@@ -67,20 +67,55 @@ struct Launch { request:usize, row:usize, first:usize, rows:usize, slot:usize, b
 #[derive(Debug, PartialEq, Eq)]
 enum AttentionPlan { Decode { stride:usize }, Extend { launches:Vec<Launch> } }
 
-/// Decode metadata: per-row tables (-1 padded), lengths and packed offsets.
-fn decode_tables(batch:&BatchView)->Result<(usize,Vec<i32>,Vec<i32>,Vec<i32>)> {
+/// Decode metadata: per-row tables at a fixed `stride` (-1 padded), lengths
+/// and packed offsets. The decode kernels visit only each row's live pages
+/// (its cache length), so a wider table changes neither work nor results,
+/// and one stride for every step lets a recorded step replay at any context.
+fn decode_tables(batch:&BatchView,stride:usize)->Result<(Vec<i32>,Vec<i32>,Vec<i32>)> {
     let rows=batch.positions.len();
-    let stride=batch.positions.iter().copied().max().context("MiniMax empty batch")? as usize/64+1;
     let mut tables=vec![-1i32;rows*stride];
     let mut lengths=Vec::with_capacity(rows);
     for row in 0..rows {
         let request=batch.request(row)?;
         let length=batch.positions[row] as usize+1;
         let width=length.div_ceil(64);
+        ensure!(width<=stride,MiniMaxError::Invalid("live page-table width"));
         tables[row*stride..row*stride+width].copy_from_slice(&request.pages[..width]);
         lengths.push(length as i32);
     }
-    Ok((stride,tables,lengths,(0..=rows as i32).collect()))
+    Ok((tables,lengths,(0..=rows as i32).collect()))
+}
+
+/// How decode steps run (`CUTEAFD_MINIMAX_GRAPHS`): `on` (default) replays one
+/// graph per decode row count, recorded right after that row count's first
+/// eager step; `off` keeps every step eager; `verify` also re-executes every
+/// replayed step eagerly and compares the two steps' logits bit for bit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum GraphMode { Off, On, Verify }
+impl GraphMode {
+    fn from_env() -> Result<Self> {
+        match std::env::var("CUTEAFD_MINIMAX_GRAPHS").as_deref() {
+            Err(_) | Ok("on") => Ok(Self::On),
+            Ok("off") => Ok(Self::Off),
+            Ok("verify") => Ok(Self::Verify),
+            Ok(_) => Err(MiniMaxError::Invalid("CUTEAFD_MINIMAX_GRAPHS is on, off or verify").into()),
+        }
+    }
+}
+
+/// What a recorded decode step bakes in: its extents and the identities of
+/// the input, cache and expert owner it was recorded with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct GraphKey { rows:usize, stride:usize, pool_pages:usize, embedded:usize, cache:usize, experts:usize }
+
+/// Recorded decode steps (one per row count in serving). Declared after
+/// `Execution::commands`, whose drop drains the stream before these go.
+struct DecodeGraphs<'a> {
+    mode: GraphMode,
+    bank: std::collections::BTreeMap<GraphKey, std::rc::Rc<Graph<'a>>>,
+    /// Keys whose recording failed run eagerly from then on.
+    refused: std::collections::BTreeSet<GraphKey>,
+    replays: u64,
 }
 
 /// Extend metadata: one launch per request tile of at most `tile` rows. Each
@@ -112,6 +147,10 @@ fn le_bytes(values:&[i32])->Vec<u8> { values.iter().flat_map(|v|v.to_le_bytes())
 
 pub(super) trait ExpertExecutor<'a> {
     fn begin(&mut self, _waves:usize, _kind:ExpertV2SourceKind) -> Result<()> { Ok(()) }
+    /// Before and after recording a step (its dispatches and collects are
+    /// recorded, not run): announces nothing and drops what a failed
+    /// recording left uncollected.
+    fn record(&mut self, _kind:ExpertV2SourceKind) -> Result<()> { Ok(()) }
     fn dispatch(&mut self, layer:usize, rows:usize, ids:&Buffer<'a>, weights:&Buffer<'a>,
         input:&Buffer<'a>, commands:&Commands<'a>) -> Result<()>;
     fn collect(&mut self, layer:usize, rows:usize, output:&Buffer<'a>, commands:&Commands<'a>) -> Result<()>;
@@ -136,6 +175,7 @@ pub(super) struct Execution<'a> {
     diagnostics:std::cell::RefCell<Option<Diagnostics>>,
     draft:Option<super::dspark::Dspark<'a>>,
     draft_causal:bool,
+    graphs:std::cell::RefCell<DecodeGraphs<'a>>,
 }
 impl<'a> Execution<'a> {
     pub fn load(device:Device<'a>, programs:&'a Programs<'a>, checkpoint:&Checkpoint,
@@ -171,8 +211,11 @@ impl<'a> Execution<'a> {
         commands.upload(scratch.get("index_bounds")?,&vec![0;extend_rows*4])?;
         commands.drain()?;
         let head=TargetHeadOwner::new(&commands,&scratch,logit_rows,cfg.vocab_size)?;
+        let mode=if diagnostics.borrow().is_some() {GraphMode::Off} else {GraphMode::from_env()?};
+        tracing::info!(?mode,"MiniMax decode step graphs, one per row count (CUTEAFD_MINIMAX_GRAPHS: on, off or verify)");
+        let graphs=std::cell::RefCell::new(DecodeGraphs{mode,bank:Default::default(),refused:Default::default(),replays:0});
         Ok(Self{commands,head,weights,scratch,cfg:cfg.clone(),rows,logit_rows,context,decode_rows,extend_rows,table_stride,
-            poisoned:std::cell::Cell::new(false),diagnostics,draft:None,draft_causal:false})
+            poisoned:std::cell::Cell::new(false),diagnostics,draft:None,draft_causal:false,graphs})
     }
     pub fn load_draft(&mut self, contract:&cuteafd_loader::families::minimax_m3::dspark::DsparkContract,
         layout:super::dspark::Layout)->Result<()> {
@@ -231,60 +274,150 @@ impl<'a> Execution<'a> {
         for cache in caches { ensure!(cache.key.raw().bytes>=batch.pool_pages*32768
             && cache.value.raw().bytes>=batch.pool_pages*32768 && cache.index.raw().bytes>=batch.pool_pages*8448,
             MiniMaxError::Invalid("physical cache extent")); }
+        let waves=self.cfg.moe[..=last_layer].iter().filter(|&&moe|moe).count();
+        // A full-model decode step replays its row count's recording.
+        let mode=self.graphs.borrow().mode;
+        let owner=std::ptr::from_ref(&*experts).cast::<()>() as usize;
+        let key=(mode!=GraphMode::Off && kind==ExpertV2SourceKind::Decode && rows<=self.decode_rows
+            && last_layer+1==self.cfg.layers && logits==(0..rows)).then(|| GraphKey { rows,
+            stride:self.decode_stride(batch), pool_pages:batch.pool_pages, embedded:embedded.raw().ptr as usize,
+            cache:caches[0].key.raw().ptr as usize, experts:owner });
+        let graph=key.and_then(|key|self.graphs.borrow().bank.get(&key).cloned());
         let result=(||{
-            experts.begin(self.cfg.moe[..=last_layer].iter().filter(|&&moe|moe).count(),kind)?;
+            experts.begin(waves,kind)?;
             self.commands.upload(self.scratch.get("positions")?,&batch.positions.iter().flat_map(|v|v.to_le_bytes()).collect::<Vec<_>>())?;
             self.commands.upload(self.scratch.get("slots")?,&batch.slots.iter().flat_map(|v|v.to_le_bytes()).collect::<Vec<_>>())?;
             let plan=self.plan_attention(batch,rows)?;
-            self.commands.widen(embedded,self.scratch.get("residual")?,rows*6144)?;
-            for (layer,cache) in caches.iter().enumerate().take(last_layer+1) {
-                let mut dump=diagnostics.as_ref().filter(|d|d.layer==layer).map(|d|d.begin(batch)).transpose()?;
-                if let Some(d)=&mut dump { d.tensor(&self.commands,"input","f32",&[rows,6144],self.scratch.get("residual")?)?; }
-                self.attention(layer,rows,batch,cache,&plan,dump.as_mut())?;
-                ffn::norm(&self.commands,self.scratch.get("residual")?,self.weights.layer(layer,"post_attention_layernorm.weight")?,self.scratch.get("norm")?,rows)?;
-                if let Some(d)=&mut dump { d.tensor(&self.commands,"ffn_norm","bf16",&[rows,6144],self.scratch.get("norm")?)?; }
-                if self.cfg.moe[layer] {
-                    self.commands.launch("minimax_router_scores", &[self.scratch.get("norm")?,
-                        self.weights.layer(layer,"block_sparse_moe.gate.weight")?,self.scratch.get("router_logits")?], &[Scalar::I32(rows as i32)])?;
-                    self.commands.launch("minimax_route", &[self.scratch.get("router_logits")?,
-                        self.weights.layer(layer,"block_sparse_moe.e_score_correction_bias")?,self.scratch.get("route_ids")?,self.scratch.get("route_weights")?], &[Scalar::I32(rows as i32)])?;
-                    if let Some(d)=&mut dump {
-                        d.tensor(&self.commands,"router_ids","i32",&[rows,4],self.scratch.get("route_ids")?)?;
-                        d.tensor(&self.commands,"router_weights","f32",&[rows,4],self.scratch.get("route_weights")?)?;
-                    }
-                    experts.dispatch(layer,rows,self.scratch.get("route_ids")?,self.scratch.get("route_weights")?,self.scratch.get("norm")?,&self.commands)?;
-                    ffn::dense(&self.commands,&self.weights,&self.scratch,layer,rows,true)?;
-                    if let Some(d)=&mut dump { d.tensor(&self.commands,"shared","bf16",&[rows,6144],self.scratch.get("shared")?)?; }
-                    experts.collect(layer,rows,self.scratch.get("routed")?,&self.commands)?;
-                    self.commands.add_bf16(self.scratch.get("shared")?,self.scratch.get("routed")?,self.scratch.get("delta")?,rows*6144)?;
-                } else { ffn::dense(&self.commands,&self.weights,&self.scratch,layer,rows,false)?; }
-                self.residual(rows)?;
-                if let Some(draft)=&self.draft { draft.tap(&self.commands,layer,self.scratch.get("residual")?,rows)?; }
-                if let Some(mut d)=dump {
-                    d.tensor(&self.commands,"residual","f32",&[rows,6144],self.scratch.get("residual")?)?;
-                    diagnostics.as_mut().context("MiniMax diagnostic owner")?.finish(d)?;
-                }
+            if let Some(graph)=&graph {
+                self.commands.replay(graph)?;
+                return self.head.output(&self.commands,&self.scratch,rows).map(Some);
             }
-            if last_layer+1==self.cfg.layers && !logits.is_empty() {
-                self.head.logits(&self.commands,&self.weights,&self.scratch,logits).map(Some)
-            } else { Ok(None) }
+            self.layers(embedded,batch,caches,experts,&plan,rows,last_layer,logits.clone(),&mut diagnostics)
         })();
         // All device/cache/expert borrows end only after queued work retires.
         let drained=self.commands.drain();
         let finished=experts.finish();
         let result=result.and_then(|value|{drained?;finished?;Ok(value)});
-        if result.is_err() { self.poisoned.set(true); experts.abort(); }
+        if result.is_err() {
+            self.poisoned.set(true); experts.abort();
+            // No step follows a poisoned one: release the recordings' owners
+            // (a graph a failed drain still retains stays with the stream).
+            self.graphs.borrow_mut().bank.clear();
+            return result;
+        }
+        match (key,&graph) {
+            (Some(key),Some(_)) => {
+                self.graphs.borrow_mut().replays+=1;
+                if mode==GraphMode::Verify { self.verify(embedded,batch,caches,experts,key,waves,last_layer)?; }
+            }
+            // The row count's first step ran eagerly and its output is complete:
+            // record the same step for later replays (a failure only keeps it eager).
+            (Some(key),None) if !self.graphs.borrow().refused.contains(&key) => {
+                if let Err(error)=self.record(embedded,batch,caches,experts,key,last_layer) {
+                    tracing::warn!(rows=key.rows,"MiniMax decode graph not recorded, the row count stays eager: {error:#}");
+                    self.graphs.borrow_mut().refused.insert(key);
+                }
+            }
+            _ => {}
+        }
         result
+    }
+    /// The step body: residual widening, every layer through `last_layer`,
+    /// then the head over `logits` (an empty range skips it).
+    #[allow(clippy::too_many_arguments)]
+    fn layers(&self, embedded:&Buffer<'a>, batch:&BatchView, caches:&[LayerCache<'a>],
+        experts:&mut dyn ExpertExecutor<'a>, plan:&AttentionPlan, rows:usize, last_layer:usize,
+        logits:std::ops::Range<usize>, diagnostics:&mut Option<Diagnostics>) -> Result<Option<DeviceLogits>> {
+        self.commands.widen(embedded,self.scratch.get("residual")?,rows*6144)?;
+        for (layer,cache) in caches.iter().enumerate().take(last_layer+1) {
+            let mut dump=diagnostics.as_ref().filter(|d|d.layer==layer).map(|d|d.begin(batch)).transpose()?;
+            if let Some(d)=&mut dump { d.tensor(&self.commands,"input","f32",&[rows,6144],self.scratch.get("residual")?)?; }
+            self.attention(layer,rows,batch,cache,plan,dump.as_mut())?;
+            ffn::norm(&self.commands,self.scratch.get("residual")?,self.weights.layer(layer,"post_attention_layernorm.weight")?,self.scratch.get("norm")?,rows)?;
+            if let Some(d)=&mut dump { d.tensor(&self.commands,"ffn_norm","bf16",&[rows,6144],self.scratch.get("norm")?)?; }
+            if self.cfg.moe[layer] {
+                self.commands.launch("minimax_router_scores", &[self.scratch.get("norm")?,
+                    self.weights.layer(layer,"block_sparse_moe.gate.weight")?,self.scratch.get("router_logits")?], &[Scalar::I32(rows as i32)])?;
+                self.commands.launch("minimax_route", &[self.scratch.get("router_logits")?,
+                    self.weights.layer(layer,"block_sparse_moe.e_score_correction_bias")?,self.scratch.get("route_ids")?,self.scratch.get("route_weights")?], &[Scalar::I32(rows as i32)])?;
+                if let Some(d)=&mut dump {
+                    d.tensor(&self.commands,"router_ids","i32",&[rows,4],self.scratch.get("route_ids")?)?;
+                    d.tensor(&self.commands,"router_weights","f32",&[rows,4],self.scratch.get("route_weights")?)?;
+                }
+                experts.dispatch(layer,rows,self.scratch.get("route_ids")?,self.scratch.get("route_weights")?,self.scratch.get("norm")?,&self.commands)?;
+                ffn::dense(&self.commands,&self.weights,&self.scratch,layer,rows,true)?;
+                if let Some(d)=&mut dump { d.tensor(&self.commands,"shared","bf16",&[rows,6144],self.scratch.get("shared")?)?; }
+                experts.collect(layer,rows,self.scratch.get("routed")?,&self.commands)?;
+                self.commands.add_bf16(self.scratch.get("shared")?,self.scratch.get("routed")?,self.scratch.get("delta")?,rows*6144)?;
+            } else { ffn::dense(&self.commands,&self.weights,&self.scratch,layer,rows,false)?; }
+            self.residual(rows)?;
+            if let Some(draft)=&self.draft { draft.tap(&self.commands,layer,self.scratch.get("residual")?,rows)?; }
+            if let Some(mut d)=dump {
+                d.tensor(&self.commands,"residual","f32",&[rows,6144],self.scratch.get("residual")?)?;
+                diagnostics.as_mut().context("MiniMax diagnostic owner")?.finish(d)?;
+            }
+        }
+        if last_layer+1==self.cfg.layers && !logits.is_empty() {
+            self.head.logits(&self.commands,&self.weights,&self.scratch,logits).map(Some)
+        } else { Ok(None) }
+    }
+    /// Records the step that just ran (its metadata is still uploaded) as a
+    /// graph for `key`, on the drained stream; nothing executes.
+    #[allow(clippy::too_many_arguments)]
+    fn record(&self, embedded:&Buffer<'a>, batch:&BatchView, caches:&[LayerCache<'a>],
+        experts:&mut dyn ExpertExecutor<'a>, key:GraphKey, last_layer:usize) -> Result<()> {
+        let library=self.commands.library();
+        let (free,_)=library.cuda_memory_info()?;
+        let started=std::time::Instant::now();
+        experts.record(ExpertV2SourceKind::Decode)?;
+        let graph=self.commands.capture(|| self.layers(embedded,batch,caches,experts,
+            &AttentionPlan::Decode{stride:key.stride},key.rows,last_layer,0..key.rows,&mut None).map(|_|()));
+        let reset=experts.record(ExpertV2SourceKind::Decode);
+        let graph=graph?; reset?;
+        let (after,_)=library.cuda_memory_info()?;
+        let mut graphs=self.graphs.borrow_mut();
+        graphs.bank.insert(key,std::rc::Rc::new(graph));
+        tracing::info!(rows=key.rows,record_ms=started.elapsed().as_secs_f64()*1e3,
+            graph_bytes=free.saturating_sub(after),graphs=graphs.bank.len(),replays=graphs.replays,
+            "MiniMax decode graph recorded");
+        Ok(())
+    }
+    /// `CUTEAFD_MINIMAX_GRAPHS=verify`: runs the replayed step again eagerly
+    /// (same inputs: the cache rows it appends are rewritten identically) and
+    /// compares the logits bit for bit.
+    #[allow(clippy::too_many_arguments)]
+    fn verify(&self, embedded:&Buffer<'a>, batch:&BatchView, caches:&[LayerCache<'a>],
+        experts:&mut dyn ExpertExecutor<'a>, key:GraphKey, waves:usize, last_layer:usize) -> Result<()> {
+        let library=self.commands.library();
+        let replayed=self.head.output(&self.commands,&self.scratch,key.rows)?.to_host(library)?;
+        let eager=(||{
+            experts.begin(waves,ExpertV2SourceKind::Decode)?;
+            self.layers(embedded,batch,caches,experts,&AttentionPlan::Decode{stride:key.stride},key.rows,last_layer,
+                0..key.rows,&mut None)?.context("MiniMax verified step has no logits")
+        })();
+        let drained=self.commands.drain();
+        let finished=experts.finish();
+        let eager=eager.and_then(|logits|{drained?;finished?;logits.to_host(library)});
+        let eager=match eager { Ok(eager)=>eager, Err(error)=>{ self.poisoned.set(true); experts.abort(); return Err(error); } };
+        let differing=replayed.iter().zip(&eager).filter(|(a,b)|a.to_bits()!=b.to_bits()).count();
+        let max=replayed.iter().zip(&eager).map(|(a,b)|(a-b).abs()).fold(0f32,f32::max);
+        let replays=self.graphs.borrow().replays;
+        if differing==0 { tracing::info!(rows=key.rows,replays,"MiniMax decode graph replay matches eager bit for bit"); }
+        else { tracing::error!(rows=key.rows,replays,differing,max_abs=max,"MiniMax decode graph replay differs from eager"); }
+        Ok(())
     }
     fn residual(&self,rows:usize)->Result<()> {
         self.commands.launch("minimax_residual", &[self.scratch.get("residual")?,self.scratch.get("delta")?,self.scratch.get("residual")?], &[Scalar::I32(rows as i32)])
     }
+    /// The page-table stride of every decode step: wide enough for any live
+    /// request (none holds more than the pool's pages or the context's).
+    fn decode_stride(&self,batch:&BatchView)->usize { self.table_stride.min(batch.pool_pages) }
     /// Uploads the step's attention metadata (see [`AttentionPlan`]).
     fn plan_attention(&self,batch:&BatchView,rows:usize)->Result<AttentionPlan> {
         let s=&self.scratch;
         if rows<=self.decode_rows {
-            let (stride,tables,lengths,offsets)=decode_tables(batch)?;
-            ensure!(stride<=self.table_stride,MiniMaxError::Invalid("live page-table width"));
+            let stride=self.decode_stride(batch);
+            let (tables,lengths,offsets)=decode_tables(batch,stride)?;
             self.commands.upload(s.get("page_table")?,&le_bytes(&tables))?;
             self.commands.upload(s.get("cache_lengths")?,&le_bytes(&lengths))?;
             self.commands.upload(s.get("cu_seqlens_q")?,&le_bytes(&offsets))?;
@@ -408,11 +541,14 @@ mod tests {
             requests:vec![RequestView{row_start:0,rows:3,start_position:62,pages:vec![0,2]},
                 RequestView{row_start:3,rows:1,start_position:4,pages:vec![4]}]};
         batch.validate(64,128)?;
-        let (stride,tables,lengths,offsets)=decode_tables(&batch)?;
-        assert_eq!(stride,2);
+        let (tables,lengths,offsets)=decode_tables(&batch,2)?;
         assert_eq!(tables,[0,-1, 0,-1, 0,2, 4,-1]);
         assert_eq!(lengths,[63,64,65,5]);
         assert_eq!(offsets,[0,1,2,3,4]);
+        // Every decode step uses one fixed stride; live entries keep their place.
+        let (wide,_,_)=decode_tables(&batch,4)?;
+        assert_eq!(wide,[0,-1,-1,-1, 0,-1,-1,-1, 0,2,-1,-1, 4,-1,-1,-1]);
+        assert!(decode_tables(&batch,1).is_err(),"a row wider than the stride is refused");
         // A two-row tile splits the first request; launch metadata is 16-byte aligned.
         let (launches,tables,lengths,offsets,bounds)=extend_tables(&batch,2,4)?;
         assert_eq!(launches,[Launch{request:0,row:0,first:0,rows:2,slot:0,bounds:2},
