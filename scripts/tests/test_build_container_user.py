@@ -165,3 +165,37 @@ def test_nvfp4_verifier_writes_the_reference_as_the_calling_user():
     assert '--user "$(id -u):$(id -g)"' in text
     for key in ("HOME=", "USER=", "LOGNAME=", "TORCHINDUCTOR_CACHE_DIR=", "CARGO_HOME="):
         assert f'-e "{key}$container_home' in text or f'-e "{key}$(id -un)"' in text, key
+
+
+def dev_shell_lock_mounts(home: Path, lock_dir: str | None) -> list[str]:
+    """cuteafd-dev.sh's build-slot block, run as written: its docker -v slot mounts."""
+    text = DEV_SHELL.read_text(encoding="utf-8")
+    start = text.index("# Host build slots")
+    block = text[start:text.index('if [[ -n "${CUTEAFD_DEV_TARGET_DIR:-}" ]]', start)]
+    env = {key: value for key, value in os.environ.items() if key != "CUTEAFD_LOCK_DIR"}
+    env.update(HOME=str(home), CUTEAFD_BUILD_SLOTS="2")
+    if lock_dir is not None:
+        env["CUTEAFD_LOCK_DIR"] = lock_dir
+    body = "set -euo pipefail\ndocker_args=()\n" + block + '\nprintf "%s\\n" "${docker_args[@]}"\n'
+    result = subprocess.run(["bash", "-c", body], env=env, capture_output=True, text=True, timeout=60)
+    assert result.returncode == 0, result.stderr
+    args = result.stdout.splitlines()
+    return [args[i + 1] for i, token in enumerate(args[:-1]) if token == "-v"]
+
+
+def test_dev_shell_build_slots_follow_the_lock_directory(tmp_path):
+    """The container compiles under the host's real build-slot inodes: HOME's by
+    default, CUTEAFD_LOCK_DIR's when a deployment keeps its locks elsewhere."""
+    home = tmp_path / "home"
+    inside = "/tmp/cuteafd-build-locks"
+    assert dev_shell_lock_mounts(home, None) == [
+        f"{home}/.cache/cuteafd/build.lock:{inside}/build.lock",
+        f"{home}/.cache/cuteafd/build.lock.1:{inside}/build.lock.1",
+    ]
+    shared, other_home = tmp_path / "shared-locks", tmp_path / "other-home"
+    assert dev_shell_lock_mounts(other_home, str(shared)) == [
+        f"{shared}/build.lock:{inside}/build.lock",
+        f"{shared}/build.lock.1:{inside}/build.lock.1",
+    ]
+    assert (shared / "build.lock").is_file() and (shared / "build.lock.1").is_file()
+    assert not (other_home / ".cache/cuteafd/build.lock").exists()  # no private slot beside HOME
