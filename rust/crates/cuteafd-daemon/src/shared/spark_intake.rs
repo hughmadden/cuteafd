@@ -1398,6 +1398,9 @@ pub(crate) struct SparkDeviceLink<'a> {
     /// in its plane of this pinned, device-mapped arena (planes as in write
     /// mode), which the reducer reads in place after the completion wait.
     hosted: Option<HostAllocation<'a>>,
+    /// [`Self::publish_by_kernel`]: the publish kernel's block counter (u32, zeroed).
+    arrivals: DeviceAllocation<'a>,
+    publish_kernel: Cell<bool>,
     library: &'a NativeLibrary,
     capacity: usize,
     topk: usize,
@@ -1405,6 +1408,11 @@ pub(crate) struct SparkDeviceLink<'a> {
     row_bytes: usize,
     ranks: usize,
 }
+
+/// Waves up to this many payload bytes publish through `cuteafd_host_publish`
+/// when [`SparkDeviceLink::publish_by_kernel`] is on; larger ones (prefill)
+/// keep the copy engine, which moves them faster than a few blocks of stores.
+const PUBLISH_KERNEL_MAX_BYTES: usize = 1 << 20;
 
 /// Write mode and host landing: one plane per rank (write mode then adds one
 /// 64-byte line per rank flag).
@@ -1504,7 +1512,18 @@ impl<'a> SparkDeviceLink<'a> {
         };
         tracing::info!(ranks, capacity, written = written.is_some(), landing = if host { "host" } else { "gpu" },
             egress, "device-driven Spark exchange ready (proxy thread posts; the stream waits and reduces)");
-        Ok(Self { lane, intake, mailbox, written, hosted, library, capacity, topk, wire_row_bytes, row_bytes, ranks })
+        let arrivals = DeviceAllocation::new(library, 256)?;
+        library.copy_h2d(arrivals.buffer, &[0; 256])?;
+        Ok(Self { lane, intake, mailbox, written, hosted, arrivals, publish_kernel: Cell::new(false), library,
+            capacity, topk, wire_row_bytes, row_bytes, ranks })
+    }
+
+    /// Decode-sized waves ([`PUBLISH_KERNEL_MAX_BYTES`]) then publish with one
+    /// kernel that stores their routes and rows into the mailbox and egress
+    /// buffer, instead of three copy-engine copies and the signal kernel
+    /// (each copy adds a few microseconds of DMA latency to every layer).
+    pub(crate) fn publish_by_kernel(&self, enabled: bool) {
+        self.publish_kernel.set(enabled);
     }
 
     pub(crate) fn world_size(&self) -> usize {
@@ -1604,13 +1623,28 @@ impl<'a> SparkDeviceLink<'a> {
             Some((ptr, bytes)) => CuteafdHostBuffer { ptr: ptr as *mut c_void, bytes, ..self.mailbox.buffer },
             None => self.mailbox_at(m::wire(self.capacity, self.topk)),
         };
+        ensure!(wire_bytes <= wire_target.bytes, "a device wave's rows exceed the link's wire buffer");
+        let words = [layer as u32, rows as u32, kind, self.topk as u32];
+        if self.publish_kernel.get() && wire_bytes <= PUBLISH_KERNEL_MAX_BYTES && route_bytes % 16 == 0
+            && wire_bytes % 16 == 0 {
+            // SAFETY: as the copies below; the destinations are the same pinned,
+            // device-mapped mailbox and egress ranges, and the counter is this
+            // link's own (waves on one link are stream-ordered).
+            return unsafe {
+                self.library.host_publish([(ids.ptr.cast_const(), self.mailbox_at(m::ROUTES).ptr, route_bytes),
+                    (weights.ptr.cast_const(), self.mailbox_at(m::weights(self.capacity, self.topk)).ptr, route_bytes),
+                    (wire.ptr.cast_const(), wire_target.ptr, wire_bytes)],
+                    self.mailbox_at(m::READY).ptr.cast(), self.mailbox_at(m::SEND_STATE).ptr.cast(),
+                    self.mailbox_at(m::DESCRIPTOR).ptr.cast(), words, self.arrivals.buffer.ptr.cast(), stream)
+            };
+        }
         unsafe {
             self.library.copy_d2h_host_buffer_async(self.mailbox_at(m::ROUTES), ids, route_bytes, stream)?;
             self.library.copy_d2h_host_buffer_async(self.mailbox_at(m::weights(self.capacity, self.topk)), weights,
                 route_bytes, stream)?;
             self.library.copy_d2h_host_buffer_async(wire_target, wire, wire_bytes, stream)?;
             self.library.host_signal(self.mailbox_at(m::READY).ptr.cast(), self.mailbox_at(m::SEND_STATE).ptr.cast(),
-                self.mailbox_at(m::DESCRIPTOR).ptr.cast(), [layer as u32, rows as u32, kind, self.topk as u32], stream)
+                self.mailbox_at(m::DESCRIPTOR).ptr.cast(), words, stream)
         }
     }
 
