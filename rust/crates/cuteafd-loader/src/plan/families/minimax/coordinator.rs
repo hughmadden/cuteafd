@@ -1,40 +1,21 @@
 //! Native source-weight contract for the MiniMax M3 coordinator: every
 //! RTX-resident text operand in its checkpoint format (MXFP8 payload and UE8M0
-//! scale codes land unchanged), how each rank of a KV-head split holds it, and
-//! the layer arithmetic the native programs must reproduce. Routed experts,
-//! vision and the drafter are separate owners.
+//! scale codes land unchanged) and how each rank of a KV-head split holds it.
+//! Routed experts, vision and the drafter are separate owners.
 use super::Model;
 use crate::formats::native_dense::NativeDenseLayout;
 use crate::plan::{checkpoint::{Checkpoint, CheckpointTensor}, spec::Component};
 use anyhow::{ensure, Context, Result};
-use cuteafd_core::dense_attention::{GqaGeometry, NormWeight, RouterBiasOrder, SigmoidRouter};
-use cuteafd_core::{DType, FfnActivation};
+use cuteafd_core::DType;
 
 #[derive(Debug, Clone)]
 pub struct CoordinatorContract {
     pub weights: NativeDenseLayout,
-    /// Gemma norms: `x * (1 + w)`.
-    pub norm_weight: NormWeight,
-    pub norm_eps: f32,
-    pub router: SigmoidRouter,
-    pub layers: Vec<LayerContract>,
-}
-
-#[derive(Debug, Clone)]
-pub struct LayerContract {
-    pub layer: usize,
-    pub geometry: GqaGeometry,
-    pub theta: f64,
-    /// Dense layers' MLP (0-2); routed layers' shared expert otherwise.
-    pub dense_activation: Option<FfnActivation>,
-    pub shared_activation: Option<FfnActivation>,
-    pub msa: Option<crate::families::minimax_m3::config::MsaConfig>,
 }
 
 impl CoordinatorContract {
     pub fn from_checkpoint(checkpoint: &Checkpoint) -> Result<Self> {
         let model = Model::open(checkpoint)?;
-        let cfg = model.cfg();
         let mut declarations = Vec::new();
         for (stem, contract) in &model.contracts {
             if matches!(contract.role.component, Component::RoutedExpert | Component::Vision | Component::Speculator) { continue; }
@@ -52,27 +33,7 @@ impl CoordinatorContract {
                 super::Storage::Nvfp4 => anyhow::bail!("{stem}: NVFP4 outside the routed experts"),
             }
         }
-        let weights = NativeDenseLayout::from_headers(checkpoint, declarations)?;
-        let activation = FfnActivation::SwigluOai { alpha: cfg.swiglu_alpha as f32, limit: cfg.swiglu_limit as f32 };
-        let layers = (0..cfg.layers).map(|layer| Ok(LayerContract {
-            layer,
-            geometry: GqaGeometry { query_heads: cfg.heads, kv_heads: cfg.kv_heads, qk_dim: cfg.head_dim,
-                value_dim: cfg.head_dim, rotary_dim: cfg.rotary_dim }.validate()?,
-            theta: cfg.rope_theta,
-            dense_activation: (!cfg.moe[layer]).then_some(activation),
-            shared_activation: cfg.moe[layer].then_some(activation),
-            msa: cfg.sparse[layer].then_some(cfg.msa),
-        })).collect::<Result<Vec<_>>>()?;
-        Ok(Self {
-            weights,
-            norm_weight: NormWeight::ZeroCentered,
-            norm_eps: cfg.rms_norm_eps as f32,
-            // The reference gathers the unbiased sigmoid scores of the biased
-            // selection, renormalizes them and scales by routed_scaling_factor.
-            router: SigmoidRouter { topk: cfg.topk, factor: cfg.routed_scale as f32, epsilon: 0.0,
-                bias_order: RouterBiasOrder::GatherOriginal },
-            layers,
-        })
+        Ok(Self { weights: NativeDenseLayout::from_headers(checkpoint, declarations)? })
     }
 }
 
@@ -162,14 +123,6 @@ impl RankWeightLayout {
             .context("rank weight overflow")?;
         Ok(self)
     }
-
-    /// Caller supplies every non-weight cost; nothing missing is inferred as zero.
-    pub fn check_budget(&self, available: u64, reservations: &[u64]) -> Result<u64> {
-        let total = reservations.iter().try_fold(self.resident_bytes, |n, v| n.checked_add(*v))
-            .context("MiniMax coordinator reservation overflow")?;
-        ensure!(total <= available, "MiniMax coordinator weights and reservations need {total} bytes, available {available}");
-        Ok(total)
-    }
 }
 
 #[cfg(test)]
@@ -183,8 +136,6 @@ mod tests {
         testing::write_minimax_m3_snapshot(dir.path(), true, true);
         let checkpoint = Checkpoint::open(dir.path()).unwrap();
         let contract = CoordinatorContract::from_checkpoint(&checkpoint).unwrap();
-        assert_eq!((contract.norm_weight, contract.router.topk, contract.router.factor), (NormWeight::ZeroCentered, 4, 2.0));
-        assert_eq!(contract.layers.iter().filter(|l| l.dense_activation.is_some()).count(), 3);
         assert!(contract.weights.tensors.iter().all(|t| !t.meta.name.contains(".experts.") && !t.meta.name.starts_with("vision")));
         let one = RankWeightLayout::from_checkpoint(&checkpoint, 0, 1).unwrap();
         let find = |l: &RankWeightLayout, name: &str| l.operands.iter().find(|o| o.name == name).cloned().unwrap();

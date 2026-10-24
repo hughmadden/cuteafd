@@ -30,7 +30,7 @@ tensor header and plans memory; the engine is being brought up.
   128-token block scores its max; the query's own block is forced; each query
   row and KV head attends its top 16 blocks (2,048 keys). Per-row selection by
   construction. Contract: b12x `attention/dsa_indexer/MSA.md`; CPU oracle
-  `cuteafd-loader/src/families/minimax_m3/reference.rs`.
+  `python/reference/families/minimax_m3/model.py` (`msa_select`).
 - Cache: per layer, 64-row K and V pages for the rank's KV heads (E4M3 by
   default) and the shared index key in the paged indexer layout (E4M3 row +
   FP32 scale); 69,360 B/token on one GPU, 38,640 per GPU with two splitting
