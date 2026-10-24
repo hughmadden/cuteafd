@@ -406,6 +406,7 @@ def test_multitier_exports_do_not_use_two_tier_only_schedules(tmp_path, monkeypa
         wire_input=lambda *_: False, ws_input_stages=lambda *_: None,
         ws_dynamic_tiles=lambda *_: False, ws_tile=lambda *_: None,
         decode_tile=lambda *_: None, activation=lambda *_: "silu",
+        default_decode_schedule=lambda *_: None,
     )
     for name in ("warp_specialized", "fused_input_rotation", "token_major_rotation"):
         setattr(package, name, lambda *_, name=name: name == rotation)
@@ -436,10 +437,7 @@ def test_gate_options_match_real_spark_package(tmp_path, monkeypatch, geometry, 
     fixture = compare_sm.load_file(
         "gate_package_fixture", ROOT / "python/tests/test_package_v41_exl3_profiles.py")
     package = fixture.package
-    # Exercise the compact WS branch before any profile is enabled in production.
-    monkeypatch.setattr(package, "compact_warp_specialized",
-                        lambda g, role, width, rows: g == "qwen4" and role == "spark"
-                        and width == 256 and rows >= 256)
+    # Compare the shipping cooperative compact route and its measured hint.
     capacities = (1, 80, 256, 4096)
     build_root = tmp_path / "build-fixture"
     build_root.mkdir()
@@ -447,7 +445,7 @@ def test_gate_options_match_real_spark_package(tmp_path, monkeypatch, geometry, 
         build_root, "spark", (4, 5), geometry=geometry,
         capacities=capacities, compact=compact,
         profiles=() if compact else tuple(p[0] for p in package.profiles_for_role("spark", geometry)))
-    expected = {(call.args[1], call.args[3]): call.kwargs for call in calls
+    expected = {(call.args[0].parent.name.split('+')[0], call.args[3]): call.kwargs for call in calls
                 if bool(call.kwargs.get("compact_weights")) == compact}
     recorded = []
     monkeypatch.setitem(sys.modules, "package_exl3_aot", package)
@@ -461,8 +459,12 @@ def test_gate_options_match_real_spark_package(tmp_path, monkeypatch, geometry, 
     assert recorded
     for values, options in recorded:
         assert options.pop("compile_only") is True
-        assert options == expected[(values[1], values[3])]
-    assert any(options.get("warp_specialized") for _, options in recorded)
+        assert options == expected[(values[0].parent.name, values[3])]
+    if compact:
+        assert not any(options.get("warp_specialized") for _, options in recorded)
+        assert any(options.get("decode_schedule") == package.PURE_EVICT_FIRST for _, options in recorded)
+    else:
+        assert any(options.get("warp_specialized") for _, options in recorded)
 
 
 def residency_gate(name="validate_table_residency"):

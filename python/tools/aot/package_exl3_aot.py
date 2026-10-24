@@ -98,7 +98,8 @@ def verify(package: Path, revision: str | None = None, runtime: Path | None = No
             if (manifest['role'] != 'spark'
                     or widths.get(directory.split('/')[0]) != meta['intermediate']
                     or len(meta['bits']) != 2 or meta.get('tile') != [64, 128, 64, 128]
-                    or meta.get('warp_specialized', False) or meta.get('decode_schedule') is not None
+                    or meta.get('warp_specialized', False)
+                    or meta.get('decode_schedule') not in (None, 'l2=2,pf1=0,pf2=0,pdl=1')
                     or meta.get('input_format', 'bf16') != 'bf16'):
                 raise ValueError(f'EXL3 invalid compact geometry or execution contract: {directory}')
         if 'blocks_per_sm' in variant and variant['blocks_per_sm'] != meta.get('blocks_per_sm'):
@@ -127,11 +128,11 @@ def verify(package: Path, revision: str | None = None, runtime: Path | None = No
             raise ValueError(f'EXL3 variant warp specialization mismatch: {directory}')
         if variant.get('input_format', 'bf16') != meta.get('input_format', 'bf16'):
             raise ValueError(f'EXL3 variant input format mismatch: {directory}')
-        # A schedule variant lives in m<capacity>-<schedule> and its export
-        # records the options; a default directory records none.
+        # The variant records its exact compiled schedule, including defaults.
+        # Explicit schedule siblings must still carry a schedule and suffix.
         schedule = variant.get('schedule')
         if (variant.get('decode_schedule') != meta.get('decode_schedule')
-                or (schedule is None) != (meta.get('decode_schedule') is None)
+                or (schedule is not None and meta.get('decode_schedule') is None)
                 or directory.rsplit('/', 1)[-1] != f"m{meta['capacity']}"
                 + ('' if schedule is None else f'-{schedule}')):
             raise ValueError(f'EXL3 variant decode schedule mismatch: {directory}')
@@ -468,6 +469,35 @@ DECODE_SCHEDULES = {
                             80: {'decode_schedule': 'gb10', 'tile': (64, 128, 64, 128),
                                  'blocks_per_sm': 2}}},
 }
+
+
+PURE_EVICT_FIRST = 'l2=2,pf1=0,pf2=0,pdl=1'
+
+
+def default_decode_schedule(geometry: str, role: str, profile: str,
+                            capacity: int, bits: list[int]) -> str | None:
+    """Only measured cooperative Spark profiles use the pure streaming hint.
+
+    GB10, default/control/hint, three alternating rounds, rows 1..80: GLM
+    compact TP6 1.054..1.123x (control .997..1.002); Flash TP4 1.027..1.082x
+    (.997..1.001); Qwen compact TP4 1.003..1.094x (1.000..1.004); Kimi TP6
+    1.020..1.107x (.991..1.004). Compact m16 rows 2/4/8/16: GLM
+    1.067..1.119x (.995..1.003), Qwen 1.019..1.083x (.989..1.002).
+    Tiles, occupancy and arithmetic unchanged.
+    """
+    measured = {
+        ('glm', 'tp6-compact-width384', (4, 5)),
+        ('glmf', 'tp4-width512', (3, 4)),
+        ('qwen4', 'tp4-compact-width256', (4, 5)),
+        ('kimik3', 'tp6-width512', (2, 3)),
+    }
+    identity = (geometry, profile, tuple(bits))
+    measured_m16 = {('glm', 'tp6-compact-width384', (4, 5)),
+                    ('qwen4', 'tp4-compact-width256', (4, 5))}
+    if role == 'spark' and ((capacity in (1, 80) and identity in measured)
+                            or (capacity == 16 and identity in measured_m16)):
+        return PURE_EVICT_FIRST
+    return None
 
 
 def decode_schedule_variants(geometry: str, role: str, profile: str,
@@ -846,10 +876,13 @@ def build(args: argparse.Namespace) -> None:
                     options['token_major_rotation'] = True
                 if (limit := swiglu_limit(geometry)) != 10.0:
                     options['swiglu_limit'] = limit
-                # The default export, then any decode-schedule variant of it: the
-                # same options plus a schedule, content-keyed in the build tree and
-                # installed as m<capacity>-<schedule> beside m<capacity>.
-                exports = [(None, raw, options)]
+                default_options = options
+                if (schedule_hint := default_decode_schedule(
+                        geometry, args.role, profile, capacity, args.bits)) is not None:
+                    raw = profile_dir.with_name(f'{profile_dir.name}+{schedule_hint}') / raw.name
+                    default_options = {**options, 'decode_schedule': schedule_hint}
+                # Explicit schedule siblings keep their original options and suffix.
+                exports = [(None, raw, default_options)]
                 for schedule, schedule_options in ([] if compact else decode_schedule_variants(
                         geometry, args.role, profile, capacity)):
                     exports.append((schedule, profile_dir.with_name(f'{profile_dir.name}+{schedule}')
@@ -901,6 +934,7 @@ def build(args: argparse.Namespace) -> None:
                     variant['input_format'] = meta['input_format']
                 if schedule is not None:
                     variant['schedule'] = schedule
+                if meta.get('decode_schedule') is not None:
                     variant['decode_schedule'] = meta['decode_schedule']
                 variants.append(variant)
         files = {str(p.relative_to(stage)): {'bytes': p.stat().st_size, 'sha256': digest(p)}
