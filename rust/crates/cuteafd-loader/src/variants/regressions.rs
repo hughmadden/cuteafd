@@ -84,6 +84,25 @@ fn metadata_free_fully_tiled_fp8_uses_exact_source_header_ratios() {
 }
 
 #[test]
+fn header_only_fp8_rejects_ambiguous_or_rectangular_tiles_but_declared_tiles_work() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("model.safetensors");
+    let config = dir.path().join("config.json");
+    for (rows,cols,grid_rows,grid_cols,block) in [(200,200,2,2,[128,128]),(256,128,2,2,[128,64])] {
+        std::fs::write(&config,"{}").unwrap();
+        write_safetensors(&file,&[
+            ("w.weight","F8_E4M3",vec![rows,cols],vec![0x38;rows*cols]),
+            ("w.weight_scale_inv","F32",vec![grid_rows,grid_cols],[1f32,2.0,3.0,4.0].into_iter().flat_map(f32::to_le_bytes).collect()),
+        ]);
+        let error = TensorSource::from_files([file.clone()]).unwrap().matrix("w.weight").unwrap_err();
+        assert!(matches!(error.downcast_ref::<TensorSourceError>(),Some(TensorSourceError::Fp8Layout { .. })),"{error:#}");
+        std::fs::write(&config,serde_json::json!({"quantization_config":{"weight_block_size":block}}).to_string()).unwrap();
+        let matrix = TensorSource::from_files([file.clone()]).unwrap().matrix("w.weight").unwrap();
+        assert_eq!(matrix.data[(rows-1)*cols+cols-1],4.0);
+    }
+}
+
+#[test]
 fn fp8_bad_layout_and_short_scales_return_typed_errors() {
     let dir = tempfile::tempdir().unwrap();
     let file = dir.path().join("model.safetensors");
@@ -133,8 +152,8 @@ fn fixture_spec(file: &Path) -> cuteafd_core::variants::VariantSpec {
 }
 
 #[test]
-fn variant_defaults_to_shared_only_and_combined_policy_has_distinct_namespace() {
-    let (dir,file,_,_) = variant_fixture();
+fn variant_defaults_to_shared_only_and_combined_shared_source_is_unavailable() {
+    let (dir,file,base,_) = variant_fixture();
     let mut spec = fixture_spec(&file);
     let shared = derive_variant(dir.path(),"m",1,&spec,1).unwrap();
     assert_eq!(shared.mode,"shared-only");
@@ -145,11 +164,31 @@ fn variant_defaults_to_shared_only_and_combined_policy_has_distinct_namespace() 
     spec.mode = Some("ffn".into());
     let combined = derive_variant(dir.path(),"m",1,&spec,1).unwrap();
     assert_eq!(combined.mode,"ffn");
-    let cp = combined.plan.unwrap();
-    assert_eq!(cp.sites[0].0.kind,SiteKind::Ffn);
-    assert_ne!(p.namespace,cp.namespace);
+    assert!(combined.plan.is_none());
+    assert!(matches!(combined.rejection_kind,Some(VariantRejection::UnsupportedSource { .. })));
+    assert!(combined.rejection.as_deref().unwrap().contains("combined routed+shared"));
+    assert!(combined.verdicts.is_empty(),"reject the unsupported scope before fitting any operators");
+    // This is an availability outcome, so base and independently supported
+    // shared-only variants remain loadable after the rejected configuration.
+    assert_eq!(open_source(dir.path(),"base",crate::families::glm5::variants::wants_tensor).unwrap()
+        .matrix("model.layers.1.mlp.shared_experts.down_proj.weight").unwrap(),base);
+    spec.mode = None;
+    assert!(derive_variant(dir.path(),"m",2,&spec,1).unwrap().plan.is_some());
     spec.mode = Some("routed".into());
     assert!(derive_variant(dir.path(),"m",1,&spec,1).unwrap_err().to_string().contains("mode"));
+}
+
+#[test]
+fn explicit_ffn_mode_without_shared_expert_sites_can_derive_dense_outputs() {
+    let (dir,file,base,edited) = variant_fixture();
+    let name = "model.layers.0.mlp.down_proj.weight";
+    let bytes = |matrix: &Matrix| matrix.data.iter().flat_map(|v| v.to_le_bytes()).collect();
+    write_safetensors(&dir.path().join("model.safetensors"),&[(name,"F32",vec![32,48],bytes(&base))]);
+    write_safetensors(&file,&[(name,"F32",vec![32,48],bytes(&edited))]);
+    let mut spec = fixture_spec(&file);
+    spec.mode = Some("ffn".into());
+    let outcome = derive_variant(dir.path(),"m",1,&spec,1).unwrap();
+    assert_eq!(outcome.plan.unwrap().sites[0].0.kind,SiteKind::DenseFfn);
 }
 
 #[test]

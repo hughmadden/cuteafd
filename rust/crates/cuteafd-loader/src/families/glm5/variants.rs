@@ -6,10 +6,10 @@
 //! its edits are ignored):
 //! - `self_attn.o_proj` → `Attn`;
 //! - dense layers' `mlp.down_proj` → `DenseFfn`;
-//! - MoE layers' `mlp.shared_experts.down_proj` → `Ffn` (mode `ffn`: an explicit policy
-//!   on the combined routed + shared output; shared checks do not verify
-//!   routed expert equivalence) or `SharedExpert` (default mode `shared-only`: the shared expert
-//!   alone, the alternate-weight checkpoint's edit).
+//! - MoE layers' `mlp.shared_experts.down_proj` → `SharedExpert` (default
+//!   `shared-only`: the shared expert alone, the alternate-weight checkpoint's edit). The site
+//!   map retains `Ffn` for explicit `ffn` mode, but derivation rejects such
+//!   shared-tensor sources: they cannot verify the combined routed+shared output.
 use crate::variants::{DeriveOpts, SiteTensor, TensorSource};
 use cuteafd_core::variants::{SiteKey, SiteKind};
 
