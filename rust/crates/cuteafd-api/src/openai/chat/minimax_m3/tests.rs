@@ -1,8 +1,8 @@
 use super::{fixtures::{encoding, GOLDENS, TEMPLATE}, *};
 use crate::openai::chat::glm5::{parser::GlmStop, processor::TextParser};
-use deepseek_recipe::stream::OutputChunk;
 use deepseek_recipe_core::tools::ToolDefinition;
 use serde_json::{json, Value};
+use crate::openai::chat::harness::{self, project, tool, Projection};
 
 fn goldens() -> Vec<Value> { serde_json::from_str(GOLDENS).unwrap() }
 
@@ -220,9 +220,6 @@ fn real_release_snapshot_headers_agree_when_pointed_at() {
 
 // ---------------------------------------------------------------- parser
 
-fn tool(name: &str, parameters: Value) -> ToolDefinition {
-    ToolDefinition { name: name.into(), description: None, parameters, strict: None }
-}
 
 fn tools() -> Vec<ToolDefinition> {
     vec![
@@ -242,53 +239,9 @@ fn param(name: &str, value: &str) -> String { format!("{NS}<{name}>{value}{NS}</
 fn invoke(name: &str, params: &[String]) -> String { format!("{INVOKE_OPEN}{name}\">{}{INVOKE_CLOSE}\n", params.concat()) }
 fn block(invokes: &[String]) -> String { format!("{CALL_OPEN}\n{}{CALL_CLOSE}", invokes.concat()) }
 
-#[derive(Debug, Default, PartialEq)]
-struct Projection {
-    reasoning: String,
-    content: String,
-    calls: Vec<(String, Value)>,
-    stop: Option<GlmStop>,
-}
 
-fn project(chunks: &[OutputChunk], stop: Option<GlmStop>) -> Projection {
-    let mut projection = Projection { stop, ..Default::default() };
-    let mut arguments = Vec::<String>::new();
-    for chunk in chunks {
-        match chunk {
-            OutputChunk::Reasoning { content } => projection.reasoning.push_str(content),
-            OutputChunk::Raw { content } => projection.content.push_str(content),
-            OutputChunk::ToolCall { tool_name, arguments: first } => {
-                projection.calls.push((tool_name.clone(), Value::Null));
-                arguments.push(first.clone());
-            }
-            OutputChunk::ToolArgumentsDelta { content } => arguments.last_mut().expect("delta follows a call").push_str(content),
-            other => panic!("unexpected chunk {other:?}"),
-        }
-    }
-    for (call, text) in projection.calls.iter_mut().zip(arguments) {
-        call.1 = serde_json::from_str(&text).unwrap_or_else(|error| panic!("arguments {text:?}: {error}"));
-    }
-    projection
-}
-
-fn parse(options: &MiniMaxParserOptions, pieces: &[&str]) -> Projection {
-    let mut parser = MiniMaxOutputParser::new(options.clone());
-    let mut chunks = Vec::new();
-    for piece in pieces { chunks.extend(parser.push(piece)); }
-    chunks.extend(parser.finish());
-    project(&chunks, parser.stop().cloned())
-}
-
-/// Parse whole, at every two-way split, and one character at a time; all must agree.
 fn parse_everywhere(options: &MiniMaxParserOptions, text: &str) -> Projection {
-    let whole = parse(options, &[text]);
-    for (index, _) in text.char_indices() {
-        assert_eq!(parse(options, &[&text[..index], &text[index..]]), whole, "split at {index}");
-    }
-    let characters: Vec<String> = text.chars().map(String::from).collect();
-    let pieces: Vec<&str> = characters.iter().map(String::as_str).collect();
-    assert_eq!(parse(options, &pieces), whole, "character stream");
-    whole
+    harness::parse_everywhere(|| MiniMaxOutputParser::new(options.clone()), text)
 }
 
 fn options(tools: Option<Vec<ToolDefinition>>) -> MiniMaxParserOptions {

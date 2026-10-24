@@ -18,7 +18,7 @@ use deepseek_recipe::stream::OutputChunk;
 use deepseek_recipe_core::tools::ToolDefinition;
 use serde_json::{Map, Value};
 use super::{CALL_OPEN, CALL_CLOSE, INVOKE_OPEN, INVOKE_CLOSE, NS, THINK_OPEN, THINK_CLOSE};
-use super::super::glm5::{parser::GlmStop, processor::TextParser};
+use super::super::glm5::{parser::{excerpt, held_prefix, GlmStop, VisibleContent}, processor::TextParser};
 
 #[derive(Debug, Clone, Default)]
 pub struct MiniMaxParserOptions {
@@ -40,9 +40,7 @@ pub struct MiniMaxOutputParser {
     block: bool,
     scanned: usize,
     calls: usize,
-    content_started: bool,
-    /// Trailing content whitespace, sent only before more content.
-    held: String,
+    visible: VisibleContent,
     /// The whitespace held before the open block, kept if the block returns as content.
     before: String,
     stop: Option<GlmStop>,
@@ -51,23 +49,13 @@ pub struct MiniMaxOutputParser {
 impl MiniMaxOutputParser {
     pub fn new(options: MiniMaxParserOptions) -> Self {
         Self { reasoning: options.thinking, options, pending: String::new(), block: false, scanned: 0, calls: 0,
-            content_started: false, held: String::new(), before: String::new(), stop: None }
+            visible: VisibleContent::default(), before: String::new(), stop: None }
     }
 
     fn emit(&mut self, text: String, out: &mut Vec<OutputChunk>) {
         if text.is_empty() { return; }
         if self.reasoning { out.push(OutputChunk::Reasoning { content: text }); }
-        else if self.calls == 0 { self.content(&text, out); }
-    }
-
-    /// glm5's `emit_content`: leading whitespace is dropped, trailing whitespace waits for more content.
-    fn content(&mut self, text: &str, out: &mut Vec<OutputChunk>) {
-        let text = if self.content_started { text } else { text.trim_start() };
-        if text.is_empty() { return; }
-        self.content_started = true;
-        let body = text.trim_end();
-        if !body.is_empty() { out.push(OutputChunk::Raw { content: std::mem::take(&mut self.held) + body }); }
-        self.held.push_str(&text[body.len()..]);
+        else if self.calls == 0 { self.visible.emit(&text, out); }
     }
 
     /// A closed block: each well-formed invoke is a call, the rest returns as content.
@@ -89,7 +77,7 @@ impl MiniMaxOutputParser {
                 }
                 Err(reason) => {
                     tracing::warn!(id = %self.options.id, reason, text = %excerpt(text), "MiniMax tool invoke returned as content");
-                    self.content(text, out);
+                    self.visible.emit(text, out);
                 }
             }
         }
@@ -98,8 +86,8 @@ impl MiniMaxOutputParser {
     /// Return a whole block as content, after the whitespace that preceded it.
     fn lose(&mut self, text: &str, before: String, reason: &str, out: &mut Vec<OutputChunk>) {
         tracing::warn!(id = %self.options.id, reason, text = %excerpt(text), "MiniMax tool block returned as content");
-        self.held = before;
-        self.content(text, out);
+        self.visible.restore(before);
+        self.visible.emit(text, out);
     }
 
     fn drain(&mut self, final_chunk: bool) -> Vec<OutputChunk> {
@@ -133,7 +121,7 @@ impl MiniMaxOutputParser {
                 let text = self.pending.drain(..index).collect();
                 self.emit(text, &mut out);
                 if marker == CALL_OPEN && self.options.tools.is_some() {
-                    self.before = std::mem::take(&mut self.held);
+                    self.before = self.visible.take_held();
                     self.block = true;
                     continue;
                 }
@@ -169,20 +157,6 @@ impl TextParser for MiniMaxOutputParser {
     fn finish(&mut self) -> Vec<OutputChunk> { self.drain(true) }
     fn stop(&self) -> Option<&GlmStop> { self.stop.as_ref() }
     fn tool_calls(&self) -> usize { self.calls }
-}
-
-fn held_prefix(text: &str, marker: &str) -> usize {
-    (1..marker.len().min(text.len() + 1)).rev().find(|&n| {
-        text.is_char_boundary(text.len() - n) && marker.starts_with(&text[text.len() - n..])
-    }).unwrap_or(0)
-}
-
-/// A short excerpt of model text for a log line.
-fn excerpt(text: &str) -> String {
-    match text.char_indices().nth(80) {
-        Some((cut, _)) => format!("{:?}...", &text[..cut]),
-        None => format!("{text:?}"),
-    }
 }
 
 /// A block's invokes and the text between them, each with the whitespace before it.
