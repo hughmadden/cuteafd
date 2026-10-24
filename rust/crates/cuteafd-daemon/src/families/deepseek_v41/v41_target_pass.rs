@@ -139,6 +139,8 @@ pub(crate) struct Pass<'a, R> {
     sampled: Option<SampledTargetRows>,
     chain: Option<crate::shared::memory::chain::StageChain<'a>>,
     device_order: bool,
+    /// The next pass may L2-prefetch during its exchanges ([`Self::set_l2_prefetch`]).
+    l2_solo: bool,
 }
 
 pub(crate) type TargetPass<'w, 'a> = Pass<'a, SingleResources<'w, 'a>>;
@@ -176,6 +178,10 @@ impl<'a, R> Pass<'a, R> {
     }
 
     pub(crate) fn set_device_order(&mut self, on: bool) { self.device_order = on; }
+    /// Whether the next pass may prefetch weights into L2 during its Spark
+    /// exchanges (`--l2-prefetch`): only while the other lane is idle. Consumed
+    /// by that pass, like the device order.
+    pub(crate) fn set_l2_prefetch(&mut self, on: bool) { self.l2_solo = on; }
 }
 impl<'w, 'a> TargetPass<'w, 'a> {
     pub fn bind_execution_plan(&self, placement: &cuteafd_loader::placement::Placement) -> Result<()> {
@@ -249,7 +255,12 @@ impl<'w, 'a> TargetPass<'w, 'a> {
             sampled: None,
             chain,
             device_order: true,
+            l2_solo: true,
         })
+    }
+    /// `--l2-prefetch` with `budget` bytes per layer (see [`BackboneLane::enable_l2_prefetch`]).
+    pub fn enable_l2_prefetch(&mut self, budget: usize) -> Result<()> {
+        self.resources.lane.enable_l2_prefetch(budget)
     }
     /// # Safety
     /// All components belong to the same device, capacity and official model.
@@ -417,6 +428,8 @@ impl<'w, 'a> TargetPass<'w, 'a> {
         let step_sample = if verification && tracing::enabled!(target: "cuteafd::target_step", tracing::Level::DEBUG) {
             Some((batch.cache()?.positions().len(), std::time::Instant::now()))
         } else { None };
+        // `--l2-prefetch` only while the other lane is idle (consumed per pass).
+        self.resources.lane.set_l2_prefetch(std::mem::replace(&mut self.l2_solo, true));
         let Some(handle) = self.begin_chain(verification)? else {
             return unsafe { self.execute_phase_inner(requests, batch, transport, placement, selected,
                 suffix, encoder, terminal).await };
@@ -828,6 +841,7 @@ mod tests {
             sampled: None,
             chain: None,
             device_order: false,
+            l2_solo: true,
         };
         assert!(pass.begin_chain(false)?.is_none());
         assert!(pass.begin_chain(true)?.is_none());
@@ -836,6 +850,8 @@ mod tests {
         assert!(pass.state.begin().is_err());
         pass.set_device_order(true);
         assert!(pass.device_order);
+        pass.set_l2_prefetch(false);
+        assert!(!pass.l2_solo);
         Ok(())
     }
 

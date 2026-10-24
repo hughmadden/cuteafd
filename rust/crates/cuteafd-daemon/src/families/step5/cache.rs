@@ -5,38 +5,7 @@ use cuteafd_ffi::CuteafdDeviceBuffer;
 use cuteafd_loader::serving_capacity::step5::{ByteSpan, Step5CacheLayout};
 use std::{cell::{Cell, RefCell}, rc::{Rc, Weak}};
 
-/// Checked cache-only reservations. Weights, code, workspace and transport must
-/// be subtracted before supplying the available bytes to `CacheRank::new`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct Reservation {
-    active: usize,
-    marks: usize,
-    pages: usize,
-    total: usize,
-}
-
-impl Reservation {
-    fn new(layout: &Step5CacheLayout, rank: usize, sequences: u64, slots: u64,
-        pages: u64, available: usize) -> Result<Self> {
-        ensure!(sequences > 0 && pages > 0, "empty Step-5 cache capacity");
-        let state = layout.ranks.get(rank).context("Step-5 cache rank")?;
-        let geometry = layout.geometry.ranks.get(rank).context("Step-5 cache geometry rank")?;
-        let declared = state.regions.iter().try_fold(0u64, |sum, region|
-            sum.checked_add(region.page_bytes.checked_mul(2)?))
-            .context("Step-5 CSA page geometry overflow")?;
-        ensure!(geometry.persistent_unit_bytes == declared, "Step-5 inconsistent CSA page geometry");
-        let bytes = |unit: u64, count: u64| -> Result<usize> {
-            Ok(usize::try_from(unit.checked_mul(count).context("Step-5 cache allocation overflow")?)?)
-        };
-        let active = bytes(state.bytes, sequences)?;
-        let marks = bytes(state.bytes, slots)?;
-        let pages = bytes(geometry.persistent_unit_bytes, pages)?;
-        let total = active.checked_add(marks).and_then(|n| n.checked_add(pages))
-            .context("Step-5 cache total overflow")?;
-        ensure!(total <= available, "Step-5 cache needs {total} bytes, admitted only {available}");
-        Ok(Self { active, marks, pages, total })
-    }
-}
+pub(super) use cuteafd_loader::plan::families::step5::admission::Reservation;
 
 /// Maintenance owns its stream; transactions use registered lane streams.
 /// Boundary operations join every live lane before copying shared state.
@@ -44,8 +13,8 @@ pub(super) struct CacheRank<'a> {
     pub stream: Stream<'a>,
     lane_streams: RefCell<Vec<Weak<Stream<'a>>>>,
     active: Allocation<'a>,
-    marks: Option<Allocation<'a>>,
-    pages: Option<Allocation<'a>>,
+    marks: Option<Rc<Allocation<'a>>>,
+    pages: Option<Rc<Allocation<'a>>>,
     page_count: u64,
     layout: Step5CacheLayout,
     rank: usize,
@@ -53,6 +22,7 @@ pub(super) struct CacheRank<'a> {
     slots: u64,
     marks_at: Vec<Option<u64>>,
     pending_bank: Vec<Cell<bool>>,
+    predictor_evidence: Vec<Vec<Cell<u64>>>,
     pub(super) poisoned: Cell<bool>,
     pub(super) busy: Vec<Cell<bool>>,
     reservation: Reservation,
@@ -75,11 +45,14 @@ impl<'a> CacheRank<'a> {
         // Allocate all storage before enqueueing initialization: failed allocation
         // cannot release an earlier plane still being initialized asynchronously.
         let active = Allocation::new(device, reservation.active)?;
-        let marks = if reservation.marks > 0 { Some(Allocation::new(device, reservation.marks)?) } else { None };
+        let marks = if reservation.marks > 0 { Some(Rc::new(Allocation::new(device, reservation.marks)?)) } else { None };
         let page_count = pages;
-        let pages = if reservation.pages > 0 { Some(Allocation::new(device, reservation.pages)?) } else { None };
+        let pages = if reservation.pages > 0 { Some(Rc::new(Allocation::new(device, reservation.pages)?)) } else { None };
+        let predictor_evidence = (0..sequences).map(|_|
+            (0..layout.ranks[rank].mtp_lengths.len()).map(|_| Cell::new(0)).collect()).collect();
         let owner = Self { stream, lane_streams: RefCell::new(Vec::new()), active, marks, pages, page_count, layout, rank, sequences, slots,
-            marks_at, pending_bank: vec![Cell::new(false); usize::try_from(sequences)?], poisoned: Cell::new(false), busy: vec![Cell::new(false); usize::try_from(sequences)?], reservation };
+            marks_at, pending_bank: vec![Cell::new(false); usize::try_from(sequences)?], predictor_evidence,
+            poisoned: Cell::new(false), busy: vec![Cell::new(false); usize::try_from(sequences)?], reservation };
         let mut guard = owner.stream.cancellation_guard("Step-5 cache initialization");
         device.run(|| {
             // SAFETY: the active allocation is live through completion on the owned stream.
@@ -98,17 +71,49 @@ impl<'a> CacheRank<'a> {
             "Step-5 cache lane stream device mismatch");
         let mut streams = self.lane_streams.borrow_mut();
         streams.retain(|stream| stream.strong_count() > 0);
-        ensure!(streams.iter().all(|other| !other.ptr_eq(&Rc::downgrade(stream))),
-            "Step-5 duplicate cache lane stream");
-        streams.push(Rc::downgrade(stream));
+        // Sequential target/predictor owners share one stream; retain it once.
+        let stream = Rc::downgrade(stream);
+        if streams.iter().all(|other| !other.ptr_eq(&stream)) {
+            streams.push(stream);
+        }
         Ok(())
     }
 
     pub fn drain(&self) -> Result<()> {
-        for stream in self.lane_streams.borrow().iter().filter_map(Weak::upgrade) {
-            stream.drain()?;
+        super::execution::collect_lane_results(self.lane_streams.borrow().iter()
+            .filter_map(Weak::upgrade).map(|stream| stream.drain())
+            .chain(std::iter::once_with(|| self.stream.drain())))
+    }
+
+    pub(super) fn validate_reset(&self, sequence: u64) -> Result<()> {
+        self.check_idle(sequence)
+    }
+
+    /// Old KV and summaries remain masked by the zero frontier. Only canonical
+    /// lengths and both pending banks must be initialized before slot reuse.
+    pub(super) fn reset_sequence(&self, sequence: u64) -> Result<()> {
+        self.validate_reset(sequence)?;
+        self.drain()?;
+        let state = &self.layout.ranks[self.rank];
+        let spans = [state.length, state.next_length].into_iter()
+            .chain(state.mtp_lengths.iter().copied())
+            .chain(state.regions.iter().flat_map(|region| [region.pending_key,
+                region.pending_z, region.next_key, region.next_z]));
+        let mut guard = self.stream.cancellation_guard("Step-5 cold sequence reset");
+        for span in spans {
+            let target = self.request_component(span, sequence)?;
+            self.stream.device.run(|| {
+                // SAFETY: an idle private sequence owns these nonpaged banks;
+                // the guard drains errors before any state can be reused.
+                unsafe { self.stream.device.library.cuda_zero_bytes_async(
+                    target, target.bytes, self.stream.raw) }
+            })?;
         }
-        self.stream.drain()
+        self.stream.drain()?;
+        self.pending_bank[sequence as usize].set(false);
+        for stage in &self.predictor_evidence[sequence as usize] { stage.set(0); }
+        guard.complete = true;
+        Ok(())
     }
 
     pub fn bytes(&self) -> usize { self.reservation.total }
@@ -117,6 +122,10 @@ impl<'a> CacheRank<'a> {
         self.pages.as_ref().map_or(CuteafdDeviceBuffer {
             ptr: std::ptr::null_mut(), bytes: 0, ..self.active.buffer
         }, |pages| pages.buffer)
+    }
+    /// Complete registered snapshot inventory, not just one slot or page view.
+    pub(super) fn snapshot_owners(&self) -> Vec<Rc<Allocation<'a>>> {
+        self.marks.iter().chain(self.pages.iter()).cloned().collect()
     }
     pub fn layout(&self) -> &Step5CacheLayout { &self.layout }
     pub fn rank(&self) -> usize { self.rank }
@@ -184,7 +193,7 @@ impl<'a> CacheRank<'a> {
     pub fn component(&self, span: ByteSpan) -> Result<CuteafdDeviceBuffer> {
         let state = &self.layout.ranks[self.rank];
         let declared = span == state.length || span == state.next_length || state.mtp_hidden == Some(span)
-            || state.mtp_lengths.contains(&span)
+            || state.mtp_lengths.contains(&span) || state.mtp_stage_hidden.contains(&span)
             || state.sliding.iter().any(|s| s.key == span || s.value == span)
             || state.regions.iter().any(|r| r.pending_key == span || r.pending_z == span || r.next_key == span || r.next_z == span || r.summaries == Some(span));
         ensure!(declared, "Step-5 component is not part of this rank's cache layout");
@@ -217,9 +226,35 @@ impl<'a> CacheRank<'a> {
         self.request_component(if bank { state.next_length } else { state.length }, sequence)
     }
 
-    fn snapshot_copies(&self, sequence: u64, slot: u64, frontier: u64)
+    /// Submission evidence only; the authoritative length remains in device state.
+    /// Restore refreshes this evidence once at the prefix boundary, never per step.
+    pub(super) fn predictor_frontier(&self, sequence: u64, stage: usize) -> Result<u64> {
+        self.validate_reset(sequence)?;
+        Ok(self.predictor_evidence[sequence as usize].get(stage)
+            .context("Step-5 predictor stage evidence missing")?.get())
+    }
+
+    pub(super) fn record_predictor_frontier(&self, sequence: u64, stage: usize, end: u64) -> Result<()> {
+        self.predictor_evidence.get(sequence as usize).and_then(|stages| stages.get(stage))
+            .context("Step-5 predictor publication evidence missing")?.set(end);
+        Ok(())
+    }
+
+    fn predictor_frontiers(&self, sequence: u64, slot: Option<u64>) -> Result<Vec<u64>> {
+        let mark = slot.map(|slot| self.mark_view(u32::try_from(slot)?)).transpose()?;
+        self.layout.ranks[self.rank].mtp_lengths.iter().map(|&span| {
+            ensure!(span.bytes == 8, "Step-5 predictor frontier width");
+            let source = if let Some(mark) = mark { view(mark, span)? }
+                else { self.request_component(span, sequence)? };
+            let mut encoded = [0; 8];
+            self.stream.device.run(|| self.stream.device.library.copy_d2h(&mut encoded, source))?;
+            Ok(u64::from_le_bytes(encoded))
+        }).collect()
+    }
+
+    fn snapshot_copies(&self, sequence: u64, slot: u64, frontier: u64, stages: &[u64])
         -> Result<Vec<cuteafd_loader::serving_capacity::step5::SnapshotCopy>> {
-        let mut copies = self.layout.snapshot_copies(self.rank, frontier, self.sequences,
+        let mut copies = self.layout.snapshot_copies(self.rank, frontier, stages, self.sequences,
             sequence, self.slots, slot)?;
         if self.pending_bank[sequence as usize].get() {
             let state = &self.layout.ranks[self.rank];
@@ -246,7 +281,8 @@ impl<'a> CacheRank<'a> {
     pub fn capture(&mut self, sequence: u64, slot: u64, frontier: u64) -> Result<()> {
         self.check_idle(sequence)?;
         self.drain()?;
-        let copies = self.snapshot_copies(sequence, slot, frontier)?;
+        let stages = self.predictor_frontiers(sequence, None)?;
+        let copies = self.snapshot_copies(sequence, slot, frontier, &stages)?;
         let marks = self.marks.as_ref().context("Step-5 prefix retention is disabled")?.buffer;
         self.marks_at[usize::try_from(slot)?] = None;
         let mut guard = self.stream.cancellation_guard("Step-5 cache capture");
@@ -270,19 +306,53 @@ impl<'a> CacheRank<'a> {
     pub fn restore(&mut self, sequence: u64, slot: u64, frontier: u64) -> Result<()> {
         self.check_idle(sequence)?;
         self.drain()?;
-        let copies = self.snapshot_copies(sequence, slot, frontier)?;
+        let stages = self.predictor_frontiers(sequence, Some(slot))?;
+        let copies = self.snapshot_copies(sequence, slot, frontier, &stages)?;
         ensure!(self.marks_at[usize::try_from(slot)?] == Some(frontier),
             "Step-5 mark is absent or belongs to a different frontier");
-        self.restore_copies(copies)
+        self.restore_copies(copies)?;
+        for (stage, end) in stages.into_iter().enumerate() {
+            self.record_predictor_frontier(sequence, stage, end)?;
+        }
+        Ok(())
     }
 
-    /// Shared prefix metadata identifies host-restored marks; local capture
-    /// bookkeeping cannot identify a slot that the host tier just overwrote.
+    /// Validate canonical bytes, not arena-local capture bookkeeping, before
+    /// any rank installs a host-promoted snapshot into active state.
+    pub fn validate_retained(&self, sequence: u64, slot: u64, frontier: u64) -> Result<()> {
+        self.check_idle(sequence)?;
+        self.drain()?;
+        let stages = self.predictor_frontiers(sequence, Some(slot))?;
+        self.snapshot_copies(sequence, slot, frontier, &stages)?;
+        let mark = self.mark_view(u32::try_from(slot)?)?;
+        let length = self.layout.ranks[self.rank].length;
+        ensure!(length.bytes == 8, "Step-5 canonical mark length width");
+        let source = view(mark, length)?;
+        let mut encoded = [0; 8];
+        self.stream.device.run(|| self.stream.device.library.copy_d2h(&mut encoded, source))?;
+        validate_mark_length(encoded, frontier)
+    }
+
+    pub(super) fn validate_predictor_metadata(&self, sequence: u64, slot: u64, expected: &[u64]) -> Result<()> {
+        self.check_idle(sequence)?;
+        self.drain()?;
+        ensure!(self.predictor_frontiers(sequence, Some(slot))? == expected,
+            "Step-5 retained predictor metadata differs from canonical mark counters");
+        Ok(())
+    }
+
+    /// Caller validates every rank with validate_retained before installing any
+    /// rank. The shared family retains the arena slot across both phases.
     pub fn restore_retained(&self, sequence: u64, slot: u64, frontier: u64) -> Result<()> {
         self.check_idle(sequence)?;
         self.drain()?;
-        let copies = self.snapshot_copies(sequence, slot, frontier)?;
-        self.restore_copies(copies)
+        let stages = self.predictor_frontiers(sequence, Some(slot))?;
+        let copies = self.snapshot_copies(sequence, slot, frontier, &stages)?;
+        self.restore_copies(copies)?;
+        for (stage, end) in stages.into_iter().enumerate() {
+            self.record_predictor_frontier(sequence, stage, end)?;
+        }
+        Ok(())
     }
 
     fn check_idle(&self, sequence: u64) -> Result<()> {
@@ -313,6 +383,12 @@ impl<'a> CacheRank<'a> {
     }
 }
 
+fn validate_mark_length(encoded: [u8; 8], frontier: u64) -> Result<()> {
+    ensure!(u64::from_le_bytes(encoded) == frontier,
+        "Step-5 canonical mark length differs from retained frontier");
+    Ok(())
+}
+
 #[cfg(test)]
 pub(super) mod tests {
     use super::*;
@@ -324,6 +400,11 @@ pub(super) mod tests {
     }
 
     pub(in crate::families::step5) fn layout_for(context: u64, ranks: usize, mtp: usize, step: u64) -> Step5CacheLayout {
+        layout_with_format(context, ranks, mtp, step, cuteafd_loader::families::qwen4::Qwen4KvCache::Bf16)
+    }
+
+    pub(in crate::families::step5) fn layout_with_format(context: u64, ranks: usize, mtp: usize, step: u64,
+        kv_format: cuteafd_loader::families::qwen4::Qwen4KvCache) -> Step5CacheLayout {
         let config = cuteafd_loader::plan::families::step5::Config {
             norm_eps: 1e-5, hidden: 4096, vocab: 128896, layers: 92, mtp: 3,
             dense: 13824, experts: 352, intermediate: 1536, shared: 1536, topk: 8,
@@ -333,7 +414,52 @@ pub(super) mod tests {
             rope_scaling: None, scale_full: false, scale_sliding: false,
             activation: Vec::new(), shared_activation: Vec::new(),
         };
-        Step5CacheLayout::new(&config, ranks, context, mtp, step).unwrap()
+        Step5CacheLayout::new(&config, ranks, context, mtp, step, kv_format).unwrap()
+    }
+
+    #[test]
+    #[ignore = "requires CUTEAFD_NATIVE_LIB and CUDA"]
+    fn native_cold_slot_reset_clears_both_banks_without_touching_other_slots() -> Result<()> {
+        use cuteafd_loader::families::qwen4::Qwen4KvCache;
+        // SAFETY: the selected library implements the native CUDA ABI.
+        let library = unsafe { cuteafd_ffi::NativeLibrary::load(std::env::var("CUTEAFD_NATIVE_LIB")?)? };
+        let device = crate::shared::memory::device::cache_test_device(&library)?;
+        for (kv_format, depth) in [Qwen4KvCache::Bf16, Qwen4KvCache::Fp8].into_iter()
+            .flat_map(|format| (0..=3).map(move |depth| (format, depth))) {
+        let layout = layout_with_format(65, 1, depth, 64, kv_format);
+        let cache = CacheRank::new(device, layout.clone(), 0, 2, 1, 2, usize::MAX)?;
+        let initial = vec![0xa5; cache.active.buffer.bytes];
+        device.run(|| library.copy_h2d(cache.active.buffer, &initial))?;
+        cache.publish_bank(1);
+        cache.reset_sequence(1)?;
+        let mut actual = vec![0; initial.len()];
+        device.run(|| library.copy_d2h(&mut actual, cache.active.buffer))?;
+        let mut expected = initial;
+        let state = &layout.ranks[0];
+        for span in [state.length, state.next_length].into_iter()
+            .chain(state.mtp_lengths.iter().copied())
+            .chain(state.regions.iter().flat_map(|region| [region.pending_key,
+                region.pending_z, region.next_key, region.next_z])) {
+            let offset = usize::try_from(span.offset * 2 + span.bytes)?;
+            expected[offset..offset + usize::try_from(span.bytes)?].fill(0);
+        }
+        assert_eq!(actual, expected);
+        assert!(!cache.pending_bank[1].get());
+        cache.busy[1].set(true);
+        assert!(cache.reset_sequence(1).is_err());
+        cache.busy[1].set(false);
+        assert!(cache.reset_sequence(2).is_err());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn canonical_mark_length_requires_exact_encoded_frontier() {
+        for frontier in [0u64, 1, 63, 64, 65, 1 << 20, u64::MAX] {
+            validate_mark_length(frontier.to_le_bytes(), frontier).unwrap();
+            assert!(validate_mark_length(frontier.wrapping_add(1).to_le_bytes(), frontier).is_err());
+            assert!(validate_mark_length(frontier.wrapping_sub(1).to_le_bytes(), frontier).is_err());
+        }
     }
 
     #[test]
@@ -381,32 +507,45 @@ pub(super) mod tests {
         // SAFETY: the explicitly selected native library implements the CUDA ABI.
         let library = unsafe { cuteafd_ffi::NativeLibrary::load(std::env::var("CUTEAFD_NATIVE_LIB")?)? };
         let device = crate::shared::memory::device::cache_test_device(&library)?;
-        let layout = layout();
+        for kv_format in [cuteafd_loader::families::qwen4::Qwen4KvCache::Bf16,
+            cuteafd_loader::families::qwen4::Qwen4KvCache::Fp8] {
+        for depth in 0..=3 {
+        let layout = layout_with_format(65, 1, depth, 64, kv_format);
+        let stages = [64u64, 62, 60][..depth].to_vec();
         let mut cache = CacheRank::new(device, layout.clone(), 0, 2, 2, 1, usize::MAX)?;
         assert_eq!(cache.bytes(), Reservation::new(&layout, 0, 2, 2, 1, usize::MAX)?.total);
         assert!(cache.page_pool().bytes > 0);
-        let copies = layout.snapshot_copies(0, 65, 2, 0, 2, 0)?;
+        let copies = layout.snapshot_copies(0, 65, &stages, 2, 0, 2, 0)?;
         for (i, copy) in copies.iter().enumerate() {
             let plane = view(cache.active.buffer, copy.active)?;
             let data: Vec<u8> = (0..plane.bytes).map(|n| (n.wrapping_mul(37) + i) as u8).collect();
             device.run(|| library.copy_h2d(plane, &data))?;
+        }
+        for (&span, &frontier) in layout.ranks[0].mtp_lengths.iter().zip(&stages) {
+            device.run(|| library.copy_h2d(cache.request_component(span, 0)?, &frontier.to_le_bytes()))?;
         }
         assert!(cache.restore(0, 0, 65).is_err());
         cache.capture(0, 0, 65)?;
         assert!(cache.restore(1, 0, 64).is_err());
         device.run(|| library.copy_h2d(cache.active.buffer, &vec![0xa5; cache.active.buffer.bytes]))?;
         cache.restore(1, 0, 65)?;
-        let restored = layout.snapshot_copies(0, 65, 2, 1, 2, 0)?;
+        let restored = layout.snapshot_copies(0, 65, &stages, 2, 1, 2, 0)?;
         let mut actual = vec![0; cache.active.buffer.bytes];
         device.run(|| library.copy_d2h(&mut actual, cache.active.buffer))?;
         let mut expected = vec![0xa5; actual.len()];
         for (i, copy) in restored.iter().enumerate() {
             let at = copy.active.offset as usize;
-            for n in 0..copy.active.bytes as usize { expected[at + n] = (n.wrapping_mul(37) + i) as u8; }
+            let predictor_length = layout.ranks[0].mtp_lengths.iter().position(|s|
+                copy.mark.offset == s.offset).map(|stage| stages[stage].to_le_bytes());
+            for n in 0..copy.active.bytes as usize {
+                expected[at + n] = if let Some(length) = predictor_length { length[n] } else { (n.wrapping_mul(37) + i) as u8 };
+            }
         }
         assert_eq!(actual, expected);
         assert!(cache.capture(2, 0, 65).is_err());
         assert!(cache.capture(0, 2, 65).is_err());
+        }
+        }
         Ok(())
     }
 }

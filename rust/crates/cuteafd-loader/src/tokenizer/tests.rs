@@ -25,6 +25,31 @@ fn byte_tokenizer() -> tempfile::TempDir {
 }
 
 #[test]
+fn added_markers_and_grammar_document_use_native_tiktoken_without_json_file() {
+    let dir = tempfile::tempdir().unwrap();
+    crate::plan::testing::write_kimi_tokenizer(dir.path());
+    let tokenizer = LoadedTokenizer::from_snapshot(dir.path()).unwrap();
+    assert_eq!(tokenizer.added_token_ids(&["<|end_of_msg|>", "a", "missing", "<|open|>"]), [257, 256]);
+    let doc = tokenizer.grammar_tokenizer_json().unwrap();
+    let grammar: tokenizers::Tokenizer = serde_json::from_str(&doc).unwrap();
+    for text in ["hello", "<|open|>user<|end_of_msg|>"] {
+        assert_eq!(grammar.encode_fast(text, false).unwrap().get_ids(), tokenizer.encode_ids(text).unwrap());
+    }
+    assert!(!dir.path().join("tokenizer.json").exists());
+}
+
+#[test]
+fn added_markers_do_not_include_ordinary_json_vocabulary() {
+    let dir = byte_tokenizer();
+    let mut value: serde_json::Value = serde_json::from_slice(&std::fs::read(dir.path().join("tokenizer.json")).unwrap()).unwrap();
+    value["added_tokens"] = serde_json::json!([{"id":256,"content":"<|open|>","single_word":false,
+        "lstrip":false,"rstrip":false,"normalized":false,"special":true}]);
+    std::fs::write(dir.path().join("tokenizer.json"), value.to_string()).unwrap();
+    let tokenizer = LoadedTokenizer::from_snapshot(dir.path()).unwrap();
+    assert_eq!(tokenizer.added_token_ids(&["a", "missing", "<|open|>"]), [256]);
+}
+
+#[test]
 fn terminal_utf8_matches_lossy_whole_decode_at_every_byte_boundary() {
     let dir = byte_tokenizer();
     for text in [

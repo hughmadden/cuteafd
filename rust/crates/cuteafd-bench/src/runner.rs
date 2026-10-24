@@ -417,6 +417,7 @@ impl Bench {
             "readiness_s": crate::context::readiness_s(),
             "full_prefill_logits": crate::fidelity_dataset::prefill_admitted(&crate::context::get().settings),
             "snapshot": crate::context::get().snapshot,
+            "settings": crate::context::get().settings,
             "fingerprint": fingerprint,
             "model": info.as_ref().map(|i| i.model.clone()),
             "checkpoint": crate::context::get().snapshot.as_ref().and_then(|p| crate::report::hub_repo(&p.to_string_lossy()))
@@ -534,7 +535,7 @@ impl Bench {
             *slot = Some(active.clone());
         }
         let report = Arc::new(Mutex::new(Report {
-            schema: SCHEMA.into(), id: id.clone(), created: now_rfc3339(), finished: None, status: RunStatus::Running,
+            schema: SCHEMA.into(), prompt_content: Some(crate::text::PROMPT_CONTENT.into()), id: id.clone(), created: now_rfc3339(), finished: None, status: RunStatus::Running,
             profile: name, plan: plan.clone(), server: ServerInfo::default(), fingerprint: String::new(), baseline: None,
             panels: plan.iter().map(|p| PanelResult { id: p.id.clone(),
                 title: panels::find(&p.id).map_or(p.id.clone(), |panel| panel.title().to_string()),

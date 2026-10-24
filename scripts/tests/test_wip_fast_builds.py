@@ -282,6 +282,8 @@ def test_seed_uses_only_owner_aware_build_resource():
     assert 'wip_seed_lease_' not in text
     assert 'wip_build_resource_acquire' in text
     helpers = text[text.index('wip_seed_lock() {'):text.index('\n}\n', text.index('wip_seed_lock() {')) + 3]
-    result = subprocess.run(['bash', '-c', helpers + '\nwip_seed_lock rhea; wip_seed_lock ostrich; wip_seed_lock kakapo'],
+    common = (ROOT / 'scripts/lib/release-common.sh').read_text()
+    lan = common[common.index('release_lan_seed_hosts=('):common.index('# release_host_has_rdma HOST')]
+    result = subprocess.run(['bash', '-c', lan + helpers + '\nfor h in rhea ostrich kakapo cassowary; do wip_seed_lock $h; done'],
                             capture_output=True, text=True, timeout=5)
-    assert result.stdout.split() == ['rhea', 'sparks', 'kakapo']
+    assert result.stdout.split() == ['rhea', 'sparks', 'kakapo', 'cassowary']

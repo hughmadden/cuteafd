@@ -26,9 +26,69 @@ pub struct LayerBytes {
 pub struct DrafterBytes {
     pub owned: u64,
     pub scratch: u64,
+    /// Full-context draft K/V per target pool page, not per sequence/context.
+    pub pool_unit: u64,
 }
 
 impl DrafterBytes {
+    /// Native MTP owns one dense block, bounded hidden/logit planes and pooled KV sidecars.
+    pub fn native_mtp(checkpoint: &crate::plan::checkpoint::Checkpoint, cfg: &Qwen35Config) -> anyhow::Result<Self> {
+        use anyhow::Context;
+        ensure!(cfg.mtp_layers == 1, "dense MTP requires one checkpoint-native layer");
+        let tensor = |name: &str| checkpoint.tensors.iter().find(|t| t.meta.name == name)
+            .with_context(|| format!("dense MTP tensor missing: {name}"));
+        let fp8 = tensor("mtp.layers.0.mlp.gate_proj.weight")?.meta.dtype == DType::F8E4M3;
+        let mut groups = vec![vec!["input_layernorm.weight"], vec!["post_attention_layernorm.weight"],
+            vec!["mlp.down_proj.weight"], vec!["mlp.gate_proj.weight", "mlp.up_proj.weight"],
+            vec!["self_attn.q_proj.weight", "self_attn.k_proj.weight", "self_attn.v_proj.weight"],
+            vec!["self_attn.q_norm.weight"], vec!["self_attn.k_norm.weight"], vec!["self_attn.o_proj.weight"]];
+        let mut owned = 0u64;
+        for group in groups.drain(..) {
+            let projection = group[0].starts_with("mlp.") || matches!(group[0], "self_attn.q_proj.weight" | "self_attn.o_proj.weight");
+            let mut bytes = 0;
+            let mut scales = 0;
+            for name in group {
+                let full = format!("mtp.layers.0.{name}");
+                let value = &tensor(&full)?.meta;
+                ensure!(value.dtype == if fp8 && projection { DType::F8E4M3 } else { DType::Bf16 },
+                    "{full}: unsupported native MTP dtype");
+                bytes += value.byte_length;
+                if fp8 && projection {
+                    let scale = &tensor(&format!("{full}_scale_inv"))?.meta;
+                    ensure!(matches!(scale.dtype, DType::Bf16 | DType::F32), "{full}: unsupported scale dtype");
+                    scales += scale.byte_length * if scale.dtype == DType::Bf16 { 2 } else { 1 };
+                }
+            }
+            owned += bytes.max(256);
+            if fp8 && projection { owned += scales.max(256); }
+        }
+        for (name, shape) in [("fc", vec![cfg.hidden, 2 * cfg.hidden]), ("norm", vec![cfg.hidden]),
+            ("pre_fc_norm_hidden", vec![cfg.hidden]), ("pre_fc_norm_embedding", vec![cfg.hidden])] {
+            let full = format!("mtp.{name}.weight");
+            let value = &tensor(&full)?.meta;
+            ensure!(value.dtype == DType::Bf16 && value.shape == shape, "{full}: native MTP shape/dtype differs");
+            owned += value.byte_length.max(256);
+        }
+        owned += ((64 * 2 + 4096) * cfg.hidden * 2 + 64 * cfg.vocab * 4) as u64;
+        // The independent greedy selector owns one ID/status/log-probability row.
+        owned += 12;
+        let record = crate::families::qwen4::Qwen4KvCache::Bf16.record_bytes(cfg.kv_heads, cfg.head_dim);
+        Ok(Self { owned, scratch: 0, pool_unit: (64 * record + cfg.hidden * 2) as u64 })
+    }
+
+    pub fn block_dspark(config: &serde_json::Value, slots: usize, sms: u64, context: usize)
+        -> anyhow::Result<Self> {
+        use crate::families::glm5::draft_representation::{block_dspark_paged_resident_bytes, GlmDraftRepresentation};
+        use crate::families::qwen4::Qwen4KvCache;
+        let cfg = crate::formats::block_dspark::BlockDsparkConfig::from_json(config)?;
+        ensure!(cfg.window.is_none(), "dense dSpark requires full-context cache");
+        let layout = cfg.paged_cache_layout(slots, context, PAGE_ROWS as usize, Qwen4KvCache::Bf16)?;
+        let (owned, scratch) = block_dspark_paged_resident_bytes(config, slots, slots, sms,
+            GlmDraftRepresentation::Bf16Only, 0, context, PAGE_ROWS as usize, Qwen4KvCache::Bf16)?;
+        Ok(Self { owned: owned.checked_sub(layout.full_bytes).ok_or_else(|| anyhow::anyhow!("draft inventory underflow"))?,
+            scratch, pool_unit: layout.full_bytes })
+    }
+
     fn movable(self) -> Result<Movable, PlacementError> {
         crate::placement::draft::DrafterDemand::local(MovableId::Drafter, vec![Bytes2 { resident: self.owned, staging: 0 },
             Bytes2 { resident: self.scratch, staging: 0 }], 0).movable(1)
@@ -51,13 +111,18 @@ pub struct DenseInputs<'a> {
     pub pool_bounded: Vec<BoundedDemand>,
 }
 
-pub fn request(inputs: DenseInputs<'_>) -> Result<PlacementRequest> {
+pub fn request(mut inputs: DenseInputs<'_>) -> Result<PlacementRequest> {
     ensure!(!inputs.cfg.attention.is_empty() && inputs.layers.len() == inputs.cfg.attention.len(),
         "dense Qwen layer byte inventory differs from checkpoint");
     ensure!(inputs.record_bytes > 0 && inputs.max_context > 0, "invalid dense Qwen cache geometry");
     ensure!(inputs.fixed.iter().all(|item| item.gpu == 0)
         && inputs.pool_bounded.iter().all(|item| item.gpu == 0),
         "single-device dense Qwen demand names a peer");
+    if let Some(draft) = inputs.drafter.filter(|draft| draft.pool_unit > 0) {
+        inputs.pool_bounded.push(BoundedDemand { gpu: 0, category: Category::Drafter,
+            group: "full-context dSpark KV".into(), bytes_per_unit: draft.pool_unit,
+            offset_units: 0, cap_units: u64::MAX, basis: Basis::Exact });
+    }
     let layers = inputs.cfg.attention.iter().zip(inputs.layers).map(|(&kind, bytes)| {
         ensure!(bytes.weights > 0, "dense Qwen layer has no native weight admission");
         let mut extra = Vec::new();
@@ -117,6 +182,7 @@ pub const HEAD_WORKSPACE: usize = 4 << 20;
 pub struct NativeBuffers {
     pub planes: [usize; 13],
     pub logits: usize,
+    pub head_rows: usize,
     pub ids: usize,
     pub head: usize,
     pub commit: usize,
@@ -129,7 +195,7 @@ pub struct NativeBuffers {
 }
 
 impl NativeBuffers {
-    pub fn new(cfg: &Qwen35Config, scratch: usize, slots: usize, marks: usize) -> Result<Self> {
+    pub fn new(cfg: &Qwen35Config, scratch: usize, slots: usize, marks: usize, full_prefill_logits: bool) -> Result<Self> {
         ensure!((1..=VERIFY_ROWS).contains(&slots), "dense state slots must be 1..64");
         // Bound all products below before computing the native allocation recipe.
         ensure!(cfg.hidden <= 16_777_216 && cfg.vocab <= 16_777_216
@@ -150,7 +216,8 @@ impl NativeBuffers {
         let planes = [hidden, hidden, hidden, query, query, query, scratch,
             PREFILL_ROWS * 4, PREFILL_ROWS * 4, PREFILL_ROWS * 12, PREFILL_ROWS * 8,
             PREFILL_ROWS * 8, VERIFY_ROWS * cfg.max_context.div_ceil(64) * 4].map(|n| n.max(256));
-        Ok(Self { planes, logits: VERIFY_ROWS * cfg.vocab * 4, ids: PREFILL_ROWS * 4,
+        let head_rows = if full_prefill_logits { PREFILL_ROWS } else { VERIFY_ROWS };
+        Ok(Self { planes, logits: head_rows * cfg.vocab * 4, head_rows, ids: PREFILL_ROWS * 4,
             head: HEAD_WORKSPACE, commit: 3 * VERIFY_ROWS * 4, state_per_layer, replay_per_layer,
             verify: [mark_bytes.checked_mul(slots).ok_or_else(|| anyhow::anyhow!("dense verify mark overflow"))?.max(256),
                 VERIFY_ROWS * cfg.vocab * 4, cfg.attention.len() * VERIFY_ROWS * cfg.hidden * 2],
@@ -169,7 +236,7 @@ impl NativeBuffers {
     }
 }
 
-/// Header-only packed native BF16 allocations, including widened small GDN operands.
+/// Header-only native BF16/E4M3 allocations, including exact block scales and widened GDN operands.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NativeWeights {
     pub layers: Vec<u64>,
@@ -179,7 +246,7 @@ pub struct NativeWeights {
 }
 
 impl NativeWeights {
-    pub fn bf16(checkpoint: &crate::plan::checkpoint::Checkpoint, cfg: &Qwen35Config,
+    pub fn native(checkpoint: &crate::plan::checkpoint::Checkpoint, cfg: &Qwen35Config,
         norm_dtype: cuteafd_core::DType) -> Result<Self> {
         use cuteafd_core::DType;
         ensure!(matches!(norm_dtype, DType::Bf16 | DType::F32), "invalid native GDN norm dtype");
@@ -193,6 +260,7 @@ impl NativeWeights {
                 "{name}: unsupported native dense BF16 operand {dtype:?}");
             Ok(if widen && *dtype == DType::Bf16 { t.meta.byte_length * 2 } else { t.meta.byte_length })
         };
+        let fp8 = tensor("model.language_model.layers.0.mlp.gate_proj.weight")?.meta.dtype == DType::F8E4M3;
         let mut layers = Vec::new();
         for (index, &kind) in cfg.attention.iter().enumerate() {
             let p = format!("model.language_model.layers.{index}.");
@@ -201,18 +269,42 @@ impl NativeWeights {
                 names.iter().try_fold(0u64, |n, name| Ok(n + bytes(&format!("{p}{name}.weight"), false, false)?))
                     .map(|n| n.max(256))
             };
+            let projection = |names: &[&str]| -> Result<u64> {
+                if !fp8 { return pack(names); }
+                let mut weights = 0u64;
+                let mut scales = 0u64;
+                let mut columns = None;
+                for name in names {
+                    let name = format!("{p}{name}.weight");
+                    let w = tensor(&name)?;
+                    let scale = tensor(&format!("{name}_scale_inv"))?;
+                    ensure!(w.meta.dtype == DType::F8E4M3 && w.meta.shape.len() == 2
+                        && w.meta.shape.iter().all(|n| *n > 0 && n % 128 == 0),
+                        "{name}: expected whole 128x128 E4M3 blocks");
+                    ensure!(columns.is_none_or(|n| n == w.meta.shape[1]), "{name}: packed columns differ");
+                    columns = Some(w.meta.shape[1]);
+                    ensure!(scale.meta.shape == w.meta.shape.iter().map(|n| n / 128).collect::<Vec<_>>()
+                        && matches!(scale.meta.dtype, DType::Bf16 | DType::F32),
+                        "{name}: invalid native FP8 block scale grid");
+                    weights += w.meta.byte_length;
+                    scales += if scale.meta.dtype == DType::Bf16 { scale.meta.byte_length * 2 } else { scale.meta.byte_length };
+                }
+                Ok(weights.max(256) + scales.max(256))
+            };
             let mut total = one("input_layernorm")? + one("post_attention_layernorm")?
-                + one("mlp.down_proj")? + pack(&["mlp.gate_proj", "mlp.up_proj"])?;
+                + projection(&["mlp.down_proj"])? + projection(&["mlp.gate_proj", "mlp.up_proj"])?;
             total += if kind == HybridAttention::Gdn {
-                pack(&["linear_attn.in_proj_qkv", "linear_attn.in_proj_z", "linear_attn.in_proj_b", "linear_attn.in_proj_a"])?
-                    + one("linear_attn.out_proj")?
+                (if fp8 { projection(&["linear_attn.in_proj_qkv", "linear_attn.in_proj_z"])?
+                        + pack(&["linear_attn.in_proj_b", "linear_attn.in_proj_a"])? }
+                     else { pack(&["linear_attn.in_proj_qkv", "linear_attn.in_proj_z", "linear_attn.in_proj_b", "linear_attn.in_proj_a"])? })
+                    + projection(&["linear_attn.out_proj"])?
                     + bytes(&format!("{p}linear_attn.conv1d.weight"), true, false)?.max(256)
                     + bytes(&format!("{p}linear_attn.A_log"), true, false)?.max(256)
                     + bytes(&format!("{p}linear_attn.dt_bias"), true, false)?.max(256)
                     + bytes(&format!("{p}linear_attn.norm.weight"), false, true)?.max(256)
             } else {
-                pack(&["self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj"])?
-                    + one("self_attn.o_proj")? + one("self_attn.q_norm")? + one("self_attn.k_norm")?
+                projection(&["self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj"])?
+                    + projection(&["self_attn.o_proj"])? + one("self_attn.q_norm")? + one("self_attn.k_norm")?
             };
             layers.push(total);
         }
@@ -285,7 +377,35 @@ pub fn norm_dtype(spec: &NativeProgram) -> Result<DType> {
     }
 }
 
-pub fn validate(cfg: &Qwen35Config, op: &str, rows: usize, spec: &NativeProgram) -> Result<()> {
+pub fn program_name(prefix: &str, op: &str, rows: usize, format: crate::families::qwen4::Qwen4KvCache) -> String {
+    let suffix = if matches!(op, "attn_producer" | "full_gqa") && format == crate::families::qwen4::Qwen4KvCache::Fp8 { "_kv_fp8" } else { "" };
+    if rows == 0 { format!("{prefix}_{op}{suffix}") } else { format!("{prefix}_{op}{suffix}_m{rows}") }
+}
+
+pub fn native_program_name(prefix: &str, op: &str, rows: usize,
+    kv: crate::families::qwen4::Qwen4KvCache, fp8: bool) -> String {
+    let op = if fp8 && matches!(op, "gdn" | "attn_producer" | "attn_o" | "ffn") {
+        format!("{op}_fp8")
+    } else { op.to_owned() };
+    let suffix = if kv == crate::families::qwen4::Qwen4KvCache::Fp8
+        && matches!(op.as_str(), "attn_producer_fp8" | "full_gqa") { "_kv_fp8" } else { "" };
+    if fp8 { if rows == 0 { format!("{prefix}_{op}{suffix}") } else { format!("{prefix}_{op}{suffix}_m{rows}") } }
+    else { program_name(prefix, &op, rows, kv) }
+}
+
+pub fn validate_projection_format(op: &str, fp8: bool, spec: &NativeProgram) -> Result<()> {
+    if matches!(op, "gdn" | "attn_producer" | "attn_o" | "ffn") {
+        ensure!((spec.geometry["fp8_weights"] == "only") == fp8,
+            "{}: checkpoint projection format mismatch", spec.name);
+        if fp8 {
+            ensure!(spec.geometry["weight_block"] == serde_json::json!([128, 128]),
+                "{}: invalid FP8 block geometry", spec.name);
+        }
+    }
+    Ok(())
+}
+
+pub fn validate(cfg: &Qwen35Config, op: &str, rows: usize, format: crate::families::qwen4::Qwen4KvCache, spec: &NativeProgram) -> Result<()> {
     if rows > 0 {
         ensure!(spec.capacity_rows as usize >= rows, "{} capacity is smaller than {rows}", spec.name);
         integer(spec, "max_rows", rows)?;
@@ -304,8 +424,13 @@ pub fn validate(cfg: &Qwen35Config, op: &str, rows: usize, spec: &NativeProgram)
             integer(spec, "head_dim", cfg.gdn.key_dim)?;
             integer(spec, "in_width", cfg.gdn.conv_width() + cfg.gdn.value_width() + 2 * cfg.gdn.value_heads)?;
             number(spec, "eps", cfg.rms_norm_eps)?;
-            ensure!(spec.geometry["output_gate"] == "silu" && spec.geometry["fp8_weights"] == false,
-                "{}: dense BF16 GDN needs SiLU and native BF16 projections", spec.name);
+            ensure!(spec.geometry["output_gate"] == "silu"
+                && (spec.geometry["fp8_weights"] == false || spec.geometry["fp8_weights"] == "only"),
+                "{}: dense GDN needs SiLU and native checkpoint projections", spec.name);
+            if spec.geometry["fp8_weights"] == "only" {
+                ensure!(spec.geometry["gate_weights"] == "bf16" && spec.geometry["gate_order"] == serde_json::json!(["b", "a"]),
+                    "{}: native GDN gates require BF16 b/a order", spec.name);
+            }
             norm_dtype(spec)?;
         }
         "gdn_commit" => {
@@ -313,13 +438,14 @@ pub fn validate(cfg: &Qwen35Config, op: &str, rows: usize, spec: &NativeProgram)
             integer(spec, "value_heads", cfg.gdn.value_heads)?;
             integer(spec, "channels", cfg.gdn.conv_width())?;
             integer(spec, "replay_rows", VERIFY_ROWS)?;
-            integer(spec, "replay_bytes", NativeBuffers::new(cfg, 0, 1, 0)?.replay_per_layer)?;
+            integer(spec, "replay_bytes", NativeBuffers::new(cfg, 0, 1, 0, false)?.replay_per_layer)?;
         }
         "attn_producer" | "full_gqa" => {
             integer(spec, "heads", cfg.heads)?;
             integer(spec, "kv_heads", cfg.kv_heads)?;
             integer(spec, "head_dim", cfg.head_dim)?;
-            integer(spec, "record_bytes", 2 * cfg.kv_heads * cfg.head_dim * 2)?;
+            integer(spec, "record_bytes", format.record_bytes(cfg.kv_heads, cfg.head_dim))?;
+            ensure!(spec.geometry["kv_format"] == format.to_string(), "{}: dense KV format mismatch", spec.name);
             ensure!(spec.geometry["indexed"] == false, "{}: dense attention must not use QSA", spec.name);
             if op == "attn_producer" {
                 integer(spec, "in_width", 2 * (cfg.heads + cfg.kv_heads) * cfg.head_dim)?;
@@ -334,7 +460,7 @@ pub fn validate(cfg: &Qwen35Config, op: &str, rows: usize, spec: &NativeProgram)
         }
         "attn_o" => {
             integer(spec, "width", cfg.heads * cfg.head_dim)?;
-            ensure!(spec.geometry["fp8_weights"] == false, "{}: expected native BF16 output projection", spec.name);
+            ensure!(spec.geometry["fp8_weights"] == false || spec.geometry["fp8_weights"] == "only", "{}: expected native checkpoint output projection", spec.name);
         }
         "ffn" => integer(spec, "intermediate", cfg.intermediate)?,
         "add" => (),
@@ -357,6 +483,18 @@ pub fn validate_abi(op: &str, rows: usize, spec: &NativeProgram) -> Result<()> {
         "ffn" => vec!["x", "w_gate_up", "w_down", "out", "scratch"],
         _ => anyhow::bail!("unknown dense Qwen ABI {op}"),
     };
+    let fp8 = spec.geometry["fp8_weights"] == "only";
+    if fp8 {
+        pointers = match op {
+            "gdn" => vec!["x", "w_qkvz_fp8", "w_qkvz_scale", "w_ba", "conv_w", "a_log", "dt_bias", "norm_w",
+                "w_out_fp8", "w_out_scale", "conv_state", "state", "slots", "seq_first", "out"],
+            "attn_producer" => vec!["x", "w_in_fp8", "w_in_scale", "q_norm", "k_norm", "rope_positions", "kv_slots",
+                "kv_cache", "query", "gate", "scratch"],
+            "attn_o" => vec!["attn", "gate", "w_o_fp8", "w_o_scale", "out", "scratch"],
+            "ffn" => vec!["x", "w_gate_up_fp8", "w_gate_up_scale", "w_down_fp8", "w_down_scale", "out", "scratch"],
+            _ => anyhow::bail!("unexpected FP8 projection ABI {op}"),
+        };
+    }
     if op == "gdn" {
         if rows == VERIFY_ROWS { pointers.push("replay"); }
         pointers.push("scratch");
@@ -365,6 +503,7 @@ pub fn validate_abi(op: &str, rows: usize, spec: &NativeProgram) -> Result<()> {
     let scalars = match op {
         "gdn_commit" | "full_gqa" => 3,
         "gdn" if rows == VERIFY_ROWS => 2,
+        "attn_o" if fp8 && rows > VERIFY_ROWS => 2,
         _ => 1,
     };
     ensure!(spec.scalar_kinds == vec![b'i'; scalars], "{}: dense scalar ABI differs", spec.name);
@@ -397,6 +536,86 @@ mod tests {
     }
 
     #[test]
+    fn native_fp8_header_inventory_charges_scales_and_keeps_bf16_gates() -> Result<()> {
+        use crate::plan::checkpoint::{Checkpoint, CheckpointTensor};
+        let cfg = cfg();
+        let mut checkpoint = Checkpoint { snapshot: Default::default(), config: serde_json::json!({}),
+            quantize_config: None, weight_map: Default::default(), tensors: vec![], missing_shards: vec![], shard_bytes: 0 };
+        let mut add = |name: String, dtype, shape: Vec<usize>, byte_length| checkpoint.tensors.push(CheckpointTensor {
+            shard: "model.safetensors".into(), meta: crate::SafetensorsTensorMetadata {
+                name, dtype, shape, byte_offset: 0, byte_length } });
+        for name in ["embed_tokens.weight", "norm.weight"] {
+            add(format!("model.language_model.{name}"), DType::Bf16, vec![128], 256);
+        }
+        add("lm_head.weight".into(), DType::Bf16, vec![128], 256);
+        for (index, kind) in cfg.attention.iter().enumerate() {
+            let prefix = format!("model.language_model.layers.{index}.");
+            let mut ordinary = vec!["input_layernorm.weight", "post_attention_layernorm.weight"];
+            let mut projections = vec!["mlp.down_proj", "mlp.gate_proj", "mlp.up_proj"];
+            if *kind == HybridAttention::Gdn {
+                ordinary.extend(["linear_attn.in_proj_b.weight", "linear_attn.in_proj_a.weight",
+                    "linear_attn.conv1d.weight", "linear_attn.A_log", "linear_attn.dt_bias", "linear_attn.norm.weight"]);
+                projections.extend(["linear_attn.in_proj_qkv", "linear_attn.in_proj_z", "linear_attn.out_proj"]);
+            } else {
+                ordinary.extend(["self_attn.q_norm.weight", "self_attn.k_norm.weight"]);
+                projections.extend(["self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj", "self_attn.o_proj"]);
+            }
+            for name in ordinary { add(format!("{prefix}{name}"), DType::Bf16, vec![128], 256); }
+            for name in projections {
+                add(format!("{prefix}{name}.weight"), DType::F8E4M3, vec![128, 128], 16384);
+                add(format!("{prefix}{name}.weight_scale_inv"), DType::Bf16, vec![1, 1], 2);
+            }
+        }
+        let inventory = NativeWeights::native(&checkpoint, &cfg, DType::Bf16)?;
+        assert_eq!(inventory.layers, [6 * 16384 + 4 * 256 + 2 * 256 + 2 * 256 + 3 * 512 + 256,
+            7 * 16384 + 4 * 256 + 4 * 256]);
+        for tensor in &mut checkpoint.tensors {
+            if tensor.meta.name.ends_with("weight_scale_inv") {
+                tensor.meta.dtype = DType::F32;
+                tensor.meta.byte_length = 4;
+            }
+        }
+        assert_eq!(NativeWeights::native(&checkpoint, &cfg, DType::Bf16)?, inventory);
+        let scale = checkpoint.tensors.iter().position(|tensor| tensor.meta.name.ends_with("weight_scale_inv")).unwrap();
+        checkpoint.tensors[scale].meta.shape = vec![2, 1];
+        assert!(NativeWeights::native(&checkpoint, &cfg, DType::Bf16).is_err());
+        checkpoint.tensors[scale].meta.shape = vec![1, 1];
+        let gate = checkpoint.tensors.iter().position(|tensor| tensor.meta.name.ends_with("in_proj_a.weight")).unwrap();
+        checkpoint.tensors[gate].meta.dtype = DType::F8E4M3;
+        assert!(NativeWeights::native(&checkpoint, &cfg, DType::Bf16).is_err());
+        checkpoint.tensors[gate].meta.dtype = DType::Bf16;
+        checkpoint.tensors.remove(scale);
+        assert!(NativeWeights::native(&checkpoint, &cfg, DType::Bf16).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn native_fp8_names_and_block_contract_match_offline_and_runtime_admission() -> Result<()> {
+        use crate::families::qwen4::Qwen4KvCache::{Bf16, Fp8};
+        for rows in [64, 4096] {
+            assert_eq!(native_program_name("qwen38", "attn_producer", rows, Fp8, true),
+                format!("qwen38_attn_producer_fp8_kv_fp8_m{rows}"));
+            assert_eq!(native_program_name("qwen38", "full_gqa", rows, Fp8, true),
+                format!("qwen38_full_gqa_kv_fp8_m{rows}"));
+            assert_eq!(native_program_name("qwen38", "gdn", rows, Bf16, true),
+                format!("qwen38_gdn_fp8_m{rows}"));
+            for op in ["gdn", "attn_producer", "attn_o", "ffn"] {
+                let mut spec = NativeProgram { name: op.into(), geometry: serde_json::json!({
+                    "fp8_weights":"only", "weight_block":[128,128]}), capacity_rows: rows as u64,
+                    pointers: vec![], scalar_kinds: vec![], scratch: Default::default() };
+                validate_projection_format(op, true, &spec)?;
+                assert!(validate_projection_format(op, false, &spec).is_err());
+                spec.geometry["weight_block"] = serde_json::json!([64, 128]);
+                assert!(validate_projection_format(op, true, &spec).is_err());
+                spec.geometry["fp8_weights"] = serde_json::json!(false);
+                validate_projection_format(op, false, &spec)?;
+                assert!(validate_projection_format(op, true, &spec).is_err());
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
     fn native_scratch_and_exact_marks_are_charged_before_dense_pool() -> Result<()> {
         let cfg = cfg();
         let layers = [LayerBytes { weights: 1 << 30, state: 1 << 20, replay: 1 << 20, prefix: 2 << 20 },
@@ -424,7 +643,7 @@ mod tests {
             LayerBytes { weights: 1 << 30, state: 0, replay: 0, prefix: 0 }];
         let base = solve(&request(inputs(&cfg, &layers, 2 << 30))?)?;
         let mut with_draft = inputs(&cfg, &layers, 2 << 30);
-        with_draft.drafter = Some(DrafterBytes { owned: 3 << 30, scratch: 1 << 30 });
+        with_draft.drafter = Some(DrafterBytes { owned: 3 << 30, scratch: 1 << 30, ..Default::default() });
         let placement = solve(&request(with_draft)?)?;
         assert_eq!(placement.movables, [(MovableId::Drafter, 0)]);
         assert!(placement.pool_tokens < base.pool_tokens && placement.pool_tokens >= 262144);
@@ -432,12 +651,35 @@ mod tests {
             .map(|item| item.bytes).sum();
         assert_eq!(charged, 4 << 30);
         let mut explicit = inputs(&cfg, &layers, 2 << 30);
-        explicit.drafter = Some(DrafterBytes { owned: 3 << 30, scratch: 1 << 30 });
+        explicit.drafter = Some(DrafterBytes { owned: 3 << 30, scratch: 1 << 30, ..Default::default() });
         explicit.requested_pool = Some(base.pool_tokens);
         assert!(solve(&request(explicit)?).is_err());
         let mut overflow = inputs(&cfg, &layers, 0);
-        overflow.drafter = Some(DrafterBytes { owned: u64::MAX, scratch: 1 });
+        overflow.drafter = Some(DrafterBytes { owned: u64::MAX, scratch: 1, ..Default::default() });
         assert!(solve(&request(overflow)?).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn full_context_drafter_kv_tracks_aggregate_pool_pages() -> Result<()> {
+        let cfg = cfg();
+        let layers = [LayerBytes { weights: 1 << 30, state: 1 << 20, replay: 1 << 20, prefix: 0 },
+            LayerBytes { weights: 1 << 30, state: 0, replay: 0, prefix: 0 }];
+        for tokens in [262144, 524288] {
+            let mut input = inputs(&cfg, &layers, 0);
+            input.gpu.capacity_bytes = 32 << 30;
+            input.gpu.baseline = Baseline::Measured { free_bytes: 32 << 30 };
+            input.requested_pool = Some(tokens);
+            input.drafter = Some(DrafterBytes { owned: 1 << 30, scratch: 1 << 20, pool_unit: 64 * 20480 });
+            let req = request(input)?;
+            assert_eq!(req.pool_bounded.len(), 1);
+            assert_eq!(req.pool_bounded[0].bytes(tokens / PAGE_ROWS)?, tokens * 20480);
+            let placement = solve(&req)?;
+            assert_eq!(placement.pool_tokens, tokens);
+            let charged: u64 = placement.items[0].iter().filter(|item| item.category == Category::Drafter)
+                .map(|item| item.bytes).sum();
+            assert_eq!(charged, (1 << 30) + (1 << 20) + tokens * 20480);
+        }
         Ok(())
     }
 

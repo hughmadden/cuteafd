@@ -51,7 +51,10 @@ pub const ROW_DETAIL_LIMIT: usize = 64;
 /// Rows of one input sample (a wider wave contributes its first rows).
 pub const SAMPLE_ROWS: usize = 64;
 const DEFAULT_SAMPLE_STEPS: u64 = 64;
-const ID_MASK: u32 = 511;
+/// V4.1 native group requests pack the owner rank above bit 9 of the expert
+/// id; only those requests are masked. Other families keep full ids (Kimi K3
+/// has 896 experts).
+const NATIVE_GROUP_ID_MASK: u32 = 511;
 
 /// The route log's settings, from the environment once per process.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -126,7 +129,12 @@ impl Wave {
     /// requests are masked off); `weights` keeps narrow waves' gate weights.
     pub fn from_request(request: &ExpertProtocolV2Request, transport: u64, pass: u64, ranks: usize,
         step: Option<StepContext>, weights: bool) -> Self {
-        let ids = request.routes.iter().map(|r| r.expert_id & ID_MASK).collect();
+        let mask = if request.header.flags & crate::expert::V41_NATIVE_GROUP_REQUEST_FLAG != 0 {
+            NATIVE_GROUP_ID_MASK
+        } else {
+            u32::MAX
+        };
+        let ids = request.routes.iter().map(|r| r.expert_id & mask).collect();
         let routes = if request.rows.len() <= ROW_DETAIL_LIMIT {
             let topk = request.rows.first().map_or(0, |r| r.route_count as usize);
             let uniform = request.rows.iter().enumerate()
@@ -186,7 +194,7 @@ impl Wave {
                 }
             }
             Routes::PerExpert(ids) => {
-                let mut counts = [0u32; ID_MASK as usize + 1];
+                let mut counts = vec![0u32; ids.iter().max().map_or(0, |&id| id as usize + 1)];
                 for &id in ids { counts[id as usize] += 1; }
                 text.push_str(r#","expert_rows":["#);
                 let mut first = true;
@@ -534,9 +542,24 @@ mod tests {
     #[test]
     fn owner_bits_are_masked_off() {
         let mut request = request(1, 2, 4, ExpertV2SourceKind::Decode);
+        request.header.flags |= crate::expert::V41_NATIVE_GROUP_REQUEST_FLAG;
         request.routes[0].expert_id = 383 | (1 << 10);
         let wave = Wave::from_request(&request, 0, 0, 4, None, false);
         assert_eq!(encoded(&wave)["topk"][0][0], 383);
+    }
+
+    #[test]
+    fn ids_above_511_are_kept_outside_native_group_requests() {
+        // Kimi K3 routes to 896 experts; ids 512..895 must not alias.
+        let mut narrow = request(1, 2, 4, ExpertV2SourceKind::Decode);
+        narrow.routes[0].expert_id = 895;
+        let wave = Wave::from_request(&narrow, 0, 0, 4, None, false);
+        assert_eq!(encoded(&wave)["topk"][0][0], 895);
+        let mut wide = request(ROW_DETAIL_LIMIT + 1, 8, 3, ExpertV2SourceKind::Prefill);
+        wide.routes[0].expert_id = 895;
+        let json = encoded(&Wave::from_request(&wide, 0, 0, 4, None, false));
+        let counts: Vec<(u32, u32)> = serde_json::from_value(json["expert_rows"].clone()).unwrap();
+        assert!(counts.iter().any(|c| c.0 == 895));
     }
 
     #[test]

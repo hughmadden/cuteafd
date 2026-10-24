@@ -8,6 +8,40 @@ use crate::{
     GLM52_NUM_HIDDEN_LAYERS,
 };
 
+/// Shared 512-latent + 64 raw-coordinate MLA storage contract. The compact
+/// representation is the existing GLM group-128 E4M3/FP32-scale record.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MlaCacheFormat {
+    Bf16,
+    #[default]
+    Fp8,
+}
+
+impl MlaCacheFormat {
+    pub const fn record_bytes(self) -> usize {
+        match self { Self::Bf16 => 576 * 2, Self::Fp8 => GLM52_MLA_FP8_DS_BYTES_PER_TOKEN }
+    }
+    pub const fn label(self) -> &'static str {
+        match self { Self::Bf16 => "bf16", Self::Fp8 => "fp8" }
+    }
+    pub const fn program_suffix(self) -> &'static str {
+        match self { Self::Bf16 => "", Self::Fp8 => "_fp8" }
+    }
+}
+
+impl std::str::FromStr for MlaCacheFormat {
+    type Err = &'static str;
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value { "bf16" => Ok(Self::Bf16), "fp8" => Ok(Self::Fp8),
+            _ => Err("KV cache must be bf16 or fp8") }
+    }
+}
+
+impl std::fmt::Display for MlaCacheFormat {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str(self.label()) }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum KvCacheDType {
@@ -234,5 +268,21 @@ impl KvCacheConfig {
 
     pub fn capacity_bytes(&self) -> usize {
         self.bytes_per_token() * self.max_tokens
+    }
+}
+
+#[cfg(test)]
+mod mla_format_tests {
+    use super::*;
+    #[test]
+    fn shared_mla_record_is_the_existing_glm_contract() {
+        assert_eq!(MlaCacheFormat::default(), MlaCacheFormat::Fp8);
+        assert_eq!(MlaCacheFormat::Bf16.record_bytes(), 1152);
+        assert_eq!(MlaCacheFormat::Fp8.record_bytes(), 512 + 4 * 4 + 64 * 2);
+        for format in [MlaCacheFormat::Bf16, MlaCacheFormat::Fp8] {
+            assert_eq!(format.label().parse::<MlaCacheFormat>(), Ok(format));
+            assert_eq!(format.to_string(), format.label());
+        }
+        assert!("int8".parse::<MlaCacheFormat>().is_err());
     }
 }

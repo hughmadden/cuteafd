@@ -15,6 +15,7 @@ pub struct ServerContext {
     pub family: Option<String>,
     pub snapshot: Option<PathBuf>,
     pub settings: Vec<Setting>,
+    pub supports_thinking_off: Option<bool>,
 }
 
 /// What the engine resolved for its device KV pool and host prefix cache.
@@ -82,6 +83,10 @@ pub fn set_resolved(name: &str, value: &str) {
     if let Ok(mut slot) = state().context.lock() {
         apply_resolved(&mut slot.settings, name, value);
     }
+}
+
+pub fn set_thinking_off(supported: bool) {
+    if let Ok(mut slot) = state().context.lock() { slot.supports_thinking_off = Some(supported); }
 }
 
 pub fn get() -> ServerContext {

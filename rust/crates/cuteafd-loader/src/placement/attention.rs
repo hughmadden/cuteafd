@@ -43,6 +43,94 @@ pub enum LayerOwnership {
     Alternating,
 }
 
+/// Legal contiguous boundaries, preserving selected colocate groups. Split-only
+/// stretches contribute just one candidate because their owners are irrelevant.
+pub fn owner_boundaries(groups: &[(bool, Option<u16>)], nonempty: bool) -> Vec<usize> {
+    (0..=groups.len()).filter(|&k| {
+        if nonempty && (!groups[..k].iter().any(|g| g.0) || !groups[k..].iter().any(|g| g.0)) { return false; }
+        if k > 0 && !groups[k - 1].0 { return false; }
+        !groups.iter().enumerate().any(|(i, &(selected, group))| selected && group.is_some_and(|group|
+            groups.iter().enumerate().any(|(j, &(other, key))| other && key == Some(group) && (i < k) != (j < k))))
+    }).collect()
+}
+
+/// Compare accepted admissions, not a partial estimate of their allocations.
+/// The physical capacity breaks ties once a target or explicit pool is met.
+pub fn owner_score(onboard: Onboard, placed: &Placement) -> (u64, u64, u64) {
+    let capacity = placed.pool_limits.0.iter().map(|r| r.max_units).min().unwrap_or(0);
+    match onboard {
+        Onboard::ExpertsFirst { .. } => (placed.onboard_layers as u64, placed.pool_tokens, capacity),
+        _ => (placed.pool_tokens, placed.onboard_layers as u64, capacity),
+    }
+}
+
+/// Typed pool evidence survives mark-selection and contextual error wrappers.
+pub trait OwnerAdmissionError {
+    fn placement_error(&self) -> Option<&PlacementError>;
+}
+
+impl OwnerAdmissionError for PlacementError {
+    fn placement_error(&self) -> Option<&PlacementError> { Some(self) }
+}
+
+impl OwnerAdmissionError for anyhow::Error {
+    fn placement_error(&self) -> Option<&PlacementError> { self.downcast_ref() }
+}
+
+fn attainable_pool(error: &PlacementError) -> Option<u64> {
+    match error {
+        PlacementError::PoolDoesNotFit { fit, .. } => Some(*fit),
+        PlacementError::BelowFloor { pool, .. } => Some(*pool),
+        PlacementError::PrefixMarks { source, .. } | PlacementError::OwnerCandidates { source, .. } => attainable_pool(source),
+        _ => None,
+    }
+}
+
+/// Evaluate owner-specific costs before choosing a boundary. The callback builds
+/// native/cache/graph inventory for these owners and runs ordinary admission with
+/// those modes pinned; its payload carries the matching inventory to the caller.
+/// Equal scores retain the first legal candidate. An unsupported candidate does
+/// not mask another valid placement. If all fail, report the greatest attainable
+/// pool and its selected-layer owner split; without pool evidence keep the first error.
+pub fn solve_owners<T, E: From<PlacementError> + OwnerAdmissionError>(groups: &[(bool, Option<u16>)],
+    ownership: LayerOwnership, first: u8, onboard: Onboard,
+    mut admit: impl FnMut(&[u8]) -> Result<(Placement, T), E>) -> Result<(Placement, T), E> {
+    if first > 1 { return Err(PlacementError::Inventory("layers first GPU must be 0 or 1").into()); }
+    if ownership == LayerOwnership::Alternating {
+        return admit(&alternating_owners(groups.iter().copied(), first)?);
+    }
+    let mut best = None;
+    let mut refusal = None;
+    let mut best_refusal: Option<(u64, usize, usize, PlacementError)> = None;
+    for boundary in owner_boundaries(groups, ownership == LayerOwnership::NonemptyRanges) {
+        let owners = (0..groups.len()).map(|i| if i < boundary { first } else { 1 - first }).collect::<Vec<_>>();
+        match admit(&owners) {
+            Ok(candidate) => {
+                let score = owner_score(onboard, &candidate.0);
+                if best.as_ref().is_none_or(|(old, _)| score > *old) { best = Some((score, candidate)); }
+            }
+            Err(error) => {
+                if let Some(source) = error.placement_error() {
+                    if let Some(fit) = attainable_pool(source) {
+                        if best_refusal.as_ref().is_none_or(|old| fit > old.0) {
+                            let rank0 = groups.iter().zip(&owners).filter(|(group, owner)| group.0 && **owner == 0).count();
+                            let rank1 = groups.iter().filter(|group| group.0).count() - rank0;
+                            best_refusal = Some((fit, rank0, rank1, source.clone()));
+                        }
+                    }
+                }
+                if refusal.is_none() { refusal = Some(error); }
+            }
+        }
+    }
+    best.map(|(_, candidate)| candidate).ok_or_else(|| {
+        if let Some((fit, rank0, rank1, source)) = best_refusal {
+            return PlacementError::OwnerCandidates { fit, rank0, rank1, source: Box::new(source) }.into();
+        }
+        refusal.unwrap_or_else(|| PlacementError::Inventory("no legal layer ownership boundary").into())
+    })
+}
+
 /// Pure alternating ownership of selected colocate groups, independent of
 /// budgets, weight loading, expert onboarding and pool admission.
 pub fn alternating_owners(groups: impl IntoIterator<Item = (bool, Option<u16>)>, first: u8)

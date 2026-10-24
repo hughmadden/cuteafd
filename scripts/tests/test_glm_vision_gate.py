@@ -182,16 +182,16 @@ def test_glm_serving_admits_and_precreates_all_reachable_workspaces():
     temporaries = source.split("fn temporaries(", 1)[1].split("fn lane(", 1)[0]
     assert "glmf_temporary_bytes(" in temporaries and "self.alloc(bytes.scratch)" in temporaries
     lane = source.split("fn lane(", 1)[1].split("/// ModelOpt NVFP4 dense MLPs", 1)[0]
-    assert "glmf_lane_bytes(" in lane and "self.alloc(bytes.streams)" in lane
+    assert "glmf_lane_bytes(" in lane and "streams: [alloc(bytes.streams)?" in lane
     reserve = source.split("pub(crate) fn workspace_reserve(", 1)[1].split("/// The prefill lanes a serving engine", 1)[0]
     assert "plan.workspace_bytes(" in reserve and "workspace_reserve_bytes(" in reserve
     prepare = source.split("pub fn prepare_serving_workspaces(", 1)[1].split("/// Capture the complete", 1)[0]
-    for required in ("self.decode_workspace_of(rank)", "self.pipelined()", "self.prefill_lane_count",
-                     "self.prefill_lanes_of(rank, lanes)", "drafter.prepare_workspace()", "self.synchronize()"):
+    for required in ("self.decode_workspace_of(rank)", "self.pipelined()", "self.prefill_waves",
+                     "self.prefill_slots_of(rank, lanes)", "drafter.prepare_workspace()", "self.synchronize()"):
         assert required in prepare
     # Scoring (`--full-prefill-logits`) precreates the same lanes: a serial prefill runs in lane 0.
     scoring = source.split("pub fn prepare_scoring_prefill(", 1)[1].split("fn step_plan(", 1)[0]
-    assert "self.prefill_lanes_of(rank, lanes)" in scoring and "self.workspace(" not in scoring
+    assert "self.prefill_slots_of(rank, lanes)" in scoring and "self.workspace(" not in scoring
     # The per-workspace runtime allowance is the loader's shared definition; where the measured
     # loaded code covers it (`placement::inventory::LOADED_CODE`) the reserve charges that instead.
     graphs = (ROOT / "rust/crates/cuteafd-loader/src/serving_capacity/glmf_graphs.rs").read_text()
@@ -220,15 +220,22 @@ def test_glm_serving_admits_and_precreates_all_reachable_workspaces():
     # GLM full also prepares the shared drafter after admission, before publishing it.
     full = (root / "glm5/mod.rs").read_text().split("pub fn with_engine", 1)[1]
     admitted = full.index("glm::solve_working_set(")
-    loaded = full.index("dflash::GlmDrafter::load(")
+    loaded = full.index("dflash::DflashDrafter::load(")
     prepared = full.index("drafter.prepare_workspace()?")
     pool = full.index("engine::GlmEngine::new(")
     assert admitted < loaded < prepared < pool < full.index("engine.drafter = drafter")
-    drafter = (root / "glm5/dflash.rs").read_text()
+    drafter = (root / "../shared/speculation/dflash.rs").read_text()
     prepare = drafter.split("pub(crate) fn prepare_workspace(", 1)[1].split("pub(crate) fn prime_remote(", 1)[0]
-    assert "self.workspace(self.max_sequences)" in prepare
+    assert "self.prime_remote()" in prepare
     prime, existing = drafter.split("pub(crate) fn prime_remote(", 1)[1].split("fn workspace(", 1)
-    assert "self.prepare_workspace()?" in prime
+    assert "self.workspace(self.max_sequences)" in prime
+    assert "if self.startup_primed.get() { return Ok(()); }" in prime
+    assert "self.prime_metadata()?" in prime
+    assert "self.reset_context(0, 0)?" in prime
+    assert "self.reset_context(slot, TAP_ROWS)?" in prime
+    assert "self.discard_context(slot)?" in prime
+    assert prime.index("self.prime_metadata()?") < prime.index("self.update(") < prime.index("self.draft_device_with(")
+    assert prime.index("self.discard_context(slot)?") < prime.index("self.startup_primed.set(true)")
     assert "prepare_workspace()" not in existing
     assert "prepare_workspace()" not in drafter.split("pub(crate) fn prepare_workspace(", 1)[0]
     assert 'if let Some(dspark::Drafter::RemoteDflash(draft))' in opening

@@ -26,7 +26,8 @@ fn loader<'a>(library: &'a NativeLibrary, checkpoint: &'a Checkpoint,
     formats: &'a BTreeMap<String, MimoProjectionRepresentation>) -> MimoLoader<'a> {
     MimoLoader { library, checkpoint, stream: std::ptr::null_mut(), checkpoint_tp: 1,
         fp8_head: false, output_formats: formats, fp8_scales: crate::shared::fp8_linear::Fp8Scales::Amax,
-        device: 0, peers: vec![RankDevice { device: 1, stream: std::ptr::null_mut() }] }
+        device: 0, peers: vec![RankDevice { device: 1, stream: std::ptr::null_mut() }],
+        dense: std::rc::Rc::new(crate::shared::experts::rtx::dense::DenseLoad::mount(library)), transient: Default::default() }
 }
 
 fn count(events: &str, tag: char) -> usize { events.chars().filter(|&c| c == tag).count() }
@@ -184,6 +185,7 @@ fn successful_loaders_reclaim_storage_and_unload_normally() -> Result<()> {
         }
         drop(preceding_layer);
         drop(preceding_pin);
+        drop(loader);
         drop(library);
         let events = fixture.events()?;
         assert_eq!(count(&events, 'D'), count(&events, 'd'), "{events}");

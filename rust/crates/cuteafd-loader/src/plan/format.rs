@@ -235,10 +235,11 @@ impl QuantOperand {
             })
     }
 
-    /// The EXL3 trellis bits per weight, if this is a (complete) EXL3 operand.
+    /// MCG trellis bits for the existing routed-expert kernel contracts.
+    /// Dense native loaders select their codebook independently from headers.
     pub fn exl3_bits(&self) -> Option<usize> {
         match self.encoding {
-            Encoding::Exl3 { bits } => Some(bits),
+            Encoding::Exl3 { bits } if !self.companions.iter().any(|s|s=="mul1") => Some(bits),
             _ => None,
         }
     }
@@ -530,10 +531,9 @@ fn fp4(members: &BTreeMap<String, &CheckpointTensor>, weight: &crate::Safetensor
 }
 
 /// An EXL3 projection: `trellis` I16 `[K/16, N/16, 16 * bits]`, `suh` F16
-/// `[K]`, `svh` F16 `[N]` and the MCG codebook marker `mcg` I32 `[]` or `[1]`
-/// — the contract the expert catalog derives its storage map with
-/// (`formats::exl3_storage::exl3_module`). MUL1, 3INST and packed `su`/`sv`
-/// stay unsupported, named by tensor.
+/// `[K]`, `svh` F16 `[N]` and one `mcg`/`mul1` I32 `[]` or `[1]` marker.
+/// The marker remains in companions so routed contracts can require MCG.
+/// 3INST and packed `su`/`sv` stay unsupported, named by tensor.
 fn detect_exl3(members: &BTreeMap<String, &CheckpointTensor>) -> Result<QuantOperand, Malformed> {
     use crate::formats::exl3_storage::{exl3_module, Exl3StorageError};
     let anchor = members.values().next().map_or(String::new(), |t| t.meta.name.clone());
@@ -543,7 +543,7 @@ fn detect_exl3(members: &BTreeMap<String, &CheckpointTensor>) -> Result<QuantOpe
         .map_err(|error| match error {
             Exl3StorageError::Malformed { tensor, reason } => Malformed { tensor, reason },
             Exl3StorageError::Unsupported { tensor, variant } => {
-                Malformed { tensor, reason: format!("{variant} (this build runs the MCG codebook with unpacked suh/svh)") }
+                Malformed { tensor, reason: format!("{variant} (expected MCG/MUL1 with unpacked suh/svh)") }
             }
             other => Malformed { tensor: stem.clone(), reason: other.to_string() },
         })?;
@@ -557,6 +557,6 @@ fn detect_exl3(members: &BTreeMap<String, &CheckpointTensor>) -> Result<QuantOpe
         scale: None,
         global_scale: None,
         input_scale: None,
-        companions: vec!["mcg".into(), "suh".into(), "svh".into()],
+        companions: vec![module.codebook.marker().into(), "suh".into(), "svh".into()],
     })
 }

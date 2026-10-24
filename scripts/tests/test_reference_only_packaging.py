@@ -196,6 +196,14 @@ def test_standard_generated_rows_are_informational_for_every_panel(decode_gen, p
     assert 'per-position rates' in note
 
 
+def test_new_sets_need_ten_thousand_generated_rows_per_half():
+    rows = lambda decode, prefill: dict(decode_generated_positions=decode, prefill_generated_positions=prefill)
+    packager.require_new_set_generated_rows(rows(10_000, 10_000))
+    for decode, prefill, short in ((9_999, 10_000, 'decode has 9,999'), (12_000, 9_371, 'prefill has 9,371')):
+        with pytest.raises(ValueError, match=short):
+            packager.require_new_set_generated_rows(rows(decode, prefill))
+
+
 def test_dense_root_wording_is_unchanged_and_v41_root_comes_from_the_manifest():
     # Dense/Step-5 goldens record no root arithmetic: their cards keep the original text byte for byte.
     assert packager.root_description({}, {'reference_snapshot': {'precision': 'official BF16'}}) == (

@@ -36,6 +36,10 @@ pub struct ProbeSpec {
     /// the request carries no matched-prompt evidence.
     #[serde(default)]
     pub output_dependent: bool,
+    /// Panel-local diagnostics that need not run on every benchmark arm and
+    /// carry no matched-prompt evidence, even with input-determined prompts.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub pair_exempt: bool,
     /// Already-expanded native image spans, verified against prepared sources by the engine.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub media: Vec<ProbeMedia>,
@@ -776,6 +780,15 @@ mod tests {
         let record = probe.record();
         assert_eq!((record.prompt_ids.len(), record.cached_tokens, record.generated.as_slice(), record.cold),
             (3, 2, &[5u32][..], true));
+    }
+
+    #[test]
+    fn pair_exempt_marks_arm_local_diagnostics() {
+        use super::*;
+        assert!(!serde_json::from_str::<ProbeSpec>("{}").unwrap().pair_exempt);
+        let spec = ProbeSpec { pair_exempt: true, ..ProbeSpec::default() };
+        let spec: ProbeSpec = serde_json::from_value(serde_json::to_value(spec).unwrap()).unwrap();
+        assert!(spec.pair_exempt && Probe::new(spec).input_determined());
     }
 
     #[test]

@@ -1,0 +1,132 @@
+{
+  "version": "realistic-v1",
+  "source_revision": "d1b56b2f2",
+  "agentic_rendering": "Observable assistant/tool events from four repository Codex sessions; no private reasoning or injected instructions; document dumps and duplicate events omitted; events truncated at 8000 characters; credential/auth/email patterns and home usernames redacted. Source hashes attest compressed rollout files.",
+  "secret_scan": {
+    "tool": "detect-secrets",
+    "version": "1.5.0",
+    "mode": "scan --all-files",
+    "findings": 0
+  },
+  "reference_tokenizer": {
+    "model": "Qwen/Qwen3.8-Flash-Next",
+    "revision": "de4b8e4d43b917e7706784d8bb445c9af86a3540",
+    "sha256": "0997f410c57a1f4e53b09e4be8f4a172d90edd9564368fb0847030937229b9f3"
+  },
+  "chunk_tokens": 32,
+  "sources": [
+    {
+      "kind": "code",
+      "path": "scripts/bench/bench-ab.py",
+      "sha256": "a6637a86c7f50eaadd00ca4df9b1c206f4d000bd31bfd42601cac9bb0d01607d",
+      "excerpt_bytes": 9712,
+      "excerpt_sha256": "a6637a86c7f50eaadd00ca4df9b1c206f4d000bd31bfd42601cac9bb0d01607d"
+    },
+    {
+      "kind": "code",
+      "path": "scripts/bench/bench-agentic-session.py",
+      "sha256": "0fe03d00b3990fa55d9aa6df1b5c893ac69a209e347161233363ec8695f1288a",
+      "excerpt_bytes": 31741,
+      "excerpt_sha256": "0fe03d00b3990fa55d9aa6df1b5c893ac69a209e347161233363ec8695f1288a"
+    },
+    {
+      "kind": "code",
+      "path": "rust/crates/cuteafd-core/src/attention_geometry.rs",
+      "sha256": "cce66696db261749f99d6aad14feb441034954fd447996b396ec533600ed71b6",
+      "excerpt_bytes": 14046,
+      "excerpt_sha256": "cce66696db261749f99d6aad14feb441034954fd447996b396ec533600ed71b6"
+    },
+    {
+      "kind": "code",
+      "path": "rust/crates/cuteafd-core/src/constants.rs",
+      "sha256": "006013e4f98071faf6c1a802eefe6b17fdc646b14b0544c84a759c0ad00de8a4",
+      "excerpt_bytes": 5345,
+      "excerpt_sha256": "006013e4f98071faf6c1a802eefe6b17fdc646b14b0544c84a759c0ad00de8a4"
+    },
+    {
+      "kind": "code",
+      "path": "rust/crates/cuteafd-core/src/coordinator_programs.rs",
+      "sha256": "008b7ef50ec0bf9b95c17b13c5e43883f4afdb69f02eca3609a46896ecb5cba0",
+      "excerpt_bytes": 32657,
+      "excerpt_sha256": "008b7ef50ec0bf9b95c17b13c5e43883f4afdb69f02eca3609a46896ecb5cba0"
+    },
+    {
+      "kind": "code",
+      "path": "rust/crates/cuteafd-core/src/debug_expert.rs",
+      "sha256": "cbc4b6f2e034bf7dfa38e422cefe977b3fadfdd3689b32a22e11c9d8d24c8873",
+      "excerpt_bytes": 3549,
+      "excerpt_sha256": "cbc4b6f2e034bf7dfa38e422cefe977b3fadfdd3689b32a22e11c9d8d24c8873"
+    },
+    {
+      "kind": "code",
+      "path": "rust/crates/cuteafd-core/src/dense_attention.rs",
+      "sha256": "cf6bfa198a3a7e037105d2deede3cfa9b5ebb88af376dbbe40e425019b256776",
+      "excerpt_bytes": 22950,
+      "excerpt_sha256": "cf6bfa198a3a7e037105d2deede3cfa9b5ebb88af376dbbe40e425019b256776"
+    },
+    {
+      "kind": "code",
+      "path": "rust/crates/cuteafd-core/src/draft_policy.rs",
+      "sha256": "42c49dee04b91447521663c228ecaa03e2449aefab147f12caca3307a51efc35",
+      "excerpt_bytes": 21162,
+      "excerpt_sha256": "ba3707080faa9caaafda61a08da6b869526ff86fdbdf51f15c195eccc24734d5"
+    },
+    {
+      "kind": "prose",
+      "path": "PLAN.md",
+      "sha256": "9534b1dfe8d9284189e74cc5b195f525d0819cb588dfacfcf8a00d5fff5629e5",
+      "excerpt_bytes": 127347,
+      "excerpt_sha256": "c0241c9469663fef90436b3fc55e91cf65041b768731a356c324a986bfaa8a3f"
+    },
+    {
+      "kind": "agentic",
+      "path": "codex/rollout-2026-10-05T07-05-37-01a1092a-6d9d-7ba1-b94a-1e87f89a0498.jsonl.zst",
+      "sha256": "288ec24814ca7f9e56ce060db0d25c58cd1db5c3b9d35f9a451991d014a428d5",
+      "rendered_sha256": "f293c78aa24ecbaaeeb80197468efb1b9cc1e6abdab7cb75c8486501e7436224"
+    },
+    {
+      "kind": "agentic",
+      "path": "codex/rollout-2026-10-05T07-05-30-01a1092a-4fe7-7491-aa9d-683b0e1b233d.jsonl.zst",
+      "sha256": "508bb41a83453ad46729fbb8ff00921aa64fffa393d7538cbb416101776798dc",
+      "rendered_sha256": "7451053367c9ee6ba7e32ec1fdb7ae03349d9f320c6dc3d53f988230d494e97b"
+    },
+    {
+      "kind": "agentic",
+      "path": "codex/rollout-2026-10-05T07-05-22-01a1092a-2fb2-7b41-87ed-8f5db0f2b5f1.jsonl.zst",
+      "sha256": "f300db68166c93e71828bc36a906c012543535538fba7a85549624df13f50776",
+      "rendered_sha256": "96119ae7e9801215fc34c90232ff76ab4c4ba10582312b5731eb7b2f923d7102"
+    },
+    {
+      "kind": "agentic",
+      "path": "codex/rollout-2026-10-05T07-04-46-01a10929-a42d-7133-af3f-f8b79b9a5c39.jsonl.zst",
+      "sha256": "7fc5e50d0b29bf3ceb21c175ce478d1e2c8473fc9b85982ec8ef6d7205d7eecc",
+      "rendered_sha256": "c0e3bba6ee827cd9fb72d1f7e4742cee8a0b5abe16e6206c5edd456c25860761"
+    }
+  ],
+  "banks": [
+    {
+      "kind": "code",
+      "path": "code.txt",
+      "sha256": "e7f8354a07fcaed90c1af74fe1ed6d77c4d9799ecbee7cc5be5d7a096a2fc37c",
+      "bytes": 141599,
+      "reference_tokens": 40015,
+      "chunks": 1251
+    },
+    {
+      "kind": "agentic",
+      "path": "agentic.txt",
+      "sha256": "6ed7a5a8f45d803fe0694052f495810af024e8e05e442c8b53c6be9250285982",
+      "bytes": 113039,
+      "reference_tokens": 37878,
+      "chunks": 1184
+    },
+    {
+      "kind": "prose",
+      "path": "prose.txt",
+      "sha256": "8915cb3c536a86df44c1edce6c33685993337501a7c2eb4bbcf08c9541041673",
+      "bytes": 127366,
+      "reference_tokens": 40006,
+      "chunks": 1251
+    }
+  ]
+}

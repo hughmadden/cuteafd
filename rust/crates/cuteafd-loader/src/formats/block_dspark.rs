@@ -24,17 +24,29 @@ pub enum DsparkRope {
         rope_theta: f64,
         factor: f64,
         original_max_position_embeddings: usize,
+        #[serde(default = "default_beta_fast")]
         beta_fast: f64,
+        #[serde(default = "default_beta_slow")]
         beta_slow: f64,
+        #[serde(default)]
+        mscale: Option<f64>,
+        #[serde(default)]
+        mscale_all_dim: Option<f64>,
     },
 }
+
+fn default_beta_fast() -> f64 { 32.0 }
+fn default_beta_slow() -> f64 { 1.0 }
 
 /// Immutable draft-only rotary inputs. The legacy 64-wide default route
 /// computes its frequencies in the kernel instead of consuming this table.
 #[derive(Debug, Clone, PartialEq)]
 pub struct DsparkRotaryPlan {
     pub inv_freq: Vec<f32>,
+    /// Magnitude applied to rotary query/key coordinates.
     pub attention_factor: f32,
+    /// Additional MLA softmax multiplier, separate from rotary magnitude.
+    pub softmax_factor: f32,
 }
 
 impl DsparkRope {
@@ -53,6 +65,8 @@ impl DsparkRope {
                 original_max_position_embeddings,
                 beta_fast,
                 beta_slow,
+                mscale,
+                mscale_all_dim,
             } => {
                 if !factor.is_finite()
                     || factor < 1.0
@@ -61,6 +75,8 @@ impl DsparkRope {
                     || !beta_slow.is_finite()
                     || beta_fast <= beta_slow
                     || beta_slow <= 0.0
+                    || [mscale, mscale_all_dim].into_iter().flatten()
+                        .any(|scale| !scale.is_finite() || scale < 0.0)
                 {
                     return Err(Unsupported("invalid YaRN rotary parameters".into()));
                 }
@@ -80,8 +96,17 @@ impl DsparkRope {
                 "rotary theta must be finite and greater than one in FP32".into(),
             ));
         }
-        let attention_factor =
-            yarn.map_or(1.0, |(factor, _, _, _)| (1.0 + 0.1 * factor.ln()) as f32);
+        let (attention_factor, softmax_factor) = match *self {
+            Self::Yarn { factor, mscale, mscale_all_dim, .. } => {
+                let magnitude = |scale: f64| if factor <= 1.0 { 1.0 }
+                    else { 1.0 + 0.1 * scale * factor.ln() };
+                // MLA separates the rotary-coordinate magnitude from the
+                // all-dimension query scale. GQA without these fields keeps HF YaRN.
+                let all = magnitude(mscale_all_dim.unwrap_or(0.0));
+                ((magnitude(mscale.unwrap_or(1.0)) / all) as f32, (all * all) as f32)
+            }
+            Self::Default { .. } => (1.0, 1.0),
+        };
         let correction = yarn.map(|(_, original, fast, slow)| {
             let dimension = |rotations: f64| {
                 head_dim as f64 * (original as f64 / (rotations * 2.0 * std::f64::consts::PI)).ln()
@@ -110,7 +135,8 @@ impl DsparkRope {
                 }
             })
             .collect::<Vec<_>>();
-        if !attention_factor.is_finite() || inv_freq.iter().any(|x| !x.is_finite() || *x <= 0.0) {
+        if !attention_factor.is_finite() || !softmax_factor.is_finite()
+            || inv_freq.iter().any(|x| !x.is_finite() || *x <= 0.0) {
             return Err(Unsupported(
                 "rotary plan is not representable in FP32".into(),
             ));
@@ -118,6 +144,7 @@ impl DsparkRope {
         Ok(DsparkRotaryPlan {
             inv_freq,
             attention_factor,
+            softmax_factor,
         })
     }
 }
@@ -160,6 +187,31 @@ struct Layers {
 }
 
 impl BlockDsparkConfig {
+    /// Full layers share the target token budget; windowed layers keep their
+    /// original slot-local rings. Both use the shared draft cache inventory.
+    pub fn paged_cache_layout(&self, slots: usize, context: usize, target_tokens: usize,
+        kv: crate::families::qwen4::Qwen4KvCache) -> Result<super::dflash::DraftCacheLayout, DsparkConfigError> {
+        let invalid = || DsparkConfigError::Unsupported("invalid dSpark paged cache admission".into());
+        if slots == 0 || context == 0 || target_tokens == 0
+            || context.checked_add(self.block).is_none_or(|n| n > i32::MAX as usize)
+            || self.window.is_some_and(|window| window != context) { return Err(invalid()); }
+        let pages = target_tokens.div_ceil(64);
+        let rows = pages.checked_mul(64).ok_or_else(invalid)?;
+        if rows > i32::MAX as usize { return Err(invalid()); }
+        let plane = kv.plane_record_bytes(self.kv_heads, self.head_dim);
+        let record_bytes = plane.checked_mul(2).ok_or_else(invalid)?;
+        let full = self.window.is_none();
+        let cache_rows = if full { rows } else { slots.checked_mul(context).ok_or_else(invalid)? };
+        let layer_bytes = cache_rows.checked_mul(record_bytes).ok_or_else(invalid)?;
+        let total = layer_bytes.checked_mul(self.layers).ok_or_else(invalid)? as u64;
+        let page_table_bytes = if full { slots.checked_mul(context.div_ceil(64))
+            .and_then(|n| n.checked_mul(4)).ok_or_else(invalid)? as u64 } else { 0 };
+        Ok(super::dflash::DraftCacheLayout { target_tokens, page_rows: 64, pages, record_bytes,
+            full_layers: if full { self.layers } else { 0 },
+            window_bytes: if full { 0 } else { total }, full_bytes: if full { total } else { 0 },
+            page_table_bytes, layer_bytes: vec![layer_bytes; self.layers] })
+    }
+
     pub fn read(snapshot: &Path) -> Result<Self, DsparkConfigError> {
         Self::from_json(&serde_json::from_slice(&std::fs::read(
             snapshot.join("config.json"),
@@ -263,27 +315,8 @@ impl BlockDsparkConfig {
                 ))
             }
         };
-        match t.rope_parameters {
-            DsparkRope::Default { rope_theta } if rope_theta.is_finite() && rope_theta > 1.0 => (),
-            DsparkRope::Yarn {
-                rope_theta,
-                factor,
-                original_max_position_embeddings,
-                beta_fast,
-                beta_slow,
-            } if rope_theta.is_finite()
-                && rope_theta > 1.0
-                && factor.is_finite()
-                && factor >= 1.0
-                && original_max_position_embeddings > 0
-                && beta_fast.is_finite()
-                && beta_slow.is_finite()
-                && beta_fast > beta_slow
-                && beta_slow > 0.0 =>
-            {
-                ()
-            }
-            _ => return Err(Unsupported("invalid RoPE parameters".into())),
+        if t.rope_parameters.plan(t.head_dim)?.softmax_factor != 1.0 {
+            return Err(Unsupported("GQA dSpark has no all-dimension YaRN softmax scale".into()));
         }
         if let Some(target_layers) = raw["num_target_layers"].as_u64() {
             if taps.iter().any(|&l| l as u64 >= target_layers) {
@@ -479,6 +512,37 @@ mod tests {
     }
 
     #[test]
+    fn mla_yarn_separates_rotary_magnitude_and_softmax_scale() {
+        let raw = json!({"rope_type":"yarn", "rope_theta":50000.0,
+            "factor":32.0, "original_max_position_embeddings":32768,
+            "mscale":1.0, "mscale_all_dim":1.0});
+        let rope: DsparkRope = serde_json::from_value(raw.clone()).unwrap();
+        let plan = rope.plan(64).unwrap();
+        assert_eq!(plan.attention_factor, 1.0);
+        assert_eq!(plan.softmax_factor, (1.0 + 0.1 * 32.0f64.ln()).powi(2) as f32);
+        let mut explicit = raw.clone();
+        explicit["beta_fast"] = json!(32.0);
+        explicit["beta_slow"] = json!(1.0);
+        assert_eq!(plan, serde_json::from_value::<DsparkRope>(explicit).unwrap().plan(64).unwrap());
+        let mut scaled = raw.clone();
+        scaled["mscale"] = json!(0.5);
+        let scaled = serde_json::from_value::<DsparkRope>(scaled).unwrap().plan(64).unwrap();
+        assert_eq!(scaled.inv_freq, plan.inv_freq);
+        assert_eq!(scaled.softmax_factor, plan.softmax_factor);
+        assert_eq!(scaled.attention_factor,
+            ((1.0 + 0.05 * 32.0f64.ln()) / (1.0 + 0.1 * 32.0f64.ln())) as f32);
+        for field in ["mscale", "mscale_all_dim"] {
+            let mut invalid = raw.clone();
+            invalid[field] = json!(-1.0);
+            assert!(serde_json::from_value::<DsparkRope>(invalid).unwrap().plan(64).is_err());
+        }
+        let mut unit = raw;
+        unit["factor"] = json!(1.0);
+        let unit = serde_json::from_value::<DsparkRope>(unit).unwrap().plan(64).unwrap();
+        assert_eq!((unit.attention_factor, unit.softmax_factor), (1.0, 1.0));
+    }
+
+    #[test]
     fn rotary_plan_rejects_invalid_direct_construction() {
         assert!(DsparkRope::Default {
             rope_theta: f64::NAN
@@ -497,6 +561,22 @@ mod tests {
         .unwrap();
         assert_eq!(plan.attention_factor, 1.0);
         assert_eq!(plan.inv_freq[0], 1.0);
+    }
+
+    #[test]
+    fn shared_paged_inventory_is_token_budget_not_slot_context_product() {
+        use crate::families::qwen4::Qwen4KvCache;
+        let cfg = BlockDsparkConfig::from_json(&qwen()).unwrap();
+        for kv in [Qwen4KvCache::Bf16, Qwen4KvCache::Fp8] {
+            let one = cfg.paged_cache_layout(1, 262144, 8193, kv).unwrap();
+            let many = cfg.paged_cache_layout(16, 262144, 8193, kv).unwrap();
+            assert_eq!(one.full_bytes, many.full_bytes);
+            assert_eq!(one.pages, 129);
+            assert_eq!(one.full_bytes, (129 * 64 * 2 * kv.plane_record_bytes(8, 128) * 5) as u64);
+            assert_eq!(many.page_table_bytes, 16 * 4096 * 4);
+            assert_eq!(many.window_bytes, 0);
+            assert!(cfg.paged_cache_layout(16, 262144, 0, kv).is_err());
+        }
     }
 
     #[test]

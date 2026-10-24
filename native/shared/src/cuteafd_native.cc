@@ -1062,6 +1062,34 @@ extern "C" cuteafd_status_t cuteafd_cuda_b12x_quantize_bf16_nvfp4_row_payload_as
 }
 #endif
 
+extern "C" cuteafd_status_t cuteafd_register_host_mapping(void* ptr, size_t bytes) {
+  if (ptr == nullptr || bytes == 0) {
+    return fail(CUTEAFD_STATUS_INVALID_ARGUMENT, "empty host mapping");
+  }
+#if CUTEAFD_NATIVE_ENABLE_CUDA
+  cudaError_t err = cudaHostRegister(ptr, bytes, cudaHostRegisterPortable);
+  if (err != cudaSuccess) {
+    return fail_cuda(CUTEAFD_STATUS_ALLOCATION_FAILED, "cudaHostRegister failed", err);
+  }
+  return ok();
+#else
+  return fail(CUTEAFD_STATUS_CUDA_UNAVAILABLE, "host registration requires CUDA");
+#endif
+}
+
+extern "C" cuteafd_status_t cuteafd_unregister_host_mapping(void* ptr) {
+#if CUTEAFD_NATIVE_ENABLE_CUDA
+  cudaError_t err = cudaHostUnregister(ptr);
+  if (err != cudaSuccess) {
+    return fail_cuda(CUTEAFD_STATUS_INTERNAL_ERROR, "cudaHostUnregister failed", err);
+  }
+  return ok();
+#else
+  (void)ptr;
+  return fail(CUTEAFD_STATUS_CUDA_UNAVAILABLE, "host registration requires CUDA");
+#endif
+}
+
 extern "C" cuteafd_status_t cuteafd_alloc_host_buffer(size_t bytes, cuteafd_host_buffer_t* out) {
   if (out == nullptr) {
     return fail(CUTEAFD_STATUS_INVALID_ARGUMENT, "host buffer output pointer is null");

@@ -1,14 +1,14 @@
 //! Kimi K3 (`KimiK3ForConditionalGeneration`, text `kimi_linear`): KDA + NoPE
 //! MLA hybrid with attention-residual blocks, latent MoE and Situ FFNs. The
-//! planner validates the checkpoint's own config and tensor headers and names
-//! each missing kernel; no execution path exists in this build yet.
+//! planner validates only the checkpoint's own config and tensor headers.
+//! Runtime admission verifies installed native programs and expert packages.
 use std::collections::BTreeMap;
 
 use anyhow::{ensure, Result};
 use cuteafd_core::{DType, FfnActivation};
 
 use crate::families::kimi_k3::config::{KimiAttention, KimiK3Config};
-use crate::plan::{checkpoint::Checkpoint, family::*, format::QuantOperand, names::indexed, spec::*};
+use crate::plan::{checkpoint::Checkpoint, family::*, format::{self, QuantOperand}, names::indexed, spec::*};
 
 mod placement;
 #[cfg(test)]
@@ -17,20 +17,21 @@ mod tests;
 pub struct KimiK3;
 pub static KIMI_K3: KimiK3 = KimiK3;
 
+/// The same validated header inventory used by planning, for native startup.
+/// This does not grant serving admission or convert any core weight format.
+pub fn core_inventory(checkpoint: &Checkpoint) -> Result<crate::families::kimi_k3::core::CoreInventory> {
+    Ok(Model::open(checkpoint)?.core)
+}
+
 const TEXT: &str = "language_model.model.";
 const HEAD: &str = "language_model.lm_head.";
 const GIB: u64 = 1 << 30;
 
-/// Routed-expert weights per Spark rank for Kimi K3 without `--spark-budget-gib`.
-///
-/// TP6 EXL3 K2 needs 107.54 GiB per rank (92 layers x 896 experts: each rank
-/// holds 1/6 of the trellis, the 3072-wide rotation slice, and full copies of
-/// the 3584-wide input/output rotations). 108 GiB is that plus 0.46 GiB margin,
-/// equal to the planner's usable GB10 bytes (121.7 GiB physical minus ~13 GiB
-/// host OS and storage daemon). Rank runtime and I/O stay separate charges on
-/// the device layout. The shared 100 GiB default would put ~8 routed layers
-/// (55 GiB) on the coordinators and leave no room for the 256K KV floor.
-pub const SPARK_BUDGET_BYTES: u64 = 108 * GIB;
+/// Complete per-rank allocation ceiling without `--spark-budget-gib`.
+/// Exact TP6 header arenas and endpoint I/O plus an estimated runtime/workspace
+/// reserve constrain RTX onboarding alongside marks and the selected context floor.
+/// The default remains estimated until the first full worker load/steady census.
+pub const SPARK_BUDGET_BYTES: u64 = crate::families::kimi_k3::SPARK_DEFAULT_BUDGET_BYTES;
 
 /// The EXL3 expert package Kimi K3 uses: H3584/E896/K16/I3072, uniform K2 in
 /// the K2/K3 tier set, TP6 width 512.
@@ -44,6 +45,7 @@ struct Tensor {
 
 pub(super) struct Model {
     cfg: KimiK3Config,
+    snapshot: std::path::PathBuf,
     spec: ModelSpec,
     tensors: BTreeMap<String, Tensor>,
     /// Header byte counts by component.
@@ -54,8 +56,11 @@ pub(super) struct Model {
     expert_formats: Vec<String>,
     /// Coordinator text bytes by TP2 residency (embedding, head and MLA excluded).
     coordinator: Residency,
+    /// One canonical latent/router frontend, alternating by routed ordinal.
+    frontends: [u64; 2],
     /// MLA operands by layer, held whole on the owner or head-split explicitly.
     mla: Vec<Residency>,
+    core: crate::families::kimi_k3::core::CoreInventory,
 }
 
 /// Coordinator text weights by how a two-GPU head split holds them.
@@ -142,11 +147,15 @@ impl Model {
         }
         let spec = spec(&cfg, checkpoint);
         let mla = vec![Residency::default(); cfg.layers];
-        let mut model = Self { cfg, spec, tensors, bytes: BTreeMap::new(), complete: true, expert_formats: Vec::new(),
-            coordinator: Residency::default(), mla };
+        let mut model = Self { cfg, snapshot: checkpoint.snapshot.clone(), spec, tensors, bytes: BTreeMap::new(), complete: true, expert_formats: Vec::new(),
+            coordinator: Residency::default(), frontends: [0; 2], mla,
+            core: crate::families::kimi_k3::core::CoreInventory::default() };
+        model.core = crate::families::kimi_k3::core::CoreInventory::from_checkpoint(&model.cfg, checkpoint,
+            &model.tensors.iter().map(|(name, tensor)| (name.clone(), tensor.shape.clone())).collect())?;
         let mut headers = BTreeMap::new();
         for tensor in &checkpoint.tensors { headers.insert(tensor.meta.name.as_str(), &tensor.meta); }
         for (name, expected) in &model.tensors {
+            if model.core.get_weight(name).is_some() { continue; }
             let Some(meta) = headers.get(name.as_str()) else {
                 ensure!(checkpoint.contains_tensor(name), "Kimi K3 checkpoint lacks {name}");
                 model.complete = false;
@@ -158,8 +167,13 @@ impl Model {
         for tensor in &checkpoint.tensors {
             if let Some(role) = KIMI_K3.classify(&model.spec, &tensor.meta.name) {
                 *model.bytes.entry(role.component).or_default() += tensor.meta.byte_length;
+                if model.core.projections.contains_key(format::split_stem(&tensor.meta.name).0) { continue; }
                 if let Some((layer, rest)) = text(&tensor.meta.name).and_then(|r| indexed(r, "layers."))
                     .filter(|_| role.component != Component::RoutedExpert) {
+                    if matches!(role.component, Component::LatentProjection | Component::Router) {
+                        let ordinal = model.cfg.dense[..layer].iter().filter(|dense| !**dense).count();
+                        model.frontends[ordinal % 2] += tensor.meta.byte_length;
+                    }
                     let residency = if role.component == Component::Attention && model.cfg.attention[layer] == KimiAttention::Mla {
                         &mut model.mla[layer]
                     } else { &mut model.coordinator };
@@ -168,6 +182,19 @@ impl Model {
                 } else if matches!(role.component, Component::Norm | Component::ResidualMix) {
                     model.coordinator.replicated += tensor.meta.byte_length;
                 }
+            }
+        }
+        for projection in model.core.projections.values() {
+            let Some((layer, rest)) = text(&projection.stem).and_then(|r| indexed(r, "layers.")) else { continue; };
+            let (split, replicated) = projection.residency();
+            let residency = if rest.starts_with("self_attn.") && model.cfg.attention[layer] == KimiAttention::Mla {
+                &mut model.mla[layer]
+            } else { &mut model.coordinator };
+            residency.split += split;
+            residency.replicated += replicated;
+            if rest.starts_with("block_sparse_moe.routed_expert_") {
+                let ordinal = model.cfg.dense[..layer].iter().filter(|dense| !**dense).count();
+                model.frontends[ordinal % 2] += replicated;
             }
         }
         let mut formats = std::collections::BTreeSet::new();
@@ -260,46 +287,70 @@ impl Family for KimiK3 {
         Some(TensorRole::layer(component, layer))
     }
     fn component_hint(&self, component: Component) -> Option<Hint> {
-        // Work items as posted on #273.
-        let (what, how) = match component {
-            Component::RoutedExpert => ("EXL3 K2 latent experts (H3584 E896 K16 I3072, Situ)",
-                "mixed_trellis expert ids above 512 (10-bit descriptors), Situ epilogue through compile_mixed_trellis, \
-                 package_exl3_aot.py GEOMETRIES (3584,3072,896,16) TP6 width 512; reducer width 3584 (W4/W5)"),
-            Component::Router => ("sigmoid noaux_tc router at E896/K16, scale 1.0",
-                "expert_router.cu caps E512/K8 and glm routes fix 2.5; add an FP32 E896 top-16 variant (W5)"),
-            Component::Attention => ("KDA 96x128 at hidden 7168 with a full-rank output gate; NoPE full-causal MLA 96 heads with sigmoid output gate",
-                "generalize glmf KDA programs (hidden 7168, 48 heads/GPU, g_proj in w_in, F32 conv/o_norm, A_log narrowed before split) (W6); \
-                 AOT-export b12x dense_mla (576/512 latent, scale 192^-0.5, unrotated rope slot), no-RoPE producer, gate before o_proj (W7)"),
-            Component::ResidualMix => ("attention-residual mixer (not mHC)",
-                "shared FP32 rmsnorm-score softmax mix over up to 9 BF16 candidates, fused with the following RMSNorm; block store scratch (W8)"),
-            Component::LatentProjection => ("latent MoE projections and post-combine RMSNorm(3584)",
-                "coordinator order: down_proj -> dispatch -> reduce at 3584 -> RMSNorm -> up_proj -> + shared (W9)"),
-            Component::DenseFfn | Component::SharedExpert => ("Situ dense/shared FFN",
-                "BF16 FFN programs with the Situ epilogue (FfnActivation::Situ) (W8)"),
-            Component::Vision => ("MoonViT3d tower + patchmergerv2 projector", "later step; text first"),
-            Component::Embedding | Component::LmHead | Component::Norm => ("Kimi K3 engine", "families/kimi_k3 engine (W9)"),
-            _ => return None,
-        };
-        Some(Hint { what: format!("Kimi K3 {}: {what} missing", component.label()), how: how.into() })
+        match component {
+            Component::Vision => Some(Hint {
+                what: "Kimi K3 vision execution is not implemented".into(),
+                how: "Add the bundled MoonViT3d tower and patchmergerv2 projector; serve text with --vision off today".into(),
+            }),
+            Component::Speculator | Component::SpeculatorExpert => Some(Hint {
+                what: "Kimi K3 draft execution is not implemented".into(),
+                how: "Serve text without speculation; a windowed external drafter needs a native integration".into(),
+            }),
+            _ => None,
+        }
     }
 }
 
 impl FamilyModel for Model {
     fn spec(&self) -> &ModelSpec { &self.spec }
+    /// Header-native K6 core tensors are served natively; there is no BF16 fallback.
+    fn configure(&mut self, _options: &crate::plan::PlanOptions) -> Result<(), ConfigError> {
+        self.core.validate_runtime_groups(&self.cfg).map_err(ConfigError::from_anyhow)
+    }
+    fn native_serving_admission(&self) -> bool { true }
+    fn vision_mode(&self, mode: crate::plan::MediaMode) -> crate::plan::MediaMode {
+        if mode == crate::plan::MediaMode::Auto { crate::plan::MediaMode::Off } else { mode }
+    }
+    fn cache_geometry(&self, options: crate::serving_capacity::CacheOptions)
+        -> Result<Option<crate::serving_capacity::FamilyCacheGeometry>, crate::serving_capacity::CacheGeometryError> {
+        use crate::{placement::AttentionPlacement, serving_capacity::CacheGeometryError};
+        if options.coordinator_ranks != 2 || options.attention_placement == Some(AttentionPlacement::Context) {
+            return Err(CacheGeometryError::Unsupported { family: "kimi_k3", what: "requires TP2 owned or head-split MLA" });
+        }
+        let layers = self.cfg.mla_layers();
+        let resident = if options.attention_placement == Some(AttentionPlacement::Heads) { [layers; 2] }
+            else { [layers.div_ceil(2), layers / 2] };
+        crate::families::kimi_k3::kda::cache_geometry(&self.cfg, resident, options.mla_kv).map(Some)
+    }
     fn spark_budget_bytes(&self) -> u64 { SPARK_BUDGET_BYTES }
     fn activation(&self, layer: usize, _shared: bool) -> Option<FfnActivation> {
         (layer < self.cfg.layers).then(|| self.cfg.activation())
     }
     fn accepts(&self, role: &TensorRole, stem: &str, operand: &mut QuantOperand) -> Result<(), String> {
-        let known = self.tensors.contains_key(stem) || self.tensors.contains_key(&format!("{stem}.weight"))
-            || (role.component == Component::RoutedExpert && operand.exl3_bits() == Some(2))
-            || role.component == Component::Vision;
-        if !known {
-            return Err(format!("{stem}: not in the Kimi K3 release tensor contract ({})", super::describe(operand)));
+        if let Some(projection) = self.core.projections.get(stem) {
+            return super::require(matches!(operand.encoding, format::Encoding::Exl3 { bits: 6 })
+                && operand.logical == [projection.stored_outputs, projection.shape[1]],
+                || format!("{stem}: expected header-native K6 {:?}", projection.shape));
         }
-        let hint = KIMI_K3.component_hint(role.component)
-            .unwrap_or(Hint { what: "Kimi K3 engine missing".into(), how: "families/kimi_k3 (W9)".into() });
-        Err(format!("{stem}: {}: {}", hint.what, hint.how))
+        if role.component == Component::RoutedExpert && operand.exl3_bits() == Some(2) {
+            let expected = match stem.rsplit_once('.').map(|(_, name)| name) {
+                Some("w1" | "w3") => [self.cfg.moe_intermediate, self.cfg.latent],
+                Some("w2") => [self.cfg.latent, self.cfg.moe_intermediate],
+                _ => return Err(format!("{stem}: unknown Kimi routed projection")),
+            };
+            return super::require(operand.logical == expected, ||
+                format!("{stem}: Kimi routed shape {:?}, expected {expected:?}", operand.logical));
+        }
+        let expected = self.tensors.get(stem).or_else(|| self.tensors.get(&format!("{stem}.weight")))
+            .ok_or_else(|| format!("{stem}: outside the Kimi K3 native text tensor contract ({})", super::describe(operand)))?;
+        let encoding = match expected.dtype {
+            DType::Bf16 => format::Encoding::Bf16,
+            DType::F32 => format::Encoding::F32,
+            _ => return Err(format!("{stem}: unsupported Kimi text dtype {:?}", expected.dtype)),
+        };
+        super::require(operand.logical == expected.shape && operand.is_plain(&[encoding])
+            && operand.input_scale.is_none() && operand.companions.is_empty(), ||
+            format!("{stem}: expected plain {:?} {:?}, found {}", expected.dtype, expected.shape, super::describe(operand)))
     }
     fn experts(&self, operand: &QuantOperand) -> Option<ExpertContract> {
         (operand.exl3_bits() == Some(2)).then(|| ExpertContract {
@@ -310,7 +361,7 @@ impl FamilyModel for Model {
         })
     }
     fn placement(&self, _input: &crate::plan::PlanInput, report: &mut crate::plan::PlanReport,
-        options: &crate::plan::layout::LayoutOptions, requested: crate::plan::ExpertPlacement)
+        options: &mut crate::plan::layout::LayoutOptions, requested: crate::plan::ExpertPlacement)
         -> Option<anyhow::Result<cuteafd_core::memory_layout::MemoryLayout>> {
         Some(Ok(placement::layout(self, report, options, requested)))
     }

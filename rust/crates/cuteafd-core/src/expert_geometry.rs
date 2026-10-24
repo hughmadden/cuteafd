@@ -14,6 +14,9 @@ pub const EXLR8_EXECUTION_ROWS: usize = 64;
 pub struct SparkEndpoint {
     pub capacity: u32,
     pub ingress: SparkIngress,
+    /// Overrides only this connection's depth; other endpoints keep the model default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ring_depth: Option<usize>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -166,6 +169,12 @@ pub struct SparkRings {
 }
 
 impl SparkEndpoint {
+    /// The planner and both transport peers use the same admitted ring depth.
+    pub fn resolved_rings(self, rings: SparkRings) -> Option<SparkRings> {
+        let depth = self.ring_depth.unwrap_or(rings.depth);
+        (1..=8).contains(&depth).then_some(SparkRings { depth, ..rings })
+    }
+
     /// Retained response metadata per QP: largest header plus indexed rows.
     pub fn response_prefix_bytes(self) -> Option<usize> {
         if !(1..=4096).contains(&self.capacity) { return None; }
@@ -188,7 +197,7 @@ impl SparkEndpoint {
 
     pub fn ring_bytes(self, geometry: ExpertGeometry, rings: SparkRings) -> Option<usize> {
         let (request, response) = self.wire_bytes(geometry)?;
-        geometry.ring_bytes_for_wire(request, response, rings, 1)
+        geometry.ring_bytes_for_wire(request, response, self.resolved_rings(rings)?, 1)
     }
 }
 
@@ -374,9 +383,37 @@ mod tests {
     use super::*;
 
     #[test]
+    fn endpoint_ring_depth_resolves_default_and_rejects_invalid_depths() {
+        let endpoint = SparkEndpoint { capacity: 4096, ingress: SparkIngress::Fp8K32, ring_depth: None };
+        let geometry = ExpertGeometry::DEEPSEEK_V41;
+        let rings = SparkRings { max_frame_bytes: 64 << 20, depth: 8,
+            slot_bytes: 8 << 20, alignment: 4096 };
+        assert_eq!(endpoint.resolved_rings(rings), Some(rings));
+        let default_bytes = endpoint.ring_bytes(geometry, rings).unwrap();
+        for depth in 1..=8 {
+            let endpoint = SparkEndpoint { ring_depth: Some(depth), ..endpoint };
+            assert_eq!(endpoint.resolved_rings(rings), Some(SparkRings { depth, ..rings }));
+            assert_eq!(endpoint.ring_bytes(geometry, rings), Some(default_bytes / 8 * depth));
+        }
+        for depth in [0, 9, usize::MAX] {
+            assert!(endpoint.resolved_rings(SparkRings { depth, ..rings }).is_none());
+            let endpoint = SparkEndpoint { ring_depth: Some(depth), ..endpoint };
+            assert!(endpoint.resolved_rings(rings).is_none());
+            assert!(endpoint.ring_bytes(geometry, rings).is_none());
+        }
+        let serialized = serde_json::to_value(endpoint).unwrap();
+        assert!(serialized.get("ring_depth").is_none());
+        assert_eq!(serde_json::from_value::<SparkEndpoint>(serialized).unwrap(), endpoint);
+        let endpoint = SparkEndpoint { ring_depth: Some(2), ..endpoint };
+        let serialized = serde_json::to_value(endpoint).unwrap();
+        assert_eq!(serialized["ring_depth"], 2);
+        assert_eq!(serde_json::from_value::<SparkEndpoint>(serialized).unwrap(), endpoint);
+    }
+
+    #[test]
     fn endpoint_response_prefix_is_bounded_by_admitted_rows() {
         for capacity in [0, 1, 640, 4096, 4097, u32::MAX] {
-            let endpoint = SparkEndpoint { capacity, ingress: SparkIngress::Bf16 };
+            let endpoint = SparkEndpoint { ring_depth: None, capacity, ingress: SparkIngress::Bf16 };
             assert_eq!(endpoint.response_prefix_bytes(), if (1..=4096).contains(&capacity) {
                 Some(128 + capacity as usize * 4)
             } else { None });

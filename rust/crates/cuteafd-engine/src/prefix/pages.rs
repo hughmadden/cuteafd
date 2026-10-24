@@ -1,10 +1,9 @@
 //! One refcounted device page pool for every generic family (it replaces the per-family free
 //! lists). A page holds `page_rows` token rows of every paged layer; a sequence's placement is a
 //! list of page indices. Sharing is by reference count: a retained snapshot and every request
-//! restored from it hold the same full pages, which nobody writes again because every writer
-//! appends past its own committed length. The one page that can still change is a partial tail
-//! (its rows past the snapshot's length belong to whoever owns it), so [`RefPagePool::fork`]
-//! copies it into a fresh page instead of sharing it (copy on write, done eagerly: one page).
+//! restored from it share only pages below their earliest writable row. A target-only writer
+//! appends past its committed length; a lagging predictor can still write a retained row.
+//! Forks eagerly copy every retained page at or beyond that writable frontier.
 //!
 //! Identity: a page index is reused after it is freed, so every free bumps the index's
 //! generation. `(index, generation)` names one allocation for the host tier's page sharing.
@@ -273,28 +272,41 @@ impl RefPagePool {
 
     /// [`RefPagePool::fork_cost`] per half.
     pub fn fork_need(&self, len: usize, total: usize) -> Need {
-        let full = self.full_pages(len);
-        let total = total.max(full + usize::from(len % self.page_rows > 0)).max(1);
-        self.need_for(full..total)
+        self.fork_need_writable(len, total, len)
     }
 
-    /// Pages for a sequence of `total` pages that starts as `source[..len rows]`: the full pages
-    /// are shared, a partial tail is copied into a fresh page at the same position (the returned
-    /// [`TailCopy`], on the position's owner in a parity pool), and fresh pages follow. All or
-    /// nothing.
+    /// Fresh pages when rows at or beyond `write_frontier` may still change.
+    pub fn fork_need_writable(&self, len: usize, total: usize, write_frontier: usize) -> Need {
+        assert!(write_frontier <= len, "write frontier exceeds retained length");
+        self.need_for(self.full_pages(write_frontier)..total.max(self.pages_for(len)))
+    }
+
+    /// Share complete immutable pages and eagerly copy a partial tail.
     pub fn fork(&mut self, source: &[u32], len: usize, total: usize) -> Result<Fork, PoolExhausted> {
-        let full = self.full_pages(len);
-        let partial = len % self.page_rows;
-        assert!(source.len() >= full + usize::from(partial > 0), "fork source shorter than {len} rows");
-        let total = total.max(full + usize::from(partial > 0)).max(1);
-        let fresh = self.alloc_for(full..total)?;
-        self.share(&source[..full]);
-        let copy = (partial > 0).then(|| TailCopy { from: source[full], to: fresh[0], rows: partial,
-            owner: self.owner(source[full]) });
-        debug_assert!(copy.is_none_or(|c| self.owner(c.from) == self.owner(c.to)), "a tail copy keeps its owner");
-        let mut pages = source[..full].to_vec();
+        let (pages, copies) = self.fork_writable(source, len, total, len)?;
+        debug_assert!(copies.len() <= 1);
+        Ok(Fork { pages, copy: copies.into_iter().next() })
+    }
+
+    /// Share only pages strictly before the earliest writable retained row. Copies include
+    /// complete retained pages when a predictor lags behind the target's committed frontier.
+    pub fn fork_writable(&mut self, source: &[u32], len: usize, total: usize,
+        write_frontier: usize) -> Result<(Vec<u32>, Vec<TailCopy>), PoolExhausted> {
+        assert!(write_frontier <= len, "write frontier exceeds retained length");
+        let shared = self.full_pages(write_frontier);
+        let retained = len.div_ceil(self.page_rows);
+        assert!(source.len() >= retained, "fork source shorter than {len} rows");
+        let fresh = self.alloc_for(shared..total.max(self.pages_for(len)))?;
+        self.share(&source[..shared]);
+        let copies = (shared..retained).map(|i| {
+            let copy = TailCopy { from: source[i], to: fresh[i - shared],
+                rows: (len - i * self.page_rows).min(self.page_rows), owner: self.owner(source[i]) };
+            debug_assert_eq!(self.owner(copy.from), self.owner(copy.to), "a copy keeps its owner");
+            copy
+        }).collect();
+        let mut pages = source[..shared].to_vec();
         pages.extend(fresh);
-        Ok(Fork { pages, copy })
+        Ok((pages, copies))
     }
 
     fn exhausted(&self, need: Need) -> PoolExhausted {
@@ -361,5 +373,31 @@ mod tests {
         assert!(pool.fork(&owner, 64, 64).is_err());
         assert_eq!(pool.free(), before, "a failed fork holds nothing");
         assert_eq!(pool.refs(owner[0]), 4);
+    }
+}
+
+#[cfg(test)]
+mod writable_tests {
+    use super::*;
+
+    #[test]
+    fn aligned_predictor_tail_is_private_and_multiple_copies_keep_parity() {
+        for parity in [false, true] {
+            let mut pool = if parity { RefPagePool::parity(16, 256, 0) } else { RefPagePool::new(16, 256) };
+            let source = pool.alloc(3).unwrap();
+            assert_eq!(pool.fork_need_writable(512, 3, 511), pool.need_for(1..3));
+            let (pages, copies) = pool.fork_writable(&source, 512, 3, 511).unwrap();
+            assert_eq!(pages[0], source[0]);
+            assert_ne!(pages[1], source[1]);
+            assert_eq!(copies, vec![TailCopy { from: source[1], to: pages[1], rows: 256,
+                owner: pool.owner(source[1]) }]);
+            let (wide, copies) = pool.fork_writable(&source, 513, 3, 255).unwrap();
+            assert_eq!(copies.iter().map(|c| c.rows).collect::<Vec<_>>(), vec![256, 256, 1]);
+            for c in copies { assert_eq!(pool.owner(c.from), pool.owner(c.to)); }
+            pool.release(&source);
+            pool.release(&pages);
+            pool.release(&wide);
+            assert_eq!(pool.free(), 16);
+        }
     }
 }

@@ -17,6 +17,44 @@ pub const BRIDGE_EXCHANGE_BYTES: u64 = BRIDGE_SLOTS * 256 + 256 + 256;
 /// Receive slots of a draft bridge: context, input rows, hidden rows, logits.
 pub const BRIDGE_SLOTS: u64 = 4;
 
+/// Rank-1 drafter bridge with embedding/tap staging on rank 0. The head's
+/// owning rank is explicit: a rank-1 head reuses the drafter's hidden rows,
+/// logits and head scratch instead of allocating duplicate rank-0 storage.
+/// `rows` is the full admitted draft batch, not a head launch chunk.
+pub fn remote_dflash_bridge_demands(hidden: u64, vocab: u64, taps: u64, rows: u64, head_rank: u8)
+    -> Result<MovableDemands, PlacementError> {
+    use cuteafd_core::memory_layout::{Basis, Category};
+    if hidden == 0 || vocab == 0 || taps == 0 || rows == 0 || rows > i32::MAX as u64 || head_rank > 1 {
+        return Err(PlacementError::Inventory("remote DFlash bridge geometry or head owner"));
+    }
+    let mul = |a: u64, b: u64| a.checked_mul(b)
+        .ok_or(PlacementError::Overflow("remote DFlash bridge"));
+    let hidden_rows = mul(mul(rows, hidden)?, 2)?.max(256);
+    let mut bytes = vec![
+        ("DFlash bridge taps", mul(mul(mul(2048, taps)?, hidden)?, 2)?.max(256)),
+        ("DFlash bridge input ids", mul(rows, 4)?.max(256)),
+        ("DFlash bridge gathered input", hidden_rows),
+    ];
+    if head_rank == 0 {
+        bytes.extend([
+            ("DFlash bridge normalized hidden", hidden_rows),
+            ("DFlash bridge logits", mul(mul(rows, vocab)?, 4)?.max(256)),
+            ("DFlash bridge head scratch", 4 << 20),
+        ]);
+    }
+    let mut demands: Vec<_> = bytes.into_iter().map(|(group, bytes)|
+        Demand::new(0, Category::Drafter, group, bytes, Basis::Formula)).collect();
+    for gpu in 0..2 {
+        demands.push(Demand::new(gpu, Category::Transport, "DFlash bridge exchange",
+            BRIDGE_EXCHANGE_BYTES, Basis::Formula));
+    }
+    for gpu in 0..2 {
+        demands.iter().filter(|d| d.gpu == gpu).try_fold(0u64, |sum, d|
+            sum.checked_add(d.bytes).ok_or(PlacementError::Overflow("remote DFlash bridge")))?;
+    }
+    Ok(MovableDemands { placement_gpu: 1, demands })
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DrafterDemand {
     /// `Drafter` for owned weights; `DsparkExperts` for stage experts loaded
@@ -92,6 +130,25 @@ impl DrafterDemand {
     }
 }
 
+impl crate::formats::dflash::MlaDraftCacheLayout {
+    /// Both offline and measured admission must consume these exact charges
+    /// before allocating the cache. This is only the cache portion of the
+    /// drafter inventory, not weights, activations or native scratch.
+    pub fn demands(&self, gpu: u8) -> Result<Vec<Demand>, PlacementError> {
+        use cuteafd_core::memory_layout::{Basis, Category};
+        let retained = self.cache_bytes.checked_sub(self.margin_bytes)
+            .ok_or(PlacementError::Inventory("MLA draft cache margin exceeds physical cache"))?;
+        Ok(vec![
+            Demand::new(gpu, Category::Drafter, "MLA DFlash retained latent cache",
+                retained, Basis::Formula),
+            Demand::new(gpu, Category::Drafter, "MLA DFlash per-slot private block and page padding",
+                self.margin_bytes, Basis::Formula),
+            Demand::new(gpu, Category::Drafter, "MLA DFlash virtual page tables",
+                self.page_table_bytes, Basis::Formula),
+        ])
+    }
+}
+
 /// Test oracle: the same request with every movable charged as fixed demands
 /// on its first allowed GPU (how families charged drafters before #65).
 #[cfg(test)]
@@ -148,6 +205,83 @@ pub fn require_home(placement: &Placement, family: &'static str, executable: &[u
 mod tests {
     use super::*;
     use cuteafd_core::memory_layout::{Basis, Category};
+
+    // Frozen pre-extraction GLM Flash formula: compare every demand, not just totals.
+    fn legacy_glm_flash_bridge(hidden: u64, vocab: u64, taps: u64, rows: u64)
+        -> Result<MovableDemands, PlacementError> {
+        if hidden == 0 || vocab == 0 || taps == 0 || rows == 0 || rows > i32::MAX as u64 {
+            return Err(PlacementError::Inventory("GLM Flash remote DFlash bridge geometry"));
+        }
+        let mul = |a: u64, b: u64| a.checked_mul(b)
+            .ok_or(PlacementError::Overflow("GLM Flash remote DFlash bridge"));
+        let hidden_rows = mul(mul(rows, hidden)?, 2)?.max(256);
+        let bytes = [
+            ("DFlash bridge taps", mul(mul(mul(2048, taps)?, hidden)?, 2)?.max(256)),
+            ("DFlash bridge input ids", mul(rows, 4)?.max(256)),
+            ("DFlash bridge gathered input", hidden_rows),
+            ("DFlash bridge normalized hidden", hidden_rows),
+            ("DFlash bridge logits", mul(mul(rows, vocab)?, 4)?.max(256)),
+            ("DFlash bridge head scratch", 4 << 20),
+        ];
+        let mut demands: Vec<_> = bytes.into_iter().map(|(group, bytes)|
+            Demand::new(0, Category::Drafter, group, bytes, Basis::Formula)).collect();
+        for gpu in 0..2 {
+            demands.push(Demand::new(gpu, Category::Transport, "DFlash bridge exchange",
+                1536, Basis::Formula));
+        }
+        for gpu in 0..2 {
+            demands.iter().filter(|d| d.gpu == gpu).try_fold(0u64, |sum, d|
+                sum.checked_add(d.bytes).ok_or(PlacementError::Overflow("GLM Flash remote DFlash bridge")))?;
+        }
+        Ok(MovableDemands { placement_gpu: 1, demands })
+    }
+
+    #[test]
+    fn bridge_formula_reproduces_legacy_glm_flash_allocations_exactly() {
+        for (hidden, vocab, taps) in [(4096, 154_880, 5), (4096, 154_880, 6)] {
+            for rows in [1, 8, 16, 32, 64, 128] {
+                assert_eq!(remote_dflash_bridge_demands(hidden, vocab, taps, rows, 0).unwrap(),
+                    legacy_glm_flash_bridge(hidden, vocab, taps, rows).unwrap());
+            }
+        }
+        assert_eq!(remote_dflash_bridge_demands(1, 1, 1, 1, 0).unwrap(),
+            legacy_glm_flash_bridge(1, 1, 1, 1).unwrap());
+    }
+
+    #[test]
+    fn draft_local_head_charges_only_new_bridge_allocations() {
+        let (hidden, vocab, taps, rows) = (7168, 163_840, 5, 64);
+        let bridge = remote_dflash_bridge_demands(hidden, vocab, taps, rows, 1).unwrap();
+        assert_eq!(bridge.placement_gpu, 1);
+        assert_eq!(bridge.demands, vec![
+            Demand::new(0, Category::Drafter, "DFlash bridge taps", 146_800_640, Basis::Formula),
+            Demand::new(0, Category::Drafter, "DFlash bridge input ids", 256, Basis::Formula),
+            Demand::new(0, Category::Drafter, "DFlash bridge gathered input", 917_504, Basis::Formula),
+            Demand::new(0, Category::Transport, "DFlash bridge exchange", 1536, Basis::Formula),
+            Demand::new(1, Category::Transport, "DFlash bridge exchange", 1536, Basis::Formula),
+        ]);
+        let head0 = remote_dflash_bridge_demands(hidden, vocab, taps, rows, 0).unwrap();
+        let total = |d: &MovableDemands| d.demands.iter().map(|d| d.bytes).sum::<u64>();
+        assert_eq!(total(&head0) - total(&bridge), rows * hidden * 2 + rows * vocab * 4 + (4 << 20));
+        // No logits payload is allocated by this bridge when the head is local.
+        assert!(remote_dflash_bridge_demands(1, u64::MAX, 1, 1, 1).is_ok());
+    }
+
+    #[test]
+    fn shared_bridge_rejects_invalid_owner_and_geometry_or_allocation_overflow() {
+        for head in [0, 1] {
+            for (h, v, t, r) in [(0, 1, 1, 1), (1, 0, 1, 1), (1, 1, 0, 1),
+                (1, 1, 1, 0), (1, 1, 1, i32::MAX as u64 + 1)] {
+                assert!(matches!(remote_dflash_bridge_demands(h, v, t, r, head), Err(PlacementError::Inventory(_))));
+            }
+            for (h, t, r) in [(u64::MAX, 1, 1), (1, u64::MAX, 1), (u64::MAX / 4096, 1, 1)] {
+                assert!(matches!(remote_dflash_bridge_demands(h, 1, t, r, head), Err(PlacementError::Overflow(_))));
+            }
+        }
+        for head in [2, u8::MAX] {
+            assert!(matches!(remote_dflash_bridge_demands(1, 1, 1, 1, head), Err(PlacementError::Inventory(_))));
+        }
+    }
 
     fn scratch(gpu: u8, bytes: u64) -> MovableDemands {
         MovableDemands { placement_gpu: gpu, demands: vec![Demand::new(gpu, Category::Workspace, "scratch", bytes, Basis::Formula)] }

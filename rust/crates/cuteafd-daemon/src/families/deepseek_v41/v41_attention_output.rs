@@ -75,9 +75,9 @@ impl<'a> AttentionOutputWeights<'a> {
             staging,
         )?;
         let launched = (|| unsafe {
-            grouped_kernel.pack_scales(tensors.get(&names[1])?, grouped_scales.buffer, stream.raw)?;
+            crate::shared::experts::rtx::dense::v41_pack_scales(&grouped_kernel, tensors.get(&names[1])?, grouped_scales.buffer, stream.raw)?;
             if let Some(scales)=&scales {
-                kernel.pack_scales(tensors.get(&names[3])?,scales.buffer,stream.raw)?;
+                crate::shared::experts::rtx::dense::v41_pack_scales(&kernel, tensors.get(&names[3])?,scales.buffer,stream.raw)?;
             }
             Ok(())
         })();
@@ -90,6 +90,13 @@ impl<'a> AttentionOutputWeights<'a> {
             grouped_scales,
             scales,
         })
+    }
+    /// The buffers a decode step reads, in order (L2 prefetch): grouped wo_a and
+    /// its packed scales, then wo_b and its scales unless TP2 splits it.
+    pub(crate) fn decode_reads(&self) -> Vec<CuteafdDeviceBuffer> {
+        [self.tensors.get(&self.names[0]).ok(), Some(self.grouped_scales.buffer),
+            self.tensors.get(&self.names[2]).ok(), self.scales.as_ref().map(|scales| scales.buffer)]
+            .into_iter().flatten().collect()
     }
     pub fn wave(&self, capacity: u32, budget: usize) -> Result<AttentionOutputWave<'_, 'a>> {
         ensure!(
@@ -681,5 +688,14 @@ mod tp2_tests {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+impl AttentionOutputWeights<'_> {
+    pub(crate) fn visit(&self, prefix: &str, f: &mut dyn FnMut(String, cuteafd_ffi::CuteafdDeviceBuffer)) {
+        self.tensors.visit(prefix, f);
+        f(format!("{prefix}grouped_scale"), self.grouped_scales.buffer);
+        if let Some(s) = &self.scales { f(format!("{prefix}packed_scale"), s.buffer); }
     }
 }

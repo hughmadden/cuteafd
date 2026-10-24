@@ -33,7 +33,7 @@ use crate::shared::prefix::{PrefixArgs, Toggle};
 use crate::shared::probe;
 use crate::shared::console;
 use cuteafd_engine::prefix::{After, PointPlan, PointPolicy, PrefixCache, PrefixConfig, PrefixFamily, SnapshotKind};
-use crate::families::glm5::dflash::{ContextRow, Draft, DraftSeq, TAP_ROWS};
+use crate::shared::speculation::dflash::{ContextRow, Draft, DraftSeq, TAP_ROWS};
 use crate::shared::draft::evidence::{Censor, DraftSource};
 use crate::shared::draft_policy::DraftHistory;
 use super::{open, Opened};
@@ -387,7 +387,7 @@ impl SharedPolicy {
         let mut policy = cuteafd_core::DraftPolicy::seeded(geometry, super::draft_binding::seed())?;
         crate::shared::draft::apply_length_rule(&mut policy);
         engine.arm_draft_probe(engine.decode_rows)?;
-        let fp8_head = matches!(engine.draft_head(), super::super::glm5::dflash::TargetHead::Launch(_));
+        let fp8_head = matches!(engine.draft_head(), crate::shared::speculation::dflash::TargetHead::Launch(_));
         let trace = crate::shared::speculation_trace::Trace::open()?.is_some();
         Ok(Self { policy, prior: drafter.draft_prior(fp8_head)?, observed: 0, skipped: 0, trace, decision: None })
     }

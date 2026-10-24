@@ -15,7 +15,9 @@
 //! int8 by default (an FP32 scale `amax / 127` per 32 dims of each head's key and
 //! value: 1440 bytes on V2 Flash) or BF16 (`--kv-cache bf16`: 2560 bytes); the
 //! `full_*_kvint8` programs read and write the int8 layout, and int8 prefill widens
-//! the sequence's records once into `kv_wide`. SWA records are BF16. An SWA
+//! the sequence's records once into `kv_wide` (interim full-prefill route). SWA
+//! independently selects BF16, int8/group-32 or E4M3/group-64 records and reads
+//! compact bytes directly without a global BF16 shadow. An SWA
 //! step's records go to a step buffer first; the attention program reads
 //! in-step keys from it, older keys from the ring, and commits the step to the
 //! ring afterwards.
@@ -44,7 +46,7 @@ use cuteafd_transport::{
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::programs::{Programs, Scalar, VocabularyHead, VOCABULARY_HEAD_WORKSPACE};
 use cuteafd_ffi::NativeLibrary;
-use cuteafd_loader::families::mimo_v2::{MimoAttention, MimoKvCache, MimoV2Config,
+use cuteafd_loader::families::mimo_v2::{MimoAttention, MimoKvCache, MimoKvFormats, MimoV2Config,
     MimoAttentionWorkspace, MimoPrefillOutput, MimoWorkspaceLayout, MimoWorkspaceOptions};
 use crate::shared::peer_split::{PeerExchange, RankDevice, DIRECT};
 use std::cell::{Cell, RefCell};
@@ -526,7 +528,7 @@ pub(crate) struct MimoEngine<'a> {
     /// Kernel/activation choice over the same immutable FP8 output weight.
     pub output_fp8_decode: bool,
     /// KV record format of every layer (and the MTP rings).
-    kv_cache: MimoKvCache,
+    kv_cache: MimoKvFormats,
     /// Decode and verify steps replay one captured graph per layer segment
     /// between the Spark exchanges ([`Self::decode_layers`]); false: eager launches.
     pub decode_graphs: bool,
@@ -585,7 +587,7 @@ impl<'a> MimoEngine<'a> {
     #[allow(clippy::too_many_arguments)]
     pub fn new(library: &'a NativeLibrary, programs: &'a Programs<'a>, cfg: MimoV2Config,
         weights: MimoWeights<'a>, stream: *mut c_void, max_context: usize, prefill_rows: usize, pages: usize,
-        rings: usize, embedding: TokenEmbedding<'a>, kv_cache: MimoKvCache,
+        rings: usize, embedding: TokenEmbedding<'a>, kv_cache: MimoKvFormats,
         prefill_output: MimoPrefillOutput) -> Result<Self> {
         let _memory_scope = cuteafd_ffi::memory_ledger::scope("kv");
         let family = cfg.program_family()?;
@@ -776,7 +778,7 @@ impl<'a> MimoEngine<'a> {
     }
 
     /// The KV record format.
-    pub fn kv_cache(&self) -> MimoKvCache {
+    pub fn kv_cache(&self) -> MimoKvFormats {
         self.kv_cache
     }
 
@@ -2557,7 +2559,7 @@ impl<'a> MimoEngine<'a> {
                     ("positions", bindings.attention_positions), ("page_table", w.page_table.buffer.ptr)];
                 if tables.decode {
                     scalars.push(Scalar::I32(DECODE_SPLITS));
-                } else if self.kv_cache != MimoKvCache::Bf16 {
+                } else if self.kv_cache.full != MimoKvCache::Bf16 {
                     // 8-bit prefill: the sequence's keys are widened once into `kv_wide`.
                     let keys = tables.positions.last().map_or(0, |&p| p + 1);
                     ensure!(keys as usize <= self.max_context, "prefill past max_context ({keys} keys)");

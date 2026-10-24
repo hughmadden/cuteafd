@@ -23,14 +23,16 @@ One file per v2.0.0 release card: `<model>-<quant>-<min|max>.config`, on the
 natural minimum (1 RTX + the fewest Sparks it fits) and the maximum
 (2 RTX + 4 or 6 Sparks). Each names the checkpoint revision, speculator,
 drafter, KV pool, media and expert placement the card ran with, so starting
-from one reproduces the published card. Replace the `REPLACE-ME-spark-N` hosts
+from one reproduces the published card, except that V4.1 MXFP4 max now uses
+six Sparks and keeps its four-Spark release layout as a reference.
+Replace the `REPLACE-ME-spark-N` hosts
 and the `192.0.2.N` (RFC 5737 documentation) RoCE addresses with your own,
 download the checkpoint and its drafter, then `--dry-run` and `--restart`.
 Cards and quality findings are in the main README and each family doc.
 
 | Model · quant | Min | Max | Speculator | `POOL_TOKENS` |
 | --- | --- | --- | --- | --- |
-| [DeepSeek V4.1 Flash · MXFP4](../../docs/models/deepseek_v41.md) | [1 RTX + 3 Spark (TP3)](deepseek-v41-mxfp4-min.config) | [2 RTX + 4 Spark](deepseek-v41-mxfp4-max.config) | `DSPARK=on` | `auto` (exception, below) |
+| [DeepSeek V4.1 Flash · MXFP4](../../docs/models/deepseek_v41.md) | [1 RTX + 3 Spark (TP3)](deepseek-v41-mxfp4-min.config) | [2 RTX + 6 Spark](deepseek-v41-mxfp4-max.config) | `DSPARK=on` | `auto` (exception, below) |
 | [DeepSeek V4 Flash · MXFP4](../../docs/models/deepseek_v4.md) | [1 RTX + 2 Spark](deepseek-v4-flash-mxfp4-min.config) | [2 RTX + 4 Spark](deepseek-v4-flash-mxfp4-max.config) | `dspark` | `auto` |
 | [DeepSeek V4 Pro · EXL3 K2](../../docs/models/deepseek_v4.md) | [1 RTX + 4 Spark](deepseek-v4-pro-exl3-min.config) | [2 RTX + 6 Spark](deepseek-v4-pro-exl3-max.config) | `dspark` | `auto` |
 | [GLM 5.3 · EXL3 K4](../../docs/models/glm5.md) | [1 RTX + 4 Spark](glm53-exl3-min.config) | [2 RTX + 6 Spark](glm53-exl3-max.config) | `dflash2` `incoai/GLM-5.3-DFlash2` | `auto` |
@@ -65,6 +67,7 @@ attention placement.
 | Model · quant | Config | Layout |
 | --- | --- | --- |
 | Kimi K3 · EXL3 K2 (#273) | [max](kimi-k3-exl3-max.config) | 2 RTX (TP2 attention) + 6 Spark (TP6 experts), 5 routed layers on the RTX |
+| Kimi K3 · EXL3 K2 + K6 core (#273) | [max](kimi-k3-exl3-k6-max.config) | 2 RTX (TP2 attention) + 6 Spark (TP6 experts), 12 routed layers on the RTX, full 1M context, DFlash2 |
 | Step-5-Preview · FP8 (#274) | [max](step5-fp8-max.config) | 2 RTX + 6 Spark |
 | Step-5-Preview · NVFP4 (#274) | [min](step5-nvfp4-min.config) | 1 RTX + 4 Spark |
 

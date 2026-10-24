@@ -4,7 +4,7 @@ use super::common::{self, plain, table};
 use super::{Ctx, Panel, Rates};
 use crate::client::Chat;
 use crate::report::ServerInfo;
-use crate::text::{filler, nonce};
+use crate::text::{corpus, nonce};
 use anyhow::Result;
 use serde_json::{json, Value};
 
@@ -70,11 +70,11 @@ impl Panel for Structured {
         for (i, (name, prompt, schema)) in list.iter().enumerate() {
             ctx.progress.step(i as f64 / list.len() as f64, *name);
             let text = format!("[{}] {prompt} Reply in JSON.", nonce());
-            let mut body = plain(&text, 400);
+            let mut body = plain(ctx.client, &text, 400);
             body["response_format"] = json!({"type": "json_schema", "json_schema": {"name": name, "strict": true,
                 "schema": schema}});
             let constrained = ctx.client.chat(body, None)?;
-            let free = ctx.client.chat(plain(&text, 400), None)?;
+            let free = ctx.client.chat(plain(ctx.client, &text, 400), None)?;
             let compiled = jsonschema::JSONSchema::options().with_draft(jsonschema::Draft::Draft202012).compile(schema)
                 .map_err(|e| anyhow::anyhow!("schema {name}: {e}"))?;
             let parsed: Option<Value> = serde_json::from_str(constrained.content.trim()).ok();
@@ -109,7 +109,7 @@ impl Panel for Needle {
     fn id(&self) -> &'static str { "needle" }
     fn title(&self) -> &'static str { "Long-context needle" }
     fn description(&self) -> &'static str {
-        "A passphrase hidden at five depths of filler from 2K tokens to the model's context limit; the heatmap \
+        "A passphrase hidden at five depths of corpus from 2K tokens to the model's context limit; the heatmap \
          shows retrieval (thinking off)."
     }
     fn estimate_s(&self, rates: &Rates, _info: &ServerInfo) -> f64 {
@@ -118,7 +118,7 @@ impl Panel for Needle {
     fn run(&self, ctx: &Ctx<'_>) -> Result<Value> {
         let grid = Self::grid(ctx.max_context);
         let total: usize = grid.iter().map(|(_, d)| d.len()).sum();
-        let words_per_token = 1.0 / common::tokens_per_word(ctx);
+        let words_per_token = 1.0 / common::prompt_token_ratio(ctx);
         let mut cells = Vec::new();
         for (length, depths) in &grid {
             for &depth in depths {
@@ -127,14 +127,13 @@ impl Panel for Needle {
                 let secret = format!("{}-{}", ["amber", "cobalt", "violet", "saffron", "jade"][cells.len() % 5],
                     1000 + (cells.len() * 7919 + *length as usize) % 9000);
                 let words = ((*length as f64 - 80.0) * words_per_token).max(50.0) as usize;
-                let text = filler(*length ^ cells.len() as u64, words);
-                let mut parts: Vec<&str> = text.split(' ').collect();
-                let at = ((parts.len() as f64) * depth) as usize;
-                let needle = format!("The secret passphrase is {secret}.");
-                parts.insert(at.min(parts.len()), &needle);
+                let mut text = corpus(*length ^ cells.len() as u64, words);
+                let mut at = ((text.len() as f64) * depth) as usize;
+                while !text.is_char_boundary(at) { at -= 1; }
+                text.insert_str(at, &format!("\nThe secret passphrase is {secret}.\n"));
                 let prompt = format!("[{}] {}\n\nWhat is the secret passphrase mentioned in the text above? Reply \
-                    with the passphrase only.", nonce(), parts.join(" "));
-                let chat = ctx.client.chat(plain(&prompt, 24), None);
+                    with the passphrase only.", nonce(), text);
+                let chat = ctx.client.chat(plain(ctx.client, &prompt, 24), None);
                 let (found, tokens) = match &chat {
                     Ok(chat) => (chat.content.contains(&secret), chat.timing.prompt_tokens),
                     Err(_) => (false, 0),
@@ -346,7 +345,7 @@ impl Panel for IfEval {
     }
     fn run(&self, ctx: &Ctx<'_>) -> Result<Value> {
         let items = ifeval_items();
-        let bodies = items.iter().map(|(prompt, _)| plain(prompt, 700)).collect();
+        let bodies = items.iter().map(|(prompt, _)| plain(ctx.client, prompt, 700)).collect();
         let results = batched(ctx, bodies, common::concurrency(ctx.info).clamp(1, 4), "prompt");
         let (mut rows, mut prompt_ok, mut checks, mut checks_ok) = (Vec::new(), 0, 0, 0);
         for ((prompt, rules), result) in items.iter().zip(results) {

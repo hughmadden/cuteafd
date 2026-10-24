@@ -1,3 +1,8 @@
+/// Physical Spark world ceiling shared by planning, protocols and rank storage.
+pub const MAX_SPARK_WORLD: usize = 8;
+// WaveReceipt uses one bit per physical rank.
+const _: () = assert!(MAX_SPARK_WORLD <= u8::BITS as usize);
+
 pub mod tp_units;
 pub mod dense_attention;
 pub mod ffn_activation;
@@ -17,6 +22,7 @@ mod dspark_rng;
 pub use dspark_rng::{DsparkRng, DsparkRngReservation};
 mod target_sampling;
 pub use target_sampling::{
+    device_bytes as target_sampler_device_bytes,
     TargetSamplingError, TargetSamplingParams, GREEDY_TEMPERATURE_EPS, MAX_TARGET_TEMPERATURE,
 };
 mod dspark_verify;
@@ -25,6 +31,7 @@ mod engram;
 pub mod prefix;
 pub mod serving_capacity;
 pub mod thermal;
+pub mod push_outcome;
 pub mod memory_layout;
 pub mod media;
 pub use media::{AudioKey, ImageKey, MediaKey, MediaSpan};
@@ -93,7 +100,7 @@ pub use ids::{LayerId, PlacementVersion, PositionId, Priority, RequestId};
 pub use kv_cache::{
     KvBackedBlock, KvCacheAllocator, KvCacheBackingStore, KvCacheConfig, KvCacheDType,
     KvCacheSnapshot, KvLayout, KvReservation, KvReservationState, KvWriteRecord, KvWriteState,
-    MlaKvCacheRepresentation,
+    MlaCacheFormat, MlaKvCacheRepresentation,
 };
 pub use layerwave::{
     admit_layerwaves_for_iteration, plan_prefill_chunks, plan_prefill_chunks_with_model,

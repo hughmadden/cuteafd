@@ -45,7 +45,8 @@ if tool == 'docker':
         tp, ep = int(value('--spark-tp', str(ranks))), int(value('--spark-ep', '1'))
         explicit = '--spark-tp' in args or ranks == 3
         gpus = int(value('--rtx', '1'))
-        print(json.dumps(dict(spark_ranks=ranks, prefill_rows=rows or 1024,
+        print(json.dumps(dict(spark_ranks=ranks, prefill_unit_rows=rows or 1024,
+            prefill_waves=1, prefill_span_rows=rows or 1024,
             version=1, family='deepseek_v41', executable=True, wip_launchable=True,
             launch=dict(family='deepseek_v41'),
             topology=dict(tp=tp, ep=ep,
@@ -93,6 +94,8 @@ class Exl3ReleasePreflightTest(unittest.TestCase):
                 path = binary / tool
                 path.write_text(f'#!{sys.executable}\n' + MOCK)
                 path.chmod(0o755)
+            from launcher_sandbox import stub_cuda_python
+            stub_cuda_python(binary, gpu_mib * 2**20)
             snapshot = directory / 'hf/hub/models--deepseek-ai--DeepSeek-V4.1-Flash/snapshots/dba1be0a40aa45a94ad051997016db3960a90277'
             snapshot.mkdir(parents=True)
             (snapshot / 'config.json').write_text(json.dumps(

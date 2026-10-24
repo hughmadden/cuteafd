@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from v41_launch_capture import ROOT, capture, parse_run
+from v41_launch_capture import ROOT, capture, parse_run, namespace_launch_contract
 
 MATRIX = json.loads((ROOT / "scripts/bench/release-smoke.example.json").read_text())
 ENTRIES = MATRIX["entries"]
@@ -25,18 +25,45 @@ def release_entry(entry: dict) -> dict:
     return entry
 
 
-@pytest.mark.parametrize("entry", ENTRIES, ids=lambda e: e["name"])
-def test_deployment_preserves_release_container_commands(entry: dict) -> None:
+@pytest.mark.parametrize("entry,swa_kv", [
+    pytest.param(entry, swa_kv, id=entry["name"] + (f"-{swa_kv}" if swa_kv else ""))
+    for entry in ENTRIES
+    for swa_kv in ([None, "bf16", "int8", "fp8"] if entry["family"] == "mimo_v2" else [None])
+])
+@pytest.mark.parametrize("draft_kv", ["bf16", "fp8"])
+def test_deployment_preserves_release_container_commands(entry: dict, swa_kv: str | None, draft_kv: str) -> None:
     golden = json.loads((FIXTURES / f"{entry['name']}.json").read_text())
-    current = capture(ROOT, entry["name"], release_entry=release_entry(entry))
+    selected = release_entry(entry)
+    compact_draft = entry["family"] in {"glm5", "glm5_flash", "mimo_v2"}
+    if compact_draft:
+        selected["set"]["DRAFT_KV_CACHE"] = draft_kv
+    if swa_kv is not None:
+        selected["set"]["SWA_KV_CACHE"] = swa_kv
+    current = capture(ROOT, entry["name"], release_entry=selected)
     assert [run["host"] for run in current["containers"]] == [run["host"] for run in golden]
     for old, new in zip(golden, current["containers"]):
-        before, after = parse_run(old["argv"]), parse_run(new["argv"])
-        # MiMo Pro configs select balanced TP placement (#521); every other card stays round-robin.
-        before["env"]["CUTEAFD_TP_PLACEMENT"] = "balanced" if "mimo-v26-pro" in entry["config"] else "round-robin"
+        before, after = namespace_launch_contract(parse_run(old["argv"])), parse_run(new["argv"])
         if old["host"] == "coordinator":
             # capture() bounds readiness to 30s; admission now shares that deadline.
             before["env"]["CUTEAFD_SPARK_ADMISSION_TIMEOUT_SECONDS"] = "30"
+            if entry["family"] == "mimo_v2":
+                anchor = "--kv-cache" if "--kv-cache" in before["command"] else "--prefix-partial"
+                position = before["command"].index(anchor) + 2
+                before["command"][position:position] = ["--swa-kv-cache", swa_kv or "int8"]
+            if entry["family"] == "qwen4":
+                # Local/dual still execute their whole-step default, now explicit in the plan.
+                position = before["command"].index("--console-secret-file")
+                before["command"][position:position] = ["--prefill-rows", "4096", "--prefill-waves", "1"]
+            if entry["family"] == "deepseek_v4":
+                # V4 forwards the planner's resolved unit and wave defaults.
+                anchor = "--split-device" if "--split-device" in before["command"] else "--pool-tokens"
+                position = before["command"].index(anchor) + 2
+                before["command"][position:position] = ["--prefill-rows", "4096", "--prefill-waves", "2"]
+            if compact_draft:
+                anchor = {"glm5": "--pool-tokens", "glm5_flash": "--host-cache-bytes",
+                          "mimo_v2": "--swa-kv-cache"}[entry["family"]]
+                position = before["command"].index(anchor) + 2
+                before["command"][position:position] = ["--draft-kv-cache", draft_kv]
         # Includes the byte-identical V4.1 fingerprint. Other families have no
         # resolved-config fingerprint today; adding a fabricated one is a failure.
         if entry["family"] == "deepseek_v41" and "serve-native" in before["command"]:
@@ -57,53 +84,78 @@ def test_all_family_deployment_dry_run_starts_no_serving_containers(entry: dict)
 def exlr8_entry(manifest: str = "up1", **overrides: str) -> dict:
     entry = release_entry(next(e for e in ENTRIES if e["name"] == "glm53-exl3-max"))
     entry["set"].update(SPARK_COUNT="4", SPECULATOR="off", RTX_EXPERT_LAYERS="0",
-        ATTENTION_PLACEMENT="context", EXLR8_MANIFEST=manifest,
-        EXLR8_DENSE_FROM="deepseek-ai/DeepSeek-V4.1-Flash", **overrides)
+        ATTENTION_PLACEMENT="context", EXLR8_MANIFEST=manifest, **overrides)
     return entry
 
 
+@pytest.mark.parametrize("speculator", ["dflash2", "off", "unset"])
+def test_exlr8_uses_glm_drafter_default_and_explicit_opt_out(speculator: str, tmp_path: Path) -> None:
+    entry = exlr8_entry()
+    launcher = None
+    if speculator == "unset":
+        launcher = tmp_path / "run-family.sh"
+        source = ROOT / "scripts/launch/run-family.sh"
+        # The release fixture has explicit settings; remove both before resolution.
+        launcher.write_text(source.read_text().replace(
+            'exlr8_manifest="$(get EXLR8_MANIFEST)"',
+            'unset \'cfg[SPECULATOR]\' \'cfg[SPECULATOR_MODEL_ID]\'\n'
+            'exlr8_manifest="$(get EXLR8_MANIFEST)"'))
+    else:
+        entry["set"]["SPECULATOR"] = speculator
+    result = capture(ROOT, f"exlr8-{speculator}", release_entry=entry, launcher_source=launcher)
+    plan = result["plans"][0]
+    selected = "off" if speculator == "off" else "dflash2"
+    assert plan[plan.index("--speculator") + 1] == selected
+    for run in result["containers"]:
+        command = parse_run(run["argv"])["command"]
+        if "serve-glm" in command:
+            assert ("--draft" in command) == (selected == "dflash2")
+            if selected == "dflash2":
+                assert "models--incoai--GLM-5.3-DFlash2/snapshots/" in command[command.index("--draft") + 1]
+        else:
+            assert "expertd-native" in command
+            assert "--draft" not in command
+
+
 @pytest.mark.parametrize("manifest", ["up1", "bit325"])
-def test_exlr8_forwards_native_selection_without_dense_worker_flags(manifest: str) -> None:
+def test_exlr8_forwards_checkpoint_native_selection(manifest: str) -> None:
     result = capture(ROOT, f"exlr8-{manifest}", release_entry=exlr8_entry(manifest))
     assert len(result["plans"]) == 1
     plan = result["plans"][0]
     assert plan[plan.index("--exlr8-manifest") + 1] == manifest
-    dense = plan[plan.index("--exlr8-dense-from") + 1]
-    assert dense.startswith("/hf/hub/models--deepseek-ai--DeepSeek-V4.1-Flash/snapshots/")
-    assert "CUTEAFD_GLM_PREFILL_LANES=3" in plan
+    assert "--exlr8-dense-from" not in plan
+    assert "--prefill-lanes" not in plan and "CUTEAFD_GLM_PREFILL_LANES=2" not in plan
     assert len(result["containers"]) == 5
     for run in result["containers"]:
         parsed = parse_run(run["argv"])
         command = parsed["command"]
         assert command[command.index("--exlr8-manifest") + 1] == manifest
         if "serve-glm" in command:
-            assert command[command.index("--exlr8-dense-from") + 1] == dense
-            assert parsed["env"]["CUTEAFD_GLM_PREFILL_LANES"] == "3"
+            assert "--exlr8-dense-from" not in command
+            assert command[command.index("--prefill-waves") + 1] == "2"
+            assert "CUTEAFD_GLM_PREFILL_LANES" not in parsed["env"]
         else:
             assert "expertd-native" in command
-            assert "--exlr8-dense-from" not in command
 
 
-@pytest.mark.parametrize("lanes", ["1", "2", "3", "4"])
-def test_exlr8_launcher_preserves_explicit_prefill_lanes(lanes: str, tmp_path: Path) -> None:
-    source = ROOT / "scripts/launch/run-family.sh"
-    launcher = tmp_path / "run-family.sh"
-    launcher.write_text(source.read_text().replace(
-        '    selected_lanes="${CUTEAFD_GLM_PREFILL_LANES:-3}"',
-        f'    CUTEAFD_GLM_PREFILL_LANES={lanes}\n'
-        '    selected_lanes="${CUTEAFD_GLM_PREFILL_LANES:-3}"'))
-    result = capture(ROOT, f"exlr8-lanes-{lanes}", release_entry=exlr8_entry(),
-        launcher_source=launcher)
-    assert f"CUTEAFD_GLM_PREFILL_LANES={lanes}" in result["plans"][0]
+@pytest.mark.parametrize("waves", ["1", "2", "3", "4"])
+def test_exlr8_launcher_preserves_explicit_prefill_waves(waves: str) -> None:
+    result = capture(ROOT, f"exlr8-waves-{waves}", release_entry=exlr8_entry(PREFILL_WAVES=waves))
+    plan = result["plans"][0]
+    assert plan[plan.index("--prefill-waves") + 1] == waves
     coordinator = parse_run(result["containers"][0]["argv"])
-    assert coordinator["env"]["CUTEAFD_GLM_PREFILL_LANES"] == lanes
+    assert coordinator["command"][coordinator["command"].index("--prefill-waves") + 1] == waves
+    assert "CUTEAFD_GLM_PREFILL_LANES" not in coordinator["env"]
 
 
+@pytest.mark.parametrize("gpus,attention", [("1", "auto"), ("1", "heads"), ("2", "auto"), ("2", "context")])
 @pytest.mark.parametrize("ranks", range(1, 7))
-def test_exlr8_launcher_accepts_canonical_spark_worlds(ranks: int) -> None:
+def test_exlr8_launcher_accepts_canonical_spark_worlds(ranks: int, gpus: str, attention: str) -> None:
     entry = exlr8_entry()
-    entry["set"]["SPARK_COUNT"] = str(ranks)
-    result = capture(ROOT, f"exlr8-world-{ranks}", release_entry=entry)
+    entry["set"].update(SPARK_COUNT=str(ranks), RTX_GPUS=gpus, ATTENTION_PLACEMENT=attention)
+    result = capture(ROOT, f"exlr8-world-{ranks}-{gpus}-{attention}", release_entry=entry)
+    coordinator = parse_run(result["containers"][0]["argv"])["command"]
+    assert ("--split-device" in coordinator) == (gpus == "2")
     assert len(result["containers"]) == ranks + 1
     workers = [parse_run(run["argv"])["command"] for run in result["containers"][1:]]
     for rank, command in enumerate(workers):
@@ -113,10 +165,12 @@ def test_exlr8_launcher_accepts_canonical_spark_worlds(ranks: int) -> None:
 
 @pytest.mark.parametrize("overrides,reason", [
     ({"EXLR8_MANIFEST": "other"}, "EXLR8_MANIFEST"),
-    ({"EXLR8_DENSE_FROM": ""}, "EXLR8_DENSE_FROM"),
-    ({"RTX_GPUS": "1"}, "two RTX"),
-    ({"SPARK_COUNT": "7"}, "canonical Spark ranks"),
-    ({"SPECULATOR": "dflash2"}, "SPECULATOR=off"),
+    ({"RTX_GPUS": "0"}, "RTX GPUs"),
+    ({"RTX_GPUS": "3"}, "RTX GPUs"),
+    ({"RTX_GPUS": "1"}, "heads attention"),
+    ({"RTX_GPUS": "1", "ATTENTION_PLACEMENT": "layers"}, "heads attention"),
+    ({"SPARK_COUNT": "9"}, "canonical Spark ranks"),
+    ({"SPECULATOR": "mtp"}, "SPECULATOR=off or dflash2"),
     ({"RTX_EXPERT_LAYERS": "1"}, "cannot onboard"),
     ({"ATTENTION_PLACEMENT": "heads"}, "context attention"),
 ])
@@ -200,21 +254,3 @@ def test_implicit_mimo_host_cache_matches_effective_serve_argv(enabled: str) -> 
     assert serve.count("--host-cache-bytes") == 1
     assert actual == "auto"
     assert plan[plan.index("--host-cache-bytes") + 1] == actual
-
-
-@pytest.mark.parametrize("policy", ["round-robin", "balanced"])
-def test_tp_placement_reaches_planner_coordinator_and_workers(policy: str) -> None:
-    entry = release_entry(next(e for e in ENTRIES if e["name"] == "mimo-pro-max"))
-    entry["set"]["TP_PLACEMENT"] = policy
-    result = capture(ROOT, f"tp-placement-{policy}", release_entry=entry)
-    assert f"CUTEAFD_TP_PLACEMENT={policy}" in result["plans"][0]
-    assert len(result["containers"]) == 7
-    for container in result["containers"]:
-        assert parse_run(container["argv"])["env"]["CUTEAFD_TP_PLACEMENT"] == policy
-
-
-def test_tp_placement_rejects_unknown_policy_before_launch() -> None:
-    entry = release_entry(next(e for e in ENTRIES if e["name"] == "mimo-pro-max"))
-    entry["set"]["TP_PLACEMENT"] = "fitted"
-    with pytest.raises(RuntimeError, match="TP_PLACEMENT"):
-        capture(ROOT, "tp-placement-invalid", release_entry=entry)

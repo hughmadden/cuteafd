@@ -6,13 +6,16 @@ Attention (KDA), a minority run MLA + DSA.
 ## Supported checkpoints / quants
 
 - `zai-org/GLM-5.3-Flash` official FP8.
+- `wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K3.25-Core-FP8`: unchanged EXL3
+  routed experts with official native FP8 MLA/dense/shared projections bundled
+  in the same checkpoint. No second weight checkpoint is read at runtime.
 - `brandonmusic/GLM-5.3-Flash-tr3-4bpw` and other standard exllamav3 EXL3
   tr3 publications — read directly from `config.json` + tensor headers, no
   CuteAFD-specific side files required.
 - NVIDIA ModelOpt NVFP4 (`nvidia/GLM-5.3-Flash-NVFP4`) — routed experts and
   dense MLPs both run natively in NVFP4.
 
-**Starting configs** (v2.0.0 release cards, natural minimum and maximum; replace the
+**Starting configs** (current primary-only recipes, natural minimum and maximum; replace the
 placeholder Spark hosts and addresses): Official FP8 [min](../../examples/configs/glm53-flash-fp8-min.config) · [max](../../examples/configs/glm53-flash-fp8-max.config); EXL3 K3.25 [min](../../examples/configs/glm53-flash-exl3-min.config) · [max](../../examples/configs/glm53-flash-exl3-max.config); NVFP4 [min](../../examples/configs/glm53-flash-nvfp4-min.config) · [max](../../examples/configs/glm53-flash-nvfp4-max.config); tr3 4bpw [min](../../examples/configs/glm53-flash-tr3-min.config) · [max](../../examples/configs/glm53-flash-tr3-max.config).
 
 ## Engineering summary
@@ -375,10 +378,10 @@ of every quant, mixed placement or hardware combination.
 - Synchronized ~440 ms Spark response gaps (normally 15-18 ms) were observed once; coordinator/transport cause is unproven.
 - rc3 defaults (where they apply): compact DSA index cache, shared replay records, tensor-core draft head and W8A8 draft GEMMs on one GPU with Spark experts and an automatic pool; a head split keeps token keys, 64 rows and its own replay records. 128-row decode/verify (Hugh's #25 m128 programs) stays opt-in after the matched C16 gate. Simulated-5090 planner pools roughly double from rc2 (EXL3/tr3 319,488 → 710,912; NVFP4 331,776 → 734,208; FP8 297,472 → 668,672 tokens); all four simulated cards reach the full 1,048,576 effective context. Hugh's #26–#29 ship as in rc2; #31 (packed admission prefill and chain verify) is not in rc3. Opt-in combinations are not all qualified end to end.
 
-- NVFP4 defaults to the official FP8 companion for block projections.
-  `GLM5_FLASH_FP8_MODEL_ID=off` now also works with the two-GPU split:
-  BF16 projections are packed exactly as in the unsplit path before
-  slicing. Native NVFP4 dense and routed experts are unchanged.
+- All weight projections load from the primary checkpoint. NVFP4 and tr3
+  BF16 block projections quantize to FP8 at load, including the two-GPU
+  split; native NVFP4 dense and routed experts retain their own format.
+  Dated cards below describe their original checkpoint/precision recipes.
 - Running BF16 attention natively (`CUTEAFD_GLM_BF16=native`) costs a
   meaningful coordinator-step slowdown versus the default FP8-block path;
   use it only when the extra precision is worth it.

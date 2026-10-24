@@ -393,19 +393,7 @@ impl<'a> TargetSamplingWave<'a> {
     }
     /// Device bytes the sampler adds to the head wave budget (design §11.1).
     pub(crate) fn device_bytes(capacity: usize, vocab: usize) -> usize {
-        capacity * cuteafd_ffi::CUTEAFD_V41_SAMPLER_PARAM_BYTES
-            + Self::mask_arena_bytes(capacity, vocab)
-            + capacity * cuteafd_ffi::CUTEAFD_V41_SAMPLER_SCRATCH_BYTES
-            + Self::mask_arena_bytes(capacity, vocab)
-            + capacity * SAMPLING_HISTOGRAM_BUCKETS * 4
-            + Self::rank_order_bytes(capacity)
-            + capacity * 4
-            + capacity * 4
-            + capacity * 4
-            + capacity * 4
-            + capacity * 8
-            + capacity * 4
-            + capacity * 4
+        cuteafd_core::target_sampler_device_bytes(capacity, vocab)
     }
     /// Allocate every sampler arena against `library` and bind `stages`.
     ///
@@ -775,5 +763,25 @@ pub(crate) fn bytemuck_slice<T: Copy>(values: &[T]) -> &[u8] {
             values.as_ptr().cast::<u8>(),
             std::mem::size_of_val(values),
         )
+    }
+}
+
+#[cfg(test)]
+mod allocation_accounting_tests {
+    use super::*;
+
+    #[test]
+    fn shared_device_bytes_match_every_sampler_arena() {
+        for rows in [1, 7, 64, 128] {
+            for vocab in [1usize, 31, 32, 33, 128896] {
+                let expected = rows * (cuteafd_ffi::CUTEAFD_V41_SAMPLER_PARAM_BYTES
+                    + cuteafd_ffi::CUTEAFD_V41_SAMPLER_SCRATCH_BYTES
+                    + SAMPLING_HISTOGRAM_BUCKETS * std::mem::size_of::<u32>()
+                    + 8 * std::mem::size_of::<u32>())
+                    + 2 * TargetSamplingWave::mask_arena_bytes(rows, vocab)
+                    + TargetSamplingWave::rank_order_bytes(rows);
+                assert_eq!(TargetSamplingWave::device_bytes(rows, vocab), expected);
+            }
+        }
     }
 }

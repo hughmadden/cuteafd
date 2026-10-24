@@ -131,7 +131,7 @@ int RequireInteger(const picojson::value& value, const char* label) {
 }
 
 xgrammar::TokenizerInfo LoadTokenizer(
-    const char* tokenizer_json_path, size_t vocab_size, const int32_t* stop_token_ids,
+    const std::string& tokenizer_json, size_t vocab_size, const int32_t* stop_token_ids,
     size_t stop_token_count) {
   if (vocab_size == 0 || vocab_size > static_cast<size_t>(std::numeric_limits<int>::max())) {
     throw std::invalid_argument("XGrammar vocabulary size is outside the supported range");
@@ -139,7 +139,6 @@ xgrammar::TokenizerInfo LoadTokenizer(
   if (stop_token_count > 0 && stop_token_ids == nullptr) {
     throw std::invalid_argument("XGrammar stop-token array is null");
   }
-  const std::string tokenizer_json = ReadFile(tokenizer_json_path);
   const picojson::value root_value = ParseJSON(tokenizer_json, "tokenizer JSON");
   const auto& root = RequireObject(root_value, "tokenizer JSON");
   const auto& model =
@@ -244,7 +243,21 @@ extern "C" cuteafd_status_t cuteafd_xgrammar_compiler_create(
   *out_compiler = nullptr;
   return Guard(error, error_bytes, CUTEAFD_STATUS_INTERNAL_ERROR, [&] {
     auto compiler = std::make_unique<CompilerHandle>(
-        LoadTokenizer(tokenizer_json_path, vocab_size, stop_token_ids, stop_token_count));
+        LoadTokenizer(ReadFile(tokenizer_json_path), vocab_size, stop_token_ids, stop_token_count));
+    *out_compiler = compiler.release();
+  });
+}
+
+extern "C" cuteafd_status_t cuteafd_xgrammar_compiler_create_json(
+    const char* tokenizer_json, size_t vocab_size, const int32_t* stop_token_ids,
+    size_t stop_token_count, void** out_compiler, char* error, size_t error_bytes) {
+  if (out_compiler == nullptr || tokenizer_json == nullptr) {
+    return CUTEAFD_STATUS_INVALID_ARGUMENT;
+  }
+  *out_compiler = nullptr;
+  return Guard(error, error_bytes, CUTEAFD_STATUS_INTERNAL_ERROR, [&] {
+    auto compiler = std::make_unique<CompilerHandle>(
+        LoadTokenizer(tokenizer_json, vocab_size, stop_token_ids, stop_token_count));
     *out_compiler = compiler.release();
   });
 }

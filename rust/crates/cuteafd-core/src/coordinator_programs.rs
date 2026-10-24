@@ -109,6 +109,45 @@ pub enum OutputPlanError {
     IncompatibleExport,
 }
 
+/// Native rotary MLA drafting contract, shared by admission and manifest validation.
+/// All exports process at most 64 rows; larger batches must be chunked by the owner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MlaDraftProgramLayout {
+    pub context: usize,
+    pub splits: usize,
+    pub chunks_per_split: usize,
+    pub partial_output_bytes: usize,
+    pub partial_lse_bytes: usize,
+    /// Producer, attention, ungated output, respectively. These phases are ordered.
+    pub scratch: [usize; 3],
+}
+
+impl MlaDraftProgramLayout {
+    pub const ROWS: usize = 64;
+    pub const HEADS: usize = 64;
+    pub const PAGE: usize = 64;
+
+    pub fn new(context: usize) -> Result<Self, MlaDraftLayoutError> {
+        if !(1..=1_048_576).contains(&context) { return Err(MlaDraftLayoutError); }
+        let pages = context.div_ceil(Self::PAGE);
+        let splits = pages.min(16);
+        let align = |n: usize| n.div_ceil(1024) * 1024;
+        let partial_output_bytes = if splits > 1 { align(Self::ROWS * Self::HEADS * splits * 512 * 2) } else { 0 };
+        let partial_lse_bytes = if splits > 1 { align(Self::ROWS * Self::HEADS * splits * 4) } else { 0 };
+        Ok(Self { context, splits, chunks_per_split: pages.div_ceil(splits),
+            partial_output_bytes, partial_lse_bytes,
+            scratch: [align(Self::ROWS * 2112 * 2) + align(Self::ROWS * Self::HEADS * 192 * 2),
+                partial_output_bytes + partial_lse_bytes, align(Self::ROWS * Self::HEADS * 128 * 2)] })
+    }
+
+    /// One arena can cover all three phase-disjoint native scratch planes.
+    pub fn scratch_bytes(self) -> usize { self.scratch.into_iter().max().unwrap_or(0) }
+}
+
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+#[error("MLA draft program context must be in 1..=1048576")]
+pub struct MlaDraftLayoutError;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SparseAttentionBackend { NativeFp32, Bf16Aot }
 
@@ -367,6 +406,30 @@ pub struct CardPlanError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mla_draft_scratch_preserves_export_capacity_and_ungated_output() {
+        for context in [1, 63, 64, 65, 1024, 1025, 262144, 1048576] {
+            let layout = MlaDraftProgramLayout::new(context).unwrap();
+            let pages = context.div_ceil(64);
+            assert_eq!(layout.splits, pages.min(16));
+            assert_eq!(layout.chunks_per_split, pages.div_ceil(layout.splits));
+            assert_eq!(layout.scratch[0], 1_843_200);
+            assert_eq!(layout.scratch[2], 1_048_576, "ungated output has exactly one value plane");
+            let partial = if layout.splits > 1 { 4_194_304 * layout.splits } else { 0 };
+            let lse = if layout.splits > 1 { 16_384 * layout.splits } else { 0 };
+            assert_eq!(layout.partial_output_bytes, partial);
+            assert_eq!(layout.partial_lse_bytes, lse);
+            assert_eq!(layout.scratch[1], partial + lse);
+            assert_eq!(layout.scratch_bytes(), layout.scratch.iter().copied().max().unwrap());
+        }
+        assert_eq!(MlaDraftProgramLayout::new(262144).unwrap().scratch_bytes(), 67_371_008);
+        assert_eq!(MlaDraftProgramLayout::new(262144).unwrap().scratch,
+            MlaDraftProgramLayout::new(1048576).unwrap().scratch);
+        for context in [0, 1048577, usize::MAX] {
+            assert_eq!(MlaDraftProgramLayout::new(context), Err(MlaDraftLayoutError));
+        }
+    }
 
     #[test]
     fn output_recipe_is_immutable_and_rejects_partial_row_exports() {

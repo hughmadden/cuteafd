@@ -1,8 +1,22 @@
 //! Fabric deltas share the NIC observation clock on each host. A missing,
 //! reset, restarted or stale counter is unknown, never invented as zero.
+//! Bytes no engine counter or registered source claims stay residual. The
+//! transport meters every byte it posts, so a residual is same-port traffic
+//! those counters cannot see: framing, retries, and same-host bulk whose
+//! volume tracks the exchange. A host's own allowance is therefore bounded by
+//! the exchange its engine reports, and residual beyond that bound is
+//! reported as foreign traffic.
 use cuteafd_transport::traffic::{EngineSample, HostSample, Snapshot};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
+
+/// Share of the engine-reported exchange a host may hold as residual before
+/// the rest counts as foreign. Engine counters reconcile with the wire to a
+/// few percent on steady phases, but short prefill phases carry same-port
+/// bulk they cannot see; the worst own-share measured on a prefill phase was
+/// 0.63 of the metered bytes. A flow that is not the card's own adds bytes
+/// without adding engine bytes, so it clears this bound exactly.
+const OWN_EXCHANGE_SLACK: f64 = 0.65;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Phase {
@@ -245,9 +259,11 @@ pub fn interval(name: &str, timed: bool, before: &Snapshot, after: &Snapshot) ->
             if timed && health.verdict == cuteafd_transport::fabric_health::Verdict::Warn {
                 for reason in &health.reasons { phase.assessments.push(format!("fabric health: {label}: {reason}")); }
             }
-            // Protocol bytes exclude Ethernet/IP/RDMA overhead. Require both
-            // 5% of NIC traffic and 1 Gb/s to avoid calling headers foreign work.
-            let foreign = foreign_sent_bytes.unwrap_or(0).saturating_add(foreign_received_bytes.unwrap_or(0));
+            // Protocol bytes exclude Ethernet/IP/RDMA overhead, and prefill
+            // carries same-port bulk the engine counters cannot see; both stay
+            // in the residual. That residual is the host's own traffic up to
+            // its engine-reported exchange times the slack, whatever port the
+            // card configured; only the excess over that bound is foreign.
             let nic = sent_bytes.unwrap_or(0).saturating_add(received_bytes.unwrap_or(0));
             if timed && nic > 0 && a.sources.contains_key("sparknest") && storage.is_none() {
                 phase.assessments.push(format!("storage attribution unavailable: {label} ({sparknest_status})"));
@@ -255,9 +271,6 @@ pub fn interval(name: &str, timed: bool, before: &Snapshot, after: &Snapshot) ->
             let storage_bytes = sparknest_sent_bytes.unwrap_or(0).saturating_add(sparknest_received_bytes.unwrap_or(0));
             if timed && rate(storage_bytes) > 1.0 && storage_bytes as f64 > nic as f64 * 0.05 {
                 phase.assessments.push(format!("SparkNest traffic: {label} {:.2} Gb/s (>5% and >1 Gb/s)", rate(storage_bytes)));
-            }
-            if timed && rate(foreign) > 1.0 && foreign as f64 > nic as f64 * 0.05 {
-                phase.assessments.push(format!("foreign traffic: {label} {:.2} Gb/s (>5% and >1 Gb/s)", rate(foreign)));
             }
             let signal = |key: &str| counters.iter().any(|(name, n)| *n > 0 && (name == key || name.strip_prefix("hw_counters/") == Some(key)));
             let wait_rate = counters.get("port_xmit_wait").map(|ticks| *ticks as f64 / seconds);
@@ -277,6 +290,16 @@ pub fn interval(name: &str, timed: bool, before: &Snapshot, after: &Snapshot) ->
             let residual_kind = if counters.iter().any(|(key,n)| *n > 0 && (key.contains("retrans") || key.contains("sequence") || key.contains("packet_seq_err"))) {
                 "unattributed/retry overhead"
             } else { "unattributed (headers/ACK/skew or foreign)" }.into();
+            let own = |engine: Option<u64>| (engine.unwrap_or(0) as f64 * OWN_EXCHANGE_SLACK) as u64;
+            let excess = [(foreign_sent_bytes, "sent", engine_sent_bytes), (foreign_received_bytes, "received", engine_received_bytes)]
+                .into_iter().filter_map(|(foreign, side, engine)| foreign.map(|bytes| (bytes.saturating_sub(own(engine)), side)));
+            if timed {
+                for (bytes, side) in excess {
+                    if rate(bytes) > 1.0 && bytes as f64 > nic as f64 * 0.05 {
+                        phase.assessments.push(format!("foreign traffic: {label} {:.2} Gb/s {side} beyond this host's own exchange (>5% and >1 Gb/s)", rate(bytes)));
+                    }
+                }
+            }
             phase.ports.push(Port { host: host.clone(), device: port.device.clone(), port: port.port,
                 hostname: a.hostname.clone(),
                 mtu: port.mtu, health: Some(health), health_since_start: port.health_since_start.clone(),
@@ -343,13 +366,56 @@ mod tests {
         })]) }
     }
     #[test]
-    fn directional_utilization_and_foreign_congestion() {
+    fn directional_utilization_and_congestion() {
         let phase = interval("decode", true, &snapshot(1.0, 0, 0), &snapshot(2.0, 10_000_000_000, 9_000_000_000));
         let port = &phase.ports[0];
         assert_eq!(port.utilization, Some(0.8));
         assert_eq!(port.foreign_sent_bytes, Some(1_000_000_000));
-        assert_eq!(phase.assessments.len(), 2);
+        // A residual inside the host's own-exchange allowance is not foreign.
+        let found = caveats(std::slice::from_ref(&phase));
+        assert!(found.iter().all(|c| !c.contains("foreign traffic")));
+        assert_eq!(phase.assessments.len(), 1);
         assert_eq!(header(&[phase]).unwrap(), "RoCE 1 x 100 Gb/s · peak 80.0%");
+    }
+    fn exchange_host(key: &str, time: f64, nic: (u64, u64), engine: (u64, u64)) -> Snapshot {
+        Snapshot { hosts: BTreeMap::from([(key.into(), HostSample {
+            incarnation: "one".into(), sampled_s: time,
+            ports: vec![PortSample { device: "nic".into(), port: 1, link_gbps: Some(200.0), state: Some("4: ACTIVE".into()),
+                counters: BTreeMap::from([("port_xmit_data".into(), nic.0), ("port_rcv_data".into(), nic.1)]),
+                ..Default::default() }],
+            engine: vec![EngineSample { device: "nic".into(), port: 1, peer: "peer".into(),
+                sent_bytes: engine.0, received_bytes: engine.1, ..Default::default() }], ..Default::default()
+        })]) }
+    }
+    #[test]
+    fn own_exchange_on_a_non_default_expert_port_is_not_foreign() {
+        // A card whose expert port is 19935: the residual is its own native
+        // exchange, inside this host's allowance, not a foreign flow on that
+        // port; the configured port number is irrelevant to attribution.
+        let key = "10.55.0.1:19935";
+        let before = exchange_host(key, 1.0, (0, 0), (0, 0));
+        let after = exchange_host(key, 2.0, (11_565_000_000, 7_304_000_000), (8_462_000_000, 4_439_000_000));
+        let phase = interval("prefill", true, &before, &after);
+        assert_eq!(phase.ports[0].foreign_sent_bytes, Some(3_103_000_000));
+        assert_eq!(phase.ports[0].foreign_received_bytes, Some(2_865_000_000));
+        assert!(caveats(std::slice::from_ref(&phase)).is_empty(), "{:?}", phase.assessments);
+
+        // The same port receiving bytes no host in the card sent: foreign.
+        let after = exchange_host(key, 2.0, (11_565_000_000, 9_500_000_000), (8_462_000_000, 4_439_000_000));
+        let phase = interval("prefill", true, &before, &after);
+        let found = caveats(&[phase]);
+        assert!(found.iter().any(|c| c.contains("foreign traffic") && c.contains(key) && c.contains("received beyond")),
+            "{found:?}");
+
+        // A second symmetric flow on top of the host's own exchange is not the
+        // host's own traffic just because both directions rose: it exceeds the
+        // engine-reported exchange bound in both directions.
+        let after = exchange_host(key, 2.0, (15_693_000_000, 9_658_500_000), (8_462_000_000, 4_439_000_000));
+        let phase = interval("prefill", true, &before, &after);
+        let found = caveats(&[phase]);
+        assert_eq!(found.iter().filter(|c| c.contains("foreign traffic")).count(), 2, "{found:?}");
+        assert!(found.iter().any(|c| c.contains("sent beyond")), "{found:?}");
+        assert!(found.iter().any(|c| c.contains("received beyond")), "{found:?}");
     }
     #[test]
     fn source_restart_and_disappearance_leave_foreign_unknown() {

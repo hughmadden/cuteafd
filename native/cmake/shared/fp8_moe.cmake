@@ -56,7 +56,7 @@ foreach(entry IN LISTS CUTEAFD_FP8_MOE_ENTRIES)
   elseif(entry STREQUAL "step5:nvfp4")
     set(geometry "step5_nvfp4")
     set(count_family "step5")
-    set(package "${CMAKE_CURRENT_BINARY_DIR}/fp8/fp8-step5-nvfp4")
+    set(package "${CMAKE_CURRENT_BINARY_DIR}/fp8/fp8-step5-nvfp4a4")
   elseif(entry MATCHES "^(glm|glmf|glmfdense|qwen4):(nvfp4|nvfp4a4)$")
     if(CMAKE_MATCH_1 STREQUAL "glmfdense" AND CUTEAFD_FP8_MOE_ROLE STREQUAL "spark")
       continue()  # dense MLPs run on the coordinator only

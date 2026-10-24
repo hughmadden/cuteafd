@@ -29,6 +29,11 @@ DGX Sparks serves the routed experts over RoCE.
   connect directly. [Client APIs](docs/client-apis.md)
 - **Own your intelligence:** your weights, your hardware, no rate limits.
 
+Prefill reports without `prompt_content: "realistic-v1"` used synthetic filler.
+New prefill benchmarks use fixed real code, agent/tool transcripts and technical
+prose; their prefill numbers are not directly comparable to the older content.
+Decode and agentic-session workloads are unchanged.
+
 ## What's new in v3.0.0
 
 - **Two-GPU placement for every family:** experts run TP2 across both RTX
@@ -150,6 +155,11 @@ Each card is one launch of the basic profile: tok/s for C1 decode and concurrent
   vision on for EXL3. [Details](docs/models/qwen4.md#known-limits)
 - **GLM Flash tr3** vision needs `CHAT_TEMPLATE_FROM=zai-org/GLM-5.3-Flash`;
   without it `VISION=auto` serves text only and says so.
+- **GLM 5.3 EXLR8** (work/p0 only, not in a release): with multi-lane prefill,
+  prompts beyond about 8K tokens can hang at the coordinator's peer wait
+  ([#408](https://github.com/tpurtell/cuteafd/issues/408)). Use
+  `CUTEAFD_GLM_PREFILL_LANES=1` in the launch environment for long prompts
+  until the fix lands.
 
 ### Methodology
 

@@ -157,11 +157,20 @@ impl<'a> Exl3Worker<'a> {
     /// including that each export carries the requested decode schedule.
     pub(crate) fn validate_exports(directory: &Path, capacity: u32, rank: usize, schedule: Exl3Schedule)
         -> Result<()> {
-        ensure!(rank < 6, "EXL3 worker rank must be 0..5");
+        ensure!(rank < 8, "EXL3 worker rank must be 0..7");
         schedule.validate(Exl3RowPolicy::active())?;
         for c in Self::capacities(capacity)? {
             schedule.check_export(directory, c)?;
             Exl3Execution::validate_artifact(&schedule.directory(directory, c))?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn validate_planned_residency(directory: &Path, capacity: u32,
+        schedule: Exl3Schedule, layout: &cuteafd_loader::V41Exl3Residency,
+        geometry: cuteafd_core::ExpertGeometry) -> Result<()> {
+        for c in Self::capacities(capacity)? {
+            Exl3Execution::validate_planned_residency(&schedule.directory(directory, c), layout, geometry)?;
         }
         Ok(())
     }
@@ -186,8 +195,8 @@ impl<'a> Exl3Worker<'a> {
     }
 
     fn validate_rank(world: usize, rank: usize) -> Result<()> {
-        ensure!((1..=6).contains(&world) && rank < world,
-            "EXL3 worker requires declared Spark TP1..6 weights and rank below world");
+        ensure!((1..=8).contains(&world) && rank < world,
+            "EXL3 worker requires declared Spark TP1..8 weights and rank below world");
         Ok(())
     }
 

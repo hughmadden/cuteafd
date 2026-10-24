@@ -1,7 +1,7 @@
 //! One GPU1 DFlash2 owner; the target retains its single embedding and head.
 //! GLM Flash's binding of the shared device-driven draft bridge
 //! (`shared::draft::remote`): taps, input rows, hidden rows and logits.
-use crate::families::glm5::dflash::{ContextRow, Draft, DraftSeq, GlmDrafter, ReplayDrafter, TargetHead, TAP_ROWS};
+use crate::shared::speculation::dflash::{ContextRow, Draft, DraftSeq, DflashDrafter, ReplayDrafter, TargetHead, TAP_ROWS};
 use crate::shared::draft::remote::{Prepared, RemoteBridge};
 use crate::shared::memory::device::{Allocation, Device, DeviceOwner};
 use crate::shared::peer_split::RankDevice;
@@ -32,7 +32,7 @@ struct TargetBuffers<'a> {
 }
 
 pub(crate) struct RemoteDflash<'a> {
-    pub draft: DeviceOwner<'a, GlmDrafter<'a>>,
+    pub draft: DeviceOwner<'a, DflashDrafter<'a>>,
     target: DeviceOwner<'a, TargetBuffers<'a>>,
     // The drafter drops before the bridge's stream it borrows.
     bridge: RemoteBridge<'a>,
@@ -40,7 +40,7 @@ pub(crate) struct RemoteDflash<'a> {
 }
 
 impl<'a> RemoteDflash<'a> {
-    pub fn new(draft: DeviceOwner<'a, GlmDrafter<'a>>, prepared: Prepared<'a>) -> Result<Self> {
+    pub fn new(draft: DeviceOwner<'a, DflashDrafter<'a>>, prepared: Prepared<'a>) -> Result<Self> {
         let library = draft.device.library;
         ensure!(draft.device.id == prepared.stream.device.id, "remote draft owner disagrees with prepared stream");
         let c = &draft.cfg;
@@ -49,6 +49,8 @@ impl<'a> RemoteDflash<'a> {
         let inventory = cuteafd_loader::placement::families::glm5_flash::remote_dflash_bridge_demands(
             c.hidden as u64, c.vocab as u64, c.taps.len() as u64, rows as u64)?;
         let bridge = RemoteBridge::new(prepared);
+        ensure!(bridge.head_rank() == 0 && bridge.head_device() == bridge.target_device(),
+            "GLM Flash target head must remain on its owning rank 0");
         let device = Device { library, id: bridge.target_device() };
         let target = device.own(|| {
             let _scope = cuteafd_ffi::memory_ledger::scope("drafter/bridge");
@@ -92,22 +94,26 @@ impl<'a> RemoteDflash<'a> {
     }
 
     fn launch_head(&self, head: &TargetHead<'_>, rows: usize, serving: bool) -> Result<()> {
+        self.launch_head_at(head, self.target.hidden.buffer.ptr.cast_const(),
+            self.target.logits.buffer.ptr, rows, serving, self.bridge.exchange.stream(0))
+    }
+
+    fn launch_head_at(&self, head: &TargetHead<'_>, hidden: *const c_void, logits: *mut c_void,
+        rows: usize, serving: bool, stream: *mut c_void) -> Result<()> {
         self.target.device.run(|| match head {
             TargetHead::Bf16(weight) if serving => {
                 // SAFETY: target-owned weight and admitted scratch stay live on this stream.
                 unsafe { crate::shared::draft::launch_bf16_head(&self.target.head,
-                    self.target.hidden.buffer.ptr.cast(), weight.buffer.ptr.cast(),
-                    self.target.logits.buffer.ptr.cast(), rows, self.bridge.exchange.stream(0)) }
+                    hidden.cast(), weight.buffer.ptr.cast(), logits.cast(), rows, stream) }
             }
             TargetHead::Bf16(weight) => {
                 // SAFETY: target head and admitted operands share the target stream.
-                unsafe { crate::families::glm5::launch_draft_head(self.draft.device.library,
-                    &self.target.head, self.target.hidden.buffer.ptr.cast_const(), weight.buffer.ptr.cast_const(),
-                    self.target.logits.buffer.ptr.cast(), rows, self.draft.cfg.hidden, self.draft.cfg.vocab,
-                    self.bridge.exchange.stream(0), self.draft.draft_head_mode()) }
+                unsafe { crate::shared::speculation::dflash::launch_draft_head(self.draft.device.library,
+                    &self.target.head, hidden, weight.buffer.ptr.cast_const(), logits.cast(), rows,
+                    self.draft.cfg.hidden, self.draft.cfg.vocab, stream, self.draft.draft_head_mode()) }
             }
-            TargetHead::Launch(launch) => launch(self.target.hidden.buffer.ptr.cast_const(),
-                self.target.logits.buffer.ptr.cast(), rows, self.bridge.exchange.stream(0)),
+            TargetHead::Bf16Buffer(_) => anyhow::bail!("GLM Flash remote adapter requires its retained target head owner"),
+            TargetHead::Launch(launch) => launch(hidden, logits.cast(), rows, stream),
         })
     }
 
@@ -208,7 +214,8 @@ impl<'a> RemoteDflash<'a> {
             let launch = |hidden: *const c_void, logits: *mut f32, rows: usize, stream: *mut c_void| {
                 ensure!(stream == self.bridge.stream.raw && rows <= self.rows, "remote draft head capacity/stream");
                 self.bridge.round_trip_head(hidden, self.target.hidden.buffer.ptr,
-                    rows * self.draft.cfg.hidden * 2, || self.launch_head(&head, rows, serving),
+                    rows * self.draft.cfg.hidden * 2,
+                    |hidden, logits, stream| self.launch_head_at(&head, hidden, logits, rows, serving, stream),
                     self.target.logits.buffer.ptr.cast_const(), logits.cast(), rows * self.draft.cfg.vocab * 4)
             };
             self.draft.device.run(|| self.draft.draft_device_with(sequences, &input,
@@ -247,7 +254,7 @@ mod tests {
     #[test]
     #[ignore = "requires both RTX GPUs, native CUDA library and explicit checkpoint paths"]
     fn remote_dflash_cuda_matches_local_and_drains_terminal_waits() -> Result<()> {
-        use crate::families::glm5::dflash::{self, DflashConfig};
+        use crate::shared::speculation::dflash::{self, DflashConfig};
         use crate::shared::fp8_linear::{Fp8Rows, Fp8Scales};
         use crate::shared::memory::DeviceAllocation;
         use crate::shared::token_io::{EmbedPlacement, EmbedSource};
@@ -285,12 +292,12 @@ mod tests {
         let mask = embedding.host_rows(&[cfg.mask_token])?;
         for representation in [GlmDraftRepresentation::Fp8Only, GlmDraftRepresentation::Bf16Only] {
             let prepared = Prepared::new(&library, RankDevice { device: 0, stream: lead.raw },
-                RankDevice { device: 1, stream: peer_target.raw }, IDENTITY)?;
-            let local = GlmDrafter::load(&library, &draft_path, file.clone(), lead.raw, 4, 4,
-                mask.clone(), true, representation, Fp8Scales::Pow2, Fp8Rows::W8a8)?;
+                RankDevice { device: 1, stream: peer_target.raw }, 0, IDENTITY)?;
+            let local = DflashDrafter::load(&library, &draft_path, file.clone(), lead.raw, 4, 4,
+                mask.clone(), true, representation, Fp8Scales::Pow2, Fp8Rows::W8a8, cuteafd_loader::families::qwen4::Qwen4KvCache::Bf16)?;
             let draft_device = prepared.stream.device;
-            let draft = draft_device.own(|| GlmDrafter::load(&library, &draft_path, file.clone(),
-                prepared.stream.raw, 4, 4, mask.clone(), true, representation, Fp8Scales::Pow2, Fp8Rows::W8a8))?;
+            let draft = draft_device.own(|| DflashDrafter::load(&library, &draft_path, file.clone(),
+                prepared.stream.raw, 4, 4, mask.clone(), true, representation, Fp8Scales::Pow2, Fp8Rows::W8a8, cuteafd_loader::families::qwen4::Qwen4KvCache::Bf16))?;
             let remote = RemoteDflash::new(draft, prepared)?;
             let result = (|| -> Result<()> {
                 remote.prime(&embedding, TargetHead::Bf16(&head))?;
@@ -362,7 +369,7 @@ mod tests {
 impl ReplayDrafter for RemoteDflash<'_> {
     fn block(&self) -> usize { self.draft.cfg.block }
     fn sequences(&self) -> usize { self.draft.max_batch_sequences() }
-    fn resident_modes(&self) -> Vec<crate::families::glm5::dflash::ReplayMode> { self.draft.resident_modes() }
+    fn resident_modes(&self) -> Vec<crate::shared::speculation::dflash::ReplayMode> { self.draft.resident_modes() }
     fn context(&self, taps: &[u8], first: usize) -> Result<()> {
         let width = self.draft.cfg.taps.len() * self.draft.cfg.hidden * 2;
         ensure!(taps.len() % width == 0, "remote replay tap row width");

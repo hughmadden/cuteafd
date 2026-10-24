@@ -492,7 +492,7 @@ fn class_exhaustion_evicts_until_it_fits() {
 /// A snapshot of one page in compressor 0 over `tokens`, as the eviction tests size them.
 fn one_page(device: &mut Device, kind: SnapshotKind, tokens: &[u32], page: u32) -> DeviceSnapshot {
     let layout = layout();
-    let mut pages: [Vec<DevicePage>; COMPRESSORS] = std::array::from_fn(|_| Vec::new());
+    let mut pages: [Vec<DevicePage>; cuteafd_hostcache::PAGE_BANKS] = std::array::from_fn(|_| Vec::new());
     pages[0].push(DevicePage {
         id: DevicePageId { compressor: 0, page, generation: 0 },
         segments: vec![device.range(layout.page)],

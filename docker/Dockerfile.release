@@ -26,7 +26,7 @@ RUN --mount=type=cache,target=/root/.cache/pip,id=cuteafd-pip-${TARGETARCH},shar
     python3 -m pip install uv && \
     uv pip install --system --break-system-packages \
       safetensors \
-      huggingface-hub \
+      "huggingface-hub>=2.2,<3" \
       "nvidia-cutlass-dsl[cu13]==4.6.2" \
       "apache-tvm-ffi==0.1.12" \
       "cuda-tile==1.5.0" \

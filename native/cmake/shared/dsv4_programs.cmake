@@ -72,10 +72,12 @@ if(CUTEAFD_ENABLE_STEP5_AOT)
   endif()
 endif()
 if(CUTEAFD_ENABLE_KIMIK3_AOT)
+  # Kimi always packages the native K6 core programs; the runtime selects them
+  # from the checkpoint's own headers.
   if(CUTEAFD_PROGRAM_GEOMETRY STREQUAL "")
-    set(CUTEAFD_PROGRAM_GEOMETRY "kimik3")
+    set(CUTEAFD_PROGRAM_GEOMETRY "kimik3,kimi_k6_dense,kimi_split")
   else()
-    set(CUTEAFD_PROGRAM_GEOMETRY "${CUTEAFD_PROGRAM_GEOMETRY},kimik3")
+    set(CUTEAFD_PROGRAM_GEOMETRY "${CUTEAFD_PROGRAM_GEOMETRY},kimik3,kimi_k6_dense,kimi_split")
   endif()
 endif()
 if(CUTEAFD_ENABLE_EXLR8_AOT)
@@ -84,6 +86,9 @@ if(CUTEAFD_ENABLE_EXLR8_AOT)
     set(CUTEAFD_PROGRAM_GEOMETRY "exlr8")
   else()
     set(CUTEAFD_PROGRAM_GEOMETRY "${CUTEAFD_PROGRAM_GEOMETRY},exlr8")
+  endif()
+  if(CUTEAFD_EXLR8_ROLE STREQUAL "coordinator")
+    set(CUTEAFD_PROGRAM_GEOMETRY "${CUTEAFD_PROGRAM_GEOMETRY},exlr8_dense,glm_stage,glm2_stage")
   endif()
 endif()
 set(CUTEAFD_DSV4_DIR "${CMAKE_CURRENT_BINARY_DIR}/dsv4_programs")
@@ -116,6 +121,9 @@ add_custom_command(
   DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/aot/export_b12x_dsv4_aot.py" "${stamp}"
     "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/aot/export_b12x_step5_aot.py"
     "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/aot/export_b12x_exlr8_aot.py"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/aot/export_b12x_exlr8_dense_aot.py"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/aot/export_b12x_kimi_k6_dense_aot.py"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/aot/export_b12x_kimi_split_aot.py"
     ${CUTEAFD_SPARKINFER_PROVENANCE_INPUTS} ${CUTEAFD_SPARKINFER_EXPORT_INPUTS}
   COMMENT "Exporting coordinator programs (${CUTEAFD_PROGRAM_GEOMETRY})"
   VERBATIM)

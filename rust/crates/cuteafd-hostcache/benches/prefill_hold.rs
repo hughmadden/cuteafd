@@ -56,7 +56,8 @@ fn probe_snapshot(generation: u32) -> DeviceSnapshot {
         addr += bytes as u64;
         DeviceRange { addr: start, bytes }
     };
-    let pages: [Vec<DevicePage>; COMPRESSORS] = std::array::from_fn(|compressor| {
+    let pages: [Vec<DevicePage>; cuteafd_hostcache::PAGE_BANKS] = std::array::from_fn(|compressor| {
+        if compressor >= COMPRESSORS { return Vec::new(); }
         vec![DevicePage {
             id: DevicePageId {
                 compressor: compressor as u8,

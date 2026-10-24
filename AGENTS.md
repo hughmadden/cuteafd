@@ -25,7 +25,8 @@ before → after tables with conditions.
   sudo inside a wrapper script or interpreter (`sudo python …`, `sudo bash …`):
   the approver can't see what it runs and will flag or deny it.
 - Canonical lock order: `sparks.lock` -> `gpu0.lock` -> `gpu1.lock` ->
-  `rhea.lock` -> `moa.lock` -> `kakapo.lock`. Never acquire an earlier lock
+  `rhea.lock` -> `moa.lock` -> `kakapo.lock` -> `cassowary.lock` ->
+  `kakapo-export.lock` -> `cassowary-export.lock`. Never acquire an earlier lock
   while holding a later one. Coordinator exports skip all GPU probes while
   a seed lease is live. Every lock wait and run has a timeout.
 - Waiting costs tokens, sleeping doesn't: start a long run as one background
@@ -125,8 +126,8 @@ before → after tables with conditions.
 - `./wip.sh --slot S --role both` for iteration, `./run.sh --wip S
   --restart` to launch; `./build.sh` and `./run.sh` for
   release images. Slots isolate artifacts, not GPUs or ports: CPU builds
-  use five counting slots; kakapo uses counting leases, serving-host seeds
-  remain exclusive. Serialize performance runs, one model per GPU.
+  use five counting slots; LAN-only seeds use counting leases plus one
+  GPU export at a time, serving-host seeds remain exclusive. Serialize performance runs, one model per GPU.
   `~/.cache/cuteafd/{gpu1,sparks}.lock` (flock) are the hardware mutexes;
   hold one only around the run that needs it and stop its containers before
   releasing it, so the next task finds a clean device.
@@ -153,7 +154,7 @@ before → after tables with conditions.
 - Host checks: `cargo check/test --workspace` from `rust/` with
   `CARGO_TARGET_DIR=~/.cache/cuteafd/builds/<task>/target` (no Python
   needed). Script tests: `.venv/bin/python -m pytest -q scripts/tests`
-  (`uv venv --python 3.12 .venv` + pytest pytest-xdist numpy tokenizers jsonschema pyyaml pillow matplotlib safetensors);
+  (`uv venv --python 3.12 .venv` + pytest pytest-xdist numpy tokenizers "huggingface-hub>=2.2" jsonschema pyyaml pillow matplotlib safetensors);
   `scripts/dev/cpu-gate --task NAME --jobs N` runs both suites concurrently
   (or set `CUTEAFD_TEST_JOBS`; default half the logical CPUs). The gate uses
   nextest when present on PATH or in the persistent architecture Cargo home,
@@ -367,14 +368,19 @@ facts recorded somewhere for agents working on it.
   limit they ran at. Fabric 10.55.0.22 / 10.55.1.22.
 - Sparks (GB10, SM121, ARM64, 121 GiB unified; `nvidia-smi` memory reads
   N/A, measure with CUDA): ostrich, dodo, emu, kiwi, rhea, moa at
-  10.55.0.1–6. Ranks 0–5 in that order. All six are the pool. TP4 on the
-  first four is the qualified V4.1 default until a six-rank layout wins.
-- `kakapo` (GB10, 172.22.2.7): build seed only, never serves; 10 GbE, no
-  RoCE. Its sealed slots reach the Sparks through sparknest. Three counting
-  build leases (20 threads / 121 GiB), shared `kakapo.lock` umbrella plus
-  exclusive `kakapo.build.N.lock`, exclude legacy exclusive users. Full or
-  unavailable kakapo may fall back to idle rhea/moa under their exclusive
-  hardware locks. Independent instances share host-wide exporter worker slots.
+  10.55.0.1–6. Ranks 0–5 in that order. All six are the pool. V4.1 max
+  uses all six (TJ 2026-10-22); TP4 is a reference layout.
+- LAN-only build seeds `kakapo` (GB10, 172.22.2.7) and `cassowary` (GB10,
+  172.22.2.8, ConnectX ports down): build only, never serve; 10 GbE, off the
+  RoCE fabric. Their sealed slots reach the Sparks through sparknest. Each has
+  three counting build leases (20 threads / ~120 GiB): shared `SEED.lock`
+  umbrella plus exclusive `SEED.build.N.lock`, excluding legacy exclusive
+  users. The leases cover Cargo and CPU phases; the GPU export takes the
+  seed's fair `SEED-export` turn (hwlock), one at a time; native-cache hits
+  skip it. An automatic seed is the less-loaded LAN seed (fewest held
+  slots), then idle rhea/moa under their exclusive hardware locks; `--seed`
+  is a placement request. Independent instances share host-wide exporter
+  worker slots. `build-dev-images.sh` gives both seeds the Spark dev image.
 - Fabric: Sparks have two RoCE ports at 200 Gb/s each on separate
   subnets (rail A 10.55.0.x, rail B 10.55.1.x); raptor has one 400 Gb/s
   port carrying both rail subnets. The switch is being raised from 100G to

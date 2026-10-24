@@ -11,7 +11,7 @@
 //! banks, with prompts first only at equal use. Neither order touches a pinned snapshot.
 use crate::pool::{Class, HostRange, PoolExhausted, Slab, SlabPool};
 use crate::SnapshotKind;
-use crate::COMPRESSORS;
+use crate::PAGE_BANKS;
 use cuteafd_core::prefix::{ReuseRule, Retention};
 use serde::Serialize;
 use std::collections::HashMap;
@@ -73,7 +73,7 @@ pub struct HostSnapshot {
     /// What the engine told the cache at store time.
     pub meta: SnapshotMeta,
     /// Per compressor, in logical order.
-    pub pages: [Vec<PageRef>; COMPRESSORS],
+    pub pages: [Vec<PageRef>; PAGE_BANKS],
     /// The backbone tail arena slot.
     pub tail: Slab,
     /// The dSpark draft rings, when the snapshot has them and the layout enables the class.
@@ -102,7 +102,7 @@ pub struct StorePlan {
     /// `(compressor, logical index, device identity, destination slab)` for pages to copy.
     pub copies: Vec<(u8, u32, DevicePageId, Slab)>,
     /// Per compressor, in logical order, the final page references (shared or newly allocated).
-    pub pages: [Vec<PageRef>; COMPRESSORS],
+    pub pages: [Vec<PageRef>; PAGE_BANKS],
     /// The backbone tail arena slot.
     pub tail: Slab,
     /// The dSpark draft rings, when planned.
@@ -185,7 +185,7 @@ impl Snapshots {
     pub fn plan_store(
         &mut self,
         meta: SnapshotMeta,
-        device_pages: &[Vec<DevicePageId>; COMPRESSORS],
+        device_pages: &[Vec<DevicePageId>; PAGE_BANKS],
     ) -> Result<StorePlan, PoolExhausted> {
         let tail = self.pool.take(Class::Tail)?;
         let scores = match self.take_optional(Class::Scores) {
@@ -206,7 +206,7 @@ impl Snapshots {
         } else {
             None
         };
-        let mut pages: [Vec<PageRef>; COMPRESSORS] = std::array::from_fn(|_| Vec::new());
+        let mut pages: [Vec<PageRef>; PAGE_BANKS] = std::array::from_fn(|_| Vec::new());
         let mut copies = Vec::new();
         for (compressor, list) in device_pages.iter().enumerate() {
             for (index, &id) in list.iter().enumerate() {
@@ -215,7 +215,7 @@ impl Snapshots {
                         self.add_page_ref(page);
                         pages[compressor].push(page);
                     }
-                    None => match self.pool.take(Class::Page) {
+                    None => match self.pool.take(crate::pool::Layout::page_class(compressor)) {
                         Ok(slab) => {
                             let page = self.insert_page(slab);
                             pages[compressor].push(page);
@@ -370,15 +370,19 @@ impl Snapshots {
     /// Make room in one eviction-order pass, then let the caller plan exactly once.
     /// Slab occupancy, not snapshot footprints, accounts for shared pages and class fragmentation.
     pub(crate) fn make_room(&mut self, meta: &SnapshotMeta,
-        device_pages: &[Vec<DevicePageId>; COMPRESSORS], headroom: [u64; 4]) -> (Vec<Key>, u64) {
+        device_pages: &[Vec<DevicePageId>; PAGE_BANKS], headroom: [u64; 4]) -> (Vec<Key>, u64) {
         let layout = self.pool.layout();
         let mut demand = [0, 1, u64::from(meta.has_draft && layout.draft > 0),
-            u64::from(layout.scores > 0)];
-        let mut shared = HashMap::<PageRef, u64>::new();
-        for id in device_pages.iter().flatten() {
-            if let Some(&page) = self.device_map.get(id) {
-                *shared.entry(page).or_default() += 1;
-            } else { demand[0] += 1; }
+            u64::from(layout.scores > 0), 0];
+        let headroom = [headroom[0], headroom[1], headroom[2], headroom[3], 0];
+        let mut shared = HashMap::<PageRef, (usize, u64)>::new();
+        for (bank, ids) in device_pages.iter().enumerate() {
+            let class = crate::pool::Layout::page_class(bank).index();
+            for id in ids {
+                if let Some(&page) = self.device_map.get(id) {
+                    shared.entry(page).or_insert((class, 0)).1 += 1;
+                } else { demand[class] += 1; }
+            }
         }
         if self.pool.can_take(demand) { return (Vec::new(), 0); }
         let mut candidates: Vec<_> = match self.order {
@@ -401,7 +405,7 @@ impl Snapshots {
             for page in pages {
                 if self.page_ref_count(page) == 0 {
                     // An incoming shared page must be copied if its final resident owner left.
-                    demand[0] += shared.remove(&page).unwrap_or(0);
+                    if let Some((class, count)) = shared.remove(&page) { demand[class] += count; }
                     target = self.pool.pressure_target(demand, headroom);
                 }
             }
@@ -601,7 +605,7 @@ impl Snapshots {
     fn map_copied_pages(
         &mut self,
         copies: &[(u8, u32, DevicePageId, Slab)],
-        pages: &mut [Vec<PageRef>; COMPRESSORS],
+        pages: &mut [Vec<PageRef>; PAGE_BANKS],
     ) {
         for &(compressor, index, id, _slab) in copies {
             let page = pages[compressor as usize][index as usize];
@@ -664,7 +668,7 @@ impl Snapshots {
     }
 
     /// Drop one reference to every page in `pages`.
-    fn release_pages(&mut self, pages: &[Vec<PageRef>; COMPRESSORS]) {
+    fn release_pages(&mut self, pages: &[Vec<PageRef>; PAGE_BANKS]) {
         for list in pages {
             for &page in list {
                 self.release_page(page);
@@ -741,8 +745,8 @@ pub mod testing {
     }
 
     /// A page list with `ids` in compressor 0.
-    pub fn pages(ids: &[DevicePageId]) -> [Vec<DevicePageId>; COMPRESSORS] {
-        let mut pages: [Vec<DevicePageId>; COMPRESSORS] = std::array::from_fn(|_| Vec::new());
+    pub fn pages(ids: &[DevicePageId]) -> [Vec<DevicePageId>; PAGE_BANKS] {
+        let mut pages: [Vec<DevicePageId>; PAGE_BANKS] = std::array::from_fn(|_| Vec::new());
         pages[0].extend_from_slice(ids);
         pages
     }
@@ -768,7 +772,7 @@ pub mod testing {
             let mut sequence = prefix_tokens.clone();
             sequence
                 .extend((0..(tokens - prefix) as u32).map(|token| (index as u32) * 8192 + token));
-            let mut pages: [Vec<DevicePageId>; COMPRESSORS] = std::array::from_fn(|_| Vec::new());
+            let mut pages: [Vec<DevicePageId>; PAGE_BANKS] = std::array::from_fn(|_| Vec::new());
             pages[0].extend_from_slice(&prefix_pages);
             pages[0].extend(
                 (0..((tokens - prefix) / 100) as u32).map(|page| DevicePageId {
@@ -796,6 +800,45 @@ mod tests {
     use super::*;
     use crate::pool::testing::CHUNK;
     use crate::pool::Layout;
+
+    #[test]
+    fn typed_draft_pages_share_abort_and_evict_under_the_same_host_quota() {
+        let layout = Layout::family(64, 64, 0).with_draft_pages(128);
+        let mut memory = crate::pool::testing::FakePinned::new(usize::MAX);
+        let mut store = Snapshots::new(SlabPool::new(1024, 256, layout, &mut memory).unwrap());
+        let mut device = pages(&[id(1)]);
+        device[crate::DRAFT_PAGE_BANK] = vec![DevicePageId {
+            compressor: crate::DRAFT_PAGE_BANK as u8, page: 1, generation: 0 }];
+        let plan = store.plan_store(meta(SnapshotKind::Prompt, &[1], false), &device).unwrap();
+        let first = store.commit_store(plan, 0);
+        assert_eq!(store.bytes_used(), 64 + 64 + 128);
+        let plan = store.plan_store(meta(SnapshotKind::Turn, &[1, 2], false), &device).unwrap();
+        assert!(plan.copies.is_empty());
+        assert_eq!(store.bytes_used(), 64 + 128 + 2 * 64);
+        store.abort_store(plan);
+        assert_eq!(store.bytes_used(), 256);
+        let plan = store.plan_store(meta(SnapshotKind::Turn, &[1, 2], false), &device).unwrap();
+        let second = store.commit_store(plan, 1);
+        store.remove(first);
+        assert_eq!(store.bytes_used(), 256);
+        // Force pressure in both page classes and check that typed class fragmentation
+        // cannot exceed the same fixed budget or evict a pinned snapshot.
+        store.pin(second);
+        for n in 2..12 {
+            let mut next = pages(&[id(n)]);
+            next[crate::DRAFT_PAGE_BANK] = vec![DevicePageId {
+                compressor: crate::DRAFT_PAGE_BANK as u8, page: n, generation: 0 }];
+            let metadata = meta(SnapshotKind::Turn, &[n], false);
+            store.make_room(&metadata, &next, [0; 4]);
+            if let Ok(plan) = store.plan_store(metadata, &next) { store.commit_store(plan, n as u64); }
+            assert!(store.bytes_used() <= 1024);
+            assert!(store.get(second).is_some());
+        }
+        store.unpin(second);
+        store.evict_to(0);
+        assert_eq!(store.bytes_used(), 0);
+        assert_eq!(store.live_pages(), 0);
+    }
 
     #[test]
     fn verified_touch_refreshes_lru_but_peek_does_not() {
@@ -1144,7 +1187,7 @@ mod tests {
 
     #[test]
     fn pressure_batches_headroom_but_does_not_evict_on_a_following_store_that_fits() {
-        let layout = Layout { page: 64, tail: 64, draft: 0, scores: 0 };
+        let layout = Layout { page: 64, tail: 64, draft: 0, scores: 0, draft_page: 0 };
         let mut memory = crate::pool::testing::FakePinned::new(usize::MAX);
         let mut store = Snapshots::new(SlabPool::new(1024, 256, layout, &mut memory).unwrap());
         for n in 0..8 {
@@ -1154,7 +1197,7 @@ mod tests {
         let incoming = pages(&[id(100)]);
         let (victims, _) = store.make_room(&meta(SnapshotKind::Turn, &[100], false), &incoming, [128, 128, 0, 0]);
         assert_eq!(victims.len(), 3);
-        assert!(store.pool.can_take([3, 3, 0, 0]));
+        assert!(store.pool.can_take([3, 3, 0, 0, 0]));
         let plan = store.plan_store(meta(SnapshotKind::Turn, &[100], false), &incoming).unwrap();
         store.commit_store(plan, 100);
         let next = pages(&[id(101)]);
@@ -1168,7 +1211,7 @@ mod tests {
     fn bulk_victims_match_retry_loop_on_randomized_shared_pinned_traces() {
         for order in [EvictionOrder::Banks, EvictionOrder::LeastRecent] {
             let build = || {
-                let layout = Layout { page: 64, tail: 128, draft: 64, scores: 32 };
+                let layout = Layout { page: 64, tail: 128, draft: 64, scores: 32, draft_page: 0 };
                 let mut memory = crate::pool::testing::FakePinned::new(usize::MAX);
                 Snapshots::with_rule(SlabPool::new(8192, 256, layout, &mut memory).unwrap(), ReuseRule::EXACT, order)
             };
@@ -1213,12 +1256,14 @@ mod tests {
     // Reference: the former allocate/fail/evict-one loop, extended to the same
     // free-class target. Trial plans are rolled back without consuming a key.
     fn retry_pressure(store: &mut Snapshots, meta: &SnapshotMeta,
-        pages: &[Vec<DevicePageId>; COMPRESSORS], headroom: [u64; 4]) -> (Option<StorePlan>, Vec<Key>) {
+        pages: &[Vec<DevicePageId>; PAGE_BANKS], headroom: [u64; 4]) -> (Option<StorePlan>, Vec<Key>) {
         let demand = |store: &Snapshots| {
             let layout = store.pool.layout();
-            [pages.iter().flatten().filter(|id| !store.device_map.contains_key(id)).count() as u64,
-                1, u64::from(meta.has_draft && layout.draft > 0), u64::from(layout.scores > 0)]
+            [pages[..crate::COMPRESSORS].iter().flatten().filter(|id| !store.device_map.contains_key(id)).count() as u64,
+                1, u64::from(meta.has_draft && layout.draft > 0), u64::from(layout.scores > 0),
+                pages[crate::DRAFT_PAGE_BANK].iter().filter(|id| !store.device_map.contains_key(id)).count() as u64]
         };
+        let headroom = [headroom[0], headroom[1], headroom[2], headroom[3], 0];
         let pressure = !store.pool.can_take(demand(store));
         let mut victims = Vec::new();
         loop {

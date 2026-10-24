@@ -351,8 +351,8 @@ impl RemoteEncoder {
         timeout: Duration,
     ) -> Result<Self> {
         expected.validate()?;
-        if addresses.is_empty() || addresses.len() > 6 {
-            return Err(error("vision needs 1..6 replicas"));
+        if addresses.is_empty() || addresses.len() > 8 {
+            return Err(error("vision needs 1..8 replicas"));
         }
         let mut this = Self {
             healthy: Arc::new(AtomicBool::new(true)),

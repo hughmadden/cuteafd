@@ -111,11 +111,39 @@
     "ostrich",
     "dodo",
     "emu",
-    "kiwi"
+    "kiwi",
+    "rhea",
+    "moa"
    ],
    "set": {
     "ADDR": "0.0.0.0:8701",
     "EXPERT_PORT": "19801",
+    "SPARK_COUNT": "6",
+    "SPARK_0_HOST": "ostrich",
+    "SPARK_1_HOST": "dodo",
+    "SPARK_2_HOST": "emu",
+    "SPARK_3_HOST": "kiwi",
+    "SPARK_4_HOST": "rhea",
+    "SPARK_5_HOST": "moa"
+   }
+  },
+  {
+   "name": "v41-flash-ref-tp4",
+   "family": "deepseek_v41",
+   "config": "examples/configs/deepseek-v41-mxfp4-max.config",
+   "gpus": [
+    0,
+    1
+   ],
+   "sparks": [
+    "ostrich",
+    "dodo",
+    "emu",
+    "kiwi"
+   ],
+   "set": {
+    "ADDR": "0.0.0.0:8745",
+    "EXPERT_PORT": "19845",
     "SPARK_COUNT": "4",
     "SPARK_0_HOST": "ostrich",
     "SPARK_1_HOST": "dodo",
@@ -227,6 +255,58 @@
    }
   },
   {
+   "name": "glm53-exl3-min",
+   "family": "glm5",
+   "config": "examples/configs/glm53-exl3-min.config",
+   "gpus": [
+    1
+   ],
+   "sparks": [
+    "ostrich",
+    "dodo",
+    "emu",
+    "kiwi"
+   ],
+   "set": {
+    "ADDR": "0.0.0.0:8747",
+    "COORDINATOR_GPU": "1",
+    "EXPERT_PORT": "19847",
+    "SPARK_COUNT": "4",
+    "SPARK_0_HOST": "ostrich",
+    "SPARK_1_HOST": "dodo",
+    "SPARK_2_HOST": "emu",
+    "SPARK_3_HOST": "kiwi"
+   }
+  },
+  {
+   "name": "glm53-exlr8-max",
+   "family": "glm5",
+   "config": "examples/configs/glm53-exlr8-max.config",
+   "gpus": [
+    0,
+    1
+   ],
+   "sparks": [
+    "ostrich",
+    "dodo",
+    "emu",
+    "kiwi",
+    "rhea",
+    "moa"
+   ],
+   "set": {
+    "ADDR": "0.0.0.0:8746",
+    "EXPERT_PORT": "19846",
+    "SPARK_COUNT": "6",
+    "SPARK_0_HOST": "ostrich",
+    "SPARK_1_HOST": "dodo",
+    "SPARK_2_HOST": "emu",
+    "SPARK_3_HOST": "kiwi",
+    "SPARK_4_HOST": "rhea",
+    "SPARK_5_HOST": "moa"
+   }
+  },
+  {
    "name": "mimo26-pro-max",
    "family": "mimo_v2",
    "config": "examples/configs/mimo-v26-pro-mxfp4-max.config",
@@ -277,7 +357,7 @@
   {
    "name": "kimi-k3-max",
    "family": "kimi_k3",
-   "config": "examples/configs/kimi-k3-exl3-max.config",
+   "config": "examples/configs/kimi-k3-exl3-k6-max.config",
    "gpus": [
     0,
     1

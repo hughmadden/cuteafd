@@ -8,7 +8,7 @@ pub mod projection;
 pub mod weight_policy;
 pub mod decode_graph;
 pub mod workspace;
-pub use config::{MimoAttention, MimoKvCache, MimoV2Config};
+pub use config::{MimoAttention, MimoKvCache, MimoKvFormats, MimoV2Config};
 pub use qkv::{checkpoint_tp, FusedQkvLayout, QkvSegment};
 pub use workspace::{MimoAttentionWorkspace, MimoExpertInput, MimoPrefillOutput, MimoWorkspaceLayout, MimoWorkspaceOptions};
 pub mod draft_config;

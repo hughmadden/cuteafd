@@ -1,127 +1,21 @@
-//! Native BF16 NoPE MLA operands, packed one at a time in checkpoint head order.
+//! Target-family geometry adapter for the shared native BF16 MLA packer.
 use super::config::{KimiAttention, KimiK3Config};
-use crate::tensors::LoadedTensor;
-use cuteafd_core::DType;
-use thiserror::Error;
+use crate::{formats::mla::{self, MlaGeometry, MlaOperand, MlaTensor, MlaWeightError}, tensors::LoadedTensor};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum MlaOperand { QkvA, QNorm, KvNorm, QB, Uk, Uv, Gate, Output }
-
-#[derive(Debug, PartialEq, Eq)]
-pub struct MlaTensor {
-    pub shape: Vec<usize>,
-    pub bytes: Vec<u8>,
-}
-
-#[derive(Debug, Error)]
-pub enum MlaWeightError {
-    #[error("Kimi MLA invalid {0}")]
-    Geometry(&'static str),
-    #[error("Kimi MLA tensor {name}: expected BF16 {shape:?}")]
-    Tensor { name: String, shape: Vec<usize> },
-    #[error("Kimi MLA checkpoint read {name}: {source}")]
-    Read { name: String, source: anyhow::Error },
-}
-type Result<T> = std::result::Result<T, MlaWeightError>;
-
-/// Replicate low-rank A inputs/norms; shard whole Q/K/V heads and o_proj
-/// columns. UK is transposed per head; UV retains its checkpoint row order.
-/// Only the requested operand is materialized, never an extra entire layer.
 pub fn pack(cfg: &KimiK3Config, layer: usize, operand: MlaOperand, ranks: usize,
-    mut read: impl FnMut(&str) -> anyhow::Result<LoadedTensor>) -> Result<Vec<MlaTensor>> {
-    if cfg.attention.get(layer) != Some(&KimiAttention::Mla) || !matches!(ranks, 1 | 2)
-        || cfg.heads == 0 || cfg.heads % ranks != 0 || cfg.hidden == 0
-        || cfg.q_lora_rank == 0 || cfg.kv_lora_rank == 0 || cfg.qk_nope_dim == 0
-        || cfg.qk_rope_dim == 0 || cfg.v_head_dim == 0 {
-        return Err(MlaWeightError::Geometry("layer/head/rank geometry"));
+    read: impl FnMut(&str) -> anyhow::Result<LoadedTensor>) -> Result<Vec<MlaTensor>, MlaWeightError> {
+    if cfg.attention.get(layer) != Some(&KimiAttention::Mla) {
+        return Err(MlaWeightError::Geometry("target layer is not MLA"));
     }
-    let base = format!("language_model.model.layers.{layer}.self_attn");
-    let extent = |shape: &[usize]| shape.iter().try_fold(2usize, |n, &d| n.checked_mul(d))
-        .ok_or(MlaWeightError::Geometry("operand extent overflow"));
-    let mut load = |leaf: &str, shape: &[usize]| -> Result<Vec<u8>> {
-        let name = format!("{base}.{leaf}.weight");
-        let t = read(&name).map_err(|source| MlaWeightError::Read { name: name.clone(), source })?;
-        if t.info.dtype != DType::Bf16 || t.info.shape != shape || t.bytes.len() != extent(shape)? {
-            return Err(MlaWeightError::Tensor { name, shape: shape.to_vec() });
-        }
-        Ok(t.bytes)
-    };
-    let (heads, local, hidden, kv) = (cfg.heads, cfg.heads / ranks, cfg.hidden, cfg.kv_lora_rank);
-    let qdim = cfg.qk_nope_dim.checked_add(cfg.qk_rope_dim)
-        .ok_or(MlaWeightError::Geometry("query width overflow"))?;
-    let vdim = cfg.qk_nope_dim.checked_add(cfg.v_head_dim)
-        .ok_or(MlaWeightError::Geometry("KV projection width overflow"))?;
-    let overflow = || MlaWeightError::Geometry("operand extent overflow");
-    let kv_a_rows = kv.checked_add(cfg.qk_rope_dim).ok_or_else(overflow)?;
-    let qkv_a_rows = cfg.q_lora_rank.checked_add(kv_a_rows).ok_or_else(overflow)?;
-    let q_rows = heads.checked_mul(qdim).ok_or_else(overflow)?;
-    let kv_rows = heads.checked_mul(vdim).ok_or_else(overflow)?;
-    let v_rows = heads.checked_mul(cfg.v_head_dim).ok_or_else(overflow)?;
-    for shape in [&[qkv_a_rows, hidden][..], &[q_rows, cfg.q_lora_rank],
-        &[kv_rows, kv], &[v_rows, hidden], &[hidden, v_rows]] {
-        extent(shape)?;
-    }
-    let mut replicate = |leaf: &str, shape: Vec<usize>| -> Result<Vec<MlaTensor>> {
-        let bytes = load(leaf, &shape)?;
-        Ok((0..ranks).map(|_| MlaTensor { shape: shape.clone(), bytes: bytes.clone() }).collect())
-    };
-    match operand {
-        MlaOperand::QNorm => replicate("q_a_layernorm", vec![cfg.q_lora_rank]),
-        MlaOperand::KvNorm => replicate("kv_a_layernorm", vec![kv]),
-        MlaOperand::QkvA => {
-            let mut bytes = load("q_a_proj", &[cfg.q_lora_rank, hidden])?;
-            bytes.extend(load("kv_a_proj_with_mqa", &[kv_a_rows, hidden])?);
-            let shape = vec![qkv_a_rows, hidden];
-            Ok((0..ranks).map(|_| MlaTensor { shape: shape.clone(), bytes: bytes.clone() }).collect())
-        }
-        MlaOperand::QB | MlaOperand::Gate => {
-            let (leaf, width, input) = if operand == MlaOperand::QB {
-                ("q_b_proj", qdim, cfg.q_lora_rank)
-            } else { ("g_proj", cfg.v_head_dim, hidden) };
-            let bytes = load(leaf, &[heads * width, input])?;
-            let share = bytes.len() / ranks;
-            Ok((0..ranks).map(|rank| MlaTensor { shape: vec![local * width, input],
-                bytes: bytes[rank * share..(rank + 1) * share].to_vec() }).collect())
-        }
-        MlaOperand::Output => {
-            let bytes = load("o_proj", &[hidden, heads * cfg.v_head_dim])?;
-            let row_bytes = heads * cfg.v_head_dim * 2;
-            let share = row_bytes / ranks;
-            Ok((0..ranks).map(|rank| MlaTensor { shape: vec![hidden, local * cfg.v_head_dim],
-                bytes: bytes.chunks_exact(row_bytes)
-                    .flat_map(|row| row[rank * share..(rank + 1) * share].iter().copied()).collect() }).collect())
-        }
-        MlaOperand::Uk | MlaOperand::Uv => {
-            let bytes = load("kv_b_proj", &[heads * vdim, kv])?;
-            let shape = if operand == MlaOperand::Uk { vec![local, kv, cfg.qk_nope_dim] }
-                else { vec![local, cfg.v_head_dim, kv] };
-            let mut result = Vec::with_capacity(ranks);
-            for rank in 0..ranks {
-                let mut packed = Vec::with_capacity(extent(&shape)?);
-                for head in rank * local..(rank + 1) * local {
-                    if operand == MlaOperand::Uk {
-                        for k in 0..kv {
-                            for d in 0..cfg.qk_nope_dim {
-                                let at = ((head * vdim + d) * kv + k) * 2;
-                                packed.extend_from_slice(&bytes[at..at + 2]);
-                            }
-                        }
-                    } else {
-                        let start = (head * vdim + cfg.qk_nope_dim) * kv * 2;
-                        packed.extend_from_slice(&bytes[start..start + cfg.v_head_dim * kv * 2]);
-                    }
-                }
-                result.push(MlaTensor { shape: shape.clone(), bytes: packed });
-            }
-            Ok(result)
-        }
-    }
+    let geometry = MlaGeometry { hidden: cfg.hidden, heads: cfg.heads, q_rank: cfg.q_lora_rank,
+        kv_rank: cfg.kv_lora_rank, nope: cfg.qk_nope_dim, rope: cfg.qk_rope_dim, value: cfg.v_head_dim };
+    mla::pack(&geometry, &format!("language_model.model.layers.{layer}.self_attn"), true, operand, ranks, read)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cuteafd_core::{TensorInfo, TensorRole};
+    use cuteafd_core::{DType, TensorInfo, TensorRole};
 
     fn cfg() -> KimiK3Config {
         let mut cfg = KimiK3Config::from_hf(&crate::plan::testing::kimi_k3_config()).unwrap();
@@ -191,6 +85,27 @@ mod tests {
         let all = pack(&cfg, 3, MlaOperand::Uk, 1, tensor).unwrap();
         assert_eq!(all[0].shape, [4, 2, 2]);
     }
+    #[test]
+    fn draft_and_target_share_packing_without_reading_a_gate_or_borrowed_weights() {
+        let cfg = cfg();
+        let geometry = MlaGeometry { hidden: cfg.hidden, heads: cfg.heads, q_rank: cfg.q_lora_rank,
+            kv_rank: cfg.kv_lora_rank, nope: cfg.qk_nope_dim, rope: cfg.qk_rope_dim, value: cfg.v_head_dim };
+        for operand in [MlaOperand::QkvA, MlaOperand::QNorm, MlaOperand::KvNorm, MlaOperand::QB,
+            MlaOperand::Uk, MlaOperand::Uv, MlaOperand::Output] {
+            let expected = pack(&cfg, 3, operand, 1, tensor).unwrap();
+            let mut reads = Vec::new();
+            let draft = mla::pack(&geometry, "layers.2.self_attn", false, operand, 1, |name| {
+                reads.push(name.to_owned());
+                tensor(&name.replace("layers.2.self_attn", "language_model.model.layers.3.self_attn"))
+            }).unwrap();
+            assert_eq!(draft, expected);
+            assert!(reads.iter().all(|name| name.starts_with("layers.2.self_attn.")
+                && !name.contains("g_proj") && !name.contains("embed_tokens") && !name.contains("lm_head")));
+        }
+        assert!(mla::pack(&geometry, "layers.2.self_attn", false, MlaOperand::Gate, 1, |_| unreachable!()).is_err());
+        assert!(mla::pack(&geometry, "", false, MlaOperand::QB, 1, |_| unreachable!()).is_err());
+    }
+
     #[test]
     fn overflow_refuses_before_checkpoint_reads() {
         for field in 0..7 {

@@ -23,6 +23,7 @@ pub const GLMF_REVISION: &str = "a7e7d1b4d82329acebe54ca88dc71d47d0d2056d";
 pub const GLMF_CONFIG: &str = "glm5_flash-v2_20261005_bf16root";
 pub const QWEN_REVISION: &str = "3e0ccef6cff461baf39ba838627edd93cb687be4";
 pub const QWEN_CONFIG: &str = "qwen4-v2_20261005_fp8";
+pub const QWEN_MANIFEST_SHA256: &str = "0d544ab679c2ff78383b3915cc453df912f8c5cfe3ffaa4ac245fd75e370a33b";
 pub const V4FLASH_REVISION: &str = "de92b14a7dabecd4d5dd4f7c799920842a5c3834";
 pub const V4FLASH_CONFIG: &str = "deepseek_v4-v2_20261005_v4flash";
 pub const GLM_REVISION: &str = "581cdf3b5ee5a63dd5a7726b9d33ea16cf105b0d";
@@ -64,6 +65,9 @@ pub const STANDARD_SPLIT_SHA256: &str = "2af36f78359d9ce7f37d0d2d4740c57ca11f0a7
 pub const STANDARD_FALLBACK: &str = "decode only; prefill not admitted";
 // Window ids, positions and blocks are model-independent; buckets/gen rows depend on tokenization/generations.
 const STANDARD_BUCKET_DIFF_MAX: i32 = 3;
+/// Scored generated rows each standard half needs to load (TJ, 2026-10-20).
+/// Every published set clears it; new sets are packaged against 10,000.
+pub const STANDARD_GENERATED_MIN: usize = 6_500;
 
 /// Sealed after balancing all seven published text sets, not sampled at runtime.
 /// Each half has A/B/C/D/E counts 13/6/5/3/5. The singleton legacy anchor
@@ -120,8 +124,11 @@ pub fn standard_windows(reference: &Reference, path: &str, admitted: bool) -> Re
         }
         ensure!(blocks == BTreeMap::from([("A",13), ("B",6), ("C",5), ("D",3), ("E",5)]),
             "standard-v2 block stratification differs");
-        ensure!(roles.get("ctx").copied().unwrap_or(0) > 0 && roles.get("gen").copied().unwrap_or(0) > 0,
+        ensure!(roles.get("ctx").copied().unwrap_or(0) > 0,
             "standard-v2 requires context and generated rows in each half");
+        let generated = roles.get("gen").copied().unwrap_or(0);
+        ensure!(generated >= STANDARD_GENERATED_MIN,
+            "standard-v2 half has {generated} scored generated rows, under {STANDARD_GENERATED_MIN}");
         buckets.push(counts);
     }
     ensure!(buckets[0].keys().chain(buckets[1].keys()).all(|k|
@@ -167,6 +174,19 @@ pub fn same_base_checkpoint(reference: &str, served: &str) -> bool {
 }
 
 pub fn default_publication(model: &str) -> Option<(&'static str, &'static str)> {
+    default_publication_in(model, &crate::fidelity_match::hub())
+}
+
+fn default_publication_in(model: &str, hub: &Path) -> Option<(&'static str, &'static str)> {
+    named_publication(model).or_else(|| {
+        let resolved = crate::fidelity_match::resolve_in(model, None, hub).ok()?;
+        let publication = crate::fidelity_match::official(&resolved.reference_root)?;
+        Some((publication.revision, publication.config))
+    })
+}
+
+// Resolver name checks must not recurse into the ancestry fallback.
+pub(crate) fn named_publication(model: &str) -> Option<(&'static str, &'static str)> {
     if let Some(p) = crate::fidelity_match::official(model) { return Some((p.revision, p.config)); }
     match base_model(model) {
         Some("Qwen3.8-Flash-Next") => return Some((QWEN_REVISION, QWEN_CONFIG)),
@@ -293,7 +313,8 @@ pub fn download(agent: &ureq::Agent, cache: &Path, repo: &str, commit: &str, con
         manifest["qualification_sha256"].as_str().context("qualification hash")?)?)?;
     let label = qualification_label(&qualification, &manifest)?;
     Ok((reference, digest(&bytes), json!({"repository":repo,"revision":commit,"config":config,
-        "qualification":label,"text_checkpoint":manifest.get("text_checkpoint").unwrap_or(&manifest["checkpoint"])})))
+        "qualification":label,"root_checkpoint":manifest["root_checkpoint"],
+        "text_checkpoint":manifest.get("text_checkpoint").unwrap_or(&manifest["checkpoint"])})))
 }
 
 fn tensor<'a>(bytes: &'a [u8], name: &str, dtype: &str, shape: &[usize]) -> Result<&'a [u8]> {
@@ -483,6 +504,34 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn cached_publication_fallback_rejects_speculators_and_invalid_ancestry() {
+        let hub = tempfile::tempdir().unwrap();
+        let models = [
+            ("RedHatAI/GLM-5.3-Flash-speculator.dspark-preview",
+                json!({"architectures":["DSparkDraftModel"]}),
+                "base_model: zai-org/GLM-5.3-Flash\nbase_model_relation: quantized", false),
+            ("test/local-quant", json!({"architectures":["GlmMoeDsaForCausalLM"]}),
+                "base_model: zai-org/GLM-5.3-Flash\nbase_model_relation: quantized", true),
+            ("test/local-finetune", json!({"architectures":["GlmMoeDsaForCausalLM"]}),
+                "base_model: zai-org/GLM-5.3-Flash\nbase_model_relation: finetune", false),
+            ("test/local-merge", json!({"architectures":["GlmMoeDsaForCausalLM"]}),
+                "base_model: [zai-org/GLM-5.3-Flash, Qwen/Qwen3.8-Flash-Next]\nbase_model_relation: merge", false),
+        ];
+        for (model, config, card, accepted) in models {
+            let path = hub.path().join(format!("models--{}", model.replace('/', "--")))
+                .join("snapshots/abcdef");
+            std::fs::create_dir_all(&path).unwrap();
+            std::fs::write(path.join("config.json"), config.to_string()).unwrap();
+            std::fs::write(path.join("README.md"), format!("---\n{card}\n---\n")).unwrap();
+            assert!(crate::fidelity_match::lineage_in(model, None, hub.path())
+                .iter().any(|ancestor| ancestor == "zai-org/GLM-5.3-Flash"));
+            assert_eq!(default_publication_in(model, hub.path()),
+                accepted.then_some((GLMF_REVISION, GLMF_CONFIG)), "{model}");
+        }
+        assert_eq!(default_publication_in("test/not-cached", hub.path()), None);
+    }
 
     fn kimi_reference_qualification() -> (Value, Value) {
         let revision = "a".repeat(40);
@@ -751,6 +800,17 @@ mod tests {
         }
         assert!(standard_windows(&reference,"decode",true).is_ok());
         assert!(standard_windows(&reference,"prefill",true).is_ok());
+        // The decode half has 8,998 scored generated rows; keep exactly the floor, then one fewer.
+        for keep in [STANDARD_GENERATED_MIN, STANDARD_GENERATED_MIN - 1] {
+            reference = saved.clone();
+            let mut excess = 8998 - keep;
+            for w in reference.windows.iter_mut().filter(|w| STANDARD_DECODE.contains(&w.id.as_str())) {
+                for pos in w.positions.iter().map(|p| p.pos).collect::<Vec<_>>() {
+                    if excess > 0 && w.roles[pos] == "gen" { w.roles[pos] = "ctx".into(); excess -= 1; }
+                }
+            }
+            assert_eq!(standard_windows(&reference,"decode",true).is_ok(), keep == STANDARD_GENERATED_MIN, "{keep}");
+        }
         reference = saved;
         for w in &mut reference.windows {
             if STANDARD_DECODE.contains(&w.id.as_str()) { w.bucket = "2-8K".into(); }

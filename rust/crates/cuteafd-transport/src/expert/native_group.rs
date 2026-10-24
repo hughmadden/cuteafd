@@ -60,7 +60,7 @@ const WORD_MASK: u32 = 0xfff;
 
 /// Validated native Spark `TP×EP` topology.
 ///
-/// Pure TP accepts every degree in 1..=6; replicated groups retain the
+/// Pure TP accepts every degree in 1..=8; replicated groups retain the
 /// qualified `TP2EP2`, `TP3EP2` and `TP2EP3` layouts. `TP×EP` is the physical
 /// rank count, with no dummy ranks. Package/fit admission is a separate gate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -186,9 +186,11 @@ impl SparkTopology {
             // New pure-TP worlds reserve eight IDs each, above every legacy
             // namespace. Existing workers retain their exact executor identity.
             (5, 1) => Ok(104),
+            (7, 1) => Ok(120),
+            (8, 1) => Ok(128),
             (tp, ep) => bail!(
                 "unsupported native Spark TP×EP topology TP{tp}EP{ep}: \
-                 supported are TP1..TP6 with EP1, TP2EP2, TP3EP2 and TP2EP3"
+                 supported are TP1..TP8 with EP1, TP2EP2, TP3EP2 and TP2EP3"
             ),
         }
     }
@@ -370,11 +372,11 @@ mod tests {
     ];
 
     #[test]
-    fn pure_tp_one_through_six_have_disjoint_executor_namespaces() -> Result<()> {
+    fn pure_tp_one_through_eight_have_disjoint_executor_namespaces() -> Result<()> {
         let mut ids = BTreeSet::new();
-        for world in 1..=6 {
-            let topology = SparkTopology::new(world, 1)?;
-            assert_eq!(topology.world_size(), usize::from(world));
+        for world in 1..=cuteafd_core::MAX_SPARK_WORLD {
+            let topology = SparkTopology::new(world as u8, 1)?;
+            assert_eq!(topology.world_size(), world);
             for rank in 0..topology.world_size() {
                 let id = topology.executor_id(rank)?;
                 assert!(ids.insert(id), "executor namespace overlaps at {id}");
@@ -386,7 +388,7 @@ mod tests {
                          SparkTopology::NATIVE_TP2_EP3] {
             for id in topology.executor_ids() { assert!(ids.insert(id)); }
         }
-        for tp in [7, 8, 9] { assert!(SparkTopology::new(tp, 1).is_err()); }
+        for tp in [9, u8::MAX] { assert!(SparkTopology::new(tp, 1).is_err()); }
         Ok(())
     }
 
@@ -837,9 +839,9 @@ mod tests {
     }
 
     #[test]
-    fn pure_tp_one_through_six_rejects_stale_and_foreign_responses() -> Result<()> {
-        for world in 1..=6 {
-            let topology = SparkTopology::new(world, 1)?;
+    fn pure_tp_one_through_eight_rejects_stale_and_foreign_responses() -> Result<()> {
+        for world in 1..=cuteafd_core::MAX_SPARK_WORLD {
+            let topology = SparkTopology::new(world as u8, 1)?;
             let owners = owners_for(topology);
             let request = native_request(2, topology, &owners)?;
             let frame = request.encode()?;
@@ -850,12 +852,12 @@ mod tests {
             let mut stale = native.response(executors[0], &payload)?.to_owned()?;
             stale.header.request_id += 1;
             assert!(receiver.push(&stale.encode()?, |_, _, _| panic!("stale response")).is_err());
-            for other_world in (1..=6).filter(|other| *other != world) {
-                let foreign_id = SparkTopology::new(other_world, 1)?.executor_id(0)?;
+            for other_world in (1..=cuteafd_core::MAX_SPARK_WORLD).filter(|other| *other != world) {
+                let foreign_id = SparkTopology::new(other_world as u8, 1)?.executor_id(0)?;
                 let response = native.response(foreign_id, &payload)?.to_owned()?.encode()?;
                 assert!(receiver.push(&response, |_, _, _| panic!("foreign topology")).is_err());
             }
-            for rank in (0..usize::from(world)).rev() {
+            for rank in (0..world).rev() {
                 let response = native.response(executors[rank], &payload)?.to_owned()?.encode()?;
                 receiver.push(&response, |actual, start, bytes| {
                     assert_eq!((actual, start), (rank, 0));
@@ -865,7 +867,7 @@ mod tests {
                 assert!(receiver.push(&response, |_, _, _| panic!("duplicate response")).is_err());
                 assert_eq!(receiver.complete(), rank == 0);
             }
-            assert_eq!(receiver.received_rows_slice(), vec![2; usize::from(world)]);
+            assert_eq!(receiver.received_rows_slice(), vec![2; world]);
         }
         Ok(())
     }
@@ -1033,9 +1035,9 @@ mod tests {
         assert_eq!(three.world_size(), 3);
         assert_eq!(three.ownership_topology(), None);
 
-        for world in 1..=6 {
+        for world in 1..=cuteafd_core::MAX_SPARK_WORLD {
             let topology = SparkTopology::new(world as u8, 1)?;
-            if !matches!(world, 1 | 5) {
+            if matches!(world, 2 | 3 | 4 | 6) {
                 let client = SparkExperts::new_world(crate::expert::SparkWorld::owned(topology)?, &peers[..world], 80, config.clone())?;
                 assert_eq!(client.world_size(), world);
             }

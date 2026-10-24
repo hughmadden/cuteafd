@@ -5,6 +5,7 @@ pub(crate) mod speculative;
 pub(crate) mod scheduler;
 pub(crate) mod console;
 mod distributed;
+mod coordinator_push;
 pub(crate) mod scores;
 use scores::RetainedScores;
 pub(crate) mod prefix;
@@ -132,14 +133,14 @@ fn start(mut args: crate::cli::NativeServeArgs, http: bool) -> Result<Started> {
         Ok(report) => tracing::info!(target: "cuteafd::fabric", rails = report.rails.use_rails, "{}", report.summary()),
         Err(error) => tracing::warn!(target: "cuteafd::fabric", "fabric discovery failed: {error:#}"),
     }
-    let topology = crate::shared::spark_topology::resolve(
+    crate::shared::spark_topology::resolve(
         args.spark_tp,
         args.spark_ep,
         args.peers.len(),
         "serve-native",
     )?;
-    ensure!(topology.is_some() || matches!(args.peers.len(), 2 | 3 | 4 | 6),
-        "unsupported V4.1 Spark count {}; supported counts: 2, 3, 4, 6", args.peers.len());
+    ensure!((1..=8).contains(&args.peers.len()),
+        "V4.1 Spark transport requires 1..=8 peers, got {}", args.peers.len());
     if args.pool_tokens == Some(0) && args.memory_reservation.is_none() {
         args.memory_reservation = Some("97%".parse()?);
     }
@@ -465,6 +466,10 @@ fn worker(
     admission::startup_phase(&lib, "v41/transport", device_total)?;
     pass.install_attention_plan(attention_plan)?;
     prefill_pass.install_attention_plan(attention_plan)?;
+    if let Some(budget) = args.l2.budget(&lib, crate::shared::l2_prefetch::OTHER_DEFAULT)? {
+        pass.enable_l2_prefetch(budget)?;
+        prefill_pass.enable_l2_prefetch(budget)?;
+    }
     let exl3_tiers: &[usize] = catalog.exl3().map(|m| m.decoder_tiers()).unwrap_or(&[]);
     let draft_free_before = if small_card { lib.cuda_memory_info()?.0 } else { 0 };
     let draft_weights = if args.dspark {

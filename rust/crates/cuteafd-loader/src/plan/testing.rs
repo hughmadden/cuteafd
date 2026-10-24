@@ -1,10 +1,62 @@
 //! Checkpoint fixtures for planner tests (this crate's and the daemon's CLI
 //! tests): headers with the real geometry of each family over sparse,
 //! all-zero payloads, so a fixture costs no disk.
+pub mod exlr8;
+
 use serde_json::{json, Value};
 use std::fs;
 use std::io::Write;
 use std::path::Path;
+
+/// Tiny native TikToken snapshot, deliberately without tokenizer.json.
+pub fn write_kimi_tokenizer(snapshot: &Path) {
+    use base64::Engine;
+    let ranks = (0..=255u8).map(|byte| format!("{} {byte}\n",
+        base64::engine::general_purpose::STANDARD.encode([byte]))).collect::<String>();
+    fs::write(snapshot.join("tiktoken.model"), ranks).unwrap();
+    fs::write(snapshot.join("tokenization_kimi.py"), format!("{}\nnum_reserved_special_tokens = 256\n",
+        crate::tokenizer::tiktoken::KIMI_PATTERN.join("\n"))).unwrap();
+    fs::write(snapshot.join("tokenizer_config.json"), json!({"added_tokens_decoder": {
+        "256": {"content": "<|open|>"}, "257": {"content": "<|end_of_msg|>"}
+    }}).to_string()).unwrap();
+}
+
+/// Real Kimi geometry with one sparse shard per layer, below the header limit.
+pub fn write_kimi_snapshot(dir: &Path, all: bool) {
+    write_kimi_tensors(dir, kimi_k3_tensors(all));
+}
+
+/// Sparse K6 header fixture only, not a numerically quantized checkpoint.
+/// The payload is intentionally unsuitable for layer-forward qualification.
+pub fn write_kimi_core_snapshot(dir: &Path, all: bool) {
+    let mut tensors = Vec::new();
+    for tensor in kimi_k3_tensors(all) {
+        if let Some(stem) = tensor.0.strip_suffix(".weight").filter(|stem|
+            crate::families::kimi_k3::core::split(stem).is_some()) {
+            let n = if stem.ends_with(".kv_a_proj_with_mqa") { tensor.2[0].next_multiple_of(128) } else { tensor.2[0] };
+            tensors.extend(exl3(stem, n, tensor.2[1], 6));
+        } else { tensors.push(tensor); }
+    }
+    write_kimi_tensors(dir, tensors);
+}
+
+fn write_kimi_tensors(dir: &Path, tensors: Vec<Tensor>) {
+    let mut shards = std::collections::BTreeMap::<usize, Vec<Tensor>>::new();
+    for tensor in tensors {
+        let shard = tensor.0.split(".layers.").nth(1)
+            .and_then(|tail| tail.split('.').next())
+            .and_then(|layer| layer.parse::<usize>().ok()).map_or(0, |layer| layer + 1);
+        shards.entry(shard).or_default().push(tensor);
+    }
+    let mut weight_map = serde_json::Map::new();
+    for (index, tensors) in shards {
+        let file = format!("model-{index:05}.safetensors");
+        write_safetensors(&dir.join(&file), &tensors);
+        for (name, ..) in tensors { weight_map.insert(name, Value::String(file.clone())); }
+    }
+    fs::write(dir.join("config.json"), kimi_k3_config().to_string()).unwrap();
+    fs::write(dir.join("model.safetensors.index.json"), json!({"weight_map":weight_map}).to_string()).unwrap();
+}
 
 /// (name, safetensors dtype, shape).
 pub type Tensor = (String, &'static str, Vec<usize>);
@@ -747,4 +799,134 @@ pub fn kimi_k3_config() -> Value {
         "text_config": text,
         "vision_config": {"vt_num_hidden_layers": 27},
     })
+}
+
+/// Release tensor headers. Only routed layer 1 includes experts unless `all`.
+pub fn kimi_k3_tensors(all: bool) -> Vec<Tensor> {
+    use crate::families::kimi_k3::config::{KimiAttention, KimiK3Config};
+    let cfg = KimiK3Config::from_hf(&kimi_k3_config()).unwrap();
+    let mut out = Vec::new();
+    let p = "language_model.model.";
+    out.push(t(format!("{p}embed_tokens.weight"), "BF16", &[163840, 7168]));
+    out.push(t("language_model.lm_head.weight", "BF16", &[163840, 7168]));
+    for name in ["norm", "output_attn_res_norm"] { out.push(t(format!("{p}{name}.weight"), "BF16", &[7168])); }
+    out.push(t(format!("{p}output_attn_res_proj.weight"), "BF16", &[1, 7168]));
+    for layer in 0..93 {
+        let b = format!("{p}layers.{layer}");
+        for n in ["input_layernorm", "post_attention_layernorm", "self_attention_res_norm", "mlp_res_norm"] {
+            out.push(t(format!("{b}.{n}.weight"), "BF16", &[7168]));
+        }
+        for n in ["self_attention_res_proj", "mlp_res_proj"] { out.push(t(format!("{b}.{n}.weight"), "BF16", &[1, 7168])); }
+        let a = format!("{b}.self_attn");
+        out.push(t(format!("{a}.g_proj.weight"), "BF16", &[12288, 7168]));
+        out.push(t(format!("{a}.o_proj.weight"), "BF16", &[7168, 12288]));
+        if cfg.attention[layer] == KimiAttention::Kda {
+            for proj in ["q", "k", "v"] {
+                out.push(t(format!("{a}.{proj}_proj.weight"), "BF16", &[12288, 7168]));
+                out.push(t(format!("{a}.{proj}_conv1d.weight"), "F32", &[12288, 1, 4]));
+            }
+            out.push(t(format!("{a}.f_a_proj.weight"), "BF16", &[128, 7168]));
+            out.push(t(format!("{a}.f_b_proj.weight"), "BF16", &[12288, 128]));
+            out.push(t(format!("{a}.b_proj.weight"), "BF16", &[96, 7168]));
+            out.push(t(format!("{a}.A_log"), "F32", &[128]));
+            out.push(t(format!("{a}.dt_bias"), "F32", &[12288]));
+            out.push(t(format!("{a}.o_norm.weight"), "F32", &[128]));
+        } else {
+            out.push(t(format!("{a}.q_a_proj.weight"), "BF16", &[1536, 7168]));
+            out.push(t(format!("{a}.q_a_layernorm.weight"), "BF16", &[1536]));
+            out.push(t(format!("{a}.q_b_proj.weight"), "BF16", &[18432, 1536]));
+            out.push(t(format!("{a}.kv_a_proj_with_mqa.weight"), "BF16", &[576, 7168]));
+            out.push(t(format!("{a}.kv_a_layernorm.weight"), "BF16", &[512]));
+            out.push(t(format!("{a}.kv_b_proj.weight"), "BF16", &[24576, 512]));
+        }
+        if layer == 0 {
+            for (proj, n, k) in [("gate", 33792, 7168), ("up", 33792, 7168), ("down", 7168, 33792)] {
+                out.push(t(format!("{b}.mlp.{proj}_proj.weight"), "BF16", &[n, k]));
+            }
+            continue;
+        }
+        let m = format!("{b}.block_sparse_moe");
+        out.push(t(format!("{m}.gate.weight"), "BF16", &[896, 7168]));
+        out.push(t(format!("{m}.gate.e_score_correction_bias"), "F32", &[896]));
+        out.push(t(format!("{m}.routed_expert_down_proj.weight"), "BF16", &[3584, 7168]));
+        out.push(t(format!("{m}.routed_expert_up_proj.weight"), "BF16", &[7168, 3584]));
+        out.push(t(format!("{m}.routed_expert_norm.weight"), "BF16", &[3584]));
+        for (proj, n, k) in [("gate", 6144, 7168), ("up", 6144, 7168), ("down", 7168, 6144)] {
+            out.push(t(format!("{m}.shared_experts.{proj}_proj.weight"), "BF16", &[n, k]));
+        }
+        if all || layer == 1 {
+            for e in 0..896 {
+                for (w, n, k) in [("w1", 3072, 3584), ("w3", 3072, 3584), ("w2", 3584, 3072)] {
+                    out.extend(exl3(&format!("{m}.experts.{e}.{w}"), n, k, 2));
+                }
+            }
+        }
+    }
+    out.push(t("vision_tower.encoder.blocks.0.wqkv.weight", "BF16", &[1536, 1024]));
+    out.push(t("mm_projector.proj.0.weight", "BF16", &[4096, 4096]));
+    out
+}
+
+/// CPU-only installed package fixture; no native objects are executed.
+pub fn write_kimi_installed_inventory(root: &std::path::Path, spark: bool) -> std::path::PathBuf {
+    use serde_json::json;
+    let lock: serde_json::Value = serde_json::from_str(include_str!(concat!(env!("CARGO_MANIFEST_DIR"),
+        "/../../../third_party/sparkinfer.lock.json"))).unwrap();
+    let revision = lock["revision"].as_str().unwrap();
+    let mut programs = Vec::new();
+    for (name, geometry) in [
+        ("kimik3_router_scores", json!({"hidden":7168,"experts":896,"top_k":16})),
+        ("kimik3_expert_input_quant", json!({"hidden":3584})),
+        ("kimik3_latent_down", json!({"width":7168,"outputs":3584})),
+        ("kimik3_latent_up", json!({"width":3584,"outputs":7168})),
+        ("kimik3_rmsnorm_h3584", json!({"hidden":3584})),
+    ] {
+        if !spark { programs.push(json!({"name":name,"geometry":geometry,"object_sha256":"b".repeat(64)})); }
+    }
+    if !spark {
+        for (name, bytes) in [("kimik3_kda_m64", 8_673_280), ("kimik3_kda_m4096", 629_464_064)] {
+            programs.push(json!({"name":name,"scratch_bytes_at_capacity":{"scratch":bytes}}));
+        }
+        for (suffix, producer, output, attention) in [("",92_798_976,100_663_296,50_528_256),
+            ("_h96",168_296_448,201_326_592,101_056_512)] {
+            for rows in [64,4096] {
+                for (prefix, bytes) in [("mla_producer",producer), ("mla_output",output)] {
+                    programs.push(json!({"name":format!("kimik3_{prefix}{suffix}_m{rows}"),
+                        "scratch_bytes_at_capacity":{"scratch":bytes}}));
+                }
+            }
+            for (mode, rows, bytes) in [("decode",64,attention),("verify",64,attention),("extend",4096,0)] {
+                programs.push(json!({"name":format!("kimik3_dense_mla_{mode}{suffix}_m{rows}"),
+                    "scratch_bytes_at_capacity":{"scratch":bytes}}));
+            }
+        }
+    }
+    std::fs::create_dir_all(root.join("share")).unwrap();
+    let path = root.join("share/PROGRAMS.json");
+    std::fs::write(&path, json!({"schema":1,"sparkinfer_revision":revision,"programs":programs}).to_string()).unwrap();
+    let package = root.join("lib/exl3/exl3-kimik3-k23");
+    let layouts = if spark { (0..6).map(|r| (format!("tp6-rank{r}"), 512)).collect::<Vec<_>>() }
+        else { vec![("rtx-tp1".into(), 3072), ("rtx-tp2".into(), 1536)] };
+    let mut variants = Vec::new();
+    for (layout, intermediate) in layouts {
+        for capacity in [1, 80, 256, 1024, 4096] {
+            let directory = format!("{layout}/m{capacity}");
+            let meta = json!({"directory":directory,"capacity":capacity,"intermediate":intermediate,
+                "experts":896,"top_k":16,"bits":[2,3],"output_dtype":if spark {"bf16"} else {"fp32"},
+                "hidden":3584,"activation":"situ","descriptor_bits":10,"sparkinfer_revision":revision,
+                "trellis_lut":{"bytes":4096},"buffers":{"scratch":{"allocation":"scratch",
+                    "bytes":capacity * 4096,"dtype":"f32","zero_on_create":false}}});
+            let target = package.join(&directory);
+            std::fs::create_dir_all(target.join("routes")).unwrap();
+            std::fs::write(target.join("v41_exl3.json"), meta.to_string()).unwrap();
+            for file in ["libcuteafd_exl3.so", "routes/libv41_exl3_routes.so", "trellis_lut.bin"] {
+                std::fs::write(target.join(file), []).unwrap();
+            }
+            variants.push(meta);
+        }
+    }
+    std::fs::write(package.join("manifest.json"), json!({"schema":"cuteafd.exl3-package.v1",
+        "geometry":"kimik3","role":if spark {"spark"} else {"coordinator"},
+        "sparkinfer_revision":revision,"variants":variants}).to_string()).unwrap();
+    path
 }

@@ -42,6 +42,12 @@ impl<T> DeferredAdmission<T> {
     /// queue. Permanent capacity failures and non-allocation errors return the
     /// job to the caller for its normal error handling.
     pub fn defer(&mut self, job: T, error: &PrefixError, busy: bool, release_epoch: u64) -> Result<(), T> {
+        if let PrefixError::DraftPages(pages) = error {
+            if pages.needed > pages.capacity { return Err(job); }
+            // Target-free counts cannot wake a different resource reliably. Every request
+            // retirement also advances the target release epoch; retry on that boundary.
+            return self.defer_until_release(job, busy, release_epoch);
+        }
         let PrefixError::Pages(pages) = error else { return Err(job) };
         if self.pending.is_some() || !busy || pages.needed > pages.capacity || pages.needed <= pages.free {
             return Err(job);
@@ -144,6 +150,17 @@ pub fn fit_output<E>(maximum: usize,
 mod tests {
     use super::*;
     use crate::prefix::{PoolExhausted, RefPagePool};
+
+    #[test]
+    fn draft_pressure_waits_for_retirement_not_target_free_counts() {
+        let mut waiter = DeferredAdmission::default();
+        let error = PrefixError::DraftPages(PoolExhausted { needed: 4, free: 2, capacity: 8 });
+        waiter.defer(7, &error, true, 19).unwrap();
+        assert!(matches!(waiter.poll(usize::MAX, 19, true, |_| false), AdmissionPoll::Blocked));
+        assert!(matches!(waiter.poll(0, 20, true, |_| false), AdmissionPoll::Ready(7)));
+        let permanent = PrefixError::DraftPages(PoolExhausted { needed: 9, free: 8, capacity: 8 });
+        assert_eq!(waiter.defer(8, &permanent, true, 20), Err(8));
+    }
 
     #[test]
     fn until_release_waits_for_epoch_progress_or_idle() {
