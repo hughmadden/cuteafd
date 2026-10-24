@@ -77,7 +77,7 @@ impl RuntimeSizing {
 pub const PROGRAM_NAMES: &[&str] = &[
     "norm", "q_norm_rope", "k_norm_rope", "index_q_norm_rope", "index_k_norm_rope",
     "rope", "scale_prep", "kv_split", "swiglu_i3072", "swiglu_i12288", "router_scores",
-    "route", "residual", "index_q_quant", "index_k_quant", "index_k_pack", "kv_pack",
+    "route", "residual", "index_q_quant", "index_k_pack", "kv_pack",
     "mxfp8_q", "mxfp8_kv", "mxfp8_o", "mxfp8_index_q", "mxfp8_index_k",
     "mxfp8_shared_gate_up", "mxfp8_shared_down", "mxfp8_dense_gate_up", "mxfp8_dense_down",
     "mxfp8_q_decode", "mxfp8_kv_decode", "mxfp8_index_q_decode", "mxfp8_index_k_decode",

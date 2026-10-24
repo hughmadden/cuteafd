@@ -7,7 +7,7 @@ use std::collections::BTreeMap;
 pub(super) struct Scratch<'a> { buffers: BTreeMap<&'static str, Buffer<'a>> }
 impl<'a> Scratch<'a> {
     pub fn new(device: Device<'a>, ledger: &RuntimeLedger) -> Result<Self> {
-        let buffers = ledger.allocations.iter().filter(|a| !matches!(a.name,"embedded"|"token_ids"|"cache_descales"|"prefix_tail"|"sampler"|"selector"|"spark_intake"))
+        let buffers = ledger.allocations.iter().filter(|a| !matches!(a.name,"embedded"|"token_ids"|"prefix_tail"|"sampler"|"selector"|"spark_intake"))
             .map(|a| Ok((a.name,Buffer::new(device.library,device.id,usize::try_from(a.bytes)?)?)))
             .collect::<Result<_>>()?;
         Ok(Self { buffers })
