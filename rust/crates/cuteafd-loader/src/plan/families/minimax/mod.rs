@@ -258,12 +258,14 @@ impl Family for MiniMaxM3 {
             Component::Attention | Component::Indexer => Some(Hint {
                 what: "MiniMax M3 native MSA execution awaits device qualification".into(),
                 how: "Use the matching MiniMax PROGRAMS.json for single-device WIP admission; serving uses FP8 K/V planes, \
-                    8448-byte index pages and causal paged tiles. Qualify real-weight numerics and cache replay before release.".into(),
+                    8448-byte index pages, paged decode tiles and the index-prefill and attention-extend kernels for prefill. \
+                    Qualify real-weight numerics and cache replay before release.".into(),
             }),
             Component::RoutedExpert => Some(Hint {
                 what: "MiniMax M3 native NVFP4 W4A4 expert execution awaits device qualification".into(),
-                how: "Install fp8-minimax-nvfp4a4 with SwiGLU-OAI activation code 3; use mount loading for divisor scales, \
-                    Spark TP2/TP3/TP4 and TP1 for onboarded bottom routed layers. Push loading is unsupported.".into(),
+                how: "Install fp8-minimax-nvfp4a4 with SwiGLU-OAI activation code 3: Spark TP2/TP3/TP4, and TP1 for onboarded \
+                    bottom routed layers. Compressed-tensors divisor scales load from mounted checkpoints (push images copy \
+                    scales unchanged).".into(),
             }),
             Component::Vision => Some(Hint {
                 what: "MiniMax M3 images and video run through the bundled tower on the RTX or a Spark rank".into(),

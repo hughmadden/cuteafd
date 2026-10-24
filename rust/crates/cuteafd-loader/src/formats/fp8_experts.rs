@@ -140,6 +140,13 @@ fn alpha_name(weight: &str) -> String {
     } else { format!("{weight}_scale_2") }
 }
 
+/// Whether a `quantization_config` declares its routed experts in compressed-tensors NVFP4 W4A4
+/// with 16-element groups (`nvfp4-pack-quantized`: `weight_packed` codes and divisor global scales).
+fn declares_packed_nvfp4_experts(quantization: &serde_json::Value) -> bool {
+    quantization["moe_quant_algo"] == "NVFP4" && quantization["moe_quant_format"] == "nvfp4-pack-quantized"
+        && quantization["group_size"] == 16
+}
+
 /// Where every routed FP8 expert tensor lives in the snapshot.
 #[derive(Debug, Clone)]
 pub struct Fp8ExpertTensors {
@@ -411,10 +418,8 @@ impl Fp8ExpertTensors {
             use crate::plan::checkpoint::ModuleNumerics;
             let source = source_names.get(name).map(String::as_str).unwrap_or(name);
             if name.ends_with(".weight_packed") {
-                let q = &checkpoint.config["quantization_config"];
-                ensure!(checkpoint.model_type() == Some("minimax_m3_vl") && q["moe_quant_algo"] == "NVFP4"
-                    && q["moe_quant_format"] == "nvfp4-pack-quantized" && q["group_size"] == 16,
-                    "{name}: MiniMax packed experts require declared NVFP4 W4A4 with K16 divisor scales");
+                ensure!(checkpoint.quantization().is_some_and(declares_packed_nvfp4_experts),
+                    "{name}: compressed-tensors packed experts require declared NVFP4 W4A4 with K16 divisor scales");
                 ensure!(catalog.tensors.contains_key(&alpha_name(name))
                     && catalog.tensors.contains_key(&input_scale_name(name)),
                     "{name}: declared NVFP4 W4A4 needs weight_global_scale and input_global_scale divisors");
