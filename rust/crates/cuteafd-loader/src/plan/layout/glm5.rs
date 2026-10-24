@@ -71,6 +71,10 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyMod
     if options.host_embedding {
         place_host_embedding(report, checkpoint, &mut devices, &mut waste, &mut notes);
     }
+    if options.variant_table_bytes > 0 {
+        devices[0].items.push(Item::new(Category::Weights, "weight variant tables", "packed FP32 A/B + I32 ranks",
+            options.variant_table_bytes, Basis::Formula));
+    }
     for (index, device) in devices.iter_mut().take(ranks).enumerate() {
         device.items.push(runtime_item(shape.manifest.as_ref(), &program_families("glm", split),
             local_package(report), split, index, options.rtx_bytes[index]));
@@ -598,6 +602,31 @@ mod tests {
             assert!(native_layout(&checkpoint, &options, &vec![256; gpus], 256, 4, &manifest).is_err());
             assert!(native_layout(&checkpoint, &options, &[], 256, 4, &manifest).is_err());
         }
+    }
+
+    #[test]
+    fn variant_tables_are_charged_before_placement_and_can_exhaust_admission() {
+        use crate::plan::{PlanInput, PlanOptions, ExpertPlacement};
+        let dir = tempfile::tempdir().unwrap();
+        write_snapshot(dir.path(), &glm5_config(), &glm5_tensors(|n,r,k| fp8(n,r,k,None)), None);
+        let input = PlanInput::open(dir.path()).unwrap();
+        let manifest = dir.path().join("PROGRAMS.json");
+        std::fs::write(&manifest, native_manifest().to_string()).unwrap();
+        let mut options = PlanOptions { placement: ExpertPlacement::Sparks { ranks:6 },
+            layout: Some(LayoutOptions { rtx_bytes:vec![96<<30],workspace_manifest:Some(manifest),context_tokens:65536,
+                onboard:Some(crate::placement::Onboard::Layers(0)),glm5_drafter_disabled:true,
+                host_memory:Some((128<<30,128<<30)),host_cache_bytes:Some(0),..Default::default() }),..Default::default() };
+        let base = input.plan(&options).unwrap();
+        assert!(base.solver_placement.is_some(), "{:#?}", base.hints);
+        // Deliberately consume the full card: printed-only accounting would
+        // still select the original nonempty KV pool and report a valid fit.
+        options.layout.as_mut().unwrap().variant_table_bytes = 96<<30;
+        let charged = input.plan(&options).unwrap();
+        let memory = charged.memory_layout.as_ref().unwrap();
+        let item = memory.devices[0].items.iter().find(|i| i.group == "weight variant tables").unwrap();
+        assert_eq!(item.bytes,96<<30);
+        assert!(!charged.placement_supported);
+        assert!(charged.solver_placement.is_none());
     }
 
     #[test]

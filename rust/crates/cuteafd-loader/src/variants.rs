@@ -469,23 +469,47 @@ pub fn f16_to_f32(bits: u16) -> f32 {
 #[derive(Debug, Clone, Default)]
 pub struct TensorSource {
     tensors: BTreeMap<String, (PathBuf, crate::SafetensorsTensorMetadata)>,
+    /// Metadata belongs to each source, never borrowed from the served base.
+    quantization: BTreeMap<PathBuf, Vec<serde_json::Value>>,
 }
+
+#[derive(Debug, thiserror::Error)]
+pub enum TensorSourceError {
+    #[error("tensor {tensor}: {reason}")]
+    Invalid { tensor: String, reason: String },
+    #[error("tensor {tensor}: unsupported FP8 block layout: {reason}")]
+    Fp8Layout { tensor: String, reason: String },
+}
+
+fn source_error(name: &str, reason: impl Into<String>) -> anyhow::Error {
+    TensorSourceError::Invalid { tensor: name.into(), reason: reason.into() }.into()
+}
+
 impl TensorSource {
     /// Every tensor of the given safetensors files (no index needed).
     pub fn from_files(files: impl IntoIterator<Item = PathBuf>) -> Result<Self> {
         let mut tensors = BTreeMap::new();
+        let mut quantization = BTreeMap::new();
+        let mut directories = BTreeMap::new();
         for path in files {
+            let directory = path.parent().unwrap_or_else(|| Path::new("."));
+            if !directories.contains_key(directory) {
+                directories.insert(directory.to_path_buf(), crate::plan::checkpoint::read_quantization_configs(directory)?);
+            }
+            quantization.insert(path.clone(), directories[directory].clone());
             for meta in crate::read_safetensors_metadata(&path)? {
+                ensure!(!tensors.contains_key(&meta.name), "duplicate tensor {} in source files", meta.name);
                 tensors.insert(meta.name.clone(), (path.clone(), meta));
             }
         }
-        Ok(Self { tensors })
+        Ok(Self { tensors, quantization })
     }
     /// The headers a role read with `Checkpoint::open_for_role`.
     pub fn from_checkpoint(checkpoint: &crate::plan::checkpoint::Checkpoint) -> Self {
         let tensors = checkpoint.tensors.iter()
             .map(|t| (t.meta.name.clone(), (checkpoint.snapshot.join(&t.shard), t.meta.clone()))).collect();
-        Self { tensors }
+        let quantization = checkpoint.tensors.iter().map(|t| (checkpoint.snapshot.join(&t.shard), checkpoint.quantizations().cloned().collect())).collect();
+        Self { tensors, quantization }
     }
     pub fn contains(&self, name: &str) -> bool { self.tensors.contains_key(name) }
     pub fn names(&self) -> impl Iterator<Item = &str> { self.tensors.keys().map(String::as_str) }
@@ -493,6 +517,17 @@ impl TensorSource {
 
     fn bytes(&self, name: &str) -> Result<(Vec<u8>, &crate::SafetensorsTensorMetadata)> {
         let (path, meta) = self.tensors.get(name).with_context(|| format!("tensor {name} is not in this source"))?;
+        let count = meta.shape.iter().try_fold(1usize, |n, &dim| n.checked_mul(dim))
+            .ok_or_else(|| source_error(name, "shape element count overflows usize"))?;
+        let width = match meta.dtype {
+            DType::F32 => 4, DType::Bf16 | DType::F16 => 2,
+            DType::F8E4M3 | DType::F8E8M0 | DType::U8 => 1,
+            ref dtype => return Err(source_error(name, format!("unsupported source dtype {dtype:?}"))),
+        };
+        let expected = count.checked_mul(width).ok_or_else(|| source_error(name, "tensor byte count overflows usize"))?;
+        if u64::try_from(expected)? != meta.byte_length {
+            return Err(source_error(name, format!("shape {:?} requires {expected} bytes, header holds {}", meta.shape, meta.byte_length)));
+        }
         let file = std::fs::File::open(path).with_context(|| format!("opening {}", path.display()))?;
         // Header offsets are absolute file offsets (`read_safetensors_metadata` adds the data start).
         let mut bytes = vec![0u8; usize::try_from(meta.byte_length)?];
@@ -503,18 +538,24 @@ impl TensorSource {
 
     /// The dequantized FP32 matrix for a 2-D `.weight` tensor. FP8 E4M3 needs
     /// a block-scale partner: `<name>_scale_inv` (F32, GLM) or `<module>.scale`
-    /// (UE8M0, DeepSeek V4.1); block sizes come from the two shapes.
+    /// (UE8M0, DeepSeek V4.1). The source's own quantization metadata declares
+    /// block sizes; the headers must agree with the resulting ceil-div grid.
     pub fn matrix(&self, name: &str) -> Result<Matrix> {
         let (bytes, meta) = self.bytes(name)?;
-        ensure!(meta.shape.len() == 2, "{name} has shape {:?}, expected 2-D", meta.shape);
+        if meta.shape.len() != 2 { return Err(source_error(name, format!("shape {:?}, expected 2-D", meta.shape))); }
         let (rows, cols) = (meta.shape[0], meta.shape[1]);
+        if rows == 0 || cols == 0 { return Err(source_error(name, "matrix dimensions must be positive")); }
         let data: Vec<f32> = match meta.dtype {
             DType::F32 => bytes.par_chunks_exact(4).map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect(),
             DType::Bf16 => bytes.par_chunks_exact(2).map(|b| f32::from_bits(u32::from(u16::from_le_bytes([b[0], b[1]])) << 16)).collect(),
             DType::F16 => bytes.par_chunks_exact(2).map(|b| f16_to_f32(u16::from_le_bytes([b[0], b[1]]))).collect(),
             DType::F8E4M3 => {
                 let (scale, srows, scols) = self.block_scale(name)?;
-                let (br, bc) = (rows.div_ceil(srows), cols.div_ceil(scols));
+                let (br, bc) = self.block_shape(name, rows, cols, srows, scols)?;
+                let expected = (rows.div_ceil(br), cols.div_ceil(bc));
+                if (srows, scols) != expected {
+                    return Err(source_error(name, format!("scale grid {srows}x{scols}, expected {}x{} for blocks {br}x{bc}", expected.0, expected.1)));
+                }
                 let lut: Vec<f32> = (0..=255u8).map(e4m3_to_f32).collect();
                 let mut out = vec![0f32; rows * cols];
                 out.par_chunks_mut(cols).enumerate().for_each(|(r, row)| {
@@ -524,25 +565,62 @@ impl TensorSource {
                 });
                 out
             }
-            ref other => bail!("{name}: dtype {other:?} is not a supported variant format"),
+            ref other => return Err(source_error(name, format!("dtype {other:?} is not a supported variant format"))),
         };
         ensure!(data.len() == rows * cols, "{name}: {} values for shape {rows}x{cols}", data.len());
         Ok(Matrix::new(rows, cols, data))
+    }
+
+    fn block_shape(&self, name: &str, rows: usize, cols: usize, srows: usize, scols: usize) -> Result<(usize, usize)> {
+        let invalid = |reason: &str| TensorSourceError::Fp8Layout { tensor: name.into(), reason: reason.into() };
+        let path = &self.tensors.get(name).ok_or_else(|| source_error(name, "missing source tensor"))?.0;
+        let mut declared = None;
+        for quant in self.quantization.get(path).into_iter().flatten() {
+            // EXL3 wraps the retained dense operands' original HF declaration.
+            let mut declaration = quant;
+            for _ in 0..16 {
+                if let Some(original) = declaration.get("original_quantization_config") { declaration = original; }
+                else if declaration.get("weight_block_size").is_some() { break; }
+                else if let Some(inner) = declaration.get("quantization_config") { declaration = inner; }
+                else { break; }
+            }
+            let Some(value) = declaration.get("weight_block_size") else { continue };
+            let shape = value.as_array().filter(|v| v.len() == 2)
+                .ok_or_else(|| invalid("weight_block_size must contain two positive integers"))?;
+            let dim = |v: &serde_json::Value| -> Result<usize> {
+                v.as_u64().and_then(|n| usize::try_from(n).ok()).filter(|&n| n > 0)
+                    .ok_or_else(|| invalid("weight_block_size must contain two positive integers").into())
+            };
+            let shape = (dim(&shape[0])?, dim(&shape[1])?);
+            if declared.is_some_and(|prior| prior != shape) {
+                return Err(invalid("source quantization declarations disagree on weight_block_size").into());
+            }
+            declared = Some(shape);
+        }
+        if let Some(shape) = declared { return Ok(shape); }
+        // Older standard EXL3 snapshots omit the original FP8 config. Fully
+        // tiled operands carry an exact grid-to-weight ratio in their own
+        // headers. Partial grids cannot establish block boundaries this way.
+        if srows > 0 && scols > 0 && rows % srows == 0 && cols % scols == 0 {
+            return Ok((rows / srows, cols / scols));
+        }
+        Err(invalid("source has no FP8 weight_block_size declaration and headers do not describe an exact full-tile grid").into())
     }
 
     fn block_scale(&self, name: &str) -> Result<(Vec<f32>, usize, usize)> {
         let module = name.strip_suffix(".weight").unwrap_or(name);
         let candidates = [format!("{name}_scale_inv"), format!("{module}.weight_scale_inv"), format!("{module}.scale")];
         let scale_name = candidates.iter().find(|c| self.contains(c))
-            .with_context(|| format!("{name}: FP8 weight without a block scale ({})", candidates.join(", ")))?;
+            .ok_or_else(|| source_error(name, format!("FP8 weight without a block scale ({})", candidates.join(", "))))?;
         let (bytes, meta) = self.bytes(scale_name)?;
-        ensure!(meta.shape.len() == 2, "{scale_name} is not 2-D");
-        let values = match meta.dtype {
+        if meta.shape.len() != 2 || meta.shape.contains(&0) { return Err(source_error(scale_name, "scale grid must be nonempty and 2-D")); }
+        let values: Vec<f32> = match meta.dtype {
             DType::F32 => bytes.chunks_exact(4).map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect(),
             DType::F8E8M0 | DType::U8 => bytes.iter().map(|&b| ue8m0_to_f32(b)).collect(),
             DType::Bf16 => bytes.chunks_exact(2).map(|b| f32::from_bits(u32::from(u16::from_le_bytes([b[0], b[1]])) << 16)).collect(),
-            ref other => bail!("{scale_name}: scale dtype {other:?} is not supported"),
+            ref other => return Err(source_error(scale_name, format!("scale dtype {other:?} is not supported"))),
         };
+        if !values.iter().all(|v| v.is_finite() && *v > 0.0) { return Err(source_error(scale_name, "scales must be finite and positive")); }
         Ok((values, meta.shape[0], meta.shape[1]))
     }
 }
@@ -577,7 +655,7 @@ pub fn derive_sites(base: &TensorSource, variant: &TensorSource, sites: &[SiteTe
             Ok((op, report)) => (report.accept.then_some((site.key, op)),
                 SiteVerdict { site: site.key.to_string(), tensor: site.tensor.clone(), report: Some(report) }),
             Err(VariantError::Unchanged) => (None, SiteVerdict { site: site.key.to_string(), tensor: site.tensor.clone(), report: None }),
-            Err(error) => bail!("{}: {error}", site.tensor),
+            Err(error) => return Err(anyhow::Error::new(error).context(site.tensor.clone())),
         })
     }).collect());
     let mut ops = Vec::new();
@@ -599,6 +677,7 @@ pub fn first_rejection(verdicts: &[SiteVerdict]) -> Option<String> {
 /// A family's variant site map: which tensors to read and which sites they feed.
 pub struct FamilyVariants {
     pub family: &'static str,
+    pub mode: &'static str,
     pub hidden: usize,
     /// Tensor names (and scale partners) to read from both sides.
     pub wants: fn(&str) -> bool,
@@ -611,13 +690,16 @@ impl FamilyVariants {
 /// The site map for the served checkpoint's family; `mode` is the `--variant` `mode=`.
 pub fn family_variants(config: &serde_json::Value, mode: Option<&str>) -> Result<FamilyVariants> {
     let text = config.get("text_config").unwrap_or(config);
-    let int = |key: &str| text[key].as_u64().map(|v| v as usize).with_context(|| format!("config.json {key}"));
+    let int = |key: &str| text[key].as_u64().and_then(|v| usize::try_from(v).ok()).with_context(|| format!("config.json {key}"));
     match text["model_type"].as_str().unwrap_or_default() {
         "glm_moe_dsa" => {
             use crate::families::glm5::variants::{variant_sites, wants_tensor, GlmVariantMode};
             let mode: GlmVariantMode = mode.map(str::parse).transpose().map_err(anyhow::Error::msg)?.unwrap_or_default();
             let (layers, first_moe) = (int("num_hidden_layers")?, int("first_k_dense_replace")?);
-            Ok(FamilyVariants { family: "glm5", hidden: int("hidden_size")?, wants: wants_tensor,
+            ensure!(layers > 0 && layers <= usize::from(u16::MAX) + 1 && first_moe <= layers,
+                "config.json invalid GLM layer geometry");
+            ensure!((1..=u32::MAX as usize).contains(&int("hidden_size")?), "config.json hidden_size must fit a positive u32");
+            Ok(FamilyVariants { family: "glm5", mode: mode.name(), hidden: int("hidden_size")?, wants: wants_tensor,
                 sites: Box::new(move |variant| variant_sites(layers, first_moe, mode, variant)) })
         }
         other => bail!("weight variants are not supported for model_type {other:?} yet"),
@@ -629,7 +711,8 @@ pub fn family_variants(config: &serde_json::Value, mode: Option<&str>) -> Result
 /// folder of shards.
 pub fn open_source(path: &Path, role: &str, wants: fn(&str) -> bool) -> Result<TensorSource> {
     if path.is_file() { return TensorSource::from_files([path.to_path_buf()]); }
-    if !path.join("model.safetensors.index.json").is_file() && !path.join("model.safetensors").is_file() {
+    if !path.join("config.json").is_file()
+        || (!path.join("model.safetensors.index.json").is_file() && !path.join("model.safetensors").is_file()) {
         // A bare folder of shards (e.g. tensors range-read from a published checkpoint).
         let files = safetensors_files(path)?;
         let mut source = TensorSource::from_files(files)?;
@@ -649,10 +732,31 @@ pub struct VariantOutcome {
     pub public_id: String,
     pub plan: Option<cuteafd_core::variants::VariantPlan>,
     pub rejection: Option<String>,
+    pub rejection_kind: Option<VariantRejection>,
+    pub mode: String,
     pub verdicts: Vec<SiteVerdict>,
     /// Site tensors the variant carries but the base does not (not derived).
     pub missing_in_base: Vec<String>,
     pub seconds: f64,
+}
+
+/// Unsupported sources are availability decisions. Path, JSON and invalid mode
+/// errors still propagate as startup failures instead of hiding a bad launch.
+#[derive(Debug, Clone, Serialize, thiserror::Error)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum VariantRejection {
+    #[error("site tensors are missing in the served base: {tensors:?}")]
+    Incomplete { tensors: Vec<String> },
+    #[error("derivation base {base} differs from the served snapshot; served site compatibility is unverified")]
+    UnverifiedBase { base: String },
+    #[error("source holds no supported site tensors")]
+    NoSupportedSites,
+    #[error("every supported site tensor is unchanged against the base")]
+    Unchanged,
+    #[error("{reason}")]
+    UnsupportedSource { reason: String },
+    #[error("{reason}")]
+    Verification { reason: String },
 }
 impl VariantOutcome {
     /// The verification summary `/v1/models` carries.
@@ -660,7 +764,9 @@ impl VariantOutcome {
         let reports: Vec<&VerifyReport> = self.verdicts.iter().filter_map(|v| v.report.as_ref()).collect();
         let max = |f: fn(&VerifyReport) -> f32| reports.iter().map(|r| f(r)).fold(0f32, f32::max);
         let min = |f: fn(&VerifyReport) -> f32| reports.iter().map(|r| f(r)).fold(f32::INFINITY, f32::min);
-        serde_json::json!({"tensors": reports.len(), "unchanged": self.verdicts.len() - reports.len(),
+        serde_json::json!({"mode": self.mode, "verification_scope": "listed attention/dense/shared output tensors only",
+            "routed_experts_verified": false, "full_checkpoint_equivalence": false,
+            "rejection": self.rejection_kind, "tensors": reports.len(), "unchanged": self.verdicts.len() - reports.len(),
             "r_w_max": max(|r| r.r_w), "next_share_max": max(|r| r.next_share), "proj_cos_min": min(|r| r.proj_cos),
             "alpha_min": min(|r| r.alphas.iter().copied().fold(f32::INFINITY, f32::min)),
             "alpha_max": max(|r| r.alphas.iter().copied().fold(0f32, f32::max)),
@@ -676,20 +782,48 @@ pub fn derive_variant(served: &Path, served_id: &str, index: u8, spec: &cuteafd_
     let family = family_variants(&config, spec.mode.as_deref())?;
     let base_path = spec.base.as_deref().map_or_else(|| served.to_path_buf(), PathBuf::from);
     let variant = open_source(Path::new(&spec.source), "variant", family.wants)?;
+    // Resolve even explicit base paths before deciding unsupported: a typo is a
+    // launch error. A different checkpoint needs compatibility evidence that
+    // output-side fitting alone cannot supply.
+    let base_identity = std::fs::canonicalize(&base_path).with_context(|| format!("variant base {}", base_path.display()))?;
+    let served_identity = std::fs::canonicalize(served)?;
+    let public_id = spec.public_id(served_id);
+    let mut outcome = VariantOutcome { name: spec.name.clone(), public_id: public_id.clone(), plan: None,
+        rejection: None, rejection_kind: None, mode: family.mode.into(), verdicts: Vec::new(), missing_in_base: Vec::new(), seconds: 0.0 };
+    let reject = |mut outcome: VariantOutcome, reason: VariantRejection| -> Result<VariantOutcome> {
+        outcome.rejection = Some(reason.to_string());
+        outcome.rejection_kind = Some(reason);
+        outcome.seconds = started.elapsed().as_secs_f64();
+        Ok(outcome)
+    };
     let base = open_source(&base_path, "variant-base", family.wants)?;
+    if base_identity != served_identity {
+        return reject(outcome, VariantRejection::UnverifiedBase { base: base_path.display().to_string() });
+    }
     let (sites, missing): (Vec<SiteTensor>, Vec<SiteTensor>) = family.sites(&variant).into_iter().partition(|s| base.contains(&s.tensor));
     let missing_in_base: Vec<String> = missing.into_iter().map(|s| s.tensor).collect();
-    ensure!(!sites.is_empty(), "variant {}: {} holds none of the {} site tensors the base has", spec.name, spec.source, family.family);
-    let (ops, verdicts) = derive_sites(&base, &variant, &sites, parallel)?;
+    if !missing_in_base.is_empty() {
+        outcome.missing_in_base = missing_in_base.clone();
+        return reject(outcome, VariantRejection::Incomplete { tensors: missing_in_base });
+    }
+    if sites.is_empty() { return reject(outcome, VariantRejection::NoSupportedSites); }
+    let (ops, verdicts) = match derive_sites(&base, &variant, &sites, parallel) {
+        Ok(result) => result,
+        Err(error) if error.downcast_ref::<TensorSourceError>().is_some() || error.downcast_ref::<VariantError>().is_some() =>
+            return reject(outcome, VariantRejection::UnsupportedSource { reason: format!("{error:#}") }),
+        Err(error) => return Err(error),
+    };
     let rejection = first_rejection(&verdicts);
-    let public_id = spec.public_id(served_id);
-    let plan = if rejection.is_none() {
-        ensure!(!ops.is_empty(), "variant {}: every site tensor is unchanged against the base", spec.name);
-        Some(cuteafd_core::variants::VariantPlan::new(index, spec.name.clone(), public_id.clone(),
-            u32::try_from(family.hidden)?, ops)?)
-    } else { None };
-    Ok(VariantOutcome { name: spec.name.clone(), public_id, plan, rejection, verdicts, missing_in_base,
-        seconds: started.elapsed().as_secs_f64() })
+    outcome.verdicts = verdicts;
+    if let Some(reason) = rejection { return reject(outcome, VariantRejection::Verification { reason }); }
+    if ops.is_empty() { return reject(outcome, VariantRejection::Unchanged); }
+    outcome.plan = match cuteafd_core::variants::VariantPlan::new(index, spec.name.clone(), public_id,
+        u32::try_from(family.hidden)?, ops) {
+        Ok(plan) => Some(plan),
+        Err(error) => return reject(outcome, VariantRejection::UnsupportedSource { reason: error.to_string() }),
+    };
+    outcome.seconds = started.elapsed().as_secs_f64();
+    Ok(outcome)
 }
 
 /// Path helper for families: the `.safetensors` files of a directory or a single file.

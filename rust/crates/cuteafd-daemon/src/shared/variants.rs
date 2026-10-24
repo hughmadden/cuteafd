@@ -14,6 +14,10 @@ pub(crate) struct VariantArgs {
 fn parse_spec(text: &str) -> Result<VariantSpec, String> { text.parse().map_err(|e: cuteafd_core::variants::VariantError| e.to_string()) }
 
 impl VariantArgs {
+    pub fn reject_unsupported(&self, family: &str) -> anyhow::Result<()> {
+        anyhow::ensure!(self.variants.is_empty(), "--variant is not supported for {family}; configured variants must never be silently served as base");
+        Ok(())
+    }
     /// The configured specs with their 1-based indices, checked against the served id.
     pub fn indexed(&self, served: &str) -> anyhow::Result<Vec<(u8, VariantSpec)>> {
         validate_specs(&self.variants, served)?;
@@ -27,6 +31,20 @@ mod tests {
     use clap::Parser;
     #[derive(Parser)]
     struct Cli { #[command(flatten)] variants: VariantArgs }
+
+    #[test]
+    fn unsupported_family_rejects_configured_variants_and_keeps_base_launch() {
+        let cli = crate::cli::Cli::try_parse_from(["cuteafd","serve-native","--snapshot","/not-read",
+            "--native-lib","/not-loaded","--variant","name=keys,source=/extract"]).unwrap();
+        let crate::cli::Commands::ServeNative(args) = cli.command else { panic!() };
+        let error = crate::families::deepseek_v41::v41_native_serve::start_worker(args).err().expect("unsupported variants must reject before native loading");
+        assert!(error.to_string().contains("--variant is not supported"));
+        let base = Cli::try_parse_from(["x"]).unwrap();
+        base.variants.reject_unsupported("serve-native").unwrap();
+        let configured = Cli::try_parse_from(["x","--variant","name=keys,source=/extract"]).unwrap();
+        let error = configured.variants.reject_unsupported("serve-native").unwrap_err();
+        assert!(error.to_string().contains("--variant is not supported for serve-native"));
+    }
 
     #[test]
     fn repeatable_flag_parses_in_order() {

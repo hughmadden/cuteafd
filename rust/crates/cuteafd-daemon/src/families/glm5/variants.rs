@@ -49,10 +49,7 @@ pub(crate) fn configured_sites(plans: &[VariantPlan]) -> Vec<SiteKey> {
 
 /// Device bytes the tables take (charged in admission before the KV pool is sized).
 pub(crate) fn table_bytes(plans: &[VariantPlan], hidden: usize) -> u64 {
-    configured_sites(plans).into_iter().map(|key| {
-        let (a, b, k, _) = site_tables(plans, key, hidden);
-        [a.len() * 4, b.len() * 4, k.len() * 4].into_iter().map(|bytes| bytes.max(256) as u64).sum::<u64>()
-    }).sum()
+    cuteafd_core::variants::resident_table_bytes(plans, hidden)
 }
 
 impl<'a> GlmVariantTables<'a> {
@@ -119,11 +116,19 @@ pub(crate) fn derive(snapshot: &std::path::Path, served_id: &str, specs: &[(u8, 
                 records.push(VariantRecord::of(&plan, served_id, verify));
                 plans.push(plan);
             }
-            None => tracing::warn!(variant = %spec.name, rejection = outcome.rejection.as_deref().unwrap_or("rejected"),
-                "weight variant unavailable: not an output-side low-rank edit; a weight-set variant is required"),
+            None => {
+                let reason = outcome.rejection.as_deref().unwrap_or("rejected");
+                tracing::warn!(variant = %spec.name, id = %outcome.public_id, rejection = reason, "weight variant unavailable");
+                records.push(VariantRecord::unavailable(*index, spec, served_id, reason, verify));
+            }
         }
     }
     let bytes = table_bytes(&plans, hidden);
+    for record in &mut records {
+        record.verify["resident_table_bytes"] = serde_json::json!(bytes);
+        record.verify["table_bytes_scope"] = serde_json::json!("launch");
+        record.verify["site_tables"] = serde_json::json!(cuteafd_core::variants::table_layouts(&plans, hidden));
+    }
     Ok(Derived { plans, records, bytes })
 }
 

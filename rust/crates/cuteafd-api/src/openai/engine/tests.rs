@@ -64,8 +64,8 @@ struct Worker { prompts: Arc<Mutex<Vec<String>>>, closed: Arc<Mutex<Vec<bool>>>,
 
 fn serve(mut profile: ModelProfile, snapshot: Option<std::path::PathBuf>, replies: Vec<&'static str>, hold: bool)
     -> (axum::Router, Worker) {
-    let mut models = crate::gateway::ModelMap::official_names(profile.id.clone());
-    models.variants = profile.variants.iter().map(|v| (v.public_id.clone(), v.index)).collect();
+    let mut models = profile.gateway.as_ref().map_or_else(|| crate::gateway::ModelMap::official_names(profile.id.clone()), |m| m.models.clone());
+    models.set_variants(&profile.variants);
     profile.gateway = Some(Arc::new(GatewayMount { models,
         snapshot, options: EngineOptions::default(), search: None, gate: None, origins: Default::default() }));
     let (tx, mut rx) = mpsc::channel::<NativeRequest>(4);
@@ -155,14 +155,59 @@ fn conversation(model: &str, thinking: bool, tools: bool, image: bool) -> Conver
     Conversation { chat, messages, responses }
 }
 
+
+#[tokio::test]
+async fn unavailable_variant_ids_reject_every_protocol_and_native_build_without_queueing() {
+    use cuteafd_core::variants::{VariantRecord, VariantSpec};
+    let mut profile = ModelProfile::new("test-glm", ModelEncoding::Glm(Arc::new(glm5::fixtures::encoding())));
+    let spec: VariantSpec = "name=bad,source=/bad,id=test-glm-bad".parse().unwrap();
+    profile.variants = vec![VariantRecord::unavailable(1, &spec, "test-glm", "missing base tensor L3", json!({"mode":"shared-only"}))];
+    // Native build has no gateway catch-all at all, but must preserve the typed
+    // failure for a reserved id rather than treating it as an unknown model.
+    let c = conversation("test-glm-bad", false, false, false);
+    let error = crate::openai::build(&profile, NativeLimits::default(), &axum::http::HeaderMap::new(), c.chat.clone()).err().expect("unavailable model rejected");
+    assert_eq!(error.status, StatusCode::SERVICE_UNAVAILABLE);
+    let response = error.into_response();
+    let bytes = axum::body::to_bytes(response.into_body(), 1 << 20).await.unwrap();
+    assert_eq!(serde_json::from_slice::<Value>(&bytes).unwrap()["error"]["code"], "model_unavailable");
+    let mut models = crate::gateway::ModelMap::official_names(profile.id.clone());
+    models.aliases = vec![("bad-alias".into(),"test-glm-bad".into()), ("test-glm-*".into(),"test-glm".into())];
+    models.listed.push("test-glm-bad".into());
+    profile.gateway = Some(Arc::new(GatewayMount { models, snapshot:None,options:EngineOptions::default(),search:None,gate:None,origins:Default::default() }));
+    let (app, worker) = serve(profile, None, vec![], false);
+    for model in ["test-glm-bad", "bad-alias"] {
+        let mut c = conversation(model, false, false, false);
+        c.messages["model"] = json!(model);
+        c.responses["model"] = json!(model);
+        for (path, body) in [("/v1/chat/completions",c.chat),("/v1/messages",c.messages),("/v1/responses",c.responses)] {
+            let (status,text) = post(&app,path,body).await;
+            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{model} {path}: {text}");
+            assert!(text.contains("model_unavailable"), "{path}: {text}");
+            assert!(text.contains("missing base tensor L3"), "{path}: {text}");
+        }
+    }
+    assert!(worker.variants.lock().unwrap().is_empty(), "rejected ids never reach the engine");
+    let response = app.clone().oneshot(axum::http::Request::get("/v1/models").body(Body::empty()).unwrap()).await.unwrap();
+    let bytes = axum::body::to_bytes(response.into_body(), 1 << 20).await.unwrap();
+    let listing: Value = serde_json::from_slice(&bytes).unwrap();
+    assert!(!listing["data"].as_array().unwrap().iter().any(|m| m["id"] == "test-glm-bad"));
+    let (status,text) = post(&app,"/v1/chat/completions",conversation("claude-sonnet-5",false,false,false).chat).await;
+    assert_eq!(status,StatusCode::OK,"{text}");
+    assert_eq!(*worker.variants.lock().unwrap(), [0]);
+}
+
 #[tokio::test]
 async fn variant_model_ids_select_the_variant_on_every_protocol() {
     let mut profile = ModelProfile::new("test-glm", ModelEncoding::Glm(Arc::new(glm5::fixtures::encoding())));
     profile.variants = vec![cuteafd_core::variants::VariantRecord { index: 1, name: "abliterated".into(),
-        public_id: "test-glm-abliterated".into(), base: "test-glm".into(), sites: 96, k_max: 1, verify: json!({}) }];
+        public_id: "test-glm-abliterated".into(), base: "test-glm".into(), sites: 96, k_max: 1, availability: cuteafd_core::variants::VariantAvailability::Ready, verify: json!({}) }];
+    let mut models = crate::gateway::ModelMap::official_names(profile.id.clone());
+    models.aliases = vec![("ready-alias".into(),"test-glm-abliterated".into()),
+        ("test-glm-*".into(),"test-glm".into())];
+    profile.gateway = Some(Arc::new(GatewayMount { models,snapshot:None,options:EngineOptions::default(),search:None,gate:None,origins:Default::default() }));
     let (app, worker) = serve(profile, None, vec![], false);
     let mut expected = Vec::new();
-    for (model, variant) in [("test-glm", 0u8), ("test-glm-abliterated", 1), ("claude-sonnet-5", 0)] {
+    for (model, variant) in [("test-glm", 0u8), ("test-glm-abliterated", 1), ("ready-alias",1), ("claude-sonnet-5", 0)] {
         let mut c = conversation(model, false, false, false);
         c.messages["model"] = json!(model);
         c.responses["model"] = json!(model);

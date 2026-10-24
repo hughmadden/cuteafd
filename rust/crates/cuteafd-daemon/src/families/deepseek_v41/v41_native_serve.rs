@@ -38,6 +38,7 @@ use tokio::sync::{mpsc, oneshot};
 
 
 pub(crate) async fn run(args: crate::cli::NativeServeArgs) -> Result<()> {
+    args.variants.reject_unsupported("serve-native / deepseek_v41")?;
     // Identify the checkpoint before loading it: an unidentifiable directory fails in seconds.
     let mut profile = served_profile(args.model_id.clone(), &args.snapshot)?;
     let Started { send, readiness, worker_thread, stats, http } = start(args, true)?;
@@ -129,6 +130,7 @@ pub(crate) fn start_worker(args: crate::cli::NativeServeArgs)
 /// Validate and normalize the launch, then spawn the CUDA worker thread.
 /// With `http`, the API and live console load where `serve-native` always loaded them.
 fn start(mut args: crate::cli::NativeServeArgs, http: bool) -> Result<Started> {
+    args.variants.reject_unsupported("serve-native / deepseek_v41")?;
     match cuteafd_transport::fabric::discover() {
         Ok(report) => tracing::info!(target: "cuteafd::fabric", rails = report.rails.use_rails, "{}", report.summary()),
         Err(error) => tracing::warn!(target: "cuteafd::fabric", "fabric discovery failed: {error:#}"),

@@ -174,11 +174,14 @@ pub struct LayoutOptions {
     pub workspace_manifest: Option<std::path::PathBuf>,
     /// Per-GPU budget for resident weights (`--coordinator-weight-budget-gib`).
     pub weight_budget_bytes: u64,
+    /// Packed launch-local weight-variant A/B/rank allocations on coordinator 0.
+    pub variant_table_bytes: u64,
 }
 
 impl Default for LayoutOptions {
     fn default() -> Self {
         Self {
+            variant_table_bytes: 0,
             host_cache_bytes: None,
             media_cache_bytes: None,
             host_memory: None,

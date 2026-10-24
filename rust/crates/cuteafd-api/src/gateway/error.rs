@@ -13,6 +13,8 @@ pub enum ErrorKind {
     PermissionDenied,
     /// 404: unknown model, response id, session or route.
     NotFound,
+    /// 503: configured model id whose variant was rejected at startup.
+    ModelUnavailable,
     /// 413
     RequestTooLarge,
     /// 429
@@ -44,6 +46,9 @@ impl GatewayError {
     pub fn invalid(message: impl Into<String>) -> Self { Self::new(ErrorKind::InvalidRequest, message) }
     pub fn unsupported(message: impl Into<String>) -> Self { Self::new(ErrorKind::Unsupported, message) }
     pub fn not_found(message: impl Into<String>) -> Self { Self::new(ErrorKind::NotFound, message) }
+    pub fn model_unavailable(id: &str, reason: &str) -> Self {
+        Self::new(ErrorKind::ModelUnavailable, format!("model '{id}' is unavailable: {reason}")).with_param("model")
+    }
     pub fn upstream(message: impl Into<String>) -> Self { Self::new(ErrorKind::Upstream, message) }
     pub fn internal(message: impl Into<String>) -> Self { Self::new(ErrorKind::Internal, message) }
     pub fn with_param(mut self, param: impl Into<String>) -> Self { self.param = Some(param.into()); self }
@@ -59,7 +64,7 @@ impl GatewayError {
             ErrorKind::NotFound => 404,
             ErrorKind::RequestTooLarge => 413,
             ErrorKind::RateLimited => 429,
-            ErrorKind::Overloaded => 503,
+            ErrorKind::Overloaded | ErrorKind::ModelUnavailable => 503,
             ErrorKind::Upstream => 502,
             ErrorKind::Internal => 500,
         }
@@ -86,6 +91,7 @@ fn bounded(mut message: String) -> String {
 impl GatewayError {
     /// Anthropic `error.type` for this error.
     pub fn anthropic_type(&self) -> &'static str {
+        if self.kind == ErrorKind::ModelUnavailable { return "model_unavailable_error"; }
         match self.status() {
             401 => "authentication_error",
             403 => "permission_error",
@@ -99,6 +105,7 @@ impl GatewayError {
     }
     /// OpenAI `error.type` for this error.
     pub fn openai_type(&self) -> &'static str {
+        if self.kind == ErrorKind::ModelUnavailable { return "model_unavailable_error"; }
         match self.status() {
             401 => "authentication_error",
             403 => "permission_error",
@@ -115,6 +122,7 @@ impl GatewayError {
     /// OpenAI error body: `{"error":{"message","type","param","code"}}`.
     pub fn openai_body(&self) -> serde_json::Value {
         let code = match self.kind {
+            ErrorKind::ModelUnavailable => Some("model_unavailable"),
             ErrorKind::NotFound if self.param.as_deref() == Some("model") => Some("model_not_found"),
             ErrorKind::Authentication => Some("invalid_api_key"),
             ErrorKind::Unsupported => Some("unsupported_value"),
