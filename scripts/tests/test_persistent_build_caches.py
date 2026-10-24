@@ -84,6 +84,23 @@ def test_architecture_cache_mounts_and_warm_state(tmp_path, arch):
     assert "cold" in plan(tmp_path, env, arch, tc="bcde").stderr
 
 
+def test_worker_admission_follows_an_explicit_lock_directory(tmp_path):
+    """Host-wide export admission sits beside the hardware locks: HOME by default,
+    CUTEAFD_LOCK_DIR when a deployment keeps its locks elsewhere."""
+    env = fixture(tmp_path)
+    default = plan(tmp_path, env)
+    assert default.returncode == 0, default.stderr
+    assert f"type=bind,src={env['HOME']}/.cache/cuteafd/export-workers,dst=/export-slots" in pairs(default.stdout.splitlines(), "--mount")
+    env["CUTEAFD_LOCK_DIR"] = str(tmp_path / "locks")
+    moved = plan(tmp_path, env)
+    assert moved.returncode == 0, moved.stderr
+    mounts = pairs(moved.stdout.splitlines(), "--mount")
+    assert f"type=bind,src={tmp_path}/locks/export-workers,dst=/export-slots" in mounts
+    assert (tmp_path / "locks/export-workers").is_dir()
+    # Only admission moves; the input caches stay under HOME.
+    assert_plan(moved.stdout.splitlines(), env)
+
+
 def test_off_ignores_all_explicit_compiler_cache_settings(tmp_path):
     env = fixture(tmp_path)
     env.update(CUTEAFD_BUILD_CACHES="off", CUTEAFD_KACHE="/missing/tool", CUTEAFD_SCCACHE_CUDA="1",

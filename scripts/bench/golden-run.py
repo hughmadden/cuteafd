@@ -123,7 +123,9 @@ def namespace_root():
     return str(Path(os.environ.get('CUTEAFD_NAMESPACE_ROOT', '/mnt/sparknest')).expanduser().resolve())
 
 
-HUB = '/mnt/sparknest/hf-home/hub'
+def hub_placeholder():
+    """The {hub} placeholder: the namespace's hub as mounted (same path) in the container."""
+    return namespace_root() + '/hf-home/hub'
 # Real experts. Hosts refused outright, with the reason (lift a refusal here once cleared).
 REFUSED_HOSTS = {
     'oliver': 'reserved for the Kimi F32 golden',
@@ -133,6 +135,10 @@ REFUSED_HOSTS = {
 }
 # Which hardware lock covers a Spark (scripts/hw/hwlock.py order; as `cuteafd bench smoke`).
 HOST_LOCKS = {'ostrich': 'sparks', 'dodo': 'sparks', 'emu': 'sparks', 'kiwi': 'sparks', 'rhea': 'rhea', 'moa': 'moa'}
+# Another deployment's Sparks are the SPARK_i_HOST entries (with a LANE_A) of --config,
+# as release_spark_host_rows accepts them; they form that deployment's pool under
+# sparks.lock in its CUTEAFD_LOCK_DIR.
+POOL_LOCK = 'sparks'
 WORKER_READY = 'native worker bootstrap ready'
 WORKER_LABEL = 'cuteafd.golden-run'
 DEFAULT_EXPERT_PORT = 19451  # beside serving's 19441, so a stray serving worker is detected, not reused
@@ -204,7 +210,7 @@ def apply_env(arms, common, per_arm):
 def parse_gpus(value):
     gpus = sorted({int(g) for g in value.split(',') if g.strip()})
     if not gpus or any(g not in (0, 1) for g in gpus):
-        raise ValueError('--gpus takes raptor GPU indices 0 and/or 1')
+        raise ValueError('--gpus takes coordinator GPU indices 0 and/or 1')
     return gpus
 
 
@@ -252,7 +258,7 @@ PLACEHOLDERS = ('snapshot', 'hub', 'out', 'fixtures', 'peers', 'expert_layers')
 
 def substitute(args, snapshot, out=OUT, **values):
     """Replace {snapshot}, {hub}, {out}, {fixtures}, {peers} and {expert_layers}."""
-    table = {'snapshot': snapshot, 'hub': HUB, 'out': out, **values}
+    table = {'snapshot': snapshot, 'hub': hub_placeholder(), 'out': out, **values}
     result = []
     for arg in args:
         for key in PLACEHOLDERS:
@@ -282,7 +288,14 @@ def worker_name(task, arm, rank):
 
 # --------------------------------------------------------------------------- Spark workers
 
-def parse_hosts(value):
+def configured_hosts(config_path):
+    """The configuration's SPARK_i_HOST values that also name a SPARK_i_LANE_A."""
+    values = cards.config(config_path)
+    return {host for key, host in values.items()
+            if (match := re.fullmatch(r'SPARK_(\d+)_HOST', key)) and values.get(f'SPARK_{match.group(1)}_LANE_A')}
+
+
+def parse_hosts(value, configured=()):
     hosts = [h.strip() for h in value.split(',') if h.strip()]
     if not hosts:
         raise ValueError('--spark-hosts names no host')
@@ -291,8 +304,9 @@ def parse_hosts(value):
     for host in hosts:
         if host in REFUSED_HOSTS:
             raise ValueError(f'--spark-hosts: {host} is refused ({REFUSED_HOSTS[host]})')
-        if host not in HOST_LOCKS:
-            raise ValueError(f'--spark-hosts: {host} is not a pool Spark ({", ".join(sorted(HOST_LOCKS))})')
+        if host not in HOST_LOCKS and host not in configured:
+            raise ValueError(f'--spark-hosts: {host} is not a pool Spark ({", ".join(sorted(HOST_LOCKS))}) '
+                             'or a SPARK_i_HOST with SPARK_i_LANE_A in --config')
     return hosts
 
 
@@ -329,7 +343,7 @@ def spark_lanes(config_path, hosts):
 
 
 def locks_for(gpus, hosts=()):
-    names = {f'gpu{g}' for g in gpus} | {HOST_LOCKS[h] for h in hosts}
+    names = {f'gpu{g}' for g in gpus} | {HOST_LOCKS.get(h, POOL_LOCK) for h in hosts}
     return hwlock.canonical(sorted(names))
 
 
@@ -1165,7 +1179,7 @@ def build_state(args, arms):
     hub = hub_root()
     sparks = None
     if args.spark_hosts:
-        hosts = parse_hosts(args.spark_hosts)
+        hosts = parse_hosts(args.spark_hosts, configured_hosts(args.config))
         if args.worker_ready_timeout < 1:
             raise ValueError('--worker-ready-timeout must be positive seconds')
         if not 1 <= args.expert_port <= 65535:
@@ -1244,7 +1258,7 @@ def main(argv=None):
     parser.add_argument('--arm-arg', action='append', default=[], metavar='ARM:TOKEN',
                         help='one extra argv token appended for that arm only (repeatable, in order)')
     parser.add_argument('--env', action='append', default=[], metavar='KEY=VALUE', help='environment for every arm')
-    parser.add_argument('--gpus', default='0,1', help='raptor GPUs, locked gpu0 then gpu1 (default 0,1)')
+    parser.add_argument('--gpus', default='0,1', help='coordinator GPUs, locked gpu0 then gpu1 (default 0,1)')
     raw = parser.add_mutually_exclusive_group()
     raw.add_argument('--native-test', metavar='EXE', help='run this test executable (built in the coordinator dev '
                      'image from the slot commit) with ARGS instead of a golden subcommand')

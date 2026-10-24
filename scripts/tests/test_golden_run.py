@@ -565,6 +565,37 @@ def test_spark_hosts_refused(hosts, match):
         golden.parse_hosts(hosts)
 
 
+ROMEO_SPARKS = ['10.201.1.19', '10.201.2.20', '10.201.3.16', '10.201.4.42', '10.201.5.15', '10.201.6.16']
+
+
+def test_configured_deployment_sparks_take_the_pool_lock(tmp_path):
+    """Another deployment's Sparks are its config's SPARK_i_HOST/LANE_A entries, locked as sparks."""
+    config = tmp_path / 'six.config'
+    config.write_text(''.join(f'SPARK_{i}_HOST={h}\nSPARK_{i}_LANE_A={h}\n' for i, h in enumerate(ROMEO_SPARKS))
+                      + 'SPARK_5_LANE_B=\n')
+    configured = golden.configured_hosts(config)
+    assert configured == set(ROMEO_SPARKS)
+    assert golden.parse_hosts(','.join(ROMEO_SPARKS), configured) == ROMEO_SPARKS
+    assert golden.locks_for([0], ROMEO_SPARKS) == ['sparks', 'gpu0']
+    # Upstream hosts keep their own locks; an unconfigured name is still refused.
+    assert golden.locks_for([0], ['rhea', ROMEO_SPARKS[0]]) == ['sparks', 'gpu0', 'rhea']
+    with pytest.raises(ValueError, match='not a pool Spark'):
+        golden.parse_hosts('10.201.7.1', configured)
+    # A host without a lane address is not a configured Spark.
+    config.write_text('SPARK_0_HOST=lonely\n')
+    assert golden.configured_hosts(config) == set()
+    # Refusals win even when a config names the host.
+    with pytest.raises(ValueError, match='coordinator'):
+        golden.parse_hosts('raptor', {'raptor'})
+
+
+def test_hub_placeholder_follows_namespace_root(tmp_path, monkeypatch):
+    monkeypatch.delenv('CUTEAFD_NAMESPACE_ROOT', raising=False)
+    assert golden.hub_placeholder() == str(Path('/mnt/sparknest').resolve()) + '/hf-home/hub'
+    monkeypatch.setenv('CUTEAFD_NAMESPACE_ROOT', str(tmp_path))
+    assert golden.hub_placeholder() == str(tmp_path.resolve()) + '/hf-home/hub'
+
+
 def test_expert_layers_and_lock_order():
     assert golden.parse_layers('3') == [3]
     assert golden.parse_layers('5-7,3,6') == [3, 5, 6, 7]
@@ -680,6 +711,26 @@ def test_native_test_needs_a_passing_summary(spark_env, monkeypatch, output, pro
     record = json.loads((spark_env['home'] / '.cache/cuteafd/builds/gr/golden/a/r1/argv.json').read_text())
     assert problem in record['problem']
     assert json.loads(spark_env['state'].read_text()) == {}
+
+
+def test_configured_ip_sparks_run_under_the_pool_lock(spark_env, monkeypatch):
+    """Six numeric-IP Sparks from --config (a non-upstream deployment) on one coordinator GPU."""
+    env = spark_env
+    env['config'].write_text(''.join(f'SPARK_{i}_HOST={h}\nSPARK_{i}_LANE_A={h}\n' for i, h in enumerate(ROMEO_SPARKS)))
+    monkeypatch.setenv('STUB_RUN_OUTPUT', PASSED)
+    order = []
+    real_hold = golden.hwlock.hold
+    monkeypatch.setattr(golden.hwlock, 'hold', lambda names, *a, **k: order.append(list(names)) or real_hold(names, *a, **k))
+    argv = spark_argv(env, hosts=','.join(ROMEO_SPARKS))
+    argv[argv.index('--gpus') + 1] = '0'
+    assert golden.main(argv) == 0
+    assert order == [['sparks', 'gpu0']]
+    workers = [c for c in ssh_calls(env) if 'expertd-native' in c[1]]
+    assert [host for host, _ in workers] == ROMEO_SPARKS
+    for rank, (_, command) in enumerate(workers):
+        command = shlex.split(command)
+        assert command[command.index('--rank') + 1] == str(rank) and command[command.index('--world') + 1] == '6'
+
 
 
 def test_worker_exit_before_ready_fails_fast_and_tears_down(spark_env, monkeypatch):
