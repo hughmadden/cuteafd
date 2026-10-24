@@ -54,9 +54,13 @@ pub enum SiteOp {
     /// `y -= A (Bᵀ y)`: `a` and `b` are `[k][hidden]` row-major. A rank-1
     /// projection `W' = (I − α r rᵀ) W` is `k = 1`, `a = α·r`, `b = r`.
     Steer { k: u8, a: Vec<f32>, b: Vec<f32> },
-    /// Reserved for a stored weight delta (`y += ΔW x` on variant rows; GLM
-    /// Flash L44). Not built in v1.
-    Delta {},
+    /// A stored weight delta: `y += ΔW x` on variant rows, where `x` is the
+    /// input of the tensor that writes the site (`Attn`: the `o_proj` input;
+    /// `SharedExpert`/`DenseFfn`: the `down_proj` input). For an edit that is
+    /// not low-rank (GLM Flash dealignai L44). `weight` is the BF16 bits of
+    /// `ΔW = W' − W`, `[rows][cols]` with `rows` = hidden; the family picks
+    /// the device format.
+    Delta { rows: u32, cols: u32, weight: Vec<u16> },
 }
 impl SiteOp {
     /// The rank-1 projection `y -= alpha r (rᵀ y)`.
@@ -64,8 +68,9 @@ impl SiteOp {
         Self::Steer { k: 1, a: r.iter().map(|v| alpha * v).collect(), b: r.to_vec() }
     }
     pub fn rank(&self) -> usize {
-        match self { Self::Steer { k, .. } => usize::from(*k), Self::Delta {} => 0 }
+        match self { Self::Steer { k, .. } => usize::from(*k), Self::Delta { .. } => 0 }
     }
+    pub fn is_delta(&self) -> bool { matches!(self, Self::Delta { .. }) }
 }
 
 /// One configured variant, ready for a family to upload.
@@ -119,7 +124,13 @@ impl VariantPlan {
                     }
                     if a.iter().chain(b).any(|v| !v.is_finite()) { return Err(bad("non-finite table value".into())); }
                 }
-                SiteOp::Delta {} => return Err(bad("delta sites are not supported in v1".into())),
+                SiteOp::Delta { rows, cols, weight } => {
+                    if site.kind == SiteKind::Ffn { return Err(bad("a delta needs one tensor's input; Ffn combines two".into())); }
+                    if *rows != hidden || *cols == 0 || weight.len() != *rows as usize * *cols as usize {
+                        return Err(bad(format!("delta holds {} values as {rows}x{cols}, expected {hidden} rows", weight.len())));
+                    }
+                    if weight.iter().any(|&v| !bf16_to_f32(v).is_finite()) { return Err(bad("non-finite delta value".into())); }
+                }
             }
         }
         let namespace = namespace(hidden, &sites);
@@ -133,6 +144,10 @@ impl VariantPlan {
     /// Device table bytes: `a` and `b` at the variant's own rank per site.
     pub fn table_bytes(&self) -> u64 {
         self.sites.iter().map(|(_, op)| 2 * op.rank() as u64 * u64::from(self.hidden) * 4).sum()
+    }
+    /// Delta values (`rows · cols` per delta site); bytes per value depend on the family's device format.
+    pub fn delta_values(&self) -> u64 {
+        self.sites.iter().map(|(_, op)| match op { SiteOp::Delta { weight, .. } => weight.len() as u64, _ => 0 }).sum()
     }
 }
 
@@ -152,7 +167,12 @@ pub fn namespace(hidden: u32, sites: &[(SiteKey, SiteOp)]) -> u64 {
                 hash.update([0, *k]);
                 for v in a.iter().chain(b) { hash.update(v.to_bits().to_le_bytes()); }
             }
-            SiteOp::Delta {} => hash.update([1, 0]),
+            SiteOp::Delta { rows, cols, weight } => {
+                hash.update([1, 0]);
+                hash.update(rows.to_le_bytes());
+                hash.update(cols.to_le_bytes());
+                for v in weight { hash.update(v.to_le_bytes()); }
+            }
         }
     }
     let digest = hash.finalize();
@@ -307,7 +327,16 @@ impl VariantStats {
 
 // The kernel's host reference (one copy, `crate::steer_rows`): the same fixed reduction
 // order as `cuteafd_steer_rows`, so CPU tests match the GPU bit for bit.
-pub use crate::steer_rows::{bf16_to_f32, f32_to_bf16_rne as bf16_rne, steer_rows_ref};
+pub use crate::steer_rows::{add_rows_ref, bf16_to_f32, f32_to_bf16_rne as bf16_rne, steer_rows_ref};
+
+/// Per-variant switch of one delta site, `[V+1]` with slot 0 zero: `on[v]` is 1
+/// when variant `v` stores a delta at `key`.
+pub fn delta_switch(plans: &[VariantPlan], key: SiteKey) -> Vec<i32> {
+    let slots = plans.iter().map(|p| usize::from(p.index)).max().unwrap_or(0) + 1;
+    let mut on = vec![0i32; slots];
+    for plan in plans { if plan.site(key).is_some_and(SiteOp::is_delta) { on[usize::from(plan.index)] = 1; } }
+    on
+}
 
 /// Pack plans into the kernel's per-site table layout (§4): for one site,
 /// `(a, b, k, k_max)` with slot 0 zero and slots in variant index order.
@@ -383,7 +412,16 @@ mod tests {
         assert!(VariantPlan::new(1, "x", "x", 4, vec![(key(1, SiteKind::Attn), SiteOp::rank1(1.0, &r[..3]))]).is_err());
         assert!(VariantPlan::new(1, "x", "x", 4, vec![(key(1, SiteKind::Attn), SiteOp::rank1(1.0, &r)),
             (key(1, SiteKind::Attn), SiteOp::rank1(2.0, &r))]).is_err());
-        assert!(VariantPlan::new(1, "x", "x", 4, vec![(key(1, SiteKind::Attn), SiteOp::Delta {})]).is_err());
+        let delta = |rows: u32, cols: u32| SiteOp::Delta { rows, cols, weight: vec![bf16_rne(0.5); (rows * cols) as usize] };
+        let d = VariantPlan::new(1, "x", "x", 4, vec![(key(1, SiteKind::Attn), delta(4, 8)),
+            (key(1, SiteKind::SharedExpert), SiteOp::rank1(1.0, &r))]).unwrap();
+        assert_eq!((d.k_max(), d.delta_values(), d.table_bytes()), (1, 32, 2 * 4 * 4));
+        assert_ne!(d.namespace, VariantPlan::new(1, "x", "x", 4, vec![(key(1, SiteKind::Attn), delta(4, 4)),
+            (key(1, SiteKind::SharedExpert), SiteOp::rank1(1.0, &r))]).unwrap().namespace, "delta bytes are in the namespace");
+        assert!(VariantPlan::new(1, "x", "x", 4, vec![(key(1, SiteKind::Attn), delta(3, 8))]).is_err(), "rows must be hidden");
+        assert!(VariantPlan::new(1, "x", "x", 4, vec![(key(1, SiteKind::Ffn), delta(4, 8))]).is_err(), "Ffn has no single input");
+        assert!(VariantPlan::new(1, "x", "x", 4, vec![(key(1, SiteKind::Attn),
+            SiteOp::Delta { rows: 4, cols: 2, weight: vec![0x7fc0; 8] })]).is_err(), "non-finite");
     }
 
     #[test]
@@ -441,6 +479,23 @@ mod tests {
         let mut y = before.clone();
         steer_rows_ref(&mut y, h, 2, h, &[1, 1], &a, &b, &[0, 0], k_max);
         assert_eq!(y, before);
+    }
+
+    #[test]
+    fn add_rows_writes_only_switched_rows() {
+        let h = 4;
+        let mut y: Vec<u16> = (0..3 * h).map(|i| bf16_rne(i as f32 - 5.0)).collect();
+        y[0] = 0x8000; // -0.0 on a base row stays -0.0 (never written)
+        let before = y.clone();
+        let d: Vec<f32> = (0..3 * h).map(|i| 0.25 * i as f32).collect();
+        // Row 1 is variant 2 (no delta here), row 2 variant 1 (stores the delta).
+        add_rows_ref(&mut y, h, &d, h, 3, h, &[0, 2, 1], &[0, 1, 0]);
+        assert_eq!(&y[..2 * h], &before[..2 * h], "base row and a variant without the delta untouched");
+        for c in 0..h { assert_eq!(bf16_to_f32(y[2 * h + c]), bf16_to_f32(before[2 * h + c]) + d[2 * h + c]); }
+        let plan = VariantPlan::new(2, "d", "m-d", h as u32, vec![(key(7, SiteKind::Attn),
+            SiteOp::Delta { rows: h as u32, cols: 2, weight: vec![0; 2 * h] })]).unwrap();
+        assert_eq!(delta_switch(&[plan.clone()], key(7, SiteKind::Attn)), [0, 0, 1]);
+        assert_eq!(delta_switch(&[plan], key(7, SiteKind::SharedExpert)), [0, 0, 0]);
     }
 
     #[test]

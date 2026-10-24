@@ -59,11 +59,14 @@ pub struct DeriveOpts {
     /// Extra subspace columns beyond `k_max + 1`, and power iterations.
     pub oversample: usize,
     pub iterations: usize,
+    /// A tensor that fails verification becomes a stored delta
+    /// ([`SiteOp::Delta`]) instead of making the variant unavailable.
+    pub delta_fallback: bool,
 }
 impl Default for DeriveOpts {
     fn default() -> Self {
         Self { k_max: MAX_STEER_RANK, rank_share: 0.01, max_r_delta: Some(0.2), max_r_w: None, min_proj_cos: 0.98,
-            edit_floor: 0.0, oversample: 8, iterations: 4 }
+            edit_floor: 0.0, oversample: 8, iterations: 4, delta_fallback: false }
     }
 }
 
@@ -490,6 +493,7 @@ impl TensorSource {
     pub fn contains(&self, name: &str) -> bool { self.tensors.contains_key(name) }
     pub fn names(&self) -> impl Iterator<Item = &str> { self.tensors.keys().map(String::as_str) }
     pub fn shape(&self, name: &str) -> Option<&[usize]> { self.tensors.get(name).map(|(_, m)| m.shape.as_slice()) }
+    pub fn dtype(&self, name: &str) -> Option<&DType> { self.tensors.get(name).map(|(_, m)| &m.dtype) }
 
     fn bytes(&self, name: &str) -> Result<(Vec<u8>, &crate::SafetensorsTensorMetadata)> {
         let (path, meta) = self.tensors.get(name).with_context(|| format!("tensor {name} is not in this source"))?;
@@ -562,6 +566,8 @@ pub struct SiteVerdict {
     pub tensor: String,
     /// `None` when the tensor is unchanged (no site).
     pub report: Option<VerifyReport>,
+    /// The tensor failed steering verification and is served as a stored delta.
+    pub delta: bool,
 }
 
 /// Derive every listed site, in parallel across tensors (`parallel` at a
@@ -573,10 +579,12 @@ pub fn derive_sites(base: &TensorSource, variant: &TensorSource, sites: &[SiteTe
     let results: Vec<Result<(Option<(SiteKey, SiteOp)>, SiteVerdict)>> = pool.install(|| sites.par_iter().map(|site| {
         let w = base.matrix(&site.tensor).with_context(|| format!("base {}", site.tensor))?;
         let v = variant.matrix(&site.tensor).with_context(|| format!("variant {}", site.tensor))?;
+        let verdict = |report, delta| SiteVerdict { site: site.key.to_string(), tensor: site.tensor.clone(), report, delta };
         Ok(match derive_site(&w, &v, &site.opts) {
-            Ok((op, report)) => (report.accept.then_some((site.key, op)),
-                SiteVerdict { site: site.key.to_string(), tensor: site.tensor.clone(), report: Some(report) }),
-            Err(VariantError::Unchanged) => (None, SiteVerdict { site: site.key.to_string(), tensor: site.tensor.clone(), report: None }),
+            Ok((_, report)) if !report.accept && site.opts.delta_fallback =>
+                (Some((site.key, delta_op(&w, &v))), verdict(Some(report), true)),
+            Ok((op, report)) => (report.accept.then_some((site.key, op)), verdict(Some(report), false)),
+            Err(VariantError::Unchanged) => (None, verdict(None, false)),
             Err(error) => bail!("{}: {error}", site.tensor),
         })
     }).collect());
@@ -590,9 +598,15 @@ pub fn derive_sites(base: &TensorSource, variant: &TensorSource, sites: &[SiteTe
     Ok((ops, verdicts))
 }
 
+/// `ΔW = variant − base` as a stored delta (BF16, round to nearest even).
+pub fn delta_op(base: &Matrix, variant: &Matrix) -> SiteOp {
+    let weight = base.data.par_iter().zip(&variant.data).map(|(w, v)| cuteafd_core::variants::bf16_rne(v - w)).collect();
+    SiteOp::Delta { rows: base.rows as u32, cols: base.cols as u32, weight }
+}
+
 /// The first rejected site, as a planning result: "tensor T: reason".
 pub fn first_rejection(verdicts: &[SiteVerdict]) -> Option<String> {
-    verdicts.iter().find_map(|v| v.report.as_ref().filter(|r| !r.accept)
+    verdicts.iter().filter(|v| !v.delta).find_map(|v| v.report.as_ref().filter(|r| !r.accept)
         .map(|r| format!("{} ({}): {}", v.tensor, v.site, r.reason.as_deref().unwrap_or("rejected"))))
 }
 
@@ -619,6 +633,13 @@ pub fn family_variants(config: &serde_json::Value, mode: Option<&str>) -> Result
             let (layers, first_moe) = (int("num_hidden_layers")?, int("first_k_dense_replace")?);
             Ok(FamilyVariants { family: "glm5", hidden: int("hidden_size")?, wants: wants_tensor,
                 sites: Box::new(move |variant| variant_sites(layers, first_moe, mode, variant)) })
+        }
+        "glm5_next_text" | "glm5_next" => {
+            use crate::families::glm5_flash::variants::{variant_sites, wants_tensor};
+            ensure!(mode.is_none(), "GLM-5.3 Flash variants take no mode= (got {mode:?})");
+            let (layers, first_moe) = (int("num_hidden_layers")?, int("first_k_dense_replace")?);
+            Ok(FamilyVariants { family: "glm5_flash", hidden: int("hidden_size")?, wants: wants_tensor,
+                sites: Box::new(move |variant| variant_sites(layers, first_moe, variant)) })
         }
         other => bail!("weight variants are not supported for model_type {other:?} yet"),
     }
@@ -657,10 +678,11 @@ pub struct VariantOutcome {
 impl VariantOutcome {
     /// The verification summary `/v1/models` carries.
     pub fn verify_summary(&self) -> serde_json::Value {
-        let reports: Vec<&VerifyReport> = self.verdicts.iter().filter_map(|v| v.report.as_ref()).collect();
+        let reports: Vec<&VerifyReport> = self.verdicts.iter().filter(|v| !v.delta).filter_map(|v| v.report.as_ref()).collect();
+        let deltas = self.verdicts.iter().filter(|v| v.delta).count();
         let max = |f: fn(&VerifyReport) -> f32| reports.iter().map(|r| f(r)).fold(0f32, f32::max);
         let min = |f: fn(&VerifyReport) -> f32| reports.iter().map(|r| f(r)).fold(f32::INFINITY, f32::min);
-        serde_json::json!({"tensors": reports.len(), "unchanged": self.verdicts.len() - reports.len(),
+        serde_json::json!({"tensors": reports.len(), "deltas": deltas, "unchanged": self.verdicts.len() - reports.len() - deltas,
             "r_w_max": max(|r| r.r_w), "next_share_max": max(|r| r.next_share), "proj_cos_min": min(|r| r.proj_cos),
             "alpha_min": min(|r| r.alphas.iter().copied().fold(f32::INFINITY, f32::min)),
             "alpha_max": max(|r| r.alphas.iter().copied().fold(0f32, f32::max)),
