@@ -1,270 +1,293 @@
-//! The transport worker against a fake GPU and a fake transport: wave order,
-//! slot/staging ownership hand-off, and failure drain, without hardware.
+//! The exchange worker against a fake GPU (counters a test thread advances)
+//! and a fake transport: wave order, slot reuse by counters, a decode step
+//! queued far ahead of its exchange, and failure release, without hardware.
 use super::*;
-use crate::shared::prefill_pipeline::{prefill_schedule, sequence_units, FfnRoute, Step};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-/// Events complete when the test (the "GPU") says so; replies arrive a few
-/// polls after a post, in post order, one payload per rank.
-#[derive(Default)]
+/// The "GPU": the control words, written by the engine side of the test as
+/// a stream would (staged after copies, consumed after a reduce) and read by
+/// the worker; the worker publishes `landed` here.
 struct World {
-    /// Completed event handles.
-    complete: Mutex<std::collections::HashSet<usize>>,
-    /// Events recorded so far, in order.
-    recorded: Mutex<Vec<(usize, usize)>>,
-    /// Payload owners alive (a held receive slot each).
-    live: AtomicUsize,
-    /// Uploads queued and not yet passed by a drain.
-    queued: AtomicUsize,
-    drained: AtomicBool,
+    words: Vec<AtomicU32>,
+    slots: usize,
+    /// Posted sequences, in order, and the slot each went to.
+    posted: Mutex<Vec<(u32, usize)>>,
+    /// Per slot: the sequence currently posted into it and not yet landed.
+    occupied: Mutex<Vec<Option<u32>>>,
+    fail_post: Option<u32>,
+    fail_poll: Option<u32>,
+    released: AtomicBool,
+    polls: AtomicUsize,
 }
 
-struct Payload { world: Arc<World>, slot: usize, sequence: u64 }
-impl Drop for Payload {
-    fn drop(&mut self) { self.world.live.fetch_sub(1, Ordering::SeqCst); }
+impl World {
+    fn new(slots: usize) -> Arc<Self> {
+        Arc::new(Self { words: (0..Counter::words(slots)).map(|_| AtomicU32::new(0)).collect(), slots,
+            posted: Mutex::new(Vec::new()), occupied: Mutex::new(vec![None; slots]), fail_post: None, fail_poll: None,
+            released: AtomicBool::new(false), polls: AtomicUsize::new(0) })
+    }
+    fn load(&self, counter: Counter) -> u32 { self.words[counter.index(self.slots)].load(Ordering::Acquire) }
+    fn store(&self, counter: Counter, value: u32) { self.words[counter.index(self.slots)].store(value, Ordering::Release) }
 }
 
-struct Fake {
-    world: Arc<World>,
-    ranks: usize,
-    waves: usize,
-    /// Fail the post (`Some(n)`: the n-th post, 1-based) or the poll.
-    fail_post: Option<u64>,
-    fail_poll: Option<u64>,
-    posts: u64,
-    /// Per slot: the wave currently in it.
-    occupied: Vec<Option<u64>>,
-    posted: Vec<u64>,
-}
-
-struct FakeWave { sequence: u64, slot: usize, polls: usize, sent: usize }
-
-const STAGED: usize = 1000;
-const LANDED: usize = 2000;
+struct Fake { world: Arc<World> }
+struct FakeWave { sequence: u32, slot: usize, polls: usize }
 
 impl Backend for Fake {
     type Wave = FakeWave;
-    type Payload = Payload;
-    fn complete(&self, event: Handle) -> Result<bool> {
-        Ok(self.world.complete.lock().unwrap().contains(&(event.raw() as usize)))
-    }
-    fn staged(&self, slot: usize) -> Handle { Handle::of((STAGED + slot) as *mut c_void) }
+    fn counter(&self, counter: Counter) -> u32 { self.world.load(counter) }
     fn post(&mut self, job: Job) -> Result<FakeWave> {
-        self.posts += 1;
-        if self.fail_post == Some(self.posts) { anyhow::bail!("injected post failure"); }
-        assert!(job.slot < self.waves);
-        assert!(self.occupied[job.slot].is_none(), "slot {} reposted before its wave landed", job.slot);
-        if let Some(previous) = self.posted.last() { assert!(job.sequence > *previous, "posts out of order"); }
-        self.posted.push(job.sequence);
-        self.occupied[job.slot] = Some(job.sequence);
-        Ok(FakeWave { sequence: job.sequence, slot: job.slot, polls: 0, sent: 0 })
+        if self.world.fail_post == Some(job.sequence) { anyhow::bail!("injected post failure"); }
+        let mut occupied = self.world.occupied.lock().unwrap();
+        assert!(occupied[job.slot].is_none(), "slot {} reposted before its wave landed", job.slot);
+        // The planes are free: the slot's previous reduce was consumed.
+        assert!(reached(self.world.load(Counter::Consumed(job.slot)), job.consumed));
+        if let Source::Staged { .. } = job.source {
+            assert!(reached(self.world.load(Counter::Staged(job.slot)), job.sequence), "posted before staged");
+        }
+        let mut posted = self.world.posted.lock().unwrap();
+        if let Some(&(previous, _)) = posted.last() { assert_eq!(job.sequence, previous.wrapping_add(1), "posts out of order"); }
+        posted.push((job.sequence, job.slot));
+        occupied[job.slot] = Some(job.sequence);
+        Ok(FakeWave { sequence: job.sequence, slot: job.slot, polls: 0 })
     }
-    fn poll(&mut self, wave: &mut FakeWave, arrived: &mut Vec<(usize, u32, Payload)>) -> Result<Option<u8>> {
+    fn poll(&mut self, wave: &mut FakeWave, slot: usize, _rows: usize) -> Result<bool> {
+        assert_eq!(slot, wave.slot);
+        self.world.polls.fetch_add(1, Ordering::Relaxed);
         wave.polls += 1;
-        if self.fail_poll == Some(wave.sequence) && wave.sent == 1 { anyhow::bail!("injected receive failure"); }
-        if wave.polls % 3 == 0 && wave.sent < self.ranks {
-            self.world.live.fetch_add(1, Ordering::SeqCst);
-            arrived.push((wave.sent, 0, Payload { world: self.world.clone(), slot: wave.slot, sequence: wave.sequence }));
-            wave.sent += 1;
-        }
-        if wave.sent == self.ranks {
-            self.occupied[wave.slot] = None;
-            return Ok(Some(0));
-        }
-        Ok(None)
+        if self.world.fail_poll == Some(wave.sequence) && wave.polls == 2 { anyhow::bail!("injected receive failure"); }
+        if wave.polls < 3 { return Ok(false); }
+        self.world.occupied.lock().unwrap()[slot] = None;
+        Ok(true)
     }
-    fn upload(&self, slot: usize, _rows: usize, rank: usize, _first: u32, payload: &Payload) -> Result<()> {
-        assert!(rank < self.ranks && payload.slot == slot);
-        self.world.queued.fetch_add(1, Ordering::SeqCst);
-        Ok(())
-    }
-    fn landed(&self, slot: usize) -> Result<Handle> {
-        let event = LANDED + slot;
-        self.world.recorded.lock().unwrap().push((event, self.posted.len()));
-        // The copy stream finishes uploads in order; this fake completes them at once.
-        self.world.complete.lock().unwrap().insert(event);
-        Ok(Handle::of(event as *mut c_void))
-    }
-    fn drain(&self) -> Result<()> {
-        self.world.queued.store(0, Ordering::SeqCst);
-        self.world.drained.store(true, Ordering::SeqCst);
-        Ok(())
+    fn publish(&mut self, sequence: u32) {
+        if !reached(self.world.load(Counter::Landed), sequence) { self.world.store(Counter::Landed, sequence); }
+        self.world.released.store(true, Ordering::Release);
     }
 }
 
-fn fake(world: &Arc<World>, waves: usize) -> Fake {
-    Fake { world: world.clone(), ranks: 3, waves, fail_post: None, fail_poll: None, posts: 0,
-        occupied: vec![None; waves], posted: Vec::new() }
+fn job(sequence: u32, slot: usize, consumed: u32) -> Job {
+    Job { sequence, slot, rows: 1, consumed, sent: Instant::now(),
+        source: Source::Staged { layout: RouteStaging::new(1, 8, 16).unwrap(),
+            build: Box::new(|_, _| anyhow::bail!("the fake posts without building")) } }
 }
 
-fn job(sequence: u64, slot: usize, consumed: Option<usize>) -> Job {
-    Job { sequence, slot, rows: 64, layout: RouteStaging::new(64, 8, 16).unwrap(),
-        build: Box::new(|_, _| anyhow::bail!("the fake posts without building")),
-        consumed: consumed.map(|event| Handle::of(event as *mut c_void)), arrived: Instant::now() }
+/// Spins (bounded) until `counter` reaches `target`, as a stream wait would.
+fn wait(world: &World, counter: Counter, target: u32) -> Result<()> {
+    let started = Instant::now();
+    while !reached(world.load(counter), target) {
+        ensure!(started.elapsed() < Duration::from_secs(5), "{counter:?} never reached {target}");
+        std::thread::yield_now();
+    }
+    Ok(())
 }
 
-/// The engine side over the fake: drives the executor's schedule, sending
-/// jobs and landing them in dispatch order, completing each staged event a
-/// little after its send (the GPU lagging the host).
-fn drive(waves: usize, units: usize, layers: usize, fail_post: Option<u64>, fail_poll: Option<u64>)
-    -> (Result<Vec<u64>>, Arc<World>, Retired<Payload>) {
-    let world = Arc::new(World::default());
-    let mut backend = fake(&world, waves);
-    backend.fail_post = fail_post;
-    backend.fail_poll = fail_poll;
-    let routes: Vec<_> = (0..layers).map(|layer| if layer == 0 { FfnRoute::Local } else { FfnRoute::Spark }).collect();
-    let units = sequence_units(units * 256, 256, waves, layers).unwrap();
-    let steps = prefill_schedule(&routes, &units, waves).unwrap();
+/// The engine as a single stream: a decode step of `layers` layers queued on
+/// it as send (wait for the slot's previous landing, stage, write staged),
+/// land (wait for landed), reduce (write consumed). The host side (sending
+/// jobs) runs ahead of the "stream" thread, which executes the queued ops in
+/// order: exactly the run-ahead serving does.
+fn drive(world: &Arc<World>, slots: usize, layers: u32, timeout: Duration)
+    -> (Result<()>, Result<()>, Option<u32>) {
+    #[derive(Debug)]
+    enum Op { WaitLanded(u32), Staged(usize, u32), Consumed(usize, u32) }
     let (jobs, inbox) = mpsc::channel();
-    let (report, done) = mpsc::channel();
+    let (ops, queue) = mpsc::channel::<Op>();
     std::thread::scope(|scope| {
-        let worker = scope.spawn(|| run_worker(&mut backend, inbox, report, Duration::from_secs(5)));
-        let engine = (|| -> Result<Vec<u64>> {
-            let mut sequence = 0u64;
-            let mut outstanding = VecDeque::new();
-            let mut landed = Vec::new();
-            let mut slot_of_unit = vec![0; units.len()];
-            let mut next_slot = 0;
-            let mut unread = vec![false; waves];
-            for step in steps {
-                match step {
-                    Step::Send { unit, .. } => {
-                        assert!(!unread[next_slot], "slot reused before its reduce");
-                        sequence += 1;
-                        let slot = next_slot;
-                        next_slot = (next_slot + 1) % waves;
-                        slot_of_unit[unit] = slot;
-                        // A slot read before carries its consumed event (completed below).
-                        let consumed = (sequence > waves as u64).then_some(3000 + slot);
-                        jobs.send(job(sequence, slot, consumed))
-                            .map_err(|_| anyhow::anyhow!("worker gone"))?;
-                        world.complete.lock().unwrap().insert(STAGED + slot);
-                        outstanding.push_back((sequence, slot));
-                    }
-                    Step::Land { .. } => {
-                        let (expected, slot) = outstanding.pop_front().unwrap();
-                        let landed_wave: Landed = done.recv_timeout(Duration::from_secs(5))
-                            .map_err(|_| anyhow::anyhow!("no completion"))??;
-                        assert_eq!(landed_wave.sequence, expected, "waves landed out of dispatch order");
-                        landed.push(landed_wave.sequence);
-                        // The reduce reads and releases the slot.
-                        unread[slot] = false;
-                        world.complete.lock().unwrap().remove(&(STAGED + slot));
-                        world.complete.lock().unwrap().insert(3000 + slot);
-                    }
-                    _ => {}
+        let mut backend = Fake { world: world.clone() };
+        let worker = scope.spawn(move || run_worker(&mut backend, &inbox, timeout, false));
+        let stream = scope.spawn(|| -> Result<()> {
+            for op in queue {
+                match op {
+                    Op::WaitLanded(sequence) => wait(world, Counter::Landed, sequence)?,
+                    Op::Staged(slot, sequence) => world.store(Counter::Staged(slot), sequence),
+                    Op::Consumed(slot, uses) => world.store(Counter::Consumed(slot), uses),
                 }
             }
-            Ok(landed)
-        })();
+            Ok(())
+        });
+        // The host queues the whole step without waiting for anything.
+        let mut uses = vec![0u32; slots];
+        for sequence in 1..=layers {
+            let slot = (sequence as usize - 1) % slots;
+            ops.send(Op::WaitLanded(sequence.wrapping_sub(slots as u32))).unwrap();
+            ops.send(Op::Staged(slot, sequence)).unwrap();
+            jobs.send(Command::Wave(job(sequence, slot, uses[slot]))).unwrap();
+            ops.send(Op::WaitLanded(sequence)).unwrap();
+            uses[slot] += 1;
+            ops.send(Op::Consumed(slot, uses[slot])).unwrap();
+        }
+        drop(ops);
+        let stream = stream.join().unwrap();
         drop(jobs);
-        let retired = worker.join().unwrap();
-        (engine, world, retired)
+        let (worker, highest) = worker.join().unwrap();
+        (stream, worker, highest)
     })
 }
 
 #[test]
-fn waves_post_and_land_in_dispatch_order_across_slots() {
-    for waves in 1..=4 {
-        let (landed, world, retired) = drive(waves, 6, 7, None, None);
-        let landed = landed.unwrap();
-        assert_eq!(landed, (1..=landed.len() as u64).collect::<Vec<_>>());
-        assert!(retired.error.is_none() && !retired.abandoned && retired.drained);
-        assert_eq!(world.queued.load(Ordering::SeqCst), 0, "uploads not drained");
-        // Only receive owners of waves whose `landed` events the worker had
-        // not yet observed may remain, and they are handed back.
-        assert_eq!(world.live.load(Ordering::SeqCst), retired.held.len());
-        drop(retired);
-        assert_eq!(world.live.load(Ordering::SeqCst), 0, "receive slots leaked");
+fn a_decode_step_queued_ahead_lands_every_layer_in_order() {
+    for slots in 1..=4 {
+        let world = World::new(slots);
+        let (stream, worker, highest) = drive(&world, slots, 80, Duration::from_secs(5));
+        stream.unwrap();
+        worker.unwrap();
+        assert_eq!(highest, Some(80));
+        let posted = world.posted.lock().unwrap();
+        assert_eq!(posted.iter().map(|p| p.0).collect::<Vec<_>>(), (1..=80).collect::<Vec<_>>());
+        assert!(posted.iter().all(|&(sequence, slot)| slot == (sequence as usize - 1) % slots));
+        assert_eq!(world.load(Counter::Landed), 80);
     }
 }
 
 #[test]
-fn a_job_waits_for_its_staged_copies_and_its_slots_previous_reduce() {
-    let world = Arc::new(World::default());
-    let mut backend = fake(&world, 2);
+fn a_wave_waits_for_its_staged_copies_and_its_slots_previous_reduce() {
+    let world = World::new(1);
     let (jobs, inbox) = mpsc::channel();
-    let (report, done) = mpsc::channel::<Result<Landed>>();
     std::thread::scope(|scope| {
-        let worker = scope.spawn(|| run_worker(&mut backend, inbox, report, Duration::from_secs(5)));
-        jobs.send(job(1, 0, Some(3000))).unwrap();
-        // Neither staged nor consumed yet: nothing may be posted or landed.
-        std::thread::sleep(Duration::from_millis(30));
-        assert!(done.try_recv().is_err());
-        world.complete.lock().unwrap().insert(STAGED);
-        std::thread::sleep(Duration::from_millis(30));
-        assert!(done.try_recv().is_err(), "posted before the slot's previous reduce completed");
-        world.complete.lock().unwrap().insert(3000);
-        let first = done.recv_timeout(Duration::from_secs(5)).unwrap().unwrap();
-        assert_eq!(first.sequence, 1);
+        let mut backend = Fake { world: world.clone() };
+        let worker = scope.spawn(move || run_worker(&mut backend, &inbox, Duration::from_secs(5), false));
+        // Wave 2 reuses slot 0, whose wave 1 is landed but not yet reduced.
+        world.store(Counter::Staged(0), 1);
+        jobs.send(Command::Wave(job(1, 0, 0))).unwrap();
+        wait(&world, Counter::Landed, 1).unwrap();
+        jobs.send(Command::Wave(job(2, 0, 1))).unwrap();
+        std::thread::sleep(Duration::from_millis(20));
+        assert_eq!(world.posted.lock().unwrap().len(), 1, "posted before staged");
+        world.store(Counter::Staged(0), 2);
+        std::thread::sleep(Duration::from_millis(20));
+        assert_eq!(world.posted.lock().unwrap().len(), 1, "posted into planes a pending reduce still reads");
+        world.store(Counter::Consumed(0), 1);
+        wait(&world, Counter::Landed, 2).unwrap();
         drop(jobs);
-        let retired = worker.join().unwrap();
-        assert!(retired.error.is_none() && !retired.abandoned);
+        let (result, _) = worker.join().unwrap();
+        result.unwrap();
     });
 }
 
 #[test]
-fn a_failure_mid_wave_drains_uploads_and_returns_every_receive_slot() {
-    for (fail_post, fail_poll) in [(Some(3), None), (None, Some(2)), (Some(1), None), (None, Some(5))] {
-        let (result, world, retired) = drive(2, 4, 5, fail_post, fail_poll);
-        assert!(result.is_err(), "the engine saw no failure ({fail_post:?}, {fail_poll:?})");
-        assert!(retired.error.is_some());
-        assert!(world.drained.load(Ordering::SeqCst), "uploads not drained before owners returned");
-        assert_eq!(world.queued.load(Ordering::SeqCst), 0);
-        // Every arrived payload is in `held` (none dropped while its upload
-        // could still be queued), and none outlives the hand-back.
-        assert_eq!(world.live.load(Ordering::SeqCst), retired.held.len());
-        drop(retired);
-        assert_eq!(world.live.load(Ordering::SeqCst), 0);
+fn a_failure_releases_every_queued_and_later_wait() {
+    for (fail_post, fail_poll) in [(Some(3), None), (None, Some(2)), (Some(1), None), (None, Some(40))] {
+        let mut world = World::new(2);
+        Arc::get_mut(&mut world).unwrap().fail_post = fail_post;
+        Arc::get_mut(&mut world).unwrap().fail_poll = fail_poll;
+        let (jobs, inbox) = mpsc::channel();
+        std::thread::scope(|scope| {
+            let world2 = world.clone();
+            let worker = scope.spawn(move || {
+                let mut backend = Fake { world: world2 };
+                let (result, highest) = run_worker(&mut backend, &inbox, Duration::from_secs(5), false);
+                assert!(result.is_err());
+                release_until_closed(&mut backend, &inbox, highest);
+            });
+            // The engine keeps queueing (it does not know yet) and waits on
+            // the GPU: every wait must release.
+            let mut uses = [0u32; 2];
+            for sequence in 1..=60u32 {
+                let slot = (sequence as usize - 1) % 2;
+                wait(&world, Counter::Landed, sequence.wrapping_sub(2)).unwrap();
+                world.store(Counter::Staged(slot), sequence);
+                if jobs.send(Command::Wave(job(sequence, slot, uses[slot]))).is_err() { break; }
+                wait(&world, Counter::Landed, sequence).unwrap();
+                uses[slot] += 1;
+                world.store(Counter::Consumed(slot), uses[slot]);
+            }
+            drop(jobs);
+            worker.join().unwrap();
+        });
+        assert!(world.released.load(Ordering::Acquire));
     }
 }
 
 #[test]
-fn closing_with_waves_in_flight_abandons_them_without_deadlock() {
-    let world = Arc::new(World::default());
-    let mut backend = fake(&world, 2);
+fn closing_with_waves_in_flight_fails_instead_of_hanging() {
+    let world = World::new(2);
     let (jobs, inbox) = mpsc::channel();
-    let (report, _done) = mpsc::channel::<Result<Landed>>();
     std::thread::scope(|scope| {
-        let worker = scope.spawn(|| run_worker(&mut backend, inbox, report, Duration::from_secs(5)));
-        jobs.send(job(1, 0, None)).unwrap();
-        jobs.send(job(2, 1, None)).unwrap();
-        // The second wave's copies never complete: the engine errored before.
-        world.complete.lock().unwrap().insert(STAGED);
+        let mut backend = Fake { world: world.clone() };
+        let worker = scope.spawn(move || run_worker(&mut backend, &inbox, Duration::from_secs(5), false));
+        // Wave 2's copies never complete: the engine errored before.
+        world.store(Counter::Staged(0), 1);
+        jobs.send(Command::Wave(job(1, 0, 0))).unwrap();
+        jobs.send(Command::Wave(job(2, 1, 0))).unwrap();
         std::thread::sleep(Duration::from_millis(10));
         drop(jobs);
-        let retired = worker.join().unwrap();
-        assert!(retired.abandoned && retired.error.is_none() && retired.drained);
-        drop(retired);
-        assert_eq!(world.live.load(Ordering::SeqCst), 0);
+        let (result, highest) = worker.join().unwrap();
+        assert!(result.is_err() && highest == Some(2));
     });
 }
 
 #[test]
 fn a_stalled_gpu_times_out_instead_of_hanging() {
-    let world = Arc::new(World::default());
-    let mut backend = fake(&world, 1);
+    let world = World::new(1);
     let (jobs, inbox) = mpsc::channel();
-    let (report, done) = mpsc::channel::<Result<Landed>>();
-    let retired = std::thread::scope(|scope| {
-        let worker = scope.spawn(|| run_worker(&mut backend, inbox, report, Duration::from_millis(50)));
-        jobs.send(job(1, 0, None)).unwrap();
-        let error = done.recv_timeout(Duration::from_secs(5)).unwrap().err().expect("timeout reported");
-        assert!(format!("{error:#}").contains("no progress"), "{error:#}");
+    let (result, _) = std::thread::scope(|scope| {
+        let mut backend = Fake { world: world.clone() };
+        let worker = scope.spawn(move || run_worker(&mut backend, &inbox, Duration::from_millis(50), false));
+        jobs.send(Command::Wave(job(1, 0, 0))).unwrap();
+        let joined = worker.join().unwrap();
         drop(jobs);
-        worker.join().unwrap()
+        joined
     });
-    assert!(retired.error.is_some() && retired.abandoned && retired.drained);
+    assert!(format!("{:#}", result.unwrap_err()).contains("no progress"));
 }
 
 #[test]
-fn an_idle_worker_backs_off_to_bounded_sleeps() {
-    assert_eq!(idle_sleep(Duration::from_micros(200)), Duration::from_micros(50));
-    assert_eq!(idle_sleep(Duration::from_millis(1)), Duration::from_micros(125));
-    assert_eq!(idle_sleep(Duration::from_secs(1)), Duration::from_micros(200));
-    // Spinning and yielding stay bounded to the first 200 us of a wait.
-    let started = Instant::now();
-    idle_backoff(Duration::from_millis(5));
-    assert!(started.elapsed() >= Duration::from_micros(150));
+fn an_idle_worker_blocks_instead_of_spinning() {
+    let world = World::new(1);
+    let (jobs, inbox) = mpsc::channel();
+    std::thread::scope(|scope| {
+        let mut backend = Fake { world: world.clone() };
+        let worker = scope.spawn(move || run_worker(&mut backend, &inbox, Duration::from_secs(5), false));
+        world.store(Counter::Staged(0), 1);
+        jobs.send(Command::Wave(job(1, 0, 0))).unwrap();
+        wait(&world, Counter::Landed, 1).unwrap();
+        let polls = world.polls.load(Ordering::Relaxed);
+        std::thread::sleep(Duration::from_millis(50));
+        // Blocked on its channel: no further progress passes while idle.
+        assert_eq!(world.polls.load(Ordering::Relaxed), polls);
+        drop(jobs);
+        worker.join().unwrap().0.unwrap();
+    });
+}
+
+#[test]
+fn counters_compare_cyclically_across_wraparound() {
+    assert!(reached(5, 5) && reached(6, 5) && !reached(4, 5));
+    assert!(reached(1, u32::MAX) && !reached(u32::MAX, 1));
+    // A slot's first use waits for `sequence - waves`, already reached.
+    for waves in 1..=4u32 { assert!(reached(0, 1u32.wrapping_sub(waves))); }
+    assert!(reached(0, 0u32.wrapping_sub(3)));
+}
+
+/// No family exchanges inline any more: every Spark wave goes through the
+/// link's persistent exchange, and nothing waits on the host for routes or
+/// a receive around it.
+#[test]
+fn no_family_exchanges_on_the_engine_thread() {
+    let banned = [
+        [".dis", "patch(&"].concat(), ["block_", "on(self.moe_land"].concat(), ["block_", "on(spark_land"].concat(),
+        [".rece", "ive(wave"].concat(), ["receive_", "wave("].concat(), ["with_", "waves("].concat(),
+        ["with_link_", "waves("].concat(),
+    ];
+    for (family, source) in [
+        ("glm5", include_str!("../families/glm5/engine.rs")),
+        ("glm5 layers", include_str!("../families/glm5/engine/layers.rs")),
+        ("glm5 mod", include_str!("../families/glm5/mod.rs")),
+        ("glm5_flash", include_str!("../families/glm5_flash/engine.rs")),
+        ("glm5_flash mod", include_str!("../families/glm5_flash/mod.rs")),
+        ("mimo_v2", include_str!("../families/mimo_v2/engine.rs")),
+        ("mimo_v2 mod", include_str!("../families/mimo_v2/mod.rs")),
+        ("qwen4", include_str!("../families/qwen4/engine.rs")),
+        ("step5", include_str!("../families/step5/execution.rs")),
+        ("deepseek_v4", include_str!("../families/deepseek_v4/engine.rs")),
+        ("deepseek_v4 prefill", include_str!("../families/deepseek_v4/engine/prefill.rs")),
+        ("kimi_k3", include_str!("../families/kimi_k3/spark.rs")),
+        ("deepseek_v41", include_str!("../families/deepseek_v41/v41_experts/coordinator.rs")),
+    ] {
+        for needle in &banned {
+            assert!(!source.contains(needle.as_str()), "{family} still exchanges inline ({needle})");
+        }
+    }
 }

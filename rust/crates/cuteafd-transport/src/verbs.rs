@@ -4244,7 +4244,7 @@ impl VerbsHostMappedRdmaRing {
     }
 }
 
-pub(crate) fn load_verbs_host_native_library() -> Result<Arc<NativeLibrary>> {
+pub fn load_verbs_host_native_library() -> Result<Arc<NativeLibrary>> {
     let native_path = verbs_host_native_library_path().context(
         "native library not found; set CUTEAFD_NATIVE_LIB or build native/libcuteafd_native.so with RDMA",
     )?;
