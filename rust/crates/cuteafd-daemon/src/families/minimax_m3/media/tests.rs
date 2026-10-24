@@ -125,7 +125,8 @@ async fn http_mixed_media_reaches_exact_feature_rows_with_literal_markers() {
     assert!(!job.literal_spans.is_empty());
     assert!(job.prompt.contains("Literal ]<]image[>[ and ]<]video[>[ remain text."));
     assert_eq!(tokens.iter().filter(|&&token| token == IMAGE_TOKEN).count(), 2);
-    assert_eq!(tokens.iter().filter(|&&token| token == VIDEO_TOKEN).count(), 12);
+    // One video marker per temporal pair before expansion; 3 pairs of 4 rows after.
+    assert_eq!(tokens.iter().filter(|&&token| token == VIDEO_TOKEN).count(), 3);
     let segment = &job.videos[0];
     let frame_bytes = 56 * 56 * 3;
     assert_eq!(segment.rgb8.len(), frame_bytes * 6);
@@ -189,7 +190,8 @@ async fn http_media_rejects_broken_video_spans_and_expanded_context_overflow() {
             tokens.push(VIDEO_TOKEN);
         }
         let error = prepare(job, tokens, Some(&expander()), VOCABULARY, limit).err().expect("invalid media rejected");
-        let expected = ["video placeholder span", "unowned video placeholder", "expanded image prompt exceeds context limit"][case];
+        let expected = ["media placeholder must be enclosed by image start/end tokens",
+            "paired placeholder count differs from supplied media", "expanded image prompt exceeds context limit"][case];
         assert!(error.to_string().contains(expected), "{error:#}");
     }
 }

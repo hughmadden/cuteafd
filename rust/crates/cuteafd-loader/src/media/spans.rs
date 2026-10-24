@@ -7,11 +7,23 @@ pub struct SpanExpander {
     pub end: u32,
     pub vocabulary: u32,
 }
+/// A media item laid out as `pairs` placeholders of `rows` feature rows each: a MiniMax
+/// video segment, whose temporal pairs each sit between their own image markers.
+#[derive(Debug, Clone, Copy)]
+pub struct PairedMedia {
+    pub key: cuteafd_core::MediaKey,
+    pub pairs: usize,
+    pub rows: usize,
+}
 #[derive(Debug)]
 pub struct ExpandedMediaPrompt {
     /// Only these native ids reach the LM, PLE and drafters.
     pub tokens: Vec<u32>,
     pub media: Vec<MediaSpan>,
+    /// The feature row each span starts at inside its media item (0 but for paired media).
+    pub offsets: Vec<usize>,
+    /// Feature rows of each span's media item.
+    pub rows: Vec<usize>,
 }
 impl SpanExpander {
     /// Marker ids come from the checkpoint config, never hard-coded by the API.
@@ -115,73 +127,81 @@ impl SpanExpander {
                 expanded.extend(std::iter::repeat_n(token, len));
             } else { expanded.push(token); }
         }
-        Ok(ExpandedMediaPrompt { tokens: expanded, media })
+        Ok(ExpandedMediaPrompt { offsets: vec![0; media.len()], rows: media.iter().map(|span| span.len).collect(),
+            tokens: expanded, media })
     }
 
-    pub fn expand(
-        &self,
-        tokens: &[u32],
-        images: &[PreparedImage],
-        context_limit: usize,
-    ) -> Result<ExpandedMediaPrompt> {
+    pub fn expand(&self, tokens: &[u32], images: &[PreparedImage], context_limit: usize) -> Result<ExpandedMediaPrompt> {
+        self.expand_paired(tokens, images, None, context_limit)
+    }
+
+    /// [`expand`](Self::expand) plus paired media behind their own placeholder id, in one
+    /// pass so every span keeps its final offset. Each paired placeholder, between the
+    /// image start/end markers, becomes its pair's rows of the media item's features.
+    pub fn expand_paired(&self, tokens: &[u32], images: &[PreparedImage], paired: Option<(u32, &[PairedMedia])>,
+        context_limit: usize) -> Result<ExpandedMediaPrompt> {
+        let pair_id = paired.map(|(id, _)| id);
+        let paired = paired.map_or(&[][..], |(_, items)| items);
         if self.vocabulary == 0
             || self.vocabulary >= 1 << 31
-            || [self.placeholder, self.start, self.end]
-                .iter()
-                .any(|&v| v >= self.vocabulary)
+            || [self.placeholder, self.start, self.end].iter().any(|&v| v >= self.vocabulary)
             || self.placeholder == self.start
             || self.placeholder == self.end
             || self.start == self.end
+            || pair_id.is_some_and(|id| id >= self.vocabulary || [self.placeholder, self.start, self.end].contains(&id))
         {
             return Err(invalid("invalid image marker ids or vocabulary"));
         }
         if tokens.iter().any(|&v| v >= self.vocabulary) {
             return Err(invalid("token outside checkpoint vocabulary"));
         }
-        let count = tokens.iter().filter(|&&v| v == self.placeholder).count();
-        if count != images.len() {
-            return Err(invalid(
-                "image placeholder count differs from supplied images",
-            ));
+        if tokens.iter().filter(|&&v| v == self.placeholder).count() != images.len() {
+            return Err(invalid("image placeholder count differs from supplied images"));
+        }
+        let pairs = paired.iter().try_fold(0usize, |n, item| (item.pairs > 0 && item.rows > 0)
+            .then(|| n.checked_add(item.pairs)).flatten()).ok_or_else(|| invalid("paired media needs pairs and rows"))?;
+        if pair_id.is_some_and(|id| tokens.iter().filter(|&&v| v == id).count() != pairs) {
+            return Err(invalid("paired placeholder count differs from supplied media"));
         }
         let mut expanded_len = tokens.len();
         for image in images {
             if image.tokens == 0 {
                 return Err(invalid("image has no LM rows"));
             }
-            expanded_len = expanded_len
-                .checked_add(image.tokens - 1)
+            expanded_len = expanded_len.checked_add(image.tokens - 1).ok_or_else(|| invalid("image prompt length overflow"))?;
+        }
+        for item in paired {
+            expanded_len = (item.rows - 1).checked_mul(item.pairs).and_then(|n| expanded_len.checked_add(n))
                 .ok_or_else(|| invalid("image prompt length overflow"))?;
         }
         if expanded_len > context_limit {
             return Err(invalid("expanded image prompt exceeds context limit"));
         }
         let mut expanded = Vec::with_capacity(expanded_len);
-        let mut media = Vec::with_capacity(images.len());
+        let (mut media, mut offsets, mut rows) = (Vec::new(), Vec::new(), Vec::new());
+        let (mut image, mut item, mut pair) = (0, 0, 0);
         for (i, &token) in tokens.iter().enumerate() {
-            if token != self.placeholder {
+            let (len, key, offset, total) = if token == self.placeholder {
+                let next = &images[image];
+                image += 1;
+                (next.tokens, next.key.into(), 0, next.tokens)
+            } else if pair_id == Some(token) {
+                let next = paired[item];
+                let offset = pair * next.rows;
+                (item, pair) = if pair + 1 == next.pairs { (item + 1, 0) } else { (item, pair + 1) };
+                (next.rows, next.key, offset, next.pairs * next.rows)
+            } else {
                 expanded.push(token);
                 continue;
+            };
+            if i == 0 || tokens.get(i - 1) != Some(&self.start) || tokens.get(i + 1) != Some(&self.end) {
+                return Err(invalid("media placeholder must be enclosed by image start/end tokens"));
             }
-            if i == 0
-                || tokens.get(i - 1) != Some(&self.start)
-                || tokens.get(i + 1) != Some(&self.end)
-            {
-                return Err(invalid(
-                    "image placeholder must be enclosed by image start/end tokens",
-                ));
-            }
-            let image = &images[media.len()];
-            media.push(MediaSpan {
-                start: expanded.len(),
-                len: image.tokens,
-                key: image.key.into(),
-            });
-            expanded.extend(std::iter::repeat_n(self.placeholder, image.tokens));
+            media.push(MediaSpan { start: expanded.len(), len, key });
+            offsets.push(offset);
+            rows.push(total);
+            expanded.extend(std::iter::repeat_n(token, len));
         }
-        Ok(ExpandedMediaPrompt {
-            tokens: expanded,
-            media,
-        })
+        Ok(ExpandedMediaPrompt { tokens: expanded, media, offsets, rows })
     }
 }

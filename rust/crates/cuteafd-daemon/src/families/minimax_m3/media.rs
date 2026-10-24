@@ -3,7 +3,8 @@ use super::MiniMaxError;
 use anyhow::{Context, Result};
 use cuteafd_api::openai::{media::MediaPreparer, NativeRequest};
 use cuteafd_engine::media::{EncodeJob, MediaKeys, RequestMedia};
-use cuteafd_loader::{media::{ImageFamily, ProcessorConfig, SpanExpander, minimax::ENCODER_TOKENS}, plan::MediaMode};
+use cuteafd_loader::{media::{ExpandedMediaPrompt, ImageFamily, PairedMedia, ProcessorConfig, SpanExpander,
+    minimax::{ENCODER_TOKENS, IMAGE_TOKEN, VIDEO_TOKEN}}, plan::MediaMode};
 use crate::shared::{prefix::PrefixArgs, qwen::{Encoder, scheduler::Prompt}, vision::{TowerSpec, startup::RemotePeers}};
 use std::{path::Path, sync::Arc};
 
@@ -67,49 +68,25 @@ pub(super) fn prepare(job: NativeRequest, tokens: Vec<u32>, expander: Option<&Sp
     if !job.audio.is_empty() {
         return Err(MiniMaxError::Unsupported("audio input is not admitted").into());
     }
-    let (tokens, mut spans) = if let Some(expander) = expander {
+    let expanded = if let Some(expander) = expander {
         if job.probe.as_ref().is_some_and(|p| p.spec.prompt_ids.is_some()) && (!job.media.is_empty() || !job.videos.is_empty()) {
             return Err(MiniMaxError::Unsupported("expanded media probe overrides").into());
         }
         let images = job.media.iter().map(|image| image.as_ref().clone()).collect::<Vec<_>>();
-        let expanded = expander.expand(&tokens, &images, max_context)?;
-        (expanded.tokens, expanded.media)
+        let paired = job.videos.iter().map(|segment| {
+            let patches = cuteafd_core::media::video_segment_patches([segment.grid.t, segment.grid.h, segment.grid.w])
+                .ok_or(MiniMaxError::Invalid("video segment grid"))?;
+            if patches != segment.tokens as u64 * 4 { return Err(MiniMaxError::Invalid("video segment token count").into()); }
+            Ok(PairedMedia { key: segment.key.into(), pairs: segment.grid.t as usize, rows: segment.tokens / segment.grid.t as usize })
+        }).collect::<Result<Vec<_>>>()?;
+        expander.expand_paired(&tokens, &images, Some((VIDEO_TOKEN, &paired)), max_context)?
     } else {
-        if !job.media.is_empty() || !job.videos.is_empty() || tokens.contains(&cuteafd_loader::media::minimax::IMAGE_TOKEN) || tokens.contains(&cuteafd_loader::media::minimax::VIDEO_TOKEN) {
+        if !job.media.is_empty() || !job.videos.is_empty() || tokens.contains(&IMAGE_TOKEN) || tokens.contains(&VIDEO_TOKEN) {
             return Err(MiniMaxError::Unsupported("image input requires the bundled encoder").into());
         }
-        (tokens, Vec::new())
+        ExpandedMediaPrompt { tokens, media: Vec::new(), offsets: Vec::new(), rows: Vec::new() }
     };
-    let mut layout = spans.drain(..).map(|span| (span, 0, span.len)).collect::<Vec<_>>();
-    let mut cursor = 0;
-    for segment in &job.videos {
-        let markers = expander.context("video requires the bundled encoder")?;
-        let patches = cuteafd_core::media::video_segment_patches([segment.grid.t, segment.grid.h, segment.grid.w])
-            .ok_or(MiniMaxError::Invalid("video segment grid"))?;
-        if patches != segment.tokens as u64 * 4 {
-            return Err(MiniMaxError::Invalid("video segment token count").into());
-        }
-        let rows = segment.tokens / segment.grid.t as usize;
-        for pair in 0..segment.grid.t as usize {
-            let start = tokens[cursor..].iter().position(|&t| t == cuteafd_loader::media::minimax::VIDEO_TOKEN)
-                .map(|n| n + cursor).context("missing video placeholder span")?;
-            let end = start.checked_add(rows).context("video span overflow")?;
-            if start == 0 || tokens.get(start - 1) != Some(&markers.start)
-                || tokens.get(end) != Some(&markers.end)
-                || tokens.get(start..end).is_none_or(|span| span.iter().any(|&t| t != cuteafd_loader::media::minimax::VIDEO_TOKEN)) {
-                return Err(MiniMaxError::Invalid("video placeholder span differs from prepared segment").into());
-            }
-            layout.push((cuteafd_core::MediaSpan { start, len: rows, key: segment.key.into() }, pair * rows, segment.tokens));
-            cursor = end;
-        }
-    }
-    if tokens[cursor..].contains(&cuteafd_loader::media::minimax::VIDEO_TOKEN) {
-        return Err(MiniMaxError::Invalid("unowned video placeholder").into());
-    }
-    layout.sort_by_key(|(span, _, _)| span.start);
-    let spans = layout.iter().map(|&(span, _, _)| span).collect::<Vec<_>>();
-    let offsets = layout.iter().map(|&(_, offset, _)| offset).collect::<Vec<_>>();
-    let rows = layout.iter().map(|&(_, _, rows)| rows).collect();
+    let ExpandedMediaPrompt { tokens, media: spans, offsets, rows } = expanded;
     let media = RequestMedia::new_with_layout(spans.clone(), 6144, tokens.len(), offsets.clone(), rows)?;
     let keys = MediaKeys::new_with_offsets(&tokens, vocabulary as u32, &spans, &offsets)?;
     let jobs = job.media.iter().map(|image| EncodeJob::image(image.key,

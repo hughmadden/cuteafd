@@ -165,15 +165,17 @@ pub fn prepare_video_frames(frames: &[RgbImage], encoder: EncoderId, sizing: Vid
 }
 
 impl PreparedVideoSegment {
-    /// Expand one video's marker before tokenization, matching MiniMaxVLProcessor.
-    /// Each temporal pair has its own image delimiters. `frame_indices` contains
-    /// source indices for this segment, so timestamps retain the video's timeline.
+    /// One video's marker text before tokenization, as MiniMaxVLProcessor lays it out:
+    /// each temporal pair gets its timestamp and its own image delimiters around one
+    /// video marker, which SpanExpander::expand_paired expands into the pair's rows.
+    /// `frame_indices` holds this segment's source indices, so timestamps keep the
+    /// video's timeline.
     pub fn placeholder(&self, fps: Option<f64>, frame_indices: Option<&[usize]>) -> Result<String> {
         let grid = [self.grid.t, self.grid.h, self.grid.w];
         if cuteafd_core::media::video_segment_patches(grid) != Some(self.tokens as u64 * 4) || self.tokens > 57_600 {
             return Err(invalid("video placeholder grid and token count differ"));
         }
-        let (t, frame_tokens) = (self.grid.t as usize, self.tokens / self.grid.t as usize);
+        let t = self.grid.t as usize;
         let timestamps = if let (Some(fps),Some(indices)) = (fps,frame_indices) {
             if !fps.is_finite() || fps <= 0.0 || indices.is_empty() { return Err(invalid("invalid video timestamp metadata")); }
             Some((fps,indices))
@@ -184,9 +186,7 @@ impl PreparedVideoSegment {
                 let timestamp = indices[(frame * 2).min(indices.len()-1)] as f64 / fps;
                 text.push_str(&format!("]<]{timestamp:.1} seconds[>["));
             }
-            text.push_str("]<]start of image[>[");
-            for _ in 0..frame_tokens { text.push_str("]<]video[>["); }
-            text.push_str("]<]end of image[>[");
+            text.push_str("]<]start of image[>[]<]video[>[]<]end of image[>[");
         }
         Ok(text)
     }
@@ -323,8 +323,7 @@ mod tests {
     fn video_placeholder_wraps_each_temporal_pair_and_keeps_sampled_timestamps() {
         let frames = vec![RgbImage {width:56,height:28,data:vec![0;56*28*3]};3];
         let segment = prepare_video_frames(&frames,EncoderId([0;32]),VideoResize::Off).unwrap().remove(0);
-        let pair = "]<]start of image[>[".to_owned()
-            + "]<]video[>[" + "]<]video[>[" + "]<]end of image[>[";
+        let pair = "]<]start of image[>[]<]video[>[]<]end of image[>[";
         assert_eq!(segment.placeholder(None,None).unwrap(),pair.repeat(2));
         assert_eq!(segment.placeholder(Some(4.0),Some(&[1,8,15])).unwrap(),
             format!("]<]0.2 seconds[>[{pair}]<]3.8 seconds[>[{pair}"));
@@ -420,8 +419,11 @@ mod tests {
             let indices: Vec<usize> = (0..count).collect();
             let (mut text, mut offset) = (String::new(), 0);
             for segment in &segments {
+                // The processor writes every row's marker; the expander does that in token space.
+                let rows = segment.tokens / segment.grid.t as usize;
                 text.push_str(&segment.placeholder(case["source_fps"].as_f64(),
-                    Some(&indices[offset..offset + segment.source_frames])).unwrap());
+                    Some(&indices[offset..offset + segment.source_frames])).unwrap()
+                    .replace("]<]video[>[", &"]<]video[>[".repeat(rows)));
                 offset += segment.source_frames;
             }
             assert_eq!(text, case["placeholder"].as_str().unwrap(), "{name}");
