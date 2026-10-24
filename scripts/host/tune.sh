@@ -138,7 +138,7 @@ swap_policy() {
                 status=masked
             elif ((LIVE)); then
                 output=$(timeout 10s systemctl is-enabled "$name" 2>/dev/null) || true
-                if [[ $output == masked ]]; then status=masked; fi
+                if [[ -n $output ]]; then status=$output; fi
             fi
             if [[ $ACTION == report ]]; then row "swap unit $name" "$status" masked; fi
             [[ $status == masked ]] || unmasked+=("$name")
