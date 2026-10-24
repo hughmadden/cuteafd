@@ -121,6 +121,47 @@ __global__ void reduce_compact(const __nv_bfloat16* p0,
   }
 }
 
+__device__ __forceinline__ void widen8(uint4 packed, float* out) {
+  const auto* pairs = reinterpret_cast<const __nv_bfloat162*>(&packed);
+  for (int i = 0; i < 4; ++i) {
+    const float2 pair = __bfloat1622float2(pairs[i]);
+    out[2 * i] = pair.x;
+    out[2 * i + 1] = pair.y;
+  }
+}
+
+__device__ __forceinline__ void accumulate8(uint4 packed, float* value) {
+  float add[8];
+  widen8(packed, add);
+  for (int i = 0; i < 8; ++i) value[i] = __fadd_rn(value[i], add[i]);
+}
+
+// reduce_compact_eight over eight BF16 per thread through 16-byte loads: each
+// element's ordered FP32 sum and single rounding are unchanged (bit-identical),
+// while planes in host-mapped memory cross PCIe in full requests.
+template<int Ranks>
+__global__ void reduce_compact_eight_v8(const uint4* p0, const uint4* p1, const uint4* p2,
+    const uint4* p3, const uint4* p4, const uint4* p5, const uint4* p6, const uint4* p7,
+    const uint4* shared, uint4* output, uint64_t vectors) {
+  for (uint64_t offset = uint64_t(blockIdx.x) * blockDim.x + threadIdx.x;
+       offset < vectors; offset += uint64_t(gridDim.x) * blockDim.x) {
+    float value[8];
+    widen8(p0[offset], value);
+    if constexpr (Ranks >= 2) accumulate8(p1[offset], value);
+    if constexpr (Ranks >= 3) accumulate8(p2[offset], value);
+    if constexpr (Ranks >= 4) accumulate8(p3[offset], value);
+    if constexpr (Ranks >= 5) accumulate8(p4[offset], value);
+    if constexpr (Ranks >= 6) accumulate8(p5[offset], value);
+    if constexpr (Ranks >= 7) accumulate8(p6[offset], value);
+    if constexpr (Ranks >= 8) accumulate8(p7[offset], value);
+    if (shared) accumulate8(shared[offset], value);
+    uint4 packed;
+    auto* pairs = reinterpret_cast<__nv_bfloat162*>(&packed);
+    for (int i = 0; i < 4; ++i) pairs[i] = __floats2bfloat162_rn(value[2 * i], value[2 * i + 1]);
+    output[offset] = packed;
+  }
+}
+
 template<int Ranks>
 __global__ void reduce_compact_eight(const __nv_bfloat16* p0,
     const __nv_bfloat16* p1, const __nv_bfloat16* p2,
@@ -272,8 +313,29 @@ extern "C" int32_t cuteafd_reduce_compact_bf16_eight_planes_async(
       reinterpret_cast<uintptr_t>(shared) > UINTPTR_MAX - bytes ||
       (shared != output && overlaps(shared, bytes, output, bytes))))
     return cudaErrorInvalidValue;
-  const unsigned blocks = static_cast<unsigned>(count / 256 < 4096 ? count / 256 : 4096);
   auto cuda_stream = static_cast<cudaStream_t>(stream);
+  bool aligned = count % 8 == 0 && reinterpret_cast<uintptr_t>(output) % 16 == 0
+      && reinterpret_cast<uintptr_t>(shared) % 16 == 0;
+  for (uint32_t rank = 0; rank < ranks; ++rank) aligned = aligned && reinterpret_cast<uintptr_t>(planes[rank]) % 16 == 0;
+  if (aligned) {
+    const uint64_t vectors = count / 8;
+    const unsigned grid = static_cast<unsigned>(vectors / 256 < 4096 ? (vectors + 255) / 256 : 4096);
+    const auto* v = reinterpret_cast<const uint4* const*>(planes);
+    const auto* s = reinterpret_cast<const uint4*>(shared);
+    auto* o = reinterpret_cast<uint4*>(output);
+    switch (ranks) {
+      case 1: reduce_compact_eight_v8<1><<<grid, 256, 0, cuda_stream>>>(v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7], s, o, vectors); break;
+      case 2: reduce_compact_eight_v8<2><<<grid, 256, 0, cuda_stream>>>(v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7], s, o, vectors); break;
+      case 3: reduce_compact_eight_v8<3><<<grid, 256, 0, cuda_stream>>>(v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7], s, o, vectors); break;
+      case 4: reduce_compact_eight_v8<4><<<grid, 256, 0, cuda_stream>>>(v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7], s, o, vectors); break;
+      case 5: reduce_compact_eight_v8<5><<<grid, 256, 0, cuda_stream>>>(v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7], s, o, vectors); break;
+      case 6: reduce_compact_eight_v8<6><<<grid, 256, 0, cuda_stream>>>(v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7], s, o, vectors); break;
+      case 7: reduce_compact_eight_v8<7><<<grid, 256, 0, cuda_stream>>>(v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7], s, o, vectors); break;
+      case 8: reduce_compact_eight_v8<8><<<grid, 256, 0, cuda_stream>>>(v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7], s, o, vectors); break;
+    }
+    return cudaGetLastError();
+  }
+  const unsigned blocks = static_cast<unsigned>(count / 256 < 4096 ? count / 256 : 4096);
   const auto* p0 = reinterpret_cast<const __nv_bfloat16*>(planes[0]);
   const auto* p1 = reinterpret_cast<const __nv_bfloat16*>(planes[1]);
   const auto* p2 = reinterpret_cast<const __nv_bfloat16*>(planes[2]);
