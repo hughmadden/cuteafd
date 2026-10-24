@@ -1,7 +1,7 @@
 //! Teacher-forced qualification through the serving programs and paged cache.
 use super::{cache::{Cache, INDEX_PAGE_BYTES, KV_PAGE_BYTES}, execution::{BatchView, Execution, ExpertExecutor, RequestView},
     prefix::{MiniMaxPrefix, Placement}, routed::Routed, MiniMaxError};
-use crate::shared::{golden_scores::{scored_kl, scored_nll}, memory::device::Device,
+use crate::shared::{golden_scores::{scored_kl, scored_nll, HiddenMetrics}, memory::device::Device,
     placement::{spark_rings, SparkAdmission},
     token_io::{EmbedPlacement, EmbedSource, TokenEmbedding}};
 use anyhow::{ensure, Context, Result};
@@ -376,7 +376,7 @@ fn score_window(runner: &mut Runner<'_, '_>, args: &GoldenArgs, window: &Window,
     let mut current = placement((0..window.tokens.len().div_ceil(64) as u32).collect());
     let mut scores = Scores::default();
     let mut generated = Scores::default();
-    let (mut dot, mut left, mut right, mut error) = (0.0, 0.0, 0.0, 0.0);
+    let mut hidden = HiddenMetrics::default();
     let mut first = 0;
     while first < window.tokens.len() {
         let unscored = first < window.positions[0] - 1;
@@ -397,9 +397,7 @@ fn score_window(runner: &mut Runner<'_, '_>, args: &GoldenArgs, window: &Window,
             }
         } else {
             file.write_all(&values.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>())?;
-            for (&a, &b) in values.iter().zip(&expected[first * width..(first + count) * width]) {
-                let (a, b) = (a as f64, b as f64); dot += a * b; left += a * a; right += b * b; error += (a - b).powi(2);
-            }
+            hidden.add(&values, &expected[first * width..(first + count) * width])?;
         }
         first += count;
     }
@@ -408,8 +406,8 @@ fn score_window(runner: &mut Runner<'_, '_>, args: &GoldenArgs, window: &Window,
     std::fs::write(directory.join("tokens.bin"), window.tokens.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>())?;
     std::fs::write(directory.join("positions.bin"), window.positions.iter().flat_map(|&p| (p as u32).to_le_bytes()).collect::<Vec<_>>())?;
     let mut result = if full {scores.result()?} else {
-        ensure!(left > 0.0 && right > 0.0, "zero partial hidden norm");
-        json!({"cosine":dot / (left * right).sqrt(), "relative_l2":(error / right).sqrt()})
+        let (cosine, relative_l2) = hidden.result()?;
+        json!({"cosine":cosine, "relative_l2":relative_l2})
     };
     result["schema"] = "cuteafd.minimax.golden.window/2".into();
     result["window"] = window.id.clone().into(); result["binding"] = binding.clone();
@@ -429,16 +427,6 @@ fn score_window(runner: &mut Runner<'_, '_>, args: &GoldenArgs, window: &Window,
     }
     if !full {verdict(&result, false)?;}
     Ok(result)
-}
-
-fn request(identity: u64, layer: usize, rows: usize, routes: Vec<cuteafd_transport::ExpertProtocolV2RouteEntry>,
-    wire: bytes::Bytes, kind: ExpertV2SourceKind) -> Result<cuteafd_transport::ExpertProtocolV2Request> {
-    use cuteafd_transport::{ExpertProtocolV2Request, ExpertProtocolV2RowDescriptor, ExpertV2Dtype};
-    let mut request = ExpertProtocolV2Request::new_bytes(identity, 1, layer as u32, 6144, ExpertV2Dtype::Bf16,
-        (0..rows as u32).map(|row| ExpertProtocolV2RowDescriptor {row_id:row as u64, source_kind:kind,
-            source_request_id:identity, token_position:row as u64, route_offset:row * 4, route_count:4}).collect(), routes, wire)?;
-    request.header.flags |= cuteafd_transport::expert::EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16;
-    Ok(request)
 }
 
 pub(crate) async fn run_golden(args: GoldenArgs) -> Result<()> {
@@ -531,7 +519,7 @@ pub(crate) async fn run_golden(args: GoldenArgs) -> Result<()> {
     let spark = if let Some(&first) = remote.first() {
         cuteafd_transport::worker_selection::require_peer_clients(&args.peers, endpoint, 1)?;
         Some(super::routed::Spark::connect(&library, args.device, SparkWorld::canonical(args.peers.len())?, &args.peers,
-            sizing.rows, config, first, request)?)
+            sizing.rows, config, first, super::serve::request)?)
     } else {None};
     let experts: Box<dyn ExpertExecutor<'_>> = if local.is_none() && spark.is_none() {Box::new(DenseOnly)}
         else {Box::new(Routed::new(local, spark)?)};

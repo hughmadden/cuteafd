@@ -113,7 +113,7 @@ impl ServeArgs {
     }
 }
 
-fn request(identity: u64, layer: usize, rows: usize, routes: Vec<cuteafd_transport::ExpertProtocolV2RouteEntry>,
+pub(super) fn request(identity: u64, layer: usize, rows: usize, routes: Vec<cuteafd_transport::ExpertProtocolV2RouteEntry>,
     wire: bytes::Bytes, kind: cuteafd_transport::ExpertV2SourceKind) -> Result<cuteafd_transport::ExpertProtocolV2Request> {
     use cuteafd_transport::{ExpertProtocolV2Request, ExpertProtocolV2RowDescriptor, ExpertV2Dtype};
     if identity == 0 || !(3..60).contains(&layer) || !(1..=4096).contains(&rows) {

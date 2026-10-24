@@ -8,7 +8,7 @@ use super::{
 };
 use crate::shared::{
     memory::device::{Allocation, Device},
-    golden_scores::{select_scored_rows, scored_nll, scored_kl},
+    golden_scores::{hidden_metrics, select_scored_rows, scored_nll, scored_kl},
     placement::{spark_rings, SparkAdmission},
     spark_intake::SparkDeviceLink,
 };
@@ -278,21 +278,6 @@ fn hidden_file(path: PathBuf, full_rows: usize, rows: usize) -> Result<Vec<f32>>
         .map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect();
     ensure!(values.iter().all(|v| v.is_finite()), "nonfinite reference hidden payload");
     Ok(values)
-}
-
-fn hidden_metrics(actual: &[f32], expected: &[f32]) -> Result<(f64, f64)> {
-    ensure!(!actual.is_empty() && actual.len() == expected.len()
-        && actual.iter().chain(expected).all(|v| v.is_finite()), "hidden comparison shape/finite mismatch");
-    let (mut error, mut norm, mut dot, mut ours) = (0., 0., 0., 0.);
-    for (&a, &b) in actual.iter().zip(expected) {
-        let (a, b) = (f64::from(a), f64::from(b));
-        error += (a - b).powi(2);
-        norm += b * b;
-        dot += a * b;
-        ours += a * a;
-    }
-    ensure!(norm > 0. && ours > 0., "zero hidden state norm");
-    Ok((dot / (norm * ours).sqrt(), (error / norm).sqrt()))
 }
 
 fn reference(args: &GoldenArgs, vocab: usize) -> Result<Reference> {
