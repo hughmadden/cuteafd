@@ -29,6 +29,7 @@ mod dspark_verify;
 pub use dspark_verify::{verify_dspark_greedy, verify_dspark_greedy_vocab, GreedyVerification, MAX_DSPARK_PROPOSALS, V41_VERIFY_ROWS};
 mod engram;
 pub mod prefix;
+pub mod variants;
 pub mod steer_rows;
 pub mod serving_capacity;
 pub mod thermal;

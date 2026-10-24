@@ -71,6 +71,14 @@ pub(crate) struct ServeArgs {
     pub console: console::ConsoleArgs,
     #[command(flatten)]
     pub api: crate::shared::api::ApiArgs,
+    #[command(flatten)]
+    pub variants: crate::shared::variants::VariantArgs,
+}
+
+/// The prefix-cache key of a sequence's tokens: base keys are the tokens; a weight variant's
+/// carry its namespace (contract §5), so variant and base state never share a snapshot.
+fn prefix_key(tokens: &[u32], variant: u8) -> Result<std::borrow::Cow<'_, [u32]>> {
+    Ok(cuteafd_engine::prefix::namespaced(tokens, variant)?)
 }
 
 fn model_id(snapshot: &std::path::Path) -> Option<String> {
@@ -89,7 +97,7 @@ pub(crate) async fn run_serve(args: ServeArgs) -> Result<()> {
     let api = args.api.load()?;
     let snapshot: PathBuf = args.engine.snapshot.clone();
     let encoding = GlmEncoding::from_snapshot(&snapshot)?.with_thinking_off(args.thinking_off);
-    let profile = ModelProfile::new(
+    let mut profile = ModelProfile::new(
         args.model_id.clone().or_else(|| model_id(&snapshot)).context("model id")?,
         ModelEncoding::Glm(Arc::new(encoding)),
     );
@@ -97,6 +105,8 @@ pub(crate) async fn run_serve(args: ServeArgs) -> Result<()> {
     let stats = Arc::new(Mutex::new(serde_json::Value::Null));
     let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
     let mut engine_args = args.engine.clone();
+    engine_args.variants = args.variants.indexed(&profile.id)?;
+    engine_args.served_id = profile.id.clone();
     if engine_args.draft_context_slots.is_none() {
         engine_args.draft_context_slots = Some(20.max(engine_args.draft_sequences)
             .max(args.max_sequences.saturating_mul(5).div_ceil(4)));
@@ -108,7 +118,9 @@ pub(crate) async fn run_serve(args: ServeArgs) -> Result<()> {
     let hub = console::hub(args.console.console_text, || Ok(console_layout(&args, &profile.id)));
     let worker = tokio::task::spawn_blocking(move ||
         serve_loop(engine_args, receive, ready_tx, worker_stats, max_sequences, policy, prefix));
-    let max_context = ready_rx.await.context("engine failed before it was ready")??;
+    let (max_context, variants) = ready_rx.await.context("engine failed before it was ready")??;
+    // Only variants whose tables verified and loaded are served under their ids.
+    profile.variants = variants;
     let limits = NativeLimits::new(u32::try_from(max_context)?, args.max_output)?;
     cuteafd_bench::context::phase("engine loaded");
     let router = cuteafd_api::openai::router_for_model(queue, limits, stats, Duration::from_secs(25),
@@ -161,7 +173,7 @@ struct Policy {
 }
 
 fn serve_loop(args: super::EngineArgs, mut receive: mpsc::Receiver<NativeRequest>,
-    ready: tokio::sync::oneshot::Sender<Result<usize>>, stats: Arc<Mutex<serde_json::Value>>, max_sequences: usize,
+    ready: tokio::sync::oneshot::Sender<Result<(usize, Vec<cuteafd_core::variants::VariantRecord>)>>, stats: Arc<Mutex<serde_json::Value>>, max_sequences: usize,
     policy: Policy, prefix: PrefixArgs) -> Result<()> {
     let opened = match open(&args) {
         Ok(opened) => opened,
@@ -174,7 +186,8 @@ fn serve_loop(args: super::EngineArgs, mut receive: mpsc::Receiver<NativeRequest
     let result = opened.with_engine(&args, |engine, transport, runtime| {
         anyhow::ensure!(transport.is_some() || engine.skip_routed() || engine.has_tp2(), "serve-glm needs Spark peers, local TP2 or --skip-routed-experts");
         if let Some(ready) = ready.take() {
-            let _ = ready.send(Ok(engine.max_context));
+            let records = engine.variants.as_ref().map(|v| v.records.clone()).unwrap_or_default();
+            let _ = ready.send(Ok((engine.max_context, records)));
         }
         let ranks = args.peers.as_deref().map_or(4, |peers| peers.split(',').count());
         let spark = transport.is_some();
@@ -183,7 +196,7 @@ fn serve_loop(args: super::EngineArgs, mut receive: mpsc::Receiver<NativeRequest
             ranks, &prefix, args.token_io.token_select)
     });
     if let Some(ready) = ready.take() {
-        let _ = ready.send(result.as_ref().map(|_| args.max_context).map_err(|e| anyhow::anyhow!("{e:#}")));
+        let _ = ready.send(result.as_ref().map(|_| (args.max_context, Vec::new())).map_err(|e| anyhow::anyhow!("{e:#}")));
     }
     result
 }
@@ -411,11 +424,12 @@ fn release(family: &GlmPrefix<'_, '_>, cache: &mut PrefixCache<CudaCopyEngine<'_
 
 /// Serving statistics for `/v1/stats`.
 fn publish(stats: &Mutex<serde_json::Value>, requests: u64, generated: u64, active: usize, prefilling: usize,
-    cache: &PrefixCache<CudaCopyEngine<'_>>) {
+    cache: &PrefixCache<CudaCopyEngine<'_>>, variants: &cuteafd_core::variants::VariantStats) {
     if let Ok(mut stats) = stats.lock() {
         *stats = serde_json::json!({"requests": requests, "generated_tokens": generated, "active": active,
             "prefilling": prefilling, "prefix_cache": cache.stats(),
             "draft_policy": crate::shared::draft::resource::snapshot()});
+        if !variants.is_empty() { stats["variants"] = variants.json(); }
     }
 }
 
@@ -448,6 +462,8 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
     mut transport: Option<&mut SparkLink<'_>>, runtime: &tokio::runtime::Runtime, stats: &Mutex<serde_json::Value>,
     max_sequences: usize, policy: Policy, ranks: usize, prefix: &PrefixArgs, select: SelectPlacement) -> Result<()> {
     let (family, mut cache) = prefix_cache(engine, prefix, max_sequences)?;
+    let mut by_variant = cuteafd_core::variants::VariantStats::new(
+        engine.variants.as_ref().map(|v| v.records.clone()).unwrap_or_default());
     let markers = crate::shared::prefix::marker_ids(&opened.snapshot,
         &crate::families::glm5_flash::serve::MESSAGE_STARTS)?;
     let mut grammars = crate::shared::constraints::Compiler::with_vocab(
@@ -497,7 +513,7 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
                     if !busy {
                         // Idle: publish the state the server waits in (captures and releases done).
                         cache.tick();
-                        publish(stats, requests, generated_total, 0, 0, &cache);
+                        publish(stats, requests, generated_total, 0, 0, &cache, &by_variant);
                         console::gauges_now(|| console::Gauges::prefix_cache(&cache, 0, 0, 0));
                         match receive.blocking_recv() {
                             Some(job) => job,
@@ -537,7 +553,9 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
             let admit_started = Instant::now();
             // Lookup and fork of the retained pages (byte-exact: the pages are the whole state).
             let lookup: &[u32] = if cold { &[] } else { &tokens };
-            let admitted = match cache.admit(&family, lookup, capacity, true, |pages| GlmPlacement { pages, len: 0 }) {
+            // A variant's rows live in its own prefix namespace (part of the key).
+            let lookup = prefix_key(lookup, job.variant)?;
+            let admitted = match cache.admit(&family, &lookup, capacity, true, |pages| GlmPlacement { pages, len: 0, variant: job.variant }) {
                 Ok(admitted) => admitted,
                 Err(error) => {
                     free_slots.extend(slot);
@@ -552,6 +570,7 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
             };
             admitted_total += 1;
             let resume = admitted.resume;
+            by_variant.admitted(job.variant, tokens.len(), !cold, resume > 0);
             job.prefix_cache_source.set(resume, admitted.source.as_ref().is_some_and(|source| source.host));
             probe::admitted(&job.probe, "glm5", &tokens, resume);
             let _ = job.events.send(Ok(InferenceChunk::Ready {
@@ -655,8 +674,8 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
                 // Intermediate snapshot points this chunk ends at (off unless configured).
                 for &(_, point) in p.plan.points.iter().filter(|&&(chunk, _)| chunk == p.chunks && !probe::cold(&p.job.probe)) {
                     cache.capture_session(p.ticket.session());
-                    if let Err(error) = cache.capture(&family, SnapshotKind::Prompt, &p.tokens[..point], &p.placement,
-                        After::default()) {
+                    if let Err(error) = cache.capture(&family, SnapshotKind::Prompt,
+                        &prefix_key(&p.tokens[..point], p.placement.variant)?, &p.placement, After::default()) {
                         tracing::warn!("snapshot point {point} not retained: {error:#}");
                     }
                 }
@@ -665,13 +684,15 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
             });
             for (mut p, prefilled) in finished {
                 let (slot, placement, resume) = (p.slot, p.placement.clone(), p.resume);
+                by_variant.steered(placement.variant, placement.len.saturating_sub(resume));
                 if let Err(error) = &prefilled {
                     if p.cancelled {
                         p.ticket.cancel();
                         // The client left during the prefill: keep what it computed for a retry.
                         if placement.len > resume && !probe::cold(&p.job.probe) {
                             cache.capture_session(p.ticket.session());
-                            if let Err(error) = cache.park(&family, &p.tokens[..placement.len], &placement) {
+                            if let Err(error) = cache.park(&family, &prefix_key(&p.tokens[..placement.len], placement.variant)?,
+                                &placement) {
                                 tracing::warn!("parking a cancelled prefill: {error:#}");
                             }
                         }
@@ -698,8 +719,9 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
                 let retain_prompt = |cache: &mut PrefixCache<CudaCopyEngine<'_>>, placement: &GlmPlacement| {
                     if let (Some(prompt), Some(logits)) = (&prompt, &logits) {
                         cache.capture_session(session.clone());
-                        if let Err(error) = cache.capture(&family, SnapshotKind::Prompt, prompt, placement,
-                            After::from_logits(logits, true)) {
+                        let captured = prefix_key(prompt, placement.variant).and_then(|key| Ok(cache.capture(&family,
+                            SnapshotKind::Prompt, &key, placement, After::from_logits(logits, true))?));
+                        if let Err(error) = captured {
                             tracing::warn!("prompt snapshot not retained: {error:#}");
                         }
                     }
@@ -858,6 +880,7 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
         }
         phases[2] += timer.elapsed().as_secs_f64();
         cuteafd_transport::route_log::step(|| active.iter().zip(&sequences).map(|(a, s)| (a.id, s.len() as u32)).collect());
+        for (a, s) in active.iter().zip(&sequences) { by_variant.steered(a.placement.variant, s.len()); }
         let mut rows: Vec<(&mut GlmPlacement, usize)> = active.iter_mut().zip(&sequences)
             .map(|(a, s)| (&mut a.placement, s.len())).collect();
         let timer = Instant::now();
@@ -1009,8 +1032,10 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
             let engine_phases = std::mem::take(&mut *engine.profile.borrow_mut());
             let host = std::mem::take(&mut phases);
             let [steps, dflash, dflash_ok] = request.counts;
+            by_variant.finished(request.placement.variant, request.generated, dflash as u64, dflash_ok as u64);
             let per_step = |s: f64| 1e3 * s / host[6].max(1.0);
             tracing::info!(tokens = request.generated, seconds, tok_s = request.generated as f64 / seconds,
+                variant = by_variant.name(request.placement.variant),
                 active = active.len(), steps, dflash, dflash_ok, gpu_wait_s = engine_phases[0],
                 experts_s = engine_phases[1], head_s = engine_phases[2], "request complete");
             tracing::info!(steps = host[6], rows_per_step = host[7] / host[6].max(1.0), draft_ms = per_step(host[0]),
@@ -1021,15 +1046,15 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
                 // The conversation so far: every committed row (the last token is not in it).
                 let rows = &request.history[..request.placement.len];
                 cache.capture_session(request.ticket.session());
-                if let Err(error) = cache.capture(&family, SnapshotKind::Turn, rows, &request.placement,
-                    After::from_logits(row, true)) {
+                if let Err(error) = cache.capture(&family, SnapshotKind::Turn,
+                    &prefix_key(rows, request.placement.variant)?, &request.placement, After::from_logits(row, true)) {
                     tracing::warn!("turn snapshot not retained: {error:#}");
                 }
             }
             release(&family, &mut cache, &mut free_slots, &request.placement, request.slot);
         }
         cache.tick();
-        publish(stats, requests, generated_total, active.len(), prefills.len(), &cache);
+        publish(stats, requests, generated_total, active.len(), prefills.len(), &cache, &by_variant);
         console::gauges(|| console::Gauges::prefix_cache(&cache, active.len(), prefills.len(), receive.len() + kv_waiter.len()));
         prefills.stepped(cycle.elapsed().as_secs_f64());
     }

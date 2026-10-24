@@ -144,6 +144,51 @@ fn validate_glmf_precision(args: &PlanArgs, family: &str) -> Result<(), PlanErro
     Ok(())
 }
 
+/// `cuteafd plan --variant ...`: the shared CPU derivation, one verdict per site tensor.
+fn plan_variants(args: &PlanArgs, snapshot: &std::path::Path) -> Result<()> {
+    let served = if std::path::Path::new(&args.model).is_dir() {
+        snapshot.file_name().and_then(|n| n.to_str()).unwrap_or("model").to_owned()
+    } else { args.model.clone() };
+    let parallel = std::thread::available_parallelism().map_or(4, |n| (n.get() / 8).clamp(1, 4));
+    let mut outcomes = Vec::new();
+    for (index, spec) in args.variants.indexed(&served)? {
+        outcomes.push(cuteafd_loader::variants::derive_variant(snapshot, &served, index, &spec, parallel)?);
+    }
+    if args.json {
+        let value: Vec<serde_json::Value> = outcomes.iter().map(|o| serde_json::json!({
+            "name": o.name, "id": o.public_id, "available": o.plan.is_some(), "rejection": o.rejection,
+            "sites": o.plan.as_ref().map(|p| p.sites.len()), "k_max": o.plan.as_ref().map(|p| p.k_max()),
+            "table_bytes": o.plan.as_ref().map(|p| p.table_bytes()),
+            "namespace": o.plan.as_ref().map(|p| format!("{:016x}", p.namespace)),
+            "verify": o.verify_summary(), "missing_in_base": o.missing_in_base, "verdicts": o.verdicts })).collect();
+        println!("{}", serde_json::to_string_pretty(&value)?);
+        return Ok(());
+    }
+    for outcome in &outcomes {
+        println!("variant {} ({}): {:.1} s", outcome.name, outcome.public_id, outcome.seconds);
+        println!("  {:<18} {:<58} {:>2} {:>7} {:>6} {:>7} {:>7} {:>8}  verdict", "site", "tensor", "k", "alpha", "top", "next", "|cos|", "r_W");
+        for verdict in &outcome.verdicts {
+            match &verdict.report {
+                None => println!("  {:<18} {:<58} unchanged", verdict.site, verdict.tensor),
+                Some(r) => println!("  {:<18} {:<58} {:>2} {:>7.3} {:>6.4} {:>7.5} {:>7.5} {:>8.5}  {}", verdict.site, verdict.tensor,
+                    r.k, r.alphas.first().copied().unwrap_or(0.0), r.top_share, r.next_share, r.proj_cos, r.r_w,
+                    if r.accept { "ok".to_owned() } else { format!("REJECT: {}", r.reason.as_deref().unwrap_or("")) }),
+            }
+        }
+        if !outcome.missing_in_base.is_empty() {
+            println!("  note: {} site tensors are absent from the base and were not derived (first: {})",
+                outcome.missing_in_base.len(), outcome.missing_in_base[0]);
+        }
+        match (&outcome.plan, &outcome.rejection) {
+            (Some(plan), _) => println!("  AVAILABLE: {} sites, k_max {}, tables {} KiB per GPU that owns them, namespace {:016x}",
+                plan.sites.len(), plan.k_max(), plan.table_bytes().div_ceil(1024), plan.namespace),
+            (None, Some(reason)) => println!("  UNAVAILABLE: {reason}; weight-set variant required. Base serving is unaffected."),
+            (None, None) => unreachable!(),
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn run_plan(mut args: PlanArgs) -> Result<()> {
     if args.spark_range { args.layout = true; }
     if args.deployment {
@@ -198,6 +243,7 @@ pub(crate) fn run_plan(mut args: PlanArgs) -> Result<()> {
             .snapshot_path
             .with_context(|| format!("no snapshot of {} under {}", args.model, hf_home.display()))?
     };
+    if !args.variants.variants.is_empty() { return plan_variants(&args, &snapshot); }
     if cuteafd_loader::plan::exlr8::recognizes(&snapshot)? {
         if args.spark_range {
             return Err(PlanError::InvalidOption { option: "--spark-range", reason:
@@ -812,7 +858,7 @@ mod tests {
     }
 
     fn args(model: &std::path::Path, spark_ranks: usize, require_ready: bool) -> PlanArgs {
-        PlanArgs {
+        PlanArgs { variants: Default::default(),
             draft_kv_cache: cuteafd_loader::families::qwen4::Qwen4KvCache::Bf16,
             exlr8_manifest: None,
             mapped_scale_preload_gib: 0.0,
