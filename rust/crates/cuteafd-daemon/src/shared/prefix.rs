@@ -4,6 +4,8 @@ use anyhow::Result;
 use cuteafd_engine::prefix::{FamilyLayout, PointPolicy};
 use cuteafd_ffi::{CuteafdDeviceBuffer, NativeLibrary};
 
+#[path = "prefix/append.rs"]
+pub(crate) mod append;
 #[path = "prefix/budget.rs"]
 pub(crate) mod budget;
 pub(crate) use budget::HostBudget;
