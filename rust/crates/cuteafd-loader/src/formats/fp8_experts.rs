@@ -146,8 +146,12 @@ pub struct Fp8ExpertTensors {
     reader: Arc<crate::expert_reader::ExpertReader>,
     snapshot: PathBuf,
     shape: RoutedExpertShape,
-    /// Decoder namespace; `language_model.model.` also selects MiniMax expert names.
+    /// Decoder namespace (`model.`, `model.language_model.` or `language_model.model.`).
     prefix: String,
+    /// Compressed-tensors NVFP4 (MiniMax M3): `block_sparse_moe.experts.{e}.w{1,3,2}.weight_packed`
+    /// codes whose FP32 scalar `weight_global_scale` and `input_global_scale` are
+    /// divisors, inverted once while staging.
+    divisor_scales: bool,
     /// Whether draft (MTP) experts live under `mtp.layers.{s}.` (Qwen 3.8 Flash
     /// Next) rather than as decoder layers past the backbone: layer
     /// `shape.layers + s` names them.
@@ -271,16 +275,19 @@ impl Fp8ExpertTensors {
         }, tensor.dtype.clone()))
     }
 
+    /// Whether the scalar scales are compressed-tensors divisors (see the field).
+    pub fn divisor_scales(&self) -> bool { self.divisor_scales }
+
     /// Push images currently copy scalar bytes unchanged; divisor scales need
     /// the mount loader's reciprocal staging before a package can consume them.
     pub fn validate_push_scales(&self) -> Result<()> {
-        ensure!(self.prefix != "language_model.model.",
-            "MiniMax NVFP4 push loading cannot copy weight_global_scale/input_global_scale divisors unchanged; use mount loading to stage their reciprocals");
+        ensure!(!self.divisor_scales,
+            "compressed NVFP4 push loading cannot copy weight_global_scale/input_global_scale divisors unchanged; use mount loading to stage their reciprocals");
         Ok(())
     }
 
     pub fn name(&self, layer: usize, expert: usize, projection: Fp8Projection) -> String {
-        if self.prefix == "language_model.model." {
+        if self.divisor_scales {
             let stem = match projection { Fp8Projection::Gate => "w1", Fp8Projection::Up => "w3", Fp8Projection::Down => "w2" };
             return format!("{}layers.{layer}.block_sparse_moe.experts.{expert}.{stem}.weight_packed", self.prefix);
         }
@@ -335,6 +342,9 @@ impl Fp8ExpertTensors {
             (name.contains(".mlp.experts.") || name.contains(".block_sparse_moe.experts.") || stacked_projection(name, prefix).is_some())
                 && layer.is_some_and(|layer| layers.is_none_or(|selected| selected.contains(&layer)))
         };
+        // Compressed-tensors packs its codes as `weight_packed`; the read below
+        // requires both scalar divisors beside every one.
+        let divisor_scales = weight_map.keys().any(|name| routed(name) && name.ends_with(".weight_packed"));
         let shards: std::collections::BTreeSet<&String> =
             weight_map.iter().filter(|(name, _)| routed(name)).map(|(_, shard)| shard).collect();
         let mut tensors = HashMap::new();
@@ -383,8 +393,8 @@ impl Fp8ExpertTensors {
             }
             _ => Vec::new(),
         };
-        let mut catalog = Self { reader: Default::default(), snapshot: snapshot.to_path_buf(), shape, prefix: prefix.to_string(), mtp_layers,
-            format: ExpertFormat::Fp8Block128, tensors: Arc::new(tensors), activations,
+        let mut catalog = Self { reader: Default::default(), snapshot: snapshot.to_path_buf(), shape, prefix: prefix.to_string(),
+            divisor_scales, mtp_layers, format: ExpertFormat::Fp8Block128, tensors: Arc::new(tensors), activations,
             slice_layer: first_selected_layer(shape, layers), coordinator: false };
         let first_layer = layers.and_then(|selected| selected.first().copied()).unwrap_or(shape.first_layer);
         let first = catalog.name(first_layer, 0, Fp8Projection::Gate);
@@ -558,7 +568,7 @@ impl Fp8ExpertTensors {
                     let name = input_scale_name(&self.name(layer, expert, projection));
                     let scale = self.located(&name)?;
                     ensure!(scale.dtype == DType::F32 && scale.bytes == 4
-                        && (self.prefix != "language_model.model." || scale.shape.is_empty()),
+                        && (!self.divisor_scales || scale.shape.is_empty()),
                         "{name}: expected one FP32 input scale, found {:?} {:?}", scale.dtype, scale.shape);
                 }
             }
@@ -600,7 +610,7 @@ impl Fp8ExpertTensors {
             let alpha_name = alpha_name(&name);
             let alpha = self.located(&alpha_name)?;
             ensure!(alpha.dtype == DType::F32 && alpha.bytes == 4
-                && (self.prefix != "language_model.model." || alpha.shape.is_empty()),
+                && (!self.divisor_scales || alpha.shape.is_empty()),
                 "{alpha_name}: expected one FP32 value, found {:?} {:?}", alpha.dtype, alpha.shape);
             return Ok(());
         }
@@ -796,7 +806,7 @@ impl Fp8ExpertTensors {
         let name = input_scale_name(&self.name(layer, expert, projection));
         // The reference loads both input divisors; equality is a runtime check,
         // not guaranteed by their headers. Compare before reciprocal rounding.
-        if self.prefix == "language_model.model." && projection == Fp8Projection::Up {
+        if self.divisor_scales && projection == Fp8Projection::Up {
             let gate = input_scale_name(&self.name(layer, expert, Fp8Projection::Gate));
             let a = self.read_scalar_bytes(&gate)?;
             let b = self.read_scalar_bytes(&name)?;
@@ -1069,7 +1079,8 @@ mod tests {
     fn catalog(format: ExpertFormat, intermediate: usize) -> Fp8ExpertTensors {
         let shape = RoutedExpertShape { layers: 78, first_layer: 3, experts: 256, topk: 8, hidden: 6144, intermediate,
             draft_stages: 0, draft_experts: 0 };
-        Fp8ExpertTensors { reader: Default::default(), snapshot: PathBuf::new(), shape, prefix: "model.".into(), mtp_layers: false, format,
+        Fp8ExpertTensors { reader: Default::default(), snapshot: PathBuf::new(), shape, prefix: "model.".into(),
+            divisor_scales: false, mtp_layers: false, format,
             tensors: Arc::new(HashMap::new()), activations: Vec::new(), slice_layer: 0, coordinator: false }
     }
 
@@ -1459,6 +1470,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let tensors = nvfp4_snapshot(dir.path(), 2);
         assert_eq!(tensors.format(), ExpertFormat::Nvfp4);
+        // ModelOpt scales multiply: push images may copy them unchanged.
+        assert!(!tensors.divisor_scales() && tensors.validate_push_scales().is_ok());
         // Distinct per expert, gate == up in each: the guard accepts the layer.
         write_input_scales(&tensors, |expert, _| if expert == 0 { 0.25 } else { 1.5 });
         input_scales(&tensors, |t| Fp8ExpertTensors::check_input_scales(0, &t[0], &t[1])).unwrap();

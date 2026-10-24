@@ -33,8 +33,7 @@ pub fn start(config: &EncoderWorkerConfig, snapshot: &Path, library: PathBuf, bu
     let ledger = NativeVision::required(&library, &spec.native)?;
     ensure!(ledger.total_bytes() <= budget, "vision tower admission needs {} bytes, budget {budget}", ledger.total_bytes());
     let processor = ProcessorConfig::from_snapshot(snapshot, spec.image_family())?;
-    let handshake = EncoderHandshake { encoder_id: id, max_patches: spec.native.max_tokens * processor.merge.pow(2),
-        output_width: spec.native.output_width, patch_size: processor.patch, merge_size: processor.merge, plan_hash: config.plan_hash };
+    let handshake = EncoderHandshake::for_tower(&spec, id, &processor, config.plan_hash);
     let minimax = spec.image_family() == cuteafd_loader::media::ImageFamily::Minimax;
     let service = EncoderService::start(spec, library, 0, ledger.total_bytes())?;
     let start = if minimax { EncoderServer::start_minimax } else { EncoderServer::start };
@@ -91,12 +90,8 @@ pub fn start_encoders(vision: Option<&EncoderWorkerConfig>, audio: Option<&Audio
         let backend = cuteafd_ffi::audio::NativeAudio::backend(&library)?;
         let image_spec = TowerSpec::from_snapshot(snapshot, image_config.max_tokens)?;
         let processor = ProcessorConfig::from_snapshot(snapshot, image_spec.image_family())?;
-        let image_handshake = EncoderHandshake {
-            encoder_id: image_spec.encoder_id(&image_config.revision, sm),
-            max_patches: image_spec.native.max_tokens * processor.merge.pow(2),
-            output_width: image_spec.native.output_width, patch_size: processor.patch,
-            merge_size: processor.merge, plan_hash: image_config.plan_hash,
-        };
+        let image_handshake = EncoderHandshake::for_tower(&image_spec,
+            image_spec.encoder_id(&image_config.revision, sm), &processor, image_config.plan_hash);
         let audio_spec = super::audio::AudioTowerSpec::from_snapshot(snapshot, cuteafd_loader::media::audio::MAX_CLIP_SAMPLES)?;
         let audio_handshake = super::remote::AudioHandshake {
             encoder_id: audio_spec.plan().encoder_id(&audio_config.revision, sm, &backend),

@@ -440,6 +440,7 @@ printf '%s\0' "${RELEASE_SERVING_ARGS[@]}"
             for eager, census, wip, valid in [
                 (None, None, '', True), ('', None, '', True),
                 ('layer_row', None, '/slot', True), ('layer_row', '0', '/slot', True),
+                ('minimax_step', None, '/slot', True),
                 ('layer_row', None, '', False), ('sparse', None, '/slot', False),
                 ('layer_row', '1', '/slot', False),
             ]:
@@ -455,7 +456,7 @@ printf '%s\0' "${RELEASE_SERVING_ARGS[@]}"
                         env=env, capture_output=True)
                     self.assertEqual(result.returncode == 0, valid, result.stderr)
                     if valid:
-                        expected = ['before'] + (['-e', 'CUTEAFD_GRAPH_EAGER=layer_row'] if eager else []) + ['after']
+                        expected = ['before'] + (['-e', f'CUTEAFD_GRAPH_EAGER={eager}'] if eager else []) + ['after']
                         self.assertEqual(result.stdout, ('\0'.join(expected) + '\0').encode())
 
     def test_embedding_placement_registered_and_gpu_default(self) -> None:

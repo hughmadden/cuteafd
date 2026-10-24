@@ -21,18 +21,23 @@
 //! copies and the host tier preserve all those segments without replicating any layer.
 use super::engine::{GlmEngine, GlmPlacement, INDEX_PAGE_BYTES, PAGE_ROWS, RECORD_BYTES};
 use crate::shared::memory::DeviceAllocation;
-use crate::shared::prefix::view;
+use crate::shared::prefix::PagedPlane;
 use anyhow::Result;
 use cuteafd_engine::prefix::{BoxError, FamilyLayout, MarkSlot, MarkStore, PageOwners, PrefixFamily, ReuseRule,
     TailCopy};
 use cuteafd_ffi::CuteafdDeviceBuffer;
 use cuteafd_hostcache::copy::DeviceRange;
 
-/// Index-key page: 64 rows x 128 E4M3, then 64 FP32 scales.
-const INDEX_KEY_BYTES: usize = 128;
-const INDEX_SCALES: usize = PAGE_ROWS * INDEX_KEY_BYTES;
+const _: () = assert!(INDEX_PAGE_BYTES == crate::shared::prefix::INDEX_PAGE_BYTES);
+const RECORD_SPANS: &[(usize, usize)] = &[(0, RECORD_BYTES)];
 
 type PagedBuffers = (usize, CuteafdDeviceBuffer, Option<CuteafdDeviceBuffer>);
+
+/// A rank's latent records, then its index keys on full-indexer layers.
+fn planes(records: CuteafdDeviceBuffer, index: Option<CuteafdDeviceBuffer>) -> impl Iterator<Item = PagedPlane> {
+    std::iter::once(PagedPlane { buffer: records, page_bytes: PAGE_ROWS * RECORD_BYTES, spans: RECORD_SPANS })
+        .chain(index.map(PagedPlane::index))
+}
 
 fn locate_page(parity: bool, page: u32) -> (usize, usize) {
     if parity { ((page & 1) as usize, (page >> 1) as usize) } else { (0, page as usize) }
@@ -40,15 +45,8 @@ fn locate_page(parity: bool, page: u32) -> (usize, usize) {
 
 fn page_segments(paged: &[PagedBuffers], parity: bool, layers: bool, page: u32) -> Vec<DeviceRange> {
     let (owner, page) = locate_page(parity, page);
-    let record_page = PAGE_ROWS * RECORD_BYTES;
-    let mut out = Vec::new();
-    for &(_, records, index) in paged.iter().filter(|(rank, _, _)| layers || *rank == owner) {
-        out.push(DeviceRange { addr: records.ptr as u64 + (page * record_page) as u64, bytes: record_page });
-        if let Some(index) = index {
-            out.push(DeviceRange { addr: index.ptr as u64 + (page * INDEX_PAGE_BYTES) as u64, bytes: INDEX_PAGE_BYTES });
-        }
-    }
-    out
+    paged.iter().filter(|(rank, _, _)| layers || *rank == owner)
+        .flat_map(|&(_, records, index)| planes(records, index).map(move |plane| plane.page(page))).collect()
 }
 
 fn copy_rows(paged: &[PagedBuffers], parity: bool, copy: TailCopy,
@@ -58,14 +56,9 @@ fn copy_rows(paged: &[PagedBuffers], parity: bool, copy: TailCopy,
     anyhow::ensure!(rows <= PAGE_ROWS && from_rank == to_rank
         && owner.is_none_or(|o| o == from_rank) && owner.is_some() == parity,
         "tail copy {copy:?} crosses GPUs or exceeds a page");
-    let record_page = PAGE_ROWS * RECORD_BYTES;
     for &(rank, records, index) in paged.iter().filter(|(rank, _, _)| owner.is_none_or(|o| o == *rank)) {
-        submit(rank, view(records, to * record_page, rows * RECORD_BYTES)?,
-            view(records, from * record_page, rows * RECORD_BYTES)?)?;
-        if let Some(index) = index {
-            let (from, to) = (from * INDEX_PAGE_BYTES, to * INDEX_PAGE_BYTES);
-            submit(rank, view(index, to, rows * INDEX_KEY_BYTES)?, view(index, from, rows * INDEX_KEY_BYTES)?)?;
-            submit(rank, view(index, to + INDEX_SCALES, rows * 4)?, view(index, from + INDEX_SCALES, rows * 4)?)?;
+        for plane in planes(records, index) {
+            for (dst, src) in plane.tail(from, to, rows)? { submit(rank, dst, src)?; }
         }
     }
     Ok(())
@@ -244,18 +237,13 @@ fn download(engine: &GlmEngine<'_>, addr: u64, bytes: usize, template: CuteafdDe
 /// full-indexer layers), layer by layer, in position order.
 fn paged_rows(family: &GlmPrefix<'_, '_>, placement: &GlmPlacement, len: usize) -> Result<Vec<u8>> {
     let mut out = Vec::new();
-    let record_page = PAGE_ROWS * RECORD_BYTES;
     for (p, &page) in placement.pages.iter().enumerate().take(len.div_ceil(PAGE_ROWS)) {
         let rows = (len - p * PAGE_ROWS).min(PAGE_ROWS);
         let (owner, page) = locate_page(family.parity(), page);
         for &(_, records, index) in family.paged.iter().filter(|(rank, _, _)| !family.parity() || *rank == owner) {
-            out.extend_from_slice(&download(family.engine, records.ptr as u64 + (page * record_page) as u64,
-                rows * RECORD_BYTES, records)?);
-            if let Some(index) = index {
-                let bytes = download(family.engine, index.ptr as u64 + (page * INDEX_PAGE_BYTES) as u64,
-                    INDEX_PAGE_BYTES, index)?;
-                out.extend_from_slice(&bytes[..rows * INDEX_KEY_BYTES]);
-                out.extend_from_slice(&bytes[INDEX_SCALES..INDEX_SCALES + rows * 4]);
+            for plane in planes(records, index) {
+                let bytes = download(family.engine, plane.page(page).addr, plane.page_bytes, plane.buffer)?;
+                for &(offset, row_bytes) in plane.spans { out.extend_from_slice(&bytes[offset..offset + rows * row_bytes]); }
             }
         }
     }
@@ -393,7 +381,7 @@ mod ownership_tests {
                 expected.push((rank, records.ptr as usize + 2 * record_page,
                     records.ptr as usize + record_page, rows * RECORD_BYTES));
                 if let Some(index) = index {
-                    for (offset, bytes) in [(0, rows * INDEX_KEY_BYTES), (INDEX_SCALES, rows * 4)] {
+                    for (offset, bytes) in [(0, rows * 128), (PAGE_ROWS * 128, rows * 4)] {
                         expected.push((rank, index.ptr as usize + 2 * INDEX_PAGE_BYTES + offset,
                             index.ptr as usize + INDEX_PAGE_BYTES + offset, bytes));
                     }

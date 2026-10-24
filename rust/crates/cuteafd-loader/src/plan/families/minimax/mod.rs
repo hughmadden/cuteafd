@@ -275,8 +275,8 @@ impl Family for MiniMaxM3 {
                     Spark TP2/TP3/TP4 and TP1 for onboarded bottom routed layers. Push loading is unsupported.".into(),
             }),
             Component::Vision => Some(Hint {
-                what: "MiniMax M3 image feature injection awaits device qualification".into(),
-                how: "Compile the MiniMax D80 vision attention export and qualify the native BF16 tower and language-model feature injection against the CPU reference. Video input is unsupported.".into(),
+                what: "MiniMax M3 images and video run through the bundled tower on the RTX or a Spark rank".into(),
+                how: "Build with the D80 vision attention export; qualify the tower with python/tools/qualify/minimax_m3/qualify-vision.py and the served path with scripts/qualify/minimax_m3/qualify-native-vision.py.".into(),
             }),
             Component::Speculator => Some(Hint {
                 what: "MiniMax M3 DSpark drafting awaits device qualification".into(),

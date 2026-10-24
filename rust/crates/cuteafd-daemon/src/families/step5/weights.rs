@@ -8,9 +8,9 @@ use anyhow::{ensure, Context, Result};
 use cuteafd_core::DType;
 use cuteafd_ffi::CuteafdDeviceBuffer;
 use cuteafd_loader::plan::checkpoint::Checkpoint;
-use cuteafd_loader::plan::families::step5::coordinator::{
-    RankWeightLayout, WeightOperand, WeightSlice,
-};
+#[cfg(test)]
+use cuteafd_loader::plan::families::step5::coordinator::WeightSlice;
+use cuteafd_loader::plan::families::step5::coordinator::{RankWeightLayout, WeightOperand};
 use std::collections::BTreeMap;
 
 const EMBEDDING: &str = "model.embed_tokens.weight";
@@ -99,71 +99,9 @@ pub(super) fn load_operand<'a>(
         "f32"
     });
     let allocation = Allocation::new(device, usize::try_from(operand.allocation_bytes)?)?;
-    load_records(device, checkpoint, layout, operand, allocation.buffer)?;
+    crate::shared::experts::rtx::dense::load_records(device, &checkpoint.snapshot, layout, operand,
+        allocation.buffer)?;
     Ok(allocation)
-}
-
-/// `operand`'s bytes as shared dense records into `buffer` (allocated as the
-/// mount allocates it): unchanged checkpoint rectangles (whole tensors, a
-/// rank's rows, a rank's column window, in source order), or for an F32
-/// source of a BF16 operand one staged step narrowed on the GPU. Filled
-/// through the mount at once, or recorded for the coordinator push group.
-fn load_records(device: Device<'_>, checkpoint: &Checkpoint, layout: &RankWeightLayout, operand: &WeightOperand,
-    buffer: CuteafdDeviceBuffer) -> Result<()> {
-    use crate::shared::experts::rtx::dense::{DenseLoad, Job, Operand, Rect, Step, STEP_BYTES};
-    let dense = DenseLoad::mount(device.library);
-    let elem = if operand.dtype == DType::Bf16 { 2 } else { 4 };
-    let mut lands = Vec::new();
-    let mut at = 0usize;
-    for source in &operand.sources {
-        let meta = &source.meta;
-        ensure!(meta.dtype == operand.dtype || (operand.dtype == DType::Bf16 && meta.dtype == DType::F32),
-            "Step-5 native parameter precision changed");
-        let total = if meta.shape.len() >= 2 { meta.shape[0] } else { 1 };
-        let bytes = usize::try_from(meta.byte_length)?;
-        ensure!(total > 0 && bytes % total == 0, "{}: rows do not divide the tensor", meta.name);
-        let whole = Rect { name: meta.name.clone(), path: checkpoint.snapshot.join(&source.shard), base: meta.byte_offset,
-            row_bytes: bytes / total, rows: 0..total, cols: 0..bytes / total };
-        let rect = match operand.slice {
-            WeightSlice::Replicated => whole,
-            WeightSlice::Rows | WeightSlice::Cols => {
-                ensure!(operand.sources.len() == 1 && meta.shape.len() == 2, "Step-5 split source layout");
-                let (rank, ranks) = (layout.rank, layout.ranks);
-                // Narrowing is elementwise: a source element's width selects the window.
-                let elem = if meta.dtype == DType::F32 { 4 } else { elem };
-                if operand.slice == WeightSlice::Rows {
-                    ensure!(total % ranks == 0, "{}: rows do not split over {ranks} GPUs", meta.name);
-                    whole.sub(rank * total / ranks..(rank + 1) * total / ranks)
-                } else {
-                    let width = meta.shape[1] / ranks * elem;
-                    ensure!(meta.shape[1] % ranks == 0, "{}: columns do not split over {ranks} GPUs", meta.name);
-                    Rect { cols: rank * width..(rank + 1) * width, ..whole }
-                }
-            }
-        };
-        if meta.dtype == operand.dtype {
-            let n = rect.bytes();
-            lands.push((rect, at));
-            at += n;
-        } else {
-            // F32 -> BF16 on the GPU: one tensor per step (CSA indexer tensors).
-            let n = rect.bytes();
-            ensure!(n <= STEP_BYTES, "{}: F32 narrowing step beyond the staging bound", meta.name);
-            // SAFETY (offset): the narrowed values lie inside the operand.
-            let dst = CuteafdDeviceBuffer { ptr: unsafe { buffer.ptr.cast::<u8>().add(at) }.cast(), bytes: n / 2, ..buffer };
-            device.run(|| dense.step(Step { device: device.id, rects: vec![rect],
-                jobs: vec![Job::NarrowF32Bf16 { at: 0, bytes: n, dst }] }, std::ptr::null_mut()))?;
-            at += n / 2;
-        }
-    }
-    let expected = operand.shape.iter().try_fold(elem, |n: usize, dim| n.checked_mul(*dim))
-        .context("Step-5 packed size overflow")?;
-    ensure!(at == expected && expected.max(256) as u64 == operand.allocation_bytes && buffer.bytes >= expected,
-        "Step-5 packed storage disagrees with header admission");
-    if !lands.is_empty() {
-        device.run(|| dense.operand(Operand { device: device.id, buffer, lands, bytes: at }))?;
-    }
-    Ok(())
 }
 
 /// The host packing of `operand` (the records' reference).
@@ -337,6 +275,51 @@ mod tests {
             vec![4, 2]
         )))
         .is_err());
+        Ok(())
+    }
+
+    /// The shared dense records land the reference packing byte for byte:
+    /// whole tensors, a rank's rows or column window, narrowed FP32 tensors
+    /// and fused pairs.
+    #[test]
+    fn shared_records_land_the_reference_packing() -> Result<()> {
+        use crate::shared::experts::rtx::dense::operand_lands;
+        let dir = tempfile::tempdir()?;
+        let land = |operand: &WeightOperand, rank: usize| -> Result<Vec<u8>> {
+            let (lands, packed) = operand_lands(dir.path(), &layout(rank), operand)?;
+            let mut host = vec![0u8; packed];
+            for (rect, at, narrow) in lands {
+                let mut read = vec![0u8; rect.bytes()];
+                rect.read(&mut read)?;
+                let read = if narrow { materialize_bf16(&read, DType::F32)? } else { read };
+                host[at..at + read.len()].copy_from_slice(&read);
+            }
+            Ok(host)
+        };
+        let values = [1.00390625f32, 1.01171875, -1.00390625, -1.01171875, 0.0, -0.0, f32::MIN_POSITIVE, 2.0];
+        let bytes: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
+        std::fs::write(dir.path().join("unused"), &bytes)?;
+        let tensor = source("index_w", DType::F32, vec![4, 2]);
+        for rank in 0..2 {
+            for (slice, shape) in [(WeightSlice::Rows, vec![2, 2]), (WeightSlice::Cols, vec![4, 1]),
+                (WeightSlice::Replicated, vec![4, 2])] {
+                for dtype in [DType::Bf16, DType::F32] {
+                    let operand = WeightOperand { name: "index_w".into(), sources: vec![tensor.clone()],
+                        dtype: dtype.clone(), shape: shape.clone(), slice, allocation_bytes: 256 };
+                    let reference = pack(&operand, &layout(rank), |_| Ok((bytes.clone(), DType::F32, vec![4, 2])))?;
+                    assert_eq!(land(&operand, rank)?, reference, "rank {rank} {slice:?} {dtype:?}");
+                }
+            }
+        }
+        for (name, byte) in [("gate", 0x19u8), ("up", 0x29)] {
+            std::fs::write(dir.path().join(name), [byte; 8])?;
+        }
+        let half = |name: &str| CheckpointTensor { shard: name.into(), ..source(name, DType::Bf16, vec![2, 2]) };
+        let operand = WeightOperand { name: "gate_up".into(), sources: vec![half("gate"), half("up")],
+            dtype: DType::Bf16, shape: vec![4, 2], slice: WeightSlice::Replicated, allocation_bytes: 256 };
+        let reference = pack(&operand, &layout(0), |name| Ok((vec![if name == "gate" { 0x19 } else { 0x29 }; 8],
+            DType::Bf16, vec![2, 2])))?;
+        assert_eq!(land(&operand, 0)?, reference);
         Ok(())
     }
 

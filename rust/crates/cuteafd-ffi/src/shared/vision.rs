@@ -213,19 +213,37 @@ impl NativeVision {
         }
     }
     /// Encode into caller-owned output. No Rust or CUDA allocation in this call.
-    /// The LUT is normalized FP32 `[channel][rgb8]`, with reference operation order.
+    /// `grid` is `[t, h, w]`: a still image (`t = 1`, one RGB8 frame) or, on the MiniMax
+    /// ABI 3 tower, a video segment of `t` temporal pairs (`2t` frames; the processor
+    /// repeats an odd final frame). The LUT is normalized FP32 `[channel][rgb8]`, with
+    /// reference operation order.
     pub fn encode_into(
         &mut self,
         rgb: &[u8],
-        grid: [usize; 2],
+        grid: [usize; 3],
+        video: bool,
         lut: &[f32; 768],
         output: &mut [u16],
     ) -> Result<(), VisionError> {
-        let [h, w] = grid;
+        if video {
+            let encode = self.encode_frames.ok_or(VisionError::InvalidInput(
+                "temporal vision encoding requires MiniMax ABI 3",
+            ))?;
+            validate_frames(grid, rgb.len(), output.len(), self.max_tokens, self.output_width)?;
+            // SAFETY: checked contiguous host extents remain live through synchronous
+            // encode. The owner drains its stream on every return before reuse.
+            return check(unsafe {
+                encode(self.owner, rgb.as_ptr(), rgb.len() as u64, lut.as_ptr(),
+                    grid[0] as i32, grid[1] as i32, grid[2] as i32,
+                    output.as_mut_ptr(), std::mem::size_of_val(output) as u64)
+            });
+        }
+        let [t, h, w] = grid;
         let patches = h
             .checked_mul(w)
             .ok_or(VisionError::InvalidInput("vision grid overflow"))?;
-        if h < 2
+        if t != 1
+            || h < 2
             || w < 2
             || h % 2 != 0
             || w % 2 != 0
@@ -260,32 +278,17 @@ impl NativeVision {
         check(unsafe { (self.ledger)(self.owner, &mut ledger) })?;
         Ok(ledger)
     }
-    /// Encode a MiniMax segment of paired RGB8 frames. An odd final frame is
-    /// repeated by the processor; `grid[0]` counts temporal pairs, not frames.
-    pub fn encode_frames_into(
-        &mut self, rgb: &[u8], grid: [usize; 3], lut: &[f32; 768], output: &mut [u16],
-    ) -> Result<(), VisionError> {
-        let encode = self.encode_frames.ok_or(VisionError::InvalidInput(
-            "temporal vision encoding requires MiniMax ABI 3",
-        ))?;
-        validate_frames(grid, rgb.len(), output.len(), self.max_tokens, self.output_width)?;
-        // SAFETY: checked contiguous host extents remain live through synchronous
-        // encode. The owner drains its stream on every return before reuse.
-        check(unsafe {
-            encode(self.owner, rgb.as_ptr(), rgb.len() as u64, lut.as_ptr(),
-                grid[0] as i32, grid[1] as i32, grid[2] as i32,
-                output.as_mut_ptr(), std::mem::size_of_val(output) as u64)
-        })
-    }
 }
 fn validate_frames(
     grid: [usize; 3], rgb_bytes: usize, output_elements: usize, max_tokens: usize, output_width: usize,
 ) -> Result<(), VisionError> {
     let [t, h, w] = grid;
-    let patches = t.checked_mul(h).and_then(|n| n.checked_mul(w))
-        .ok_or(VisionError::InvalidInput("vision temporal grid overflow"))?;
-    if !(1..=4).contains(&t) || h < 2 || w < 2 || h % 2 != 0 || w % 2 != 0
-        || h > i32::MAX as usize || w > i32::MAX as usize
+    let patches = match (u32::try_from(t), u32::try_from(h), u32::try_from(w)) {
+        (Ok(t), Ok(h), Ok(w)) => cuteafd_core::media::video_segment_patches([t, h, w]),
+        _ => None,
+    }.and_then(|n| usize::try_from(n).ok())
+        .ok_or(VisionError::InvalidInput("vision temporal grid is not a video segment"))?;
+    if h > i32::MAX as usize || w > i32::MAX as usize
         || patches > max_tokens.saturating_mul(4)
         || patches.checked_mul(2 * 14 * 14 * 3) != Some(rgb_bytes)
         || (patches / 4).checked_mul(output_width) != Some(output_elements)

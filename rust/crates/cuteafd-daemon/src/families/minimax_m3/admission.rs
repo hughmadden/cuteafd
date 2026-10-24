@@ -16,8 +16,12 @@ pub(super) struct Request {
     pub kv_format: Qwen4KvCache,
     pub onboard: Option<usize>,
     pub spark_budget: u64,
+    /// What a Spark-hosted vision tower holds on every rank beside the experts (0 when local).
+    pub spark_vision_bytes: u64,
     pub headroom: u64,
     pub draft_bytes: u64,
+    /// Drafter context rings (0 without the drafter): bounds the verify rows.
+    pub draft_rings: usize,
     pub host_embedding: bool,
 }
 
@@ -30,6 +34,8 @@ pub(super) struct Admitted {
     pub weights: RankWeightLayout,
     pub local_capacity: Option<usize>,
     pub spark_capacity: usize,
+    /// Decode steps the warm-up records before ready; their bytes are reserved.
+    pub graphs: cuteafd_loader::placement::inventory::StartupGraphs<usize>,
     reservations: Reservations,
 }
 
@@ -63,7 +69,20 @@ pub(super) fn solve(checkpoint: &Checkpoint, programs: &serde_json::Value,
     let remote_reserved = [io.intake, io.host_exchange, io.row_indices, io.endpoint_staging, io.mapped_rings,
         512 << 20, cuteafd_core::memory_layout::SPARK_RUNTIME_RESIDUAL_BYTES]
         .into_iter().try_fold(0u64, |sum, b| sum.checked_add(b)).context("MiniMax remote reservation overflow")?;
-    let onboard = admission::onboard_layers(&catalog, &cfg, request.sizing, request.spark_budget, remote_reserved, request.onboard)?;
+    let with_vision = remote_reserved.checked_add(request.spark_vision_bytes).context("MiniMax remote vision reservation overflow")?;
+    let onboard = admission::onboard_layers(&catalog, &cfg, request.sizing, request.spark_budget, with_vision, request.onboard);
+    if request.spark_vision_bytes > 0 && request.onboard.is_none() && onboard.as_ref().map_or(true, |o| !o.local_layers.is_empty()) {
+        // Every routed layer fits the Sparks without the tower: the tower is the cause, not onboarding.
+        if let Ok(all) = admission::onboard_layers(&catalog, &cfg, request.sizing, request.spark_budget, remote_reserved, Some(0)) {
+            let experts = all.spark_bytes.iter().copied().max().unwrap_or(0).saturating_add(remote_reserved);
+            let gb = |bytes: u64| bytes as f64 / 1e9;
+            anyhow::bail!("Spark-hosted vision needs {:.2} GB on every Spark rank, but each TP{} rank has {:.2} GB left \
+                after its experts ({:.2} of {:.2} GB): use the local tower (--vision auto or rtx, without --vision-peers) \
+                or more Spark ranks", gb(request.spark_vision_bytes), request.sizing.spark_ranks,
+                gb(request.spark_budget.saturating_sub(experts)), gb(experts), gb(request.spark_budget));
+        }
+    }
+    let onboard = onboard?;
     let (expert_workspace, local_capacity) = if onboard.local_layers.is_empty() { (0, None) } else {
         let package = local_package.context("MiniMax onboarded layers require the native TP1 expert package manifest")?;
         let bytes = admission::expert_workspace(package, 1, request.sizing.rows)?;
@@ -72,15 +91,16 @@ pub(super) fn solve(checkpoint: &Checkpoint, programs: &serde_json::Value,
             .min().context("MiniMax TP1 package row capacity")?;
         (bytes, Some(usize::try_from(capacity)?))
     };
+    let graphs = admission::decode_graphs(request.sizing, request.draft_rings)?;
     let mut reservations = Reservations { weights: weights.resident_bytes.checked_add(request.draft_bytes).context("MiniMax draft admission overflow")?, local_experts: onboard.local_bytes,
-        expert_workspace, headroom: request.headroom, ..Default::default() };
+        expert_workspace, headroom: request.headroom, graphs: graphs.inventory.bytes(0), ..Default::default() };
     reservations.startup = reservations.fixed_bytes(&ledger)?.checked_add(admission::scale_prep_staging_bytes(&weights))
         .context("MiniMax load peak overflow")?;
     let cache = admission::admit(&cfg, request.sizing, &ledger, reservations, request.available,
         request.requested_pool, request.kv_format)?;
     ensure!(cache.total_bytes <= request.available, "MiniMax admission exceeded its measured free bytes");
     Ok(Admitted { cache, ledger, programs, local_layers: onboard.local_layers, spark_layers: onboard.spark_layers,
-        weights, local_capacity, spark_capacity: request.sizing.rows, reservations })
+        weights, local_capacity, spark_capacity: request.sizing.rows, graphs, reservations })
 }
 
 #[cfg(test)]
@@ -121,13 +141,17 @@ mod tests {
         ensure!(report.placement_supported, "{:?}", report.hints);
         let memory = report.memory_layout.as_ref().unwrap();
         let device = memory.devices.iter().find(|d| d.kind == cuteafd_core::memory_layout::DeviceKind::Rtx).unwrap();
-        let measured_baseline: u64 = device.items.iter().filter(|i| i.category == cuteafd_core::memory_layout::Category::Runtime)
-            .map(|i| i.bytes).sum();
+        // The planner's runtime items the live sample already holds (context,
+        // code); the startup graphs are admitted on top of it, as the server does.
+        let graph_groups = ["graphs", cuteafd_loader::placement::inventory::GRAPH_GROWTH];
+        let measured_baseline: u64 = device.items.iter().filter(|i| i.category == cuteafd_core::memory_layout::Category::Runtime
+            && !graph_groups.contains(&i.group.as_str())).map(|i| i.bytes).sum();
         let mut live = solve(&checkpoint, &programs, None, Request {
             sizing: RuntimeSizing { rows: 256, decode_rows: 64, sequences: 16, context: 4096, spark_ranks: 3, logit_rows: 64,
                 lanes: cuteafd_loader::serving_capacity::prefill_lanes::DEFAULT_PREFILL_LANES, host_landing: false },
             available: options.rtx_bytes[0] - measured_baseline, requested_pool: Some(4096),
-            kv_format: Qwen4KvCache::Fp8, onboard: None, spark_budget: 108 << 30, headroom: 0, draft_bytes:0, host_embedding,
+            kv_format: Qwen4KvCache::Fp8, onboard: None, spark_budget: 108 << 30, spark_vision_bytes: 0, headroom: 0,
+            draft_bytes:0, draft_rings: 0, host_embedding,
         })?;
         assert_eq!(live.cache.total_bytes + measured_baseline, device.used_bytes());
         assert_eq!(live.cache.pool_tokens, memory.pool_tokens);
@@ -135,12 +159,25 @@ mod tests {
         assert!(live.weights.operands.iter().any(|o| o.name == "language_model.lm_head.weight"));
         assert!(live.local_layers.is_empty());
         assert_eq!(live.spark_layers, (3..60).collect::<Vec<_>>());
+        // The same decode graph keys are recorded by the server and charged by both ledgers.
+        assert_eq!(live.graphs.keys, (1..=16).collect::<Vec<_>>());
+        let charged: u64 = device.items.iter().filter(|i| graph_groups.contains(&i.group.as_str())).map(|i| i.bytes).sum();
+        assert_eq!(charged, live.graphs.inventory.bytes(0));
         assert_eq!(live.ledger.bytes("head_workspace"), Some(cuteafd_ffi::programs::VOCABULARY_HEAD_WORKSPACE as u64));
         let cfg = MiniMaxM3Config::from_hf(&checkpoint.config)?;
         assert!(live.readmit(&cfg, RuntimeSizing { rows: 256, decode_rows: 64, sequences: 16, logit_rows: 64,
             context: 4096, spark_ranks: 3, lanes: cuteafd_loader::serving_capacity::prefill_lanes::DEFAULT_PREFILL_LANES,
             host_landing: false },
             live.cache.total_bytes - 1, Some(4096), Qwen4KvCache::Fp8).is_err());
+        // A Spark-hosted tower that leaves no room for the experts is refused by name.
+        let refused = solve(&checkpoint, &programs, None, Request {
+            sizing: RuntimeSizing { rows: 256, decode_rows: 64, sequences: 16, context: 4096, spark_ranks: 3, logit_rows: 64,
+                lanes: cuteafd_loader::serving_capacity::prefill_lanes::DEFAULT_PREFILL_LANES, host_landing: false },
+            available: options.rtx_bytes[0] - measured_baseline, requested_pool: Some(4096),
+            kv_format: Qwen4KvCache::Fp8, onboard: None, spark_budget: 108 << 30, spark_vision_bytes: (108 << 30) - (1 << 20),
+            headroom: 0, draft_bytes: 0, draft_rings: 0, host_embedding,
+        }).err().map(|error| format!("{error:#}")).unwrap_or_default();
+        assert!(refused.starts_with("Spark-hosted vision needs 115.96 GB on every Spark rank, but each TP3 rank has"), "{refused}");
         Ok(())
     }
 }

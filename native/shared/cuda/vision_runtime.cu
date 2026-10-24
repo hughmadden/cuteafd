@@ -104,13 +104,14 @@ __global__ void rgb_patches(const uint8_t* rgb, const float* lut, uint16_t* patc
   int x=(unit%(gw/2))*32+(r%2)*16+pixel%16;
   patches[i] = bf16_bits(lut[c*256+rgb[(size_t(y)*gw*16+x)*3+c]]);
 }
+// Grid-stride: exact grids and grid_for's capped grids both cover every element.
 __global__ void cast_bf16(const float* x, uint16_t* y, size_t n) {
-  size_t i=size_t(blockIdx.x)*blockDim.x+threadIdx.x;
-  if(i<n)y[i]=bf16_bits(x[i]);
+  for(size_t i=size_t(blockIdx.x)*blockDim.x+threadIdx.x;i<n;i+=size_t(gridDim.x)*blockDim.x)
+    y[i]=bf16_bits(x[i]);
 }
 __global__ void cast_float(const uint16_t* x, float* y, size_t n) {
-  size_t i=size_t(blockIdx.x)*blockDim.x+threadIdx.x;
-  if(i<n)y[i]=__bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(x+i));
+  for(size_t i=size_t(blockIdx.x)*blockDim.x+threadIdx.x;i<n;i+=size_t(gridDim.x)*blockDim.x)
+    y[i]=__bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(x+i));
 }
 int gemm(Owner* o, const uint16_t* x, uint64_t offset, int m, int n, int k, float* y) {
   const float one=1,zero=0;

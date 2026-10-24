@@ -214,6 +214,27 @@ impl RuntimeLedger {
 /// padded so each launch's row starts 16-byte aligned.
 pub fn extend_table_stride(context: u64) -> u64 { context.div_ceil(PAGE_ROWS).next_multiple_of(4) }
 
+/// Device bytes one recorded decode step is charged: a whole step (60 layers
+/// with their Spark exchanges and the head, ~3,100 nodes) measured 6-8 MiB on
+/// an RTX 5090 (the driver allocates in 2 MiB chunks). Estimated until the
+/// startup census replaces it.
+pub const DECODE_GRAPH_BYTES: u64 = 8 << 20;
+
+/// The decode steps the coordinator records at startup and replays: one per
+/// row count a verify step can have. A drafting sequence verifies its anchor
+/// and up to seven drafts, the others one row each, all within the decode tile.
+/// Keys are exact row counts, not padded buckets: a padded row would need its
+/// K/V and index writes masked and its expert routes withheld from the Sparks,
+/// and the recordings cost readiness and memory only once.
+pub fn decode_graphs(sizing: RuntimeSizing, draft_rings: usize) -> Result<crate::placement::inventory::StartupGraphs<usize>> {
+    if draft_rings > sizing.sequences { return Err(AdmissionError::Unsupported("draft rings beyond the sequences")); }
+    let rows = (sizing.sequences + 7 * draft_rings).min(sizing.decode_rows);
+    let keys: Vec<usize> = (1..=rows).collect();
+    use crate::placement::inventory::{GraphSet, Lifetime};
+    GraphSet::new(&[keys.len() as u64], DECODE_GRAPH_BYTES, 10, 16 << 20, keys.len() as u64, Lifetime::Startup)
+        .startup(keys).map_err(manifest)
+}
+
 /// Most extend launches one prefill step makes: each request's rows split
 /// into tiles of at most `tile` rows, and at each lane cut.
 pub fn extend_launches(sizing: RuntimeSizing, tile: u64) -> u64 {
@@ -236,13 +257,15 @@ pub struct Reservations {
     pub pending_code: u64,
     pub runtime_baseline: u64,
     pub headroom: u64,
+    /// The startup decode graphs ([`decode_graphs`]), recorded before ready.
+    pub graphs: u64,
     /// Additional absolute peak above the same pre-weight sample.
     pub startup: u64,
 }
 impl Reservations {
     pub fn fixed_bytes(self, ledger: &RuntimeLedger) -> Result<u64> {
         sum([ledger.fixed_bytes, self.weights, self.local_experts,
-            self.expert_workspace, self.media, self.pending_code, self.runtime_baseline, self.headroom])
+            self.expert_workspace, self.media, self.pending_code, self.runtime_baseline, self.headroom, self.graphs])
     }
 }
 
@@ -421,6 +444,27 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn decode_graph_inventory_covers_every_verify_row_count_exactly() {
+        use crate::placement::inventory::Lifetime;
+        // Target-only: one row per sequence; drafting: up to 8 rows per ring, within the tile.
+        for (sequences, rings, rows) in [(16, 0, 16), (1, 0, 1), (16, 8, 64), (1, 1, 8), (4, 2, 18), (64, 0, 64)] {
+            let graphs = decode_graphs(RuntimeSizing { sequences, ..sizing() }, rings).unwrap();
+            assert_eq!(graphs.keys, (1..=rows).collect::<Vec<_>>());
+            assert_eq!(graphs.inventory.lifetime, Lifetime::Startup);
+            let captured = rows as u64 * DECODE_GRAPH_BYTES;
+            assert_eq!(graphs.inventory.at_ready(0), captured);
+            assert_eq!(graphs.inventory.bytes(0), captured + (captured * 10).div_ceil(100).max(16 << 20));
+        }
+        assert!(decode_graphs(RuntimeSizing { sequences: 4, ..sizing() }, 5).is_err());
+        // The reservation is part of the fixed bytes the pool is sized after.
+        let cfg = config();
+        let programs = ProgramSizes::from_manifest(&programs_manifest(), sizing()).unwrap();
+        let ledger = RuntimeLedger::new(&cfg, sizing(), &programs).unwrap();
+        let none = Reservations::default().fixed_bytes(&ledger).unwrap();
+        assert_eq!(Reservations { graphs: 7, ..Default::default() }.fixed_bytes(&ledger).unwrap(), none + 7);
+    }
+
+    #[test]
     fn minimax_local_golden_admits_no_transport_storage() {
         let local = RuntimeSizing { spark_ranks: 0, ..sizing() };
         let programs = ProgramSizes::from_manifest(&programs_manifest(), local).unwrap();
@@ -464,8 +508,9 @@ pub(crate) mod tests {
         let programs = ProgramSizes::from_manifest(&programs_manifest(), sizing).unwrap();
         let ledger = RuntimeLedger::new(&cfg, sizing, &programs).unwrap();
         let reservations = Reservations { weights: 1000, local_experts: 3000,
-            expert_workspace: 4000, media: 5000, pending_code: 6000, runtime_baseline: 7000, headroom: 8000, startup: 0 };
-        let fixed = ledger.fixed_bytes + 34_000;
+            expert_workspace: 4000, media: 5000, pending_code: 6000, runtime_baseline: 7000, headroom: 8000,
+            graphs: 9000, startup: 0 };
+        let fixed = ledger.fixed_bytes + 43_000;
         let page = 60 * (2 * 32768 + 8448);
         let available = fixed + 3 * page;
         let admitted = admit(&cfg, sizing, &ledger, reservations, available, Some(192), Qwen4KvCache::Fp8).unwrap();

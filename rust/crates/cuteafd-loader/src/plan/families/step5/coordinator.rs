@@ -1,11 +1,8 @@
 //! Native source-weight contract, not an executable Step-5 coordinator.
 //! Reuses the planner inventory and shared dense header/admission validator.
 use super::{Config, Model};
-use crate::formats::native_dense::NativeDenseLayout;
-use crate::plan::{
-    checkpoint::{Checkpoint, CheckpointTensor},
-    spec::Component,
-};
+use crate::formats::native_dense::{Hold, NativeDenseLayout, GATE_UP};
+use crate::plan::{checkpoint::Checkpoint, spec::Component};
 use anyhow::{ensure, Result};
 use cuteafd_core::dense_attention::{
     GqaGeometry, NormWeight, RotaryArithmetic, RouterBiasOrder, SigmoidRouter, SlidingWindow,
@@ -133,34 +130,19 @@ impl CoordinatorContract {
 
 /// Native operand storage, derived before CUDA initialization. This excludes
 /// routed experts and MTP, and is not a complete serving admission contract.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum WeightSlice {
-    Replicated,
-    Rows,
-    Cols,
-}
+pub use crate::formats::native_dense::{RankWeightLayout, WeightOperand, WeightSlice};
 
-#[derive(Debug, Clone)]
-pub struct WeightOperand {
-    pub name: String,
-    pub sources: Vec<CheckpointTensor>,
-    pub dtype: DType,
-    pub shape: Vec<usize>,
-    pub slice: WeightSlice,
-    pub allocation_bytes: u64,
-}
-
-#[derive(Debug, Clone)]
-pub struct RankWeightLayout {
-    pub rank: usize,
-    pub ranks: usize,
-    pub operands: Vec<WeightOperand>,
-    pub resident_bytes: u64,
-}
+/// Attention operands a head split divides by output rows (`o_proj` divides
+/// by input columns).
+const ROWS: [&str; 6] = [".self_attn.q_proj.weight", ".self_attn.k_proj.weight", ".self_attn.v_proj.weight",
+    ".self_attn.g_proj.weight", ".sparse_indexer_q.weight", ".sparse_indexer_w.weight"];
+/// FP32 indexer tensors the coordinator holds as BF16.
+const NARROWED: [&str; 4] = [".sparse_indexer_w.weight", ".sparse_indexer_q_norm.weight",
+    ".sparse_indexer_k_norm.weight", ".sparse_indexer_k_norm.bias"];
 
 impl RankWeightLayout {
     pub fn from_checkpoint(checkpoint: &Checkpoint, rank: usize, ranks: usize) -> Result<Self> {
-        Self::build(checkpoint, rank, ranks, None)
+        rank_layout(&CoordinatorContract::from_checkpoint(checkpoint)?.weights, rank, ranks, None)
     }
 
     /// Whole owners retain full native operands, and peers retain no private
@@ -168,7 +150,8 @@ impl RankWeightLayout {
     pub fn for_execution(checkpoint: &Checkpoint, rank: usize,
         ownership: &super::ownership::ExecutionOwnership) -> Result<Self> {
         ownership.validate_config(&Config::parse(checkpoint)?)?;
-        Self::build(checkpoint, rank, ownership.ranks(), Some(ownership))
+        rank_layout(&CoordinatorContract::from_checkpoint(checkpoint)?.weights, rank, ownership.ranks(),
+            Some(ownership))
     }
 
     /// MTP stages stay whole on their admitted owner. Matching head shapes
@@ -185,7 +168,7 @@ impl RankWeightLayout {
                 && tensor.role.layer.is_some_and(|layer| layer < end)
         }).map(|(name, tensor)| (name.clone(), tensor.shape.clone(), tensor.dtype.clone()));
         let weights = NativeDenseLayout::from_headers(checkpoint, declarations)?;
-        let mut layout = Self::from_native(&weights, 0, 1, None)?;
+        let mut layout = rank_layout(&weights, 0, 1, None)?;
         for operand in &mut layout.operands {
             operand.slice = WeightSlice::Replicated;
         }
@@ -197,156 +180,54 @@ impl RankWeightLayout {
         let cfg = Config::parse(checkpoint)?;
         ensure!(stage < cfg.mtp, "Step-5 predictor stage outside checkpoint");
         let prefix = format!("model.layers.{}.", cfg.layers + stage);
-        let mut layout = Self::for_mtp(checkpoint, stage + 1)?;
-        layout.operands.retain(|operand| operand.name.starts_with(&prefix));
-        layout.resident_bytes = layout.operands.iter().try_fold(0u64, |sum, operand|
-            sum.checked_add(operand.allocation_bytes))
-            .ok_or_else(|| anyhow::anyhow!("Step-5 stage weight size overflow"))?;
+        let layout = Self::for_mtp(checkpoint, stage + 1)?.retain(|operand| operand.name.starts_with(&prefix))?;
         ensure!(layout.operands.len() == 16, "Step-5 predictor operand inventory");
         Ok(layout)
     }
+}
 
-    fn build(checkpoint: &Checkpoint, rank: usize, ranks: usize,
-        ownership: Option<&super::ownership::ExecutionOwnership>) -> Result<Self> {
-        let contract = CoordinatorContract::from_checkpoint(checkpoint)?;
-        Self::from_native(&contract.weights, rank, ranks, ownership)
-    }
-
-    fn from_native(weights: &NativeDenseLayout, rank: usize, ranks: usize,
-        ownership: Option<&super::ownership::ExecutionOwnership>) -> Result<Self> {
-        ensure!(
-            matches!(ranks, 1 | 2) && rank < ranks,
-            "Step-5 coordinator rank geometry"
-        );
-        let sources: std::collections::BTreeMap<_, _> = weights
-            .tensors
-            .iter()
-            .map(|t| (t.meta.name.as_str(), t))
-            .collect();
-        let mut operands = Vec::new();
-        let mut resident_bytes = 0u64;
-        for source in &weights.tensors {
-            let name = &source.meta.name;
-            let mut split_ranks = ranks;
-            if let Some(ownership) = ownership {
-                if let Some(rest) = name.strip_prefix("model.layers.") {
-                    let (layer, operand) = rest.split_once('.')
-                        .ok_or_else(|| anyhow::anyhow!("Step-5 layer operand"))?;
-                    let local = ownership.layer(layer.parse()?, rank)?;
-                    let attention = operand.starts_with("self_attn.")
-                        || operand.starts_with("input_layernorm.");
-                    if (attention && local.query_heads == 0) || (!attention && !local.ffn) { continue; }
-                    split_ranks = if local.query_heads == 32 { 2 } else { 1 };
-                } else {
-                    let owner = if name == "model.embed_tokens.weight" {
-                        ownership.execution().spec().entry_gpu
-                    } else { ownership.execution().spec().head_gpu };
-                    if rank != usize::from(owner) { continue; }
-                    split_ranks = 1;
-                }
-            }
-            if name.ends_with(".up_proj.weight") {
-                continue;
-            }
-            let mut selected = vec![source.clone()];
-            let mut shape = source.meta.shape.clone();
-            let mut output_name = name.clone();
-            if let Some(base) = name.strip_suffix(".gate_proj.weight") {
-                let up = format!("{base}.up_proj.weight");
-                let up = sources
-                    .get(up.as_str())
-                    .ok_or_else(|| anyhow::anyhow!("missing packed up operand"))?;
-                ensure!(
-                    up.meta.shape == shape && up.meta.dtype == source.meta.dtype,
-                    "Step-5 gate/up operands disagree"
-                );
-                shape[0] = shape[0]
-                    .checked_mul(2)
-                    .ok_or_else(|| anyhow::anyhow!("packed rows overflow"))?;
-                selected.push((*up).clone());
-                output_name = format!("{base}.gate_up_proj.weight");
-            }
-            let index_bf16 = [
-                ".sparse_indexer_w.weight",
-                ".sparse_indexer_q_norm.weight",
-                ".sparse_indexer_k_norm.weight",
-                ".sparse_indexer_k_norm.bias",
-            ]
-            .iter()
-            .any(|suffix| name.ends_with(suffix));
-            let dtype = if index_bf16 {
-                DType::Bf16
+/// Step-5's rules for the shared dense builder: with `ownership`, a rank holds
+/// only the layers' attention and FFN it owns (the embedding and head on their
+/// GPUs), split only where it shares a layer's heads; the indexer's FP32
+/// tensors narrow to BF16; every operand stays BF16 or FP32.
+fn rank_layout(weights: &NativeDenseLayout, rank: usize, ranks: usize,
+    ownership: Option<&super::ownership::ExecutionOwnership>) -> Result<RankWeightLayout> {
+    let layout = RankWeightLayout::from_native(weights, rank, ranks, &[GATE_UP], |source| {
+        let name = &source.meta.name;
+        let mut split = ranks;
+        if let Some(ownership) = ownership {
+            if let Some(rest) = name.strip_prefix("model.layers.") {
+                let (layer, operand) = rest.split_once('.')
+                    .ok_or_else(|| anyhow::anyhow!("Step-5 layer operand"))?;
+                let local = ownership.layer(layer.parse()?, rank)?;
+                let attention = operand.starts_with("self_attn.")
+                    || operand.starts_with("input_layernorm.");
+                if (attention && local.query_heads == 0) || (!attention && !local.ffn) { return Ok(None); }
+                split = if local.query_heads == 32 { 2 } else { 1 };
             } else {
-                source.meta.dtype.clone()
-            };
-            let slice = if ownership.is_some() && split_ranks == 1 {
-                WeightSlice::Replicated
-            } else if [
-                ".self_attn.q_proj.weight",
-                ".self_attn.k_proj.weight",
-                ".self_attn.v_proj.weight",
-                ".self_attn.g_proj.weight",
-                ".sparse_indexer_q.weight",
-                ".sparse_indexer_w.weight",
-            ]
-            .iter()
-            .any(|suffix| name.ends_with(suffix))
-            {
-                WeightSlice::Rows
-            } else if name.ends_with(".self_attn.o_proj.weight") {
-                WeightSlice::Cols
-            } else {
-                WeightSlice::Replicated
-            };
-            if slice != WeightSlice::Replicated {
-                ensure!(shape.len() == 2, "Step-5 split operand must be a matrix");
-                let axis = if slice == WeightSlice::Rows { 0 } else { 1 };
-                ensure!(shape[axis] % split_ranks == 0, "Step-5 uneven head split");
-                shape[axis] /= split_ranks;
+                let owner = if name == "model.embed_tokens.weight" {
+                    ownership.execution().spec().entry_gpu
+                } else { ownership.execution().spec().head_gpu };
+                if rank != usize::from(owner) { return Ok(None); }
+                split = 1;
             }
-            let element_bytes = match dtype {
-                DType::Bf16 => 2u64,
-                DType::F32 => 4u64,
-                _ => anyhow::bail!("Step-5 unsupported coordinator operand precision"),
-            };
-            let bytes = shape
-                .iter()
-                .try_fold(element_bytes, |n, dim| n.checked_mul(*dim as u64))
-                .ok_or_else(|| anyhow::anyhow!("Step-5 operand size overflow"))?
-                .max(256);
-            resident_bytes = resident_bytes
-                .checked_add(bytes)
-                .ok_or_else(|| anyhow::anyhow!("Step-5 rank weight size overflow"))?;
-            operands.push(WeightOperand {
-                name: output_name,
-                sources: selected,
-                dtype,
-                shape,
-                slice,
-                allocation_bytes: bytes,
-            });
         }
-        Ok(Self {
-            rank,
-            ranks,
-            operands,
-            resident_bytes,
-        })
-    }
-
-    /// Caller must supply every non-weight cost before constructing an owner.
-    /// This method does not infer missing workspace/module costs as zero.
-    pub fn check_budget(&self, available: u64, reservations: &[u64]) -> Result<u64> {
-        let total = reservations
-            .iter()
-            .try_fold(self.resident_bytes, |n, v| n.checked_add(*v))
-            .ok_or_else(|| anyhow::anyhow!("Step-5 coordinator reservation overflow"))?;
-        ensure!(
-            total <= available,
-            "Step-5 coordinator weights and reservations need {total} bytes, available {available}"
-        );
-        Ok(total)
-    }
+        let slice = if ownership.is_some() && split == 1 {
+            WeightSlice::Replicated
+        } else if ROWS.iter().any(|suffix| name.ends_with(suffix)) {
+            WeightSlice::Rows
+        } else if name.ends_with(".self_attn.o_proj.weight") {
+            WeightSlice::Cols
+        } else {
+            WeightSlice::Replicated
+        };
+        let dtype = if NARROWED.iter().any(|suffix| name.ends_with(suffix)) { DType::Bf16 }
+            else { source.meta.dtype.clone() };
+        Ok(Some(Hold { slice, ranks: split, dtype }))
+    })?;
+    ensure!(layout.operands.iter().all(|operand| matches!(operand.dtype, DType::Bf16 | DType::F32)),
+        "Step-5 unsupported coordinator operand precision");
+    Ok(layout)
 }
 
 #[cfg(test)]

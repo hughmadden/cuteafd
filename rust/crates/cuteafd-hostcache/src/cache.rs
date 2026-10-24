@@ -349,7 +349,11 @@ impl<E: CopyEngine, P> HostCache<E, P> {
         let snapshots = if config.enabled() {
             let chunk_bytes = usize::try_from(config.chunk_bytes)
                 .map_err(|_| anyhow::anyhow!("chunk_bytes exceeds usize"))?;
+            let started = std::time::Instant::now();
             let pool = SlabPool::new(config.bytes, chunk_bytes, layout, &mut engine)?;
+            let (pinned, seconds) = (config.bytes / config.chunk_bytes * config.chunk_bytes, started.elapsed().as_secs_f64());
+            tracing::info!(target: "cuteafd::hostcache", pinned_bytes = pinned, chunk_bytes, seconds,
+                gb_per_s = pinned as f64 / seconds.max(1e-9) / 1e9, "host snapshot pool pinned");
             Some(Snapshots::with_rule(pool, rule, order))
         } else {
             None
@@ -680,6 +684,7 @@ impl<E: CopyEngine, P> HostCache<E, P> {
         if !self.enabled() {
             return RestoreOutcome::Failed;
         }
+        let begun = self.engine.now_ns();
         let plan = {
             let Some(snapshots) = self.snapshots.as_ref() else {
                 return RestoreOutcome::Failed;
@@ -712,11 +717,15 @@ impl<E: CopyEngine, P> HostCache<E, P> {
                 return RestoreOutcome::TimedOut;
             }
         };
+        let issued = self.engine.now_ns();
         let completed = self
             .engine
             .wait(event, self.config.restore_budget_ns)
             .unwrap_or(false);
         let ns = self.engine.now_ns().saturating_sub(start);
+        tracing::debug!(target: "cuteafd::hostcache", bytes = plan.bytes, completed,
+            plan_us = start.saturating_sub(begun) / 1000, issue_us = issued.saturating_sub(start) / 1000,
+            wait_us = (start + ns).saturating_sub(issued) / 1000, "host restore");
         // A timed-out restore still reads host slabs. Keep its pin if the
         // exceptional barrier fails; callers must also retain their targets.
         if completed || self.engine.release_barrier(Stream::Restore).is_ok() { self.unpin(key); }

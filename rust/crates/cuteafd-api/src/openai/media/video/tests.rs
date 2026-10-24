@@ -74,6 +74,7 @@ fn defaults_keep_all_frames_segment_eight_and_repeat_the_odd_tail() {
     for (frame, value) in rgb.into_iter().zip([0, 1, 2, 3, 4, 5, 6, 7, 0, 1, 2, 2]) {
         assert!(frame.iter().all(|&p| p == value));
     }
+    // One marker per temporal pair (4 + 2); the worker expands each into the pair's rows.
     assert_eq!(prepared[0].placeholder.matches("]<]video[>[").count(), 6);
     assert!(!prepared[0].placeholder.contains("seconds"));
     // Each temporal patch keeps its first frame's source time across the segment split.

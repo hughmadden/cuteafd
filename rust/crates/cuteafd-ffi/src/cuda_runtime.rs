@@ -30,7 +30,7 @@ use std::sync::Arc;
 
 /// `RTLD_NOW` from `dlfcn.h` (glibc and macOS both use 2): resolve every symbol before
 /// `dlopen` returns, so a missing entry point fails the probe instead of crashing later.
-const RTLD_NOW: c_int = 2;
+pub(crate) const RTLD_NOW: c_int = 2;
 
 /// `RTLD_NOLOAD` from glibc's `dlfcn.h`: look the library up in the process image without
 /// loading it. The no-second-runtime guarantee this value carries is glibc-specific (the
@@ -38,13 +38,13 @@ const RTLD_NOW: c_int = 2;
 /// platforms disagree (FreeBSD uses 0x20000). macOS is kept correct for local development
 /// but is not a fleet target.
 #[cfg(not(target_os = "macos"))]
-const RTLD_NOLOAD: c_int = 0x4;
+pub(crate) const RTLD_NOLOAD: c_int = 0x4;
 #[cfg(target_os = "macos")]
-const RTLD_NOLOAD: c_int = 0x10;
+pub(crate) const RTLD_NOLOAD: c_int = 0x10;
 
 /// Sonames probed, newest first: the fleet image ships `libcudart.so.13`, the build toolchain
 /// `libcudart.so.12`.
-const SONAMES: [&str; 2] = ["libcudart.so.13", "libcudart.so.12"];
+pub(crate) const SONAMES: [&str; 2] = ["libcudart.so.13", "libcudart.so.12"];
 
 /// PCI identity of a CUDA ordinal, including CUDA_VISIBLE_DEVICES remapping.
 /// Bind only the runtime already loaded by the native library.

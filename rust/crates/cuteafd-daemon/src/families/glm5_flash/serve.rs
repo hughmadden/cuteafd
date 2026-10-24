@@ -171,7 +171,7 @@ pub(crate) async fn run_serve(args: ServeArgs) -> Result<()> {
     let prefix = args.prefix.clone();
     let hub = console::hub(args.console.console_text, || console_layout(&args, &profile.id));
     let vision = args.vision;
-    let remote = super::media::RemoteVision::from_args(&args)?;
+    let remote = super::media::RemoteVision::parse(args.vision, args.vision_peers.as_deref(), args.encoder_plan_hash.as_deref(), args.encoder_revision.as_deref())?;
     let media_cache_bytes = args.media_cache_bytes;
     let worker = tokio::task::spawn_blocking(move ||
         serve_loop(engine_args, receive, ready_tx, worker_stats, max_sequences, policy, decode_share, prefix, vision, media_cache_bytes, remote));

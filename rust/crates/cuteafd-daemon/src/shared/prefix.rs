@@ -4,6 +4,8 @@ use anyhow::Result;
 use cuteafd_engine::prefix::{FamilyLayout, PointPolicy};
 use cuteafd_ffi::{CuteafdDeviceBuffer, NativeLibrary};
 
+#[path = "prefix/append.rs"]
+pub(crate) mod append;
 #[path = "prefix/budget.rs"]
 pub(crate) mod budget;
 pub(crate) use budget::HostBudget;
@@ -36,6 +38,16 @@ pub(crate) struct PrefixArgs {
     /// KV tokens to keep free after host pressure eviction (0 disables batching).
     #[arg(long, default_value_t = cuteafd_core::prefix::DEFAULT_HOST_CACHE_EVICT_TOKENS)]
     pub host_cache_evict_tokens: u64,
+    /// When a retained snapshot is copied to the host tier: on-retain (at retention, on
+    /// the store stream) or on-evict (only when the device evicts it).
+    #[arg(long, value_enum, default_value_t = crate::cli::HostCacheStore::OnRetain, env = "CUTEAFD_HOST_CACHE_STORE")]
+    pub host_cache_store: crate::cli::HostCacheStore,
+    /// Longest the device-evict path waits for an in-flight store before dropping it uncached.
+    #[arg(long, default_value_t = 1000, env = "CUTEAFD_HOST_CACHE_COPY_BUDGET_MS")]
+    pub host_cache_copy_budget_ms: u64,
+    /// Longest a host restore waits before the request falls through to prefill.
+    #[arg(long, default_value_t = 500, env = "CUTEAFD_HOST_CACHE_RESTORE_BUDGET_MS")]
+    pub host_cache_restore_budget_ms: u64,
     /// RAM kept outside an automatic pinned prefix pool, at least 10% of total RAM.
     #[arg(long, default_value = "8GiB", value_parser = parse_bytes)]
     pub host_cache_headroom_bytes: u64,
@@ -152,6 +164,12 @@ impl PrefixArgs {
             bytes,
             eviction_headroom: budget::eviction_headroom(layout, self.host_cache_evict_tokens)?,
             chunk_bytes: chunk.min(bytes),
+            store: match self.host_cache_store {
+                crate::cli::HostCacheStore::OnRetain => cuteafd_hostcache::config::StoreMode::OnRetain,
+                crate::cli::HostCacheStore::OnEvict => cuteafd_hostcache::config::StoreMode::OnEvict,
+            },
+            copy_budget_ns: self.host_cache_copy_budget_ms.saturating_mul(1_000_000),
+            restore_budget_ns: self.host_cache_restore_budget_ms.saturating_mul(1_000_000),
             min_tokens: self.host_cache_min_tokens,
             max_tokens: u32::try_from(max_context)?,
             ..Default::default()
@@ -217,6 +235,39 @@ pub(crate) fn view(buffer: CuteafdDeviceBuffer, offset: usize, bytes: usize) -> 
     anyhow::ensure!(offset.checked_add(bytes).is_some_and(|end| end <= buffer.bytes),
         "view {offset}+{bytes} past a {}-byte buffer", buffer.bytes);
     Ok(CuteafdDeviceBuffer { ptr: buffer.ptr.cast::<u8>().wrapping_add(offset).cast(), bytes, ..buffer })
+}
+
+/// One buffer of a pages-only prefix family (GLM 5.3, MiniMax M3): page `p` is
+/// `page_bytes` at `buffer + p * page_bytes`, and the first `rows` rows of a page
+/// are `rows * row_bytes` at each `(offset, row_bytes)` span.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PagedPlane {
+    pub buffer: CuteafdDeviceBuffer,
+    pub page_bytes: usize,
+    pub spans: &'static [(usize, usize)],
+}
+
+/// The paged E4M3 index-key page (GLM 5.3 DSA, MiniMax MSA): 64 rows of 128 key
+/// bytes, then 64 FP32 scales.
+pub(crate) const INDEX_PAGE_BYTES: usize = 64 * (128 + 4);
+const INDEX_PAGE_SPANS: &[(usize, usize)] = &[(0, 128), (64 * 128, 4)];
+
+impl PagedPlane {
+    /// An index-key plane ([`INDEX_PAGE_BYTES`] pages).
+    pub fn index(buffer: CuteafdDeviceBuffer) -> Self {
+        Self { buffer, page_bytes: INDEX_PAGE_BYTES, spans: INDEX_PAGE_SPANS }
+    }
+    /// Page `page` whole, as the host tier stores it.
+    pub fn page(&self, page: usize) -> cuteafd_hostcache::copy::DeviceRange {
+        cuteafd_hostcache::copy::DeviceRange { addr: self.buffer.ptr as u64 + (page * self.page_bytes) as u64,
+            bytes: self.page_bytes }
+    }
+    /// The copies of a partial tail: the first `rows` rows of page `from` into
+    /// page `to`, as `(destination, source)` views.
+    pub fn tail(&self, from: usize, to: usize, rows: usize) -> Result<Vec<(CuteafdDeviceBuffer, CuteafdDeviceBuffer)>> {
+        self.spans.iter().map(|&(offset, row_bytes)| Ok((view(self.buffer, to * self.page_bytes + offset, rows * row_bytes)?,
+            view(self.buffer, from * self.page_bytes + offset, rows * row_bytes)?))).collect()
+    }
 }
 
 #[cfg(test)]
@@ -310,5 +361,11 @@ mod tests {
             draft_bytes: 0, rule: cuteafd_core::prefix::ReuseRule::EXACT, mark_store: Default::default(), page_owners: Default::default() };
         let config = cli.prefix.host_config(layout, 32768, 1).unwrap().unwrap();
         assert_eq!((config.bytes, config.max_tokens), (1 << 20, 32768));
+        assert_eq!(config.store, cuteafd_hostcache::config::StoreMode::OnRetain);
+        assert_eq!((config.copy_budget_ns, config.restore_budget_ns), (1_000_000_000, 500_000_000));
+        let cli = Cli::parse_from(["serve", "--host-cache-bytes", "1MiB", "--host-cache-headroom-bytes", "0",
+            "--host-cache-store", "on-evict", "--host-cache-restore-budget-ms", "2000"]);
+        let config = cli.prefix.host_config(layout, 32768, 1).unwrap().unwrap();
+        assert_eq!((config.store, config.restore_budget_ns), (cuteafd_hostcache::config::StoreMode::OnEvict, 2_000_000_000));
     }
 }

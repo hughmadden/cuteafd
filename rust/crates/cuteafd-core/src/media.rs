@@ -66,6 +66,20 @@ impl<'de> Deserialize<'de> for MediaKey {
     }
 }
 
+/// Temporal patch pairs in one video attention segment: MiniMax's
+/// `vision_segment_max_frames`, eight frames.
+pub const MAX_SEGMENT_PAIRS: u32 = 4;
+
+/// Patches in a complete video segment `[t, h, w]`: `t` temporal patch pairs of
+/// `h x w` patches in whole 2x2 merge windows. `None` for any other grid.
+pub fn video_segment_patches(grid: [u32; 3]) -> Option<u64> {
+    let [t, h, w] = grid;
+    if !(1..=MAX_SEGMENT_PAIRS).contains(&t) || h == 0 || w == 0 || h % 2 != 0 || w % 2 != 0 {
+        return None;
+    }
+    u64::from(t).checked_mul(u64::from(h))?.checked_mul(u64::from(w))
+}
+
 /// A contiguous span of media feature rows in the expanded native prompt.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct MediaSpan {
@@ -83,6 +97,15 @@ impl MediaSpan {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn video_segments_hold_one_to_four_pairs_of_whole_merge_windows() {
+        assert_eq!(video_segment_patches([4, 2, 4]), Some(32));
+        assert_eq!(video_segment_patches([1, u32::MAX - 1, u32::MAX - 1]), Some(u64::from(u32::MAX - 1).pow(2)));
+        for grid in [[0, 2, 2], [5, 2, 2], [1, 0, 2], [1, 3, 2], [1, 2, 3]] {
+            assert_eq!(video_segment_patches(grid), None, "{grid:?}");
+        }
+    }
 
     #[test]
     fn full_key_and_span_round_trip() {

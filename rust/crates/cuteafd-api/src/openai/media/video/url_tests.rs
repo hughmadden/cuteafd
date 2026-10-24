@@ -88,7 +88,8 @@ fn defaults_follow_the_serving_sampler_frame_size_and_timestamps() {
         let prepared = preparer(ImageUrlFetch::Off).prepare_videos(&source).unwrap();
         let segment = &prepared[0].segments[0];
         assert_eq!((segment.grid.t, segment.grid.h * 14, segment.grid.w * 14, segment.source_frames), (2, height, width, 4));
-        let pair = format!("]<]start of image[>[{}]<]end of image[>[", "]<]video[>[".repeat(height as usize / 28 * (width as usize / 28)));
+        assert_eq!(segment.tokens, 2 * (height as usize / 28) * (width as usize / 28));
+        let pair = "]<]start of image[>[]<]video[>[]<]end of image[>[";
         assert_eq!(prepared[0].placeholder, format!("]<]0.0 seconds[>[{pair}]<]2.0 seconds[>[{pair}"));
     }
 }

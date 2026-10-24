@@ -5,6 +5,8 @@ use super::{
     prefix::{Frontier, Placement, Step5Prefix},
 };
 use crate::shared::memory::device::{Allocation, Device, Stream};
+pub(super) use crate::shared::prefix::append::SequenceRows;
+use crate::shared::prefix::append;
 use anyhow::{ensure, Context, Result};
 use cuteafd_engine::prefix::{PrefixCache, RefPagePool};
 use cuteafd_ffi::{
@@ -231,53 +233,6 @@ impl<'a> Staging<'a> {
     }
 }
 
-/// One contiguous query slice with its own native state slot and admitted pages.
-#[derive(Debug, Clone, Copy)]
-pub(super) struct SequenceRows<'p> {
-    pub sequence: u64,
-    pub start: usize,
-    pub rows: usize,
-    pub base: usize,
-    pub pages: &'p [u32],
-}
-
-pub(super) fn validate_wave(sequences: &[SequenceRows<'_>], pool: &RefPagePool,
-    slots: usize, capacity: usize, context: usize, pages: usize,
-) -> Result<usize> {
-    ensure!(!sequences.is_empty() && !pool.is_parity() && pool.page_rows() == 64
-        && pool.capacity().checked_add(pool.reserved()) == Some(pages),
-        "Step-5 wave pool geometry differs from native admission");
-    let mut slots_seen = BTreeSet::new();
-    let mut referenced = BTreeSet::new();
-    let mut writable = BTreeSet::new();
-    let mut total = 0usize;
-    for sequence in sequences {
-        ensure!(sequence.sequence < slots as u64 && slots_seen.insert(sequence.sequence),
-            "Step-5 wave duplicate or unadmitted sequence slot");
-        let end = sequence.base.checked_add(sequence.rows).context("Step-5 wave frontier overflow")?;
-        ensure!(sequence.rows > 0 && sequence.start == total && end <= context,
-            "Step-5 wave row slice or context extent");
-        total = total.checked_add(sequence.rows).context("Step-5 wave rows overflow")?;
-        ensure!(total <= capacity && end.div_ceil(64) <= sequence.pages.len()
-            && sequence.pages.len() <= context.div_ceil(64),
-            "Step-5 wave exceeds row or page-table admission");
-        let mut unique = BTreeSet::new();
-        for (logical, &page) in sequence.pages.iter().enumerate() {
-            // RefPagePool::refs indexes directly, so bounds precede every read.
-            ensure!((page as usize) >= pool.reserved() && (page as usize) < pages
-                && unique.insert(page), "Step-5 wave invalid or duplicate physical page");
-            let refs = pool.refs(page);
-            ensure!(refs > 0, "Step-5 wave references an unallocated page");
-            let write = logical >= sequence.base / 64;
-            ensure!(!writable.contains(&page) && (!write || (!referenced.contains(&page) && refs == 1)),
-                "Step-5 wave writable page is shared or aliases another sequence");
-            referenced.insert(page);
-            if write { writable.insert(page); }
-        }
-    }
-    Ok(total)
-}
-
 #[derive(Debug, Clone)]
 struct Sequence {
     sequence: u64,
@@ -286,6 +241,13 @@ struct Sequence {
     base: usize,
     raw: usize,
     pages: Vec<u32>,
+}
+
+impl Sequence {
+    fn view(&self) -> SequenceRows<'_> {
+        SequenceRows { sequence: self.sequence, start: self.start, rows: self.rows, base: self.base,
+            pages: &self.pages }
+    }
 }
 
 fn retain_wave(sequences: &[SequenceRows<'_>]) -> Result<Vec<Sequence>> {
@@ -454,7 +416,7 @@ impl<'e, 'a, E: CopyEngine> Step<'e, 'a, E> {
         let admitted = (|| {
             let cache = ranks[0].borrow();
             let shared = pool.try_borrow().context("Step-5 prefix pool already borrowed")?;
-            validate_wave(&[SequenceRows { sequence: placement.sequence, start: 0, rows, base, pages: &pages }],
+            append::validate(&[SequenceRows { sequence: placement.sequence, start: 0, rows, base, pages: &pages }],
                 shared.pool(), usize::try_from(cache.sequences())?, staging[0].rows,
                 usize::try_from(cache.layout().context)?, usize::try_from(cache.page_count())?)
         })();
@@ -476,7 +438,7 @@ impl<'e, 'a, E: CopyEngine> Step<'e, 'a, E> {
         Step5Prefix::new(ranks.clone())?;
         ensure!(ranks.len() == staging.len(), "Step-5 wave rank inventory");
         let cache = ranks[0].borrow();
-        validate_wave(sequences, pool, usize::try_from(cache.sequences())?, staging[0].rows,
+        append::validate(sequences, pool, usize::try_from(cache.sequences())?, staging[0].rows,
             usize::try_from(cache.layout().context)?, usize::try_from(cache.page_count())?)?;
         drop(cache);
         Self::prepare(ranks, staging, retain_wave(sequences)?, None)
@@ -907,14 +869,8 @@ impl<'e, 'a, E: CopyEngine> Step<'e, 'a, E> {
     /// Scheduler-owned pages are never released or replaced here. All native
     /// banks publish together after every rank has prepared and drained.
     pub(super) fn publish_wave(mut self, placements: &mut [(&mut Placement, usize)]) -> Result<()> {
-        ensure!(self.lease.is_none() && placements.len() == self.sequences.len(),
-            "Step-5 scheduler publication inventory");
-        for ((placement, accepted), sequence) in placements.iter().zip(&self.sequences) {
-            ensure!(placement.sequence == sequence.sequence && placement.pages == sequence.pages
-                && *accepted <= sequence.rows
-                && (placement.committed == sequence.base || placement.committed == sequence.base + *accepted),
-                "Step-5 scheduler publication frontier differs from retained evidence");
-        }
+        ensure!(self.lease.is_none(), "Step-5 scheduler publication inventory");
+        append::check_publication(self.sequences.iter().map(Sequence::view), placements)?;
         let accepted: Vec<_> = placements.iter().map(|(_, rows)| *rows).collect();
         self.prepare_publication(&accepted)?;
         for ((placement, accepted), sequence) in placements.iter_mut().zip(&self.sequences) {
@@ -1124,74 +1080,6 @@ pub(super) mod tests {
         }
         assert!(retain_wave(&[SequenceRows { sequence: 0, start: 0, rows: usize::MAX,
             base: 7, pages: &[] }]).is_err());
-    }
-
-    #[test]
-    fn wave_admission_shares_only_immutable_pages_and_preserves_row_slices() {
-        let mut pool = RefPagePool::new(16, 64);
-        let source = pool.alloc(2).unwrap();
-        let first = pool.fork(&source, 65, 3).unwrap();
-        let second = pool.fork(&source, 65, 3).unwrap();
-        let sequences = [
-            SequenceRows { sequence: 3, start: 0, rows: 1, base: 65, pages: &first.pages },
-            SequenceRows { sequence: 1, start: 1, rows: 17, base: 65, pages: &second.pages },
-        ];
-        assert_eq!(validate_wave(&sequences, &pool, 4, 18, 192, 16).unwrap(), 18);
-        assert_eq!(first.pages[0], second.pages[0]);
-        assert_ne!(first.pages[1], second.pages[1]);
-        assert!(first.copy.is_some() && second.copy.is_some());
-        let mut invalid = sequences;
-        invalid[1].pages = &first.pages;
-        assert!(validate_wave(&invalid, &pool, 4, 18, 192, 16).is_err());
-        let readonly = SequenceRows { sequence: 0, start: 0, rows: 1, base: 128, pages: &first.pages };
-        let writer = SequenceRows { sequence: 1, start: 1, rows: 1, base: 65, pages: &first.pages };
-        assert!(validate_wave(&[readonly, writer], &pool, 4, 18, 192, 16).is_err());
-        assert!(validate_wave(&[SequenceRows { start: 0, ..writer }, SequenceRows { start: 1, ..readonly }],
-            &pool, 4, 18, 192, 16).is_err());
-        let reversed = [SequenceRows { start: 0, ..sequences[1] }, SequenceRows { start: 17, ..sequences[0] }];
-        assert_eq!(validate_wave(&reversed, &pool, 4, 18, 192, 16).unwrap(), 18);
-        pool.release(&source);
-        pool.release(&first.pages);
-        pool.release(&second.pages);
-        assert_eq!(pool.free(), 16);
-    }
-
-    #[test]
-    fn wave_admission_rejects_invalid_inventory_before_pool_indexing() {
-        let mut pool = RefPagePool::new(8, 64);
-        let pages = pool.alloc(3).unwrap();
-        let valid = SequenceRows { sequence: 0, start: 0, rows: 2, base: 63, pages: &pages };
-        assert_eq!(validate_wave(&[valid], &pool, 2, 16, 192, 8).unwrap(), 2);
-        for invalid in [
-            SequenceRows { sequence: 2, ..valid },
-            SequenceRows { start: 1, ..valid },
-            SequenceRows { rows: 0, ..valid },
-            SequenceRows { rows: 17, ..valid },
-            SequenceRows { base: usize::MAX, ..valid },
-            SequenceRows { base: 191, ..valid },
-            SequenceRows { pages: &pages[..1], ..valid },
-            SequenceRows { pages: &[0, 0], ..valid },
-            SequenceRows { pages: &[0, 7], ..valid },
-            SequenceRows { pages: &[0, 8], ..valid },
-            SequenceRows { pages: &[0, u32::MAX], ..valid },
-        ] {
-            assert!(validate_wave(&[invalid], &pool, 2, 16, 192, 8).is_err(), "{invalid:?}");
-        }
-        assert!(validate_wave(&[], &pool, 2, 16, 192, 8).is_err());
-        assert!(validate_wave(&[valid], &pool, 2, 16, 192, 9).is_err());
-        assert!(validate_wave(&[valid, SequenceRows { start: 2, ..valid }], &pool, 2, 16, 192, 8).is_err());
-        pool.share(&pages[1..2]);
-        assert!(validate_wave(&[valid], &pool, 2, 16, 192, 8).is_err());
-        pool.release(&pages[1..2]);
-        let mut reserved = RefPagePool::with_reserved(8, 64, 1);
-        let allocation = reserved.alloc(2).unwrap();
-        let reserved_valid = SequenceRows { pages: &allocation, ..valid };
-        validate_wave(&[reserved_valid], &reserved, 2, 16, 192, 8).unwrap();
-        assert!(validate_wave(&[SequenceRows { pages: &[0, 1], ..valid }], &reserved, 2, 16, 192, 8).is_err());
-        let wrong_rows = RefPagePool::new(8, 32);
-        assert!(validate_wave(&[valid], &wrong_rows, 2, 16, 192, 8).is_err());
-        let parity = RefPagePool::parity(8, 64, 0);
-        assert!(validate_wave(&[valid], &parity, 2, 16, 192, 8).is_err());
     }
 
     #[test]

@@ -466,6 +466,31 @@ impl NativeLibrary {
         Ok(())
     }
 
+    /// [`Self::host_signal`] with its payload (see `cuteafd_host_publish`):
+    /// a small grid stores each span (device source, host destination, bytes;
+    /// 16-byte aligned multiples) and then publishes, with no copy-engine copy.
+    ///
+    /// # Safety
+    /// As [`Self::host_signal`]; every source is live device memory complete in
+    /// stream order, every destination pinned, device-mapped host memory the
+    /// host reads only after the sequence, and `arrivals` (u32 [1]) zeroed
+    /// device memory used by no other launch at the same time.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn host_publish(&self, spans: [(*const c_void, *mut c_void, usize); 3], flag: *mut u32,
+        send_state: *mut u32, descriptor: *mut u32, words: [u32; 4], arrivals: *mut u32, stream: *mut c_void)
+        -> Result<()> {
+        type F = unsafe extern "C" fn(*const *const c_void, *const *mut c_void, *const u64, *mut u32, *mut u32,
+            *mut u32, *const u32, *mut u32, *mut c_void) -> i32;
+        let f = *unsafe { self.lib.get::<F>(b"cuteafd_host_publish") }?;
+        let sources = spans.map(|span| span.0);
+        let destinations = spans.map(|span| span.1);
+        let bytes = spans.map(|span| span.2 as u64);
+        let status = unsafe { f(sources.as_ptr(), destinations.as_ptr(), bytes.as_ptr(), flag, send_state,
+            descriptor, words.as_ptr(), arrivals, stream) };
+        ensure!(status == 0, "host mailbox publish failed with CUDA error {status}");
+        Ok(())
+    }
+
     /// Write-mode Spark completions on `stream` (see `cuteafd_spark_wait_written`).
     ///
     /// # Safety

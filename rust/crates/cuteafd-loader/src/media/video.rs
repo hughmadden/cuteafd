@@ -51,19 +51,14 @@ pub fn decode_video(encoded: &[u8], max_decoded_bytes: usize,
     if budget == 0 { return Err(invalid("decoded video exceeds request byte limit")); }
     let mut input = tempfile::NamedTempFile::new().map_err(io_error)?;
     input.write_all(encoded).map_err(io_error)?;
+    // One process reads the stream header and every packet's flags (compact JSON,
+    // under 32 bytes a packet).
     let mut probe = command("ffprobe");
     probe.args(["-protocol_whitelist", "file", "-format_whitelist", FORMATS,
         "-threads", "1", "-max_pixels", "67108864", "-select_streams", "v:0",
-        "-show_entries", "stream=width,height,avg_frame_rate", "-of", "json"])
+        "-show_entries", "stream=width,height,avg_frame_rate:packet=flags", "-of", "json=c=1"])
         .arg(input.path());
-    let stream = probe_stream(&run(&mut probe, 16 << 10, Duration::from_secs(10))?)?;
-    let mut packets = command("ffprobe");
-    packets.args(["-protocol_whitelist", "file", "-format_whitelist", FORMATS,
-        "-threads", "1", "-max_pixels", "67108864", "-select_streams", "v:0",
-        "-show_entries", "packet=flags", "-of", "csv=p=0"])
-        .arg(input.path());
-    let flags = run(&mut packets, MAX_PACKETS * 4, Duration::from_secs(10))?;
-    let frames = flags.split(|&b| b == b'\n').filter(|line| !line.is_empty() && !line.contains(&b'D')).count();
+    let (stream, frames) = probe_stream(&run(&mut probe, MAX_PACKETS * 32 + (16 << 10), Duration::from_secs(10))?)?;
     if frames == 0 { return Err(invalid("video stream has no frames")); }
     let probe = VideoProbe { width: stream.width, height: stream.height, fps: frame_rate(&stream.avg_frame_rate), frames };
     let DecodePlan { indices, width, height } = plan(&probe)?;
@@ -99,6 +94,13 @@ pub fn decode_video(encoded: &[u8], max_decoded_bytes: usize,
 #[derive(Deserialize)]
 struct Probe {
     streams: Vec<Stream>,
+    #[serde(default)]
+    packets: Vec<Packet>,
+}
+#[derive(Deserialize)]
+struct Packet {
+    #[serde(default)]
+    flags: String,
 }
 #[derive(Deserialize)]
 struct Stream {
@@ -107,15 +109,19 @@ struct Stream {
     #[serde(default)]
     avg_frame_rate: String,
 }
-fn probe_stream(metadata: &[u8]) -> Result<Stream> {
+/// The video stream and the frames its decoder emits: packets an edit list does not
+/// discard (flag `D`).
+fn probe_stream(metadata: &[u8]) -> Result<(Stream, usize)> {
     let probe: Probe = serde_json::from_slice(metadata)
         .map_err(|_| invalid("video probe returned invalid metadata"))?;
+    if probe.packets.len() > MAX_PACKETS { return Err(invalid("video has too many packets")); }
+    let frames = probe.packets.iter().filter(|packet| !packet.flags.is_empty() && !packet.flags.contains('D')).count();
     let stream = probe.streams.into_iter().next().ok_or_else(|| invalid("video has no video stream"))?;
     let pixels = u64::from(stream.width) * u64::from(stream.height);
     if pixels == 0 || pixels > MAX_PIXELS {
         return Err(invalid("video dimensions exceed the pixel limit"));
     }
-    Ok(stream)
+    Ok((stream, frames))
 }
 fn frame_rate(value: &str) -> Option<f64> {
     let (numerator, denominator) = value.split_once('/')?;
@@ -256,6 +262,9 @@ mod tests {
             assert!(probe_stream(header).is_err());
         }
         assert!(probe_stream(br#"{"streams":[{"width":28,"height":28}]}"#).is_ok());
+        // Discarded (edit-list) packets are not frames.
+        let header = br#"{"packets":[{"flags":"K__"},{"flags":"__D"},{"flags":"___"}],"streams":[{"width":28,"height":28}]}"#;
+        assert_eq!(probe_stream(header).unwrap().1, 2);
     }
     #[test]
     fn samples_and_scales_a_720p_clip_inside_the_decoder() {

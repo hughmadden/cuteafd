@@ -218,7 +218,7 @@ PROFILE_SPARK_NSYS_GPU_METRICS
 EOF
     [[ "$1" != kimi_k3 ]] || printf '%s\n' KV_CACHE RTX_EXPERT_LAYERS SPECULATOR_MODEL_ID SPECULATOR_MODEL_REVISION SPECULATOR_DRAFTS
     [[ "$1" != step5 ]] || printf '%s\n' SPECULATOR_DEPTH KV_CACHE
-    [[ "$1" != minimax_m3 ]] || printf '%s\n' KV_CACHE RTX_EXPERT_LAYERS PREFILL_BATCH_TOKENS PREFILL_LANES MEDIA_CACHE_BYTES VISION_REPLICAS
+    [[ "$1" != minimax_m3 ]] || printf '%s\n' KV_CACHE RTX_EXPERT_LAYERS PREFILL_BATCH_TOKENS PREFILL_LANES MEDIA_CACHE_BYTES VISION_REPLICAS HOST_CACHE_STORE
     _spark_slot_keys HOST LANE_A
     return
   fi
@@ -720,9 +720,9 @@ if [[ "${CUTEAFD_GRAPH_CENSUS:-}" == 1 ]]; then
 fi
 if [[ -n "${CUTEAFD_GRAPH_EAGER:-}" ]]; then
   [[ -n "$wip_layout" ]] || { printf '%s\n' 'Graph eager override requires a WIP build' >&2; exit 2; }
-  [[ "$CUTEAFD_GRAPH_EAGER" == layer_row ]] || { printf '%s\n' 'Graph eager override must be layer_row' >&2; exit 2; }
+  [[ "$CUTEAFD_GRAPH_EAGER" == layer_row || "$CUTEAFD_GRAPH_EAGER" == minimax_step ]] || { printf '%s\n' 'Graph eager override must be layer_row or minimax_step' >&2; exit 2; }
   [[ "${CUTEAFD_GRAPH_CENSUS:-}" != 1 ]] || { printf '%s\n' 'Graph eager A/B requires census timing disabled' >&2; exit 2; }
-  graph_census_args+=(-e CUTEAFD_GRAPH_EAGER=layer_row)
+  graph_census_args+=(-e "CUTEAFD_GRAPH_EAGER=$CUTEAFD_GRAPH_EAGER")
 fi
 }
 # API keys, the live console and usage records: arguments for the serve command
@@ -1565,6 +1565,8 @@ family="$detected"
 if [[ "$family" == minimax_m3 ]]; then
   minimax_kv_cache="$(get KV_CACHE fp8)"
   case "$minimax_kv_cache" in bf16|fp8) ;; *) release_die "KV_CACHE must be bf16 or fp8" ;; esac
+  minimax_host_store="$(get HOST_CACHE_STORE on-evict)"
+  case "$minimax_host_store" in on-evict|on-retain) ;; *) release_die "HOST_CACHE_STORE must be on-evict or on-retain" ;; esac
   minimax_local_layers="$(get RTX_EXPERT_LAYERS auto)"
   [[ "$minimax_local_layers" == auto || "$minimax_local_layers" =~ ^[0-9]+$ ]] ||
     release_die "MiniMax RTX_EXPERT_LAYERS must be auto or a fixed routed-layer count"
@@ -1713,7 +1715,7 @@ if [[ "$family" == minimax_m3 ]]; then
       --coordinator-gpu-budget-gib "$minimax_budget" --coordinator-weight-budget-gib "$minimax_budget"
       --concurrency "$minimax_concurrency" --prefill-rows "$minimax_prefill_rows" --prefill-lanes "$minimax_prefill_lanes"
       --mapped-scale-preload-gib "$(get MAPPED_SCALE_PRELOAD_GIB 0)"
-      --prefix-cache-entries "$(get PREFIX_CACHE_ENTRIES 20)" --host-cache-bytes "$(get HOST_CACHE_BYTES 0)"
+      --prefix-cache-entries "$(get PREFIX_CACHE_ENTRIES 20)" --host-cache-bytes "$(get HOST_CACHE_BYTES auto)"
       --pool-tokens "$minimax_pool" --context-tokens "$minimax_context"
       --vision "$vision" --audio "$audio" --vision-replicas "$vision_replicas")
     [[ "$minimax_local_layers" == auto ]] || minimax_plan_args+=(--rtx-expert-layers "$minimax_local_layers")
@@ -1995,17 +1997,17 @@ if [[ "$drafts" != adaptive ]]; then
     { echo "SPECULATOR_DRAFTS must be adaptive or a draft count, with SPECULATOR=dflash2 (or dspark on GLM 5.3 Flash)" >&2; exit 2; }
   draft_args+=(--draft-fixed "$drafts")
 fi
-# Prefix cache (MiMo, GLM 5.3, GLM 5.3 Flash, Qwen 3.8, DeepSeek V4): PREFIX_CACHE_ENTRIES
+# Prefix cache (MiMo, GLM 5.3, GLM 5.3 Flash, Qwen 3.8, DeepSeek V4, MiniMax M3): PREFIX_CACHE_ENTRIES
 # snapshots per bank (prompts, turns; 0 = off), HOST_CACHE_BYTES of pinned host memory for
 # retention (auto by default, e.g. 64GiB explicitly; 0 = off). POOL_TOKENS: paged KV tokens shared by
-# live sequences and retained snapshots.
+# live sequences and retained snapshots. MiniMax copies a snapshot to that host memory only when
+# the device evicts it (HOST_CACHE_STORE=on-evict; on-retain copies every snapshot as it is kept).
 case $family in
-  minimax_m3)
-    family_args+=(--prefix-cache-entries "$(get PREFIX_CACHE_ENTRIES 20)" --host-cache-bytes "$(get HOST_CACHE_BYTES 0)") ;;
-  mimo_v2|glm5|glm5_flash|qwen4|qwen3_5|deepseek_v4|kimi_k3|step5)
+  mimo_v2|glm5|glm5_flash|qwen4|qwen3_5|deepseek_v4|kimi_k3|step5|minimax_m3)
     family_args+=(--prefix-cache-entries "$(get PREFIX_CACHE_ENTRIES 20)")
     [[ "$(get HOST_CACHE_BYTES auto)" == 0 ]] || family_args+=(--host-cache-bytes "$(get HOST_CACHE_BYTES auto)") ;;
 esac
+[[ $family != minimax_m3 || "$(get HOST_CACHE_BYTES auto)" == 0 ]] || family_args+=(--host-cache-store "$minimax_host_store")
 if [[ ( $family == mimo_v2 || $family == qwen4 || $family == glm5_flash || $family == minimax_m3 ) && $vision != off ]]; then
   # Text-only frozen daemons can predate the optional media-cache flag.
   [[ -z "$(get MEDIA_CACHE_BYTES)" ]] || family_args+=(--media-cache-bytes "$(get MEDIA_CACHE_BYTES)")

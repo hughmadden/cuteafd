@@ -124,19 +124,29 @@ impl StepDump {
     }
 }
 
-/// `CUTEAFD_MINIMAX_STEP_DIGEST=1`: logs the SHA-256 of every step's final
-/// hidden rows after its stream drained, so two schedules of the same
-/// requests (prefill lanes on and off) can be compared bit for bit.
-pub(super) fn step_digest(commands: &Commands<'_>, hidden: &Buffer<'_>, rows: usize, lanes: usize) -> Result<()> {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if !*ON.get_or_init(|| std::env::var("CUTEAFD_MINIMAX_STEP_DIGEST").is_ok_and(|v| v == "1")) { return Ok(()); }
-    let mut bytes = vec![0; rows * 6144 * 4];
-    let source = hidden.view(0, bytes.len())?;
-    commands.library().cuda_set_device(commands.device())?;
-    commands.library().copy_d2h(&mut bytes, source.raw())?;
-    tracing::info!(target: "cuteafd::minimax_digest", rows, lanes, digest = %format!("{:x}", Sha256::digest(&bytes)),
-        "step hidden digest");
-    Ok(())
+/// Opt-in (`CUTEAFD_MINIMAX_LOGITS_TRACE=FILE`): one JSON line per executed step
+/// with the SHA-256 and argmax of every projected logits row, so two serving
+/// configurations can be compared bit for bit. Downloads every row: diagnostic only.
+pub(super) struct LogitTrace { file: fs::File }
+
+impl LogitTrace {
+    pub fn from_env() -> Result<Option<Self>> {
+        let Some(path) = std::env::var_os("CUTEAFD_MINIMAX_LOGITS_TRACE") else { return Ok(None) };
+        let file = fs::OpenOptions::new().create_new(true).append(true).open(&path)
+            .with_context(|| format!("MiniMax logits trace {}", Path::new(&path).display()))?;
+        Ok(Some(Self { file }))
+    }
+    pub fn record(&mut self, prefill: bool, positions: &[i64], rows: &[f32], vocab: usize) -> Result<()> {
+        ensure!(vocab > 0 && rows.len() == positions.len() * vocab, MiniMaxError::Invalid("logits trace extent"));
+        let rows = rows.chunks_exact(vocab).map(|row| {
+            let bytes: Vec<u8> = row.iter().flat_map(|v| v.to_le_bytes()).collect();
+            let top = row.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).map_or(0, |(i, _)| i);
+            json!({"sha256": format!("{:x}", Sha256::digest(&bytes)), "top": top})
+        }).collect::<Vec<_>>();
+        let line = json!({"prefill": prefill, "positions": positions, "rows": rows});
+        writeln!(self.file, "{line}")?;
+        Ok(())
+    }
 }
 
 fn selection_rows(bytes: &[u8], rows: usize, capacity: usize) -> Result<Vec<u8>> {

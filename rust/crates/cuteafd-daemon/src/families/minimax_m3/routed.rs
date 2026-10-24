@@ -37,6 +37,9 @@ impl<'a> Spark<'a> {
     pub fn connect(library:&'a NativeLibrary,device:i32,world:SparkWorld,peers:&[SocketAddr],rows:usize,
         config:TcpTransportConfig,first:usize,build:Build,lanes:usize,host:bool)->Result<Self> {
         if host { tracing::info!("MiniMax Spark partials land in pinned host planes (no GPU landing)"); }
+        // One- and two-row waves publish with one store kernel (CUTEAFD_SPARK_PUBLISH=copy: copy engine).
+        let kernel=!matches!(std::env::var("CUTEAFD_SPARK_PUBLISH").as_deref(),Ok("copy"));
+        tracing::info!(publish=if kernel {"kernel"} else {"copy"},"MiniMax Spark small decode waves publish from the stream");
         Ok(Self(LaneLinks::connect(lanes,|lane| {
             let routes=(0..rows*TOPK).map(|i| ExpertProtocolV2RouteEntry {
                 row_index:(i/TOPK) as u32, expert_id:(i%128) as u32, gate_weight:0.0 }).collect();
@@ -53,8 +56,10 @@ impl<'a> Spark<'a> {
                 identity=identity.checked_add(1).ok_or(MiniMaxError::Overflow("Spark wave identity"))?;
                 build(identity,wave.layer as usize,wave.rows as usize,routes,wire,kind)
             });
-            Ok(Rc::new(SparkDeviceLink::new_zero_copy(library,device,world,peers,rows,TOPK,ROW,ROW,config.clone(),
-                Some(warm),wave_build,host)?))
+            let link=SparkDeviceLink::new_zero_copy(library,device,world,peers,rows,TOPK,ROW,ROW,config.clone(),
+                Some(warm),wave_build,host)?;
+            link.publish_by_kernel(kernel);
+            Ok(Rc::new(link))
         })?))
     }
 }
@@ -105,6 +110,13 @@ impl<'a> ExpertExecutor<'a> for Routed<'a> {
             let remote=waves.checked_sub(local).context("MiniMax expert inventory exceeds routed layers")? as u64;
             for link in &links[..lanes] { link.arm()?; link.expect(remote); }
         }
+        Ok(())
+    }
+    fn record(&mut self,kind:ExpertV2SourceKind)->Result<()> {
+        ensure!(!self.poisoned,MiniMaxError::Invalid("previous expert failure; restart required"));
+        // A recording queues nothing: an uncollected dispatch it left owns no work.
+        self.pending.iter_mut().for_each(|p|{p.take();});
+        self.kind=kind;
         Ok(())
     }
     fn lanes(&self)->usize { self.pending.len() }

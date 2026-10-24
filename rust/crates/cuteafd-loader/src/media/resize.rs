@@ -56,47 +56,44 @@ struct Coeffs {
     k: Vec<i32>,                 // out_size * ksize
 }
 
-fn precompute(in_size: usize, out_size: usize) -> Coeffs {
-    const SUPPORT: f64 = 2.0;
-    // box = (0, 0, in_w, in_h) as C floats; (in1 - in0) promoted to double.
-    let in0 = 0f32;
-    let in1 = in_size as f32;
-    let scale = (in1 - in0) as f64 / out_size as f64;
-    let filterscale = if scale < 1.0 { 1.0 } else { scale };
-    let support = SUPPORT * filterscale;
+/// Normalized bicubic taps per output pixel, in the operation order Pillow's
+/// `precompute_coeffs` and torch's antialiased `_compute_indices_weights_aa` share (f64,
+/// box from 0, C truncation), then fixed point rounding half away from zero: Pillow at 22
+/// bits, torch at the most bits that keep every weight in int16.
+fn precompute(in_size: usize, out_size: usize, torch: bool) -> Coeffs {
+    let scale = in_size as f64 / out_size as f64;
+    let filterscale = scale.max(1.0);
+    let support = 2.0 * filterscale;
     let ksize = support.ceil() as usize * 2 + 1;
     let mut bounds = Vec::with_capacity(out_size);
-    let mut k = vec![0i32; out_size * ksize];
-    let mut w = vec![0f64; ksize];
+    let mut weights = vec![0.0f64; out_size * ksize];
+    let mut maximum = 0.0f64;
     for xx in 0..out_size {
-        let center = in0 as f64 + (xx as f64 + 0.5) * scale;
-        let ss = 1.0 / filterscale;
-        // C casts truncate toward zero.
-        let xmin = ((center - support + 0.5) as i64).max(0);
-        let xmax = ((center + support + 0.5) as i64).min(in_size as i64);
-        let count = (xmax - xmin).max(0) as usize;
-        let count = count.min(ksize);
-        let mut ww = 0.0f64;
-        for (x, wx) in w.iter_mut().enumerate().take(count) {
-            let v = bicubic(((x as i64 + xmin) as f64 - center + 0.5) * ss);
-            *wx = v;
-            ww += v;
+        let center = scale * (xx as f64 + 0.5);
+        let xmin = ((center - support + 0.5) as i64).max(0) as usize;
+        let xmax = ((center + support + 0.5) as usize).min(in_size);
+        let count = xmax.saturating_sub(xmin).min(ksize);
+        let row = &mut weights[xx * ksize..xx * ksize + count];
+        let mut total = 0.0;
+        for (j, weight) in row.iter_mut().enumerate() {
+            *weight = bicubic((j as f64 + xmin as f64 - center + 0.5) * (1.0 / filterscale));
+            total += *weight;
         }
-        let row = &mut k[xx * ksize..(xx + 1) * ksize];
-        for (x, dst) in row.iter_mut().enumerate().take(count) {
-            let mut v = w[x];
-            if ww != 0.0 {
-                v /= ww;
-            }
-            *dst = if v < 0.0 {
-                (-0.5 + v * (1u32 << PRECISION_BITS) as f64) as i32
-            } else {
-                (0.5 + v * (1u32 << PRECISION_BITS) as f64) as i32
-            };
-        }
-        bounds.push((xmin as usize, count));
+        if total != 0.0 { for weight in row { *weight /= total; maximum = maximum.max(*weight); } }
+        bounds.push((xmin, count));
     }
-    Coeffs { precision: PRECISION_BITS, ksize, bounds, k }
+    let mut precision = PRECISION_BITS;
+    if torch {
+        precision = 0;
+        while precision < 22 && ((0.5 + maximum * (1u32 << (precision + 1)) as f64) as i32) < 1 << 15 {
+            precision += 1;
+        }
+    }
+    let k = weights.into_iter().map(|weight| {
+        let value = weight * (1u32 << precision) as f64;
+        (if value < 0.0 { value - 0.5 } else { value + 0.5 }) as i32
+    }).collect();
+    Coeffs { precision, ksize, bounds, k }
 }
 
 #[inline(always)]
@@ -112,38 +109,6 @@ pub(crate) fn resize_bicubic(img: &RgbImage, width: u32, height: u32) -> RgbImag
 /// per-axis adaptive precision (UpSampleKernel.cpp).
 pub(crate) fn resize_bicubic_torch(img: &RgbImage, width: u32, height: u32) -> RgbImage {
     resize_bicubic_impl(img, width, height, true)
-}
-
-fn precompute_torch(in_size: usize, out_size: usize) -> Coeffs {
-    let scale = in_size as f64 / out_size as f64;
-    let support = 2.0 * scale.max(1.0);
-    let ksize = support.ceil() as usize * 2 + 1;
-    let mut bounds = Vec::with_capacity(out_size);
-    let mut weights = vec![0.0f64; out_size * ksize];
-    let mut maximum = 0.0f64;
-    for xx in 0..out_size {
-        let center = scale * (xx as f64 + 0.5);
-        let xmin = ((center - support + 0.5) as i64).max(0) as usize;
-        let xmax = ((center + support + 0.5) as usize).min(in_size);
-        let count = (xmax - xmin).min(ksize);
-        let row = &mut weights[xx * ksize..xx * ksize + count];
-        let mut total = 0.0;
-        for (j, weight) in row.iter_mut().enumerate() {
-            *weight = bicubic((j as f64 + xmin as f64 - center + 0.5) * (1.0 / scale.max(1.0)));
-            total += *weight;
-        }
-        if total != 0.0 { for weight in row { *weight /= total; maximum = maximum.max(*weight); } }
-        bounds.push((xmin, count));
-    }
-    let mut precision = 0;
-    while precision < 22 && ((0.5 + maximum * (1u32 << (precision + 1)) as f64) as i32) < 1 << 15 {
-        precision += 1;
-    }
-    let k = weights.into_iter().map(|weight| {
-        let value = weight * (1u32 << precision) as f64;
-        (if value < 0.0 { value - 0.5 } else { value + 0.5 }) as i32
-    }).collect();
-    Coeffs { precision, ksize, bounds, k }
 }
 
 fn resize_bicubic_impl(img: &RgbImage, width: u32, height: u32, torch: bool) -> RgbImage {
@@ -183,15 +148,14 @@ fn resize_bicubic_impl(img: &RgbImage, width: u32, height: u32, torch: bool) -> 
     }
     let need_h = ow != iw;
     let need_v = oh != ih;
-    let compute = if torch { precompute_torch } else { precompute };
-    let cv = compute(ih, oh);
+    let cv = precompute(ih, oh, torch);
     let ybox_first = cv.bounds[0].0;
     let (lx, lc) = cv.bounds[oh - 1];
     let ybox_last = lx + lc;
 
     // Horizontal pass over input rows [ybox_first, ybox_last).
     let (tmp, tmp_w, row_off) = if need_h {
-        let ch = compute(iw, ow);
+        let ch = precompute(iw, ow, torch);
         let rows = ybox_last - ybox_first;
         let mut t = vec![0u8; ow * rows * 3];
         for y in 0..rows {
@@ -298,8 +262,9 @@ mod tests {
 
     #[test]
     fn weights_sum_to_one_in_fixed_point() {
-        for (i, o) in [(10, 3), (3, 10), (1000, 999), (7, 1), (1, 7)] {
-            let c = precompute(i, o);
+        for ((i, o), torch) in [(10, 3), (3, 10), (1000, 999), (7, 1), (1, 7)].into_iter()
+            .flat_map(|size| [(size, false), (size, true)]) {
+            let c = precompute(i, o, torch);
             for xx in 0..o {
                 let (_, cnt) = c.bounds[xx];
                 let s: i64 = c.k[xx * c.ksize..xx * c.ksize + cnt]
@@ -307,8 +272,8 @@ mod tests {
                     .map(|&v| v as i64)
                     .sum();
                 assert!(
-                    (s - (1 << PRECISION_BITS)).abs() <= cnt as i64,
-                    "{i}->{o} px {xx}: {s}"
+                    (s - (1 << c.precision)).abs() <= cnt as i64,
+                    "{i}->{o} torch={torch} px {xx}: {s}"
                 );
             }
         }
