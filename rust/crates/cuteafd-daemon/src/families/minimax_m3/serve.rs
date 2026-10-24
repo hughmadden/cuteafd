@@ -228,7 +228,7 @@ fn worker(args: &ServeArgs, receive: &mut tokio::sync::mpsc::Receiver<cuteafd_ap
     let mut media = cuteafd_engine::media::MediaAdmission::new(cuteafd_engine::media::EmbeddingCache::new(media_bytes), encoder, 16);
     tracing::info!(pool_tokens=admitted.cache.pool_tokens, context=cache.context, local_layers=?admitted.local_layers,
         rows=sizing.rows, logit_rows=sizing.logit_rows, draft_rings,
-        "MiniMax native eager target; prefill uses causal paged MSA tiles");
+        "MiniMax native eager target; prefill uses the MSA index-prefill and attention-extend kernels");
     let drafts=if args.speculator=="dspark" {scheduler::Drafts::Neural {depth:7,fixed:false}} else {scheduler::Drafts::None};
     scheduler::schedule(&backend, &args.snapshot, receive, stats, sizing.sequences, drafts,
         eos, args.decode_share, &prefix, args.token_io.token_select, &mut media, None,
