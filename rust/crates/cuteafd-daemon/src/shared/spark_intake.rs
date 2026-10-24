@@ -1409,10 +1409,14 @@ pub(crate) struct SparkDeviceLink<'a> {
     ranks: usize,
 }
 
-/// Waves up to this many payload bytes publish through `cuteafd_host_publish`
-/// when [`SparkDeviceLink::publish_by_kernel`] is on; larger ones (prefill)
-/// keep the copy engine, which moves them faster than a few blocks of stores.
-const PUBLISH_KERNEL_MAX_BYTES: usize = 1 << 20;
+/// Waves up to this many wire bytes publish through `cuteafd_host_publish`
+/// when [`SparkDeviceLink::publish_by_kernel`] is on; larger ones keep the copy
+/// engine. Stores from SMs reach pinned host memory far slower than the copy
+/// engine does (RTX 5090 on an EPYC host: the kernel takes 4.1 us for one
+/// 12 KiB MiniMax row and 70 us for 16 rows; the copies and signal kernel
+/// took 12 and 21 us from the route kernel's end), so it pays only for waves
+/// of one or two such rows.
+const PUBLISH_KERNEL_MAX_BYTES: usize = 32 << 10;
 
 /// Write mode and host landing: one plane per rank (write mode then adds one
 /// 64-byte line per rank flag).
@@ -1518,10 +1522,10 @@ impl<'a> SparkDeviceLink<'a> {
             capacity, topk, wire_row_bytes, row_bytes, ranks })
     }
 
-    /// Decode-sized waves ([`PUBLISH_KERNEL_MAX_BYTES`]) then publish with one
-    /// kernel that stores their routes and rows into the mailbox and egress
-    /// buffer, instead of three copy-engine copies and the signal kernel
-    /// (each copy adds a few microseconds of DMA latency to every layer).
+    /// Small waves ([`PUBLISH_KERNEL_MAX_BYTES`]) then publish with one kernel
+    /// that stores their routes and rows into the mailbox and egress buffer,
+    /// instead of three copy-engine copies and the signal kernel (each copy
+    /// adds a few microseconds of DMA latency to every layer).
     pub(crate) fn publish_by_kernel(&self, enabled: bool) {
         self.publish_kernel.set(enabled);
     }

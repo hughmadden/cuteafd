@@ -42,10 +42,10 @@ impl<'a> Spark<'a> {
         if host { tracing::info!("MiniMax Spark partials land in pinned host planes (no GPU landing)"); }
         let link=SparkDeviceLink::new_zero_copy(library,device,world,peers,rows,TOPK,ROW,ROW,config,
             Some(warm),wave_build,host)?;
-        // Decode waves publish with one store kernel (CUTEAFD_SPARK_PUBLISH=copy: copy engine).
+        // One- and two-row waves publish with one store kernel (CUTEAFD_SPARK_PUBLISH=copy: copy engine).
         let kernel=!matches!(std::env::var("CUTEAFD_SPARK_PUBLISH").as_deref(),Ok("copy"));
         link.publish_by_kernel(kernel);
-        tracing::info!(publish=if kernel {"kernel"} else {"copy"},"MiniMax Spark decode waves publish from the stream");
+        tracing::info!(publish=if kernel {"kernel"} else {"copy"},"MiniMax Spark small decode waves publish from the stream");
         Ok(Self(Rc::new(link)))
     }
 }
