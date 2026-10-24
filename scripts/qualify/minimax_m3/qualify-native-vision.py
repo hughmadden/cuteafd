@@ -6,7 +6,8 @@ fidelity chart and terminal windows, and --set semantics: counted shapes, a 1344
 four-quadrant image, a 2016x672 banner and numbered clips). Expected answers are ordered
 terms taken from the fixture manifests. --timing N adds streamed TTFT rows: one fresh
 pixel per image request, a distinct clip per video request, and text-only prompts of
-matching lengths. The API key arrives on stdin; the report records fixture hashes.
+matching lengths, plus the `/v1/thermal` window they ran in. The API key arrives on
+stdin; the report records fixture hashes.
 """
 import argparse
 import base64
@@ -114,11 +115,9 @@ def main():
             "shapes and their color.")
     call("squares-triangles", body([image("squares3.png"), image("triangles5.png")], pair),
          shapes(semantics["squares3"]) + shapes(semantics["triangles5"]))
-    partial = call("squares-circles-partial", body([image("squares3.png"), image("circles7.png")], pair),
-                   shapes(semantics["squares3"]) + shapes(circles))
-    if partial:
-        check("squares-circles-partial-hit", 0 < cached(partial) < partial["usage"]["prompt_tokens"],
-              dict(cached_tokens=cached(partial), prompt_tokens=partial["usage"]["prompt_tokens"]))
+    # MiniMax restores prompt-end and turn-end snapshots only: a shared first image is not a hit.
+    call("squares-circles", body([image("squares3.png"), image("circles7.png")], pair),
+         shapes(semantics["squares3"]) + shapes(circles))
     call("triangles-squares-reordered", body([image("triangles5.png"), image("squares3.png")], pair),
          shapes(semantics["triangles5"]) + shapes(semantics["squares3"]))
     follow = copy.deepcopy(body([image("circles7.png")], count))
@@ -147,12 +146,25 @@ def main():
     frames = dict(type="video_url", video_url=dict(frames=[url(name) for name in clip["frames"]], source_fps=1))
     call("clip-frames", body([frames], question), terms)
     if args.timing:
+        start = thermal(args.base_url)["now_s"]
         timing(args, post, report, save, root, url)
+        # Whether, why and how much the GPUs throttled while the timing rows ran.
+        report["thermal"] = thermal(args.base_url, start).get("window")
+        for gpu in (report["thermal"] or {}).get("gpus", []):
+            print(json.dumps(dict(gpu=gpu.get("index"), throttle_s=gpu.get("throttle_s"),
+                                  max_c=(gpu.get("temperature_c") or {}).get("max"))), flush=True)
     report["passed"] = all(case.get("passed") for case in report["cases"])
     save()
     print(json.dumps(dict(passed=report["passed"], failed=[c["name"] for c in report["cases"] if not c.get("passed")])),
           flush=True)
     return 0 if report["passed"] else 1
+
+
+def thermal(base_url, start=None):
+    """The server's NVML view (`/v1/thermal`, no key); with `start`, the window since then."""
+    query = f"?from={start}" if start is not None else ""
+    with urllib.request.urlopen(base_url + "/v1/thermal" + query, timeout=30) as response:
+        return json.load(response)
 
 
 def timing(args, post, report, save, root, url):
@@ -193,12 +205,17 @@ def timing(args, post, report, save, root, url):
         save()
         print(json.dumps(row), flush=True)
 
+    names = next(f for f in json.loads((root / "semantics.json").read_text())["fixtures"] if f["id"] == "clip")["frames"]
     for k in range(args.timing):
         stream("tile-672", [fresh("circles7.png"), dict(type="text", text="Describe the image.")])
         stream("quadrants-1344", [fresh("quadrants.png"), dict(type="text", text="Describe the image.")])
         stream("text-600", [text(570)])
         clip = dict(type="video_url", video_url=dict(url=url(f"clip-timing{k % 3}.mp4")))
         stream("clip-480p" if k < 3 else "clip-480p-cached", [clip, dict(type="text", text="Describe the video.")])
+        # The same sampled frames as PNGs: no ffmpeg, the same tokens.
+        frames = [fresh(names[0])["image_url"]["url"]] + [url(name) for name in names[1:]]
+        stream("clip-frames", [dict(type="video_url", video_url=dict(frames=frames, source_fps=1)),
+                               dict(type="text", text="Describe the video.")])
         stream("text-1700", [text(1630)])
 
 
