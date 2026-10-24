@@ -245,9 +245,7 @@ pub(crate) async fn run_serve(args: ServeArgs) -> Result<()> {
     use cuteafd_api::openai::{ModelEncoding, ModelProfile, NativeLimits};
     args.validate()?;
     let snapshot = args.snapshot.clone();
-    let config = cuteafd_loader::plan::checkpoint::read_json(&snapshot.join("config.json"))?;
-    let architecture = config["architectures"][0].as_str().context("MiniMax architecture missing")?;
-    let encoding = ModelEncoding::from_architecture(architecture, &snapshot)?.context("MiniMax API architecture unsupported")?;
+    let encoding = ModelEncoding::MiniMaxM3(Arc::new(cuteafd_api::openai::chat::minimax_m3::MiniMaxEncoding::from_snapshot(&snapshot)?));
     let eos = encoding.eos_token_ids();
     let model = args.model_id.clone().or_else(|| cuteafd_api::openai::snapshot_model_id(&snapshot))
         .context("MiniMax requires --model-id for a snapshot without HF identity")?;

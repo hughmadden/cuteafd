@@ -167,8 +167,7 @@ fn response_format_joins_the_developer_message() {
 #[test]
 fn token_contract_is_pinned_to_the_release() {
     let tokens = encoding();
-    assert_eq!(tokens.tokens(), &MiniMaxTokenIds { eos: vec![200_020], think_close: 200_060, image: 200_025, video: 200_026,
-        turn_markers: vec![200_019, 200_034] });
+    assert_eq!(tokens.tokens(), &MiniMaxTokenIds { eos: vec![200_020], think_close: 200_060, turn_markers: vec![200_019, 200_034] });
     let profile_ids = crate::openai::ModelEncoding::MiniMaxM3(std::sync::Arc::new(encoding()));
     assert_eq!(profile_ids.eos_token_ids(), [200_020]);
     assert_eq!(profile_ids.think_close_token_id(), Some(200_060));
@@ -191,15 +190,12 @@ fn snapshot_dir(eos: Value) -> tempfile::TempDir {
 }
 
 #[test]
-fn snapshot_loader_reads_its_own_headers_and_architecture_selects_the_family() {
+fn snapshot_loader_reads_its_own_headers() {
     let dir = snapshot_dir(json!(200_020));
     let loaded = MiniMaxEncoding::from_snapshot(dir.path()).unwrap();
     assert_eq!(loaded.tokens(), encoding().tokens());
     let body = json!({"messages": [{"role": "user", "content": "Hi"}]});
     assert_eq!(loaded.render(&body, &[]).unwrap(), encoding().render(&body, &[]).unwrap());
-    let selected = crate::openai::ModelEncoding::from_architecture(ARCHITECTURE, dir.path()).unwrap();
-    assert!(matches!(selected, Some(crate::openai::ModelEncoding::MiniMaxM3(_))));
-    assert!(crate::openai::ModelEncoding::from_architecture("Qwen3ForCausalLM", dir.path()).unwrap().is_none());
     // The template can also live in tokenizer_config.json.
     std::fs::remove_file(dir.path().join("chat_template.jinja")).unwrap();
     std::fs::write(dir.path().join("tokenizer_config.json"), json!({"chat_template": TEMPLATE}).to_string()).unwrap();
@@ -215,7 +211,7 @@ fn real_release_snapshot_headers_agree_when_pointed_at() {
     if !snapshot.join("tokenizer.json").exists() { return; }
     let loaded = MiniMaxEncoding::from_snapshot(&snapshot).unwrap();
     assert_eq!(loaded.tokens(), encoding().tokens());
-    assert_eq!(loaded.template_source(), TEMPLATE);
+    assert_eq!(std::fs::read_to_string(snapshot.join("chat_template.jinja")).unwrap(), TEMPLATE);
 }
 
 // ---------------------------------------------------------------- parser

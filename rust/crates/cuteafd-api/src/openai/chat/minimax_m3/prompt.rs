@@ -1,5 +1,5 @@
 use serde_json::{json, Value};
-use super::super::glm5::prompt::{reasoning_effort, template_message, response_format_instruction};
+use super::super::glm5::prompt::{declared_tools, reasoning_effort, template_message, response_format_instruction};
 use super::super::glm5::template::python_json;
 
 /// The template prints scalars with `{{ val }}`: minijinja spells floats unlike
@@ -20,7 +20,7 @@ pub fn pythonize_floats(value: &mut Value) {
 /// wins over a budget. Either is rendered only while thinking is on: with
 /// thinking off (see [`super::Thinking`]; efforts `none` and `minimal` are
 /// off) the vendor ignores the effort and the prompt ends in the close marker.
-pub fn budget_effort(budget: u32) -> &'static str {
+pub(super) fn budget_effort(budget: u32) -> &'static str {
     match budget { 0..=1024 => "low", 1025..=4096 => "medium", 4097..=16384 => "high",
         16385..=32768 => "xhigh", _ => "max" }
 }
@@ -77,10 +77,6 @@ pub fn template_context(body: &Value, tool_names: &[String]) -> Result<Value, St
         let budget = budget.as_u64().and_then(|v| u32::try_from(v).ok()).ok_or("thinking.budget_tokens must be a non-negative u32")?;
         if thinking { context["reasoning_effort"] = json!(budget_effort(budget)); }
     }
-    if !tool_names.is_empty() {
-        let tools = body["tools"].as_array().ok_or("tools must be an array")?;
-        context["tools"] = tools.iter().filter(|t| t["function"]["name"].as_str()
-            .is_some_and(|n| tool_names.iter().any(|wanted| wanted == n))).cloned().collect::<Vec<_>>().into();
-    }
+    if !tool_names.is_empty() { context["tools"] = declared_tools(body, tool_names)?.into(); }
     Ok(context)
 }

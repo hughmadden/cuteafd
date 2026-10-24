@@ -8,7 +8,7 @@
 //! system message and rejects later ones.
 use serde_json::{json, Map, Value};
 
-use crate::openai::chat::glm5::prompt::{reasoning_effort, response_format_instruction, template_message};
+use crate::openai::chat::glm5::prompt::{declared_tools, reasoning_effort, response_format_instruction, template_message};
 pub use crate::openai::chat::glm5::prompt::{resolve_thinking, GlmToolChoice as QwenToolChoice};
 
 /// Request-level prompt settings resolved by the API layer.
@@ -65,11 +65,7 @@ pub fn template_context(body: &Value, options: &QwenPromptOptions) -> Result<Val
     let mut context = Map::new();
     context.insert("messages".into(), Value::Array(messages));
     if !options.tool_names.is_empty() {
-        let tools = body.get("tools").and_then(Value::as_array).ok_or("tools must be an array")?;
-        let declared: Vec<Value> = tools.iter()
-            .filter(|tool| tool["function"]["name"].as_str().is_some_and(|name| options.tool_names.iter().any(|n| n == name)))
-            .cloned().collect();
-        context.insert("tools".into(), Value::Array(declared));
+        context.insert("tools".into(), Value::Array(declared_tools(body, &options.tool_names)?));
     }
     context.insert("add_generation_prompt".into(), Value::Bool(true));
     context.insert("enable_thinking".into(), Value::Bool(options.thinking));

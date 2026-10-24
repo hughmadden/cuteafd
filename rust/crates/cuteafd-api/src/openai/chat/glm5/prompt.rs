@@ -166,11 +166,7 @@ pub fn template_context(body: &Value, options: &GlmPromptOptions) -> Result<Valu
     let mut context = Map::new();
     context.insert("messages".into(), Value::Array(messages));
     if !options.tool_names.is_empty() {
-        let tools = body.get("tools").and_then(Value::as_array).ok_or("tools must be an array")?;
-        let declared: Vec<Value> = tools.iter()
-            .filter(|tool| tool["function"]["name"].as_str().is_some_and(|name| options.tool_names.iter().any(|n| n == name)))
-            .cloned().collect();
-        context.insert("tools".into(), Value::Array(declared));
+        context.insert("tools".into(), Value::Array(declared_tools(body, &options.tool_names)?));
     }
     context.insert("add_generation_prompt".into(), Value::Bool(true));
     if options.thinking {
@@ -182,6 +178,13 @@ pub fn template_context(body: &Value, options: &GlmPromptOptions) -> Result<Valu
         context.insert("clear_thinking".into(), Value::Bool(clear));
     }
     Ok(Value::Object(context))
+}
+
+/// The request's tools the prompt declares (`names`, from tool selection), in request order.
+pub(crate) fn declared_tools(body: &Value, names: &[String]) -> Result<Vec<Value>, String> {
+    let tools = body.get("tools").and_then(Value::as_array).ok_or("tools must be an array")?;
+    Ok(tools.iter().filter(|tool| tool["function"]["name"].as_str().is_some_and(|name| names.iter().any(|n| n == name)))
+        .cloned().collect())
 }
 
 /// Copy the fields the template reads. `content: null` becomes `""` (the

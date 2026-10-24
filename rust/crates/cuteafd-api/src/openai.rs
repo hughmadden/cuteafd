@@ -57,13 +57,6 @@ pub enum ModelEncoding {
 }
 
 impl ModelEncoding {
-    /// Select the M3 API family from checkpoint architecture metadata.
-    /// Other architectures remain owned by their existing serving adapters.
-    pub fn from_architecture(architecture: &str, snapshot: &std::path::Path) -> anyhow::Result<Option<Self>> {
-        if architecture != minimax_m3::ARCHITECTURE { return Ok(None); }
-        Ok(Some(Self::MiniMaxM3(Arc::new(minimax_m3::MiniMaxEncoding::from_snapshot(snapshot)?))))
-    }
-
     /// Whether the active chat renderer can render a thinking-off request.
     pub fn supports_thinking_off(&self) -> bool {
         match self {
@@ -949,14 +942,13 @@ pub(crate) fn build(profile: &ModelProfile, limits: NativeLimits, headers: &axum
                 stop_sequences: converted.parsing_options.stop_sequences.clone(), id: id.clone() });
             (prompt, Vec::new(), OutputProcessor::Glm(glm5::GlmStreamProcessor::new(generator, parser)))
         }
-        Some((Templated::MiniMaxM3(encoding), mut raw, _thinking)) => {
-            raw["response_format"] = response_format.unwrap_or(Value::Null);
+        Some((Templated::MiniMaxM3(encoding), raw, _thinking)) => {
             let names = converted.conversation.tools.iter().map(|t| t.name.clone()).collect::<Vec<_>>();
             let prompt = encoding.render(&raw, &names).map_err(Rejection::bad)?;
+            // tool_choice none already left no tools (the recipe's conversion drops them).
             let parser = minimax_m3::MiniMaxOutputParser::new(minimax_m3::MiniMaxParserOptions {
                 thinking: minimax_thinking == Some(minimax_m3::Thinking::Enabled),
-                tools: (tools_declared && converted.conversation.tool_choice != deepseek_recipe_core::tools::ToolChoice::None)
-                    .then(|| converted.conversation.tools.clone()),
+                tools: tools_declared.then(|| converted.conversation.tools.clone()),
                 stop_sequences: converted.parsing_options.stop_sequences.clone(), id: id.clone() });
             (prompt, Vec::new(), OutputProcessor::MiniMaxM3(glm5::GlmStreamProcessor::new(generator, parser)))
         }
@@ -1063,17 +1055,20 @@ async fn prepare_media(profile: &ModelProfile, decoder: &images::ImageDecoder, w
             Err(e) => return Err(Rejection::new(StatusCode::INTERNAL_SERVER_ERROR, e)),
         }
     };
-    let media = if media_sources.is_empty() { Vec::new() } else {
+    // Images and videos share the media preparer: one slot, one blocking job.
+    let (media, videos) = if media_sources.is_empty() && video_sources.is_empty() { (Vec::new(), Vec::new()) } else {
         let preparer = profile.media_preparer.as_ref().expect("sources require preparer").clone();
         let slot = preparer.slots.clone().acquire_owned().await
-            .map_err(|_| Rejection::unavailable("image preparation is closed"))?;
+            .map_err(|_| Rejection::unavailable("media preparation is closed"))?;
         let hashes = probe.map(|p| p.spec.media.iter()
             .map(|span| span.fixture.as_ref().map(|f| f.sha256.clone())).collect::<Vec<_>>()).unwrap_or_default();
         match tokio::task::spawn_blocking(move || {
             let _slot = slot;
-            preparer.prepare_verified(&media_sources, &hashes)
+            let images = if media_sources.is_empty() { Vec::new() } else { preparer.prepare_verified(&media_sources, &hashes)?.images };
+            let videos = if video_sources.is_empty() { Vec::new() } else { preparer.prepare_videos(&video_sources)? };
+            anyhow::Ok((images, videos))
         }).await {
-            Ok(Ok(prepared)) => prepared.images,
+            Ok(Ok(prepared)) => prepared,
             Ok(Err(message)) => return Err(Rejection::bad(message)),
             Err(message) => return Err(Rejection::new(StatusCode::INTERNAL_SERVER_ERROR, message)),
         }
@@ -1088,19 +1083,6 @@ async fn prepare_media(profile: &ModelProfile, decoder: &images::ImageDecoder, w
             preparer.prepare(&sources)
         }).await {
             Ok(Ok(prepared)) => prepared.clips,
-            Ok(Err(message)) => return Err(Rejection::bad(message)),
-            Err(message) => return Err(Rejection::new(StatusCode::INTERNAL_SERVER_ERROR, message)),
-        }
-    };
-    let videos = if video_sources.is_empty() { Vec::new() } else {
-        let preparer = profile.media_preparer.as_ref().expect("videos require preparer").clone();
-        let slot = preparer.slots.clone().acquire_owned().await
-            .map_err(|_| Rejection::unavailable("video preparation is closed"))?;
-        match tokio::task::spawn_blocking(move || {
-            let _slot = slot;
-            preparer.prepare_videos(&video_sources)
-        }).await {
-            Ok(Ok(prepared)) => prepared,
             Ok(Err(message)) => return Err(Rejection::bad(message)),
             Err(message) => return Err(Rejection::new(StatusCode::INTERNAL_SERVER_ERROR, message)),
         }
