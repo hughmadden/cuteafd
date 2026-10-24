@@ -5622,6 +5622,40 @@ It includes:
 `cuteafd bench publish` builds both sections from the smoke exports plus a
 retired list in the matrix file.
 
+## v5: one decode graph strategy (TJ, 2026-10-24)
+
+Decode graph capture is per family today, and the memory it costs varies
+widely. The goal is less wasted memory and one standard strategy, not graphs
+shared across lanes through address tables.
+
+Where it stands (2026-10-24):
+
+| Family | Row shapes per graph key | Other key axes | Cost |
+|---|---|---|---|
+| GLM 5.3 / EXLR8 | 24 to 131K (1–16, 20 … 64), 7 above | 11 page-table widths, one capture per layer + head | 213 shapes, ~3 GiB/GPU (`glm_decode_graph_allowance`, 3 GiB floor) |
+| V4.1 | exact rows 1–64 (8 fixed on cards < 32 GB) | per layer, per lane | not measured; largest after GLM |
+| GLM Flash | 6 (1, 4, 8, 16, 32, 64; spec 2–64) | | |
+| Qwen 4 | 4 plain, 7 spec | | |
+| V4, MiMo, shared `decode_graph` | 4 (1, 4, 16, 64) | | MiMo ~0.9 GiB/GPU |
+| Kimi K3, Step-5 | exact verify rows | | not measured |
+
+Work:
+1. Measure every family's graph memory from the startup ledger, per GPU and
+   per lane, on its max card.
+2. One shared row-bucket rule and one place it lives (`shared/decode_graph`),
+   with a family override only where a measured route crossover needs one.
+   Coarser buckets pad rows; decode is bandwidth-bound, so judge by emitted
+   tok/s at C1/C4/C16, not by padded-row count.
+3. One rule for which axes key a graph (rows, table width, layer) and when a
+   shape runs eagerly instead of capturing (odd prefill tails already do).
+4. Planner admission charges each family's graphs from that same rule.
+5. Bar: graph memory down, freed memory reported as pool or onboard layers,
+   and decode within 0.98× at every concurrency. Zero captures per request
+   stays.
+
+Second decode lanes (MiMo port, 2026-10-24) double a family's graph set,
+so this lands before lanes spread to GLM or V4.1-sized graph sets.
+
 ## Backlog (lowest priority: only when nothing planned is left)
 
 - Qwen 3.8 Flash Next NVFP4 without Sparks, competitive with vLLM on one
