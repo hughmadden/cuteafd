@@ -5635,10 +5635,10 @@ pixel cap, Torch uint8 antialiased bicubic and fused CLIP normalization. Its
 legacy pinpoint/tiling fields are inactive. Images repeat the temporal sample;
 video segments group at most eight frames (the vendor tower's four temporal
 patches, temporal positions restarting per segment) and repeat an odd final frame. By
-default encoded videos follow MiniMax's serving processor (sglang `minimax_m3_vl.py`):
-constant-interval sampling at `fps` (1) that always keeps the last frame, and frames
-scaled so the longer side is at most 756 with both sides rounded up to 28; frame lists
-are taken as already sampled. The bundled processor's uniform sampler and
+default videos follow MiniMax's serving processor (sglang `minimax_m3_vl.py`): frames
+scale so the longer side is at most 756 with both sides rounded up to 28, and encoded
+videos sample at constant `1/fps` intervals (1 fps) that always keep the last frame;
+frame lists are taken as already sampled. The bundled processor's uniform sampler and
 602,112-pixel smart resize remain available through explicit `do_sample_frames` and
 `do_resize`; the sampler pins the compatible Transformers implementation because the
 checkpoint does not pin that dependency consistently. Processor hashes participate
@@ -5653,8 +5653,8 @@ torchcodec's exact scan does); ffmpeg then selects the sampled frames, converts 
 RGB and scales them (bicubic B=0, C=0.5: torch's antialiased Keys cubic) inside the
 decoder, so the decoded budget covers kept frames only. Video admission bounds
 sampled frames to 768, decoded video bytes to 64 MiB, each segment to the loaded
-encoder capacity, and all video features to 57,600 tokens. Media count-token/probe overrides remain
-unsupported. Image start/end wrapping happens after literal shielding. Video
+encoder capacity, and all video features to 57,600 tokens. Media count-token/probe
+overrides remain unsupported. Image start/end wrapping happens after literal shielding. Video
 placeholders preserve sampled timestamps and each pair's own delimiters; separated
 spans share a complete segment embedding with explicit row offsets.
 
