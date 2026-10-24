@@ -41,10 +41,6 @@ container-name characters, [A-Za-z0-9_.-].
   --all                         with --restart, sweep worker ports on selected hosts
   --dry-run                     validate a launch without starting serving containers
 
-MiniMax dry runs are CPU-only header admission. Set CUTEAFD_PLAN_BIN to a built
-cuteafd executable; MODEL_ID may name a local snapshot directory. They do not
-verify runtime artifacts, device execution or remote availability.
-
 DeepSeek V4.1 keys (cuteafd.config documents each): RTX_GPUS, RTX_EXPERT_LAYERS,
 CONCURRENCY, HTTP_QUEUE_DEPTH, HTTP_QUEUE_WAIT_MS, POOL_TOKENS, EMBEDDING,
 KV_POOL_SIZE, HOST_CACHE_BYTES, MEMORY_RESERVATION, PREFIX_CACHE_ENTRIES,
