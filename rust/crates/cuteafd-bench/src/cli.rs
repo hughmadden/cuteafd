@@ -36,6 +36,7 @@ pub struct RunOptions {
     pub lossless_dump: Option<crate::panels::lossless::RowDump>,
     pub context_lengths: Option<Vec<u64>>,
     pub context_levels: Option<Vec<usize>>,
+    pub context_suffix: Option<u64>,
 }
 
 fn agent() -> ureq::Agent {
@@ -133,6 +134,7 @@ pub fn run(options: &RunOptions) -> Result<(Report, PathBuf)> {
     if let Some(dump) = &options.lossless_dump { body["lossless_dump"] = json!(dump); }
     if let Some(lengths) = &options.context_lengths { body["context_lengths"] = json!(lengths); }
     if let Some(levels) = &options.context_levels { body["context_levels"] = json!(levels); }
+    if let Some(suffix) = options.context_suffix { body["context_suffix"] = json!(suffix); }
     let response = authorize(agent.post(&format!("{base}/v1/bench/runs")), &options.api_key)
         .send_json(body);
     let id = match response {
