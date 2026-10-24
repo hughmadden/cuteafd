@@ -1717,8 +1717,11 @@ if [[ "$family" == minimax_m3 ]]; then
     [[ -z "$(get SPARK_DEVICE_BUDGET_BYTES)" ]] || minimax_plan_args+=(--spark-budget-gib "$(python3 -c 'import sys;print(int(sys.argv[1])/2**30)' "$(get SPARK_DEVICE_BUDGET_BYTES)")")
     [[ -z "$(get MEDIA_CACHE_BYTES)" ]] || minimax_plan_args+=(--media-cache-bytes "$(get MEDIA_CACHE_BYTES)")
     echo "MiniMax CPU dry run: header admission only; runtime artifacts and device execution remain unverified" >&2
-    "$planner" plan "$snapshot" "${minimax_plan_args[@]}"
-    exit $?
+    plan_json="$("$planner" plan "$snapshot" "${minimax_plan_args[@]}")" || exit $?
+    # With --wip the dry run takes the launch's deployment guard, as other families' dry runs do.
+    [[ -z "$wip_slot" ]] || release_validate_deployment "$plan_json" "$family"
+    printf '%s\n' "$plan_json"
+    exit 0
   fi
 fi
 coordinator_image="$(get COORDINATOR_DOCKER_INFERENCE)"

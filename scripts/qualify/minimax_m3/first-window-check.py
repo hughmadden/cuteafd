@@ -5,7 +5,6 @@ from __future__ import annotations
 import argparse
 import importlib.util
 import json
-import math
 import os
 from pathlib import Path
 import re
@@ -13,24 +12,12 @@ import struct
 import sys
 
 ROOT = Path(__file__).resolve().parents[3]
+sys.path.insert(0, str(ROOT / "scripts/lib"))
+# Configurations are data here; run.sh and stop.sh validate them when they load them.
+from wip_aot_scopes import read_config as config  # noqa: E402
+
 REVISION = "54e4e69dfc452b1e94a426c24a4fdeeaa8e3ad5e"
 MODEL = "MiniMaxAI/MiniMax-M3.1-Flash"
-
-
-def config(path):
-    values = {}
-    for line in Path(path).read_text().splitlines():
-        line = line.split("#", 1)[0].strip()
-        if not line:
-            continue
-        key, sep, value = line.partition("=")
-        if not sep or not re.fullmatch(r"[A-Z][A-Z0-9_]*", key.strip()):
-            raise ValueError("configuration must contain literal KEY=VALUE entries")
-        value = value.strip().strip("\"'")
-        if any(char in value for char in "`$\n\r"):
-            raise ValueError("configuration interpolation is not permitted")
-        values[key.strip()] = value
-    return values
 
 
 def hosts(values):
@@ -176,44 +163,6 @@ def load_harness():
     return module
 
 
-def api(url):
-    import urllib.request
-    request = urllib.request.Request(url.rstrip("/") + "/v1/chat/completions",
-        data=json.dumps({"model": MODEL, "messages": [{"role": "user", "content": "Say hello."}],
-                         "max_tokens": 16, "temperature": 0}).encode(),
-        headers={"Content-Type": "application/json"})
-    with urllib.request.urlopen(request, timeout=120) as response:
-        body = json.load(response)
-    choices = body.get("choices", [])
-    message = choices[0].get("message", {}) if choices else {}
-    if body.get("error") or not (message.get("content") or message.get("reasoning_content")):
-        raise ValueError("API returned an error or empty completion")
-
-
-def result_gate(path, kind):
-    result = json.loads(path.read_text())
-    partial = kind != "full"
-    prefix = kind != "diagnostic"
-    if (result.get("schema") != "cuteafd.minimax.golden/1" or result.get("passed") is not True
-            or result.get("partial_target") is not partial or result.get("prefix_byte_exact") is not prefix
-            or not result.get("windows")):
-        raise ValueError("golden summary does not prove the requested target and prefix gates")
-    def number(row, key):
-        value = row.get(key)
-        if isinstance(value, bool) or not isinstance(value, (float, int)) or not math.isfinite(value):
-            raise ValueError(f"missing finite golden metric {key}")
-        return value
-    for window in result["windows"]:
-        if window.get("partial_target") is not partial or window.get("prefix_byte_exact") is not prefix:
-            raise ValueError("window target/prefix proof differs from the summary")
-        if partial and (number(window, "cosine") < 0.99 or number(window, "relative_l2") > 0.05):
-            raise ValueError("partial golden failed cosine >=0.99 or relative L2 <=0.05")
-    if not partial:
-        if (number(result, "scored_tokens") <= 0 or result.get("gate_scope") != "generated"
-                or number(result, "top1") < 0.90 or number(result, "mean_kl") > 0.06):
-            raise ValueError("full golden failed top-1 >=90% or KL <=0.06 nat")
-
-
 def runtime_inputs():
     from urllib.parse import urlparse
     url = urlparse(os.environ["MINIMAX_URL"])
@@ -227,10 +176,10 @@ def runtime_inputs():
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("mode", choices=("preflight", "hosts", "locks", "plan", "api", "expert-port", "window", "result", "runtime", "budgets"))
+    parser.add_argument("mode", choices=("preflight", "hosts", "locks", "expert-port", "window", "runtime", "budgets"))
     parser.add_argument("value")
     parser.add_argument("--gpu", type=int)
-    parser.add_argument("--kind", choices=("full", "partial", "diagnostic"), default="full")
+    parser.add_argument("--plan", type=Path, help="budgets: the configuration's dry-run deployment")
     args = parser.parse_args()
     try:
         if args.mode == "preflight":
@@ -239,32 +188,20 @@ def main():
             print(",".join(hosts(config(args.value))))
         elif args.mode == "locks":
             print(",".join(load_harness().locks_for([args.gpu], hosts(config(args.value)))))
-        elif args.mode == "api":
-            api(args.value)
         elif args.mode == "window":
             print(diagnostic_window(Path(args.value)))
-        elif args.mode == "result":
-            result_gate(Path(args.value), args.kind)
         elif args.mode == "runtime":
             runtime_inputs()
         elif args.mode == "budgets":
-            values = config(args.value)
-            worker = int(values.get("SPARK_DEVICE_BUDGET_BYTES", str(108 << 30)))
-            if worker <= 0:
-                raise ValueError("Spark memory budget must be positive")
-            print(values["COORDINATOR_GPU_BUDGET_GIB"], worker)
-        elif args.mode == "expert-port":
+            # Workers get the plan's Spark budget, as run.sh gives them: the configured
+            # SPARK_DEVICE_BUDGET_BYTES, else the family default.
+            report = json.loads(Path(args.plan).read_text())["report"]
+            print(config(args.value)["COORDINATOR_GPU_BUDGET_GIB"], int(report["spark_budget_bytes"]))
+        else:
             port = int(config(args.value).get("EXPERT_PORT", "0"))
             if not 1024 <= port <= 65535:
                 raise ValueError("set an explicit unprivileged EXPERT_PORT in each configuration")
             print(port)
-        else:
-            deployment = json.loads(Path(args.value).read_text())
-            report = deployment.get("report", {})
-            if deployment.get("wip_launchable") is not True:
-                raise ValueError("deployment is not WIP launchable")
-            if report.get("fits") is not True or report.get("placement_supported") is not True:
-                raise ValueError("plan must support placement and fit all budgets")
     except (ValueError, OSError, KeyError, TypeError) as error:
         print(f"first-window: {error}", file=sys.stderr)
         return 2
