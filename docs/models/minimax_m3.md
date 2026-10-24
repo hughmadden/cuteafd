@@ -81,8 +81,8 @@ cuteafd plan "$SNAPSHOT" --layout --rtx 1 --spark-ranks 4 \
   --speculator dspark --host-cache-bytes 0
 ```
 
-`--host-cache-bytes 0` disables the separate host prefix snapshot tier for the
-capacity comparison; it does not disable the proposed host K/V backing.
+`--host-cache-bytes 0` leaves the host prefix snapshot tier out of the
+capacity comparison.
 Pool tokens are aggregate capacity, not a larger model context: each sequence
 still obeys the checkpoint's 1,048,576-token limit.
 
@@ -172,86 +172,6 @@ block, causal tails and stable pointer lifetimes. Never dequantize the full
 cache to BF16 as its default representation. Validate NLL/logits and accepted
 DSpark continuations against the FP8 path before execution admission.
 
-### Selected-block paging (accounting only)
-
-`--kv-placement host|spark` keeps index keys on GPU and plans full K/V backing
-elsewhere. `--kv-hot-cache-gib` defaults to 1 GiB, including resident slot
-metadata. Host backing uses `--kv-host-budget-gib` (default 192 GiB); this is
-an explicit backing budget, not a claim that all physical RAM is free. On a
-251 GiB host, embedding, prefix snapshots, OS reserve and other allocations
-must also fit; the host ledger charges the backing. Spark backing is equally
-sharded and bounded by the **least free rank** after experts, runtime,
-transport, estimated scratch and vision. Remote capacity is not free memory
-that can be spent twice.
-
-The GPU proposal charges 7,920 B/token index plus **30 B/token** for a proposed
-16-byte entry per layer/head/128-token block. That directory format is an
-estimate. The hot-cache budget also covers 32 bytes per physical head-block
-slot and must hold at least every layer's selected set plus insertion blocks.
-This accounting reserves slots rather than asserting any cache hit rate.
-
-Decode data flow: GPU index query -> max-pool/top-16 -> stable `q2k` -> GPU
-page-directory lookup and missing-block deduplication -> reserve/pin hot slots
--> gather misses -> publish completed mappings -> sparse attention. Logical
-selection order stays unchanged; physical cache placement is a separate map.
-Keep the writable local block resident. Key the GPU LRU by sequence/page
-generation, layer, KV head and logical block; never evict in-flight pages.
-GPU writes maintain canonical backing before eviction or snapshot publication.
-Prefill processes bounded tiles, gathering the union of selections across
-the tile. That union, and DSpark's multi-row verification union at C1, may
-exceed 16 blocks; split tiles rather than overrun the hot-cache admission.
-
-At FP8 a single decode row selects at most
-`16 * 128 * 4 * 128 * 2` = **2 MiB/layer**, or **120 MiB over 60 layers**.
-Per-head blocks are 32 KiB. NVFP4 reduces those figures to 1.125 MiB/layer
-and 67.5 MiB per target row, with globals already resident. Writes add
-61,440 B/committed token at FP8 (34,560 at NVFP4), plus synchronization.
-
-| Path | Bandwidth assumption | Cold FP8 transfer floor per target row |
-| --- | --- | --- |
-| PCIe Gen4 x16 | 24 GB/s payload | 5.24 ms |
-| PCIe Gen5 x16 | 48 GB/s payload | 2.62 ms |
-| RoCE 100 Gb/s | 12.5 GB/s wire ceiling | 10.07 ms |
-| RoCE 200 Gb/s | 25 GB/s wire ceiling | 5.03 ms |
-| Ethernet 10 Gb/s | 1.25 GB/s wire ceiling | 100.66 ms |
-
-PCIe payload figures are assumptions below the approximately 31.5/63 GB/s
-encoded x16 ceilings ([PCI-SIG](https://pcisig.com/what-bit-rates-does-pcie-50-specification-support-and-how-does-it-compare-prior-pcie-generations));
-no host link width, negotiated speed or bandwidth was probed. With 50%/90%
-hits multiply the transfer term by 0.5/0.1; local-block inclusion alone does
-not establish those hit rates. Add lookup, roundtrip, completion, writes,
-index scanning and expert-traffic contention. Next-layer selection depends
-on the preceding attention/FFN, so C1 cannot hide all transfers behind the
-layer pipeline. Overlap resident-block attention with miss gathers and
-independent requests where available. C1 cost is an incremental transfer
-bound per verified target row, not a measured emitted-token penalty;
-drafting acceptance and row-union reuse determine its amortization.
-
-Mapped pinned host storage permits GPU-initiated coalesced gather loads and
-writes without CPU byte copying or polling; see the [CUDA mapped-memory
-contract](https://docs.nvidia.com/cuda/archive/13.0.3/cuda-c-programming-guide/index.html#mapped-memory).
-It still consumes PCIe bandwidth. Native device-initiated gather is the host
-proposal; CPU-driven per-layer memcpy staging would violate the hot-path goal.
-**Do not assume Spark-to-5090 GPUDirect:** NVIDIA excludes GeForce from
-[supported GPUDirect RDMA](https://docs.nvidia.com/holoscan/archive/2.9.0/set_up_gpudirect_rdma.html),
-and [DGX Spark](https://docs.nvidia.com/dgx/dgx-spark-porting-guide/porting/cuda.html)
-does not support GPUDirect RDMA to `cudaMalloc` memory; its documented verbs
-alternative registers `cudaHostAlloc` memory. NIC-to-host staging followed
-by GPU gather introduces a host hop. Thus `spark` remains a capacity-only,
-non-executable design until a supported device-initiated transport satisfying
-the no-staging constraint is demonstrated. Nominal RoCE bandwidth alone
-cannot establish feasibility.
-
-Prefix restores must retain canonical K/V and index page bytes, scales,
-logical identities, valid lengths and generation metadata. Share immutable
-pages and copy-on-write tails; publish prompt/turn snapshots only after all
-writes complete. Restore mappings before attention, invalidate uncommitted
-speculative generations and preserve the existing drafter cold/warm contract.
-LRU eviction changes residency only, never model state. Gate implementation
-on byte-exact restore versus scratch prefill, causal block-boundary tests,
-miss/eviction/rollback races and DSpark continuation parity.
-
-
 ### Capacity summary (DSpark on in every cell)
 
 **Default TP2 at 108 GiB/Spark remains refused for every variant:** onboarding
@@ -266,9 +186,8 @@ L = exact checkpoint/native allocation formulas, with calibrated context and
 estimated code/remote scratch; consequently **pool capacity is an offline
 forecast**, not an exact live-memory promise. P = additionally proposed cache
 allocation/metadata; execution explicitly unimplemented. All rows use full
-1M context, automatic pool, 1 GiB hot cache where paged, and 192 GiB host
-backing. E is host embedding, S the 256-row/one-sequence profile, N NVFP4,
-H host paging and R Spark paging; the final column is accounting status.
+1M context and an automatic pool. E is host embedding, S the
+256-row/one-sequence profile and N NVFP4; the final column is accounting status.
 
 | Option | TP2* (116 GiB/Spark) | TP3 | TP4 | Accounting |
 | --- | ---: | ---: | ---: | --- |
@@ -276,24 +195,16 @@ H host paging and R Spark paging; the final column is accounting status.
 | Host embedding (E) | 112,064 | 111,296 | 110,592 | L |
 | 5090 C1 sizing (S) | 179,840 | 179,776 | 179,712 | L |
 | NVFP4 K/V (N) | 125,056 | 123,904 | 122,624 | P |
-| Host paging (H) | 533,376 | 526,976 | 520,704 | P |
-| Spark paging (R) | 54,784 | 526,976 | 520,704 | P |
 | E + S | 215,296 | 215,232 | 215,168 | L |
 | E + S + N | 351,488 | 351,360 | 351,360 | P |
-| E + S + H | 1,743,232 | 1,742,848 | 1,742,464 | P |
-| E + S + R | 81,280 | 1,593,728 | 1,742,464 | P |
-| E + S + N + H | 1,743,232 | 1,742,848 | 1,742,464 | P |
-| E + S + N + R | 144,640 | 1,742,848 | 1,742,464 | P |
 
 These figures use the supplied release headers and 170-SM program manifest;
 the table evaluates the ledger equations, with ten cells cross-checked
 against `cuteafd plan` JSON. Native pools round to 64-token pages, proposals
 to 128-token blocks. TP differences in coordinator capacity include Spark
-intake buffers. Spark paging is also capped by remote memory after vision.
-At TP3/TP4 the full host-paging combination is index-limited: NVFP4 reduces
-backing bytes/traffic rather than increasing that pool. A one-sequence profile
-cannot consume more than 1M tokens in one request; surplus is aggregate page
-capacity for retained prefixes or a subsequent explicit concurrency increase.
+intake buffers. A one-sequence profile cannot consume more than 1M tokens in
+one request; surplus is aggregate page capacity for retained prefixes or a
+subsequent explicit concurrency increase.
 
 Proceed first with mapped embedding plus the explicit 5090 sizing profile:
 **215,168 tokens at TP4**, keeping native formats and DSpark. Next obtain the
@@ -301,5 +212,4 @@ real TP1/remote package manifests to resolve default-budget TP2, then qualify
 mapped lookup, chunked prefill, draft continuation and exact prefix restore
 on an authorized device. Measure warmed C1 emitted throughput and acceptance
 before changing defaults. NVFP4 needs the native SM120 kernels and numerical
-gates; host paging needs a device-gather prototype and miss traces; Spark
-paging remains blocked on the transport feasibility requirement above.
+gates.
