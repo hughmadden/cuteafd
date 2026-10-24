@@ -1,13 +1,32 @@
 //! Separate E4M3 K/V planes and packed index pages, with no positional marks.
 use super::{execution::LayerCache, MiniMaxError};
+use crate::shared::prefix::PagedPlane;
 use anyhow::Result;
 use cuteafd_ffi::{minimax::Buffer, CuteafdDeviceBuffer, NativeLibrary};
-use cuteafd_loader::families::minimax_m3::cache::MiniMaxCacheLayout;
+use cuteafd_loader::families::minimax_m3::cache::{self as layout, MiniMaxCacheLayout};
 use cuteafd_engine::prefix::TailCopy;
 
-pub(super) const PAGE_ROWS: usize = 64;
+pub(super) const PAGE_ROWS: usize = layout::PAGE_ROWS as usize;
+/// One K or V page: 64 rows of 4 KV heads x 128 E4M3 bytes.
 pub(super) const KV_PAGE_BYTES: usize = PAGE_ROWS * 4 * 128;
-pub(super) const INDEX_PAGE_BYTES: usize = PAGE_ROWS * 132;
+pub(super) use crate::shared::prefix::INDEX_PAGE_BYTES;
+const _: () = assert!(INDEX_PAGE_BYTES as u64 == layout::INDEX_PAGE_BYTES);
+const KV_SPANS: &[(usize, usize)] = &[(0, KV_PAGE_BYTES / PAGE_ROWS)];
+
+/// One layer's K, V and index planes, in the order the host tier stores them.
+fn planes(key: CuteafdDeviceBuffer, value: CuteafdDeviceBuffer, index: CuteafdDeviceBuffer) -> [PagedPlane; 3] {
+    let kv = |buffer| PagedPlane { buffer, page_bytes: KV_PAGE_BYTES, spans: KV_SPANS };
+    [kv(key), kv(value), PagedPlane::index(index)]
+}
+
+/// A tail copy's `(from, to, rows)` inside a pool of `pages` (one GPU, so no owner).
+fn tail_pages(copy: TailCopy, pages: usize) -> std::result::Result<(usize, usize, usize), MiniMaxError> {
+    if copy.owner.is_some() || copy.rows > PAGE_ROWS || copy.from == copy.to
+        || copy.from as usize >= pages || copy.to as usize >= pages {
+        return Err(MiniMaxError::Invalid("cache tail copy"));
+    }
+    Ok((copy.from as usize, copy.to as usize, copy.rows))
+}
 
 pub(super) struct Cache<'a> {
     pub layers: Vec<LayerCache<'a>>,
@@ -17,22 +36,6 @@ pub(super) struct Cache<'a> {
     pub tail: Buffer<'a>,
     pub library: &'a NativeLibrary,
     pub device: i32,
-}
-
-/// Offsets for one partial page, including the index scales' separate suffix.
-pub(super) fn copy_spans(copy: TailCopy, pages: usize)
-    -> std::result::Result<Vec<(usize, usize, usize, usize)>, MiniMaxError> {
-    if copy.owner.is_some() || copy.rows > PAGE_ROWS || copy.from == copy.to
-        || copy.from as usize >= pages || copy.to as usize >= pages {
-        return Err(MiniMaxError::Invalid("cache tail copy"));
-    }
-    let (from, to, rows) = (copy.from as usize, copy.to as usize, copy.rows);
-    Ok(vec![
-        (0, from * KV_PAGE_BYTES, to * KV_PAGE_BYTES, rows * 512),
-        (1, from * KV_PAGE_BYTES, to * KV_PAGE_BYTES, rows * 512),
-        (2, from * INDEX_PAGE_BYTES, to * INDEX_PAGE_BYTES, rows * 128),
-        (2, from * INDEX_PAGE_BYTES + 8192, to * INDEX_PAGE_BYTES + 8192, rows * 4),
-    ])
 }
 
 impl<'a> Cache<'a> {
@@ -64,16 +67,16 @@ impl<'a> Cache<'a> {
             .chain([self.tail.raw()]).collect()
     }
 
+    /// Every layer's planes; page `p` of the prefix cache is page `p` of each.
+    pub fn planes(&self) -> impl Iterator<Item = PagedPlane> + '_ {
+        self.layers.iter().flat_map(|l| planes(l.key.raw(), l.value.raw(), l.index.raw()))
+    }
+
     pub fn copy_rows(&self, copy: TailCopy) -> Result<()> {
-        let spans = copy_spans(copy, self.pages)?;
+        let (from, to, rows) = tail_pages(copy, self.pages)?;
         self.library.cuda_set_device(self.device)?;
-        for layer in &self.layers {
-            let planes = [&layer.key, &layer.value, &layer.index];
-            for &(plane, from, to, bytes) in &spans {
-                if bytes == 0 { continue; }
-                self.library.copy_d2d(planes[plane].view(to, bytes)?.raw(),
-                    planes[plane].view(from, bytes)?.raw(), bytes)?;
-            }
+        for plane in self.planes() {
+            for (dst, src) in plane.tail(from, to, rows)? { self.library.copy_d2d(dst, src, src.bytes)?; }
         }
         Ok(())
     }
@@ -82,21 +85,37 @@ impl<'a> Cache<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
     #[test]
     fn minimax_tail_copy_preserves_every_visible_byte_and_nothing_else() {
+        let pages = 3;
+        let sizes = [KV_PAGE_BYTES, KV_PAGE_BYTES, INDEX_PAGE_BYTES];
+        let bases = [0x1000_0000usize, 0x2000_0000, 0x3000_0000];
+        let buffer = |p: usize| CuteafdDeviceBuffer { ptr: bases[p] as *mut std::ffi::c_void,
+            bytes: pages * sizes[p], device_id: 0, flags: 0 };
+        // The rows a page holds: K/V rows of 4 heads x 128 bytes; index keys, then scales at 64 x 128.
+        let visible = |p: usize, offset: usize, rows: usize| if p < 2 { offset < rows * 512 }
+            else { offset < rows * 128 || (8192..8192 + rows * 4).contains(&offset) };
         for rows in [0, 1, 17, 63, 64] {
-            let sizes = [KV_PAGE_BYTES, KV_PAGE_BYTES, INDEX_PAGE_BYTES];
-            let mut planes: Vec<_> = sizes.iter().map(|&n| (0..n * 3)
-                .map(|i| ((i * 7 + i / n) % 251) as u8).collect::<Vec<_>>()).collect();
-            let before = planes.clone();
-            let spans = copy_spans(TailCopy { from: 1, to: 2, rows, owner: None }, 3).unwrap();
-            for &(p, from, to, n) in &spans { planes[p].copy_within(from..from+n, to); }
-            for p in 0..3 { for i in 0..planes[p].len() {
-                let source = spans.iter().find(|&&(q, _, to, n)| q == p && (to..to+n).contains(&i));
-                assert_eq!(planes[p][i], source.map_or(before[p][i], |&(_, from, to, _)| before[p][from+i-to]));
-            }}
+            let (from, to, n) = tail_pages(TailCopy { from: 1, to: 2, rows, owner: None }, pages).unwrap();
+            for (p, plane) in planes(buffer(0), buffer(1), buffer(2)).iter().enumerate() {
+                let size = sizes[p];
+                let before: Vec<u8> = (0..pages * size).map(|i| ((i * 7 + i / size) % 251) as u8).collect();
+                let mut after = before.clone();
+                for (dst, src) in plane.tail(from, to, n).unwrap() {
+                    let (d, s) = (dst.ptr as usize - bases[p], src.ptr as usize - bases[p]);
+                    after.copy_within(s..s + src.bytes, d);
+                }
+                for (i, &byte) in after.iter().enumerate() {
+                    let (page, offset) = (i / size, i % size);
+                    let expected = if page == to && visible(p, offset, rows) { before[from * size + offset] } else { before[i] };
+                    assert_eq!(byte, expected, "plane {p} byte {i} after a {rows}-row tail copy");
+                }
+            }
         }
-        assert!(copy_spans(TailCopy { from: 0, to: 1, rows: 65, owner: None }, 2).is_err());
-        assert!(copy_spans(TailCopy { from: 0, to: 2, rows: 1, owner: None }, 2).is_err());
+        for bad in [TailCopy { from: 0, to: 1, rows: 65, owner: None }, TailCopy { from: 0, to: 3, rows: 1, owner: None },
+            TailCopy { from: 1, to: 1, rows: 1, owner: None }, TailCopy { from: 0, to: 1, rows: 1, owner: Some(0) }] {
+            assert!(tail_pages(bad, pages).is_err(), "{bad:?}");
+        }
     }
 }

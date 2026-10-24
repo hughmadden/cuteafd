@@ -1,4 +1,4 @@
-use super::{cache::{Cache, PAGE_ROWS, KV_PAGE_BYTES, INDEX_PAGE_BYTES}, MiniMaxError};
+use super::{cache::{Cache, PAGE_ROWS}, MiniMaxError};
 use cuteafd_core::MediaSpan;
 use cuteafd_engine::{media::RequestMedia, prefix::{BoxError, FamilyLayout, MarkSlot, MarkStore,
     PageOwners, PrefixFamily, ReuseRule, TailCopy}};
@@ -24,7 +24,7 @@ impl PrefixFamily for MiniMaxPrefix<'_, '_> {
     type Placement = Placement;
     fn layout(&self) -> FamilyLayout {
         FamilyLayout { page_rows: PAGE_ROWS, pages: self.cache.pages,
-            page_bytes: self.cache.layers.len() * (2 * KV_PAGE_BYTES + INDEX_PAGE_BYTES),
+            page_bytes: self.cache.planes().map(|plane| plane.page_bytes).sum(),
             mark_bytes: 0, draft_bytes: 0, rule: ReuseRule::EXACT,
             mark_store: MarkStore::Arena, page_owners: PageOwners::Uniform }
     }
@@ -46,9 +46,7 @@ impl PrefixFamily for MiniMaxPrefix<'_, '_> {
     fn drain(&self) -> Result<(), BoxError> { Ok(()) }
     fn page_segments(&self, page: u32) -> Vec<DeviceRange> {
         if page as usize >= self.cache.pages { return Vec::new(); }
-        self.cache.layers.iter().flat_map(|l| [(l.key.raw(), KV_PAGE_BYTES),
-            (l.value.raw(), KV_PAGE_BYTES), (l.index.raw(), INDEX_PAGE_BYTES)])
-            .map(|(buffer, bytes)| DeviceRange { addr: buffer.ptr as u64 + u64::from(page) * bytes as u64, bytes }).collect()
+        self.cache.planes().map(|plane| plane.page(page as usize)).collect()
     }
     fn mark_segments(&self, _: MarkSlot) -> Vec<DeviceRange> { Vec::new() }
     fn host_tail(&self) -> Vec<DeviceRange> {
@@ -59,6 +57,7 @@ impl PrefixFamily for MiniMaxPrefix<'_, '_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::super::cache::{INDEX_PAGE_BYTES, KV_PAGE_BYTES};
     use cuteafd_engine::prefix::{After, PrefixCache, PrefixConfig, SnapshotKind};
     use cuteafd_hostcache::copy::StubCopyEngine;
     use cuteafd_loader::families::{minimax_m3::cache::{MiniMaxCacheLayout, RankPages}, qwen4::Qwen4KvCache};
