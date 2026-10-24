@@ -26,7 +26,8 @@ fn extraction_normalizes_shapes_defaults_and_top_level_options() {
         json!({"type":"input_video", "frames":[FRAMES[0]]})] {
         let source = sources(part).remove(0);
         assert_eq!(source.frames, [FRAMES[0]]);
-        assert!(!source.sample && !source.resize);
+        assert!(source.sample.is_none() && source.resize.is_none());
+        assert_eq!(source.sizing(), VideoResize::Vendor);
         assert!(source.count.is_none() && source.source_fps.is_none() && source.fps.is_none());
     }
     for value in [json!("https://example.com/a.mp4"), json!({"url":"https://example.com/a.mp4"})] {
@@ -34,7 +35,8 @@ fn extraction_normalizes_shapes_defaults_and_top_level_options() {
             "source_fps":24, "num_frames":3, "do_resize":true}));
         let source = take_sources(&mut request).unwrap().remove(0);
         assert_eq!(source.url.as_deref(), Some("https://example.com/a.mp4"));
-        assert_eq!((source.sample, source.resize, source.count, source.source_fps), (true, true, Some(3), Some(24.0)));
+        assert_eq!((source.sample, source.resize, source.count, source.source_fps), (Some(true), Some(true), Some(3), Some(24.0)));
+        assert_eq!(source.sizing(), VideoResize::Smart);
         assert_eq!(request["messages"][0]["content"][0], json!({"type":"text", "text":"]<]video[>["}));
     }
 }

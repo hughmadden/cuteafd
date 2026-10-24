@@ -70,10 +70,27 @@ fn encoded_http_video_uses_fetch_policy_and_the_same_processor() {
 
 fn generated(source: &str) -> String {
     let output = std::process::Command::new("ffmpeg").args(["-hide_banner", "-loglevel", "error", "-nostdin",
-        "-f", "lavfi", "-i", source, "-threads", "1", "-c:v", "ffv1", "-f", "matroska", "pipe:1"])
+        "-f", "lavfi", "-i", source, "-threads", "1", "-c:v", "mpeg4", "-q:v", "4", "-f", "matroska", "pipe:1"])
         .stdin(std::process::Stdio::null()).output().unwrap();
     assert!(output.status.success(), "ffmpeg lavfi fixture");
     format!("data:video/x-matroska;base64,{}", STANDARD.encode(output.stdout))
+}
+fn unset(url: String) -> Vec<VideoSource> {
+    take_sources(&mut json!({"messages":[{"role":"user","content":[{"type":"video_url","video_url":url}]}]})).unwrap()
+}
+
+#[test]
+fn defaults_follow_the_serving_sampler_frame_size_and_timestamps() {
+    // sglang at 1 fps keeps frames 0, 4, 8 and the last (9) of a 2.5 s, 4 fps clip and
+    // scales 1280x720, 1920x1080 and 640x480 to 756x448, 756x448 and 644x504.
+    for (size, (height, width)) in [("1280x720", (448, 756)), ("1920x1080", (448, 756)), ("640x480", (504, 644))] {
+        let source = unset(generated(&format!("color=c=gray:s={size}:r=4:d=2.5")));
+        let prepared = preparer(ImageUrlFetch::Off).prepare_videos(&source).unwrap();
+        let segment = &prepared[0].segments[0];
+        assert_eq!((segment.grid.t, segment.grid.h * 14, segment.grid.w * 14, segment.source_frames), (2, height, width, 4));
+        let pair = format!("]<]start of image[>[{}]<]end of image[>[", "]<]video[>[".repeat(height as usize / 28 * (width as usize / 28)));
+        assert_eq!(prepared[0].placeholder, format!("]<]0.0 seconds[>[{pair}]<]2.0 seconds[>[{pair}"));
+    }
 }
 
 #[test]

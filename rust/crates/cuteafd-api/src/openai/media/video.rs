@@ -1,7 +1,7 @@
 //! MiniMax video inputs reuse the image fetch policy and bundled processor.
 use super::MediaPreparer;
 use anyhow::{ensure, Context, Result};
-use cuteafd_loader::{LiteralSpans, media::{decode_bounded, minimax::{self, PreparedVideoSegment}}};
+use cuteafd_loader::{LiteralSpans, media::{decode_bounded, MediaError, minimax::{self, PreparedVideoSegment, VideoResize}}};
 use serde_json::{json, Value};
 use std::{sync::Arc, time::{Duration, Instant}};
 
@@ -10,10 +10,25 @@ pub struct VideoSource {
     url: Option<String>,
     frames: Vec<String>,
     source_fps: Option<f64>,
-    sample: bool,
+    sample: Option<bool>,
     count: Option<usize>,
     fps: Option<f64>,
-    resize: bool,
+    resize: Option<bool>,
+}
+impl VideoSource {
+    /// Unset options follow MiniMax's serving path: encoded videos sample at `fps`
+    /// (1 by default), frame lists arrive sampled, and frames scale to at most 756.
+    /// Explicit `do_sample_frames`/`do_resize` pick the bundled processor's uniform
+    /// sampler and smart resize, or turn sampling and resizing off.
+    fn indices(&self, total: usize, source_fps: Option<f64>) -> Result<Vec<usize>, MediaError> {
+        match self.sample {
+            None if self.url.is_some() => minimax::constant_interval_indices(total, source_fps, self.fps.unwrap_or(minimax::VIDEO_FPS)),
+            sample => minimax::sample_frame_indices(total, source_fps, sample == Some(true), self.count, self.fps),
+        }
+    }
+    fn sizing(&self) -> VideoResize {
+        match self.resize { None => VideoResize::Vendor, Some(true) => VideoResize::Smart, Some(false) => VideoResize::Off }
+    }
 }
 #[derive(Debug)]
 pub struct PreparedVideo {
@@ -35,9 +50,9 @@ pub fn take_sources(body: &mut Value) -> Result<Vec<VideoSource>> {
                 frame.as_str().or_else(|| frame["url"].as_str()).or_else(|| frame["image_url"]["url"].as_str())
                     .expect("canonical frame URL").to_owned()).collect();
             sources.push(VideoSource { url, frames, source_fps: value["source_fps"].as_f64(),
-                sample: value["do_sample_frames"].as_bool().unwrap_or(false),
+                sample: value["do_sample_frames"].as_bool(),
                 count: value["num_frames"].as_u64().map(|n| n as usize), fps: value["fps"].as_f64(),
-                resize: value["do_resize"].as_bool().unwrap_or(false) });
+                resize: value["do_resize"].as_bool() });
             *part = json!({"type":"text","text":"]<]video[>["});
         }
     }
@@ -79,7 +94,7 @@ impl MediaPreparer {
             };
             let decoded = frames.iter().try_fold(0usize, |n, f| n.checked_add(f.data.len())).context("decoded video extent overflow")?;
             remaining = remaining.checked_sub(decoded).context("decoded videos exceed request byte limit")?;
-            let indices = minimax::sample_frame_indices(frames.len(), source_fps, source.sample, source.count, source.fps)?;
+            let indices = source.indices(frames.len(), source_fps)?;
             let frames = indices.iter().map(|&i| frames[i].clone()).collect::<Vec<_>>();
             ensure!(frames.windows(2).all(|pair| pair[0].width == pair[1].width && pair[0].height == pair[1].height),
                 "video frames must share dimensions");
@@ -87,7 +102,7 @@ impl MediaPreparer {
             let mut placeholder = String::new();
             let mut offset = 0;
             for frames in frames.chunks(minimax::MAX_SEGMENT_FRAMES) {
-                let segment = minimax::prepare_video_frames(frames, self.encoder, source.resize)?
+                let segment = minimax::prepare_video_frames(frames, self.encoder, source.sizing())?
                     .pop().context("video segment is empty")?;
                 prepared_bytes = prepared_bytes.checked_add(segment.rgb8.len()).context("prepared video extent overflow")?;
                 ensure!(prepared_bytes <= self.limits.decoded_bytes, "prepared videos exceed request byte limit");
