@@ -184,6 +184,10 @@ pub(crate) struct PlanArgs {
     /// Override automatic placement of the untied token embedding.
     #[arg(long, alias = "embed-placement", value_enum)]
     pub(crate) embedding_placement: Option<crate::shared::token_io::EmbedPlacement>,
+    /// Derive and verify weight variants against this snapshot and print only
+    /// their verdicts and table sizes (the serve flag's syntax).
+    #[command(flatten)]
+    pub(crate) variants: crate::shared::variants::VariantArgs,
     /// Hugging Face model id (resolved under HF_HOME) or a snapshot directory.
     pub(crate) model: String,
     #[arg(long)]
