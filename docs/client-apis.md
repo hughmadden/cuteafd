@@ -47,7 +47,8 @@ accepts any requested model id and runs the served model. It also advertises the
 Code's model discovery lists only `claude-*` ids, and Codex has a fixed set of
 slugs. To refresh those lists without a rebuild, generate a file with
 `scripts/gateway/official-model-names.py` and pass it as
-`--official-model-names-file`.
+`--official-model-names-file`. Launchers: `OFFICIAL_MODEL_NAMES=off` makes an
+unknown id an error (unset keeps the default).
 
 **Web search.** Claude Code's WebSearch and Codex's web search run on the
 server: `--gateway-search exa` (needs `EXA_API_KEY`; `--search` on the

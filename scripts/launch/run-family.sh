@@ -163,6 +163,7 @@ ENABLE_BENCH
 CONSOLE_ASSETS
 USAGE
 GATEWAY
+OFFICIAL_MODEL_NAMES
 EOF
   if [[ "$1" == qwen3_5 ]]; then
     cat <<'EOF'
@@ -468,6 +469,7 @@ MEMORY_RESERVATION
 MODEL_ID
 MODEL_REVISION
 MODEL_VARIANT
+OFFICIAL_MODEL_NAMES
 POOL_TOKENS
 PREFILL_BATCH_TOKENS
 PREFIX_CACHE_ENTRIES
@@ -824,9 +826,23 @@ case "$ENABLE_BENCH" in
   off) ;;
   *) echo "ENABLE_BENCH must be on or off" >&2; exit 2 ;;
 esac
-# GATEWAY=off drops the Messages/Responses/Realtime routes; unset keeps the binary default (on).
+shared_gateway_args
+}
+
+# Client-protocol policy, forwarded only when set; unset keeps the binary defaults (on).
+# GATEWAY=off drops the Messages/Responses/Realtime routes. OFFICIAL_MODEL_NAMES=off
+# stops answering unknown model ids with the served model, so a misspelled id fails
+# instead of reaching the catch-all; the served and variant ids still resolve.
+shared_gateway_args() {
+local gateway official
 gateway="$(get GATEWAY "")"
 case "$gateway" in on|off) api_args+=(--gateway "$gateway") ;; "") ;; *) echo "GATEWAY must be on or off" >&2; exit 2 ;; esac
+official="$(get OFFICIAL_MODEL_NAMES "")"
+case "$official" in
+  on|off) api_args+=(--official-model-names "$official") ;;
+  "") ;;
+  *) echo "OFFICIAL_MODEL_NAMES must be on or off" >&2; exit 2 ;;
+esac
 }
 
 # ---------------------------------------------------------------------------
