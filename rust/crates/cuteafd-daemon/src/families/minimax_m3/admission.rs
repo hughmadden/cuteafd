@@ -19,6 +19,8 @@ pub(super) struct Request {
     pub headroom: u64,
     pub draft_bytes: u64,
     pub host_embedding: bool,
+    /// Prefill lanes: each holds its own endpoint (connections and rings) on every rank.
+    pub lanes: usize,
 }
 
 pub(super) struct Admitted {
@@ -54,10 +56,10 @@ pub(super) fn solve(checkpoint: &Checkpoint, programs: &serde_json::Value,
     let catalog = cuteafd_loader::read_expert_catalog(&checkpoint.snapshot)?;
     let layers = cfg.moe.iter().enumerate().filter_map(|(layer, &moe)| moe.then_some(layer)).collect();
     let working = SparkWorkingSet { rtx_layers: vec![], spark_layers: layers,
-        spark_ranks: request.sizing.spark_ranks, prefill_lanes: 1 };
+        spark_ranks: request.sizing.spark_ranks, prefill_lanes: request.lanes as u64 };
     let endpoint = cuteafd_core::SparkEndpoint { capacity: request.sizing.rows.try_into()?, ingress: cuteafd_core::SparkIngress::Bf16 };
     let rings = cuteafd_core::SparkRings { max_frame_bytes: 64 << 20, depth: 8, slot_bytes: 8 << 20, alignment: 4096 };
-    let io = working.rank_endpoints_io(0, catalog.routed_experts().geometry()?, &[endpoint], rings)?;
+    let io = working.rank_endpoints_io(0, catalog.routed_experts().geometry()?, &vec![endpoint; request.lanes], rings)?;
     // Remote code/scratch is architecture-specific. This selects owners only;
     // measured worker admission remains mandatory before any transport launch.
     let remote_reserved = [io.intake, io.host_exchange, io.row_indices, io.endpoint_staging, io.mapped_rings,
@@ -127,6 +129,7 @@ mod tests {
             sizing: RuntimeSizing { rows: 256, decode_rows: 64, sequences: 16, context: 4096, spark_ranks: 3, logit_rows: 64 },
             available: options.rtx_bytes[0] - measured_baseline, requested_pool: Some(4096),
             kv_format: Qwen4KvCache::Fp8, onboard: None, spark_budget: 108 << 30, headroom: 0, draft_bytes:0, host_embedding,
+            lanes: 1,
         })?;
         assert_eq!(live.cache.total_bytes + measured_baseline, device.used_bytes());
         assert_eq!(live.cache.pool_tokens, memory.pool_tokens);

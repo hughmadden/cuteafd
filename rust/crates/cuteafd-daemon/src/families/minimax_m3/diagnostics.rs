@@ -124,6 +124,21 @@ impl StepDump {
     }
 }
 
+/// `CUTEAFD_MINIMAX_STEP_DIGEST=1`: logs the SHA-256 of every step's final
+/// hidden rows after its stream drained, so two schedules of the same
+/// requests (prefill lanes on and off) can be compared bit for bit.
+pub(super) fn step_digest(commands: &Commands<'_>, hidden: &Buffer<'_>, rows: usize, lanes: usize) -> Result<()> {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var("CUTEAFD_MINIMAX_STEP_DIGEST").is_ok_and(|v| v == "1")) { return Ok(()); }
+    let mut bytes = vec![0; rows * 6144 * 4];
+    let source = hidden.view(0, bytes.len())?;
+    commands.library().cuda_set_device(commands.device())?;
+    commands.library().copy_d2h(&mut bytes, source.raw())?;
+    tracing::info!(target: "cuteafd::minimax_digest", rows, lanes, digest = %format!("{:x}", Sha256::digest(&bytes)),
+        "step hidden digest");
+    Ok(())
+}
+
 fn selection_rows(bytes: &[u8], rows: usize, capacity: usize) -> Result<Vec<u8>> {
     ensure!(rows > 0 && rows <= capacity && bytes.len() == 4 * capacity * 16 * 4,
         MiniMaxError::Invalid("diagnostic selection stride"));

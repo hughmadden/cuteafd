@@ -261,10 +261,10 @@ fn completed(directory: &Path, binding: &Value, full: bool) -> Result<Option<Val
 
 struct DenseOnly;
 impl<'a> ExpertExecutor<'a> for DenseOnly {
-    fn dispatch(&mut self, _: usize, _: usize, _: &Buffer<'a>, _: &Buffer<'a>, _: &Buffer<'a>, _: &Commands<'a>) -> Result<()> {
+    fn dispatch(&mut self, _: usize, _: usize, _: usize, _: &Buffer<'a>, _: &Buffer<'a>, _: &Buffer<'a>, _: &Commands<'a>) -> Result<()> {
         Err(MiniMaxError::Invalid("unexpected routed layer in dense-only golden").into())
     }
-    fn collect(&mut self, _: usize, _: usize, _: &Buffer<'a>, _: &Commands<'a>) -> Result<()> {
+    fn collect(&mut self, _: usize, _: usize, _: usize, _: &Buffer<'a>, _: &Commands<'a>) -> Result<()> {
         Err(MiniMaxError::Invalid("unexpected routed collect in dense-only golden").into())
     }
 }
@@ -528,7 +528,7 @@ pub(crate) async fn run_golden(args: GoldenArgs) -> Result<()> {
     let spark = if let Some(&first) = remote.first() {
         cuteafd_transport::worker_selection::require_peer_clients(&args.peers, endpoint, 1)?;
         Some(super::routed::Spark::connect(&library, args.device, SparkWorld::canonical(args.peers.len())?, &args.peers,
-            sizing.rows, config, first, request)?)
+            sizing.rows, config, first, request, 1)?)
     } else {None};
     let experts: Box<dyn ExpertExecutor<'_>> = if local.is_none() && spark.is_none() {Box::new(DenseOnly)}
         else {Box::new(Routed::new(local, spark)?)};

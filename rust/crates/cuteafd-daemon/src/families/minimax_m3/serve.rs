@@ -47,6 +47,12 @@ pub(crate) struct ServeArgs {
     max_sequences: u8,
     #[arg(long)]
     model_id: Option<String>,
+    /// Prefill lanes (1 or 2): a prefill chunk of at least twice 512 rows is
+    /// cut in two lanes, each with its own Spark exchange in flight while the
+    /// other lane's half of the layer runs on the GPU. Each lane holds its own
+    /// connections and rings on every rank.
+    #[arg(long, default_value_t = 2, value_parser = clap::value_parser!(u8).range(1..=super::routed::MAX_LANES as i64))]
+    prefill_lanes: u8,
     /// Project every prefill row's logits (prefill-shaped probe scoring);
     /// otherwise prefill projects only the rows a request needs.
     #[arg(long)]
@@ -137,7 +143,7 @@ fn worker(args: &ServeArgs, receive: &mut tokio::sync::mpsc::Receiver<cuteafd_ap
     library.cuda_set_device(args.device)?;
     let programs = library.programs()?.with_manifest(&args.manifest)?;
     programs.load_matching(|name| name.starts_with("minimax_"))?;
-    let (rows, sequences) = (args.prefill_rows as usize, args.max_sequences as usize);
+    let (rows, sequences, lanes) = (args.prefill_rows as usize, args.max_sequences as usize, args.prefill_lanes as usize);
     let rings = args.draft_context_slots.unwrap_or_else(|| cuteafd_loader::families::minimax_m3::dspark::default_ring_slots(sequences));
     let draft_contract=if args.speculator=="dspark" {Some(cuteafd_loader::families::minimax_m3::dspark::DsparkContract::open(&args.snapshot)?)} else {None};
     let draft_layout=draft_contract.as_ref().map(|c|super::dspark::Layout::new(&library,c,rings,rows)).transpose()?;
@@ -163,7 +169,7 @@ fn worker(args: &ServeArgs, receive: &mut tokio::sync::mpsc::Receiver<cuteafd_ap
         let text = admission::solve(&checkpoint, &manifest, local_package.as_ref(), admission::Request {
             sizing, available: free, requested_pool: None, kv_format: args.kv_cache, onboard,
             spark_budget: args.spark_budget_bytes, headroom, draft_bytes,
-            host_embedding: args.token_io.embed_placement == EmbedPlacement::Host })?;
+            host_embedding: args.token_io.embed_placement == EmbedPlacement::Host, lanes })?;
         let vision_bytes = ReadyVision::local_bytes(&args.snapshot, &args.native_lib)?;
         let cache_target = args.pool_tokens.filter(|n| *n > 0).unwrap_or(262_144)
             .checked_mul(text.cache.cache.token_bytes(0)).context("MiniMax vision cache target overflow")?;
@@ -182,17 +188,17 @@ fn worker(args: &ServeArgs, receive: &mut tokio::sync::mpsc::Receiver<cuteafd_ap
         admission::solve(&checkpoint, &manifest, local_package.as_ref(), admission::Request {
             sizing, available, requested_pool: args.pool_tokens, kv_format: args.kv_cache, onboard,
             spark_budget: args.spark_budget_bytes.saturating_sub(remote_reserve), headroom, draft_bytes,
-            host_embedding: args.token_io.embed_placement == EmbedPlacement::Host })?
+            host_embedding: args.token_io.embed_placement == EmbedPlacement::Host, lanes })?
     };
     let mut catalog = cuteafd_loader::read_expert_catalog(&args.snapshot)?;
     catalog.select_draft(cuteafd_loader::plan::spec::DraftOwnership::None)?;
     let endpoint = SparkEndpoint { capacity: args.prefill_rows, ingress: SparkIngress::Bf16 };
     let config = TcpTransportConfig::default();
     let working = SparkWorkingSet { rtx_layers: admitted.local_layers.clone(), spark_layers: admitted.spark_layers.clone(),
-        spark_ranks: args.peers.len(), prefill_lanes: 1 };
+        spark_ranks: args.peers.len(), prefill_lanes: lanes as u64 };
     let pending = SparkAdmission::plan(&args.snapshot, ExpertGeometry::MINIMAX_M3, Some(&catalog), &working,
         args.peers.len(), None, ModelAdmission::for_clients(ExpertGeometry::MINIMAX_M3, endpoint,
-            admitted.spark_capacity as u32, spark_rings(config.max_frame_bytes)?, 1)?)?.start(&args.peers)?;
+            admitted.spark_capacity as u32, spark_rings(config.max_frame_bytes)?, lanes)?)?.start(&args.peers)?;
     let device = Device { library: &library, id: args.device };
     let cache_bytes = admitted.cache.cache_bytes.checked_add(256).context("MiniMax cache reserve overflow")?;
     let token_ids = cuteafd_ffi::minimax::Buffer::new(&library, args.device, admitted.ledger.bytes("token_ids").unwrap() as usize)?;
@@ -215,10 +221,10 @@ fn worker(args: &ServeArgs, receive: &mut tokio::sync::mpsc::Receiver<cuteafd_ap
     let mut cache = Cache::new(&library, args.device, &admitted.cache.cache, admitted.cache.pool_pages as usize,
         sizing.sequences, cache_bytes)?;
     cache.context = cache.context.min(admitted.cache.pool_tokens as usize);
-    cuteafd_transport::worker_selection::require_peer_clients(&args.peers, endpoint, 1)?;
+    cuteafd_transport::worker_selection::require_peer_clients(&args.peers, endpoint, lanes)?;
     let world = SparkWorld::canonical(args.peers.len())?;
     let spark = admitted.spark_layers.first().map(|&first| super::routed::Spark::connect(&library, args.device, world,
-        &args.peers, sizing.rows, config, first, request)).transpose()?;
+        &args.peers, sizing.rows, config, first, request, lanes)).transpose()?;
     let expander = vision.as_ref().map(|_| cuteafd_loader::media::minimax::span_expander(&args.snapshot, cfg.vocab_size as u32, false)).transpose()?;
     let backend = MiniMaxBackend { execution: &execution, cache: &cache, embedding: &embedding, token_ids, embedded,
         experts: RefCell::new(Routed::new(local, spark)?), rows: sizing.rows, vocabulary: cfg.vocab_size, expander,
@@ -227,7 +233,7 @@ fn worker(args: &ServeArgs, receive: &mut tokio::sync::mpsc::Receiver<cuteafd_ap
     let (encoder, preparer, media_bytes) = vision.map_or((Encoder::Off, None, 0), |v| (v.encoder, Some(v.preparer), v.cache_bytes));
     let mut media = cuteafd_engine::media::MediaAdmission::new(cuteafd_engine::media::EmbeddingCache::new(media_bytes), encoder, 16);
     tracing::info!(pool_tokens=admitted.cache.pool_tokens, context=cache.context, local_layers=?admitted.local_layers,
-        rows=sizing.rows, logit_rows=sizing.logit_rows, draft_rings,
+        rows=sizing.rows, logit_rows=sizing.logit_rows, draft_rings, prefill_lanes=lanes,
         "MiniMax native eager target; prefill uses the MSA index-prefill and attention-extend kernels");
     let drafts=if args.speculator=="dspark" {scheduler::Drafts::Neural {depth:7,fixed:false}} else {scheduler::Drafts::None};
     scheduler::schedule(&backend, &args.snapshot, receive, stats, sizing.sequences, drafts,

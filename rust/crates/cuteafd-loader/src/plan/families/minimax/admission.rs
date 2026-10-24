@@ -132,6 +132,18 @@ impl ProgramSizes {
     pub fn workspace_bytes(&self) -> u64 { self.workspace_bytes }
 }
 
+/// Buffers with one row per batch row: (name, elements per row, bytes per
+/// element). A prefill lane's view of one starts at its first row.
+pub const ROW_BUFFERS: &[(&str, u64, u64)] = &[
+    ("residual", 6144, 4), ("embedded", 6144, 2), ("norm", 6144, 2), ("q", 8192, 2), ("q_norm", 8192, 2),
+    ("kv", 1024, 2), ("k", 512, 2), ("k_norm", 512, 2), ("v", 512, 2),
+    ("index_q", 512, 2), ("index_q_norm", 512, 2), ("index_k", 128, 2), ("index_k_norm", 128, 2),
+    ("index_q_fp8", 512, 1), ("index_q_scales", 4, 4), ("attention", 8192, 2),
+    ("delta", 6144, 2), ("gate_up", 24576, 2), ("activation", 12288, 2),
+    ("shared", 6144, 2), ("routed", 6144, 2), ("router_logits", 128, 4), ("route_ids", 4, 4),
+    ("route_weights", 4, 4), ("token_ids", 1, 4), ("positions", 1, 8), ("slots", 1, 8), ("batch_ids", 1, 4),
+];
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Allocation {
     pub name: &'static str,
@@ -151,15 +163,7 @@ impl RuntimeLedger {
         let mut add = |name, dimensions: &[u64]| -> Result<()> {
             allocations.push(Allocation { name, bytes: product(dimensions)?.max(256) }); Ok(())
         };
-        for (name, width, bytes) in [
-            ("residual", h, 4), ("embedded", h, 2), ("norm", h, 2), ("q", 8192, 2), ("q_norm", 8192, 2),
-            ("kv", 1024, 2), ("k", 512, 2), ("k_norm", 512, 2), ("v", 512, 2),
-            ("index_q", 512, 2), ("index_q_norm", 512, 2), ("index_k", 128, 2), ("index_k_norm", 128, 2),
-            ("index_q_fp8", 512, 1), ("index_q_scales", 4, 4), ("attention", 8192, 2),
-            ("delta", h, 2), ("gate_up", 24576, 2), ("activation", 12288, 2),
-            ("shared", h, 2), ("routed", h, 2), ("router_logits", 128, 4), ("route_ids", 4, 4),
-            ("route_weights", 4, 4), ("token_ids", 1, 4), ("positions", 1, 8), ("slots", 1, 8), ("batch_ids", 1, 4),
-        ] { add(name, &[r, width, bytes])?; }
+        for &(name, width, bytes) in ROW_BUFFERS { add(name, &[r, width, bytes])?; }
         add("head_input", &[sizing.logit_rows as u64, h, 2])?;
         add("head_workspace", &[4 << 20])?;
         add("logits", &[sizing.logit_rows as u64, cfg.vocab_size as u64, 4])?;
@@ -380,6 +384,18 @@ pub(crate) mod tests {
         assert_eq!(ledger.fixed_bytes, ledger.allocations.iter().map(|a| a.bytes).sum::<u64>());
         assert!(ledger.allocations.iter().all(|a| a.bytes >= 256));
 
+    }
+
+    #[test]
+    fn minimax_row_buffers_hold_one_row_per_batch_row() {
+        let sizing = sizing();
+        let programs = ProgramSizes::from_manifest(&programs_manifest(), sizing).unwrap();
+        let ledger = RuntimeLedger::new(&config(), sizing, &programs).unwrap();
+        // Lane views stride these by row: each holds exactly rows x its row bytes.
+        for &(name, width, bytes) in ROW_BUFFERS {
+            assert_eq!(ledger.bytes(name), Some((sizing.rows as u64 * width * bytes).max(256)), "{name}");
+        }
+        assert_eq!(ledger.bytes("norm"), Some(sizing.rows as u64 * config().hidden as u64 * 2));
     }
 
     #[test]
