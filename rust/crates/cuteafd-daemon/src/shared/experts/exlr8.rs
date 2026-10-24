@@ -8,6 +8,8 @@ use cuteafd_loader::plan::exlr8::residency::Residency;
 mod execution;
 pub(crate) use execution::Exlr8Execution;
 
+pub(crate) use cuteafd_loader::plan::exlr8::PrefillActivations as Exlr8PrefillActivations;
+
 const BANKS: usize = 2;
 
 pub(crate) struct Exlr8Weights<'a> {

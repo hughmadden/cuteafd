@@ -47,6 +47,40 @@ def _run(repo: Path, hf: Path, *args: str) -> subprocess.CompletedProcess[str]:
                           capture_output=True, text=True, timeout=60)
 
 
+@pytest.mark.parametrize("activations", [None, "a16", "a8"])
+@pytest.mark.parametrize("wip", [False, True])
+def test_exlr8_prefill_activations_reach_plan_coordinator_and_workers(tmp_path, activations, wip):
+    config = {"model_type": "glm_moe_dsa", "num_hidden_layers": 4, "first_k_dense_replace": 3}
+    keys = "EXLR8_MANIFEST=up1\nSPARK_COUNT=4\nRTX_GPUS=1\nSPECULATOR=off\nVISION=off\nAUDIO=off\n"
+    args = ("--wip", "a8-test") if wip else ()
+    if activations is not None:
+        args += ("--set", f"EXLR8_PREFILL_ACTIVATIONS={activations}")
+    result = _family_launch_result(tmp_path, config, "test/exlr8", keys, extra_args=args)
+    assert result.returncode == 0, result.stderr
+    lines = result.stderr.splitlines()
+    plans = [line for line in lines if "cuteafd plan" in line]
+    coordinators = [line for line in lines if "cuteafd serve-glm --snapshot" in line]
+    workers = [line for line in lines if "cuteafd expertd-native" in line]
+    assert plans and coordinators and workers, result.stderr
+    for line in plans + coordinators + workers:
+        assert "--exlr8-manifest up1" in line
+        if activations is None:
+            assert "--exlr8-prefill-activations" not in line
+        else:
+            assert f"--exlr8-prefill-activations {activations}" in line
+
+
+@pytest.mark.parametrize("keys,diagnostic", [
+    ("EXLR8_MANIFEST=up1\nEXLR8_PREFILL_ACTIVATIONS=fp8\n", "EXLR8_PREFILL_ACTIVATIONS must be a16 or a8"),
+    ("EXLR8_PREFILL_ACTIVATIONS=a8\n", "EXLR8_PREFILL_ACTIVATIONS requires EXLR8_MANIFEST"),
+])
+def test_exlr8_prefill_activations_reject_invalid_launch_config(tmp_path, keys, diagnostic):
+    config = {"model_type": "glm_moe_dsa", "num_hidden_layers": 4, "first_k_dense_replace": 3}
+    result = _family_launch_result(tmp_path, config, "test/exlr8", keys + "SPECULATOR=off\n")
+    assert result.returncode != 0 and diagnostic in result.stderr
+    assert "docker run" not in result.stderr
+
+
 def test_glm_flash_config_goes_to_run_family(tmp_path: Path) -> None:
     repo, hf = _repo(tmp_path), tmp_path / "hf"
     _snapshot(hf, "zai-org/GLM-5.3-Flash", {"model_type": "glm5_next", "num_hidden_layers": 45,
