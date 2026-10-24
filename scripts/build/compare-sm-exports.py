@@ -312,6 +312,7 @@ def _export_exl3(extra, output):
             compact_ws = compact and len(bits) == 2 and package.compact_warp_specialized(
                 geometry, role, width, rows)
             ws = compact_ws or (len(bits) == 2 and tile is None
+                                and (role != "coordinator" or bits == (4, 5))
                                 and package.warp_specialized(geometry, role, width, rows))
             if ws:
                 block = 32 if compact_ws else 64
@@ -334,6 +335,8 @@ def _export_exl3(extra, output):
                 options["route_block"] = block
             if (limit := package.swiglu_limit(geometry)) != 10.0:
                 options["swiglu_limit"] = limit
+            if (schedule := package.default_decode_schedule(geometry, role, profile, rows, list(bits))) is not None:
+                options["decode_schedule"] = schedule
             export(output / profile / f"m{rows}", width, experts, rows, bits, "auto", topk, dtype, **options)
 
 

@@ -98,7 +98,8 @@ def verify(package: Path, revision: str | None = None, runtime: Path | None = No
             if (manifest['role'] != 'spark'
                     or widths.get(directory.split('/')[0]) != meta['intermediate']
                     or len(meta['bits']) != 2 or meta.get('tile') != [64, 128, 64, 128]
-                    or meta.get('warp_specialized', False) or meta.get('decode_schedule') is not None
+                    or meta.get('warp_specialized', False)
+                    or meta.get('decode_schedule') not in (None, 'l2=2,pf1=0,pf2=0,pdl=1')
                     or meta.get('input_format', 'bf16') != 'bf16'):
                 raise ValueError(f'EXL3 invalid compact geometry or execution contract: {directory}')
         if 'blocks_per_sm' in variant and variant['blocks_per_sm'] != meta.get('blocks_per_sm'):
@@ -127,11 +128,11 @@ def verify(package: Path, revision: str | None = None, runtime: Path | None = No
             raise ValueError(f'EXL3 variant warp specialization mismatch: {directory}')
         if variant.get('input_format', 'bf16') != meta.get('input_format', 'bf16'):
             raise ValueError(f'EXL3 variant input format mismatch: {directory}')
-        # A schedule variant lives in m<capacity>-<schedule> and its export
-        # records the options; a default directory records none.
+        # The variant records its exact compiled schedule, including defaults.
+        # Explicit schedule siblings must still carry a schedule and suffix.
         schedule = variant.get('schedule')
         if (variant.get('decode_schedule') != meta.get('decode_schedule')
-                or (schedule is None) != (meta.get('decode_schedule') is None)
+                or (schedule is not None and meta.get('decode_schedule') is None)
                 or directory.rsplit('/', 1)[-1] != f"m{meta['capacity']}"
                 + ('' if schedule is None else f'-{schedule}')):
             raise ValueError(f'EXL3 variant decode schedule mismatch: {directory}')
@@ -359,10 +360,25 @@ def warp_specialized(geometry: str, role: str, width: int, capacity: int) -> boo
     -> 15.47; single runs 3-25% faster for TP2/TP3/TP6 widths (tile-128
     GLM TP3 640 included) and at m128/m256. Decode capacities (<= 80 rows)
     keep the cooperative kernel.
+
+    SM120 RTX PRO 6000, 2026-10-24, H6144/E256/top8, K4 weights with
+    K5 slots, FP32 sums, common wire-roundtripped input, three interleaved
+    rounds of five graph replays (core + sum, no packing): width1024 BF16
+    WS random/72-histogram paired-median speedups m1024 1.080/1.059,
+    m2752 1.037/1.033. Width2048 m256 is 1.054/1.148; larger capacities
+    regress and stay cooperative. Width1024 m256 uses wire (see below).
+    Other tier pairs, widths, families and unmeasured capacities stay off.
     """
-    if role != 'spark' or geometry not in ('dsv4p', 'glm', 'glmf'):
+    if role == 'coordinator':
+        return (geometry == 'glm'
+                and ((width == 1024 and capacity in (256, 1024, 2752))
+                     or (width == 2048 and capacity == 256)))
+    if role != 'spark':
         return False
-    return capacity >= 256
+    if geometry == 'kimik3':
+        # Qualified ordinary TP6 slices; compact ownership and smaller packages stay off.
+        return width == 512 and capacity >= 1024
+    return geometry in ('dsv4p', 'glm', 'glmf') and capacity >= 256
 
 
 def compact_warp_specialized(geometry: str, role: str, width: int, capacity: int) -> bool:
@@ -386,8 +402,14 @@ def wire_input(geometry: str, role: str, width: int, capacity: int) -> bool:
     (with the 192-wide tile); 256 9.04 / 10.15 -> 7.34 / 9.36. Four input
     stages instead of three lose 0.2-0.8 ms at every width on K4/K5. Measured on
     GLM 5.3 only: GLM 5.3 Flash and V4 Pro keep the former exports until measured.
+
+    SM120 RTX PRO 6000, 2026-10-24, width1024 m256: cooperative 1737.66 us
+    -> wire/stage3/dynamic 1516.48 us (1.146x random, 1.204x median paired
+    across 72 histograms), conditions in `warp_specialized`. At m1024 wire
+    loses on random (0.927x); wider coordinator profiles keep BF16 input.
     """
-    return geometry == 'glm' and warp_specialized(geometry, role, width, capacity)
+    return (geometry == 'glm' and warp_specialized(geometry, role, width, capacity)
+            and (role == 'spark' or (width == 1024 and capacity == 256)))
 
 
 def ws_input_stages(geometry: str, role: str, width: int, capacity: int) -> int | None:
@@ -396,7 +418,7 @@ def ws_input_stages(geometry: str, role: str, width: int, capacity: int) -> int 
     weight ring of 256-wide 4-bit tiles leaves room for) hide it; with K4/K5
     tiers three stages measure faster than four (see `wire_input`). Bit-identical.
     """
-    return 3 if geometry == 'glm' and warp_specialized(geometry, role, width, capacity) else None
+    return 3 if wire_input(geometry, role, width, capacity) else None
 
 
 def ws_dynamic_tiles(geometry: str, role: str, width: int, capacity: int) -> bool:
@@ -406,7 +428,7 @@ def ws_dynamic_tiles(geometry: str, role: str, width: int, capacity: int) -> boo
     width 512 m2752: FC1 fills 1761 MB of LPDDR5X for 805 MB of weights).
     Bit-identical; the largest of the GLM 5.3 GB10 gains (see `wire_input`).
     """
-    return geometry == 'glm' and warp_specialized(geometry, role, width, capacity)
+    return wire_input(geometry, role, width, capacity)
 
 
 def ws_tile(geometry: str, role: str, width: int, capacity: int) -> tuple[int, ...] | None:
@@ -465,6 +487,40 @@ DECODE_SCHEDULES = {
                             80: {'decode_schedule': 'gb10', 'tile': (64, 128, 64, 128),
                                  'blocks_per_sm': 2}}},
 }
+
+
+PURE_EVICT_FIRST = 'l2=2,pf1=0,pf2=0,pdl=1'
+
+
+def default_decode_schedule(geometry: str, role: str, profile: str,
+                            capacity: int, bits: list[int]) -> str | None:
+    """Only measured cooperative profiles use the pure streaming hint.
+
+    GB10, default/control/hint, three alternating rounds, rows 1..80: GLM
+    compact TP6 1.054..1.123x (control .997..1.002); Flash TP4 1.027..1.082x
+    (.997..1.001); Qwen compact TP4 1.003..1.094x (1.000..1.004); Kimi TP6
+    1.020..1.107x (.991..1.004). Compact m16 rows 2/4/8/16: GLM
+    1.067..1.119x (.995..1.003), Qwen 1.019..1.083x (.989..1.002).
+    RTX TP2 m1/m80: Flash median 1.015..1.144x (control .995..1.016),
+    GLM median 1.014..1.037x (.999..1.005), finite normalized fixtures.
+    Tiles, occupancy and arithmetic unchanged.
+    """
+    measured = {
+        ('glm', 'tp6-compact-width384', (4, 5)),
+        ('glmf', 'tp4-width512', (3, 4)),
+        ('qwen4', 'tp4-compact-width256', (4, 5)),
+        ('kimik3', 'tp6-width512', (2, 3)),
+    }
+    identity = (geometry, profile, tuple(bits))
+    measured_m16 = {('glm', 'tp6-compact-width384', (4, 5)),
+                    ('qwen4', 'tp4-compact-width256', (4, 5))}
+    if role == 'spark' and ((capacity in (1, 80) and identity in measured)
+                            or (capacity == 16 and identity in measured_m16)):
+        return PURE_EVICT_FIRST
+    measured_rtx = {('glm', 'rtx-tp2', (4, 5)), ('glmf', 'rtx-tp2', (3, 4))}
+    if role == 'coordinator' and capacity in (1, 80) and identity in measured_rtx:
+        return PURE_EVICT_FIRST
+    return None
 
 
 def decode_schedule_variants(geometry: str, role: str, profile: str,
@@ -818,9 +874,16 @@ def build(args: argparse.Namespace) -> None:
                     options['hidden'] = hidden
                 block = route_block(geometry, capacity)
                 ws = compact_ws or (len(args.bits) == 2 and tile is None
+                                    and (args.role != 'coordinator' or tuple(args.bits) == (4, 5))
                                     and warp_specialized(geometry, args.role, width, capacity))
                 if ws:
                     block = 32 if compact_ws else 64
+                    if geometry == 'kimik3' or args.role == 'coordinator':
+                        # Existing policy-keyed directories contain cooperative exports.
+                        suffix = ('-wire-s3-dynamic' if wire_input(geometry, args.role, width, capacity)
+                                  else '-bf16-static' if args.role == 'coordinator' else '')
+                        profile_dir = profile_dir.with_name(f'{profile_dir.name}+ws-m{block}{suffix}')
+                        raw = profile_dir / f'm{capacity}'
                 if block != 8:
                     options['route_block'] = block
                 if ws:
@@ -839,10 +902,13 @@ def build(args: argparse.Namespace) -> None:
                     options['token_major_rotation'] = True
                 if (limit := swiglu_limit(geometry)) != 10.0:
                     options['swiglu_limit'] = limit
-                # The default export, then any decode-schedule variant of it: the
-                # same options plus a schedule, content-keyed in the build tree and
-                # installed as m<capacity>-<schedule> beside m<capacity>.
-                exports = [(None, raw, options)]
+                default_options = options
+                if (schedule_hint := default_decode_schedule(
+                        geometry, args.role, profile, capacity, args.bits)) is not None:
+                    raw = profile_dir.with_name(f'{profile_dir.name}+{schedule_hint}') / raw.name
+                    default_options = {**options, 'decode_schedule': schedule_hint}
+                # Explicit schedule siblings keep their original options and suffix.
+                exports = [(None, raw, default_options)]
                 for schedule, schedule_options in ([] if compact else decode_schedule_variants(
                         geometry, args.role, profile, capacity)):
                     exports.append((schedule, profile_dir.with_name(f'{profile_dir.name}+{schedule}')
@@ -894,6 +960,7 @@ def build(args: argparse.Namespace) -> None:
                     variant['input_format'] = meta['input_format']
                 if schedule is not None:
                     variant['schedule'] = schedule
+                if meta.get('decode_schedule') is not None:
                     variant['decode_schedule'] = meta['decode_schedule']
                 variants.append(variant)
         files = {str(p.relative_to(stage)): {'bytes': p.stat().st_size, 'sha256': digest(p)}

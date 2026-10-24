@@ -5362,10 +5362,13 @@ mod prefill_lane_tests {
         for (path, expected) in [
             // Shared KDA geometry keeps GLM's low-rank gates, BF16 norm and rounded beta;
             // projection routes and capacity-based thresholds are unchanged.
-            ("integration/cuteafd/glmf.py", 0xb51f_2224_6aff_2bd4_u64),
+            // Fork #136 adds full-head MLA absorb/UV cache hints and preserves W8 prefill mode;
+            // projection dispatch, shapes and arithmetic thresholds remain unchanged.
+            ("integration/cuteafd/glmf.py", 0xf39b_b9ad_75d4_25a9_u64),
             // b729115b uses canonical BF16 MMA at every positive row count.
             // Hugh Madden fork #30 (TMA fences before consumer_release): fence-only change.
-            ("integration/cuteafd/_glm_kernels.py", 0x7f20_e05f_fd23_f141),
+            // Fork #136 adds only an optional weight TMA cache policy; MMA and K order are unchanged.
+            ("integration/cuteafd/_glm_kernels.py", 0xd327_0840_454a_bc62),
             ("integration/cuteafd/_fp8_weights.py", 0xab87_f59d_f17b_3556),
             // 5dcdd837 opts decode mHC into partial-group fusion; projection thresholds and arithmetic stay unchanged.
             ("integration/cuteafd/dsv4_mhc.py", 0x978a_179d_ef8c_2101),
