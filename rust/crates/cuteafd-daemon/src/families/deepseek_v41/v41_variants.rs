@@ -268,6 +268,7 @@ unsafe fn steer_rows(_library: &NativeLibrary, _x: CuteafdDeviceBuffer, _ld: i64
 mod tests {
     use super::*;
     use cuteafd_core::variants::{bf16_rne, bf16_to_f32, steer_rows_ref, SiteOp};
+    use anyhow::{ensure, Context};
 
     fn plan(index: u8, alpha: f32, r: &[f32], layers: impl IntoIterator<Item = u16>) -> VariantPlan {
         VariantPlan::new(index, format!("v{index}"), format!("m-v{index}"), V41_HIDDEN as u32,
@@ -340,6 +341,123 @@ mod tests {
         }
         assert!(launches(true, true, false));
         assert!(!launches(true, false, false), "base-only eager chunks skip the kernel");
+    }
+
+    /// Juliette gate 2 (component): layer L's real `wo_b` projection on the
+    /// GPU, steered by the kernel, against the published W' applied exactly
+    /// (FP8 values dequantized, FP32 accumulation). Base rows stay bit-identical,
+    /// the kernel matches the host reference, and the steered rows land on W'x
+    /// within the GEMM's own error plus the FP8 requantization floor.
+    ///   CUTEAFD_NATIVE_LIB=... CUTEAFD_SNAPSHOT=<stock 1017> CUTEAFD_VARIANT_SOURCE=<overlay> \
+    ///   [CUTEAFD_VARIANT_LAYERS=10,22,35] TEST --exact --ignored --nocapture
+    #[test]
+    #[ignore = "GPU gate: native library with steer_rows, stock V4.1 1017 snapshot, Keys overlay"]
+    fn component_wo_b_steering_matches_published_weights() -> Result<()> {
+        use crate::families::deepseek_v41::v41_attention_output::AttentionOutputWeights;
+        use crate::shared::memory::device::{Allocation, Device};
+        let env = |key: &str| std::env::var(key).with_context(|| format!("{key} is required"));
+        let library = unsafe { NativeLibrary::load(env("CUTEAFD_NATIVE_LIB")?)? };
+        let catalog = cuteafd_loader::read_official_v41_catalog(std::path::Path::new(&env("CUTEAFD_SNAPSHOT")?))?;
+        let overlay = env("CUTEAFD_VARIANT_SOURCE")?;
+        let layers: Vec<usize> = std::env::var("CUTEAFD_VARIANT_LAYERS").unwrap_or_else(|_| "10,22,35".into())
+            .split(',').map(str::parse).collect::<std::result::Result<_, _>>()?;
+        let spec: cuteafd_core::variants::VariantSpec = format!("name=abliterated,source={overlay}").parse()?;
+        let loaded = load_variants(&[(1, spec)], "served", &catalog)?;
+        let variant = loaded.first().context("the overlay was refused")?;
+        let (alpha, r) = match &variant.plan.sites[0].1 {
+            SiteOp::Steer { a, b, .. } => (a[0] / b[0], b.clone()),
+            SiteOp::Delta {} => unreachable!(),
+        };
+        let tables = V41SteerTables::new(std::slice::from_ref(&variant.plan))?.context("tables")?;
+        let device = Device { library: &library, id: 0 };
+        let steer_weights = device.run(|| V41SteerWeights::upload(&library, 0, &tables, |_| true))?;
+        let source = cuteafd_loader::V41VariantSource::open(std::path::Path::new(&overlay), LAYERS as u16)?;
+        let rows = 16usize;
+        let mask: Vec<u8> = (0..rows).map(|i| (i % 2) as u8).collect();
+        let mut steer = device.run(|| BlockSteer::new(&library, &steer_weights, rows))?;
+        steer.capture_every_shape();
+        steer.set_rows(&mask)?;
+        let read = |buffer: CuteafdDeviceBuffer| -> Result<Vec<u16>> {
+            let mut bytes = vec![0u8; buffer.bytes];
+            device.run(|| library.copy_d2h(&mut bytes, buffer))?;
+            Ok(bytes.chunks_exact(2).map(|b| u16::from_ne_bytes([b[0], b[1]])).collect())
+        };
+        let gemv = |w: &[f32], z: &[f32]| -> Vec<f32> {
+            let mut out = vec![0f32; w.len() / z.len()];
+            let threads = std::thread::available_parallelism().map_or(8, |n| n.get());
+            let per = out.len().div_ceil(threads);
+            std::thread::scope(|scope| for (i, chunk) in out.chunks_mut(per).enumerate() {
+                scope.spawn(move || for (j, o) in chunk.iter_mut().enumerate() {
+                    let row = &w[(i * per + j) * z.len()..][..z.len()];
+                    *o = row.iter().zip(z).map(|(a, b)| f64::from(*a) * f64::from(*b)).sum::<f64>() as f32;
+                });
+            });
+            out
+        };
+        let norm = |v: &[f32]| v.iter().map(|x| f64::from(*x).powi(2)).sum::<f64>().sqrt();
+        let rel = |a: &[f32], b: &[f32]| norm(&a.iter().zip(b).map(|(x, y)| x - y).collect::<Vec<_>>()) / norm(b);
+        let dot = |a: &[f32], b: &[f32]| a.iter().zip(b).map(|(x, y)| f64::from(*x) * f64::from(*y)).sum::<f64>();
+        eprintln!("alpha={alpha:.4}  layer  gemm_floor  fp8_floor  base_vs_pub  steered_vs_pub  r_component_err");
+        for layer in layers {
+            let weights = device.own(|| AttentionOutputWeights::load(&library, &catalog, layer,
+                AttentionOutputWeights::device_bytes(&library, &catalog, layer)?, 1 << 20))?;
+            let mut wave = device.own(|| weights.wave(rows as u32, usize::MAX))?;
+            let input = Allocation::new(device, rows * 65536)?;
+            let host: Vec<u8> = (0..rows * 32768).flat_map(|i| {
+                let value = (((i * 2654435761) % 4093) as f32 / 4093.0 - 0.5) * 0.25;
+                ((value.to_bits() >> 16) as u16).to_ne_bytes()
+            }).collect();
+            device.run(|| library.copy_h2d(input.buffer, &host))?;
+            let tokens: Vec<u64> = (0..rows as u64).map(|i| 1000 + i).collect();
+            let attention = crate::families::deepseek_v41::v41_sparse_attention::QueuedSparseAttention {
+                values: CuteafdDeviceBuffer { bytes: rows * 65536, ..input.buffer }, rows, layer };
+            let ([z_buffer, y_buffer], stream) = wave.wo_b_buffers(rows);
+            let y = device.run(|| unsafe {
+                wave.prepare_chain_graph(&tokens, stream)?;
+                let y = wave.enqueue_chain_graph(&attention, stream)?;
+                library.cuda_stream_synchronize(stream)?;
+                Ok(y)
+            })?;
+            ensure!(y.ptr == y_buffer.ptr && y.bytes == y_buffer.bytes, "projection output buffer differs");
+            let (z, base_out) = (read(z_buffer)?, read(y_buffer)?);
+            device.run(|| unsafe {
+                steer.upload(rows, stream)?;
+                steer.enqueue(layer, y_buffer, rows, stream)?;
+                library.cuda_stream_synchronize(stream)
+            })?;
+            let steered = read(y_buffer)?;
+            let mut reference = base_out.clone();
+            let t = &tables.tables[0];
+            let vidx: Vec<i32> = mask.iter().map(|&v| i32::from(v)).collect();
+            steer_rows_ref(&mut reference, V41_HIDDEN, rows, V41_HIDDEN, &vidx, &t.a, &t.b, &t.k, t.k_max);
+            let name = format!("layers.{layer}.attn.wo_b");
+            let w = cuteafd_loader::read_fp8_block32(&catalog, &name)?.dequantize();
+            let w_pub = cuteafd_loader::read_fp8_block32(&source, &name)?.dequantize();
+            let mut worst = [0f64; 5];
+            for row in 0..rows {
+                let span = row * V41_HIDDEN..(row + 1) * V41_HIDDEN;
+                if mask[row] == 0 {
+                    ensure!(steered[span.clone()] == base_out[span.clone()], "layer {layer} base row {row} was written");
+                    continue;
+                }
+                let ulp = steered[span.clone()].iter().zip(&reference[span.clone()]).map(|(a, b)| a.abs_diff(*b)).max().unwrap_or(0);
+                ensure!(ulp <= 1, "layer {layer} row {row}: kernel differs from the host reference by {ulp} BF16 ulp");
+                let f = |bits: &[u16]| bits.iter().map(|&b| bf16_to_f32(b)).collect::<Vec<f32>>();
+                let zr = f(&z[row * 8192..(row + 1) * 8192]);
+                let (y_gpu, y_steered) = (f(&base_out[span.clone()]), f(&steered[span]));
+                let (y_host, y_pub) = (gemv(&w, &zr), gemv(&w_pub, &zr));
+                let projected: Vec<f32> = { let c = dot(&r, &y_host) as f32; y_host.iter().zip(&r).map(|(y, r)| y - alpha * r * c).collect() };
+                let (c_s, c_pub) = (dot(&r, &y_steered), dot(&r, &y_pub));
+                let row_err = [rel(&y_gpu, &y_host), rel(&projected, &y_pub), rel(&y_gpu, &y_pub), rel(&y_steered, &y_pub),
+                    (c_s - c_pub).abs() / c_pub.abs().max(1e-12)];
+                for (w, e) in worst.iter_mut().zip(row_err) { *w = w.max(e); }
+            }
+            eprintln!("            {layer:>5}  {:.5}     {:.5}    {:.5}      {:.5}          {:.5}", worst[0], worst[1], worst[2], worst[3], worst[4]);
+            ensure!(worst[3] <= 1.1 * (worst[0] + worst[1]) + 1e-3,
+                "layer {layer}: steered rows miss W'x ({:.5}) beyond the GEMM ({:.5}) plus FP8 ({:.5}) floors", worst[3], worst[0], worst[1]);
+            ensure!(worst[3] < 0.5 * worst[2], "layer {layer}: steering does not move the output toward W'x");
+        }
+        Ok(())
     }
 
     /// The host reference with the uploaded table layout leaves base rows
