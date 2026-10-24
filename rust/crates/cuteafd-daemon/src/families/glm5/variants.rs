@@ -10,7 +10,8 @@
 //! Table pointers are baked into the captured decode graphs, which always
 //! launch at configured sites; per-row variant ids arrive in the workspace's
 //! `variants` buffer by H2D beside the step's other tables, so the graph key
-//! never gains a variant axis. Base rows (`vidx == 0`) are never written.
+//! never gains a variant axis. Base rows (`vidx == 0`) are never written. The kernel is
+//! `cuteafd_ffi::steer_rows`, bound (its modules loaded) when the tables upload.
 use crate::shared::memory::DeviceAllocation;
 use anyhow::{ensure, Context, Result};
 use cuteafd_core::variants::{site_tables, SiteKey, VariantPlan, VariantRecord};
@@ -30,6 +31,10 @@ struct SiteTable<'a> {
 pub(crate) struct GlmVariantTables<'a> {
     sites: BTreeMap<SiteKey, SiteTable<'a>>,
     hidden: usize,
+    /// The bound kernel (modules loaded on the coordinator device before any capture).
+    steer: cuteafd_ffi::steer_rows::SteerRows<'a>,
+    /// Table slots past base: the largest variant index.
+    slots: usize,
     pub records: Vec<VariantRecord>,
     pub plans: Vec<VariantPlan>,
 }
@@ -67,34 +72,26 @@ impl<'a> GlmVariantTables<'a> {
             };
             sites.insert(key, SiteTable { a: put(f32_bytes(&a))?, b: put(f32_bytes(&b))?, k: put(i32_bytes(&k))?, k_max });
         }
-        Ok(Self { sites, hidden, records, plans })
+        let slots = plans.iter().map(|p| usize::from(p.index)).max().unwrap_or(0);
+        Ok(Self { sites, hidden, steer: library.steer_rows()?, slots, records, plans })
     }
 
     pub fn configured(&self, key: SiteKey) -> bool { self.sites.contains_key(&key) }
     pub fn site_count(&self) -> usize { self.sites.len() }
 
     /// Steer `rows` BF16 rows of `x` (row stride `hidden`) at `key`, if any variant edits it.
-    pub fn launch(&self, library: &NativeLibrary, key: SiteKey, x: *mut c_void, rows: usize, vidx: *const c_void,
-        stream: *mut c_void) -> Result<()> {
+    pub fn launch(&self, key: SiteKey, x: *mut c_void, rows: usize, vidx: *const c_void, stream: *mut c_void) -> Result<()> {
         let Some(site) = self.sites.get(&key) else { return Ok(()) };
-        // SAFETY: `x` holds `rows` live BF16 rows of `hidden` columns and `vidx` `rows` i32 ids on
-        // this stream's device; the tables are this struct's live allocations of the §4 shapes.
+        let shape = cuteafd_ffi::steer_rows::SteerRowsShape { rows, h: self.hidden, ld: self.hidden, k_max: site.k_max,
+            variants: self.slots };
+        // SAFETY: `x` holds `rows` live BF16 rows of `hidden` columns and `vidx` `rows` i32 ids on the
+        // binding device, ordered on `stream`; the tables are this struct's live allocations of the
+        // §4 shapes (DeviceAllocation is 256-byte aligned), and `x` overlaps none of them.
         unsafe {
-            steer_rows(library, x, self.hidden as i64, i32::try_from(rows)?, i32::try_from(self.hidden)?, vidx.cast(),
-                site.a.buffer.ptr.cast_const().cast(), site.b.buffer.ptr.cast_const().cast(),
-                site.k.buffer.ptr.cast_const().cast(), i32::try_from(site.k_max)?, stream)
+            self.steer.launch_raw(x.cast(), vidx.cast(), site.a.buffer.ptr.cast_const().cast(),
+                site.b.buffer.ptr.cast_const().cast(), site.k.buffer.ptr.cast_const().cast(), shape, stream)
         }.with_context(|| format!("steer_rows at {key}"))
     }
-}
-
-/// `cuteafd_steer_rows` (contract §4). Temporary until the `cuteafd-ffi` binding from the
-/// kernel session merges: it refuses to run, so a configured variant can never serve rows
-/// unsteered, and nothing launches when no `--variant` is given.
-#[allow(clippy::too_many_arguments)]
-unsafe fn steer_rows(_library: &NativeLibrary, _x: *mut c_void, _ld: i64, _rows: i32, _h: i32, _vidx: *const i32,
-    _a: *const f32, _b: *const f32, _k: *const i32, _k_max: i32, _stream: *mut c_void) -> Result<()> {
-    anyhow::bail!("the steer_rows kernel binding is not in this build yet (weight-variant kernel session); \
-        --variant cannot serve on the GPU")
 }
 
 /// The launch's derived variants: the available plans, their records and table bytes.

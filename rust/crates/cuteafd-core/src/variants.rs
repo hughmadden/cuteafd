@@ -6,7 +6,8 @@
 //!
 //! Interface contract: `designs/weight-variants-contract.md` (v1, 2026-10-24).
 //! This module holds the shared types (§2), the `--variant` flag (§6), the
-//! prefix namespace (§5) and the host reference of the steering kernel (§4).
+//! prefix namespace (§5); the steering kernel's host reference (§4) is re-exported from
+//! `crate::steer_rows`.
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::fmt;
@@ -304,44 +305,9 @@ impl VariantStats {
     }
 }
 
-/// BF16 round-to-nearest-even from FP32 (NaN stays NaN).
-pub fn bf16_rne(value: f32) -> u16 {
-    let bits = value.to_bits();
-    if value.is_nan() { return ((bits >> 16) | 0x40) as u16; }
-    let round = 0x7fff + ((bits >> 16) & 1);
-    (bits.wrapping_add(round) >> 16) as u16
-}
-pub fn bf16_to_f32(value: u16) -> f32 { f32::from_bits(u32::from(value) << 16) }
-
-/// Host reference of `cuteafd_steer_rows` (§4): `x` is BF16 bits `[rows, ld]`,
-/// steered in place on its first `h` columns. `a`/`b` are `[V+1][k_max][h]`
-/// (slot 0 unused), `k` is `[V+1]`. Per row the reduction runs in FP32 in
-/// column order, so a row's result never depends on other rows.
-#[allow(clippy::too_many_arguments)]
-pub fn steer_rows_ref(x: &mut [u16], ld: usize, rows: usize, h: usize, vidx: &[i32], a: &[f32], b: &[f32],
-    k: &[i32], k_max: usize) {
-    assert!(ld >= h && vidx.len() >= rows && (rows == 0 || x.len() >= (rows - 1) * ld + h));
-    assert_eq!(a.len(), k.len() * k_max * h);
-    assert_eq!(b.len(), a.len());
-    let mut t = vec![0f32; k_max];
-    for r in 0..rows {
-        let v = vidx[r];
-        if v <= 0 || v as usize >= k.len() { continue; }
-        let v = v as usize;
-        let kv = k[v].clamp(0, k_max as i32) as usize;
-        if kv == 0 { continue; }
-        let row = &mut x[r * ld..r * ld + h];
-        for (j, tj) in t.iter_mut().enumerate().take(kv) {
-            let bj = &b[(v * k_max + j) * h..][..h];
-            *tj = row.iter().zip(bj).map(|(&x, &b)| bf16_to_f32(x) * b).fold(0.0, |s, p| s + p);
-        }
-        for (c, x) in row.iter_mut().enumerate() {
-            let mut y = bf16_to_f32(*x);
-            for (j, tj) in t.iter().enumerate().take(kv) { y -= a[(v * k_max + j) * h + c] * tj; }
-            *x = bf16_rne(y);
-        }
-    }
-}
+// The kernel's host reference (one copy, `crate::steer_rows`): the same fixed reduction
+// order as `cuteafd_steer_rows`, so CPU tests match the GPU bit for bit.
+pub use crate::steer_rows::{bf16_to_f32, f32_to_bf16_rne as bf16_rne, steer_rows_ref};
 
 /// Pack plans into the kernel's per-site table layout (§4): for one site,
 /// `(a, b, k, k_max)` with slot 0 zero and slots in variant index order.
@@ -454,8 +420,9 @@ mod tests {
 
     #[test]
     fn host_reference_matches_fp32_math_and_skips_base_rows() {
-        let h = 8;
-        let r: Vec<f32> = (0..h).map(|i| (i as f32 + 1.0) / 14.282857).collect();
+        let h = 128;
+        let norm = ((1..=h).map(|i| (i * i) as f32).sum::<f32>()).sqrt();
+        let r: Vec<f32> = (0..h).map(|i| (i as f32 + 1.0) / norm).collect();
         let plan = VariantPlan::new(1, "a", "m-a", h as u32, vec![(key(0, SiteKind::Attn), SiteOp::rank1(3.0, &r))]).unwrap();
         let (a, b, k, k_max) = site_tables(&[plan], key(0, SiteKind::Attn), h);
         assert_eq!((k.as_slice(), k_max), (&[0, 1][..], 1));
@@ -478,7 +445,7 @@ mod tests {
 
     #[test]
     fn host_reference_is_batch_invariant() {
-        let h = 16;
+        let h = 128;
         let r: Vec<f32> = (0..2 * h).map(|i| ((i * 7 % 11) as f32 - 5.0) / 10.0).collect();
         let plan = VariantPlan::new(2, "k2", "m-k2", h as u32, vec![(key(4, SiteKind::Ffn),
             SiteOp::Steer { k: 2, a: r.iter().map(|v| v * 0.5).collect(), b: r.clone() })]).unwrap();

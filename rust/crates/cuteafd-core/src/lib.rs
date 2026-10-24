@@ -30,6 +30,7 @@ pub use dspark_verify::{verify_dspark_greedy, verify_dspark_greedy_vocab, Greedy
 mod engram;
 pub mod prefix;
 pub mod variants;
+pub mod steer_rows;
 pub mod serving_capacity;
 pub mod thermal;
 pub mod push_outcome;

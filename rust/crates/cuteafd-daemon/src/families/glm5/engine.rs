@@ -2047,7 +2047,7 @@ impl<'a> GlmEngine<'a> {
         let Some(tables) = &self.variants else { return Ok(()) };
         let key = cuteafd_core::variants::SiteKey { layer: u16::try_from(layer)?, kind };
         if rank != 0 || !tables.configured(key) || self.step_variant.get() == Some(0) { return Ok(()) }
-        tables.launch(self.library, key, x, rows, w.variants.buffer.ptr.cast_const(), self.stream)
+        tables.launch(key, x, rows, w.variants.buffer.ptr.cast_const(), self.stream)
     }
 
     fn norm(&self, w: &Workspace<'_>, layer: &GlmLayer<'_>, weight: &str, deltas: i32, rows: Scalar) -> Result<()> {
