@@ -16,7 +16,7 @@ use crate::shared::memory::{DeviceAllocation, HostAllocation};
 use crate::shared::token_io::{DeviceLogits, TokenEmbedding};
 use crate::shared::spark_intake::{copy_parallel, IntakeMode, SparkIntake, SparkLink};
 use cuteafd_transport::expert::{
-    SparkExpertWave, EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16,
+    EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16,
 };
 use cuteafd_transport::{
     ExpertProtocolV2Request, ExpertProtocolV2RowDescriptor, ExpertV2Dtype, ExpertV2SourceKind,
@@ -1078,9 +1078,9 @@ impl<'a> GlmEngine<'a> {
                 let ranks = self.moe_skip(w, index, layer, t, cap)?;
                 self.reduce(skip.pointers(), w, ranks, t)?;
             } else {
-                let (transport, runtime) = experts.as_mut()
+                let (transport, _) = experts.as_mut()
                     .with_context(|| format!("layer {index} is an MoE layer; pass Spark peers for its routed experts"))?;
-                self.moe(w, index, layer, t, cap, tables.decode, transport, runtime)?;
+                self.moe(w, index, layer, t, cap, tables.decode, transport)?;
             }
             // h += ffn; x = next input_layernorm(h) (or the final norm). Under a head split
             // the FFN output is this GPU's partial plus rank 1's (dense), or the routed sum
@@ -1284,9 +1284,14 @@ impl<'a> GlmEngine<'a> {
         let bytes = t * self.cfg.hidden * 2;
         // The decode transport's intake planes (or the skip intake's); the
         // replayed graphs bake them in.
-        let planes = match (experts.as_ref(), &self.skip) {
+        let planes = match (experts.as_mut(), &self.skip) {
             (_, Some(skip)) => skip.pointers(),
-            (Some((transport, _)), None) => transport.intake.pointers(),
+            // One decode slot: the replayed graphs bake slot 0's planes.
+            (Some((transport, _)), None) => {
+                let waves = transport.exchange()?;
+                ensure!(waves.waves() == 1, "GLM decode graphs bake one return slot's planes");
+                waves.planes(0)
+            }
             (None, None) => [std::ptr::null(); MAX_RANKS],
         };
         // Previous layer's FFN output: none (first layer), in `delta`, or Spark planes.
@@ -1363,9 +1368,13 @@ impl<'a> GlmEngine<'a> {
             let key = GraphKey { layer: index, rows: t, table_width: tables.table_width,
                 table_stride: tables.table_stride, previous, head: head && layer.is_none() };
             self.replay_on(0, key, segment)?;
+            if let (Previous::Planes(_), None, Some((transport, _))) = (previous, &self.skip, experts.as_mut()) {
+                // The segment just queued reduced the previous layer's planes.
+                transport.exchange()?.consumed(0, self.stream)?;
+            }
             if let Some(w1) = w1 {
                 // Rank 1's segments: layer 0 with rank 0's first, then each next one before
-                // the host waits in this layer's exchange.
+                // this layer's exchange.
                 if index == 0 {
                     self.peer_segment(0, Previous::First, w1, t, ranked, bytes)?;
                 }
@@ -1390,11 +1399,11 @@ impl<'a> GlmEngine<'a> {
                 Some(layer) if self.skip.is_some() => Previous::Planes(self.moe_skip(w, index, layer,
                     tables.exchange_rows, "m64")?),
                 Some(layer) => {
-                    let (transport, runtime) = experts.as_mut()
+                    let (transport, _) = experts.as_mut()
                         .with_context(|| format!("layer {index} is an MoE layer; pass Spark peers for its routed experts"))?;
-                    let ranks = self.moe_exchange(w, index, layer, tables.exchange_rows, "m64", true, transport,
-                        runtime)?;
-                    Previous::Planes(ranks)
+                    let waves = transport.exchange()?;
+                    self.moe_exchange(w, index, layer, tables.exchange_rows, "m64", true, waves)?;
+                    Previous::Planes(waves.ranks())
                 }
             };
             if let Some(probe) = self.draft_probe.borrow_mut().as_mut() {
@@ -1555,10 +1564,12 @@ impl<'a> GlmEngine<'a> {
     #[allow(clippy::too_many_arguments)]
     #[allow(clippy::too_many_arguments)]
     fn moe(&self, w: &Workspace<'_>, index: usize, layer: &GlmLayer<'_>, t: usize, cap: &str, decode: bool,
-        transport: &mut SparkLink<'_>, runtime: &tokio::runtime::Runtime) -> Result<()> {
+        transport: &mut SparkLink<'_>) -> Result<()> {
         self.moe_front(w, layer, t)?;
-        let ranks = self.moe_exchange(w, index, layer, t, cap, decode, transport, runtime)?;
-        self.reduce(transport.intake.pointers(), w, ranks, t)
+        let waves = transport.exchange()?;
+        let slot = self.moe_exchange(w, index, layer, t, cap, decode, waves)?;
+        self.reduce(waves.planes(slot), w, waves.ranks(), t)?;
+        waves.consumed(slot, self.stream)
     }
 
     /// Router scores, the sigmoid top-k selection and the wire rows (device only).
@@ -1585,19 +1596,35 @@ impl<'a> GlmEngine<'a> {
             ("scale_mma_ptr", w.delta.buffer.ptr)], &[rows, Scalar::I32(grid as i32)])
     }
 
-    /// Routes and wire rows down, the shared expert, the Spark exchange and
-    /// the rank planes' uploads; returns the rank count the reduce needs.
-    /// The next exchange's download sync completes the uploads before the
-    /// staging is rewritten.
+    /// Routes and wire rows to the link's exchange, the shared expert (and
+    /// the decode L2 prefetch) while the Sparks compute, then a device wait
+    /// for the wave's planes on the stream; returns the planes' slot. The
+    /// host never waits: the reduce that follows on the stream reads the
+    /// planes once the worker landed them, then marks them consumed.
     #[allow(clippy::too_many_arguments)]
     fn moe_exchange(&self, w: &Workspace<'_>, index: usize, layer: &GlmLayer<'_>, t: usize, cap: &str, decode: bool,
-        transport: &mut SparkLink<'_>, runtime: &tokio::runtime::Runtime) -> Result<usize> {
-        self.moe_stage(w, index, layer, t, cap)?;
+        transport: &mut crate::shared::spark_waves::Waves<'_>) -> Result<usize> {
+        ensure!(transport.ranks() <= MAX_RANKS, "{} Spark ranks exceed the reduction planes", transport.ranks());
+        let (h, topk, bf16) = (self.cfg.hidden, self.cfg.topk, self.spark_bf16);
+        let layout = crate::shared::experts::staging::RouteStaging::new(t, topk, if bf16 { h * 2 } else { h + h / 32 })?;
+        self.route_sample(w, index, t, cap)?;
+        let timer = std::time::Instant::now();
+        // SAFETY: ids, weights and wire rows hold this layer's `t` rows in
+        // stream order; the copies read them before later stream work.
+        let ticket = unsafe {
+            transport.send(t, layout, [w.route_ids.buffer, w.route_weights.buffer,
+                if bf16 { w.x.buffer } else { w.wire.buffer }], self.stream,
+                Box::new(move |routes, wire| expert_request_parts(routes, wire, index, t, h, topk, decode, bf16)))?
+        };
+        self.exchange_host.borrow_mut()[0] += timer.elapsed().as_secs_f64();
+        // The shared expert runs on the GPU while the worker posts and the Sparks compute.
+        self.shared_on(0, index, w, layer, Scalar::I32(t as i32), cap)?;
         if decode {
             self.prefetch(index)?;
         }
-        let wave = self.moe_send(w, index, t, decode, transport)?;
-        runtime.block_on(self.moe_land(t, transport, wave))
+        let slot = ticket.slot();
+        transport.land(ticket, self.stream)?;
+        Ok(slot)
     }
 
     /// [`Self::moe_exchange`] without the Spark request (benchmarks): the
@@ -1618,9 +1645,10 @@ impl<'a> GlmEngine<'a> {
     }
 
     /// Routes and wire rows down to this workspace's pinned staging (the host
-    /// waits for them), then the shared expert queued on the GPU; send the
-    /// request with [`Self::moe_send`].
-    fn moe_stage(&self, w: &Workspace<'_>, layer_index: usize, layer: &GlmLayer<'_>, t: usize, cap: &str) -> Result<()> {
+    /// waits for them), then the shared expert queued on the GPU. Only the
+    /// skip benchmark (a host-mode exchange's cost) and the EXLR8 wire
+    /// golden use it; serving goes through [`Self::moe_exchange`].
+    pub(super) fn moe_stage(&self, w: &Workspace<'_>, layer_index: usize, layer: &GlmLayer<'_>, t: usize, cap: &str) -> Result<()> {
         let (h, topk) = (self.cfg.hidden, self.cfg.topk);
         let layout = crate::shared::experts::staging::RouteStaging::new(t, topk,
             if self.spark_bf16 { h * 2 } else { h + h / 32 })?;
@@ -1672,7 +1700,7 @@ impl<'a> GlmEngine<'a> {
     /// shared expert queues behind them, and the worker builds and posts the
     /// request once the copies complete. This thread never waits for the GPU.
     fn moe_wave(&self, w: &Workspace<'_>, index: usize, layer: &GlmLayer<'_>, t: usize, cap: &str,
-        transport: &mut crate::shared::spark_waves::Waves<'_, '_>) -> Result<crate::shared::spark_waves::WaveTicket> {
+        transport: &mut crate::shared::spark_waves::Waves<'_>) -> Result<crate::shared::spark_waves::WaveTicket> {
         let (h, topk, bf16) = (self.cfg.hidden, self.cfg.topk, self.spark_bf16);
         let layout = crate::shared::experts::staging::RouteStaging::new(t, topk, if bf16 { h * 2 } else { h + h / 32 })?;
         self.route_sample(w, index, t, cap)?;
@@ -1726,37 +1754,6 @@ impl<'a> GlmEngine<'a> {
             step: None,
         });
         Ok(())
-    }
-
-    /// One request to every Spark rank from the staged routes and wire rows
-    /// ([`Self::moe_stage`]); complete it with [`Self::moe_land`].
-    fn moe_send(&self, w: &Workspace<'_>, index: usize, t: usize, decode: bool, transport: &mut SparkLink<'_>)
-        -> Result<SparkExpertWave> {
-        let timer = std::time::Instant::now();
-        let request = {
-            let staging = w.router_host.borrow();
-            if let Some(probe) = self.draft_probe.borrow_mut().as_mut().filter(|p| p.active()) {
-                probe.staged(index, &staging.bytes()[..t * self.cfg.topk * 4]);
-            }
-            expert_request(staging.bytes(), index, t, self.cfg.hidden, self.cfg.topk, decode, self.spark_bf16)?
-        };
-        self.exchange_host.borrow_mut()[2] += timer.elapsed().as_secs_f64();
-        let post = std::time::Instant::now();
-        let wave = transport.dispatch(&request)?;
-        self.exchange_host.borrow_mut()[3] += post.elapsed().as_secs_f64();
-        self.exchange_host.borrow_mut()[0] += timer.elapsed().as_secs_f64();
-        Ok(wave)
-    }
-
-    /// Receives `wave`'s BF16 rank partials into the transport's intake
-    /// planes; returns the rank count the reduce needs.
-    async fn moe_land(&self, t: usize, transport: &mut SparkLink<'_>, wave: SparkExpertWave) -> Result<usize> {
-        let ranks = transport.world_size();
-        ensure!(ranks <= MAX_RANKS, "{ranks} Spark ranks exceed the reduction planes");
-        let timer = std::time::Instant::now();
-        transport.receive(wave, t, self.stream).await?;
-        self.profile.borrow_mut()[1] += timer.elapsed().as_secs_f64();
-        Ok(ranks)
     }
 
     /// Pipelined Spark prefill of consecutive-row lanes of one sequence, each
@@ -1971,11 +1968,11 @@ impl<'a> GlmEngine<'a> {
         if let Some(pair) = &self.tp2 { pair.start_checks(self.force_route_check.get())?; }
         // Each wave's request build, post, polling and partial uploads run on
         // the link's transport worker while this thread queues GPU work.
-        let ran = link.with_waves(self.wave_staging_bytes()?, |transport| {
-            let mut hooks = UnitHooks { engine: self, workspaces: &workspaces, peers: &peers, layers, counts: &counts,
-                begin: &begin, attention: &attention, post: &post, transport, cap, waves };
-            crate::shared::prefill_pipeline::run_prefill_units(&mut hooks, &unit_list, waves)
-        });
+        let transport = link.exchange()?;
+        ensure!(transport.fits(self.wave_staging_bytes()?), "the prefill link's staging is narrower than its widest wave");
+        let mut hooks = UnitHooks { engine: self, workspaces: &workspaces, peers: &peers, layers, counts: &counts,
+            begin: &begin, attention: &attention, post: &post, transport, cap, waves };
+        let ran = crate::shared::prefill_pipeline::run_prefill_units(&mut hooks, &unit_list, waves);
         if let Some(pair) = &self.tp2 { ran.and(pair.finish_span())?; } else { ran?; }
         // The last unit's workspace holds the call's last rows.
         let last = lanes.len() - 1;
@@ -2352,7 +2349,7 @@ pub(crate) fn print_mla_check(layer: usize, stats: &[[f64; 3]; 5]) {
 /// GLM's per-unit hooks over the unchanged lane arithmetic. Unit `u` holds
 /// workspace slot `u % waves` (rank 0's and rank 1's) and that slot's
 /// exchange lane; its Spark waves go out on the prefill link, one return slot each.
-struct UnitHooks<'h, 'e, 'a, 'l, 'r, B, A, P> {
+struct UnitHooks<'h, 'e, 'a, 'l, B, A, P> {
     engine: &'h GlmEngine<'a>,
     workspaces: &'h [&'h Workspace<'e>],
     /// Rank 1's workspace per slot (borrowed once for the call).
@@ -2362,12 +2359,12 @@ struct UnitHooks<'h, 'e, 'a, 'l, 'r, B, A, P> {
     begin: &'h B,
     attention: &'h A,
     post: &'h P,
-    transport: &'h mut crate::shared::spark_waves::Waves<'l, 'r>,
+    transport: &'h mut crate::shared::spark_waves::Waves<'l>,
     cap: &'static str,
     waves: usize,
 }
 
-impl<B, A, P> crate::shared::prefill_pipeline::PrefillHooks for UnitHooks<'_, '_, '_, '_, '_, B, A, P>
+impl<B, A, P> crate::shared::prefill_pipeline::PrefillHooks for UnitHooks<'_, '_, '_, '_, B, A, P>
 where B: Fn(usize) -> Result<()>,
       A: Fn(usize, usize) -> Result<()>,
       P: Fn(usize, usize, Option<([*const u16; MAX_RANKS], usize)>) -> Result<()> {
@@ -2402,13 +2399,7 @@ where B: Fn(usize) -> Result<()>,
     fn land_experts(&mut self, layer: usize, unit: &crate::shared::prefill_pipeline::Unit,
         wave: crate::shared::spark_waves::WaveTicket) -> Result<()> {
         let slot = wave.slot();
-        let timer = std::time::Instant::now();
-        let times = self.transport.land(wave, self.engine.stream)?;
-        self.engine.profile.borrow_mut()[1] += timer.elapsed().as_secs_f64();
-        self.engine.exchange_host.borrow_mut()[0] += times.posted;
-        if let Some(probe) = self.engine.draft_probe.borrow_mut().as_mut().filter(|p| p.active()) {
-            probe.staged(layer, self.transport.staged_ids(slot)?);
-        }
+        self.transport.land(wave, self.engine.stream)?;
         // The reduce reads the return slot this wave just landed in; the slot
         // takes its next wave only after that reduce.
         (self.post)(layer, unit.index, Some((self.transport.planes(slot), self.transport.ranks())))?;

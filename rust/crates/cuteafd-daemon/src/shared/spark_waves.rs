@@ -57,8 +57,7 @@ use crate::shared::spark_intake::{copy_parallel, upload_offset, MAX_INTAKE_RANKS
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::{CuteafdDeviceBuffer, CuteafdHostBuffer, NativeLibrary};
 use cuteafd_transport::expert::{SparkExperts, SparkExpertWave, WaveReceipt};
-use cuteafd_transport::{ExpertProtocolV2Request, ExpertProtocolV2RouteEntry, StagingArena,
-    VerbsHostProtocolV2ResponsePayload};
+use cuteafd_transport::{ExpertProtocolV2Request, ExpertProtocolV2RouteEntry, StagingArena};
 use std::collections::VecDeque;
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicU32, Ordering};

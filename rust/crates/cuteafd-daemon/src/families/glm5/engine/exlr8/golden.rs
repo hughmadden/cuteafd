@@ -321,8 +321,9 @@ fn native_layer3_same_quant() -> Result<()> {
                     "m4096",
                     false,
                     transport,
-                    runtime,
                 )?;
+                // The exchange staged its own copy; stage the same rows here for the wire check.
+                engine.moe_stage(w, 3, &engine.weights.layers[3], rows, "m4096")?;
                 let staged = w.router_host.borrow();
                 let request = expert_request(
                     staged.bytes(),
