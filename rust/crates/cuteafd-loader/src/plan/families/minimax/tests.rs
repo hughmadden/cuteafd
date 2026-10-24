@@ -392,8 +392,7 @@ fn minimax_cache_proposals_keep_draft_and_never_admit_execution() {
     let baseline_pool = baseline.memory_layout.as_ref().unwrap().pool_tokens;
     for backing in [KvBacking::Gpu, KvBacking::Host, KvBacking::Spark] {
         for nvfp4 in [false, true] {
-            // FP8 GPU and host placements execute (minimax_host_kv_placement_...).
-            if backing != KvBacking::Spark && !nvfp4 { continue; }
+            if backing == KvBacking::Gpu && !nvfp4 { continue; }
             options.layout.as_mut().unwrap().minimax_cache = CachePlan { backing, nvfp4, ..Default::default() };
             let report = plan::plan(dir.path(), &options).unwrap();
             assert!(!report.placement_supported && !report.wip_launchable() && !report.executable());
@@ -426,60 +425,7 @@ fn minimax_cache_proposals_keep_draft_and_never_admit_execution() {
 }
 
 #[test]
-fn minimax_host_kv_placement_admits_serving_and_charges_exact_host_pages() {
-    use capacity::{CachePlan, KvBacking};
-    use cuteafd_core::memory_layout::{Basis, Category};
-    let dir = snapshot(false, true);
-    let mut options = native_5090_options(dir.path(), 4);
-    let layout = options.layout.as_mut().unwrap();
-    layout.minimax_5090 = true;
-    layout.host_embedding = true;
-    layout.host_memory = Some((251 << 30, 238 << 30));
-    let baseline = plan::plan(dir.path(), &options).unwrap();
-    let pool = |r: &crate::plan::PlanReport| r.memory_layout.as_ref().unwrap().pool_tokens;
-    let host = |hot_bytes, host_bytes| CachePlan { backing: KvBacking::Host, nvfp4: false, hot_bytes, host_bytes };
-    let (kv, index) = (60 * 2 * 32768u64, 60 * 8448u64);
-    options.layout.as_mut().unwrap().minimax_cache = host(None, 192 << 30);
-    let report = plan::plan(dir.path(), &options).unwrap();
-    assert!(report.placement_supported && report.wip_launchable(), "{:?}", report.hints);
-    // One sequence slot at the checkpoint's 1M context, every index page on the GPU and
-    // what they leave of it holding resident K/V in 2 MiB parts.
-    assert_eq!(pool(&report), 1 << 20);
-    assert!(pool(&report) > 4 * pool(&baseline));
-    let memory = report.memory_layout.as_ref().unwrap();
-    let gpu = memory.devices.iter().find(|d| d.kind == DeviceKind::Rtx).unwrap();
-    assert!(gpu.used_bytes() <= gpu.capacity_bytes);
-    let items: Vec<_> = gpu.items.iter().filter(|i| i.category == Category::Kv).collect();
-    assert_eq!(items.len(), 2);
-    assert!(items.iter().all(|i| i.basis == Basis::Exact));
-    assert_eq!(items[0].bytes, 16_384 * index);
-    let resident = items[1].bytes / kv;
-    assert!(resident >= 1024 && resident % 64 == 0 && items[1].bytes == resident * kv, "{resident}");
-    let pinned = report.bytes_by_owner["pinned host K/V pages"];
-    assert_eq!(pinned, (16_384 - resident).div_ceil(64) * 64 * kv);
-    let ledger = report.host_ledger.as_ref().unwrap();
-    assert!(ledger.items.iter().any(|i| i.group == "pinned host K/V pages" && i.bytes == pinned && i.basis == Basis::Exact));
-    assert!(memory.notes.iter().any(|n| n.starts_with("host K/V placement: 16384 pages")), "{:?}", memory.notes);
-    // Zero resident bytes put every K/V page on the host; the GPU keeps the index pages.
-    options.layout.as_mut().unwrap().minimax_cache = host(Some(0), 192 << 30);
-    let cold = plan::plan(dir.path(), &options).unwrap();
-    assert!(cold.wip_launchable(), "{:?}", cold.hints);
-    assert_eq!(cold.bytes_by_owner["pinned host K/V pages"], 16_384 * kv);
-    // An explicit pool beyond the host budget is refused by name.
-    options.layout.as_mut().unwrap().minimax_cache = host(Some(0), 1 << 30);
-    options.layout.as_mut().unwrap().pool_tokens = Some(1 << 20);
-    let refused = plan::plan(dir.path(), &options).unwrap();
-    assert!(!refused.placement_supported && refused.hints.iter().any(|h| h.what.contains("host K/V tier")), "{:?}", refused.hints);
-    // A RAM-starved host fails the host ledger rather than the GPU plan.
-    options.layout.as_mut().unwrap().pool_tokens = None;
-    options.layout.as_mut().unwrap().minimax_cache = host(None, 192 << 30);
-    options.layout.as_mut().unwrap().host_memory = Some((64 << 30, 32 << 30));
-    let starved = plan::plan(dir.path(), &options).unwrap();
-    assert!(!starved.fits && starved.hints.iter().any(|h| h.what.contains("host memory shortfall")), "{:?}", starved.hints);
-}
-
-#[test]
-fn minimax_paged_cache_obeys_explicit_pool_and_spark_budgets() {
+fn minimax_paged_cache_obeys_explicit_pool_host_and_spark_budgets() {
     use capacity::{CachePlan, KvBacking};
     let dir = snapshot(false, true);
     let mut options = native_5090_options(dir.path(), 3);
@@ -487,6 +433,21 @@ fn minimax_paged_cache_obeys_explicit_pool_and_spark_budgets() {
     layout.minimax_5090 = true;
     layout.host_embedding = true;
     layout.context_tokens = 4096;
+    layout.minimax_cache = CachePlan { backing: KvBacking::Host, host_bytes: 64 << 20, ..Default::default() };
+    let host = plan::plan(dir.path(), &options).unwrap();
+    let host_pool = host.memory_layout.as_ref().unwrap().pool_tokens;
+    assert!(host.memory_layout.as_ref().unwrap().notes.iter().any(|n| n.contains("per-sequence context cap 4096")));
+    assert_eq!(host_pool, (64u64 << 20) / 61_440 / 128 * 128);
+    assert_eq!(host.bytes_by_owner["proposed host KV backing"], host_pool * 61_440);
+    options.layout.as_mut().unwrap().pool_tokens = Some(128);
+    let explicit = plan::plan(dir.path(), &options).unwrap();
+    assert_eq!(explicit.memory_layout.unwrap().pool_tokens, 128);
+    options.layout.as_mut().unwrap().pool_tokens = Some(host_pool + 128);
+    let refused = plan::plan(dir.path(), &options).unwrap();
+    assert!(refused.hints.iter().any(|h| h.what.contains("GPU/backing budgets")), "{:?}", refused.hints);
+    let layout = options.layout.as_mut().unwrap();
+    layout.pool_tokens = None;
+    layout.minimax_cache = CachePlan::default();
     let baseline = plan::plan(dir.path(), &options).unwrap();
     let used = baseline.memory_layout.as_ref().unwrap().devices.iter().filter(|d| d.kind == DeviceKind::Spark)
         .map(|d| d.used_bytes()).max().unwrap();

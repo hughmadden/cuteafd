@@ -328,18 +328,6 @@ impl<E: CopyEngine, M: Clone + Default> PrefixCache<E, M> {
     pub fn pool(&self) -> &RefPagePool {
         &self.pool
     }
-
-    /// Make the device pool tiered ([`RefPagePool::tiered`]): ids below `resident` are the
-    /// device-resident tier. Only before the first admission, for a uniform pool without
-    /// reserved pages.
-    pub fn tier_pages(&mut self, resident: usize) -> Result<(), PrefixError> {
-        if self.layout.page_owners != PageOwners::Uniform || self.layout.mark_store.reserved() != 0
-            || self.pool.used() != 0 || resident > self.layout.pages {
-            return Err(PrefixError::Layout("a tiered pool needs an idle uniform pool without reserved pages"));
-        }
-        self.pool = RefPagePool::tiered(self.layout.pages, self.layout.page_rows, resident);
-        Ok(())
-    }
     pub fn arena(&self) -> &MarkArena {
         &self.arena
     }

@@ -160,10 +160,7 @@ impl<'e, 'a> Backend<'a> for MiniMaxBackend<'e, 'a> {
             CudaCopyEngine::registered(self.cache.library, &self.cache.buffers()).map(|copy| (config, copy))).transpose()?;
         let config = PrefixConfig { entries: args.prefix_cache_entries, mark_slots: 0,
             keep_logits: true, min_tokens: args.prefix_cache_min_tokens };
-        let mut cache = PrefixCache::new(layout, config, host)?;
-        // Host K/V placement: allocations prefer the device-resident pages.
-        if self.cache.resident < self.cache.pages { cache.tier_pages(self.cache.resident)?; }
-        Ok((family, cache))
+        Ok((family, PrefixCache::new(layout, config, host)?))
     }
     fn prepare(&self, job: NativeRequest, tokens: Vec<u32>) -> Result<(scheduler::Prompt, RequestMedia, Vec<EncodeJob>)> {
         super::media::prepare(job, tokens, self.expander.as_ref(), self.vocabulary, self.cache.context)

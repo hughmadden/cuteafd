@@ -65,9 +65,7 @@ fn options(args: &PlanArgs) -> Result<PlanOptions, PlanError> {
                 }).unwrap_or(cuteafd_loader::families::qwen4::Qwen4KvCache::Fp8),
                 minimax_cache: cuteafd_loader::plan::families::minimax::capacity::CachePlan {
                     nvfp4: args.kv_format == Some(crate::cli::PlanKvFormat::Nvfp4), backing: args.kv_placement,
-                    // Zero puts every K/V page in host memory.
-                    hot_bytes: args.kv_hot_cache_gib.map(|gib| if gib == 0.0 { Ok(0) }
-                        else { budget_bytes("--kv-hot-cache-gib", gib) }).transpose()?,
+                    hot_bytes: budget_bytes("--kv-hot-cache-gib", args.kv_hot_cache_gib)?,
                     host_bytes: budget_bytes("--kv-host-budget-gib", args.kv_host_budget_gib)?,
                 },
                 minimax_5090: args.minimax_profile == "rtx5090",
@@ -825,7 +823,7 @@ mod tests {
             coordinator_gpu_budget_gib: None,
             pool_tokens: None,
             kv_format: Default::default(),
-            kv_placement: Default::default(), kv_hot_cache_gib: None, kv_host_budget_gib: 192.0,
+            kv_placement: Default::default(), kv_hot_cache_gib: 1.0, kv_host_budget_gib: 192.0,
             minimax_profile: "default".into(),
             fp8_decode: false, mtp_fp8_head: true, attention_plan_rows: None,
             kda_fp8: crate::families::glm5_flash::fp8::KdaFp8::Row128,

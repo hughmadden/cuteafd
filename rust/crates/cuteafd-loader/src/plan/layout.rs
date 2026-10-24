@@ -1271,9 +1271,6 @@ pub(crate) fn charge_host(report: &mut PlanReport, options: &LayoutOptions, chec
     if let Some(&bytes) = report.bytes_by_owner.get("proposed host KV backing") {
         push(Category::Kv, "proposed pinned K/V backing (NOT IMPLEMENTED)", "payload", bytes, Basis::Estimated);
     }
-    if let Some(&bytes) = report.bytes_by_owner.get("pinned host K/V pages") {
-        push(Category::Kv, "pinned host K/V pages", "FP8 64-token pages", bytes, Basis::Exact);
-    }
     push(Category::Tables, "mapped-scales/preloaded", "checkpoint", report.mapped_placement.preloaded_bytes, Basis::Exact);
     let media_cache_loaded = (matches!(family, "mimo_v2" | "qwen4" | "glm5_flash")
         && report.vision != super::MediaMode::Off)

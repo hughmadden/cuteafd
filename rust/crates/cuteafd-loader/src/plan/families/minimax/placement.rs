@@ -41,8 +41,8 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
     opts: &crate::plan::layout::LayoutOptions, requested: ExpertPlacement) -> anyhow::Result<MemoryLayout> {
     let path = opts.workspace_manifest.as_deref().unwrap_or_else(|| std::path::Path::new("/opt/cuteafd/share/PROGRAMS.json"));
     if opts.workspace_manifest.is_none() && !path.is_file() {
-        anyhow::ensure!(!opts.minimax_cache.proposed() && opts.minimax_cache.tiering() == admission::Tiering::Gpu
-            && !opts.minimax_5090, "MiniMax cache placements and the 5090 profile require --workspace-manifest");
+        anyhow::ensure!(!opts.minimax_cache.proposed() && !opts.minimax_5090,
+            "MiniMax cache proposals and 5090 profile require --workspace-manifest");
         return Ok(header_layout(model, report, opts, requested));
     }
     let mut base = opts.clone();
@@ -324,8 +324,7 @@ fn exact_layout(model: &Model, input: &crate::plan::PlanInput, report: &mut Plan
     // native workspace and prepared destination during sequential weight load.
     reservations.startup = reservations.fixed_bytes(&ledger)?.checked_add(admission::scale_prep_staging_bytes(&weights))
         .context("MiniMax load peak overflow")?;
-    let admitted = admission::admit(cfg, sizing, &ledger, reservations, opts.rtx_bytes[0], opts.pool_tokens,
-        opts.minimax_kv, opts.minimax_cache.tiering())?;
+    let admitted = admission::admit(cfg, sizing, &ledger, reservations, opts.rtx_bytes[0], opts.pool_tokens, opts.minimax_kv)?;
     let mut items = vec![
         Item::new(Category::Weights, "native MXFP8 text, BF16 embedding/head, FP32 router", "checkpoint", weights.resident_bytes, Basis::Exact),
         Item::new(Category::Runtime, "CUDA context", "sm_120", arch.context_bytes, Basis::Calibrated),
@@ -349,15 +348,7 @@ fn exact_layout(model: &Model, input: &crate::plan::PlanInput, report: &mut Plan
         items.push(Item::new(Category::Workspace, "vision scratch", "4096 merged tokens", encoder.scratch, Basis::Formula));
     };
     if reservations.media > 0 { add_vision(&mut items); }
-    if admitted.tiered() {
-        let index = admitted.pool_pages * (admitted.cache.ranks[0].page_bytes
-            - 2 * cfg.layers as u64 * admitted.cache.ranks[0].kv_page_bytes);
-        items.push(Item::new(Category::Kv, "packed MSA index pages (whole pool)", "64-token pages", index, Basis::Exact));
-        items.push(Item::new(Category::Kv, format!("resident FP8 K/V pages ({} of {})", admitted.resident_pages,
-            admitted.pool_pages), "64-token pages", admitted.cache_bytes - index, Basis::Exact));
-    } else {
-        items.push(Item::new(Category::Kv, "separate FP8 K/V planes + packed MSA index", "64-token pages", admitted.cache_bytes, Basis::Exact));
-    }
+    items.push(Item::new(Category::Kv, "separate FP8 K/V planes + packed MSA index", "64-token pages", admitted.cache_bytes, Basis::Exact));
     let mut memory = MemoryLayout { devices: vec![DeviceLayout { kind: DeviceKind::Rtx, index: 0,
         capacity_bytes: opts.rtx_bytes[0], items, kv_tokens: admitted.pool_tokens }], pool_tokens: admitted.pool_tokens,
         waste: vec![], notes: vec![format!("MiniMax coordinator native allocation ledger; causal paged MSA tiles; zero graphs; speculation {}",
@@ -366,17 +357,6 @@ fn exact_layout(model: &Model, input: &crate::plan::PlanInput, report: &mut Plan
             format!("{onboard} routed layers on the RTX ({:.1} GiB), {} on {} Sparks", local as f64 / GIB as f64, layers.len() - onboard, sizing.spark_ranks)] };
     report.bytes_by_owner.clear();
     report.bytes_by_owner.insert("coordinator text weights".into(), weights.resident_bytes);
-    if admitted.tiered() {
-        report.bytes_by_owner.insert("pinned host K/V pages".into(), admitted.host_bytes);
-        let gib = |b: u64| b as f64 / GIB as f64;
-        memory.notes.push(format!("host K/V placement: {} pages ({} tokens), K/V of {} resident on the GPU ({:.2} GiB) \
-            and {} in pinned host memory ({:.2} GiB) read over PCIe; index pages of every page on the GPU ({:.2} GiB, {} B/token)",
-            admitted.pool_pages, admitted.pool_tokens, admitted.resident_pages,
-            gib(admitted.resident_pages * 2 * cfg.layers as u64 * admitted.cache.ranks[0].kv_page_bytes),
-            admitted.pool_pages - admitted.resident_pages, gib(admitted.host_bytes),
-            gib(admitted.pool_pages * (admitted.cache.ranks[0].page_bytes - 2 * cfg.layers as u64 * admitted.cache.ranks[0].kv_page_bytes)),
-            admitted.cache.ranks[0].index_page_bytes * cfg.layers as u64 / 64));
-    }
     if let Some(draft) = &draft { report.bytes_by_owner.insert("bundled DSpark weights".into(), draft.weights_bytes); }
     report.bytes_by_owner.insert("local routed expert weights".into(), local);
     let recipe = crate::plan::experts::checkpoint_spark_recipe(input.checkpoint(), sizing.spark_ranks, &layers[onboard..])?;

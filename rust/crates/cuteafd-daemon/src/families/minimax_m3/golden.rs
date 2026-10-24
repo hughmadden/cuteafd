@@ -492,8 +492,7 @@ pub(crate) async fn run_golden(args: GoldenArgs) -> Result<()> {
     let available = cuteafd_ffi::coordinator_gpu_budget().map_or(free as u64,
         |b| (free as u64).min(b.0.saturating_sub((total - free) as u64)));
     let pool_tokens = if args.check_prefix {(context as u64).max(128) * 3 + 256} else {context as u64};
-    let admitted = admission::admit(&cfg, sizing, &ledger, reservations, available, Some(pool_tokens), Qwen4KvCache::Fp8,
-        admission::Tiering::Gpu)?;
+    let admitted = admission::admit(&cfg, sizing, &ledger, reservations, available, Some(pool_tokens), Qwen4KvCache::Fp8)?;
     let endpoint = SparkEndpoint {capacity:args.prefill_rows, ingress:SparkIngress::Bf16};
     let config = TcpTransportConfig::default();
     let pending = if args.peers.is_empty() {None} else {
@@ -524,9 +523,8 @@ pub(crate) async fn run_golden(args: GoldenArgs) -> Result<()> {
             Ok((execution, local))
         })
     })?;
-    let cache = Cache::new(&library, args.device, &admitted.cache, admitted.pool_pages as usize,
-        admitted.resident_pages as usize, 1, super::cache::CacheBudget {
-            gpu: admitted.cache_bytes.checked_add(256).context("cache admission overflow")?, host: admitted.host_bytes })?;
+    let cache = Cache::new(&library, args.device, &admitted.cache, admitted.pool_pages as usize, 1,
+        admitted.cache_bytes.checked_add(256).context("cache admission overflow")?)?;
     let spark = if let Some(&first) = remote.first() {
         cuteafd_transport::worker_selection::require_peer_clients(&args.peers, endpoint, 1)?;
         Some(super::routed::Spark::connect(&library, args.device, SparkWorld::canonical(args.peers.len())?, &args.peers,

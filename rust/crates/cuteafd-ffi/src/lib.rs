@@ -448,13 +448,9 @@ pub const CUTEAFD_STATUS_OK: CuteafdStatus = 0;
 pub const CUTEAFD_STATUS_CUDA_UNAVAILABLE: CuteafdStatus = 3;
 pub const CUTEAFD_STATUS_RDMA_UNAVAILABLE: CuteafdStatus = 7;
 pub const CUTEAFD_STATUS_NCCL_UNAVAILABLE: CuteafdStatus = 8;
-pub const CUTEAFD_STATUS_UNSUPPORTED: CuteafdStatus = 9;
 pub const CUTEAFD_DEVICE_BUFFER_FLAG_HOST_FALLBACK: u64 = 1;
 pub const CUTEAFD_DEVICE_BUFFER_FLAG_MANAGED: u64 = 2;
 pub const CUTEAFD_DEVICE_BUFFER_FLAG_MAPPED_HOST: u64 = 4;
-/// A range of tiered planes ([`NativeLibrary::tiered_planes`]): device pages,
-/// then pinned host pages, then an alias shared by every range.
-pub const CUTEAFD_DEVICE_BUFFER_FLAG_TIERED: u64 = 8;
 pub const CUTEAFD_HOST_BUFFER_FLAG_NONE: u64 = 0;
 pub const CUTEAFD_HOST_BUFFER_FLAG_PINNED: u64 = 1;
 pub const CUTEAFD_HOST_BUFFER_FLAG_HOST_FALLBACK: u64 = 2;
@@ -656,35 +652,6 @@ pub struct CuteafdRouteShardReductionBuffers {
     pub peers: [CuteafdDeviceBuffer; 3],
     pub output_f32: CuteafdDeviceBuffer,
 }
-
-/// Tiered planes on one device ([`NativeLibrary::tiered_planes`]): every range is
-/// `device_bytes` of device memory, then `host_bytes` of pinned host memory on the
-/// device's NUMA node, then `shared_bytes` mapping one device allocation common to
-/// all ranges. Device-accessible only; freed by [`NativeLibrary::free_tiered_planes`].
-#[derive(Debug)]
-pub struct CuteafdTieredPlanes {
-    handle: *mut c_void,
-    pub bases: Vec<*mut c_void>,
-    pub device_bytes: usize,
-    pub host_bytes: usize,
-    pub shared_bytes: usize,
-    pub device_id: c_int,
-}
-
-impl CuteafdTieredPlanes {
-    /// Bytes of one range.
-    pub fn bytes(&self) -> usize { self.device_bytes + self.host_bytes + self.shared_bytes }
-    /// Range `index` as one device buffer.
-    pub fn plane(&self, index: usize) -> Option<CuteafdDeviceBuffer> {
-        self.bases.get(index).map(|&ptr| CuteafdDeviceBuffer { ptr, bytes: self.bytes(),
-            device_id: self.device_id, flags: CUTEAFD_DEVICE_BUFFER_FLAG_TIERED })
-    }
-}
-
-/// Tiered planes need CUDA virtual memory management and host-NUMA allocations.
-#[derive(Debug, thiserror::Error)]
-#[error("tiered device/host planes are unsupported here: {0}")]
-pub struct TieredPlanesUnsupported(pub String);
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
@@ -2315,69 +2282,6 @@ impl NativeLibrary {
         memory_ledger::record_free(buffer.ptr as usize);
         let status = unsafe { free_fn(buffer) };
         self.status_to_result("cuteafd_free_device_buffer", status)
-    }
-
-    /// Allocation granularity of tiered plane parts on the current device.
-    pub fn tiered_granularity(&self) -> Result<usize> {
-        let call: Symbol<unsafe extern "C" fn(*mut usize) -> CuteafdStatus> =
-            unsafe { self.lib.get(b"cuteafd_tiered_granularity")? };
-        let mut bytes = 0usize;
-        // SAFETY: the symbol follows the bundled C ABI and writes one size.
-        let status = unsafe { call(&mut bytes) };
-        if status == CUTEAFD_STATUS_UNSUPPORTED {
-            return Err(TieredPlanesUnsupported(self.last_error().unwrap_or_default()).into());
-        }
-        self.status_to_result("cuteafd_tiered_granularity", status)?;
-        Ok(bytes)
-    }
-
-    /// `count` tiered ranges on the current device (see [`CuteafdTieredPlanes`]).
-    /// The device parts and the shared alias are admitted against the logical GPU
-    /// budget; the host parts are pinned host memory.
-    pub fn tiered_planes(&self, count: usize, device_bytes: usize, host_bytes: usize,
-        shared_bytes: usize) -> Result<CuteafdTieredPlanes> {
-        let device_total = count.checked_mul(device_bytes).and_then(|n| n.checked_add(shared_bytes))
-            .context("tiered plane device bytes overflow")?;
-        let _budget_guard = if device_total > 0 { self.admit_gpu_allocation(device_total)? } else { None };
-        let call: Symbol<unsafe extern "C" fn(usize, usize, usize, usize, *mut *mut c_void, *mut *mut c_void)
-            -> CuteafdStatus> = unsafe { self.lib.get(b"cuteafd_tiered_planes_create")? };
-        let mut bases = vec![std::ptr::null_mut(); count];
-        let mut handle = std::ptr::null_mut();
-        // SAFETY: `bases` holds `count` writable slots; the call writes at most that many.
-        let status = unsafe { call(count, device_bytes, host_bytes, shared_bytes, bases.as_mut_ptr(), &mut handle) };
-        if status == CUTEAFD_STATUS_UNSUPPORTED {
-            return Err(TieredPlanesUnsupported(self.last_error().unwrap_or_default()).into());
-        }
-        self.status_to_result("cuteafd_tiered_planes_create", status)?;
-        let device_id = self.cuda_get_device()?;
-        for (index, &base) in bases.iter().enumerate() {
-            let base = base as usize;
-            memory_ledger::record_alloc(memory_ledger::Space::Device, device_id, base, device_bytes);
-            memory_ledger::record_alloc(memory_ledger::Space::Pinned, -1, base + device_bytes, host_bytes);
-            if index == 0 {
-                memory_ledger::record_alloc(memory_ledger::Space::Device, device_id,
-                    base + device_bytes + host_bytes, shared_bytes);
-            }
-        }
-        Ok(CuteafdTieredPlanes { handle, bases, device_bytes, host_bytes, shared_bytes, device_id })
-    }
-
-    /// Release every range of `planes`; the caller has drained every reader and writer.
-    pub fn free_tiered_planes(&self, planes: &mut CuteafdTieredPlanes) -> Result<()> {
-        if planes.handle.is_null() { return Ok(()); }
-        let call: Symbol<unsafe extern "C" fn(*mut c_void) -> CuteafdStatus> =
-            unsafe { self.lib.get(b"cuteafd_tiered_planes_destroy")? };
-        for (index, &base) in planes.bases.iter().enumerate() {
-            let base = base as usize;
-            memory_ledger::record_free(base);
-            memory_ledger::record_free(base + planes.device_bytes);
-            if index == 0 { memory_ledger::record_free(base + planes.device_bytes + planes.host_bytes); }
-        }
-        // SAFETY: the handle came from cuteafd_tiered_planes_create and is cleared below.
-        let status = unsafe { call(planes.handle) };
-        planes.handle = std::ptr::null_mut();
-        planes.bases.clear();
-        self.status_to_result("cuteafd_tiered_planes_destroy", status)
     }
 
     pub fn cuda_stream_create(&self) -> Result<*mut c_void> {

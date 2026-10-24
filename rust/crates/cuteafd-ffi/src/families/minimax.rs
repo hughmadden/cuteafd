@@ -1,7 +1,7 @@
 //! Retained device operands for the MiniMax coordinator ABI.
 mod dspark;
 
-use crate::{CuteafdDeviceBuffer, CuteafdTieredPlanes, NativeLibrary, programs::{Program, ProgramSpec, Programs, Scalar, VocabularyHead}};
+use crate::{CuteafdDeviceBuffer, NativeLibrary, programs::{Program, ProgramSpec, Programs, Scalar, VocabularyHead}};
 use anyhow::{ensure, Context, Result};
 use std::{cell::RefCell, collections::BTreeMap, ffi::c_void, path::Path, rc::Rc};
 
@@ -27,26 +27,13 @@ fn on_device<T>(library: &NativeLibrary, device: i32, f: impl FnOnce() -> Result
     result.and_then(|value|{restored?;Ok(value)})
 }
 
-/// A device allocation, or one range of a tiered plane set (freed with the set).
-struct Storage<'a> { library: &'a NativeLibrary, buffer: CuteafdDeviceBuffer, planes: Option<Rc<PlaneSet<'a>>> }
+struct Storage<'a> { library: &'a NativeLibrary, buffer: CuteafdDeviceBuffer }
 impl Drop for Storage<'_> {
     fn drop(&mut self) {
-        if self.planes.is_some() || self.library.is_quarantined_after_failed_drain() { return; }
+        if self.library.is_quarantined_after_failed_drain() { return; }
         if let Err(error) = on_device(self.library, self.buffer.device_id,
             || self.library.free_device_buffer(&mut self.buffer)) {
             tracing::error!(%error, "releasing MiniMax device storage");
-        }
-    }
-}
-
-/// Every range of one tiered allocation; released after the last view of any range.
-struct PlaneSet<'a> { library: &'a NativeLibrary, planes: CuteafdTieredPlanes }
-impl Drop for PlaneSet<'_> {
-    fn drop(&mut self) {
-        if self.library.is_quarantined_after_failed_drain() { return; }
-        let (library, device) = (self.library, self.planes.device_id);
-        if let Err(error) = on_device(library, device, || library.free_tiered_planes(&mut self.planes)) {
-            tracing::error!(%error, "releasing MiniMax tiered planes");
         }
     }
 }
@@ -57,21 +44,7 @@ impl<'a> Buffer<'a> {
     pub fn new(library: &'a NativeLibrary, device: i32, bytes: usize) -> Result<Self> {
         ensure!(bytes > 0, MiniMaxNativeError::Operand("empty allocation"));
         let buffer = on_device(library, device, || library.alloc_device_buffer(bytes))?;
-        Ok(Self { storage: Rc::new(Storage { library, buffer, planes: None }), view: buffer })
-    }
-    /// One buffer per range of a new tiered plane set ([`CuteafdTieredPlanes`]):
-    /// `device_bytes` of device memory, `host_bytes` of pinned host memory, then
-    /// `shared_bytes` that every range aliases. Kernels address a range like any
-    /// device buffer.
-    pub fn tiered(library: &'a NativeLibrary, device: i32, count: usize, device_bytes: usize,
-        host_bytes: usize, shared_bytes: usize) -> Result<Vec<Self>> {
-        ensure!(count > 0 && device_bytes + host_bytes + shared_bytes > 0, MiniMaxNativeError::Operand("empty tiered planes"));
-        let planes = on_device(library, device, || library.tiered_planes(count, device_bytes, host_bytes, shared_bytes))?;
-        let views = (0..count).map(|i| planes.plane(i)).collect::<Option<Vec<_>>>()
-            .ok_or(MiniMaxNativeError::Operand("tiered plane count"))?;
-        let set = Rc::new(PlaneSet { library, planes });
-        Ok(views.into_iter().map(|buffer| Self { storage: Rc::new(Storage { library, buffer,
-            planes: Some(set.clone()) }), view: buffer }).collect())
+        Ok(Self { storage: Rc::new(Storage { library, buffer }), view: buffer })
     }
     pub fn raw(&self) -> CuteafdDeviceBuffer { self.view }
     pub fn view(&self, offset: usize, bytes: usize) -> Result<Self> {

@@ -1,5 +1,5 @@
 //! Single coordinator startup: validate, admit, load, bind, schedule.
-use super::{admission::{self, HostTier, RuntimeSizing, Tiering}, backend::MiniMaxBackend, cache::{Cache, CacheBudget},
+use super::{admission::{self, RuntimeSizing}, backend::MiniMaxBackend, cache::Cache,
     execution::Execution, media::{ReadyVision, RemoteVision}, routed::Routed, MiniMaxError};
 use crate::shared::{memory::device::Device, placement::{SparkAdmission, spark_rings},
     prefix::PrefixArgs, qwen::{Encoder, scheduler::{self, Backend}},
@@ -7,7 +7,7 @@ use crate::shared::{memory::device::Device, placement::{SparkAdmission, spark_ri
 use anyhow::{Context, Result};
 use cuteafd_core::{ExpertGeometry, SparkEndpoint, SparkIngress};
 use cuteafd_loader::{families::{minimax_m3::config::MiniMaxM3Config, qwen4::Qwen4KvCache},
-    plan::{checkpoint::Checkpoint, families::minimax::capacity::KvBacking, MediaMode}, placement::SparkWorkingSet};
+    plan::{checkpoint::Checkpoint, MediaMode}, placement::SparkWorkingSet};
 use cuteafd_transport::{expert::SparkWorld, worker_selection::ModelAdmission, TcpTransportConfig};
 use std::{cell::RefCell, net::SocketAddr, path::PathBuf, sync::{Arc, Mutex}};
 
@@ -31,18 +31,6 @@ pub(crate) struct ServeArgs {
     pool_tokens: Option<u64>,
     #[arg(long, default_value = "fp8")]
     kv_cache: Qwen4KvCache,
-    /// K/V placement: gpu, or host (K/V pages beyond the resident tier in pinned
-    /// host memory that attention reads over PCIe; index pages stay on the GPU).
-    #[arg(long, default_value = "gpu")]
-    kv_placement: KvBacking,
-    /// GPU-resident K/V GiB with host placement. Default: what the pool's index
-    /// pages leave, at least 1 GiB for an automatic pool; 0: every K/V page on the host.
-    #[arg(long)]
-    kv_hot_cache_gib: Option<f64>,
-    /// Pinned host K/V GiB with host placement, capped by available host RAM less
-    /// the host reserve (--host-cache-headroom-bytes, at least 10% of RAM).
-    #[arg(long, default_value_t = 192.0)]
-    kv_host_budget_gib: f64,
     #[arg(long, default_value_t = 0)]
     max_context: u64,
     #[arg(long, alias = "prefill-batch-tokens", default_value_t = 4096, value_parser = clap::value_parser!(u32).range(1..=4096))]
@@ -97,11 +85,6 @@ impl ServeArgs {
             return Err(MiniMaxError::Invalid("one coordinator and distinct TP2/TP3/TP4 peers required").into());
         }
         if self.kv_cache != Qwen4KvCache::Fp8 { return Err(MiniMaxError::Unsupported("BF16 KV has no exported MiniMax kernel").into()); }
-        if self.kv_placement == KvBacking::Spark { return Err(MiniMaxError::Unsupported("Spark K/V backing has no executor").into()); }
-        if self.kv_hot_cache_gib.is_some_and(|g| !(g.is_finite() && g >= 0.0))
-            || !(self.kv_host_budget_gib.is_finite() && self.kv_host_budget_gib > 0.0) {
-            return Err(MiniMaxError::Invalid("K/V resident or host GiB").into());
-        }
         if !matches!(self.speculator.as_str(),"off"|"dspark") { return Err(MiniMaxError::Unsupported("speculator must be dspark or off").into()); }
         if self.speculator=="dspark" && self.prefill_rows<7 {return Err(MiniMaxError::Invalid("DSpark needs at least seven scratch rows").into());}
         if matches!(std::env::var("CUTEAFD_SPARK_WRITE").as_deref(), Ok("1" | "on")) {
@@ -123,18 +106,6 @@ impl ServeArgs {
         let count = self.rtx_expert_layers.parse::<usize>().map_err(|_| MiniMaxError::Invalid("RTX expert layers: use auto or N"))?;
         if count > 57 { return Err(MiniMaxError::Invalid("RTX expert layers exceed routed layer count").into()); }
         Ok(Some(count))
-    }
-
-    /// The K/V placement admission charges: host placement pins at most the
-    /// host budget, and never more than available RAM less the host reserve.
-    fn tiering(&self) -> Result<Tiering> {
-        if self.kv_placement != KvBacking::Host { return Ok(Tiering::Gpu); }
-        let memory = crate::shared::prefix::budget::host_memory()?;
-        let reserve = self.prefix.host_cache_headroom_bytes.max(memory.total / 10);
-        let gib = |g: f64| (g * (1u64 << 30) as f64) as u64;
-        let host_bytes = gib(self.kv_host_budget_gib).min(memory.available.saturating_sub(reserve));
-        tracing::info!(host_bytes, available = memory.available, reserve, "MiniMax host K/V budget");
-        Ok(Tiering::Host(HostTier { resident_bytes: self.kv_hot_cache_gib.map(gib), host_bytes }))
     }
 }
 
@@ -187,22 +158,15 @@ fn worker(args: &ServeArgs, receive: &mut tokio::sync::mpsc::Receiver<cuteafd_ap
             (free as u64).min(b.0.saturating_sub((total - free) as u64))))
     };
     let remote = RemoteVision::parse(args.vision_peers.as_deref(), args.encoder_plan_hash.as_deref(), args.encoder_revision.as_deref())?;
-    let tiering = args.tiering()?;
     let (vision_mode, text_admission) = if args.vision == MediaMode::Auto && remote.is_none() {
         let free = available()?;
         let text = admission::solve(&checkpoint, &manifest, local_package.as_ref(), admission::Request {
             sizing, available: free, requested_pool: None, kv_format: args.kv_cache, onboard,
             spark_budget: args.spark_budget_bytes, headroom, draft_bytes,
-            host_embedding: args.token_io.embed_placement == EmbedPlacement::Host, tiering })?;
+            host_embedding: args.token_io.embed_placement == EmbedPlacement::Host })?;
         let vision_bytes = ReadyVision::local_bytes(&args.snapshot, &args.native_lib)?;
-        // Host placement keeps only the target's index pages and the resident floor on the GPU.
-        let (target_token_bytes, floor) = match tiering {
-            Tiering::Gpu => (text.cache.cache.token_bytes(0), 0),
-            Tiering::Host(_) => (text.cache.cache.token_bytes(0) - 2 * cfg.layers as u64
-                * text.cache.cache.ranks[0].kv_page_bytes / 64, cuteafd_loader::plan::families::minimax::admission::HOT_FLOOR_BYTES),
-        };
         let cache_target = args.pool_tokens.filter(|n| *n > 0).unwrap_or(262_144)
-            .checked_mul(target_token_bytes).and_then(|n| n.checked_add(floor)).context("MiniMax vision cache target overflow")?;
+            .checked_mul(text.cache.cache.token_bytes(0)).context("MiniMax vision cache target overflow")?;
         let mode = super::media::local_auto_mode(free, text.cache.fixed_bytes, vision_bytes, cache_target)?;
         tracing::info!(?mode, vision_bytes, cache_target, "MiniMax automatic vision placement preserves text admission");
         (mode, Some(text))
@@ -218,7 +182,7 @@ fn worker(args: &ServeArgs, receive: &mut tokio::sync::mpsc::Receiver<cuteafd_ap
         admission::solve(&checkpoint, &manifest, local_package.as_ref(), admission::Request {
             sizing, available, requested_pool: args.pool_tokens, kv_format: args.kv_cache, onboard,
             spark_budget: args.spark_budget_bytes.saturating_sub(remote_reserve), headroom, draft_bytes,
-            host_embedding: args.token_io.embed_placement == EmbedPlacement::Host, tiering })?
+            host_embedding: args.token_io.embed_placement == EmbedPlacement::Host })?
     };
     let mut catalog = cuteafd_loader::read_expert_catalog(&args.snapshot)?;
     catalog.select_draft(cuteafd_loader::plan::spec::DraftOwnership::None)?;
@@ -249,8 +213,7 @@ fn worker(args: &ServeArgs, receive: &mut tokio::sync::mpsc::Receiver<cuteafd_ap
         })
     })?;
     let mut cache = Cache::new(&library, args.device, &admitted.cache.cache, admitted.cache.pool_pages as usize,
-        admitted.cache.resident_pages as usize, sizing.sequences,
-        CacheBudget { gpu: cache_bytes, host: admitted.cache.host_bytes })?;
+        sizing.sequences, cache_bytes)?;
     cache.context = cache.context.min(admitted.cache.pool_tokens as usize);
     cuteafd_transport::worker_selection::require_peer_clients(&args.peers, endpoint, 1)?;
     let world = SparkWorld::canonical(args.peers.len())?;
@@ -264,9 +227,7 @@ fn worker(args: &ServeArgs, receive: &mut tokio::sync::mpsc::Receiver<cuteafd_ap
         trace: RefCell::new(super::diagnostics::LogitTrace::from_env()?) };
     let (encoder, preparer, media_bytes) = vision.map_or((Encoder::Off, None, 0), |v| (v.encoder, Some(v.preparer), v.cache_bytes));
     let mut media = cuteafd_engine::media::MediaAdmission::new(cuteafd_engine::media::EmbeddingCache::new(media_bytes), encoder, 16);
-    tracing::info!(pool_tokens=admitted.cache.pool_tokens, resident_pages=admitted.cache.resident_pages,
-        host_kv_bytes=admitted.cache.host_bytes, gpu_cache_bytes=admitted.cache.cache_bytes,
-        context=cache.context, local_layers=?admitted.local_layers,
+    tracing::info!(pool_tokens=admitted.cache.pool_tokens, context=cache.context, local_layers=?admitted.local_layers,
         rows=sizing.rows, logit_rows=sizing.logit_rows, draft_rings,
         "MiniMax native eager target; prefill uses the MSA index-prefill and attention-extend kernels");
     let drafts=if args.speculator=="dspark" {scheduler::Drafts::Neural {depth:7,fixed:false}} else {scheduler::Drafts::None};
@@ -338,11 +299,5 @@ mod tests {
         let mut a=args(); a.token_io.embed_placement=EmbedPlacement::Host; assert!(a.validate().is_ok());
         let mut a=args(); a.rtx_expert_layers="58".into(); assert!(a.validate().is_err());
         let mut a=args(); a.rtx_expert_layers="3".into(); assert_eq!(a.validate().unwrap(),Some(3));
-        assert_eq!(args().kv_placement, KvBacking::Gpu);
-        assert_eq!(args().tiering().unwrap(), Tiering::Gpu);
-        let mut a=args(); a.kv_placement=KvBacking::Host; a.kv_hot_cache_gib=Some(0.0); assert!(a.validate().is_ok());
-        let mut a=args(); a.kv_placement=KvBacking::Spark; assert!(a.validate().is_err());
-        let mut a=args(); a.kv_hot_cache_gib=Some(-1.0); assert!(a.validate().is_err());
-        let mut a=args(); a.kv_host_budget_gib=0.0; assert!(a.validate().is_err());
     }
 }
