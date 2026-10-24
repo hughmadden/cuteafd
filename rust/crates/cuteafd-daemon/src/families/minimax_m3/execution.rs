@@ -1,8 +1,9 @@
 //! One device, one append-only paged MSA pipeline, native checkpoint arithmetic.
 use super::{MiniMaxError, diagnostics::{Diagnostics, StepDump}, ffn, head::TargetHeadOwner, scratch::Scratch, weights::Weights};
-use crate::shared::{memory::device::Device, token_io::DeviceLogits};
+use crate::shared::{decode_graph::{census, GraphBank, GraphDecision, GraphOwner, GraphPolicy},
+    memory::device::Device, token_io::DeviceLogits};
 use anyhow::{ensure, Context, Result};
-use cuteafd_ffi::{minimax::{Buffer, Commands, Graph}, programs::{Programs,Scalar}};
+use cuteafd_ffi::{minimax::{Buffer, Commands, Retention}, programs::{Programs,Scalar}};
 use cuteafd_transport::ExpertV2SourceKind;
 use cuteafd_loader::{families::minimax_m3::config::MiniMaxM3Config,
     plan::{checkpoint::Checkpoint,families::minimax::admission::RuntimeLedger}};
@@ -86,50 +87,25 @@ fn decode_tables(batch:&BatchView,stride:usize)->Result<(Vec<i32>,Vec<i32>,Vec<i
     Ok((tables,lengths,(0..=rows as i32).collect()))
 }
 
-/// How decode steps run (`CUTEAFD_MINIMAX_GRAPHS`): `on` (default) replays one
-/// graph per decode row count, recorded right after that row count's first
-/// eager step; `off` keeps every step eager; `verify` also re-executes every
-/// replayed step eagerly and compares the two steps' logits bit for bit.
+/// Census bank of a recorded whole decode step: `CUTEAFD_GRAPH_EAGER=minimax_step`
+/// runs every step eagerly while the recordings stay admitted (an A/B arm).
+const STEP_BANK: &std::ffi::CStr = c"minimax_step";
+
+/// What the startup recordings were made against (the keys are row counts
+/// only): the step input, cache, expert owner, pool and decode table stride.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum GraphMode { Off, On, Verify }
-impl GraphMode {
-    fn from_env() -> Result<Self> {
-        match std::env::var("CUTEAFD_MINIMAX_GRAPHS").as_deref() {
-            Err(_) | Ok("on") => Ok(Self::On),
-            Ok("off") => Ok(Self::Off),
-            Ok("verify") => Ok(Self::Verify),
-            Ok(_) => Err(MiniMaxError::Invalid("CUTEAFD_MINIMAX_GRAPHS is on, off or verify").into()),
-        }
-    }
-}
+struct Binding { embedded:usize, cache:usize, experts:usize, pool_pages:usize, stride:usize }
 
-/// What a recorded decode step bakes in: its extents and the identities of
-/// the input, cache and expert owner it was recorded with.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-struct GraphKey { rows:usize, stride:usize, pool_pages:usize, embedded:usize, cache:usize, experts:usize }
-
-/// Recorded decode steps (one per row count in serving). Declared after
-/// `Execution::commands`, whose drop drains the stream before these go.
-struct DecodeGraphs<'a> {
-    mode: GraphMode,
-    bank: std::collections::BTreeMap<GraphKey, std::rc::Rc<Graph<'a>>>,
-    /// Keys whose recording failed, or found the budget spent, run eagerly from then on.
-    refused: std::collections::BTreeSet<GraphKey>,
+/// Whole decode steps recorded at startup, one per admitted row count
+/// ([`Execution::warm_graphs`]); each owner keeps what its launches retained.
+/// Declared after `Execution::commands`, whose drop drains the stream first.
+struct StepGraphs<'a> {
+    bank: GraphBank<usize, GraphOwner<'a, Retention<'a>>>,
+    binding: Option<Binding>,
+    /// `CUTEAFD_MINIMAX_GRAPH_VERIFY=1`: each replayed step runs again eagerly
+    /// and the two steps' logits are compared bit for bit (a diagnostic).
+    verify: bool,
     replays: u64,
-    /// Device bytes the recordings took (6-8 MiB each on an RTX 5090) and the
-    /// most they may take (`CUTEAFD_MINIMAX_GRAPH_MIB`, default 512): every
-    /// decode row count up to 64 may appear with DSpark, out of the headroom.
-    bytes: u64,
-    budget: u64,
-}
-impl DecodeGraphs<'_> {
-    fn budget_from_env() -> Result<u64> {
-        let mib = match std::env::var("CUTEAFD_MINIMAX_GRAPH_MIB") {
-            Ok(value) => value.parse::<u64>().map_err(|_| MiniMaxError::Invalid("CUTEAFD_MINIMAX_GRAPH_MIB"))?,
-            Err(_) => 512,
-        };
-        Ok(mib << 20)
-    }
 }
 
 /// Extend metadata: one launch per request tile of at most `tile` rows. Each
@@ -161,9 +137,9 @@ fn le_bytes(values:&[i32])->Vec<u8> { values.iter().flat_map(|v|v.to_le_bytes())
 
 pub(super) trait ExpertExecutor<'a> {
     fn begin(&mut self, _waves:usize, _kind:ExpertV2SourceKind) -> Result<()> { Ok(()) }
-    /// Before and after recording a step (its dispatches and collects are
-    /// recorded, not run): announces nothing and drops what a failed
-    /// recording left uncollected.
+    /// Before and after recording a step at startup (its dispatches and
+    /// collects are recorded, not run): announces nothing and drops what a
+    /// failed recording left uncollected.
     fn record(&mut self, _kind:ExpertV2SourceKind) -> Result<()> { Ok(()) }
     fn dispatch(&mut self, layer:usize, rows:usize, ids:&Buffer<'a>, weights:&Buffer<'a>,
         input:&Buffer<'a>, commands:&Commands<'a>) -> Result<()>;
@@ -189,7 +165,7 @@ pub(super) struct Execution<'a> {
     diagnostics:std::cell::RefCell<Option<Diagnostics>>,
     draft:Option<super::dspark::Dspark<'a>>,
     draft_causal:bool,
-    graphs:std::cell::RefCell<DecodeGraphs<'a>>,
+    graphs:std::cell::RefCell<StepGraphs<'a>>,
 }
 impl<'a> Execution<'a> {
     pub fn load(device:Device<'a>, programs:&'a Programs<'a>, checkpoint:&Checkpoint,
@@ -225,10 +201,8 @@ impl<'a> Execution<'a> {
         commands.upload(scratch.get("index_bounds")?,&vec![0;extend_rows*4])?;
         commands.drain()?;
         let head=TargetHeadOwner::new(&commands,&scratch,logit_rows,cfg.vocab_size)?;
-        let mode=if diagnostics.borrow().is_some() {GraphMode::Off} else {GraphMode::from_env()?};
-        tracing::info!(?mode,"MiniMax decode step graphs, one per row count (CUTEAFD_MINIMAX_GRAPHS: on, off or verify)");
-        let graphs=std::cell::RefCell::new(DecodeGraphs{mode,bank:Default::default(),refused:Default::default(),replays:0,
-            bytes:0,budget:DecodeGraphs::budget_from_env()?});
+        let graphs=std::cell::RefCell::new(StepGraphs{bank:GraphBank::with_policy(GraphPolicy::FixedStartup),binding:None,
+            verify:matches!(std::env::var("CUTEAFD_MINIMAX_GRAPH_VERIFY").as_deref(),Ok("1")),replays:0});
         Ok(Self{commands,head,weights,scratch,cfg:cfg.clone(),rows,logit_rows,context,decode_rows,extend_rows,table_stride,
             poisoned:std::cell::Cell::new(false),diagnostics,draft:None,draft_causal:false,graphs})
     }
@@ -290,69 +264,125 @@ impl<'a> Execution<'a> {
             && cache.value.raw().bytes>=batch.pool_pages*32768 && cache.index.raw().bytes>=batch.pool_pages*8448,
             MiniMaxError::Invalid("physical cache extent")); }
         let waves=self.cfg.moe[..=last_layer].iter().filter(|&&moe|moe).count();
-        // A full-model decode step replays its row count's recording.
-        let mode=self.graphs.borrow().mode;
-        let owner=std::ptr::from_ref(&*experts).cast::<()>() as usize;
-        let key=(mode!=GraphMode::Off && kind==ExpertV2SourceKind::Decode && rows<=self.decode_rows
-            && last_layer+1==self.cfg.layers && logits==(0..rows)).then(|| GraphKey { rows,
-            stride:self.decode_stride(batch), pool_pages:batch.pool_pages, embedded:embedded.raw().ptr as usize,
-            cache:caches[0].key.raw().ptr as usize, experts:owner });
-        let graph=key.and_then(|key|self.graphs.borrow().bank.get(&key).cloned());
+        // A full-model decode step replays the recording of its row count.
+        let replay=(kind==ExpertV2SourceKind::Decode && rows<=self.decode_rows && last_layer+1==self.cfg.layers
+            && logits==(0..rows)).then(|| self.binding(embedded,caches,batch.pool_pages,&*experts)).transpose()?.flatten();
         let result=(||{
             experts.begin(waves,kind)?;
             self.commands.upload(self.scratch.get("positions")?,&batch.positions.iter().flat_map(|v|v.to_le_bytes()).collect::<Vec<_>>())?;
             self.commands.upload(self.scratch.get("slots")?,&batch.slots.iter().flat_map(|v|v.to_le_bytes()).collect::<Vec<_>>())?;
             let plan=self.plan_attention(batch,rows)?;
-            if let Some(graph)=&graph {
-                self.commands.replay(graph)?;
-                return self.head.output(&self.commands,&self.scratch,rows).map(Some);
+            if replay.is_some() {
+                let mut graphs=self.graphs.borrow_mut();
+                if let (GraphDecision::Replay,Some(owner))=graphs.bank.enqueue(&rows) {
+                    let raw=owner.raw;
+                    graphs.replays+=1;
+                    drop(graphs);
+                    // SAFETY: the bank keeps the executable and every operand it
+                    // recorded; this step's metadata uploads precede it on the stream.
+                    unsafe { census::dispatch(self.commands.library(),self.commands.raw(),STEP_BANK,rows,Some(raw),
+                        || self.layers(embedded,Some(batch),batch.pool_pages,caches,experts,&plan,rows,last_layer,
+                            logits.clone(),&mut None).map(|_|()))? };
+                    return self.head.output(&self.commands,&self.scratch,rows).map(|logits|(Some(logits),true));
+                }
             }
-            self.layers(embedded,batch,caches,experts,&plan,rows,last_layer,logits.clone(),&mut diagnostics)
+            self.layers(embedded,Some(batch),batch.pool_pages,caches,experts,&plan,rows,last_layer,logits.clone(),
+                &mut diagnostics).map(|logits|(logits,false))
         })();
         // All device/cache/expert borrows end only after queued work retires.
         let drained=self.commands.drain();
         let finished=experts.finish();
         let result=result.and_then(|value|{drained?;finished?;Ok(value)});
-        if result.is_err() {
-            self.poisoned.set(true); experts.abort();
-            // No step follows a poisoned one: release the recordings' owners
-            // (a graph a failed drain still retains stays with the stream).
-            let mut graphs=self.graphs.borrow_mut();
-            graphs.bank.clear(); graphs.bytes=0;
-            return result;
-        }
-        match (key,&graph) {
-            (Some(key),Some(_)) => {
-                self.graphs.borrow_mut().replays+=1;
-                if mode==GraphMode::Verify { self.verify(embedded,batch,caches,experts,key,waves,last_layer)?; }
+        if result.is_err() { self.poisoned.set(true); experts.abort(); }
+        let (logits,replayed)=result?;
+        if replayed && self.graphs.borrow().verify { self.verify(embedded,batch,caches,experts,waves,last_layer)?; }
+        Ok(logits)
+    }
+    /// The recordings' binding when this step's input, cache, expert owner and
+    /// pool are theirs; `None` before the warm-up. Any other binding is refused.
+    fn binding(&self, embedded:&Buffer<'a>, caches:&[LayerCache<'a>], pool_pages:usize,
+        experts:&dyn ExpertExecutor<'a>) -> Result<Option<Binding>> {
+        let step=Binding { embedded:embedded.raw().ptr as usize, cache:caches[0].key.raw().ptr as usize,
+            experts:std::ptr::from_ref(experts).cast::<()>() as usize, pool_pages, stride:self.table_stride.min(pool_pages) };
+        match self.graphs.borrow().binding {
+            None => Ok(None),
+            Some(binding) => {
+                ensure!(binding==step,MiniMaxError::Invalid("decode step outside its recordings' binding"));
+                Ok(Some(binding))
             }
-            // The row count's first step ran eagerly and its output is complete:
-            // record the same step for later replays (a failure only keeps it eager).
-            (Some(key),None) if !self.graphs.borrow().refused.contains(&key) => {
-                let spent={ let g=self.graphs.borrow(); (g.bytes>=g.budget).then_some((g.bytes,g.budget)) };
-                if let Some((bytes,budget))=spent {
-                    tracing::info!(rows=key.rows,bytes,budget,"MiniMax decode graph budget spent, the row count stays eager");
-                    self.graphs.borrow_mut().refused.insert(key);
-                } else if let Err(error)=self.record(embedded,batch,caches,experts,key,last_layer) {
-                    tracing::warn!(rows=key.rows,"MiniMax decode graph not recorded, the row count stays eager: {error:#}");
-                    self.graphs.borrow_mut().refused.insert(key);
+        }
+    }
+    /// Records the admitted decode inventory before ready: one whole step per
+    /// row count in `keys`, each on the drained stream against the server's
+    /// step input, cache, pool and expert owner, the Spark exchange included
+    /// (its sequence numbers live in the pinned mailbox). Nothing executes; a
+    /// replay follows each step's metadata uploads. Returns the device bytes
+    /// the recordings took.
+    pub fn warm_graphs(&self, keys:&[usize], embedded:&Buffer<'a>, caches:&[LayerCache<'a>], pool_pages:usize,
+        experts:&mut dyn ExpertExecutor<'a>) -> Result<u64> {
+        ensure!(!self.poisoned.get(),MiniMaxError::Invalid("previous native execution failure; restart required"));
+        ensure!(self.diagnostics.borrow().is_none(),MiniMaxError::Unsupported("decode graphs beside diagnostic dumps"));
+        ensure!(caches.len()==self.cfg.layers && keys.iter().all(|rows|(1..=self.decode_rows).contains(rows)),
+            MiniMaxError::Invalid("decode graph inventory"));
+        let stride=self.table_stride.min(pool_pages);
+        let binding=Binding { embedded:embedded.raw().ptr as usize, cache:caches[0].key.raw().ptr as usize,
+            experts:std::ptr::from_ref(&*experts).cast::<()>() as usize, pool_pages, stride };
+        let library=self.commands.library();
+        let device=Device { library, id:self.commands.device() };
+        self.commands.drain()?;
+        let (free,_)=library.cuda_memory_info()?;
+        let mut graphs=self.graphs.borrow_mut();
+        ensure!(graphs.binding.is_none(),MiniMaxError::Invalid("decode graphs already recorded"));
+        let started=std::time::Instant::now();
+        graphs.bank.warm(keys,|&rows| {
+            ensure!(self.commands.idle(),MiniMaxError::Invalid("recording on a busy stream"));
+            let (before,_)=library.cuda_memory_info()?;
+            experts.record(ExpertV2SourceKind::Decode)?;
+            // SAFETY: startup owns this drained stream; capture records and runs nothing.
+            device.run(|| unsafe { library.cuda_graph_begin_capture(self.commands.raw()) })?;
+            let queued=self.layers(embedded,None,pool_pages,caches,experts,&AttentionPlan::Decode{stride},rows,
+                self.cfg.layers-1,0..rows,&mut None);
+            // SAFETY: ends the capture begun above, even when recording failed.
+            let ended=device.run(|| unsafe { library.cuda_graph_end_capture(self.commands.raw()) });
+            let pins=self.commands.take_retained();
+            let reset=experts.record(ExpertV2SourceKind::Decode);
+            match (queued,ended) {
+                (Ok(_),Ok(raw)) => {
+                    // SAFETY: the owner keeps every recorded operand; Execution
+                    // drains its stream before the bank (or the pins) go.
+                    let owner=unsafe { GraphOwner::new(library,device.id,raw,pins) }?;
+                    reset?;
+                    let (after,_)=library.cuda_memory_info()?;
+                    Ok((owner,Some(before.saturating_sub(after) as u64)))
                 }
+                (Err(error),Ok(raw)) => {
+                    // SAFETY: the failed recording was never launched.
+                    device.run(|| unsafe { library.cuda_graph_exec_destroy(raw) })?;
+                    Err(error)
+                }
+                (Err(error),Err(ended)) => Err(error.context(format!("ending the failed recording: {ended:#}"))),
+                (Ok(_),Err(error)) => Err(error),
             }
-            _ => {}
-        }
-        result
+        })?;
+        graphs.binding=Some(binding);
+        let (after,_)=library.cuda_memory_info()?;
+        let bytes=free.saturating_sub(after) as u64;
+        tracing::info!(executables=keys.len(),bytes,ms=started.elapsed().as_secs_f64()*1e3,
+            "MiniMax decode steps recorded at startup");
+        Ok(bytes)
     }
     /// The step body: residual widening, every layer through `last_layer`,
     /// then the head over `logits` (an empty range skips it).
     #[allow(clippy::too_many_arguments)]
-    fn layers(&self, embedded:&Buffer<'a>, batch:&BatchView, caches:&[LayerCache<'a>],
+    fn layers(&self, embedded:&Buffer<'a>, batch:Option<&BatchView>, pool_pages:usize, caches:&[LayerCache<'a>],
         experts:&mut dyn ExpertExecutor<'a>, plan:&AttentionPlan, rows:usize, last_layer:usize,
         logits:std::ops::Range<usize>, diagnostics:&mut Option<Diagnostics>) -> Result<Option<DeviceLogits>> {
         self.commands.widen(embedded,self.scratch.get("residual")?,rows*6144)?;
         for (layer,cache) in caches.iter().enumerate().take(last_layer+1) {
-            let mut dump=diagnostics.as_ref().filter(|d|d.layer==layer).map(|d|d.begin(batch)).transpose()?;
+            let mut dump=diagnostics.as_ref().filter(|d|d.layer==layer)
+                .map(|d|d.begin(batch.context("MiniMax diagnostic step needs its batch")?)).transpose()?;
             if let Some(d)=&mut dump { d.tensor(&self.commands,"input","f32",&[rows,6144],self.scratch.get("residual")?)?; }
-            self.attention(layer,rows,batch,cache,plan,dump.as_mut())?;
+            self.attention(layer,rows,pool_pages,batch,cache,plan,dump.as_mut())?;
             ffn::norm(&self.commands,self.scratch.get("residual")?,self.weights.layer(layer,"post_attention_layernorm.weight")?,self.scratch.get("norm")?,rows)?;
             if let Some(d)=&mut dump { d.tensor(&self.commands,"ffn_norm","bf16",&[rows,6144],self.scratch.get("norm")?)?; }
             if self.cfg.moe[layer] {
@@ -381,40 +411,18 @@ impl<'a> Execution<'a> {
             self.head.logits(&self.commands,&self.weights,&self.scratch,logits).map(Some)
         } else { Ok(None) }
     }
-    /// Records the step that just ran (its metadata is still uploaded) as a
-    /// graph for `key`, on the drained stream; nothing executes.
-    #[allow(clippy::too_many_arguments)]
-    fn record(&self, embedded:&Buffer<'a>, batch:&BatchView, caches:&[LayerCache<'a>],
-        experts:&mut dyn ExpertExecutor<'a>, key:GraphKey, last_layer:usize) -> Result<()> {
-        let library=self.commands.library();
-        let (free,_)=library.cuda_memory_info()?;
-        let started=std::time::Instant::now();
-        experts.record(ExpertV2SourceKind::Decode)?;
-        let graph=self.commands.capture(|| self.layers(embedded,batch,caches,experts,
-            &AttentionPlan::Decode{stride:key.stride},key.rows,last_layer,0..key.rows,&mut None).map(|_|()));
-        let reset=experts.record(ExpertV2SourceKind::Decode);
-        let graph=graph?; reset?;
-        let (after,_)=library.cuda_memory_info()?;
-        let mut graphs=self.graphs.borrow_mut();
-        graphs.bank.insert(key,std::rc::Rc::new(graph));
-        let bytes=free.saturating_sub(after) as u64;
-        graphs.bytes+=bytes;
-        tracing::info!(rows=key.rows,record_ms=started.elapsed().as_secs_f64()*1e3,graph_bytes=bytes,
-            total_bytes=graphs.bytes,graphs=graphs.bank.len(),replays=graphs.replays,"MiniMax decode graph recorded");
-        Ok(())
-    }
-    /// `CUTEAFD_MINIMAX_GRAPHS=verify`: runs the replayed step again eagerly
+    /// `CUTEAFD_MINIMAX_GRAPH_VERIFY=1`: runs the replayed step again eagerly
     /// (same inputs: the cache rows it appends are rewritten identically) and
     /// compares the logits bit for bit.
-    #[allow(clippy::too_many_arguments)]
     fn verify(&self, embedded:&Buffer<'a>, batch:&BatchView, caches:&[LayerCache<'a>],
-        experts:&mut dyn ExpertExecutor<'a>, key:GraphKey, waves:usize, last_layer:usize) -> Result<()> {
+        experts:&mut dyn ExpertExecutor<'a>, waves:usize, last_layer:usize) -> Result<()> {
         let library=self.commands.library();
-        let replayed=self.head.output(&self.commands,&self.scratch,key.rows)?.to_host(library)?;
+        let rows=batch.positions.len();
+        let replayed=self.head.output(&self.commands,&self.scratch,rows)?.to_host(library)?;
         let eager=(||{
             experts.begin(waves,ExpertV2SourceKind::Decode)?;
-            self.layers(embedded,batch,caches,experts,&AttentionPlan::Decode{stride:key.stride},key.rows,last_layer,
-                0..key.rows,&mut None)?.context("MiniMax verified step has no logits")
+            self.layers(embedded,Some(batch),batch.pool_pages,caches,experts,&AttentionPlan::Decode{stride:self.decode_stride(batch)},
+                rows,last_layer,0..rows,&mut None)?.context("MiniMax verified step has no logits")
         })();
         let drained=self.commands.drain();
         let finished=experts.finish();
@@ -423,8 +431,8 @@ impl<'a> Execution<'a> {
         let differing=replayed.iter().zip(&eager).filter(|(a,b)|a.to_bits()!=b.to_bits()).count();
         let max=replayed.iter().zip(&eager).map(|(a,b)|(a-b).abs()).fold(0f32,f32::max);
         let replays=self.graphs.borrow().replays;
-        if differing==0 { tracing::info!(rows=key.rows,replays,"MiniMax decode graph replay matches eager bit for bit"); }
-        else { tracing::error!(rows=key.rows,replays,differing,max_abs=max,"MiniMax decode graph replay differs from eager"); }
+        if differing==0 { tracing::info!(rows,replays,"MiniMax decode graph replay matches eager bit for bit"); }
+        else { tracing::error!(rows,replays,differing,max_abs=max,"MiniMax decode graph replay differs from eager"); }
         Ok(())
     }
     fn residual(&self,rows:usize)->Result<()> {
@@ -451,9 +459,13 @@ impl<'a> Execution<'a> {
         self.commands.upload(&s.get("index_bounds")?.view(self.extend_rows*4,bounds.len()*4)?,&le_bytes(&bounds))?;
         Ok(AttentionPlan::Extend{launches})
     }
-    fn attention(&self, layer:usize,rows:usize,batch:&BatchView,cache:&LayerCache<'a>,plan:&AttentionPlan,
-        mut dump:Option<&mut StepDump>)->Result<()> {
+    /// One layer's attention; `batch` is absent only while recording a decode
+    /// step, which has neither extend launches nor dumps.
+    #[allow(clippy::too_many_arguments)]
+    fn attention(&self, layer:usize,rows:usize,pool_pages:usize,batch:Option<&BatchView>,cache:&LayerCache<'a>,
+        plan:&AttentionPlan,mut dump:Option<&mut StepDump>)->Result<()> {
         let s=&self.scratch;
+        let step=|| batch.context("MiniMax extend launches and dumps need their batch");
         ffn::norm(&self.commands,s.get("residual")?,self.weights.layer(layer,"input_layernorm.weight")?,s.get("norm")?,rows)?;
         if let Some(d)=dump.as_deref_mut() { d.tensor(&self.commands,"norm","bf16",&[rows,6144],s.get("norm")?)?; }
         for (projection,stem,out) in [("q","q","q"),("kv","kv","kv"),("index_q","index_q","index_q"),("index_k","index_k","index_k")] {
@@ -475,10 +487,11 @@ impl<'a> Execution<'a> {
         if let Some(d)=dump.as_deref_mut() {
             d.tensor(&self.commands,"index_q_fp8","u8",&[rows,4,128],s.get("index_q_fp8")?)?;
             d.tensor(&self.commands,"index_q_scales","f32",&[rows,4],s.get("index_q_scales")?)?;
-            d.cache_rows(&self.commands,"index_k_fp8","u8",&[rows,1,128],&cache.index,&batch.slots,8448,0,128)?;
-            d.cache_rows(&self.commands,"index_k_scales","f32",&[rows,1],&cache.index,&batch.slots,8448,8192,4)?;
+            let slots=&step()?.slots;
+            d.cache_rows(&self.commands,"index_k_fp8","u8",&[rows,1,128],&cache.index,slots,8448,0,128)?;
+            d.cache_rows(&self.commands,"index_k_scales","f32",&[rows,1],&cache.index,slots,8448,8192,4)?;
             for (name,source) in [("k_fp8",&cache.key),("v_fp8",&cache.value)] {
-                d.cache_rows(&self.commands,name,"u8",&[rows,4,128],source,&batch.slots,32768,0,512)?;
+                d.cache_rows(&self.commands,name,"u8",&[rows,4,128],source,slots,32768,0,512)?;
             }
         }
         match plan {
@@ -488,12 +501,12 @@ impl<'a> Execution<'a> {
                 let stride=*stride;
                 self.commands.launch("minimax_index_decode", &[&s.get("index_q_fp8")?.view(0,rows*512)?,
                     &s.get("index_q_scales")?.view(0,rows*16)?,&cache.index,s.get("page_table")?,s.get("cache_lengths")?,s.get("q2k")?,s.get("scratch")?], &[
-                    Scalar::I32(rows as i32),Scalar::I32(stride as i32),Scalar::I32(stride as i32),Scalar::I64(batch.pool_pages as i64)])?;
+                    Scalar::I32(rows as i32),Scalar::I32(stride as i32),Scalar::I32(stride as i32),Scalar::I64(pool_pages as i64)])?;
                 if let Some(d)=dump.as_deref_mut() { d.selection(&self.commands,s.get("q2k")?,rows,self.decode_rows)?; }
                 self.commands.launch("minimax_attention_decode", &[&s.get("q_norm")?.view(0,rows*16384)?,&cache.key,&cache.value,
                     s.get("k_descale")?,s.get("v_descale")?,s.get("page_table")?,s.get("cache_lengths")?,s.get("cu_seqlens_q")?,s.get("q2k")?,
                     &s.get("attention")?.view(0,rows*16384)?,s.get("lse")?,s.get("scratch")?], &[
-                    Scalar::I32(rows as i32),Scalar::I32(rows as i32),Scalar::I32(stride as i32),Scalar::I64(batch.pool_pages as i64)])?;
+                    Scalar::I32(rows as i32),Scalar::I32(rows as i32),Scalar::I32(stride as i32),Scalar::I64(pool_pages as i64)])?;
             }
             // Each request's index keys through this step are staged as the
             // contiguous rows the prefill scorer reads; its tiles then select
@@ -501,6 +514,7 @@ impl<'a> Execution<'a> {
             AttentionPlan::Extend{launches} => {
                 let (stride,tile)=(self.table_stride,self.extend_rows);
                 let (tables,bounds)=(s.get("page_table")?,s.get("index_bounds")?);
+                let batch=step()?;
                 for launch in launches {
                     let request=&batch.requests[launch.request];
                     let table=tables.view(launch.slot*stride*4,stride*4)?;
@@ -518,7 +532,7 @@ impl<'a> Execution<'a> {
                         s.get("k_descale")?,s.get("v_descale")?,&table,&s.get("cache_lengths")?.view(launch.slot*16,16)?,
                         &s.get("cu_seqlens_q")?.view(launch.slot*16,16)?,s.get("q2k_extend")?,
                         &s.get("attention")?.view(row*16384,n*16384)?,s.get("lse")?,s.get("scratch")?], &[
-                        Scalar::I32(n as i32),Scalar::I32(1),Scalar::I32(stride as i32),Scalar::I64(batch.pool_pages as i64)])?;
+                        Scalar::I32(n as i32),Scalar::I32(1),Scalar::I32(stride as i32),Scalar::I64(pool_pages as i64)])?;
                 }
             }
         }

@@ -134,16 +134,6 @@ int cuteafd_alloc_managed_device_buffer(size_t bytes, struct device_buffer *out)
 }
 
 struct graph_exec { int device; size_t bytes; };
-int cuteafd_cuda_graph_begin_capture(void *stream) {
-    (void)stream;
-    event('C');
-    return 0;
-}
-int cuteafd_cuda_graph_launch(void *handle, void *stream) {
-    (void)handle; (void)stream;
-    event('L');
-    return 0;
-}
 int cuteafd_cuda_graph_end_capture(void *stream, void **out) {
     (void)stream;
     struct graph_exec *graph = malloc(sizeof(*graph));

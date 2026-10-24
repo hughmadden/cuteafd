@@ -2,7 +2,10 @@
 use std::sync::{atomic::{AtomicU8, Ordering}, OnceLock};
 
 static ENABLED: OnceLock<bool> = OnceLock::new();
-static STARTUP_EAGER: OnceLock<bool> = OnceLock::new();
+static STARTUP_EAGER: OnceLock<Option<String>> = OnceLock::new();
+/// Banks a WIP launcher may run eagerly for the whole process with
+/// `CUTEAFD_GRAPH_EAGER=<bank>` (an A/B arm; their graphs are still captured).
+const STARTUP_EAGER_BANKS: [&str; 2] = ["layer_row", "minimax_step"];
 static EAGER: AtomicU8 = AtomicU8::new(0);
 
 pub(crate) fn enabled() -> bool {
@@ -11,7 +14,7 @@ pub(crate) fn enabled() -> bool {
 
 fn bank_id(bank: &str) -> Option<u8> {
     Some(match bank { "baseline" => 0, "sparse" => 1, "index" => 2,
-        "layer_row" => 3, "head" => 4, "dspark" => 5, "window" => 6, _ => return None })
+        "layer_row" => 3, "head" => 4, "dspark" => 5, "window" => 6, "minimax_step" => 7, _ => return None })
 }
 
 pub(crate) fn idle() {
@@ -28,14 +31,12 @@ pub(crate) fn idle() {
 }
 
 fn startup_eager(bank: &str, value: Option<&str>) -> bool {
-    bank == "layer_row" && value == Some("layer_row")
+    STARTUP_EAGER_BANKS.contains(&bank) && value == Some(bank)
 }
 
 pub(crate) fn eager(bank: &str) -> bool {
     // WIP launchers admit this startup-only arm without enabling census timing.
-    let forced = bank == "layer_row" && *STARTUP_EAGER.get_or_init(|| {
-        startup_eager("layer_row", std::env::var("CUTEAFD_GRAPH_EAGER").ok().as_deref())
-    });
+    let forced = startup_eager(bank, STARTUP_EAGER.get_or_init(|| std::env::var("CUTEAFD_GRAPH_EAGER").ok()).as_deref());
     forced || (enabled() && bank_id(bank).is_some_and(|id| id != 0 && id == EAGER.load(Ordering::Relaxed)))
 }
 
@@ -223,10 +224,13 @@ mod tests {
     #[test]
     fn startup_eager_only_selects_layer_row_without_timing() {
         assert!(super::startup_eager("layer_row", Some("layer_row")));
-        for value in [None, Some(""), Some("sparse"), Some("all")] {
+        assert!(super::startup_eager("minimax_step", Some("minimax_step")));
+        for value in [None, Some(""), Some("sparse"), Some("all"), Some("minimax_step")] {
             assert!(!super::startup_eager("layer_row", value));
         }
+        assert!(!super::startup_eager("minimax_step", Some("layer_row")));
         assert!(!super::startup_eager("sparse", Some("layer_row")));
+        assert!(!super::startup_eager("sparse", Some("sparse")));
     }
 
     #[test]

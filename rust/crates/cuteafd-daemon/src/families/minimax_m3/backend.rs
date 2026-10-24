@@ -75,6 +75,8 @@ pub(super) struct MiniMaxBackend<'e, 'a> {
     pub probe: RefCell<RoundRoutes>,
     pub rings: RefCell<Rings>,
     pub full_prefill_logits: bool,
+    /// Graph captures once the startup recordings finished: serving adds none.
+    pub startup_captures: std::cell::Cell<Option<u64>>,
 }
 impl<'e, 'a> MiniMaxBackend<'e, 'a> {
     /// One step; the head projects only the batch rows in `logits`.
@@ -174,7 +176,14 @@ impl<'e, 'a> Backend<'a> for MiniMaxBackend<'e, 'a> {
     }
     fn history(&self, _: &Placement) {}
     fn prefetch(&self, _: &[u32], _: &[u32]) {}
-    fn require_live(&self) -> Result<()> { self.pending.borrow_mut().take(); self.execution.drain() }
+    fn require_live(&self) -> Result<()> {
+        self.pending.borrow_mut().take();
+        if let Some(startup) = self.startup_captures.get() {
+            let current = cuteafd_ffi::graph_captures();
+            ensure!(current == startup, "MiniMax zero-steady-capture contract: startup={startup}, current={current}");
+        }
+        self.execution.drain()
+    }
     fn log_table_stats(&self, _: &str) {}
     fn prefill_device(&self, p: &mut Placement, tokens: &[u32], logit_rows: usize,
         pool: &RefPagePool) -> Result<Option<DeviceLogits>> {
