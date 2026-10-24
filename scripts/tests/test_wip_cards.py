@@ -1039,7 +1039,8 @@ def test_panels_none_with_a_probe_is_a_readiness_run(entry, tmp_path, monkeypatc
         '--state', str(state), '--panels', 'none', '--probe', 'v41-min:console', '--dry-run'])
     assert cards.main() == 0
     job = json.loads((state / 'plan.json').read_text())['jobs'][0]
-    assert json.loads((Path(job['state']) / 'matrix.json').read_text())['entries'][0]['profile'] == 'panels:'
+    entry = json.loads((Path(job['state']) / 'matrix.json').read_text())['entries'][0]
+    assert entry['profile'] == 'panels:' and entry['baseline'] is False
 
 
 def test_post_load_repeat_reaches_every_job(entry, tmp_path, monkeypatch):
@@ -1443,6 +1444,13 @@ def test_panels_alone_skip_the_baseline_and_prefill_lengths_reach_the_sweep(entr
             '--state', str(state2), '--panels', listed, '--prefill-lengths', '8192', '--dry-run'])
         assert cards.main() == 0
         assert json.loads(next(state2.glob('*/matrix.json')).read_text())['entries'][0].get('baseline') is expected
+
+
+def test_readiness_only_row_needs_no_report(entry, tmp_path):
+    job = make({**entry, 'profile': 'panels:', 'baseline': False}, tmp_path)
+    row = cards.summarize_job(job, 0)
+    assert 'expected one report' not in (row.get('error') or '')
+    assert not any('expected one report' in e for e in row.get('errors', []))
 
 
 def test_prefill_sweep_rows(entry, tmp_path):

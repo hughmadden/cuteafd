@@ -991,8 +991,9 @@ def summarize_job(job, exit_code):
             fail(row, message)
     launched = outcome.get('launch_s') is not None or bool(reports)
     sweep_only = job['entry'].get('profile') == 'panels:' and bool(job['entry'].get('levels') or job['entry'].get('prefill_lengths'))
-    if sweep_only and not reports:
-        pass  # No server-side profile ran; the sweep below carries the numbers.
+    readiness_only = job['entry'].get('profile') == 'panels:' and job['entry'].get('baseline') is False and not sweep_only
+    if (sweep_only or readiness_only) and not reports:
+        pass  # No server-side profile ran; the sweep or the probes carry the results.
     elif len(reports) != 1:
         fail(row, f'expected one report, found {len(reports)}')
     else:
@@ -2051,8 +2052,8 @@ def main():
         listed = requested_panels(profile)
         for card in cards:
             card['profile'] = profile
-            if listed and 'baseline' not in listed:
-                card['baseline'] = False  # Explicit panels alone; list baseline to keep it.
+            if (listed or not (levels or prefill_lengths)) and 'baseline' not in listed:
+                card['baseline'] = False  # Explicit panels alone, or a probe-only readiness run; list baseline to keep it.
     lossless_set = None
     if args.lossless_set is not None:
         lossless_set = load_lossless_set(args.lossless_set)
