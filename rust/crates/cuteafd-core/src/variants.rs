@@ -93,6 +93,7 @@ pub enum VariantError {
     Derive(String),
     #[error("tensor is unchanged")]
     Unchanged,
+
 }
 
 impl VariantPlan {
@@ -130,7 +131,8 @@ impl VariantPlan {
     pub fn site(&self, key: SiteKey) -> Option<&SiteOp> {
         self.sites.binary_search_by_key(&key, |(k, _)| *k).ok().map(|i| &self.sites[i].1)
     }
-    /// Device table bytes: `a` and `b` at the variant's own rank per site.
+    /// Logical operator bytes only. Resident bytes require all launch plans;
+    /// use [`resident_table_bytes`] for admission and reporting.
     pub fn table_bytes(&self) -> u64 {
         self.sites.iter().map(|(_, op)| 2 * op.rank() as u64 * u64::from(self.hidden) * 4).sum()
     }
@@ -220,6 +222,14 @@ pub fn validate_specs(specs: &[VariantSpec], served: &str) -> Result<(), Variant
     Ok(())
 }
 
+/// A configured public id remains reserved even if its tables cannot be loaded.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum VariantAvailability {
+    Ready,
+    Unavailable { reason: String },
+}
+
 /// What `/v1/models`, the request log and `/v1/stats` say about a variant.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct VariantRecord {
@@ -230,17 +240,27 @@ pub struct VariantRecord {
     pub base: String,
     pub sites: usize,
     pub k_max: usize,
+    pub availability: VariantAvailability,
     /// Verification summary from the derivation (family-defined fields).
     pub verify: serde_json::Value,
 }
 impl VariantRecord {
     pub fn of(plan: &VariantPlan, base: &str, verify: serde_json::Value) -> Self {
         Self { index: plan.index, name: plan.name.clone(), public_id: plan.public_id.clone(), base: base.into(),
-            sites: plan.sites.len(), k_max: plan.k_max(), verify }
+            sites: plan.sites.len(), k_max: plan.k_max(), availability: VariantAvailability::Ready, verify }
+    }
+    pub fn unavailable(index: u8, spec: &VariantSpec, base: &str, reason: impl Into<String>, verify: serde_json::Value) -> Self {
+        Self { index, name: spec.name.clone(), public_id: spec.public_id(base), base: base.into(), sites: 0, k_max: 0,
+            availability: VariantAvailability::Unavailable { reason: reason.into() }, verify }
+    }
+    pub fn is_ready(&self) -> bool { matches!(self.availability, VariantAvailability::Ready) }
+    pub fn unavailable_reason(&self) -> Option<&str> {
+        match &self.availability { VariantAvailability::Ready => None, VariantAvailability::Unavailable { reason } => Some(reason) }
     }
     /// The `"variant"` object a `/v1/models` record carries.
     pub fn model_field(&self) -> serde_json::Value {
-        serde_json::json!({"name": self.name, "base": self.base, "sites": self.sites, "k_max": self.k_max, "verify": self.verify})
+        serde_json::json!({"name": self.name, "base": self.base, "sites": self.sites, "k_max": self.k_max,
+            "availability": self.availability, "mode": self.verify.get("mode"), "verify": self.verify})
     }
 }
 
@@ -299,7 +319,11 @@ impl VariantStats {
         let mut out = serde_json::Map::new();
         out.insert("base".into(), entry(&self.counters[0], 0, 0));
         for record in &self.records {
-            out.insert(record.name.clone(), entry(&self.counters[usize::from(record.index)], record.sites, record.k_max));
+            let mut value = entry(&self.counters[usize::from(record.index)], record.sites, record.k_max);
+            value["id"] = serde_json::json!(record.public_id);
+            value["availability"] = serde_json::json!(record.availability);
+            value["verify"] = record.verify.clone();
+            out.insert(record.name.clone(), value);
         }
         serde_json::Value::Object(out)
     }
@@ -309,12 +333,38 @@ impl VariantStats {
 // order as `cuteafd_steer_rows`, so CPU tests match the GPU bit for bit.
 pub use crate::steer_rows::{bf16_to_f32, f32_to_bf16_rne as bf16_rne, steer_rows_ref};
 
+/// The exact packing used for a site's resident A/B/rank buffers. The allocation
+/// floor matches the device allocator; holes and the base slot count in full.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SiteTableLayout {
+    pub site: SiteKey,
+    pub slots: usize,
+    pub k_max: usize,
+    pub hidden: usize,
+}
+impl SiteTableLayout {
+    pub fn values(&self) -> usize { self.slots * self.k_max * self.hidden }
+    pub fn resident_bytes(&self) -> u64 {
+        (2 * (self.values() * 4).max(256) + (self.slots * 4).max(256)) as u64
+    }
+}
+pub fn site_table_layout(plans: &[VariantPlan], key: SiteKey, hidden: usize) -> SiteTableLayout {
+    SiteTableLayout { site: key, slots: plans.iter().map(|p| usize::from(p.index)).max().unwrap_or(0) + 1,
+        k_max: plans.iter().filter_map(|p| p.site(key)).map(SiteOp::rank).max().unwrap_or(0).max(1), hidden }
+}
+pub fn table_layouts(plans: &[VariantPlan], hidden: usize) -> Vec<SiteTableLayout> {
+    let keys: std::collections::BTreeSet<_> = plans.iter().flat_map(|p| p.sites.iter().map(|(key, _)| *key)).collect();
+    keys.into_iter().map(|key| site_table_layout(plans, key, hidden)).collect()
+}
+pub fn resident_table_bytes(plans: &[VariantPlan], hidden: usize) -> u64 {
+    table_layouts(plans, hidden).iter().map(SiteTableLayout::resident_bytes).sum()
+}
+
 /// Pack plans into the kernel's per-site table layout (§4): for one site,
 /// `(a, b, k, k_max)` with slot 0 zero and slots in variant index order.
 /// `k_max` is the largest rank at this site (1 for the fast path).
 pub fn site_tables(plans: &[VariantPlan], key: SiteKey, hidden: usize) -> (Vec<f32>, Vec<f32>, Vec<i32>, usize) {
-    let slots = plans.iter().map(|p| usize::from(p.index)).max().unwrap_or(0) + 1;
-    let k_max = plans.iter().filter_map(|p| p.site(key)).map(SiteOp::rank).max().unwrap_or(0).max(1);
+    let SiteTableLayout { slots, k_max, .. } = site_table_layout(plans, key, hidden);
     let (mut a, mut b, mut k) = (vec![0f32; slots * k_max * hidden], vec![0f32; slots * k_max * hidden], vec![0i32; slots]);
     for plan in plans {
         if let Some(SiteOp::Steer { k: rank, a: pa, b: pb }) = plan.site(key) {
@@ -389,7 +439,7 @@ mod tests {
     #[test]
     fn stats_count_per_variant_and_report_base() {
         let record = VariantRecord { index: 2, name: "alternate".into(), public_id: "m-alternate".into(), base: "m".into(),
-            sites: 96, k_max: 1, verify: serde_json::json!({}) };
+            sites: 96, k_max: 1, availability: VariantAvailability::Ready, verify: serde_json::json!({}) };
         let mut stats = VariantStats::new(vec![record]);
         stats.admitted(2, 100, true, true);
         stats.admitted(0, 50, true, false);
@@ -406,6 +456,40 @@ mod tests {
         assert_eq!(json["base"]["prefix_hits"], 0);
         assert!(json["base"]["draft_acceptance"].is_null());
         assert_eq!((stats.name(2), stats.name(0), stats.name(5)), ("alternate", "base", "base"));
+    }
+
+    #[test]
+    fn unavailable_records_keep_ids_reasons_and_zero_counters() {
+        let spec: VariantSpec = "name=bad,source=/bad,id=m-bad".parse().unwrap();
+        let record = VariantRecord::unavailable(3, &spec, "m", "incomplete", serde_json::json!({"mode":"shared-only"}));
+        assert!(!record.is_ready());
+        assert_eq!(record.unavailable_reason(), Some("incomplete"));
+        let stats = VariantStats::new(vec![record]).json();
+        assert_eq!(stats["bad"]["id"], "m-bad");
+        assert_eq!(stats["bad"]["availability"]["state"], "unavailable");
+        assert_eq!(stats["bad"]["availability"]["reason"], "incomplete");
+        assert_eq!(stats["bad"]["requests"], 0);
+    }
+
+    #[test]
+    fn resident_bytes_match_packed_tables_with_base_holes_and_site_rank_padding() {
+        let site = key(1, SiteKind::SharedExpert);
+        let other = key(2, SiteKind::Attn);
+        let h = 128;
+        let a = VariantPlan::new(1, "a", "m-a", h as u32, vec![(site, SiteOp::rank1(1.0, &vec![1.0;h]))]).unwrap();
+        let b = VariantPlan::new(7, "b", "m-b", h as u32, vec![(site, SiteOp::Steer { k:3,a:vec![1.0;3*h],b:vec![1.0;3*h] }),
+            (other, SiteOp::rank1(1.0, &vec![1.0;h]))]).unwrap();
+        let plans = [a,b];
+        let expected: u64 = [site,other].into_iter().map(|site| {
+            let (a,b,k,_) = site_tables(&plans,site,h);
+            assert_eq!(k.len(),8);
+            assert_eq!(&k[2..7], &[0;5]);
+            ((a.len()*4).max(256)+(b.len()*4).max(256)+(k.len()*4).max(256)) as u64
+        }).sum();
+        assert_eq!(expected, 2*(8*3*h*4) as u64+256 + 2*(8*h*4) as u64+256);
+        assert_eq!(resident_table_bytes(&plans,h), expected);
+        assert!(expected > plans.iter().map(VariantPlan::table_bytes).sum::<u64>());
+        assert_eq!(resident_table_bytes(&[],h),0);
     }
 
     #[test]

@@ -287,10 +287,12 @@ impl ToolNames {
 
 /// Map `turn` onto a Chat Completions request body for `profile`.
 pub(crate) fn chat_body(turn: &TurnRequest, profile: &ModelProfile) -> Result<Value, GatewayError> {
+    profile.check_variant(&turn.model)?;
     chat_body_with(turn, profile, &ToolNames::new(turn), system_placement(profile))
 }
 
 fn chat_body_with(turn: &TurnRequest, profile: &ModelProfile, names: &ToolNames, systems: SystemPlacement) -> Result<Value, GatewayError> {
+    profile.check_variant(&turn.model)?;
     if turn.modalities.audio_out {
         return Err(GatewayError::unsupported("audio output needs a speech synthesizer; this server has none").with_param("modalities"));
     }
@@ -495,7 +497,7 @@ impl Backend for Engine {
         let owner = self.profile().id.split_once('/').map_or("cuteafd", |(owner, _)| owner);
         let base = ModelInfo { id: self.profile().id.clone(), context_tokens: Some(self.limits().context()),
             max_output_tokens: Some(self.limits().output()), owned_by: owner.to_owned() };
-        let variants = self.profile().variants.iter().map(|v| ModelInfo { id: v.public_id.clone(), ..base.clone() }).collect::<Vec<_>>();
+        let variants = self.profile().variants.iter().filter(|v| v.is_ready()).map(|v| ModelInfo { id: v.public_id.clone(), ..base.clone() }).collect::<Vec<_>>();
         std::iter::once(base).chain(variants).collect()
     }
 
