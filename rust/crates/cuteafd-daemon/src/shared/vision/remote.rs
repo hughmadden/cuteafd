@@ -93,22 +93,27 @@ impl EncoderHandshake {
             .saturating_mul(if self.merge_size == 3 { 2 } else { 1 })
     }
     fn validate_job(&self, job: &EncodeJob) -> Result<usize> {
-        let ([t, h, w], rgb8) = job.image_input()?;
-        let patches = u64::from(h) * u64::from(w);
-        let rgb_bytes = self.input_bytes(patches);
-        if t != 1
-            || h == 0
-            || w == 0
-            || (self.merge_size == 2 && (h % 2 != 0 || w % 2 != 0))
-            || patches > u64::from(self.max_patches)
-            || job.tokens as u64 != self.tokens(h, w)
-            || (self.merge_size == 3 && job.tokens > 1024)
-            || job.hidden_width != self.output_width as usize
-            || rgb8.len() as u64 != rgb_bytes
-        {
-            return Err(error("invalid image grid/RGB8/output geometry"));
+        let (grid, rgb8) = job.image_input()?;
+        self.validate_image_geometry(grid, job.tokens as u64, rgb8.len() as u64)?;
+        if job.hidden_width != self.output_width as usize {
+            return Err(error("invalid image output width"));
         }
         job.feature_bytes()
+    }
+    /// What both ends check of a still image before any allocation.
+    fn validate_image_geometry(&self, [t, h, w]: [u32; 3], tokens: u64, len: u64) -> Result<()> {
+        let patches = u64::from(h) * u64::from(w);
+        if t != 1
+            || patches == 0
+            || patches > u64::from(self.max_patches)
+            || (self.merge_size == 2 && (h % 2 != 0 || w % 2 != 0))
+            || tokens != self.tokens(h, w)
+            || (self.merge_size == 3 && tokens > 1024)
+            || len != self.input_bytes(patches)
+        {
+            return Err(error("invalid image frame before allocation"));
+        }
+        Ok(())
     }
     fn validate_minimax(&self) -> Result<()> {
         self.validate()?;
@@ -832,45 +837,18 @@ where
             continue;
         }
         let job = match (opcode, handshake) {
-            (1, Handshake::Image(handshake) | Handshake::Minimax(handshake)) => {
-                let key: cuteafd_core::MediaKey = ImageKey(read_array(s)?).into();
-                let grid = [get_u32(s)?, get_u32(s)?, get_u32(s)?];
-                let tokens = get_u64(s)?;
-                let len = get_u64(s)?;
-                let patches = u64::from(grid[1]) * u64::from(grid[2]);
-                if grid[0] != 1
-                    || patches == 0
-                    || patches > u64::from(handshake.max_patches)
-                    || (handshake.merge_size == 2 && (grid[1] % 2 != 0 || grid[2] % 2 != 0))
-                    || tokens != handshake.tokens(grid[1], grid[2])
-                    || (handshake.merge_size == 3 && tokens > 1024)
-                    || len != handshake.input_bytes(patches)
-                {
-                    return Err(error("invalid vision frame before allocation"));
-                }
-                let mut rgb = vec![0; len as usize];
-                s.read_exact(&mut rgb).map_err(error)?;
-                let job = EncodeJob::image(
-                    match key {
-                        cuteafd_core::MediaKey::Image(key) => key,
-                        _ => unreachable!(),
-                    },
-                    grid,
-                    rgb.into(),
-                    tokens as usize,
-                    handshake.output_width as usize,
-                );
-                job
-            }
-            (3, Handshake::Minimax(handshake)) => {
+            // A still image (1) or, on a MiniMax tower, a video segment (3): the same frame.
+            (1, Handshake::Image(handshake) | Handshake::Minimax(handshake)) | (3, Handshake::Minimax(handshake)) => {
                 let key = ImageKey(read_array(s)?);
                 let grid = [get_u32(s)?, get_u32(s)?, get_u32(s)?];
                 let tokens = get_u64(s)?;
                 let len = get_u64(s)?;
-                handshake.validate_video_geometry(grid, tokens, len)?;
+                if opcode == 3 { handshake.validate_video_geometry(grid, tokens, len)? }
+                else { handshake.validate_image_geometry(grid, tokens, len)? }
                 let mut rgb = vec![0; usize::try_from(len).map_err(error)?];
                 s.read_exact(&mut rgb).map_err(error)?;
-                EncodeJob::video(key, grid, rgb.into(), tokens as usize, handshake.output_width as usize)
+                let job = if opcode == 3 { EncodeJob::video } else { EncodeJob::image };
+                job(key, grid, rgb.into(), tokens as usize, handshake.output_width as usize)
             }
             (2, Handshake::Audio(handshake)) => {
                 let key = AudioKey(read_array(s)?);
