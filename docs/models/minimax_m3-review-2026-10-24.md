@@ -3,8 +3,7 @@
 Branch `hugh/minimax-m3` at `51f79cf68` (46 commits over upstream `work/p0` `f7bb2da19`,
 185 files, +17,184 / −258), kernel fork `hughmadden/sparkinfer-glmrt` at `012972f7`
 (7 commits over the base pin `56ec22d0`). Reviewed 2026-10-24 by the Claude agent within
-Turq, from the code on the branch plus the raw run logs under
-`~/.cache/cuteafd/builds/minimax-juliette/resume-logs/`. No plan, hand-off or report
+Turq, from the code on the branch plus the bring-up's raw run logs. No plan, hand-off or report
 written by another agent was used.
 
 ## Verdict
@@ -26,7 +25,7 @@ reasons are structural rather than tuning:
 5. The MXFP8 linears have no split-K and the four attention/indexer projections are
    launched separately, so coordinator weight streaming at decode runs well under HBM speed.
 
-Measured on juliette (RTX 5090, Sparks 7–10 at TP4, build `51f79cf68`): C1 decode ≈20 tok/s
+Measured on an RTX 5090 coordinator with four Sparks (TP4, build `51f79cf68`): C1 decode ≈20 tok/s
 without the drafter and ≈45 tok/s with it; four concurrent streams give an *aggregate* of
 15–21 tok/s, i.e. less than one stream; prefill of a 4.4K prompt takes ≈6 s (≈700 tok/s).
 My estimate of what this cell should do with the same kernels and formats is ≈50–55 tok/s

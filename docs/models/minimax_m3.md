@@ -99,7 +99,7 @@ every temporal pair its own image delimiters and timestamp.
 | 8-frame segment 504x644 | 1,656 | 94.9 | 0.090 / 0.074 |
 | 8-frame segment 896x896 | 4,096 | 377.5 | — |
 
-Served at TP2 (spark7, spark8; RTX 5090 coordinator, FP8 KV, 4096 prefill
+Served at TP2 (two Sparks; RTX 5090 coordinator, FP8 KV, 4096 prefill
 rows, 16 sequences), the resident RTX tower takes 2.57 GB (its 2.50 GB ledger
 and module): at 1M context the largest admitted pool drops from 189,568 to
 152,512 tokens (-37,056), which is what the default serves, and the
@@ -108,7 +108,7 @@ reference's 65,536-token pool fits either way.
 A Spark-hosted tower does not fit at TP2. It needs 3.57 GB per rank
 (weights, scratch, 1 GiB guard) beside 117.44 GB of experts, rings and
 workspace, against a 120.3-122.4 GB budget (MemAvailable - 3 GiB), and
-admission refuses it by name. At TP3 (spark7, spark8, spark10, a tower on
+admission refuses it by name. At TP3 (three Sparks, a tower on
 every rank, `--vision-peers` on the coordinator) all the live checks below
 pass, and the coordinator keeps the 2.57 GB. TTFT there, with text of the
 same length (two runs, no throttling):
@@ -146,7 +146,7 @@ takes 0.84 s for the image prompt and 1.34 s for the clip against 0.80 s and
 (decode, resize, 27 ms encode), the PNG frames 0.22 s and the MP4 0.40 s: the
 95 ms encode plus preparation, where the MP4's ffprobe and ffmpeg take 72 ms
 and 155 ms in the coordinator container (a process start alone is about 70 ms
-on juliette). No thermal throttling.
+on the coordinator host). No thermal throttling.
 
 Text throughput with the tower resident, same slot and day, vision off -> on:
 prefill 4.4K/16K 1509/1650 -> 1499/1654 tok/s, decode C1/C4/C16
