@@ -672,6 +672,17 @@ async fn chat_developer_and_root_roles_reach_only_the_minimax_template() {
 }
 
 #[tokio::test]
+async fn chat_rejects_a_non_object_body_for_every_family() {
+    for family in families() {
+        let (app, _) = serve(family.profile.clone(), family.snapshot.clone(), vec![], false);
+        for body in [json!([]), json!("hi"), json!(7)] {
+            let (status, text) = post(&app, "/v1/chat/completions", body).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{}: {text}", family.name);
+        }
+    }
+}
+
+#[tokio::test]
 async fn resent_web_search_call_without_results_keeps_the_session_valid() {
     // Codex over HTTP (store:false) resends its hosted web_search_call items
     // by value: action and status, never the sources. Every later turn must

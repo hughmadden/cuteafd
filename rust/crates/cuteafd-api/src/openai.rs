@@ -799,9 +799,11 @@ pub(crate) fn build(profile: &ModelProfile, limits: NativeLimits, headers: &axum
     if response_format.as_ref().and_then(|v| v.get("type")).and_then(Value::as_str) == Some("regex") {
         body["response_format"] = json!({"type":"text"});
     }
-    if matches!(profile.encoding, ModelEncoding::MiniMaxM3(_)) {
+    // Only an object takes defaults; anything else fails validation below (a
+    // non-object body must be a 400, not a panic indexing into it).
+    if let (ModelEncoding::MiniMaxM3(_), Some(object)) = (&profile.encoding, body.as_object_mut()) {
         for (key, value) in [("temperature", 1.0), ("top_p", 0.95)] {
-            if body.get(key).is_none_or(Value::is_null) { body[key] = json!(value); }
+            if object.get(key).is_none_or(Value::is_null) { object.insert(key.into(), json!(value)); }
         }
     }
     let sampling = request_target_sampling(&body).map_err(Rejection::bad)?;
