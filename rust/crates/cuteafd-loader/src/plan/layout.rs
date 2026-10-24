@@ -346,6 +346,16 @@ pub fn spark_endpoints(family: &str, lanes: u64) -> usize {
     }
 }
 
+/// Spark execution lanes a family's endpoints use on each rank: each lane
+/// owns an execution workspace and runs its endpoint's waves concurrently
+/// with the other lane's (V4.1's two decode transports).
+pub fn spark_execution_lanes(family: &str) -> usize {
+    match family {
+        "deepseek_v41" => 2,
+        _ => 1,
+    }
+}
+
 /// The selected ring geometry for `endpoints` coordinator endpoints per rank.
 pub fn spark_ring_geometry(endpoints: usize) -> crate::placement::SparkRingGeometry {
     crate::placement::SparkRingGeometry { max_frame_bytes: 64 << 20, depth: 8,
@@ -413,6 +423,25 @@ mod selected_spark_io_tests {
             assert_eq!(residual.lifetime, cuteafd_core::memory_layout::ItemLifetime::ReadyResident);
             assert!(cuteafd_core::memory_layout::SPARK_RUNTIME_RESIDUAL_SOURCE.contains("0a6fc7b1"));
         }
+    }
+
+    #[test]
+    fn each_spark_execution_lane_charges_one_execution_workspace() {
+        for family in ["deepseek_v4", "glm5", "glm5_flash", "mimo_v2", "qwen4", "kimi_k3", "step5"] {
+            assert_eq!(spark_execution_lanes(family), 1, "{family}");
+        }
+        // V4.1's two decode transports run on separate Spark execution lanes.
+        assert_eq!(spark_execution_lanes("deepseek_v41"), 2);
+        let working = SparkWorkingSet { spark_layers: vec![3], spark_ranks: 4, prefill_lanes: 1, ..Default::default() };
+        let rings = spark_ring_geometry(spark_endpoints("deepseek_v41", 1));
+        let waves = |allowance: u64| {
+            let mut device = DeviceLayout { kind: DeviceKind::Spark, index: 0,
+                capacity_bytes: 121 * GIB, items: vec![], kv_tokens: 0 };
+            charge_spark_io(&mut device, &working, ExpertGeometry::DEEPSEEK_V41, 4096, false, rings, allowance).unwrap();
+            device.items.iter().find(|item| item.group == "expert waves").unwrap().bytes
+        };
+        let wave = 21 * GIB / 10;
+        assert_eq!(waves(2 * wave) - waves(wave), wave);
     }
 
     #[test]
@@ -790,7 +819,9 @@ pub(crate) fn charge_spark_devices(report: &mut PlanReport, model: &dyn super::F
                 .map_err(|_| crate::placement::PlacementError::Overflow("Spark capacity"))
                 .and_then(|capacity| charge_spark_io(device, working, geometry, capacity,
                     checkpoint.spark_input_is_bf16(), spark_ring_geometry(endpoints),
-                    charges.wave_bytes * options.spark_capacity_rows / 4096)));
+                    // One execution workspace per Spark execution lane.
+                    charges.wave_bytes * options.spark_capacity_rows / 4096
+                        * spark_execution_lanes(report.family.as_deref().unwrap_or_default()) as u64)));
         if let Err(error) = io {
             report.placement_supported = false;
             notes.push(format!("{}: {error}", what(device)));
@@ -1247,7 +1278,7 @@ pub(crate) fn charge_host(report: &mut PlanReport, options: &LayoutOptions, chec
         let bf16 = native || matches!(family, "glm5" | "qwen4");
         let ingress = if native { SparkIngress::Fp8K32 } else if bf16 { SparkIngress::Bf16 }
             else { SparkIngress::Fp8K32 };
-        let endpoint = SparkEndpoint { ring_depth: None, capacity: u32::try_from(unit_rows)?, ingress };
+        let endpoint = SparkEndpoint { ring_depth: None, capacity: u32::try_from(unit_rows)?, ingress, execution_lane: 0 };
         let (request, response) = endpoint.wire_bytes(geometry).context("host wire size overflow")?;
         let rings = SparkRings { max_frame_bytes: (64 << 20).max(request).max(response),
             depth: 8, slot_bytes: 8 << 20, alignment: 4096 };
