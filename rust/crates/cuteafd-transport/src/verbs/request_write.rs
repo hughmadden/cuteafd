@@ -796,13 +796,16 @@ mod tests {
                     plane = Some(buffer);
                 }
                 let result = (|| -> Result<()> {
-                    client.bootstrap(&bf16_request(0, capacity, hidden)?)?;
+                    // No `bootstrap`: it requires a placement worker's installed
+                    // grouping, which this generic echo server does not report.
+                    // The first dispatch is full-capacity, so it sizes the rings
+                    // for every later wave, as serving's warm-up does.
                     let written_before = crate::traffic::written_total();
                     let mut large = 0usize;
                     let mut request_tails = 0u64;
                     // Small (one SEND each way), then large frames: 21 rows is
                     // 258,048 payload bytes, just under one chunk with headers.
-                    let sizes = [1u32, 21, 64, 2048, 1500, 2048, 7, 2048];
+                    let sizes = [2048u32, 1, 21, 64, 1500, 2048, 7, 2048];
                     let mut sent = std::collections::VecDeque::new();
                     for (index, &rows) in sizes.iter().cycle().take(sizes.len() * 3).enumerate() {
                         while client.open_waves() == waves {

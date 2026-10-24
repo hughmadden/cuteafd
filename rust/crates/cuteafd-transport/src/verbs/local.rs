@@ -133,6 +133,24 @@ pub struct LocalVerbsExpertConnection {
 // from its bootstrap thread to the GPU owner, but is never shared concurrently.
 unsafe impl Send for LocalVerbsExpertConnection {}
 
+/// The coordinator's last bootstrap message, after it connected its QP and
+/// posted its receives: where reply tails land. Required exactly when replies
+/// can exceed one chunk and are not write-mode.
+fn read_reply_target(reader: &mut BufReader<TcpStream>, start: &VerbsHostProtocolV2PersistentStart,
+    response_ring: VerbsHostRdmaRing) -> Result<Option<request_write::ReplyTarget>> {
+    let reply: VerbsHostProtocolV2ReplyTarget = decode_persistent_control(read_control_value(reader)?)?;
+    anyhow::ensure!(reply.message == "protocol_v2_reply_target", "expected protocol_v2_reply_target, got {}",
+        reply.message);
+    anyhow::ensure!(reply.target.is_some() == (start.write_target.is_none()
+        && request_write::needs_target(start.response_capacity_wire_bytes)),
+        "coordinator reply target does not match response capacity {}", start.response_capacity_wire_bytes);
+    if let Some(target) = &reply.target {
+        target.validate(response_ring.slot_capacity_bytes)?;
+        anyhow::ensure!(target.depth == response_ring.depth, "coordinator reply ring depth differs from the start");
+    }
+    Ok(reply.target)
+}
+
 /// Raises the newest coordinator watermark from a received request header
 /// (wrapping 32-bit; a request never lowers it).
 fn observe_watermark(watermark: &mut Option<u32>, frame: &[u8], flags: u32) -> Result<()> {
@@ -548,17 +566,7 @@ impl LocalVerbsExpertConnection {
                 flow_label: start.flow_label,
             },
         )?;
-        let reply: VerbsHostProtocolV2ReplyTarget = decode_persistent_control(read_control_value(
-            &mut BufReader::new(stream.try_clone()?))?)?;
-        anyhow::ensure!(reply.message == "protocol_v2_reply_target", "expected protocol_v2_reply_target, got {}",
-            reply.message);
-        anyhow::ensure!(reply.target.is_some() == (start.write_target.is_none()
-            && request_write::needs_target(start.response_capacity_wire_bytes)),
-            "coordinator reply target does not match response capacity {}", start.response_capacity_wire_bytes);
-        if let Some(target) = &reply.target {
-            target.validate(response_ring.slot_capacity_bytes)?;
-            anyhow::ensure!(target.depth == response_ring.depth, "coordinator reply ring depth differs from the start");
-        }
+        let reply = read_reply_target(&mut BufReader::new(stream.try_clone()?), &start, response_ring)?;
 
         Ok(Self {
             stream,
@@ -577,7 +585,7 @@ impl LocalVerbsExpertConnection {
             next_liveness: Instant::now(),
             liveness_polls: 0,
             deferred: std::collections::VecDeque::new(),
-            reply_target: reply.target,
+            reply_target: reply,
             reply_watermark: None,
             uncovered_replies: 0,
             timing,
@@ -1292,6 +1300,63 @@ mod budget_tests {
         });
         if let Some(digest) = digest { start["worker_selection_digest"] = digest.into(); }
         start
+    }
+
+    /// The persistent bootstrap with reply targets, over a real TCP pair (no
+    /// NIC): the worker reads the coordinator's start, writes ready, then
+    /// reads `protocol_v2_reply_target`, which the coordinator sends only
+    /// after ready. A large-reply session must get a valid target for its
+    /// ring; a small-reply or write-mode one must get none; anything else,
+    /// a wrong message or a stale control version, fails closed.
+    #[test]
+    fn bootstrap_reads_the_reply_target_after_ready_and_fails_closed() -> Result<()> {
+        let small = 64 << 10;
+        let large = 33_816_672;
+        let ring = |capacity: usize| VerbsHostRdmaRing::new(capacity, 4096, 8);
+        let target = |ring: VerbsHostRdmaRing| request_write::ReplyTarget { address: 1 << 40, rkey: 3,
+            slot_stride_bytes: ring.slot_stride_bytes, depth: ring.depth, landing: None };
+        let cases: Vec<(usize, bool, serde_json::Value, bool)> = vec![
+            (large, false, serde_json::to_value(VerbsHostProtocolV2ReplyTarget { message: "protocol_v2_reply_target".into(),
+                wire_version: PERSISTENT_CONTROL_VERSION, target: Some(target(ring(large)?)) })?, true),
+            (small, false, serde_json::to_value(VerbsHostProtocolV2ReplyTarget { message: "protocol_v2_reply_target".into(),
+                wire_version: PERSISTENT_CONTROL_VERSION, target: None })?, true),
+            // Write mode: replies are flagged writes to the client's plane.
+            (large, true, serde_json::to_value(VerbsHostProtocolV2ReplyTarget { message: "protocol_v2_reply_target".into(),
+                wire_version: PERSISTENT_CONTROL_VERSION, target: None })?, true),
+            (large, false, serde_json::to_value(VerbsHostProtocolV2ReplyTarget { message: "protocol_v2_reply_target".into(),
+                wire_version: PERSISTENT_CONTROL_VERSION, target: None })?, false),
+            (small, false, serde_json::to_value(VerbsHostProtocolV2ReplyTarget { message: "protocol_v2_reply_target".into(),
+                wire_version: PERSISTENT_CONTROL_VERSION, target: Some(target(ring(small)?)) })?, false),
+            (large, false, serde_json::to_value(VerbsHostProtocolV2ReplyTarget { message: "protocol_v2_reply_target".into(),
+                wire_version: PERSISTENT_CONTROL_VERSION, target: Some(request_write::ReplyTarget { depth: 2,
+                    ..target(ring(large)?) }) })?, false),
+            (large, false, serde_json::to_value(VerbsHostProtocolV2ReplyTarget { message: "protocol_v2_reply_target".into(),
+                wire_version: PERSISTENT_CONTROL_VERSION - 1, target: Some(target(ring(large)?)) })?, false),
+            (large, false, serde_json::json!({"message": "protocol_v2_persistent_ready",
+                "wire_version": PERSISTENT_CONTROL_VERSION}), false),
+        ];
+        for (capacity, write_mode, reply, accepted) in cases {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+            let mut coordinator = TcpStream::connect(listener.local_addr()?)?;
+            let (worker, _) = listener.accept()?;
+            let mut start = placement_start(None, 0);
+            start["response_capacity_wire_bytes"] = capacity.into();
+            if write_mode {
+                start["write_target"] = serde_json::json!({"plane_addr": 1, "plane_bytes": capacity, "flag_addr": 2, "rkey": 4});
+            }
+            write_control(&mut coordinator, &start)?;
+            let start: VerbsHostProtocolV2PersistentStart = decode_persistent_control(
+                read_control_value(&mut BufReader::new(worker.try_clone()?))?)?;
+            // The worker answers ready; the coordinator reads it before sending
+            // its reply target, so the start reader cannot have buffered it.
+            write_control(&mut worker.try_clone()?, &serde_json::json!({"message": "protocol_v2_persistent_ready"}))?;
+            read_control_value(&mut BufReader::new(coordinator.try_clone()?))?;
+            write_control(&mut coordinator, &reply)?;
+            let result = read_reply_target(&mut BufReader::new(worker), &start, ring(capacity)?);
+            assert_eq!(result.is_ok(), accepted, "capacity {capacity} write {write_mode}: {reply} -> {result:?}");
+            if let Ok(target) = result { assert_eq!(target.is_some(), capacity == large && !write_mode); }
+        }
+        Ok(())
     }
 
     #[test]
