@@ -149,6 +149,8 @@ pub struct Entry {
     pub context_lengths: Option<Vec<u64>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_levels: Option<Vec<usize>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_suffix: Option<u64>,
 }
 
 /// `open` runs once after the sweep's first warm-up, just before its first
@@ -471,6 +473,7 @@ impl Entry {
             lossless_dump: self.lossless_dump.clone().or_else(|| defaults.lossless_dump.clone()),
             context_lengths: self.context_lengths.clone().or_else(|| defaults.context_lengths.clone()),
             context_levels: self.context_levels.clone().or_else(|| defaults.context_levels.clone()),
+            context_suffix: self.context_suffix.or(defaults.context_suffix),
         }
     }
 
@@ -949,6 +952,7 @@ pub fn run(args: SmokeArgs) -> Result<()> {
         crate::panels::context_load::Options {
             lengths: entry.context_lengths.clone().unwrap_or(defaults.lengths),
             levels: entry.context_levels.clone().unwrap_or(defaults.levels),
+            suffix_tokens: entry.context_suffix.unwrap_or(defaults.suffix_tokens),
         }.validate().map_err(|e| anyhow::anyhow!("{}: {e}", entry.name))?;
         entries.push(entry);
     }
@@ -971,11 +975,11 @@ pub fn run(args: SmokeArgs) -> Result<()> {
     eprintln!("{} entries, {} to run, build {build}, up to {} at once", entries.len(), pending.len(), args.parallel);
     if args.dry_run {
         for e in &pending {
-            eprintln!("  {} api_key_file={} family={} gpus={:?} sparks={:?} locks={:?} levels={:?} post_load_c1={} post_load_repeat={} prefill_lengths={:?} sweep_tokens={} baseline={} window={} lossless_set={} lossless_dump={:?} context_lengths={:?} context_levels={:?} fabric={} worker_stop={} set={:?}",
+            eprintln!("  {} api_key_file={} family={} gpus={:?} sparks={:?} locks={:?} levels={:?} post_load_c1={} post_load_repeat={} prefill_lengths={:?} sweep_tokens={} baseline={} window={} lossless_set={} lossless_dump={:?} context_lengths={:?} context_levels={:?} context_suffix={} fabric={} worker_stop={} set={:?}",
                 e.name, e.set.get("API_KEY_FILE").map_or("-", String::as_str), e.family.as_deref().unwrap_or("?"), e.gpus, e.sparks, locks_for(e), e.levels,
                 e.post_load_c1.unwrap_or(false), e.post_load_repeat.unwrap_or(false), e.prefill_lengths,
                 e.sweep_tokens.unwrap_or(crate::sweep::TOKENS), e.baseline.unwrap_or(true), e.window.is_some(),
-                e.lossless_set.as_deref().unwrap_or("default"), e.lossless_dump, e.context_lengths, e.context_levels, e.fabric.unwrap_or(true),
+                e.lossless_set.as_deref().unwrap_or("default"), e.lossless_dump, e.context_lengths, e.context_levels, e.context_suffix.unwrap_or(0), e.fabric.unwrap_or(true),
                 WORKER_STOP, e.set);
         }
         return Ok(());
@@ -1397,7 +1401,7 @@ fn run_entry(entry: &Entry, repo: &Path, out_root: &Path, configs: &Path, logs: 
             api_key: api_key.clone(), quiet: true,
             deadline: Some(Duration::from_secs(entry.run_timeout_s.unwrap_or(900))),
             lossless_set: entry.lossless_set.as_ref().map(|p| crate::panels::lossless::CaseSet::load(&repo.join(p)))
-                .transpose()?, lossless_dump: entry.lossless_dump.clone(), context_lengths: entry.context_lengths.clone(), context_levels: entry.context_levels.clone() };
+                .transpose()?, lossless_dump: entry.lossless_dump.clone(), context_lengths: entry.context_lengths.clone(), context_levels: entry.context_levels.clone(), context_suffix: entry.context_suffix };
         let (mut report, dir) = crate::cli::run(&options)?;
         // Publication markers are runner metadata, not serving defaults. This
         // also works against images built before these markers existed.
@@ -1621,11 +1625,13 @@ mod tests {
 
     #[test]
     fn context_options_merge_and_roundtrip() {
-        let defaults = Entry { context_lengths: Some(vec![32768, 131072]), context_levels: Some(vec![1, 8, 16]), ..Entry::default() };
+        let defaults = Entry { context_lengths: Some(vec![32768, 131072]), context_levels: Some(vec![1, 8, 16]), context_suffix: Some(512), ..Entry::default() };
         let own = Entry { context_levels: Some(vec![1, 8]), ..Entry::default() };
         let merged = own.merged(&defaults);
         assert_eq!(merged.context_lengths, defaults.context_lengths);
         assert_eq!(merged.context_levels, Some(vec![1, 8]));
+        assert_eq!(merged.context_suffix, Some(512));
+        assert_eq!(Entry { context_suffix: Some(0), ..Entry::default() }.merged(&defaults).context_suffix, Some(0));
         let encoded = serde_json::to_value(&merged).unwrap();
         assert_eq!(encoded["context_lengths"], serde_json::json!([32768, 131072]));
         assert_eq!(serde_json::from_value::<Entry>(encoded).unwrap(), merged);

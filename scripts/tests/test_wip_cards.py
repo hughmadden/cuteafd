@@ -1768,19 +1768,22 @@ def test_lossless_set_gate_fails_the_row_and_names_failing_cases(entry, tmp_path
     assert cards.summarize_job(job, 0)['lossless_set']['status'] == 'skipped'
 
 
-def test_context_load_options_reach_matrix(entry, tmp_path, monkeypatch):
+def test_context_load_options_reach_matrix(entry, tmp_path, monkeypatch, capsys):
     kit = _kit(tmp_path, entry)
     state = tmp_path / 'context-state'
     monkeypatch.setattr(sys, 'argv', ['wip-cards', '--kit', str(kit), '--cards', 'v41-min', '--matrix', '--arm', 'a=b:s',
-        '--state', str(state), '--panels', 'context_load', '--context-lengths', '32768,131072', '--context-levels', '1,8,16', '--dry-run'])
+        '--state', str(state), '--panels', 'context_load', '--context-lengths', '32768,131072', '--context-levels', '1,8,16', '--context-suffix', '512', '--dry-run'])
     assert cards.main() == 0
     e = json.loads(next(state.glob('*/matrix.json')).read_text())['entries'][0]
     assert e['profile'] == 'panels:context_load' and e['baseline'] is False
     assert e['context_lengths'] == [32768, 131072] and e['context_levels'] == [1, 8, 16]
+    assert e['context_suffix'] == 512
+    assert 'context_suffix=512' in capsys.readouterr().out
 
 
 @pytest.mark.parametrize('option,value', [('--context-lengths', '255'), ('--context-lengths', '1048577'),
-    ('--context-lengths', 'oops'), ('--context-levels', '0'), ('--context-levels', '257'), ('--context-levels', '8,8')])
+    ('--context-lengths', 'oops'), ('--context-levels', '0'), ('--context-levels', '257'), ('--context-levels', '8,8'),
+    ('--context-suffix', '-1'), ('--context-suffix', '1048577'), ('--context-suffix', 'oops')])
 def test_context_load_invalid_options_fail_before_hardware(entry, tmp_path, monkeypatch, option, value):
     kit = _kit(tmp_path, entry)
     monkeypatch.setattr(sys, 'argv', ['wip-cards', '--kit', str(kit), '--cards', 'v41-min', '--matrix', '--arm', 'a=b:s',

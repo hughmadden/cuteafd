@@ -2050,6 +2050,7 @@ def main():
                         '(needs PREFIX_CACHE_ENTRIES=0; the sweep fails if a repeat hits the cache)')
     parser.add_argument('--context-lengths', metavar='N,N', help='shared base contexts for context_load (256..1048576; default 32768,131072)')
     parser.add_argument('--context-levels', metavar='C,C', help='context_load concurrency levels (distinct 1..256; default 1,8,16)')
+    parser.add_argument('--context-suffix', type=int, metavar='N', help='additional fresh context_load suffix tokens per request (0..1048576; default 0)')
     parser.add_argument('--prefill-lengths', metavar='N,N', help='client-side cold prefill at these prompt lengths (one untimed warm '
                         'request each, then one measured), e.g. 8192')
     parser.add_argument('--trace', action='store_true', help='every job writes SPECULATION_TRACE to <job>/speculation-trace.jsonl; '
@@ -2169,6 +2170,8 @@ def main():
         if not parts or not all(x.isdigit() and 256 <= int(x) <= 1 << 20 for x in parts):
             parser.error('--context-lengths takes prompt lengths in 256..1048576, e.g. 32768,131072')
         context_lengths = [int(x) for x in parts]
+    if args.context_suffix is not None and not 0 <= args.context_suffix <= 1 << 20:
+        parser.error('--context-suffix takes tokens in 0..1048576')
     context_levels = None
     if args.context_levels is not None:
         parts = [x.strip() for x in args.context_levels.split(',') if x.strip()]
@@ -2203,6 +2206,8 @@ def main():
             card['context_lengths'] = context_lengths
         if context_levels is not None:
             card['context_levels'] = context_levels
+        if args.context_suffix is not None:
+            card['context_suffix'] = args.context_suffix
         if lossless_set:
             card['lossless_set'] = lossless_set
         if lossless_dump:
@@ -2311,6 +2316,8 @@ def main():
             cmd = smoke_command(job['binary'], job['launcher']['repo'], job)
             prefix = ('CUTEAFD_BENCH_NONCE_SEED=' + shlex.quote(job['nonce_seed']) + ' ') if job.get('nonce_seed') else ''
             print('# settings ' + job['arm'] + '/' + job['card'] + ': ' + json.dumps(job['entry']['set'], sort_keys=True))
+            if args.context_suffix is not None:
+                print('# context_suffix=' + str(job['entry']['context_suffix']))
             print(prefix + 'setsid ' + shlex.join(cmd) + ' # numeric exit -> ' + job['state'] + '/exit')
             for kind in ('observer', 'precheck'):
                 if kind in job['entry']:
@@ -2343,6 +2350,7 @@ def main():
         (['lossless_set'] if any(job['entry'].get('lossless_set') for job in jobs) else []) + \
         (['lossless_dump'] if any(job['entry'].get('lossless_dump') for job in jobs) else []) + \
         (['context_lengths'] if context_lengths is not None else []) + (['context_levels'] if context_levels is not None else []) + \
+        (['context_suffix'] if args.context_suffix is not None else []) + \
         (['worker_stop'] if any(job['entry']['set'].get('PROFILE_SPARK') for job in jobs) else [])
     for job in {j['launcher']['repo']: j for j in reversed(jobs)}.values():
         binary_supports(job['binary'], job['launcher']['repo'], job, fields)
