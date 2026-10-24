@@ -35,15 +35,18 @@ impl<'a> Engine<'a> {
                 // Diagnostics own rows by slot too; a slot is reused only after its unit commits.
                 self.prepare_route_checks(&units.iter().map(|u| u.rows.len()).collect::<Vec<_>>())?;
                 let mut links = transports.borrow_mut();
-                // Waves build, post and land on the prefill link's transport
+                // Waves build, post and land on the prefill link's exchange
                 // worker while this thread queues GPU work.
-                let staging = self.wave_staging_bytes()?;
-                let (logits, landed) = match links.get_mut(1) {
-                    Some(link) => link.with_waves(staging, |transport| self.run_units(placement, tokens, &tables, w,
-                        w1, Some(transport), logit_rows, download, on_layer, &units, waves))?,
-                    None => self.run_units(placement, tokens, &tables, w, w1, None, logit_rows, download, on_layer,
-                        &units, waves)?,
+                let transport = match links.get_mut(1) {
+                    Some(link) => {
+                        let exchange = link.exchange()?;
+                        ensure!(exchange.fits(self.wave_staging_bytes()?), "prefill link staging is narrower than a unit");
+                        Some(exchange)
+                    }
+                    None => None,
                 };
+                let (logits, landed) = self.run_units(placement, tokens, &tables, w, w1, transport, logit_rows,
+                    download, on_layer, &units, waves)?;
                 self.finish_route_step()?;
                 // No unit cursor survives into decode/verify: all geometry is selected by hook.
                 self.context_units.borrow_mut().clear();
@@ -62,7 +65,7 @@ impl<'a> Engine<'a> {
 impl<'a> Engine<'a> {
     #[allow(clippy::too_many_arguments)]
     fn run_units(&self, placement: &Placement, tokens: &[u32], tables: &[StepTables], w: &Workspace<'a>,
-        w1: Option<&Workspace<'a>>, transport: Option<&mut crate::shared::spark_waves::Waves<'_, '_>>,
+        w1: Option<&Workspace<'a>>, transport: Option<&mut crate::shared::spark_waves::Waves<'_>>,
         logit_rows: usize, download: bool, on_layer: Option<&mut dyn FnMut(usize, &[u8]) -> Result<()>>,
         units: &[Unit], waves: usize) -> Result<(Vec<f32>, usize)> {
         let mut hooks = UnitHooks { engine: self, placement, tokens, tables, w, w1, transport, logit_rows, download,
@@ -73,14 +76,14 @@ impl<'a> Engine<'a> {
     }
 }
 
-struct UnitHooks<'h, 'a, 't, 'l, 'c, 'n> {
+struct UnitHooks<'h, 'a, 't, 'l, 'c> {
     engine: &'h Engine<'a>,
     placement: &'h Placement,
     tokens: &'h [u32],
     tables: &'h [StepTables],
     w: &'h Workspace<'a>,
     w1: Option<&'h Workspace<'a>>,
-    transport: Option<&'t mut crate::shared::spark_waves::Waves<'l, 'n>>,
+    transport: Option<&'t mut crate::shared::spark_waves::Waves<'l>>,
     logit_rows: usize,
     download: bool,
     on_layer: Option<&'c mut dyn FnMut(usize, &[u8]) -> Result<()>>,
@@ -98,7 +101,7 @@ fn reuse_context(owner: &mut [Option<(usize, usize)>; 2], ordinal: usize, layer:
     reuse
 }
 
-impl UnitHooks<'_, '_, '_, '_, '_, '_> {
+impl UnitHooks<'_, '_, '_, '_, '_> {
     fn post(&mut self, layer: usize, unit: &Unit, ranks: usize, slot: Option<usize>) -> Result<()> {
         let e = self.engine;
         let rows = Scalar::I32(unit.rows.len() as i32);
@@ -122,7 +125,7 @@ impl UnitHooks<'_, '_, '_, '_, '_, '_> {
     }
 }
 
-impl PrefillHooks for UnitHooks<'_, '_, '_, '_, '_, '_> {
+impl PrefillHooks for UnitHooks<'_, '_, '_, '_, '_> {
     type Ticket = crate::shared::spark_waves::WaveTicket;
 
     fn route(&self, layer: usize) -> FfnRoute {
@@ -213,7 +216,7 @@ impl PrefillHooks for UnitHooks<'_, '_, '_, '_, '_, '_> {
     fn land_experts(&mut self, layer: usize, unit: &Unit, ticket: Self::Ticket) -> Result<()> {
         let transport = self.transport.as_mut().context("no prefill Spark link")?;
         let slot = ticket.slot();
-        let ranks = self.engine.wave_land(layer, transport, ticket)?;
+        let ranks = self.engine.wave_land(transport, ticket)?;
         self.post(layer, unit, ranks, Some(slot))
     }
 
