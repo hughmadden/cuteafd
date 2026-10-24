@@ -190,9 +190,9 @@ for selected in pro6000 5090; do
     cp "$MINIMAX_CONFIG_DIR/minimax-m31-flash-nvfp4-$selected-tp$tp.config" "$cfg"
     printf '\nMODEL_ID=MiniMaxAI/MiniMax-M3.1-Flash\nINSTANCE=%s\nWIP_INSTANCE=%s\nWIP_ROOT="%s"\nADDR=%s\n' \
       "$instance" "$instance" "$WIP_ROOT" "$MINIMAX_ADDR" >>"$cfg"
-    # A WIP dry run applies the launch's deployment guard (wip_launchable implies fit and placement).
-    "$root/run.sh" --wip qualification --config "$cfg" --set "MODEL_ID=$MINIMAX_SNAPSHOT" --dry-run \
-      >"$output/$selected-tp$tp-plan.json"
+    # A WIP dry run plans the launch from the hub snapshot and applies its deployment guard
+    # (wip_launchable implies fit and placement); its last line is the deployment.
+    "$root/run.sh" --wip qualification --config "$cfg" --dry-run | tail -n 1 >"$output/$selected-tp$tp-plan.json"
   done
   device="$(nvidia-smi --id="$gpu" --query-gpu=name --format=csv,noheader)"
   if [[ "$selected" == 5090 && "$device" != *5090* ]] || [[ "$selected" == pro6000 && "$device" != *PRO*6000* ]]; then

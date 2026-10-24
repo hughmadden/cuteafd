@@ -18,6 +18,11 @@ from wip_aot_scopes import read_config as config  # noqa: E402
 
 REVISION = "54e4e69dfc452b1e94a426c24a4fdeeaa8e3ad5e"
 MODEL = "MiniMaxAI/MiniMax-M3.1-Flash"
+# run-family.sh's MiniMax defaults for the keys checked below; the example configs state only
+# what differs. An unset GPU budget leaves the card's whole CUDA total, which the planner's
+# 95.5 GiB default does not cap on a PRO 6000 (94.97 GiB).
+LAUNCHER_DEFAULTS = {"RTX_GPUS": "auto", "KV_CACHE": "fp8", "SPECULATOR": "off", "COORDINATOR_GPU": "0"}
+PLANNER_GPU_BUDGET_GIB = "95.5"
 
 
 def hosts(values):
@@ -132,12 +137,14 @@ def preflight(card):
             raise ValueError(f"set MINIMAX_GPU_{current.upper()} to an explicit local GPU index (0 or 1)")
         for tp in (4, 2, 3):
             values = config(Path(os.environ["MINIMAX_CONFIG_DIR"]) / f"minimax-m31-flash-nvfp4-{current}-tp{tp}.config")
-            required_values = {"SPARK_COUNT": str(tp), "RTX_GPUS": "1", "KV_CACHE": "fp8",
-                               "SPECULATOR": "off", "COORDINATOR_GPU": gpu,
-                               "COORDINATOR_GPU_BUDGET_GIB": "31.8" if current == "5090" else "95.5"}
+            # What the launcher runs: the configured value, else its default (unset is None).
+            launched = {**LAUNCHER_DEFAULTS, **values}
+            required_values = {"SPARK_COUNT": {str(tp)}, "RTX_GPUS": {"auto", "1"}, "KV_CACHE": {"fp8"},
+                               "SPECULATOR": {"off"}, "COORDINATOR_GPU": {gpu},
+                               "COORDINATOR_GPU_BUDGET_GIB": {"31.8"} if current == "5090" else {None, "95.5"}}
             for key, wanted in required_values.items():
-                if values.get(key) != wanted:
-                    raise ValueError(f"{current} TP{tp}: {key} must be {wanted}")
+                if launched.get(key) not in wanted:
+                    raise ValueError(f"{current} TP{tp}: {key} must be {' or '.join(sorted(w or 'unset' for w in wanted))}")
             current_hosts = hosts(values)
             if expected_hosts is None:
                 expected_hosts = current_hosts
@@ -194,9 +201,11 @@ def main():
             runtime_inputs()
         elif args.mode == "budgets":
             # Workers get the plan's Spark budget, as run.sh gives them: the configured
-            # SPARK_DEVICE_BUDGET_BYTES, else the family default.
+            # SPARK_DEVICE_BUDGET_BYTES, else the family default. The golden gets the configured
+            # GPU budget, else the planner's default (no cap below a PRO 6000's CUDA total).
             report = json.loads(Path(args.plan).read_text())["report"]
-            print(config(args.value)["COORDINATOR_GPU_BUDGET_GIB"], int(report["spark_budget_bytes"]))
+            print(config(args.value).get("COORDINATOR_GPU_BUDGET_GIB", PLANNER_GPU_BUDGET_GIB),
+                  int(report["spark_budget_bytes"]))
         else:
             port = int(config(args.value).get("EXPERT_PORT", "0"))
             if not 1024 <= port <= 65535:
