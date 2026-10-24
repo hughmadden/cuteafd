@@ -598,13 +598,14 @@ impl TensorSource {
             declared = Some(shape);
         }
         if let Some(shape) = declared { return Ok(shape); }
-        // Older standard EXL3 snapshots omit the original FP8 config. Fully
-        // tiled operands carry an exact grid-to-weight ratio in their own
-        // headers. Partial grids cannot establish block boundaries this way.
+        // Older EXL3 snapshots omit the original FP8 config. Header-only
+        // inference supports exact square power-of-two tiles; divisibility
+        // alone can also describe partial grids (e.g. 200 rows / 2 scales).
         if srows > 0 && scols > 0 && rows % srows == 0 && cols % scols == 0 {
-            return Ok((rows / srows, cols / scols));
+            let (br, bc) = (rows / srows, cols / scols);
+            if br == bc && br.is_power_of_two() { return Ok((br, bc)); }
         }
-        Err(invalid("source has no FP8 weight_block_size declaration and headers do not describe an exact full-tile grid").into())
+        Err(invalid("source has no FP8 weight_block_size declaration and headers do not describe exact square power-of-two tiles").into())
     }
 
     fn block_scale(&self, name: &str) -> Result<(Vec<f32>, usize, usize)> {
@@ -807,6 +808,12 @@ pub fn derive_variant(served: &Path, served_id: &str, index: u8, spec: &cuteafd_
         return reject(outcome, VariantRejection::Incomplete { tensors: missing_in_base });
     }
     if sites.is_empty() { return reject(outcome, VariantRejection::NoSupportedSites); }
+    if let Some(site) = sites.iter().find(|site| site.key.kind == cuteafd_core::variants::SiteKind::Ffn
+        && site.tensor.ends_with(".mlp.shared_experts.down_proj.weight")) {
+        return reject(outcome, VariantRejection::UnsupportedSource { reason: format!(
+            "mode=ffn selected {}: fitting a shared-expert tensor does not verify the combined routed+shared output; use mode=shared-only",
+            site.tensor) });
+    }
     let (ops, verdicts) = match derive_sites(&base, &variant, &sites, parallel) {
         Ok(result) => result,
         Err(error) if error.downcast_ref::<TensorSourceError>().is_some() || error.downcast_ref::<VariantError>().is_some() =>
