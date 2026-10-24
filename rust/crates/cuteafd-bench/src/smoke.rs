@@ -3,8 +3,10 @@
 //! launches it with ./run.sh, waits for readiness, runs the Release smoke
 //! profile through the server's own runner, exports the report, tears the
 //! launch down and moves on, past failures. Entries on disjoint hardware run
-//! side by side (taking the shared lock files for the hardware they use);
-//! finished entries are remembered per build so an interrupted matrix resumes.
+//! side by side (taking the shared lock files for the hardware they use, unless
+//! a parent names locks it already holds in CUTEAFD_HW_LOCKS_HELD). Prelaunch
+//! hooks still run immediately before each entry launches under those locks.
+//! Finished entries are remembered per build so an interrupted matrix resumes.
 //! SIGTERM, SIGINT or SIGHUP cancels the run: every launched entry's launcher
 //! is stopped and its containers removed (bounded, see [`CANCEL_TEARDOWN_S`])
 //! before the process exits non-zero and its hardware locks are released.
@@ -802,11 +804,15 @@ impl Locks {
     }
 
     fn try_take(&mut self, names: &[&'static str]) -> Result<bool> {
-        let dir = expand("~/.cache/cuteafd");
-        std::fs::create_dir_all(&dir)?;
+        let parent = std::env::var("CUTEAFD_HW_LOCKS_HELD").unwrap_or_default();
+        self.try_take_in(&expand("~/.cache/cuteafd"), names, &parent)
+    }
+
+    fn try_take_in(&mut self, dir: &Path, names: &[&'static str], parent: &str) -> Result<bool> {
+        std::fs::create_dir_all(dir)?;
         let mut taken = Vec::new();
         for &name in names {
-            if self.held.contains_key(name) {
+            if self.held.contains_key(name) || parent.split(',').any(|p| p.trim_end_matches(".lock") == name.trim_end_matches(".lock")) {
                 continue;
             }
             let file = File::options().create(true).append(true).open(dir.join(name))?;
@@ -1588,6 +1594,29 @@ mod tests {
         Entry { name: name.into(), family: Some("glm5_flash".into()), gpus: Some(gpus.to_vec()),
             sparks: Some(sparks.iter().map(|s| s.to_string()).collect()),
             set: [("ADDR".to_string(), format!("0.0.0.0:{port}"))].into(), ..Entry::default() }
+    }
+
+    #[test]
+    fn nonblocking_locks_skip_parent_held_locks_and_release_only_own() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = File::options().create(true).append(true).open(dir.path().join("gpu1.lock")).unwrap();
+        parent.lock().unwrap();
+        let mut locks = Locks::default();
+        assert!(locks.try_take_in(dir.path(), &["gpu1.lock", "rhea.lock"], "gpu1").unwrap());
+        assert!(!locks.held.contains_key("gpu1.lock"));
+        assert_eq!(locks.held["rhea.lock"].1, 1);
+        assert!(locks.try_take_in(dir.path(), &["gpu1.lock", "rhea.lock"], "gpu1.lock").unwrap());
+        assert_eq!(locks.held["rhea.lock"].1, 2);
+        locks.release(&["gpu1.lock", "rhea.lock"]);
+        assert_eq!(locks.held["rhea.lock"].1, 1);
+        locks.release(&["gpu1.lock", "rhea.lock"]);
+        assert!(locks.held.is_empty());
+        let check = File::options().read(true).write(true).open(dir.path().join("gpu1.lock")).unwrap();
+        assert!(matches!(check.try_lock(), Err(std::fs::TryLockError::WouldBlock)));
+        assert!(File::options().read(true).write(true).open(dir.path().join("rhea.lock")).unwrap().try_lock().is_ok());
+        parent.unlock().unwrap();
+        drop(parent);
+        assert!(check.try_lock().is_ok());
     }
 
     #[test]
