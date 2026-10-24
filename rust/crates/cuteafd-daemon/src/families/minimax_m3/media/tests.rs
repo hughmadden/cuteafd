@@ -56,7 +56,7 @@ async fn routed_request() -> (NativeRequest, Vec<u32>) {
     let snapshot = tokenizer_snapshot();
     let tokenizer = LoadedTokenizer::from_snapshot(snapshot.path()).unwrap();
     let encoding = MiniMaxEncoding::new(TEMPLATE, MiniMaxTokenIds {
-        eos: vec![200_020], think_close: 200_060, image: IMAGE_TOKEN, video: VIDEO_TOKEN }).unwrap();
+        eos: vec![200_020], think_close: 200_060, image: IMAGE_TOKEN, video: VIDEO_TOKEN, turn_markers: vec![200_019, 200_034] }).unwrap();
     let preparer = MediaPreparer::new(ProcessorConfig::for_family(ImageFamily::Minimax),
         EncoderId([17; 32]), ImageUrlFetch::Off, 1).unwrap();
     let profile = ModelProfile::new("test-minimax", ModelEncoding::MiniMaxM3(Arc::new(encoding)))

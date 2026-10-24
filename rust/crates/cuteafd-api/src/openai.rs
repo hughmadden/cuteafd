@@ -206,11 +206,12 @@ impl ModelProfile {
     /// Token ids that end generation for one request.
     fn stop_token_ids(&self, tools_declared: bool) -> Vec<u32> {
         match &self.encoding {
-            ModelEncoding::Glm(_) | ModelEncoding::Qwen(_) | ModelEncoding::Step5(_) => {
+            ModelEncoding::Glm(_) | ModelEncoding::Qwen(_) | ModelEncoding::Step5(_) | ModelEncoding::MiniMaxM3(_) => {
                 let mut ids = match &self.encoding {
                     ModelEncoding::Glm(encoding) => encoding.stop_token_ids(tools_declared),
                     ModelEncoding::Qwen(encoding) => encoding.stop_token_ids(tools_declared),
                     ModelEncoding::Step5(encoding) => encoding.stop_token_ids(tools_declared),
+                    ModelEncoding::MiniMaxM3(encoding) => encoding.stop_token_ids(),
                     _ => unreachable!(),
                 };
                 ids.extend(&self.eos_token_ids);
@@ -218,7 +219,7 @@ impl ModelProfile {
                 ids.dedup();
                 ids
             }
-            ModelEncoding::DeepseekV4 | ModelEncoding::DeepseekV41 | ModelEncoding::Kimi(_) | ModelEncoding::MiniMaxM3(_) => self.eos_token_ids.clone(),
+            ModelEncoding::DeepseekV4 | ModelEncoding::DeepseekV41 | ModelEncoding::Kimi(_) => self.eos_token_ids.clone(),
         }
     }
 }

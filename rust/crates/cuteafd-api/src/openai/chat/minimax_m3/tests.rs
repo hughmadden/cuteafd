@@ -140,18 +140,22 @@ fn response_format_joins_the_developer_message() {
 #[test]
 fn token_contract_is_pinned_to_the_release() {
     let tokens = encoding();
-    assert_eq!(tokens.tokens(), &MiniMaxTokenIds { eos: vec![200_020], think_close: 200_060, image: 200_025, video: 200_026 });
+    assert_eq!(tokens.tokens(), &MiniMaxTokenIds { eos: vec![200_020], think_close: 200_060, image: 200_025, video: 200_026,
+        turn_markers: vec![200_019, 200_034] });
     let profile_ids = crate::openai::ModelEncoding::MiniMaxM3(std::sync::Arc::new(encoding()));
     assert_eq!(profile_ids.eos_token_ids(), [200_020]);
     assert_eq!(profile_ids.think_close_token_id(), Some(200_060));
     assert!(profile_ids.supports_thinking_off());
+    // A fake next turn stops at its marker token instead of spending tokens until the parser sees it.
+    let profile = crate::openai::ModelProfile::new("m", profile_ids);
+    for tools in [false, true] { assert_eq!(profile.stop_token_ids(tools), [200_019, 200_020, 200_034]); }
 }
 
 fn snapshot_dir(eos: Value) -> tempfile::TempDir {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("chat_template.jinja"), TEMPLATE).unwrap();
     std::fs::write(dir.path().join("tokenizer_config.json"), br#"{"bos_token": "]~b]", "eos_token": "[e~["}"#).unwrap();
-    let added: Vec<_> = [("]~b]", 200_019), ("[e~[", 200_020), (IMAGE, 200_025), (VIDEO, 200_026),
+    let added: Vec<_> = [("]~b]", 200_019), ("[e~[", 200_020), (IMAGE, 200_025), (VIDEO, 200_026), ("]~!b[", 200_034),
         (NS, 200_058), (THINK_OPEN, 200_059), (THINK_CLOSE, 200_060)]
         .into_iter().map(|(content, id)| json!({"content": content, "id": id})).collect();
     std::fs::write(dir.path().join("tokenizer.json"), json!({"added_tokens": added}).to_string()).unwrap();
@@ -623,7 +627,7 @@ mod router {
             assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&bytes));
             assert!(seen.prompt.starts_with("]~!b[]~b]system\n") && seen.prompt.contains("<effort>high</effort>"));
             assert!(seen.prompt.contains("<tool>{\"name\": \"get_weather\"") && seen.prompt.ends_with("]~b]ai\n"));
-            assert!(seen.stops.contains(&200_020) && !seen.stops.contains(&248_046));
+            assert_eq!(seen.stops, [200_019, 200_020, 200_034]);
             assert!(seen.constraint.is_none());
             // The release's recommended sampling applies when the client sets none.
             assert_eq!((seen.temperature, seen.top_p), (1.0, 0.95));
