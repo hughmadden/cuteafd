@@ -4,9 +4,9 @@
 //! coordinator's one GPU. Routed experts, vision and the drafter are separate
 //! owners.
 use super::Model;
-use crate::formats::native_dense::{self, Hold, NativeDenseLayout, GATE_UP};
+use crate::formats::native_dense::{Hold, NativeDenseLayout, RankWeightLayout, GATE_UP};
 use crate::plan::{checkpoint::Checkpoint, spec::Component};
-use anyhow::{ensure, Result};
+use anyhow::Result;
 use cuteafd_core::DType;
 
 const EMBEDDING: &str = "language_model.model.embed_tokens.weight";
@@ -39,32 +39,18 @@ pub fn native_weights(checkpoint: &Checkpoint) -> Result<NativeDenseLayout> {
 
 /// Every operand of `weights` whole on one GPU, gate/up and K/V fused: the
 /// target's layout and the drafter's.
-pub fn single_gpu(weights: &NativeDenseLayout) -> Result<native_dense::RankWeightLayout> {
-    native_dense::RankWeightLayout::from_native(weights, 0, 1, &FUSED, |source| Ok(Some(Hold::whole(source))))
+pub fn single_gpu(weights: &NativeDenseLayout) -> Result<RankWeightLayout> {
+    RankWeightLayout::from_native(weights, 0, 1, &FUSED, |source| Ok(Some(Hold::whole(source))))
 }
 
-/// The coordinator's resident text operands: the shared dense layout on
-/// MiniMax's one GPU (the planner and the server open it by this name).
-#[derive(Debug, Clone)]
-pub struct RankWeightLayout(pub native_dense::RankWeightLayout);
-
-impl std::ops::Deref for RankWeightLayout {
-    type Target = native_dense::RankWeightLayout;
-    fn deref(&self) -> &Self::Target { &self.0 }
-}
-
-impl RankWeightLayout {
-    /// MiniMax M3 runs one coordinator GPU: `rank` 0 of 1.
-    pub fn from_checkpoint(checkpoint: &Checkpoint, rank: usize, ranks: usize) -> Result<Self> {
-        ensure!((rank, ranks) == (0, 1), "MiniMax M3 runs one coordinator GPU, not rank {rank} of {ranks}");
-        Ok(Self(single_gpu(&native_weights(checkpoint)?)?))
-    }
-
-    /// Mapped token lookup owns the embedding; the untied output head stays resident.
-    pub fn with_host_embedding(self, checkpoint: &Checkpoint) -> Result<Self> {
-        checkpoint.require_untied_embedding(EMBEDDING)?;
-        Ok(Self(self.0.retain(|operand| operand.name != EMBEDDING)?))
-    }
+/// The coordinator's resident text operands on its one GPU, as the planner and
+/// the server admit them. With `host_embedding`, mapped token lookup owns the
+/// embedding; the untied output head stays resident.
+pub fn resident_weights(checkpoint: &Checkpoint, host_embedding: bool) -> Result<RankWeightLayout> {
+    let weights = single_gpu(&native_weights(checkpoint)?)?;
+    if !host_embedding { return Ok(weights); }
+    checkpoint.require_untied_embedding(EMBEDDING)?;
+    weights.retain(|operand| operand.name != EMBEDDING)
 }
 
 #[cfg(test)]
@@ -80,7 +66,7 @@ mod tests {
         let checkpoint = Checkpoint::open(dir.path()).unwrap();
         let weights = native_weights(&checkpoint).unwrap();
         assert!(weights.tensors.iter().all(|t| !t.meta.name.contains(".experts.") && !t.meta.name.starts_with("vision")));
-        let one = RankWeightLayout::from_checkpoint(&checkpoint, 0, 1).unwrap();
+        let one = resident_weights(&checkpoint, false).unwrap();
         let find = |name: &str| one.operands.iter().find(|o| o.name == name).cloned().unwrap();
         let shared = find("language_model.model.layers.3.block_sparse_moe.shared_experts.gate_up_proj.weight");
         assert_eq!((shared.shape.as_slice(), shared.sources.len()), (&[6144, 6144][..], 2));
@@ -98,9 +84,7 @@ mod tests {
             == o.sources.iter().map(|s| s.meta.byte_length).sum::<u64>().max(256)));
         assert_eq!(one.resident_bytes, one.operands.iter().map(|o| o.allocation_bytes).sum::<u64>());
         assert_eq!(one.operands.iter().map(|o| o.sources.len()).sum::<usize>(), weights.tensors.len());
-        for (rank, ranks) in [(0, 2), (1, 2), (1, 1), (0, 0)] {
-            assert!(RankWeightLayout::from_checkpoint(&checkpoint, rank, ranks).is_err());
-        }
+        assert_eq!((one.rank, one.ranks), (0, 1));
     }
 
     #[test]
@@ -108,8 +92,8 @@ mod tests {
         let dir = tempfile::tempdir()?;
         testing::write_minimax_m3_snapshot(dir.path(), false, false);
         let mut checkpoint = Checkpoint::open(dir.path())?;
-        let gpu = RankWeightLayout::from_checkpoint(&checkpoint, 0, 1)?;
-        let host = gpu.clone().with_host_embedding(&checkpoint)?;
+        let gpu = resident_weights(&checkpoint, false)?;
+        let host = resident_weights(&checkpoint, true)?;
         let embedding = gpu.operands.iter().find(|o| o.name.ends_with("embed_tokens.weight")).unwrap();
         assert_eq!(gpu.resident_bytes - host.resident_bytes, embedding.allocation_bytes);
         assert_eq!(host.operands.len() + 1, gpu.operands.len());
@@ -118,7 +102,7 @@ mod tests {
             .find(|o| o.name == "language_model.lm_head.weight").unwrap().allocation_bytes;
         assert_eq!(head(&gpu), head(&host));
         checkpoint.config["tie_word_embeddings"] = serde_json::Value::Bool(true);
-        assert!(gpu.with_host_embedding(&checkpoint).is_err());
+        assert!(resident_weights(&checkpoint, true).is_err());
         Ok(())
     }
 }

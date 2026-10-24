@@ -1,6 +1,6 @@
 //! Allocation recipe shared by native serving and manifest-backed planning.
 use std::collections::BTreeMap;
-use super::coordinator::RankWeightLayout;
+use crate::formats::native_dense::RankWeightLayout;
 use crate::serving_capacity::{prefill_lanes::{lane_capacity, MAX_PREFILL_LANES}, spark_intake_bytes};
 use crate::families::minimax_m3::{cache::{MiniMaxCacheLayout, PAGE_ROWS}, config::MiniMaxM3Config};
 use crate::families::qwen4::Qwen4KvCache;
@@ -415,8 +415,7 @@ impl Recipe {
         let cache = MiniMaxCacheLayout::new(cfg, sizing.context, request.kv_format)?;
         let programs = ProgramSizes::from_manifest(programs, sizing)?;
         let ledger = RuntimeLedger::new(cfg, sizing, &programs)?;
-        let weights = RankWeightLayout::from_checkpoint(checkpoint, 0, 1)?;
-        let weights = if request.host_embedding { weights.with_host_embedding(checkpoint)? } else { weights };
+        let weights = super::coordinator::resident_weights(checkpoint, request.host_embedding)?;
         let endpoints = vec![cuteafd_core::SparkEndpoint { capacity: u32::try_from(sizing.rows)?,
             ingress: cuteafd_core::SparkIngress::Bf16 }; sizing.lanes];
         let all_remote = crate::placement::SparkWorkingSet { rtx_layers: vec![], spark_layers: cfg.moe.iter().enumerate()
@@ -642,7 +641,7 @@ pub(crate) mod tests {
     fn prepared_scales_replace_source_storage_with_a_bounded_load_peak() {
         let dir = tempfile::tempdir().unwrap();
         testing::write_minimax_m3_snapshot(dir.path(), false, false);
-        let weights = RankWeightLayout::from_checkpoint(&Checkpoint::open(dir.path()).unwrap(), 0, 1).unwrap();
+        let weights = super::super::coordinator::resident_weights(&Checkpoint::open(dir.path()).unwrap(), false).unwrap();
         assert_eq!(scale_prep_staging_bytes(&weights), 24576 * 6144 / 32);
     }
 

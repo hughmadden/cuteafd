@@ -9,7 +9,7 @@ use cuteafd_engine::{media::RequestMedia, prefix::{After, PrefixCache, PrefixCon
 use cuteafd_ffi::CuteafdDeviceBuffer;
 use cuteafd_hostcache::copy::StubCopyEngine;
 use cuteafd_loader::{families::{minimax_m3::config::MiniMaxM3Config, qwen4::Qwen4KvCache},
-    plan::{checkpoint::{read_json, Checkpoint}, families::minimax::{admission, coordinator::RankWeightLayout}}};
+    plan::{checkpoint::{read_json, Checkpoint}, families::minimax::{admission, coordinator}}};
 use cuteafd_transport::ExpertV2SourceKind;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -432,7 +432,7 @@ pub(crate) async fn run_golden(args: GoldenArgs) -> Result<()> {
     let checkpoint = Checkpoint::coordinator(&args.snapshot, false, false)?;
     let cfg = MiniMaxM3Config::from_hf(&checkpoint.config)?;
     cfg.release_geometry()?;
-    let weights = RankWeightLayout::from_checkpoint(&checkpoint, 0, 1)?;
+    let weights = coordinator::resident_weights(&checkpoint, false)?;
     let mut catalog = cuteafd_loader::read_expert_catalog(&args.snapshot)?;
     catalog.select_draft(cuteafd_loader::plan::spec::DraftOwnership::None)?;
     if args.check_headers {

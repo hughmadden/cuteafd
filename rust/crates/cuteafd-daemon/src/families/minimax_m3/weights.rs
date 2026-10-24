@@ -13,7 +13,7 @@ pub(super) struct Weights<'a> { operands: BTreeMap<String, Allocation<'a>> }
 
 impl<'a> Weights<'a> {
     pub fn load(native: &Native<'a>, checkpoint: &Checkpoint) -> Result<Self> {
-        let layout = coordinator::RankWeightLayout::from_checkpoint(checkpoint, 0, 1)?;
+        let layout = coordinator::resident_weights(checkpoint, false)?;
         Self::load_layout(native, checkpoint, &layout)
     }
     pub fn draft_layout(contract: &cuteafd_loader::families::minimax_m3::dspark::DsparkContract) -> Result<RankWeightLayout> {
@@ -82,7 +82,7 @@ mod tests {
         let dir = tempfile::tempdir()?;
         testing::write_minimax_m3_snapshot(dir.path(), true, true);
         let checkpoint = Checkpoint::open(dir.path())?;
-        let layout = coordinator::RankWeightLayout::from_checkpoint(&checkpoint,0,1)?;
+        let layout = coordinator::resident_weights(&checkpoint,false)?;
         assert_eq!(layout.resident_bytes,layout.operands.iter().map(|w|w.allocation_bytes).sum::<u64>());
         for suffix in ["weight","weight_scale_inv"] {
             let operand = layout.operands.iter().find(|w|w.name == format!("language_model.model.layers.0.self_attn.kv_proj.{suffix}")).unwrap();
