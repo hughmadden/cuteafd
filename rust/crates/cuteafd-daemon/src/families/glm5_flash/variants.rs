@@ -17,7 +17,9 @@
 //! Table pointers and the per-row variant ids (`w.variants`, uploaded with the
 //! step's tables) have stable addresses, so captured decode graphs keep their keys
 //! and always launch at configured sites; a prefill chunk with only base rows
-//! launches nothing. Base rows (`vidx == 0`) are never written.
+//! launches nothing. Base rows (`vidx == 0`) are never written. The kernels are
+//! `cuteafd_ffi::steer_rows` (`SteerRows`, `AddRows`), bound (their modules loaded on the
+//! coordinator device) when the sites upload, before any decode graph capture.
 use crate::shared::fp8_linear::{Fp8Scales, Fp8Weight};
 use crate::shared::memory::DeviceAllocation;
 use anyhow::{ensure, Context, Result};
@@ -54,6 +56,11 @@ pub(crate) struct GlmfVariants<'a> {
     scratch: Option<DeviceAllocation<'a>>,
     slice_rows: usize,
     hidden: usize,
+    /// Table slots past base: the largest variant index.
+    slots: usize,
+    /// The bound kernels: steering when a site steers, the masked add when one stores a delta.
+    steer_rows: Option<cuteafd_ffi::steer_rows::SteerRows<'a>>,
+    add_rows: Option<cuteafd_ffi::steer_rows::AddRows<'a>>,
     pub records: Vec<VariantRecord>,
     pub plans: Vec<VariantPlan>,
 }
@@ -169,7 +176,10 @@ impl<'a> GlmfVariants<'a> {
             (Some(DeviceAllocation::new(library, slice_rows * hidden * 4)?),
                 Some(crate::shared::fp8_linear::scratch(library, slice_rows, &gemv)?))
         };
-        Ok(Self { steer, deltas, out, scratch, slice_rows, hidden, records, plans })
+        let slots = plans.iter().map(|p| usize::from(p.index)).max().unwrap_or(0);
+        let steer_rows = (!steer.is_empty()).then(|| library.steer_rows()).transpose()?;
+        let add_rows = (!deltas.is_empty()).then(|| library.add_rows()).transpose()?;
+        Ok(Self { steer, deltas, out, scratch, slice_rows, hidden, slots, steer_rows, add_rows, records, plans })
     }
 
     pub fn site_count(&self) -> usize { self.steer.len() + self.deltas.len() }
@@ -177,15 +187,17 @@ impl<'a> GlmfVariants<'a> {
     pub fn slice_rows(&self) -> usize { self.slice_rows }
 
     /// Steer `rows` BF16 rows of `x` (row stride `hidden`) at `key`, if any variant steers it.
-    pub fn steer(&self, library: &NativeLibrary, key: SiteKey, x: *mut c_void, rows: usize, vidx: *const c_void,
-        stream: *mut c_void) -> Result<()> {
+    pub fn steer(&self, key: SiteKey, x: *mut c_void, rows: usize, vidx: *const c_void, stream: *mut c_void) -> Result<()> {
         let Some(site) = self.steer.get(&key) else { return Ok(()) };
-        // SAFETY: `x` holds `rows` live BF16 rows of `hidden` columns and `vidx` `rows` i32 ids on
-        // this stream's device; the tables are this struct's live allocations of the §4 shapes.
+        let kernel = self.steer_rows.as_ref().context("steer_rows binding")?;
+        let shape = cuteafd_ffi::steer_rows::SteerRowsShape { rows, h: self.hidden, ld: self.hidden, k_max: site.k_max,
+            variants: self.slots };
+        // SAFETY: `x` holds `rows` live BF16 rows of `hidden` columns and `vidx` `rows` i32 ids on the
+        // binding device, ordered on `stream`; the tables are this struct's live allocations of the §4
+        // shapes (256-byte aligned), and `x` overlaps none of them.
         unsafe {
-            steer_rows(library, x, self.hidden as i64, i32::try_from(rows)?, i32::try_from(self.hidden)?, vidx.cast(),
-                site.a.buffer.ptr.cast_const().cast(), site.b.buffer.ptr.cast_const().cast(),
-                site.k.buffer.ptr.cast_const().cast(), i32::try_from(site.k_max)?, stream)
+            kernel.launch_raw(x.cast(), vidx.cast(), site.a.buffer.ptr.cast_const().cast(),
+                site.b.buffer.ptr.cast_const().cast(), site.k.buffer.ptr.cast_const().cast(), shape, stream)
         }.with_context(|| format!("steer_rows at {key}"))
     }
 
@@ -197,6 +209,7 @@ impl<'a> GlmfVariants<'a> {
         vidx: *const c_void, stream: *mut c_void) -> Result<()> {
         let Some(site) = self.deltas.get(&key) else { return Ok(()) };
         let (out, scratch) = (self.out.as_ref().context("delta output")?, self.scratch.as_ref().context("delta scratch")?);
+        let add = self.add_rows.as_ref().context("add_rows binding")?;
         let (h, k) = (self.hidden, site.weight.k);
         for first in (0..rows).step_by(self.slice_rows) {
             let n = self.slice_rows.min(rows - first);
@@ -205,32 +218,13 @@ impl<'a> GlmfVariants<'a> {
             // stream orders the GEMV before the add and the next slice's GEMV after it.
             unsafe {
                 site.weight.apply(library, x.byte_add(first * k * 2), out.buffer.ptr, true, n, 0, h, scratch, stream)?;
-                add_rows(library, y.byte_add(first * h * 2), h as i64, out.buffer.ptr.cast_const().cast(), h as i64,
-                    i32::try_from(n)?, i32::try_from(h)?, vidx.byte_add(first * 4).cast(),
-                    site.on.buffer.ptr.cast_const().cast(), stream)
+                add.launch_raw(y.byte_add(first * h * 2).cast(), out.buffer.ptr.cast_const().cast(),
+                    vidx.byte_add(first * 4).cast(), site.on.buffer.ptr.cast_const().cast(),
+                    cuteafd_ffi::steer_rows::AddRowsShape { rows: n, h, ld_y: h, ld_d: h, variants: self.slots }, stream)
             }.with_context(|| format!("delta at {key}"))?;
         }
         Ok(())
     }
-}
-
-/// `cuteafd_steer_rows` (contract §4). Temporary until the `cuteafd-ffi` binding from the
-/// kernel session merges: it refuses to run, so a configured variant can never serve rows
-/// unsteered, and nothing launches when no `--variant` is given.
-#[allow(clippy::too_many_arguments)]
-unsafe fn steer_rows(_library: &NativeLibrary, _x: *mut c_void, _ld: i64, _rows: i32, _h: i32, _vidx: *const i32,
-    _a: *const f32, _b: *const f32, _k: *const i32, _k_max: i32, _stream: *mut c_void) -> Result<()> {
-    anyhow::bail!("the steer_rows kernel binding is not in this build yet (weight-variant kernel session); \
-        --variant cannot serve on the GPU")
-}
-
-/// `cuteafd_add_rows` (the delta site's masked add; host reference
-/// `cuteafd_core::variants::add_rows_ref`). Temporary, as [`steer_rows`].
-#[allow(clippy::too_many_arguments)]
-unsafe fn add_rows(_library: &NativeLibrary, _y: *mut c_void, _ld_y: i64, _d: *const f32, _ld_d: i64, _rows: i32,
-    _h: i32, _vidx: *const i32, _on: *const i32, _stream: *mut c_void) -> Result<()> {
-    anyhow::bail!("the add_rows kernel binding is not in this build yet (weight-variant kernel session); \
-        a delta variant cannot serve on the GPU")
 }
 
 /// Why a derived variant cannot serve on GLM Flash's sites (`None`: it can).
