@@ -1,6 +1,8 @@
 // Official MiniMax tower: FP32 Conv3d, BF16 CLIP blocks and two GELU projectors.
 constexpr int MM_HIDDEN=1280, MM_INTER=5120, MM_PATCH=1176, MM_OUTPUT=6144;
 constexpr int MM_CHUNK=1024;
+// Temporal patch pairs per video attention segment (vision_segment_max_frames).
+constexpr int MM_SEGMENT_PAIRS=4;
 
 bool valid_minimax(const cuteafd_vision_spec& s) {
   if(s.abi_version!=3 || s.reserved!=4 || s.geometry_reserved || !s.max_tokens || s.max_tokens>4096 ||
@@ -71,10 +73,6 @@ __global__ void minimax_round(float* x,size_t count) {
   for(size_t i=size_t(blockIdx.x)*blockDim.x+threadIdx.x;i<count;i+=size_t(gridDim.x)*blockDim.x)
     x[i]=round_bf16(x[i]);
 }
-__global__ void minimax_residual(float* x,const float* y,const float* bias,size_t count) {
-  for(size_t i=size_t(blockIdx.x)*blockDim.x+threadIdx.x;i<count;i+=size_t(gridDim.x)*blockDim.x)
-    x[i]=round_bf16(x[i]+round_bf16(y[i]+bias[i%MM_HIDDEN]));
-}
 __global__ void minimax_rope(const float* qkv,const float* bias,const int32_t* thw,
   const float* inv,int row0,uint16_t* q,uint16_t* k,uint16_t* v) {
   int row=blockIdx.x,global=row0+row;
@@ -108,7 +106,7 @@ int minimax_patch_gemm(Owner* o,int rows,const float* x,float* y) {
 int encode_minimax(Owner* o,const uint8_t* rgb,uint64_t rgb_bytes,const float* lut,int gt,int gh,int gw,
   bool still,uint16_t* output,uint64_t output_bytes,cuteafd_vision_observer cb,void* ctx) {
   const auto& s=o->spec;
-  if(!o->uploaded || !rgb || !lut || !output || gt<1 || gt>4 || gh<2 || gw<2 || gh%2 || gw%2 ||
+  if(!o->uploaded || !rgb || !lut || !output || gt<1 || gt>MM_SEGMENT_PAIRS || gh<2 || gw<2 || gh%2 || gw%2 ||
      (still && gt!=1))return cudaErrorInvalidValue;
   int64_t count=int64_t(gt)*gh*gw;
   if(count>int64_t(s.max_tokens)*4 || rgb_bytes!=uint64_t(count)*14*14*3*(still?1:2) ||
@@ -142,7 +140,7 @@ int encode_minimax(Owner* o,const uint8_t* rgb,uint64_t rgb_bytes,const float* l
     for(int r=0;r<n;r+=MM_CHUNK) {
       int rows=std::min(MM_CHUNK,n-r);
       MM_RUN(gemm(o,o->attn+size_t(r)*MM_HIDDEN,b.proj,rows,MM_HIDDEN,MM_HIDDEN,o->proj));
-      MM_LAUNCH((minimax_residual<<<grid_for(long(rows)*MM_HIDDEN),256,0,stream>>>(o->x+size_t(r)*MM_HIDDEN,o->proj,w(b.proj_bias),size_t(rows)*MM_HIDDEN)));
+      MM_LAUNCH((qwen_residual<<<grid_for(long(rows)*MM_HIDDEN),256,0,stream>>>(o->x+size_t(r)*MM_HIDDEN,o->proj,w(b.proj_bias),size_t(rows)*MM_HIDDEN,MM_HIDDEN)));
     }
     MM_LAUNCH((layernorm_bf16_kernel<<<n,256,0,stream>>>(o->x,w(b.norm2),w(n2),o->norm,MM_HIDDEN,s.norm_eps)));
     for(int r=0;r<n;r+=MM_CHUNK) {
@@ -150,12 +148,11 @@ int encode_minimax(Owner* o,const uint8_t* rgb,uint64_t rgb_bytes,const float* l
       MM_RUN(gemm(o,o->norm+size_t(r)*MM_HIDDEN,b.gate_up,rows,MM_INTER,MM_HIDDEN,o->gu));
       MM_LAUNCH((qwen_biased_gelu<<<grid_for(long(rows)*MM_INTER),256,0,stream>>>(o->gu,w(b.gate_up_bias),o->mlp,size_t(rows)*MM_INTER,MM_INTER,false)));
       MM_RUN(gemm(o,o->mlp,b.down,rows,MM_HIDDEN,MM_INTER,o->proj));
-      MM_LAUNCH((minimax_residual<<<grid_for(long(rows)*MM_HIDDEN),256,0,stream>>>(o->x+size_t(r)*MM_HIDDEN,o->proj,w(b.down_bias),size_t(rows)*MM_HIDDEN)));
+      MM_LAUNCH((qwen_residual<<<grid_for(long(rows)*MM_HIDDEN),256,0,stream>>>(o->x+size_t(r)*MM_HIDDEN,o->proj,w(b.down_bias),size_t(rows)*MM_HIDDEN,MM_HIDDEN)));
     }
     if((i+1)%4==0)MM_RUN(observe(o,cb,ctx,i+1,o->x,n,MM_HIDDEN,false));
   }
-  // cast_bf16 is one element per thread: it needs the exact grid, not grid_for's 4096-block cap.
-  MM_LAUNCH((cast_bf16<<<(size_t(n)*MM_HIDDEN+255)/256,256,0,stream>>>(o->x,o->norm,size_t(n)*MM_HIDDEN)));
+  MM_LAUNCH((cast_bf16<<<grid_for(long(n)*MM_HIDDEN),256,0,stream>>>(o->x,o->norm,size_t(n)*MM_HIDDEN)));
   for(int r=0;r<n;r+=MM_CHUNK) {
     int rows=std::min(MM_CHUNK,n-r);
     MM_RUN(gemm(o,o->norm+size_t(r)*MM_HIDDEN,s.merger_extra[0],rows,MM_OUTPUT,MM_HIDDEN,o->fc1));
