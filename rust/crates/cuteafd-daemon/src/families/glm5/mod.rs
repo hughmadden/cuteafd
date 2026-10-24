@@ -8,6 +8,7 @@ pub(crate) mod landing;
 pub(crate) mod native_dense;
 pub(crate) mod push;
 pub(crate) mod weights;
+pub(crate) mod variants;
 
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::NativeLibrary;
@@ -116,6 +117,12 @@ pub(crate) struct EngineArgs {
     /// Numerical decode/verify reduction plan rows; automatic uses the active drafter width.
     #[arg(long, env = "CUTEAFD_ATTENTION_PLAN_ROWS")]
     pub attention_plan_rows: Option<usize>,
+    /// Weight variants to derive and serve (`serve-glm --variant`, indexed 1..=7).
+    #[arg(skip)]
+    pub variants: Vec<(u8, cuteafd_core::variants::VariantSpec)>,
+    /// The served model id the variants' public ids derive from.
+    #[arg(skip)]
+    pub served_id: String,
 }
 
 fn native_activation(args: &EngineArgs, first_moe: usize, layers: usize, serving: bool) -> Result<()> {
@@ -544,9 +551,18 @@ impl Opened {
                 + lanes * engine::native_dense::scratch_bytes(&self.cfg, heads, inter, args.prefill_rows);
             vec![per_gpu as u64; devices.len()]
         } else { Vec::new() };
-        let gpus = inventory.gpus.iter().zip(&reserved_weights).map(|(gpu, &bytes)| -> Result<_> {
-            let free_bytes = gpu.free_bytes.checked_sub(bytes)
-                .context("GLM coordinator header-derived weights exceed pre-weight free memory")?;
+        // Weight variants: derived on the CPU before admission so their tables are charged
+        // before the KV pool is sized (they live outside the weight ledger).
+        let variants = if args.variants.is_empty() { None } else {
+            ensure!(devices.len() == 1 && owners.is_none() && !native,
+                "weight variants need one coordinator GPU (no head split, layer owners or EXLR8 native dense) for now");
+            Some(variants::derive(&self.snapshot, &args.served_id, &args.variants, self.cfg.hidden)?)
+        };
+        let variant_bytes = variants.as_ref().map_or(0, |v| v.bytes);
+        let gpus = inventory.gpus.iter().zip(&reserved_weights).enumerate().map(|(rank, (gpu, &bytes))| -> Result<_> {
+            let charge = if rank == 0 { variant_bytes } else { 0 };
+            let free_bytes = gpu.free_bytes.checked_sub(bytes).and_then(|free| free.checked_sub(charge))
+                .context("GLM coordinator header-derived weights (and variant tables) exceed pre-weight free memory")?;
             Ok((gpu.total_bytes, Baseline::Measured { free_bytes }))
         }).collect::<Result<Vec<_>>>()?;
         inventory.record("glm5", &gpus.iter().map(|(_, b)| match b {
@@ -806,6 +822,13 @@ impl Opened {
             max_context, args.prefill_rows, pages, embedding, prefill_lanes, context.filter(|_| context_kv))?;
         engine.native_experts = native_owners;
         engine.spark_bf16 = spark_bf16;
+        if let Some(derived) = variants {
+            ensure!(tp2_range.is_none(), "weight variants do not support local TP2 layers yet");
+            let tables = variants::GlmVariantTables::upload(&self.library, derived.plans, derived.records, self.cfg.hidden)?;
+            tracing::info!(sites = tables.site_count(), bytes = variant_bytes, variants = tables.records.len(),
+                "GLM weight-variant tables resident");
+            engine.variants = Some(tables);
+        }
         engine.full_prefill_logits = args.full_prefill_logits;
         engine.prefill_span_rows = args.prefill_span_rows;
         engine.attention_plan = attention_plan;
