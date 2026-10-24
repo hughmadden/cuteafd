@@ -1190,6 +1190,8 @@ pub(crate) struct NativeServeArgs {
     /// Number of replicated Spark expert groups, each holding all 384 experts (opt-in; all-or-none with --spark-tp).
     #[arg(long, requires = "spark_tp", value_parser = clap::value_parser!(u8).range(1..=3))]
     pub spark_ep: Option<u8>,
+    #[command(flatten)]
+    pub variants: crate::shared::variants::VariantArgs,
 }
 
 /// Parse transport geometry; checkpoint admission checks native package coverage.
