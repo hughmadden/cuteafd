@@ -171,10 +171,8 @@ impl<'a, R> Pass<'a, R> {
 
     fn drain_chain(&self) -> Result<()> {
         let chain = self.chain.as_ref().context("target pass chain absent")?;
-        if crate::shared::memory::chain::device_enabled() {
-            chain.drain_bounded(Duration::from_secs(60)).map_err(|error|
-                error.context(format!("device lanes: {}", cuteafd_transport::expert::device_stuck_report())))
-        } else { chain.drain() }
+        chain.drain_bounded(Duration::from_secs(60)).map_err(|error|
+            error.context(format!("device lanes: {}", cuteafd_transport::expert::device_stuck_report())))
     }
 
     pub(crate) fn set_device_order(&mut self, on: bool) { self.device_order = on; }
@@ -440,7 +438,7 @@ impl<'w, 'a> TargetPass<'w, 'a> {
         // unscoped, so the chained work must be complete before returning.
         let drained = self.drain_chain();
         let result = result.and(drained).and_then(|()| transport.check_device());
-        if result.is_ok() && crate::shared::memory::chain::device_enabled() {
+        if result.is_ok() {
             // Device-ordered local layers left their captured routes in the router's ring.
             self.resources.lane.drain_route_ring()?;
         }
