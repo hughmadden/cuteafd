@@ -5487,6 +5487,15 @@ Every family that sends experts to Sparks prefills the same way.
     byte-identity gate.
   - Card bars: 8K and TTFT ≥ 0.98×, decode ≥ 0.95×, KL identical. Report a
     64K row, the Spark busy fraction and a per-buffer workspace breakdown.
+  - **Absolute bar (TJ, 2026-10-24).** A same-day ratio against work/p0 is not
+    enough: GLM 5.3 K4 max fell from ~2,800–3,268 tok/s at 8K (Oct 11–20) to
+    ~1,900–2,060 while every card passed against an already-regressed
+    baseline. Each family's port must also match or beat its best recorded
+    absolute 8K/64K prefill from before the shared path, on the same layout
+    and quant, before it lands. References: GLM 5.3 K4 max 8K ≥ 3,000
+    (3,268 on 2026-10-20, be747f19d); MiMo Pro max 8K ≥ 3,479 (old 3-lane
+    path, 2026-10-24). Every card reports the absolute numbers next to the
+    family's reference. A family that was good before cannot land slower.
 - **Today (audit 2026-10-23):**
   - GLM 5.3 runs 3 lanes, GLM Flash 2, MiMo 3/2 (measured), V4 2 and V4.1 2
     on `PipelineOrder`;
