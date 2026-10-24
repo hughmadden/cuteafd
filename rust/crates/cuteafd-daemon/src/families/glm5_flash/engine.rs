@@ -5402,7 +5402,9 @@ mod prefill_lane_tests {
             // large tile, including _glm_kernels.glm_projection) passes none, so its default kernel
             // and entries are built exactly as before: shapes, arithmetic routes and thresholds
             // are unchanged.
-            ("gemm/bf16_gemv/_skinny.py", 0xcb7f_0612_9acd_baff),
+            // Fork #151 splits only `COMPENSATED_TILES_BY_ROWS[(6144, 4096)]`'s 16-row band at
+            // 8 rows (bitwise-equal retiling; no GLM program reads the compensated table).
+            ("gemm/bf16_gemv/_skinny.py", 0x9952_d5a8_6510_7b35),
         ] {
             let bytes = std::fs::read(root.join(path)).unwrap();
             let hash = bytes.iter().fold(0xcbf2_9ce4_8422_2325_u64,
