@@ -154,7 +154,8 @@ int encode_minimax(Owner* o,const uint8_t* rgb,uint64_t rgb_bytes,const float* l
     }
     if((i+1)%4==0)MM_RUN(observe(o,cb,ctx,i+1,o->x,n,MM_HIDDEN,false));
   }
-  MM_LAUNCH((cast_bf16<<<grid_for(long(n)*MM_HIDDEN),256,0,stream>>>(o->x,o->norm,size_t(n)*MM_HIDDEN)));
+  // cast_bf16 is one element per thread: it needs the exact grid, not grid_for's 4096-block cap.
+  MM_LAUNCH((cast_bf16<<<(size_t(n)*MM_HIDDEN+255)/256,256,0,stream>>>(o->x,o->norm,size_t(n)*MM_HIDDEN)));
   for(int r=0;r<n;r+=MM_CHUNK) {
     int rows=std::min(MM_CHUNK,n-r);
     MM_RUN(gemm(o,o->norm+size_t(r)*MM_HIDDEN,s.merger_extra[0],rows,MM_OUTPUT,MM_HIDDEN,o->fc1));
