@@ -378,7 +378,7 @@ mod tests {
         let template = include_str!(concat!(env!("CARGO_MANIFEST_DIR"),
             "/../cuteafd-api/src/openai/chat/minimax_m3/fixtures/chat_template.jinja"));
         let encoding = Arc::new(MiniMaxEncoding::new(template, MiniMaxTokenIds { eos: vec![200_020], think_close: 200_060,
-            image: 200_025, video: 200_026, turn_markers: vec![200_019, 200_034] }).unwrap());
+            turn_markers: vec![200_019, 200_034] }).unwrap());
         let padded = |n: usize| format!("{CALL_OPEN}{}{}", "\n".repeat(n), &weather[CALL_OPEN.len() + 1..]);
         let in_value = weather.replacen("Taipei", &format!("Tai{NS}pei"), 1);
         let undeclared = weather.replace("get_weather", "get_wether");

@@ -42,9 +42,7 @@ pub fn template_context(body: &Value, options: &Step5PromptOptions, bos: &str) -
     }
     let mut context = json!({"messages": messages, "bos_token": bos, "add_generation_prompt": true});
     if !options.tool_names.is_empty() {
-        let tools = body.get("tools").and_then(Value::as_array).ok_or("tools must be an array")?;
-        context["tools"] = Value::Array(tools.iter().filter(|tool| tool["function"]["name"].as_str()
-            .is_some_and(|name| options.tool_names.iter().any(|wanted| wanted == name))).cloned().collect());
+        context["tools"] = Value::Array(crate::openai::chat::glm5::prompt::declared_tools(body, &options.tool_names)?);
     }
     if let Some(effort) = reasoning_effort(body)? { context["reasoning_effort"] = Value::String(effort); }
     let preserve = body.get("preserve_thinking").filter(|v| !v.is_null()).or_else(||

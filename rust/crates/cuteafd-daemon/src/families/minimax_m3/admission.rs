@@ -33,7 +33,6 @@ pub(super) struct Admitted {
     pub spark_layers: Vec<usize>,
     pub weights: RankWeightLayout,
     pub local_capacity: Option<usize>,
-    pub spark_capacity: usize,
     /// Decode steps the warm-up records before ready; their bytes are reserved.
     pub graphs: cuteafd_loader::placement::inventory::StartupGraphs<usize>,
     reservations: Reservations,
@@ -100,7 +99,7 @@ pub(super) fn solve(checkpoint: &Checkpoint, programs: &serde_json::Value,
         request.requested_pool, request.kv_format)?;
     ensure!(cache.total_bytes <= request.available, "MiniMax admission exceeded its measured free bytes");
     Ok(Admitted { cache, ledger, programs, local_layers: onboard.local_layers, spark_layers: onboard.spark_layers,
-        weights, local_capacity, spark_capacity: request.sizing.rows, graphs, reservations })
+        weights, local_capacity, graphs, reservations })
 }
 
 #[cfg(test)]

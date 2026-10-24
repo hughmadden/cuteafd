@@ -97,17 +97,37 @@ pub struct GlmOutputParser {
     pending: String,
     call: Option<Call>,
     calls: usize,
-    content_started: bool,
-    held_whitespace: String,
+    visible: VisibleContent,
     stop: Option<GlmStop>,
+}
+
+/// Visible content as the XML tool-call parsers (GLM, Qwen, MiniMax) send it:
+/// leading whitespace is dropped and trailing whitespace waits until more
+/// content follows, so whitespace around a call never becomes a text block.
+#[derive(Debug, Default)]
+pub(crate) struct VisibleContent { started: bool, held: String }
+
+impl VisibleContent {
+    pub(crate) fn emit(&mut self, text: &str, out: &mut Vec<OutputChunk>) {
+        let text = if self.started { text } else { text.trim_start() };
+        if text.is_empty() { return; }
+        self.started = true;
+        let body = text.trim_end();
+        if !body.is_empty() { out.push(OutputChunk::Raw { content: std::mem::take(&mut self.held) + body }); }
+        self.held.push_str(&text[body.len()..]);
+    }
+    /// The held whitespace, which a call that opens now keeps with its text.
+    pub(crate) fn take_held(&mut self) -> String { std::mem::take(&mut self.held) }
+    /// Hold a call's preceding whitespace again when the call returns as content.
+    pub(crate) fn restore(&mut self, held: String) { self.held = held; }
+    pub(crate) fn clear(&mut self) { self.held.clear(); }
 }
 
 impl GlmOutputParser {
     pub fn new(mut options: GlmParserOptions) -> Self {
         options.stop_sequences.retain(|sequence| !sequence.is_empty());
         let mode = if options.thinking { Mode::Reasoning } else { Mode::Content };
-        Self { options, mode, pending: String::new(), call: None, calls: 0, content_started: false,
-            held_whitespace: String::new(), stop: None }
+        Self { options, mode, pending: String::new(), call: None, calls: 0, visible: VisibleContent::default(), stop: None }
     }
 
     /// Consume generated text; returns the chunks it completes.
@@ -132,7 +152,7 @@ impl GlmOutputParser {
             }
             self.mode = Mode::Done;
         }
-        self.held_whitespace.clear();
+        self.visible.clear();
         out
     }
 
@@ -196,7 +216,7 @@ impl GlmOutputParser {
             Marker::ThinkOpen => self.mode = Mode::Reasoning,
             Marker::ThinkClose => self.mode = Mode::Content,
             Marker::Call => {
-                let before = std::mem::take(&mut self.held_whitespace);
+                let before = self.visible.take_held();
                 self.call = Some(Call { text: TOOL_CALL.into(), before, ..Call::default() });
                 self.mode = Mode::Name;
             }
@@ -209,7 +229,7 @@ impl GlmOutputParser {
     fn halt(&mut self, reason: GlmStop) {
         self.stop = Some(reason);
         self.pending.clear();
-        self.held_whitespace.clear();
+        self.visible.clear();
         self.mode = Mode::Done;
     }
 
@@ -219,22 +239,7 @@ impl GlmOutputParser {
             out.push(OutputChunk::Reasoning { content: text });
             return;
         }
-        if self.calls == 0 { self.emit_content(&text, out); }
-    }
-
-    /// Visible content: leading whitespace is dropped, trailing whitespace
-    /// waits for more content.
-    fn emit_content(&mut self, text: &str, out: &mut Vec<OutputChunk>) {
-        let text = if self.content_started { text } else { text.trim_start() };
-        if text.is_empty() { return; }
-        self.content_started = true;
-        let body = text.trim_end();
-        let trailing = &text[body.len()..];
-        if !body.is_empty() {
-            let content = std::mem::take(&mut self.held_whitespace) + body;
-            out.push(OutputChunk::Raw { content });
-        }
-        self.held_whitespace.push_str(trailing);
+        if self.calls == 0 { self.visible.emit(&text, out); }
     }
 
     /// Consume `length` bytes of pending text; an open call keeps them.
@@ -426,8 +431,8 @@ impl GlmOutputParser {
     fn lose(&mut self, reason: &'static str, out: &mut Vec<OutputChunk>) {
         let call = self.call.take().expect("a call is open");
         tracing::warn!(id = %self.options.id, reason, text = %excerpt(&call.text), "GLM tool call returned as content");
-        self.held_whitespace = call.before;
-        self.emit_content(&call.text, out);
+        self.visible.restore(call.before);
+        self.visible.emit(&call.text, out);
         self.mode = Mode::Content;
     }
 }
@@ -435,7 +440,7 @@ impl GlmOutputParser {
 fn arguments(content: String) -> OutputChunk { OutputChunk::ToolArgumentsDelta { content } }
 
 /// Length of the longest suffix of `text` that is a proper prefix of `marker`.
-fn held_prefix(text: &str, marker: &str) -> usize {
+pub(crate) fn held_prefix(text: &str, marker: &str) -> usize {
     let longest = text.len().min(marker.len().saturating_sub(1));
     (1..=longest).rev()
         .find(|length| {
@@ -446,7 +451,7 @@ fn held_prefix(text: &str, marker: &str) -> usize {
 }
 
 /// The earliest of `tags` in `text`: (index, tag).
-fn first_of(text: &str, tags: &[&'static str]) -> Option<(usize, &'static str)> {
+pub(crate) fn first_of(text: &str, tags: &[&'static str]) -> Option<(usize, &'static str)> {
     tags.iter().filter_map(|&tag| text.find(tag).map(|index| (index, tag))).min_by_key(|&(index, _)| index)
 }
 
@@ -463,7 +468,7 @@ fn without_closing_tags(name: &str) -> &str {
 }
 
 /// A short excerpt of model text for a log line.
-fn excerpt(text: &str) -> String {
+pub(crate) fn excerpt(text: &str) -> String {
     match text.char_indices().nth(80) {
         Some((cut, _)) => format!("{:?}...", &text[..cut]),
         None => format!("{text:?}"),

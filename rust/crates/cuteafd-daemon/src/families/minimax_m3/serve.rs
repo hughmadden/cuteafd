@@ -9,7 +9,7 @@ use cuteafd_core::{ExpertGeometry, SparkEndpoint, SparkIngress};
 use cuteafd_loader::{families::{minimax_m3::config::MiniMaxM3Config, qwen4::Qwen4KvCache},
     plan::{checkpoint::Checkpoint, MediaMode}, placement::SparkWorkingSet, serving_capacity::prefill_lanes};
 use cuteafd_transport::{expert::SparkWorld, worker_selection::ModelAdmission, TcpTransportConfig};
-use std::{cell::RefCell, net::SocketAddr, path::PathBuf, sync::{Arc, Mutex}};
+use std::{cell::RefCell, net::SocketAddr, path::{Path, PathBuf}, sync::{Arc, Mutex}};
 
 #[derive(Debug, Clone, clap::Args)]
 pub(crate) struct ServeArgs {
@@ -41,6 +41,10 @@ pub(crate) struct ServeArgs {
     rtx_expert_layers: String,
     #[arg(long, default_value = "dspark", value_parser = ["dspark", "off"])]
     speculator: String,
+    /// Fixed DSpark draft depth (launcher SPECULATOR_DRAFTS); absent lets the
+    /// shared policy choose up to the drafter's block of seven, as on Kimi K3.
+    #[arg(long, value_parser = clap::value_parser!(u8).range(1..=7))]
+    draft_fixed: Option<u8>,
     #[arg(long, default_value = "0.0.0.0:8000")]
     listen: String,
     #[arg(long, default_value_t = 32768)]
@@ -117,7 +121,7 @@ impl ServeArgs {
     }
 }
 
-fn request(identity: u64, layer: usize, rows: usize, routes: Vec<cuteafd_transport::ExpertProtocolV2RouteEntry>,
+pub(super) fn request(identity: u64, layer: usize, rows: usize, routes: Vec<cuteafd_transport::ExpertProtocolV2RouteEntry>,
     wire: bytes::Bytes, kind: cuteafd_transport::ExpertV2SourceKind) -> Result<cuteafd_transport::ExpertProtocolV2Request> {
     use cuteafd_transport::{ExpertProtocolV2Request, ExpertProtocolV2RowDescriptor, ExpertV2Dtype};
     if identity == 0 || !(3..60).contains(&layer) || !(1..=4096).contains(&rows) {
@@ -129,6 +133,89 @@ fn request(identity: u64, layer: usize, rows: usize, routes: Vec<cuteafd_transpo
             route_offset: row * 4, route_count: 4 }).collect(), routes, wire)?;
     request.header.flags |= cuteafd_transport::expert::EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16;
     Ok(request)
+}
+
+/// What admission chose for one coordinator, for [`start`]: its sizing, ledger and KV pool, the
+/// routed layers it runs locally and on the Sparks, and the drafter (serve only).
+pub(super) struct Start<'s> {
+    pub snapshot: &'s Path,
+    pub checkpoint: &'s Checkpoint,
+    pub cfg: &'s MiniMaxM3Config,
+    pub sizing: RuntimeSizing,
+    pub ledger: &'s admission::RuntimeLedger,
+    pub cache: &'s cuteafd_loader::plan::families::minimax::admission::Admission,
+    pub local_layers: &'s [usize],
+    pub spark_layers: &'s [usize],
+    pub peers: &'s [SocketAddr],
+    pub catalog: &'s cuteafd_loader::OfficialV41Catalog,
+    /// The native TP1 expert package directory (for `local_layers`).
+    pub package: &'s Path,
+    pub embed: EmbedPlacement,
+    /// Free coordinator bytes measured before the weights load.
+    pub available: u64,
+    pub draft: Option<(&'s cuteafd_loader::families::minimax_m3::dspark::DsparkContract, super::dspark::Layout)>,
+}
+
+/// The loaded coordinator that serve and golden drive.
+pub(super) struct Runtime<'a> {
+    pub execution: Execution<'a>,
+    pub cache: Cache<'a>,
+    pub embedding: TokenEmbedding<'a>,
+    pub token_ids: cuteafd_ffi::minimax::Buffer<'a>,
+    pub embedded: cuteafd_ffi::minimax::Buffer<'a>,
+    /// RTX-local and Spark routed experts; `None` when the run executes no routed layer.
+    pub routed: Option<Routed<'a>>,
+}
+
+/// The start-up after admission, shared by serve and golden: Spark worker admission runs while
+/// the target weights, token embedding and local experts load, then the KV cache is allocated and
+/// the Spark exchange connects (one connection set per prefill lane).
+pub(super) fn start<'a>(library: &'a cuteafd_ffi::NativeLibrary, device: i32,
+    programs: &'a cuteafd_ffi::programs::Programs<'a>, start: Start<'_>) -> Result<Runtime<'a>> {
+    let Start { snapshot, checkpoint, cfg, sizing, ledger, cache, local_layers, spark_layers, peers, catalog,
+        package, embed, available, draft } = start;
+    let endpoint = SparkEndpoint { capacity: u32::try_from(sizing.rows)?, ingress: SparkIngress::Bf16 };
+    let config = TcpTransportConfig::default();
+    let pending = if spark_layers.is_empty() { None } else {
+        let working = SparkWorkingSet { rtx_layers: local_layers.to_vec(), spark_layers: spark_layers.to_vec(),
+            spark_ranks: peers.len(), prefill_lanes: sizing.lanes as u64 };
+        Some(SparkAdmission::plan(snapshot, ExpertGeometry::MINIMAX_M3, Some(catalog), &working, peers.len(), None,
+            ModelAdmission::for_clients(ExpertGeometry::MINIMAX_M3, endpoint, endpoint.capacity,
+                spark_rings(config.max_frame_bytes)?, sizing.lanes)?)?.start(peers)?)
+    };
+    let buffer = |name: &str| -> Result<cuteafd_ffi::minimax::Buffer<'a>> {
+        let bytes = ledger.bytes(name).with_context(|| format!("MiniMax {name} admission"))?;
+        cuteafd_ffi::minimax::Buffer::new(library, device, usize::try_from(bytes)?)
+    };
+    let (token_ids, embedded) = (buffer("token_ids")?, buffer("embedded")?);
+    let tensor = checkpoint.tensors.iter().find(|t| t.meta.name == super::weights::EMBEDDING)
+        .context("MiniMax embedding header missing")?;
+    let source = EmbedSource::new(snapshot, &tensor.shard, &tensor.meta, cfg.hidden)?;
+    let (embedding, (execution, local)) = crate::shared::placement::load_while_admitting(pending, || {
+        TokenEmbedding::load(library, source, embed, || {
+            let mut execution = Execution::load(Device { library, id: device }, programs, checkpoint, cfg, ledger, sizing)?;
+            if let Some((contract, layout)) = draft { execution.load_draft(contract, layout)?; }
+            let local = if local_layers.is_empty() {None} else {
+                let tensors = catalog.fp8().context("MiniMax native expert catalog missing")?.for_coordinator();
+                Some(crate::shared::experts::fp8::Fp8Experts::load(library, &tensors, package,
+                    local_layers, 1, 0, sizing.rows, usize::try_from(available)?)?)
+            };
+            Ok((execution, local))
+        })
+    })?;
+    let mut kv = Cache::new(library, device, &cache.cache, cache.pool_pages as usize, sizing.sequences,
+        cache.cache_bytes.checked_add(256).context("MiniMax cache reserve overflow")?)?;
+    kv.context = kv.context.min(cache.pool_tokens as usize);
+    let spark = match spark_layers.first() {
+        None => None,
+        Some(&first) => {
+            cuteafd_transport::worker_selection::require_peer_clients(peers, endpoint, sizing.lanes)?;
+            Some(super::routed::Spark::connect(library, device, SparkWorld::canonical(peers.len())?, peers,
+                sizing.rows, config, first, request, sizing.lanes, sizing.host_landing)?)
+        }
+    };
+    let routed = if local.is_none() && spark.is_none() {None} else {Some(Routed::new(local, spark)?)};
+    Ok(Runtime { execution, cache: kv, embedding, token_ids, embedded, routed })
 }
 
 type Ready = (usize, Option<Arc<cuteafd_api::openai::media::MediaPreparer>>);
@@ -204,42 +291,15 @@ fn worker(args: &ServeArgs, receive: &mut tokio::sync::mpsc::Receiver<cuteafd_ap
     };
     let mut catalog = cuteafd_loader::read_expert_catalog(&args.snapshot)?;
     catalog.select_draft(cuteafd_loader::plan::spec::DraftOwnership::None)?;
-    let endpoint = SparkEndpoint { capacity: args.prefill_rows, ingress: SparkIngress::Bf16 };
-    let config = TcpTransportConfig::default();
-    let working = SparkWorkingSet { rtx_layers: admitted.local_layers.clone(), spark_layers: admitted.spark_layers.clone(),
-        spark_ranks: args.peers.len(), prefill_lanes: lanes as u64 };
-    let pending = SparkAdmission::plan(&args.snapshot, ExpertGeometry::MINIMAX_M3, Some(&catalog), &working,
-        args.peers.len(), None, ModelAdmission::for_clients(ExpertGeometry::MINIMAX_M3, endpoint,
-            admitted.spark_capacity as u32, spark_rings(config.max_frame_bytes)?, lanes)?)?.start(&args.peers)?;
-    let device = Device { library: &library, id: args.device };
-    let cache_bytes = admitted.cache.cache_bytes.checked_add(256).context("MiniMax cache reserve overflow")?;
-    let token_ids = cuteafd_ffi::minimax::Buffer::new(&library, args.device, admitted.ledger.bytes("token_ids").unwrap() as usize)?;
-    let embedded = cuteafd_ffi::minimax::Buffer::new(&library, args.device, admitted.ledger.bytes("embedded").unwrap() as usize)?;
-    let tensor = checkpoint.tensors.iter().find(|t| t.meta.name == "language_model.model.embed_tokens.weight")
-        .context("MiniMax embedding header missing")?;
-    let source = EmbedSource::new(&args.snapshot, &tensor.shard, &tensor.meta, cfg.hidden)?;
-    let (embedding, (execution, local)) = crate::shared::placement::load_while_admitting(Some(pending), || {
-        TokenEmbedding::load(&library, source, args.token_io.embed_placement, || {
-            let mut execution = Execution::load(device, &programs, &checkpoint, &cfg, &admitted.ledger, sizing)?;
-            if let (Some(contract),Some(layout))=(&draft_contract,draft_layout) {execution.load_draft(contract,layout)?;}
-            let local = if admitted.local_layers.is_empty() {None} else {
-                let tensors = catalog.fp8().context("MiniMax native expert catalog missing")?.for_coordinator();
-                Some(crate::shared::experts::fp8::Fp8Experts::load(&library, &tensors, &package,
-                    &admitted.local_layers, 1, 0, sizing.rows, available as usize)?)
-            };
-            Ok((execution, local))
-        })
-    })?;
-    let mut cache = Cache::new(&library, args.device, &admitted.cache.cache, admitted.cache.pool_pages as usize,
-        sizing.sequences, cache_bytes)?;
-    cache.context = cache.context.min(admitted.cache.pool_tokens as usize);
-    cuteafd_transport::worker_selection::require_peer_clients(&args.peers, endpoint, lanes)?;
-    let world = SparkWorld::canonical(args.peers.len())?;
-    let spark = admitted.spark_layers.first().map(|&first| super::routed::Spark::connect(&library, args.device, world,
-        &args.peers, sizing.rows, config, first, request, lanes, host_landing)).transpose()?;
+    let Runtime { execution, cache, embedding, token_ids, embedded, routed } = start(&library, args.device, &programs, Start {
+        snapshot: &args.snapshot, checkpoint: &checkpoint, cfg: &cfg, sizing, ledger: &admitted.ledger,
+        cache: &admitted.cache, local_layers: &admitted.local_layers, spark_layers: &admitted.spark_layers,
+        peers: &args.peers, catalog: &catalog, package: &package, embed: args.token_io.embed_placement, available,
+        draft: draft_contract.as_ref().zip(draft_layout) })?;
+    let experts = routed.context("MiniMax serving admitted no routed expert owner")?;
     let expander = vision.as_ref().map(|_| cuteafd_loader::media::minimax::span_expander(&args.snapshot, cfg.vocab_size as u32)).transpose()?;
     let backend = MiniMaxBackend { execution: &execution, cache: &cache, embedding: &embedding, token_ids, embedded,
-        experts: RefCell::new(Routed::new(local, spark)?), rows: chunk, vocabulary: cfg.vocab_size, expander,
+        experts: RefCell::new(experts), rows: chunk, vocabulary: cfg.vocab_size, expander,
         pending: RefCell::new(None), timing: RefCell::new([0.0; 2]), probe: RefCell::new(crate::shared::draft::routes::RoundRoutes::new(1,4)),
         rings: RefCell::new(super::backend::Rings::new(sizing.sequences, rings)), full_prefill_logits: args.full_prefill_logits,
         trace: RefCell::new(super::diagnostics::LogitTrace::from_env()?),
@@ -259,7 +319,9 @@ fn worker(args: &ServeArgs, receive: &mut tokio::sync::mpsc::Receiver<cuteafd_ap
     tracing::info!(pool_tokens=admitted.cache.pool_tokens, context=cache.context, local_layers=?admitted.local_layers,
         lane_rows=sizing.rows, prefill_lanes=lanes, chunk_rows=chunk, logit_rows=sizing.logit_rows, draft_rings,
         "MiniMax native target; decode replays its startup recordings, prefill uses the MSA index-prefill and attention-extend kernels");
-    let drafts=if args.speculator=="dspark" {scheduler::Drafts::Neural {depth:7,fixed:false}} else {scheduler::Drafts::None};
+    let drafts=if args.speculator=="dspark" {
+        scheduler::Drafts::Neural {depth:args.draft_fixed.map_or(7,usize::from),fixed:args.draft_fixed.is_some()}
+    } else {scheduler::Drafts::None};
     scheduler::schedule(&backend, &args.snapshot, receive, stats, sizing.sequences, drafts,
         eos, args.decode_share, &prefix, args.token_io.token_select, &mut media, None,
         || initialized((backend.geometry().max_context, preparer)))
@@ -269,9 +331,7 @@ pub(crate) async fn run_serve(args: ServeArgs) -> Result<()> {
     use cuteafd_api::openai::{ModelEncoding, ModelProfile, NativeLimits};
     args.validate()?;
     let snapshot = args.snapshot.clone();
-    let config = cuteafd_loader::plan::checkpoint::read_json(&snapshot.join("config.json"))?;
-    let architecture = config["architectures"][0].as_str().context("MiniMax architecture missing")?;
-    let encoding = ModelEncoding::from_architecture(architecture, &snapshot)?.context("MiniMax API architecture unsupported")?;
+    let encoding = ModelEncoding::MiniMaxM3(Arc::new(cuteafd_api::openai::chat::minimax_m3::MiniMaxEncoding::from_snapshot(&snapshot)?));
     let eos = encoding.eos_token_ids();
     let model = args.model_id.clone().or_else(|| cuteafd_api::openai::snapshot_model_id(&snapshot))
         .context("MiniMax requires --model-id for a snapshot without HF identity")?;
@@ -328,5 +388,14 @@ mod tests {
         let mut a=args(); a.token_io.embed_placement=EmbedPlacement::Host; assert!(a.validate().is_ok());
         let mut a=args(); a.rtx_expert_layers="58".into(); assert!(a.validate().is_err());
         let mut a=args(); a.rtx_expert_layers="3".into(); assert_eq!(a.validate().unwrap(),Some(3));
+        assert!(args().draft_fixed.is_none());
+    }
+    #[test]
+    fn minimax_fixed_draft_depth_is_one_to_the_drafter_block() {
+        let parse = |depth: &str| crate::cli::Cli::try_parse_from(["cuteafd", "serve-minimax", "--snapshot", "/model",
+            "--native-lib", "/lib.so", "--peers", "127.0.0.1:1,127.0.0.1:2", "--draft-fixed", depth]);
+        let Ok(crate::cli::Cli { command: crate::cli::Commands::ServeMiniMax(a), .. }) = parse("3") else { panic!("depth 3") };
+        assert_eq!(a.draft_fixed, Some(3));
+        assert!(parse("0").is_err() && parse("8").is_err());
     }
 }

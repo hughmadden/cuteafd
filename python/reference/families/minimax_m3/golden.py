@@ -181,32 +181,11 @@ def execute(args):
                           "activation": args.activation, "arithmetic": ARITHMETIC}))
         return
     probing = getattr(args, "_prefix_probe", False)
-    # Early stops emit a partial reference, never completed golden metadata.
-    proof = qualify(args, manifest, execute) if args.stop_after_layer is None else None
+    proof = qualify(args, manifest, execute)
     if args.prefix_only and not probing:
         return
     states, times = run_layers(args.snapshot, manifest, args.out, device=args.device,
-                              activation=args.activation, resume=None if probing else args.resume,
-                              stop_after_layer=args.stop_after_layer, layers=args.layers)
-    if args.stop_after_layer is not None:
-        entries = []
-        dtype = torch.float32 if args.activation == "served-cache" else torch.bfloat16
-        for window, state in zip(manifest["windows"], states, strict=True):
-            directory = args.out / "windows" / window["id"]
-            directory.mkdir(parents=True, exist_ok=True)
-            filename = f"layer{args.stop_after_layer:02d}.bin"
-            torch.from_numpy(state.load()).view(dtype).float().numpy().astype("<f4").tofile(directory / filename)
-            torch.tensor(window["tokens"], dtype=torch.int32).numpy().astype("<i4").tofile(directory / "tokens.bin")
-            entries.append(dict(id=window["id"], path=f"windows/{window['id']}", vocab=cfg.vocab_size,
-                                positions=list(range(window["score_from"], len(window["tokens"]))),
-                                sha256={name: digest(directory / name) for name in (filename, "tokens.bin")}))
-        (args.out / "windows.json").write_bytes(canonical(manifest) + b"\n")
-        partial = dict(schema="cuteafd.minimax.partial-reference/1", family="minimax_m3",
-                       checkpoint=model.CHECKPOINT, snapshot_identity=identity, set_sha256=manifest["set_sha256"],
-                       activation=args.activation, last_layer=args.stop_after_layer, complete_model=False,
-                       mtp=False, source_pin=source_identity(), arithmetic=ARITHMETIC, windows=entries)
-        (args.out / "partial.json").write_bytes(canonical(partial) + b"\n")
-        return
+                              activation=args.activation, resume=None if probing else args.resume, layers=args.layers)
     admission(weights, cfg, max(len(w["tokens"]) for w in manifest["windows"]))
     with torch.inference_mode():
         norm = weights.tensor(model.TEXT + "norm.weight")
@@ -250,13 +229,10 @@ def main():
     parser.add_argument("--activation", choices=("served-cache", "served", "bf16"), default="served")
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--resume", type=Path, help="previous run's state directory; use a fresh output")
-    parser.add_argument("--stop-after-layer", type=int)
     parser.add_argument("--layers", type=int, nargs="*", help="also export selected full layer states")
     parser.add_argument("--prefix-only", action="store_true")
     parser.add_argument("--check-only", action="store_true")
     args = parser.parse_args()
-    if args.prefix_only and args.stop_after_layer is not None:
-        parser.error("prefix qualification requires all layers")
     execute(args)
 
 

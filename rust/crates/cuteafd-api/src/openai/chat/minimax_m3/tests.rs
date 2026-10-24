@@ -1,8 +1,8 @@
 use super::{fixtures::{encoding, GOLDENS, TEMPLATE}, *};
 use crate::openai::chat::glm5::{parser::GlmStop, processor::TextParser};
-use deepseek_recipe::stream::OutputChunk;
 use deepseek_recipe_core::tools::ToolDefinition;
 use serde_json::{json, Value};
+use crate::openai::chat::harness::{self, project, tool, Projection};
 
 fn goldens() -> Vec<Value> { serde_json::from_str(GOLDENS).unwrap() }
 
@@ -93,17 +93,24 @@ fn default_effort_adds_no_line_and_unsupported_levels_fail() {
     // Lowercased as every family does; unknown levels are the client's error.
     assert!(encoding.render(&json!({"messages": user, "reasoning_effort": "High"}), &[]).unwrap().contains("<effort>high</effort>"));
     assert!(encoding.render(&json!({"messages": user, "reasoning_effort": "turbo"}), &[]).is_err());
-    assert!(encoding.render(&json!({"messages": user, "reasoning_effort": "minimal"}), &[]).unwrap().contains("<effort>low</effort>"));
+    assert!(encoding.render(&json!({"messages": user, "reasoning_effort": "turbo", "thinking": {"type": "disabled"}}), &[]).is_err());
 }
 
 #[test]
 fn thinking_off_closes_the_reasoning_prefix() {
     let encoding = encoding();
     let user = json!([{"role": "user", "content": "Hi"}]);
-    // A budget sizes thinking: with thinking off it renders no effort line.
-    for extra in [json!({"reasoning_effort": "none"}), json!({"enable_thinking": false}),
+    // The vendor's spellings of off: a disabled switch, or effort none or minimal,
+    // which wins over a switch that says on (a Responses effort arrives as
+    // `enabled` plus the effort). With thinking off neither an effort nor a budget renders.
+    for extra in [json!({"reasoning_effort": "none"}), json!({"reasoning_effort": "minimal"}),
+        json!({"chat_template_kwargs": {"reasoning_effort": "minimal"}}), json!({"enable_thinking": false}),
         json!({"thinking": {"type": "disabled"}}), json!({"chat_template_kwargs": {"enable_thinking": false}}),
-        json!({"thinking": {"type": "disabled", "budget_tokens": 20000}})] {
+        json!({"thinking": {"type": "disabled", "budget_tokens": 20000}}),
+        json!({"thinking": {"type": "disabled"}, "reasoning_effort": "high"}),
+        json!({"enable_thinking": false, "reasoning_effort": "max"}),
+        json!({"thinking": {"type": "enabled"}, "reasoning_effort": "minimal"}),
+        json!({"thinking": {"type": "adaptive"}, "reasoning_effort": "none"})] {
         let mut body = json!({"messages": user});
         body.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
         let rendered = encoding.render(&body, &[]).unwrap();
@@ -160,8 +167,7 @@ fn response_format_joins_the_developer_message() {
 #[test]
 fn token_contract_is_pinned_to_the_release() {
     let tokens = encoding();
-    assert_eq!(tokens.tokens(), &MiniMaxTokenIds { eos: vec![200_020], think_close: 200_060, image: 200_025, video: 200_026,
-        turn_markers: vec![200_019, 200_034] });
+    assert_eq!(tokens.tokens(), &MiniMaxTokenIds { eos: vec![200_020], think_close: 200_060, turn_markers: vec![200_019, 200_034] });
     let profile_ids = crate::openai::ModelEncoding::MiniMaxM3(std::sync::Arc::new(encoding()));
     assert_eq!(profile_ids.eos_token_ids(), [200_020]);
     assert_eq!(profile_ids.think_close_token_id(), Some(200_060));
@@ -184,15 +190,12 @@ fn snapshot_dir(eos: Value) -> tempfile::TempDir {
 }
 
 #[test]
-fn snapshot_loader_reads_its_own_headers_and_architecture_selects_the_family() {
+fn snapshot_loader_reads_its_own_headers() {
     let dir = snapshot_dir(json!(200_020));
     let loaded = MiniMaxEncoding::from_snapshot(dir.path()).unwrap();
     assert_eq!(loaded.tokens(), encoding().tokens());
     let body = json!({"messages": [{"role": "user", "content": "Hi"}]});
     assert_eq!(loaded.render(&body, &[]).unwrap(), encoding().render(&body, &[]).unwrap());
-    let selected = crate::openai::ModelEncoding::from_architecture(ARCHITECTURE, dir.path()).unwrap();
-    assert!(matches!(selected, Some(crate::openai::ModelEncoding::MiniMaxM3(_))));
-    assert!(crate::openai::ModelEncoding::from_architecture("Qwen3ForCausalLM", dir.path()).unwrap().is_none());
     // The template can also live in tokenizer_config.json.
     std::fs::remove_file(dir.path().join("chat_template.jinja")).unwrap();
     std::fs::write(dir.path().join("tokenizer_config.json"), json!({"chat_template": TEMPLATE}).to_string()).unwrap();
@@ -208,14 +211,11 @@ fn real_release_snapshot_headers_agree_when_pointed_at() {
     if !snapshot.join("tokenizer.json").exists() { return; }
     let loaded = MiniMaxEncoding::from_snapshot(&snapshot).unwrap();
     assert_eq!(loaded.tokens(), encoding().tokens());
-    assert_eq!(loaded.template_source(), TEMPLATE);
+    assert_eq!(std::fs::read_to_string(snapshot.join("chat_template.jinja")).unwrap(), TEMPLATE);
 }
 
 // ---------------------------------------------------------------- parser
 
-fn tool(name: &str, parameters: Value) -> ToolDefinition {
-    ToolDefinition { name: name.into(), description: None, parameters, strict: None }
-}
 
 fn tools() -> Vec<ToolDefinition> {
     vec![
@@ -235,53 +235,9 @@ fn param(name: &str, value: &str) -> String { format!("{NS}<{name}>{value}{NS}</
 fn invoke(name: &str, params: &[String]) -> String { format!("{INVOKE_OPEN}{name}\">{}{INVOKE_CLOSE}\n", params.concat()) }
 fn block(invokes: &[String]) -> String { format!("{CALL_OPEN}\n{}{CALL_CLOSE}", invokes.concat()) }
 
-#[derive(Debug, Default, PartialEq)]
-struct Projection {
-    reasoning: String,
-    content: String,
-    calls: Vec<(String, Value)>,
-    stop: Option<GlmStop>,
-}
 
-fn project(chunks: &[OutputChunk], stop: Option<GlmStop>) -> Projection {
-    let mut projection = Projection { stop, ..Default::default() };
-    let mut arguments = Vec::<String>::new();
-    for chunk in chunks {
-        match chunk {
-            OutputChunk::Reasoning { content } => projection.reasoning.push_str(content),
-            OutputChunk::Raw { content } => projection.content.push_str(content),
-            OutputChunk::ToolCall { tool_name, arguments: first } => {
-                projection.calls.push((tool_name.clone(), Value::Null));
-                arguments.push(first.clone());
-            }
-            OutputChunk::ToolArgumentsDelta { content } => arguments.last_mut().expect("delta follows a call").push_str(content),
-            other => panic!("unexpected chunk {other:?}"),
-        }
-    }
-    for (call, text) in projection.calls.iter_mut().zip(arguments) {
-        call.1 = serde_json::from_str(&text).unwrap_or_else(|error| panic!("arguments {text:?}: {error}"));
-    }
-    projection
-}
-
-fn parse(options: &MiniMaxParserOptions, pieces: &[&str]) -> Projection {
-    let mut parser = MiniMaxOutputParser::new(options.clone());
-    let mut chunks = Vec::new();
-    for piece in pieces { chunks.extend(parser.push(piece)); }
-    chunks.extend(parser.finish());
-    project(&chunks, parser.stop().cloned())
-}
-
-/// Parse whole, at every two-way split, and one character at a time; all must agree.
 fn parse_everywhere(options: &MiniMaxParserOptions, text: &str) -> Projection {
-    let whole = parse(options, &[text]);
-    for (index, _) in text.char_indices() {
-        assert_eq!(parse(options, &[&text[..index], &text[index..]]), whole, "split at {index}");
-    }
-    let characters: Vec<String> = text.chars().map(String::from).collect();
-    let pieces: Vec<&str> = characters.iter().map(String::as_str).collect();
-    assert_eq!(parse(options, &pieces), whole, "character stream");
-    whole
+    harness::parse_everywhere(|| MiniMaxOutputParser::new(options.clone()), text)
 }
 
 fn options(tools: Option<Vec<ToolDefinition>>) -> MiniMaxParserOptions {
@@ -330,18 +286,51 @@ fn type_sets_enums_consts_and_additional_properties_type_values() {
         "level": {"enum": [1, 2, 3]}, "answer": {"const": 42}, "flag": {"type": ["boolean", "null"]},
         "list": {"type": ["array", "null"], "items": {"type": ["number", "null"]}},
         "opts": {"type": ["object", "null"], "properties": {"n": {"type": ["integer", "null"]}}}}});
-    let tools = vec![tool("t", schema)];
-    let call = |params: &[String]| parse_everywhere(&options(Some(tools.clone())), &block(&[invoke("t", params)])).calls;
-    assert_eq!(call(&[param("days", "3"), param("note", "Oslo"), param("unit", "c"), param("level", "2"), param("answer", "42"),
-        param("flag", "true"), param("list", &format!("{NS}<item>1.5{NS}</item>{NS}<item>null{NS}</item>")),
-        param("opts", &format!("{NS}<n>7{NS}</n>")), param("extra", "9")]),
-        vec![("t".into(), json!({"days": 3, "note": "Oslo", "unit": "c", "level": 2, "answer": 42, "flag": true,
-            "list": [1.5, null], "opts": {"n": 7}, "extra": 9}))]);
-    // JSON of a type in the set wins; the text is the value only where a string is allowed.
-    assert_eq!(call(&[param("days", "null"), param("note", "null"), param("flag", "null"), param("list", "null"), param("opts", "null")]),
-        vec![("t".into(), json!({"days": null, "note": null, "flag": null, "list": null, "opts": null}))]);
-    for (key, value) in [("days", "three"), ("extra", "nine"), ("flag", "yes"), ("list", "a, b")] {
-        assert!(call(&[param(key, value)]).is_empty(), "{key}={value}");
+    for strict in [None, Some(true)] {
+        let tools = vec![ToolDefinition { strict, ..tool("t", schema.clone()) }];
+        let call = |params: &[String]| parse_everywhere(&options(Some(tools.clone())), &block(&[invoke("t", params)])).calls;
+        assert_eq!(call(&[param("days", "3"), param("note", "Oslo"), param("unit", "c"), param("level", "2"), param("answer", "42"),
+            param("flag", "true"), param("list", &format!("{NS}<item>1.5{NS}</item>{NS}<item>null{NS}</item>")),
+            param("opts", &format!("{NS}<n>7{NS}</n>")), param("extra", "9")]),
+            vec![("t".into(), json!({"days": 3, "note": "Oslo", "unit": "c", "level": 2, "answer": 42, "flag": true,
+                "list": [1.5, null], "opts": {"n": 7}, "extra": 9}))]);
+        // JSON of a type in the set wins; the text is the value only where a string is allowed.
+        assert_eq!(call(&[param("days", "null"), param("note", "null"), param("flag", "null"), param("list", "null"), param("opts", "null")]),
+            vec![("t".into(), json!({"days": null, "note": null, "flag": null, "list": null, "opts": null}))]);
+        // A value that is not its type: a strict tool cannot read the invoke; others keep
+        // the spellings vLLM's coercion takes, then the text.
+        for (key, value, loose) in [("days", "three", json!("three")), ("extra", "nine", json!("nine")),
+            ("flag", "yes", json!("yes")), ("list", "a, b", json!("a, b")), ("days", "+4", json!(4)),
+            ("flag", "True", json!(true)), ("flag", "0", json!(false)), ("days", "NULL", json!(null))] {
+            let expected = if strict.is_some() { vec![] } else { vec![("t".into(), json!({(key): loose}))] };
+            assert_eq!(call(&[param(key, value)]), expected, "{key}={value} strict={strict:?}");
+        }
+    }
+}
+
+#[test]
+fn best_effort_reading_follows_vllm_for_non_strict_tools() {
+    let rows = |items: &str| param("rows", items);
+    let lenient = options(Some(tools()));
+    let strict = options(Some(tools().into_iter().map(|t| ToolDefinition { strict: Some(true), ..t }).collect()));
+    for (params, value) in [
+        // Repeated parameters collect into a list in order, as do repeated nested fields.
+        (vec![param("city", "a"), param("city", "b"), param("city", "c")], json!({"city": ["a", "b", "c"]})),
+        (vec![param("range", &format!("{NS}<lo>1{NS}</lo>{NS}<lo>2{NS}</lo>"))], json!({"range": {"lo": [1, 2]}})),
+        // An array schema takes its children whatever their names.
+        (vec![param("tags", &format!("{NS}<tag>a{NS}</tag>{NS}<tag>b{NS}</tag>"))], json!({"tags": ["a", "b"]})),
+        // Elements under a scalar schema stay an object.
+        (vec![param("city", &format!("{NS}<name>Oslo{NS}</name>"))], json!({"city": {"name": "Oslo"}})),
+        (vec![param("tags", &format!("{NS}<item>{NS}<item>deep{NS}</item>{NS}</item>"))], json!({"tags": [{"item": "deep"}]})),
+        // A number for an integer, and an unreadable anyOf leaf, keep their JSON or text.
+        (vec![param("days", "2.0"), param("either", "x")], json!({"days": 2.0, "either": "x"})),
+        (vec![rows(&format!("{NS}<item>{NS}<n>one{NS}</n>{NS}</item>"))], json!({"rows": [{"n": "one"}]})),
+    ] {
+        let text = block(&[invoke(if params[0].contains("<rows>") { "write_file" } else { "get_weather" }, &params)]);
+        assert_eq!(parse_everywhere(&lenient, &text).calls.into_iter().map(|c| c.1).collect::<Vec<_>>(), vec![value.clone()],
+            "{text}");
+        let exact = parse_everywhere(&strict, &text);
+        assert!(exact.calls.is_empty() && exact.content == text, "strict {value}: {exact:?}");
     }
 }
 
@@ -383,10 +372,8 @@ fn malformed_calls_stay_visible_and_never_become_partial_calls() {
         format!("{CALL_OPEN}\n{INVOKE_OPEN}get_weather\">{}{CALL_CLOSE}", param("city", "Oslo")),
         // mismatched parameter close
         format!("{CALL_OPEN}\n{INVOKE_OPEN}get_weather\">{NS}<city>Oslo{NS}</town>{INVOKE_CLOSE}\n{CALL_CLOSE}"),
-        // duplicate parameter
-        block(&[invoke("get_weather", &[param("city", "a"), param("city", "b")])]),
-        // wrongly typed integer
-        block(&[invoke("get_weather", &[param("days", "two")])]),
+        // text beside a parameter
+        format!("{CALL_OPEN}\n{INVOKE_OPEN}get_weather\">noise {}{INVOKE_CLOSE}\n{CALL_CLOSE}", param("city", "Oslo")),
         // empty block
         format!("{CALL_OPEN}\n{CALL_CLOSE}"),
         // missing name
@@ -406,7 +393,7 @@ fn malformed_calls_stay_visible_and_never_become_partial_calls() {
 #[test]
 fn one_broken_invoke_returns_alone_as_content() {
     let (a, b) = (invoke("get_weather", &[param("city", "a")]), invoke("get_weather", &[param("city", "b")]));
-    let bad = invoke("get_weather", &[param("city", "c"), param("days", "two")]);
+    let bad = format!("{INVOKE_OPEN}get_weather\">{}{NS}<days>2{NS}</day>{INVOKE_CLOSE}\n", param("city", "c"));
     let text = format!("Three lookups.\n{}[e~[", block(&[a, bad.clone(), b]));
     let projection = parse_everywhere(&options(Some(tools())), &text);
     assert_eq!(projection.calls, vec![("get_weather".into(), json!({"city": "a"})), ("get_weather".into(), json!({"city": "b"}))]);
@@ -448,8 +435,8 @@ fn values_may_contain_xml_looking_text_but_not_the_namespace() {
 fn same_name_nesting_balances() {
     let inner = format!("{NS}<item>{NS}<item>deep{NS}</item>{NS}</item>");
     let projection = parse_everywhere(&options(Some(tools())), &block(&[invoke("get_weather", &[param("tags", &inner)])]));
-    // The inner array is not a string, so the call is rejected whole rather than guessed.
-    assert!(projection.calls.is_empty());
+    // The balanced search finds the outer close: one item holding one element.
+    assert_eq!(projection.calls, vec![("get_weather".into(), json!({"tags": [{"item": "deep"}]}))]);
     let nested = format!("{NS}<item>{NS}<n>1{NS}</n>{NS}</item>");
     let projection = parse_everywhere(&options(Some(tools())), &block(&[invoke("write_file", &[param("rows", &nested)])]));
     assert_eq!(projection.calls, vec![("write_file".into(), json!({"rows": [{"n": 1}]}))]);
@@ -485,8 +472,9 @@ fn long_arguments_parse_in_linear_time() {
 #[test]
 fn call_count_tracks_parsed_calls_only() {
     let mut parser = MiniMaxOutputParser::new(options(Some(tools())));
+    let broken = format!("{INVOKE_OPEN}get_weather\">{NS}<days>x{NS}</day>{INVOKE_CLOSE}\n");
     let text = format!("{}{}", block(&[invoke("get_weather", &[param("city", "a")]), invoke("get_weather", &[param("city", "b")])]),
-        block(&[invoke("get_weather", &[param("days", "x")])]));
+        format!("{CALL_OPEN}\n{broken}{CALL_CLOSE}"));
     parser.push(&text);
     parser.finish();
     assert_eq!(parser.tool_calls(), 2);

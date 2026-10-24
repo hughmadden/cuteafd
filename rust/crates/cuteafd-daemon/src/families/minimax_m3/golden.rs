@@ -1,18 +1,15 @@
 //! Teacher-forced qualification through the serving programs and paged cache.
 use super::{cache::{Cache, INDEX_PAGE_BYTES, KV_PAGE_BYTES}, execution::{BatchView, Execution, ExpertExecutor, RequestView},
-    prefix::{MiniMaxPrefix, Placement}, routed::Routed, MiniMaxError};
-use crate::shared::{golden_scores::{scored_kl, scored_nll}, memory::device::Device,
-    placement::{spark_rings, SparkAdmission},
-    token_io::{EmbedPlacement, EmbedSource, TokenEmbedding}};
+    prefix::{MiniMaxPrefix, Placement}, MiniMaxError};
+use crate::shared::{golden_scores::{scored_kl, scored_nll, HiddenMetrics}, token_io::{EmbedPlacement, TokenEmbedding}};
 use anyhow::{ensure, Context, Result};
-use cuteafd_core::{ExpertGeometry, SparkEndpoint, SparkIngress};
+use cuteafd_core::ExpertGeometry;
 use cuteafd_engine::{media::RequestMedia, prefix::{After, PrefixCache, PrefixConfig, PrefixFamily, SnapshotKind}};
 use cuteafd_ffi::minimax::{Buffer, Commands};
 use cuteafd_hostcache::copy::StubCopyEngine;
 use cuteafd_loader::{families::{minimax_m3::config::MiniMaxM3Config, qwen4::Qwen4KvCache},
-    placement::SparkWorkingSet, plan::{checkpoint::{read_json, Checkpoint}, families::minimax::{admission,
-    coordinator::RankWeightLayout}}};
-use cuteafd_transport::{expert::SparkWorld, worker_selection::ModelAdmission, ExpertV2SourceKind, TcpTransportConfig};
+    plan::{checkpoint::{read_json, Checkpoint}, families::minimax::{admission, coordinator::RankWeightLayout}}};
+use cuteafd_transport::ExpertV2SourceKind;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::{io::{Read, Write}, net::SocketAddr, path::{Component, Path, PathBuf}};
@@ -105,10 +102,9 @@ struct Window { id: String, directory: PathBuf, tokens: Vec<u32>, positions: Vec
 
 fn references(args: &GoldenArgs, cfg: &MiniMaxM3Config) -> Result<(Value, Vec<Window>)> {
     let root = args.golden.as_ref().context("MiniMax golden requires --golden")?;
-    let partial = args.last_layer < 59 && root.join("partial.json").is_file();
-    let meta = read_json(&root.join(if partial {"partial.json"} else {"meta.json"}))?;
-    ensure!(meta["schema"] == if partial {"cuteafd.minimax.partial-reference/1"} else {"cuteafd.fidelity.golden/2"},
-        "MiniMax reference schema differs");
+    // A partial-layer run reads the layerNN.bin a full reference exported with --layers.
+    let meta = read_json(&root.join("meta.json"))?;
+    ensure!(meta["schema"] == "cuteafd.fidelity.golden/2", "MiniMax reference schema differs");
     ensure!(meta["family"] == "minimax_m3"
         && meta["checkpoint"] == "MiniMaxAI/MiniMax-M3.1-Flash" && meta["mtp"] == false
         && meta["snapshot_identity"]["snapshot_revision"] == REVISION,
@@ -119,10 +115,7 @@ fn references(args: &GoldenArgs, cfg: &MiniMaxM3Config) -> Result<(Value, Vec<Wi
         && meta["source_pin"]["transformers"]["sha256"]["src/transformers/models/minimax_m3_vl/modular_minimax_m3_vl.py"]
             == "1c755515c8aefdbc6f9145ae8f051e43907e21022d9644e81afe47cd2e37b58d",
         "MiniMax reference source pin differs");
-    if partial {
-        ensure!(meta["last_layer"] == args.last_layer && meta["complete_model"] == false && meta["activation"] == "served-cache",
-            "partial reference must match the requested layer and served cache arithmetic");
-    } else {
+    {
         let proof = &meta["prefix_qualification"];
         ensure!(proof["passed"] == true && proof["finite"] == true
             && proof["set_sha256"] == meta["set_sha256"]
@@ -162,12 +155,6 @@ fn references(args: &GoldenArgs, cfg: &MiniMaxM3Config) -> Result<(Value, Vec<Wi
         let (file, count) = if args.last_layer == 59 { ("logits.bin".into(), positions.len() * cfg.vocab_size) }
             else { (format!("layer{:02}.bin", args.last_layer), tokens.len() * cfg.hidden) };
         ensure!(std::fs::metadata(directory.join(&file))?.len() == count as u64 * 4, "reference payload extent differs");
-        if partial {
-            for name in [file.as_str(), "tokens.bin"] {
-                ensure!(entry["sha256"][name].as_str() == Some(hash(&directory.join(name))?.as_str()),
-                    "partial reference payload hash differs");
-            }
-        }
         ensure!(!windows.iter().any(|w: &Window| w.id == id), "duplicate reference window");
         windows.push(Window { id: id.into(), directory, tokens, positions, generated });
     }
@@ -198,10 +185,19 @@ impl Scores {
     }
 }
 
+/// Full-model gates over the generated-role rows, from the first real-weight run (standard set v1,
+/// 13,534 rows, TP2; decode- and prefill-shaped scoring: top-1 0.955/0.957, KL 0.0186, NLL 0.2519
+/// against the served-cache reference's 0.2536), with margin for kernel route and chunk changes.
+const TOP1_MIN: f64 = 0.94;
+const KL_MAX: f64 = 0.03;
+const NLL_EXCESS_MAX: f64 = 0.01;
+
 fn verdict(result: &Value, full: bool) -> Result<()> {
     let number = |key| result[key].as_f64().filter(|v| v.is_finite()).with_context(|| format!("missing finite {key}"));
-    if full { ensure!(number("top1")? >= 0.90 && number("mean_kl")? <= 0.06,
-        "MiniMax fidelity failed: top-1 must be >= 0.90 and KL <= 0.06 nat"); }
+    if full { ensure!(number("top1")? >= TOP1_MIN && number("mean_kl")? <= KL_MAX
+            && number("nll")? - number("reference_nll")? <= NLL_EXCESS_MAX,
+        "MiniMax fidelity failed: top-1 >= {TOP1_MIN}, KL <= {KL_MAX} nat and NLL at most {NLL_EXCESS_MAX} nat \
+         above the reference required"); }
     else { ensure!(number("cosine")? >= 0.99 && number("relative_l2")? <= 0.05,
         "MiniMax partial hidden failed: cosine >= 0.99 and relative L2 <= 0.05 required"); }
     Ok(())
@@ -376,7 +372,7 @@ fn score_window(runner: &mut Runner<'_, '_>, args: &GoldenArgs, window: &Window,
     let mut current = placement((0..window.tokens.len().div_ceil(64) as u32).collect());
     let mut scores = Scores::default();
     let mut generated = Scores::default();
-    let (mut dot, mut left, mut right, mut error) = (0.0, 0.0, 0.0, 0.0);
+    let mut hidden = HiddenMetrics::default();
     let mut first = 0;
     while first < window.tokens.len() {
         let unscored = first < window.positions[0] - 1;
@@ -384,10 +380,11 @@ fn score_window(runner: &mut Runner<'_, '_>, args: &GoldenArgs, window: &Window,
             else {runner.rows.min(if unscored {window.positions[0] - 1 - first} else {window.tokens.len() - first})};
         let count = count.min(window.tokens.len() - first);
         let values = runner.evaluate(&mut current, &window.tokens[first..first + count], unscored || args.score_shape == ScoreShape::Prefill)?;
-        file.write_all(&values.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>())?;
         if full {
             for (row, ours) in values.chunks_exact(vocab).enumerate() {
                 if let Ok(index) = window.positions.binary_search(&(first + row + 1)) {
+                    // Only scored rows are kept, as the reference stores them: row i predicts positions[i].
+                    file.write_all(&ours.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>())?;
                     scores.add(ours, &expected[index * vocab..(index + 1) * vocab], window.tokens[first + row + 1])?;
                     if window.generated[first + row + 1] {
                         generated.add(ours, &expected[index * vocab..(index + 1) * vocab], window.tokens[first + row + 1])?;
@@ -395,9 +392,8 @@ fn score_window(runner: &mut Runner<'_, '_>, args: &GoldenArgs, window: &Window,
                 }
             }
         } else {
-            for (&a, &b) in values.iter().zip(&expected[first * width..(first + count) * width]) {
-                let (a, b) = (a as f64, b as f64); dot += a * b; left += a * a; right += b * b; error += (a - b).powi(2);
-            }
+            file.write_all(&values.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>())?;
+            hidden.add(&values, &expected[first * width..(first + count) * width])?;
         }
         first += count;
     }
@@ -406,14 +402,15 @@ fn score_window(runner: &mut Runner<'_, '_>, args: &GoldenArgs, window: &Window,
     std::fs::write(directory.join("tokens.bin"), window.tokens.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>())?;
     std::fs::write(directory.join("positions.bin"), window.positions.iter().flat_map(|&p| (p as u32).to_le_bytes()).collect::<Vec<_>>())?;
     let mut result = if full {scores.result()?} else {
-        ensure!(left > 0.0 && right > 0.0, "zero partial hidden norm");
-        json!({"cosine":dot / (left * right).sqrt(), "relative_l2":(error / right).sqrt()})
+        let (cosine, relative_l2) = hidden.result()?;
+        json!({"cosine":cosine, "relative_l2":relative_l2})
     };
-    result["schema"] = "cuteafd.minimax.golden.window/1".into();
+    result["schema"] = "cuteafd.minimax.golden.window/2".into();
     result["window"] = window.id.clone().into(); result["binding"] = binding.clone();
-    result["positions"] = json!(window.positions); result["rows"] = window.tokens.len().into();
+    result["positions"] = json!(window.positions); result["rows"] = expected_rows.into();
     result["width"] = width.into(); result["dtype"] = "F32".into(); result["byte_order"] = "little".into();
-    result["logits_row_target_offset"] = 1.into(); result["partial_target"] = (!full).into();
+    // Full: row i predicts positions[i]. Partial: row i is token i's hidden state.
+    result["row_targets"] = (if full {"positions"} else {"tokens"}).into(); result["partial_target"] = (!full).into();
     result["prefix_byte_exact"] = args.check_prefix.into();
     result["generated"] = if generated.rows > 0 {generated.result()?} else {Value::Null};
     seal_window(directory, &filename, &mut result)?;
@@ -426,16 +423,6 @@ fn score_window(runner: &mut Runner<'_, '_>, args: &GoldenArgs, window: &Window,
     }
     if !full {verdict(&result, false)?;}
     Ok(result)
-}
-
-fn request(identity: u64, layer: usize, rows: usize, routes: Vec<cuteafd_transport::ExpertProtocolV2RouteEntry>,
-    wire: bytes::Bytes, kind: ExpertV2SourceKind) -> Result<cuteafd_transport::ExpertProtocolV2Request> {
-    use cuteafd_transport::{ExpertProtocolV2Request, ExpertProtocolV2RowDescriptor, ExpertV2Dtype};
-    let mut request = ExpertProtocolV2Request::new_bytes(identity, 1, layer as u32, 6144, ExpertV2Dtype::Bf16,
-        (0..rows as u32).map(|row| ExpertProtocolV2RowDescriptor {row_id:row as u64, source_kind:kind,
-            source_request_id:identity, token_position:row as u64, route_offset:row * 4, route_count:4}).collect(), routes, wire)?;
-    request.header.flags |= cuteafd_transport::expert::EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16;
-    Ok(request)
 }
 
 pub(crate) async fn run_golden(args: GoldenArgs) -> Result<()> {
@@ -494,46 +481,22 @@ pub(crate) async fn run_golden(args: GoldenArgs) -> Result<()> {
         |b| (free as u64).min(b.0.saturating_sub((total - free) as u64)));
     let pool_tokens = if args.check_prefix {(context as u64).max(128) * 3 + 256} else {context as u64};
     let admitted = admission::admit(&cfg, sizing, &ledger, reservations, available, Some(pool_tokens), Qwen4KvCache::Fp8)?;
-    let endpoint = SparkEndpoint {capacity:args.prefill_rows, ingress:SparkIngress::Bf16};
-    let config = TcpTransportConfig::default();
-    let pending = if args.peers.is_empty() {None} else {
+    if !remote.is_empty() {
         if let Ok(selected) = std::env::var("CUTEAFD_GOLDEN_EXPERT_LAYERS") {
             let selected = selected.split(',').map(str::parse::<usize>).collect::<std::result::Result<Vec<_>, _>>()?;
             ensure!(selected == remote, "golden runner worker layers differ from executed remote layers");
         }
-        let working = SparkWorkingSet {rtx_layers:args.expert_layers.clone(), spark_layers:remote.clone(),
-            spark_ranks:args.peers.len(), prefill_lanes:1};
-        Some(SparkAdmission::plan(&args.snapshot, ExpertGeometry::MINIMAX_M3, Some(&catalog), &working,
-            args.peers.len(), None, ModelAdmission::for_clients(ExpertGeometry::MINIMAX_M3, endpoint,
-                args.prefill_rows, spark_rings(config.max_frame_bytes)?, 1)?)?.start(&args.peers)?)
-    };
-    let device = Device {library:&library, id:args.device};
-    let ids = Buffer::new(&library, args.device, ledger.bytes("token_ids").context("token admission")? as usize)?;
-    let embedded = Buffer::new(&library, args.device, ledger.bytes("embedded").context("embedding admission")? as usize)?;
-    let tensor = checkpoint.tensors.iter().find(|t| t.meta.name == super::weights::EMBEDDING)
-        .context("MiniMax embedding header missing")?;
-    let source = EmbedSource::new(&args.snapshot, &tensor.shard, &tensor.meta, cfg.hidden)?;
-    let (embedding, (execution, local)) = crate::shared::placement::load_while_admitting(pending, || {
-        TokenEmbedding::load(&library, source, EmbedPlacement::Gpu, || {
-            let execution = Execution::load(device, &programs, &checkpoint, &cfg, &ledger, sizing)?;
-            let local = if args.expert_layers.is_empty() {None} else {
-                let tensors = catalog.fp8().context("MiniMax expert catalog missing")?.for_coordinator();
-                Some(crate::shared::experts::fp8::Fp8Experts::load(&library, &tensors, &package,
-                    &args.expert_layers, 1, 0, sizing.rows, available as usize)?)
-            };
-            Ok((execution, local))
-        })
-    })?;
-    let cache = Cache::new(&library, args.device, &admitted.cache, admitted.pool_pages as usize, 1,
-        admitted.cache_bytes.checked_add(256).context("cache admission overflow")?)?;
-    let spark = if let Some(&first) = remote.first() {
-        cuteafd_transport::worker_selection::require_peer_clients(&args.peers, endpoint, 1)?;
-        Some(super::routed::Spark::connect(&library, args.device, SparkWorld::canonical(args.peers.len())?, &args.peers,
-            sizing.rows, config, first, request, 1, sizing.host_landing)?)
-    } else {None};
-    let experts: Box<dyn ExpertExecutor<'_>> = if local.is_none() && spark.is_none() {Box::new(DenseOnly)}
-        else {Box::new(Routed::new(local, spark)?)};
-    let mut runner = Runner {execution:&execution, cache:&cache, embedding:&embedding, ids, embedded, experts,
+    }
+    // Serve's start-up, without its startup decode recordings: every golden step runs eagerly, so
+    // the gate scores the kernels themselves. A served replay is the same launch sequence
+    // (CUTEAFD_MINIMAX_GRAPH_VERIFY=1 checks replay against eager bit for bit).
+    let super::serve::Runtime { execution, cache, embedding, token_ids, embedded, routed } =
+        super::serve::start(&library, args.device, &programs, super::serve::Start {
+            snapshot: &args.snapshot, checkpoint: &checkpoint, cfg: &cfg, sizing, ledger: &ledger, cache: &admitted,
+            local_layers: &args.expert_layers, spark_layers: &remote, peers: &args.peers, catalog: &catalog,
+            package: &package, embed: EmbedPlacement::Gpu, available, draft: None })?;
+    let experts: Box<dyn ExpertExecutor<'_>> = match routed { Some(routed) => Box::new(routed), None => Box::new(DenseOnly) };
+    let mut runner = Runner {execution:&execution, cache:&cache, embedding:&embedding, ids:token_ids, embedded, experts,
         last_layer:args.last_layer, rows:sizing.rows};
     if args.check_prefix {check_prefix(&mut runner, &windows[0].tokens)?;}
     let mut results = Vec::new();
@@ -624,9 +587,13 @@ mod tests {
         assert!(Scores::default().result().is_err());
         assert!(scores.add(&[f32::NAN, 0.], &[0., 1.], 0).is_err());
         assert!(scores.add(&[0., 1.], &[0., 1.], 2).is_err());
-        verdict(&json!({"top1":0.9,"mean_kl":0.06}), true)?;
-        for invalid in [json!({"top1":0.89,"mean_kl":0.0}), json!({"top1":1.,"mean_kl":0.061}),
-            json!({"top1":null,"mean_kl":0.0})] {assert!(verdict(&invalid, true).is_err());}
+        verdict(&json!({"top1":0.94,"mean_kl":0.03,"nll":0.255,"reference_nll":0.25}), true)?;
+        for invalid in [json!({"top1":0.939,"mean_kl":0.0,"nll":0.25,"reference_nll":0.25}),
+            json!({"top1":1.,"mean_kl":0.031,"nll":0.25,"reference_nll":0.25}),
+            json!({"top1":1.,"mean_kl":0.0,"nll":0.27,"reference_nll":0.25}),
+            json!({"top1":1.,"mean_kl":0.0,"nll":0.25}), json!({"top1":null,"mean_kl":0.0})] {
+            assert!(verdict(&invalid, true).is_err());
+        }
         verdict(&json!({"cosine":0.99,"relative_l2":0.05}), false)?;
         assert!(verdict(&json!({"cosine":0.98,"relative_l2":0.0}), false).is_err());
         Ok(())
@@ -641,9 +608,9 @@ mod tests {
         std::fs::write(directory.path().join("logits.bin"), &raw)?;
         std::fs::write(directory.path().join("tokens.bin"), [1u32, 0].into_iter().flat_map(u32::to_le_bytes).collect::<Vec<_>>())?;
         std::fs::write(directory.path().join("positions.bin"), 1u32.to_le_bytes())?;
-        let mut result = json!({"schema":"cuteafd.minimax.golden.window/1", "binding":binding,
+        let mut result = json!({"schema":"cuteafd.minimax.golden.window/2", "binding":binding,
             "top1":1.0,"mean_kl":0.0,"prefix_byte_exact":true,"rows":2,"width":2,
-            "dtype":"F32","byte_order":"little","positions":[1],"logits_row_target_offset":1});
+            "dtype":"F32","byte_order":"little","positions":[1],"row_targets":"positions"});
         seal_window(directory.path(), "logits.bin", &mut result)?;
         let read = completed(directory.path(), &binding, true)?.unwrap();
         assert_eq!(read, result);
@@ -675,7 +642,7 @@ mod tests {
     }
 
     #[test]
-    fn minimax_golden_reads_sealed_partial_reference_without_claiming_full_fidelity() -> Result<()> {
+    fn minimax_golden_reads_layer_exports_of_a_qualified_full_reference() -> Result<()> {
         use cuteafd_loader::families::minimax_m3::config::MsaConfig;
         let root = tempfile::tempdir()?;
         let snapshot = root.path().join("snapshot"); let golden = root.path().join("golden");
@@ -687,16 +654,17 @@ mod tests {
         std::fs::write(folder.join("layer00.bin"), [0f32; 6].into_iter().flat_map(f32::to_le_bytes).collect::<Vec<_>>())?;
         write_json(&golden.join("windows.json"), &json!({"set_sha256":"set", "windows":[{
             "id":"code-1","tokens":[0,1,0],"roles":["ctx","ctx","gen"]}]}))?;
-        let mut meta = json!({"schema":"cuteafd.minimax.partial-reference/1", "family":"minimax_m3",
-            "checkpoint":"MiniMaxAI/MiniMax-M3.1-Flash","mtp":false,"last_layer":0,"complete_model":false,
-            "activation":"served-cache","set_sha256":"set", "snapshot_identity":{"snapshot_revision":REVISION,
-                "config_sha256":hash(&snapshot.join("config.json"))?,"tokenizer_sha256":hash(&snapshot.join("tokenizer.json"))?},
+        let identity = json!({"snapshot_revision":REVISION,
+            "config_sha256":hash(&snapshot.join("config.json"))?,"tokenizer_sha256":hash(&snapshot.join("tokenizer.json"))?});
+        let mut meta = json!({"schema":"cuteafd.fidelity.golden/2", "family":"minimax_m3",
+            "checkpoint":"MiniMaxAI/MiniMax-M3.1-Flash","mtp":false,
+            "activation":"served-cache","set_sha256":"set", "snapshot_identity":identity,
+            "prefix_qualification":{"passed":true,"finite":true,"set_sha256":"set","snapshot_identity":identity},
             "source_pin":{"transformers":{"revision":"6b6792ff3b1a434913dc59659d4461acc9c3a51a",
                 "sha256":{"src/transformers/models/minimax_m3_vl/modular_minimax_m3_vl.py":
                     "1c755515c8aefdbc6f9145ae8f051e43907e21022d9644e81afe47cd2e37b58d"}}},
-            "windows":[{"id":"code-1","path":"windows/code-1","vocab":2,"positions":[1,2],
-                "sha256":{"tokens.bin":hash(&folder.join("tokens.bin"))?,"layer00.bin":hash(&folder.join("layer00.bin"))?}}]});
-        write_json(&golden.join("partial.json"), &meta)?;
+            "windows":[{"id":"code-1","path":"windows/code-1","vocab":2,"positions":[1,2]}]});
+        write_json(&golden.join("meta.json"), &meta)?;
         let mut args = args(&["--last-layer", "0"]); args.snapshot = snapshot; args.golden = Some(golden.clone());
         let cfg = MiniMaxM3Config {vocab_size:2,hidden:2,layers:60,heads:1,kv_heads:1,head_dim:2,rotary_dim:2,
             rope_theta:10000.,rms_norm_eps:1e-6,moe:vec![false;60],dense_intermediate:2,moe_intermediate:2,
@@ -705,14 +673,15 @@ mod tests {
             max_position:128,tie_embeddings:false,bos:0,eos:vec![1]};
         let (_, windows) = references(&args, &cfg)?;
         assert_eq!(windows[0].tokens, [0,1,0]); assert_eq!(windows[0].generated, [false,false,true]);
+        // A full-model run needs logits.bin; an unqualified reference is refused.
         args.last_layer = 59; assert!(references(&args, &cfg).is_err()); args.last_layer = 0;
-        for field in ["last_layer", "activation", "complete_model"] {
-            let prior = meta[field].clone(); meta[field] = Value::Null;
-            write_json(&golden.join("partial.json"), &meta)?; assert!(references(&args, &cfg).is_err()); meta[field] = prior;
-        }
-        write_json(&golden.join("partial.json"), &meta)?;
-        std::fs::write(folder.join("layer00.bin"), [1f32; 6].into_iter().flat_map(f32::to_le_bytes).collect::<Vec<_>>())?;
+        meta["prefix_qualification"]["passed"] = false.into();
+        write_json(&golden.join("meta.json"), &meta)?;
         assert!(references(&args, &cfg).is_err());
+        meta["prefix_qualification"]["passed"] = true.into();
+        write_json(&golden.join("meta.json"), &meta)?;
+        std::fs::write(folder.join("layer00.bin"), [1f32; 5].into_iter().flat_map(f32::to_le_bytes).collect::<Vec<_>>())?;
+        assert!(references(&args, &cfg).is_err(), "a short layer export is refused");
         Ok(())
     }
 }

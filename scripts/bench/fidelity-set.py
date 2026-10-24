@@ -14,6 +14,7 @@ import copy
 import hashlib
 import importlib.util
 import json
+import os
 import pathlib
 import re
 import sys
@@ -645,7 +646,8 @@ def main(argv=None):
     p.add_argument("--api-options", type=pathlib.Path, help="JSON provider controls/deviations, recorded in provenance")
     p.add_argument("--response-cache", type=pathlib.Path, help="required resumable private cache for api/hf")
     p.add_argument("--snapshot", type=pathlib.Path, help="local HF checkpoint for generation")
-    p.add_argument("--bench-token")
+    # The server's API key; CUTEAFD_API_KEY keeps it out of the process list, as the bench CLI does.
+    p.add_argument("--bench-token", default=os.environ.get("CUTEAFD_API_KEY"))
     p.add_argument("--timeout", type=float, default=1800)
     p.add_argument("--out", type=pathlib.Path)
     a = p.parse_args(argv)

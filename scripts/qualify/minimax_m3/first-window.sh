@@ -78,7 +78,7 @@ schedule() {
     step "$selected: 4. Golden through layer 5 with local RTX experts, no Sparks" 'cosine >=0.99; relative L2 <=0.05; byte-exact prefix restore (partial-model diagnostic, no NLL claim)'
     show minimax-golden --last-layer 5 --expert-layers 3,4,5 --check-prefix
     for tp in 4 2 3; do
-      step "$selected: Spark TP$tp full golden" 'top-1 >=90%; KL <=0.06 nat; byte-exact prefix restore'
+      step "$selected: Spark TP$tp full golden" 'top-1 >=94%; KL <=0.03 nat; NLL <=0.01 nat above reference; byte-exact prefix restore'
       show minimax-golden --peers '{peers}' --check-prefix
       step "$selected: TP$tp serve and api-smoke" 'HTTP success; nonempty completion; no API error; owned containers stopped before lock release'
       show run.sh --wip qualification --config "CONFIG_DIR/minimax-m31-flash-nvfp4-$selected-tp$tp.config"
@@ -109,18 +109,6 @@ export WIP_INSTANCE="$instance" WIP_ROOT="$build/wip-$MINIMAX_RUN_ID"
 export TMPDIR="$build/tmp" CARGO_TARGET_DIR="$build/target" CUTEAFD_BUILD_CACHES=off
 export CUTEAFD_PLAN_BIN="$MINIMAX_PLAN_BIN"
 
-serve_cleanup() {
-  local host status=0 name
-  if docker container inspect "$container" >/dev/null 2>&1; then
-    timeout 120 docker stop "$container" && docker rm "$container" || status=1
-  fi
-  for host in "${serve_hosts[@]}"; do
-    name="cuteafd-spark-expert-$host-$expert_port"
-    timeout 120 ssh -o BatchMode=yes -o ConnectTimeout=15 "$host" \
-      "if docker container inspect '$name' >/dev/null 2>&1; then docker stop '$name' && docker rm '$name'; fi" || status=1
-  done
-  return "$status"
-}
 if [[ "$internal" == serve ]]; then
   [[ -n "${CUTEAFD_HW_LOCKS_HELD:-}" && "$stage_config" == "$output/"* ]] || {
     echo 'first-window: internal serve requires the hardware lock and owned configuration' >&2; exit 2;
@@ -137,17 +125,13 @@ if [[ "$internal" == serve ]]; then
     timeout 60 ssh -o BatchMode=yes -o ConnectTimeout=15 "$host" \
       "if docker container inspect '$name' >/dev/null 2>&1; then exit 1; fi"
   done
-  trap serve_cleanup EXIT
+  # stop.sh stops exactly this configuration's instance and EXPERT_PORT workers.
+  trap '"$root/stop.sh" --config "$stage_config"' EXIT
   trap 'exit 130' INT
   trap 'exit 143' TERM
+  # run.sh returns once /health answers, or fails.
   "$root/run.sh" --wip qualification --config "$stage_config"
-  deadline=$((SECONDS + timeout_s))
-  until curl --max-time 5 -fsS "$MINIMAX_URL/health" >/dev/null; do
-    ((SECONDS < deadline)) || { echo 'first-window: readiness timeout' >&2; exit 1; }
-    sleep 2
-  done
   "$root/scripts/qualify/api-smoke.sh" "$MINIMAX_URL" MiniMaxAI/MiniMax-M3.1-Flash
-  "$python" "$checks" api "$MINIMAX_URL"
   exit 0
 fi
 
@@ -175,7 +159,7 @@ trap 'exit 143' TERM
 golden() {
   local name="$1" cfg="$2" gpu="$3" peers="$4"; shift 4
   local budgets gpu_budget worker_budget
-  budgets="$("$python" "$checks" budgets "$cfg")"
+  budgets="$("$python" "$checks" budgets "$cfg" --plan "${cfg%.config}-plan.json")"
   read -r gpu_budget worker_budget <<<"$budgets"
   local -a command=("$python" "$root/scripts/bench/golden-run.py" --task minimax-qualify
     --output-dir "$output/$name" --family minimax --model "$MINIMAX_SNAPSHOT"
@@ -192,10 +176,8 @@ golden() {
   if [[ -n "$peers" ]]; then command+=(--peers '{peers}'); fi
   command+=("$@")
   show "${command[@]}"
+  # minimax-golden's own verdict (top-1/KL, or cosine/relative L2 per partial window) fails the run.
   "${command[@]}"
-  local kind=full
-  if [[ "$name" == *-layer3 ]]; then kind=diagnostic; elif [[ "$name" == *-layer5 ]]; then kind=partial; fi
-  "$python" "$checks" result "$output/$name/native/r1/scores/summary.json" --kind "$kind"
 }
 
 printf -v preflight '%q %q preflight %q' "$python" "$checks" "$card"
@@ -208,8 +190,9 @@ for selected in pro6000 5090; do
     cp "$MINIMAX_CONFIG_DIR/minimax-m31-flash-nvfp4-$selected-tp$tp.config" "$cfg"
     printf '\nMODEL_ID=MiniMaxAI/MiniMax-M3.1-Flash\nINSTANCE=%s\nWIP_INSTANCE=%s\nWIP_ROOT="%s"\nADDR=%s\n' \
       "$instance" "$instance" "$WIP_ROOT" "$MINIMAX_ADDR" >>"$cfg"
-    "$root/run.sh" --config "$cfg" --set "MODEL_ID=$MINIMAX_SNAPSHOT" --dry-run >"$output/$selected-tp$tp-plan.json"
-    "$python" "$checks" plan "$output/$selected-tp$tp-plan.json"
+    # A WIP dry run applies the launch's deployment guard (wip_launchable implies fit and placement).
+    "$root/run.sh" --wip qualification --config "$cfg" --set "MODEL_ID=$MINIMAX_SNAPSHOT" --dry-run \
+      >"$output/$selected-tp$tp-plan.json"
   done
   device="$(nvidia-smi --id="$gpu" --query-gpu=name --format=csv,noheader)"
   if [[ "$selected" == 5090 && "$device" != *5090* ]] || [[ "$selected" == pro6000 && "$device" != *PRO*6000* ]]; then
@@ -230,7 +213,7 @@ for selected in pro6000 5090; do
       "if docker container inspect 'cuteafd-spark-expert-wip-$instance' >/dev/null 2>&1; then exit 1; fi"
   done
   build_owned=1
-  CUTEAFD_WIP_SPARK_TP_ROLES='tp2;tp3' CUTEAFD_WIP_GENERIC_SPARK_COUNTS='minimax=2;minimax=3;minimax=4' \
+  CUTEAFD_WIP_GENERIC_SPARK_COUNTS='minimax=2;minimax=3;minimax=4' \
     timeout "$timeout_s" "$root/wip.sh" --slot qualification --role both --config "$cfg" --seed "$MINIMAX_BUILD_SEED"
   build_cleanup
   build_owned=0

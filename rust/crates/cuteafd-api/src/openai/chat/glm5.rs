@@ -201,7 +201,7 @@ impl GlmEncoding {
     }
 }
 
-fn read_chat_template(snapshot: &Path) -> Result<(String, PathBuf)> {
+pub(crate) fn read_chat_template(snapshot: &Path) -> Result<(String, PathBuf)> {
     let path = snapshot.join("chat_template.jinja");
     match std::fs::read_to_string(&path) {
         Ok(source) => Ok((source, path)),
@@ -219,6 +219,14 @@ fn read_chat_template(snapshot: &Path) -> Result<(String, PathBuf)> {
         }
         Err(error) => Err(error).with_context(|| format!("read {}", path.display())),
     }
+}
+
+/// The id `tokenizer.json` gives the added token `content`.
+pub(crate) fn added_token_id(tokenizer: &Value, content: &str) -> Result<u32> {
+    let added = tokenizer["added_tokens"].as_array().context("tokenizer.json added_tokens")?;
+    let id = added.iter().find(|token| token["content"] == content).and_then(|token| token["id"].as_u64())
+        .with_context(|| format!("tokenizer has no {content} token"))?;
+    u32::try_from(id).with_context(|| format!("{content} token id exceeds u32"))
 }
 
 fn vision_markers(config: &Value, tokenizer: &Value) -> Result<[String; 3]> {
@@ -287,7 +295,7 @@ fn resolve_template_snapshot(source: &str, hf_home: Option<&Path>) -> Result<Pat
         .with_context(|| format!("CHAT_TEMPLATE_FROM={source} has no cached snapshot; download it or supply a snapshot path"))
 }
 
-fn read_json(path: &Path) -> Result<Value> {
+pub(crate) fn read_json(path: &Path) -> Result<Value> {
     let text = std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
     serde_json::from_str(&text).with_context(|| format!("parse {}", path.display()))
 }

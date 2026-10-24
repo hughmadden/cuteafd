@@ -101,7 +101,7 @@ def test_minimax_refuses_push_loading(tmp_path):
     assert "docker run -d" not in result.stderr
 
 
-def _cpu_dry_run(tmp_path: Path, config_text: str):
+def _cpu_dry_run(tmp_path: Path, config_text: str, *args: str, plan: dict | None = None):
     snapshot = tmp_path / "snapshot"
     snapshot.mkdir()
     (snapshot / "config.json").write_text(json.dumps(CONFIG))
@@ -116,13 +116,15 @@ def _cpu_dry_run(tmp_path: Path, config_text: str):
         tool.chmod(0o755)
     planner = tools / "cuteafd-plan"
     planner.write_text('''#!/usr/bin/env python3
-import json, sys
-print(json.dumps({"args": sys.argv[1:], "executable": False}))
+import json, os, sys
+print(os.environ.get("FAKE_PLAN") or json.dumps({"args": sys.argv[1:], "executable": False}))
 ''')
     planner.chmod(0o755)
     env = {**os.environ, "PATH": f"{tools}:{os.environ['PATH']}",
            "CUTEAFD_PLAN_BIN": str(planner), "FORBIDDEN_CALLS": str(calls)}
-    result = subprocess.run([str(ROOT / "run.sh"), "--config", str(config), "--dry-run"],
+    if plan is not None:
+        env["FAKE_PLAN"] = json.dumps(plan)
+    result = subprocess.run([str(ROOT / "run.sh"), "--config", str(config), *args, "--dry-run"],
                             capture_output=True, text=True, env=env, timeout=30)
     assert not calls.exists(), calls.read_text() if calls.exists() else ""
     return result
@@ -149,6 +151,22 @@ def test_minimax_examples_have_cpu_only_dry_run(tmp_path, card, budget, tp):
         assert args[args.index(flag) + 1] == value
     assert "--require-ready" not in args
     assert "header admission only" in result.stderr
+
+
+@pytest.mark.parametrize("launchable", [True, False])
+def test_minimax_wip_dry_run_takes_the_launch_deployment_guard(tmp_path, launchable):
+    text = (ROOT / "examples/configs/minimax-m31-flash-nvfp4-5090-tp2.config").read_text()
+    plan = {"version": 1, "family": "minimax_m3", "launch": {"family": "minimax_m3"},
+            "spark_admission": "coordinator_authoritative", "executable": False,
+            "wip_launchable": launchable, "report": {"hints": ["coordinator pool below one request"]}}
+    result = _cpu_dry_run(tmp_path, text, "--wip", "qualification", plan=plan)
+    if launchable:
+        assert result.returncode == 0, result.stderr
+        assert json.loads(result.stdout)["wip_launchable"]
+    else:
+        assert result.returncode != 0
+        assert "invalid deployment specification" in result.stderr
+        assert "coordinator pool below one request" in result.stderr
 
 
 def test_minimax_cpu_dry_run_checks_family_keys(tmp_path):
@@ -185,6 +203,14 @@ def test_minimax_forwards_explicit_spark_budget_to_plan_and_runtime(tmp_path):
     assert float(_flag(plan, "--spark-budget-gib")) == 106
     workers = [line for line in result.stderr.splitlines() if "cuteafd expertd-native" in line]
     assert workers and all(f"--device-budget-bytes {budget}" in line for line in workers)
+
+
+def test_minimax_dspark_takes_the_shared_draft_length_keys(tmp_path):
+    result = _launch(tmp_path, "SPECULATOR=dspark\nDRAFT_POLICY=simple-rc\nDRAFT_ROW_COST=power\nSPECULATOR_DRAFTS=3\n")
+    assert result.returncode == 0, result.stderr
+    serve = _line(result, "serve-minimax --snapshot")
+    assert "CUTEAFD_DRAFT_POLICY=simple-rc" in serve and "CUTEAFD_DRAFT_ROW_COST=power" in serve
+    assert _flag(serve, "--draft-fixed") == "3"
 
 
 def test_minimax_bundled_dspark_is_explicit(tmp_path):

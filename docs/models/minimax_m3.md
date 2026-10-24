@@ -47,6 +47,35 @@ tensor header and plans memory; the engine is being brought up.
 - Speculator: the bundled DSpark drafter (5 dense sliding-4096 layers, blocks
   of 7, Markov rank 256, confidence head; taps 3/17/31/45/59).
 
+## Serving behaviour
+
+- Thinking follows the vendor's documented controls on chat, Responses and
+  Anthropic requests. `thinking.type: enabled` opens `<mm:think>` in the prompt;
+  `disabled`, `enable_thinking: false` or effort `none`/`minimal` turn it off
+  (the prompt ends in the close marker); absent is adaptive (the model decides).
+  An effort (`low`..`max`, or an Anthropic budget: <=1024 low, <=4096 medium,
+  <=16384 high, <=32768 xhigh, else max) is rendered only while thinking is on.
+- Tool arguments: a `strict: true` tool's call must match its schema or it is
+  returned as text; other tools are read best effort, as vLLM's `minimax_m3`
+  parser does (values coerce to the declared type when they parse, a repeated
+  parameter becomes a list).
+- DSpark draft length uses the shared `simple` policy (default;
+  `DRAFT_POLICY`/`DRAFT_ROW_COST` select others, `SPECULATOR_DRAFTS=N` fixes the
+  depth). TP2 on a 5090, aggregate tok/s at C1/C4/C16: target only
+  26.3/48.6/76.9, fixed depth 7 37.2/61.2/120.9, `simple` 41.2/69.7/114.5. The
+  C16 shortfall against fixed 7 is open in the shared policy.
+- Fidelity: `minimax-golden` against `golden.py --activation served-cache` on
+  the standard 64-window set (`fidelity-set.py` text recipe; 13,534
+  generated-role rows) scores top-1 0.957, KL 0.0186 nat and NLL 0.2520 against
+  the reference's 0.2536 at TP2, decode- and prefill-shaped alike. The gate is
+  top-1 >= 0.94, KL <= 0.03 and NLL at most 0.01 above the reference. The
+  reference's own BF16-K/V arm differs from its FP8-K/V arm by the same amount
+  (top-1 0.955, KL 0.0186, NLL 0.2537): FP8 K/V costs no NLL. Rows outside the
+  chat template (raw text with no turn marker, text after an end of turn) are
+  near-degenerate and swing between any two arithmetics (KL 0.6-4.7 nat between
+  the two reference arms), so the gate scores generated rows only. The bench
+  fidelity panel needs the set published as a dataset with a `PUBLICATIONS` row.
+
 ## Planned cards (header lower bound)
 
 `cuteafd plan --layout` on the release headers. Without a workspace manifest, workspaces and graphs remain estimates; drafter on the

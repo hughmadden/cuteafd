@@ -218,7 +218,8 @@ PROFILE_SPARK_NSYS_GPU_METRICS
 EOF
     [[ "$1" != kimi_k3 ]] || printf '%s\n' KV_CACHE RTX_EXPERT_LAYERS SPECULATOR_MODEL_ID SPECULATOR_MODEL_REVISION SPECULATOR_DRAFTS
     [[ "$1" != step5 ]] || printf '%s\n' SPECULATOR_DEPTH KV_CACHE
-    [[ "$1" != minimax_m3 ]] || printf '%s\n' KV_CACHE RTX_EXPERT_LAYERS PREFILL_BATCH_TOKENS PREFILL_LANES MEDIA_CACHE_BYTES VISION_REPLICAS HOST_CACHE_STORE
+    [[ "$1" != minimax_m3 ]] || printf '%s\n' KV_CACHE RTX_EXPERT_LAYERS PREFILL_BATCH_TOKENS PREFILL_LANES MEDIA_CACHE_BYTES \
+      VISION_REPLICAS HOST_CACHE_STORE SPECULATOR_DRAFTS DRAFT_POLICY DRAFT_ROW_COST
     _spark_slot_keys HOST LANE_A
     return
   fi
@@ -1722,8 +1723,11 @@ if [[ "$family" == minimax_m3 ]]; then
     [[ -z "$(get SPARK_DEVICE_BUDGET_BYTES)" ]] || minimax_plan_args+=(--spark-budget-gib "$(python3 -c 'import sys;print(int(sys.argv[1])/2**30)' "$(get SPARK_DEVICE_BUDGET_BYTES)")")
     [[ -z "$(get MEDIA_CACHE_BYTES)" ]] || minimax_plan_args+=(--media-cache-bytes "$(get MEDIA_CACHE_BYTES)")
     echo "MiniMax CPU dry run: header admission only; runtime artifacts and device execution remain unverified" >&2
-    "$planner" plan "$snapshot" "${minimax_plan_args[@]}"
-    exit $?
+    plan_json="$("$planner" plan "$snapshot" "${minimax_plan_args[@]}")" || exit $?
+    # With --wip the dry run takes the launch's deployment guard, as other families' dry runs do.
+    [[ -z "$wip_slot" ]] || release_validate_deployment "$plan_json" "$family"
+    printf '%s\n' "$plan_json"
+    exit 0
   fi
 fi
 coordinator_image="$(get COORDINATOR_DOCKER_INFERENCE)"
@@ -1990,11 +1994,11 @@ case "$speculator" in
     family_args+=(--mtp "$(get SPECULATOR_DEPTH "$mtp_depth")") ;;
 esac
 # SPECULATOR_DRAFTS: adaptive (default) or a fixed draft count per cycle
-# (DFlash2 on GLM 5.x, GLM 5.3 Flash and MiMo V2; dSpark on GLM 5.3 Flash), for policy A/B runs.
+# (DFlash2 on GLM 5.x, GLM 5.3 Flash and MiMo V2; dSpark on GLM 5.3 Flash and MiniMax M3), for policy A/B runs.
 drafts="$(get SPECULATOR_DRAFTS adaptive)"
 if [[ "$drafts" != adaptive ]]; then
-  [[ "$drafts" =~ ^[0-9]+$ && ($speculator == dflash2 || $family:$speculator == glm5_flash:dspark) ]] ||
-    { echo "SPECULATOR_DRAFTS must be adaptive or a draft count, with SPECULATOR=dflash2 (or dspark on GLM 5.3 Flash)" >&2; exit 2; }
+  [[ "$drafts" =~ ^[0-9]+$ && ($speculator == dflash2 || $family:$speculator == glm5_flash:dspark || $family:$speculator == minimax_m3:dspark) ]] ||
+    { echo "SPECULATOR_DRAFTS must be adaptive or a draft count, with SPECULATOR=dflash2 (or dspark on GLM 5.3 Flash or MiniMax M3)" >&2; exit 2; }
   draft_args+=(--draft-fixed "$drafts")
 fi
 # Prefix cache (MiMo, GLM 5.3, GLM 5.3 Flash, Qwen 3.8, DeepSeek V4, MiniMax M3): PREFIX_CACHE_ENTRIES

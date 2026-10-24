@@ -423,13 +423,12 @@ fn chat_body_with(turn: &TurnRequest, profile: &ModelProfile, names: &ToolNames,
             let kind = match (enabled, turn.reasoning.adaptive) { (false, _) => "disabled", (true, true) => "adaptive", (true, false) => "enabled" };
             body["thinking"] = json!({"type": kind});
             if enabled { if let Some(e) = effort.filter(|e| !matches!(*e, "none")) { body["reasoning_effort"] = json!(e); } }
+            // MiniMax M3 sizes its <effort> from an Anthropic budget itself (minimax_m3::prompt).
+            if let (true, ModelEncoding::MiniMaxM3(_), Some(budget)) = (enabled, &profile.encoding, turn.reasoning.budget_tokens) {
+                body["thinking"]["budget_tokens"] = json!(budget);
+            }
         }
         None => if let Some(e) = effort { body["reasoning_effort"] = json!(e); },
-    }
-    if matches!(profile.encoding, ModelEncoding::MiniMaxM3(_)) && effort.is_none() && turn.reasoning.enabled != Some(false) {
-        if let Some(budget) = turn.reasoning.budget_tokens {
-            body["reasoning_effort"] = json!(super::minimax_m3::prompt::budget_effort(budget));
-        }
     }
     if let Some(max) = turn.max_output_tokens { body["max_tokens"] = json!(max); }
     if let Some(t) = turn.sampling.temperature { body["temperature"] = json!(t); }

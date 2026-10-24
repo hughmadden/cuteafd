@@ -1,5 +1,5 @@
 use serde_json::{json, Value};
-use super::super::glm5::prompt::{reasoning_effort, resolve_thinking, template_message, response_format_instruction};
+use super::super::glm5::prompt::{declared_tools, reasoning_effort, template_message, response_format_instruction};
 use super::super::glm5::template::python_json;
 
 /// The template prints scalars with `{{ val }}`: minijinja spells floats unlike
@@ -17,9 +17,10 @@ pub fn pythonize_floats(value: &mut Value) {
 /// Budgets are effort hints, not generation token limits: <=1024 low,
 /// <=4096 medium, <=16384 high, <=32768 xhigh, above that max. An explicit
 /// `reasoning_effort` (OpenAI Chat/Responses, Anthropic `output_config.effort`)
-/// wins over a budget; `none` or a disabled thinking switch turns thinking off
-/// (the prompt then ends in the close marker); OpenAI's `minimal` is `low`.
-pub fn budget_effort(budget: u32) -> &'static str {
+/// wins over a budget. Either is rendered only while thinking is on: with
+/// thinking off (see [`super::Thinking`]; efforts `none` and `minimal` are
+/// off) the vendor ignores the effort and the prompt ends in the close marker.
+pub(super) fn budget_effort(budget: u32) -> &'static str {
     match budget { 0..=1024 => "low", 1025..=4096 => "medium", 4097..=16384 => "high",
         16385..=32768 => "xhigh", _ => "max" }
 }
@@ -66,21 +67,16 @@ pub fn template_context(body: &Value, tool_names: &[String]) -> Result<Value, St
             if let Some(value) = kwargs.get(key) { context[key] = value.clone(); }
         }
     }
-    let effort = reasoning_effort(body)?;
-    if let Some(effort) = effort.map(|e| if e == "minimal" { "low".to_owned() } else { e }) {
-        if !matches!(effort.as_str(), "low" | "medium" | "high" | "xhigh" | "max" | "none") {
-            return Err("MiniMax M3 reasoning_effort must be low, medium, high, xhigh, max or none".into());
+    let thinking = super::Thinking::of(body)? != super::Thinking::Off;
+    if let Some(effort) = reasoning_effort(body)? {
+        if !matches!(effort.as_str(), "low" | "medium" | "high" | "xhigh" | "max" | "minimal" | "none") {
+            return Err("MiniMax M3 reasoning_effort must be low, medium, high, xhigh, max, minimal or none".into());
         }
-        if effort != "none" { context["reasoning_effort"] = json!(effort); }
+        if thinking { context["reasoning_effort"] = json!(effort); }
     } else if let Some(budget) = body.get("thinking").and_then(|v| v.get("budget_tokens")) {
         let budget = budget.as_u64().and_then(|v| u32::try_from(v).ok()).ok_or("thinking.budget_tokens must be a non-negative u32")?;
-        // A budget sizes thinking; with thinking off it is not an effort.
-        if resolve_thinking(body)? { context["reasoning_effort"] = json!(budget_effort(budget)); }
+        if thinking { context["reasoning_effort"] = json!(budget_effort(budget)); }
     }
-    if !tool_names.is_empty() {
-        let tools = body["tools"].as_array().ok_or("tools must be an array")?;
-        context["tools"] = tools.iter().filter(|t| t["function"]["name"].as_str()
-            .is_some_and(|n| tool_names.iter().any(|wanted| wanted == n))).cloned().collect::<Vec<_>>().into();
-    }
+    if !tool_names.is_empty() { context["tools"] = declared_tools(body, tool_names)?.into(); }
     Ok(context)
 }
