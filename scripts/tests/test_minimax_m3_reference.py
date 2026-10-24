@@ -535,30 +535,3 @@ def test_layer_diagnostic_validates_tensor_identity(snapshot, tmp_path, field):
         diagnostic.compare(snapshot, dump)
 
 
-def test_partial_reference_emits_only_sealed_layer_output(snapshot, tmp_path, monkeypatch):
-    from types import SimpleNamespace
-    from tokenizers import Tokenizer
-    from tokenizers.models import WordLevel
-    from families.minimax_m3.golden import execute
-    import hashlib
-    import numpy as np
-    Tokenizer(WordLevel({str(i): i for i in range(64)}, unk_token="0")).save(str(snapshot / "tokenizer.json"))
-    monkeypatch.setattr(model, "REVISION", snapshot.name)
-    windows = tmp_path / "windows.json"
-    windows.write_text(json.dumps(panel([1, 7, 3, 9, 11, 5, 2])))
-    out = tmp_path / "partial"
-    args = SimpleNamespace(snapshot=snapshot, windows=windows, out=out, device="cpu", activation="served-cache",
-                           resume=None, stop_after_layer=0, layers=None, prefix_only=False, check_only=False)
-    execute(args)
-    partial = json.loads((out / "partial.json").read_bytes())
-    assert partial["schema"] == "cuteafd.minimax.partial-reference/1"
-    assert partial["last_layer"] == 0 and not partial["complete_model"] and not (out / "meta.json").exists()
-    entry = partial["windows"][0]
-    folder = out / entry["path"]
-    assert set(entry["sha256"]) == {"layer00.bin", "tokens.bin"}
-    for name, digest in entry["sha256"].items():
-        assert hashlib.sha256((folder / name).read_bytes()).hexdigest() == digest
-    hidden = np.fromfile(folder / "layer00.bin", dtype="<f4").reshape(7, 32)
-    state = np.fromfile(out / "state/layer00/sample.bin", dtype="<f4").reshape(7, 32)
-    np.testing.assert_array_equal(hidden, state)
-    assert (out / "windows.json").is_file()

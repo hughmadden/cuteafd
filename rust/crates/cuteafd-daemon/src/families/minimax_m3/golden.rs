@@ -105,10 +105,9 @@ struct Window { id: String, directory: PathBuf, tokens: Vec<u32>, positions: Vec
 
 fn references(args: &GoldenArgs, cfg: &MiniMaxM3Config) -> Result<(Value, Vec<Window>)> {
     let root = args.golden.as_ref().context("MiniMax golden requires --golden")?;
-    let partial = args.last_layer < 59 && root.join("partial.json").is_file();
-    let meta = read_json(&root.join(if partial {"partial.json"} else {"meta.json"}))?;
-    ensure!(meta["schema"] == if partial {"cuteafd.minimax.partial-reference/1"} else {"cuteafd.fidelity.golden/2"},
-        "MiniMax reference schema differs");
+    // A partial-layer run reads the layerNN.bin a full reference exported with --layers.
+    let meta = read_json(&root.join("meta.json"))?;
+    ensure!(meta["schema"] == "cuteafd.fidelity.golden/2", "MiniMax reference schema differs");
     ensure!(meta["family"] == "minimax_m3"
         && meta["checkpoint"] == "MiniMaxAI/MiniMax-M3.1-Flash" && meta["mtp"] == false
         && meta["snapshot_identity"]["snapshot_revision"] == REVISION,
@@ -119,10 +118,7 @@ fn references(args: &GoldenArgs, cfg: &MiniMaxM3Config) -> Result<(Value, Vec<Wi
         && meta["source_pin"]["transformers"]["sha256"]["src/transformers/models/minimax_m3_vl/modular_minimax_m3_vl.py"]
             == "1c755515c8aefdbc6f9145ae8f051e43907e21022d9644e81afe47cd2e37b58d",
         "MiniMax reference source pin differs");
-    if partial {
-        ensure!(meta["last_layer"] == args.last_layer && meta["complete_model"] == false && meta["activation"] == "served-cache",
-            "partial reference must match the requested layer and served cache arithmetic");
-    } else {
+    {
         let proof = &meta["prefix_qualification"];
         ensure!(proof["passed"] == true && proof["finite"] == true
             && proof["set_sha256"] == meta["set_sha256"]
@@ -162,12 +158,6 @@ fn references(args: &GoldenArgs, cfg: &MiniMaxM3Config) -> Result<(Value, Vec<Wi
         let (file, count) = if args.last_layer == 59 { ("logits.bin".into(), positions.len() * cfg.vocab_size) }
             else { (format!("layer{:02}.bin", args.last_layer), tokens.len() * cfg.hidden) };
         ensure!(std::fs::metadata(directory.join(&file))?.len() == count as u64 * 4, "reference payload extent differs");
-        if partial {
-            for name in [file.as_str(), "tokens.bin"] {
-                ensure!(entry["sha256"][name].as_str() == Some(hash(&directory.join(name))?.as_str()),
-                    "partial reference payload hash differs");
-            }
-        }
         ensure!(!windows.iter().any(|w: &Window| w.id == id), "duplicate reference window");
         windows.push(Window { id: id.into(), directory, tokens, positions, generated });
     }
@@ -665,7 +655,7 @@ mod tests {
     }
 
     #[test]
-    fn minimax_golden_reads_sealed_partial_reference_without_claiming_full_fidelity() -> Result<()> {
+    fn minimax_golden_reads_layer_exports_of_a_qualified_full_reference() -> Result<()> {
         use cuteafd_loader::families::minimax_m3::config::MsaConfig;
         let root = tempfile::tempdir()?;
         let snapshot = root.path().join("snapshot"); let golden = root.path().join("golden");
@@ -677,16 +667,17 @@ mod tests {
         std::fs::write(folder.join("layer00.bin"), [0f32; 6].into_iter().flat_map(f32::to_le_bytes).collect::<Vec<_>>())?;
         write_json(&golden.join("windows.json"), &json!({"set_sha256":"set", "windows":[{
             "id":"code-1","tokens":[0,1,0],"roles":["ctx","ctx","gen"]}]}))?;
-        let mut meta = json!({"schema":"cuteafd.minimax.partial-reference/1", "family":"minimax_m3",
-            "checkpoint":"MiniMaxAI/MiniMax-M3.1-Flash","mtp":false,"last_layer":0,"complete_model":false,
-            "activation":"served-cache","set_sha256":"set", "snapshot_identity":{"snapshot_revision":REVISION,
-                "config_sha256":hash(&snapshot.join("config.json"))?,"tokenizer_sha256":hash(&snapshot.join("tokenizer.json"))?},
+        let identity = json!({"snapshot_revision":REVISION,
+            "config_sha256":hash(&snapshot.join("config.json"))?,"tokenizer_sha256":hash(&snapshot.join("tokenizer.json"))?});
+        let mut meta = json!({"schema":"cuteafd.fidelity.golden/2", "family":"minimax_m3",
+            "checkpoint":"MiniMaxAI/MiniMax-M3.1-Flash","mtp":false,
+            "activation":"served-cache","set_sha256":"set", "snapshot_identity":identity,
+            "prefix_qualification":{"passed":true,"finite":true,"set_sha256":"set","snapshot_identity":identity},
             "source_pin":{"transformers":{"revision":"6b6792ff3b1a434913dc59659d4461acc9c3a51a",
                 "sha256":{"src/transformers/models/minimax_m3_vl/modular_minimax_m3_vl.py":
                     "1c755515c8aefdbc6f9145ae8f051e43907e21022d9644e81afe47cd2e37b58d"}}},
-            "windows":[{"id":"code-1","path":"windows/code-1","vocab":2,"positions":[1,2],
-                "sha256":{"tokens.bin":hash(&folder.join("tokens.bin"))?,"layer00.bin":hash(&folder.join("layer00.bin"))?}}]});
-        write_json(&golden.join("partial.json"), &meta)?;
+            "windows":[{"id":"code-1","path":"windows/code-1","vocab":2,"positions":[1,2]}]});
+        write_json(&golden.join("meta.json"), &meta)?;
         let mut args = args(&["--last-layer", "0"]); args.snapshot = snapshot; args.golden = Some(golden.clone());
         let cfg = MiniMaxM3Config {vocab_size:2,hidden:2,layers:60,heads:1,kv_heads:1,head_dim:2,rotary_dim:2,
             rope_theta:10000.,rms_norm_eps:1e-6,moe:vec![false;60],dense_intermediate:2,moe_intermediate:2,
@@ -695,14 +686,15 @@ mod tests {
             max_position:128,tie_embeddings:false,bos:0,eos:vec![1]};
         let (_, windows) = references(&args, &cfg)?;
         assert_eq!(windows[0].tokens, [0,1,0]); assert_eq!(windows[0].generated, [false,false,true]);
+        // A full-model run needs logits.bin; an unqualified reference is refused.
         args.last_layer = 59; assert!(references(&args, &cfg).is_err()); args.last_layer = 0;
-        for field in ["last_layer", "activation", "complete_model"] {
-            let prior = meta[field].clone(); meta[field] = Value::Null;
-            write_json(&golden.join("partial.json"), &meta)?; assert!(references(&args, &cfg).is_err()); meta[field] = prior;
-        }
-        write_json(&golden.join("partial.json"), &meta)?;
-        std::fs::write(folder.join("layer00.bin"), [1f32; 6].into_iter().flat_map(f32::to_le_bytes).collect::<Vec<_>>())?;
+        meta["prefix_qualification"]["passed"] = false.into();
+        write_json(&golden.join("meta.json"), &meta)?;
         assert!(references(&args, &cfg).is_err());
+        meta["prefix_qualification"]["passed"] = true.into();
+        write_json(&golden.join("meta.json"), &meta)?;
+        std::fs::write(folder.join("layer00.bin"), [1f32; 5].into_iter().flat_map(f32::to_le_bytes).collect::<Vec<_>>())?;
+        assert!(references(&args, &cfg).is_err(), "a short layer export is refused");
         Ok(())
     }
 }
