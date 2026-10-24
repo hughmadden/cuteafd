@@ -88,6 +88,10 @@ pub enum VariantError {
     Site { name: String, site: SiteKey, reason: String },
     #[error("variant {name}: {reason}")]
     Plan { name: String, reason: String },
+    #[error("derivation: {0}")]
+    Derive(String),
+    #[error("tensor is unchanged")]
+    Unchanged,
 }
 
 impl VariantPlan {

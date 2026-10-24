@@ -41,6 +41,7 @@ mod snapshot;
 mod tensors;
 mod tokenizer;
 pub mod plan;
+pub mod variants;
 pub mod placement;
 pub mod push_load;
 
