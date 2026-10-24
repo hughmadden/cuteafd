@@ -9,11 +9,13 @@ should pass `--role coordinator|spark` explicitly. ARM64 is not proof of GB10.
 | Setting | Role | Recommended value | Reason |
 | --- | --- | --- | --- |
 | CPU governor | Both | `performance` | Avoid frequency ramp-up on short host phases. |
-| `vm.swappiness` | Both | `10` | Recommended: reduce swap preference while retaining reclaim flexibility (was 60 on both hosts). |
+| Swap | Both | Off; fstab swap entries commented, swap units masked | Avoid reclaim-to-disk stalls in serving. Leave the backing file intact. |
+| THP `enabled` / `defrag` | Both | `madvise` | Keep hugepages opt-in and avoid unsolicited compaction. |
+| `vm.zone_reclaim_mode` | Both | `0` | Avoid local-zone reclaim stalls. |
 | Energy-performance preference (EPP) | Coordinator, where exposed | `performance` | Prefer responsiveness over energy saving. |
 | cpuidle `disable` | Coordinator | `1` when exit `latency >= 50` microseconds | Avoid deep-idle wake latency between waves; retain shallow states. |
 | cpuidle `disable` | Spark | `1` when exit `latency >= 200` microseconds | Avoid deep GB10 wake latency; retain shallow states. |
-| `vm.compaction_proactiveness` | Spark | `0` | TJ's 2026-10-23 policy: stop proactive background compaction competing with serving on unified memory. This does not disable allocation-time compaction. |
+| `vm.compaction_proactiveness` | Both | `0` | TJ's 2026-10-23 Spark policy, extended to both roles: stop proactive background compaction competing with serving. This does not disable allocation-time compaction. |
 
 The cutoffs are variables at the top of the script. Selection uses each
 state's measured sysfs `latency`, never its name. On raptor this excludes
@@ -39,12 +41,17 @@ is claimed for this host-tuning change.
 - CPU: governor/EPP and every CPU's idle-state name, exit latency, disable
   bit and usage counter. `[pass]` matches a recommendation, `[differs]`
   does not, `[unknown]` means unavailable or no universal recommendation.
-- THP `enabled` and `defrag`: recommend `madvise` (already set on our
-  hosts); report modes and compare the bracketed active mode. No writes.
-- `vm.zone_reclaim_mode=0`, unlimited memlock and inactive irqbalance:
-  recommended and already set on our hosts; report only. Memlock is the
-  report process's limit; a running expert worker's limits are also shown.
-  Service/container limits can differ from an interactive shell.
+- THP `enabled`/`defrag` `madvise` and `vm.zone_reclaim_mode=0`: likely
+  Spark/DGX OS defaults, already set here; apply enforces them nonetheless.
+- Unlimited memlock and inactive irqbalance: likely Spark/DGX OS defaults,
+  already set here; report only. Memlock is the report process's limit;
+  a running expert worker's limits are also shown. Service/container limits
+  can differ from an interactive shell. For a human-installed
+  `/etc/security/limits.d/90-cuteafd.conf`, use `* - memlock unlimited`
+  (add `root - memlock unlimited` if needed); systemd services need
+  `LimitMEMLOCK=infinity`, containers `--ulimit memlock=-1:-1`. New login or
+  service restart is required. Review IRQ placement before disabling an
+  active irqbalance service; the script does not stop it.
 - RoCE netdev IRQ CPU lists and `ethtool -c` coalescing: report only.
   Affinities are grouped by identical CPU list, retaining every IRQ ID.
   Choose IRQ/NUMA placement and coalescing against the site's topology and
@@ -76,11 +83,13 @@ only; this PR does not change launcher affinity.
 
 ## Considered and not applied
 
-- `isolcpus`/`nohz_full`/`rcu_nocbs`/`processor.max_cstate=1`: boot parameters
-  need a reboot; use sysfs for idle policy and affinity for core placement.
-- TCP buffers/BBR/`somaxconn`: expert traffic uses RDMA verbs, not TCP.
-- `panic_on_oom=1`: turns OOM into a reboot on shared hosts.
-- `overcommit_memory=1`, NVMe queue tuning: low value; leave site defaults.
+- `nohz_full`/`rcu_nocbs`/`isolcpus`: reduce tick/RCU-callback jitter on
+  dedicated cores, but require boot parameters/reboot, one hot task per
+  core, and can slightly slow syscalls. Try P-core placement first; use
+  only if a profile shows tick jitter on a spinning hot thread. Device-side
+  decode exchange removes most engine-thread spinning.
+- `processor.max_cstate=1`: needs a reboot; use the latency-selected sysfs
+  idle policy instead.
 - NCCL: not used by design; serving uses our verbs/P2P collectives.
 
 ## GB10 memory
@@ -91,6 +100,58 @@ reading. Never drop caches. Keep headroom and bound simultaneous CUDA
 context creation: [#730](https://github.com/tpurtell/cuteafd/issues/730)
 records context-creation OOMs despite high MemAvailable; reclaimable bytes
 are not a guarantee that parallel contexts can allocate immediately.
+
+## TCP policy (both roles)
+
+Recommended, not measured requirements: these serve HTTP, SparkNest and a
+possible future 10G TCP expert transport for an eight-node cluster. They do
+not affect today's RDMA verbs path. Apply checks BBR availability, loads
+`tcp_bbr` when needed, and writes `/etc/modules-load.d/90-cuteafd.conf`.
+The VM and TCP values share `/etc/sysctl.d/90-cuteafd.conf`:
+
+```ini
+# TJ 2026-10-23: background proactive compaction on GB10 unified memory stalls serving.
+vm.compaction_proactiveness = 0
+vm.zone_reclaim_mode = 0
+net.core.default_qdisc = fq
+net.ipv4.tcp_congestion_control = bbr
+net.core.rmem_max = 134217728
+net.core.wmem_max = 134217728
+net.ipv4.tcp_rmem = 4096 87380 134217728
+net.ipv4.tcp_wmem = 4096 65536 134217728
+net.core.netdev_max_backlog = 500000
+net.core.somaxconn = 65535
+```
+
+`fq` is required for BBR pacing. Changing `default_qdisc` does not replace
+an existing interface's qdisc; inspect `tc qdisc show` and arrange interface
+recreation/reboot in a maintenance window. The script never runs `tc`.
+BBR v1 can crowd out CUBIC flows on shared links: acceptable on our own
+cluster, but reconsider on a shared network. Buffer maxima are ceilings,
+not per-socket allocations. Existing configuration files get a one-time
+`.cuteafd.bak` backup. Changes are reversible: restore prior sysctl values
+and backups/remove these snippets, then reload sysctls; remove the module
+snippet if no longer wanted. Do not unload a module in active use.
+
+## Swap policy
+
+Report checks `swapon --show`, active swap lines in `/etc/fstab`, and
+installed/generated/loaded swap-unit masks. Apply runs `swapoff -a` only
+when needed, backs up fstab once to `/etc/fstab.cuteafd.bak`, comments active
+swap entries, and masks discovered swap units. It never deletes backing
+files or uses force to overwrite a local unit. A conflicting local swap
+unit must be reviewed by the human. Fstab must be readable and systemd
+inventory available; unknown inventory refuses swap apply. Swapoff may
+need substantial memory headroom: review report and available RAM first.
+Apply with serving stopped: masking units can trigger a systemd reload,
+which can invalidate running GPU containers on our cluster.
+
+On raptor/ostrich/kakapo, `/swap.img` is commented in fstab,
+`swap.img.swap` is masked and no swap is active. Ostrich still has its
+16 GB `/swap.img`; an operator may remove it after confirming swap is off.
+`vm.swappiness` is reported for context but never set: it is irrelevant
+once swap is disabled. Disable any external zram/swap generator separately
+if it recreates units after boot. No swap file is deleted by this script.
 
 ## Run and persist
 

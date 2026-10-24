@@ -7,6 +7,16 @@ import pytest
 
 
 SCRIPT = Path(__file__).resolve().parents[1] / "host/tune.sh"
+TCP = {
+    "net.core.default_qdisc": "fq", "net.ipv4.tcp_congestion_control": "bbr",
+    "net.core.rmem_max": "134217728", "net.core.wmem_max": "134217728",
+    "net.ipv4.tcp_rmem": "4096 87380 134217728",
+    "net.ipv4.tcp_wmem": "4096 65536 134217728",
+    "net.core.netdev_max_backlog": "500000", "net.core.somaxconn": "65535",
+}
+SYSCTL_CONFIG = ("# TJ 2026-10-23: background proactive compaction on GB10 unified memory stalls serving.\n"
+                 "vm.compaction_proactiveness = 0\nvm.zone_reclaim_mode = 0\n") + "\n".join(
+    f"{key} = {value}" for key, value in TCP.items())
 
 
 def put(root, path, value):
@@ -28,9 +38,20 @@ def fixture(root, role):
             for name, value in {"name": f"arbitrary-{index}", "latency": latency,
                                 "disable": 0, "usage": 123}.items():
                 put(root, f"{state}/{name}", value)
+    for key, value in TCP.items():
+        put(root, "proc/sys/" + key.replace(".", "/"), value)
+    put(root, "proc/sys/net/ipv4/tcp_available_congestion_control", "reno cubic bbr")
+    put(root, "etc/sysctl.d/90-cuteafd.conf", SYSCTL_CONFIG)
+    put(root, "etc/modules-load.d/90-cuteafd.conf", "tcp_bbr")
     put(root, "proc/sys/vm/compaction_proactiveness", 20)
     put(root, "proc/sys/vm/swappiness", 60)
     put(root, "proc/sys/vm/zone_reclaim_mode", 0)
+    put(root, "swapon.txt", "")
+    put(root, "swap-units.txt", "swap.img.swap")
+    put(root, "etc/fstab", "# /swap.img none swap sw 0 0")
+    units = root / "etc/systemd/system"
+    units.mkdir(parents=True)
+    (units / "swap.img.swap").symlink_to("/dev/null")
     put(root, "lscpu.csv", "# CPU,MAXMHZ\n0,2800.0000\n1,3900.0000")
     for name in ("enabled", "defrag"):
         put(root, f"kernel/mm/transparent_hugepage/{name}", "always [madvise] never")
@@ -69,8 +90,11 @@ def test_report_and_dry_run_select_by_latency(tmp_path, role, threshold):
             assert (f"[{marker}] cpu{cpu}/state{index} "
                     f"name=arbitrary-{index} latency_us={latency} usage=123 disable: 0 "
                     f"| target={expected}") in report.stdout
-    assert "[pass] THP enabled (modes: always [madvise] never): madvise | target=madvise" in report.stdout
-    assert "[pass] vm.zone_reclaim_mode: 0 | target=0" in report.stdout
+    assert "[pass] kernel/mm/transparent_hugepage/enabled: madvise | target=madvise" in report.stdout
+    assert "[pass] proc/sys/vm/zone_reclaim_mode: 0 | target=0" in report.stdout
+    assert "[pass] active swap (swapon --show): none | target=none" in report.stdout
+    assert "[pass] fstab active swap entries: none | target=none" in report.stdout
+    assert "[pass] swap unit swap.img.swap: masked | target=masked" in report.stdout
     if role == "spark":
         assert "P=1 (3900MHz) E=0 (2800MHz)" in report.stdout
     assert "200 Gb/sec" in report.stdout
@@ -83,11 +107,9 @@ def test_report_and_dry_run_select_by_latency(tmp_path, role, threshold):
     writes = {line.split(" <- ")[0].removeprefix("DRY-RUN write ")
               for line in dry.stdout.splitlines() if line.startswith("DRY-RUN write ")}
     expected = {str(tmp_path / "devices/system/cpu/cpufreq/policy0/scaling_governor"),
-                str(tmp_path / "proc/sys/vm/swappiness")}
+                str(tmp_path / "proc/sys/vm/compaction_proactiveness")}
     if role == "coordinator":
         expected.add(str(tmp_path / "devices/system/cpu/cpufreq/policy0/energy_performance_preference"))
-    else:
-        expected.add(str(tmp_path / "proc/sys/vm/compaction_proactiveness"))
     for cpu in (0, 1):
         for index, latency in enumerate(latencies):
             if latency >= threshold:
@@ -125,7 +147,7 @@ def test_fixture_report_never_runs_host_probes(tmp_path):
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
     marker = tmp_path / "host-probe-ran"
-    for name in ("lscpu", "ps", "taskset", "ethtool", "dcb", "rdma", "nvidia-smi", "systemctl"):
+    for name in ("lscpu", "ps", "taskset", "ethtool", "dcb", "rdma", "nvidia-smi", "systemctl", "swapon", "swapoff"):
         stub = bin_dir / name
         stub.write_text(f'#!/bin/sh\ntouch "{marker}"\nexit 1\n')
         stub.chmod(0o755)
@@ -135,6 +157,46 @@ def test_fixture_report_never_runs_host_probes(tmp_path):
                             env=env, text=True, capture_output=True, timeout=15)
     assert result.returncode == 0, result.stderr
     assert not marker.exists()
+
+
+def test_swap_disable_preview_and_default_enforcement(tmp_path):
+    fixture(tmp_path, "spark")
+    put(tmp_path, "swapon.txt", "/swap.img file 16G 0B -2")
+    put(tmp_path, "etc/fstab", "/dev/root / ext4 defaults 0 1\n/swap.img none swap sw 0 0\n# /old none swap sw 0 0")
+    (tmp_path / "etc/systemd/system/swap.img.swap").unlink()
+    for name in ("enabled", "defrag"):
+        put(tmp_path, f"kernel/mm/transparent_hugepage/{name}", "[always] madvise never")
+    put(tmp_path, "proc/sys/vm/zone_reclaim_mode", 1)
+    before = snapshot(tmp_path)
+    result = run(tmp_path, "apply", "--role", "spark", "--dry-run")
+    assert result.returncode == 0, result.stderr
+    assert "DRY-RUN command swapoff -a" in result.stdout
+    assert f"DRY-RUN backup {tmp_path}/etc/fstab" in result.stdout
+    assert f"DRY-RUN comment active swap entries in {tmp_path}/etc/fstab" in result.stdout
+    assert "DRY-RUN command systemctl mask -- swap.img.swap" in result.stdout
+    assert f"{tmp_path}/proc/sys/vm/zone_reclaim_mode <- 0" in result.stdout
+    for name in ("enabled", "defrag"):
+        assert f"{tmp_path}/kernel/mm/transparent_hugepage/{name} <- madvise" in result.stdout
+    assert "swappiness" not in result.stdout
+    assert snapshot(tmp_path) == before
+
+
+def test_tcp_policy_preview_and_persistence(tmp_path):
+    fixture(tmp_path, "spark")
+    for key in TCP:
+        put(tmp_path, "proc/sys/" + key.replace(".", "/"), "0")
+    put(tmp_path, "proc/sys/net/ipv4/tcp_available_congestion_control", "reno cubic")
+    (tmp_path / "etc/sysctl.d/90-cuteafd.conf").unlink()
+    (tmp_path / "etc/modules-load.d/90-cuteafd.conf").unlink()
+    before = snapshot(tmp_path)
+    result = run(tmp_path, "apply", "--role", "spark", "--dry-run")
+    assert result.returncode == 0, result.stderr
+    for key, value in TCP.items():
+        assert f"{tmp_path}/proc/sys/{key.replace('.', '/')} <- {value}" in result.stdout
+    assert "check tcp_bbr availability (modinfo); command modprobe tcp_bbr" in result.stdout
+    assert f"DRY-RUN write config {tmp_path}/etc/sysctl.d/90-cuteafd.conf" in result.stdout
+    assert f"DRY-RUN write config {tmp_path}/etc/modules-load.d/90-cuteafd.conf <- tcp_bbr" in result.stdout
+    assert snapshot(tmp_path) == before
 
 
 def test_unknown_latency_is_never_written(tmp_path):
@@ -150,8 +212,8 @@ def test_missing_interfaces_report_unknown(tmp_path):
     result = run(tmp_path, "--role", "spark")
     assert result.returncode == 0, result.stderr
     for label in ("CPU governor", "CPU energy_performance_preference", "cpuidle",
-                  "THP enabled", "rdma link", "RoCE port rate", "RoCE NIC diagnostics",
-                  "vm.zone_reclaim_mode", "memlock", "irqbalance", "GB10 P/E cores"):
+                  "kernel/mm/transparent_hugepage/enabled", "rdma link", "RoCE port rate", "RoCE NIC diagnostics",
+                  "memlock", "irqbalance", "GB10 P/E cores", "active swap", "fstab active swap", "swap units"):
         assert f"[unknown] {label}" in result.stdout
 
 
