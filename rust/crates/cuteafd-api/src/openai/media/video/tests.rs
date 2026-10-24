@@ -111,8 +111,9 @@ fn decoded_prepared_encoded_and_encoder_limits_apply_to_video() {
     assert!(p.prepare_videos(&source).is_err());
     let mut p = preparer(); p.limits.encoded_bytes = 1;
     assert!(p.prepare_videos(&source).is_err());
+    // The image detail cap does not bound video segments; the tower's capacity does.
     let mut p = preparer(); p.config.max_image_tokens = 1;
-    assert!(p.prepare_videos(&source).unwrap_err().to_string().contains("token capacity"));
+    assert_eq!(p.prepare_videos(&source).unwrap()[0].segments[0].tokens, 3);
     let mut p = preparer(); p.limits.decoded_bytes = 3*28*28*3;
     let source = sources(json!({"type":"video", "frames":[FRAMES[0]]}));
     assert!(p.prepare_videos(&[source[0].clone(), source[0].clone()]).is_err());

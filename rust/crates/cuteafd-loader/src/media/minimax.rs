@@ -9,6 +9,9 @@ pub const VIDEO_TOKEN: u32 = 200_026;
 /// sglang `_apply_max_frames_limit` splits `grid_t` into runs of `vision_segment_max_frames`
 /// (4) temporal patches, each its own attention segment with positions 0..t: 8 frames.
 pub const MAX_SEGMENT_FRAMES: usize = 8;
+/// Token capacity of the loaded tower (16,384 patches of scratch); one video segment
+/// must fit it whatever the image detail cap is.
+pub const ENCODER_TOKENS: usize = 4096;
 /// Compatible framework source for inherited sampling; the checkpoint does not pin it.
 pub const SAMPLING_REFERENCE: (&str, &str) = (
     "transformers/v4.57.1/src/transformers/video_processing_utils.py",

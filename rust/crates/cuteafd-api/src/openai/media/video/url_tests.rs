@@ -68,6 +68,27 @@ fn encoded_http_video_uses_fetch_policy_and_the_same_processor() {
     assert_sampled(&result.unwrap());
 }
 
+fn generated(source: &str) -> String {
+    let output = std::process::Command::new("ffmpeg").args(["-hide_banner", "-loglevel", "error", "-nostdin",
+        "-f", "lavfi", "-i", source, "-threads", "1", "-c:v", "ffv1", "-f", "matroska", "pipe:1"])
+        .stdin(std::process::Stdio::null()).output().unwrap();
+    assert!(output.status.success(), "ffmpeg lavfi fixture");
+    format!("data:video/x-matroska;base64,{}", STANDARD.encode(output.stdout))
+}
+
+#[test]
+fn segments_are_bounded_by_tower_capacity_not_the_image_cap() {
+    let mut low = preparer(ImageUrlFetch::Off);
+    low.config.max_image_tokens = 1;
+    let url = format!("data:video/x-matroska;base64,{}", STANDARD.encode(VIDEO));
+    assert!(low.prepare_videos(&source(&url)).is_ok());
+    // Eight unresized 924x924 frames: one segment of 4 x 33 x 33 = 4,356 tokens.
+    let mut body = json!({"messages":[{"role":"user","content":[{"type":"video_url","video_url":{
+        "url":generated("color=c=gray:s=924x924:r=8:d=1"),"do_sample_frames":false,"do_resize":false}}]}]});
+    let error = preparer(ImageUrlFetch::Off).prepare_videos(&take_sources(&mut body).unwrap()).unwrap_err();
+    assert!(error.to_string().contains("token capacity"), "{error:#}");
+}
+
 #[test]
 fn encoded_video_rejects_bad_payload_mime_and_request_byte_limits() {
     let encoded = STANDARD.encode(VIDEO);

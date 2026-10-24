@@ -91,7 +91,7 @@ impl MediaPreparer {
                     .pop().context("video segment is empty")?;
                 prepared_bytes = prepared_bytes.checked_add(segment.rgb8.len()).context("prepared video extent overflow")?;
                 ensure!(prepared_bytes <= self.limits.decoded_bytes, "prepared videos exceed request byte limit");
-                ensure!(segment.tokens <= self.config.max_image_tokens, "video segment exceeds encoder token capacity");
+                ensure!(segment.tokens <= minimax::ENCODER_TOKENS, "video segment exceeds encoder token capacity");
                 total_tokens = total_tokens.checked_add(segment.tokens).context("video token count overflow")?;
                 ensure!(total_tokens <= 57_600, "videos exceed total token budget");
                 placeholder.push_str(&segment.placeholder(source_fps, Some(&indices[offset..offset + segment.source_frames]))?);
