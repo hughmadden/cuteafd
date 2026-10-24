@@ -63,8 +63,6 @@ impl V41SteerTables {
         Ok(Some(Self { tables, layers, variants }))
     }
     pub fn edits(&self, layer: usize) -> bool { self.layers.get(layer).is_some_and(Option::is_some) }
-    /// Highest configured variant index (row values above it are refused).
-    pub fn variants(&self) -> usize { self.variants }
     /// Table bytes on a GPU holding the layers `holds` selects: each distinct
     /// table once. The planner charges this before sizing the KV pool.
     pub fn device_bytes(&self, holds: impl Fn(usize) -> bool) -> usize {
@@ -96,6 +94,19 @@ pub(crate) fn variant_rows(rows: &[super::v41_backbone_router::ExpertRow], reque
 pub(crate) struct V41Variant {
     pub plan: VariantPlan,
     pub derivation: cuteafd_loader::V41Derivation,
+}
+
+impl V41Variant {
+    /// What `/v1/models` and stats show for this variant.
+    pub fn record(&self, served: &str) -> cuteafd_core::variants::VariantRecord {
+        let d = &self.derivation;
+        let fold = |f: fn(&cuteafd_loader::V41SiteReport) -> f32, max: bool| d.sites.iter().map(f)
+            .fold(if max { f32::MIN } else { f32::MAX }, if max { f32::max } else { f32::min });
+        cuteafd_core::variants::VariantRecord::of(&self.plan, served, serde_json::json!({
+            "alpha": d.alpha, "shared_direction": d.shared_direction, "direction_cos_min": d.direction_cos_min,
+            "second_share_max": fold(|s| s.second_share, true), "projection_cos_min": fold(|s| s.projection_cos, false),
+            "rebuild_exact_min": fold(|s| s.rebuild_exact, false)}))
+    }
 }
 
 /// Derive every `--variant` against the served stock snapshot (or its `base=`),
