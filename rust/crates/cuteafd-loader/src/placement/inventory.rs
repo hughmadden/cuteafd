@@ -48,6 +48,9 @@ pub struct ArchContext {
     pub peer_context_bytes: u64,
     /// Device bytes one captured decode-graph executable holds (measured).
     pub graph_executable_bytes: u64,
+    /// The NIC can land Spark partials in this card's memory (dma-buf, GPUDirect RDMA). GeForce
+    /// cards cannot: their partials land in pinned host planes the reducer reads in place.
+    pub gpu_landing: bool,
     /// The driver these numbers were measured on.
     pub driver: &'static str,
     /// Measurement provenance.
@@ -64,15 +67,15 @@ pub struct ArchContext {
 pub const ARCH_CONTEXTS: &[ArchContext] = &[
     ArchContext { arch: "sm_120", max_total_bytes: 34 << 30, total_bytes: 0, sms: 170, context_bytes: 586_416_128,
         cublas_bytes: 71_303_168,
-        peer_context_bytes: 0, graph_executable_bytes: 149_712, driver: "595.91.07",
+        peer_context_bytes: 0, graph_executable_bytes: 149_712, gpu_landing: false, driver: "595.91.07",
         source: "RTX 5090 class: SM120 PRO probe on the same driver/CUDA 13.2; SM count from the 5090 spec" },
     ArchContext { arch: "sm_120", max_total_bytes: u64::MAX, total_bytes: 101_973_491_712, sms: 188,
         context_bytes: 586_416_128, cublas_bytes: 71_303_168,
-        peer_context_bytes: 0, graph_executable_bytes: 149_712, driver: "595.91.07",
+        peer_context_bytes: 0, graph_executable_bytes: 149_712, gpu_landing: true, driver: "595.91.07",
         source: "RTX PRO 6000 Blackwell probe (CUDA 13.2); Qwen 12,397 graphs = 1,855,979,520 B" },
     ArchContext { arch: "sm_121", max_total_bytes: u64::MAX, total_bytes: 130_594_156_544, sms: 48,
         context_bytes: 257 << 20, cublas_bytes: 160 << 20,
-        peer_context_bytes: 0, graph_executable_bytes: 149_712, driver: "580.178.04",
+        peer_context_bytes: 0, graph_executable_bytes: 149_712, gpu_landing: false, driver: "580.178.04",
         source: "GB10 probe (CUDA 13.0, MemAvailable deltas): context 189-257 MiB + cuBLAS 150-160 MiB; graph bytes from SM120" },
 ];
 

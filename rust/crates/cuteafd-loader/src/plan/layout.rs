@@ -1206,7 +1206,7 @@ pub(crate) fn charge_host(report: &mut PlanReport, options: &LayoutOptions, chec
             topk: u32::try_from(topk)?, intermediate: u32::try_from(spec.moe.as_ref().unwrap().intermediate)?,
             layers: u32::try_from(spec.layers.len())? };
         let endpoints = spark_endpoints(family, lanes);
-        let bf16 = native || matches!(family, "glm5" | "qwen4");
+        let bf16 = native || matches!(family, "glm5" | "qwen4" | "minimax_m3");
         let ingress = if native { SparkIngress::Fp8K32 } else if bf16 { SparkIngress::Bf16 }
             else { SparkIngress::Fp8K32 };
         let endpoint = SparkEndpoint { capacity: u32::try_from(rows)?, ingress };

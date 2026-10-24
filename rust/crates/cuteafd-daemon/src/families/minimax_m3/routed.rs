@@ -1,6 +1,12 @@
 use super::{MiniMaxError, execution::ExpertExecutor};
 use crate::shared::{experts::fp8::Fp8Experts,minimax_ffi,prefill_lanes::LaneLinks,
     spark_intake::{self,IntakePreference,SparkDeviceLink}};
+
+/// Whether this GPU's Spark partials land in pinned host planes (no dma-buf
+/// landing, as on GeForce cards): the ledger and the links take the same answer.
+pub(super) fn host_landing(library:&NativeLibrary)->Result<bool> {
+    Ok(!spark_intake::preferred_device_exchange_available(library,IntakePreference::Probed)?)
+}
 use cuteafd_loader::serving_capacity::prefill_lanes::MAX_PREFILL_LANES;
 use anyhow::{ensure,Context,Result};
 use cuteafd_ffi::{NativeLibrary,minimax::{Buffer,Commands}};
@@ -25,11 +31,11 @@ pub(super) type Build=fn(u64,usize,usize,Vec<ExpertProtocolV2RouteEntry>,bytes::
 pub(super) struct Spark<'a>(LaneLinks<Rc<SparkDeviceLink<'a>>>);
 
 impl<'a> Spark<'a> {
-    /// `first` is a Spark layer for the warm wave that sizes every rank's rings.
+    /// `first` is a Spark layer for the warm wave that sizes every rank's rings;
+    /// `host` is [`host_landing`].
     #[allow(clippy::too_many_arguments)]
     pub fn connect(library:&'a NativeLibrary,device:i32,world:SparkWorld,peers:&[SocketAddr],rows:usize,
-        config:TcpTransportConfig,first:usize,build:Build,lanes:usize)->Result<Self> {
-        let host=!spark_intake::preferred_device_exchange_available(library,IntakePreference::Probed)?;
+        config:TcpTransportConfig,first:usize,build:Build,lanes:usize,host:bool)->Result<Self> {
         if host { tracing::info!("MiniMax Spark partials land in pinned host planes (no GPU landing)"); }
         Ok(Self(LaneLinks::connect(lanes,|lane| {
             let routes=(0..rows*TOPK).map(|i| ExpertProtocolV2RouteEntry {

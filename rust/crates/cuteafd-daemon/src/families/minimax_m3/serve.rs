@@ -151,10 +151,11 @@ fn worker(args: &ServeArgs, receive: &mut tokio::sync::mpsc::Receiver<cuteafd_ap
     let draft_contract=if args.speculator=="dspark" {Some(cuteafd_loader::families::minimax_m3::dspark::DsparkContract::open(&args.snapshot)?)} else {None};
     let draft_layout=draft_contract.as_ref().map(|c|super::dspark::Layout::new(&library,c,rings,chunk)).transpose()?;
     let (draft_bytes,draft_rings)=draft_layout.as_ref().map_or((0,0),|l|(l.bytes,l.slots));
+    let host_landing = super::routed::host_landing(&library)?;
     let sizing = RuntimeSizing { rows, decode_rows: rows.min(64), sequences,
         context: if args.max_context == 0 {cfg.max_position as u64} else {args.max_context}, spark_ranks: args.peers.len(),
         logit_rows: RuntimeSizing::head_rows(chunk, args.full_prefill_logits, draft_layout.as_ref().map_or(0, |l| l.sequences * 7)),
-        lanes };
+        lanes, host_landing };
     let headroom = (args.headroom_gib * (1u64 << 30) as f64) as u64;
     let manifest = cuteafd_loader::plan::checkpoint::read_json(&args.manifest)?;
     let package = crate::shared::experts::fp8::package_directory(&args.native_lib, 1,
@@ -228,7 +229,7 @@ fn worker(args: &ServeArgs, receive: &mut tokio::sync::mpsc::Receiver<cuteafd_ap
     cuteafd_transport::worker_selection::require_peer_clients(&args.peers, endpoint, lanes)?;
     let world = SparkWorld::canonical(args.peers.len())?;
     let spark = admitted.spark_layers.first().map(|&first| super::routed::Spark::connect(&library, args.device, world,
-        &args.peers, sizing.rows, config, first, request, lanes)).transpose()?;
+        &args.peers, sizing.rows, config, first, request, lanes, host_landing)).transpose()?;
     let expander = vision.as_ref().map(|_| cuteafd_loader::media::minimax::span_expander(&args.snapshot, cfg.vocab_size as u32, false)).transpose()?;
     let backend = MiniMaxBackend { execution: &execution, cache: &cache, embedding: &embedding, token_ids, embedded,
         experts: RefCell::new(Routed::new(local, spark)?), rows: chunk, vocabulary: cfg.vocab_size, expander,

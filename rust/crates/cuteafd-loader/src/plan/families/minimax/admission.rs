@@ -45,6 +45,9 @@ pub struct RuntimeSizing {
     /// Prefill lanes (`--prefill-lanes`, `serving_capacity::prefill_lanes`): a chunk of up to
     /// `lanes` x `rows` rows, one Spark endpoint per lane on every rank.
     pub lanes: usize,
+    /// Spark partials land in pinned host planes (a card without dma-buf, as GeForce): each
+    /// lane's GPU intake then holds one row per rank, and its planes are host memory.
+    pub host_landing: bool,
 }
 impl RuntimeSizing {
     /// Rows of the longest prefill chunk, which the per-row buffers hold: lanes cut on KV pages.
@@ -197,7 +200,10 @@ impl RuntimeLedger {
         add("scratch", &[programs.workspace_bytes()])?;
         add("sampler", &[cuteafd_core::target_sampler_device_bytes(sizing.decode_rows, cfg.vocab_size) as u64])?;
         add("selector", &[sizing.decode_rows as u64, 12])?;
-        add("spark_intake", &[spark_intake_bytes(sizing.lanes as u64, sizing.spark_ranks as u64, sizing.rows as u64, h)])?;
+        // Every lane's link has a GPU plane per rank: whole lanes with GPU landing, one row with
+        // host landing (its pinned planes are host memory, charged by the host layout).
+        let intake_rows = if sizing.host_landing { 1 } else { sizing.rows as u64 };
+        add("spark_intake", &[spark_intake_bytes(sizing.lanes as u64, sizing.spark_ranks as u64, intake_rows, h)])?;
         let fixed_bytes = sum(allocations.iter().map(|a| a.bytes))?;
         Ok(Self { allocations, fixed_bytes })
     }
@@ -360,7 +366,8 @@ pub(crate) mod tests {
             .collect::<serde_json::Map<_, _>>();
         serde_json::json!({"layouts":layouts})
     }
-    fn sizing() -> RuntimeSizing { RuntimeSizing { rows: 256, decode_rows: 64, sequences: 16, context: 1 << 20, spark_ranks: 3, logit_rows: 64, lanes: 1 } }
+    fn sizing() -> RuntimeSizing { RuntimeSizing { rows: 256, decode_rows: 64, sequences: 16, context: 1 << 20, spark_ranks: 3,
+        logit_rows: 64, lanes: 1, host_landing: false } }
     fn config() -> MiniMaxM3Config { MiniMaxM3Config::from_hf(&release_config()).unwrap() }
 
     #[test]

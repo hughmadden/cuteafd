@@ -309,6 +309,35 @@ fn native_5090_options(dir: &std::path::Path, ranks: usize) -> PlanOptions {
     options
 }
 
+/// The Spark intake each lane's device link allocates: GPU planes on a card the NIC can land in;
+/// on a GeForce card one GPU row per rank plus pinned host planes. Per rank these are the
+/// runtime's own memory ledger (24 Oct, TP2 on the 5090, one lane of 4096 rows): device
+/// `spark-intake` 24,576 B and pinned `spark-intake` 100,663,296 B for two ranks.
+#[test]
+fn spark_intake_is_charged_where_each_card_lands_it() {
+    let dir = snapshot(false, false);
+    let intake = |report: &crate::plan::PlanReport| {
+        assert!(report.placement_supported, "{:?}", report.hints);
+        let gpu = report.memory_layout.as_ref().unwrap().devices.iter().find(|d| d.kind == DeviceKind::Rtx).unwrap()
+            .items.iter().find(|i| i.group == "MiniMax spark_intake").unwrap().bytes;
+        let host = report.host_ledger.as_ref().unwrap().items.iter().find(|i| i.group == "spark-intake").unwrap().bytes;
+        (gpu, host)
+    };
+    let (ranks, gpu_row, host_plane) = (3, 24_576 / 2, 100_663_296 / 2);
+    for lanes in [1u64, 2] {
+        let mut options = native_5090_options(dir.path(), ranks);
+        let layout = options.layout.as_mut().unwrap();
+        (layout.prefill_rows, layout.prefill_lanes, layout.native_mtp_layers) = (4096, lanes, 0);
+        (layout.concurrency, layout.context_tokens, layout.pool_tokens) = (16, 65536, Some(65536));
+        let geforce = plan::plan(dir.path(), &options).unwrap();
+        assert_eq!(intake(&geforce), (lanes * ranks as u64 * gpu_row, lanes * ranks as u64 * host_plane),
+            "{lanes} lanes on the 5090");
+        options.layout.as_mut().unwrap().rtx_bytes = vec![PRO_TOTAL_BYTES];
+        let pro = plan::plan(dir.path(), &options).unwrap();
+        assert_eq!(intake(&pro).0, lanes * ranks as u64 * host_plane, "{lanes} lanes on the PRO 6000 land on the GPU");
+    }
+}
+
 #[test]
 fn minimax_5090_profile_and_host_embedding_preserve_draft_and_increase_pool() {
     use cuteafd_core::memory_layout::Category;
