@@ -172,6 +172,48 @@ block, causal tails and stable pointer lifetimes. Never dequantize the full
 cache to BF16 as its default representation. Validate NLL/logits and accepted
 DSpark continuations against the FP8 path before execution admission.
 
+### Host prefix tier
+
+Retained prompt and turn snapshots share the device page pool with live
+requests; the pool evicts its least recently used snapshot when an admission
+needs pages or a bank (`--prefix-cache-entries`, 20) is full. The shared host
+tier keeps evicted snapshots in pinned RAM (`HOST_CACHE_BYTES`, launcher
+default `auto`: full-context KV for concurrency + 4, at most min(32 GiB, 25%
+of RAM)), and a returning conversation restores them into fresh device pages
+byte for byte. MiniMax runs it `on-evict` (`HOST_CACHE_STORE`): nothing is
+copied until the device evicts a snapshot, and that eviction waits for its
+copy; `on-retain` copies each snapshot when it is kept. A page is 180
+segments (K, V and index planes of 60 layers, 4.44 MB per 64 tokens);
+snapshots under 512 tokens stay on the device.
+
+TP2 (RTX 5090 on PCIe Gen4 + 2 Sparks), speculator off, 131,072-token pool,
+16 sequences, 4096 prefill rows, one launch per arm, 24 Oct:
+
+| Host tier | Prefill 4.4K / 16K / 32K tok/s | Decode C1 / C4 / C16 tok/s | Ready after launch |
+| --- | --- | --- | --- |
+| off | 1492 / 1650 / 1621 | 26.6 / 50.2 / 78.4 | 62 s |
+| 32 GiB, on-evict | 1485 / 1652 / 1622 | 26.6 / 49.2 / 79.5 | 113 s |
+| 32 GiB, on-retain | 1488 / 1649 / 1623 | 26.6 / 48.7 / 78.7 | 93 s |
+| 16 GiB, on-evict | — | — | 82 s |
+
+Without page pressure both modes copied only the six snapshots the full banks
+evicted (3.5 GB); on-evict's evictions waited 25 ms in all. A churn of one
+59,460-token and six 15,000-token conversations (more than the pool holds),
+then each again, restored every return from RAM: identical greedy text, and
+bit-identical logits on all 192 decode steps after the restores.
+
+| Returning prompt | Prefill TTFT | Restore TTFT, on-evict | on-retain |
+| --- | ---: | ---: | ---: |
+| 59,460 tokens | 37.5 s | 0.41 s | 0.31 s |
+| 15,000 tokens | 9.1 s | 0.06-0.13 s | 0.06-0.08 s |
+
+On-retain returns faster under churn because its evictions find the copy
+done; on-evict copies nothing that stays on the device and keeps no device
+duplicates in the host quota. Restores average 16 GB/s; the copy engine
+alone moves a 929-page restore's 167,220 segments at 25.8 GB/s (one
+contiguous copy: 27.2). Readiness pays for pinning the quota up front, at
+about 1 GB/s on this host.
+
 ### Capacity summary (DSpark on in every cell)
 
 **Default TP2 at 108 GiB/Spark remains refused for every variant:** onboarding
