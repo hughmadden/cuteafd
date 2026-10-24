@@ -113,9 +113,23 @@ struct GraphKey { rows:usize, stride:usize, pool_pages:usize, embedded:usize, ca
 struct DecodeGraphs<'a> {
     mode: GraphMode,
     bank: std::collections::BTreeMap<GraphKey, std::rc::Rc<Graph<'a>>>,
-    /// Keys whose recording failed run eagerly from then on.
+    /// Keys whose recording failed, or found the budget spent, run eagerly from then on.
     refused: std::collections::BTreeSet<GraphKey>,
     replays: u64,
+    /// Device bytes the recordings took (6-8 MiB each on an RTX 5090) and the
+    /// most they may take (`CUTEAFD_MINIMAX_GRAPH_MIB`, default 512): every
+    /// decode row count up to 64 may appear with DSpark, out of the headroom.
+    bytes: u64,
+    budget: u64,
+}
+impl DecodeGraphs<'_> {
+    fn budget_from_env() -> Result<u64> {
+        let mib = match std::env::var("CUTEAFD_MINIMAX_GRAPH_MIB") {
+            Ok(value) => value.parse::<u64>().map_err(|_| MiniMaxError::Invalid("CUTEAFD_MINIMAX_GRAPH_MIB"))?,
+            Err(_) => 512,
+        };
+        Ok(mib << 20)
+    }
 }
 
 /// Extend metadata: one launch per request tile of at most `tile` rows. Each
@@ -213,7 +227,8 @@ impl<'a> Execution<'a> {
         let head=TargetHeadOwner::new(&commands,&scratch,logit_rows,cfg.vocab_size)?;
         let mode=if diagnostics.borrow().is_some() {GraphMode::Off} else {GraphMode::from_env()?};
         tracing::info!(?mode,"MiniMax decode step graphs, one per row count (CUTEAFD_MINIMAX_GRAPHS: on, off or verify)");
-        let graphs=std::cell::RefCell::new(DecodeGraphs{mode,bank:Default::default(),refused:Default::default(),replays:0});
+        let graphs=std::cell::RefCell::new(DecodeGraphs{mode,bank:Default::default(),refused:Default::default(),replays:0,
+            bytes:0,budget:DecodeGraphs::budget_from_env()?});
         Ok(Self{commands,head,weights,scratch,cfg:cfg.clone(),rows,logit_rows,context,decode_rows,extend_rows,table_stride,
             poisoned:std::cell::Cell::new(false),diagnostics,draft:None,draft_causal:false,graphs})
     }
@@ -302,7 +317,8 @@ impl<'a> Execution<'a> {
             self.poisoned.set(true); experts.abort();
             // No step follows a poisoned one: release the recordings' owners
             // (a graph a failed drain still retains stays with the stream).
-            self.graphs.borrow_mut().bank.clear();
+            let mut graphs=self.graphs.borrow_mut();
+            graphs.bank.clear(); graphs.bytes=0;
             return result;
         }
         match (key,&graph) {
@@ -313,7 +329,11 @@ impl<'a> Execution<'a> {
             // The row count's first step ran eagerly and its output is complete:
             // record the same step for later replays (a failure only keeps it eager).
             (Some(key),None) if !self.graphs.borrow().refused.contains(&key) => {
-                if let Err(error)=self.record(embedded,batch,caches,experts,key,last_layer) {
+                let spent={ let g=self.graphs.borrow(); (g.bytes>=g.budget).then_some((g.bytes,g.budget)) };
+                if let Some((bytes,budget))=spent {
+                    tracing::info!(rows=key.rows,bytes,budget,"MiniMax decode graph budget spent, the row count stays eager");
+                    self.graphs.borrow_mut().refused.insert(key);
+                } else if let Err(error)=self.record(embedded,batch,caches,experts,key,last_layer) {
                     tracing::warn!(rows=key.rows,"MiniMax decode graph not recorded, the row count stays eager: {error:#}");
                     self.graphs.borrow_mut().refused.insert(key);
                 }
@@ -377,9 +397,10 @@ impl<'a> Execution<'a> {
         let (after,_)=library.cuda_memory_info()?;
         let mut graphs=self.graphs.borrow_mut();
         graphs.bank.insert(key,std::rc::Rc::new(graph));
-        tracing::info!(rows=key.rows,record_ms=started.elapsed().as_secs_f64()*1e3,
-            graph_bytes=free.saturating_sub(after),graphs=graphs.bank.len(),replays=graphs.replays,
-            "MiniMax decode graph recorded");
+        let bytes=free.saturating_sub(after) as u64;
+        graphs.bytes+=bytes;
+        tracing::info!(rows=key.rows,record_ms=started.elapsed().as_secs_f64()*1e3,graph_bytes=bytes,
+            total_bytes=graphs.bytes,graphs=graphs.bank.len(),replays=graphs.replays,"MiniMax decode graph recorded");
         Ok(())
     }
     /// `CUTEAFD_MINIMAX_GRAPHS=verify`: runs the replayed step again eagerly
