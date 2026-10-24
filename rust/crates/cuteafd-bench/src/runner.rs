@@ -47,6 +47,10 @@ pub struct RunRequest {
     pub context_lengths: Option<Vec<u64>>,
     #[serde(default)]
     pub context_levels: Option<Vec<usize>>,
+    /// The `/v1/models` id to measure (a ready weight variant's public id, say);
+    /// unset: the served model (or the server's `CUTEAFD_BENCH_MODEL`).
+    #[serde(default)]
+    pub model: Option<String>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -63,6 +67,8 @@ pub enum StartError {
     InvalidSet(String),
     #[error("invalid context-load options: {0}")]
     InvalidContext(String),
+    #[error("{0}")]
+    UnknownModel(String),
 }
 
 /// What the progress ticker knows about the panel now running: enough to price
@@ -365,6 +371,17 @@ impl Bench {
         Ok(report.id)
     }
 
+    /// The run's server identity. Only the default model's info is cached (the
+    /// page's view); a selected model never replaces it, and the cache never
+    /// hides the selection. Every panel measures through `client`, whose model
+    /// is the selection.
+    fn run_server_info(&self, client: &Client, record: &Value) -> ServerInfo {
+        let mut info = if client.selected().is_some() { crate::server::server_info(&client.model) }
+            else { self.server_info(&client.model) };
+        info.variant = record.get("variant").filter(|v| v.is_object()).cloned();
+        info
+    }
+
     fn server_info(&self, model: &str) -> ServerInfo {
         let mut slot = self.info.lock().expect("info lock");
         if let Some(info) = slot.as_ref().filter(|i| i.model == model) {
@@ -508,6 +525,10 @@ impl Bench {
             levels: request.context_levels.clone().unwrap_or(defaults.levels),
         };
         context_load.validate().map_err(StartError::InvalidContext)?;
+        // A named model is checked before the run exists: an id the server does
+        // not advertise as ready fails the request, never a stored run.
+        let model = request.model.clone().filter(|id| !id.is_empty());
+        if model.is_some() { self.check_model(&base, model.clone())?; }
         let (name, planned) = match (&request.panels, &request.profile) {
             (Some(panels), _) => ("custom".to_string(),
                 panels.iter().map(|id| PlannedPanel { id: id.clone(), passes: 1 }).collect::<Vec<_>>()),
@@ -550,9 +571,15 @@ impl Bench {
         // clients), so its console text is allowed until it retires.
         let text = BenchText::enable(self);
         std::thread::Builder::new().name("cuteafd-bench".into()).spawn(move || {
-            bench.execute(active, base, plan, report, text, skip_baseline, lossless_set, lossless_dump, context_load, fabric);
+            bench.execute(active, base, plan, report, text, skip_baseline, lossless_set, lossless_dump, context_load, fabric, model);
         }).expect("spawn the benchmark thread");
         Ok(id)
+    }
+
+    /// The named model is a ready record `/v1/models` advertises (see `pick_model`).
+    fn check_model(&self, base: &str, model: Option<String>) -> Result<(), StartError> {
+        Client::new(base, None, Arc::new(AtomicBool::new(false))).with_api_key(self.api_key.get().cloned())
+            .with_model(model).discover().map(drop).map_err(|error| StartError::UnknownModel(format!("{error:#}")))
     }
 
     fn update_active(&self, f: impl FnOnce(&mut ActiveRun)) {
@@ -566,7 +593,7 @@ impl Bench {
     fn execute(self: Arc<Self>, active: ActiveRun, base: String, plan: Vec<PlannedPanel>,
         report: Arc<Mutex<Report>>, text: Option<BenchText>, skip_baseline: bool,
         lossless_set: Option<panels::lossless::CaseSet>, lossless_dump: Option<panels::lossless::RowDump>,
-        context_load: panels::context_load::Options, fabric: bool) {
+        context_load: panels::context_load::Options, fabric: bool, model: Option<String>) {
         let id = active.id.clone();
         let progress = Progress::default();
         let done = Arc::new(AtomicBool::new(false));
@@ -577,7 +604,7 @@ impl Bench {
                 .spawn(move || bench.tick(&report, &progress, &done, &base, fabric)).ok()
         };
         let outcome = self.run_plan(&active, &base, &report, &progress, &plan, skip_baseline, lossless_set.as_ref(),
-            lossless_dump.as_ref(), &context_load, fabric);
+            lossless_dump.as_ref(), &context_load, fabric, model);
         {
             let mut r = report.lock().expect("report lock");
             r.finished = Some(now_rfc3339());
@@ -625,13 +652,14 @@ impl Bench {
 
     fn run_plan(&self, active: &ActiveRun, base: &str, report: &Arc<Mutex<Report>>, progress: &Progress,
         plan: &[PlannedPanel], skip_baseline: bool, lossless_set: Option<&panels::lossless::CaseSet>,
-        lossless_dump: Option<&panels::lossless::RowDump>, context_load: &panels::context_load::Options, fabric: bool)
-        -> anyhow::Result<()> {
-        let mut client = Client::new(base, Some(active.token.clone()), active.cancel.clone()).with_api_key(self.api_key.get().cloned()).with_fabric(fabric);
+        lossless_dump: Option<&panels::lossless::RowDump>, context_load: &panels::context_load::Options, fabric: bool,
+        model: Option<String>) -> anyhow::Result<()> {
+        let mut client = Client::new(base, Some(active.token.clone()), active.cancel.clone())
+            .with_api_key(self.api_key.get().cloned()).with_fabric(fabric).with_model(model);
         let record = client.discover()?;
         let max_context = record["max_context_tokens"].as_u64().unwrap_or(8192);
         let max_output = record["max_output_tokens"].as_u64().unwrap_or(4096);
-        let info = self.server_info(&client.model);
+        let info = self.run_server_info(&client, &record);
         let fingerprint = crate::server::fingerprint(&info);
         let run_mark = client.thermal_mark();
         {
@@ -949,6 +977,70 @@ mod tests {
         assert!(close(panel_eta_s(100.0, 1, 2, 0.5, 25.0), 25.0 + 100.0));
         // The last pass has no later passes to price in.
         assert!(close(panel_eta_s(100.0, 2, 2, 0.25, 30.0), 90.0));
+    }
+
+    /// Serves one `/v1/models` listing (base, a ready variant, an unready one) per connection.
+    fn models(n: usize) -> (String, std::thread::JoinHandle<()>) {
+        use std::io::{BufRead, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let body = serde_json::json!({"data": [{"id": "glm-5.3", "max_context_tokens": 4096},
+            {"id": "glm-5.3-keys", "max_context_tokens": 4096,
+                "variant": {"name": "keys", "base": "glm-5.3", "availability": {"state": "ready"}}},
+            {"id": "glm-5.3-cold", "variant": {"name": "cold", "availability": {"state": "unavailable", "reason": "no tables"}}}]})
+            .to_string();
+        let worker = std::thread::spawn(move || for _ in 0..n {
+            let (mut socket, _) = listener.accept().unwrap();
+            let mut reader = std::io::BufReader::new(socket.try_clone().unwrap());
+            let mut line = String::new();
+            while reader.read_line(&mut line).unwrap() > 0 && !line.ends_with("\r\n\r\n") {}
+            write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+        });
+        (base, worker)
+    }
+
+    #[test]
+    fn run_request_carries_a_model_and_defaults_without_one() {
+        let request: super::RunRequest = serde_json::from_str(r#"{"profile":"smoke","model":"glm-5.3-keys"}"#).unwrap();
+        assert_eq!(request.model.as_deref(), Some("glm-5.3-keys"));
+        let request: super::RunRequest = serde_json::from_str(r#"{"profile":"smoke"}"#).unwrap();
+        assert!(request.model.is_none());
+    }
+
+    #[test]
+    fn a_named_model_is_checked_before_the_run_starts() {
+        let (base, worker) = models(3);
+        let bench = super::Bench::new(crate::store::Store::memory().unwrap());
+        bench.check_model(&base, Some("glm-5.3-keys".into())).unwrap();
+        for (id, why) in [("glm-5.3-gone", "not listed"), ("glm-5.3-cold", "no tables")] {
+            match bench.check_model(&base, Some(id.into())) {
+                Err(error @ super::StartError::UnknownModel(_)) => assert!(error.to_string().contains(why), "{error}"),
+                other => panic!("{id}: {other:?}"),
+            }
+        }
+        worker.join().unwrap();
+        assert!(bench.active().is_none(), "a refused model starts no run");
+    }
+
+    #[test]
+    fn a_selected_variant_is_the_run_identity_and_never_replaces_the_default() {
+        if std::env::var_os("CUTEAFD_BENCH_MODEL").is_some() { return; }
+        let (base, worker) = models(2);
+        let bench = super::Bench::new(crate::store::Store::memory().unwrap());
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut default = crate::client::Client::new(&base, None, cancel.clone());
+        let record = default.discover().unwrap();
+        let info = bench.run_server_info(&default, &record);
+        assert_eq!((info.model.as_str(), info.variant.is_none()), ("glm-5.3", true));
+        let mut keys = crate::client::Client::new(&base, None, cancel).with_model(Some("glm-5.3-keys".into()));
+        let record = keys.discover().unwrap();
+        let variant = bench.run_server_info(&keys, &record);
+        worker.join().unwrap();
+        assert_eq!(variant.model, "glm-5.3-keys");
+        assert_eq!(variant.variant.as_ref().unwrap()["name"], "keys");
+        assert_ne!(crate::server::fingerprint(&variant), crate::server::fingerprint(&info),
+            "base and variant never share a baseline or panel history");
+        assert_eq!(bench.status()["model"], "glm-5.3", "the page's cached default is untouched");
     }
 
     #[test]

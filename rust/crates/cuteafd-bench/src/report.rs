@@ -82,8 +82,14 @@ impl ServerInfo {
     /// The checkpoint repository the server loaded (`org/name` from a Hugging Face
     /// snapshot path), else the served model name: quants of one model share a
     /// served name but not a checkpoint.
+    /// The checkpoint repo; a weight variant's run appends its public id, so its
+    /// card, export directory and published row never pass as the base's.
     pub fn checkpoint(&self) -> String {
-        hub_repo(self.configuration.snapshot.as_deref().unwrap_or("")).unwrap_or_else(|| self.model.clone())
+        let repo = hub_repo(self.configuration.snapshot.as_deref().unwrap_or("")).unwrap_or_else(|| self.model.clone());
+        match &self.variant {
+            Some(_) if repo != self.model => format!("{repo} · {}", self.model),
+            _ => repo,
+        }
     }
 }
 
@@ -95,6 +101,10 @@ mod checkpoint_tests {
         assert_eq!(s.checkpoint(), "zai-org/GLM-5.3");
         s.configuration.snapshot = Some("/root/.cache/huggingface/hub/models--nvidia--GLM-5.3-NVFP4/snapshots/e3b8".into());
         assert_eq!(s.checkpoint(), "nvidia/GLM-5.3-NVFP4");
+        // A weight variant's run keeps the checkpoint but names the variant.
+        s.model = "glm-5.3-keys".into();
+        s.variant = Some(serde_json::json!({"name": "keys", "availability": {"state": "ready"}}));
+        assert_eq!(s.checkpoint(), "nvidia/GLM-5.3-NVFP4 · glm-5.3-keys");
     }
 }
 
@@ -115,6 +125,10 @@ pub struct ServerInfo {
     /// RFC 3339 UTC of the server's start.
     #[serde(default)]
     pub started: Option<String>,
+    /// The `/v1/models` `variant` object when the run measured a weight
+    /// variant (`model` is then the variant's public id, not the base's).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub variant: Option<serde_json::Value>,
 }
 
 impl ServerInfo {
