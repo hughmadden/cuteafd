@@ -54,6 +54,8 @@ use tokio::sync::mpsc;
 pub(crate) struct ServeArgs {
     #[command(flatten)]
     pub engine: super::EngineArgs,
+    #[command(flatten)]
+    pub variants: crate::shared::variants::VariantArgs,
     #[arg(long, default_value = "0.0.0.0:8000")]
     pub listen: String,
     #[arg(long, default_value_t = 4096)]
@@ -144,6 +146,12 @@ pub(crate) fn auto_vision(mode: cuteafd_loader::plan::MediaMode, snapshot: &std:
     })
 }
 
+/// The prefix-cache key of a sequence's (media-keyed) tokens: base keys are the tokens; a weight
+/// variant's carry its namespace (contract §5), so variant and base state never share a snapshot.
+fn prefix_key(tokens: &[u32], variant: u8) -> Result<std::borrow::Cow<'_, [u32]>> {
+    Ok(cuteafd_engine::prefix::namespaced(tokens, variant)?)
+}
+
 pub(crate) async fn run_serve(args: ServeArgs) -> Result<()> {
     let api = args.api.load()?;
     let snapshot: PathBuf = args.engine.snapshot.clone();
@@ -163,6 +171,8 @@ pub(crate) async fn run_serve(args: ServeArgs) -> Result<()> {
     let stats = Arc::new(Mutex::new(serde_json::Value::Null));
     let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
     let mut engine_args = args.engine.clone();
+    engine_args.variants = args.variants.indexed(&profile.id)?;
+    engine_args.served_id = profile.id.clone();
     engine_args.slots = engine_args.slots.max(args.max_sequences);
     (engine_args.draft_context_slots, engine_args.draft_sequences) = draft_capacity(args.max_sequences,
         engine_args.draft_sequences, engine_args.draft_context_slots);
@@ -175,7 +185,9 @@ pub(crate) async fn run_serve(args: ServeArgs) -> Result<()> {
     let media_cache_bytes = args.media_cache_bytes;
     let worker = tokio::task::spawn_blocking(move ||
         serve_loop(engine_args, receive, ready_tx, worker_stats, max_sequences, policy, decode_share, prefix, vision, media_cache_bytes, remote));
-    let (max_context, media) = ready_rx.await.context("engine failed before it was ready")??;
+    let (max_context, media, variants) = ready_rx.await.context("engine failed before it was ready")??;
+    // Only variants whose sites verified and loaded are served under their ids.
+    profile.variants = variants;
     let limits = NativeLimits::new(u32::try_from(max_context)?, args.max_output)?;
     if let Some((preparer, health)) = media {
         profile = profile.with_loaded_vision(preparer);
@@ -235,7 +247,7 @@ type VisionReady = Option<(Arc<cuteafd_api::openai::media::MediaPreparer>, Optio
 
 #[allow(clippy::too_many_arguments)]
 fn serve_loop(mut args: super::EngineArgs, mut receive: mpsc::Receiver<NativeRequest>,
-    ready: tokio::sync::oneshot::Sender<Result<(usize, VisionReady)>>, stats: Arc<Mutex<serde_json::Value>>, max_sequences: usize,
+    ready: tokio::sync::oneshot::Sender<Result<(usize, VisionReady, Vec<cuteafd_core::variants::VariantRecord>)>>, stats: Arc<Mutex<serde_json::Value>>, max_sequences: usize,
     policy: Policy, decode_share: DecodeShareArgs, prefix: PrefixArgs,
     vision: cuteafd_loader::plan::MediaMode, media_cache_bytes: Option<u64>, remote: Option<super::media::RemoteVision>) -> Result<()> {
     args.serving_graph_policy = Some((max_sequences.min(DECODE_ROWS), args.draft.is_some()));
@@ -284,12 +296,14 @@ fn serve_loop(mut args: super::EngineArgs, mut receive: mpsc::Receiver<NativeReq
                 // every start-up allocation.
                 crate::shared::memory_report::log("glm5_flash ready");
                 if let Some(ready) = ready.take() {
-                    let _ = ready.send(Ok((engine.max_context, preparer.clone().map(|p| (p, health.clone())))));
+                    let records = engine.variants.as_ref().map(|v| v.records.clone()).unwrap_or_default();
+                    let _ = ready.send(Ok((engine.max_context, preparer.clone().map(|p| (p, health.clone())), records)));
                 }
             })
     });
     if let Some(ready) = ready.take() {
-        let _ = ready.send(result.as_ref().map(|_| (args.max_context, preparer.map(|p| (p, health)))).map_err(|e| anyhow::anyhow!("{e:#}")));
+        let _ = ready.send(result.as_ref().map(|_| (args.max_context, preparer.map(|p| (p, health)), Vec::new()))
+            .map_err(|e| anyhow::anyhow!("{e:#}")));
     }
     result
 }
@@ -975,7 +989,7 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
                             continue;
                         }
                         let resume = if probe::cold(&prompt.job.probe) { 0 }
-                            else { cache.peek_media(prompt.keys.tokens(), prompt.keys.spans(), true) };
+                            else { cache.peek_media(&prefix_key(prompt.keys.tokens(), prompt.job.variant)?, prompt.keys.spans(), true) };
                         let waiter = MediaWaiter::new(prompt, request_media, jobs, resume)?;
                         if let Err((_, error)) = media.enqueue(waiter) {
                             let _ = events.send(Err(super::media::failure(error)));
@@ -1014,9 +1028,12 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
             cache.tick();
             let admit_started = Instant::now();
             // Lookup, fork of the retained pages and restore of the mark (byte-exact).
-            let build = |units| GlmfPlacement::new(units, kda);
+            // A variant's rows live in its own prefix namespace (part of the key) and carry its id.
+            let variant = ready.job().job.variant;
+            let build = |units| GlmfPlacement { variant, ..GlmfPlacement::new(units, kda) };
+            let lookup = prefix_key(ready.job().keys.tokens(), variant)?;
             let admission = if cold { cache.admit_cold(&family, ready.job().tokens.len(), capacity, build) }
-                else { cache.admit_media(&family, ready.job().keys.tokens(), ready.job().keys.spans(), capacity, true, build) };
+                else { cache.admit_media(&family, &lookup, ready.job().keys.spans(), capacity, true, build) };
             let admitted = match admission {
                 Ok(admitted) => admitted,
                 Err(error) => {
@@ -1031,6 +1048,9 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
                     continue;
                 }
             };
+            let mut admitted = admitted;
+            // A restored or forked placement serves the requesting variant (its namespace matched).
+            admitted.placement.variant = variant;
             let resume = admitted.resume;
             let ready = match ready.reconcile(resume) {
                 Ok(ready) => ready,
@@ -1122,7 +1142,9 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
                         // The client left during the prefill: keep what it computed for a retry.
                         if placement.len > resume && !probe::cold(&p.job.probe) {
                             cache.capture_session(p.ticket.session());
-                            if let Err(error) = cache.park_media(&family, &p.keys.tokens()[..placement.len], p.keys.spans(), &placement) {
+                            let parked = prefix_key(&p.keys.tokens()[..placement.len], placement.variant).and_then(|key|
+                                Ok(cache.park_media(&family, &key, p.keys.spans(), &placement)?));
+                            if let Err(error) = parked {
                                 tracing::warn!("parking a cancelled prefill: {error:#}");
                             }
                         }
@@ -1161,7 +1183,8 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
                         packed_chunks = p.packed, "prefill");
                 }
                 // The prompt snapshot, taken once the first token is out (it only enqueues copies).
-                let prompt = (resume < p.tokens.len() && !probe::cold(&p.job.probe)).then(|| p.keys.tokens().to_vec());
+                let prompt = (resume < p.tokens.len() && !probe::cold(&p.job.probe))
+                    .then(|| prefix_key(p.keys.tokens(), p.placement.variant).map(|key| key.into_owned())).transpose()?;
                 let spans = p.keys.spans().to_vec();
                 let session = p.ticket.session();
                 let retain_prompt = |cache: &mut PrefixCache<CudaCopyEngine<'_>>, placement: &GlmfPlacement| {
@@ -1529,9 +1552,9 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
             if let Some(row) = &request.turn {
                 // The conversation so far: every committed row (the last token is not in it).
                 let keys = MediaKeys::new(&request.history, engine.cfg.vocab_size as u32, request.keys.spans())?;
-                let rows = &keys.tokens()[..request.placement.len];
+                let rows = prefix_key(&keys.tokens()[..request.placement.len], request.placement.variant)?;
                 cache.capture_session(request.ticket.session());
-                if let Err(error) = cache.capture_media(&family, SnapshotKind::Turn, rows, request.keys.spans(), &request.placement,
+                if let Err(error) = cache.capture_media(&family, SnapshotKind::Turn, &rows, request.keys.spans(), &request.placement,
                     After::from_logits(row, true)) {
                     tracing::warn!("turn snapshot not retained: {error:#}");
                 }
@@ -1636,8 +1659,9 @@ fn prefill_chunk<'a>(cx: &PrefillCx<'_, '_, 'a>, selector: &mut TokenSelector<'_
 fn capture_points<'a>(family: &GlmfPrefix<'_, 'a>, cache: &mut PrefixCache<CudaCopyEngine<'a>>, p: &Prefill<'_>) {
     for &(_, point) in p.plan.points.iter().filter(|&&(chunk, _)| chunk == p.chunks && !probe::cold(&p.job.probe)) {
         cache.capture_session(p.ticket.session());
-        if let Err(error) = cache.capture_media(family, SnapshotKind::Prompt, &p.keys.tokens()[..point],
-            p.keys.spans(), &p.placement, After::default()) {
+        let captured = prefix_key(&p.keys.tokens()[..point], p.placement.variant).and_then(|key|
+            Ok(cache.capture_media(family, SnapshotKind::Prompt, &key, p.keys.spans(), &p.placement, After::default())?));
+        if let Err(error) = captured {
             tracing::warn!("snapshot point {point} not retained: {error:#}");
         }
     }
