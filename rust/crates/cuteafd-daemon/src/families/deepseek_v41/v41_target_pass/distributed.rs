@@ -204,6 +204,7 @@ impl<'w, 'a> DistributedTargetPass<'w, 'a> {
             state: State::Idle,
             chain,
             device_order: true,
+            device_default: true,
             l2_solo: true,
             sampled: None,
         })
