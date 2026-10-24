@@ -257,3 +257,14 @@ fn a_stalled_gpu_times_out_instead_of_hanging() {
     });
     assert!(retired.error.is_some() && retired.abandoned && retired.drained);
 }
+
+#[test]
+fn an_idle_worker_backs_off_to_bounded_sleeps() {
+    assert_eq!(idle_sleep(Duration::from_micros(200)), Duration::from_micros(50));
+    assert_eq!(idle_sleep(Duration::from_millis(1)), Duration::from_micros(125));
+    assert_eq!(idle_sleep(Duration::from_secs(1)), Duration::from_micros(200));
+    // Spinning and yielding stay bounded to the first 200 us of a wait.
+    let started = Instant::now();
+    idle_backoff(Duration::from_millis(5));
+    assert!(started.elapsed() >= Duration::from_micros(150));
+}

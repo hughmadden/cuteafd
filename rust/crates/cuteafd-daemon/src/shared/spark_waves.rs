@@ -261,8 +261,7 @@ pub(crate) fn run_worker<B: Backend>(backend: &mut B, inbox: mpsc::Receiver<Job>
                 // Staged copies and slot reuse wait on the GPU; replies have their
                 // own transport deadline inside `poll`.
                 ensure!(since.elapsed() < timeout, "prefill transport worker made no progress for {timeout:?}");
-                std::hint::spin_loop();
-                if since.elapsed() > Duration::from_micros(50) { std::thread::yield_now(); }
+                idle_backoff(since.elapsed());
             }
         }
     })();
@@ -282,6 +281,26 @@ pub(crate) fn run_worker<B: Backend>(backend: &mut B, inbox: mpsc::Receiver<Job>
     let mut held: Vec<(usize, u32, B::Payload)> = retiring.into_iter().flat_map(|(_, held)| held).collect();
     held.extend(inflight.into_iter().flat_map(|wave| wave.held));
     Retired { held, drained, abandoned, error }
+}
+
+/// How the worker waits when nothing progressed: a short spin (a reply or a
+/// staged copy usually completes within microseconds of the last one), then
+/// yields, then short sleeps, so a long wave never takes a core from the
+/// engine thread (which queues the other units' GPU work meanwhile). A wave
+/// lasts milliseconds; the sleep adds at most 200 us to noticing it.
+fn idle_backoff(idle: Duration) {
+    if idle < Duration::from_micros(20) {
+        std::hint::spin_loop();
+    } else if idle < Duration::from_micros(200) {
+        std::thread::yield_now();
+    } else {
+        std::thread::sleep(idle_sleep(idle));
+    }
+}
+
+/// The sleep after `idle` without progress: 50 us, growing to 200 us.
+fn idle_sleep(idle: Duration) -> Duration {
+    Duration::from_micros((idle.as_micros() / 8).clamp(50, 200) as u64)
 }
 
 /// The engine thread's side of a running prefill transport.
