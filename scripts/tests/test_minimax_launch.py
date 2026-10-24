@@ -40,6 +40,7 @@ def test_minimax_launch_matches_planner(tmp_path, ranks, kv):
     assert _flag(serve, "--spark-budget-bytes") == str(108 << 30)
     assert _flag(serve, "--max-sequences") == _flag(plan, "--concurrency") == "64"
     assert _flag(serve, "--prefill-batch-tokens") == _flag(plan, "--prefill-rows") == "4096"
+    assert _flag(serve, "--prefill-lanes") == _flag(plan, "--prefill-lanes") == "2"
     assert _flag(plan, "--spark-ranks") == str(ranks)
     assert "--mtp" not in serve and "--split-device" not in serve
     workers = [line for line in result.stderr.splitlines() if "cuteafd expertd-native" in line]
@@ -65,6 +66,7 @@ def test_minimax_launch_matches_planner(tmp_path, ranks, kv):
     ("CONCURRENCY=65\n", "CONCURRENCY must be 1..64"),
     ("PREFILL_BATCH_TOKENS=4097\n", "PREFILL_BATCH_TOKENS must be 1..4096"),
     ("CONCURRENCY=16\nPREFILL_BATCH_TOKENS=8\n", "CONCURRENCY must not exceed PREFILL_BATCH_TOKENS"),
+    ("PREFILL_LANES=5\n", "PREFILL_LANES must be 1 to 4"),
     ("MAX_CONTEXT_TOKENS=1048577\n", "MAX_CONTEXT_TOKENS must be 0 (automatic) or 1..1048576"),
     ("ATTENTION_PLACEMENT=heads\n", "supports only ATTENTION_PLACEMENT=auto"),
     ("EMBEDDING=host\n", "requires EMBEDDING=gpu"),
