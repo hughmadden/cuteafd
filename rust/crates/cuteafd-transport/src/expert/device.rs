@@ -381,7 +381,12 @@ impl SparkDeviceLane {
                 // Release: the landed planes (and this thread's copies) are
                 // complete before the GPU sees the sequence.
                 done_word.store(expected, Ordering::Release);
-                state.completed.fetch_add(1, Ordering::Release);
+                let completed = state.completed.fetch_add(1, Ordering::Release) + 1;
+                if completed >= 1024 && completed.is_power_of_two() {
+                    let per = |ns: &AtomicU64| ns.load(Ordering::Relaxed) as f64 / 1e3 / completed as f64;
+                    tracing::info!(waves = completed, build_post_us = per(&state.build_post_ns),
+                        receive_us = per(&state.receive_ns), "device lane wave times (means since start)");
+                }
                 last = Instant::now();
             }
         })?;
