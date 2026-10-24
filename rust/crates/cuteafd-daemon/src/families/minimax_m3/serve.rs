@@ -335,37 +335,15 @@ pub(crate) async fn run_serve(args: ServeArgs) -> Result<()> {
     let eos = encoding.eos_token_ids();
     let model = args.model_id.clone().or_else(|| cuteafd_api::openai::snapshot_model_id(&snapshot))
         .context("MiniMax requires --model-id for a snapshot without HF identity")?;
-    let mut profile = ModelProfile::new(model, encoding).with_tokenizer(&snapshot)?;
+    let profile = ModelProfile::new(model, encoding);
     let api = args.api.load()?;
-    let (queue, mut receive) = tokio::sync::mpsc::channel(16);
-    let stats = Arc::new(Mutex::new(serde_json::Value::Null));
-    let worker_stats = stats.clone();
     let engine_args = args.clone();
-    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<Result<Ready>>();
-    let handle = tokio::task::spawn_blocking(move || {
-        let mut ready = Some(ready_tx);
-        let result = worker(&engine_args, &mut receive, &worker_stats, eos, |state| {
-            if let Some(ready) = ready.take() { let _ = ready.send(Ok(state)); } Ok(())
-        });
-        if let Some(ready) = ready.take() {
-            let _ = ready.send(Err(anyhow::anyhow!("MiniMax initialization failed: {:#}",
-                result.as_ref().err().context("worker exited before readiness")?)));
-        }
-        result
-    });
-    let (context, vision) = ready_rx.await.context("MiniMax worker exited before readiness")??;
-    if let Some(preparer) = vision { profile = profile.with_loaded_vision(preparer); }
-    let limits = NativeLimits::new(u32::try_from(context)?, args.max_output.min(context as u32))?;
-    let hub = crate::shared::console::hub(false, || Ok(crate::shared::console::Layout::new("minimax_m3", profile.id.clone(), snapshot.clone())));
-    let router = cuteafd_api::openai::router_for_model(queue, limits, stats, std::time::Duration::from_secs(25),
-        hub.clone(), api.serve(profile, &snapshot)?);
-    let listener = tokio::net::TcpListener::bind(&args.listen).await?;
-    cuteafd_bench::ready(&listener);
-    tokio::select! {
-        served = axum::serve(listener, api.app(router, hub).into_make_service_with_connect_info::<SocketAddr>()) => served?,
-        _ = crate::shared::api::watch_scheduler(handle) => unreachable!(),
-    }
-    Ok(())
+    crate::shared::api::serve_native("MiniMax", "minimax_m3", &args.listen, &snapshot, api,
+        move |receive, stats, ready| worker(&engine_args, receive, stats, eos, |state| { ready(state); Ok(()) }),
+        |(context, vision): Ready| {
+            let profile = match vision { Some(preparer) => profile.with_loaded_vision(preparer), None => profile };
+            Ok((profile, NativeLimits::new(u32::try_from(context)?, args.max_output.min(context as u32))?))
+        }).await
 }
 
 #[cfg(test)]

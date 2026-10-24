@@ -321,38 +321,10 @@ pub(crate) async fn run_serve(args: ServeArgs) -> Result<()> {
         Some(format!("{organization}/{model}"))
     })).context("Step-5 requires --model-id for a snapshot without HF identity")?;
     let profile = ModelProfile::new(model, ModelEncoding::Step5(encoding));
-    let (queue, mut receive) = tokio::sync::mpsc::channel(16);
-    let stats = Arc::new(Mutex::new(serde_json::Value::Null));
-    let worker_stats = stats.clone();
     let engine_args = args.clone();
-    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<Result<usize>>();
-    let handle = tokio::task::spawn_blocking(move || {
-        let mut ready = Some(ready_tx);
-        let result = worker(&engine_args, &mut receive, &worker_stats, eos, |context| {
-            if let Some(ready) = ready.take() { let _ = ready.send(Ok(context)); }
-            Ok(())
-        });
-        if let Some(ready) = ready.take() {
-            let _ = ready.send(Err(anyhow::anyhow!("Step-5 initialization failed: {:#}",
-                result.as_ref().err().context("worker exited before readiness")?)));
-        }
-        result
-    });
-    let context = ready_rx.await.context("Step-5 worker exited before readiness")??;
-    let limits = NativeLimits::new(u32::try_from(context)?, args.max_output)?;
-    let hub = crate::shared::console::hub(false, || Ok(crate::shared::console::Layout::new(
-        "step5", profile.id.clone(), snapshot.clone())));
-    let router = cuteafd_api::openai::router_for_model(queue, limits, stats, std::time::Duration::from_secs(25),
-        hub.clone(), api.serve(profile, &snapshot)?);
-    let listener = tokio::net::TcpListener::bind(&args.listen).await?;
-    cuteafd_bench::ready(&listener);
-    crate::shared::memory_report::log("ready");
-    tokio::select! {
-        served = axum::serve(listener, api.app(router, hub)
-            .into_make_service_with_connect_info::<SocketAddr>()) => served?,
-        _ = crate::shared::api::watch_scheduler(handle) => unreachable!(),
-    }
-    Ok(())
+    crate::shared::api::serve_native("Step-5", "step5", &args.listen, &snapshot, api,
+        move |receive, stats, ready| worker(&engine_args, receive, stats, eos, |context| { ready(context); Ok(()) }),
+        |context: usize| Ok((profile, NativeLimits::new(u32::try_from(context)?, args.max_output)?))).await
 }
 
 #[cfg(test)]

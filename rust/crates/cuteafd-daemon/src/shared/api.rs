@@ -196,6 +196,47 @@ pub(crate) fn catch_scheduler_panic(work: impl FnOnce() -> anyhow::Result<()>) -
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(work))
         .unwrap_or_else(|_| Err(anyhow::anyhow!("scheduler panicked")))
 }
+/// What a native family's serve command does around its scheduler: `worker`
+/// runs on a blocking thread until it reports readiness (its third argument),
+/// `open` turns that report into the served profile and limits, and the
+/// OpenAI router, console and API policy then serve until the scheduler stops.
+/// `name` labels startup errors; `console` is the family's console id.
+pub(crate) async fn serve_native<R: Send + 'static>(name: &'static str, console: &'static str, listen: &str,
+    snapshot: &std::path::Path, api: ApiPolicy,
+    worker: impl FnOnce(&mut tokio::sync::mpsc::Receiver<cuteafd_api::openai::NativeRequest>,
+        &cuteafd_api::openai::SharedStats, &mut dyn FnMut(R)) -> anyhow::Result<()> + Send + 'static,
+    open: impl FnOnce(R) -> anyhow::Result<(ModelProfile, cuteafd_api::openai::NativeLimits)>) -> anyhow::Result<()> {
+    let (queue, mut receive) = tokio::sync::mpsc::channel(16);
+    let stats: cuteafd_api::openai::SharedStats = Arc::new(std::sync::Mutex::new(serde_json::Value::Null));
+    let worker_stats = stats.clone();
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<anyhow::Result<R>>();
+    let handle = tokio::task::spawn_blocking(move || {
+        let mut ready = Some(ready_tx);
+        let result = worker(&mut receive, &worker_stats, &mut |state| {
+            if let Some(ready) = ready.take() { let _ = ready.send(Ok(state)); }
+        });
+        if let Some(ready) = ready.take() {
+            let error = result.as_ref().err().map_or_else(|| "scheduler exited before readiness".into(), |e| format!("{e:#}"));
+            let _ = ready.send(Err(anyhow::anyhow!("{name} initialization failed: {error}")));
+        }
+        result
+    });
+    let (profile, limits) = open(ready_rx.await.with_context(|| format!("{name} worker exited before readiness"))??)?;
+    let snapshot = snapshot.to_path_buf();
+    let hub = crate::shared::console::hub(false, || Ok(crate::shared::console::Layout::new(
+        console, profile.id.clone(), snapshot.clone())));
+    let router = cuteafd_api::openai::router_for_model(queue, limits, stats, std::time::Duration::from_secs(25),
+        hub.clone(), api.serve(profile, &snapshot)?);
+    let listener = tokio::net::TcpListener::bind(listen).await?;
+    cuteafd_bench::ready(&listener);
+    crate::shared::memory_report::log("ready");
+    tokio::select! {
+        served = axum::serve(listener, api.app(router, hub)
+            .into_make_service_with_connect_info::<std::net::SocketAddr>()) => served?,
+        _ = watch_scheduler(handle) => unreachable!(),
+    }
+    Ok(())
+}
 pub(crate) async fn watch_scheduler(worker: tokio::task::JoinHandle<anyhow::Result<()>>) {
     let reason = match worker.await {
         Ok(Ok(())) => "scheduler stopped".into(),
