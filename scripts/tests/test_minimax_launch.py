@@ -170,6 +170,14 @@ def test_minimax_forwards_explicit_spark_budget_to_plan_and_runtime(tmp_path):
     assert workers and all(f"--device-budget-bytes {budget}" in line for line in workers)
 
 
+def test_minimax_dspark_takes_the_shared_draft_length_keys(tmp_path):
+    result = _launch(tmp_path, "SPECULATOR=dspark\nDRAFT_POLICY=simple-rc\nDRAFT_ROW_COST=power\nSPECULATOR_DRAFTS=3\n")
+    assert result.returncode == 0, result.stderr
+    serve = _line(result, "serve-minimax --snapshot")
+    assert "CUTEAFD_DRAFT_POLICY=simple-rc" in serve and "CUTEAFD_DRAFT_ROW_COST=power" in serve
+    assert _flag(serve, "--draft-fixed") == "3"
+
+
 def test_minimax_bundled_dspark_is_explicit(tmp_path):
     result = _launch(tmp_path, "SPECULATOR=dspark\n")
     assert result.returncode == 0, result.stderr
