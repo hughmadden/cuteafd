@@ -287,7 +287,7 @@ EOF
       # Weight variants: VARIANTS plus each named variant's own keys.
       printf '%s\n' VARIANTS
       local variant
-      for variant in ${cfg[VARIANTS]//,/ }; do
+      for variant in ${cfg[VARIANTS]:+${cfg[VARIANTS]//,/ }}; do
         variant="${variant^^}"; variant="${variant//-/_}"
         printf 'VARIANT_%s_%s\n' "$variant" SOURCE "$variant" REVISION "$variant" BASE "$variant" ID "$variant" MODE
       done
