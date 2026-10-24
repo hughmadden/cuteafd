@@ -32,10 +32,24 @@ __device__ int claim(int32_t* map, int32_t page, int32_t* count, int32_t capacit
   return value > 0 ? value - 1 : -1;
 }
 
-__device__ void copy_slice(const uint4* source, uint4* destination, int lane) {
-  for (int unit = lane; unit < kPageRows * kHeadUnits; unit += 32) {
-    const int offset = unit / kHeadUnits * kRowUnits + unit % kHeadUnits;
-    destination[offset] = source[offset];
+// One head's 64 rows of 128 bytes (512 B apart) in the K and the V plane.
+// Host reads cost ~1-2 us of PCIe latency, so every load is issued before
+// the first store.
+__device__ void copy_slices(const uint4* __restrict__ key, uint4* __restrict__ key_out,
+                            const uint4* __restrict__ value, uint4* __restrict__ value_out, int lane) {
+  constexpr int kUnits = kPageRows * kHeadUnits / 32;
+  uint4 k[kUnits], v[kUnits];
+#pragma unroll
+  for (int i = 0; i < kUnits; ++i) {
+    const int unit = lane + 32 * i, offset = unit / kHeadUnits * kRowUnits + unit % kHeadUnits;
+    k[i] = key[offset];
+    v[i] = value[offset];
+  }
+#pragma unroll
+  for (int i = 0; i < kUnits; ++i) {
+    const int unit = lane + 32 * i, offset = unit / kHeadUnits * kRowUnits + unit % kHeadUnits;
+    key_out[offset] = k[i];
+    value_out[offset] = v[i];
   }
 }
 
@@ -77,8 +91,8 @@ __global__ void stage(const int32_t* q2k, uint32_t q2k_rows, uint32_t rows, cons
       if (seen & (1 << head)) continue;
       const int64_t from = int64_t(page) * kPageBytes + head * 128;
       const int64_t to = int64_t(base + slot) * kPageBytes + head * 128;
-      copy_slice(reinterpret_cast<const uint4*>(key + from), reinterpret_cast<uint4*>(key + to), lane);
-      copy_slice(reinterpret_cast<const uint4*>(value + from), reinterpret_cast<uint4*>(value + to), lane);
+      copy_slices(reinterpret_cast<const uint4*>(key + from), reinterpret_cast<uint4*>(key + to),
+                  reinterpret_cast<const uint4*>(value + from), reinterpret_cast<uint4*>(value + to), lane);
       if (lane == 0) atomicAdd(&stats[0], 1ull);
     }
   }
