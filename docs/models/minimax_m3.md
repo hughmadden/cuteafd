@@ -72,12 +72,10 @@ RTX, vision on a Spark, FP8 KV, Spark budget 108 GiB per rank.
 The bundled tower runs natively: BF16 cuBLAS GEMMs with FP32 accumulation,
 the b12x D80 varlen attention export (build with
 `CUTEAFD_WIP_VISION_ATTENTION_AOT=ON`) and q/k rotated in FP32 as MiniMax's
-serving applier does. `--vision auto` (the default) keeps it on the RTX when
-the requested `--pool-tokens` still fits beside it and turns vision off
-otherwise; with no pool requested it aims for 262,144 tokens, which a 5090
-cannot hold even for text, so request a pool or pass `--vision rtx`.
-`--vision-peers` with `expertd-native --encoder` on the ranks hosts it on the
-Sparks instead.
+serving applier does. `--vision auto` (the default) keeps it on the
+coordinator GPU, as the other families do, and the KV pool takes what is left
+(startup logs the cost in pool tokens); `--vision-peers` with `expertd-native
+--encoder` on the ranks hosts it on the Sparks instead.
 Preprocessing is the release's: smart resize (factor 28); video samples 1 fps
 keeping the last frame, scales the longer side to at most 756 px and gives
 every temporal pair its own image delimiters and timestamp.
@@ -104,8 +102,8 @@ every temporal pair its own image delimiters and timestamp.
 Served at TP2 (spark7, spark8; RTX 5090 coordinator, FP8 KV, 4096 prefill
 rows, 16 sequences), the resident RTX tower takes 2.57 GB (its 2.50 GB ledger
 and module): at 1M context the largest admitted pool drops from 189,568 to
-152,512 tokens (-37,056), and the reference's 65,536-token pool fits either
-way. A Spark-hosted tower does not fit at TP2: it needs 3.57 GB per rank
+152,512 tokens (-37,056), which is what the default serves, and the
+reference's 65,536-token pool fits either way. A Spark-hosted tower does not fit at TP2: it needs 3.57 GB per rank
 (weights, scratch, 1 GiB guard) beside 117.44 GB of experts, rings and
 workspace, against a 120.3-122.4 GB budget (MemAvailable - 3 GiB), and
 admission refuses it by name; the SM121 tower itself starts on the ranks.

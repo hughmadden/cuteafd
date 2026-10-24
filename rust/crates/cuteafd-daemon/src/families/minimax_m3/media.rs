@@ -15,10 +15,6 @@ pub(super) struct ReadyVision {
     pub spark_reserve_bytes: u64,
 }
 impl ReadyVision {
-    pub fn local_bytes(snapshot: &Path, native: &Path) -> Result<u64> {
-        let spec = TowerSpec::minimax(snapshot, ENCODER_TOKENS)?;
-        Ok(cuteafd_ffi::vision::NativeVision::required(native, &spec.native)?.total_bytes())
-    }
     pub fn load(snapshot: &Path, native: &Path, library: &cuteafd_ffi::NativeLibrary, device: i32,
         mode: MediaMode, prefix: &PrefixArgs, requested_cache: Option<u64>, remote: Option<RemotePeers>) -> Result<(Option<Self>, PrefixArgs)> {
         // RemotePeers::parse refuses peers unless placement is Spark or auto.
@@ -52,12 +48,6 @@ impl ReadyVision {
         let encoder = Encoder::Local(crate::shared::vision::local::LocalEncoder::new(service, &processor, 6144, ENCODER_TOKENS));
         Ok((Some(Self { encoder, preparer, cache_bytes, spark_reserve_bytes: 0 }), prefix))
     }
-}
-
-pub(super) fn local_auto_mode(available: u64, text_fixed: u64, vision: u64, cache_target: u64) -> Result<MediaMode> {
-    let needed = text_fixed.checked_add(vision).and_then(|v| v.checked_add(cache_target))
-        .context("MiniMax automatic vision admission overflow")?;
-    Ok(if needed <= available { MediaMode::Rtx(None) } else { MediaMode::Off })
 }
 
 pub(super) fn prepare(job: NativeRequest, tokens: Vec<u32>, expander: Option<&SpanExpander>,
@@ -105,14 +95,6 @@ mod tests {
             prompt: String::new(), constraint: None, images: Vec::new(), media: images, videos: Vec::new(), audio: Vec::new(),
             max_tokens: 8, sampling: Default::default(), stop_token_ids: Vec::new(),
             events: tokio::sync::mpsc::unbounded_channel().0, usage: None, probe: None }
-    }
-    #[test]
-    fn minimax_auto_vision_preserves_text_and_requested_cache() -> Result<()> {
-        assert_eq!(local_auto_mode(1000, 600, 100, 300)?, MediaMode::Rtx(None));
-        assert_eq!(local_auto_mode(999, 600, 100, 300)?, MediaMode::Off);
-        assert_eq!(local_auto_mode(1000, 600, 100, 301)?, MediaMode::Off);
-        assert!(local_auto_mode(u64::MAX, u64::MAX, 1, 1).is_err());
-        Ok(())
     }
     #[test]
     fn minimax_media_refuses_unadmitted_tokens_and_encoder_identity() {
