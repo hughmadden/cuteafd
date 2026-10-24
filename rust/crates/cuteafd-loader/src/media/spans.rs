@@ -25,7 +25,7 @@ impl SpanExpander {
                 .ok_or_else(|| invalid(format!("missing image marker: {}", names[0])))
         };
         let expander = Self {
-            placeholder: id(&["image_token_id", "image_token_index"])?,
+            placeholder: id(&["image_token_id"])?,
             start: id(&["vision_start_token_id", "image_start_token_id", "boi_token_id"])?,
             end: id(&["vision_end_token_id", "image_end_token_id", "eoi_token_id"])?,
             vocabulary,
@@ -60,7 +60,7 @@ impl SpanExpander {
         audio: &[super::audio::PreparedAudio],
         context_limit: usize,
     ) -> Result<ExpandedMediaPrompt> {
-        let image_markers = config.get("image_token_id").or_else(|| config.get("image_token_index")).map(|_| Self::from_config(config, vocabulary)).transpose()?;
+        let image_markers = config.get("image_token_id").map(|_| Self::from_config(config, vocabulary)).transpose()?;
         let audio_markers = config.get("audio_token_id").map(|_| Self::from_audio_config(config, vocabulary)).transpose()?;
         if vocabulary == 0 || vocabulary >= 1 << 31 || tokens.iter().any(|&id| id >= vocabulary) {
             return Err(invalid("token outside checkpoint vocabulary"));
