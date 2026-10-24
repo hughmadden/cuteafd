@@ -2142,10 +2142,10 @@ mod tests {
         let generic = IntakeChoice { setting: "auto".into(), mode, reason,
             probe: Some(measured), h2d_gbps: h2d };
         assert!(device_choice_available(&generic));
-        let v41 = preferred_choice(generic, IntakePreference::Pinned);
-        assert_eq!(v41.mode, IntakeMode::Pinned);
-        assert!(!device_choice_available(&v41));
-        assert_eq!(v41.mode_for(4096 * 10240).0, IntakeMode::Pinned);
+        let pinned = preferred_choice(generic, IntakePreference::Pinned);
+        assert_eq!(pinned.mode, IntakeMode::Pinned);
+        assert!(!device_choice_available(&pinned));
+        assert_eq!(pinned.mode_for(4096 * 10240).0, IntakeMode::Pinned);
     }
 
     #[test]

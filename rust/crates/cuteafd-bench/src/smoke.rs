@@ -3,8 +3,10 @@
 //! launches it with ./run.sh, waits for readiness, runs the Release smoke
 //! profile through the server's own runner, exports the report, tears the
 //! launch down and moves on, past failures. Entries on disjoint hardware run
-//! side by side (taking the shared lock files for the hardware they use);
-//! finished entries are remembered per build so an interrupted matrix resumes.
+//! side by side (taking the shared lock files for the hardware they use, unless
+//! a parent names locks it already holds in CUTEAFD_HW_LOCKS_HELD). Prelaunch
+//! hooks still run immediately before each entry launches under those locks.
+//! Finished entries are remembered per build so an interrupted matrix resumes.
 //! SIGTERM, SIGINT or SIGHUP cancels the run: every launched entry's launcher
 //! is stopped and its containers removed (bounded, see [`CANCEL_TEARDOWN_S`])
 //! before the process exits non-zero and its hardware locks are released.
@@ -147,6 +149,8 @@ pub struct Entry {
     pub context_lengths: Option<Vec<u64>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_levels: Option<Vec<usize>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_suffix: Option<u64>,
 }
 
 /// `open` runs once after the sweep's first warm-up, just before its first
@@ -469,6 +473,7 @@ impl Entry {
             lossless_dump: self.lossless_dump.clone().or_else(|| defaults.lossless_dump.clone()),
             context_lengths: self.context_lengths.clone().or_else(|| defaults.context_lengths.clone()),
             context_levels: self.context_levels.clone().or_else(|| defaults.context_levels.clone()),
+            context_suffix: self.context_suffix.or(defaults.context_suffix),
         }
     }
 
@@ -802,11 +807,15 @@ impl Locks {
     }
 
     fn try_take(&mut self, names: &[&'static str]) -> Result<bool> {
-        let dir = expand("~/.cache/cuteafd");
-        std::fs::create_dir_all(&dir)?;
+        let parent = std::env::var("CUTEAFD_HW_LOCKS_HELD").unwrap_or_default();
+        self.try_take_in(&expand("~/.cache/cuteafd"), names, &parent)
+    }
+
+    fn try_take_in(&mut self, dir: &Path, names: &[&'static str], parent: &str) -> Result<bool> {
+        std::fs::create_dir_all(dir)?;
         let mut taken = Vec::new();
         for &name in names {
-            if self.held.contains_key(name) {
+            if self.held.contains_key(name) || parent.split(',').any(|p| p.trim_end_matches(".lock") == name.trim_end_matches(".lock")) {
                 continue;
             }
             let file = File::options().create(true).append(true).open(dir.join(name))?;
@@ -943,6 +952,7 @@ pub fn run(args: SmokeArgs) -> Result<()> {
         crate::panels::context_load::Options {
             lengths: entry.context_lengths.clone().unwrap_or(defaults.lengths),
             levels: entry.context_levels.clone().unwrap_or(defaults.levels),
+            suffix_tokens: entry.context_suffix.unwrap_or(defaults.suffix_tokens),
         }.validate().map_err(|e| anyhow::anyhow!("{}: {e}", entry.name))?;
         entries.push(entry);
     }
@@ -965,11 +975,11 @@ pub fn run(args: SmokeArgs) -> Result<()> {
     eprintln!("{} entries, {} to run, build {build}, up to {} at once", entries.len(), pending.len(), args.parallel);
     if args.dry_run {
         for e in &pending {
-            eprintln!("  {} api_key_file={} family={} gpus={:?} sparks={:?} locks={:?} levels={:?} post_load_c1={} post_load_repeat={} prefill_lengths={:?} sweep_tokens={} baseline={} window={} lossless_set={} lossless_dump={:?} context_lengths={:?} context_levels={:?} fabric={} worker_stop={} set={:?}",
+            eprintln!("  {} api_key_file={} family={} gpus={:?} sparks={:?} locks={:?} levels={:?} post_load_c1={} post_load_repeat={} prefill_lengths={:?} sweep_tokens={} baseline={} window={} lossless_set={} lossless_dump={:?} context_lengths={:?} context_levels={:?} context_suffix={} fabric={} worker_stop={} set={:?}",
                 e.name, e.set.get("API_KEY_FILE").map_or("-", String::as_str), e.family.as_deref().unwrap_or("?"), e.gpus, e.sparks, locks_for(e), e.levels,
                 e.post_load_c1.unwrap_or(false), e.post_load_repeat.unwrap_or(false), e.prefill_lengths,
                 e.sweep_tokens.unwrap_or(crate::sweep::TOKENS), e.baseline.unwrap_or(true), e.window.is_some(),
-                e.lossless_set.as_deref().unwrap_or("default"), e.lossless_dump, e.context_lengths, e.context_levels, e.fabric.unwrap_or(true),
+                e.lossless_set.as_deref().unwrap_or("default"), e.lossless_dump, e.context_lengths, e.context_levels, e.context_suffix.unwrap_or(0), e.fabric.unwrap_or(true),
                 WORKER_STOP, e.set);
         }
         return Ok(());
@@ -1391,7 +1401,7 @@ fn run_entry(entry: &Entry, repo: &Path, out_root: &Path, configs: &Path, logs: 
             api_key: api_key.clone(), quiet: true,
             deadline: Some(Duration::from_secs(entry.run_timeout_s.unwrap_or(900))),
             lossless_set: entry.lossless_set.as_ref().map(|p| crate::panels::lossless::CaseSet::load(&repo.join(p)))
-                .transpose()?, lossless_dump: entry.lossless_dump.clone(), context_lengths: entry.context_lengths.clone(), context_levels: entry.context_levels.clone() };
+                .transpose()?, lossless_dump: entry.lossless_dump.clone(), context_lengths: entry.context_lengths.clone(), context_levels: entry.context_levels.clone(), context_suffix: entry.context_suffix };
         let (mut report, dir) = crate::cli::run(&options)?;
         // Publication markers are runner metadata, not serving defaults. This
         // also works against images built before these markers existed.
@@ -1591,12 +1601,37 @@ mod tests {
     }
 
     #[test]
+    fn nonblocking_locks_skip_parent_held_locks_and_release_only_own() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = File::options().create(true).append(true).open(dir.path().join("gpu1.lock")).unwrap();
+        parent.lock().unwrap();
+        let mut locks = Locks::default();
+        assert!(locks.try_take_in(dir.path(), &["gpu1.lock", "rhea.lock"], "gpu1").unwrap());
+        assert!(!locks.held.contains_key("gpu1.lock"));
+        assert_eq!(locks.held["rhea.lock"].1, 1);
+        assert!(locks.try_take_in(dir.path(), &["gpu1.lock", "rhea.lock"], "gpu1.lock").unwrap());
+        assert_eq!(locks.held["rhea.lock"].1, 2);
+        locks.release(&["gpu1.lock", "rhea.lock"]);
+        assert_eq!(locks.held["rhea.lock"].1, 1);
+        locks.release(&["gpu1.lock", "rhea.lock"]);
+        assert!(locks.held.is_empty());
+        let check = File::options().read(true).write(true).open(dir.path().join("gpu1.lock")).unwrap();
+        assert!(matches!(check.try_lock(), Err(std::fs::TryLockError::WouldBlock)));
+        assert!(File::options().read(true).write(true).open(dir.path().join("rhea.lock")).unwrap().try_lock().is_ok());
+        parent.unlock().unwrap();
+        drop(parent);
+        assert!(check.try_lock().is_ok());
+    }
+
+    #[test]
     fn context_options_merge_and_roundtrip() {
-        let defaults = Entry { context_lengths: Some(vec![32768, 131072]), context_levels: Some(vec![1, 8, 16]), ..Entry::default() };
+        let defaults = Entry { context_lengths: Some(vec![32768, 131072]), context_levels: Some(vec![1, 8, 16]), context_suffix: Some(512), ..Entry::default() };
         let own = Entry { context_levels: Some(vec![1, 8]), ..Entry::default() };
         let merged = own.merged(&defaults);
         assert_eq!(merged.context_lengths, defaults.context_lengths);
         assert_eq!(merged.context_levels, Some(vec![1, 8]));
+        assert_eq!(merged.context_suffix, Some(512));
+        assert_eq!(Entry { context_suffix: Some(0), ..Entry::default() }.merged(&defaults).context_suffix, Some(0));
         let encoded = serde_json::to_value(&merged).unwrap();
         assert_eq!(encoded["context_lengths"], serde_json::json!([32768, 131072]));
         assert_eq!(serde_json::from_value::<Entry>(encoded).unwrap(), merged);

@@ -5358,12 +5358,23 @@ mod prefill_lane_tests {
             // projection routes and capacity-based thresholds are unchanged.
             // Fork #136 adds full-head MLA absorb/UV cache hints and preserves W8 prefill mode;
             // projection dispatch, shapes and arithmetic thresholds remain unchanged.
-            ("integration/cuteafd/glmf.py", 0xf39b_b9ad_75d4_25a9_u64),
+            // Fork #146 (FP8 dense decode duel, #703) moves the GEMV tuning table into
+            // `_fp8_weights` (re-exported) and gives each measured shape one column group and the
+            // wide tile its own (column block, tiles per CTA): the per-shape `warps` (the K split
+            // and cross-warp fold, hence the numerics), the head-split KDA tile (8, 2), the
+            // projection routes and the capacity thresholds are unchanged; only the launch grid
+            // partitions, so a shape outside the table keeps master's (warps, 4) bitwise.
+            ("integration/cuteafd/glmf.py", 0x3d18_c625_28d5_0755_u64),
             // b729115b uses canonical BF16 MMA at every positive row count.
             // Hugh Madden fork #30 (TMA fences before consumer_release): fence-only change.
             // Fork #136 adds only an optional weight TMA cache policy; MMA and K order are unchanged.
             ("integration/cuteafd/_glm_kernels.py", 0xd327_0840_454a_bc62),
-            ("integration/cuteafd/_fp8_weights.py", 0xab87_f59d_f17b_3556),
+            // Fork #146 adds `fp8_gemv_tuning`/`fp8_gemv_wide`/`fp8_gemv_wide_kernel` and the
+            // `NcMmaFp8Gemv` load path. Selected shapes keep the shipped `warps`; every change is a
+            // grid partition (groups, cta_tiles). The (5120, 17408) wide tile's `nc` load path
+            // (16-byte read-only loads, L1 evict, ping-pong widen) runs the same MMAs in the same
+            // order with the same FP32 accumulation: bitwise-equal outputs at every row count.
+            ("integration/cuteafd/_fp8_weights.py", 0x8bca_9b91_3c5f_9e49),
             // 5dcdd837 opts decode mHC into partial-group fusion; projection thresholds and arithmetic stay unchanged.
             ("integration/cuteafd/dsv4_mhc.py", 0x978a_179d_ef8c_2101),
             // KDAGeometry import/export and signed-byte operand registration only;
@@ -5373,7 +5384,15 @@ mod prefill_lane_tests {
             // skinny_max_rows and the default GLM RoutedBf16Projection paths are unchanged.
             // Fork #71 adds Step-5 DECODE_TMA_TILES keys (4096,12288), (4096,6144), (384,4096) and
             // (3072,4096): none is a GLM Flash [N,K], and each retile keeps the same K order.
-            ("gemm/bf16_gemv/_skinny.py", 0x0afd_d59f_c563_86f3),
+            // Fork #145 adds COMPENSATED_TILES_BY_ROWS ((6144,4096), (4096,12288), (4096,6144),
+            // (384,4096), (3072,4096), (24752,7168): none is a GLM Flash [N,K]) and an explicit
+            // tile_m entry form. Only pointwise.compile_bf16_projection_aot(compensated=True)
+            // reads that table; the uncompensated decode route never does. RowTiledBf16Projection
+            // gains pass-through prefill overrides, and every existing caller (RoutedBf16Projection's
+            // large tile, including _glm_kernels.glm_projection) passes none, so its default kernel
+            // and entries are built exactly as before: shapes, arithmetic routes and thresholds
+            // are unchanged.
+            ("gemm/bf16_gemv/_skinny.py", 0xcb7f_0612_9acd_baff),
         ] {
             let bytes = std::fs::read(root.join(path)).unwrap();
             let hash = bytes.iter().fold(0xcbf2_9ce4_8422_2325_u64,
