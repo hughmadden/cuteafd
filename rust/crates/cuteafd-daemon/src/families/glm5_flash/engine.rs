@@ -5390,7 +5390,15 @@ mod prefill_lane_tests {
             // skinny_max_rows and the default GLM RoutedBf16Projection paths are unchanged.
             // Fork #71 adds Step-5 DECODE_TMA_TILES keys (4096,12288), (4096,6144), (384,4096) and
             // (3072,4096): none is a GLM Flash [N,K], and each retile keeps the same K order.
-            ("gemm/bf16_gemv/_skinny.py", 0x0afd_d59f_c563_86f3),
+            // Fork #145 adds COMPENSATED_TILES_BY_ROWS ((6144,4096), (4096,12288), (4096,6144),
+            // (384,4096), (3072,4096), (24752,7168): none is a GLM Flash [N,K]) and an explicit
+            // tile_m entry form. Only pointwise.compile_bf16_projection_aot(compensated=True)
+            // reads that table; the uncompensated decode route never does. RowTiledBf16Projection
+            // gains pass-through prefill overrides, and every existing caller (RoutedBf16Projection's
+            // large tile, including _glm_kernels.glm_projection) passes none, so its default kernel
+            // and entries are built exactly as before: shapes, arithmetic routes and thresholds
+            // are unchanged.
+            ("gemm/bf16_gemv/_skinny.py", 0xcb7f_0612_9acd_baff),
         ] {
             let bytes = std::fs::read(root.join(path)).unwrap();
             let hash = bytes.iter().fold(0xcbf2_9ce4_8422_2325_u64,

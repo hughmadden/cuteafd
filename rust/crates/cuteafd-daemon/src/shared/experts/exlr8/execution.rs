@@ -537,7 +537,7 @@ mod tests {
         spec.geometry["top_k"] = serde_json::json!(8);
         spec.geometry["max_groups"] = serde_json::json!(512);
         spec.geometry["group_rows"] = serde_json::json!(16);
-        spec.geometry["serving_variant"] = serde_json::json!("k1_reg_pair_b2");
+        spec.geometry["serving_variant"] = serde_json::json!("k1_k23_coalesced");
         spec.scratch = [
             ("fc1".into(), 512 * 16 * 2 * 6 * 16 * 128 * 4),
             ("intermediate".into(), 512 * 16 * 16 * 128 * 2),
