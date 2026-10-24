@@ -172,20 +172,6 @@ pub fn spark_package_directory(lib: &std::path::Path, cfg: &MimoV2Config,
     Ok(package.join(format!("tp{tp}")))
 }
 
-/// A missing implicit manifest makes local onboarding ineligible. A malformed
-/// or explicitly selected manifest is an unsupported package, never a fallback.
-pub fn package_manifest(directory: &std::path::Path, explicit: Option<&std::path::Path>)
-    -> anyhow::Result<Option<serde_json::Value>> {
-    let path = explicit.map(std::path::Path::to_path_buf).unwrap_or_else(||
-        directory.parent().unwrap_or(directory).join("manifest.json"));
-    match std::fs::read(&path) {
-        Ok(bytes) => Ok(Some(serde_json::from_slice(&bytes).map_err(|error|
-            anyhow::anyhow!("MiMo expert manifest {}: {error}", path.display()))?)),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound && explicit.is_none() => Ok(None),
-        Err(error) => Err(anyhow::anyhow!("MiMo expert manifest {}: {error}", path.display())),
-    }
-}
-
 pub fn exact_package(directory: &std::path::Path,
     tensors: &crate::formats::fp8_experts::Fp8ExpertTensors, tp: usize, rank: usize)
     -> (std::path::PathBuf, crate::formats::fp8_experts::Slicing) {
@@ -361,19 +347,6 @@ mod tests {
             }
             drafts.retain(|(name, _)| !name.starts_with("draft."));
         }
-    }
-
-    #[test]
-    fn implicit_missing_explicit_and_malformed_package_contract() {
-        let dir = tempfile::tempdir().unwrap();
-        let layout = dir.path().join("tp2");
-        assert!(package_manifest(&layout, None).unwrap().is_none());
-        assert!(package_manifest(&layout, Some(&dir.path().join("missing.json"))).is_err());
-        let manifest = dir.path().join("manifest.json");
-        std::fs::write(&manifest, "not json").unwrap();
-        assert!(package_manifest(&layout, None).is_err());
-        std::fs::write(&manifest, "{}").unwrap();
-        assert!(package_manifest(&layout, None).unwrap().is_some());
     }
 }
 

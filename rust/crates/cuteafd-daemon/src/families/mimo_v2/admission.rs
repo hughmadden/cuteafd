@@ -23,7 +23,7 @@ fn routed_costs(opened: &super::Opened, args: &super::EngineArgs, layers: usize,
     -> Result<(Vec<Option<cuteafd_loader::placement::ExpertCost>>, u64, [u64; 2], Option<std::path::PathBuf>)> {
     use crate::shared::experts::fp8::bf16_sibling;
     use crate::shared::experts::rtx::fp8moe::Fp8MoeTp2;
-    use cuteafd_loader::placement::{Bytes2, ExpertCost, families::mimo_v2::{expert_layer_bytes, package_directory, package_manifest}};
+    use cuteafd_loader::placement::{Bytes2, ExpertCost, families::mimo_v2::{expert_layer_bytes, package_directory}, inventory::package_manifest};
     use cuteafd_loader::formats::fp8_experts::Slicing;
     if args.skip_experts || args.expert_window.is_some() || opened.cfg.dense.iter().take(layers).all(|&dense| dense) {
         ensure!(ranks == 1 || args.expert_window.is_none(), "MiMo streamed TP1 experts require one RTX");
@@ -701,7 +701,7 @@ fn workspace_options(
 }
 
 fn local_package_manifest(directory: &std::path::Path) -> Result<serde_json::Value> {
-    cuteafd_loader::placement::families::mimo_v2::package_manifest(directory, None)?
+    cuteafd_loader::placement::inventory::package_manifest(directory, None)?
         .with_context(|| format!("MiMo local package {} needs manifest.json in its package root", directory.display()))
 }
 

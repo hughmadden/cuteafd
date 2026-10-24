@@ -2,9 +2,10 @@
 //! ring geometry its Spark links register.
 use anyhow::{ensure, Result};
 use cuteafd_loader::{
-    families::{minimax_m3::config::MiniMaxM3Config, qwen4::Qwen4KvCache},
+    families::{minimax_m3::config::MiniMaxM3Config, qwen4::Qwen4KvCache}, formats::fp8_experts::ExpertFormat,
     plan::{checkpoint::Checkpoint, families::minimax::admission::{self, Reservations}},
 };
+use std::path::{Path, PathBuf};
 pub(super) use admission::{RuntimeLedger, RuntimeSizing};
 
 pub(super) struct Request {
@@ -41,6 +42,16 @@ impl Admitted {
         self.cache = admission::admit(cfg, sizing, &self.ledger, self.reservations, available, requested_pool, kv_format)?;
         Ok(())
     }
+}
+
+/// The coordinator's native TP1 expert package in `native_lib`'s image and the manifest at its
+/// package root (`tp1/` holds only the module); `None` when the image ships no package, which
+/// refuses onboarding.
+pub(super) fn local_package(native_lib: &Path) -> Result<(PathBuf, Option<serde_json::Value>)> {
+    let directory = crate::shared::experts::fp8::package_directory_for(native_lib, 1, ExpertFormat::Nvfp4,
+        cuteafd_core::ExpertGeometry::MINIMAX_M3.family());
+    let manifest = cuteafd_loader::placement::inventory::package_manifest(&directory, None)?;
+    Ok((directory, manifest))
 }
 
 pub(super) fn solve(checkpoint: &Checkpoint, programs: &serde_json::Value,
@@ -81,6 +92,22 @@ mod tests {
         let mut layouts = serde_json::json!({"tp1": layout(1, 102_837_248)});
         if let Some(scratch) = remote_scratch { layouts["tp3"] = layout(3, scratch); }
         serde_json::json!({"layouts": layouts})
+    }
+
+    /// Serve and golden read the TP1 package's manifest at the package root, as the image ships it.
+    #[test]
+    fn minimax_local_package_reads_the_manifest_at_the_package_root() -> Result<()> {
+        let image = tempfile::tempdir()?;
+        let root = image.path().join("fp8/fp8-minimax-nvfp4a4");
+        std::fs::create_dir_all(root.join("tp1"))?;
+        std::fs::write(root.join("tp1/libcuteafd_fp8moe.so"), b"module")?;
+        let native = image.path().join("libcuteafd_native.so");
+        assert_eq!(local_package(&native)?, (root.join("tp1"), None));
+        std::fs::write(root.join("manifest.json"), package(None).to_string())?;
+        assert_eq!(local_package(&native)?, (root.join("tp1"), Some(package(None))));
+        std::fs::write(root.join("manifest.json"), b"not JSON")?;
+        assert!(local_package(&native).is_err());
+        Ok(())
     }
 
     #[test]

@@ -470,9 +470,10 @@ pub(crate) async fn run_golden(args: GoldenArgs) -> Result<()> {
         host_landing:!args.peers.is_empty() && super::routed::host_landing(&library)?};
     let program_sizes = admission::ProgramSizes::from_manifest(&read_json(&args.manifest)?, sizing)?;
     let ledger = admission::RuntimeLedger::new(&cfg, sizing, &program_sizes)?;
-    let package = crate::shared::experts::fp8::package_directory(native, 1, cuteafd_loader::formats::fp8_experts::ExpertFormat::Nvfp4);
+    let (package, local_package) = super::admission::local_package(native)?;
     let workspace = if args.expert_layers.is_empty() {0} else {
-        admission::expert_workspace(&read_json(&package.join("manifest.json"))?, 1, sizing.rows)?
+        admission::expert_workspace(local_package.as_ref().context("MiniMax golden local experts need the native \
+            expert package manifest (fp8-minimax-nvfp4a4/manifest.json)")?, 1, sizing.rows)?
     };
     let mut reservations = admission::Reservations {weights:weights.resident_bytes,
         local_experts:admission::expert_resident_bytes(&catalog, &args.expert_layers, 1, 0)?,

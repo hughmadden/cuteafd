@@ -168,7 +168,8 @@ pub(crate) fn package_directory(native_lib: &Path, tp: usize, format: ExpertForm
     package_directory_for(native_lib, tp, format, cuteafd_core::expert_geometry().family())
 }
 
-fn package_directory_for(native_lib: &Path, tp: usize, format: ExpertFormat,
+/// [`package_directory`] for the expert geometry `family` rather than the process's.
+pub(crate) fn package_directory_for(native_lib: &Path, tp: usize, format: ExpertFormat,
     family: Option<&'static str>) -> PathBuf {
     let family = package_family(family, format);
     let root = native_lib.parent().unwrap_or(Path::new(".")).join("fp8");

@@ -552,14 +552,29 @@ pub fn fp8moe_package_scratch(lib: &std::path::Path, family: &str,
     Some((name, fp8moe_scratch_bytes(&manifest, "tp1", rows)?))
 }
 
+/// The manifest of an `fp8moe` package layout `directory` (`.../fp8-<family>/tp<n>`): it lives at
+/// the package root beside the layouts, which hold only their modules. A missing implicit
+/// manifest makes local onboarding ineligible; a malformed or explicitly selected one is an
+/// unsupported package, never a fallback.
+pub fn package_manifest(directory: &std::path::Path, explicit: Option<&std::path::Path>)
+    -> anyhow::Result<Option<Value>> {
+    let path = explicit.map(std::path::Path::to_path_buf).unwrap_or_else(||
+        directory.parent().unwrap_or(directory).join("manifest.json"));
+    match std::fs::read(&path) {
+        Ok(bytes) => Ok(Some(serde_json::from_slice(&bytes).map_err(|error|
+            anyhow::anyhow!("expert package manifest {}: {error}", path.display()))?)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound && explicit.is_none() => Ok(None),
+        Err(error) => Err(anyhow::anyhow!("expert package manifest {}: {error}", path.display())),
+    }
+}
+
 /// Mandatory native W4A4 dense package; missing exports never select W4A16.
 pub fn dense_package_directory(lib: &std::path::Path, geometry: &str) -> std::path::PathBuf {
     lib.join("fp8").join(crate::formats::fp8_experts::ExpertFormat::Nvfp4.package_name(geometry)).join("tp1")
 }
 
 pub fn dense_package_scratch(lib: &std::path::Path, geometry: &str, rows: u64) -> Option<u64> {
-    let directory = dense_package_directory(lib, geometry);
-    let manifest: Value = serde_json::from_slice(&std::fs::read(directory.parent()?.join("manifest.json")).ok()?).ok()?;
+    let manifest = package_manifest(&dense_package_directory(lib, geometry), None).ok()??;
     fp8moe_scratch_bytes(&manifest, "tp1", rows)
 }
 
@@ -603,6 +618,19 @@ mod tests {
             std::fs::remove_file(root.join("manifest.json")).unwrap();
             assert!(fp8moe_package_scratch(dir.path(), family, ExpertFormat::Nvfp4, 1).is_none());
         }
+    }
+
+    #[test]
+    fn implicit_missing_explicit_and_malformed_package_contract() {
+        let dir = tempfile::tempdir().unwrap();
+        let layout = dir.path().join("tp2");
+        assert!(package_manifest(&layout, None).unwrap().is_none());
+        assert!(package_manifest(&layout, Some(&dir.path().join("missing.json"))).is_err());
+        let manifest = dir.path().join("manifest.json");
+        std::fs::write(&manifest, "not json").unwrap();
+        assert!(package_manifest(&layout, None).is_err());
+        std::fs::write(&manifest, "{}").unwrap();
+        assert!(package_manifest(&layout, None).unwrap().is_some());
     }
 
     #[test]

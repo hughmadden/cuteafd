@@ -242,10 +242,7 @@ fn worker(args: &ServeArgs, receive: &mut tokio::sync::mpsc::Receiver<cuteafd_ap
         lanes, host_landing };
     let headroom = (args.headroom_gib * (1u64 << 30) as f64) as u64;
     let manifest = cuteafd_loader::plan::checkpoint::read_json(&args.manifest)?;
-    let package = crate::shared::experts::fp8::package_directory(&args.native_lib, 1,
-        cuteafd_loader::formats::fp8_experts::ExpertFormat::Nvfp4);
-    let local_package = package.join("manifest.json");
-    let local_package = local_package.is_file().then(|| cuteafd_loader::plan::checkpoint::read_json(&local_package)).transpose()?;
+    let (package, local_package) = admission::local_package(&args.native_lib)?;
     // The coordinator GPU budget is already applied to the free bytes it reports.
     let available = || -> Result<u64> {
         library.cuda_set_device(args.device)?;
