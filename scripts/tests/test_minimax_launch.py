@@ -138,9 +138,10 @@ def test_minimax_examples_state_only_what_differs_from_the_launcher(tmp_path, ca
     assert dict(pairs)["SPARK_COUNT"] == str(tp)
     code, commands = _example_launch(tmp_path / "example", pairs, card, tp)
     assert code == 0 and len(commands) == tp + 2, commands
-    # Every key changes what the launcher starts: none restates a default.
+    # Every key changes what the launcher starts: none restates a default. The release pair is
+    # the promoted one every example names; a WIP launch runs the slot instead.
     for index, (key, value) in enumerate(pairs):
-        if key in ("MODEL_ID", "MODEL_REVISION"):
+        if key in ("MODEL_ID", "MODEL_REVISION", "COORDINATOR_DOCKER_INFERENCE", "SPARK_EXPERT_DOCKER_INFERENCE"):
             continue
         assert _example_launch(tmp_path / key, pairs[:index] + pairs[index + 1:], card, tp) != (code, commands), \
             f"{key}={value} is the launcher's default"
