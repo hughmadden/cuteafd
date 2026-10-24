@@ -337,18 +337,51 @@ fn type_sets_enums_consts_and_additional_properties_type_values() {
         "level": {"enum": [1, 2, 3]}, "answer": {"const": 42}, "flag": {"type": ["boolean", "null"]},
         "list": {"type": ["array", "null"], "items": {"type": ["number", "null"]}},
         "opts": {"type": ["object", "null"], "properties": {"n": {"type": ["integer", "null"]}}}}});
-    let tools = vec![tool("t", schema)];
-    let call = |params: &[String]| parse_everywhere(&options(Some(tools.clone())), &block(&[invoke("t", params)])).calls;
-    assert_eq!(call(&[param("days", "3"), param("note", "Oslo"), param("unit", "c"), param("level", "2"), param("answer", "42"),
-        param("flag", "true"), param("list", &format!("{NS}<item>1.5{NS}</item>{NS}<item>null{NS}</item>")),
-        param("opts", &format!("{NS}<n>7{NS}</n>")), param("extra", "9")]),
-        vec![("t".into(), json!({"days": 3, "note": "Oslo", "unit": "c", "level": 2, "answer": 42, "flag": true,
-            "list": [1.5, null], "opts": {"n": 7}, "extra": 9}))]);
-    // JSON of a type in the set wins; the text is the value only where a string is allowed.
-    assert_eq!(call(&[param("days", "null"), param("note", "null"), param("flag", "null"), param("list", "null"), param("opts", "null")]),
-        vec![("t".into(), json!({"days": null, "note": null, "flag": null, "list": null, "opts": null}))]);
-    for (key, value) in [("days", "three"), ("extra", "nine"), ("flag", "yes"), ("list", "a, b")] {
-        assert!(call(&[param(key, value)]).is_empty(), "{key}={value}");
+    for strict in [None, Some(true)] {
+        let tools = vec![ToolDefinition { strict, ..tool("t", schema.clone()) }];
+        let call = |params: &[String]| parse_everywhere(&options(Some(tools.clone())), &block(&[invoke("t", params)])).calls;
+        assert_eq!(call(&[param("days", "3"), param("note", "Oslo"), param("unit", "c"), param("level", "2"), param("answer", "42"),
+            param("flag", "true"), param("list", &format!("{NS}<item>1.5{NS}</item>{NS}<item>null{NS}</item>")),
+            param("opts", &format!("{NS}<n>7{NS}</n>")), param("extra", "9")]),
+            vec![("t".into(), json!({"days": 3, "note": "Oslo", "unit": "c", "level": 2, "answer": 42, "flag": true,
+                "list": [1.5, null], "opts": {"n": 7}, "extra": 9}))]);
+        // JSON of a type in the set wins; the text is the value only where a string is allowed.
+        assert_eq!(call(&[param("days", "null"), param("note", "null"), param("flag", "null"), param("list", "null"), param("opts", "null")]),
+            vec![("t".into(), json!({"days": null, "note": null, "flag": null, "list": null, "opts": null}))]);
+        // A value that is not its type: a strict tool cannot read the invoke; others keep
+        // the spellings vLLM's coercion takes, then the text.
+        for (key, value, loose) in [("days", "three", json!("three")), ("extra", "nine", json!("nine")),
+            ("flag", "yes", json!("yes")), ("list", "a, b", json!("a, b")), ("days", "+4", json!(4)),
+            ("flag", "True", json!(true)), ("flag", "0", json!(false)), ("days", "NULL", json!(null))] {
+            let expected = if strict.is_some() { vec![] } else { vec![("t".into(), json!({(key): loose}))] };
+            assert_eq!(call(&[param(key, value)]), expected, "{key}={value} strict={strict:?}");
+        }
+    }
+}
+
+#[test]
+fn best_effort_reading_follows_vllm_for_non_strict_tools() {
+    let rows = |items: &str| param("rows", items);
+    let lenient = options(Some(tools()));
+    let strict = options(Some(tools().into_iter().map(|t| ToolDefinition { strict: Some(true), ..t }).collect()));
+    for (params, value) in [
+        // Repeated parameters collect into a list in order, as do repeated nested fields.
+        (vec![param("city", "a"), param("city", "b"), param("city", "c")], json!({"city": ["a", "b", "c"]})),
+        (vec![param("range", &format!("{NS}<lo>1{NS}</lo>{NS}<lo>2{NS}</lo>"))], json!({"range": {"lo": [1, 2]}})),
+        // An array schema takes its children whatever their names.
+        (vec![param("tags", &format!("{NS}<tag>a{NS}</tag>{NS}<tag>b{NS}</tag>"))], json!({"tags": ["a", "b"]})),
+        // Elements under a scalar schema stay an object.
+        (vec![param("city", &format!("{NS}<name>Oslo{NS}</name>"))], json!({"city": {"name": "Oslo"}})),
+        (vec![param("tags", &format!("{NS}<item>{NS}<item>deep{NS}</item>{NS}</item>"))], json!({"tags": [{"item": "deep"}]})),
+        // A number for an integer, and an unreadable anyOf leaf, keep their JSON or text.
+        (vec![param("days", "2.0"), param("either", "x")], json!({"days": 2.0, "either": "x"})),
+        (vec![rows(&format!("{NS}<item>{NS}<n>one{NS}</n>{NS}</item>"))], json!({"rows": [{"n": "one"}]})),
+    ] {
+        let text = block(&[invoke(if params[0].contains("<rows>") { "write_file" } else { "get_weather" }, &params)]);
+        assert_eq!(parse_everywhere(&lenient, &text).calls.into_iter().map(|c| c.1).collect::<Vec<_>>(), vec![value.clone()],
+            "{text}");
+        let exact = parse_everywhere(&strict, &text);
+        assert!(exact.calls.is_empty() && exact.content == text, "strict {value}: {exact:?}");
     }
 }
 
@@ -390,10 +423,8 @@ fn malformed_calls_stay_visible_and_never_become_partial_calls() {
         format!("{CALL_OPEN}\n{INVOKE_OPEN}get_weather\">{}{CALL_CLOSE}", param("city", "Oslo")),
         // mismatched parameter close
         format!("{CALL_OPEN}\n{INVOKE_OPEN}get_weather\">{NS}<city>Oslo{NS}</town>{INVOKE_CLOSE}\n{CALL_CLOSE}"),
-        // duplicate parameter
-        block(&[invoke("get_weather", &[param("city", "a"), param("city", "b")])]),
-        // wrongly typed integer
-        block(&[invoke("get_weather", &[param("days", "two")])]),
+        // text beside a parameter
+        format!("{CALL_OPEN}\n{INVOKE_OPEN}get_weather\">noise {}{INVOKE_CLOSE}\n{CALL_CLOSE}", param("city", "Oslo")),
         // empty block
         format!("{CALL_OPEN}\n{CALL_CLOSE}"),
         // missing name
@@ -413,7 +444,7 @@ fn malformed_calls_stay_visible_and_never_become_partial_calls() {
 #[test]
 fn one_broken_invoke_returns_alone_as_content() {
     let (a, b) = (invoke("get_weather", &[param("city", "a")]), invoke("get_weather", &[param("city", "b")]));
-    let bad = invoke("get_weather", &[param("city", "c"), param("days", "two")]);
+    let bad = format!("{INVOKE_OPEN}get_weather\">{}{NS}<days>2{NS}</day>{INVOKE_CLOSE}\n", param("city", "c"));
     let text = format!("Three lookups.\n{}[e~[", block(&[a, bad.clone(), b]));
     let projection = parse_everywhere(&options(Some(tools())), &text);
     assert_eq!(projection.calls, vec![("get_weather".into(), json!({"city": "a"})), ("get_weather".into(), json!({"city": "b"}))]);
@@ -455,8 +486,8 @@ fn values_may_contain_xml_looking_text_but_not_the_namespace() {
 fn same_name_nesting_balances() {
     let inner = format!("{NS}<item>{NS}<item>deep{NS}</item>{NS}</item>");
     let projection = parse_everywhere(&options(Some(tools())), &block(&[invoke("get_weather", &[param("tags", &inner)])]));
-    // The inner array is not a string, so the call is rejected whole rather than guessed.
-    assert!(projection.calls.is_empty());
+    // The balanced search finds the outer close: one item holding one element.
+    assert_eq!(projection.calls, vec![("get_weather".into(), json!({"tags": [{"item": "deep"}]}))]);
     let nested = format!("{NS}<item>{NS}<n>1{NS}</n>{NS}</item>");
     let projection = parse_everywhere(&options(Some(tools())), &block(&[invoke("write_file", &[param("rows", &nested)])]));
     assert_eq!(projection.calls, vec![("write_file".into(), json!({"rows": [{"n": 1}]}))]);
@@ -492,8 +523,9 @@ fn long_arguments_parse_in_linear_time() {
 #[test]
 fn call_count_tracks_parsed_calls_only() {
     let mut parser = MiniMaxOutputParser::new(options(Some(tools())));
+    let broken = format!("{INVOKE_OPEN}get_weather\">{NS}<days>x{NS}</day>{INVOKE_CLOSE}\n");
     let text = format!("{}{}", block(&[invoke("get_weather", &[param("city", "a")]), invoke("get_weather", &[param("city", "b")])]),
-        block(&[invoke("get_weather", &[param("days", "x")])]));
+        format!("{CALL_OPEN}\n{broken}{CALL_CLOSE}"));
     parser.push(&text);
     parser.finish();
     assert_eq!(parser.tool_calls(), 2);

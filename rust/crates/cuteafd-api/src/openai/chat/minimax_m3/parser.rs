@@ -4,6 +4,16 @@
 //! invoke, or one never closed, returns whole. Each case is logged. Visible
 //! content follows glm5: no leading whitespace, trailing whitespace only
 //! before more content, and after the first call only returned tool XML.
+//!
+//! Values are typed by the tool's schema. A strict tool's arguments must read
+//! exactly as its schema says (a value that cannot, or a repeated parameter,
+//! makes its invoke unreadable), so a strict call never carries arguments its
+//! validator would refuse. Other tools read best effort, as vLLM's
+//! `minimax_m3` parser does: a value that is not its declared type keeps its
+//! JSON reading or its text, nested elements under a scalar schema stay an
+//! object, an array schema takes its children whatever their names, and a
+//! repeated parameter collects into a list. OpenAI's tool-calling contract
+//! leaves non-strict arguments to the client to check.
 use deepseek_recipe::stream::OutputChunk;
 use deepseek_recipe_core::tools::ToolDefinition;
 use serde_json::{Map, Value};
@@ -199,13 +209,31 @@ fn invoke(text: &str, tools: &[ToolDefinition]) -> Result<(String, Value), &'sta
     let text = text.trim_start().strip_prefix(INVOKE_OPEN).ok_or("text between invokes")?;
     let (name, rest) = text.strip_suffix(INVOKE_CLOSE).ok_or("closing tag missing")?.split_once("\">").ok_or("unreadable name")?;
     if name.is_empty() || name.contains(['<', '>', '"', '\n']) { return Err("unreadable name"); }
-    let schema = tools.iter().find(|t| t.name == name).map(|t| &t.parameters).unwrap_or(&Value::Null);
+    let tool = tools.iter().find(|t| t.name == name);
+    let schema = tool.map(|t| &t.parameters).unwrap_or(&Value::Null);
+    let strict = tool.is_some_and(|t| t.strict == Some(true));
     let mut arguments = Map::new();
+    let mut repeated = Vec::new();
     for node in nodes(rest, 0).ok_or("malformed parameters")? {
-        let value = typed(&node, field(schema, &node.name), schema, 0).ok_or("a value does not fit its schema")?;
-        if arguments.insert(node.name, value).is_some() { return Err("repeated parameter"); }
+        let value = typed(&node, field(schema, &node.name), schema, strict, 0).ok_or("a value does not fit its schema")?;
+        if !insert(&mut arguments, &mut repeated, &node.name, value, strict) { return Err("repeated parameter"); }
     }
     Ok((name.to_owned(), arguments.into()))
+}
+
+/// Add `name`: a strict tool refuses a repeated parameter; otherwise repeats
+/// collect into a list in order (`repeated` names the fields that are such lists).
+fn insert(map: &mut Map<String, Value>, repeated: &mut Vec<String>, name: &str, value: Value, strict: bool) -> bool {
+    let Some(previous) = map.get_mut(name) else { map.insert(name.to_owned(), value); return true };
+    if strict { return false; }
+    match previous {
+        Value::Array(items) if repeated.iter().any(|r| r == name) => items.push(value),
+        _ => {
+            *previous = Value::Array(vec![previous.take(), value]);
+            repeated.push(name.to_owned());
+        }
+    }
+    true
 }
 
 struct Node<'a> { name: String, raw: &'a str, children: Vec<Node<'a>> }
@@ -240,10 +268,14 @@ fn nodes(mut text: &str, depth: usize) -> Option<Vec<Node<'_>>> {
     Some(out)
 }
 
-fn typed(node: &Node<'_>, schema: &Value, root: &Value, depth: usize) -> Option<Value> {
+/// `node` read as `schema`; `None` only where `strict` (or the nesting limit)
+/// refuses a reading. Best effort never fails: see the module notes.
+fn typed(node: &Node<'_>, schema: &Value, root: &Value, strict: bool, depth: usize) -> Option<Value> {
     if depth > 64 { return None; }
     if let Some(pointer) = schema["$ref"].as_str().and_then(|r| r.strip_prefix('#')) {
-        return typed(node, root.pointer(pointer)?, root, depth + 1);
+        let target = root.pointer(pointer);
+        if strict && target.is_none() { return None; }
+        return typed(node, target.unwrap_or(&Value::Null), root, strict, depth + 1);
     }
     for key in ["anyOf", "oneOf"] {
         if let Some(branches) = schema[key].as_array() {
@@ -251,7 +283,9 @@ fn typed(node: &Node<'_>, schema: &Value, root: &Value, depth: usize) -> Option<
             if node.children.is_empty() && branches.iter().any(|s| types(s).contains(&"string")) {
                 return Some(node.raw.to_owned().into());
             }
-            return branches.iter().find_map(|s| typed(node, s, root, depth + 1));
+            // The first branch that reads exactly; best effort then reads it untyped.
+            return branches.iter().find_map(|s| typed(node, s, root, true, depth + 1))
+                .or_else(|| if strict { None } else { typed(node, &Value::Null, root, false, depth + 1) });
         }
     }
     let kinds = types(schema);
@@ -262,25 +296,49 @@ fn typed(node: &Node<'_>, schema: &Value, root: &Value, depth: usize) -> Option<
         let json = serde_json::from_str::<Value>(raw).ok();
         if let Some(member) = schema["enum"].as_array().into_iter().flatten().chain(schema.get("const"))
             .find(|m| m.as_str() == Some(node.raw) || json.as_ref() == Some(*m)) { return Some(member.clone()); }
-        if let Some(value) = json.filter(|v| admits(&kinds, v)) { return Some(value); }
+        if let Some(value) = json.clone().filter(|v| admits(&kinds, v)) { return Some(value); }
         if kinds.is_empty() || kinds.contains(&"string") { return Some(node.raw.to_owned().into()); }
         // The template renders an empty array or object as no text.
-        if !raw.is_empty() { return None; }
-        if kinds.contains(&"array") { return Some(Value::Array(Vec::new())); }
-        return kinds.contains(&"object").then(|| Map::new().into());
+        if raw.is_empty() && kinds.contains(&"array") { return Some(Value::Array(Vec::new())); }
+        if raw.is_empty() && kinds.contains(&"object") { return Some(Map::new().into()); }
+        if strict { return None; }
+        return Some(loose(raw, &kinds).or(json).unwrap_or_else(|| node.raw.to_owned().into()));
     }
-    if node.children.iter().all(|n| n.name == "item") && (kinds.is_empty() || kinds.contains(&"array")) {
+    let items = node.children.iter().all(|n| n.name == "item") && (kinds.is_empty() || kinds.contains(&"array"));
+    if items || (!strict && kinds.contains(&"array") && !kinds.contains(&"object")) {
         return node.children.iter().enumerate().map(|(i, n)| {
             let item = schema.get("prefixItems").and_then(|v| v.get(i)).unwrap_or(&schema["items"]);
-            typed(n, item, root, depth + 1)
+            typed(n, item, root, strict, depth + 1)
         }).collect::<Option<Vec<_>>>().map(Value::Array);
     }
-    if !kinds.is_empty() && !kinds.contains(&"object") { return None; }
+    if strict && !kinds.is_empty() && !kinds.contains(&"object") { return None; }
     let mut values = Map::new();
+    let mut repeated = Vec::new();
     for child in &node.children {
-        if values.insert(child.name.clone(), typed(child, field(schema, &child.name), root, depth + 1)?).is_some() { return None; }
+        let value = typed(child, field(schema, &child.name), root, strict, depth + 1)?;
+        if !insert(&mut values, &mut repeated, &child.name, value, strict) { return None; }
     }
     Some(values.into())
+}
+
+/// Spellings of a declared scalar type that JSON does not read, as vLLM's
+/// coercion takes them: any-case `null`, a signed integer, a finite float and
+/// any-case `true`/`false` or `1`/`0`, in that order of preference.
+fn loose(raw: &str, kinds: &[&str]) -> Option<Value> {
+    if kinds.contains(&"null") && raw.eq_ignore_ascii_case("null") { return Some(Value::Null); }
+    if kinds.contains(&"integer") {
+        if let Ok(value) = raw.strip_prefix('+').unwrap_or(raw).parse::<i64>() { return Some(value.into()); }
+    }
+    if kinds.contains(&"number") {
+        if let Some(number) = raw.parse::<f64>().ok().filter(|v| v.is_finite()).and_then(serde_json::Number::from_f64) {
+            return Some(number.into());
+        }
+    }
+    if kinds.contains(&"boolean") {
+        if raw.eq_ignore_ascii_case("true") || raw == "1" { return Some(true.into()); }
+        if raw.eq_ignore_ascii_case("false") || raw == "0" { return Some(false.into()); }
+    }
+    None
 }
 
 /// `type` as a set: `["integer", "null"]` is the strict-mode spelling of an optional field.
