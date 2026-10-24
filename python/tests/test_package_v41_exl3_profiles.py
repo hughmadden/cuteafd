@@ -146,7 +146,7 @@ class PackageProfileTests(unittest.TestCase):
             self.assertLessEqual(set(options), {'tile', 'blocks_per_sm', 'route_block',
                                                 'hidden', 'swiglu_limit', 'decode_schedule',
                                                 'compact_weights', 'token_major_rotation', 'warp_specialized',
-                                                'wire_input', 'ws_input_stages', 'ws_dynamic_tiles'},
+                                                'wire_input', 'ws_input_stages', 'ws_dynamic_tiles', 'activation'},
                                  'unexpected option consumed by the fake export')
             if options.get('compact_weights'):
                 self.assertEqual(len(tiers), 2)
@@ -580,6 +580,32 @@ class PackageProfileTests(unittest.TestCase):
                 self.assertFalse(any(w(geometry, 'coordinator', width, c) for c in (256, 1024, 4096)))
         for geometry in ('v41', 'dsv4f', 'qwen4'):
             self.assertFalse(any(w(geometry, 'spark', 512, c) for c in (256, 1024, 4096)))
+
+    def test_kimi_ws64_only_for_qualified_ordinary_tp6_prefill(self):
+        capacities = (1, 16, 80, 256, 1024, 2048, 4096)
+        self.assertEqual([package.warp_specialized('kimik3', 'spark', 512, c)
+                          for c in capacities], [False] * 4 + [True] * 3)
+        for width in (384, 768, 1024, 1536, 3072):
+            self.assertFalse(any(package.warp_specialized('kimik3', 'spark', width, c)
+                                 for c in capacities))
+        self.assertFalse(any(package.warp_specialized('kimik3', 'coordinator', 512, c)
+                             for c in capacities))
+        self.assertFalse(any(package.compact_warp_specialized('kimik3', 'spark', 512, c)
+                             for c in capacities))
+        with tempfile.TemporaryDirectory() as temporary:
+            _, _, calls, _ = self.build_fixture(
+                Path(temporary), 'spark', (2, 3), geometry='kimik3',
+                capacities=(80, 256, 1024, 4096), profiles=('tp6-width512',))
+            for call in calls:
+                capacity = call.args[3]
+                self.assertEqual(call.kwargs['activation'], 'situ')
+                if capacity >= 1024:
+                    self.assertTrue(call.kwargs['warp_specialized'])
+                    self.assertEqual(call.kwargs['route_block'], 64)
+                    self.assertIn('+ws-m64/', str(call.args[0]))
+                else:
+                    self.assertNotIn('warp_specialized', call.kwargs)
+                    self.assertNotIn('+ws-', str(call.args[0]))
 
     def test_decode_capacities_ship_the_canonical_tile(self):
         """A decode capacity the B12x planner widens is pinned to m1's tile (#309).
