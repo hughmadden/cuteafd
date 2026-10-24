@@ -272,6 +272,15 @@ PROFILE_SPARK_NCU_SKIP
 PROFILE_SPARK_NSYS_GPU_METRICS
 EOF
   _spark_slot_keys HOST LANE_A
+  # Weight variants: VARIANTS plus each named variant's own keys.
+  _variant_keys() {
+    printf '%s\n' VARIANTS
+    local variant
+    for variant in ${cfg[VARIANTS]:+${cfg[VARIANTS]//,/ }}; do
+      variant="${variant^^}"; variant="${variant//-/_}"
+      printf 'VARIANT_%s_%s\n' "$variant" SOURCE "$variant" REVISION "$variant" BASE "$variant" ID "$variant" MODE
+    done
+  }
   case "$1" in
     deepseek_v4)
       cat <<'EOF'
@@ -284,13 +293,7 @@ SPECULATOR_MODEL_REVISION
 EOF
       ;;
     glm5)
-      # Weight variants: VARIANTS plus each named variant's own keys.
-      printf '%s\n' VARIANTS
-      local variant
-      for variant in ${cfg[VARIANTS]:+${cfg[VARIANTS]//,/ }}; do
-        variant="${variant^^}"; variant="${variant//-/_}"
-        printf 'VARIANT_%s_%s\n' "$variant" SOURCE "$variant" REVISION "$variant" BASE "$variant" ID "$variant" MODE
-      done
+      _variant_keys
       cat <<'EOF'
 PREFILL_ROWS
 PREFILL_WAVES
@@ -308,6 +311,7 @@ SPECULATOR_MODEL_REVISION
 EOF
       ;;
     glm5_flash)
+      _variant_keys
       cat <<'EOF'
 L2_PREFETCH
 FP8_SCALES
@@ -2163,15 +2167,16 @@ fi
 served_args=()
 served="$(get SERVED_MODEL_ID)"
 [[ -z "$served" ]] || served_args=(--model-id "$served")
-# VARIANTS=<name,...>: weight variants served under their own model ids (serve-glm --variant).
+# VARIANTS=<name,...>: weight variants served under their own model ids (serve-glm / serve-glmf --variant).
 # Per name, keyed by the name in upper case with - as _ (abliterated: VARIANT_ABLITERATED_*):
 # _SOURCE (a Hugging Face id under this hub, with _REVISION, or an absolute path mounted
 # read-only), _BASE (the checkpoint the edit is measured against, id[@revision] or a path;
-# default the served snapshot), _ID (default <served id>-<name>) and _MODE (glm5: ffn or shared-only).
+# default the served snapshot), _ID (default <served id>-<name>) and _MODE (glm5: ffn or shared-only;
+# glm5_flash takes none).
 variant_args=()
 variant_mounts=()
 if [[ -n "$(get VARIANTS)" ]]; then
-  [[ "$family" == glm5 ]] || release_die "VARIANTS is supported for glm5 only"
+  [[ "$family" == glm5 || "$family" == glm5_flash ]] || release_die "VARIANTS is supported for glm5 and glm5_flash only"
   # Sets variant_resolved (and the read-only mount a path outside the namespace needs).
   variant_path() {
     local value="$1" revision="$2"
