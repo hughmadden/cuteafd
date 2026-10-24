@@ -5619,7 +5619,7 @@ file, instead of forcing the 5090 / 1× RTX / 2× RTX columns.
 | Kimi K3 (EXL3 K2 + Core-K6) | max 2 RTX + 6 Sparks | — (one card) |
 | Step-5 | NVFP4 min 1 RTX + 4 Sparks; FP8 max 2 RTX + 6 Sparks | quant × hardware level |
 | Dense Qwen 3.8 27B | BF16 min 1 RTX; FP8 min 1 RTX | quants (RTX only, no TP2 card) |
-| Qwen 3.8 Flash Next | EXL3 5090 (1 RTX 5090 + 1 Spark) | — (one card, unchanged from v3) |
+| Qwen 3.8 Flash Next | EXL3 min 1 RTX PRO 6000 (0 Sparks, `qwen38-exl3-min`); EXL3 5090 (1 RTX 5090 + 1 Spark) | hardware levels (both unchanged from v3) |
 
 EXLR8's `bit325` card is a smoke card for the 3.25 bpw width profile
 (`EXLR8_MANIFEST=bit325`, the checkpoint's KL-optimized 3.25 bpw
