@@ -163,19 +163,21 @@ impl GlmPlacement {
 /// its pages from the prefix cache's pool).
 pub(crate) struct PageAllocator {
     pool: cuteafd_engine::prefix::RefPagePool,
+    /// The weight variant new sequences run as ([`GlmEngine::golden_variant`]).
+    variant: u8,
 }
 
 impl PageAllocator {
     /// `engine`'s pool: parity half pools under context (page `j` on GPU `j mod 2`).
     pub fn new(engine: &GlmEngine<'_>) -> Self {
         Self { pool: if engine.context_kv() { cuteafd_engine::prefix::RefPagePool::parity(engine.pages, PAGE_ROWS, 0) }
-            else { cuteafd_engine::prefix::RefPagePool::new(engine.pages, PAGE_ROWS) } }
+            else { cuteafd_engine::prefix::RefPagePool::new(engine.pages, PAGE_ROWS) }, variant: engine.golden_variant.get() }
     }
 
     /// Reserves every page a sequence of up to `capacity` tokens needs.
     pub fn admit(&mut self, capacity: usize) -> Result<GlmPlacement> {
         let pages = self.pool.alloc(self.pool.pages_for(capacity)).context("cache pages exhausted")?;
-        Ok(GlmPlacement { pages, len: 0, variant: 0 })
+        Ok(GlmPlacement { pages, len: 0, variant: self.variant })
     }
 
     /// A second sequence starting as `source`'s first `len` rows: full pages shared, the
@@ -364,6 +366,8 @@ pub(crate) struct GlmEngine<'a> {
     /// The running step's variant when every row shares one (prefill: a base chunk launches
     /// no steering); `None` for a decode step, whose captured graphs always launch.
     step_variant: Cell<Option<u8>>,
+    /// The variant goldens and benches run their sequences as (`glm-golden --golden-variant`).
+    pub(crate) golden_variant: Cell<u8>,
     /// The DFlash2 drafter; every step taps its target layers.
     pub drafter: Option<crate::shared::speculation::dflash::DflashDrafter<'a>>,
     pub(super) attention_plan: cuteafd_core::coordinator_programs::AttentionReductionPlan,
@@ -454,7 +458,7 @@ impl<'a> GlmEngine<'a> {
             lanes: RefCell::new(Vec::new()), terminal: Cell::new(crate::shared::peer_split::TerminalState::Active), spark_bf16: false, full_prefill_logits: false, prefill_span_rows: DEFAULT_PREFILL_SPAN_ROWS, skip: None, l2: None, profile: RefCell::new([0.0; 3]),
             exchange_host: RefCell::new([0.0; 4]), draft_probe: RefCell::new(None),
             graphs: RefCell::new(std::collections::HashMap::new()), graphs_warmed: Cell::new(false), graphs_warming: Cell::new(false), graph_misses: Cell::new(0), drafter: None, embedding, prefill_w8a8: true,
-            variants: None, step_variant: Cell::new(None) })
+            variants: None, step_variant: Cell::new(None), golden_variant: Cell::new(0) })
     }
 
     /// Arm after graph warmup; only explicit verify rounds record signals.
