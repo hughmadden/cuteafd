@@ -573,6 +573,11 @@ impl<'a> Execution<'a> {
     /// The page-table stride of every decode step: wide enough for any live
     /// request (none holds more than the pool's pages or the context's).
     fn decode_stride(&self,batch:&BatchView)->usize { self.table_stride.min(batch.pool_pages) }
+    /// The attention route `plan_attention` takes for a `rows`-row step, as the verify trace
+    /// names it: every row a causal decode over its paged prefix, or index-prefill and extend tiles.
+    pub fn attention_route(&self,rows:usize)->&'static str {
+        if rows<=self.decode_rows {"causal_paged_decode"} else {"causal_paged_extend"}
+    }
     /// Uploads the step's attention metadata (see [`AttentionPlan`]); extend
     /// tiles end at the lane `cuts`.
     fn plan_attention(&self,batch:&BatchView,rows:usize,cuts:&[usize])->Result<AttentionPlan> {

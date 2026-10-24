@@ -209,7 +209,7 @@ impl<'e, 'a> Backend<'a> for MiniMaxBackend<'e, 'a> {
     fn verify_bucket_rows(&self, rows: usize, _: bool, _: bool) -> usize { rows }
     fn verify_attention_trace(&self, contexts: &[Vec<usize>], rows: usize) -> serde_json::Value {
         serde_json::json!({"kind":"minimax_msa_paged", "rows":rows, "contexts":contexts,
-            "attention":"causal_paged_decode_tiles", "arithmetic":"native_mxfp8_nvfp4a4"})
+            "attention":self.execution.attention_route(rows), "arithmetic":"native_mxfp8_nvfp4a4"})
     }
     fn draft_geometry(&self, _: &Path, width: usize) -> Result<cuteafd_core::PolicyGeometry> {
         self.execution.draft()?;
