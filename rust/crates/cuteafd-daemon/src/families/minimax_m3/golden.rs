@@ -1,11 +1,11 @@
 //! Teacher-forced qualification through the serving programs and paged cache.
-use super::{cache::{Cache, INDEX_PAGE_BYTES, KV_PAGE_BYTES}, execution::{BatchView, Execution, ExpertExecutor, RequestView},
-    native::Native, prefix::{MiniMaxPrefix, Placement}, MiniMaxError};
+use super::{cache::{Cache, INDEX_PAGE_BYTES, KV_PAGE_BYTES, PAGE_ROWS}, execution::{Execution, ExpertExecutor},
+    native::Native, prefix::{MiniMaxPrefix, Placement}, transaction::Step, MiniMaxError};
 use crate::shared::{golden_scores::{scored_kl, scored_nll, HiddenMetrics}, memory::device::Allocation, prefix::view,
     token_io::{EmbedPlacement, TokenEmbedding}};
 use anyhow::{ensure, Context, Result};
 use cuteafd_core::ExpertGeometry;
-use cuteafd_engine::{media::RequestMedia, prefix::{After, PrefixCache, PrefixConfig, PrefixFamily, SnapshotKind}};
+use cuteafd_engine::{media::RequestMedia, prefix::{After, PrefixCache, PrefixConfig, PrefixFamily, RefPagePool, SnapshotKind}};
 use cuteafd_ffi::CuteafdDeviceBuffer;
 use cuteafd_hostcache::copy::StubCopyEngine;
 use cuteafd_loader::{families::{minimax_m3::config::MiniMaxM3Config, qwen4::Qwen4KvCache},
@@ -273,12 +273,11 @@ struct Runner<'e, 'a> {
     last_layer: usize, rows: usize,
 }
 impl Runner<'_, '_> {
-    fn evaluate(&mut self, placement: &mut Placement, tokens: &[u32], prefill: bool) -> Result<Vec<f32>> {
-        let start = placement.committed;
-        let batch = BatchView { positions:(start..start + tokens.len()).map(|p| p as i64).collect(),
-            slots:(start..start + tokens.len()).map(|p| i64::from(placement.pages[p / 64]) * 64 + (p % 64) as i64).collect(),
-            requests:vec![RequestView {row_start:0, rows:tokens.len(),start_position:start,
-                pages:placement.pages.iter().map(|&p| p as i32).collect()}], pool_pages:self.cache.pages };
+    /// One step of `tokens` from `placement`'s frontier, through the serving
+    /// path's wave checks against `pool`.
+    fn evaluate(&mut self, pool: &RefPagePool, placement: &mut Placement, tokens: &[u32], prefill: bool) -> Result<Vec<f32>> {
+        let batch = Step::begin(&[(&mut *placement, tokens)], pool, self.cache.sequences, self.rows,
+            self.cache.context, self.cache.pages)?.batch(self.cache.pages);
         let embedded = self.embedding.embed(tokens, self.ids.buffer, 1, self.embedded.buffer, self.execution.stream());
         let drained = self.execution.drain();
         embedded?; drained?;
@@ -295,8 +294,8 @@ impl Runner<'_, '_> {
         placement.committed += tokens.len();
         Ok(values)
     }
-    fn prefill(&mut self, placement: &mut Placement, tokens: &[u32]) -> Result<()> {
-        for chunk in tokens.chunks(self.rows) { self.evaluate(placement, chunk, true)?; }
+    fn prefill(&mut self, pool: &RefPagePool, placement: &mut Placement, tokens: &[u32]) -> Result<()> {
+        for chunk in tokens.chunks(self.rows) { self.evaluate(pool, placement, chunk, true)?; }
         Ok(())
     }
 }
@@ -330,7 +329,7 @@ fn check_prefix(runner: &mut Runner<'_, '_>, tokens: &[u32]) -> Result<()> {
     for frontier in [63, 64, 65] {
         pool.clear(&family)?;
         let mut source = pool.admit_cold(&family, frontier, frontier + 1, placement)?.placement;
-        runner.prefill(&mut source, &tokens[..frontier])?;
+        runner.prefill(pool.pool(), &mut source, &tokens[..frontier])?;
         let expected = state(runner.cache, &source, runner.last_layer + 1)?;
         ensure!(pool.capture(&family, SnapshotKind::Prompt, &tokens[..frontier], &source, After::default())?,
             "prefix prompt capture failed");
@@ -339,10 +338,10 @@ fn check_prefix(runner: &mut Runner<'_, '_>, tokens: &[u32]) -> Result<()> {
         let mut restored = admitted.placement;
         ensure!(state(runner.cache, &restored, runner.last_layer + 1)? == expected, "restored cache bytes differ");
         let mut cold = pool.admit_cold(&family, frontier, frontier + 1, placement)?.placement;
-        runner.prefill(&mut cold, &tokens[..frontier])?;
+        runner.prefill(pool.pool(), &mut cold, &tokens[..frontier])?;
         ensure!(state(runner.cache, &cold, runner.last_layer + 1)? == expected, "cold prefix cache bytes differ");
-        let a = runner.evaluate(&mut restored, &tokens[frontier..frontier + 1], false)?;
-        let b = runner.evaluate(&mut cold, &tokens[frontier..frontier + 1], false)?;
+        let a = runner.evaluate(pool.pool(), &mut restored, &tokens[frontier..frontier + 1], false)?;
+        let b = runner.evaluate(pool.pool(), &mut cold, &tokens[frontier..frontier + 1], false)?;
         ensure!(a.iter().map(|v| v.to_bits()).eq(b.iter().map(|v| v.to_bits())), "prefix continuation output differs");
         ensure!(state(runner.cache, &restored, runner.last_layer + 1)? == state(runner.cache, &cold, runner.last_layer + 1)?,
             "prefix continuation cache bytes differ");
@@ -371,7 +370,9 @@ fn score_window(runner: &mut Runner<'_, '_>, args: &GoldenArgs, window: &Window,
     let width = if full {vocab} else {6144};
     let expected = floats(&std::fs::read(window.directory.join(&filename))?, expected_rows * width)?;
     let mut file = std::fs::File::create(directory.join(format!("{filename}.partial")))?;
-    let mut current = placement((0..window.tokens.len().div_ceil(64) as u32).collect());
+    // A fresh pool hands out pages 0, 1, ... in order.
+    let mut pages = RefPagePool::new(runner.cache.pages, PAGE_ROWS);
+    let mut current = placement(pages.alloc(window.tokens.len().div_ceil(PAGE_ROWS))?);
     let mut scores = Scores::default();
     let mut generated = Scores::default();
     let mut hidden = HiddenMetrics::default();
@@ -381,7 +382,7 @@ fn score_window(runner: &mut Runner<'_, '_>, args: &GoldenArgs, window: &Window,
         let count = if args.score_shape == ScoreShape::Decode && !unscored {1}
             else {runner.rows.min(if unscored {window.positions[0] - 1 - first} else {window.tokens.len() - first})};
         let count = count.min(window.tokens.len() - first);
-        let values = runner.evaluate(&mut current, &window.tokens[first..first + count], unscored || args.score_shape == ScoreShape::Prefill)?;
+        let values = runner.evaluate(&pages, &mut current, &window.tokens[first..first + count], unscored || args.score_shape == ScoreShape::Prefill)?;
         if full {
             for (row, ours) in values.chunks_exact(vocab).enumerate() {
                 if let Ok(index) = window.positions.binary_search(&(first + row + 1)) {

@@ -13,42 +13,21 @@ use cuteafd_loader::{families::minimax_m3::{cache::PAGE_ROWS,config::MiniMaxM3Co
 pub(super) struct LayerCache<'a> { pub key: Allocation<'a>, pub value: Allocation<'a>, pub index: Allocation<'a> }
 #[derive(Debug,Clone)]
 pub(super) struct RequestView { pub row_start:usize, pub rows:usize, pub start_position:usize, pub pages:Vec<i32> }
+/// A step's rows as the kernels see them, built from a wave the shared
+/// append checks validated ([`super::transaction::Step::batch`]).
 #[derive(Debug,Clone)]
 pub(super) struct BatchView { pub positions:Vec<i64>, pub slots:Vec<i64>, pub requests:Vec<RequestView>, pub pool_pages:usize }
 
 impl BatchView {
+    /// The kernel ABI's limits on the validated wave: rows within the step's
+    /// capacity, at most 64 requests, pool page ids in i32, every request
+    /// inside the RoPE table.
     pub fn validate(&self, capacity:usize, context:usize) -> Result<usize> {
         let rows = self.positions.len();
         ensure!(rows>0 && rows<=capacity && self.slots.len()==rows && !self.requests.is_empty()
-            && self.requests.len()<=64 && self.pool_pages>0 && self.pool_pages<=i32::MAX as usize,
+            && self.requests.len()<=64 && self.pool_pages>0 && self.pool_pages<=i32::MAX as usize
+            && self.requests.iter().all(|r|r.start_position.checked_add(r.rows).is_some_and(|end|end<=context)),
             MiniMaxError::Invalid("batch extent"));
-        let mut cursor = 0;
-        for request in &self.requests {
-            ensure!(request.rows>0 && request.row_start==cursor && request.rows<=rows-cursor,
-                MiniMaxError::Invalid("packed request rows"));
-            let end = request.start_position.checked_add(request.rows).context("MiniMax request extent overflow")?;
-            ensure!(end<=context && request.pages.len()>=end.div_ceil(64)
-                && request.pages.iter().all(|&p|p>=0 && (p as usize)<self.pool_pages),
-                MiniMaxError::Invalid("request pages or context"));
-            for local in 0..request.rows {
-                let position=request.start_position+local;
-                let slot=request.pages[position/64] as i64*64+(position%64) as i64;
-                ensure!(self.positions[cursor+local]==position as i64 && self.slots[cursor+local]==slot,
-                    MiniMaxError::Invalid("append position or slot"));
-            }
-            cursor+=request.rows;
-        }
-        ensure!(cursor==rows,MiniMaxError::Invalid("unowned batch rows"));
-        ensure!(self.slots.iter().collect::<std::collections::BTreeSet<_>>().len()==rows,
-            MiniMaxError::Invalid("multiple append rows share a physical slot"));
-        let written:std::collections::BTreeSet<_>=self.slots.iter().map(|slot|(*slot/64) as i32).collect();
-        let mut owners=std::collections::BTreeSet::new();
-        for request in &self.requests {
-            for &page in &request.pages {
-                ensure!(owners.insert(page) || !written.contains(&page),
-                    MiniMaxError::Invalid("append page is shared; copy-on-write required"));
-            }
-        }
         Ok(rows)
     }
     fn request(&self,row:usize)->Result<&RequestView> {
@@ -710,25 +689,6 @@ impl<'a> Execution<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[test] fn minimax_batch_checks_causal_lengths_and_physical_slots() -> Result<()> {
-        let batch=BatchView {positions:vec![63,64,4],slots:vec![63,128,260],pool_pages:5,
-            requests:vec![RequestView{row_start:0,rows:2,start_position:63,pages:vec![0,2]},
-                RequestView{row_start:2,rows:1,start_position:4,pages:vec![4]}]};
-        assert_eq!(batch.validate(64,128)?,3);
-        let mut bad=batch.clone(); bad.slots[1]=64; assert!(bad.validate(64,128).is_err());
-        let mut bad=batch.clone(); bad.requests[1].row_start=1; assert!(bad.validate(64,128).is_err());
-        let mut bad=batch.clone(); bad.positions[1]=65; assert!(bad.validate(64,128).is_err());
-        let mut shared=batch.clone(); shared.requests[1].pages=vec![0]; shared.slots[2]=4;
-        assert!(shared.validate(64,128).is_err());
-        let shared=BatchView {positions:vec![64,64],slots:vec![128,256],pool_pages:5,
-            requests:vec![RequestView{row_start:0,rows:1,start_position:64,pages:vec![0,2]},
-                RequestView{row_start:1,rows:1,start_position:64,pages:vec![0,4]}]};
-        assert_eq!(shared.validate(64,128)?,2);
-        assert!(batch.validate(2,128).is_err());
-        assert!(batch.validate(64,64).is_err());
-        Ok(())
-    }
-
     #[test] fn minimax_attention_metadata_is_built_once_per_step() -> Result<()> {
         // Two requests: 3 rows from 62 (pages 0, 2) and 1 row at 4 (page 4).
         let batch=BatchView {positions:vec![62,63,64,4],slots:vec![62,63,128,260],pool_pages:5,

@@ -1,5 +1,5 @@
 //! Append-only writes: the shared wave checks before dispatch, publication after drain.
-use super::prefix::Placement;
+use super::{execution::{BatchView, RequestView}, prefix::Placement};
 use crate::shared::prefix::append::{self, SequenceRows};
 use anyhow::{ensure, Result};
 use cuteafd_engine::prefix::RefPagePool;
@@ -33,6 +33,20 @@ impl Step {
         }).collect();
         append::validate(&retained.iter().map(Sequence::view).collect::<Vec<_>>(), pool, slots, capacity, context, pages)?;
         Ok(Self { sequences: retained, complete: false })
+    }
+    /// The validated wave as the kernels see it: its packed rows' positions
+    /// and physical KV slots, and each sequence's page table.
+    pub fn batch(&self, pool_pages: usize) -> BatchView {
+        let mut batch = BatchView { positions: Vec::new(), slots: Vec::new(), requests: Vec::new(), pool_pages };
+        for s in &self.sequences {
+            batch.requests.push(RequestView { row_start: s.start, rows: s.tokens.len(), start_position: s.base,
+                pages: s.pages.iter().map(|&p| p as i32).collect() });
+            for position in s.base..s.base + s.tokens.len() {
+                batch.positions.push(position as i64);
+                batch.slots.push(i64::from(s.pages[position / 64]) * 64 + (position % 64) as i64);
+            }
+        }
+        batch
     }
     pub fn completed(&mut self) { self.complete = true; }
     pub fn publish(self, sequences: &mut [(&mut Placement, usize)]) -> Result<()> {
@@ -73,6 +87,27 @@ mod tests {
         step.completed(); p.sequence = 1;
         assert!(step.publish(&mut [(&mut p, 1)]).is_err());
         assert_eq!(p.committed, 2);
+    }
+    #[test]
+    fn minimax_wave_batch_takes_causal_positions_and_physical_slots() -> Result<()> {
+        let mut pool = RefPagePool::new(8, 64);
+        pool.alloc(5)?;
+        // Two rows from 63 over pages 0 and 2, one row at 4 on page 4.
+        let (mut a, mut b) = (placement(vec![0, 2], 0, 63), placement(vec![4], 1, 4));
+        let batch = Step::begin(&[(&mut a, &[1, 2]), (&mut b, &[3])], &pool, 2, 64, 128, 8)?.batch(8);
+        assert_eq!((batch.positions.as_slice(), batch.slots.as_slice()), ([63, 64, 4].as_slice(), [63, 128, 260].as_slice()));
+        assert_eq!(batch.requests.iter().map(|r| (r.row_start, r.rows, r.start_position)).collect::<Vec<_>>(),
+            [(0, 2, 63), (2, 1, 4)]);
+        assert_eq!(batch.validate(64, 128)?, 3);
+        assert!(batch.validate(2, 128).is_err() && batch.validate(64, 64).is_err());
+        // A page one request writes and another lists needs copy-on-write.
+        let mut c = placement(vec![0], 1, 4);
+        assert!(Step::begin(&[(&mut a, &[1, 2]), (&mut c, &[3])], &pool, 2, 64, 128, 8).is_err());
+        // A complete page both only read is shared; each writes its own page.
+        let (mut x, mut y) = (placement(vec![0, 2], 0, 64), placement(vec![0, 4], 1, 64));
+        let batch = Step::begin(&[(&mut x, &[1]), (&mut y, &[2])], &pool, 2, 64, 128, 8)?.batch(8);
+        assert_eq!(batch.slots, [128, 256]);
+        Ok(())
     }
     #[test]
     fn minimax_append_rejects_aliases_before_writes() {

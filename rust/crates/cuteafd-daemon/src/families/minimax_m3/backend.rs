@@ -1,4 +1,4 @@
-use super::{cache::Cache, execution::{BatchView, Execution, RequestView}, prefix::{MiniMaxPrefix, Placement},
+use super::{cache::Cache, execution::Execution, prefix::{MiniMaxPrefix, Placement},
     routed::Routed, transaction::Step, MiniMaxError};
 use crate::shared::{draft::routes::RoundRoutes, memory::device::Allocation, prefix::{view, CudaCopyEngine, PrefixArgs, Toggle},
     qwen::{Encoder, scheduler::{self, Backend}}, token_io::{DeviceLogits, TokenEmbedding}};
@@ -86,24 +86,13 @@ impl<'e, 'a> MiniMaxBackend<'e, 'a> {
         self.pending.borrow_mut().take();
         let mut step = Step::begin(sequences, pool, self.cache.sequences, self.rows,
             self.cache.context, self.cache.pages)?;
-        let mut positions = Vec::new();
-        let mut slots = Vec::new();
-        let mut requests = Vec::new();
-        let mut tokens = Vec::new();
-        for (p, ids) in sequences.iter() {
-            requests.push(RequestView { row_start: tokens.len(), rows: ids.len(), start_position: p.committed,
-                pages: p.pages.iter().map(|&p| p as i32).collect() });
-            tokens.extend_from_slice(ids);
-            for position in p.committed..p.committed + ids.len() {
-                positions.push(position as i64);
-                slots.push(i64::from(p.pages[position / 64]) * 64 + (position % 64) as i64);
-            }
-        }
+        let batch = step.batch(self.cache.pages);
+        let tokens = sequences.iter().flat_map(|(_, ids)| ids.iter().copied()).collect::<Vec<_>>();
         let library = self.cache.library;
         library.cuda_set_device(self.cache.device)?;
         let embedded = self.embedding.embed(&tokens, self.token_ids.buffer, 1, self.embedded.buffer, self.execution.stream());
-        let mut chunks = Vec::with_capacity(requests.len());
-        for (request, (p, _)) in requests.iter().zip(sequences.iter()) {
+        let mut chunks = Vec::with_capacity(batch.requests.len());
+        for (request, (p, _)) in batch.requests.iter().zip(sequences.iter()) {
             let mut chunk = cuteafd_engine::media::MediaChunk::default();
             p.media.write_chunk(p.committed, p.committed + request.rows, &mut chunk)?;
             chunks.push(chunk);
@@ -116,7 +105,7 @@ impl<'e, 'a> MiniMaxBackend<'e, 'a> {
         // A span's rows are consecutive in both the chunk and its packed features, so each
         // run is one copy (an image is one 7 MB copy, not 576 row copies).
         const ROW: usize = 6144 * 2;
-        for (request, chunk) in requests.iter().zip(&chunks) {
+        for (request, chunk) in batch.requests.iter().zip(&chunks) {
             ensure!(chunk.features.len() == chunk.indices.len() * ROW, "MiniMax media chunk feature extent");
             let mut first = 0;
             while first < chunk.indices.len() {
@@ -128,7 +117,6 @@ impl<'e, 'a> MiniMaxBackend<'e, 'a> {
                 first = end;
             }
         }
-        let batch = BatchView { positions, slots, requests, pool_pages: self.cache.pages };
         let started = std::time::Instant::now();
         let kind = if prefill { cuteafd_transport::ExpertV2SourceKind::Prefill }
             else { cuteafd_transport::ExpertV2SourceKind::Decode };

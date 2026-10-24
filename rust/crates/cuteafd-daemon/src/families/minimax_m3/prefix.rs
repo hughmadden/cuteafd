@@ -96,6 +96,9 @@ mod tests {
             let restored = shared.admit(&family, &longer, len + 1, false, placement)?;
             assert_eq!(restored.resume, len);
             assert_eq!(restored.placement.committed, len);
+            // The continuation's append wave passes the serving checks (golden's prefix check runs it).
+            let mut continuation = restored.placement.clone();
+            super::super::transaction::Step::begin(&[(&mut continuation, &[99])], shared.pool(), 2, 64, 256, 16)?;
             for logical in 0..len.div_ceil(64) {
                 let (from, to) = (source.pages[logical], restored.placement.pages[logical]);
                 let rows = (len - logical * 64).min(64);
