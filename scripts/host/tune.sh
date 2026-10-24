@@ -117,7 +117,7 @@ swap_policy() {
     if ((LIVE)); then
         # Include installed, generated, active, and fstab-derived units.
         if installed=$(timeout 10s systemctl list-unit-files --type=swap --no-legend --no-pager 2>/dev/null) &&
-            loaded=$(timeout 10s systemctl list-units --all --type=swap --no-legend --no-pager 2>/dev/null); then
+            loaded=$(timeout 10s systemctl list-units --all --type=swap --no-legend --no-pager --plain 2>/dev/null); then
             units=$(printf '%s\n%s\n' "$installed" "$loaded" | awk '$1 ~ /[.]swap$/ {print $1}' | sort -u)
             for source in "${fstab_sources[@]}"; do
                 if [[ $source == /* ]]; then
