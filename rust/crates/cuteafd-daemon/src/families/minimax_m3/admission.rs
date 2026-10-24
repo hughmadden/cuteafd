@@ -18,6 +18,8 @@ pub(super) struct Request {
     pub spark_budget: u64,
     pub headroom: u64,
     pub draft_bytes: u64,
+    /// Drafter context rings (0 without the drafter): bounds the verify rows.
+    pub draft_rings: usize,
     pub host_embedding: bool,
 }
 
@@ -30,6 +32,8 @@ pub(super) struct Admitted {
     pub weights: RankWeightLayout,
     pub local_capacity: Option<usize>,
     pub spark_capacity: usize,
+    /// Decode steps the warm-up records before ready; their bytes are reserved.
+    pub graphs: cuteafd_loader::placement::inventory::StartupGraphs<usize>,
     reservations: Reservations,
 }
 
@@ -72,15 +76,16 @@ pub(super) fn solve(checkpoint: &Checkpoint, programs: &serde_json::Value,
             .min().context("MiniMax TP1 package row capacity")?;
         (bytes, Some(usize::try_from(capacity)?))
     };
+    let graphs = admission::decode_graphs(request.sizing, request.draft_rings)?;
     let mut reservations = Reservations { weights: weights.resident_bytes.checked_add(request.draft_bytes).context("MiniMax draft admission overflow")?, local_experts: onboard.local_bytes,
-        expert_workspace, headroom: request.headroom, ..Default::default() };
+        expert_workspace, headroom: request.headroom, graphs: graphs.inventory.bytes(0), ..Default::default() };
     reservations.startup = reservations.fixed_bytes(&ledger)?.checked_add(admission::scale_prep_staging_bytes(&weights))
         .context("MiniMax load peak overflow")?;
     let cache = admission::admit(&cfg, request.sizing, &ledger, reservations, request.available,
         request.requested_pool, request.kv_format)?;
     ensure!(cache.total_bytes <= request.available, "MiniMax admission exceeded its measured free bytes");
     Ok(Admitted { cache, ledger, programs, local_layers: onboard.local_layers, spark_layers: onboard.spark_layers,
-        weights, local_capacity, spark_capacity: request.sizing.rows, reservations })
+        weights, local_capacity, spark_capacity: request.sizing.rows, graphs, reservations })
 }
 
 #[cfg(test)]
@@ -121,12 +126,16 @@ mod tests {
         ensure!(report.placement_supported, "{:?}", report.hints);
         let memory = report.memory_layout.as_ref().unwrap();
         let device = memory.devices.iter().find(|d| d.kind == cuteafd_core::memory_layout::DeviceKind::Rtx).unwrap();
-        let measured_baseline: u64 = device.items.iter().filter(|i| i.category == cuteafd_core::memory_layout::Category::Runtime)
-            .map(|i| i.bytes).sum();
+        // The planner's runtime items the live sample already holds (context,
+        // code); the startup graphs are admitted on top of it, as the server does.
+        let graph_groups = ["graphs", cuteafd_loader::placement::inventory::GRAPH_GROWTH];
+        let measured_baseline: u64 = device.items.iter().filter(|i| i.category == cuteafd_core::memory_layout::Category::Runtime
+            && !graph_groups.contains(&i.group.as_str())).map(|i| i.bytes).sum();
         let mut live = solve(&checkpoint, &programs, None, Request {
             sizing: RuntimeSizing { rows: 256, decode_rows: 64, sequences: 16, context: 4096, spark_ranks: 3, logit_rows: 64 },
             available: options.rtx_bytes[0] - measured_baseline, requested_pool: Some(4096),
-            kv_format: Qwen4KvCache::Fp8, onboard: None, spark_budget: 108 << 30, headroom: 0, draft_bytes:0, host_embedding,
+            kv_format: Qwen4KvCache::Fp8, onboard: None, spark_budget: 108 << 30, headroom: 0, draft_bytes:0,
+            draft_rings: 0, host_embedding,
         })?;
         assert_eq!(live.cache.total_bytes + measured_baseline, device.used_bytes());
         assert_eq!(live.cache.pool_tokens, memory.pool_tokens);
@@ -134,6 +143,10 @@ mod tests {
         assert!(live.weights.operands.iter().any(|o| o.name == "language_model.lm_head.weight"));
         assert!(live.local_layers.is_empty());
         assert_eq!(live.spark_layers, (3..60).collect::<Vec<_>>());
+        // The same decode graph keys are recorded by the server and charged by both ledgers.
+        assert_eq!(live.graphs.keys, (1..=16).collect::<Vec<_>>());
+        let charged: u64 = device.items.iter().filter(|i| graph_groups.contains(&i.group.as_str())).map(|i| i.bytes).sum();
+        assert_eq!(charged, live.graphs.inventory.bytes(0));
         assert_eq!(live.ledger.bytes("head_workspace"), Some(cuteafd_ffi::programs::VOCABULARY_HEAD_WORKSPACE as u64));
         let cfg = MiniMaxM3Config::from_hf(&checkpoint.config)?;
         assert!(live.readmit(&cfg, RuntimeSizing { rows: 256, decode_rows: 64, sequences: 16, logit_rows: 64,

@@ -204,7 +204,14 @@ fn native_manifest_admits_bundled_dspark_and_charges_its_full_layout() {
         .find(|d| d.kind == DeviceKind::Rtx).unwrap().clone();
     let (off_rtx, on_rtx) = (rtx(&off), rtx(&on));
     assert!(off_rtx.items.iter().all(|i| i.category != Category::Drafter));
-    assert_eq!(on_rtx.used_bytes() - off_rtx.used_bytes(), draft.bytes);
+    // Drafting verifies up to eight rows per ring: rows 1..=64 are recorded instead of 1..=16.
+    let graphs = |device: &cuteafd_core::memory_layout::DeviceLayout| device.items.iter()
+        .filter(|i| ["graphs", crate::placement::inventory::GRAPH_GROWTH].contains(&i.group.as_str())).map(|i| i.bytes).sum::<u64>();
+    let sizing = |sequences| admission::RuntimeSizing { rows: 256, decode_rows: 64, sequences, context: 1 << 20,
+        spark_ranks: 3, logit_rows: 64 };
+    assert_eq!(graphs(&off_rtx), admission::decode_graphs(sizing(16), 0).unwrap().inventory.bytes(0));
+    assert_eq!(graphs(&on_rtx), admission::decode_graphs(sizing(16), draft.slots).unwrap().inventory.bytes(0));
+    assert_eq!(on_rtx.used_bytes() - off_rtx.used_bytes(), draft.bytes + graphs(&on_rtx) - graphs(&off_rtx));
     assert_eq!(on_rtx.items.iter().filter(|i| i.category == Category::Drafter).map(|i| i.bytes).sum::<u64>(), draft.bytes);
     assert_eq!(on.bytes_by_owner["bundled DSpark weights"], draft.weights_bytes);
     assert_eq!(on.memory_layout.as_ref().unwrap().pool_tokens, 16384);

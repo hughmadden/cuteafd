@@ -162,7 +162,7 @@ fn worker(args: &ServeArgs, receive: &mut tokio::sync::mpsc::Receiver<cuteafd_ap
         let free = available()?;
         let text = admission::solve(&checkpoint, &manifest, local_package.as_ref(), admission::Request {
             sizing, available: free, requested_pool: None, kv_format: args.kv_cache, onboard,
-            spark_budget: args.spark_budget_bytes, headroom, draft_bytes,
+            spark_budget: args.spark_budget_bytes, headroom, draft_bytes, draft_rings,
             host_embedding: args.token_io.embed_placement == EmbedPlacement::Host })?;
         let vision_bytes = ReadyVision::local_bytes(&args.snapshot, &args.native_lib)?;
         let cache_target = args.pool_tokens.filter(|n| *n > 0).unwrap_or(262_144)
@@ -181,7 +181,7 @@ fn worker(args: &ServeArgs, receive: &mut tokio::sync::mpsc::Receiver<cuteafd_ap
         let remote_reserve = vision.as_ref().map_or(0, |v| v.spark_reserve_bytes);
         admission::solve(&checkpoint, &manifest, local_package.as_ref(), admission::Request {
             sizing, available, requested_pool: args.pool_tokens, kv_format: args.kv_cache, onboard,
-            spark_budget: args.spark_budget_bytes.saturating_sub(remote_reserve), headroom, draft_bytes,
+            spark_budget: args.spark_budget_bytes.saturating_sub(remote_reserve), headroom, draft_bytes, draft_rings,
             host_embedding: args.token_io.embed_placement == EmbedPlacement::Host })?
     };
     let mut catalog = cuteafd_loader::read_expert_catalog(&args.snapshot)?;
@@ -224,12 +224,23 @@ fn worker(args: &ServeArgs, receive: &mut tokio::sync::mpsc::Receiver<cuteafd_ap
         experts: RefCell::new(Routed::new(local, spark)?), rows: sizing.rows, vocabulary: cfg.vocab_size, expander,
         pending: RefCell::new(None), timing: RefCell::new([0.0; 2]), probe: RefCell::new(crate::shared::draft::routes::RoundRoutes::new(1,4)),
         rings: RefCell::new(super::backend::Rings::new(sizing.sequences, rings)), full_prefill_logits: args.full_prefill_logits,
-        trace: RefCell::new(super::diagnostics::LogitTrace::from_env()?) };
+        trace: RefCell::new(super::diagnostics::LogitTrace::from_env()?),
+        startup_captures: std::cell::Cell::new(None) };
+    // Every decode row count the scheduler can form, recorded before ready
+    // against these buffers and this expert owner (the admitted inventory).
+    let graphs = &admitted.graphs;
+    let recorded = execution.warm_graphs(&graphs.keys, &backend.embedded, &cache.layers, cache.pages,
+        &mut *backend.experts.borrow_mut())?;
+    tracing::info!(executables = graphs.keys.len(), measured_bytes = recorded, reserved_bytes = graphs.inventory.bytes(0),
+        bytes_per_executable = recorded.div_ceil(graphs.keys.len().max(1) as u64), reserve = "estimated",
+        "MiniMax startup graph census");
+    anyhow::ensure!(recorded <= graphs.inventory.bytes(0), "MiniMax startup graphs exceed their admitted reserve");
+    backend.startup_captures.set(Some(cuteafd_ffi::graph_captures()));
     let (encoder, preparer, media_bytes) = vision.map_or((Encoder::Off, None, 0), |v| (v.encoder, Some(v.preparer), v.cache_bytes));
     let mut media = cuteafd_engine::media::MediaAdmission::new(cuteafd_engine::media::EmbeddingCache::new(media_bytes), encoder, 16);
     tracing::info!(pool_tokens=admitted.cache.pool_tokens, context=cache.context, local_layers=?admitted.local_layers,
         rows=sizing.rows, logit_rows=sizing.logit_rows, draft_rings,
-        "MiniMax native eager target; prefill uses the MSA index-prefill and attention-extend kernels");
+        "MiniMax native target; decode replays its startup recordings, prefill uses the MSA index-prefill and attention-extend kernels");
     let drafts=if args.speculator=="dspark" {scheduler::Drafts::Neural {depth:7,fixed:false}} else {scheduler::Drafts::None};
     scheduler::schedule(&backend, &args.snapshot, receive, stats, sizing.sequences, drafts,
         eos, args.decode_share, &prefix, args.token_io.token_select, &mut media, None,

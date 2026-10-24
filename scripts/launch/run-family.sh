@@ -720,9 +720,9 @@ if [[ "${CUTEAFD_GRAPH_CENSUS:-}" == 1 ]]; then
 fi
 if [[ -n "${CUTEAFD_GRAPH_EAGER:-}" ]]; then
   [[ -n "$wip_layout" ]] || { printf '%s\n' 'Graph eager override requires a WIP build' >&2; exit 2; }
-  [[ "$CUTEAFD_GRAPH_EAGER" == layer_row ]] || { printf '%s\n' 'Graph eager override must be layer_row' >&2; exit 2; }
+  [[ "$CUTEAFD_GRAPH_EAGER" == layer_row || "$CUTEAFD_GRAPH_EAGER" == minimax_step ]] || { printf '%s\n' 'Graph eager override must be layer_row or minimax_step' >&2; exit 2; }
   [[ "${CUTEAFD_GRAPH_CENSUS:-}" != 1 ]] || { printf '%s\n' 'Graph eager A/B requires census timing disabled' >&2; exit 2; }
-  graph_census_args+=(-e CUTEAFD_GRAPH_EAGER=layer_row)
+  graph_census_args+=(-e "CUTEAFD_GRAPH_EAGER=$CUTEAFD_GRAPH_EAGER")
 fi
 }
 # API keys, the live console and usage records: arguments for the serve command

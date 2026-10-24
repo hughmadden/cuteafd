@@ -303,10 +303,12 @@ fn exact_layout(model: &Model, input: &crate::plan::PlanInput, report: &mut Plan
         .context("MiniMax onboarded layers require fp8-minimax-nvfp4a4/manifest.json")?, 1, rows)? } else { 0 };
     let program_set = ProgramSet::from_manifest(&manifest, &["minimax"]);
     let code = inventory::loaded_code_allowance("minimax", "fp8-minimax-nvfp4a4", false, 0, &arch, Some(&program_set)).bytes;
+    // The serving warm-up records exactly these keys before ready.
+    let graphs = admission::decode_graphs(sizing, draft.as_ref().map_or(0, |d| d.slots))?;
     let mut reservations = Reservations { weights: weights.resident_bytes.checked_add(draft.as_ref().map_or(0, |d| d.bytes))
             .context("MiniMax drafter reservation overflow")?, local_experts: local,
         expert_workspace: local_scratch, pending_code: code, runtime_baseline: arch.context_bytes,
-        headroom: opts.headroom_bytes, ..Default::default() };
+        headroom: opts.headroom_bytes, graphs: graphs.inventory.bytes(0), ..Default::default() };
     let fixed = reservations.fixed_bytes(&ledger)?;
     let hardware = EncoderHardware { v41: false, gpus: vec![EncoderGpuBudget {
         free_bytes: opts.rtx_bytes[0].saturating_sub(fixed),
@@ -331,6 +333,7 @@ fn exact_layout(model: &Model, input: &crate::plan::PlanInput, report: &mut Plan
         Item::new(Category::Runtime, "pending program code", "", code, Basis::Estimated),
         Item::new(Category::Reserved, "coordinator headroom", "", opts.headroom_bytes, Basis::Formula),
     ];
+    items.extend(graphs.inventory.items(0).into_iter().map(|item| Item { basis: Basis::Estimated, ..item }));
     for allocation in &ledger.allocations { items.push(Item::new(Category::Workspace,
         format!("MiniMax {}", allocation.name), "native allocation", allocation.bytes, Basis::Exact)); }
     if let Some(draft) = &draft {
@@ -351,8 +354,9 @@ fn exact_layout(model: &Model, input: &crate::plan::PlanInput, report: &mut Plan
     items.push(Item::new(Category::Kv, "separate FP8 K/V planes + packed MSA index", "64-token pages", admitted.cache_bytes, Basis::Exact));
     let mut memory = MemoryLayout { devices: vec![DeviceLayout { kind: DeviceKind::Rtx, index: 0,
         capacity_bytes: opts.rtx_bytes[0], items, kv_tokens: admitted.pool_tokens }], pool_tokens: admitted.pool_tokens,
-        waste: vec![], notes: vec![format!("MiniMax coordinator native allocation ledger; causal paged MSA tiles; zero graphs; speculation {}",
-            if draft.is_some() { "bundled DSpark" } else { "off" }),
+        waste: vec![], notes: vec![format!("MiniMax coordinator native allocation ledger; {} decode steps recorded at startup \
+            (rows 1..={}, estimated {} MiB each); speculation {}", graphs.keys.len(), graphs.keys.len(),
+            admission::DECODE_GRAPH_BYTES >> 20, if draft.is_some() { "bundled DSpark" } else { "off" }),
             "Offline CUDA/code baselines remain estimates; serving re-admits measured free memory before allocation".into(),
             format!("{onboard} routed layers on the RTX ({:.1} GiB), {} on {} Sparks", local as f64 / GIB as f64, layers.len() - onboard, sizing.spark_ranks)] };
     report.bytes_by_owner.clear();
