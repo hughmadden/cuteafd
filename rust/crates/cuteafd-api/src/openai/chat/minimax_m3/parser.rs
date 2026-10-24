@@ -200,7 +200,7 @@ fn invoke(text: &str, tools: &[ToolDefinition]) -> Result<(String, Value), &'sta
     let schema = tools.iter().find(|t| t.name == name).map(|t| &t.parameters).unwrap_or(&Value::Null);
     let mut arguments = Map::new();
     for node in nodes(rest, 0).ok_or("malformed parameters")? {
-        let value = typed(&node, &schema["properties"][&node.name], schema, 0).ok_or("a value does not fit its schema")?;
+        let value = typed(&node, field(schema, &node.name), schema, 0).ok_or("a value does not fit its schema")?;
         if arguments.insert(node.name, value).is_some() { return Err("repeated parameter"); }
     }
     Ok((name.to_owned(), arguments.into()))
@@ -246,39 +246,64 @@ fn typed(node: &Node<'_>, schema: &Value, root: &Value, depth: usize) -> Option<
     for key in ["anyOf", "oneOf"] {
         if let Some(branches) = schema[key].as_array() {
             // Prefer explicit strings for a leaf, as the other XML families do.
-            if node.children.is_empty() && branches.iter().any(|s| s["type"] == "string") {
+            if node.children.is_empty() && branches.iter().any(|s| types(s).contains(&"string")) {
                 return Some(node.raw.to_owned().into());
             }
             return branches.iter().find_map(|s| typed(node, s, root, depth + 1));
         }
     }
-    let kind = schema["type"].as_str();
-    if kind == Some("array") || (!node.children.is_empty() && kind.is_none() && node.children.iter().all(|n| n.name == "item")) {
-        if node.children.is_empty() && !node.raw.trim().is_empty() { return None; }
+    let kinds = types(schema);
+    if node.children.is_empty() {
+        // An enum/const member by its JSON spelling, then JSON of a declared type,
+        // then the text where a string is allowed (or no type is given).
+        let raw = node.raw.trim();
+        let json = serde_json::from_str::<Value>(raw).ok();
+        if let Some(member) = schema["enum"].as_array().into_iter().flatten().chain(schema.get("const"))
+            .find(|m| m.as_str() == Some(node.raw) || json.as_ref() == Some(*m)) { return Some(member.clone()); }
+        if let Some(value) = json.filter(|v| admits(&kinds, v)) { return Some(value); }
+        if kinds.is_empty() || kinds.contains(&"string") { return Some(node.raw.to_owned().into()); }
+        // The template renders an empty array or object as no text.
+        if !raw.is_empty() { return None; }
+        if kinds.contains(&"array") { return Some(Value::Array(Vec::new())); }
+        return kinds.contains(&"object").then(|| Map::new().into());
+    }
+    if node.children.iter().all(|n| n.name == "item") && (kinds.is_empty() || kinds.contains(&"array")) {
         return node.children.iter().enumerate().map(|(i, n)| {
-            if n.name != "item" { return None; }
             let item = schema.get("prefixItems").and_then(|v| v.get(i)).unwrap_or(&schema["items"]);
             typed(n, item, root, depth + 1)
         }).collect::<Option<Vec<_>>>().map(Value::Array);
     }
-    if kind == Some("object") || !node.children.is_empty() {
-        if kind.is_some_and(|k| k != "object") || (node.children.is_empty() && !node.raw.trim().is_empty()) { return None; }
-        let mut values = Map::new();
-        for child in &node.children {
-            let s = schema["properties"].get(&child.name).unwrap_or(&schema["additionalProperties"]);
-            if values.insert(child.name.clone(), typed(child, s, root, depth + 1)?).is_some() { return None; }
-        }
-        return Some(values.into());
+    if !kinds.is_empty() && !kinds.contains(&"object") { return None; }
+    let mut values = Map::new();
+    for child in &node.children {
+        if values.insert(child.name.clone(), typed(child, field(schema, &child.name), root, depth + 1)?).is_some() { return None; }
     }
-    if matches!(kind, Some("integer" | "number" | "boolean" | "null")) {
-        let value: Value = serde_json::from_str(node.raw.trim()).ok()?;
-        return match kind? {
-            "integer" if value.is_i64() || value.is_u64() => Some(value),
-            "number" if value.is_number() => Some(value),
-            "boolean" if value.is_boolean() => Some(value),
-            "null" if value.is_null() => Some(value),
-            _ => None,
-        };
+    Some(values.into())
+}
+
+/// `type` as a set: `["integer", "null"]` is the strict-mode spelling of an optional field.
+fn types(schema: &Value) -> Vec<&str> {
+    match &schema["type"] {
+        Value::String(kind) => vec![kind.as_str()],
+        Value::Array(kinds) => kinds.iter().filter_map(Value::as_str).collect(),
+        _ => Vec::new(),
     }
-    Some(node.raw.to_owned().into())
+}
+
+/// Whether leaf text read as JSON has a declared type; a string is the text itself, never its JSON reading.
+fn admits(kinds: &[&str], value: &Value) -> bool {
+    kinds.iter().any(|&kind| match kind {
+        "integer" => value.is_i64() || value.is_u64(),
+        "number" => value.is_number(),
+        "boolean" => value.is_boolean(),
+        "null" => value.is_null(),
+        "array" => value.is_array(),
+        "object" => value.is_object(),
+        _ => false,
+    })
+}
+
+/// A property's schema, else the object's `additionalProperties`.
+fn field<'a>(schema: &'a Value, name: &str) -> &'a Value {
+    schema["properties"].get(name).unwrap_or(&schema["additionalProperties"])
 }

@@ -300,6 +300,28 @@ fn calls_parse_with_schema_types_at_every_split() {
 }
 
 #[test]
+fn type_sets_enums_consts_and_additional_properties_type_values() {
+    let schema = json!({"type": "object", "additionalProperties": {"type": "integer"}, "properties": {
+        "days": {"type": ["integer", "null"]}, "note": {"type": ["string", "null"]}, "unit": {"enum": ["c", "f"]},
+        "level": {"enum": [1, 2, 3]}, "answer": {"const": 42}, "flag": {"type": ["boolean", "null"]},
+        "list": {"type": ["array", "null"], "items": {"type": ["number", "null"]}},
+        "opts": {"type": ["object", "null"], "properties": {"n": {"type": ["integer", "null"]}}}}});
+    let tools = vec![tool("t", schema)];
+    let call = |params: &[String]| parse_everywhere(&options(Some(tools.clone())), &block(&[invoke("t", params)])).calls;
+    assert_eq!(call(&[param("days", "3"), param("note", "Oslo"), param("unit", "c"), param("level", "2"), param("answer", "42"),
+        param("flag", "true"), param("list", &format!("{NS}<item>1.5{NS}</item>{NS}<item>null{NS}</item>")),
+        param("opts", &format!("{NS}<n>7{NS}</n>")), param("extra", "9")]),
+        vec![("t".into(), json!({"days": 3, "note": "Oslo", "unit": "c", "level": 2, "answer": 42, "flag": true,
+            "list": [1.5, null], "opts": {"n": 7}, "extra": 9}))]);
+    // JSON of a type in the set wins; the text is the value only where a string is allowed.
+    assert_eq!(call(&[param("days", "null"), param("note", "null"), param("flag", "null"), param("list", "null"), param("opts", "null")]),
+        vec![("t".into(), json!({"days": null, "note": null, "flag": null, "list": null, "opts": null}))]);
+    for (key, value) in [("days", "three"), ("extra", "nine"), ("flag", "yes"), ("list", "a, b")] {
+        assert!(call(&[param(key, value)]).is_empty(), "{key}={value}");
+    }
+}
+
+#[test]
 fn rendered_tool_calls_round_trip_through_the_parser() {
     let arguments = json!({"city": "Oslo", "days": 3, "tags": ["x", "y"], "range": {"lo": 1, "hi": 2}, "metric": false});
     let context = json!({"messages": [{"role": "user", "content": "w"}, {"role": "assistant", "content": "",
@@ -649,6 +671,28 @@ mod router {
         assert_eq!(elements[0]["type"], "optional");
         assert_eq!(elements[1]["begin"], CALL_OPEN);
         assert_eq!(elements[1]["content"]["elements"][1]["tags"][0]["begin"], "]<]minimax[>[<invoke name=\"get_weather\">");
+    }
+
+    #[tokio::test]
+    async fn strict_tool_calls_with_nullable_fields_pass_validation() {
+        // OpenAI strict mode: every field is required and optional ones are nullable by a type set.
+        let parameters = json!({"type": "object", "additionalProperties": false, "required": ["city", "days", "unit", "tags"],
+            "properties": {"city": {"type": "string"}, "days": {"type": ["integer", "null"]},
+                "unit": {"type": ["string", "null"], "enum": ["c", "f", null]},
+                "tags": {"type": ["array", "null"], "items": {"type": "string"}}}});
+        let body = json!({"model": MODEL, "messages": [{"role": "user", "content": "Weather?"}],
+            "tools": [{"type": "function", "function": {"name": "get_weather", "strict": true, "parameters": parameters}}]});
+        let reply = block(&[invoke("get_weather", &[param("city", "Oslo"), param("days", "3"), param("unit", "c"),
+                param("tags", &format!("{NS}<item>a{NS}</item>"))]),
+            invoke("get_weather", &[param("city", "Bergen"), param("days", "null"), param("unit", "null"), param("tags", "null")])]);
+        let (status, bytes, seen) = serve(body, &reply).await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&bytes));
+        assert!(seen.constraint.is_some());
+        let value: Value = serde_json::from_slice(&bytes).unwrap();
+        let calls: Vec<Value> = value["choices"][0]["message"]["tool_calls"].as_array().unwrap().iter()
+            .map(|c| serde_json::from_str(c["function"]["arguments"].as_str().unwrap()).unwrap()).collect();
+        assert_eq!(calls, [json!({"city": "Oslo", "days": 3, "unit": "c", "tags": ["a"]}),
+            json!({"city": "Bergen", "days": null, "unit": null, "tags": null})]);
     }
 
     #[tokio::test]
