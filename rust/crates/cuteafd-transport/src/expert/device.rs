@@ -297,6 +297,7 @@ impl SparkDeviceLane {
             let mut expected = ready_word.load(Ordering::Acquire);
             done_word.store(expected, Ordering::Release);
             let mut last = Instant::now();
+            let mut last_done = Instant::now();
             let mut stalled_logged = false;
             while !state.stop.load(Ordering::Relaxed) {
                 let published = ready_word.load(Ordering::Acquire);
@@ -397,8 +398,12 @@ impl SparkDeviceLane {
                 })();
                 // The request's egress view is gone; once its sends drain, the
                 // GPU may write the next wave there (after the completion below).
+                let received = Instant::now();
                 let result = result.and_then(|()| if egress.is_some() { transport.egress_target().map(|_| ()) }
                     else { Ok(()) });
+                tracing::debug!(target: "cuteafd::device_lane", sequence = published,
+                    gpu_us = (seen - last_done).as_micros() as u64, handled_us = (received - seen).as_micros() as u64,
+                    drained_us = received.elapsed().as_micros() as u64, "device lane wave");
                 if let Err(error) = result {
                     tracing::error!("device Spark wave failed: {error:#}");
                     let mut slot = state.error.lock().unwrap_or_else(|p| p.into_inner());
@@ -409,6 +414,7 @@ impl SparkDeviceLane {
                 // Release: the landed planes (and this thread's copies) are
                 // complete before the GPU sees the sequence.
                 done_word.store(expected, Ordering::Release);
+                last_done = Instant::now();
                 let completed = state.completed.fetch_add(1, Ordering::Release) + 1;
                 if completed >= 1024 && completed.is_power_of_two() {
                     let per = |ns: &AtomicU64| ns.load(Ordering::Relaxed) as f64 / 1e3 / completed as f64;
