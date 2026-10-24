@@ -626,7 +626,10 @@ impl Opened {
         let variants = if args.variants.is_empty() { None } else {
             ensure!(devices.len() == 1 && owners.is_none() && !native,
                 "weight variants need one coordinator GPU (no head split, layer owners or EXLR8 native dense) for now");
-            Some(variants::derive(&self.snapshot, &args.served_id, &args.variants, self.cfg.hidden)?)
+            cuteafd_bench::context::phase("variant derivation started");
+            let derived = variants::derive(&self.snapshot, &args.served_id, &args.variants, self.cfg.hidden)?;
+            cuteafd_bench::context::phase("variant derivation complete");
+            Some(derived)
         };
         let variant_bytes = variants.as_ref().map_or(0, |v| v.bytes);
         let gpus = inventory.gpus.iter().zip(&reserved_weights).enumerate().map(|(rank, (gpu, &bytes))| -> Result<_> {

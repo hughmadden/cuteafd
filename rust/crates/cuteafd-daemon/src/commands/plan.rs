@@ -810,7 +810,8 @@ mod tests {
         let site = SiteKey {layer:1,kind:SiteKind::SharedExpert};
         let plan = VariantPlan::new(7,"keys","m-keys",128,vec![(site,SiteOp::rank1(2.0,&vec![0.5;128]))]).unwrap();
         let outcome = cuteafd_loader::variants::VariantOutcome {name:"keys".into(),public_id:"m-keys".into(),plan:Some(plan),
-            rejection:None,rejection_kind:None,mode:"shared-only".into(),verdicts:vec![],missing_in_base:vec![],seconds:0.0};
+            rejection:None,rejection_kind:None,mode:"shared-only".into(),verdicts:vec![],missing_in_base:vec![],seconds:0.0,
+            payload_bytes_read:0};
         let cli = crate::cli::Cli::try_parse_from(["cuteafd","plan","/not-read","--layout"]).unwrap();
         let crate::cli::Commands::Plan(args) = cli.command else {panic!()};
         let mut selected = options(&args).unwrap();
