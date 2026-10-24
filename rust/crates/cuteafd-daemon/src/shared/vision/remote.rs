@@ -34,6 +34,12 @@ pub struct EncoderHandshake {
     pub plan_hash: [u8; 32],
 }
 impl EncoderHandshake {
+    /// What a peer hosting `spec` answers, and so what a coordinator expects of it.
+    pub fn for_tower(spec: &super::TowerSpec, encoder_id: EncoderId, processor: &cuteafd_loader::media::ProcessorConfig,
+        plan_hash: [u8; 32]) -> Self {
+        Self { encoder_id, max_patches: spec.native.max_tokens * processor.merge.pow(2),
+            output_width: spec.native.output_width, patch_size: processor.patch, merge_size: processor.merge, plan_hash }
+    }
     fn validate(&self) -> Result<()> {
         if self.max_patches == 0
             || self.max_patches > MAX_PATCHES
@@ -113,11 +119,9 @@ impl EncoderHandshake {
     }
     fn validate_video_geometry(&self, grid: [u32; 3], tokens: u64, len: u64) -> Result<()> {
         self.validate_minimax()?;
-        let [t, h, w] = grid;
-        let patches = u64::from(h).checked_mul(u64::from(w))
-            .and_then(|n| n.checked_mul(u64::from(t))).ok_or(MediaError::Features)?;
-        if !(1..=4).contains(&t) || h == 0 || w == 0 || h % 2 != 0 || w % 2 != 0
-            || patches > u64::from(self.max_patches) || tokens != patches / 4
+        let patches = cuteafd_core::media::video_segment_patches(grid)
+            .ok_or_else(|| error("invalid video frame before allocation"))?;
+        if patches > u64::from(self.max_patches) || tokens != patches / 4
             || len != self.input_bytes(patches).saturating_mul(2) {
             return Err(error("invalid video frame before allocation"));
         }
@@ -643,11 +647,9 @@ impl EncoderServer {
                 let started = Instant::now();
                 let output = vec![0; job.tokens * job.hidden_width];
                 let ticket = match &job.input {
-                    EncodeInput::Image { grid, rgb8 } => service.submit(NativeJob {
-                        rgb: rgb8.clone(), grid: [grid[1] as usize, grid[2] as usize],
-                        lut: lut.clone(), output }),
-                    EncodeInput::Video { grid, rgb8 } => service.submit_video(super::VideoEncodeJob {
-                        rgb: rgb8.clone(), grid: grid.map(|n| n as usize), lut: lut.clone(), output }),
+                    EncodeInput::Image { grid, rgb8 } | EncodeInput::Video { grid, rgb8 } => service.submit(NativeJob {
+                        rgb: rgb8.clone(), grid: grid.map(|n| n as usize),
+                        video: matches!(job.input, EncodeInput::Video { .. }), lut: lut.clone(), output }),
                     _ => return Err(error("vision peer refuses audio")),
                 }.map_err(error)?;
                 // The owner retains all buffers until its stream has drained, even
@@ -953,8 +955,8 @@ mod tests {
         let (queue, jobs) = mpsc::sync_channel::<super::super::Work>(2);
         let owner = thread::spawn(move || {
             while let Ok(work) = jobs.recv() {
-                let super::super::EncoderJob::Video(mut job) = work.job else { panic!("expected video job") };
-                assert!(matches!(job.grid, [1..=4, 2, 2]));
+                let super::super::EncoderJob::Vision(mut job) = work.job else { panic!("expected vision job") };
+                assert!(job.video && matches!(job.grid, [1..=4, 2, 2]));
                 assert_eq!(job.rgb.len(), job.grid[0] * 2 * 28 * 28 * 3);
                 assert!(job.rgb.iter().all(|&b| b == 6));
                 job.output.fill(0x3f80);

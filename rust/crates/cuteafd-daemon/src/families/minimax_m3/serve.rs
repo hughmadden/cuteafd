@@ -1,6 +1,6 @@
 //! Single coordinator startup: validate, admit, load, bind, schedule.
 use super::{admission::{self, RuntimeSizing}, backend::MiniMaxBackend, cache::Cache,
-    execution::Execution, media::{ReadyVision, RemoteVision}, routed::Routed, MiniMaxError};
+    execution::Execution, media::ReadyVision, routed::Routed, MiniMaxError};
 use crate::shared::{memory::device::Device, placement::{SparkAdmission, spark_rings},
     prefix::PrefixArgs, qwen::{Encoder, scheduler::{self, Backend}},
     token_io::{EmbedPlacement, EmbedSource, TokenEmbedding, TokenIoArgs}};
@@ -157,7 +157,8 @@ fn worker(args: &ServeArgs, receive: &mut tokio::sync::mpsc::Receiver<cuteafd_ap
         Ok(cuteafd_ffi::coordinator_gpu_budget().map_or(free as u64, |b|
             (free as u64).min(b.0.saturating_sub((total - free) as u64))))
     };
-    let remote = RemoteVision::parse(args.vision_peers.as_deref(), args.encoder_plan_hash.as_deref(), args.encoder_revision.as_deref())?;
+    let remote = crate::shared::vision::startup::RemotePeers::parse(args.vision, args.vision_peers.as_deref(),
+        args.encoder_plan_hash.as_deref(), args.encoder_revision.as_deref())?;
     let (vision_mode, text_admission) = if args.vision == MediaMode::Auto && remote.is_none() {
         let free = available()?;
         let text = admission::solve(&checkpoint, &manifest, local_package.as_ref(), admission::Request {
@@ -219,7 +220,7 @@ fn worker(args: &ServeArgs, receive: &mut tokio::sync::mpsc::Receiver<cuteafd_ap
     let world = SparkWorld::canonical(args.peers.len())?;
     let spark = admitted.spark_layers.first().map(|&first| super::routed::Spark::connect(&library, args.device, world,
         &args.peers, sizing.rows, config, first, request)).transpose()?;
-    let expander = vision.as_ref().map(|_| cuteafd_loader::media::minimax::span_expander(&args.snapshot, cfg.vocab_size as u32, false)).transpose()?;
+    let expander = vision.as_ref().map(|_| cuteafd_loader::media::minimax::span_expander(&args.snapshot, cfg.vocab_size as u32)).transpose()?;
     let backend = MiniMaxBackend { execution: &execution, cache: &cache, embedding: &embedding, token_ids, embedded,
         experts: RefCell::new(Routed::new(local, spark)?), rows: sizing.rows, vocabulary: cfg.vocab_size, expander,
         pending: RefCell::new(None), timing: RefCell::new([0.0; 2]), probe: RefCell::new(crate::shared::draft::routes::RoundRoutes::new(1,4)),

@@ -285,6 +285,12 @@ mod scoring_workspace_tests {
     use super::*;
 
     #[test]
+    fn minimax_vision_scratch_matches_the_native_ledger() {
+        // native/tests/vision_minimax_contract_selftest.cc: scratch 758,189,312 + 4 MiB BLAS.
+        assert_eq!(minimax_vision_scratch_bytes(), 758_189_312 + 4 * MIB);
+    }
+
+    #[test]
     fn unknown_package_runtime_item_uses_manifest_formula() {
         let manifest = serde_json::json!({"programs":[{"name":"qwen4_decode"}]});
         let item = runtime_item(Some(&manifest), &["qwen4".into()], "unmeasured", false, 0, 96 << 30);
@@ -1068,6 +1074,16 @@ pub(crate) fn qwen_scratch_bytes(tokens: u64) -> u64 {
      n*1152*2, n*1152*2, tokens*2560*2, 4096*3456*4, 4096*1152*4,
      4096*4304*4, 4096*4304*2, 4096*4608*4, 4096*4608*2, 4096*2560*4,
      n*16*16*3, 3*256*4, n*2*4, n*4*4, n*4*4, 16384*16*4, 2*4, 4*MIB]
+        .into_iter().map(|b| b.div_ceil(256)*256).sum()
+}
+
+/// Mirrors scratch_minimax at the tower's 4096-token capacity (16,384 patches), with the
+/// fixed 1024-row GEMM staging, LSE and the BLAS workspace: 762,383,616 bytes.
+pub fn minimax_vision_scratch_bytes() -> u64 {
+    let (n, chunk, tokens) = (4096 * 4, 1024, 4096);
+    [n*1280*4, n*1280*2, n*1176*4, n*1280*2, n*1280*2, n*1280*2, n*1280*2, tokens*6144*2, n*6144*2,
+     chunk*1280*3*4, chunk*1280*4, chunk*5120*4, chunk*5120*2, chunk*6144*4, chunk*6144*2, chunk*6144*4,
+     n*2*14*14*3, 768*4, n*3*4, 16384*16*4, 2*4, 4*MIB]
         .into_iter().map(|b| b.div_ceil(256)*256).sum()
 }
 

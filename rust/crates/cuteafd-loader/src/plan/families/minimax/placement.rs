@@ -97,7 +97,7 @@ fn header_layout(model: &Model, report: &mut PlanReport, opts: &crate::plan::lay
     let replicated = edge(Component::Router) + edge(Component::Norm) + edge(Component::Indexer) / 5;
     let drafter = if opts.native_mtp_layers > 0 { edge(Component::Speculator) } else { 0 };
     let vision = edge(Component::Vision);
-    let vision_scratch = if vision > 0 { 762_383_616 } else { 0 };
+    let vision_scratch = if vision > 0 { crate::plan::layout::minimax_vision_scratch_bytes() } else { 0 };
     // Every official tensor/vector extent is 256-byte aligned; BF16 vectors
     // expand to FP32, followed by thirteen FP32 rotary frequencies.
     let vector_bytes: u64 = model.contracts.values().filter(|c| c.role.component == Component::Vision)
@@ -278,7 +278,7 @@ fn exact_layout(model: &Model, input: &crate::plan::PlanInput, report: &mut Plan
         .map(|c| if c.shape.len() == 1 { c.shape[0] as u64 * 2 } else { 0 }
             + if c.bias { c.shape[0] as u64 * 2 } else { 0 }).sum();
     let vision_weights = if vision_source > 0 { vision_source + vector_bytes + 52 } else { 0 };
-    let vision_scratch = if vision_source > 0 { 762_383_616 } else { 0 };
+    let vision_scratch = if vision_source > 0 { crate::plan::layout::minimax_vision_scratch_bytes() } else { 0 };
     let spark_vision_reserve = if matches!(report.vision, MediaMode::Spark(_)) {
         vision_weights + vision_scratch + GIB } else { 0 };
     let endpoints = [cuteafd_core::SparkEndpoint { capacity: u32::try_from(rows)?, ingress: cuteafd_core::SparkIngress::Bf16 }];

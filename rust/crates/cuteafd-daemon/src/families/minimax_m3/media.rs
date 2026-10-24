@@ -3,8 +3,8 @@ use super::MiniMaxError;
 use anyhow::{Context, Result};
 use cuteafd_api::openai::{media::MediaPreparer, NativeRequest};
 use cuteafd_engine::media::{EncodeJob, MediaKeys, RequestMedia};
-use cuteafd_loader::{media::{ImageFamily, ProcessorConfig, SpanExpander, minimax::{ENCODER_TOKENS, MAX_SEGMENT_FRAMES}}, plan::MediaMode};
-use crate::shared::{prefix::PrefixArgs, qwen::{Encoder, scheduler::Prompt}, vision::{TowerSpec, EncoderService}};
+use cuteafd_loader::{media::{ImageFamily, ProcessorConfig, SpanExpander, minimax::ENCODER_TOKENS}, plan::MediaMode};
+use crate::shared::{prefix::PrefixArgs, qwen::{Encoder, scheduler::Prompt}, vision::{TowerSpec, startup::RemotePeers}};
 use std::{path::Path, sync::Arc};
 
 pub(super) struct ReadyVision {
@@ -13,50 +13,26 @@ pub(super) struct ReadyVision {
     pub cache_bytes: usize,
     pub spark_reserve_bytes: u64,
 }
-pub(super) struct RemoteVision {
-    peers: Vec<std::net::SocketAddr>,
-    hash: [u8; 32],
-    revision: String,
-}
-impl RemoteVision {
-    pub fn parse(peers: Option<&str>, hash: Option<&str>, revision: Option<&str>) -> Result<Option<Self>> {
-        let Some(peers) = peers else {
-            if hash.is_some() || revision.is_some() { return Err(MiniMaxError::Invalid("encoder identity without peers").into()); }
-            return Ok(None);
-        };
-        let peers = peers.split(',').map(str::parse).collect::<std::result::Result<Vec<_>, _>>()?;
-        if peers.is_empty() || peers.len() > 4 { return Err(MiniMaxError::Invalid("encoder peer count").into()); }
-        let hash = crate::shared::vision::worker::parse_plan_hash(hash.context("encoder plan hash required")?)?;
-        let revision = revision.filter(|s| !s.is_empty()).context("encoder revision required")?.to_owned();
-        Ok(Some(Self { peers, hash, revision }))
-    }
-}
 impl ReadyVision {
     pub fn local_bytes(snapshot: &Path, native: &Path) -> Result<u64> {
         let spec = TowerSpec::minimax(snapshot, ENCODER_TOKENS)?;
         Ok(cuteafd_ffi::vision::NativeVision::required(native, &spec.native)?.total_bytes())
     }
     pub fn load(snapshot: &Path, native: &Path, library: &cuteafd_ffi::NativeLibrary, device: i32,
-        mode: MediaMode, prefix: &PrefixArgs, requested_cache: Option<u64>, remote: Option<RemoteVision>) -> Result<(Option<Self>, PrefixArgs)> {
-        if mode == MediaMode::Off {
-            if remote.is_some() { return Err(MiniMaxError::Invalid("vision peers with vision off").into()); }
-            return Ok((None, prefix.clone()));
-        }
+        mode: MediaMode, prefix: &PrefixArgs, requested_cache: Option<u64>, remote: Option<RemotePeers>) -> Result<(Option<Self>, PrefixArgs)> {
+        // RemotePeers::parse refuses peers unless placement is Spark or auto.
+        if mode == MediaMode::Off { return Ok((None, prefix.clone())); }
         if let Some(remote) = remote {
-            if !matches!(mode, MediaMode::Auto | MediaMode::Spark(_)) {
-                return Err(MiniMaxError::Invalid("remote encoder placement").into());
-            }
             let spec = TowerSpec::minimax(snapshot, ENCODER_TOKENS)?;
-            let spark_reserve_bytes = spec.native.weight_bytes.checked_add(762_383_616 + (1 << 30))
+            let spark_reserve_bytes = spec.native.weight_bytes
+                .checked_add(cuteafd_loader::plan::layout::minimax_vision_scratch_bytes() + (1 << 30))
                 .context("MiniMax remote vision reservation overflow")?;
             let processor = ProcessorConfig::from_snapshot(snapshot, ImageFamily::Minimax)?;
             let (prefix, cache_bytes) = prefix.with_media_headroom(requested_cache)?;
             let id = spec.encoder_id(&remote.revision, 121);
             let preparer = Arc::new(MediaPreparer::for_loaded_encoder(processor.clone(), id, 4)?);
-            let expected = crate::shared::vision::remote::EncoderHandshake { encoder_id: id,
-                max_patches: ENCODER_TOKENS as u32 * processor.merge.pow(2), output_width: 6144,
-                patch_size: processor.patch, merge_size: processor.merge, plan_hash: remote.hash };
-            let encoder = Encoder::Remote(crate::shared::vision::remote::RemoteEncoder::connect_minimax(remote.peers,
+            let expected = crate::shared::vision::remote::EncoderHandshake::for_tower(&spec, id, &processor, remote.plan_hash);
+            let encoder = Encoder::Remote(crate::shared::vision::remote::RemoteEncoder::connect_minimax(remote.addresses,
                 expected, std::time::Duration::from_secs(60))?);
             return Ok((Some(Self { encoder, preparer, cache_bytes, spark_reserve_bytes }), prefix));
         }
@@ -71,15 +47,7 @@ impl ReadyVision {
         let info = library.cuda_device_info(device)?;
         let sm = (info.compute_capability_major * 10 + info.compute_capability_minor) as u32;
         let preparer = Arc::new(MediaPreparer::for_loaded_encoder(processor.clone(), spec.encoder_id(revision, sm), 4)?);
-        let ledger = cuteafd_ffi::vision::NativeVision::required(native, &spec.native)?;
-        library.cuda_set_device(device)?;
-        let (free, total) = library.cuda_memory_info()?;
-        cuteafd_core::serving_capacity::admit_device_reservations(95,
-            cuteafd_core::serving_capacity::DeviceMemory { device: device as u32,
-                total_bytes: total as u64, baseline_free_bytes: free as u64 },
-            &[cuteafd_core::serving_capacity::MemoryReservation {
-                name: "minimax.vision".into(), bytes: ledger.total_bytes() }])?;
-        let service = EncoderService::start(spec, native.to_path_buf(), device, ledger.total_bytes())?;
+        let (service, _) = crate::shared::vision::startup::start_local(spec, library, native, device, device)?;
         let encoder = Encoder::Local(crate::shared::vision::local::LocalEncoder::new(service, &processor, 6144, ENCODER_TOKENS));
         Ok((Some(Self { encoder, preparer, cache_bytes, spark_reserve_bytes: 0 }), prefix))
     }
@@ -116,16 +84,12 @@ pub(super) fn prepare(job: NativeRequest, tokens: Vec<u32>, expander: Option<&Sp
     let mut cursor = 0;
     for segment in &job.videos {
         let markers = expander.context("video requires the bundled encoder")?;
-        if segment.grid.t == 0 || segment.grid.t as usize > MAX_SEGMENT_FRAMES / 2
-            || segment.grid.h == 0 || segment.grid.w == 0
-            || segment.grid.h % 2 != 0 || segment.grid.w % 2 != 0 {
-            return Err(MiniMaxError::Invalid("video segment grid").into());
-        }
-        let rows = (segment.grid.h as usize).checked_mul(segment.grid.w as usize)
-            .context("video row extent overflow")? / 4;
-        if rows.checked_mul(segment.grid.t as usize) != Some(segment.tokens) {
+        let patches = cuteafd_core::media::video_segment_patches([segment.grid.t, segment.grid.h, segment.grid.w])
+            .ok_or(MiniMaxError::Invalid("video segment grid"))?;
+        if patches != segment.tokens as u64 * 4 {
             return Err(MiniMaxError::Invalid("video segment token count").into());
         }
+        let rows = segment.tokens / segment.grid.t as usize;
         for pair in 0..segment.grid.t as usize {
             let start = tokens[cursor..].iter().position(|&t| t == cuteafd_loader::media::minimax::VIDEO_TOKEN)
                 .map(|n| n + cursor).context("missing video placeholder span")?;
@@ -179,8 +143,6 @@ mod tests {
             assert!(prepare(request(Vec::new()), tokens, None, 200960, 64).is_err());
         }
         assert!(prepare(request(Vec::new()), vec![1,2], None, 200960, 1).is_err());
-        assert!(RemoteVision::parse(None, Some("aa"), None).is_err());
-        assert!(RemoteVision::parse(Some("127.0.0.1:1"), None, None).is_err());
     }
     #[test]
     fn minimax_image_features_follow_expanded_rows_across_chunks() -> Result<()> {
