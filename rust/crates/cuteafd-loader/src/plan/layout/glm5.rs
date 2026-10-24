@@ -608,7 +608,7 @@ mod tests {
     fn variant_tables_are_charged_before_placement_and_can_exhaust_admission() {
         use crate::plan::{PlanInput, PlanOptions, ExpertPlacement};
         let dir = tempfile::tempdir().unwrap();
-        write_snapshot(dir.path(), &glm5_config(), &glm5_tensors(|n,r,k| crate::plan::testing::exl3(n,r,k,4)), None);
+        write_snapshot(dir.path(), &glm5_config(), &glm5_tensors(|n,r,k| fp8(n,r,k,None)), None);
         let input = PlanInput::open(dir.path()).unwrap();
         let manifest = dir.path().join("PROGRAMS.json");
         std::fs::write(&manifest, native_manifest().to_string()).unwrap();

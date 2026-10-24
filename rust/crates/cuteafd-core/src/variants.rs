@@ -93,7 +93,6 @@ pub enum VariantError {
     Derive(String),
     #[error("tensor is unchanged")]
     Unchanged,
-
 }
 
 impl VariantPlan {
@@ -341,16 +340,17 @@ pub struct SiteTableLayout {
     pub slots: usize,
     pub k_max: usize,
     pub hidden: usize,
+    pub resident_bytes: u64,
 }
 impl SiteTableLayout {
     pub fn values(&self) -> usize { self.slots * self.k_max * self.hidden }
-    pub fn resident_bytes(&self) -> u64 {
-        (2 * (self.values() * 4).max(256) + (self.slots * 4).max(256)) as u64
-    }
+    pub fn resident_bytes(&self) -> u64 { self.resident_bytes }
 }
 pub fn site_table_layout(plans: &[VariantPlan], key: SiteKey, hidden: usize) -> SiteTableLayout {
-    SiteTableLayout { site: key, slots: plans.iter().map(|p| usize::from(p.index)).max().unwrap_or(0) + 1,
-        k_max: plans.iter().filter_map(|p| p.site(key)).map(SiteOp::rank).max().unwrap_or(0).max(1), hidden }
+    let slots = plans.iter().map(|p| usize::from(p.index)).max().unwrap_or(0) + 1;
+    let k_max = plans.iter().filter_map(|p| p.site(key)).map(SiteOp::rank).max().unwrap_or(0).max(1);
+    let resident_bytes = (2 * (slots * k_max * hidden * 4).max(256) + (slots * 4).max(256)) as u64;
+    SiteTableLayout { site: key, slots, k_max, hidden, resident_bytes }
 }
 pub fn table_layouts(plans: &[VariantPlan], hidden: usize) -> Vec<SiteTableLayout> {
     let keys: std::collections::BTreeSet<_> = plans.iter().flat_map(|p| p.sites.iter().map(|(key, _)| *key)).collect();

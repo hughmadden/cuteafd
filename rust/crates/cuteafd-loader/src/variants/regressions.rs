@@ -125,6 +125,15 @@ fn unsupported_unchanged_and_singular_are_unavailable_but_launch_errors_propagat
     let o = derive_variant(dir.path(),"m",1,&spec,1).unwrap();
     assert!(o.plan.is_none());
     assert!(o.rejection.unwrap().contains("zero base"));
+    // Nonzero base, but delta lives in a row outside its column span: U^T W
+    // is exactly singular, so an output-side operator cannot reproduce it.
+    let mut rank_deficient = zero.clone(); rank_deficient.data[..48].fill(1.0);
+    let mut outside_span = rank_deficient.clone(); outside_span.data[48..96].fill(1.0);
+    write_safetensors(&dir.path().join("model.safetensors"),&[("model.layers.1.mlp.shared_experts.down_proj.weight","F32",vec![32,48],bytes(&rank_deficient))]);
+    write_safetensors(&file,&[("model.layers.1.mlp.shared_experts.down_proj.weight","F32",vec![32,48],bytes(&outside_span))]);
+    let o = derive_variant(dir.path(),"m",1,&spec,1).unwrap();
+    assert!(o.plan.is_none());
+    assert!(o.rejection.unwrap().contains("singular"));
     let mut bad = spec.clone(); bad.source = dir.path().join("missing").display().to_string();
     assert!(derive_variant(dir.path(),"m",1,&bad,1).is_err());
     std::fs::write(dir.path().join("config.json"),"{").unwrap();
