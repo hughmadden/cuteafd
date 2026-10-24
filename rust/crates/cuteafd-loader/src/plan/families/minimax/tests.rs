@@ -81,50 +81,20 @@ fn drifted_headers_are_named() {
 }
 
 #[test]
-fn card_layouts_on_5090_and_pro_6000() {
-    let dir = snapshot(false, true);
-    let gib = |b: u64| b as f64 / (1u64 << 30) as f64;
-    let mut seen = Vec::new();
-    for (card, rtx) in [("5090", RTX_5090), ("pro6000", PRO_TOTAL_BYTES)] {
-        for ranks in [2, 3, 4] {
-            let report = plan::plan(dir.path(), &with_layout(rtx, ranks)).unwrap();
-            let memory = report.memory_layout.as_ref().unwrap();
-            let spark = memory.devices.iter().filter(|d| d.kind == DeviceKind::Spark).map(|d| d.used_bytes()).max().unwrap();
-            let rtx_used = memory.devices.iter().find(|d| d.kind == DeviceKind::Rtx).unwrap().used_bytes();
-            let onboarded = memory.notes.iter().find_map(|n| n.split_once(" routed layers on the RTX").map(|(n, _)| n.parse::<usize>().unwrap())).unwrap();
-            assert!(spark <= placement::SPARK_BUDGET_BYTES, "{card} TP{ranks}: Spark {:.1} GiB", gib(spark));
-            seen.push((card, ranks, onboarded, memory.pool_tokens, rtx_used <= rtx));
-        }
-    }
-    let row = |card, ranks| *seen.iter().find(|r| r.0 == card && r.1 == ranks).unwrap();
-    // TP3 and TP4 hold every routed layer on the Sparks.
-    for ranks in [3, 4] {
-        assert_eq!(row("5090", ranks).2, 0);
-        assert_eq!(row("pro6000", ranks).2, 0);
-    }
-    // TP2 (108.2 GiB of experts per rank) onboards bottom layers to the RTX.
-    assert!(row("pro6000", 2).2 > 0 && row("pro6000", 2).4);
-    // The PRO 6000 holds a full 1M context beside its weights; the 5090 a quarter of one.
-    assert!(row("pro6000", 4).3 >= 1 << 20, "{seen:?}");
-    // 9.2 GiB of FP8 KV + index keys at 69,360 B/token beside 22.6 GiB of weights,
-    // drafter, workspace estimate and headroom.
-    assert!((100_000..200_000).contains(&row("5090", 4).3), "{seen:?}");
-    assert_eq!(row("5090", 3).3, row("5090", 4).3);
-    // 5090 + 2 Sparks: the two onboarded layers leave no 256K pool.
-    let refused = plan::plan(dir.path(), &with_layout(RTX_5090, 2)).unwrap();
-    assert!(!refused.fits && refused.hints.iter().any(|h| h.what.contains("below one 256K request")), "{:?}", refused.hints);
-}
-
-#[test]
 fn vision_uses_encoder_owner_and_reserves_weights_and_scratch() {
     use crate::plan::{encoder::EncoderKind, MediaMode};
     let dir = snapshot(true, false);
-    for (mode, expected) in [(MediaMode::Rtx(Some(1)), EncoderKind::Rtx { gpu: 1 }),
+    let programs = dir.path().join("PROGRAMS.json");
+    std::fs::write(&programs, admission::tests::programs_manifest().to_string()).unwrap();
+    for (mode, expected) in [(MediaMode::Rtx(Some(0)), EncoderKind::Rtx { gpu: 0 }),
         (MediaMode::Spark(Some(2)), EncoderKind::Spark { rank: 2 }), (MediaMode::Off, EncoderKind::Off)] {
         let mut options = with_layout(PRO_TOTAL_BYTES, 4);
-        options.layout.as_mut().unwrap().rtx_bytes = vec![PRO_TOTAL_BYTES; 2];
+        let layout = options.layout.as_mut().unwrap();
+        (layout.workspace_manifest, layout.native_mtp_layers, layout.prefill_rows, layout.concurrency) =
+            (Some(programs.clone()), 0, 256, 16);
         options.vision = mode;
         let report = plan::plan(dir.path(), &options).unwrap();
+        assert!(report.placement_supported, "{mode:?}: {:?}", report.hints);
         let encoder = report.encoder.as_ref().unwrap();
         assert_eq!(encoder.kind, expected);
         let items: Vec<_> = report.memory_layout.as_ref().unwrap().devices.iter().flat_map(|d| &d.items)
@@ -160,7 +130,6 @@ fn native_manifest_uses_shared_allocation_ledger() {
     let memory = report.memory_layout.as_ref().unwrap();
     assert_eq!(memory.pool_tokens, 16384);
     assert!(memory.notes.iter().any(|n| n.contains("native allocation ledger")));
-    assert!(!memory.notes.iter().any(|n| n.contains("header lower bound")));
     let rtx = memory.devices.iter().find(|d| d.kind == DeviceKind::Rtx).unwrap();
     let item = |name: &str| rtx.items.iter().find(|i| i.group == name).unwrap();
     // Two lanes of 256 rows by default: the per-row buffers hold their 512-row chunk.
@@ -250,7 +219,7 @@ fn native_dspark_requires_a_bundled_checkpoint() {
 }
 
 #[test]
-fn explicit_missing_native_manifest_does_not_fall_back_to_headers() {
+fn a_missing_native_manifest_is_refused() {
     let dir = snapshot(false, false);
     let mut options = with_layout(PRO_TOTAL_BYTES, 3);
     options.layout.as_mut().unwrap().workspace_manifest = Some(dir.path().join("missing-PROGRAMS.json"));

@@ -50,8 +50,7 @@ pub(super) fn solve(checkpoint: &Checkpoint, programs: &serde_json::Value,
     local_package: Option<&serde_json::Value>, request: Request) -> Result<Admitted> {
     let cfg = MiniMaxM3Config::from_hf(&checkpoint.config)?;
     request.sizing.validate(&cfg)?;
-    cuteafd_loader::families::minimax_m3::cache::MiniMaxCacheLayout::for_runtime(
-        &cfg, 1, request.sizing.context, request.kv_format)?;
+    cuteafd_loader::families::minimax_m3::cache::MiniMaxCacheLayout::new(&cfg, request.sizing.context, request.kv_format)?;
     let programs = ProgramSizes::from_manifest(programs, request.sizing)?;
     let ledger = RuntimeLedger::new(&cfg, request.sizing, &programs)?;
     let weights = RankWeightLayout::from_checkpoint(checkpoint, 0, 1)?;

@@ -52,19 +52,14 @@ struct Contract {
 
 pub(super) struct Model {
     cfg: MiniMaxM3Config,
-    vision: Option<MiniMaxM3VisionConfig>,
     draft: Option<MiniMaxM3DsparkConfig>,
     spec: ModelSpec,
     /// Logical weights by stem.
     contracts: BTreeMap<String, Contract>,
     /// Header byte counts by component, the bundled drafter's included.
     bytes: BTreeMap<Component, u64>,
-    /// Routed expert bytes per MoE layer.
-    expert_layer_bytes: BTreeMap<usize, u64>,
     /// Every expected tensor has a readable header.
     complete: bool,
-    /// Only successful manifest-backed placement can admit the WIP executor.
-    native_admission: bool,
 }
 
 fn text(name: &str) -> Option<&str> { name.strip_prefix(TEXT) }
@@ -144,8 +139,8 @@ impl Model {
                 add(stem.into(), vision_role.clone(), vec![n, k], Storage::Bf16, true);
             }
         }
-        let mut model = Self { spec: spec(&cfg, vision.is_some(), draft.as_ref(), checkpoint), cfg, vision, draft, contracts,
-            bytes: BTreeMap::new(), expert_layer_bytes: BTreeMap::new(), complete: checkpoint.missing_shards.is_empty(), native_admission: false };
+        let mut model = Self { spec: spec(&cfg, vision.is_some(), draft.as_ref(), checkpoint), cfg, draft, contracts,
+            bytes: BTreeMap::new(), complete: checkpoint.missing_shards.is_empty() };
         let mut stems: BTreeMap<&str, Vec<&crate::SafetensorsTensorMetadata>> = BTreeMap::new();
         for tensor in &checkpoint.tensors { stems.entry(format::split_stem(&tensor.meta.name).0).or_default().push(&tensor.meta); }
         for (stem, contract) in &model.contracts {
@@ -160,9 +155,6 @@ impl Model {
         for tensor in &checkpoint.tensors {
             let Some(role) = MINIMAX_M3.classify(&model.spec, &tensor.meta.name) else { continue };
             *model.bytes.entry(role.component).or_default() += tensor.meta.byte_length;
-            if role.component == Component::RoutedExpert {
-                *model.expert_layer_bytes.entry(role.layer.context("routed expert without a layer")?).or_default() += tensor.meta.byte_length;
-            }
         }
         if model.draft.is_some() {
             let drafter = Checkpoint::open(&checkpoint.snapshot.join("dspark")).context("MiniMax DSpark headers")?;
@@ -292,12 +284,8 @@ impl Family for MiniMaxM3 {
 
 impl FamilyModel for Model {
     fn spec(&self) -> &ModelSpec { &self.spec }
-    fn configure(&mut self, options: &crate::plan::PlanOptions) -> Result<(), ConfigError> {
-        self.native_admission = options.layout.as_ref().is_some_and(|layout| layout.workspace_manifest.is_some()
-            || std::path::Path::new("/opt/cuteafd/share/PROGRAMS.json").is_file());
-        Ok(())
-    }
-    fn native_serving_admission(&self) -> bool { self.native_admission }
+    /// Placement reads the image's PROGRAMS.json, so every placed layout is the native ledger.
+    fn native_serving_admission(&self) -> bool { true }
     fn activation(&self, layer: usize, _shared: bool) -> Option<FfnActivation> {
         (layer < self.cfg.layers).then_some(FfnActivation::SwigluOai {
             alpha: self.cfg.swiglu_alpha as f32, limit: self.cfg.swiglu_limit as f32 })
@@ -305,7 +293,12 @@ impl FamilyModel for Model {
     fn spark_budget_bytes(&self) -> u64 { placement::SPARK_BUDGET_BYTES }
     fn cache_geometry(&self, options: crate::serving_capacity::CacheOptions)
         -> Result<Option<crate::serving_capacity::FamilyCacheGeometry>, crate::serving_capacity::CacheGeometryError> {
-        placement::cache_geometry(&self.cfg, options).map(Some)
+        if options.coordinator_ranks != 1 || options.attention_placement
+            .is_some_and(|p| p != crate::placement::AttentionPlacement::Heads) {
+            return Err(crate::serving_capacity::CacheGeometryError::Unsupported { family: "minimax_m3", what: "one coordinator GPU" });
+        }
+        let cache = crate::families::minimax_m3::cache::MiniMaxCacheLayout::new(&self.cfg, self.cfg.max_position as u64, options.minimax_kv)?;
+        Ok(Some(cache.geometry()))
     }
     fn accepts(&self, role: &TensorRole, stem: &str, operand: &mut QuantOperand) -> Result<(), String> {
         let contract = self.contract(stem)

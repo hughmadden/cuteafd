@@ -41,12 +41,11 @@ pub(super) struct Cache<'a> {
 impl<'a> Cache<'a> {
     pub fn new(library: &'a NativeLibrary, device: i32, layout: &MiniMaxCacheLayout,
         pages: usize, sequences: usize, admitted: u64) -> Result<Self> {
-        if layout.ranks.len() != 1 || layout.ranks[0].kv_page_bytes != KV_PAGE_BYTES as u64
-            || layout.ranks[0].index_page_bytes != INDEX_PAGE_BYTES as u64
+        if layout.kv_page_bytes != KV_PAGE_BYTES as u64 || layout.index_page_bytes != INDEX_PAGE_BYTES as u64
             || pages == 0 || pages > i32::MAX as usize || !(1..=64).contains(&sequences) {
             return Err(MiniMaxError::Invalid("native cache geometry").into());
         }
-        let required = layout.ranks[0].page_bytes.checked_mul(pages as u64)
+        let required = layout.page_bytes.checked_mul(pages as u64)
             .and_then(|n| n.checked_add(256)).ok_or(MiniMaxError::Overflow("cache"))?;
         if required > admitted { return Err(MiniMaxError::Invalid("cache admission").into()); }
         let mut layers = Vec::with_capacity(layout.layers);

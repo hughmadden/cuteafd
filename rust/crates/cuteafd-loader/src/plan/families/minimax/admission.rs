@@ -281,11 +281,11 @@ pub struct Admission {
 pub fn admit(cfg: &MiniMaxM3Config, sizing: RuntimeSizing, ledger: &RuntimeLedger, reservations: Reservations,
     available: u64, requested_pool: Option<u64>, kv_format: Qwen4KvCache) -> Result<Admission> {
     sizing.validate(cfg)?;
-    let cache = MiniMaxCacheLayout::for_runtime(cfg, 1, sizing.context, kv_format)?;
+    let cache = MiniMaxCacheLayout::new(cfg, sizing.context, kv_format)?;
     let fixed_bytes = reservations.fixed_bytes(ledger)?;
     let needed = fixed_bytes.max(reservations.startup);
     if needed > available { return Err(AdmissionError::Budget { needed, available }); }
-    let page_bytes = cache.ranks[0].page_bytes;
+    let page_bytes = cache.page_bytes;
     let fitting = (available - fixed_bytes) / page_bytes;
     let pool_pages = match requested_pool.filter(|n| *n > 0) {
         Some(tokens) if tokens % PAGE_ROWS != 0 => return Err(AdmissionError::Unsupported("pool not aligned to 64-token pages")),

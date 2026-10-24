@@ -60,7 +60,7 @@ mod tests {
     use super::super::cache::{INDEX_PAGE_BYTES, KV_PAGE_BYTES};
     use cuteafd_engine::prefix::{After, PrefixCache, PrefixConfig, SnapshotKind};
     use cuteafd_hostcache::copy::StubCopyEngine;
-    use cuteafd_loader::families::{minimax_m3::cache::{MiniMaxCacheLayout, RankPages}, qwen4::Qwen4KvCache};
+    use cuteafd_loader::families::minimax_m3::cache::MiniMaxCacheLayout;
 
     #[test]
     #[ignore = "CPU-only native fixture; requires an explicit build slot and fixture directory"]
@@ -68,10 +68,9 @@ mod tests {
         let fixture = cuteafd_ffi::native_library_lifetime_fixture::Fixture::build()?;
         let library = fixture.load()?;
         fixture.immediate_copies(&library)?;
-        let layout = MiniMaxCacheLayout { kv_format: Qwen4KvCache::Fp8, layers: 2, context: 256,
-            ranks: vec![RankPages { first_kv_head: 0, kv_heads: 4, kv_page_bytes: KV_PAGE_BYTES as u64,
-                index_page_bytes: INDEX_PAGE_BYTES as u64, page_bytes: 2 * (2 * KV_PAGE_BYTES + INDEX_PAGE_BYTES) as u64 }] };
-        let cache = Cache::new(&library, 0, &layout, 16, 2, layout.ranks[0].page_bytes * 16 + 256)?;
+        let layout = MiniMaxCacheLayout { layers: 2, context: 256, kv_page_bytes: KV_PAGE_BYTES as u64,
+            index_page_bytes: INDEX_PAGE_BYTES as u64, page_bytes: 2 * (2 * KV_PAGE_BYTES + INDEX_PAGE_BYTES) as u64 };
+        let cache = Cache::new(&library, 0, &layout, 16, 2, layout.page_bytes * 16 + 256)?;
         let family = MiniMaxPrefix { cache: &cache };
         let mut shared = PrefixCache::<StubCopyEngine>::new(family.layout(), PrefixConfig {
             entries: 4, mark_slots: 0, keep_logits: false, min_tokens: 1 }, None)?;
