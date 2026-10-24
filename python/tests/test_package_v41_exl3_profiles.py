@@ -156,8 +156,9 @@ class PackageProfileTests(unittest.TestCase):
             if 'route_block' in options:
                 meta['route_block'] = options['route_block']
             if 'decode_schedule' in options:
-                # The exporter records b12x's canonical options; any string will do here.
-                meta['decode_schedule'] = f"canonical:{options['decode_schedule']}"
+                # Pure schedules are already canonical; retain the alias sentinel.
+                schedule = options['decode_schedule']
+                meta['decode_schedule'] = schedule if schedule.startswith('l2=') else f'canonical:{schedule}'
             if geometry != 'v41':
                 meta['hidden'] = options['hidden']
                 self.assertEqual(options['hidden'], package.GEOMETRIES[geometry][0])
@@ -227,7 +228,11 @@ class PackageProfileTests(unittest.TestCase):
                 self.assertEqual(call.args[1], 384)
                 self.assertEqual(call.kwargs['tile'], (64, 128, 64, 128))
                 self.assertNotIn('warp_specialized', call.kwargs)
-                self.assertNotIn('decode_schedule', call.kwargs)
+                expected = package.default_decode_schedule('glm', 'spark', 'tp6-compact-width384',
+                                                           call.args[3], [4, 5])
+                self.assertEqual(call.kwargs.get('decode_schedule'), expected)
+                if expected:
+                    self.assertIn('+' + expected, str(call.args[0]))
             self.assertEqual(manifest['requested_layouts'],
                              [f'tp6-compact-rank{rank}' for rank in range(6)])
             self.assertEqual(manifest['requested_capacities'], [1, 16])
@@ -360,7 +365,7 @@ class PackageProfileTests(unittest.TestCase):
     def test_glmf_spark_tp4_decode_capacities_carry_the_gb10_schedule(self):
         """GLM 5.3 Flash's TP4 decode exports (m1, m80) get an m<capacity>-gb10 sibling with
         the gb10 decode schedule, compiled once per capacity and shared by the four ranks;
-        every other export, and every m<capacity>, stays the default schedule."""
+        default m1/m80 instead carry the measured pure evict-first identity."""
         with tempfile.TemporaryDirectory() as temporary:
             output, manifest, calls, capacities = self.build_fixture(
                 Path(temporary), 'spark', (3, 4), geometry='glmf')
@@ -373,7 +378,11 @@ class PackageProfileTests(unittest.TestCase):
                 meta = json.loads((output / directory / 'v41_exl3.json').read_text())
                 self.assertEqual(meta['decode_schedule'], 'canonical:gb10')
                 default = json.loads((output / directory.removesuffix('-gb10') / 'v41_exl3.json').read_text())
-                self.assertNotIn('decode_schedule', default)
+                self.assertEqual(default['decode_schedule'], package.PURE_EVICT_FIRST)
+                default_variant = next(v for v in manifest['variants']
+                                       if v['directory'] == directory.removesuffix('-gb10'))
+                self.assertNotIn('schedule', default_variant)
+                self.assertEqual(default_variant['decode_schedule'], default['decode_schedule'])
                 # m80-gb10 runs 64x128 tiles at two CTAs per SM; m1-gb10 keeps the default tile.
                 wide = directory.endswith('/m80-gb10')
                 self.assertEqual(variant['blocks_per_sm'], 2 if wide else 1)

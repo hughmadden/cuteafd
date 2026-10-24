@@ -333,6 +333,8 @@ def _export_exl3(extra, output):
                 options["route_block"] = block
             if (limit := package.swiglu_limit(geometry)) != 10.0:
                 options["swiglu_limit"] = limit
+            if (schedule := package.default_decode_schedule(geometry, role, profile, rows, list(bits))) is not None:
+                options["decode_schedule"] = schedule
             export(output / profile / f"m{rows}", width, experts, rows, bits, "auto", topk, dtype, **options)
 
 
