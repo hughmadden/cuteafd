@@ -104,7 +104,8 @@ impl V41Variant {
         let fold = |f: fn(&cuteafd_loader::V41SiteReport) -> f32, max: bool| d.sites.iter().map(f)
             .fold(if max { f32::MIN } else { f32::MAX }, if max { f32::max } else { f32::min });
         cuteafd_core::variants::VariantRecord::of(&self.plan, served, serde_json::json!({
-            "alpha": d.alpha, "shared_direction": d.shared_direction, "direction_cos_min": d.direction_cos_min,
+            "alpha": d.alpha, "shared_direction": d.shared_direction, "shared_alpha": d.shared_alpha,
+            "direction_cos_min": d.direction_cos_min, "r_gap_max": fold(|s| s.r_gap, true),
             "next_share_max": fold(|s| s.verify.next_share, true), "proj_cos_min": fold(|s| s.verify.proj_cos, false),
             "rebuild_exact_min": fold(|s| s.rebuild_exact, false), "unchanged": d.unchanged.len()}))
     }
@@ -115,29 +116,20 @@ impl V41Variant {
 /// whose edit fails the recipe's bars is logged and left out; base serving and
 /// the other variants continue.
 pub(crate) fn load_variants(specs: &[(u8, cuteafd_core::variants::VariantSpec)], served: &str,
-    catalog: &cuteafd_loader::OfficialV41Catalog) -> Result<Vec<V41Variant>> {
+    snapshot: &std::path::Path) -> Result<Vec<V41Variant>> {
     let mut loaded = Vec::new();
     for (index, spec) in specs {
-        ensure!(spec.mode.is_none(), "variant {}: DeepSeek V4.1 has no variant modes (got mode={})",
-            spec.name, spec.mode.as_deref().unwrap_or_default());
-        let started = std::time::Instant::now();
-        let source = cuteafd_loader::V41VariantSource::open(std::path::Path::new(&spec.source), LAYERS as u16)
-            .with_context(|| format!("variant {}", spec.name))?;
-        let base_catalog = spec.base.as_ref().map(|b| cuteafd_loader::read_official_v41_catalog(std::path::Path::new(b)))
-            .transpose().with_context(|| format!("variant {} base", spec.name))?;
-        let base: &dyn cuteafd_loader::TensorBytes = base_catalog.as_ref().unwrap_or(catalog);
-        let derivation = cuteafd_loader::derive_v41_variant(base, &source, V41_HIDDEN, &Default::default())
+        // The same derivation `cuteafd plan --variant` reports.
+        let (outcome, derivation) = cuteafd_loader::derive_v41_outcome(snapshot, served, *index, spec)
             .with_context(|| format!("variant {} derivation", spec.name))?;
-        if !derivation.accept {
-            tracing::error!(variant = %spec.name, reason = derivation.reason.as_deref().unwrap_or(""),
+        let (Some(plan), Some(derivation)) = (outcome.plan, derivation) else {
+            tracing::error!(variant = %spec.name, reason = outcome.rejection.as_deref().unwrap_or(""),
                 "weight variant refused; it will not be served");
             continue;
-        }
-        let plan = VariantPlan::new(*index, spec.name.clone(), spec.public_id(served), V41_HIDDEN as u32, derivation.ops.clone())?;
-        tracing::info!(variant = %spec.name, id = %plan.public_id, file = %source.file.display(), sites = plan.sites.len(),
-            alpha = ?derivation.alpha, shared_direction = derivation.shared_direction,
-            direction_cos_min = derivation.direction_cos_min, seconds = started.elapsed().as_secs_f32(),
-            "weight variant derived");
+        };
+        tracing::info!(variant = %spec.name, id = %plan.public_id, sites = plan.sites.len(), alpha = ?derivation.alpha,
+            shared_direction = derivation.shared_direction, shared_alpha = derivation.shared_alpha,
+            direction_cos_min = derivation.direction_cos_min, seconds = outcome.seconds, "weight variant derived");
         loaded.push(V41Variant { plan, derivation });
     }
     Ok(loaded)
@@ -360,11 +352,11 @@ mod tests {
         let layers: Vec<usize> = std::env::var("CUTEAFD_VARIANT_LAYERS").unwrap_or_else(|_| "10,22,35".into())
             .split(',').map(str::parse).collect::<std::result::Result<_, _>>()?;
         let spec: cuteafd_core::variants::VariantSpec = format!("name=alternate,source={overlay}").parse()?;
-        let loaded = load_variants(&[(1, spec)], "served", &catalog)?;
+        let loaded = load_variants(&[(1, spec)], "served", std::path::Path::new(&env("CUTEAFD_SNAPSHOT")?))?;
         let variant = loaded.first().context("the overlay was refused")?;
         let (alpha, r) = match &variant.plan.sites[0].1 {
             SiteOp::Steer { a, b, .. } => (a[0] / b[0], b.clone()),
-            SiteOp::Delta {} => unreachable!(),
+            SiteOp::Delta { .. } => unreachable!(),
         };
         let tables = V41SteerTables::new(std::slice::from_ref(&variant.plan))?.context("tables")?;
         let device = Device { library: &library, id: 0 };

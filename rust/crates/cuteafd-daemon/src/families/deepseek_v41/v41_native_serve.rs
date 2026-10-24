@@ -151,8 +151,7 @@ fn start(mut args: crate::cli::NativeServeArgs, http: bool) -> Result<Started> {
     // Weight variants are derived on the CPU before any CUDA work; a refused one is left out.
     let (plans, variants) = if args.variants.variants.is_empty() { (Vec::new(), Vec::new()) } else {
         let served = served_profile(args.model_id.clone(), &args.snapshot)?.id;
-        let catalog = cuteafd_loader::read_official_v41_catalog(&args.snapshot)?;
-        let loaded = super::v41_variants::load_variants(&args.variants.indexed(&served)?, &served, &catalog)?;
+        let loaded = super::v41_variants::load_variants(&args.variants.indexed(&served)?, &served, &args.snapshot)?;
         let records = loaded.iter().map(|v| v.record(&served)).collect();
         (loaded.into_iter().map(|v| v.plan).collect::<Vec<_>>(), records)
     };
