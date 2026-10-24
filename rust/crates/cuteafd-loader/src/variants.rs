@@ -439,19 +439,26 @@ pub fn e4m3_to_f32(byte: u8) -> f32 {
     if exp == 0 { return sign * man * (2f32).powi(-9); }
     sign * (1.0 + man / 8.0) * (2f32).powi(i32::from(exp) - 7)
 }
-/// f32 to FP8 E4M3, round to nearest even, saturating at ±448 (torch's clamp-then-convert).
+static E4M3_MAGNITUDES: std::sync::LazyLock<[f32; 127]> = std::sync::LazyLock::new(|| std::array::from_fn(|c| e4m3_to_f32(c as u8)));
+/// f32 to FP8 E4M3, round to nearest even, saturating at ±448 (torch's clamp-then-convert),
+/// keeping the sign of zero. A binary search over the 127 finite magnitudes: FP8 rebuild checks
+/// encode ~10⁸ values per tensor (`tests::fast_encoder_matches_the_exhaustive_search`).
 pub fn f32_to_e4m3(value: f32) -> u8 {
     if value.is_nan() { return 0x7f; }
     let sign = if value.is_sign_negative() { 0x80u8 } else { 0 };
-    let x = value.abs().min(448.0);
-    // Exhaustive nearest search over the 127 finite magnitudes keeps this obviously right.
-    let mut best = 0u8;
-    let mut best_err = f32::INFINITY;
-    for code in 0u8..0x7f {
-        let err = (e4m3_to_f32(code) - x).abs();
-        if err < best_err || (err == best_err && code & 1 == 0 && best & 1 == 1) { best = code; best_err = err; }
+    let a = f64::from(value.abs().min(448.0));
+    let table = &*E4M3_MAGNITUDES;
+    // Largest code whose value is <= a (codes are monotone in value).
+    let (mut lo, mut hi) = (0usize, 126usize);
+    while lo < hi {
+        let mid = (lo + hi).div_ceil(2);
+        if f64::from(table[mid]) <= a { lo = mid } else { hi = mid - 1 }
     }
-    sign | best
+    let code = if lo == 126 { 126 } else {
+        let half = (f64::from(table[lo]) + f64::from(table[lo + 1])) / 2.0;
+        if a > half || (a == half && lo % 2 == 1) { lo + 1 } else { lo }
+    };
+    sign | code as u8
 }
 pub fn ue8m0_to_f32(byte: u8) -> f32 { if byte == 0xff { f32::NAN } else { (2f32).powi(i32::from(byte) - 127) } }
 pub fn f16_to_f32(bits: u16) -> f32 {

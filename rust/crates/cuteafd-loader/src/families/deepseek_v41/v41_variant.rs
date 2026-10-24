@@ -15,7 +15,7 @@
 //!   the least-squares α is biased low by FP8 requantization noise in ΔW;
 //! - every site is checked by rebuilding the variant's FP8 bytes with the op
 //!   that will be served.
-use crate::variants::{derive_site, e4m3_to_f32, ue8m0_to_f32, DeriveOpts, Matrix, SiteTensor, TensorSource, VerifyReport};
+use crate::variants::{derive_site, e4m3_to_f32, f32_to_e4m3, ue8m0_to_f32, DeriveOpts, Matrix, SiteTensor, TensorSource, VerifyReport};
 use anyhow::{bail, ensure, Context, Result};
 use cuteafd_core::variants::{SiteKey, SiteKind, SiteOp, VariantError};
 use cuteafd_core::DType;
@@ -25,28 +25,6 @@ use std::path::{Path, PathBuf};
 
 /// UE8M0 scale block edge of the official FP8 `wo_b`.
 pub const V41_FP8_BLOCK: usize = 32;
-
-static E4M3: std::sync::LazyLock<[f32; 127]> = std::sync::LazyLock::new(|| std::array::from_fn(|c| e4m3_to_f32(c as u8)));
-
-/// The same bytes as [`crate::variants::f32_to_e4m3`] (nearest, ties to even,
-/// saturating, sign of zero kept) by binary search: the α search encodes
-/// ~10⁸ values per tensor.
-pub(crate) fn e4m3_rne(value: f32) -> u8 {
-    if value.is_nan() { return 0x7f; }
-    let sign = if value.is_sign_negative() { 0x80 } else { 0 };
-    let a = f64::from(value.abs().min(448.0));
-    // Largest finite code whose value is <= a (codes are monotone in value).
-    let (mut lo, mut hi) = (0usize, 126usize);
-    while lo < hi {
-        let mid = (lo + hi).div_ceil(2);
-        if f64::from(E4M3[mid]) <= a { lo = mid } else { hi = mid - 1 }
-    }
-    let code = if lo == 126 { 126 } else {
-        let half = (f64::from(E4M3[lo]) + f64::from(E4M3[lo + 1])) / 2.0;
-        if a > half || (a == half && lo % 2 == 1) { lo + 1 } else { lo }
-    };
-    sign | code as u8
-}
 
 /// One FP8 E4M3 matrix with UE8M0 32×32 block scales, as stored.
 #[derive(Clone)]
@@ -273,7 +251,7 @@ fn rebuild_exact(w: &[f32], variant: &Fp8Block32, u: &[f32], p: &[f32], alpha: f
         let mut equal = 0usize;
         for j in 0..cols {
             let x = w[i * cols + j] - alpha * (u[i] * p[j]);
-            equal += usize::from(e4m3_rne(x / variant.scale_at(i, j)) == variant.weight[i * cols + j]);
+            equal += usize::from(f32_to_e4m3(x / variant.scale_at(i, j)) == variant.weight[i * cols + j]);
         }
         (equal, cols)
     }).reduce(|| (0, 0), |a, b| (a.0 + b.0, a.1 + b.1));
@@ -283,7 +261,7 @@ fn rebuild_exact(w: &[f32], variant: &Fp8Block32, u: &[f32], p: &[f32], alpha: f
 fn rebuild_exact_op(w: &Matrix, variant: &Fp8Block32, op: &SiteOp) -> f32 {
     let x = crate::variants::rebuild(w, op);
     let equal: usize = x.data.par_iter().enumerate().map(|(k, &v)| {
-        usize::from(e4m3_rne(v / variant.scale_at(k / variant.cols, k % variant.cols)) == variant.weight[k])
+        usize::from(f32_to_e4m3(v / variant.scale_at(k / variant.cols, k % variant.cols)) == variant.weight[k])
     }).sum();
     equal as f32 / x.data.len() as f32
 }
@@ -388,23 +366,6 @@ pub fn derive_v41_variant(base: &dyn TensorBytes, variant: &V41VariantSource, hi
 mod tests {
     use super::*;
 
-    #[test]
-    fn fast_encoder_matches_the_shared_encoder() {
-        use crate::variants::f32_to_e4m3;
-        for code in 0u8..=255 {
-            let v = e4m3_to_f32(code);
-            if v.is_nan() { continue; }
-            assert_eq!(e4m3_rne(v), code, "code {code:#x}");
-            // Midpoints to both neighbours, and just past them.
-            for x in [v * 1.03125, v * 0.96875, v * 1.0625, v + 2f32.powi(-10), v - 2f32.powi(-10), v * 1.5, -v * 1.07] {
-                assert_eq!(e4m3_rne(x), f32_to_e4m3(x), "{x}");
-            }
-        }
-        for x in [1e9f32, -1e9, 448.0, 464.0, 0.0, -0.0, 2f32.powi(-10), 1.0625, 1.1875] {
-            assert_eq!(e4m3_rne(x), f32_to_e4m3(x), "{x}");
-        }
-    }
-
     struct Mem(Vec<(String, DType, Vec<usize>, Vec<u8>)>);
     impl TensorBytes for Mem {
         fn read(&self, name: &str) -> Result<(DType, Vec<usize>, Vec<u8>)> {
@@ -414,7 +375,7 @@ mod tests {
     }
     fn quantize(w: &[f32], rows: usize, cols: usize, scale: u8) -> Vec<u8> {
         let s = ue8m0_to_f32(scale);
-        w.iter().take(rows * cols).map(|&x| e4m3_rne(x / s)).collect()
+        w.iter().take(rows * cols).map(|&x| f32_to_e4m3(x / s)).collect()
     }
     fn tensors(name: &str, w: &[f32], rows: usize, cols: usize, scale: u8) -> [(String, DType, Vec<usize>, Vec<u8>); 2] {
         [(format!("{name}.weight"), DType::F8E4M3, vec![rows, cols], quantize(w, rows, cols, scale)),

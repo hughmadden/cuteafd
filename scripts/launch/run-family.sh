@@ -1479,7 +1479,8 @@ local -a args=(--vision "$VISION" --audio "$AUDIO" serve-native "${vision_args[@
 [[ -z "${SERVED_MODEL_ID:-}" ]] || args+=(--model-id "$SERVED_MODEL_ID")
 args+=("${api_args[@]}")
 # Weight variants (VARIANTS): serve-native --variant; V4.1 has no variant modes.
-variant_launch_args "$hf_home/hub" nomode
+variant_args=() variant_mounts=()
+[[ -z "${VARIANTS:-}" ]] || variant_launch_args "$hf_home/hub" nomode
 args+=(${variant_args[@]+"${variant_args[@]}"})
 args+=(--http-queue-depth "${HTTP_QUEUE_DEPTH:-$CONCURRENCY}" --http-queue-wait-ms "$HTTP_QUEUE_WAIT_MS")
 [[ "$RTX_EXPERT_LAYERS" == auto ]] || args+=(--rtx-expert-layers "$RTX_EXPERT_LAYERS")

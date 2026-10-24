@@ -389,3 +389,34 @@ fn glm53_steered_rows_match_the_published_variant() {
         }
     }
 }
+
+/// The exhaustive nearest search the binary search replaced (ties to the even code).
+fn e4m3_exhaustive(value: f32) -> u8 {
+    if value.is_nan() { return 0x7f; }
+    let sign = if value.is_sign_negative() { 0x80u8 } else { 0 };
+    let x = value.abs().min(448.0);
+    let mut best = 0u8;
+    let mut best_err = f32::INFINITY;
+    for code in 0u8..0x7f {
+        let err = (e4m3_to_f32(code) - x).abs();
+        if err < best_err || (err == best_err && code & 1 == 0 && best & 1 == 1) { best = code; best_err = err; }
+    }
+    sign | best
+}
+
+#[test]
+fn fast_encoder_matches_the_exhaustive_search() {
+    for code in 0u8..=255 {
+        let v = e4m3_to_f32(code);
+        if v.is_nan() { continue; }
+        // Each code, the midpoints to both neighbours, and just past them.
+        for x in [v, v * 1.03125, v * 0.96875, v * 1.0625, v + 2f32.powi(-10), v - 2f32.powi(-10), v * 1.5, -v * 1.07] {
+            assert_eq!(f32_to_e4m3(x), e4m3_exhaustive(x), "{x}");
+        }
+    }
+    for x in [1e9f32, -1e9, 448.0, 464.0, 0.0, -0.0, 2f32.powi(-10), 1.0625, 1.1875, f32::NAN] {
+        assert_eq!(f32_to_e4m3(x), e4m3_exhaustive(x), "{x}");
+    }
+    let mut x = 1e-6f32;
+    while x < 600.0 { assert_eq!(f32_to_e4m3(x), e4m3_exhaustive(x), "{x}"); x *= 1.000_7; }
+}
