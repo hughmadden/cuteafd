@@ -228,9 +228,16 @@ def test_release_inventory_requires_each_roles_exlr8_set(tmp_path):
         SCOPE.check_inventory(tmp_path / 'e', 'expert', wanted, symbols=set())
 
 
-def test_launch_key_is_known():
-    common = (ROOT / 'scripts/lib/release-common.sh').read_text()
-    assert re.search(r'^\s+EXLR8_MANIFEST\) return 0 ;;', common, re.M)
+@pytest.mark.parametrize('key,known', [
+    ('EXLR8_MANIFEST', True),
+    ('EXLR8_PREFILL_ACTIVATIONS', True),
+    ('EXLR8_UNKNOWN', False),
+])
+def test_launch_key_is_known(key, known):
+    result = subprocess.run(['bash', '-c', 'source "$1"; release_known_key "$2"',
+                             'exlr8-keys', str(ROOT / 'scripts/lib/release-common.sh'), key],
+                            capture_output=True, text=True, timeout=10)
+    assert result.returncode == (0 if known else 1), result.stderr
 
 
 def test_kimi_build_key_changes_only_when_enabled():
