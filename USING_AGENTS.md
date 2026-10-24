@@ -157,8 +157,12 @@ The same brief works for every model. One bounded task with everything the
 agent needs to finish without asking:
 
 1. **Branch and base:** `work/<task>` off `origin/work/p0`, in a worktree
-   outside the repo (the preamble covers this). Name the PR/issue number and
-   the preflight command (`hwlock.py --preflight`) for any hardware run.
+   under `~/Developer/cute-worktrees/<name>`, outside the repo. New CuteAFD
+   and SparkInfer worktrees both go in this folder, not directly in
+   `~/Developer`; use distinct names such as `cuteafd-<task>` and
+   `sparkinfer-<task>`. Leave existing worktrees where they are. Name the
+   PR/issue number and the preflight command (`hwlock.py --preflight`) for
+   any hardware run.
 2. **Context:** the measured numbers and file paths that motivate the task,
    the `PLAN.md` item, what was already tried. Point at earlier reports
    rather than restating them.
@@ -174,6 +178,15 @@ agent needs to finish without asking:
    leave opt-in.
 6. **Report:** before → after tables with conditions, gate results, commits,
    open issues.
+
+Create the parent once, then create each task's worktree from its owning
+checkout (SparkInfer branches use that fork's base, not CuteAFD's):
+
+```sh
+mkdir -p ~/Developer/cute-worktrees
+git -C ~/Developer/cuteafd worktree add ~/Developer/cute-worktrees/cuteafd-<task> -b work/<task> origin/work/p0
+git -C ~/Developer/sparkinfer-glmrt worktree add ~/Developer/cute-worktrees/sparkinfer-<task> -b work/<task> origin/master
+```
 
 Start every cluster brief with `scripts/agents/codex-preamble.md` (worktree,
 build, lock, sudo, frugality and no-merge rules). `codex-launch.sh` prepends
