@@ -647,6 +647,31 @@ async fn system_items_follow_each_template_placement_rule() {
 }
 
 #[tokio::test]
+async fn chat_developer_and_root_roles_reach_only_the_minimax_template() {
+    // MiniMax's template renders `developer` (its low-priority system slot) and
+    // `root` (its high-priority one); the adapter's role enum, shared by every
+    // family, has neither, so the other families still refuse them.
+    for family in families() {
+        let minimax = matches!(family.profile.encoding, ModelEncoding::MiniMaxM3(_));
+        let (app, worker) = serve(family.profile.clone(), family.snapshot.clone(), vec![], false);
+        for role in ["developer", "root"] {
+            let body = json!({"model":family.profile.id,"stream":false,"max_tokens":8,"thinking":{"type":"disabled"},
+                "messages":[{"role":role,"content":"Answer in French."},{"role":"user","content":"hi"}]});
+            let (status, text) = post(&app, "/v1/chat/completions", body).await;
+            assert_eq!(status, if minimax { StatusCode::OK } else { StatusCode::BAD_REQUEST }, "{} {role}: {text}", family.name);
+        }
+        let prompts = worker.prompts.lock().unwrap().clone();
+        if !minimax { assert!(prompts.is_empty(), "{}", family.name); continue; }
+        assert!(prompts[0].contains("[e~[\n]~b]developer\nAnswer in French.[e~[\n]~b]user\nhi"), "{}", prompts[0]);
+        assert!(prompts[1].starts_with("]~!b[]~b]system\nAnswer in French.\n\n<thinking_instructions>"), "{}", prompts[1]);
+        assert!(prompts[1].contains("]~b]developer\nYou are a helpful assistant.[e~["), "{}", prompts[1]);
+        // The template drops a later `root`; refuse it rather than lose its text.
+        let body = json!({"model":family.profile.id,"messages":[{"role":"user","content":"hi"},{"role":"root","content":"x"}]});
+        assert_eq!(post(&app, "/v1/chat/completions", body).await.0, StatusCode::BAD_REQUEST);
+    }
+}
+
+#[tokio::test]
 async fn resent_web_search_call_without_results_keeps_the_session_valid() {
     // Codex over HTTP (store:false) resends its hosted web_search_call items
     // by value: action and status, never the sources. Every later turn must
@@ -717,8 +742,10 @@ async fn messages_without_thinking_do_not_reason_while_responses_and_chat_keep_d
 }
 
 /// MiniMax M3 reads one `<effort>` level from the system prompt: Anthropic
-/// budgets bucket into it, Responses/Chat efforts pass through, and the
-/// switches that turn thinking off close the reasoning prefix.
+/// budgets bucket into it, Responses/Chat efforts pass through, the switches
+/// that turn thinking off close the reasoning prefix, an explicit enable
+/// (Anthropic `enabled`, a Responses effort) opens it, and Anthropic
+/// `adaptive` or a bare chat effort leaves it to the model.
 #[tokio::test]
 async fn minimax_effort_levels_follow_each_protocols_thinking_controls() {
     let profile = ModelProfile::new("test-minimax", ModelEncoding::MiniMaxM3(Arc::new(minimax_m3::fixtures::encoding())));
@@ -730,6 +757,7 @@ async fn minimax_effort_levels_follow_each_protocols_thinking_controls() {
         ("/v1/messages", msg(json!({"type":"enabled","budget_tokens":8000}))),
         ("/v1/messages", msg(json!({"type":"enabled","budget_tokens":64000}))),
         ("/v1/messages", msg(json!({"type":"disabled"}))),
+        ("/v1/messages", msg(json!({"type":"adaptive","budget_tokens":8000}))),
         ("/v1/responses", json!({"model":"m","input":"hi","store":false,"reasoning":{"effort":"xhigh"}})),
         ("/v1/responses", json!({"model":"m","input":"hi","store":false,"reasoning":{"effort":"minimal"}})),
         ("/v1/responses", json!({"model":"m","input":"hi","store":false,"reasoning":{"effort":"none"}})),
@@ -741,11 +769,11 @@ async fn minimax_effort_levels_follow_each_protocols_thinking_controls() {
     }
     let prompts = worker.prompts.lock().unwrap().clone();
     let effort = |p: &str| p.split("<effort>").nth(1).and_then(|r| r.split("</effort>").next()).map(str::to_owned);
-    let closed = |p: &str| p.ends_with("</mm:think>");
-    let got: Vec<_> = prompts.iter().map(|p| (effort(p), closed(p))).collect();
-    let some = |level: &str, closed| (Some(level.to_owned()), closed);
-    assert_eq!(got, vec![(None, true), some("low", false), some("high", false), some("max", false), (None, true),
-        some("xhigh", false), some("low", false), (None, true), some("medium", false)]);
+    let mode = |p: &str| if p.ends_with("</mm:think>") { "off" } else if p.ends_with("<mm:think>") { "enabled" } else { "adaptive" };
+    let got: Vec<_> = prompts.iter().map(|p| (effort(p), mode(p))).collect();
+    let some = |level: &str, mode| (Some(level.to_owned()), mode);
+    assert_eq!(got, vec![(None, "off"), some("low", "enabled"), some("high", "enabled"), some("max", "enabled"), (None, "off"),
+        some("high", "adaptive"), some("xhigh", "enabled"), some("low", "enabled"), (None, "off"), some("medium", "adaptive")]);
 }
 
 #[tokio::test]

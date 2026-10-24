@@ -206,11 +206,12 @@ impl ModelProfile {
     /// Token ids that end generation for one request.
     fn stop_token_ids(&self, tools_declared: bool) -> Vec<u32> {
         match &self.encoding {
-            ModelEncoding::Glm(_) | ModelEncoding::Qwen(_) | ModelEncoding::Step5(_) => {
+            ModelEncoding::Glm(_) | ModelEncoding::Qwen(_) | ModelEncoding::Step5(_) | ModelEncoding::MiniMaxM3(_) => {
                 let mut ids = match &self.encoding {
                     ModelEncoding::Glm(encoding) => encoding.stop_token_ids(tools_declared),
                     ModelEncoding::Qwen(encoding) => encoding.stop_token_ids(tools_declared),
                     ModelEncoding::Step5(encoding) => encoding.stop_token_ids(tools_declared),
+                    ModelEncoding::MiniMaxM3(encoding) => encoding.stop_token_ids(),
                     _ => unreachable!(),
                 };
                 ids.extend(&self.eos_token_ids);
@@ -218,7 +219,7 @@ impl ModelProfile {
                 ids.dedup();
                 ids
             }
-            ModelEncoding::DeepseekV4 | ModelEncoding::DeepseekV41 | ModelEncoding::Kimi(_) | ModelEncoding::MiniMaxM3(_) => self.eos_token_ids.clone(),
+            ModelEncoding::DeepseekV4 | ModelEncoding::DeepseekV41 | ModelEncoding::Kimi(_) => self.eos_token_ids.clone(),
         }
     }
 }
@@ -836,6 +837,13 @@ pub(crate) fn build(profile: &ModelProfile, limits: NativeLimits, headers: &axum
         if glm_request.is_none() { return Err(Rejection::bad("audio requires a checkpoint chat template")); }
         media::audio::strip_adapter_audio(&mut body);
     }
+    // MiniMax's template renders `developer` and its own `root` from the raw
+    // body kept above; the adapter has neither role and checks them as system.
+    if matches!(profile.encoding, ModelEncoding::MiniMaxM3(_)) {
+        for message in body.get_mut("messages").and_then(Value::as_array_mut).into_iter().flatten() {
+            if matches!(message["role"].as_str(), Some("developer" | "root")) { message["role"] = json!("system"); }
+        }
+    }
     let mut parsed: ChatCompletionRequest = serde_json::from_value(body).map_err(Rejection::bad)?;
     let include_usage = parsed.include_usage();
     let parallel = parsed.parallel_tool_calls.unwrap_or(true);
@@ -878,8 +886,13 @@ pub(crate) fn build(profile: &ModelProfile, limits: NativeLimits, headers: &axum
     let tool_constraints = tools::ToolConstraints::new(&converted.conversation.tools,
         converted.conversation.tool_choice, selection.required, parallel,
         assistance || response_format.as_ref().is_some_and(|v| v["type"] != "text"), syntax).map_err(Rejection::bad)?;
-    let constraint = if matches!(profile.encoding, ModelEncoding::MiniMaxM3(_)) {
-        minimax_m3::grammar::response(response_format.clone(), converted.conversation.thinking_mode, tool_constraints.as_ref())
+    // MiniMax tells adaptive from enabled thinking, which the switch above merges.
+    let minimax_thinking = match &glm_request {
+        Some((Templated::MiniMaxM3(_), raw, _)) => Some(minimax_m3::Thinking::of(raw).map_err(Rejection::bad)?),
+        _ => None,
+    };
+    let constraint = if let Some(thinking) = minimax_thinking {
+        minimax_m3::grammar::response(response_format.clone(), thinking, tool_constraints.as_ref())
     } else { match profile.encoding.think_close_token_id() {
         Some(token) => constraints::response_constraint(response_format.clone(), converted.conversation.thinking_mode,
             tool_constraints.as_ref(), token),
@@ -937,9 +950,10 @@ pub(crate) fn build(profile: &ModelProfile, limits: NativeLimits, headers: &axum
             let names = converted.conversation.tools.iter().map(|t| t.name.clone()).collect::<Vec<_>>();
             let prompt = encoding.render(&raw, &names).map_err(Rejection::bad)?;
             let parser = minimax_m3::MiniMaxOutputParser::new(minimax_m3::MiniMaxParserOptions {
+                thinking: minimax_thinking == Some(minimax_m3::Thinking::Enabled),
                 tools: (tools_declared && converted.conversation.tool_choice != deepseek_recipe_core::tools::ToolChoice::None)
                     .then(|| converted.conversation.tools.clone()),
-                stop_sequences: converted.parsing_options.stop_sequences.clone() });
+                stop_sequences: converted.parsing_options.stop_sequences.clone(), id: id.clone() });
             (prompt, Vec::new(), OutputProcessor::MiniMaxM3(glm5::GlmStreamProcessor::new(generator, parser)))
         }
         Some((Templated::Step5(encoding), raw, _thinking)) => {

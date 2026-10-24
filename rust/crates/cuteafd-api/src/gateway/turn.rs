@@ -100,6 +100,10 @@ pub struct Sampling {
 pub struct Reasoning {
     /// `None` leaves the backend default.
     pub enabled: Option<bool>,
+    /// Anthropic `thinking.type: adaptive`: enabled, but the model decides
+    /// whether to think (MiniMax M3 otherwise opens the block itself).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub adaptive: bool,
     /// OpenAI effort (`minimal`/`low`/`medium`/`high`/`xhigh`, ...).
     pub effort: Option<String>,
     /// Anthropic `thinking.budget_tokens`.

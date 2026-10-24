@@ -100,8 +100,10 @@ fn default_effort_adds_no_line_and_unsupported_levels_fail() {
 fn thinking_off_closes_the_reasoning_prefix() {
     let encoding = encoding();
     let user = json!([{"role": "user", "content": "Hi"}]);
+    // A budget sizes thinking: with thinking off it renders no effort line.
     for extra in [json!({"reasoning_effort": "none"}), json!({"enable_thinking": false}),
-        json!({"thinking": {"type": "disabled"}}), json!({"chat_template_kwargs": {"enable_thinking": false}})] {
+        json!({"thinking": {"type": "disabled"}}), json!({"chat_template_kwargs": {"enable_thinking": false}}),
+        json!({"thinking": {"type": "disabled", "budget_tokens": 20000}})] {
         let mut body = json!({"messages": user});
         body.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
         let rendered = encoding.render(&body, &[]).unwrap();
@@ -109,7 +111,25 @@ fn thinking_off_closes_the_reasoning_prefix() {
         assert!(!rendered.contains("<effort>"), "{extra}");
     }
     let on = encoding.render(&json!({"messages": user, "thinking": {"type": "enabled", "budget_tokens": 20000}}), &[]).unwrap();
-    assert!(on.ends_with("]~b]ai\n") && on.contains("<effort>xhigh</effort>"));
+    assert!(on.ends_with("]~b]ai\n<mm:think>") && on.contains("<effort>xhigh</effort>"), "{on:?}");
+}
+
+#[test]
+fn enabled_thinking_opens_the_block_and_adaptive_leaves_it_to_the_model() {
+    let encoding = encoding();
+    let user = json!([{"role": "user", "content": "Hi"}]);
+    for (extra, end) in [(json!({"thinking": {"type": "enabled"}}), "]~b]ai\n<mm:think>"),
+        (json!({"thinking": {"type": "Enabled"}, "enable_thinking": false}), "]~b]ai\n<mm:think>"),
+        (json!({}), "]~b]ai\n"), (json!({"thinking": {"type": "adaptive"}}), "]~b]ai\n"),
+        (json!({"reasoning_effort": "high"}), "]~b]ai\n"), (json!({"enable_thinking": true}), "]~b]ai\n")] {
+        let mut body = json!({"messages": user});
+        body.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+        assert!(encoding.render(&body, &[]).unwrap().ends_with(end), "{extra}");
+    }
+    // The prompt opened the block, so output starts as reasoning.
+    let enabled = MiniMaxParserOptions { thinking: true, ..Default::default() };
+    let projection = parse_everywhere(&enabled, "Think <b>first</b>.</mm:think>\nAnswer.[e~[");
+    assert_eq!((projection.reasoning.as_str(), projection.content.as_str()), ("Think <b>first</b>.", "Answer."));
 }
 
 #[test]
@@ -140,18 +160,22 @@ fn response_format_joins_the_developer_message() {
 #[test]
 fn token_contract_is_pinned_to_the_release() {
     let tokens = encoding();
-    assert_eq!(tokens.tokens(), &MiniMaxTokenIds { eos: vec![200_020], think_close: 200_060, image: 200_025, video: 200_026 });
+    assert_eq!(tokens.tokens(), &MiniMaxTokenIds { eos: vec![200_020], think_close: 200_060, image: 200_025, video: 200_026,
+        turn_markers: vec![200_019, 200_034] });
     let profile_ids = crate::openai::ModelEncoding::MiniMaxM3(std::sync::Arc::new(encoding()));
     assert_eq!(profile_ids.eos_token_ids(), [200_020]);
     assert_eq!(profile_ids.think_close_token_id(), Some(200_060));
     assert!(profile_ids.supports_thinking_off());
+    // A fake next turn stops at its marker token instead of spending tokens until the parser sees it.
+    let profile = crate::openai::ModelProfile::new("m", profile_ids);
+    for tools in [false, true] { assert_eq!(profile.stop_token_ids(tools), [200_019, 200_020, 200_034]); }
 }
 
 fn snapshot_dir(eos: Value) -> tempfile::TempDir {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("chat_template.jinja"), TEMPLATE).unwrap();
     std::fs::write(dir.path().join("tokenizer_config.json"), br#"{"bos_token": "]~b]", "eos_token": "[e~["}"#).unwrap();
-    let added: Vec<_> = [("]~b]", 200_019), ("[e~[", 200_020), (IMAGE, 200_025), (VIDEO, 200_026),
+    let added: Vec<_> = [("]~b]", 200_019), ("[e~[", 200_020), (IMAGE, 200_025), (VIDEO, 200_026), ("]~!b[", 200_034),
         (NS, 200_058), (THINK_OPEN, 200_059), (THINK_CLOSE, 200_060)]
         .into_iter().map(|(content, id)| json!({"content": content, "id": id})).collect();
     std::fs::write(dir.path().join("tokenizer.json"), json!({"added_tokens": added}).to_string()).unwrap();
@@ -261,7 +285,7 @@ fn parse_everywhere(options: &MiniMaxParserOptions, text: &str) -> Projection {
 }
 
 fn options(tools: Option<Vec<ToolDefinition>>) -> MiniMaxParserOptions {
-    MiniMaxParserOptions { tools, stop_sequences: Vec::new() }
+    MiniMaxParserOptions { tools, ..Default::default() }
 }
 
 #[test]
@@ -289,13 +313,36 @@ fn calls_parse_with_schema_types_at_every_split() {
             param("mode", &format!("{NS}<append>false{NS}</append>")),
             param("rows", &format!("{NS}<item>{NS}<n>1{NS}</n>{NS}</item>{NS}<item>{NS}<n>2{NS}</n>{NS}</item>"))])]));
     let projection = parse_everywhere(&options(Some(tools())), &text);
-    assert_eq!(projection, Projection { reasoning: "Two lookups.".into(), content: "Checking.\n".into(),
+    // The whitespace before a parsed call is dropped, as glm5 drops it.
+    assert_eq!(projection, Projection { reasoning: "Two lookups.".into(), content: "Checking.".into(),
         calls: vec![
             ("get_weather".into(), json!({"city": "Taipei 台北", "days": 2, "metric": true, "ratio": 0.5, "tags": ["a", "b c"],
                 "range": {"lo": 1, "hi": 9}, "either": "7", "extra": "kept as text"})),
             ("write_file".into(), json!({"path": "/tmp/a.txt", "text": "line1\nline2 <b>&</b> ]x[",
                 "mode": {"append": false}, "rows": [{"n": 1}, {"n": 2}]}))],
         stop: Some(GlmStop::Marker("[e~[".into())) });
+}
+
+#[test]
+fn type_sets_enums_consts_and_additional_properties_type_values() {
+    let schema = json!({"type": "object", "additionalProperties": {"type": "integer"}, "properties": {
+        "days": {"type": ["integer", "null"]}, "note": {"type": ["string", "null"]}, "unit": {"enum": ["c", "f"]},
+        "level": {"enum": [1, 2, 3]}, "answer": {"const": 42}, "flag": {"type": ["boolean", "null"]},
+        "list": {"type": ["array", "null"], "items": {"type": ["number", "null"]}},
+        "opts": {"type": ["object", "null"], "properties": {"n": {"type": ["integer", "null"]}}}}});
+    let tools = vec![tool("t", schema)];
+    let call = |params: &[String]| parse_everywhere(&options(Some(tools.clone())), &block(&[invoke("t", params)])).calls;
+    assert_eq!(call(&[param("days", "3"), param("note", "Oslo"), param("unit", "c"), param("level", "2"), param("answer", "42"),
+        param("flag", "true"), param("list", &format!("{NS}<item>1.5{NS}</item>{NS}<item>null{NS}</item>")),
+        param("opts", &format!("{NS}<n>7{NS}</n>")), param("extra", "9")]),
+        vec![("t".into(), json!({"days": 3, "note": "Oslo", "unit": "c", "level": 2, "answer": 42, "flag": true,
+            "list": [1.5, null], "opts": {"n": 7}, "extra": 9}))]);
+    // JSON of a type in the set wins; the text is the value only where a string is allowed.
+    assert_eq!(call(&[param("days", "null"), param("note", "null"), param("flag", "null"), param("list", "null"), param("opts", "null")]),
+        vec![("t".into(), json!({"days": null, "note": null, "flag": null, "list": null, "opts": null}))]);
+    for (key, value) in [("days", "three"), ("extra", "nine"), ("flag", "yes"), ("list", "a, b")] {
+        assert!(call(&[param(key, value)]).is_empty(), "{key}={value}");
+    }
 }
 
 #[test]
@@ -319,7 +366,7 @@ fn undeclared_tool_or_calls_without_tools_stay_visible_text() {
     // No tools declared: the block is plain content, the parser must not invent calls.
     // With no tools the call opener ends the turn, as GLM's disabled <tool_call> does.
     let projection = parse_everywhere(&options(None), &format!("hello {text}"));
-    assert_eq!((projection.content.as_str(), projection.stop), ("hello ", Some(GlmStop::Marker(CALL_OPEN.into()))));
+    assert_eq!((projection.content.as_str(), projection.stop), ("hello", Some(GlmStop::Marker(CALL_OPEN.into()))));
     assert!(projection.calls.is_empty());
     // A name outside the declared tools is still a well-formed call with untyped text values.
     let projection = parse_everywhere(&options(Some(tools())), &block(&[invoke("unknown", &[param("n", "1")])]));
@@ -340,8 +387,6 @@ fn malformed_calls_stay_visible_and_never_become_partial_calls() {
         block(&[invoke("get_weather", &[param("city", "a"), param("city", "b")])]),
         // wrongly typed integer
         block(&[invoke("get_weather", &[param("days", "two")])]),
-        // bare text between invokes
-        format!("{CALL_OPEN}\nnoise {good}{CALL_CLOSE}"),
         // empty block
         format!("{CALL_OPEN}\n{CALL_CLOSE}"),
         // missing name
@@ -349,13 +394,45 @@ fn malformed_calls_stay_visible_and_never_become_partial_calls() {
     ] {
         let projection = parse_everywhere(&options(Some(tools())), &format!("Plan. {text}"));
         assert!(projection.calls.is_empty(), "{text:?} -> {projection:?}");
-        assert_eq!(projection.content, format!("Plan. {text}"), "{text:?}");
+        assert_eq!(projection.content, format!("Plan. {}", text.trim_end()), "{text:?}");
     }
     let mut parser = MiniMaxOutputParser::new(options(Some(tools())));
     let mut chunks = parser.push(&format!("{CALL_OPEN}\n{INVOKE_OPEN}get_wea"));
     chunks.extend(parser.finish());
     assert_eq!(parser.tool_calls(), 0);
     assert_eq!(project(&chunks, None).content, format!("{CALL_OPEN}\n{INVOKE_OPEN}get_wea"));
+}
+
+#[test]
+fn one_broken_invoke_returns_alone_as_content() {
+    let (a, b) = (invoke("get_weather", &[param("city", "a")]), invoke("get_weather", &[param("city", "b")]));
+    let bad = invoke("get_weather", &[param("city", "c"), param("days", "two")]);
+    let text = format!("Three lookups.\n{}[e~[", block(&[a, bad.clone(), b]));
+    let projection = parse_everywhere(&options(Some(tools())), &text);
+    assert_eq!(projection.calls, vec![("get_weather".into(), json!({"city": "a"})), ("get_weather".into(), json!({"city": "b"}))]);
+    assert_eq!(projection.content, format!("Three lookups.\n{}", bad.trim_end()));
+    let mut parser = MiniMaxOutputParser::new(options(Some(tools())));
+    parser.push(&text);
+    assert_eq!(parser.tool_calls(), 2);
+    // Stray text between invokes, or an invoke cut short by the next one, returns the same way.
+    let good = invoke("get_weather", &[param("city", "Oslo")]);
+    let cut = format!("{INVOKE_OPEN}get_weather\">{}", param("city", "x"));
+    for (inner, content) in [(format!("noise {good}"), "noise".to_owned()), (format!("{cut}{good}"), cut.clone())] {
+        let projection = parse_everywhere(&options(Some(tools())), &format!("{CALL_OPEN}\n{inner}{CALL_CLOSE}"));
+        assert_eq!((projection.content, projection.calls), (content, vec![("get_weather".into(), json!({"city": "Oslo"}))]));
+    }
+}
+
+#[test]
+fn content_whitespace_and_text_after_calls_follow_glm() {
+    let call = block(&[invoke("get_weather", &[param("city", "Oslo")])]);
+    // `</tool_call>\n` before EOS must not open a trailing text block beside the call.
+    for tail in ["\n", "\n[e~[", "\nDone. More text.[e~["] {
+        let projection = parse_everywhere(&options(Some(tools())), &format!("\n\nChecking.  \n{call}{tail}"));
+        assert_eq!((projection.content.as_str(), projection.calls.len()), ("Checking.", 1), "{tail:?}");
+    }
+    let projection = parse_everywhere(&options(None), "<mm:think> r </mm:think>\n  Answer with  inner  space. \n");
+    assert_eq!((projection.reasoning.as_str(), projection.content.as_str()), (" r ", "Answer with  inner  space."));
 }
 
 #[test]
@@ -384,10 +461,25 @@ fn turn_markers_and_client_stops_end_the_stream() {
         let projection = parse_everywhere(&options(None), &format!("<mm:think>r</mm:think>answer{marker}after"));
         assert_eq!((projection.content.as_str(), projection.stop), ("answer", Some(GlmStop::Marker(marker.into()))));
     }
-    let with_stop = MiniMaxParserOptions { tools: Some(tools()), stop_sequences: vec!["STOP".into()] };
+    let with_stop = MiniMaxParserOptions { tools: Some(tools()), stop_sequences: vec!["STOP".into()], ..Default::default() };
     let projection = parse_everywhere(&with_stop, "<mm:think>STOP is reasoning</mm:think>answerSTOPignored");
     assert_eq!((projection.reasoning.as_str(), projection.content.as_str(), projection.stop),
         ("STOP is reasoning", "answer", Some(GlmStop::Sequence("STOP".into()))));
+}
+
+#[test]
+fn long_arguments_parse_in_linear_time() {
+    // A held block used to be rescanned whole for its closing tag on every push.
+    let text = "x".repeat(256 << 10);
+    let stream = block(&[invoke("write_file", &[param("path", "a"), param("text", &text)])]);
+    let mut parser = MiniMaxOutputParser::new(options(Some(tools())));
+    let started = std::time::Instant::now();
+    let mut chunks = Vec::new();
+    for piece in stream.as_bytes().chunks(4) { chunks.extend(parser.push(std::str::from_utf8(piece).unwrap())); }
+    chunks.extend(parser.finish());
+    let elapsed = started.elapsed();
+    assert_eq!(project(&chunks, None).calls, vec![("write_file".into(), json!({"path": "a", "text": text}))]);
+    assert!(elapsed < std::time::Duration::from_secs(1), "256 KiB in 4-byte pushes took {elapsed:?}");
 }
 
 #[test]
@@ -467,6 +559,7 @@ fn constrained_calls_use_the_m3_namespace_form() {
     let tags = &format["content"]["elements"][1];
     assert_eq!((tags["type"].as_str(), tags["separator"].as_str(), tags["stop_after_first"].as_bool()),
         (Some("tags_with_separator"), Some("\n"), Some(false)));
+    for at in [0, 2] { assert_eq!(format["content"]["elements"][at]["pattern"], "[ \\n\\t]{0,16}"); }
     assert_eq!(tags["tags"][0]["begin"], "]<]minimax[>[<invoke name=\"get_weather\">");
     assert_eq!(tags["tags"][0]["end"], INVOKE_CLOSE);
     assert_eq!(tags["tags"][0]["content"]["type"], "grammar");
@@ -476,23 +569,29 @@ fn constrained_calls_use_the_m3_namespace_form() {
 }
 
 #[test]
-fn response_constraint_allows_adaptive_reasoning_prefix_only_while_thinking() {
+fn response_constraint_reasoning_prefix_follows_the_thinking_mode() {
     use crate::openai::tools::{ToolConstraints, ToolSyntax};
     use deepseek_recipe_core::tools::ToolChoice;
     let required = ToolConstraints::new(&tools(), ToolChoice::Auto, true, true, false, ToolSyntax::MiniMaxM3).unwrap();
-    let on: Value = serde_json::from_str(&grammar::response(None, true, required.as_ref()).unwrap().unwrap().0).unwrap();
+    let on: Value = serde_json::from_str(&grammar::response(None, Thinking::Adaptive, required.as_ref()).unwrap().unwrap().0).unwrap();
     assert_eq!(on["type"], "structural_tag");
     let elements = on["format"]["elements"].as_array().unwrap();
     assert_eq!(elements[0]["type"], "optional");
     assert_eq!(elements[0]["content"]["elements"][0]["value"], THINK_CLOSE);
     assert_eq!(elements[0]["content"]["elements"][1]["begin"], THINK_OPEN);
     assert_eq!(elements[1]["begin"], CALL_OPEN);
-    let off: Value = serde_json::from_str(&grammar::response(None, false, required.as_ref()).unwrap().unwrap().0).unwrap();
+    // Enabled thinking opened the block in the prompt: the output must close it.
+    let enabled: Value = serde_json::from_str(&grammar::response(None, Thinking::Enabled, required.as_ref()).unwrap().unwrap().0).unwrap();
+    let elements = enabled["format"]["elements"].as_array().unwrap();
+    assert_eq!((&elements[0]["type"], &elements[0]["excludes"]), (&json!("any_text"), &json!([THINK_CLOSE])));
+    assert_eq!((&elements[1]["type"], &elements[1]["value"]), (&json!("const_string"), &json!(THINK_CLOSE)));
+    assert_eq!(elements[2]["begin"], CALL_OPEN);
+    let off: Value = serde_json::from_str(&grammar::response(None, Thinking::Off, required.as_ref()).unwrap().unwrap().0).unwrap();
     assert_eq!(off["format"]["begin"], CALL_OPEN);
     // Unconstrained requests stay unconstrained.
     let optional = ToolConstraints::new(&tools(), ToolChoice::Auto, false, true, false, ToolSyntax::MiniMaxM3).unwrap();
-    assert!(grammar::response(None, true, optional.as_ref()).unwrap().is_none());
-    let json_mode = grammar::response(Some(json!({"type": "json_object"})), true, None).unwrap().unwrap();
+    assert!(grammar::response(None, Thinking::Enabled, optional.as_ref()).unwrap().is_none());
+    let json_mode = grammar::response(Some(json!({"type": "json_object"})), Thinking::Adaptive, None).unwrap().unwrap();
     assert!(json_mode.0.contains("ds41_json_schema") && json_mode.0.contains(THINK_OPEN));
 }
 
@@ -545,7 +644,8 @@ mod router {
 
     #[tokio::test]
     async fn chat_dispatch_uses_own_prompt_stops_sampling_and_parsers() {
-        let text = format!("<mm:think>Look it up.</mm:think>Checking.\n{}", block(&[invoke("get_weather",
+        // The newline after the block must not reach `content`.
+        let text = format!("<mm:think>Look it up.</mm:think>Checking.\n{}\n", block(&[invoke("get_weather",
             &[param("city", "Oslo"), param("days", "2")])]));
         for streaming in [false, true] {
             let body = json!({"model": MODEL, "stream": streaming, "tools": weather_tool(), "reasoning_effort": "high",
@@ -554,7 +654,7 @@ mod router {
             assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&bytes));
             assert!(seen.prompt.starts_with("]~!b[]~b]system\n") && seen.prompt.contains("<effort>high</effort>"));
             assert!(seen.prompt.contains("<tool>{\"name\": \"get_weather\"") && seen.prompt.ends_with("]~b]ai\n"));
-            assert!(seen.stops.contains(&200_020) && !seen.stops.contains(&248_046));
+            assert_eq!(seen.stops, [200_019, 200_020, 200_034]);
             assert!(seen.constraint.is_none());
             // The release's recommended sampling applies when the client sets none.
             assert_eq!((seen.temperature, seen.top_p), (1.0, 0.95));
@@ -575,7 +675,7 @@ mod router {
                     serde_json::from_str(message["tool_calls"][0]["function"]["arguments"].as_str().unwrap()).unwrap(),
                     value["choices"][0]["finish_reason"].clone())
             };
-            assert_eq!((reasoning.as_str(), content.as_str(), reason.as_str()), ("Look it up.", "Checking.\n", Some("tool_calls")));
+            assert_eq!((reasoning.as_str(), content.as_str(), reason.as_str()), ("Look it up.", "Checking.", Some("tool_calls")));
             assert_eq!(calls, json!({"city": "Oslo", "days": 2}));
         }
     }
@@ -602,6 +702,44 @@ mod router {
         assert_eq!(elements[0]["type"], "optional");
         assert_eq!(elements[1]["begin"], CALL_OPEN);
         assert_eq!(elements[1]["content"]["elements"][1]["tags"][0]["begin"], "]<]minimax[>[<invoke name=\"get_weather\">");
+    }
+
+    #[tokio::test]
+    async fn strict_tool_calls_with_nullable_fields_pass_validation() {
+        // OpenAI strict mode: every field is required and optional ones are nullable by a type set.
+        let parameters = json!({"type": "object", "additionalProperties": false, "required": ["city", "days", "unit", "tags"],
+            "properties": {"city": {"type": "string"}, "days": {"type": ["integer", "null"]},
+                "unit": {"type": ["string", "null"], "enum": ["c", "f", null]},
+                "tags": {"type": ["array", "null"], "items": {"type": "string"}}}});
+        let body = json!({"model": MODEL, "messages": [{"role": "user", "content": "Weather?"}],
+            "tools": [{"type": "function", "function": {"name": "get_weather", "strict": true, "parameters": parameters}}]});
+        let reply = block(&[invoke("get_weather", &[param("city", "Oslo"), param("days", "3"), param("unit", "c"),
+                param("tags", &format!("{NS}<item>a{NS}</item>"))]),
+            invoke("get_weather", &[param("city", "Bergen"), param("days", "null"), param("unit", "null"), param("tags", "null")])]);
+        let (status, bytes, seen) = serve(body, &reply).await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&bytes));
+        assert!(seen.constraint.is_some());
+        let value: Value = serde_json::from_slice(&bytes).unwrap();
+        let calls: Vec<Value> = value["choices"][0]["message"]["tool_calls"].as_array().unwrap().iter()
+            .map(|c| serde_json::from_str(c["function"]["arguments"].as_str().unwrap()).unwrap()).collect();
+        assert_eq!(calls, [json!({"city": "Oslo", "days": 3, "unit": "c", "tags": ["a"]}),
+            json!({"city": "Bergen", "days": null, "unit": null, "tags": null})]);
+    }
+
+    #[tokio::test]
+    async fn enabled_thinking_opens_the_block_and_requires_its_close() {
+        let body = json!({"model": MODEL, "thinking": {"type": "enabled"}, "tools": weather_tool(), "tool_choice": "required",
+            "messages": [{"role": "user", "content": "Weather in Oslo?"}]});
+        let reply = format!("Look it up.</mm:think>{}", block(&[invoke("get_weather", &[param("city", "Oslo")])]));
+        let (status, bytes, seen) = serve(body, &reply).await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&bytes));
+        assert!(seen.prompt.ends_with("]~b]ai\n<mm:think>"), "{}", seen.prompt);
+        let constraint: Value = serde_json::from_str(&seen.constraint.unwrap()).unwrap();
+        assert_eq!(constraint["format"]["elements"][0]["type"], "any_text");
+        let value: Value = serde_json::from_slice(&bytes).unwrap();
+        let message = &value["choices"][0]["message"];
+        assert_eq!((&message["reasoning_content"], &message["tool_calls"][0]["function"]["name"]),
+            (&json!("Look it up."), &json!("get_weather")));
     }
 
     #[tokio::test]

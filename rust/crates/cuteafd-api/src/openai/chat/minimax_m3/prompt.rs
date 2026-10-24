@@ -1,5 +1,5 @@
 use serde_json::{json, Value};
-use super::super::glm5::prompt::{reasoning_effort, template_message, response_format_instruction};
+use super::super::glm5::prompt::{reasoning_effort, resolve_thinking, template_message, response_format_instruction};
 use super::super::glm5::template::python_json;
 
 /// The template prints scalars with `{{ val }}`: minijinja spells floats unlike
@@ -28,6 +28,8 @@ pub fn template_context(body: &Value, tool_names: &[String]) -> Result<Value, St
     let raw = body["messages"].as_array().ok_or("messages must be an array")?;
     if raw.is_empty() { return Err("messages must not be empty".into()); }
     let mut messages = raw.iter().enumerate().map(|(i, message)| {
+        // The template reads `root`, its high-priority system prompt, only first and drops it elsewhere.
+        if i > 0 && message["role"] == "root" { return Err("a root message must be the first message".to_owned()); }
         let mut out = template_message(message, i)?;
         for key in ["current_date", "current_location"] {
             if let Some(value) = message.get(key) { out[key] = value.clone(); }
@@ -72,7 +74,8 @@ pub fn template_context(body: &Value, tool_names: &[String]) -> Result<Value, St
         if effort != "none" { context["reasoning_effort"] = json!(effort); }
     } else if let Some(budget) = body.get("thinking").and_then(|v| v.get("budget_tokens")) {
         let budget = budget.as_u64().and_then(|v| u32::try_from(v).ok()).ok_or("thinking.budget_tokens must be a non-negative u32")?;
-        context["reasoning_effort"] = json!(budget_effort(budget));
+        // A budget sizes thinking; with thinking off it is not an effort.
+        if resolve_thinking(body)? { context["reasoning_effort"] = json!(budget_effort(budget)); }
     }
     if !tool_names.is_empty() {
         let tools = body["tools"].as_array().ok_or("tools must be an array")?;
