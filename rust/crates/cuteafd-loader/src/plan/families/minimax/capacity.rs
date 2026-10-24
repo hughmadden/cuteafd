@@ -1,9 +1,10 @@
 //! NVFP4 K/V (`--kv-cache nvfp4`): a planning contract without a native executor.
 use super::admission::AdmissionError;
-use crate::families::minimax_m3::{config::MiniMaxM3Config, reference};
+use crate::families::{minimax_m3::{cache::{MiniMaxCacheLayout, PAGE_ROWS}, config::MiniMaxM3Config}, qwen4::Qwen4KvCache};
 use crate::plan::{layout::LayoutOptions, Hint, PlanReport};
 use cuteafd_core::memory_layout::{Basis, Category, DeviceKind, Item, MemoryLayout};
 
+/// Proposed NVFP4 K/V bytes per token beside the native FP8 index keys.
 #[derive(Debug, Clone, Copy)]
 pub struct Records {
     pub kv: u64,
@@ -11,12 +12,12 @@ pub struct Records {
     pub globals: u64,
 }
 impl Records {
-    pub fn new(cfg: &MiniMaxM3Config, nvfp4: bool) -> Self {
+    pub fn new(cfg: &MiniMaxM3Config) -> Result<Self, AdmissionError> {
+        let layout = MiniMaxCacheLayout::new(cfg, 1, cfg.max_position as u64, Qwen4KvCache::Fp8)?;
+        let fp8_kv = 2 * layout.layers as u64 * layout.ranks[0].kv_page_bytes / PAGE_ROWS;
         let heads = (cfg.layers * cfg.kv_heads * 2) as u64;
-        Self { kv: if nvfp4 { heads * (cfg.head_dim / 2 + cfg.head_dim / 16) as u64 }
-            else { reference::kv_bytes_per_token(cfg, 1) as u64 },
-            index: reference::index_bytes_per_token(cfg) as u64,
-            globals: if nvfp4 { heads * 4 } else { 0 } }
+        Ok(Self { kv: heads * (cfg.head_dim / 2 + cfg.head_dim / 16) as u64,
+            index: layout.token_bytes(0) - fp8_kv, globals: heads * 4 })
     }
 }
 
@@ -45,7 +46,7 @@ pub(super) fn apply(cfg: &MiniMaxM3Config, memory: &mut MemoryLayout, report: &m
     ensure!(opts.native_mtp_layers > 0, "MiniMax cache proposals require the bundled DSpark");
     ensure!(opts.minimax_kv == crate::families::qwen4::Qwen4KvCache::Fp8,
         "MiniMax cache proposals support FP8 or NVFP4, not BF16");
-    let records = Records::new(cfg, true);
+    let records = Records::new(cfg)?;
     let gpu = memory.devices.iter_mut().find(|d| d.kind == DeviceKind::Rtx).unwrap();
     gpu.items.retain(|i| i.category != Category::Kv);
     let available = gpu.capacity_bytes.saturating_sub(gpu.used_bytes());
@@ -68,10 +69,8 @@ mod tests {
     #[test]
     fn minimax_nvfp4_records_and_budget() {
         let cfg = MiniMaxM3Config::from_hf(&crate::families::minimax_m3::config::tests::release_config()).unwrap();
-        let fp8 = Records::new(&cfg, false);
-        let fp4 = Records::new(&cfg, true);
-        assert_eq!((fp8.kv, fp8.index), (61_440, 7_920));
-        assert_eq!((fp4.kv + fp4.index, fp4.globals), (42_480, 1_920));
+        let fp4 = Records::new(&cfg).unwrap();
+        assert_eq!((fp4.kv, fp4.index, fp4.globals), (34_560, 7_920, 1_920));
         let p = pool(fp4, 5 << 30, None).unwrap();
         assert_eq!(p.tokens, ((5u64 << 30) - 1920) / 42480 / 128 * 128);
         assert!(p.gpu_bytes <= 5 << 30);

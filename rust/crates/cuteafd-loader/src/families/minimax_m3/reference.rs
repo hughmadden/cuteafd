@@ -82,17 +82,6 @@ pub fn msa_attended(msa: &MsaConfig, selection: &[i32], position: usize) -> usiz
     }).sum()
 }
 
-/// Bytes of one token's main KV across every layer: K and V for every KV head.
-pub fn kv_bytes_per_token(cfg: &MiniMaxM3Config, element_bytes: usize) -> usize {
-    cfg.layers * 2 * cfg.kv_heads * cfg.head_dim * element_bytes
-}
-
-/// Bytes of one token's MSA index key across the sparse layers, in the paged
-/// indexer layout (FP8 E4M3 row plus one FP32 scale).
-pub fn index_bytes_per_token(cfg: &MiniMaxM3Config) -> usize {
-    cfg.sparse.iter().filter(|s| **s).count() * (cfg.msa.index_dim + 4)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -167,13 +156,5 @@ mod tests {
         assert_eq!(msa_attended(&msa, &selection, position), 15 * 128 + 6);
         // A future key never counts: the reference masks it before pooling.
         assert_eq!(msa_select(&msa, &scores[..=position], position), selection);
-    }
-
-    #[test]
-    fn release_cache_record_sizes() {
-        let cfg = MiniMaxM3Config::from_hf(&release_config()).unwrap();
-        assert_eq!(kv_bytes_per_token(&cfg, 1), 61_440);
-        assert_eq!(kv_bytes_per_token(&cfg, 2), 122_880);
-        assert_eq!(index_bytes_per_token(&cfg), 7_920);
     }
 }
