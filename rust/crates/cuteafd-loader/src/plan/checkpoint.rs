@@ -99,11 +99,17 @@ fn quantization_config<'a>(config: &'a Value, external: Option<&'a Value>) -> Op
 
 /// The same source metadata selection as [`Checkpoint::quantization`], also
 /// usable for a standalone tensor extract without an index or engine sidecar.
-pub fn read_quantization_config(snapshot: &Path) -> Result<Option<Value>> {
+pub fn read_quantization_configs(snapshot: &Path) -> Result<Vec<Value>> {
     let path = snapshot.join("config.json");
     let config = if path.is_file() { read_json(&path)? } else { Value::Null };
     let external = read_external_quantization_config(snapshot)?;
-    Ok(quantization_config(&config, external.as_ref()).cloned())
+    Ok(quantization_configs(&config, external.as_ref()).cloned().collect())
+}
+
+fn quantization_configs<'a>(config: &'a Value, external: Option<&'a Value>) -> impl Iterator<Item = &'a Value> {
+    config.get("quantization_config").into_iter()
+        .chain(config.get("text_config").and_then(|text| text.get("quantization_config")))
+        .chain(external)
 }
 
 impl Checkpoint {
@@ -406,6 +412,12 @@ impl Checkpoint {
             .get("text_config")
             .filter(|value| value.is_object())
             .unwrap_or(&self.config)
+    }
+
+    /// Every source-native declaration, retaining external metadata when the
+    /// primary config describes only a quantization wrapper (e.g. EXL3).
+    pub fn quantizations(&self) -> impl Iterator<Item = &Value> {
+        quantization_configs(&self.config, self.quantize_config.as_ref())
     }
 
     /// `quantization_config` from config.json, else the external file.
