@@ -29,7 +29,7 @@ use std::time::{Duration, Instant};
 use crate::synthetic::{expert_response_from_protocol_v2_response, protocol_v2_request_from_expert_request, ProtocolV2ExecutorResponseRef, ProtocolV2ExpertExecutor, ProtocolV2RequestDevicePayload, SyntheticRouteExecutor};
 use crate::{is_connection_closed, verbs_host_preflight, ExpertProtocolV2FrameBuffer, ExpertProtocolV2Request, ExpertProtocolV2RequestView, ExpertProtocolV2Response, ExpertProtocolV2ResponseHeader, ExpertProtocolV2ResponseView, ExpertProtocolV2Status, ExpertV2Dtype, TcpTransportConfig, EXPERT_PROTOCOL_V2_REQUEST_HEADER_LEN, EXPERT_PROTOCOL_V2_RESPONSE_DEBUG_HEADER_LEN, EXPERT_PROTOCOL_V2_RESPONSE_HEADER_LEN};
 
-const PERSISTENT_CONTROL_VERSION: u32 = 4;
+const PERSISTENT_CONTROL_VERSION: u32 = 5;
 const PERSISTENT_CONTROL_LIMIT: usize = 64 * 1024;
 
 fn decode_persistent_control<T: DeserializeOwned>(value: serde_json::Value) -> Result<T> {
@@ -2245,6 +2245,25 @@ impl VerbsHostProtocolV2PersistentClientSession {
                 VERBS_HOST_RECV_WR_ID + slot as u64,
             )?;
         }
+        // Replies above one chunk WRITE their tail into the receive they will
+        // complete: tell the worker where receive `s` lands. Write mode has
+        // no receives; its replies already go straight to the client's plane.
+        let reply_target = if !write_mode && request_write::needs_target(response_capacity_wire_bytes) {
+            let (address, rkey) = library.rdma_rc_endpoint_request_target(endpoint.info.handle)?;
+            let landing = match (gpu_landing, landing) {
+                (true, Some(landing)) => {
+                    let (address, rkey) = library.rdma_rc_endpoint_recv_landing_target(endpoint.info.handle)?;
+                    Some(request_write::ReplyLanding { address, rkey, slot_bytes: landing.slot_bytes,
+                        slots: landing.bytes / landing.slot_bytes, header_bytes: EXPERT_PROTOCOL_V2_RESPONSE_HEADER_LEN })
+                }
+                _ => None,
+            };
+            endpoint.traffic.receives_writes();
+            Some(request_write::ReplyTarget { address, rkey, slot_stride_bytes: response_ring.slot_stride_bytes,
+                depth: response_ring.depth, landing })
+        } else { None };
+        write_control(&mut stream, &VerbsHostProtocolV2ReplyTarget {
+            message: "protocol_v2_reply_target".into(), wire_version: PERSISTENT_CONTROL_VERSION, target: reply_target })?;
         let (response_frame_recycle_tx, response_frame_recycle_rx) = mpsc::channel();
         let (pinned_response_frame_recycle_tx, pinned_response_frame_recycle_rx) = mpsc::channel();
         // Landed payloads are not in the host slot, so there is nothing to retain.
@@ -3311,6 +3330,15 @@ struct VerbsHostProtocolV2PersistentStart {
     model_endpoint: Option<u32>,
 }
 
+/// Client to worker after the client QP is connected and its receives are
+/// posted: where each reply frame above one chunk WRITEs its tail.
+#[derive(Debug, Serialize, Deserialize)]
+struct VerbsHostProtocolV2ReplyTarget {
+    message: String,
+    wire_version: u32,
+    target: Option<request_write::ReplyTarget>,
+}
+
 fn is_zero_label(label: &u32) -> bool {
     *label == 0
 }
@@ -3382,6 +3410,9 @@ struct NativeRdmaEndpoint {
     terminal_owner: Option<Arc<AtomicBool>>,
     traffic: Arc<crate::traffic::WireCounter>,
     credits: EndpointCredits,
+    /// Receives successfully posted on this QP. The coordinator stamps it into
+    /// every request as the reply watermark (`request_write::stamp_watermark`).
+    recvs_posted: std::sync::atomic::AtomicU64,
 }
 
 impl NativeRdmaEndpoint {
@@ -3502,7 +3533,7 @@ impl NativeRdmaEndpoint {
             send_frame_bytes, recv_frame_bytes, send_span, recv_span,
             queue_depth, queue_depth, max_sge, host_buffer_flags,
         )?;
-        Ok(Self { library, info, terminal_owner: None, credits: EndpointCredits::default(),
+        Ok(Self { library, info, terminal_owner: None, credits: EndpointCredits::default(), recvs_posted: Default::default(),
             traffic: crate::traffic::register(&rdma_device.device, rdma_device.port, "", c_char_array_to_string(&info.gid_hex), info.active_mtu) })
     }
 
@@ -3588,7 +3619,9 @@ impl NativeRdmaEndpoint {
 
     fn post_recv_at(&self, offset_bytes: usize, bytes: usize, wr_id: u64) -> Result<()> {
         self.library
-            .rdma_rc_endpoint_post_recv_at(self.info.handle, offset_bytes, bytes, wr_id)
+            .rdma_rc_endpoint_post_recv_at(self.info.handle, offset_bytes, bytes, wr_id)?;
+        self.recvs_posted.fetch_add(1, Ordering::Relaxed);
+        Ok(())
     }
 
     fn send(&self, frame: &[u8]) -> Result<()> {

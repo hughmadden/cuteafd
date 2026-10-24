@@ -39,6 +39,112 @@ fn parts(bytes: usize) -> impl Iterator<Item = (usize, usize, bool)> {
         .chain(std::iter::once((0, head, false)))
 }
 
+/// Where the coordinator's reply frame `s` lands: it consumes the `s`-th
+/// receive the coordinator posted on this QP. Receives are posted in slot
+/// order (initial `0..depth`, then reposts in consumption order, which
+/// `RepostOrder` keeps), so receive `s` is host slot `s % depth`; with GPU
+/// landing its payload goes to device slot `s % landing.slots` (native
+/// rotates one slot per post). Sent once over the control stream after the
+/// coordinator has attached landing and posted its initial receives.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub(super) struct ReplyTarget {
+    /// Coordinator response ring (host slots), exposed for remote WRITE.
+    pub address: u64,
+    pub rkey: u32,
+    pub slot_stride_bytes: usize,
+    pub depth: usize,
+    /// GPU landing: frame bytes past `header_bytes` land here instead.
+    pub landing: Option<ReplyLanding>,
+}
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub(super) struct ReplyLanding {
+    pub address: u64,
+    pub rkey: u32,
+    pub slot_bytes: usize,
+    pub slots: usize,
+    pub header_bytes: usize,
+}
+impl ReplyTarget {
+    pub fn validate(&self, slot_capacity_bytes: usize) -> Result<()> {
+        anyhow::ensure!(self.address != 0 && self.depth > 0 && self.slot_stride_bytes >= slot_capacity_bytes,
+            "invalid coordinator reply target");
+        if let Some(landing) = self.landing {
+            anyhow::ensure!(landing.address != 0 && (1..=4).contains(&landing.slots) && landing.slot_bytes > 0
+                && (1..CHUNK_BYTES).contains(&landing.header_bytes), "invalid coordinator GPU landing target");
+        }
+        Ok(())
+    }
+    /// Remote address and key for reply `sequence`'s frame bytes starting at
+    /// `offset` (`offset >= CHUNK_BYTES`, so past any landing header).
+    pub fn tail(&self, sequence: u64, offset: usize, bytes: usize, capacity: usize) -> Result<(u64, u32)> {
+        anyhow::ensure!(offset >= CHUNK_BYTES && offset.checked_add(bytes).is_some_and(|end| end <= capacity),
+            "reply tail outside its frame");
+        match self.landing {
+            Some(landing) => {
+                let slot = (sequence % landing.slots as u64) as usize;
+                let at = offset - landing.header_bytes;
+                anyhow::ensure!(at + bytes <= landing.slot_bytes, "reply tail exceeds its GPU landing slot");
+                Ok((landing.address + (slot * landing.slot_bytes + at) as u64, landing.rkey))
+            }
+            None => {
+                let slot = (sequence % self.depth as u64) as usize;
+                Ok((self.address + (slot * self.slot_stride_bytes + offset) as u64, self.rkey))
+            }
+        }
+    }
+}
+
+/// Reply frame `sequence` may WRITE into its receive only once that receive is
+/// posted: `sequence < posted`, compared on the 32-bit wrapping watermark the
+/// coordinator stamps into every request (exact while the gap is < 2^31).
+pub(super) fn reply_receive_posted(sequence: u64, watermark: u32) -> bool {
+    (watermark.wrapping_sub(sequence as u32) as i32) > 0
+}
+
+/// Stamps the coordinator's receives-posted count into a staged request header.
+pub(super) fn stamp_watermark(header: &mut [u8], flags: u32, posted: u64) -> Result<()> {
+    let at = crate::protocol_v2::request_reply_watermark_offset(flags);
+    header.get_mut(at..at + 4).context("request header too short for its watermark")?
+        .copy_from_slice(&(posted as u32).to_le_bytes());
+    Ok(())
+}
+pub(super) fn read_watermark(header: &[u8], flags: u32) -> Result<u32> {
+    let at = crate::protocol_v2::request_reply_watermark_offset(flags);
+    Ok(u32::from_le_bytes(header.get(at..at + 4).context("request header too short for its watermark")?
+        .try_into().unwrap()))
+}
+
+/// One WR of a reply frame staged at a worker send slot, in post order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ReplyPart {
+    /// Frame bytes `[offset, offset + bytes)` RDMA-written to `remote`.
+    Write { offset: usize, bytes: usize, remote: (u64, u32) },
+    /// The head: the frame's first `bytes`, as the SEND that completes the
+    /// coordinator's receive (the whole frame when it is not chunked).
+    Send { bytes: usize },
+}
+
+/// How reply frame `sequence` of `bytes` goes out: tail WRITEs into the
+/// receive it will complete, then the head SEND, when it exceeds one chunk and
+/// that receive is covered by `watermark`; otherwise one SEND, which RC holds
+/// until the receive is posted. Returns whether the frame was chunked.
+pub(super) fn reply_parts(target: Option<&ReplyTarget>, watermark: Option<u32>, sequence: u64, bytes: usize,
+    capacity: usize) -> Result<(Vec<ReplyPart>, bool)> {
+    let covered = watermark.is_some_and(|posted| reply_receive_posted(sequence, posted));
+    match target {
+        Some(target) if bytes > CHUNK_BYTES && covered => {
+            let mut out = Vec::with_capacity(bytes.div_ceil(CHUNK_BYTES));
+            for offset in (CHUNK_BYTES..bytes).step_by(CHUNK_BYTES) {
+                let len = CHUNK_BYTES.min(bytes - offset);
+                out.push(ReplyPart::Write { offset, bytes: len, remote: target.tail(sequence, offset, len, capacity)? });
+            }
+            out.push(ReplyPart::Send { bytes: CHUNK_BYTES });
+            Ok((out, true))
+        }
+        _ => Ok((vec![ReplyPart::Send { bytes }], false)),
+    }
+}
+
 /// Requests posted to one worker and not yet answered by a final reply. The
 /// worker's slot for the next request is free only below `depth`.
 #[derive(Debug, Default)]
@@ -193,6 +299,10 @@ impl VerbsHostProtocolV2PersistentClientSession {
         let slot = unsafe { std::slice::from_raw_parts_mut(view.host_ptr.cast::<u8>().add(slot_offset), staged) };
         let (head, payload) = slot.split_at_mut(prefix_bytes);
         head.copy_from_slice(self.request_frame.as_slice());
+        // Every receive posted so far may take a reply tail WRITE. Read after
+        // the waits above: a later post only raises it.
+        stamp_watermark(head, request.header.flags,
+            self.endpoint.recvs_posted.load(std::sync::atomic::Ordering::Relaxed))?;
         if payload_region.is_none() {
             if payload.len() >= PARALLEL_REQUEST_COPY_BYTES {
                 copy_threads(payload, &request.hidden_payload);
@@ -384,6 +494,124 @@ mod tests {
         Ok(())
     }
 
+    fn host_target(depth: usize) -> ReplyTarget {
+        ReplyTarget { address: 1 << 40, rkey: 7, slot_stride_bytes: 64 << 20, depth, landing: None }
+    }
+
+    #[test]
+    fn small_replies_stay_one_send_and_large_covered_replies_end_with_the_head() -> Result<()> {
+        let target = host_target(8);
+        let capacity = 50 << 20;
+        // At or under one chunk: one SEND everywhere (decode, verify).
+        for bytes in [96, 40_000, CHUNK_BYTES] {
+            assert_eq!(reply_parts(Some(&target), Some(100), 3, bytes, capacity)?,
+                (vec![ReplyPart::Send { bytes }], false));
+        }
+        // A 33,816,672-byte MiMo N3 reply into receive 11 (slot 3, covered).
+        let bytes = 33_816_672;
+        let (parts, chunked) = reply_parts(Some(&target), Some(12), 11, bytes, capacity)?;
+        assert!(chunked);
+        assert_eq!(parts.len(), bytes.div_ceil(CHUNK_BYTES));
+        assert_eq!(*parts.last().unwrap(), ReplyPart::Send { bytes: CHUNK_BYTES });
+        let mut next = CHUNK_BYTES;
+        for part in &parts[..parts.len() - 1] {
+            let ReplyPart::Write { offset, bytes: len, remote } = *part else { panic!("head before tail") };
+            assert_eq!(offset, next);
+            assert_eq!(remote, (target.address + (3 * target.slot_stride_bytes + offset) as u64, 7));
+            next += len;
+        }
+        assert_eq!(next, bytes);
+        // No target (write mode or small capacity): one SEND.
+        assert_eq!(reply_parts(None, Some(12), 11, bytes, capacity)?.1, false);
+        Ok(())
+    }
+
+    #[test]
+    fn uncovered_receives_fall_back_to_one_send_and_the_watermark_wraps() -> Result<()> {
+        let target = host_target(8);
+        let bytes = 3 * CHUNK_BYTES;
+        // Receive 12 is not posted yet at watermark 12: RC SEND waits for it.
+        assert_eq!(reply_parts(Some(&target), Some(12), 12, bytes, 64 << 20)?, (vec![ReplyPart::Send { bytes }], false));
+        assert_eq!(reply_parts(Some(&target), None, 0, bytes, 64 << 20)?.1, false);
+        assert!(reply_parts(Some(&target), Some(13), 12, bytes, 64 << 20)?.1);
+        // 32-bit wrap: the sequence just below 2^32 is covered by a small watermark.
+        assert!(reply_receive_posted(u32::MAX as u64, 3));
+        assert!(reply_receive_posted((1u64 << 32) + 2, 3));
+        assert!(!reply_receive_posted((1u64 << 32) + 3, 3));
+        let mut header = vec![0u8; 128];
+        for flags in [0, crate::EXPERT_PROTOCOL_V2_FLAG_DEBUG_CHECKSUM] {
+            stamp_watermark(&mut header, flags, (1u64 << 32) + 5)?;
+            assert_eq!(read_watermark(&header, flags)?, 5);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn gpu_landing_tails_skip_the_host_header_and_rotate_landing_slots() -> Result<()> {
+        let landing = ReplyLanding { address: 1 << 41, rkey: 9, slot_bytes: 4096 * 6144 * 2, slots: 3, header_bytes: 96 };
+        let target = ReplyTarget { landing: Some(landing), ..host_target(8) };
+        target.validate(64 << 20)?;
+        let capacity = 96 + landing.slot_bytes;
+        // Receive 4 lands in device slot 1; frame offset o goes to o - 96 there.
+        assert_eq!(target.tail(4, CHUNK_BYTES, CHUNK_BYTES, capacity)?,
+            (landing.address + (landing.slot_bytes + CHUNK_BYTES - 96) as u64, 9));
+        // The last byte of a full plane is the last byte of its device slot.
+        assert!(target.tail(5, capacity - 1, 1, capacity).is_ok());
+        assert!(target.tail(5, capacity - 1, 2, capacity).is_err());
+        assert!(target.tail(5, CHUNK_BYTES - 1, 1, capacity).is_err(), "header bytes are never written");
+        assert!(ReplyTarget { landing: Some(ReplyLanding { slots: 5, ..landing }), ..target }.validate(64 << 20).is_err());
+        Ok(())
+    }
+
+    /// A post that fails mid-frame (tail WRITE posted, head not) leaves the
+    /// frame unsealed: its slot stays owned through any completions, and the
+    /// next frame is refused, so the connection drops and quiesces the QP
+    /// before the slot can be restaged under a live WRITE.
+    #[test]
+    fn failed_mid_frame_post_keeps_the_slot_and_refuses_the_next_frame() -> Result<()> {
+        let mut sends = SendQueue::default();
+        sends.posted_request()?;
+        sends.posted_part(false)?;
+        sends.posted_part(false)?; // the head SEND then fails to post
+        sends.completed(2)?;
+        assert_eq!(sends.requests_in_flight(), 1, "an unsealed frame released its slot");
+        assert!(sends.posted_request().is_err());
+        Ok(())
+    }
+
+    /// N deferred requests: each final reply consumes the next coordinator
+    /// receive in emit order; with the coordinator reposting every consumed
+    /// receive before its next dispatch, every reply frame of every request is
+    /// covered and chunks, multi-frame replies included.
+    #[test]
+    fn deferred_and_multi_frame_replies_stay_covered_by_dispatch_watermarks() -> Result<()> {
+        for (depth, deferred, frames) in [(8usize, 1usize, 1usize), (8, 3, 1), (8, 2, 3), (2, 2, 1)] {
+            let target = host_target(depth);
+            let mut posted = depth as u64; // initial receives
+            let mut consumed = 0u64;
+            let mut sent = 0u64;
+            let mut watermark = None;
+            for _wave in 0..64 {
+                // Coordinator dispatches `deferred` requests; each stamps P.
+                for _ in 0..deferred { watermark = Some(posted as u32); }
+                // Worker replies: `frames` frames per request.
+                for _ in 0..deferred * frames {
+                    let (parts, chunked) = reply_parts(Some(&target), watermark, sent, 4 * CHUNK_BYTES, 64 << 20)?;
+                    assert!(sent < posted, "a frame would consume an unposted receive");
+                    assert_eq!(chunked, sent < watermark.unwrap() as u64);
+                    // Every frame fits the ring here, so every frame chunks.
+                    assert!(chunked || deferred * frames > depth, "depth {depth}: frame {sent} sent whole");
+                    assert!(matches!(parts.last(), Some(ReplyPart::Send { .. })));
+                    sent += 1;
+                }
+                // Coordinator consumes and reposts each received frame.
+                while consumed < sent { consumed += 1; posted += 1; }
+            }
+            assert!(sent > 0);
+        }
+        Ok(())
+    }
+
     /// Explicit hardware gate only. Compiling this test never opens a NIC.
     /// One loopback QP pair carries a WRITE tail plus head SEND into the
     /// receiver's posted slot without draining WRITE completions first.
@@ -428,5 +656,149 @@ mod tests {
         let a = library.rdma_rc_endpoint_destroy(client.handle);
         let b = library.rdma_rc_endpoint_destroy(server.handle);
         result.and(a).and(b)
+    }
+
+    /// Echoes the request's hidden rows in `frames` row-indexed host frames.
+    struct ChunkedEcho { frames: u32 }
+    impl crate::synthetic::ProtocolV2ExpertExecutor for ChunkedEcho {
+        fn name(&self) -> &'static str { "chunked-echo" }
+        fn execute(&self, _: &ExpertProtocolV2RequestView<'_>) -> Result<crate::ExpertProtocolV2Response> {
+            bail!("chunked echo streams")
+        }
+        fn execute_streaming(&self, request: &ExpertProtocolV2RequestView<'_>,
+            emit: &mut dyn FnMut(crate::ExpertProtocolV2ResponseRef<'_>) -> Result<()>) -> Result<()> {
+            let h = &request.header;
+            let stride = h.hidden_row_stride_bytes as usize;
+            let rows = h.row_count;
+            let per = rows.div_ceil(self.frames).max(1);
+            let indices: Vec<u32> = (0..rows).collect();
+            for first in (0..rows).step_by(per as usize) {
+                let end = (first + per).min(rows);
+                let payload = &request.hidden_payload()[first as usize * stride..end as usize * stride];
+                let response = crate::ExpertProtocolV2ResponseRef::new_with_output_stride(h.request_id,
+                    h.placement_version, h.layer_id, end - first, h.hidden_dim, h.hidden_dtype, stride as u32,
+                    crate::ExpertProtocolV2Status::Ok, payload)?.with_executor_name(self.name());
+                let response = if self.frames > 1 {
+                    response.with_row_indices(&indices[first as usize..end as usize], end < rows)?
+                } else { response };
+                emit(response)?;
+            }
+            Ok(())
+        }
+    }
+
+    fn bf16_request(id: u64, rows: u32, hidden: u32) -> Result<ExpertProtocolV2Request> {
+        let payload: Vec<u8> = (0..rows as usize * hidden as usize * 2).map(|i| ((i * 7 + id as usize) % 253) as u8).collect();
+        Ok(ExpertProtocolV2Request::new(id, 1, 3, hidden, crate::ExpertV2Dtype::Bf16,
+            (0..rows).map(|row| crate::ExpertProtocolV2RowDescriptor { row_id: row.into(),
+                source_kind: crate::ExpertV2SourceKind::Prefill, source_request_id: id, token_position: row.into(),
+                route_offset: row, route_count: 1 }).collect(),
+            (0..rows).map(|row| crate::ExpertProtocolV2RouteEntry { row_index: row, expert_id: 0, gate_weight: 1.0 })
+                .collect(), payload)?)
+    }
+
+    /// Explicit hardware gate only (golden-run.py --rdma --native-test).
+    /// A real worker (`serve_protocol_v2_verbs_host_with_executor`) and a real
+    /// coordinator transport on one host: request tails, watermarks and reply
+    /// tails end to end. `CUTEAFD_LOOPBACK_ADDR` is a local RoCE address.
+    /// Pinned-host intake: 1/2/3-wave dispatch, single- and four-frame
+    /// replies, small (SEND-only) and large (chunked) frames; GPU landing
+    /// (`CUTEAFD_LOOPBACK_GPU=1`): single-frame replies into a device plane.
+    #[test]
+    #[ignore = "requires approved native RDMA loopback hardware gate"]
+    fn native_loopback_reply_tails_land_byte_exact_on_pinned_and_gpu_intake() -> Result<()> {
+        let ip = std::env::var("CUTEAFD_LOOPBACK_ADDR").context("set CUTEAFD_LOOPBACK_ADDR to a local RoCE address")?;
+        let gpu = std::env::var("CUTEAFD_LOOPBACK_GPU").as_deref() == Ok("1");
+        let hidden = 6144u32;
+        let capacity = 2048u32;
+        for frames in if gpu { vec![1] } else { vec![1, 4] } {
+            let listener = std::net::TcpListener::bind(format!("{ip}:0"))?;
+            let addr = listener.local_addr()?;
+            drop(listener);
+            let executor: Arc<dyn crate::synthetic::ProtocolV2ExpertExecutor> = Arc::new(ChunkedEcho { frames });
+            std::thread::spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+                let _ = runtime.block_on(super::super::serve_protocol_v2_verbs_host_with_executor(&addr.to_string(), executor));
+            });
+            std::thread::sleep(Duration::from_millis(300));
+            for waves in [1usize, 2, 3] {
+                let library = load_verbs_host_native_library()?;
+                let mut client = super::super::LocalTp4Client::new_ranks(vec![addr], TcpTransportConfig {
+                    timing: false, timeout: Duration::from_secs(30), max_frame_bytes: 64 << 20 });
+                client.set_max_waves(waves)?;
+                let plane_bytes = capacity as usize * hidden as usize * 2;
+                let mut plane = None;
+                if gpu {
+                    let buffer = library.alloc_device_buffer(plane_bytes * waves)?;
+                    client.set_landing(vec![Some(DeviceLanding::with_slots(buffer, waves)?)])?;
+                    plane = Some(buffer);
+                }
+                let result = (|| -> Result<()> {
+                    client.bootstrap(&bf16_request(0, capacity, hidden)?)?;
+                    let written_before = crate::traffic::written_total();
+                    let mut large = 0usize;
+                    let mut request_tails = 0u64;
+                    // Small (one SEND each way), then large frames: 21 rows is
+                    // 258,048 payload bytes, just under one chunk with headers.
+                    let sizes = [1u32, 21, 64, 2048, 1500, 2048, 7, 2048];
+                    let mut sent = std::collections::VecDeque::new();
+                    for (index, &rows) in sizes.iter().cycle().take(sizes.len() * 3).enumerate() {
+                        while client.open_waves() == waves {
+                            let (request, slot): (ExpertProtocolV2Request, usize) = sent.pop_front().unwrap();
+                            let mut got = vec![0u8; request.hidden_payload.len()];
+                            while !client.poll(|chunk| {
+                                if chunk.landed { return Ok(()); }
+                                let first = chunk.row_indices.as_ref().map_or(0, |rows| rows[0]) as usize;
+                                let at = first * hidden as usize * 2;
+                                got[at..at + chunk.partial_output_payload.as_ref().len()]
+                                    .copy_from_slice(chunk.partial_output_payload.as_ref());
+                                Ok(())
+                            })? {}
+                            if let Some(buffer) = plane {
+                                let view = CuteafdDeviceBuffer { ptr: unsafe { buffer.ptr.cast::<u8>()
+                                    .add(slot * plane_bytes) }.cast(), bytes: got.len(), ..buffer };
+                                library.copy_d2h(&mut got, view)?;
+                            }
+                            anyhow::ensure!(got == request.hidden_payload.as_ref(), "request {} echo differs",
+                                request.header.request_id);
+                        }
+                        let request = bf16_request(index as u64 + 1, rows, hidden)?;
+                        let wire = request.wire_stats().wire_bytes;
+                        if wire > CHUNK_BYTES { large += 1; request_tails += (wire - CHUNK_BYTES) as u64; }
+                        client.dispatch(&request)?;
+                        sent.push_back((request, index % waves));
+                    }
+                    while let Some((request, slot)) = sent.pop_front() {
+                        let mut got = vec![0u8; request.hidden_payload.len()];
+                        while !client.poll(|chunk| {
+                            if chunk.landed { return Ok(()); }
+                            let first = chunk.row_indices.as_ref().map_or(0, |rows| rows[0]) as usize;
+                            let at = first * hidden as usize * 2;
+                            got[at..at + chunk.partial_output_payload.as_ref().len()]
+                                .copy_from_slice(chunk.partial_output_payload.as_ref());
+                            Ok(())
+                        })? {}
+                        if let Some(buffer) = plane {
+                            let view = CuteafdDeviceBuffer { ptr: unsafe { buffer.ptr.cast::<u8>()
+                                .add(slot * plane_bytes) }.cast(), bytes: got.len(), ..buffer };
+                            library.copy_d2h(&mut got, view)?;
+                        }
+                        anyhow::ensure!(got == request.hidden_payload.as_ref(), "request {} echo differs",
+                            request.header.request_id);
+                    }
+                    let written = crate::traffic::written_total() - written_before;
+                    // Request tails are exact; everything above them is reply tails.
+                    let reply_tails = written.checked_sub(request_tails).context("request tails not all written")?;
+                    anyhow::ensure!(large > 0 && reply_tails > 0, "no reply tail was written");
+                    eprintln!("loopback gpu={gpu} frames={frames} waves={waves}: {large} large requests, \
+                        request tails {request_tails} B, reply tails {reply_tails} B");
+                    Ok(())
+                })();
+                client.reset();
+                if let Some(mut buffer) = plane { library.free_device_buffer(&mut buffer)?; }
+                result?;
+            }
+        }
+        Ok(())
     }
 }

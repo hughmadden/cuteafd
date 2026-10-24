@@ -5559,6 +5559,19 @@ let RC go-back-N replay most of a 26.5 MB frame per loss (MiMo request
 wire/engine 1.04-3.2x); chunked WRITE measured 1.015x. Replies are still one
 large SEND per rank per wave.
 
+Reply frames mirror that rule. Every request header carries, in its last
+four bytes, the coordinator's count of receives posted on that QP (a 32-bit
+wrapping watermark; frame protocol 4, persistent control 5). Reply frame `s`
+completes the coordinator's `s`-th receive: host slot `s % depth`, and with
+GPU landing device slot `s % waves`, whose payload starts at frame byte 96.
+After the QP connects, the coordinator sends the worker its response ring and
+its GPU landing (separate strict, remote-writable MR) addresses and keys. A
+frame above 256 KiB whose receive the latest watermark covers WRITEs every
+byte past 256 KiB there, then SENDs its first 256 KiB on the same QP. Small
+frames and uncovered ones (a retained slot not yet reposted) are one SEND,
+which RC holds until the receive is posted. Write mode sends its rows as
+256 KiB WRITEs and the flag alone, last.
+
 Context-split staging (GLM 5.3 port; GLM Flash and V4 have the same shape):
 today only the first lane gathers each layer's history into that layer
 parity's staging view, and later lanes reuse it. Units can run ahead (dense

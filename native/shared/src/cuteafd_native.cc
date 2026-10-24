@@ -465,6 +465,9 @@ struct CuteafdRdmaRcEndpointHandle {
   ibv_mr* read_mr = nullptr;
   // Receive ring exposed for request-tail WRITEs (`request_target`).
   ibv_mr* request_target_mr = nullptr;
+  // GPU landing range exposed for reply-tail WRITEs (`recv_landing_target`):
+  // the same pages as `landing_mr`, strictly ordered and remote-writable.
+  ibv_mr* landing_target_mr = nullptr;
   // Registered host words the completion flags of written responses are sent
   // from (a ring, so a value is never rewritten while its write may be queued).
   ibv_mr* flag_source_mr = nullptr;
@@ -531,6 +534,7 @@ bool destroy_rdma_rc_endpoint(CuteafdRdmaRcEndpointHandle* endpoint) {
     deregister(endpoint->read_mr);
   }
   if (endpoint->request_target_mr != nullptr) deregister(endpoint->request_target_mr);
+  if (endpoint->landing_target_mr != nullptr) deregister(endpoint->landing_target_mr);
   if (endpoint->flag_source_mr != nullptr) {
     deregister(endpoint->flag_source_mr);
   }
@@ -3808,6 +3812,10 @@ extern "C" cuteafd_status_t cuteafd_rdma_rc_endpoint_set_recv_landing(
   }
 #if CUTEAFD_NATIVE_ENABLE_RDMA && CUTEAFD_NATIVE_ENABLE_CUDA
   auto* endpoint = static_cast<CuteafdRdmaRcEndpointHandle*>(handle);
+  if (endpoint->landing_target_mr != nullptr) {
+    ibv_dereg_mr(endpoint->landing_target_mr);
+    endpoint->landing_target_mr = nullptr;
+  }
   if (endpoint->landing_mr != nullptr) {
     ibv_dereg_mr(endpoint->landing_mr);
     endpoint->landing_mr = nullptr;
@@ -3874,6 +3882,31 @@ extern "C" cuteafd_status_t cuteafd_rdma_rc_endpoint_expose_device(void* handle,
   (void)device_ptr;
   (void)bytes;
   return fail(CUTEAFD_STATUS_RDMA_UNAVAILABLE, "exposing device memory requires RDMA and CUDA");
+#endif
+}
+
+extern "C" cuteafd_status_t cuteafd_rdma_rc_endpoint_recv_landing_target(
+    void* handle, uint64_t* address, uint32_t* rkey) {
+  if (handle == nullptr || address == nullptr || rkey == nullptr)
+    return fail(CUTEAFD_STATUS_INVALID_ARGUMENT, "invalid landing target output");
+#if CUTEAFD_NATIVE_ENABLE_RDMA && CUTEAFD_NATIVE_ENABLE_CUDA
+  auto* ep = static_cast<CuteafdRdmaRcEndpointHandle*>(handle);
+  if (ep->landing_mr == nullptr || ep->qp == nullptr)
+    return fail(CUTEAFD_STATUS_RDMA_UNAVAILABLE, "endpoint has no GPU landing to expose");
+  if (ep->landing_target_mr == nullptr) {
+    // No RELAXED_ORDERING: a reply's tail WRITEs land before the head SEND
+    // that completes the receive which reports the frame.
+    ibv_mr* mr = nullptr;
+    const cuteafd_status_t status = register_device_dmabuf(ep->pd, ep->landing_ptr, ep->landing_bytes, &mr,
+        IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE);
+    if (status != CUTEAFD_STATUS_OK) return status;
+    ep->landing_target_mr = mr;
+  }
+  *address = reinterpret_cast<uintptr_t>(ep->landing_ptr);
+  *rkey = ep->landing_target_mr->rkey;
+  return ok();
+#else
+  return fail(CUTEAFD_STATUS_RDMA_UNAVAILABLE, "GPU landing targets require RDMA and CUDA");
 #endif
 }
 

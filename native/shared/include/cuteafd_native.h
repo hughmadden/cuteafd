@@ -578,6 +578,10 @@ cuteafd_status_t cuteafd_rdma_rc_endpoint_register_region(void* handle, void* pt
 cuteafd_status_t cuteafd_rdma_rc_endpoint_post_send_slot_region(
     void* handle, size_t slot_offset, size_t slot_bytes, uint32_t region, size_t region_offset,
     size_t region_bytes, uint64_t wr_id);
+// Exposes the GPU landing range set by `set_recv_landing` for remote WRITE
+// (strict ordering, second MR over the same pages); stable until the landing
+// changes or the endpoint is destroyed.
+cuteafd_status_t cuteafd_rdma_rc_endpoint_recv_landing_target(void* handle, uint64_t* address, uint32_t* rkey);
 // Request frames (every persistent request). The receiver exposes its admitted
 // request ring for remote WRITE (no relaxed ordering; key lives until destroy).
 cuteafd_status_t cuteafd_rdma_rc_endpoint_request_target(void* handle, uint64_t* address, uint32_t* rkey);

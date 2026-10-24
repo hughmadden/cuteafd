@@ -4894,6 +4894,20 @@ impl NativeLibrary {
         Ok((address, rkey))
     }
 
+    /// Exposes the endpoint's GPU landing range for remote reply-tail WRITEs
+    /// and returns its address and rkey.
+    pub fn rdma_rc_endpoint_recv_landing_target(&self, handle: *mut c_void) -> Result<(u64, u32)> {
+        type F = unsafe extern "C" fn(*mut c_void, *mut u64, *mut u32) -> CuteafdStatus;
+        // SAFETY: symbol resolved by name with the declared C signature.
+        let f: Symbol<F> = unsafe { self.lib.get(b"cuteafd_rdma_rc_endpoint_recv_landing_target")? };
+        let (mut address, mut rkey) = (0, 0);
+        // SAFETY: the caller owns the live endpoint handle; both outputs are
+        // valid locals that native writes only on success.
+        let status = unsafe { f(handle, &mut address, &mut rkey) };
+        self.status_to_result("cuteafd_rdma_rc_endpoint_recv_landing_target", status)?;
+        Ok((address, rkey))
+    }
+
     /// Posts one signaled WR carrying frame bytes `[offset, offset + bytes)`
     /// of the request staged at send-ring `slot`: the first `prefix` bytes
     /// from the slot, the rest from `region` (`None`: all from the slot).
