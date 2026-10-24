@@ -1443,8 +1443,17 @@ cuteafd_status_t mapped_word(const uint32_t* word, CUdeviceptr* out) {
   if (word == nullptr || (reinterpret_cast<uintptr_t>(word) & 3) != 0) {
     return fail(CUTEAFD_STATUS_INVALID_ARGUMENT, "stream value word must be a non-null aligned u32");
   }
+  // Only page-locked (pinned or registered) host memory: with HMM or UVA a
+  // pageable address can also yield a device pointer, but the stream memory
+  // operations require memory the driver keeps resident.
+  cudaPointerAttributes attributes{};
+  cudaError_t err = cudaPointerGetAttributes(&attributes, word);
+  if (err != cudaSuccess || attributes.type != cudaMemoryTypeHost) {
+    cudaGetLastError();
+    return fail(CUTEAFD_STATUS_INVALID_ARGUMENT, "stream value word is not mapped pinned host memory");
+  }
   void* device = nullptr;
-  const cudaError_t err = cudaHostGetDevicePointer(&device, const_cast<uint32_t*>(word), 0);
+  err = cudaHostGetDevicePointer(&device, const_cast<uint32_t*>(word), 0);
   if (err != cudaSuccess) {
     return fail_cuda(CUTEAFD_STATUS_INVALID_ARGUMENT,
                      "stream value word is not mapped pinned host memory", err);

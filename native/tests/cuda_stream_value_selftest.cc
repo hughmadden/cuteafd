@@ -117,22 +117,7 @@ int main() {
   at(flag).store(3, std::memory_order_release);
   wait_idle(stream);
 
-  // 6. Graph capture: both memops capture and replay (zero steady-state
-  //    captures need the waits to be replayable inside decode segments).
-  void* graph = nullptr;
-  check(cuteafd_cuda_graph_begin_capture(stream) == CUTEAFD_STATUS_OK, "begin capture");
-  check(cuteafd_cuda_stream_wait_value32(stream, flag, 4) == CUTEAFD_STATUS_OK, "captured wait");
-  check(cuteafd_cuda_stream_write_value32(stream, published, 11) == CUTEAFD_STATUS_OK, "captured write");
-  check(cuteafd_cuda_graph_end_capture(stream, &graph) == CUTEAFD_STATUS_OK, "end capture");
-  check(cuteafd_cuda_graph_launch(graph, stream) == CUTEAFD_STATUS_OK, "replay");
-  std::this_thread::sleep_for(std::chrono::milliseconds(20));
-  check(at(published).load(std::memory_order_acquire) == 10, "captured wait holds the replay");
-  at(flag).store(4, std::memory_order_release);
-  wait_idle(stream);
-  check(at(published).load(std::memory_order_acquire) == 11, "captured write published");
-  check(cuteafd_cuda_graph_exec_destroy(graph) == CUTEAFD_STATUS_OK, "graph destroy");
-
-  // 7. Many queued waits released in order by one rising counter (a decode
+  // 6. Many queued waits released in order by one rising counter (a decode
   //    step queued ahead of its exchange).
   for (uint32_t layer = 5; layer < 85; ++layer) {
     check(cuteafd_cuda_stream_wait_value32(stream, flag, layer) == CUTEAFD_STATUS_OK, "queued layer wait");

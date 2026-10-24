@@ -328,7 +328,9 @@ cuteafd_status_t cuteafd_cuda_event_query(void* cuda_event, int32_t* ready);
 // Stream memory operations on one u32 word of mapped pinned host memory
 // (`cuteafd_alloc_host_buffer`): a host thread and the GPU exchange sequence
 // numbers through it with no host wait. `word` is the host address; the call
-// resolves its device alias on the stream's device.
+// resolves its device alias on the stream's device. Both are queued eagerly
+// (between graph replays), never captured: the counters' values are runtime
+// state, not graph parameters.
 // wait: later work on `cuda_stream` starts only once (int32_t)(*word - value)
 // >= 0 (cyclic, wraparound-safe). Where the device can flush remote writes
 // the wait also orders GPUDirect RDMA writes that preceded the host's store.
