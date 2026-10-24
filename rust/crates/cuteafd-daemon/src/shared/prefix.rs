@@ -235,6 +235,39 @@ pub(crate) fn view(buffer: CuteafdDeviceBuffer, offset: usize, bytes: usize) -> 
     Ok(CuteafdDeviceBuffer { ptr: buffer.ptr.cast::<u8>().wrapping_add(offset).cast(), bytes, ..buffer })
 }
 
+/// One buffer of a pages-only prefix family (GLM 5.3, MiniMax M3): page `p` is
+/// `page_bytes` at `buffer + p * page_bytes`, and the first `rows` rows of a page
+/// are `rows * row_bytes` at each `(offset, row_bytes)` span.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PagedPlane {
+    pub buffer: CuteafdDeviceBuffer,
+    pub page_bytes: usize,
+    pub spans: &'static [(usize, usize)],
+}
+
+/// The paged E4M3 index-key page (GLM 5.3 DSA, MiniMax MSA): 64 rows of 128 key
+/// bytes, then 64 FP32 scales.
+pub(crate) const INDEX_PAGE_BYTES: usize = 64 * (128 + 4);
+const INDEX_PAGE_SPANS: &[(usize, usize)] = &[(0, 128), (64 * 128, 4)];
+
+impl PagedPlane {
+    /// An index-key plane ([`INDEX_PAGE_BYTES`] pages).
+    pub fn index(buffer: CuteafdDeviceBuffer) -> Self {
+        Self { buffer, page_bytes: INDEX_PAGE_BYTES, spans: INDEX_PAGE_SPANS }
+    }
+    /// Page `page` whole, as the host tier stores it.
+    pub fn page(&self, page: usize) -> cuteafd_hostcache::copy::DeviceRange {
+        cuteafd_hostcache::copy::DeviceRange { addr: self.buffer.ptr as u64 + (page * self.page_bytes) as u64,
+            bytes: self.page_bytes }
+    }
+    /// The copies of a partial tail: the first `rows` rows of page `from` into
+    /// page `to`, as `(destination, source)` views.
+    pub fn tail(&self, from: usize, to: usize, rows: usize) -> Result<Vec<(CuteafdDeviceBuffer, CuteafdDeviceBuffer)>> {
+        self.spans.iter().map(|&(offset, row_bytes)| Ok((view(self.buffer, to * self.page_bytes + offset, rows * row_bytes)?,
+            view(self.buffer, from * self.page_bytes + offset, rows * row_bytes)?))).collect()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
