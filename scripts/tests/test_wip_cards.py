@@ -22,6 +22,7 @@ def no_stop_handlers(monkeypatch):
     need a stop set cards.STOP themselves."""
     monkeypatch.setattr(cards, 'install_stop_handlers', lambda: None)
     monkeypatch.setitem(cards.STOP, 'signal', None)
+    monkeypatch.setattr(cards, '_LIVE', {})
 
 
 @pytest.fixture
