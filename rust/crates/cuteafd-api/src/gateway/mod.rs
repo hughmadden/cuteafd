@@ -161,6 +161,10 @@ fn models_routes(gateway: Arc<Gateway>) -> Router {
         } else { error.openai_response() })
     }
     use serde_json::{json, Value};
+    fn with_variant(mut entry: Value, gateway: &Gateway, id: &str) -> Value {
+        if let Some(variant) = gateway.backend.variant_field(id) { entry["variant"] = variant; }
+        entry
+    }
     fn entry(model: &ModelInfo, metadata: Option<&Value>) -> Value {
         let mut entry = json!({"id": model.id, "object": "model", "type": "model", "display_name": model.id,
             "created": 0, "created_at": "1970-01-01T00:00:00Z", "owned_by": model.owned_by,
@@ -197,7 +201,7 @@ fn models_routes(gateway: Arc<Gateway>) -> Router {
         if before { start = end.saturating_sub(limit).max(start); } else { end = (start + limit).min(end); }
         let page = &models[start..end];
         let metadata = gateway.backend.model_metadata();
-        let data: Vec<Value> = page.iter().map(|model| entry(model, metadata.as_ref())).collect();
+        let data: Vec<Value> = page.iter().map(|model| with_variant(entry(model, metadata.as_ref()), &gateway, &model.id)).collect();
         anthropic::with_request_id(Json(json!({"object": "list", "data": data, "has_more": has_more,
             "first_id": page.first().map(|m| m.id.clone()), "last_id": page.last().map(|m| m.id.clone())})).into_response())
     }
@@ -206,7 +210,8 @@ fn models_routes(gateway: Arc<Gateway>) -> Router {
             Ok(served) => {
                 let listing = gateway.models.listing(&gateway.backend.models());
                 let base = listing.iter().find(|m| m.id == served).cloned().unwrap_or_else(|| listing[0].clone());
-                anthropic::with_request_id(Json(entry(&ModelInfo { id, ..base }, gateway.backend.model_metadata().as_ref())).into_response())
+                let record = with_variant(entry(&ModelInfo { id: id.clone(), ..base }, gateway.backend.model_metadata().as_ref()), &gateway, &id);
+                anthropic::with_request_id(Json(record).into_response())
             }
             Err(error) => error_response(error, &headers),
         }
