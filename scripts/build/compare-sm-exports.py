@@ -311,7 +311,7 @@ def _export_exl3(extra, output):
             compact_ws = compact and len(bits) == 2 and package.compact_warp_specialized(
                 geometry, role, width, rows)
             ws = compact_ws or (len(bits) == 2 and tile is None
-                                and package.warp_specialized(geometry, role, width, rows))
+                                and package.warp_specialized(geometry, role, width, rows, bits))
             if ws:
                 block = 32 if compact_ws else 64
                 options["warp_specialized"] = True
