@@ -3,8 +3,9 @@
 
 Runs the checkpoint's own bundled processors (image_processor.py, video_processor.py,
 processing_minimax.py) and MiniMax's serving sampler and frame sizing (sglang
-minimax_m3_vl.py, copied below verbatim as pure functions) on deterministic inputs, and
-writes what they produce for the Rust parity test:
+minimax_m3_vl.py, kept in python/reference/minimax_m3_media.py) on deterministic inputs,
+checks that the Python preprocessing in minimax_m3_media.py reproduces the processors bit
+for bit, and writes what they produce for the Rust parity test:
 
   CUTEAFD_MINIMAX_PROCESSOR_PARITY=OUT cargo test -p cuteafd-loader minimax_vendor_parity -- --ignored
 
@@ -21,63 +22,19 @@ import argparse
 import hashlib
 import importlib.util
 import json
-import math
 import sys
 from pathlib import Path
 
 import numpy as np
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[4] / "python/reference"))
+import minimax_m3_media as media
 
 SOURCES = {  # MiniMaxAI/MiniMax-M3.1-Flash 54e4e69 (blob-identical at 9e7ebac)
     "image_processor.py": "8218f98634c365608a98ea887bfebac37131ec2acdb8445188350490de7cf994",
     "video_processor.py": "ced0f8d85d73f8722fecb26033d2d91ecf4a4e5112c91ce1b1522ca7edd0943d",
     "processing_minimax.py": "0706ae8b93b3489a3b3bc7f48a5f29fb34b1449ebebb37586250e4d5fa8f5e35",
 }
-
-
-# sglang python/sglang/srt/multimodal/processors/minimax_m3_vl.py (sha256 8e1f9b30...),
-# the two functions the serving path applies before the bundled processor.
-def round_up(x, multiple):
-    return (x + multiple - 1) // multiple * multiple
-
-
-def get_hw_multiple_of(image_size, multiple, max_size=None):
-    w, h = image_size
-    if isinstance(max_size, int):
-        ratio = 1.0
-        max_dim = max(w, h)
-        if max_dim > max_size:
-            ratio = max_size / max_dim
-        new_w = round_up(round(w * ratio), multiple)
-        new_h = round_up(round(h * ratio), multiple)
-        return new_w, new_h
-    raise NotImplementedError("only the integer frame_max_size path serves decoded videos")
-
-
-def _compute_sampled_frame_indices(total_frames, video_fps, fps, max_frames=None):
-    if total_frames <= 0 or video_fps <= 0 or fps <= 0:
-        return [0] if total_frames > 0 else []
-    read_time_interval = 1.0 / fps
-    eps = 1e-4
-    indices = []
-    prev_kept_ts = -float("inf")
-    while True:
-        if not indices:
-            target_frame = 0
-        else:
-            target_ts = prev_kept_ts + read_time_interval - eps
-            target_frame = math.ceil(target_ts * video_fps)
-            target_frame = max(target_frame, indices[-1] + 1)
-        if target_frame >= total_frames:
-            break
-        indices.append(target_frame)
-        prev_kept_ts = target_frame / video_fps
-    last_frame_idx = total_frames - 1
-    last_ts = last_frame_idx / video_fps
-    if indices and indices[-1] != last_frame_idx and last_ts - prev_kept_ts > eps:
-        indices.append(last_frame_idx)
-    if not indices:
-        indices = [0]
-    return indices
 
 
 def load(snapshot: Path, name: str):
@@ -168,6 +125,12 @@ def main():
         tensor = torch.from_numpy(rgb).permute(2, 0, 1).contiguous()
         result = images(images=[tensor], return_tensors="pt")
         grid = [int(v) for v in result["image_grid_thw"][0]]
+        size = media.smart_resize(h, w)
+        if size != image_module.smart_resize(h, w) or [1, size[0] // 14, size[1] // 14] != grid:
+            raise ValueError(f"{name}: minimax_m3_media.smart_resize differs from the release")
+        frame = media.resize_rgb(rgb, *size)
+        if not np.array_equal(media.patches(np.stack([frame, frame])), result["pixel_values"].numpy()):
+            raise ValueError(f"{name}: minimax_m3_media patches differ from the release processor")
         sha = write_patches(result["pixel_values"], args.out / f"{name}.f32")
         cases["images"].append({"name": name, "height": h, "width": w, "grid": grid,
                                 "tokens": grid[0] * grid[1] * grid[2] // 4, "patches_sha256": sha})
@@ -204,6 +167,10 @@ def main():
         result = processor(text=["]<]video[>["], videos=[tensor], videos_kwargs={"do_resize": resize,
                            "video_metadata": [metadata], "return_metadata": True}, return_tensors="pt")
         grid = [int(v) for v in result["video_grid_thw"][0]]
+        size = media.smart_resize(h, w, max_pixels=media.VIDEO_MAX_PIXELS) if resize else (h, w)
+        sized = [media.resize_rgb(frame, *size) for frame in frames]
+        if not np.array_equal(media.patches(sized + sized[-1:] * (count % 2)), result["pixel_values_videos"].numpy()):
+            raise ValueError(f"{name}: minimax_m3_media patches differ from the release processor")
         sha = write_patches(result["pixel_values_videos"], args.out / f"{name}.f32")
         text = tokenizer.decode(result["input_ids"][0].tolist(), skip_special_tokens=False)
         cases["videos"].append({"name": name, "frames": count, "height": h, "width": w,
@@ -215,7 +182,7 @@ def main():
                                   (751, 25.0, 0.5), (61, 60.0, 1.0), (240, 24.0, 3.0), (7, 2.0, 1.0),
                                   (3601, 29.97, 1.0), (45, 15.0, 1.5)]:
         cases["serving_sampler"].append({"total": total, "video_fps": video_fps, "fps": fps,
-            "indices": _compute_sampled_frame_indices(total, video_fps, fps)})
+            "indices": media.serving_frame_indices(total, video_fps, fps)})
     for total, video_fps, num_frames, fps in [(10, None, 4, None), (90, 30.0, None, None), (11, 2.5, None, 1.0),
                                              (100, 30.0, None, 2.0), (17, None, 16, None), (29, 7.0, None, 3.0),
                                              (1000, 29.97, None, 1.0), (13, None, 13, None)]:
@@ -225,13 +192,18 @@ def main():
                                          "fps": fps, "indices": [int(v) for v in indices]})
     for h, w in [(720, 1280), (1080, 1920), (480, 640), (1280, 720), (2160, 3840), (760, 1000), (28, 28),
                  (1, 1), (757, 3), (1001, 999), (756, 756), (300, 4000), (99, 100), (1081, 1919)]:
-        new_w, new_h = get_hw_multiple_of((w, h), 28, 756)
-        cases["serving_sizing"].append({"height": h, "width": w, "resized": [new_h, new_w]})
+        cases["serving_sizing"].append({"height": h, "width": w, "resized": list(media.serving_frame_size(h, w))})
         try:
             resized = list(video_module.smart_resize(h, w, factor=28, min_pixels=videos.min_pixels,
                                                      max_pixels=videos.max_pixels))
         except ValueError:  # aspect ratio above 200
             resized = None
+        try:
+            ours = list(media.smart_resize(h, w, max_pixels=media.VIDEO_MAX_PIXELS))
+        except ValueError:
+            ours = None
+        if ours != resized:
+            raise ValueError(f"{h}x{w}: minimax_m3_media.smart_resize differs from video_processor.py")
         cases["smart_sizing"].append({"height": h, "width": w, "resized": resized})
     (args.out / "cases.json").write_text(json.dumps(cases, indent=1) + "\n")
     print(json.dumps({"images": len(cases["images"]), "videos": len(cases["videos"]),
