@@ -38,14 +38,14 @@ struct Case {
 
 impl Case {
     /// Three variants: `kk`, 0 (does not edit this site) and `(kk + 1) / 2`;
-    /// rows draw base, each variant and an out-of-range negative index.
+    /// rows draw base, each variant and malformed negative/positive indices.
     fn new(seed: u64, rows: usize, h: usize, ld: usize, kk: usize) -> Self {
         let mut rng = Rng(seed);
         let shape = SteerRowsShape { rows, h, ld, k_max: kk, variants: 3 };
         let table = (shape.variants + 1) * kk * h;
         let b_scale = 2.0 / (h as f32).sqrt();
         let x = (0..rows * ld).map(|_| f32_to_bf16_rne(rng.unit() * 3.0)).collect();
-        let vidx = (0..rows).map(|_| match rng.below(9) { 0 => -1, n => (n % 4) as i32 }).collect();
+        let vidx = (0..rows).map(|_| match rng.below(12) { 0 => -1, 1 => 4, 2 => 63, 3 => i32::MAX, n => (n % 4) as i32 }).collect();
         let a = (0..table).map(|_| rng.unit() * 0.5).collect();
         let b = (0..table).map(|_| rng.unit() * b_scale).collect();
         Case { shape, x, vidx, a, b, k: vec![0, kk as i32, 0, kk.div_ceil(2) as i32] }
@@ -60,7 +60,7 @@ impl Case {
         std::thread::scope(|scope| {
             for (index, part) in x.chunks_mut(chunk * ld).enumerate() {
                 let vidx = &self.vidx[index * chunk..(index * chunk + chunk).min(rows)];
-                scope.spawn(move || steer_rows_ref(part, ld, vidx.len(), h, vidx, &self.a, &self.b, &self.k, k_max));
+                scope.spawn(move || steer_rows_ref(part, ld, vidx.len(), h, vidx, &self.a, &self.b, &self.k[..=self.shape.variants], k_max));
             }
         });
         x
@@ -156,11 +156,11 @@ fn steer_rows_matches_reference_bit_exactly() -> Result<()> {
                 // Base, k == 0 and negative rows are byte-unchanged; steered rows changed.
                 for (r, &v) in case.vidx.iter().enumerate() {
                     let row = r * ld..(r + 1) * ld;
-                    if v <= 0 || v == 2 {
+                    if v <= 0 || v as usize > case.shape.variants || v == 2 {
                         ensure!(got[row.clone()] == case.x[row], "h {h} k {kk}: row {r} (vidx {v}) was written");
                     }
                 }
-                ensure!(got != case.x || case.vidx.iter().all(|&v| v <= 0 || v == 2), "no row was steered");
+                ensure!(got != case.x || case.vidx.iter().all(|&v| v <= 0 || v as usize > case.shape.variants || v == 2), "no row was steered");
                 cases += 1;
             }
         }
@@ -204,7 +204,7 @@ fn steer_rows_is_batch_invariant() -> Result<()> {
 
 #[test]
 #[ignore = "requires a CUDA GPU and CUTEAFD_NATIVE_LIB built with CUTEAFD_ENABLE_STEER_ROWS_AOT"]
-fn steer_rows_graph_replays_new_rows_and_tables() -> Result<()> {
+fn steer_rows_graph_replays_new_masks_with_immutable_tables() -> Result<()> {
     let library = library()?;
     let steer = library.steer_rows()?;
     let stream = library.cuda_stream_create()?;
@@ -221,10 +221,13 @@ fn steer_rows_graph_replays_new_rows_and_tables() -> Result<()> {
             if let Some(error) = first_mismatch(&device.x()?, &first.reference(), 5120) {
                 anyhow::bail!("k {kk} first replay: {error}");
             }
-            // New rows, assignments, tables and k at the same addresses.
+            // Only row data and masks change; table values, addresses and V stay fixed.
             let mut second = Case::new(2000 + kk as u64, 64, 5120, 5120, kk);
-            second.k = vec![0, 0, kk as i32, 1];
-            device.upload(&second)?;
+            second.a = first.a.clone();
+            second.b = first.b.clone();
+            second.k = first.k.clone();
+            library.copy_h2d(device.buffers[0], &bytes(&second.x, u16::to_le_bytes))?;
+            library.copy_h2d(device.buffers[1], &bytes(&second.vidx, i32::to_le_bytes))?;
             library.cuda_graph_launch(graph, stream)?;
             library.cuda_stream_synchronize(stream)?;
             if let Some(error) = first_mismatch(&device.x()?, &second.reference(), 5120) {
@@ -307,7 +310,7 @@ impl AddCase {
             shape,
             y: (0..rows * ld_y).map(|_| f32_to_bf16_rne(rng.unit() * 3.0)).collect(),
             d: (0..rows * ld_d).map(|_| rng.unit() * 0.05).collect(),
-            vidx: (0..rows).map(|_| match rng.below(9) { 0 => -1, n => (n % 4) as i32 }).collect(),
+            vidx: (0..rows).map(|_| match rng.below(12) { 0 => -1, 1 => 4, 2 => 63, 3 => i32::MAX, n => (n % 4) as i32 }).collect(),
             on: vec![0, 1, 0, 1],
         }
     }
@@ -315,7 +318,7 @@ impl AddCase {
     fn reference(&self) -> Vec<u16> {
         let mut y = self.y.clone();
         let s = self.shape;
-        cuteafd_core::steer_rows::add_rows_ref(&mut y, s.ld_y, &self.d, s.ld_d, s.rows, s.h, &self.vidx, &self.on);
+        cuteafd_core::steer_rows::add_rows_ref(&mut y, s.ld_y, &self.d, s.ld_d, s.rows, s.h, &self.vidx, &self.on[..=s.variants]);
         y
     }
 }
@@ -389,14 +392,14 @@ fn add_rows_matches_reference_and_replays() -> Result<()> {
             }
             for (r, &v) in case.vidx.iter().enumerate() {
                 let row = r * case.shape.ld_y..(r + 1) * case.shape.ld_y;
-                if v <= 0 || v == 2 {
+                if v <= 0 || v as usize > case.shape.variants || v == 2 {
                     ensure!(got[row.clone()] == case.y[row], "add_rows h {h}: row {r} (vidx {v}) was written");
                 }
             }
             cases += 1;
         }
     }
-    // Graph replay with new rows, deltas, assignments and switches.
+    // Graph replay with new rows, deltas and masks; switches stay immutable.
     let first = AddCase::new(77, 64, 4096);
     let device = AddDevice::new(&library, &first)?;
     // SAFETY: stream is live; the graph is destroyed after a final synchronize.
@@ -408,8 +411,10 @@ fn add_rows_matches_reference_and_replays() -> Result<()> {
         library.cuda_stream_synchronize(stream)?;
         ensure!(device.y()? == first.reference(), "add_rows first replay differs");
         let mut second = AddCase::new(78, 64, 4096);
-        second.on = vec![0, 0, 1, 1];
-        device.upload(&second)?;
+        second.on = first.on.clone();
+        library.copy_h2d(device.buffers[0], &bytes(&second.y, u16::to_le_bytes))?;
+        library.copy_h2d(device.buffers[1], &bytes(&second.d, f32::to_le_bytes))?;
+        library.copy_h2d(device.buffers[2], &bytes(&second.vidx, i32::to_le_bytes))?;
         library.cuda_graph_launch(graph, stream)?;
         library.cuda_stream_synchronize(stream)?;
         ensure!(device.y()? == second.reference(), "add_rows second replay differs");
@@ -466,5 +471,115 @@ fn add_rows_timing() -> Result<()> {
         library.cuda_event_destroy(stop)?;
         library.cuda_stream_destroy(stream)?;
     }
+    Ok(())
+}
+
+/// Exact initialized tables and poison-filled allocation padding must have the
+/// same masks. Run under compute-sanitizer as well to audit speculative reads.
+#[test]
+#[ignore = "requires a CUDA GPU and CUTEAFD_NATIVE_LIB built with CUTEAFD_ENABLE_STEER_ROWS_AOT"]
+fn steer_rows_bounds_and_graph_masks_preserve_bits() -> Result<()> {
+    let library = library()?;
+    let steer = library.steer_rows()?;
+    let stream = library.cuda_stream_create()?;
+    for variants in [1, 3, 7] {
+        for kk in [1, 2, 19, 32] {
+            for padded in [false, true] {
+                let indices = [0, -1, i32::MIN, variants as i32 + 1, 63, i32::MAX, 1, variants as i32];
+                let mut first = Case::new(911, indices.len(), 128, 136, kk);
+                first.shape.variants = variants;
+                first.vidx = indices.to_vec();
+                let slots = if padded { 64 } else { variants + 1 };
+                first.a.resize(slots * kk * 128, 0.25);
+                first.b.resize(slots * kk * 128, 0.125);
+                first.k = vec![kk as i32; slots];
+                first.k[0] = i32::MAX;
+                first.k[1] = i32::MAX; // clamp; k_max still determines table stride
+                // Signaling NaN payloads and signed zeros expose an accidental
+                // BF16 roundtrip on base, invalid, or padded columns.
+                for r in 0..6 {
+                    for e in 0..136 { first.x[r * 136 + e] = [0x7f81, 0xffc3, 0x8000, 1][e % 4]; }
+                }
+                let device = Device::new(&library, &first)?;
+                // SAFETY: fixed buffers and metadata outlive graph retirement;
+                // each replay is synchronized before changing row inputs.
+                unsafe {
+                    library.cuda_graph_begin_capture(stream)?;
+                    device.launch(&steer, first.shape, stream)?;
+                    let graph = library.cuda_graph_end_capture(stream)?;
+                    for replay in 0..3 {
+                        let mut case = first.clone();
+                        if replay == 1 { case.vidx.rotate_right(2); }
+                        if replay == 2 { case.vidx.fill(0); }
+                        library.copy_h2d(device.buffers[0], &bytes(&case.x, u16::to_le_bytes))?;
+                        library.copy_h2d(device.buffers[1], &bytes(&case.vidx, i32::to_le_bytes))?;
+                        library.cuda_graph_launch(graph, stream)?;
+                        library.cuda_stream_synchronize(stream)?;
+                        ensure!(device.x()? == case.reference(),
+                            "steer bounds/replay V={variants} k_max={kk} padded={padded} replay={replay}");
+                    }
+                    library.cuda_graph_exec_destroy(graph)?;
+                }
+                for (buffer, expected) in [(device.buffers[2], bytes(&first.a, f32::to_le_bytes)),
+                    (device.buffers[3], bytes(&first.b, f32::to_le_bytes)),
+                    (device.buffers[4], bytes(&first.k, i32::to_le_bytes))] {
+                    let mut got = vec![0; expected.len()];
+                    library.copy_d2h(&mut got, buffer)?;
+                    ensure!(got == expected, "steering metadata was mutated");
+                }
+            }
+        }
+    }
+    // SAFETY: all replays synchronized and graphs were retired.
+    unsafe { library.cuda_stream_destroy(stream)? };
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires a CUDA GPU and CUTEAFD_NATIVE_LIB built with CUTEAFD_ENABLE_STEER_ROWS_AOT"]
+fn add_rows_bounds_and_graph_masks_preserve_bits() -> Result<()> {
+    let library = library()?;
+    let add = library.add_rows()?;
+    let stream = library.cuda_stream_create()?;
+    for variants in [1, 3, 7] {
+        for padded in [false, true] {
+            let indices = [0, -1, i32::MIN, variants as i32 + 1, 63, i32::MAX, 1, variants as i32];
+            let mut case = AddCase::new(733, indices.len(), 128);
+            case.shape.variants = variants;
+            case.vidx = indices.to_vec();
+            case.on = vec![1; if padded { 64 } else { variants + 1 }];
+            case.on[0] = 99;
+            if variants > 1 { case.on[variants] = 0; } // a valid hole
+            for r in 0..6 {
+                for e in 0..128 { case.y[r * 128 + e] = [0x7f81, 0xffc3, 0x8000, 1][e % 4]; }
+            }
+            let original_y = case.y.clone();
+            let device = AddDevice::new(&library, &case)?;
+            // SAFETY: buffers, bound, and switches remain fixed until graph
+            // retirement; each replay is synchronized before changing masks.
+            unsafe {
+                library.cuda_graph_begin_capture(stream)?;
+                device.launch(&add, case.shape, stream)?;
+                let graph = library.cuda_graph_end_capture(stream)?;
+                for replay in 0..3 {
+                    case.y = original_y.clone();
+                    if replay == 1 { case.vidx.rotate_right(2); }
+                    if replay == 2 { case.vidx.fill(0); }
+                    library.copy_h2d(device.buffers[0], &bytes(&case.y, u16::to_le_bytes))?;
+                    library.copy_h2d(device.buffers[2], &bytes(&case.vidx, i32::to_le_bytes))?;
+                    library.cuda_graph_launch(graph, stream)?;
+                    library.cuda_stream_synchronize(stream)?;
+                    ensure!(device.y()? == case.reference(),
+                        "add bounds/replay V={variants} padded={padded} replay={replay}");
+                }
+                library.cuda_graph_exec_destroy(graph)?;
+            }
+            let mut got = vec![0; case.on.len() * 4];
+            library.copy_d2h(&mut got, device.buffers[3])?;
+            ensure!(got == bytes(&case.on, i32::to_le_bytes), "delta switches were mutated");
+        }
+    }
+    // SAFETY: all replays synchronized and graphs were retired.
+    unsafe { library.cuda_stream_destroy(stream)? };
     Ok(())
 }
