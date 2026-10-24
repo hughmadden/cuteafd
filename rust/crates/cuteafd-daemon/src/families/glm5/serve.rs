@@ -424,11 +424,12 @@ fn release(family: &GlmPrefix<'_, '_>, cache: &mut PrefixCache<CudaCopyEngine<'_
 
 /// Serving statistics for `/v1/stats`.
 fn publish(stats: &Mutex<serde_json::Value>, requests: u64, generated: u64, active: usize, prefilling: usize,
-    cache: &PrefixCache<CudaCopyEngine<'_>>) {
+    cache: &PrefixCache<CudaCopyEngine<'_>>, variants: &cuteafd_core::variants::VariantStats) {
     if let Ok(mut stats) = stats.lock() {
         *stats = serde_json::json!({"requests": requests, "generated_tokens": generated, "active": active,
             "prefilling": prefilling, "prefix_cache": cache.stats(),
             "draft_policy": crate::shared::draft::resource::snapshot()});
+        if !variants.is_empty() { stats["variants"] = variants.json(); }
     }
 }
 
@@ -461,6 +462,8 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
     mut transport: Option<&mut SparkLink<'_>>, runtime: &tokio::runtime::Runtime, stats: &Mutex<serde_json::Value>,
     max_sequences: usize, policy: Policy, ranks: usize, prefix: &PrefixArgs, select: SelectPlacement) -> Result<()> {
     let (family, mut cache) = prefix_cache(engine, prefix, max_sequences)?;
+    let mut by_variant = cuteafd_core::variants::VariantStats::new(
+        engine.variants.as_ref().map(|v| v.records.clone()).unwrap_or_default());
     let markers = crate::shared::prefix::marker_ids(&opened.snapshot,
         &crate::families::glm5_flash::serve::MESSAGE_STARTS)?;
     let mut grammars = crate::shared::constraints::Compiler::with_vocab(
@@ -510,7 +513,7 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
                     if !busy {
                         // Idle: publish the state the server waits in (captures and releases done).
                         cache.tick();
-                        publish(stats, requests, generated_total, 0, 0, &cache);
+                        publish(stats, requests, generated_total, 0, 0, &cache, &by_variant);
                         console::gauges_now(|| console::Gauges::prefix_cache(&cache, 0, 0, 0));
                         match receive.blocking_recv() {
                             Some(job) => job,
@@ -567,6 +570,7 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
             };
             admitted_total += 1;
             let resume = admitted.resume;
+            by_variant.admitted(job.variant, tokens.len(), !cold, resume > 0);
             job.prefix_cache_source.set(resume, admitted.source.as_ref().is_some_and(|source| source.host));
             probe::admitted(&job.probe, "glm5", &tokens, resume);
             let _ = job.events.send(Ok(InferenceChunk::Ready {
@@ -680,6 +684,7 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
             });
             for (mut p, prefilled) in finished {
                 let (slot, placement, resume) = (p.slot, p.placement.clone(), p.resume);
+                by_variant.steered(placement.variant, placement.len.saturating_sub(resume));
                 if let Err(error) = &prefilled {
                     if p.cancelled {
                         p.ticket.cancel();
@@ -875,6 +880,7 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
         }
         phases[2] += timer.elapsed().as_secs_f64();
         cuteafd_transport::route_log::step(|| active.iter().zip(&sequences).map(|(a, s)| (a.id, s.len() as u32)).collect());
+        for (a, s) in active.iter().zip(&sequences) { by_variant.steered(a.placement.variant, s.len()); }
         let mut rows: Vec<(&mut GlmPlacement, usize)> = active.iter_mut().zip(&sequences)
             .map(|(a, s)| (&mut a.placement, s.len())).collect();
         let timer = Instant::now();
@@ -1026,8 +1032,10 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
             let engine_phases = std::mem::take(&mut *engine.profile.borrow_mut());
             let host = std::mem::take(&mut phases);
             let [steps, dflash, dflash_ok] = request.counts;
+            by_variant.finished(request.placement.variant, request.generated, dflash as u64, dflash_ok as u64);
             let per_step = |s: f64| 1e3 * s / host[6].max(1.0);
             tracing::info!(tokens = request.generated, seconds, tok_s = request.generated as f64 / seconds,
+                variant = by_variant.name(request.placement.variant),
                 active = active.len(), steps, dflash, dflash_ok, gpu_wait_s = engine_phases[0],
                 experts_s = engine_phases[1], head_s = engine_phases[2], "request complete");
             tracing::info!(steps = host[6], rows_per_step = host[7] / host[6].max(1.0), draft_ms = per_step(host[0]),
@@ -1046,7 +1054,7 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
             release(&family, &mut cache, &mut free_slots, &request.placement, request.slot);
         }
         cache.tick();
-        publish(stats, requests, generated_total, active.len(), prefills.len(), &cache);
+        publish(stats, requests, generated_total, active.len(), prefills.len(), &cache, &by_variant);
         console::gauges(|| console::Gauges::prefix_cache(&cache, active.len(), prefills.len(), receive.len() + kv_waiter.len()));
         prefills.stepped(cycle.elapsed().as_secs_f64());
     }

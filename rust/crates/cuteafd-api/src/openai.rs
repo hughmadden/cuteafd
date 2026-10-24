@@ -1251,7 +1251,9 @@ async fn chat(State(state): State<NativeState>, headers: axum::http::HeaderMap,
     if let Some(usage) = &usage {
         usage.details(crate::usage::Details {
             model_requested: body["model"].as_str().map(str::to_owned),
-            model_served: Some(state.profile.id.clone()),
+            // A weight variant is served under its own id (usage groups by it).
+            model_served: Some(body["model"].as_str().filter(|id| state.profile.variant_index(id).is_some())
+                .unwrap_or(&state.profile.id).to_owned()),
             stream: body["stream"].as_bool().unwrap_or(false),
             n_items: body["messages"].as_array().map(|v| v.len() as u64),
             n_tools: body["tools"].as_array().map(|v| v.len() as u64),
