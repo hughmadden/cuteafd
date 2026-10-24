@@ -684,6 +684,7 @@ impl<E: CopyEngine, P> HostCache<E, P> {
         if !self.enabled() {
             return RestoreOutcome::Failed;
         }
+        let begun = self.engine.now_ns();
         let plan = {
             let Some(snapshots) = self.snapshots.as_ref() else {
                 return RestoreOutcome::Failed;
@@ -716,11 +717,15 @@ impl<E: CopyEngine, P> HostCache<E, P> {
                 return RestoreOutcome::TimedOut;
             }
         };
+        let issued = self.engine.now_ns();
         let completed = self
             .engine
             .wait(event, self.config.restore_budget_ns)
             .unwrap_or(false);
         let ns = self.engine.now_ns().saturating_sub(start);
+        tracing::debug!(target: "cuteafd::hostcache", bytes = plan.bytes, completed,
+            plan_us = start.saturating_sub(begun) / 1000, issue_us = issued.saturating_sub(start) / 1000,
+            wait_us = (start + ns).saturating_sub(issued) / 1000, "host restore");
         // A timed-out restore still reads host slabs. Keep its pin if the
         // exceptional barrier fails; callers must also retain their targets.
         if completed || self.engine.release_barrier(Stream::Restore).is_ok() { self.unpin(key); }

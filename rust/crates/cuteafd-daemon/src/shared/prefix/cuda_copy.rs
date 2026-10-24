@@ -97,6 +97,12 @@ pub(crate) trait SnapshotOwner {
     fn snapshot_buffers(&self) -> Result<Vec<CuteafdDeviceBuffer>>;
 }
 
+/// Entries per `cudaMemcpyBatchAsync` call. The driver takes ~0.85 us per entry to submit a
+/// batch, and one large batch starts copying late; pieces of 1440 entries (8 MiniMax pages)
+/// keep submission ahead of the link (a 235-page MiniMax restore: 20.9 -> 26.2 GB/s against
+/// 26.9 for one contiguous copy, RTX 5090 on PCIe Gen4).
+const BATCH_ENTRIES: usize = 1440;
+
 /// A pinned chunk and how it was pinned, which decides how it is freed.
 struct Chunk {
     buffer: CuteafdHostBuffer,
@@ -240,6 +246,7 @@ impl<'a> CudaCopyEngine<'a> {
         Ok(())
     }
     fn issue_many(&mut self, stream: Stream, copies: &[(HostRange, DeviceRange)], d2h: bool) -> Result<()> {
+        let (started, submitted) = (Instant::now(), self.submissions);
         self.routed.clear();
         // Validate the complete plan, including ownership and all host extents,
         // before the first device receives work.
@@ -253,6 +260,7 @@ impl<'a> CudaCopyEngine<'a> {
                     bytes: device.bytes, ..self.template }));
             }
         }
+        let validated = started.elapsed();
         for rank in 0..self.streams.len() {
             if !self.routed.iter().any(|&(owner, _, _)| owner == rank) { continue; }
             let state = &self.streams[rank][stream as usize];
@@ -279,12 +287,19 @@ impl<'a> CudaCopyEngine<'a> {
                 }
             }
             if let Some(runtime) = &self.runtime {
-                // SAFETY: the entire batch was validated, grouped by device,
-                // and its staging arrays stay live through this submission.
-                unsafe { runtime.memcpy_batch_async(&self.batch_dsts, &self.batch_srcs, &self.batch_sizes, state.raw)?; }
-                self.submissions += 1;
+                let pieces = self.batch_dsts.chunks(BATCH_ENTRIES).zip(self.batch_srcs.chunks(BATCH_ENTRIES))
+                    .zip(self.batch_sizes.chunks(BATCH_ENTRIES));
+                for ((dsts, srcs), sizes) in pieces {
+                    // SAFETY: the entire batch was validated, grouped by device, and its
+                    // staging arrays stay live through these in-order submissions.
+                    unsafe { runtime.memcpy_batch_async(dsts, srcs, sizes, state.raw)?; }
+                    self.submissions += 1;
+                }
             }
         }
+        tracing::debug!(target: "cuteafd::host_cache", d2h, copies = copies.len(), routed = self.routed.len(),
+            submissions = self.submissions - submitted, validate_us = validated.as_micros() as u64,
+            submit_us = (started.elapsed() - validated).as_micros() as u64, "host copy plan issued");
         Ok(())
     }
 }
