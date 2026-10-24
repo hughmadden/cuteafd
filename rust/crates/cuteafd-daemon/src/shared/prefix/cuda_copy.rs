@@ -3,7 +3,7 @@
 //! a nonblocking event probe per stream. Registered allocations route each copy
 //! to its owning GPU; the engine keeps those owners alive until its queues drain.
 use anyhow::{ensure, Context, Result};
-use cuteafd_ffi::{CopyMechanism, CudaRuntime, CuteafdDeviceBuffer, CuteafdHostBuffer, NativeLibrary};
+use cuteafd_ffi::{CopyMechanism, CudaRuntime, CuteafdDeviceBuffer, CuteafdHostBuffer, HugePagePinning, NativeLibrary};
 use cuteafd_hostcache::copy::{CopyEngine, DeviceRange, Event, Stream};
 use cuteafd_hostcache::pool::{HostChunk, HostRange, PinnedMemory};
 use std::collections::VecDeque;
@@ -97,11 +97,21 @@ pub(crate) trait SnapshotOwner {
     fn snapshot_buffers(&self) -> Result<Vec<CuteafdDeviceBuffer>>;
 }
 
+/// A pinned chunk and how it was pinned, which decides how it is freed.
+struct Chunk {
+    buffer: CuteafdHostBuffer,
+    hugepages: bool,
+}
+
 pub(crate) struct CudaCopyEngine<'a> {
     library: &'a NativeLibrary,
     template: CuteafdDeviceBuffer,
     regions: Option<Regions>,
-    chunks: Vec<Option<CuteafdHostBuffer>>,
+    chunks: Vec<Option<Chunk>>,
+    /// Hugepage-backed pinning (frees every chunk it made); `hugepages` is whether new
+    /// chunks still use it, cleared after a failure falls back to `cudaHostAlloc`.
+    pinning: Option<HugePagePinning>,
+    hugepages: bool,
     /// Two logical queues, with one physical queue per registered device.
     streams: Vec<[StreamState<'a>; 2]>,
     next_event: u64,
@@ -169,19 +179,31 @@ impl<'a> CudaCopyEngine<'a> {
         }
         let runtime = CudaRuntime::load();
         let mechanism = if runtime.is_some() { CopyMechanism::MemcpyBatch } else { CopyMechanism::Merged1d };
+        let pinning = HugePagePinning::load();
         tracing::info!(target: "cuteafd::host_cache", mechanism = mechanism.name(), devices = streams.len(),
             runtime_version = runtime.as_ref().map(CudaRuntime::version).unwrap_or(0),
+            pinning = if pinning.is_some() { "hugepage-register" } else { "cuda-host-alloc" },
+            transparent_hugepages = cuteafd_ffi::transparent_hugepage_mode().as_deref().unwrap_or("unavailable"),
             "host snapshot cache copy mechanism");
-        Ok(Self { library, template, regions, chunks: Vec::new(), streams, next_event: 0,
+        Ok(Self { library, template, regions, chunks: Vec::new(), hugepages: pinning.is_some(), pinning,
+            streams, next_event: 0,
             started: Instant::now(), runtime, submissions: 0, batch_dsts: Vec::new(),
             batch_srcs: Vec::new(), batch_sizes: Vec::new(), ordered: Vec::new(), routed: Vec::new(), owners: Vec::new(), retained: Vec::new() })
     }
-    fn resolve_host(chunks: &[Option<CuteafdHostBuffer>], range: HostRange) -> Result<CuteafdHostBuffer> {
-        let chunk = chunks.get(range.chunk as usize).and_then(Option::as_ref).context("host cache chunk released")?;
+    fn resolve_host(chunks: &[Option<Chunk>], range: HostRange) -> Result<CuteafdHostBuffer> {
+        let chunk = &chunks.get(range.chunk as usize).and_then(Option::as_ref).context("host cache chunk released")?.buffer;
         ensure!(range.offset.checked_add(range.bytes).is_some_and(|end| end <= chunk.bytes),
             "host range outside its chunk");
         Ok(CuteafdHostBuffer { ptr: chunk.ptr.cast::<u8>().wrapping_add(range.offset).cast(),
             bytes: range.bytes, flags: chunk.flags })
+    }
+    /// Free a chunk through the path that pinned it; its queues have drained.
+    fn free_chunk(&self, chunk: &mut Chunk) -> Result<()> {
+        match &self.pinning {
+            // SAFETY: the chunk came from this pinning and no queued copy still uses it.
+            Some(pinning) if chunk.hugepages => unsafe { pinning.free(&mut chunk.buffer) },
+            _ => self.library.free_host_buffer(&mut chunk.buffer),
+        }
     }
     /// Exceptional cleanup may exceed the cache's normal wait budget. Every
     /// physical queue is attempted before any storage can be released.
@@ -268,16 +290,27 @@ impl<'a> CudaCopyEngine<'a> {
 }
 impl PinnedMemory for CudaCopyEngine<'_> {
     fn allocate_chunk(&mut self, bytes: usize) -> Result<HostChunk> {
-        let buffer = self.library.alloc_host_buffer(bytes)?;
-        self.chunks.push(Some(buffer));
+        let hugepage = match &self.pinning {
+            Some(pinning) if self.hugepages => pinning.alloc(bytes).map_err(|error| {
+                tracing::warn!(target: "cuteafd::host_cache", %error,
+                    "hugepage pinning failed; host snapshot chunks fall back to cudaHostAlloc");
+            }).ok(),
+            _ => None,
+        };
+        self.hugepages &= hugepage.is_some();
+        let chunk = match hugepage {
+            Some(buffer) => Chunk { buffer, hugepages: true },
+            None => Chunk { buffer: self.library.alloc_host_buffer(bytes)?, hugepages: false },
+        };
+        self.chunks.push(Some(chunk));
         Ok(HostChunk { id: (self.chunks.len() - 1) as u32, bytes })
     }
     fn release_chunk(&mut self, chunk: HostChunk) -> Result<()> {
         self.synchronize(Stream::Store)?;
         self.synchronize(Stream::Restore)?;
-        let mut buffer = self.chunks.get_mut(chunk.id as usize).and_then(Option::take)
+        let mut chunk = self.chunks.get_mut(chunk.id as usize).and_then(Option::take)
             .context("host cache chunk already released")?;
-        self.library.free_host_buffer(&mut buffer)
+        self.free_chunk(&mut chunk)
     }
 }
 impl CopyEngine for CudaCopyEngine<'_> {
@@ -349,8 +382,8 @@ impl Drop for CudaCopyEngine<'_> {
             tracing::error!(%error, "host cache drain failed; retaining pinned and device copy storage");
             return;
         }
-        for buffer in self.chunks.iter_mut().flatten() {
-            let _ = self.library.free_host_buffer(buffer);
+        for mut chunk in std::mem::take(&mut self.chunks).into_iter().flatten() {
+            let _ = self.free_chunk(&mut chunk);
         }
     }
 }
