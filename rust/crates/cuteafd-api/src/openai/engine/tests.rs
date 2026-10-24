@@ -201,9 +201,13 @@ async fn variant_model_ids_select_the_variant_on_every_protocol() {
     let mut profile = ModelProfile::new("test-glm", ModelEncoding::Glm(Arc::new(glm5::fixtures::encoding())));
     profile.variants = vec![cuteafd_core::variants::VariantRecord { index: 1, name: "alternate".into(),
         public_id: "test-glm-alternate".into(), base: "test-glm".into(), sites: 96, k_max: 1, availability: cuteafd_core::variants::VariantAvailability::Ready, verify: json!({}) }];
+    let mut models = crate::gateway::ModelMap::official_names(profile.id.clone());
+    models.aliases = vec![("ready-alias".into(),"test-glm-alternate".into()),
+        ("test-glm-*".into(),"test-glm".into())];
+    profile.gateway = Some(Arc::new(GatewayMount { models,snapshot:None,options:EngineOptions::default(),search:None,gate:None,origins:Default::default() }));
     let (app, worker) = serve(profile, None, vec![], false);
     let mut expected = Vec::new();
-    for (model, variant) in [("test-glm", 0u8), ("test-glm-alternate", 1), ("claude-sonnet-5", 0)] {
+    for (model, variant) in [("test-glm", 0u8), ("test-glm-alternate", 1), ("ready-alias",1), ("claude-sonnet-5", 0)] {
         let mut c = conversation(model, false, false, false);
         c.messages["model"] = json!(model);
         c.responses["model"] = json!(model);

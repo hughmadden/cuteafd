@@ -127,6 +127,7 @@ pub(crate) fn derive(snapshot: &std::path::Path, served_id: &str, specs: &[(u8, 
     for record in &mut records {
         record.verify["resident_table_bytes"] = serde_json::json!(bytes);
         record.verify["table_bytes_scope"] = serde_json::json!("launch");
+        record.verify["site_tables"] = serde_json::json!(cuteafd_core::variants::table_layouts(&plans, hidden));
     }
     Ok(Derived { plans, records, bytes })
 }

@@ -34,6 +34,11 @@ mod tests {
 
     #[test]
     fn unsupported_family_rejects_configured_variants_and_keeps_base_launch() {
+        let cli = crate::cli::Cli::try_parse_from(["cuteafd","serve-native","--snapshot","/not-read",
+            "--native-lib","/not-loaded","--variant","name=alternate,source=/extract"]).unwrap();
+        let crate::cli::Commands::ServeNative(args) = cli.command else { panic!() };
+        let error = crate::families::deepseek_v41::v41_native_serve::start_worker(args).err().expect("unsupported variants must reject before native loading");
+        assert!(error.to_string().contains("--variant is not supported"));
         let base = Cli::try_parse_from(["x"]).unwrap();
         base.variants.reject_unsupported("serve-native").unwrap();
         let configured = Cli::try_parse_from(["x","--variant","name=alternate,source=/extract"]).unwrap();
