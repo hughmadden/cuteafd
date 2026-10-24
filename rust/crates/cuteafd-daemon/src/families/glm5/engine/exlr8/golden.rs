@@ -467,8 +467,9 @@ fn prefill_lanes_byte_exact(total: usize, chunk: usize, waves: usize) -> Result<
     ])?.engine;
     let opened = crate::families::glm5::open(&args)?;
     opened.with_engine(&args, |engine, transport, runtime| {
-        ensure!(engine.prefill_lanes == waves && engine.lanes.borrow().len() == waves,
-            "lane exactness gate requires exactly {waves} admitted prefill lanes");
+        ensure!(engine.prefill_lanes == waves
+            && engine.prefill_link.borrow().as_ref().is_some_and(|link| link.waves() == waves),
+            "lane exactness gate requires exactly {waves} admitted waves on the prefill link");
         ensure!(engine.native_experts.len() == 2, "lane gate requires native shared owners");
         let transport = transport.context("lane gate needs real workers")?;
         let mut allocator = PageAllocator::new(engine);
