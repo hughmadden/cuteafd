@@ -4,22 +4,14 @@
 Run inside the coordinator CUDA container with the native library of a WIP slot built
 with the vision attention AOT. Only the 523 tower/projector tensors are read.
 
-The reference is an independent PyTorch transcription of the release's tower (the
-newer Transformers modeling_minimax_m3_vl.py and MiniMax's sglang minimax_vl_common.py
-agree on the graph): Conv3d 2x14x14 -> pre LayerNorm -> 32 CLIP layers (LayerNorm, MHA
-with 3D axial RoPE on 78 of 80 channels, LayerNorm, GELU MLP) -> per-patch GELU
-projector -> 2x2 merge GELU MLP. Video segments attend within at most four temporal
-patches (vision_segment_max_frames). It runs in FP32 as the yardstick target, and in
-BF16 with the numerics each vendor path uses:
-
-  sglang       BF16 pixels and conv, FP32 rotary (one BF16 rounding of q and k)
-  hf-5.19      BF16 pixels and conv, BF16 cos/sin and products
-  native-fp32  FP32 conv on FP32 pixels (the checkpoint's F32 weight), FP32 rotary
-  native-bf16  FP32 conv, Transformers' BF16 rotary
-
-The native tower passes a stage when its distance to the FP32 reference (relative L2 and
-mean row cosine) is no worse than the farther of the two vendor BF16 arms (sglang,
-hf-5.19) plus a small margin.
+The reference is python/reference/minimax_m3_vision.py (qualified against Transformers'
+MiniMaxM3VL tower in scripts/tests/test_minimax_m3_vision_reference.py); inputs are
+prepared by python/reference/minimax_m3_media.py, which processor-parity.py checks
+against the release processors. The reference runs twice on the GPU: with the release
+numerics (BF16, F32 convolution) and in FP32 as the yardstick. A stage passes when the
+native tower is no farther from FP32 (relative L2, mean row cosine) than the BF16
+reference, with a small margin. Segments above --reference-max-patches are timed only:
+the reference materializes full attention scores.
 """
 from __future__ import annotations
 
@@ -27,18 +19,20 @@ import argparse
 import ctypes as C
 import hashlib
 import json
-import math
+import sys
 import time
 from pathlib import Path
 
 import numpy as np
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[4] / "python/reference"))
+import minimax_m3_media as media
+import minimax_m3_vision as reference
+
 NO_OFFSET = (1 << 64) - 1
 PREFIXES = ("vision_tower.", "multi_modal_projector.", "patch_merge_mlp.")
-TOWER = "vision_tower.vision_model."
+TOWER = reference.VISION_PREFIX
 FIELDS = "qkv qkv_bias proj proj_bias gate_up gate_up_bias down down_bias norm1 norm2 key0_bias".split()
-MEAN = (0.48145466, 0.4578275, 0.40821073)
-STD = (0.26862954, 0.26130258, 0.27577711)
 
 
 class Block(C.Structure):
@@ -166,121 +160,16 @@ def pack_spec(tensors, max_tokens=4096):
     return spec, b"".join(chunks)
 
 
-def lut():
-    # The fast processor fuses rescale into FP32 mean/std: (v - mean*255) / (std*255).
-    values = np.arange(256, dtype=np.float32)
-    return np.ascontiguousarray(np.stack([(values - np.float32(m) * np.float32(255)) / (np.float32(s) * np.float32(255))
-                                          for m, s in zip(MEAN, STD)]).astype(np.float32))
-
-
-def smart_resize(height, width, factor=28, min_pixels=3136, max_pixels=451584):
-    h_bar = max(factor, round(height / factor) * factor)
-    w_bar = max(factor, round(width / factor) * factor)
-    if h_bar * w_bar > max_pixels:
-        beta = math.sqrt((height * width) / max_pixels)
-        h_bar, w_bar = math.floor(height / beta / factor) * factor, math.floor(width / beta / factor) * factor
-    elif h_bar * w_bar < min_pixels:
-        beta = math.sqrt(min_pixels / (height * width))
-        h_bar, w_bar = math.ceil(height * beta / factor) * factor, math.ceil(width * beta / factor) * factor
-    return h_bar, w_bar
-
-
-def resized(rgb, height, width):
-    """The release processor's torch uint8 antialiased bicubic resize (HWC in and out)."""
+def reference_weights(tensors, dtype, device):
+    """Checkpoint tensors as the reference takes them: the F32 convolution stays F32."""
     import torch
-    import torch.nn.functional as F
-    if rgb.shape[:2] == (height, width):
-        return np.ascontiguousarray(rgb)
-    tensor = torch.from_numpy(np.ascontiguousarray(rgb)).permute(2, 0, 1)[None]
-    out = F.interpolate(tensor, size=(height, width), mode="bicubic", align_corners=False, antialias=True)
-    return np.ascontiguousarray(out[0].permute(1, 2, 0).numpy())
-
-
-def patches(frames, table):
-    """[t, bh, bw, mh, mw, C, temporal, ph, pw] rows from 2*t RGB8 frames (HWC)."""
-    frames = np.asarray(frames)
-    count, h, w, _ = frames.shape
-    t, gh, gw = count // 2, h // 14, w // 14
-    values = np.stack([table[c][frames[..., c]] for c in range(3)], axis=1)  # [2t, C, H, W]
-    values = values.reshape(t, 2, 3, gh // 2, 2, 14, gw // 2, 2, 14).transpose(0, 3, 6, 4, 7, 2, 1, 5, 8)
-    return np.ascontiguousarray(values.reshape(t * gh * gw, 1176))
-
-
-def positions(t, gh, gw):
-    """(t, h, w) per patch in merge-window order, as the processor lays patches out."""
-    p = np.arange(t * gh * gw)
-    spatial, unit, r = p % (gh * gw), (p % (gh * gw)) // 4, p % 4
-    return np.stack([p // (gh * gw), (unit // (gw // 2)) * 2 + r // 2, (unit % (gw // 2)) * 2 + r % 2], axis=-1)
-
-
-class Reference:
-    def __init__(self, tensors, device):
-        import torch
-        self.torch, self.device = torch, device
-        self.raw = {}
-        for name, value in tensors.items():
-            if value.dtype == np.uint16:
-                value = (value.astype(np.uint32) << 16).view(np.float32)
-            self.raw[name] = torch.from_numpy(np.ascontiguousarray(value)).to(device)
-        self.inv = 1.0 / (10000.0 ** (torch.arange(0, 26, 2, dtype=torch.float32, device=device) / 26))
-        self.layers = sum(name.endswith(".layer_norm1.weight") for name in tensors)
-
-    def __call__(self, pixel_values, grid, dtype, conv_fp32, rotary_fp32, capture=None):
-        torch = self.torch
-        import torch.nn.functional as F
-        W = {k: v.to(dtype) for k, v in self.raw.items()}
-        t, gh, gw = grid
-        n = t * gh * gw
-        x = torch.from_numpy(pixel_values).to(self.device).view(n, 3, 2, 14, 14)
-        conv_dtype = torch.float32 if conv_fp32 else dtype
-        h = F.conv3d(x.to(conv_dtype), self.raw[TOWER + "embeddings.patch_embedding.weight"].to(conv_dtype),
-                     stride=(2, 14, 14)).view(n, 1280).to(dtype)
-        h = F.layer_norm(h, (1280,), W[TOWER + "pre_layrnorm.weight"], W[TOWER + "pre_layrnorm.bias"], 1e-5)
-        if capture is not None:
-            capture[0] = h.float().cpu().numpy()
-        pos = torch.from_numpy(positions(t, gh, gw)).to(self.device).float()
-        freqs = (pos[:, :, None] * self.inv).flatten(1)
-        freqs = torch.cat([freqs, freqs], dim=-1)  # [n, 78]
-        cos, sin = freqs.cos(), freqs.sin()
-        if not rotary_fp32:
-            cos, sin = cos.to(dtype), sin.to(dtype)
-
-        def rotate(v):  # v: [n, 16, 80]
-            rot, rest = v[..., :78], v[..., 78:]
-            if rotary_fp32:
-                rot = rot.float()
-            half = torch.cat([-rot[..., 39:], rot[..., :39]], dim=-1)
-            rot = rot * cos[:, None, :] + half * sin[:, None, :]
-            return torch.cat([rot.to(v.dtype), rest], dim=-1)
-
-        segment = 4 * gh * gw  # vision_segment_max_frames temporal patches per attention segment
-        for i in range(self.layers):
-            p = f"{TOWER}encoder.layers.{i}."
-            y = F.layer_norm(h, (1280,), W[p + "layer_norm1.weight"], W[p + "layer_norm1.bias"], 1e-5)
-            q, k, v = (F.linear(y, W[p + f"self_attn.{s}_proj.weight"], W[p + f"self_attn.{s}_proj.bias"]).view(n, 16, 80)
-                       for s in ("q", "k", "v"))
-            q, k = rotate(q), rotate(k)
-            outputs = []
-            for start in range(0, n, segment):
-                ks, vs = (z[start:start + segment].transpose(0, 1)[None] for z in (k, v))
-                end = min(n, start + segment)
-                # Query chunks bound the MATH backend's score matrix; keys stay the whole segment.
-                for row in range(start, end, 2048):
-                    qs = q[row:min(end, row + 2048)].transpose(0, 1)[None]
-                    with torch.nn.attention.sdpa_kernel(torch.nn.attention.SDPBackend.MATH):
-                        outputs.append(F.scaled_dot_product_attention(qs, ks, vs, scale=80 ** -0.5)[0].transpose(0, 1))
-            attn = torch.cat(outputs).reshape(n, 1280)
-            h = h + F.linear(attn, W[p + "self_attn.out_proj.weight"], W[p + "self_attn.out_proj.bias"])
-            y = F.layer_norm(h, (1280,), W[p + "layer_norm2.weight"], W[p + "layer_norm2.bias"], 1e-5)
-            y = F.gelu(F.linear(y, W[p + "mlp.fc1.weight"], W[p + "mlp.fc1.bias"]))
-            h = h + F.linear(y, W[p + "mlp.fc2.weight"], W[p + "mlp.fc2.bias"])
-            if capture is not None and (i + 1) % 4 == 0:
-                capture[i + 1] = h.float().cpu().numpy()
-        y = F.gelu(F.linear(h, W["multi_modal_projector.linear_1.weight"], W["multi_modal_projector.linear_1.bias"]))
-        y = F.linear(y, W["multi_modal_projector.linear_2.weight"], W["multi_modal_projector.linear_2.bias"])
-        y = F.gelu(F.linear(y.reshape(n // 4, 24576), W["patch_merge_mlp.linear_1.weight"], W["patch_merge_mlp.linear_1.bias"]))
-        y = F.linear(y, W["patch_merge_mlp.linear_2.weight"], W["patch_merge_mlp.linear_2.bias"])
-        return y.float().cpu().numpy()
+    weights = {}
+    for name, value in tensors.items():
+        tensor = torch.from_numpy(value)
+        if value.dtype == np.uint16:
+            tensor = tensor.view(torch.bfloat16)
+        weights[name] = tensor.to(device, torch.float32 if value.dtype == np.float32 else dtype)
+    return weights
 
 
 def metrics(native, ref):
@@ -293,33 +182,29 @@ def metrics(native, ref):
                 ref_mean_abs=float(np.abs(b).mean()))
 
 
-def verdict(native, vendors):
-    """No farther from FP32 than the farther vendor BF16 arm, with a small margin.
-
-    Worst-row cosine is reported, not gated: it is one row's minimum, and the vendor arms
-    themselves spread from 0.68 to 0.98 on it at the same stage.
-    """
-    return (native["relative_l2"] <= max(v["relative_l2"] for v in vendors) * 1.25 + 0.002
-            and native["mean_cosine"] >= min(v["mean_cosine"] for v in vendors) - 0.0005)
+def verdict(native, floor):
+    """No farther from FP32 than the BF16 reference, with a small margin. Worst-row cosine
+    is one row's minimum and is reported, not gated."""
+    return (native["relative_l2"] <= floor["relative_l2"] * 1.25 + 0.002
+            and native["mean_cosine"] >= floor["mean_cosine"] - 0.0005)
 
 
 def inputs(args):
-    """(name, frames [2t, H, W, 3] uint8 already processor-sized, grid, video?)."""
+    """(name, frames [2t, H, W, 3] uint8 processor-sized, grid, video?)."""
     from PIL import Image
     cases = []
     for path in args.images:
         rgb = np.asarray(Image.open(path).convert("RGB"))
-        h, w = smart_resize(*rgb.shape[:2])
-        frame = resized(rgb, h, w)
-        cases.append((Path(path).stem, np.stack([frame, frame]), (1, h // 14, w // 14), False))
-    rng = np.random.default_rng(7)
-    for t, h, w in args.videos:
-        base = rng.integers(0, 256, size=(h // 8 + 1, w // 8 + 1, 3)).astype(np.uint8)
-        frames = []
-        for k in range(2 * t):  # a panning texture: temporal positions matter
-            shifted = np.roll(np.kron(base, np.ones((8, 8, 1), np.uint8)), 3 * k, axis=1)[:h, :w]
-            frames.append(np.ascontiguousarray(shifted))
-        cases.append((f"video-{t}x{h}x{w}", np.stack(frames), (t, h // 14, w // 14), True))
+        frame = media.resize_rgb(rgb, *media.smart_resize(*rgb.shape[:2]))
+        cases.append((Path(path).stem, np.stack([frame, frame]), (1, frame.shape[0] // 14, frame.shape[1] // 14), False))
+    clip = [np.asarray(Image.open(p).convert("RGB")) for p in args.clip_frames]
+    for size in args.clip_sizes:
+        frames = [media.resize_rgb(frame, *size) for frame in clip]
+        frames += frames[-1:] * (len(frames) % 2)  # an odd clip repeats its last frame
+        t = len(frames) // 2
+        if not 1 <= t <= 4:
+            raise ValueError("a clip segment holds one to eight frames")
+        cases.append((f"clip-{t}x{size[0]}x{size[1]}", np.stack(frames), (t, size[0] // 14, size[1] // 14), True))
     return cases
 
 
@@ -345,7 +230,7 @@ def run(args):
         if status:
             raise RuntimeError(f"native MiniMax vision status {status}")
 
-    table = lut()
+    table = media.normalization_lut()
     owner, required = C.c_void_p(), Ledger()
     check(library.cuteafd_vision_required(C.byref(spec), C.byref(required)))
     check(library.cuteafd_vision_create(C.byref(spec), 0, required.weights + required.scratch + required.blas_workspace,
@@ -357,8 +242,6 @@ def run(args):
     try:
         check(library.cuteafd_vision_upload(owner, 0, blob, len(blob)))
         del blob
-        reference = None if args.native_only else Reference(tensors, "cuda")
-        del tensors
 
         def encode(frames, grid, video, observe=False):
             t, gh, gw = grid
@@ -391,42 +274,50 @@ def run(args):
                 raise RuntimeError(errors)
             return (out.astype(np.uint32) << 16).view(np.float32), stages, elapsed
 
-        saved = {}
-        arms = {"sglang": (torch.bfloat16, False, True), "hf-5.19": (torch.bfloat16, False, False),
-                "native-fp32": (torch.bfloat16, True, True), "native-bf16": (torch.bfloat16, True, False)}
-        for name, frames, grid, video in inputs(args):
+        cases = inputs(args)
+        saved, natives = {}, {}
+        for name, frames, grid, video in cases:
             encode(frames, grid, video)  # first use of this shape
-            native, stages, _ = encode(frames, grid, video, observe=reference is not None and not video)
-            saved[name] = native
-            if reference is None:
-                continue
-            pixels = patches(frames, table)
-            with torch.inference_mode():
-                fp32_stages = {}
-                fp32 = reference(pixels, grid, torch.float32, True, True, fp32_stages)
-                measured = {str(s): metrics(v, fp32_stages[s]) for s, v in stages.items()}
-                measured["output"] = metrics(native, fp32)
-                yardsticks = {}
-                for arm, (dtype, conv_fp32, rotary_fp32) in arms.items():
-                    arm_stages = {}
-                    value = reference(pixels, grid, dtype, conv_fp32, rotary_fp32, arm_stages)
-                    yardsticks[arm] = {str(s): metrics(v, fp32_stages[s]) for s, v in arm_stages.items()}
-                    yardsticks[arm]["output"] = metrics(value, fp32)
-                    yardsticks[arm]["native_vs_arm_output"] = metrics(native, value)
-            floor = yardsticks["sglang"]
-            measured = {stage: dict(value, **{"pass": verdict(value, [yardsticks["sglang"][stage],
-                                                                       yardsticks["hf-5.19"][stage]])})
-                        for stage, value in measured.items()}
-            result["g2"][name] = dict(grid=list(grid), tokens=grid[0] * grid[1] * grid[2] // 4, native=measured,
-                                      yardsticks=yardsticks)
-            print(json.dumps(dict(event="G2", case=name, grid=grid, output=measured["output"],
-                                  sglang=floor["output"], native_fp32_rotary=yardsticks["native-fp32"]["output"],
-                                  native_bf16_rotary=yardsticks["native-bf16"]["output"])), flush=True)
-        reference = None
-        torch.cuda.empty_cache()
+            natives[name] = encode(frames, grid, video, observe=not args.native_only and not video)
+            saved[name] = natives[name][0]
+        if not args.native_only:
+            arms = {}
+            for arm, dtype in (("bf16", torch.bfloat16), ("fp32", torch.float32)):
+                weights = reference_weights(tensors, dtype, "cuda")
+                for name, frames, grid, video in cases:
+                    if grid[0] * grid[1] * grid[2] > args.reference_max_patches:
+                        continue
+                    captured = {}
+                    observe = lambda stage, hidden: captured.__setitem__(stage, hidden.float().cpu().numpy()) \
+                        if stage % 4 == 0 else None
+                    pixels = torch.from_numpy(media.patches(frames, table)).cuda()
+                    out = reference.forward(pixels, [grid], weights, dtype=dtype, observe=observe)
+                    captured["output"] = out["features"].float().cpu().numpy()
+                    arms.setdefault(name, {})[arm] = captured
+                    del out
+                del weights
+                torch.cuda.empty_cache()
+            for name, (native, stages, _) in natives.items():
+                if name not in arms:
+                    continue
+                fp32, bf16 = arms[name]["fp32"], arms[name]["bf16"]
+                observed = {str(s): v for s, v in stages.items()}
+                observed["output"] = native
+                floor = {str(s): metrics(v, fp32[s]) for s, v in bf16.items()}
+                measured = {}
+                for stage, value in observed.items():
+                    key = stage if stage == "output" else int(stage)
+                    m = metrics(value, fp32[key])
+                    measured[stage] = dict(m, versus_bf16_reference=metrics(value, bf16[key])["relative_l2"],
+                                           **{"pass": verdict(m, floor[stage])})
+                grid = next(g for n, _, g, _ in cases if n == name)
+                result["g2"][name] = dict(grid=list(grid), tokens=grid[0] * grid[1] * grid[2] // 4,
+                                          native=measured, bf16_reference=floor)
+                print(json.dumps(dict(event="G2", case=name, grid=grid, native=measured["output"],
+                                      bf16_reference=floor["output"])), flush=True)
+        del tensors
         initial, final = Ledger(), Ledger()
         check(library.cuteafd_vision_get_ledger(owner, C.byref(initial)))
-        cases = inputs(args)
         for repeat in range(args.repeats):
             for name, frames, grid, video in (reversed(cases) if repeat % 2 else cases):
                 value, _, elapsed = encode(frames, grid, video)
@@ -435,7 +326,8 @@ def run(args):
         check(library.cuteafd_vision_get_ledger(owner, C.byref(final)))
         result.update(initial_ledger=initial.as_dict(), final_ledger=final.as_dict(),
                       no_encode_device_allocation=initial.device_allocations == final.device_allocations == 2,
-                      g2_pass=all(m["pass"] for case in result["g2"].values() for m in case["native"].values()),
+                      g2_pass=bool(result["g2"]) and all(m["pass"] for case in result["g2"].values()
+                                                         for m in case["native"].values()),
                       g3_pass=bool(result["g3"]) and all(result["g3"].values()))
         result["encode_ms_median"] = {k: float(np.median(v)) for k, v in result["encode_ms"].items()}
         args.output.write_text(json.dumps(result, indent=1) + "\n")
@@ -446,14 +338,23 @@ def run(args):
         check(library.cuteafd_vision_destroy(owner))
 
 
+def size(value):
+    h, w = (int(v) for v in value.split("x"))
+    if h % 28 or w % 28:
+        raise argparse.ArgumentTypeError("clip sizes are HxW multiples of 28")
+    return h, w
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--snapshot", type=Path, required=True)
     parser.add_argument("--library", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--images", type=Path, nargs="*", default=[])
-    parser.add_argument("--videos", type=lambda s: tuple(int(v) for v in s.split("x")), nargs="*", default=[],
-                        help="TxHxW video segments (T temporal patches, 1..4; H and W multiples of 28)")
+    parser.add_argument("--clip-frames", type=Path, nargs="*", default=[],
+                        help="one to eight sampled frames of a clip (one attention segment)")
+    parser.add_argument("--clip-sizes", type=size, nargs="*", default=[], help="HxW sizes to encode the clip at")
+    parser.add_argument("--reference-max-patches", type=int, default=7000)
     parser.add_argument("--repeats", type=int, default=5)
     parser.add_argument("--native-only", action="store_true")
     raise SystemExit(run(parser.parse_args()))
