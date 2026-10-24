@@ -41,21 +41,9 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
     opts: &crate::plan::layout::LayoutOptions, requested: ExpertPlacement) -> anyhow::Result<MemoryLayout> {
     let path = opts.workspace_manifest.as_deref().unwrap_or_else(|| std::path::Path::new("/opt/cuteafd/share/PROGRAMS.json"));
     if opts.workspace_manifest.is_none() && !path.is_file() {
-        anyhow::ensure!(!opts.minimax_nvfp4_kv && !opts.minimax_5090,
-            "MiniMax cache proposals and 5090 profile require --workspace-manifest");
         return Ok(header_layout(model, report, opts, requested));
     }
-    let mut base = opts.clone();
-    if opts.minimax_5090 {
-        anyhow::ensure!(opts.native_mtp_layers > 0, "MiniMax 5090 profile requires the bundled DSpark");
-        if base.prefill_rows == 0 { base.prefill_rows = 256; }
-        if base.concurrency == 0 { base.concurrency = 1; }
-    }
-    if opts.minimax_nvfp4_kv { base.pool_tokens = None; }
-    let mut memory = exact_layout(model, input, report, &base, requested, path)?;
-    if opts.minimax_5090 { memory.notes.push("Opt-in 5090 C1 sizing: prefill rows and sequence slots only; DSpark stays on; C1 performance unmeasured".into()); }
-    if opts.minimax_nvfp4_kv { super::capacity::apply(model.cfg(), &mut memory, report, opts)?; }
-    Ok(memory)
+    exact_layout(model, input, report, opts, requested, path)
 }
 
 fn header_layout(model: &Model, report: &mut PlanReport, opts: &crate::plan::layout::LayoutOptions,

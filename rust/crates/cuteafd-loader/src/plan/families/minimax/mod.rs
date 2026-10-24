@@ -14,7 +14,6 @@ use crate::plan::{checkpoint::Checkpoint, family::*, format::{self, QuantOperand
 
 pub mod coordinator;
 pub mod admission;
-pub mod capacity;
 mod placement;
 #[cfg(test)]
 mod tests;

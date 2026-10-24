@@ -167,11 +167,10 @@ pub(crate) struct FabricArgs {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
-pub(crate) enum PlanKvFormat { Bf16, Fp8, Nvfp4 }
+pub(crate) enum PlanKvFormat { Bf16, Fp8 }
 impl PlanKvFormat {
     pub(crate) fn resident(self) -> cuteafd_core::MlaCacheFormat {
-        match self { Self::Bf16 => cuteafd_core::MlaCacheFormat::Bf16,
-            Self::Fp8 | Self::Nvfp4 => cuteafd_core::MlaCacheFormat::Fp8 }
+        match self { Self::Bf16 => cuteafd_core::MlaCacheFormat::Bf16, Self::Fp8 => cuteafd_core::MlaCacheFormat::Fp8 }
     }
 }
 impl From<cuteafd_core::MlaCacheFormat> for PlanKvFormat {
@@ -324,9 +323,6 @@ pub(crate) struct PlanArgs {
     /// Full-attention KV format for --layout (family default when omitted).
     #[arg(long = "kv-cache", value_enum)]
     pub(crate) kv_format: Option<PlanKvFormat>,
-    /// Opt-in C1 sizing; explicit prefill rows and concurrency override it.
-    #[arg(long, value_parser = ["default", "rtx5090"], default_value = "default")]
-    pub(crate) minimax_profile: String,
     /// Qwen projection residency for --layout.
     #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
     pub(crate) fp8_decode: bool,
@@ -714,17 +710,6 @@ mod tests {
         assert!(help.contains("Experimental MiMo warm DFlash"), "{help}");
         assert!(help.contains("https://github.com/tpurtell/cuteafd/issues/41"), "{help}");
         assert!(!help.contains("off until qualified"), "{help}");
-    }
-
-    #[test]
-    fn minimax_planning_cache_options_do_not_enable_runtime_formats() {
-        use clap::Parser;
-        let super::Commands::Plan(args) = super::Cli::try_parse_from(["cuteafd", "plan", "/model",
-            "--layout", "--kv-cache", "nvfp4", "--minimax-profile", "rtx5090"]).unwrap().command else { panic!("plan"); };
-        assert_eq!(args.kv_format, Some(super::PlanKvFormat::Nvfp4));
-        assert_eq!(args.minimax_profile, "rtx5090");
-        assert!(super::Cli::try_parse_from(["cuteafd", "serve-minimax", "--snapshot", "/model",
-            "--native-lib", "/lib.so", "--kv-cache", "nvfp4"]).is_err());
     }
 
     #[test]
