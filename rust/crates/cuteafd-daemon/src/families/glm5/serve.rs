@@ -119,7 +119,7 @@ pub(crate) async fn run_serve(args: ServeArgs) -> Result<()> {
     let worker = tokio::task::spawn_blocking(move ||
         serve_loop(engine_args, receive, ready_tx, worker_stats, max_sequences, policy, prefix));
     let (max_context, variants) = ready_rx.await.context("engine failed before it was ready")??;
-    // Only variants whose tables verified and loaded are served under their ids.
+    // Every configured id stays reserved; the API lists only ready variants.
     profile.variants = variants;
     let limits = NativeLimits::new(u32::try_from(max_context)?, args.max_output)?;
     cuteafd_bench::context::phase("engine loaded");
