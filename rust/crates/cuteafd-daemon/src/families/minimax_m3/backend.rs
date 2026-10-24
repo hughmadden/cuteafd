@@ -4,7 +4,7 @@ use crate::shared::{draft::routes::RoundRoutes, memory::device::Allocation, pref
     qwen::{Encoder, scheduler::{self, Backend}}, token_io::{DeviceLogits, TokenEmbedding}};
 use anyhow::{ensure, Context, Result};
 use cuteafd_api::openai::NativeRequest;
-use cuteafd_engine::{media::{EncodeJob, EmbeddingCache, RequestMedia},
+use cuteafd_engine::{media::{EncodeJob, RequestMedia},
     prefix::{PrefixCache, PrefixConfig, PrefixFamily, RefPagePool}};
 use cuteafd_ffi::NativeLibrary;
 use cuteafd_loader::media::SpanExpander;
@@ -164,9 +164,6 @@ impl<'e, 'a> Backend<'a> for MiniMaxBackend<'e, 'a> {
     fn prepare(&self, job: NativeRequest, tokens: Vec<u32>) -> Result<(scheduler::Prompt, RequestMedia, Vec<EncodeJob>)> {
         super::media::prepare(job, tokens, self.expander.as_ref(), self.vocabulary, self.cache.context)
     }
-    fn probe_features(&self, _: &scheduler::Prompt, _: &mut RequestMedia,
-        _: &mut EmbeddingCache, _: &Path) -> Result<()> { Ok(()) }
-    fn coordinates(&self, _: &[u32], _: &NativeRequest, _: &RequestMedia) -> Result<()> { Ok(()) }
     fn placement(&self, pages: Vec<u32>, slot: i32) -> Placement {
         Placement { pages, sequence: slot as usize, committed: 0,
             media: RequestMedia::new(Vec::new(), 6144, 0).expect("fixed text geometry") }
@@ -176,8 +173,6 @@ impl<'e, 'a> Backend<'a> for MiniMaxBackend<'e, 'a> {
         if self.execution.draft().is_ok() { self.rings.borrow_mut().bind(p.sequence)?; }
         Ok(())
     }
-    fn history(&self, _: &Placement) {}
-    fn prefetch(&self, _: &[u32], _: &[u32]) {}
     fn require_live(&self) -> Result<()> {
         self.pending.borrow_mut().take();
         if let Some(startup) = self.startup_captures.get() {
@@ -186,7 +181,6 @@ impl<'e, 'a> Backend<'a> for MiniMaxBackend<'e, 'a> {
         }
         self.execution.drain()
     }
-    fn log_table_stats(&self, _: &str) {}
     fn prefill_device(&self, p: &mut Placement, tokens: &[u32], logit_rows: usize,
         pool: &RefPagePool) -> Result<Option<DeviceLogits>> {
         if logit_rows > tokens.len() { return Err(MiniMaxError::Invalid("prefill logits extent").into()); }
@@ -279,7 +273,6 @@ impl<'e, 'a> Backend<'a> for MiniMaxBackend<'e, 'a> {
     fn probe_begin(&self, rows: usize) {
         let mut probe=self.probe.borrow_mut(); probe.begin(rows); probe.dense(0).expect("one aggregate stage");
     }
-    fn probe_end(&self) {}
     fn probe_finish<T>(&self, observe: impl FnOnce(&RoundRoutes, &[Option<f64>]) -> T) -> Option<T> {
         Some(observe(&self.probe.borrow(),&[None]))
     }

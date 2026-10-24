@@ -90,11 +90,12 @@ fn effective_neural(configured: bool, probe: &probe::ProbeRef) -> bool {
 
 /// The scheduler owns admission, batching, token selection and publication.
 /// Family adapters retain all model state, prefix byte layouts and draft math.
+/// Hooks a family has no use for default to doing nothing.
 pub(crate) trait Backend<'a> {
     type Placement: Placement;
     type Draft: DraftState;
-    type History;
-    type Coordinates;
+    type History: Default;
+    type Coordinates: Default;
     type Encoder: Encoder;
     type Meta: Clone + Default;
     type Prefix: PrefixFamily<Self::Meta, Placement = Self::Placement>;
@@ -106,13 +107,15 @@ pub(crate) trait Backend<'a> {
     fn prefix_cache(&self, args: &PrefixArgs, lanes: usize)
         -> Result<(Self::Prefix, PrefixCache<CudaCopyEngine<'a>, Self::Meta>)>;
     fn prepare(&self, job: NativeRequest, tokens: Vec<u32>) -> Result<(Prompt, RequestMedia, Vec<EncodeJob>)>;
-    fn probe_features(&self, prompt: &Prompt, media: &mut RequestMedia,
-        cache: &mut cuteafd_engine::media::EmbeddingCache, snapshot: &Path) -> Result<()>;
-    fn coordinates(&self, tokens: &[u32], job: &NativeRequest, media: &RequestMedia) -> Result<Self::Coordinates>;
+    fn probe_features(&self, _prompt: &Prompt, _media: &mut RequestMedia,
+        _cache: &mut cuteafd_engine::media::EmbeddingCache, _snapshot: &Path) -> Result<()> { Ok(()) }
+    fn coordinates(&self, _tokens: &[u32], _job: &NativeRequest, _media: &RequestMedia) -> Result<Self::Coordinates> {
+        Ok(Self::Coordinates::default())
+    }
     fn placement(&self, units: Vec<u32>, slot: i32) -> Self::Placement;
     fn bind_request(&self, placement: &mut Self::Placement, coordinates: Self::Coordinates,
         media: RequestMedia, tokens: &[u32], resume: usize) -> Result<()>;
-    fn history(&self, placement: &Self::Placement) -> Self::History;
+    fn history(&self, _placement: &Self::Placement) -> Self::History { Self::History::default() }
     fn restore_draft(&self, _placement: &Self::Placement, frontier: usize, _tokens: &[u32],
         draft: &mut Self::Draft) -> Result<()> {
         draft.restored(frontier);
@@ -120,9 +123,9 @@ pub(crate) trait Backend<'a> {
     }
     fn needs_snapshot_filter(&self, _neural: bool) -> bool { false }
     fn snapshot_compatible(&self, _saved: &Self::Meta, _frontier: usize, _neural: bool) -> bool { true }
-    fn prefetch(&self, tokens: &[u32], next: &[u32]);
+    fn prefetch(&self, _tokens: &[u32], _next: &[u32]) {}
     fn require_live(&self) -> Result<()>;
-    fn log_table_stats(&self, phase: &str);
+    fn log_table_stats(&self, _phase: &str) {}
     // Family write validation uses the actual cache pool after admission/COW.
     fn prefill_device(&self, placement: &mut Self::Placement, tokens: &[u32], logit_rows: usize,
         pool: &cuteafd_engine::prefix::RefPagePool)
@@ -147,7 +150,7 @@ pub(crate) trait Backend<'a> {
     /// Drop any unaccepted replay owned by this request before its storage is released.
     fn cancel(&self, _placement: &Self::Placement) -> Result<()> { Ok(()) }
     fn probe_begin(&self, rows: usize);
-    fn probe_end(&self);
+    fn probe_end(&self) {}
     fn probe_finish<T>(&self, observe: impl FnOnce(&RoundRoutes, &[Option<f64>]) -> T) -> Option<T>;
 }
 
