@@ -471,6 +471,8 @@ pub struct TensorSource {
     tensors: BTreeMap<String, (PathBuf, crate::SafetensorsTensorMetadata)>,
     /// Metadata belongs to each source, never borrowed from the served base.
     quantization: BTreeMap<PathBuf, Vec<serde_json::Value>>,
+    /// Successful tensor payload reads, including scale partners, shared by clones.
+    payload_bytes_read: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -502,14 +504,14 @@ impl TensorSource {
                 tensors.insert(meta.name.clone(), (path.clone(), meta));
             }
         }
-        Ok(Self { tensors, quantization })
+        Ok(Self { tensors, quantization, ..Self::default() })
     }
     /// The headers a role read with `Checkpoint::open_for_role`.
     pub fn from_checkpoint(checkpoint: &crate::plan::checkpoint::Checkpoint) -> Self {
         let tensors = checkpoint.tensors.iter()
             .map(|t| (t.meta.name.clone(), (checkpoint.snapshot.join(&t.shard), t.meta.clone()))).collect();
         let quantization = checkpoint.tensors.iter().map(|t| (checkpoint.snapshot.join(&t.shard), checkpoint.quantizations().cloned().collect())).collect();
-        Self { tensors, quantization }
+        Self { tensors, quantization, ..Self::default() }
     }
     pub fn contains(&self, name: &str) -> bool { self.tensors.contains_key(name) }
     pub fn names(&self) -> impl Iterator<Item = &str> { self.tensors.keys().map(String::as_str) }
@@ -533,6 +535,7 @@ impl TensorSource {
         let mut bytes = vec![0u8; usize::try_from(meta.byte_length)?];
         file.read_exact_at(&mut bytes, meta.byte_offset)
             .with_context(|| format!("reading {name} from {}", path.display()))?;
+        self.payload_bytes_read.fetch_add(meta.byte_length, std::sync::atomic::Ordering::Relaxed);
         Ok((bytes, meta))
     }
 
@@ -739,6 +742,8 @@ pub struct VariantOutcome {
     /// Site tensors the variant carries but the base does not (not derived).
     pub missing_in_base: Vec<String>,
     pub seconds: f64,
+    /// Measured base + variant tensor payload reads; excludes headers and config files.
+    pub payload_bytes_read: u64,
 }
 
 /// Unsupported sources are availability decisions. Path, JSON and invalid mode
@@ -771,7 +776,7 @@ impl VariantOutcome {
             "r_w_max": max(|r| r.r_w), "next_share_max": max(|r| r.next_share), "proj_cos_min": min(|r| r.proj_cos),
             "alpha_min": min(|r| r.alphas.iter().copied().fold(f32::INFINITY, f32::min)),
             "alpha_max": max(|r| r.alphas.iter().copied().fold(0f32, f32::max)),
-            "derive_seconds": self.seconds})
+            "derive_seconds": self.seconds, "payload_bytes_read": self.payload_bytes_read})
     }
 }
 
@@ -790,7 +795,8 @@ pub fn derive_variant(served: &Path, served_id: &str, index: u8, spec: &cuteafd_
     let served_identity = std::fs::canonicalize(served)?;
     let public_id = spec.public_id(served_id);
     let mut outcome = VariantOutcome { name: spec.name.clone(), public_id: public_id.clone(), plan: None,
-        rejection: None, rejection_kind: None, mode: family.mode.into(), verdicts: Vec::new(), missing_in_base: Vec::new(), seconds: 0.0 };
+        rejection: None, rejection_kind: None, mode: family.mode.into(), verdicts: Vec::new(), missing_in_base: Vec::new(),
+        seconds: 0.0, payload_bytes_read: 0 };
     let reject = |mut outcome: VariantOutcome, reason: VariantRejection| -> Result<VariantOutcome> {
         outcome.rejection = Some(reason.to_string());
         outcome.rejection_kind = Some(reason);
@@ -814,7 +820,10 @@ pub fn derive_variant(served: &Path, served_id: &str, index: u8, spec: &cuteafd_
             "mode=ffn selected {}: fitting a shared-expert tensor does not verify the combined routed+shared output; use mode=shared-only",
             site.tensor) });
     }
-    let (ops, verdicts) = match derive_sites(&base, &variant, &sites, parallel) {
+    let derived = derive_sites(&base, &variant, &sites, parallel);
+    outcome.payload_bytes_read = base.payload_bytes_read.load(std::sync::atomic::Ordering::Relaxed)
+        + variant.payload_bytes_read.load(std::sync::atomic::Ordering::Relaxed);
+    let (ops, verdicts) = match derived {
         Ok(result) => result,
         Err(error) if error.downcast_ref::<TensorSourceError>().is_some() || error.downcast_ref::<VariantError>().is_some() =>
             return reject(outcome, VariantRejection::UnsupportedSource { reason: format!("{error:#}") }),

@@ -107,6 +107,8 @@ pub(crate) fn derive(snapshot: &std::path::Path, served_id: &str, specs: &[(u8, 
     for (index, spec) in specs {
         let outcome = cuteafd_loader::variants::derive_variant(snapshot, served_id, *index, spec, parallel)
             .with_context(|| format!("variant {}", spec.name))?;
+        tracing::info!(variant = %spec.name, seconds = outcome.seconds,
+            payload_bytes_read = outcome.payload_bytes_read, "weight variant derivation complete");
         let verify = outcome.verify_summary();
         match outcome.plan {
             Some(plan) => {
