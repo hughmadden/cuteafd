@@ -23,6 +23,8 @@ pub struct Client {
     token: Option<String>,
     api_key: Option<cuteafd_api::openai::auth::ApiKey>,
     cancel: Arc<AtomicBool>,
+    /// The listed id this run asked for; `None`: the server's default.
+    selected: Option<String>,
 }
 
 /// Renew an off-path observation lease for a long standalone sweep.
@@ -66,12 +68,20 @@ impl Client {
     pub fn new(base: &str, token: Option<String>, cancel: Arc<AtomicBool>) -> Self {
         let agent = ureq::AgentBuilder::new().timeout_connect(Duration::from_secs(10))
             .timeout_read(Duration::from_secs(900)).build();
-        Self { configuration: crate::report::Configuration::default(), base: base.trim_end_matches('/').to_string(), model: String::new(), agent, token, cancel, api_key: None, fabric_enabled: false }
+        Self { configuration: crate::report::Configuration::default(), base: base.trim_end_matches('/').to_string(), model: String::new(), agent, token, cancel, api_key: None, fabric_enabled: false, selected: None }
     }
 
     pub fn with_api_key(mut self, key: Option<cuteafd_api::openai::auth::ApiKey>) -> Self {
         self.api_key = key;
         self
+    }
+    /// Bench this listed id (a weight variant's public id, say) instead of the default.
+    pub fn with_model(mut self, model: Option<String>) -> Self {
+        self.selected = model.filter(|id| !id.is_empty());
+        self
+    }
+    pub fn selected(&self) -> Option<&str> {
+        self.selected.as_deref()
     }
     pub fn with_fabric(mut self, enabled: bool) -> Self {
         self.fabric_enabled = enabled;
@@ -103,10 +113,12 @@ impl Client {
     }
 
     /// The served model id and its `/v1/models` record; sets `self.model`.
-    /// `CUTEAFD_BENCH_MODEL` picks another listed id (a weight variant's, say).
+    /// The run's selection ([`Self::with_model`]) wins; otherwise the server
+    /// process's `CUTEAFD_BENCH_MODEL`, else the first listed id.
     pub fn discover(&mut self) -> Result<Value> {
         let models = self.get("/v1/models")?;
-        let record = pick_model(&models, std::env::var("CUTEAFD_BENCH_MODEL").ok().as_deref())?;
+        let wanted = self.selected.clone().or_else(|| std::env::var("CUTEAFD_BENCH_MODEL").ok());
+        let record = pick_model(&models, wanted.as_deref())?;
         self.configuration.supports_thinking_off = record["supports_thinking_off"].as_bool();
         self.model = record["id"].as_str().context("model id")?.to_string();
         Ok(record)
@@ -359,25 +371,90 @@ fn merge_tool_calls(calls: &mut Vec<Value>, deltas: &[Value]) {
     }
 }
 
-/// The `/v1/models` record to bench: the first, or the one named `wanted`.
+/// The `/v1/models` record to bench: the first (the served model), or the one
+/// named `wanted` exactly. A named id other than the first must be a ready
+/// weight variant: an alias listed beside the served model would measure the
+/// base under another name, so it is refused rather than benched.
 fn pick_model(models: &Value, wanted: Option<&str>) -> Result<Value> {
-    let data = models["data"].as_array().context("/v1/models lists no model")?;
-    match wanted.filter(|id| !id.is_empty()) {
-        None => data.first().cloned().context("/v1/models lists no model"),
-        Some(id) => data.iter().find(|m| m["id"] == id).cloned()
-            .with_context(|| format!("CUTEAFD_BENCH_MODEL={id} is not listed by /v1/models")),
+    let data = models["data"].as_array().filter(|d| !d.is_empty()).context("/v1/models lists no model")?;
+    let Some(id) = wanted.filter(|id| !id.is_empty()) else { return Ok(data[0].clone()) };
+    let listed = || data.iter().filter_map(|m| m["id"].as_str()).collect::<Vec<_>>().join(", ");
+    let Some(position) = data.iter().position(|m| m["id"] == id) else {
+        bail!("model {id} is not listed by /v1/models (listed: {})", listed());
+    };
+    let record = &data[position];
+    if position > 0 {
+        let variant = &record["variant"];
+        if !variant.is_object() {
+            bail!("model {id} is an alias of the served model {}, not a weight variant", data[0]["id"]);
+        }
+        if variant["availability"]["state"] != "ready" {
+            bail!("weight variant {id} is not ready: {}", variant["availability"]["reason"].as_str().unwrap_or("unavailable"));
+        }
     }
+    Ok(record.clone())
 }
 
 #[cfg(test)]
 mod tests {
+    fn listing() -> Value {
+        serde_json::json!({"data": [{"id": "base"},
+            {"id": "base-alternate", "variant": {"name": "alternate", "availability": {"state": "ready"}}},
+            {"id": "base-cold", "variant": {"name": "cold", "availability": {"state": "unavailable", "reason": "tables missing"}}},
+            {"id": "claude-opus-5-5"}]})
+    }
+
     #[test]
     fn bench_model_defaults_to_the_first_listed_id_or_the_named_one() {
-        let models = serde_json::json!({"data": [{"id": "base"}, {"id": "base-alternate"}]});
+        let models = listing();
         assert_eq!(super::pick_model(&models, None).unwrap()["id"], "base");
         assert_eq!(super::pick_model(&models, Some("")).unwrap()["id"], "base");
+        assert_eq!(super::pick_model(&models, Some("base")).unwrap()["id"], "base");
         assert_eq!(super::pick_model(&models, Some("base-alternate")).unwrap()["id"], "base-alternate");
-        assert!(super::pick_model(&models, Some("missing")).is_err());
+        let missing = super::pick_model(&models, Some("missing")).unwrap_err().to_string();
+        assert!(missing.contains("not listed") && missing.contains("base-alternate"), "{missing}");
+        // Never a silent fallback to the base: unready variants and aliases are refused.
+        assert!(super::pick_model(&models, Some("base-cold")).unwrap_err().to_string().contains("tables missing"));
+        assert!(super::pick_model(&models, Some("claude-opus-5-5")).unwrap_err().to_string().contains("alias"));
+        assert!(super::pick_model(&serde_json::json!({"data": []}), None).is_err());
+    }
+
+    /// Serves `/v1/models` with `body` to each of `n` connections.
+    fn models_server(body: Value, n: usize) -> (String, std::thread::JoinHandle<()>) {
+        use std::io::Write;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let worker = std::thread::spawn(move || {
+            let body = body.to_string();
+            for _ in 0..n {
+                let (mut socket, _) = listener.accept().unwrap();
+                let mut reader = BufReader::new(socket.try_clone().unwrap());
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                assert!(line.starts_with("GET /v1/models "), "{line}");
+                while line != "\r\n" { line.clear(); reader.read_line(&mut line).unwrap(); }
+                write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+            }
+        });
+        (base, worker)
+    }
+
+    #[test]
+    fn discover_uses_the_run_selection_and_never_falls_back() {
+        let (base, worker) = models_server(listing(), 3);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let mut variant = Client::new(&base, None, cancel.clone()).with_model(Some("base-alternate".into()));
+        assert_eq!(variant.discover().unwrap()["variant"]["name"], "alternate");
+        assert_eq!(variant.model, "base-alternate");
+        let mut default = Client::new(&base, None, cancel.clone()).with_model(Some(String::new()));
+        if std::env::var_os("CUTEAFD_BENCH_MODEL").is_none() {
+            default.discover().unwrap();
+            assert_eq!(default.model, "base");
+        } else { default.discover().ok(); }
+        let mut missing = Client::new(&base, None, cancel).with_model(Some("base-gone".into()));
+        assert!(missing.discover().is_err());
+        assert!(missing.model.is_empty(), "a refused selection leaves no model to measure");
+        worker.join().unwrap();
     }
 
     use super::*;
