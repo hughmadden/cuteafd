@@ -99,12 +99,18 @@ impl<'e, 'a> MiniMaxBackend<'e, 'a> {
         let library = self.cache.library;
         library.cuda_set_device(self.cache.device)?;
         let embedded = self.embedding.embed(&tokens, self.token_ids.raw(), 1, self.embedded.raw(), self.execution.stream());
-        self.execution.drain()?;
-        embedded?;
-        // Features are admitted host leases; injection precedes the device residual conversion.
+        let mut chunks = Vec::with_capacity(requests.len());
         for (request, (p, _)) in requests.iter().zip(sequences.iter()) {
             let mut chunk = cuteafd_engine::media::MediaChunk::default();
             p.media.write_chunk(p.committed, p.committed + request.rows, &mut chunk)?;
+            chunks.push(chunk);
+        }
+        // The embedding is stream-ordered; only host feature copies (off the
+        // stream) or a failed enqueue need the stream drained first.
+        if embedded.is_err() || chunks.iter().any(|c| !c.features.is_empty()) { self.execution.drain()?; }
+        embedded?;
+        // Features are admitted host leases; injection precedes the device residual conversion.
+        for (request, chunk) in requests.iter().zip(&chunks) {
             for (feature, &row) in chunk.features.chunks_exact(6144 * 2).zip(&chunk.indices) {
                 let destination = self.embedded.view((request.row_start + row as usize) * 6144 * 2, 6144 * 2)?;
                 library.copy_h2d(destination.raw(), feature)?;
