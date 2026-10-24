@@ -2223,7 +2223,6 @@ impl Opened {
             args.prefill_waves, u32::try_from(args.prefill_rows)?)?;
         transport.enable_terminal_ownership(self.library.clone())?;
         crate::shared::memory_report::release_load_staging(&self.library);
-        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
         let warm_rows = args.expert_rows();
         let warm = engine::spark_warmup_request(&self.cfg, warm_rows, remote[0], self.checkpoint.spark_input_is_bf16())?;
         // Publish grouping before the draft planner prices the installed workers.
@@ -2232,15 +2231,15 @@ impl Opened {
             .get("transport/rdma-rings").copied().unwrap_or(0);
         let (started, before) = (Instant::now(), rings());
         let warm_stream = crate::shared::spark_intake::WarmStream::new(self.library.as_ref())?;
-        runtime.block_on(async {
-            let wave = transport.dispatch(&warm)?;
-            transport.receive(wave, warm_rows, warm_stream.raw()).await
-        }).with_context(|| format!("warming Spark expert transport with {warm_rows} rows"))?;
+        let exchange = transport.exchange()?;
+        let wave = exchange.send_request(warm)?;
+        exchange.land_drained(wave, warm_stream.raw())
+            .with_context(|| format!("warming Spark expert transport with {warm_rows} rows"))?;
         warm_stream.finish()?;
         tracing::info!(waves = args.prefill_waves, ranks = peers.len(), rows = warm_rows,
             ring_bytes = rings().saturating_sub(before), elapsed_ms = started.elapsed().as_millis() as u64,
             "Spark expert transport warm");
-        Ok(Some(engine::Experts::Spark { transport: std::cell::RefCell::new(transport), runtime }))
+        Ok(Some(engine::Experts::Spark { transport: std::cell::RefCell::new(transport) }))
     }
 }
 

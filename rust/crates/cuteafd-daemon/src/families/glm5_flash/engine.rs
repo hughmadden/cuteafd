@@ -60,7 +60,7 @@ use cuteafd_loader::families::glm5_flash::{GlmNextAttention, GlmNextConfig};
 use cuteafd_loader::serving_capacity::{glmf_lane_bytes, glmf_step_scratch, glmf_step_workspaces, glmf_table_pages,
     glmf_temporary_bytes, GlmfKdaState, GlmfScratchOptions, GlmfStepShape};
 use crate::shared::spark_intake::SparkLink;
-use cuteafd_transport::expert::{SparkExpertWave, EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16};
+use cuteafd_transport::expert::EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16;
 use cuteafd_transport::{
     ExpertProtocolV2Request, ExpertProtocolV2RouteEntry, ExpertProtocolV2RowDescriptor, ExpertV2Dtype, ExpertV2SourceKind,
 };
@@ -468,7 +468,7 @@ pub(crate) enum Experts<'a> {
     LocalExl3(LocalExl3<'a>),
     /// Spark ranks serving the routed experts over RoCE (one BF16 partial per
     /// rank); one transport per prefill lane (decode uses the first).
-    Spark { transport: RefCell<SparkLink<'a>>, runtime: tokio::runtime::Runtime },
+    Spark { transport: RefCell<SparkLink<'a>> },
     /// Profiling only: the router, the wire rows and the shared expert run,
     /// the routed experts contribute nothing (the coordinator's own work).
     Skip,
@@ -785,6 +785,10 @@ struct Workspace<'a> {
     route_ids: Dev<'a>,
     route_weights: Dev<'a>,
     wire: Dev<'a>,
+    /// Admitted pinned route staging (the planner charges it); Spark waves
+    /// now stage in the link exchange's slots, so it stays unused until the
+    /// planner drops the charge.
+    #[allow(dead_code)]
     router_host: RefCell<HostAllocation<'a>>,
     /// Shared by every prefill lane of this GPU (decode: its own).
     temps: Rc<Temporaries<'a>>,
@@ -1382,7 +1386,7 @@ pub(crate) struct GlmfEngine<'a> {
     unit_prefill: Cell<bool>,
     // Hop consumers retire before the exchange whose terminal words they borrow.
     layer_execution: Option<layers::Execution<'a>>,
-    layer_waves: RefCell<Vec<Option<SparkExpertWave>>>,
+    layer_waves: RefCell<Vec<Option<crate::shared::spark_waves::WaveTicket>>>,
     /// The head split's second GPU and the exchange between the two.
     peer: Option<GlmfPeer<'a>>,
     exchange: Option<PeerExchange<'a>>,
@@ -1433,8 +1437,6 @@ pub(crate) struct GlmfEngine<'a> {
     logged_graph_shapes: RefCell<std::collections::HashSet<(usize, usize, bool, GraphGeometry)>>,
     /// Opt-in matched-token/route evidence; never adds a device readback.
     split_audit: bool,
-    /// Recorded after a layer's routes and wire rows reach the host staging.
-    routes_ready: *mut c_void,
     /// The shared draft policy's per-step signals (layer events, routes), armed by
     /// `serve-glmf` under the shared policy and active only around its verify steps.
     draft_probe: RefCell<Option<super::draft_probe::RoundProbe<'a>>>,
@@ -1791,7 +1793,7 @@ impl<'a> GlmfEngine<'a> {
             startup_graphs: startup_graphs_enabled(),
             warming_graphs: std::cell::Cell::new(false), logged_graph_shapes: RefCell::new(std::collections::HashSet::new()),
             split_audit: std::env::var("CUTEAFD_GLMF_SPLIT_AUDIT").is_ok_and(|v| v == "1"),
-            spark_bf16: false, full_prefill_logits: false, routes_ready: library.cuda_event_create_ordering()?,
+            spark_bf16: false, full_prefill_logits: false,
             draft_probe: RefCell::new(None), capturing: std::cell::Cell::new(false),
             ops: std::env::var("CUTEAFD_GLMF_PROFILE_OPS").is_ok_and(|v| v == "1").then(RefCell::default),
             fp8_prefill: Fp8Prefill::default(), kda_fp32_partials: false,
@@ -2302,7 +2304,7 @@ impl<'a> GlmfEngine<'a> {
         extension: usize) -> Result<cuteafd_core::PolicyGeometry> {
         use crate::shared::draft::resource::{self, LayerHome};
         let remote = match &self.experts {
-            Some(Experts::Spark { transport, .. }) => transport.borrow().transport.installed_grouping()?,
+            Some(Experts::Spark { transport, .. }) => transport.borrow().installed_grouping()?,
             _ => Vec::new(),
         };
         let homes = self.weights.layers.iter().enumerate().map(|(layer, weights)| {
@@ -4196,7 +4198,7 @@ impl<'a> GlmfEngine<'a> {
                     })?;
                 } else {
                     // The router ran inside this layer's segment: its ids are still in place.
-                    self.probe_ring(index, w, t, matches!(self.experts, Some(Experts::Spark { .. })))?;
+                    self.probe_ring(index, w, t)?;
                     self.moe_experts(w, index, &layers[index], t, rows, cap, true, w1)?;
                 }
             }
@@ -4830,7 +4832,7 @@ impl<'a> GlmfEngine<'a> {
                     self.cfg.routed_scale as f32, true, self.stream)
             }
         })?;
-        self.probe_ring(index, w, t, matches!(experts, Some(Experts::Spark { .. })))?;
+        self.probe_ring(index, w, t)?;
         if !matches!(experts, Some(Experts::Local(_))) && !self.spark_bf16 {
             let grid = self.quantize_grid.blocks(t, h);
             self.run("expert_input_quant", &[("source_ptr", w.x.buffer.ptr), ("values_ptr", w.wire.buffer.ptr),
@@ -4956,11 +4958,12 @@ impl<'a> GlmfEngine<'a> {
                 }
                 return Ok(());
             }
-            Experts::Spark { transport, runtime } => {
+            Experts::Spark { transport } => {
                 // The compact reducer adds the shared expert plane to the rank partials.
                 let mut transport = transport.borrow_mut();
-                let wave = self.spark_dispatch(w, index, t, decode, &mut transport, shared)?;
-                return runtime.block_on(self.spark_land(w, t, &mut transport, wave));
+                let exchange = transport.exchange()?;
+                let wave = self.spark_send(w, index, t, decode, exchange, shared)?;
+                return self.spark_land(w, t, exchange, wave);
             }
         }
         self.run("add", &[("a", w.routed_ptr()?), ("b", w.shared.buffer.ptr), ("out", w.delta.buffer.ptr)], &[rows])
@@ -4976,11 +4979,12 @@ impl<'a> GlmfEngine<'a> {
     }
 
     /// Queue layer `index`'s router ids into the draft probe's ring right
-    /// behind the router (`spark`: the layer's ids are also staged).
-    fn probe_ring(&self, index: usize, w: &Workspace<'_>, t: usize, spark: bool) -> Result<()> {
+    /// behind the router. Spark layers ring too: their routes reach the host
+    /// only on the exchange worker, after the post.
+    fn probe_ring(&self, index: usize, w: &Workspace<'_>, t: usize) -> Result<()> {
         if self.capturing.get() { return Ok(()); }
         let mut probe = self.draft_probe.borrow_mut();
-        let Some(probe) = probe.as_mut().filter(|p| p.wants_ring(spark)) else { return Ok(()) };
+        let Some(probe) = probe.as_mut().filter(|p| p.wants_ring(false)) else { return Ok(()) };
         // SAFETY: the router just wrote `t` rows of ids into `route_ids` on this stream; the ring
         // is read after the step's sync.
         unsafe { probe.ring(self.library, index, w.route_ids.buffer, t, self.stream) }
@@ -5023,79 +5027,25 @@ impl<'a> GlmfEngine<'a> {
         self.draft_probe.borrow().as_ref().map(|probe| probe.ring_check)
     }
 
-    /// Routes and wire rows down and one request to every Spark rank; the
-    /// shared expert (`shared`) queues behind the copies and runs while the
-    /// ranks compute. Complete with [`Self::spark_land`].
-    fn spark_dispatch(&self, w: &Workspace<'_>, index: usize, t: usize, decode: bool, transport: &mut SparkLink<'_>,
-        shared: impl FnOnce() -> Result<()>) -> Result<SparkExpertWave> {
+    /// Layer `index`'s wave on the link's exchange: routes and wire rows copy
+    /// into the wave slot's pinned staging on the stream, then the shared
+    /// expert (`shared`) queues behind them and runs while the worker posts
+    /// and the ranks compute. This thread never waits for the GPU. Complete
+    /// with [`Self::spark_land`].
+    fn spark_send(&self, w: &Workspace<'_>, index: usize, t: usize, decode: bool,
+        exchange: &mut crate::shared::spark_waves::Waves<'_>, shared: impl FnOnce() -> Result<()>)
+        -> Result<crate::shared::spark_waves::WaveTicket> {
         let kind = if decode { ExpertV2SourceKind::Decode } else { ExpertV2SourceKind::Prefill };
-        let (h, topk) = (self.cfg.hidden, self.cfg.topk);
-        let layout = crate::shared::experts::staging::RouteStaging::new(t, topk,
-            if self.spark_bf16 { h * 2 } else { h + h / 32 })?;
-        let route_bytes = layout.route_bytes;
-        let staging = w.router_host.borrow_mut();
-        let timer = std::time::Instant::now();
-        // SAFETY: the pinned regions are large enough; the sync completes them.
-        unsafe {
-            layout.enqueue(self.library, staging.buffer,
-                [w.route_ids.buffer, w.route_weights.buffer,
-                    if self.spark_bf16 { w.x.buffer } else { w.wire.buffer }], self.stream)?;
-            self.library.cuda_event_record(self.routes_ready, self.stream)?;
-        }
-        // The shared expert queues behind the copies and runs during the exchange;
-        // the host waits for the copies only (they also order after this
-        // workspace's previous plane uploads, which frees its pinned plane staging).
-        shared()?;
-        // SAFETY: the event was recorded on this engine's stream above.
-        unsafe { self.library.cuda_event_synchronize(self.routes_ready)? };
-        self.profile.borrow_mut()[0] += timer.elapsed().as_secs_f64();
-        let staged = staging.bytes();
-        if let Some(probe) = self.draft_probe.borrow_mut().as_mut().filter(|p| p.active()) {
-            probe.staged(index, &staged[..route_bytes]);
-        }
-        let routes = layout.routes(staged)?;
-        let wire = layout.wire(staged)?.to_vec();
-        drop(staging);
-        let request = spark_request(h, topk, index, t, routes, wire, kind, self.spark_bf16)?;
-        if self.split_audit && !decode && t >= 256 {
-            let counts = audit_route_counts(&request.routes);
-            tracing::info!(layer = index, rows = t, distinct = counts.len(),
-                max_routes = counts.values().max().copied().unwrap_or(0),
-                histogram = %serde_json::to_string(&counts)?, "GLM Flash split audit routes");
-        }
-        transport.dispatch(&request)
-    }
-
-    /// Receives `wave`'s BF16 rank partials into its transport's intake planes
-    /// and sums them with the shared expert into `delta`.
-    async fn spark_land(&self, w: &Workspace<'_>, t: usize, transport: &mut SparkLink<'_>, wave: SparkExpertWave)
-        -> Result<()> {
-        let ranks = transport.world_size();
-        ensure!(ranks <= MAX_RANKS, "{ranks} Spark ranks exceed the reduction planes");
-        let timer = std::time::Instant::now();
-        transport.receive(wave, t, self.stream).await?;
-        self.profile.borrow_mut()[1] += timer.elapsed().as_secs_f64();
-        // SAFETY: the shared-expert plane and `delta` are live [t, h] BF16
-        // buffers; the planes are ordered after the wave by `receive`.
-        unsafe { transport.reduce(w.shared.buffer.ptr.cast(), w.delta.buffer.ptr.cast(), t, self.stream) }
-    }
-
-    /// A prefill unit's wave on the link's transport worker: routes and wire
-    /// rows copy into the wave slot's pinned staging on the stream, and the
-    /// worker builds and posts the request once they complete. This thread
-    /// does not wait for the GPU.
-    fn wave_send(&self, w: &Workspace<'_>, index: usize, t: usize,
-        transport: &mut crate::shared::spark_waves::Waves<'_, '_>) -> Result<crate::shared::spark_waves::WaveTicket> {
         let (h, topk, bf16) = (self.cfg.hidden, self.cfg.topk, self.spark_bf16);
         let layout = crate::shared::experts::staging::RouteStaging::new(t, topk, if bf16 { h * 2 } else { h + h / 32 })?;
-        ensure!(transport.ranks() <= MAX_RANKS, "{} Spark ranks exceed the reduction planes", transport.ranks());
-        let audit = self.split_audit && t >= 256;
-        // SAFETY: ids, weights and wire rows hold this unit's `t` rows in
+        ensure!(exchange.ranks() <= MAX_RANKS, "{} Spark ranks exceed the reduction planes", exchange.ranks());
+        let audit = self.split_audit && !decode && t >= 256;
+        // SAFETY: ids, weights and wire rows hold this layer's `t` rows in
         // stream order; the copies read them before later stream work.
-        unsafe {
-            transport.send(t, layout, [w.route_ids.buffer, w.route_weights.buffer,
+        let ticket = unsafe {
+            exchange.send(t, layout, [w.route_ids.buffer, w.route_weights.buffer,
                 if bf16 { w.x.buffer } else { w.wire.buffer }], self.stream, Box::new(move |routes, wire| {
-                    let request = spark_request_bytes(h, topk, index, t, routes, wire, ExpertV2SourceKind::Prefill, bf16)?;
+                    let request = spark_request_bytes(h, topk, index, t, routes, wire, kind, bf16)?;
                     if audit {
                         let counts = audit_route_counts(&request.routes);
                         tracing::info!(layer = index, rows = t, distinct = counts.len(),
@@ -5103,25 +5053,21 @@ impl<'a> GlmfEngine<'a> {
                             histogram = %serde_json::to_string(&counts)?, "GLM Flash split audit routes");
                     }
                     Ok(request)
-                }))
-        }
+                }))?
+        };
+        shared()?;
+        Ok(ticket)
     }
 
-    /// The land half of [`Self::wave_send`]: the stream waits for the wave's
+    /// The land half of [`Self::spark_send`]: the stream waits for the wave's
     /// planes and sums them with the shared expert into `delta`.
-    fn wave_land(&self, w: &Workspace<'_>, index: usize, t: usize,
-        transport: &mut crate::shared::spark_waves::Waves<'_, '_>, wave: crate::shared::spark_waves::WaveTicket)
-        -> Result<()> {
+    fn spark_land(&self, w: &Workspace<'_>, t: usize, exchange: &mut crate::shared::spark_waves::Waves<'_>,
+        wave: crate::shared::spark_waves::WaveTicket) -> Result<()> {
         let slot = wave.slot();
-        let timer = std::time::Instant::now();
-        transport.land(wave, self.stream)?;
-        self.profile.borrow_mut()[1] += timer.elapsed().as_secs_f64();
-        if let Some(probe) = self.draft_probe.borrow_mut().as_mut().filter(|p| p.active()) {
-            probe.staged(index, transport.staged_ids(slot)?);
-        }
+        exchange.land(wave, self.stream)?;
         // SAFETY: the shared-expert plane and `delta` are live [t, h] BF16
         // buffers; the slot's planes are ordered after the wave by `land`.
-        unsafe { transport.reduce(slot, w.shared.buffer.ptr.cast(), w.delta.buffer.ptr.cast(), t, self.stream) }
+        unsafe { exchange.reduce(slot, w.shared.buffer.ptr.cast(), w.delta.buffer.ptr.cast(), t, self.stream) }
     }
 
     /// Bytes of the widest prefill wave's pinned staging (routes and wire rows).
@@ -5185,8 +5131,6 @@ impl Drop for GlmfEngine<'_> {
         // Every rank can still read graph operands, weights and workspaces.
         // Abort before any owner releases storage when drainage is unproved.
         crate::shared::decode_graph::fatal_drain(self.shutdown_submission(), "GLM Flash engine");
-        // SAFETY: all rank streams drained while their event and operands remained live.
-        let _ = unsafe { self.library.cuda_event_destroy(self.routes_ready) };
         self.graphs = RefCell::new(GraphBank::new(None));
         if let Some(peer) = &mut self.peer { peer.graphs = RefCell::new(GraphBank::new(None)); }
         if let Some(ops) = self.ops.take() {
