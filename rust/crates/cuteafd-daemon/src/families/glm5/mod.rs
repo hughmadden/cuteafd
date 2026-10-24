@@ -18,12 +18,8 @@ use std::ffi::c_void;
 use std::path::PathBuf;
 use std::time::Instant;
 
-<<<<<<< HEAD
 /// One enum for the engine flag and `cuteafd plan`, so the planner charges what admission charges.
 pub(crate) use cuteafd_loader::plan::exlr8::PrefillActivations as Exlr8PrefillActivations;
-=======
-pub(crate) use crate::shared::experts::exlr8::Exlr8PrefillActivations;
->>>>>>> 054111823 (Wire opt-in A8 activations for EXLR8 grouped expert prefill)
 
 /// What every GLM command needs to stand up the engine.
 #[derive(Debug, Clone, clap::Args)]

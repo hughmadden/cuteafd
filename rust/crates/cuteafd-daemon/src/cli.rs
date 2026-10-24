@@ -524,7 +524,7 @@ pub(crate) struct NativeExpertDaemonArgs {
     #[arg(long)]
     pub(crate) exlr8_manifest: Option<String>,
     /// Native EXLR8 routed expert prefill activations; decode (`rows <= 64`) always keeps A16.
-    #[arg(long, value_enum, default_value_t = crate::shared::experts::exlr8::Exlr8PrefillActivations::A16)]
+    #[arg(long, value_parser = exlr8_prefill_activations_parser(), default_value_t = crate::shared::experts::exlr8::Exlr8PrefillActivations::A16)]
     pub(crate) exlr8_prefill_activations: crate::shared::experts::exlr8::Exlr8PrefillActivations,
     /// Spark-role native library built with V4.1 expert AOT kernels.
     #[arg(long)]

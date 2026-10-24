@@ -8,12 +8,7 @@ use cuteafd_loader::plan::exlr8::residency::Residency;
 mod execution;
 pub(crate) use execution::Exlr8Execution;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
-pub(crate) enum Exlr8PrefillActivations {
-    #[default]
-    A16,
-    A8,
-}
+pub(crate) use cuteafd_loader::plan::exlr8::PrefillActivations as Exlr8PrefillActivations;
 
 const BANKS: usize = 2;
 
