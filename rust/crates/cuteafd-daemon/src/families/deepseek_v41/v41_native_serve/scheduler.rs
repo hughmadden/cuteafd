@@ -118,7 +118,7 @@ impl Active<'_> {
             self.finished = true;
             self.ticket.finishing();
             // A cold benchmark probe leaves nothing behind.
-            self.cacheable = !crate::shared::probe::cold(&self.job.probe);
+            self.cacheable = !crate::shared::probe::cold(&self.job.probe) && self.job.variant == 0;
         }
         Ok(chunks)
     }
@@ -365,6 +365,7 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
             }
             id = id.checked_add(1).context("request ID exhausted")?;
             let lease = requests.admit(slot, id)?;
+            requests.set_variant(lease, prepared.job.variant)?;
             let events = prepared.job.events.clone();
             let admitted = (|| -> Result<_> {
                 let admission::Prepared { job, prompt, images } = &mut prepared;
@@ -377,7 +378,9 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
                 // Units for the request's whole declared lifetime are allocated here and the
                 // best snapshot restored into them; every running request already owns its
                 // own lifetime units, so this is the whole capacity check.
-                let cold = crate::shared::probe::cold(&job.probe);
+                // Until the prefix key carries the variant namespace, a variant
+                // request neither restores nor publishes snapshots.
+                let cold = crate::shared::probe::cold(&job.probe) || job.variant != 0;
                 let draft_id = draft_id(&draft, id);
                 let lifetime = |output: usize| prompt.len().saturating_add(output);
                 let restored = match prefixes.admit(requests, draft.as_deref_mut(), lease, draft_id, image_keys.tokens(),
@@ -494,7 +497,7 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
                 if crate::shared::probe::wants_first(&job.probe) {
                     crate::shared::probe::host_row(&job.probe, prompt.len(), &scores.logits()?);
                 }
-                if cached != prompt.len() && !crate::shared::probe::cold(&job.probe) {
+                if cached != prompt.len() && !crate::shared::probe::cold(&job.probe) && job.variant == 0 {
                   prefixes.capture_session(job.usage.as_ref().map(|u| u.session_id().to_owned()));
                   let draft_request = draft_id(&draft, id);
                   if let Err(error) = prefixes.retain(requests, draft.as_deref_mut(), SnapshotKind::Prompt, image_keys.tokens(),

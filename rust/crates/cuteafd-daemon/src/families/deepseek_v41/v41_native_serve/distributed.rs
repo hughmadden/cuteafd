@@ -12,7 +12,9 @@ use std::rc::Rc;
 
 pub(super) fn worker(args: crate::cli::NativeServeArgs, mut receive: mpsc::Receiver<NativeRequest>,
     ready: &mut Option<oneshot::Sender<std::result::Result<Option<std::sync::Arc<std::sync::atomic::AtomicBool>>, String>>>,
-    stats: std::sync::Arc<std::sync::Mutex<serde_json::Value>>) -> Result<()> {
+    stats: std::sync::Arc<std::sync::Mutex<serde_json::Value>>,
+    variants: Vec<cuteafd_core::variants::VariantPlan>) -> Result<()> {
+    let steer = crate::families::deepseek_v41::v41_variants::V41SteerTables::new(&variants)?;
     let minimum_expert_layers = match args.rtx_expert_layers {
         admission::LocalLayers::Auto | admission::LocalLayers::ExpertsFirst => 1,
         admission::LocalLayers::Count(count) => {
@@ -90,7 +92,7 @@ pub(super) fn worker(args: crate::cli::NativeServeArgs, mut receive: mpsc::Recei
     // possible their bytes are recorded and arrive in the Spark push group.
     let pushing = super::coordinator_push::wanted(&args, &catalog);
     let recorder = crate::shared::experts::rtx::dense::Recorder::start(pushing)?;
-    let weights = BackboneLaneWeights::load_distributed_with_split(
+    let mut weights = BackboneLaneWeights::load_distributed_with_split(
         &lib,
         &catalog,
         map,
@@ -99,6 +101,9 @@ pub(super) fn worker(args: crate::cli::NativeServeArgs, mut receive: mpsc::Recei
         args.tp2_query_projection,
         args.tp2_output_projection,
     )?;
+    // Live before the measured admission below, which therefore charges them.
+    if let Some(steer) = &steer { weights.install_variants(steer)?; }
+    let weights = weights;
     let query_shards=if args.tp2_query_projection {
         use crate::families::deepseek_v41::v41_projection_tp2::{Kind,Weights};
         Some([0usize,1].map(|rank| (0..40).map(|layer|
@@ -498,7 +503,7 @@ mod tests {
         drop(send);
         let (ready, mut readiness) = oneshot::channel();
             let stats = std::sync::Arc::new(std::sync::Mutex::new(serde_json::Value::Null));
-            super::super::worker(args, receive, &mut Some(ready), stats)?;
+            super::super::worker(args, receive, &mut Some(ready), stats, Vec::new())?;
         readiness.try_recv()?.map_err(anyhow::Error::msg)?;
         for (i, mut output) in outputs.into_iter().enumerate() {
             let mut ready = 0;
