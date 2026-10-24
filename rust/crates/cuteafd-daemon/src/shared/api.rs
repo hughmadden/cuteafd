@@ -111,6 +111,7 @@ impl ApiPolicy {
             use cuteafd_api::gateway::ModelMap;
             let mut models = if policy.official { ModelMap::official_names(profile.id.clone()) } else { ModelMap::single(profile.id.clone()) };
             if let Some(text) = &policy.names_file { models.apply_names_file(text).map_err(anyhow::Error::msg)?; }
+            models.variants = profile.variants.iter().map(|v| (v.public_id.clone(), v.index)).collect();
             let snapshot = snapshot.join("tokenizer.json").is_file().then(|| snapshot.to_path_buf());
             profile.gateway = Some(Arc::new(cuteafd_api::openai::GatewayMount { models, snapshot,
                 options: cuteafd_api::openai::engine::EngineOptions {

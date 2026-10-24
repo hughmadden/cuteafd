@@ -20,6 +20,9 @@ pub struct ModelMap {
     /// Extra ids to advertise in listings (e.g. the ids a CLI's picker
     /// expects), each resolving through the rules above.
     pub listed: Vec<String>,
+    /// Weight variants `(public id, index)`, checked before everything else:
+    /// a variant id resolves to itself and never falls back to `served`.
+    pub variants: Vec<(String, u8)>,
 }
 
 /// Model ids Claude Code shows and requests (its `/model` picker, default
@@ -51,7 +54,7 @@ impl ModelMap {
     /// expect, all running `served`.
     pub fn official_names(served: impl Into<String>) -> Self {
         let listed = CLAUDE_CODE_MODELS.iter().chain(CODEX_MODELS).map(|id| id.to_string()).collect();
-        Self { served: served.into(), accept_any: true, aliases: Vec::new(), listed }
+        Self { served: served.into(), accept_any: true, aliases: Vec::new(), listed, variants: Vec::new() }
     }
 
     /// Apply an official-names file so ids can be refreshed without a
@@ -84,8 +87,18 @@ impl ModelMap {
         Ok(())
     }
 
-    /// Resolve a requested id to the served id.
+    /// Resolve a requested id to the served id (a variant's own id for a variant).
     pub fn resolve(&self, requested: &str) -> Result<String, GatewayError> {
+        self.resolve_variant(requested).map(|(served, _)| served)
+    }
+
+    /// Resolve a requested id to `(served id, variant index)`; base is 0.
+    pub fn resolve_variant(&self, requested: &str) -> Result<(String, u8), GatewayError> {
+        if let Some((id, index)) = self.variants.iter().find(|(id, _)| id == requested) { return Ok((id.clone(), *index)); }
+        self.resolve_base(requested).map(|served| (served, 0))
+    }
+
+    fn resolve_base(&self, requested: &str) -> Result<String, GatewayError> {
         if requested.is_empty() || requested == self.served { return Ok(self.served.clone()); }
         for (pattern, target) in &self.aliases {
             let hit = match pattern.strip_suffix('*') {
@@ -105,6 +118,10 @@ impl ModelMap {
             id: self.served.clone(), context_tokens: None, max_output_tokens: None, owned_by: "cuteafd".into(),
         });
         let mut out = vec![base.clone()];
+        for (id, _) in &self.variants {
+            let record = backend.iter().find(|m| &m.id == id).cloned().unwrap_or_else(|| ModelInfo { id: id.clone(), ..base.clone() });
+            out.push(record);
+        }
         for id in &self.listed {
             if out.iter().any(|m| &m.id == id) { continue; }
             out.push(ModelInfo { id: id.clone(), ..base.clone() });
@@ -130,6 +147,25 @@ mod tests {
         map.accept_any = true;
         assert_eq!(map.resolve("gpt-5.1-codex").unwrap(), "served-model");
         assert_eq!(map.resolve("").unwrap(), "served-model");
+    }
+    #[test]
+    fn variant_ids_resolve_before_aliases_and_accept_any() {
+        let mut map = ModelMap::official_names("served");
+        map.aliases.push(("served-*".into(), "served".into()));
+        map.variants.push(("served-alternate".into(), 1));
+        map.variants.push(("other-id".into(), 2));
+        assert_eq!(map.resolve_variant("served-alternate").unwrap(), ("served-alternate".into(), 1));
+        assert_eq!(map.resolve_variant("other-id").unwrap(), ("other-id".into(), 2));
+        assert_eq!(map.resolve_variant("served").unwrap(), ("served".into(), 0));
+        assert_eq!(map.resolve_variant("served-unknown").unwrap(), ("served".into(), 0), "aliases still apply");
+        assert_eq!(map.resolve_variant("claude-opus-5-5").unwrap(), ("served".into(), 0), "accept_any still applies");
+        let ids: Vec<String> = map.listing(&[]).into_iter().map(|m| m.id).collect();
+        assert_eq!(&ids[..3], ["served", "served-alternate", "other-id"]);
+        // Without accept_any an unknown id keeps today's error, and a variant id still resolves.
+        let mut strict = ModelMap::single("served");
+        strict.variants.push(("served-x".into(), 1));
+        assert!(strict.resolve("nope").is_err());
+        assert_eq!(strict.resolve("served-x").unwrap(), "served-x");
     }
     #[test]
     fn official_names_list_claude_ids_for_discovery() {
