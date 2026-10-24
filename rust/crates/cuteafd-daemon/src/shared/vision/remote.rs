@@ -34,6 +34,12 @@ pub struct EncoderHandshake {
     pub plan_hash: [u8; 32],
 }
 impl EncoderHandshake {
+    /// What a peer hosting `spec` answers, and so what a coordinator expects of it.
+    pub fn for_tower(spec: &super::TowerSpec, encoder_id: EncoderId, processor: &cuteafd_loader::media::ProcessorConfig,
+        plan_hash: [u8; 32]) -> Self {
+        Self { encoder_id, max_patches: spec.native.max_tokens * processor.merge.pow(2),
+            output_width: spec.native.output_width, patch_size: processor.patch, merge_size: processor.merge, plan_hash }
+    }
     fn validate(&self) -> Result<()> {
         if self.max_patches == 0
             || self.max_patches > MAX_PATCHES
@@ -87,22 +93,27 @@ impl EncoderHandshake {
             .saturating_mul(if self.merge_size == 3 { 2 } else { 1 })
     }
     fn validate_job(&self, job: &EncodeJob) -> Result<usize> {
-        let ([t, h, w], rgb8) = job.image_input()?;
-        let patches = u64::from(h) * u64::from(w);
-        let rgb_bytes = self.input_bytes(patches);
-        if t != 1
-            || h == 0
-            || w == 0
-            || (self.merge_size == 2 && (h % 2 != 0 || w % 2 != 0))
-            || patches > u64::from(self.max_patches)
-            || job.tokens as u64 != self.tokens(h, w)
-            || (self.merge_size == 3 && job.tokens > 1024)
-            || job.hidden_width != self.output_width as usize
-            || rgb8.len() as u64 != rgb_bytes
-        {
-            return Err(error("invalid image grid/RGB8/output geometry"));
+        let (grid, rgb8) = job.image_input()?;
+        self.validate_image_geometry(grid, job.tokens as u64, rgb8.len() as u64)?;
+        if job.hidden_width != self.output_width as usize {
+            return Err(error("invalid image output width"));
         }
         job.feature_bytes()
+    }
+    /// What both ends check of a still image before any allocation.
+    fn validate_image_geometry(&self, [t, h, w]: [u32; 3], tokens: u64, len: u64) -> Result<()> {
+        let patches = u64::from(h) * u64::from(w);
+        if t != 1
+            || patches == 0
+            || patches > u64::from(self.max_patches)
+            || (self.merge_size == 2 && (h % 2 != 0 || w % 2 != 0))
+            || tokens != self.tokens(h, w)
+            || (self.merge_size == 3 && tokens > 1024)
+            || len != self.input_bytes(patches)
+        {
+            return Err(error("invalid image frame before allocation"));
+        }
+        Ok(())
     }
     fn validate_minimax(&self) -> Result<()> {
         self.validate()?;
@@ -113,11 +124,9 @@ impl EncoderHandshake {
     }
     fn validate_video_geometry(&self, grid: [u32; 3], tokens: u64, len: u64) -> Result<()> {
         self.validate_minimax()?;
-        let [t, h, w] = grid;
-        let patches = u64::from(h).checked_mul(u64::from(w))
-            .and_then(|n| n.checked_mul(u64::from(t))).ok_or(MediaError::Features)?;
-        if !(1..=4).contains(&t) || h == 0 || w == 0 || h % 2 != 0 || w % 2 != 0
-            || patches > u64::from(self.max_patches) || tokens != patches / 4
+        let patches = cuteafd_core::media::video_segment_patches(grid)
+            .ok_or_else(|| error("invalid video frame before allocation"))?;
+        if patches > u64::from(self.max_patches) || tokens != patches / 4
             || len != self.input_bytes(patches).saturating_mul(2) {
             return Err(error("invalid video frame before allocation"));
         }
@@ -643,11 +652,9 @@ impl EncoderServer {
                 let started = Instant::now();
                 let output = vec![0; job.tokens * job.hidden_width];
                 let ticket = match &job.input {
-                    EncodeInput::Image { grid, rgb8 } => service.submit(NativeJob {
-                        rgb: rgb8.clone(), grid: [grid[1] as usize, grid[2] as usize],
-                        lut: lut.clone(), output }),
-                    EncodeInput::Video { grid, rgb8 } => service.submit_video(super::VideoEncodeJob {
-                        rgb: rgb8.clone(), grid: grid.map(|n| n as usize), lut: lut.clone(), output }),
+                    EncodeInput::Image { grid, rgb8 } | EncodeInput::Video { grid, rgb8 } => service.submit(NativeJob {
+                        rgb: rgb8.clone(), grid: grid.map(|n| n as usize),
+                        video: matches!(job.input, EncodeInput::Video { .. }), lut: lut.clone(), output }),
                     _ => return Err(error("vision peer refuses audio")),
                 }.map_err(error)?;
                 // The owner retains all buffers until its stream has drained, even
@@ -830,45 +837,18 @@ where
             continue;
         }
         let job = match (opcode, handshake) {
-            (1, Handshake::Image(handshake) | Handshake::Minimax(handshake)) => {
-                let key: cuteafd_core::MediaKey = ImageKey(read_array(s)?).into();
-                let grid = [get_u32(s)?, get_u32(s)?, get_u32(s)?];
-                let tokens = get_u64(s)?;
-                let len = get_u64(s)?;
-                let patches = u64::from(grid[1]) * u64::from(grid[2]);
-                if grid[0] != 1
-                    || patches == 0
-                    || patches > u64::from(handshake.max_patches)
-                    || (handshake.merge_size == 2 && (grid[1] % 2 != 0 || grid[2] % 2 != 0))
-                    || tokens != handshake.tokens(grid[1], grid[2])
-                    || (handshake.merge_size == 3 && tokens > 1024)
-                    || len != handshake.input_bytes(patches)
-                {
-                    return Err(error("invalid vision frame before allocation"));
-                }
-                let mut rgb = vec![0; len as usize];
-                s.read_exact(&mut rgb).map_err(error)?;
-                let job = EncodeJob::image(
-                    match key {
-                        cuteafd_core::MediaKey::Image(key) => key,
-                        _ => unreachable!(),
-                    },
-                    grid,
-                    rgb.into(),
-                    tokens as usize,
-                    handshake.output_width as usize,
-                );
-                job
-            }
-            (3, Handshake::Minimax(handshake)) => {
+            // A still image (1) or, on a MiniMax tower, a video segment (3): the same frame.
+            (1, Handshake::Image(handshake) | Handshake::Minimax(handshake)) | (3, Handshake::Minimax(handshake)) => {
                 let key = ImageKey(read_array(s)?);
                 let grid = [get_u32(s)?, get_u32(s)?, get_u32(s)?];
                 let tokens = get_u64(s)?;
                 let len = get_u64(s)?;
-                handshake.validate_video_geometry(grid, tokens, len)?;
+                if opcode == 3 { handshake.validate_video_geometry(grid, tokens, len)? }
+                else { handshake.validate_image_geometry(grid, tokens, len)? }
                 let mut rgb = vec![0; usize::try_from(len).map_err(error)?];
                 s.read_exact(&mut rgb).map_err(error)?;
-                EncodeJob::video(key, grid, rgb.into(), tokens as usize, handshake.output_width as usize)
+                let job = if opcode == 3 { EncodeJob::video } else { EncodeJob::image };
+                job(key, grid, rgb.into(), tokens as usize, handshake.output_width as usize)
             }
             (2, Handshake::Audio(handshake)) => {
                 let key = AudioKey(read_array(s)?);
@@ -953,8 +933,8 @@ mod tests {
         let (queue, jobs) = mpsc::sync_channel::<super::super::Work>(2);
         let owner = thread::spawn(move || {
             while let Ok(work) = jobs.recv() {
-                let super::super::EncoderJob::Video(mut job) = work.job else { panic!("expected video job") };
-                assert!(matches!(job.grid, [1..=4, 2, 2]));
+                let super::super::EncoderJob::Vision(mut job) = work.job else { panic!("expected vision job") };
+                assert!(job.video && matches!(job.grid, [1..=4, 2, 2]));
                 assert_eq!(job.rgb.len(), job.grid[0] * 2 * 28 * 28 * 3);
                 assert!(job.rgb.iter().all(|&b| b == 6));
                 job.output.fill(0x3f80);

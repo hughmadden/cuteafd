@@ -692,6 +692,16 @@ if(CUTEAFD_ENABLE_CUDA)
   target_link_libraries(cuteafd_vision_pointwise_selftest PRIVATE CUDA::cudart CUDA::cublas)
   add_test(NAME cuteafd_vision_pointwise_selftest COMMAND cuteafd_vision_pointwise_selftest)
   set_tests_properties(cuteafd_vision_pointwise_selftest PROPERTIES TIMEOUT 30 SKIP_RETURN_CODE 77)
+  # CPU-only MiniMax tower admission; its stub attention owner aborts if admission reaches it.
+  add_executable(cuteafd_vision_minimax_contract_selftest tests/vision_minimax_contract_selftest.cc
+    shared/cuda/vision_runtime.cu)
+  set_target_properties(cuteafd_vision_minimax_contract_selftest PROPERTIES
+    CUDA_ARCHITECTURES "${CUTEAFD_CUDA_ARCHITECTURES}")
+  target_compile_definitions(cuteafd_vision_minimax_contract_selftest PRIVATE CUTEAFD_HAVE_VISION_ATTENTION_AOT=1)
+  target_include_directories(cuteafd_vision_minimax_contract_selftest PRIVATE ${CUTEAFD_NATIVE_INCLUDE_DIRS})
+  target_link_libraries(cuteafd_vision_minimax_contract_selftest PRIVATE CUDA::cudart CUDA::cublas)
+  add_test(NAME cuteafd_vision_minimax_contract_selftest COMMAND cuteafd_vision_minimax_contract_selftest)
+  set_tests_properties(cuteafd_vision_minimax_contract_selftest PROPERTIES TIMEOUT 30)
   # Chunk-1 GPU target-sampler (K1) device tests. They link the shipped native
   # library and therefore also pin the exported C ABI of sampling_gpu.h.
   # `.cu` because the subnormal/FTZ canary defines a probe kernel compiled with

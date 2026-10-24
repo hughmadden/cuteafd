@@ -38,9 +38,12 @@ tensor header and plans memory; the engine is being brought up.
 - Experts: package `minimax:nvfp4` on Spark worlds 2, 3, 4 and 6 at exact
   1536/1024/768/512 widths; bottom routed layers onboard to the RTX (TP1)
   when a Spark rank would exceed its budget.
-- Vision: Conv3d (2x14x14) patch embed, 32 CLIP layers (1280, 16 heads of
-  80) with 3D axial RoPE, a GELU projector to 6144 and a 2x2 patch-merge GELU
-  MLP; 576 tokens per 672x672 tile, `dynamic_res` tiling; images and video.
+- Vision: Conv3d (2x14x14, FP32) patch embed, 32 CLIP layers (1280, 16 heads
+  of 80) with 3D axial RoPE on 78 channels, a GELU projector to 6144 and a 2x2
+  patch-merge GELU MLP. Images smart-resize to at most 451,584 px (576 tokens:
+  the `dynamic_res` pinpoints are inactive, so large images shrink and never
+  tile); video samples 1 fps and attends in segments of 4 temporal patches
+  (8 frames). See [Vision](#vision).
 - Speculator: the bundled DSpark drafter (5 dense sliding-4096 layers, blocks
   of 7, Markov rank 256, confidence head; taps 3/17/31/45/59).
 
@@ -63,6 +66,77 @@ RTX, vision on a Spark, FP8 KV, Spark budget 108 GiB per rank.
 | --- | --- | --- |
 | 2026-10-23 | Planner family, tensor contract, cache layout | — |
 | 2026-10-23 | Re-pinned to `54e4e69`: the release rewrote its history (README/docs only; every weight, config, tokenizer and template blob is identical to `9e7ebac`) | — |
+
+## Vision
+
+The bundled tower runs natively: BF16 cuBLAS GEMMs with FP32 accumulation,
+the b12x D80 varlen attention export (build with
+`CUTEAFD_WIP_VISION_ATTENTION_AOT=ON`) and q/k rotated in FP32 as MiniMax's
+serving applier does. `--vision auto` (the default) keeps it on the
+coordinator GPU, as the other families do, and the KV pool takes what is left
+(startup logs the cost in pool tokens); `--vision-peers` with `expertd-native
+--encoder` on the ranks hosts it on the Sparks instead.
+Preprocessing is the release's: smart resize (factor 28); video samples 1 fps
+keeping the last frame, scales the longer side to at most 756 px and gives
+every temporal pair its own image delimiters and timestamp.
+
+- Preprocessing parity (CPU): `python/tools/qualify/minimax_m3/processor-parity.py`
+  runs the release's own processors (Transformers 5.14.0): patches, grids and
+  prompt expansion are bit-identical for 16 images and 9 frame lists, and the
+  1 fps sampler matches sglang's. MP4 frames are scaled by ffmpeg's bicubic
+  rather than torch's, so encoded video differs in about 1.5% of bytes (±1).
+- Tower parity (real weights, RTX 5090, `qualify-vision.py`): the native
+  output stays within the BF16 reference's own distance from an FP32
+  reference (per-row p90 and mean cosine); repeats are bit-stable with no
+  device allocation per encode.
+
+| Input | Tokens | Encode ms | Output rel. L2 vs FP32: native / BF16 ref |
+| --- | ---: | ---: | --- |
+| chart 512x512 | 324 | 16.7 | 0.015 / 0.015 |
+| one 672x672 tile | 576 | 26.6 | 0.060 / 0.036 (row p90 0.092 / 0.093) |
+| 1344x1344 (shrinks to 672x672) | 576 | 26.4 | 0.084 / 0.073 |
+| banner 2016x672 | 533 | 25.0 | 0.037 / 0.043 |
+| 8-frame segment 504x644 | 1,656 | 94.9 | 0.090 / 0.074 |
+| 8-frame segment 896x896 | 4,096 | 377.5 | — |
+
+Served at TP2 (spark7, spark8; RTX 5090 coordinator, FP8 KV, 4096 prefill
+rows, 16 sequences), the resident RTX tower takes 2.57 GB (its 2.50 GB ledger
+and module): at 1M context the largest admitted pool drops from 189,568 to
+152,512 tokens (-37,056), which is what the default serves, and the
+reference's 65,536-token pool fits either way. A Spark-hosted tower does not fit at TP2: it needs 3.57 GB per rank
+(weights, scratch, 1 GiB guard) beside 117.44 GB of experts, rings and
+workspace, against a 120.3-122.4 GB budget (MemAvailable - 3 GiB), and
+admission refuses it by name; the SM121 tower itself starts on the ranks.
+TP3 (spark7, spark8, spark10) has room and is not yet measured.
+
+The live checks (`scripts/qualify/minimax_m3/qualify-native-vision.py` on the
+`generate-media-fixtures.py --set semantics` fixtures) count and colour shapes,
+read a four-quadrant image, a banner, a chart and a terminal, order two images,
+and read a clip's numbers and motion from MP4 and from frames. Exact
+repeats of an image and a video request restore the whole prompt; leading
+media shared with an earlier, different prompt is not a hit, since MiniMax
+restores prompt-end and turn-end snapshots only.
+
+| TTFT (streamed, fresh media, median of 3) | Prompt tokens | s |
+| --- | ---: | ---: |
+| one 672x672 image | 774 | 0.875 |
+| 1344x1344 image | 774 | 0.910 |
+| text only | 796-804 | 0.810 |
+| 6 s 640x480 MP4 (7 sampled frames, one segment) | 1,892 | 1.735 |
+| the same 7 frames as PNGs | 1,892 | 1.555 |
+| text only | 1,908-1,932 | 1.305 |
+
+The scheduler starts a prefill once its features are ready. The prefill
+takes 0.84 s for the image prompt and 1.34 s for the clip against 0.80 s and
+1.30 s for text of the same length. Before it, the image spends about 35 ms
+(decode, resize, 27 ms encode), the PNG frames 0.22 s and the MP4 0.40 s: the
+95 ms encode plus preparation, where the MP4's ffprobe and ffmpeg take 72 ms
+and 155 ms in the coordinator container (a process start alone is about 70 ms
+on juliette). No thermal throttling.
+
+Text throughput with the tower resident, same slot and day, vision off -> on:
+prefill 4.4K/16K 1509/1650 -> 1499/1654 tok/s, decode C1/C4/C16
+27.1/49.4/79.5 -> 27.0/50.3/80.6 tok/s (no thermal throttling).
 
 ## Single 32 GiB coordinator: KV-saving design
 

@@ -44,11 +44,10 @@ impl LocalEncoder {
                 else { Err(MediaError::Encoder("audio encoder not loaded".into())) },
         };
         let [t, h, w] = *grid;
-        let patches = (h as usize).checked_mul(w as usize)
-            .and_then(|n| n.checked_mul(t as usize)).ok_or(MediaError::Features)?;
-        if (!video && t != 1) || (video && !(1..=4).contains(&t))
-            || h == 0 || w == 0 || h % 2 != 0 || w % 2 != 0
-            || job.tokens != patches / 4 || job.tokens > self.max_tokens
+        let patches = if video { cuteafd_core::media::video_segment_patches(*grid).map(|n| n as usize) }
+            else if t == 1 && h != 0 && w != 0 && h % 2 == 0 && w % 2 == 0 { (h as usize).checked_mul(w as usize) }
+            else { None }.ok_or(MediaError::Features)?;
+        if job.tokens != patches / 4 || job.tokens > self.max_tokens
             || self.patch_size.checked_mul(self.patch_size).and_then(|pixels| pixels.checked_mul(3))
                 .and_then(|bytes| patches.checked_mul(bytes))
                 .and_then(|bytes| bytes.checked_mul(if video { 2 } else { 1 })) != Some(rgb8.len()) {
@@ -73,12 +72,9 @@ impl EncoderClient for LocalEncoder {
             let started = Instant::now();
             let output = vec![0; pending.job.tokens * self.width];
             let submitted = match &pending.job.input {
-                EncodeInput::Image { grid, rgb8 } => self.service.submit(EncodeJob {
-                    rgb: rgb8.clone(), grid: [grid[1] as usize, grid[2] as usize],
-                    lut: self.lut.clone(), output }),
-                EncodeInput::Video { grid, rgb8 } => self.service.submit_video(super::VideoEncodeJob {
+                EncodeInput::Image { grid, rgb8 } | EncodeInput::Video { grid, rgb8 } => self.service.submit(EncodeJob {
                     rgb: rgb8.clone(), grid: grid.map(|n| n as usize),
-                    lut: self.lut.clone(), output }),
+                    video: matches!(pending.job.input, EncodeInput::Video { .. }), lut: self.lut.clone(), output }),
                 EncodeInput::Audio { pcm } => self.service.submit_audio(super::audio::AudioEncodeJob {
                     pcm: pcm.clone(), fp32_scratch: vec![0.0; output.len()], output }),
             };
@@ -136,7 +132,8 @@ mod tests {
             let (queue, jobs) = mpsc::sync_channel::<super::super::Work>(2);
             let owner = std::thread::spawn(move || {
                 while let Ok(work) = jobs.recv() {
-                    let super::super::EncoderJob::Video(mut job) = work.job else { panic!("expected video job") };
+                    let super::super::EncoderJob::Vision(mut job) = work.job else { panic!("expected vision job") };
+                    assert!(job.video);
                     assert_eq!(job.grid, [2, 2, 2]);
                     assert_eq!(job.rgb.len(), 4 * 28 * 28 * 3);
                     job.output.fill(0x3f80);

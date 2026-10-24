@@ -113,10 +113,19 @@ impl<'e, 'a> MiniMaxBackend<'e, 'a> {
         if embedded.is_err() || chunks.iter().any(|c| !c.features.is_empty()) { self.execution.drain()?; }
         embedded?;
         // Features are admitted host leases; injection precedes the device residual conversion.
+        // A span's rows are consecutive in both the chunk and its packed features, so each
+        // run is one copy (an image is one 7 MB copy, not 576 row copies).
+        const ROW: usize = 6144 * 2;
         for (request, chunk) in requests.iter().zip(&chunks) {
-            for (feature, &row) in chunk.features.chunks_exact(6144 * 2).zip(&chunk.indices) {
-                let destination = self.embedded.view((request.row_start + row as usize) * 6144 * 2, 6144 * 2)?;
-                library.copy_h2d(destination.raw(), feature)?;
+            ensure!(chunk.features.len() == chunk.indices.len() * ROW, "MiniMax media chunk feature extent");
+            let mut first = 0;
+            while first < chunk.indices.len() {
+                let mut end = first + 1;
+                while end < chunk.indices.len() && chunk.indices[end] == chunk.indices[end - 1] + 1 { end += 1; }
+                let destination = self.embedded.view((request.row_start + chunk.indices[first] as usize) * ROW,
+                    (end - first) * ROW)?;
+                library.copy_h2d(destination.raw(), &chunk.features[first * ROW..end * ROW])?;
+                first = end;
             }
         }
         let batch = BatchView { positions, slots, requests, pool_pages: self.cache.pages };

@@ -1,6 +1,6 @@
 //! Single coordinator startup: validate, admit, load, bind, schedule.
 use super::{admission::{self, RuntimeSizing}, backend::MiniMaxBackend, cache::Cache,
-    execution::Execution, media::{ReadyVision, RemoteVision}, routed::Routed, MiniMaxError};
+    execution::Execution, media::ReadyVision, routed::Routed, MiniMaxError};
 use crate::shared::{memory::device::Device, placement::{SparkAdmission, spark_rings},
     prefix::PrefixArgs, qwen::{Encoder, scheduler::{self, Backend}},
     token_io::{EmbedPlacement, EmbedSource, TokenEmbedding, TokenIoArgs}};
@@ -157,31 +157,38 @@ fn worker(args: &ServeArgs, receive: &mut tokio::sync::mpsc::Receiver<cuteafd_ap
         Ok(cuteafd_ffi::coordinator_gpu_budget().map_or(free as u64, |b|
             (free as u64).min(b.0.saturating_sub((total - free) as u64))))
     };
-    let remote = RemoteVision::parse(args.vision_peers.as_deref(), args.encoder_plan_hash.as_deref(), args.encoder_revision.as_deref())?;
-    let (vision_mode, text_admission) = if args.vision == MediaMode::Auto && remote.is_none() {
-        let free = available()?;
-        let text = admission::solve(&checkpoint, &manifest, local_package.as_ref(), admission::Request {
-            sizing, available: free, requested_pool: None, kv_format: args.kv_cache, onboard,
-            spark_budget: args.spark_budget_bytes, headroom, draft_bytes, draft_rings,
-            host_embedding: args.token_io.embed_placement == EmbedPlacement::Host })?;
-        let vision_bytes = ReadyVision::local_bytes(&args.snapshot, &args.native_lib)?;
-        let cache_target = args.pool_tokens.filter(|n| *n > 0).unwrap_or(262_144)
-            .checked_mul(text.cache.cache.token_bytes(0)).context("MiniMax vision cache target overflow")?;
-        let mode = super::media::local_auto_mode(free, text.cache.fixed_bytes, vision_bytes, cache_target)?;
-        tracing::info!(?mode, vision_bytes, cache_target, "MiniMax automatic vision placement preserves text admission");
-        (mode, Some(text))
-    } else { (args.vision, None) };
+    let remote = crate::shared::vision::startup::RemotePeers::parse(args.vision, args.vision_peers.as_deref(),
+        args.encoder_plan_hash.as_deref(), args.encoder_revision.as_deref())?;
+    // `auto`, like the other families: a checkpoint that bundles the tower and names no Spark
+    // peers keeps it on the coordinator GPU, and the KV pool takes what is left. The text-only
+    // pool is admitted first so startup logs what the tower costs.
+    let auto_local = args.vision == MediaMode::Auto && remote.is_none();
+    let vision_mode = if auto_local && cuteafd_loader::families::minimax_m3::config::MiniMaxM3VisionConfig::read(&args.snapshot)?.is_none() {
+        MediaMode::Off
+    } else { args.vision };
+    let text_admission = (auto_local && vision_mode == MediaMode::Auto).then(|| -> Result<_> {
+        admission::solve(&checkpoint, &manifest, local_package.as_ref(), admission::Request {
+            sizing, available: available()?, requested_pool: None, kv_format: args.kv_cache, onboard,
+            spark_budget: args.spark_budget_bytes, spark_vision_bytes: 0, headroom, draft_bytes, draft_rings,
+            host_embedding: args.token_io.embed_placement == EmbedPlacement::Host })
+    }).transpose()?;
     let (vision, prefix) = ReadyVision::load(&args.snapshot, &args.native_lib, &library, args.device,
         vision_mode, &args.prefix, args.media_cache_bytes, remote)?;
     let available = available()?;
     let admitted = if let Some(mut text) = text_admission {
-        text.readmit(&cfg, sizing, available, args.pool_tokens, args.kv_cache)?;
+        let text_pool = text.cache.pool_tokens;
+        text.readmit(&cfg, sizing, available, None, args.kv_cache).context("the bundled vision tower leaves no room \
+            for a KV pool on the coordinator GPU: pass --vision off, or host it on Sparks with --vision-peers")?;
+        tracing::info!(text_pool_tokens = text_pool, pool_tokens = text.cache.pool_tokens,
+            tower_kv_tokens = text_pool.saturating_sub(text.cache.pool_tokens),
+            "MiniMax automatic vision keeps the bundled tower on the coordinator GPU; the KV pool takes what is left");
+        if args.pool_tokens.is_some() { text.readmit(&cfg, sizing, available, args.pool_tokens, args.kv_cache)?; }
         text
     } else {
-        let remote_reserve = vision.as_ref().map_or(0, |v| v.spark_reserve_bytes);
         admission::solve(&checkpoint, &manifest, local_package.as_ref(), admission::Request {
             sizing, available, requested_pool: args.pool_tokens, kv_format: args.kv_cache, onboard,
-            spark_budget: args.spark_budget_bytes.saturating_sub(remote_reserve), headroom, draft_bytes, draft_rings,
+            spark_budget: args.spark_budget_bytes, spark_vision_bytes: vision.as_ref().map_or(0, |v| v.spark_reserve_bytes),
+            headroom, draft_bytes, draft_rings,
             host_embedding: args.token_io.embed_placement == EmbedPlacement::Host })?
     };
     let mut catalog = cuteafd_loader::read_expert_catalog(&args.snapshot)?;
@@ -219,7 +226,7 @@ fn worker(args: &ServeArgs, receive: &mut tokio::sync::mpsc::Receiver<cuteafd_ap
     let world = SparkWorld::canonical(args.peers.len())?;
     let spark = admitted.spark_layers.first().map(|&first| super::routed::Spark::connect(&library, args.device, world,
         &args.peers, sizing.rows, config, first, request)).transpose()?;
-    let expander = vision.as_ref().map(|_| cuteafd_loader::media::minimax::span_expander(&args.snapshot, cfg.vocab_size as u32, false)).transpose()?;
+    let expander = vision.as_ref().map(|_| cuteafd_loader::media::minimax::span_expander(&args.snapshot, cfg.vocab_size as u32)).transpose()?;
     let backend = MiniMaxBackend { execution: &execution, cache: &cache, embedding: &embedding, token_ids, embedded,
         experts: RefCell::new(Routed::new(local, spark)?), rows: sizing.rows, vocabulary: cfg.vocab_size, expander,
         pending: RefCell::new(None), timing: RefCell::new([0.0; 2]), probe: RefCell::new(crate::shared::draft::routes::RoundRoutes::new(1,4)),

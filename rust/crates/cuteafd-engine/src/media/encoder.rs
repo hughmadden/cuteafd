@@ -41,7 +41,8 @@ impl EncodeJob {
         match (&self.key, &self.input) {
             (MediaKey::Image(_), EncodeInput::Image { grid, rgb8 }) if !grid.contains(&0) && !rgb8.is_empty() => Ok(()),
             (MediaKey::Image(_), EncodeInput::Video { grid, rgb8 })
-                if !grid.contains(&0) && grid[0] <= 4 && !rgb8.is_empty() => Ok(()),
+                if cuteafd_core::media::video_segment_patches(*grid) == Some(self.tokens as u64 * 4)
+                    && !rgb8.is_empty() => Ok(()),
             (MediaKey::Audio(_), EncodeInput::Audio { pcm }) => {
                 if !(481..=7_200_000).contains(&pcm.len()) || pcm.iter().any(|x| !x.is_finite()) {
                     return Err(MediaError::Features);
@@ -149,6 +150,8 @@ mod tests {
         }
         let mut segment = job.clone();
         segment.input = EncodeInput::Video { grid: [4, 2, 2], rgb8: vec![1; 8 * 28 * 28 * 3].into() };
+        assert!(segment.validate().is_err(), "a segment's token count follows its grid");
+        segment.tokens = 4;
         assert!(segment.validate().is_ok());
         let mut invalid = job;
         invalid.key = AudioKey([7; 32]).into();

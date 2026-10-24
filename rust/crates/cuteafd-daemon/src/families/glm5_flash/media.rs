@@ -11,30 +11,7 @@ pub(super) fn vision_config(mode: MediaMode, snapshot: &std::path::Path) -> Resu
     Ok(config.get("vision_config").is_some().then_some(config))
 }
 
-pub(super) struct RemoteVision {
-    addresses: Vec<std::net::SocketAddr>,
-    plan_hash: [u8; 32],
-    revision: String,
-}
-impl RemoteVision {
-    pub fn from_args(args: &super::serve::ServeArgs) -> Result<Option<Self>> {
-        let Some(peers) = &args.vision_peers else {
-            anyhow::ensure!(args.encoder_plan_hash.is_none() && args.encoder_revision.is_none(),
-                "encoder plan hash/revision require --vision-peers");
-            return Ok(None);
-        };
-        anyhow::ensure!(matches!(args.vision, MediaMode::Auto | MediaMode::Spark(_)),
-            "--vision-peers requires Spark/auto vision placement");
-        let addresses = peers.split(',').map(|peer| peer.trim().parse()
-            .context("vision peer must be an IP:port")).collect::<Result<Vec<_>>>()?;
-        anyhow::ensure!((1..=6).contains(&addresses.len()), "vision needs 1..6 replicas");
-        let plan_hash = crate::shared::vision::worker::parse_plan_hash(args.encoder_plan_hash.as_deref()
-            .context("--vision-peers requires --encoder-plan-hash")?)?;
-        let revision = args.encoder_revision.clone().context("--vision-peers requires --encoder-revision")?;
-        anyhow::ensure!(!revision.is_empty(), "encoder revision must not be empty");
-        Ok(Some(Self { addresses, plan_hash, revision }))
-    }
-}
+pub(super) use crate::shared::vision::startup::RemotePeers as RemoteVision;
 
 pub(super) struct ReadyVision {
     pub encoder: Encoder,
@@ -56,10 +33,7 @@ impl ReadyVision {
             let id = spec.encoder_id(&remote.revision, 121);
             let preparer = Arc::new(MediaPreparer::for_loaded_encoder(processor.clone(), id, 4)?);
             anyhow::ensure!(preparer.config().max_image_tokens <= 4096, "GLM Flash tower capacity is 4096 tokens per image");
-            let expected = crate::shared::vision::remote::EncoderHandshake {
-                encoder_id: id, max_patches: 4096 * processor.merge.pow(2), output_width: spec.native.output_width,
-                patch_size: processor.patch, merge_size: processor.merge, plan_hash: remote.plan_hash,
-            };
+            let expected = crate::shared::vision::remote::EncoderHandshake::for_tower(&spec, id, &processor, remote.plan_hash);
             anyhow::ensure!(expected.output_width as usize == width, "GLM Flash tower/LM output width mismatch");
             let encoder = crate::shared::vision::remote::RemoteEncoder::connect(remote.addresses, expected,
                 std::time::Duration::from_secs(60))?;
@@ -81,21 +55,7 @@ impl ReadyVision {
         let revision = args.snapshot.file_name().and_then(|v| v.to_str()).context("snapshot revision")?;
         let preparer = Arc::new(MediaPreparer::for_loaded_encoder(processor.clone(), spec.encoder_id(revision, sm), 4)?);
         anyhow::ensure!(preparer.config().max_image_tokens <= 4096, "GLM Flash tower capacity is 4096 tokens per image");
-        let ledger = cuteafd_ffi::vision::NativeVision::required(&args.native_lib, &spec.native)?;
-        library.cuda_set_device(gpu)?;
-        let admitted = ledger.total_bytes();
-        let loaded = (|| -> Result<_> {
-        let (free, total) = library.cuda_memory_info()?;
-        cuteafd_core::serving_capacity::admit_device_reservations(95,
-            cuteafd_core::serving_capacity::DeviceMemory { device: gpu as u32,
-                total_bytes: total as u64, baseline_free_bytes: free as u64 },
-            &[cuteafd_core::serving_capacity::MemoryReservation { name: "vision.resident_weights_scratch".into(), bytes: admitted }])?;
-        // Start before LM preflight: its live baseline already includes the admitted tower.
-        Ok(crate::shared::vision::EncoderService::start(spec, args.native_lib.clone(), gpu, admitted)?)
-        })();
-        let restored = library.cuda_set_device(args.device);
-        let service = loaded?;
-        restored?;
+        let (service, admitted) = crate::shared::vision::startup::start_local(spec, library, &args.native_lib, gpu, args.device)?;
         tracing::info!(gpu, admitted_bytes = admitted, cache_bytes, sm, "GLM Flash resident vision encoder ready");
         Ok((Some(Self { encoder: Encoder::Local(crate::shared::vision::local::LocalEncoder::new(service, &processor, width, 4096)),
             preparer, cache_bytes }), prefix))
@@ -322,7 +282,7 @@ mod tests {
     use cuteafd_loader::media::{ImageGrid, ImageKey, PreparedImage};
 
     #[test]
-    fn remote_options_require_complete_identity_and_valid_placement() {
+    fn remote_vision_options_reach_the_shared_parser() {
         use clap::Parser;
         let make = |options: Vec<String>| {
             let mut argv = vec!["cuteafd".into(), "serve-glmf".into(), "--snapshot".into(), "/not-read".into(),
@@ -333,22 +293,13 @@ mod tests {
             args.vision = MediaMode::Spark(Some(0));
             args
         };
-        assert!(RemoteVision::from_args(&make(vec![])).unwrap().is_none());
+        let from_args = |args: &super::super::serve::ServeArgs| RemoteVision::parse(args.vision,
+            args.vision_peers.as_deref(), args.encoder_plan_hash.as_deref(), args.encoder_revision.as_deref());
+        assert!(from_args(&make(vec![])).unwrap().is_none());
         let complete = vec!["--vision-peers".into(), "127.0.0.1:1234,127.0.0.2:1234".into(),
             "--encoder-plan-hash".into(), "ab".repeat(32), "--encoder-revision".into(), "revision".into()];
-        let args = make(complete.clone());
-        let remote = RemoteVision::from_args(&args).unwrap().unwrap();
-        assert_eq!(remote.addresses.len(), 2); assert_eq!(remote.plan_hash, [0xab;32]);
-        for bad in ["", "hostname:1234", "127.0.0.1", "127.0.0.1:1234,"] {
-            let mut args = make(complete.clone()); args.vision_peers = Some(bad.into());
-            assert!(RemoteVision::from_args(&args).is_err());
-        }
-        let mut args = make(complete.clone()); args.encoder_plan_hash = None;
-        assert!(RemoteVision::from_args(&args).is_err());
-        let mut args = make(complete.clone()); args.encoder_revision = None;
-        assert!(RemoteVision::from_args(&args).is_err());
-        let mut args = make(complete); args.vision = MediaMode::Rtx(None);
-        assert!(RemoteVision::from_args(&args).is_err());
+        let remote = from_args(&make(complete)).unwrap().unwrap();
+        assert_eq!((remote.addresses.len(), remote.plan_hash, remote.revision.as_str()), (2, [0xab; 32], "revision"));
         assert!(matches!(failure(cuteafd_engine::media::MediaError::Encoder("socket died".into())),
             cuteafd_api::openai::NativeFailure::Unavailable(message) if message == "vision encoder unavailable"));
     }

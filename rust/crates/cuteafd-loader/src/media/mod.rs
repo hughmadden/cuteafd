@@ -12,7 +12,7 @@ pub use cuteafd_core::{ImageKey, MediaSpan};
 pub use decode::{decode, decode_bounded, AlphaPolicy, DecodePolicy};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-pub use spans::{ExpandedMediaPrompt, SpanExpander};
+pub use spans::{ExpandedMediaPrompt, PairedMedia, SpanExpander};
 use std::{path::Path, sync::Arc};
 
 #[derive(Debug, thiserror::Error)]
@@ -277,31 +277,36 @@ impl ProcessorConfig {
             ));
         }
         let factor = self.patch * self.merge;
-        if self.family == ImageFamily::Minimax {
-            minimax::resize_shape(height, width, factor, self.min_pixels, self.effective_max())
-        } else if self.family == ImageFamily::GlmFlash {
+        if self.family == ImageFamily::GlmFlash {
             glm_resize(height, width, factor, self.min_pixels, self.effective_max())
         } else {
-            qwen_resize(height, width, factor, self.min_pixels, self.effective_max())
+            smart_resize(height, width, factor, self.min_pixels, self.effective_max(),
+                self.family == ImageFamily::Minimax)
         }
     }
 }
 
-fn qwen_resize(height: u32, width: u32, factor: u32, min: u64, max: u64) -> Result<(u32, u32)> {
+/// Qwen2-VL smart resize: sides round to `factor`, then scale into `[min, max]` pixels.
+/// `release_clamp` is MiniMax's bundled processor (the rounded size is at least one factor
+/// and budget shrinks floor freely); otherwise Qwen's (the floored size is clamped).
+pub(crate) fn smart_resize(height: u32, width: u32, factor: u32, min: u64, max: u64, release_clamp: bool)
+    -> Result<(u32, u32)> {
     let (h, w, f) = (f64::from(height), f64::from(width), f64::from(factor));
-    if h.max(w) / h.min(w) > 200.0 {
-        return Err(invalid("absolute aspect ratio must be at most 200"));
+    if h == 0.0 || w == 0.0 || h.max(w) / h.min(w) > 200.0 {
+        return Err(invalid("dimensions must be positive with aspect ratio at most 200"));
     }
-    let (mut rh, mut rw) = ((h / f).round_ties_even() * f, (w / f).round_ties_even() * f);
+    let (round_min, floor_min) = if release_clamp { (f, 0.0) } else { (0.0, f) };
+    let (mut rh, mut rw) = (((h / f).round_ties_even() * f).max(round_min), ((w / f).round_ties_even() * f).max(round_min));
     if rh * rw > max as f64 {
         let beta = (h * w / max as f64).sqrt();
-        rh = f.max((h / beta / f).floor() * f);
-        rw = f.max((w / beta / f).floor() * f);
+        rh = floor_min.max((h / beta / f).floor() * f);
+        rw = floor_min.max((w / beta / f).floor() * f);
     } else if rh * rw < min as f64 {
         let beta = (min as f64 / (h * w)).sqrt();
         rh = (h * beta / f).ceil() * f;
         rw = (w * beta / f).ceil() * f;
     }
+    if rh < f || rw < f { return Err(invalid("resize budget cannot hold a merged patch")); }
     Ok((rh as u32, rw as u32))
 }
 fn glm_resize(height: u32, width: u32, factor: u32, min: u64, max: u64) -> Result<(u32, u32)> {
@@ -393,16 +398,8 @@ impl ImageProcessor for ProcessorConfig {
             h: height / self.patch,
             w: width / self.patch,
         };
-        let mut hash = Sha256::new();
-        hash.update(b"cuteafd-image-v1");
-        hash.update(encoder.0);
-        hash.update(self.id().0);
-        for dim in [grid.t, grid.h, grid.w] {
-            hash.update(dim.to_le_bytes());
-        }
-        hash.update(&rgb.data);
         Ok(PreparedImage {
-            key: ImageKey(hash.finalize().into()),
+            key: media_key(b"cuteafd-image-v1", encoder, self, grid, &rgb.data),
             grid,
             rgb8: rgb.data.into(),
             tokens,
@@ -410,52 +407,47 @@ impl ImageProcessor for ProcessorConfig {
     }
 }
 
+/// Media identity: domain tag, encoder, preprocessing, grid and the prepared RGB8 bytes.
+pub(crate) fn media_key(domain: &[u8], encoder: EncoderId, config: &ProcessorConfig, grid: ImageGrid, rgb: &[u8]) -> ImageKey {
+    let mut hash = Sha256::new();
+    hash.update(domain);
+    hash.update(encoder.0);
+    hash.update(config.id().0);
+    for dim in [grid.t, grid.h, grid.w] {
+        hash.update(dim.to_le_bytes());
+    }
+    hash.update(rgb);
+    ImageKey(hash.finalize().into())
+}
+
+/// Reference-compatible f32 patch rows `[t, bh, bw, mh, mw | C, temporal, py, px]`. A still
+/// image holds one frame, repeated for both temporal samples; a video segment holds `2t`
+/// frames. The encoder's RGB8/LUT path never builds this; qualification checks the layout.
+pub fn patch_rows(grid: ImageGrid, rgb8: &[u8], still: bool, config: &ProcessorConfig) -> Result<Vec<f32>> {
+    config.validate()?;
+    let (t, gh, gw, p, m, temporal) = (grid.t as usize, grid.h as usize, grid.w as usize,
+        config.patch as usize, config.merge as usize, config.temporal as usize);
+    let frames = if still { 1 } else { t * temporal };
+    if t == 0 || (still && t != 1) || gh == 0 || gw == 0 || gh % m != 0 || gw % m != 0
+        || rgb8.len() != frames * gh * gw * p * p * 3 {
+        return Err(invalid("patch grid and RGB byte extent differ"));
+    }
+    let lut = config.normalization_lut();
+    let mut out = Vec::with_capacity(t * gh * gw * 3 * temporal * p * p);
+    for time in 0..t { for bh in 0..gh / m { for bw in 0..gw / m { for mh in 0..m { for mw in 0..m {
+        for (c, table) in lut.iter().enumerate() { for sample in 0..temporal { for py in 0..p { for px in 0..p {
+            let frame = if still { 0 } else { time * temporal + sample };
+            let (y, x) = ((bh * m + mh) * p + py, (bw * m + mw) * p + px);
+            out.push(table[rgb8[((frame * gh * p + y) * gw * p + x) * 3 + c] as usize]);
+        }}}}
+    }}}}}
+    Ok(out)
+}
+
 impl PreparedImage {
-    /// Reference-compatible f32 patches. The encoder's RGB8/LUT path avoids
-    /// constructing this large array; qualification uses it to check layout.
+    /// Reference-compatible f32 patches; see [`patch_rows`].
     pub fn patches(&self, config: &ProcessorConfig) -> Result<Vec<f32>> {
-        config.validate()?;
-        let (gh, gw, p, m, t) = (
-            self.grid.h as usize,
-            self.grid.w as usize,
-            config.patch as usize,
-            config.merge as usize,
-            config.temporal as usize,
-        );
-        if self.grid.t != 1
-            || gh == 0
-            || gw == 0
-            || gh % m != 0
-            || gw % m != 0
-            || self.rgb8.len() != gh * gw * p * p * 3
-        {
-            return Err(invalid("patch grid and RGB byte extent differ"));
-        }
-        let lut = config.normalization_lut();
-        let mut out = Vec::with_capacity(gh * gw * 3 * t * p * p);
-        for bh in 0..gh / m {
-            for bw in 0..gw / m {
-                for mh in 0..m {
-                    for mw in 0..m {
-                        for table in &lut {
-                            for _ in 0..t {
-                                for py in 0..p {
-                                    for px in 0..p {
-                                        let y = (bh * m + mh) * p + py;
-                                        let x = (bw * m + mw) * p + px;
-                                        let c = out.len() / (t * p * p) % 3;
-                                        out.push(
-                                            table[self.rgb8[(y * gw * p + x) * 3 + c] as usize],
-                                        );
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        Ok(out)
+        patch_rows(self.grid, &self.rgb8, true, config)
     }
 }
 
