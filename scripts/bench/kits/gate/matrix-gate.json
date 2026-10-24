@@ -255,6 +255,30 @@
    }
   },
   {
+   "name": "glm53-exl3-min",
+   "family": "glm5",
+   "config": "examples/configs/glm53-exl3-min.config",
+   "gpus": [
+    1
+   ],
+   "sparks": [
+    "ostrich",
+    "dodo",
+    "emu",
+    "kiwi"
+   ],
+   "set": {
+    "ADDR": "0.0.0.0:8747",
+    "COORDINATOR_GPU": "1",
+    "EXPERT_PORT": "19847",
+    "SPARK_COUNT": "4",
+    "SPARK_0_HOST": "ostrich",
+    "SPARK_1_HOST": "dodo",
+    "SPARK_2_HOST": "emu",
+    "SPARK_3_HOST": "kiwi"
+   }
+  },
+  {
    "name": "glm53-exlr8-max",
    "family": "glm5",
    "config": "examples/configs/glm53-exlr8-max.config",

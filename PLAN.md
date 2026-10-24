@@ -5487,6 +5487,19 @@ Every family that sends experts to Sparks prefills the same way.
     byte-identity gate.
   - Card bars: 8K and TTFT ≥ 0.98×, decode ≥ 0.95×, KL identical. Report a
     64K row, the Spark busy fraction and a per-buffer workspace breakdown.
+  - **Absolute bar (TJ, 2026-10-24).** A same-day ratio against work/p0 is not
+    enough: each family's port must also match or beat its best recorded
+    absolute 8K/64K prefill on the pre-shared path, on the same layout, quant
+    and benchmark corpus, before it lands. Numbers from before #592's
+    realistic corpus (2026-10-21) are not comparable: the old filler routed
+    ~59% of tokens to one expert; re-measure the reference release on the
+    current corpus instead. References: GLM 5.3 K4 max 8K ≥ 3,168 and 64K ≥
+    3,087, min 8K ≥ 2,696 (v3.0.1 release, own launcher and defaults,
+    realistic corpus, 2026-10-24, #703; today's work/p0 does 2,063, so K4
+    regressed between v3.0.1 and the Oct 23 old path, before the shared
+    executor); MiMo Pro max 8K ≥ 3,479 (old 3-lane path, 2026-10-24). Every
+    card reports the absolute numbers next to the family's reference. A
+    family that was good before cannot land slower.
 - **Today (audit 2026-10-23):**
   - GLM 5.3 runs 3 lanes, GLM Flash 2, MiMo 3/2 (measured), V4 2 and V4.1 2
     on `PipelineOrder`;
@@ -5655,6 +5668,293 @@ Work:
 
 Second decode lanes (MiMo port, 2026-10-24) double a family's graph set,
 so this lands before lanes spread to GLM or V4.1-sized graph sets.
+
+## Per-request weight variants: review and proposed direction (2026-10-24)
+
+This is the reconciled implementation plan, not a claim of qualification or
+an already changed default. The existing overlay architecture remains:
+one resident base checkpoint, request-selected operators at named sublayer
+outputs, and immutable device tables. Integration and correctness fixes
+come before further performance work.
+
+Evidence: the local Gemini review and the current code at
+`wv-core-glm5` **39372033d**, `wv-glmf` **22a7012b5**, `wv-dsv41`
+**1968814ed**, and kernel **5961f2b82**, already merged into
+`hugh/weight-variants` **8d6478143**. Remote heads matched these revisions.
+The actual handoffs are comments on
+[core / GLM full #1](https://github.com/hughmadden/cuteafd/pull/1#issuecomment-6380042423),
+[V4.1 #3](https://github.com/hughmadden/cuteafd/pull/3#issuecomment-6380037741), and
+[GLM Flash #4](https://github.com/hughmadden/cuteafd/pull/4#issuecomment-6380028721).
+Some PR-body status and next-command sections predate their own heads.
+Their numerical results are author-reported historical evidence; this
+reconciliation used source inspection, a Git merge preview, and workspace
+arithmetic, with no new Cargo, CUDA or serving run. The original external
+design files under `recipes/cuteafd-upstream/designs/` are absent here;
+this section records the forward contract in the repository.
+
+### Reconciliation of the original review
+
+| Original finding | Current disposition | Action |
+|---|---|---|
+| P0-1: branch conflicts / empty `Delta` matches | Integration is still blocked, but the V4.1 matches are now `Delta { .. }` and its duplicate smoke script was dropped. Core + Flash merge cleanly; Flash + V4.1 still produce nine conflicting files. | Integrate shared core once; port V4.1's delta onto it rather than keeping its copied core implementation. |
+| P1-1: Flash delta decode cost / sliced prefill | All-base captured decode still executes the delta GEMV. Wide prefill was changed in `22a7012b5`, but its workspace check is broken (below), and it changes activation arithmetic to W8A8. | Fix the workspace contract and qualify the new arithmetic before measuring overhead. |
+| P1-2: unbounded GPU variant index | Confirmed ABI weakness: host reference checks the upper bound, device kernels do not. Current request routing supplies verified indices; this is not evidence of an ordinary request causing an out-of-bounds read. | Bound indices on device and test the actual table extent. |
+| P1-3: cache namespace / repeated copies | Launch-local indices correctly separate device snapshots, host pages and chain IDs. Tables and index assignments are immutable for the process. Prompt copies exist, but the review's fixed 6–7 copies per request is not the normal GLM path. | Keep current namespace semantics; optionally retain one namespaced request key. Persistence needs a separate identity design. |
+| P1-4: mixed prefill waves / allocation / two GPUs | GLM prefill units in a call use one placement, so the alleged mixed-variant trigger does not exist. Unconditional row-buffer allocation is real but small. Missing multi-GPU hooks are behind a rejecting startup gate. | Allocate buffers only when configured; retain and assert the supported-layout gate. No emergency multi-GPU port. |
+| P2-1: FP8 scale block inference | Wrong for partial blocks; current GLM tensor dimensions are whole blocks. Malformed grids can also panic. | Decode from each source's declared quantization layout and validate its scale grid. Do not guess a block size from a shortlist. |
+| P2-2: f32 intermediate basis | No demonstrated failure; the final fit uses f64 and all served tables are f32. | No precision rewrite without an ill-conditioned counterexample. |
+| P2-3: diagonal-only alpha diagnostic | The operator uses the full coupling matrix; only the rank > 1 summary is incomplete. | Label the diagonal correctly or add singular values / off-diagonal norm. |
+| P2-4: aliases shadow a valid variant | Incorrect, including at the reviewed core revision: variant IDs are checked before aliases. | Preserve precedence; fix unavailable-ID fallback instead. |
+| P2-5: missing local contract / operator docs | Confirmed. | Keep this contract in PLAN; document supported CLI modes and availability in README when implemented. |
+
+The original traffic and latency numbers for Flash's delta were estimates,
+not measurements. Its two packed matrices plus scales are 43,253,760 bytes
+(41.25 MiB), not 43.25 MiB. A whole-height native call removes the host
+slice loop; it does not prove one HBM read of each weight. The wide native
+route launches an activation pack and a tiled GEMM, followed by `add_rows`.
+Report measured traffic and runtime, not a source-level launch estimate.
+
+### Correctness and integration fixes
+
+1. **Fix Flash's wide-delta workspace contract.** At `22a7012b5`,
+   `families/glm5_flash/variants.rs::wide_delta_bytes` supplies only its
+   activation-pack estimate plus 1 MiB. `native/shared/cuda/fp8_gemv.cu`
+   `run_wide` first requires `wide_bytes`, which includes the legacy split-K
+   workspace, before choosing the whole-height route. With the standard
+   shared-down delta (`K=2048`, `N=4096`, 4096 rows, 170 or 188 SMs), Rust
+   supplies **9,699,328 bytes**, while that native check requires
+   **17,314,816 bytes**: it returns `cudaErrorInvalidValue` before launching.
+   Both attention and FFN deltas also fail for smaller wide chunks such as
+   65 and 128 rows. These values reproduce the code's formulas, not a GPU
+   run. Use the native workspace query and require the maximum of its
+   contract and the whole-height packing requirement; select the existing
+   fallback before launch if dead scratch is insufficient. Alternatively,
+   make the native query and entry point agree on a dedicated wide route.
+   Scratch-fit arithmetic alone is not a test of the native ABI.
+
+2. **Reserve unavailable variant IDs.** GLM, Flash and V4.1 drop rejected
+   variants from their loaded records. The default gateway's `accept_any`
+   then resolves a request for that configured ID to base, including via
+   native chat's gateway fallback. Retain every configured public ID with
+   either `Ready` or `Unavailable(reason)`. Resolve it before aliases and
+   catch-all matching; an unavailable ID returns a typed model-unavailable
+   error, never base output. Apply the same rule to every protocol and alias
+   target. Base and other valid variants can continue. `/v1/models` lists
+   ready variants; planning and stats report rejected IDs and reasons.
+
+3. **Accept a complete variant or reject it.** The shared GLM/Flash loader
+   partitions missing base tensors into `missing_in_base`, then can still
+   return a plan for the remaining sites. Make that outcome unavailable;
+   V4.1's latest derivation already rejects this case. Validate the complete
+   set of plans before admission, including Flash's current restriction to
+   one distinct delta per site and its unsupported MLA/NVFP4 activation
+   sites. Today some such errors appear only during device upload, aborting
+   base startup after loading weights. Report them as variant availability
+   decisions before allocation. Keep malformed paths/configuration errors
+   distinct from a well-formed but unsupported variant.
+
+4. **Choose the GLM edit's scope explicitly.** Current `GlmVariantMode`
+   defaults to `Ffn`, but derivation verifies only the shared down projection
+   and excludes routed expert tensors. Applying that operator to the combined
+   output adds an unverified edit to routed experts. The proposed default
+   for the Keys/shared-only source is **`shared-only`**, after its component
+   qualification. A combined-FFN policy must be explicit, identified in the
+   variant record and namespace, and separately qualified; shared-tensor
+   checks alone cannot establish that it reproduces a published checkpoint.
+   Do not automatically infer a common routed-expert operator from one
+   shared matrix. State the checked tensor/site scope; full-checkpoint
+   equivalence requires evidence about edits outside those sites too.
+
+5. **Unify branches and the shipping kernel pin.** Core + Flash merge cleanly
+   in the Git preview. V4.1 carries re-applied core commits with different
+   SHAs and still defines a column-order `variants::steer_rows_ref`; retain
+   core's re-export of the kernel-order reference instead. Preserve V4.1's
+   newer per-layer alpha/noise-band checks, direction-residual gate and
+   common plan/serve derivation entry point. Reconcile `SiteVerdict`'s Flash
+   delta field, both launchers and all tests; resolving conflict markers is
+   not a compile gate. All branches also pin a temporary SparkInfer fork
+   (`hugh/steer-rows` at `a1504a4e`), while current upstream work/p0 pins
+   `37b6fc9d`. Land the kernel work on the canonical kernel master and bump
+   pin plus tree lock without rolling back intervening kernel fixes.
+
+6. **Harden the ABI and source validation.** Carry the actual variant bound
+   through a versioned native entry point and guard `0 < vidx <= V` before
+   reading `k`, `on`, `a` or `b`. Keep holes and slot 0 initialized; do not
+   mistake a rounded-up allocation for initialized table entries. Match the
+   host reference's invalid-index no-op behavior, retain host validation,
+   and reject a native library with the wrong ABI before graph capture.
+   Decode scale layouts from config and tensor headers, with checked shape
+   arithmetic and typed errors. A separately supplied derivation base must
+   be shown compatible with the tensors actually served.
+
+### Forward execution and cache contract
+
+- A request selects base or one configured variant (at most seven). The
+  operators are `Steer: y -= A(B^T y)` and, only at supported input-bearing
+  sites, `Delta: y += delta_W x`. Apply them after the intended projection
+  or complete expert reduction and before the residual/mHC consumer.
+  Base rows are not read or written by the masked operator. Spark weights
+  and the expert-exchange protocol stay shared.
+- Device tables, scalar layout metadata, modules and workspace addresses
+  are immutable from startup through graph retirement. Only the row-index
+  buffer changes per step, and padded rows are base. Keep one graph topology
+  per existing shape: no variant-content key or per-request capture. Eager
+  calls can skip inactive sites. If measured decode overhead warrants work,
+  gate the expensive delta computation on device or fuse a consumer; do not
+  add a host-selected base/variant graph axis as the initial fix.
+- Keep GLM full and Flash restricted to one coordinator GPU. Check the
+  restriction at admission and engine binding. A future multi-GPU port must
+  place every hook on the full result, including DenseFfn and combined Ffn,
+  and qualify head splits, layer ownership and TP2 independently. V4.1's
+  existing complete-output hook and lane masks need their own layout gates.
+- Keep the current launch-local prefix namespace for the first integration;
+  it already isolates all cache tiers. Avoid repeated prompt copies by
+  retaining a namespaced key if that cost matters. Hot reload, index reuse,
+  cross-process or persistent cache reuse are separate work. Such reuse
+  needs a stable identity for the served checkpoint, realized operator and
+  delta bytes, site/mode map and numerical policy, plus stable page-chain
+  hashing. Input hashes alone are insufficient if derivation can produce
+  different tables. Fixed-order reductions or a verified serialized derived
+  artifact can make restart identity reproducible; an optional derivation
+  cache must never replace loading standard checkpoint metadata directly.
+- Report actual resident bytes from the same packed plan admission uses,
+  including base slots, holes, per-site maximum rank, deduplication, masks,
+  delta scratch and transient upload peaks. Current `plan` table-byte
+  summaries omit some of those costs. Preserve V4.1's table deduplication,
+  but never force equal strengths merely because directions agree.
+
+### Work order and gates
+
+Integrate the shared contracts and canonical pin first, retaining all
+family-specific changes. Then fix unavailable routing, partial acceptance,
+Flash workspace sizing and checkpoint-faithful GLM mode; harden device
+bounds and scale validation in that same qualification series. Follow with
+optional-buffer cleanup and truthful memory/numerical diagnostics. Defer
+prefix API redesign, generalized multi-GPU support and kernel fusion until
+their own use case or measurement warrants them.
+
+CPU gates: unavailable IDs under official aliases and catch-all routing
+across Chat/Messages/Responses; missing and conflicting sites; source block
+sizes including 129 rows with 128-row blocks and malformed scales; one
+kernel-order reference; launcher baseline equivalence; native workspace
+requirements at 65/128/4096 rows and both supported coordinator SM counts;
+existing namespace isolation; and the full CPU gate with no new failing
+IDs. Restore this machine's missing GPTQModel object-mirror dependency and
+initialize pinned submodules before attempting that gate.
+
+GPU gates: bounds and base-row byte preservation on both SM120/SM121;
+mixed base/variant batches and graph replay with changed masks; real
+activation component checks for both steering and deltas; base golden
+byte-exactness with variants configured; prompt and turn restores within
+each variant and misses across variants; target verification/speculation;
+and Flash's W8A16/W8A8 transition plus scratch-lifetime checks at short,
+wide, packed and fallback shapes. Arithmetic-route changes may alter
+logits within the established numerical contract; cache restoration must
+still restore the exact state of the selected execution.
+
+The handoffs report some GLM full traffic tests and a V4.1 synthetic GPU
+component gate. They do not establish the missing base/configured-variant
+golden and prefix gates, and Flash has no end-to-end hardware qualification.
+After correctness, measure this engine against itself with an untimed warm
+batch and one launch per arm: variants absent versus configured-but-base
+traffic, then variant traffic, at C1/C16 plus 8K prefill. Include readiness,
+memory and thermal windows. Retain the handoffs' overhead goals (base C1
+0.995, variant traffic 0.98) as targets, distinguish noise from a regression,
+and use AGENTS' tiered escalation; historical same-server traffic numbers
+are not a substitute for the configuration A/B. No comparison-engine
+campaign is required for these fixes.
+
+### First milestone: layered GLM-5.3 full ready for Romeo
+
+The requested first deliverable is the full `glm5` model with request-selected
+weight overlays: one resident base checkpoint, base and variant public IDs,
+and the immutable steering tables described above. The user-specified target
+is **Romeo plus all six Sparks, retaining the two-layer weight design**.
+Planning, packaging and qualification must use that deployment. This milestone does not
+depend on integrating the Flash or V4.1 adapters. The cross-family work order
+above remains the later integration plan.
+
+Target the staged EXL3-K4 base plus the Keys overlay, with `shared-only`
+explicit in the candidate configuration. Keep DFlash2 available and test its
+target verification. Retain Romeo's one coordinator GPU with experts placed
+across all six Sparks;
+the unsupported coordinator head-split, TP2, layer-owner and EXLR8 native-dense
+paths remain gated. Combined `ffn` steering is a separate explicit policy,
+not evidence of reproducing the Keys checkpoint's edited tensor scope.
+
+Romeo was inspected read-only on 2026-10-24. It has one RTX PRO 6000 Max-Q
+96 GB, full-model configurations at `/srv/cuteafd/romeo-glm53-k4.config`,
+`romeo-glm53-k4-variants.config` and
+`romeo-glm53-k4-variants-shared.config`, configured for Spark1-4 and DFlash2.
+Those four-Spark files are historical staging to adapt, not the requested
+deployment or evidence that the six-Spark design is qualified.
+The base revision is `47af23347db743b4666d952e2eb48f2b01c3fede`; the draft
+revision is `425aa615ce320caac34400208b30808c8f14f76c`.
+The staged overlay is `/srv/cuteafd/variants/keys-glm53-sites/model.safetensors`.
+`/srv/cuteafd/gates/wv/out/` contains full-model API-ready logs and base/variant
+traffic results for the earlier `ffn` configuration. These are initial test
+records, not qualification of the revised design. Recheck resources before
+any hardware run; container names or a free GPU do not establish ownership.
+
+1. **Recover a reproducible candidate.** Start from the reviewed full-GLM
+   core at `39372033d`, reconcile onto current `work/p0` in an isolated
+   worktree, and preserve newer shared/native fixes. Repair local submodule
+   mirror dependencies and initialize all pinned sources. Verify the staged
+   base, draft and overlay identities and tensor headers; recover the local
+   site's source provenance and quantization metadata rather than assuming a
+   standalone safetensors file supplies them. Record the exact served-base
+   relationship and checked edit scope. Confirm memory fit and expert
+   placement for Romeo plus all six Sparks with the planner; carry that
+   layout through package selection, launch and test configuration.
+
+2. **Complete the GLM application and loader fixes.** Reserve every configured
+   variant ID, with ready/unavailable state, and reject unavailable requests
+   before alias or catch-all resolution on all supported protocols. Reject
+   incomplete site plans. Use the Keys shared-only scope by default and in
+   the Romeo config; report any broader FFN policy explicitly. Read each
+   source's declared FP8 block layout, validate malformed grids without
+   panics, and reject an unverified alternate derivation base. Report actual
+   packed resident bytes, allocate row masks only when needed, and assert
+   the supported topology again when binding tables to the engine.
+
+3. **Complete the kernel contract in parallel with step 2.** Carry the actual
+   variant bound through a versioned native ABI, make invalid indices no-ops
+   before any table access, initialize base and unused slots, and match the
+   host reference. Preserve graph-stable metadata and startup ABI checks.
+   Forward-port the kernel commits to canonical SparkInfer master before
+   updating cuteafd's submodule and tree lock. Use a separate worktree for
+   this stream; integrate after both streams pass their focused checks.
+
+4. **Pass build and CPU gates.** Cover rejected-ID routing, partial variants,
+   mode/site selection, source scale metadata, packed-memory accounting,
+   namespace isolation and unchanged no-variant launcher behavior. Run the
+   CPU gate with no new failing IDs and compare native exports for 188/170
+   SMs. Build matching SM120 coordinator and SM121 Spark WIP artifacts from
+   the integrated commit, including the expert packages for the six-Spark
+   layout, using the prescribed NVMe build roots and slots.
+
+5. **Prepare the Romeo test handoff.** Provide a dedicated WIP instance,
+   pinned source/kernel/artifact manifest, verified checkpoint mounts,
+   base-only and shared-only variant configurations, deterministic golden
+   inputs, and exact launch/test/cleanup commands for Romeo and all six
+   Sparks. Replace the staged four-peer settings with the verified six-peer
+   topology. Check the actual staged
+   source derives the expected 96 rank-one sites with no missing required
+   tensors and that the planner includes the real table/workspace charge.
+   A candidate is ready to test when these artifacts and CPU/export results
+   exist; hardware qualification must still be marked pending.
+
+The first session on Romeo plus all six Sparks then runs, in order:
+kernel bounds/base-row tests;
+base prefill/decode golden with variants absent versus configured and unused;
+shared-only component checks against published tensors within the existing
+quantization-floor tolerances; mixed base/variant graph replay; exact prompt
+and turn prefix restores with cross-variant misses; and DFlash2 verification,
+quality/tool-use and behavior smoke. Only then run the warmed C1/C16 and
+8K-prefill comparisons, recording readiness, headroom and thermal windows.
+Use the same checkpoint, draft and workload settings across arms and current
+work/p0 for the shared-path comparison. Hardware leases, preflight and cleanup
+follow AGENTS.md. Stop owned test services when finished.
 
 ## Backlog (lowest priority: only when nothing planned is left)
 
