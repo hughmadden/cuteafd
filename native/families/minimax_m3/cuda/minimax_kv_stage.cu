@@ -21,14 +21,17 @@ constexpr int kBlockTokens = 128;
 constexpr int kTopk = 16;
 
 // Slot map entries: 0 free, -1 being claimed, -2 overflow, s + 1 staged in slot s.
+// A plain read first: every row of a prefill tile selects its local block,
+// so most claims find the page already staged without an atomic.
 __device__ int claim(int32_t* map, int32_t page, int32_t* count, int32_t capacity) {
-  int32_t value = atomicCAS(&map[page], 0, -1);
+  int32_t value = *reinterpret_cast<volatile int32_t*>(&map[page]);
+  if (value == 0) value = atomicCAS(&map[page], 0, -1);
   if (value == 0) {
     const int32_t slot = atomicAdd(count, 1);
     value = slot < capacity ? slot + 1 : -2;
     atomicExch(&map[page], value);
   }
-  while (value == -1) value = atomicAdd(&map[page], 0);
+  while (value == -1) value = *reinterpret_cast<volatile int32_t*>(&map[page]);
   return value > 0 ? value - 1 : -1;
 }
 
@@ -86,7 +89,10 @@ __global__ void stage(const int32_t* q2k, uint32_t q2k_rows, uint32_t rows, cons
         continue;
       }
       int32_t seen = 0;
-      if (lane == 0) seen = atomicOr(&heads[slot], 1 << head);
+      if (lane == 0) {
+        seen = *reinterpret_cast<volatile int32_t*>(&heads[slot]);
+        if (!(seen & (1 << head))) seen = atomicOr(&heads[slot], 1 << head);
+      }
       seen = __shfl_sync(0xffffffffu, seen, 0);
       if (seen & (1 << head)) continue;
       const int64_t from = int64_t(page) * kPageBytes + head * 128;
