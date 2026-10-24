@@ -36,4 +36,5 @@ pub(crate) mod spark_intake;
 pub(crate) mod spark_topology;
 pub(crate) mod target_head;
 pub(crate) mod thermal;
+pub(crate) mod variants;
 pub(crate) mod vision;
