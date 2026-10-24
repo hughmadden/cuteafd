@@ -77,8 +77,10 @@ docker_args+=(
 # Host build slots (scripts/build/build-slot.sh) exclude through these lock
 # files; mount them at the same path so a compile inside takes the real slot.
 # Only the slot files are shared (created first, so the container never makes
-# a private copy); the hardware locks and the fair queue stay host-only.
-lock_dir="$HOME/.cache/cuteafd"
+# a private copy); the hardware locks and the fair queue stay host-only. A
+# deployment whose locks live outside HOME names them with CUTEAFD_LOCK_DIR, as
+# build-slot.sh reads it on the host.
+lock_dir="${CUTEAFD_LOCK_DIR:-$HOME/.cache/cuteafd}"
 mkdir -p "$lock_dir"
 # The slot files live in a private, writable directory at the same path inside
 # (a bind-mounted file under an unmounted parent is not writable for flock's
