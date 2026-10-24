@@ -1,18 +1,15 @@
 //! Teacher-forced qualification through the serving programs and paged cache.
 use super::{cache::{Cache, INDEX_PAGE_BYTES, KV_PAGE_BYTES}, execution::{BatchView, Execution, ExpertExecutor, RequestView},
-    prefix::{MiniMaxPrefix, Placement}, routed::Routed, MiniMaxError};
-use crate::shared::{golden_scores::{scored_kl, scored_nll, HiddenMetrics}, memory::device::Device,
-    placement::{spark_rings, SparkAdmission},
-    token_io::{EmbedPlacement, EmbedSource, TokenEmbedding}};
+    prefix::{MiniMaxPrefix, Placement}, MiniMaxError};
+use crate::shared::{golden_scores::{scored_kl, scored_nll, HiddenMetrics}, token_io::{EmbedPlacement, TokenEmbedding}};
 use anyhow::{ensure, Context, Result};
-use cuteafd_core::{ExpertGeometry, SparkEndpoint, SparkIngress};
+use cuteafd_core::ExpertGeometry;
 use cuteafd_engine::{media::RequestMedia, prefix::{After, PrefixCache, PrefixConfig, PrefixFamily, SnapshotKind}};
 use cuteafd_ffi::minimax::{Buffer, Commands};
 use cuteafd_hostcache::copy::StubCopyEngine;
 use cuteafd_loader::{families::{minimax_m3::config::MiniMaxM3Config, qwen4::Qwen4KvCache},
-    placement::SparkWorkingSet, plan::{checkpoint::{read_json, Checkpoint}, families::minimax::{admission,
-    coordinator::RankWeightLayout}}};
-use cuteafd_transport::{expert::SparkWorld, worker_selection::ModelAdmission, ExpertV2SourceKind, TcpTransportConfig};
+    plan::{checkpoint::{read_json, Checkpoint}, families::minimax::{admission, coordinator::RankWeightLayout}}};
+use cuteafd_transport::ExpertV2SourceKind;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::{io::{Read, Write}, net::SocketAddr, path::{Component, Path, PathBuf}};
@@ -484,46 +481,22 @@ pub(crate) async fn run_golden(args: GoldenArgs) -> Result<()> {
         |b| (free as u64).min(b.0.saturating_sub((total - free) as u64)));
     let pool_tokens = if args.check_prefix {(context as u64).max(128) * 3 + 256} else {context as u64};
     let admitted = admission::admit(&cfg, sizing, &ledger, reservations, available, Some(pool_tokens), Qwen4KvCache::Fp8)?;
-    let endpoint = SparkEndpoint {capacity:args.prefill_rows, ingress:SparkIngress::Bf16};
-    let config = TcpTransportConfig::default();
-    let pending = if args.peers.is_empty() {None} else {
+    if !remote.is_empty() {
         if let Ok(selected) = std::env::var("CUTEAFD_GOLDEN_EXPERT_LAYERS") {
             let selected = selected.split(',').map(str::parse::<usize>).collect::<std::result::Result<Vec<_>, _>>()?;
             ensure!(selected == remote, "golden runner worker layers differ from executed remote layers");
         }
-        let working = SparkWorkingSet {rtx_layers:args.expert_layers.clone(), spark_layers:remote.clone(),
-            spark_ranks:args.peers.len(), prefill_lanes:1};
-        Some(SparkAdmission::plan(&args.snapshot, ExpertGeometry::MINIMAX_M3, Some(&catalog), &working,
-            args.peers.len(), None, ModelAdmission::for_clients(ExpertGeometry::MINIMAX_M3, endpoint,
-                args.prefill_rows, spark_rings(config.max_frame_bytes)?, 1)?)?.start(&args.peers)?)
-    };
-    let device = Device {library:&library, id:args.device};
-    let ids = Buffer::new(&library, args.device, ledger.bytes("token_ids").context("token admission")? as usize)?;
-    let embedded = Buffer::new(&library, args.device, ledger.bytes("embedded").context("embedding admission")? as usize)?;
-    let tensor = checkpoint.tensors.iter().find(|t| t.meta.name == super::weights::EMBEDDING)
-        .context("MiniMax embedding header missing")?;
-    let source = EmbedSource::new(&args.snapshot, &tensor.shard, &tensor.meta, cfg.hidden)?;
-    let (embedding, (execution, local)) = crate::shared::placement::load_while_admitting(pending, || {
-        TokenEmbedding::load(&library, source, EmbedPlacement::Gpu, || {
-            let execution = Execution::load(device, &programs, &checkpoint, &cfg, &ledger, sizing)?;
-            let local = if args.expert_layers.is_empty() {None} else {
-                let tensors = catalog.fp8().context("MiniMax expert catalog missing")?.for_coordinator();
-                Some(crate::shared::experts::fp8::Fp8Experts::load(&library, &tensors, &package,
-                    &args.expert_layers, 1, 0, sizing.rows, available as usize)?)
-            };
-            Ok((execution, local))
-        })
-    })?;
-    let cache = Cache::new(&library, args.device, &admitted.cache, admitted.pool_pages as usize, 1,
-        admitted.cache_bytes.checked_add(256).context("cache admission overflow")?)?;
-    let spark = if let Some(&first) = remote.first() {
-        cuteafd_transport::worker_selection::require_peer_clients(&args.peers, endpoint, 1)?;
-        Some(super::routed::Spark::connect(&library, args.device, SparkWorld::canonical(args.peers.len())?, &args.peers,
-            sizing.rows, config, first, super::serve::request, 1, sizing.host_landing)?)
-    } else {None};
-    let experts: Box<dyn ExpertExecutor<'_>> = if local.is_none() && spark.is_none() {Box::new(DenseOnly)}
-        else {Box::new(Routed::new(local, spark)?)};
-    let mut runner = Runner {execution:&execution, cache:&cache, embedding:&embedding, ids, embedded, experts,
+    }
+    // Serve's start-up, without its startup decode recordings: every golden step runs eagerly, so
+    // the gate scores the kernels themselves. A served replay is the same launch sequence
+    // (CUTEAFD_MINIMAX_GRAPH_VERIFY=1 checks replay against eager bit for bit).
+    let super::serve::Runtime { execution, cache, embedding, token_ids, embedded, routed } =
+        super::serve::start(&library, args.device, &programs, super::serve::Start {
+            snapshot: &args.snapshot, checkpoint: &checkpoint, cfg: &cfg, sizing, ledger: &ledger, cache: &admitted,
+            local_layers: &args.expert_layers, spark_layers: &remote, peers: &args.peers, catalog: &catalog,
+            package: &package, embed: EmbedPlacement::Gpu, available, draft: None })?;
+    let experts: Box<dyn ExpertExecutor<'_>> = match routed { Some(routed) => Box::new(routed), None => Box::new(DenseOnly) };
+    let mut runner = Runner {execution:&execution, cache:&cache, embedding:&embedding, ids:token_ids, embedded, experts,
         last_layer:args.last_layer, rows:sizing.rows};
     if args.check_prefix {check_prefix(&mut runner, &windows[0].tokens)?;}
     let mut results = Vec::new();
