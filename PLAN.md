@@ -5928,3 +5928,37 @@ released, and all rolling activation frontiers are retired. Oliver's complete
 sealed BF16 source replica is now ready. Full production awaits the explicit
 recipe decision required by the brief; the source checkpoint and final K4/K6
 payload together fit the root disk with room for bounded rolling state.
+
+TJ approved the reviewed recipe with "Go" on 2026-10-24. Full production
+started at 22:06 Taipei, attempt `1792850759329904317`, under
+`~/.cache/cuteafd/quantization/glm53-k4-core-k6/production/`; output is
+`~/.cache/huggingface/cuteafd-exports/GLM-5.3-EXL3-K4-Core-K6/`.
+Use `quantization/glm5/core_k6/launch.py` with source/tokens/root/export;
+explicit recovery adds `--resume`. Publication is a later explicit
+`--publish-only` invocation after the brief's confirmation point. The GPU
+job does not upload automatically. It holds the bounded local gpu1 queue
+admission, uses the architecture-matched container with a 60 GiB memory cap,
+and releases its container before exit. Monitor every 30 minutes after
+stable startup. Full calibration is 1,097,737 rows; MTP uses the 1,096,311
+valid within-prompt shifted pairs.
+
+Fork main and the matching pin/tree lock are pushed at
+`a196a448fb3f76774c31e02b42523997f05385e3`. New core/MTP helpers passed
+50 focused CPU tests, ten K4/K6 CUDA cases and six source-native MTP CUDA
+cases. Coordinator/export/publication/compatibility gates pass 115 CPU cases.
+The real-weight smoke quantized all core matrices in target layers 0–3,
+all 256 experts of layer 3 and MTP EH/KV (798 projections), using unchanged
+cal-1304. Native/staged target boundaries and DSA state were byte-exact at
+2,205 tokens; real MTP and shared-head norm were byte-exact at 2,204 valid
+pairs. Peak GPU allocation was 27.06 GiB. Its final log call duplicated a
+memory keyword after the successful numerical report; the logging fix and
+independent completed-proof audit retain that report's original identity,
+verify all four shard checksums and 798 calibrated evidence records, and
+exit successfully without repeating numerical work. Evidence and audit
+markers remain in `~/.cache/cuteafd/builds/glm53-core-k6/`.
+
+Do not change the producer, fork pin or prepared data during the run: the
+production plan binds numerical code and packages. Documentation, status
+and a future publication-only compatibility fix are separate from that
+numerical identity. CPU-only publication requires the matching durable
+completion marker, exact 80-shard inventory and remote checksum audit.
