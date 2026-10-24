@@ -159,6 +159,38 @@ mod tests {
     }
 
     #[test]
+    fn unverified_combined_shared_source_stays_unavailable_without_aborting_base() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("config.json"), serde_json::json!({"model_type":"glm_moe_dsa",
+            "num_hidden_layers":2,"first_k_dense_replace":1,"hidden_size":32}).to_string()).unwrap();
+        let write = |path: &std::path::Path, edited: bool| {
+            let values: Vec<f32> = (0..32*48).map(|i| if i/48 != i%48 {0.0}
+                else if edited && i == 0 {-1.0} else {1.0}).collect();
+            let header = serde_json::json!({"model.layers.1.mlp.shared_experts.down_proj.weight":{
+                "dtype":"F32","shape":[32,48],"data_offsets":[0,values.len()*4]}}).to_string();
+            let mut bytes = (header.len() as u64).to_le_bytes().to_vec();
+            bytes.extend(header.as_bytes());
+            bytes.extend(values.iter().flat_map(|v| v.to_le_bytes()));
+            std::fs::write(path, bytes).unwrap();
+        };
+        write(&dir.path().join("model.safetensors"), false);
+        let source = dir.path().join("keys.safetensors");
+        write(&source, true);
+        let spec = |name: &str, mode| cuteafd_core::variants::VariantSpec {
+            name:name.into(),source:source.display().to_string(),base:None,id:None,mode };
+        let derived = derive(dir.path(), "base", &[(1,spec("combined",Some("ffn".into()))),
+            (2,spec("shared",None))], 32).expect("unsupported scope must not abort base startup");
+        assert_eq!(derived.plans.len(),1);
+        assert_eq!(derived.plans[0].index,2);
+        assert_eq!(derived.records.len(),2);
+        assert_eq!(derived.records[0].public_id,"base-combined");
+        assert!(!derived.records[0].is_ready());
+        assert!(derived.records[0].unavailable_reason().unwrap().contains("combined routed+shared"));
+        assert_eq!(derived.records[0].verify["rejection"]["kind"],"unsupported_source");
+        assert!(derived.records[1].is_ready());
+    }
+
+    #[test]
     fn sites_are_the_union_and_bytes_follow_the_largest_rank() {
         let h = 128;
         let a = plan(1, &[(2, SiteKind::Attn), (2, SiteKind::DenseFfn), (3, SiteKind::Ffn)], 1, h);
