@@ -284,6 +284,13 @@ SPECULATOR_MODEL_REVISION
 EOF
       ;;
     glm5)
+      # Weight variants: VARIANTS plus each named variant's own keys.
+      printf '%s\n' VARIANTS
+      local variant
+      for variant in ${cfg[VARIANTS]//,/ }; do
+        variant="${variant^^}"; variant="${variant//-/_}"
+        printf 'VARIANT_%s_%s\n' "$variant" SOURCE "$variant" REVISION "$variant" BASE "$variant" ID "$variant" MODE
+      done
       cat <<'EOF'
 PREFILL_ROWS
 PREFILL_WAVES
@@ -2156,6 +2163,45 @@ fi
 served_args=()
 served="$(get SERVED_MODEL_ID)"
 [[ -z "$served" ]] || served_args=(--model-id "$served")
+# VARIANTS=<name,...>: weight variants served under their own model ids (serve-glm --variant).
+# Per name, keyed by the name in upper case with - as _ (alternate: VARIANT_ALTERNATE_*):
+# _SOURCE (a Hugging Face id under this hub, with _REVISION, or an absolute path mounted
+# read-only), _BASE (the checkpoint the edit is measured against, id[@revision] or a path;
+# default the served snapshot), _ID (default <served id>-<name>) and _MODE (glm5: ffn or shared-only).
+variant_args=()
+variant_mounts=()
+if [[ -n "$(get VARIANTS)" ]]; then
+  [[ "$family" == glm5 ]] || release_die "VARIANTS is supported for glm5 only"
+  # Sets variant_resolved (and the read-only mount a path outside the namespace needs).
+  variant_path() {
+    local value="$1" revision="$2"
+    if [[ "$value" == /* ]]; then
+      [[ -e "$value" ]] || release_die "variant path $value does not exist"
+      [[ "$value" == "$namespace_root"/* ]] || variant_mounts+=(-v "$value:$value:ro")
+      variant_resolved="$value"
+    else
+      variant_resolved="$(snapshot_of "$value" "$revision")" || release_die "missing variant snapshot $value"
+    fi
+  }
+  IFS=, read -ra variant_names <<<"$(get VARIANTS)"
+  ((${#variant_names[@]} <= 7)) || release_die "VARIANTS names at most 7 variants"
+  for variant in "${variant_names[@]}"; do
+    [[ "$variant" =~ ^[A-Za-z0-9_-]+$ ]] || release_die "VARIANTS names must be [A-Za-z0-9_-]"
+    key="${variant^^}"; key="VARIANT_${key//-/_}"
+    variant_source="$(get "${key}_SOURCE")"
+    [[ -n "$variant_source" ]] || release_die "${key}_SOURCE is required"
+    variant_path "$variant_source" "$(get "${key}_REVISION")"
+    spec="name=$variant,source=$variant_resolved"
+    variant_base="$(get "${key}_BASE")"
+    if [[ -n "$variant_base" ]]; then
+      variant_path "${variant_base%@*}" "$([[ "$variant_base" == *@* ]] && printf '%s' "${variant_base#*@}")"
+      spec+=",base=$variant_resolved"
+    fi
+    [[ -z "$(get "${key}_ID")" ]] || spec+=",id=$(get "${key}_ID")"
+    [[ -z "$(get "${key}_MODE")" ]] || spec+=",mode=$(get "${key}_MODE")"
+    variant_args+=(--variant "$spec")
+  done
+fi
 shared_probe_args
 shared_trace_args
 # Qwen serving defaults to qualified startup graphs; preserve explicit overrides.
@@ -3033,11 +3079,11 @@ docker run -d "${RELEASE_SERVING_ARGS[@]}" --name "$coordinator_name" --restart 
   "${bond_args[@]}" "${bench_nonce_env_args[@]}" "${tp2_env_args[@]}" "${graph_census_args[@]}" "${lane_env_args[@]}" "${thermal_args[@]}" \
   "${shared_env_args[@]:4}" -e "CUTEAFD_IMAGE=$coordinator_image" "${wip_mount_args[@]}" "${device_map_args[@]}" \
   -v "$namespace_root:$namespace_root:ro" -v "$bench_dir:/run/cuteafd/bench" -v "$fidelity_cache:/run/cuteafd/fidelity" -e CUTEAFD_FIDELITY_CACHE=/run/cuteafd/fidelity \
-  "${api_mount_args[@]}" "${chat_template_mounts[@]}" "${trace_args[@]}" "${probe_args[@]}" ${profile_args[@]+"${profile_args[@]}"} ${profile_wrapper_args[@]+"${profile_wrapper_args[@]}"} "$coordinator_image" ${profile_wrapper[@]+"${profile_wrapper[@]}"} cuteafd "${coordinator_budget_args[@]}" $serve --snapshot "$snapshot" \
+  "${api_mount_args[@]}" "${chat_template_mounts[@]}" "${trace_args[@]}" "${probe_args[@]}" ${variant_mounts[@]+"${variant_mounts[@]}"} ${profile_args[@]+"${profile_args[@]}"} ${profile_wrapper_args[@]+"${profile_wrapper_args[@]}"} "$coordinator_image" ${profile_wrapper[@]+"${profile_wrapper[@]}"} cuteafd "${coordinator_budget_args[@]}" $serve --snapshot "$snapshot" \
   --native-lib /opt/cuteafd/lib/libcuteafd_native.so "${peer_args[@]}" --listen "$addr" \
   --max-sequences "$effective_concurrency" "${context_args[@]}" \
   --max-output "$(get MAX_OUTPUT_TOKENS 4096)" "${dspark_args[@]}" \
-  "${family_args[@]}" "${draft_args[@]}" "${served_args[@]}" >/dev/null
+  "${family_args[@]}" "${draft_args[@]}" "${served_args[@]}" ${variant_args[@]+"${variant_args[@]}"} >/dev/null
 url="http://127.0.0.1:${addr##*:}"
 ready_deadline=$((SECONDS + 900))
 until curl --max-time 5 -sf "$url/health" >/dev/null; do
