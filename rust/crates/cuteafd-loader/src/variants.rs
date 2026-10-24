@@ -620,6 +620,13 @@ pub fn family_variants(config: &serde_json::Value, mode: Option<&str>) -> Result
             Ok(FamilyVariants { family: "glm5", hidden: int("hidden_size")?, wants: wants_tensor,
                 sites: Box::new(move |variant| variant_sites(layers, first_moe, mode, variant)) })
         }
+        "deepseek_v41_text" => {
+            use crate::families::deepseek_v41::v41_variant::{variant_sites, wants_tensor};
+            ensure!(mode.is_none(), "DeepSeek V4.1 has no variant modes");
+            let layers = int("num_hidden_layers")?;
+            Ok(FamilyVariants { family: "deepseek_v41", hidden: int("hidden_size")?, wants: wants_tensor,
+                sites: Box::new(move |variant| variant_sites(layers, variant)) })
+        }
         other => bail!("weight variants are not supported for model_type {other:?} yet"),
     }
 }

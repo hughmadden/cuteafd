@@ -8,12 +8,16 @@
 //! file's own tensor names; the base tensors come from the served catalog, so
 //! the Spark worker identity never changes.
 //!
-//! V4.1 recipe (measured on the alternate-weight 1017 overlay, 2026-10-24): every edit is
-//! a rank-1 output projection, and all 26 layers share one direction. α is
-//! taken from the bit-exact FP8 rebuild against the variant's own scales; the
-//! least-squares α is biased low by FP8 requantization noise in ΔW.
+//! Each site is fitted by the shared library ([`crate::variants::derive_site`]).
+//! On top, the V4.1 recipe (measured on the alternate-weight 1017 overlay, 2026-10-24):
+//! - all rank-1 sites whose directions agree share one direction, stored once;
+//! - α comes from the bit-exact FP8 rebuild against the variant's own scales:
+//!   the least-squares α is biased low by FP8 requantization noise in ΔW;
+//! - every site is checked by rebuilding the variant's FP8 bytes with the op
+//!   that will be served.
+use crate::variants::{derive_site, e4m3_to_f32, ue8m0_to_f32, DeriveOpts, Matrix, SiteTensor, TensorSource, VerifyReport};
 use anyhow::{bail, ensure, Context, Result};
-use cuteafd_core::variants::{SiteKey, SiteKind, SiteOp};
+use cuteafd_core::variants::{SiteKey, SiteKind, SiteOp, VariantError};
 use cuteafd_core::DType;
 use rayon::prelude::*;
 use serde::Serialize;
@@ -22,19 +26,13 @@ use std::path::{Path, PathBuf};
 /// UE8M0 scale block edge of the official FP8 `wo_b`.
 pub const V41_FP8_BLOCK: usize = 32;
 
-/// FP8 E4M3 (fn) value of `code`; 0x7f/0xff are NaN.
-pub fn e4m3_to_f32(code: u8) -> f32 { E4M3[usize::from(code & 0x7f)].copysign(if code & 0x80 != 0 { -1.0 } else { 1.0 }) }
+static E4M3: std::sync::LazyLock<[f32; 127]> = std::sync::LazyLock::new(|| std::array::from_fn(|c| e4m3_to_f32(c as u8)));
 
-static E4M3: std::sync::LazyLock<[f32; 128]> = std::sync::LazyLock::new(|| {
-    std::array::from_fn(|code| {
-        let (e, m) = ((code >> 3) as i32, (code & 7) as f32);
-        if code == 0x7f { f32::NAN } else if e == 0 { m / 8.0 * 2f32.powi(-6) } else { (1.0 + m / 8.0) * 2f32.powi(e - 7) }
-    })
-});
-
-/// Round to the nearest E4M3 (ties to even), saturating at ±448, keeping the
-/// sign of zero: the same bytes as torch's `clamp(-448, 448).to(float8_e4m3fn)`.
-pub fn f32_to_e4m3(value: f32) -> u8 {
+/// The same bytes as [`crate::variants::f32_to_e4m3`] (nearest, ties to even,
+/// saturating, sign of zero kept) by binary search: the α search encodes
+/// ~10⁸ values per tensor.
+pub(crate) fn e4m3_rne(value: f32) -> u8 {
+    if value.is_nan() { return 0x7f; }
     let sign = if value.is_sign_negative() { 0x80 } else { 0 };
     let a = f64::from(value.abs().min(448.0));
     // Largest finite code whose value is <= a (codes are monotone in value).
@@ -49,9 +47,6 @@ pub fn f32_to_e4m3(value: f32) -> u8 {
     };
     sign | code as u8
 }
-
-/// UE8M0 scale value `2^(code − 127)`.
-pub fn e8m0_to_f32(code: u8) -> f32 { if code == 0xff { f32::NAN } else { 2f32.powi(i32::from(code) - 127) } }
 
 /// One FP8 E4M3 matrix with UE8M0 32×32 block scales, as stored.
 #[derive(Clone)]
@@ -69,7 +64,7 @@ impl Fp8Block32 {
         Ok(Self { rows, cols, weight, scale })
     }
     fn scale_at(&self, row: usize, col: usize) -> f32 {
-        e8m0_to_f32(self.scale[(row / V41_FP8_BLOCK) * (self.cols / V41_FP8_BLOCK) + col / V41_FP8_BLOCK])
+        ue8m0_to_f32(self.scale[(row / V41_FP8_BLOCK) * (self.cols / V41_FP8_BLOCK) + col / V41_FP8_BLOCK])
     }
     /// Row-major FP32 values (`w · scale`, exact).
     pub fn dequantize(&self) -> Vec<f32> {
@@ -135,11 +130,32 @@ fn wo_b_site(name: &str) -> Option<(u16, &str)> {
     Some((layer.parse().ok()?, suffix))
 }
 
+/// Tensors a V4.1 variant derivation reads from either side ([`crate::variants::family_variants`]).
+pub fn wants_tensor(name: &str) -> bool { wo_b_site(name).is_some_and(|(_, s)| s == "weight" || s == "scale") }
+
+/// Shared-library accept bars for an FP8 `wo_b` edit (alternate-weight 1017 pilot): the
+/// edit is rank 1 with the second direction at 0.003–0.004 of ‖ΔW‖²; the
+/// leftover is FP8 requantization noise (r_ΔW 0.31–0.38, r_W ~0.02), so no
+/// leftover bar applies here and the FP8 rebuild is the floor check;
+/// unedited layers re-read from the same bytes differ by 0.
+pub fn variant_opts() -> DeriveOpts {
+    DeriveOpts { k_max: 4, rank_share: 0.005, max_r_delta: None, max_r_w: None, min_proj_cos: 0.98, edit_floor: 0.005,
+        ..DeriveOpts::default() }
+}
+
+/// The `wo_b` sites below `layers` the variant carries (for `cuteafd plan --variant`).
+pub fn variant_sites(layers: usize, variant: &TensorSource) -> Vec<SiteTensor> {
+    (0..layers).map(|layer| format!("layers.{layer}.attn.wo_b.weight")).enumerate()
+        .filter(|(_, tensor)| variant.contains(tensor))
+        .map(|(layer, tensor)| SiteTensor { key: SiteKey { layer: layer as u16, kind: SiteKind::Attn }, opts: variant_opts(), tensor })
+        .collect()
+}
+
 impl V41VariantSource {
     /// Open a sidecar file, or the one file of FP8 `wo_b` tensors in a snapshot
     /// directory (other formats, such as EXL3 sidecars, are skipped). Every
     /// tensor in the chosen file must be an FP8 `wo_b` weight or its scale of a
-    /// backbone layer below `layers`.
+    /// backbone layer below `layers`: an edit elsewhere is refused, never dropped.
     pub fn open(path: &Path, layers: u16) -> Result<Self> {
         let file = if path.is_dir() {
             let mut found = Vec::new();
@@ -177,18 +193,16 @@ impl V41VariantSource {
     }
 }
 
-/// Per-recipe accept bars and search for the V4.1 FP8 `wo_b` edit.
-#[derive(Debug, Clone, Copy, Serialize)]
+/// The V4.1 recipe's bars and search on top of the shared fit.
+#[derive(Debug, Clone, Serialize)]
 pub struct V41VariantOpts {
-    /// Second singular value's share of ‖ΔW‖² (measured 0.003–0.004).
-    pub second_share_max: f32,
-    /// Fraction of the variant's FP8 bytes reproduced by `q(W − α r rᵀW)` (measured 0.84–0.86).
+    /// Shared-library fit and accept bars ([`variant_opts`]).
+    pub derive: DeriveOpts,
+    /// Fraction of the variant's FP8 bytes reproduced by `q(W − A BᵀW)` (measured 0.84–0.87).
     pub rebuild_min: f32,
-    /// Projection form `|cos(rᵀΔW, rᵀW)|` (measured 0.989–0.997).
-    pub projection_cos_min: f32,
-    /// Sites whose directions all agree this well (|cos|) share one.
+    /// Rank-1 sites whose directions all agree this well (|cos|) share one.
     pub shared_cos_min: f32,
-    /// α search for the rebuild: least-squares α ± `alpha_span`, step `alpha_step`.
+    /// α search for the rebuild: least-squares α ± `alpha_span` on a grid of `alpha_step`.
     pub alpha_span: f32,
     pub alpha_step: f32,
     /// Rows sampled by the α search (every `stride`-th row); the final check reads all rows.
@@ -196,8 +210,8 @@ pub struct V41VariantOpts {
 }
 impl Default for V41VariantOpts {
     fn default() -> Self {
-        Self { second_share_max: 0.005, rebuild_min: 0.8, projection_cos_min: 0.98, shared_cos_min: 0.999,
-            alpha_span: 0.4, alpha_step: 0.02, alpha_row_stride: 8 }
+        Self { derive: variant_opts(), rebuild_min: 0.8, shared_cos_min: 0.999, alpha_span: 0.4, alpha_step: 0.02,
+            alpha_row_stride: 8 }
     }
 }
 
@@ -205,18 +219,11 @@ impl Default for V41VariantOpts {
 #[derive(Debug, Clone, Serialize)]
 pub struct V41SiteReport {
     pub layer: u16,
-    /// ‖ΔW‖ / ‖W‖.
-    pub rel_delta: f32,
-    /// Top two singular values' shares of ‖ΔW‖².
-    pub top_share: f32,
-    pub second_share: f32,
-    /// Least-squares α for this site's own direction.
-    pub alpha_ls: f32,
-    pub projection_cos: f32,
-    /// ‖ΔW − (−α u uᵀW)‖ / ‖ΔW‖ and / ‖W‖ at the least-squares α.
-    pub r_delta: f32,
-    pub r_w: f32,
-    /// FP8 bytes equal after `q(W − α r rᵀW)` with the served op, and for stock W.
+    /// The shared library's fit (least-squares α).
+    pub verify: VerifyReport,
+    /// α the FP8 rebuild prefers for this site's own direction (rank 1).
+    pub alpha_rebuild: Option<f32>,
+    /// FP8 bytes equal after `q(W − A BᵀW)` with the served op, and for stock W.
     pub rebuild_exact: f32,
     pub stock_exact: f32,
     pub accept: bool,
@@ -227,12 +234,14 @@ pub struct V41SiteReport {
 #[derive(Debug, Clone, Serialize)]
 pub struct V41Derivation {
     pub hidden: u32,
-    /// Served α and whether every site uses one shared direction.
+    /// Served α per site, or one when the direction is shared.
     pub alpha: Vec<f32>,
     pub shared_direction: bool,
-    /// Smallest pairwise |cos| between the sites' directions.
+    /// Smallest pairwise |cos| between the rank-1 sites' directions.
     pub direction_cos_min: f32,
     pub sites: Vec<V41SiteReport>,
+    /// Layers the variant carries unchanged against the base (no site).
+    pub unchanged: Vec<u16>,
     #[serde(skip)]
     pub ops: Vec<(SiteKey, SiteOp)>,
     pub accept: bool,
@@ -255,63 +264,28 @@ fn left_mul(m: &[f32], cols: usize, u: &[f32]) -> Vec<f32> {
     }).reduce(|| vec![0f64; cols], |mut a, b| { a.iter_mut().zip(b).for_each(|(x, y)| *x += y); a })
         .into_iter().map(|v| v as f32).collect()
 }
-/// `M v`.
-fn right_mul(m: &[f32], cols: usize, v: &[f32]) -> Vec<f32> {
-    m.par_chunks(cols).map(|row| dot(row, v) as f32).collect()
-}
 
-/// Rank-1 fit of `D = Wv − W` (H×K): top left singular vector `u` of D by
-/// power iteration on `D Dᵀ`, the top two singular shares, α by least squares
-/// and the projection-form checks (the pilot's `rank1.py` measures).
-struct Rank1 { u: Vec<f32>, p: Vec<f32>, alpha: f32, top: f32, second: f32, cos: f32, r_delta: f32, r_w: f32, rel: f32 }
-fn rank1(w: &[f32], d: &[f32], rows: usize, cols: usize) -> Rank1 {
-    let energy: f64 = d.par_iter().map(|&x| f64::from(x) * f64::from(x)).sum();
-    let w_norm: f64 = w.par_iter().map(|&x| f64::from(x) * f64::from(x)).sum::<f64>().sqrt();
-    let power = |deflate: Option<(&[f32], f64)>| -> (Vec<f32>, f64) {
-        let mut u: Vec<f32> = (0..rows).map(|i| 1.0 + ((i * 7919) % 101) as f32 / 101.0).collect();
-        if let Some((v, _)) = deflate { let c = dot(&u, v) as f32; u.iter_mut().zip(v).for_each(|(x, y)| *x -= c * y); }
-        normalize(&mut u);
-        let mut sigma2 = 0.0;
-        for _ in 0..200 {
-            let mut next = right_mul(d, cols, &left_mul(d, cols, &u));
-            if let Some((v, s2)) = deflate {
-                let c = (s2 * dot(v, &u)) as f32;
-                next.iter_mut().zip(v).for_each(|(x, y)| *x -= c * y);
-            }
-            let estimate = dot(&next, &u);
-            normalize(&mut next);
-            u = next;
-            if (estimate - sigma2).abs() <= 1e-7 * estimate.abs() { sigma2 = estimate; break; }
-            sigma2 = estimate;
-        }
-        (u, sigma2)
-    };
-    let (u, s1) = power(None);
-    let (_, s2) = power(Some((&u, s1)));
-    let p = left_mul(w, cols, &u);
-    let q = left_mul(d, cols, &u);
-    let (qp, pp, qq) = (dot(&q, &p), dot(&p, &p), dot(&q, &q));
-    let alpha = -(qp / pp);
-    // ‖D + α u pᵀ‖² = ‖D‖² + 2α qᵀp + α² ‖p‖² (u is unit).
-    let residual = (energy + 2.0 * alpha * qp + alpha * alpha * pp).max(0.0).sqrt();
-    Rank1 { u, alpha: alpha as f32, top: (s1 / energy) as f32, second: (s2 / energy) as f32,
-        cos: (qp.abs() / (qq.sqrt() * pp.sqrt())) as f32, r_delta: (residual / energy.sqrt()) as f32,
-        r_w: (residual / w_norm) as f32, rel: (energy.sqrt() / w_norm) as f32, p }
-}
-
-/// Fraction of `variant` bytes equal to `q(W − α u pᵀ)` with the variant's own
-/// scales, over every `stride`-th row (`alpha = 0`: stock W requantized).
+/// Fraction of `variant` bytes equal to `q(W − α u pᵀ)` (`p = uᵀW`) with the
+/// variant's own scales, over every `stride`-th row (`alpha = 0`: stock W requantized).
 fn rebuild_exact(w: &[f32], variant: &Fp8Block32, u: &[f32], p: &[f32], alpha: f32, stride: usize) -> f32 {
     let cols = variant.cols;
     let (equal, total) = (0..variant.rows).into_par_iter().step_by(stride).map(|i| {
         let mut equal = 0usize;
         for j in 0..cols {
             let x = w[i * cols + j] - alpha * (u[i] * p[j]);
-            equal += usize::from(f32_to_e4m3(x / variant.scale_at(i, j)) == variant.weight[i * cols + j]);
+            equal += usize::from(e4m3_rne(x / variant.scale_at(i, j)) == variant.weight[i * cols + j]);
         }
         (equal, cols)
     }).reduce(|| (0, 0), |a, b| (a.0 + b.0, a.1 + b.1));
     equal as f32 / total as f32
+}
+/// The same for a general op (`q(rebuild(W, op))`).
+fn rebuild_exact_op(w: &Matrix, variant: &Fp8Block32, op: &SiteOp) -> f32 {
+    let x = crate::variants::rebuild(w, op);
+    let equal: usize = x.data.par_iter().enumerate().map(|(k, &v)| {
+        usize::from(e4m3_rne(v / variant.scale_at(k / variant.cols, k % variant.cols)) == variant.weight[k])
+    }).sum();
+    equal as f32 / x.data.len() as f32
 }
 
 /// The α near `start` that the variant's FP8 bytes reproduce best (the middle
@@ -326,77 +300,88 @@ fn rebuild_alpha(w: &[f32], variant: &Fp8Block32, u: &[f32], p: &[f32], start: f
     plateau[plateau.len() / 2]
 }
 
-/// Derive the V4.1 variant: fit each edited `wo_b` against the served base,
-/// detect a shared direction, choose α by FP8 rebuild, and check every site
-/// with the op that will be served. A rejected site makes the variant
-/// unavailable (`accept == false`) with the reason; base serving is unaffected.
+/// Derive the V4.1 variant: fit each edited `wo_b` against the served base
+/// with the shared library, then apply the recipe (shared direction, α by FP8
+/// rebuild) and check every site with the op that will be served. A rejected
+/// site makes the variant unavailable (`accept == false`) with the reason;
+/// base serving is unaffected.
 pub fn derive_v41_variant(base: &dyn TensorBytes, variant: &V41VariantSource, hidden: usize,
     opts: &V41VariantOpts) -> Result<V41Derivation> {
-    struct Fit { layer: u16, w: Vec<f32>, edit: Fp8Block32, fit: Rank1, stock: f32, best_alpha: f32 }
+    struct Fit { layer: u16, w: Matrix, edit: Fp8Block32, op: SiteOp, verify: VerifyReport, stock: f32, best_alpha: Option<f32> }
     let mut fits = Vec::with_capacity(variant.layers.len());
+    let mut unchanged = Vec::new();
     for &layer in &variant.layers {
         let name = format!("layers.{layer}.attn.wo_b");
         let stock = read_fp8_block32(base, &name).with_context(|| format!("base {name}"))?;
         let edit = read_fp8_block32(variant, &name).with_context(|| format!("variant {name}"))?;
         ensure!(stock.rows == hidden && edit.rows == stock.rows && edit.cols == stock.cols,
             "{name}: variant {}x{} differs from base {}x{} (hidden {hidden})", edit.rows, edit.cols, stock.rows, stock.cols);
-        let w = stock.dequantize();
-        let mut d = edit.dequantize();
-        d.par_iter_mut().zip(w.par_iter()).for_each(|(v, &b)| *v -= b);
-        let fit = rank1(&w, &d, stock.rows, stock.cols);
-        drop(d);
-        let stock_exact = rebuild_exact(&w, &edit, &fit.u, &fit.p, 0.0, 1);
-        let best_alpha = rebuild_alpha(&w, &edit, &fit.u, &fit.p, fit.alpha, opts);
-        tracing::info!(layer, rel_delta = fit.rel, top = fit.top, second = fit.second, alpha_ls = fit.alpha,
-            alpha_rebuild = best_alpha, cos = fit.cos, "V4.1 variant site fit");
-        fits.push(Fit { layer, w, edit, fit, stock: stock_exact, best_alpha });
+        let w = Matrix::new(stock.rows, stock.cols, stock.dequantize());
+        let v = Matrix::new(edit.rows, edit.cols, edit.dequantize());
+        let (op, verify) = match derive_site(&w, &v, &opts.derive) {
+            Ok(fit) => fit,
+            Err(VariantError::Unchanged) => { unchanged.push(layer); continue; }
+            Err(error) => bail!("{name}: {error}"),
+        };
+        drop(v);
+        let stock_exact = rebuild_exact(&w.data, &edit, &vec![0.0; w.rows], &vec![0.0; w.cols], 0.0, 1);
+        let best_alpha = match &op {
+            SiteOp::Steer { k: 1, b, .. } => {
+                let p = left_mul(&w.data, w.cols, b);
+                Some(rebuild_alpha(&w.data, &edit, b, &p, verify.alphas[0], opts))
+            }
+            _ => None,
+        };
+        tracing::info!(layer, k = verify.k, rel_delta = verify.rel_delta, top = verify.top_share, next = verify.next_share,
+            alpha_ls = ?verify.alphas, alpha_rebuild = ?best_alpha, cos = verify.proj_cos, "V4.1 variant site fit");
+        fits.push(Fit { layer, w, edit, op, verify, stock: stock_exact, best_alpha });
     }
-    // One direction for every site when they all agree (sign-aligned mean).
-    let first = fits[0].fit.u.clone();
+    ensure!(!fits.is_empty(), "variant {}: every wo_b tensor is unchanged against the base", variant.file.display());
+    // One direction for every site when all are rank 1 and agree (sign-aligned mean).
+    let directions: Vec<&[f32]> = fits.iter().filter_map(|f| match &f.op { SiteOp::Steer { k: 1, b, .. } => Some(b.as_slice()), _ => None }).collect();
     let mut cos_min = 1.0f32;
-    for (i, a) in fits.iter().enumerate() {
-        for b in &fits[i + 1..] { cos_min = cos_min.min(dot(&a.fit.u, &b.fit.u).abs() as f32); }
+    for (i, a) in directions.iter().enumerate() {
+        for b in &directions[i + 1..] { cos_min = cos_min.min(dot(a, b).abs() as f32); }
     }
-    let shared = fits.len() > 1 && cos_min >= opts.shared_cos_min;
-    let served: Vec<(Vec<f32>, f32)> = if shared {
+    let shared = directions.len() == fits.len() && fits.len() > 1 && cos_min >= opts.shared_cos_min;
+    let served: Vec<SiteOp> = if shared {
         let mut r = vec![0f32; hidden];
-        for fit in &fits {
-            let sign = dot(&fit.fit.u, &first).signum() as f32;
-            r.iter_mut().zip(&fit.fit.u).for_each(|(x, y)| *x += sign * y);
+        for u in &directions {
+            let sign = dot(u, directions[0]).signum() as f32;
+            r.iter_mut().zip(u.iter()).for_each(|(x, y)| *x += sign * y);
         }
         normalize(&mut r);
-        let mut alphas: Vec<f32> = fits.iter().map(|f| f.best_alpha).collect();
+        let mut alphas: Vec<f32> = fits.iter().filter_map(|f| f.best_alpha).collect();
         alphas.sort_by(f32::total_cmp);
-        let alpha = alphas[alphas.len() / 2];
-        vec![(r, alpha); fits.len()]
+        vec![SiteOp::rank1(alphas[alphas.len() / 2], &r); fits.len()]
     } else {
-        fits.iter().map(|f| (f.fit.u.clone(), f.best_alpha)).collect()
+        fits.iter().map(|f| match (&f.op, f.best_alpha) {
+            (SiteOp::Steer { k: 1, b, .. }, Some(alpha)) => SiteOp::rank1(alpha, b),
+            (op, _) => op.clone(),
+        }).collect()
     };
     let mut reports = Vec::with_capacity(fits.len());
-    for (fit, (r, alpha)) in fits.iter().zip(&served) {
-        let p = left_mul(&fit.w, fit.edit.cols, r);
-        let exact = rebuild_exact(&fit.w, &fit.edit, r, &p, *alpha, 1);
-        let f = &fit.fit;
-        let reason = if f.second > opts.second_share_max {
-            Some(format!("second singular share {:.4} > {} (not rank 1)", f.second, opts.second_share_max))
-        } else if f.cos < opts.projection_cos_min {
-            Some(format!("projection |cos| {:.4} < {} (not an output projection)", f.cos, opts.projection_cos_min))
-        } else if exact < opts.rebuild_min {
-            Some(format!("FP8 rebuild reproduces {exact:.4} of the bytes < {}", opts.rebuild_min))
-        } else { None };
-        reports.push(V41SiteReport { layer: fit.layer, rel_delta: f.rel, top_share: f.top, second_share: f.second,
-            alpha_ls: f.alpha, projection_cos: f.cos, r_delta: f.r_delta, r_w: f.r_w, rebuild_exact: exact,
-            stock_exact: fit.stock, accept: reason.is_none(), reason });
+    for (fit, op) in fits.iter().zip(&served) {
+        let exact = match op {
+            SiteOp::Steer { k: 1, a, b } => {
+                let p = left_mul(&fit.w.data, fit.w.cols, b);
+                rebuild_exact(&fit.w.data, &fit.edit, b, &p, dot(a, b) as f32, 1)
+            }
+            op => rebuild_exact_op(&fit.w, &fit.edit, op),
+        };
+        let reason = if !fit.verify.accept { fit.verify.reason.clone() }
+            else if exact < opts.rebuild_min { Some(format!("FP8 rebuild reproduces {exact:.4} of the bytes < {}", opts.rebuild_min)) }
+            else { None };
+        reports.push(V41SiteReport { layer: fit.layer, verify: fit.verify.clone(), alpha_rebuild: fit.best_alpha,
+            rebuild_exact: exact, stock_exact: fit.stock, accept: reason.is_none(), reason });
     }
-    let rejected = reports.iter().find(|r| !r.accept);
-    let reason = rejected.map(|r| format!("layers.{}.attn.wo_b: {}", r.layer, r.reason.as_deref().unwrap_or("")));
-    let ops = fits.iter().zip(&served)
-        .map(|(fit, (r, alpha))| (SiteKey { layer: fit.layer, kind: SiteKind::Attn }, SiteOp::rank1(*alpha, r)))
-        .collect();
-    let mut alpha: Vec<f32> = served.iter().map(|(_, a)| *a).collect();
+    let reason = reports.iter().find(|r| !r.accept)
+        .map(|r| format!("layers.{}.attn.wo_b: {}", r.layer, r.reason.as_deref().unwrap_or("")));
+    let ops = fits.iter().zip(&served).map(|(fit, op)| (SiteKey { layer: fit.layer, kind: SiteKind::Attn }, op.clone())).collect();
+    let mut alpha: Vec<f32> = served.iter().map(|op| match op { SiteOp::Steer { a, b, .. } => dot(a, b) as f32, SiteOp::Delta {} => 0.0 }).collect();
     if shared { alpha.truncate(1); }
     Ok(V41Derivation { hidden: hidden as u32, alpha, shared_direction: shared, direction_cos_min: cos_min,
-        accept: reason.is_none(), reason, sites: reports, ops })
+        accept: reason.is_none(), reason, sites: reports, unchanged, ops })
 }
 
 #[cfg(test)]
@@ -404,25 +389,20 @@ mod tests {
     use super::*;
 
     #[test]
-    fn e4m3_round_trips_every_code_and_rounds_ties_to_even() {
+    fn fast_encoder_matches_the_shared_encoder() {
+        use crate::variants::f32_to_e4m3;
         for code in 0u8..=255 {
-            if code & 0x7f == 0x7f { continue; }
-            assert_eq!(f32_to_e4m3(e4m3_to_f32(code)), code, "code {code:#x}");
+            let v = e4m3_to_f32(code);
+            if v.is_nan() { continue; }
+            assert_eq!(e4m3_rne(v), code, "code {code:#x}");
+            // Midpoints to both neighbours, and just past them.
+            for x in [v * 1.03125, v * 0.96875, v * 1.0625, v + 2f32.powi(-10), v - 2f32.powi(-10), v * 1.5, -v * 1.07] {
+                assert_eq!(e4m3_rne(x), f32_to_e4m3(x), "{x}");
+            }
         }
-        assert_eq!(e4m3_to_f32(0x7e), 448.0);
-        assert_eq!(f32_to_e4m3(1e9), 0x7e, "saturates");
-        assert_eq!(f32_to_e4m3(-1e9), 0xfe);
-        // 1.0 (0x38) and 1.125 (0x39): the tie 1.0625 goes to the even code.
-        assert_eq!(f32_to_e4m3(1.0625), 0x38);
-        // 1.125 (0x39) and 1.25 (0x3a): the tie 1.1875 goes to 0x3a.
-        assert_eq!(f32_to_e4m3(1.1875), 0x3a);
-        assert_eq!(f32_to_e4m3(1.07), 0x39);
-        // Smallest subnormal 2^-9 and half of it.
-        assert_eq!(f32_to_e4m3(2f32.powi(-9)), 0x01);
-        assert_eq!(f32_to_e4m3(2f32.powi(-10)), 0x00, "tie to even zero");
-        assert_eq!(f32_to_e4m3(-0.0), 0x80);
-        assert_eq!(e8m0_to_f32(127), 1.0);
-        assert_eq!(e8m0_to_f32(120), 2f32.powi(-7));
+        for x in [1e9f32, -1e9, 448.0, 464.0, 0.0, -0.0, 2f32.powi(-10), 1.0625, 1.1875] {
+            assert_eq!(e4m3_rne(x), f32_to_e4m3(x), "{x}");
+        }
     }
 
     struct Mem(Vec<(String, DType, Vec<usize>, Vec<u8>)>);
@@ -433,9 +413,8 @@ mod tests {
         }
     }
     fn quantize(w: &[f32], rows: usize, cols: usize, scale: u8) -> Vec<u8> {
-        let s = e8m0_to_f32(scale);
-        let _ = rows;
-        w.iter().take(rows * cols).map(|&x| f32_to_e4m3(x / s)).collect()
+        let s = ue8m0_to_f32(scale);
+        w.iter().take(rows * cols).map(|&x| e4m3_rne(x / s)).collect()
     }
     fn tensors(name: &str, w: &[f32], rows: usize, cols: usize, scale: u8) -> [(String, DType, Vec<usize>, Vec<u8>); 2] {
         [(format!("{name}.weight"), DType::F8E4M3, vec![rows, cols], quantize(w, rows, cols, scale)),
@@ -453,7 +432,7 @@ mod tests {
         let mut edit = Vec::new();
         for layer in [10u16, 11, 12] {
             let w: Vec<f32> = (0..rows * cols).map(|i| ((i as f32 * 0.7 + f32::from(layer)).sin()) * 0.05).collect();
-            let wq: Vec<f32> = quantize(&w, rows, cols, 120).iter().map(|&c| e4m3_to_f32(c) * e8m0_to_f32(120)).collect();
+            let wq: Vec<f32> = quantize(&w, rows, cols, 120).iter().map(|&c| e4m3_to_f32(c) * ue8m0_to_f32(120)).collect();
             let p = left_mul(&wq, cols, &r);
             let edited: Vec<f32> = (0..rows * cols).map(|k| wq[k] - 3.5 * (r[k / cols] * p[k % cols])).collect();
             let name = format!("layers.{layer}.attn.wo_b");
@@ -475,6 +454,14 @@ mod tests {
         assert_eq!(*k, 1);
         assert!(dot(b, &r).abs() > 0.999);
         assert!(derived.ops.iter().all(|(key, op)| key.kind == SiteKind::Attn && op == &derived.ops[0].1));
+        // The shared library's site map (`cuteafd plan --variant`) reads the same sites.
+        let config = serde_json::json!({"model_type": "deepseek_v41",
+            "text_config": {"model_type": "deepseek_v41_text", "hidden_size": rows, "num_hidden_layers": 40}});
+        let family = crate::variants::family_variants(&config, None)?;
+        assert_eq!((family.family, family.hidden), ("deepseek_v41", rows));
+        let sites = family.sites(&TensorSource::from_files([file])?);
+        assert_eq!(sites.iter().map(|s| s.key.layer).collect::<Vec<_>>(), [10, 11, 12]);
+        assert!(crate::variants::family_variants(&config, Some("ffn")).is_err(), "V4.1 has no modes");
         Ok(())
     }
 
@@ -537,12 +524,14 @@ mod tests {
         eprintln!("{}", serde_json::to_string_pretty(&derived)?);
         eprintln!("derived {} sites in {:.1}s", derived.sites.len(), started.elapsed().as_secs_f32());
         assert!(derived.accept, "{:?}", derived.reason);
+        assert!(derived.unchanged.is_empty());
         assert!(derived.shared_direction && derived.direction_cos_min > 0.999);
         assert_eq!(derived.alpha.len(), 1);
         assert!((3.3..=3.55).contains(&derived.alpha[0]), "alpha {}", derived.alpha[0]);
         for site in &derived.sites {
-            assert!((0.84..=0.92).contains(&site.top_share) && site.second_share < 0.005, "{site:?}");
-            assert!((3.25..=3.45).contains(&site.alpha_ls) && site.projection_cos > 0.985, "{site:?}");
+            let v = &site.verify;
+            assert!(v.k == 1 && (0.84..=0.92).contains(&v.top_share) && v.next_share < 0.005, "{site:?}");
+            assert!((3.25..=3.45).contains(&v.alphas[0]) && v.proj_cos > 0.985, "{site:?}");
             assert!(site.rebuild_exact >= 0.8 && site.rebuild_exact > site.stock_exact + 0.2, "{site:?}");
         }
         Ok(())

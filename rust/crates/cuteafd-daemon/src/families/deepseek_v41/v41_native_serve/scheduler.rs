@@ -118,7 +118,7 @@ impl Active<'_> {
             self.finished = true;
             self.ticket.finishing();
             // A cold benchmark probe leaves nothing behind.
-            self.cacheable = !crate::shared::probe::cold(&self.job.probe) && self.job.variant == 0;
+            self.cacheable = !crate::shared::probe::cold(&self.job.probe);
         }
         Ok(chunks)
     }
@@ -146,9 +146,11 @@ fn retire_request<'a, C: DraftChain<'a>>(mut request: Active<'a>, requests: &mut
         && requests.cache().request_id(request.lease).is_ok() {
         prefixes.capture_session(request.job.usage.as_ref().map(|u| u.session_id().to_owned()));
         let id = draft_id(&draft, request.id());
+        let keys = keyed(&request.image_keys, &request.tokens);
         let retained = request.next_after_commit.as_ref().context("finished request has no retained logits")
-            .and_then(|next| prefixes.retain(requests, draft.as_deref_mut(), SnapshotKind::Turn,
-                &keyed(&request.image_keys, &request.tokens), request.image_keys.spans(), next, request.lease, id));
+            .and_then(|next| Ok((next, cuteafd_engine::prefix::namespaced(&keys, request.job.variant)?)))
+            .and_then(|(next, key)| prefixes.retain(requests, draft.as_deref_mut(), SnapshotKind::Turn,
+                &key, request.image_keys.spans(), next, request.lease, id));
         if let Err(error) = retained { tracing::warn!(%error, "completed request prefix was not retained"); }
     }
     // Release both owners even if one cleanup reports an error.
@@ -378,12 +380,13 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
                 // Units for the request's whole declared lifetime are allocated here and the
                 // best snapshot restored into them; every running request already owns its
                 // own lifetime units, so this is the whole capacity check.
-                // Until the prefix key carries the variant namespace, a variant
-                // request neither restores nor publishes snapshots.
-                let cold = crate::shared::probe::cold(&job.probe) || job.variant != 0;
+                let cold = crate::shared::probe::cold(&job.probe);
+                // A variant's cached state differs from base from its first edited layer:
+                // its prefix key carries the variant (contract §5); base keys are unchanged.
+                let key = cuteafd_engine::prefix::namespaced(image_keys.tokens(), job.variant)?;
                 let draft_id = draft_id(&draft, id);
                 let lifetime = |output: usize| prompt.len().saturating_add(output);
-                let restored = match prefixes.admit(requests, draft.as_deref_mut(), lease, draft_id, image_keys.tokens(),
+                let restored = match prefixes.admit(requests, draft.as_deref_mut(), lease, draft_id, &key,
                     prompt, image_keys.spans(), lifetime(job.max_tokens), cold) {
                     Err(error) if busy_slots == 0 && super::prefix::exhausted(&error) => {
                         // Idle and short: grant the longest output that fits the pool (every
@@ -394,7 +397,7 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
                         let granted = kv_waiter.shrink_output(&mut prefixes, requested,
                             |prefixes, output| Ok::<_, anyhow::Error>(prefixes.could_fit(units(output))), |_, _| Ok(()))?
                             .ok_or(error)?;
-                        let restored = prefixes.admit(requests, draft.as_deref_mut(), lease, draft_id, image_keys.tokens(),
+                        let restored = prefixes.admit(requests, draft.as_deref_mut(), lease, draft_id, &key,
                             prompt, image_keys.spans(), lifetime(granted), cold)?;
                         if granted < requested {
                             tracing::warn!(request_id=id, prompt_tokens=prompt.len(), cached_tokens=restored.cached,
@@ -497,10 +500,11 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
                 if crate::shared::probe::wants_first(&job.probe) {
                     crate::shared::probe::host_row(&job.probe, prompt.len(), &scores.logits()?);
                 }
-                if cached != prompt.len() && !crate::shared::probe::cold(&job.probe) && job.variant == 0 {
+                if cached != prompt.len() && !crate::shared::probe::cold(&job.probe) {
                   prefixes.capture_session(job.usage.as_ref().map(|u| u.session_id().to_owned()));
                   let draft_request = draft_id(&draft, id);
-                  if let Err(error) = prefixes.retain(requests, draft.as_deref_mut(), SnapshotKind::Prompt, image_keys.tokens(),
+                  let key = cuteafd_engine::prefix::namespaced(image_keys.tokens(), job.variant)?;
+                  if let Err(error) = prefixes.retain(requests, draft.as_deref_mut(), SnapshotKind::Prompt, &key,
                       image_keys.spans(), &scores, lease, draft_request) {
                     tracing::warn!(%error, "prompt prefix was not retained");
                   }
