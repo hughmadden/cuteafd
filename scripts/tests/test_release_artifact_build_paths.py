@@ -409,7 +409,20 @@ def test_native_phase_refuses_missing_rust_state(scratch):
     assert not Path(env["STUB_CALL_LOG"]).exists()
 
 
-@pytest.mark.parametrize("change", ["env", "source", "daemon"])
+def test_native_phase_accepts_a_tree_whose_only_change_is_timestamps(scratch):
+    """Host helpers touch directories (a new excluded __pycache__, a staged
+    output dir) between the phases; content, paths and modes are the inputs."""
+    src, output, _, env = _stub_build(scratch)
+    state = scratch / "state"
+    assert _phase(src, output, env, "rust", state).returncode == 0
+    (src / "scripts" / "build" / "__pycache__").mkdir()  # excluded, but bumps the parent mtime
+    os.utime(src / "rust" / "Cargo.toml", (1, 1))
+    os.utime(src, (2, 2))
+    native = _phase(src, output, env, "native", state)
+    assert native.returncode == 0, native.stdout + native.stderr
+
+
+@pytest.mark.parametrize("change", ["env", "source", "mode", "daemon"])
 def test_native_phase_refuses_stale_rust_state(scratch, change):
     src, output, relocated, env = _stub_build(scratch)
     state = scratch / "state"
@@ -419,11 +432,18 @@ def test_native_phase_refuses_stale_rust_state(scratch, change):
         extra["CUTEAFD_RELEASE_AUDIO_AOT"] = "OFF"
     elif change == "source":
         (src / "THIRD_PARTY_NOTICES.md").write_text("changed\n")
+    elif change == "mode":
+        (src / "THIRD_PARTY_NOTICES.md").chmod(0o755)
     else:
         (relocated.parent / f"{relocated.name}-x86-64-v4" / "x86_64-unknown-linux-gnu" / "release" / "cuteafd").write_text("other\n")
     result = _phase(src, output, env, "native", state, **extra)
     assert result.returncode == 2, result.stdout + result.stderr
     assert "changed" in result.stderr
+    if change == "env":  # the differing key is named, its value is not printed
+        assert "> env CUTEAFD_RELEASE_AUDIO_AOT" in result.stderr
+        assert "CUTEAFD_RELEASE_AUDIO_AOT=" not in result.stderr
+    elif change in ("source", "mode"):
+        assert "> source=" in result.stderr
     assert "cmake" not in Path(env["STUB_CALL_LOG"]).read_text()
     assert not state.exists()
 

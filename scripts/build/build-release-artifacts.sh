@@ -174,7 +174,10 @@ release_source_tar() {
 }
 release_phase_inputs() {
   printf 'role=%s\ncuda_arch=%s\noutput=%s\n' "$role" "$cuda_arch" "$output_dir"
-  printf 'source=%s\n' "$(release_source_tar --sort=name | sha256sum | awk '{print $1}')"
+  # Content, paths and modes only: timestamps and ownership of an unchanged tree
+  # (a directory touched by a host-side helper) are not inputs.
+  printf 'source=%s\n' "$(release_source_tar --sort=name --mtime=@0 --owner=0 --group=0 --numeric-owner \
+    --format=gnu | sha256sum | awk '{print $1}')"
   env | LC_ALL=C sort |
     grep -Ev '^(CUDA_VISIBLE_DEVICES|NVIDIA_[A-Z0-9_]*|CUTEAFD_RELEASE_ARTIFACT_PHASE|HOSTNAME|PWD|OLDPWD|SHLVL|_)=' || true
 }
@@ -205,8 +208,14 @@ case "$artifact_phase" in
     build_root="$artifact_state/build"
     # Single use: the native phase owns and removes the state on every exit.
     trap 'rm -rf "$artifact_state"' EXIT
-    release_phase_inputs | cmp -s - "$artifact_state/inputs" ||
-      { echo "release artifact inputs changed since the rust phase (role, arch, source or environment): $artifact_state" >&2; exit 2; }
+    release_phase_inputs >"$artifact_state/inputs.native"
+    if ! cmp -s "$artifact_state/inputs.native" "$artifact_state/inputs"; then
+      echo "release artifact inputs changed since the rust phase (role, arch, source or environment): $artifact_state" >&2
+      # Name what differs; environment values are not printed.
+      diff "$artifact_state/inputs" "$artifact_state/inputs.native" |
+        sed -nE 's/^([<>]) (role|cuda_arch|output|source)=/\1 \2=/p; t; s/^([<>]) ([A-Za-z_][A-Za-z0-9_]*)=.*/\1 env \2/p' >&2 || true
+      exit 2
+    fi
     ;;
 esac
 # release-artifact-phases:end
