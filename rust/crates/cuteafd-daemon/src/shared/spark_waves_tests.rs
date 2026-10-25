@@ -247,6 +247,11 @@ fn an_idle_worker_blocks_instead_of_spinning() {
         std::thread::sleep(Duration::from_millis(50));
         // Blocked on its channel: no further progress passes while idle.
         assert_eq!(world.polls.load(Ordering::Relaxed), polls);
+        // The next request wakes it and lands.
+        world.store(Counter::Staged(0), 2);
+        world.store(Counter::Consumed(0), 1);
+        jobs.send(Command::Wave(job(2, 0, 1))).unwrap();
+        wait(&world, Counter::Landed, 2).unwrap();
         drop(jobs);
         worker.join().unwrap().0.unwrap();
     });

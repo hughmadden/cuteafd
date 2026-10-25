@@ -20,6 +20,13 @@ pub(crate) fn deprecated_budget_flags(args: impl IntoIterator<Item = impl AsRef<
     replacements
 }
 
+/// A positive number of seconds (fractions allowed).
+fn parse_idle_park(text: &str) -> std::result::Result<f64, String> {
+    let seconds: f64 = text.parse().map_err(|_| format!("{text:?} is not a number of seconds"))?;
+    if !(seconds.is_finite() && seconds > 0.0) { return Err(format!("idle park seconds must be positive, got {text}")); }
+    Ok(seconds)
+}
+
 /// A Spark chunk size: `none`/`0` (never split) or bytes (NKiB/NMiB), in range.
 /// TEMPORARY: remove after PFC test (TJ 2026-10-25).
 fn parse_chunk_bytes(text: &str) -> std::result::Result<ChunkBytes, String> {
@@ -64,6 +71,17 @@ pub(crate) struct Cli {
     #[arg(long, global = true, env = "CUTEAFD_SPARK_REPLY_CHUNK_BYTES", default_value = "none",
         value_parser = parse_chunk_bytes)]
     pub(crate) spark_reply_chunk_bytes: ChunkBytes,
+    /// How host threads wait while serving: `spin` (default, lowest latency)
+    /// or `block` (per-step waits sleep, the Spark exchange worker paces its
+    /// polling: a less loaded machine). Spark workers read it too.
+    #[arg(long, global = true, env = "CUTEAFD_HOST_WAIT", default_value = "spin")]
+    pub(crate) host_wait: cuteafd_transport::wait_policy::HostWait,
+    /// Seconds without an active request after which every polling host thread
+    /// parks (no CPU, no GPU work), in either wait mode; the next request
+    /// wakes them. Spark workers read it too.
+    #[arg(long, global = true, env = "CUTEAFD_IDLE_PARK_SECONDS", default_value_t = 30.0,
+        value_parser = parse_idle_park)]
+    pub(crate) idle_park_seconds: f64,
     #[command(subcommand)]
     pub(crate) command: Commands,
 }

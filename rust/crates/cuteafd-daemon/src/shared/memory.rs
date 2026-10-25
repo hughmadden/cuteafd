@@ -186,11 +186,10 @@ impl<'a> LayerStaging<'a> {
     }
     pub(crate) fn region_bytes(&self) -> usize { self.region }
 }
-/// A host wait for a stream's queued work that sleeps instead of spinning:
-/// one blocking-sync event per device, recorded on the stream and then
-/// synchronized. For per-step waits that last milliseconds (the sampling
-/// sync, a draft round): the context's default scheduling spins the waiting
-/// thread for their whole duration.
+/// A per-step host wait for a stream's queued work (the sampling sync, a
+/// draft round): under `--host-wait block` it sleeps on one blocking-sync
+/// event per device, recorded on the stream; under `spin` (default) it is a
+/// stream synchronize, which the context's default scheduling spins.
 pub(crate) struct BlockingWait<'a> {
     library: &'a NativeLibrary,
     events: Vec<(i32, *mut std::ffi::c_void)>,
@@ -204,6 +203,10 @@ impl<'a> BlockingWait<'a> {
     /// # Safety
     /// `stream` is a live stream of the current device.
     pub(crate) unsafe fn wait(&mut self, stream: *mut std::ffi::c_void) -> Result<()> {
+        if cuteafd_transport::wait_policy::wait_policy().wait == cuteafd_transport::wait_policy::HostWait::Spin {
+            // SAFETY: forwarded from this function's contract.
+            return unsafe { self.library.cuda_stream_synchronize(stream) };
+        }
         let device = self.library.cuda_get_device()?;
         let event = match self.events.iter().find(|(owner, _)| *owner == device) {
             Some(&(_, event)) => event,

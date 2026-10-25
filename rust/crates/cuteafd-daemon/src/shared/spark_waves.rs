@@ -273,6 +273,9 @@ pub(crate) fn run_worker<B: Backend>(backend: &mut B, inbox: &mpsc::Receiver<Com
     let mut idle_since: Option<Instant> = None;
     let mut idle_passes = 0u32;
     let mut pace = Pace::default();
+    // `--host-wait block` paces the polling between a wave's post and its
+    // completion; `spin` polls throughout (lowest latency).
+    let paced = cuteafd_transport::wait_policy::wait_policy().wait == cuteafd_transport::wait_policy::HostWait::Block;
     // Whether the current wait is early enough to sleep through, and whether
     // the last pass slept (the next one re-decides).
     let (mut early, mut slept) = (false, false);
@@ -280,6 +283,8 @@ pub(crate) fn run_worker<B: Backend>(backend: &mut B, inbox: &mpsc::Receiver<Com
     // finish before that (its slot or stream waits for the landing), so its
     // wait is timed from the later of this and its send (the host runs ahead).
     let mut last_landed = Instant::now();
+    // Sleeps taken and seconds slept (the CPU the pacing saved).
+    let mut sleeps = (0u64, 0.0f64);
     let result = (|| -> Result<()> {
         loop {
             let mut progressed = false;
@@ -354,7 +359,7 @@ pub(crate) fn run_worker<B: Backend>(backend: &mut B, inbox: &mpsc::Receiver<Com
                 // reply, which carries its own transport deadline.
                 ensure!(empty || since.elapsed() < timeout, "Spark exchange made no progress for {timeout:?}");
             }
-            if idle_passes < SPIN_PASSES || empty {
+            if idle_passes < SPIN_PASSES || empty || !paced {
                 std::hint::spin_loop();
                 continue;
             }
@@ -370,9 +375,19 @@ pub(crate) fn run_worker<B: Backend>(backend: &mut B, inbox: &mpsc::Receiver<Com
                 };
             }
             slept = early;
-            if early { std::thread::sleep(SLEEP); } else { std::hint::spin_loop(); }
+            if early {
+                let started = Instant::now();
+                std::thread::sleep(SLEEP);
+                sleeps.0 += 1;
+                sleeps.1 += started.elapsed().as_secs_f64();
+            } else { std::hint::spin_loop(); }
         }
     })();
+    tracing::debug!(sleeps = sleeps.0, slept_ms = sleeps.1 * 1e3, round_trip_us = pace.round_trip.map(|m| m * 1e6),
+        staging_us = pace.staging.map(|m| m * 1e6), "Spark exchange worker pacing");
+    #[cfg(test)]
+    eprintln!("worker pacing: {} sleeps, {:.1} ms slept, round trip {:?} us, staging {:?} us", sleeps.0, sleeps.1 * 1e3,
+        pace.round_trip.map(|m| (m * 1e6) as u64), pace.staging.map(|m| (m * 1e6) as u64));
     (result, highest)
 }
 
@@ -679,6 +694,7 @@ impl<'a> Waves<'a> {
         } else {
             self.layouts[slot] = None;
         }
+        cuteafd_transport::wait_policy::note_active();
         let job = Job { sequence, slot, rows, source, consumed: self.uses[slot], sent: Instant::now() };
         self.jobs.as_ref().context("Spark exchange stopped")?.send(Command::Wave(job))
             .map_err(|_| WaveError::Lost(sequence))?;

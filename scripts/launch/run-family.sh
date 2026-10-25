@@ -205,6 +205,8 @@ TARGET_HEAD
 SPARK_INTAKE
 SPARK_REQUEST_CHUNK_BYTES
 SPARK_REPLY_CHUNK_BYTES
+HOST_WAIT
+IDLE_PARK_SECONDS
 CONSOLE_TEXT
 FP8_EXPERT_PREFILL
 ATTENTION_PLAN_ROWS
@@ -256,6 +258,8 @@ TARGET_HEAD
 SPARK_INTAKE
 SPARK_REQUEST_CHUNK_BYTES
 SPARK_REPLY_CHUNK_BYTES
+HOST_WAIT
+IDLE_PARK_SECONDS
 CONSOLE_TEXT
 FP8_EXPERT_PREFILL
 ATTENTION_PLAN_ROWS
@@ -505,6 +509,8 @@ SPECULATOR
 SPARK_INTAKE
 SPARK_REQUEST_CHUNK_BYTES
 SPARK_REPLY_CHUNK_BYTES
+HOST_WAIT
+IDLE_PARK_SECONDS
 TARGET_HEAD
 THERMAL
 TP2_ATTENTION
@@ -632,6 +638,11 @@ thermal_args=(-e "CUTEAFD_THERMAL=$thermal")
 # RDMA WRITE tails plus a head SEND; none (or 0) sends them whole; bytes or
 # NKiB/NMiB. Unset keeps the binary defaults (requests 256KiB, replies none).
 # The coordinator sends both to every Spark worker.
+# HOST_WAIT (spin, default; or block) is how serving's host threads wait:
+# spin for the lowest latency, block for a less loaded machine (per-step syncs
+# sleep, the Spark exchange worker paces its polling). IDLE_PARK_SECONDS
+# (default 30): with no active request for that long every polling thread
+# parks. Coordinator and Spark workers both read them.
 shared_coordinator_env_args() {
 intake="$(get SPARK_INTAKE auto)"
 case "$intake" in auto|gpu|pinned|host) ;; *) echo "SPARK_INTAKE must be auto, gpu, pinned or host" >&2; exit 2 ;; esac
@@ -661,7 +672,22 @@ done
 if [[ -n "${CUTEAFD_PUSH_SOCKET:-}" ]]; then
   shared_env_args+=(-e "CUTEAFD_PUSH_SOCKET=$CUTEAFD_PUSH_SOCKET")
 fi
-shared_worker_env_args=(-e "HF_HOME=$namespace_hf_home" -e "CUTEAFD_FP8_EXPERT_PREFILL=$fp8_prefill" -e "CUTEAFD_THERMAL=$(get THERMAL on)")
+# Unset keys leave the binary defaults (spin, 30 s).
+wait_env_args=()
+host_wait="$(get HOST_WAIT "")"
+if [[ -n $host_wait ]]; then
+  case "$host_wait" in spin|block) ;; *) release_die "HOST_WAIT must be spin or block" ;; esac
+  wait_env_args+=(-e "CUTEAFD_HOST_WAIT=$host_wait")
+fi
+idle_park="$(get IDLE_PARK_SECONDS "")"
+if [[ -n $idle_park ]]; then
+  [[ $idle_park =~ ^[0-9]+(\.[0-9]+)?$ && ! $idle_park =~ ^0+(\.0+)?$ ]] \
+    || release_die "IDLE_PARK_SECONDS must be a positive number of seconds"
+  wait_env_args+=(-e "CUTEAFD_IDLE_PARK_SECONDS=$idle_park")
+fi
+shared_env_args+=("${wait_env_args[@]}")
+shared_worker_env_args=(-e "HF_HOME=$namespace_hf_home" -e "CUTEAFD_FP8_EXPERT_PREFILL=$fp8_prefill" -e "CUTEAFD_THERMAL=$(get THERMAL on)"
+  "${wait_env_args[@]}")
 if [[ -n "${CUTEAFD_PUSH_SOCKET:-}" ]]; then
   shared_worker_env_args+=(-e "CUTEAFD_PUSH_SOCKET=$CUTEAFD_PUSH_SOCKET")
 fi

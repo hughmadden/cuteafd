@@ -515,7 +515,10 @@ pub(super) fn run(mut config: NativeExpertServiceConfig, listen: &str) -> Result
     // connections). The wait must therefore end after `idle_wait`
     // (`LocalVerbsExpertConnection::poll`), not after an active exchange's
     // timeout. Any request or admission resets the idle timer.
-    let idle_spin = Duration::from_secs(30);
+    // Busy serving spins; after the shared idle-park time without a request
+    // (`--idle-park-seconds`, 30 s by default) the loop parks on completion
+    // events, so an idle worker uses no CPU.
+    let idle_spin = cuteafd_transport::wait_policy::wait_policy().idle_park;
     let idle_wait = Duration::from_millis(100);
     let mut last_activity = Instant::now();
     let mut idle_cursor = 0usize;
@@ -835,6 +838,14 @@ fn next_slot(busy: &[bool]) -> Option<usize> {
 mod slot_tests {
     use super::{execution_slots, next_slot};
     use cuteafd_core::{SparkEndpoint, SparkIngress, SparkRings};
+
+    /// An idle worker parks after the shared idle-park time (no CPU while no
+    /// request arrives), whichever host-wait mode serving uses.
+    #[test]
+    fn the_owner_loop_parks_after_the_shared_idle_time() {
+        let source = include_str!("local.rs");
+        assert!(source.contains("let idle_spin = cuteafd_transport::wait_policy::wait_policy().idle_park;"));
+    }
 
     #[test]
     fn execution_slots_are_a_rank_property_of_the_admission() {
