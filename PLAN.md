@@ -49,7 +49,7 @@ Core (parity tier, must match or beat the parent engines):
 
 | Model | Family | Format | Notes |
 | --- | --- | --- | --- |
-| deepseek-ai/DeepSeek-V4.1-Flash | deepseek_v41 | FP8 block + MXFP4 experts | engram ×2, dSpark 3-stage, vision. The regression anchor. |
+| deepseek-ai/DeepSeek-V4.1-Flash | deepseek_v41 | FP8 block + MXFP4 experts | engram ×2, dSpark 3-stage, vision. |
 | wrldsuksgo2mars/GLM-5.3-EXL3-K4-v1 | glm5 | EXL3 K4 experts | 78 layers, MLA+DSA, DFlash2 draft (`incoai/GLM-5.3-DFlash2`) |
 | deepseek-ai/DeepSeek-V4-Flash-0731 | deepseek_v4 | FP8 block + FP4 experts | compress 4/128 alternating, nextn 1 |
 | wrldsuksgo2mars/DeepSeek-V4-Pro-0813-EXL3-K2-calibrated-v1 | deepseek_v4 | EXL3 K2 experts | 61 layers, 7168 wide, ~96 GiB per Spark rank at TP4 |
@@ -183,20 +183,28 @@ declares its header, speculator, micro-step stages and layer classes in a `conso
 Shared page shell, palette and SVG chart primitives at `/assets/cuteafd-ui.{css,js}` (also used
 by `/bench`); logo and favicon at `/assets/cuteafd-{logo,mark}.svg`.
 
-## Execution engines (decided 2026-09-29)
+## One engine, shared structure (TJ, 2026-10-25)
 
-V4.1's execution stack is specialized to its causal encoder/decoder: KV and
-index sources [2,8,14,20], engram gates at layers 1 and 14, dSpark taps from
-layer 37, encoder/replay stages. Other families share none of that, so there
-are two engines under one scheduler, API, transport, host cache and sampler:
+There is one engine. Every family, V4.1 included, runs on the same shared
+structure: the shared prefill executor (`shared/prefill_pipeline.rs`), the
+shared decode lane contract and owners, the shared Spark exchange, scheduler,
+API, transport, host cache and sampler. A family supplies hooks (attention,
+router, experts, head, speculator taps) and its `LaneSupport` entry; it does
+not own a private prefill or decode loop. Unified prefill and decode is a v4
+feature, and new families (e.g. MiniMax) start on it.
 
-- `deepseek_v41` keeps its specialized path; nothing regresses it.
-- A generic per-layer engine runs every other family: each layer is a block
-  (norm/HC in, family attention with its own window/compressed/index/state
-  cache, router, shared expert, routed experts on Sparks, HC/residual out),
-  plus head and native speculator. DeepSeek V4 is its first tenant, then GLM,
-  MiMo, Qwen. It adopts V4.1's proven optimizations (chained stages, lanes,
-  dual RTX, route packing) as it matures.
+Family specifics are hook parameters, not separate engines. V4.1's causal
+encoder/decoder (KV and index sources [2,8,14,20], engram gates at layers 1
+and 14, dSpark taps from layer 37, encoder/replay ranges) is expressed as
+layer ranges and per-layer attributes of the shared engine. If a feature truly
+cannot fit, name it and the reason on #744 instead of forking the path.
+
+Why: the early "no regression against ds41rt" gate kept V4.1 on its own path
+and pushed every family into separate optimized loops. That hid shared defects
+behind per-family code (the reply-incast traffic problem, the compact-kernel
+prefill regression) and made each fix land once per family. One structure means
+a fix or a measured win lands for every family at once. The 2026-09-29
+two-engine decision is retired.
 
 Kernels are shared by parameterizing dimensions; `cuteafd plan` feeds the
 AOT exporters the geometry each image must carry.
