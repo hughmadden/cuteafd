@@ -1180,7 +1180,8 @@ impl<'a> DflashDrafter<'a> {
             &self.confidence_key(family, fp8_head))
     }
 
-    fn confidence_key(&self, family: &str, fp8_head: bool) -> String {
+    /// The selector prior's key: `family/dflash2/` and these numerics.
+    pub(crate) fn confidence_key(&self, family: &str, fp8_head: bool) -> String {
         let head = if fp8_head { "head-fp8-row".into() } else { format!("head-bf16-{:?}", self.head_mode.get()) };
         let kv = if self.kv_cache == cuteafd_loader::families::qwen4::Qwen4KvCache::Fp8 { "-kv-fp8" } else { "" };
         let numerics = format!("{}-{:?}-{head}-{:?}{kv}-r1", self.representation.name(), self.fp8_rows.get(),

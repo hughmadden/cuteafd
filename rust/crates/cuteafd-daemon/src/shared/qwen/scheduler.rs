@@ -13,6 +13,118 @@ pub(crate) enum Drafts {
     Neural { depth: usize, fixed: bool },
 }
 
+/// A selector drafter's keyed prior: the key its fit is filed under, and the fit loaded for
+/// that key (the generic GLM-5.3 fit until the drafter ships one).
+pub(crate) struct SelectorPrior {
+    pub key: String,
+    pub fit: crate::shared::draft_confidence::SelectorFit,
+}
+
+/// Drafts each request asks its drafter for: every position its room allows when they are
+/// fixed, or when a selector drafter's features price them after drafting (it runs its whole
+/// block either way); otherwise the history-priced selection.
+fn draft_depths(fixed: bool, selector: bool, priors: &[Vec<f64>], selected: Vec<usize>) -> Vec<usize> {
+    if fixed || selector { priors.iter().map(Vec::len).collect() } else { selected }
+}
+
+/// The post-draft `p0` of one request's `drafted` positions: a confidence head blended with its
+/// history, or a selector drafter's features through its keyed prior. `None` keeps the
+/// history prior.
+fn drafted_prior(head: Option<&[f32]>, selector: Option<(&SelectorPrior, &[[f32; 4]])>, history: &DraftHistory,
+    drafted: usize) -> Result<Option<Vec<f64>>> {
+    if let Some(head) = head {
+        anyhow::ensure!(head.len() >= drafted, "draft confidence does not cover its proposal");
+        return Ok(Some(crate::shared::draft::resource::head_confidence(history, &head[..drafted])));
+    }
+    if let Some((selector, features)) = selector {
+        anyhow::ensure!(features.len() >= drafted, "draft selector features do not cover its proposal");
+        return Ok(Some(crate::shared::draft::resource::selector_confidence(&selector.fit, history, &features[..drafted])));
+    }
+    Ok(None)
+}
+
+/// One `draft_confidence` record of `scripts/bench/calibrate-draft-confidence.py`: a request's
+/// selector features and the history rates its neural drafts were priced at, the prior, and
+/// how many of them verification proposed, accepted and observed. A censored verification (a
+/// stop on an accepted draft, the output limit, a cancel) observes no miss past its accepted
+/// prefix.
+#[allow(clippy::too_many_arguments)]
+fn confidence_record(key: &str, request: u64, history: &[f64], features: &[[f32; 4]], prior: &[f64],
+    proposed: usize, accepted: usize, censored: bool) -> serde_json::Value {
+    let accepted = accepted.min(proposed);
+    let observed = proposed.min(accepted + usize::from(!censored));
+    serde_json::json!({"type": "draft_confidence", "key": key, "request": request, "history": history,
+        "features": features, "prior": prior, "proposed": proposed, "accepted": accepted, "observed": observed})
+}
+
+#[cfg(test)]
+mod selector_tests {
+    use super::*;
+    use crate::shared::draft_confidence::SelectorFit;
+
+    fn history() -> DraftHistory {
+        let mut history = DraftHistory::default();
+        for (proposed, accepted) in [(7, 3), (7, 7), (5, 1), (7, 2)] { history.observe(proposed, accepted); }
+        history
+    }
+
+    /// Without a selector prior (Kimi K3, Qwen4, Step-5, MiniMax DSpark) depths and post-draft
+    /// priors are what the scheduler chose before the hooks existed.
+    #[test]
+    fn families_without_a_selector_keep_their_depths_and_priors() {
+        let priors = vec![vec![0.5; 7], Vec::new(), vec![0.5; 3]];
+        assert_eq!(draft_depths(false, false, &priors, vec![2, 0, 1]), [2, 0, 1]);
+        assert_eq!(draft_depths(true, false, &priors, vec![2, 0, 1]), [7, 0, 3]);
+        let history = history();
+        assert_eq!(drafted_prior(None, None, &history, 5).unwrap(), None);
+        let head = [0.9f32, 0.8, 0.7, 0.6, 0.5, 0.4, 0.3];
+        assert_eq!(drafted_prior(Some(&head), None, &history, 4).unwrap(),
+            Some(crate::shared::draft::resource::head_confidence(&history, &head[..4])));
+        assert!(drafted_prior(Some(&head[..2]), None, &history, 4).is_err());
+    }
+
+    /// A selector drafter drafts its whole room, then its features price the drafts through the
+    /// keyed fit at the request's history rates (a confidence head would win, as before).
+    #[test]
+    fn a_selector_drafter_drafts_its_room_and_prices_its_features() {
+        let priors = vec![vec![0.5; 7], Vec::new(), vec![0.5; 3]];
+        assert_eq!(draft_depths(false, true, &priors, vec![2, 0, 1]), [7, 0, 3]);
+        let selector = SelectorPrior { key: "minimax_m3/dflash2/test-r1".into(), fit: SelectorFit::default() };
+        let features = [[2.0f32, 0.9, 0.3, 0.0], [0.1, 0.3, 1.9, 4.0], [1.0, 0.6, 0.8, 1.0]];
+        let history = history();
+        let prior = drafted_prior(None, Some((&selector, &features)), &history, 3).unwrap().unwrap();
+        assert_eq!(prior, SelectorFit::default().confidence(&history.conditional(3), &features).unwrap());
+        // Confident first draft, unconfident second.
+        assert!(prior[0] > prior[1]);
+        assert!(drafted_prior(None, Some((&selector, &features[..2])), &history, 3).is_err());
+        let head = [0.9f32; 3];
+        assert_eq!(drafted_prior(Some(&head), Some((&selector, &features)), &history, 3).unwrap(),
+            Some(crate::shared::draft::resource::head_confidence(&history, &head)));
+    }
+
+    /// The record is the calibration tool's format; a censored verification observes no miss.
+    #[test]
+    fn calibration_records_censor_terminal_and_cancelled_verifications() {
+        let features = [[1.0f32, 0.5, 1.0, 2.0]; 7];
+        let record = confidence_record("minimax_m3/dflash2/test-r1", 3, &[0.75; 7], &features, &[0.6; 7], 7, 2, false);
+        let mut fields: Vec<_> = record.as_object().unwrap().keys().cloned().collect();
+        fields.sort();
+        assert_eq!(fields, ["accepted", "features", "history", "key", "observed", "prior", "proposed", "request", "type"]);
+        assert_eq!((record["type"].as_str(), record["key"].as_str(), record["request"].as_u64()),
+            (Some("draft_confidence"), Some("minimax_m3/dflash2/test-r1"), Some(3)));
+        assert_eq!((record["proposed"].as_u64(), record["accepted"].as_u64(), record["observed"].as_u64()),
+            (Some(7), Some(2), Some(3)));
+        assert_eq!(record["features"][6].as_array().unwrap().len(), 4);
+        // Every draft accepted: nothing past the proposal is observed.
+        assert_eq!(confidence_record("k", 0, &[], &features, &[], 7, 7, false)["observed"], 7);
+        // A stop or cancel on an accepted prefix censors the next draft.
+        assert_eq!(confidence_record("k", 0, &[], &features, &[], 7, 2, true)["observed"], 2);
+        // Accepted counts past the neural drafts (a copy continuation) stop at them.
+        let copied = confidence_record("k", 0, &[], &features, &[], 3, 5, false);
+        assert_eq!((copied["accepted"].as_u64(), copied["observed"].as_u64()), (Some(3), Some(3)));
+    }
+}
+
 /// Ungraphed rows can replay prompt tokens or advance a live decode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum UngraphedKind {
@@ -145,6 +257,12 @@ pub(crate) trait Backend<'a> {
     fn draft(&self, sequences: &mut [DraftSeq<'_, Self::Placement, Self::Draft>], timing: &mut DraftTiming)
         -> Result<Vec<Vec<u32>>>;
     fn draft_confidence<'s>(&self, _draft: &'s Self::Draft) -> Option<&'s [f32]> { None }
+    /// A selector drafter's (DFlash2) features of its last proposal, one row per drafted
+    /// position: margin, candidate probability, entropy and unary rank.
+    fn draft_selector<'s>(&self, _draft: &'s Self::Draft) -> Option<&'s [[f32; 4]]> { None }
+    /// The keyed prior mapping a selector drafter's features to acceptance. With one, every
+    /// request drafts its whole room and the post-draft selection prices the features.
+    fn selector_prior(&self) -> Option<&SelectorPrior> { None }
     fn accept(&self, verified: &mut [Verified<'_, Self::Placement, Self::Draft, Self::History>],
         speculative: bool) -> Result<()>;
     /// Drop any unaccepted replay owned by this request before its storage is released.
@@ -1047,7 +1165,8 @@ pub(crate) fn schedule<'a, B: Backend<'a>>(engine: &B, snapshot: &std::path::Pat
                 let selection = resource::select_drafted(shared, &candidates, depth, geometry.decode_rows,
                     neural_confidence.iter().filter(|p| !p.is_empty()).count());
                 predicted = selection.predicted;
-                let mut depths = if fixed { neural_confidence.iter().map(Vec::len).collect() } else { selection.lengths };
+                let mut depths = draft_depths(fixed, engine.selector_prior().is_some(), &neural_confidence,
+                    selection.lengths);
                 for (a, d) in active.iter().zip(depths.iter_mut()) {
                     // A whole-prompt prefix hit has no draft continuation yet: it drafts after its first step.
                     if a.draft.pending_rows() == 0 {
@@ -1069,10 +1188,17 @@ pub(crate) fn schedule<'a, B: Backend<'a>>(engine: &B, snapshot: &std::path::Pat
                 }
             }
         };
-        for ((request, proposal), prior) in active.iter().zip(&proposals).zip(&mut neural_confidence) {
-            if let Some(head) = engine.draft_confidence(&request.draft) {
-                anyhow::ensure!(head.len() >= proposal.len(), "draft confidence does not cover its proposal");
-                *prior = resource::head_confidence(&request.outcomes, &head[..proposal.len()]);
+        // With a trace, each selector draft's features and the history rates they were priced at.
+        let mut selector_trace: Vec<Option<(Vec<f64>, Vec<[f32; 4]>)>> = vec![None; active.len()];
+        for (((request, proposal), prior), captured) in active.iter().zip(&proposals).zip(&mut neural_confidence)
+            .zip(&mut selector_trace) {
+            let selector = engine.selector_prior().zip(engine.draft_selector(&request.draft));
+            if let Some(drafted) = drafted_prior(engine.draft_confidence(&request.draft), selector, &request.outcomes,
+                proposal.len())? {
+                *prior = drafted;
+            }
+            if let Some((_, features)) = selector.filter(|_| trace.is_some() && !proposal.is_empty()) {
+                *captured = Some((request.outcomes.conditional(features.len()), features.to_vec()));
             }
         }
         let trace_neural = trace.as_ref().map(|_| proposals.clone());
@@ -1278,6 +1404,17 @@ pub(crate) fn schedule<'a, B: Backend<'a>>(engine: &B, snapshot: &std::path::Pat
                 "committed_tokens": active.iter().zip(&before).map(|(a, &n)| &a.history[n..]).collect::<Vec<_>>(),
                 "predicted_us": predicted, "rates": neural_confidence,
                 "draft_policy": resource::snapshot()}));
+            if let Some(key) = engine.selector_prior().map(|selector| selector.key.as_str()) {
+                for (index, captured) in selector_trace.iter().enumerate() {
+                    let Some((history, features)) = captured else { continue };
+                    let (rows, kept, censor) = outcomes[index];
+                    let neural = rows.saturating_sub(1).min(neural_lengths[index]);
+                    if neural > 0 {
+                        trace.cycle(confidence_record(key, active[index].id, history, features,
+                            &neural_confidence[index], neural, kept.saturating_sub(1), censor.is_some()));
+                    }
+                }
+            }
         }
         for index in (0..active.len()).rev() {
             if !finished[index] {
