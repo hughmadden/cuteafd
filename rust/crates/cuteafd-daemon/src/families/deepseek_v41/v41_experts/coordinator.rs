@@ -480,9 +480,12 @@ impl<'w> NativePendingFfn<'w, '_> {
         // pass queues them at once (the device waits).
         let host_ordered = !crate::shared::memory::chain::deferred();
         if host_ordered {
+            let block = cuteafd_transport::wait_policy::wait_policy().wait == cuteafd_transport::wait_policy::HostWait::Block;
             while !exchange.landed(&self.ticket) {
                 crate::shared::spark_waves::healthy()?;
-                if cooperative { tokio::task::yield_now().await } else { std::hint::spin_loop() }
+                if cooperative { tokio::task::yield_now().await }
+                else if block { std::thread::sleep(std::time::Duration::from_micros(20)) }
+                else { std::hint::spin_loop() }
             }
         }
         // SAFETY: the reduce stream joins the chain (the shared contribution's
