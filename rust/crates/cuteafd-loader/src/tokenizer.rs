@@ -131,9 +131,7 @@ impl LoadedTokenizer {
             tokenizer_path = snapshot_path.join("tiktoken.model");
             tiktoken::load(snapshot_path)?
         } else {
-            tokenizers::Tokenizer::from_file(&tokenizer_path).map_err(|err| {
-                anyhow::anyhow!("loading tokenizer {}: {err}", tokenizer_path.display())
-            })?
+            return Self::from_file(&tokenizer_path);
         };
         let pieces = pieces::Pieces::new(&tokenizer);
         Ok(Self {
@@ -142,6 +140,28 @@ impl LoadedTokenizer {
             pieces,
             literal: OnceLock::new(),
         })
+    }
+
+    /// Load an explicitly named tokenizer document through the same tokenizer representation.
+    pub fn from_file(path: &Path) -> Result<Self> {
+        let tokenizer = tokenizers::Tokenizer::from_file(path)
+            .map_err(|error| anyhow::anyhow!("loading tokenizer {}: {error}", path.display()))?;
+        let pieces = pieces::Pieces::new(&tokenizer);
+        Ok(Self { tokenizer_path: path.display().to_string(), tokenizer, pieces, literal: OnceLock::new() })
+    }
+
+    /// The loaded vocabulary and byte-decoder metadata consumed by native grammar compilation.
+    pub fn grammar_tokenizer_json(&self) -> Result<String> {
+        self.tokenizer.to_string(false)
+            .map_err(|error| anyhow::anyhow!("serializing grammar tokenizer: {error}"))
+    }
+
+    /// Resolve only explicitly added token spellings, preserving the caller's order.
+    /// Ordinary vocabulary entries must not become message-boundary markers.
+    pub fn added_token_ids(&self, spellings: &[&str]) -> Vec<u32> {
+        let added = self.tokenizer.get_added_tokens_decoder();
+        spellings.iter().filter_map(|spelling| added.iter()
+            .find_map(|(&id, token)| (token.content == *spelling).then_some(id))).collect()
     }
 
     /// `text`'s token ids without special tokens, byte-identical to the tokenizer's own
@@ -230,7 +250,7 @@ impl LoadedTokenizer {
     }
 }
 
-fn cached_tokenizer(snapshot_path: &Path) -> Result<Arc<LoadedTokenizer>> {
+pub fn cached_tokenizer(snapshot_path: &Path) -> Result<Arc<LoadedTokenizer>> {
     let cache = TOKENIZER_CACHE.get_or_init(|| RwLock::new(HashMap::new()));
     let key = snapshot_path.to_path_buf();
     if let Some(tokenizer) = cache

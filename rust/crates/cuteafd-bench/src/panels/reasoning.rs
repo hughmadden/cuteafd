@@ -13,7 +13,7 @@ pub struct Reasoning;
 pub static REASONING: Reasoning = Reasoning;
 
 /// (label, request fields) per level for a family; the first is thinking off.
-pub fn levels(family: Option<&str>) -> Vec<(String, Value)> {
+fn family_levels(family: Option<&str>) -> Vec<(String, Value)> {
     let off = ("off".to_string(), json!({"thinking": {"type": "disabled"}}));
     let named = |names: &[&str]| -> Vec<(String, Value)> {
         std::iter::once(off.clone()).chain(names.iter().map(|n| (n.to_string(),
@@ -28,6 +28,11 @@ pub fn levels(family: Option<&str>) -> Vec<(String, Value)> {
         Some("mimo_v2") => vec![off, ("on".into(), json!({"thinking": {"type": "enabled"}}))],
         _ => named(&["low", "high", "max"]),
     }
+}
+
+pub fn levels(info: &ServerInfo) -> Vec<(String, Value)> {
+    family_levels(info.family.as_deref()).into_iter()
+        .filter(|(label, _)| label != "off" || info.configuration.supports_thinking_off()).collect()
 }
 
 fn modpow(mut base: u64, mut exp: u64, m: u64) -> u64 {
@@ -124,11 +129,11 @@ impl Panel for Reasoning {
          AIME-style set, recommended sampling: accuracy, reasoning tokens, time to solve (solo-equivalent)."
     }
     fn estimate_s(&self, rates: &Rates, info: &ServerInfo) -> f64 {
-        let n = levels(info.family.as_deref()).len() as f64 * 14.0;
+        let n = levels(info).len() as f64 * 14.0;
         n * rates.seconds(150.0, 3000.0) / 6.0
     }
     fn run(&self, ctx: &Ctx<'_>) -> Result<Value> {
-        let levels = levels(ctx.info.family.as_deref());
+        let levels = levels(ctx.info);
         let sampling = sampling();
         let mut rng = Rng::new(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos() as u64).unwrap_or(11));
@@ -239,8 +244,8 @@ mod tests {
             let (q, _) = puzzle(tier, &mut rng);
             assert!(!q.is_empty());
         }
-        assert_eq!(levels(Some("deepseek_v41")).len(), 6);
-        assert_eq!(levels(Some("mimo_v2")).len(), 2);
-        assert_eq!(levels(Some("qwen4"))[3].0, "xhigh");
+        assert_eq!(family_levels(Some("deepseek_v41")).len(), 6);
+        assert_eq!(family_levels(Some("mimo_v2")).len(), 2);
+        assert_eq!(family_levels(Some("qwen4"))[3].0, "xhigh");
     }
 }

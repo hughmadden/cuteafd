@@ -38,7 +38,15 @@ def find(name):
 if args[:2] == ['image', 'inspect']:
     if args[2] == '-f':
         print(args[4]); sys.exit(0)
-    print(json.dumps([{'Id': args[2], 'RepoTags': ['cuteafd-coordinator-dev:test']}])); sys.exit(0)
+    # STUB_IMAGES: {host: {ref: inspect record}} is that host's whole image store.
+    store = json.loads(os.environ.get('STUB_IMAGES', '{}')).get(host)
+    if store is not None:
+        if args[2] not in store:
+            sys.exit(1)
+        print(json.dumps([store[args[2]]])); sys.exit(0)
+    print(json.dumps([{'Id': args[2], 'RepoTags': ['cuteafd-coordinator-dev:test'], 'Architecture': 'arm64',
+                       'Os': 'linux', 'Config': {'Labels': {'io.cuteafd.toolchain.hash': 't1'}},
+                       'RootFS': {'Type': 'layers', 'Layers': ['sha256:' + '11' * 32]}}])); sys.exit(0)
 if args[:2] == ['container', 'inspect']:
     sys.exit(0 if find(args[2]) else 1)
 if args[:1] == ['logs']:
@@ -273,7 +281,8 @@ def test_env_per_arm_and_container_mounts(env, monkeypatch):
                 and call[i + 1].startswith('nvidia.com/gpu=')] == ['nvidia.com/gpu=0', 'nvidia.com/gpu=1']
         assert call[call.index('--ipc') + 1] == 'host' and 'memlock=-1:-1' in call
         mounts = [call[i + 1] for i, a in enumerate(call) if a == '-v']
-        assert f"{env['tmp']}/hub:/hf/hub:ro" in mounts
+        assert "/mnt/sparknest:/mnt/sparknest:ro" in mounts
+        assert f"{env['tmp'] / 'hub'}:{env['tmp'] / 'hub'}:ro" in mounts
         assert any(m.endswith(':/opt/cuteafd/lib/libcuteafd_native.so:ro') for m in mounts)
         assert any(m.endswith(':/opt/cuteafd/share:ro') for m in mounts)
         assert any(m.endswith(f'/gr/golden/{mode}/r1:/out') for m in mounts)
@@ -282,7 +291,7 @@ def test_env_per_arm_and_container_mounts(env, monkeypatch):
         assert (tail[-2:] == ['--trace', '/out/t']) == (mode == 'heads')
         if mode == 'heads':
             tail = tail[:-2]
-        assert tail[-8:] == ['glm-golden', '--snapshot', '/hf/hub/models--org--model/snapshots/rev1', '--device', '0',
+        assert tail[-8:] == ['glm-golden', '--snapshot', str(env['tmp'] / 'hub/models--org--model/snapshots/rev1'), '--device', '0',
                              '--split-device', '1', '--skip-routed-experts', '--nll'][-8:]
     out = env['home'] / '.cache/cuteafd/builds/gr/golden'
     record = json.loads((out / 'heads/r1/argv.json').read_text())
@@ -391,9 +400,85 @@ def test_compare_tool_on_synthetic_logits(tmp_path):
     assert cli.returncode == 0 and 'byte-identical: True' in cli.stdout
 
 
+def log_probs(values) -> np.ndarray:
+    """Row-wise log-softmax: the probe's `log_probs` tensor is already normalized."""
+    values = np.asarray(values, dtype=np.float64)
+    top = values.max(axis=-1, keepdims=True)
+    return (values - top - np.log(np.exp(values - top).sum(axis=-1, keepdims=True))).astype('<f4')
+
+
+def write_row(path: Path, values) -> None:
+    """One row as the probe writes it: the safetensors header from rows.rs."""
+    data = np.asarray(values, dtype='<f4').tobytes()
+    header = json.dumps({'log_probs': {'dtype': 'F32', 'shape': [len(values)],
+                                       'data_offsets': [0, len(data)]}}).encode()
+    header += b' ' * (-len(header) % 8)
+    path.write_bytes(len(header).to_bytes(8, 'little') + header + data)
+
+
+def test_compare_tool_reads_safetensors_rows(tmp_path):
+    rng = np.random.default_rng(1)
+    rows = log_probs(rng.normal(size=(3, 40)))
+    a, b = tmp_path / 'a', tmp_path / 'b'
+    a.mkdir()
+    b.mkdir()
+    for index, row in enumerate(rows):
+        write_row(a / f'row-{index:08}.safetensors', row)
+        write_row(b / f'row-{index:08}.safetensors', row)
+    same = compare.compare_paths(a, b)
+    assert same['layout'] == 'rows' and same['rows'] == 3 and same['byte_identical']
+    assert same['max_abs_diff'] == 0 and same['mean_kl'] == 0 and same['top1_agreement'] == 1
+    # Perturb one row into a new top-1: the row is named and its metrics are its own.
+    perturbed = rows[1].copy()
+    perturbed[3] = perturbed.max() + 2
+    write_row(b / 'row-00000001.safetensors', log_probs(perturbed))
+    diff = compare.compare_paths(a, b)
+    assert not diff['byte_identical'] and diff['rows'] == 3 and diff['vocab'] == 40
+    assert diff['worst_row'] == 'row-00000001.safetensors'
+    assert diff['worst_abs_diff_row'] == 'row-00000001.safetensors'
+    assert diff['top1_agreement'] == pytest.approx(2 / 3)
+    # Only one row moved, so its KL is the mean's three times over.
+    assert diff['mean_kl'] == pytest.approx(diff['max_kl'] / 3)
+    assert diff['max_kl'] > 0 and diff['max_abs_diff'] > 0
+    # A row only one side wrote is a difference, and a width mismatch names its row.
+    (b / 'row-00000002.safetensors').unlink()
+    missing = compare.compare_paths(a, b)
+    assert missing['only_a'] == 1 and missing['rows'] == 2 and not missing['byte_identical']
+    write_row(b / 'row-00000001.safetensors', np.zeros(39))
+    with pytest.raises(ValueError, match='widths differ'):
+        compare.compare_paths(a, b)
+    cli = subprocess.run([sys.executable, str(COMPARE), str(a), str(b)], capture_output=True, text=True)
+    assert cli.returncode == 2 and 'widths differ' in cli.stderr
+
+
+def test_compare_pairs_reads_safetensors_row_dumps(tmp_path):
+    root = tmp_path / 'golden'
+    rows = log_probs(np.random.default_rng(2).normal(size=(2, 24)))
+    for arm in ('a', 'b'):
+        (root / arm / 'r1' / 'logits').mkdir(parents=True)
+        for index, row in enumerate(rows):
+            write_row(root / arm / 'r1' / 'logits' / f'row-{index:08}.safetensors', row)
+    state = dict(root=str(root), task='t', family='kimi', snapshot='org/model', gpus='0', locks='gpu0',
+                 golden=['kimi-golden'], mode='golden', vocab=24, slots={})
+    results = golden.compare_pairs(state, [('a', 'b')], 1)
+    assert len(results) == 1 and not results[0].get('error')
+    assert results[0]['file'] == 'logits' and results[0]['rows'] == 2 and results[0]['byte_identical']
+    golden.write_summary(state, [], results)
+    assert '| a | b | 1 | logits | True | 2 |' in (root / 'summary.md').read_text()
+    bad = rows[1].copy()
+    bad[0] = bad.max() + 3
+    write_row(root / 'b/r1/logits/row-00000001.safetensors', log_probs(bad))
+    results = golden.compare_pairs(state, [('a', 'b')], 1)
+    assert results[0]['worst_row'] == 'row-00000001.safetensors'
+    golden.write_summary(state, [], results)
+    table = next(line for line in (root / 'summary.md').read_text().splitlines()
+                 if line.startswith('| a | b |') and 'repeat' not in line)
+    assert '| False |' in table and 'row-00000001.safetensors' in table
+
+
 def test_resolve_model_uses_hub_paths(env):
     host, container, extra = golden.resolve_model('org/model')
-    assert container == '/hf/hub/models--org--model/snapshots/rev1' and not extra
+    assert container == str(host) and extra == [str(host)]
     assert golden.vocab_size(host) == 8
 
 
@@ -488,6 +573,37 @@ def test_spark_hosts_refused(hosts, match):
         golden.parse_hosts(hosts)
 
 
+ROMEO_SPARKS = ['10.201.1.19', '10.201.2.20', '10.201.3.16', '10.201.4.42', '10.201.5.15', '10.201.6.16']
+
+
+def test_configured_deployment_sparks_take_the_pool_lock(tmp_path):
+    """Another deployment's Sparks are its config's SPARK_i_HOST/LANE_A entries, locked as sparks."""
+    config = tmp_path / 'six.config'
+    config.write_text(''.join(f'SPARK_{i}_HOST={h}\nSPARK_{i}_LANE_A={h}\n' for i, h in enumerate(ROMEO_SPARKS))
+                      + 'SPARK_5_LANE_B=\n')
+    configured = golden.configured_hosts(config)
+    assert configured == set(ROMEO_SPARKS)
+    assert golden.parse_hosts(','.join(ROMEO_SPARKS), configured) == ROMEO_SPARKS
+    assert golden.locks_for([0], ROMEO_SPARKS) == ['sparks', 'gpu0']
+    # Upstream hosts keep their own locks; an unconfigured name is still refused.
+    assert golden.locks_for([0], ['rhea', ROMEO_SPARKS[0]]) == ['sparks', 'gpu0', 'rhea']
+    with pytest.raises(ValueError, match='not a pool Spark'):
+        golden.parse_hosts('10.201.7.1', configured)
+    # A host without a lane address is not a configured Spark.
+    config.write_text('SPARK_0_HOST=lonely\n')
+    assert golden.configured_hosts(config) == set()
+    # Refusals win even when a config names the host.
+    with pytest.raises(ValueError, match='coordinator'):
+        golden.parse_hosts('raptor', {'raptor'})
+
+
+def test_hub_placeholder_follows_namespace_root(tmp_path, monkeypatch):
+    monkeypatch.delenv('CUTEAFD_NAMESPACE_ROOT', raising=False)
+    assert golden.hub_placeholder() == str(Path('/mnt/sparknest').resolve()) + '/hf-home/hub'
+    monkeypatch.setenv('CUTEAFD_NAMESPACE_ROOT', str(tmp_path))
+    assert golden.hub_placeholder() == str(tmp_path.resolve()) + '/hf-home/hub'
+
+
 def test_expert_layers_and_lock_order():
     assert golden.parse_layers('3') == [3]
     assert golden.parse_layers('5-7,3,6') == [3, 5, 6, 7]
@@ -565,7 +681,7 @@ def test_real_experts_start_before_and_stop_before_locks_release(spark_env, monk
     run_env = json.loads((env['tmp'] / 'run-env.json').read_text())
     assert run_env['CUTEAFD_GOLDEN_PEERS'] == '10.9.0.1:19451,10.9.0.2:19451,10.9.0.3:19451,10.9.0.4:19451'
     assert run_env['CUTEAFD_GOLDEN_SPARK_WORLD'] == '4' and run_env['CUTEAFD_GOLDEN_EXPERT_LAYERS'] == '3'
-    assert run_env['CUTEAFD_GOLDEN_SNAPSHOT'] == '/hf/hub/models--org--model/snapshots/rev1'
+    assert run_env['CUTEAFD_GOLDEN_SNAPSHOT'] == str(env['tmp'] / 'hub/models--org--model/snapshots/rev1')
     assert run_env['CUTEAFD_PROGRAM_MANIFEST'] == '/opt/cuteafd/share/PROGRAMS.json'
     assert run_env['CUTEAFD_GOLDEN_SPARK_PACKAGES'] == '/opt/cuteafd/spark'
     assert run_env['CUTEAFD_SPARK_ADMISSION_TIMEOUT_SECONDS'] == '2400'
@@ -603,6 +719,26 @@ def test_native_test_needs_a_passing_summary(spark_env, monkeypatch, output, pro
     record = json.loads((spark_env['home'] / '.cache/cuteafd/builds/gr/golden/a/r1/argv.json').read_text())
     assert problem in record['problem']
     assert json.loads(spark_env['state'].read_text()) == {}
+
+
+def test_configured_ip_sparks_run_under_the_pool_lock(spark_env, monkeypatch):
+    """Six numeric-IP Sparks from --config (a non-upstream deployment) on one coordinator GPU."""
+    env = spark_env
+    env['config'].write_text(''.join(f'SPARK_{i}_HOST={h}\nSPARK_{i}_LANE_A={h}\n' for i, h in enumerate(ROMEO_SPARKS)))
+    monkeypatch.setenv('STUB_RUN_OUTPUT', PASSED)
+    order = []
+    real_hold = golden.hwlock.hold
+    monkeypatch.setattr(golden.hwlock, 'hold', lambda names, *a, **k: order.append(list(names)) or real_hold(names, *a, **k))
+    argv = spark_argv(env, hosts=','.join(ROMEO_SPARKS))
+    argv[argv.index('--gpus') + 1] = '0'
+    assert golden.main(argv) == 0
+    assert order == [['sparks', 'gpu0']]
+    workers = [c for c in ssh_calls(env) if 'expertd-native' in c[1]]
+    assert [host for host, _ in workers] == ROMEO_SPARKS
+    for rank, (_, command) in enumerate(workers):
+        command = shlex.split(command)
+        assert command[command.index('--rank') + 1] == str(rank) and command[command.index('--world') + 1] == '6'
+
 
 
 def test_worker_exit_before_ready_fails_fast_and_tears_down(spark_env, monkeypatch):
@@ -720,8 +856,8 @@ def test_fixture_generation_command_mode(env, monkeypatch):
     assert call[-5:] == ['python3', '-m', 'pytest', '-q', 'python/tests/test_step5_chain_fixture.py']
     run_env = json.loads((env['tmp'] / 'run-env.json').read_text())
     assert run_env['CUTEAFD_STEP5_CHAIN_FIXTURE_DIR'] == str(fixtures) == run_env['CUTEAFD_GOLDEN_FIXTURES']
-    assert run_env['STEP5_QUANT_SNAPSHOT'] == '/hf/hub/models--org--model/snapshots/rev1'
-    assert run_env['STEP5_REFERENCE_SNAPSHOT'] == '/hf/hub/models--x/snapshots/r'
+    assert run_env['STEP5_QUANT_SNAPSHOT'] == str(env['tmp'] / 'hub/models--org--model/snapshots/rev1')
+    assert run_env['STEP5_REFERENCE_SNAPSHOT'] == str(env['tmp'] / 'hub/models--x/snapshots/r')
     assert run_env['PYTHONDONTWRITEBYTECODE'] == '1' and '/workspace/cuteafd/python/reference' in run_env['PYTHONPATH']
     assert 'CUTEAFD_GOLDEN_PEERS' not in run_env
 
@@ -777,6 +913,19 @@ def test_dense_native_test_without_sparks(env, monkeypatch):
     assert f'{fixtures}:{fixtures}:ro' in mounts and '--network' not in call
 
 
+def test_rdma_loopback_native_test_without_sparks(env, monkeypatch):
+    write_slot(env['home'], 'i1')
+    monkeypatch.setenv('STUB_RUN_OUTPUT', PASSED)
+    test = env['tmp'] / 'loopback-test'
+    test.write_text('#!/bin/sh\n')
+    test.chmod(0o755)
+    argv = SPARK_BASE + ['--model', 'org/model', '--arm', 'a=i1:s1', '--gpus', '1', '--native-test', str(test),
+                         '--rdma', '--', 'transport::tests::loopback', '--exact', '--ignored']
+    assert golden.main(argv) == 0
+    call = runs(env)[0]
+    assert '--network' in call and '--device=/dev/infiniband' in call
+
+
 def test_spark_port_checked_only_at_grant():
     """A run queued behind another golden must not fail preflight on its port."""
     import inspect
@@ -784,3 +933,253 @@ def test_spark_port_checked_only_at_grant():
     assert "if at_grant else '-'" in source
     assert "if port!='-':" in golden.REMOTE_CHECK
     assert inspect.signature(golden.preflight).parameters['at_grant'].default is True
+
+
+def test_namespace_root_keeps_mount_loading_paths_identical(env, monkeypatch):
+    root = env['tmp'] / 'namespace'
+    snapshot = root / 'hf-home/hub/models--org--model/snapshots/rev1'
+    snapshot.mkdir(parents=True)
+    (snapshot / 'config.json').write_text('{"vocab_size": 8}')
+    monkeypatch.setenv('CUTEAFD_NAMESPACE_ROOT', str(root))
+    monkeypatch.setenv('CUTEAFD_HF_HUB', str(root / 'hf-home/hub'))
+    host, container, extra = golden.resolve_model(str(snapshot))
+    assert str(host) == container == str(snapshot)
+    assert not extra
+    assert (Path(container) / 'config.json').read_bytes() == (host / 'config.json').read_bytes()
+    assert golden.hub_root() == root / 'hf-home/hub'
+
+
+SPARK_IMAGE = 'sha256:' + 'cd' * 32
+
+
+def spark_image(ident, **change):
+    """A Spark dev image inspect record (classic or containerd store); CHANGE overrides fields."""
+    record = {'Id': ident, 'RepoTags': ['spark:tc'], 'Architecture': 'arm64', 'Os': 'linux',
+              'Config': {'Env': ['PATH=/usr/bin'], 'Entrypoint': None, 'WorkingDir': '/workspace',
+                         'Labels': {'io.cuteafd.toolchain.hash': 'aa74e55ca2130070'}},
+              'RootFS': {'Type': 'layers', 'Layers': ['sha256:' + '11' * 32, 'sha256:' + '22' * 32]}}
+    for key, value in change.items():
+        if key == 'Labels':
+            record['Config'] = dict(record['Config'], Labels=value)
+        elif key in ('Env', 'Entrypoint', 'User'):
+            record['Config'] = dict(record['Config'], **{key: value})
+        elif key == 'Layers':
+            record['RootFS'] = dict(record['RootFS'], Layers=value)
+        else:
+            record[key] = value
+    return record
+
+
+def image_stores(monkeypatch, copies):
+    """Sealed-ID images on every Spark except COPIES ({host: record}), which hold only the tag."""
+    stores = {host: {SPARK_IMAGE: spark_image(SPARK_IMAGE), 'spark:tc': spark_image(SPARK_IMAGE)} for host in SPARKS}
+    for host, record in copies.items():
+        stores[host] = {'spark:tc': record} if record else {}
+    monkeypatch.setenv('STUB_IMAGES', json.dumps(stores))
+
+
+def test_image_content_ignores_store_specific_fields():
+    classic = spark_image(SPARK_IMAGE, RepoDigests=[], Size=25001997958, GraphDriver={'Name': 'overlay2'})
+    containerd = spark_image('sha256:' + 'ef' * 32, RepoDigests=['spark@sha256:' + 'ef' * 32], Size=25262440795,
+                             Descriptor={'mediaType': 'application/vnd.oci.image.manifest.v1+json'})
+    containerd['Config'] = dict(containerd['Config'], Hostname='', AttachStdin=False, Volumes=None)
+    assert golden.image_content(classic) == golden.image_content(containerd)
+    assert golden.image_content(spark_image(SPARK_IMAGE, Layers=[])) is None
+
+
+@pytest.mark.parametrize('field,value', [('StopTimeout', 0), ('StopTimeout', 10), ('Tty', True),
+                                         ('StopSignal', 'SIGINT'), ('Cmd', ['bash'])])
+def test_image_content_keeps_set_config_fields(field, value):
+    base = spark_image(SPARK_IMAGE)
+    changed = spark_image(SPARK_IMAGE)
+    changed['Config'] = dict(changed['Config'], **{field: value})
+    assert golden.image_content(changed) != golden.image_content(base)
+    zero, ten = (spark_image(SPARK_IMAGE) for _ in range(2))
+    zero['Config'] = dict(zero['Config'], StopTimeout=0)
+    ten['Config'] = dict(ten['Config'], StopTimeout=10)
+    assert golden.image_content(zero) != golden.image_content(ten)
+
+
+def test_reloaded_dev_image_with_stop_timeout_zero_is_refused(spark_env, monkeypatch, capsys):
+    record = spark_image('sha256:' + 'ef' * 32)
+    record['Config'] = dict(record['Config'], StopTimeout=0)  # the sealed image has none
+    image_stores(monkeypatch, {'moa': record})
+    assert golden.main(spark_argv(spark_env, '--dry-run')) == 2
+    assert 'moa' in capsys.readouterr().err
+
+
+def test_reloaded_dev_image_with_other_id_runs_vouched_by_a_sealed_host(spark_env, monkeypatch, capsys):
+    # docker save | load into a containerd store: same layers and config, another ID.
+    copy = 'sha256:' + 'ef' * 32
+    image_stores(monkeypatch, {'rhea': spark_image(copy), 'moa': spark_image(copy)})
+    monkeypatch.setenv('STUB_RUN_OUTPUT', PASSED)
+    assert golden.main(spark_argv(spark_env, '--dry-run')) == 0
+    out = capsys.readouterr().out
+    assert f'# rhea: dev image {SPARK_IMAGE} is local {copy} (same content as on dodo)' in out
+    assert 'golden-run: preflight pass' in out
+    assert golden.main(spark_argv(spark_env)) == 0
+    starts = {host: shlex.split(cmd) for host, cmd in ssh_calls(spark_env) if 'expertd-native' in cmd}
+    for host in SPARKS:
+        argv = starts[host]
+        assert argv[argv.index('--entrypoint') + 2] == (copy if host in ('rhea', 'moa') else SPARK_IMAGE)
+    record = json.loads((spark_env['home'] / '.cache/cuteafd/builds/gr/golden/a/r1/argv.json').read_text())
+    workers = {w['host']: w for w in record['workers']}
+    assert workers['rhea']['image_id'] == copy and workers['rhea']['sealed_image_id'] == SPARK_IMAGE
+    assert workers['rhea']['image_identity'] == 'tag' and workers['rhea']['image_vouched_by'] == 'dodo'
+    assert workers['dodo']['image_identity'] == 'sealed' and workers['dodo']['image_id'] == SPARK_IMAGE
+    assert workers['rhea']['image_content_sha256'] == workers['dodo']['image_content_sha256']
+
+
+@pytest.mark.parametrize('change,match', [
+    ({'Layers': ['sha256:' + '11' * 32, 'sha256:' + '33' * 32]}, 'differs from the slot'),
+    ({'Labels': {'io.cuteafd.toolchain.hash': 'bb00000000000000'}}, 'differs from the slot'),
+    ({'Architecture': 'amd64'}, 'differs from the slot'),
+    ({'Variant': 'v8'}, 'differs from the slot'),
+    ({'Env': ['PATH=/usr/bin', 'LD_PRELOAD=/x.so']}, 'differs from the slot'),
+    ({'Entrypoint': ['/bin/other']}, 'differs from the slot'),
+    ({'User': '0:0'}, 'differs from the slot'),
+    ({'Layers': []}, 'no RootFS layers'),
+])
+def test_reloaded_dev_image_with_other_content_is_refused(spark_env, monkeypatch, capsys, change, match):
+    image_stores(monkeypatch, {'moa': spark_image('sha256:' + 'ef' * 32, **change)})
+    taken = []
+    monkeypatch.setattr(golden.hwlock, 'hold', lambda *a, **k: taken.append(a))
+    assert golden.main(spark_argv(spark_env, '--dry-run')) == 2
+    err = capsys.readouterr().err
+    assert 'moa' in err and match in err
+    assert not taken and not runs(spark_env)
+
+
+def test_dev_image_copy_without_a_sealed_host_is_refused(spark_env, monkeypatch, capsys):
+    copy = spark_image('sha256:' + 'ef' * 32)
+    image_stores(monkeypatch, {host: copy for host in SPARKS})
+    assert golden.main(spark_argv(spark_env, '--dry-run')) == 2
+    assert f'dev image {SPARK_IMAGE} is missing, and no other Spark of this run holds it' in capsys.readouterr().err
+
+
+def test_missing_dev_image_and_tag_is_refused(spark_env, monkeypatch, capsys):
+    image_stores(monkeypatch, {'emu': None})
+    assert golden.main(spark_argv(spark_env, '--dry-run')) == 2
+    assert f'emu: dev image {SPARK_IMAGE} is missing (and so is its tag spark:tc)' in capsys.readouterr().err
+
+
+def test_sealed_image_with_divergent_content_across_hosts_is_refused():
+    def record(host, layers):
+        return {'image_identity': 'sealed', 'sealed_image_id': SPARK_IMAGE, 'image_id': SPARK_IMAGE, 'image': 'spark:tc',
+                'image_content_sha256': layers}
+    with pytest.raises(ValueError, match='has different content on dodo, emu'):
+        golden.check_spark_images({'dodo': record('dodo', 'a'), 'emu': record('emu', 'b')})
+
+
+def test_dev_image_change_between_enqueue_and_grant_is_refused(spark_env, monkeypatch, capsys):
+    image_stores(monkeypatch, {'moa': spark_image('sha256:' + 'ef' * 32)})
+    real = golden.preflight
+    calls = []
+
+    def preflight(state, arms, at_grant=True):
+        if at_grant:
+            image_stores(monkeypatch, {'moa': spark_image('sha256:' + '99' * 32)})
+        calls.append(at_grant)
+        return real(state, arms, at_grant)
+    monkeypatch.setattr(golden, 'preflight', preflight)
+    assert golden.main(spark_argv(spark_env)) != 0
+    assert 'dev image on moa changed since enqueue' in capsys.readouterr().err
+    assert not runs(spark_env)
+
+
+
+def seal_spark_content(home, content):
+    """Re-seal the test Spark slot's META with base_image_content_sha256 (a new-style seal)."""
+    root = home / '.cache/cuteafd/builds/wip-i1/slots/s1/spark-expert'
+    meta = json.loads((root / 'META.json').read_text())
+    meta['base_image_content_sha256'] = content
+    data = json.dumps(meta).encode()
+    (root / 'META.json').write_bytes(data)
+    (root / 'FINGERPRINT').write_text(hashlib.sha256(data).hexdigest() + '\n')
+
+
+def test_dev_image_content_cli_matches_the_runner(tmp_path):
+    record = spark_image(SPARK_IMAGE)
+    out = subprocess.run([sys.executable, str(ROOT / 'scripts/lib/dev_image_content.py')], input=json.dumps([record]),
+                         capture_output=True, text=True, check=True).stdout.strip()
+    assert out == golden.image_content(record) and len(out) == 64
+    bad = subprocess.run([sys.executable, str(ROOT / 'scripts/lib/dev_image_content.py')],
+                         input=json.dumps([spark_image(SPARK_IMAGE, Layers=[])]), capture_output=True, text=True)
+    assert bad.returncode and 'no RootFS layers' in bad.stderr
+    assert golden.IMAGE_CONTENT in golden.REMOTE_CHECK
+
+
+def test_new_seal_admits_a_reloaded_copy_without_a_voucher(spark_env, monkeypatch, capsys):
+    copy = 'sha256:' + 'ef' * 32
+    seal_spark_content(spark_env['home'], golden.image_content(spark_image(SPARK_IMAGE)))
+    image_stores(monkeypatch, {host: spark_image(copy) for host in SPARKS})
+    assert golden.main(spark_argv(spark_env, '--dry-run')) == 0
+    out = capsys.readouterr().out
+    assert f'# moa: dev image {SPARK_IMAGE} is local {copy} (same content as on the seal)' in out
+
+
+@pytest.mark.parametrize('change', [
+    {'Layers': ['sha256:' + '11' * 32, 'sha256:' + '33' * 32]},
+    {'Labels': {'io.cuteafd.toolchain.hash': 'bb00000000000000'}},
+    {'Architecture': 'amd64'}, {'Os': 'windows'}, {'Variant': 'v8'},
+    {'Env': ['PATH=/usr/bin', 'LD_PRELOAD=/x.so']}, {'Entrypoint': ['/bin/other']}, {'User': '0:0'},
+])
+@pytest.mark.parametrize('sealed_id', [True, False])
+def test_new_seal_refuses_other_content_even_under_the_sealed_id(spark_env, monkeypatch, capsys, change, sealed_id):
+    seal_spark_content(spark_env['home'], golden.image_content(spark_image(SPARK_IMAGE)))
+    ident = SPARK_IMAGE if sealed_id else 'sha256:' + 'ef' * 32
+    record = spark_image(ident, **change)
+    image_stores(monkeypatch, {'emu': record} if not sealed_id else {})
+    if sealed_id:
+        stores = json.loads(os.environ['STUB_IMAGES'])
+        stores['emu'] = {SPARK_IMAGE: record, 'spark:tc': record}
+        monkeypatch.setenv('STUB_IMAGES', json.dumps(stores))
+    assert golden.main(spark_argv(spark_env, '--dry-run')) == 2
+    err = capsys.readouterr().err
+    assert 'emu:' in err and 'not the sealed' in err
+
+
+def test_new_seal_with_malformed_content_is_refused(spark_env, monkeypatch, capsys):
+    seal_spark_content(spark_env['home'], 'sha256:' + 'ab' * 32)
+    assert golden.main(spark_argv(spark_env, '--dry-run')) == 2
+    assert 'base_image_content_sha256 is malformed' in capsys.readouterr().err
+
+
+def coordinator_meta(home, **fields):
+    root = home / '.cache/cuteafd/builds/wip-i1/slots/s1/coordinator'
+    meta = json.loads((root / 'META.json').read_text())
+    meta.update(fields)
+    data = json.dumps(meta).encode()
+    (root / 'META.json').write_bytes(data)
+    (root / 'FINGERPRINT').write_text(hashlib.sha256(data).hexdigest() + '\n')
+
+
+def coordinator_store(monkeypatch, store):
+    stores = json.loads(os.environ.get('STUB_IMAGES', '{}'))
+    stores['raptor'] = store
+    monkeypatch.setenv('STUB_IMAGES', json.dumps(stores))
+
+
+def test_coordinator_old_seal_still_needs_the_sealed_id(spark_env, monkeypatch, capsys):
+    coordinator_store(monkeypatch, {'dev:tc': spark_image('sha256:' + 'ef' * 32)})
+    assert golden.main(spark_argv(spark_env, '--dry-run')) == 2
+    assert f'dev image {IMAGE} is missing' in capsys.readouterr().err
+
+
+def test_coordinator_new_seal_runs_a_reloaded_copy_of_the_same_content(spark_env, monkeypatch, capsys):
+    copy = 'sha256:' + 'ef' * 32
+    coordinator_meta(spark_env['home'], base_image_content_sha256=golden.image_content(spark_image(IMAGE)))
+    coordinator_store(monkeypatch, {'dev:tc': spark_image(copy)})
+    assert golden.main(spark_argv(spark_env, '--dry-run')) == 0
+    out = capsys.readouterr().out
+    coordinator = [line for line in out.splitlines() if line.startswith('docker run') and '--rm' in line]
+    assert coordinator and copy in coordinator[0] and IMAGE not in coordinator[0]
+
+
+@pytest.mark.parametrize('sealed_id', [True, False])
+def test_coordinator_new_seal_refuses_other_content(spark_env, monkeypatch, capsys, sealed_id):
+    coordinator_meta(spark_env['home'], base_image_content_sha256=golden.image_content(spark_image(IMAGE)))
+    other = spark_image(IMAGE if sealed_id else 'sha256:' + 'ef' * 32, Layers=['sha256:' + '44' * 32])
+    coordinator_store(monkeypatch, {IMAGE: other} if sealed_id else {'dev:tc': other})
+    assert golden.main(spark_argv(spark_env, '--dry-run')) == 2
+    assert 'not the sealed' in capsys.readouterr().err

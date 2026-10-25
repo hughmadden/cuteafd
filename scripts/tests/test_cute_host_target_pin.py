@@ -113,7 +113,9 @@ def test_manifests_record_the_compiled_target_not_the_export_hosts_gpu_name():
     exec(compile(ast.Module(body=[fn], type_ignores=[]), 'pin', 'exec'), pin.__dict__)
     props = types.SimpleNamespace(major=12, minor=0, name='NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition')
     assert pin.export_target(props) == 'sm120'
-    for name in ('export_b12x_v41_experts_aot.py', 'export_b12x_v41_nvfp4_aot.py', 'export_b12x_exl3_aot.py',
+    v41 = (ROOT / 'python/tools/aot/export_b12x_v41_experts_aot.py').read_text()
+    assert 'from export_b12x_slices_aot import export as export_slices' in v41
+    for name in ('export_b12x_slices_aot.py', 'export_b12x_v41_nvfp4_aot.py', 'export_b12x_exl3_aot.py',
                  'export_b12x_v41_fp8_aot.py'):
         text = (ROOT / 'python/tools/aot' / name).read_text()
         assert 'props.name' not in text and 'properties.name' not in text, name

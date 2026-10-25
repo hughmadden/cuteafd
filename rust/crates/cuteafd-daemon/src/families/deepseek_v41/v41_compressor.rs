@@ -1177,3 +1177,10 @@ impl<'a> CompressorState<'a> {
         &self.index
     }
 }
+
+#[cfg(test)]
+impl CompressorWeights<'_> {
+    pub(crate) fn visit(&self, prefix: &str, f: &mut dyn FnMut(String, cuteafd_ffi::CuteafdDeviceBuffer)) {
+        self.tensors.visit(prefix, f);
+    }
+}

@@ -9,8 +9,8 @@ fn spark_model(capacity: u32, compiled_capacity: u32, bf16: bool, device_endpoin
     ensure!(device_endpoints <= 2 && (!bf16 || device_endpoints == 0),
         "invalid V4.1 device endpoint set");
     let ingress = if bf16 { SparkIngress::Bf16 } else { SparkIngress::Fp8K32 };
-    let mut endpoints = vec![SparkEndpoint { capacity, ingress }; 2];
-    endpoints.extend(std::iter::repeat_n(SparkEndpoint { capacity: capacity.min(80), ingress }, device_endpoints));
+    let mut endpoints = vec![SparkEndpoint { ring_depth: None, capacity, ingress }; 2];
+    endpoints.extend(std::iter::repeat_n(SparkEndpoint { ring_depth: None, capacity: capacity.min(80), ingress }, device_endpoints));
     let model = cuteafd_transport::worker_selection::ModelAdmission {
         capacity, compiled_capacity, endpoints,
         rings: crate::shared::placement::spark_rings(64 << 20)?,
@@ -24,6 +24,16 @@ pub(super) fn start_sparks(args: &crate::cli::NativeServeArgs,
     capacity: u32, compiled_capacity: u32,
     topology: Option<cuteafd_transport::expert::SparkTopology>,
     device_endpoints: usize) -> Result<Option<crate::shared::placement::PendingSparkAdmission>> {
+    plan_sparks(args, catalog, local_layers, capacity, compiled_capacity, topology, device_endpoints)?
+        .map(|admission| admission.start(&args.peers)).transpose()
+}
+
+/// The Spark admission (headers only), before any worker is contacted.
+pub(super) fn plan_sparks(args: &crate::cli::NativeServeArgs,
+    catalog: &cuteafd_loader::OfficialV41Catalog, local_layers: usize,
+    capacity: u32, compiled_capacity: u32,
+    topology: Option<cuteafd_transport::expert::SparkTopology>,
+    device_endpoints: usize) -> Result<Option<crate::shared::placement::SparkAdmission>> {
     let geometry = catalog.routed_experts().geometry()?;
     ensure!(local_layers <= geometry.layers as usize, "V4.1 local boundary exceeds checkpoint");
     if args.peers.is_empty() {
@@ -34,8 +44,7 @@ pub(super) fn start_sparks(args: &crate::cli::NativeServeArgs,
         rtx_layers: (0..local_layers).collect(), spark_ranks: args.peers.len(), prefill_lanes: 2 };
     Ok(Some(crate::shared::placement::SparkAdmission::plan(&args.snapshot, geometry, Some(catalog),
         &working, args.peers.len(), topology,
-        spark_model(capacity, compiled_capacity, catalog.nvfp4().is_some(), device_endpoints)?)?
-        .start(&args.peers)?))
+        spark_model(capacity, compiled_capacity, catalog.nvfp4().is_some(), device_endpoints)?)?))
 }
 
 #[cfg(test)]
@@ -48,7 +57,7 @@ mod spark_tests {
             (include_str!("../v41_native_serve.rs"), "ExpertWeights::load(", "transport.install_device_link("),
             (include_str!("distributed.rs"), "tp2_ffn::load_routed_weights(", "let mut make_transport ="),
         ] {
-            let start = source.find("admission::start_sparks(").unwrap();
+            let start = source.find("admission::start_sparks(").or_else(|| source.find("plan.start_with(")).unwrap();
             let load = source[start..].find(load).unwrap() + start;
             let wait = source.find("pending.wait()?").unwrap();
             let connect = source[wait..].find(connect).unwrap() + wait;

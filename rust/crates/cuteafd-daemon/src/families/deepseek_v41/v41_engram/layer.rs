@@ -55,7 +55,7 @@ impl<'a> EngramLayerWeights<'a> {
             raw: library.cuda_stream_create()?,
         };
         unsafe {
-            kernel.pack_scales(tensors.get(&names[1])?, packed_scales.buffer, stream.raw)?;
+            crate::shared::experts::rtx::dense::v41_pack_scales(&kernel, tensors.get(&names[1])?, packed_scales.buffer, stream.raw)?;
             library.cuda_stream_synchronize(stream.raw)?;
         }
         Ok(Self {
@@ -435,5 +435,13 @@ impl Drop for EngramGate<'_, '_> {
         if let Err(error) = unsafe { self.graphs.clear() } {
             tracing::error!(%error, "destroying native engram graphs");
         }
+    }
+}
+
+#[cfg(test)]
+impl EngramLayerWeights<'_> {
+    pub(crate) fn visit(&self, prefix: &str, f: &mut dyn FnMut(String, cuteafd_ffi::CuteafdDeviceBuffer)) {
+        self.tensors.visit(prefix, f);
+        f(format!("{prefix}packed_scale"), self.packed_scales.buffer);
     }
 }

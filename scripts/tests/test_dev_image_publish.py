@@ -127,7 +127,9 @@ esac
 
 
 def launch(repo, env, *args):
-    return subprocess.run(['bash', str(repo / 'scripts/build/build-dev-images.sh'), '--spark-hosts', 'rhea', *args],
+    # Leg supervision only: LAN-only seed distribution has its own tests (test_wip_seed_transfer).
+    return subprocess.run(['bash', str(repo / 'scripts/build/build-dev-images.sh'), '--spark-hosts', 'rhea',
+                           '--seed-hosts', '', *args],
                           env=env, capture_output=True, text=True, timeout=20)
 
 

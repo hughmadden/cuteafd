@@ -78,7 +78,7 @@ fn replicated_tie_seed_mode() -> Result<ReplicatedExpertTieSeedMode> {
 }
 
 impl ReplicatedGroupPlanner {
-    fn new(topology: SparkTopology) -> Result<Self> {
+    pub(crate) fn new(topology: SparkTopology) -> Result<Self> {
         Self::new_with_seed_mode(topology, replicated_tie_seed_mode()?)
     }
 
@@ -305,8 +305,8 @@ impl<'a> NativeTp4Wave<'a> {
             "invalid native TP wave capacity"
         );
         ensure!(
-            matches!(ranks, 2 | 3 | 4 | 6),
-            "native TP wave requires two, three, four or six ranks"
+            (1..=8).contains(&ranks),
+            "native TP wave requires one through eight ranks"
         );
         (capacity as usize)
             .checked_mul(ranks * V41_PARTIAL_ROW_BYTES as usize + 2 * 5120 * 2)
@@ -324,8 +324,8 @@ impl<'a> NativeTp4Wave<'a> {
         tracing::info!(mode = choice.mode.name(), reason = %choice.reason,
             "V4.1 Spark intake probe (host lane uses pinned uploads)");
         ensure!(
-            matches!(world_size, 2 | 3 | 4 | 6),
-            "native TP wave requires two, three, four or six ranks"
+            (1..=8).contains(&world_size),
+            "native TP wave requires one through eight ranks"
         );
         ensure!(
             Self::device_bytes_for(capacity, world_size)? <= available_bytes,
@@ -1036,7 +1036,7 @@ mod replicated_tests {
             let legacy = NativeTp4Wave::device_bytes(capacity).unwrap();
             assert_eq!(legacy, NativeTp4Wave::device_bytes_for(capacity, 4).unwrap());
             assert_eq!(legacy, capacity as usize * 6 * 10240);
-            for ranks in [2usize, 3, 4, 6] {
+            for ranks in 1usize..=8 {
                 let expected = capacity as usize * (ranks * 10240 + 20480);
                 assert_eq!(NativeTp4Wave::device_bytes_for(capacity, ranks).unwrap(), expected);
                 assert!(expected >= capacity as usize * ranks * 10240);
@@ -1046,7 +1046,7 @@ mod replicated_tests {
                 NativeTp4Wave::device_bytes_for(capacity, 6).unwrap() > legacy
             );
         }
-        for (capacity, ranks) in [(0u32, 6usize), (4097, 6), (80, 0), (80, 1), (80, 5), (80, 8)] {
+        for (capacity, ranks) in [(0u32, 6usize), (4097, 6), (80, 0), (80, 9)] {
             assert!(NativeTp4Wave::device_bytes_for(capacity, ranks).is_err(), "{capacity}/{ranks}");
         }
     }

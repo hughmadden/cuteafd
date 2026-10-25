@@ -507,3 +507,27 @@ impl<'library> DsparkWeights<'library> {
     }
 
 }
+
+impl DsparkWeights<'_> {
+    /// Frees the experts' raw scale images kept for recorded plane packs.
+    pub(crate) fn release_raw_scales(&self) {
+        if let ExpertStages::Full(stages) = &self.experts {
+            for stage in stages { stage.release_raw_scales(); }
+        }
+    }
+}
+
+#[cfg(test)]
+impl DsparkWeights<'_> {
+    pub(crate) fn visit(&self, f: &mut dyn FnMut(String, cuteafd_ffi::CuteafdDeviceBuffer)) {
+        self.auxiliary.visit("dspark.", f);
+        for (i, s) in self.shared_scales.iter().enumerate() { f(format!("dspark.shared_scale{i}"), s.buffer); }
+        for (i, s) in self.grouped_output_scales.iter().enumerate() { f(format!("dspark.grouped_scale{i}"), s.buffer); }
+        for (i, s) in self.projection_scales.iter().enumerate() { f(format!("dspark.projection_scale{i}"), s.buffer); }
+        if let ExpertStages::Full(stages) = &self.experts {
+            for (stage, w) in stages.iter().enumerate() {
+                for (plane, b) in w.buffers.iter().enumerate() { f(format!("dspark.experts{stage}.plane{plane}"), b.buffer); }
+            }
+        }
+    }
+}

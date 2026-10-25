@@ -5,21 +5,31 @@ source "$repo_root/scripts/lib/release-common.sh"
 source "$repo_root/scripts/lib/build-supervision.sh"
 usage() {
   printf '%s\n' 'Usage: build-dev-images.sh [--config FILE] [--spark-hosts HOST,...]' \
-    '  [--seed-hosts HOST,...] [--role coordinator|expert|both] [--publish] [--dry-run]' \
+    '  [--seed-hosts HOST,...] [--export-hosts HOST,...] [--role coordinator|expert|both]' \
+    '  [--distribute-only] [--publish] [--dry-run]' \
     'Build toolchain-only dev images natively, independent of SparkInfer pins.' \
     '--publish uses only ghcr.io/tpurtell/cuteafd-dev:tc-HASH{-amd64,-arm64} and latest.' \
-    'Publishing never retags local development defaults. Use rhea or kakapo as the Spark seed.' \
-    '--seed-hosts: build-only Spark seeds that also receive the Spark image (default kakapo; empty for none).' \
+    'Publishing never retags local development defaults. Use rhea or a LAN-only seed as the Spark seed.' \
+    '--seed-hosts: build-only Spark seeds that also receive the Spark image' \
+    '  (default: the LAN-only seeds, kakapo,cassowary; empty for none).' \
+    '--export-hosts: remote coordinator export hosts that receive the coordinator image' \
+    '  (default: the config'"'"'s CUTEAFD_EXPORT_HOST, reached at CUTEAFD_EXPORT_HOST_ADDR; empty for none).' \
+    '  Its previous image stays under :prev-ID; a running container keeps its image.' \
+    '--distribute-only: build nothing and retag nothing here or on the seed; copy this toolchain'"'"'s' \
+    '  existing images to receivers whose copy differs (layer list). A host that already matches is skipped.' \
     'A copy to or from a host without RoCE goes zstd-compressed over AES-GCM ssh on its LAN address.' \
     'Both architectures build concurrently; CUTEAFD_DEV_IMAGE_SEQUENTIAL=1 restores coordinator-first order.' \
     'Hold build.lock and the Spark seed host lock around actual builds.'
 }
-config="$repo_root/cuteafd.config"; hosts_csv=; seed_hosts_csv=kakapo; role=both; dry_run=0; publish=0
+config="$repo_root/cuteafd.config"; hosts_csv=; role=both; dry_run=0; publish=0; distribute_only=0
+seed_hosts_csv="$(IFS=,; echo "${release_lan_seed_hosts[*]}")"; export_hosts_csv=__config__
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --config) config="${2:?}"; shift 2 ;;
     --spark-hosts) hosts_csv="${2:?}"; shift 2 ;;
     --seed-hosts) seed_hosts_csv="${2-}"; shift 2 ;;
+    --export-hosts) export_hosts_csv="${2-}"; shift 2 ;;
+    --distribute-only) distribute_only=1; shift ;;
     --role) role="${2:?}"; shift 2 ;;
     --publish) publish=1; shift ;;
     --dry-run) dry_run=1; shift ;;
@@ -29,6 +39,7 @@ while [[ $# -gt 0 ]]; do
 done
 case "$role" in coordinator|expert|both) ;; *) release_die 'invalid --role' ;; esac
 (( ! publish )) || [[ "$role" == both ]] || release_die 'publishing requires both architectures'
+(( ! publish || ! distribute_only )) || release_die '--distribute-only never publishes'
 sequential="${CUTEAFD_DEV_IMAGE_SEQUENTIAL:-0}"
 [[ "$sequential" == 0 || "$sequential" == 1 ]] || release_die 'CUTEAFD_DEV_IMAGE_SEQUENTIAL must be 0 or 1'
 release_load_config "$config"
@@ -55,6 +66,22 @@ else
 fi
 seed_only_hosts=()
 [[ -z "$seed_hosts_csv" ]] || IFS=, read -ra seed_only_hosts <<<"$seed_hosts_csv"
+# Remote coordinator export hosts (scripts/build/export-remote.sh) need the exact
+# coordinator dev image: they admit an export only when its layer list matches.
+[[ "$export_hosts_csv" != __config__ ]] || export_hosts_csv="${CUTEAFD_EXPORT_HOST:-}"
+export_hosts=()
+[[ -z "$export_hosts_csv" ]] || IFS=, read -ra export_hosts <<<"$export_hosts_csv"
+((${#export_hosts[@]} <= 1)) || [[ -z "${CUTEAFD_EXPORT_HOST_ADDR:-}" ]] ||
+  release_die 'CUTEAFD_EXPORT_HOST_ADDR names one host; pass one --export-hosts entry with it'
+# export_ssh HOST ARGS...: the remote export's own route (its address under HOST's
+# ssh configuration and host key), as scripts/build/export-remote.sh connects.
+export_ssh() {
+  local host="$1" addr="${CUTEAFD_EXPORT_HOST_ADDR:-}"
+  shift
+  local -a route=()
+  [[ -z "$addr" || "$addr" == "$host" ]] || route=(-o "HostName=$addr" -o "HostKeyAlias=$host")
+  release_ssh -o ConnectTimeout=10 ${route[@]+"${route[@]}"} "$host" "$@"
+}
 if [[ "$role" != coordinator ]]; then
   ((${#spark_hosts[@]})) || release_die 'no Spark build host'
   seed_host="${spark_hosts[0]}"
@@ -64,23 +91,59 @@ if [[ "$role" != coordinator ]]; then
   done
 fi
 printf 'Toolchain: tc-%s\n  amd64: %s\n  arm64: %s\n' "$hash" "$coordinator_tag" "$spark_tag"
+((publish)) || [[ "$role" == expert ]] || ((${#export_hosts[@]} == 0)) ||
+  printf 'Export hosts receive the coordinator image: %s\n' "${export_hosts[*]}"
+((!distribute_only)) || printf 'Distribute only: no build, no retag on this host or the seed.\n'
 ((!publish)) || printf '  index: %s:tc-%s\n  latest: %s:latest\n' "$package" "$hash" "$package"
-case "$role:$sequential" in
-  both:0) printf 'Plan: coordinator (amd64) and expert (arm64) legs build concurrently; checks/retag/distribution/publish wait for both.\n' ;;
-  both:1) printf 'Plan: sequential: coordinator then expert (CUTEAFD_DEV_IMAGE_SEQUENTIAL=1); shared steps wait for both.\n' ;;
+case "$distribute_only:$role:$sequential" in
+  1:*) printf 'Plan: distribute existing %s image(s) only.\n' "$role" ;;
+  0:both:0) printf 'Plan: coordinator (amd64) and expert (arm64) legs build concurrently; checks/retag/distribution/publish wait for both.\n' ;;
+  0:both:1) printf 'Plan: sequential: coordinator then expert (CUTEAFD_DEV_IMAGE_SEQUENTIAL=1); shared steps wait for both.\n' ;;
   *) printf 'Plan: %s leg only.\n' "$role" ;;
 esac
 [[ "$role" == coordinator ]] || printf 'Spark seed: %s; receives the image: %s\n' "$seed_host" "${spark_hosts[*]:1}"
 if ((dry_run)); then printf 'Dry run: nothing built or pushed.\n'; exit 0; fi
+# layers_of RUNNER IMAGE: the image's content identity (its RootFS layer list). An
+# image ID is not portable: docker save | load can give the same layers another ID.
+# Empty when the image is missing; otherwise the digest export-remote.sh compares.
+layers_of() {
+  "${@:1:$#-1}" "l=\$(docker image inspect -f '{{json .RootFS.Layers}}' '${!#}' 2>/dev/null) && printf '%s\\n' \"\$l\" | sha256sum | cut -c1-64" 2>/dev/null || true
+}
+# copy_coordinator_image HOST: this host's coordinator image to an export host,
+# skipped when its layers already match; then retagged there like a builder.
+copy_coordinator_image() {
+  local host="$1" want have
+  want="$(layers_of bash -c "$coordinator_tag")"
+  [[ -n "$want" ]] || release_die "no local $coordinator_tag to distribute"
+  have="$(layers_of export_ssh "$host" "$coordinator_tag")"
+  if [[ -n "$want" && "$want" == "$have" ]]; then
+    printf 'Export host %s already has %s\n' "$host" "$coordinator_tag"
+  else
+    printf 'Copying %s to export host %s compressed\n' "$coordinator_tag" "$host"
+    docker image save "$coordinator_tag" | zstd -T8 -3 -q |
+      export_ssh "$host" "${release_bulk_ssh_opts[@]}" "zstd -d -q | docker image load" >/dev/null
+  fi
+  export_ssh "$host" bash -s -- "$COORDINATOR_DOCKER_DEV" "$coordinator_tag" "$(repo_of "$COORDINATOR_DOCKER_DEV")" <<<"$retag_body"
+  [[ "$(layers_of export_ssh "$host" "$COORDINATOR_DOCKER_DEV")" == "$want" ]] ||
+    release_die "export host $host did not receive $coordinator_tag"
+}
 # Preserve old si-* images for campaigns, and old tc-* images before moving a local default.
+# A same-toolchain rebuild (or a refreshed receiver: docker load moves the tc- tag)
+# keeps the old image as :prev-ID, never under the tc- tag the new image now owns.
+# Builders and receivers share this; a running container keeps its image.
 retag_body='set -euo pipefail
 image="$1"; versioned="$2"; repo="$3"
+new="$(docker image inspect -f "{{.Id}}" "$versioned" 2>/dev/null || true)"
 old="$(docker image inspect -f "{{.Id}}" "$image" 2>/dev/null || true)"
-if [[ -n "$old" ]]; then
+if [[ -n "$old" && "$old" != "$new" ]]; then
   si="$(docker image inspect -f "{{index .Config.Labels \"io.cuteafd.sparkinfer.revision\"}}" "$old")"
   tc="$(docker image inspect -f "{{index .Config.Labels \"io.cuteafd.toolchain.hash\"}}" "$old")"
   [[ -z "$si" || "$si" == "<no value>" ]] || docker tag "$old" "$repo:si-${si:0:7}"
-  [[ -z "$tc" || "$tc" == "<no value>" ]] || docker tag "$old" "$repo:tc-$tc"
+  if [[ -z "$tc" || "$tc" == "<no value>" || "$repo:tc-$tc" == "$versioned" ]]; then
+    docker tag "$old" "$repo:prev-${old:7:12}"
+  else
+    docker tag "$old" "$repo:tc-$tc"
+  fi
 fi
 docker tag "$versioned" "$image"'
 check_body='set -euo pipefail
@@ -172,6 +235,29 @@ copy_spark_image() {
   release_bulk_ssh "$src" "$src_addr" "docker image save '$spark_tag' | zstd -T8 -3 -q" |
     release_bulk_ssh "$dst" "$dst_addr" 'zstd -d -q | docker image load'
 }
+# distribute_spark_image HOST: the seed's Spark image to HOST unless its layers
+# already match, then the local default retagged there.
+distribute_spark_image() {
+  local host="$1" want
+  want="$(layers_of ssh -o BatchMode=yes "$seed_host" "$spark_tag")"
+  if [[ -n "$want" && "$(layers_of ssh -o BatchMode=yes "$host" "$spark_tag")" == "$want" ]]; then
+    printf '%s already has %s\n' "$host" "$spark_tag"
+  else
+    copy_spark_image "$seed_host" "$host"
+  fi
+  ssh -o BatchMode=yes "$host" bash -s -- "$SPARK_EXPERT_DOCKER_DEV" "$spark_tag" "$(repo_of "$SPARK_EXPERT_DOCKER_DEV")" <<<"$retag_body"
+}
+if ((distribute_only)); then
+  # Nothing is built and nothing changes on this host or the seed: receivers only.
+  if [[ "$role" != coordinator ]]; then
+    for host in "${spark_hosts[@]:1}"; do distribute_spark_image "$host"; done
+  fi
+  if [[ "$role" != expert ]]; then
+    for host in ${export_hosts[@]+"${export_hosts[@]}"}; do copy_coordinator_image "$host"; done
+  fi
+  printf 'Done. Receivers hold this toolchain'"'"'s images; running containers keep theirs.\n'
+  exit 0
+fi
 case "$role" in
   both) build_supervise 'dev image build' "$leg_log_dir" "$sequential" \
     coordinator build_coordinator_dev cancel_coordinator_dev amd64.log \
@@ -185,13 +271,12 @@ esac
 if ((!publish)); then
   if [[ "$role" != expert ]]; then
     bash -c "$retag_body" _ "$COORDINATOR_DOCKER_DEV" "$coordinator_tag" "$(repo_of "$COORDINATOR_DOCKER_DEV")"
+    # Remote coordinator exports admit only a layer-identical image.
+    for host in ${export_hosts[@]+"${export_hosts[@]}"}; do copy_coordinator_image "$host"; done
   fi
   if [[ "$role" != coordinator ]]; then
     ssh -o BatchMode=yes "$seed_host" bash -s -- "$SPARK_EXPERT_DOCKER_DEV" "$spark_tag" "$(repo_of "$SPARK_EXPERT_DOCKER_DEV")" <<<"$retag_body"
-    for host in "${spark_hosts[@]:1}"; do
-      copy_spark_image "$seed_host" "$host"
-      ssh -o BatchMode=yes "$host" bash -s -- "$SPARK_EXPERT_DOCKER_DEV" "$spark_tag" "$(repo_of "$SPARK_EXPERT_DOCKER_DEV")" <<<"$retag_body"
-    done
+    for host in "${spark_hosts[@]:1}"; do distribute_spark_image "$host"; done
   fi
 fi
 if ((publish)); then

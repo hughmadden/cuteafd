@@ -90,7 +90,7 @@ fn run_case(label: &str, captured: bool, lanes: usize, injected: u32, serving: b
         1,
         1,
         embedding,
-        MimoKvCache::Int8,
+        MimoKvFormats::default(),
         MimoPrefillOutput::AllRows,
     )?);
     let fixture_head = engine.weights.head.allocations()[0].buffer;

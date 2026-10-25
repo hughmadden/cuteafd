@@ -2,6 +2,12 @@
 
 Reports from `cuteafd bench` (profiles other than the basic one run when asked). Each directory holds `report.svg`, `report.json` and the share card; `cuteafd bench publish` rebuilds this index and the root README's table.
 
+Prefill reports without `prompt_content: "realistic-v1"` used synthetic filler.
+New prefill prompts use fixed repository code, technical prose and reviewed
+agent/tool transcripts; the content change shifts prefill numbers, so these
+are not like-for-like historical comparisons. Decode and agentic-session
+workloads are unchanged.
+
 <!-- reports:begin -->
 
 ## DeepSeek V4

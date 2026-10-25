@@ -90,7 +90,8 @@ def test_the_relocated_cargo_home_matches_the_unwritable_image_default():
 def test_both_release_legs_and_the_artifact_compiler_carry_the_group():
     text = BUILD.read_text(encoding="utf-8")
     # The coordinator leg uses the rendered array exactly once...
-    assert text.count('"${release_build_user_args[@]}" \\') == 1
+    # (in the option array both artifact phases share).
+    assert text.count('  "${release_build_user_args[@]}"\n') == 1
     assert 'release_build_container_user_args_render "$release_build_root"' in text
     # ...and the Spark leg computes the group inside the remote heredoc, where
     # `id` reports the Spark's own user (raptor is 1000, the Sparks 1001).
@@ -102,7 +103,7 @@ def test_both_release_legs_and_the_artifact_compiler_carry_the_group():
                   '-e "TORCHINDUCTOR_CACHE_DIR=$container_home/torchinductor"',
                   '-e "CARGO_HOME=$container_home/cargo"'):
         assert token in remote, token
-    # Both the idle probe and the export run as the invoking uid/gid.
+    # The idle probe and the artifact phases' shared options run as the invoking uid/gid.
     assert remote.count('--user "$(id -u):$(id -g)"') == 2
     assert 'container_home="$release_build_root/container-home"' in remote
     # The container, not the caller, creates the writable roots: the bind-mounted
@@ -165,3 +166,37 @@ def test_nvfp4_verifier_writes_the_reference_as_the_calling_user():
     assert '--user "$(id -u):$(id -g)"' in text
     for key in ("HOME=", "USER=", "LOGNAME=", "TORCHINDUCTOR_CACHE_DIR=", "CARGO_HOME="):
         assert f'-e "{key}$container_home' in text or f'-e "{key}$(id -un)"' in text, key
+
+
+def dev_shell_lock_mounts(home: Path, lock_dir: str | None) -> list[str]:
+    """cuteafd-dev.sh's build-slot block, run as written: its docker -v slot mounts."""
+    text = DEV_SHELL.read_text(encoding="utf-8")
+    start = text.index("# Host build slots")
+    block = text[start:text.index('if [[ -n "${CUTEAFD_DEV_TARGET_DIR:-}" ]]', start)]
+    env = {key: value for key, value in os.environ.items() if key != "CUTEAFD_LOCK_DIR"}
+    env.update(HOME=str(home), CUTEAFD_BUILD_SLOTS="2")
+    if lock_dir is not None:
+        env["CUTEAFD_LOCK_DIR"] = lock_dir
+    body = "set -euo pipefail\ndocker_args=()\n" + block + '\nprintf "%s\\n" "${docker_args[@]}"\n'
+    result = subprocess.run(["bash", "-c", body], env=env, capture_output=True, text=True, timeout=60)
+    assert result.returncode == 0, result.stderr
+    args = result.stdout.splitlines()
+    return [args[i + 1] for i, token in enumerate(args[:-1]) if token == "-v"]
+
+
+def test_dev_shell_build_slots_follow_the_lock_directory(tmp_path):
+    """The container compiles under the host's real build-slot inodes: HOME's by
+    default, CUTEAFD_LOCK_DIR's when a deployment keeps its locks elsewhere."""
+    home = tmp_path / "home"
+    inside = "/tmp/cuteafd-build-locks"
+    assert dev_shell_lock_mounts(home, None) == [
+        f"{home}/.cache/cuteafd/build.lock:{inside}/build.lock",
+        f"{home}/.cache/cuteafd/build.lock.1:{inside}/build.lock.1",
+    ]
+    shared, other_home = tmp_path / "shared-locks", tmp_path / "other-home"
+    assert dev_shell_lock_mounts(other_home, str(shared)) == [
+        f"{shared}/build.lock:{inside}/build.lock",
+        f"{shared}/build.lock.1:{inside}/build.lock.1",
+    ]
+    assert (shared / "build.lock").is_file() and (shared / "build.lock.1").is_file()
+    assert not (other_home / ".cache/cuteafd/build.lock").exists()  # no private slot beside HOME

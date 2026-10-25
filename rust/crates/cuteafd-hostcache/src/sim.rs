@@ -159,8 +159,8 @@ impl Addressing {
     }
 
     /// Group logically-ordered pages per compressor, preserving logical order within each bank.
-    fn group_pages(&self, pages: &[DevicePageId]) -> [Vec<DevicePage>; COMPRESSORS] {
-        let mut by_compressor: [Vec<DevicePage>; COMPRESSORS] = std::array::from_fn(|_| Vec::new());
+    fn group_pages(&self, pages: &[DevicePageId]) -> [Vec<DevicePage>; crate::PAGE_BANKS] {
+        let mut by_compressor: [Vec<DevicePage>; crate::PAGE_BANKS] = std::array::from_fn(|_| Vec::new());
         for &id in pages {
             by_compressor[id.compressor as usize].push(DevicePage {
                 id,

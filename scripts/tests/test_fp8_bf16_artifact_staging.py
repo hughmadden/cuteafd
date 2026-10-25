@@ -62,6 +62,8 @@ def test_qwen_tp5_exact_slice_has_no_padding():
 
 
 def test_mxfp4_exact_k32_widths_reuse_existing_tail_abi():
+    assert package_tool.exact_widths(2048, 3) == [768, 640, 640]
+    assert package_tool.exact_widths(2048, 3, 32) == [704, 672, 672]
     assert package_tool.exact_widths(2048, 6, 32) == [352, 352, 352, 352, 320, 320]
     assert package_tool.exact_widths(2048, 6, 16) == []
     # Importing geometry is CPU-only; no exporter or CUDA context is involved.
@@ -83,6 +85,13 @@ def test_mxfp4_exact_k32_widths_reuse_existing_tail_abi():
         assert geometry.slice == width
     with pytest.raises(SystemExit, match="no rank"):
         package_tool.layout_geometry(base, "tp6-w336")
+    for width in (768, 640, 704, 672):
+        tp, geometry = package_tool.layout_geometry(base, f"tp3-w{width}")
+        assert tp == 3
+        assert geometry.slice == width
+    for width in (656, 688, 736):
+        with pytest.raises(SystemExit, match="no rank"):
+            package_tool.layout_geometry(base, f"tp3-w{width}")
 
 
 @pytest.mark.parametrize("counts,expected", [("", ""), ("5", "--layouts;tp5"),
@@ -100,7 +109,7 @@ def test_cmake_requested_counts_preserve_defaults_and_select_both_input_forms(tm
     assert source.count('${exact_slices} ${requested_layouts}') >= 2
 
 
-def test_step5_nvfp4_has_one_package_not_an_a4_alias(tmp_path):
+def test_step5_nvfp4_keeps_exporter_geometry_and_canonical_a4_package(tmp_path):
     source = (REPO / "native/cmake/shared/fp8_moe.cmake").read_text()
     body = source.split("set(CUTEAFD_FP8_MOE_ENTRIES)\n", 1)[1].split(
         "foreach(entry IN LISTS CUTEAFD_FP8_MOE_ENTRIES)", 1)[0]
@@ -111,6 +120,9 @@ def test_step5_nvfp4_has_one_package_not_an_a4_alias(tmp_path):
     assert result.returncode == 0, result.stderr
     assert "ENTRIES=step5:nvfp4;glm:nvfp4;glm:nvfp4a4" in result.stderr
     assert "step5_nvfp4a4" not in TOOL.read_text()
+    branch = source.split('elseif(entry STREQUAL "step5:nvfp4")', 1)[1].split("elseif(", 1)[0]
+    assert 'set(geometry "step5_nvfp4")' in branch
+    assert '/fp8/fp8-step5-nvfp4a4")' in branch
 
 
 def test_step5_bf16_alone_enables_package_exporter(tmp_path):
@@ -260,7 +272,9 @@ static void mock_launch(void** args, int) {{
         [5 | (5 if geometry == "step5_bf16" else 4 if "nvfp4" in geometry else 1) << 8 | 1 << 16 | 1 << 24, 6144, 1024, 384, 8, 2048, 2, 1, 0, 1, 80, 0, 0, 0, 0, 0])
     (tmp_path / "bridge.cc").write_text(source)
     library = tmp_path / "bridge.so"
-    compiled = subprocess.run([compiler, "-shared", "-fPIC", "-std=c++17", "-pthread",
+    # PyTorch may have loaded libcudart globally in this worker. Keep this
+    # CPU fixture's CUDA calls bound to its own mocks.
+    compiled = subprocess.run([compiler, "-shared", "-fPIC", "-Wl,-Bsymbolic-functions", "-std=c++17", "-pthread",
                                f"-I{tmp_path}", str(tmp_path / "bridge.cc"), "-o", str(library)],
                               text=True, capture_output=True, timeout=30)
     assert compiled.returncode == 0, compiled.stderr
@@ -351,7 +365,7 @@ def stage(tmp_path: Path, kind: str, *, requested="mimo", role="expert", revisio
         write_package(native / name, input_kind="bf16", role=owner, weights="nvfp4")
     write_package(native / "fp8-step5", input_kind=wire, role=owner)
     write_package(native / "fp8-step5-bf16-weights", input_kind="bf16", role=owner, weights="bf16")
-    write_package(native / "fp8-step5-nvfp4", input_kind="bf16", role=owner, weights="nvfp4")
+    write_package(native / "fp8-step5-nvfp4a4", input_kind="bf16", role=owner, weights="nvfp4")
     if role == "coordinator":
         write_package(native / "fp8-qwen4", input_kind=wire, role=owner)
     write_package(native / "fp8-mimo-bf16", input_kind="bf16", revision=revision)
@@ -377,7 +391,7 @@ def test_step5_stages_native_weights_and_one_nvfp4_package(tmp_path, kind, role)
                            families="step5:fp8;step5:bf16;step5:nvfp4")
     assert result.returncode == 0, result.stderr
     assert {p.name for p in output.iterdir()} == {
-        "fp8-step5", "fp8-step5-bf16-weights", "fp8-step5-nvfp4", "fp8-mimo-bf16"}
+        "fp8-step5", "fp8-step5-bf16-weights", "fp8-step5-nvfp4a4", "fp8-mimo-bf16"}
     package_tool.verify(output / "fp8-step5-bf16-weights", revision=REVISION,
                         role=role, input_kind="bf16")
 

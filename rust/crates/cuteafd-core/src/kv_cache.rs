@@ -7,4 +7,4 @@ pub use allocator::{
     KvWriteState,
 };
 pub use backing_store::{KvBackedBlock, KvCacheBackingStore};
-pub use config::{KvCacheConfig, KvCacheDType, KvLayout, MlaKvCacheRepresentation};
+pub use config::{KvCacheConfig, KvCacheDType, KvLayout, MlaCacheFormat, MlaKvCacheRepresentation};

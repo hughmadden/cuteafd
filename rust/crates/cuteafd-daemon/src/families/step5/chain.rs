@@ -127,6 +127,7 @@ impl<'a> TargetChain<'a> {
         rows: usize,
         available: u64,
         reservations: &[u64],
+        kv_format: cuteafd_loader::families::qwen4::Qwen4KvCache,
     ) -> Result<Self> {
         let (bytes, routed) = Self::plan(programs, checkpoint, count, rows)?;
         let contract = CoordinatorContract::from_checkpoint(checkpoint)?;
@@ -157,8 +158,7 @@ impl<'a> TargetChain<'a> {
                     rows,
                     Some(rope.clone()),
                     available,
-                    &[],
-                )?)
+                    &[], kv_format)?)
             } else {
                 Attention::Sparse(CsaLayer::load(
                     device,
@@ -168,8 +168,7 @@ impl<'a> TargetChain<'a> {
                     rows,
                     Some(rope.clone()),
                     available,
-                    &[],
-                )?)
+                    &[], kv_format)?)
             };
             let routed = plan
                 .map(|p| RoutedFfn::load(device, programs, checkpoint, id, p))
@@ -602,7 +601,7 @@ mod tests {
             ModelAdmission {
                 capacity: 64,
                 compiled_capacity: u32::try_from(compiled)?,
-                endpoints: vec![SparkEndpoint {
+                endpoints: vec![SparkEndpoint { ring_depth: None,
                     capacity: 64,
                     ingress: SparkIngress::Bf16,
                 }],
@@ -765,8 +764,7 @@ mod tests {
             &[
                 cache.borrow().bytes() as u64,
                 staging.allocation_bytes() as u64,
-            ],
-        )?;
+            ], cuteafd_loader::families::qwen4::Qwen4KvCache::Bf16)?;
         let input = Allocation::new(device, 64 * H * 4)?;
         let read = |buffer, bytes| {
             let mut result = vec![0; bytes];

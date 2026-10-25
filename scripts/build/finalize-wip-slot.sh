@@ -15,6 +15,13 @@ image_id="$6"
 wip_instance="${WIP_INSTANCE:-}"
 wip_root="${WIP_ROOT:-}"
 wip_build_key="${CUTEAFD_WIP_BUILD_KEY:-}"
+# The dev image's portable content identity (scripts/lib/dev_image_content.py), computed
+# by wip.sh on the host holding the image; older callers leave it absent.
+image_content="${CUTEAFD_WIP_DEV_IMAGE_CONTENT:-}"
+[[ -z "$image_content" || "$image_content" =~ ^[0-9a-f]{64}$ ]] || {
+  echo "invalid CUTEAFD_WIP_DEV_IMAGE_CONTENT: $image_content" >&2
+  exit 2
+}
 [[ "$role" == coordinator || "$role" == spark-expert ]] || {
   echo "invalid WIP role: $role" >&2
   exit 2
@@ -135,6 +142,9 @@ metadata = {
 }
 # Build key (wip.sh: source tree + scopes + toolchain) and per-phase timings,
 # when the caller recorded them; older callers leave both absent.
+image_content = ${image_content@Q}
+if image_content:
+    metadata["base_image_content_sha256"] = image_content
 build_key = ${wip_build_key@Q}
 if build_key:
     metadata["build_key"] = build_key

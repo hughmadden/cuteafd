@@ -65,10 +65,17 @@ def jobs(scope):
         suffix = "" if heads == 48 else "_h96"
         names = [f"{op}{suffix}_m{rows}" for rows in (64, 4096)
                  for op in ("mla_producer", "mla_output")]
-        names += [f"dense_mla_{mode}{suffix}_m{rows}"
+        names += [f"mla_producer{suffix}_fp8_m{rows}" for rows in (64, 4096)]
+        names += [f"dense_mla_{mode}{suffix}{cache}_m{rows}"
+                  for cache in ("", "_fp8")
                   for mode, rows in (("decode", 64), ("verify", 64), ("extend", 4096))]
         result.append((f"kimi-mla-h{heads}", "export_b12x_dsv4_aot.py",
                        ["--geometry", "kimik3", "--only", ",".join(names)]))
+    result.append(("mla-draft-h64", "export_b12x_dsv4_aot.py",
+                   ["--geometry", "kimik3", "--only", ",".join([
+                       "mla_draft_producer_m64", "mla_draft_producer_fp8_m64", "mla_draft_output_m64",
+                       "mla_draft_attention_full_m64", "mla_draft_attention_w4096_m64",
+                       "mla_draft_attention_full_fp8_m64", "mla_draft_attention_w4096_fp8_m64"])]))
     result.append(("kimi-residual", "export_b12x_dsv4_aot.py",
                    ["--geometry", "kimik3", "--only", ",".join([
                        "attn_res_c1_keep_append", "attn_res_c2_add_append",
@@ -79,10 +86,16 @@ def jobs(scope):
     result.append(("kimi-situ", "export_b12x_dsv4_aot.py",
                    ["--geometry", "kimik3", "--only", ",".join(
                        f"situ_i{width}" for width in (3072, 6144, 16896, 33792))]))
+    result.append(("kimi-ffn", "export_b12x_dsv4_aot.py",
+                   ["--geometry", "kimik3", "--only", ",".join(
+                       f"ffn_{op}_i{width}" for width in (3072, 6144, 16896, 33792)
+                       for op in ("gate_up", "down")) + "," + ",".join(
+                       f"ffn_gate_up_i{width}_comp" for width in (3072, 6144, 16896, 33792))]))
     result.append(("kimi-routing", "export_b12x_dsv4_aot.py",
                    ["--geometry", "kimik3", "--only", "router_scores,expert_input_quant"]))
     if scope == "suspects":
         return result
+    result.append(("kimi-split", "export_b12x_kimi_split_aot.py", []))
     result.extend((geometry, "export_b12x_dsv4_aot.py", ["--geometry", geometry])
                   for geometry in GEOMETRIES)
     for family in ("dsv4f", "dsv4p"):
@@ -132,6 +145,11 @@ def jobs(scope):
     result.append(("routed-mimop-tp6", "package_fp8_moe_aot.py",
                    ["--geometry", "mimop", "--capacities", CAPACITIES,
                     "--layouts", "tp6", "--exact-slices"]))
+    for geometry, bits in (("qwen4", "4,5"), ("glm", "4,5"), ("glmf", "3,4"),
+                           ("dsv4f", "2,3"), ("v41", "2,3"), ("v41", "3,4"), ("v41", "4,5")):
+        result.append((f"exl3-compact-{geometry}-k{bits.replace(',', '')}", "package_exl3_aot.py",
+                       ["--geometry", geometry, "--capacities", CAPACITIES, "--bits", bits,
+                        "--compact-companions"]))
     result.extend((f"exl3-{geometry}", "package_exl3_aot.py",
                    ["--geometry", geometry, "--capacities", CAPACITIES])
                   for geometry in EXL3_GEOMETRIES)
@@ -151,19 +169,51 @@ def jobs(scope):
                    ["--geometry", geometry, "--capacities", CAPACITIES])
                   for geometry in EXL3_GEOMETRIES)
     result.extend([
+        ("kimi-k6-dense", "export_b12x_dsv4_aot.py", ["--geometry", "kimi_k6_dense,kimi_split"]),
         ("exlr8", "export_b12x_dsv4_aot.py", ["--geometry", "exlr8"]),
+        ("glm-stage", "export_b12x_dsv4_aot.py", ["--geometry", "glm_stage"]),
+        ("glm2-stage", "export_b12x_dsv4_aot.py", ["--geometry", "glm2_stage"]),
         ("exlr8-dense-trellis", "export_b12x_dsv4_aot.py",
          ["--geometry", "exlr8_dense", "--only",
           "trellis_q_b,trellis_o,trellis_gate_up,trellis_down"]),
+        ("exlr8-dense-trellis-tp2", "export_b12x_dsv4_aot.py",
+         ["--geometry", "exlr8_dense", "--only",
+          "trellis_q_b_tp2,trellis_o_tp2,trellis_gate_up_tp2,trellis_down_tp2"]),
+        ("exlr8-dense-trellis-bf16", "export_b12x_dsv4_aot.py",
+         ["--geometry", "exlr8_dense", "--only", ",".join(
+             f"trellis_{name}{tp}_bf16" for tp in ("", "_tp2")
+             for name in ("q_b", "o", "gate_up", "down"))]),
         ("exlr8-dense-mxfp8", "export_b12x_dsv4_aot.py",
          ["--geometry", "exlr8_dense", "--only",
           "mxfp8_q_a,mxfp8_kv_a,mxfp8_index_q,mxfp8_index_k"]),
         ("exlr8-dense-int4", "export_b12x_dsv4_aot.py",
          ["--geometry", "exlr8_dense", "--only", "int4_q_b,int4_o"]),
+        ("exlr8-dense-int4-tp2", "export_b12x_dsv4_aot.py",
+         ["--geometry", "exlr8_dense", "--only", "int4_q_b_tp2,int4_o_tp2"]),
         ("exlr8-dense-fp8-row", "export_b12x_dsv4_aot.py",
          ["--geometry", "exlr8_dense", "--only", "fp8_row_lm_head,fp8_row_embedding"]),
+        ("exlr8-dense-unpack", "export_b12x_dsv4_aot.py",
+         ["--geometry", "exlr8_dense", "--only", ",".join(
+             f"unpack_{name}{tp}" for tp in ("", "_tp2")
+             for name in ("q_b", "o", "gate_up", "down"))]),
+        ("exlr8-dense-prefill", "export_b12x_dsv4_aot.py",
+         ["--geometry", "exlr8_dense", "--only", ",".join(
+             f"prefill_{name}{tp}" for tp in ("", "_tp2")
+             for name in ("q_b", "o", "gate_up", "down"))]),
+        ("exlr8-dense-transforms", "export_b12x_dsv4_aot.py",
+         ["--geometry", "exlr8_dense", "--only", ",".join(
+             [f"trellis_input_k{k}_{dt}" for k in (2048, 6144, 8192, 12288, 16384)
+              for dt in ("f16", "bf16")]
+             + [f"trellis_output_n{n}" for n in (6144, 8192, 12288, 16384)])]),
+        ("exlr8-dense-glue", "export_b12x_dsv4_aot.py",
+         ["--geometry", "exlr8_dense", "--only", ",".join(
+             [f"swiglu_split_i{i}" for i in (12288, 6144)]
+             + [f"f32_narrow_pack_n{n}_p{p}" for n, p in
+                ((2048, 2624), (576, 2624), (128, 160), (32, 160))]
+             + ["bf16_index_weights"])]),
         ("audio", "export_b12x_audio_aot.py", ["--capability", "120"]),
         ("vision-attention", "export_b12x_vision_attention_aot.py", ["--capability", "120"]),
+        ("steer-rows", "export_b12x_steer_rows_aot.py", ["--capability", "120"]),
     ])
     return result
 
@@ -237,35 +287,56 @@ def _export_exl3(extra, output):
     capacities = (package.package_capacities(geometry, requested) if hasattr(package, "package_capacities")
                   else sorted({int(item) for item in requested.split(",")}))
     bits = tuple(int(item) for item in extra[extra.index("--bits") + 1].split(",")) if "--bits" in extra else (3, 4)
-    for profile, width, experts, topk, dtype, _ in package.profiles_for_role("coordinator", geometry):
+    compact = "--compact-companions" in extra
+    role = extra[extra.index("--role") + 1] if "--role" in extra else "coordinator"
+    if compact:
+        if len(bits) != 2:
+            raise ValueError("compact companions require two-tier Spark exports")
+        role = "spark"
+        profiles = package.compact_profiles(geometry, package.build_profiles(role, geometry))
+    else:
+        profiles = package.profiles_for_role(role, geometry)
+    for profile, width, experts, topk, dtype, _ in profiles:
         for rows in capacities:
-            options = {"hidden": package.GEOMETRIES[geometry][0], "compile_only": True}
-            if getattr(package, "activation", lambda _: "silu")(geometry) != "silu":
+            options = {"compile_only": True}
+            if compact:
+                options["compact_weights"] = True
+            tile = (64, 128, 64, 128) if compact else package.decode_tile(geometry, width, rows)
+            if tile is not None:
+                options["tile"] = tile
+            if geometry != "v41":
+                options["hidden"] = package.GEOMETRIES[geometry][0]
+            if package.activation(geometry) != "silu":
                 options["activation"] = package.activation(geometry)
             block = package.route_block(geometry, rows)
-            if len(bits) == 2 and package.warp_specialized(geometry, "coordinator", width, rows):
-                block = 64
+            compact_ws = compact and len(bits) == 2 and package.compact_warp_specialized(
+                geometry, role, width, rows)
+            ws = compact_ws or (len(bits) == 2 and tile is None
+                                and (role != "coordinator" or bits == (4, 5))
+                                and package.warp_specialized(geometry, role, width, rows))
+            if ws:
+                block = 32 if compact_ws else 64
                 options["warp_specialized"] = True
-                if package.wire_input(geometry, "coordinator", width, rows):
+                if package.wire_input(geometry, role, width, rows):
                     options["wire_input"] = True
-                stages = package.ws_input_stages(geometry, "coordinator", width, rows)
+                stages = package.ws_input_stages(geometry, role, width, rows)
                 if stages is not None:
                     options["ws_input_stages"] = stages
-                if package.ws_dynamic_tiles(geometry, "coordinator", width, rows):
+                if package.ws_dynamic_tiles(geometry, role, width, rows):
                     options["ws_dynamic_tiles"] = True
-                tile = package.ws_tile(geometry, "coordinator", width, rows)
-                if tile is not None:
-                    options["tile"] = tile
-            elif len(bits) == 2 and package.fused_input_rotation(geometry, "coordinator", width, rows):
+                policy_tile = package.ws_tile(geometry, role, width, rows)
+                if policy_tile is not None:
+                    options["tile"] = policy_tile
+            elif len(bits) == 2 and tile is None and package.fused_input_rotation(geometry, role, width, rows):
                 options["fused_input_rotation"] = True
             elif len(bits) == 2 and package.token_major_rotation(geometry, rows):
                 options["token_major_rotation"] = True
-            # The package pins its decode capacities to the canonical tile (#309);
-            # compare the geometry that ships, not the planner's widened default.
-            tile = package.decode_tile(geometry, width, rows)
-            if tile is not None:
-                options["tile"] = tile
-            options.update(route_block=block, swiglu_limit=package.swiglu_limit(geometry))
+            if block != 8:
+                options["route_block"] = block
+            if (limit := package.swiglu_limit(geometry)) != 10.0:
+                options["swiglu_limit"] = limit
+            if (schedule := package.default_decode_schedule(geometry, role, profile, rows, list(bits))) is not None:
+                options["decode_schedule"] = schedule
             export(output / profile / f"m{rows}", width, experts, rows, bits, "auto", topk, dtype, **options)
 
 
@@ -317,7 +388,8 @@ def worker(payload):
         export_exl3_routes(payload["args"], output)
     else:
         sys.argv = [str(path), "--output-dir", str(output), *payload["args"]]
-        if payload["exporter"] in ("export_b12x_audio_aot.py", "export_b12x_vision_attention_aot.py"):
+        if payload["exporter"] in ("export_b12x_audio_aot.py", "export_b12x_vision_attention_aot.py",
+                                  "export_b12x_steer_rows_aot.py"):
             # Standalone exporters initialize a one-SM offline target themselves.
             # Retain this worker's synthetic target so the comparison is meaningful.
             from b12x._lib import compile_pool
@@ -497,6 +569,8 @@ def parse_sms(value):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--sms", type=parse_sms, default=(188, 170))
+    parser.add_argument("--role", choices=("coordinator", "spark"), default="coordinator",
+                        help="role for non-compact EXL3 expert groups")
     parser.add_argument("--scope", choices=("suspects", "all"), default="all")
     parser.add_argument("--groups", help="comma-separated job names; --list prints available names")
     parser.add_argument("--list", action="store_true")
@@ -522,6 +596,9 @@ def main():
         if unknown:
             parser.error(f"unknown groups: {sorted(unknown)}")
         selected_jobs = [job for job in selected_jobs if job[0] in selected]
+    selected_jobs = [(name, exporter, [*extra, "--role", args.role]
+                      if exporter == "package_exl3_aot.py" else extra)
+                     for name, exporter, extra in selected_jobs]
     output = args.output_dir.expanduser().resolve()
     load_file("cuteafd_build_filesystem", ROOT / "scripts/build/assert-build-filesystem.py").check_path(str(output))
     output.mkdir(parents=True, exist_ok=True)

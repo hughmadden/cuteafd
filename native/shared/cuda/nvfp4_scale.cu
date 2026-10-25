@@ -3,6 +3,7 @@
 //! Kept independent of the Spark-only b12x AOT translation unit so the
 //! coordinator can re-lay checkpoint scales for its resident experts.
 #include "common.h"
+#include "expert_pack_layout.h"
 
 #include <cstdint>
 #include <limits>
@@ -34,8 +35,7 @@ __global__ void swizzle_nvfp4_scale_kernel(const uint8_t* __restrict__ source,
   if (row < rows && column < cols) {
     value = source[row * cols + column];
   }
-  const size_t offset = (row / 128) * (columns_padded * 128) + (column / 4) * 512 +
-                        (row % 32) * 16 + ((row / 32) % 4) * 4 + (column % 4);
+  const size_t offset = cuteafd_nvfp4_scale_offset(row, column, columns_padded);
   destination[offset] = value;
 }
 
@@ -61,8 +61,7 @@ __global__ void pad_nvfp4_plane(const uint8_t* source, uint8_t* destination,
   const size_t source_row = Fc1 ? half_row + (row / kernel_n) * source_n : row;
   const bool valid = (!Fc1 || half_row < source_n) && col < source_cols;
   const size_t offset = Scale
-      ? (row / 128) * (cols * 128) + (col / 4) * 512 +
-            (row % 32) * 16 + ((row / 32) % 4) * 4 + col % 4
+      ? cuteafd_nvfp4_scale_offset(row, col, cols)
       : index;
   destination[offset] = valid ? source[source_row * source_cols + col] : 0;
 }

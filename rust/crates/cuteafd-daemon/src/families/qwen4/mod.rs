@@ -60,11 +60,20 @@ pub(crate) struct EngineArgs {
     /// Serving graph modes, set before weight/KV admission; diagnostics stay lazy.
     #[arg(skip)]
     pub planner_graph_modes: Option<(usize, bool)>,
+    /// Resolve the serving host quota once the final pool and context are known.
+    #[arg(skip)]
+    pub planner_host_prefix: Option<(crate::shared::prefix::PrefixArgs, usize)>,
     /// Sequences with GDN/PLE state (about 115 MiB each).
     #[arg(long, default_value_t = 8)]
     pub slots: usize,
     #[arg(long, default_value_t = 4096)]
     pub prefill_rows: usize,
+    /// Units in flight on the one Spark transport (one keeps the legacy path).
+    #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u8).range(1..=4))]
+    pub prefill_waves: u8,
+    /// Diagnostic unit cuts, including N=1, without changing the span size.
+    #[arg(long)]
+    pub prefill_units: Option<usize>,
     /// Admit every prefill row's logits at startup for fidelity probes.
     #[arg(long)]
     pub full_prefill_logits: bool,
@@ -141,10 +150,13 @@ pub(crate) struct EngineArgs {
 pub(crate) struct GoldenArgs {
     #[command(flatten)]
     pub engine: EngineArgs,
-    /// Directory with tokens.bin, layerNN.bin and logits.bin from
-    /// python/reference/families/qwen4/golden.py.
+    /// Directory with tokens.bin, optional layerNN.bin and logits.bin from
+    /// python/reference/families/qwen4/golden.py, or a published shared fidelity set.
     #[arg(long)]
     pub golden: PathBuf,
+    /// One window from the published shared fidelity quick subset (otherwise all eight).
+    #[arg(long, requires_all = ["nll", "save_logits"])]
+    pub window: Option<String>,
     /// Prefill only the first N tokens, then feed the rest through decode
     /// steps of --step-rows rows (teacher-forced), comparing their rows.
     #[arg(long)]
@@ -158,9 +170,9 @@ pub(crate) struct GoldenArgs {
     /// Score every prefill row's logits against the golden (mean NLL, top-1).
     #[arg(long)]
     pub nll: bool,
-    /// Save tokens.bin and F32 logits.bin for a reference run: with --nll every prefill row,
-    /// with --prefill N only the decode/verify rows (positions N.., tokens.bin from N), so two
-    /// runs compare exactly the rows the decode path produced.
+    /// Save engine logits even without a reference logits.bin: with --nll every prefill row,
+    /// otherwise only decode/verify rows after --prefill N. Shared fidelity sets instead write
+    /// scored Probe rows, per-window metrics and fidelity.json to a new directory.
     #[arg(long)]
     pub save_logits: Option<PathBuf>,
     /// After the comparison, time this many greedy single-row decode steps.
@@ -220,6 +232,25 @@ pub(crate) struct GoldenArgs {
     pub resume_repeat: usize,
 }
 
+impl EngineArgs {
+    fn prefill_shape(&self) -> Result<Option<cuteafd_loader::serving_capacity::PrefillShape>> {
+        if self.prefill_units.is_none() && self.prefill_waves == 1 { return Ok(None); }
+        ensure!(self.split_device.is_none(), "Qwen prefill units do not admit dual-owner hop slots");
+        ensure!(self.peers.is_some() || self.shared_only, "Qwen prefill units need Spark experts or shared-only diagnostics");
+        let shape = cuteafd_loader::serving_capacity::PrefillShape {
+            unit_rows: self.prefill_units.unwrap_or(self.prefill_rows) as u64, waves: u64::from(self.prefill_waves),
+        }.validate()?;
+        ensure!(shape.waves <= 2, "Qwen mapped PLE gathers admit at most two prefill waves");
+        ensure!(self.prefill_rows <= 8192, "Qwen prefill span exceeds 8192 rows");
+        Ok(Some(shape))
+    }
+
+    /// Per-wave tables, PLE gathers and Spark workers never hold the whole span.
+    fn prefill_wave_rows(&self) -> usize {
+        self.prefill_units.unwrap_or(self.prefill_rows).max(engine::DECODE_ROWS)
+    }
+}
+
 /// The checkpoint and native library, opened on the calling thread.
 pub(crate) struct Opened {
     pub checkpoint: Checkpoint,
@@ -240,7 +271,7 @@ fn required_fp8_programs(args: &EngineArgs) -> Vec<String> {
     let mut required = Vec::new();
     if args.fp8_decode {
         let suffix = if args.kv_format == cuteafd_loader::families::qwen4::Qwen4KvCache::Fp8 { "_kv_fp8" } else { "" };
-        for cap in ["m64".to_string(), format!("m{}", args.prefill_rows)] {
+        for cap in ["m64", "m4096"] {
             required.extend([format!("qwen4_gdn_w8_{cap}"),
                 format!("qwen4_attn_producer_w8{suffix}_{cap}"), format!("qwen4_attn_o_w8_{cap}")]);
         }
@@ -289,6 +320,55 @@ mod weight_representation_tests {
             assert!(manifest.residency(cuteafd_loader::V41Exl3Layer::Backbone(layer), 3, 0)?
                 .device_arena_layout()?.1 > 0);
         }
+        Ok(())
+    }
+
+    #[test]
+    fn prefill_units_validate_owner_slots_and_preserve_explicit_geometry() -> Result<()> {
+        assert_eq!(args(&[])?.prefill_shape()?, None);
+        for owners in [vec!["--local-experts"], vec!["--local-experts", "--split-device", "1"]] {
+            let mut explicit = owners;
+            explicit.extend(["--prefill-rows", "4096", "--prefill-waves", "1"]);
+            let parsed = args(&explicit)?;
+            assert_eq!(parsed.prefill_shape()?, None);
+            assert_eq!(parsed.prefill_wave_rows(), 4096);
+        }
+        for (rows, waves) in [(512, 1), (1024, 2), (2048, 2), (4096, 2)] {
+            let rows_arg = rows.to_string();
+            let waves_arg = waves.to_string();
+            let parsed = args(&["--shared-only", "--prefill-units", &rows_arg, "--prefill-waves", &waves_arg])?;
+            let shape = parsed.prefill_shape()?.unwrap();
+            assert_eq!((shape.unit_rows, shape.waves), (rows, waves));
+            assert_eq!(parsed.prefill_rows, 4096);
+        }
+        for extra in [
+            vec!["--prefill-waves", "2"],
+            vec!["--shared-only", "--prefill-units", "511"],
+            vec!["--shared-only", "--prefill-units", "8192"],
+            vec!["--shared-only", "--prefill-rows", "16384", "--prefill-units", "4096"],
+            vec!["--shared-only", "--prefill-units", "2048", "--prefill-waves", "3"],
+            vec!["--shared-only", "--prefill-units", "512", "--prefill-waves", "3"],
+            vec!["--local-experts", "--split-device", "1", "--prefill-units", "2048"],
+        ] {
+            assert!(args(&extra)?.prefill_shape().is_err(), "{extra:?}");
+        }
+        let shape = args(&["--peers", "localhost:9870", "--prefill-rows", "2048", "--prefill-waves", "2"])?.prefill_shape()?.unwrap();
+        assert_eq!((shape.unit_rows, shape.slot_rows()), (2048, 4096));
+        let mut parsed = args(&["--peers", "localhost:9870", "--prefill-waves", "2"])?;
+        let shape = parsed.prefill_shape()?.unwrap();
+        assert_eq!((shape.unit_rows, shape.slot_rows()), (4096, 8192));
+        parsed.prefill_rows = shape.slot_rows() as usize;
+        parsed.prefill_units = Some(shape.unit_rows as usize);
+        assert_eq!(parsed.prefill_shape()?, Some(shape));
+        assert_eq!(parsed.prefill_wave_rows(), 4096);
+        let worker = admission::spark_model(parsed.prefill_wave_rows(), false)?;
+        assert_eq!((worker.capacity, worker.compiled_capacity), (4096, 4096));
+        let cfg = Qwen4Config::from_hf(&cuteafd_loader::plan::testing::qwen4_config(48))?;
+        let admission = admission::inputs(&parsed, &cfg, 48, false, None, Some((160, true)), 0)?;
+        assert_eq!(admission.prefill_rows, 8192);
+        assert_eq!(admission.prefill_shape, Some(shape));
+        assert!(required_fp8_programs(&EngineArgs { fp8_decode: true, ..parsed })
+            .iter().all(|name| !name.contains("m8192")));
         Ok(())
     }
 
@@ -431,6 +511,12 @@ impl Opened {
             1 + usize::from(args.split_device.is_some()), args.split_device.is_some())?;
         let automatic_context = args.max_context == 0;
         let mut context_args = args.clone();
+        let prefill_shape = args.prefill_shape()?;
+        if let Some(shape) = prefill_shape {
+            // Explicit diagnostic cuts retain the requested whole-step span.
+            if args.prefill_units.is_none() { context_args.prefill_rows = shape.slot_rows() as usize; }
+            context_args.prefill_units = Some(shape.unit_rows as usize);
+        }
         context_args.max_context = crate::shared::context::checkpoint_context(
             &args.snapshot, &args.manifest, "qwen4", args.max_context)?;
         let args = &context_args;
@@ -468,18 +554,54 @@ impl Opened {
             let source = args.experts_snapshot.as_deref().unwrap_or(&args.snapshot);
             crate::shared::placement::SparkAdmission::plan(source, cuteafd_core::ExpertGeometry::QWEN4,
                 self.experts.as_ref(), &working, peers.len(), None,
-                admission::spark_model(args.prefill_rows, self.checkpoint.spark_input_is_bf16())?)?.select(&peers)?;
+                admission::spark_model(args.prefill_wave_rows(), self.checkpoint.spark_input_is_bf16())?)?.select(&peers)?;
         }
         let mut manifest_json: Option<serde_json::Value> = std::fs::read(&args.manifest).ok()
             .and_then(|bytes| serde_json::from_slice(&bytes).ok());
         let stream = self.library.cuda_stream_create()?;
         let started = Instant::now();
         let loader = weights::Qwen4Loader { library: &self.library, checkpoint: &self.checkpoint,
-            fp8_decode: args.fp8_decode, fp8_scales: args.fp8_scales, stream };
+            fp8_decode: args.fp8_decode, fp8_scales: args.fp8_scales, stream,
+            dense: std::rc::Rc::new(crate::shared::experts::rtx::dense::DenseLoad::mount(&self.library)) };
         let source = self.embed_source()?;
-        let (embedding, model) = crate::shared::token_io::TokenEmbedding::load(&self.library, source,
-            args.token_io.embed_placement,
-            || { let _memory_scope = cuteafd_ffi::memory_ledger::scope("weights"); loader.model(&self.cfg, layers, args.mtp > 0 && layers == self.cfg.layers, args.mtp_fp8_head) })?;
+        let with_mtp = args.mtp > 0 && layers == self.cfg.layers;
+        // The coordinator's dense records push in a group of this GPU alone when
+        // the checkpoint is SparkNest's; records are planned from headers first,
+        // and any failure loads them through the mount.
+        let device = crate::shared::memory::device::Device { library: &self.library, id: self.library.cuda_get_device()? };
+        let planned = (|| -> Result<_> {
+            let load = std::rc::Rc::new(crate::shared::experts::rtx::dense::DenseLoad::push(&self.library));
+            let planning = weights::Qwen4Loader { dense: load.clone(), ..loader.clone() };
+            let model = {
+                let _memory_scope = cuteafd_ffi::memory_ledger::scope("weights");
+                planning.model(&self.cfg, layers, with_mtp, args.mtp_fp8_head)?
+            };
+            let records = load.sink.as_ref().context("push sink")?.take_all();
+            let (landed, operands, staged, steps, largest, finishes) = records.summary();
+            tracing::info!(landed, operands, staged, steps, largest_step_bytes = largest, finishes,
+                "Qwen coordinator dense records planned");
+            let dense = crate::shared::experts::rtx::dense::plan_records(&args.snapshot, records.clone(), &[device], 0)?;
+            let push = crate::shared::experts::rtx::push::CoordinatorPush::prepare_alone(&args.snapshot, None, 1, None)?;
+            Ok((push, model, records, dense))
+        })().map_err(|error| tracing::warn!(%error, "Qwen coordinator dense push unavailable; mount")).ok();
+        let (embedding, model) = match planned {
+            Some((push, model, records, dense)) => {
+                let split = crate::shared::memory::load_timing::Split::start();
+                let (pushed, embedding) = push.receive_with(vec![device], None, 0, Some(Ok(dense)), ||
+                    crate::shared::token_io::TokenEmbedding::load(&self.library, source, args.token_io.embed_placement,
+                        || Ok(())));
+                let pushed = pushed?;
+                let (embedding, ()) = embedding?;
+                if pushed.is_none() {
+                    crate::shared::experts::rtx::dense::fill_records_by_mount(&self.library, &records, |_| stream)?;
+                }
+                split.log(if pushed.is_some() { "qwen4 dense push" } else { "qwen4 dense mount fill" });
+                (embedding, model)
+            }
+            None => crate::shared::token_io::TokenEmbedding::load(&self.library, source, args.token_io.embed_placement,
+                || { let _memory_scope = cuteafd_ffi::memory_ledger::scope("weights");
+                    loader.model(&self.cfg, layers, with_mtp, args.mtp_fp8_head) })?,
+        };
         let attention_plan = attention_plan(args, model.mtp.is_some())?;
         let programs = programs.with_attention_plan(attention_plan, |name| selected.contains(name))?;
         if let Some(manifest) = &mut manifest_json {
@@ -514,7 +636,7 @@ impl Opened {
             "Qwen 3.8 Flash Next coordinator weights resident (one representation per weight)");
         let ple = match self.cfg.ple_layers.first() {
             Some(&layer) if layer < layers => Some(ple::PleTable::load(&self.library, &self.checkpoint, &self.cfg,
-                layer, &args.table, args.prefill_rows.max(engine::DECODE_ROWS))?),
+                layer, &args.table, args.prefill_wave_rows())?),
             _ => None,
         };
         // Establish expert ownership before admission. EXL3 keeps its existing
@@ -552,17 +674,25 @@ impl Opened {
         let pages = pool_tokens.div_ceil(engine::PAGE_ROWS);
         let mut engine = engine::Qwen4Engine::new(&self.library, &programs, self.cfg.clone(), model, ple, stream,
             max_context, args.prefill_rows, pages, args.slots, args.kv_format, embedding)?;
+        engine.prefill_shape = prefill_shape;
         engine.attention_plan = attention_plan;
         engine.spark_bf16 = self.checkpoint.spark_input_is_bf16();
         if args.planner_graph_modes.is_some() { engine.enable_startup_graphs(); }
         engine.w8a8_prefill = args.fp8_prefill_w8a8;
         if let Some(experts) = match admitted_experts { Some(experts) => experts, None => self.experts(args, layers, stream)? } {
+            // Local EXL3 experts load their first window by push when the
+            // checkpoint is SparkNest's (a group of this GPU alone), else lazily.
+            if let engine::Experts::LocalExl3(local) = &experts {
+                local.push_window(args.experts_snapshot.as_deref().unwrap_or(&args.snapshot), self.library.cuda_get_device()?)?;
+            }
             engine.set_experts(experts);
         }
         if let Some(budget) = args.l2.budget(&self.library, crate::shared::l2_prefetch::OTHER_DEFAULT)? {
             engine.l2 = Some(crate::shared::l2_prefetch::L2Prefetch::new(&self.library, budget, &engine.decode_read_order())?);
         }
+        engine.admit_host_memory(args)?;
         if args.full_prefill_logits { engine.prepare_scoring_prefill()?; }
+        engine.prepare_prefill_units()?;
         let result = body(&engine);
         drop(engine);
         // SAFETY: the engine that used the stream is gone.
@@ -633,15 +763,18 @@ impl Opened {
         } else { None };
         let peers = peers.split(',').map(str::parse).collect::<std::result::Result<Vec<std::net::SocketAddr>, _>>()?;
         let spark_world = cuteafd_transport::expert::SparkWorld::canonical(peers.len())?;
-        let mut transport = crate::shared::spark_intake::SparkLink::new(&self.library, spark_world, &peers,
-            u32::try_from(args.prefill_rows)?, cuteafd_transport::TcpTransportConfig { timing: false,
-                timeout: std::time::Duration::from_secs(120), max_frame_bytes: 64 << 20 }, self.cfg.hidden * 2)?;
+        let shape = args.prefill_shape()?;
+        let mut transport = crate::shared::spark_intake::SparkLink::new_waves(&self.library, spark_world, &peers,
+            u32::try_from(args.prefill_wave_rows())?, cuteafd_transport::TcpTransportConfig { timing: cuteafd_transport::protocol_v2_timing_from_env(),
+                timeout: std::time::Duration::from_secs(120), max_frame_bytes: 64 << 20 }, self.cfg.hidden * 2,
+                shape.map_or(1, |s| s.waves as usize),
+                u32::try_from(shape.map_or(args.prefill_rows, |s| s.unit_rows as usize).max(engine::DECODE_ROWS))?)?;
         transport.enable_terminal_ownership(self.library.clone())?;
         // Connect every rank and publish its installed expert grouping now, with
         // the widest wave this transport can carry: the draft planner prices the
         // workers before any serving step opens a session, and the sessions this
         // opens are the ones every step after it reuses.
-        transport.bootstrap(&engine::spark_bootstrap_request(&self.cfg, args.prefill_rows,
+        transport.bootstrap(&engine::spark_bootstrap_request(&self.cfg, args.prefill_wave_rows(),
             self.checkpoint.spark_input_is_bf16())?)?;
         crate::shared::memory_report::release_load_staging(&self.library);
         let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
@@ -661,7 +794,7 @@ impl Opened {
         let started = Instant::now();
         let mtp = if catalog.exl3().is_some() {
             let experts = crate::families::deepseek_v4::local::LocalExperts::load(&self.library,
-                &args.native_lib, catalog, 1, &[], args.prefill_rows, budget, stream)?
+                &args.native_lib, catalog, 1, &[], args.prefill_wave_rows(), budget, stream)?
                 .context("coordinator-local MTP needs exl3-qwen4-k45/rtx-tp1/m* packages")?;
             ensure!(experts.layers().is_empty() && experts.stages() == 1,
                 "local draft executor must keep exactly the MTP expert layer, no backbone layers");
@@ -671,7 +804,7 @@ impl Opened {
             let draft = tensors.for_layer(layer)?;
             let directory = crate::shared::experts::fp8::package_directory(&args.native_lib, 1, draft.format());
             let experts = crate::shared::experts::fp8::Fp8Experts::load(&self.library, &draft, &directory,
-                &[layer], 1, 0, args.prefill_rows, budget)?;
+                &[layer], 1, 0, args.prefill_wave_rows(), budget)?;
             ensure!(!experts.wire_input(), "coordinator-local MTP FP8 package must take BF16 rows");
             engine::MtpExperts::Fp8(experts)
         };
@@ -712,9 +845,26 @@ pub(crate) async fn run_golden(args: GoldenArgs) -> Result<()> {
     tokio::task::spawn_blocking(move || golden(args)).await?
 }
 
-fn golden(args: GoldenArgs) -> Result<()> {
+fn golden(mut args: GoldenArgs) -> Result<()> {
+    args.engine.full_prefill_logits |= args.nll;
+    ensure!(args.step_rows > 0, "Qwen golden --step-rows must be nonzero");
+    let windows = if args.golden.join("manifest.json").try_exists()? {
+        ensure!(args.nll && args.save_logits.is_some(), "shared Qwen fidelity needs --nll --save-logits DIR");
+        ensure!(args.prefill.is_none() && !args.teacher_force && args.spec_keep.is_none()
+            && args.mtp_oracle.is_none() && args.token_check.is_none() && args.spec_decode.is_none()
+            && args.resume_at.is_empty() && args.bench_prefill == 0 && args.bench_decode == 0,
+            "shared Qwen fidelity cannot be combined with legacy golden diagnostics");
+        let output = args.save_logits.as_deref().unwrap();
+        ensure!(!output.try_exists()? && output.parent().is_some_and(std::path::Path::is_dir),
+            "Qwen fidelity output needs an existing parent and a new directory");
+        Some(fidelity_windows(&args.golden, args.window.as_deref())?)
+    } else {
+        ensure!(args.window.is_none(), "--window needs a published shared fidelity set");
+        None
+    };
     let opened = open(&args.engine)?;
     opened.with_engine(&args.engine, |engine| {
+        if let Some(windows) = &windows { return score_fidelity(&args, &opened, engine, windows); }
         if let Some(dir) = &args.mtp_oracle {
             return mtp_golden::mtp_oracle(&args, &opened, engine, dir);
         }
@@ -765,16 +915,121 @@ fn score(logits: &[f32], golden: &[f32], tokens: &[u32], first: usize, vocab: us
     (agree, next_ok, golden_next, nll, scored)
 }
 
+fn fidelity_windows(root: &std::path::Path, selected: Option<&str>) -> Result<Vec<cuteafd_bench::reference::Window>> {
+    use cuteafd_bench::fidelity_dataset;
+    use sha2::{Digest, Sha256};
+    let bytes = std::fs::read(root.join("manifest.json"))?;
+    ensure!(format!("{:x}", Sha256::digest(&bytes)) == fidelity_dataset::QWEN_MANIFEST_SHA256,
+        "Qwen fidelity manifest differs from immutable publication");
+    let manifest: serde_json::Value = serde_json::from_slice(&bytes)?;
+    ensure!(manifest["config"] == fidelity_dataset::QWEN_CONFIG && manifest["vocab"] == 248320,
+        "Qwen fidelity config/vocabulary differs");
+    let reference = fidelity_dataset::load(root, &manifest)?;
+    let mut windows = fidelity_dataset::quick_windows(&reference)?;
+    if let Some(id) = selected {
+        windows.retain(|window| window.id == id);
+        ensure!(windows.len() == 1, "Qwen fidelity window must belong to the sealed quick subset");
+    }
+    ensure!(windows.iter().all(|window| window.media.is_empty() && window.tokens.len() <= 16384
+        && window.score_from > 0 && window.score_from < window.tokens.len()),
+        "Qwen fidelity requires text-only bounded causal windows");
+    Ok(windows)
+}
+
+fn fidelity_chunks(tokens: usize, capacity: usize) -> Result<Vec<std::ops::Range<usize>>> {
+    ensure!((2..=16384).contains(&tokens) && capacity > 0, "Qwen fidelity causal window/chunk extent differs");
+    let count = tokens - 1;
+    Ok((0..count).step_by(capacity).map(|first| first..(first + capacity).min(count)).collect())
+}
+
+fn score_fidelity(args: &GoldenArgs, opened: &Opened, engine: &engine::Qwen4Engine<'_>,
+    windows: &[cuteafd_bench::reference::Window]) -> Result<()> {
+    use cuteafd_api::openai::probe::{Probe, ProbeSpec};
+    use cuteafd_bench::{fidelity_dataset, fidelity_rows, reference::Fidelity};
+    ensure!(engine.weights.layers.len() == opened.cfg.layers && opened.cfg.vocab_size == 248320,
+        "Qwen fidelity needs every target layer and the published vocabulary");
+    let root = args.save_logits.as_deref().context("shared Qwen fidelity requires --save-logits")?;
+    std::fs::create_dir(root).context("Qwen fidelity output must be a new directory with an existing parent")?;
+    let provenance = serde_json::json!({"prefill_rows":engine.prefill_rows,
+        "prefill_shape":engine.prefill_shape.map(|shape| serde_json::json!({"unit_rows":shape.unit_rows,"waves":shape.waves})),
+        "kv_cache":args.engine.kv_format.to_string(), "fp8_decode":args.engine.fp8_decode,
+        "fp8_prefill_w8a8":args.engine.fp8_prefill_w8a8});
+    let mut allocator = engine::Allocator::new(engine.pages, engine.slots, &opened.cfg);
+    let mut records = Vec::new();
+    let vocab = opened.cfg.vocab_size;
+    for window in windows {
+        let mut placement = allocator.admit(window.tokens.len() - 1)?;
+        let dump = root.join(&window.id);
+        let probe = Probe::new(ProbeSpec { cold: true, no_speculation: true,
+            prompt_ids: Some(window.tokens.clone()), score_from: Some(window.score_from),
+            score_positions: Some(window.positions.iter().map(|p| p.pos).collect()), top_k: 32,
+            want: window.want(), dump_rows: Some(dump.clone()), ..Default::default() });
+        probe.admitted("qwen4", &window.tokens, 0);
+        probe.selected_score_path("prefill");
+        probe.provenance(provenance.clone());
+        for chunk in fidelity_chunks(window.tokens.len(), engine.prefill_rows)? {
+            let logits = engine.prefill_forced(&mut placement, &window.tokens[chunk.clone()], None, None, chunk.len())?
+                .context("Qwen fidelity needs all target logits")?;
+            ensure!(logits.len() == chunk.len() * vocab, "Qwen fidelity logits shape differs");
+            for (row, logits) in logits.chunks_exact(vocab).enumerate() {
+                let position = chunk.start + row + 1;
+                if position >= window.score_from { probe.row(position, logits); }
+            }
+            probe.scored_prefill_chunk(chunk.start + 1, chunk.len());
+        }
+        let record = probe.record();
+        ensure!(record.error.is_none(), "Qwen fidelity row dump failed: {:?}", record.error);
+        let mut score = window.score(&record.rows);
+        ensure!(score.missing == 0 && score.non_finite == 0 && score.records.len() == window.positions.len(),
+            "Qwen fidelity did not cover every finite scored row");
+        fidelity_rows::score_compact(vocab, window, &dump, &mut score)?;
+        println!("Qwen window {}: rows={} top-1={:.4}% mean NLL={:.8} mean KL(top1024+tail)={:.8}",
+            window.id, score.positions, score.top1 * 100.0, score.nll, score.kl);
+        let file = std::fs::OpenOptions::new().write(true).create_new(true).open(root.join(format!("{}.json", window.id)))?;
+        serde_json::to_writer(file, &serde_json::json!({"probe":record,"score":score}))?;
+        records.extend(score.records);
+        engine.drain_state()?;
+        allocator.release(placement);
+    }
+    let score = Fidelity::from_records(records);
+    println!("Qwen prefill logits: rows={} top-1 agreement {:.4}% | mean NLL engine {:.8} | mean KL(top1024+tail) {:.8}",
+        score.positions, score.top1 * 100.0, score.nll, score.kl);
+    let file = std::fs::OpenOptions::new().write(true).create_new(true).open(root.join("fidelity.json"))?;
+    serde_json::to_writer(file, &serde_json::json!({"schema":"cuteafd.qwen4.golden/1",
+        "reference_config":fidelity_dataset::QWEN_CONFIG,"reference_revision":fidelity_dataset::QWEN_REVISION,
+        "reference_manifest_sha256":fidelity_dataset::QWEN_MANIFEST_SHA256,
+        "path_shape":"prefill-shaped","kl_kind":"top1024+tail","provenance":provenance,"score":score}))?;
+    Ok(())
+}
+
+fn golden_logits(root: &std::path::Path, dump_only: bool, expected: usize) -> Result<Option<Vec<f32>>> {
+    let bytes = match std::fs::read(root.join("logits.bin")) {
+        Ok(bytes) => bytes,
+        Err(error) if dump_only && error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error).context("Qwen golden logits; pass --save-logits for a pure engine dump"),
+    };
+    ensure!(bytes.len() == expected.checked_mul(4).context("Qwen golden logits extent overflow")?,
+        "Qwen golden logits shape differs");
+    let values = bytes.chunks_exact(4).map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect::<Vec<_>>();
+    ensure!(values.iter().all(|v| v.is_finite()), "Qwen golden logits are non-finite");
+    Ok(Some(values))
+}
+
 fn golden_run(args: &GoldenArgs, opened: &Opened, engine: &engine::Qwen4Engine<'_>) -> Result<()> {
     let cfg = &opened.cfg;
     let layers = engine.weights.layers.len();
-    let tokens: Vec<u32> = std::fs::read(args.golden.join("tokens.bin"))?
-        .chunks_exact(4).map(|b| u32::from_le_bytes(b.try_into().unwrap())).collect();
+    let token_bytes = std::fs::read(args.golden.join("tokens.bin"))?;
+    ensure!(!token_bytes.is_empty() && token_bytes.len().is_multiple_of(4), "Qwen golden token extent differs");
+    let tokens: Vec<u32> = token_bytes.chunks_exact(4).map(|b| u32::from_le_bytes(b.try_into().unwrap())).collect();
+    let reference_logits = golden_logits(&args.golden, args.save_logits.is_some(),
+        tokens.len().checked_mul(cfg.vocab_size).context("Qwen golden logits shape overflow")?)?;
+    if reference_logits.is_none() { println!("Qwen engine-only logits dump; no reference NLL/KL or agreement comparison"); }
     let mut allocator = engine::Allocator::new(engine.pages, engine.slots, cfg);
     let mut placement = allocator.admit(tokens.len() + args.bench_decode + usize::from(args.bench_decode > 0))?;
     let row = cfg.hidden * 2;
     let stream_row = row * 4;
     let prefill = args.prefill.unwrap_or(tokens.len()).min(tokens.len());
+    ensure!(prefill > 0, "Qwen golden requires a nonempty prefill");
     // Rows [first, first + n) of layer `layer`'s golden streams.
     let compare = |layer: usize, first: usize, streams: &[u8], worst: &mut Vec<f64>| -> Result<()> {
         let path = args.golden.join(format!("layer{layer:02}.bin"));
@@ -813,9 +1068,14 @@ fn golden_run(args: &GoldenArgs, opened: &Opened, engine: &engine::Qwen4Engine<'
     while done < prefill {
         let n = engine.prefill_rows.min(prefill - done);
         let first = done;
-        let chunk = engine.prefill_forced(&mut placement, &tokens[done..done + n],
-            Some(&mut |layer, streams| compare(layer, first, streams, &mut worst)),
-            args.teacher_force.then_some(&forced as &dyn Fn(usize) -> Option<Vec<u8>>), if args.nll { n } else { 1 })?;
+        let chunk = if engine.prefill_shape.is_some() {
+            ensure!(!args.teacher_force, "Qwen unit golden compares logits, not teacher-forced layer streams");
+            engine.prefill_forced(&mut placement, &tokens[done..done + n], None, None, if args.nll { n } else { 1 })?
+        } else {
+            engine.prefill_forced(&mut placement, &tokens[done..done + n],
+                Some(&mut |layer, streams| compare(layer, first, streams, &mut worst)),
+                args.teacher_force.then_some(&forced as &dyn Fn(usize) -> Option<Vec<u8>>), if args.nll { n } else { 1 })?
+        };
         logits = match (logits, chunk) {
             (Some(mut all), Some(more)) if args.nll => {
                 all.extend(more);
@@ -860,10 +1120,6 @@ fn golden_run(args: &GoldenArgs, opened: &Opened, engine: &engine::Qwen4Engine<'
         println!("speculative verify: {spec_steps} steps of {} rows, each committing {} (GDN/PLE verify-by-replay)",
             args.step_rows, args.spec_keep.unwrap_or(0));
     }
-    let golden_logits = || -> Result<Vec<f32>> {
-        Ok(std::fs::read(args.golden.join("logits.bin"))?
-            .chunks_exact(4).map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect())
-    };
     let vocab = cfg.vocab_size;
     if prefill < tokens.len() {
         println!("decode: {} rows in steps of {} in {:.2} s; worst row-block cosine per layer {:?}",
@@ -874,13 +1130,14 @@ fn golden_run(args: &GoldenArgs, opened: &Opened, engine: &engine::Qwen4Engine<'
             if let Ok(path) = std::env::var("CUTEAFD_DUMP_DECODE_LOGITS") {
                 std::fs::write(&path, decode_logits.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>())?;
             }
-            let golden = golden_logits()?;
-            let (agree, next_ok, golden_next, nll, scored) = score(&decode_logits, &golden, &tokens, prefill, vocab);
-            let rows = decode_logits.len() / vocab;
-            println!("decode logits: top-1 agreement {:.1}% over {rows} rows | next-token accuracy engine {:.1}% \
-                golden {:.1}% | mean NLL {:.4} | mean KL(golden||engine) {:.5}", 100.0 * agree as f64 / rows as f64,
-                100.0 * next_ok as f64 / scored.max(1) as f64, 100.0 * golden_next as f64 / scored.max(1) as f64,
-                nll / scored.max(1) as f64, crate::families::glm5_flash::mean_kl(&decode_logits, &golden, prefill, vocab));
+            if let Some(golden) = &reference_logits {
+                let (agree, next_ok, golden_next, nll, scored) = score(&decode_logits, golden, &tokens, prefill, vocab);
+                let rows = decode_logits.len() / vocab;
+                println!("decode logits: top-1 agreement {:.1}% over {rows} rows | next-token accuracy engine {:.1}% \
+                    golden {:.1}% | mean NLL {:.4} | mean KL(golden||engine) {:.5}", 100.0 * agree as f64 / rows as f64,
+                    100.0 * next_ok as f64 / scored.max(1) as f64, 100.0 * golden_next as f64 / scored.max(1) as f64,
+                    nll / scored.max(1) as f64, crate::families::glm5_flash::mean_kl(&decode_logits, golden, prefill, vocab));
+            }
         }
     }
     // Reference dumps for `scripts/bench/golden-run.py --compare-logits`: with --nll every
@@ -973,9 +1230,9 @@ fn golden_run(args: &GoldenArgs, opened: &Opened, engine: &engine::Qwen4Engine<'
         if let Ok(path) = std::env::var("CUTEAFD_DUMP_PREFILL_LOGITS") {
             std::fs::write(&path, logits.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>())?;
         }
-        let golden = golden_logits()?;
+        let Some(golden) = &reference_logits else { return Ok(()) };
         if args.nll {
-            let (agree, next_ok, golden_next, nll, scored) = score(&logits, &golden, &tokens, 0, vocab);
+            let (agree, next_ok, golden_next, nll, scored) = score(&logits, golden, &tokens, 0, vocab);
             let (_, _, _, golden_nll, _) = score(&golden[..prefill * vocab], &golden, &tokens, 0, vocab);
             println!("prefill logits: top-1 agreement {:.1}% over {prefill} rows | next-token accuracy engine {:.1}% \
                 golden {:.1}% | mean NLL engine {:.4} golden {:.4}", 100.0 * agree as f64 / prefill as f64,
@@ -989,6 +1246,49 @@ fn golden_run(args: &GoldenArgs, opened: &Opened, engine: &engine::Qwen4Engine<'
         println!("last-row logits: argmax engine {} golden {} cosine {cosine:.6}", argmax(logits), argmax(last));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod golden_tests {
+    use super::{fidelity_chunks, fidelity_windows, golden_logits};
+
+    #[test]
+    fn causal_fidelity_chunks_cover_next_token_positions_once() {
+        for tokens in [513, 751, 4097, 8193, 10773] {
+            for capacity in [512, 2048, 4096, 16384] {
+                let chunks = fidelity_chunks(tokens, capacity).unwrap();
+                let predicted = chunks.iter().flat_map(|chunk| chunk.clone().map(|row| row + 1)).collect::<Vec<_>>();
+                assert_eq!(predicted, (1..tokens).collect::<Vec<_>>());
+                assert!(chunks.iter().all(|chunk| !chunk.is_empty() && chunk.len() <= capacity));
+            }
+        }
+        assert!(fidelity_chunks(1, 2048).is_err());
+        assert!(fidelity_chunks(513, 0).is_err());
+    }
+
+    #[test]
+    fn engine_only_logits_dump_requires_explicit_opt_in_and_rejects_bad_references() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(golden_logits(dir.path(), true, 4).unwrap().is_none());
+        assert!(golden_logits(dir.path(), false, 4).is_err());
+        let values = [0.0f32, 1.0, -1.0, 2.0];
+        let path = dir.path().join("logits.bin");
+        std::fs::write(&path, values.into_iter().flat_map(f32::to_le_bytes).collect::<Vec<_>>()).unwrap();
+        assert_eq!(golden_logits(dir.path(), true, 4).unwrap().unwrap(), values);
+        assert!(golden_logits(dir.path(), true, 3).is_err());
+        std::fs::write(&path, f32::NAN.to_le_bytes()).unwrap();
+        assert!(golden_logits(dir.path(), true, 1).is_err());
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        assert!(golden_logits(dir.path(), true, 1).is_err());
+    }
+
+    #[test]
+    fn shared_fidelity_rejects_an_unpublished_manifest() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("manifest.json"), b"{}").unwrap();
+        assert!(fidelity_windows(dir.path(), None).unwrap_err().to_string().contains("immutable publication"));
+    }
 }
 
 /// `--token-check N`: prefill the golden prompt, then [`crate::shared::token_io::gate`]

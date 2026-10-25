@@ -37,7 +37,7 @@ async fn window_opens_after_warm_up_before_timed_requests() {
         let opened_at = Arc::new(Mutex::new(Vec::new()));
         let record = opened_at.clone();
         let counter = seen.clone();
-        let sweep = cuteafd_bench::sweep::run_windowed(&base, None, &[2, 1], true, false, &[], false, cuteafd_bench::sweep::TOKENS, Some(Box::new(move || {
+        let sweep = cuteafd_bench::sweep::run_windowed(&base, None, None, &[2, 1], true, false, &[], false, cuteafd_bench::sweep::TOKENS, Some(Box::new(move || {
             record.lock().unwrap().push(counter.load(Ordering::SeqCst));
             Ok(())
         }))).unwrap();
@@ -45,7 +45,7 @@ async fn window_opens_after_warm_up_before_timed_requests() {
         // A refused open fails the sweep before any timed request: only the
         // discovery and the one C1 warm-up reach the engine.
         let before = seen.load(Ordering::SeqCst);
-        let refused = cuteafd_bench::sweep::run_windowed(&base, None, &[1], false, false, &[], false, cuteafd_bench::sweep::TOKENS,
+        let refused = cuteafd_bench::sweep::run_windowed(&base, None, None, &[1], false, false, &[], false, cuteafd_bench::sweep::TOKENS,
             Some(Box::new(|| anyhow::bail!("refused"))));
         assert!(format!("{:#}", refused.unwrap_err()).contains("refused"));
         (opened_at, sweep, seen.load(Ordering::SeqCst) - before)
@@ -53,6 +53,7 @@ async fn window_opens_after_warm_up_before_timed_requests() {
     // One call, after exactly the C2 warm-up wave (two requests).
     assert_eq!(opened_at, vec![2]);
     assert_eq!(sweep.points.len(), 3);
+    assert!(sweep.model.as_deref().is_some_and(|m| !m.is_empty()), "the sweep names the id it measured");
     assert_eq!(refused, 1);
 }
 

@@ -284,6 +284,7 @@ cmake \
   -DCMAKE_BUILD_TYPE=Release \
   -DCUTEAFD_ENABLE_CUDA=ON \
   -DCUTEAFD_ENABLE_VISION_ATTENTION_AOT="${CUTEAFD_WIP_VISION_ATTENTION_AOT:-ON}" \
+  -DCUTEAFD_ENABLE_STEER_ROWS_AOT="${CUTEAFD_WIP_STEER_ROWS_AOT:-ON}" \
   -DCUTEAFD_ENABLE_AUDIO_AOT="$audio_aot" \
   -DCUTEAFD_ENABLE_V41_EXPERT_AOT=ON \
   -DCUTEAFD_SPARK_TP_ROLES="$spark_tp_roles" \
@@ -371,6 +372,7 @@ for wip_family in "${wip_fp8_list[@]}"; do
   case "$wip_family" in
     *:fp8) wip_package="fp8-${wip_family%%:*}" ;;
     step5:bf16) wip_package="fp8-step5-bf16-weights" ;;
+    step5:nvfp4) wip_package="fp8-step5-nvfp4a4" ;;
     # ModelOpt NVFP4 calibrated W4A4 share the fp8_moe programs.
     *:nvfp4|*:nvfp4a4) wip_package="fp8-${wip_family%%:*}-${wip_family#*:}" ;;
     *) continue ;;

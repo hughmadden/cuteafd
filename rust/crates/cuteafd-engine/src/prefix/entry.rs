@@ -62,6 +62,7 @@ pub(crate) struct Entry<M> {
     pub mark: Option<Mark>,
     pub after: After,
     pub meta: M,
+    pub draft: Option<super::DraftPageAttachment>,
     pub last_use: u64,
     /// The host tier's write-behind copy, when one was issued.
     pub ticket: Option<StoreTicket>,

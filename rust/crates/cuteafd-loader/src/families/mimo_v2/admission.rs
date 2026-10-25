@@ -1,7 +1,7 @@
 //! Pure allocation contract; native scratch is injected as metadata queries.
 use anyhow::{ensure, Context, Result};
 use cuteafd_core::serving_capacity::MemoryReservation;
-use super::{MimoV2Config, MimoKvCache, MimoPrefillOutput};
+use super::{MimoV2Config, MimoKvFormats, MimoPrefillOutput};
 
 pub fn resolve_transport_lanes(spark: bool, family: &str, configured: Option<&str>) -> Result<usize> {
     if !spark {
@@ -87,8 +87,10 @@ pub fn draft_reservations_with(
     use crate::families::mimo_v2::draft_representation::MimoDraftCapacity;
     let slots = capacity.context_slots;
     let max_sequences = capacity.max_batch_sequences;
+    let expected = MimoDraftCapacity { kv_cache: capacity.kv_cache,
+        ..MimoDraftCapacity::new(slots, max_sequences, cfg.block)? };
     ensure!(
-        capacity == MimoDraftCapacity::new(slots, max_sequences, cfg.block)?,
+        capacity == expected,
         "DFlash capacity does not match its configured block extent"
     );
     ensure!(
@@ -215,7 +217,7 @@ pub fn draft_reservations_with(
         for kind in ["k", "v"] {
             reserve(
                 format!("draft.layer{layer}.{kind}_ring"),
-                &[slots, RING, kv, 2],
+                &[slots, RING, capacity.kv_cache.plane_record_bytes(cfg.kv_heads, cfg.head_dim)],
             )?;
         }
     }
@@ -284,7 +286,7 @@ pub fn workspace_scratch(
     ranks: usize,
     rank: usize,
     decode: bool,
-    kv: MimoKvCache,
+    kv: MimoKvFormats,
     fp8_output: bool,
     mut query: impl FnMut(&str) -> Result<u64>,
 ) -> Result<u64> {
@@ -307,12 +309,13 @@ pub fn workspace_scratch(
         ("m4096", "prefill")
     };
     for family in families {
-        let kv = kv.program_tag();
+        let swa = kv.sliding.program_tag();
+        let kv = kv.full.program_tag();
         for name in [
             format!("{family}_full_producer{kv}_{cap}"),
-            format!("{family}_swa_producer_{cap}"),
+            format!("{family}_swa_producer{swa}_{cap}"),
             format!("{family}_full_attention{kv}_{mode}_{cap}"),
-            format!("{family}_swa_attention_{mode}_{cap}"),
+            format!("{family}_swa_attention{swa}_{mode}_{cap}"),
             format!("{family}_ffn_{cap}"),
         ] {
             scratch = scratch.max(query(&name)?);
@@ -355,7 +358,7 @@ pub fn attention_workspace_geometry(rank: usize, ranks: usize, decode: bool,
 }
 
 pub fn workspace_options(cfg: &MimoV2Config, ranks: usize, rank: usize, rows: usize,
-    context: usize, lanes: usize, spark: bool, expert_input: super::MimoExpertInput, kv: MimoKvCache, mtp: usize,
+    context: usize, lanes: usize, spark: bool, expert_input: super::MimoExpertInput, kv: MimoKvFormats, mtp: usize,
     output: MimoPrefillOutput, fp8_output: bool,
     mut query: impl FnMut(&str) -> Result<u64>) -> Result<Vec<(String, super::MimoWorkspaceOptions)>> {
     workspace_shapes(rows, rank == 0, spark, lanes, output, mtp).into_iter()

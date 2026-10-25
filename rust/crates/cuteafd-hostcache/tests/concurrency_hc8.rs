@@ -50,13 +50,13 @@ fn device_bytes() -> usize {
 /// identities, ranges handed out sequentially from `next_addr`.
 fn lane_snapshot(lane: usize, generation: u32, next_addr: &mut u64) -> DeviceSnapshot {
     let layout = layout();
-    let mut lists: [Vec<DevicePage>; COMPRESSORS] = std::array::from_fn(|_| Vec::new());
+    let mut lists: [Vec<DevicePage>; cuteafd_hostcache::PAGE_BANKS] = std::array::from_fn(|_| Vec::new());
     let mut range = |bytes: usize| {
         let start = *next_addr;
         *next_addr += bytes as u64;
         DeviceRange { addr: start, bytes }
     };
-    for (compressor, list) in lists.iter_mut().enumerate() {
+    for (compressor, list) in lists.iter_mut().take(COMPRESSORS).enumerate() {
         for index in 0..PAGES {
             // Four contiguous segments per page, as the engine allocates them.
             list.push(DevicePage {

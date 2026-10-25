@@ -102,8 +102,11 @@ def main() -> int:
     # Docker creates missing mount parents as root. Bind a host-owned home first
     # so Cargo can write its lock/config alongside the separately mounted inputs.
     bind_directory(host_home, container_home)
-    # Worker admission is host-wide even with input/compiler caches disabled.
-    workers = root / 'export-workers'
+    # Worker admission is host-wide even with input/compiler caches disabled. A
+    # deployment whose hardware locks live outside HOME (CUTEAFD_LOCK_DIR) keeps
+    # its admission beside them, so every user of those locks shares one ledger.
+    lock_dir = os.environ.get('CUTEAFD_LOCK_DIR')
+    workers = Path(lock_dir) / 'export-workers' if lock_dir else root / 'export-workers'
     try:
         nvme_cache(workers)
     except (ValueError, OSError, subprocess.SubprocessError):

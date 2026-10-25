@@ -108,6 +108,7 @@ struct Fake {
     rings: usize,
     slots: usize,
     queue: RefCell<Vec<Op>>,
+    writable_lag: usize,
     fail_restore: Cell<bool>,
     fail_copy: Cell<bool>,
     fail_drain: Cell<bool>,
@@ -121,14 +122,20 @@ struct Fake {
     pooled: bool,
     /// Leading pool pages never handed out (a pooled fake reserves page 0, the stand-in).
     reserved: usize,
+    draft: RefCell<Option<DraftFixture>>,
+}
+
+struct DraftFixture {
+    pool: DraftPagePool,
+    bindings: Vec<Option<DraftBinding>>,
 }
 
 impl Fake {
     fn new(pages: usize, rings: usize, slots: usize) -> Self {
         let bytes = (pages * ROWS + rings * RING + slots * WINDOW) * ROW;
         let mem = Rc::new(RefCell::new(StubCopyEngine::new(CopyModel::default(), bytes, 1 << 26)));
-        Self { mem, pages, rings, slots, queue: RefCell::new(Vec::new()), fail_restore: Cell::new(false), fail_copy: Cell::new(false), fail_drain: Cell::new(false), record_format: Cell::new("opaque_v1"), drains: Cell::new(0),
-            rule: ReuseRule::EXACT, markless: false, pooled: false, reserved: 0 }
+        Self { mem, pages, rings, slots, writable_lag: 0, queue: RefCell::new(Vec::new()), fail_restore: Cell::new(false), fail_copy: Cell::new(false), fail_drain: Cell::new(false), record_format: Cell::new("opaque_v1"), drains: Cell::new(0),
+            rule: ReuseRule::EXACT, markless: false, pooled: false, reserved: 0, draft: RefCell::new(None) }
     }
     /// Marks in pool pages: no arena slot exists (any use of one panics). `pages` pages hand
     /// out, past the reserved page 0.
@@ -144,6 +151,19 @@ impl Fake {
             mark_bytes: if self.markless { 0 } else { WINDOW * ROW }, draft_bytes: 0, rule: self.rule,
             mark_store: if self.pooled { MarkStore::Pool { pages: MARK_PAGES, reserved: self.reserved } }
                 else { MarkStore::Arena }, page_owners: Default::default() }
+    }
+    fn draft_range(&self, page: u32) -> DeviceRange {
+        DeviceRange { addr: ((self.pages * ROWS + self.rings * RING + self.slots * WINDOW) * ROW
+            + page as usize * DRAFT_PAGE_ROWS * ROW) as u64, bytes: DRAFT_PAGE_ROWS * ROW }
+    }
+    fn draft_copies(&self, copies: Vec<TailCopy>) {
+        for copy in copies {
+            let mut from = self.draft_range(copy.from);
+            let mut to = self.draft_range(copy.to);
+            from.bytes = copy.rows * ROW;
+            to.bytes = from.bytes;
+            self.queue.borrow_mut().push(Op::Copy(from, to));
+        }
     }
     /// Row `i` of the mark held in pool `pages`.
     fn mark_row(&self, pages: &[u32], i: usize) -> DeviceRange {
@@ -207,12 +227,89 @@ impl Fake {
 
 impl PrefixFamily for Fake {
     type Placement = Placement;
+    fn write_frontier(&self, len: usize) -> usize {
+        len.saturating_sub(self.writable_lag)
+    }
     fn record_format(&self) -> &'static str {
         self.record_format.get()
     }
     fn layout(&self) -> FamilyLayout {
         Fake::layout(self)
     }
+    fn discard(&self, placement: &mut Placement) -> Result<(), BoxError> {
+        if let Some(draft) = self.draft.borrow_mut().as_mut() {
+            if let Some(binding) = draft.bindings[placement.ring].take() { draft.pool.release(binding)?; }
+        }
+        Ok(())
+    }
+    fn draft_page_bytes(&self) -> usize {
+        if self.draft.borrow().is_some() { DRAFT_PAGE_ROWS * ROW } else { 0 }
+    }
+    fn admit_draft_pages(&self, placement: &mut Placement, capacity: usize) -> Result<(), BoxError> {
+        let mut draft = self.draft.borrow_mut();
+        let Some(draft) = draft.as_mut() else { return Ok(()) };
+        let binding = match draft.bindings[placement.ring] {
+            Some(binding) => binding,
+            None => {
+                let binding = draft.pool.bind(placement.ring, placement.len)?;
+                draft.bindings[placement.ring] = Some(binding);
+                binding
+            }
+        };
+        draft.pool.admit(binding, capacity, 8)?;
+        Ok(())
+    }
+    fn draft_pages_valid(&self, attachment: &DraftPageAttachment) -> bool {
+        self.draft.borrow().as_ref().is_some_and(|d| d.pool.check_attachment(attachment).is_ok())
+    }
+    fn draft_pages_revocable(&self, attachment: &DraftPageAttachment) -> bool {
+        self.draft.borrow().as_ref().is_some_and(|d| d.pool.snapshot_revocable(attachment.snapshot))
+    }
+    fn retain_draft_pages(&self, attachment: &DraftPageAttachment) -> Result<(), BoxError> {
+        self.draft.borrow_mut().as_mut().ok_or("missing draft pool")?.pool.retain_snapshot(attachment.snapshot)?;
+        Ok(())
+    }
+    fn capture_draft_pages(&self, placement: &Placement, len: usize) -> Result<Option<DraftPageAttachment>, BoxError> {
+        let mut draft = self.draft.borrow_mut();
+        let Some(draft) = draft.as_mut() else { return Ok(None) };
+        let binding = draft.bindings[placement.ring].ok_or("missing draft binding")?;
+        assert_eq!(draft.pool.frontier(binding)?.1, len);
+        let (snapshot, copies) = draft.pool.capture_writable(binding, self.write_frontier(len))?;
+        self.draft_copies(copies);
+        Ok(Some(draft.pool.attachment(snapshot)?))
+    }
+    fn release_draft_pages(&self, attachment: &DraftPageAttachment) -> Result<(), BoxError> {
+        let mut draft = self.draft.borrow_mut();
+        let draft = draft.as_mut().ok_or("missing draft pool")?;
+        draft.pool.check_attachment(attachment)?;
+        draft.pool.release_snapshot(attachment.snapshot)?;
+        Ok(())
+    }
+    fn restore_draft_pages(&self, attachment: Option<&DraftPageAttachment>, placement: &mut Placement,
+        frontier: usize) -> Result<(), BoxError> {
+        let mut draft = self.draft.borrow_mut();
+        let Some(draft) = draft.as_mut() else { return Ok(()) };
+        if let Some(old) = draft.bindings[placement.ring].take() { draft.pool.release(old)?; }
+        let binding = if let Some(attachment) = attachment {
+            draft.pool.check_attachment(attachment)?;
+            draft.pool.pin_snapshot(attachment.snapshot)?;
+            let (binding, copies) = match draft.pool.restore_writable(placement.ring, attachment.snapshot,
+                frontier, self.write_frontier(frontier)) {
+                Ok(restored) => restored,
+                Err(error) => { draft.pool.unpin_snapshot(attachment.snapshot)?; return Err(error.into()); }
+            };
+            self.draft_copies(copies);
+            self.flush();
+            draft.pool.unpin_snapshot(attachment.snapshot)?;
+            binding
+        } else { draft.pool.bind(placement.ring, frontier)? };
+        draft.bindings[placement.ring] = Some(binding);
+        Ok(())
+    }
+    fn promote_draft_pages(&self, saved: &DraftPageAttachment) -> Result<DraftPageAttachment, BoxError> {
+        Ok(self.draft.borrow_mut().as_mut().ok_or("missing draft pool")?.pool.promote(saved)?)
+    }
+    fn draft_page_segments(&self, page: DraftPageId) -> Vec<DeviceRange> { vec![self.draft_range(page.index)] }
     fn pages<'p>(&self, placement: &'p Placement) -> &'p [u32] {
         &placement.pages
     }
@@ -429,6 +526,78 @@ fn completed_retained_pages_unblock_admission_while_another_request_is_running()
 }
 
 #[test]
+fn the_same_tokens_in_different_namespaces_never_hit() {
+    let fake = Fake::new(64, 4, 8);
+    let mut cache = cache(&fake, 4, 1 << 20);
+    let prompt = seq(100, 50);
+    let key = |tag| super::namespaced(&prompt, tag).unwrap().into_owned();
+    let admit = |cache: &mut PrefixCache<Shared>, tag, ring| {
+        let admitted = cache.admit(&fake, &key(tag), 64, false,
+            |pages| Placement { pages, ring, len: 0, ring_from: 0 }).unwrap();
+        (admitted.resume, admitted.placement)
+    };
+    // Variant 1 prefills and retains its prompt under its own key.
+    let (resume, mut v1) = admit(&mut cache, 1, 0);
+    assert_eq!(resume, 0);
+    let logits = fake.forward(&mut v1, &prompt).unwrap();
+    cache.capture(&fake, SnapshotKind::Prompt, &key(1), &v1, After::from_logits(&logits, true)).unwrap();
+    assert_eq!(cache.peek(&key(1), false), 50);
+    // Base and variant 2 see nothing, on either tier.
+    assert_eq!((cache.peek(&key(0), false), cache.peek(&key(2), false)), (0, 0));
+    let (resume, base) = admit(&mut cache, 0, 1);
+    assert_eq!(resume, 0, "base must not restore variant state");
+    let (resume, v2) = admit(&mut cache, 2, 2);
+    assert_eq!(resume, 0, "variant 2 must not restore variant 1 state");
+    // Variant 1 itself restores exactly (the forward checks every context row).
+    let (resume, mut again) = admit(&mut cache, 1, 3);
+    assert_eq!(resume, 50);
+    let mut longer = prompt.clone();
+    longer.extend(seq(900, 5));
+    fake.forward(&mut again, &longer).unwrap();
+    for placement in [v1, base, v2, again] { cache.release(&fake, &placement.pages).unwrap(); }
+    cache.clear(&fake).unwrap();
+}
+
+#[test]
+fn variant_pages_restore_from_host_only_in_their_own_namespace() {
+    let mut fake = Fake::new(24, 4, 1);
+    fake.markless = true; // GLM full: the latent/index pages are the complete state.
+    let mut cache = cache(&fake, 4, 1 << 20);
+    let prompt = seq(100, 22); // Include a partial tail page.
+    let key = |tag| super::namespaced(&prompt, tag).unwrap().into_owned();
+    let admit = |cache: &mut PrefixCache<Shared>, tag| {
+        cache.admit(&fake, &key(tag), 40, false,
+            |pages| Placement { pages, ring: 0, len: 0, ring_from: 0 }).unwrap()
+    };
+    let mut original = admit(&mut cache, 1).placement;
+    let logits = fake.forward(&mut original, &prompt).unwrap();
+    cache.capture(&fake, SnapshotKind::Turn, &key(1), &original, After::from_logits(&logits, true)).unwrap();
+    fake.mem.borrow_mut().advance(10_000_000);
+    cache.tick();
+    assert_eq!(cache.stats().host.unwrap().stores_completed, 1);
+    cache.release(&fake, &original.pages).unwrap();
+    cache.clear(&fake).unwrap(); // Only the pinned-RAM copy remains.
+
+    for tag in [0, 2] {
+        let other = admit(&mut cache, tag);
+        assert_eq!(other.resume, 0, "another model must not promote the variant's host pages");
+        cache.release(&fake, &other.placement.pages).unwrap();
+    }
+    let restored = admit(&mut cache, 1);
+    assert_eq!(restored.resume, prompt.len());
+    assert!(restored.source.unwrap().host);
+    let mut placement = restored.placement;
+    let mut longer = prompt;
+    longer.extend(seq(900, 5));
+    // Every context byte, including the partial tail, must match a fresh prefill.
+    fake.forward(&mut placement, &longer).unwrap();
+    assert_eq!((cache.stats().promotions, cache.stats().host.unwrap().restores), (1, 1));
+    cache.release(&fake, &placement.pages).unwrap();
+    cache.clear(&fake).unwrap();
+    assert_eq!(cache.pool().free(), 24);
+}
+
+#[test]
 fn prompt_repeat_is_an_exact_hit_with_its_logits_and_no_forward() {
     let fake = Fake::new(64, 4, 8);
     let mut cache = cache(&fake, 4, 0);
@@ -447,6 +616,90 @@ fn prompt_repeat_is_an_exact_hit_with_its_logits_and_no_forward() {
     cache.release(&fake, &b.pages).unwrap();
     cache.clear(&fake).unwrap();
     assert_eq!(cache.pool().free(), 64);
+    assert_eq!(cache.arena().in_use(), 0);
+}
+
+#[test]
+fn eight_active_sequences_need_only_four_retained_marks_for_exact_restores() {
+    let slots = 4; // Capacity-constrained placement retains four complete TP2 marks.
+    let fake = Fake::new(128, 8, slots);
+    let mut cache = cache(&fake, 20, 0);
+    let mut active = Vec::new();
+    for ring in 0..8 {
+        let prompt = seq(100 + ring as u32 * 100, 12);
+        let (_, _, placement) = serve(&mut cache, &fake, ring, &prompt, &[], 16);
+        active.push((prompt, placement));
+        assert!(cache.arena().in_use() <= 4);
+    }
+    assert_eq!(cache.arena().in_use(), 4);
+    // Retention pressure does not change any running sequence's recurrent state.
+    for (tokens, placement) in &mut active {
+        tokens.push(900);
+        fake.forward(placement, tokens).unwrap();
+    }
+    let prompt = &active[7].0[..12];
+    let admitted = cache.admit(&fake, prompt, 16, false,
+        |pages| Placement { pages, ring: 0, len: 0, ring_from: 0 }).unwrap();
+    assert_eq!(admitted.resume, 12);
+    let mut restored = admitted.placement;
+    let mut longer = prompt.to_vec();
+    longer.push(901);
+    fake.forward(&mut restored, &longer).unwrap();
+    cache.release(&fake, &restored.pages).unwrap();
+    for (_, placement) in active { cache.release(&fake, &placement.pages).unwrap(); }
+    cache.clear(&fake).unwrap();
+    assert_eq!(cache.pool().free(), 128);
+    assert_eq!(cache.arena().in_use(), 0);
+}
+
+#[test]
+fn a_single_mark_drains_queued_restore_before_reuse_under_capture_pressure() {
+    let fake = Fake::new(64, 3, 1);
+    let mut cache = cache(&fake, 20, 0);
+    let first = seq(100, 12);
+    let (_, _, original) = serve(&mut cache, &fake, 0, &first, &[], 16);
+    cache.release(&fake, &original.pages).unwrap();
+    let next = seq(500, 12);
+    let mut writer = cache.admit(&fake, &next, 16, false,
+        |pages| Placement { pages, ring: 2, len: 0, ring_from: 0 }).unwrap().placement;
+    let logits = fake.forward(&mut writer, &next).unwrap();
+    let admitted = cache.admit(&fake, &first, 16, false,
+        |pages| Placement { pages, ring: 1, len: 0, ring_from: 0 }).unwrap();
+    assert_eq!(admitted.resume, first.len());
+    assert!(!fake.queue.borrow().is_empty(), "restore is still queued");
+    let before = fake.drains.get();
+    assert!(cache.capture(&fake, SnapshotKind::Prompt, &next, &writer,
+        After::from_logits(&logits, true)).unwrap());
+    assert!(fake.drains.get() > before, "old mark readers drain before slot reuse");
+    let mut restored = admitted.placement;
+    let mut longer = first;
+    longer.push(900);
+    fake.forward(&mut restored, &longer).unwrap();
+    fake.forward(&mut writer, &next).unwrap();
+    cache.release(&fake, &restored.pages).unwrap();
+    cache.release(&fake, &writer.pages).unwrap();
+    cache.clear(&fake).unwrap();
+    assert_eq!(cache.pool().free(), 64);
+    assert_eq!(cache.arena().in_use(), 0);
+}
+
+#[test]
+fn zero_mark_budget_skips_capture_without_changing_active_state() {
+    let fake = Fake::new(16, 1, 0);
+    let mut cache = cache(&fake, 20, 0);
+    let prompt = seq(100, 12);
+    let mut placement = cache.admit(&fake, &prompt, 16, false,
+        |pages| Placement { pages, ring: 0, len: 0, ring_from: 0 }).unwrap().placement;
+    let logits = fake.forward(&mut placement, &prompt).unwrap();
+    assert!(!cache.capture(&fake, SnapshotKind::Prompt, &prompt, &placement,
+        After::from_logits(&logits, true)).unwrap());
+    assert_eq!(cache.stats().capture_skips, 1);
+    let mut longer = prompt;
+    longer.push(900);
+    fake.forward(&mut placement, &longer).unwrap();
+    cache.release(&fake, &placement.pages).unwrap();
+    cache.clear(&fake).unwrap();
+    assert_eq!(cache.pool().free(), 16);
     assert_eq!(cache.arena().in_use(), 0);
 }
 
@@ -627,6 +880,138 @@ fn host_tier_restores_evicted_snapshots_exactly_and_shares_identical_prefixes() 
 }
 
 #[test]
+fn draft_pressure_evicts_only_retention_and_guarantees_live_proposal_credit() {
+    let fake = Fake::new(256, 3, 16);
+    let draft_tokens = 12 * 64;
+    let bytes = fake.draft_range(0).addr as usize + draft_tokens * ROW;
+    *fake.mem.borrow_mut() = StubCopyEngine::new(CopyModel::default(), bytes, 1 << 26);
+    *fake.draft.borrow_mut() = Some(DraftFixture {
+        pool: DraftPagePool::new(draft_tokens, 3, 4096, 23).unwrap(), bindings: vec![None; 3],
+    });
+    let mut cache: PrefixCache<Shared> = PrefixCache::new_with_draft_pages(fake.layout(),
+        config(16, 16), None, fake.draft_page_bytes()).unwrap();
+    for n in 0..10 {
+        let tokens = seq(100 + n, 64);
+        let mut p = cache.admit_cold(&fake, 64, 64,
+            |pages| Placement { pages, ring: 0, len: 0, ring_from: 0 }).unwrap().placement;
+        let logits = fake.forward(&mut p, &tokens).unwrap();
+        {
+            let mut draft = fake.draft.borrow_mut();
+            let draft = draft.as_mut().unwrap();
+            let binding = draft.bindings[0].unwrap();
+            let producer = draft.pool.reserve(binding, 0, 64).unwrap();
+            draft.pool.commit(producer, 64).unwrap();
+        }
+        cache.capture(&fake, SnapshotKind::Turn, &tokens, &p, After::from_logits(&logits, true)).unwrap();
+        fake.discard(&mut p).unwrap();
+        cache.release(&fake, &p.pages).unwrap();
+    }
+    assert_eq!(cache.stats().entries_turn, 10);
+    let before = fake.draft.borrow().as_ref().unwrap().pool.free();
+    assert!(before <= 3);
+    let mut live = Vec::new();
+    for slot in 0..3 {
+        live.push(cache.admit_cold(&fake, 65, 65,
+            |pages| Placement { pages, ring: slot, len: 0, ring_from: 0 }).unwrap().placement);
+    }
+    // Every old draft attachment was revoked, but all target snapshots survive.
+    assert_eq!(cache.stats().entries_turn, 10);
+    {
+        let mut draft = fake.draft.borrow_mut();
+        let draft = draft.as_mut().unwrap();
+        for slot in 0..3 {
+            let binding = draft.bindings[slot].unwrap();
+            let rows = draft.pool.reserve(binding, 0, 65).unwrap();
+            draft.pool.commit(rows, 65).unwrap();
+            let proposal = draft.pool.reserve(binding, 65, 8).unwrap();
+            draft.pool.commit(proposal, 0).unwrap();
+        }
+    }
+    for p in &mut live { fake.discard(p).unwrap(); cache.release(&fake, &p.pages).unwrap(); }
+    // Draft-only revocation never turns a valid target hit into a miss. Its drafter
+    // binds cold at P, with no historical page from a previous slot occupant.
+    let prompt = seq(100, 64);
+    let mut hit = cache.admit(&fake, &prompt, 0, false,
+        |pages| Placement { pages, ring: 0, len: 0, ring_from: 0 }).unwrap();
+    assert_eq!(hit.resume, 64);
+    let binding = fake.draft.borrow().as_ref().unwrap().bindings[0].unwrap();
+    assert_eq!(fake.draft.borrow().as_ref().unwrap().pool.frontier(binding).unwrap(), (64, 64));
+    fake.discard(&mut hit.placement).unwrap();
+    cache.release(&fake, &hit.placement.pages).unwrap();
+    cache.clear(&fake).unwrap();
+    assert_eq!(fake.draft.borrow().as_ref().unwrap().pool.free(), 12);
+}
+
+#[test]
+fn typed_draft_pages_follow_target_device_and_host_restores_exactly() {
+    for frontier in [63usize, 64, 65] {
+        let mut fake = Fake::new(80, 4, 8);
+        fake.writable_lag = 1;
+        let draft_tokens = 2048;
+        let device_bytes = fake.draft_range(0).addr as usize + draft_tokens * ROW;
+        *fake.mem.borrow_mut() = StubCopyEngine::new(CopyModel::default(), device_bytes, 1 << 26);
+        *fake.draft.borrow_mut() = Some(DraftFixture {
+            pool: DraftPagePool::new(draft_tokens, 4, 4096, 23).unwrap(), bindings: vec![None; 4],
+        });
+        let host = HostConfig { bytes: 1 << 20, chunk_bytes: 1 << 16, min_tokens: 1, ..HostConfig::default() };
+        let mut cache = PrefixCache::new_with_draft_pages(fake.layout(), config(8, 8),
+            Some((host, Shared(fake.mem.clone()))), fake.draft_page_bytes()).unwrap();
+        let tokens = seq(100, frontier);
+        let mut p = cache.admit_cold(&fake, frontier, 0,
+            |pages| Placement { pages, ring: 0, len: 0, ring_from: 0 }).unwrap().placement;
+        let logits = fake.forward(&mut p, &tokens).unwrap();
+        {
+            let mut state = fake.draft.borrow_mut();
+            let state = state.as_mut().unwrap();
+            let binding = state.bindings[0].unwrap();
+            let reservation = state.pool.reserve(binding, 0, frontier).unwrap();
+            for (position, physical) in state.pool.destinations(reservation).unwrap().into_iter().enumerate() {
+                let range = DeviceRange { addr: fake.draft_range(0).addr + physical as u64 * ROW as u64, bytes: ROW };
+                fake.mem.borrow_mut().write_device(range, &(position as u64 + 1).to_le_bytes());
+            }
+            state.pool.commit(reservation, frontier).unwrap();
+            state.bindings[0] = Some(binding);
+        }
+        cache.capture(&fake, SnapshotKind::Turn, &tokens, &p, After::from_logits(&logits, true)).unwrap();
+        fake.mem.borrow_mut().advance(10_000_000);
+        cache.tick();
+        assert_eq!(cache.stats().host.unwrap().stores_completed, 1);
+        cache.release(&fake, &p.pages).unwrap();
+        // First the device attachment, then the same snapshot after device eviction.
+        for host_hit in [false, true] {
+            if host_hit { cache.clear(&fake).unwrap(); }
+            let admitted = cache.admit(&fake, &tokens, 0, false,
+                |pages| Placement { pages, ring: 1, len: 0, ring_from: 0 }).unwrap();
+            assert_eq!(admitted.resume, frontier);
+            fake.forward(&mut { admitted.placement.clone() }, &tokens).unwrap();
+            fake.drain().unwrap();
+            let mut state = fake.draft.borrow_mut();
+            let state = state.as_mut().unwrap();
+            let binding = state.bindings[1].unwrap();
+            assert_eq!(state.pool.frontier(binding).unwrap(), (0, frontier));
+            let proposal = state.pool.reserve(binding, frontier, 1).unwrap();
+            let pages = state.pool.page_table(proposal).unwrap();
+            for position in 0..frontier {
+                let row = pages[position / 64] as u64 * 64 + (position % 64) as u64;
+                let range = DeviceRange { addr: fake.draft_range(0).addr + row * ROW as u64, bytes: ROW };
+                assert_eq!(fake.mem.borrow().read_device(range), (position as u64 + 1).to_le_bytes());
+            }
+            state.pool.commit(proposal, 0).unwrap();
+            state.pool.release(binding).unwrap();
+            state.bindings[1] = None;
+            cache.release(&fake, &admitted.placement.pages).unwrap();
+        }
+        assert_eq!(cache.stats().promotions, 1);
+        cache.clear(&fake).unwrap();
+        let mut state = fake.draft.borrow_mut();
+        let state = state.as_mut().unwrap();
+        state.pool.release(state.bindings[0].take().unwrap()).unwrap();
+        assert_eq!(state.pool.free(), state.pool.capacity());
+        assert!(cache.stats().host.unwrap().bytes_used <= 1 << 20);
+    }
+}
+
+#[test]
 fn family_metadata_survives_host_promotion_and_tail_cow() {
     #[derive(Clone, Debug, Default, PartialEq, Eq)]
     struct Metadata { len: usize, logical_pages: usize, generation: u64 }
@@ -712,6 +1097,79 @@ fn family_metadata_survives_host_promotion_and_tail_cow() {
     assert_eq!(cache.stats().promotions, 2);
     cache.clear(&family).unwrap();
     assert_eq!(cache.pool().free(), 64);
+
+    // A target-only turn must not hide a shorter predictor-complete prompt.
+    // Repeat selection on device, then with both entries resident only on host.
+    let short = seq(3000, 13);
+    let mut long = short.clone();
+    long.extend(seq(4000, 8));
+    for (tokens, generation, kind) in [(&short, 200, SnapshotKind::Prompt), (&long, 0, SnapshotKind::Turn)] {
+        family.generation.set(generation);
+        let mut source = cache.admit_cold(&family, tokens.len(), tokens.len(),
+            |pages| Placement { pages, ring: 0, len: 0, ring_from: 0 }).unwrap().placement;
+        let logits = family.fake.forward(&mut source, tokens).unwrap();
+        assert!(cache.capture(&family, kind, tokens, &source, After::from_logits(&logits, true)).unwrap());
+        family.fake.mem.borrow_mut().advance(10_000_000);
+        cache.tick();
+        cache.release(&family, &source.pages).unwrap();
+    }
+    let mut next = long.clone();
+    next.push(5000);
+    let complete = |meta: &Metadata, frontier| meta.generation == 200 && meta.len == frontier;
+    for host_only in [false, true] {
+        if host_only { cache.clear(&family).unwrap(); }
+        assert_eq!(cache.peek_media(&next, &[], false), long.len());
+        assert_eq!(cache.peek_media_compatible(&next, &[], false, &complete), short.len());
+        let hit = cache.admit_native_compatible(&family, &next, &next, &[], next.len(), false,
+            Some(&complete), |pages| Placement { pages, ring: 1, len: 0, ring_from: 0 }).unwrap();
+        assert_eq!(hit.resume, short.len());
+        if host_only { assert!(hit.source.unwrap().host); }
+        let mut restored = hit.placement;
+        let restored_logits = family.fake.forward(&mut restored, &next).unwrap();
+        let mut cold = cache.admit_cold(&family, next.len(), next.len(),
+            |pages| Placement { pages, ring: 2, len: 0, ring_from: 0 }).unwrap().placement;
+        assert_eq!(restored_logits, family.fake.forward(&mut cold, &next).unwrap());
+        for row in next.len().saturating_sub(WINDOW)..next.len() {
+            let mem = family.fake.mem.borrow();
+            assert_eq!(mem.read_device(family.fake.ring_row(restored.ring, row)),
+                mem.read_device(family.fake.ring_row(cold.ring, row)));
+        }
+        cache.release(&family, &cold.pages).unwrap();
+        cache.release(&family, &restored.pages).unwrap();
+    }
+    let hit = cache.admit_native_compatible(&family, &next, &next, &[], next.len(), false,
+        Some(&complete), |pages| Placement { pages, ring: 1, len: 0, ring_from: 0 }).unwrap();
+    let mut restored = hit.placement;
+    let restored_logits = family.fake.forward(&mut restored, &next).unwrap();
+    // A drafting continuation publishes a complete turn, then hits it on
+    // the next turn rather than falling back to its original prompt.
+    family.generation.set(200);
+    assert!(cache.capture(&family, SnapshotKind::Turn, &next, &restored,
+        After::from_logits(&restored_logits, true)).unwrap());
+    cache.release(&family, &restored.pages).unwrap();
+    let mut turn = next.clone();
+    turn.push(5001);
+    let hit = cache.admit_native_compatible(&family, &turn, &turn, &[], turn.len(), false,
+        Some(&complete), |pages| Placement { pages, ring: 3, len: 0, ring_from: 0 }).unwrap();
+    assert_eq!(hit.resume, next.len());
+    let mut continued = hit.placement;
+    let logits = family.fake.forward(&mut continued, &turn).unwrap();
+    let mut cold = cache.admit_cold(&family, turn.len(), turn.len(),
+        |pages| Placement { pages, ring: 2, len: 0, ring_from: 0 }).unwrap().placement;
+    assert_eq!(logits, family.fake.forward(&mut cold, &turn).unwrap());
+    for row in turn.len().saturating_sub(WINDOW)..turn.len() {
+        let mem = family.fake.mem.borrow();
+        assert_eq!(mem.read_device(family.fake.ring_row(continued.ring, row)),
+            mem.read_device(family.fake.ring_row(cold.ring, row)));
+    }
+    cache.release(&family, &cold.pages).unwrap();
+    cache.release(&family, &continued.pages).unwrap();
+    let reject = |_: &Metadata, _: usize| false;
+    let hit = cache.admit_native_compatible(&family, &next, &next, &[], next.len(), false,
+        Some(&reject), |pages| Placement { pages, ring: 1, len: 0, ring_from: 0 }).unwrap();
+    assert_eq!(hit.resume, 0);
+    cache.release(&family, &hit.placement.pages).unwrap();
+    cache.clear(&family).unwrap();
 }
 
 #[test]
@@ -1305,4 +1763,86 @@ fn two_slot_host_working_set_retains_pages_and_promotes_only_marks_under_pressur
         assert_eq!((cache.stats().mark_promotions, cache.stats().promotions), (12, 0));
         assert_eq!((cache.stats().host_hits, cache.stats().device_hits), (12, 0));
     }
+}
+
+#[test]
+fn lagging_predictor_readers_and_writer_cannot_mutate_retained_snapshot() {
+    for frontier in [255, 256, 257, 512] {
+        for lag in [1, 5] {
+            for queued in [false, true] {
+                let fake = Fake { writable_lag: lag, ..Fake::new(600, 4, 2) };
+                let mut cache = cache(&fake, 2, 0);
+                let tokens = seq(100, frontier);
+                let build = |ring| move |pages| Placement { pages, ring, len: 0, ring_from: 0 };
+                let mut writer = cache.admit_cold(&fake, frontier, frontier + 1, build(0)).unwrap().placement;
+                fake.forward(&mut writer, &tokens).unwrap();
+                if queued {
+                    assert_eq!(cache.queue_capture(&fake, SnapshotKind::Turn, &tokens, &[], &writer,
+                        After::default()).unwrap(), Captured::Done);
+                } else {
+                    assert!(cache.capture(&fake, SnapshotKind::Turn, &tokens, &writer, After::default()).unwrap());
+                }
+                fake.drain().unwrap();
+                let row = |p: &Placement, position: usize| fake.page_row(p.pages[position / ROWS], position % ROWS);
+                let snapshot = |p: &Placement| (0..frontier).map(|i|
+                    fake.mem.borrow().read_device(row(p, i)).to_vec()).collect::<Vec<_>>();
+                let original = snapshot(&writer);
+                // A writer can close its own pending row after retaining the snapshot.
+                fake.mem.borrow_mut().write_device(row(&writer, frontier - lag), &value(4, &[900]));
+                let mut continuation = tokens.clone();
+                continuation.push(903);
+                let first = cache.admit(&fake, &continuation, frontier + 1, false, build(1)).unwrap();
+                assert_eq!(first.resume, frontier);
+                fake.drain().unwrap();
+                assert_eq!(snapshot(&first.placement), original);
+                fake.mem.borrow_mut().write_device(row(&first.placement, frontier - lag), &value(4, &[901]));
+                let second = cache.admit(&fake, &continuation, frontier + 1, false, build(2)).unwrap();
+                assert_eq!(second.resume, frontier);
+                fake.drain().unwrap();
+                assert_eq!(snapshot(&second.placement), original);
+                fake.mem.borrow_mut().write_device(row(&second.placement, frontier - lag), &value(4, &[902]));
+                assert_eq!(fake.mem.borrow().read_device(row(&first.placement, frontier - lag)), &value(4, &[901]));
+                let third = cache.admit(&fake, &continuation, frontier + 1, false, build(3)).unwrap();
+                assert_eq!(third.resume, frontier);
+                fake.drain().unwrap();
+                assert_eq!(snapshot(&third.placement), original, "frontier={frontier} lag={lag} queued={queued}");
+                for placement in [&writer, &first.placement, &second.placement, &third.placement] {
+                    cache.release(&fake, &placement.pages).unwrap();
+                }
+                cache.clear(&fake).unwrap();
+                assert_eq!(cache.pool().free(), fake.pages);
+            }
+        }
+    }
+}
+
+#[test]
+fn predictor_inclusive_host_pages_do_not_deduplicate_by_target_tokens() {
+    let fake = Fake { writable_lag: 1, ..Fake::new(600, 2, 2) };
+    let mut cache = cache(&fake, 2, 1 << 20);
+    let tokens = seq(100, 256);
+    let mut writer = cache.admit_cold(&fake, 256, 257,
+        |pages| Placement { pages, ring: 0, len: 0, ring_from: 0 }).unwrap().placement;
+    fake.forward(&mut writer, &tokens).unwrap();
+    let row = |p: &Placement| fake.page_row(p.pages[255 / ROWS], 255 % ROWS);
+    fake.mem.borrow_mut().write_device(row(&writer), &value(4, &[900]));
+    assert!(cache.capture(&fake, SnapshotKind::Prompt, &tokens, &writer, After::default()).unwrap());
+    fake.mem.borrow_mut().advance(10_000_000);
+    cache.tick();
+    fake.mem.borrow_mut().write_device(row(&writer), &value(4, &[901]));
+    assert!(cache.capture(&fake, SnapshotKind::Turn, &tokens, &writer, After::default()).unwrap());
+    fake.mem.borrow_mut().advance(10_000_000);
+    cache.tick();
+    cache.release(&fake, &writer.pages).unwrap();
+    cache.clear(&fake).unwrap();
+    let mut continuation = tokens.clone();
+    continuation.push(902);
+    let restored = cache.admit(&fake, &continuation, 257, false,
+        |pages| Placement { pages, ring: 1, len: 0, ring_from: 0 }).unwrap();
+    assert_eq!(restored.resume, 256);
+    assert!(restored.source.unwrap().host);
+    fake.drain().unwrap();
+    assert_eq!(fake.mem.borrow().read_device(row(&restored.placement)), value(4, &[901]));
+    cache.release(&fake, &restored.placement.pages).unwrap();
+    cache.clear(&fake).unwrap();
 }

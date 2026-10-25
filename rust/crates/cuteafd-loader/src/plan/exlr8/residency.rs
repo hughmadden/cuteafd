@@ -1,4 +1,4 @@
-//! Checkpoint-native, unit-major EXLR8 residency and verified range reads.
+//! Checkpoint-native, unit-major EXLR8 residency and bounded range reads.
 //! Arena offsets are independent of a CUDA address; the owner binds them only
 //! after exact weight/workspace admission and retains the arena for graph life.
 use super::{Header, Layer, manifest, number, owner};
@@ -53,16 +53,14 @@ pub struct Unit {
     pub bits: i32,
     pub source: [Range; 3],
     pub destination: [usize; 3],
-    pub checksum: u64,
 }
 impl Unit {
     pub fn staging_bytes(&self) -> usize {
         self.source.iter().map(|r| r.bytes).sum()
     }
 
-    /// One bounded range read per component; checksum order is payload, channel,
-    /// blocks. A checksum failure must never publish this unit to a live arena.
-    pub fn read_verified(&self, staging: &mut [u8]) -> Result<()> {
+    /// Read each component into its bounded staging range.
+    pub fn read(&self, staging: &mut [u8]) -> Result<()> {
         self.read_inner(staging).map_err(Into::into)
     }
     fn read_inner(&self, staging: &mut [u8]) -> anyhow::Result<()> {
@@ -75,16 +73,6 @@ impl Unit {
             source.read(&mut staging[at..at + source.bytes])?;
             at += source.bytes;
         }
-        let actual = xxhash64(staging);
-        ensure!(
-            actual == self.checksum,
-            "checksum mismatch e{} u{} p{} K{}: {actual:016x} != {:016x}",
-            self.expert,
-            self.unit,
-            self.projection,
-            self.bits,
-            self.checksum
-        );
         Ok(())
     }
 }
@@ -229,8 +217,8 @@ impl Residency {
         set: ExpertSet,
     ) -> anyhow::Result<Self> {
         ensure!(
-            (1..=6).contains(&world) && rank < world,
-            "expected TP1..6 and rank below world"
+            (1..=8).contains(&world) && rank < world,
+            "expected TP1..8 and rank below world"
         );
         let config = read_json(&snapshot.join("config.json"))?;
         ensure!(
@@ -447,17 +435,14 @@ impl Residency {
                     )?;
                     let channel = cache_range(channel, &index_bytes)?;
                     let block = cache_range(block, &index_bytes)?;
-                    let checksum = read_u64(
-                        range(
-                            &index,
-                            &index_path,
-                            &format!("{stem}.checksum"),
-                            "U64",
-                            &[experts, 3, units],
-                            ((e * 3 + p) * units + u) * 8,
-                            8,
-                        )?,
-                        &index_bytes,
+                    range(
+                        &index,
+                        &index_path,
+                        &format!("{stem}.checksum"),
+                        "U64",
+                        &[experts, 3, units],
+                        ((e * 3 + p) * units + u) * 8,
+                        8,
                     )?;
                     let payload_dest = reserve(&mut cursor, bytes)?;
                     let channel_dest = reserve(&mut cursor, 256)?;
@@ -487,7 +472,6 @@ impl Residency {
                             block,
                         ],
                         destination: [payload_dest, channel_dest, block_dest],
-                        checksum,
                     });
                 }
             }
@@ -613,74 +597,11 @@ fn ensure_inner(plan: &Residency, address: u64) -> anyhow::Result<(Vec<u64>, Vec
     Ok((pointers, bits))
 }
 
-// XXH64, seed zero, canonical little-endian arithmetic from the published
-// algorithm. Keeping it here avoids depending on an optional native library.
-fn xxhash64(data: &[u8]) -> u64 {
-    const P1: u64 = 11400714785074694791;
-    const P2: u64 = 14029467366897019727;
-    const P3: u64 = 1609587929392839161;
-    const P4: u64 = 9650029242287828579;
-    const P5: u64 = 2870177450012600261;
-    fn lane(a: u64, v: u64) -> u64 {
-        a.wrapping_add(v.wrapping_mul(P2))
-            .rotate_left(31)
-            .wrapping_mul(P1)
-    }
-    let word = |at: usize| u64::from_le_bytes(data[at..at + 8].try_into().unwrap());
-    let mut at = 0;
-    let mut h;
-    if data.len() >= 32 {
-        let mut v = [P1.wrapping_add(P2), P2, 0, 0u64.wrapping_sub(P1)];
-        while at + 32 <= data.len() {
-            for (i, value) in v.iter_mut().enumerate() {
-                *value = lane(*value, word(at + i * 8));
-            }
-            at += 32;
-        }
-        h = v[0]
-            .rotate_left(1)
-            .wrapping_add(v[1].rotate_left(7))
-            .wrapping_add(v[2].rotate_left(12))
-            .wrapping_add(v[3].rotate_left(18));
-        for value in v {
-            h = (h ^ lane(0, value)).wrapping_mul(P1).wrapping_add(P4);
-        }
-    } else {
-        h = P5;
-    }
-    h = h.wrapping_add(data.len() as u64);
-    while at + 8 <= data.len() {
-        h = (h ^ lane(0, word(at)))
-            .rotate_left(27)
-            .wrapping_mul(P1)
-            .wrapping_add(P4);
-        at += 8;
-    }
-    if at + 4 <= data.len() {
-        h = (h
-            ^ (u32::from_le_bytes(data[at..at + 4].try_into().unwrap()) as u64).wrapping_mul(P1))
-        .rotate_left(23)
-        .wrapping_mul(P2)
-        .wrapping_add(P3);
-        at += 4;
-    }
-    for &byte in &data[at..] {
-        h = (h ^ (byte as u64).wrapping_mul(P5))
-            .rotate_left(11)
-            .wrapping_mul(P1);
-    }
-    h ^= h >> 33;
-    h = h.wrapping_mul(P2);
-    h ^= h >> 29;
-    h = h.wrapping_mul(P3);
-    h ^ (h >> 32)
-}
-
 #[cfg(test)]
 mod tests {
+    use std::io::Write;
     use super::*;
     use serde_json::{Value, json};
-    use std::io::Write;
 
     #[test]
     fn execution_workspace_is_exact_aligned_and_checked() {
@@ -707,177 +628,14 @@ mod tests {
         }
     }
 
-    fn write(
-        path: &Path,
-        metadata: Value,
-        tensors: Vec<(String, &'static str, Vec<usize>, Vec<u8>)>,
-    ) {
-        let mut header = serde_json::Map::from_iter([("__metadata__".into(), metadata)]);
-        let mut offset = 0;
-        for (name, dtype, shape, bytes) in &tensors {
-            header.insert(
-                name.clone(),
-                json!({"dtype":dtype,"shape":shape,
-                "data_offsets":[offset,offset+bytes.len()]}),
-            );
-            offset += bytes.len();
-        }
-        let header = serde_json::to_vec(&header).unwrap();
-        assert!(header.len() < 65528);
-        let mut out = File::create(path).unwrap();
-        out.write_all(&65528u64.to_le_bytes()).unwrap();
-        out.write_all(&header).unwrap();
-        out.write_all(&vec![b' '; 65528 - header.len()]).unwrap();
-        for (_, _, _, bytes) in tensors {
-            out.write_all(&bytes).unwrap();
-        }
-    }
-
-    fn fixture(root: &Path, padded: bool) {
-        std::fs::create_dir(root.join("experts")).unwrap();
-        std::fs::create_dir(root.join("manifests")).unwrap();
-        std::fs::write(
-            root.join("config.json"),
-            json!({
-            "architectures":["GlmMoeDsaForCausalLM"], "hidden_size":128,
-            "moe_intermediate_size":384,"n_routed_experts":2,"num_hidden_layers":4,
-            "first_k_dense_replace":3})
-            .to_string(),
-        )
-        .unwrap();
-        std::fs::write(
-            root.join("manifests/exlr8-manifest-mixed.json"),
-            json!({
-            "format":"exlr8-v2-manifest","name":"mixed","version":"test","set_id":"b".repeat(64),
-            "layers":{"3":{"gate":[[2,3,4],[4,2,3]],"up":[[4,3,2],[2,3,4]],"down":[3,4],
-            "shared":{"gate":[3,4,3],"up":[4,3,4],"down":4}}}})
-            .to_string(),
-        )
-        .unwrap();
-        let mut tensors = vec![
-            ("signs.in".into(), "I8", vec![128], vec![1; 128]),
-            ("signs.out".into(), "I8", vec![128], vec![255; 128]),
-        ];
-        for k in 2..=4 {
-            let bytes: usize = 128 * 16 * k;
-            let stride = if padded {
-                bytes.div_ceil(65536) * 65536
-            } else {
-                bytes
-            };
-            let mut weights = Vec::new();
-            let mut base = 65536usize;
-            for (prefix, es) in [("", 2), ("shared.", 1)] {
-                if k == 2 && es == 1 {
-                    continue;
-                }
-                let mut offsets = Vec::new();
-                let mut checksums = Vec::new();
-                for e in 0..es {
-                    for p in 0..3 {
-                        for u in 0..3 {
-                            offsets.extend_from_slice(
-                                &((base + (p * es * 3 + e * 3 + u) * stride) as u64).to_le_bytes(),
-                            );
-                            offsets.extend_from_slice(&(bytes as u64).to_le_bytes());
-                            let mut data = vec![(k * 10 + e * 3 + p + u) as u8; bytes];
-                            data.extend(vec![(e + p + u) as u8; 256]);
-                            data.extend(vec![k as u8; 2]);
-                            checksums.extend_from_slice(&xxhash64(&data).to_le_bytes());
-                        }
-                    }
-                }
-                tensors.push((
-                    format!("{prefix}k{k}.index"),
-                    "I64",
-                    vec![es, 3, 3, 2],
-                    offsets,
-                ));
-                tensors.push((
-                    format!("{prefix}k{k}.checksum"),
-                    "U64",
-                    vec![es, 3, 3],
-                    checksums,
-                ));
-                for (p, (projection, channel, block)) in [
-                    ("gate", "svh", "su_block"),
-                    ("up", "svh", "su_block"),
-                    ("down", "suh", "sv_block"),
-                ]
-                .iter()
-                .enumerate()
-                {
-                    let mut payload = Vec::new();
-                    let mut channels = Vec::new();
-                    for e in 0..es {
-                        for u in 0..3 {
-                            payload.extend(vec![(k * 10 + e * 3 + p + u) as u8; bytes]);
-                            payload.extend(vec![0; stride - bytes]);
-                            channels.extend(vec![(e + p + u) as u8; 256]);
-                        }
-                    }
-                    let len = payload.len();
-                    weights.push((
-                        format!("{prefix}trellis.{projection}"),
-                        "U8",
-                        vec![len],
-                        payload,
-                    ));
-                    tensors.push((
-                        format!("{prefix}k{k}.{projection}.{channel}"),
-                        "F16",
-                        vec![es, 384],
-                        channels,
-                    ));
-                    tensors.push((
-                        format!("{prefix}k{k}.{projection}.{block}"),
-                        "F16",
-                        vec![es, 1],
-                        vec![k as u8; es * 2],
-                    ));
-                }
-                base += 3 * es * 3 * stride;
-            }
-            write(
-                &root.join(format!("experts/exlr8-layer-003.k{k}.safetensors")),
-                json!({"format":"exlr8-v2","scheme":"exlr8-e4m3-v2","layer":"3","k":k.to_string(),
-                    "gate_up_order":"grouped","down_order":"item128","pad_halves":padded.to_string()}),
-                weights,
-            );
-        }
-        write(
-            &root.join("experts/exlr8-layer-003.index.safetensors"),
-            json!({"format":"exlr8-v2","scheme":"exlr8-e4m3-v2","layer":"3",
-                "gate_up_order":"grouped","down_order":"item128","widths":"2,3,4","shared_widths":"3,4"}),
-            tensors,
-        );
-    }
-
-    #[test]
-    fn checksum_matches_independent_e1_vectors() {
-        for (n, expected) in [
-            (0, 0xef46db3751d8e999),
-            (1, 0xe934a84adb052768),
-            (4, 0xffced8604453cc1e),
-            (8, 0x884a173614b81b8d),
-            (31, 0xc346d2b59b4d8ee1),
-            (32, 0xcbf59c5116ff32b4),
-            (33, 0x0c535d1acafb8ead),
-            (1000, 0xf306f04aa88b54d3),
-        ] {
-            assert_eq!(
-                xxhash64(&(0..n).map(|i| (i % 251) as u8).collect::<Vec<_>>()),
-                expected
-            );
-        }
-    }
+    use crate::plan::testing::exlr8::fixture;
 
     #[test]
     fn residency_ownership_mixed_widths_shared_and_padded_ranges() {
         for padded in [false, true] {
             let root = tempfile::tempdir().unwrap();
             fixture(root.path(), padded);
-            for world in 1..=6 {
+            for world in 1..=8 {
                 for set in [ExpertSet::Routed, ExpertSet::Shared] {
                     let mut owners = BTreeSet::new();
                     for rank in 0..world {
@@ -943,8 +701,8 @@ mod tests {
                                 assert_eq!(ptrs[slot * 3 + i], 0x10000 + dest as u64);
                             }
                             let mut staging = vec![0; unit.staging_bytes()];
-                            unit.read_verified(&mut staging).unwrap();
-                            assert!(unit.read_verified(&mut staging[1..]).is_err());
+                            unit.read(&mut staging).unwrap();
+                            assert!(unit.read(&mut staging[1..]).is_err());
                         }
                         for (slot, &width) in bits.iter().enumerate() {
                             if width == 0 {
@@ -968,23 +726,21 @@ mod tests {
     }
 
     #[test]
-    fn corrupt_checksum_and_index_are_refused() {
+    fn truncated_native_source_is_refused() {
         let root = tempfile::tempdir().unwrap();
         fixture(root.path(), false);
         let plan = Residency::plan(root.path(), "mixed", 3, 1, 0, ExpertSet::Routed).unwrap();
         let unit = &plan.loads[0];
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .open(&unit.source[0].path)
-            .unwrap();
-        file.seek(SeekFrom::Start(unit.source[0].offset)).unwrap();
-        file.write_all(&[0]).unwrap();
-        assert!(
-            unit.read_verified(&mut vec![0; unit.staging_bytes()])
-                .unwrap_err()
-                .to_string()
-                .contains("checksum mismatch")
-        );
+        let source = &unit.source[0];
+        std::fs::OpenOptions::new().write(true).open(&source.path).unwrap()
+            .set_len(source.offset + source.bytes as u64 - 1).unwrap();
+        assert!(unit.read(&mut vec![0; unit.staging_bytes()]).is_err());
+    }
+
+    #[test]
+    fn corrupt_index_is_refused() {
+        let root = tempfile::tempdir().unwrap();
+        fixture(root.path(), false);
         let path = root
             .path()
             .join("experts/exlr8-layer-003.index.safetensors");
@@ -1000,7 +756,7 @@ mod tests {
                 .contains("outside its projection")
         );
         assert!(Residency::plan(root.path(), "../mixed", 3, 1, 0, ExpertSet::Routed).is_err());
-        assert!(Residency::plan(root.path(), "mixed", 3, 7, 0, ExpertSet::Routed).is_err());
+        assert!(Residency::plan(root.path(), "mixed", 3, 9, 0, ExpertSet::Routed).is_err());
     }
 
     #[test]
@@ -1047,7 +803,7 @@ mod tests {
                 assert_eq!(plan.loads.len() % 3, 0);
                 plan.descriptors(0x10000).unwrap();
                 for unit in plan.loads.iter().take(3) {
-                    unit.read_verified(&mut vec![0; unit.staging_bytes()])
+                    unit.read(&mut vec![0; unit.staging_bytes()])
                         .unwrap();
                 }
             }

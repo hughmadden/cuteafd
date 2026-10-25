@@ -27,6 +27,9 @@ impl RunStatus {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Report {
     pub schema: String,
+    /// Absent in historical reports that used synthetic prompts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_content: Option<String>,
     pub id: String,
     /// RFC 3339 UTC.
     pub created: String,
@@ -79,8 +82,14 @@ impl ServerInfo {
     /// The checkpoint repository the server loaded (`org/name` from a Hugging Face
     /// snapshot path), else the served model name: quants of one model share a
     /// served name but not a checkpoint.
+    /// The checkpoint repo; a weight variant's run appends its public id, so its
+    /// card, export directory and published row never pass as the base's.
     pub fn checkpoint(&self) -> String {
-        hub_repo(self.configuration.snapshot.as_deref().unwrap_or("")).unwrap_or_else(|| self.model.clone())
+        let repo = hub_repo(self.configuration.snapshot.as_deref().unwrap_or("")).unwrap_or_else(|| self.model.clone());
+        match &self.variant {
+            Some(_) if repo != self.model => format!("{repo} · {}", self.model),
+            _ => repo,
+        }
     }
 }
 
@@ -92,6 +101,10 @@ mod checkpoint_tests {
         assert_eq!(s.checkpoint(), "zai-org/GLM-5.3");
         s.configuration.snapshot = Some("/root/.cache/huggingface/hub/models--nvidia--GLM-5.3-NVFP4/snapshots/e3b8".into());
         assert_eq!(s.checkpoint(), "nvidia/GLM-5.3-NVFP4");
+        // A weight variant's run keeps the checkpoint but names the variant.
+        s.model = "glm-5.3-alternate".into();
+        s.variant = Some(serde_json::json!({"name": "alternate", "availability": {"state": "ready"}}));
+        assert_eq!(s.checkpoint(), "nvidia/GLM-5.3-NVFP4 · glm-5.3-alternate");
     }
 }
 
@@ -112,6 +125,10 @@ pub struct ServerInfo {
     /// RFC 3339 UTC of the server's start.
     #[serde(default)]
     pub started: Option<String>,
+    /// The `/v1/models` `variant` object when the run measured a weight
+    /// variant (`model` is then the variant's public id, not the base's).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub variant: Option<serde_json::Value>,
 }
 
 impl ServerInfo {
@@ -447,6 +464,9 @@ pub struct FabricPort {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct Configuration {
+    /// Renderer capability; absent preserves requests to older servers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supports_thinking_off: Option<bool>,
     #[serde(default)]
     pub snapshot: Option<String>,
     /// Storage formats per tensor group (from `cuteafd plan`).
@@ -465,6 +485,12 @@ pub struct Configuration {
 }
 
 impl Configuration {
+    pub fn supports_thinking_off(&self) -> bool { self.supports_thinking_off != Some(false) }
+
+    pub fn thinking_label(&self) -> &'static str {
+        if self.supports_thinking_off() { "thinking off" } else { "thinking always on (template)" }
+    }
+
     /// Options whose value differs from the default (the chips).
     pub fn non_default(&self) -> impl Iterator<Item = &Setting> {
         self.settings.iter().filter(|s| s.differs())
@@ -551,6 +577,9 @@ pub struct Baseline {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BasicCard {
+    /// Actual request mode; always-thinking templates must not be compared as off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking: Option<String>,
     /// C1 decode per content type, thinking off.
     pub decode: Vec<ContentRate>,
     /// Code decode sweep, thinking off; aggregate over each batch's decode interval.
@@ -558,6 +587,9 @@ pub struct BasicCard {
     pub concurrency: Vec<ConcurrentRate>,
     #[serde(default)]
     pub prefill: Option<PrefillRate>,
+    /// Server tokens per reference token from the corpus warm-up fit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_token_ratio: Option<f64>,
     /// Seconds of the untimed warm-up requests (first-use loads, graphs, tables).
     #[serde(default)]
     pub warmup_s: Option<f64>,

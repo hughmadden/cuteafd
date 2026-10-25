@@ -760,7 +760,7 @@ mod http_503_mapping {
 
     fn dummy_job() -> openai::NativeRequest {
         let (events, _receive) = tokio::sync::mpsc::unbounded_channel();
-        openai::NativeRequest {
+        openai::NativeRequest { variant: 0,
             prefix_cache_source: Default::default(), literal_spans: Vec::new(), prompt: String::new(),
             constraint: None,
             images: Vec::new(), media: Vec::new(), audio: Vec::new(),

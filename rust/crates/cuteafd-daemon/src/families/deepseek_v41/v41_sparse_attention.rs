@@ -112,6 +112,15 @@ fn validate_plan_installation(installed: bool, graph_count: usize, pending: bool
     Ok(())
 }
 
+/// Exact-pointer (non-descriptor) keys at decode-band rows come only from short
+/// prefill and replay passes: they embed one request's cache and proposal
+/// addresses and never repeat. Capturing them filled the per-layer bank and
+/// evicted warmed descriptor keys, so every new request recaptured decode
+/// graphs (#500). They execute eagerly; the bank stays decode-only below the
+/// full-chunk and decoder-replay shapes, which graph_policy still captures.
+fn exact_small_shape(batched: bool, rows: usize, batch_rows: usize) -> bool {
+    !batched && rows <= batch_rows
+}
 fn slice(mut b: CuteafdDeviceBuffer, offset: usize, bytes: usize) -> CuteafdDeviceBuffer {
     debug_assert!(offset + bytes <= b.bytes);
     b.ptr = unsafe { b.ptr.cast::<u8>().add(offset).cast() };
@@ -676,7 +685,8 @@ impl<'a,const HEADS:usize> LocalSparseAttentionWave<'a,HEADS> {
         }
         let fixed_limit = super::graph_policy::fixed_binding_limit();
         if cached.is_none() && (!super::graph_policy::captures_shape(rows as u32)
-            || fixed_limit.is_some_and(|limit| self.graph_count(layer) >= limit)) {
+            || fixed_limit.is_some_and(|limit| self.graph_count(layer) >= limit)
+            || exact_small_shape(batch.is_some(), rows, self.batch_rows)) {
             // Exact fingerprints can include launch recipes beyond row count.
             // Freeze the bounded bank rather than evicting and recapturing them.
             tracing::debug!(target: "cuteafd::target_step", layer, rows,
@@ -813,5 +823,19 @@ mod plan_installation_tests {
         assert!(validate_plan_installation(false, 1, false, 64, 64).is_err());
         assert!(validate_plan_installation(false, 0, true, 64, 64).is_err());
         assert!(validate_plan_installation(false, 0, false, 6, 64).is_err());
+    }
+}
+
+#[cfg(test)]
+mod exact_small_shape_tests {
+    use super::exact_small_shape;
+    #[test]
+    fn prefill_exact_keys_never_enter_the_decode_bank() {
+        for rows in [1, 6, 52, 57, 64] {
+            assert!(exact_small_shape(false, rows, 64), "exact prefill rows {rows} must run eagerly");
+            assert!(!exact_small_shape(true, rows, 64), "descriptor decode rows {rows} must stay capturable");
+        }
+        // Full prefill chunks and the decoder replay keep their own retained graphs.
+        for rows in [128, 2048] { assert!(!exact_small_shape(false, rows, 64)); }
     }
 }

@@ -132,6 +132,7 @@ pub(crate) struct Draft {
 }
 
 pub(crate) struct MimoDrafter<'a> {
+    pub(crate) kv_cache: cuteafd_loader::families::qwen4::Qwen4KvCache,
     library: &'a NativeLibrary,
     timing: crate::shared::draft::timing::DraftTiming<'a>,
     pub cfg: DflashConfig,
@@ -361,7 +362,8 @@ impl<'a> MimoDrafter<'a> {
             MimoDraftRepresentation::Bf16Only => ("bf16", "bf16-linear"),
             MimoDraftRepresentation::Fp8Only => ("fp8", "w8a16-chunk64"),
         };
-        let numerics = format!("{storage}-{rows}-{head}-{:?}-r1", self.confidence_scales).to_ascii_lowercase();
+        let kv = if self.kv_cache == cuteafd_loader::families::qwen4::Qwen4KvCache::Fp8 { "-kv-fp8" } else { "" };
+        let numerics = format!("{storage}-{rows}-{head}-{:?}{kv}-r1", self.confidence_scales).to_ascii_lowercase();
         let key = format!("mimo_v2/dflash/{numerics}");
         let mut fit = crate::shared::draft_confidence::SelectorFit::load(&self.confidence_directory, &key)?;
         fit.key = key;
@@ -373,12 +375,13 @@ impl<'a> MimoDrafter<'a> {
     /// to `max_sequences` sequences. `mask_row` is the mask token's embedding.
     pub fn load(library: &'a NativeLibrary, dir: &Path, file: Vec<u8>, stream: *mut c_void, slots: usize,
         max_sequences: usize, mask_row: Vec<u8>, representation: MimoDraftRepresentation,
-        scales: fp8_linear::Fp8Scales) -> Result<Self> {
+        scales: fp8_linear::Fp8Scales, kv_cache: cuteafd_loader::families::qwen4::Qwen4KvCache) -> Result<Self> {
         let _memory_scope = cuteafd_ffi::memory_ledger::scope("drafter");
         let cfg = DflashConfig::read(dir)?;
         ensure!(matches!(representation, MimoDraftRepresentation::Bf16Only | MimoDraftRepresentation::Fp8Only),
             "MiMo serving supports only immutable bf16-only or fp8-only drafter storage; historical dual/mixed controls are not production modes");
-        let capacity = MimoDraftCapacity::new(slots, max_sequences, cfg.block)?;
+        let mut capacity = MimoDraftCapacity::new(slots, max_sequences, cfg.block)?;
+        capacity.kv_cache = kv_cache;
         let runtime_layout = cfg.runtime_layout(representation, capacity)?;
         let weight_layout = runtime_layout.weights;
         ensure!(mask_row.len() == cfg.hidden * 2, "mask row of {} bytes", mask_row.len());
@@ -450,8 +453,8 @@ impl<'a> MimoDrafter<'a> {
                 gate_up: matrix(concat(&[(&format!("{p}.mlp.gate_proj.weight"), inter),
                     (&format!("{p}.mlp.up_proj.weight"), inter)], h)?, 2 * inter, h, false)?,
                 down: matrix(tensor(&format!("{p}.mlp.down_proj.weight"), &[h, inter])?, h, inter, false)?,
-                k_ring: zeroed(slots * RING * kv * 2)?,
-                v_ring: zeroed(slots * RING * kv * 2)?,
+                k_ring: zeroed(slots * RING * kv_cache.plane_record_bytes(cfg.kv_heads, cfg.head_dim))?,
+                v_ring: zeroed(slots * RING * kv_cache.plane_record_bytes(cfg.kv_heads, cfg.head_dim))?,
             })
         }).collect::<Result<Vec<_>>>()?;
         let taps = cfg.taps.len() * h;
@@ -459,6 +462,7 @@ impl<'a> MimoDrafter<'a> {
             max_load_staging = weight_layout.max_load_staging, slots, max_sequences,
             "DFlash immutable weight storage");
         Ok(Self {
+            kv_cache,
             library,
             stream,
             slots,
@@ -609,7 +613,7 @@ impl<'a> MimoDrafter<'a> {
                 self.library.mimo_dflash_qk_rope(self.context_kv.buffer.ptr, layer.q_norm.buffer.ptr,
                     layer.k_norm.buffer.ptr, self.context_positions.buffer.ptr, self.context_slots.buffer.ptr,
                     std::ptr::null_mut(), layer.k_ring.buffer.ptr, layer.v_ring.buffer.ptr, n, 0, c.kv_heads,
-                    c.rope_dim, c.theta, c.eps, c.v_scale, s)?;
+                    c.rope_dim, c.theta, c.eps, c.v_scale, self.kv_cache == cuteafd_loader::families::qwen4::Qwen4KvCache::Fp8, s)?;
             }
         }
         self.timing.end(context_span, s)?;
@@ -743,12 +747,12 @@ impl<'a> MimoDrafter<'a> {
                     c.qkv_width())?;
                 l.mimo_dflash_qk_rope(w.qkv.buffer.ptr, layer.q_norm.buffer.ptr, layer.k_norm.buffer.ptr,
                     w.positions.buffer.ptr, std::ptr::null(), w.q.buffer.ptr, w.k.buffer.ptr, w.v.buffer.ptr, rows,
-                    c.heads, c.kv_heads, c.rope_dim, c.theta, eps, c.v_scale, s)?;
+                    c.heads, c.kv_heads, c.rope_dim, c.theta, eps, c.v_scale, false, s)?;
                 l.mimo_dflash_attention(w.q.buffer.ptr, w.k.buffer.ptr, w.v.buffer.ptr, layer.k_ring.buffer.ptr,
                     layer.v_ring.buffer.ptr, w.tables.buffer.ptr, at(&w.tables, s_count * 4),
                     at(&w.tables, 2 * s_count * 4), layer.sinks.as_ref().map_or(std::ptr::null(), |t| t.buffer.ptr),
                     w.attn.buffer.ptr, w.attention_workspace.buffer.ptr, s_count, block, c.heads, c.kv_heads, RING,
-                    max_keys, c.window, 1.0 / (c.head_dim as f32).sqrt(), s)?;
+                    max_keys, c.window, 1.0 / (c.head_dim as f32).sqrt(), self.kv_cache == cuteafd_loader::families::qwen4::Qwen4KvCache::Fp8, s)?;
                 self.linear(w.attn.buffer.ptr, &layer.o, 0, w.delta.buffer.ptr, rows,
                     attention_width, h)?;
                 l.mimo_dflash_add_norm(w.h.buffer.ptr, w.delta.buffer.ptr, layer.post_norm.buffer.ptr, w.n.buffer.ptr,
@@ -819,7 +823,7 @@ pub(crate) fn features(top: &[f32]) -> [f32; 4] {
     [best - top.get(1).copied().unwrap_or(f32::NEG_INFINITY), 1.0 / total, entropy.max(0.0), 0.0]
 }
 
-impl crate::families::glm5::dflash::ReplayDrafter for MimoDrafter<'_> {
+impl crate::shared::speculation::dflash::ReplayDrafter for MimoDrafter<'_> {
     fn block(&self) -> usize {
         self.cfg.block
     }
@@ -828,8 +832,8 @@ impl crate::families::glm5::dflash::ReplayDrafter for MimoDrafter<'_> {
         self.max_sequences.min(self.slots)
     }
 
-    fn resident_modes(&self) -> Vec<crate::families::glm5::dflash::ReplayMode> {
-        use crate::families::glm5::dflash::ReplayMode;
+    fn resident_modes(&self) -> Vec<crate::shared::speculation::dflash::ReplayMode> {
+        use crate::shared::speculation::dflash::ReplayMode;
         let name = match self.representation {
             MimoDraftRepresentation::Bf16Only => "BF16",
             MimoDraftRepresentation::Fp8Only => "FP8",

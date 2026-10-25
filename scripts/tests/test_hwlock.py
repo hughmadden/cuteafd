@@ -145,12 +145,30 @@ def test_canonical_order_and_unknown_locks():
         hwlock.canonical(['gpu2'])
 
 
-def test_kakapo_seed_lock_is_known_and_ordered_last():
-    # The out-of-pool build seed's lock sorts after every serving lock, so a
-    # serving job and a seed lease always take shared locks in one order.
-    assert hwlock.ORDER[-1] == 'kakapo'
-    assert hwlock.canonical(['kakapo', 'moa', 'sparks', 'gpu1', 'rhea', 'gpu0']) == \
-        ['sparks', 'gpu0', 'gpu1', 'rhea', 'moa', 'kakapo']
+def test_lan_seed_locks_are_known_and_ordered_after_serving_then_export_turns():
+    # The LAN-only seeds' leases sort after every serving lock, and each seed's
+    # GPU-export turn after every lease: a build holds its lease when it queues
+    # for the export, so the turn must come later in the one canonical order.
+    assert hwlock.LAN_SEEDS == ('kakapo', 'cassowary')
+    assert hwlock.ORDER[-5:] == ('kakapo', 'cassowary', 'kakapo-export', 'cassowary-export', 'oliver')
+    assert hwlock.canonical(['cassowary-export', 'kakapo', 'moa', 'sparks', 'gpu1', 'cassowary', 'rhea', 'gpu0']) == \
+        ['sparks', 'gpu0', 'gpu1', 'rhea', 'moa', 'kakapo', 'cassowary', 'cassowary-export']
+    assert hwlock.canonical(['oliver', 'gpu0']) == ['gpu0', 'oliver']
+
+
+def test_hold_stops_waiting_when_cancelled(lockdir, monkeypatch):
+    monkeypatch.setattr(hwlock, 'LOCK_DIR', lockdir)
+    busy = spawn(lockdir, 'kakapo-export', 5.0, lockdir / 'busy')
+    try:
+        wait_for(lockdir / 'busy')
+        calls = []
+        with pytest.raises(hwlock.Cancelled):
+            with hwlock.hold(['kakapo-export'], 30, cancelled=lambda: calls.append(1) or len(calls) > 1):
+                pytest.fail('a cancelled waiter never holds the lock')
+        assert not list((lockdir / 'hwq').glob('*.ticket')) or all(
+            'kakapo-export' not in p.read_text() or str(busy.pid) in p.name for p in (lockdir / 'hwq').glob('*.ticket'))
+    finally:
+        busy.wait(timeout=10)
 
 
 def test_older_dual_gpu_waiter_is_not_overtaken_by_later_single_gpu_job(lockdir):

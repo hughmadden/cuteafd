@@ -55,6 +55,9 @@ pub struct ExpertContract {
 pub trait FamilyModel: Send + Sync {
     fn spec(&self) -> &ModelSpec;
 
+    /// Apply explicit execution opt-ins before checking the tensor contract.
+    fn configure(&mut self, _options: &super::PlanOptions) -> Result<(), ConfigError> { Ok(()) }
+
     /// Placement accounts for executable runtime owners, not only checkpoint inventory.
     fn native_serving_admission(&self) -> bool { false }
 
@@ -65,7 +68,7 @@ pub trait FamilyModel: Send + Sync {
     /// solving the same request its runtime admits. `None` means the family
     /// has no adapter: `plan` refuses its layout.
     fn placement(&self, _input: &super::PlanInput, _report: &mut super::PlanReport,
-        _options: &super::layout::LayoutOptions, _requested: super::ExpertPlacement)
+        _options: &mut super::layout::LayoutOptions, _requested: super::ExpertPlacement)
         -> Option<anyhow::Result<cuteafd_core::memory_layout::MemoryLayout>> {
         None
     }

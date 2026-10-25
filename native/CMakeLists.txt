@@ -9,6 +9,7 @@ endif()
 
 option(CUTEAFD_ENABLE_CUDA "Build CUDA kernels and CUDA-backed ABI functions" OFF)
 option(CUTEAFD_ENABLE_VISION_ATTENTION_AOT "Build shared Qwen/GLM BF16 vision attention" OFF)
+option(CUTEAFD_ENABLE_STEER_ROWS_AOT "Build shared weight-variant row steering (cuteafd_steer_rows)" OFF)
 option(CUTEAFD_ENABLE_AUDIO_AOT "Build qualification-only FP32 MiMo audio tower" OFF)
 option(CUTEAFD_ENABLE_V41_LOCAL_EXPERT_AOT "Build full RTX backbone expert kernels alongside dSpark" OFF)
 option(CUTEAFD_ENABLE_V41_TP2_EXPERT_AOT "Build dual RTX TP2 encoder expert kernels" OFF)
@@ -238,7 +239,7 @@ set(CUTEAFD_FP8_EXPERT_FAMILIES OFF)
 if(CUTEAFD_EXPERT_FAMILIES MATCHES ":(fp8|nvfp4)" OR "step5:bf16" IN_LIST CUTEAFD_EXPERT_FAMILIES)
   set(CUTEAFD_FP8_EXPERT_FAMILIES ON)
 endif()
-if(CUTEAFD_ENABLE_AUDIO_AOT OR CUTEAFD_ENABLE_VISION_ATTENTION_AOT OR CUTEAFD_ENABLE_V41_EXPERT_AOT OR CUTEAFD_ENABLE_V41_LOCAL_EXPERT_AOT OR
+if(CUTEAFD_ENABLE_AUDIO_AOT OR CUTEAFD_ENABLE_VISION_ATTENTION_AOT OR CUTEAFD_ENABLE_STEER_ROWS_AOT OR CUTEAFD_ENABLE_V41_EXPERT_AOT OR CUTEAFD_ENABLE_V41_LOCAL_EXPERT_AOT OR
    CUTEAFD_ENABLE_V41_TP2_EXPERT_AOT OR CUTEAFD_ENABLE_EXL3_PACKAGES OR CUTEAFD_ENABLE_V41_NVFP4_AOT OR CUTEAFD_ENABLE_V41_FP8_AOT OR CUTEAFD_ENABLE_V41_ATTENTION_AOT OR CUTEAFD_ENABLE_DSV4_AOT OR CUTEAFD_ENABLE_GLM_AOT OR
    CUTEAFD_ENABLE_MIMO_AOT OR CUTEAFD_ENABLE_GLMF_AOT OR CUTEAFD_ENABLE_QWEN4_AOT OR CUTEAFD_ENABLE_QWEN_DENSE_AOT OR CUTEAFD_ENABLE_STEP5_AOT OR CUTEAFD_ENABLE_KIMIK3_AOT OR CUTEAFD_ENABLE_EXLR8_AOT OR CUTEAFD_FP8_EXPERT_FAMILIES)
   set(CUTEAFD_BUILD_SPARKINFER_AOT ON)
@@ -349,6 +350,9 @@ if(CUTEAFD_ENABLE_CUDA)
     shared/cuda/vocab_head_rows.cu
     families/mimo_v2/cuda/mimo_dflash.cu
     shared/cuda/fp8_block_dequant.cu
+    shared/cuda/fp8_grid_kmajor.cu
+    shared/cuda/load_scale_gather.cu
+    shared/cuda/fp8_load_quant.cu
     shared/cuda/fp8_gemv.cu
     shared/cuda/l2_prefetch.cu
     families/deepseek_v41/cuda/v41_dspark_cache.cu
@@ -443,6 +447,9 @@ endif()
 if(CUTEAFD_ENABLE_VISION_ATTENTION_AOT)
   include(cmake/shared/vision_attention.cmake)
 endif()
+if(CUTEAFD_ENABLE_STEER_ROWS_AOT)
+  include(cmake/shared/steer_rows.cmake)
+endif()
 if(CUTEAFD_ENABLE_AUDIO_AOT)
   include(cmake/shared/audio.cmake)
 endif()
@@ -462,6 +469,10 @@ if(CUTEAFD_ENABLE_VISION_ATTENTION_AOT)
   target_compile_definitions(cuteafd_native PRIVATE CUTEAFD_HAVE_VISION_ATTENTION_AOT=1)
   target_include_directories(cuteafd_native PRIVATE "${CUTEAFD_VISION_ATTENTION_DIR}")
   add_dependencies(cuteafd_native cuteafd_vision_attention_export)
+endif()
+if(CUTEAFD_ENABLE_STEER_ROWS_AOT)
+  target_include_directories(cuteafd_native PRIVATE "${CUTEAFD_STEER_ROWS_DIR}")
+  add_dependencies(cuteafd_native cuteafd_steer_rows_export)
 endif()
 if(CUTEAFD_ENABLE_EXL3_PACKAGES)
   add_dependencies(cuteafd_native cuteafd_v41_exl3_export)
@@ -575,6 +586,12 @@ endif()
 
 enable_testing()
 add_test(NAME cuteafd_native_selftest COMMAND cuteafd_native_selftest)
+# Load-time FP8 quantization shared with the CUDA load kernels, against the
+# host rule's fixture (CPU only).
+add_executable(cuteafd_fp8_load_quant_selftest tests/fp8_load_quant_selftest.cc)
+target_compile_definitions(cuteafd_fp8_load_quant_selftest PRIVATE
+  "CUTEAFD_LOAD_QUANT_FIXTURE=\"${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/fp8_load_quant.bin\"")
+add_test(NAME cuteafd_fp8_load_quant_selftest COMMAND cuteafd_fp8_load_quant_selftest)
 
 if(CUTEAFD_ENABLE_XGRAMMAR)
   add_executable(cuteafd_xgrammar_regular_selftest tests/xgrammar_regular_selftest.cc)
@@ -646,6 +663,26 @@ if(CUTEAFD_ENABLE_CUDA)
   target_link_libraries(cuteafd_cuda_peer_planes_selftest PRIVATE cuteafd_native CUDA::cudart)
   add_test(NAME cuteafd_cuda_peer_planes_selftest COMMAND cuteafd_cuda_peer_planes_selftest)
   set_tests_properties(cuteafd_cuda_peer_planes_selftest PROPERTIES TIMEOUT 30 SKIP_RETURN_CODE 77)
+  add_executable(cuteafd_cuda_load_scale_gather_selftest tests/cuda_load_scale_gather_selftest.cc)
+  target_link_libraries(cuteafd_cuda_load_scale_gather_selftest PRIVATE cuteafd_native CUDA::cudart)
+  add_test(NAME cuteafd_cuda_load_scale_gather_selftest COMMAND cuteafd_cuda_load_scale_gather_selftest)
+  set_tests_properties(cuteafd_cuda_load_scale_gather_selftest PROPERTIES TIMEOUT 30 SKIP_RETURN_CODE 77)
+  add_executable(cuteafd_cuda_fp8_grid_kmajor_selftest tests/cuda_fp8_grid_kmajor_selftest.cc)
+  target_link_libraries(cuteafd_cuda_fp8_grid_kmajor_selftest PRIVATE cuteafd_native CUDA::cudart)
+  add_test(NAME cuteafd_cuda_fp8_grid_kmajor_selftest COMMAND cuteafd_cuda_fp8_grid_kmajor_selftest)
+  set_tests_properties(cuteafd_cuda_fp8_grid_kmajor_selftest PROPERTIES TIMEOUT 30 SKIP_RETURN_CODE 77)
+  add_executable(cuteafd_cuda_fp8_load_quant_selftest tests/cuda_fp8_load_quant_selftest.cc)
+  target_link_libraries(cuteafd_cuda_fp8_load_quant_selftest PRIVATE cuteafd_native CUDA::cudart)
+  target_compile_definitions(cuteafd_cuda_fp8_load_quant_selftest PRIVATE
+    "CUTEAFD_LOAD_QUANT_FIXTURE=\"${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/fp8_load_quant.bin\"")
+  add_test(NAME cuteafd_cuda_fp8_load_quant_selftest COMMAND cuteafd_cuda_fp8_load_quant_selftest)
+  set_tests_properties(cuteafd_cuda_fp8_load_quant_selftest PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77)
+  add_executable(cuteafd_cuda_scale_codes_selftest tests/cuda_scale_codes_selftest.cc)
+  target_include_directories(cuteafd_cuda_scale_codes_selftest PRIVATE
+    "${CUTEAFD_XGRAMMAR_SOURCE_DIR}/3rdparty/picojson")
+  target_link_libraries(cuteafd_cuda_scale_codes_selftest PRIVATE cuteafd_native CUDA::cudart)
+  add_test(NAME cuteafd_cuda_scale_codes_selftest COMMAND cuteafd_cuda_scale_codes_selftest)
+  set_tests_properties(cuteafd_cuda_scale_codes_selftest PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
   add_executable(cuteafd_cuda_selftest tests/cuda_selftest.cc)
   target_link_libraries(cuteafd_cuda_selftest PRIVATE cuteafd_native CUDA::cudart CUDA::cublas CUDA::cuda_driver)
   add_test(NAME cuteafd_cuda_selftest COMMAND cuteafd_cuda_selftest)

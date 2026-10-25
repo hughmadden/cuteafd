@@ -266,12 +266,12 @@ pub fn judge(id: &str, on: &ProbeRecord, off: &ProbeRecord) -> Verdict {
 }
 
 /// The probe pair as kept evidence: ids, row hashes and top two per row.
-fn evidence(case: &Case, on: &ProbeRecord, off: &ProbeRecord) -> Value {
+pub(crate) fn evidence(configuration: &crate::report::Configuration, case: &Case, on: &ProbeRecord, off: &ProbeRecord) -> Value {
     let record = |r: &ProbeRecord| json!({"engine": r.engine, "cold": r.cold, "no_speculation": r.no_speculation,
         "generated": r.generated, "rows": r.rows.iter().map(|row| json!({"position": row.position, "hash": row.hash,
             "top": row.top})).collect::<Vec<_>>()});
-    json!({"nonce": case.nonce, "text": case.text(), "max_tokens": TOKENS, "thinking": "disabled", "temperature": 0,
-        "prompt_ids": off.prompt_ids, "on": record(on), "off": record(off)})
+    crate::request::thinking_off(configuration, json!({"nonce": case.nonce, "text": case.text(), "max_tokens": TOKENS, "thinking": "disabled", "temperature": 0,
+        "prompt_ids": off.prompt_ids, "on": record(on), "off": record(off)}))
 }
 
 /// The pass record from the verdicts (`k/N`, a gate status and a table).
@@ -344,7 +344,7 @@ fn run_cases(ctx: &Ctx<'_>, dump: Option<(&RowDump, &std::path::Path)>) -> Resul
         None => { default = CaseSet::default_set(); &default }
     };
     let speculator = ctx.info.configuration.speculator.clone().unwrap_or_default();
-    let spec = |off: bool| ProbeSpec { cold: true, no_speculation: off, record_rows: TOKENS as usize, top_k: 2,
+    let spec = |off: bool| ProbeSpec { cold: true, no_speculation: off, pair_exempt: true, record_rows: TOKENS as usize, top_k: 2,
         ..ProbeSpec::default() };
     // A new run directory: the probes' leaves are exclusive and never overwrite an earlier run.
     let run_dir = dump.map(|(_, root)| -> Result<std::path::PathBuf> {
@@ -368,11 +368,11 @@ fn run_cases(ctx: &Ctx<'_>, dump: Option<(&RowDump, &std::path::Path)>) -> Resul
             }
             spec
         };
-        let on = ctx.client.chat(plain(&text, TOKENS), Some(arm(false)))
+        let on = ctx.client.chat(plain(ctx.client, &text, TOKENS), Some(arm(false)))
             .with_context(|| format!("{} drafts on", case.id))?;
         let on = probe_of(&on)?.clone();
         anyhow::ensure!(honoured(&on), "this engine does not run benchmark probes");
-        let off = ctx.client.chat(plain(&text, TOKENS), Some(arm(true)))
+        let off = ctx.client.chat(plain(ctx.client, &text, TOKENS), Some(arm(true)))
             .with_context(|| format!("{} drafts off", case.id))?;
         let off = probe_of(&off)?.clone();
         let mut verdict = judge(&case.id, &on, &off);
@@ -391,7 +391,7 @@ fn run_cases(ctx: &Ctx<'_>, dump: Option<(&RowDump, &std::path::Path)>) -> Resul
                 "cases": dumped});
             std::fs::write(dir.join("manifest.json"), serde_json::to_vec_pretty(&manifest)?)?;
         }
-        kept.insert(case.id.clone(), evidence(case, &on, &off));
+        kept.insert(case.id.clone(), evidence(&ctx.info.configuration, case, &on, &off));
         verdicts.push(verdict);
         ctx.progress.partial(aggregate(set, &speculator, &verdicts, serde_json::Map::new()));
     }
@@ -477,6 +477,7 @@ mod tests {
         let dump = RowDump::parse("c0,c2:48-52").unwrap();
         dump.validate(&s).unwrap();
         let (value, specs) = run_fake(&s, Some((&dump, root.path())));
+        assert!(specs.iter().all(|s| s.pair_exempt));
         assert_eq!(value["gate"], "fail");
         let dir = std::path::PathBuf::from(value["row_dump"]["dir"].as_str().unwrap());
         assert!(dir.starts_with(root.path()) && dir.file_name().unwrap().to_str().unwrap().starts_with("spec-lossless-rows-"));
@@ -518,6 +519,7 @@ mod tests {
         let s = set(2);
         let root = tempfile::tempdir().unwrap();
         let (value, specs) = run_fake(&s, None);
+        assert!(specs.iter().all(|s| s.pair_exempt));
         assert!(specs.iter().all(|s| s.dump_rows.is_none() && s.dump_window.is_none()));
         assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
         let mut keys: Vec<&String> = value.as_object().unwrap().keys().collect();
@@ -608,7 +610,7 @@ mod tests {
         let on = record(&[1, 2], &["x", "q"], false);
         let off = record(&[1, 2], &["x", "y"], true);
         let mut kept = serde_json::Map::new();
-        kept.insert("glmf-v19-base".into(), evidence(&s.cases[0], &on, &off));
+        kept.insert("glmf-v19-base".into(), evidence(&crate::report::Configuration::default(), &s.cases[0], &on, &off));
         let value = aggregate(&s, "dflash", &[judge("glmf-v19-base", &on, &off)], kept);
         let keys = |v: &Value| { let mut k: Vec<String> = v.as_object().unwrap().keys().cloned().collect(); k.sort(); k };
         assert_eq!(keys(&value), ["evidence", "gate", "passed", "rows", "set", "speculator", "summary", "table", "total"]);

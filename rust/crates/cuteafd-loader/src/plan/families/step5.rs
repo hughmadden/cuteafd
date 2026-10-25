@@ -5,6 +5,8 @@ use cuteafd_core::{DType, FfnActivation};
 use crate::plan::{checkpoint::Checkpoint, family::*, format::QuantOperand, names::indexed, spec::*};
 
 mod placement;
+pub mod admission;
+pub mod native;
 pub mod coordinator;
 pub mod ownership;
 #[cfg(test)]
@@ -317,7 +319,7 @@ impl Model {
                 "CSA compresses index keys only: one E4M3 proxy256 summary per eight tokens, original GQA K/V retained; provider-group top-512 regions".into(),
                 "FP32 residual and zero-centered norms; post-SiLU clamp + FP32 product, one BF16 round, for routed/shared/dense FFNs".into(),
                 "ssmax_s [64] FP32 is retained and validated, unused by released kernels; ordinary attention scale 1/sqrt(192)".into(),
-                "Header-only memory lower bounds; no executable kernels, runtime workspace/prefix/graph admission or serving-fit claim".into(),
+                "Eager native admission on qualified WIP cards; native MTP defaults to depth 3, with exact predictor header contracts; no release or media qualification".into(),
             ] };
         let mut spec = spec;
         if complete {
@@ -364,25 +366,29 @@ impl Family for Step5 {
         Some(TensorRole::layer(component, layer))
     }
     fn component_hint(&self, component: Component) -> Option<Hint> {
-        let exports = match component {
-            Component::RoutedExpert => "shared stacked FP8 block128 / NVFP4 W4A4 expert-axis reader and native BF16-tail backend; step5 H4096 E352 K8 I1536 TP6(256)/TP4(384) exports; post-SiLU clamp/FP32 product",
-            Component::Attention => "BF16 GQA192 projections, Q/K norms, sigmoid head gate, SWA512 + verify slack, provider-group sparse paged GQA192 prefill/decode/verify exports",
-            Component::Indexer | Component::Compressor => "CSA-8 summarize/commit/rollback, index norm/RoPE/E4M3 rounding, signed weighted-ReLU scores and deterministic provider top-512 region expansion exports",
-            Component::DenseFfn | Component::SharedExpert => "shared BF16 FFN exports with post-SiLU clamp and FP32 product (not existing pre-SiLU clamp kernels)",
-            Component::Vision => "official perception encoder QuickGELU/LayerScale, two downsamplers, BF16 projector and crop/token ordering exports",
-            Component::Speculator => "three BF16 SWA/dense MTP stage exports and independent heads; shared draft policy and exact rollback/prefix adapter",
-            _ => "FP32 residual/zero-centered norm and FP32 sigmoid router with selection-only bias and factor3 primitives",
-        };
-        Some(Hint { what: format!("Step-5 {} kernels/exports missing", component.label()), how: format!("Add {exports}; gate SM120 + SM121 and exact state before enabling runtime.") })
+        match component {
+            Component::Vision => Some(Hint { what: "Step-5 bundled vision is not qualified".into(),
+                how: "Use text-only serving; qualify the official bundled encoder before enabling media.".into() }),
+            _ => None,
+        }
     }
+    fn optional(&self, component: Component) -> bool {
+        matches!(component, Component::Vision | Component::Speculator)
+    }
+    fn expert_catalog(&self) -> bool { true }
+
 }
 
 impl FamilyModel for Model {
     fn spec(&self) -> &ModelSpec { &self.spec }
+    fn native_serving_admission(&self) -> bool { true }
+    fn vision_mode(&self, mode: crate::plan::MediaMode) -> crate::plan::MediaMode {
+        if mode == crate::plan::MediaMode::Auto { crate::plan::MediaMode::Off } else { mode }
+    }
     fn cache_geometry(&self, options: crate::serving_capacity::CacheOptions)
         -> Result<Option<crate::serving_capacity::FamilyCacheGeometry>, crate::serving_capacity::CacheGeometryError> {
         let layout = crate::serving_capacity::step5::Step5CacheLayout::new(
-            &self.cfg, options.coordinator_ranks, self.cfg.max_context, options.native_mtp_layers, options.prefill_rows.max(64))?;
+            &self.cfg, options.coordinator_ranks, self.cfg.max_context, options.native_mtp_layers, options.prefill_rows.max(64), options.step5_kv)?;
         Ok(Some(layout.geometry))
     }
     fn activation(&self, layer: usize, shared: bool) -> Option<FfnActivation> {
@@ -401,6 +407,17 @@ impl FamilyModel for Model {
                 && operand.is_fp8_block(128, &[crate::plan::format::ScaleEncoding::F32]) {
                 return Ok(());
             }
+            if contract.is_some_and(|tensor| tensor.role == *role && tensor.dtype == DType::U8
+                    && tensor.shape == operand.stored)
+                && role.layer.is_some_and(|layer| (3..88).contains(&layer))
+                && operand.is_nvfp4() && operand.input_scale.is_some_and(|scale|
+                    scale.encoding == crate::plan::format::ScaleEncoding::F32)
+                && operand.companions.is_empty()
+                && operand.stored.len() == 3 && operand.logical.len() == 3
+                && operand.logical[..2] == operand.stored[..2]
+                && operand.stored[2].checked_mul(2) == Some(operand.logical[2]) {
+                return Ok(());
+            }
             if shape_matches && role.layer.is_some_and(|layer| (88..91).contains(&layer))
                 && contract.is_some_and(|tensor| tensor.dtype == DType::Bf16)
                 && operand.encoding == crate::plan::format::Encoding::Bf16
@@ -409,12 +426,38 @@ impl FamilyModel for Model {
                 return Ok(());
             }
         }
-        let hint = STEP5.component_hint(role.component).expect("every component has a hint");
-        Err(format!("{stem}: {}: {}", hint.what, hint.how))
+        // Predictor headers in this same contract are the three qualified SWA/dense
+        // stages, including their private EH projection, norms and shared head.
+        if !matches!(role.component, Component::RoutedExpert | Component::Vision) {
+            if let Some(tensor) = self.tensors.get(stem).or_else(|| self.tensors.get(&format!("{stem}.weight"))) {
+                let encoding = match tensor.dtype {
+                    DType::Bf16 => Some(crate::plan::format::Encoding::Bf16),
+                    DType::F32 => Some(crate::plan::format::Encoding::F32),
+                    _ => None,
+                };
+                // The index key norm groups its validated FP32 bias with the weight.
+                let companions = operand.companions.is_empty()
+                    || (operand.companions == ["bias"]
+                        && stem.ends_with(".self_attn.sparse_indexer_k_norm")
+                        && self.tensors.get(&format!("{stem}.bias")).is_some_and(|bias|
+                            bias.role == *role && bias.dtype == DType::F32 && bias.shape == tensor.shape));
+                let container = role.component != Component::Speculator || matches!(
+                    (&tensor.dtype, operand.container.as_str()), (DType::Bf16, "bf16") | (DType::F32, "f32"));
+                if tensor.role == *role && tensor.shape == operand.logical && tensor.shape == operand.stored
+                    && container && encoding == Some(operand.encoding) && operand.scale.is_none()
+                    && operand.global_scale.is_none() && operand.input_scale.is_none() && companions {
+                    return Ok(());
+                }
+            }
+        }
+        Err(format!("{stem}: Step-5 {:?} operand is outside the validated native contract", role.component))
     }
     fn experts(&self, operand: &QuantOperand) -> Option<ExpertContract> {
         let package = if operand.is_fp8_block(128, &[crate::plan::format::ScaleEncoding::F32]) {
             "step5:fp8"
+        } else if operand.is_nvfp4() && operand.input_scale.is_some_and(|scale|
+            scale.encoding == crate::plan::format::ScaleEncoding::F32) {
+            "step5:nvfp4"
         } else if operand.encoding == crate::plan::format::Encoding::Bf16
             && operand.scale.is_none() && operand.global_scale.is_none()
             && operand.input_scale.is_none() && operand.companions.is_empty() {
@@ -426,9 +469,9 @@ impl FamilyModel for Model {
             local: Err("Step-5 coordinator-local routed experts are not qualified".into()),
         })
     }
-    fn placement(&self, _input: &crate::plan::PlanInput, report: &mut crate::plan::PlanReport,
-        options: &crate::plan::layout::LayoutOptions, requested: crate::plan::ExpertPlacement)
+    fn placement(&self, input: &crate::plan::PlanInput, report: &mut crate::plan::PlanReport,
+        options: &mut crate::plan::layout::LayoutOptions, requested: crate::plan::ExpertPlacement)
         -> Option<anyhow::Result<cuteafd_core::memory_layout::MemoryLayout>> {
-        Some(Ok(placement::layout(self, report, options, requested)))
+        Some(placement::layout(self, input, report, options, requested))
     }
 }

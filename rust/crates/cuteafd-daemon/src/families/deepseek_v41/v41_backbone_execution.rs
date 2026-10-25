@@ -851,3 +851,12 @@ mod tests {
 #[cfg(test)]
 #[path = "v41_backbone_execution/distributed_tests.rs"]
 mod distributed_tests;
+
+#[cfg(test)]
+impl CacheProducerWeights<'_> {
+    pub(crate) fn visit(&self, f: &mut dyn FnMut(String, cuteafd_ffi::CuteafdDeviceBuffer)) {
+        for (layer, w) in self.windows.iter().enumerate() { w.visit(&format!("gpu{}.window{layer}.", w.device.id), f); }
+        for (i, w) in self.sources.iter().enumerate() { w.visit(&format!("gpu{}.compressor{i}.", w.device.id), f); }
+        for s in &self._sinks { s.visit(&format!("gpu{}.sinks.", s.device.id), f); }
+    }
+}

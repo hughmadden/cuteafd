@@ -60,7 +60,7 @@ pub struct Checkpoint {
     pub snapshot: PathBuf,
     /// `config.json`, verbatim.
     pub config: Value,
-    /// Standard external quantization metadata (including ModelOpt's HF export), when present.
+    /// Standard external quantization metadata, without the separately validated tensor_storage map.
     pub quantize_config: Option<Value>,
     /// Authoritative inventory, including tensors whose shards are not local.
     pub weight_map: BTreeMap<String, String>,
@@ -83,6 +83,33 @@ pub fn read_json(path: &Path) -> Result<Value> {
         path.display()
     );
     serde_json::from_slice(&bytes).with_context(|| format!("parsing {}", path.display()))
+}
+
+fn read_external_quantization_config(snapshot: &Path) -> Result<Option<Value>> {
+    ["quantize_config.json", "quantization_config.json", "hf_quant_config.json"].iter()
+        .map(|name| snapshot.join(name)).find(|path| path.is_file())
+        .map(|path| crate::formats::exl3_storage::read_storage_metadata(&path, MAX_JSON_BYTES, None)).transpose()
+}
+
+fn quantization_config<'a>(config: &'a Value, external: Option<&'a Value>) -> Option<&'a Value> {
+    config.get("quantization_config")
+        .or_else(|| config.get("text_config").and_then(|text| text.get("quantization_config")))
+        .or(external)
+}
+
+/// The same source metadata selection as [`Checkpoint::quantization`], also
+/// usable for a standalone tensor extract without an index or engine sidecar.
+pub fn read_quantization_configs(snapshot: &Path) -> Result<Vec<Value>> {
+    let path = snapshot.join("config.json");
+    let config = if path.is_file() { read_json(&path)? } else { Value::Null };
+    let external = read_external_quantization_config(snapshot)?;
+    Ok(quantization_configs(&config, external.as_ref()).cloned().collect())
+}
+
+fn quantization_configs<'a>(config: &'a Value, external: Option<&'a Value>) -> impl Iterator<Item = &'a Value> {
+    config.get("quantization_config").into_iter()
+        .chain(config.get("text_config").and_then(|text| text.get("quantization_config")))
+        .chain(external)
 }
 
 impl Checkpoint {
@@ -136,22 +163,17 @@ impl Checkpoint {
         if CheckpointFormat::detect(snapshot)? == CheckpointFormat::Exlr8 {
             return super::exlr8::inventory(snapshot, config, needed);
         }
-        let quantize_config = ["quantize_config.json", "quantization_config.json", "hf_quant_config.json"]
-            .iter()
-            .map(|name| snapshot.join(name))
-            .find(|path| path.is_file())
-            .map(|path| read_json(&path))
-            .transpose()?;
+        let quantize_config = read_external_quantization_config(snapshot)?;
         let index_path = snapshot.join("model.safetensors.index.json");
         let weight_map: BTreeMap<String, String> = if index_path.is_file() {
-            let index = read_json(&index_path)?;
-            serde_json::from_value(
-                index
-                    .get("weight_map")
-                    .cloned()
-                    .context("index has no weight_map")?,
-            )
-            .context("decoding weight_map")?
+            #[derive(serde::Deserialize)]
+            struct Index { weight_map: BTreeMap<String, String> }
+            let file = File::open(&index_path)?;
+            ensure!(file.metadata()?.len() <= MAX_JSON_BYTES, "index exceeds metadata size limit");
+            let mut input = std::io::BufReader::new(file).take(MAX_JSON_BYTES + 1);
+            let index: Index = serde_json::from_reader(&mut input).context("decoding weight_map")?;
+            ensure!(MAX_JSON_BYTES + 1 - input.limit() <= MAX_JSON_BYTES, "index exceeds metadata size limit");
+            index.weight_map
         } else {
             let single = snapshot.join("model.safetensors");
             ensure!(
@@ -392,12 +414,15 @@ impl Checkpoint {
             .unwrap_or(&self.config)
     }
 
+    /// Every source-native declaration, retaining external metadata when the
+    /// primary config describes only a quantization wrapper (e.g. EXL3).
+    pub fn quantizations(&self) -> impl Iterator<Item = &Value> {
+        quantization_configs(&self.config, self.quantize_config.as_ref())
+    }
+
     /// `quantization_config` from config.json, else the external file.
     pub fn quantization(&self) -> Option<&Value> {
-        self.config
-            .get("quantization_config")
-            .or_else(|| self.text_config().get("quantization_config"))
-            .or(self.quantize_config.as_ref())
+        quantization_config(&self.config, self.quantize_config.as_ref())
     }
 
     pub fn architectures(&self) -> Vec<String> {

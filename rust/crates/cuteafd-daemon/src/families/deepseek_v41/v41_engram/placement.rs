@@ -210,3 +210,10 @@ mod tests {
         Ok(())
     }
 }
+
+#[cfg(test)]
+impl PlacedEngramWeights<'_> {
+    pub(crate) fn visit(&self, f: &mut dyn FnMut(String, cuteafd_ffi::CuteafdDeviceBuffer)) {
+        for (i, w) in self.weights.iter().enumerate() { w.visit(&format!("gpu{}.engram{i}.", w.device.id), f); }
+    }
+}

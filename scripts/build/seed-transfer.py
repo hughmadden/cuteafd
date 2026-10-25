@@ -4,8 +4,8 @@
   seed-transfer.py lan-addr HOST
 
 Prints HOST's IPv4 address on a subnet this host is directly attached to,
-ignoring loopback, tailscale, docker and other virtual bridges. A seed such as
-kakapo (10 GbE only) resolves by name to its tailscale address, a slower route
+ignoring loopback, tailscale, docker and other virtual bridges. A LAN-only seed
+(kakapo, cassowary: 10 GbE only) resolves by name to its tailscale address, a slower route
 than the shared LAN, so bulk transfers to it use this address instead. Nothing
 here is cluster-specific: both sides report their own interfaces (`ip -4 -o
 addr show scope global`). Exit 1 when no shared subnet exists.

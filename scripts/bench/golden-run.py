@@ -6,15 +6,15 @@ on raptor's RTX GPUs, optionally against real expert workers on Sparks.
       --model HF_ID_OR_SNAPSHOT_DIR --arm A=WIP_INSTANCE:SLOT [--arm B=...] \\
       [--arm-env A:KEY=VALUE] [--arm-arg A:TOKEN] [--env KEY=VALUE] [--gpus 0,1] [--repeats N] \\
       [--timeout SECONDS] [--preflight CMD] [--compare-logits A:B] \\
-      [--native-test TEST_EXECUTABLE | --command] [--fixtures DIR [--fixtures-writable]] \\
+      [--native-test TEST_EXECUTABLE | --command] [--fixtures DIR [--fixtures-writable]] [--rdma] \\
       [--spark-hosts H1,H2,... [--expert-layers 3,5-7] [--worker-env KEY=VALUE] [--arm-worker-env A:KEY=VALUE] [--worker-arg ARG]] \\
       -- ARGS...
 
 Each arm runs its slot's `cuteafd`, `libcuteafd_native.so`, `PROGRAMS.json` and expert
 packages, mounted read-only as /opt/cuteafd/{bin,lib,share} in the slot's own dev image
 (META base_image_id), with CDI `--device nvidia.com/gpu=N`, `--ipc host`, memlock
-unlimited, the host uid (release_serving_docker_args), the hub read-only at /hf/hub
-(HF_HOME=/hf) and /mnt/sparknest read-only. What runs:
+unlimited, the host uid (release_serving_docker_args), the full namespace read-only at /mnt/sparknest
+(HF_HOME=/mnt/sparknest/hf-home). What runs:
 
 - default: the family's golden subcommand (`glm-golden ARGS`, ...). The slot supplies
   --native-lib and --manifest; ARGS may not override them.
@@ -23,12 +23,14 @@ unlimited, the host uid (release_serving_docker_args), the hub read-only at /hf/
   read-only and run as `EXE ARGS` (e.g. `NAME --exact --ignored --nocapture`); green only
   when its `test result:` lines show at least one test passed and none failed.
 - --command: ARGS verbatim (e.g. `python3 -m pytest -q python/tests/...`).
+--rdma gives the container host networking and /dev/infiniband without Sparks (a
+same-host verbs loopback test); --spark-hosts implies it.
 Both raw modes run in the slot's sealed source tree, mounted read-only at
 /workspace/cuteafd (the working directory, PYTHONPATH with the reference packages,
 PYTHONDONTWRITEBYTECODE=1), with CUTEAFD_NATIVE_LIB and CUTEAFD_PROGRAM_MANIFEST set.
 
 Placeholders in ARGS and in --env/--arm-env values: {snapshot} (the checkpoint's
-container path), {hub} (/hf/hub), {out} (the run's writable output directory, e.g.
+container path), {hub} (the resolved host hub path), {out} (the run's writable output directory, e.g.
 `--save-logits {out}/logits`), {fixtures}, {peers} and {expert_layers}. Other existing
 absolute host paths in ARGS are mounted read-only at the same path. --fixtures DIR is
 mounted at its own path (read-only; --fixtures-writable for a fixture-generation run,
@@ -38,7 +40,10 @@ Sparks) and exported as CUTEAFD_GOLDEN_FIXTURES.
 Real experts (--spark-hosts, ranks in the given order): before every run the arm's
 sealed spark-expert slot is checked on each host (seal, artifact checksums, SparkInfer
 lock, the same source manifest as the coordinator slot, dev image, CDI, a free
---expert-port, no leftover container, the checkpoint visible), then each host runs the
+--expert-port, no leftover container, the checkpoint visible). A host without the sealed
+dev image ID (docker save | load into a containerd image store gives another ID) runs its
+local copy of the sealed tag only when a host of the run holding the sealed ID reports the
+same platform, run config and RootFS layers; argv.json records both IDs. Then each host runs the
 serving path's `cuteafd expertd-native --rank R --world N` from that slot (read-only
 mounts, no staging copy), bounded by an in-container timeout. The coordinator waits for
 every worker's "native worker bootstrap ready" (--worker-ready-timeout; a worker that
@@ -48,7 +53,7 @@ CUTEAFD_GOLDEN_EXPERT_LAYERS (expanded --expert-layers) and CUTEAFD_GOLDEN_SPARK
 (the workers' package manifest.json files, identical on every host, read-only under
 /opt/cuteafd/spark). A golden subcommand must take them as `--peers {peers}`. Workers are
 removed (logs kept) after every run, on failure, timeout and SIGTERM/SIGINT too, before
-the locks are released. oliver (reserved) and kakapo (build seed) are refused.
+the locks are released. oliver (reserved) and the LAN-only build seeds are refused.
 
 Hardware: the locks (sparks for dodo/emu, gpu0, gpu1, rhea, moa, in that order) are
 taken once through the fair queue (scripts/hw/hwlock.py) and every arm and repeat runs
@@ -65,15 +70,19 @@ workers/HOST.log} and whatever the run wrote to {out}; argv.json holds the exact
 and worker commands, image IDs, seal SHAs, env and the GPUs' power context (gpu-powerd
 state, sampled power limit and draw). summary.md lists exit codes and the key log lines
 (admission, logits digests, agreement/top-1, resume verdicts, test results, errors),
-the workers' readiness and errors, plus each --compare-logits A:B result: sha256
-byte-equality, then max |diff|, KL and top-1 over rows (vocab from the checkpoint's
-config.json, or --vocab).
+the workers' readiness and errors, plus each --compare-logits A:B result: byte
+equality, then max |diff|, KL and top-1 over rows (vocab from the checkpoint's
+config.json, or --vocab). Both layouts a golden writes are compared: a flat
+`*logits*.bin` dump and the per-row safetensors directory (row-NNNNNNNN.safetensors
+plus manifest.jsonl) that Kimi and the shared probe write; for the row layout the
+table names the row carrying the largest KL.
 """
 from __future__ import annotations
 
 import argparse
 import hashlib
 import importlib.util
+import inspect
 import json
 import os
 import re
@@ -92,6 +101,7 @@ SUBCOMMANDS = {'dsv4': 'dsv4-golden', 'v41': 'v41-golden', 'glm': 'glm-golden', 
 # Families without a golden subcommand yet: native tests and commands only.
 RAW_FAMILIES = ('kimi',)
 NAME = re.compile(r'[A-Za-z0-9][A-Za-z0-9_.-]*\Z')
+ROW_FILE = re.compile(r'row-[0-9]+\.safetensors\Z')
 ENV_KEY = re.compile(r'[A-Za-z_][A-Za-z0-9_]*\Z')
 ANSI = re.compile(r'\x1b\[[0-9;]*m')
 # Key result lines across the families' goldens.
@@ -113,15 +123,26 @@ POWER_SAMPLE_S = 5.0
 SOURCE = '/workspace/cuteafd'
 TEST_DIR = '/opt/cuteafd/test'
 SPARK_PACKAGES = '/opt/cuteafd/spark'
-HUB = '/hf/hub'
+def namespace_root():
+    return str(Path(os.environ.get('CUTEAFD_NAMESPACE_ROOT', '/mnt/sparknest')).expanduser().resolve())
+
+
+def hub_placeholder():
+    """The {hub} placeholder: the namespace's hub as mounted (same path) in the container."""
+    return namespace_root() + '/hf-home/hub'
 # Real experts. Hosts refused outright, with the reason (lift a refusal here once cleared).
 REFUSED_HOSTS = {
     'oliver': 'reserved for the Kimi F32 golden',
     'kakapo': 'build seed for the fidelity goldens, not a serving rank',
+    'cassowary': 'LAN-only build seed, not a serving rank',
     'raptor': 'the coordinator, not a Spark rank',
 }
 # Which hardware lock covers a Spark (scripts/hw/hwlock.py order; as `cuteafd bench smoke`).
 HOST_LOCKS = {'ostrich': 'sparks', 'dodo': 'sparks', 'emu': 'sparks', 'kiwi': 'sparks', 'rhea': 'rhea', 'moa': 'moa'}
+# Another deployment's Sparks are the SPARK_i_HOST entries (with a LANE_A) of --config,
+# as release_spark_host_rows accepts them; they form that deployment's pool under
+# sparks.lock in its CUTEAFD_LOCK_DIR.
+POOL_LOCK = 'sparks'
 WORKER_READY = 'native worker bootstrap ready'
 WORKER_LABEL = 'cuteafd.golden-run'
 DEFAULT_EXPERT_PORT = 19451  # beside serving's 19441, so a stray serving worker is detected, not reused
@@ -193,7 +214,7 @@ def apply_env(arms, common, per_arm):
 def parse_gpus(value):
     gpus = sorted({int(g) for g in value.split(',') if g.strip()})
     if not gpus or any(g not in (0, 1) for g in gpus):
-        raise ValueError('--gpus takes raptor GPU indices 0 and/or 1')
+        raise ValueError('--gpus takes coordinator GPU indices 0 and/or 1')
     return gpus
 
 
@@ -241,7 +262,7 @@ PLACEHOLDERS = ('snapshot', 'hub', 'out', 'fixtures', 'peers', 'expert_layers')
 
 def substitute(args, snapshot, out=OUT, **values):
     """Replace {snapshot}, {hub}, {out}, {fixtures}, {peers} and {expert_layers}."""
-    table = {'snapshot': snapshot, 'hub': HUB, 'out': out, **values}
+    table = {'snapshot': snapshot, 'hub': hub_placeholder(), 'out': out, **values}
     result = []
     for arg in args:
         for key in PLACEHOLDERS:
@@ -256,7 +277,7 @@ def substitute(args, snapshot, out=OUT, **values):
 
 
 def placeholder_values(state):
-    return dict(fixtures=state.get('fixtures'), peers=state['sparks']['peers_csv'] if state.get('sparks') else None,
+    return dict(hub=str(state['hub']), fixtures=state.get('fixtures'), peers=state['sparks']['peers_csv'] if state.get('sparks') else None,
                 expert_layers=','.join(map(str, state['sparks']['layers'])) if state.get('sparks')
                 and state['sparks']['layers'] else None)
 
@@ -271,7 +292,14 @@ def worker_name(task, arm, rank):
 
 # --------------------------------------------------------------------------- Spark workers
 
-def parse_hosts(value):
+def configured_hosts(config_path):
+    """The configuration's SPARK_i_HOST values that also name a SPARK_i_LANE_A."""
+    values = cards.config(config_path)
+    return {host for key, host in values.items()
+            if (match := re.fullmatch(r'SPARK_(\d+)_HOST', key)) and values.get(f'SPARK_{match.group(1)}_LANE_A')}
+
+
+def parse_hosts(value, configured=()):
     hosts = [h.strip() for h in value.split(',') if h.strip()]
     if not hosts:
         raise ValueError('--spark-hosts names no host')
@@ -280,8 +308,9 @@ def parse_hosts(value):
     for host in hosts:
         if host in REFUSED_HOSTS:
             raise ValueError(f'--spark-hosts: {host} is refused ({REFUSED_HOSTS[host]})')
-        if host not in HOST_LOCKS:
-            raise ValueError(f'--spark-hosts: {host} is not a pool Spark ({", ".join(sorted(HOST_LOCKS))})')
+        if host not in HOST_LOCKS and host not in configured:
+            raise ValueError(f'--spark-hosts: {host} is not a pool Spark ({", ".join(sorted(HOST_LOCKS))}) '
+                             'or a SPARK_i_HOST with SPARK_i_LANE_A in --config')
     return hosts
 
 
@@ -318,7 +347,7 @@ def spark_lanes(config_path, hosts):
 
 
 def locks_for(gpus, hosts=()):
-    names = {f'gpu{g}' for g in gpus} | {HOST_LOCKS[h] for h in hosts}
+    names = {f'gpu{g}' for g in gpus} | {HOST_LOCKS.get(h, POOL_LOCK) for h in hosts}
     return hwlock.canonical(sorted(names))
 
 
@@ -327,11 +356,25 @@ def ssh(host, command, timeout=120, check=True):
                           check=check, text=True, capture_output=True, timeout=timeout)
 
 
+# The dev image's portable content identity (scripts/lib/dev_image_content.py), here and
+# inlined into REMOTE_CHECK for the Sparks.
+_content_spec = importlib.util.spec_from_file_location('dev_image_content', REPO / 'scripts/lib/dev_image_content.py')
+_content = importlib.util.module_from_spec(_content_spec)
+_content_spec.loader.exec_module(_content)
+image_content = _content.image_content
+IMAGE_CONTENT = inspect.getsource(_content._unset) + '\n\n' + inspect.getsource(_content.image_content)
+
+
 # Runs on each Spark (python3 -c, argv: root slot role instance image port worker_names_json
 # snapshot_rel snapshot_abs): the sealed spark-expert slot, its artifacts, SparkInfer lock,
 # dev image, CDI, a free port, no leftover worker, the checkpoint, the workers' serving
-# identity and package manifests, as JSON.
+# identity and package manifests, as JSON. The dev image is the sealed base_image_id when
+# this host has it ('sealed'); otherwise the sealed base_image tag's local image: 'content'
+# when it matches the seal's base_image_content_sha256, else ('tag', older seals without it)
+# admitted by check_sparks only when a 'sealed' host of the same run has the same content.
+# Any image whose content differs from a sealed base_image_content_sha256 is refused.
 REMOTE_CHECK = r'''import hashlib,json,os,pathlib,re,subprocess,sys
+''' + IMAGE_CONTENT + r'''
 root,slot,instance,image,port,names,snap_rel,snap_abs=sys.argv[1:9]
 home=pathlib.Path.home()
 if root=='-':
@@ -367,8 +410,23 @@ for rel in ('docker/release-entrypoint.sh','third_party/sparkinfer','scripts/lib
 v=subprocess.run([sys.executable,str(ws/'scripts/build/verify-sparkinfer-source.py'),'--source',str(ws/'third_party/sparkinfer'),'--lock',str(ws/'third_party/sparkinfer.lock.json')],capture_output=True,text=True)
 if v.returncode: fail('SparkInfer source does not match its lock: '+(v.stderr.strip().splitlines() or ['?'])[-1])
 if m.get('base_image_id')!=image and image!='-': fail(f'slot dev image {m.get("base_image_id")} differs from the expected {image}')
-i=subprocess.run(['docker','image','inspect','-f','{{.Id}}',m.get('base_image_id','')],capture_output=True,text=True)
-if i.returncode or i.stdout.strip()!=m.get('base_image_id'): fail(f'dev image {m.get("base_image_id")} is missing')
+def inspect(ref):
+    i=subprocess.run(['docker','image','inspect',ref],capture_output=True,text=True) if ref else None
+    try: return json.loads(i.stdout)[0] if i and i.returncode==0 else None
+    except (ValueError,IndexError): return None
+sealed_id=m.get('base_image_id') or ''
+info=inspect(sealed_id)
+identity='sealed'
+if not info or info.get('Id')!=sealed_id:
+    info,identity=inspect(m.get('base_image') or ''),'tag'
+    if not info or not info.get('Id'): fail(f'dev image {sealed_id} is missing (and so is its tag {m.get("base_image")})')
+content=image_content(info)
+if not content: fail(f'dev image {info["Id"]} has no RootFS layers or platform to identify it by')
+sealed_content=m.get('base_image_content_sha256')
+if sealed_content is not None:
+    if not re.fullmatch(r'[0-9a-f]{64}',str(sealed_content)): fail(f'META base_image_content_sha256 is malformed: {sealed_content!r}')
+    if content!=sealed_content: fail(f'dev image {info["Id"]} ({m.get("base_image")}) has content {content[:12]}, not the sealed {sealed_content[:12]}')
+    if identity=='tag': identity='content'
 if os.environ.get('CUTEAFD_CDI_CHECK')!='off':  # off: script tests only
     cdi=any(re.search(r'^\s*-?\s*name:\s*\W?all\W?\s*$',pathlib.Path(s).read_text(),re.M) for s in ('/var/run/cdi/nvidia.yaml','/etc/cdi/nvidia.yaml') if os.access(s,os.R_OK))
     if not cdi: fail('CDI device nvidia.com/gpu=all is not in /var/run/cdi/nvidia.yaml')
@@ -390,7 +448,8 @@ for kind in ('fp8','exl3'):
         if (d/'manifest.json').is_file(): packages[f'{kind}/{d.name}']=(d/'manifest.json').read_text()
 variants={k:sorted(x.name for x in (art/k).iterdir() if x.is_dir()) for k in ('bin-variants','lib-variants') if (art/k).is_dir()}
 print(json.dumps({'root':str(p),'seal_sha256':hashlib.sha256(meta).hexdigest(),'source_manifest_sha256':m['source_manifest_sha256'],
-  'artifact_manifest_sha256':m['artifact_manifest_sha256'],'artifacts':listed,'image_id':m['base_image_id'],'image':m.get('base_image'),
+  'artifact_manifest_sha256':m['artifact_manifest_sha256'],'artifacts':listed,'image_id':info['Id'],'image':m.get('base_image'),
+  'sealed_image_id':sealed_id,'image_identity':identity,'image_content_sha256':content,
   'hub':hub,'snapshot':snapshot,'serving_args':sv.stdout.decode().rstrip('\0').split('\0'),'packages':packages,'variants':variants}))
 '''
 
@@ -401,7 +460,7 @@ def check_spark(host, arm, state, coordinator, at_grant=True):
     in the fair queue may legitimately hold it."""
     root = coordinator.get('wip_root') or '-'
     snap = state['snapshot_container']
-    snap_rel = snap[len(HUB) + 1:] if snap.startswith(HUB + '/') else '-'
+    snap_rel = '-'
     names = json.dumps([worker_name(state['task'], arm, r) for r in range(len(state['sparks']['hosts']))])
     argv = ['python3', '-c', REMOTE_CHECK, root, coordinator['slot'], coordinator['instance'], '-',
             str(state['sparks']['port']) if at_grant else '-', names, snap_rel, snap if snap_rel == '-' else '-']
@@ -426,7 +485,34 @@ def check_sparks(state, arm, coordinator, at_grant=True):
         if record['packages'] != first['packages'] or record['artifact_manifest_sha256'] != first['artifact_manifest_sha256']:
             raise ValueError(f'{host}: spark-expert slot differs from {state["sparks"]["hosts"][0]}\'s '
                              '(artifacts or package manifests)')
+    check_spark_images(records)
     return records
+
+
+def check_spark_images(records):
+    """A host lacking the sealed dev image ID runs its local copy of the sealed tag only when a
+    host of this run that holds the sealed ID (verified there by docker, content-addressed) has
+    the same content: platform, run config and RootFS layers. Raises ValueError otherwise."""
+    vouchers = {}
+    for host, record in records.items():
+        if record['image_identity'] == 'sealed':
+            vouchers.setdefault(record['sealed_image_id'], {})[host] = record['image_content_sha256']
+    for sealed, hosts in vouchers.items():
+        if len(set(hosts.values())) > 1:
+            raise ValueError(f'dev image {sealed} has different content on {", ".join(sorted(hosts))}')
+    for host, record in records.items():
+        if record['image_identity'] in ('sealed', 'content'):  # content: checked against the seal on HOST
+            continue
+        sealed, local = record['sealed_image_id'], record['image_id']
+        hosts = vouchers.get(sealed)
+        if not hosts:
+            raise ValueError(f"{host}: dev image {sealed} is missing, and no other Spark of this run holds it "
+                             f"to vouch for the local {record['image']} ({local})")
+        voucher, content = next(iter(sorted(hosts.items())))
+        if record['image_content_sha256'] != content:
+            raise ValueError(f"{host}: local {record['image']} ({local}) differs from the slot's dev image {sealed} "
+                             f'on {voucher} (layers, platform or run config)')
+        record['image_vouched_by'] = voucher
 
 
 def worker_command(state, arm, rank, record):
@@ -442,11 +528,13 @@ def worker_command(state, arm, rank, record):
         mounts.append((art / kind, f'{SLOT_LIB}/{kind}'))
     mounts += [(art, SLOT_SHARE), (root / 'workspace/docker/release-entrypoint.sh', ENTRYPOINT),
                (root / 'workspace/third_party/sparkinfer', '/source/third_party/sparkinfer'),
-               (record['hub'], HUB)]
-    if not record['snapshot'].startswith(record['hub'] + '/'):
-        mounts.append(('/mnt/sparknest', '/mnt/sparknest'))
-    snapshot = HUB + record['snapshot'][len(record['hub']):] if record['snapshot'].startswith(record['hub'] + '/') \
-        else record['snapshot']
+               (namespace_root(), namespace_root())]
+    snapshot = record['snapshot']
+    hub = Path(record['hub'])
+    if not hub.is_relative_to(namespace_root()):
+        mounts.append((hub, hub))
+    if not Path(snapshot).is_relative_to(namespace_root()) and not Path(snapshot).is_relative_to(hub):
+        mounts.append((snapshot, snapshot))
     cmd = ['docker', 'run', '-d', '--name', worker_name(state['task'], arm, rank), '--restart', 'no',
            '--label', f"{WORKER_LABEL}={state['task']}/{arm}", '--device', 'nvidia.com/gpu=all', '--network', 'host',
            '--ipc', 'host', '--ulimit', 'memlock=-1:-1', '--device=/dev/infiniband', *record['serving_args']]
@@ -458,7 +546,8 @@ def worker_command(state, arm, rank, record):
            'PYTHONPATH': '/source/third_party/sparkinfer', 'CUTEAFD_NATIVE_LIB': f'{SLOT_LIB}/libcuteafd_native.so',
            # As the coordinator gets it: workers resolve installed programs and packages from it.
            'CUTEAFD_PROGRAM_MANIFEST': f'{SLOT_SHARE}/PROGRAMS.json',
-           'RUST_LOG': 'info', **{k: os.environ[k] for k in RDMA_ENV if os.environ.get(k)}, **sparks['env'],
+           'RUST_LOG': 'info', 'HF_HOME': namespace_root() + '/hf-home',
+           **{k: os.environ[k] for k in ('CUTEAFD_PUSH_SOCKET',) if os.environ.get(k)}, **{k: os.environ[k] for k in RDMA_ENV if os.environ.get(k)}, **sparks['env'],
            **sparks.get('arm_env', {}).get(arm, {})}
     for key, value in env.items():
         cmd += ['-e', f'{key}={value}']
@@ -551,7 +640,8 @@ def stop_workers(state, arm, out_dir):
 # --------------------------------------------------------------------------- checkpoint
 
 def hub_root():
-    return Path(os.environ.get('CUTEAFD_HF_HUB', Path.home() / '.cache/huggingface/hub')).resolve()
+    default = Path(namespace_root()) / 'hf-home/hub' if os.environ.get('CUTEAFD_NAMESPACE_ROOT') else Path.home() / '.cache/huggingface/hub'
+    return Path(os.environ.get('CUTEAFD_HF_HUB', default)).resolve()
 
 
 def resolve_model(model, hub=None):
@@ -572,9 +662,7 @@ def resolve_model(model, hub=None):
     path = path.resolve()
     if not (path / 'config.json').is_file():
         raise ValueError(f'{path} has no config.json')
-    if path.is_relative_to(hub):
-        return path, '/hf/hub/' + str(path.relative_to(hub)), []
-    if path.is_relative_to('/mnt/sparknest'):
+    if path.is_relative_to(namespace_root()):
         return path, str(path), []
     return path, str(path), [str(path)]
 
@@ -647,10 +735,14 @@ def verify_slot(arm):
     image_id = meta.get('base_image_id')
     if not image_id:
         raise ValueError(f'{root}: META.json has no base_image_id')
+    image_content_sha256 = meta.get('base_image_content_sha256')
+    if image_content_sha256 is not None and not re.fullmatch(r'[0-9a-f]{64}', str(image_content_sha256)):
+        raise ValueError(f'{root}: META.json base_image_content_sha256 is malformed')
     return dict(instance=arm['instance'], slot=arm['slot'], root=str(root), seal_sha256=meta['seal_sha256'],
                 artifact_manifest_sha256=meta['artifact_manifest_sha256'], artifacts=listed,
                 packages=(meta.get('contents') or {}).get('packages'), image=meta.get('base_image'),
-                image_id=image_id, source_commit=identity.get('commit'), source_dirty=identity.get('dirty'),
+                image_id=image_id, sealed_image_id=image_id, image_content_sha256=image_content_sha256,
+                source_commit=identity.get('commit'), source_dirty=identity.get('dirty'),
                 sparkinfer_revision=meta.get('sparkinfer_revision'), wip_root=meta.get('wip_root'),
                 source_manifest_sha256=meta['source_manifest_sha256'])
 
@@ -662,14 +754,34 @@ def verify_sparkinfer(slot):
          '--lock', str(workspace / 'third_party/sparkinfer.lock.json')])
 
 
-def image_record(image_id):
+def inspect_image(ref):
     try:
-        info = json.loads(run(['docker', 'image', 'inspect', image_id]).stdout)[0]
+        return json.loads(run(['docker', 'image', 'inspect', ref]).stdout)[0]
     except (subprocess.SubprocessError, IndexError, json.JSONDecodeError):
-        raise ValueError(f'dev image {image_id} is missing (scripts/build/build-dev-images.sh, or rebuild the slot)') from None
-    if info['Id'] != image_id:
-        raise ValueError(f'dev image {image_id} resolved to {info["Id"]}')
-    return dict(id=info['Id'], tags=info.get('RepoTags') or [])
+        return None
+
+
+def image_record(slot):
+    """The coordinator slot's dev image here: the sealed base_image_id, or, for a seal with
+    base_image_content_sha256, the sealed tag's local image of that content (docker save |
+    load can give it another ID). Any image whose content differs from the seal is refused."""
+    sealed, want = slot['sealed_image_id'], slot.get('image_content_sha256')
+    info, identity = inspect_image(sealed), 'sealed'
+    if not info or info.get('Id') != sealed:
+        if info:
+            raise ValueError(f'dev image {sealed} resolved to {info.get("Id")}')
+        if not want:
+            raise ValueError(f'dev image {sealed} is missing (scripts/build/build-dev-images.sh, or rebuild the slot)')
+        info, identity = inspect_image(slot.get('image') or ''), 'content'
+        if not info or not info.get('Id'):
+            raise ValueError(f"dev image {sealed} is missing (and so is its tag {slot.get('image')})")
+    content = image_content(info)
+    if not content:
+        raise ValueError(f"dev image {info['Id']} has no RootFS layers or platform to identify it by")
+    if want and content != want:
+        raise ValueError(f"dev image {info['Id']} ({slot.get('image')}) has content {content[:12]}, "
+                         f'not the sealed {want[:12]}')
+    return dict(id=info['Id'], tags=info.get('RepoTags') or [], identity=identity, content_sha256=content)
 
 
 def container_exists(name):
@@ -685,7 +797,8 @@ def preflight(state, arms, at_grant=True):
     for name, arm in arms.items():
         slot = verify_slot(arm)
         verify_sparkinfer(slot)
-        slot['image_record'] = image_record(slot['image_id'])
+        slot['image_record'] = image_record(slot)
+        slot['image_id'] = slot['image_record']['id']
         if container_exists(container_name(state['task'], name)):
             raise ValueError(f"container {container_name(state['task'], name)} already exists "
                              '(a previous run of this task left it; inspect and docker rm it)')
@@ -697,10 +810,14 @@ def preflight(state, arms, at_grant=True):
         for name, slot in records.items():
             if (slot['seal_sha256'], slot['artifacts']) != (previous[name]['seal_sha256'], previous[name]['artifacts']):
                 raise ValueError(f'arm {name}: sealed slot changed since enqueue')
+            if slot['image_id'] != previous[name]['image_id']:
+                raise ValueError(f'arm {name}: dev image changed since enqueue')
             for host, record in (slot.get('sparks') or {}).items():
                 before = previous[name]['sparks'][host]
                 if (record['seal_sha256'], record['artifacts']) != (before['seal_sha256'], before['artifacts']):
                     raise ValueError(f'arm {name}: sealed spark-expert slot on {host} changed since enqueue')
+                if record['image_id'] != before['image_id']:
+                    raise ValueError(f'arm {name}: dev image on {host} changed since enqueue')
     return records
 
 
@@ -747,9 +864,7 @@ def docker_command(state, name, arm, slot, out_dir, golden, packages=None):
     mounts += [(str(art), SLOT_SHARE),
                (str(root / 'workspace/docker/release-entrypoint.sh'), ENTRYPOINT),
                (str(root / 'workspace/third_party/sparkinfer'), '/source/third_party/sparkinfer'),
-               (str(state['hub']), '/hf/hub')]
-    if Path('/mnt/sparknest').is_dir():
-        mounts.append(('/mnt/sparknest', '/mnt/sparknest'))
+               (namespace_root(), namespace_root())]
     mounts += [(p, p) for p in state['extra_mounts']]
     if mode != 'golden':
         mounts.append((str(root / 'workspace'), SOURCE))
@@ -763,7 +878,9 @@ def docker_command(state, name, arm, slot, out_dir, golden, packages=None):
            '--label', f"cuteafd.golden-run={state['task']}/{name}",
            *state['serving_args'], *cards.cdi_gpu_args(gpus), '--ipc', 'host',
            '--ulimit', 'memlock=-1:-1']
-    if state.get('sparks'):
+    if state.get('memory'):  # cap the coordinator container's host memory, swap equally
+        cmd += ['--memory', str(state['memory']), '--memory-swap', str(state['memory'])]
+    if state.get('sparks') or state.get('rdma'):
         cmd += ['--network', 'host', '--device=/dev/infiniband']
     for source, target in mounts:
         cmd += ['-v', f'{source}:{target}:ro']
@@ -776,7 +893,10 @@ def docker_command(state, name, arm, slot, out_dir, golden, packages=None):
     # environment as well as from --manifest.
     env = {'PATH': f'{SLOT_BIN}:/usr/local/cuda/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin',
            'PYTHONPATH': '/source/third_party/sparkinfer', 'CUTEAFD_NATIVE_LIB': f'{SLOT_LIB}/libcuteafd_native.so',
-           'CUTEAFD_PROGRAM_MANIFEST': f'{SLOT_SHARE}/PROGRAMS.json', 'RUST_LOG': 'info'}
+           'CUTEAFD_PROGRAM_MANIFEST': f'{SLOT_SHARE}/PROGRAMS.json', 'RUST_LOG': 'info',
+           'HF_HOME': namespace_root() + '/hf-home'}
+    if os.environ.get('CUTEAFD_PUSH_SOCKET'):
+        env['CUTEAFD_PUSH_SOCKET'] = os.environ['CUTEAFD_PUSH_SOCKET']
     if mode != 'golden':
         env.update(PYTHONPATH=f'/source/third_party/sparkinfer:{SOURCE}/python/reference',
                    PYTHONDONTWRITEBYTECODE='1')
@@ -900,13 +1020,19 @@ def run_arm(state, name, repeat, arms):
     cmd, env = docker_command(state, name, arm, slot, out_dir, golden, packages)
     workers = [dict(host=host, rank=rank, container=worker_name(state['task'], name, rank),
                     argv=worker_command(state, name, rank, slot['sparks'][host]),
-                    seal_sha256=slot['sparks'][host]['seal_sha256'], image_id=slot['sparks'][host]['image_id'])
+                    seal_sha256=slot['sparks'][host]['seal_sha256'], image_id=slot['sparks'][host]['image_id'],
+                    sealed_image_id=slot['sparks'][host]['sealed_image_id'],
+                    image_identity=slot['sparks'][host]['image_identity'],
+                    image_content_sha256=slot['sparks'][host]['image_content_sha256'],
+                    image_vouched_by=slot['sparks'][host].get('image_vouched_by'))
                for rank, host in enumerate(state['sparks']['hosts'])] if state.get('sparks') else []
     record = dict(arm=name, repeat=repeat, argv=cmd, golden=golden, container=container_name(state['task'], name),
                   mode=state['mode'], native_test=state.get('native_test'), native_test_sha256=state.get('native_test_sha256'),
                   fixtures=state.get('fixtures'), workers=workers, spark_packages=package_digests,
                   expert_layers=state['sparks']['layers'] if state.get('sparks') else None,
                   image=slot['image'], image_id=slot['image_id'], image_tags=slot['image_record']['tags'],
+                  sealed_image_id=slot['sealed_image_id'], image_identity=slot['image_record']['identity'],
+                  image_content_sha256=slot['image_record']['content_sha256'],
                   seal_sha256=slot['seal_sha256'], artifact_manifest_sha256=slot['artifact_manifest_sha256'],
                   slot=f"{slot['instance']}:{slot['slot']}", slot_root=slot['root'], source_commit=slot['source_commit'],
                   source_dirty=slot['source_dirty'], env=env, arm_env=arm['env'], arm_args=arm['args'], gpus=state['gpus'],
@@ -1008,6 +1134,16 @@ def logits_files(directory):
     return sorted(str(p.relative_to(directory)) for p in Path(directory).rglob('*logits*.bin') if p.is_file())
 
 
+def row_dump_dirs(directory):
+    """Relative directories holding a per-row safetensors dump (row-NNNNNNNN.safetensors).
+
+    Kimi and the shared probe write their logits this way: one F32 tensor per
+    row plus manifest.jsonl, instead of a single flat `.bin` file.
+    """
+    return sorted({str(p.parent.relative_to(directory)) for p in Path(directory).rglob('row-*.safetensors')
+                   if p.is_file() and ROW_FILE.fullmatch(p.name)})
+
+
 def compare_pairs(state, pairs, repeats):
     """Compare saved logits of arm pairs, per repeat, file by file."""
     results = []
@@ -1018,33 +1154,49 @@ def compare_pairs(state, pairs, repeats):
     for a, b in pairs:
         for repeat in range(1, repeats + 1):
             da, db = Path(state['root']) / a / f'r{repeat}', Path(state['root']) / b / f'r{repeat}'
+            dumped = False
             files = [f for f in logits_files(da) if (db / f).is_file()]
-            if not files:
-                results.append(dict(a=a, b=b, repeat=repeat, file=None, error='no saved logits common to both arms'))
-                continue
             for name in files:
+                dumped = True
                 out = Path(state['root']) / f'compare-{a}-{b}-r{repeat}-{name.replace("/", "_")}.json'
                 extra = []
                 tokens = (da / name).parent / 'tokens.bin'
                 if Path(name).name == 'logits.bin' and tokens.is_file():
                     extra = ['--tokens', str(tokens)]
                 args = [str(da / name), str(db / name), str(state['vocab']), *extra, '--json', str(out)]
-                if python:
-                    cmd = [*python, str(tool), *args]
-                else:  # the dev image has numpy; read-only views of the outputs
-                    image = state['slots'][a]['image_id']
-                    cmd = ['docker', 'run', '--rm', '--network', 'none', '--user', f'{os.getuid()}:{os.getgid()}',
-                           '-v', f'{tool}:{tool}:ro', '-v', f"{state['root']}:{state['root']}", '--entrypoint',
-                           'python3', image, str(tool), *args]
-                proc = subprocess.run(cmd, capture_output=True, text=True, timeout=3600)
-                if proc.returncode or not out.is_file():
+                results.append(compare_one(state, python, tool, args, out, dict(a=a, b=b, repeat=repeat, file=name)))
+            # Per-row dumps: each directory of row-NNNNNNNN.safetensors compares as
+            # one set, and the tool reports the row holding the largest KL.
+            dirs_b = set(row_dump_dirs(db)) if db.is_dir() else set()
+            for name in row_dump_dirs(da) if da.is_dir() else []:
+                dumped = True
+                if name not in dirs_b:
                     results.append(dict(a=a, b=b, repeat=repeat, file=name,
-                                        error=(proc.stderr.strip().splitlines() or ['compare failed'])[-1]))
+                                        error='row dump present in one arm only'))
                     continue
-                measured = json.loads(out.read_text())
-                results.append(dict(measured, a=a, b=b, repeat=repeat, file=name,
-                                    path_a=measured['a'], path_b=measured['b']))
+                out = Path(state['root']) / f'compare-{a}-{b}-r{repeat}-{name.replace("/", "_")}-rows.json'
+                args = [str(da / name), str(db / name), '--json', str(out)]
+                results.append(compare_one(state, python, tool, args, out, dict(a=a, b=b, repeat=repeat, file=name)))
+            if not dumped:
+                results.append(dict(a=a, b=b, repeat=repeat, file=None,
+                                    error='no saved logits common to both arms'))
     return results
+
+
+def compare_one(state, python, tool, args, out, record):
+    """Run compare-logits.py once and fold its JSON into a summary row."""
+    if python:
+        cmd = [*python, str(tool), *args]
+    else:  # the dev image has numpy; read-only views of the outputs
+        image = state['slots'][record['a']]['image_id']
+        cmd = ['docker', 'run', '--rm', '--network', 'none', '--user', f'{os.getuid()}:{os.getgid()}',
+               '-v', f'{tool}:{tool}:ro', '-v', f"{state['root']}:{state['root']}", '--entrypoint',
+               'python3', image, str(tool), *args]
+    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=3600)
+    if proc.returncode or not out.is_file():
+        return dict(record, error=(proc.stderr.strip().splitlines() or ['compare failed'])[-1])
+    measured = json.loads(out.read_text())
+    return dict(measured, **record, path_a=measured['a'], path_b=measured['b'])
 
 
 def write_summary(state, records, comparisons):
@@ -1075,17 +1227,18 @@ def write_summary(state, records, comparisons):
             lines += ['', f"workers (ready after {r.get('workers_ready_s', '-')} s):", '', '```',
                       *(worker_lines(run_dir / 'workers') or ['(no worker logs)']), '```']
     if comparisons:
-        lines += ['', '## Logits comparisons', '', '| a | b | repeat | file | byte-identical | rows | max abs diff | mean KL | max KL | top-1 |',
-                  '|---|---|---|---|---|---|---|---|---|---|']
+        lines += ['', '## Logits comparisons', '', '| a | b | repeat | file | byte-identical | rows | max abs diff | mean KL | max KL | top-1 | worst row |',
+                  '|---|---|---|---|---|---|---|---|---|---|---|']
         for c in comparisons:
             if c.get('error'):
-                lines.append(f"| {c['a']} | {c['b']} | {c['repeat']} | {c['file'] or '-'} | error: {c['error']} | | | | | |")
+                lines.append(f"| {c['a']} | {c['b']} | {c['repeat']} | {c['file'] or '-'} | error: {c['error']} | | | | | | |")
                 continue
+            worst = '-' if c['byte_identical'] or not c.get('worst_row') else c['worst_row']
             if not c['rows']:
-                lines.append(f"| {c['a']} | {c['b']} | {c['repeat']} | {c['file']} | {c['byte_identical']} | 0 | | | | |")
+                lines.append(f"| {c['a']} | {c['b']} | {c['repeat']} | {c['file']} | {c['byte_identical']} | 0 | | | | | {worst} |")
                 continue
             lines.append(f"| {c['a']} | {c['b']} | {c['repeat']} | {c['file']} | {c['byte_identical']} | {c['rows']} | "
-                         f"{c['max_abs_diff']:.4e} | {c['mean_kl']:.6f} | {c['max_kl']:.6f} | {100 * c['top1_agreement']:.2f}% |")
+                         f"{c['max_abs_diff']:.4e} | {c['mean_kl']:.6f} | {c['max_kl']:.6f} | {100 * c['top1_agreement']:.2f}% | {worst} |")
     text = '\n'.join(lines) + '\n'
     (Path(state['root']) / 'summary.md').write_text(text)
     return text
@@ -1122,7 +1275,7 @@ def build_state(args, arms):
     hub = hub_root()
     sparks = None
     if args.spark_hosts:
-        hosts = parse_hosts(args.spark_hosts)
+        hosts = parse_hosts(args.spark_hosts, configured_hosts(args.config))
         if args.worker_ready_timeout < 1:
             raise ValueError('--worker-ready-timeout must be positive seconds')
         if not 1 <= args.expert_port <= 65535:
@@ -1161,12 +1314,15 @@ def build_state(args, arms):
             raise ValueError(f'--native-test {args.native_test} is not an executable file (an absolute path)')
         native_test, native_digest = str(test.resolve()), sha256_file(test)
     fixtures = resolve_fixtures(args, task_root)
-    covered = [hub, Path('/mnt/sparknest'), snapshot] + ([Path(fixtures)] if fixtures else [])
-    state = dict(task=args.task, family=args.family, root=str(task_root / 'golden'), gpus=parse_gpus(args.gpus),
+    if not hub.is_relative_to(namespace_root()):
+        extra = [str(hub)] + [path for path in extra if not Path(path).is_relative_to(hub)]
+    covered = [hub, Path(namespace_root()), snapshot] + ([Path(fixtures)] if fixtures else [])
+    state = dict(task=args.task, family=args.family, root=str(task_root / 'golden'), gpus=parse_gpus(args.gpus), memory=args.memory_bytes,
                  snapshot=str(snapshot), snapshot_container=container_path, hub=str(hub), timeout=args.timeout,
                  golden=golden, extra_mounts=extra + path_mounts(golden, covered + [Path(p) for p in extra]),
                  mode=mode, native_test=native_test, native_test_sha256=native_digest, fixtures=fixtures,
-                 fixtures_writable=bool(args.fixtures_writable), sparks=sparks)
+                 fixtures_writable=bool(args.fixtures_writable), sparks=sparks,
+                 rdma=bool(args.rdma))
     state['locks'] = locks_for(state['gpus'], sparks['hosts'] if sparks else ())
     state['vocab'] = args.vocab or (vocab_size(snapshot) if args.compare_logits else None)
     for arm in arms.values():
@@ -1198,7 +1354,7 @@ def main(argv=None):
     parser.add_argument('--arm-arg', action='append', default=[], metavar='ARM:TOKEN',
                         help='one extra argv token appended for that arm only (repeatable, in order)')
     parser.add_argument('--env', action='append', default=[], metavar='KEY=VALUE', help='environment for every arm')
-    parser.add_argument('--gpus', default='0,1', help='raptor GPUs, locked gpu0 then gpu1 (default 0,1)')
+    parser.add_argument('--gpus', default='0,1', help='coordinator GPUs, locked gpu0 then gpu1 (default 0,1)')
     raw = parser.add_mutually_exclusive_group()
     raw.add_argument('--native-test', metavar='EXE', help='run this test executable (built in the coordinator dev '
                      'image from the slot commit) with ARGS instead of a golden subcommand')
@@ -1206,6 +1362,8 @@ def main(argv=None):
     parser.add_argument('--fixtures', metavar='DIR', help='fixture directory, mounted at its own path; {fixtures}')
     parser.add_argument('--fixtures-writable', action='store_true',
                         help='mount --fixtures writable (a GPU-only fixture-generation run under the task)')
+    parser.add_argument('--rdma', action='store_true',
+                        help='host networking and /dev/infiniband without Sparks (same-host verbs loopback)')
     parser.add_argument('--spark-hosts', metavar='H1,H2,...', help='start real expert workers, rank = position')
     parser.add_argument('--expert-layers', metavar='LIST', help='expert layers the run exercises (e.g. 3 or 3,5-7); '
                         'CUTEAFD_GOLDEN_EXPERT_LAYERS and {expert_layers}')
@@ -1215,6 +1373,8 @@ def main(argv=None):
                         help='worker environment for one arm (repeatable; over --worker-env)')
     parser.add_argument('--worker-arg', action='append', default=[], metavar='ARG',
                         help='extra expertd-native argument (repeatable; e.g. --worker-arg=--exl3-schedule)')
+    parser.add_argument('--memory-bytes', type=int, metavar='N',
+                        help='host memory cap for the coordinator container (docker --memory/--memory-swap)')
     parser.add_argument('--worker-budget-bytes', type=int, default=DEFAULT_WORKER_BUDGET)
     parser.add_argument('--worker-memory-bytes', type=int, metavar='N',
                         help='container memory cap per worker (docker --memory/--memory-swap); above the device budget')
@@ -1275,6 +1435,11 @@ def main(argv=None):
                 out = Path(state['root']) / name / f'r{repeat}'
                 packages = Path(state['root']) / name / 'spark-packages' if state.get('sparks') else None
                 for rank, host in enumerate(state['sparks']['hosts'] if state.get('sparks') else ()):
+                    spark = state['slots'][name]['sparks'][host]
+                    if spark['image_identity'] != 'sealed':
+                        vouch = spark.get('image_vouched_by') or 'the seal'
+                        print(f"# {host}: dev image {spark['sealed_image_id']} is local {spark['image_id']} "
+                              f"(same content as on {vouch})")
                     print(f'# {name} r{repeat} expert rank {rank} on {host}\n'
                           f"ssh {host} {shlex.quote(shlex.join(worker_command(state, name, rank, state['slots'][name]['sparks'][host])))}")
                 cmd, _ = docker_command(state, name, arms[name], state['slots'][name], out, run_args(state, arms[name]), packages)

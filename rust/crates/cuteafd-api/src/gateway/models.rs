@@ -20,6 +20,11 @@ pub struct ModelMap {
     /// Extra ids to advertise in listings (e.g. the ids a CLI's picker
     /// expects), each resolving through the rules above.
     pub listed: Vec<String>,
+    /// Weight variants `(public id, index)`, checked before everything else:
+    /// a variant id resolves to itself and never falls back to `served`.
+    pub variants: Vec<(String, u8)>,
+    /// Reserved configured ids that failed verification or source validation.
+    pub unavailable: Vec<(String, String)>,
 }
 
 /// Model ids Claude Code shows and requests (its `/model` picker, default
@@ -51,7 +56,7 @@ impl ModelMap {
     /// expect, all running `served`.
     pub fn official_names(served: impl Into<String>) -> Self {
         let listed = CLAUDE_CODE_MODELS.iter().chain(CODEX_MODELS).map(|id| id.to_string()).collect();
-        Self { served: served.into(), accept_any: true, aliases: Vec::new(), listed }
+        Self { served: served.into(), accept_any: true, aliases: Vec::new(), listed, variants: Vec::new(), unavailable: Vec::new() }
     }
 
     /// Apply an official-names file so ids can be refreshed without a
@@ -84,8 +89,34 @@ impl ModelMap {
         Ok(())
     }
 
-    /// Resolve a requested id to the served id.
+    /// Resolve a requested id to the served id (a variant's own id for a variant).
     pub fn resolve(&self, requested: &str) -> Result<String, GatewayError> {
+        self.resolve_variant(requested).map(|(served, _)| served)
+    }
+
+    /// Resolve a requested id to `(served id, variant index)`; base is 0.
+    pub fn resolve_variant(&self, requested: &str) -> Result<(String, u8), GatewayError> {
+        if let Some((id, reason)) = self.unavailable.iter().find(|(id, _)| id == requested) {
+            return Err(GatewayError::model_unavailable(id, reason));
+        }
+        if let Some((id, index)) = self.variants.iter().find(|(id, _)| id == requested) { return Ok((id.clone(), *index)); }
+        let served = self.resolve_base(requested)?;
+        // Resolve the chosen alias target as an exact variant, without applying
+        // alias patterns again (preserves the first matching alias's precedence).
+        if let Some((id, reason)) = self.unavailable.iter().find(|(id, _)| *id == served) {
+            return Err(GatewayError::model_unavailable(id, reason));
+        }
+        let index = self.variants.iter().find(|(id, _)| *id == served).map_or(0, |(_, index)| *index);
+        Ok((served, index))
+    }
+
+    /// Install every configured id from the engine profile, including rejections.
+    pub fn set_variants(&mut self, records: &[cuteafd_core::variants::VariantRecord]) {
+        self.variants = records.iter().filter(|v| v.is_ready()).map(|v| (v.public_id.clone(), v.index)).collect();
+        self.unavailable = records.iter().filter_map(|v| v.unavailable_reason().map(|r| (v.public_id.clone(), r.to_owned()))).collect();
+    }
+
+    fn resolve_base(&self, requested: &str) -> Result<String, GatewayError> {
         if requested.is_empty() || requested == self.served { return Ok(self.served.clone()); }
         for (pattern, target) in &self.aliases {
             let hit = match pattern.strip_suffix('*') {
@@ -105,7 +136,12 @@ impl ModelMap {
             id: self.served.clone(), context_tokens: None, max_output_tokens: None, owned_by: "cuteafd".into(),
         });
         let mut out = vec![base.clone()];
+        for (id, _) in &self.variants {
+            let record = backend.iter().find(|m| &m.id == id).cloned().unwrap_or_else(|| ModelInfo { id: id.clone(), ..base.clone() });
+            out.push(record);
+        }
         for id in &self.listed {
+            if self.resolve(id).is_err() { continue; }
             if out.iter().any(|m| &m.id == id) { continue; }
             out.push(ModelInfo { id: id.clone(), ..base.clone() });
         }
@@ -130,6 +166,46 @@ mod tests {
         map.accept_any = true;
         assert_eq!(map.resolve("gpt-5.1-codex").unwrap(), "served-model");
         assert_eq!(map.resolve("").unwrap(), "served-model");
+    }
+    #[test]
+    fn variant_ids_resolve_before_aliases_and_accept_any() {
+        let mut map = ModelMap::official_names("served");
+        map.aliases.push(("served-*".into(), "served".into()));
+        map.variants.push(("served-alternate".into(), 1));
+        map.variants.push(("other-id".into(), 2));
+        assert_eq!(map.resolve_variant("served-alternate").unwrap(), ("served-alternate".into(), 1));
+        assert_eq!(map.resolve_variant("other-id").unwrap(), ("other-id".into(), 2));
+        assert_eq!(map.resolve_variant("served").unwrap(), ("served".into(), 0));
+        assert_eq!(map.resolve_variant("served-unknown").unwrap(), ("served".into(), 0), "aliases still apply");
+        assert_eq!(map.resolve_variant("claude-opus-5-5").unwrap(), ("served".into(), 0), "accept_any still applies");
+        let ids: Vec<String> = map.listing(&[]).into_iter().map(|m| m.id).collect();
+        assert_eq!(&ids[..3], ["served", "served-alternate", "other-id"]);
+        // Without accept_any an unknown id keeps today's error, and a variant id still resolves.
+        let mut strict = ModelMap::single("served");
+        strict.variants.push(("served-x".into(), 1));
+        assert!(strict.resolve("nope").is_err());
+        assert_eq!(strict.resolve("served-x").unwrap(), "served-x");
+    }
+    #[test]
+    fn unavailable_ids_and_alias_targets_never_fall_through_to_base() {
+        use crate::gateway::error::ErrorKind;
+        let mut map = ModelMap::official_names("served");
+        map.variants = vec![("served-ready".into(), 2)];
+        map.unavailable = vec![("served-rejected".into(), "incomplete site tensors".into())];
+        map.aliases = vec![("ready-alias".into(), "served-ready".into()),
+            ("bad-alias".into(), "served-rejected".into()), ("served-*".into(), "served".into())];
+        for id in ["served-rejected", "bad-alias"] {
+            let error = map.resolve_variant(id).unwrap_err();
+            assert_eq!(error.kind, ErrorKind::ModelUnavailable);
+            assert_eq!(error.openai_body()["error"]["code"], "model_unavailable");
+            assert!(error.message.contains("incomplete site tensors"));
+        }
+        assert_eq!(map.resolve_variant("ready-alias").unwrap(), ("served-ready".into(),2));
+        assert_eq!(map.resolve_variant("served-ready").unwrap(), ("served-ready".into(),2));
+        assert_eq!(map.resolve_variant("served-other").unwrap(), ("served".into(),0));
+        assert_eq!(map.resolve_variant("anything").unwrap(), ("served".into(),0));
+        map.listed.extend(["served-rejected".into(), "bad-alias".into()]);
+        assert!(!map.listing(&[]).iter().any(|v| v.id == "served-rejected" || v.id == "bad-alias"));
     }
     #[test]
     fn official_names_list_claude_ids_for_discovery() {

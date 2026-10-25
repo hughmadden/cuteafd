@@ -1,4 +1,4 @@
-"""Coordinator exports never queue for a raptor GPU; remote waits are bounded."""
+"""Coordinator exports queue only after releasing build resources."""
 import os
 import subprocess
 from pathlib import Path
@@ -22,10 +22,10 @@ def _dispatch():
 
 
 @pytest.mark.parametrize('setting,host,expected', [
-    ('auto', '', 'capped remote wait-remote'),
-    ('auto', 'oliver', 'capped remote wait-remote'),
+    ('auto', '', 'capped'),
+    ('auto', 'other', 'remote capped'),
     ('remote', '', 'remote wait-remote'),
-    ('capped', 'oliver', 'capped remote wait-remote'),
+    ('capped', 'other', 'remote capped'),
 ])
 def test_mode_order(setting, host, expected):
     script = 'release_die() { echo "DIE $*"; exit 9; }\n' + _function('wip_coordinator_export_modes') + \
@@ -42,15 +42,17 @@ def test_unknown_mode_is_refused():
     assert result.returncode == 9 and 'must be auto, remote or capped' in result.stdout
 
 
+@pytest.mark.parametrize('setting', ['auto', 'capped'])
 @pytest.mark.parametrize('capped,remote,expected_done,expected_calls', [
-    (0, 0, 'capped', ['capped']),
-    (75, 0, 'remote', ['capped', 'remote']),
+    (0, 0, 'remote', ['remote']),
+    (0, 75, 'capped', ['remote', 'capped']),
 ])
-def test_dispatch_falls_through_to_remote(tmp_path, capped, remote, expected_done, expected_calls):
+def test_dispatch_queues_only_after_remote_unavailable(tmp_path, setting, capped, remote, expected_done, expected_calls):
     trace = tmp_path / 'trace'
     script = f'''
 release_die() {{ echo "DIE $*"; exit 9; }}
-wip_coordinator_export_modes() {{ printf 'capped remote turn\\n'; }}
+{_function('wip_coordinator_export_modes')}
+CUTEAFD_WIP_COORDINATOR_EXPORT={setting} CUTEAFD_EXPORT_HOST=other
 wip_remote_export() {{ echo remote >> {trace}; return {remote}; }}
 wip_capped_export() {{ echo capped >> {trace}; return {capped}; }}
 wip_hwlock() {{ echo turn >> {trace}; }}
@@ -68,9 +70,10 @@ run
 
 def test_capped_export_runs_only_on_a_gpu_whose_lock_it_holds_and_is_watched():
     capped = _function('wip_capped_export')
-    # Never queues (no fair-turn wait) and never picks a GPU across locks.
+    # Fair wait is bounded; held GPU selection happens inside placement.
     assert 'wip_hwlock' not in capped
     assert 'export-placement.py" hold --gpus "${CUTEAFD_WIP_EXPORT_GPUS:-1,0}"' in capped
+    assert '--wait "${CUTEAFD_WIP_EXPORT_WAIT_S:-14400}"' in capped
     on = _function('wip_capped_export_on')
     assert 'CUTEAFD_EXPORT_GPU' in on and 'memory.free' not in on and 'sort -t,' not in on
     assert '"$placement" admit' in on and 'watch --gpu "$gpu" --cap-mib "$cap" --cgroup "$id"' in on
@@ -110,7 +113,7 @@ esac
     common = (ROOT / 'scripts/lib/release-common.sh').read_text()
     helper = common[common.index('release_gpu_device_args() {'):common.index('\n}\n', common.index('release_gpu_device_args() {')) + 3]
     cdi = (ROOT / 'scripts/lib/cdi-gpus.sh').read_text()
-    script = 'CUTEAFD_CDI_CHECK=off\n' + cdi + helper + _function('wip_capped_export') + _function('wip_capped_export_on') + f'''
+    script = 'CUTEAFD_CDI_CHECK=off\n' + cdi + helper + _function('wip_capped_export_functions') + _function('wip_capped_export') + _function('wip_capped_export_on') + f'''
 repo_root={str(ROOT)!r} coordinator_container=wipc COORDINATOR_DOCKER_DEV=img
 wip_capped_export docker exec -e CUTEAFD_WIP_DSV4_AOT=ON -e 'CUTEAFD_WIP_EXPERT_FAMILIES=a;b' wipc /x coordinator
 '''
@@ -125,6 +128,36 @@ wip_capped_export docker exec -e CUTEAFD_WIP_DSV4_AOT=ON -e 'CUTEAFD_WIP_EXPERT_
     assert 'docker exec cid123 timeout --kill-after=30 7200 /wip/source/scripts/build/build-wip-artifacts.sh' in calls
     assert 'docker ps -a' in calls
     assert 'capped on gpu1' in result.stdout
+    assert 'command not found' not in result.stderr, result.stderr
+
+
+def _capped_child_block(tmp_path):
+    """The definitions wip_capped_export actually hands its fresh `bash -c` child."""
+    common = (ROOT / 'scripts/lib/release-common.sh').read_text()
+    start = common.index('release_gpu_device_args() {')
+    helper = common[start:common.index('\n}\n', start) + 3]
+    script = (f'source {str(ROOT / "scripts/lib/cdi-gpus.sh")!r}\n' + helper + _function('wip_capped_export_on')
+              + _function('wip_capped_export_functions') + 'wip_capped_export_functions\n')
+    result = subprocess.run(['bash', '-c', script], capture_output=True, text=True, timeout=30)
+    assert result.returncode == 0, result.stderr
+    return result.stdout
+
+
+def test_capped_export_child_defines_every_helper_it_calls(tmp_path):
+    import re
+    block = _capped_child_block(tmp_path)
+    defined = set(re.findall(r'^([A-Za-z_][A-Za-z0-9_]*) \(\)', block, re.M))
+    called = set(re.findall(r'\b((?:cuteafd_cdi|release_gpu|wip_capped)_[A-Za-z0-9_]*)\b', block))
+    assert called <= defined, f'missing in the capped-export child: {sorted(called - defined)}'
+    # The fresh child resolves a GPU through the WSL all-only path (cuteafd_cdi_only_all and
+    # cuteafd_cdi_single_gpu_host), with nothing else from the parent shell.
+    spec = tmp_path / 'nvidia.yaml'
+    spec.write_text('devices:\n    - name: all\n')
+    child = subprocess.run(['env', '-i', f'PATH={os.environ["PATH"]}', f'CUTEAFD_CDI_SPECS={spec}',
+                            'CUTEAFD_CDI_GPU_COUNT=1', 'bash', '-c', block + '\nrelease_gpu_device_args GPU-one'],
+                           capture_output=True, text=True, timeout=30)
+    assert child.returncode == 0 and 'command not found' not in child.stderr, child.stderr
+    assert child.stdout.split() == ['--device', 'nvidia.com/gpu=all']
 
 
 def test_the_export_containers_gpu_binding_has_one_call_site():
@@ -150,3 +183,22 @@ def test_remote_staging_seals_with_one_path_per_nest_call():
         if re.search(r'\bnest seal\b', line):
             args = [a for a in line.split('nest seal', 1)[1].split('>')[0].split() if not a.startswith('-')]
             assert len(args) == 1, line.strip()
+
+
+def test_native_cache_hit_restores_without_gpu_placement(tmp_path):
+    function = _function('build_coordinator')
+    script = """set -euo pipefail
+sync_local_source() { :; }
+docker() { echo "docker $*"; }
+native_store_sync() { :; }
+native_store_has() { return 0; }
+release_die() { exit 9; }
+wip_capped_export() { echo unexpected-queue; exit 99; }
+slot=test coordinator_container=fixture COORDINATOR_DOCKER_DEV=fixture
+bf16_families= audio_aot=OFF wip_export_locks=on
+""" + function + '\nbuild_coordinator native\n'
+    result = subprocess.run(['bash', '-c', script], capture_output=True, text=True, timeout=10)
+    assert result.returncode == 0, result.stderr
+    assert 'native cache hit, no GPU turn' in result.stdout
+    assert 'CUTEAFD_WIP_NATIVE_REQUIRE_HIT=1' in result.stdout
+    assert 'unexpected-queue' not in result.stdout

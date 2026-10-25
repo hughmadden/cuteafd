@@ -8,7 +8,7 @@
 use crate::client::Client;
 use crate::panels::common::{aggregate, median, plain, wave, Timed};
 use crate::panels::speed::CONTENT;
-use crate::text::{filler, nonce};
+use crate::text::{corpus, nonce};
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -53,6 +53,11 @@ pub struct PrefillPoint {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct Sweep {
+    /// The `/v1/models` id the sweep measured (absent in sweeps that predate it).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_content: Option<String>,
     pub points: Vec<Point>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub prefill: Vec<PrefillPoint>,
@@ -118,7 +123,7 @@ fn measure(client: &Client, c: usize, phase: &str, repeat: Option<&Prompts>, tok
     -> Result<(Point, Prompts)> {
     let prompts = repeat.cloned().unwrap_or_else(|| Prompts::fresh(c));
     let batch = |texts: &[String]| -> Vec<Result<Timed>> {
-        wave(client, texts.iter().map(|text| plain(text, tokens)).collect())
+        wave(client, texts.iter().map(|text| plain(client, text, tokens)).collect())
     };
     // A repeat only means something if nothing came from the prefix cache.
     let uncached = |results: Vec<Result<Timed>>| -> Result<Vec<Result<Timed>>> {
@@ -150,17 +155,17 @@ fn measure(client: &Client, c: usize, phase: &str, repeat: Option<&Prompts>, tok
     Ok((point, prompts))
 }
 
-/// Cold prefill at each length: fit tokens per filler word from two short
+/// Cold prefill at each length: fit tokens per reference token from two short
 /// requests, then per length one untimed warm request and one measured request
 /// with a fresh prefix (it must reuse no cached tokens).
 fn prefill(client: &Client, lengths: &[u64], max_context: u64, on_timed: &mut OnTimed) -> Result<Vec<PrefillPoint>> {
     let ask = |words: usize, seed: u64| -> Result<crate::client::Chat> {
-        client.chat(plain(&format!("[{}] Summarize in one word.\n\n{}", nonce(), filler(seed, words)), 1), None)
+        client.chat(plain(client, &format!("[{}] Summarize in one word.\n\n{}", nonce(), corpus(seed, words)), 1), None)
     };
-    let (a, b) = (ask(300, 101)?, ask(900, 102)?);
+    let (a, b) = (ask(300, 101)?, ask(900, 101)?);
     let slope = (b.timing.prompt_tokens as f64 - a.timing.prompt_tokens as f64) / 600.0;
     let intercept = a.timing.prompt_tokens as f64 - slope * 300.0;
-    let (slope, intercept) = if slope.is_finite() && slope > 0.3 { (slope, intercept) } else { (1.3, 20.0) };
+    let (slope, intercept) = if slope.is_finite() && slope > 0.3 { (slope, intercept) } else { (1.0, 20.0) };
     let mut points = Vec::new();
     for &length in lengths {
         let target = length.min(max_context.saturating_sub(64)) as f64;
@@ -194,14 +199,16 @@ pub fn parse_lengths(text: &str) -> Result<Vec<u64>, String> {
 /// Runs the sweep against `url`; `api_key` is the server's bearer key.
 pub fn run(url: &str, api_key: Option<&str>, levels: &[usize], post_load_c1: bool, post_load_repeat: bool,
     prefill_lengths: &[u64]) -> Result<Sweep> {
-    run_windowed(url, api_key, levels, post_load_c1, post_load_repeat, prefill_lengths, false, TOKENS, None)
+    run_windowed(url, api_key, None, levels, post_load_c1, post_load_repeat, prefill_lengths, false, TOKENS, None)
 }
 
 /// [`run`], calling `on_timed` once just before the first timed request. `tokens`
 /// is each decode request's output length ([`TOKENS`] by default; longer runs give
-/// a profiled wave more decode steps at every width).
+/// a profiled wave more decode steps at every width). `model` selects the
+/// `/v1/models` id to measure exactly ([`Client::with_model`]); `None` keeps
+/// the default (`CUTEAFD_BENCH_MODEL`, else the first listed id).
 #[allow(clippy::too_many_arguments)]
-pub fn run_windowed(url: &str, api_key: Option<&str>, levels: &[usize], post_load_c1: bool,
+pub fn run_windowed(url: &str, api_key: Option<&str>, model: Option<&str>, levels: &[usize], post_load_c1: bool,
     post_load_repeat: bool, prefill_lengths: &[u64], fabric: bool, tokens: u64, mut on_timed: OnTimed) -> Result<Sweep> {
     if !(1..=MAX_TOKENS).contains(&tokens) {
         bail!("sweep tokens must be 1..={MAX_TOKENS}, got {tokens}");
@@ -210,10 +217,12 @@ pub fn run_windowed(url: &str, api_key: Option<&str>, levels: &[usize], post_loa
         bail!("post_load_repeat needs post_load_c1 and a levels list that includes 1 (it replays the levels C1)");
     }
     let key = api_key.map(cuteafd_api::openai::auth::ApiKey::new).transpose().map_err(anyhow::Error::msg)?;
-    let mut client = Client::new(url, None, Arc::new(AtomicBool::new(false))).with_api_key(key).with_fabric(fabric);
+    let mut client = Client::new(url, None, Arc::new(AtomicBool::new(false))).with_api_key(key).with_fabric(fabric)
+        .with_model(model.map(str::to_string));
     let _subscription = client.fabric_subscription();
     let record = client.discover().context("sweep: /v1/models")?;
-    let mut sweep = Sweep::default();
+    let mut sweep = Sweep { model: Some(client.model.clone()), prompt_content: Some(crate::text::PROMPT_CONTENT.into()),
+        ..Sweep::default() };
     if !prefill_lengths.is_empty() {
         let max_context = record["max_context_tokens"].as_u64().unwrap_or(8192);
         let mark = client.thermal_mark();

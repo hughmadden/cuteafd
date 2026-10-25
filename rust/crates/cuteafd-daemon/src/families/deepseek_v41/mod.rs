@@ -32,3 +32,8 @@ pub(crate) mod v41_tensors;
 pub(crate) mod v41_vision;
 pub(crate) mod v41_vision_encoder;
 pub(crate) mod v41_window;
+#[cfg(test)]
+#[path = "coordinator_golden_tests.rs"]
+mod coordinator_golden_tests;
+#[cfg(test)]
+mod scale_code_golden_tests;

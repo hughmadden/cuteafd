@@ -1,4 +1,5 @@
 #include "../../../shared/cuda/draft_attention.cuh"
+#include "../../../shared/cuda/draft_kv.cuh"
 // DFlash block drafter of MiMo V2.6 Pro (the snapshot's dflash/: five
 // Qwen3-style layers, 128 query / 8 KV heads of 128, attention sinks, value
 // scale, NeoX RoPE on the first 64 dims, non-causal block attention over a
@@ -29,6 +30,7 @@ constexpr int kNormThreads = 512;
 // RoPE on the first `rope_dim` (64 or 128) dims at the row's position; k and
 // bf16(v * v_scale) go to row `slots[row]` (row itself when slots is null,
 // skipped when negative) of the [slot, kv_heads, 128] caches.
+template <bool fp8>
 __global__ void qk_rope_kernel(const bf16* qkv, const bf16* q_norm, const bf16* k_norm, const int64_t* positions,
                                const int32_t* slots, bf16* q_out, bf16* k_out, bf16* v_out, int rows, int heads,
                                int kv_heads, int rope_dim, float theta, float eps, float v_scale) {
@@ -80,10 +82,18 @@ __global__ void qk_rope_kernel(const bf16* qkv, const bf16* q_norm, const bf16* 
   bf16* k = k_out + (uint64_t(slot) * kv_heads + kv) * kHeadDim;
   bf16* v = v_out + (uint64_t(slot) * kv_heads + kv) * kHeadDim;
   const bf16* v_in = qkv + row * width + uint64_t(heads + kv_heads + kv) * kHeadDim;
+  if constexpr (fp8) {
+    float values[4];
+#pragma unroll
+    for (int j = 0; j < 4; ++j) values[j] = r(f(v_in[lane + 32 * j]) * v_scale);
+    cuteafd::draft_kv::store<128>(k_out, slot, kv, kv_heads, y);
+    cuteafd::draft_kv::store<128>(v_out, slot, kv, kv_heads, values);
+  } else {
 #pragma unroll
   for (int j = 0; j < 4; ++j) {
     k[lane + 32 * j] = __float2bfloat16(y[j]);
     v[lane + 32 * j] = __float2bfloat16(f(v_in[lane + 32 * j]) * v_scale);
+  }
   }
 }
 
@@ -115,7 +125,7 @@ extern "C" int32_t cuteafd_mimo_dflash_qk_rope(const void* qkv, const void* q_no
                                                int32_t rope_dim, float theta, float eps, float v_scale, void* stream) {
   if (rows < 1 || kv_heads < 1 || heads < 0 || (rope_dim != 64 && rope_dim != 128)) return cudaErrorInvalidValue;
   const int warps = rows * (heads + kv_heads);
-  qk_rope_kernel<<<(warps * 32 + 255) / 256, 256, 0, static_cast<cudaStream_t>(stream)>>>(
+  qk_rope_kernel<false><<<(warps * 32 + 255) / 256, 256, 0, static_cast<cudaStream_t>(stream)>>>(
       static_cast<const bf16*>(qkv), static_cast<const bf16*>(q_norm), static_cast<const bf16*>(k_norm),
       static_cast<const int64_t*>(positions), static_cast<const int32_t*>(slots), static_cast<bf16*>(q_out),
       static_cast<bf16*>(k_out), static_cast<bf16*>(v_out), rows, heads, kv_heads, rope_dim, theta, eps, v_scale);
@@ -147,7 +157,7 @@ extern "C" int32_t cuteafd_mimo_dflash_attention(const void* q, const void* k_bl
       / cuteafd::draft_attention::queries_per_slice;
   return cuteafd::draft_attention::launch(q, k_block, v_block, k_ring, v_ring, seq_slots,
       ctx_lengths, ctx_ends, sinks, out, workspace, sequences, block_rows, heads, kv_heads,
-      ring, max_keys, window, false, kHeadDim, slices, scale, static_cast<cudaStream_t>(stream));
+      ring, max_keys, window, false, kHeadDim, slices, false, scale, static_cast<cudaStream_t>(stream));
 }
 
 // h = h + delta (BF16), n = RMSNorm(h) * w for `rows` rows of `width` (<= 8192 * 4).
@@ -158,4 +168,32 @@ extern "C" int32_t cuteafd_mimo_dflash_add_norm(void* h, const void* delta, cons
       static_cast<bf16*>(h), static_cast<const bf16*>(delta), static_cast<const bf16*>(w), static_cast<bf16*>(n),
       width, eps);
   return cudaGetLastError();
+}
+
+
+extern "C" int32_t cuteafd_mimo_dflash_qk_rope_fp8(const void* qkv, const void* q_norm, const void* k_norm,
+                                               const void* positions, const void* slots, void* q_out, void* k_out,
+                                               void* v_out, int32_t rows, int32_t heads, int32_t kv_heads,
+                                               int32_t rope_dim, float theta, float eps, float v_scale, void* stream) {
+  if (rows < 1 || kv_heads < 1 || heads < 0 || (rope_dim != 64 && rope_dim != 128)) return cudaErrorInvalidValue;
+  const int warps = rows * (heads + kv_heads);
+  qk_rope_kernel<true><<<(warps * 32 + 255) / 256, 256, 0, static_cast<cudaStream_t>(stream)>>>(
+      static_cast<const bf16*>(qkv), static_cast<const bf16*>(q_norm), static_cast<const bf16*>(k_norm),
+      static_cast<const int64_t*>(positions), static_cast<const int32_t*>(slots), static_cast<bf16*>(q_out),
+      static_cast<bf16*>(k_out), static_cast<bf16*>(v_out), rows, heads, kv_heads, rope_dim, theta, eps, v_scale);
+  return cudaGetLastError();
+}
+
+extern "C" int32_t cuteafd_mimo_dflash_attention_fp8(const void* q, const void* k_block, const void* v_block,
+                                                 const void* k_ring, const void* v_ring, const void* seq_slots,
+                                                 const void* ctx_lengths, const void* ctx_ends, const void* sinks,
+                                                 void* out, void* workspace, int32_t sequences, int32_t block_rows,
+                                                 int32_t heads, int32_t kv_heads, int32_t ring, int32_t max_keys,
+                                                 int32_t window, float scale, void* stream) {
+  if (kv_heads < 1 || heads < 1 || heads % kv_heads || block_rows < 1) return cudaErrorInvalidValue;
+  const int slices = (heads / kv_heads * block_rows + cuteafd::draft_attention::queries_per_slice - 1)
+      / cuteafd::draft_attention::queries_per_slice;
+  return cuteafd::draft_attention::launch(q, k_block, v_block, k_ring, v_ring, seq_slots,
+      ctx_lengths, ctx_ends, sinks, out, workspace, sequences, block_rows, heads, kv_heads,
+      ring, max_keys, window, false, kHeadDim, slices, true, scale, static_cast<cudaStream_t>(stream));
 }

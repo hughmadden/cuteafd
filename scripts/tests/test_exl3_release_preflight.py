@@ -45,7 +45,8 @@ if tool == 'docker':
         tp, ep = int(value('--spark-tp', str(ranks))), int(value('--spark-ep', '1'))
         explicit = '--spark-tp' in args or ranks == 3
         gpus = int(value('--rtx', '1'))
-        print(json.dumps(dict(spark_ranks=ranks, prefill_rows=rows or 1024,
+        print(json.dumps(dict(spark_ranks=ranks, prefill_unit_rows=rows or 1024,
+            prefill_waves=1, prefill_span_rows=rows or 1024,
             version=1, family='deepseek_v41', executable=True, wip_launchable=True,
             launch=dict(family='deepseek_v41'),
             topology=dict(tp=tp, ep=ep,
@@ -93,12 +94,17 @@ class Exl3ReleasePreflightTest(unittest.TestCase):
                 path = binary / tool
                 path.write_text(f'#!{sys.executable}\n' + MOCK)
                 path.chmod(0o755)
-            snapshot = directory / 'hf/hub/models--deepseek-ai--DeepSeek-V4.1-Flash/snapshots/dba1be0a40aa45a94ad051997016db3960a90277'
+            from launcher_sandbox import stub_cuda_python
+            stub_cuda_python(binary, gpu_mib * 2**20)
+            # The remote preflight resolves the snapshot inside the shared
+            # namespace, just as the real launcher does.
+            snapshot = directory / 'hf-home/hub/models--deepseek-ai--DeepSeek-V4.1-Flash/snapshots/dba1be0a40aa45a94ad051997016db3960a90277'
             snapshot.mkdir(parents=True)
             (snapshot / 'config.json').write_text(json.dumps(
                 {'quantization_config': {'quant_method': 'exl3' if exl3 else 'fp4', 'bits': 2.0}}))
             env = dict(os.environ, PATH=str(binary) + os.pathsep + os.environ['PATH'],
-                       HF_HOME=str(directory / 'hf'), MOCK_LOG=str(directory / 'calls.jsonl'),
+                       HF_HOME=str(directory / 'hf-home'), CUTEAFD_NAMESPACE_ROOT=str(directory),
+                       MOCK_LOG=str(directory / 'calls.jsonl'),
                        MOCK_REVISION=json.loads((ROOT / 'third_party/sparkinfer.lock.json').read_text())['revision'],
                        MOCK_LEGACY='1' if legacy else '', MOCK_GPU_MIB=str(gpu_mib),
                        MOCK_TP=str(spark_count if spark_count in (2, 3, 6) else 2),

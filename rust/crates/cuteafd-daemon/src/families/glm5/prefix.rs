@@ -262,104 +262,229 @@ fn paged_rows(family: &GlmPrefix<'_, '_>, placement: &GlmPlacement, len: usize) 
     Ok(out)
 }
 
-/// glm-golden --resume-at P: prefill `tokens[..P]` into sequence A, capture its snapshot (shared
-/// pages, the copied tail page), restore it into sequence B, continue both with the same chunks
-/// and `decode` greedy single-row steps, and compare every layer's rows, every logit and every
-/// paged row byte for byte (a restore must be exact). A straight prefill without the boundary
-/// at P is reported too (informational: chunking changes may round differently).
-/// With `cold`, B is prefilled from scratch on its own pages instead (no restore): the floor of
-/// what the kernels themselves vary. The check runs `repeat` times on fresh sequences (every
-/// attempt must be identical: the DSA top-k is deterministic, ties going to the lower index).
+/// Greedy decode logits are retained as bits so NaNs and signed zeros compare exactly.
+struct Continuation {
+    suffix: SuffixRun,
+    decode: Vec<Vec<u32>>,
+    paged: Vec<u8>,
+    len: usize,
+}
+
+fn argmax(logits: &[f32]) -> u32 {
+    logits.iter().enumerate().max_by(|x, y| x.1.total_cmp(y.1)).map_or(0, |(i, _)| i as u32)
+}
+
+fn decode_trace(engine: &GlmEngine<'_>, placement: &mut GlmPlacement, last: &[f32], steps: usize,
+    experts: &mut Experts<'_, '_>) -> Result<Vec<Vec<u32>>> {
+    use anyhow::Context;
+    let mut next = argmax(last);
+    let mut trace = Vec::new();
+    for _ in 0..steps {
+        let transport = experts.as_mut().map(|(t, r)| (&mut **t, *r));
+        let logits = engine.verify(&mut [(&mut *placement, 1)], &[next], transport, None)?.context("decode logits")?;
+        next = argmax(&logits);
+        trace.push(logits.iter().map(|v| v.to_bits()).collect());
+    }
+    Ok(trace)
+}
+
+fn continuation(family: &GlmPrefix<'_, '_>, placement: &mut GlmPlacement, tokens: &[u32],
+    chunk: usize, decode: usize, experts: &mut Experts<'_, '_>) -> Result<Continuation> {
+    let suffix = prefill_digest(family.engine, placement, tokens, chunk, true, experts)?;
+    let decode = decode_trace(family.engine, placement, &suffix.last, decode, experts)?;
+    let paged = paged_rows(family, placement, placement.len)?;
+    Ok(Continuation { suffix, decode, paged, len: placement.len })
+}
+
+/// Shared by device-fork, cold-floor and host restores; all three must clear the same bar.
+fn compare_continuations(a: &Continuation, b: &Continuation) -> (bool, String) {
+    let first_layer = a.suffix.layers.iter().zip(&b.suffix.layers).position(|(x, y)| x != y);
+    let layers_equal = a.suffix.layers == b.suffix.layers;
+    let logits_equal = a.suffix.logits == b.suffix.logits;
+    let max_diff = a.suffix.last.iter().zip(&b.suffix.last).map(|(x, y)| (x - y).abs()).fold(0f32, f32::max);
+    let decode_equal = argmax(&a.suffix.last) == argmax(&b.suffix.last) && a.decode == b.decode;
+    let paged_equal = a.len == b.len && a.paged == b.paged;
+    let same = |equal| if equal { "identical" } else { "DIFFERS" };
+    let layers = if layers_equal { "identical".into() }
+        else { format!("differ from layer {first_layer:?}") };
+    (layers_equal && logits_equal && decode_equal && paged_equal,
+        format!("layers {layers} | logits {} (last row max |diff| {max_diff:.3e}) | decode {} | paged rows 0..{} {}",
+            same(logits_equal), same(decode_equal), a.len, same(paged_equal)))
+}
+
+/// What a passing [`resume_check`] observed (its final lines' counts).
+#[derive(Debug, Clone, serde::Serialize)]
+pub(crate) struct ResumeSummary {
+    pub at: usize,
+    pub prefilled: usize,
+    pub chunk: usize,
+    pub decode: usize,
+    pub mode: &'static str,
+    pub variant: u8,
+    pub attempts: usize,
+    pub byte_identical: usize,
+    pub states_identical: usize,
+    pub suffix_top1_agree: usize,
+    pub suffix_rows: usize,
+    pub straight_last_row_identical: bool,
+}
+
+/// glm-golden --resume-at P: compare exact prefix bytes (including the tail), continuation
+/// layer/logit digests, greedy decode logits and final paged bytes. Device mode forks A;
+/// cold mode prefills B; host mode finishes and releases A before restoring B from pinned RAM.
+/// An unbroken prefill is informational because chunk boundaries can round differently.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn resume_check(engine: &GlmEngine<'_>, tokens: &[u32],
-    at: usize, n: usize, chunk: usize, decode: usize, cold: bool, repeat: usize, mut experts: Experts<'_, '_>)
-    -> Result<()> {
+    at: usize, n: usize, chunk: usize, decode: usize, cold: bool, repeat: usize,
+    host: Option<&crate::shared::prefix::PrefixArgs>, mut experts: Experts<'_, '_>) -> Result<ResumeSummary> {
     use super::engine::PageAllocator;
+    use cuteafd_engine::prefix::{After, SnapshotKind};
+    use cuteafd_hostcache::copy::{CopyEngine, Stream};
     use anyhow::{ensure, Context};
     ensure!(engine.weights.layers.len() == engine.cfg.layers, "--resume-at needs every layer");
     ensure!(engine.full_prefill_logits, "--resume-at needs every prefill row's logits");
     ensure!(experts.is_some() || engine.skip_routed(), "--resume-at needs Spark peers or --skip-routed-experts");
     ensure!(at > 0 && at < n && n <= tokens.len(), "--resume-at {at} must lie inside the {n} prefilled tokens");
+    let capacity = n.checked_add(decode).context("resume capacity overflow")?;
     let chunk = chunk.clamp(1, engine.prefill_rows);
     let embed = &tokens[..n];
-    let family = GlmPrefix::new(engine, false)?;
-    let mut allocator = PageAllocator::new(engine);
+    // Only one allocator owns the engine's page IDs. Device/cold mode retains its existing
+    // allocator; host mode uses exactly the production cache and its pool.
+    let (family, mut cache) = if let Some(args) = host {
+        let (family, cache) = super::serve::prefix_cache(engine, args, 1)?;
+        ensure!(cache.host_config().is_some(), "--resume-host is unsupported for this placement (heads split has no host tier)");
+        (family, Some(cache))
+    } else { (GlmPrefix::new(engine, false)?, None) };
+    let mut allocator = host.is_none().then(|| PageAllocator::new(engine));
+    let variant = engine.golden_variant.get();
+    let build = |pages| GlmPlacement { pages, len: 0, variant };
+    let key = cuteafd_engine::prefix::namespaced(embed, variant)?;
     let err = |e: BoxError| anyhow::anyhow!("{e}");
     let (mut identical, mut states_identical, mut last) = (0, 0, None);
     for _ in 0..repeat.max(1) {
-    // A: prefill [0, P), capture (pages only), continue in place.
-    let mut a = allocator.admit(n + decode)?;
-    prefill_digest(engine, &mut a, &embed[..at], chunk, false, &mut experts)?;
-    family.drain().map_err(err)?;
-    let started = std::time::Instant::now();
-    // B: a second sequence restored from the snapshot (shared full pages, its own tail page).
-    let mut b = if cold {
-        let mut b = allocator.admit(n + decode)?;
-        prefill_digest(engine, &mut b, &embed[..at], chunk, false, &mut experts)?;
-        b
-    } else {
-        let (mut b, copy) = allocator.fork(&a, at, n + decode)?;
-        if let Some(copy) = copy {
-            family.copy_rows(copy).map_err(err)?;
-        }
-        family.restore(None, &mut b, at).map_err(err)?;
-        b
-    };
-    family.drain().map_err(err)?;
-    let restore_ms = started.elapsed().as_secs_f64() * 1e3;
-    // The state at P (every paged row): what a restore must reproduce.
-    let state_at = paged_rows(&family, &a, at)? == paged_rows(&family, &b, at)?;
-    let straight = prefill_digest(engine, &mut a, &embed[at..], chunk, true, &mut experts)?;
-    let restored = prefill_digest(engine, &mut b, &embed[at..], chunk, true, &mut experts)?;
-    let first_layer = straight.layers.iter().zip(&restored.layers).position(|(x, y)| x != y);
-    let logits_equal = straight.logits == restored.logits;
-    let max_diff = straight.last.iter().zip(&restored.last).map(|(x, y)| (x - y).abs()).fold(0f32, f32::max);
-    let argmax = |l: &[f32]| l.iter().enumerate().max_by(|x, y| x.1.total_cmp(y.1)).map_or(0, |(i, _)| i as u32);
-    let (mut next_a, mut next_b) = (argmax(&straight.last), argmax(&restored.last));
-    let mut decode_equal = next_a == next_b;
-    for _ in 0..decode {
-        let transport = experts.as_mut().map(|(t, r)| (&mut **t, *r));
-        let la = engine.verify(&mut [(&mut a, 1)], &[next_a], transport, None)?.context("decode logits")?;
-        let transport = experts.as_mut().map(|(t, r)| (&mut **t, *r));
-        let lb = engine.verify(&mut [(&mut b, 1)], &[next_b], transport, None)?.context("decode logits")?;
-        decode_equal &= la.iter().zip(&lb).all(|(x, y)| x.to_bits() == y.to_bits());
-        (next_a, next_b) = (argmax(&la), argmax(&lb));
-    }
-    let len = a.len;
-    let paged_equal = paged_rows(&family, &a, len)? == paged_rows(&family, &b, len)?;
-    println!("resume at {at} of {n} (chunks of {chunk}, {decode} decode steps): state at {at} {} | layers {} | logits \
-        {} (last row max |diff| {max_diff:.3e}) | decode {} | paged rows 0..{len} {} | fork+restore {restore_ms:.1} ms",
-        if state_at { "identical" } else { "DIFFERS" },
-        first_layer.map_or("identical".to_string(), |l| format!("differ from layer {l}")),
-        if logits_equal { "identical" } else { "DIFFER" }, if decode_equal { "identical" } else { "DIFFERS" },
-        if paged_equal { "identical" } else { "DIFFER" });
-    allocator.release(b);
-    allocator.release(a);
-    identical += usize::from(first_layer.is_none() && logits_equal && decode_equal && paged_equal);
-    states_identical += usize::from(state_at);
-    last = Some(restored);
+        let (state_at, straight, restored, restore_ms) = if let Some(cache) = &mut cache {
+            // A's reference bytes and trace must survive only on the CPU before B is admitted.
+            let mut a = cache.admit_cold(&family, n, capacity, build)?.placement;
+            prefill_digest(engine, &mut a, &embed[..at], chunk, false, &mut experts)?;
+            family.drain().map_err(err)?;
+            let prefix_bytes = paged_rows(&family, &a, at)?;
+            let stores_before = cache.stats().host.context("host stats missing")?.stores_completed;
+            ensure!(cache.capture(&family, SnapshotKind::Prompt, &key[..at], &a, After::default())?,
+                "host golden prefix capture was skipped; check retention thresholds and page capacity");
+            // The store stream must retire before A can append to the partial tail or release
+            // its pages. One bounded wait plus tick publishes the completed RAM snapshot.
+            let copy = cache.host_engine_mut().context("host copy engine missing")?;
+            let event = copy.record(Stream::Store)?;
+            ensure!(copy.wait(event, 30_000_000_000)?, "host prefix store exceeded 30 seconds");
+            cache.tick();
+            ensure!(cache.stats().host.context("host stats missing")?.stores_completed > stores_before,
+                "host prefix store did not complete");
+            let straight = continuation(&family, &mut a, &embed[at..], chunk, decode, &mut experts)?;
+            cache.release(&family, &a.pages)?;
+            drop(a);
+            cache.clear(&family)?; // Device retention only: keep the pinned RAM snapshot.
+            ensure!(cache.pool().used() == 0, "device pages remain live before host restore");
+            let before = cache.stats().host.context("host stats missing")?;
+            let started = std::time::Instant::now();
+            // Namespaced keys identify the weights; raw ids alone feed embeddings/restore context.
+            let admitted = cache.admit_native(&family, &key, embed, &[], capacity, false, build)?;
+            let restore_ms = started.elapsed().as_secs_f64() * 1e3;
+            ensure!(admitted.resume == at && admitted.source.as_ref().is_some_and(|s| s.host),
+                "expected host restore at {at}, got resume {} from {:?}", admitted.resume, admitted.source);
+            let after = cache.stats().host.context("host stats missing")?;
+            ensure!(after.restores > before.restores && after.restore_bytes > before.restore_bytes,
+                "host source did not copy RAM bytes back to the device");
+            println!("host restore: restores +{}, restore_bytes +{} (variant {variant})",
+                after.restores - before.restores, after.restore_bytes - before.restore_bytes);
+            let mut b = admitted.placement;
+            family.drain().map_err(err)?;
+            let state_at = prefix_bytes == paged_rows(&family, &b, at)?;
+            let restored = continuation(&family, &mut b, &embed[at..], chunk, decode, &mut experts)?;
+            cache.release(&family, &b.pages)?;
+            cache.clear(&family)?;
+            (state_at, straight, restored, restore_ms)
+        } else {
+            let allocator = allocator.as_mut().unwrap();
+            let mut a = allocator.admit(capacity)?;
+            prefill_digest(engine, &mut a, &embed[..at], chunk, false, &mut experts)?;
+            family.drain().map_err(err)?;
+            let started = std::time::Instant::now();
+            let mut b = if cold {
+                let mut b = allocator.admit(capacity)?;
+                prefill_digest(engine, &mut b, &embed[..at], chunk, false, &mut experts)?;
+                b
+            } else {
+                let (mut b, copy) = allocator.fork(&a, at, capacity)?;
+                if let Some(copy) = copy { family.copy_rows(copy).map_err(err)?; }
+                family.restore(None, &mut b, at).map_err(err)?;
+                b
+            };
+            family.drain().map_err(err)?;
+            let restore_ms = started.elapsed().as_secs_f64() * 1e3;
+            let state_at = paged_rows(&family, &a, at)? == paged_rows(&family, &b, at)?;
+            let straight = continuation(&family, &mut a, &embed[at..], chunk, decode, &mut experts)?;
+            let restored = continuation(&family, &mut b, &embed[at..], chunk, decode, &mut experts)?;
+            allocator.release(b);
+            allocator.release(a);
+            (state_at, straight, restored, restore_ms)
+        };
+        let (equal, detail) = compare_continuations(&straight, &restored);
+        println!("resume at {at} of {n} (chunks of {chunk}, {decode} decode steps): state at {at} {} | {detail} | restore {restore_ms:.1} ms",
+            if state_at { "identical" } else { "DIFFERS" });
+        identical += usize::from(equal);
+        states_identical += usize::from(state_at);
+        last = Some(restored.suffix);
     }
     let restored = last.context("no attempt")?;
     let repeat = repeat.max(1);
-    // C: one prefill with no boundary at P (chunking changes may round differently; informational).
-    let mut c = allocator.admit(n)?;
+    let mut c = if let Some(cache) = &mut cache { cache.admit_cold(&family, n, n, build)?.placement }
+        else { allocator.as_mut().unwrap().admit(n)? };
     let whole = prefill_digest(engine, &mut c, embed, chunk, true, &mut experts)?;
     let x = &whole.argmax[at..];
     let agree = x.iter().zip(&restored.argmax).filter(|(p, q)| p == q).count();
     let last_equal = whole.last.iter().zip(&restored.last).all(|(p, q)| p.to_bits() == q.to_bits());
     println!("vs one straight prefill without the boundary at {at}: suffix top-1 agreement {agree}/{}, last row logits {}",
         x.len(), if last_equal { "identical" } else { "differ" });
-    allocator.release(c);
-    println!("resume at {at} of {n} (chunks of {chunk}): {identical}/{repeat} attempts byte-identical, state at {at} \
-        identical in {states_identical}/{repeat}{}", if cold { " [cold floor: B prefilled, not restored]" } else { "" });
+    if let Some(cache) = &mut cache { cache.release(&family, &c.pages)?; }
+        else { allocator.as_mut().unwrap().release(c); }
+    let mode = if cold { " [cold floor: B prefilled, not restored]" }
+        else if host.is_some() { " [host restore: device retention cleared]" } else { "" };
+    println!("resume at {at} of {n} (chunks of {chunk}): {identical}/{repeat} attempts byte-identical, state at {at} identical in {states_identical}/{repeat}{mode}");
     ensure!(states_identical == repeat, "the restored state differs from the captured one");
     ensure!(identical == repeat, "the restored sequence's continuation differs from the straight one");
-    Ok(())
+    Ok(ResumeSummary { at, prefilled: n, chunk, decode, variant, attempts: repeat, byte_identical: identical,
+        states_identical, suffix_top1_agree: agree, suffix_rows: x.len(), straight_last_row_identical: last_equal,
+        mode: if cold { "cold" } else if host.is_some() { "host" } else { "device" } })
 }
 
 #[cfg(test)]
 mod ownership_tests {
     use super::*;
+
+    fn trace() -> Continuation {
+        Continuation { suffix: SuffixRun { layers: vec![11, 22], logits: 33,
+            argmax: vec![1], last: vec![0.0, 1.0] },
+            decode: vec![vec![0.0f32.to_bits(), 1.0f32.to_bits()]], paged: vec![1, 2, 3], len: 65 }
+    }
+
+    #[test]
+    fn resume_comparison_rejects_every_trace_component() {
+        assert!(compare_continuations(&trace(), &trace()).0);
+        for change in 0..7 {
+            let mut changed = trace();
+            match change {
+                0 => changed.suffix.layers[1] ^= 1,
+                1 => { changed.suffix.layers.pop(); }
+                2 => changed.suffix.logits ^= 1,
+                3 => changed.suffix.last = vec![2.0, 1.0], // Different first greedy token.
+                4 => changed.decode[0][0] = (-0.0f32).to_bits(),
+                5 => changed.paged[2] ^= 1, // Last byte includes the partial page's tail.
+                6 => changed.len += 1,
+                _ => unreachable!(),
+            }
+            assert!(!compare_continuations(&trace(), &changed).0, "missed component {change}");
+        }
+    }
 
     fn buffer(addr: usize, bytes: usize, rank: usize) -> CuteafdDeviceBuffer {
         CuteafdDeviceBuffer { ptr: addr as *mut std::ffi::c_void, bytes, device_id: rank as i32, flags: 0 }

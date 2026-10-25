@@ -39,19 +39,13 @@ def test_remote_exports_have_unique_paths_and_cleanup_owned_containers():
     assert 'flock -n "$slot_fd"' in text
 
 
-def test_seed_admission_after_reuse_and_no_gpu_queue():
+def test_seed_admission_after_reuse_and_release_before_gpu_queue():
     text = (ROOT / 'wip.sh').read_text()
-    assert text.index('((wip_build_expert == 0)) || wip_build_resource_acquire') > text.index('wip_reused_expert=1')
-    capped = text[text.index('wip_capped_export() {'):text.index('wip_capped_export_on() (')]
-    # The only GPU-lock path is the non-blocking placement hold, so it may run
-    # while the Spark leg holds its seed lease: nothing here can wait on a lock.
-    assert capped.count('export-placement.py" hold') == 1
-    assert 'wip_hwlock' not in capped and 'flock' not in capped and 'hwlock.py' not in capped
-    assert 'wip_build_resource_dir' not in capped
-    dispatch = text[text.index('    local mode exported=0'):text.index('    ((exported)) || release_die')]
-    assert 'wip_hwlock' not in dispatch and 'wait-remote)' in dispatch
-    assert '[[ "$seed_host" != kakapo ]]' not in capped
-    assert text.index('distribute_expert_slot\nwip_resource_complete=1') < text.rindex('wip_build_resource_release')
+    flow = text.split('wip_build_selected_roles() {', 1)[1].split('\n}\n', 1)[0]
+    assert flow.index('build_coordinator rust') < flow.index('wip_build_resource_acquire')
+    assert flow.index('build_expert') < flow.index('wip_build_resource_release')
+    assert flow.index('wip_build_resource_release') < flow.index('wip_distribute_sealed_expert') < flow.index('build_coordinator native')
+    assert text.index('wip_build_selected_roles\n') > text.index('wip_reused_expert=1')
 
 
 def test_every_fingerprinted_build_input_reaches_both_build_containers():
@@ -88,3 +82,11 @@ def test_dense_qwen_aot_opt_in_reaches_native_and_fingerprints():
         assert f'-e "{variable}=${{{variable}:-OFF}}"' in launcher
         build = (ROOT / f'scripts/build/build-{mode}-artifacts.sh').read_text()
         assert f'-DCUTEAFD_ENABLE_QWEN_DENSE_AOT="$( [[ "$role" == coordinator ]] && echo "${{{variable}:-OFF}}" || echo OFF)"' in build
+
+
+def test_v41_release_exports_all_decoder_families_and_compact_companions():
+    cmake = (ROOT / 'native/cmake/shared/exl3.cmake').read_text()
+    release = (ROOT / 'scripts/build/build-release-artifacts.sh').read_text()
+    assert 'set(CUTEAFD_V41_EXL3_BIT_FAMILIES "2,3;3,4;4,5" CACHE STRING' in cmake
+    assert '${CUTEAFD_RELEASE_EXL3_BIT_FAMILIES:-2,3;3,4;4,5}' in release
+    assert '--compact-companions' in cmake

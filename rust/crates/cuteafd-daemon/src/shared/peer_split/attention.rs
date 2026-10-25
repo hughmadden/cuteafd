@@ -591,7 +591,7 @@ pub(crate) fn layer_pipeline_selected<K: PipelineKernels>(scope: &crate::shared:
     layer_pipeline_selected_instances(scope, plan, &exchanges, lanes, order, rows, kernels)
 }
 
-fn pipeline_hops(exchange: &impl LayerProtocol, plan: &LayerExecutionPlan, point: HopPoint,
+pub(crate) fn pipeline_hops(exchange: &impl LayerProtocol, plan: &LayerExecutionPlan, point: HopPoint,
     lane: usize, rows: usize, kernels: &mut impl LayerKernels, consumed: &mut [usize]) -> Result<()> {
     for (index, &hop) in plan.hops().iter().enumerate().filter(|(_, hop)| hop.at == point) {
         ensure!(consumed[index] == 0, "duplicate planned hop {index} in lane {lane}");
@@ -601,7 +601,7 @@ fn pipeline_hops(exchange: &impl LayerProtocol, plan: &LayerExecutionPlan, point
     Ok(())
 }
 
-fn pipeline_attention(exchange: &impl LayerProtocol, plan: &LayerExecutionPlan, layer: usize,
+pub(crate) fn pipeline_attention(exchange: &impl LayerProtocol, plan: &LayerExecutionPlan, layer: usize,
     lane: usize, rows: usize, kernels: &mut impl LayerKernels, consumed: &mut [usize]) -> Result<Option<usize>> {
     exchange.require_live()?;
     if layer == 0 { pipeline_hops(exchange, plan, HopPoint::Entry, lane, rows, kernels, consumed)?; }

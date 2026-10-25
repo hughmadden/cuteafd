@@ -62,6 +62,10 @@ pub(crate) struct RunArgs {
     /// Explicit panels instead of a profile, e.g. tool_eval,prefill.
     #[arg(long, value_delimiter = ',')]
     pub(crate) panels: Option<Vec<String>>,
+    /// The /v1/models id to measure, e.g. a ready weight variant's public id.
+    /// Unlisted, unready or alias ids are refused before the run starts.
+    #[arg(long, env = "CUTEAFD_BENCH_MODEL")]
+    pub(crate) model: Option<String>,
     /// Passes per panel, e.g. tool_eval=3 (the only way to repeat a panel).
     #[arg(long)]
     pub(crate) passes: Option<String>,
@@ -144,7 +148,7 @@ pub(crate) fn run(args: BenchArgs) -> Result<()> {
                 None => Vec::new(),
             };
             let lossless_set = run.lossless_set.as_deref().map(cuteafd_bench::panels::lossless::CaseSet::load).transpose()?;
-            let options = cuteafd_bench::cli::RunOptions { url: run.url, profile: run.profile, panels: run.panels,
+            let options = cuteafd_bench::cli::RunOptions { url: run.url, profile: run.profile, panels: run.panels, model: run.model,
                 passes, baseline: None, fabric: run.fabric, export: run.export, out: run.out, label: None, root: run.root, api_key: run.api_key, quiet: false, deadline: None,
                 lossless_set, lossless_dump: run.lossless_dump, context_lengths: run.context_lengths.as_deref().map(cuteafd_bench::sweep::parse_lengths).transpose().map_err(anyhow::Error::msg)?,
                 context_levels: run.context_levels.as_deref().map(cuteafd_bench::sweep::parse_levels).transpose().map_err(anyhow::Error::msg)? };
@@ -248,7 +252,7 @@ fn serve_context(matches: &ArgMatches, coordinator_budget_gib: Option<f64>)
     settings.extend(cuteafd_bench::context::env_settings().into_iter()
         .filter(|setting| setting.name != "CUTEAFD_ATTENTION_PLACEMENT"));
     Ok(Some(cuteafd_bench::context::ServerContext { command: name.to_string(),
-        family: Some(family.to_string()), snapshot, settings }))
+        family: Some(family.to_string()), snapshot, settings, supports_thinking_off: None }))
 }
 
 /// The attention placement `requested` resolves to for a serve command: two coordinator GPUs
@@ -290,6 +294,21 @@ mod tests {
     }
 
     #[test]
+    fn step5_context_uses_registered_native_attention_placement() {
+        for extra in [vec![], vec!["--split-device", "1"]] {
+            let argv = ["cuteafd", "serve-step5", "--snapshot", "/s", "--native-lib", "/l", "--peers", "127.0.0.1:19000"]
+                .into_iter().chain(extra).collect::<Vec<_>>();
+            let matches = crate::cli::Cli::command().try_get_matches_from(argv).unwrap();
+            let context = serve_context(&matches, None).unwrap().expect("Step-5 serve context");
+            assert_eq!(context.family.as_deref(), Some("step5"));
+            let placement = context.settings.iter().find(|s| s.name == "attention-placement").unwrap();
+            assert_eq!(placement.value.as_deref(), Some("heads"));
+            assert_eq!(placement.default.as_deref(), Some("heads"));
+            assert!(attention_mode("step5", matches.subcommand().unwrap().1, "context").is_err());
+        }
+    }
+
+    #[test]
     fn context_load_arguments_parse_and_validate() {
         let args = |lengths: &str, levels: &str| crate::cli::Cli::command().try_get_matches_from([
             "cuteafd", "bench", "--panels", "context_load", "--context-lengths", lengths, "--context-levels", levels]);
@@ -319,6 +338,24 @@ mod tests {
         let (_, sub) = one.subcommand().unwrap();
         assert!(attention_mode("glm5", sub, "context").is_err());
         assert_eq!(attention_mode("glm5", sub, "auto").unwrap(), Heads);
+    }
+
+    #[test]
+    fn dense_qwen_context_reports_family_and_active_draft_settings() {
+        for draft in [None, Some("/model/dspark")] {
+            let mut argv = vec!["cuteafd", "serve-qwen35", "--snapshot", "/target", "--native-lib", "/native.so"];
+            if let Some(snapshot) = draft { argv.extend(["--draft", snapshot, "--draft-fixed", "7"]); }
+            let matches = crate::cli::Cli::command().try_get_matches_from(argv).unwrap();
+            let context = serve_context(&matches, None).unwrap().expect("dense serve context");
+            assert_eq!(context.family.as_deref(), Some("qwen3_5"));
+            assert_eq!(context.snapshot.as_deref(), Some(std::path::Path::new("/target")));
+            let configuration = cuteafd_bench::server::configuration(&context, &Default::default());
+            assert_eq!(configuration.speculator.is_some(), draft.is_some());
+            if draft.is_some() {
+                assert_eq!(configuration.speculator.as_deref(), Some("dSpark (dspark)"));
+                assert_eq!(context.settings.iter().find(|s| s.name == "draft-fixed").unwrap().value.as_deref(), Some("7"));
+            }
+        }
     }
 
     #[test]

@@ -3,6 +3,7 @@ set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$repo_root/scripts/lib/release-common.sh"
+source "$repo_root/scripts/lib/release-export-locks.sh"
 source "$repo_root/scripts/lib/cdi-gpus.sh"
 source "$repo_root/scripts/build/compiler-cache.sh"
 source "$repo_root/scripts/build/build-caches.sh"
@@ -32,9 +33,14 @@ family/card set or explicit for a raw-knob experimental build.
 Docker, SSH, submodules, hardware locks or any image.
 The build takes ~/.cache/cuteafd/build.lock for its whole run, so two release
 builds serialize; CUTEAFD_RELEASE_LOCK_TIMEOUT_SECONDS bounds that wait
-(default 1200). It never takes sparks.lock or gpu1.lock, and it does not pin
-GPU0: a compile, a download or an image assembly must not block serving. The two
-AOT exports take no lock at all. The coordinator export picks the least-used RTX
+(default 1200). Compiles, downloads and image assembly hold no hardware lock:
+each leg first builds its Rust daemons with no GPU, then only the native/AOT
+phase leases hardware through scripts/hw/hwlock.py (fair turn, idle preflight
+before enqueue and at grant, the same timeout bounds the wait) and removes its
+container before releasing it: the coordinator's GPU (gpuN.lock), the seed's
+sparks.lock (SEED-export.lock for a LAN-only seed), held on this host while the
+Spark export's SSH command runs. The coordinator export picks the least-used RTX
+(only GPU CUTEAFD_RELEASE_EXPORT_GPU, 0 or 1, when set)
 with at most CUTEAFD_RELEASE_IDLE_GPU_LIMIT_MIB (default 512) in use, waiting
 bounded by CUTEAFD_RELEASE_IDLE_WAIT_SECONDS (default 300), pins it by UUID,
 stops the export if foreign processes exceed CUTEAFD_RELEASE_EXPORT_GPU_LIMIT_MIB
@@ -66,6 +72,19 @@ CUTEAFD_RELEASE_REMOTE_BUILD_DIR selects where the Spark seed host stages the so
 tree and builds the expert images (default: a cuteafd-release-build directory in the
 seed host's own home). Use a fresh one per release so a previous staging tree cannot
 be reused.
+CUTEAFD_RELEASE_WHEELHOUSE (required) names a local directory holding every wheel
+docker/release-python-lock.json lists, for both architectures: the release images
+install exactly those, --no-deps, hash-checked, with no network or index.
+`scripts/build/release-python-lock.py fetch --lock docker/release-python-lock.json
+--wheelhouse DIR` fills it from the locked HTTPS URLs; the build verifies every hash
+before any compile and copies the directory to the Spark seed's staging tree.
+CUTEAFD_RELEASE_IMAGE_TRANSPORT picks how the Spark image reaches the other build
+hosts: rdma (default; rdmapipe seed -> each peer) or ssh-hub (for hub-and-spoke
+fabrics: one docker image save from the seed into a task-owned archive under
+CUTEAFD_RELEASE_IMAGE_HUB_DIR on this host, then CUTEAFD_RELEASE_IMAGE_HUB_PARALLEL
+(default 3) concurrent docker image loads over ssh; the directory needs
+CUTEAFD_RELEASE_IMAGE_HUB_MIN_FREE_GIB, default 40). Both are checked before any
+compile, and every host's image must match the seed's ID or portable content.
 CUTEAFD_RELEASE_SSH_CONFIG, CUTEAFD_RELEASE_BUILD_ROOT and
 CUTEAFD_RELEASE_REMOTE_BUILD_DIR must each be a canonical absolute path built from
 letters, digits, dot, underscore, plus and minus - no spaces, dot segments, trailing
@@ -99,7 +118,11 @@ use a cached matching image or pull it, verifying its hash, architecture and
 pinned base-digest label. Missing images, pull failures and mismatches fall back
 to Dockerfile.dev locally, with the reason logged. Set
 CUTEAFD_RELEASE_DEV_IMAGE_SOURCE=build to force local dev builds on both hosts
-(default registry). Compilation uses the admitted immutable image ID.
+(default registry), or =local to use only each host's configured dev tag
+(COORDINATOR_DOCKER_DEV, SPARK_EXPERT_DOCKER_DEV) after verifying its architecture,
+toolchain hash, base digest, image ID and entrypoint: no registry, pull, build or
+fallback; a missing or mismatched image fails that leg before it compiles.
+Compilation uses the admitted immutable image ID.
 CUTEAFD_RELEASE_DEV_IMAGE=sha256:ID overrides only the coordinator, keeping its
 existing live toolchain/source checks and image-ID-bound provenance proof.
 Missing proof or mismatches refuse this explicit override rather than falling back.
@@ -299,6 +322,9 @@ release_idle_wait_seconds="${CUTEAFD_RELEASE_IDLE_WAIT_SECONDS:-300}"
 [[ "$release_idle_wait_seconds" =~ ^[1-9][0-9]*$ ]] ||
   release_die "CUTEAFD_RELEASE_IDLE_WAIT_SECONDS must be positive seconds"
 release_idle_gpu_limit_mib="${CUTEAFD_RELEASE_IDLE_GPU_LIMIT_MIB:-512}"
+release_export_gpu="${CUTEAFD_RELEASE_EXPORT_GPU:-}"
+[[ -z "$release_export_gpu" || "$release_export_gpu" =~ ^[01]$ ]] ||
+  release_die "CUTEAFD_RELEASE_EXPORT_GPU must be 0 or 1 (a GPU with gpu0.lock/gpu1.lock)"
 [[ "$release_idle_gpu_limit_mib" =~ ^[1-9][0-9]*$ ]] ||
   release_die "CUTEAFD_RELEASE_IDLE_GPU_LIMIT_MIB must be positive MiB"
 export_gpu_limit_mib="${CUTEAFD_RELEASE_EXPORT_GPU_LIMIT_MIB:-8192}"
@@ -312,6 +338,181 @@ spark_export_min_free_gib="${CUTEAFD_RELEASE_SPARK_MIN_FREE_GIB:-100}"
   release_die "CUTEAFD_RELEASE_SPARK_MIN_FREE_GIB must be positive GiB"
 # release-build-budget:end
 
+# release-python-lock:start
+# The release images' Python packages: exactly docker/release-python-lock.json, read
+# from a local hash-checked wheelhouse that reaches docker as a named build context.
+release_wheelhouse="${CUTEAFD_RELEASE_WHEELHOUSE:-}"
+if [[ -n "$release_wheelhouse" ]]; then
+  release_validate_path_setting CUTEAFD_RELEASE_WHEELHOUSE "$release_wheelhouse"
+  release_path_within "$release_wheelhouse" "$repo_root" &&
+    release_die "CUTEAFD_RELEASE_WHEELHOUSE must not be $repo_root or inside it"
+fi
+# The Spark seed keeps its copy inside the staging tree's .cuteafd-release/, which
+# the source sync and the source manifest both leave alone.
+release_remote_wheelhouse=.cuteafd-release/wheelhouse
+release_verify_wheelhouse() {
+  [[ -n "$release_wheelhouse" ]] ||
+    release_die "CUTEAFD_RELEASE_WHEELHOUSE must name the wheelhouse for docker/release-python-lock.json (fill it with scripts/build/release-python-lock.py fetch)"
+  python3 -I "$repo_root/scripts/build/release-python-lock.py" verify \
+    --lock "$repo_root/docker/release-python-lock.json" --wheelhouse "$release_wheelhouse" ||
+    release_die "the release wheelhouse $release_wheelhouse does not hold docker/release-python-lock.json"
+}
+# release-python-lock:end
+
+# release-image-distribution:start
+# How the fresh Spark image reaches the other build hosts. `rdma` (default) streams
+# seed -> peer through rdmapipe. `ssh-hub` is for hub-and-spoke fabrics where the
+# Sparks reach each other only through the host running this script: one
+# `docker image save` on the seed lands in a task-owned archive here, then a bounded
+# fan-out of `docker image load` over plain ssh feeds every other host. It needs only
+# ssh and docker, sends nothing spoke to spoke, and both modes are preflighted before
+# any compile.
+release_image_transport="${CUTEAFD_RELEASE_IMAGE_TRANSPORT:-rdma}"
+release_image_hub_dir="${CUTEAFD_RELEASE_IMAGE_HUB_DIR:-}"
+release_image_hub_parallel="${CUTEAFD_RELEASE_IMAGE_HUB_PARALLEL:-3}"
+release_image_hub_min_free_gib="${CUTEAFD_RELEASE_IMAGE_HUB_MIN_FREE_GIB:-40}"
+release_image_hub_archive=""
+case "$release_image_transport" in
+  rdma) ;;
+  ssh-hub)
+    [[ -n "$release_image_hub_dir" ]] ||
+      release_die "CUTEAFD_RELEASE_IMAGE_TRANSPORT=ssh-hub needs CUTEAFD_RELEASE_IMAGE_HUB_DIR, a task-owned directory on this host"
+    release_validate_path_setting CUTEAFD_RELEASE_IMAGE_HUB_DIR "$release_image_hub_dir"
+    release_path_within "$release_image_hub_dir" "$repo_root" &&
+      release_die "CUTEAFD_RELEASE_IMAGE_HUB_DIR must not be $repo_root or inside it"
+    [[ "$release_image_hub_parallel" =~ ^[1-9][0-9]?$ ]] ||
+      release_die "CUTEAFD_RELEASE_IMAGE_HUB_PARALLEL must be 1-99 concurrent loads"
+    [[ "$release_image_hub_min_free_gib" =~ ^[1-9][0-9]*$ ]] ||
+      release_die "CUTEAFD_RELEASE_IMAGE_HUB_MIN_FREE_GIB must be positive GiB"
+    ;;
+  *) release_die "CUTEAFD_RELEASE_IMAGE_TRANSPORT must be rdma or ssh-hub, got: $release_image_transport" ;;
+esac
+release_image_transport_plan="rdma: rdmapipe seed -> each peer"
+[[ "$release_image_transport" == rdma ]] ||
+  release_image_transport_plan="ssh-hub: seed docker save -> $release_image_hub_dir on $(hostname), then up to $release_image_hub_parallel concurrent docker loads (>= ${release_image_hub_min_free_gib} GiB free)"
+
+# Before any compile: the selected transport can run on every build host.
+release_image_distribution_preflight() {
+  local host free_kib
+  if [[ "$release_image_transport" == rdma ]]; then
+    for host in "${RELEASE_BUILD_HOSTS[@]}"; do
+      release_ssh "$host" "command -v rdmapipe >/dev/null 2>&1" ||
+        release_die "rdmapipe is required on every Spark build host to distribute the Spark image ($host lacks it); CUTEAFD_RELEASE_IMAGE_TRANSPORT=ssh-hub needs only ssh and docker"
+    done
+    return 0
+  fi
+  mkdir -p "$release_image_hub_dir" ||
+    release_die "cannot create image hub directory: $release_image_hub_dir"
+  python3 "$repo_root/scripts/build/assert-build-filesystem.py" "$release_image_hub_dir" ||
+    release_die "image hub directory is not a safe writable filesystem: $release_image_hub_dir"
+  free_kib="$(df -Pk "$release_image_hub_dir" | awk 'NR == 2 { print $4 }')"
+  [[ "$free_kib" =~ ^[0-9]+$ ]] && ((free_kib >= release_image_hub_min_free_gib * 1024 * 1024)) ||
+    release_die "image hub directory $release_image_hub_dir needs at least ${release_image_hub_min_free_gib} GiB free"
+  for host in "${RELEASE_BUILD_HOSTS[@]}"; do
+    release_ssh "$host" "docker version --format '{{.Server.Version}}' >/dev/null" ||
+      release_die "$host cannot run docker over ssh for the ssh-hub image distribution"
+  done
+}
+
+# release_spark_image_identity HOST: "ID CONTENT" of the pending Spark image on HOST.
+# CONTENT is the portable identity (scripts/lib/dev_image_content.py): docker save |
+# load into a containerd store reports a different ID for identical layers and config.
+release_spark_image_identity() {
+  local id content quoted
+  printf -v quoted '%q' "$SPARK_EXPERT_DOCKER_INFERENCE"
+  id="$(release_ssh "$1" "docker image inspect -f '{{.Id}}' $quoted")" &&
+    content="$(set -o pipefail; release_ssh "$1" "docker image inspect $quoted" |
+      python3 "$repo_root/scripts/lib/dev_image_content.py")" &&
+    [[ -n "$id" && -n "$content" ]] || return 1
+  printf '%s %s\n' "$id" "$content"
+}
+
+release_distribute_spark_image_rdma() {
+  echo "== concurrently distributing Spark image over RDMA =="
+  local -a image_copy_pids=() image_copy_hosts=()
+  local host index image_copy_failed=0 spark_image_quoted
+  printf -v spark_image_quoted '%q' "$SPARK_EXPERT_DOCKER_INFERENCE"
+  for host in "${RELEASE_BUILD_HOSTS[@]:1}"; do
+    (
+      set -o pipefail
+      echo "== RDMA image copy $seed_host -> $host =="
+      release_ssh "$seed_host" \
+        "set -o pipefail; docker image save $spark_image_quoted | rdmapipe --send" |
+        release_ssh "$host" \
+          "set -o pipefail; rdmapipe --recv | docker image load"
+      echo "== RDMA image copy $seed_host -> $host complete =="
+    ) &
+    image_copy_pids+=("$!")
+    image_copy_hosts+=("$host")
+  done
+  for index in "${!image_copy_pids[@]}"; do
+    if ! wait "${image_copy_pids[$index]}"; then
+      echo "RDMA image copy to ${image_copy_hosts[$index]} failed" >&2
+      image_copy_failed=1
+    fi
+  done
+  ((image_copy_failed == 0)) || release_die "concurrent RDMA Spark image distribution failed"
+}
+
+release_distribute_spark_image_hub() {
+  local archive="$release_image_hub_dir/cuteafd-spark-image-$$.tar" spark_image_quoted host
+  local failed=0 status start index
+  local -a peers=("${RELEASE_BUILD_HOSTS[@]:1}") wave=() pids=()
+  printf -v spark_image_quoted '%q' "$SPARK_EXPERT_DOCKER_INFERENCE"
+  [[ ! -e "$archive" && ! -e "$archive.part" ]] ||
+    release_die "image hub archive $archive already exists; it belongs to another build"
+  release_image_hub_archive="$archive"
+  echo "== saving Spark image from $seed_host to hub archive $archive =="
+  ( set -o pipefail; release_ssh "$seed_host" "docker image save $spark_image_quoted" >"$archive.part" ) ||
+    { rm -f -- "$archive.part"; release_die "docker image save on $seed_host into $archive failed"; }
+  [[ -s "$archive.part" ]] ||
+    { rm -f -- "$archive.part"; release_die "docker image save on $seed_host wrote an empty archive"; }
+  mv -- "$archive.part" "$archive"
+  echo "== distributing Spark image from hub to ${#peers[@]} hosts, $release_image_hub_parallel at a time =="
+  # Waves of at most PARALLEL loads; each PID is waited on exactly once.
+  for ((start = 0; start < ${#peers[@]}; start += release_image_hub_parallel)); do
+    wave=("${peers[@]:start:release_image_hub_parallel}")
+    pids=()
+    for host in "${wave[@]}"; do
+      (
+        echo "== ssh-hub image load $(hostname) -> $host =="
+        release_ssh "$host" "docker image load" <"$archive" || exit $?
+        echo "== ssh-hub image load $(hostname) -> $host complete =="
+      ) &
+      pids+=("$!")
+    done
+    for index in "${!pids[@]}"; do
+      status=0
+      wait "${pids[$index]}" || status=$?
+      ((status == 0)) || { echo "ssh-hub image load on ${wave[$index]} failed (exit $status)" >&2; failed=1; }
+    done
+  done
+  rm -f -- "$archive"
+  release_image_hub_archive=""
+  ((failed == 0)) || release_die "ssh-hub Spark image distribution failed"
+}
+
+release_distribute_spark_image() {
+  local seed_identity host identity
+  seed_identity="$(release_spark_image_identity "$seed_host")" ||
+    release_die "cannot identify $SPARK_EXPERT_DOCKER_INFERENCE on $seed_host"
+  if [[ "$release_image_transport" == rdma ]]; then
+    release_image_distribution_preflight
+    release_distribute_spark_image_rdma
+  else
+    release_distribute_spark_image_hub
+  fi
+  # Every host must now hold the seed's image: the same ID, or the same content
+  # under another image store's ID.
+  for host in "${RELEASE_BUILD_HOSTS[@]:1}"; do
+    identity="$(release_spark_image_identity "$host")" ||
+      release_die "$host has no $SPARK_EXPERT_DOCKER_INFERENCE after distribution"
+    [[ "${identity%% *}" == "${seed_identity%% *}" || "${identity#* }" == "${seed_identity#* }" ]] ||
+      release_die "$host Spark image ${identity%% *} differs from $seed_host's ${seed_identity%% *}"
+  done
+}
+# release-image-distribution:end
+
 release_sequential="${CUTEAFD_RELEASE_SEQUENTIAL:-0}"
 [[ "$release_sequential" == 0 || "$release_sequential" == 1 ]] ||
   release_die "CUTEAFD_RELEASE_SEQUENTIAL must be 0 or 1"
@@ -320,7 +521,15 @@ release_leg_plan="coordinator and Spark legs build concurrently; shared export/d
   release_leg_plan="sequential: coordinator then Spark (CUTEAFD_RELEASE_SEQUENTIAL=1)"
 
 release_dev_image_source="${CUTEAFD_RELEASE_DEV_IMAGE_SOURCE:-registry}"
-case "$release_dev_image_source" in registry|build) ;; *) release_die "CUTEAFD_RELEASE_DEV_IMAGE_SOURCE must be registry or build" ;; esac
+case "$release_dev_image_source" in registry|build|local) ;; *) release_die "CUTEAFD_RELEASE_DEV_IMAGE_SOURCE must be registry, build or local" ;; esac
+
+# A LAN-only seed has its own GPU-export turn; any other seed is in the Spark pool.
+release_spark_export_lock() {
+  case "$1" in
+    kakapo|cassowary) printf '%s-export\n' "$1" ;;
+    *) printf 'sparks\n' ;;
+  esac
+}
 
 if ((dry_run)); then
   release_toolchain_hash="$(python3 "$repo_root/scripts/build/dev-toolchain.py")"
@@ -332,17 +541,29 @@ if ((dry_run)); then
   echo "  seed host: ${RELEASE_BUILD_HOSTS[0]:-}"
   if [[ -n "${CUTEAFD_RELEASE_DEV_IMAGE:-}" ]]; then
     echo "  coordinator dev image: verify explicit override $CUTEAFD_RELEASE_DEV_IMAGE"
+  elif [[ "$release_dev_image_source" == local ]]; then
+    echo "  coordinator dev image: existing local $COORDINATOR_DOCKER_DEV on $(hostname) only; verify, never pull or build"
   elif [[ "$release_dev_image_source" == registry ]]; then
     echo "  coordinator dev image: pull ghcr.io/tpurtell/cuteafd-dev:tc-$release_toolchain_hash-amd64 on $(hostname) if missing; verify or build locally"
   else
     echo "  coordinator dev image: build Dockerfile.dev locally on $(hostname)"
   fi
-  if [[ "$release_dev_image_source" == registry ]]; then
+  if [[ "$release_dev_image_source" == local ]]; then
+    echo "  Spark dev image: existing local $SPARK_EXPERT_DOCKER_DEV on ${RELEASE_BUILD_HOSTS[0]:-} only; verify, never pull or build"
+  elif [[ "$release_dev_image_source" == registry ]]; then
     echo "  Spark dev image: pull ghcr.io/tpurtell/cuteafd-dev:tc-$release_toolchain_hash-arm64 on ${RELEASE_BUILD_HOSTS[0]:-} if missing; verify or build locally"
   else
     echo "  Spark dev image: build Dockerfile.dev locally on ${RELEASE_BUILD_HOSTS[0]:-}"
   fi
   echo "  build legs: $release_leg_plan"
+  echo "  Spark image distribution: $release_image_transport_plan"
+  if [[ -z "$release_wheelhouse" ]]; then
+    echo "  Python packages: CUTEAFD_RELEASE_WHEELHOUSE is not set; a build stops before compiling"
+  elif (release_verify_wheelhouse) >/dev/null 2>&1; then
+    echo "  Python packages: docker/release-python-lock.json from $release_wheelhouse (offline, hash-checked)"
+  else
+    echo "  Python packages: $release_wheelhouse does not hold docker/release-python-lock.json; a build stops before compiling"
+  fi
   echo "  release tag: $release_version"
   echo "  V41 Spark expert roles: ${spark_tp_roles:-<legacy TP4 only>} ($spark_tp_roles_note)"
   echo "  coordinator image: $COORDINATOR_DOCKER_INFERENCE"
@@ -351,7 +572,8 @@ if ((dry_run)); then
   echo "  release build root: ${release_build_root:-<container /tmp>}"
   echo "  build container user: $(id -un) ($(id -u):$(id -g))"
   echo "  build container home: $(release_build_container_home "$release_build_root")"
-  echo "  build lock: $HOME/.cache/cuteafd/build.lock (waited up to ${release_build_lock_timeout}s; no hardware lock is taken)"
+  echo "  build lock: $HOME/.cache/cuteafd/build.lock (waited up to ${release_build_lock_timeout}s; Rust, downloads and images hold no hardware lock)"
+  echo "  AOT export hardware leases: coordinator gpu${release_export_gpu:-N}.lock, Spark $(release_spark_export_lock "${RELEASE_BUILD_HOSTS[0]}").lock (hwlock fair turn, waited up to ${CUTEAFD_RELEASE_LOCK_TIMEOUT_SECONDS:-1200}s)"
   echo "  AOT export GPU guard: least-used RTX with <=${release_idle_gpu_limit_mib} MiB used, waited ${release_idle_wait_seconds}s, pinned by UUID, stopped past ${export_gpu_limit_mib} MiB of foreign process use (export container excluded)"
   echo "  Spark AOT export guard: no serving worker and >=${spark_export_min_free_gib} GiB allocatable memory, same wait"
   cuteafd_build_cache_docker_args "${release_build_root:-$HOME/.cache/cuteafd/builds/release-cache-fallback}" "$(release_build_container_home "$release_build_root")" "$release_toolchain_hash" dry >/dev/null
@@ -369,6 +591,9 @@ SPARK_EXPERT_DOCKER_INFERENCE+="-pending-$$"
 release_pending_cleanup() {
   [[ -z "${coordinator_container:-}" ]] || docker rm -f "$coordinator_container" >/dev/null 2>&1 || true
   docker image rm "$COORDINATOR_DOCKER_INFERENCE" >/dev/null 2>&1 || true
+  # Only this build's own hub archive, named by its PID; nothing else in the directory.
+  [[ -z "${release_image_hub_archive:-}" ]] ||
+    rm -f -- "$release_image_hub_archive" "$release_image_hub_archive.part"
   local host
   for host in "${RELEASE_BUILD_HOSTS[@]}"; do
     timeout 30s ssh "${release_ssh_opts[@]}" "$host" docker image rm "$SPARK_EXPERT_DOCKER_INFERENCE" >/dev/null 2>&1 || true
@@ -455,6 +680,7 @@ release_select_idle_export_gpu() {
       uuid="${uuid// /}"
       used="${used// /}"
       [[ "$index" =~ ^[0-9]+$ && "$uuid" == GPU-* && "$used" =~ ^[0-9]+$ ]] || continue
+      [[ -z "${release_export_gpu:-}" || "$index" == "$release_export_gpu" ]] || continue
       (( used <= release_idle_gpu_limit_mib )) || continue
       if (( used < best_used )); then
         best_index="$index"
@@ -566,6 +792,12 @@ release_watch_export_gpu() {
   release_export_watchdog_summary "$uuid" "$incomplete_count"
   trap - EXIT TERM
   return "$status"
+}
+
+# The export lock helper calls this before it removes the container and
+# releases the lease, so no watchdog outlives the lock.
+release_export_locked_cleanup() {
+  release_stop_export_watchdog
 }
 
 release_stop_export_watchdog() {
@@ -763,6 +995,8 @@ if [[ -n "$release_build_root" ]]; then
   ((remote_root_free_kib >= 60 * 1024 * 1024)) ||
     release_die "$seed_host release build root $release_build_root needs at least 60 GiB free"
 fi
+release_image_distribution_preflight
+release_verify_wheelhouse
 
 # Only the coordinator writes local artifacts/reuse proof. Allocate the proof path
 # before forking so the shared tail can read it without importing worker variables.
@@ -774,11 +1008,12 @@ release_dev_reuse_manifest="$release_leg_log_dir/coordinator-dev-image.json"
 
 build_coordinator_release() (
 release_source_dir=""
+release_state_parent=""
 coordinator_export_container="$export_container-coordinator"
 release_export_cleanup() {
   docker rm -f "$coordinator_export_container" >/dev/null 2>&1 || true
 }
-trap 'release_stop_export_watchdog; release_export_cleanup; rm -rf "$release_source_dir"' EXIT
+trap 'release_stop_export_watchdog; release_export_cleanup; rm -rf "$release_source_dir" ${release_state_parent:+"$release_state_parent"}' EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 release_dev_reuse_label_args=()
@@ -809,54 +1044,97 @@ mkdir -p "$release_source_parent"
 release_source_dir="$(mktemp -d "$release_source_parent/coordinator-source.XXXXXXXX")"
 "$repo_root/scripts/build/stage-release-source.sh" "$repo_root" "$release_source_dir"
 coordinator_export_container="$export_container-coordinator"
-export_gpu_pick="$(release_select_idle_export_gpu)" || exit 2
-read -r export_gpu_index export_gpu_uuid export_gpu_used <<<"$export_gpu_pick"
-echo "== coordinator AOT export on $(hostname) GPU $export_gpu_index ($export_gpu_uuid) at $(date -Is): ${export_gpu_used} MiB in use, no hardware lock =="
 release_build_user_args=()
 mapfile -t release_build_user_args < <(release_build_container_user_args_render "$release_build_root")
-# Killing a docker client does not stop its container; the leg's EXIT trap owns
-# both the named export and its watchdog, including failures before docker run.
-# --foreground keeps timeout and its client inside the cancellable leg group.
-release_watch_export_gpu "$export_gpu_uuid" "$coordinator_export_container" &
-export_watchdog_pid=$!
-coordinator_export_status=0
 compiler_cache_args=()
 cache_plan="$(cuteafd_build_cache_docker_args "${release_build_root:-$release_source_parent}" "$(release_build_container_home "$release_build_root")" "$release_toolchain_hash")" || release_die "cache plan failed"
 mapfile -t compiler_cache_args <<<"$cache_plan"
-cuteafd_cdi_gpu_args "$export_gpu_uuid" || exit 2
+# Both phases (scripts/build/build-release-artifacts.sh) share these options, one
+# build tree in the bind-mounted state and the same image; only the GPU
+# assignment and CUTEAFD_RELEASE_ARTIFACT_PHASE differ.
+release_state_parent="$(mktemp -d "$release_source_parent/coordinator-state.XXXXXXXX")"
+coordinator_artifact_opts=(
+  --ipc=host
+  --ulimit memlock=-1:-1
+  "${release_build_user_args[@]}"
+  "${compiler_cache_args[@]}"
+  -e "CUTEAFD_RELEASE_EXPERT_FAMILIES=${CUTEAFD_RELEASE_EXPERT_FAMILIES:-}"
+  -e "CUTEAFD_RELEASE_GENERIC_SPARK_COUNTS=${CUTEAFD_RELEASE_GENERIC_SPARK_COUNTS:-}"
+  -e "CUTEAFD_RELEASE_FP8_MOE_BF16_FAMILIES=$bf16_families"
+  -e "CUTEAFD_RELEASE_AUDIO_AOT=$audio_aot"
+  ${native_build_env_args[@]+"${native_build_env_args[@]}"}
+  -e "CUTEAFD_RELEASE_DSV4_AOT=${CUTEAFD_RELEASE_DSV4_AOT:-ON}"
+  -e "CUTEAFD_RELEASE_DSV4_MAX_CONTEXT=${CUTEAFD_RELEASE_DSV4_MAX_CONTEXT:-1048576}"
+  -e "CUTEAFD_RELEASE_GLM_AOT=${CUTEAFD_RELEASE_GLM_AOT:-OFF}"
+  -e "CUTEAFD_RELEASE_CONTEXT_SPLIT_AOT=${CUTEAFD_RELEASE_CONTEXT_SPLIT_AOT:-ON}"
+  -e "CUTEAFD_RELEASE_MIMO_AOT=${CUTEAFD_RELEASE_MIMO_AOT:-OFF}"
+  -e "CUTEAFD_RELEASE_MIMO_GEOMETRIES=${CUTEAFD_RELEASE_MIMO_GEOMETRIES:-mimo,mimo2,mimop,mimop2}"
+  -e "CUTEAFD_RELEASE_GLMF_AOT=${CUTEAFD_RELEASE_GLMF_AOT:-OFF}"
+  -e "CUTEAFD_RELEASE_QWEN4_AOT=${CUTEAFD_RELEASE_QWEN4_AOT:-OFF}"
+  -e "CUTEAFD_RELEASE_QWEN_DENSE_AOT=${CUTEAFD_RELEASE_QWEN_DENSE_AOT:-OFF}"
+  -e "CUTEAFD_RELEASE_STEP5_AOT=${CUTEAFD_RELEASE_STEP5_AOT:-OFF}"
+  -e "CUTEAFD_RELEASE_EXLR8_AOT=${CUTEAFD_RELEASE_EXLR8_AOT:-OFF}"
+  ${release_build_root_args[@]+"${release_build_root_args[@]}"}
+  -v "$release_state_parent:$release_state_parent"
+  -e "CUTEAFD_RELEASE_ARTIFACT_STATE=$release_state_parent/state"
+  -v "$release_source_dir:/source:ro"
+  -v "$artifact_dir:/output"
+)
+coordinator_artifact_cmd=(
+  "$COORDINATOR_DOCKER_DEV"
+  /source/scripts/build/build-release-artifacts.sh /source coordinator 120 /output
+)
+# Killing a docker client does not stop its container; the leg's EXIT trap owns
+# the named container, the watchdog and the state, including failures before
+# docker run. --foreground keeps timeout and its client inside the leg group.
+echo "== coordinator Rust phase on $(hostname) at $(date -Is): no GPU, no hardware lock =="
+coordinator_rust_status=0
+# No GPU at all: plain runc and void devices, not just no CDI request (the image's
+# NVIDIA_VISIBLE_DEVICES=all and a default nvidia runtime would expose them).
 timeout --foreground "$export_timeout" docker run --rm --name "$coordinator_export_container" \
-  "${CUTEAFD_CDI_ARGS[@]}" \
-  --ipc=host \
-  --ulimit memlock=-1:-1 \
-  -e "CUDA_VISIBLE_DEVICES=$export_gpu_uuid" \
-  -e "NVIDIA_VISIBLE_DEVICES=$export_gpu_uuid" \
-  "${release_build_user_args[@]}" \
-  "${compiler_cache_args[@]}" \
-  -e "CUTEAFD_RELEASE_EXPERT_FAMILIES=${CUTEAFD_RELEASE_EXPERT_FAMILIES:-}" \
-  -e "CUTEAFD_RELEASE_GENERIC_SPARK_COUNTS=${CUTEAFD_RELEASE_GENERIC_SPARK_COUNTS:-}" \
-  -e "CUTEAFD_RELEASE_FP8_MOE_BF16_FAMILIES=$bf16_families" \
-  -e "CUTEAFD_RELEASE_AUDIO_AOT=$audio_aot" \
-  ${native_build_env_args[@]+"${native_build_env_args[@]}"} \
-  -e "CUTEAFD_RELEASE_DSV4_AOT=${CUTEAFD_RELEASE_DSV4_AOT:-ON}" \
-  -e "CUTEAFD_RELEASE_DSV4_MAX_CONTEXT=${CUTEAFD_RELEASE_DSV4_MAX_CONTEXT:-1048576}" \
-  -e "CUTEAFD_RELEASE_GLM_AOT=${CUTEAFD_RELEASE_GLM_AOT:-OFF}" \
-  -e "CUTEAFD_RELEASE_CONTEXT_SPLIT_AOT=${CUTEAFD_RELEASE_CONTEXT_SPLIT_AOT:-ON}" \
-  -e "CUTEAFD_RELEASE_MIMO_AOT=${CUTEAFD_RELEASE_MIMO_AOT:-OFF}" \
-  -e "CUTEAFD_RELEASE_MIMO_GEOMETRIES=${CUTEAFD_RELEASE_MIMO_GEOMETRIES:-mimo,mimo2,mimop,mimop2}" \
-  -e "CUTEAFD_RELEASE_GLMF_AOT=${CUTEAFD_RELEASE_GLMF_AOT:-OFF}" \
-  -e "CUTEAFD_RELEASE_QWEN4_AOT=${CUTEAFD_RELEASE_QWEN4_AOT:-OFF}" \
-  -e "CUTEAFD_RELEASE_QWEN_DENSE_AOT=${CUTEAFD_RELEASE_QWEN_DENSE_AOT:-OFF}" \
-  -e "CUTEAFD_RELEASE_STEP5_AOT=${CUTEAFD_RELEASE_STEP5_AOT:-OFF}" \
-  -e "CUTEAFD_RELEASE_EXLR8_AOT=${CUTEAFD_RELEASE_EXLR8_AOT:-OFF}" \
-  ${release_build_root_args[@]+"${release_build_root_args[@]}"} \
-  -v "$release_source_dir:/source:ro" \
-  -v "$artifact_dir:/output" \
-  "$COORDINATOR_DOCKER_DEV" \
-  /source/scripts/build/build-release-artifacts.sh /source coordinator 120 /output ||
-  coordinator_export_status=$?
-release_stop_export_watchdog
+  --runtime runc -e NVIDIA_VISIBLE_DEVICES=void -e CUDA_VISIBLE_DEVICES= \
+  "${coordinator_artifact_opts[@]}" \
+  -e CUTEAFD_RELEASE_ARTIFACT_PHASE=rust \
+  "${coordinator_artifact_cmd[@]}" ||
+  coordinator_rust_status=$?
+(( coordinator_rust_status == 0 )) ||
+  release_die "coordinator Rust phase failed (exit $coordinator_rust_status) on $(hostname) at $(date -Is)"
+# release-export-gpu-lease:start
+# Only the native/AOT phase needs a GPU: it holds that GPU's hardware lock
+# (fair hwlock turn, idle preflight before enqueue and at grant), runs under the
+# foreign-use watchdog, and its container is removed before the lock is released.
+export_gpu_pick="$(release_select_idle_export_gpu)" || exit 2
+read -r export_gpu_index export_gpu_uuid export_gpu_used <<<"$export_gpu_pick"
+export_gpu_lock="gpu$export_gpu_index"
+[[ "$export_gpu_lock" == gpu0 || "$export_gpu_lock" == gpu1 ]] ||
+  release_die "GPU $export_gpu_index has no hardware lock (gpu0.lock/gpu1.lock); pin a locked GPU with CUTEAFD_RELEASE_EXPORT_GPU"
+printf -v export_gpu_preflight 'nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits -i %q | awk %q' \
+  "$export_gpu_uuid" "{ used = \$1 + 0 } END { exit !(NR == 1 && used <= $release_idle_gpu_limit_mib) }"
+release_coordinator_native_export() {
+  local status=0
+  echo "== coordinator AOT export on $(hostname) GPU $export_gpu_index ($export_gpu_uuid) at $(date -Is): ${export_gpu_used} MiB in use, holding $export_gpu_lock.lock =="
+  release_watch_export_gpu "$export_gpu_uuid" "$coordinator_export_container" &
+  export_watchdog_pid=$!
+  cuteafd_cdi_gpu_args "$export_gpu_uuid" || return 2
+  timeout --foreground "$export_timeout" docker run --rm --name "$coordinator_export_container" \
+    "${CUTEAFD_CDI_ARGS[@]}" \
+    -e "CUDA_VISIBLE_DEVICES=$export_gpu_uuid" \
+    -e "NVIDIA_VISIBLE_DEVICES=$export_gpu_uuid" \
+    "${coordinator_artifact_opts[@]}" \
+    -e CUTEAFD_RELEASE_ARTIFACT_PHASE=native \
+    "${coordinator_artifact_cmd[@]}" ||
+    status=$?
+  release_stop_export_watchdog
+  return "$status"
+}
+coordinator_export_status=0
+release_with_export_locks "" "$coordinator_export_container" "$export_gpu_lock" "$export_gpu_preflight" \
+  release_coordinator_native_export || coordinator_export_status=$?
+# release-export-gpu-lease:end
 (( coordinator_export_status == 0 )) ||
   release_die "coordinator AOT export failed (exit $coordinator_export_status); it ran on $(hostname) GPU $export_gpu_index ($export_gpu_uuid) at $(date -Is)"
+rm -rf "$release_state_parent"
+release_state_parent=""
 rm -rf "$release_source_dir"
 release_source_dir=""
 
@@ -872,6 +1150,7 @@ DOCKER_BUILDKIT=1 docker build \
   --build-arg CUTEAFD_SPARKINFER_COMMIT="$sparkinfer_commit" \
   --build-arg CUTEAFD_RELEASE_VERSION="$release_version" \
   --build-arg CUTEAFD_SPARK_TP_ROLES= \
+  --build-context "wheelhouse=$release_wheelhouse" \
   -f "$repo_root/docker/Dockerfile.release" \
   -t "$COORDINATOR_DOCKER_INFERENCE" \
   "$repo_root"
@@ -919,6 +1198,11 @@ release_sync --delete --delete-excluded \
   --exclude '*.pyo' \
   "$repo_root/third_party/xgrammar/" \
   "$seed_host:$remote_dir/third_party/xgrammar/"
+release_ssh "$seed_host" "mkdir -p $remote_dir_quoted/$release_remote_wheelhouse"
+release_sync --delete "$release_wheelhouse/" "$seed_host:$remote_dir/$release_remote_wheelhouse/"
+release_ssh "$seed_host" \
+  "cd $remote_dir_quoted && python3 -I scripts/build/release-python-lock.py verify --lock docker/release-python-lock.json --wheelhouse $release_remote_wheelhouse --arch arm64" ||
+  release_die "$seed_host staged wheelhouse does not hold docker/release-python-lock.json"
 verify_remote_source_manifest
 
 # Prepared before the leg below so the quoted heredoc region stays exactly the
@@ -1015,10 +1299,17 @@ cancel_file="$process_dir/$export_container.cancel"
 mkdir -p "$process_dir"
 [[ ! -e "$cancel_file" ]] || exit 143
 printf '%s\n' "$$" >"$process_file"
+# The rust phase's build tree, kept for the export phase (which consumes and
+# removes it) and removed by any failed phase.
+artifact_state_parent="${release_build_root:-$process_dir}/$export_container.artifacts"
 cleanup_spark_phase() {
+  local status=$?
   trap '' HUP INT TERM
   kill -TERM -- "-$$" 2>/dev/null || true
   docker rm -f "$export_container" "$export_container-probe" >/dev/null 2>&1 || true
+  if ((status != 0)) || [[ "$phase" == export ]]; then
+    rm -rf "$artifact_state_parent"
+  fi
   rm -f "$process_file"
 }
 trap cleanup_spark_phase EXIT
@@ -1039,10 +1330,56 @@ python3 scripts/build/select-dev-image.py select \
 else
 dev_image="$(python3 scripts/build/select-dev-image.py image --manifest "$dev_manifest")"
 fi
+if [[ "$phase" == rust || "$phase" == export ]]; then
+mkdir -p "$remote_dir/.cuteafd-release-image" "$artifact_state_parent"
+# This host's invoking user, not root: the container writes a Cargo target dir
+# and staging into bind-mounted host paths (see the coordinator note in build.sh).
+# A --user UID has no passwd entry here, so the identity and the cache roots are
+# passed explicitly; the artifact compiler creates them before Cargo runs.
+container_home=/tmp/cuteafd-home
+[[ -z "$release_build_root" ]] || container_home="$release_build_root/container-home"
+cache_plan="$(cuteafd_build_cache_docker_args "${release_build_root:-$HOME/.cache/cuteafd/builds/release-cache-fallback}" "$container_home" "$(python3 scripts/build/dev-toolchain.py)")" || exit 2
+mapfile -t compiler_cache_args <<<"$cache_plan"
+# Both phases share every option and the build tree; only the GPU and the phase differ.
+spark_artifact_opts=(
+  "${compiler_cache_args[@]}"
+  --user "$(id -u):$(id -g)"
+  -e "HOME=$container_home"
+  -e "USER=$(id -un)"
+  -e "LOGNAME=$(id -un)"
+  -e "TORCHINDUCTOR_CACHE_DIR=$container_home/torchinductor"
+  -e "CARGO_HOME=$container_home/cargo"
+  --ipc=host
+  --ulimit memlock=-1:-1
+  -e "CUTEAFD_RELEASE_SPARK_TP_ROLES=$spark_tp_roles"
+  -e "CUTEAFD_RELEASE_EXPERT_FAMILIES=$expert_families"
+  -e "CUTEAFD_RELEASE_GENERIC_SPARK_COUNTS=${CUTEAFD_RELEASE_GENERIC_SPARK_COUNTS:-}"
+  -e "CUTEAFD_RELEASE_FP8_MOE_BF16_FAMILIES=$bf16_families"
+  -e "CUTEAFD_RELEASE_AUDIO_AOT=$audio_aot"
+  -e "CUTEAFD_RELEASE_EXLR8_AOT=${CUTEAFD_RELEASE_EXLR8_AOT:-OFF}"
+  ${native_build_env_args[@]+"${native_build_env_args[@]}"}
+  ${release_build_root_args[@]+"${release_build_root_args[@]}"}
+  -v "$artifact_state_parent:$artifact_state_parent"
+  -e "CUTEAFD_RELEASE_ARTIFACT_STATE=$artifact_state_parent/state"
+  -v "$remote_dir:/source:ro"
+  -v "$remote_dir/.cuteafd-release-image:/output"
+)
+spark_artifact_cmd=("$dev_image" /source/scripts/build/build-release-artifacts.sh /source expert 121 /output)
+fi
+if [[ "$phase" == rust ]]; then
+echo "== Spark Rust phase on $(hostname) at $(date -Is): no GPU, no hardware lock =="
+# No GPU at all: plain runc and void devices (see the coordinator Rust phase).
+docker run --rm --name "$export_container" \
+  --runtime runc -e NVIDIA_VISIBLE_DEVICES=void -e CUDA_VISIBLE_DEVICES= \
+  "${spark_artifact_opts[@]}" \
+  -e CUTEAFD_RELEASE_ARTIFACT_PHASE=rust \
+  "${spark_artifact_cmd[@]}"
+fi
 if [[ "$phase" == export ]]; then
-# AOT export outside the hardware locks (USING_AGENTS.md): it needs a GPU to
-# query at compile time, not a lock, and it may not run beside a serving job on
-# a Spark whose 121 GiB are the serving budget. Wait bounded for an idle host --
+# The native/AOT phase runs while the coordinator holds this seed's hardware
+# lease (build.sh). It needs a GPU to query at compile time and may not run
+# beside a serving job on a Spark whose 121 GiB are the serving budget, so it
+# still checks the host after grant. Wait bounded for an idle host --
 # no serving worker container and at least 100 GiB allocatable (MemAvailable
 # bounded by cgroups on integrated devices, CUDA free on discrete) -- watch the host
 # while the export runs and stop it if a serving container appears. Host and
@@ -1078,7 +1415,7 @@ while :; do
       --entrypoint python3 "$dev_image" /allocatable_memory.py 2>/dev/null || true)"
     read -r spark_allocatable_free spark_memory_measure <<<"$spark_memory_probe"
     if [[ "$spark_allocatable_free" =~ ^[0-9]+$ ]] && (( spark_allocatable_free >= spark_export_min_free_bytes )); then
-      echo "== Spark AOT export on $(hostname) at $(date -Is): ${spark_allocatable_free} bytes allocatable ($spark_memory_measure), no serving container, no hardware lock =="
+      echo "== Spark AOT export on $(hostname) at $(date -Is): ${spark_allocatable_free} bytes allocatable ($spark_memory_measure), no serving container, under the coordinator's lease =="
       break
     fi
     spark_wait_reason="allocatable memory ${spark_allocatable_free:-unreadable} (${spark_memory_measure:-unknown measure}), needs ${spark_export_min_free_bytes} bytes"
@@ -1090,42 +1427,15 @@ while :; do
   echo "$(hostname): waiting for an idle Spark export host ($(date -Is)): $spark_wait_reason"
   sleep 15
 done
-mkdir -p .cuteafd-release-image
-# This host's invoking user, not root: the container writes a Cargo target dir
-# and staging into bind-mounted host paths (see the coordinator note in build.sh).
-# A --user UID has no passwd entry here, so the identity and the cache roots are
-# passed explicitly; the artifact compiler creates them before Cargo runs.
-container_home=/tmp/cuteafd-home
-[[ -z "$release_build_root" ]] || container_home="$release_build_root/container-home"
-cache_plan="$(cuteafd_build_cache_docker_args "${release_build_root:-$HOME/.cache/cuteafd/builds/release-cache-fallback}" "$container_home" "$(python3 scripts/build/dev-toolchain.py)")" || exit 2
-mapfile -t compiler_cache_args <<<"$cache_plan"
 # The export is stopped by name from three directions: the contention watchdog
 # while it runs, and this shell's own EXIT/HUP when the caller's timeout kills
 # the ssh client (a dying docker client does not stop its container).
 cuteafd_cdi_gpu_args all || exit 2
 docker run --rm --name "$export_container" \
-  "${compiler_cache_args[@]}" \
-  --user "$(id -u):$(id -g)" \
-  -e "HOME=$container_home" \
-  -e "USER=$(id -un)" \
-  -e "LOGNAME=$(id -un)" \
-  -e "TORCHINDUCTOR_CACHE_DIR=$container_home/torchinductor" \
-  -e "CARGO_HOME=$container_home/cargo" \
   "${CUTEAFD_CDI_ARGS[@]}" \
-  --ipc=host \
-  --ulimit memlock=-1:-1 \
-  -e "CUTEAFD_RELEASE_SPARK_TP_ROLES=$spark_tp_roles" \
-  -e "CUTEAFD_RELEASE_EXPERT_FAMILIES=$expert_families" \
-  -e "CUTEAFD_RELEASE_GENERIC_SPARK_COUNTS=${CUTEAFD_RELEASE_GENERIC_SPARK_COUNTS:-}" \
-  -e "CUTEAFD_RELEASE_FP8_MOE_BF16_FAMILIES=$bf16_families" \
-  -e "CUTEAFD_RELEASE_AUDIO_AOT=$audio_aot" \
-  -e "CUTEAFD_RELEASE_EXLR8_AOT=${CUTEAFD_RELEASE_EXLR8_AOT:-OFF}" \
-  ${native_build_env_args[@]+"${native_build_env_args[@]}"} \
-  ${release_build_root_args[@]+"${release_build_root_args[@]}"} \
-  -v "$remote_dir:/source:ro" \
-  -v "$remote_dir/.cuteafd-release-image:/output" \
-  "$dev_image" \
-  /source/scripts/build/build-release-artifacts.sh /source expert 121 /output &
+  "${spark_artifact_opts[@]}" \
+  -e CUTEAFD_RELEASE_ARTIFACT_PHASE=native \
+  "${spark_artifact_cmd[@]}" &
 spark_export_container_pid=$!
 (
   while sleep "$spark_export_poll_seconds"; do
@@ -1159,13 +1469,21 @@ DOCKER_BUILDKIT=1 docker build \
   --build-arg CUTEAFD_SPARKINFER_COMMIT="$sparkinfer_commit" \
   --build-arg CUTEAFD_RELEASE_VERSION="$release_version" \
   --build-arg CUTEAFD_SPARK_TP_ROLES="$spark_tp_roles" \
+  --build-context wheelhouse=.cuteafd-release/wheelhouse \
   -f docker/Dockerfile.release \
   -t "$inference_image" .
 fi
 REMOTE
 }
 build_spark_release_leg dev
-build_spark_release_leg export
+build_spark_release_leg rust
+# The seed's hardware lease is held here, on the coordinator where the locks
+# live, for exactly the export phase's SSH command (release-export-gpu-lease).
+spark_export_lock="$(release_spark_export_lock "$seed_host")"
+printf -v spark_export_preflight '%q ' ssh "${release_ssh_opts[@]}" -o ConnectTimeout=10 "$seed_host" \
+  "test -z \"\$(docker ps -q --filter 'name=^cuteafd-spark-expert-[a-z0-9_.-]+-[0-9]+\$')\""
+release_with_export_locks "$seed_host" "$export_container-expert" "$spark_export_lock" "$spark_export_preflight" \
+  build_spark_release_leg export
 build_spark_release_leg image
 verify_remote_source_manifest
 )
@@ -1388,42 +1706,7 @@ for host in "${RELEASE_BUILD_HOSTS[@]:1}"; do
   # ensure_image cannot mistake the stale tag for the fresh seed image.
   release_ssh "$host" "docker image rm --force '$SPARK_EXPERT_DOCKER_INFERENCE' >/dev/null 2>&1 || true"
 done
-rdmapipe_ready=1
-for host in "${RELEASE_BUILD_HOSTS[@]}"; do
-  if ! release_ssh "$host" "command -v rdmapipe >/dev/null 2>&1"; then
-    rdmapipe_ready=0
-    break
-  fi
-done
-if ((rdmapipe_ready)); then
-  echo "== concurrently distributing Spark image over RDMA =="
-  image_copy_pids=()
-  image_copy_hosts=()
-  printf -v spark_image_quoted '%q' "$SPARK_EXPERT_DOCKER_INFERENCE"
-  for host in "${RELEASE_BUILD_HOSTS[@]:1}"; do
-    (
-      set -o pipefail
-      echo "== RDMA image copy $seed_host -> $host =="
-      release_ssh "$seed_host" \
-        "set -o pipefail; docker image save $spark_image_quoted | rdmapipe --send" |
-        release_ssh "$host" \
-          "set -o pipefail; rdmapipe --recv | docker image load"
-      echo "== RDMA image copy $seed_host -> $host complete =="
-    ) &
-    image_copy_pids+=("$!")
-    image_copy_hosts+=("$host")
-  done
-  image_copy_failed=0
-  for index in "${!image_copy_pids[@]}"; do
-    if ! wait "${image_copy_pids[$index]}"; then
-      echo "RDMA image copy to ${image_copy_hosts[$index]} failed" >&2
-      image_copy_failed=1
-    fi
-  done
-  ((image_copy_failed == 0)) || release_die "concurrent RDMA Spark image distribution failed"
-else
-  release_die "rdmapipe is required on every Spark build host to distribute the Spark image"
-fi
+release_distribute_spark_image
 
 coordinator_revision="$(
   docker image inspect -f '{{index .Config.Labels "org.opencontainers.image.revision"}}' \

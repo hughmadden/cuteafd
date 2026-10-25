@@ -77,8 +77,10 @@ docker_args+=(
 # Host build slots (scripts/build/build-slot.sh) exclude through these lock
 # files; mount them at the same path so a compile inside takes the real slot.
 # Only the slot files are shared (created first, so the container never makes
-# a private copy); the hardware locks and the fair queue stay host-only.
-lock_dir="$HOME/.cache/cuteafd"
+# a private copy); the hardware locks and the fair queue stay host-only. A
+# deployment whose locks live outside HOME names them with CUTEAFD_LOCK_DIR, as
+# build-slot.sh reads it on the host.
+lock_dir="${CUTEAFD_LOCK_DIR:-$HOME/.cache/cuteafd}"
 mkdir -p "$lock_dir"
 # The slot files live in a private, writable directory at the same path inside
 # (a bind-mounted file under an unmounted parent is not writable for flock's
@@ -130,8 +132,10 @@ elif [[ "$role" != cpu ]]; then
   release_need nvidia-smi
   release_resolve_coordinator_gpu_identity
   # Under hwlock, the GPU this container gets must be one the caller holds: the
-  # config (not the environment) selects it, so a mismatch is a wrong config.
-  if [[ -n "${CUTEAFD_HW_LOCKS_HELD:-}" && ",$CUTEAFD_HW_LOCKS_HELD," != *",gpu$RELEASE_COORDINATOR_GPU_HOST_INDEX,"* ]]; then
+  # config (not the environment) selects it, so a mismatch is a wrong config. A
+  # single-GPU host other than raptor (oliver) is locked by its host name.
+  if [[ -n "${CUTEAFD_HW_LOCKS_HELD:-}" && ",$CUTEAFD_HW_LOCKS_HELD," != *",gpu$RELEASE_COORDINATOR_GPU_HOST_INDEX,"* \
+      && ",$CUTEAFD_HW_LOCKS_HELD," != *",$(hostname -s),"* ]]; then
     echo "coordinator GPU $RELEASE_COORDINATOR_GPU_HOST_INDEX is not among held locks ($CUTEAFD_HW_LOCKS_HELD); set COORDINATOR_GPU in CUTEAFD_CONFIG" >&2
     exit 2
   fi

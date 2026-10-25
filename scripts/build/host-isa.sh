@@ -10,7 +10,7 @@
 # code for the CPU sampler's masked exp reduction ran 1.6x slower than v2 on
 # Zen 5 (min_p row 425 vs 200 us; v4 231), and v2 runs on every x86-64 host
 # in scope. Explicit targets make the build host irrelevant: the same flags come
-# out of raptor, oliver, kakapo or a Spark.
+# out of raptor, oliver, a LAN-only build seed or a Spark.
 #
 # Artifact layout: `cuteafd` and `libcuteafd_native.so` are the base (first
 # ISA); each further ISA adds bin-variants/<isa>/cuteafd and

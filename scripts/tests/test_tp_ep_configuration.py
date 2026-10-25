@@ -393,6 +393,9 @@ gpu_request=device=uuid0,uuid1
 gpu_uuid_csv=uuid0,uuid1
 fingerprint=test
 hf_home=/models
+namespace_root=/mnt/sparknest
+namespace_hf_home="$namespace_root/hf-home"
+ready_timeout="${{CUTEAFD_RELEASE_READY_TIMEOUT_SECONDS:-900}}"
 COORDINATOR_DOCKER_INFERENCE=coordinator-image
 SPARK_EXPERT_DOCKER_INFERENCE=spark-image
 SPARK_DEVICE_BUDGET_BYTES=107374182400
@@ -412,6 +415,7 @@ shared_env_args=(-e CUTEAFD_SPARK_INTAKE=auto -e CUTEAFD_CONSOLE_TEXT=true -e CU
 shared_worker_env_args=(-e CUTEAFD_FP8_EXPERT_PREFILL=auto -e CUTEAFD_THERMAL=on)
 thermal_args=(-e CUTEAFD_THERMAL=on)
 v41_fp8_head_args=()
+v41_l2_prefetch=
 {extra_setup}'''
             setup += '\ncount_plan=\'{"spark_admission":"coordinator_authoritative"}\'\n'
             result = subprocess.run(
@@ -1420,13 +1424,17 @@ class PublishedImageReferenceTest(unittest.TestCase):
                                         "SPARK_EXPERT_DOCKER_INFERENCE="))
                 )
                 self.assertEqual(values.get("COORDINATOR_DOCKER_INFERENCE"), coordinator)
-                self.assertEqual(values.get("SPARK_EXPERT_DOCKER_INFERENCE"), spark)
-                # One release, one tag: a mixed pair fails the launcher's engine
-                # identity check at startup.
-                self.assertEqual(
-                    values["COORDINATOR_DOCKER_INFERENCE"].rsplit(":", 1)[1],
-                    values["SPARK_EXPERT_DOCKER_INFERENCE"].rsplit(":", 1)[1],
-                )
+                if "SPARK_EXPERT_DOCKER_INFERENCE" not in values:
+                    # RTX-only launchers need no expert image and may reject its key.
+                    self.assertIn("SPARK_COUNT=0", path.read_text().splitlines())
+                else:
+                    self.assertEqual(values["SPARK_EXPERT_DOCKER_INFERENCE"], spark)
+                    # One release, one tag: a mixed pair fails the launcher's engine
+                    # identity check at startup.
+                    self.assertEqual(
+                        values["COORDINATOR_DOCKER_INFERENCE"].rsplit(":", 1)[1],
+                        values["SPARK_EXPERT_DOCKER_INFERENCE"].rsplit(":", 1)[1],
+                    )
 
     def test_no_example_pins_an_unpublished_candidate_tag(self) -> None:
         for path in sorted(EXAMPLES.glob("*.config")):
@@ -1476,6 +1484,8 @@ SPARK_EXPERT_DOCKER_INFERENCE=registry.example/spark:v9
 engine_commit=engine-revision
 sparkinfer_commit=sparkinfer-revision
 snapshot_rel=hub/models--x--M/snapshots/rev
+namespace_root={namespace}
+namespace_hf_home={namespace}/hf-home
 host=dodo
 model_is_exl3={exl3}
 exl3_family_tag={family}
@@ -1499,17 +1509,18 @@ unset HF_HOME
                   missing: int = 0, sparkinfer: str = "sparkinfer-revision",
                   wip_slot: str = '""') -> subprocess.CompletedProcess[str]:
         with tempfile.TemporaryDirectory() as temporary:
-            home = Path(temporary)
-            # HF_HOME is unset below, so the remote resolves the snapshot under
-            # $HOME/.cache/huggingface.
-            (home / ".cache/huggingface/hub/models--x--M/snapshots/rev").mkdir(parents=True)
+            home = Path(temporary).resolve()
+            namespace = home / "namespace"
+            # The remote reads the snapshot under the forwarded namespace
+            # hf-home; HF_HOME is unset and ~/.cache/huggingface stays empty.
+            (namespace / "hf-home/hub/models--x--M/snapshots/rev").mkdir(parents=True)
             stub = home / "bin"
             stub.mkdir()
             docker = stub / "docker"
             docker.write_text(self.DOCKER_STUB)
             docker.chmod(0o755)
             script = (self.HARNESS.format(exl3=exl3, family=family, wip_slot=wip_slot,
-                                          home=str(home))
+                                          home=str(home), namespace=str(namespace))
                       + self.statement()
                       + '\nprintf "manifest=[%s]\n" "$spark_manifest"\n')
             return subprocess.run(

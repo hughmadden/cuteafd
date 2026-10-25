@@ -1751,3 +1751,9 @@ mod tests {
         );
     }
 }
+
+/// Retained device sampler storage: params/scratch, two masks, histogram,
+/// rank-order ids/staging and per-row selectors. Shared with allocation admission.
+pub fn device_bytes(capacity: usize, vocab: usize) -> usize {
+    capacity * (64 + 64 + 2 * vocab.div_ceil(32) * 4 + 2048 * 4 + 256 * 12 + 32)
+}

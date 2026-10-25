@@ -67,6 +67,9 @@ def test_two_target_counts():
                   "attn_res_c9_add", "attn_res_c9_replace", "attn_res_c9_keep"]),
     ("latent", ["rmsnorm_h3584", "rmsnorm_h7168", "latent_down", "latent_up"]),
     ("situ", [f"situ_i{width}" for width in (3072, 6144, 16896, 33792)]),
+    ("ffn", [f"ffn_{op}_i{width}" for width in (3072, 6144, 16896, 33792)
+             for op in ("gate_up", "down")] +
+            [f"ffn_gate_up_i{width}_comp" for width in (3072, 6144, 16896, 33792)]),
 ])
 def test_kimi_w8_cross_sm_groups(group, names):
     job = next(job for job in compare_sm.jobs("suspects") if job[0] == f"kimi-{group}")
@@ -74,11 +77,86 @@ def test_kimi_w8_cross_sm_groups(group, names):
                    ["--geometry", "kimik3", "--only", ",".join(names)])
 
 
+def test_mla_draft_cross_sm_group_and_checkpoint_neutral_registry(monkeypatch):
+    names = ["mla_draft_producer_m64", "mla_draft_producer_fp8_m64", "mla_draft_output_m64",
+             "mla_draft_attention_full_m64", "mla_draft_attention_w4096_m64",
+             "mla_draft_attention_full_fp8_m64", "mla_draft_attention_w4096_fp8_m64"]
+    job = next(job for job in compare_sm.jobs("suspects") if job[0] == "mla-draft-h64")
+    assert job == ("mla-draft-h64", "export_b12x_dsv4_aot.py",
+                   ["--geometry", "kimik3", "--only", ",".join(names)])
+    source = ROOT / "python/tools/aot/export_b12x_dsv4_aot.py"
+    tree = ast.parse(source.read_text())
+    tree.body = [node for node in tree.body
+                 if isinstance(node, ast.FunctionDef) and node.name == "mla_draft_programs"]
+    calls = []
+
+    def compile_fake(g, **kwargs):
+        calls.append((g, kwargs))
+        return kwargs
+
+    module = SimpleNamespace(kimi_mla=SimpleNamespace(
+        MlaDraftGeometry=lambda **kwargs: kwargs,
+        **{f"compile_mla_draft_{op}_aot": compile_fake for op in ("producer", "output", "attention")}))
+    monkeypatch.setitem(sys.modules, "b12x.integration.cuteafd", module)
+    ns = {}
+    exec(compile(tree, str(source), "exec"), ns)
+    programs = ns["mla_draft_programs"](64, 262144)
+    assert {row[0] for row in programs} == set(names)
+    for row in programs:
+        row[-1]()
+    assert calls == [({"window_size": None, "kv_cache": "bf16"}, {"max_rows": 64})] + [
+        (dict(window_size=window, kv_cache=cache), dict(max_rows=64, **extra))
+        for cache in ("bf16", "fp8")
+        for window, extra in ((None, {}), (None, {"max_context": 262144}),
+                              (4096, {"max_context": 262144}))]
+
+
+
+@pytest.mark.parametrize("geometry", ["glm_stage", "glm2_stage"])
+def test_glm_stage_cross_sm_groups(geometry):
+    name = geometry.replace("_", "-")
+    job = next(job for job in compare_sm.jobs("all") if job[0] == name)
+    assert job == (name, "export_b12x_dsv4_aot.py", ["--geometry", geometry])
+
+
 def test_mimop_k32_tp6_uses_production_exact_slice_export():
     job = next(job for job in compare_sm.jobs("all") if job[0] == "routed-mimop-tp6")
     assert job == ("routed-mimop-tp6", "package_fp8_moe_aot.py",
                    ["--geometry", "mimop", "--capacities", compare_sm.CAPACITIES,
                     "--layouts", "tp6", "--exact-slices"])
+
+
+@pytest.mark.parametrize("geometry,bits", [
+    ("qwen4", "45"), ("glm", "45"), ("glmf", "34"), ("dsv4f", "23"),
+    ("v41", "23"), ("v41", "34"), ("v41", "45"),
+])
+def test_compact_gate_matches_packager_spark_companions(tmp_path, monkeypatch, geometry, bits):
+    name = f"exl3-compact-{geometry}-k{bits}"
+    _, exporter, args = next(job for job in compare_sm.jobs("all") if job[0] == name)
+    assert exporter == "package_exl3_aot.py"
+    package = compare_sm.load_file("test_compact_package", ROOT / "python/tools/aot/package_exl3_aot.py")
+    profiles = package.compact_profiles(geometry, package.build_profiles("spark", geometry))
+    capacities = package.package_capacities(geometry, compare_sm.CAPACITIES)
+    recorded = []
+    monkeypatch.setitem(sys.modules, "package_exl3_aot", package)
+    monkeypatch.setitem(sys.modules, "export_b12x_exl3_aot", SimpleNamespace(
+        export=lambda *values, **options: recorded.append((values, options))))
+    compare_sm._export_exl3(args, tmp_path)
+    assert [(values[0], values[1], values[2], values[3], values[5], values[6], values[7])
+            for values, _ in recorded] == [
+        (tmp_path / profile / f"m{rows}", width, experts, rows, "auto", topk, dtype)
+        for profile, width, experts, topk, dtype, _ in profiles for rows in capacities]
+    for values, options in recorded:
+        assert values[4] == tuple(map(int, bits))
+        assert options["compile_only"] and options["compact_weights"]
+        assert options["tile"] == (64, 128, 64, 128)
+        assert not options.get("warp_specialized") and not options.get("wire_input")
+        rows = values[3]
+        assert options.get("route_block", 8) == package.route_block(geometry, rows)
+        assert options.get("swiglu_limit", 10.0) == package.swiglu_limit(geometry)
+    widths = {profile[1] for profile in profiles}
+    assert widths == ({256, 384} if geometry == "qwen4" else
+                      {640} if geometry == "v41" else {384, 768})
 
 
 def test_identical_object_ignores_context_metadata(tmp_path):
@@ -218,7 +296,7 @@ def test_step5_projection_operands_keep_checkpoint_materialization_boundaries(mo
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     calls = {name: build() for name, build in module.builders(heads, "projections").items()}
-    assert len(calls) == 12
+    assert len(calls) == 13
     for name, (width, outputs, dtype) in {
         "attn_q": (4096, heads * 192, "bf16"),
         "attn_kv": (4096, heads // 16 * 192, "bf16"),
@@ -232,6 +310,7 @@ def test_step5_projection_operands_keep_checkpoint_materialization_boundaries(mo
         "dense_down": (13824, 4096, "bf16"),
         "shared_gate_up": (4096, 3072, "bf16"),
         "shared_down": (1536, 4096, "bf16"),
+        "mtp_eh": (8192, 4096, "bf16"),
     }.items():
         assert calls[name] == dict(width=width, outputs=outputs, output_dtype=dtype)
 
@@ -326,14 +405,15 @@ def test_multitier_exports_do_not_use_two_tier_only_schedules(tmp_path, monkeypa
         route_block=lambda *_: 8, swiglu_limit=lambda *_: 10.0,
         wire_input=lambda *_: False, ws_input_stages=lambda *_: None,
         ws_dynamic_tiles=lambda *_: False, ws_tile=lambda *_: None,
-        decode_tile=lambda *_: None,
+        decode_tile=lambda *_: None, activation=lambda *_: "silu",
+        default_decode_schedule=lambda *_: None,
     )
     for name in ("warp_specialized", "fused_input_rotation", "token_major_rotation"):
         setattr(package, name, lambda *_, name=name: name == rotation)
     monkeypatch.setitem(sys.modules, "package_exl3_aot", package)
     monkeypatch.setitem(sys.modules, "export_b12x_exl3_aot", SimpleNamespace(
         export=lambda *args, **kwargs: recorded.append((args, kwargs))))
-    compare_sm._export_exl3(["--geometry", "qwen4", "--capacities", "1024",
+    compare_sm._export_exl3(["--geometry", "qwen4", "--capacities", "1024", "--role", "spark",
                             "--bits", ",".join(map(str, bits))], tmp_path)
     assert len(recorded) == 1
     assert recorded[0][0][4] == bits
@@ -352,12 +432,42 @@ def test_cpu_lut_override_covers_all_bindings_and_restores_on_error():
     assert [module._trellis256_execution_lut for module in (first, fourth)] == originals
 
 
-def test_production_package_limits_special_rotation_to_two_tiers():
-    source = (ROOT / "python/tools/aot/package_exl3_aot.py").read_text()
-    for policy in ("warp_specialized", "fused_input_rotation", "token_major_rotation"):
-        matches = [line for line in source.splitlines()
-                   if f"{policy}(geometry," in line and line.startswith("                ")]
-        assert matches and all("len(args.bits) == 2" in line for line in matches)
+@pytest.mark.parametrize("geometry,compact,role,bits", [
+    ("qwen4", True, "spark", (4, 5)), ("glm", False, "spark", (4, 5)),
+    ("glm", False, "coordinator", (4, 5)), ("glm", False, "coordinator", (3, 4)),
+])
+def test_gate_options_match_real_package(tmp_path, monkeypatch, geometry, compact, role, bits):
+    fixture = compare_sm.load_file(
+        "gate_package_fixture", ROOT / "python/tests/test_package_v41_exl3_profiles.py")
+    package = fixture.package
+    # Compare the shipping cooperative compact route and its measured hint.
+    capacities = (1, 80, 256, 1024, 2752, 4096)
+    build_root = tmp_path / "build-fixture"
+    build_root.mkdir()
+    _, _, calls, _ = fixture.PackageProfileTests().build_fixture(
+        build_root, role, bits, geometry=geometry,
+        capacities=capacities, compact=compact,
+        profiles=() if compact else tuple(p[0] for p in package.profiles_for_role(role, geometry)))
+    expected = {(call.args[0].parent.name.split('+')[0], call.args[3]): call.kwargs for call in calls
+                if bool(call.kwargs.get("compact_weights")) == compact}
+    recorded = []
+    monkeypatch.setitem(sys.modules, "package_exl3_aot", package)
+    monkeypatch.setitem(sys.modules, "export_b12x_exl3_aot", SimpleNamespace(
+        export=lambda *values, **options: recorded.append((values, options))))
+    args = ["--geometry", geometry, "--bits", ",".join(map(str, bits)), "--role", role,
+            "--capacities", ",".join(map(str, capacities))]
+    if compact:
+        args.append("--compact-companions")
+    compare_sm._export_exl3(args, tmp_path / "gate")
+    assert recorded
+    for values, options in recorded:
+        assert options.pop("compile_only") is True
+        assert options == expected[(values[0].parent.name, values[3])]
+    if compact:
+        assert not any(options.get("warp_specialized") for _, options in recorded)
+        assert any(options.get("decode_schedule") == package.PURE_EVICT_FIRST for _, options in recorded)
+    else:
+        assert any(options.get("warp_specialized") for _, options in recorded) == (role == "spark" or bits == (4, 5))
 
 
 def residency_gate(name="validate_table_residency"):

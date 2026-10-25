@@ -50,8 +50,8 @@ fn engine_cache(bytes: u64) -> HostCache<StubCopyEngine, u64> {
 fn engine_snapshot(tokens: usize, generation: u32) -> DeviceSnapshot {
     let pages = tokens * KV_BYTES_PER_TOKEN / (PAGE_BYTES * COMPRESSORS);
     let mut ranges = Ranges::new();
-    let mut lists: [Vec<DevicePage>; COMPRESSORS] = std::array::from_fn(|_| Vec::new());
-    for (compressor, list) in lists.iter_mut().enumerate() {
+    let mut lists: [Vec<DevicePage>; cuteafd_hostcache::PAGE_BANKS] = std::array::from_fn(|_| Vec::new());
+    for (compressor, list) in lists.iter_mut().take(COMPRESSORS).enumerate() {
         for index in 0..pages {
             list.push(DevicePage {
                 id: DevicePageId {
@@ -179,8 +179,8 @@ fn lookup(c: &mut Criterion) {
     let mut tokens = Vec::new();
     for generation in 0..10_000u32 {
         let sequence: Vec<u32> = (0..8).chain(std::iter::once(generation)).collect();
-        let mut lists: [Vec<DevicePage>; COMPRESSORS] = std::array::from_fn(|_| Vec::new());
-        for (compressor, list) in lists.iter_mut().enumerate() {
+        let mut lists: [Vec<DevicePage>; cuteafd_hostcache::PAGE_BANKS] = std::array::from_fn(|_| Vec::new());
+        for (compressor, list) in lists.iter_mut().take(COMPRESSORS).enumerate() {
             list.push(DevicePage {
                 id: DevicePageId {
                     compressor: compressor as u8,

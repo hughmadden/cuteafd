@@ -46,7 +46,7 @@ def test_wip_audio_opt_in_is_validated_before_operations_and_forwarded(value):
     if value is not None:
         env['CUTEAFD_WIP_AUDIO_AOT'] = value
     coordinator = 'build_coordinator() {' + script.split('build_coordinator() {', 1)[1].split('\nbuild_expert()', 1)[0]
-    expert = 'build_expert() (' + script.split('build_expert() (', 1)[1].split('\nwip_build_coordinator=0', 1)[0]
+    expert = 'build_expert() (' + script.split('build_expert() (', 1)[1].split('\n# Role builders end here.', 1)[0]
     # The native-store helpers both builders call (wip.sh defines them just before).
     helpers = script[script.index('# Native/AOT outputs are cached by input key'):script.index('build_coordinator() {')]
     command = ('set -euo pipefail\nrelease_die() { printf "%s\\n" "$*" >&2; exit 2; }\n' + validation + '\n'
@@ -56,7 +56,12 @@ def test_wip_audio_opt_in_is_validated_before_operations_and_forwarded(value):
                'sync_local_source() { :; }; sync_seed_source() { :; }\n'
                'docker() { printf "docker %s\\n" "$*"; }\n'
                'ssh() { printf "ssh %s\\n" "$*"; }\n'
-               'timeout() { shift 2; "$@"; }\n' + helpers + 'native_store_has() { return 1; }\n' + coordinator + '\n' + expert + '\n'
+               'timeout() { shift 2; "$@"; }\n'
+               # Identified at top level: the coordinator's image ID matches, the expert's does not.
+               "wip_coordinator_image_id='docker image inspect -f {{.Id}} fixture'\n"
+               f"wip_coordinator_image_content={7:064d}\n"
+               f"wip_expert_image_id=other wip_expert_image_content={8:064d}\n"
+               + helpers + 'native_store_has() { return 1; }\n' + coordinator + '\n' + expert + '\n'
                'build_coordinator\nbuild_expert\n')
     result = subprocess.run(['bash', '-c', command], env=env, capture_output=True, text=True, timeout=10)
     if value not in (None, 'ON', 'OFF'):
@@ -65,6 +70,10 @@ def test_wip_audio_opt_in_is_validated_before_operations_and_forwarded(value):
         assert 'docker' not in result.stdout and 'ssh' not in result.stdout
         return
     assert result.returncode == 0, result.stderr
+    finalizers = [line for line in result.stdout.splitlines() if 'finalize-wip-slot.sh' in line]
+    assert len(finalizers) == 2
+    assert f'CUTEAFD_WIP_DEV_IMAGE_CONTENT={7:064d}' in finalizers[0]
+    assert 'CUTEAFD_WIP_DEV_IMAGE_CONTENT= ' in finalizers[1] and f'{8:064d}' not in finalizers[1]
     builds = [line for line in result.stdout.splitlines() if '/build-wip-artifacts.sh' in line]
     # Both roles run Cargo, then the native phase (which a native-cache hit restores).
     assert len(builds) == 4
@@ -79,6 +88,7 @@ def test_wip_audio_opt_in_is_validated_before_operations_and_forwarded(value):
 def check_readiness(tmp_path, role, present, from_slot=''):
     text = (ROOT / 'wip.sh').read_text()
     block = text.split('# wip-slot-readiness:start', 1)[1].split('# wip-slot-readiness:end', 1)[0]
+    block += text.split('wip_check_expert_readiness() {', 1)[1].split('\n}\n', 1)[0]
     slots = tmp_path / 'slots'
     for part in present:
         workspace = slots / 'test' / part / 'workspace'
@@ -311,8 +321,33 @@ def test_finalizer_retains_checked_programs_and_frozen_transformers_identity(tmp
     meta = json.loads((frozen / 'META.json').read_text())
     assert meta['transformers_revision'] == 'a' * 40
     assert meta['transformers_source_sha256'] == module.source_tree_sha256(transformers)
+    assert 'base_image_content_sha256' not in meta  # an older caller passes no content identity
+    content = {**os.environ, 'CUTEAFD_WIP_DEV_IMAGE_CONTENT': 'c' * 64}
+    result = subprocess.run(command, env=content, capture_output=True, text=True, timeout=10)
+    assert result.returncode == 0, result.stderr
+    assert json.loads((frozen / 'META.json').read_text())['base_image_content_sha256'] == 'c' * 64
+    bad = subprocess.run(command, env={**content, 'CUTEAFD_WIP_DEV_IMAGE_CONTENT': 'sha256:' + 'c' * 64},
+                         capture_output=True, text=True, timeout=10)
+    assert bad.returncode == 2 and 'invalid CUTEAFD_WIP_DEV_IMAGE_CONTENT' in bad.stderr
     (output / 'PROGRAMS.json').write_text('corrupted')
     assert subprocess.run(command, capture_output=True, text=True).returncode != 0
+
+
+def test_wip_seals_the_dev_image_content_it_built_with():
+    script = (ROOT / 'wip.sh').read_text()
+    top = script.index('wip_coordinator_image_content="$(docker image inspect "$wip_coordinator_image_id" |')
+    assert script.index('distribute_spark_dev_image\n') < top < script.index('build_coordinator() {')
+    # One identity algorithm: the seal (both roles) and the image distribution use the same CLI.
+    uses = script.count('python3 "$repo_root/scripts/lib/dev_image_content.py"')
+    helper = script[script.index('wip_image_content() {'):script.index('distribute_spark_dev_image() {')]
+    assert uses == 3 and 'dev_image_content.py' in helper and 'wip_image_content "$1" "$SPARK_EXPERT_DOCKER_DEV"' in helper
+    assert 'docker image inspect -f' not in script[script.index('distribute_spark_dev_image() {'):
+                                                   script.index('# --recreate follows --role')]
+    for role, ident in (('build_coordinator() {', 'wip_coordinator_image'), ('build_expert() (', 'wip_expert_image')):
+        body = script.split(role, 1)[1]
+        body = body[:body.index('finalize-wip-slot.sh')]
+        assert f'[[ "$image_id" != "${{{ident}_id:-}}" ]] || image_content="${{{ident}_content:-}}"' in body
+        assert 'CUTEAFD_WIP_DEV_IMAGE_CONTENT=$image_content' in body
 
 
 def test_wip_verifies_transformers_before_both_role_builds_and_frozen_source(tmp_path):
@@ -406,3 +441,50 @@ def test_v41_workspace_manifests_reach_sealed_slots_and_release_images():
     assert "find bin-variants lib-variants V41_EXPERT_WORKSPACES -type f" in wip
     release = (ROOT / "build.sh").read_text()
     assert 'find coordinator/V41_EXPERT_WORKSPACES spark-expert/V41_EXPERT_WORKSPACES -type f' in release
+
+
+@pytest.mark.parametrize('role,export_status', [('both', 0), ('both', 23), ('coordinator', 0)])
+def test_distribution_precedes_export_even_on_failure_or_coordinator_retry(tmp_path, role, export_status):
+    text = (ROOT / 'wip.sh').read_text()
+    flow = text.split('wip_build_selected_roles() {', 1)[1].split('\n}\n', 1)[0]
+    trace = tmp_path / 'trace'
+    script = f"""set -euo pipefail
+role={role}; wip_reused_coordinator=0; wip_reused_expert=0
+build_coordinator() {{ echo coordinator-$1 >> '{trace}'; [[ $1 != native ]] || return {export_status}; }}
+wip_build_resource_acquire() {{ echo lease >> '{trace}'; }}
+build_expert() {{ echo sealed >> '{trace}'; }}
+wip_retain_counterpart() {{ :; }}
+wip_build_resource_release() {{ echo release >> '{trace}'; }}
+wip_distribute_sealed_expert() {{ echo distribute >> '{trace}'; }}
+{flow}
+"""
+    result = subprocess.run(['bash', '-c', script], capture_output=True, text=True, timeout=10)
+    assert result.returncode == export_status, result.stderr
+    expected = ['coordinator-rust'] + (['lease', 'sealed'] if role == 'both' else [])
+    assert trace.read_text().splitlines() == expected + ['release', 'distribute', 'coordinator-native']
+
+
+def test_coordinator_retry_discovers_sealed_seed_slot_after_dry_run():
+    text = (ROOT / 'wip.sh').read_text()
+    probe = text.split('# A coordinator-only retry repairs', 1)[1].split('# Probe only after', 1)[0]
+    assert text.index('# A coordinator-only retry repairs') > text.index('if ((dry_run)); then')
+    assert 'docker inspect' in probe and 'FINGERPRINT' in probe and 'wip_spark_leg=1' in probe
+
+
+@pytest.mark.parametrize('running', ['true', 'false'])
+def test_distribution_stops_only_seed_it_restarted(tmp_path, running):
+    text = (ROOT / 'wip.sh').read_text()
+    helper = 'wip_distribute_sealed_expert() (' + text.split('wip_distribute_sealed_expert() (', 1)[1].split('\n)\n', 1)[0] + '\n)\n'
+    trace = tmp_path / 'trace'
+    setup = f"""set -euo pipefail
+wip_spark_leg=1 seed_host=fixture spark_container=owned
+ssh() {{ echo "$*" >> '{trace}'; [[ $* != *inspect* ]] || echo {running}; }}
+wip_check_expert_readiness() {{ :; }}
+distribute_expert_slot() {{ echo distribute >> '{trace}'; }}
+"""
+    result = subprocess.run(['bash', '-c', setup + helper + '\nwip_distribute_sealed_expert'], capture_output=True, text=True, timeout=10)
+    assert result.returncode == 0, result.stderr
+    calls = trace.read_text()
+    assert 'distribute' in calls
+    assert ('docker stop' in calls) == (running == 'false')
+    assert ('docker start' in calls) == (running == 'false')

@@ -106,9 +106,8 @@ for bf16_family in "${bf16_family_list[@]}"; do
   [[ ";$expert_families;" == *";$bf16_family:fp8;"* ]] ||
     { echo "CUTEAFD_RELEASE_FP8_MOE_BF16_FAMILIES=$bf16_family needs $bf16_family:fp8 in CUTEAFD_RELEASE_EXPERT_FAMILIES" >&2; exit 2; }
 done
-# v7 ships both EXL3 decoder families by default: the uniform K=2 raw
-# publication family (2,3) and the staged K3.25 family (3,4).
-exl3_bit_families="${CUTEAFD_RELEASE_EXL3_BIT_FAMILIES:-2,3;3,4}"
+# Package each supported checkpoint decoder family, including K4/K5.
+exl3_bit_families="${CUTEAFD_RELEASE_EXL3_BIT_FAMILIES:-2,3;3,4;4,5}"
 [[ "$cuda_arch" =~ ^[0-9]+$ ]] || {
   echo "CUDA_ARCH must be numeric" >&2
   exit 2
@@ -130,38 +129,109 @@ if [[ "$xgrammar" == ON ]]; then
     --lock "$source_dir/third_party/xgrammar.lock.json"
 fi
 
-build_root="$(mktemp -d "$build_root_parent/cuteafd-release-build.XXXXXX")"
-trap 'rm -rf "$build_root"' EXIT
-mkdir -p "$build_root/source"
+# release-artifact-phases:start
+# CUTEAFD_RELEASE_ARTIFACT_PHASE splits one build so only the GPU part holds a
+# hardware lease (build.sh): `rust` stages the source and builds the daemons with
+# no GPU, `native` (CMake, AOT exports, packaging) continues in the same
+# CUTEAFD_RELEASE_ARTIFACT_STATE build tree. `all` (default) is both in one run.
+# Native refuses a state whose recorded inputs (role, arch, source, environment
+# minus the GPU assignment) differ from its own, or whose daemons changed.
+artifact_phase="${CUTEAFD_RELEASE_ARTIFACT_PHASE:-all}"
+artifact_state="${CUTEAFD_RELEASE_ARTIFACT_STATE:-}"
+case "$artifact_phase" in
+  all) ;;
+  rust|native)
+    [[ "$artifact_state" == /* ]] ||
+      { echo "CUTEAFD_RELEASE_ARTIFACT_PHASE=$artifact_phase needs an absolute CUTEAFD_RELEASE_ARTIFACT_STATE" >&2; exit 2; }
+    ;;
+  *) echo "CUTEAFD_RELEASE_ARTIFACT_PHASE must be all, rust or native, got: $artifact_phase" >&2; exit 2 ;;
+esac
+release_source_tar() {
+  tar \
+    -C "$source_dir" \
+    --exclude=.git \
+    --exclude='*/.git' \
+    --exclude='.venv*' \
+    --exclude='*/.venv*' \
+    --exclude=.mypy_cache \
+    --exclude='*/.mypy_cache' \
+    --exclude=.pytest_cache \
+    --exclude='*/.pytest_cache' \
+    --exclude=.ruff_cache \
+    --exclude='*/.ruff_cache' \
+    --exclude=__pycache__ \
+    --exclude='*/__pycache__' \
+    --exclude='*.pyc' \
+    --exclude='*.pyo' \
+    --exclude=.cuteafd-cache \
+    --exclude=.cuteafd-release \
+    --exclude=.cuteafd-release-image \
+    --exclude=.cuteafd-wip \
+    --exclude=dist \
+    --exclude=rust/target \
+    --exclude='native/build*' \
+    "$@" -cf - .
+}
+release_phase_inputs() {
+  printf 'role=%s\ncuda_arch=%s\noutput=%s\n' "$role" "$cuda_arch" "$output_dir"
+  # Content, paths and modes only: timestamps and ownership of an unchanged tree
+  # (a directory touched by a host-side helper) are not inputs.
+  printf 'source=%s\n' "$(release_source_tar --sort=name --mtime=@0 --owner=0 --group=0 --numeric-owner \
+    --format=gnu | sha256sum | awk '{print $1}')"
+  # GPU assignment and the image's driver-detection startup (BASH_ENV) are not
+  # build inputs: with a driver visible it sets _CUDA_COMPAT_STATUS and, when
+  # the CUDA forward-compat libraries apply, prepends exactly
+  # /usr/local/cuda/compat/lib.real: to LD_LIBRARY_PATH. Only that leading
+  # entry is ignored; the rest of LD_LIBRARY_PATH stays an input.
+  env | LC_ALL=C sort |
+    grep -Ev '^(CUDA_VISIBLE_DEVICES|NVIDIA_[A-Z0-9_]*|_CUDA_COMPAT_STATUS|CUTEAFD_RELEASE_ARTIFACT_PHASE|HOSTNAME|PWD|OLDPWD|SHLVL|_)=' |
+    sed 's#^LD_LIBRARY_PATH=/usr/local/cuda/compat/lib\.real:#LD_LIBRARY_PATH=#' || true
+}
+release_phase_daemons() {
+  local isa
+  for isa in "${host_isas[@]}"; do
+    sha256sum "$(cuteafd_host_isa_daemon "$cargo_target_dir" "$isa")"
+  done
+}
+case "$artifact_phase" in
+  all)
+    build_root="$(mktemp -d "$build_root_parent/cuteafd-release-build.XXXXXX")"
+    trap 'rm -rf "$build_root"' EXIT
+    ;;
+  rust)
+    [[ ! -e "$artifact_state" ]] ||
+      { echo "release artifact state already exists: $artifact_state" >&2; exit 2; }
+    mkdir "$artifact_state"
+    build_root="$artifact_state/build"
+    mkdir "$build_root"
+    # Kept for the native phase on success, removed on any failure.
+    trap 'status=$?; ((status == 0)) || rm -rf "$artifact_state"' EXIT
+    release_phase_inputs >"$artifact_state/inputs"
+    ;;
+  native)
+    [[ -s "$artifact_state/rust.done" && -s "$artifact_state/inputs" ]] ||
+      { echo "release artifact state has no completed rust phase: $artifact_state" >&2; exit 2; }
+    build_root="$artifact_state/build"
+    # Single use: the native phase owns and removes the state on every exit.
+    trap 'rm -rf "$artifact_state"' EXIT
+    release_phase_inputs >"$artifact_state/inputs.native"
+    if ! cmp -s "$artifact_state/inputs.native" "$artifact_state/inputs"; then
+      echo "release artifact inputs changed since the rust phase (role, arch, source or environment): $artifact_state" >&2
+      # Name what differs; environment values are not printed.
+      diff "$artifact_state/inputs" "$artifact_state/inputs.native" |
+        sed -nE 's/^([<>]) (role|cuda_arch|output|source)=/\1 \2=/p; t; s/^([<>]) ([A-Za-z_][A-Za-z0-9_]*)=.*/\1 env \2/p' >&2 || true
+      exit 2
+    fi
+    ;;
+esac
+# release-artifact-phases:end
 # The cargo target and the install source must agree. Default to the writable
 # staged copy; an explicit external override is honored for both so a caller
 # that relocates the target cannot leave the install pointing at the old path.
 cargo_target_dir="${CARGO_TARGET_DIR:-$build_root/source/rust/target}"
-tar \
-  -C "$source_dir" \
-  --exclude=.git \
-  --exclude='*/.git' \
-  --exclude='.venv*' \
-  --exclude='*/.venv*' \
-  --exclude=.mypy_cache \
-  --exclude='*/.mypy_cache' \
-  --exclude=.pytest_cache \
-  --exclude='*/.pytest_cache' \
-  --exclude=.ruff_cache \
-  --exclude='*/.ruff_cache' \
-  --exclude=__pycache__ \
-  --exclude='*/__pycache__' \
-  --exclude='*.pyc' \
-  --exclude='*.pyo' \
-  --exclude=.cuteafd-cache \
-  --exclude=.cuteafd-release \
-  --exclude=.cuteafd-release-image \
-  --exclude=.cuteafd-wip \
-  --exclude=dist \
-  --exclude=rust/target \
-  --exclude='native/build*' \
-  -cf - . |
-  tar -C "$build_root/source" -xf -
+if [[ "$artifact_phase" != native ]]; then
+mkdir -p "$build_root/source"
+release_source_tar | tar -C "$build_root/source" -xf -
 
 python3 "$build_root/source/scripts/build/verify-sparkinfer-source.py" \
   --source "$build_root/source/third_party/sparkinfer" \
@@ -171,6 +241,7 @@ if [[ "$xgrammar" == ON ]]; then
   python3 "$build_root/source/scripts/build/verify-xgrammar-source.py" \
     --source "$build_root/source/third_party/xgrammar" \
     --lock "$build_root/source/third_party/xgrammar.lock.json"
+fi
 fi
 
 if [[ "${CUTEAFD_BUILD_CACHES:-on}" == off ]]; then
@@ -198,8 +269,18 @@ cuteafd_compiler_cache_setup "$build_root"
 cuteafd_compiler_cache_check_cmake_compilers "$build_root/native"
 mapfile -t compiler_cache_cmake_args < <(cuteafd_compiler_cache_cmake_args "$build_root/native")
 cargo_target_dir+="$( [[ "${CUTEAFD_KACHE_MODE:-disabled}" != enabled ]] || printf -- '-kache' )"
+# The native phase compiles no Rust: it reads the daemons from the target the
+# rust phase actually used, whatever compiler-cache mode this run fell back to.
+case "$artifact_phase" in
+  rust) printf '%s\n' "$cargo_target_dir" >"$artifact_state/rust.target" ;;
+  native)
+    [[ -s "$artifact_state/rust.target" ]] ||
+      { echo "release artifact state records no Rust target: $artifact_state" >&2; exit 2; }
+    cargo_target_dir="$(<"$artifact_state/rust.target")"
+    ;;
+esac
 export CARGO_TARGET_DIR="$cargo_target_dir"
-cuteafd_build_cache_cargo_offline "$build_root/source/rust/Cargo.toml"
+[[ "$artifact_phase" == native ]] || cuteafd_build_cache_cargo_offline "$build_root/source/rust/Cargo.toml"
 # Host CPU targets (scripts/build/host-isa.sh): GB10-tuned on the Spark leg; the
 # coordinator ships a portable x86-64-v2 base plus an x86-64-v4 variant. Each
 # daemon builds into its own target directory; the variants build side by side.
@@ -213,12 +294,23 @@ echo "Host ISA targets: ${host_isas[*]} (base ${host_isas[0]})"
 # CUTEAFD_RELEASE_RUST_LTO / _CODEGEN_UNITS opt in (e.g. thin / 1).
 [[ -z "${CUTEAFD_RELEASE_RUST_LTO:-}" ]] || export CARGO_PROFILE_RELEASE_LTO="$CUTEAFD_RELEASE_RUST_LTO"
 [[ -z "${CUTEAFD_RELEASE_RUST_CODEGEN_UNITS:-}" ]] || export CARGO_PROFILE_RELEASE_CODEGEN_UNITS="$CUTEAFD_RELEASE_RUST_CODEGEN_UNITS"
+if [[ "$artifact_phase" != native ]]; then
 host_isa_jobs=()
 for host_isa in "${host_isas[@]}"; do
   cuteafd_host_isa_cargo_build "$cargo_target_dir" "$host_isa" "$build_root/source/rust/Cargo.toml" &
   host_isa_jobs+=("$!")
 done
 for host_isa_job in "${host_isa_jobs[@]}"; do wait "$host_isa_job"; done
+fi
+if [[ "$artifact_phase" == rust ]]; then
+  release_phase_daemons >"$artifact_state/rust.done"
+  echo "rust phase complete: $artifact_state"
+  exit 0
+fi
+if [[ "$artifact_phase" == native ]]; then
+  release_phase_daemons | cmp -s - "$artifact_state/rust.done" ||
+    { echo "release daemons changed or are missing since the rust phase: $artifact_state" >&2; exit 2; }
+fi
 
 # Release images serve the native V4.1 path. The DS4 Flash/Pro AOT bridge is
 # retained for development commands, but must not add legacy generated kernels
@@ -231,6 +323,7 @@ cmake \
   -DCMAKE_BUILD_TYPE=Release \
   -DCUTEAFD_ENABLE_CUDA=ON \
   -DCUTEAFD_ENABLE_VISION_ATTENTION_AOT="${CUTEAFD_RELEASE_VISION_ATTENTION_AOT:-ON}" \
+  -DCUTEAFD_ENABLE_STEER_ROWS_AOT="${CUTEAFD_RELEASE_STEER_ROWS_AOT:-ON}" \
   -DCUTEAFD_ENABLE_AUDIO_AOT="$audio_aot" \
   -DCUTEAFD_ENABLE_V41_EXPERT_AOT=ON \
   -DCUTEAFD_SPARK_TP_ROLES="$spark_tp_roles" \
@@ -321,6 +414,7 @@ for release_family in "${release_family_list[@]}"; do
   case "$release_family" in
     *:fp8) release_package="fp8-${release_family%%:*}" ;;
     step5:bf16) release_package="fp8-step5-bf16-weights" ;;
+    step5:nvfp4) release_package="fp8-step5-nvfp4a4" ;;
     # ModelOpt NVFP4 calibrated W4A4 share the fp8_moe programs.
     *:nvfp4|*:nvfp4a4) release_package="fp8-${release_family%%:*}-${release_family#*:}" ;;
     *) continue ;;

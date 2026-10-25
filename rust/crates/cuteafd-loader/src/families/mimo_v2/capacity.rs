@@ -3,7 +3,7 @@
 //! CUDA module, graph, transport, expert and external-drafter reservations are
 //! supplied by the runtime, where their selected implementations are known.
 use super::resident::{MimoResidentLayout, MimoResidentOptions};
-use super::{MimoKvCache, MimoV2Config, MimoWorkspaceLayout, MimoWorkspaceOptions};
+use super::{MimoKvFormats, MimoV2Config, MimoWorkspaceLayout, MimoWorkspaceOptions};
 use crate::plan::checkpoint::Checkpoint;
 use crate::serving_capacity::{mimo_cache_geometry, CacheGeometryError};
 use cuteafd_core::serving_capacity::{
@@ -32,7 +32,7 @@ pub struct MimoCapacityOptions {
     pub max_context_tokens: u64,
     pub rings: u64,
     pub mark_slots: u64,
-    pub kv_cache: MimoKvCache,
+    pub kv_cache: MimoKvFormats,
     /// Logical rank order, independent of physical device id order.
     pub ranks: Vec<MimoRankRuntime>,
     pub host_prefix_bytes: u64,
@@ -299,7 +299,7 @@ mod tests {
             max_context_tokens: 32768,
             rings: 20,
             mark_slots: 42,
-            kv_cache: MimoKvCache::Int8,
+            kv_cache: MimoKvFormats::default(),
             host_prefix_bytes: 64 << 30,
             ranks: (0..ranks)
                 .map(|rank| MimoRankRuntime {
@@ -327,7 +327,7 @@ mod tests {
                                     expert_input: super::super::MimoExpertInput::Fp8,
                                     max_context: 32768,
                                     pool_pages: 0,
-                                    kv_cache: MimoKvCache::Int8,
+                                    kv_cache: MimoKvFormats::default(),
                                     attention: MimoAttentionWorkspace::Global,
                                     prefill_output: MimoPrefillOutput::AllRows,
                                     native_scratch_bytes: 16 << 20,
@@ -341,6 +341,17 @@ mod tests {
         }
     }
 
+    fn options_with_swa(ranks: usize, sliding: super::super::MimoKvCache) -> MimoCapacityOptions {
+        let mut options = options(ranks);
+        options.kv_cache.sliding = sliding;
+        for rank in &mut options.ranks {
+            for (_, workspace) in &mut rank.workspaces {
+                workspace.kv_cache = options.kv_cache;
+            }
+        }
+        options
+    }
+
     #[test]
     fn rank_mapping_keeps_lead_weights_and_partitions_only_kv_heads() {
         let dir = tempfile::tempdir().unwrap();
@@ -352,69 +363,72 @@ mod tests {
         );
         let checkpoint = Checkpoint::open(dir.path()).unwrap();
         let cfg = MimoV2Config::from_hf(&checkpoint.config).unwrap();
-        let options = options(2);
-        let phases = mimo_capacity_profiles(&checkpoint, &cfg, weights(2), &options).unwrap();
-        let profile = &phases.steady;
-        assert_eq!(
-            profile.devices.iter().map(|d| d.device).collect::<Vec<_>>(),
-            [1, 0]
-        );
-        assert_eq!(profile.pool_unit_rows, 64);
-        // The one full-attention layer has720B/row per rank. All65 page
-        // index rows (64decode+1prefill) are owned independently per rank.
-        assert_eq!(profile.devices[0].pool_unit_bytes, 64 * 720 + 65 * 4);
-        assert_eq!(
-            profile.devices[0].pool_unit_bytes,
-            profile.devices[1].pool_unit_bytes
-        );
-        assert!(profile.devices[0]
-            .reservations
-            .iter()
-            .any(|r| r.name == "lm_head.bf16"));
-        assert!(profile.devices[1]
-            .reservations
-            .iter()
-            .all(|r| r.name != "lm_head.bf16"));
-        assert_eq!(profile.host_prefix_bytes, 64 << 30);
-        let arena = |rank: usize| {
-            profile.devices[rank]
+        for (sliding, record) in [(super::super::MimoKvCache::Bf16, 5120),
+            (super::super::MimoKvCache::Int8, 2880), (super::super::MimoKvCache::Fp8, 2720)] {
+            let options = options_with_swa(2, sliding);
+            let phases = mimo_capacity_profiles(&checkpoint, &cfg, weights(2), &options).unwrap();
+            let profile = &phases.steady;
+            assert_eq!(
+                profile.devices.iter().map(|d| d.device).collect::<Vec<_>>(),
+                [1, 0]
+            );
+            assert_eq!(profile.pool_unit_rows, 64);
+            // The one full-attention layer has720B/row per rank. All65 page
+            // index rows (64decode+1prefill) are owned independently per rank.
+            assert_eq!(profile.devices[0].pool_unit_bytes, 64 * 720 + 65 * 4);
+            assert_eq!(
+                profile.devices[0].pool_unit_bytes,
+                profile.devices[1].pool_unit_bytes
+            );
+            assert!(profile.devices[0]
                 .reservations
                 .iter()
-                .find(|r| r.name == "prefix.exact_mark_arena")
-                .unwrap()
-                .bytes
-        };
-        assert_eq!(arena(0), 42 * 128 * 2560);
-        assert_eq!(arena(0), arena(1));
-        assert!(profile
-            .devices
-            .iter()
-            .all(|d| d.reservations.iter().all(|r| r.name != "loading.temporary")));
-        assert!(phases.loading.iter().all(|d| d.pool_unit_bytes == 0));
-        let loading_extra = phases.loading[0]
-            .reservations
-            .iter()
-            .find(|r| r.name == "loading.temporary")
-            .unwrap();
-        assert_eq!(loading_extra.bytes, 4096 * 8192 * 2);
-        for phase in &phases.post_target_kv {
-            assert_eq!(phase.pool_unit_bytes, 64 * 720);
-            assert!(phase
+                .any(|r| r.name == "lm_head.bf16"));
+            assert!(profile.devices[1]
                 .reservations
                 .iter()
-                .any(|cost| cost.name == "state.active_rings"));
-            assert!(phase
+                .all(|r| r.name != "lm_head.bf16"));
+            assert_eq!(profile.host_prefix_bytes, 64 << 30);
+            let arena = |rank: usize| {
+                profile.devices[rank]
+                    .reservations
+                    .iter()
+                    .find(|r| r.name == "prefix.exact_mark_arena")
+                    .unwrap()
+                    .bytes
+            };
+            assert_eq!(arena(0), 42 * 128 * record / 2);
+            assert_eq!(arena(0), arena(1));
+            assert!(profile
+                .devices
+                .iter()
+                .all(|d| d.reservations.iter().all(|r| r.name != "loading.temporary")));
+            assert!(phases.loading.iter().all(|d| d.pool_unit_bytes == 0));
+            let loading_extra = phases.loading[0]
                 .reservations
                 .iter()
-                .all(|cost| cost.name != "context.rope_tables"));
-            assert!(!phase
-                .reservations
-                .iter()
-                .any(|cost| cost.name.starts_with("prefix.")
-                    || cost.name.starts_with("prefill.")
-                    || cost.name.starts_with("decode.")
-                    || cost.name.starts_with("loading.")
-                    || cost.name == "native.modules"));
+                .find(|r| r.name == "loading.temporary")
+                .unwrap();
+            assert_eq!(loading_extra.bytes, 4096 * 8192 * 2);
+            for phase in &phases.post_target_kv {
+                assert_eq!(phase.pool_unit_bytes, 64 * 720);
+                assert!(phase
+                    .reservations
+                    .iter()
+                    .any(|cost| cost.name == "state.active_rings"));
+                assert!(phase
+                    .reservations
+                    .iter()
+                    .all(|cost| cost.name != "context.rope_tables"));
+                assert!(!phase
+                    .reservations
+                    .iter()
+                    .any(|cost| cost.name.starts_with("prefix.")
+                        || cost.name.starts_with("prefill.")
+                        || cost.name.starts_with("decode.")
+                        || cost.name.starts_with("loading.")
+                        || cost.name == "native.modules"));
+            }
         }
     }
 
@@ -584,44 +598,47 @@ mod tests {
         write_snapshot(dir.path(), &mimo_flash_config(), &tensors, Some(1));
         let checkpoint = Checkpoint::open(dir.path()).unwrap();
         let cfg = MimoV2Config::from_hf(&checkpoint.config).unwrap();
-        let profiles = mimo_capacity_profiles(
-            &checkpoint,
-            &cfg,
-            MimoResidentOptions {
-                native_mtp_layers: 1,
-                output_formats: weights(2)
-                    .output_formats
-                    .into_iter()
-                    .chain(std::iter::once((
-                        "model.mtp.layers.0.self_attn.o_proj.weight".into(),
-                        super::super::projection::MimoProjectionRepresentation::Bf16,
-                    )))
-                    .collect(),
-                ..weights(2)
-            },
-            &options(2),
-        )
-        .unwrap();
-        let name = "loading.mtp_state_before_target_kv";
-        let state = profiles.loading[0]
-            .reservations
-            .iter()
-            .find(|r| r.name == name)
+        for (sliding, record) in [(super::super::MimoKvCache::Bf16, 5120),
+            (super::super::MimoKvCache::Int8, 2880), (super::super::MimoKvCache::Fp8, 2720)] {
+            let profiles = mimo_capacity_profiles(
+                &checkpoint,
+                &cfg,
+                MimoResidentOptions {
+                    native_mtp_layers: 1,
+                    output_formats: weights(2)
+                        .output_formats
+                        .into_iter()
+                        .chain(std::iter::once((
+                            "model.mtp.layers.0.self_attn.o_proj.weight".into(),
+                            super::super::projection::MimoProjectionRepresentation::Bf16,
+                        )))
+                        .collect(),
+                    ..weights(2)
+                },
+                &options_with_swa(2, sliding),
+            )
             .unwrap();
-        // One unsplit SWA stage, a 256-row hidden history, and the five
-        // fixed hidden buffers plus stage ids/index. All are lead-only.
-        assert_eq!(
-            state.bytes,
-            20 * (256 * 5120 + 256 * 4096 * 2) + 12 * 64 * 4096 + 2 * 64 * 4 + 256
-        );
-        assert!(profiles.loading[1]
-            .reservations
-            .iter()
-            .all(|r| r.name != name));
-        assert!(profiles
-            .steady
-            .devices
-            .iter()
-            .all(|d| d.reservations.iter().all(|r| r.name != name)));
+            let name = "loading.mtp_state_before_target_kv";
+            let state = profiles.loading[0]
+                .reservations
+                .iter()
+                .find(|r| r.name == name)
+                .unwrap();
+            // One unsplit SWA stage, a 256-row hidden history, and the five
+            // fixed hidden buffers plus stage ids/index. All are lead-only.
+            assert_eq!(
+                state.bytes,
+                20 * (256 * record + 256 * 4096 * 2) + 12 * 64 * 4096 + 2 * 64 * 4 + 256
+            );
+            assert!(profiles.loading[1]
+                .reservations
+                .iter()
+                .all(|r| r.name != name));
+            assert!(profiles
+                .steady
+                .devices
+                .iter()
+                .all(|d| d.reservations.iter().all(|r| r.name != name)));
+        }
     }
 }

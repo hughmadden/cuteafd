@@ -1,5 +1,11 @@
 #!/usr/bin/env python3
-"""Select a checkout-matched published toolchain, or build it on this host."""
+"""Select a checkout-matched published toolchain, or build it on this host.
+
+--mode local admits only the configured local tag: an image already on this host
+with the checkout's architecture, toolchain hash, base digest, immutable ID and
+Dockerfile.dev entrypoint. It never looks up a registry, pulls or builds, and any
+mismatch fails with the tag named.
+"""
 from __future__ import annotations
 
 import argparse
@@ -15,6 +21,7 @@ _toolchain = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_toolchain)
 REGISTRY = 'ghcr.io/tpurtell/cuteafd-dev'
 SHA256 = re.compile(r'sha256:[0-9a-f]{64}')
+ENTRYPOINT = ['/usr/local/bin/cuteafd-entrypoint']  # docker/Dockerfile.dev
 
 
 class ImageError(RuntimeError):
@@ -56,9 +63,25 @@ def write_manifest(path, manifest):
     path.write_text(json.dumps(manifest, indent=2) + '\n')
 
 
+def select_local(local_tag, arch, toolchain_hash, base, output):
+    try:
+        obj = inspect(local_tag)
+        verify(obj, arch, toolchain_hash, base)
+        if (obj.get('Config') or {}).get('Entrypoint') != ENTRYPOINT:
+            raise ImageError(f'entrypoint is not {ENTRYPOINT[0]}')
+    except ImageError as error:
+        raise ImageError(f'CUTEAFD_RELEASE_DEV_IMAGE_SOURCE=local: {local_tag} on {arch}: {error}') from error
+    write_manifest(output, dict(schema='cuteafd.release-dev-image-reuse/2', source='local', architecture=arch,
+                                image_id=obj['Id'], requested_ref=local_tag, registry_reference=None,
+                                registry_digest=None, toolchain_hash=toolchain_hash, base_digest=base))
+    return obj['Id']
+
+
 def select(source, arch, local_tag, engine_commit, output, mode='registry'):
     toolchain_hash = _toolchain.identity(source)
     base = _toolchain.BASE + _toolchain.BASE_DIGESTS[arch]
+    if mode == 'local':
+        return select_local(local_tag, arch, toolchain_hash, base, output)
     reference = f'{REGISTRY}:tc-{toolchain_hash}-{arch}'
     obj = None
     pulled_digest = None
@@ -108,6 +131,8 @@ def labels(manifest):
     values = {'io.cuteafd.dev-image.reused': manifest['image_id'],
               'io.cuteafd.dev-image.source': manifest['source'],
               'io.cuteafd.dev-image.toolchain.hash': manifest['toolchain_hash']}
+    if manifest.get('requested_ref'):
+        values['io.cuteafd.dev-image.local.reference'] = manifest['requested_ref']
     if manifest.get('registry_reference'):
         values['io.cuteafd.dev-image.registry.reference'] = manifest['registry_reference']
         values['io.cuteafd.dev-image.registry.digest'] = manifest['registry_digest']
@@ -125,7 +150,7 @@ def main():
     selection.add_argument('--local-tag', required=True)
     selection.add_argument('--engine-commit', required=True)
     selection.add_argument('--output', type=Path, required=True)
-    selection.add_argument('--mode', choices=('registry', 'build'), default='registry')
+    selection.add_argument('--mode', choices=('registry', 'build', 'local'), default='registry')
     for command in ('labels', 'image', 'record-override'):
         child = sub.add_parser(command)
         child.add_argument('--manifest', type=Path, required=True)

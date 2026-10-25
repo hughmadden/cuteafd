@@ -289,3 +289,10 @@ mod tests {
         Ok(())
     }
 }
+
+#[cfg(test)]
+impl IndexLaneWeights<'_> {
+    pub(crate) fn visit(&self, f: &mut dyn FnMut(String, cuteafd_ffi::CuteafdDeviceBuffer)) {
+        for (i, w) in self.weights.iter().enumerate() { w.visit(&format!("gpu{}.index{i}.", w.device.id), f); }
+    }
+}

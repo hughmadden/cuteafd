@@ -211,13 +211,19 @@ pub(crate) fn worker_group_rows_for_input(reports: &[cuteafd_transport::worker_s
     Ok(group)
 }
 
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+#[error("installed worker read-byte report missing layer {layer}")]
+pub(crate) struct MissingWorkerReadBytes {
+    pub layer: usize,
+}
+
 /// Price the busiest actual installed worker slice, which may differ by rank.
 pub(crate) fn worker_weight_read_bytes(reports: &[cuteafd_transport::worker_selection::InstalledExpertGrouping],
     layer: usize) -> Result<usize> {
     let bytes = reports.iter().filter(|report| report.layers().iter()
         .any(|range| (range.first as usize..range.end as usize).contains(&layer)))
-        .map(|report| report.weight_read_bytes()).collect::<Result<Vec<_>>>()?;
-    bytes.into_iter().max().with_context(|| format!("installed worker read-byte report missing layer {layer}"))
+        .map(|report| report.weight_read_bytes()).collect::<std::result::Result<Vec<_>, _>>()?;
+    bytes.into_iter().max().ok_or_else(|| MissingWorkerReadBytes { layer }.into())
 }
 
 /// Per-device bytes of one expert of `layer` from an EXL3 manifest at `tp`
@@ -674,7 +680,7 @@ mod tests {
             InstalledExpertVariant, WorkerIdentity, WorkerSelection};
         let identity: WorkerIdentity = serde_json::from_value(serde_json::json!({
             "checkpoint": "0".repeat(64), "geometry": [4096, 288, 8, 2048, 45],
-            "world": 2, "topology": [2, 1], "ownership_wire": false, "placement": "round-robin",
+            "world": 2, "topology": [2, 1], "ownership_wire": false,
         })).unwrap();
         let loaded = WorkerSelection::new(identity, &[3, 4]).unwrap();
         let reports: Vec<_> = (0..2).map(|rank| InstalledExpertGrouping::new(loaded.clone(), rank, 256,
@@ -707,7 +713,7 @@ mod tests {
             InstalledExpertGrouping, InstalledExpertVariant, WorkerIdentity, WorkerSelection};
         let identity: WorkerIdentity = serde_json::from_value(serde_json::json!({
             "checkpoint": "0".repeat(64), "geometry": [4096, 288, 8, 2048, 45],
-            "world": 2, "topology": [2, 1], "ownership_wire": false, "placement": "round-robin",
+            "world": 2, "topology": [2, 1], "ownership_wire": false,
         })).unwrap();
         let loaded = WorkerSelection::new(identity, &[3]).unwrap();
         let report = |rank, bf16_group| {
@@ -740,7 +746,7 @@ mod tests {
             InstalledExpertGrouping, InstalledExpertVariant, WorkerIdentity, WorkerSelection};
         let identity: WorkerIdentity = serde_json::from_value(serde_json::json!({
             "checkpoint": "0".repeat(64), "geometry": [4096, 288, 8, 2048, 45],
-            "world": 6, "topology": [6, 1], "ownership_wire": false, "placement": "round-robin",
+            "world": 6, "topology": [6, 1], "ownership_wire": false,
         })).unwrap();
         let report = |rank, layers: &[usize], bytes| {
             let loaded = WorkerSelection::new(identity.clone(), layers).unwrap();

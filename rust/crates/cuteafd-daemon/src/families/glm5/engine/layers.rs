@@ -15,7 +15,8 @@ pub(super) struct Execution<'a> {
 
 enum Transport<'t, 'l> {
     Serial(Option<(&'t mut SparkLink<'l>, &'t tokio::runtime::Runtime)>),
-    Lane(&'t mut SparkLane<'l>),
+    /// Prefill units sharing the one prefill link, borrowed per send/land.
+    Shared(&'t std::cell::RefCell<&'t mut SparkLink<'l>>, &'t tokio::runtime::Runtime),
 }
 
 struct Bindings<'e, 'a, 't, 'l, 'c> {
@@ -100,7 +101,7 @@ impl<'a> GlmEngine<'a> {
         let owners = self.loaded_attention_owners();
         let mut bindings = [Bindings { engine: self, work: [w, w1], tables, lane: 0,
             transport: Transport::Serial(experts.as_mut().map(|(link, runtime)| (&mut **link, *runtime))),
-            owners, on_layer, tap: (rows.saturating_sub(super::super::dflash::TAP_ROWS), rows.min(super::super::dflash::TAP_ROWS), 0) }];
+            owners, on_layer, tap: (rows.saturating_sub(crate::shared::speculation::dflash::TAP_ROWS), rows.min(crate::shared::speculation::dflash::TAP_ROWS), 0) }];
         self.run_layer_pipeline(scope, LaneOrder::Independent, &mut bindings)?;
         if let Some(pair) = &self.tp2 { pair.finish_checks()?; }
         if self.weights.layers.len() < self.cfg.layers { return Ok(None); }
@@ -114,20 +115,24 @@ impl<'a> GlmEngine<'a> {
         Ok(Some(self.device_logits(w, wanted, tables[0].decode && rows == wanted)))
     }
 
+    /// Owned-attention prefill units on the one prefill link. The shared layer
+    /// pipeline's ordered chunks land each wave before the next is sent, so
+    /// the units share the link (its return slots rotate) with one in flight.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn layer_prefill(&self, scope: &SubmissionScope<'_>, work: &[&Workspace<'a>],
-        peers: &PeerWorkspaces<'_, 'a>, tables: &[[StepTables; 2]], wanted: usize) -> Result<Option<StepLogits>> {
-        let mut transports = self.lanes.borrow_mut();
-        ensure!(transports.len() >= tables.len(), "GLM per-layer lane transport inventory");
+        peers: &PeerWorkspaces<'_, 'a>, tables: &[[StepTables; 2]], wanted: usize,
+        link: &mut SparkLink<'_>, runtime: &tokio::runtime::Runtime) -> Result<Option<StepLogits>> {
         let total = tables.iter().map(|t| t[0].positions.len()).sum::<usize>();
         let mut first = 0;
         let mut bindings = Vec::new();
-        for (lane, ((table, w), transport)) in tables.iter().zip(work).zip(transports.iter_mut()).enumerate() {
+        let link = std::cell::RefCell::new(link);
+        for (lane, (table, w)) in tables.iter().zip(work).enumerate() {
             let rows = table[0].positions.len();
-            let start = total.saturating_sub(super::super::dflash::TAP_ROWS).max(first).min(first + rows);
+            let start = total.saturating_sub(crate::shared::speculation::dflash::TAP_ROWS).max(first).min(first + rows);
             let owners = self.loaded_attention_owners();
             bindings.push(Bindings { engine: self, work: [w, peers.get(lane)?], tables: table, lane,
-                transport: Transport::Lane(transport), owners, on_layer: None,
-                tap: (start - first, first + rows - start, start.saturating_sub(total.saturating_sub(super::super::dflash::TAP_ROWS))) });
+                transport: Transport::Shared(&link, runtime), owners, on_layer: None,
+                tap: (start - first, first + rows - start, start.saturating_sub(total.saturating_sub(crate::shared::speculation::dflash::TAP_ROWS))) });
             first += rows;
         }
         self.run_layer_pipeline(scope, LaneOrder::OrderedChunks, &mut bindings)?;
@@ -240,6 +245,7 @@ impl PipelineKernels for Bindings<'_, '_, '_, '_, '_> {
         let rows = Scalar::I32(self.rows() as i32);
         if !layer.dense && e.tp2_layer(index) {
             e.moe_front(w, layer, self.rows())?;
+            e.ring_local_routes(index, w, self.rows())?;
             e.ffn(w, layer, e.cfg.moe_intermediate, self.cap(), w.shared.buffer.ptr, rows)?;
             e.moe_front_on(1, w1, self.layer(1, index), self.rows())?;
             e.ffn_on(1, w1, self.layer(1, index), e.cfg.moe_intermediate, self.cap(), w1.shared.buffer.ptr, rows)?;
@@ -273,7 +279,13 @@ impl PipelineKernels for Bindings<'_, '_, '_, '_, '_> {
                 execution.waves.borrow_mut()[self.lane] = Some(e.moe_send(w, index, real, decode, link)?);
                 Ok(Ticket::Spark)
             },
-            Transport::Lane(lane) => { e.lane_send(w, index, real, lane)?; Ok(Ticket::Lane) }
+            Transport::Shared(link, _) => {
+                let execution = e.layer_execution.as_ref().context("layer execution")?;
+                ensure!(execution.waves.borrow()[self.lane].is_none(), "previous Spark wave is still live");
+                let wave = e.moe_send(w, index, real, decode, &mut link.borrow_mut())?;
+                execution.waves.borrow_mut()[self.lane] = Some(wave);
+                Ok(Ticket::Lane)
+            }
             _ => anyhow::bail!("GLM MoE layer {index} needs Spark peers"),
         }
     }
@@ -287,17 +299,28 @@ impl PipelineKernels for Bindings<'_, '_, '_, '_, '_> {
                 Transport::Serial(Some((link, runtime))) => {
                     let wave = e.layer_execution.as_ref().context("layer execution")?.waves.borrow_mut()[self.lane]
                         .take().context("missing dispatched Spark wave")?;
-                    Some((link.intake.pointers(), runtime.block_on(e.moe_land(real, link, wave))?))
+                    let ranks = runtime.block_on(e.moe_land(real, link, wave))?;
+                    e.reduce(link.intake.pointers(), w, ranks, real, index)?;
+                    link.intake.consumed(e.stream)?;
+                    None
                 },
                 _ => anyhow::bail!("Spark completion transport changed"),
             },
             Ticket::Lane => match &mut self.transport {
-                Transport::Lane(lane) => Some((lane.intake.pointers(), e.lane_land(real, lane)?)),
+                Transport::Shared(link, runtime) => {
+                    let wave = e.layer_execution.as_ref().context("layer execution")?.waves.borrow_mut()[self.lane]
+                        .take().context("missing dispatched Spark wave")?;
+                    let mut link = link.borrow_mut();
+                    let ranks = runtime.block_on(e.moe_land(real, &mut link, wave))?;
+                    e.reduce(link.intake.pointers(), w, ranks, real, index)?;
+                    link.intake.consumed(e.stream)?;
+                    None
+                }
                 _ => anyhow::bail!("lane completion transport changed"),
             },
             Ticket::Complete => None,
         };
-        if let Some((planes, ranks)) = planes { e.reduce(planes, w, ranks, real)?; }
+        if let Some((planes, ranks)) = planes { e.reduce(planes, w, ranks, real, index)?; }
         if !e.tp2_layer(index) {
             let bytes = self.rows() * e.cfg.hidden * 2;
             for rank in 0..2 {

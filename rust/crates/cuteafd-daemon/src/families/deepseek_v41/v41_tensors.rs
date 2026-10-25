@@ -8,6 +8,39 @@ use std::collections::{BTreeMap, BTreeSet};
 mod vocabulary_shard;
 pub(crate) use vocabulary_shard::VocabularyShard;
 
+/// Checkpoint tensor `name` (an unsharded coordinator tensor) as one
+/// rectangle: its rows (`rows` of them, or all), each whole.
+pub(crate) fn rect(catalog: &OfficialV41Catalog, name: &str, rows: Option<std::ops::Range<usize>>)
+    -> Result<crate::shared::experts::rtx::dense::Rect> {
+    let tensor = catalog.tensor(name)?;
+    ensure!(matches!(tensor.placement, cuteafd_loader::V41TensorPlacement::CoordinatorRtx),
+        "{name}: only unsharded RTX tensors land on the coordinator");
+    let total = tensor.metadata.shape.first().copied().filter(|_| tensor.metadata.shape.len() >= 2).unwrap_or(1);
+    let bytes = usize::try_from(tensor.metadata.byte_length)?;
+    ensure!(total > 0 && bytes % total == 0, "{name}: rows do not divide the tensor");
+    let rows = rows.unwrap_or(0..total);
+    ensure!(rows.end <= total && !rows.is_empty(), "{name}: rows outside the tensor");
+    Ok(crate::shared::experts::rtx::dense::Rect { name: name.into(), path: catalog.snapshot().join(&tensor.shard),
+        base: tensor.metadata.byte_offset, row_bytes: bytes / total, rows, cols: 0..bytes / total })
+}
+
+/// Row (`axis` 0) or column (`axis` 1) half `rank` of an unsharded
+/// coordinator matrix, as one rectangle.
+pub(crate) fn half(catalog: &OfficialV41Catalog, name: &str, axis: usize, rank: usize)
+    -> Result<crate::shared::experts::rtx::dense::Rect> {
+    let tensor = catalog.tensor(name)?;
+    let shape = &tensor.metadata.shape;
+    ensure!(shape.len() == 2 && axis < 2 && rank < 2 && shape[axis] % 2 == 0, "{name}: no TP2 half on axis {axis}");
+    let whole = rect(catalog, name, None)?;
+    Ok(if axis == 0 {
+        let half = shape[0] / 2;
+        whole.sub(rank * half..(rank + 1) * half)
+    } else {
+        let width = whole.row_bytes / 2;
+        crate::shared::experts::rtx::dense::Rect { cols: rank * width..(rank + 1) * width, ..whole }
+    })
+}
+
 pub(crate) struct NativeRtxTensors<'a> {
     tensors: BTreeMap<String, DeviceAllocation<'a>>,
     resident_bytes: usize,
@@ -66,23 +99,15 @@ impl<'a> NativeRtxTensors<'a> {
             staging_bytes > 0 && staging_bytes <= 64 * 1024 * 1024,
             "RTX pinned staging must be 1 byte through 64 MiB"
         );
-        let mut staging = HostAllocation::new(library, staging_bytes)?;
+        let _ = staging_bytes;
+        let dense = crate::shared::experts::rtx::dense::DenseLoad::mount(library);
+        let device = library.cuda_get_device()?;
         let mut tensors = BTreeMap::new();
         for name in names {
-            let reader = catalog.coordinator_tensor_reader(name)?;
-            let bytes = usize::try_from(reader.bytes())?;
+            let bytes = usize::try_from(catalog.device_tensor_bytes(name, None)?)?;
             let allocation = DeviceAllocation::new(library, bytes)?;
-            let mut offset = 0;
-            while offset < bytes {
-                let count = staging_bytes.min(bytes - offset);
-                let source = &mut staging.bytes_mut()[..count];
-                reader.read_into(offset as u64, source)?;
-                let mut destination = allocation.buffer;
-                destination.ptr = unsafe { destination.ptr.cast::<u8>().add(offset).cast() };
-                destination.bytes = count;
-                library.copy_h2d(destination, source)?;
-                offset += count;
-            }
+            dense.operand(crate::shared::experts::rtx::dense::Operand { device, buffer: allocation.buffer,
+                lands: vec![(rect(catalog, name, None)?, 0)], bytes })?;
             tensors.insert(name.clone(), allocation);
         }
         Ok(Self {
@@ -217,4 +242,20 @@ impl<'library> VocabularyHead<'library> {
     pub fn weight(&self) -> Option<CuteafdDeviceBuffer> { self.shard.weight() }
     pub fn device_id(&self) -> i32 { self.shard.device_id() }
     pub fn fp8(&self) -> Option<&crate::shared::fp8_linear::Fp8Weight<'library>> { self.shard.fp8() }
+}
+
+#[cfg(test)]
+impl NativeRtxTensors<'_> {
+    /// Every resident tensor (golden digests).
+    pub(crate) fn visit(&self, prefix: &str, f: &mut dyn FnMut(String, cuteafd_ffi::CuteafdDeviceBuffer)) {
+        for (name, allocation) in &self.tensors { f(format!("{prefix}{name}"), allocation.buffer); }
+        if let Some((_, alias)) = &self.mapped_embedding { f(format!("{prefix}embed.weight"), *alias); }
+    }
+}
+
+#[cfg(test)]
+impl VocabularyHead<'_> {
+    pub(crate) fn visit(&self, prefix: &str, f: &mut dyn FnMut(String, cuteafd_ffi::CuteafdDeviceBuffer)) {
+        self.shard.visit(prefix, f);
+    }
 }

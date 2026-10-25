@@ -60,11 +60,13 @@ fn families() -> Vec<Family> {
 
 /// One scripted engine: records each job's prompt and answers with `reply`.
 #[derive(Clone, Default)]
-struct Worker { prompts: Arc<Mutex<Vec<String>>>, closed: Arc<Mutex<Vec<bool>>> }
+struct Worker { prompts: Arc<Mutex<Vec<String>>>, closed: Arc<Mutex<Vec<bool>>>, variants: Arc<Mutex<Vec<u8>>> }
 
 fn serve(mut profile: ModelProfile, snapshot: Option<std::path::PathBuf>, replies: Vec<&'static str>, hold: bool)
     -> (axum::Router, Worker) {
-    profile.gateway = Some(Arc::new(GatewayMount { models: crate::gateway::ModelMap::official_names(profile.id.clone()),
+    let mut models = profile.gateway.as_ref().map_or_else(|| crate::gateway::ModelMap::official_names(profile.id.clone()), |m| m.models.clone());
+    models.set_variants(&profile.variants);
+    profile.gateway = Some(Arc::new(GatewayMount { models,
         snapshot, options: EngineOptions::default(), search: None, gate: None, origins: Default::default() }));
     let (tx, mut rx) = mpsc::channel::<NativeRequest>(4);
     let worker = Worker::default();
@@ -73,6 +75,7 @@ fn serve(mut profile: ModelProfile, snapshot: Option<std::path::PathBuf>, replie
         let mut replies = replies.into_iter();
         while let Some(job) = rx.recv().await {
             seen.prompts.lock().unwrap().push(job.prompt.clone());
+            seen.variants.lock().unwrap().push(job.variant);
             let reply = replies.next().unwrap_or("ok");
             let _ = job.events.send(Ok(InferenceChunk::Ready { system_fingerprint: None,
                 prompt_usage: PromptUsage { prompt_tokens: 11, prompt_cache_hit_tokens: 3 } }));
@@ -150,6 +153,81 @@ fn conversation(model: &str, thinking: bool, tools: bool, image: bool) -> Conver
         responses["tools"] = json!([{"type":"function","name":"read_file","description":"Read a file.","parameters":schema}]);
     }
     Conversation { chat, messages, responses }
+}
+
+
+#[tokio::test]
+async fn unavailable_variant_ids_reject_every_protocol_and_native_build_without_queueing() {
+    use cuteafd_core::variants::{VariantRecord, VariantSpec};
+    let mut profile = ModelProfile::new("test-glm", ModelEncoding::Glm(Arc::new(glm5::fixtures::encoding())));
+    let spec: VariantSpec = "name=bad,source=/bad,id=test-glm-bad".parse().unwrap();
+    profile.variants = vec![VariantRecord::unavailable(1, &spec, "test-glm", "missing base tensor L3", json!({"mode":"shared-only"}))];
+    // Native build has no gateway catch-all at all, but must preserve the typed
+    // failure for a reserved id rather than treating it as an unknown model.
+    let c = conversation("test-glm-bad", false, false, false);
+    let error = crate::openai::build(&profile, NativeLimits::default(), &axum::http::HeaderMap::new(), c.chat.clone()).err().expect("unavailable model rejected");
+    assert_eq!(error.status, StatusCode::SERVICE_UNAVAILABLE);
+    let response = error.into_response();
+    let bytes = axum::body::to_bytes(response.into_body(), 1 << 20).await.unwrap();
+    assert_eq!(serde_json::from_slice::<Value>(&bytes).unwrap()["error"]["code"], "model_unavailable");
+    let mut models = crate::gateway::ModelMap::official_names(profile.id.clone());
+    models.aliases = vec![("bad-alias".into(),"test-glm-bad".into()), ("test-glm-*".into(),"test-glm".into())];
+    models.listed.push("test-glm-bad".into());
+    profile.gateway = Some(Arc::new(GatewayMount { models, snapshot:None,options:EngineOptions::default(),search:None,gate:None,origins:Default::default() }));
+    let (app, worker) = serve(profile, None, vec![], false);
+    for model in ["test-glm-bad", "bad-alias"] {
+        let mut c = conversation(model, false, false, false);
+        c.messages["model"] = json!(model);
+        c.responses["model"] = json!(model);
+        for (path, body) in [("/v1/chat/completions",c.chat),("/v1/messages",c.messages),("/v1/responses",c.responses)] {
+            let (status,text) = post(&app,path,body).await;
+            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{model} {path}: {text}");
+            assert!(text.contains("model_unavailable"), "{path}: {text}");
+            assert!(text.contains("missing base tensor L3"), "{path}: {text}");
+        }
+    }
+    assert!(worker.variants.lock().unwrap().is_empty(), "rejected ids never reach the engine");
+    let response = app.clone().oneshot(axum::http::Request::get("/v1/models").body(Body::empty()).unwrap()).await.unwrap();
+    let bytes = axum::body::to_bytes(response.into_body(), 1 << 20).await.unwrap();
+    let listing: Value = serde_json::from_slice(&bytes).unwrap();
+    assert!(!listing["data"].as_array().unwrap().iter().any(|m| m["id"] == "test-glm-bad"));
+    let (status,text) = post(&app,"/v1/chat/completions",conversation("claude-sonnet-5",false,false,false).chat).await;
+    assert_eq!(status,StatusCode::OK,"{text}");
+    assert_eq!(*worker.variants.lock().unwrap(), [0]);
+}
+
+#[tokio::test]
+async fn variant_model_ids_select_the_variant_on_every_protocol() {
+    let mut profile = ModelProfile::new("test-glm", ModelEncoding::Glm(Arc::new(glm5::fixtures::encoding())));
+    profile.variants = vec![cuteafd_core::variants::VariantRecord { index: 1, name: "alternate".into(),
+        public_id: "test-glm-alternate".into(), base: "test-glm".into(), sites: 96, k_max: 1, availability: cuteafd_core::variants::VariantAvailability::Ready, verify: json!({}) }];
+    let mut models = crate::gateway::ModelMap::official_names(profile.id.clone());
+    models.aliases = vec![("ready-alias".into(),"test-glm-alternate".into()),
+        ("test-glm-*".into(),"test-glm".into())];
+    profile.gateway = Some(Arc::new(GatewayMount { models,snapshot:None,options:EngineOptions::default(),search:None,gate:None,origins:Default::default() }));
+    let (app, worker) = serve(profile, None, vec![], false);
+    let mut expected = Vec::new();
+    for (model, variant) in [("test-glm", 0u8), ("test-glm-alternate", 1), ("ready-alias",1), ("claude-sonnet-5", 0)] {
+        let mut c = conversation(model, false, false, false);
+        c.messages["model"] = json!(model);
+        c.responses["model"] = json!(model);
+        for (path, body) in [("/v1/chat/completions", &c.chat), ("/v1/messages", &c.messages), ("/v1/responses", &c.responses)] {
+            let (status, text) = post(&app, path, body.clone()).await;
+            assert_eq!(status, StatusCode::OK, "{model} {path}: {text}");
+            expected.push(variant);
+        }
+    }
+    assert_eq!(*worker.variants.lock().unwrap(), expected);
+    let listing = axum::http::Request::get("/v1/models").body(Body::empty()).unwrap();
+    let response = app.clone().oneshot(listing).await.unwrap();
+    let bytes = axum::body::to_bytes(response.into_body(), 1 << 24).await.unwrap();
+    let models: Value = serde_json::from_slice(&bytes).unwrap();
+    let ids: Vec<&str> = models["data"].as_array().unwrap().iter().filter_map(|m| m["id"].as_str()).collect();
+    assert!(ids.contains(&"test-glm-alternate"), "{ids:?}");
+    let record = models["data"].as_array().unwrap().iter().find(|m| m["id"] == "test-glm-alternate").unwrap();
+    assert_eq!(record["variant"]["name"], "alternate");
+    assert_eq!(record["variant"]["base"], "test-glm");
+    assert!(models["data"][0].get("variant").is_none());
 }
 
 #[tokio::test]
@@ -692,6 +770,16 @@ async fn chat_accepts_listed_aliases_only_with_the_gateway_mounted() {
         std::time::Duration::from_secs(1), ConsoleHub::disabled(), strict);
     let (status, text) = post(&strict, "/v1/chat/completions", body("claude-sonnet-5")).await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "official names off: {text}");
+    assert_eq!(serde_json::from_str::<Value>(&text).unwrap()["error"]["message"], "model must be test-qwen");
+    // The gateway protocols retain their own unknown-model contract.
+    for (path, body) in [
+        ("/v1/messages", json!({"model":"claude-sonnet-5","max_tokens":8,"messages":[{"role":"user","content":"hi"}]})),
+        ("/v1/responses", json!({"model":"claude-sonnet-5","input":"hi"})),
+    ] {
+        let (status, text) = post(&strict, path, body).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{path}: {text}");
+        assert_eq!(serde_json::from_str::<Value>(&text).unwrap()["error"]["type"], "not_found_error", "{path}: {text}");
+    }
     let (status, _) = post(&strict, "/v1/chat/completions", body("")).await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "an empty model id stays refused");
 }

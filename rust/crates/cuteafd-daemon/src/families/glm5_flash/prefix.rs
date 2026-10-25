@@ -946,7 +946,7 @@ mod tests {
         assert_eq!(page.iter().map(|r| r.bytes).sum::<usize>(), unit);
         let marks = (0..2).map(|gpu| DeviceRange { addr: (gpu * gpu_bytes + unit * 2) as u64, bytes: 17 })
             .collect::<Vec<_>>();
-        let layout = Layout { page: unit, tail: 34, draft: 0, scores: 0 };
+        let layout = Layout { page: unit, tail: 34, draft: 0, scores: 0 , draft_page: 0};
         let config = Config { bytes: 1 << 26, chunk_bytes: 1 << 22, min_tokens: 1, ..Default::default() };
         for (src, dst) in &replicas {
             memory.write_device(*src, &vec![5; src.bytes]);
@@ -956,7 +956,7 @@ mod tests {
         let mut host = HostCache::with_rule(config, layout, memory, ReuseRule::EXACT,
             cuteafd_hostcache::snapshot::EvictionOrder::LeastRecent).unwrap();
         for (kind, tokens) in [(SnapshotKind::Prompt, vec![1, 2]), (SnapshotKind::Turn, vec![1, 2, 3])] {
-            let mut pages: [Vec<DevicePage>; cuteafd_hostcache::COMPRESSORS] = Default::default();
+            let mut pages: [Vec<DevicePage>; cuteafd_hostcache::PAGE_BANKS] = Default::default();
             pages[0].push(DevicePage { id: DevicePageId { compressor: 0, page: 1, generation: 1 }, segments: page.clone() });
             let snapshot = DeviceSnapshot { meta: SnapshotMeta { kind, end: tokens.len() as u32, tokens: tokens.clone(),
                 has_draft: false }, pages: pages.clone(), tail: marks.clone(), draft: None, scores: vec![] };
@@ -1062,8 +1062,20 @@ mod tests {
                 let planned = super::ArenaMarks::Rule(prefix.mark_rule(lanes)).slots_on(&cfg, cfg.layers, index, state)
                     .unwrap();
                 let allocated = cuteafd_engine::prefix::MarkArena::slots_for(lanes, prefix.prefix_cache_entries, mark,
-                    prefix.prefix_cache_mark_mib << 20);
+                    prefix.prefix_cache_mark_mib << 20, prefix.host_cache_bytes.enabled());
                 assert_eq!((planned, allocated), (slots, slots), "{lanes} lanes, {index:?}, {state:?}");
+            }
+        }
+        let hosted = Cli::parse_from(["serve", "--host-cache-bytes", "auto"]).prefix;
+        for lanes in [1, 16, 64] {
+            for (index, state) in [(IndexCache::Keys, KdaState::F32), (IndexCache::Compact, KdaState::Bf16)] {
+                let bytes = glm_flash_rank_cache_geometry(&cfg, cfg.layers, 1, index.into(), state.bytes() as u64)
+                    .unwrap().ranks[0].retained_mark_bytes;
+                let planned = super::ArenaMarks::Rule(hosted.mark_rule(lanes))
+                    .slots_on(&cfg, cfg.layers, index, state).unwrap();
+                assert_eq!(planned as u64, cuteafd_core::prefix::mark_slots_with_host(lanes as u64,
+                    hosted.prefix_cache_entries as u64, bytes, (hosted.prefix_cache_mark_mib as u64) << 20, true));
+                assert_eq!(planned, 2);
             }
         }
         // What either admission now reserves is the arena the ledger measured as `prefix`: FP32 at 8

@@ -103,6 +103,18 @@ impl<'a> Fp8Weight<'a> {
         Ok(Self { packed, scale, n, k })
     }
 
+    /// Unfilled storage for an `[n, k]` copy (filled by W8A16 pack jobs).
+    pub fn allocate(library: &'a NativeLibrary, n: usize, k: usize) -> Result<Self> {
+        ensure!(n % 16 == 0 && k % 128 == 0, "FP8 copy of [{n}, {k}]: needs n % 16 == 0 and k % 128 == 0");
+        Ok(Self { packed: DeviceAllocation::new(library, n * k)?, scale: DeviceAllocation::new(library, n * k / 128 * 4)?,
+            n, k })
+    }
+
+    /// The packed values and scales.
+    pub fn buffers(&self) -> (cuteafd_ffi::CuteafdDeviceBuffer, cuteafd_ffi::CuteafdDeviceBuffer) {
+        (self.packed.buffer, self.scale.buffer)
+    }
+
     /// Device bytes of the copy and its scales.
     pub fn bytes(&self) -> usize {
         self.n * self.k + self.n * self.k / 128 * 4
@@ -195,5 +207,13 @@ mod rows_tests {
         assert_eq!([Fp8Rows::W8a16, Fp8Rows::Wide, Fp8Rows::W8a8].map(Fp8Rows::code), [0, 1, 2]);
         assert!(Fp8Rows::W8a16 < Fp8Rows::Wide && Fp8Rows::Wide < Fp8Rows::W8a8);
         assert_eq!(Fp8Rows::default(), Fp8Rows::W8a16);
+    }
+}
+
+#[cfg(test)]
+impl Fp8Weight<'_> {
+    pub(crate) fn visit(&self, prefix: &str, f: &mut dyn FnMut(String, cuteafd_ffi::CuteafdDeviceBuffer)) {
+        f(format!("{prefix}packed"), self.packed.buffer);
+        f(format!("{prefix}scale"), self.scale.buffer);
     }
 }

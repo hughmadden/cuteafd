@@ -14,6 +14,9 @@ use cuteafd_loader::families::qwen3_5::Qwen35Checkpoint;
 pub(crate) struct GoldenArgs {
     #[arg(long)]
     pub snapshot: PathBuf,
+    /// Hugging Face identity for a snapshot outside the standard hub layout.
+    #[arg(long)]
+    pub model_id: Option<String>,
     #[arg(long, env = "CUTEAFD_NATIVE_LIB")]
     pub native_lib: Option<PathBuf>,
     #[arg(long, default_value = "/opt/cuteafd/share/PROGRAMS.json")]
@@ -34,6 +37,9 @@ pub(crate) struct GoldenArgs {
     /// Strict explicit KV pool, otherwise the shared pool-first policy applies.
     #[arg(long)]
     pub pool_tokens: Option<u64>,
+    /// Full-attention KV storage only; GDN recurrence remains FP32.
+    #[arg(long, default_value = "fp8")]
+    pub kv_cache: cuteafd_loader::families::qwen4::Qwen4KvCache,
     /// Input chunk size, including serial decode-shaped qualification.
     #[arg(long, default_value_t = 4096)]
     pub prefill_chunk: usize,
@@ -52,6 +58,9 @@ pub(crate) struct GoldenArgs {
     /// Compare this many plain and policy-selected speculative greedy tokens.
     #[arg(long, requires = "draft")]
     pub spec_decode: Option<usize>,
+    /// Compare the native checkpoint MTP layer with an independent teacher-forced oracle.
+    #[arg(long, conflicts_with_all = ["draft", "spec_decode", "verify_check", "prefix_check"])]
+    pub mtp_golden: Option<PathBuf>,
     /// Maximum absolute mean-NLL difference from the supplied reference.
     #[arg(long, default_value_t = 0.01)]
     pub nll_tolerance: f64,
@@ -66,7 +75,8 @@ pub(crate) async fn run_golden(args: GoldenArgs) -> Result<()> {
     ensure!((1..=4096).contains(&args.prefill_chunk), "prefill chunk must be 1..4096");
     ensure!(args.nll_tolerance.is_finite() && args.nll_tolerance >= 0.0, "invalid NLL tolerance");
     let golden = args.golden.as_ref().context("dense golden requires --golden reference directory")?;
-    let (directory, positions) = reference_window(golden, &args.window, &args.snapshot, cfg.vocab)?;
+    let reference = reference_snapshot(&args.snapshot, args.model_id.as_deref(), &cuteafd_bench::fidelity_match::hub())?;
+    let (directory, positions) = reference_window(golden, &args.window, &args.snapshot, &reference, cfg.vocab)?;
     let token_bytes = std::fs::read(directory.join("tokens.bin"))?;
     ensure!(token_bytes.len() >= 8 && token_bytes.len() % 4 == 0, "invalid reference token payload");
     let tokens: Vec<_> = token_bytes.chunks_exact(4).map(|b| u32::from_le_bytes(b.try_into().unwrap())).collect();
@@ -85,6 +95,9 @@ pub(crate) async fn run_golden(args: GoldenArgs) -> Result<()> {
     let library = unsafe { cuteafd_ffi::NativeLibrary::load(native)? };
     library.cuda_set_device(args.device)?;
     let programs = library.programs()?.with_manifest(&args.manifest)?;
+    if let Some(reference) = &args.mtp_golden {
+        return engine::mtp::oracle(&args, &library, &programs, &checkpoint, cfg, &directory, reference, &tokens);
+    }
     if let Some(count) = args.spec_decode {
         return dspark::spec_decode(&args, &library, &programs, &checkpoint, cfg, &tokens, count);
     }
@@ -93,7 +106,7 @@ pub(crate) async fn run_golden(args: GoldenArgs) -> Result<()> {
     let marks = args.prefix_check.then_some(crate::shared::prefix::MarkRule {
         lanes: slots, entries: 1, budget_bytes: 1 << 30, host: false });
     let mut engine = engine::DenseEngine::with_prefix(&library, &programs, &checkpoint, cfg.clone(),
-        args.pool_tokens, None, slots, marks)?;
+        args.pool_tokens, None, slots, marks, args.kv_cache, false)?;
     if args.verify_check {
         engine.verify_check(&tokens)?;
         if args.state_slots > 1 { engine.multislot_verify_check(&tokens)?; }
@@ -134,7 +147,30 @@ pub(crate) async fn run_golden(args: GoldenArgs) -> Result<()> {
     Ok(())
 }
 
-fn reference_window(root: &std::path::Path, window: &str, snapshot: &std::path::Path, vocab: usize)
+fn reference_snapshot(snapshot: &std::path::Path, model: Option<&str>, hub: &std::path::Path) -> Result<PathBuf> {
+    use cuteafd_bench::fidelity_match;
+    let inferred = snapshot.ancestors().find_map(|path| {
+        let name = path.file_name()?.to_str()?.strip_prefix("models--")?;
+        let (organization, model) = name.split_once("--")?;
+        Some(format!("{organization}/{model}"))
+    });
+    ensure!(model.zip(inferred.as_deref()).is_none_or(|(given, inferred)| given == inferred),
+        "dense golden model identity disagrees with snapshot repository");
+    let model = model.or(inferred.as_deref()).context("dense golden requires --model-id outside an HF snapshot repository")?;
+    let resolution = fidelity_match::resolve_in(model, Some(snapshot), hub)?;
+    ensure!(matches!(resolution.reference_root.as_str(), "Qwen/Qwen3.5-9B" | "Qwen/Qwen3.8-27B"),
+        "dense reference resolves to an unsupported official root");
+    let root = if resolution.reference_root == model { snapshot.to_owned() } else {
+        fidelity_match::local_snapshot(hub, &resolution.reference_root)
+            .context("mapped highest-precision reference snapshot is not available locally")?
+    };
+    tracing::info!(model, reference_root = resolution.reference_root, reference_match = resolution.reference_match,
+        "dense golden resolved official fidelity root");
+    Ok(root)
+}
+
+fn reference_window(root: &std::path::Path, window: &str, snapshot: &std::path::Path,
+    reference: &std::path::Path, vocab: usize)
     -> Result<(PathBuf, Option<Vec<usize>>)> {
     use sha2::{Digest, Sha256};
     let metadata: serde_json::Value = serde_json::from_slice(&std::fs::read(root.join("meta.json"))?)?;
@@ -144,9 +180,12 @@ fn reference_window(root: &std::path::Path, window: &str, snapshot: &std::path::
     let sealed = root.join("windows.json").is_file();
     let identity = if sealed { &metadata["snapshot_identity"] } else { &metadata };
     for (file, key) in [("config.json", "config_sha256"), ("tokenizer.json", "tokenizer_sha256")] {
-        let hash = format!("{:x}", Sha256::digest(std::fs::read(snapshot.join(file))?));
-        ensure!(identity[key].as_str() == Some(hash.as_str()), "dense reference {key} differs from checkpoint");
+        let hash = format!("{:x}", Sha256::digest(std::fs::read(reference.join(file))?));
+        ensure!(identity[key].as_str() == Some(hash.as_str()), "dense reference {key} differs from mapped official root");
     }
+    let tokenizer = format!("{:x}", Sha256::digest(std::fs::read(snapshot.join("tokenizer.json"))?));
+    ensure!(identity["tokenizer_sha256"].as_str() == Some(tokenizer.as_str()),
+        "dense reference tokenizer differs from target checkpoint");
     if !sealed { return Ok((root.to_owned(), None)); }
     ensure!(metadata["schema"] == "cuteafd.fidelity.golden/2"
         && metadata["prefix_qualification"]["passed"] == true, "unqualified fidelity golden");
@@ -168,6 +207,17 @@ fn reference_window(root: &std::path::Path, window: &str, snapshot: &std::path::
 #[cfg(test)]
 mod tests {
     use clap::Parser;
+    #[test]
+    fn mtp_oracle_is_explicit_and_excludes_other_draft_modes() {
+        #[derive(clap::Parser)]
+        struct Cli { #[command(flatten)] args: super::GoldenArgs }
+        let parsed = Cli::try_parse_from(["test", "--snapshot", "model", "--mtp-golden", "oracle"]).unwrap();
+        assert_eq!(parsed.args.mtp_golden.as_deref(), Some(std::path::Path::new("oracle")));
+        for flag in ["--verify-check", "--prefix-check"] {
+            assert!(Cli::try_parse_from(["test", "--snapshot", "model", "--mtp-golden", "oracle", flag]).is_err());
+        }
+        assert!(Cli::try_parse_from(["test", "--snapshot", "model", "--mtp-golden", "oracle", "--draft", "draft"]).is_err());
+    }
     #[test]
     fn scored_window_rows_predict_the_token_at_position_not_after_it() {
         let logits = [4.0, 0.0, 0.0, 4.0, 9.0, -9.0];
@@ -222,18 +272,54 @@ mod tests {
         std::fs::write(root.path().join("windows.json"), br#"{"set_sha256":"panel"}"#)?;
         let write = |metadata: &serde_json::Value| std::fs::write(root.path().join("meta.json"), metadata.to_string());
         write(&metadata)?;
-        let (path, positions) = super::reference_window(root.path(), "a00", snapshot.path(), 2)?;
+        let (path, positions) = super::reference_window(root.path(), "a00", snapshot.path(), snapshot.path(), 2)?;
         assert_eq!(path, root.path().join("windows/a00"));
         assert_eq!(positions, Some(vec![64,65]));
-        assert!(super::reference_window(root.path(), "missing", snapshot.path(), 2).is_err());
-        assert!(super::reference_window(root.path(), "a00", snapshot.path(), 3).is_err());
+        assert!(super::reference_window(root.path(), "missing", snapshot.path(), snapshot.path(), 2).is_err());
+        assert!(super::reference_window(root.path(), "a00", snapshot.path(), snapshot.path(), 3).is_err());
         metadata["windows"][0]["path"] = json!("../escape");
         write(&metadata)?;
-        assert!(super::reference_window(root.path(), "a00", snapshot.path(), 2).is_err());
+        assert!(super::reference_window(root.path(), "a00", snapshot.path(), snapshot.path(), 2).is_err());
         metadata["windows"][0]["path"] = json!("windows/a00");
         metadata["snapshot_identity"]["config_sha256"] = json!("different");
         write(&metadata)?;
-        assert!(super::reference_window(root.path(), "a00", snapshot.path(), 2).is_err());
+        assert!(super::reference_window(root.path(), "a00", snapshot.path(), snapshot.path(), 2).is_err());
+        Ok(())
+    }
+    #[test]
+    fn quant_reference_uses_shared_ancestry_and_keeps_root_config_and_target_tokenizer_checks() -> anyhow::Result<()> {
+        use serde_json::json;
+        use sha2::{Digest, Sha256};
+        let hub = tempfile::tempdir()?;
+        let make = |model: &str, config: &str| -> anyhow::Result<std::path::PathBuf> {
+            let path = hub.path().join(format!("models--{}/snapshots/abcdef", model.replace('/', "--")));
+            std::fs::create_dir_all(&path)?;
+            std::fs::write(path.join("config.json"), config)?;
+            std::fs::write(path.join("tokenizer.json"), "{}")?;
+            Ok(path)
+        };
+        let official = make("Qwen/Qwen3.8-27B", "{}")?;
+        let quant = make("Qwen/Qwen3.8-27B-FP8", r#"{"quantization_config":{"quant_method":"fp8"}}"#)?;
+        assert_eq!(super::reference_snapshot(&quant, None, hub.path())?, official);
+        assert!(super::reference_snapshot(&quant, Some("Qwen/Qwen3.5-9B"), hub.path()).is_err());
+        let community = make("test/quant", "{}")?;
+        assert!(super::reference_snapshot(&community, None, hub.path()).is_err());
+        std::fs::write(community.join("README.md"), "---\nbase_model: Qwen/Qwen3.8-27B\nbase_model_relation: quantized\n---\n")?;
+        assert_eq!(super::reference_snapshot(&community, None, hub.path())?, official);
+        std::fs::write(community.join("README.md"), "---\nbase_model: Qwen/Qwen3.5-9B\nbase_model_relation: finetune\n---\n")?;
+        assert!(super::reference_snapshot(&community, None, hub.path()).is_err());
+        let golden = tempfile::tempdir()?;
+        let hash = format!("{:x}", Sha256::digest(b"{}"));
+        let metadata = json!({"family":"qwen3_5", "mtp":false,
+            "reference_sha256":"7788020ca357c6c8fb6e750fd847dd80ac77625902213b47f4949c8085344a58",
+            "config_sha256":hash,"tokenizer_sha256":hash});
+        std::fs::write(golden.path().join("meta.json"), metadata.to_string())?;
+        assert!(super::reference_window(golden.path(), "legacy", &quant, &official, 2).is_ok());
+        std::fs::write(official.join("config.json"), r#"{"changed":true}"#)?;
+        assert!(super::reference_window(golden.path(), "legacy", &quant, &official, 2).is_err());
+        std::fs::write(official.join("config.json"), "{}")?;
+        std::fs::write(quant.join("tokenizer.json"), r#"{"changed":true}"#)?;
+        assert!(super::reference_window(golden.path(), "legacy", &quant, &official, 2).is_err());
         Ok(())
     }
     #[test]
@@ -246,6 +332,7 @@ mod tests {
         assert_eq!(args.max_sequences, 8);
         assert_eq!(args.pool_tokens.filter(|&tokens| tokens > 0), None);
         assert_eq!(args.prefix.prefix_cache_entries, 4);
+        assert_eq!(args.kv_cache, cuteafd_loader::families::qwen4::Qwen4KvCache::Fp8);
     }
 
     #[test]
@@ -264,5 +351,6 @@ mod tests {
         let cli = crate::cli::Cli::try_parse_from(["cuteafd", "qwen35-golden", "--snapshot", "/m", "--check-headers"]).unwrap();
         let crate::cli::Commands::Qwen35Golden(args) = cli.command else { panic!("dense golden not registered") };
         assert_eq!(args.nll_tolerance, 0.01);
+        assert_eq!(args.kv_cache, cuteafd_loader::families::qwen4::Qwen4KvCache::Fp8);
     }
 }

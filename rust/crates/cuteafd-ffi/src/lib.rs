@@ -1,12 +1,14 @@
 mod families;
 mod shared;
-pub use shared::{audio, exlr8, fp8_moe, peer_exchange, programs, vision};
+pub use shared::{audio, dense_trellis, exlr8, fp8_moe, glm_stage, mla_draft, native_dense, native_dense_glue, peer_exchange, programs, steer_rows, vision};
 pub use families::kimi_k3::{KimiMla, KimiMlaBatch, KimiMlaError, KimiMlaMode, KimiMlaWeights,
-    KimiFfn, KimiFfnBatch, KimiLatent, KimiPrefixMode, KimiResidual, KimiResidualBatch, KimiResidualSite,
+    KimiFfn, KimiFfnBatch, KimiFfnMode, KimiLatent, KimiPrefixMode, KimiResidual, KimiResidualBatch, KimiResidualSite,
     KimiRmsNorm, KimiSitu, KimiW8Error, KimiKda, KimiKdaBatch, KimiKdaWeights, KimiKdaCommit,
     KimiRouter, KimiRoutes, KimiExpertInput, MLA_PAGE_ROWS, MLA_RECORD_BYTES};
+pub use families::kimi_k3_split::{KimiSplitError, KimiMlaSplit, KimiMlaRankBatch,
+    KimiKdaCore, KimiKdaCoreWeights, KimiKdaCoreBatch};
 pub use shared::vocab_head::{VOCAB_HEAD_ROWS_MAX, VOCAB_HEAD_ROWS_PASS};
-pub use shared::v41_device_ops::{Bf16Add, V41PeerCopy};
+pub use shared::v41_device_ops::{Bf16Add, F32Add, V41PeerCopy};
 pub use families::deepseek_v41::v41_candidate_blocks::V41CandidateBlocks;
 pub use families::deepseek_v41::v41_index_topk::V41IndexTopK;
 pub use families::deepseek_v41::v41_sparse_attention::{V41SparseAttention, V41SparseBatch, V41SparseSource, V41SparseWindow};
@@ -28,13 +30,14 @@ pub use shared::v41_exl3_wire::V41Exl3Wire;
 pub use shared::v41_experts::{
     V41ExpertReduction, V41ExpertInfo, V41ExpertInputQuantizer, V41ExpertKernel, V41ExpertLaunchArgs, V41ExpertPacker, V41ExpertPointer, V41ExpertOutputKind,
     V41CompactReducer, V41LocalExpertReducer, V41Tp2ExpertReducer, V41RouteReducer, V41_EXPERT_POINTER_COUNT,
-    v41_pack_intermediate_supported, v41_rank_count_supported,
+    v41_pack_intermediate_supported, v41_rank_count_supported, V41ScaleCodeJob,
 };
 pub use shared::rtx_combine::{RtxPartialDtype, RtxTp2Combine};
 mod cuda_runtime;
 pub mod host_isa;
 pub mod memory_ledger;
 pub mod synchronized_load;
+pub mod push_ring;
 
 static COORDINATOR_GPU_BUDGET: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static GPU_BUDGET_ALLOCATION: Mutex<()> = Mutex::new(());
@@ -123,19 +126,47 @@ fn memory_cgroup_paths(membership: &str) -> Vec<(std::path::PathBuf, bool)> {
     paths
 }
 
-fn cgroup_allocatable_bytes(mut available: usize, membership: &str,
-    read: impl Fn(&Path) -> Result<Option<String>>) -> Result<usize> {
+fn cgroup_memory_limits(mut total: u64, mut available: u64, membership: &str,
+    read: impl Fn(&Path) -> Result<Option<String>>) -> Result<(u64, u64)> {
     for (path, v2) in memory_cgroup_paths(membership) {
-        let (limit_file, current_file) = if v2 { ("memory.max", "memory.current") }
-            else { ("memory.limit_in_bytes", "memory.usage_in_bytes") };
+        let (limit_file, current_file, inactive_key) = if v2 {
+            ("memory.max", "memory.current", "inactive_file")
+        } else { ("memory.limit_in_bytes", "memory.usage_in_bytes", "total_inactive_file") };
         let Some(limit) = read(&path.join(limit_file))? else { continue };
         if limit.trim() == "max" { continue }
         let limit: u64 = limit.trim().parse().context("invalid cgroup memory limit")?;
         let current = read(&path.join(current_file))?.context("missing cgroup memory usage")?;
         let current: u64 = current.trim().parse().context("invalid cgroup memory usage")?;
-        available = available.min(usize::try_from(limit.saturating_sub(current)).unwrap_or(usize::MAX));
+        let stat = read(&path.join("memory.stat"))?.unwrap_or_default();
+        let inactive = stat.lines().find_map(|line| {
+            let mut fields = line.split_whitespace();
+            (fields.next() == Some(inactive_key)).then(|| fields.next())
+        }).flatten().map(str::parse::<u64>).transpose()?.unwrap_or(0);
+        // Only inactive file cache is reclaimable working-set headroom.
+        let working_set = current.saturating_sub(inactive);
+        total = total.min(limit);
+        available = available.min(limit.saturating_sub(working_set));
     }
-    Ok(available)
+    Ok((total, available))
+}
+
+fn cgroup_allocatable_bytes(available: usize, membership: &str,
+    read: impl Fn(&Path) -> Result<Option<String>>) -> Result<usize> {
+    let (_, available) = cgroup_memory_limits(u64::MAX, available as u64, membership, read)?;
+    Ok(usize::try_from(available).unwrap_or(usize::MAX))
+}
+
+/// Live MemAvailable bounded by every visible cgroup's reclaimable working set.
+/// The total remains bounded by hard limits for fractional host-cache sizing.
+pub fn host_memory() -> Result<(u64, u64)> {
+    let text = std::fs::read_to_string("/proc/meminfo")?;
+    let total = text.lines().find_map(|line| line.strip_prefix("MemTotal:"))
+        .context("missing MemTotal")?.split_whitespace().next().context("missing MemTotal value")?
+        .parse::<u64>()?.checked_mul(1024).context("MemTotal overflow")?;
+    let available = parse_mem_available(&text)? as u64;
+    anyhow::ensure!(total > 0 && available <= total, "invalid MemTotal/MemAvailable");
+    let membership = std::fs::read_to_string("/proc/self/cgroup")?;
+    cgroup_memory_limits(total, available, &membership, read_cgroup_file)
 }
 
 fn read_cgroup_file(path: &Path) -> Result<Option<String>> {
@@ -178,7 +209,19 @@ pub fn cgroup_memory_census() -> Result<Vec<cuteafd_core::expert_geometry::Cgrou
     cgroup_memory_samples(&membership, read_cgroup_file)
 }
 
-/// Bound a MemAvailable sample by every visible cgroup ancestor, without CUDA queries.
+/// Return freed startup metadata arenas once, before retained model allocations.
+/// glibc otherwise retains large JSON/header parsing arenas for the process lifetime.
+pub fn trim_startup_metadata() {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    {
+        unsafe extern "C" { fn malloc_trim(pad: usize) -> i32; }
+        // SAFETY: glibc malloc_trim is thread-safe and touches only allocator-owned free pages.
+        unsafe { malloc_trim(0); }
+    }
+}
+
+/// Host-charged allocation headroom, bounded by every visible cgroup ancestor.
+/// This is not device headroom: GB10 CUDA allocations are not charged to memcg.
 pub fn cgroup_memory_headroom(available: usize) -> Result<usize> {
     let membership = std::fs::read_to_string("/proc/self/cgroup").context("reading device cgroup membership")?;
     cgroup_allocatable_bytes(available, &membership, read_cgroup_file)
@@ -197,14 +240,8 @@ mod allocatable_memory_tests {
         let result = device_allocatable_memory(&info, || {
             queried.set(true);
             anyhow::bail!("cudaMemGetInfo failed: out of memory")
-        }, || cgroup_allocatable_bytes(
-            allocatable_bytes(true, 0, || Ok("MemAvailable: 112197632 kB\n".into()))?,
-            "0::/", |path| Ok(match path.to_str().unwrap() {
-                "/sys/fs/cgroup/memory.max" => Some((100u64 << 30).to_string()),
-                "/sys/fs/cgroup/memory.current" => Some((4u64 << 30).to_string()),
-                _ => None,
-            }))).unwrap();
-        assert_eq!(result, (96usize << 30, 128usize << 30));
+        }, || allocatable_bytes(true, 0, || Ok("MemAvailable: 112197632 kB\n".into()))).unwrap();
+        assert_eq!(result, (112_197_632usize * 1024, 128usize << 30));
         assert!(!queried.get());
         assert_eq!(device_allocatable_memory(&info, || panic!("raw query"),
             || Ok(200usize << 30)).unwrap(), (128usize << 30, 128usize << 30));
@@ -213,6 +250,30 @@ mod allocatable_memory_tests {
         let invalid = CuteafdCudaDeviceInfo { total_memory_bytes: 0, ..info };
         assert!(device_allocatable_memory(&invalid, || panic!("raw query"),
             || panic!("invalid total must fail first")).is_err());
+    }
+
+    #[test]
+    fn integrated_device_pages_do_not_spend_host_cgroup_headroom() {
+        // Recorded retained-arena phase: device +310.7 MB, memcg +2.6 MB.
+        let device_before = 5_117_050_880u64;
+        let device_after = 5_427_741_028u64;
+        let host_before = 33_460_191_232u64;
+        let host_after = 33_462_812_672u64;
+        assert_eq!(device_after - device_before, 310_690_148);
+        assert_eq!(host_after - host_before, 2_621_440);
+        let info = CuteafdCudaDeviceInfo { integrated: 1, total_memory_bytes: 130_594_160_640,
+            ..Default::default() };
+        let available = 110_105_620_480usize;
+        let host_cap = 116_500_987_904u64;
+        let host_headroom = cgroup_allocatable_bytes(available, "0::/", |path| Ok(
+            match path.to_str().unwrap() {
+                "/sys/fs/cgroup/memory.max" => Some(host_cap.to_string()),
+                "/sys/fs/cgroup/memory.current" => Some(host_after.to_string()),
+                _ => None,
+            })).unwrap();
+        assert!(host_headroom < available);
+        assert_eq!(device_allocatable_memory(&info, || panic!("raw CUDA query"),
+            || Ok(available)).unwrap().0, available);
     }
 
     #[test]
@@ -227,7 +288,7 @@ mod allocatable_memory_tests {
     }
 
     #[test]
-    fn gb10_respects_nested_cgroup_headroom_and_namespace_root() {
+    fn host_allocations_respect_nested_cgroup_headroom_and_namespace_root() {
         let files = std::collections::HashMap::from([
             ("/sys/fs/cgroup/team/worker/memory.max", "100"),
             ("/sys/fs/cgroup/team/worker/memory.current", "20"),
@@ -256,6 +317,49 @@ mod allocatable_memory_tests {
         assert!(cgroup_allocatable_bytes(90, "0::/", |p| Ok(
             p.ends_with("memory.max").then(|| "30".into()))).is_err());
         assert!(cgroup_allocatable_bytes(90, "0::/", |_| anyhow::bail!("denied")).is_err());
+    }
+
+    #[test]
+    fn cgroup_working_set_reclaims_only_inactive_file_cache() {
+        let files = std::collections::HashMap::from([
+            ("/sys/fs/cgroup/team/worker/memory.max", "48"),
+            ("/sys/fs/cgroup/team/worker/memory.current", "44"),
+            ("/sys/fs/cgroup/team/worker/memory.stat", "inactive_file 8\nactive_file 30\n"),
+            ("/sys/fs/cgroup/team/memory.max", "64"),
+            ("/sys/fs/cgroup/team/memory.current", "60"),
+            ("/sys/fs/cgroup/team/memory.stat", "inactive_file 40\n"),
+            ("/sys/fs/cgroup/memory.max", "max"),
+        ]);
+        let read = |p: &std::path::Path| Ok(files.get(p.to_str().unwrap()).map(|s| s.to_string()));
+        assert_eq!(super::cgroup_memory_limits(128, 96, "0::/team/worker", read).unwrap(), (48, 12));
+        assert_eq!(cgroup_allocatable_bytes(5, "0::/team/worker", read).unwrap(), 5);
+        let root = |p: &std::path::Path| Ok(match p.to_str().unwrap() {
+            "/sys/fs/cgroup/memory.max" => Some("30".into()),
+            "/sys/fs/cgroup/memory.current" => Some("40".into()),
+            "/sys/fs/cgroup/memory.stat" => Some("inactive_file 25\n".into()),
+            _ => None,
+        });
+        assert_eq!(cgroup_allocatable_bytes(90, "0::/hidden/host/path", root).unwrap(), 15);
+        let legacy = |p: &std::path::Path| Ok(match p.to_str().unwrap() {
+            "/sys/fs/cgroup/memory/memory.limit_in_bytes" => Some("32".into()),
+            "/sys/fs/cgroup/memory/memory.usage_in_bytes" => Some("28".into()),
+            "/sys/fs/cgroup/memory/memory.stat" => Some("inactive_file 1\ntotal_inactive_file 16\n".into()),
+            _ => None,
+        });
+        assert_eq!(cgroup_allocatable_bytes(90, "7:memory:/", legacy).unwrap(), 20);
+        for (current, stat, expected) in [("40", "inactive_file 0", 0),
+            ("4", "inactive_file 8", 32), ("28", "active_file 16", 4)] {
+            let fixture = |p: &std::path::Path| Ok(match p.file_name().and_then(|n| n.to_str()) {
+                Some("memory.max") => Some("32".into()),
+                Some("memory.current") => Some(current.into()),
+                Some("memory.stat") => Some(stat.into()),
+                _ => None,
+            });
+            assert_eq!(cgroup_allocatable_bytes(90, "0::/", fixture).unwrap(), expected);
+        }
+        assert!(cgroup_allocatable_bytes(90, "0::/", |p| Ok(Some(match p.file_name().unwrap().to_str().unwrap() {
+            "memory.stat" => "inactive_file invalid", _ => "32"
+        }.into()))).is_err());
     }
 
     #[test]
@@ -1162,6 +1266,8 @@ type CudaF32ToBf16AsyncFn = unsafe extern "C" fn(
     count: usize,
     cuda_stream: *mut c_void,
 ) -> CuteafdStatus;
+type CudaAccumulateBf16ToF32AsyncFn =
+    unsafe extern "C" fn(*const u16, *mut f32, usize, *mut c_void) -> CuteafdStatus;
 type CudaGatherRowsF32ToFp8E4m3RowScaledAsyncFn = unsafe extern "C" fn(
     src: *const f32,
     row_indices: *const u32,
@@ -1611,13 +1717,26 @@ impl NativeLibrary {
     ) -> Result<CuteafdXGrammarCompiler<'a>> {
         let path = CString::new(tokenizer_json_path.to_string_lossy().as_bytes())
             .context("XGrammar tokenizer path contains a NUL byte")?;
-        let create: Symbol<XGrammarCompilerCreateFn> =
-            unsafe { self.lib.get(b"cuteafd_xgrammar_compiler_create")? };
+        self.xgrammar_compiler_input(&path, b"cuteafd_xgrammar_compiler_create", vocab_size, stop_token_ids)
+    }
+
+    /// Compile from the already loaded checkpoint tokenizer, including native TikToken snapshots.
+    pub fn xgrammar_compiler_json<'a>(&'a self, tokenizer_json: &str, vocab_size: usize,
+        stop_token_ids: &[i32]) -> Result<CuteafdXGrammarCompiler<'a>> {
+        let json = CString::new(tokenizer_json).context("XGrammar tokenizer JSON contains a NUL byte")?;
+        self.xgrammar_compiler_input(&json, b"cuteafd_xgrammar_compiler_create_json", vocab_size, stop_token_ids)
+    }
+
+    fn xgrammar_compiler_input<'a>(&'a self, input: &std::ffi::CStr, symbol: &[u8], vocab_size: usize,
+        stop_token_ids: &[i32]) -> Result<CuteafdXGrammarCompiler<'a>> {
+        // SAFETY: both native entry points share this signature and consume input before returning.
+        let create: Symbol<XGrammarCompilerCreateFn> = unsafe { self.lib.get(symbol)? };
         let mut handle = std::ptr::null_mut();
         let mut error = [0 as c_char; XGRAMMAR_ERROR_BYTES];
+        // SAFETY: the input and stop-token slices remain live; native code initializes the owned handle.
         let status = unsafe {
             create(
-                path.as_ptr(),
+                input.as_ptr(),
                 vocab_size,
                 if stop_token_ids.is_empty() {
                     std::ptr::null()
@@ -2074,7 +2193,9 @@ impl NativeLibrary {
 
     /// Allocatable free/total bytes on the current device, before logical budgets.
     /// Integrated-device allocations reclaim Linux page cache, so MemAvailable is the
-    /// shared device/host headroom, bounded by cgroup hard-limit headroom.
+    /// shared device/host headroom. GB10 device pages are not charged to memcg,
+    /// so Docker memory limits bound host allocations only, not device admission.
+    /// Callers reserve their planned safety margin before admitting payloads.
     /// Integrated devices do not query cudaMemGetInfo: even that query can fail
     /// before reclaiming page cache. Raw samples remain available for diagnostics.
     /// Discrete devices keep cudaMemGetInfo, regardless of compute capability.
@@ -2083,7 +2204,7 @@ impl NativeLibrary {
         device_allocatable_memory(&info, || self.cuda_physical_memory_info(), || {
             let available = allocatable_bytes(true, 0,
                 || std::fs::read_to_string("/proc/meminfo").context("reading device allocatable memory"))?;
-            cgroup_memory_headroom(available)
+            Ok(available)
         })
     }
 
@@ -2522,9 +2643,57 @@ impl NativeLibrary {
         unsafe { self.copy_h2d_raw_ptr(dst, staging.ptr as *const c_void, src.len()) }
     }
 
+    /// Create the pinned staging and fence for ordered uploads into `dst` on
+    /// `stream`, sized to all of `dst`, without copying. Ports that reuse a
+    /// destination mid-call (while peer waits are queued) reserve it before
+    /// readiness, so no upload ever allocates host memory under queued work.
+    /// Reserving an existing entry of at least this capacity is a no-op.
+    ///
+    /// # Safety
+    /// Same contract as [`Self::copy_h2d_ordered`].
+    pub unsafe fn reserve_h2d_ordered(&self, dst: CuteafdDeviceBuffer, stream: *mut c_void) -> Result<()> {
+        anyhow::ensure!(!dst.ptr.is_null() && dst.bytes > 0, "ordered H2D reservation is empty or null");
+        anyhow::ensure!(!self.is_quarantined_after_failed_drain(), "ordered H2D library is quarantined");
+        let device = self.cuda_get_device()?;
+        let mut entries = self.ordered_h2d_staging.lock()
+            .map_err(|_| anyhow::anyhow!("ordered H2D staging lock is poisoned"))?;
+        self.ordered_h2d_entry(&mut entries, (device, stream as usize, dst.ptr as usize), dst.bytes)?;
+        Ok(())
+    }
+
+    /// The entry for `key`, created with staging for `capacity` bytes. An
+    /// existing entry never grows: replacing pinned staging frees host memory
+    /// (cudaFreeHost synchronizes the device), which deadlocks against a
+    /// queued peer wait. A larger source is refused; pass the destination's
+    /// whole admitted extent on first use, or reserve it at startup.
+    fn ordered_h2d_entry<'e>(&self,
+        entries: &'e mut std::collections::BTreeMap<(i32, usize, usize), OrderedH2DStaging>,
+        key: (i32, usize, usize), capacity: usize) -> Result<&'e mut OrderedH2DStaging> {
+        if let Some(entry) = entries.get(&key) {
+            anyhow::ensure!(capacity <= entry.staging.buffer.bytes,
+                "ordered H2D upload of {capacity} bytes exceeds the {}-byte staging reserved for its \
+                 destination; size the first upload or reservation by the destination's whole extent",
+                entry.staging.buffer.bytes);
+        } else {
+            let event = self.cuda_event_create_ordering()?;
+            let mut staging = SyncH2DStagingBuffer::default();
+            if let Err(error) = staging.ensure(self, capacity) {
+                // SAFETY: the fresh event was never recorded.
+                let _ = unsafe { self.cuda_event_destroy(event) };
+                return Err(error);
+            }
+            entries.insert(key, OrderedH2DStaging { staging, event, pending: false });
+        }
+        Ok(entries.get_mut(&key).expect("ordered upload entry present"))
+    }
+
     /// Upload after prior consumers on `stream`, retaining the pinned source
     /// until the copy's event completes. Unlike default-stream copy_h2d, this
     /// permits workspace reuse while previous compute is still queued.
+    ///
+    /// The first upload into a destination sizes its staging to `dst.bytes`
+    /// (pass the whole admitted buffer, not a view narrowed to `src`); later
+    /// uploads reuse it and never reallocate (see [`Self::reserve_h2d_ordered`]).
     ///
     /// # Safety
     /// `dst` and `stream` belong to the current device and remain live through
@@ -2538,11 +2707,8 @@ impl NativeLibrary {
         let mut entries = self.ordered_h2d_staging.lock()
             .map_err(|_| anyhow::anyhow!("ordered H2D staging lock is poisoned"))?;
         let key = (device, stream as usize, dst.ptr as usize);
-        if !entries.contains_key(&key) {
-            entries.insert(key, OrderedH2DStaging { staging: SyncH2DStagingBuffer::default(),
-                event: self.cuda_event_create_ordering()?, pending: false });
-        }
-        let entry = entries.get_mut(&key).expect("ordered upload entry inserted");
+        let capacity = if entries.contains_key(&key) { src.len() } else { dst.bytes };
+        let entry = self.ordered_h2d_entry(&mut entries, key, capacity)?;
         if entry.pending {
             // SAFETY: this entry owns the event recorded after its last copy.
             if let Err(error) = unsafe { self.cuda_event_synchronize(entry.event) } {
@@ -2551,8 +2717,9 @@ impl NativeLibrary {
             }
             entry.pending = false;
         }
-        let staging = entry.staging.ensure(self, src.len())?;
-        // SAFETY: pinned staging is private, large enough, and its last reader completed.
+        let staging = entry.staging.buffer;
+        // SAFETY: pinned staging is private, holds src (checked by ordered_h2d_entry),
+        // and its last reader completed.
         unsafe { std::ptr::copy_nonoverlapping(src.as_ptr(), staging.ptr.cast::<u8>(), src.len()); }
         entry.pending = true;
         // SAFETY: caller supplies live stream/destination; the entry retains the source.
@@ -2697,11 +2864,15 @@ impl NativeLibrary {
                     src.bytes
                 );
             }
-            validate_device_buffer_bytes(
-                &format!("{context} entry {index} destination"),
-                *dst,
-                entry_bytes,
-            )?;
+            // Format the context only on failure: a fine-grained slot has
+            // thousands of entries.
+            if dst.ptr.is_null() || dst.bytes < entry_bytes {
+                validate_device_buffer_bytes(
+                    &format!("{context} entry {index} destination"),
+                    *dst,
+                    entry_bytes,
+                )?;
+            }
         }
         let source_ptrs = srcs
             .iter()
@@ -3213,6 +3384,28 @@ impl NativeLibrary {
             unsafe { self.lib.get(b"cuteafd_cuda_zero_bytes_async")? };
         let status = unsafe { kernel_fn(dst.ptr, bytes, cuda_stream) };
         self.status_to_result("cuteafd_cuda_zero_bytes_async", status)
+    }
+
+    /// Add BF16 values into a disjoint F32 plane on the same device.
+    ///
+    /// # Safety
+    /// The stream belongs to the buffers' device. Both allocations remain live,
+    /// and source and destination are initialized before this stream reads them.
+    pub unsafe fn cuda_accumulate_bf16_to_f32_async(
+        &self,
+        src: CuteafdDeviceBuffer,
+        dst: CuteafdDeviceBuffer,
+        count: usize,
+        cuda_stream: *mut c_void,
+    ) -> Result<()> {
+        validate_bf16_to_f32_accumulation(src, dst, count)?;
+        if count == 0 { return Ok(()); }
+        // SAFETY: the native symbol has this ABI; the caller retains the stream and buffers.
+        let kernel: Symbol<CudaAccumulateBf16ToF32AsyncFn> =
+            unsafe { self.lib.get(b"cuteafd_cuda_accumulate_bf16_to_f32_async")? };
+        // SAFETY: validated extents; initialization and ordering are the caller's contract.
+        let status = unsafe { kernel(src.ptr.cast::<u16>(), dst.ptr.cast::<f32>(), count, cuda_stream) };
+        self.status_to_result("cuteafd_cuda_accumulate_bf16_to_f32_async", status)
     }
 
     pub fn cuda_f32_to_bf16(
@@ -4890,6 +5083,30 @@ fn validate_row_gather_f32_to_nvfp4_e2m1_fp8_e4m3_buffers(
 }
 
 
+fn validate_bf16_to_f32_accumulation(
+    src: CuteafdDeviceBuffer,
+    dst: CuteafdDeviceBuffer,
+    count: usize,
+) -> Result<()> {
+    if count == 0 { return Ok(()); }
+    let context = "cuteafd_cuda_accumulate_bf16_to_f32_async";
+    validate_u16_buffer_values(context, src, count)?;
+    validate_f32_buffer_values(context, dst, count)?;
+    anyhow::ensure!(src.device_id >= 0 && src.device_id == dst.device_id,
+        "{context} source/destination devices differ");
+    let source = src.ptr as usize;
+    let destination = dst.ptr as usize;
+    anyhow::ensure!(source % 2 == 0 && destination % 4 == 0,
+        "{context} unaligned source/destination");
+    let source_end = source.checked_add(count.checked_mul(2).context("BF16 extent overflow")?)
+        .context("BF16 address overflow")?;
+    let destination_end = destination.checked_add(checked_f32_bytes(context, count)?)
+        .context("F32 address overflow")?;
+    anyhow::ensure!(source_end <= destination || destination_end <= source,
+        "{context} source/destination overlap");
+    Ok(())
+}
+
 fn validate_f32_to_bf16_buffers(
     context: &str,
     src: CuteafdDeviceBuffer,
@@ -5556,6 +5773,31 @@ mod tests {
             device_id: 0,
             flags: 0,
         }
+    }
+
+    #[test]
+    fn bf16_accumulation_checks_live_extents_devices_and_disjointness() -> Result<()> {
+        let src = synthetic_device_buffer(0x1000, 32);
+        let dst = synthetic_device_buffer(0x2000, 64);
+        validate_bf16_to_f32_accumulation(src, dst, 16)?;
+        validate_bf16_to_f32_accumulation(CuteafdDeviceBuffer::default(), CuteafdDeviceBuffer::default(), 0)?;
+        for (source, destination, count) in [
+            (src, dst, 17),
+            (CuteafdDeviceBuffer { bytes: 30, ..src }, dst, 16),
+            (src, CuteafdDeviceBuffer { bytes: 60, ..dst }, 16),
+            (src, CuteafdDeviceBuffer { device_id: 1, ..dst }, 16),
+            (CuteafdDeviceBuffer { ptr: std::ptr::null_mut(), ..src }, dst, 16),
+            (src, CuteafdDeviceBuffer { ptr: 0x1010 as *mut c_void, ..dst }, 16),
+            (src, CuteafdDeviceBuffer { ptr: 0xff0 as *mut c_void, ..dst }, 16),
+            (CuteafdDeviceBuffer { ptr: 0x1001 as *mut c_void, ..src }, dst, 16),
+            (src, CuteafdDeviceBuffer { ptr: 0x2002 as *mut c_void, ..dst }, 16),
+            (synthetic_device_buffer(usize::MAX - 1, 32), dst, 16),
+            (src, dst, usize::MAX),
+        ] {
+            assert!(validate_bf16_to_f32_accumulation(source, destination, count).is_err());
+        }
+        validate_bf16_to_f32_accumulation(src, synthetic_device_buffer(0x1020, 64), 16)?;
+        Ok(())
     }
 
     /* ---- v4.1 GPU target-sampler: ABI pin + validator ---- */

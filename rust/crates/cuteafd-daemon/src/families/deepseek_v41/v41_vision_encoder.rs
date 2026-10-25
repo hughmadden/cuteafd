@@ -6,7 +6,7 @@ use cuteafd_core::ImageKey;
 use cuteafd_engine::media::{EncodeJob, EncodeOutput, EncoderClient, EncoderTicket, MediaError};
 use cuteafd_loader::{OfficialV41Catalog, V41Image, V41ImageGrid};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -52,6 +52,13 @@ pub(crate) fn handshake(
         merge_size: 3,
         plan_hash,
     })
+}
+
+/// Opens only the shards holding vision tensors: a Spark encoder host need not
+/// carry the coordinator-only Engram shards.
+fn vision_catalog(snapshot: &Path) -> Result<OfficialV41Catalog> {
+    let names: HashSet<String> = VisionRuntime::names().into_iter().collect();
+    cuteafd_loader::read_official_v41_role_catalog(snapshot, "vision", |name| names.contains(name))
 }
 
 fn validate_job(job: &EncodeJob) -> std::result::Result<V41ImageGrid, MediaError> {
@@ -120,8 +127,7 @@ impl LocalEncoder {
                     // SAFETY: selected architecture-matching native library; all CUDA owners live on this thread.
                     let lib = unsafe { cuteafd_ffi::NativeLibrary::load(&library) }?;
                     lib.cuda_set_device(device)?;
-                    let catalog = cuteafd_loader::read_official_v41_catalog(&snapshot,
-                    )?;
+                    let catalog = vision_catalog(&snapshot)?;
                     let bytes = VisionRuntime::device_bytes(&catalog, CAPACITY)?;
                     let info = lib.cuda_device_info(device)?;
                     let sm = info.compute_capability_major * 10 + info.compute_capability_minor;
@@ -378,8 +384,7 @@ pub(crate) fn start_worker(
     );
     let sm = crate::shared::vision::worker::architecture(&library)?;
     ensure!(sm == 121, "V4.1 Spark worker requires SM121, got SM{sm}");
-    let catalog =
-        cuteafd_loader::read_official_v41_catalog(snapshot)?;
+    let catalog = vision_catalog(snapshot)?;
     let mut encoder =
         LocalEncoder::start(snapshot.to_owned(), library, 0, usize::try_from(budget)?)?;
     let bytes = encoder.bytes as u64;
@@ -407,6 +412,15 @@ pub(crate) fn start_worker(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    #[ignore = "requires an official V4.1 snapshot; shards without vision tensors may be absent"]
+    fn vision_catalog_needs_only_vision_shards() -> Result<()> {
+        let snapshot = PathBuf::from(std::env::var_os("CUTEAFD_V41_VISION_SNAPSHOT").context("snapshot")?);
+        let catalog = vision_catalog(&snapshot)?;
+        handshake(&catalog, "test", 121, [0; 32])?;
+        VisionRuntime::device_bytes(&catalog, CAPACITY)?;
+        Ok(())
+    }
     #[test]
     #[ignore = "requires matching CUDA image and official checkpoint; qualifies real owner and wire"]
     fn native_owner_wire_features_and_loss() -> Result<()> {

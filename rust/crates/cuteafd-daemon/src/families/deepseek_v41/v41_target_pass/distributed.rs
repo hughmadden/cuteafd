@@ -204,8 +204,17 @@ impl<'w, 'a> DistributedTargetPass<'w, 'a> {
             state: State::Idle,
             chain,
             device_order: true,
+            l2_solo: true,
             sampled: None,
         })
+    }
+    /// `--l2-prefetch` on both GPUs' lanes, each for the layers it holds.
+    pub fn enable_l2_prefetch(&mut self, budget: usize) -> Result<()> {
+        for lane in &mut self.resources.lanes {
+            let device = lane.device;
+            device.run(|| lane.get_mut().enable_l2_prefetch(budget))?;
+        }
+        Ok(())
     }
     /// Retain decode-row graph shapes on both owning devices (sticky).
     pub fn retain_small_graph_shapes(&mut self) -> Result<()> {
@@ -350,6 +359,9 @@ impl<'w, 'a> DistributedTargetPass<'w, 'a> {
         // modes (TP2 attention/query/output, all opt-in) keep host drains.
         let verification = std::mem::replace(&mut self.resources.verification, false);
         self.set_attention_decode(verification);
+        // `--l2-prefetch` only while the other lane is idle (consumed per pass).
+        let solo = std::mem::replace(&mut self.l2_solo, true);
+        for lane in &mut self.resources.lanes { lane.get_mut().set_l2_prefetch(solo); }
         let chained = verification && !self.resources.lanes.iter().any(|lane| lane.uses_peer_projection());
         let Some(handle) = self.begin_chain(chained)? else {
             return unsafe { self.execute_unchained(requests, batch, transport, placement, selected,

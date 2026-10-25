@@ -93,8 +93,8 @@ pub fn snapshot(
     generation: u32,
 ) -> DeviceSnapshot {
     let layout = layout();
-    let mut lists: [Vec<DevicePage>; COMPRESSORS] = std::array::from_fn(|_| Vec::new());
-    for (compressor, list) in lists.iter_mut().enumerate() {
+    let mut lists: [Vec<DevicePage>; cuteafd_hostcache::PAGE_BANKS] = std::array::from_fn(|_| Vec::new());
+    for (compressor, list) in lists.iter_mut().take(COMPRESSORS).enumerate() {
         for index in 0..pages {
             list.push(DevicePage {
                 id: DevicePageId {
@@ -162,7 +162,7 @@ pub fn target(device: &mut Device, snapshot: &DeviceSnapshot, generation: u32) -
 }
 
 /// The device identities of a snapshot, per compressor, as `plan_store` wants them.
-pub fn device_pages(snapshot: &DeviceSnapshot) -> [Vec<DevicePageId>; COMPRESSORS] {
+pub fn device_pages(snapshot: &DeviceSnapshot) -> [Vec<DevicePageId>; cuteafd_hostcache::PAGE_BANKS] {
     std::array::from_fn(|c| snapshot.pages[c].iter().map(|page| page.id).collect())
 }
 

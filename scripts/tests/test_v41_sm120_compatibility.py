@@ -236,8 +236,66 @@ int main() {
         subprocess.run([str(directory / "test")], check=True, timeout=30)
 
 
+@pytest.mark.parametrize("options", [
+    dict(bits=(3, 4, 5)), dict(warp_specialized=True),
+])
+def test_compact_exl3_export_rejects_unsupported_contract_before_cuda(monkeypatch, tmp_path, options):
+    monkeypatch.setitem(sys.modules, "_pinned_sparkinfer", ModuleType("_pinned_sparkinfer"))
+    spec = importlib.util.spec_from_file_location(
+        "compact_test_exl3_export", ROOT / "python/tools/aot/export_b12x_exl3_aot.py")
+    exporter = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(exporter)
+    kwargs = dict(bits=(3, 4), routing="packed", compact_weights=True)
+    kwargs.update(options)
+    with pytest.raises(ValueError, match="compact weights require cooperative two-tier"):
+        exporter.export(tmp_path, 384, 256, 16, **kwargs)
+
+
+@pytest.mark.parametrize("bits,compact", [((3, 4), True), ((2, 3, 4), False), ((2, 3, 4, 5), False)])
+def test_exl3_export_forwards_pure_l2_schedule_before_cuda(monkeypatch, tmp_path, bits, compact):
+    from types import SimpleNamespace
+
+    monkeypatch.setitem(sys.modules, "_pinned_sparkinfer", ModuleType("_pinned_sparkinfer"))
+    spec = importlib.util.spec_from_file_location(
+        "schedule_test_exl3_export", ROOT / "python/tools/aot/export_b12x_exl3_aot.py")
+    exporter = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(exporter)
+    observed = []
+
+    class Compiled(Exception):
+        pass
+
+    def compile_kernel(**kwargs):
+        observed.append(kwargs)
+        raise Compiled
+
+    modules = {
+        "torch": dict(int32="int32", cuda=SimpleNamespace(get_device_properties=lambda _: SimpleNamespace(
+            major=12, minor=0, multi_processor_count=170, shared_memory_per_block_optin=101376))),
+        "b12x.moe._shared.kernels.w4a16.host": dict(route_pack_capacity=lambda *a, **k: (0, 128)),
+        "b12x.moe._shared.kernels.w4a16.mixed_trellis": dict(
+            EXL3_AOT_MAX_SMS={(12, 0): 188}, compile_mixed_trellis=compile_kernel,
+            compile_mixed_trellis3=compile_kernel, make_mixed_trellis_buffers=None),
+        "b12x.moe._shared.kernels.w4a16.mixed_trellis4": dict(compile_mixed_trellis4=compile_kernel),
+        "b12x.moe.fused_moe._impl": dict(_projection_mixed_direct_topk_routes=lambda *a, **k: False,
+            _projection_mixed_tile_config=lambda *a, **k: (64, 128, 64, 128)),
+    }
+    for name, attrs in modules.items():
+        module = ModuleType(name)
+        module.__dict__.update(attrs)
+        monkeypatch.setitem(sys.modules, name, module)
+    schedule = "l2=2,pf1=0,pf2=0,pdl=1"
+    with pytest.raises(Compiled):
+        exporter.export(tmp_path, 384, 256, 16, bits=bits, routing="packed",
+                        compact_weights=compact, decode_schedule=schedule)
+    assert observed[0]["decode_schedule"] == schedule
+    if compact:
+        assert observed[0]["compact_weights"] is True
+
+
 @pytest.mark.parametrize("blocks", [1, 2])
-def test_exl3_generated_bridge_uses_runtime_sms_and_propagates_errors(monkeypatch, blocks):
+@pytest.mark.parametrize("compact", [False, True])
+def test_exl3_generated_bridge_uses_runtime_sms_and_propagates_errors(monkeypatch, blocks, compact):
     compiler = shutil.which("g++")
     if not compiler:
         pytest.skip("native bridge qualification needs a C++ compiler")
@@ -271,7 +329,8 @@ inline int wrapper_{role}(cuteafd_{label}_Kernel_Module_t*, void*, int32_t, int3
                 "int32_t active_m", "int32_t grid_x", "cudaStream_t stream"]))
         exporter.write_bridge(directory, dict(blocks_per_sm=blocks, sms=188, compute=[12, 0],
             capacity=16, hidden=128, intermediate=128, experts=4, top_k=2,
-            bits=[3, 4], output_dtype="bf16", objects=objects))
+            bits=[3, 4], output_dtype="bf16", objects=objects,
+            **(dict(descriptor_rows=7, native_info_version=3) if compact else {})))
         (directory / "main.cc").write_text(r'''
 #include <algorithm>
 #include <cassert>
@@ -279,6 +338,8 @@ inline int wrapper_{role}(cuteafd_{label}_Kernel_Module_t*, void*, int32_t, int3
 #include <initializer_list>
 #include "v41_exl3_bridge.cc"
 int main() {
+ uint32_t info[16]{};
+ assert(cuteafd_exl3_info(info,16)==0 && info[0]==VERSION && info[6]==2);
  for (int dev : {2,5}) {
   device=dev; void* handle=nullptr;
   assert(cuteafd_exl3_create(&handle)==0);
@@ -304,7 +365,7 @@ int main() {
  override_sms=0; minor=1;
  assert(cuteafd_exl3_create(&handle)==cudaErrorInvalidDevice && handle==nullptr);
 }
-'''.replace("BLOCKS", str(blocks)))
+'''.replace("BLOCKS", str(blocks)).replace("VERSION", str(3 if compact else 2)))
         subprocess.run([compiler, "-std=c++17", "-pthread", "-I", str(directory),
                         str(directory / "main.cc"), "-o", str(directory / "test")],
                        check=True, timeout=750)

@@ -119,9 +119,109 @@ impl FromStr for LocalLayers {
     }
 }
 
+/// Admit the complete future host working set once, before any allocation.
+/// Families supply table byte formulas summed across every local GPU, together
+/// with the full prefix-cache quota (zero when disabled) and deferred logits.
+/// Separate checks for tables and cache against the same live sample are not
+/// reservations: they can each fit while their combined working set does not.
+pub(crate) fn admit_host_memory(cache: u64, tables: &[(&str, u64)], deferred_logits: u64, headroom: u64)
+    -> Result<cuteafd_core::memory_layout::HostLayout> {
+    use cuteafd_core::memory_layout::{Basis, Category, Item};
+    let memory = cuteafd_loader::formats::mapped_preload::host_memory()?;
+    let snapshot = cuteafd_ffi::memory_ledger::snapshot();
+    let resident = snapshot.by_scope(cuteafd_ffi::memory_ledger::Space::Pinned, -1).into_iter()
+        .map(|(scope, bytes)| Item::new(Category::of_scope(scope), scope, "pinned", bytes as u64, Basis::Exact))
+        .collect();
+    let ledger = host_admission(memory, resident, cache, tables, deferred_logits, headroom)?;
+    tracing::info!(host_budget_bytes = cache, host_ledger = %serde_json::to_string(&ledger)?,
+        "coordinator host memory admitted");
+    Ok(ledger)
+}
+
+fn host_admission((total, available): (u64, u64),
+    mut resident: Vec<cuteafd_core::memory_layout::Item>, cache: u64,
+    tables: &[(&str, u64)], deferred_logits: u64, headroom: u64)
+    -> Result<cuteafd_core::memory_layout::HostLayout> {
+    use cuteafd_core::memory_layout::{Basis, Category, HostLayout, Item, ItemLifetime, host_table_item};
+    // Resident bytes are already missing from live availability. Only these
+    // future consumers and the reserve are charged against it again.
+    resident.extend(tables.iter().map(|&(name, bytes)| host_table_item(name, bytes)));
+    resident.push(Item::new(Category::Workspace, "scoring/full-logits", "FP32", deferred_logits, Basis::Formula)
+        .with_lifetime(ItemLifetime::PostReadyReserve));
+    let ledger = HostLayout::new(total, available, headroom.max(total / 10), cache, resident)
+        .context("host admission byte count overflow")?;
+    ensure!(ledger.shortfall_bytes == 0,
+        "coordinator host memory cannot admit host cache {} plus deferred consumers {} and reserve {}: available {}, total {}, resident {}, shortfall {} bytes",
+        cache, ledger.deferred_bytes, ledger.reserve_bytes, available, total,
+        ledger.resident_bytes, ledger.shortfall_bytes);
+    Ok(ledger)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cuteafd_core::memory_layout::{Basis, Category, Item, ItemLifetime};
+
+    #[test]
+    fn named_pinned_tables_are_admitted_without_a_prefix_cache() -> Result<()> {
+        let memory = (1000, 800);
+        let resident = vec![Item::new(Category::Weights, "resident/weight", "pinned", 200, Basis::Exact)];
+        let ledger = host_admission(memory, resident, 0,
+            &[("synthetic/ordered-table", 300), ("synthetic/other-gpu", 200)], 100, 0)?;
+        assert_eq!((ledger.host_budget_bytes, ledger.resident_bytes, ledger.deferred_bytes), (0, 200, 600));
+        assert_eq!((ledger.reserve_bytes, ledger.headroom_bytes, ledger.shortfall_bytes), (100, 100, 0));
+        for (name, bytes) in [("synthetic/ordered-table", 300), ("synthetic/other-gpu", 200)] {
+            let item = ledger.items.iter().find(|item| item.group == name).unwrap();
+            assert_eq!((item.category, item.bytes, item.lifetime),
+                (Category::Staging, bytes, ItemLifetime::PostReadyReserve));
+        }
+        let encoded = serde_json::to_value(&ledger)?;
+        assert_eq!(serde_json::from_value::<cuteafd_core::memory_layout::HostLayout>(encoded)?, ledger);
+        Ok(())
+    }
+
+    #[test]
+    fn host_admission_charges_future_tables_and_prefix_once_but_not_resident_twice() -> Result<()> {
+        let memory = (1000, 700);
+        let resident = vec![Item::new(Category::Staging, "resident/table", "pinned", 300, Basis::Exact)];
+        let ledger = host_admission(memory, resident, 100, &[("synthetic/table", 200)], 100, 150)?;
+        assert_eq!((ledger.resident_bytes, ledger.deferred_bytes, ledger.headroom_bytes), (300, 300, 150));
+        assert_eq!(ledger.reserve_bytes, 150);
+        assert_eq!(host_admission(memory, vec![], 100, &[], 100, 0)?.deferred_bytes, 100);
+        Ok(())
+    }
+
+    #[test]
+    fn tables_and_prefix_must_be_admitted_in_one_complete_working_set() -> Result<()> {
+        let memory = (1000, 600);
+        let tables = [("synthetic/table", 300)];
+        assert!(host_admission(memory, vec![], 300, &[], 0, 0).is_ok());
+        assert!(host_admission(memory, vec![], 0, &tables, 0, 0).is_ok());
+        let error = host_admission(memory, vec![], 300, &tables, 0, 0).unwrap_err();
+        assert!(error.to_string().contains("shortfall 100 bytes"), "{error}");
+        Ok(())
+    }
+
+    #[test]
+    fn host_admission_refuses_available_total_and_arithmetic_shortfalls() {
+        let memory = (1000, 300);
+        let error = host_admission(memory, vec![], 0, &[("synthetic/table", 201)], 0, 0).unwrap_err();
+        assert!(error.to_string().contains("shortfall 1 bytes"), "{error}");
+        let resident = vec![Item::new(Category::Staging, "resident/table", "pinned", 800, Basis::Exact)];
+        let error = host_admission((1000, 1000), resident, 0,
+            &[("synthetic/table", 101)], 0, 0).unwrap_err();
+        assert!(error.to_string().contains("shortfall 1 bytes"), "{error}");
+        let memory = (u64::MAX, u64::MAX);
+        for (cache, tables, logits, headroom) in [
+            (0, vec![("synthetic/a", u64::MAX), ("synthetic/b", 1)], 0, 0),
+            (1, vec![("synthetic/a", u64::MAX)], 0, 0),
+            (0, vec![("synthetic/a", u64::MAX)], 1, 0),
+            (0, vec![], 1, u64::MAX),
+        ] {
+            let error = host_admission(memory, vec![], cache, &tables, logits, headroom).unwrap_err();
+            assert!(error.to_string().contains("overflow"), "{error}");
+        }
+    }
     #[test]
     fn local_layers_max_uses_shared_experts_first_policy() {
         use cuteafd_loader::placement::{Onboard, EXPERTS_FIRST_POOL_FLOOR};

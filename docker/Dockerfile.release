@@ -1,8 +1,8 @@
 # syntax=docker/dockerfile:1.7
-ARG BASE_IMAGE=nvcr.io/nvidia/pytorch:26.05-py3
+# The same digest as Dockerfile.dev and docker/release-python-lock.json base_image.
+ARG BASE_IMAGE=nvcr.io/nvidia/pytorch:26.05-py3@sha256:222d8b18e671be5c3ef91cb41727a2572a0b23f59ded6c39f373a96946f6f2ba
 FROM ${BASE_IMAGE} AS inference
 ARG TARGETARCH
-# Cache mounts stay out of layers. Reset with: docker buildx prune --filter type=exec.cachemount
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV HF_HUB_OFFLINE=1
@@ -21,31 +21,30 @@ RUN apt-get update && \
       iproute2 pciutils netcat-openbsd && \
     rm -rf /var/lib/apt/lists/*
 
-RUN --mount=type=cache,target=/root/.cache/pip,id=cuteafd-pip-${TARGETARCH},sharing=locked \
-    --mount=type=cache,target=/root/.cache/uv,id=cuteafd-uv-${TARGETARCH},sharing=locked \
-    python3 -m pip install uv && \
-    uv pip install --system --break-system-packages \
-      safetensors \
-      huggingface-hub \
-      "nvidia-cutlass-dsl[cu13]==4.6.2" \
-      "apache-tvm-ffi==0.1.12" \
-      "cuda-tile==1.5.0" \
-      "nvidia-cudnn-frontend==1.26.0" \
-      "einops==0.8.2" \
-      "ninja==1.13.0" \
-      "nvidia-ml-py==13.610.43" \
-      "tabulate==0.10.0" \
-      "transformers==5.13.0" \
-      "rich==15.0.0" && \
-    uv pip install --system --break-system-packages --no-deps \
-      "flashinfer-python==0.6.14" && \
+# Python dependencies are exactly the wheels docker/release-python-lock.json names,
+# read from the hash-checked wheelhouse build.sh passes as the `wheelhouse` build
+# context: no network, no index, no resolution and no source builds, each wheel
+# --no-deps against its locked sha256. Everything else is the digest-pinned base,
+# and `uv pip check` proves base plus lock a consistent closure. The NGC base also
+# declares pytest a runtime requirement of its bundled triton-kernels, so it is locked.
+COPY docker/release-python-lock.json /opt/cuteafd/share/RELEASE_PYTHON_LOCK.json
+COPY scripts/build/release-python-lock.py /opt/cuteafd/scripts/build/release-python-lock.py
+RUN --network=none --mount=type=bind,from=wheelhouse,target=/wheelhouse \
+    set -e; \
+    lock=/opt/cuteafd/share/RELEASE_PYTHON_LOCK.json; \
+    tool=/opt/cuteafd/scripts/build/release-python-lock.py; \
+    python3 -I "$tool" requirements --lock "$lock" --wheelhouse /wheelhouse \
+      --arch "$TARGETARCH" --only uv >/tmp/release-uv.txt; \
+    python3 -m pip install --no-index --no-deps --require-hashes --no-cache-dir \
+      -r /tmp/release-uv.txt; \
+    python3 -I "$tool" requirements --lock "$lock" --wheelhouse /wheelhouse \
+      --arch "$TARGETARCH" --exclude uv >/tmp/release-python.txt; \
+    uv pip install --system --break-system-packages --offline --no-index --no-deps \
+      --no-build --no-cache --require-hashes -r /tmp/release-python.txt; \
+    rm /tmp/release-uv.txt /tmp/release-python.txt; \
+    python3 -I "$tool" verify-installed --lock "$lock"; \
+    uv pip check; \
     python3 -c 'import torch; print(torch.__version__)'
-
-# The NGC 26.05 base declares pytest as a runtime requirement of its bundled
-# triton-kernels distribution. Keep the release environment dependency-complete
-# so the source-pinned SparkInfer installation can be checked globally below.
-RUN --mount=type=cache,target=/root/.cache/uv,id=cuteafd-uv-${TARGETARCH},sharing=locked \
-    uv pip install --system --break-system-packages pytest
 
 # Keep source/revision metadata after the expensive immutable dependency
 # layers. Rapid SparkInfer iteration should invalidate only the pinned-source
@@ -87,7 +86,9 @@ COPY scripts/build/sparkinfer-release-provenance.py /opt/cuteafd/scripts/build/s
 COPY third_party/sparkinfer.lock.json /opt/cuteafd/third_party/sparkinfer.lock.json
 COPY third_party/sparkinfer /opt/cuteafd/third_party/sparkinfer
 
-RUN --mount=type=cache,target=/root/.cache/uv,id=cuteafd-uv-${TARGETARCH},sharing=locked \
+# The editable install builds no isolated backend: the base's own setuptools and
+# packaging must satisfy SparkInfer's build-system requirements, checked first.
+RUN --network=none \
     python3 /opt/cuteafd/scripts/build/verify-sparkinfer-source.py \
       --source /opt/cuteafd/third_party/sparkinfer \
       --lock /opt/cuteafd/third_party/sparkinfer.lock.json && \
@@ -97,8 +98,10 @@ RUN --mount=type=cache,target=/root/.cache/uv,id=cuteafd-uv-${TARGETARCH},sharin
       --print-revision)" && \
     [ "${CUTEAFD_SPARKINFER_COMMIT}" != unknown ] && \
     [ "${CUTEAFD_SPARKINFER_COMMIT}" = "$locked_revision" ] && \
-    uv pip install --system --break-system-packages --no-deps \
-      --editable /opt/cuteafd/third_party/sparkinfer && \
+    python3 -I /opt/cuteafd/scripts/build/release-python-lock.py check-build-requires \
+      --pyproject /opt/cuteafd/third_party/sparkinfer/pyproject.toml && \
+    uv pip install --system --break-system-packages --offline --no-index --no-deps \
+      --no-build-isolation --no-cache --editable /opt/cuteafd/third_party/sparkinfer && \
     uv pip check && \
     python3 -c 'import importlib.metadata, pathlib, b12x; source = pathlib.Path("/opt/cuteafd/third_party/sparkinfer").resolve(); module = pathlib.Path(b12x.__file__).resolve(); assert module.is_relative_to(source), (module, source); print(importlib.metadata.version("b12x"), module)' && \
     python3 /opt/cuteafd/scripts/build/verify-sparkinfer-source.py \
@@ -107,11 +110,15 @@ RUN --mount=type=cache,target=/root/.cache/uv,id=cuteafd-uv-${TARGETARCH},sharin
       --require-no-python-cache
 
 # tool-eval-bench (MIT, pinned submodule) for the benchmark's tool-eval panel,
-# which runs it as a subprocess against the server's own API.
+# which runs it as a subprocess against the server's own API. It runs from its
+# lock-verified source through bin/tool-eval-bench, as WIP slots do, so no
+# setuptools-scm build backend is fetched; its dependencies are locked above. A
+# metadata-only dist-info carries the version a built install would report.
 COPY scripts/build/verify-tool-eval-source.py /opt/cuteafd/scripts/build/verify-tool-eval-source.py
 COPY third_party/tool-eval-bench.lock.json /opt/cuteafd/third_party/tool-eval-bench.lock.json
 COPY third_party/tool-eval-bench /opt/cuteafd/third_party/tool-eval-bench
-RUN --mount=type=cache,target=/root/.cache/uv,id=cuteafd-uv-${TARGETARCH},sharing=locked \
+COPY docker/tool-eval-bench-wrapper.sh /opt/cuteafd/bin/tool-eval-bench
+RUN --network=none \
     if [ "$CUTEAFD_ROLE" = coordinator ]; then \
       python3 /opt/cuteafd/scripts/build/verify-tool-eval-source.py \
         --source /opt/cuteafd/third_party/tool-eval-bench \
@@ -119,10 +126,17 @@ RUN --mount=type=cache,target=/root/.cache/uv,id=cuteafd-uv-${TARGETARCH},sharin
       revision="$(python3 /opt/cuteafd/scripts/build/verify-tool-eval-source.py \
         --source /opt/cuteafd/third_party/tool-eval-bench \
         --lock /opt/cuteafd/third_party/tool-eval-bench.lock.json --print-revision)" && \
-      SETUPTOOLS_SCM_PRETEND_VERSION="0.0.0+g${revision%"${revision#???????}"}" \
-        uv pip install --system --break-system-packages /opt/cuteafd/third_party/tool-eval-bench && \
-      uv pip check && tool-eval-bench --help >/dev/null; \
-    else rm -rf /opt/cuteafd/third_party/tool-eval-bench; fi
+      version="0.0.0+g${revision%"${revision#???????}"}" && \
+      meta="/opt/cuteafd/lib/tool-eval-bench/tool_eval_bench-$version.dist-info" && \
+      mkdir -p "$meta" && \
+      printf 'Metadata-Version: 2.1\nName: tool-eval-bench\nVersion: %s\n' "$version" >"$meta/METADATA" && \
+      tool-eval-bench --help >/dev/null && \
+      [ "$(PYTHONPATH=/opt/cuteafd/third_party/tool-eval-bench/src:/opt/cuteafd/lib/tool-eval-bench \
+        python3 -P -c 'import tool_eval_bench; print(tool_eval_bench.__version__)')" = "$version" ] && \
+      python3 /opt/cuteafd/scripts/build/verify-tool-eval-source.py --require-no-python-cache \
+        --source /opt/cuteafd/third_party/tool-eval-bench \
+        --lock /opt/cuteafd/third_party/tool-eval-bench.lock.json; \
+    else rm -rf /opt/cuteafd/third_party/tool-eval-bench /opt/cuteafd/bin/tool-eval-bench; fi
 
 COPY .cuteafd-release-image/cuteafd /opt/cuteafd/bin/cuteafd
 COPY .cuteafd-release-image/libcuteafd_native.so /opt/cuteafd/lib/libcuteafd_native.so

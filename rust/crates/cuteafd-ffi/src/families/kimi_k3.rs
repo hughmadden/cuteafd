@@ -3,6 +3,7 @@
 use crate::programs::{Program, ProgramSpec, Programs, Scalar};
 use crate::CuteafdDeviceBuffer as Buffer;
 use std::ffi::c_void;
+use cuteafd_core::MlaCacheFormat;
 use thiserror::Error;
 
 pub const MLA_RECORD_BYTES: usize = 1152;
@@ -56,25 +57,41 @@ pub struct KimiMla<'a> {
     producer: Program<'a>, attention: Program<'a>, output: Program<'a>,
     heads: usize, rows: usize, context: usize, splits: usize,
     scratch: [usize; 3],
+    cache_format: MlaCacheFormat,
 }
 
 impl<'a> KimiMla<'a> {
-    pub fn load(programs: &'a Programs<'a>, heads: usize, rows: usize, mode: KimiMlaMode) -> Result<Self> {
+    pub fn load(programs: &'a Programs<'a>, heads: usize, rows: usize, mode: KimiMlaMode, cache_format: MlaCacheFormat) -> Result<Self> {
         if !matches!(heads, 48 | 96) || !(1..=4096).contains(&rows) {
             return Err(KimiMlaError::Invalid("head/row geometry"));
         }
         let suffix = if heads == 48 { "" } else { "_h96" };
-        let producer = programs.program(&format!("kimik3_mla_producer{suffix}_m{rows}"), PRODUCER)?;
-        let attention = programs.program(&format!("kimik3_dense_mla_{}{suffix}_m{rows}", mode.name()), ATTENTION)?;
+        let cache = cache_format.program_suffix();
+        let producer = programs.program(&format!("kimik3_mla_producer{suffix}{cache}_m{rows}"), PRODUCER)?;
+        let attention = programs.program(&format!("kimik3_dense_mla_{}{suffix}{cache}_m{rows}", mode.name()), ATTENTION)?;
         let output = programs.program(&format!("kimik3_mla_output{suffix}_m{rows}"), OUTPUT)?;
         let (context, splits, scratch) = validate_manifest(
-            [producer.spec(), attention.spec(), output.spec()], heads, rows, mode)?;
-        Ok(Self { producer, attention, output, heads, rows, context, splits, scratch })
+            [producer.spec(), attention.spec(), output.spec()], heads, rows, mode, cache_format)?;
+        Ok(Self { producer, attention, output, heads, rows, context, splits, scratch, cache_format })
     }
 
     pub fn scratch_bytes(&self) -> [usize; 3] { self.scratch }
     pub fn max_context(&self) -> usize { self.context }
     pub fn splits(&self) -> usize { self.splits }
+
+    /// Shared dense attention after an independently projected producer. The
+    /// projected route retains the same cache/query layout and attention math.
+    pub fn attention(&self,b:KimiMlaBatch,stream:*mut c_void)->Result<()> {
+        validate_projected_attention(b,self.heads,self.rows,self.context,self.splits,self.scratch[1],
+            self.cache_format.record_bytes())?;
+        // SAFETY: metadata, device and extents checked; the caller publishes
+        // query/cache/indices first and retains storage through stream drain.
+        unsafe {self.attention.launch(&[b.query.ptr,b.cache.ptr,b.page_table.ptr,b.lengths.ptr,
+            b.query_offsets.ptr,b.attention.ptr,b.lse.ptr,b.attention_scratch.ptr],
+            &[Scalar::I32(b.rows as i32),Scalar::I32(b.requests as i32),Scalar::I64(b.page_table_width as i64),
+                Scalar::I32(b.active_splits as i32)],stream)?;}
+        Ok(())
+    }
 
     /// Enqueue without allocation of device storage, synchronization or lazy
     /// kernel loading. The owning engine serializes accesses and retains all
@@ -91,7 +108,7 @@ impl<'a> KimiMla<'a> {
         let device = b.x.device_id;
         let requirements = [
             (b.x, r * 7168 * 2), (b.slots, r * 8),
-            (b.cache, b.cache_pages * MLA_PAGE_ROWS * MLA_RECORD_BYTES),
+            (b.cache, b.cache_pages * MLA_PAGE_ROWS * self.cache_format.record_bytes()),
             (b.page_table, b.requests * b.page_table_width * 4),
             (b.lengths, b.requests * 4), (b.query_offsets, (b.requests + 1) * 4),
             (b.query, r * h * 576 * 2), (b.q_resid, r * 1536 * 2),
@@ -121,11 +138,42 @@ impl<'a> KimiMla<'a> {
     }
 }
 
-fn validate_manifest(specs: [&ProgramSpec; 3], heads: usize, rows: usize, mode: KimiMlaMode)
+fn validate_projected_attention(b:KimiMlaBatch,heads:usize,rows:usize,context:usize,splits:usize,scratch:usize,
+    record_bytes:usize)->Result<()> {
+    if b.rows==0 || b.rows>rows || b.requests==0 || b.requests>b.rows
+        || b.page_table_width==0 || b.page_table_width>context.div_ceil(MLA_PAGE_ROWS)
+        || b.cache_pages==0 || b.cache_pages>i32::MAX as usize || b.active_splits!=splits {
+        return Err(KimiMlaError::Invalid("projected attention batch/context/split geometry"));
+    }
+    let cache=b.cache_pages.checked_mul(MLA_PAGE_ROWS*record_bytes)
+        .ok_or(KimiMlaError::Invalid("projected attention cache overflow"))?;
+    let operands=[(b.query,b.rows*heads*576*2),(b.cache,cache),
+        (b.page_table,b.requests*b.page_table_width*4),(b.lengths,b.requests*4),
+        (b.query_offsets,(b.requests+1)*4),(b.attention,b.rows*heads*512*2),
+        (b.lse,b.rows*heads*4),(b.attention_scratch,scratch)];
+    validate_buffers(&operands,b.query.device_id)?;
+    for (buffer,bytes) in operands {
+        if buffer.flags!=0 || (buffer.ptr as usize).checked_add(bytes).is_none() {
+            return Err(KimiMlaError::Invalid("attention flags/address overflow"));
+        }
+    }
+    for writer in 5..8 {for other in 0..8 {
+        if writer!=other && operands[writer].1>0 && operands[other].1>0 {
+            let (a,an)=operands[writer];let (b,bn)=operands[other];
+            let start=a.ptr as usize;let end=start.checked_add(an).ok_or(KimiMlaError::Invalid("attention address overflow"))?;
+            let other_start=b.ptr as usize;let other_end=other_start.checked_add(bn).ok_or(KimiMlaError::Invalid("attention address overflow"))?;
+            if start<other_end && other_start<end {return Err(KimiMlaError::Invalid("attention operands overlap"));}
+        }
+    }}
+    Ok(())
+}
+
+fn validate_manifest(specs: [&ProgramSpec; 3], heads: usize, rows: usize, mode: KimiMlaMode, cache_format: MlaCacheFormat)
     -> Result<(usize, usize, [usize; 3])> {
     for (i, spec) in specs.iter().enumerate() {
         let geometry = &spec.geometry;
-        if spec.capacity_rows as usize != rows || geometry["heads"].as_u64() != Some(heads as u64)
+        if (i != 2 && geometry["kv_cache"].as_str() != Some(cache_format.label()))
+            || spec.capacity_rows as usize != rows || geometry["heads"].as_u64() != Some(heads as u64)
             || [("hidden", 7168), ("q_lora_rank", 1536), ("kv_lora_rank", 512),
                 ("qk_nope_dim", 128), ("qk_rope_dim", 64), ("v_head_dim", 128), ("page_rows", 64)]
                 .iter().any(|&(key, n)| geometry[key].as_u64() != Some(n))
@@ -301,6 +349,30 @@ impl<'a> KimiSitu<'a> {
     }
 }
 
+/// Gate/up accumulation policy. Compensation is an explicit comparison opt-in.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum KimiFfnMode { #[default] Direct, Compensated }
+impl KimiFfnMode {
+    pub fn name(self) -> &'static str {
+        match self { Self::Direct => "direct", Self::Compensated => "compensated" }
+    }
+
+    pub fn gate_up_stem(self, intermediate: usize) -> String {
+        let suffix = if self == Self::Compensated { "_comp" } else { "" };
+        format!("kimik3_ffn_gate_up_i{intermediate}{suffix}")
+    }
+
+    fn validate(self, spec: &ProgramSpec) -> W8Result<()> {
+        let compensated = spec.geometry.get("compensated");
+        let matches = match self {
+            Self::Direct => compensated.is_none() || compensated.and_then(|v| v.as_bool()) == Some(false),
+            Self::Compensated => compensated.and_then(|v| v.as_bool()) == Some(true),
+        };
+        if !matches { return Err(KimiW8Error::Invalid("FFN gate/up compensation manifest")); }
+        Ok(())
+    }
+}
+
 /// Dense first-layer or shared-expert MLP. The TP2 caller packs intermediate
 /// slices gate-first and owns the partial-output meet after this chain.
 pub struct KimiFfn<'a> {
@@ -322,14 +394,37 @@ pub struct KimiFfnBatch {
     pub output: Buffer,
 }
 impl<'a> KimiFfn<'a> {
-    pub fn load(programs: &'a Programs<'a>, intermediate: usize) -> W8Result<Self> {
+    pub fn load(programs: &'a Programs<'a>, intermediate: usize, mode: KimiFfnMode) -> W8Result<Self> {
         let situ = KimiSitu::load(programs, intermediate)?;
-        let gate_up = programs.program(&format!("kimik3_ffn_gate_up_i{intermediate}"), &["x", "w", "out"])?;
+        let gate_up = programs.program(&mode.gate_up_stem(intermediate), &["x", "w", "out"])?;
         let down = programs.program(&format!("kimik3_ffn_down_i{intermediate}"), &["x", "w", "out"])?;
         validate_projection_manifest(gate_up.spec(), 7168, 2 * intermediate)?;
+        mode.validate(gate_up.spec())?;
         validate_projection_manifest(down.spec(), intermediate, 7168)?;
+        KimiFfnMode::Direct.validate(down.spec())?;
         let rows = situ.rows.min(gate_up.spec().capacity_rows as usize).min(down.spec().capacity_rows as usize);
         Ok(Self { gate_up, situ, down, rows, width: intermediate })
+    }
+
+    /// Standalone BF16 projection with this FFN's gate/up geometry. It also
+    /// provides a same-weight reduction-order control for projected seams.
+    pub fn project_gate_up(&self,rows:usize,input:Buffer,weight:Buffer,output:Buffer,
+        stream:*mut c_void)->W8Result<()> {
+        validate_projection_buffers(rows,self.rows,7168,2*self.width,input,weight,output)?;
+        // SAFETY: resolved program, checked geometry/devices/disjoint output;
+        // the caller retains every operand until the stream drains.
+        unsafe {self.gate_up.launch(&[input.ptr,weight.ptr,output.ptr],&[Scalar::I32(rows as i32)],stream)?;}
+        Ok(())
+    }
+
+    /// Standalone down projection, retaining the existing BF16 reduction.
+    pub fn project_down(&self,rows:usize,input:Buffer,weight:Buffer,output:Buffer,
+        stream:*mut c_void)->W8Result<()> {
+        validate_projection_buffers(rows,self.rows,self.width,7168,input,weight,output)?;
+        // SAFETY: resolved program with validated dense disjoint operands;
+        // the caller retains all storage through completion.
+        unsafe {self.down.launch(&[input.ptr,weight.ptr,output.ptr],&[Scalar::I32(rows as i32)],stream)?;}
+        Ok(())
     }
 
     pub fn launch(&self, b: KimiFfnBatch, stream: *mut c_void) -> W8Result<()> {
@@ -816,9 +911,38 @@ mod tests {
             capacity_rows: rows as u32,
             geometry: serde_json::json!({"heads": heads, "hidden": 7168, "q_lora_rank": 1536,
                 "kv_lora_rank": 512, "qk_nope_dim": 128, "qk_rope_dim": 64, "v_head_dim": 128,
-                "page_rows": 64, "norm_eps": 1e-6, "max_context": context,
+                "page_rows": 64, "norm_eps": 1e-6, "kv_cache": "bf16", "max_context": context,
                 "num_splits": splits, "chunks_per_split": context.div_ceil(64).div_ceil(splits), "mode": mode.name()}),
         })
+    }
+
+    #[test]
+    fn projected_attention_checks_geometry_extents_and_writer_aliases() {
+        let buffer=|index|Buffer{ptr:(index*0x10000000usize)as *mut c_void,
+            bytes:0x10000000,device_id:0,flags:0};
+        let b=KimiMlaBatch{rows:8,requests:1,page_table_width:1,cache_pages:1,active_splits:16,
+            x:buffer(9),slots:buffer(10),cache:buffer(2),page_table:buffer(3),lengths:buffer(4),
+            query_offsets:buffer(5),query:buffer(1),q_resid:buffer(11),attention:buffer(6),lse:buffer(7),
+            output:buffer(12),producer_scratch:buffer(13),attention_scratch:buffer(8),output_scratch:buffer(14)};
+        let validate=|batch|validate_projected_attention(batch,96,64,1048576,16,4096,MLA_RECORD_BYTES);
+        validate(b).unwrap();
+        for bad in [KimiMlaBatch{rows:0,..b},KimiMlaBatch{rows:65,..b},
+            KimiMlaBatch{requests:9,..b},KimiMlaBatch{page_table_width:16385,..b},
+            KimiMlaBatch{cache_pages:usize::MAX,..b},KimiMlaBatch{active_splits:1,..b}] {
+            assert!(validate(bad).is_err());
+        }
+        let readers=[b.query,b.cache,b.page_table,b.lengths,b.query_offsets];
+        for reader in readers {
+            assert!(validate(KimiMlaBatch{attention:Buffer{ptr:reader.ptr,..b.attention},..b}).is_err());
+            assert!(validate(KimiMlaBatch{lse:Buffer{ptr:reader.ptr,..b.lse},..b}).is_err());
+            assert!(validate(KimiMlaBatch{attention_scratch:Buffer{ptr:reader.ptr,..b.attention_scratch},..b}).is_err());
+        }
+        for query in [Buffer{bytes:1,..b.query},Buffer{device_id:1,..b.query},Buffer{flags:1,..b.query},
+            Buffer{ptr:std::ptr::null_mut(),..b.query},
+            Buffer{ptr:(usize::MAX-15)as *mut c_void,..b.query}] {
+            assert!(validate(KimiMlaBatch{query,..b}).is_err());
+        }
+        assert!(validate(KimiMlaBatch{lse:Buffer{ptr:b.attention.ptr,..b.lse},..b}).is_err());
     }
 
     #[test]
@@ -826,24 +950,41 @@ mod tests {
         for heads in [48, 96] {
             for mode in [KimiMlaMode::Decode, KimiMlaMode::Verify, KimiMlaMode::Extend] {
                 let entries = specs(heads, 64, mode);
-                assert!(validate_manifest(entries.each_ref(), heads, 64, mode).is_ok());
+                assert!(validate_manifest(entries.each_ref(), heads, 64, mode, MlaCacheFormat::Bf16).is_ok());
                 for index in 0..3 {
                     for (key, bad) in [("heads", serde_json::json!(32)), ("hidden", serde_json::json!(4096)),
                         ("page_rows", serde_json::json!(128)), ("norm_eps", serde_json::json!(1e-5))] {
                         let mut wrong = entries.clone(); wrong[index].geometry[key] = bad;
-                        assert!(validate_manifest(wrong.each_ref(), heads, 64, mode).is_err());
+                        assert!(validate_manifest(wrong.each_ref(), heads, 64, mode, MlaCacheFormat::Bf16).is_err());
                     }
                     let mut wrong = entries.clone(); wrong[index].scratch.clear();
-                    assert!(validate_manifest(wrong.each_ref(), heads, 64, mode).is_err());
+                    assert!(validate_manifest(wrong.each_ref(), heads, 64, mode, MlaCacheFormat::Bf16).is_err());
                     let mut wrong = entries.clone(); wrong[index].scalar_kinds = b"iii".to_vec();
-                    assert!(validate_manifest(wrong.each_ref(), heads, 64, mode).is_err());
+                    assert!(validate_manifest(wrong.each_ref(), heads, 64, mode, MlaCacheFormat::Bf16).is_err());
                     let mut wrong = entries.clone(); wrong[index].capacity_rows = 4096;
-                    assert!(validate_manifest(wrong.each_ref(), heads, 64, mode).is_err());
+                    assert!(validate_manifest(wrong.each_ref(), heads, 64, mode, MlaCacheFormat::Bf16).is_err());
                 }
                 for (key, bad) in [("max_context", serde_json::json!(0)), ("num_splits", serde_json::json!(0)),
                     ("chunks_per_split", serde_json::json!(1)), ("mode", serde_json::json!("wrong"))] {
                     let mut wrong = entries.clone(); wrong[1].geometry[key] = bad;
-                    assert!(validate_manifest(wrong.each_ref(), heads, 64, mode).is_err());
+                    assert!(validate_manifest(wrong.each_ref(), heads, 64, mode, MlaCacheFormat::Bf16).is_err());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn compact_manifest_rejects_mixed_writer_reader_formats() {
+        for heads in [48, 96] {
+            for mode in [KimiMlaMode::Decode, KimiMlaMode::Verify, KimiMlaMode::Extend] {
+                let mut compact = specs(heads, 64, mode);
+                for spec in &mut compact[..2] { spec.geometry["kv_cache"] = "fp8".into(); }
+                assert!(validate_manifest(compact.each_ref(), heads, 64, mode, MlaCacheFormat::Fp8).is_ok());
+                assert!(validate_manifest(compact.each_ref(), heads, 64, mode, MlaCacheFormat::Bf16).is_err());
+                for index in 0..2 {
+                    let mut mixed = compact.clone();
+                    mixed[index].geometry["kv_cache"] = "bf16".into();
+                    assert!(validate_manifest(mixed.each_ref(), heads, 64, mode, MlaCacheFormat::Fp8).is_err());
                 }
             }
         }
@@ -954,6 +1095,25 @@ mod tests {
         for bad in [Buffer { bytes: wire.bytes - 1, ..wire }, Buffer { device_id: 1, ..wire },
             Buffer { ptr: latent.ptr, ..wire }, Buffer { ptr: std::ptr::null_mut(), ..wire }] {
             assert!(validate_expert_input_buffers(rows, rows, 1, latent, bad).is_err());
+        }
+    }
+
+    #[test]
+    fn ffn_selection_defaults_direct_and_rejects_mislabeled_numerics() {
+        assert_eq!(KimiFfnMode::default(), KimiFfnMode::Direct);
+        let site = KimiResidualSite { candidates: 1, prefix: KimiPrefixMode::Keep, append: true };
+        for intermediate in [3072, 6144, 16896, 33792] {
+            for (mode, suffix) in [(KimiFfnMode::Direct, ""), (KimiFfnMode::Compensated, "_comp")] {
+                assert_eq!(mode.gate_up_stem(intermediate), format!("kimik3_ffn_gate_up_i{intermediate}{suffix}"));
+                let mut spec = residual_spec(site);
+                spec.geometry = serde_json::json!({});
+                if mode == KimiFfnMode::Compensated { spec.geometry["compensated"] = true.into(); }
+                mode.validate(&spec).unwrap();
+                spec.geometry["compensated"] = (mode == KimiFfnMode::Direct).into();
+                assert!(mode.validate(&spec).is_err());
+                spec.geometry["compensated"] = "true".into();
+                assert!(mode.validate(&spec).is_err());
+            }
         }
     }
 

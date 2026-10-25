@@ -75,7 +75,7 @@ pub struct ModelPlan {
     /// `(compressor, index, device identity, model page)` for pages to copy.
     pub copies: Vec<(u8, u32, DevicePageId, u32)>,
     /// Per compressor, in logical order, the page references (shared or newly allocated).
-    pub pages: [Vec<u32>; COMPRESSORS],
+    pub pages: [Vec<u32>; cuteafd_hostcache::PAGE_BANKS],
     pub slab_bytes: u64,
 }
 
@@ -108,9 +108,9 @@ impl Model {
     pub fn plan(
         &mut self,
         meta: &SnapshotMeta,
-        device_pages: &[Vec<DevicePageId>; COMPRESSORS],
+        device_pages: &[Vec<DevicePageId>; cuteafd_hostcache::PAGE_BANKS],
     ) -> Key {
-        let mut pages: [Vec<u32>; COMPRESSORS] = std::array::from_fn(|_| Vec::new());
+        let mut pages: [Vec<u32>; cuteafd_hostcache::PAGE_BANKS] = std::array::from_fn(|_| Vec::new());
         let mut copies = Vec::new();
         let mut slab_bytes = self.layout.tail as u64;
         if self.layout.scores > 0 {
@@ -129,7 +129,7 @@ impl Model {
                         self.next_page += 1;
                         self.page_device.insert(page, id);
                         self.page_refs.insert(page, 0);
-                        page_bytes += self.layout.page as u64;
+                        page_bytes += self.layout.page_size(compressor) as u64;
                         copies.push((compressor as u8, index as u32, id, page));
                         page
                     }
@@ -200,7 +200,7 @@ impl Model {
     pub fn store(
         &mut self,
         meta: &SnapshotMeta,
-        device_pages: &[Vec<DevicePageId>; COMPRESSORS],
+        device_pages: &[Vec<DevicePageId>; cuteafd_hostcache::PAGE_BANKS],
     ) -> Key {
         let key = self.plan(meta, device_pages);
         self.commit(key)
@@ -244,7 +244,7 @@ impl Model {
             if self.mapped.get(&device) == Some(&page) {
                 self.mapped.remove(&device);
             }
-            self.bytes -= self.layout.page as u64;
+            self.bytes -= self.layout.page_size(device.compressor as usize) as u64;
         }
     }
 
@@ -402,8 +402,8 @@ pub enum Op {
 }
 
 /// Spread a flat page list across the compressor banks, as the engine's page lists are.
-fn distribute(pages: &[DevicePageId]) -> [Vec<DevicePageId>; COMPRESSORS] {
-    let mut device_pages: [Vec<DevicePageId>; COMPRESSORS] = std::array::from_fn(|_| Vec::new());
+fn distribute(pages: &[DevicePageId]) -> [Vec<DevicePageId>; cuteafd_hostcache::PAGE_BANKS] {
+    let mut device_pages: [Vec<DevicePageId>; cuteafd_hostcache::PAGE_BANKS] = std::array::from_fn(|_| Vec::new());
     for (index, &id) in pages.iter().enumerate() {
         device_pages[index % COMPRESSORS].push(id);
     }
