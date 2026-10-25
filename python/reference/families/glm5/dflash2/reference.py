@@ -165,8 +165,9 @@ class Drafter:
             n = rms(h, self.w["norm.weight" if last else f"layers.{l + 1}.input_layernorm.weight"])
         return n
 
-    def select(self, anchor: int, hidden: torch.Tensor) -> tuple[list[int], list[list[float]]]:
-        """Greedy candidate path over rows 1.. of the block."""
+    def select(self, anchor: int, hidden: torch.Tensor, fp32_score: bool = False) -> tuple[list[int], list[list[float]]]:
+        """Greedy candidate path over rows 1.. of the block. Scores are BF16 sums (the GLM port);
+        `fp32_score` adds the unary logit and the BF16 edge in FP32, as SGLang's DFlash2 selector."""
         rows = hidden[1:]
         logits = F.linear(rows, self.lm_head)
         unary, candidates = torch.topk(logits, self.topk, dim=-1)
@@ -177,7 +178,7 @@ class Drafter:
         for i in range(rows.shape[0]):
             conditioned = pred_cb[previous] * projected[i]
             transition = torch.einsum("r,kr->k", conditioned, succ_cb[candidates[i]])
-            scores = (unary[i] + transition).float()
+            scores = unary[i].float() + transition.float() if fp32_score else (unary[i] + transition).float()
             best = scores.max()
             index = int((scores == best).nonzero()[0])
             runner = torch.where(torch.arange(self.topk, device=scores.device) == index,

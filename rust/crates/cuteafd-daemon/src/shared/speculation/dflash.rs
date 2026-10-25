@@ -992,6 +992,9 @@ pub(crate) struct DflashDrafter<'a> {
     /// How the borrowed BF16 head runs past one draft block ([`DraftHead`]; GLM 5.3
     /// Flash's --draft-head). [`DraftHead::Exact`] unless the target sets it.
     head_mode: Cell<DraftHead>,
+    /// The selector scores candidates in FP32 (SGLang's DFlash2 selector) rather than rounding
+    /// each score to BF16 (the GLM ports).
+    selector_fp32: Cell<bool>,
     /// How the FP8 GEMMs run (GLM 5.3 Flash's --draft-linear), and the latest mode the FP8
     /// scratch was admitted for.
     fp8_rows: Cell<fp8_linear::Fp8Rows>,
@@ -1184,7 +1187,9 @@ impl<'a> DflashDrafter<'a> {
     pub(crate) fn confidence_key(&self, family: &str, fp8_head: bool) -> String {
         let head = if fp8_head { "head-fp8-row".into() } else { format!("head-bf16-{:?}", self.head_mode.get()) };
         let kv = if self.kv_cache == cuteafd_loader::families::qwen4::Qwen4KvCache::Fp8 { "-kv-fp8" } else { "" };
-        let numerics = format!("{}-{:?}-{head}-{:?}{kv}-r1", self.representation.name(), self.fp8_rows.get(),
+        // An FP32-scored selector's features are their own distribution.
+        let score = if self.selector_fp32.get() { "-score-fp32" } else { "" };
+        let numerics = format!("{}-{:?}-{head}-{:?}{kv}{score}-r1", self.representation.name(), self.fp8_rows.get(),
             self.confidence_scales).to_ascii_lowercase();
         format!("{family}/dflash2/{numerics}")
     }
@@ -1307,6 +1312,7 @@ impl<'a> DflashDrafter<'a> {
             fp8_workspace,
             timing: crate::shared::draft::timing::DraftTiming::from_env(library, "glm-dflash")?,
             head_mode: Cell::new(DraftHead::Exact),
+            selector_fp32: Cell::new(false),
             fp8_rows: Cell::new(fp8_rows),
             fp8_admitted: fp8_rows,
             cfg,
@@ -1406,7 +1412,8 @@ impl<'a> DflashDrafter<'a> {
                 layout, slots: owners.take("context_slots")? }),
             mask_row: Vec::new(), workspace: RefCell::new(Some(workspace)), startup_primed: Cell::new(false), representation,
             fp8_workspace: if representation == GlmDraftRepresentation::Fp8Only { Some(owners.take("fp8_scratch")?) } else { None },
-            head_mode: Cell::new(DraftHead::Exact), fp8_rows: Cell::new(fp8_rows), fp8_admitted: fp8_rows,
+            head_mode: Cell::new(DraftHead::Exact), selector_fp32: Cell::new(false), fp8_rows: Cell::new(fp8_rows),
+            fp8_admitted: fp8_rows,
             confidence_directory: snapshot.into(), confidence_scales: scales,
             timing: crate::shared::draft::timing::DraftTiming::from_env(library, "mla-dflash")?, cfg,
         };
@@ -1427,6 +1434,12 @@ impl<'a> DflashDrafter<'a> {
     /// ignores it).
     pub fn set_draft_head(&self, mode: DraftHead) {
         self.head_mode.set(mode);
+    }
+
+    /// Whether the selector scores candidates in FP32 (SGLang's DFlash2 selector) from now on,
+    /// rather than rounding each score to BF16 (the GLM ports' default).
+    pub fn set_selector_fp32(&self, fp32: bool) {
+        self.selector_fp32.set(fp32);
     }
 
     pub(crate) fn draft_head_mode(&self) -> DraftHead {
@@ -2355,7 +2368,9 @@ impl<'a> DflashDrafter<'a> {
             let select_span = self.timing.begin("selector_confidence", None, rows, s)?;
             self.linear(w.n.buffer.ptr, &self.projection, 0,
                 w.projected.buffer.ptr, rows, h, c.rank)?;
-            l.glm_dflash_select(self.predecessor.buffer.ptr, self.successor.buffer.ptr, w.projected.buffer.ptr,
+            let select = if self.selector_fp32.get() { NativeLibrary::glm_dflash_select_fp32_score }
+                else { NativeLibrary::glm_dflash_select };
+            select(l, self.predecessor.buffer.ptr, self.successor.buffer.ptr, w.projected.buffer.ptr,
                 w.candidates.buffer.ptr, w.unary.buffer.ptr, w.anchors.buffer.ptr, w.tokens.buffer.ptr,
                 w.features.buffer.ptr, s_count, block, c.drafts(), c.rank, s)?;
             self.timing.end(select_span, s)?;
@@ -2524,6 +2539,8 @@ pub(crate) fn replay_with(drafter: &(impl ReplayDrafter + ?Sized), tokens: &[u32
         let mut out = Vec::with_capacity(anchors.len());
         let mut rows_seen = Vec::new();
         let (mut text, mut greedy_ok, mut first) = (0usize, 0usize, 0usize);
+        // Anchors whose first k drafts all hold against the greedy picks, k = 1..=drafts.
+        let mut reached = vec![0usize; drafts];
         for &p in &anchors {
             while done < p {
                 let n = (p - done).min(drafter.tap_rows());
@@ -2544,6 +2561,7 @@ pub(crate) fn replay_with(drafter: &(impl ReplayDrafter + ?Sized), tokens: &[u32
                 kept += 1;
             }
             greedy_ok += kept;
+            reached[..kept].iter_mut().for_each(|count| *count += 1);
             first += usize::from(draft[0] == greedy[p]);
             out.push(draft);
         }
@@ -2553,6 +2571,12 @@ pub(crate) fn replay_with(drafter: &(impl ReplayDrafter + ?Sized), tokens: &[u32
             greedy {:.1}%, draft median {:.3} ms (p10 {:.3}, p90 {:.3})", mode.name,
             anchors.len(), text as f64 / n, greedy_ok as f64 / n, 100.0 * first as f64 / n,
             1e3 * seconds[seconds.len() / 2], 1e3 * seconds[seconds.len() / 10], 1e3 * seconds[seconds.len() * 9 / 10]);
+        println!("draft replay {} by position vs greedy (all of 1..k held; conditional on k - 1):{}", mode.name,
+            reached.iter().enumerate().map(|(k, &count)| {
+                let before = if k == 0 { anchors.len() } else { reached[k - 1] };
+                format!(" {}: {:.1}% ({:.1}%)", k + 1, 100.0 * count as f64 / n,
+                    100.0 * count as f64 / before.max(1) as f64)
+            }).collect::<String>());
         outputs.push(out);
         hidden.push(rows_seen);
         // Draft steps of several sequences (slot i drafts at the last anchor's position).

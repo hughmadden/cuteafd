@@ -85,6 +85,10 @@ pub(crate) struct GoldenArgs {
     /// taps the residual after each target layer.
     #[arg(long, requires = "draft", hide = true, default_value_t = 0, allow_hyphen_values = true)]
     draft_tap_shift: i64,
+    /// With --draft: the selector's scores, FP32 (SGLang's, serving's default) or BF16-rounded
+    /// (reference.py --selector-score).
+    #[arg(long, hide = true, default_value = "fp32", value_parser = ["fp32", "bf16"])]
+    draft_selector_score: String,
 }
 
 fn selection(args: &GoldenArgs) -> Result<Vec<usize>> {
@@ -484,7 +488,7 @@ fn draft_diagnostics(args: &GoldenArgs, cfg: &MiniMaxM3Config, checkpoint: &Chec
     let (embed, head_tensor) = (tensor(super::weights::EMBEDDING)?, tensor("language_model.lm_head.weight")?);
     dflash::check_target_head_source(&head_tensor.meta, cfg.hidden, cfg.vocab_size)?;
     let contract = super::dflash::Contract::open(draft, args.draft_fp8, args.draft_kv_cache, 8, library.sm_count()?,
-        args.draft_causal)?;
+        args.draft_causal, args.draft_selector_score == "fp32")?;
     let file = dflash::prefetch(draft);
     let stream = Stream::new(device)?;
     let (embedding, ()) = TokenEmbedding::load(&library, EmbedSource::new(&args.snapshot, &embed.shard, &embed.meta,
@@ -704,7 +708,9 @@ mod tests {
         assert_eq!((replay.draft_replay, replay.draft_fp8, replay.draft_kv_cache), (Some(64), Some(false), Qwen4KvCache::Bf16));
         let oracle = args(&["--draft", "/draft", "--draft-oracle", "/oracle"]);
         assert_eq!((oracle.draft_oracle.as_deref(), oracle.draft_fp8), (Some(Path::new("/oracle")), None));
-        assert_eq!(oracle.draft_tap_shift, 0);
+        assert_eq!((oracle.draft_tap_shift, oracle.draft_selector_score.as_str()), (0, "fp32"));
+        assert_eq!(args(&["--draft", "/draft", "--draft-replay", "64", "--draft-selector-score", "bf16"])
+            .draft_selector_score, "bf16");
         assert_eq!(args(&["--draft", "/draft", "--draft-replay", "64", "--draft-tap-shift", "-1"]).draft_tap_shift, -1);
         assert_eq!(oracle.draft_kv_cache, Qwen4KvCache::Fp8);
         for extra in [&["--draft-replay", "64"][..], &["--draft-oracle", "/oracle"],

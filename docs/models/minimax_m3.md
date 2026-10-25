@@ -72,8 +72,10 @@ Status: **under qualification**. `serve-minimax` serves the release from a
   GEMMs load as one E4M3 copy by default (`SPECULATOR_FP8=off` keeps the checkpoint's BF16),
   the rings as FP8 K/V (`DRAFT_KV_CACHE=bf16`). `minimax-golden --draft SNAPSHOT
   --draft-replay P` replays it on a golden window's taps; `--draft-oracle DIR` compares it with
-  `python/reference/families/minimax_m3/dflash2/reference.py`. Every request drafts its whole
-  room; the shared scheduler then prices each draft's selector features (margin, candidate
+  `python/reference/families/minimax_m3/dflash2/reference.py`. The selector scores each top-16
+  candidate as its unary logit plus the BF16 edge in FP32, as SGLang's DFlash2 selector does (the
+  GLM ports round the score to BF16; hidden `--draft-selector-score bf16` keeps that A/B). Every
+  request drafts its whole room; the shared scheduler then prices each draft's selector features (margin, candidate
   probability, entropy, rank) through the keyed `SelectorFit`
   (`draft-confidence.<numerics>.json` beside the drafter's config; the generic GLM-5.3 fit until
   one is fitted). With `SPECULATION_TRACE` the scheduler writes the `draft_confidence` records
