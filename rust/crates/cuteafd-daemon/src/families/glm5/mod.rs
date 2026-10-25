@@ -445,6 +445,14 @@ pub(crate) struct GoldenArgs {
     /// numerics checks between builds).
     #[arg(long)]
     pub bench_dump: Option<PathBuf>,
+    /// Row-width invariance after --prefill tokens (default 512): verify the same
+    /// teacher-forced rows at each of these widths (comma-separated; 1 runs first and
+    /// again last as a determinism check), rewinding between widths, and compare every
+    /// shared row's per-layer residual and logits bitwise against width 1's. Reports the
+    /// first layer that differs for each (width, row). Layer downloads run the steps
+    /// uncaptured, on the same kernels.
+    #[arg(long, value_delimiter = ',')]
+    pub width_invariance: Vec<usize>,
     /// With --bench-verify: prefill this many tokens (the golden prompt
     /// repeated) instead of --prefill, for long-context step costs.
     #[arg(long)]
@@ -1201,6 +1209,115 @@ fn nll_run(args: &GoldenArgs, opened: &Opened, engine: &engine::GlmEngine<'_>, m
 
 /// --bench-verify: verify-step cost by rows (the DFlash2 policy's step
 /// table) with the host's phase split, then the drafter step by sequences.
+/// One verify step of `rows` teacher-forced rows from `start`: every layer's residual
+/// rows (BF16, the real rows only) and the logits, then the sequence rewinds.
+fn hooked_verify(engine: &engine::GlmEngine<'_>, placement: &mut engine::GlmPlacement, start: usize,
+    tokens: &[u32], mut transport: Option<&mut SparkLink<'_>>, runtime: &tokio::runtime::Runtime)
+    -> Result<(Vec<Vec<u8>>, Vec<f32>, Vec<engine::WidthTap>)> {
+    let rows = tokens.len();
+    let row_bytes = engine.cfg.hidden * 2;
+    let mut layers = Vec::new();
+    let mut hook = |_: usize, h: &[u8]| -> Result<()> {
+        layers.push(h[..rows * row_bytes].to_vec());
+        Ok(())
+    };
+    placement.len = start;
+    *engine.width_taps.borrow_mut() = Some(Vec::new());
+    let logits = engine.verify(&mut [(placement, rows)], tokens, transport.as_deref_mut().map(|t| (t, runtime)),
+        Some(&mut hook));
+    let taps = engine.width_taps.borrow_mut().take().unwrap_or_default();
+    let logits = logits?.context("width invariance needs every layer")?;
+    placement.len = start;
+    Ok((layers, logits, taps))
+}
+
+/// Where a differing row first departs inside its first differing MoE layer:
+/// the MoE input (attention and norm), the staged routes (router), or the
+/// routed + shared output (Spark experts, exchange and reduce).
+fn tap_split(taps: &[engine::WidthTap], reference: &[engine::WidthTap], row: usize, hidden: usize, topk: usize) -> String {
+    let rows = |tap: &engine::WidthTap| tap.routes.len() / (topk * 8);
+    for (tap, base) in taps.iter().zip(reference) {
+        let x = tap.x[row * hidden * 2..(row + 1) * hidden * 2] != base.x[..hidden * 2];
+        let (n, m) = (rows(tap), rows(base));
+        let route = |t: &engine::WidthTap, n: usize, r: usize| (t.routes[r * topk * 4..(r + 1) * topk * 4].to_vec(),
+            t.routes[n * topk * 4 + r * topk * 4..n * topk * 4 + (r + 1) * topk * 4].to_vec());
+        let (ids, weights) = route(tap, n, row);
+        let (base_ids, base_weights) = route(base, m, 0);
+        let delta = tap.delta[row * hidden * 2..(row + 1) * hidden * 2] != base.delta[..hidden * 2];
+        if x || ids != base_ids || weights != base_weights || delta {
+            return format!(" [MoE layer {}: input {} ids {} weights {} output {}]", tap.layer,
+                if x { "differs" } else { "same" }, if ids != base_ids { "differ" } else { "same" },
+                if weights != base_weights { "differ" } else { "same" }, if delta { "differs" } else { "same" });
+        }
+    }
+    String::new()
+}
+
+/// [`GoldenArgs::width_invariance`].
+fn width_invariance(args: &GoldenArgs, engine: &engine::GlmEngine<'_>,
+    mut transport: Option<&mut SparkLink<'_>>, runtime: &tokio::runtime::Runtime) -> Result<()> {
+    let tokens: Vec<u32> = std::fs::read(args.golden.join("tokens.bin"))?
+        .chunks_exact(4).map(|b| u32::from_le_bytes(b.try_into().unwrap())).collect();
+    let max_rows = *args.width_invariance.iter().max().unwrap();
+    ensure!(args.width_invariance.iter().all(|&w| (1..=engine::DECODE_ROWS).contains(&w)),
+        "--width-invariance takes widths 1..={}", engine::DECODE_ROWS);
+    ensure!(transport.is_some() || engine.skip_routed(), "--width-invariance needs Spark peers or --skip-routed-experts");
+    let prefill = args.prefill.unwrap_or(512);
+    let tokens: Vec<u32> = tokens.iter().copied().cycle().take(prefill + max_rows).collect();
+    let mut placement = engine::PageAllocator::new(engine).admit(prefill + max_rows)?;
+    for chunk in tokens[..prefill].chunks(engine.prefill_capacity()) {
+        engine.prefill(&mut placement, chunk, transport.as_deref_mut().map(|t| (t, runtime)), None)?;
+    }
+    let start = placement.len;
+    let row_bytes = engine.cfg.hidden * 2;
+    let vocab = engine.cfg.vocab_size;
+    // Width 1 at every row position is the reference: a decode step of that row alone
+    // after the rows before it (teacher-forced, so each sees the same history).
+    let mut reference: Vec<(Vec<Vec<u8>>, Vec<f32>, Vec<engine::WidthTap>)> = Vec::new();
+    for r in 0..max_rows {
+        // Rows before r enter the cache through width-1 steps too, so every width's row r
+        // sees byte-identical history.
+        for k in 0..r {
+            placement.len = start + k;
+            engine.verify(&mut [(&mut placement, 1)], &tokens[start + k..start + k + 1],
+                transport.as_deref_mut().map(|t| (t, runtime)), None)?;
+        }
+        let (layers, logits, taps) = hooked_verify(engine, &mut placement, start + r, &tokens[start + r..start + r + 1],
+            transport.as_deref_mut(), runtime)?;
+        reference.push((layers, logits, taps));
+    }
+    println!("width invariance after {prefill} tokens: rows compared bitwise against width-1 decode at the same \
+        position and history (first differing layer per row; L = logits)");
+    let mut widths = vec![1];
+    widths.extend(args.width_invariance.iter().copied().filter(|&w| w > 1));
+    widths.push(1);
+    let mut clean = true;
+    for (pass, &width) in widths.iter().enumerate() {
+        let (layers, logits, taps) = hooked_verify(engine, &mut placement, start, &tokens[start..start + width],
+            transport.as_deref_mut(), runtime)?;
+        let mut differing = Vec::new();
+        for r in 0..width {
+            let (ref_layers, ref_logits, ref_taps) = &reference[r];
+            let layer = (0..layers.len()).find(|&i| layers[i][r * row_bytes..(r + 1) * row_bytes]
+                != ref_layers[i][..row_bytes]);
+            let logits_differ = logits[r * vocab..(r + 1) * vocab].iter().map(|v| v.to_bits())
+                .ne(ref_logits[..vocab].iter().map(|v| v.to_bits()));
+            if layer.is_some() || logits_differ {
+                let max = logits[r * vocab..(r + 1) * vocab].iter().zip(&ref_logits[..vocab])
+                    .map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+                differing.push(format!("row {r}: layer {} (max |dlogit| {max:.3e}){}",
+                    layer.map_or("L".to_string(), |i| i.to_string()),
+                    tap_split(&taps, ref_taps, r, engine.cfg.hidden, engine.cfg.topk)));
+            }
+        }
+        clean &= differing.is_empty();
+        println!("  width {width:2}{}: {}", if pass + 1 == widths.len() { " (repeat)" } else { "" },
+            if differing.is_empty() { "bitwise identical".to_string() } else { differing.join("; ") });
+    }
+    println!("width invariance: {}", if clean { "PASS" } else { "FAIL" });
+    Ok(())
+}
+
 fn bench_verify(args: &GoldenArgs, engine: &engine::GlmEngine<'_>,
     mut transport: Option<&mut SparkLink<'_>>, runtime: &tokio::runtime::Runtime, max_rows: usize) -> Result<()> {
     let tokens: Vec<u32> = std::fs::read(args.golden.join("tokens.bin"))?
@@ -1351,6 +1468,9 @@ fn golden_run(args: &GoldenArgs, opened: &Opened, engine: &engine::GlmEngine<'_>
     }
     if let Some(rows) = args.bench_verify {
         return bench_verify(args, engine, transport, runtime, rows);
+    }
+    if !args.width_invariance.is_empty() {
+        return width_invariance(args, engine, transport, runtime);
     }
     if let Some(at) = args.resume_at {
         let tokens: Vec<u32> = std::fs::read(args.golden.join("tokens.bin"))?
