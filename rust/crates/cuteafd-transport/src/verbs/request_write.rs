@@ -640,6 +640,52 @@ mod tests {
         Ok(())
     }
 
+    /// N waves rotating over N registered egress slots, each a multi-part
+    /// request (WRITE tails, then the head SEND): rewriting slot `w % N`
+    /// (`drain_egress_reads`, which retires completions oldest first while
+    /// the slot is still read) retires exactly wave `w - N`'s parts and
+    /// leaves every other wave's WRs on the wire. Copied (unregistered)
+    /// frames in between never hold a slot.
+    #[test]
+    fn egress_slot_rewrite_retires_only_its_own_wave_while_others_stay_in_flight() -> Result<()> {
+        for slots in [2usize, 3, 4] {
+            for parts in [1usize, 2, 102] {
+                let mut queue = SendQueue::default();
+                // Per in-flight request, oldest first: its WRs still posted.
+                let mut wire: VecDeque<(Option<usize>, usize)> = VecDeque::new();
+                for wave in 0..1024usize {
+                    let slot = wave % slots;
+                    let before: Vec<_> = wire.iter().copied().collect();
+                    // `drain_egress_reads`: one completion at a time while the slot is read.
+                    while queue.reads_egress(slot) {
+                        queue.completed(1)?;
+                        let front = wire.front_mut().unwrap();
+                        front.1 -= 1;
+                        if front.1 == 0 { wire.pop_front(); }
+                    }
+                    // Only wave `wave - slots` (and copied frames older than it) retired.
+                    let retired = before.len() - wire.len();
+                    let readers = before.iter().take(retired).filter(|(reads, _)| reads.is_some()).count();
+                    assert_eq!(readers, usize::from(wave >= slots), "{slots} slots, {parts} parts: wave {wave}");
+                    assert!(wire.iter().all(|&(reads, _)| reads != Some(slot)));
+                    assert_eq!(wire.iter().filter(|(reads, _)| reads.is_some()).count(), wave.min(slots - 1),
+                        "the other waves' requests stay in flight");
+                    assert_eq!(queue.in_flight, wire.iter().map(|&(_, n)| n).sum::<usize>());
+                    queue.posted_request(Some(slot))?;
+                    for part in 0..parts { queue.posted_part(part + 1 == parts)?; }
+                    wire.push_back((Some(slot), parts));
+                    if wave % 3 == 1 {
+                        // A decode-sized copied frame between prefill waves.
+                        queue.posted_request(None)?;
+                        queue.posted_part(true)?;
+                        wire.push_back((None, 1));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// The serving sequence that failed on GLM K4 max (`request part without
     /// a request`): `LocalTp4Client::post` reaps each rank's CQ between that
     /// rank's part posts, so every earlier WRITE can complete while later
