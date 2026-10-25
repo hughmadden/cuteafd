@@ -48,9 +48,24 @@ impl LaneSet {
     /// The first lane's error wins when both fail.
     pub async fn join(&self, first: impl Future<Output = Result<()>>, second: impl Future<Output = Result<()>>)
         -> Result<()> {
-        let (first, second) = tokio::join!(first, second);
+        let joined = std::pin::pin!(async { tokio::join!(first, second) });
+        let (first, second) = paced(joined).await;
         first.and(second)
     }
+}
+
+/// Lanes wait by yielding (stream queries, reply and commit polls), so the
+/// executor re-polls at once: `--host-wait spin` keeps that; `block` polls
+/// every [`PACE_SLEEP`] instead, adding at most that to a wake.
+const PACE_SLEEP: std::time::Duration = std::time::Duration::from_micros(20);
+
+async fn paced<F: Future>(mut future: std::pin::Pin<&mut F>) -> F::Output {
+    let block = cuteafd_transport::wait_policy::wait_policy().wait == cuteafd_transport::wait_policy::HostWait::Block;
+    std::future::poll_fn(move |context| {
+        let poll = future.as_mut().poll(context);
+        if poll.is_pending() && block { std::thread::sleep(PACE_SLEEP); }
+        poll
+    }).await
 }
 
 /// Balance a drained request cohort before admission. Preserve the first
