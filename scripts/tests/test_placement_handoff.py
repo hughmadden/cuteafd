@@ -35,7 +35,7 @@ class PlacementHandoffTest(unittest.TestCase):
             root=Path(directory); (root/'plan').write_text(json.dumps(plan))
             for name in ['docker','ssh','nest']:
                 path=root/name;path.write_text(STUB);path.chmod(0o755)
-            env=dict(os.environ,HOME=str(root/"home"),PATH=str(root)+os.pathsep+os.environ['PATH'],EVENTS=str(root/'events'),PLAN=str(root/'plan'),
+            env=dict(os.environ,PWD=str(ROOT),HOME=str(root/"home"),PATH=str(root)+os.pathsep+os.environ['PATH'],EVENTS=str(root/'events'),PLAN=str(root/'plan'),
                 ENCODER_PLAN=json.dumps(encoder))
             setup=r'''
 set -euo pipefail
