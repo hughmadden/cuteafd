@@ -1010,6 +1010,7 @@ if [[ -n "$wip_slot" ]]; then
   wip_coordinator_container="$(release_wip_container coordinator)"
   wip_spark_container="$(release_wip_container spark-expert)"
   wip_layout="$HOME/.cache/cuteafd/wip-run/$WIP_LAYOUT_SLOT"
+  ((dry_run == 0)) || { release_private_wip_layout; wip_layout="$RELEASE_PRIVATE_WIP_LAYOUT"; }
   release_ensure_dev_image "$COORDINATOR_DOCKER_INFERENCE"
   release_stage_wip_layout "$wip_coordinator_container" "$wip_slot" coordinator "$wip_layout"
   engine_commit="wip-$wip_slot-$(sha256sum "$wip_layout/lib/libcuteafd_native.so" | cut -c1-12)"
@@ -1093,7 +1094,7 @@ for host in "${hosts[@]}"; do
   # arguments into one remote shell line, so an empty argument is elided and
   # every later positional shifts; the optional EXL3 family tag therefore
   # travels as a sentinel and the host name sits ahead of it.
-  spark_manifest="$(release_ssh -o ConnectTimeout=10 "$host" bash -s -- "$SPARK_EXPERT_DOCKER_INFERENCE" "$engine_commit" "$sparkinfer_commit" "$snapshot_rel" "$host" "$model_is_exl3" "${exl3_family_tag:-__none__}" "${wip_slot:-__none__}" "${wip_spark_container:-__none__}" "${WIP_LAYOUT_SLOT:-__none__}" "${WIP_ROOT:-__default__}" "${WIP_INSTANCE:-__none__}" "$namespace_root" <<'REMOTE'
+  spark_manifest="$(release_ssh -o ConnectTimeout=10 "$host" bash -s -- "$SPARK_EXPERT_DOCKER_INFERENCE" "$engine_commit" "$sparkinfer_commit" "$snapshot_rel" "$host" "$model_is_exl3" "${exl3_family_tag:-__none__}" "${wip_slot:-__none__}" "${wip_spark_container:-__none__}" "${WIP_LAYOUT_SLOT:-__none__}" "${WIP_ROOT:-__default__}" "${WIP_INSTANCE:-__none__}" "$namespace_root" "$dry_run" <<'REMOTE'
 set -euo pipefail
 image="$1"; engine="$2"; sparkinfer="$3"; snapshot_rel="$4"; host="$5"
 exl3="$6"; exl3_family="${7:-__none__}"; wip_slot="${8:-__none__}"
@@ -1101,6 +1102,7 @@ wip_spark_container="${9:-cuteafd-spark-expert-wip}"
 wip_layout_slot="${10:-$wip_slot}"
 wip_root_arg="${11:-__default__}"; wip_instance_arg="${12:-__none__}"
 namespace_root="${13:-/mnt/sparknest}"
+dry_run="${14:-0}"
 [[ "$wip_instance_arg" != __none__ ]] || wip_instance_arg=
 [[ "$wip_root_arg" != __default__ ]] || wip_root_arg="$HOME/.cache/cuteafd/builds/wip${wip_instance_arg:+-$wip_instance_arg}"
 wip_cp() { # slot files come from the container when it exists, else from the WIP root
@@ -1137,6 +1139,12 @@ if find "$hf_home/$snapshot_rel" -xtype l -print -quit | grep -q .; then
 fi
 if [[ "$wip_slot" != __none__ ]]; then
   layout="$HOME/.cache/cuteafd/wip-run/$wip_layout_slot"
+  if [[ "$dry_run" == 1 ]]; then
+    # A dry run stages a private copy: a live worker may mount the shared layout.
+    mkdir -p "$HOME/.cache/cuteafd/wip-run"
+    layout="$(mktemp -d "$HOME/.cache/cuteafd/wip-run/.dry-run.XXXXXX")"
+    trap 'rm -rf -- "$layout" "$layout.tmp"' EXIT
+  fi
   rm -rf "$layout.tmp" && mkdir -p "$layout.tmp/raw"
   wip_cp "slots/$wip_slot/spark-expert/workspace/.cuteafd-wip/." "$layout.tmp/raw/" ||
     die "WIP slot $wip_slot has no spark-expert artifacts in $wip_spark_container or $wip_root_arg"
@@ -1158,7 +1166,6 @@ if [[ "$wip_slot" != __none__ ]]; then
   rm -rf "$layout.tmp/raw" "$layout" && mv "$layout.tmp" "$layout"
 fi
 if [[ "$exl3" == true && "$wip_slot" != __none__ ]]; then
-  layout="$HOME/.cache/cuteafd/wip-run/$wip_layout_slot"
   if [ -f "$layout/lib/exl3/exl3-$exl3_family/manifest.json" ]; then cat "$layout/lib/exl3/exl3-$exl3_family/manifest.json"; else cat "$layout/lib/exl3/manifest.json"; fi
 elif [[ "$exl3" == true ]]; then
   docker run --rm --network none --entrypoint /bin/sh "$image" -c \
@@ -1728,9 +1735,11 @@ if [[ -n "$wip_slot" ]]; then
   wip_coordinator_container="$(release_wip_container coordinator)"
   wip_spark_container="$(release_wip_container spark-expert)"
   coordinator_image="$(get COORDINATOR_DOCKER_DEV cuteafd-coordinator-dev)"
-  release_ensure_dev_image "$coordinator_image"
+  # Progress and the slot's source check go to stderr: a dry run's stdout is its deployment JSON.
+  release_ensure_dev_image "$coordinator_image" >&2
   wip_layout="$HOME/.cache/cuteafd/wip-run/$WIP_LAYOUT_SLOT"
-  release_stage_wip_layout "$wip_coordinator_container" "$wip_slot" coordinator "$wip_layout"
+  ((dry_run == 0)) || { release_private_wip_layout; wip_layout="$RELEASE_PRIVATE_WIP_LAYOUT"; }
+  release_stage_wip_layout "$wip_coordinator_container" "$wip_slot" coordinator "$wip_layout" >&2
   wip_mount_args=(-v "$wip_layout/bin:/opt/cuteafd/bin:ro" -v "$wip_layout/lib:/opt/cuteafd/lib:ro"
     -v "$wip_layout/share:/opt/cuteafd/share:ro"
     -v "$wip_layout/source:/source:ro" -e PYTHONPATH=/source/third_party/sparkinfer
@@ -2785,6 +2794,7 @@ audio_encoder_hash=""
   elif [[ "$selected_ranks" != "$ranks" ]]; then
     # Re-resolve count-dependent MTP, ingress and local flags before launching.
     export SPARK_COUNT="$selected_ranks"
+    release_remove_private_wip_layout # exec runs no EXIT trap; the next run stages its own
     exec bash "$repo_root/scripts/launch/run-family.sh" "${launch_argv[@]}"
   fi
   deployment_peer_csv="$(jq -er '.peers | join(",")' <<<"$plan_json")"
@@ -2816,7 +2826,7 @@ if [[ -n "$expert_input" && "$expert_input" != fp8 ]]; then
   printf -v preflight_command '%q ' docker run --rm -i --entrypoint python3 "$spark_image" - "$expert_geometry" "tp$ranks" 4096
   for ((rank = 0; rank < ranks; rank++)); do
     host="$(get "SPARK_${rank}_HOST")"
-    if ! ssh "$host" "$preflight_command" < "$repo_root/scripts/launch/preflight-fp8-bf16.py"; then
+    if ! ssh "$host" "$preflight_command" < "$repo_root/scripts/launch/preflight-fp8-bf16.py" >&2; then
       echo "$host cannot serve EXPERT_INPUT=$expert_input; build $expert_geometry:fp8 with CUTEAFD_RELEASE_FP8_MOE_BF16_FAMILIES=$expert_geometry (or its WIP equivalent)" >&2
       exit 2
     fi
@@ -2893,6 +2903,7 @@ peers=()
 if ((dry_run)); then
   # No serving container, restart or remote staging below this point is allowed
   # during validation. Runtime-only proofs (including audio exports) stay pending.
+  # The deployment JSON is the whole of stdout; notes went to stderr.
   printf '%s\n' "$deployment_json"
   exit 0
 fi

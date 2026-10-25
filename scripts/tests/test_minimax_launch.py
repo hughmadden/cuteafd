@@ -118,14 +118,22 @@ def test_minimax_refuses_push_loading(tmp_path):
 
 
 def test_minimax_dry_run_takes_the_shared_deployment_plan(tmp_path):
+    # A live server of the same slot and instance mounts this staged layout.
+    live = tmp_path / "home/.cache/cuteafd/wip-run/qualification/serve-default"
+    (live / "bin").mkdir(parents=True)
+    (live / "bin" / "cuteafd").write_text("live")
     result = _launch(tmp_path, extra_args=("--wip", "qualification", "--dry-run"))
     assert result.returncode == 0, result.stderr
-    # The last line is the deployment the launch would take (the slot's source check prints first).
-    deployment = json.loads(result.stdout.splitlines()[-1])
+    # Stdout is the deployment the launch would take and nothing else (notes go to stderr).
+    deployment = json.loads(result.stdout)
     assert deployment["family"] == "minimax_m3" and deployment["wip_launchable"]
     plan = _line(result, "cuteafd plan")
     assert _flag(plan, "--spark-ranks") == "4" and "--deployment" in plan
     assert "docker run -d" not in result.stderr and "serve-minimax --snapshot" not in result.stderr
+    # It planned from a private copy of the slot, which it removed; the live layout is untouched.
+    assert "/wip-run/.dry-run." in plan
+    assert (live / "bin" / "cuteafd").read_text() == "live"
+    assert [path.name for path in live.parents[1].iterdir()] == ["qualification"]
 
 
 # The examples' cards, as CUDA reports them: an RTX 5090 and a PRO 6000 (PRO_TOTAL_BYTES).
