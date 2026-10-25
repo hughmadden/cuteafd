@@ -4,6 +4,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import time
@@ -43,6 +44,35 @@ def test_missing_toolchain_refuses_before_any_work(tmp_path):
     assert result.returncode == 2
     assert 'cargo, rustc not on PATH' in result.stderr
     assert not (tmp_path / '.cache/cuteafd/builds/path-probe').exists()
+
+
+def test_toolchain_path_recovers_cargo_from_the_standard_locations(tmp_path):
+    """A systemd unit starts without ~/.cargo/bin; the gate must find a stub there
+    instead of refusing, and leave a working PATH alone."""
+    stub = tmp_path / '.cargo/bin'
+    stub.mkdir(parents=True)
+    for tool in gate.TOOLCHAIN:
+        (stub / tool).write_text('#!/bin/sh\n')
+        (stub / tool).chmod(0o755)
+    path, used = gate.toolchain_path({'HOME': str(tmp_path), 'PATH': ''})
+    assert used == str(stub)
+    assert path.split(os.pathsep)[0] == str(stub)
+    assert shutil.which('cargo', path=path) == str(stub / 'cargo')
+    assert shutil.which('rustc', path=path) == str(stub / 'rustc')
+    # A working PATH is returned untouched, whatever the standard locations hold.
+    path, used = gate.toolchain_path({'HOME': str(tmp_path), 'PATH': str(stub)})
+    assert (path, used) == (str(stub), None)
+    # $CARGO_HOME wins over ~/.cargo, which still comes before the persistent home.
+    cargo_home = tmp_path / 'cargo-home'
+    (cargo_home / 'bin').mkdir(parents=True)
+    for tool in gate.TOOLCHAIN:
+        (cargo_home / 'bin' / tool).write_text('#!/bin/sh\n')
+        (cargo_home / 'bin' / tool).chmod(0o755)
+    path, used = gate.toolchain_path({'HOME': str(tmp_path), 'CARGO_HOME': str(cargo_home), 'PATH': ''})
+    assert used == str(cargo_home / 'bin') and path.split(os.pathsep)[0] == str(cargo_home / 'bin')
+    assert path.split(os.pathsep)[1] == str(stub)
+    # Nothing to add: unchanged and reported as not found, so main still refuses.
+    assert gate.toolchain_path({'HOME': str(tmp_path / 'empty'), 'PATH': '/nonexistent'}) == ('/nonexistent', None)
 
 
 def test_cargo_passes_only_with_parsed_tests_and_no_failures(tmp_path, monkeypatch):
