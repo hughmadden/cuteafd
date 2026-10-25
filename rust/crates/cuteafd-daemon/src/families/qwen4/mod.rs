@@ -346,7 +346,7 @@ mod weight_representation_tests {
             assert_eq!(parsed.prefill_shape()?, None);
             assert_eq!(parsed.prefill_wave_rows(), 4096);
         }
-        for (rows, waves) in [(512, 1), (1024, 2), (2048, 2), (2752, 2), (4096, 2)] {
+        for (rows, waves) in [(512, 1), (1024, 2), (2048, 2), (2752, 2), (4096, 2), (2048, 3), (2752, 3), (2048, 4)] {
             let rows_arg = rows.to_string();
             let waves_arg = waves.to_string();
             let parsed = args(&["--shared-only", "--prefill-units", &rows_arg, "--prefill-waves", &waves_arg])?;
@@ -358,9 +358,8 @@ mod weight_representation_tests {
             vec!["--prefill-waves", "2"],
             vec!["--shared-only", "--prefill-units", "511"],
             vec!["--shared-only", "--prefill-units", "8192"],
-            vec!["--shared-only", "--prefill-units", "2048", "--prefill-waves", "3"],
-            vec!["--shared-only", "--prefill-units", "2752", "--prefill-waves", "3"],
-            vec!["--shared-only", "--prefill-units", "2048", "--prefill-waves", "4"],
+            vec!["--shared-only", "--prefill-units", "4096", "--prefill-waves", "3"],
+            vec!["--shared-only", "--prefill-units", "2752", "--prefill-waves", "4"],
             vec!["--local-experts", "--split-device", "1", "--prefill-units", "2048"],
         ] {
             assert!(args(&extra)?.prefill_shape().is_err(), "{extra:?}");
@@ -394,6 +393,24 @@ mod weight_representation_tests {
         assert_eq!(admission.prefill_shape, Some(shape));
         assert!(required_fp8_programs(&EngineArgs { fp8_decode: true, ..parsed })
             .iter().all(|name| !name.contains("m8192")));
+        Ok(())
+    }
+
+    #[test]
+    fn six_spark_prefill_uses_three_waves_with_fixed_mapped_ple_slots() -> Result<()> {
+        let mut parsed = args(&["--peers", "a:9870,b:9870,c:9870,d:9870,e:9870,f:9870"])?;
+        let shape = parsed.resolved_prefill()?;
+        assert_eq!((shape.unit_rows, shape.waves, shape.span_rows), (2752, 3, 8256));
+        parsed.prefill_rows = shape.span_rows as usize;
+        parsed.prefill_units = Some(shape.unit_rows as usize);
+        let cfg = Qwen4Config::from_hf(&cuteafd_loader::plan::testing::qwen4_config(48))?;
+        let inputs = admission::inputs(&parsed, &cfg, 48, false, None, Some((160, true)), 0)?;
+        assert_eq!(inputs.prefill_shape, Some(shape.units()));
+        assert_eq!(inputs.prefill_rows, 8256);
+        let staging = cuteafd_loader::formats::mapped_table::MappedStaging::new(
+            2752 * cfg.ple_rows(), 3, 64 * cfg.ple_rows(), 160)?;
+        assert_eq!(staging.slot_bytes().count(), 4);
+        assert_eq!(staging.counter_bytes, 4 * 128);
         Ok(())
     }
 

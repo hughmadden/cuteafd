@@ -37,14 +37,11 @@ pub struct PrefillLimits {
     /// Capacity of the intake arena, bounded by the shared live-slot reserve.
     pub max_span_rows: u64,
     pub max_waves: u64,
-    /// A declared temporary capability hold may cap Auto, never explicit pins.
-    pub max_waves_reason: Option<&'static str>,
 }
 
 impl Default for PrefillLimits {
     fn default() -> Self {
-        Self { max_unit_rows: 4096, max_span_rows: RESERVE_ROWS + 64, max_waves: MAX_WAVES,
-            max_waves_reason: None }
+        Self { max_unit_rows: 4096, max_span_rows: RESERVE_ROWS + 64, max_waves: MAX_WAVES }
     }
 }
 
@@ -84,14 +81,7 @@ impl PrefillPlan {
 
 pub fn prefill_shape(spark_ranks: usize, limits: PrefillLimits,
     explicit: PrefillOverrides) -> Result<PrefillPlan, PrefillError> {
-    let waves = explicit.waves.unwrap_or_else(|| {
-        let planned = planned_waves(spark_ranks);
-        if let Some(reason) = limits.max_waves_reason.filter(|_| planned > limits.max_waves) {
-            tracing::info!(planned_waves = planned, admitted_waves = limits.max_waves, reason,
-                "automatic prefill waves limited by declared executor capability");
-            limits.max_waves
-        } else { planned }
-    });
+    let waves = explicit.waves.unwrap_or_else(|| planned_waves(spark_ranks));
     let rows = explicit.unit_rows.unwrap_or_else(|| unit_rows(waves));
     let units = super::PrefillShape { unit_rows: rows, waves };
     if units.validate().is_err() {
@@ -215,15 +205,18 @@ mod tests {
     }
 
     #[test]
-    fn declared_capability_holds_cap_auto_but_never_explicit_pins() {
+    fn qwen_fixed_ple_ring_admits_adaptive_spark_waves() {
         let limits = crate::families::qwen4::prefill_limits(false);
         assert_eq!(prefill_shape(6, limits, PrefillOverrides::default()).unwrap(),
-            PrefillPlan { unit_rows: 4096, waves: 2, span_rows: 8192 });
+            PrefillPlan { unit_rows: 2752, waves: 3, span_rows: 8256 });
         for waves in [3, 4] {
-            assert!(matches!(prefill_shape(6, limits, PrefillOverrides {
+            let shape = prefill_shape(6, limits, PrefillOverrides {
                 waves: Some(waves), ..Default::default()
-            }), Err(PrefillError::ExecutorCapacity { .. })));
+            }).unwrap();
+            assert_eq!(shape.waves, waves);
         }
+        assert_eq!(prefill_shape(0, crate::families::qwen4::prefill_limits(true),
+            PrefillOverrides::default()).unwrap().waves, 1);
     }
 
     #[test]

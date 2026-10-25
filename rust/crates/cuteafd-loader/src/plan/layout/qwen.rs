@@ -204,7 +204,6 @@ fn placement(input: &super::super::PlanInput, report: &mut PlanReport, options: 
             "Qwen prefill waves require single-owner Spark experts");
         let unit = if options.prefill_rows > 0 { options.prefill_rows } else { 4096 };
         let units = crate::serving_capacity::PrefillShape { unit_rows: unit, waves: options.prefill_waves }.validate()?;
-        anyhow::ensure!(units.waves <= 2, "Qwen mapped PLE gathers admit at most two prefill waves");
         Some(units)
     } else { None };
     let span = prefill_shape.map_or(shape.prefill_rows, |s| s.slot_rows());

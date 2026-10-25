@@ -184,8 +184,7 @@ fn shared_prefill_public_plan_family_by_spark_matrix() {
             let mut options = wave_plan_options(dir.path(), ranks);
             let report = plan(dir.path(), &options).unwrap();
             assert_eq!(report.family.as_deref(), Some(family));
-            let (unit, waves) = if family == "qwen4" && ranks >= 6 { (4096, 2) }
-                else { match ranks { 0 => (4096, 1), 1..=5 => (4096, 2), _ => (2752, 3) } };
+            let (unit, waves) = match ranks { 0 => (4096, 1), 1..=5 => (4096, 2), _ => (2752, 3) };
             // Header fixtures may independently lack kernels, rank divisibility,
             // local experts or memory. Shape resolution does not imply fit.
             assert_eq!((report.prefill_unit_rows, report.prefill_waves, report.prefill_span_rows),
@@ -196,7 +195,7 @@ fn shared_prefill_public_plan_family_by_spark_matrix() {
                 layout.prefill_lanes = waves;
                 layout.prefill_span_rows = Some(unit * waves);
                 let report = plan(dir.path(), &options).unwrap();
-                let max_waves = if ranks == 0 { 1 } else if family == "qwen4" { 2 }
+                let max_waves = if ranks == 0 { 1 }
                     else if family == "deepseek_v4" { 3 } else { 4 };
                 if waves > max_waves {
                     assert!(!report.placement_supported, "{family} ranks={ranks}: {}", render(&report));
@@ -306,7 +305,7 @@ fn family_executor_prefill_markers_do_not_claim_shared_wave_ports() {
 fn qwen_prefill_publishes_unit_waves_and_span_before_host_admission() {
     let config = qwen4_config(4);
     let dir = snapshot(config.clone(), &qwen4_coordinator(&config, false));
-    for (unit, waves) in [(512, 1), (1024, 2), (4096, 2)] {
+    for (unit, waves) in [(512, 1), (1024, 2), (4096, 2), (2752, 3), (2048, 4)] {
         let report = plan(dir.path(), &PlanOptions {
             layout: Some(layout::LayoutOptions { rtx_bytes: vec![96 << 30],
                 prefill_rows: unit, prefill_lanes: waves, context_tokens: 32768,
@@ -355,9 +354,7 @@ fn qwen_mapped_ple_host_staging_matches_runtime_allocations() {
         }
         let input = PlanInput::open(dir.path()).unwrap();
         for (gpus, ranks) in [(1, 0), (2, 0), (1, 4)] {
-            // The launcher currently admits at most two waves; MappedStaging's
-            // geometry test independently covers all four staging depths.
-            for (unit, k) in [(512usize, 1usize), (2048, 2), (4096, 2)] {
+            for (unit, k) in [(512usize, 1usize), (2048, 2), (4096, 2), (2752, 3), (2048, 4)] {
                 if ranks == 0 && k != 1 { continue; }
                 let report = input.plan(&PlanOptions {
                     layout: Some(layout::LayoutOptions { rtx_bytes: vec![96 << 30; gpus],

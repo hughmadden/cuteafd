@@ -245,7 +245,7 @@ mod tests {
                     "F8_E4M3", &[100, 160]));
             }
             testing::write_snapshot(dir.path(), &config, &tensors, None);
-            for (rows, waves) in [(4096, 1), (4096, 2), (2752, 2), (2048, 2)] {
+            for (rows, waves) in [(4096, 1), (4096, 2), (2752, 3), (2048, 4)] {
                 let report = plan(dir.path(), &PlanOptions {
                     placement: ExpertPlacement::Sparks { ranks: 4 },
                     layout: Some(LayoutOptions { rtx_bytes: vec![32 << 30], prefill_rows: rows,

@@ -8,11 +8,11 @@ pub use rope::{ImageSpan, RopeError, RopePositions};
 pub use config::{Qwen4Attention, Qwen4Config};
 pub use ngram::{NgramHasher, NgramHistory};
 
-/// The mapped PLE ring retains two wave-owned gather buffers until #717 lands.
+/// Whole-step local owners are serial; the fixed mapped PLE ring admits every
+/// shared wave geometry for Spark experts.
 pub fn prefill_limits(local: bool) -> crate::serving_capacity::prefill_waves::PrefillLimits {
     crate::serving_capacity::prefill_waves::PrefillLimits {
-        max_waves: if local { 1 } else { 2 },
-        max_waves_reason: (!local).then_some("Qwen mapped PLE ring holds two wave-owned gather slots pending #717"),
+        max_waves: if local { 1 } else { crate::serving_capacity::prefill_waves::MAX_WAVES },
         ..Default::default()
     }
 }
