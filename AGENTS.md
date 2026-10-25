@@ -357,6 +357,8 @@ this repository is developed against; a different deployment will have
 different hosts, addresses and paths, but needs the same categories of
 facts recorded somewhere for agents working on it.
 
+Host policy and read-only inventory: [host tuning](docs/host-tuning.md).
+
 ### Hosts
 
 - `raptor`: coordinator, x86-64, 2× RTX PRO 6000 Blackwell 96 GB (SM120),
