@@ -110,6 +110,17 @@ impl Fixture {
         })
     }
 
+    /// Configure static package ABI before loading a CPU expert module.
+    pub fn configure_fp8(&self, library: &NativeLibrary, words: &[u32; 16], scratch: &[u64; 6]) -> Result<()> {
+        // SAFETY: the CPU-only export copies the two fixed-size arrays synchronously.
+        unsafe {
+            let configure: Symbol<unsafe extern "C" fn(*const u32, *const u64)> =
+                library.lib.get(b"fixture_configure_fp8")?;
+            configure(words.as_ptr(), scratch.as_ptr());
+        }
+        Ok(())
+    }
+
     pub fn load(&self) -> Result<NativeLibrary> {
         // SAFETY: this test just compiled the fixture with the native ABI.
         let library = unsafe { NativeLibrary::load(&self.module)? };

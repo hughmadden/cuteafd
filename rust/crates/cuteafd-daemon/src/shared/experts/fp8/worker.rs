@@ -1,7 +1,7 @@
 //! Spark request adapter for the FP8 family: FP8 K32 wire rows and routes in,
 //! the compact BF16 rank partial out, written straight into the registered
 //! send slot when the transport permits it.
-use super::Fp8Experts;
+use super::{Fp8Experts, Fp8Weights};
 use crate::shared::experts::execution::HostExpertExchange;
 use crate::shared::memory::{DeviceAllocation, LoadStream};
 use anyhow::{ensure, Context, Result};
@@ -15,7 +15,7 @@ use std::rc::Rc;
 pub(crate) struct Fp8Worker<'a> {
     // Drain the stream before dropping the experts or the inputs.
     stream: LoadStream<'a>,
-    experts: Rc<Fp8Experts<'a>>,
+    experts: Fp8Experts<'a, Rc<Fp8Weights<'a>>>,
     library: &'a NativeLibrary,
     inputs: [DeviceAllocation<'a>; 3],
     output: DeviceAllocation<'a>,
@@ -36,16 +36,20 @@ fn validate_worker_layers(layers: &[usize]) -> Result<()> {
 
 impl<'a> Fp8Worker<'a> {
     pub(crate) fn capacity(&self) -> usize { self.capacity }
-    /// Device bytes the worker adds to its resident layers for `capacity`.
-    /// (Input rows are sized for BF16, the larger of the two representations.)
-    pub(crate) fn workspace_bytes(capacity: usize) -> usize {
-        let geometry = cuteafd_core::expert_geometry();
-        let (hidden, topk) = (geometry.hidden as usize, geometry.topk as usize);
-        capacity * (hidden * 2 + topk * 8 + hidden * 2)
+    /// Exact retained input/routes/output bytes (scratch is admitted separately).
+    pub(crate) fn io_bytes(info: &cuteafd_ffi::fp8_moe::Fp8MoeInfo, bf16_sibling: bool,
+        capacity: usize) -> Result<usize> {
+        cuteafd_ffi::fp8_moe::fp8_slot_io_bytes(info.hidden, info.topk, info.wire_input,
+            bf16_sibling, capacity)
     }
 
-    pub(crate) fn new(library: &'a NativeLibrary, experts: Rc<Fp8Experts<'a>>, capacity: u32) -> Result<Self> {
-        let _memory_scope = cuteafd_ffi::memory_ledger::scope("experts/workspace");
+    pub(crate) fn workspace_bytes(experts: &Fp8Weights<'_>, capacity: usize) -> Result<usize> {
+        Self::io_bytes(experts.module.info(), experts.bf16_module.is_some(), capacity)?
+            .checked_add(experts.slot_scratch_bytes(capacity)?)
+            .context("native slot workspace size overflow")
+    }
+
+    pub(crate) fn new(library: &'a NativeLibrary, experts: Rc<Fp8Weights<'a>>, capacity: u32) -> Result<Self> {
         let geometry = cuteafd_core::expert_geometry();
         let (hidden, topk, capacity) = (geometry.hidden as usize, geometry.topk as usize, capacity as usize);
         validate_worker_layers(&experts.layers.iter().map(|layer| layer.layer).collect::<Vec<_>>())?;
@@ -53,6 +57,7 @@ impl<'a> Fp8Worker<'a> {
         ensure!(experts.wire_input() || matches!(experts.module.info().weights,
             cuteafd_ffi::fp8_moe::Fp8MoeWeights::Nvfp4 | cuteafd_ffi::fp8_moe::Fp8MoeWeights::Bf16),
             "Spark workers need a wire-input package, or native BF16-input weights");
+        let experts = Fp8Experts::from_shared(library, experts, capacity)?;
         let inputs = [
             DeviceAllocation::new(library, capacity * if !experts.wire_input() || experts.bf16_module.is_some() { hidden * 2 }
                 else { hidden + hidden / 32 })?,
@@ -211,6 +216,85 @@ impl<'a> Fp8Worker<'a> {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    #[test]
+    #[ignore = "requires an allocated CPU build slot and explicit NVMe fixture directory"]
+    fn native_slots_own_distinct_capacity_sized_scratch_and_charge_workspace_once() -> Result<()> {
+        use cuteafd_ffi::{fp8_moe::Fp8MoeModule, memory_ledger::{self, Space},
+            native_library_lifetime_fixture::Fixture};
+        let fixture = Fixture::build()?;
+        let library = fixture.load()?;
+        fixture.quiet_events(&library, true)?;
+        library.cuda_set_device(7)?;
+        fixture.configure_memory(&library, 7, 1 << 30)?;
+        std::fs::hard_link(fixture.directory().join("liblifetime_fixture.so"),
+            fixture.directory().join("libcuteafd_fp8moe.so"))?;
+        let geometry = cuteafd_core::expert_geometry();
+        let baseline = memory_ledger::snapshot().total(Space::Device, 7);
+        for format in [1u32, 2, 4, 5] {
+            for capacity in [1usize, 17] {
+                let wire = matches!(format, 1 | 2);
+                let mut words = [5 | format << 8 | 1 << 16 | 1 << 24, geometry.hidden,
+                    128, 2, geometry.topk, 256, 2, if wire { 7 } else { 1 }, 0,
+                    2, 16, 4096, 0, 0, 0, 0];
+                fixture.configure_fp8(&library, &words, &[1024, 4096, 0, 0, 0, 0])?;
+                // SAFETY: this test compiled the CPU-only native ABI above.
+                let module = unsafe { Fp8MoeModule::load(fixture.directory())? };
+                let bf16_module = if wire {
+                    words[7] = 1;
+                    fixture.configure_fp8(&library, &words, &[2048, 8192, 0, 0, 0, 0])?;
+                    // SAFETY: the same trusted CPU ABI snapshots independent metadata per module.
+                    Some(unsafe { Fp8MoeModule::load(fixture.directory())? })
+                } else { None };
+                let resident = {
+                    let _scope = memory_ledger::scope("experts/weights");
+                    DeviceAllocation::new(&library, 512)?
+                };
+                let weights = Rc::new(Fp8Weights {
+                    layers: vec![super::super::Fp8Layer { layer: 3,
+                        slice: cuteafd_core::SparkSlice { unit_map: None, layer: 3, first: 0,
+                            width: 128, stored_width: 128, tiers: vec![], projection_counts: vec![] },
+                        regions: vec![Some(resident.into())] }],
+                    module, bf16_module, tp: 2, rank: 0, weight_read_bytes: 256,
+                });
+                let scratch = match (wire, capacity) { (true, 1) => 2048, (true, _) => 8192,
+                    (false, 1) => 1024, (false, _) => 4096 };
+                assert_eq!(weights.resident_bytes(), 512);
+                assert_eq!(weights.slot_scratch_bytes(capacity)?, scratch);
+                let io = Fp8Worker::io_bytes(weights.module.info(), wire, capacity)?;
+                let workspace = Fp8Worker::workspace_bytes(&weights, capacity)?;
+                assert_eq!(workspace, io + scratch);
+                let workers = {
+                    let _scope = memory_ledger::scope("experts/workspace/slot");
+                    [Fp8Worker::new(&library, weights.clone(), capacity as u32)?,
+                        Fp8Worker::new(&library, weights.clone(), capacity as u32)?]
+                };
+                assert!(Rc::ptr_eq(&workers[0].experts.weights, &workers[1].experts.weights));
+                assert_ne!(workers[0].experts.scratch.buffer.ptr, workers[1].experts.scratch.buffer.ptr);
+                for worker in &workers {
+                    assert_eq!(worker.experts.scratch_bytes(), scratch);
+                    assert_eq!(worker.inputs.iter().map(|input| input.buffer.bytes).sum::<usize>()
+                        + worker.output.buffer.bytes, io);
+                }
+                let ledger = memory_ledger::snapshot();
+                let scopes = ledger.by_scope(Space::Device, 7);
+                assert_eq!(scopes["experts/weights"], 512);
+                assert_eq!(scopes["experts/workspace/native_scratch"], 2 * scratch);
+                assert_eq!(scopes["experts/workspace/slot"], 2 * io);
+                assert_eq!(ledger.total(Space::Device, 7) - baseline, 512 + 2 * workspace);
+                let row = ledger.rows.iter().find(|row| row.key.device == 7
+                    && row.key.scope == "experts/workspace/native_scratch").unwrap();
+                assert_eq!(row.allocations, 2);
+                drop(workers);
+                assert_eq!(memory_ledger::snapshot().total(Space::Device, 7) - baseline, 512);
+                drop(weights);
+                assert_eq!(memory_ledger::snapshot().total(Space::Device, 7), baseline);
+            }
+        }
+        Ok(())
+    }
+
     #[test]
     fn width_group_accepts_sparse_layers_but_not_empty_or_duplicate_ids() {
         for layers in [&[3][..], &[3, 4, 5][..], &[3, 6, 7, 8, 9, 12][..]] {
