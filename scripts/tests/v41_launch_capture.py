@@ -300,7 +300,11 @@ def release_checkpoint(family: str, model: str) -> dict:
 
 
 def normalize(value: str, root: Path) -> str:
-    return value.replace(str(root), "<root>")
+    # The capture's namespace root stands in for the hosts' /mnt/sparknest.
+    return value.replace(str(root / NAMESPACE), "/mnt/sparknest").replace(str(root), "<root>")
+
+
+NAMESPACE = "namespace"
 
 
 def capture(launcher_root: Path, case: str, *, release_entry: dict | None = None,
@@ -311,7 +315,7 @@ def capture(launcher_root: Path, case: str, *, release_entry: dict | None = None
     with the launcher stderr.
     """
     with tempfile.TemporaryDirectory(dir=os.environ.get("TMPDIR")) as temporary:
-        root = Path(temporary)
+        root = Path(temporary).resolve()
         (root / "bin").mkdir()
         for tool in ("docker", "ssh", "nvidia-smi", "curl", "ss", "nest", "id", "hostname", "timeout"):
             path = root / "bin" / tool
@@ -320,6 +324,11 @@ def capture(launcher_root: Path, case: str, *, release_entry: dict | None = None
         coordinator_host = "coordinator" if release_entry else "raptor"
         home = root / "hosts" / coordinator_host
         home.mkdir(parents=True)
+        # Every host mounts the namespace at the same path, as /mnt/sparknest
+        # would be; Spark workers read the snapshot there, never from their own
+        # ~/.cache/huggingface. HF_HOME on the coordinator names the same hub.
+        (root / NAMESPACE / "hf-home" / "hub").mkdir(parents=True)
+        (root / "hf").symlink_to(root / NAMESPACE / "hf-home")
         hub = root / "hf" / "hub"
         checkpoints, revisions = dict(CHECKPOINTS), dict(REVISIONS)
         release_values = {}
@@ -388,7 +397,7 @@ def capture(launcher_root: Path, case: str, *, release_entry: dict | None = None
         spec = root / "nvidia.yaml"
         spec.write_text("devices:\n" + "".join(f"  - name: {name}\n" for name in (*GPU_UUIDS, "0", "1", "all")))
         log = root / "log.jsonl"
-        env = {"PATH": f"{root / 'bin'}:/usr/bin:/bin", "HOME": str(home), "HF_HOME": str(root / "hf"),
+        env = {"PATH": f"{root / 'bin'}:/usr/bin:/bin", "HOME": str(home), "HF_HOME": str(root / "hf"), "CUTEAFD_NAMESPACE_ROOT": str(root / NAMESPACE),
                "CAPTURE_LOG": str(log), "CAPTURE_ROOT": str(root), "CAPTURE_HOST": coordinator_host,
                "CAPTURE_SPARKS": str(sparks), "CAPTURE_SPARKINFER": lock["revision"],
                "CAPTURE_FAMILY": release_entry["family"] if release_entry else "deepseek_v41",
@@ -422,7 +431,7 @@ def namespace_launch_contract(run: dict) -> dict:
     run["env"]["HF_HOME"] = "/mnt/sparknest/hf-home"
     run["mounts"] = sorted("/mnt/sparknest:/mnt/sparknest:ro" if mount.endswith(":/hf/hub:ro")
                            else mount for mount in run["mounts"])
-    run["command"] = [value.replace("/hf/hub/", "<root>/hf/hub/") for value in run["command"]]
+    run["command"] = [value.replace("/hf/hub/", "/mnt/sparknest/hf-home/hub/") for value in run["command"]]
     return run
 
 

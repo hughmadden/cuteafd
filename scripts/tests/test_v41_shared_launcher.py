@@ -146,7 +146,7 @@ def test_shared_launcher_matches_the_private_v41_path(case: str, tmp_root) -> No
         expected[expected.index("--rtx"):expected.index("--rtx")] = additions
         index = expected.index("--available-sparks") + 2
         expected[index:index] = ["--mapped-scale-preload-gib", "0"]
-        expected = [value.replace("/hf/hub/", "<root>/hf/hub/").replace("HF_HOME=/hf", "HF_HOME=/mnt/sparknest/hf-home") for value in expected]
+        expected = [value.replace("/hf/hub/", "/mnt/sparknest/hf-home/hub/").replace("HF_HOME=/hf", "HF_HOME=/mnt/sparknest/hf-home") for value in expected]
         expected = ["/mnt/sparknest:/mnt/sparknest:ro" if value.endswith(":/hf/hub:ro") else value for value in expected]
         expected_plans.append(expected)
     assert current["plans"] == expected_plans, case
@@ -220,7 +220,7 @@ def test_serving_containers_keep_namespace_paths_and_host_identity() -> None:
         assert run["env"]["HF_HOME"] == "/mnt/sparknest/hf-home"
         assert "/mnt/sparknest:/mnt/sparknest:ro" in run["mounts"]
         assert not any(":/hf" in mount for mount in run["mounts"])
-        assert run["command"][run["command"].index("--snapshot") + 1].startswith("<root>/hf/hub/")
+        assert run["command"][run["command"].index("--snapshot") + 1].startswith("/mnt/sparknest/hf-home/hub/")
 
 
 @pytest.mark.parametrize("value", [None, "off", "draft", "all"])
