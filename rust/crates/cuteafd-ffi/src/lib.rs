@@ -1175,6 +1175,9 @@ type CudaEventRecordFn =
     unsafe extern "C" fn(cuda_event: *mut c_void, cuda_stream: *mut c_void) -> CuteafdStatus;
 type CudaEventSynchronizeFn = unsafe extern "C" fn(cuda_event: *mut c_void) -> CuteafdStatus;
 type CudaEventQueryFn = unsafe extern "C" fn(cuda_event: *mut c_void, ready: *mut i32) -> CuteafdStatus;
+type RdmaRcEndpointTargetFn = unsafe extern "C" fn(*mut c_void, *mut u64, *mut u32) -> CuteafdStatus;
+type RdmaRcEndpointPostRequestPartFn =
+    unsafe extern "C" fn(*mut c_void, usize, usize, u32, usize, usize, usize, u64, u32, u64) -> CuteafdStatus;
 type CudaStreamWaitValue32Fn = unsafe extern "C" fn(cuda_stream: *mut c_void, word: *const u32, value: u32) -> CuteafdStatus;
 type CudaStreamWriteValue32Fn = unsafe extern "C" fn(cuda_stream: *mut c_void, word: *mut u32, value: u32) -> CuteafdStatus;
 type CudaEventElapsedMsFn = unsafe extern "C" fn(
@@ -1709,6 +1712,12 @@ native_symbols! {
     cuteafd_cuda_stream_destroy: CudaStreamDestroyFn,
     cuteafd_cuda_stream_synchronize: CudaStreamSynchronizeFn,
     cuteafd_cuda_stream_query: CudaStreamQueryFn,
+    cuteafd_cuda_event_query: CudaEventQueryFn,
+    cuteafd_cuda_stream_wait_value32: CudaStreamWaitValue32Fn,
+    cuteafd_cuda_stream_write_value32: CudaStreamWriteValue32Fn,
+    cuteafd_rdma_rc_endpoint_request_target: RdmaRcEndpointTargetFn,
+    cuteafd_rdma_rc_endpoint_recv_landing_target: RdmaRcEndpointTargetFn,
+    cuteafd_rdma_rc_endpoint_post_request_part: RdmaRcEndpointPostRequestPartFn,
     cuteafd_cuda_stream_wait_event: CudaStreamWaitEventFn,
     cuteafd_cuda_event_create: CudaEventCreateFn,
     cuteafd_cuda_event_create_ordering: CudaEventCreateFn,
@@ -2565,7 +2574,7 @@ impl NativeLibrary {
     /// # Safety
     /// `cuda_event` is a live event created by this library.
     pub unsafe fn cuda_event_query(&self, cuda_event: *mut c_void) -> Result<bool> {
-        let query_fn: Symbol<CudaEventQueryFn> = unsafe { self.lib.get(b"cuteafd_cuda_event_query")? };
+        let query_fn = self.cuteafd_cuda_event_query()?;
         let mut ready = 0;
         let status = unsafe { query_fn(cuda_event, &mut ready) };
         self.status_to_result("cuteafd_cuda_event_query", status)?;
@@ -2584,7 +2593,7 @@ impl NativeLibrary {
     /// value, or the stream never drains.
     pub unsafe fn cuda_stream_wait_value32(&self, cuda_stream: *mut c_void, word: *const u32, value: u32)
         -> Result<()> {
-        let wait_fn: Symbol<CudaStreamWaitValue32Fn> = unsafe { self.lib.get(b"cuteafd_cuda_stream_wait_value32")? };
+        let wait_fn = self.cuteafd_cuda_stream_wait_value32()?;
         let status = unsafe { wait_fn(cuda_stream, word, value) };
         self.status_to_result("cuteafd_cuda_stream_wait_value32", status)
     }
@@ -2596,7 +2605,7 @@ impl NativeLibrary {
     /// As [`Self::cuda_stream_wait_value32`]; the word outlives the queued store.
     pub unsafe fn cuda_stream_write_value32(&self, cuda_stream: *mut c_void, word: *mut u32, value: u32)
         -> Result<()> {
-        let write_fn: Symbol<CudaStreamWriteValue32Fn> = unsafe { self.lib.get(b"cuteafd_cuda_stream_write_value32")? };
+        let write_fn = self.cuteafd_cuda_stream_write_value32()?;
         let status = unsafe { write_fn(cuda_stream, word, value) };
         self.status_to_result("cuteafd_cuda_stream_write_value32", status)
     }
@@ -4951,9 +4960,7 @@ impl NativeLibrary {
     /// Registers the endpoint's receive ring for remote request WRITEs and
     /// returns its address and rkey (stable until the endpoint is destroyed).
     pub fn rdma_rc_endpoint_request_target(&self, handle: *mut c_void) -> Result<(u64, u32)> {
-        type F = unsafe extern "C" fn(*mut c_void, *mut u64, *mut u32) -> CuteafdStatus;
-        // SAFETY: symbol resolved by name with the declared C signature.
-        let f: Symbol<F> = unsafe { self.lib.get(b"cuteafd_rdma_rc_endpoint_request_target")? };
+        let f = self.cuteafd_rdma_rc_endpoint_request_target()?;
         let (mut address, mut rkey) = (0, 0);
         // SAFETY: the caller owns the live endpoint handle; both outputs are
         // valid locals that native writes only on success.
@@ -4965,9 +4972,7 @@ impl NativeLibrary {
     /// Exposes the endpoint's GPU landing range for remote reply-tail WRITEs
     /// and returns its address and rkey.
     pub fn rdma_rc_endpoint_recv_landing_target(&self, handle: *mut c_void) -> Result<(u64, u32)> {
-        type F = unsafe extern "C" fn(*mut c_void, *mut u64, *mut u32) -> CuteafdStatus;
-        // SAFETY: symbol resolved by name with the declared C signature.
-        let f: Symbol<F> = unsafe { self.lib.get(b"cuteafd_rdma_rc_endpoint_recv_landing_target")? };
+        let f = self.cuteafd_rdma_rc_endpoint_recv_landing_target()?;
         let (mut address, mut rkey) = (0, 0);
         // SAFETY: the caller owns the live endpoint handle; both outputs are
         // valid locals that native writes only on success.
@@ -4988,9 +4993,7 @@ impl NativeLibrary {
     #[allow(clippy::too_many_arguments)]
     pub unsafe fn rdma_rc_endpoint_post_request_part(&self, handle: *mut c_void, slot: usize, prefix: usize,
         region: Option<(u32, usize)>, offset: usize, bytes: usize, remote: Option<(u64, u32)>, wr: u64) -> Result<()> {
-        type F = unsafe extern "C" fn(*mut c_void, usize, usize, u32, usize, usize, usize, u64, u32, u64) -> CuteafdStatus;
-        // SAFETY: symbol resolved by name with the declared C signature.
-        let f: Symbol<F> = unsafe { self.lib.get(b"cuteafd_rdma_rc_endpoint_post_request_part")? };
+        let f = self.cuteafd_rdma_rc_endpoint_post_request_part()?;
         let (region, region_offset) = region.unwrap_or((u32::MAX, 0));
         let (address, rkey) = remote.unwrap_or((0, 0));
         // SAFETY: forwarded from this function's contract; native bounds-checks

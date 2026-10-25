@@ -100,15 +100,14 @@ fn native_exlr8_decode_widths_finite_and_row_invariant() -> Result<()> {
         ModelAdmission { capacity: MAX_ROWS as u32, compiled_capacity: 4096,
             endpoints: vec![SparkEndpoint { ring_depth: None, capacity: MAX_ROWS as u32,
                 ingress: SparkIngress::Fp8K32 }],
-            rings: spark_rings(config.max_frame_bytes)? }, Some(&manifest))?.select(&peers)?;
+            rings: spark_rings(config.max_frame_bytes)?, execution_slots: 1 }, Some(&manifest))?.select(&peers)?;
     let zero = DeviceAllocation::new(&library, MAX_ROWS * row_bytes)?;
     let output = DeviceAllocation::new(&library, MAX_ROWS * row_bytes)?;
     library.cuda_zero_bytes(zero.buffer, zero.buffer.bytes)?;
     let stream = LoadStream { library: &library, raw: library.cuda_stream_create()? };
     let mut link = SparkLink::new(&library, spark_world, &peers, MAX_ROWS as u32, config, row_bytes)?;
     link.enable_terminal_ownership(library.clone())?;
-    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
-    let result = runtime.block_on(async {
+    let result = (|| -> Result<()> {
         let mut id = 1;
         link.bootstrap(&request(geometry, layers[0], 0, 0, MAX_ROWS, id)?)?;
         let out = PathBuf::from(std::env::var("CUTEAFD_GOLDEN_OUT")?);
@@ -123,13 +122,16 @@ fn native_exlr8_decode_widths_finite_and_row_invariant() -> Result<()> {
             for (first, rows) in waves {
                 id += 1;
                 let request = request(geometry, layer, seed, first, rows, id)?;
-                let wave = link.dispatch(&request)?;
-                link.receive(wave, rows, stream.raw).await?;
+                let exchange = link.exchange()?;
+                let ticket = exchange.send_request(request)?;
+                let slot = ticket.slot();
+                exchange.land(ticket, stream.raw)?;
                 // SAFETY: full-width buffers stay owned until the stream drains;
-                // receive orders every rank plane first.
-                unsafe { link.reduce(zero.buffer.ptr.cast(), output.buffer.ptr.cast(), rows, stream.raw)?; }
+                // the landing wait orders every rank plane first.
+                unsafe { exchange.reduce(slot, zero.buffer.ptr.cast(), output.buffer.ptr.cast(), rows, stream.raw)?; }
                 // SAFETY: stream and all queued storage remain live here.
                 unsafe { library.cuda_stream_synchronize(stream.raw)?; }
+                crate::shared::spark_waves::healthy()?;
                 let mut wave = vec![0; output.buffer.bytes];
                 library.copy_d2h(&mut wave, output.buffer)?;
                 wave.truncate(rows * row_bytes);
@@ -158,8 +160,8 @@ fn native_exlr8_decode_widths_finite_and_row_invariant() -> Result<()> {
         std::fs::write(out.join("exlr8-decode.json"), serde_json::to_vec_pretty(&serde_json::json!({
             "world": world, "layers": layers, "manifest": manifest, "max_rows": MAX_ROWS, "rows_checked": checked,
         }))?)?;
-        Ok::<_, anyhow::Error>(())
-    });
+        Ok(())
+    })();
     let quiesce = link.terminal_quiesce();
     let copies = link.terminal_drain_copies();
     // SAFETY: allocations, stream and intake remain alive on every result path.
