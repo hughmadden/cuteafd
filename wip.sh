@@ -501,12 +501,19 @@ stream_between_hosts() {
   fi
 }
 
+# wip_image_content HOST REF: the portable content identity of image REF on HOST ("" =
+# here; scripts/lib/dev_image_content.py), empty when it is missing or uninspectable.
+wip_image_content() {
+  if [[ -z "$1" ]]; then docker image inspect "$2" 2>/dev/null || true
+  else ssh -o BatchMode=yes "$1" "docker image inspect '$2' 2>/dev/null || true"; fi |
+    python3 "$repo_root/scripts/lib/dev_image_content.py" 2>/dev/null || true
+}
+
 # spark_dev_image_content HOST: the portable content identity of HOST's Spark dev
 # image (scripts/lib/dev_image_content.py), empty when it is missing. Image IDs differ
 # across image stores (docker save | load into containerd) for identical content.
 spark_dev_image_content() {
-  ssh -o BatchMode=yes "$1" "docker image inspect '$SPARK_EXPERT_DOCKER_DEV' 2>/dev/null || true" |
-    python3 "$repo_root/scripts/lib/dev_image_content.py" 2>/dev/null || true
+  wip_image_content "$1" "$SPARK_EXPERT_DOCKER_DEV"
 }
 
 distribute_spark_dev_image() {
@@ -603,12 +610,20 @@ CLEAR_ROOT
   done
 fi
 
+# wip_same_image_content HOST IMAGE WANT: IMAGE on HOST has content WANT (nonempty).
+# An existing container whose image ID differs from the role image's (docker save |
+# load into a containerd store gives identical images other IDs) is reused only then.
+wip_same_image_content() {
+  [[ -n "$3" && "$(wip_image_content "$1" "$2")" == "$3" ]]
+}
+
 preflight_existing_container_images() {
-  local expected actual host coordinator_device
+  local expected actual host coordinator_device want=
   expected="$(docker image inspect -f '{{.Id}}' "$COORDINATOR_DOCKER_DEV")"
   if docker container inspect "$coordinator_container" >/dev/null 2>&1; then
     actual="$(docker inspect -f '{{.Image}}' "$coordinator_container")"
     [[ "$actual" == "$expected" ]] ||
+      wip_same_image_content "" "$actual" "$(wip_image_content "" "$expected")" ||
       release_die "$coordinator_container uses an old development image; rerun ./wip.sh --recreate"
     coordinator_device="$(
       docker inspect -f \
@@ -624,8 +639,11 @@ preflight_existing_container_images() {
   expected="$(ssh -o BatchMode=yes "$seed_host" "docker image inspect -f '{{.Id}}' '$SPARK_EXPERT_DOCKER_DEV'")"
   for host in "${wip_container_hosts[@]}"; do
     actual="$(ssh -o BatchMode=yes "$host" "docker inspect -f '{{.Image}}' '$spark_container' 2>/dev/null || true")"
-    [[ -z "$actual" || "$actual" == "$expected" ]] ||
+    [[ -z "$actual" || "$actual" == "$expected" ]] && continue
+    [[ -n "$want" ]] || want="$(wip_image_content "$seed_host" "$expected")"
+    wip_same_image_content "$host" "$actual" "$want" ||
       release_die "$host $spark_container uses an old development image; rerun ./wip.sh --recreate"
+    echo "WIP: $host $spark_container runs $actual, the same content as $seed_host's $SPARK_EXPERT_DOCKER_DEV"
   done
 }
 
@@ -660,6 +678,7 @@ ensure_local_container() {
       release_die "$coordinator_container cache plan changed; rerun ./wip.sh --recreate"
     container_id="$(docker inspect -f '{{.Image}}' "$coordinator_container")"
     [[ "$container_id" == "$image_id" ]] ||
+      wip_same_image_content "" "$container_id" "$(wip_image_content "" "$image_id")" ||
       release_die "$coordinator_container uses an old development image; rerun ./wip.sh --recreate"
     if [[ -n "$wip_mount_root" ]]; then
       [[ "$(docker inspect -f '{{range .Mounts}}{{if eq .Destination "/wip"}}{{.Source}}{{end}}{{end}}' "$coordinator_container")" == "$(realpath "$wip_mount_root")" ]] ||
@@ -717,7 +736,7 @@ ensure_remote_container() {
       if ! ssh -o BatchMode=yes "$host" "mkdir -p $cache_helper_dir" ||
          ! scp -q "$repo_root/scripts/build/compiler-cache.sh" "$repo_root/scripts/build/assert-build-filesystem.py" "$repo_root/scripts/build/build-caches.sh" "$repo_root/scripts/build/build-cache-plan.py" "$host:$cache_staging/scripts/build/" ||
          ! ssh -o BatchMode=yes "$host" "mkdir -p ${cache_helper_dir%/build}/lib" ||
-         ! scp -q "$repo_root/scripts/lib/cdi-gpus.sh" "$host:$cache_staging/scripts/lib/"; then
+         ! scp -q "$repo_root/scripts/lib/cdi-gpus.sh" "$repo_root/scripts/lib/dev_image_content.py" "$host:$cache_staging/scripts/lib/"; then
         cuteafd_compiler_cache_warn 'cannot stage Spark cache helper'
         cache_staging=
       fi
@@ -753,6 +772,7 @@ export CUTEAFD_BUILD_CACHES="${11:-on}" CUTEAFD_SCCACHE_CUDA="${10:-1}"
 source "$6/scripts/build/build-caches.sh"
 [[ -f "$6/scripts/lib/cdi-gpus.sh" ]] || { echo "Spark CDI helper not staged" >&2; exit 2; }
 source "$6/scripts/lib/cdi-gpus.sh"
+helper_lib="$6/scripts/lib"
 cuteafd_build_cache_defaults
 cache_plan="$(cuteafd_build_cache_docker_args "$root" /wip/home "${12:?}")" || exit 2
 mapfile -t cache_args <<<"$cache_plan"
@@ -764,8 +784,13 @@ if docker container inspect "$container" >/dev/null 2>&1; then
     { echo "$container cache plan changed; rerun ./wip.sh --recreate" >&2; exit 2; }
   container_id="$(docker inspect -f '{{.Image}}' "$container")"
   if [ "$container_id" != "$image_id" ]; then
-    echo "$container uses an old development image; rerun ./wip.sh --recreate" >&2
-    exit 2
+    # Reused only with the role image's content (scripts/lib/dev_image_content.py, staged).
+    want="$(docker image inspect "$image_id" 2>/dev/null | python3 "$helper_lib/dev_image_content.py" 2>/dev/null || true)"
+    have="$(docker image inspect "$container_id" 2>/dev/null | python3 "$helper_lib/dev_image_content.py" 2>/dev/null || true)"
+    if [[ -z "$want" || "$have" != "$want" ]]; then
+      echo "$container uses an old development image; rerun ./wip.sh --recreate" >&2
+      exit 2
+    fi
   fi
   if [[ -n "$root" ]]; then
     [[ "$(docker inspect -f '{{range .Mounts}}{{if eq .Destination "/wip"}}{{.Source}}{{end}}{{end}}' "$container")" == "$(realpath "$root")" ]] ||

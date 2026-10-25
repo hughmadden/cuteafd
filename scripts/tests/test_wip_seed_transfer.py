@@ -471,7 +471,7 @@ def _distribute(tmp_path, images):
         if record is not None:
             (store / host).write_text(record)
     targets = ' '.join(h for h in images if h != 'seed')
-    script = (_function('spark_dev_image_content') + _function('distribute_spark_dev_image') +
+    script = (_function('wip_image_content') + _function('spark_dev_image_content') + _function('distribute_spark_dev_image') +
               f'repo_root={ROOT}\n'
               'release_die() { echo "$*" >&2; exit 2; }\n'
               'stream_between_hosts() { printf "stream %s -> %s\\n" "$1" "$3" >> "$TRACE"; }\n'
