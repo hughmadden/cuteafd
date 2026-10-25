@@ -942,6 +942,23 @@
       }
     },
     {
+      "name": "qwen35-9b-bf16-min",
+      "config": "examples/configs/qwen35-9b-bf16-min.config",
+      "family": "qwen3_5",
+      "gpus": [
+        1
+      ],
+      "sparks": [],
+      "set": {
+        "RTX_GPUS": "1",
+        "COORDINATOR_GPU": "1",
+        "SPARK_COUNT": "0",
+        "SPECULATOR": "off",
+        "ADDR": "0.0.0.0:8830",
+        "EXPERT_PORT": "20500"
+      }
+    },
+    {
       "name": "qwen38-27b-bf16-min",
       "config": "examples/configs/qwen38-27b-bf16-min.config",
       "family": "qwen3_5",
@@ -954,7 +971,8 @@
         "COORDINATOR_GPU": "1",
         "SPARK_COUNT": "0",
         "ADDR": "0.0.0.0:8828",
-        "EXPERT_PORT": "20460"
+        "EXPERT_PORT": "20460",
+        "SPECULATOR": "dspark"
       }
     },
     {
@@ -970,7 +988,8 @@
         "COORDINATOR_GPU": "1",
         "SPARK_COUNT": "0",
         "ADDR": "0.0.0.0:8829",
-        "EXPERT_PORT": "20480"
+        "EXPERT_PORT": "20480",
+        "SPECULATOR": "dspark"
       }
     }
   ],

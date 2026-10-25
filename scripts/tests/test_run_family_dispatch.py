@@ -423,6 +423,29 @@ def test_dense_qwen_wip_uses_native_single_gpu_and_no_workers(tmp_path: Path, ca
     assert "--prefill-rows 4096" in plan and "--require-ready" not in plan
 
 
+@pytest.mark.parametrize("model", ["Qwen/Qwen3.5-9B", "Qwen/Qwen3.8-27B-FP8"])
+def test_dense_qwen_requires_resolved_coordinator_prefill_unit(tmp_path, model):
+    shape = {"prefill_unit_rows": 4096, "prefill_waves": 1, "prefill_span_rows": 4096}
+    result = _family_launch_result(tmp_path, DENSE_CONFIG, model,
+        "SPARK_COUNT=0\nSPECULATOR=off\n", extra_args=("--wip", "dense-test"),
+        deployment_overrides=shape,
+        encoder_plan={"placement_supported": True, "fits": True, "spark_ranks": 0})
+    assert result.returncode == 0, result.stderr
+    assert "serve-qwen35 --snapshot" in result.stderr
+    assert "cuteafd expertd-native" not in result.stderr
+
+
+@pytest.mark.parametrize("missing", ["prefill_unit_rows", "prefill_waves"])
+def test_dense_qwen_does_not_bypass_shared_prefill_contract(tmp_path, missing):
+    result = _family_launch_result(tmp_path, DENSE_CONFIG, "Qwen/Qwen3.5-9B",
+        "SPARK_COUNT=0\n", extra_args=("--wip", "dense-test"),
+        deployment_overrides={missing: 0},
+        encoder_plan={"placement_supported": True, "fits": True, "spark_ranks": 0})
+    assert result.returncode != 0
+    assert "the qwen3_5 deployment plan names no prefill" in result.stderr
+    assert "serve-qwen35 --snapshot" not in result.stderr
+
+
 @pytest.mark.parametrize("family", ["mimo_v2", "deepseek_v41"])
 @pytest.mark.parametrize("wip", [False, True])
 @pytest.mark.parametrize("allowed", [True, False, None, "true", "absent"])
@@ -858,7 +881,7 @@ glm = family == "glm5"
 unit = int(value("--prefill-rows", "0")) or (2048 if shared else 4096)
 waves = 1 if glm and ranks == 0 else int(value("--prefill-waves", "0")) or (2 if shared or glm or family == "deepseek_v4" else 1)
 span = int(value("--prefill-span-rows", "0")) or 16384 if glm or family == "deepseek_v4" else unit * waves
-report.update(prefill_unit_rows=unit, prefill_waves=waves, prefill_span_rows=span, prefill_transports=1)
+report.update(prefill_unit_rows=unit, prefill_waves=waves, prefill_span_rows=span, prefill_transports=int(ranks > 0))
 deployment = dict(version=1, family=family, executable=family != "qwen3_5" and placement_ready, wip_launchable=placement_ready, rtx_gpus=gpus, spark_ranks=ranks,
     topology=dict(tp=tp, ep=ep,
                   wire="native_ownership" if explicit else "canonical"), peers=peers,
