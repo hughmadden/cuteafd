@@ -6002,7 +6002,8 @@ upstream payload fetches. The full CPU plan accepts exactly the published
 packed device-table charge. Both published-weight component fixtures ran
 and passed with the original numerical bars and unchanged base rows.
 Mixed-model and agentic cache gates, DFlash2 and real-agent checks, and the
-matched four-Spark performance comparison remain required. The later
+candidate speed comparison with reported four-Spark results remain required.
+The user waived fresh baseline/control performance runs on 2026-10-25. The later
 API and qualification-tooling fixes are integrated for the final seal;
 smoke entries now carry one exact model ID through panels and sweeps and
 use the deployment's shared hardware lock directory.
@@ -6019,6 +6020,31 @@ unused; both model indices restore exact prefix and continuation bytes from
 RAM after releasing device retention. Keys logits are finite. It adds
 no execution, graph or cache path. The capped-export child now receives all
 the CDI helper functions it calls.
+
+The first live serving attempt stopped before readiness at the launcher's
+900 s inner deadline. The accepted launcher fix honors the existing configured
+3600 s bound without changing the sealed S3 runtime. Its retry reached API
+readiness in 1411 s: ranks 0–3 were ready around 16:14, while ranks 4–5
+finished around 16:34. The first precheck request then returned 401; no model,
+agent, DFlash2 or speed gate ran. Smoke supplies a private API key unless the
+entry explicitly sets `API_KEY_FILE`; that supplied key differed from the
+precheck's configured file. The next private matrix uses the same explicit
+key path on both sides. No credential is changed or included in evidence.
+
+The user authorized installing and using Sparknest on Romeo and all six
+Sparks, with Romeo serving as the storage hub. Use the published release
+when it supports the direct-link topology; if a configuration mode is missing,
+implement it in a local fork as explicitly requested. Verify hub-to-spoke RDMA,
+keep checkpoint files and offsets unchanged, and retain the existing engine
+push/sliced loader. Romeo already holds the complete pinned K4 snapshot
+(394,111,464,078 logical bytes, fully allocated) and the pinned DFlash2 source
+on the same filesystem as the proposed store. Adopt those files with hard
+links rather than duplicating checkpoint payloads. The partial original Keys
+HTTP-backed source must not be advertised as complete local shard replicas;
+keep its independently verified source view accessible through the launcher's
+existing absolute-path variant mount support. Switch storage only between
+runs, validate actual plan/admission after filesystem-daemon memory costs,
+and resume the remaining qualification with the verified S3 binaries.
 
 ## Backlog (lowest priority: only when nothing planned is left)
 
