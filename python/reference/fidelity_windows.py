@@ -393,6 +393,31 @@ def standard_split() -> dict:
     return split
 
 
+# Scored generated rows each standard half of a newly built or packaged set needs (TJ, 2026-10-20).
+# The loader admits published sets from 6,500; new sets are built to this larger floor.
+NEW_SET_GENERATED_MIN = 10_000
+
+
+def require_new_set_generated_rows(rows):
+    short = {half: rows[f'{half}_generated_positions'] for half in ('decode', 'prefill')
+             if rows[f'{half}_generated_positions'] < NEW_SET_GENERATED_MIN}
+    if short:
+        raise ValueError(f'new fidelity sets need {NEW_SET_GENERATED_MIN:,} scored generated rows per half; '
+                         + ', '.join(f'{half} has {count:,}' for half, count in short.items()))
+
+
+def standard_generated_rows(panel):
+    """Report natural row counts using the consumer's fixed split, never resample."""
+    windows = {window['id']: window for window in panel['windows']}
+    counts = {name: sum(window['roles'][window['score_from']:].count('gen')
+                        for window in (windows[wid] for wid in ids))
+              for name, ids in standard_split().items()}
+    small, large = min(counts.values()), max(counts.values())
+    return dict(tier='standard-v2', decode_generated_positions=counts['decode'],
+                prefill_generated_positions=counts['prefill'],
+                max_min_ratio=large / small if small else None, informational_only=True)
+
+
 def verify_snapshot(manifest: dict, snapshot: Path) -> dict:
     """Check cheap, stable identities without hashing hundreds of GB of weights."""
     from checkpoint_tokenizer import tokenizer_identity

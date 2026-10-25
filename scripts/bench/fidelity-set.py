@@ -23,7 +23,8 @@ import urllib.request
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "python/reference"))
-from fidelity_windows import MAX_TOKENS, SET_SCHEMA, bucket, canonical, set_hash, validate_set
+from fidelity_windows import (MAX_TOKENS, NEW_SET_GENERATED_MIN, SET_SCHEMA, bucket, canonical,
+                              require_new_set_generated_rows, set_hash, standard_generated_rows, validate_set)
 from checkpoint_tokenizer import load_tokenizer, tokenizer_identity
 from fidelity_generation import token_ids
 
@@ -679,6 +680,7 @@ def main(argv=None):
     if not a.retokenize_text and any((a.legacy_source, a.legacy_source_sha256, a.legacy_source_revision)):
         p.error("legacy extension inputs require --retokenize-text")
     from tokenizers import Tokenizer
+    generated = False
     if a.retokenize_text:
         if (not a.source_tokenizer or not a.source_sha256 or a.pinned_text or a.media_fixtures
                 or a.recording or a.file_list or a.legacy_reference or a.family != "step5"):
@@ -723,6 +725,7 @@ def main(argv=None):
             arm=json.loads(a.arm_manifest.read_text()), probe=ProbeClient(a.base_url, a.bench_token, a.timeout),
             fixtures=a.media_fixtures, tokenizer_sha256=hashlib.sha256(a.tokenizer.read_bytes()).hexdigest())
     else:
+        generated = True
         arm = json.loads(a.arm_manifest.read_text())
         probe = ProbeClient(a.base_url, a.bench_token, a.timeout)
         if a.backend != "probe":
@@ -766,9 +769,24 @@ def main(argv=None):
     if out.exists():
         p.error("set versions are immutable; choose a new --version/output")
     out.parent.mkdir(parents=True, exist_ok=True)
+    short = None
+    if generated:
+        # A new set must clear the packaging floor; check it here, before hours of reference work.
+        rows = standard_generated_rows(manifest)
+        print(f"standard-v2 generated rows: decode {rows['decode_generated_positions']:,}, "
+              f"prefill {rows['prefill_generated_positions']:,} (new sets need {NEW_SET_GENERATED_MIN:,} per half)")
+        try:
+            require_new_set_generated_rows(rows)
+        except ValueError as error:
+            short = error
+            # Keep the text for diagnosis, never under the name a reference run would read.
+            out = out.with_name(f"{out.stem}.short{out.suffix}")
     out.write_bytes(canonical(manifest) + b"\n")
     count = len(manifest["windows"])
     print(f"{out}: {count} windows, {count * 512} rows, sha256 {manifest['set_sha256']}")
+    if short:
+        print(f"{short}; the set is not publishable", file=sys.stderr)
+        sys.exit(3)
 
 
 if __name__ == "__main__":

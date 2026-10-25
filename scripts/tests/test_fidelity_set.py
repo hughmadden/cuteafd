@@ -76,7 +76,8 @@ def fake_server():
     server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
-    state["client"] = builder.ProbeClient(f"http://127.0.0.1:{server.server_port}", "test-token", 10)
+    state["url"] = f"http://127.0.0.1:{server.server_port}"
+    state["client"] = builder.ProbeClient(state["url"], "test-token", 10)
     yield state
     server.shutdown()
     server.server_close()
@@ -193,6 +194,35 @@ def test_standard_halves_hold_equal_context_buckets_whatever_the_answer_length(f
         windows = [w for w in manifest["windows"] if w["block"] == block and w["id"] != "legacy"]
         assert [w["bucket"] for w in windows] == ["0-2K" if target < 2048 else "2-8K" for target in targets]
     assert manifest["recipe"]["prompt_targets"] == {"D": list(builder.D_TARGETS), "E": list(builder.E_TARGETS)}
+
+
+@pytest.mark.parametrize("generated, decode, prefill", [(600, 13824, 13312), (73, 1971, 1898)])
+def test_new_text_set_keeps_its_name_only_when_both_standard_halves_reach_the_floor(
+        fake_server, monkeypatch, tmp_path, capsys, generated, decode, prefill):
+    fake_server["generated"] = generated
+    monkeypatch.setattr(builder, "load_tokenizer", lambda path, **_: FakeTokenizer())
+    monkeypatch.setattr(builder, "tokenizer_identity", lambda path: {"tokenizer_sha256": "c" * 64})
+    arm, legacy, out = tmp_path / "arm.json", tmp_path / "legacy.json", tmp_path / "set-v2.json"
+    arm.write_text(json.dumps(policy()))
+    legacy.write_text(json.dumps({"schema": "cuteafd.bench.reference/1", "score_from": 64, "tokens": list(range(576))}))
+    argv = ["--family", "minimax_m3", "--version", "v2", "--model", "test-model", "--checkpoint", "test-model",
+            "--tokenizer", str(tmp_path / "tokenizer.json"), "--arm-manifest", str(arm),
+            "--legacy-reference", str(legacy), "--base-url", fake_server["url"], "--bench-token", "test-token",
+            "--out", str(out)]
+    fake_server["family"] = "minimax_m3"
+    short = tmp_path / "set-v2.short.json"
+    if decode >= 10_000:
+        builder.main(argv)
+        captured = capsys.readouterr()
+        assert out.is_file() and not short.exists()
+    else:
+        with pytest.raises(SystemExit) as error:
+            builder.main(argv)
+        captured = capsys.readouterr()
+        assert error.value.code == 3
+        assert not out.exists() and short.is_file()
+        assert f"decode has {decode:,}, prefill has {prefill:,}" in captured.err
+    assert f"standard-v2 generated rows: decode {decode:,}, prefill {prefill:,}" in captured.out
 
 
 def test_text_recipe_requires_explicit_sealed_anchor(capsys):

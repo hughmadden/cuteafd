@@ -5,7 +5,6 @@ import copy
 import hashlib
 import json
 from pathlib import Path
-import re
 import shutil
 import subprocess
 import sys
@@ -15,7 +14,9 @@ from safetensors.numpy import save_file
 
 REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO / 'python/reference'))
-from fidelity_windows import canonical, validate_public_metadata, validate_public_text, validate_text_source
+# The generated-row floor is shared with the set builder, which applies it before any reference run.
+from fidelity_windows import (canonical, require_new_set_generated_rows, standard_generated_rows,
+                              validate_public_metadata, validate_public_text, validate_text_source)
 from checkpoint_tokenizer import load_tokenizer, tokenizer_identity
 
 QUICK = ['legacy', 'a00', 'a04', 'a08', 'a20', 'c00', 'd00', 'e00']
@@ -80,35 +81,6 @@ def compact_tensors(full, window):
                 roles=np.array([r == 'gen' for r in window['roles'][start:]], dtype='u1'),
                 top_ids=ids, top_log_probs=probabilities, tail_log_mass=tails,
                 next_token_log_prob=next_lps)
-
-
-# Scored generated rows each standard half of a newly packaged set needs (TJ, 2026-10-20).
-# The loader admits published sets from 6,500; new sets are built to this larger floor.
-NEW_SET_GENERATED_MIN = 10_000
-
-
-def require_new_set_generated_rows(rows):
-    short = {half: rows[f'{half}_generated_positions'] for half in ('decode', 'prefill')
-             if rows[f'{half}_generated_positions'] < NEW_SET_GENERATED_MIN}
-    if short:
-        raise ValueError(f'new fidelity sets need {NEW_SET_GENERATED_MIN:,} scored generated rows per half; '
-                         + ', '.join(f'{half} has {count:,}' for half, count in short.items()))
-
-
-def standard_generated_rows(panel):
-    """Report natural row counts using the consumer's fixed split, never resample."""
-    source = (REPO / 'rust/crates/cuteafd-bench/src/fidelity_dataset.rs').read_text()
-    windows = {window['id']: window for window in panel['windows']}
-    counts = {}
-    for name in ('decode', 'prefill'):
-        match = re.search(r'pub const STANDARD_' + name.upper() + r':[^=]+=\s*\[(.*?)\];', source, re.S)
-        ids = re.findall(r'"([a-e][0-9]{2}|legacy)"', match.group(1))
-        counts[name] = sum(window['roles'][window['score_from']:].count('gen')
-                           for window in (windows[wid] for wid in ids))
-    small, large = min(counts.values()), max(counts.values())
-    return dict(tier='standard-v2', decode_generated_positions=counts['decode'],
-                prefill_generated_positions=counts['prefill'],
-                max_min_ratio=large / small if small else None, informational_only=True)
 
 
 def standard_generated_note(counts):
