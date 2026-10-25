@@ -69,8 +69,11 @@ def test_minimax_host_prefix_tier_defaults_on_and_stores_on_eviction(tmp_path, k
     ("COORDINATOR_GPUS=0,1\n", "two-GPU head split is not implemented"),
     ("COORDINATOR_GPU=0,1\n", "two-GPU head split is not implemented"),
     ("COORDINATOR_SPLIT=heads\n", "two-GPU head split is not implemented"),
-    ("SPECULATOR=mtp\n", "supports SPECULATOR=dspark or off"),
-    ("SPECULATOR=dflash2\n", "supports SPECULATOR=dspark or off"),
+    ("SPECULATOR=mtp\n", "supports SPECULATOR=dspark, dflash2 or off"),
+    ("SPECULATOR=dflash2\nSPECULATOR_FP8=maybe\n", "SPECULATOR_FP8 must be auto, on or off"),
+    ("SPECULATOR=dflash2\nDRAFT_KV_CACHE=int8\n", "DRAFT_KV_CACHE must be bf16 or fp8"),
+    ("SPECULATOR=dspark\nDRAFT_KV_CACHE=bf16\n", "DRAFT_KV_CACHE apply to SPECULATOR=dflash2"),
+    ("SPECULATOR_MODEL_ID=other/draft\n", "apply to SPECULATOR=dflash2"),
     ("RTX_EXPERT_LAYERS=max\n", "must be auto or a fixed routed-layer count"),
     ("RTX_EXPERT_LAYERS=25%\n", "must be auto or a fixed routed-layer count"),
     ("RTX_EXPERT_LAYERS=58\n", "checkpoint has 57 routed layers"),
@@ -192,3 +195,20 @@ def test_minimax_bundled_dspark_is_explicit(tmp_path):
     plan = _line(result, "cuteafd plan")
     assert _flag(serve, "--speculator") == _flag(plan, "--speculator") == "dspark"
     assert "--draft " not in serve
+
+
+@pytest.mark.parametrize("keys,fp8,kv", [("", None, "fp8"), ("SPECULATOR_FP8=off\nDRAFT_KV_CACHE=bf16\n", "false", "bf16"),
+                                         ("SPECULATOR_FP8=on\n", "true", "fp8")])
+def test_minimax_dflash2_serves_and_plans_the_radixark_drafter_on_the_shared_drafter(tmp_path, keys, fp8, kv):
+    result = _launch(tmp_path, "SPECULATOR=dflash2\nSPECULATOR_DRAFTS=5\n" + keys)
+    assert result.returncode == 0, result.stderr
+    serve = _line(result, "serve-minimax --snapshot")
+    plan = _line(result, "cuteafd plan")
+    assert _flag(serve, "--speculator") == _flag(plan, "--speculator") == "dflash2"
+    draft = _flag(serve, "--draft")
+    assert draft.endswith("models--RadixArk--Minimax-M3.1-Flash-Dflash2/snapshots/abc")
+    assert _flag(plan, "--drafter-snapshot") == draft
+    assert _flag(serve, "--draft-fp8") == fp8
+    assert ("--minimax-draft-bf16" in plan) == (fp8 == "false")
+    assert _flag(serve, "--draft-kv-cache") == _flag(plan, "--draft-kv-cache") == kv
+    assert _flag(serve, "--draft-fixed") == "5"

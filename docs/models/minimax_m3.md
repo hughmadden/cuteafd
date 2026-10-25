@@ -47,7 +47,11 @@ Status: **under qualification**. `serve-minimax` serves the release from a
   tile); video samples 1 fps and attends in segments of 4 temporal patches
   (8 frames). See [Vision](#vision).
 - Speculator: the bundled DSpark drafter (5 dense sliding-4096 layers, blocks
-  of 7, Markov rank 256, confidence head; taps 3/17/31/45/59).
+  of 7, Markov rank 256, confidence head; taps 3/17/31/45/59), or
+  `RadixArk/Minimax-M3.1-Flash-Dflash2` (revision `923bf1d4b567d5ccb71b0488c6e61b5e4794e92a`,
+  `--speculator dflash2 --draft SNAPSHOT`) on the shared DFlash2 drafter: 5 Gemma-norm
+  sliding-4096 layers, 64 query / 4 KV heads, NeoX RoPE on 64 channels, SwiGLU-OAI, blocks of
+  an anchor and 7 drafts, the same taps; it borrows the target's embedding and BF16 head.
 
 ## Serving behaviour
 
@@ -61,6 +65,14 @@ Status: **under qualification**. `serve-minimax` serves the release from a
   returned as text; other tools are read best effort, as vLLM's `minimax_m3`
   parser does (values coerce to the declared type when they parse, a repeated
   parameter becomes a list).
+- DFlash2 (`SPECULATOR=dflash2`, `SPECULATOR_MODEL_ID` defaults to the RadixArk draft) taps
+  the FP32 residual's last 4096 rows of every step into the shared drafter's ring, on the
+  target's stream (the decode recordings carry the taps). Its block attends as SGLang serves the
+  release: a per-row 4096 window and causal block rows (no `is_causal` in the config). The
+  GEMMs load as one E4M3 copy by default (`SPECULATOR_FP8=off` keeps the checkpoint's BF16),
+  the rings as FP8 K/V (`DRAFT_KV_CACHE=bf16`). `minimax-golden --draft SNAPSHOT
+  --draft-replay P` replays it on a golden window's taps; `--draft-oracle DIR` compares it with
+  `python/reference/families/minimax_m3/dflash2/reference.py`.
 - DSpark draft length uses the shared `simple` policy (default;
   `DRAFT_POLICY`/`DRAFT_ROW_COST` select others, `SPECULATOR_DRAFTS=N` fixes the
   depth). TP2 on a 5090, aggregate tok/s at C1/C4/C16: target only
@@ -209,6 +221,13 @@ Without the image's `PROGRAMS.json` the planner refuses, as Step-5's does.
 - DSpark: 2.30 GB of weights, 40 MiB of BF16 K/V rings per drafting ring
   (default: concurrency, at most eight; a request admitted while every ring is
   busy decodes target-only) and taps holding a chunk's five target layers.
+- DFlash2: the shared drafter's own admission (`families::minimax_m3::dflash::DflashMemory`,
+  planner and server alike): 2.22 GB of E4M3 GEMMs and BF16 norms, kernels and selector
+  codebooks (4.11 GB in BF16), 21 MiB of FP8 K/V rings per drafting ring (40 MiB in BF16),
+  361 MB of taps and context-update buffers for a 4096-row tail, and its step buffers (51 MB of
+  logits at eight sequences). FP8 packing holds one 377 MB BF16 source matrix (`fc`) at load. On the
+  RTX 5090 at TP2 (planned cards' shapes) the pool is 138,112 tokens with FP8 GEMMs and FP8
+  rings, 111,104 with BF16 GEMMs.
 - Spark intake: per lane and rank, a GPU plane of the lane's rows where the NIC
   lands in GPU memory; on a GeForce coordinator one GPU row, with the partials in
   pinned host planes.
