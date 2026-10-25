@@ -310,7 +310,8 @@ def generate(entry, arm_name, arm, state, key_file, overrides, probes, expected_
         values.pop('WIP_INSTANCE', None)
         values.pop('WIP_ROOT', None)
         values['COORDINATOR_DOCKER_INFERENCE'] = 'ghcr.io/tpurtell/cuteafd-coordinator:' + arm['release']
-        values['SPARK_EXPERT_DOCKER_INFERENCE'] = 'ghcr.io/tpurtell/cuteafd-spark-expert:' + arm['release']
+        if count > 0:
+            values['SPARK_EXPERT_DOCKER_INFERENCE'] = 'ghcr.io/tpurtell/cuteafd-spark-expert:' + arm['release']
         run_args = []
     elif arm.get('root'):
         values['WIP_ROOT'] = arm['root']
