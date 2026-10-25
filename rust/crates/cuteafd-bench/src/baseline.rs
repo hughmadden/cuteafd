@@ -279,6 +279,9 @@ fn fidelity(run: &mut Run<'_>, check: &mut Check) -> Result<()> {
     } else if scored.dataset.as_ref().is_some_and(|d| d["qualification"] == "reference-only qualified") {
         check.summary.push_str(" · reference-only qualified");
     }
+    if scored.dataset.as_ref().is_some_and(|d| d["internal"] == true) {
+        check.summary.push_str(" · internal set");
+    }
     Ok(())
 }
 
