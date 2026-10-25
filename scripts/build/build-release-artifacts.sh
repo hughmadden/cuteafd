@@ -254,6 +254,16 @@ cuteafd_compiler_cache_setup "$build_root"
 cuteafd_compiler_cache_check_cmake_compilers "$build_root/native"
 mapfile -t compiler_cache_cmake_args < <(cuteafd_compiler_cache_cmake_args "$build_root/native")
 cargo_target_dir+="$( [[ "${CUTEAFD_KACHE_MODE:-disabled}" != enabled ]] || printf -- '-kache' )"
+# The native phase compiles no Rust: it reads the daemons from the target the
+# rust phase actually used, whatever compiler-cache mode this run fell back to.
+case "$artifact_phase" in
+  rust) printf '%s\n' "$cargo_target_dir" >"$artifact_state/rust.target" ;;
+  native)
+    [[ -s "$artifact_state/rust.target" ]] ||
+      { echo "release artifact state records no Rust target: $artifact_state" >&2; exit 2; }
+    cargo_target_dir="$(<"$artifact_state/rust.target")"
+    ;;
+esac
 export CARGO_TARGET_DIR="$cargo_target_dir"
 [[ "$artifact_phase" == native ]] || cuteafd_build_cache_cargo_offline "$build_root/source/rust/Cargo.toml"
 # Host CPU targets (scripts/build/host-isa.sh): GB10-tuned on the Spark leg; the

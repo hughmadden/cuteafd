@@ -94,7 +94,8 @@ def test_build_leases_hardware_only_for_the_native_export_phase():
     assert rust < pick < lease < image
     # The Rust phase gets no GPU; the native phase is the only GPU run and runs leased.
     rust_run = coord[coord.rindex('timeout --foreground', 0, rust):rust]
-    assert 'CDI' not in rust_run and 'CUDA_VISIBLE_DEVICES' not in rust_run
+    assert 'CDI' not in rust_run
+    assert '--runtime runc -e NVIDIA_VISIBLE_DEVICES=void -e CUDA_VISIBLE_DEVICES=' in rust_run
     native = coord.split('release_coordinator_native_export() {', 1)[1].split('\n}\n', 1)[0]
     assert '"${CUTEAFD_CDI_ARGS[@]}"' in native and 'CUTEAFD_RELEASE_ARTIFACT_PHASE=native' in native
     assert 'release_watch_export_gpu "$export_gpu_uuid" "$coordinator_export_container" &' in native
