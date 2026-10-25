@@ -6137,7 +6137,7 @@ units, no expiry, bounded failure restarts and the same source pin, offsets
 and private block store. Its existing Python/FUSE runtime is sealed outside
 build scratch (archive SHA256
 `00d87d11019dbcae4b77b35bfbef79dc3971b694af2bec9f8e2347526b98df4c`).
-No packages, credentials or checkpoint payloads were copied by this change;
+No packages were installed, and no credentials or checkpoint payloads copied;
 the dependency archive is recovery material, not another weight copy.
 
 ## Backlog (lowest priority: only when nothing planned is left)
