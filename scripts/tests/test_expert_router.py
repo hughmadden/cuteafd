@@ -71,3 +71,41 @@ def test_native_wide_dispatch_and_reducer_width():
     assert "select_wide_kernel<false><<<rows,1024,0,s>>>" in source
     assert "CUTEAFD_HIDDEN_CASE(3584, __VA_ARGS__)" in (
         ROOT / "native/shared/cuda/expert_hidden.cuh").read_text()
+
+
+def test_v41_reference_qualifier_parses_optional_library():
+    path = ROOT / "python/tools/qualify/deepseek_v41/qualify_v41_router_native_abi.py"
+    spec = importlib.util.spec_from_file_location("v41_native_abi", path)
+    qualifier = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(qualifier)
+    base = ["--native-lib", "/candidate.so", "--output", "/result.json"]
+    assert qualifier.parse_args(base).reference_native_lib is None
+    args = qualifier.parse_args(base + ["--reference-native-lib", "/reference.so"])
+    assert args.native_lib == Path("/candidate.so")
+    assert args.reference_native_lib == Path("/reference.so")
+
+
+def test_v41_reference_qualifier_compares_all_fields_bitwise(monkeypatch):
+    import sys
+    from types import SimpleNamespace
+    import pytest
+
+    path = ROOT / "python/tools/qualify/deepseek_v41/qualify_v41_router_native_abi.py"
+    spec = importlib.util.spec_from_file_location("v41_native_abi_compare", path)
+    qualifier = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(qualifier)
+    monkeypatch.setitem(sys.modules, "torch", SimpleNamespace(int32=np.int32, equal=np.array_equal))
+    reference = [np.zeros((2, 4), dtype=np.float32), np.zeros((2, 3), dtype=np.int32),
+                 np.ones((2, 3), dtype=np.float32)]
+    actual = [value[:1].copy() for value in reference]
+    qualifier.assert_outputs_bitwise(actual, reference, 128, 1)
+    for index, name in enumerate(("scores", "ids", "routing")):
+        changed = [value.copy() for value in actual]
+        changed[index].view(np.int32)[0, 0] ^= 1
+        with pytest.raises(AssertionError) as error:
+            qualifier.assert_outputs_bitwise(changed, reference, 128, 1)
+        assert error.value.args[0] == (128, 1, name)
+    signed_zero = [value.copy() for value in actual]
+    signed_zero[0][0, 0] = -0.0
+    with pytest.raises(AssertionError):
+        qualifier.assert_outputs_bitwise(signed_zero, reference, 128, 1)
