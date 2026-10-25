@@ -256,3 +256,57 @@ def test_wip_cancel_stops_remote_session_that_survives_ssh_client(tmp_path):
         if process.poll() is None:
             os.killpg(process.pid, signal.SIGKILL)
             process.wait()
+
+
+def local_env(tmp_path, arch='amd64', failure='', present=True, entrypoint=MOD.ENTRYPOINT):
+    env = fixture(tmp_path, arch, failure=failure, present=present)
+    obj = json.loads(env['OBJECT'])
+    obj['Config']['Entrypoint'] = entrypoint
+    env['OBJECT'] = json.dumps(obj)
+    return env
+
+
+@pytest.mark.parametrize('arch', ['amd64', 'arm64'])
+def test_local_mode_admits_only_the_configured_tag(tmp_path, arch):
+    result = subprocess.run(command(tmp_path, arch, mode='local'), env=local_env(tmp_path, arch),
+                            capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == IMAGE
+    assert calls(tmp_path) == [['image', 'inspect', 'local-dev']]
+    manifest = json.loads((tmp_path/'manifest.json').read_text())
+    assert manifest['source'] == 'local' and manifest['requested_ref'] == 'local-dev'
+    assert manifest['image_id'] == IMAGE and manifest['architecture'] == arch
+    assert manifest['registry_reference'] is None and manifest['registry_digest'] is None
+    assert manifest['toolchain_hash'] == MOD._toolchain.identity(ROOT)
+    assert manifest['base_digest'] == MOD._toolchain.BASE + MOD._toolchain.BASE_DIGESTS[arch]
+    labels = subprocess.run(['python3', str(SELECTOR), 'labels', '--manifest', str(tmp_path/'manifest.json')],
+                            capture_output=True, text=True, check=True).stdout.splitlines()
+    assert 'io.cuteafd.dev-image.source=local' in labels
+    assert 'io.cuteafd.dev-image.local.reference=local-dev' in labels
+
+
+@pytest.mark.parametrize(('failure', 'present', 'entrypoint', 'reason'), [
+    ('', False, MOD.ENTRYPOINT, 'local-dev on amd64'),
+    ('hash', True, MOD.ENTRYPOINT, 'toolchain label mismatch'),
+    ('base', True, MOD.ENTRYPOINT, 'base-digest label mismatch'),
+    ('arch', True, MOD.ENTRYPOINT, 'architecture mismatch'),
+    ('', True, ['/bin/sh'], 'entrypoint is not /usr/local/bin/cuteafd-entrypoint'),
+])
+def test_local_mode_never_pulls_builds_or_falls_back(tmp_path, failure, present, entrypoint, reason):
+    result = subprocess.run(command(tmp_path, mode='local'),
+                            env=local_env(tmp_path, failure=failure, present=present, entrypoint=entrypoint),
+                            capture_output=True, text=True)
+    assert result.returncode == 1
+    assert 'CUTEAFD_RELEASE_DEV_IMAGE_SOURCE=local: local-dev on amd64' in result.stderr
+    assert reason in result.stderr
+    assert all(call[:2] == ['image', 'inspect'] for call in calls(tmp_path))
+    assert not (tmp_path/'manifest.json').exists()
+
+
+def test_build_accepts_local_mode_and_reports_it_in_the_dry_run():
+    text = (ROOT / 'build.sh').read_text()
+    assert 'in registry|build|local) ;;' in text
+    # Both dry-run lines (coordinator and Spark) name the local-only plan.
+    assert text.count('[[ "$release_dev_image_source" == local ]]') == 2
+    assert text.count('only; verify, never pull or build"') == 2
+    assert '--mode "$release_dev_image_source"' in text and '--mode "${19:-registry}"' in text
