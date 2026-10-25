@@ -159,6 +159,7 @@ fn plan_variants(args: &PlanArgs, snapshot: &std::path::Path) -> Result<()> {
             "name": o.name, "id": o.public_id, "available": o.plan.is_some(), "rejection": o.rejection,
             "sites": o.plan.as_ref().map(|p| p.sites.len()), "k_max": o.plan.as_ref().map(|p| p.k_max()),
             "table_bytes": o.plan.as_ref().map(|p| p.table_bytes()),
+            "delta_values": o.plan.as_ref().map(|p| p.delta_values()),
             "namespace": o.plan.as_ref().map(|p| format!("{:016x}", p.namespace)),
             "verify": o.verify_summary(), "missing_in_base": o.missing_in_base, "verdicts": o.verdicts })).collect();
         println!("{}", serde_json::to_string_pretty(&value)?);
@@ -172,7 +173,9 @@ fn plan_variants(args: &PlanArgs, snapshot: &std::path::Path) -> Result<()> {
                 None => println!("  {:<18} {:<58} unchanged", verdict.site, verdict.tensor),
                 Some(r) => println!("  {:<18} {:<58} {:>2} {:>7.3} {:>6.4} {:>7.5} {:>7.5} {:>8.5}  {}", verdict.site, verdict.tensor,
                     r.k, r.alphas.first().copied().unwrap_or(0.0), r.top_share, r.next_share, r.proj_cos, r.r_w,
-                    if r.accept { "ok".to_owned() } else { format!("REJECT: {}", r.reason.as_deref().unwrap_or("")) }),
+                    if r.accept { "ok".to_owned() }
+                    else if verdict.delta { format!("DELTA (stored ΔW): {}", r.reason.as_deref().unwrap_or("")) }
+                    else { format!("REJECT: {}", r.reason.as_deref().unwrap_or("")) }),
             }
         }
         if !outcome.missing_in_base.is_empty() {
@@ -180,8 +183,9 @@ fn plan_variants(args: &PlanArgs, snapshot: &std::path::Path) -> Result<()> {
                 outcome.missing_in_base.len(), outcome.missing_in_base[0]);
         }
         match (&outcome.plan, &outcome.rejection) {
-            (Some(plan), _) => println!("  AVAILABLE: {} sites, k_max {}, tables {} KiB per GPU that owns them, namespace {:016x}",
-                plan.sites.len(), plan.k_max(), plan.table_bytes().div_ceil(1024), plan.namespace),
+            (Some(plan), _) => println!("  AVAILABLE: {} sites ({} deltas), k_max {}, tables {} KiB per GPU that owns them, \
+                deltas {} Mi values, namespace {:016x}", plan.sites.len(), plan.sites.iter().filter(|(_, op)| op.is_delta()).count(),
+                plan.k_max(), plan.table_bytes().div_ceil(1024), plan.delta_values().div_ceil(1 << 20), plan.namespace),
             (None, Some(reason)) => println!("  UNAVAILABLE: {reason}; weight-set variant required. Base serving is unaffected."),
             (None, None) => unreachable!(),
         }

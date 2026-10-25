@@ -33,6 +33,19 @@ def test_variants_reach_serve_glm(tmp_path: Path) -> None:
     assert f"-v {outside}:{outside}:ro" in line
 
 
+def test_variants_reach_serve_glmf(tmp_path: Path) -> None:
+    from test_run_family_dispatch import GLMF_TWO_LAYER
+    _snapshot(tmp_path / "hf", "example-org/GLM-5.3-Flash-alternate-weights", GLMF_TWO_LAYER, "rev2")
+    keys = ("RTX_GPUS=1\nVARIANTS=alternate\n"
+            "VARIANT_ALTERNATE_SOURCE=example-org/GLM-5.3-Flash-alternate-weights\nVARIANT_ALTERNATE_REVISION=rev2\n")
+    result = _family_launch_result(tmp_path, GLMF_TWO_LAYER, "test/glmf", keys)
+    assert result.returncode == 0, result.stderr
+    line = next(line for line in result.stderr.splitlines() if "cuteafd serve-glmf" in line)
+    snapshot = (tmp_path / "hf" / "hub").resolve() / "models--example-org--GLM-5.3-Flash-alternate-weights-FP8" / "snapshots" / "rev2"
+    assert line.endswith(f"--variant name=alternate,source={snapshot}") or \
+        f"--variant name=alternate,source={snapshot}" in line, line
+
+
 def test_no_variants_adds_nothing(tmp_path: Path) -> None:
     line = _coordinator(_family_launch_result(tmp_path, GLM, "zai-org/GLM-5.3", ""))
     assert "--variant" not in line and ":ro " not in line.split(" serve-glm ")[0].split("-v ")[-1]
