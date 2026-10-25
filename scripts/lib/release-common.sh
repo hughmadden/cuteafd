@@ -2135,6 +2135,19 @@ release_wip_cp() {
   fi
 }
 
+# A dry run stages into a private layout (RELEASE_PRIVATE_WIP_LAYOUT) and removes it
+# when the launcher exits: re-staging the shared one (rm, then mv) would pull files
+# from under a live server of the same slot and instance.
+release_private_wip_layout() {
+  mkdir -p "$HOME/.cache/cuteafd/wip-run"
+  RELEASE_PRIVATE_WIP_LAYOUT="$(mktemp -d "$HOME/.cache/cuteafd/wip-run/.dry-run.XXXXXX")"
+  trap release_remove_private_wip_layout EXIT
+}
+release_remove_private_wip_layout() {
+  [[ -z "${RELEASE_PRIVATE_WIP_LAYOUT:-}" ]] ||
+    rm -rf -- "$RELEASE_PRIVATE_WIP_LAYOUT" "$RELEASE_PRIVATE_WIP_LAYOUT.tmp"
+}
+
 release_stage_wip_layout() {
   local container="$1" slot="$2" role="$3" layout="$4"
   local raw="$layout.tmp/raw" root
