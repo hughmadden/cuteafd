@@ -4,9 +4,11 @@
 //! `CUTEAFD_IDLE_PARK_SECONDS`), the same on the coordinator and the Spark
 //! workers.
 //!
-//! - Busy waits ([`HostWait`]): `block` (default) sleeps in per-step syncs
-//!   (blocking-sync events) and paces the exchange worker's polling to each
-//!   wave's expected duration, for a less loaded machine; `spin` spins in
+//! - Busy waits ([`HostWait`]): `block` (default) spins for [`BLOCK_SPIN`]
+//!   in each critical-path wait (most per-layer waits end within it), then
+//!   sleeps: per-step syncs on blocking-sync events, the rest in
+//!   [`BLOCK_SLEEP`] slices at 1 us timer slack; the exchange worker paces its
+//!   polling to each wave's expected duration. `spin` spins in
 //!   host syncs and keeps the exchange worker polling between a wave's post
 //!   and its replies, for the lowest latency at one busy core per waiting
 //!   thread.
