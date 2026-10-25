@@ -5671,6 +5671,10 @@ so this lands before lanes spread to GLM or V4.1-sized graph sets.
 
 ## Per-request weight variants: review and proposed direction (2026-10-24)
 
+Alternate checkpoint labels and deployment paths in this section are generic
+examples. Machine-specific paths and original receipt identities remain in
+the private operational records; these labels do not rename deployed files.
+
 This is the reconciled implementation plan, not a claim of qualification or
 an already changed default. The existing overlay architecture remains:
 one resident base checkpoint, request-selected operators at named sublayer

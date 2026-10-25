@@ -16,6 +16,11 @@ DGX Sparks serves the routed experts over RoCE.
   load from the Hugging Face snapshot itself, with no repacking or side files.
 - **Exact prefix cache:** agentic sessions restore the deepest cached prefix
   byte-for-byte instead of recomputing it.
+- **Per-request weight layers:** configure an alternative weight checkpoint
+  with `--variant name=alternate,source=/weights/alternate,id=alternate-weights,mode=shared-only`.
+  Supported GLM output-projection edits are derived and verified at startup;
+  requests select the base or a ready variant by model ID. This does not
+  establish full-checkpoint equivalence for weights outside those sites.
 - **Built-in dashboard:** a live console of lanes, pipeline stages and draft
   acceptance, plus a benchmark page with speed, quality and agentic panels.
   [Dashboard](docs/dashboard.md)

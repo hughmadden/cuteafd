@@ -282,7 +282,7 @@ const GLM53_PILOT: &[(&str, Option<f32>, f32, f32, f32)] = &[
     ("model.layers.50.self_attn.o_proj.weight", None, 0.0, 0.0, 0.0),
 ];
 
-/// GLM-5.3 full: official FP8 dense tensors against the alternate-weight checkpoint's FP16 tensors
+/// GLM-5.3 full: base FP8 dense tensors against a pinned alternate fixture's FP16 tensors
 /// (the pilot table above): α 3.0, down_proj leftover at FP16 rounding,
 /// o_proj leftover at the BF16-versus-FP8 floor, layer 50 unedited.
 #[test]
@@ -311,10 +311,10 @@ fn glm53_variant_pack_reproduces_the_pilot() {
     }
 }
 
-/// GLM-5.3 Flash: official FP8 against example-org's alternate-weights-FP8
+/// GLM-5.3 Flash: base FP8 against a pinned alternate FP8 fixture
 /// (`glmf-alternate-rank.json`): BF16 L12 o_proj is rank 1; L44 o_proj is not low rank.
 #[test]
-#[ignore = "needs CUTEAFD_GLMF_BASE (zai-org/GLM-5.3-Flash) and CUTEAFD_GLMF_VARIANT (example-org/GLM-5.3-Flash-alternate-weights)"]
+#[ignore = "needs CUTEAFD_GLMF_BASE (FP8 base checkpoint) and CUTEAFD_GLMF_VARIANT (pinned alternate fixture)"]
 fn glm_flash_alternate_reproduces_the_pilot() {
     let Some(base_dir) = fixture_dir("CUTEAFD_GLMF_BASE") else { return };
     let Some(variant_dir) = fixture_dir("CUTEAFD_GLMF_VARIANT") else { return };
