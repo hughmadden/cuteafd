@@ -435,8 +435,8 @@ COORDINATOR_WS_CELLS: dict[tuple[str, int, int], dict] = {
     ('v41', 1152, 1024): _WS_S14,
     ('v41', 2304, 2752): _WS_S14,
     ('v41', 2304, 2048): _WS_S14,
-    ('v41', 1152, 2752): _WS_S14,
-    ('v41', 1152, 2048): _WS_S14,
+    ('v41', 1152, 2752): dict(route_block=64, dynamic=True, tile=(64, 192, 64, 256)),
+    ('v41', 1152, 2048): dict(route_block=64, dynamic=True, tile=(64, 192, 64, 256)),
     ('v41', 2304, 4096): _WS_S14,
     ('v41', 1152, 4096): _WS_S14,
     # Kimi K3 (H3584/E896/top16 K2/K3): m256 stays cooperative 8-row; m1024

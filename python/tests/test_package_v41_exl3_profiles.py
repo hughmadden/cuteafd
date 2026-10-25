@@ -930,6 +930,27 @@ class PackageProfileTests(unittest.TestCase):
                 self.assertTrue(call.kwargs['ws_dynamic_tiles'])
                 self.assertEqual(call.kwargs['route_block'], 64)
 
+    def test_v41_coordinator_tp2_prefill_units_use_qualified_n192(self):
+        for capacity in (2048, 2752):
+            self.assertEqual(package.ws_tile('v41', 'coordinator', 1152, capacity),
+                             (64, 192, 64, 256))
+            self.assertTrue(package.ws_dynamic_tiles('v41', 'coordinator', 1152, capacity))
+            self.assertEqual(package.ws_route_block('v41', 'coordinator', 1152, capacity), 64)
+            self.assertEqual(package.ws_tile('v41', 'coordinator', 2304, capacity),
+                             package.TILE_RTX_MIXED)
+        for capacity in (1024, 4096):
+            self.assertEqual(package.ws_tile('v41', 'coordinator', 1152, capacity),
+                             package.TILE_RTX_MIXED)
+        with tempfile.TemporaryDirectory() as temporary:
+            _, _, calls, _ = self.build_fixture(
+                Path(temporary), 'coordinator', (3, 4), geometry='v41',
+                capacities=(2048, 2752), profiles=('rtx-tp2',))
+            self.assertTrue(calls)
+            for call in calls:
+                self.assertEqual(call.kwargs['tile'], (64, 192, 64, 256))
+                self.assertTrue(call.kwargs['ws_dynamic_tiles'])
+                self.assertEqual(call.kwargs['route_block'], 64)
+
     def test_glm_spark_width640_widens_only_qualified_fc2_tiles(self):
         for capacity in (1024, 2048, 2752, 4096):
             self.assertEqual(package.ws_tile('glm', 'spark', 640, capacity),
