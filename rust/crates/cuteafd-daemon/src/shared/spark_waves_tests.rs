@@ -308,6 +308,8 @@ struct EchoWorld {
     next_slot: usize,
     /// Each layer's input rows: a request must carry exactly its layer's.
     inputs: Vec<Vec<u8>>,
+    /// The exchange's counters, set once it started (diagnosis).
+    words: Arc<std::sync::OnceLock<Words>>,
 }
 struct EchoWave { slot: usize, rows: Vec<Vec<u8>>, polls: usize }
 
@@ -327,8 +329,21 @@ impl Transport for EchoWorld {
         ensure!(hidden.len() == request.header.row_count as usize * self.row_bytes, "echo rows differ");
         let layer = request.header.layer_id as usize;
         if hidden != self.inputs[layer].as_slice() {
-            let stale = self.inputs.iter().position(|input| input.as_slice() == hidden);
-            anyhow::bail!("request for layer {layer} carried staged rows of layer {stale:?}");
+            // Snapshot now, then again later: still arriving (own layer
+            // later) or overwritten (a later layer)?
+            let words = self.words.get().copied();
+            let counters = || words.map(|w| (w.load(Counter::Landed), w.load(Counter::Staged(0)), w.load(Counter::Consumed(0))));
+            let mut report = Vec::new();
+            for delay_us in [0u64, 50, 500, 5000, 20000] {
+                std::thread::sleep(Duration::from_micros(delay_us));
+                let snapshot: Vec<u8> = hidden.to_vec();
+                let matches = self.inputs.iter().position(|input| input.as_slice() == snapshot.as_slice());
+                let differ = snapshot.iter().zip(&self.inputs[layer]).filter(|(a, b)| a != b).count();
+                let first = snapshot.iter().zip(&self.inputs[layer]).position(|(a, b)| a != b);
+                report.push(format!("+{delay_us}us: differ {differ} first {first:?} matches {matches:?} \
+                    (landed, staged, consumed) {:?}", counters()));
+            }
+            anyhow::bail!("request for layer {layer}: {}", report.join("; "));
         }
         Ok(EchoWave { slot, rows: (0..self.ranks).map(|rank| rank_rows(hidden, rank)).collect(), polls: 0 })
     }
@@ -368,10 +383,14 @@ fn gpu_exchange_queues_a_step_ahead_and_lands_byte_exact() -> Result<()> {
     // SAFETY: the opt-in path names the built native library for this GPU.
     let library = std::sync::Arc::new(unsafe { NativeLibrary::load(&path)? });
     cuteafd_transport::set_verbs_host_native_library_path(std::path::PathBuf::from(&path))?;
-    let (hidden, topk) = (512usize, 4usize);
+    // The compact reducer sums rows of the process-wide expert hidden size
+    // (5120 unless a family sets another; this test process never does), so
+    // the planes are V4.1-shaped. Top-6 also takes the byte path of the
+    // staging copy (24-byte route rows are not 16-byte multiples).
+    let (hidden, topk) = (5120usize, 6usize);
     let row_bytes = hidden * 2;
     for (ranks, landing, waves, layers, rows) in [(3usize, 0u8, 1usize, 80u32, 16usize), (4, 0b0101, 1, 80, 64),
-        (3, 0b111, 1, 80, 1), (4, 0, 3, 24, 256), (6, 0b100001, 2, 30, 128)] {
+        (3, 0b111, 1, 80, 1), (4, 0, 3, 24, 128), (6, 0b100001, 2, 30, 64)] {
         let capacity = rows;
         let planes_owned = (0..ranks).map(|_| DeviceAllocation::new(&library, capacity * row_bytes * waves))
             .collect::<Result<Vec<_>>>()?;
@@ -380,14 +399,21 @@ fn gpu_exchange_queues_a_step_ahead_and_lands_byte_exact() -> Result<()> {
                 bytes: capacity * row_bytes, ..plane.buffer }).collect()).collect();
         let layout = RouteStaging::new(rows, topk, row_bytes)?;
         let arenas = (0..waves).map(|_| StagingArena::new(layout.bytes)).collect::<Result<Vec<_>>>()?;
+        let words = Arc::new(std::sync::OnceLock::new());
         let hosts: Vec<Vec<u8>> = (0..layers as usize).map(|layer| (0..rows * hidden).flat_map(|i| {
-            let value = ((i * 7 + layer * 13) % 61) as f32 / 16.0 - 1.5;
+            // Multiples of 0.5 in [-2, 2]: every rank partial (x rank + 1) and
+            // every sum over up to six ranks is exact in BF16, so the reference
+            // does not depend on the reducer's summation order.
+            // The first eight values carry the layer's bits (0 or 0.5), so
+            // every layer's rows differ.
+            let value = if i < 8 { ((layer >> i) & 1) as f32 / 2.0 } else { ((i * 7 + layer * 13) % 9) as f32 / 2.0 - 2.0 };
             ((value.to_bits() >> 16) as u16).to_le_bytes()
         }).collect()).collect();
-        let echo = EchoWorld { library: library.clone(), ranks, row_bytes, landing, next_slot: 0, inputs: hosts.clone(),
+        let echo = EchoWorld { library: library.clone(), ranks, row_bytes, landing, next_slot: 0, inputs: hosts.clone(), words: words.clone(),
             planes: planes.iter().map(|slot| slot.iter().map(|plane| (plane.ptr as usize, plane.bytes)).collect()).collect() };
         let intake = Intake { ranks, rows: capacity, row_bytes, waves, planes, landing, next_slot: 0 };
         let mut exchange = Waves::start(&library, intake, echo, Vec::new(), arenas, false)?;
+        let _ = words.set(exchange.words());
         let stream = crate::shared::spark_intake::WarmStream::new(library.as_ref())?;
         let ids = DeviceAllocation::new(&library, rows * topk * 4)?;
         let weights = DeviceAllocation::new(&library, rows * topk * 4)?;

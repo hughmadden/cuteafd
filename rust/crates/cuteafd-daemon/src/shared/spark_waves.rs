@@ -21,18 +21,21 @@
 //!   ranks whose rows arrive in pinned host memory (no GPU landing) it also
 //!   queues an SM copy of them from the slot's mapped landing staging into the
 //!   planes, behind the wait. Later work there (the reduce) sees the planes.
+//! - `consumed[slot]`: after the reduce, the consuming stream writes the
+//!   slot's use count; the worker posts the slot's next wave (whose rows
+//!   overwrite the planes and landing staging) only once it is reached.
 //!
 //! Every copy the engine queues around these waits (the staging copies in
 //! [`Waves::send`], the pinned ranks' landing in [`Waves::land`]) is an SM
 //! copy through the mapped host memory's device alias, never
-//! `cudaMemcpyAsync`: copy-engine work is not held by a stream memory wait
-//! (CUDA documents that ordering through these operations is invisible to
-//! it). Measured on raptor: with `cudaMemcpyAsync` staging, a decode step
-//! queued 40 layers ahead overwrote the arena while the worker was still
-//! reading the previous wave from it.
-//! - `consumed[slot]`: after the reduce, the consuming stream writes the
-//!   slot's use count; the worker posts the slot's next wave (whose rows
-//!   overwrite the planes and landing staging) only once it is reached.
+//! `cudaMemcpyAsync`. CUDA documents that ordering through stream memory
+//! operations is invisible to its scheduler, and a small H2D may read its
+//! host source when queued; a kernel reads and writes when it runs. A lazily
+//! loaded kernel's first launch can wait for the device to idle, so a first
+//! launch behind a pending wait stalls the engine thread until the worker
+//! releases that wait (a one-time stall, not a deadlock: the worker never
+//! waits on the engine). [`Waves::start`] preloads the exchange's own kernels
+//! so its steady path never stalls that way.
 //!
 //! The worker queues no GPU work at all. A stream memory wait stalls its
 //! hardware queue, and streams share queues, so a wait released by GPU work
@@ -536,18 +539,16 @@ impl<'a> Waves<'a> {
                 host: staging.as_ref().filter(|_| pinned & (1 << rank) != 0)
                     .map_or(0, |staging| staging.buffer.ptr as usize + rank * plane_bytes) })
             .collect()).collect();
-        // Pinned ranks reach the planes by an SM copy on the consuming stream:
-        // a kernel reads the mapped staging when it runs, after the wait.
-        // `cudaMemcpyAsync` H2D of small sizes may read host memory when it is
-        // queued instead, which is before the worker filled it.
+        // Pinned ranks reach the planes by an SM copy on the consuming stream,
+        // which reads the mapped staging when it runs, after the wait.
         let landing_alias = landing_staging.iter().map(|staging| staging.as_ref()
             .map(|staging| library.cuda_host_buffer_device_alias(staging.buffer).map(|alias| alias.ptr as usize))
             .transpose()).collect::<Result<Vec<_>>>()?;
         let arena_alias = arenas.iter().map(|arena| library.cuda_host_buffer_device_alias(arena.host())
             .map(|alias| alias.ptr as usize)).collect::<Result<Vec<_>>>()?;
-        // Every kernel the engine queues behind an exchange wait must be loaded
-        // before such a wait is pending: a lazily loaded kernel's first launch
-        // can wait for the device to idle, which a pending wait never allows.
+        // The exchange's own kernels load now, with nothing pending: a lazily
+        // loaded kernel's first launch behind a pending wait stalls the engine
+        // thread until the worker releases that wait.
         library.peer_exchange_initialize()?;
         warm_reducer(library, &intake)?;
         let timeout = transport.timeout();
@@ -607,6 +608,8 @@ impl<'a> Waves<'a> {
             let alias = self.arena_alias[slot];
             let sizes = [layout.route_bytes, layout.route_bytes, layout.wire_bytes];
             let offsets = [0, layout.route_bytes, 2 * layout.route_bytes];
+            ensure!(offsets[2] + sizes[2] == layout.bytes && layout.bytes <= arena.bytes(),
+                "Spark staging regions run past their {}-byte arena", arena.bytes());
             let regions: Vec<(*mut c_void, *const c_void, u64)> = (0..3).map(|i| {
                 ensure!(sources[i].bytes >= sizes[i] && !sources[i].ptr.is_null(), "Spark staging source is short or null");
                 Ok(((alias + offsets[i]) as *mut c_void, sources[i].ptr.cast_const(), sizes[i] as u64))
@@ -661,6 +664,7 @@ impl<'a> Waves<'a> {
             WaveError::Order { expected, found: ticket.sequence });
         // SAFETY: as `submit`'s waits.
         unsafe { self.library.cuda_stream_wait_value32(stream, self.words.ptr(Counter::Landed), ticket.sequence)? };
+        ensure!(ticket.rows <= self.rows, "Spark wave of {} rows lands past its {}-row planes", ticket.rows, self.rows);
         if let Some(alias) = self.landing_alias[slot] {
             let pinned: Vec<cuteafd_ffi::peer_exchange::PeerPlane> = self.planes[slot].iter().enumerate()
                 .filter(|(rank, _)| self.landing & (1 << rank) == 0)
@@ -692,6 +696,10 @@ impl<'a> Waves<'a> {
     }
 
     pub(crate) fn ranks(&self) -> usize { self.ranks }
+
+    /// The counter words' base address (tests: diagnosis from the worker).
+    #[cfg(test)]
+    pub(crate) fn words(&self) -> Words { self.words }
 
     /// Marks `slot`'s planes read once `stream` reaches this point (after the
     /// reduce): the worker posts the slot's next wave only after it.
