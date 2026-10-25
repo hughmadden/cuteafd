@@ -28,6 +28,10 @@ from checkpoint_tokenizer import load_tokenizer, tokenizer_identity
 from fidelity_generation import token_ids
 
 FAMILIES = ("deepseek_v41", "mimo_v2", "qwen4", "qwen3_5", "glm5_flash", "deepseek_v4", "glm5", "step5", "kimi_k3", "minimax_m3")
+# Request fields a family's recipe turns add, recorded in the set's recipe. MiniMax M3's chat
+# template defaults to adaptive thinking, which answers most agentic turns without reasoning
+# and leaves the standard halves short of generated rows; the recipe turns thinking on.
+FAMILY_REQUEST = {"minimax_m3": {"thinking": {"type": "enabled"}}}
 REPO_FILES = ["rust/crates/cuteafd-api/src/openai/probe.rs", "scripts/bench/bench-agentic-session.py",
               "python/reference/families/deepseek_v41/golden.py", "rust/crates/cuteafd-bench/src/client.rs",
               "scripts/bench/make-fidelity-reference.py", "rust/crates/cuteafd-bench/src/reference.rs",
@@ -175,7 +179,8 @@ def build_set(*, family: str, model: str, checkpoint: str, version: str, arm: di
         count = max(0, target * 3 - len(canonical(base)))
         for attempt in range(8):
             body = {"model": model, "messages": copy.deepcopy(base), "temperature": 0,
-                    "seed": 0, "max_tokens": 1, "reasoning_effort": "high", "stream": False}
+                    "seed": 0, "max_tokens": 1, "reasoning_effort": "high", "stream": False,
+                    **copy.deepcopy(FAMILY_REQUEST.get(family, {}))}
             if count:
                 body["messages"].insert(0, {"role": "system", "content": "Repository context:\n" + (corpus * (count // len(corpus) + 1))[:count]})
             if tools:
@@ -338,7 +343,8 @@ def build_set(*, family: str, model: str, checkpoint: str, version: str, arm: di
                 "recipe": {"windows": 64, "positions_per_window": 512, "max_tokens": 1024,
                     "context_cap": MAX_TOKENS, "temperature": 0, "seed": 0, "reasoning_effort": "high",
                     "blocks": {"A": 26, "B": 12, "C": 10, "D": 6, "E": 10},
-                    "prompt_roles": "conditioning history ctx; current assistant span gen"}, "windows": windows}
+                    "prompt_roles": "conditioning history ctx; current assistant span gen",
+                    **({"request": FAMILY_REQUEST[family]} if family in FAMILY_REQUEST else {})}, "windows": windows}
     if getattr(probe, "identity", {}).get("text_source") in ("api", "hf"):
         manifest["reference_snapshot"] = {
             key: arm[key] for key in ("checkpoint", "snapshot_revision", "config_sha256", "tokenizer_sha256")}

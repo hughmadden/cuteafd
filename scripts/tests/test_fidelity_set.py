@@ -207,6 +207,20 @@ def test_other_family_recipes_keep_internal_names(fake_server, family):
     assert len(manifest["windows"]) == 64
 
 
+def test_minimax_recipe_enables_thinking_on_every_request_and_records_it(fake_server):
+    fake_server["family"] = "minimax_m3"
+    manifest = make(fake_server)
+    assert fake_server["requests"]
+    # Sizing renders and generations alike: the rendered prompt depends on the thinking mode.
+    assert all(request["body"]["thinking"] == {"type": "enabled"} for request in fake_server["requests"])
+    assert manifest["recipe"]["request"] == {"thinking": {"type": "enabled"}}
+    fake_server["requests"].clear()
+    fake_server["family"] = "qwen4"
+    other = make(fake_server)
+    assert not any("thinking" in request["body"] for request in fake_server["requests"])
+    assert "request" not in other["recipe"]
+
+
 def test_live_fixture_tools_execute_and_reasoning_is_echoed(fake_server):
     fake_server["tool_once"] = True
     manifest = make(fake_server)
