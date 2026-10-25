@@ -49,8 +49,8 @@ def main():
         expected=[torch.cat([row[i] for row in single]) for i in range(3)]
         for m in range(1,65):
             actual=run(hidden[:m],image_mask[:m])
-            for name,a,b in zip(('scores','ids','routing'),actual,expected):
-                assert torch.equal(a.view(torch.int32),b[:m].view(torch.int32)),(e,m,name)
+            for name,value,reference in zip(('scores','ids','routing'),actual,expected):
+                assert torch.equal(value.view(torch.int32),reference[:m].view(torch.int32)),(e,m,name)
         width_checks.append(dict(experts=e,rows=list(range(1,65)),bitwise=True,nan_prefilled=True))
     checks=[]
     for slot,value in [(8,0),(8,-1),(8,4097),(9,127),(0,0),(1,0),(2,0),(3,0),(5,0),(6,0),(7,0),(5,x.data_ptr()),(5,(1<<64)-16)]:
