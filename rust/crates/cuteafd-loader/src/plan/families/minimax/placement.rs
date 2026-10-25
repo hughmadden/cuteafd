@@ -7,10 +7,6 @@ use crate::plan::encoder::{encoder_placement, EncoderGpuBudget, EncoderHardware,
 use cuteafd_core::memory_layout::{Basis, Category, DeviceKind, DeviceLayout, Item, MemoryLayout};
 
 const GIB: u64 = 1 << 30;
-/// Per-rank routed-expert allocation ceiling without `--spark-budget-gib`
-/// (the Kimi K3 precedent: a GB10 rank keeps ~113-116 GiB available idle).
-/// Estimated until the first full worker load/steady census.
-pub const SPARK_BUDGET_BYTES: u64 = 108 << 30;
 /// The KV an RTX-hosted tower must leave beside it when no pool is requested:
 /// one full 256K agentic request.
 const POOL_FLOOR_TOKENS: u64 = 262_144;
@@ -63,7 +59,7 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
             + if c.bias { c.shape[0] as u64 * 2 } else { 0 }).sum();
     let vision_weights = if vision_source > 0 { vision_source + vector_bytes + 52 } else { 0 };
     let vision_scratch = if vision_source > 0 { crate::plan::layout::minimax_vision_scratch_bytes() } else { 0 };
-    let budget = opts.spark_allocation_budget_bytes.unwrap_or(SPARK_BUDGET_BYTES);
+    let budget = opts.spark_allocation_budget_bytes.unwrap_or(admission::SPARK_BUDGET_BYTES);
     let local_layers = match opts.onboard.or(opts.local_expert_layers.map(Onboard::Layers)).unwrap_or(Onboard::Auto) {
         Onboard::Layers(n) => admission::LocalLayers::Bottom(n),
         Onboard::Auto => admission::LocalLayers::Fewest,
