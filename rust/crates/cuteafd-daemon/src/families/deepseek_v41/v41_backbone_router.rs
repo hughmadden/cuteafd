@@ -697,17 +697,18 @@ impl BackboneRouterWave<'_, '_> {
                 self.stream.raw)?; }
             self.ring_pending.push((self.layer, rows));
         }
-        // Experts read the routes on the device: local layers inside a
-        // device-ordered pass, and every remote layer inside any chain scope
-        // (the shared exchange stages its request from the device). Later
-        // stages join the chain instead of the host waiting. A cold shape
-        // still completes on the host: its eager run precedes the capture.
-        // Route-policy tracing reads a remote layer's routes from the pinned
-        // staging on the host, so it keeps the host wait.
-        let device_read = if self.full_request {
-            crate::shared::memory::chain::active() && (self.ring_capture
-                || !tracing::enabled!(target: "cuteafd::route_policy", tracing::Level::DEBUG))
-        } else { crate::shared::memory::chain::deferred() };
+        // Inside a device-ordered pass every expert (local, or the shared
+        // exchange staging a remote request from the device) reads the routes
+        // on the device: later stages join the chain instead of the host
+        // waiting. A host-ordered pass (1 RTX) keeps this per-layer host wait
+        // for remote layers too: its owners rebind each layer only after their
+        // streams completed (`LoadStream::require_complete`), which this wait,
+        // behind attention in the chain, is what proves. A cold shape always
+        // completes on the host: its eager run precedes the capture. Route-
+        // policy tracing reads a remote layer's routes from the pinned staging
+        // on the host, so it keeps the host wait.
+        let device_read = crate::shared::memory::chain::deferred() && (!self.full_request || self.ring_capture
+            || !tracing::enabled!(target: "cuteafd::route_policy", tracing::Level::DEBUG));
         if !cold && device_read {
             unsafe { crate::shared::memory::chain::finish(self.stream.library, self.stream.raw)?; }
         } else {
@@ -966,5 +967,30 @@ impl RouterOutput<'_> {
 impl BackboneRouterWeights<'_> {
     pub(crate) fn visit(&self, prefix: &str, f: &mut dyn FnMut(String, cuteafd_ffi::CuteafdDeviceBuffer)) {
         self.tensors.visit(prefix, f);
+    }
+}
+
+#[cfg(test)]
+mod host_order_tests {
+    /// A host-ordered pass (1 RTX, not `chain::deferred`) rebinds each owner
+    /// per layer only after a host check that its stream completed
+    /// (`LoadStream::require_complete`, exempt exactly when deferred). The
+    /// router's per-layer host wait, behind attention in the chain, is what
+    /// makes that check hold, for remote layers too: queueing remote layers
+    /// device-ordered in host-ordered passes failed V4.1 min at C4 with
+    /// "cannot rebind an unfinished V4.1 stream" (#731).
+    #[test]
+    fn host_ordered_passes_keep_the_router_host_wait_their_rebinds_rely_on() {
+        let router = include_str!("v41_backbone_router.rs");
+        let read = router.split("let device_read = ").nth(1).unwrap().split(';').next().unwrap();
+        assert!(read.trim_start().starts_with("crate::shared::memory::chain::deferred() &&"),
+            "every device-ordered route read requires a device-ordered pass: {read}");
+        assert!(router.contains("if !cold && device_read {") && router.contains("self.stream.wait().await?;"));
+        let memory = include_str!("../../shared/memory.rs");
+        let complete = memory.split("pub(crate) fn require_complete(&self)").nth(1).unwrap().split("\n    }\n").next().unwrap();
+        assert!(complete.contains("if chain::deferred() {") && complete.contains("cuda_stream_query"));
+        let lane = include_str!("v41_backbone_lane.rs");
+        let advance = lane.split("pub fn advance(&mut self)").nth(1).unwrap().split("\n    }\n").next().unwrap();
+        assert!(advance.contains("self.query.rebind(") && advance.contains("self.router.rebind("));
     }
 }
