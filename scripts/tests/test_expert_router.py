@@ -51,6 +51,17 @@ def test_v41_projection_uses_aot_without_native_score_fallback():
         assert obsolete not in source
 
 
+def test_v41_skinny_activation_is_fused_before_selection():
+    source = (ROOT / "native/shared/cuda/expert_router.cu").read_text()
+    router = source[source.index('extern "C" int32_t cuteafd_v41_router('):
+                    source.index('extern "C" int32_t cuteafd_v41_router_select_logits(')]
+    assert "if(rows<=64)" in router
+    assert "select_fast_kernel<false>" in router
+    assert "select_fast_kernel<true>" in router
+    exporter = (ROOT / "python/tools/aot/export_b12x_v41_router_aot.py").read_text()
+    assert "compile_v41_router_scores_aot(experts=experts, activated=True)" in exporter
+
+
 def test_native_wide_dispatch_and_reducer_width():
     source = (ROOT / "native/shared/cuda/expert_router.cu").read_text()
     assert "experts>1024 || topk<1 || topk>16" in source

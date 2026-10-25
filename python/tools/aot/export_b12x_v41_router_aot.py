@@ -27,7 +27,7 @@ def main():
     normalize=lambda value:re.sub(r'\s+','',value)
     for experts in (128,384):
         label=f'v41_router_e{experts}'
-        compile_v41_router_scores_aot(experts=experts).export_to_c(str(a.output_dir),label,'cuteafd_'+label)
+        compile_v41_router_scores_aot(experts=experts, activated=True).export_to_c(str(a.output_dir),label,'cuteafd_'+label)
         h=(a.output_dir/(label+'.h')).read_text()
         expected=[f'cuteafd_{label}_Kernel_Module_t *module','void *x','void *w','void *logits','int32_t live_rows','cudaStream_t stream']
         signature=re.search(r'static inline int32_t cute_dsl_cuteafd_'+label+r'_wrapper\(([^)]*)\)',h)
@@ -37,7 +37,7 @@ def main():
         symbols=re.findall(r'void (_mlir_\w+)\(void \*\*args, int32_t num_args\);',h)
         if not args or normalize(args[1])!='&x,&w,&logits,&live_rows,&stream,&ret' or len(symbols)!=1 or f'{symbols[0]}(args, 6);' not in h:
             raise ValueError(f'unexpected router dispatch ABI: {label}')
-        variants.append(dict(experts=experts,skinny_max_rows=V41_ROUTER_SKINNY_MAX_ROWS,input_width=5120,output_dtype='FP32',tile_m=64,tile_n=16,tile_k=64,
+        variants.append(dict(experts=experts,skinny_max_rows=V41_ROUTER_SKINNY_MAX_ROWS,input_width=5120,output_dtype='FP32',skinny_activation='sqrtsoftplus',tile_m=64,tile_n=16,tile_k=64,
                              symbol=symbols[0],label=label,artifacts={label+suffix:hashlib.sha256((a.output_dir/(label+suffix)).read_bytes()).hexdigest() for suffix in ('.h','.o')}))
         print(f'exported {label}',flush=True)
     lock=_pinned_sparkinfer.LOCK_DATA

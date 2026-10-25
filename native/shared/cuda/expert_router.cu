@@ -226,7 +226,11 @@ extern "C" int32_t cuteafd_v41_router(const uint16_t* hidden,const uint16_t* wei
       reinterpret_cast<uintptr_t>(scores)%16) return cudaErrorInvalidValue;
   auto status=cuteafd_v41_router_scores_aot(hidden,weight,scores,rows,experts,stream);
   if(status)return status;
-  select_fast_kernel<true><<<rows,512,0,s>>>(scores,bias,bias_vl,image_mask,ids,routing,experts,topk);
+  // Skinny writes activated scores; the wider MMA route still writes logits.
+  if(rows<=64)
+    select_fast_kernel<false><<<rows,512,0,s>>>(scores,bias,bias_vl,image_mask,ids,routing,experts,topk);
+  else
+    select_fast_kernel<true><<<rows,512,0,s>>>(scores,bias,bias_vl,image_mask,ids,routing,experts,topk);
   return cudaGetLastError();
 #else
   return cudaErrorNotSupported;
