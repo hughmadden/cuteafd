@@ -69,7 +69,8 @@ pub struct WorkerSelection {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ModelAdmission {
-    /// Actual row storage and endpoint admission extent.
+    /// Largest live request unit. Endpoint intake arenas may retain several
+    /// units, but kernel execution and every execution slot are bounded here.
     pub capacity: u32,
     /// Main native export extent; scratch/program state may exceed live rows.
     pub compiled_capacity: u32,
@@ -93,8 +94,18 @@ impl ModelAdmission {
         endpoint: cuteafd_core::SparkEndpoint, compiled_capacity: u32,
         rings: cuteafd_core::SparkRings, clients: usize) -> Result<Self> {
         ensure!((1..=8).contains(&clients), "ModelAdmission requires 1..=8 persistent clients");
-        let model = Self { capacity: endpoint.capacity, compiled_capacity,
-            endpoints: vec![endpoint; clients], rings, execution_slots: 1 };
+        Self::for_units(geometry, endpoint, endpoint.capacity, compiled_capacity, rings, clients, 1)
+    }
+
+    /// Admit a multi-unit intake span independently of the per-unit kernel
+    /// extent. The larger endpoint is storage, never permission for a larger
+    /// request; request validation also enforces `capacity`.
+    pub fn for_units(geometry: cuteafd_core::ExpertGeometry,
+        endpoint: cuteafd_core::SparkEndpoint, unit_capacity: u32, compiled_capacity: u32,
+        rings: cuteafd_core::SparkRings, clients: usize, execution_slots: u8) -> Result<Self> {
+        ensure!((1..=8).contains(&clients), "ModelAdmission requires 1..=8 persistent clients");
+        let model = Self { capacity: unit_capacity, compiled_capacity,
+            endpoints: vec![endpoint; clients], rings, execution_slots };
         model.validate(geometry)?;
         model.require_clients(endpoint, clients)?;
         Ok(model)
@@ -117,16 +128,18 @@ impl ModelAdmission {
             self.compiled_capacity, self.capacity);
         ensure!(!self.endpoints.is_empty() && self.endpoints.len() <= 8,
             "ModelAdmission requires 1..=8 endpoints");
-        let endpoint_capacity = self.endpoints.iter().map(|endpoint| endpoint.capacity).max().unwrap();
-        ensure!(self.capacity == endpoint_capacity,
-            "ModelAdmission capacity {} differs from maximum endpoint capacity {endpoint_capacity}", self.capacity);
-        for (endpoint, spec) in self.endpoints.iter().enumerate() {
-            ensure!(spec.capacity <= self.capacity && spec.ring_bytes(geometry, self.rings).is_some(),
-                "invalid ModelAdmission endpoint {endpoint} capacity/ingress/ring geometry");
-        }
         ensure!((1..=cuteafd_core::expert_geometry::MAX_SPARK_EXECUTION_SLOTS).contains(&self.execution_slots),
             "ModelAdmission execution slots {} outside 1..={}", self.execution_slots,
             cuteafd_core::expert_geometry::MAX_SPARK_EXECUTION_SLOTS);
+        let endpoint_capacity = self.endpoints.iter().map(|endpoint| endpoint.capacity).max().unwrap();
+        let intake_capacity = self.capacity * u32::from(self.execution_slots);
+        ensure!((self.capacity..=intake_capacity).contains(&endpoint_capacity),
+            "ModelAdmission capacity {} requires maximum endpoint capacity in {}..={intake_capacity}, got endpoint capacity {endpoint_capacity}",
+            self.capacity, self.capacity);
+        for (endpoint, spec) in self.endpoints.iter().enumerate() {
+            ensure!(spec.capacity <= intake_capacity && spec.ring_bytes(geometry, self.rings).is_some(),
+                "invalid ModelAdmission endpoint {endpoint} capacity/ingress/ring geometry");
+        }
         self.ring_bytes(geometry)?;
         Ok(())
     }
@@ -878,9 +891,11 @@ fn validate_endpoint_request(selection: &WorkerSelection, index: usize,
     header: &crate::ExpertProtocolV2RequestHeader) -> Result<()> {
     use cuteafd_core::SparkIngress;
     use crate::ExpertV2Dtype;
-    let spec = selection.model().expect("typed endpoint").endpoints[index];
-    ensure!(header.row_count <= spec.capacity,
-        "endpoint {} rows {} exceed admitted capacity {}", index, header.row_count, spec.capacity);
+    let model = selection.model().expect("typed endpoint");
+    let spec = model.endpoints[index];
+    let capacity = spec.capacity.min(model.capacity);
+    ensure!(header.row_count <= capacity,
+        "endpoint {} rows {} exceed admitted capacity {}", index, header.row_count, capacity);
     let ingress = match spec.ingress {
         SparkIngress::Fp8K32 => header.hidden_dtype == ExpertV2Dtype::Fp8E4m3Ue8m0K32,
         SparkIngress::Bf16 => header.hidden_dtype == ExpertV2Dtype::Bf16,
@@ -1421,6 +1436,34 @@ mod tests {
         selection.model.as_mut().unwrap().compiled_capacity = 2048;
         assert!(InstalledExpertGrouping::new(selection, 0, 2048,
             ExpertGroupingSelector::Native, variants).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn multiunit_endpoint_storage_never_authorizes_an_oversized_kernel_request() -> Result<()> {
+        use cuteafd_core::{SparkEndpoint, SparkIngress, SparkRings};
+        let mut selection = admission_selection();
+        let endpoint = SparkEndpoint { ring_depth: None, capacity: 8256, ingress: SparkIngress::Bf16 };
+        let model = ModelAdmission::for_units(selection.geometry(), endpoint, 2752, 4096,
+            SparkRings { max_frame_bytes: 64 << 20, depth: 8, slot_bytes: 8 << 20, alignment: 4096 }, 2, 3)?;
+        assert_eq!((model.capacity, model.compiled_capacity, model.execution_slots), (2752, 4096, 3));
+        assert_eq!(model.endpoints, [endpoint, endpoint]);
+        let mut invalid = model.clone();
+        invalid.execution_slots = 2;
+        assert!(invalid.validate(selection.geometry()).is_err());
+        selection.model = Some(model);
+        let mut header = crate::ExpertProtocolV2RequestHeader {
+            request_id: 1, placement_version: 17, layer_id: 13, row_count: 2752,
+            hidden_dim: 6144, hidden_dtype: crate::ExpertV2Dtype::Bf16,
+            hidden_row_stride_bytes: 12288, route_count: 2752 * 8,
+            row_descriptor_bytes: 40, route_bytes: 12, hidden_payload_bytes: 2752 * 12288,
+            flags: crate::protocol_v2::EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16,
+        };
+        validate_endpoint_request(&selection, 0, &header)?;
+        header.row_count += 1;
+        assert!(validate_endpoint_request(&selection, 0, &header).is_err());
+        header.row_count = endpoint.capacity;
+        assert!(validate_endpoint_request(&selection, 0, &header).is_err());
         Ok(())
     }
 

@@ -61,15 +61,15 @@ pub(crate) struct EngineArgs {
     /// workspace, graph and drafter costs (up to the common 2M-token target).
     #[arg(long, default_value_t = 262_144)]
     pub pool_tokens: usize,
-    #[arg(long, default_value_t = 4096)]
+    /// Per-unit rows; 0 selects the shared topology policy.
+    #[arg(long, default_value_t = 0)]
     pub prefill_rows: usize,
-    /// Rows one pipelined prefill call streams through its units (PLAN
-    /// "Prefill contract"); `waves x prefill_rows` restores fixed chunks.
-    #[arg(long, default_value_t = engine::DEFAULT_PREFILL_SPAN_ROWS)]
+    /// Shared prefill span; 0 resolves to waves times per-unit rows.
+    #[arg(long, default_value_t = 0)]
     pub prefill_span_rows: usize,
-    /// Prefill units in flight on the one Spark transport (1 = serial).
-    #[arg(long, default_value_t = cuteafd_loader::plan::layout::glm_prefill_lanes(None) as u8,
-        value_parser = clap::value_parser!(u8).range(1..=4))]
+    /// Prefill units in flight (0 = shared topology policy, 1 = serial).
+    #[arg(long, default_value_t = 0,
+        value_parser = clap::value_parser!(u8).range(0..=4))]
     pub prefill_waves: u8,
     /// Pool-first by default; local requests require an exported RTX backend.
     #[arg(long, env = "RTX_EXPERT_LAYERS", default_value = "auto")]
@@ -125,6 +125,26 @@ pub(crate) struct EngineArgs {
     pub attention_plan_rows: Option<usize>,
 }
 
+fn resolve_prefill(args: &mut EngineArgs) -> Result<()> {
+    use cuteafd_loader::serving_capacity::prefill_waves::{prefill_shape, PrefillLimits, PrefillOverrides};
+    let ranks = args.peers.as_deref().map_or(0, |peers| peers.split(',').count());
+    let attention = cuteafd_loader::placement::attention::parse(&args.attention_placement)
+        .map_err(anyhow::Error::msg)?;
+    let shape = prefill_shape(ranks, PrefillLimits {
+        max_waves: if ranks == 0 { 1 }
+            else if attention == Some(cuteafd_loader::placement::AttentionPlacement::Layers) { 2 } else { 4 },
+        ..Default::default()
+    }, PrefillOverrides {
+        unit_rows: (args.prefill_rows > 0).then_some(args.prefill_rows as u64),
+        waves: (args.prefill_waves > 0).then_some(u64::from(args.prefill_waves)),
+        span_rows: (args.prefill_span_rows > 0).then_some(args.prefill_span_rows as u64),
+    })?;
+    args.prefill_rows = usize::try_from(shape.unit_rows)?;
+    args.prefill_waves = u8::try_from(shape.waves)?;
+    args.prefill_span_rows = usize::try_from(shape.span_rows)?;
+    Ok(())
+}
+
 fn native_activation(args: &EngineArgs, first_moe: usize, layers: usize, serving: bool) -> Result<()> {
     use cuteafd_loader::placement::{AttentionPlacement, Onboard};
     ensure!(!args.skip_routed_experts, "EXLR8 requires real Spark experts");
@@ -152,27 +172,26 @@ fn native_activation(args: &EngineArgs, first_moe: usize, layers: usize, serving
 /// scratch plus every prefill lane's scratch and, with A8 prefill, its MX8 records.
 /// `cuteafd plan --layout` charges the same bytes (`plan::layout::glm5::native_layout`).
 fn native_dense_charge(cfg: &GlmDsaConfig, gpus: usize, args: &EngineArgs) -> u64 {
-    let lanes = cuteafd_loader::placement::families::glm5::prefill_lanes(
-        args.peers.as_deref().map_or(0, |peers| peers.split(',').count()), u64::from(args.prefill_waves)) as usize;
+    let lanes = usize::from(args.prefill_waves);
     cuteafd_loader::plan::exlr8::dense::lane_charge_bytes(cfg, gpus, engine::DECODE_ROWS, args.prefill_rows, lanes,
         args.exlr8_prefill_activations == Exlr8PrefillActivations::A8) as u64
 }
 
-fn spark_model(lanes: usize, bf16: bool, native: bool) -> Result<cuteafd_transport::worker_selection::ModelAdmission> {
+fn spark_model(lanes: usize, unit_rows: u32, bf16: bool, native: bool) -> Result<cuteafd_transport::worker_selection::ModelAdmission> {
     ensure!(lanes > 0, "GLM Spark admission requires at least one prefill lane");
     let ingress = if native { cuteafd_core::SparkIngress::Fp8K32 }
         else if bf16 { cuteafd_core::SparkIngress::Bf16 } else { cuteafd_core::SparkIngress::Fp8K32 };
     // The decode link, plus one prefill link carrying `lanes` waves in flight.
     let endpoints = 1 + usize::from(lanes > 1);
     Ok(cuteafd_transport::worker_selection::ModelAdmission {
-        capacity: 4096, compiled_capacity: 4096,
-        endpoints: vec![cuteafd_core::SparkEndpoint { ring_depth: None, capacity: 4096, ingress }; endpoints],
+        capacity: unit_rows, compiled_capacity: 4096,
+        endpoints: vec![cuteafd_core::SparkEndpoint { ring_depth: None, capacity: unit_rows, ingress }; endpoints],
         rings: crate::shared::placement::spark_rings(if native { cuteafd_transport::expert::native_frame_budget(cuteafd_core::ExpertGeometry::GLM5, 4096)? } else { 64 << 20 })?,
         // One execution slot per prefill wave in flight; decode runs alone
         // (prefill and decode never share a rank at once). The native EXLR8
         // Spark backend serves one request at a time.
         execution_slots: if native { 1 } else {
-            cuteafd_loader::plan::layout::spark_execution_slots("glm5", lanes as u64, 1) }
+            cuteafd_loader::plan::layout::spark_execution_slots("glm5", lanes as u64, 1)? }
     })
 }
 
@@ -191,7 +210,7 @@ mod draft_cli_tests {
     fn spark_contract_matches_decode_link_and_parallel_prefill_lanes() -> Result<()> {
         for lanes in [1, 2, 3, 4] {
             for bf16 in [false, true] {
-                let model = spark_model(lanes, bf16, false)?;
+                let model = spark_model(lanes, 4096, bf16, false)?;
                 model.validate(cuteafd_core::ExpertGeometry::GLM5)?;
                 // The decode link and one prefill link carrying every wave in flight.
                 assert_eq!(model.endpoints.len(), if lanes == 1 { 1 } else { 2 });
@@ -201,7 +220,7 @@ mod draft_cli_tests {
             }
         }
         for lanes in 1..=4 {
-            let native = spark_model(lanes, false, true)?;
+            let native = spark_model(lanes, 4096, false, true)?;
             native.validate(cuteafd_core::ExpertGeometry::GLM5)?;
             assert_eq!(native.endpoints.len(), if lanes == 1 { 1 } else { 2 });
             assert!(native.endpoints.iter().all(|endpoint|
@@ -209,7 +228,7 @@ mod draft_cli_tests {
             assert_eq!(native.rings.max_frame_bytes,
                 cuteafd_transport::expert::native_frame_budget(cuteafd_core::ExpertGeometry::GLM5, native.capacity)?);
         }
-        assert!(spark_model(0, false, false).is_err());
+        assert!(spark_model(0, 4096, false, false).is_err());
         Ok(())
     }
 
@@ -543,6 +562,7 @@ impl Opened {
         -> Result<T> {
         let automatic_context = args.max_context == 0;
         let mut context_args = args.clone();
+        resolve_prefill(&mut context_args)?;
         context_args.max_context = crate::shared::context::checkpoint_context(
             &args.snapshot, &args.manifest, "glm5", args.max_context)?;
         let args = &context_args;
@@ -698,8 +718,9 @@ impl Opened {
             self.library.cuda_set_device(args.device)?;
             context.partial_scratch = selected_scratch?.into_iter().max().unwrap_or(0);
         }
-        let prefill_lanes = glm::prefill_lanes(spark_ranks, u64::from(args.prefill_waves)) as usize;
-        let prefill_lanes = if owners.is_some() { prefill_lanes.min(2) } else { prefill_lanes };
+        let prefill_lanes = usize::from(args.prefill_waves);
+        ensure!(owners.is_none() || prefill_lanes <= cuteafd_loader::placement::LAYER_PIPELINE_MAX_LANES as usize,
+            "layer-owned prefill lacks capacity for {prefill_lanes} waves");
         let exchange_f32 = glm::local_exchange_f32()?;
         let local = glm::select_local_inventory(&self.catalog, manifest_path, layers, devices.len(),
             args.prefill_rows as u64, prefill_lanes as u64, exchange_f32, args.rtx_expert_layers,
@@ -761,7 +782,7 @@ impl Opened {
                 .collect::<std::result::Result<Vec<std::net::SocketAddr>, _>>()?;
             let admission = crate::shared::placement::SparkAdmission::plan_manifest(&self.snapshot,
                 self.catalog.routed_experts().geometry()?, Some(&self.catalog), &working.spark,
-                peers.len(), None, spark_model(prefill_lanes, spark_bf16, native)?,
+                peers.len(), None, spark_model(prefill_lanes, u32::try_from(args.prefill_rows.max(engine::DECODE_ROWS))?, spark_bf16, native)?,
                 args.exlr8_manifest.as_deref())?;
             // The coordinator GPUs' EXL3 TP2 halves join the Spark push group as
             // two more ranks; planning failure leaves them on the mount.
@@ -1446,7 +1467,8 @@ fn bench_prefill(args: &GoldenArgs, engine: &engine::GlmEngine<'_>,
     Ok(())
 }
 
-fn golden(args: GoldenArgs) -> Result<()> {
+fn golden(mut args: GoldenArgs) -> Result<()> {
+    resolve_prefill(&mut args.engine)?;
     // Validate the scoring call before opening CUDA or loading any weights.
     let rows = args.engine.prefill_rows;
     crate::shared::prefill_pipeline::retained_logits_units(rows, rows,

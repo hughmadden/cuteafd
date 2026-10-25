@@ -8,15 +8,16 @@ use cuteafd_loader::serving_capacity::qwen_cache_geometry;
 use cuteafd_loader::serving_capacity::qwen_graphs::QwenAdmissionInputs;
 use cuteafd_loader::placement::{families::qwen4, Baseline};
 
-pub(super) fn spark_model(rows: usize, bf16: bool)
+pub(super) fn spark_model(rows: usize, waves: u64, bf16: bool)
     -> Result<cuteafd_transport::worker_selection::ModelAdmission> {
     let capacity = u32::try_from(rows)?;
     let ingress = if bf16 { cuteafd_core::SparkIngress::Bf16 }
         else { cuteafd_core::SparkIngress::Fp8K32 };
     Ok(cuteafd_transport::worker_selection::ModelAdmission {
-        capacity, compiled_capacity: capacity,
+        capacity, compiled_capacity: 4096,
         endpoints: vec![cuteafd_core::SparkEndpoint { ring_depth: None, capacity, ingress }],
-        rings: crate::shared::placement::spark_rings(64 << 20)?, execution_slots: 1
+        rings: crate::shared::placement::spark_rings(64 << 20)?,
+        execution_slots: cuteafd_loader::plan::layout::spark_execution_slots("qwen4", waves, 1)?
     })
 }
 
@@ -206,7 +207,7 @@ mod tests {
 
     #[test]
     fn host_tables_match_full_destination_extents_and_minimum_allocations() -> anyhow::Result<()> {
-        for rows in [1usize, 64, 512, 4096] {
+        for rows in [1usize, 64, 512, 2048, 2752, 4096] {
             for decode in [false, true] {
                 let tables = super::StepTableBytes::new(rows, decode, 32768, 8192, 9)?;
                 let table_rows = if decode { rows } else { 1 };
@@ -243,26 +244,41 @@ mod tests {
                     "F8_E4M3", &[100, 160]));
             }
             testing::write_snapshot(dir.path(), &config, &tensors, None);
-            for waves in [1, 2] {
+            for (rows, waves) in [(4096, 1), (4096, 2), (2752, 2), (2048, 2)] {
                 let report = plan(dir.path(), &PlanOptions {
                     placement: ExpertPlacement::Sparks { ranks: 4 },
-                    layout: Some(LayoutOptions { rtx_bytes: vec![32 << 30], prefill_rows: 4096,
+                    layout: Some(LayoutOptions { rtx_bytes: vec![32 << 30], prefill_rows: rows,
                         prefill_waves: waves, context_tokens: 32768, prefix_slots: Some(0),
                         host_cache_bytes: Some(0), host_memory: Some((128 << 30, 128 << 30)),
                         ..Default::default() }), ..Default::default()
                 })?;
                 assert!(report.solver_placement.is_some(), "{}", cuteafd_loader::plan::render(&report));
                 assert_eq!((report.prefill_unit_rows, report.prefill_waves, report.prefill_span_rows),
-                    (Some(4096), Some(waves), Some(4096 * waves)));
+                    (Some(rows), Some(waves), Some(rows * waves)));
                 let pool = usize::try_from(report.memory_layout.as_ref().unwrap().pool_tokens)?;
                 let pages = qwen_pool_pages(pool).unwrap().max(QWEN_UNIT_PAGES);
-                let runtime = super::HostWorkspaceBytes::new(&cfg, 4096, false, pages, pages / QWEN_UNIT_PAGES,
+                let runtime = super::HostWorkspaceBytes::new(&cfg, rows as usize, false, pages, pages / QWEN_UNIT_PAGES,
                     true, false, waves > 1, !mapped_ple, 1)?;
                 let items: Vec<_> = report.host_ledger.as_ref().unwrap().items.iter()
                     .filter(|item| item.group == "staging/ordered-tables").collect();
                 assert_eq!(items.len(), usize::from(waves > 1));
                 assert_eq!(items.iter().map(|item| item.bytes).sum::<u64>(), runtime.ordered,
-                    "4096x{waves}, mapped PLE {mapped_ple}");
+                    "{rows}x{waves}, mapped PLE {mapped_ple}");
+                let shape = (waves > 1).then_some(cuteafd_loader::serving_capacity::PrefillShape {
+                    unit_rows: rows, waves,
+                });
+                let runtime = qwen_admission(&QwenAdmissionInputs {
+                    cfg: &cfg, layers: 4, mtp: false,
+                    kv_format: cuteafd_loader::families::qwen4::Qwen4KvCache::default(),
+                    manifest: None, prefill_rows: rows * waves, prefill_shape: shape,
+                    slots: 8, mark_bytes: 0, full_prefill_logits: 0,
+                    ple: mapped_ple.then_some((160, true)), future_expert_bytes: 0, headroom: 0,
+                })?;
+                for (_, name, bytes) in runtime.items.iter().filter(|item| item.1.ends_with("step")) {
+                    let planned = report.memory_layout.as_ref().unwrap().devices[0].items.iter()
+                        .filter(|item| item.group == *name).map(|item| item.bytes).sum::<u64>();
+                    assert_eq!(planned, *bytes, "{rows}x{waves}, {name}, mapped PLE {mapped_ple}");
+                }
             }
         }
         Ok(())
@@ -300,11 +316,11 @@ mod tests {
 
     #[test]
     fn spark_contract_matches_single_link_capacity_and_checkpoint_ingress() -> anyhow::Result<()> {
-        for rows in [64, 2048, 4096] {
+        for rows in [64, 2048, 2752, 4096] {
             for bf16 in [false, true] {
-                let model = super::spark_model(rows, bf16)?;
+                let model = super::spark_model(rows, 1, bf16)?;
                 model.validate(cuteafd_core::ExpertGeometry::QWEN4)?;
-                assert_eq!((model.capacity, model.compiled_capacity), (rows as u32, rows as u32));
+                assert_eq!((model.capacity, model.compiled_capacity), (rows as u32, 4096));
                 assert_eq!(model.endpoints.len(), 1);
                 assert_eq!(model.endpoints[0].capacity, rows as u32);
                 assert_eq!(model.endpoints[0].ingress, if bf16 { cuteafd_core::SparkIngress::Bf16 }

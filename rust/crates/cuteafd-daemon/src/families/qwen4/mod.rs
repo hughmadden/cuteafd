@@ -66,12 +66,13 @@ pub(crate) struct EngineArgs {
     /// Sequences with GDN/PLE state (about 115 MiB each).
     #[arg(long, default_value_t = 8)]
     pub slots: usize,
-    #[arg(long, default_value_t = 4096)]
+    /// Per-unit rows; 0 selects the shared topology policy.
+    #[arg(long, default_value_t = 0)]
     pub prefill_rows: usize,
-    /// Units in flight on the one Spark transport (one keeps the legacy path).
-    #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u8).range(1..=4))]
+    /// Units in flight; 0 selects the shared policy within executor capability.
+    #[arg(long, default_value_t = 0, value_parser = clap::value_parser!(u8).range(0..=4))]
     pub prefill_waves: u8,
-    /// Diagnostic unit cuts, including N=1, without changing the span size.
+    /// Explicit per-unit rows for diagnostic cuts, including N=1.
     #[arg(long)]
     pub prefill_units: Option<usize>,
     /// Admit every prefill row's logits at startup for fidelity probes.
@@ -233,22 +234,34 @@ pub(crate) struct GoldenArgs {
 }
 
 impl EngineArgs {
+    fn resolved_prefill(&self) -> Result<cuteafd_loader::serving_capacity::prefill_waves::PrefillPlan> {
+        use cuteafd_loader::serving_capacity::prefill_waves::{prefill_shape, PrefillOverrides};
+        let ranks = self.peers.as_deref().map_or(0, |peers| peers.split(',').filter(|p| !p.is_empty()).count());
+        let local = self.local_experts || self.split_device.is_some() || (ranks == 0 && !self.shared_only);
+        let shape = prefill_shape(ranks, cuteafd_loader::families::qwen4::prefill_limits(local),
+            PrefillOverrides {
+                unit_rows: self.prefill_units.or((self.prefill_rows > 0).then_some(self.prefill_rows)).map(|r| r as u64),
+                waves: (self.prefill_waves > 0).then_some(u64::from(self.prefill_waves)),
+                span_rows: self.prefill_units.and_then(|_| (self.prefill_rows > 0).then_some(self.prefill_rows as u64)),
+            })?;
+        ensure!(shape.waves == 1 || self.peers.is_some() || self.shared_only,
+            "Qwen prefill units need Spark experts or shared-only diagnostics");
+        ensure!(self.split_device.is_none() || self.prefill_units.is_none(),
+            "Qwen dual-owner execution does not admit diagnostic unit cuts");
+        Ok(shape)
+    }
+
     fn prefill_shape(&self) -> Result<Option<cuteafd_loader::serving_capacity::PrefillShape>> {
-        if self.prefill_units.is_none() && self.prefill_waves == 1 { return Ok(None); }
-        ensure!(self.split_device.is_none(), "Qwen prefill units do not admit dual-owner hop slots");
-        ensure!(self.peers.is_some() || self.shared_only, "Qwen prefill units need Spark experts or shared-only diagnostics");
-        let shape = cuteafd_loader::serving_capacity::PrefillShape {
-            unit_rows: self.prefill_units.unwrap_or(self.prefill_rows) as u64, waves: u64::from(self.prefill_waves),
-        }.validate()?;
-        ensure!(shape.waves <= 2, "Qwen mapped PLE gathers admit at most two prefill waves");
-        ensure!(self.prefill_rows <= 8192, "Qwen prefill span exceeds 8192 rows");
-        Ok(Some(shape))
+        let shape = self.resolved_prefill()?;
+        Ok((self.prefill_units.is_some() || shape.waves > 1).then_some(shape.units()))
     }
 
     /// Per-wave tables, PLE gathers and Spark workers never hold the whole span.
     fn prefill_wave_rows(&self) -> usize {
-        self.prefill_units.unwrap_or(self.prefill_rows).max(engine::DECODE_ROWS)
+        self.prefill_units.unwrap_or(if self.prefill_rows > 0 { self.prefill_rows } else { 4096 })
+            .max(engine::DECODE_ROWS)
     }
+
 }
 
 /// The checkpoint and native library, opened on the calling thread.
@@ -333,25 +346,37 @@ mod weight_representation_tests {
             assert_eq!(parsed.prefill_shape()?, None);
             assert_eq!(parsed.prefill_wave_rows(), 4096);
         }
-        for (rows, waves) in [(512, 1), (1024, 2), (2048, 2), (4096, 2)] {
+        for (rows, waves) in [(512, 1), (1024, 2), (2048, 2), (2752, 2), (4096, 2)] {
             let rows_arg = rows.to_string();
             let waves_arg = waves.to_string();
             let parsed = args(&["--shared-only", "--prefill-units", &rows_arg, "--prefill-waves", &waves_arg])?;
             let shape = parsed.prefill_shape()?.unwrap();
             assert_eq!((shape.unit_rows, shape.waves), (rows, waves));
-            assert_eq!(parsed.prefill_rows, 4096);
+            assert_eq!(parsed.prefill_rows, 0);
         }
         for extra in [
             vec!["--prefill-waves", "2"],
             vec!["--shared-only", "--prefill-units", "511"],
             vec!["--shared-only", "--prefill-units", "8192"],
-            vec!["--shared-only", "--prefill-rows", "16384", "--prefill-units", "4096"],
             vec!["--shared-only", "--prefill-units", "2048", "--prefill-waves", "3"],
-            vec!["--shared-only", "--prefill-units", "512", "--prefill-waves", "3"],
+            vec!["--shared-only", "--prefill-units", "2752", "--prefill-waves", "3"],
+            vec!["--shared-only", "--prefill-units", "2048", "--prefill-waves", "4"],
             vec!["--local-experts", "--split-device", "1", "--prefill-units", "2048"],
         ] {
             assert!(args(&extra)?.prefill_shape().is_err(), "{extra:?}");
         }
+        let diagnostic = args(&["--shared-only", "--prefill-rows", "16384", "--prefill-units", "2752",
+            "--prefill-waves", "2", "--full-prefill-logits"])?;
+        assert!(diagnostic.prefill_shape().is_err());
+        let diagnostic = args(&["--shared-only", "--prefill-rows", "5504", "--prefill-units", "2752",
+            "--prefill-waves", "2", "--full-prefill-logits"])?;
+        let shape = diagnostic.prefill_shape()?.unwrap();
+        assert_eq!((shape.unit_rows, shape.waves, diagnostic.prefill_rows), (2752, 2, 5504));
+        let cfg = Qwen4Config::from_hf(&cuteafd_loader::plan::testing::qwen4_config(48))?;
+        let admitted = admission::inputs(&diagnostic, &cfg, 48, false, None, Some((160, true)), 0)?;
+        assert_eq!((admitted.prefill_shape, admitted.prefill_rows), (Some(shape), 5504));
+        assert_eq!(admitted.full_prefill_logits,
+            cuteafd_loader::plan::layout::full_prefill_logits_bytes("qwen4", 5504, cfg.vocab_size as u64));
         let shape = args(&["--peers", "localhost:9870", "--prefill-rows", "2048", "--prefill-waves", "2"])?.prefill_shape()?.unwrap();
         assert_eq!((shape.unit_rows, shape.slot_rows()), (2048, 4096));
         let mut parsed = args(&["--peers", "localhost:9870", "--prefill-waves", "2"])?;
@@ -361,7 +386,7 @@ mod weight_representation_tests {
         parsed.prefill_units = Some(shape.unit_rows as usize);
         assert_eq!(parsed.prefill_shape()?, Some(shape));
         assert_eq!(parsed.prefill_wave_rows(), 4096);
-        let worker = admission::spark_model(parsed.prefill_wave_rows(), false)?;
+        let worker = admission::spark_model(parsed.prefill_wave_rows(), shape.waves, false)?;
         assert_eq!((worker.capacity, worker.compiled_capacity), (4096, 4096));
         let cfg = Qwen4Config::from_hf(&cuteafd_loader::plan::testing::qwen4_config(48))?;
         let admission = admission::inputs(&parsed, &cfg, 48, false, None, Some((160, true)), 0)?;
@@ -449,7 +474,7 @@ mod weight_representation_tests {
             let parsed = args(&["--fp8-decode", "true", "--kv-cache", format]).unwrap();
             let required = required_fp8_programs(&parsed);
             let suffix = if format == "fp8" { "_kv_fp8" } else { "" };
-            for cap in ["m64".to_string(), format!("m{}", parsed.prefill_rows)] {
+            for cap in ["m64".to_string(), "m4096".to_string()] {
                 assert!(required.contains(&format!("qwen4_attn_producer_w8{suffix}_{cap}")));
                 let other = if format == "fp8" { "" } else { "_kv_fp8" };
                 assert!(!required.contains(&format!("qwen4_attn_producer_w8{other}_{cap}")));
@@ -511,10 +536,11 @@ impl Opened {
             1 + usize::from(args.split_device.is_some()), args.split_device.is_some())?;
         let automatic_context = args.max_context == 0;
         let mut context_args = args.clone();
+        let resolved = args.resolved_prefill()?;
         let prefill_shape = args.prefill_shape()?;
+        context_args.prefill_rows = usize::try_from(resolved.span_rows)?;
+        context_args.prefill_waves = u8::try_from(resolved.waves)?;
         if let Some(shape) = prefill_shape {
-            // Explicit diagnostic cuts retain the requested whole-step span.
-            if args.prefill_units.is_none() { context_args.prefill_rows = shape.slot_rows() as usize; }
             context_args.prefill_units = Some(shape.unit_rows as usize);
         }
         context_args.max_context = crate::shared::context::checkpoint_context(
@@ -554,7 +580,7 @@ impl Opened {
             let source = args.experts_snapshot.as_deref().unwrap_or(&args.snapshot);
             crate::shared::placement::SparkAdmission::plan(source, cuteafd_core::ExpertGeometry::QWEN4,
                 self.experts.as_ref(), &working, peers.len(), None,
-                admission::spark_model(args.prefill_wave_rows(), self.checkpoint.spark_input_is_bf16())?)?.select(&peers)?;
+                admission::spark_model(args.prefill_wave_rows(), args.resolved_prefill()?.waves, self.checkpoint.spark_input_is_bf16())?)?.select(&peers)?;
         }
         let mut manifest_json: Option<serde_json::Value> = std::fs::read(&args.manifest).ok()
             .and_then(|bytes| serde_json::from_slice(&bytes).ok());

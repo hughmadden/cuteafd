@@ -17,27 +17,14 @@ const LANES: u64 = 1;
 
 pub(super) fn layout(model: &Model, report: &mut PlanReport, opts: &mut crate::plan::layout::LayoutOptions,
     requested: ExpertPlacement) -> MemoryLayout {
-    use crate::families::kimi_k3::allocation::{DEFAULT_PREFILL_UNIT_ROWS, DEFAULT_PREFILL_WAVES, LANE_ROWS_MAX};
-    let unit_rows = if opts.prefill_rows > 0 { opts.prefill_rows } else { DEFAULT_PREFILL_UNIT_ROWS as u64 };
-    let waves = if opts.prefill_lanes > 0 { opts.prefill_lanes } else { DEFAULT_PREFILL_WAVES as u64 };
-    let shape = crate::serving_capacity::PrefillShape { unit_rows, waves };
-    if let Err(error) = shape.validate().and_then(|shape| {
-        anyhow::ensure!((256..=LANE_ROWS_MAX as u64).contains(&shape.slot_rows()),
-            "Kimi prefill span must hold 256..={LANE_ROWS_MAX} rows");
-        Ok(shape)
-    }) {
-        report.fits = false;
-        report.placement_supported = false;
-        report.hints.push(Hint { what: format!("Kimi prefill: {error:#}"),
-            how: "Select page-aligned unit rows and waves with a 256..=8192-row span.".into() });
-        return MemoryLayout { devices: Vec::new(), pool_tokens: 0, waste: Vec::new(), notes: vec![error.to_string()] };
-    }
-    let rows = shape.slot_rows() as usize;
-    let unit = unit_rows as usize;
-    report.prefill_span_rows = Some(shape.slot_rows());
-    report.prefill_transports = Some(LANES);
-    opts.prefill_unit_rows = Some(unit_rows);
-    opts.prefill_waves = waves;
+    use crate::serving_capacity::prefill_waves::PrefillLimits;
+    let prefill = match crate::plan::layout::resolve_prefill(report, opts, requested.spark_ranks(), PrefillLimits::default()) {
+        Ok(prefill) => prefill,
+        Err(error) => return crate::plan::layout::unsupported_prefill(report, error),
+    };
+    let shape = prefill.units();
+    let rows = prefill.span_rows as usize;
+    let unit = prefill.unit_rows as usize;
     let cfg = model.cfg();
     let ranks = requested.spark_ranks();
     let gpus = opts.rtx_bytes.len();
@@ -159,7 +146,7 @@ pub(super) fn layout(model: &Model, report: &mut PlanReport, opts: &mut crate::p
             let verify = opts.kimi_drafter_snapshot.as_ref().map(|snapshot|
                 crate::formats::dflash::MlaDflashConfig::read(snapshot).map(|draft| draft.block))
                 .transpose()?.unwrap_or(0);
-            let mut demands = allocation::baseline_demands(cfg, manifest, shape, context as usize,
+            let mut demands = allocation::baseline_demands(cfg, manifest, rows, shape, context as usize,
                 usize::try_from(slots)?, verify, &model.core, report.requested_attention == Some(AttentionPlacement::Heads))?;
             let families = if model.core.projections.is_empty() { &["kimik3"][..] } else { &["kimik3", "kimi"][..] };
             let programs = ProgramSet::from_manifest(manifest, families);
@@ -197,7 +184,7 @@ pub(super) fn layout(model: &Model, report: &mut PlanReport, opts: &mut crate::p
         let working = SparkWorkingSet { rtx_layers: vec![], spark_layers: cfg.dense.iter().enumerate()
             .filter_map(|(layer, dense)| (!dense).then_some(layer)).collect(), spark_ranks: ranks, prefill_lanes: LANES };
         let rings = crate::plan::layout::spark_ring_geometry(LANES as usize);
-        let endpoints = [cuteafd_core::SparkEndpoint { ring_depth: None, capacity: opts.spark_capacity_rows as u32,
+        let endpoints = [cuteafd_core::SparkEndpoint { ring_depth: None, capacity: unit as u32,
             ingress: cuteafd_core::SparkIngress::Fp8K32 }];
         let budget = opts.spark_allocation_budget_bytes.unwrap_or(super::SPARK_BUDGET_BYTES);
         let spark = SparkBudgetInventory::exl3(&catalog, &working, &endpoints,
@@ -383,10 +370,14 @@ pub(super) fn layout(model: &Model, report: &mut PlanReport, opts: &mut crate::p
             kv_tokens: 0, items: vec![Item::new(Category::Experts, "routed experts (TP6 width 512, replicated 3584 rotations)",
                 model.expert_formats.join("+"), resident, Basis::Exact)] };
         if let Err(error) = crate::plan::layout::charge_spark_io(&mut device, &working, cuteafd_core::ExpertGeometry::KIMI_K3,
-            opts.spark_capacity_rows as u32, false, rings, 0) {
+            unit as u32, false, rings, 0) {
             refusal(report, format!("Kimi K3 Spark rank {rank} I/O: {error}"), "Fix the Spark ring geometry.");
         }
         device.items.push(Item::new(Category::Workspace, "EXL3 expert workspace", "kimik3:exl3-k23", SPARK_EXL3_WORKSPACE, Basis::Estimated));
+        match crate::plan::layout::spark_execution_slots("kimi_k3", shape.waves, 1) {
+            Ok(slots) => crate::plan::layout::charge_spark_slots(&mut device, &working, "kimi_k3", slots, shape.unit_rows),
+            Err(error) => refusal(report, format!("Kimi Spark slots: {error}"), "Use a supported wave count."),
+        }
         memory.devices.push(device);
     }
     memory.notes.push(format!("Spark budget {} B/rank includes exact TP6 header arenas and endpoint I/O plus {} B estimated runtime/workspace reserve; census pending",

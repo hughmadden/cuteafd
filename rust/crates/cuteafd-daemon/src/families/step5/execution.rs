@@ -90,7 +90,7 @@ impl<'a> NativeOwners<'a> {
             if rank == head_rank {
                 if let Some(head) = &head_plan { *plan = plan.with_head(head)?; }
                 plan.workspace = plan.workspace.max(
-                    cuteafd_loader::plan::families::step5::native::mtp_forecast_workspace(span, depth, kv_format)?);
+                    cuteafd_loader::plan::families::step5::native::mtp_forecast_workspace(rows, depth, kv_format)?);
             }
         }
         admit_native(&admission, available, reservations, || {

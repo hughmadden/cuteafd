@@ -56,7 +56,7 @@ pub(crate) struct GoldenArgs {
     /// Last target layer, inclusive; logits require the complete target through layer 91.
     #[arg(long, default_value_t = 87)]
     last_layer: usize,
-    /// Cold prefix rows (at most 4096); omitted uses the complete reference window.
+    /// Cold prefix rows (one unit, or the admitted --prefill-units span).
     #[arg(long)]
     prefill: Option<usize>,
     #[arg(long, default_value_t = 0)]
@@ -335,10 +335,14 @@ fn reference(args: &GoldenArgs, vocab: usize) -> Result<Reference> {
         .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
         .collect();
     let rows = args.prefill.unwrap_or(tokens.len());
-    ensure!(
-        (1..=4096).contains(&rows) && rows <= tokens.len(),
-        "cold Step-5 golden requires 1..4096 reference rows"
-    );
+    let capacity = if let Some(unit) = args.prefill_units {
+        use cuteafd_loader::serving_capacity::prefill_waves::{prefill_shape, PrefillLimits, PrefillOverrides};
+        prefill_shape(args.peers.len(), PrefillLimits::default(), PrefillOverrides {
+            unit_rows: Some(unit as u64), waves: Some(u64::from(args.prefill_waves)), span_rows: None,
+        })?.span_rows as usize
+    } else { 4096 };
+    ensure!((1..=capacity).contains(&rows) && rows <= tokens.len(),
+        "cold Step-5 golden reference rows exceed admitted capacity {capacity}");
     ensure!(tokens.iter().all(|&t| (t as usize) < vocab), "reference token outside vocabulary");
     ensure!(args.compare_layers.iter().all(|&layer| layer <= args.last_layer)
         && args.compare_layers.windows(2).all(|layers| layers[0] < layers[1])
@@ -474,8 +478,9 @@ fn expert_admission(args: &GoldenArgs, rows: usize, layers: &[usize]) -> Result<
         .into_iter()
         .max()
         .context("empty FP8 capacities")?;
+    let unit = args.prefill_units.unwrap_or(rows);
     ensure!(
-        compiled >= rows as u64 && compiled <= 4096,
+        compiled >= unit as u64 && compiled <= 4096,
         "FP8 package row capacity"
     );
     let config = TcpTransportConfig::default();
@@ -491,9 +496,9 @@ fn expert_admission(args: &GoldenArgs, rows: usize, layers: &[usize]) -> Result<
         },
         args.peers.len(),
         None,
-        ModelAdmission::for_clients(ExpertGeometry::STEP5,
+        ModelAdmission::for_units(ExpertGeometry::STEP5,
             SparkEndpoint { ring_depth: None, capacity: rows as u32, ingress: SparkIngress::Bf16 },
-            compiled as u32, spark_rings(config.max_frame_bytes)?, 1)?,
+            unit as u32, compiled as u32, spark_rings(config.max_frame_bytes)?, 1, args.prefill_waves)?,
     )?
     .select(&args.peers)?;
     cuteafd_transport::worker_selection::require_peer_clients(&args.peers,
@@ -802,6 +807,13 @@ fn split_run(args: &GoldenArgs, checkpoint: &Checkpoint, cfg: &Config,
         None => (rows, 1),
     };
     ensure!(unit > 0 && unit <= rows && (unit == rows || unit % 64 == 0), "Step-5 golden prefill units");
+    if args.prefill_units.is_some() {
+        use cuteafd_loader::serving_capacity::prefill_waves::{prefill_shape, PrefillLimits, PrefillOverrides};
+        let shape = prefill_shape(args.peers.len(), PrefillLimits::default(), PrefillOverrides {
+            unit_rows: Some(unit as u64), waves: Some(waves as u64), span_rows: None,
+        })?;
+        ensure!(rows as u64 <= shape.span_rows, "Step-5 golden rows exceed the admitted unit span");
+    }
     // Per-layer retention reads one whole-step output; units score logits only.
     ensure!(args.prefill_units.is_none() || (args.compare_layers.is_empty() && args.dump_layers.is_empty()
         && reference.hidden.is_empty()),
@@ -852,15 +864,15 @@ fn split_run(args: &GoldenArgs, checkpoint: &Checkpoint, cfg: &Config,
     let started = std::time::Instant::now();
     let caches = [RefCell::new(CacheRank::new(devices[0], layout.clone(), 0, 1, 0, pages, cache_bytes[0] as usize)?),
         RefCell::new(CacheRank::new(devices[1], layout, 1, 1, 0, pages, cache_bytes[1] as usize)?)];
-    let stages = [Staging::new(devices[0], &programs, &caches[0].borrow(), staging_bytes[0] as usize)?,
-        Staging::new(devices[1], &programs, &caches[1].borrow(), staging_bytes[1] as usize)?];
+    let stages = [Staging::new_for_units(devices[0], &programs, &caches[0].borrow(), staging_bytes[0] as usize, 1, unit)?,
+        Staging::new_for_units(devices[1], &programs, &caches[1].borrow(), staging_bytes[1] as usize, 1, unit)?];
     let (world, config) = expert_admission(args, rows, layers)?;
     let transport = devices[0].own(|| {
         let mut link = if waves > 1 {
             SparkLink::new_waves(&library, world, &args.peers, rows as u32, config, H * 2, waves, unit as u32)?
         } else { SparkLink::new(&library, world, &args.peers, rows as u32, config, H * 2)? };
         link.enable_terminal_ownership(library.clone())?;
-        link.bootstrap(&super::execution::bootstrap_request(rows, 17)?)?;
+        link.bootstrap(&super::execution::bootstrap_request(unit, 17)?)?;
         Ok(link)
     })?;
     let family = Step5Prefix::new(vec![&caches[0], &caches[1]])?;

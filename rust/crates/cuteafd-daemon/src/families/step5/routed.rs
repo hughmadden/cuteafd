@@ -103,7 +103,7 @@ impl RoutedPlan {
 
     /// Live planes hold `span` rows (every in-flight unit); scratch holds one.
     pub(super) fn with_span(mut self, span: usize) -> Result<Self> {
-        ensure!(span >= self.admission.rows && span <= 4096, "Step-5 routed span outside 1..=4096");
+        ensure!(span >= self.admission.rows, "Step-5 routed span smaller than unit capacity");
         let live = cuteafd_loader::plan::families::step5::native::routed_planes(span)?;
         for plane in 0..14 {
             if cuteafd_loader::plan::families::step5::native::routed_live(plane) {

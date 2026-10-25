@@ -1144,24 +1144,29 @@ pub(super) mod tests {
         let manifest_path = testing::write_kimi_installed_inventory(package_root.path(), false);
         let manifest: serde_json::Value = serde_json::from_slice(&std::fs::read(&manifest_path)?)?;
         let cfg = KimiK3Config::from_hf(&testing::kimi_k3_config())?;
-        let rows = 4096;
         let context = 1_048_576;
         let capacity = cuteafd_loader::placement::inventory::PRO_TOTAL_BYTES;
         let spark_bytes = 115_964_116_992;
         use cuteafd_core::MlaCacheFormat;
-        for (slots, prefix_slots, host_cache_bytes, entries, format) in [
+        for ((slots, prefix_slots, host_cache_bytes, entries, format), waves) in [
             (16, Some(1), Some(0), 20, MlaCacheFormat::Fp8),
             (8, None, None, 20, MlaCacheFormat::Fp8),
             (16, None, Some(8 << 30), 20, MlaCacheFormat::Fp8),
             (8, None, None, 20, MlaCacheFormat::Bf16),
-        ] {
+        ].into_iter().flat_map(|case| [2usize, 3, 4].map(move |waves| (case, waves))) {
+            let shape = cuteafd_loader::serving_capacity::prefill_waves::prefill_shape(6,
+                Default::default(), cuteafd_loader::serving_capacity::prefill_waves::PrefillOverrides {
+                    waves: Some(waves as u64), ..Default::default()
+                })?;
+            let rows = shape.span_rows as usize;
+            let unit = shape.unit_rows as usize;
             let rule = crate::shared::prefix::MarkRule { lanes: slots as usize, entries,
                 budget_bytes: 512 << 20, host: host_cache_bytes != Some(0) };
             let mark_bytes = cfg.kda_layers() as u64 * (cfg.kda_state_bytes() + cfg.kda_conv_bytes());
             let marks = prefix_slots.unwrap_or_else(|| rule.slots(usize::try_from(mark_bytes).unwrap()) as u64);
             assert_eq!(marks, if entries == 0 { 0 } else if rule.host { 2 } else { 1 });
             let options = PlanOptions { placement: ExpertPlacement::Sparks { ranks: 6 },
-                layout: Some(LayoutOptions { host_memory: Some((128 << 30, 128 << 30)), rtx_bytes: vec![capacity; 2], prefill_rows: rows as u64 / 2, prefill_lanes: 2,
+                layout: Some(LayoutOptions { host_memory: Some((128 << 30, 128 << 30)), rtx_bytes: vec![capacity; 2], prefill_rows: unit as u64, prefill_lanes: waves as u64,
                     concurrency: slots, state_slots: Some(slots), prefix_slots,
                     mimo_prefix_entries: entries as u64, mimo_prefix_mark_bytes: rule.budget_bytes,
                     context_tokens: context as u64, host_cache_bytes, mla_kv: format,
@@ -1174,7 +1179,6 @@ pub(super) mod tests {
             let package = allocation::expert_package(&manifest_path)?;
             // Startup charges hook-local owners (TP2 workspace, Spark endpoint,
             // peer exchange, graphs) at the unit; row planes at the lane.
-            let unit = test_unit(rows, 2, None);
             let mut rtx = plan_rtx(&cfg, &catalog, package, unit, 92)?;
             rtx.layers = Onboard::Auto;
             let working = SparkWorkingSet { rtx_layers: vec![], spark_layers: (1..93).collect(),
@@ -1189,7 +1193,8 @@ pub(super) mod tests {
             let arch = ArchContext::for_device("sm_120", capacity);
             let mut i = inputs(&cfg);
             i.cache_format = format;
-            i.rows = rows; i.lanes = 1; i.state_slots = slots as usize; i.prefix_marks = marks as usize;
+            i.rows = rows; i.waves = waves; i.unit_rows = Some(unit);
+            i.lanes = 1; i.state_slots = slots as usize; i.prefix_marks = marks as usize;
             i.lane_layouts = vec![std::array::from_fn(|_| LaneLayout::new(&cfg, rows, test_unit(rows, i.waves, i.unit_rows), context,
                 allocation::NativeScratch::from_manifest(&manifest).unwrap()).unwrap())];
             i.fixed = super::super::startup::exchange_demands(unit, false, false)?;

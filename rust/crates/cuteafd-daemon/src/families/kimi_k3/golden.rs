@@ -623,7 +623,8 @@ mod tests {
             scored += count;
         }
         assert_eq!(scored, 4096);
-        for (tokens, capacity) in [(1, 1), (16385, 4096), (513, 0), (513, 8193)] {
+        assert_eq!(forward_chunks(10827, 8256)?, [0..8256, 8256..10826]);
+        for (tokens, capacity) in [(1, 1), (16385, 4096), (513, 0), (513, 8257)] {
             assert!(forward_chunks(tokens, capacity).is_err());
         }
         Ok(())

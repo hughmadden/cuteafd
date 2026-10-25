@@ -27,6 +27,26 @@ fn dense_pushable(args: &EngineArgs) -> bool {
     args.kda_nvfp4_gate.is_none()
 }
 
+fn resolve_prefill(args: &mut EngineArgs, complete: bool) -> Result<()> {
+    use cuteafd_loader::serving_capacity::prefill_waves::{prefill_shape, PrefillLimits, PrefillOverrides};
+    let ranks = args.peers.as_deref().map_or(0, |peers| peers.split(',').count());
+    let attention = cuteafd_loader::placement::attention::parse(&args.attention_placement)
+        .map_err(anyhow::Error::msg)?;
+    let shape = prefill_shape(if complete { ranks } else { 0 }, PrefillLimits {
+        max_waves: if !complete || ranks == 0 { 1 }
+            else if attention == Some(cuteafd_loader::placement::AttentionPlacement::Layers) { 2 } else { 4 },
+        ..Default::default()
+    }, PrefillOverrides {
+        unit_rows: (args.prefill_rows > 0).then_some(args.prefill_rows as u64),
+        waves: (args.prefill_waves > 0).then_some(args.prefill_waves as u64),
+        span_rows: (args.prefill_span_rows > 0).then_some(args.prefill_span_rows as u64),
+    })?;
+    args.prefill_rows = usize::try_from(shape.unit_rows)?;
+    args.prefill_waves = usize::try_from(shape.waves)?;
+    args.prefill_span_rows = usize::try_from(shape.span_rows)?;
+    Ok(())
+}
+
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::NativeLibrary;
 use cuteafd_loader::formats::fp8_experts::Fp8ExpertTensors;
@@ -93,8 +113,8 @@ pub(crate) struct EngineArgs {
     /// pooled keys bit for bit. A two-GPU head split keeps `keys`.
     #[arg(long, value_enum, env = "CUTEAFD_GLMF_INDEX_CACHE", default_value = "keys")]
     pub index_cache: engine::IndexCache,
-    /// Rows of one prefill lane, and of a serial prefill chunk (the programs take up to 4096).
-    #[arg(long, default_value_t = 4096)]
+    /// Rows per unit; 0 selects the shared topology policy (at most 4096).
+    #[arg(long, default_value_t = 0)]
     pub prefill_rows: usize,
     /// The most rows of one decode or verify step: 64 (the `_m64` programs), or 128, where a step of
     /// more than 64 rows runs the wide `_m128` programs (a build with CUTEAFD_GLMF_WIDE_DECODE_ROWS=128;
@@ -111,12 +131,11 @@ pub(crate) struct EngineArgs {
     /// Maximum live prefill units on one Spark transport (1 to 4; mixed layer ownership caps
     /// this at 2). Units retain their own operands and share attention temporaries; long
     /// spans reuse slots continuously. --prefill-rows bounds each unit's rows.
-    #[arg(long = "prefill-waves", default_value_t = engine::DEFAULT_PREFILL_WAVES,
-        value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..=engine::MAX_PREFILL_WAVES as u64))]
+    #[arg(long = "prefill-waves", default_value_t = 0,
+        value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(0..=engine::MAX_PREFILL_WAVES as u64))]
     pub prefill_waves: usize,
-    /// Maximum rows of a continuous prefill call; units recycle the admitted slots.
-    #[arg(long, default_value_t = 16384,
-        value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..))]
+    /// Shared prefill span; 0 resolves to waves times per-unit rows.
+    #[arg(long, default_value_t = 0)]
     pub prefill_span_rows: usize,
     /// GPU memory (GiB) an automatic pool leaves free for growth the start-up cannot measure
     /// (lazily loaded kernels, cuBLAS, allocator rounding), when every other allocation precedes
@@ -444,8 +463,10 @@ mod draft_cli_tests {
             "--draft-fp8", "auto"]).is_err());
     }
     fn parse(extra: &[&str]) -> EngineArgs {
-        Parse::try_parse_from(["test", "--snapshot", "/checkpoint", "--native-lib", "/native"].into_iter()
-            .chain(extra.iter().copied())).unwrap().engine
+        let mut args = Parse::try_parse_from(["test", "--snapshot", "/checkpoint", "--native-lib", "/native"].into_iter()
+            .chain(extra.iter().copied())).unwrap().engine;
+        resolve_prefill(&mut args, true).unwrap();
+        args
     }
 
     #[test]
@@ -854,24 +875,35 @@ mod draft_cli_tests {
     }
 
     #[test]
-    fn prefill_lanes_default_to_two_of_4096_rows_and_take_one_to_four() {
-        let defaults = parse(&[]);
-        assert_eq!((defaults.prefill_waves, defaults.prefill_rows), (2, 4096));
-        let four = parse(&["--prefill-waves", "4", "--prefill-rows", "2048"]);
+    fn prefill_units_follow_shared_topology_and_preserve_explicit_pins() {
+        for ranks in [0, 1, 2, 4, 5, 6, 8] {
+            let peers = (0..ranks).map(|rank| format!("127.0.0.1:{}", 19441 + rank)).collect::<Vec<_>>().join(",");
+            let args = if ranks == 0 { parse(&[]) } else { parse(&["--peers", &peers]) };
+            let waves = cuteafd_loader::serving_capacity::prefill_waves::planned_waves(ranks);
+            assert_eq!((args.prefill_waves as u64, args.prefill_rows as u64),
+                (waves, cuteafd_loader::serving_capacity::prefill_waves::unit_rows(waves)));
+        }
+        let four = parse(&["--peers", SPARKS[1], "--prefill-waves", "4", "--prefill-rows", "2048"]);
         assert_eq!((four.prefill_waves, four.prefill_rows), (4, 2048));
         assert_eq!(parse(&["--prefill-rows", "2048"]).prefill_rows, 2048);
-        for lanes in ["0", "5"] {
-            assert!(Parse::try_parse_from(["test", "--snapshot", "/checkpoint", "--native-lib", "/native",
-                "--prefill-waves", lanes]).is_err());
+        for (peers, waves, rows) in [(None, 2, 4096), (Some(SPARKS[1]), 4, 4096)] {
+            let mut args = parse(&[]);
+            args.peers = peers.map(str::to_owned);
+            args.prefill_waves = waves;
+            args.prefill_rows = rows;
+            assert!(resolve_prefill(&mut args, true).is_err());
         }
+        assert!(Parse::try_parse_from(["test", "--snapshot", "/checkpoint", "--native-lib", "/native",
+            "--prefill-waves", "5"]).is_err());
     }
 
     #[test]
-    fn prefill_span_is_an_explicit_positive_engine_flag() {
-        assert_eq!(parse(&[]).prefill_span_rows, 16384);
-        assert_eq!(parse(&["--prefill-span-rows", "32768"]).prefill_span_rows, 32768);
-        assert!(Parse::try_parse_from(["test", "--snapshot", "/checkpoint", "--native-lib", "/native",
-            "--prefill-span-rows", "0"]).is_err());
+    fn prefill_span_is_exactly_the_shared_wave_extent() {
+        assert_eq!(parse(&[]).prefill_span_rows, 4096);
+        assert_eq!(parse(&["--prefill-span-rows", "4096"]).prefill_span_rows, 4096);
+        let mut args = Parse::try_parse_from(["test", "--snapshot", "/checkpoint", "--native-lib", "/native",
+            "--prefill-span-rows", "16384"]).unwrap().engine;
+        assert!(resolve_prefill(&mut args, true).is_err());
     }
 
     #[test]
@@ -1474,8 +1506,7 @@ impl Opened {
                 args.token_io.embed_placement, engine::GlmfAttention { first_owner: 1 - attention.first_owner, ..attention }))
             .transpose()?;
         let spark_ranks = args.peers.as_deref().map_or(0, |p| p.split(',').count());
-        let lanes = engine::configured_prefill_waves(layers == self.cfg.layers, args.prefill_waves);
-        let lanes = usize::try_from(admission::admitted_prefill_waves(attention.mode, lanes as u64))?;
+        let lanes = usize::try_from(admission::admitted_prefill_waves(attention.mode, args.prefill_waves as u64)?)?;
         let lookup = |name: &str| programs.spec(name).ok().map(|p| p.scratch.get("scratch").copied().unwrap_or(0));
         let scratch = GlmfScratchOptions { split, kda_w8: representation.kda_fp8,
             kda_fp32_partials: args.kda_fp32_partials, kda_output_shard: args.kda_output_shard,
@@ -1602,6 +1633,7 @@ impl Opened {
         let args = &resolved;
         let automatic_context = args.max_context == 0;
         let mut context_args = args.clone();
+        resolve_prefill(&mut context_args, args.layers.is_none_or(|n| n == self.cfg.layers))?;
         context_args.max_context = crate::shared::context::checkpoint_context(
             &args.snapshot, &args.manifest, "glm5_flash", args.max_context)?;
         let args = &context_args;
@@ -1862,12 +1894,12 @@ impl Opened {
             let ingress = if self.checkpoint.spark_input_is_bf16() { cuteafd_core::SparkIngress::Bf16 }
                 else { cuteafd_core::SparkIngress::Fp8K32 };
             let model = cuteafd_transport::worker_selection::ModelAdmission {
-                capacity, compiled_capacity: capacity,
+                capacity, compiled_capacity: 4096,
                 endpoints: vec![cuteafd_core::SparkEndpoint { ring_depth: None, capacity, ingress }],
                 rings: crate::shared::placement::spark_rings(64 << 20)?,
                 // One execution slot per prefill wave the link keeps in flight.
                 execution_slots: cuteafd_loader::plan::layout::spark_execution_slots("glm5_flash",
-                    args.prefill_waves as u64, 1)
+                    args.prefill_waves as u64, 1)?
             };
             let admission = crate::shared::placement::SparkAdmission::plan(source, geometry, self.experts.as_ref(),
                 &working, peers.len(), None, model)?;
@@ -2011,7 +2043,7 @@ impl Opened {
             let mut settings = step_settings(args, index_cache, self.checkpoint.spark_input_is_bf16());
             settings.max_context = max_context;
             let plan = engine::StepPlan::new(&self.library, &programs, &self.cfg, &model.layers, step_experts, settings);
-            let lanes = engine::configured_prefill_waves(layers == self.cfg.layers, args.prefill_waves);
+            let lanes = args.prefill_waves;
             Some(engine::StepWorkspaces::allocate(&plan, args.prefill_rows, lanes)?)
         } else { None };
         let records = early_workspaces.as_ref().map(|w| w.prefill_scratch()

@@ -30,6 +30,92 @@ pub fn unit_rows(waves: u64) -> u64 {
     }
 }
 
+/// Kernel and arena limits, not family-specific scheduling defaults.
+#[derive(Debug, Clone, Copy)]
+pub struct PrefillLimits {
+    pub max_unit_rows: u64,
+    /// Capacity of the intake arena, bounded by the shared live-slot reserve.
+    pub max_span_rows: u64,
+    pub max_waves: u64,
+    /// A declared temporary capability hold may cap Auto, never explicit pins.
+    pub max_waves_reason: Option<&'static str>,
+}
+
+impl Default for PrefillLimits {
+    fn default() -> Self {
+        Self { max_unit_rows: 4096, max_span_rows: RESERVE_ROWS + 64, max_waves: MAX_WAVES,
+            max_waves_reason: None }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum PrefillError {
+    #[error("unsupported prefill shape: {waves} waves x {unit_rows} rows; units must be page-aligned 64..=4096 rows and waves 1..=4")]
+    InvalidShape { unit_rows: u64, waves: u64 },
+    #[error("unsupported prefill shape: {waves} waves x {unit_rows} rows; executor supports at most {max_waves} waves x {max_unit_rows} rows")]
+    ExecutorCapacity { unit_rows: u64, waves: u64, max_unit_rows: u64, max_waves: u64 },
+    #[error("unsupported prefill shape: {waves} waves x {unit_rows} rows exceeds the admitted {reserve_rows}-row live-slot reserve")]
+    ReserveExceeded { unit_rows: u64, waves: u64, reserve_rows: u64 },
+    #[error("unsupported prefill span: {span_rows} rows must equal {slot_rows} live slot rows within the {max_span_rows}-row shared arena")]
+    IntakeSpan { span_rows: u64, slot_rows: u64, max_span_rows: u64 },
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PrefillOverrides {
+    pub unit_rows: Option<u64>,
+    pub waves: Option<u64>,
+    pub span_rows: Option<u64>,
+}
+
+/// The shape admitted before allocating workspace, Spark execution slots or
+/// landing rotation. The topology policy is identical for every family.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PrefillPlan {
+    pub unit_rows: u64,
+    pub waves: u64,
+    pub span_rows: u64,
+}
+
+impl PrefillPlan {
+    pub fn units(self) -> super::PrefillShape {
+        super::PrefillShape { unit_rows: self.unit_rows, waves: self.waves }
+    }
+}
+
+pub fn prefill_shape(spark_ranks: usize, limits: PrefillLimits,
+    explicit: PrefillOverrides) -> Result<PrefillPlan, PrefillError> {
+    let waves = explicit.waves.unwrap_or_else(|| {
+        let planned = planned_waves(spark_ranks);
+        if let Some(reason) = limits.max_waves_reason.filter(|_| planned > limits.max_waves) {
+            tracing::info!(planned_waves = planned, admitted_waves = limits.max_waves, reason,
+                "automatic prefill waves limited by declared executor capability");
+            limits.max_waves
+        } else { planned }
+    });
+    let rows = explicit.unit_rows.unwrap_or_else(|| unit_rows(waves));
+    let units = super::PrefillShape { unit_rows: rows, waves };
+    if units.validate().is_err() {
+        return Err(PrefillError::InvalidShape { unit_rows: rows, waves });
+    }
+    if waves > limits.max_waves || rows > limits.max_unit_rows {
+        return Err(PrefillError::ExecutorCapacity { unit_rows: rows, waves,
+            max_unit_rows: limits.max_unit_rows, max_waves: limits.max_waves });
+    }
+    // Rounding each share to a whole page admits 3 x 2752, not 3 x 4096.
+    // Intake and execution share exactly this extent; no larger family ceiling.
+    let reserve_rows = RESERVE_ROWS.div_ceil(64 * waves) * (64 * waves);
+    let slot_rows = units.slot_rows();
+    if slot_rows > reserve_rows {
+        return Err(PrefillError::ReserveExceeded { unit_rows: rows, waves, reserve_rows });
+    }
+    let span_rows = explicit.span_rows.unwrap_or(slot_rows);
+    let max_span_rows = limits.max_span_rows.min(RESERVE_ROWS + 64);
+    if span_rows != slot_rows || span_rows > max_span_rows {
+        return Err(PrefillError::IntakeSpan { span_rows, slot_rows, max_span_rows });
+    }
+    Ok(PrefillPlan { unit_rows: rows, waves, span_rows })
+}
+
 /// Waves that hide `turnaround` (raptor's reply drain, reduce, attention and
 /// routing between a unit's waves) behind `spark` (one unit's expert compute):
 /// ceil(T / S) + 1, clamped to 2..=[`MAX_WAVES`].
@@ -79,6 +165,65 @@ mod tests {
             assert!(unit * waves >= RESERVE_ROWS);
         }
         assert_eq!((2..=4).map(unit_rows).collect::<Vec<_>>(), [4096, 2752, 2048]);
+    }
+
+    #[test]
+    fn explicit_shapes_cannot_grow_the_shared_live_reserve() {
+        for (waves, rows) in [(1, 4096), (2, 4096), (3, 2752), (4, 2048), (4, 512)] {
+            let shape = prefill_shape(6, PrefillLimits::default(), PrefillOverrides {
+                waves: Some(waves), unit_rows: Some(rows), ..Default::default()
+            }).unwrap();
+            assert_eq!((shape.waves, shape.unit_rows, shape.span_rows), (waves, rows, waves * rows));
+        }
+        for (waves, rows) in [(3, 2816), (3, 4096), (4, 2112), (4, 4096)] {
+            let error = prefill_shape(6, PrefillLimits::default(), PrefillOverrides {
+                waves: Some(waves), unit_rows: Some(rows), ..Default::default()
+            }).unwrap_err();
+            assert!(matches!(error, PrefillError::ReserveExceeded { .. }), "{error}");
+        }
+    }
+
+    #[test]
+    fn intake_is_exactly_the_shared_live_slot_extent() {
+        let limits = PrefillLimits { max_span_rows: u64::MAX, ..Default::default() };
+        let shape = prefill_shape(6, limits, PrefillOverrides::default()).unwrap();
+        assert_eq!(shape, PrefillPlan { unit_rows: 2752, waves: 3, span_rows: 8256 });
+        assert_eq!(shape.units().slot_rows(), 8256);
+        for span in [0, 8192, 8257, 16384] {
+            let error = prefill_shape(6, limits, PrefillOverrides {
+                span_rows: Some(span), ..Default::default()
+            }).unwrap_err();
+            assert!(matches!(error, PrefillError::IntakeSpan { .. }), "{error}");
+        }
+        let error = prefill_shape(6, PrefillLimits::default(), PrefillOverrides {
+            span_rows: Some(16384), ..Default::default()
+        }).unwrap_err();
+        assert!(matches!(error, PrefillError::IntakeSpan { .. }));
+    }
+
+    #[test]
+    fn executor_and_shape_errors_are_typed_and_never_clamped() {
+        for (rows, waves) in [(0, 2), (65, 2), (8192, 1), (4096, 0), (2048, 5)] {
+            let error = prefill_shape(6, PrefillLimits::default(), PrefillOverrides {
+                unit_rows: Some(rows), waves: Some(waves), ..Default::default()
+            }).unwrap_err();
+            assert_eq!(error, PrefillError::InvalidShape { unit_rows: rows, waves });
+        }
+        let error = prefill_shape(6, PrefillLimits { max_waves: 2, ..Default::default() },
+            PrefillOverrides::default()).unwrap_err();
+        assert!(matches!(error, PrefillError::ExecutorCapacity { waves: 3, max_waves: 2, .. }));
+    }
+
+    #[test]
+    fn declared_capability_holds_cap_auto_but_never_explicit_pins() {
+        let limits = crate::families::qwen4::prefill_limits(false);
+        assert_eq!(prefill_shape(6, limits, PrefillOverrides::default()).unwrap(),
+            PrefillPlan { unit_rows: 4096, waves: 2, span_rows: 8192 });
+        for waves in [3, 4] {
+            assert!(matches!(prefill_shape(6, limits, PrefillOverrides {
+                waves: Some(waves), ..Default::default()
+            }), Err(PrefillError::ExecutorCapacity { .. })));
+        }
     }
 
     #[test]

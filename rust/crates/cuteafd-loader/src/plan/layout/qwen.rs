@@ -13,18 +13,14 @@ const SPARK_HOST_BYTES: u64 = 13 * GIB;
 /// (`dual_layout`); every other layout serves on rtx0 (`single_layout`).
 pub(crate) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyModel,
     input: &super::super::PlanInput, options: &mut LayoutOptions) -> MemoryLayout {
-    if options.prefill_lanes > 0 { options.prefill_waves = options.prefill_lanes; }
     let local = report.placement == ExpertPlacement::Local;
-    let policy = ShapePolicy { prefill_rows: local.then_some(4096), ..ShapePolicy::manifest_bounded() };
-    let shape = Shape::resolve(report, model, options, policy);
-    // Local TP1/TP2 retain whole-step execution, not the Spark unit executor.
-    options.prefill_unit_rows = Some(shape.prefill_rows);
-    report.prefill_transports = Some(u64::from(!local));
-    if local && options.prefill_waves != 1 {
-        report.placement_supported = false;
-        report.hints.push(super::super::Hint { what: "Qwen local and dual prefill execute one whole-step wave".into(),
-            how: "Use --prefill-waves 1; continuous units require single-owner Spark experts.".into() });
-    }
+    let prefill = match resolve_prefill(report, options, report.spark_ranks,
+        crate::families::qwen4::prefill_limits(local)) {
+        Ok(shape) => shape,
+        Err(error) => return unsupported_prefill(report, error),
+    };
+    let shape = Shape::resolve(report, model, options, ShapePolicy::manifest_bounded());
+    report.prefill_span_rows = Some(prefill.span_rows);
     if options.rtx_bytes.len() == 2 && options.head_split && local {
         return dual_layout(report, model, input, options, shape.prefill_rows, shape.concurrency,
             shape.context_tokens, shape.native_layers > 0, shape.manifest.as_ref());

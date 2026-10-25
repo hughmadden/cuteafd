@@ -122,7 +122,7 @@ fn host_prefill_waves_keep_unit_scratch_and_independent_return_slots() {
         prefill_rows: 4096, ..Default::default() };
     report.prefill_transports = Some(1);
     for native in [false, true] {
-        for (unit, waves, span) in [(4096, 1, 4096), (4096, 2, 8192), (4096, 3, 16384), (4096, 2, 16384), (2048, 2, 16384), (4096, 2, 2048)] {
+        for (unit, waves, span) in [(4096, 1, 4096), (4096, 2, 8192), (2752, 3, 8256), (2048, 4, 8192), (2048, 2, 4096)] {
             options.prefill_rows = span;
             options.prefill_unit_rows = Some(unit);
             options.prefill_waves = waves;
@@ -148,6 +148,153 @@ fn host_prefill_waves_keep_unit_scratch_and_independent_return_slots() {
                 assert_eq!(bytes("staging/tables-and-sync"), (unit + 64) * geometry.hidden as u64 * 8 + (2 << 20));
                 assert_eq!(bytes("scoring/full-logits"), span * vocab * 4);
             }
+        }
+    }
+}
+
+fn shared_wave_snapshots() -> Vec<(&'static str, tempfile::TempDir)> {
+    let flash = glm5_flash_config(2);
+    let qwen = qwen4_config(4);
+    vec![
+        ("glm5", snapshot(glm5_config(), &glm5_tensors(|name, n, k| fp8(name, n, k, None)))),
+        ("glm5_flash", snapshot(flash.clone(), &glm5_flash_tensors(&flash))),
+        ("deepseek_v4", v4_snapshot()),
+        ("qwen4", snapshot(qwen.clone(), &qwen4_coordinator(&qwen, false))),
+    ]
+}
+
+fn wave_plan_options(path: &Path, ranks: usize) -> PlanOptions {
+    PlanOptions { layout: Some(layout::LayoutOptions {
+        rtx_bytes: vec![96 << 30], context_tokens: 32768, pool_tokens: Some(32768),
+        prefix_slots: Some(0), host_cache_bytes: Some(0),
+        host_memory: Some((128 << 30, 128 << 30)),
+        workspace_manifest: Some(path.join("absent.json")),
+        glm5_drafter_disabled: true, glmf_drafter_disabled: true,
+        ..Default::default()
+    }), attention_placement: Some(AttentionPlacement::Heads), ..sparks(ranks) }
+}
+
+#[test]
+fn shared_prefill_public_plan_family_by_spark_matrix() {
+    for (family, dir) in shared_wave_snapshots() {
+        for ranks in [0, 1, 2, 4, 5, 6, 8] {
+            let mut options = wave_plan_options(dir.path(), ranks);
+            let report = plan(dir.path(), &options).unwrap();
+            assert_eq!(report.family.as_deref(), Some(family));
+            let (unit, waves) = if family == "qwen4" && ranks >= 6 { (4096, 2) }
+                else { match ranks { 0 => (4096, 1), 1..=5 => (4096, 2), _ => (2752, 3) } };
+            // Header fixtures may independently lack kernels, rank divisibility,
+            // local experts or memory. Shape resolution does not imply fit.
+            assert_eq!((report.prefill_unit_rows, report.prefill_waves, report.prefill_span_rows),
+                (Some(unit), Some(waves), Some(unit * waves)), "{family} ranks={ranks}: {}", render(&report));
+            for (unit, waves) in [(1024, 1), (2048, 2), (2752, 3), (2048, 4)] {
+                let layout = options.layout.as_mut().unwrap();
+                layout.prefill_rows = unit;
+                layout.prefill_lanes = waves;
+                layout.prefill_span_rows = Some(unit * waves);
+                let report = plan(dir.path(), &options).unwrap();
+                let max_waves = if ranks == 0 { 1 } else if family == "qwen4" { 2 }
+                    else if family == "deepseek_v4" { 3 } else { 4 };
+                if waves > max_waves {
+                    assert!(!report.placement_supported, "{family} ranks={ranks}: {}", render(&report));
+                    assert!(report.hints.iter().any(|hint| hint.what.contains("unsupported prefill shape")),
+                        "{}", render(&report));
+                } else {
+                    assert_eq!((report.prefill_unit_rows, report.prefill_waves, report.prefill_span_rows),
+                        (Some(unit), Some(waves), Some(unit * waves)), "{family} ranks={ranks}: {}", render(&report));
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn shared_prefill_public_plan_rejects_invalid_shapes_and_mismatching_spans() {
+    for (family, dir) in shared_wave_snapshots() {
+        // These fail shape admission before unrelated fixture capability checks.
+        for (unit, waves, span, reason) in [
+            (4096, 3, None, "unsupported prefill shape"),
+            (4096, 4, None, "unsupported prefill shape"),
+            (65, 2, None, "unsupported prefill shape"),
+            (4160, 1, None, "unsupported prefill shape"),
+            (2048, 5, None, "unsupported prefill shape"),
+            (4096, 2, Some(4096), "unsupported prefill span"),
+            (4096, 2, Some(8256), "unsupported prefill span"),
+            (4096, 2, Some(16384), "unsupported prefill span"),
+        ] {
+            let mut options = wave_plan_options(dir.path(), 4);
+            let layout = options.layout.as_mut().unwrap();
+            layout.prefill_rows = unit;
+            layout.prefill_lanes = waves;
+            layout.prefill_span_rows = span;
+            let report = plan(dir.path(), &options).unwrap();
+            assert!(!report.placement_supported && !report.executable(), "{family}: {}", render(&report));
+            assert!(report.hints.iter().any(|hint| hint.what.contains(reason)), "{family}: {}", render(&report));
+            assert!(report.memory_layout.as_ref().unwrap().devices.is_empty(),
+                "invalid shapes must be refused before memory admission");
+        }
+        // The internal wave field is also an explicit pin, not just the CLI lane field.
+        let mut options = wave_plan_options(dir.path(), 4);
+        options.layout.as_mut().unwrap().prefill_waves = 2;
+        options.layout.as_mut().unwrap().prefill_unit_rows = Some(1024);
+        let report = plan(dir.path(), &options).unwrap();
+        assert_eq!((report.prefill_unit_rows, report.prefill_waves, report.prefill_span_rows),
+            (Some(1024), Some(2), Some(2048)), "{family}: {}", render(&report));
+    }
+}
+
+#[test]
+fn shared_prefill_public_plan_honors_a_real_manifest_unit_bound() {
+    for (family, dir) in shared_wave_snapshots() {
+        let manifest = dir.path().join("PROGRAMS.json");
+        std::fs::write(&manifest, r#"{"capacities":{"prefill_rows":2048}}"#).unwrap();
+        for unit in [1024, 2048, 4096] {
+            let mut options = wave_plan_options(dir.path(), 4);
+            let layout = options.layout.as_mut().unwrap();
+            layout.workspace_manifest = Some(manifest.clone());
+            layout.prefill_rows = unit;
+            layout.prefill_lanes = 2;
+            let report = plan(dir.path(), &options).unwrap();
+            if unit <= 2048 {
+                assert_eq!((report.prefill_unit_rows, report.prefill_waves, report.prefill_span_rows),
+                    (Some(unit), Some(2), Some(unit * 2)), "{family}: {}", render(&report));
+            } else {
+                assert!(!report.placement_supported, "{family}: {}", render(&report));
+                assert!(report.hints.iter().any(|hint| hint.what.contains("at most")
+                    && hint.what.contains("2048 rows")), "{family}: {}", render(&report));
+                assert!(report.memory_layout.as_ref().unwrap().devices.is_empty());
+            }
+        }
+    }
+}
+
+#[test]
+fn shared_prefill_reserve_refusals_are_typed() {
+    use crate::serving_capacity::prefill_waves::{prefill_shape, PrefillError, PrefillLimits, PrefillOverrides};
+    for waves in [3, 4] {
+        let error = prefill_shape(6, PrefillLimits::default(), PrefillOverrides {
+            unit_rows: Some(4096), waves: Some(waves), ..Default::default()
+        }).unwrap_err();
+        assert!(matches!(error, PrefillError::ReserveExceeded { unit_rows: 4096, waves: actual, .. } if actual == waves));
+    }
+    let error = prefill_shape(4, PrefillLimits { max_unit_rows: 2048, ..Default::default() },
+        PrefillOverrides { unit_rows: Some(4096), waves: Some(2), ..Default::default() }).unwrap_err();
+    assert!(matches!(error, PrefillError::ExecutorCapacity { unit_rows: 4096, max_unit_rows: 2048, .. }));
+}
+
+#[test]
+fn family_executor_prefill_markers_do_not_claim_shared_wave_ports() {
+    let v41 = tempfile::tempdir().unwrap();
+    write_v41_snapshot(v41.path());
+    let mimo = snapshot(mimo_flash_config(), &mimo_flash_tensors());
+    for (dir, marker) in [(v41, "#744"), (mimo, "#671 / #709")] {
+        for ranks in [0, 1, 2, 4, 5, 6, 8] {
+            let options = wave_plan_options(dir.path(), ranks);
+            let report = plan(dir.path(), &options).unwrap();
+            let rendered = render(&report);
+            assert!(rendered.contains("prefill shape: family executor"), "{rendered}");
+            assert!(rendered.contains(marker), "{rendered}");
+            assert!(!rendered.contains("prefill shape: 3 waves x 2752"), "{rendered}");
         }
     }
 }
@@ -178,7 +325,7 @@ fn qwen_local_and_dual_publish_whole_step_geometry_without_a_transport() {
     let config = qwen4_config(4);
     let dir = snapshot(config.clone(), &qwen4_coordinator(&config, false));
     let manifest = dir.path().join("programs.json");
-    std::fs::write(&manifest, r#"{"capacities":{"prefill_rows":2048}}"#).unwrap();
+    std::fs::write(&manifest, r#"{"capacities":{"prefill_rows":4096}}"#).unwrap();
     for gpus in [1, 2] {
         for (requested, expected) in [(0, 4096), (1024, 1024), (4096, 4096)] {
             let report = plan(dir.path(), &PlanOptions {
@@ -198,7 +345,7 @@ fn qwen_local_and_dual_publish_whole_step_geometry_without_a_transport() {
             placement: ExpertPlacement::Local, ..Default::default()
         }).unwrap();
         assert!(!report.placement_supported);
-        assert!(report.hints.iter().any(|hint| hint.what.contains("one whole-step wave")));
+        assert!(report.hints.iter().any(|hint| hint.what.contains("unsupported prefill shape")));
     }
 }
 
@@ -209,17 +356,17 @@ fn spark_host_layout_requires_explicit_family_unit_even_for_one_wave() {
     for native in [false, true] {
         for waves in [1, 2] {
             let mut report = input.plan(&sparks(4)).unwrap();
-            report.prefill_span_rows = Some(16384);
+            report.prefill_span_rows = Some(2048 * waves);
             let mut options = layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)),
                 host_cache_bytes: Some(0), prefill_rows: 4096, prefill_waves: waves, ..Default::default() };
             let error = layout::charge_host(&mut report, &options, input.checkpoint(), native).unwrap_err();
             assert!(error.to_string().contains("requires family-resolved prefill_unit_rows"), "{error:#}");
-            assert_eq!(report.prefill_span_rows, Some(16384));
+            assert_eq!(report.prefill_span_rows, Some(2048 * waves));
             options.prefill_unit_rows = Some(0);
             assert!(layout::charge_host(&mut report, &options, input.checkpoint(), native).is_err());
             options.prefill_unit_rows = Some(2048);
             layout::charge_host(&mut report, &options, input.checkpoint(), native).unwrap();
-            assert_eq!(report.prefill_span_rows, Some(16384));
+            assert_eq!(report.prefill_span_rows, Some(2048 * waves));
         }
     }
 }
@@ -782,7 +929,7 @@ fn glm5_layout_matches_runtime_request_from_header_baseline() {
         .flat_map(|cards| [None, Some(65536)].map(|pool| (cards.clone(), pool))) {
         for host_embedding in [false, true] {
             let options = layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)), rtx_bytes: cards.clone(), context_tokens: 65536,
-                pool_tokens: pool, prefill_rows: 4096, prefill_lanes: 3, host_embedding,
+                pool_tokens: pool, prefill_rows: 4096, prefill_lanes: 1, host_embedding,
                 glm5_drafter_disabled: true, ..Default::default() };
             // No manifest here: auto resolves context on two GPUs and now fails
             // closed without its programs (#202), so request heads explicitly.
@@ -790,9 +937,9 @@ fn glm5_layout_matches_runtime_request_from_header_baseline() {
                 attention_placement: Some(crate::placement::AttentionPlacement::Heads), ..Default::default() }).unwrap();
             assert!(report.executable(), "{}", render(&report));
             // The planner publishes the units serving runs: rows each, waves in
-            // flight (one without Sparks), and the default continuous span.
+            // flight, and exactly their admitted row extent.
             assert_eq!((report.prefill_unit_rows, report.prefill_waves, report.prefill_span_rows),
-                (Some(4096), Some(if report.spark_ranks == 0 { 1 } else { 3 }), Some(16384)));
+                (Some(4096), Some(1), Some(4096)));
             let memory = report.memory_layout.unwrap();
             let gpus = memory.devices.iter().filter(|d| d.kind == cuteafd_core::memory_layout::DeviceKind::Rtx)
                 .map(|d| (d.capacity_bytes, Baseline::Measured { free_bytes: d.capacity_bytes - d.items.iter()
@@ -810,7 +957,7 @@ fn glm5_layout_matches_runtime_request_from_header_baseline() {
             let inputs = glm::GlmInputs { cfg: &cfg, layers: cfg.layers, gpus,
                 headroom_bytes: options.headroom_bytes, spark_ranks: report.spark_ranks, native_experts: false, native_workspace: 0, native_dense: Vec::new(), skip_routed_experts: false,
                 prefill_rows: 4096,
-                prefill_lanes: 3, max_context: 65536, automatic_context: options.context_tokens == 0, scratch: None, drafter_bytes: 0,
+                prefill_lanes: 1, max_context: 65536, automatic_context: options.context_tokens == 0, scratch: None, drafter_bytes: 0,
                 drafter_staging: 0, pending_code: vec![], experts: vec![], expert_workspace: 0,
                 tp2_workspace: [0; 2], requested_pool: pool, onboard: Onboard::Auto,
                 full_prefill_logits: false, context: None };
@@ -821,7 +968,7 @@ fn glm5_layout_matches_runtime_request_from_header_baseline() {
             assert_eq!(pre, runtime);
             assert_eq!(pre_working, working);
             assert_eq!(working.spark.spark_ranks, report.spark_ranks);
-            assert_eq!(working.spark.prefill_lanes, 3);
+            assert_eq!(working.spark.prefill_lanes, 1);
             assert_eq!(memory.pool_tokens, runtime.pool_tokens);
             for (rank, items) in runtime.items.iter().enumerate() {
                 for item in items { assert!(memory.devices[rank].items.contains(item), "missing {item:?}"); }
@@ -831,7 +978,7 @@ fn glm5_layout_matches_runtime_request_from_header_baseline() {
 }
 
 #[test]
-fn glm5_layout_publishes_an_explicit_span_without_charging_it() {
+fn glm5_layout_explicit_span_matches_the_admitted_shape() {
     let dir = snapshot(glm5_config(), &glm5_tensors(|name, n, k| fp8(name, n, k, None)));
     let plan_with = |span| {
         let options = layout::LayoutOptions { rtx_bytes: vec![96 << 30], context_tokens: 65536,
@@ -841,11 +988,11 @@ fn glm5_layout_publishes_an_explicit_span_without_charging_it() {
             attention_placement: Some(crate::placement::AttentionPlacement::Heads), ..sparks(4) }).unwrap()
     };
     let (default, explicit) = (plan_with(None), plan_with(Some(8192)));
-    assert_eq!(default.prefill_span_rows, Some(16384));
+    assert_eq!(default.prefill_span_rows, Some(8192));
     assert_eq!((explicit.prefill_unit_rows, explicit.prefill_waves, explicit.prefill_span_rows),
         (Some(4096), Some(2), Some(8192)));
     assert_eq!(default.memory_layout.unwrap().pool_tokens, explicit.memory_layout.unwrap().pool_tokens,
-        "workspaces are per unit slot; the span charges nothing");
+        "an explicit matching span must preserve admission");
 }
 
 #[test]
@@ -1673,42 +1820,34 @@ fn deepseek_v4_plan_reads_the_runtime_config_source() {
 }
 
 #[test]
-fn v4_plan_shared_span_is_independent_of_unit_rows_and_waves() {
+fn v4_plan_shared_span_matches_unit_rows_and_waves() {
     let dir = v4_snapshot();
-    for unit in [2048, 4096] {
-        for waves in [1, 2, 3] {
-            let reports: Vec<_> = [None, Some(2048), Some(32768)].into_iter().map(|span| {
-                let report = plan(dir.path(), &PlanOptions { layout: Some(layout::LayoutOptions {
-                    host_memory: Some((128 << 30, 128 << 30)), host_cache_bytes: Some(0),
-                    prefill_rows: unit, prefill_unit_rows: Some(unit), prefill_waves: waves,
-                    prefill_span_rows: span, pool_tokens: Some(32768), ..Default::default()
-                }), ..sparks(4) }).unwrap();
-                assert_eq!(report.prefill_span_rows, Some(span.unwrap_or(16384)));
-                assert_eq!(report.prefill_unit_rows, Some(unit));
-                assert_eq!(report.prefill_waves, Some(waves));
-                report
-            }).collect();
-            let device_items = |report: &PlanReport| report.memory_layout.as_ref().unwrap().devices.iter()
-                .map(|device| device.items.iter().map(|item| (item.group.clone(), item.bytes)).collect::<Vec<_>>())
-                .collect::<Vec<_>>();
-            assert_eq!(device_items(&reports[0]), device_items(&reports[1]));
-            assert_eq!(device_items(&reports[0]), device_items(&reports[2]));
-        }
+    for (unit, waves) in [(2048, 1), (2048, 2), (2048, 3), (4096, 1), (4096, 2), (2752, 3)] {
+        let reports: Vec<_> = [None, Some(unit * waves)].into_iter().map(|span| {
+            let report = plan(dir.path(), &PlanOptions { layout: Some(layout::LayoutOptions {
+                host_memory: Some((128 << 30, 128 << 30)), host_cache_bytes: Some(0),
+                prefill_rows: unit, prefill_unit_rows: Some(unit), prefill_lanes: waves,
+                prefill_span_rows: span, pool_tokens: Some(32768), ..Default::default()
+            }), ..sparks(4) }).unwrap();
+            assert_eq!((report.prefill_unit_rows, report.prefill_waves, report.prefill_span_rows),
+                (Some(unit), Some(waves), Some(unit * waves)));
+            report
+        }).collect();
+        assert_eq!(reports[0].memory_layout, reports[1].memory_layout);
     }
 }
 
 #[test]
 fn v4_plan_resolves_serving_wave_default_and_explicit_requests() {
     let dir = v4_snapshot();
-    for (requested, expected) in [(0, 2), (1, 1), (2, 2), (3, 3)] {
+    for (requested, expected, unit) in [(0, 2, 4096), (1, 1, 4096), (2, 2, 4096), (3, 3, 2752)] {
         let report = plan(dir.path(), &PlanOptions { layout: Some(layout::LayoutOptions {
             host_memory: Some((128 << 30, 128 << 30)), host_cache_bytes: Some(0),
             prefill_lanes: requested, prefill_waves: requested.max(1),
             pool_tokens: Some(32768), ..Default::default()
         }), ..sparks(4) }).unwrap();
-        assert_eq!(report.prefill_unit_rows, Some(4096));
-        assert_eq!(report.prefill_waves, Some(expected));
-        assert_eq!(report.prefill_span_rows, Some(16384));
+        assert_eq!((report.prefill_unit_rows, report.prefill_waves, report.prefill_span_rows),
+            (Some(unit), Some(expected), Some(unit * expected)));
     }
 }
 
@@ -2118,7 +2257,9 @@ fn glm5_flash_layout_charges_the_engine_step_workspaces_and_headroom() {
     let allowance = 268 * (1 << 30) / 100;
     assert_eq!(steps(2, 4096), allowance);
     assert_eq!(steps(4, 2048), allowance);
-    assert_eq!(steps(4, 4096), 2 * allowance);
+    let refused = plan(dir.path(), &options(4, 4096)).unwrap();
+    assert!(!refused.placement_supported);
+    assert!(refused.hints.iter().any(|hint| hint.what.contains("live-slot reserve")));
     // A graph budget replaces the graph allowance, as the engine's admission reserves it.
     let mut budgeted = options(2, 4096);
     budgeted.layout.as_mut().unwrap().graph_budget_bytes = Some(512 << 20);
@@ -2179,15 +2320,16 @@ fn glm5_flash_selected_working_set_drives_plan_request_and_runtime_buffers() {
     let shape = GlmfStepShape { lead: true, split: true, local_experts: false, tp2_experts: true,
         spark: true, partial_bytes: 2, output_shard: false, full_prefill_logits: false,
         table_pages, table_pool_pages };
-    // Configured peers with all RTX, mixed, all Spark, then the zero-peer CLI default of two lanes.
+    // Configured peers with all RTX, mixed, all Spark, then the serial zero-peer deployment.
     // Heads is requested: a two-GPU build whose manifest lacks the context programs refuses
     // `context` (the default there, #202), and this fixture plans heads' working set.
     for (peers, onboard, expected_rtx) in [(4, Onboard::Auto, 3), (4, Onboard::Layers(1), 1),
         (4, Onboard::Layers(0), 0), (0, Onboard::Auto, 3)] {
+        let lanes = if expected_rtx == 3 { 1 } else { 2 };
         let options = PlanOptions { layout: Some(layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)),
             rtx_bytes: vec![placement::inventory::PRO_TOTAL_BYTES; 2], head_split: true,
             context_tokens: 262144, pool_tokens: Some(2 << 20), onboard: Some(onboard),
-            prefill_rows: 4096, prefill_lanes: 2, state_slots: Some(8), prefix_slots: Some(8),
+            prefill_rows: 4096, prefill_lanes: lanes, state_slots: Some(8), prefix_slots: Some(8),
             glmf_drafter_disabled: true, glmf_prefill_expanded: false,
             glmf_representation: resident::GlmfRepresentation { kda_fp8: false, fp8_head: false, output_shard: false },
             graph_budget_bytes: Some(64 << 20),
@@ -2201,13 +2343,13 @@ fn glm5_flash_selected_working_set_drives_plan_request_and_runtime_buffers() {
                 context_bytes: placement::ArchContext::coordinator(total, None).context_bytes
                     + placement::loaded_code("glmf", "fp8", true, rank as u8).unwrap().bytes,
                 loaded_bytes: 0 })).collect(), pending_code: vec![0; 2], headroom_bytes: opts.headroom_bytes,
-            spark_ranks: peers, prefill_lanes: 2, prefill_rows: 4096, decode_rows: 64, partial_bytes: 2,
+            spark_ranks: peers, prefill_lanes: lanes, prefill_rows: 4096, decode_rows: 64, partial_bytes: 2,
             max_context: 262144, sequences: 8, speculation: false, state_slots: 8, mark_slots: 8,
             pool_marks: false, index: opts.glmf_index, kda_state_bytes: 4, shared_replay: false,
             representation: opts.glmf_representation,
             resident: resident::resident_weights(&checkpoint, &cfg, cfg.layers, 2, opts.glmf_representation).unwrap(),
-            workspace: glmf::step_workspace_demands(&cfg, 2, 4096, 64, shape, decode, prefill),
-            local_workspace: glmf::step_workspace_demands(&cfg, 2, 4096, 64,
+            workspace: glmf::step_workspace_demands(&cfg, lanes as usize, 4096, 64, shape, decode, prefill),
+            local_workspace: glmf::step_workspace_demands(&cfg, lanes as usize, 4096, 64,
                 GlmfStepShape { spark: false, ..shape }, decode, prefill),
             graphs: placement::GraphSet::budget(&[64 << 20; 2]), experts: glmf::expert_costs(&catalog, true).unwrap(),
             expert_workspace: 0, tp2_workspace: [glmf::expert_workspace(&catalog, Some(&path), 4096, 2).unwrap(); 2],
@@ -2217,7 +2359,7 @@ fn glm5_flash_selected_working_set_drives_plan_request_and_runtime_buffers() {
         assert_eq!(working.rtx_layers.len(), expected_rtx);
         assert_eq!(placed.onboard_layers, expected_rtx);
         let spark = !working.spark_layers.is_empty();
-        assert_eq!((working.spark_ranks, working.prefill_lanes), if spark { (4, 2) } else { (0, 2) });
+        assert_eq!((working.spark_ranks, working.prefill_lanes), if spark { (4, lanes) } else { (0, lanes) });
         let mut admitted = input.clone();
         admitted.graphs = graphs;
         let request = glmf::request_for_working_set(&admitted, &working).unwrap();

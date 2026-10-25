@@ -28,7 +28,8 @@ fn installed_inventory(root: &std::path::Path, spark: bool) -> std::path::PathBu
 #[test]
 fn planner_publishes_kimi_runtime_default_and_explicit_units() {
     let dir = snapshot(true);
-    for (unit, waves, expected) in [(0, 0, (2048, 2, 4096)), (1024, 2, (1024, 2, 2048)), (4096, 1, (4096, 1, 4096))] {
+    for (unit, waves, expected) in [(0, 0, (2752, 3, 8256)), (1024, 2, (1024, 2, 2048)),
+        (4096, 1, (4096, 1, 4096)), (0, 4, (2048, 4, 8192)), (4096, 2, (4096, 2, 8192))] {
         let mut options = with_layout(6, None);
         let layout = options.layout.as_mut().unwrap();
         layout.prefill_rows = unit;
@@ -37,6 +38,23 @@ fn planner_publishes_kimi_runtime_default_and_explicit_units() {
         let report = plan::plan(dir.path(), &options).unwrap();
         assert_eq!((report.prefill_unit_rows.unwrap(), report.prefill_waves.unwrap(), report.prefill_span_rows.unwrap()), expected);
         assert_eq!(report.prefill_transports, Some(1));
+    }
+}
+
+#[test]
+fn planner_refuses_shapes_outside_shared_live_reserve() {
+    let dir = snapshot(true);
+    for (unit, waves, span) in [(4096, 4, None), (4096, 3, None), (2753, 3, None),
+        (2752, 3, Some(8192)), (2752, 3, Some(16384))] {
+        let mut options = with_layout(6, None);
+        let layout = options.layout.as_mut().unwrap();
+        layout.prefill_rows = unit;
+        layout.prefill_lanes = waves;
+        layout.prefill_span_rows = span;
+        let report = plan::plan(dir.path(), &options).unwrap();
+        assert!(!report.fits && !report.placement_supported);
+        assert!(report.hints.iter().any(|hint| hint.what.contains("prefill unsupported")), "{:?}", report.hints);
+        assert!(report.memory_layout.unwrap().devices.is_empty());
     }
 }
 

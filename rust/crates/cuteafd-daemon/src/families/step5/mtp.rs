@@ -573,17 +573,24 @@ impl<'a> Runtime<'a> {
 
     fn catch_up(&self, cache: &super::cache::CacheRank<'a>, sequence: u64,
         start: usize, tokens: &[u32], embedding: &crate::shared::token_io::TokenEmbedding<'a>) -> Result<()> {
-        let end = start.checked_add(tokens.len()).context("Step-5 teacher token extent")?;
-        let mut retained = self.tokens.borrow_mut();
-        let known = &mut retained[sequence as usize];
-        known.retain(|&(position, _)| position < start);
-        known.extend(tokens.iter().copied().enumerate().map(|(i, token)| (start + i, token)));
-        for (stage, owner) in self.stages.borrow_mut().iter_mut().enumerate() {
-            let base = cache.predictor_frontier(sequence, stage)? as usize;
-            let selected = teacher_tokens(stage, base, start, end, owner.rows, known)?;
-            if !selected.is_empty() { owner.teacher(cache, sequence, base as u64, &selected, embedding)?; }
+        let capacity = self.stages.borrow().iter().map(|owner| owner.rows).min()
+            .context("Step-5 teacher has no predictor stages")?;
+        // A target span may contain several units. Predictor hooks stay within
+        // the same admitted per-unit workspace and publish canonical frontiers.
+        for (index, chunk) in tokens.chunks(capacity).enumerate() {
+            let start = start.checked_add(index * capacity).context("Step-5 teacher chunk extent")?;
+            let end = start.checked_add(chunk.len()).context("Step-5 teacher token extent")?;
+            let mut retained = self.tokens.borrow_mut();
+            let known = &mut retained[sequence as usize];
+            known.retain(|&(position, _)| position < start);
+            known.extend(chunk.iter().copied().enumerate().map(|(i, token)| (start + i, token)));
+            for (stage, owner) in self.stages.borrow_mut().iter_mut().enumerate() {
+                let base = cache.predictor_frontier(sequence, stage)? as usize;
+                let selected = teacher_tokens(stage, base, start, end, owner.rows, known)?;
+                if !selected.is_empty() { owner.teacher(cache, sequence, base as u64, &selected, embedding)?; }
+            }
+            known.retain(|&(position, _)| position >= end.saturating_sub(4));
         }
-        known.retain(|&(position, _)| position >= end.saturating_sub(4));
         Ok(())
     }
 
@@ -683,6 +690,29 @@ mod tests {
         }
         assert!(teacher_tokens(0, 7, 8, 10, 1, &[(8, 1), (9, 2)]).is_err());
         assert!(teacher_tokens(1, 6, 8, 10, 4, &[(9, 2)]).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn adaptive_span_teacher_chunks_preserve_exact_canonical_tokens() -> Result<()> {
+        for (unit, waves) in [(4096, 2), (2752, 3), (2048, 4)] {
+            for start in [0usize, 1, 3, 511, 8256] {
+                for stage in 0..3 {
+                    let end = start + unit * waves;
+                    let known = (start..end).map(|p| (p, p as u32)).collect::<Vec<_>>();
+                    let mut base = start.saturating_sub(stage + 1);
+                    let mut tokens = Vec::new();
+                    for offset in (0..unit * waves).step_by(unit) {
+                        let first = start + offset;
+                        let selected = teacher_tokens(stage, base, first, first + unit, unit, &known)?;
+                        base += selected.len();
+                        tokens.extend(selected);
+                    }
+                    assert_eq!(base, end.saturating_sub(stage + 1));
+                    assert_eq!(tokens, (start.max(stage + 1)..end).map(|p| p as u32).collect::<Vec<_>>());
+                }
+            }
+        }
         Ok(())
     }
 

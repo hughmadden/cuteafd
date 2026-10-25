@@ -14,7 +14,7 @@ fn spark_model(capacity: u32, compiled_capacity: u32, bf16: bool)
         rings: crate::shared::placement::spark_rings(64 << 20)?,
         // Both lanes' waves (decode rounds, or prefill's two encoder streams)
         // are in flight to a rank at once.
-        execution_slots: cuteafd_loader::plan::layout::spark_execution_slots("deepseek_v41", 1, 2)
+        execution_slots: cuteafd_loader::plan::layout::spark_execution_slots("deepseek_v41", 1, 2)?
     };
     model.validate(cuteafd_core::ExpertGeometry::DEEPSEEK_V41)?;
     Ok(model)

@@ -213,7 +213,7 @@ fn full_context_mtp_forecast_charges_private_predictors_before_allocation() -> a
                     .expect("native charge").bytes;
                 assert_eq!(item("Step-5 native target and head"), target.immutable + if rank == 0 { weights } else { 0 });
                 let workspace = if rank == 0 {
-                    target.workspace.max(native::mtp_forecast_workspace(inputs.rows, depth, kv_format)?)
+                    target.workspace.max(native::mtp_forecast_workspace(inputs.unit_rows(), depth, kv_format)?)
                 } else { target.workspace };
                 assert_eq!(item("Step-5 native workspace"), workspace);
                 assert_eq!(item("Step-5 exact retained marks"), admitted.reservations[rank].marks as u64);
@@ -225,7 +225,7 @@ fn full_context_mtp_forecast_charges_private_predictors_before_allocation() -> a
                 layout: Some(layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)),
                     rtx_bytes: vec![capacity; 2], pool_tokens: inputs.requested_pool, step5_kv: kv_format,
                     context_tokens: inputs.context, concurrency: inputs.sequences as u64,
-                    prefill_rows: inputs.rows as u64, prefill_lanes: inputs.waves as u64, headroom_bytes: 1 << 30,
+                    prefill_rows: inputs.unit_rows() as u64, prefill_lanes: inputs.waves as u64, headroom_bytes: 1 << 30,
                     native_mtp_layers: depth, workspace_manifest: Some(manifest_path.clone()),
                     mimo_prefix_entries: inputs.marks.entries as u64,
                     mimo_prefix_mark_bytes: inputs.marks.budget_bytes,
@@ -775,7 +775,8 @@ fn nvfp4_min_card_admits_native_w4a4_and_bf16_root_stays_reference_only() {
         assert!(memory.devices.iter().all(|d| d.used_bytes() <= d.capacity_bytes));
         // The endpoint holds the planner's whole intake span.
         let rows = result.prefill_unit_rows.expect("planned prefill unit rows");
-        assert!([2048, 1024, 512].contains(&rows), "{rows}");
+        assert_eq!(rows, 4096);
+        assert_eq!(result.prefill_waves, Some(2));
         let span = result.prefill_span_rows.expect("planned prefill span rows");
         assert_eq!(span, rows * result.prefill_waves.expect("planned prefill waves"));
         let endpoint = cuteafd_core::SparkEndpoint { ring_depth: None, capacity: span as u32, ingress: cuteafd_core::SparkIngress::Bf16 };
@@ -1226,3 +1227,33 @@ fn shared_ffn_region_keeps_replicated_replies_apart() {
     }
 }
 
+
+#[test]
+fn adaptive_prefill_selection_preserves_overrides_and_never_retries_on_capacity() {
+    for (kind, gpus, sparks, default_unit, default_waves) in [
+        ("nvfp4", 1, 4, 4096, 2), ("fp8", 2, 6, 2752, 3),
+    ] {
+        let snapshot = snapshot(kind);
+        let manifest = native_manifest(snapshot.path());
+        for (unit, waves) in [(0, 0), (512, 1), (1024, 4), (2048, 4)] {
+            let expected_unit = if unit == 0 { default_unit } else { unit };
+            let expected_waves = if waves == 0 { default_waves } else { waves };
+            let report = plan::plan(snapshot.path(), &PlanOptions {
+                placement: ExpertPlacement::from_spark_ranks(sparks),
+                draft_ownership: Some(spec::DraftOwnership::None),
+                layout: Some(layout::LayoutOptions {
+                    // The fixed shape must remain visible even when memory cannot admit it.
+                    rtx_bytes: vec![33 << 30; gpus],
+                    prefill_rows: unit, prefill_lanes: waves,
+                    host_memory: Some((128 << 30, 128 << 30)),
+                    workspace_manifest: Some(manifest.clone()),
+                    ..Default::default()
+                }), ..Default::default()
+            }).unwrap();
+            assert!(!report.wip_launchable(), "a 33 GiB coordinator cannot hold Step-5");
+            assert_eq!(report.prefill_unit_rows, Some(expected_unit));
+            assert_eq!(report.prefill_waves, Some(expected_waves));
+            assert_eq!(report.prefill_span_rows, Some(expected_unit * expected_waves));
+        }
+    }
+}

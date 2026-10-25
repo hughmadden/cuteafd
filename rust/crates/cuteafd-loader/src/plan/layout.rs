@@ -262,22 +262,12 @@ impl Default for LayoutOptions {
     }
 }
 
-/// GLM prefill units in flight: the default (None) or a parsed value, clamped
-/// to 1..=4. Default: 2 units of 4096 rows (PLAN "Prefill contract"); serve-glm
-/// takes `--prefill-waves`, the planner `--prefill-lanes`.
-pub const GLM_DEFAULT_PREFILL_SPAN_ROWS: u64 = 16384;
-
-pub fn glm_prefill_lanes(value: Option<&str>) -> usize {
-    value.and_then(|v| v.parse().ok()).unwrap_or(2).clamp(1, 4)
-}
-
 /// Additional lead-GPU output bytes for admitted all-row fidelity probes.
-/// GLM uses its default waves (a planner `--prefill-lanes` selects others); GLM Flash's lanes (a serial prefill runs in
-/// the first) share one set of temporaries and so one logits buffer.
+/// GLM callers with multiple admitted units use the explicit-lane variant;
+/// GLM Flash's units share one set of temporaries and one logits buffer.
 /// V4 reuses its bounded head buffer; V4.1 already supports prefill scoring.
 pub fn full_prefill_logits_bytes(family: &str, rows: u64, vocab: u64) -> u64 {
-    let lanes = glm_prefill_lanes(None);
-    full_prefill_logits_bytes_with_lanes(family, rows, vocab, lanes)
+    full_prefill_logits_bytes_with_lanes(family, rows, vocab, 1)
 }
 
 pub fn full_prefill_logits_bytes_with_lanes(family: &str, rows: u64, vocab: u64, glm_lanes: usize) -> u64 {
@@ -290,8 +280,10 @@ pub fn full_prefill_logits_bytes_with_lanes(family: &str, rows: u64, vocab: u64,
     };
     let extra_rows = rows.saturating_sub(ordinary_rows);
     let logits = extra_rows.saturating_mul(lanes).saturating_mul(vocab).saturating_mul(4);
-    // Qwen's output workspace also owns one argmax and selection pair per row.
-    logits.saturating_add(if family == "qwen4" { extra_rows.saturating_mul(16) } else { 0 })
+    // Both Qwen selection arrays have a 256-byte allocation floor already
+    // charged for the ordinary one-row head.
+    let selection = rows.saturating_mul(8).max(256).saturating_sub(256).saturating_mul(2);
+    logits.saturating_add(if family == "qwen4" { selection } else { 0 })
 }
 
 #[cfg(test)]
@@ -312,16 +304,14 @@ mod scoring_workspace_tests {
     fn full_rows_are_opt_in_and_reserve_the_family_output_delta() {
         assert!(!LayoutOptions::default().full_prefill_logits);
         assert_eq!(full_prefill_logits_bytes("mimo_v2", 128, 1000), 127 * 1000 * 4);
-        assert_eq!(full_prefill_logits_bytes("qwen4", 128, 1000), 127 * (1000 * 4 + 16));
-        assert_eq!(glm_prefill_lanes(None), 2);
+        assert_eq!(full_prefill_logits_bytes("qwen4", 128, 1000), 509_536);
+        for (rows, selection) in [(1, 0), (16, 0), (32, 0), (33, 16)] {
+            assert_eq!(full_prefill_logits_bytes("qwen4", rows, 1000), (rows - 1) * 4000 + selection);
+        }
         for lanes in 1..=4 {
-            assert_eq!(glm_prefill_lanes(Some(&lanes.to_string())), lanes);
             assert_eq!(full_prefill_logits_bytes_with_lanes("glm5", 128, 1000, lanes),
                 lanes as u64 * 64 * 1000 * 4);
         }
-        assert_eq!(glm_prefill_lanes(Some("0")), 1);
-        assert_eq!(glm_prefill_lanes(Some("9")), 4);
-        assert_eq!(glm_prefill_lanes(Some("invalid")), 2);
         assert_eq!(full_prefill_logits_bytes("glm5_flash", 128, 1000), 64 * 1000 * 4);
         for family in ["deepseek_v4", "deepseek_v41"] {
             assert_eq!(full_prefill_logits_bytes(family, 2048, 1000), 0);
@@ -353,16 +343,19 @@ pub fn spark_endpoints(family: &str, lanes: u64) -> usize {
 /// coordinator keeps in flight to one rank. Prefill waves and decode lanes
 /// never share a rank at once (each family's scheduler stops decode for
 /// admission), so the bound is the larger of the two, not their sum.
-pub fn spark_execution_slots(family: &str, prefill_waves: u64, decode_lanes: u8) -> u8 {
+pub fn spark_execution_slots(family: &str, prefill_waves: u64, decode_lanes: u8) -> Result<u8, crate::placement::PlacementError> {
     let prefill = match family {
         // V4.1's two transports carry both prefill encoder streams at once.
         "deepseek_v41" => 2,
-        "glm5" | "glm5_flash" | "mimo_v2" | "kimi_k3" => prefill_waves.max(1),
+        "glm5" | "glm5_flash" | "mimo_v2" | "kimi_k3" | "deepseek_v4" | "qwen4" | "step5" => prefill_waves,
         _ => 1,
     };
     let decode = u64::from(decode_lanes.max(1));
-    u8::try_from(prefill.max(decode).min(u64::from(cuteafd_core::expert_geometry::MAX_SPARK_EXECUTION_SLOTS)))
-        .unwrap_or(cuteafd_core::expert_geometry::MAX_SPARK_EXECUTION_SLOTS)
+    let slots = prefill.max(decode);
+    if prefill == 0 || slots > u64::from(cuteafd_core::expert_geometry::MAX_SPARK_EXECUTION_SLOTS) {
+        return Err(crate::placement::PlacementError::Inventory("Spark execution slots exceed executor capability"));
+    }
+    u8::try_from(slots).map_err(|_| crate::placement::PlacementError::Overflow("Spark execution slots"))
 }
 
 /// Device bytes of one Spark execution slot (stream, scratch, inputs and
@@ -465,13 +458,15 @@ mod selected_spark_io_tests {
 
     #[test]
     fn execution_slots_follow_admitted_waves_and_lanes_and_charge_their_unit_size() {
-        assert_eq!(spark_execution_slots("glm5", 2, 1), 2);
-        assert_eq!(spark_execution_slots("glm5", 4, 1), 4);
-        assert_eq!(spark_execution_slots("mimo_v2", 3, 2), 3);
-        assert_eq!(spark_execution_slots("mimo_v2", 1, 2), 2);
-        assert_eq!(spark_execution_slots("deepseek_v41", 1, 2), 2);
-        assert_eq!(spark_execution_slots("qwen4", 1, 1), 1);
-        assert_eq!(spark_execution_slots("glm5", 9, 1), cuteafd_core::expert_geometry::MAX_SPARK_EXECUTION_SLOTS);
+        assert_eq!(spark_execution_slots("glm5", 2, 1).unwrap(), 2);
+        assert_eq!(spark_execution_slots("glm5", 4, 1).unwrap(), 4);
+        assert_eq!(spark_execution_slots("mimo_v2", 3, 2).unwrap(), 3);
+        assert_eq!(spark_execution_slots("mimo_v2", 1, 2).unwrap(), 2);
+        assert_eq!(spark_execution_slots("deepseek_v41", 1, 2).unwrap(), 2);
+        assert_eq!(spark_execution_slots("qwen4", 1, 1).unwrap(), 1);
+        assert!(spark_execution_slots("glm5", 9, 1).is_err());
+        assert!(spark_execution_slots("qwen4", 0, 1).is_err());
+        assert_eq!(spark_execution_slots("deepseek_v4", 3, 1).unwrap(), 3);
         // A smaller unit with more waves costs more, smaller slots (no hard-wired 4096 x 2).
         assert_eq!(spark_slot_bytes("glm5", 2048) * 2, spark_slot_bytes("glm5", 4096));
         let working = SparkWorkingSet { spark_layers: vec![3], spark_ranks: 4, prefill_lanes: 2, ..Default::default() };
@@ -507,9 +502,8 @@ mod selected_spark_io_tests {
             charge_spark_io(&mut device, &working, geometry, 4096, true, rings, wave).unwrap();
             assert!(device.items.is_empty());
         }
-        let glm = crate::placement::families::glm5::prefill_lanes(4, glm_prefill_lanes(None) as u64);
-        assert_eq!(spark_endpoints("glm5", glm), 2);
-        assert_eq!(spark_endpoints("glm5", crate::placement::families::glm5::prefill_lanes(0, 3)), 1);
+        assert_eq!(spark_endpoints("glm5", crate::serving_capacity::prefill_waves::planned_waves(4)), 2);
+        assert_eq!(spark_endpoints("glm5", crate::serving_capacity::prefill_waves::planned_waves(0)), 1);
     }
 }
 
@@ -618,6 +612,48 @@ pub enum ContextPolicy {
     ManifestBounded,
 }
 
+pub(crate) fn unsupported_prefill(report: &mut PlanReport, error: anyhow::Error) -> MemoryLayout {
+    report.fits = false;
+    report.placement_supported = false;
+    report.hints.push(crate::plan::Hint { what: format!("prefill unsupported: {error:#}"),
+        how: "Use a supported explicit prefill shape or add the missing executor/kernel capacity.".into() });
+    MemoryLayout { devices: vec![], pool_tokens: 0, waste: vec![], notes: vec![error.to_string()] }
+}
+
+/// Resolve the shared topology policy before family memory admission. Resolved
+/// fields are written back once and then consumed by workspace and transport
+/// ledgers; the manifest's arena capacity is never an implicit row override.
+pub fn resolve_prefill(report: &mut PlanReport, options: &mut LayoutOptions,
+    spark_ranks: usize, mut limits: crate::serving_capacity::prefill_waves::PrefillLimits)
+    -> anyhow::Result<crate::serving_capacity::prefill_waves::PrefillPlan> {
+    use crate::serving_capacity::prefill_waves::{prefill_shape, PrefillOverrides};
+    let manifest_path = options.workspace_manifest.as_deref()
+        .unwrap_or_else(|| std::path::Path::new("/opt/cuteafd/share/PROGRAMS.json"));
+    if manifest_path.is_file() {
+        let manifest: serde_json::Value = serde_json::from_slice(&std::fs::read(manifest_path)?)?;
+        if let Some(rows) = manifest["capacities"]["prefill_rows"].as_u64() {
+            limits.max_unit_rows = limits.max_unit_rows.min(rows);
+        }
+    }
+    let waves = if options.prefill_lanes > 0 { Some(options.prefill_lanes) }
+        else if options.prefill_waves > 1 { Some(options.prefill_waves) } else { None };
+    let unit_rows = (options.prefill_rows > 0).then_some(options.prefill_rows)
+        .or(options.prefill_unit_rows);
+    let shape = prefill_shape(spark_ranks, limits, PrefillOverrides {
+        unit_rows, waves, span_rows: options.prefill_span_rows,
+    })?;
+    options.prefill_rows = shape.unit_rows;
+    options.prefill_unit_rows = Some(shape.unit_rows);
+    options.prefill_lanes = shape.waves;
+    options.prefill_waves = shape.waves;
+    options.spark_capacity_rows = shape.unit_rows;
+    report.prefill_unit_rows = Some(shape.unit_rows);
+    report.prefill_waves = Some(shape.waves);
+    report.prefill_span_rows = Some(shape.span_rows);
+    report.prefill_transports = Some(u64::from(spark_ranks > 0));
+    Ok(shape)
+}
+
 /// How a family resolves the step shape from the options and its manifest.
 #[derive(Debug, Clone, Copy)]
 pub struct ShapePolicy {
@@ -671,11 +707,6 @@ impl Shape {
             else if let Some(rows) = policy.prefill_rows { rows }
             else { manifest.as_ref().and_then(|m| m["capacities"]["prefill_rows"].as_u64()).unwrap_or(4096) };
         report.prefill_span_rows = Some(prefill_rows);
-        // Legacy one-wave adapters use their resolved step as the unit.
-        // Continuous adapters must supply their actual unit before host admission.
-        if options.prefill_waves == 1 && options.prefill_unit_rows.is_none() {
-            options.prefill_unit_rows = Some(prefill_rows);
-        }
         let decode_rows = manifest.as_ref().and_then(|m| m["capacities"]["decode_rows"].as_u64()).unwrap_or(64);
         let concurrency = if options.concurrency > 0 { options.concurrency }
             else { cuteafd_core::serving_capacity::default_concurrency(options.rtx_bytes.first().copied().unwrap_or(0)) };
@@ -868,9 +899,12 @@ pub(crate) fn charge_spark_devices(report: &mut PlanReport, model: &dyn super::F
         }
         let family = report.family.as_deref().unwrap_or_default();
         // The native EXLR8 Spark backend serves one execution slot.
-        let slots = if crate::plan::exlr8::recognizes(&checkpoint.snapshot).unwrap_or(false) { 1 }
-            else { spark_execution_slots(family, working.prefill_lanes, options.decode_lanes) };
-        charge_spark_slots(device, working, family, slots, options.spark_capacity_rows);
+        let slots = if crate::plan::exlr8::recognizes(&checkpoint.snapshot).unwrap_or(false) { Ok(1) }
+            else { spark_execution_slots(family, options.prefill_waves, options.decode_lanes) };
+        match slots {
+            Ok(slots) => charge_spark_slots(device, working, family, slots, options.spark_capacity_rows),
+            Err(error) => { report.placement_supported = false; notes.push(format!("{}: {error}", what(device))); }
+        }
     }
 }
 
@@ -1292,10 +1326,7 @@ pub(crate) fn charge_host(report: &mut PlanReport, options: &LayoutOptions, chec
     let lanes = match report.prefill_transports {
         Some(transports) => transports,
         None => match family {
-            "glm5" => if options.prefill_lanes > 0 { options.prefill_lanes } else {
-                glm_prefill_lanes(None) as u64 },
-            "glm5_flash" => if options.prefill_lanes > 0 { options.prefill_lanes }
-                else { crate::serving_capacity::GLMF_DEFAULT_PREFILL_LANES },
+            "glm5" | "glm5_flash" => u64::from(ranks > 0),
             "mimo_v2" => {
                 let cfg = crate::families::mimo_v2::MimoV2Config::from_hf(&checkpoint.config)?;
                 let configured = if options.prefill_lanes > 0 { Some(options.prefill_lanes.to_string()) }

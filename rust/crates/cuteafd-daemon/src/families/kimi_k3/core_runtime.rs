@@ -346,7 +346,7 @@ mod runtime_layout_tests {
         let metadata=serde_json::json!({"abi_version":1,"row_policies":policies});
         let manifest=serde_json::json!({"programs":programs,"families":{"kimi_k6_dense":metadata}});
         // `rows` lane rows of `unit`-row units: one-unit lanes and the 4096 x 2 lane.
-        for (rows,unit) in [(1,1),(16,16),(63,63),(64,64),(4096,4096),(8192,4096)] {
+        for (rows,unit) in [(1,1),(16,16),(63,63),(64,64),(4096,4096),(8192,4096),(8256,2752),(8192,2048)] {
             for on in [false,true] {
                 let empty=CoreInventory::default();
                 let core=if on {&inventory}else{&empty};

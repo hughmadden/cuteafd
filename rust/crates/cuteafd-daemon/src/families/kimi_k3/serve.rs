@@ -35,14 +35,12 @@ pub(crate) struct ServeArgs {
     /// Fixed draft depth; absent lets the shared policy choose up to the checkpoint width.
     #[arg(long, requires = "draft", value_parser = clap::value_parser!(u8).range(1..=7))]
     pub draft_fixed: Option<u8>,
-    /// Prefill unit rows (PLAN "Prefill contract"), at most 4096; the lane
-    /// holds `--prefill-waves` units, at most 8192 rows.
-    #[arg(long, default_value_t = cuteafd_loader::families::kimi_k3::allocation::DEFAULT_PREFILL_UNIT_ROWS)]
-    pub prefill_rows: usize,
-    /// Prefill units in flight: Spark waves outstanding on the one transport.
-    #[arg(long, default_value_t = cuteafd_loader::families::kimi_k3::allocation::DEFAULT_PREFILL_WAVES as u8,
-        value_parser = clap::value_parser!(u8).range(1..=4))]
-    pub prefill_waves: u8,
+    /// Prefill unit rows, at most 4096; unset follows the shared wave policy.
+    /// The lane holds the exact shared shape (8256 rows for three waves).
+    #[arg(long)] pub prefill_rows: Option<usize>,
+    /// Prefill units in flight on one transport; unset follows the shared six-Spark policy.
+    #[arg(long, value_parser = clap::value_parser!(u8).range(1..=4))]
+    pub prefill_waves: Option<u8>,
     #[command(flatten)] pub prefix: PrefixArgs,
     #[command(flatten)] pub decode_share: crate::shared::prefill_share::DecodeShareArgs,
     #[command(flatten)] pub token_io: crate::shared::token_io::TokenIoArgs,
@@ -60,6 +58,14 @@ impl ServeArgs {
         self.max_context.unwrap_or_else(|| cuteafd_loader::families::kimi_k3::default_context(core))
     }
 
+    pub(super) fn prefill(&self) -> Result<cuteafd_loader::serving_capacity::prefill_waves::PrefillPlan> {
+        use cuteafd_loader::serving_capacity::prefill_waves::{prefill_shape, PrefillLimits, PrefillOverrides};
+        Ok(prefill_shape(6, PrefillLimits::default(), PrefillOverrides {
+            unit_rows: self.prefill_rows.map(|rows| rows as u64),
+            waves: self.prefill_waves.map(u64::from), span_rows: None,
+        })?)
+    }
+
     fn validate(&self) -> Result<()> {
         ensure!(self.device >= 0 && self.split_device >= 0 && self.device != self.split_device,
             "Kimi serving requires two distinct coordinator devices");
@@ -69,10 +75,7 @@ impl ServeArgs {
             "Kimi context exceeds the compiled 1M extent");
         ensure!(self.spark_budget_gib.is_none_or(|gib| gib.is_finite() && gib > 0.0),
             "Kimi requires a finite positive estimated --spark-budget-gib");
-        use cuteafd_loader::families::kimi_k3::allocation::{LANE_ROWS_MAX, UNIT_ROWS_MAX};
-        ensure!(self.prefill_rows % 64 == 0 && self.prefill_rows <= UNIT_ROWS_MAX
-            && (256..=LANE_ROWS_MAX).contains(&(self.prefill_rows * usize::from(self.prefill_waves))),
-            "Kimi --prefill-rows must be page aligned and at most {UNIT_ROWS_MAX}, and x --prefill-waves hold 256..={LANE_ROWS_MAX} lane rows");
+        self.prefill()?;
         ensure!(self.prefix.prefix_partial == crate::shared::prefix::Toggle::Off,
             "Kimi serving requires exact prefix frontiers");
         ensure!(matches!(self.token_io.embed_placement, crate::shared::token_io::EmbedPlacement::Gpu),
@@ -106,6 +109,7 @@ pub(crate) async fn run(args: ServeArgs) -> Result<()> {
             let cfg = cuteafd_loader::families::kimi_k3::config::KimiK3Config::from_hf(&checkpoint.config)?;
             cfg.release_geometry()?;
             let slots = usize::from(worker_args.max_sequences);
+            let prefill = worker_args.prefill()?;
             let mark_bytes = super::state::KdaLayout::new(&cfg, slots, 1, 1)?.mark_bytes()
                 .checked_mul(2).context("Kimi TP2 prefix mark extent overflow")?;
             let marks = worker_args.prefix.mark_rule(slots).slots(mark_bytes);
@@ -120,8 +124,8 @@ pub(crate) async fn run(args: ServeArgs) -> Result<()> {
                 devices: [worker_args.device, worker_args.split_device], native_lib: &worker_args.native_lib,
                 peers: worker_args.peers.clone(), rtx_expert_layers: worker_args.rtx_expert_layers,
                 spark_budget_gib: worker_args.spark_budget_gib,
-                rows: worker_args.prefill_rows * usize::from(worker_args.prefill_waves),
-                waves: usize::from(worker_args.prefill_waves), prefill_rows: Some(worker_args.prefill_rows), slots, marks,
+                rows: usize::try_from(prefill.span_rows)?, waves: usize::try_from(prefill.waves)?,
+                prefill_rows: Some(usize::try_from(prefill.unit_rows)?), slots, marks,
                 max_context: worker_args.max_context(&cuteafd_loader::plan::families::kimi::core_inventory(&checkpoint)?),
                 pool_tokens: worker_args.pool_tokens.filter(|&tokens| tokens > 0), graphs: true,
                 ffn_mode: cuteafd_ffi::KimiFfnMode::default(), hosted_layers: None, draft, verify_rows: 0,
@@ -207,6 +211,48 @@ mod tests {
         for depth in ["0", "8"] {
             assert!(args(&["--draft", "/drafter", "--draft-fixed", depth]).is_err());
         }
+        Ok(())
+    }
+
+    #[test]
+    fn shared_prefill_policy_matches_planner_and_runtime_admission() -> Result<()> {
+        use cuteafd_loader::{families::kimi_k3::allocation, plan::{self, layout::LayoutOptions,
+            testing, ExpertPlacement, PlanOptions}};
+        let snapshot = tempfile::tempdir()?;
+        testing::write_kimi_snapshot(snapshot.path(), true);
+        let peers = "127.0.0.1:1,127.0.0.1:2,127.0.0.1:3,127.0.0.1:4,127.0.0.1:5,127.0.0.1:6";
+        for (extra, expected) in [
+            (vec![], (2752, 3, 8256)),
+            (vec!["--prefill-waves", "2"], (4096, 2, 8192)),
+            (vec!["--prefill-waves", "3"], (2752, 3, 8256)),
+            (vec!["--prefill-waves", "4"], (2048, 4, 8192)),
+            (vec!["--prefill-rows", "1024", "--prefill-waves", "2"], (1024, 2, 2048)),
+        ] {
+            let mut argv = vec!["--peers", peers];
+            argv.extend(extra);
+            let args = args(&argv)?;
+            args.validate()?;
+            let shape = args.prefill()?;
+            assert_eq!((shape.unit_rows, shape.waves, shape.span_rows), expected);
+            assert_eq!(allocation::prefill_shape_with(shape.span_rows as usize, shape.waves as usize,
+                Some(shape.unit_rows as usize))?, shape.units());
+            let options = PlanOptions { placement: ExpertPlacement::Sparks { ranks: 6 },
+                layout: Some(LayoutOptions { rtx_bytes: vec![96 << 30; 2], host_memory: Some((128 << 30, 128 << 30)),
+                    host_cache_bytes: Some(0), prefill_rows: args.prefill_rows.unwrap_or(0) as u64,
+                    prefill_lanes: args.prefill_waves.map_or(0, u64::from), ..Default::default() }),
+                ..Default::default() };
+            let report = plan::plan(snapshot.path(), &options)?;
+            assert_eq!((report.prefill_unit_rows, report.prefill_waves, report.prefill_span_rows),
+                (Some(shape.unit_rows), Some(shape.waves), Some(shape.span_rows)));
+        }
+        for extra in [vec!["--prefill-rows", "0"], vec!["--prefill-rows", "2753"],
+            vec!["--prefill-rows", "4097"], vec!["--prefill-rows", "4096", "--prefill-waves", "4"]] {
+            let mut argv = vec!["--peers", peers];
+            argv.extend(extra);
+            assert!(args(&argv)?.validate().is_err());
+        }
+        assert!(args(&["--prefill-lanes", "3"]).is_err(), "removed alias stays removed");
+        assert!(args(&["--kv-cache", "int4"]).is_err(), "Kimi MLA supports only BF16/FP8 records");
         Ok(())
     }
 

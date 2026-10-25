@@ -2270,8 +2270,7 @@ impl<'a> Qwen4Engine<'a> {
         ensure!(matches!(self.experts, Some(Experts::Spark { .. } | Experts::SharedOnly)),
             "Qwen prefill units require Spark experts (or shared-only diagnostics)");
         let (t, start) = (tokens.len(), placement.len);
-        ensure!(t > 0 && t <= self.prefill_rows && start + t <= self.max_context,
-            "prefill of {t} rows at {start}");
+        validate_prefill_span(t, start, self.prefill_rows, self.max_context)?;
         let logit_rows = logit_rows.clamp(1, t);
         if start == 0 { self.start(placement)?; }
         let mut tables = StepTables { page_table: placement.pages.clone(), pool_table: placement.pool_pages.clone(),
@@ -3812,6 +3811,13 @@ impl crate::shared::prefill_pipeline::PrefillHooks for UnitHooks<'_, '_, '_, '_,
     }
 }
 
+fn validate_prefill_span(rows: usize, start: usize, admitted_span: usize, max_context: usize) -> Result<()> {
+    ensure!(rows > 0 && rows <= admitted_span
+        && start.checked_add(rows).is_some_and(|end| end <= max_context),
+        "prefill of {rows} rows at {start} exceeds admitted span {admitted_span} or context {max_context}");
+    Ok(())
+}
+
 #[cfg(test)]
 mod prefill_unit_tests {
     use super::*;
@@ -3821,7 +3827,7 @@ mod prefill_unit_tests {
     #[test]
     fn unit_tables_keep_absolute_addresses_and_reset_sequence_rows() -> Result<()> {
         for (start, count) in [0usize, 63, 255, 1023, 2047, 4093].into_iter()
-            .flat_map(|start| [4096, 8192].map(|count| (start, count))) {
+            .flat_map(|start| [4096, 8192, 8256].map(|count| (start, count))) {
             let ple_rows = 16;
             let mut whole = StepTables { page_table: vec![9, 4, 7, 2], pool_table: vec![3, 8],
                 page_width: 4, pool_width: 2, ..Default::default() };
@@ -3837,7 +3843,7 @@ mod prefill_unit_tests {
                 whole.cache_lengths.push(((position + 1) / BLOCK) as i32);
                 whole.ple_ids.extend((0..ple_rows).map(|head| (position * ple_rows + head) as i64));
             }
-            for width in [512, 1024, 2048, 4096] {
+            for width in [512, 1024, 2048, 2752, 4096] {
                 for unit in sequence_units(count, width, 1, 48)? {
                     let rows = unit.rows;
                     let local = whole.unit(rows.clone(), ple_rows, 2051);
@@ -3862,6 +3868,67 @@ mod prefill_unit_tests {
                 }
             }
         }
+        Ok(())
+    }
+
+    #[test]
+    fn prefill_workspace_allocations_equal_shared_admission_for_all_wave_counts() -> Result<()> {
+        use cuteafd_loader::serving_capacity::{PrefillShape, qwen_graphs::{qwen_admission, QwenAdmissionInputs}};
+        let mut config = cuteafd_loader::plan::testing::qwen4_config(48);
+        config["text_config"]["ple_layer_ids"] = serde_json::json!([2]);
+        config["text_config"]["ple_embed_dim"] = 2560.into();
+        config["text_config"]["ngram_size"] = 3.into();
+        config["text_config"]["heads_per_ngram"] = 8.into();
+        config["text_config"]["mtp_num_hidden_layers"] = 1.into();
+        let cfg = Qwen4Config::from_hf(&config)?;
+        let (h, heads, hd, topk) = (cfg.hidden as u64, cfg.heads as u64, cfg.head_dim as u64, cfg.topk as u64);
+        for (rows, waves) in [(4096, 1), (4096, 2), (2752, 3), (2048, 4), (512, 4)] {
+            let shape = PrefillShape { unit_rows: rows, waves }.validate()?;
+            for mtp in [false, true] {
+                for mapped in [None, Some(160u64), Some(320)] {
+                    let span = shape.slot_rows();
+                    // Mirror workspace_rows allocations, independently of the loader's
+                    // workspace formula: live planes use span, all hook scratch uses rows.
+                    let mut buffers = vec![span * 4 * h * 2, span * 4 * h * 2, span * 4 * 2,
+                        span * h * 2, span * h * 2, span * h * 2, rows * h * 2,
+                        rows * heads * hd * 2, rows * heads * hd * 2,
+                        rows * cfg.index_heads as u64 * INDEX_DIM as u64 * 2, rows * heads * hd * 2,
+                        rows * (cfg.index_budget / BLOCK) as u64 * 4, rows * SPARSE_TOPK as u64 * 4,
+                        rows * 4, 0, 0, cfg.vocab_size as u64 * 4,
+                        rows * cfg.experts as u64 * 4, rows * topk * 4, rows * topk * 4,
+                        rows * (h + h / 32), rows * 4, 8, 8, VOCABULARY_HEAD_WORKSPACE as u64];
+                    let tables = super::super::admission::StepTableBytes::new(rows as usize, false, 0, 0, cfg.ple_rows())?;
+                    buffers.extend([tables.positions, tables.rope_positions, tables.block_rope_positions,
+                        tables.kv_slots, tables.slots, tables.seq_first, tables.pool_slots,
+                        tables.cache_lengths, tables.page_table, tables.pool_table, tables.ple_ids, tables.ids]
+                        .map(|bytes| bytes as u64));
+                    if let Some(width) = mapped {
+                        buffers.extend([rows * cfg.ple_rows() as u64 * 8, rows * cfg.ple_rows() as u64 * width]);
+                    }
+                    if mtp { buffers.push(span * 4 * h * 2); }
+                    let runtime = buffers.into_iter().map(|bytes| bytes.max(256)).sum::<u64>();
+                    let admitted = qwen_admission(&QwenAdmissionInputs {
+                        cfg: &cfg, layers: 48, mtp,
+                        kv_format: cuteafd_loader::families::qwen4::Qwen4KvCache::Fp8, manifest: None,
+                        prefill_rows: span, prefill_shape: Some(shape), slots: 8, mark_bytes: 0,
+                        full_prefill_logits: 0, ple: mapped.map(|width| (width, width == 160)),
+                        future_expert_bytes: 0, headroom: 0,
+                    })?;
+                    let planned = admitted.items.iter().find(|item| item.1 == "prefill step").unwrap().2;
+                    assert_eq!(planned, runtime, "{shape:?}, MTP {mtp}, PLE {mapped:?}");
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn diagnostic_prefill_cannot_exceed_its_admitted_terminal_and_logit_span() -> Result<()> {
+        let admitted = 16384;
+        validate_prefill_span(admitted, 7, admitted, 32768)?;
+        assert!(validate_prefill_span(admitted + 1, 7, admitted, 32768).is_err());
+        assert!(validate_prefill_span(512, usize::MAX, admitted, usize::MAX).is_err());
+        assert!(validate_prefill_span(0, 0, admitted, 32768).is_err());
         Ok(())
     }
 
@@ -3925,8 +3992,8 @@ mod prefill_unit_tests {
     #[test]
     fn real_schedule_preserves_all_qwen_live_planes_and_catches_shared_rows() -> Result<()> {
         for (span, width) in [(1, 512), (513, 512), (4096, 512), (4096, 2048), (3971, 1024),
-            (8192, 4096), (8192, 2048)] {
-            for waves in [1, 2] {
+            (8192, 4096), (8192, 2048), (8256, 2752), (16513, 2752), (16385, 2048)] {
+            for waves in 1..=4 {
                 assert_eq!(replay(span, width, waves, None, false)?, None, "{span}/{width}/{waves}");
             }
         }

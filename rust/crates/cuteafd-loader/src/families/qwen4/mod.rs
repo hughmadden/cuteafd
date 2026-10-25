@@ -8,6 +8,15 @@ pub use rope::{ImageSpan, RopeError, RopePositions};
 pub use config::{Qwen4Attention, Qwen4Config};
 pub use ngram::{NgramHasher, NgramHistory};
 
+/// The mapped PLE ring retains two wave-owned gather buffers until #717 lands.
+pub fn prefill_limits(local: bool) -> crate::serving_capacity::prefill_waves::PrefillLimits {
+    crate::serving_capacity::prefill_waves::PrefillLimits {
+        max_waves: if local { 1 } else { 2 },
+        max_waves_reason: (!local).then_some("Qwen mapped PLE ring holds two wave-owned gather slots pending #717"),
+        ..Default::default()
+    }
+}
+
 /// Destination extents shared by workspace allocation and ordered H2D admission.
 #[derive(Debug)]
 pub struct StepTableBytes {

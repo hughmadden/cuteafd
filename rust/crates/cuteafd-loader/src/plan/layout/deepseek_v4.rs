@@ -30,16 +30,17 @@ use crate::plan::Checkpoint;
 pub(crate) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyModel,
     input: &super::super::PlanInput, options: &mut LayoutOptions) -> MemoryLayout {
     let checkpoint = input.checkpoint();
-    // Explicit requests win; otherwise admit the serving default of two units.
-    options.prefill_waves = if options.prefill_lanes > 0 { options.prefill_lanes }
-        else if options.prefill_unit_rows.is_none() && options.prefill_waves == 1 { 2 }
-        else { options.prefill_waves };
+    let prefill = match resolve_prefill(report, options, report.spark_ranks,
+        crate::serving_capacity::prefill_waves::PrefillLimits {
+            max_waves: 3, ..Default::default()
+        }) {
+        Ok(shape) => shape,
+        Err(error) => return unsupported_prefill(report, error),
+    };
     let mut shape = Shape::resolve(report, model, options,
         ShapePolicy { all_native_stages: true, ..ShapePolicy::manifest_bounded() });
-    shape.prefill_rows = options.prefill_unit_rows.unwrap_or(shape.prefill_rows);
-    options.prefill_unit_rows = Some(shape.prefill_rows);
-    // Continuous spans do not change the slot-owned workspace geometry.
-    report.prefill_span_rows = Some(options.prefill_span_rows.unwrap_or(16384));
+    shape.prefill_rows = prefill.unit_rows;
+    report.prefill_span_rows = Some(prefill.span_rows);
     let gpus = options.rtx_bytes.len().clamp(1, 2);
     let split = gpus == 2 && options.head_split;
     let ranks = if split { 2 } else { 1 };

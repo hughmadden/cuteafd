@@ -1130,26 +1130,55 @@ mod tests {
     #[test]
     fn subwave_views_partition_persistent_rows_and_preserve_residual_planes() -> Result<()> {
         let cfg = KimiK3Config::from_hf(&cuteafd_loader::plan::testing::kimi_k3_config())?;
-        let layout = LaneLayout::new(&cfg, 4096, 4096, 1_048_576, NativeScratch { kda: 16, mla: [16; 3] })?;
-        let windows = crate::shared::prefill_pipeline::prefill_units(4096, 1408, 1, 256)?;
-        assert_eq!(windows.len(), 3);
-        for (&name, &bytes) in &layout.operands {
-            if layout.arena_offsets.contains_key(name) || ATTENTION_METADATA.contains(&name) { continue; }
-            let mut end = 0;
-            for window in &windows {
-                let (offset, len) = subwave_extent(name, bytes, layout.rows, window)?;
-                assert_eq!(offset, end, "{name} views overlap or leave a gap");
-                assert_eq!(offset % 16, 0, "{name} alignment");
-                if name == "residual arena" {
-                    let plane_bytes = window.len() * 7168 * 2;
-                    assert_eq!(len, 9 * plane_bytes);
-                    assert_eq!(offset + 8 * plane_bytes + plane_bytes, offset + len);
+        for (rows, unit, waves) in [(4096, 1408, 1), (8192, 4096, 2), (8256, 2752, 3), (8192, 2048, 4)] {
+            let layout = LaneLayout::new(&cfg, rows, unit, 1_048_576, NativeScratch { kda: 16, mla: [16; 3] })?;
+            let windows = crate::shared::prefill_pipeline::prefill_units(rows, unit, waves, 256)?;
+            assert_eq!(windows.len(), if waves == 1 { 3 } else { waves });
+            for (&name, &bytes) in &layout.operands {
+                if layout.arena_offsets.contains_key(name) || ATTENTION_METADATA.contains(&name) { continue; }
+                let mut end = 0;
+                for window in &windows {
+                    let (offset, len) = subwave_extent(name, bytes, layout.rows, window)?;
+                    assert_eq!(offset, end, "{name} views overlap or leave a gap");
+                    assert_eq!(offset % 16, 0, "{name} alignment");
+                    if name == "residual arena" {
+                        let plane_bytes = window.len() * 7168 * 2;
+                        assert_eq!(len, 9 * plane_bytes);
+                        assert_eq!(offset + 8 * plane_bytes + plane_bytes, offset + len);
+                    }
+                    end = offset + len;
                 }
-                end = offset + len;
+                assert_eq!(end, bytes, "{name} admission extent changed");
             }
-            assert_eq!(end, bytes, "{name} admission extent changed");
         }
         assert!(subwave_extent("invalid", 4095, 4096, &(0..256)).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn three_wave_metadata_preserves_exact_unpadded_tail_rows() -> Result<()> {
+        let cfg = KimiK3Config::from_hf(&cuteafd_loader::plan::testing::kimi_k3_config())?;
+        let layout = LaneLayout::new(&cfg, 8256, 2752, 16384, NativeScratch { kda: 16, mla: [16; 3] })?;
+        for rows in [65, 1375, 1376, 2751, 2752] {
+            let start = 63;
+            let mut pool = cuteafd_engine::prefix::RefPagePool::with_reserved(256, 64, 1);
+            let pages = pool.alloc((start + rows).div_ceil(64))?;
+            let metadata = AttentionRows::new(&[SequenceRows { slot: 0, start, rows, pages: &pages }],
+                2752, 1, 16384, &pool)?;
+            metadata.check_layout(&layout)?;
+            assert_eq!(metadata.rows, rows);
+            assert_eq!(metadata.kda_slots.len(), rows * 4);
+            assert_eq!(metadata.kda_first.len(), rows * 4);
+            assert_eq!(metadata.mla_slots.len(), rows * 8);
+            assert_eq!(i32_metadata(&metadata.offsets), [0, rows as i32]);
+            assert_eq!(i32_metadata(&metadata.lengths), [(start + rows) as i32]);
+            let physical = metadata.mla_slots.chunks_exact(8).map(|value|
+                i64::from_le_bytes(value.try_into().unwrap())).collect::<Vec<_>>();
+            for (offset, slot) in physical.into_iter().enumerate() {
+                let position = start + offset;
+                assert_eq!(slot, i64::from(pages[position / 64]) * 64 + (position % 64) as i64);
+            }
+        }
         Ok(())
     }
 
@@ -1400,7 +1429,7 @@ mod tests {
     #[test]
     fn token_io_extents_are_native_bounded_and_lane_private() -> Result<()> {
         let cfg = KimiK3Config::from_hf(&cuteafd_loader::plan::testing::kimi_k3_config())?;
-        for rows in [1, 16, 64, 4096] {
+        for rows in [1, 16, 64, 4096, 8192, 8256] {
             let entry = IoLayout::new(&cfg, 0, rows)?;
             let terminal = IoLayout::new(&cfg, 1, rows)?;
             assert_eq!(entry.extents(), [rows * 4, 0, 0]);
@@ -1412,7 +1441,7 @@ mod tests {
             }
         }
         assert!(IoLayout::new(&cfg, 0, 8192).is_ok(), "token ids span a two-unit lane");
-        for (rank, rows) in [(2, 1), (0, 0), (1, 8193)] {
+        for (rank, rows) in [(2, 1), (0, 0), (1, 8257)] {
             assert!(IoLayout::new(&cfg, rank, rows).is_err());
         }
         let source = include_str!("device.rs").split("#[cfg(test)]").next().unwrap();
@@ -1585,10 +1614,10 @@ mod tests {
             assert!(layout.demand(2, 0).is_err());
             assert!(layout.demand(0, 2).is_err());
         }
-        for (rows, context) in [(0, 1), (8193, 1), (1, 0), (1, 1_048_577)] {
+        for (rows, context) in [(0, 1), (8257, 1), (1, 0), (1, 1_048_577)] {
             assert!(LaneLayout::new(&cfg, rows, (rows).min(4096), context, scratch).is_err());
         }
-        // Lanes hold up to two 4096-row units; a unit never exceeds 4096 rows.
+        // Shared lanes include the rounded three-wave span; units stay at most 4096 rows.
         assert!(LaneLayout::new(&cfg, 8192, 4096, 1_048_576, scratch).is_ok());
         assert!(LaneLayout::new(&cfg, 8192, 4097, 1_048_576, scratch).is_err());
         assert!(LaneLayout::new(&cfg, 1, 1, 1, NativeScratch { kda: usize::MAX, mla: [0; 3] }).is_err());
@@ -1696,7 +1725,7 @@ mod tests {
         // Installed-package peaks; the split KDA recurrence is larger than fused.
         let scratch = NativeScratch { kda: 629_464_064,
             mla: [168_296_448, 101_056_512, 201_326_592] };
-        for (rows, unit) in [(1, 1), (4, 4), (16, 16), (63, 63), (64, 64), (4096, 4096), (8192, 4096)] {
+        for (rows, unit) in [(1, 1), (4, 4), (16, 16), (63, 63), (64, 64), (4096, 4096), (8192, 4096), (8256, 2752), (8192, 2048)] {
             for larger in [false, true] {
                 let split = if larger { 630_905_856 } else { scratch.kda };
                 let stages = lane_extents(rows, unit, scratch.kda, scratch.mla[0], split, 0)?;
@@ -1785,7 +1814,7 @@ mod tests {
             }
         }
         let cfg = KimiK3Config::from_hf(&cuteafd_loader::plan::testing::kimi_k3_config())?;
-        for (rows, unit) in [(1, 1), (4, 4), (16, 16), (64, 64), (4096, 4096), (8192, 4096)] {
+        for (rows, unit) in [(1, 1), (4, 4), (16, 16), (64, 64), (4096, 4096), (8192, 4096), (8256, 2752), (8192, 2048)] {
             let scratch = NativeScratch { kda: 629_464_064,
                 mla: [168_296_448, 101_056_512, 201_326_592] };
             let layout = LaneLayout::new(&cfg, rows, unit, 1_048_576, scratch)?.base.with_core_stages(

@@ -399,7 +399,7 @@ EOF
 family_prefill_mode() {
   case "$1" in
     step5|kimi_k3|qwen4|deepseek_v4) echo units ;;
-    glm5) echo units-span ;;
+    glm5|glm5_flash) echo units-span ;;
     *) echo legacy ;;
   esac
 }

@@ -24,8 +24,14 @@ pub const CONTEXT_PROGRAMS: [&str; 6] = ["glmf_scored_index_topk_decode_m64", "g
     "glmf_index_expand_owned"];
 
 /// Whole-owned MLA layers use the shared mixed executor's bounded hop slots.
-pub fn admitted_prefill_waves(mode: AttentionPlacement, requested: u64) -> u64 {
-    if mode == AttentionPlacement::Layers { requested.min(LAYER_PIPELINE_MAX_LANES) } else { requested }
+pub fn admitted_prefill_waves(mode: AttentionPlacement, requested: u64) -> Result<u64, PlacementError> {
+    if !(1..=4).contains(&requested) {
+        return Err(PlacementError::Inventory("GLM Flash executor needs one to four admitted prefill units"));
+    }
+    if mode == AttentionPlacement::Layers && requested > LAYER_PIPELINE_MAX_LANES {
+        return Err(PlacementError::Inventory("layer-owned prefill supports at most two waves"));
+    }
+    Ok(requested)
 }
 
 /// The `context` programs (beside the split partials), for the fail-closed
@@ -501,10 +507,7 @@ impl GlmfWorkingSetExt for GlmfWorkingSet {
         }
         let spark_layers = routed[n..].to_vec();
         let spark_ranks = if spark_layers.is_empty() { 0 } else { i.spark_ranks };
-        if !(1..=4).contains(&i.prefill_lanes) {
-            return Err(PlacementError::Inventory("GLM Flash executor needs one to four admitted prefill units"));
-        }
-        let prefill_lanes = admitted_prefill_waves(i.attention.mode, i.prefill_lanes);
+        let prefill_lanes = admitted_prefill_waves(i.attention.mode, i.prefill_lanes)?;
         Ok(Self { rtx_layers: routed[..n].to_vec(), spark_layers, spark_ranks, prefill_lanes })
     }
 
@@ -1549,7 +1552,7 @@ mod tests {
     }
 
     #[test]
-    fn unit_admission_caps_mixed_hops_without_reducing_heads_or_context() {
+    fn unit_admission_rejects_unsupported_mixed_hops_without_clamping() {
         let cfg = GlmNextConfig::from_hf(&crate::plan::testing::glm5_flash_config(45)).unwrap();
         let mut input = inputs(&cfg, 2, inventory::PRO_TOTAL_BYTES);
         input.prefill_lanes = 4;
@@ -1558,14 +1561,18 @@ mod tests {
             assert_eq!(GlmfWorkingSet::candidate(&input, 0).unwrap().prefill_lanes, 4);
         }
         input.attention.mode = AttentionPlacement::Layers;
-        assert_eq!(GlmfWorkingSet::candidate(&input, 0).unwrap().prefill_lanes, 2);
-        for lanes in [1, 2, 3, 4] {
+        assert!(GlmfWorkingSet::candidate(&input, 0).is_err());
+        for lanes in [1, 2] {
             input.prefill_lanes = lanes;
             let working = GlmfWorkingSet::candidate(&input, 0).unwrap();
-            assert_eq!(working.prefill_lanes, lanes.min(2));
+            assert_eq!(working.prefill_lanes, lanes);
             validate_layer_pipeline_lanes(working.prefill_lanes, working.prefill_lanes as usize).unwrap();
         }
-        assert_eq!(GlmfWorkingSet::candidate(&input, input.experts.len()).unwrap().prefill_lanes, 2);
+        for lanes in [3, 4] {
+            input.prefill_lanes = lanes;
+            assert!(GlmfWorkingSet::candidate(&input, 0).is_err());
+            assert!(GlmfWorkingSet::candidate(&input, input.experts.len()).is_err());
+        }
         for lanes in [0, 5] {
             input.prefill_lanes = lanes;
             assert!(GlmfWorkingSet::candidate(&input, 0).is_err());

@@ -1204,6 +1204,18 @@ pub fn render(report: &PlanReport) -> String {
     use std::fmt::Write;
     let mut out = String::new();
     let _ = writeln!(out, "decode     {} lane(s)", report.decode_lanes);
+    match report.family.as_deref() {
+        Some("deepseek_v41") => {
+            let _ = writeln!(out, "prefill shape: family executor (shared adaptive waves pending #744)");
+        }
+        Some("mimo_v2") => {
+            let _ = writeln!(out, "prefill shape: family executor (shared adaptive waves pending #671 / #709)");
+        }
+        _ => if let (Some(unit), Some(waves)) = (report.prefill_unit_rows, report.prefill_waves) {
+            let _ = writeln!(out, "prefill shape: {waves} waves x {unit} unit rows; intake {} rows; {} Spark transport(s)",
+                report.prefill_span_rows.unwrap_or(unit * waves), report.prefill_transports.unwrap_or(0));
+        },
+    }
     if report.mapped_placement.mapped + report.mapped_placement.preloaded > 0 {
         let p = &report.mapped_placement;
         let _ = writeln!(out, "{}; scales {} bytes / cap {} bytes; host preload {} bytes / budget {} bytes ({})",

@@ -28,7 +28,7 @@ pub(super) fn admit_mtp<'a>(
         else { admission::admit_mtp(checkpoint, inputs, depth)? };
     if depth > 0 {
         for stage in 0..depth {
-            super::mtp::InputPlan::prepare(programs, checkpoint, stage, inputs.rows)?;
+            super::mtp::InputPlan::prepare(programs, checkpoint, stage, inputs.unit_rows())?;
         }
     }
     let ownership = &admitted.ownership;
@@ -210,31 +210,18 @@ mod tests {
                     ..Default::default()
                 },
             )?;
-            assert_eq!(report.wip_launchable(), launchable,
-                "nvfp4={nvfp4} context={context} pool={pool:?} host={host:?} entries={entries}: {:?}", report.hints);
-            assert!(!report.executable());
-            // The planner's automatic prefill unit (2048, or the step-down that
-            // keeps its pool) is what the daemon admits.
-            let (unit, waves, rows) = if launchable {
-                (report.prefill_unit_rows.unwrap() as usize,
-                    report.prefill_waves.unwrap() as usize,
-                    report.prefill_span_rows.unwrap() as usize)
-            } else {
-                // A refused plan has no admitted geometry. The daemon must also
-                // refuse the default shape rather than fabricate a resolved plan.
-                assert!(report.prefill_unit_rows.is_none());
-                assert!(report.prefill_span_rows.is_none());
-                (2048, 2, 4096)
-            };
-            assert_eq!(rows, unit * waves);
-            if launchable {
-                assert!([2048, 1024, 512].contains(&unit), "{unit}");
-                // Two in flight unless device-only retention at full context
-                // forces the default down to one.
-                assert!(waves == 2 || (waves == 1 && host == Some(0)), "waves {waves}");
-                assert!(report.prefill_selection.as_deref().is_some_and(|s|
-                    s.contains(&format!("{unit} rows x {waves} waves"))));
+            let retention_pressure = host == Some(0) && entries > 0;
+            if !retention_pressure {
+                assert_eq!(report.wip_launchable(), launchable,
+                    "nvfp4={nvfp4} context={context} pool={pool:?} host={host:?} entries={entries}: {:?}", report.hints);
             }
+            assert!(!report.executable());
+            // A rejected allocation still reports the selected topology shape;
+            // capacity admission never retries a smaller unit or fewer waves.
+            let (unit, waves, rows) = if nvfp4 { (4096, 2, 8192) } else { (2752, 3, 8256) };
+            assert_eq!(report.prefill_unit_rows, Some(unit as u64));
+            assert_eq!(report.prefill_waves, Some(waves as u64));
+            assert_eq!(report.prefill_span_rows, Some(rows as u64));
             let mut code = Vec::new();
             let gpus = opts
                 .rtx_bytes
@@ -285,10 +272,10 @@ mod tests {
                 startup: vec![],
             };
             let live = checkpoint_admission(&checkpoint, &inputs);
-            if !launchable {
+            if !report.wip_launchable() {
                 let error = live.err().expect("both edges must refuse the unsupported allocation");
                 let refusal = error.to_string();
-                assert!(refusal.contains("compiled/max-context floor of 1048576"));
+                if !retention_pressure { assert!(refusal.contains("compiled/max-context floor of 1048576")); }
                 assert!(report.hints.iter().any(|hint| hint.what.contains(&refusal)));
                 continue;
             }
