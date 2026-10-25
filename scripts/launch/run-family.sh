@@ -12,7 +12,7 @@ launch_argv=("$@")
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 source "$repo_root/scripts/lib/release-common.sh"
 source "$repo_root/scripts/lib/cdi-gpus.sh"
-namespace_root="$(readlink -f "${CUTEAFD_NAMESPACE_ROOT:-/mnt/sparknest}")"
+namespace_root="$(release_namespace_root)"
 namespace_hf_home="$namespace_root/hf-home"
 if [[ -n "${CUTEAFD_NAMESPACE_ROOT:-}" ]]; then
   export HF_HOME="$namespace_hf_home"
@@ -896,7 +896,7 @@ for tool in docker ssh curl jq ss nvidia-smi sha256sum python3; do release_need 
 docker info >/dev/null 2>&1 || release_die "local Docker daemon is unavailable"
 docker image inspect "$COORDINATOR_DOCKER_INFERENCE" >/dev/null 2>&1 ||
   release_die "coordinator image is missing: $COORDINATOR_DOCKER_INFERENCE (pull the published pair, or build it with a config whose COORDINATOR_DOCKER_INFERENCE names this tag)"
-hf_home="${HF_HOME:-$namespace_root/hf-home}"
+hf_home="$(release_launch_hf_home)"
 release_resolve_local_model_revision "$hf_home"
 release_resolve_coordinator_gpu_identity
 profile_bytes="$(release_cuda_total_bytes "$RELEASE_COORDINATOR_GPU_UUID")" || release_die "cannot query coordinator CUDA capacity"
@@ -1550,7 +1550,7 @@ instance="$(get INSTANCE)"
 coordinator_name="cuteafd-coordinator${instance:+-$instance}"
 model="$(get MODEL_ID)"
 revision="$(get MODEL_REVISION)"
-hf_home="${HF_HOME:-$namespace_root/hf-home}"
+hf_home="$(release_launch_hf_home)"
 hub="$(readlink -f "$hf_home/hub")"
 root="$hub/models--${model//\//--}"
 [[ -n "$revision" ]] || revision="$(<"$root/refs/main")"

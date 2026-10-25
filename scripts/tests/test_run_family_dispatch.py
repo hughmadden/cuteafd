@@ -96,6 +96,55 @@ def test_public_launcher_resolves_family_from_selected_namespace(tmp_path: Path)
     assert "--family glm5_flash" in result.stdout
 
 
+MINIMAX = {"model_type": "minimax_m3_vl", "text_config": {
+    "model_type": "minimax_m3", "num_hidden_layers": 60, "moe_layer_freq": [0] * 3 + [1] * 57}}
+
+
+def test_family_detection_reads_the_hub_the_launch_reads(tmp_path: Path) -> None:
+    """Without HF_HOME the launch reads CUTEAFD_NAMESPACE_ROOT/hf-home (default
+    /mnt/sparknest); detection used ~/.cache/huggingface and took a stale copy there
+    (or nothing, which meant DeepSeek V4.1) for the checkpoint's family."""
+    namespace, home = tmp_path / "namespace", tmp_path / "home"
+    model = "MiniMaxAI/MiniMax-M3.1-Flash"
+    _snapshot(namespace / "hf-home", model, MINIMAX)
+    _snapshot(home / ".cache" / "huggingface", model, {"model_type": "deepseek_v41"})
+    config = tmp_path / "minimax.config"
+    config.write_text(f"MODEL_ID={model}\n")
+    env = {key: value for key, value in os.environ.items() if key != "HF_HOME"}
+    env.update(HOME=str(home), CUTEAFD_NAMESPACE_ROOT=str(namespace))
+    script = (f'source {shlex.quote(str(ROOT / "scripts/lib/release-common.sh"))}; '
+              'release_config_family "$1"; printf "%s\\n" "$(release_launch_hf_home)"')
+    result = subprocess.run(["bash", "-c", script, "_", str(config)], env=env, capture_output=True, text=True, timeout=60)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.splitlines() == ["minimax_m3", str(namespace / "hf-home")]
+
+
+def test_family_detection_refuses_a_checkpoint_the_launch_hub_lacks(tmp_path: Path) -> None:
+    repo, hf = _repo(tmp_path), tmp_path / "hf"
+    (hf / "hub").mkdir(parents=True)
+    config = repo / "minimax.config"
+    config.write_text("MODEL_ID=MiniMaxAI/MiniMax-M3.1-Flash\n")
+    result = _run(repo, hf, "--config", str(config), "--dry-run")
+    assert result.returncode == 2
+    assert f"checkpoint MiniMaxAI/MiniMax-M3.1-Flash is not in {hf / 'hub'}" in result.stderr
+    assert "run-family" not in result.stdout, "no fallback to the DeepSeek V4.1 launch"
+    # The release default (no MODEL_ID) is still DeepSeek V4.1, whose own checks name a missing snapshot.
+    config.write_text("CONCURRENCY=4\n")
+    result = _run(repo, hf, "--config", str(config), "--dry-run")
+    assert result.returncode == 0 and "--family deepseek_v41" in result.stdout, result.stderr
+
+
+def test_family_detection_follows_the_launch_model_override(tmp_path: Path) -> None:
+    repo, hf = _repo(tmp_path), tmp_path / "hf"
+    _snapshot(hf, "zai-org/GLM-5.3-Flash", GLMF_TWO_LAYER)
+    config = repo / "other.config"
+    config.write_text("MODEL_ID=not/downloaded\n")
+    result = _run(repo, hf, "--config", str(config), "--set", "MODEL_ID=zai-org/GLM-5.3-Flash", "--dry-run")
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == (f"run-family --config {config} --family glm5_flash "
+                             "--set MODEL_ID=zai-org/GLM-5.3-Flash --dry-run\n")
+
+
 def test_deepseek_v41_goes_to_run_family_like_every_family(tmp_path: Path) -> None:
     """run.sh is the same thin dispatcher for DeepSeek V4.1 (#82)."""
     repo, hf = _repo(tmp_path), tmp_path / "hf"
