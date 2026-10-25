@@ -155,7 +155,10 @@ the b12x D80 varlen attention export (build with
 serving applier does. `--vision auto` (the default) keeps it on the
 coordinator GPU, as the other families do, and the KV pool takes what is left
 (startup logs the cost in pool tokens); `--vision-peers` with `expertd-native
---encoder` on the ranks hosts it on the Sparks instead.
+--encoder` on the ranks hosts it on the Sparks instead. `cuteafd plan` (and so
+`run.sh` with `VISION=auto`) plans the same: a Spark rank with room for the
+tower hosts it (TP3 and TP4 at the shipped shapes), and otherwise the
+coordinator GPU keeps it whenever a pool is left (TP2).
 Preprocessing is the release's: smart resize (factor 28); video samples 1 fps
 keeping the last frame, scales the longer side to at most 756 px and gives
 every temporal pair its own image delimiters and timestamp.

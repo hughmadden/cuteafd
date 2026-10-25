@@ -162,4 +162,78 @@ mod tests {
         assert!(refused.starts_with("Spark-hosted vision needs 115.96 GB on every Spark rank, but each TP3 rank has"), "{refused}");
         Ok(())
     }
+
+    /// The 5090's shipped 31.8 GiB budget.
+    #[test]
+    fn minimax_5090_auto_vision_plans_the_tower_and_pool_serve_admits() -> Result<()> {
+        auto_vision_plans_the_tower_and_pool_serve_admits(34_144_990_003)
+    }
+
+    #[test]
+    fn minimax_pro6000_auto_vision_plans_the_tower_and_pool_serve_admits() -> Result<()> {
+        auto_vision_plans_the_tower_and_pool_serve_admits(cuteafd_loader::placement::inventory::PRO_TOTAL_BYTES)
+    }
+
+    /// Automatic vision at the shipped TP2 shapes (64 sequences, two 4096-row lanes, the checkpoint's
+    /// context, FP8 K/V, an automatic pool, the default Spark budget and 2 GiB headroom), speculator
+    /// off and DFlash2 with its default rings, on a coordinator of `rtx` bytes. The planner keeps the
+    /// bundled tower on the coordinator GPU, as serve-minimax does, and plans the server's pool: the
+    /// text admission, readmitted into what the loaded tower leaves.
+    fn auto_vision_plans_the_tower_and_pool_serve_admits(rtx: u64) -> Result<()> {
+        use cuteafd_loader::{families::{glm5::draft_representation::GlmDraftRepresentation,
+            minimax_m3::{cache::PAGE_ROWS, dflash::DflashMemory}},
+            placement::inventory::ArchContext, plan::{encoder::EncoderKind, MediaMode},
+            serving_capacity::prefill_lanes::{lane_capacity, DEFAULT_PREFILL_LANES}};
+        use cuteafd_core::memory_layout::{Category, DeviceKind};
+        let dir = tempfile::tempdir()?;
+        testing::write_minimax_m3_snapshot(dir.path(), true, false);
+        let checkpoint = Checkpoint::open(dir.path())?;
+        let cfg = MiniMaxM3Config::from_hf(&checkpoint.config)?;
+        let programs = manifest();
+        let path = dir.path().join("PROGRAMS.json");
+        std::fs::write(&path, programs.to_string())?;
+        std::fs::create_dir_all(dir.path().join("fp8/fp8-minimax-nvfp4a4"))?;
+        std::fs::write(dir.path().join("fp8/fp8-minimax-nvfp4a4/manifest.json"), package(None).to_string())?;
+        let drafter = tempfile::tempdir()?;
+        std::fs::write(drafter.path().join("config.json"), testing::minimax_dflash2_config().to_string())?;
+        let (rows, sequences, lanes, headroom) = (4096, 64, DEFAULT_PREFILL_LANES, 2u64 << 30);
+        let rings = admission::default_draft_rings(sequences, admission::DECODE_ROWS);
+        let graph_groups = ["graphs", cuteafd_loader::placement::inventory::GRAPH_GROWTH];
+        let arch = ArchContext::coordinator(rtx, None);
+        for dflash2 in [false, true] {
+            let plan_with = |vision| plan::plan(dir.path(), &PlanOptions { placement: ExpertPlacement::Sparks { ranks: 2 },
+                vision, layout: Some(LayoutOptions { rtx_bytes: vec![rtx], workspace_manifest: Some(path.clone()),
+                    concurrency: sequences as u64, headroom_bytes: headroom, native_mtp_layers: 0,
+                    minimax_drafter_snapshot: dflash2.then(|| drafter.path().to_path_buf()), ..Default::default() }),
+                ..Default::default() });
+            let (report, text) = (plan_with(MediaMode::Auto)?, plan_with(MediaMode::Off)?);
+            ensure!(report.placement_supported, "{:?}", report.hints);
+            let encoder = report.encoder.as_ref().unwrap();
+            assert_eq!(encoder.kind, EncoderKind::Rtx { gpu: 0 }, "DFlash2 {dflash2}: {}", encoder.reason);
+            let memory = report.memory_layout.as_ref().unwrap();
+            let device = memory.devices.iter().find(|d| d.kind == DeviceKind::Rtx).unwrap();
+            // The live sample already holds the planner's context and code (as above).
+            let measured_baseline: u64 = device.items.iter().filter(|i| i.category == Category::Runtime
+                && !graph_groups.contains(&i.group.as_str())).map(|i| i.bytes).sum();
+            // serve-minimax sizes DFlash2 with the planner's own function.
+            let draft = dflash2.then(|| DflashMemory::new(&testing::minimax_dflash2_config(), rings, arch.sms.into(),
+                GlmDraftRepresentation::Fp8Only, Qwen4KvCache::Fp8)).transpose()?;
+            let sizing = RuntimeSizing { rows, decode_rows: rows.min(admission::DECODE_ROWS), sequences,
+                context: cfg.max_position as u64, spark_ranks: 2,
+                logit_rows: RuntimeSizing::head_rows(lane_capacity(lanes, rows, PAGE_ROWS as usize), false, 0),
+                lanes, host_landing: !arch.gpu_landing };
+            let request = Request { sizing, kv_format: Qwen4KvCache::Fp8, local_layers: LocalLayers::Fewest,
+                spark_budget: admission::SPARK_BUDGET_BYTES, spark_vision_bytes: 0, headroom,
+                draft_bytes: draft.map_or(0, |d| d.bytes), draft_rings: draft.map_or(0, |d| d.slots),
+                draft_staging: draft.map_or(0, |d| d.staging), host_embedding: false, startup_graphs: true,
+                rings: spark_rings()? };
+            let available = rtx - measured_baseline;
+            let mut served = solve(&checkpoint, &programs, Some(&package(None)), request, available, None)?;
+            assert_eq!(served.cache.pool_tokens, text.memory_layout.as_ref().unwrap().pool_tokens);
+            served.readmit(&cfg, sizing, available - encoder.admitted_bytes(), None, Qwen4KvCache::Fp8)?;
+            assert_eq!(served.cache.pool_tokens, memory.pool_tokens, "DFlash2 {dflash2}");
+            assert!(served.local_layers.is_empty());
+        }
+        Ok(())
+    }
 }

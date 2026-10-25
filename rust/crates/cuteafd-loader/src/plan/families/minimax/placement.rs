@@ -8,9 +8,6 @@ use crate::plan::encoder::{encoder_placement, EncoderGpuBudget, EncoderHardware,
 use cuteafd_core::memory_layout::{Basis, Category, DeviceKind, DeviceLayout, Item, MemoryLayout};
 
 const GIB: u64 = 1 << 30;
-/// The KV an RTX-hosted tower must leave beside it when no pool is requested:
-/// one full 256K agentic request.
-const POOL_FLOOR_TOKENS: u64 = 262_144;
 
 pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut PlanReport,
     opts: &crate::plan::layout::LayoutOptions, requested: ExpertPlacement) -> anyhow::Result<MemoryLayout> {
@@ -93,9 +90,10 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
     // What the server's measured sample already holds: the CUDA context and the loaded code.
     (recipe.reservations.pending_code, recipe.reservations.runtime_baseline) = (code, arch.context_bytes);
     let fixed = recipe.reservations.fixed_bytes(&recipe.ledger)?;
+    // As serve-minimax admits automatic vision: the tower stays on the coordinator GPU whenever it
+    // leaves a KV pool, which takes what is left (a requested pool must fit beside the tower).
     let hardware = EncoderHardware { v41: false, gpus: vec![EncoderGpuBudget {
-        free_bytes: opts.rtx_bytes[0].saturating_sub(fixed),
-        kv_target_bytes: recipe.cache.token_bytes() * opts.pool_tokens.filter(|n| *n > 0).unwrap_or(POOL_FLOOR_TOKENS),
+        free_bytes: opts.rtx_bytes[0].saturating_sub(fixed), kv_target_bytes: 0,
     }], sparks: (0..sizing.spark_ranks).map(|rank| {
         let expert_bytes = admission::expert_resident_bytes(catalog, &recipe.onboarding.spark_layers, sizing.spark_ranks, rank)?;
         Ok(EncoderSparkBudget { rank, host: String::new(), idle: false, expert_bytes,
