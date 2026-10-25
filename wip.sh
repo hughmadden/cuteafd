@@ -501,14 +501,22 @@ stream_between_hosts() {
   fi
 }
 
+# spark_dev_image_content HOST: the portable content identity of HOST's Spark dev
+# image (scripts/lib/dev_image_content.py), empty when it is missing. Image IDs differ
+# across image stores (docker save | load into containerd) for identical content.
+spark_dev_image_content() {
+  ssh -o BatchMode=yes "$1" "docker image inspect '$SPARK_EXPERT_DOCKER_DEV' 2>/dev/null || true" |
+    python3 "$repo_root/scripts/lib/dev_image_content.py" 2>/dev/null || true
+}
+
 distribute_spark_dev_image() {
-  local seed_id
-  seed_id="$(ssh -o BatchMode=yes "$seed_host" "docker image inspect -f '{{.Id}}' '$SPARK_EXPERT_DOCKER_DEV'")"
+  local seed_content
+  seed_content="$(spark_dev_image_content "$seed_host")"
+  [[ -n "$seed_content" ]] || release_die "cannot identify $SPARK_EXPERT_DOCKER_DEV on $seed_host"
   local -a targets=()
-  local host remote_id
+  local host
   for host in "${wip_target_hosts[@]}"; do
-    remote_id="$(ssh -o BatchMode=yes "$host" "docker image inspect -f '{{.Id}}' '$SPARK_EXPERT_DOCKER_DEV' 2>/dev/null || true")"
-    [[ "$remote_id" == "$seed_id" ]] || targets+=("$host")
+    [[ "$(spark_dev_image_content "$host")" == "$seed_content" ]] || targets+=("$host")
   done
   ((${#targets[@]})) || return 0
   local source="$seed_host"
