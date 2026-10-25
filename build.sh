@@ -112,7 +112,11 @@ use a cached matching image or pull it, verifying its hash, architecture and
 pinned base-digest label. Missing images, pull failures and mismatches fall back
 to Dockerfile.dev locally, with the reason logged. Set
 CUTEAFD_RELEASE_DEV_IMAGE_SOURCE=build to force local dev builds on both hosts
-(default registry). Compilation uses the admitted immutable image ID.
+(default registry), or =local to use only each host's configured dev tag
+(COORDINATOR_DOCKER_DEV, SPARK_EXPERT_DOCKER_DEV) after verifying its architecture,
+toolchain hash, base digest, image ID and entrypoint: no registry, pull, build or
+fallback; a missing or mismatched image fails that leg before it compiles.
+Compilation uses the admitted immutable image ID.
 CUTEAFD_RELEASE_DEV_IMAGE=sha256:ID overrides only the coordinator, keeping its
 existing live toolchain/source checks and image-ID-bound provenance proof.
 Missing proof or mismatches refuse this explicit override rather than falling back.
@@ -508,7 +512,7 @@ release_leg_plan="coordinator and Spark legs build concurrently; shared export/d
   release_leg_plan="sequential: coordinator then Spark (CUTEAFD_RELEASE_SEQUENTIAL=1)"
 
 release_dev_image_source="${CUTEAFD_RELEASE_DEV_IMAGE_SOURCE:-registry}"
-case "$release_dev_image_source" in registry|build) ;; *) release_die "CUTEAFD_RELEASE_DEV_IMAGE_SOURCE must be registry or build" ;; esac
+case "$release_dev_image_source" in registry|build|local) ;; *) release_die "CUTEAFD_RELEASE_DEV_IMAGE_SOURCE must be registry, build or local" ;; esac
 
 if ((dry_run)); then
   release_toolchain_hash="$(python3 "$repo_root/scripts/build/dev-toolchain.py")"
@@ -520,12 +524,16 @@ if ((dry_run)); then
   echo "  seed host: ${RELEASE_BUILD_HOSTS[0]:-}"
   if [[ -n "${CUTEAFD_RELEASE_DEV_IMAGE:-}" ]]; then
     echo "  coordinator dev image: verify explicit override $CUTEAFD_RELEASE_DEV_IMAGE"
+  elif [[ "$release_dev_image_source" == local ]]; then
+    echo "  coordinator dev image: existing local $COORDINATOR_DOCKER_DEV on $(hostname) only; verify, never pull or build"
   elif [[ "$release_dev_image_source" == registry ]]; then
     echo "  coordinator dev image: pull ghcr.io/tpurtell/cuteafd-dev:tc-$release_toolchain_hash-amd64 on $(hostname) if missing; verify or build locally"
   else
     echo "  coordinator dev image: build Dockerfile.dev locally on $(hostname)"
   fi
-  if [[ "$release_dev_image_source" == registry ]]; then
+  if [[ "$release_dev_image_source" == local ]]; then
+    echo "  Spark dev image: existing local $SPARK_EXPERT_DOCKER_DEV on ${RELEASE_BUILD_HOSTS[0]:-} only; verify, never pull or build"
+  elif [[ "$release_dev_image_source" == registry ]]; then
     echo "  Spark dev image: pull ghcr.io/tpurtell/cuteafd-dev:tc-$release_toolchain_hash-arm64 on ${RELEASE_BUILD_HOSTS[0]:-} if missing; verify or build locally"
   else
     echo "  Spark dev image: build Dockerfile.dev locally on ${RELEASE_BUILD_HOSTS[0]:-}"
