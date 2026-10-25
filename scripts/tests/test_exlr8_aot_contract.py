@@ -141,8 +141,8 @@ def test_local_tp2_input_contract_is_independent_of_partial_dtype():
     assert "self.shared_on(rank, pair.layers[0]" in tp2
     assert "self.shared_on(0, layer" in tp2
     layers = (glm / "engine/layers.rs").read_text()
-    assert "self.shared_on(0, layer" in layers
-    assert "self.shared_on(1, layer" in layers
+    assert "e.shared_on(0, index" in layers
+    assert "e.shared_on(1, index" in layers
 
 
 def test_no_changes_to_existing_export_builders():
