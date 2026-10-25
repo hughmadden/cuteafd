@@ -1,6 +1,6 @@
 # Both official gate geometries share runtime-row AOT entry points.
 set(CUTEAFD_V41_ROUTER_DIR "${CMAKE_CURRENT_BINARY_DIR}/v41_router")
-set(CUTEAFD_V41_ROUTER_OUTPUTS "${CUTEAFD_V41_ROUTER_DIR}/v41_router.json" "${CUTEAFD_V41_ROUTER_DIR}/v41_router_dispatch.h")
+set(CUTEAFD_V41_ROUTER_OUTPUTS "${CUTEAFD_V41_ROUTER_DIR}/v41_router.json")
 set(CUTEAFD_V41_ROUTER_OBJECTS)
 foreach(experts IN ITEMS 128 384)
   list(APPEND CUTEAFD_V41_ROUTER_OBJECTS "${CUTEAFD_V41_ROUTER_DIR}/v41_router_e${experts}.o")

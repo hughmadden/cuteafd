@@ -4,6 +4,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import time
@@ -36,13 +37,85 @@ def _fake(monkeypatch, outputs):
     return calls
 
 
-def test_missing_toolchain_refuses_before_any_work(tmp_path):
-    env = {'HOME': str(tmp_path), 'PATH': '/nonexistent'}
-    result = subprocess.run([sys.executable, str(ROOT / 'scripts/dev/cpu-gate'), '--task', 'path-probe'],
-                            env=env, capture_output=True, text=True)
-    assert result.returncode == 2
-    assert 'cargo, rustc not on PATH' in result.stderr
-    assert not (tmp_path / '.cache/cuteafd/builds/path-probe').exists()
+def test_missing_toolchain_refuses_before_any_work(tmp_path, monkeypatch, capsys):
+    """With no candidate location supplying cargo/rustc, the gate still refuses
+    before touching the build directory."""
+    monkeypatch.setattr(gate, 'BUILDS', tmp_path / 'builds')
+    monkeypatch.setattr(gate, 'HOMEBREW_BIN', tmp_path / 'no-homebrew')
+    monkeypatch.setattr(gate, 'RUSTUP_HOME', tmp_path / 'no-rustup')
+    monkeypatch.setattr(sys, 'argv', ['cpu-gate', '--task', 'path-probe'])
+    monkeypatch.setenv('HOME', str(tmp_path))
+    monkeypatch.setenv('PATH', '/nonexistent')
+    monkeypatch.delenv('CARGO_HOME', raising=False)
+    with pytest.raises(SystemExit) as refused:
+        gate.main()
+    assert refused.value.code == 2
+    assert 'cargo, rustc not on PATH' in capsys.readouterr().err
+    assert not (tmp_path / 'builds/path-probe').exists()
+
+
+def test_toolchain_path_recovers_cargo_from_the_standard_locations(tmp_path, monkeypatch):
+    """A systemd unit starts without ~/.cargo/bin; the gate must find a stub there
+    instead of refusing, and leave a working PATH alone."""
+    stub = tmp_path / '.cargo/bin'
+    stub.mkdir(parents=True)
+    for tool in gate.TOOLCHAIN:
+        (stub / tool).write_text('#!/bin/sh\n')
+        (stub / tool).chmod(0o755)
+    path, used = gate.toolchain_path({'HOME': str(tmp_path), 'PATH': ''})
+    assert used == str(stub)
+    assert path.split(os.pathsep)[0] == str(stub)
+    assert shutil.which('cargo', path=path) == str(stub / 'cargo')
+    assert shutil.which('rustc', path=path) == str(stub / 'rustc')
+    # A working PATH is returned untouched, whatever the standard locations hold.
+    path, used = gate.toolchain_path({'HOME': str(tmp_path), 'PATH': str(stub)})
+    assert (path, used) == (str(stub), None)
+    # $CARGO_HOME wins over ~/.cargo, which still comes before the persistent home.
+    cargo_home = tmp_path / 'cargo-home'
+    (cargo_home / 'bin').mkdir(parents=True)
+    for tool in gate.TOOLCHAIN:
+        (cargo_home / 'bin' / tool).write_text('#!/bin/sh\n')
+        (cargo_home / 'bin' / tool).chmod(0o755)
+    path, used = gate.toolchain_path({'HOME': str(tmp_path), 'CARGO_HOME': str(cargo_home), 'PATH': ''})
+    assert used == str(cargo_home / 'bin') and path.split(os.pathsep)[0] == str(cargo_home / 'bin')
+    assert path.split(os.pathsep)[1] == str(stub)
+    # Homebrew's prefix and the toolchain rustup resolves follow those three.
+    brew, rustup_bin = tmp_path / 'homebrew/bin', tmp_path / 'rustup/toolchains/1.99.1/bin'
+    for directory in (brew, rustup_bin):
+        directory.mkdir(parents=True)
+        for tool in gate.TOOLCHAIN:
+            (directory / tool).write_text('#!/bin/sh\n')
+            (directory / tool).chmod(0o755)
+    empty = {'HOME': str(tmp_path / 'empty'), 'PATH': '/nonexistent'}
+    monkeypatch.setattr(gate, 'HOMEBREW_BIN', brew)
+    path, used = gate.toolchain_path(empty)
+    assert used == str(brew) and path.split(os.pathsep)[0] == str(brew)
+    monkeypatch.setattr(gate, 'HOMEBREW_BIN', tmp_path / 'no-homebrew')
+    monkeypatch.setattr(gate, 'rustup_toolchain_bin', lambda root=gate.RUSTUP_HOME, env=None: rustup_bin)
+    path, used = gate.toolchain_path(empty)
+    assert used == str(rustup_bin) and path.split(os.pathsep)[0] == str(rustup_bin)
+    # Nothing to add: unchanged and reported as not found, so main still refuses.
+    monkeypatch.setattr(gate, 'rustup_toolchain_bin', lambda root=gate.RUSTUP_HOME, env=None: None)
+    assert gate.toolchain_path({'HOME': str(tmp_path / 'empty'), 'PATH': '/nonexistent'}) == ('/nonexistent', None)
+
+
+def test_rustup_toolchain_bin_asks_rustup_for_its_toolchain(tmp_path):
+    toolchain = tmp_path / 'toolchains/1.99.1/bin'
+    toolchain.mkdir(parents=True)
+    cargo = toolchain / 'cargo'
+    cargo.write_text('#!/bin/sh\n')
+    cargo.chmod(0o755)
+    root = tmp_path / 'rustup'
+    (root / 'bin').mkdir(parents=True)
+    rustup = root / 'bin/rustup'
+    rustup.write_text(f'#!/bin/sh\n[ "$1" = which ] && echo {cargo}\n')
+    rustup.chmod(0o755)
+    assert gate.rustup_toolchain_bin(root=root, env={'PATH': ''}) == toolchain
+    assert gate.rustup_toolchain_bin(root=tmp_path / 'absent') is None
+    rustup.write_text('#!/bin/sh\nexit 1\n')
+    assert gate.rustup_toolchain_bin(root=root, env={'PATH': ''}) is None
+    rustup.write_text(f'#!/bin/sh\necho {tmp_path / "missing/cargo"}\n')
+    assert gate.rustup_toolchain_bin(root=root, env={'PATH': ''}) is None
 
 
 def test_cargo_passes_only_with_parsed_tests_and_no_failures(tmp_path, monkeypatch):
