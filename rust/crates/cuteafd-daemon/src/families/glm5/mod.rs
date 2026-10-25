@@ -209,6 +209,19 @@ mod draft_cli_tests {
     }
 
     #[test]
+    fn golden_rejects_invalid_unit_geometry_before_opening_checkpoint() {
+        #[derive(Parser)]
+        struct Golden { #[command(flatten)] args: GoldenArgs }
+        for rows in ["0", "255", "257"] {
+            let args = Golden::try_parse_from(["test", "--snapshot", "/missing-checkpoint",
+                "--native-lib", "/missing-library", "--golden", "/missing-fixture",
+                "--prefill-rows", rows, "--nll"]).unwrap().args;
+            let error = golden(args).unwrap_err().to_string();
+            assert!(error.contains("prefill unit geometry"), "{error}");
+        }
+    }
+
+    #[test]
     fn native_prefill_activation_cli_defaults_to_a16() {
         let parse = |extra: &[&str]| {
             let mut argv = vec!["test", "--snapshot", "/native", "--native-lib", "/library"];
@@ -1145,9 +1158,8 @@ fn mean_kl(logits: &[f32], golden: &[f32], vocab: usize) -> f64 {
     }).sum::<f64>() / rows.max(1) as f64
 }
 
-/// --nll: the golden prompt through prefill chunks of the engine's capacity
-/// (Spark lanes when available), every row's logits scored against the
-/// golden: mean NLL of the next token, top-1 agreement, KL.
+/// --nll: score one retained prefill unit per call, downloading its logits
+/// before the next call reuses the workspace: mean NLL, top-1 agreement, KL.
 fn nll_run(args: &GoldenArgs, opened: &Opened, engine: &engine::GlmEngine<'_>, mut transport: Option<&mut SparkLink<'_>>,
     runtime: &tokio::runtime::Runtime) -> Result<()> {
     let tokens: Vec<u32> = std::fs::read(args.golden.join("tokens.bin"))?
@@ -1156,7 +1168,8 @@ fn nll_run(args: &GoldenArgs, opened: &Opened, engine: &engine::GlmEngine<'_>, m
     let mut placement = engine::PageAllocator::new(engine).admit(tokens.len())?;
     let started = Instant::now();
     let mut logits = Vec::new();
-    for chunk in tokens.chunks(engine.prefill_capacity()) {
+    let rows = crate::shared::probe::scoring_prefill_capacity(true, engine.prefill_rows, engine.prefill_capacity());
+    for chunk in tokens.chunks(rows) {
         logits.extend(engine.prefill_rows_logits(&mut placement, chunk, transport.as_deref_mut().map(|t| (t, runtime)),
             None, chunk.len())?.context("the prefill needs every layer")?);
     }
@@ -1321,6 +1334,12 @@ fn bench_prefill(args: &GoldenArgs, engine: &engine::GlmEngine<'_>,
 }
 
 fn golden(args: GoldenArgs) -> Result<()> {
+    // Validate the scoring call before opening CUDA or loading any weights.
+    let rows = args.engine.prefill_rows;
+    crate::shared::prefill_pipeline::retained_logits_units(rows, rows,
+        usize::from(args.engine.prefill_waves), 256,
+        if args.nll || args.resume_at.is_some() { rows } else { 1 },
+        if args.engine.full_prefill_logits { args.engine.prefill_rows } else { engine::DECODE_ROWS })?;
     let opened = open(&args.engine)?;
     opened.with_engine(&args.engine, |engine, transport, runtime| golden_run(&args, &opened, engine, transport, runtime))
 }
