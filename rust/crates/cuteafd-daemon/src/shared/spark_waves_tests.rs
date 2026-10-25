@@ -511,6 +511,84 @@ fn gpu_exchange_queues_a_step_ahead_and_lands_byte_exact() -> Result<()> {
     Ok(())
 }
 
+/// #784: terminal teardown closes the exchange with waves still in flight
+/// (an engine that stopped mid-step) and gets its transport back to quiesce
+/// and release the QPs; the worker reports the abandoned waves and releases
+/// every wait it was queued, so no stream blocks behind them.
+#[test]
+#[ignore = "requires a GPU and the native library (CUTEAFD_PLANE_UPLOAD_LIBRARY)"]
+fn gpu_terminal_close_returns_the_transport_with_waves_in_flight() -> Result<()> {
+    use crate::shared::memory::DeviceAllocation;
+    let path = std::env::var_os("CUTEAFD_PLANE_UPLOAD_LIBRARY").context("set CUTEAFD_PLANE_UPLOAD_LIBRARY")?;
+    // SAFETY: the opt-in path names the built native library for this GPU.
+    let library = std::sync::Arc::new(unsafe { NativeLibrary::load(&path)? });
+    cuteafd_transport::set_verbs_host_native_library_path(std::path::PathBuf::from(&path))?;
+    let (hidden, topk, ranks, rows, waves, layers) = (5120usize, 6usize, 3usize, 4usize, 2usize, 4usize);
+    let row_bytes = hidden * 2;
+    let planes_owned = (0..ranks).map(|_| DeviceAllocation::new(&library, rows * row_bytes * waves))
+        .collect::<Result<Vec<_>>>()?;
+    let planes: Vec<Vec<CuteafdDeviceBuffer>> = (0..waves).map(|slot| planes_owned.iter().map(|plane|
+        CuteafdDeviceBuffer { ptr: (plane.buffer.ptr as usize + slot * rows * row_bytes) as *mut c_void,
+            bytes: rows * row_bytes, ..plane.buffer }).collect()).collect();
+    let layout = RouteStaging::new(rows, topk, row_bytes)?;
+    let arenas = (0..waves).map(|_| StagingArena::new(layout.bytes)).collect::<Result<Vec<_>>>()?;
+    let words = Arc::new(std::sync::OnceLock::new());
+    let hosts: Vec<Vec<u8>> = (0..layers).map(|_| vec![0u8; rows * row_bytes]).collect();
+    // Replies take a second: every wave is still in flight when teardown closes.
+    let echo = EchoWorld { library: library.clone(), ranks, row_bytes, landing: 0, next_slot: 0, inputs: hosts,
+        words: words.clone(), delay: Duration::from_secs(1), cpu: None, spent: None,
+        planes: planes.iter().map(|slot| slot.iter().map(|plane| (plane.ptr as usize, plane.bytes)).collect()).collect() };
+    let intake = Intake { ranks, rows, row_bytes, waves, planes, landing: 0, next_slot: 0 };
+    let mut exchange = Waves::start(&library, intake, echo, Vec::new(), arenas, false)?;
+    let _ = words.set(exchange.words());
+    let stream = crate::shared::spark_intake::WarmStream::new(library.as_ref())?;
+    let ids = DeviceAllocation::new(&library, rows * topk * 4)?;
+    let weights = DeviceAllocation::new(&library, rows * topk * 4)?;
+    let input = DeviceAllocation::new(&library, rows * row_bytes)?;
+    let mut tickets = Vec::new();
+    for layer in 0..waves {
+        let h = hidden;
+        // SAFETY: ids, weights and input are live device buffers of the layout's extents.
+        tickets.push(unsafe { exchange.send(rows, layout, [ids.buffer, weights.buffer, input.buffer], stream.raw(),
+            Box::new(move |routes, wire| ExpertProtocolV2Request::new_bytes(layer as u64 + 1, 1, layer as u32,
+                h as u32, cuteafd_transport::ExpertV2Dtype::Bf16, (0..rows as u32).map(|row|
+                    cuteafd_transport::ExpertProtocolV2RowDescriptor { row_id: row.into(),
+                    source_kind: cuteafd_transport::ExpertV2SourceKind::Decode, source_request_id: 1,
+                    token_position: row.into(), route_offset: row * topk as u32, route_count: topk as u32 })
+                    .collect(), routes, wire)))? });
+    }
+    std::thread::sleep(Duration::from_millis(20));
+    assert!(!tickets.iter().any(|ticket| exchange.landed(ticket)), "replies must still be in flight");
+    // The first wave's landing is queued as a layer's collect would queue it:
+    // a device wait on the reply, a second away. The second stays unlanded.
+    let first = tickets.remove(0);
+    exchange.land(first, stream.raw())?;
+    let started = std::time::Instant::now();
+    let (echo, result) = exchange.close::<EchoWorld>()?;
+    assert!(started.elapsed() < Duration::from_millis(900), "close must not wait out the in-flight replies");
+    let error = result.expect_err("closing with waves in flight reports them");
+    assert!(format!("{error:#}").contains("outstanding"), "{error:#}");
+    assert_eq!(echo.ranks, ranks, "the transport comes back to the link");
+    // The landing wait queued behind an abandoned wave was released (a
+    // worker that did not release it would leave this stream blocked).
+    stream.finish()?;
+    assert!(started.elapsed() < Duration::from_millis(900), "the queued landing waited out the reply");
+    drop(tickets);
+    Ok(())
+}
+
+/// #784: no link path drops its started exchange without taking the
+/// transport back (the exchange owns it once started).
+#[test]
+fn link_teardown_and_reset_take_the_transport_back_from_the_exchange() {
+    let link = include_str!("spark_intake.rs");
+    for name in ["pub(crate) fn terminal_quiesce(&mut self)", "pub(crate) fn reset_connections(&mut self)"] {
+        let body = link.split(name).nth(1).unwrap().split("\n    }\n").next().unwrap();
+        assert!(body.contains("exchange.close::<SparkExperts>()?") && body.contains("self.transport = Some(transport);")
+            && !body.contains("drop(exchange)"), "{name}: {body}");
+    }
+}
+
 /// #762: the worker's idle signal is zero while a wave is always queued
 /// behind the one in flight, and positive when the engine posts late.
 #[test]

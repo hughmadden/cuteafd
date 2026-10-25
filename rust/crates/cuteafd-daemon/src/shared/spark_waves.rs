@@ -915,6 +915,23 @@ impl<'a> Waves<'a> {
         let transport = transport.downcast::<T>().map_err(|_| anyhow::anyhow!("Spark exchange transport type differs"))?;
         Ok((*transport, self.next_slot))
     }
+
+    /// Terminal teardown (#784): closes the worker and returns its transport
+    /// whatever state the exchange is in (at rest, failed, or with waves the
+    /// engine will never land: the worker then abandons them and releases
+    /// every queued wait), with the worker's result, so the link can quiesce
+    /// and release the QPs itself. Only a panicked worker loses the transport.
+    pub(crate) fn close<T: Transport>(mut self) -> Result<(T, Result<()>)> {
+        drop(self.jobs.take());
+        let worker = self.worker.take().context("Spark exchange already stopped")?;
+        let (transport, result) = worker.join().map_err(|_| {
+            // Waits may still be queued against these words: keep them.
+            self.library.quarantine_module_after_failed_drain();
+            anyhow::anyhow!("Spark exchange worker panicked")
+        })?;
+        let transport = transport.downcast::<T>().map_err(|_| anyhow::anyhow!("Spark exchange transport type differs"))?;
+        Ok((*transport, result))
+    }
 }
 
 impl Drop for Waves<'_> {
