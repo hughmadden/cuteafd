@@ -6074,8 +6074,21 @@ checks pass and the focused base/candidate failure IDs are unchanged. The
 Keys source snapshot has 51 regular files and no symlinks, so its existing
 absolute-path read-only bind remains valid outside the Sparknest namespace.
 The engine-pinned push protocol and plan definitions are byte-identical to
-the installed filesystem release. The next live run uses the unchanged S3
-runtime, the new namespace and one explicitly shared API-key path.
+the installed filesystem release. The live run with that launcher reached API readiness in 217.56 s. The
+existing push loader delivered 371.35 GB from the hub in 44.101 s, with
+354,198 RDMA slots and zero RPC fallback slots. Authentication and both
+exact model listings passed. Qualification stopped before inference because
+the first stats frame precedes the scheduler's initial publish; the frame
+contained real zero variant counters but no cache/active gauges. This is a
+harness startup assumption, not a missing serving cache. The reviewed
+correction accepts that frame only before any inference or queued work,
+preserves the raw response, and requires the full scheduler fields for all
+subsequent checks. Its 19 offline tests pass, including actual response
+fixtures and rejection cases. Deliberately steered Keys fidelity against the
+unsteered base remains recorded as diagnostic; base fidelity and all other
+quality gates stay required. The next controlled candidate run uses this
+committed harness and the unchanged S3 runtime. No live inference, agent or
+speed pass is claimed by these startup results.
 
 ## Backlog (lowest priority: only when nothing planned is left)
 
