@@ -143,9 +143,14 @@ fn references(args: &GoldenArgs, cfg: &MiniMaxM3Config) -> Result<(Value, Vec<Wi
         "MiniMax golden requires the pinned independent target reference");
     ensure!(matches!(meta["activation"].as_str(), Some("served" | "served-cache" | "bf16")),
         "MiniMax reference activation arm missing");
-    ensure!(meta["source_pin"]["transformers"]["revision"] == "6b6792ff3b1a434913dc59659d4461acc9c3a51a"
-        && meta["source_pin"]["transformers"]["sha256"]["src/transformers/models/minimax_m3_vl/modular_minimax_m3_vl.py"]
-            == "1c755515c8aefdbc6f9145ae8f051e43907e21022d9644e81afe47cd2e37b58d",
+    // A reference with the publication fields keeps its nested source identity as source_identity,
+    // its source_pin being the flat published form; older references stored the identity as source_pin.
+    let source = if meta["source_identity"].is_object() { &meta["source_identity"] } else { &meta["source_pin"] };
+    ensure!(source["transformers"]["revision"] == "6b6792ff3b1a434913dc59659d4461acc9c3a51a"
+        && source["transformers"]["sha256"]["src/transformers/models/minimax_m3_vl/modular_minimax_m3_vl.py"]
+            == "1c755515c8aefdbc6f9145ae8f051e43907e21022d9644e81afe47cd2e37b58d"
+        && (!meta["source_identity"].is_object()
+            || meta["source_pin"]["transformers_revision"] == source["transformers"]["revision"]),
         "MiniMax reference source pin differs");
     {
         let proof = &meta["prefix_qualification"];
@@ -851,6 +856,20 @@ mod tests {
         write_json(&golden.join("meta.json"), &meta)?;
         assert!(references(&args, &cfg).is_err());
         meta["prefix_qualification"]["passed"] = true.into();
+        // A reference with the publication fields: nested identity under source_identity, flat source_pin.
+        let mut published = meta.clone();
+        published["source_identity"] = meta["source_pin"].clone();
+        published["source_pin"] = json!({"revision":REVISION,
+            "transformers_revision":"6b6792ff3b1a434913dc59659d4461acc9c3a51a"});
+        write_json(&golden.join("meta.json"), &published)?;
+        assert!(references(&args, &cfg).is_ok());
+        for (field, value) in [("/source_identity/transformers/revision", json!("0".repeat(40))),
+            ("/source_pin/transformers_revision", json!("0".repeat(40)))] {
+            let mut changed = published.clone();
+            *changed.pointer_mut(field).unwrap() = value;
+            write_json(&golden.join("meta.json"), &changed)?;
+            assert!(references(&args, &cfg).is_err(), "{field}");
+        }
         write_json(&golden.join("meta.json"), &meta)?;
         std::fs::write(folder.join("layer00.bin"), [1f32; 5].into_iter().flat_map(f32::to_le_bytes).collect::<Vec<_>>())?;
         assert!(references(&args, &cfg).is_err(), "a short layer export is refused");
