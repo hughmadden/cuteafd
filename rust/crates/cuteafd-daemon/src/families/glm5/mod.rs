@@ -9,6 +9,7 @@ pub(crate) mod native_dense;
 pub(crate) mod push;
 pub(crate) mod weights;
 pub(crate) mod variants;
+pub(crate) mod suite;
 
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::NativeLibrary;
@@ -362,6 +363,12 @@ pub(crate) struct GoldenArgs {
     /// python/reference/families/glm5/golden.py.
     #[arg(long)]
     pub golden: PathBuf,
+    /// One load, every check: --nll of base on this directory's tokens.bin (the saved logits must
+    /// equal its absent-overlay logits.bin byte for byte), --nll of each ready --variant, then
+    /// --resume-at on --golden as base and each ready variant; per-index logits and result.json
+    /// under --save-logits. Needs --prefill-waves 1.
+    #[arg(long, value_name = "BASE_REFERENCE_DIR", requires_all = ["save_logits", "resume_at"])]
+    pub variant_suite: Option<PathBuf>,
     /// Prefill only the first N tokens, then feed the rest through decode
     /// steps of --step-rows rows (teacher-forced), comparing their rows.
     #[arg(long)]
@@ -1164,6 +1171,9 @@ pub(crate) async fn run_golden(mut args: GoldenArgs) -> Result<()> {
     args.engine.variants = args.variants.indexed(&args.engine.served_id)?;
     ensure!(args.golden_variant == 0 || args.engine.variants.iter().any(|(index, _)| *index == args.golden_variant),
         "--golden-variant {} names no --variant", args.golden_variant);
+    if args.variant_suite.is_some() {
+        suite::preflight(&args)?;
+    }
     tokio::task::spawn_blocking(move || golden(args)).await?
 }
 
@@ -1184,9 +1194,33 @@ fn mean_kl(logits: &[f32], golden: &[f32], vocab: usize) -> f64 {
 /// --nll: the golden prompt through prefill chunks of the engine's capacity
 /// (Spark lanes when available), every row's logits scored against the
 /// golden: mean NLL of the next token, top-1 agreement, KL.
-fn nll_run(args: &GoldenArgs, opened: &Opened, engine: &engine::GlmEngine<'_>, mut transport: Option<&mut SparkLink<'_>>,
+fn nll_run(args: &GoldenArgs, opened: &Opened, engine: &engine::GlmEngine<'_>, transport: Option<&mut SparkLink<'_>>,
     runtime: &tokio::runtime::Runtime) -> Result<()> {
-    let tokens: Vec<u32> = std::fs::read(args.golden.join("tokens.bin"))?
+    nll_score(&args.golden, args.save_logits.as_deref(), opened, engine, transport, runtime).map(|_| ())
+}
+
+/// What one [`nll_score`] run measured (the numbers its line prints).
+#[derive(Debug, Clone, serde::Serialize)]
+pub(crate) struct NllReport {
+    pub rows: usize,
+    pub seconds: f64,
+    pub mean_nll: f64,
+    /// Logits that are NaN or infinite.
+    pub non_finite: usize,
+    /// Present when the reference directory carries logits.bin.
+    pub golden_mean_nll: Option<f64>,
+    pub top1_agreement: Option<f64>,
+    pub mean_kl: Option<f64>,
+    /// Present without reference logits (bitwise A/B between builds and runs).
+    pub digest: Option<String>,
+}
+
+/// [`nll_run`] on `golden`'s tokens.bin (and logits.bin when present), writing tokens.bin and
+/// logits.bin to `save` when given; the sequence's pages return to a fresh allocator dropped here.
+pub(crate) fn nll_score(golden_dir: &std::path::Path, save: Option<&std::path::Path>, opened: &Opened,
+    engine: &engine::GlmEngine<'_>, mut transport: Option<&mut SparkLink<'_>>, runtime: &tokio::runtime::Runtime)
+    -> Result<NllReport> {
+    let tokens: Vec<u32> = std::fs::read(golden_dir.join("tokens.bin"))?
         .chunks_exact(4).map(|b| u32::from_le_bytes(b.try_into().unwrap())).collect();
     let vocab = opened.cfg.vocab_size;
     let mut placement = engine::PageAllocator::new(engine).admit(tokens.len())?;
@@ -1197,25 +1231,28 @@ fn nll_run(args: &GoldenArgs, opened: &Opened, engine: &engine::GlmEngine<'_>, m
             None, chunk.len())?.context("the prefill needs every layer")?);
     }
     let seconds = started.elapsed().as_secs_f64();
-    if let Some(dir) = &args.save_logits {
+    if let Some(dir) = save {
         std::fs::create_dir_all(dir)?;
         std::fs::write(dir.join("tokens.bin"), tokens.iter().flat_map(|t| t.to_le_bytes()).collect::<Vec<u8>>())?;
         std::fs::write(dir.join("logits.bin"), logits.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>())?;
     }
+    let non_finite = logits.iter().filter(|v| !v.is_finite()).count();
     let nll_of = |l: &[f32], next: u32| {
         let top = l.iter().copied().fold(f32::NEG_INFINITY, f32::max) as f64;
         top + l.iter().map(|&x| (x as f64 - top).exp()).sum::<f64>().ln() - l[next as usize] as f64
     };
-    let Ok(golden) = std::fs::read(args.golden.join("logits.bin")) else {
+    let Ok(golden) = std::fs::read(golden_dir.join("logits.bin")) else {
         // No golden logits (a token file alone): the engine's NLL of the text and a digest of
         // every logit (bitwise A/B between builds and runs).
         use std::hash::{Hash, Hasher};
         let mut digest = std::collections::hash_map::DefaultHasher::new();
         logits.iter().for_each(|v| v.to_bits().hash(&mut digest));
         let nll: f64 = (0..tokens.len() - 1).map(|r| nll_of(&logits[r * vocab..][..vocab], tokens[r + 1])).sum();
-        println!("prefill logits: {} tokens in {seconds:.2} s | mean NLL engine {:.4} | logits digest {:016x}",
-            tokens.len(), nll / (tokens.len() - 1) as f64, digest.finish());
-        return Ok(());
+        let digest = digest.finish();
+        println!("prefill logits: {} tokens in {seconds:.2} s | mean NLL engine {:.4} | logits digest {digest:016x}",
+            tokens.len(), nll / (tokens.len() - 1) as f64);
+        return Ok(NllReport { rows: tokens.len(), seconds, mean_nll: nll / (tokens.len() - 1) as f64, non_finite,
+            golden_mean_nll: None, top1_agreement: None, mean_kl: None, digest: Some(format!("{digest:016x}")) });
     };
     let golden: Vec<f32> = golden.chunks_exact(4).map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect();
     let argmax = |l: &[f32]| l.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).map_or(0, |(i, _)| i);
@@ -1229,10 +1266,13 @@ fn nll_run(args: &GoldenArgs, opened: &Opened, engine: &engine::GlmEngine<'_>, m
             golden_nll += nll_of(theirs, next);
         }
     }
+    let kl = mean_kl(&logits, &golden[..logits.len()], vocab);
     println!("prefill logits: {rows} tokens in {seconds:.2} s | top-1 agreement {:.2}% | mean NLL engine {:.4} golden \
         {:.4} | mean KL(golden||engine) {:.5}", 100.0 * agree as f64 / rows as f64, nll / (rows - 1) as f64,
-        golden_nll / (rows - 1) as f64, mean_kl(&logits, &golden[..logits.len()], vocab));
-    Ok(())
+        golden_nll / (rows - 1) as f64, kl);
+    Ok(NllReport { rows, seconds, mean_nll: nll / (rows - 1) as f64, non_finite,
+        golden_mean_nll: Some(golden_nll / (rows - 1) as f64), top1_agreement: Some(agree as f64 / rows as f64),
+        mean_kl: Some(kl), digest: None })
 }
 
 /// --bench-verify: verify-step cost by rows (the DFlash2 policy's step
@@ -1358,6 +1398,9 @@ fn bench_prefill(args: &GoldenArgs, engine: &engine::GlmEngine<'_>,
 
 fn golden(args: GoldenArgs) -> Result<()> {
     let opened = open(&args.engine)?;
+    if let Some(base) = &args.variant_suite {
+        suite::check_vocab(base, opened.cfg.vocab_size)?;
+    }
     opened.with_engine(&args.engine, |engine, transport, runtime| golden_run(&args, &opened, engine, transport, runtime))
 }
 
@@ -1368,6 +1411,9 @@ fn golden_run(args: &GoldenArgs, opened: &Opened, engine: &engine::GlmEngine<'_>
             "--golden-variant {}: that variant did not verify, so it is unavailable", args.golden_variant);
     }
     engine.golden_variant.set(args.golden_variant);
+    if args.variant_suite.is_some() {
+        return suite::run(args, opened, engine, transport, runtime);
+    }
     if let Some(dir) = &args.draft_oracle {
         return draft_oracle(args, opened, engine, dir);
     }
@@ -1399,7 +1445,7 @@ fn golden_run(args: &GoldenArgs, opened: &Opened, engine: &engine::GlmEngine<'_>
         let n = args.prefill.unwrap_or(tokens.len()).min(tokens.len());
         return prefix::resume_check(engine, &tokens, at, n,
             args.prefill_chunk.unwrap_or(engine.prefill_rows), args.resume_decode, args.resume_cold,
-            args.resume_repeat, args.resume_host.then_some(&args.prefix), transport.map(|t| (t, runtime)));
+            args.resume_repeat, args.resume_host.then_some(&args.prefix), transport.map(|t| (t, runtime))).map(|_| ());
     }
     if let Some(steps) = args.token_check {
         return token_check(args, opened, engine, transport, runtime, steps);
