@@ -24,8 +24,8 @@
 //! into its pool. Goldens and exact prefix restores therefore do not depend on ownership.
 //!
 //! **Tables.** A step's per-rank C4 tables (slots, compact half tables, shard lengths, gather
-//! lists, commit blocks) are uploaded at the step's start after both streams drained, as the
-//! head split's tables are, so no queued kernel reads a table the host rewrites.
+//! lists, commit blocks) use persistent device buffers. Uploads follow prior readers on each
+//! owning stream; retained metadata staging keeps their host sources alive until completion.
 //!
 //! **Lifetime.** [`V4ContextSplit`] is created after the peer and its exchange, never replaced
 //! while the engine lives, and dropped before them (the exchange borrows the head split's abort
