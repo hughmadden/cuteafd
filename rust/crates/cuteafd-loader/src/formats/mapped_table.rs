@@ -72,6 +72,37 @@ fn page_bytes() -> Result<usize> {
     Ok(page as usize)
 }
 
+/// Fixed pinned staging shared by runtime allocation and offline admission.
+/// Each slot has cache-line-separated ready and consumed counter words.
+#[derive(Debug, Clone, Copy)]
+pub struct MappedStaging {
+    prefill_bytes: usize,
+    prefill_slots: usize,
+    decode_bytes: usize,
+    pub counter_bytes: usize,
+    pub total_bytes: usize,
+}
+impl MappedStaging {
+    pub const COUNTER_STRIDE: usize = 64;
+
+    pub fn new(prefill_rows: usize, prefill_slots: usize, decode_rows: usize, row_bytes: usize) -> Result<Self> {
+        if prefill_rows == 0 || decode_rows == 0 || row_bytes == 0 || !(1..=4).contains(&prefill_slots) {
+            return Err(invalid("invalid mapped-table staging geometry"));
+        }
+        let overflow = || invalid("mapped-table staging overflow");
+        let prefill_bytes = prefill_rows.checked_mul(row_bytes).ok_or_else(overflow)?;
+        let decode_bytes = decode_rows.checked_mul(row_bytes).ok_or_else(overflow)?;
+        let counter_bytes = (prefill_slots + 1) * 2 * Self::COUNTER_STRIDE;
+        let total_bytes = prefill_bytes.checked_mul(prefill_slots)
+            .and_then(|n| n.checked_add(decode_bytes)).and_then(|n| n.checked_add(counter_bytes)).ok_or_else(overflow)?;
+        Ok(Self { prefill_bytes, prefill_slots, decode_bytes, counter_bytes, total_bytes })
+    }
+
+    pub fn slot_bytes(self) -> impl Iterator<Item = usize> {
+        std::iter::repeat_n(self.prefill_bytes, self.prefill_slots).chain(std::iter::once(self.decode_bytes))
+    }
+}
+
 /// One immutable checkpoint tensor viewed as fixed-width byte rows.
 ///
 /// The caller must keep the underlying file immutable for the mapping lifetime.

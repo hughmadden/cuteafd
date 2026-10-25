@@ -5,6 +5,23 @@ use std::io::{Seek, SeekFrom, Write};
 type TestResult = std::result::Result<(), Box<dyn std::error::Error>>;
 
 #[test]
+fn fixed_staging_charges_actual_wave_count_and_separate_decode_rows() -> TestResult {
+    for k in 1..=4 {
+        let staging = MappedStaging::new(2048 * 16, k, 64 * 16, 320)?;
+        assert_eq!(staging.slot_bytes().collect::<Vec<_>>(),
+            std::iter::repeat_n(2048 * 16 * 320, k).chain(std::iter::once(64 * 16 * 320)).collect::<Vec<_>>());
+        assert_eq!(staging.counter_bytes, (k + 1) * 2 * 64);
+        assert_eq!(staging.total_bytes, (k * 2048 + 64) * 16 * 320 + (k + 1) * 2 * 64);
+        assert_eq!(staging.slot_bytes().sum::<usize>() + staging.counter_bytes, staging.total_bytes);
+    }
+    for (rows, k, decode, bytes) in [(0, 1, 64, 1), (1, 0, 64, 1), (1, 5, 64, 1),
+        (1, 1, 0, 1), (1, 1, 64, 0), (usize::MAX, 1, 64, 320), (usize::MAX / 2, 4, 64, 1)] {
+        assert!(MappedStaging::new(rows, k, decode, bytes).is_err());
+    }
+    Ok(())
+}
+
+#[test]
 fn live_reader_loads_only_atomics_without_interval_or_device_locks() {
     let stats = Arc::new(TableStats::default());
     let reader = MappedTableStatsReader { tables: vec![("lock-free".into(), Arc::downgrade(&stats))] };

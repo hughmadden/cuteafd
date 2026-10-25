@@ -174,6 +174,64 @@ fn qwen_prefill_publishes_unit_waves_and_span_before_host_admission() {
 }
 
 #[test]
+fn qwen_mapped_ple_host_staging_matches_runtime_allocations() {
+    use crate::formats::mapped_table::MappedStaging;
+    for (dtype, row_bytes) in [("BF16", 320usize), ("F8_E4M3", 160)] {
+        let mut config = qwen4_config(4);
+        config["text_config"]["ple_layer_ids"] = json!([2]);
+        config["text_config"]["ple_embed_dim"] = json!(2560);
+        let cfg = crate::families::qwen4::Qwen4Config::from_hf(&config).unwrap();
+        let mut tensors = qwen4_coordinator(&config, false);
+        let (experts, storage) = qwen4_exl3(4, 4);
+        tensors.extend(experts);
+        tensors.push(t("model.language_model.layers.1.ple.ple_embedding.ngram_embedding.shard_0.weight", dtype, &[1000, 160]));
+        let dir = snapshot(config, &tensors);
+        write_quantize_config(dir.path(), &storage);
+        let catalog = crate::read_expert_catalog(dir.path()).unwrap();
+        let tiers = catalog.exl3().unwrap().decoder_tiers().iter().map(usize::to_string).collect::<String>();
+        let manifest = write_qwen4_exl3_capacities(dir.path(), &tiers);
+        for (rank, width) in [384, 256].into_iter().enumerate() {
+            for capacity in crate::placement::inventory::exl3_capacities(4096) {
+                let path = dir.path().join(format!("lib/exl3/exl3-qwen4-k{tiers}/rtx-tp2-rank{rank}/m{capacity}"));
+                std::fs::create_dir_all(&path).unwrap();
+                std::fs::write(path.join("v41_exl3.json"), serde_json::to_vec(&json!({
+                    "hidden": 2560, "intermediate": width, "experts": 512, "top_k": 10,
+                    "capacity": capacity, "output_dtype": "fp32", "tile": [64, 128, 64, 128],
+                    "trellis_lut": {"bytes": 32}, "buffers": {
+                        "scratch": {"allocation": "scratch", "dtype": "f16", "bytes": capacity * width,
+                            "zero_on_create": false}}
+                })).unwrap()).unwrap();
+            }
+        }
+        let input = PlanInput::open(dir.path()).unwrap();
+        for (gpus, ranks) in [(1, 0), (2, 0), (1, 4)] {
+            // The launcher currently admits at most two waves; MappedStaging's
+            // geometry test independently covers all four staging depths.
+            for (unit, k) in [(512usize, 1usize), (2048, 2), (4096, 2)] {
+                if ranks == 0 && k != 1 { continue; }
+                let report = input.plan(&PlanOptions {
+                    layout: Some(layout::LayoutOptions { rtx_bytes: vec![96 << 30; gpus],
+                        head_split: gpus == 2, prefill_rows: unit as u64, prefill_waves: k as u64,
+                        context_tokens: 32768, prefix_slots: Some(0), host_cache_bytes: Some(0),
+                        workspace_manifest: Some(manifest.clone()),
+                        host_memory: Some((128 << 30, 128 << 30)), ..Default::default() }),
+                    ..sparks(ranks)
+                }).unwrap();
+                assert!(report.solver_placement.is_some(), "{}", render(&report));
+                assert!(report.memory_layout.as_ref().unwrap().pool_tokens >= 32768);
+                assert_eq!((report.prefill_unit_rows, report.prefill_waves), (Some(unit as u64), Some(k as u64)));
+                let host = report.host_ledger.as_ref().unwrap();
+                let staging = host.items.iter().filter(|item| item.group == "staging/mapped-table").collect::<Vec<_>>();
+                assert_eq!(staging.len(), 1, "a dual-owner engine still has one PLE table");
+                let runtime = MappedStaging::new(unit * cfg.ple_rows(), k, 64 * cfg.ple_rows(), row_bytes).unwrap();
+                assert_eq!(staging[0].bytes as usize, runtime.slot_bytes().sum::<usize>() + runtime.counter_bytes);
+                assert_eq!(staging[0].bytes as usize, (k * unit + 64) * cfg.ple_rows() * row_bytes + (k + 1) * 128);
+            }
+        }
+    }
+}
+
+#[test]
 fn qwen_local_and_dual_publish_whole_step_geometry_without_a_transport() {
     let config = qwen4_config(4);
     let dir = snapshot(config.clone(), &qwen4_coordinator(&config, false));
