@@ -456,6 +456,24 @@ class PackageProfileTests(unittest.TestCase):
             self.assertEqual(variant['route_block'], 64)
             self.assertTrue(variant['ws_dynamic_tiles'])
 
+    def test_ordinary_spark_ws_cells_preserve_compact_cache_keys(self):
+        for geometry, bits in (('qwen4', (4, 5)), ('v41', (3, 4))):
+            with self.subTest(geometry=geometry), tempfile.TemporaryDirectory() as temporary:
+                _, _, calls, _ = self.build_fixture(
+                    Path(temporary), 'spark', bits, geometry=geometry,
+                    capacities=(2048, 2752), compact=True)
+                compact_calls = [call for call in calls
+                                 if call.kwargs.get('compact_weights')
+                                 and call.kwargs.get('warp_specialized')]
+                self.assertTrue(compact_calls)
+                for call in compact_calls:
+                    cache_key = call.args[0].parent.name
+                    self.assertEqual(cache_key.count('+ws-m'), 1)
+                    self.assertIn('+ws-m64-dynamic', cache_key)
+                    self.assertTrue(call.kwargs['ws_dynamic_tiles'])
+                    self.assertEqual(call.kwargs['route_block'], 64)
+                    self.assertFalse(call.kwargs.get('token_major_rotation', False))
+
     def test_compact_ws_small_capacity_keeps_the_32_row_block(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

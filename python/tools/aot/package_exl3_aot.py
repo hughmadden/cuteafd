@@ -1327,7 +1327,8 @@ def build(args: argparse.Namespace) -> None:
                 if ws:
                     block = (compact_block if compact_block is not None
                              else ws_route_block(geometry, args.role, width, capacity))
-                    if geometry in ('kimik3', 'qwen4', 'v41') or args.role == 'coordinator':
+                    if (geometry == 'kimik3' or args.role == 'coordinator'
+                            or (not compact and geometry in ('qwen4', 'v41'))):
                         # Existing policy-keyed directories contain cooperative exports.
                         # The input format and claim mode are part of the compiled
                         # program, so they name its cache directory.
