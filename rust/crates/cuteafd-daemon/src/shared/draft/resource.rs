@@ -281,16 +281,21 @@ impl Prior {
     }
 }
 
+/// DFlash2's per-position `p0`: the keyed selector fit of the draft's features at the
+/// request's history rates, or those rates alone when a feature row is invalid.
+pub(crate) fn selector_confidence(fit: &crate::shared::draft_confidence::SelectorFit, history: &DraftHistory,
+    features: &[[f32; 4]]) -> Vec<f64> {
+    let width = features.len().min(MAX_POSITIONS);
+    let rates = history.conditional(width);
+    fit.confidence(&rates, &features[..width]).unwrap_or(rates)
+}
+
 /// Per-position `p0` of one draft: the prior evaluated on its evidence and the
 /// request's history. `None` when the evidence does not fit the prior (an
 /// invalid selector row): the request then verifies on history alone.
 pub(crate) fn prior(prior: &Prior, history: &DraftHistory, evidence: &DraftEvidence<'_>) -> Vec<f64> {
     match (prior, evidence) {
-        (Prior::Selector(fit), DraftEvidence::Selector(features)) => {
-            let width = features.len().min(MAX_POSITIONS);
-            let rates = history.conditional(width);
-            fit.confidence(&rates, &features[..width]).unwrap_or(rates)
-        }
+        (Prior::Selector(fit), DraftEvidence::Selector(features)) => selector_confidence(fit, history, features),
         (_, DraftEvidence::Head(head)) =>
             head_confidence(history, &head[..head.len().min(MAX_POSITIONS)]),
         (Prior::Head | Prior::History, DraftEvidence::Selector(features)) =>
