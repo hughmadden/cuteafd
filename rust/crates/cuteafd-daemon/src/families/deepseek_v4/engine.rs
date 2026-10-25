@@ -1035,15 +1035,13 @@ impl<'a> Engine<'a> {
         };
         let w1 = peer_workspace.as_ref().and_then(|ws| ws.as_ref());
         if let Some(w1) = w1 {
-            // Decode's previous call is complete before its single slot is reused.
+            // Persistent slots are overwritten on their owning streams after
+            // prior readers; metadata staging retains each upload's source.
             self.on(1, || {
-                // SAFETY: all prior peer waits have matching publications.
-                unsafe { self.library.cuda_stream_synchronize(self.stream_of(1))?; }
                 self.fill(&w1.slots[0].tables, step.tables)?;
                 self.upload(w1.slots[0].tokens.buffer, bytes_of(step.tokens))
             })?;
             if self.context.is_some() {
-                self.sync()?;
                 *self.context_units.borrow_mut() = vec![[
                     self.put_context_tables(0, &lane.tables, step.tables, 0, false, &[])?,
                     self.put_context_tables(1, &w1.slots[0].tables, step.tables, 0, false, &[])?,

@@ -56,6 +56,14 @@ impl RequestBatch {
     pub fn image_mask(&self) -> &[u8] {
         &self.image_mask
     }
+    /// No request-bank borrow survives the I/O wait. The subsequent poll checks
+    /// live request generations and lane positions before consuming its lease.
+    pub async fn wait_engram_gather(&mut self, layer: usize, timeout: std::time::Duration) -> Result<()> {
+        ensure!(!self.finished, "request batch finished");
+        let wave = self.engram.as_mut().context("decoder replay has no engram work")?;
+        tokio::time::timeout(timeout, wave.wait_gather(layer)).await
+            .context("target engram gather timed out")?
+    }
     pub fn cancel(&mut self) {
         self.finished = true;
         if let Some(engram) = &mut self.engram { engram.cancel(); }

@@ -118,14 +118,10 @@ impl<'w, 'a> TargetPass<'w, 'a> {
         if layer == 0 { return Ok(()); }
         self.resources.lane.advance()?;
         if let Some(gate) = [1, 14].iter().position(|&l| l == layer) {
-            let start = Instant::now();
-            loop {
-                let ready = unsafe { requests.borrow().poll_engram(batch, &mut self.resources.upload,
-                    &mut self.resources.gates[gate], &mut self.resources.lane)? };
-                if ready { break; }
-                ensure!(start.elapsed() < self.resources.engram_timeout, "paired engram gather timed out");
-                tokio::time::sleep(Duration::from_millis(1)).await;
-            }
+            batch.wait_engram_gather(gate, self.resources.engram_timeout).await?;
+            ensure!(unsafe { requests.borrow().poll_engram(batch, &mut self.resources.upload,
+                &mut self.resources.gates[gate], &mut self.resources.lane)? },
+                "engram gather wait returned pending");
         }
         unsafe { self.resources.lane.begin_prepared()?; }
         Ok(())

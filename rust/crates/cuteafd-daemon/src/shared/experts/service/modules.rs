@@ -20,6 +20,7 @@ pub(super) struct Fp8Group {
     pub bf16_directory: Option<std::path::PathBuf>,
     pub slicing: cuteafd_loader::formats::fp8_experts::Slicing,
     pub scratch: usize,
+    pub io: usize,
     pub modules: Option<Fp8Modules>,
 }
 
@@ -49,14 +50,15 @@ impl Fp8Group {
                 tensors.rank_width(config.world, config.rank, slicing)?)?;
             let metadata = fp8::package_metadata(&directory, &tensors, &layers, config.world, config.rank, slicing)?;
             let capacity = config.capacity as usize;
-            let mut scratch = metadata.scratch_for(capacity)?.max(256);
+            let mut scratch = cuteafd_ffi::fp8_moe::fp8_slot_scratch_bytes(metadata.scratch_layout(), capacity)?;
             let bf16_directory = metadata.info.wire_input.then(|| fp8::bf16_sibling(&directory))
                 .flatten().filter(|path| path.is_dir());
             if let Some(path) = &bf16_directory {
                 let sibling = fp8::package_metadata(path, &tensors, &layers, config.world, config.rank, slicing)?;
                 fp8::validate_bf16_package(&metadata.info, &sibling.info, capacity)?;
-                scratch = scratch.max(sibling.scratch_for(capacity)?);
+                scratch = scratch.max(cuteafd_ffi::fp8_moe::fp8_slot_scratch_bytes(sibling.scratch_layout(), capacity)?);
             }
+            let io = super::backend::native_slot_io_bytes(&metadata.info, bf16_directory.is_some(), capacity)?;
             if let Some(group) = groups.iter_mut().find(|group| group.directory == directory
                 && group.bf16_directory == bf16_directory && group.slicing == slicing
                 && group.tensors.format() == tensors.format()
@@ -64,7 +66,7 @@ impl Fp8Group {
                 group.layers.push(layer);
                 group.scratch = group.scratch.max(scratch);
             } else {
-                groups.push(Self { tensors, layers, directory, bf16_directory, slicing, scratch, modules: None });
+                groups.push(Self { tensors, layers, directory, bf16_directory, slicing, scratch, io, modules: None });
             }
         }
         Ok(groups)

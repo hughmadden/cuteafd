@@ -93,18 +93,11 @@ fn validate_layer_ids(layers: &[usize]) -> Result<()> {
     Ok(())
 }
 
-/// Admit the whole resident expert allocation before allocating any weights or
-/// scratch. Callers keep worker/step and prefix-cache reservations out of `budget`.
-fn resident_admission(layer_bytes: usize, layers: usize, primary_scratch: usize, bf16_scratch: Option<usize>,
-    budget: usize) -> Result<(usize, usize)> {
-    let scratch_bytes = primary_scratch.max(bf16_scratch.unwrap_or(0)).max(256);
+/// Resident admission contains only weights. Execution owners admit scratch separately.
+fn resident_admission(layer_bytes: usize, layers: usize, budget: usize) -> Result<usize> {
     let resident = layer_bytes.checked_mul(layers).context("FP8 resident expert size overflow")?;
-    let required = resident.checked_add(scratch_bytes).context("FP8 expert allocation size overflow")?;
-    ensure!(required <= budget,
-        "FP8 experts need {:.3} GiB resident + {:.3} GiB scratch ({} bytes); budget {:.3} GiB ({} bytes)",
-        resident as f64 / (1u64 << 30) as f64, scratch_bytes as f64 / (1u64 << 30) as f64, required,
-        budget as f64 / (1u64 << 30) as f64, budget);
-    Ok((resident, scratch_bytes))
+    ensure!(resident <= budget, "FP8 experts need {resident} resident bytes; budget {budget}");
+    Ok(resident)
 }
 
 /// Both programs share the same resident slice and scratch arena. Input dtype
@@ -352,14 +345,12 @@ impl Fp8Modules {
     }
 }
 
-/// Resident FP8 layers of one TP slice and the package that runs them.
-pub(crate) struct Fp8Experts<'a> {
+/// Shared resident layers and code of one TP slice; no execution scratch.
+pub(crate) struct Fp8Weights<'a> {
     // Drop order: the module goes last; callers drain their streams first.
     pub layers: Vec<Fp8Layer<'a>>,
-    scratch: DeviceAllocation<'a>,
     /// A second package over the same weights taking BF16 rows (a Spark
-    /// rank whose coordinator sends unquantized expert input); it shares
-    /// `scratch`, sized for both.
+    /// rank whose coordinator sends unquantized expert input).
     pub bf16_module: Option<Fp8MoeModule>,
     pub module: Fp8MoeModule,
     pub tp: usize,
@@ -367,9 +358,8 @@ pub(crate) struct Fp8Experts<'a> {
     weight_read_bytes: usize,
 }
 
-impl<'a> Fp8Experts<'a> {
-    /// Loads the package at `directory` and layers `layers` of the slice
-    /// `rank` of `tp`, with scratch for `capacity` rows.
+impl<'a> Fp8Weights<'a> {
+    /// Loads resident weights and code; the execution owner allocates scratch.
     pub fn load(library: &'a NativeLibrary, tensors: &Fp8ExpertTensors, directory: &Path,
         layers: &[usize], tp: usize, rank: usize, capacity: usize, budget: usize) -> Result<Self> {
         let _memory_scope = cuteafd_ffi::memory_ledger::scope("experts/weights");
@@ -377,7 +367,7 @@ impl<'a> Fp8Experts<'a> {
     }
 
     /// Loads an optional BF16-input sibling over the same weights. Validate
-    /// both packages and admit their maximum scratch before allocating weights.
+    /// both packages before allocating weights; executions admit their scratch.
     pub fn load_with_bf16(library: &'a NativeLibrary, tensors: &Fp8ExpertTensors, directory: &Path,
         bf16_directory: Option<&Path>, layers: &[usize], tp: usize, rank: usize, capacity: usize,
         budget: usize) -> Result<Self> {
@@ -443,25 +433,22 @@ impl<'a> Fp8Experts<'a> {
         validate_checkpoint_contract(&info, tensors, layers, tp, rank, slicing)?;
         let top = info.capacity_for(capacity)
             .with_context(|| format!("FP8 package has no capacity for {capacity} rows"))?;
-        let primary_scratch = module.scratch_bytes(top)?;
+        module.scratch_bytes(top)?;
         let bf16_module = bf16.map(|bf16| {
             let top = validate_bf16_package(&info, bf16.info(), capacity)
                 .with_context(|| format!("incompatible BF16-input FP8 expert package {}", directory.display()))?;
-            let scratch = bf16.scratch_bytes(top)?;
-            Ok::<_, anyhow::Error>((bf16, scratch))
+            bf16.scratch_bytes(top)?;
+            Ok::<_, anyhow::Error>(bf16)
         }).transpose()?;
         let layer_bytes = Fp8Layer::bytes_for(tensors, tp, rank, slicing)?;
         let weight_read_bytes = tensors.weight_read_bytes_with(tp, rank, slicing)?;
         ensure!(weight_read_bytes > 0 && weight_read_bytes.checked_mul(shape.experts) == Some(layer_bytes),
             "FP8 layer read extent does not divide into experts");
-        let (resident_bytes, scratch_bytes) = resident_admission(layer_bytes,
-            layers.len(), primary_scratch,
-            bf16_module.as_ref().map(|(_, scratch)| *scratch), budget)?;
-        tracing::info!(resident_bytes, scratch_bytes, budget, bf16_package = ?bf16_directory,
-            "FP8 expert allocation admitted");
-        let scratch = DeviceAllocation::new(library, scratch_bytes)?;
-        Ok(Self { layers: Vec::with_capacity(layers.len()), scratch,
-            bf16_module: bf16_module.map(|(module, _)| module), module, tp, rank, weight_read_bytes })
+        let resident_bytes = resident_admission(layer_bytes, layers.len(), budget)?;
+        tracing::info!(resident_bytes, budget, bf16_package = ?bf16_directory,
+            "FP8 resident expert allocation admitted");
+        Ok(Self { layers: Vec::with_capacity(layers.len()),
+            bf16_module, module, tp, rank, weight_read_bytes })
     }
 
     /// Bounded P4 double banks: each checkpoint projection is read once, then
@@ -640,8 +627,11 @@ impl<'a> Fp8Experts<'a> {
         self.layers.iter().flat_map(|layer| layer.regions.iter().flatten()).map(|region| region.buffer.bytes).sum()
     }
 
-    pub fn scratch_bytes(&self) -> usize {
-        self.scratch.buffer.bytes
+    pub fn slot_scratch_bytes(&self, capacity: usize) -> Result<usize> {
+        use cuteafd_ffi::fp8_moe::fp8_slot_scratch_bytes;
+        let primary = fp8_slot_scratch_bytes(self.module.scratch_layout(), capacity)?;
+        Ok(primary.max(self.bf16_module.as_ref().map(|module|
+            fp8_slot_scratch_bytes(module.scratch_layout(), capacity)).transpose()?.unwrap_or(0)))
     }
 
     /// Whether the package takes FP8 K32 wire rows (else BF16 rows).
@@ -672,6 +662,66 @@ impl<'a> Fp8Experts<'a> {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) unsafe fn run_with(&self, module: &Fp8MoeModule, scratch: cuteafd_ffi::CuteafdDeviceBuffer, index: usize,
+        rows: usize, input: *mut c_void, ids: *mut c_void, weights: *mut c_void, out: *mut c_void,
+        stream: *mut c_void) -> Result<()> {
+        let layer = self.layers.get(index).context("FP8 expert layer index out of range")?;
+        let [w1, s1, w3, s3, w2, s2] = layer.pointers();
+        let pointers: [*mut c_void; FP8_MOE_POINTERS] =
+            [input, ids, weights, w1, s1, w3, s3, w2, s2, out, scratch.ptr];
+        // SAFETY: the execution owner retains private scratch and the caller retains I/O/stream.
+        unsafe { module.launch(&pointers, rows, stream) }
+    }
+}
+
+/// One serialized execution over resident weights. Local/paged owners keep
+/// weights directly; Spark slots share immutable weights and own distinct scratch.
+pub(crate) struct Fp8Experts<'a, W = Fp8Weights<'a>> {
+    weights: W,
+    scratch: DeviceAllocation<'a>,
+}
+
+impl<'a, W: std::borrow::Borrow<Fp8Weights<'a>>> Fp8Experts<'a, W> {
+    pub(crate) fn from_shared(library: &'a NativeLibrary, weights: W, capacity: usize) -> Result<Self> {
+        let scratch = Self::allocate_scratch(library, weights.borrow().slot_scratch_bytes(capacity)?)?;
+        Ok(Self { weights, scratch })
+    }
+}
+
+impl<'a, W> Fp8Experts<'a, W> {
+    fn allocate_scratch(library: &'a NativeLibrary, bytes: usize) -> Result<DeviceAllocation<'a>> {
+        DeviceAllocation::named(library, bytes, "experts/workspace/native_scratch")
+    }
+    pub fn scratch_bytes(&self) -> usize { self.scratch.buffer.bytes }
+}
+
+impl<'a> Fp8Experts<'a> {
+    pub fn load(library: &'a NativeLibrary, tensors: &Fp8ExpertTensors, directory: &Path,
+        layers: &[usize], tp: usize, rank: usize, capacity: usize, budget: usize) -> Result<Self> {
+        let _scope = cuteafd_ffi::memory_ledger::scope("experts/weights");
+        let mut weights = Fp8Weights::prepare(library, tensors, directory, None, layers,
+            tp, rank, capacity, budget)?;
+        let bytes = weights.slot_scratch_bytes(capacity)?;
+        let resident = Fp8Layer::bytes_for(tensors, tp, rank, tensors.slicing_for_directory(directory, tp))?
+            .checked_mul(layers.len()).context("FP8 resident size overflow")?;
+        ensure!(resident.checked_add(bytes).is_some_and(|total| total <= budget),
+            "FP8 resident weights plus execution scratch exceed budget");
+        let scratch = Self::allocate_scratch(library, bytes)?;
+        weights.load_mount(library, tensors, layers, tensors.slicing_for_directory(directory, tp))?;
+        Ok(Self { weights, scratch })
+    }
+}
+
+impl<'a, W: std::borrow::Borrow<Fp8Weights<'a>>> std::ops::Deref for Fp8Experts<'a, W> {
+    type Target = Fp8Weights<'a>;
+    fn deref(&self) -> &Self::Target { self.weights.borrow() }
+}
+impl<'a> std::ops::DerefMut for Fp8Experts<'a> {
+    fn deref_mut(&mut self) -> &mut Self::Target { &mut self.weights }
+}
+
+impl<'a, W: std::borrow::Borrow<Fp8Weights<'a>>> Fp8Experts<'a, W> {
     /// Routed experts of resident layer `index` for `rows` input rows (wire
     /// or BF16, per `wire_input`) into `out` (BF16 `[rows, H]`).
     ///
@@ -681,7 +731,7 @@ impl<'a> Fp8Experts<'a> {
     /// any of them, or this object, is released.
     pub unsafe fn run(&self, index: usize, rows: usize, wire: *mut c_void, ids: *mut c_void, weights: *mut c_void,
         out: *mut c_void, stream: *mut c_void) -> Result<()> {
-        self.run_with(&self.module, index, rows, wire, ids, weights, out, stream)
+        self.weights.borrow().run_with(&self.module, self.scratch.buffer, index, rows, wire, ids, weights, out, stream)
     }
 
     /// `run` over BF16 input rows through the BF16-input package.
@@ -693,17 +743,7 @@ impl<'a> Fp8Experts<'a> {
         let module = if !self.wire_input() { &self.module } else {
             self.bf16_module.as_ref().context("no BF16-input FP8 expert package is loaded")?
         };
-        self.run_with(module, index, rows, input, ids, weights, out, stream)
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    unsafe fn run_with(&self, module: &Fp8MoeModule, index: usize, rows: usize, input: *mut c_void,
-        ids: *mut c_void, weights: *mut c_void, out: *mut c_void, stream: *mut c_void) -> Result<()> {
-        let layer = self.layers.get(index).context("FP8 expert layer index out of range")?;
-        let [w1, s1, w3, s3, w2, s2] = layer.pointers();
-        let pointers: [*mut c_void; FP8_MOE_POINTERS] =
-            [input, ids, weights, w1, s1, w3, s3, w2, s2, out, self.scratch.buffer.ptr];
-        module.launch(&pointers, rows, stream)
+        self.weights.borrow().run_with(module, self.scratch.buffer, index, rows, input, ids, weights, out, stream)
     }
 }
 
@@ -823,7 +863,7 @@ mod tests {
     #[test]
     #[ignore = "requires two CUDA GPUs, CUTEAFD_NATIVE_LIB, CUTEAFD_FP8_TP2_SNAPSHOT and CUTEAFD_FP8_TP2_PACKAGE"]
     fn paired_uploads_are_byte_exact_against_checkpoint_rank_slices() -> anyhow::Result<()> {
-        use super::{exact_layout, ExpertFormat, Fp8Experts, Fp8ExpertTensors, Fp8Layer, Fp8Projection, NativeLibrary};
+        use super::{exact_layout, ExpertFormat, Fp8Weights, Fp8ExpertTensors, Fp8Layer, Fp8Projection, NativeLibrary};
         use anyhow::ensure;
         use crate::shared::memory::device::Device;
         use cuteafd_ffi::fp8_moe::Fp8MoeMetadata;
@@ -844,7 +884,7 @@ mod tests {
         let budgets = [0, 1].map(|rank| Fp8Layer::bytes_for(&tensors, 2, rank, layouts[rank].1)
             .and_then(|resident| Ok(resident + metadata.scratch_for(1)?.max(256))));
         let [left, right] = budgets;
-        let owners = Fp8Experts::load_pair(devices, &tensors, [&layouts[0].0, &layouts[1].0],
+        let owners = Fp8Weights::load_pair(devices, &tensors, [&layouts[0].0, &layouts[1].0],
             layouts.each_ref().map(|layout| layout.1), &[layer], 1, [left?, right?])?;
         for rank in 0..2 {
             for (slot, projection) in Fp8Projection::ALL.into_iter().enumerate() {
@@ -874,33 +914,13 @@ mod tests {
     }
 
     #[test]
-    fn resident_admission_includes_every_layer_and_scratch() {
-        let (layer, scratch) = (1_415_589_888, 64 << 20);
-        let required = layer * 48 + scratch;
-        assert_eq!(resident_admission(layer, 48, scratch, None, required).unwrap(), (layer * 48, scratch));
-        assert!(resident_admission(layer, 48, scratch, None, required - 1).is_err());
-        // An explicit paging window admits only the empty initial window's scratch.
-        assert_eq!(resident_admission(layer, 0, scratch, None, scratch).unwrap(), (0, scratch));
-        assert!(resident_admission(layer, 0, scratch, None, scratch - 1).is_err());
-    }
-
-    #[test]
-    fn resident_admission_sizes_one_arena_for_both_packages() {
-        let (layer, primary, bf16) = (1024, 512, 2048);
-        let required = layer * 48 + bf16;
-        assert_eq!(resident_admission(layer, 48, primary, Some(bf16), required).unwrap(), (layer * 48, bf16));
-        assert!(resident_admission(layer, 48, primary, Some(bf16), required - 1).is_err());
-        // Sharing requires the maximum, rather than two scratch allocations.
-        assert_eq!(resident_admission(layer, 48, bf16, Some(primary), required).unwrap(), (layer * 48, bf16));
-        assert_eq!(resident_admission(0, 0, 0, Some(0), 256).unwrap(), (0, 256));
-        assert!(resident_admission(0, 0, 0, None, 255).is_err());
-    }
-
-    #[test]
-    fn resident_admission_rejects_overflow() {
-        assert!(resident_admission(usize::MAX, 2, 0, None, usize::MAX).is_err());
-        assert!(resident_admission(usize::MAX, 1, 1, None, usize::MAX).is_err());
-        assert!(resident_admission(1, 1, 0, Some(usize::MAX), usize::MAX).is_err());
+    fn resident_admission_contains_only_weights() {
+        let layer = 1_415_589_888;
+        assert_eq!(resident_admission(layer, 48, layer * 48).unwrap(), layer * 48);
+        assert!(resident_admission(layer, 48, layer * 48 - 1).is_err());
+        assert_eq!(resident_admission(layer, 0, 0).unwrap(), 0);
+        assert!(resident_admission(usize::MAX, 2, usize::MAX).is_err());
+        assert_eq!(resident_admission(usize::MAX, 1, usize::MAX).unwrap(), usize::MAX);
     }
 
     #[test]

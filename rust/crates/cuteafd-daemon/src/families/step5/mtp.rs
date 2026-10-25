@@ -193,6 +193,7 @@ pub(super) struct StageOwner<'a> {
     attention: super::swa::SwaLayer<'a>,
     head: super::head::TargetHeadOwner<'a>,
     metadata: Vec<Plane<'a>>,
+    uploads: Vec<crate::shared::memory::HostAllocation<'a>>,
     compact: Option<CompactKv<'a>>,
     kv_format: Qwen4KvCache,
     stage: usize,
@@ -219,6 +220,11 @@ impl<'a> StageOwner<'a> {
         let head = super::head::TargetHeadOwner::load_in(device, programs, checkpoint,
             head, available, &[], Some((arena, 0)))?;
         let sizes = native::mtp_metadata_planes(rows)?;
+        // Shared device scratch aliases between stages; pinned upload sources
+        // must instead be private until the whole retained chain completes.
+        let uploads = sizes[..4].iter().copied().chain([sizes[2], 8])
+            .map(|bytes| crate::shared::memory::HostAllocation::new(device.library, bytes))
+            .collect::<Result<Vec<_>>>()?;
         let mut metadata = arena.planes(device, &sizes[..4],
             usize::try_from(native::mtp_metadata_offset(rows)?)?)?;
         // Tokens selected by earlier stages must survive reuse of shared scratch.
@@ -229,8 +235,23 @@ impl<'a> StageOwner<'a> {
                 native::mtp_compact_planes(rows, kv_format)?,
                 Some((arena, usize::try_from(native::mtp_compact_offset(rows)?)?)))?)
         } else { None };
-        Ok(Self { stream, input, attention, head, metadata, compact, kv_format, stage, rows,
+        Ok(Self { stream, input, attention, head, metadata, uploads, compact, kv_format, stage, rows,
             cache_owner: std::cell::Cell::new(None) })
+    }
+
+    /// Each source is written at most once per stage in a retained chain. The
+    /// runtime's final wait (or cancellation drain) precedes the next reuse.
+    fn upload(&mut self, source: usize, target: CuteafdDeviceBuffer, bytes: &[u8]) -> Result<()> {
+        let staging = &mut self.uploads[source];
+        ensure!(bytes.len() <= staging.buffer.bytes && bytes.len() <= target.bytes,
+            "Step-5 retained upload extent");
+        staging.bytes_mut()[..bytes.len()].copy_from_slice(bytes);
+        self.stream.device.run(|| {
+            // SAFETY: private pinned sources and device destinations survive
+            // the chain; every destination reader/writer uses this stream.
+            unsafe { self.stream.device.library.copy_h2d_async(target,
+                &staging.bytes()[..bytes.len()], self.stream.raw) }
+        })
     }
 
     /// Register once before any prefix capture or reset can observe this lane.
@@ -346,21 +367,20 @@ impl<'a> StageOwner<'a> {
         embedding: &crate::shared::token_io::TokenEmbedding<'a>) -> Result<CuteafdDeviceBuffer> {
         let rows = earlier.len() + 1;
         ensure!(rows == self.stage + 1, "Step-5 triangular predictor proposal depth");
-        cache.drain()?;
         let stream = self.stream.clone();
         let mut guard = stream.cancellation_guard("Step-5 chained predictor borrow");
         self.gather_history(cache, sequence, base, rows)?;
+        let ids = self.metadata[2].buffer;
+        self.upload(4, ids, &anchor.to_le_bytes())?;
         self.stream.device.run(|| {
-            let ids = self.metadata[2].buffer;
-            self.stream.device.library.copy_h2d(slice(ids, 0, 4)?, &anchor.to_le_bytes())?;
             for (row, source) in earlier.iter().enumerate() {
-                // SAFETY: previous stages have drained, and all token planes
-                // remain owned by this runtime until the complete chain finishes.
+                // SAFETY: previous stages precede these reads on the same stream;
+                // their token planes survive until the runtime's final wait.
                 unsafe { self.stream.device.library.copy_d2d_async(
                     slice(ids, (row + 1) * 4, 4)?, slice(*source, 0, 4)?, 4, self.stream.raw)?; }
             }
-            // SAFETY: admitted private ids and embedding output remain live
-            // through this stage's Drop drain; every id is ordered on this stream.
+            // SAFETY: admitted ids and embedding output remain live through
+            // the retained chain; every id is ordered on this stream.
             unsafe { embedding.embed_device_ids(ids, None, rows, 1, None,
                 self.input.planes[4].buffer, self.stream.raw) }
         })?;
@@ -369,26 +389,33 @@ impl<'a> StageOwner<'a> {
         let selected = step.owner.metadata[4].buffer;
         stream.device.run(|| {
             // SAFETY: the final active head row and disjoint id/status words
-            // are retained through the proposal's drain. No host token hop.
+            // are retained through the chain's wait. No host token hop.
             unsafe { stream.device.library.cuda_logits_greedy_f32_async(
                 logits.ptr.wrapping_byte_add((rows - 1) * logits.stride * 4), 1,
                 128896, logits.stride, selected.ptr, std::ptr::null_mut(),
                 selected.ptr.wrapping_byte_add(4), stream.raw) }
         })?;
-        drop(step);
+        step.retire();
         guard.complete = true;
         Ok(selected)
     }
 
-    pub(super) fn teacher(&mut self, cache: &super::cache::CacheRank<'a>, sequence: u64,
+    fn teacher(&mut self, cache: &super::cache::CacheRank<'a>, sequence: u64,
         base: u64, tokens: &[u32], embedding: &crate::shared::token_io::TokenEmbedding<'a>) -> Result<()> {
-        cache.drain()?;
         let stream = self.stream.clone();
         let mut guard = stream.cancellation_guard("Step-5 teacher history borrow");
         self.gather_history(cache, sequence, base, tokens.len())?;
-        self.stream.device.run(|| embedding.embed(tokens, self.metadata[2].buffer,
-            1, self.input.planes[4].buffer, self.stream.raw))?;
-        self.live_forward(cache, sequence, base, tokens.len())?.publish(tokens.len())?;
+        embedding.check(tokens)?;
+        let ids = self.metadata[2].buffer;
+        let bytes = tokens.iter().flat_map(|token| token.to_le_bytes()).collect::<Vec<_>>();
+        self.upload(4, ids, &bytes)?;
+        self.stream.device.run(|| {
+            // SAFETY: private pinned token ids and scratch output survive the
+            // retained chain; the id upload precedes this identical gather.
+            unsafe { embedding.embed_device_ids(ids, None, tokens.len(), 1, None,
+                self.input.planes[4].buffer, self.stream.raw) }
+        })?;
+        self.live_forward(cache, sequence, base, tokens.len())?.publish_queued(tokens.len())?;
         guard.complete = true;
         Ok(())
     }
@@ -403,8 +430,8 @@ pub(super) fn slice(buffer: CuteafdDeviceBuffer, offset: usize, bytes: usize) ->
     Ok(CuteafdDeviceBuffer { ptr: buffer.ptr.wrapping_byte_add(offset), bytes, ..buffer })
 }
 
-/// Appends only to speculative slack. Publication is independent from target
-/// acceptance; until coupled by the shared scheduler this is not a serving path.
+/// Appends to speculative slack; only accepted teacher rows publish a frontier.
+/// The runtime retains queued work until its chain wait or cancellation drain.
 pub(super) struct StageStep<'e, 'a> {
     owner: &'e mut StageOwner<'a>,
     cache: &'e super::cache::CacheRank<'a>,
@@ -417,20 +444,17 @@ pub(super) struct StageStep<'e, 'a> {
 }
 impl<'e, 'a> StageStep<'e, 'a> {
     fn enqueue(&mut self) -> Result<()> {
-        let owner = &*self.owner;
-        let stream = &owner.stream;
+        let stream = self.owner.stream.clone();
         let rows = self.coordinates.global.len();
         let mut guard = stream.cancellation_guard("Step-5 predictor stage proposal");
         for (plane, bytes) in [(0, self.coordinates.global.iter().flat_map(|n| n.to_le_bytes()).collect::<Vec<_>>()),
             (1, self.coordinates.local.iter().flat_map(|n| n.to_le_bytes()).collect()),
             (2, vec![0; rows * 4]),
             (3, self.coordinates.table.iter().flat_map(|n| n.to_le_bytes()).collect())] {
-            stream.device.run(|| {
-                // SAFETY: ordered upload retains source bytes; this proposal
-                // borrows every metadata allocation through stream drainage.
-                unsafe { stream.device.library.copy_h2d_ordered(owner.metadata[plane].buffer, &bytes, stream.raw) }
-            })?;
+            self.owner.upload(plane, self.owner.metadata[plane].buffer, &bytes)?;
         }
+        let stream = &*stream;
+        let owner = &*self.owner;
         let hidden = owner.input.enqueue(self.inputs[0], self.inputs[1], rows)?;
         stream.device.run(|| {
             // SAFETY: disjoint admitted EH and SWA input planes survive the proposal.
@@ -487,23 +511,37 @@ impl<'e, 'a> StageStep<'e, 'a> {
         self.owner.head.device_logits_on(self.hidden(), self.coordinates.global.len(), &self.owner.stream)
     }
 
-    pub(super) fn publish(mut self, accepted: usize) -> Result<()> {
+    #[cfg(test)]
+    pub(super) fn publish(self, accepted: usize) -> Result<()> {
+        let stream = self.owner.stream.clone();
+        self.publish_queued(accepted)?;
+        stream.drain()
+    }
+
+    fn publish_queued(self, accepted: usize) -> Result<()> {
         ensure!(self.enqueued && accepted <= self.coordinates.global.len(),
             "Step-5 predictor accepted row extent");
-        self.owner.stream.drain()?;
         if accepted > 0 {
             let length = self.coordinates.base + accepted as u64;
-            self.cache.stream.device.run(|| self.cache.stream.device.library.copy_h2d(
-                self.components[2], &length.to_le_bytes())).inspect_err(|_| self.cache.poisoned.set(true))?;
+            self.owner.upload(5, self.components[2], &length.to_le_bytes())
+                .inspect_err(|_| self.cache.poisoned.set(true))?;
             self.cache.record_predictor_frontier(self.sequence, self.owner.stage, length)?;
         }
-        self.complete = true;
+        self.retire();
         Ok(())
+    }
+
+    /// Success transfers queued work to the retained runtime. An aborted step
+    /// still drains before releasing its borrowed inputs or cache busy flag.
+    fn retire(mut self) {
+        self.complete = true;
     }
 }
 impl Drop for StageStep<'_, '_> {
     fn drop(&mut self) {
-        self.owner.stream.drain_or_abort("Step-5 predictor proposal retirement");
+        if !self.complete {
+            self.owner.stream.drain_or_abort("Step-5 predictor proposal retirement");
+        }
         self.cache.busy[self.sequence as usize].set(false);
     }
 }
@@ -537,6 +575,7 @@ fn teacher_tokens(stage: usize, base: usize, start: usize, end: usize,
 pub(super) struct Runtime<'a> {
     stages: std::cell::RefCell<Vec<StageOwner<'a>>>,
     tokens: std::cell::RefCell<Vec<Vec<(usize, u32)>>>,
+    selected: std::cell::RefCell<crate::shared::memory::HostAllocation<'a>>,
     rank: usize,
 }
 impl<'a> Runtime<'a> {
@@ -559,8 +598,10 @@ impl<'a> Runtime<'a> {
             owner.bind_cache(cache)?;
             stages.push(owner);
         }
+        let selected = crate::shared::memory::HostAllocation::new(cache.stream.device.library, depth * 8)?;
         Ok(Self { stages: std::cell::RefCell::new(stages),
-            tokens: std::cell::RefCell::new(vec![Vec::new(); cache.sequences() as usize]), rank: cache.rank() })
+            tokens: std::cell::RefCell::new(vec![Vec::new(); cache.sequences() as usize]),
+            selected: std::cell::RefCell::new(selected), rank: cache.rank() })
     }
 
     pub(super) fn rank(&self) -> usize { self.rank }
@@ -573,10 +614,16 @@ impl<'a> Runtime<'a> {
 
     fn catch_up(&self, cache: &super::cache::CacheRank<'a>, sequence: u64,
         start: usize, tokens: &[u32], embedding: &crate::shared::token_io::TokenEmbedding<'a>) -> Result<()> {
-        let capacity = self.stages.borrow().iter().map(|owner| owner.rows).min()
+        let mut stages = self.stages.borrow_mut();
+        let capacity = stages.iter().map(|owner| owner.rows).min()
             .context("Step-5 teacher has no predictor stages")?;
-        // A target span may contain several units. Predictor hooks stay within
-        // the same admitted per-unit workspace and publish canonical frontiers.
+        let stream = stages[0].stream.clone();
+        ensure!(stages.iter().all(|owner| Rc::ptr_eq(&owner.stream, &stream)),
+            "Step-5 predictor stages must share their retained stream");
+        let mut guard = stream.cancellation_guard("Step-5 teacher chain");
+        cache.fence()?;
+        // A target span may contain several units. Drain each predictor unit
+        // before its retained pinned upload planes are reused by the next.
         for (index, chunk) in tokens.chunks(capacity).enumerate() {
             let start = start.checked_add(index * capacity).context("Step-5 teacher chunk extent")?;
             let end = start.checked_add(chunk.len()).context("Step-5 teacher token extent")?;
@@ -584,13 +631,15 @@ impl<'a> Runtime<'a> {
             let known = &mut retained[sequence as usize];
             known.retain(|&(position, _)| position < start);
             known.extend(chunk.iter().copied().enumerate().map(|(i, token)| (start + i, token)));
-            for (stage, owner) in self.stages.borrow_mut().iter_mut().enumerate() {
+            for (stage, owner) in stages.iter_mut().enumerate() {
                 let base = cache.predictor_frontier(sequence, stage)? as usize;
                 let selected = teacher_tokens(stage, base, start, end, owner.rows, known)?;
                 if !selected.is_empty() { owner.teacher(cache, sequence, base as u64, &selected, embedding)?; }
             }
+            stream.drain()?;
             known.retain(|&(position, _)| position >= end.saturating_sub(4));
         }
+        guard.complete = true;
         Ok(())
     }
 
@@ -619,14 +668,28 @@ impl<'a> Runtime<'a> {
         let mut stages = self.stages.borrow_mut();
         ensure!(depth <= stages.len(), "Step-5 draft depth exceeds admission");
         let depth = depth.min(frontier);
+        if depth == 0 { return Ok(Vec::new()); }
+        let stream = stages[0].stream.clone();
+        ensure!(stages.iter().all(|owner| Rc::ptr_eq(&owner.stream, &stream)),
+            "Step-5 predictor stages must share their retained stream");
+        let mut guard = stream.cancellation_guard("Step-5 draft chain");
+        cache.fence()?;
         let mut selected = Vec::with_capacity(depth);
         for (stage, owner) in stages.iter_mut().take(depth).enumerate() {
             let base = frontier.checked_sub(stage + 1).context("Step-5 draft prefix too short")?;
             selected.push(owner.propose(cache, sequence, base as u64, anchor, &selected, embedding)?);
         }
-        selected.into_iter().map(|buffer| {
-            let mut bytes = [0; 8];
-            cache.stream.device.run(|| cache.stream.device.library.copy_d2h(&mut bytes, slice(buffer, 0, 8)?))?;
+        let mut landing = self.selected.borrow_mut();
+        for (bytes, buffer) in landing.bytes_mut().chunks_exact_mut(8).zip(selected) {
+            stream.device.run(|| {
+                // SAFETY: runtime-owned pinned bytes and stage token planes stay
+                // live through the single wait after every result copy is queued.
+                unsafe { stream.device.library.copy_d2h_async(bytes, slice(buffer, 0, 8)?, stream.raw) }
+            })?;
+        }
+        stream.drain()?;
+        guard.complete = true;
+        landing.bytes()[..depth * 8].chunks_exact(8).map(|bytes| {
             ensure!(u32::from_le_bytes(bytes[4..].try_into()?) == 0,
                 "Step-5 predictor logits contain a non-finite value");
             Ok(u32::from_le_bytes(bytes[..4].try_into()?))
@@ -730,6 +793,92 @@ mod tests {
         assert!(!state.open);
         state.close(19);
         assert_eq!(state.anchor, Some(17));
+    }
+
+    #[test]
+    #[ignore = "requires sealed SM120 exports, real Step-5 weights and pinned MTP fixtures"]
+    fn retained_predictor_chain_matches_per_stage_drains_byte_exact() -> Result<()> {
+        use super::super::{cache::CacheRank, rope::TargetTables};
+        use crate::shared::token_io::{EmbedPlacement, EmbedSource, TokenEmbedding};
+        use cuteafd_loader::plan::families::step5::coordinator::CoordinatorContract;
+        // SAFETY: this explicit GPU test selects the sealed slot's native ABI.
+        let library = unsafe { cuteafd_ffi::NativeLibrary::load(std::env::var("CUTEAFD_NATIVE_LIB")?)? };
+        let device = crate::shared::memory::device::cache_test_device(&library)?;
+        let programs = library.programs()?.with_manifest(std::path::Path::new(&std::env::var("CUTEAFD_PROGRAM_MANIFEST")?))?;
+        let checkpoint = Checkpoint::open(std::path::Path::new(&std::env::var("CUTEAFD_SNAPSHOT")?))?;
+        let cfg = Config::parse(&checkpoint)?;
+        let kv_format: Qwen4KvCache = std::env::var("CUTEAFD_STEP5_KV_CACHE")
+            .unwrap_or_else(|_| "bf16".into()).parse()?;
+        let layout = cuteafd_loader::serving_capacity::step5::Step5CacheLayout::new(&cfg, 1, 1024, 3, 64, kv_format)?;
+        let mut cache = CacheRank::new(device, layout.clone(), 0, 1, 2, 1, usize::MAX)?;
+        let contract = CoordinatorContract::from_checkpoint(&checkpoint)?;
+        let rope = Rc::new(TargetTables::load(device, &programs, &contract, "step5_", u64::MAX, &[])?);
+        let arena = Arena::new(device, usize::try_from(native::mtp_forecast_workspace(64, 3, kv_format)?)?)?;
+        let stream = Rc::new(Stream::new(device)?);
+        let mut stages = Vec::new();
+        for stage in 0..3 {
+            let owner = StageOwner::load(device, &programs, &checkpoint, stage, 64,
+                rope.clone(), u64::MAX, &[], &arena, stream.clone(), kv_format)?;
+            owner.bind_cache(&cache)?;
+            stages.push(owner);
+        }
+        let runtime = Runtime { stages: std::cell::RefCell::new(stages),
+            tokens: std::cell::RefCell::new(vec![Vec::new()]),
+            selected: std::cell::RefCell::new(crate::shared::memory::HostAllocation::new(&library, 24)?), rank: 0 };
+        let source = checkpoint.tensors.iter().find(|t| t.meta.name == "model.embed_tokens.weight")
+            .context("Step-5 embedding fixture source")?;
+        let source = EmbedSource::new(&checkpoint.snapshot, &source.shard, &source.meta, H)?;
+        let (embedding, ()) = device.run(|| TokenEmbedding::load(&library, source, EmbedPlacement::Gpu, || Ok(())))?;
+        let hidden = std::fs::read(std::path::Path::new(&std::env::var("CUTEAFD_STEP5_MTP_FIXTURE_DIR")?)
+            .join("target_hidden.bin"))?;
+        let tokens: Vec<u32> = (11..18).collect();
+        let frontier = tokens.len();
+        ensure!(hidden.len() >= frontier * H * 2, "Step-5 chain fixture history too short");
+        let mut reference = None;
+        for queued in [false, true] {
+            cache.reset_sequence(0)?;
+            device.run(|| library.copy_h2d(cache.length(0, false)?, &(frontier as u64).to_le_bytes()))?;
+            let history = cache.request_component(layout.ranks[0].mtp_hidden.context("target hidden history")?, 0)?;
+            device.run(|| library.copy_h2d(slice(history, 0, frontier * H * 2)?, &hidden[..frontier * H * 2]))?;
+            if queued {
+                runtime.catch_up(&cache, 0, 0, &tokens, &embedding)?;
+            } else {
+                let known: Vec<_> = tokens.iter().copied().enumerate().collect();
+                for (stage, owner) in runtime.stages.borrow_mut().iter_mut().enumerate() {
+                    let selected = teacher_tokens(stage, 0, 0, frontier, owner.rows, &known)?;
+                    cache.drain()?;
+                    owner.teacher(&cache, 0, 0, &selected, &embedding)?;
+                    stream.drain()?;
+                }
+            }
+            let draft = if queued {
+                runtime.draft(&cache, 0, frontier, &DraftState { anchor: Some(19), open: false }, 3, &embedding)?
+            } else {
+                let mut selected = Vec::new();
+                let mut tokens = Vec::new();
+                for (stage, owner) in runtime.stages.borrow_mut().iter_mut().enumerate() {
+                    cache.drain()?;
+                    let buffer = owner.propose(&cache, 0, (frontier - stage - 1) as u64, 19, &selected, &embedding)?;
+                    stream.drain()?;
+                    let mut bytes = [0; 8];
+                    device.run(|| library.copy_d2h(&mut bytes, slice(buffer, 0, 8)?))?;
+                    ensure!(bytes[4..] == [0; 4], "non-finite drained predictor logits");
+                    tokens.push(u32::from_le_bytes(bytes[..4].try_into()?));
+                    selected.push(buffer);
+                }
+                tokens
+            };
+            cache.capture(0, usize::from(queued) as u64, frontier as u64)?;
+            cache.drain()?;
+            let mut bytes = vec![0; layout.ranks[0].bytes as usize];
+            device.run(|| library.copy_d2h(&mut bytes, cache.mark_view(u32::from(queued))?))?;
+            if let Some((expected_tokens, expected_bytes)) = &reference {
+                ensure!(draft == *expected_tokens && bytes == *expected_bytes,
+                    "queued predictor chain changed tokens or canonical cache bytes");
+            } else { reference = Some((draft, bytes)); }
+        }
+        eprintln!("Step-5 retained predictor chain: queued/drained tokens and cache byte-exact ({kv_format})");
+        Ok(())
     }
 
     #[test]

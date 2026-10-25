@@ -214,6 +214,33 @@ pub struct Fp8MoeMetadata {
     scratch: Vec<usize>,
 }
 
+/// Exact scratch retained by one execution slot, from the package's static ABI.
+/// This query neither initializes CUDA nor allocates device storage.
+pub fn fp8_slot_scratch_bytes(package: impl IntoIterator<Item = (usize, usize)>, capacity: usize)
+    -> Result<usize> {
+    ensure!(capacity > 0, "native slot capacity must be nonzero");
+    let mut previous = 0;
+    let mut selected = None;
+    for (compiled, scratch) in package {
+        ensure!(compiled > previous, "native package capacities must be sorted and unique");
+        if selected.is_none() && compiled >= capacity { selected = Some(scratch.max(256)); }
+        previous = compiled;
+    }
+    selected.with_context(|| format!("FP8 expert package has no capacity for {capacity} rows"))
+}
+
+/// Exact native slot input/routes/output allocation, independent of architecture.
+pub fn fp8_slot_io_bytes(hidden: usize, topk: usize, wire_input: bool, bf16_sibling: bool,
+    capacity: usize) -> Result<usize> {
+    ensure!(hidden > 0 && hidden % 32 == 0 && topk > 0 && capacity > 0,
+        "invalid native slot I/O geometry");
+    let input = if !wire_input || bf16_sibling { hidden.checked_mul(2) }
+        else { hidden.checked_add(hidden / 32) }.context("native slot input overflow")?;
+    input.checked_add(topk.checked_mul(8).context("native slot routes overflow")?)
+        .and_then(|bytes| hidden.checked_mul(2).and_then(|out| bytes.checked_add(out)))
+        .and_then(|bytes| bytes.checked_mul(capacity)).context("native slot I/O size overflow")
+}
+
 impl Fp8MoeMetadata {
     /// Read the same geometry and workspace contract used by `load`, before
     /// any CUDA state, weights or workspaces are allocated.
@@ -260,6 +287,11 @@ impl Fp8MoeMetadata {
             usize::try_from(query(capacity)?).context("FP8 expert scratch does not fit this process")
         }).collect::<Result<Vec<_>>>()?;
         Ok(Self { info, scratch })
+    }
+
+    /// Static `(compiled capacity, scratch bytes)` records for planner/runtime admission.
+    pub fn scratch_layout(&self) -> impl Iterator<Item = (usize, usize)> + '_ {
+        self.info.capacities.iter().copied().zip(self.scratch.iter().copied())
     }
 
     /// Scratch for the smallest compiled program holding `rows`.
@@ -315,6 +347,11 @@ impl Fp8MoeModule {
 
     pub fn info(&self) -> &Fp8MoeInfo {
         &self.info
+    }
+
+    /// Static `(compiled capacity, scratch bytes)` records, identical to CPU metadata.
+    pub fn scratch_layout(&self) -> impl Iterator<Item = (usize, usize)> + '_ {
+        self.info.capacities.iter().copied().zip(self.scratch.iter().copied())
     }
 
     /// The loaded capacity and selected form's static traffic contract.
@@ -374,6 +411,36 @@ impl Drop for Fp8MoeModule {
 #[cfg(test)]
 mod metadata_tests {
     use super::*;
+
+    #[test]
+    fn slot_scratch_selects_capacity_and_rejects_invalid_manifests() {
+        let package = [(16, 0), (2048, 8192), (4096, 32768)];
+        for (rows, bytes) in [(1, 256), (16, 256), (17, 8192), (2048, 8192),
+            (2752, 32768), (4096, 32768)] {
+            assert_eq!(fp8_slot_scratch_bytes(package, rows).unwrap(), bytes);
+        }
+        assert!(fp8_slot_scratch_bytes(package, 0).is_err());
+        assert!(fp8_slot_scratch_bytes(package, 4097).is_err());
+        for package in [vec![], vec![(0, 1)], vec![(16, 1), (16, 2)], vec![(32, 1), (16, 2)]] {
+            assert!(fp8_slot_scratch_bytes(package, 1).is_err());
+        }
+    }
+
+    #[test]
+    fn slot_io_matches_retained_buffers_with_checked_arithmetic() {
+        for rows in [1, 16, 2048, 2752, 4096] {
+            assert_eq!(fp8_slot_io_bytes(4096, 8, true, false, rows).unwrap(),
+                rows * (4096 + 128 + 8 * 8 + 4096 * 2));
+            for (wire, sibling) in [(false, false), (true, true)] {
+                assert_eq!(fp8_slot_io_bytes(4096, 8, wire, sibling, rows).unwrap(),
+                    rows * (4096 * 4 + 8 * 8));
+            }
+        }
+        for (hidden, topk, rows) in [(0, 8, 1), (33, 8, 1), (128, 0, 1), (128, 8, 0),
+            (128, usize::MAX, 1), (usize::MAX - 31, 8, 1), (128, 8, usize::MAX)] {
+            assert!(fp8_slot_io_bytes(hidden, topk, true, false, rows).is_err());
+        }
+    }
 
     fn words() -> [u32; 16] {
         // ABI 5, MXFP4, pre-SiLU clamp, BF16 projection and input.
