@@ -136,7 +136,7 @@ def test_compact_gate_matches_packager_spark_companions(tmp_path, monkeypatch, g
     assert exporter == "package_exl3_aot.py"
     package = compare_sm.load_file("test_compact_package", ROOT / "python/tools/aot/package_exl3_aot.py")
     profiles = package.compact_profiles(geometry, package.build_profiles("spark", geometry))
-    capacities = package.package_capacities(geometry, compare_sm.CAPACITIES)
+    capacities = package.package_capacities(geometry, compare_sm.EXL3_CAPACITIES)
     recorded = []
     monkeypatch.setitem(sys.modules, "package_exl3_aot", package)
     monkeypatch.setitem(sys.modules, "export_b12x_exl3_aot", SimpleNamespace(

@@ -33,13 +33,15 @@ class GlmExl3PackageTest(unittest.TestCase):
             self.assertEqual(tool.activation(geometry), "silu")
 
     def test_kimi_capacity_set(self):
-        requested = '1,16,80,256,1024,4096'
-        self.assertEqual(tool.package_capacities('kimik3', requested), [1, 80, 256, 1024, 4096])
-        self.assertEqual(tool.package_capacities('glmf', requested), [1, 16, 80, 256, 1024, 4096])
-        for invalid in ('16', '2', '32', '0', '4097'):
+        # Kimi drops only m16 (K128 tiles drift against M1 decode; rows 2..16
+        # take m80); the prefill wave units 2048/2752 package like any other.
+        requested = '1,16,80,256,1024,2048,2752,4096'
+        self.assertEqual(tool.package_capacities('kimik3', requested), [1, 80, 256, 1024, 2048, 2752, 4096])
+        self.assertEqual(tool.package_capacities('glmf', requested), [1, 16, 80, 256, 1024, 2048, 2752, 4096])
+        for invalid in ('16', '0', '4097'):
             with self.assertRaises(ValueError):
                 tool.package_capacities('kimik3', invalid)
-        for capacity in (1, 80, 256, 1024, 4096):
+        for capacity in (1, 80, 256, 1024, 2048, 2752, 4096):
             self.assertEqual(tool.route_block('kimik3', capacity, 'coordinator'), 64 if capacity == 1024 else 8)
             self.assertEqual(tool.route_block('kimik3', capacity, 'spark'), 8)
             self.assertEqual(tool.token_major_rotation('kimik3', capacity, 'coordinator'), capacity == 1024)
