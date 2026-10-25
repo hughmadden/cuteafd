@@ -347,10 +347,31 @@ pub struct Onboarding {
     pub local_bytes: u64,
     pub spark_bytes: Vec<u64>,
 }
-/// The coordinator's routed layers `local`, meeting every remote owner's allocation ceiling.
-/// `remote_reserved` includes scratch, transport, runtime and any remote media.
+
+/// What a Spark rank's worker holds beside its expert residents, at each of the two peaks it admits
+/// (`spark_admission_budget`): serving adds transport, rings, package scratch, runtime residual and
+/// any remote media; loading adds package scratch, runtime residual and remote media, plus the
+/// largest pinned upload and read scratch of one sequential layer load ([`expert_load_transient_bytes`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RemoteReserve {
+    pub serve: u64,
+    pub load: u64,
+}
+
+/// The worker's load-only owners on `rank` for `layer`: its pinned upload plus its read scratch
+/// (`Fp8LayerLoad`, at the residents' exact slicing). A rank's load peak holds the largest of them.
+pub fn expert_load_transient_bytes(catalog: &crate::OfficialV41Catalog, layer: usize, world: usize, rank: usize) -> Result<u64> {
+    let tensors = catalog.fp8().ok_or_else(|| AdmissionError::Checkpoint("native NVFP4 catalog is absent".into()))?;
+    let native = tensors.for_layer(layer).map_err(|e| AdmissionError::Checkpoint(e.to_string()))?;
+    let load = native.layer_load(layer, world, rank, native.exact_slicing(world))
+        .map_err(|e| AdmissionError::Checkpoint(e.to_string()))?;
+    sum([load.pinned as u64, load.host as u64])
+}
+
+/// The coordinator's routed layers `local`, meeting every remote owner's allocation ceiling at
+/// both its serve and its load peak.
 pub fn onboard_layers(catalog: &crate::OfficialV41Catalog, cfg: &MiniMaxM3Config, sizing: RuntimeSizing,
-    budget: u64, remote_reserved: u64, local: &LocalLayers) -> Result<Onboarding> {
+    budget: u64, remote: RemoteReserve, local: &LocalLayers) -> Result<Onboarding> {
     sizing.validate(cfg)?;
     let layers = cfg.moe.iter().enumerate().filter_map(|(layer, &moe)| moe.then_some(layer)).collect::<Vec<_>>();
     let bottom = |count: usize| (layers[..count].to_vec(), layers[count..].to_vec());
@@ -360,12 +381,18 @@ pub fn onboard_layers(catalog: &crate::OfficialV41Catalog, cfg: &MiniMaxM3Config
         LocalLayers::Bottom(_) => return Err(AdmissionError::Unsupported("all-local or excessive routed layer count")),
         LocalLayers::Exactly { local, spark } => vec![(local.clone(), spark.clone())],
     };
-    let mut shortfall = remote_reserved;
+    // Per rank, each routed layer's load-only owners; a candidate's load peak takes its largest.
+    let transients = (0..sizing.spark_ranks).map(|rank| layers.iter()
+        .map(|&layer| Ok((layer, expert_load_transient_bytes(catalog, layer, sizing.spark_ranks, rank)?)))
+        .collect::<Result<std::collections::BTreeMap<_, _>>>()).collect::<Result<Vec<_>>>()?;
+    let mut shortfall = remote.serve.max(remote.load);
     for (local_layers, spark_layers) in candidates {
         let spark_bytes = (0..sizing.spark_ranks).map(|rank| expert_resident_bytes(catalog, &spark_layers, sizing.spark_ranks, rank))
             .collect::<Result<Vec<_>>>()?;
-        let needed = spark_bytes.iter().map(|&bytes| sum([bytes, remote_reserved])).collect::<Result<Vec<_>>>()?
-            .into_iter().max().unwrap_or(remote_reserved);
+        let needed = spark_bytes.iter().zip(&transients).map(|(&bytes, transient)| {
+            let largest = spark_layers.iter().filter_map(|layer| transient.get(layer).copied()).max().unwrap_or(0);
+            Ok(sum([bytes, remote.serve])?.max(sum([bytes, remote.load, largest])?))
+        }).collect::<Result<Vec<_>>>()?.into_iter().max().unwrap_or(shortfall);
         shortfall = needed;
         if needed <= budget {
             return Ok(Onboarding { local_bytes: expert_resident_bytes(catalog, &local_layers, 1, 0)?,
@@ -442,14 +469,18 @@ impl Recipe {
         let world = format!("tp{}", sizing.spark_ranks);
         let remote_scratch = package.filter(|p| p["layouts"][&world].is_object())
             .map(|p| expert_workspace(p, sizing.spark_ranks, sizing.rows)).transpose()?;
+        let scratch = remote_scratch.unwrap_or(REMOTE_SCRATCH_ESTIMATE_BYTES);
+        let residual = cuteafd_core::memory_layout::SPARK_RUNTIME_RESIDUAL_BYTES;
         let remote_reserved = sum([io.intake, io.host_exchange, io.row_indices, io.endpoint_staging, io.mapped_rings,
-            remote_scratch.unwrap_or(REMOTE_SCRATCH_ESTIMATE_BYTES), cuteafd_core::memory_layout::SPARK_RUNTIME_RESIDUAL_BYTES])?;
-        let with_vision = remote_reserved.checked_add(request.spark_vision_bytes).context("MiniMax remote vision reservation overflow")?;
+            scratch, residual])?;
+        let remote = RemoteReserve { serve: remote_reserved, load: sum([scratch, residual])? };
+        let with_vision = RemoteReserve { serve: sum([remote.serve, request.spark_vision_bytes])?,
+            load: sum([remote.load, request.spark_vision_bytes])? };
         let onboarding = onboard_layers(catalog, cfg, sizing, request.spark_budget, with_vision, &request.local_layers);
         if request.spark_vision_bytes > 0 && request.local_layers == LocalLayers::Fewest
             && onboarding.as_ref().map_or(true, |o| !o.local_layers.is_empty()) {
             // Every routed layer fits the Sparks without the tower: the tower is the cause, not onboarding.
-            if let Ok(all) = onboard_layers(catalog, cfg, sizing, request.spark_budget, remote_reserved, &LocalLayers::Bottom(0)) {
+            if let Ok(all) = onboard_layers(catalog, cfg, sizing, request.spark_budget, remote, &LocalLayers::Bottom(0)) {
                 let experts = all.spark_bytes.iter().copied().max().unwrap_or(0).saturating_add(remote_reserved);
                 let gb = |bytes: u64| bytes as f64 / 1e9;
                 anyhow::bail!("Spark-hosted vision needs {:.2} GB on every Spark rank, but each TP{} rank has {:.2} GB left \
