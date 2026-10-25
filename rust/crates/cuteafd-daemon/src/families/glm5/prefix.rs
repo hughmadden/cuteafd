@@ -312,6 +312,23 @@ fn compare_continuations(a: &Continuation, b: &Continuation) -> (bool, String) {
             same(logits_equal), same(decode_equal), a.len, same(paged_equal)))
 }
 
+/// What a passing [`resume_check`] observed (its final lines' counts).
+#[derive(Debug, Clone, serde::Serialize)]
+pub(crate) struct ResumeSummary {
+    pub at: usize,
+    pub prefilled: usize,
+    pub chunk: usize,
+    pub decode: usize,
+    pub mode: &'static str,
+    pub variant: u8,
+    pub attempts: usize,
+    pub byte_identical: usize,
+    pub states_identical: usize,
+    pub suffix_top1_agree: usize,
+    pub suffix_rows: usize,
+    pub straight_last_row_identical: bool,
+}
+
 /// glm-golden --resume-at P: compare exact prefix bytes (including the tail), continuation
 /// layer/logit digests, greedy decode logits and final paged bytes. Device mode forks A;
 /// cold mode prefills B; host mode finishes and releases A before restoring B from pinned RAM.
@@ -319,7 +336,7 @@ fn compare_continuations(a: &Continuation, b: &Continuation) -> (bool, String) {
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn resume_check(engine: &GlmEngine<'_>, tokens: &[u32],
     at: usize, n: usize, chunk: usize, decode: usize, cold: bool, repeat: usize,
-    host: Option<&crate::shared::prefix::PrefixArgs>, mut experts: Experts<'_, '_>) -> Result<()> {
+    host: Option<&crate::shared::prefix::PrefixArgs>, mut experts: Experts<'_, '_>) -> Result<ResumeSummary> {
     use super::engine::PageAllocator;
     use cuteafd_engine::prefix::{After, SnapshotKind};
     use cuteafd_hostcache::copy::{CopyEngine, Stream};
@@ -435,7 +452,9 @@ pub(crate) fn resume_check(engine: &GlmEngine<'_>, tokens: &[u32],
     println!("resume at {at} of {n} (chunks of {chunk}): {identical}/{repeat} attempts byte-identical, state at {at} identical in {states_identical}/{repeat}{mode}");
     ensure!(states_identical == repeat, "the restored state differs from the captured one");
     ensure!(identical == repeat, "the restored sequence's continuation differs from the straight one");
-    Ok(())
+    Ok(ResumeSummary { at, prefilled: n, chunk, decode, variant, attempts: repeat, byte_identical: identical,
+        states_identical, suffix_top1_agree: agree, suffix_rows: x.len(), straight_last_row_identical: last_equal,
+        mode: if cold { "cold" } else if host.is_some() { "host" } else { "device" } })
 }
 
 #[cfg(test)]
