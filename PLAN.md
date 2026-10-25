@@ -5989,9 +5989,13 @@ paged state were identical. This is a base correctness result, not layered
 or performance qualification. The published Keys payload receipt now passes
 for every extracted site. Its executed scope remains 96 edited and 60
 unchanged sites; two verified MTP sites are excluded. The persistent source
-client cache is being qualified before derivation and repeated launches.
-Alternate-layer component/cache gates, DFlash2 and real-agent checks, and
-the matched four-Spark performance comparison remain required. The later
+client cache now passes a fresh mounted payload/metadata reread with no
+upstream payload fetches. The full CPU plan accepts exactly the published
+96 rank-one edits, leaves the other 60 sites unchanged and agrees with the
+packed device-table charge. Both published-weight component fixtures ran
+and passed with the original numerical bars and unchanged base rows.
+Layered GPU/cache gates, DFlash2 and real-agent checks, and the matched
+four-Spark performance comparison remain required. The later
 API and qualification-tooling fixes are integrated for the final seal;
 smoke entries now carry one exact model ID through panels and sweeps and
 use the deployment's shared hardware lock directory.
@@ -6002,7 +6006,8 @@ Pipelined full-logit scoring remains unsupported (upstream issue 749); ordinary
 serving keeps its prefill pipeline. `glm-golden --variant-suite` now composes
 the existing NLL, streamed base-logit byte comparison and exact prefix/RAM
 checks for base and each ready variant on one engine load. Its pinned-source
-focused CPU checks pass; the combined hardware run is still required. It adds
+focused CPU checks pass; the combined hardware run is active on sealed
+`237a3cf7b`, with no result yet. It adds
 no execution, graph or cache path. The capped-export child now receives all
 the CDI helper functions it calls.
 
