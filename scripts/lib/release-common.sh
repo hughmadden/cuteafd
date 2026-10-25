@@ -2183,6 +2183,67 @@ release_remove_private_wip_layout() {
     rm -rf -- "$RELEASE_PRIVATE_WIP_LAYOUT" "$RELEASE_PRIVATE_WIP_LAYOUT.tmp"
 }
 
+# The tool_eval panel runs `tool-eval-bench` from PATH. Release images install it from the
+# pinned submodule (docker/Dockerfile.release); the WIP coordinator layout gets the same
+# source, verified against its lock, plus a bin/tool-eval-bench wrapper that runs it from
+# /source with the one dependency the dev image lacks (python-dotenv, pinned wheel below).
+RELEASE_TOOL_EVAL_DOTENV_WHEEL=python_dotenv-1.2.4-py3-none-any.whl
+RELEASE_TOOL_EVAL_DOTENV_URL=https://files.pythonhosted.org/packages/60/d1/38f3a3405989a89ac18390803e70c6ad7c7760da4f9b83cbeca0c44a0c72/python_dotenv-1.2.4-py3-none-any.whl
+RELEASE_TOOL_EVAL_DOTENV_SHA256=42269a8a5b3fd54ffa6f3d84b18abed50064717576b4ecf03dc4a55d8aa04fdc
+
+# release_tool_eval_dotenv_wheel: print the cached pinned wheel's path, downloading it once.
+# The hash is checked on every use, not only on download.
+release_tool_eval_dotenv_wheel() {
+  local dir="${CUTEAFD_WHEEL_CACHE:-$HOME/.cache/cuteafd/wheels}/$RELEASE_TOOL_EVAL_DOTENV_SHA256"
+  local wheel="$dir/$RELEASE_TOOL_EVAL_DOTENV_WHEEL"
+  if [[ ! -f "$wheel" ]]; then
+    mkdir -p "$dir" && curl -sSfL --max-time 120 -o "$wheel.part" "$RELEASE_TOOL_EVAL_DOTENV_URL" &&
+      mv "$wheel.part" "$wheel" ||
+      { rm -f "$wheel.part"; release_die "cannot download $RELEASE_TOOL_EVAL_DOTENV_WHEEL for the WIP tool-eval-bench CLI; place it at $wheel"; }
+  fi
+  [[ "$(sha256sum "$wheel" | cut -d' ' -f1)" == "$RELEASE_TOOL_EVAL_DOTENV_SHA256" ]] ||
+    release_die "$wheel does not match its pinned sha256 $RELEASE_TOOL_EVAL_DOTENV_SHA256; delete it to re-download"
+  printf '%s\n' "$wheel"
+}
+
+# release_stage_wip_tool_eval CONTAINER HOST_ROOT SLOT_SOURCE STAGE: a slot built without the
+# tool-eval-bench submodule stages no CLI (the panel reports it unavailable); a slot whose
+# copy does not match the lock fails staging. The sealed slot is only read.
+release_stage_wip_tool_eval() {
+  local container="$1" root="$2" slot_source="$3" stage="$4" wheel
+  local source="$stage/source/third_party/tool-eval-bench"
+  if ! release_wip_cp "$container" "$root" "$slot_source/third_party/tool-eval-bench" "$stage/source/third_party/" 2>/dev/null ||
+    [[ ! -f "$source/pyproject.toml" ]]; then
+    rm -rf "$source"
+    printf 'WIP slot has no tool-eval-bench source: the tool_eval panel will report it unavailable\n' >&2
+    return 0
+  fi
+  release_wip_cp "$container" "$root" "$slot_source/third_party/tool-eval-bench.lock.json" "$stage/source/third_party/" ||
+    release_die "WIP slot has tool-eval-bench source but no third_party/tool-eval-bench.lock.json"
+  release_wip_cp "$container" "$root" "$slot_source/scripts/build/verify-tool-eval-source.py" "$stage/source/scripts/build/" ||
+    release_die "WIP slot has tool-eval-bench source but no scripts/build/verify-tool-eval-source.py"
+  # The copy's gitfile points into the slot's module store; drop it and any bytecode so the
+  # lock's content digest is the whole check and only verified source can run.
+  rm -rf "$source/.git"
+  find "$source" \( -name __pycache__ -o -name '*.pyc' -o -name '*.pyo' \) -prune -exec rm -rf {} +
+  python3 -I "$stage/source/scripts/build/verify-tool-eval-source.py" --require-no-python-cache \
+    --source "$source" --lock "$stage/source/third_party/tool-eval-bench.lock.json" >&2 ||
+    release_die "WIP slot tool-eval-bench source does not match its lock; rebuild the slot with ./wip.sh"
+  wheel="$(release_tool_eval_dotenv_wheel)" || exit $?
+  mkdir -p "$stage/source/tool-eval-deps"
+  python3 -I -c 'import sys, zipfile; zipfile.ZipFile(sys.argv[1]).extractall(sys.argv[2])' \
+    "$wheel" "$stage/source/tool-eval-deps" || release_die "cannot extract $wheel"
+  cat > "$stage/bin/tool-eval-bench" <<'WRAPPER'
+#!/bin/sh
+# Staged by release_stage_wip_tool_eval: the slot's lock-verified tool-eval-bench source.
+root="${CUTEAFD_WIP_SOURCE_ROOT:-/source}"
+export PYTHONDONTWRITEBYTECODE=1
+export PYTHONPATH="$root/third_party/tool-eval-bench/src:$root/tool-eval-deps${PYTHONPATH:+:$PYTHONPATH}"
+exec python3 -P -c 'import sys; sys.argv[0] = "tool-eval-bench"; from tool_eval_bench.cli.dispatch import main; sys.exit(main())' "$@"
+WRAPPER
+  chmod 0755 "$stage/bin/tool-eval-bench"
+}
+
 release_stage_wip_layout() {
   local container="$1" slot="$2" role="$3" layout="$4"
   local raw="$layout.tmp/raw" root
@@ -2209,6 +2270,7 @@ release_stage_wip_layout() {
   release_wip_cp "$container" "$root" "$slot_source/scripts/build/verify-sparkinfer-source.py" "$layout.tmp/source/scripts/build/"
   python3 "$layout.tmp/source/scripts/build/verify-sparkinfer-source.py" \
     --source "$layout.tmp/source/third_party/sparkinfer" --lock "$layout.tmp/source/third_party/sparkinfer.lock.json"
+  [[ "$role" != coordinator ]] || release_stage_wip_tool_eval "$container" "$root" "$slot_source" "$layout.tmp"
   rm -rf "$raw" "$layout"
   mv "$layout.tmp" "$layout"
 }
