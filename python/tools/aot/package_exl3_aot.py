@@ -461,6 +461,11 @@ SPARK_WS_CELLS = {
     ('qwen4', 384): dict(dynamic=True, tile=(64, 192, 64, 256)),
     ('qwen4', 256): dict(dynamic=False, tile=(64, 256, 64, 256)),
     ('qwen4', 128): dict(dynamic=True, tile=(64, 128, 64, 256)),
+    ('v41', 1152): dict(dynamic=True, tile=(64, 192, 64, 256)),
+    ('v41', 768): dict(dynamic=True, tile=(64, 256, 64, 256)),
+    ('v41', 640): dict(dynamic=True, tile=(64, 128, 64, 256)),
+    ('v41', 512): dict(dynamic=True, tile=(64, 256, 64, 256)),
+    ('v41', 384): dict(dynamic=True, tile=(64, 192, 64, 256)),
 }
 
 
@@ -1322,7 +1327,7 @@ def build(args: argparse.Namespace) -> None:
                 if ws:
                     block = (compact_block if compact_block is not None
                              else ws_route_block(geometry, args.role, width, capacity))
-                    if geometry in ('kimik3', 'qwen4') or args.role == 'coordinator':
+                    if geometry in ('kimik3', 'qwen4', 'v41') or args.role == 'coordinator':
                         # Existing policy-keyed directories contain cooperative exports.
                         # The input format and claim mode are part of the compiled
                         # program, so they name its cache directory.

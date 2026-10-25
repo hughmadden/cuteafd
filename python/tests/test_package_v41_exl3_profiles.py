@@ -998,8 +998,7 @@ class PackageProfileTests(unittest.TestCase):
             self.assertEqual(package.ws_route_block('glm', 'spark', 640, capacity), 64)
         for capacity in (1, 80, 256, 512, 1536, 8192):
             self.assertIsNone(package.ws_tile('glm', 'spark', 640, capacity))
-        for geometry in ('v41', 'dsv4p'):
-            self.assertIsNone(package.ws_tile(geometry, 'spark', 640, 2048))
+        self.assertIsNone(package.ws_tile('dsv4p', 'spark', 640, 2048))
         self.assertIsNone(package.ws_tile('glm', 'coordinator', 640, 2048))
         self.assertIsNone(package.ws_tile('glm', 'spark', 640, 2048, compact=True))
         with tempfile.TemporaryDirectory() as temporary:
@@ -1094,6 +1093,42 @@ class PackageProfileTests(unittest.TestCase):
                 else:
                     self.assertEqual(call.kwargs['route_block'], 32)
                     self.assertTrue(call.kwargs['token_major_rotation'])
+
+    def test_v41_ordinary_spark_prefill_units_use_qualified_ws_cells(self):
+        tiles = {
+            1152: (64, 192, 64, 256),
+            768: (64, 256, 64, 256),
+            640: (64, 128, 64, 256),
+            512: (64, 256, 64, 256),
+            384: (64, 192, 64, 256),
+        }
+        for width, tile in tiles.items():
+            for capacity in (2048, 2752):
+                self.assertTrue(package.warp_specialized('v41', 'spark', width, capacity))
+                self.assertEqual(package.ws_tile('v41', 'spark', width, capacity), tile)
+                self.assertTrue(package.ws_dynamic_tiles('v41', 'spark', width, capacity))
+                self.assertFalse(package.wire_input('v41', 'spark', width, capacity))
+            for capacity in (1, 16, 80, 256, 1024, 4096):
+                self.assertFalse(package.warp_specialized('v41', 'spark', width, capacity))
+        self.assertFalse(package.warp_specialized('v41', 'spark', 2304, 2048))
+        with tempfile.TemporaryDirectory() as temporary:
+            _, _, calls, _ = self.build_fixture(
+                Path(temporary), 'spark', (3, 4), geometry='v41',
+                capacities=(1024, 2048, 2752, 4096))
+            self.assertEqual({call.args[1] for call in calls}, set(tiles))
+            for call in calls:
+                width, capacity = call.args[1], call.args[3]
+                ws = capacity in (2048, 2752)
+                self.assertEqual(call.kwargs.get('warp_specialized', False), ws)
+                self.assertEqual('+ws-m64/' in str(call.args[0]), ws)
+                self.assertFalse(call.kwargs.get('token_major_rotation', False))
+                self.assertFalse(call.kwargs.get('compact_weights', False))
+                if ws:
+                    self.assertEqual(call.kwargs['tile'], tiles[width])
+                    self.assertTrue(call.kwargs['ws_dynamic_tiles'])
+                    self.assertEqual(call.kwargs['route_block'], 64)
+                else:
+                    self.assertEqual(call.kwargs.get('route_block', 8), 8)
 
     def test_warp_specialized_spark_prefill_policy_is_unchanged(self):
         """Existing Spark widths retain WS; unrelated coordinator families do not."""
