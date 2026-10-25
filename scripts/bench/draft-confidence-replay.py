@@ -65,7 +65,7 @@ def load(trace: Path, key: str | None):
             raise ValueError("a fixed-K7 record misses history or features")
         blocks.append(dict(request=int(row["request"]), accepted=int(row["accepted"]),
                            observed=int(row["observed"]), history=row["history"][:POSITIONS],
-                           features=row["features"][:POSITIONS]))
+                           features=row["features"][:POSITIONS], prior=row.get("prior", [])[:POSITIONS]))
     if not blocks:
         raise ValueError("no fixed-K7 draft_confidence records")
     return blocks
@@ -184,8 +184,13 @@ def replay(blocks, lines, names, thinking, row_ms, folds, regularization):
     base, per_row = row_ms
     cost = lambda rows: base + per_row * (rows - 1)
     x = np.stack([features(b) for b in blocks])
+    generic = logistic(x, GENERIC)
+    # Under the generic fit, the engine's recorded prior is this one: the trace's features and
+    # history check out end to end.
+    recorded = [(generic[b, i], p) for b, block in enumerate(blocks) for i, p in enumerate(block["prior"])]
+    mismatch = max((abs(a - b) for a, b in recorded), default=float("nan"))
     raw = {"history": np.asarray([b["history"] for b in blocks]),
-           "generic": logistic(x, GENERIC),
+           "generic": generic,
            "fitted": np.full((len(blocks), POSITIONS), np.nan)}
     calibrated = {name: np.full_like(raw["history"], np.nan) for name in raw}
     line_of = np.asarray([lines[b["request"]] for b in blocks])
@@ -231,7 +236,7 @@ def replay(blocks, lines, names, thinking, row_ms, folds, regularization):
                 continue
             quality[name][i + 1] = dict(observed=len(y), accepted=float(y.mean()),
                                         logloss=calibrate.logloss(scores, y), auc=auc(scores, y))
-    return table, quality
+    return table, quality, mismatch
 
 
 def main():
@@ -253,9 +258,11 @@ def main():
     names = parse_classes(args.classes, len(requests))
     thinking = [(r.get("thinking") or {}).get("type", "default") for r in requests]
     row_ms = tuple(float(v) for v in args.row_ms.split(","))
-    table, quality = replay(blocks, lines, names, thinking, row_ms, args.folds, args.regularization)
+    table, quality, mismatch = replay(blocks, lines, names, thinking, row_ms, args.folds, args.regularization)
     print(f"{len(blocks)} fixed-K7 blocks from {len(set(lines[b['request']] for b in blocks))} of {len(requests)} "
           f"requests; T(n) = {row_ms[0]} + {row_ms[1]} (n - 1) ms")
+    print(f"generic prior against the engine's recorded prior: max difference {mismatch:.2e} "
+          "(near zero when the run used the generic fit)")
     for group, rules in table.items():
         print(f"\n{group} ({rules['ceiling']['cycles']} blocks)")
         print(f"  {'rule':<14}{'tok/cycle':>10}{'drafts':>8}{'ms/cycle':>10}{'tok/s':>8}")
@@ -266,7 +273,8 @@ def main():
     for name, positions in quality.items():
         print(f"  {name:<8}" + "".join(f" {i}: {q['logloss']:.3f}/{q['auc']:.3f}" for i, q in positions.items()))
     if args.json:
-        args.json.write_text(json.dumps(dict(row_ms=row_ms, table=table, quality=quality), indent=1) + "\n")
+        args.json.write_text(json.dumps(dict(row_ms=row_ms, table=table, quality=quality,
+                                             recorded_prior_difference=mismatch), indent=1) + "\n")
 
 
 if __name__ == "__main__":
