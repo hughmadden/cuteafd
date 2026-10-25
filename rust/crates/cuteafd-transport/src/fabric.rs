@@ -20,6 +20,8 @@ const SYSFS_INFINIBAND: &str = "/sys/class/infiniband";
 pub struct FabricReport {
     pub ports: Vec<RdmaPort>,
     pub rails: RailPlan,
+    /// GRH traffic byte applied to all native RC QPs by the shared startup key.
+    pub rdma_traffic_class: u8,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -126,7 +128,15 @@ pub fn discover() -> Result<FabricReport> {
         }
     }
     let rails = plan_rails(&ports);
-    Ok(FabricReport { ports, rails })
+    let rdma_traffic_class = parse_traffic_class(std::env::var("CUTEAFD_RDMA_TRAFFIC_CLASS").ok().as_deref())?;
+    Ok(FabricReport { ports, rails, rdma_traffic_class })
+}
+
+fn parse_traffic_class(value: Option<&str>) -> Result<u8> {
+    let value = value.filter(|v| !v.is_empty()).unwrap_or("0");
+    anyhow::ensure!(value.bytes().all(|b| b.is_ascii_digit()),
+        "CUTEAFD_RDMA_TRAFFIC_CLASS must be a decimal byte (0..255)");
+    value.parse().context("CUTEAFD_RDMA_TRAFFIC_CLASS must be a decimal byte (0..255)")
 }
 
 fn read_device(path: &Path, addresses: &[(String, Ipv4Addr, u8)]) -> Result<Vec<RdmaPort>> {
@@ -300,7 +310,7 @@ impl FabricReport {
     /// One line per rail for startup logs.
     pub fn summary(&self) -> String {
         if self.rails.rails.is_empty() {
-            return format!("fabric: {}", self.rails.reason);
+            return format!("fabric: rdma_tc={} dscp={} {}", self.rdma_traffic_class, self.rdma_traffic_class >> 2, self.rails.reason);
         }
         let rails: Vec<_> = self
             .rails
@@ -313,13 +323,27 @@ impl FabricReport {
                 )
             })
             .collect();
-        format!("fabric: use {} rail(s) of [{}]: {}", self.rails.use_rails, rails.join(", "), self.rails.reason)
+        format!("fabric: rdma_tc={} dscp={} use {} rail(s) of [{}]: {}",
+            self.rdma_traffic_class, self.rdma_traffic_class >> 2, self.rails.use_rails, rails.join(", "), self.rails.reason)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn traffic_class_is_an_opt_in_byte_not_a_dscp() {
+        for (value, expected) in [(None, 0), (Some(""), 0), (Some("104"), 104), (Some("255"), 255)] {
+            assert_eq!(parse_traffic_class(value).unwrap(), expected);
+        }
+        for value in ["-1", "+1", "256", "26x", " 104", "99999999999999"] {
+            assert!(parse_traffic_class(Some(value)).is_err(), "{value}");
+        }
+        let report = FabricReport { ports: vec![], rails: plan_rails(&[]), rdma_traffic_class: 104 };
+        assert!(report.summary().contains("rdma_tc=104 dscp=26"));
+    }
+
 
     fn port(device: &str, gbps: f64, address: [u8; 4], pcie_width: u32) -> RdmaPort {
         let address = Ipv4Addr::from(address);

@@ -230,3 +230,81 @@ def test_persist_prints_only_unit(tmp_path):
                                    ("report", "--dry-run"), ("--unknown",)])
 def test_invalid_arguments(tmp_path, args):
     assert run(tmp_path, *args).returncode == 2
+
+
+QOS = '''DCBX mode: OS controlled
+Priority trust state: pcp
+Receive buffer size (bytes): 0,459360,0,0,0,0,0,0,max_buffer_size=2039616
+PFC configuration:
+ priority    0 1 2 3 4 5 6 7
+ enabled     0 0 0 0 0 0 0 0
+ buffer      1 1 1 1 1 1 1 1
+tc: 3 ratelimit: unlimited, tsa: vendor
+ priority:  3
+tc: 6 ratelimit: unlimited, tsa: vendor
+ priority:  6
+'''
+
+
+def fabric_fixture(root):
+    import json
+    base = 'class/infiniband/rocep1s0f0/ports/1'
+    put(root, base + '/state', '4: ACTIVE')
+    put(root, base + '/link_layer', 'Ethernet')
+    put(root, base + '/gid_attrs/ndevs/3', 'roce0')
+    put(root, 'class/net/roce0/ip.json', json.dumps([
+        {'addr_info': [{'local': '10.55.0.1'}]}]))
+    put(root, 'class/net/roce0/mlnx_qos.txt', QOS)
+    put(root, 'class/net/roce0/app.json', '{}')
+    put(root, 'class/net/roce0/pause.txt', 'Autonegotiate: off\nRX: on\nTX: on')
+
+
+@pytest.mark.parametrize('role', ['coordinator', 'spark'])
+def test_fabric_preview_is_explicit_and_read_only(tmp_path, role):
+    fabric_fixture(tmp_path)
+    before = snapshot(tmp_path)
+    check = run(tmp_path, 'fabric-lossless', 'check', '--role', role)
+    assert check.returncode == 0, check.stderr
+    assert 'traffic_class=absent' in check.stdout
+    preview = run(tmp_path, 'fabric-lossless', 'apply', '--role', role, '--dry-run')
+    assert preview.returncode == 0, preview.stderr
+    assert 'command mlnx_qos -i roce0 --trust dscp' in preview.stdout
+    assert '--pfc 0,0,0,1,0,0,0,0' in preview.stdout
+    assert '--prio2buffer 0,0,0,1,0,0,0,0' in preview.stdout
+    assert '--dscp2prio=set,26,3' in preview.stdout
+    assert '--dscp2prio=set,48,6' in preview.stdout
+    assert '--dscp2prio=set,0,0' in preview.stdout
+    assert '--dscp2prio=set,24,0' in preview.stdout
+    for line in preview.stdout.splitlines():
+        assert not ('--trust' in line and '--dscp2prio' in line)
+    assert before == snapshot(tmp_path)
+
+
+def test_fabric_preflight_refuses_conflicts_and_rootless_writes(tmp_path):
+    fabric_fixture(tmp_path)
+    result = run(tmp_path, 'fabric-lossless', 'apply', '--role', 'spark')
+    assert result.returncode != 0
+    assert 'requires root' in result.stderr or 'fixture writes are forbidden' in result.stderr
+    put(tmp_path, 'class/net/roce0/mlnx_qos.txt', QOS.replace('OS controlled', 'Firmware controlled'))
+    before = snapshot(tmp_path)
+    result = run(tmp_path, 'fabric-lossless', 'apply', '--role', 'spark', '--dry-run')
+    assert result.returncode != 0 and 'OS-controlled' in result.stderr
+    assert 'DRY-RUN command' not in result.stdout
+    assert before == snapshot(tmp_path)
+
+
+def test_fabric_rollback_uses_original_state(tmp_path):
+    import json
+    fabric_fixture(tmp_path)
+    saved = {'netdev': 'roce0', 'rdma': ['rocep1s0f0', '1'],
+             'buffers': ['1'] * 8, 'sizes': ['0', '459360'] + ['0'] * 6,
+             'pfc': ['0'] * 8, 'trust': 'pcp', 'app': {'dscp_prio': [[7, 2]]},
+             'pause': {'autoneg': 'off', 'rx': 'on', 'tx': 'on'}}
+    put(tmp_path, 'var/lib/cuteafd/fabric-lossless/roce0.json', json.dumps(saved))
+    before = snapshot(tmp_path)
+    result = run(tmp_path, 'fabric-lossless', 'rollback', '--role', 'spark', '--dry-run')
+    assert result.returncode == 0, result.stderr
+    assert '--buffer_size 0,459360,0,0,0,0,0,0' in result.stdout
+    assert 'dscp-prio 7:2' in result.stdout
+    assert '--trust pcp' in result.stdout
+    assert before == snapshot(tmp_path)

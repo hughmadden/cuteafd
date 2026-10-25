@@ -3842,3 +3842,20 @@ def test_dense_qwen_forwards_speculation_trace(tmp_path: Path) -> None:
     launch = next(line for line in result.stderr.splitlines() if "serve-qwen35 --snapshot" in line)
     assert f"CUTEAFD_SPECULATION_TRACE={trace}" in launch
     assert f"{trace.parent}:{trace.parent}" in launch
+
+
+@pytest.mark.parametrize('value', ['0', '104', '255'])
+def test_rdma_traffic_byte_reaches_coordinator_and_sparks(tmp_path, value):
+    result = _family_launch_result(tmp_path, _GLMF, 'test/glmf', f'RDMA_TRAFFIC_CLASS={value}\n')
+    assert result.returncode == 0, result.stderr
+    launch = next(line for line in result.stderr.splitlines() if 'cuteafd serve-glmf' in line)
+    workers = [line for line in result.stderr.splitlines() if 'docker run -d --name cuteafd-spark-expert-' in line]
+    assert f'CUTEAFD_RDMA_TRAFFIC_CLASS={value}' in launch
+    assert workers and all(f'CUTEAFD_RDMA_TRAFFIC_CLASS={value}' in line for line in workers)
+
+
+@pytest.mark.parametrize('value', ['-1', '256', 'dscp26', '+104'])
+def test_rdma_traffic_byte_rejects_invalid_values(tmp_path, value):
+    result = _family_launch_result(tmp_path, _GLMF, 'test/glmf', f'RDMA_TRAFFIC_CLASS={value}\n')
+    assert result.returncode == 2 and 'RDMA_TRAFFIC_CLASS must be' in result.stderr
+    assert not any(line.startswith(('docker ', 'ssh ', 'nest ')) for line in result.stderr.splitlines())
