@@ -228,6 +228,7 @@ workloads are unchanged.
 
 ## MiniMax M3.1
 
+- 2026-10-25 · Full report · MiniMaxAI/MiniMax-M3.1-Flash · 1× GeForce RTX 5090 @ 600 W + 4× DGX Spark · 31 GiB budget · build 7c52779094ae · [report](minimax_m3/2026-10-25-full-minimax-m3-1-flash-1rtx-4spark-rtx5090-dflash2/report.svg)
 - 2026-10-25 · Release smoke · MiniMaxAI/MiniMax-M3.1-Flash · 1× GeForce RTX 5090 @ 600 W + 4× DGX Spark · 31 GiB budget · build 7c52779094ae · [report](minimax_m3/2026-10-25-smoke-minimax-m3-1-flash-1rtx-4spark-rtx5090-dflash2/report.svg)
 - 2026-10-25 · Release smoke · MiniMaxAI/MiniMax-M3.1-Flash · 1× GeForce RTX 5090 @ 600 W + 4× DGX Spark · 31 GiB budget · build 7c52779094ae · [report](minimax_m3/2026-10-25-smoke-minimax-m3-1-flash-1rtx-4spark-rtx5090-dspark/report.svg)
 - 2026-10-25 · Release smoke · MiniMaxAI/MiniMax-M3.1-Flash · 1× GeForce RTX 5090 @ 600 W + 4× DGX Spark · 31 GiB budget · build 7c52779094ae · [report](minimax_m3/2026-10-25-smoke-minimax-m3-1-flash-1rtx-4spark-rtx5090-off/report.svg)
