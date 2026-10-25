@@ -35,7 +35,7 @@ class PlacementHandoffTest(unittest.TestCase):
             root=Path(directory); (root/'plan').write_text(json.dumps(plan))
             for name in ['docker','ssh','nest']:
                 path=root/name;path.write_text(STUB);path.chmod(0o755)
-            env=dict(os.environ,HOME=str(root/"home"),PATH=str(root)+os.pathsep+os.environ['PATH'],EVENTS=str(root/'events'),PLAN=str(root/'plan'),
+            env=dict(os.environ,PWD=str(ROOT),HOME=str(root/"home"),PATH=str(root)+os.pathsep+os.environ['PATH'],EVENTS=str(root/'events'),PLAN=str(root/'plan'),
                 ENCODER_PLAN=json.dumps(encoder))
             setup=r'''
 set -euo pipefail
@@ -85,6 +85,8 @@ gpu_uuid_csv=uuid0,uuid1
 fingerprint=test
 hf_home=/models
 namespace_root=/mnt/sparknest
+namespace_hf_home="$namespace_root/hf-home"
+ready_timeout="${CUTEAFD_RELEASE_READY_TIMEOUT_SECONDS:-900}"
 COORDINATOR_DOCKER_INFERENCE=coordinator-image
 SPARK_EXPERT_DOCKER_INFERENCE=spark-image
 SPARK_DEVICE_BUDGET_BYTES=1000000

@@ -272,7 +272,9 @@ static void mock_launch(void** args, int) {{
         [5 | (5 if geometry == "step5_bf16" else 4 if "nvfp4" in geometry else 1) << 8 | 1 << 16 | 1 << 24, 6144, 1024, 384, 8, 2048, 2, 1, 0, 1, 80, 0, 0, 0, 0, 0])
     (tmp_path / "bridge.cc").write_text(source)
     library = tmp_path / "bridge.so"
-    compiled = subprocess.run([compiler, "-shared", "-fPIC", "-std=c++17", "-pthread",
+    # PyTorch may have loaded libcudart globally in this worker. Keep this
+    # CPU fixture's CUDA calls bound to its own mocks.
+    compiled = subprocess.run([compiler, "-shared", "-fPIC", "-Wl,-Bsymbolic-functions", "-std=c++17", "-pthread",
                                f"-I{tmp_path}", str(tmp_path / "bridge.cc"), "-o", str(library)],
                               text=True, capture_output=True, timeout=30)
     assert compiled.returncode == 0, compiled.stderr
