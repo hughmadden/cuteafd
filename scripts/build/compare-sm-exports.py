@@ -319,13 +319,17 @@ def _export_exl3(extra, output):
                 package.compact_ws_export(geometry, role, width, rows, bits)
                 if hasattr(package, 'compact_ws_export') else
                 package.compact_warp_specialized(geometry, role, width, rows))
+            # A baseline package that predates the measured-tier set only has the
+            # two shipped coordinator pairs; keep its exports loadable.
+            ws_tiers = getattr(package, "WS_TIER_PAIRS", (("glm", (4, 5)), ("glmf", (3, 4))))
             ws = compact_ws or (len(bits) == 2 and tile is None
-                                and (role != "coordinator"
-                                     or (geometry, bits) in (("glm", (4, 5)), ("glmf", (3, 4))))
+                                and (role != "coordinator" or (geometry, bits) in ws_tiers)
                                 and package.warp_specialized(geometry, role, width, rows))
             if ws:
                 block = (package.compact_ws_route_block(geometry, role, width, rows)
-                         if compact_ws else 64)
+                         if compact_ws else
+                         package.ws_route_block(geometry, role, width, rows)
+                         if hasattr(package, "ws_route_block") else 64)
                 # The compact keyword only exists where the compact WS policy does;
                 # never pass it to a baseline package that predates the policy.
                 compact_kw = {"compact": True} if compact_ws else {}
@@ -362,7 +366,9 @@ def export_exl3_routes(extra, output):
     profiles = package.profiles_for_role("coordinator", geometry)
     _, _, experts, topk, _, _ = profiles[0]
     for rows in capacities:
-        blocks = sorted({64 if package.warp_specialized(geometry, "coordinator", width, rows)
+        blocks = sorted({(package.ws_route_block(geometry, "coordinator", width, rows)
+                          if hasattr(package, "ws_route_block") else 64)
+                         if package.warp_specialized(geometry, "coordinator", width, rows)
                          else package.route_block(geometry, rows)
                          for _, width, *_ in profiles})
         for block in blocks:

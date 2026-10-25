@@ -423,6 +423,42 @@ def test_dense_qwen_wip_uses_native_single_gpu_and_no_workers(tmp_path: Path, ca
     assert "--prefill-rows 4096" in plan and "--require-ready" not in plan
 
 
+@pytest.mark.parametrize("model", ["Qwen/Qwen3.5-9B", "Qwen/Qwen3.8-27B-FP8"])
+def test_dense_qwen_requires_resolved_coordinator_prefill_unit(tmp_path, model):
+    shape = {"prefill_unit_rows": 4096, "prefill_waves": 1, "prefill_span_rows": 4096}
+    result = _family_launch_result(tmp_path, DENSE_CONFIG, model,
+        "SPARK_COUNT=0\nSPECULATOR=off\n", extra_args=("--wip", "dense-test"),
+        deployment_overrides=shape,
+        encoder_plan={"placement_supported": True, "fits": True, "spark_ranks": 0})
+    assert result.returncode == 0, result.stderr
+    assert "serve-qwen35 --snapshot" in result.stderr
+    assert "cuteafd expertd-native" not in result.stderr
+    assert "ssh h0" not in result.stderr
+
+
+@pytest.mark.parametrize("key,value", [("EXPERT_PORT", "20480"),
+    ("SPARK_EXPERT_DOCKER_INFERENCE", "unused-worker:release"),
+    ("SPARK_EXPERT_DOCKER_DEV", "unused-worker:dev")])
+def test_dense_qwen_rejects_unused_worker_configuration(tmp_path, key, value):
+    result = _family_launch_result(tmp_path, DENSE_CONFIG, "Qwen/Qwen3.5-9B",
+        f"SPARK_COUNT=0\n{key}={value}\n", extra_args=("--wip", "dense-test"),
+        encoder_plan={"placement_supported": True, "fits": True, "spark_ranks": 0})
+    assert result.returncode != 0
+    assert f"unused configuration key: {key}" in result.stderr
+    assert "serve-qwen35 --snapshot" not in result.stderr
+
+
+@pytest.mark.parametrize("missing", ["prefill_unit_rows", "prefill_waves"])
+def test_dense_qwen_does_not_bypass_shared_prefill_contract(tmp_path, missing):
+    result = _family_launch_result(tmp_path, DENSE_CONFIG, "Qwen/Qwen3.5-9B",
+        "SPARK_COUNT=0\n", extra_args=("--wip", "dense-test"),
+        deployment_overrides={missing: 0},
+        encoder_plan={"placement_supported": True, "fits": True, "spark_ranks": 0})
+    assert result.returncode != 0
+    assert "the qwen3_5 deployment plan names no prefill" in result.stderr
+    assert "serve-qwen35 --snapshot" not in result.stderr
+
+
 @pytest.mark.parametrize("family", ["mimo_v2", "deepseek_v41"])
 @pytest.mark.parametrize("wip", [False, True])
 @pytest.mark.parametrize("allowed", [True, False, None, "true", "absent"])
@@ -863,7 +899,8 @@ if (family == "deepseek_v41" and decode_lanes != 2) or (family != "deepseek_v41"
     sys.exit("unsupported --decode-lanes for " + family)
 if family == "mimo_v2" and int(value("--concurrency", "16")) == 1:
     decode_lanes = 1
-report.update(prefill_unit_rows=unit, prefill_waves=waves, prefill_span_rows=span, prefill_transports=1, decode_lanes=decode_lanes)
+report.update(prefill_unit_rows=unit, prefill_waves=waves, prefill_span_rows=span, prefill_transports=int(ranks > 0),
+    decode_lanes=decode_lanes)
 deployment = dict(version=1, family=family, executable=family != "qwen3_5" and placement_ready, wip_launchable=placement_ready, rtx_gpus=gpus, spark_ranks=ranks,
     topology=dict(tp=tp, ep=ep,
                   wire="native_ownership" if explicit else "canonical"), peers=peers,
