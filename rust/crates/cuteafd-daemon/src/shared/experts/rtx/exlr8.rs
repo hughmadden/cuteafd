@@ -112,8 +112,7 @@ impl RtxExpertLayer for Exlr8Tp2<'_> {
         ensure!(rows <= self.owner.max_rows, "EXLR8 grouping rows exceed admission");
         let name = if rows == 0 || rows > DECODE_ROWS { "exlr8_a16_grouped" }
             else { "exlr8_a16_serving" };
-        usize::try_from(self.owner.programs.spec(name)?.geometry["group_rows"].as_u64()
-            .context("EXLR8 grouping metadata missing")?).context("EXLR8 group width exceeds address space")
+        Ok(cuteafd_ffi::exlr8::group_rows(self.owner.programs.spec(name)?)?)
     }
     fn weight_read_bytes(&self) -> Result<usize> {
         self.owner.weights.iter().map(|weights| weights.budget.resident_bytes / weights.layout.experts)

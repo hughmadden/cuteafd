@@ -303,8 +303,8 @@ impl<'a> Exlr8Execution<'a> {
                 && group.spec().geometry["max_groups"] == k1.spec().geometry["max_groups"]
                 && group.spec().geometry["hidden"] == k1.spec().geometry["hidden"]
                 && group.spec().capacity_rows == k1.spec().capacity_rows
-                && group.spec().geometry["group_rows"].as_u64().unwrap_or(16)
-                    == k1.spec().geometry["group_rows"].as_u64().unwrap_or(16)
+                && cuteafd_ffi::exlr8::group_rows(group.spec())?
+                    == cuteafd_ffi::exlr8::group_rows(k1.spec())?
                 && group.spec().geometry["input_format"] == match set {
                     ExpertSet::Routed => "fp8_k32",
                     ExpertSet::Shared => "bf16",
@@ -479,7 +479,6 @@ mod tests {
         assert_eq!(spec.scalar_kinds, b"ii");
         spec.geometry["top_k"] = serde_json::json!(8);
         spec.geometry["max_groups"] = serde_json::json!(512);
-        spec.geometry["group_rows"] = serde_json::json!(16);
         spec.geometry["serving_variant"] = serde_json::json!("k1_k23_coalesced");
         spec.scratch = [
             ("fc1".into(), 512 * 16 * 2 * 6 * 16 * 128 * 4),
@@ -499,6 +498,7 @@ mod tests {
             .into_iter().map(String::from).collect();
         spec.scalar_kinds = b"iii".to_vec();
         spec.geometry.as_object_mut().unwrap().remove("serving_variant");
+        spec.geometry["group_rows"] = serde_json::json!(cuteafd_ffi::exlr8::COMPACT_GROUP_ROWS);
         spec.geometry["fc2_partials"] = serde_json::json!("f32");
         spec.geometry["ctas_per_sm"] = serde_json::json!(2);
         spec

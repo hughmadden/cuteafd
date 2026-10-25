@@ -75,7 +75,7 @@ pub fn execution_workspace(spec: &ProgramSpec, rows: usize, set: ExpertSet,
     };
     let intermediate_bytes = scratch("intermediate")?;
     let (ranges, bytes) = execution_workspace_layout(rows, spec.capacity_rows as usize,
-        spec.geometry["group_rows"].as_u64().unwrap_or(16) as usize,
+        cuteafd_ffi::exlr8::group_rows(spec)?,
         hidden, top_k, max_groups, scratch("fc1")?, intermediate_bytes, scratch("fc2")?, set)?;
     Ok(ExecutionWorkspace { ranges, bytes, rows, top_k, max_groups, hidden, units,
         unit_limit: if compact { unit_limit } else { units }, intermediate_bytes, compact, unit_tables })
@@ -148,7 +148,10 @@ mod tests {
                 "fc1_splits":6,"ctas_per_sm":4},
             "scratch_bytes_at_capacity":{"fc1":groups*16*2*6*16*128*4,
                 "intermediate":groups*16*16*128*2,"fc2":groups*16*6144*4}});
-        if variant == ExecutionVariant::DecodeCompact { value["geometry"]["serving_variant"] = json!("k1_k23_coalesced"); }
+        if variant == ExecutionVariant::DecodeCompact {
+            value["geometry"].as_object_mut().unwrap().remove("group_rows");
+            value["geometry"]["serving_variant"] = json!("k1_k23_coalesced");
+        }
         if variant == ExecutionVariant::DecodeGrouped { value["geometry"]["fc2_partials"] = json!("f32"); }
         if activations == PrefillActivations::A8 && prefill { value["geometry"]["activations"] = json!("a8"); }
         value
