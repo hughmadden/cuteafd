@@ -1097,6 +1097,12 @@ impl Checkpoint {
 pub(crate) fn check_checkpoint(snapshot: &Path, fp8: Option<bool>, context_slots: Option<usize>,
     max_batch_sequences: usize) -> Result<()> {
     let cfg = check_headers(snapshot, fp8, context_slots.unwrap_or(20.max(max_batch_sequences)), max_batch_sequences)?;
+    require_glm_ring(&cfg)
+}
+
+/// The GLM integrations tap [`TAP_ROWS`]-row chunk tails into the drafter: its ring (its
+/// window) must be [`RING`]. Every GLM load site checks, beside the header check.
+pub(crate) fn require_glm_ring(cfg: &DflashConfig) -> Result<()> {
     ensure!(cfg.window == RING, "DFlash2 window {} (the ring holds {RING})", cfg.window);
     Ok(())
 }
@@ -3150,6 +3156,14 @@ mod config_tests {
         config["layer_types"] = serde_json::json!(["sliding_attention"]);
         config["is_causal"] = "yes".into();
         assert!(BlockMask::upstream(&config).is_err());
+    }
+
+    /// Every GLM load site refuses a drafter whose window is not the GLM ring.
+    #[test]
+    fn glm_load_sites_refuse_a_window_their_taps_do_not_fill() {
+        assert!(require_glm_ring(&parse(glm()).unwrap()).is_ok());
+        let error = require_glm_ring(&parse(minimax()).unwrap()).unwrap_err().to_string();
+        assert!(error.contains("window 4096") && error.contains("2048"), "{error}");
     }
 
     /// The GLM integrations tap TAP_ROWS-row chunk tails: their header check keeps refusing other windows.

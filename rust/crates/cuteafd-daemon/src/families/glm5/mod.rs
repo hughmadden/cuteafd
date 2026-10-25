@@ -752,6 +752,7 @@ impl Opened {
         let drafter = if let Some(snapshot) = &args.draft {
             let started = Instant::now();
             let cfg = dflash::DflashConfig::read(snapshot)?;
+            dflash::require_glm_ring(&cfg)?;
             ensure!(cfg.hidden == self.cfg.hidden && cfg.vocab == self.cfg.vocab_size
                 && cfg.taps.iter().all(|&l| l < self.cfg.layers), "the DFlash2 drafter does not fit this target");
             let mask = embedding.host_rows(&[cfg.mask_token])?;

@@ -126,6 +126,7 @@ impl<'a> Drafter<'a> {
                 sequences.min(MAX_SEQUENCES), mask, representation, scales, fp8_rows, kv_cache)?));
         }
         let cfg = crate::shared::speculation::dflash::DflashConfig::read(snapshot)?;
+        crate::shared::speculation::dflash::require_glm_ring(&cfg)?;
         ensure!(cfg.hidden == hidden && cfg.vocab == vocab && cfg.taps.iter().all(|&l| l < layers),
             "the DFlash2 drafter does not fit this target");
         let mask = embedding.host_rows(&[cfg.mask_token])?;

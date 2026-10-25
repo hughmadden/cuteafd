@@ -2113,6 +2113,7 @@ impl Opened {
         let drafter = if let Some(prepared) = prepared {
             use crate::shared::speculation::dflash::{DflashConfig, DflashDrafter};
             let cfg = DflashConfig::read(snapshot)?;
+            crate::shared::speculation::dflash::require_glm_ring(&cfg)?;
             ensure!(cfg.hidden == self.cfg.hidden && cfg.vocab == self.cfg.vocab_size
                 && cfg.taps.iter().all(|&l| l < self.cfg.layers), "DFlash2 does not fit this target");
             let mask = embedding.host_rows(&[cfg.mask_token])?;

@@ -272,6 +272,7 @@ mod tests {
         let lead = Stream::new(device)?;
         let peer_target = Stream::new(Device { library: &library, id: 1 })?;
         let cfg = DflashConfig::read(&draft_path)?;
+        crate::shared::speculation::dflash::require_glm_ring(&cfg)?;
         let inventory = Checkpoint::open_for_role(&target_path, "remote-draft-component", |name|
             name.ends_with("embed_tokens.weight") || name == "lm_head.weight")?;
         let embedding_tensor = inventory.tensors.iter().find(|t| t.meta.name.ends_with("embed_tokens.weight"))
