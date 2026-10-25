@@ -971,12 +971,25 @@ release_validate_coordinator_gpu_budget() {
 # value-safety check stay in force while launch-only topology/readiness
 # requirements are skipped. A launch-incomplete but syntactically valid file
 # can therefore clean every host it names.
+# The namespace mount (CUTEAFD_NAMESPACE_ROOT, default /mnt/sparknest) and the
+# Hugging Face home every launch reads checkpoints from: HF_HOME, else the
+# namespace's hf-home. Family detection and the launch share these.
+release_namespace_root() {
+  readlink -f "${CUTEAFD_NAMESPACE_ROOT:-/mnt/sparknest}"
+}
+release_launch_hf_home() {
+  printf '%s' "${HF_HOME:-$(release_namespace_root)/hf-home}"
+}
+
 # The family of the checkpoint a config names (scripts/lib/checkpoint-family.py
-# on its config.json). A config without MODEL_ID, or a snapshot not present
-# here, is DeepSeek V4.1, the release default; its own validation reports a
-# missing snapshot.
+# on its config.json), found in the hub the launch reads (release_launch_hf_home).
+# KEY=VALUE arguments after the file are run.sh's --set overrides, applied as the
+# launch applies them (later wins). A config without MODEL_ID is DeepSeek V4.1, the
+# release default, whose validation reports a missing snapshot; a MODEL_ID whose
+# snapshot is not in that hub fails here, naming the hub.
 release_config_family() {
-  local config="$1" model="" revision="" line key value hub dir
+  local config="$1" model="" revision="" line key value hub dir pair
+  shift
   [[ -f "$config" ]] || { printf 'deepseek_v41\n'; return 0; }
   while IFS= read -r line || [[ -n "$line" ]]; do
     line="$(release_trim "${line%%#*}")"
@@ -987,17 +1000,27 @@ release_config_family() {
       MODEL_REVISION) revision="$value" ;;
     esac
   done < "$config"
+  for pair in "$@"; do
+    case "$pair" in
+      MODEL_ID=*) model="${pair#*=}" ;;
+      MODEL_REVISION=*) revision="${pair#*=}" ;;
+    esac
+  done
   [[ -n "$model" ]] || { printf 'deepseek_v41\n'; return 0; }
-  hub="${HF_HOME:-$HOME/.cache/huggingface}/hub"
+  hub="$(release_launch_hf_home)/hub"
   dir="$hub/models--${model//\//--}"
   [[ -n "$revision" || ! -f "$dir/refs/main" ]] || revision="$(<"$dir/refs/main")"
-  local described=""
+  local described="" checkpoint_config=""
   if [[ -d "$model" && -f "$model/config.json" ]]; then
-    described="$(python3 "$(dirname "${BASH_SOURCE[0]}")/checkpoint-family.py" "$model/config.json" 2>/dev/null)" || described=""
+    checkpoint_config="$model/config.json"
   elif [[ -n "$revision" && -f "$dir/snapshots/$revision/config.json" ]]; then
-    described="$(python3 "$(dirname "${BASH_SOURCE[0]}")/checkpoint-family.py" \
-      "$dir/snapshots/$revision/config.json" 2>/dev/null)" || described=""
+    checkpoint_config="$dir/snapshots/$revision/config.json"
+  else
+    release_die "checkpoint $model${revision:+@$revision} is not in $hub, the hub this launch reads" \
+      "(HF_HOME, else \$CUTEAFD_NAMESPACE_ROOT/hf-home); download it there or point HF_HOME at the hub that holds it"
   fi
+  described="$(python3 "$(dirname "${BASH_SOURCE[0]}")/checkpoint-family.py" "$checkpoint_config" 2>/dev/null)" ||
+    described=""
   # Unrecognized configs stay on the DeepSeek V4.1 path, whose checks name the problem.
   [[ -n "$described" ]] || described=deepseek_v41
   printf '%s\n' "${described%% *}"
