@@ -51,7 +51,10 @@ impl NativeLibrary {
     pub unsafe fn glm_dflash_rmsnorm_gemma(&self, x: P, w: P, out: M, rows: usize, width: usize, eps: f32, stream: M)
         -> Result<()> {
         type F = unsafe extern "C" fn(P, P, M, i32, i32, f32, M) -> i32;
+        // SAFETY: the exported symbol has the native signature `F` above.
         let f = *unsafe { self.lib.get::<F>(b"cuteafd_glm_dflash_rmsnorm_gemma") }?;
+        // SAFETY: the caller's contract (# Safety) covers every pointer for these rows on `stream`;
+        // the integer arguments are range-checked by `i`.
         check(unsafe { f(x, w, out, i(rows)?, i(width)?, eps, stream) }, "Gemma rmsnorm")
     }
 
@@ -93,7 +96,10 @@ impl NativeLibrary {
         residual_out: M, normalized: M, rows: usize, block_rows: usize, hidden: usize, group: usize, eps: f32,
         stream: M) -> Result<()> {
         type F = unsafe extern "C" fn(P, P, P, P, P, M, M, i32, i32, i32, i32, f32, M) -> i32;
+        // SAFETY: the exported symbol has the native signature `F` above.
         let f = *unsafe { self.lib.get::<F>(b"cuteafd_glm_dflash_conv_residual_norm_gemma") }?;
+        // SAFETY: the caller's contract (# Safety) covers every pointer for these rows on `stream`;
+        // the integer arguments are range-checked by `i`.
         check(unsafe {
             f(source, dynamic, base, residual, w, residual_out, normalized, i(rows)?, i(block_rows)?, i(hidden)?,
                 i(group)?, eps, stream)
@@ -133,6 +139,8 @@ impl NativeLibrary {
             else { b"cuteafd_glm_dflash_qk_rope_gemma" };
         // SAFETY: both format-specific symbols have the native signature above.
         let f = *unsafe { self.lib.get::<F>(symbol) }?;
+        // SAFETY: the caller's contract (# Safety) covers every pointer for these rows on `stream`;
+        // the integer arguments are range-checked by `i`.
         check(unsafe {
             f(qkv, q_norm, k_norm, positions, slots, q_out, k_out, v_out, i(rows)?, i(heads)?, i(kv_heads)?,
                 i(rotary)?, theta, eps, stream)
@@ -143,7 +151,9 @@ impl NativeLibrary {
     pub fn glm_dflash_block_attention_workspace(&self, sequences: usize, heads: usize, kv_heads: usize,
         block_rows: usize, max_keys: usize) -> Result<usize> {
         type F = unsafe extern "C" fn(i32, i32, i32, i32, i32) -> u64;
+        // SAFETY: the exported symbol has the native signature `F` above.
         let f = *unsafe { self.lib.get::<F>(b"cuteafd_glm_dflash_block_attention_workspace") }?;
+        // SAFETY: the native workspace query takes only the range-checked sizes.
         let bytes = unsafe { f(i(sequences)?, i(heads)?, i(kv_heads)?, i(block_rows)?, i(max_keys)?) };
         ensure!(bytes > 0, "DFlash2 block attention workspace geometry");
         Ok(usize::try_from(bytes)?)
@@ -164,6 +174,8 @@ impl NativeLibrary {
             else { b"cuteafd_glm_dflash_block_attention" };
         // SAFETY: both format-specific symbols have the native signature above.
         let f = *unsafe { self.lib.get::<F>(symbol) }?;
+        // SAFETY: the caller's contract (# Safety) covers every pointer for these rows on `stream`;
+        // the integer arguments are range-checked by `i`.
         check(unsafe {
             f(q, k_block, v_block, k_ring, v_ring, seq_slots, ctx_lengths, ctx_ends, out, workspace, i(sequences)?,
                 i(block_rows)?, i(heads)?, i(kv_heads)?, i(ring)?, i(max_keys)?, i(window)?, i32::from(causal),
@@ -190,7 +202,10 @@ impl NativeLibrary {
     pub unsafe fn glm_dflash_swiglu_oai(&self, gate_up: P, out: M, rows: usize, inter: usize, alpha: f32,
         limit: f32, stream: M) -> Result<()> {
         type F = unsafe extern "C" fn(P, M, i32, i32, f32, f32, M) -> i32;
+        // SAFETY: the exported symbol has the native signature `F` above.
         let f = *unsafe { self.lib.get::<F>(b"cuteafd_glm_dflash_swiglu_oai") }?;
+        // SAFETY: the caller's contract (# Safety) covers every pointer for these rows on `stream`;
+        // the integer arguments are range-checked by `i`.
         check(unsafe { f(gate_up, out, i(rows)?, i(inter)?, alpha, limit, stream) }, "SwiGLU-OAI")
     }
 
@@ -243,7 +258,10 @@ impl NativeLibrary {
         unary: P, anchors: P, tokens: M, features: M, sequences: usize, block_rows: usize, drafts: usize,
         rank: usize, stream: M) -> Result<()> {
         type F = unsafe extern "C" fn(P, P, P, P, P, P, M, M, i32, i32, i32, i32, M) -> i32;
+        // SAFETY: the exported symbol has the native signature `F` above.
         let f = *unsafe { self.lib.get::<F>(b"cuteafd_glm_dflash_select_fp32_score") }?;
+        // SAFETY: the caller's contract (# Safety) covers every pointer for these rows on `stream`;
+        // the integer arguments are range-checked by `i`.
         check(unsafe {
             f(pred_cb, succ_cb, projected, candidates, unary, anchors, tokens, features, i(sequences)?,
                 i(block_rows)?, i(drafts)?, i(rank)?, stream)
@@ -284,7 +302,10 @@ impl NativeLibrary {
     pub unsafe fn glm_dflash_tap_f32(&self, src: P, dst: M, rows: usize, width: usize, stride: usize, offset: usize,
         stream: M) -> Result<()> {
         type F = unsafe extern "C" fn(P, M, i32, i32, i32, i32, M) -> i32;
+        // SAFETY: the exported symbol has the native signature `F` above.
         let f = *unsafe { self.lib.get::<F>(b"cuteafd_glm_dflash_tap_f32") }?;
+        // SAFETY: the caller's contract (# Safety) covers every pointer for these rows on `stream`;
+        // the integer arguments are range-checked by `i`.
         check(unsafe { f(src, dst, i(rows)?, i(width)?, i(stride)?, i(offset)?, stream) }, "F32 tap")
     }
 }
