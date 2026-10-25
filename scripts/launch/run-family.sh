@@ -1721,6 +1721,8 @@ if [[ -n "$wip_slot" ]]; then
   # The WIP root the slot was staged under: the environment wins, else the
   # config (as V4.1's release_load_config reads it), else the default layout.
   WIP_ROOT="${WIP_ROOT:-$(get WIP_ROOT)}"
+  # The check stop.sh and the V4.1 launch apply, so a root this launch takes can be stopped.
+  release_validate_wip_root
   release_wip_slot_instance "$wip_slot"
   release_wip_serving_layout "$instance"
   wip_coordinator_container="$(release_wip_container coordinator)"

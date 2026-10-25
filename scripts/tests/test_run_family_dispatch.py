@@ -1110,6 +1110,33 @@ def test_the_wip_slot_root_a_card_config_names_launches_every_family(tmp_path):
     assert any(str(root) in line for line in stages), "\n".join(stages)
 
 
+@pytest.mark.parametrize("escapes", [False, True])
+def test_launch_and_stop_take_the_same_wip_roots(tmp_path, escapes):
+    # One check (release_validate_wip_root) for both: a root reached through a link out of
+    # the build cache is refused by the launch as stop.sh refuses it, before anything starts.
+    builds = tmp_path / "home" / ".cache" / "cuteafd" / "builds"
+    builds.mkdir(parents=True)
+    root = builds / "wip-link"
+    if escapes:
+        (tmp_path / "elsewhere").mkdir()
+        root.symlink_to(tmp_path / "elsewhere")
+    result = _family_launch_result(
+        tmp_path, SPLIT_CONFIGS["qwen4"], "test/model",
+        f"SPECULATOR=off\nVISION=off\nAUDIO=off\nWIP_ROOT={root}\n", extra_args=("--wip", "slot-test"))
+    # stop.sh's own first step on the same file (the rest of stop.sh would touch real containers).
+    assert 'release_load_config "$config" stop' in (ROOT / "stop.sh").read_text()
+    script = f'source {shlex.quote(str(ROOT / "scripts/lib/release-common.sh"))}; release_load_config "$1" stop'
+    stop = subprocess.run(["bash", "-c", script, "_", str(tmp_path / "repo" / "f.config")],
+                          env={**os.environ, "HOME": str(tmp_path / "home")}, capture_output=True, text=True, timeout=60)
+    refusal = "WIP_ROOT resolves outside"
+    assert (refusal in result.stderr, refusal in stop.stderr) == (escapes, escapes), (result.stderr, stop.stderr)
+    if escapes:
+        assert result.returncode == 2 and stop.returncode == 2
+        assert "docker cp" not in result.stderr and "docker run" not in result.stderr
+    else:
+        assert result.returncode == 0 and stop.returncode == 0, (result.stderr, stop.stderr)
+
+
 def test_mimo_transport_timing_is_resolved_once_for_all_prefill_lanes():
     source = (ROOT / "rust/crates/cuteafd-daemon/src/families/mimo_v2/mod.rs").read_text()
     timing = "let timing = cuteafd_transport::protocol_v2_timing_from_env();"
