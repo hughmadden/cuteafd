@@ -71,6 +71,11 @@ pub struct Entry {
     /// Family id (deepseek_v41 launches through run.sh's own path and runs alone).
     #[serde(default)]
     pub family: Option<String>,
+    /// The `/v1/models` id to measure (a ready weight variant's exact public id).
+    /// Wins over this process's `CUTEAFD_BENCH_MODEL`; unset with that unset,
+    /// the server's default. Panels and the sweep measure the same id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
     /// Base config file (relative to --repo).
     #[serde(default)]
     pub config: Option<String>,
@@ -245,6 +250,7 @@ impl Entry {
         Entry {
             name: self.name.clone(),
             family: self.family.clone().or_else(|| defaults.family.clone()),
+            model: self.model.clone().or_else(|| defaults.model.clone()),
             config: self.config.clone().or_else(|| defaults.config.clone()),
             set,
             run_args: self.run_args.clone().or_else(|| defaults.run_args.clone()),
@@ -270,6 +276,20 @@ impl Entry {
             context_lengths: self.context_lengths.clone().or_else(|| defaults.context_lengths.clone()),
             context_levels: self.context_levels.clone().or_else(|| defaults.context_levels.clone()),
         }
+    }
+
+    /// The entry merged with the defaults, its model resolved: the entry's (or
+    /// the defaults') own wins over `process_model` (`CUTEAFD_BENCH_MODEL`, read
+    /// once by the caller and passed as a value, never set by smoke).
+    fn resolved(&self, defaults: &Entry, process_model: Option<&str>) -> Result<Entry> {
+        let mut entry = self.merged(defaults);
+        if entry.model.as_ref().is_some_and(|m| m.trim().is_empty()) {
+            bail!("{}: model must be a /v1/models id; omit it for the server's default", entry.name);
+        }
+        if entry.model.is_none() {
+            entry.model = process_model.filter(|m| !m.is_empty()).map(str::to_string);
+        }
+        Ok(entry)
     }
 
     fn exclusive(&self) -> bool {
@@ -525,26 +545,47 @@ fn disjoint(a: &Entry, b: &Entry, base: &HashMap<String, String>) -> bool {
     !ga.iter().any(|g| gb.contains(g)) && !sa.iter().any(|s| sb.contains(s))
 }
 
-/// Lock files this process holds, with how many running entries need each.
-#[derive(Default)]
+/// The hardware lock directory: `CUTEAFD_LOCK_DIR` when set (a deployment
+/// whose locks live outside HOME, as scripts/hw/hwlock.py and build-slot.sh
+/// read it), else `~/.cache/cuteafd`.
+fn lock_dir() -> PathBuf {
+    lock_dir_from(std::env::var_os("CUTEAFD_LOCK_DIR"))
+}
+
+fn lock_dir_from(value: Option<std::ffi::OsString>) -> PathBuf {
+    value.filter(|v| !v.is_empty()).map(PathBuf::from).unwrap_or_else(|| expand("~/.cache/cuteafd"))
+}
+
+/// Canonical lock order: Spark pool, GPU0, GPU1, then the out-of-pool hosts.
+fn canonical_order(names: &[&'static str]) -> Vec<&'static str> {
+    let mut ordered = names.to_vec();
+    ordered.sort_by_key(|n| match *n {
+        "sparks.lock" => 0, "gpu0.lock" => 1, "gpu1.lock" => 2,
+        "rhea.lock" => 3, "moa.lock" => 4, _ => 5,
+    });
+    ordered
+}
+
+/// Lock files this process holds in `dir`, with how many running entries need each.
 struct Locks {
+    dir: PathBuf,
     held: HashMap<&'static str, (File, usize)>,
 }
 
 impl Locks {
+    fn new(dir: PathBuf) -> Self {
+        Self { dir, held: HashMap::new() }
+    }
+
     /// Takes `names`, waiting in line like every other agent (flock), when
     /// nothing of ours runs; with entries running, only what is free now.
     fn take(&mut self, names: &[&'static str], wait: bool) -> Result<bool> {
         if !wait {
             return self.try_take(names);
         }
-        let dir = expand("~/.cache/cuteafd");
+        let dir = self.dir.clone();
         std::fs::create_dir_all(&dir)?;
-        let mut ordered: Vec<&'static str> = names.to_vec();
-        ordered.sort_by_key(|n| match *n {
-            "sparks.lock" => 0, "gpu0.lock" => 1, "gpu1.lock" => 2,
-            "rhea.lock" => 3, "moa.lock" => 4, _ => 5,
-        });
+        let ordered = canonical_order(names);
         // A deep shared queue holds the pool for hours, and a fair-queue ticket holds no
         // lock while it waits: default to the same 6 h bound as golden-run and hwlock.py.
         // CUTEAFD_SMOKE_LOCK_WAIT_S, then CUTEAFD_HW_LOCK_WAIT_S, override it.
@@ -599,7 +640,7 @@ impl Locks {
     }
 
     fn try_take(&mut self, names: &[&'static str]) -> Result<bool> {
-        let dir = expand("~/.cache/cuteafd");
+        let dir = self.dir.clone();
         std::fs::create_dir_all(&dir)?;
         let mut taken = Vec::new();
         for &name in names {
@@ -703,10 +744,11 @@ pub fn run(args: SmokeArgs) -> Result<()> {
     std::fs::create_dir_all(&paths.configs)?;
     std::fs::create_dir_all(&paths.logs)?;
     let build = expected_build(&args, &matrix);
+    let process_model = std::env::var("CUTEAFD_BENCH_MODEL").ok();
     let mut names = std::collections::HashSet::new();
     let mut entries = Vec::new();
     for raw in &matrix.entries {
-        let entry = raw.merged(&matrix.defaults);
+        let entry = raw.resolved(&matrix.defaults, process_model.as_deref())?;
         if entry.name.is_empty() || !entry.name.chars().all(|c| c.is_ascii_alphanumeric() || "-_.".contains(c)) {
             bail!("matrix entry names must be non-empty [A-Za-z0-9._-]: {:?}", entry.name);
         }
@@ -761,9 +803,11 @@ pub fn run(args: SmokeArgs) -> Result<()> {
     }).cloned().collect();
     eprintln!("{} entries, {} to run, build {build}, up to {} at once", entries.len(), pending.len(), args.parallel);
     if args.dry_run {
+        eprintln!("lock dir {}", lock_dir().display());
         for e in &pending {
-            eprintln!("  {} api_key_file={} family={} gpus={:?} sparks={:?} locks={:?} levels={:?} post_load_c1={} post_load_repeat={} prefill_lengths={:?} sweep_tokens={} baseline={} window={} lossless_set={} lossless_dump={:?} context_lengths={:?} context_levels={:?} fabric={} worker_stop={} set={:?}",
-                e.name, e.set.get("API_KEY_FILE").map_or("-", String::as_str), e.family.as_deref().unwrap_or("?"), e.gpus, e.sparks, locks_for(e), e.levels,
+            eprintln!("  {} api_key_file={} family={} model={} gpus={:?} sparks={:?} locks={:?} levels={:?} post_load_c1={} post_load_repeat={} prefill_lengths={:?} sweep_tokens={} baseline={} window={} lossless_set={} lossless_dump={:?} context_lengths={:?} context_levels={:?} fabric={} worker_stop={} set={:?}",
+                e.name, e.set.get("API_KEY_FILE").map_or("-", String::as_str), e.family.as_deref().unwrap_or("?"),
+                e.model.as_deref().unwrap_or("default"), e.gpus, e.sparks, locks_for(e), e.levels,
                 e.post_load_c1.unwrap_or(false), e.post_load_repeat.unwrap_or(false), e.prefill_lengths,
                 e.sweep_tokens.unwrap_or(crate::sweep::TOKENS), e.baseline.unwrap_or(true), e.window.is_some(),
                 e.lossless_set.as_deref().unwrap_or("default"), e.lossless_dump, e.context_lengths, e.context_levels, e.fabric.unwrap_or(true),
@@ -774,7 +818,7 @@ pub fn run(args: SmokeArgs) -> Result<()> {
     let profile = matrix.profile.clone().unwrap_or_else(|| "smoke".into());
     let mut queue: std::collections::VecDeque<Entry> = pending.into();
     let mut running: Vec<Entry> = Vec::new();
-    let mut locks = Locks::default();
+    let mut locks = Locks::new(lock_dir());
     let (done_tx, done_rx) = mpsc::channel::<(String, Outcome)>();
     let started = Instant::now();
     let mut waiting_note = Instant::now() - Duration::from_secs(600);
@@ -1084,6 +1128,8 @@ fn run_entry(entry: &Entry, repo: &Path, out_root: &Path, configs: &Path, logs: 
         // An explicit CUTEAFD_API_KEY wins; otherwise the key file this launch serves.
         let api_key = std::env::var("CUTEAFD_API_KEY").ok().or_else(|| config.get("API_KEY_FILE")
             .and_then(|file| std::fs::read_to_string(file).ok()).map(|key| key.trim().to_string()).filter(|k| !k.is_empty()));
+        // A named model must be a ready, exactly listed id before anything is measured.
+        select_model(&url, api_key.as_deref(), entry.model.as_deref())?;
         let sweeping = entry.levels.is_some() || entry.prefill_lengths.is_some();
         let run_sweep = || -> Result<crate::sweep::Sweep> {
             let open: crate::sweep::OnTimed = entry.window.as_ref().map(|window| -> Box<dyn FnOnce() -> Result<()> + '_> {
@@ -1092,7 +1138,7 @@ fn run_entry(entry: &Entry, repo: &Path, out_root: &Path, configs: &Path, logs: 
                     window_hook("window-open", &window.open, &url, &config_path)
                 })
             });
-            let sweep = crate::sweep::run_windowed(&url, api_key.as_deref(), entry.levels.as_deref().unwrap_or(&[]),
+            let sweep = crate::sweep::run_windowed(&url, api_key.as_deref(), entry.model.as_deref(), entry.levels.as_deref().unwrap_or(&[]),
                 entry.post_load_c1.unwrap_or(false), entry.post_load_repeat.unwrap_or(false), entry.prefill_lengths.as_deref().unwrap_or(&[]), entry.fabric.unwrap_or(true),
                 entry.sweep_tokens.unwrap_or(crate::sweep::TOKENS), open);
             let closed = close_window(&url, &config_path);
@@ -1112,13 +1158,7 @@ fn run_entry(entry: &Entry, repo: &Path, out_root: &Path, configs: &Path, logs: 
             outcome.sweep = Some(sweep);
             return Ok(None);
         }
-        let options = crate::cli::RunOptions { model: None, url: url.clone(), profile, panels, passes: vec![], baseline: entry.baseline, fabric: Some(entry.fabric.unwrap_or(true)),
-            export: vec!["svg".into(), "card".into(), "json".into()], out: None, label: Some(entry.name.clone()),
-            root: out_root.to_path_buf(),
-            api_key: api_key.clone(), quiet: true,
-            deadline: Some(Duration::from_secs(entry.run_timeout_s.unwrap_or(900))),
-            lossless_set: entry.lossless_set.as_ref().map(|p| crate::panels::lossless::CaseSet::load(&repo.join(p)))
-                .transpose()?, lossless_dump: entry.lossless_dump.clone(), context_lengths: entry.context_lengths.clone(), context_levels: entry.context_levels.clone() };
+        let options = panel_options(entry, repo, out_root, &url, profile, panels, api_key.clone())?;
         let (mut report, dir) = crate::cli::run(&options)?;
         // Publication markers are runner metadata, not serving defaults. This
         // also works against images built before these markers existed.
@@ -1237,6 +1277,33 @@ fn run_entry(entry: &Entry, repo: &Path, out_root: &Path, configs: &Path, logs: 
     outcome.total_s = Some(started.elapsed().as_secs_f64());
     outcome.finished = crate::report::now_rfc3339();
     outcome
+}
+
+/// The server-side run request for an entry: the same model the sweep measures.
+fn panel_options(entry: &Entry, repo: &Path, out_root: &Path, url: &str, profile: Option<String>,
+    panels: Option<Vec<String>>, api_key: Option<String>) -> Result<crate::cli::RunOptions> {
+    Ok(crate::cli::RunOptions { model: entry.model.clone(), url: url.to_string(), profile, panels, passes: vec![],
+        baseline: entry.baseline, fabric: Some(entry.fabric.unwrap_or(true)),
+        export: vec!["svg".into(), "card".into(), "json".into()], out: None, label: Some(entry.name.clone()),
+        root: out_root.to_path_buf(),
+        api_key, quiet: true,
+        deadline: Some(Duration::from_secs(entry.run_timeout_s.unwrap_or(900))),
+        lossless_set: entry.lossless_set.as_ref().map(|p| crate::panels::lossless::CaseSet::load(&repo.join(p)))
+            .transpose()?, lossless_dump: entry.lossless_dump.clone(), context_lengths: entry.context_lengths.clone(),
+        context_levels: entry.context_levels.clone() })
+}
+
+/// Checks a named model against the server's `/v1/models` with the bench
+/// client's own resolver: an exactly listed id, and a ready weight variant when
+/// it is not the served model. Missing, unready and alias ids are refused,
+/// never measured as the base. `None` checks nothing (the server's default).
+fn select_model(url: &str, api_key: Option<&str>, model: Option<&str>) -> Result<()> {
+    let Some(model) = model else { return Ok(()) };
+    let key = api_key.map(cuteafd_api::openai::auth::ApiKey::new).transpose().map_err(anyhow::Error::msg)?;
+    let mut client = crate::client::Client::new(url, None, std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)))
+        .with_api_key(key).with_model(Some(model.to_string()));
+    client.discover().with_context(|| format!("model {model}"))?;
+    Ok(())
 }
 
 fn coordinator_name(entry: &Entry, parallel: bool) -> String {
@@ -1518,5 +1585,174 @@ mod tests {
         assert!(!config.contains_key("BENCH_HARDWARE_CLASS"));
         assert_eq!(config.get("MODEL_ID").map(String::as_str), Some("a/b"));
         assert_eq!(config.get("ENABLE_BENCH").map(String::as_str), Some("on"));
+    }
+
+    #[test]
+    fn model_selection_precedence_entry_then_defaults_then_process() {
+        let defaults = Entry { model: Some("glm-5.3-alternate".into()), ..Entry::default() };
+        let own = Entry { name: "a".into(), model: Some("glm-5.3".into()), ..Entry::default() };
+        let bare = Entry { name: "b".into(), ..Entry::default() };
+        // The process selection is a value here: no environment is read or set.
+        assert_eq!(own.resolved(&defaults, Some("other")).unwrap().model.as_deref(), Some("glm-5.3"));
+        assert_eq!(bare.resolved(&defaults, Some("other")).unwrap().model.as_deref(), Some("glm-5.3-alternate"));
+        assert_eq!(bare.resolved(&Entry::default(), Some("other")).unwrap().model.as_deref(), Some("other"));
+        assert_eq!(bare.resolved(&Entry::default(), Some("")).unwrap().model, None);
+        // Unset everywhere: no model, and the launch key of a legacy entry is unchanged.
+        let legacy = bare.resolved(&Entry::default(), None).unwrap();
+        assert_eq!(legacy.model, None);
+        assert!(serde_json::to_value(&legacy).unwrap().get("model").is_none());
+        assert_eq!(legacy.key(), bare.merged(&Entry::default()).key());
+        assert_ne!(bare.resolved(&Entry::default(), Some("other")).unwrap().key(), legacy.key());
+        let empty = Entry { model: Some(" ".into()), ..bare.clone() };
+        assert!(empty.resolved(&Entry::default(), Some("other")).unwrap_err().to_string().contains("model must be"));
+        let parsed: Matrix = serde_json::from_str(r#"{"defaults":{"model":"glm-5.3-alternate"},"entries":[{"name":"x"},{"name":"y","model":"glm-5.3"}]}"#).unwrap();
+        let models: Vec<_> = parsed.entries.iter().map(|e| e.resolved(&parsed.defaults, None).unwrap().model).collect();
+        assert_eq!(models, vec![Some("glm-5.3-alternate".to_string()), Some("glm-5.3".to_string())]);
+    }
+
+    /// A bench server double: `/v1/models`, run start/events/report. Records each
+    /// `POST /v1/bench/runs` body. `honours_model: false` acts like a server that
+    /// predates per-run model selection (it measures its default).
+    fn bench_server(honours_model: bool) -> (String, std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>) {
+        use std::io::{BufRead, BufReader, Read};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let posted = std::sync::Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
+        let record = posted.clone();
+        std::thread::spawn(move || {
+            for socket in listener.incoming() {
+                let Ok(mut socket) = socket else { continue };
+                let mut reader = BufReader::new(socket.try_clone().unwrap());
+                let mut request = String::new();
+                if reader.read_line(&mut request).is_err() { continue; }
+                let mut length = 0usize;
+                let mut line = String::new();
+                while reader.read_line(&mut line).is_ok_and(|n| n > 0) && line != "\r\n" {
+                    if let Some(v) = line.to_ascii_lowercase().strip_prefix("content-length:") { length = v.trim().parse().unwrap_or(0); }
+                    line.clear();
+                }
+                let mut body = vec![0; length];
+                let _ = reader.read_exact(&mut body);
+                let path = request.split_whitespace().nth(1).unwrap_or("").to_string();
+                let (kind, text) = if request.starts_with("GET /v1/models ") {
+                    ("application/json", serde_json::json!({"data": [{"id": "base"},
+                        {"id": "base-alternate", "variant": {"name": "alternate", "availability": {"state": "ready"}}},
+                        {"id": "base-cold", "variant": {"name": "cold", "availability": {"state": "unavailable", "reason": "tables missing"}}},
+                        {"id": "alias-of-base"}]}).to_string())
+                } else if request.starts_with("POST /v1/bench/runs ") {
+                    record.lock().unwrap().push(serde_json::from_slice(&body).unwrap_or_default());
+                    ("application/json", r#"{"id":"r1"}"#.to_string())
+                } else if path == "/v1/bench/events" {
+                    ("text/event-stream", "data: {\"type\":\"report\",\"run\":\"r1\",\"report\":{\"status\":\"done\"}}\n\n".to_string())
+                } else if path == "/v1/bench/runs/r1" {
+                    let mut report = crate::sample::report(false);
+                    report.id = "r1".into();
+                    let wanted = record.lock().unwrap().last().and_then(|b| b["model"].as_str().map(str::to_string));
+                    report.server.model = wanted.filter(|_| honours_model).unwrap_or_else(|| "base".into());
+                    ("application/json", serde_json::to_string(&report).unwrap())
+                } else {
+                    let _ = write!(socket, "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+                    continue;
+                };
+                let _ = write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: {kind}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{text}", text.len());
+            }
+        });
+        (base, posted)
+    }
+
+    #[test]
+    fn the_entry_model_reaches_the_panel_run_and_the_sweep() {
+        let (url, posted) = bench_server(true);
+        let out = tempfile::tempdir().unwrap();
+        // The entry's id wins over a process selection (passed as a value).
+        let entry = Entry { name: "alternate".into(), model: Some("base-alternate".into()), ..Entry::default() }
+            .resolved(&Entry::default(), Some("base-cold")).unwrap();
+        select_model(&url, None, entry.model.as_deref()).unwrap();
+        let options = panel_options(&entry, out.path(), out.path(), &url, Some("smoke".into()), None, None).unwrap();
+        assert_eq!(options.model.as_deref(), Some("base-alternate"));
+        let (report, _) = crate::cli::run(&options).unwrap();
+        assert_eq!(report.server.model, "base-alternate");
+        assert_eq!(posted.lock().unwrap().last().unwrap()["model"], "base-alternate");
+        let sweep = crate::sweep::run_windowed(&url, None, entry.model.as_deref(), &[], false, false, &[], false,
+            crate::sweep::TOKENS, None).unwrap();
+        assert_eq!(sweep.model.as_deref(), Some("base-alternate"));
+        assert_eq!(serde_json::to_value(&sweep).unwrap()["model"], "base-alternate");
+        // The served model by its own id is a valid selection too.
+        select_model(&url, None, Some("base")).unwrap();
+    }
+
+    #[test]
+    fn unready_missing_and_alias_models_are_refused_before_any_run() {
+        let (url, posted) = bench_server(true);
+        for (model, why) in [("base-cold", "tables missing"), ("base-gone", "not listed"), ("alias-of-base", "alias")] {
+            let error = format!("{:#}", select_model(&url, None, Some(model)).unwrap_err());
+            assert!(error.contains(why), "{model}: {error}");
+            let sweep = crate::sweep::run_windowed(&url, None, Some(model), &[1], false, false, &[], false, crate::sweep::TOKENS, None);
+            assert!(sweep.is_err(), "{model}: the sweep never falls back to the base");
+        }
+        assert!(posted.lock().unwrap().is_empty(), "nothing was started");
+        // Unset: nothing to check, no model in the request, the sweep takes the default.
+        select_model(&url, None, None).unwrap();
+        let unset = Entry { name: "base".into(), ..Entry::default() }.resolved(&Entry::default(), None).unwrap();
+        assert!(panel_options(&unset, Path::new("/r"), Path::new("/r"), &url, None, None, None).unwrap().model.is_none());
+        if std::env::var_os("CUTEAFD_BENCH_MODEL").is_none() {
+            let sweep = crate::sweep::run_windowed(&url, None, None, &[], false, false, &[], false, crate::sweep::TOKENS, None).unwrap();
+            assert_eq!(sweep.model.as_deref(), Some("base"));
+        }
+    }
+
+    #[test]
+    fn an_older_server_that_ignores_the_model_is_refused() {
+        let (url, _) = bench_server(false);
+        let out = tempfile::tempdir().unwrap();
+        let entry = Entry { name: "alternate".into(), model: Some("base-alternate".into()), ..Entry::default() };
+        let options = panel_options(&entry, out.path(), out.path(), &url, Some("smoke".into()), None, None).unwrap();
+        assert!(crate::cli::run(&options).unwrap_err().to_string().contains("predates"));
+    }
+
+    #[test]
+    fn the_lock_dir_override_and_canonical_order() {
+        assert_eq!(lock_dir_from(Some("/srv/cuteafd/home/.cache/cuteafd".into())), PathBuf::from("/srv/cuteafd/home/.cache/cuteafd"));
+        assert_eq!(lock_dir_from(Some("".into())), expand("~/.cache/cuteafd"));
+        assert_eq!(lock_dir_from(None), expand("~/.cache/cuteafd"));
+        assert_eq!(canonical_order(&["moa.lock", "gpu1.lock", "rhea.lock", "sparks.lock", "gpu0.lock"]),
+            vec!["sparks.lock", "gpu0.lock", "gpu1.lock", "rhea.lock", "moa.lock"]);
+        let mut both = entry("both", &[0, 1], &["dodo", "rhea", "moa"], 8000);
+        assert_eq!(locks_for(&both), vec!["sparks.lock", "gpu0.lock", "gpu1.lock", "rhea.lock", "moa.lock"]);
+        both.gpus = Some(vec![1]);
+        both.sparks = Some(vec!["rhea".into()]);
+        assert_eq!(locks_for(&both), vec!["gpu1.lock", "rhea.lock"]);
+    }
+
+    #[test]
+    fn queued_and_immediate_takes_use_the_configured_lock_dir() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("canonical");
+        let mut locks = Locks::new(dir.clone());
+        assert!(locks.take(&["sparks.lock", "gpu1.lock"], true).unwrap());
+        // A parent hwlock holding these locks (CUTEAFD_HW_LOCKS_HELD) skips the take.
+        let parent_held = std::env::var("CUTEAFD_HW_LOCKS_HELD").unwrap_or_default();
+        if parent_held.is_empty() {
+            assert!(dir.join("sparks.lock").exists() && dir.join("gpu1.lock").exists());
+            // The fair-queue ticket was numbered in this directory's queue and dropped once granted.
+            assert_eq!(std::fs::read_to_string(dir.join("hwq/seq")).unwrap().trim(), "1");
+        }
+        assert!(!std::fs::read_dir(dir.join("hwq")).map(|d| d.flatten()
+            .any(|e| e.file_name().to_string_lossy().ends_with(".ticket"))).unwrap_or(false));
+        // Another holder in the same directory sees the flock; a different directory does not.
+        let mut other = Locks::new(dir.clone());
+        if parent_held.is_empty() {
+            assert!(!other.try_take(&["gpu1.lock"]).unwrap());
+        }
+        let elsewhere = root.path().join("elsewhere");
+        let mut free = Locks::new(elsewhere.clone());
+        assert!(free.try_take(&["gpu1.lock", "moa.lock"]).unwrap());
+        assert!(elsewhere.join("moa.lock").exists());
+        locks.release(&["sparks.lock", "gpu1.lock"]);
+        assert!(other.try_take(&["gpu1.lock"]).unwrap());
+        // Only the configured directories were written.
+        let mut written: Vec<_> = std::fs::read_dir(root.path()).unwrap().flatten().map(|e| e.file_name()).collect();
+        written.sort();
+        assert_eq!(written, vec![std::ffi::OsString::from("canonical"), "elsewhere".into()]);
     }
 }
