@@ -406,6 +406,41 @@ def require_new_set_generated_rows(rows):
                          + ', '.join(f'{half} has {count:,}' for half, count in short.items()))
 
 
+FLOOR_EXCEPTION_SCHEMA = "cuteafd.fidelity.generated-floor-exception/1"
+
+
+def loader_generated_min() -> int:
+    """The bench loader's own per-half floor (STANDARD_GENERATED_MIN), read from its source."""
+    match = re.search(r"pub const STANDARD_GENERATED_MIN: usize = ([0-9_]+);", STANDARD_SOURCE.read_text())
+    return int(match.group(1).replace("_", ""))
+
+
+def generated_floor_exception(record, rows, set_sha256):
+    """An owner's recorded exception to the new-set floor, checked against the set it was granted for.
+
+    It names the set by hash, the per-half counts the decision was made on and a reason, and
+    lowers the floor no further than the bench loader's; a set that clears the default needs
+    none. Returns the normalized record that packaging writes into the dataset.
+    """
+    measured = {half: rows[f"{half}_generated_positions"] for half in ("decode", "prefill")}
+    floor, reason, loader = record.get("floor"), record.get("reason"), loader_generated_min()
+    if record.get("schema") != FLOOR_EXCEPTION_SCHEMA or record.get("set_sha256") != set_sha256:
+        raise ValueError("generated-row floor exception does not name this set")
+    if not isinstance(reason, str) or not reason.strip():
+        raise ValueError("generated-row floor exception needs a reason")
+    validate_public_text(reason)
+    if type(floor) is not int or not loader <= floor < NEW_SET_GENERATED_MIN:
+        raise ValueError(f"generated-row floor exception must lie in [{loader:,}, {NEW_SET_GENERATED_MIN:,})")
+    if record.get("measured") != measured:
+        raise ValueError(f"generated-row floor exception was granted for {record.get('measured')}; the set measures {measured}")
+    if min(measured.values()) >= NEW_SET_GENERATED_MIN:
+        raise ValueError("the set clears the new-set floor and needs no exception")
+    if min(measured.values()) < floor:
+        raise ValueError(f"a standard half holds fewer than the exception's {floor:,} generated rows")
+    return dict(schema=FLOOR_EXCEPTION_SCHEMA, set_sha256=set_sha256, floor=floor, loader_floor=loader,
+                default_floor=NEW_SET_GENERATED_MIN, measured=measured, reason=reason.strip())
+
+
 def standard_generated_rows(panel):
     """Report natural row counts using the consumer's fixed split, never resample."""
     windows = {window['id']: window for window in panel['windows']}

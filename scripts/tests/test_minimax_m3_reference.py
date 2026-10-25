@@ -485,9 +485,10 @@ def test_bf16_diagnostic_golden_is_never_a_reference(snapshot, tmp_path, monkeyp
         golden.write_reference_meta(out, revision)
 
 
-def package_minimax(tmp_path, monkeypatch, config="minimax_m3-test"):
+def package_minimax(tmp_path, monkeypatch, config="minimax_m3-test", agentic_gen=512, exception_reason=None):
     """golden.py, make-fidelity-reference.py, validate-fidelity-dataset.py --seal and the packager
-    over a sealed-split set of 64 own-text windows on a tiny release-shaped checkpoint."""
+    over a sealed-split set of 64 own-text windows on a tiny release-shaped checkpoint. Agentic
+    windows score agentic_gen generated rows; exception_reason packages under a floor exception."""
     import importlib.util
     from types import SimpleNamespace
     from tokenizers import Tokenizer
@@ -504,10 +505,10 @@ def package_minimax(tmp_path, monkeypatch, config="minimax_m3-test"):
     windows = []
     split = standard_split()
     for wid in split["decode"] + split["prefill"]:
-        scored = "ctx" if wid == "legacy" or wid.startswith("c") else "gen"
+        gen = 0 if wid == "legacy" or wid.startswith("c") else agentic_gen if wid.startswith("a") else 512
         windows.append(dict(id=wid, block="E" if wid == "legacy" else wid[0].upper(), bucket="0-2K",
                             tokens=[(7 * i + 3 * len(windows)) % 1100 for i in range(640)],
-                            roles=["ctx"] * 128 + [scored] * 512, score_from=128))
+                            roles=["ctx"] * 128 + ["gen"] * gen + ["ctx"] * (512 - gen), score_from=128))
     manifest = dict(schema="cuteafd.fidelity.set/1", family="minimax_m3", model=model.CHECKPOINT,
                     checkpoint=model.CHECKPOINT, generation_arm={"checkpoint": model.CHECKPOINT},
                     quick_windows=["legacy", "a00", "a04", "a08", "a20", "c00", "d00", "e00"], windows=windows)
@@ -530,8 +531,18 @@ def package_minimax(tmp_path, monkeypatch, config="minimax_m3-test"):
     validation = tools["validate-fidelity-dataset"].validate_reference_only(root, seal=True)
     (root / "reference-validation.json").write_text(json.dumps(validation, indent=2) + "\n")
     package = tmp_path / "package"
-    index = tools["package-reference-only-fidelity"].package(root, package, config, revision / "tokenizer.json",
-                                                             ROOT / "LICENSE", revision / "LICENSE")
+    packager = tools["package-reference-only-fidelity"]
+    exception = None
+    if exception_reason is not None:
+        from fidelity_windows import FLOOR_EXCEPTION_SCHEMA, standard_generated_rows
+        rows = standard_generated_rows(manifest)
+        exception = dict(schema=FLOOR_EXCEPTION_SCHEMA, set_sha256=manifest["set_sha256"], floor=6500,
+                         measured={h: rows[f"{h}_generated_positions"] for h in ("decode", "prefill")},
+                         reason=exception_reason)
+        with pytest.raises(ValueError, match="10,000 scored generated rows per half"):
+            packager.package(root, tmp_path / "refused", config, revision / "tokenizer.json", ROOT / "LICENSE")
+    index = packager.package(root, package, config, revision / "tokenizer.json", ROOT / "LICENSE",
+                             revision / "LICENSE", exception)
     return package, index, revision
 
 
@@ -553,6 +564,23 @@ def test_minimax_reference_packages_end_to_end_with_its_checkpoint_licence(tmp_p
     card = (config / "README.md").read_text()
     assert f"Official root ({golden.ROOT_PRECISION}): `{model.CHECKPOINT}` at `{revision.name}`." in card
     assert "reproduced verbatim in CHECKPOINT_LICENSE." in card
+
+
+def test_set_below_the_new_set_floor_packages_only_under_its_recorded_exception(tmp_path, monkeypatch):
+    reason = "Agentic turns end after brief reasoning; owner decision, internal use."
+    package, index, revision = package_minimax(tmp_path, monkeypatch, agentic_gen=100, exception_reason=reason)
+    config = package / index["name"]
+    qualification = json.loads((config / "qualification.json").read_bytes())
+    exception = qualification["generated_floor_exception"]
+    measured = {"decode": 13 * 100 + 14 * 512, "prefill": 13 * 100 + 13 * 512}
+    assert exception["measured"] == measured and exception["floor"] == exception["loader_floor"] == 6500
+    assert exception["default_floor"] == 10000 and exception["reason"] == reason
+    assert qualification["standard_generated_rows"]["prefill_generated_positions"] == measured["prefill"]
+    panel = json.loads((config / "windows.json").read_bytes())
+    assert panel["publication_provenance"]["generated_floor_exception"] == exception
+    card = (config / "README.md").read_text()
+    assert "Packaged under a recorded exception to the 10,000-row new-set floor" in card and reason in card
+    assert not (tmp_path / "refused").exists() or not any((tmp_path / "refused").rglob("manifest.json"))
 
 
 def test_cache_e4m3_rounds_ties_even_saturates_and_preserves_sign():

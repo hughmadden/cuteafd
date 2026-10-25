@@ -222,6 +222,30 @@ def test_new_sets_need_ten_thousand_generated_rows_per_half():
             packager.require_new_set_generated_rows(rows(decode, prefill))
 
 
+def test_floor_exception_needs_this_set_its_measured_counts_a_reason_and_the_loader_floor():
+    from fidelity_windows import FLOOR_EXCEPTION_SCHEMA, generated_floor_exception, loader_generated_min
+    rows = dict(decode_generated_positions=9981, prefill_generated_positions=7804)
+    record = dict(schema=FLOOR_EXCEPTION_SCHEMA, set_sha256='s' * 64, floor=6500,
+                  measured=dict(decode=9981, prefill=7804), reason=' Terse agentic turns; internal use. ')
+    assert loader_generated_min() == 6500
+    assert generated_floor_exception(record, rows, 's' * 64) == dict(
+        schema=FLOOR_EXCEPTION_SCHEMA, set_sha256='s' * 64, floor=6500, loader_floor=6500, default_floor=10000,
+        measured=dict(decode=9981, prefill=7804), reason='Terse agentic turns; internal use.')
+    for change, message in ((dict(set_sha256='t' * 64), 'does not name this set'),
+                            (dict(schema='other'), 'does not name this set'),
+                            (dict(reason='  '), 'needs a reason'), (dict(reason=None), 'needs a reason'),
+                            (dict(floor=6499), 'must lie in'), (dict(floor=10000), 'must lie in'),
+                            (dict(floor=6500.0), 'must lie in'), (dict(floor=8000), 'fewer than'),
+                            (dict(measured=dict(decode=9981, prefill=7805)), 'granted for'),
+                            (dict(measured=None), 'granted for'),
+                            (dict(reason='key ghp_' + 'a' * 30), 'credential')):
+        with pytest.raises(ValueError, match=message):
+            generated_floor_exception({**record, **change}, rows, 's' * 64)
+    clears = dict(decode_generated_positions=10000, prefill_generated_positions=12000)
+    with pytest.raises(ValueError, match='needs no exception'):
+        generated_floor_exception({**record, 'measured': dict(decode=10000, prefill=12000)}, clears, 's' * 64)
+
+
 def test_dense_root_wording_is_unchanged_and_v41_root_comes_from_the_manifest():
     # Dense/Step-5 goldens record no root arithmetic: their cards keep the original text byte for byte.
     assert packager.root_description({}, {'reference_snapshot': {'precision': 'official BF16'}}) == (

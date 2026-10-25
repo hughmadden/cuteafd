@@ -15,8 +15,9 @@ from safetensors.numpy import save_file
 REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO / 'python/reference'))
 # The generated-row floor is shared with the set builder, which applies it before any reference run.
-from fidelity_windows import (canonical, require_new_set_generated_rows, standard_generated_rows,
-                              validate_public_metadata, validate_public_text, validate_text_source)
+from fidelity_windows import (canonical, generated_floor_exception, require_new_set_generated_rows,
+                              standard_generated_rows, validate_public_metadata, validate_public_text,
+                              validate_text_source)
 from checkpoint_tokenizer import load_tokenizer, tokenizer_identity
 
 QUICK = ['legacy', 'a00', 'a04', 'a08', 'a20', 'c00', 'd00', 'e00']
@@ -240,7 +241,7 @@ def public_panel(panel):
     return public
 
 
-def package(source, out, config, tokenizer_path, license_path, checkpoint_license=None):
+def package(source, out, config, tokenizer_path, license_path, checkpoint_license=None, floor_exception=None):
     if out.exists() or not config or any(c not in 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_.' for c in config) or config in ('.', '..'):
         raise ValueError('output must be fresh and config must be a safe component')
     read = lambda name: json.loads(contained(source, name).read_text())
@@ -290,7 +291,13 @@ def package(source, out, config, tokenizer_path, license_path, checkpoint_licens
                 tokenizer.decode(window['tokens'], skip_special_tokens=False))
         validate_public_text(text, scored_text=True)
     precision, arithmetic, runtime_source = root_description(meta, panel)
+    generated_rows = standard_generated_rows(panel)
+    # The new-set floor holds unless the owner's recorded exception names this set and its counts.
+    exception = (require_new_set_generated_rows(generated_rows) if floor_exception is None
+                 else generated_floor_exception(floor_exception, generated_rows, set_id))
     public = public_panel(panel)
+    if exception:
+        public['publication_provenance']['generated_floor_exception'] = exception
     destination = out / config
     destination.mkdir(parents=True)
     (destination / 'windows.json').write_bytes(canonical(public) + b'\n')
@@ -332,11 +339,10 @@ def package(source, out, config, tokenizer_path, license_path, checkpoint_licens
         raise ValueError('sealed runtime provenance differs')
     runtime = read('platform.json')
     provenance['runtime'] = validate_runtime_platform(runtime)
-    generated_rows = standard_generated_rows(panel)
-    require_new_set_generated_rows(generated_rows)
     role_metrics = reference_role_metrics(validation)
     qualification = dict(schema='cuteafd.fidelity.qualification/1', kind='reference', qualifies=True,
                          **role_metrics, standard_generated_rows=generated_rows,
+                         **({'generated_floor_exception': exception} if exception else {}),
                          engine_parity=False, qualification_scope='reference logits, storage and prefix invariance',
                          set_sha256=set_id, nll=meta['nll'], scored_tokens=meta['scored_tokens'],
                          prefix_qualification=meta['prefix_qualification'], reference_validation=validation,
@@ -377,6 +383,9 @@ def package(source, out, config, tokenizer_path, license_path, checkpoint_licens
             f'32,768 scored positions; reference NLL {meta["nll"]:.15f} nat/token.\n'
             f'{reference_role_note(role_metrics)}'
             f'{standard_generated_note(generated_rows)}'
+            + (f'Packaged under a recorded exception to the {exception["default_floor"]:,}-row new-set floor: '
+               f'this set is held to {exception["floor"]:,} generated rows per half (the bench loader admits '
+               f'{exception["loader_floor"]:,}). Reason: {exception["reason"]}\n' if exception else '') +
             'The 576/640-token prefix probes have 512 byte-identical common F32 rows and zero argmax disagreements.\n'
             f'{arithmetic}\n'
             f'{launch_note}'
@@ -408,9 +417,12 @@ def main():
     parser.add_argument('--config', required=True)
     parser.add_argument('--checkpoint-license', type=Path,
                         help="the checkpoint's own licence, shipped verbatim as CHECKPOINT_LICENSE")
+    parser.add_argument('--generated-floor-exception', type=Path,
+                        help='JSON record of an owner exception to the new-set generated-row floor for this set')
     args = parser.parse_args()
+    exception = json.loads(args.generated_floor_exception.read_text()) if args.generated_floor_exception else None
     print(json.dumps(package(args.source, args.out, args.config, args.tokenizer, args.license,
-                             args.checkpoint_license), indent=2))
+                             args.checkpoint_license, exception), indent=2))
     print('Staged only; no upload or engine qualification performed.')
 
 
