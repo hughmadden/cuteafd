@@ -10,7 +10,8 @@ without root into the persistent architecture Cargo home (see AGENTS.md).
 The gate finds it on PATH or there automatically; cargo test remains the fallback.
 When cargo or rustc is not on PATH (a systemd user unit), the gate prepends the
 existing standard Cargo bin directories ($CARGO_HOME/bin, ~/.cargo/bin, the
-persistent architecture Cargo home) for itself and every child before refusing.
+persistent architecture Cargo home, Homebrew's bin, and the toolchain rustup
+resolves when /opt/rustup exists) for itself and every child before refusing.
 
 With none of --cargo, --scripts, --benches the first two run. --benches runs
 the release host-cost bounds (BENCHES: the draft policy's select median at the
@@ -67,6 +68,8 @@ SLOW_TESTS = (('cuteafd-hostcache', 'soak_has_no_leak_and_balances_the_counters'
               ('cuteafd-loader', 'mounted_mimo_audio_inventory_is_independently_admitted'))
 NAME = re.compile(r'[A-Za-z0-9][A-Za-z0-9_.-]*\Z')
 TOOLCHAIN = ('cargo', 'rustc')
+HOMEBREW_BIN = Path('/home/linuxbrew/.linuxbrew/bin')
+RUSTUP_HOME = Path('/opt/rustup')
 CARGO_RESULT = re.compile(r'^test result: (?:ok|FAILED)\. (\d+) passed; (\d+) failed; (\d+) ignored', re.M)
 CARGO_FAIL = re.compile(r'^test (\S+) \.\.\. FAILED$', re.M)
 CARGO_PANIC_ID = re.compile(r"^---- (\S+) stdout ----$", re.M)
@@ -269,21 +272,33 @@ def toolchain_path(env):
 
     A systemd user unit starts without ~/.cargo/bin on PATH, which used to reject the
     gate before any work. When either tool is missing, prepend the standard Cargo bin
-    directories that exist, in precedence order: $CARGO_HOME/bin, ~/.cargo/bin, then
-    the persistent architecture Cargo home. Returns (path, directory) where directory
-    is the one that supplied the missing tools, or None when PATH already worked or no
-    candidate supplies them (the caller then errors)."""
+    directories that exist, in precedence order (see toolchain_bins). Returns
+    (path, directory) where directory is the one that supplied the missing tools, or
+    None when PATH already worked or no candidate supplies them (the caller then
+    errors)."""
     path = env.get('PATH') or ''
     missing = [tool for tool in TOOLCHAIN if not shutil.which(tool, path=path)]
     if not missing:
         return path, None
-    added = [str(home / 'bin') for home in cargo_homes(env) if (home / 'bin').is_dir()]
+    added = [str(directory) for directory in toolchain_bins(env) if directory.is_dir()]
     combined = os.pathsep.join([*added, path]) if path else os.pathsep.join(added)
     if not added or any(not shutil.which(tool, path=combined) for tool in missing):
         return path, None
     used = next((directory for directory in added
                  if all(shutil.which(tool, path=os.pathsep.join([directory, path])) for tool in missing)), added[0])
     return combined, used
+
+
+def toolchain_bins(env):
+    """Bin directories that may hold cargo/rustc, in precedence order: the Cargo
+    homes' bin/, Homebrew's prefix, then the toolchain rustup resolves (only when
+    its /opt/rustup home exists)."""
+    bins = [home / 'bin' for home in cargo_homes(env)]
+    bins.append(HOMEBREW_BIN)
+    resolved = rustup_toolchain_bin(env=env)
+    if resolved is not None:
+        bins.append(resolved)
+    return bins
 
 
 def cargo_homes(env):
@@ -293,6 +308,29 @@ def cargo_homes(env):
     homes.append(Path(env.get('HOME') or Path.home()) / '.cargo')
     homes.append(persistent_cargo_home(env))
     return homes
+
+
+def rustup_toolchain_bin(root=RUSTUP_HOME, env=None):
+    """Bin directory of the cargo rustup resolves from its home at root, or None.
+
+    Ask rustup rather than guessing the toolchain directory name; a missing home or
+    a rustup that cannot answer leaves the caller on the other candidates."""
+    if not root.is_dir():
+        return None
+    env = dict(os.environ if env is None else env, RUSTUP_HOME=str(root))
+    rustup = root / 'bin/rustup'
+    if not (rustup.is_file() and os.access(rustup, os.X_OK)):
+        found = shutil.which('rustup', path=env.get('PATH'))
+        if not found:
+            return None
+        rustup = Path(found)
+    try:
+        result = subprocess.run([str(rustup), 'which', 'cargo'], capture_output=True, text=True,
+                                timeout=10, env=env)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    resolved = Path(result.stdout.strip()) if result.returncode == 0 and result.stdout.strip() else None
+    return resolved.parent if resolved is not None and resolved.is_file() else None
 
 
 def cargo_build_succeeded(path):
