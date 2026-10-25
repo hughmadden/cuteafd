@@ -32,6 +32,7 @@ pub fn family_title(family: &str) -> &str {
         "glm5" => "GLM 5.3",
         "glm5_flash" => "GLM 5.3 Flash",
         "mimo_v2" => "MiMo V2",
+        "minimax_m3" => "MiniMax M3.1",
         "qwen4" => "Qwen 3.8",
         other => other,
     }
@@ -1441,9 +1442,11 @@ mod tests {
         let placed = scan(&root).unwrap();
         let matrix = Matrix::load(&root.join(MATRIX_FILE)).unwrap();
         let rows = select(&placed, &matrix).unwrap();
-        assert_eq!(rows.len(), 12);
+        assert_eq!(rows.len(), 13);
         for row in rows {
             assert!(matches!(row.cells[0], Resolved::Card(_) | Resolved::Na(_)));
+            // A family in qualification publishes its 5090 card first, both PRO cells pending.
+            if row.cells[1..].iter().all(|c| matches!(c, Resolved::Pending(_))) { continue; }
             // One release card per checkpoint; the other PRO column is n/a.
             assert!(row.cells[1..].iter().any(|c| matches!(c, Resolved::Card(_))));
             assert!(row.cells[1..].iter().all(|c| matches!(c, Resolved::Card(_) | Resolved::Na(_))));
