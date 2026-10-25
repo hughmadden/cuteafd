@@ -8,6 +8,9 @@ both run, otherwise given entirely to the requested suite. --slow adds the
 explicit CPU slow tier and is required at release cuts. Install cargo-nextest
 without root into the persistent architecture Cargo home (see AGENTS.md).
 The gate finds it on PATH or there automatically; cargo test remains the fallback.
+When cargo or rustc is not on PATH (a systemd user unit), the gate prepends the
+existing standard Cargo bin directories ($CARGO_HOME/bin, ~/.cargo/bin, the
+persistent architecture Cargo home) for itself and every child before refusing.
 
 With none of --cargo, --scripts, --benches the first two run. --benches runs
 the release host-cost bounds (BENCHES: the draft policy's select median at the
@@ -63,6 +66,7 @@ SLOW_TESTS = (('cuteafd-hostcache', 'soak_has_no_leak_and_balances_the_counters'
               ('cuteafd-hostcache', 'soak_in_bank_order_has_no_leak_and_balances_the_counters'),
               ('cuteafd-loader', 'mounted_mimo_audio_inventory_is_independently_admitted'))
 NAME = re.compile(r'[A-Za-z0-9][A-Za-z0-9_.-]*\Z')
+TOOLCHAIN = ('cargo', 'rustc')
 CARGO_RESULT = re.compile(r'^test result: (?:ok|FAILED)\. (\d+) passed; (\d+) failed; (\d+) ignored', re.M)
 CARGO_FAIL = re.compile(r'^test (\S+) \.\.\. FAILED$', re.M)
 CARGO_PANIC_ID = re.compile(r"^---- (\S+) stdout ----$", re.M)
@@ -246,12 +250,49 @@ def clean_scratch(root):
     return removed
 
 
+def persistent_cargo_home(env=None):
+    """The architecture Cargo home where tools are installed without root (see AGENTS.md)."""
+    home = Path((os.environ if env is None else env).get('HOME') or Path.home())
+    return home / '.cache/cuteafd/cargo-home' / platform.machine()
+
+
 def nextest_for(env):
     found = shutil.which('cargo-nextest', path=env.get('PATH'))
     if found:
         return found
-    persistent = Path.home() / '.cache/cuteafd/cargo-home' / platform.machine() / 'bin/cargo-nextest'
+    persistent = persistent_cargo_home() / 'bin/cargo-nextest'
     return str(persistent) if persistent.is_file() and os.access(persistent, os.X_OK) else None
+
+
+def toolchain_path(env):
+    """PATH that finds cargo and rustc for this process and every child.
+
+    A systemd user unit starts without ~/.cargo/bin on PATH, which used to reject the
+    gate before any work. When either tool is missing, prepend the standard Cargo bin
+    directories that exist, in precedence order: $CARGO_HOME/bin, ~/.cargo/bin, then
+    the persistent architecture Cargo home. Returns (path, directory) where directory
+    is the one that supplied the missing tools, or None when PATH already worked or no
+    candidate supplies them (the caller then errors)."""
+    path = env.get('PATH') or ''
+    missing = [tool for tool in TOOLCHAIN if not shutil.which(tool, path=path)]
+    if not missing:
+        return path, None
+    added = [str(home / 'bin') for home in cargo_homes(env) if (home / 'bin').is_dir()]
+    combined = os.pathsep.join([*added, path]) if path else os.pathsep.join(added)
+    if not added or any(not shutil.which(tool, path=combined) for tool in missing):
+        return path, None
+    used = next((directory for directory in added
+                 if all(shutil.which(tool, path=os.pathsep.join([directory, path])) for tool in missing)), added[0])
+    return combined, used
+
+
+def cargo_homes(env):
+    """Candidate Cargo homes in precedence order: $CARGO_HOME, ~/.cargo, then the
+    persistent architecture one nextest_for falls back to."""
+    homes = [Path(env['CARGO_HOME'])] if env.get('CARGO_HOME') else []
+    homes.append(Path(env.get('HOME') or Path.home()) / '.cargo')
+    homes.append(persistent_cargo_home(env))
+    return homes
 
 
 def cargo_build_succeeded(path):
@@ -529,8 +570,13 @@ def main():
     if args.jobs < 1:
         parser.error('--jobs must be positive')
     # A systemd unit without ~/.cargo/bin on PATH otherwise burns a whole gate
-    # (cargo exit 127 plus the scripts that shell out to rustc).
-    missing = [tool for tool in ('cargo', 'rustc') if not shutil.which(tool)]
+    # (cargo exit 127 plus the scripts that shell out to rustc). Recover from the
+    # standard Cargo locations before refusing: PATH here reaches every child.
+    path, used = toolchain_path(os.environ)
+    if used:
+        os.environ['PATH'] = path
+        log(f'PATH: {used} supplies cargo/rustc (added to PATH)')
+    missing = [tool for tool in TOOLCHAIN if not shutil.which(tool)]
     if missing and (args.cargo or args.benches or args.scripts):
         parser.error(f'{", ".join(missing)} not on PATH; pass PATH including ~/.cargo/bin '
                      '(systemd-run --setenv=PATH=...)')
