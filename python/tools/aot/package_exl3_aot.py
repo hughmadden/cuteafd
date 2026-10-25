@@ -408,9 +408,11 @@ COORDINATOR_WS_CELLS: dict[tuple[str, int, int], dict] = {
     ('glm', 1024, 256): dict(route_block=64, wire=True, stages=3, dynamic=True),
     ('glm', 1024, 1024): dict(route_block=64),
     ('glm', 1024, 2752): dict(route_block=64),
+    ('glm', 1024, 2048): dict(route_block=64),
     ('glm', 2048, 256): dict(route_block=64),
     ('glmf', 1024, 256): dict(route_block=64),
     ('glmf', 1024, 2752): dict(route_block=64),
+    ('glmf', 1024, 2048): dict(route_block=64),
     # Qwen 3.8 Flash Next wins at every served capacity, both RTX splits.
     ('qwen4', 640, 256): _WS_S14_M256,
     ('qwen4', 384, 256): _WS_S14_M256,
@@ -419,8 +421,11 @@ COORDINATOR_WS_CELLS: dict[tuple[str, int, int], dict] = {
     ('qwen4', 384, 1024): _WS_S14,
     ('qwen4', 256, 1024): _WS_S14,
     ('qwen4', 640, 2752): _WS_S14,
+    ('qwen4', 640, 2048): _WS_S14,
     ('qwen4', 384, 2752): _WS_S14,
+    ('qwen4', 384, 2048): _WS_S14,
     ('qwen4', 256, 2752): _WS_S14,
+    ('qwen4', 256, 2048): _WS_S14,
     ('qwen4', 640, 4096): _WS_S14,
     ('qwen4', 384, 4096): _WS_S14,
     ('qwen4', 256, 4096): _WS_S14,
@@ -428,13 +433,20 @@ COORDINATOR_WS_CELLS: dict[tuple[str, int, int], dict] = {
     ('v41', 2304, 1024): _WS_S14,
     ('v41', 1152, 1024): _WS_S14,
     ('v41', 2304, 2752): _WS_S14,
+    ('v41', 2304, 2048): _WS_S14,
     ('v41', 1152, 2752): _WS_S14,
+    ('v41', 1152, 2048): _WS_S14,
     ('v41', 2304, 4096): _WS_S14,
     ('v41', 1152, 4096): _WS_S14,
     # Kimi K3 (H3584/E896/top16 K2/K3): m256 stays cooperative 8-row; m1024
     # takes cooperative 64-row token-major rotation (5150.3 us on rtx-tp2 w1536
     # and 10596.1 us on rtx-tp1 w3072 vs _WS_S14 6419.0 / 13262.4 us); m4096
-    # keeps _WS_S14, and m2752 is not one of its K64 capacities.
+    # keeps _WS_S14. m2048/m2752 (prefill waves, #762) are placeholders that
+    # follow m4096's arm until a screen measures them.
+    ('kimik3', 3072, 2048): _WS_S14,
+    ('kimik3', 1536, 2048): _WS_S14,
+    ('kimik3', 3072, 2752): _WS_S14,
+    ('kimik3', 1536, 2752): _WS_S14,
     ('kimik3', 3072, 4096): _WS_S14,
     ('kimik3', 1536, 4096): _WS_S14,
 }
@@ -541,11 +553,11 @@ COMPACT_WS_CELLS = {
     # 12.538 N192 (1.836x), m2752 16.646 -> 9.342 / 9.040, m1024 7.836 ->
     # 4.627 / 4.601; at m256 the 32-row N128 arm stays best (4.351 -> 3.408,
     # 1.277x, vs 3.413 for N192).
-    ('glm', 384): {256: (32, 128), 1024: (64, 192), 2752: (64, 192), 4096: (64, 192)},
+    ('glm', 384): {256: (32, 128), 1024: (64, 192), 2048: (64, 192), 2752: (64, 192), 4096: (64, 192)},
     # GLM 5.3 TP3 width 768: N192 wins from m1024 up (m4096 31.624 -> 22.012 /
     # 21.206, m2752 23.474 -> 15.701 / 15.361, m1024 11.384 -> 8.297 / 8.237);
     # m256 keeps the 64-row N128 arm (7.492 -> 6.527 vs 6.541 for N192).
-    ('glm', 768): {256: (64, 128), 1024: (64, 192), 2752: (64, 192), 4096: (64, 192)},
+    ('glm', 768): {256: (64, 128), 1024: (64, 192), 2048: (64, 192), 2752: (64, 192), 4096: (64, 192)},
     # V4.1 K3/K4 TP4 width 640 (the only uneven V4.1 world): the 32-row block
     # wins m256/m1024 and the 64-row block m2752/m4096. Round 2 of the Spark
     # duel measured a non-divisible 192-wide FC1 tile here (640 = 2 x 320-row
@@ -553,25 +565,25 @@ COMPACT_WS_CELLS = {
     # top-6) faster than N128 at m256/m1024/m2752 (5.594 vs 5.630, 6.630 vs
     # 6.766, 9.942 vs 10.093 ms) and slower at m4096 (13.868 vs 13.831), so
     # N192 takes the three smaller capacities and m4096 keeps N128.
-    ('v41', 640): {256: (32, 192), 1024: (32, 192), 2752: (64, 192), 4096: (64, 128)},
+    ('v41', 640): {256: (32, 192), 1024: (32, 192), 2048: (64, 192), 2752: (64, 192), 4096: (64, 128)},
     # Qwen4 K4/K5 TP2 compact width 384: N192 wins m1024/m2752 (3.141 vs
     # 3.159, 5.549 vs 5.596) and ties m4096 (7.570 vs 7.559), so the large
     # capacities consolidate onto the same N192/64 arm as the GLM cells; only
     # m256 keeps N128 with 32 rows (1.933 vs 1.938 for N192, and 1.978 for
     # the 64-row arm).
-    ('qwen4', 384): {256: (32, 128), 1024: (64, 192), 2752: (64, 192), 4096: (64, 192)},
+    ('qwen4', 384): {256: (32, 128), 1024: (64, 192), 2048: (64, 192), 2752: (64, 192), 4096: (64, 192)},
     # TP3 and TP4 compact share width 256; one table entry serves both and
     # takes 64 everywhere (TP3 m256 1.279x vs its 32-row arm 1.282x, TP4
     # m256 1.334x vs 1.327x). Width 256 also rejects a 192-wide tile.
-    ('qwen4', 256): {256: (64, 128), 1024: (64, 128), 2752: (64, 128), 4096: (64, 128)},
+    ('qwen4', 256): {256: (64, 128), 1024: (64, 128), 2048: (64, 128), 2752: (64, 128), 4096: (64, 128)},
     # GLM Flash K3/K4 TP6 width 384: N192 from m1024 up (m4096 14.390 ->
     # 8.526 / 8.307, m2752 10.108 -> 6.438 / 6.241, m1024 4.779 -> 3.175 /
     # 3.062); m256 keeps 32-row N128 (2.814 -> 2.171 vs 2.177).
-    ('glmf', 384): {256: (32, 128), 1024: (64, 192), 2752: (64, 192), 4096: (64, 192)},
+    ('glmf', 384): {256: (32, 128), 1024: (64, 192), 2048: (64, 192), 2752: (64, 192), 4096: (64, 192)},
     # GLM Flash TP3 width 768: N192 from m1024 up (m4096 20.085 -> 14.542 /
     # 13.928, m2752 14.319 -> 11.093 / 10.848, m1024 6.792 -> 5.645 / 5.405);
     # m256 keeps 32-row N128 (4.804 -> 4.140 vs 4.136).
-    ('glmf', 768): {256: (32, 128), 1024: (64, 192), 2752: (64, 192), 4096: (64, 192)},
+    ('glmf', 768): {256: (32, 128), 1024: (64, 192), 2048: (64, 192), 2752: (64, 192), 4096: (64, 192)},
     # V4 Flash K4/K5 (H4096/E256/top6) synthetic weights, uniform top-6 routes:
     # both compact worlds take the 32-row N128 arm at m256 and the 64-row N192
     # arm from m1024 up. Kernel + top-k sum, ms (cooperative -> WS): TP6 width
@@ -581,8 +593,8 @@ COMPACT_WS_CELLS = {
     # m1024 11.763 -> 5.439 (2.163x), m256 5.478 -> 4.807 (1.140x). Exhaustive
     # 1..4096 prefix row invariance and poisoned-tail graph replays are
     # bitwise equal to the cooperative oracle.
-    ('dsv4f', 384): {256: (32, 128), 1024: (64, 192), 2752: (64, 192), 4096: (64, 192)},
-    ('dsv4f', 768): {256: (32, 128), 1024: (64, 192), 2752: (64, 192), 4096: (64, 192)},
+    ('dsv4f', 384): {256: (32, 128), 1024: (64, 192), 2048: (64, 192), 2752: (64, 192), 4096: (64, 192)},
+    ('dsv4f', 768): {256: (32, 128), 1024: (64, 192), 2048: (64, 192), 2752: (64, 192), 4096: (64, 192)},
 }
 # Measured tier families of the compact WS cells; a different tier pair is a
 # different cell and stays cooperative until it is measured.
@@ -1184,9 +1196,11 @@ def package_capacities(geometry: str, requested: str) -> list[int]:
     if not capacities or any(v < 1 or v > 4096 for v in capacities):
         raise ValueError('EXL3 capacities must be in 1..4096')
     if geometry == 'kimik3':
+        # m16 takes K128 tiles that drift against M1 decode; rows 2..16 run on
+        # m80 (like GLM Flash). Every other capacity is allowed.
         capacities = [v for v in capacities if v != 16]
-        if any(v not in (1, 80, 256, 1024, 4096) for v in capacities) or not capacities:
-            raise ValueError('Kimi EXL3 requires K64 capacities 1,80,256,1024,4096')
+        if not capacities:
+            raise ValueError('Kimi EXL3 needs a capacity other than 16')
     return capacities
 
 
@@ -1427,7 +1441,7 @@ def main() -> None:
                              'tp3-width768=16:64,256,64,256; default is the B12x per-capacity policy')
     create.add_argument('--loopback', action='store_true',
                         help='Build Spark-role layouts for the SM120 coordinator GPU (loopback worker tests)')
-    create.add_argument('--capacities', default='1,16,80,256,1024,4096')
+    create.add_argument('--capacities', default='1,16,80,256,1024,2048,2752,4096')
     create.add_argument('--bits', type=int, nargs='+', default=[3, 4])
     create.add_argument('--build-dir', type=Path, required=True)
     create.add_argument('--output', type=Path, required=True)

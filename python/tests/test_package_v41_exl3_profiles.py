@@ -290,7 +290,7 @@ class PackageProfileTests(unittest.TestCase):
         # Unmeasured capacities stay cooperative even above the smallest one.
         for width in (384, 768):
             self.assertFalse(any(package.compact_warp_specialized('glm', 'spark', width, c)
-                                 for c in (512, 2048, 8192)))
+                                 for c in (512, 1536, 8192)))
         # Unmeasured widths of the same geometry stay cooperative at every
         # capacity; TP5 compact (640) and TP8 compact (256) were never measured.
         self.assertFalse(any(package.compact_warp_specialized('glm', 'spark', width, 4096)
@@ -374,9 +374,9 @@ class PackageProfileTests(unittest.TestCase):
         self.assertFalse(any(package.compact_warp_specialized('qwen4', 'spark', 640, c)
                              for c in capacities))
         self.assertFalse(any(package.compact_warp_specialized('v41', 'spark', 640, c)
-                             for c in (512, 2048, 8192)))
+                             for c in (512, 1536, 8192)))
         self.assertFalse(any(package.compact_warp_specialized('qwen4', 'spark', 384, c)
-                             for c in (512, 2048, 8192)))
+                             for c in (512, 1536, 8192)))
         self.assertFalse(package.compact_warp_specialized('v41', 'coordinator', 640, 4096))
         self.assertFalse(package.compact_warp_specialized('qwen4', 'coordinator', 384, 4096))
         # V4.1 width 640 is not divisible by 192, but the 192-wide FC1 tile
@@ -947,7 +947,7 @@ class PackageProfileTests(unittest.TestCase):
         for geometry in ('glm', 'glmf'):
             for width in (256, 384, 512, 640, 768, 1536):
                 self.assertFalse(package.warp_specialized(geometry, 'coordinator', width, 256))
-            for capacity in (1, 16, 80, 128, 512, 2048, 4096, 8192):
+            for capacity in (1, 16, 80, 128, 512, 1536, 4096, 8192):
                 self.assertFalse(package.warp_specialized(geometry, 'coordinator', 1024, capacity))
         for capacity in (80, 256, 1024, 2752, 4096):
             self.assertFalse(package.warp_specialized('glmf', 'coordinator', 2048, capacity))

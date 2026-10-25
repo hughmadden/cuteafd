@@ -211,6 +211,9 @@ struct Workspace<'a> {
     ids: Dev<'a>,
     tokens: Dev<'a>,
     confidence: Dev<'a>,
+    /// Pinned landing of `tokens` then `confidence`: both download behind the
+    /// round's one host wait.
+    landing: crate::shared::memory::HostAllocation<'a>,
     positions: Dev<'a>,
     tables: Dev<'a>,
     attention_workspace: Dev<'a>,
@@ -290,6 +293,8 @@ pub(crate) struct DsparkDrafter<'a> {
     library: &'a NativeLibrary,
     pub cfg: DsparkConfig,
     stream: *mut c_void,
+    /// The draft round's host wait (`--host-wait`).
+    round: std::cell::RefCell<crate::shared::memory::BlockingWait<'a>>,
     pub slots: usize,
     pub(crate) max_sequences: usize,
     context_capacity: usize,
@@ -471,6 +476,7 @@ impl<'a> DsparkDrafter<'a> {
             kv_cache,
             library,
             stream,
+            round: std::cell::RefCell::new(crate::shared::memory::BlockingWait::new(library)),
             slots,
             max_sequences,
             context_capacity,
@@ -851,6 +857,7 @@ impl<'a> DsparkDrafter<'a> {
             ids: alloc(rows * 4)?,
             tokens: alloc(rows * 4)?,
             confidence: alloc(rows * 4)?,
+            landing: crate::shared::memory::HostAllocation::new(self.library, rows * 8)?,
             positions: alloc(rows * 8)?,
             tables: alloc(3 * sequences * 4)?,
             attention_workspace,
@@ -1006,12 +1013,19 @@ impl<'a> DsparkDrafter<'a> {
             l.glmf_dspark_confidence(w.n.buffer.ptr, self.markov_w1.buffer.ptr, self.confidence_w.buffer.ptr,
                 self.confidence_b.buffer.ptr, w.anchors.buffer.ptr, w.tokens.buffer.ptr, w.confidence.buffer.ptr,
                 s_count, block, h, c.rank, s)?;
-            l.cuda_stream_synchronize(s)?;
+            // The round's results download on its stream; one host wait then
+            // covers the round and both copies (no second, synchronous drain).
+            // SAFETY: the device buffers hold `rows` words; the landing is
+            // pinned, owned by the workspace and read only after the wait.
+            let landing = |offset: usize| cuteafd_ffi::CuteafdHostBuffer {
+                ptr: w.landing.buffer.ptr.cast::<u8>().add(offset).cast(), bytes: rows * 4, ..w.landing.buffer };
+            l.copy_d2h_host_buffer_async(landing(0), CuteafdDeviceBuffer { bytes: rows * 4, ..w.tokens.buffer },
+                rows * 4, s)?;
+            l.copy_d2h_host_buffer_async(landing(rows * 4), CuteafdDeviceBuffer { bytes: rows * 4, ..w.confidence.buffer },
+                rows * 4, s)?;
+            self.round.borrow_mut().wait(s)?;
         }
-        let mut tokens = vec![0u8; rows * 4];
-        let mut confidence = vec![0u8; rows * 4];
-        l.copy_d2h(&mut tokens, CuteafdDeviceBuffer { bytes: rows * 4, ..w.tokens.buffer })?;
-        l.copy_d2h(&mut confidence, CuteafdDeviceBuffer { bytes: rows * 4, ..w.confidence.buffer })?;
+        let (tokens, confidence) = w.landing.bytes()[..rows * 8].split_at(rows * 4);
         let word = |b: &[u8], i: usize| u32::from_le_bytes(b[i * 4..i * 4 + 4].try_into().unwrap());
         Ok((0..s_count).map(|i| Draft {
             tokens: (0..block).map(|j| word(&tokens, i * block + j)).collect(),

@@ -101,22 +101,23 @@ def test_serving_and_glue_export_inventory():
         inventory("unknown")
 
 
-def test_native_worker_times_routing_experts_and_reduction_before_existing_drain():
+def test_native_worker_times_requests_without_adding_waits():
     worker = (ROOT / "rust/crates/cuteafd-daemon/src/shared/experts/service/exlr8.rs").read_text()
     assert "WorkerTiming::from_env(library, config.rank)?" in worker
-    execute = worker.split("    fn execute(", 1)[1].split("    /// # Safety", 1)[0]
-    mapped = execute.split("if let Some(mapped) = mapped {", 1)[1].split("} else {", 1)[0]
-    assert mapped.index("library_copy(") < mapped.index("timing.record(0,")
-    assert mapped.index("timing.record(0,") < mapped.index("copy_route_records(")
-    host = execute.split("} else {", 2)[2].split("// SAFETY: weights,", 1)[0]
+    # Mapped requests queue every chunk back to back (no per-chunk drain):
+    # timing brackets the whole request and publishes when it completes.
+    mapped = worker.split("    fn execute(&mut self", 1)[1].split("    fn execute_host(", 1)[0]
+    assert mapped.index("timing.record(0,") < mapped.index("library_copy(") < mapped.index("copy_route_records(")
+    assert mapped.index("execution.run(") < mapped.index("timing.record(1,")
+    assert "timing.publish(" not in mapped
+    complete = worker.split("    pub(super) fn complete(&mut self)", 1)[1]
+    assert "timing.publish(" in complete
+    # Host requests keep their blocking copies and per-chunk drain before publishing.
+    host = worker.split("    fn execute_host(", 1)[1].split("    /// The arena for", 1)[0]
     assert host.index("copy_h2d(execution.route_weights()?") < host.index("timing.record(0,")
-    assert execute.count("timing.record(0,") == 2
-    assert execute.index("execution.run(") < execute.index("timing.record(1,")
-    assert execute.index("timing.record(1,") < execute.index("cuda_stream_synchronize(")
-    assert execute.index("cuda_stream_synchronize(") < execute.index("timing.publish(")
-    assert 'rows as u32, executor_id, "exlr8"' in execute
-    # One existing per-chunk completion plus the unconditional failure drain; no timing wait.
-    assert execute.count("cuda_stream_synchronize(") == 2
+    assert host.index("execution.run(") < host.index("timing.record(1,") < host.index("cuda_stream_synchronize(")
+    assert host.index("cuda_stream_synchronize(") < host.index("timing.publish(")
+    assert 'identity.3, "exlr8"' in host
 
 
 def test_no_changes_to_existing_export_builders():
