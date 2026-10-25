@@ -145,6 +145,15 @@ def test_local_tp2_input_contract_is_independent_of_partial_dtype():
     assert "e.shared_on(1, index" in layers
 
 
+def test_native_layer_remote_fixture_matches_serving_two_plane_norm():
+    golden = (ROOT / "rust/crates/cuteafd-daemon/src/families/glm5/engine/exlr8/golden.rs").read_text()
+    fixture = golden.split("fn native_layer3_same_quant()", 1)[1].split("fn native_prefill_lanes_byte_exact()", 1)[0]
+    assert "peer_add_bf16" not in fixture  # The native helper rejects aliased output.
+    assert '(engine.recv(0, slot(3, true, 0))?, 2)' in fixture
+    assert '("delta1", second)' in fixture
+    assert 'Scalar::I32(deltas)' in fixture
+
+
 def test_no_changes_to_existing_export_builders():
     # The new family remains opt-in; existing geometry lists are unchanged.
     spec = importlib.util.spec_from_file_location("sm_exports", ROOT / "scripts/build/compare-sm-exports.py")

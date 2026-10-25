@@ -320,7 +320,7 @@ fn native_layer3_same_quant() -> Result<()> {
                 )?;
                 let normalized = engine.download(&w.x, rows * h * 2)?;
                 engine.on(1, || engine.put(&w1.x, &normalized))?;
-                if engine.tp2_layer(3) {
+                let (second, deltas) = if engine.tp2_layer(3) {
                     engine.moe_front(w, &engine.weights.layers[3], rows)?;
                     engine.shared_on(1, 3, w1, &engine.peer()?.layers[3], Scalar::I32(rows as i32), "m4096")?;
                     engine.tp2_pair(3, 0, w, w1, rows, "m4096")?;
@@ -329,16 +329,16 @@ fn native_layer3_same_quant() -> Result<()> {
                     // SAFETY: both FFN payloads are published on retained streams before the sum.
                     unsafe { pair.combine.sum(w.payload.as_ref().context("TP2 payload")?.buffer.ptr,
                         engine.recv(0, slot(3, true, 0))?, w.delta.buffer.ptr.cast(), rows, h, engine.stream)?; }
+                    (w.delta.buffer.ptr, 1)
                 } else {
                     let transport = transport.as_deref_mut().context("remote fixture needs real workers")?;
                     engine.moe(w, 3, &engine.weights.layers[3], rows, "m4096", false, transport, runtime)?;
                     engine.shared_on(1, 3, w1, &engine.peer()?.layers[3], Scalar::I32(rows as i32), "m4096")?;
                     engine.exchange()?.push(1, slot(3, true, 0), w1.shared.buffer.ptr, rows * h * 2)?;
                     engine.exchange()?.wait(0, slot(3, true, 0))?;
-                    // SAFETY: the remote routed sum and peer shared half are live BF16 token planes.
-                    unsafe { engine.library.peer_add_bf16(w.delta.buffer.ptr,
-                        engine.recv(0, slot(3, true, 0))?, w.delta.buffer.ptr, rows * h, engine.stream)?; }
-                }
+                    // Serving folds both FFN planes into the residual norm without a rounded intermediate sum.
+                    (engine.recv(0, slot(3, true, 0))?, 2)
+                };
                 let wire = engine.download(&w.wire, rows * (h + h / 32))?;
                 let out = PathBuf::from(std::env::var("CUTEAFD_GOLDEN_OUT")?);
                 std::fs::write(out.join(format!("r{rows}_actual_wire.bin")), &wire)?;
@@ -347,17 +347,17 @@ fn native_layer3_same_quant() -> Result<()> {
                     wire == expected_wire,
                     "native request differs from NumPy FP8 K32 oracle at {rows} rows"
                 );
-                // Both execution paths write delta; norm applies the residual in place.
+                // Local payloads already combined; remote keeps both planes, as serving does.
                 engine.run(
                     "glm_norm",
                     &[
                         ("residual", w.h.buffer.ptr),
                         ("delta0", w.delta.buffer.ptr),
-                        ("delta1", w.delta.buffer.ptr),
+                        ("delta1", second),
                         ("weight", engine.weights.layers[3].ptr("post_norm")?),
                         ("out", w.x.buffer.ptr),
                     ],
-                    &[Scalar::I32(rows as i32), Scalar::I32(1)],
+                    &[Scalar::I32(rows as i32), Scalar::I32(deltas)],
                 )?;
                 let actual = engine.download(&w.h, rows * h * 2)?;
                 let ids = engine.download(&w.route_ids, rows * engine.cfg.topk * 4)?;
