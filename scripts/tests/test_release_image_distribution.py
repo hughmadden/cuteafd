@@ -125,13 +125,19 @@ def test_ssh_hub_saves_once_and_loads_every_peer_bounded(env: dict) -> None:
     assert "rdmapipe" not in (Path(env["STATE"]) / "ssh.log").read_text()
 
 
-def test_one_failed_load_fails_the_build_and_names_the_host(env: dict) -> None:
-    host_file(env, "spark4", "inspect.json").parent.mkdir(parents=True)
-    host_file(env, "spark4", "fail-load").touch()
+def test_failed_loads_fail_the_build_and_name_every_host(env: dict) -> None:
+    # Parallel 2 over five peers: spark1+spark3, spark4+spark5, spark6. One failure per wave.
+    for host in ("spark3", "spark6"):
+        host_file(env, host, "inspect.json").parent.mkdir(parents=True)
+        host_file(env, host, "fail-load").touch()
     result = run(env, "release_image_distribution_preflight\nrelease_distribute_spark_image\necho DONE")
     assert result.returncode == DIE
     assert "DONE" not in result.stdout
-    assert "load on spark4 failed (exit 7)" in result.stderr
+    assert "load on spark3 failed (exit 7)" in result.stderr
+    assert "load on spark6 failed (exit 7)" in result.stderr
+    assert "ssh-hub Spark image distribution failed" in result.stderr
+    # The healthy hosts still loaded, so the failure names only the broken ones.
+    assert "load on spark4 failed" not in result.stderr
     assert list(Path(env["CUTEAFD_RELEASE_IMAGE_HUB_DIR"]).iterdir()) == []
 
 

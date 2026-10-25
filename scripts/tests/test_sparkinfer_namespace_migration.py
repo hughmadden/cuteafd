@@ -3,6 +3,7 @@ from __future__ import annotations
 import ast
 import os
 from pathlib import Path
+import json
 import re
 import shlex
 import subprocess
@@ -270,6 +271,15 @@ def test_fork_and_images_share_qualified_cutlass_pin() -> None:
         if "third_party/sparkinfer" not in content:
             continue
         sparkinfer_images.append(dockerfile.name)
+        if dockerfile.name == "Dockerfile.release":
+            # The release image installs exactly docker/release-python-lock.json.
+            lock = json.loads((ROOT / "docker" / "release-python-lock.json").read_text(encoding="utf-8"))
+            locked = {p["name"]: p["version"] for p in lock["packages"] if p["name"] in CUTLASS_PACKAGES}
+            assert locked == dict.fromkeys(CUTLASS_PACKAGES, QUALIFIED_CUTLASS_VERSION), (
+                f"docker/release-python-lock.json pins CUTLASS DSL {locked}, "
+                f"expected {QUALIFIED_CUTLASS_VERSION} to match the fork"
+            )
+            continue
         match = image_pin.search(content)
         assert match is not None, f"{dockerfile.relative_to(ROOT)} has no CUTLASS DSL pin"
         assert match.group(1) == QUALIFIED_CUTLASS_VERSION, (
