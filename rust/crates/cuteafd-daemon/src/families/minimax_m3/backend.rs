@@ -5,12 +5,29 @@ use crate::shared::{draft::routes::RoundRoutes, memory::device::Allocation, pref
 use anyhow::{ensure, Context, Result};
 use cuteafd_api::openai::NativeRequest;
 use cuteafd_engine::{media::{EncodeJob, RequestMedia},
-    prefix::{PrefixCache, PrefixConfig, PrefixFamily, RefPagePool}};
+    prefix::{FamilyLayout, PrefixCache, PrefixConfig, PrefixFamily, RefPagePool}};
+use cuteafd_hostcache::copy::CopyEngine;
 use cuteafd_ffi::NativeLibrary;
 use cuteafd_loader::media::SpanExpander;
 use std::{cell::RefCell, path::Path};
 
 use super::dspark::State;
+
+/// The device KV record the bench reports beside the pool size: E4M3 K/V planes and MSA index pages.
+const KV_FORMAT: &str = "FP8 K/V + MSA index";
+
+/// The prefix tier over the KV pool `layout`, reporting the admitted pool (every page, and the
+/// pinned host bytes) to the bench as the other families do: the context-load panel sizes its
+/// points from it and the basic card's capacity records it.
+fn prefix_tier<E: CopyEngine>(layout: FamilyLayout, args: &PrefixArgs,
+    host: Option<(cuteafd_hostcache::config::Config, E)>) -> Result<PrefixCache<E>> {
+    let host_bytes = host.as_ref().map_or(0, |(config, _)| config.bytes);
+    let config = PrefixConfig { entries: args.prefix_cache_entries, mark_slots: 0,
+        keep_logits: true, min_tokens: args.prefix_cache_min_tokens };
+    let cache = PrefixCache::new(layout, config, host)?;
+    cuteafd_bench::context::set_kv((layout.pages * layout.page_rows) as u64, layout.pages as u64, KV_FORMAT, host_bytes);
+    Ok(cache)
+}
 
 fn accept_step(step: Step, verified: &mut [scheduler::Verified<'_, Placement, State, ()>]) -> Result<()> {
     if verified.iter().any(|v| !step.matches(v.placement.sequence, v.start, v.rows)
@@ -160,9 +177,7 @@ impl<'e, 'a> Backend<'a> for MiniMaxBackend<'e, 'a> {
         let args = args.with_scoring(self.rows, self.rows.min(64), self.vocabulary)?;
         let host = args.host_config(layout, self.cache.context, lanes)?.map(|config|
             CudaCopyEngine::registered(self.cache.library, &self.cache.buffers()).map(|copy| (config, copy))).transpose()?;
-        let config = PrefixConfig { entries: args.prefix_cache_entries, mark_slots: 0,
-            keep_logits: true, min_tokens: args.prefix_cache_min_tokens };
-        Ok((family, PrefixCache::new(layout, config, host)?))
+        Ok((family, prefix_tier(layout, &args, host)?))
     }
     fn prepare(&self, job: NativeRequest, tokens: Vec<u32>) -> Result<(scheduler::Prompt, RequestMedia, Vec<EncodeJob>)> {
         super::media::prepare(job, tokens, self.expander.as_ref(), self.vocabulary, self.cache.context)
@@ -294,6 +309,23 @@ impl<'e, 'a> Backend<'a> for MiniMaxBackend<'e, 'a> {
 mod tests {
     use super::*;
     use scheduler::Placement as _;
+
+    #[test]
+    fn minimax_prefix_tier_reports_the_admitted_kv_pool_to_the_bench() -> Result<()> {
+        use clap::Parser;
+        #[derive(Parser)]
+        struct Cli { #[command(flatten)] prefix: PrefixArgs }
+        // The pool the context-load panel found unreported: 1918 pages of 64 rows.
+        let layout = FamilyLayout { page_rows: super::super::cache::PAGE_ROWS, pages: 1918, page_bytes: 4096,
+            mark_bytes: 0, draft_bytes: 0, rule: cuteafd_core::prefix::ReuseRule::EXACT,
+            mark_store: cuteafd_engine::prefix::MarkStore::Arena, page_owners: Default::default() };
+        let args = Cli::parse_from(["serve-minimax"]).prefix;
+        let cache = prefix_tier::<cuteafd_hostcache::copy::StubCopyEngine>(layout, &args, None)?;
+        assert_eq!(cache.layout().pages, 1918);
+        assert_eq!(cuteafd_bench::context::kv(), Some(cuteafd_bench::context::KvCapacity { tokens: Some(122_752),
+            pages: Some(1918), format: Some(KV_FORMAT.into()), host_bytes: Some(0) }));
+        Ok(())
+    }
 
     #[test]
     fn minimax_fake_verifier_commits_only_the_accepted_taps() -> Result<()> {
