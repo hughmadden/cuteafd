@@ -75,16 +75,37 @@ Status: **under qualification**. `serve-minimax` serves the release from a
   `python/reference/families/minimax_m3/dflash2/reference.py`. The selector scores each top-16
   candidate as its unary logit plus the BF16 edge in FP32, as SGLang's DFlash2 selector does (the
   GLM ports round the score to BF16; hidden `--draft-selector-score bf16` keeps that A/B). Every
-  request drafts its whole room; the shared scheduler then prices each draft's selector features (margin, candidate
-  probability, entropy, rank) through the keyed `SelectorFit`
-  (`draft-confidence.<numerics>.json` beside the drafter's config; the generic GLM-5.3 fit until
-  one is fitted). With `SPECULATION_TRACE` the scheduler writes the `draft_confidence` records
+  request drafts its whole room; the shared scheduler then prices each draft's selector features
+  (margin, candidate probability, entropy, rank) through the shared generic `SelectorFit` (the
+  shipped default; a keyed `draft-confidence.<numerics>.json` beside the drafter's config would
+  replace it). No MiniMax fit ships: on a 64-request fixed-7 trace (5,980 verified blocks of code,
+  prose, JSON, chat, math and mixed requests, thinking on and off),
+  `scripts/bench/draft-confidence-replay.py` prices the generic fit at 47.4 tok/s, history alone
+  at 40.7 and an oracle at 55.3 (cycles of 33 + 11.3 ms per extra row), and a MiniMax fit
+  cross-validated by request at 47.5 (per-position AUC 0.86-0.91 for both, about 0.6 for
+  history). `SPECULATION_TRACE` writes the `draft_confidence` records that
   `scripts/bench/calibrate-draft-confidence.py` fits from a fixed-7 run (`SPECULATOR_DRAFTS=7`).
 - DSpark draft length uses the shared `simple` policy (default;
   `DRAFT_POLICY`/`DRAFT_ROW_COST` select others, `SPECULATOR_DRAFTS=N` fixes the
   depth). TP2 on a 5090, aggregate tok/s at C1/C4/C16: target only
   26.3/48.6/76.9, fixed depth 7 37.2/61.2/120.9, `simple` 41.2/69.7/114.5. The
   C16 shortfall against fixed 7 is open in the shared policy.
+- DFlash2 against DSpark, RTX 5090 coordinator, greedy, `simple` policy. C1 tok/s
+  on five prompts at TP2:
+
+  | Drafter | Prose | Code | JSON | Prose, thinking | Code, thinking |
+  | --- | ---: | ---: | ---: | ---: | ---: |
+  | DSpark | 29.9 | 45.0 | 46.0 | 32.3 | 40.1 |
+  | DFlash2, history prior | 31.6 | 42.3 | 45.5 | 32.6 | 39.0 |
+  | DFlash2, selector prior | 31.9 | 46.5 | 52.1 | 34.9 | 44.7 |
+
+  Aggregate tok/s on a code prompt at C1/C4/C16, eight drafter rings:
+
+  | Sparks | Target only | DSpark | DFlash2, history prior | DFlash2, selector prior |
+  | ---: | ---: | ---: | ---: | ---: |
+  | 2 | 29.1/50.5/83.8 | 40.9/71.3/84.2 | 41.4/68.0/83.7 | 44.8/76.2/87.4 |
+  | 3 | 35.3/67.5/113.1 | 55.6/88.2/111.9 | 49.8/89.7/111.8 | - |
+  | 4 | 38.8/81.6/140.3 | 59.9/124.0/142.7 | 60.9/117.5/139.5 | - |
 - Fidelity: `minimax-golden` against `golden.py --activation served-cache` on
   the standard 64-window set (`fidelity-set.py` text recipe; 13,534
   generated-role rows) scores top-1 0.957, KL 0.0186 nat and NLL 0.2520 against
