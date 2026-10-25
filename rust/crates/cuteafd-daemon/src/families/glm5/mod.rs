@@ -762,7 +762,8 @@ impl Opened {
                 ::from_fp8_option(args.draft_fp8);
             let drafter = dflash::DflashDrafter::load(&self.library, snapshot, file, stream,
                 args.draft_context_slots.unwrap_or(20.max(args.draft_sequences)), args.draft_sequences,
-                mask, false, representation, args.fp8_scales, crate::shared::fp8_linear::Fp8Rows::W8a16, args.draft_kv_cache)?;
+                mask, dflash::BlockMask::default(), representation, args.fp8_scales,
+                crate::shared::fp8_linear::Fp8Rows::W8a16, args.draft_kv_cache)?;
             // Admission includes the shared drafter's maximum serving workspace.
             drafter.prepare_workspace()?;
             tracing::info!(elapsed_ms = started.elapsed().as_millis() as u64,

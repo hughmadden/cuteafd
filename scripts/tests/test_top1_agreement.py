@@ -176,4 +176,6 @@ def test_draft_attention_uses_one_shared_kernel_and_the_checked_timing_helper():
         assert 'max_keys,' in step and 'RING + block,' not in step
         assert 'cuda_graph_begin_capture' not in step and 'cuda_graph_launch' not in step
         assert 'attention_workspace(sequences,' in text
-        assert ('self.context_capacity + c.block' if 'block_dspark' in path else 'RING + c.block') in text
+        # The shared DFlash drafter's ring is its checkpoint window (GLM 2048, MiniMax 4096).
+        assert ('self.context_capacity + c.block' if 'block_dspark' in path
+                else 'RING + c.block' if 'mimo_v2' in path else 'c.window + c.block') in text

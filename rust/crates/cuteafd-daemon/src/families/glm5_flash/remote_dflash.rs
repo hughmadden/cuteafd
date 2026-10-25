@@ -293,11 +293,12 @@ mod tests {
         for representation in [GlmDraftRepresentation::Fp8Only, GlmDraftRepresentation::Bf16Only] {
             let prepared = Prepared::new(&library, RankDevice { device: 0, stream: lead.raw },
                 RankDevice { device: 1, stream: peer_target.raw }, 0, IDENTITY)?;
+            let row_window = dflash::BlockMask { row_window: true, causal: false };
             let local = DflashDrafter::load(&library, &draft_path, file.clone(), lead.raw, 4, 4,
-                mask.clone(), true, representation, Fp8Scales::Pow2, Fp8Rows::W8a8, cuteafd_loader::families::qwen4::Qwen4KvCache::Bf16)?;
+                mask.clone(), row_window, representation, Fp8Scales::Pow2, Fp8Rows::W8a8, cuteafd_loader::families::qwen4::Qwen4KvCache::Bf16)?;
             let draft_device = prepared.stream.device;
             let draft = draft_device.own(|| DflashDrafter::load(&library, &draft_path, file.clone(),
-                prepared.stream.raw, 4, 4, mask.clone(), true, representation, Fp8Scales::Pow2, Fp8Rows::W8a8, cuteafd_loader::families::qwen4::Qwen4KvCache::Bf16))?;
+                prepared.stream.raw, 4, 4, mask.clone(), row_window, representation, Fp8Scales::Pow2, Fp8Rows::W8a8, cuteafd_loader::families::qwen4::Qwen4KvCache::Bf16))?;
             let remote = RemoteDflash::new(draft, prepared)?;
             let result = (|| -> Result<()> {
                 remote.prime(&embedding, TargetHead::Bf16(&head))?;

@@ -132,7 +132,8 @@ impl<'a> Drafter<'a> {
         tracing::info!(mask_source = "target mask_token row", mask_token = cfg.mask_token, "drafter mask source");
         let file = read.join_dflash()?;
         Ok(Self::Dflash2(crate::shared::speculation::dflash::DflashDrafter::load(library, snapshot, file, stream, slots,
-            sequences, mask, true, representation, scales, fp8_rows, kv_cache)?))
+            sequences, mask, crate::shared::speculation::dflash::BlockMask { row_window: true, causal: false },
+            representation, scales, fp8_rows, kv_cache)?))
     }
 
     pub fn prepare_workspace(&self) -> Result<()> {
