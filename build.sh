@@ -1089,7 +1089,10 @@ coordinator_artifact_cmd=(
 # docker run. --foreground keeps timeout and its client inside the leg group.
 echo "== coordinator Rust phase on $(hostname) at $(date -Is): no GPU, no hardware lock =="
 coordinator_rust_status=0
+# No GPU at all: plain runc and void devices, not just no CDI request (the image's
+# NVIDIA_VISIBLE_DEVICES=all and a default nvidia runtime would expose them).
 timeout --foreground "$export_timeout" docker run --rm --name "$coordinator_export_container" \
+  --runtime runc -e NVIDIA_VISIBLE_DEVICES=void -e CUDA_VISIBLE_DEVICES= \
   "${coordinator_artifact_opts[@]}" \
   -e CUTEAFD_RELEASE_ARTIFACT_PHASE=rust \
   "${coordinator_artifact_cmd[@]}" ||
@@ -1365,7 +1368,9 @@ spark_artifact_cmd=("$dev_image" /source/scripts/build/build-release-artifacts.s
 fi
 if [[ "$phase" == rust ]]; then
 echo "== Spark Rust phase on $(hostname) at $(date -Is): no GPU, no hardware lock =="
+# No GPU at all: plain runc and void devices (see the coordinator Rust phase).
 docker run --rm --name "$export_container" \
+  --runtime runc -e NVIDIA_VISIBLE_DEVICES=void -e CUDA_VISIBLE_DEVICES= \
   "${spark_artifact_opts[@]}" \
   -e CUTEAFD_RELEASE_ARTIFACT_PHASE=rust \
   "${spark_artifact_cmd[@]}"

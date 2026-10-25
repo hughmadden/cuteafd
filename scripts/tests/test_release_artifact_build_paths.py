@@ -147,7 +147,8 @@ def test_guard_still_rejects_a_read_only_writable_target(tmp_path, monkeypatch):
 
 
 def _write_stub(path: Path, body: str) -> None:
-    path.write_text(textwrap.dedent(body))
+    # lstrip: the shebang must be the first line for exec via timeout/execvp.
+    path.write_text(textwrap.dedent(body).lstrip("\n"))
     path.chmod(0o755)
 
 
@@ -203,6 +204,7 @@ def _stub_build(tmp_path: Path):
         """
         #!/usr/bin/env bash
         set -euo pipefail
+        [[ "${1:-}" != metadata ]] || exit 1  # cache probe: dependencies "incomplete"
         echo cargo >>"$STUB_CALL_LOG"
         [[ "${STUB_CARGO_FAIL:-0}" == 0 ]] || exit 9
         triple=""
@@ -336,6 +338,67 @@ def test_rust_then_native_phase_builds_once_and_consumes_the_state(scratch):
     assert calls.read_text().split() == ["cargo", "cargo", "cmake", "cmake"]  # no repeated Cargo
     assert (output / "cuteafd").read_text() == "daemon\n"
     assert not state.exists()
+
+
+@pytest.mark.parametrize("rust_kache,native_kache", [(False, True), (True, False)])
+def test_native_phase_uses_the_recorded_rust_target_whatever_kache_does(scratch, rust_kache, native_kache):
+    """kache falls back soft per run; the native phase compiles no Rust, so it
+    must install the daemons from the target the Rust phase actually used."""
+    src, output, relocated, env = _stub_build(scratch)
+    calls = Path(env["STUB_CALL_LOG"])
+    flag = scratch / "kache-ok"
+    _write_stub(scratch / "shims" / "kache", f"""\
+        #!/usr/bin/env bash
+        [[ -e "{flag}" ]] || exit 1
+        [[ "${{1:-}}" == --version ]] && {{ echo kache 1.0.0; exit 0; }}
+        exec "$@"
+        """)
+    env.pop("CUTEAFD_BUILD_CACHES")
+    env.update(CUTEAFD_KACHE=str(scratch / "shims" / "kache"),
+               CUTEAFD_KACHE_CACHE_DIR=str(scratch / "kache-cache"), HOME=str(scratch / "home"))
+    (scratch / "kache-cache" / os.uname().machine).mkdir(parents=True)
+    state = scratch / "state"
+    flag.touch() if rust_kache else None
+    rust = _phase(src, output, env, "rust", state)
+    assert rust.returncode == 0, rust.stdout + rust.stderr
+    assert "compiler cache disabled" not in rust.stdout + rust.stderr or not rust_kache, rust.stdout + rust.stderr
+    target = (state / "rust.target").read_text().strip()
+    assert target == str(relocated) + ("-kache" if rust_kache else "")
+    flag.touch() if native_kache else flag.unlink(missing_ok=True)
+    native = _phase(src, output, env, "native", state)
+    assert native.returncode == 0, native.stdout + native.stderr
+    assert calls.read_text().split() == ["cargo", "cargo", "cmake", "cmake"]
+    assert (output / "cuteafd").read_text() == "daemon\n"
+    other = Path(str(relocated) + ("" if rust_kache else "-kache") + "-x86-64-v2")
+    assert Path(target + "-x86-64-v2").exists() and not other.exists()
+
+
+def test_rust_phases_run_with_no_gpu_runtime_or_devices(tmp_path):
+    """Omitting CDI is not enough: the image defaults NVIDIA_VISIBLE_DEVICES=all
+    and a host may default to the nvidia runtime. Both Rust runs pin runc/void."""
+    build = (REPO / "build.sh").read_text()
+    runs = re.findall(r"docker run --rm --name (?:[^\n]*\\\n)*[^\n]*CUTEAFD_RELEASE_ARTIFACT_PHASE=rust", build)
+    assert len(runs) == 2, runs
+    for run in runs:
+        assert "--runtime runc -e NVIDIA_VISIBLE_DEVICES=void -e CUDA_VISIBLE_DEVICES=" in run, run
+        assert "CDI" not in run
+    # Real argv: the coordinator Rust run through a docker stub.
+    log = tmp_path / "argv"
+    stub = tmp_path / "docker"
+    stub.write_text(f'#!/usr/bin/env bash\nprintf "%s\\n" "$@" >"{log}"\n')
+    stub.chmod(0o755)
+    coord = build.split('build_coordinator_release() (', 1)[1]
+    body = coord[coord.index('coordinator_artifact_opts=(\n'):coord.index('(( coordinator_rust_status == 0 ))')]
+    script = ('set -euo pipefail\nrelease_build_user_args=(); compiler_cache_args=(); native_build_env_args=(); '
+              'bf16_families=; audio_aot=ON; release_state_parent=/s; release_source_dir=/src; artifact_dir=/out; '
+              'COORDINATOR_DOCKER_DEV=image; export_timeout=60; coordinator_export_container=c\n' + body)
+    result = subprocess.run(["bash", "-c", script], capture_output=True, text=True,
+                            env={**os.environ, "PATH": f"{tmp_path}:{os.environ['PATH']}"})
+    assert result.returncode == 0, result.stderr
+    argv = log.read_text().splitlines()
+    assert argv[argv.index("--runtime") + 1] == "runc"
+    assert "NVIDIA_VISIBLE_DEVICES=void" in argv and "CUDA_VISIBLE_DEVICES=" in argv
+    assert not any(a.startswith("nvidia.com/gpu") for a in argv) and "--gpus" not in argv
 
 
 def test_native_phase_refuses_missing_rust_state(scratch):
