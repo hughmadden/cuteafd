@@ -5866,6 +5866,13 @@ campaign is required for these fixes.
 
 ### First milestone: layered GLM-5.3 full ready for Romeo
 
+User direction on 2026-10-25 supersedes the earlier upstream-first work
+order for this milestone: finish the working local/fork release without
+waiting for upstream acceptance. Stop upstream submissions for the layering
+work and ask before any future upstream submission for this project. The
+reviewed kernel pin `43503af4` and its already built/tested artifacts remain
+usable; upstream PR landing is not a qualification or packaging gate.
+
 The requested first deliverable is the full `glm5` model with request-selected
 weight overlays: one resident base checkpoint, base and variant public IDs,
 and the immutable steering tables described above. The user-specified target
@@ -5945,7 +5952,7 @@ any hardware run; container names or a free GPU do not establish ownership.
    variant bound through a versioned native ABI, make invalid indices no-ops
    before any table access, initialize base and unused slots, and match the
    host reference. Preserve graph-stable metadata and startup ABI checks.
-   Forward-port the kernel commits to canonical SparkInfer master before
+   Forward-port the kernel commits onto the current SparkInfer base before
    updating cuteafd's submodule and tree lock. Use a separate worktree for
    this stream; integrate after both streams pass their focused checks.
 
