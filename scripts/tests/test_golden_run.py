@@ -38,7 +38,15 @@ def find(name):
 if args[:2] == ['image', 'inspect']:
     if args[2] == '-f':
         print(args[4]); sys.exit(0)
-    print(json.dumps([{'Id': args[2], 'RepoTags': ['cuteafd-coordinator-dev:test']}])); sys.exit(0)
+    # STUB_IMAGES: {host: {ref: inspect record}} is that host's whole image store.
+    store = json.loads(os.environ.get('STUB_IMAGES', '{}')).get(host)
+    if store is not None:
+        if args[2] not in store:
+            sys.exit(1)
+        print(json.dumps([store[args[2]]])); sys.exit(0)
+    print(json.dumps([{'Id': args[2], 'RepoTags': ['cuteafd-coordinator-dev:test'], 'Architecture': 'arm64',
+                       'Os': 'linux', 'Config': {'Labels': {'io.cuteafd.toolchain.hash': 't1'}},
+                       'RootFS': {'Type': 'layers', 'Layers': ['sha256:' + '11' * 32]}}])); sys.exit(0)
 if args[:2] == ['container', 'inspect']:
     sys.exit(0 if find(args[2]) else 1)
 if args[:1] == ['logs']:
@@ -939,3 +947,120 @@ def test_namespace_root_keeps_mount_loading_paths_identical(env, monkeypatch):
     assert not extra
     assert (Path(container) / 'config.json').read_bytes() == (host / 'config.json').read_bytes()
     assert golden.hub_root() == root / 'hf-home/hub'
+
+
+SPARK_IMAGE = 'sha256:' + 'cd' * 32
+
+
+def spark_image(ident, **change):
+    """A Spark dev image inspect record (classic or containerd store); CHANGE overrides fields."""
+    record = {'Id': ident, 'RepoTags': ['spark:tc'], 'Architecture': 'arm64', 'Os': 'linux',
+              'Config': {'Env': ['PATH=/usr/bin'], 'Entrypoint': None, 'WorkingDir': '/workspace',
+                         'Labels': {'io.cuteafd.toolchain.hash': 'aa74e55ca2130070'}},
+              'RootFS': {'Type': 'layers', 'Layers': ['sha256:' + '11' * 32, 'sha256:' + '22' * 32]}}
+    for key, value in change.items():
+        if key == 'Labels':
+            record['Config'] = dict(record['Config'], Labels=value)
+        elif key in ('Env', 'Entrypoint', 'User'):
+            record['Config'] = dict(record['Config'], **{key: value})
+        elif key == 'Layers':
+            record['RootFS'] = dict(record['RootFS'], Layers=value)
+        else:
+            record[key] = value
+    return record
+
+
+def image_stores(monkeypatch, copies):
+    """Sealed-ID images on every Spark except COPIES ({host: record}), which hold only the tag."""
+    stores = {host: {SPARK_IMAGE: spark_image(SPARK_IMAGE), 'spark:tc': spark_image(SPARK_IMAGE)} for host in SPARKS}
+    for host, record in copies.items():
+        stores[host] = {'spark:tc': record} if record else {}
+    monkeypatch.setenv('STUB_IMAGES', json.dumps(stores))
+
+
+def test_image_content_ignores_store_specific_fields():
+    classic = spark_image(SPARK_IMAGE, RepoDigests=[], Size=25001997958, GraphDriver={'Name': 'overlay2'})
+    containerd = spark_image('sha256:' + 'ef' * 32, RepoDigests=['spark@sha256:' + 'ef' * 32], Size=25262440795,
+                             Descriptor={'mediaType': 'application/vnd.oci.image.manifest.v1+json'})
+    containerd['Config'] = dict(containerd['Config'], Hostname='', AttachStdin=False, Volumes=None)
+    assert golden.image_content(classic) == golden.image_content(containerd)
+    assert golden.image_content(spark_image(SPARK_IMAGE, Layers=[])) is None
+
+
+def test_reloaded_dev_image_with_other_id_runs_vouched_by_a_sealed_host(spark_env, monkeypatch, capsys):
+    # docker save | load into a containerd store: same layers and config, another ID.
+    copy = 'sha256:' + 'ef' * 32
+    image_stores(monkeypatch, {'rhea': spark_image(copy), 'moa': spark_image(copy)})
+    monkeypatch.setenv('STUB_RUN_OUTPUT', PASSED)
+    assert golden.main(spark_argv(spark_env, '--dry-run')) == 0
+    out = capsys.readouterr().out
+    assert f'# rhea: dev image {SPARK_IMAGE} is local {copy} (same content as on dodo)' in out
+    assert 'golden-run: preflight pass' in out
+    assert golden.main(spark_argv(spark_env)) == 0
+    starts = {host: shlex.split(cmd) for host, cmd in ssh_calls(spark_env) if 'expertd-native' in cmd}
+    for host in SPARKS:
+        argv = starts[host]
+        assert argv[argv.index('--entrypoint') + 2] == (copy if host in ('rhea', 'moa') else SPARK_IMAGE)
+    record = json.loads((spark_env['home'] / '.cache/cuteafd/builds/gr/golden/a/r1/argv.json').read_text())
+    workers = {w['host']: w for w in record['workers']}
+    assert workers['rhea']['image_id'] == copy and workers['rhea']['sealed_image_id'] == SPARK_IMAGE
+    assert workers['rhea']['image_identity'] == 'tag' and workers['rhea']['image_vouched_by'] == 'dodo'
+    assert workers['dodo']['image_identity'] == 'sealed' and workers['dodo']['image_id'] == SPARK_IMAGE
+    assert workers['rhea']['image_content_sha256'] == workers['dodo']['image_content_sha256']
+
+
+@pytest.mark.parametrize('change,match', [
+    ({'Layers': ['sha256:' + '11' * 32, 'sha256:' + '33' * 32]}, 'differs from the slot'),
+    ({'Labels': {'io.cuteafd.toolchain.hash': 'bb00000000000000'}}, 'differs from the slot'),
+    ({'Architecture': 'amd64'}, 'differs from the slot'),
+    ({'Variant': 'v8'}, 'differs from the slot'),
+    ({'Env': ['PATH=/usr/bin', 'LD_PRELOAD=/x.so']}, 'differs from the slot'),
+    ({'Entrypoint': ['/bin/other']}, 'differs from the slot'),
+    ({'User': '0:0'}, 'differs from the slot'),
+    ({'Layers': []}, 'no RootFS layers'),
+])
+def test_reloaded_dev_image_with_other_content_is_refused(spark_env, monkeypatch, capsys, change, match):
+    image_stores(monkeypatch, {'moa': spark_image('sha256:' + 'ef' * 32, **change)})
+    taken = []
+    monkeypatch.setattr(golden.hwlock, 'hold', lambda *a, **k: taken.append(a))
+    assert golden.main(spark_argv(spark_env, '--dry-run')) == 2
+    err = capsys.readouterr().err
+    assert 'moa' in err and match in err
+    assert not taken and not runs(spark_env)
+
+
+def test_dev_image_copy_without_a_sealed_host_is_refused(spark_env, monkeypatch, capsys):
+    copy = spark_image('sha256:' + 'ef' * 32)
+    image_stores(monkeypatch, {host: copy for host in SPARKS})
+    assert golden.main(spark_argv(spark_env, '--dry-run')) == 2
+    assert f'dev image {SPARK_IMAGE} is missing, and no other Spark of this run holds it' in capsys.readouterr().err
+
+
+def test_missing_dev_image_and_tag_is_refused(spark_env, monkeypatch, capsys):
+    image_stores(monkeypatch, {'emu': None})
+    assert golden.main(spark_argv(spark_env, '--dry-run')) == 2
+    assert f'emu: dev image {SPARK_IMAGE} is missing (and so is its tag spark:tc)' in capsys.readouterr().err
+
+
+def test_sealed_image_with_divergent_content_across_hosts_is_refused():
+    def record(host, layers):
+        return {'image_identity': 'sealed', 'sealed_image_id': SPARK_IMAGE, 'image_id': SPARK_IMAGE, 'image': 'spark:tc',
+                'image_content_sha256': layers}
+    with pytest.raises(ValueError, match='has different content on dodo, emu'):
+        golden.check_spark_images({'dodo': record('dodo', 'a'), 'emu': record('emu', 'b')})
+
+
+def test_dev_image_change_between_enqueue_and_grant_is_refused(spark_env, monkeypatch, capsys):
+    image_stores(monkeypatch, {'moa': spark_image('sha256:' + 'ef' * 32)})
+    real = golden.preflight
+    calls = []
+
+    def preflight(state, arms, at_grant=True):
+        if at_grant:
+            image_stores(monkeypatch, {'moa': spark_image('sha256:' + '99' * 32)})
+        calls.append(at_grant)
+        return real(state, arms, at_grant)
+    monkeypatch.setattr(golden, 'preflight', preflight)
+    assert golden.main(spark_argv(spark_env)) != 0
+    assert 'dev image on moa changed since enqueue' in capsys.readouterr().err
+    assert not runs(spark_env)

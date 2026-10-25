@@ -40,7 +40,10 @@ Sparks) and exported as CUTEAFD_GOLDEN_FIXTURES.
 Real experts (--spark-hosts, ranks in the given order): before every run the arm's
 sealed spark-expert slot is checked on each host (seal, artifact checksums, SparkInfer
 lock, the same source manifest as the coordinator slot, dev image, CDI, a free
---expert-port, no leftover container, the checkpoint visible), then each host runs the
+--expert-port, no leftover container, the checkpoint visible). A host without the sealed
+dev image ID (docker save | load into a containerd image store gives another ID) runs its
+local copy of the sealed tag only when a host of the run holding the sealed ID reports the
+same platform, run config and RootFS layers; argv.json records both IDs. Then each host runs the
 serving path's `cuteafd expertd-native --rank R --world N` from that slot (read-only
 mounts, no staging copy), bounded by an in-container timeout. The coordinator waits for
 every worker's "native worker bootstrap ready" (--worker-ready-timeout; a worker that
@@ -352,11 +355,31 @@ def ssh(host, command, timeout=120, check=True):
                           check=check, text=True, capture_output=True, timeout=timeout)
 
 
+# The dev image's portable content identity: platform, run config (labels, so the toolchain
+# hash; env, entrypoint, user, ...) and RootFS diff IDs. The image ID is not portable:
+# docker save | load into a containerd image store reports the manifest digest where the
+# classic store reports the config digest, for byte-identical layers and config.
+IMAGE_CONTENT = r'''
+def image_content(info):
+    config = {k: v for k, v in sorted((info.get('Config') or {}).items()) if v not in (None, '', [], {}, False)}
+    rootfs = info.get('RootFS') or {}
+    body = {'architecture': info.get('Architecture'), 'os': info.get('Os'), 'variant': info.get('Variant') or '',
+            'config': config, 'rootfs_type': rootfs.get('Type'), 'layers': rootfs.get('Layers') or []}
+    if not body['layers'] or not body['architecture'] or not body['os']:
+        return None
+    return hashlib.sha256(json.dumps(body, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+'''
+exec(IMAGE_CONTENT)
+
+
 # Runs on each Spark (python3 -c, argv: root slot role instance image port worker_names_json
 # snapshot_rel snapshot_abs): the sealed spark-expert slot, its artifacts, SparkInfer lock,
 # dev image, CDI, a free port, no leftover worker, the checkpoint, the workers' serving
-# identity and package manifests, as JSON.
+# identity and package manifests, as JSON. The dev image is the sealed base_image_id when
+# this host has it ('sealed'); otherwise the sealed base_image tag's local image ('tag'),
+# which check_sparks admits only when a 'sealed' host of the same run has the same content.
 REMOTE_CHECK = r'''import hashlib,json,os,pathlib,re,subprocess,sys
+''' + IMAGE_CONTENT + r'''
 root,slot,instance,image,port,names,snap_rel,snap_abs=sys.argv[1:9]
 home=pathlib.Path.home()
 if root=='-':
@@ -392,8 +415,18 @@ for rel in ('docker/release-entrypoint.sh','third_party/sparkinfer','scripts/lib
 v=subprocess.run([sys.executable,str(ws/'scripts/build/verify-sparkinfer-source.py'),'--source',str(ws/'third_party/sparkinfer'),'--lock',str(ws/'third_party/sparkinfer.lock.json')],capture_output=True,text=True)
 if v.returncode: fail('SparkInfer source does not match its lock: '+(v.stderr.strip().splitlines() or ['?'])[-1])
 if m.get('base_image_id')!=image and image!='-': fail(f'slot dev image {m.get("base_image_id")} differs from the expected {image}')
-i=subprocess.run(['docker','image','inspect','-f','{{.Id}}',m.get('base_image_id','')],capture_output=True,text=True)
-if i.returncode or i.stdout.strip()!=m.get('base_image_id'): fail(f'dev image {m.get("base_image_id")} is missing')
+def inspect(ref):
+    i=subprocess.run(['docker','image','inspect',ref],capture_output=True,text=True) if ref else None
+    try: return json.loads(i.stdout)[0] if i and i.returncode==0 else None
+    except (ValueError,IndexError): return None
+sealed_id=m.get('base_image_id') or ''
+info=inspect(sealed_id)
+identity='sealed'
+if not info or info.get('Id')!=sealed_id:
+    info,identity=inspect(m.get('base_image') or ''),'tag'
+    if not info or not info.get('Id'): fail(f'dev image {sealed_id} is missing (and so is its tag {m.get("base_image")})')
+content=image_content(info)
+if not content: fail(f'dev image {info["Id"]} has no RootFS layers or platform to identify it by')
 if os.environ.get('CUTEAFD_CDI_CHECK')!='off':  # off: script tests only
     cdi=any(re.search(r'^\s*-?\s*name:\s*\W?all\W?\s*$',pathlib.Path(s).read_text(),re.M) for s in ('/var/run/cdi/nvidia.yaml','/etc/cdi/nvidia.yaml') if os.access(s,os.R_OK))
     if not cdi: fail('CDI device nvidia.com/gpu=all is not in /var/run/cdi/nvidia.yaml')
@@ -415,7 +448,8 @@ for kind in ('fp8','exl3'):
         if (d/'manifest.json').is_file(): packages[f'{kind}/{d.name}']=(d/'manifest.json').read_text()
 variants={k:sorted(x.name for x in (art/k).iterdir() if x.is_dir()) for k in ('bin-variants','lib-variants') if (art/k).is_dir()}
 print(json.dumps({'root':str(p),'seal_sha256':hashlib.sha256(meta).hexdigest(),'source_manifest_sha256':m['source_manifest_sha256'],
-  'artifact_manifest_sha256':m['artifact_manifest_sha256'],'artifacts':listed,'image_id':m['base_image_id'],'image':m.get('base_image'),
+  'artifact_manifest_sha256':m['artifact_manifest_sha256'],'artifacts':listed,'image_id':info['Id'],'image':m.get('base_image'),
+  'sealed_image_id':sealed_id,'image_identity':identity,'image_content_sha256':content,
   'hub':hub,'snapshot':snapshot,'serving_args':sv.stdout.decode().rstrip('\0').split('\0'),'packages':packages,'variants':variants}))
 '''
 
@@ -451,7 +485,34 @@ def check_sparks(state, arm, coordinator, at_grant=True):
         if record['packages'] != first['packages'] or record['artifact_manifest_sha256'] != first['artifact_manifest_sha256']:
             raise ValueError(f'{host}: spark-expert slot differs from {state["sparks"]["hosts"][0]}\'s '
                              '(artifacts or package manifests)')
+    check_spark_images(records)
     return records
+
+
+def check_spark_images(records):
+    """A host lacking the sealed dev image ID runs its local copy of the sealed tag only when a
+    host of this run that holds the sealed ID (verified there by docker, content-addressed) has
+    the same content: platform, run config and RootFS layers. Raises ValueError otherwise."""
+    vouchers = {}
+    for host, record in records.items():
+        if record['image_identity'] == 'sealed':
+            vouchers.setdefault(record['sealed_image_id'], {})[host] = record['image_content_sha256']
+    for sealed, hosts in vouchers.items():
+        if len(set(hosts.values())) > 1:
+            raise ValueError(f'dev image {sealed} has different content on {", ".join(sorted(hosts))}')
+    for host, record in records.items():
+        if record['image_identity'] == 'sealed':
+            continue
+        sealed, local = record['sealed_image_id'], record['image_id']
+        hosts = vouchers.get(sealed)
+        if not hosts:
+            raise ValueError(f"{host}: dev image {sealed} is missing, and no other Spark of this run holds it "
+                             f"to vouch for the local {record['image']} ({local})")
+        voucher, content = next(iter(sorted(hosts.items())))
+        if record['image_content_sha256'] != content:
+            raise ValueError(f"{host}: local {record['image']} ({local}) differs from the slot's dev image {sealed} "
+                             f'on {voucher} (layers, platform or run config)')
+        record['image_vouched_by'] = voucher
 
 
 def worker_command(state, arm, rank, record):
@@ -728,6 +789,8 @@ def preflight(state, arms, at_grant=True):
                 before = previous[name]['sparks'][host]
                 if (record['seal_sha256'], record['artifacts']) != (before['seal_sha256'], before['artifacts']):
                     raise ValueError(f'arm {name}: sealed spark-expert slot on {host} changed since enqueue')
+                if record['image_id'] != before['image_id']:
+                    raise ValueError(f'arm {name}: dev image on {host} changed since enqueue')
     return records
 
 
@@ -930,7 +993,11 @@ def run_arm(state, name, repeat, arms):
     cmd, env = docker_command(state, name, arm, slot, out_dir, golden, packages)
     workers = [dict(host=host, rank=rank, container=worker_name(state['task'], name, rank),
                     argv=worker_command(state, name, rank, slot['sparks'][host]),
-                    seal_sha256=slot['sparks'][host]['seal_sha256'], image_id=slot['sparks'][host]['image_id'])
+                    seal_sha256=slot['sparks'][host]['seal_sha256'], image_id=slot['sparks'][host]['image_id'],
+                    sealed_image_id=slot['sparks'][host]['sealed_image_id'],
+                    image_identity=slot['sparks'][host]['image_identity'],
+                    image_content_sha256=slot['sparks'][host]['image_content_sha256'],
+                    image_vouched_by=slot['sparks'][host].get('image_vouched_by'))
                for rank, host in enumerate(state['sparks']['hosts'])] if state.get('sparks') else []
     record = dict(arm=name, repeat=repeat, argv=cmd, golden=golden, container=container_name(state['task'], name),
                   mode=state['mode'], native_test=state.get('native_test'), native_test_sha256=state.get('native_test_sha256'),
@@ -1339,6 +1406,10 @@ def main(argv=None):
                 out = Path(state['root']) / name / f'r{repeat}'
                 packages = Path(state['root']) / name / 'spark-packages' if state.get('sparks') else None
                 for rank, host in enumerate(state['sparks']['hosts'] if state.get('sparks') else ()):
+                    spark = state['slots'][name]['sparks'][host]
+                    if spark['image_identity'] != 'sealed':
+                        print(f"# {host}: dev image {spark['sealed_image_id']} is local {spark['image_id']} "
+                              f"(same content as on {spark['image_vouched_by']})")
                     print(f'# {name} r{repeat} expert rank {rank} on {host}\n'
                           f"ssh {host} {shlex.quote(shlex.join(worker_command(state, name, rank, state['slots'][name]['sparks'][host])))}")
                 cmd, _ = docker_command(state, name, arms[name], state['slots'][name], out, run_args(state, arms[name]), packages)
