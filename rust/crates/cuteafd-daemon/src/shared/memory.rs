@@ -188,7 +188,7 @@ impl<'a> LayerStaging<'a> {
 }
 /// A per-step host wait for a stream's queued work (the sampling sync, a
 /// draft round): under `--host-wait block` it sleeps on one blocking-sync
-/// event per device, recorded on the stream; under `spin` it is a
+/// event per device, recorded on the stream; under `spin` (default) it is a
 /// stream synchronize, which the context's default scheduling spins.
 pub(crate) struct BlockingWait<'a> {
     library: &'a NativeLibrary,

@@ -44,11 +44,10 @@ pub(crate) struct Cli {
     /// graphs and drafts); leaves physical GPU capacity/SM/L2 unchanged.
     #[arg(long, global = true, aliases = ["rtx-budget-gib", "rtx-gib"])]
     pub(crate) coordinator_gpu_budget_gib: Option<f64>,
-    /// How host threads wait while serving: `block` (default: per-step waits
-    /// sleep, the Spark exchange worker paces its polling, a less loaded
-    /// machine) or `spin` (lowest latency, one busy core per waiting thread).
-    /// Spark workers read it too.
-    #[arg(long, global = true, env = "CUTEAFD_HOST_WAIT", default_value = "block")]
+    /// How host threads wait while serving: `spin` (default, lowest latency)
+    /// or `block` (per-step waits sleep, the Spark exchange worker paces its
+    /// polling: a less loaded machine). Spark workers read it too.
+    #[arg(long, global = true, env = "CUTEAFD_HOST_WAIT", default_value = "spin")]
     pub(crate) host_wait: cuteafd_transport::wait_policy::HostWait,
     /// Seconds without an active request after which every polling host thread
     /// parks (no CPU, no GPU work), in either wait mode; the next request
