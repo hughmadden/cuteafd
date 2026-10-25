@@ -128,6 +128,36 @@ wip_capped_export docker exec -e CUTEAFD_WIP_DSV4_AOT=ON -e 'CUTEAFD_WIP_EXPERT_
     assert 'docker exec cid123 timeout --kill-after=30 7200 /wip/source/scripts/build/build-wip-artifacts.sh' in calls
     assert 'docker ps -a' in calls
     assert 'capped on gpu1' in result.stdout
+    assert 'command not found' not in result.stderr, result.stderr
+
+
+def _capped_child_block(tmp_path):
+    """The definitions wip_capped_export actually hands its fresh `bash -c` child."""
+    common = (ROOT / 'scripts/lib/release-common.sh').read_text()
+    start = common.index('release_gpu_device_args() {')
+    helper = common[start:common.index('\n}\n', start) + 3]
+    script = (f'source {str(ROOT / "scripts/lib/cdi-gpus.sh")!r}\n' + helper + _function('wip_capped_export_on')
+              + _function('wip_capped_export_functions') + 'wip_capped_export_functions\n')
+    result = subprocess.run(['bash', '-c', script], capture_output=True, text=True, timeout=30)
+    assert result.returncode == 0, result.stderr
+    return result.stdout
+
+
+def test_capped_export_child_defines_every_helper_it_calls(tmp_path):
+    import re
+    block = _capped_child_block(tmp_path)
+    defined = set(re.findall(r'^([A-Za-z_][A-Za-z0-9_]*) \(\)', block, re.M))
+    called = set(re.findall(r'\b((?:cuteafd_cdi|release_gpu|wip_capped)_[A-Za-z0-9_]*)\b', block))
+    assert called <= defined, f'missing in the capped-export child: {sorted(called - defined)}'
+    # The fresh child resolves a GPU through the WSL all-only path (cuteafd_cdi_only_all and
+    # cuteafd_cdi_single_gpu_host), with nothing else from the parent shell.
+    spec = tmp_path / 'nvidia.yaml'
+    spec.write_text('devices:\n    - name: all\n')
+    child = subprocess.run(['env', '-i', f'PATH={os.environ["PATH"]}', f'CUTEAFD_CDI_SPECS={spec}',
+                            'CUTEAFD_CDI_GPU_COUNT=1', 'bash', '-c', block + '\nrelease_gpu_device_args GPU-one'],
+                           capture_output=True, text=True, timeout=30)
+    assert child.returncode == 0 and 'command not found' not in child.stderr, child.stderr
+    assert child.stdout.split() == ['--device', 'nvidia.com/gpu=all']
 
 
 def test_the_export_containers_gpu_binding_has_one_call_site():
