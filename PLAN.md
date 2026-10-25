@@ -5981,6 +5981,16 @@ all probes and the exported identity must agree. An unready/unlisted ID or a
 server that ignored the requested ID must fail instead of producing a base
 measurement labelled as the alternate layer.
 
+Qualification progress (2026-10-25): the first full-model, base-only RAM
+prefix restore passed on Romeo and all six Sparks using sealed candidate
+`663467d14`. Device retention was released before admission from the host
+tier; captured prefix bytes, continuation layers/logits, decode and final
+paged state were identical. This is a base correctness result, not layered
+or performance qualification. The published Keys payload receipt, alternate
+layer component/cache gates, DFlash2 and real-agent checks, and matched
+four-Spark performance comparison remain required. The final candidate also
+needs the later API and qualification-tooling fixes sealed together.
+
 ## Backlog (lowest priority: only when nothing planned is left)
 
 - Qwen 3.8 Flash Next NVFP4 without Sparks, competitive with vLLM on one
