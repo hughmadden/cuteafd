@@ -1482,7 +1482,8 @@ SPARK_EXPERT_DOCKER_INFERENCE=registry.example/spark:v9
 engine_commit=engine-revision
 sparkinfer_commit=sparkinfer-revision
 snapshot_rel=hub/models--x--M/snapshots/rev
-namespace_root=/mnt/sparknest
+namespace_root={namespace}
+namespace_hf_home={namespace}/hf-home
 host=dodo
 model_is_exl3={exl3}
 exl3_family_tag={family}
@@ -1506,17 +1507,18 @@ unset HF_HOME
                   missing: int = 0, sparkinfer: str = "sparkinfer-revision",
                   wip_slot: str = '""') -> subprocess.CompletedProcess[str]:
         with tempfile.TemporaryDirectory() as temporary:
-            home = Path(temporary)
-            # HF_HOME is unset below, so the remote resolves the snapshot under
-            # $HOME/.cache/huggingface.
-            (home / ".cache/huggingface/hub/models--x--M/snapshots/rev").mkdir(parents=True)
+            home = Path(temporary).resolve()
+            namespace = home / "namespace"
+            # The remote reads the snapshot under the forwarded namespace
+            # hf-home; HF_HOME is unset and ~/.cache/huggingface stays empty.
+            (namespace / "hf-home/hub/models--x--M/snapshots/rev").mkdir(parents=True)
             stub = home / "bin"
             stub.mkdir()
             docker = stub / "docker"
             docker.write_text(self.DOCKER_STUB)
             docker.chmod(0o755)
             script = (self.HARNESS.format(exl3=exl3, family=family, wip_slot=wip_slot,
-                                          home=str(home))
+                                          home=str(home), namespace=str(namespace))
                       + self.statement()
                       + '\nprintf "manifest=[%s]\n" "$spark_manifest"\n')
             return subprocess.run(
