@@ -369,12 +369,16 @@ class TestPipelineWiring:
 
     def test_both_container_legs_bind_the_build_root(self):
         text = build_text()
-        legs = re.findall(
-            r"docker run --rm(?:[^\n]*\\\n)*[^\n]*build-release-artifacts\.sh[^\n]*", text
-        )
-        assert len(legs) == 2, f"expected a coordinator and an expert leg, found {len(legs)}"
-        for leg in legs:
-            assert "release_build_root_args[@]" in leg, leg
+        # Each leg's Rust and native phases share one option array and command.
+        for leg in ("coordinator", "spark"):
+            opts = text.split(f"{leg}_artifact_opts=(\n", 1)[1].split("\n)\n", 1)[0]
+            assert "release_build_root_args[@]" in opts, opts
+            cmd = text.split(f"{leg}_artifact_cmd=(", 1)[1].split(")", 1)[0]
+            assert "build-release-artifacts.sh" in cmd, cmd
+            runs = re.findall(
+                rf'docker run --rm --name (?:[^\n]*\\\n)*[^\n]*"\$\{{{leg}_artifact_cmd\[@\]\}}"', text
+            )
+            assert len(runs) == 2, (leg, runs)
         assert 'mkdir -p "$release_build_root"' in text
         assert 'release_prepare_build_root "" "$repo_root"' in text
         assert 'release_prepare_build_root "$seed_host" "$remote_dir"' in text
