@@ -182,8 +182,27 @@ fn qwen_mapped_ple_host_staging_matches_runtime_allocations() {
         config["text_config"]["ple_embed_dim"] = json!(2560);
         let cfg = crate::families::qwen4::Qwen4Config::from_hf(&config).unwrap();
         let mut tensors = qwen4_coordinator(&config, false);
+        let (experts, storage) = qwen4_exl3(4, 4);
+        tensors.extend(experts);
         tensors.push(t("model.language_model.layers.1.ple.ple_embedding.ngram_embedding.shard_0.weight", dtype, &[1000, 160]));
         let dir = snapshot(config, &tensors);
+        write_quantize_config(dir.path(), &storage);
+        let catalog = crate::read_expert_catalog(dir.path()).unwrap();
+        let tiers = catalog.exl3().unwrap().decoder_tiers().iter().map(usize::to_string).collect::<String>();
+        let manifest = write_qwen4_exl3_capacities(dir.path(), &tiers);
+        for (rank, width) in [384, 256].into_iter().enumerate() {
+            for capacity in crate::placement::inventory::exl3_capacities(4096) {
+                let path = dir.path().join(format!("lib/exl3/exl3-qwen4-k{tiers}/rtx-tp2-rank{rank}/m{capacity}"));
+                std::fs::create_dir_all(&path).unwrap();
+                std::fs::write(path.join("v41_exl3.json"), serde_json::to_vec(&json!({
+                    "hidden": 2560, "intermediate": width, "experts": 512, "top_k": 10,
+                    "capacity": capacity, "output_dtype": "fp32", "tile": [64, 128, 64, 128],
+                    "trellis_lut": {"bytes": 32}, "buffers": {
+                        "scratch": {"allocation": "scratch", "dtype": "f16", "bytes": capacity * width,
+                            "zero_on_create": false}}
+                })).unwrap()).unwrap();
+            }
+        }
         let input = PlanInput::open(dir.path()).unwrap();
         for (gpus, ranks) in [(1, 0), (2, 0), (1, 4)] {
             // The launcher currently admits at most two waves; MappedStaging's
@@ -194,6 +213,7 @@ fn qwen_mapped_ple_host_staging_matches_runtime_allocations() {
                     layout: Some(layout::LayoutOptions { rtx_bytes: vec![96 << 30; gpus],
                         head_split: gpus == 2, prefill_rows: unit as u64, prefill_waves: k as u64,
                         context_tokens: 32768, prefix_slots: Some(0), host_cache_bytes: Some(0),
+                        workspace_manifest: Some(manifest.clone()),
                         host_memory: Some((128 << 30, 128 << 30)), ..Default::default() }),
                     ..sparks(ranks)
                 }).unwrap();
