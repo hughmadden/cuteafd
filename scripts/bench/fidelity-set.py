@@ -33,6 +33,15 @@ FAMILIES = ("deepseek_v41", "mimo_v2", "qwen4", "qwen3_5", "glm5_flash", "deepse
 # template defaults to adaptive thinking, which answers most agentic turns without reasoning
 # and leaves the standard halves short of generated rows; the recipe turns thinking on.
 FAMILY_REQUEST = {"minimax_m3": {"thinking": {"type": "enabled"}}}
+# The fixture's system note. Only a window that declares tools may invite them: told to use
+# tools it does not have, a model emits a call anyway and its turn ends there.
+SYSTEM_NOTES = {"tools": "think carefully and use the repository tools when appropriate",
+                "no_tools": "think carefully and answer directly; no tools are available"}
+# Per-family addition to the note of windows with tools, recorded in the set's recipe. MiniMax M3
+# acts after a sentence of reasoning, so its agentic turns end short of the generated-row floor.
+FAMILY_TOOL_NOTE = {"minimax_m3": "Before each tool call, reason it through in detail: restate the problem, "
+                                  "what the files and tool results so far show, your hypotheses, and what "
+                                  "you expect the call to reveal."}
 # D and E prompt sizes per window. A scored start lies between the prompt end and 512 rows into
 # a 1024-token answer, so each size keeps it inside one bucket whatever the model generates
 # (0-2K: at most 1152; 2-8K: from 2049). With the sealed standard-v2 split, both halves then hold
@@ -182,7 +191,10 @@ def build_set(*, family: str, model: str, checkpoint: str, version: str, arm: di
     def generate(name, block, messages, target, tools=None, extra=None):
         # Size by rendered IDs, never truncate a chat template or original history.
         base = copy.deepcopy(messages)
-        base.insert(0, {"role": "system", "content": f"Fidelity fixture {name}; think carefully and use the repository tools when appropriate."})
+        note = f"Fidelity fixture {name}; {SYSTEM_NOTES['tools' if tools else 'no_tools']}."
+        if tools and family in FAMILY_TOOL_NOTE:
+            note += " " + FAMILY_TOOL_NOTE[family]
+        base.insert(0, {"role": "system", "content": note})
         count = max(0, target * 3 - len(canonical(base)))
         for attempt in range(8):
             body = {"model": model, "messages": copy.deepcopy(base), "temperature": 0,
@@ -352,7 +364,10 @@ def build_set(*, family: str, model: str, checkpoint: str, version: str, arm: di
                     "blocks": {"A": 26, "B": 12, "C": 10, "D": 6, "E": 10},
                     "prompt_roles": "conditioning history ctx; current assistant span gen",
                     "prompt_targets": {"D": list(D_TARGETS), "E": list(E_TARGETS)},
-                    **({"request": FAMILY_REQUEST[family]} if family in FAMILY_REQUEST else {})}, "windows": windows}
+                    "system_notes": SYSTEM_NOTES,
+                    **({"request": FAMILY_REQUEST[family]} if family in FAMILY_REQUEST else {}),
+                    **({"tool_turn_note": FAMILY_TOOL_NOTE[family]} if family in FAMILY_TOOL_NOTE else {})},
+                "windows": windows}
     if getattr(probe, "identity", {}).get("text_source") in ("api", "hf"):
         manifest["reference_snapshot"] = {
             key: arm[key] for key in ("checkpoint", "snapshot_revision", "config_sha256", "tokenizer_sha256")}

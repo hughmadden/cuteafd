@@ -267,6 +267,26 @@ def test_minimax_recipe_enables_thinking_on_every_request_and_records_it(fake_se
     assert "request" not in other["recipe"]
 
 
+@pytest.mark.parametrize("family", ["minimax_m3", "qwen4"])
+def test_only_windows_with_tools_invite_them_and_minimax_tool_turns_reason_first(fake_server, family):
+    fake_server["family"] = family
+    manifest = make(fake_server)
+    note = builder.FAMILY_TOOL_NOTE.get(family)
+    with_tools = [r["body"] for r in fake_server["requests"] if r["body"].get("tools")]
+    without = [r["body"] for r in fake_server["requests"] if not r["body"].get("tools")]
+    assert with_tools and without
+    for body in with_tools:
+        system = body["messages"][0]["content"]
+        assert builder.SYSTEM_NOTES["tools"] in system
+        assert (note in system) if note else not any(n in system for n in builder.FAMILY_TOOL_NOTE.values())
+    for body in without:
+        system = body["messages"][0]["content"]
+        assert builder.SYSTEM_NOTES["no_tools"] in system and "repository tools" not in system
+        assert not any(n in system for n in builder.FAMILY_TOOL_NOTE.values())
+    assert manifest["recipe"]["system_notes"] == builder.SYSTEM_NOTES
+    assert manifest["recipe"].get("tool_turn_note") == note
+
+
 def test_live_fixture_tools_execute_and_reasoning_is_echoed(fake_server):
     fake_server["tool_once"] = True
     manifest = make(fake_server)
