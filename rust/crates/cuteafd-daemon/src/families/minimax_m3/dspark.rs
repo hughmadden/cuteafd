@@ -23,6 +23,8 @@ pub(super) struct State {
     pub end: usize,
     pub ready: bool,
     pub confidence: Vec<f32>,
+    /// DFlash2: the selector features of the last proposal's drafted positions.
+    pub features: Vec<[f32; 4]>,
 }
 impl scheduler::DraftState for State {
     fn pending_rows(&self) -> usize { usize::from(self.ready && self.anchor.is_some()) }
@@ -36,7 +38,7 @@ impl State {
         ensure!(rows>0 && (!self.ready || self.end==start), MiniMaxError::Invalid("draft context frontier"));
         let end=start.checked_add(rows).context("MiniMax draft frontier overflow")?;
         if !self.ready { self.valid_from=start; }
-        self.end=end; self.ready=true; self.anchor=after; self.confidence.clear(); Ok(())
+        self.end=end; self.ready=true; self.anchor=after; self.confidence.clear(); self.features.clear(); Ok(())
     }
 }
 

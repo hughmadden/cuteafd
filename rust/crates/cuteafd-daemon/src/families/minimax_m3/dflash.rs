@@ -136,6 +136,16 @@ impl<'a> Dflash<'a> {
 
     /// The shared drafter (diagnostic replay and oracle).
     pub fn drafter(&self) -> &DflashDrafter<'a> { &self.drafter }
+
+    /// The keyed selector prior of these numerics (`minimax_m3/dflash2/...`, filed beside the
+    /// drafter's config by `scripts/bench/calibrate-draft-confidence.py`): the generic GLM-5.3
+    /// fit until one exists. The head is the target's BF16 one.
+    pub fn selector_prior(&self) -> Result<crate::shared::qwen::scheduler::SelectorPrior> {
+        let key = self.drafter.confidence_key("minimax_m3", false);
+        let fit = self.drafter.selector_fit("minimax_m3", false)?;
+        tracing::info!(key, fit = fit.key, "MiniMax DFlash2 selector prior");
+        Ok(crate::shared::qwen::scheduler::SelectorPrior { key, fit })
+    }
 }
 
 #[cfg(test)]

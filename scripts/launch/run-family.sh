@@ -220,7 +220,7 @@ EOF
     [[ "$1" != step5 ]] || printf '%s\n' SPECULATOR_DEPTH KV_CACHE
     [[ "$1" != minimax_m3 ]] || printf '%s\n' KV_CACHE RTX_EXPERT_LAYERS PREFILL_BATCH_TOKENS PREFILL_LANES MEDIA_CACHE_BYTES \
       VISION_REPLICAS HOST_CACHE_STORE SPECULATOR_DRAFTS DRAFT_POLICY DRAFT_ROW_COST \
-      SPECULATOR_MODEL_ID SPECULATOR_MODEL_REVISION SPECULATOR_FP8 DRAFT_KV_CACHE
+      SPECULATOR_MODEL_ID SPECULATOR_MODEL_REVISION SPECULATOR_FP8 DRAFT_KV_CACHE SPECULATION_TRACE
     _spark_slot_keys HOST LANE_A
     return
   fi
@@ -523,8 +523,10 @@ if [[ -n "$probe_root" ]]; then
 fi
 }
 # SPECULATION_TRACE=/abs/host/file.jsonl: the per-cycle speculation trace
-# (CUTEAFD_SPECULATION_TRACE, written by serve-glm and serve-qwen4; read by
-# scripts/qualify/glm5/glm-draft-trace.py and qualify/qwen4/qwen4-draft-trace.py).
+# (CUTEAFD_SPECULATION_TRACE, written by serve-glm and the shared Qwen scheduler's
+# families; read by scripts/qualify/glm5/glm-draft-trace.py and
+# qualify/qwen4/qwen4-draft-trace.py). Selector drafters (MiniMax DFlash2) add the
+# draft_confidence records scripts/bench/calibrate-draft-confidence.py fits.
 shared_trace_args() {
 trace_args=()
 # Optional diagnostic length rule; production selection uses resource prices.
