@@ -916,10 +916,9 @@ class PackageProfileTests(unittest.TestCase):
         for capacity in (256, 1024, 4096):
             self.assertEqual(package.ws_tile('qwen4', 'coordinator', 384, capacity),
                              package.TILE_RTX_MIXED)
-        for width in (256, 640):
-            for capacity in (2048, 2752):
-                self.assertEqual(package.ws_tile('qwen4', 'coordinator', width, capacity),
-                                 package.TILE_RTX_MIXED)
+        for capacity in (2048, 2752):
+            self.assertEqual(package.ws_tile('qwen4', 'coordinator', 640, capacity),
+                             package.TILE_RTX_MIXED)
         with tempfile.TemporaryDirectory() as temporary:
             _, _, calls, _ = self.build_fixture(
                 Path(temporary), 'coordinator', (4, 5), geometry='qwen4',
@@ -927,6 +926,25 @@ class PackageProfileTests(unittest.TestCase):
             self.assertTrue(calls)
             for call in calls:
                 self.assertEqual(call.kwargs['tile'], (64, 192, 64, 256))
+                self.assertTrue(call.kwargs['ws_dynamic_tiles'])
+                self.assertEqual(call.kwargs['route_block'], 64)
+
+    def test_qwen_coordinator_rank1_prefill_units_use_qualified_n256(self):
+        for capacity in (2048, 2752):
+            self.assertEqual(package.ws_tile('qwen4', 'coordinator', 256, capacity),
+                             (64, 256, 64, 256))
+            self.assertTrue(package.ws_dynamic_tiles('qwen4', 'coordinator', 256, capacity))
+            self.assertEqual(package.ws_route_block('qwen4', 'coordinator', 256, capacity), 64)
+        for capacity in (256, 1024, 4096):
+            self.assertEqual(package.ws_tile('qwen4', 'coordinator', 256, capacity),
+                             package.TILE_RTX_MIXED)
+        with tempfile.TemporaryDirectory() as temporary:
+            _, _, calls, _ = self.build_fixture(
+                Path(temporary), 'coordinator', (4, 5), geometry='qwen4',
+                capacities=(2048, 2752), profiles=('rtx-tp2-rank1',))
+            self.assertTrue(calls)
+            for call in calls:
+                self.assertEqual(call.kwargs['tile'], (64, 256, 64, 256))
                 self.assertTrue(call.kwargs['ws_dynamic_tiles'])
                 self.assertEqual(call.kwargs['route_block'], 64)
 

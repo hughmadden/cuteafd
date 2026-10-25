@@ -425,8 +425,8 @@ COORDINATOR_WS_CELLS: dict[tuple[str, int, int], dict] = {
     # TP2 rank0: N192 wins both exact prefill units on random and recorded routes.
     ('qwen4', 384, 2752): dict(route_block=64, dynamic=True, tile=(64, 192, 64, 256)),
     ('qwen4', 384, 2048): dict(route_block=64, dynamic=True, tile=(64, 192, 64, 256)),
-    ('qwen4', 256, 2752): _WS_S14,
-    ('qwen4', 256, 2048): _WS_S14,
+    ('qwen4', 256, 2752): dict(route_block=64, dynamic=True, tile=(64, 256, 64, 256)),
+    ('qwen4', 256, 2048): dict(route_block=64, dynamic=True, tile=(64, 256, 64, 256)),
     ('qwen4', 640, 4096): _WS_S14,
     ('qwen4', 384, 4096): _WS_S14,
     ('qwen4', 256, 4096): _WS_S14,
