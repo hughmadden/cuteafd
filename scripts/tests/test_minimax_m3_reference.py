@@ -48,9 +48,14 @@ def tiny_config():
 
 @pytest.fixture
 def snapshot(tmp_path):
-    folder = tmp_path / "snapshot"
+    return make_snapshot(tmp_path / "snapshot")
+
+
+def make_snapshot(folder, vocab=64):
     folder.mkdir()
-    (folder / "config.json").write_text(json.dumps(tiny_config()))
+    config = tiny_config()
+    config["text_config"]["vocab_size"] = vocab
+    (folder / "config.json").write_text(json.dumps(config))
     generator = torch.Generator().manual_seed(71)
     tensors = {}
 
@@ -67,9 +72,9 @@ def snapshot(tmp_path):
         tensors[name + ".weight_global_scale"] = torch.tensor(4.)
         tensors[name + ".input_global_scale"] = torch.tensor(32.)
 
-    bf16("language_model.model.embed_tokens.weight", (64, 32), .5)
+    bf16("language_model.model.embed_tokens.weight", (vocab, 32), .5)
     bf16("language_model.model.norm.weight", (32,))
-    bf16("language_model.lm_head.weight", (64, 32))
+    bf16("language_model.lm_head.weight", (vocab, 32))
     for layer in range(2):
         prefix = f"language_model.model.layers.{layer}."
         for name in ("input_layernorm", "post_attention_layernorm"):
@@ -478,6 +483,76 @@ def test_bf16_diagnostic_golden_is_never_a_reference(snapshot, tmp_path, monkeyp
     assert meta["diagnostic_only"] and "source_pin" not in meta and "root_arithmetic" not in meta
     with pytest.raises(ValueError, match="bf16 is a diagnostic"):
         golden.write_reference_meta(out, revision)
+
+
+def package_minimax(tmp_path, monkeypatch, config="minimax_m3-test"):
+    """golden.py, make-fidelity-reference.py, validate-fidelity-dataset.py --seal and the packager
+    over a sealed-split set of 64 own-text windows on a tiny release-shaped checkpoint."""
+    import importlib.util
+    from types import SimpleNamespace
+    from tokenizers import Tokenizer
+    from tokenizers.models import WordLevel
+    from fidelity_windows import set_hash, standard_split
+    from families.minimax_m3 import golden
+    revision = make_snapshot(tmp_path / ("5" * 40), vocab=1100)
+    Tokenizer(WordLevel({str(i): i for i in range(1100)}, unk_token="0")).save(str(revision / "tokenizer.json"))
+    (revision / "LICENSE").write_text("SAMPLE CHECKPOINT LICENSE\nKeep this notice with every copy.\n")
+    monkeypatch.setattr(model, "REVISION", revision.name)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *_: (12, 1))
+    monkeypatch.setenv("CUTEAFD_REFERENCE_IMAGE", "reference:test")
+    monkeypatch.setenv("CUTEAFD_REFERENCE_IMAGE_SHA256", "sha256:" + "a" * 64)
+    windows = []
+    split = standard_split()
+    for wid in split["decode"] + split["prefill"]:
+        scored = "ctx" if wid == "legacy" or wid.startswith("c") else "gen"
+        windows.append(dict(id=wid, block="E" if wid == "legacy" else wid[0].upper(), bucket="0-2K",
+                            tokens=[(7 * i + 3 * len(windows)) % 1100 for i in range(640)],
+                            roles=["ctx"] * 128 + [scored] * 512, score_from=128))
+    manifest = dict(schema="cuteafd.fidelity.set/1", family="minimax_m3", model=model.CHECKPOINT,
+                    checkpoint=model.CHECKPOINT, generation_arm={"checkpoint": model.CHECKPOINT},
+                    quick_windows=["legacy", "a00", "a04", "a08", "a20", "c00", "d00", "e00"], windows=windows)
+    manifest["set_sha256"] = set_hash(manifest)
+    (tmp_path / "set.json").write_text(json.dumps(manifest))
+    root = tmp_path / "source"
+    out = root / "golden"
+    golden.execute(SimpleNamespace(snapshot=revision, windows=tmp_path / "set.json", out=out, device="cpu",
+        activation="served", resume=None, stop_after_layer=None, layers=None, prefix_only=False, check_only=False))
+    # The real run records its GPU; this CPU run states one as a backfill would.
+    golden.write_reference_meta(out, revision, {"gpu": "reference GPU", "capability": [12, 1]})
+    load = lambda name: importlib.util.spec_from_file_location(name.replace("-", "_"), ROOT / f"scripts/bench/{name}.py")
+    tools = {}
+    for name in ("make-fidelity-reference", "validate-fidelity-dataset", "package-reference-only-fidelity"):
+        tools[name] = importlib.util.module_from_spec(load(name))
+        tools[name].__spec__.loader.exec_module(tools[name])
+    tools["make-fidelity-reference"].convert_windows(SimpleNamespace(windows=out / "windows.json", golden=out,
+        rows_dir=root / "full", out=root / "reference.json", model=[model.CHECKPOINT], name=None, top_k=None,
+        kl_max=None, top1_min=None, quick_out=None))
+    validation = tools["validate-fidelity-dataset"].validate_reference_only(root, seal=True)
+    (root / "reference-validation.json").write_text(json.dumps(validation, indent=2) + "\n")
+    package = tmp_path / "package"
+    index = tools["package-reference-only-fidelity"].package(root, package, config, revision / "tokenizer.json",
+                                                             ROOT / "LICENSE", revision / "LICENSE")
+    return package, index, revision
+
+
+def test_minimax_reference_packages_end_to_end_with_its_checkpoint_licence(tmp_path, monkeypatch):
+    import hashlib
+    from families.minimax_m3 import golden
+    package, index, revision = package_minimax(tmp_path, monkeypatch)
+    config = package / index["name"]
+    digest = lambda path: hashlib.sha256(path.read_bytes()).hexdigest()
+    assert (config / "CHECKPOINT_LICENSE").read_bytes() == (revision / "LICENSE").read_bytes()
+    assert (config / "LICENSE").read_bytes() == (ROOT / "LICENSE").read_bytes()
+    manifest = json.loads((config / "manifest.json").read_bytes())
+    assert manifest["licence_files"] == [dict(path=name, sha256=digest(config / name)) for name in ("LICENSE", "CHECKPOINT_LICENSE")]
+    assert manifest["root_checkpoint"] == {"id": model.CHECKPOINT, "revision": revision.name}
+    assert len(manifest["files"]) == 64 and index["sha256"] == digest(config / "manifest.json")
+    provenance = json.loads((config / "qualification.json").read_bytes())["reference_provenance"]
+    assert provenance["reference_precision"] == golden.ROOT_PRECISION
+    assert provenance["source_pin"]["revision"] == revision.name and provenance["attention"] == "eager"
+    card = (config / "README.md").read_text()
+    assert f"Official root ({golden.ROOT_PRECISION}): `{model.CHECKPOINT}` at `{revision.name}`." in card
+    assert "reproduced verbatim in CHECKPOINT_LICENSE." in card
 
 
 def test_cache_e4m3_rounds_ties_even_saturates_and_preserves_sign():

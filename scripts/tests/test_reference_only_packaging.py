@@ -254,6 +254,17 @@ def test_sealed_f32_arithmetic_supplies_precision_without_mutating_panel():
         packager.root_description({'root_arithmetic': {'arithmetic': 'unknown', 'source': 'unknown'}}, panel)
 
 
+def test_own_text_golden_states_its_root_precision_and_a_set_snapshot_still_comes_first():
+    meta = {'root_arithmetic': {'arithmetic': 'Decoder layer by layer.', 'source': 'decoder pins',
+                                'precision': 'official NVFP4 experts + MXFP8 dense'}}
+    assert packager.root_description(meta, {}) == (
+        'root (official NVFP4 experts + MXFP8 dense)', 'Decoder layer by layer.', 'decoder pins')
+    assert packager.reference_precision(meta, {'reference_snapshot': {'precision': 'from the set'}}) == 'from the set'
+    for blank in ('', '  ', None):
+        with pytest.raises(ValueError, match='missing reference precision'):
+            packager.reference_precision({'root_arithmetic': {**meta['root_arithmetic'], 'precision': blank}}, {})
+
+
 def test_reference_role_metrics_and_card_explain_aggregate_nll():
     validation = dict(nll=3.4, scored_tokens=10, nll_gen=.2, nll_ctx=8.2,
                       gen_top1=.95, scored_tokens_gen=6, scored_tokens_ctx=4)

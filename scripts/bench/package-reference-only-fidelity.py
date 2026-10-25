@@ -172,6 +172,10 @@ def reference_precision(meta, panel):
     precision = panel.get('reference_snapshot', {}).get('precision')
     if isinstance(precision, str) and precision.strip():
         return precision
+    # A golden over the scored model's own text (MiniMax) records its root precision itself.
+    precision = (meta.get('root_arithmetic') or {}).get('precision')
+    if isinstance(precision, str) and precision.strip():
+        return precision
     if meta.get('root_arithmetic') == KIMI_F32_ROOT:
         return KIMI_F32_PRECISION
     raise ValueError('missing reference precision: unrecognized sealed root arithmetic')
@@ -236,7 +240,7 @@ def public_panel(panel):
     return public
 
 
-def package(source, out, config, tokenizer_path, license_path):
+def package(source, out, config, tokenizer_path, license_path, checkpoint_license=None):
     if out.exists() or not config or any(c not in 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_.' for c in config) or config in ('.', '..'):
         raise ValueError('output must be fresh and config must be a safe component')
     read = lambda name: json.loads(contained(source, name).read_text())
@@ -291,6 +295,10 @@ def package(source, out, config, tokenizer_path, license_path):
     destination.mkdir(parents=True)
     (destination / 'windows.json').write_bytes(canonical(public) + b'\n')
     shutil.copyfile(license_path, destination / 'LICENSE')
+    # The checkpoint's own licence travels verbatim beside the data derived from it.
+    if checkpoint_license is not None:
+        shutil.copyfile(checkpoint_license, destination / 'CHECKPOINT_LICENSE')
+    licences = [name for name in ('LICENSE', 'CHECKPOINT_LICENSE') if (destination / name).is_file()]
     entries = {e['id']: e for e in rows['windows']}
     sealed_rows = {e['path']: e for e in full_seal['files']}
     if len(entries) != 64 or set(entries) != {w['id'] for w in panel['windows']}:
@@ -342,7 +350,7 @@ def package(source, out, config, tokenizer_path, license_path):
                     expect=copy.deepcopy(POLICY_EXPECT),
                     expect_provenance='declared policy floors; independent of engine measurements',
                     windows_sha256=digest(destination / 'windows.json'), qualification_sha256=digest(destination / 'qualification.json'),
-                    files=files, licence_files=[dict(path='LICENSE', sha256=digest(destination / 'LICENSE'))],
+                    files=files, licence_files=[dict(path=name, sha256=digest(destination / name)) for name in licences],
                     packaging_source_commit=subprocess.check_output(['git', '-C', str(REPO), 'rev-parse', 'HEAD'], text=True).strip(),
                     packaging_source_sha256=digest(Path(__file__)),
                     publication_status='REFERENCE',
@@ -383,7 +391,8 @@ def package(source, out, config, tokenizer_path, license_path):
             '## Provenance And Privacy\n\n'
             f'Source set: `{set_id}`. Raw deployment settings and local paths are omitted.\n'
             'Public text and metadata pass credential/private-key/personal-data screening. Original public MIT notice is preserved verbatim.\n'
-            'Reference data is MIT licensed; the official checkpoint remains subject to its own upstream license.\n')
+            'Reference data is MIT licensed; the official checkpoint remains subject to its own upstream license'
+            + (', reproduced verbatim in CHECKPOINT_LICENSE.\n' if 'CHECKPOINT_LICENSE' in licences else '.\n'))
     validate_public_text(card, scored_text=True)
     (destination / 'README.md').write_text(card)
     # This is an index entry, not a replacement for the shared live configs.json.
@@ -397,8 +406,11 @@ def main():
     for name in ('source', 'out', 'tokenizer', 'license'):
         parser.add_argument('--' + name, required=True, type=Path)
     parser.add_argument('--config', required=True)
+    parser.add_argument('--checkpoint-license', type=Path,
+                        help="the checkpoint's own licence, shipped verbatim as CHECKPOINT_LICENSE")
     args = parser.parse_args()
-    print(json.dumps(package(args.source, args.out, args.config, args.tokenizer, args.license), indent=2))
+    print(json.dumps(package(args.source, args.out, args.config, args.tokenizer, args.license,
+                             args.checkpoint_license), indent=2))
     print('Staged only; no upload or engine qualification performed.')
 
 
