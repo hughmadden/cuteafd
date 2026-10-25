@@ -192,22 +192,6 @@
     "status": "na",
     "reason": "Not measured for v3 (one card per checkpoint)."
    }
-  },
-  {
-   "family": "minimax_m3",
-   "checkpoint": "MiniMaxAI/MiniMax-M3.1-Flash",
-   "5090": {
-    "status": "current",
-    "report": "benchmarks/minimax_m3/2026-10-24-smoke-minimax-m3-1-flash-1rtx-2spark-rtx5090-off"
-   },
-   "1rtx": {
-    "status": "pending",
-    "reason": "Not measured yet: no RTX PRO 6000 run for this family."
-   },
-   "2rtx": {
-    "status": "pending",
-    "reason": "Not measured yet: no two-RTX run for this family."
-   }
   }
  ]
 }

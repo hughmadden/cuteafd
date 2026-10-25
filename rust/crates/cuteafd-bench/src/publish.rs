@@ -1442,11 +1442,9 @@ mod tests {
         let placed = scan(&root).unwrap();
         let matrix = Matrix::load(&root.join(MATRIX_FILE)).unwrap();
         let rows = select(&placed, &matrix).unwrap();
-        assert_eq!(rows.len(), 13);
+        assert_eq!(rows.len(), 12);
         for row in rows {
             assert!(matches!(row.cells[0], Resolved::Card(_) | Resolved::Na(_)));
-            // A family in qualification publishes its 5090 card first, both PRO cells pending.
-            if row.cells[1..].iter().all(|c| matches!(c, Resolved::Pending(_))) { continue; }
             // One release card per checkpoint; the other PRO column is n/a.
             assert!(row.cells[1..].iter().any(|c| matches!(c, Resolved::Card(_))));
             assert!(row.cells[1..].iter().all(|c| matches!(c, Resolved::Card(_) | Resolved::Na(_))));
