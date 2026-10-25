@@ -4,11 +4,12 @@
 //! `CUTEAFD_IDLE_PARK_SECONDS`), the same on the coordinator and the Spark
 //! workers.
 //!
-//! - Busy waits ([`HostWait`]): `spin` (default, lowest latency) spins in
+//! - Busy waits ([`HostWait`]): `block` (default) sleeps in per-step syncs
+//!   (blocking-sync events) and paces the exchange worker's polling to each
+//!   wave's expected duration, for a less loaded machine; `spin` spins in
 //!   host syncs and keeps the exchange worker polling between a wave's post
-//!   and its replies; `block` sleeps in per-step syncs (blocking-sync events)
-//!   and paces the exchange worker's polling to each wave's expected duration,
-//!   for a less loaded machine.
+//!   and its replies, for the lowest latency at one busy core per waiting
+//!   thread.
 //! - Idle parking, in both modes: once no request has been active for
 //!   [`WaitPolicy::idle_park`] (default 30 s), every polling thread blocks
 //!   (the engine loop and the exchange workers on their channels, the Spark
@@ -22,10 +23,10 @@ use std::time::{Duration, Instant};
 /// How a host thread waits while the engine serves.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HostWait {
+    /// Sleep in per-step waits and pace polling: a less loaded machine (default).
+    Block,
     /// Spin in host waits and polls: lowest latency, one busy core per waiting thread.
     Spin,
-    /// Sleep in per-step waits and pace polling: a less loaded machine.
-    Block,
 }
 
 impl std::str::FromStr for HostWait {
@@ -57,7 +58,7 @@ pub struct WaitPolicy {
 }
 
 impl Default for WaitPolicy {
-    fn default() -> Self { Self { wait: HostWait::Spin, idle_park: Duration::from_secs(30) } }
+    fn default() -> Self { Self { wait: HostWait::Block, idle_park: Duration::from_secs(30) } }
 }
 
 static POLICY: OnceLock<WaitPolicy> = OnceLock::new();
@@ -104,7 +105,7 @@ mod tests {
         assert_eq!("spin".parse::<HostWait>().unwrap(), HostWait::Spin);
         assert_eq!("block".parse::<HostWait>().unwrap(), HostWait::Block);
         assert!("yield".parse::<HostWait>().is_err());
-        assert_eq!(WaitPolicy::default(), WaitPolicy { wait: HostWait::Spin, idle_park: Duration::from_secs(30) });
+        assert_eq!(WaitPolicy::default(), WaitPolicy { wait: HostWait::Block, idle_park: Duration::from_secs(30) });
     }
 
     #[test]

@@ -71,10 +71,11 @@ pub(crate) struct Cli {
     #[arg(long, global = true, env = "CUTEAFD_SPARK_REPLY_CHUNK_BYTES", default_value = "none",
         value_parser = parse_chunk_bytes)]
     pub(crate) spark_reply_chunk_bytes: ChunkBytes,
-    /// How host threads wait while serving: `spin` (default, lowest latency)
-    /// or `block` (per-step waits sleep, the Spark exchange worker paces its
-    /// polling: a less loaded machine). Spark workers read it too.
-    #[arg(long, global = true, env = "CUTEAFD_HOST_WAIT", default_value = "spin")]
+    /// How host threads wait while serving: `block` (default: per-step waits
+    /// sleep, the Spark exchange worker paces its polling, a less loaded
+    /// machine) or `spin` (lowest latency, one busy core per waiting thread).
+    /// Spark workers read it too.
+    #[arg(long, global = true, env = "CUTEAFD_HOST_WAIT", default_value = "block")]
     pub(crate) host_wait: cuteafd_transport::wait_policy::HostWait,
     /// Seconds without an active request after which every polling host thread
     /// parks (no CPU, no GPU work), in either wait mode; the next request

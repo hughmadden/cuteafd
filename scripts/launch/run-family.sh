@@ -638,9 +638,10 @@ thermal_args=(-e "CUTEAFD_THERMAL=$thermal")
 # RDMA WRITE tails plus a head SEND; none (or 0) sends them whole; bytes or
 # NKiB/NMiB. Unset keeps the binary defaults (requests 256KiB, replies none).
 # The coordinator sends both to every Spark worker.
-# HOST_WAIT (spin, default; or block) is how serving's host threads wait:
-# spin for the lowest latency, block for a less loaded machine (per-step syncs
-# sleep, the Spark exchange worker paces its polling). IDLE_PARK_SECONDS
+# HOST_WAIT (block, default; or spin) is how serving's host threads wait:
+# block for a less loaded machine (per-step syncs sleep, the Spark exchange
+# worker paces its polling), spin for the lowest latency at one busy core per
+# waiting thread. IDLE_PARK_SECONDS
 # (default 30): with no active request for that long every polling thread
 # parks. Coordinator and Spark workers both read them.
 shared_coordinator_env_args() {
@@ -672,7 +673,7 @@ done
 if [[ -n "${CUTEAFD_PUSH_SOCKET:-}" ]]; then
   shared_env_args+=(-e "CUTEAFD_PUSH_SOCKET=$CUTEAFD_PUSH_SOCKET")
 fi
-# Unset keys leave the binary defaults (spin, 30 s).
+# Unset keys leave the binary defaults (block, 30 s).
 wait_env_args=()
 host_wait="$(get HOST_WAIT "")"
 if [[ -n $host_wait ]]; then
