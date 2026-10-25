@@ -484,6 +484,17 @@ release_prepare_api_key() {
   fi
 }
 
+# The base URL this host reaches a server listening on ADDR (HOST:PORT) at: the
+# bound address itself, or loopback when ADDR binds every address (0.0.0.0, ::).
+release_local_api_url() {
+  local host="${1%:*}" port="${1##*:}"
+  case "$host" in
+    ""|0.0.0.0) host=127.0.0.1 ;;
+    "::"|"[::]") host="[::1]" ;;
+  esac
+  printf 'http://%s:%s' "$host" "$port"
+}
+
 release_api_curl() {
   if [[ -n "${API_KEY_FILE:-}" ]]; then
     # Keep the key out of argv/process listings. Health probes do not need it.
