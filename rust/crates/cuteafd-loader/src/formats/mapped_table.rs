@@ -1432,7 +1432,7 @@ pub struct GatherTiming {
 /// with it. Dropping a ready result returns the slot to the pool without blocking.
 pub struct GatherLease<S: Send + 'static, J> {
     slot: Option<S>,
-    recycler: mpsc::SyncSender<S>,
+    recycler: Arc<GatherSlots<S>>,
     job: J,
     timing: Option<GatherTiming>,
 }
@@ -1452,8 +1452,58 @@ impl<S: Send + 'static, J> GatherLease<S, J> {
 impl<S: Send + 'static, J> Drop for GatherLease<S, J> {
     fn drop(&mut self) {
         if let Some(slot) = self.slot.take() {
-            // Full/disconnected means the pool is no longer usable; dropping is safe.
-            let _ = self.recycler.try_send(slot);
+            self.recycler.free.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).push(slot);
+            self.recycler.admission.notify();
+        }
+    }
+}
+
+struct GatherSlots<S> {
+    free: Mutex<Vec<S>>,
+    admission: GatherAdmission,
+    stopped: AtomicBool,
+}
+struct GatherWorkerExit<S>(Arc<GatherSlots<S>>);
+impl<S> Drop for GatherWorkerExit<S> {
+    fn drop(&mut self) {
+        self.0.stopped.store(true, Ordering::Release);
+        self.0.admission.notify();
+    }
+}
+
+#[derive(Default)]
+struct GatherAdmission(Mutex<Vec<(Arc<()>, std::task::Waker)>>);
+impl GatherAdmission {
+    fn waiter(&self) -> GatherAdmissionWait<'_> {
+        GatherAdmissionWait { admission: self, key: Arc::new(()) }
+    }
+    fn notify(&self) {
+        let waiters = std::mem::take(&mut *self.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner()));
+        for (_, wake) in waiters { wake.wake(); }
+    }
+}
+
+/// A registration belongs to its future, not its executor task: two futures
+/// may share one waker, and dropping either must not remove the other's wake.
+struct GatherAdmissionWait<'a> {
+    admission: &'a GatherAdmission,
+    key: Arc<()>,
+}
+impl GatherAdmissionWait<'_> {
+    fn register(&self, wake: &std::task::Waker) {
+        let mut waiters = self.admission.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some((_, old)) = waiters.iter_mut().find(|(key, _)| Arc::ptr_eq(key, &self.key)) {
+            old.clone_from(wake);
+        } else {
+            waiters.push((Arc::clone(&self.key), wake.clone()));
+        }
+    }
+}
+impl Drop for GatherAdmissionWait<'_> {
+    fn drop(&mut self) {
+        let mut waiters = self.admission.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(index) = waiters.iter().position(|(key, _)| Arc::ptr_eq(key, &self.key)) {
+            waiters.swap_remove(index);
         }
     }
 }
@@ -1471,13 +1521,36 @@ pub enum GatherPoll<L> {
     Ready(L),
 }
 
-type Completion<S, J, E> = mpsc::Receiver<std::result::Result<Option<GatherLease<S, J>>, E>>;
+type GatherResult<S, J, E> = std::result::Result<Option<GatherLease<S, J>>, E>;
+type Completion<S, J, E> = mpsc::Receiver<GatherResult<S, J, E>>;
+type GatherWake = Arc<Mutex<Option<std::task::Waker>>>;
+
+struct GatherCompletionSender<S: Send + 'static, J, E> {
+    sender: Option<mpsc::SyncSender<GatherResult<S, J, E>>>,
+    wake: GatherWake,
+}
+
+impl<S: Send + 'static, J, E> GatherCompletionSender<S, J, E> {
+    fn send(self, result: GatherResult<S, J, E>) {
+        if let Some(sender) = &self.sender { let _ = sender.send(result); }
+        // Drop disconnects the channel before waking, including on worker panic.
+    }
+}
+
+impl<S: Send + 'static, J, E> Drop for GatherCompletionSender<S, J, E> {
+    fn drop(&mut self) {
+        self.sender.take();
+        let wake = self.wake.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).take();
+        if let Some(wake) = wake { wake.wake(); }
+    }
+}
 
 /// Independent of scheduler slot reuse; drop cancels queued/in-progress work.
 /// An in-progress OS page fault cannot be interrupted, but its result is discarded.
 pub struct GatherTicket<S: Send + 'static, J, E> {
     cancelled: Arc<AtomicBool>,
     completion: Option<Completion<S, J, E>>,
+    wake: GatherWake,
     consumed: bool,
 }
 
@@ -1485,7 +1558,27 @@ impl<S: Send + 'static, J, E> GatherTicket<S, J, E> {
     pub fn cancel(&mut self) {
         self.cancelled.store(true, Ordering::Release);
         self.completion.take();
+        self.wake.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).take();
     }
+
+    /// Await a worker notification without polling or occupying an executor thread.
+    /// Resolves to Ready, Cancelled or an error, never Pending. Dropping this
+    /// future leaves the ticket usable; only a terminal result consumes it.
+    pub async fn wait(&mut self) -> std::result::Result<GatherPoll<GatherLease<S, J>>, GatherFailure<E>> {
+        std::future::poll_fn(|cx| {
+            // Register before checking the channel: a concurrent completion either
+            // wakes this task or is observed by poll, so no notification is lost.
+            *self.wake.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(cx.waker().clone());
+            match self.poll() {
+                Ok(GatherPoll::Pending) => std::task::Poll::Pending,
+                result => {
+                    self.wake.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).take();
+                    std::task::Poll::Ready(result)
+                }
+            }
+        }).await
+    }
+
     /// Nonblocking polling for a CUDA or scheduler thread; consume at most once.
     pub fn poll(&mut self) -> std::result::Result<GatherPoll<GatherLease<S, J>>, GatherFailure<E>> {
         if self.consumed {
@@ -1528,7 +1621,7 @@ struct WorkerJob<S: Send + 'static, J, E> {
     submitted: Option<Instant>,
     lease: GatherLease<S, J>,
     cancelled: Arc<AtomicBool>,
-    completion: mpsc::SyncSender<std::result::Result<Option<GatherLease<S, J>>, E>>,
+    completion: GatherCompletionSender<S, J, E>,
 }
 
 /// Bounded background gathers into a fixed pool of reusable staging slots:
@@ -1537,8 +1630,7 @@ struct WorkerJob<S: Send + 'static, J, E> {
 pub struct GatherWorker<S: Send + 'static, J: Send + 'static, E: Send + 'static> {
     sender: Option<mpsc::SyncSender<WorkerJob<S, J, E>>>,
     worker: Option<JoinHandle<()>>,
-    pool: Mutex<mpsc::Receiver<S>>,
-    recycler: mpsc::SyncSender<S>,
+    slots: Arc<GatherSlots<S>>,
     shutdown: Arc<AtomicBool>,
 }
 
@@ -1550,16 +1642,16 @@ impl<S: Send + 'static, J: Send + 'static, E: Send + 'static> GatherWorker<S, J,
             return Err(invalid("a gather worker needs at least one staging slot"));
         }
         let count = slots.len();
-        let (recycler, pool) = mpsc::sync_channel(count);
-        for slot in slots {
-            recycler.try_send(slot).map_err(|_| invalid("initializing the gather staging pool failed"))?;
-        }
+        let slots = Arc::new(GatherSlots { free: Mutex::new(slots), admission: GatherAdmission::default(),
+            stopped: AtomicBool::new(false) });
         let (sender, jobs) = mpsc::sync_channel::<WorkerJob<S, J, E>>(count);
         let shutdown = Arc::new(AtomicBool::new(false));
         let stopping = Arc::clone(&shutdown);
+        let worker_slots = Arc::clone(&slots);
         let worker = thread::Builder::new()
             .name(name.into())
             .spawn(move || {
+                let _exit = GatherWorkerExit(worker_slots);
                 while let Ok(mut job) = jobs.recv() {
                     if stopping.load(Ordering::Acquire) || job.cancelled.load(Ordering::Acquire) {
                         let _ = job.completion.send(Ok(None));
@@ -1596,33 +1688,72 @@ impl<S: Send + 'static, J: Send + 'static, E: Send + 'static> GatherWorker<S, J,
                 }
             })
             .map_err(|source| MappedTableError::Io { context: format!("starting {name}"), source })?;
-        Ok(Self { sender: Some(sender), worker: Some(worker), pool: Mutex::new(pool), recycler, shutdown })
+        Ok(Self { sender: Some(sender), worker: Some(worker), slots, shutdown })
     }
 
     /// Submit early, when row ids become available. None is bounded
     /// backpressure; this performs no mapped reads or blocking wait.
     /// `timed` records [`GatherTiming`] on the lease.
     pub fn try_submit(&self, job: J, timed: bool) -> Result<Option<GatherTicket<S, J, E>>> {
-        let slot = match self.pool.try_lock() {
-            Ok(pool) => match pool.try_recv() {
-                Ok(slot) => slot,
-                Err(mpsc::TryRecvError::Empty) => return Ok(None),
-                Err(mpsc::TryRecvError::Disconnected) => return Err(MappedTableError::Stopped("gather staging pool stopped")),
-            },
+        if self.slots.stopped.load(Ordering::Acquire) { return Err(MappedTableError::Stopped("gather worker stopped")); }
+        let slot = match self.slots.free.try_lock() {
+            Ok(mut free) => match free.pop() { Some(slot) => slot, None => return Ok(None) },
             Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
             Err(std::sync::TryLockError::Poisoned(_)) => return Err(MappedTableError::Stopped("gather staging pool poisoned")),
         };
+        self.submit_slot(slot, job, timed).map(Some)
+    }
+
+    /// Wait until a released lease makes admission possible. This is a
+    /// notification, not a reservation: callers retry try_submit after waking.
+    pub async fn wait_for_capacity(&self) -> Result<()> {
+        let waiter = self.slots.admission.waiter();
+        std::future::poll_fn(|cx| {
+            waiter.register(cx.waker());
+            if self.slots.stopped.load(Ordering::Acquire) {
+                return std::task::Poll::Ready(Err(MappedTableError::Stopped("gather worker stopped")));
+            }
+            match self.slots.free.lock() {
+                Ok(free) if free.is_empty() => std::task::Poll::Pending,
+                Ok(_) => std::task::Poll::Ready(Ok(())),
+                Err(_) => std::task::Poll::Ready(Err(MappedTableError::Stopped("gather staging pool poisoned"))),
+            }
+        }).await
+    }
+
+    /// Await admission without discarding the unsubmitted job or spinning.
+    pub async fn submit(&self, job: J, timed: bool) -> Result<GatherTicket<S, J, E>> {
+        let waiter = self.slots.admission.waiter();
+        let slot = std::future::poll_fn(|cx| {
+            waiter.register(cx.waker());
+            if self.slots.stopped.load(Ordering::Acquire) {
+                return std::task::Poll::Ready(Err(MappedTableError::Stopped("gather worker stopped")));
+            }
+            match self.slots.free.lock() {
+                Ok(mut free) => match free.pop() {
+                    Some(slot) => std::task::Poll::Ready(Ok(slot)),
+                    None => std::task::Poll::Pending,
+                },
+                Err(_) => std::task::Poll::Ready(Err(MappedTableError::Stopped("gather staging pool poisoned"))),
+            }
+        }).await?;
+        self.submit_slot(slot, job, timed)
+    }
+
+    fn submit_slot(&self, slot: S, job: J, timed: bool) -> Result<GatherTicket<S, J, E>> {
         let cancelled = Arc::new(AtomicBool::new(false));
-        let (completion, receive) = mpsc::sync_channel(1);
+        let wake = Arc::new(Mutex::new(None));
+        let (sender, receive) = mpsc::sync_channel(1);
         let job = WorkerJob {
             submitted: timed.then(Instant::now),
-            lease: GatherLease { slot: Some(slot), recycler: self.recycler.clone(), job, timing: None },
+            lease: GatherLease { slot: Some(slot), recycler: Arc::clone(&self.slots), job, timing: None },
             cancelled: Arc::clone(&cancelled),
-            completion,
+            completion: GatherCompletionSender { sender: Some(sender), wake: Arc::clone(&wake) },
         };
         match self.sender.as_ref().ok_or(MappedTableError::Stopped("gather worker stopped"))?.try_send(job) {
-            Ok(()) => Ok(Some(GatherTicket { cancelled, completion: Some(receive), consumed: false })),
-            Err(mpsc::TrySendError::Full(_)) => Ok(None),
+            Ok(()) => Ok(GatherTicket { cancelled, completion: Some(receive), wake, consumed: false }),
+            // Acquiring one of N slots proves fewer than N other jobs can be queued.
+            Err(mpsc::TrySendError::Full(_)) => Err(MappedTableError::Stopped("gather queue exceeded its staging slots")),
             Err(mpsc::TrySendError::Disconnected(_)) => Err(MappedTableError::Stopped("gather worker stopped")),
         }
     }

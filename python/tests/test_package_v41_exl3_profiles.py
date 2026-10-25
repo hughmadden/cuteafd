@@ -1155,7 +1155,10 @@ class PackageProfileTests(unittest.TestCase):
             for width in (512, 640, 768, 1024, 1536):
                 self.assertEqual([w(geometry, 'spark', width, c) for c in (1, 16, 80, 256, 1024, 4096)],
                                  [False, False, False, True, True, True])
-                if geometry not in ('glm', 'glmf') or width != 1024:
+                if geometry == 'dsv4p' and width == 1536:
+                    self.assertEqual([w(geometry, 'coordinator', width, c) for c in (256, 1024, 4096)],
+                                     [False, False, True])
+                elif geometry not in ('glm', 'glmf') or width != 1024:
                     self.assertFalse(any(w(geometry, 'coordinator', width, c) for c in (256, 1024, 4096)))
         for geometry in ('v41', 'dsv4f', 'qwen4'):
             self.assertFalse(any(w(geometry, 'spark', 512, c) for c in (256, 1024, 4096)))
@@ -1171,7 +1174,7 @@ class PackageProfileTests(unittest.TestCase):
                         width, capacity = call.args[1], call.args[3]
                         if geometry == 'glm':
                             ws = bits == target_bits and (
-                                (width == 1024 and capacity in (256, 1024, 2752))
+                                (width == 1024 and capacity in (256, 1024, 2752, 4096))
                                 or (width == 2048 and capacity in (256, 4096)))
                         else:
                             ws = bits == target_bits and (
@@ -1182,7 +1185,8 @@ class PackageProfileTests(unittest.TestCase):
                         self.assertEqual(call.kwargs.get('wire_input', False), wire)
                         self.assertEqual(call.kwargs.get('ws_input_stages'), 3 if wire else None)
                         dynamic = wire or (ws and ((geometry == 'glmf' and width == 1024)
-                                                  or (geometry == 'glm' and width == 2048)))
+                                                  or (geometry == 'glm' and (width == 2048
+                                                      or capacity in (1024, 4096)))))
                         self.assertEqual(call.kwargs.get('ws_dynamic_tiles', False), dynamic)
                         self.assertEqual('+ws-' in str(call.args[0]), ws)
                         if ws:
@@ -1193,7 +1197,7 @@ class PackageProfileTests(unittest.TestCase):
         for geometry in ('glm', 'glmf'):
             for width in (256, 384, 512, 640, 768, 1536):
                 self.assertFalse(package.warp_specialized(geometry, 'coordinator', width, 256))
-            unmeasured = (1, 16, 80, 128, 512, 1536, 8192) + ((4096,) if geometry == 'glm' else ())
+            unmeasured = (1, 16, 80, 128, 512, 1536, 8192)
             for capacity in unmeasured:
                 self.assertFalse(package.warp_specialized(geometry, 'coordinator', 1024, capacity))
         for capacity in (80, 1024, 2048, 2752, 4096):
@@ -1208,6 +1212,16 @@ class PackageProfileTests(unittest.TestCase):
         self.assertEqual(package.coordinator_ws_cell('glmf', 'coordinator', 2048, 256),
                          dict(route_block=64))
         self.assertFalse(package.ws_dynamic_tiles('glmf', 'coordinator', 2048, 256))
+
+    def test_glm_tp2_dynamic_ws_preserves_wire_and_losing_static_cells(self):
+        for capacity in (1024, 4096):
+            self.assertEqual(package.coordinator_ws_cell('glm', 'coordinator', 1024, capacity),
+                             dict(route_block=64, dynamic=True))
+        self.assertTrue(package.wire_input('glm', 'coordinator', 1024, 256))
+        for capacity in (2048, 2752):
+            self.assertEqual(package.coordinator_ws_cell('glm', 'coordinator', 1024, capacity),
+                             dict(route_block=64))
+            self.assertFalse(package.ws_dynamic_tiles('glm', 'coordinator', 1024, capacity))
 
     def test_flash_tp2_dynamic_ws_preserves_tune2048_static_cell(self):
         for capacity in (256, 1024, 2752, 4096):
@@ -1341,10 +1355,13 @@ class PackageProfileTests(unittest.TestCase):
                     capacities=(80, 256, 1024, 2752, 4096))
                 for call in calls:
                     capacity = call.args[3]
-                    self.assertNotIn('warp_specialized', call.kwargs)
+                    ws = bits == (2, 3) and call.args[1] == 1536 and capacity == 4096
+                    self.assertEqual(call.kwargs.get('warp_specialized', False), ws)
+                    self.assertEqual(call.kwargs.get('ws_dynamic_tiles', False), ws)
                     self.assertEqual(call.kwargs.get('route_block', 8), 8 if capacity <= 256 else 64)
                     self.assertEqual(call.kwargs.get('token_major_rotation', False),
-                                     len(bits) == 2 and capacity > 256)
+                                     len(bits) == 2 and capacity > 256 and not ws)
+                    self.assertEqual('+ws-m64-bf16-dynamic' in str(call.args[0]), ws)
         with tempfile.TemporaryDirectory() as temporary:
             _, _, calls, _ = self.build_fixture(
                 Path(temporary), 'spark', (2, 3, 4), geometry='dsv4p',
