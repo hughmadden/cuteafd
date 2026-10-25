@@ -136,7 +136,8 @@ mod tests {
         let request = Request {
             sizing: RuntimeSizing { rows: 256, decode_rows: 64, sequences: 16, context: 4096, spark_ranks: 3, logit_rows: 64,
                 lanes: cuteafd_loader::serving_capacity::prefill_lanes::DEFAULT_PREFILL_LANES, host_landing: false },
-            kv_format: Qwen4KvCache::Fp8, local_layers: LocalLayers::Fewest, spark_budget: 108 << 30, spark_vision_bytes: 0,
+            kv_format: Qwen4KvCache::Fp8, local_layers: LocalLayers::Fewest,
+            spark_budget: cuteafd_loader::plan::families::minimax::admission::SPARK_BUDGET_BYTES, spark_vision_bytes: 0,
             headroom: 0, draft_bytes: 0, draft_rings: 0, host_embedding, startup_graphs: true, rings: spark_rings()?,
         };
         let available = options.rtx_bytes[0] - measured_baseline;

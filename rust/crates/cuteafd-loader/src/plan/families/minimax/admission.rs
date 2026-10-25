@@ -402,10 +402,12 @@ pub fn onboard_layers(catalog: &crate::OfficialV41Catalog, cfg: &MiniMaxM3Config
     Err(AdmissionError::Budget { needed: shortfall, available: budget })
 }
 
-/// Per-rank Spark allocation ceiling without `--spark-budget-gib`; the planner and serve-minimax share it
-/// (the Kimi K3 precedent: a GB10 rank keeps ~113-116 GiB available idle).
-/// Estimated until the first full worker load/steady census.
-pub const SPARK_BUDGET_BYTES: u64 = 108 << 30;
+/// Per-rank Spark allocation ceiling without `--spark-budget-gib`; the planner and serve-minimax share it.
+/// Measured on headless DGX Sparks (OTA 26.09.2, multi-user.target, desktop services off): 117.77 GiB
+/// MemAvailable idle, and every TP2 load and serve peak since stayed within this ceiling. It leaves 3 GiB
+/// beside the worker's peaks, the margin below which a GB10 swaps and stops answering. A Spark that keeps
+/// a desktop session or other services needs a lower `--spark-budget-gib`.
+pub const SPARK_BUDGET_BYTES: u64 = 114 << 30;
 
 /// Expert package scratch per Spark rank when the coordinator's package manifest has no layout
 /// for the Spark world (remote packages are architecture-specific and need not be installed on
