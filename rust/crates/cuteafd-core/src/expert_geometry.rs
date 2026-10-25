@@ -19,6 +19,9 @@ pub struct SparkEndpoint {
     pub ring_depth: Option<usize>,
 }
 
+/// Most execution slots one Spark rank runs (a link admits at most four waves).
+pub const MAX_SPARK_EXECUTION_SLOTS: u8 = 4;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SparkIngress {
@@ -326,6 +329,11 @@ impl ExpertGeometry {
     }
 }
 
+/// Every EXL3 package's capacity ladder (native/cmake/shared/exl3.cmake):
+/// decode and verify (1/16/80), tails (256/1024), and the prefill wave units
+/// (2048/2752/4096: an 8192-row reserve split into 4/3/2 waves, #762).
+pub const EXL3_CAPACITIES: [u32; 8] = [1, 16, 80, 256, 1024, 2048, 2752, 4096];
+
 /// Capacity selects the compiled reduction geometry, never the live row count.
 /// GLM Flash and Kimi use K64 at m1/m80; m16 uses K128 and causes drift.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -349,7 +357,7 @@ impl Exl3RowPolicy {
 
     /// Shared by loader admission, artifact preload and runtime dispatch.
     pub fn capacities(self, max_live_rows: usize) -> Result<Vec<u32>, crate::serving_capacity::CapacityError> {
-        const CAPACITIES: [u32; 6] = [1, 16, 80, 256, 1024, 4096];
+        const CAPACITIES: [u32; 8] = EXL3_CAPACITIES;
         if !(1..=4096).contains(&max_live_rows) {
             return Err(crate::serving_capacity::CapacityError::Invalid("EXL3 live capacity must be 1..4096"));
         }
@@ -432,9 +440,12 @@ mod tests {
             assert_eq!(policy.capacities(rows).unwrap(), [1, 80]);
             assert_eq!(Exl3RowPolicy::Nearest.capacities(rows).unwrap(), [1, 16, 80]);
         }
-        assert_eq!(policy.capacities(4096).unwrap(), [1, 80, 256, 1024, 4096]);
+        assert_eq!(policy.capacities(4096).unwrap(), [1, 80, 256, 1024, 2048, 2752, 4096]);
+        assert_eq!(Exl3RowPolicy::Nearest.capacities(4096).unwrap(), EXL3_CAPACITIES);
+        assert_eq!(policy.capacities(2048).unwrap(), [1, 80, 256, 1024, 2048]);
+        assert_eq!(policy.capacities(2049).unwrap(), [1, 80, 256, 1024, 2048, 2752]);
         assert_eq!(Exl3RowPolicy::for_geometry(ExpertGeometry::KIMI_K3), policy);
-        let old = [1, 16, 80, 256, 1024, 4096];
+        let old = [1, 16, 80, 256, 1024, 2048, 2752, 4096];
         let new = policy.capacities(4096).unwrap();
         for rows in 1..=4096 {
             let required = policy.required_capacity(rows);

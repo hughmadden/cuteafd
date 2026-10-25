@@ -136,7 +136,7 @@ def test_compact_gate_matches_packager_spark_companions(tmp_path, monkeypatch, g
     assert exporter == "package_exl3_aot.py"
     package = compare_sm.load_file("test_compact_package", ROOT / "python/tools/aot/package_exl3_aot.py")
     profiles = package.compact_profiles(geometry, package.build_profiles("spark", geometry))
-    capacities = package.package_capacities(geometry, compare_sm.CAPACITIES)
+    capacities = package.package_capacities(geometry, compare_sm.EXL3_CAPACITIES)
     recorded = []
     monkeypatch.setitem(sys.modules, "package_exl3_aot", package)
     monkeypatch.setitem(sys.modules, "export_b12x_exl3_aot", SimpleNamespace(
@@ -493,8 +493,8 @@ def test_exl3_routes_gate_covers_all_coordinator_route_blocks(tmp_path, monkeypa
     monkeypatch.setitem(sys.modules, "package_exl3_aot", package)
     for geometry, expected in (
         ("glm", [("m80", 80, 256, 8, 8), ("m256", 256, 256, 8, 64), ("m1024", 1024, 256, 8, 64)]),
-        ("glmf", [("m80", 80, 288, 8, 8), ("m256-b8", 256, 288, 8, 8),
-                  ("m256-b64", 256, 288, 8, 64), ("m1024", 1024, 288, 8, 64)]),
+        ("glmf", [("m80", 80, 288, 8, 8), ("m256", 256, 288, 8, 64),
+                  ("m1024", 1024, 288, 8, 64)]),
         ("dsv4p", [("m80", 80, 384, 6, 8), ("m256", 256, 384, 6, 8), ("m1024", 1024, 384, 6, 64)]),
         ("kimik3", [("m80", 80, 896, 16, 8), ("m256", 256, 896, 16, 8), ("m1024", 1024, 896, 16, 64)]),
     ):

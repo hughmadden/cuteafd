@@ -26,6 +26,8 @@ ROOT = Path(os.environ.get("CUTEAFD_SOURCE_ROOT", Path(__file__).resolve().paren
 GEOMETRIES = ("flash", "pro", "flash2", "pro2", "glm", "glm2", "glmf", "glmf2",
               "mimo", "mimo2", "mimop", "mimop2", "mimof", "mimof2", "qwen4", "qwen35", "qwen38", "step5", "step52")
 CAPACITIES = "1,16,80,256,1024,4096"
+# EXL3 packages also carry the prefill wave units (#762): 2048 and 2752 rows.
+EXL3_CAPACITIES = "1,16,80,256,1024,2048,2752,4096"
 ROUTED_GEOMETRIES = ("mimo", "mimop", "mimof", "glm", "glmf", "qwen4",
                      "glm_nvfp4", "glmf_nvfp4", "qwen4_nvfp4", "glmfdense_nvfp4",
                      "glm_nvfp4a4", "glmf_nvfp4a4", "qwen4_nvfp4a4", "glmfdense_nvfp4a4")
@@ -149,25 +151,25 @@ def jobs(scope):
                            ("dsv4f", "2,3"), ("dsv4f", "4,5"), ("v41", "2,3"),
                            ("v41", "3,4"), ("v41", "4,5")):
         result.append((f"exl3-compact-{geometry}-k{bits.replace(',', '')}", "package_exl3_aot.py",
-                       ["--geometry", geometry, "--capacities", CAPACITIES, "--bits", bits,
+                       ["--geometry", geometry, "--capacities", EXL3_CAPACITIES, "--bits", bits,
                         "--compact-companions"]))
     result.extend((f"exl3-{geometry}", "package_exl3_aot.py",
-                   ["--geometry", geometry, "--capacities", CAPACITIES])
+                   ["--geometry", geometry, "--capacities", EXL3_CAPACITIES])
                   for geometry in EXL3_GEOMETRIES)
     result.extend((f"exl3-{geometry}-k23", "package_exl3_aot.py",
-                   ["--geometry", geometry, "--capacities", CAPACITIES, "--bits", "2,3"])
+                   ["--geometry", geometry, "--capacities", EXL3_CAPACITIES, "--bits", "2,3"])
                   for geometry in EXL3_GEOMETRIES)
     result.append(("exl3-kimik3-k23", "package_exl3_aot.py",
-                   ["--geometry", "kimik3", "--capacities", CAPACITIES, "--bits", "2,3"]))
+                   ["--geometry", "kimik3", "--capacities", EXL3_CAPACITIES, "--bits", "2,3"]))
     for geometry, bits in (("glm", "4,5"), ("qwen4", "4,5"),
                            ("qwen4", "3,4,5"), ("qwen4", "2,3,4,5")):
         result.append((f"exl3-{geometry}-k" + bits.replace(",", ""), "package_exl3_aot.py",
-                       ["--geometry", geometry, "--capacities", CAPACITIES, "--bits", bits]))
+                       ["--geometry", geometry, "--capacities", EXL3_CAPACITIES, "--bits", bits]))
     result.extend((f"context-split-{geometry}", "export_b12x_dsv4_aot.py",
                    ["--geometry", geometry, "--context-split-only"])
                   for geometry in ("flash", "pro", "glm", "glmf"))
     result.extend((f"exl3-routes-{geometry}", "export_b12x_exl3_routes_aot.py",
-                   ["--geometry", geometry, "--capacities", CAPACITIES])
+                   ["--geometry", geometry, "--capacities", EXL3_CAPACITIES])
                   for geometry in EXL3_GEOMETRIES)
     result.extend([
         ("kimi-k6-dense", "export_b12x_dsv4_aot.py", ["--geometry", "kimi_k6_dense,kimi_split"]),

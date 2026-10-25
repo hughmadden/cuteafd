@@ -262,6 +262,34 @@ __global__ void sm_copy(uint4* destination, const uint4* source, uint64_t units)
     destination[i] = source[i];
 }
 
+// Up to four byte regions in one launch (the Spark exchange's staging into
+// mapped host memory). A region whose pointers and length are 16-byte
+// aligned moves in uint4 units, any other byte by byte. SM copies run in
+// stream order behind stream memory waits, which copy-engine work need not.
+struct Regions {
+  const uint8_t* source[4];
+  uint8_t* destination[4];
+  uint64_t bytes[4];
+  uint32_t vector[4];
+  uint32_t count;
+};
+
+__global__ void copy_regions(Regions regions) {
+  const uint64_t stride = uint64_t(gridDim.x) * blockDim.x;
+  const uint64_t first = uint64_t(blockIdx.x) * blockDim.x + threadIdx.x;
+  for (uint32_t r = 0; r < regions.count; ++r) {
+    if (regions.vector[r]) {
+      const uint4* source = reinterpret_cast<const uint4*>(regions.source[r]);
+      uint4* destination = reinterpret_cast<uint4*>(regions.destination[r]);
+      for (uint64_t i = first; i < regions.bytes[r] / 16; i += stride) destination[i] = source[i];
+    } else {
+      for (uint64_t i = first; i < regions.bytes[r]; i += stride) regions.destination[r][i] = regions.source[r][i];
+    }
+  }
+  // System-scope visibility before a following stream write publishes them.
+  __threadfence_system();
+}
+
 unsigned default_blocks(uint64_t units, uint32_t blocks) {
   if (blocks) return blocks;
   const uint64_t wanted = (units + 1023) / 1024;
@@ -338,7 +366,7 @@ extern "C" int32_t cuteafd_peer_exchange_initialize() {
   for (const void* kernel : {reinterpret_cast<const void*>(push_signal<false>), reinterpret_cast<const void*>(push_planes<false>),
        reinterpret_cast<const void*>(wait_flag),
        reinterpret_cast<const void*>(add_bf16), reinterpret_cast<const void*>(host_signal),
-       reinterpret_cast<const void*>(wait_written)}) {
+       reinterpret_cast<const void*>(wait_written), reinterpret_cast<const void*>(copy_regions)}) {
     const cudaError_t status = cudaFuncGetAttributes(&attributes, kernel);
     if (status != cudaSuccess) return status;
   }
@@ -703,4 +731,24 @@ extern "C" int32_t cuteafd_p2p_probe(int32_t a, int32_t b, uint64_t bytes, int32
   *microseconds = median(samples);
   CHECK(cudaSetDevice(previous));
   return cudaSuccess;
+}
+
+extern "C" int32_t cuteafd_sm_copy_regions(void* const* destinations, const void* const* sources,
+    const uint64_t* bytes, uint32_t count, void* stream) {
+  if (!destinations || !sources || !bytes || !count || count > 4 || !stream) return cudaErrorInvalidValue;
+  Regions regions{};
+  regions.count = count;
+  uint64_t largest = 1;
+  for (uint32_t r = 0; r < count; ++r) {
+    if (bytes[r] && (!destinations[r] || !sources[r])) return cudaErrorInvalidValue;
+    regions.source[r] = static_cast<const uint8_t*>(sources[r]);
+    regions.destination[r] = static_cast<uint8_t*>(destinations[r]);
+    regions.bytes[r] = bytes[r];
+    regions.vector[r] = ((reinterpret_cast<uintptr_t>(sources[r]) | reinterpret_cast<uintptr_t>(destinations[r]) |
+        bytes[r]) & 15) == 0;
+    const uint64_t units = regions.vector[r] ? bytes[r] / 16 : bytes[r];
+    if (units > largest) largest = units;
+  }
+  copy_regions<<<default_blocks(largest, 0), 256, 0, static_cast<cudaStream_t>(stream)>>>(regions);
+  return cudaGetLastError();
 }

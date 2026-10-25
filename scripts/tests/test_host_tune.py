@@ -230,3 +230,158 @@ def test_persist_prints_only_unit(tmp_path):
                                    ("report", "--dry-run"), ("--unknown",)])
 def test_invalid_arguments(tmp_path, args):
     assert run(tmp_path, *args).returncode == 2
+
+
+QOS = '''DCBX mode: OS controlled
+Priority trust state: pcp
+Receive buffer size (bytes): 0,459360,0,0,0,0,0,0,max_buffer_size=2039616
+PFC configuration:
+ priority    0 1 2 3 4 5 6 7
+ enabled     0 0 0 0 0 0 0 0
+ buffer      1 1 1 1 1 1 1 1
+tc: 3 ratelimit: unlimited, tsa: vendor
+ priority:  3
+tc: 6 ratelimit: unlimited, tsa: vendor
+ priority:  6
+'''
+
+
+def fabric_fixture(root):
+    import json
+    base = 'class/infiniband/rocep1s0f0/ports/1'
+    put(root, base + '/state', '4: ACTIVE')
+    put(root, base + '/link_layer', 'Ethernet')
+    put(root, base + '/gid_attrs/ndevs/3', 'roce0')
+    (root / 'class/infiniband/rocep1s0f0/device/net/roce0').mkdir(parents=True)
+    put(root, 'class/net/roce0/ip.json', json.dumps([
+        {'addr_info': [{'local': '10.55.0.1'}]}]))
+    put(root, 'class/net/roce0/mlnx_qos.txt', QOS)
+    put(root, 'class/net/roce0/app.json', '{}')
+    put(root, 'class/net/roce0/pause.txt', 'Autonegotiate: off\nRX: on\nTX: on')
+
+
+@pytest.mark.parametrize('role', ['coordinator', 'spark'])
+def test_fabric_preview_is_explicit_and_read_only(tmp_path, role):
+    fabric_fixture(tmp_path)
+    before = snapshot(tmp_path)
+    check = run(tmp_path, 'fabric-lossless', 'check', '--role', role)
+    assert check.returncode == 0, check.stderr
+    assert 'traffic_class=absent' in check.stdout
+    preview = run(tmp_path, 'fabric-lossless', 'apply', '--role', role, '--dry-run')
+    assert preview.returncode == 0, preview.stderr
+    assert 'command mlnx_qos -i roce0 --trust dscp' in preview.stdout
+    assert '--pfc 0,0,0,1,0,0,0,0' in preview.stdout
+    assert '--prio2buffer 0,0,0,1,0,0,0,0' in preview.stdout
+    assert '--dscp2prio=set,26,3' in preview.stdout
+    assert '--dscp2prio=set,48,6' in preview.stdout
+    assert '--dscp2prio=set,0,0' in preview.stdout
+    assert '--dscp2prio=set,24,0' in preview.stdout
+    for line in preview.stdout.splitlines():
+        assert not ('--trust' in line and '--dscp2prio' in line)
+    assert before == snapshot(tmp_path)
+
+
+def test_fabric_preflight_refuses_conflicts_and_rootless_writes(tmp_path):
+    fabric_fixture(tmp_path)
+    result = run(tmp_path, 'fabric-lossless', 'apply', '--role', 'spark')
+    assert result.returncode != 0
+    assert 'requires root' in result.stderr or 'fixture writes are forbidden' in result.stderr
+    put(tmp_path, 'class/net/roce0/mlnx_qos.txt', QOS.replace('OS controlled', 'Firmware controlled'))
+    before = snapshot(tmp_path)
+    result = run(tmp_path, 'fabric-lossless', 'apply', '--role', 'spark', '--dry-run')
+    assert result.returncode != 0 and 'OS-controlled' in result.stderr
+    assert 'DRY-RUN command' not in result.stdout
+    assert before == snapshot(tmp_path)
+
+
+def test_fabric_rollback_uses_original_state(tmp_path):
+    import json
+    fabric_fixture(tmp_path)
+    saved = {'netdev': 'roce0', 'rdma': ['rocep1s0f0', '1'],
+             'buffers': ['1'] * 8, 'sizes': ['0', '459360'] + ['0'] * 6,
+             'pfc': ['0'] * 8, 'trust': 'pcp', 'app': {'dscp_prio': [[7, 2]]},
+             'pause': {'autoneg': 'off', 'rx': 'on', 'tx': 'on'}}
+    put(tmp_path, 'var/lib/cuteafd/fabric-lossless/roce0.json', json.dumps(saved))
+    before = snapshot(tmp_path)
+    result = run(tmp_path, 'fabric-lossless', 'rollback', '--role', 'spark', '--dry-run')
+    assert result.returncode == 0, result.stderr
+    assert '--buffer_size 0,459360,0,0,0,0,0,0' in result.stdout
+    assert 'dscp-prio 7:2' in result.stdout
+    assert '--trust pcp' in result.stdout
+    assert before == snapshot(tmp_path)
+
+
+def fabric_module():
+    import importlib.util
+    spec = importlib.util.spec_from_file_location('fabric_lossless', SCRIPT.with_name('fabric-lossless.py'))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def saved_nic(root, netdev):
+    import json
+    state = {'netdev': netdev, 'rdma': ['rdma_' + netdev, '1'],
+             'buffers': ['1'] * 8, 'sizes': ['0', '459360'] + ['0'] * 6,
+             'pfc': ['0'] * 8, 'trust': 'pcp', 'app': {'dscp_prio': [[7, 2]]},
+             'pause': {'autoneg': 'off', 'rx': 'on', 'tx': 'on'}}
+    put(root, f'class/infiniband/rdma_{netdev}/ports/1/state', '4: ACTIVE')
+    (root / f'class/infiniband/rdma_{netdev}/device/net/{netdev}').mkdir(parents=True)
+    return put(root, f'var/lib/cuteafd/fabric-lossless/{netdev}.json', json.dumps(state))
+
+
+def test_fabric_rollback_partial_failure_retry_skips_restored_down_link(tmp_path, monkeypatch):
+    module = fabric_module()
+    monkeypatch.setattr(module, 'command', lambda *args: pytest.fail('live host command forbidden'))
+    first, second = [saved_nic(tmp_path, name) for name in ('roce0', 'roce1')]
+    originals = {p.name: p.read_bytes() for p in (first, second)}
+    commands = []
+
+    def mutate(*argv):
+        commands.append(argv)
+        if 'roce1' in argv:
+            raise subprocess.CalledProcessError(1, argv)
+
+    with pytest.raises(subprocess.CalledProcessError):
+        module.restore_backups(module.rollback_plan(tmp_path, first.parent), mutate, lambda *a: 'mock qos', False)
+    assert not first.exists() and second.exists()
+    receipt, = first.parent.glob('roce0.restored.*.json')
+    assert receipt.read_bytes() == originals[first.name]
+    assert second.read_bytes() == originals[second.name]
+    put(tmp_path, 'class/infiniband/rdma_roce1/ports/1/state', '1: DOWN')
+    commands.clear()
+    module.restore_backups(module.rollback_plan(tmp_path, first.parent),
+                           lambda *a: commands.append(a), lambda *a: 'mock qos', False)
+    assert commands and all('roce0' not in argv for argv in commands)
+    assert not second.exists()
+    assert module.rollback_plan(tmp_path, first.parent) == []
+    receipt2, = first.parent.glob('roce1.restored.*.json')
+    assert receipt2.read_bytes() == originals[second.name]
+
+
+def test_fabric_rollback_down_link_preview_and_empty_noop(tmp_path):
+    backup = saved_nic(tmp_path, 'roce0')
+    put(tmp_path, 'class/infiniband/rdma_roce0/ports/1/state', '1: DOWN')
+    before = snapshot(tmp_path)
+    result = run(tmp_path, 'fabric-lossless', 'rollback', '--role', 'spark', '--dry-run')
+    assert result.returncode == 0, result.stderr
+    assert 'DRY-RUN command mlnx_qos -i roce0' in result.stdout
+    assert before == snapshot(tmp_path)
+    backup.rename(backup.with_name('roce0.restored.123.json'))
+    result = run(tmp_path, 'fabric-lossless', 'rollback', '--role', 'spark', '--dry-run')
+    assert result.returncode == 0 and 'nothing to restore' in result.stdout
+    assert 'DRY-RUN command' not in result.stdout
+
+
+@pytest.mark.parametrize('bad', [{'pause': {}}, {'app': []}, {'sizes': ['1']},
+                                  {'rdma': ['rdma_roce1', 1]}, {'netdev': '../bad'}])
+def test_fabric_rollback_validates_all_backups_before_mutation(tmp_path, bad):
+    import json
+    saved_nic(tmp_path, 'roce0')
+    backup = saved_nic(tmp_path, 'roce1')
+    backup.write_text(json.dumps({**json.loads(backup.read_text()), **bad}))
+    before = snapshot(tmp_path)
+    result = run(tmp_path, 'fabric-lossless', 'rollback', '--role', 'spark', '--dry-run')
+    assert result.returncode != 0 and 'malformed backup' in result.stderr
+    assert 'DRY-RUN command' not in result.stdout
+    assert before == snapshot(tmp_path)

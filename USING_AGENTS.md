@@ -27,9 +27,10 @@ enhanced build.
 |---|---|---|
 | **Orchestrator** (one Claude Opus session) | Plans, writes briefs, picks the model per task, makes default and policy calls, reviews every branch, resolves merge conflicts, merges into `work/p0`, cuts releases, talks to TJ | Long hardware runs, bulk implementation |
 | **Codex Sol 6.1** | The workhorse: kernels, ports, measurements, A/B campaigns, release builds and smoke matrices, investigations | Merging, tagging, pushing images, changing defaults without passing gates |
-| **Astra 6** (`high`) | Hard kernel and optimization work: new kernel structures, tiling and fusion ideas, roofline gaps, and coding those kernels | Simple kernels, investigation, profiling, probes, harnesses, integration, gates (Sol does these) |
-| **DeepSeek 4.1 Flash** | Fast structural work: renames, mechanical refactors, doc and table edits, sweeps across many files, log/report digests, simple scripts | Numerics, kernels, judgment calls |
+| **Astra 6** (`high`) | Kernel duels and targeted judgment calls, always tightly scoped (expensive): new kernel structures, tiling and fusion ideas, roofline gaps, and coding those kernels | Open-ended tasks, simple kernels, investigation, probes, harnesses, integration, gates (Sol does these) |
+| **DeepSeek 4.1 Flash** | Fast mechanical work and kernel duels: renames, refactors, doc and table edits, sweeps across many files, log/report digests, simple scripts, duel rounds against Sol or Gemini | Judgment calls, numerics outside a duel's bitwise gate |
 | **Claude Opus subagents** | Judgment-heavy cross-cutting work: engine design changes (e.g. the device-driven exchange), hard merges, investigations needing many decisions, independent reviews | Work Sol can do from a clear brief |
+| **Gemini** (`agy`, external) | Kernel duels; slower judgment-oriented work: second opinions, design reviews, research | Bulk implementation, merging |
 | **Claude Fable** | Extremely rarely: important design or planning, front-end design, a special kernel insight | Anything else |
 | **MiMo** | Only when every other option is exhausted | — |
 
@@ -45,7 +46,7 @@ Budget drives the split. Claude is the scarcest: eight parallel Opus agents
 once used ~60% of a week's capacity in under a day. Codex Sol has had ample
 budget (under 1% of a weekly subscription after a full day of work). With a
 larger Claude budget now, Opus can take somewhat more of the judgment work,
-but bounded engineering still goes to Sol.
+but bounded engineering still goes to Sol. TJ (2026-10-25): Sol is the primary agent for every task unless judgment is crucial.
 
 | Task | Model | Effort |
 |---|---|---|

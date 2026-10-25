@@ -424,6 +424,28 @@ impl NativeLibrary {
         Ok(())
     }
 
+    /// Copies up to four byte regions (`(destination, source, bytes)`, any
+    /// alignment) with SM loads and stores on `stream`, then a system-scope
+    /// fence (`cuteafd_sm_copy_regions`).
+    ///
+    /// # Safety
+    /// Every pointer is a device pointer (or a mapped host alias) valid for
+    /// its `bytes` on the stream's device until the copy completes; the
+    /// regions do not overlap.
+    pub unsafe fn sm_copy_regions(&self, regions: &[(*mut c_void, *const c_void, u64)], stream: *mut c_void)
+        -> Result<()> {
+        type F = unsafe extern "C" fn(*const *mut c_void, *const *const c_void, *const u64, u32, *mut c_void) -> i32;
+        ensure!((1..=4).contains(&regions.len()), "{} regions in one SM copy", regions.len());
+        let destinations: Vec<_> = regions.iter().map(|r| r.0).collect();
+        let sources: Vec<_> = regions.iter().map(|r| r.1).collect();
+        let bytes: Vec<_> = regions.iter().map(|r| r.2).collect();
+        // SAFETY: the caller vouches for the regions; native copies the descriptors.
+        let status = unsafe { self.lib.get::<F>(b"cuteafd_sm_copy_regions")?(destinations.as_ptr(), sources.as_ptr(),
+            bytes.as_ptr(), regions.len() as u32, stream) };
+        ensure!(status == 0, "SM region copy failed with CUDA error {status}");
+        Ok(())
+    }
+
     /// Copies up to [`PEER_MAX_PLANES`] strided planes (local or peer) in one
     /// launch, then publishes the next sequence to `flag` exactly as
     /// [`NativeLibrary::peer_push_signal`] does, so the two share a link

@@ -5450,14 +5450,16 @@ Ideas TJ wants kept for later; not v2 work.
 
 Every family that sends experts to Sparks prefills the same way.
 
-- **Units:** the prompt runs as a continuous stream of row units, 2 units in
-  flight, each unit the family's largest supported size (TJ, 2026-10-24:
-  "2 × max size basically always wins"). The max is the family's expert-kernel
-  capacity, capped at 4096 rows (TJ, 2026-10-24: no larger units for now). Bigger units mean more rows per expert,
-  hence more reuse of each decoded weight and less per-wave overhead; GLM 5.3
-  measured 4096×2 about 18% over 2048×2 on 8K. If the default doesn't fit
-  (5090, tight pool), step down 4096 → 2048 → 1024 → 512; there is no
-  optimizing chooser.
+- **Units:** the prompt runs as a continuous stream of row units: a
+  planner-admitted maximum of k units in flight inside one 8192-row reserve
+  (TJ, 2026-10-25, #762), each unit reserve / k rows on its exact EXL3
+  capacity (k = 2/3/4 → 4096/2752/2048). k hides raptor's turnaround T behind
+  the Sparks' per-unit compute S: k = ⌈T/S⌉ + 1, at most 4; 3 at six Sparks,
+  2 below. A prompt that would cut units below half a unit runs on fewer
+  waves. `PREFILL_WAVES`/`PREFILL_ROWS` pin both (benchmarks, goldens). GLM
+  5.3 K4 max: 2 × 4096 2,769 / 2,723, 4 × 2048 3,296 / 3,209, 3 × 4096
+  (12,288 in flight) 3,511 / 3,597 tok/s 8K / 64K. If the default doesn't
+  fit (5090, tight pool), step down 4096 → 2048 → 1024 → 512.
 - **One transport, N waves:** each unit's expert wave goes out on one
   transport that admits N outstanding waves, each with its own return slot.
   The Spark side already pipelines (rings 8 deep, in order); only the
@@ -5474,18 +5476,17 @@ Every family that sends experts to Sparks prefills the same way.
   chunk boundaries, so the Sparks don't drain between units.
 - **Head:** logits only for the rows serving needs. Prefix snapshots happen at
   the unit boundary that carries the prompt or turn end.
-- **Admission:** N × unit rows × row-owned bytes, plus one unit of scratch,
-  plus N return slots, charged before allocation.
+- **Admission:** k × unit rows × row-owned bytes, plus one unit of scratch,
+  plus k return slots, charged before allocation.
 - **Why units and not windows inside a chunk:** per-row workspace dominates
   (V4.1 max: 8.0 / 5.8 GiB for 2 × 2048 rows, ~2 MiB/row). Lanes and windows
   cost the same memory for the same rows in flight. Units keep full-size
   expert batches and never drain the Sparks at chunk ends.
 - **Gates per family:** byte-identical logits and KV at N=1 vs N, exact
   prefix cache, and an A/B card against work/p0 with the same config.
-  - Run every N=1 and N arm on the same Spark intake and egress mode
-    (`CUTEAFD_SPARK_INTAKE=pinned`, copied egress): `SparkLink::new_waves`
-    picks probed intake at N=1 and pinned at N>1, so unpinned arms compare
-    different exchange paths.
+  - Run every N=1 and N arm on the same Spark intake
+    (`CUTEAFD_SPARK_INTAKE=pinned`) when isolating the executor: probed
+    intake is a separate transport arm.
   - Families whose Spark exports accumulate FP32 with atomics at capacity
     ≥256 (V4, V4.1: `--atomic-min-capacity 256`; see "Cold prefill is not
     bit-reproducible") can't be byte-identical in prefill. Gate their N=1
@@ -5550,7 +5551,47 @@ outstanding waves on one link:
 - `SparkIntake` has one return slot per wave, each with its own consumed event;
 - retained receive slots repost in consumption order.
 
-Several waves take the pinned intake (GPU landing has one range per rank).
+Several waves use the same probed intake as one wave. Each rank registers one
+contiguous N-slot landing allocation; successful receive posts rotate slots in
+FIFO order, and consumed events fence replacement requests. Registered request
+egress likewise owns N independent slots, charged from the widest bootstrap
+request geometry before allocation. Pinned intake remains an explicit mode.
+
+Request frames (every Spark link, decode and prefill): with request chunk
+size `c` (default 256 KiB), a frame of at most `c` is one RC SEND. A larger
+frame WRITEs every byte past its first `c`, in WRITEs of at most `c`
+round-robin across the wave's rank QPs, into the worker's request slot for
+that sequence, then SENDs its header-bearing first `c` on the same QP into
+the receive posted there; RC ordering completes that receive after every
+WRITE. The worker posts a request's final reply only after execute returns
+and the slot's receive is reposted, so a final reply is the client's credit
+to WRITE into that slot again. One large SEND per rank let RC go-back-N
+replay most of a 26.5 MB frame per loss (MiMo request wire/engine
+1.04-3.2x); chunked WRITE measured 1.015x.
+
+Reply frames (reply chunk size, default none: every reply is one SEND). The
+tail-WRITE reply path (#714) raised worker retransmits about 8x on GLM 64K
+(single-shot, 2026-10-25), so it is off by default. When enabled it mirrors
+the request rule: every request header carries, in its last four bytes, the
+coordinator's count of receives posted on that QP (a 32-bit wrapping
+watermark). Reply frame `s` completes the coordinator's `s`-th receive: host
+slot `s % depth`, and with GPU landing device slot `s % waves`, whose payload
+starts at frame byte 96. After the QP connects, the coordinator sends the
+worker its response ring and its GPU landing (separate strict,
+remote-writable MR) addresses and keys. A frame above the reply chunk whose
+receive the latest watermark covers WRITEs every byte past it there, then
+SENDs its head on the same QP. Small frames and uncovered ones are one SEND,
+which RC holds until the receive is posted. Write mode sends its rows as
+256 KiB WRITEs and the flag alone, last.
+
+Both chunk sizes are TEMPORARY launch parameters for the PFC test (TJ
+2026-10-25; remove after it): `--spark-request-chunk-bytes` /
+`--spark-reply-chunk-bytes` (`SPARK_REQUEST_CHUNK_BYTES` /
+`SPARK_REPLY_CHUNK_BYTES` config keys; `none`, 0, bytes, NKiB, NMiB; 4 KiB
+to 64 MiB). Each size is both its direction's threshold and WRITE part size.
+The coordinator resolves them once at startup, logs them on the Spark
+transfer-plan line and sends them to every worker in the persistent start
+(control version 6), so both ends of a link always agree.
 
 Context-split staging (GLM 5.3 port; GLM Flash and V4 have the same shape):
 today only the first lane gathers each layer's history into that layer

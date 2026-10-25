@@ -289,7 +289,7 @@ fn native_layer3_same_quant() -> Result<()> {
     }
     let args = Args::try_parse_from(argv)?.engine;
     let opened = crate::families::glm5::open(&args)?;
-    opened.with_engine(&args, |engine, transport, runtime| {
+    opened.with_engine(&args, |engine, transport, _runtime| {
         let mut transport = transport;
         let peers = engine.peer_workspaces(false, 1)?.context("native gate needs two GPUs")?;
         let w1 = peers.get(0)?;
@@ -332,7 +332,7 @@ fn native_layer3_same_quant() -> Result<()> {
                     (w.delta.buffer.ptr, 1)
                 } else {
                     let transport = transport.as_deref_mut().context("remote fixture needs real workers")?;
-                    engine.moe(w, 3, &engine.weights.layers[3], rows, "m4096", false, transport, runtime)?;
+                    engine.moe(w, 3, &engine.weights.layers[3], rows, "m4096", false, transport)?;
                     engine.shared_on(1, 3, w1, &engine.peer()?.layers[3], Scalar::I32(rows as i32), "m4096")?;
                     engine.exchange()?.push(1, slot(3, true, 0), w1.shared.buffer.ptr, rows * h * 2)?;
                     engine.exchange()?.wait(0, slot(3, true, 0))?;
@@ -407,9 +407,8 @@ fn native_prefill_lanes_byte_exact() -> Result<()> {
 #[test]
 #[ignore = "requires native SM120 exports, two GPUs and real EXLR8 workers"]
 fn native_prefill_two_waves_byte_exact() -> Result<()> {
-    ensure!(std::env::var("CUTEAFD_SPARK_INTAKE").as_deref() == Ok("pinned")
-        && std::env::var("CUTEAFD_SPARK_EGRESS").as_deref() == Ok("copied"),
-        "two-wave exactness gate requires pinned intake and copied egress on both links");
+    ensure!(std::env::var("CUTEAFD_SPARK_INTAKE").as_deref() == Ok("pinned"),
+        "two-wave exactness gate requires pinned intake on both links");
     prefill_lanes_byte_exact(8192, 4096, 2)
 }
 

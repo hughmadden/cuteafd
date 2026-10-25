@@ -155,11 +155,34 @@ mod tests {
     }
 
     #[test]
+    fn adaptive_units_size_row_planes_without_shrinking_exported_scratch() {
+        for activations in [PrefillActivations::A16, PrefillActivations::A8] {
+            let programs = json!({"programs":[entry(ExecutionVariant::Prefill, activations)]});
+            let spec = program_spec(&programs, ExecutionVariant::Prefill.program(activations)).unwrap();
+            let full = execution_workspace(&spec, 4096, ExpertSet::Routed,
+                ExecutionVariant::Prefill, 8, activations).unwrap();
+            for rows in [2048, 2752] {
+                let unit = execution_workspace(&spec, rows, ExpertSet::Routed,
+                    ExecutionVariant::Prefill, 8, activations).unwrap();
+                assert_eq!(unit.rows, rows);
+                assert_eq!(unit.ranges[0].1, rows * (6144 + 6144 / 32));
+                assert_eq!(unit.ranges[1].1, rows * 8 * 4);
+                assert_eq!(unit.ranges[3].1, rows * 6144 * 2);
+                for index in [4, 5, 8, 9] {
+                    assert_eq!(unit.ranges[index].1, full.ranges[index].1);
+                }
+                assert_eq!(unit.max_groups, full.max_groups);
+                assert!(unit.bytes < full.bytes);
+            }
+        }
+    }
+
+    #[test]
     fn routed_backend_charges_both_decode_arenas_prefill_and_stable_output() {
         for activations in [PrefillActivations::A16, PrefillActivations::A8] {
             let programs = json!({"programs":[entry(ExecutionVariant::DecodeCompact, activations),
                 entry(ExecutionVariant::DecodeGrouped, activations), entry(ExecutionVariant::Prefill, activations)]});
-            for rows in [1u64, 64, 65, 1024, 4096] {
+            for rows in [1u64, 64, 65, 1024, 2048, 2752, 4096] {
                 let mut expected = rows.max(64) * 6144 * 2;
                 for variant in [ExecutionVariant::DecodeCompact, ExecutionVariant::DecodeGrouped, ExecutionVariant::Prefill] {
                     if variant == ExecutionVariant::Prefill && rows <= 64 { continue; }
