@@ -366,6 +366,75 @@ def fused_input_rotation(geometry: str, role: str, width: int, capacity: int) ->
     return False
 
 
+# Warp-specialized tile with 128-wide FC1 N tiles and a 256-wide FC2: every
+# coordinator rank width and hidden size is a whole 128 tiles, so FC1 never
+# straddles a live edge while FC2 halves the FC2 N tile count.
+TILE_RTX_MIXED = (64, 128, 64, 256)
+
+# Tier pairs measured for warp-specialized coordinator exports. Another tier
+# pair of the same geometry is a different kernel cost and stays cooperative.
+WS_TIER_PAIRS = {('glm', (4, 5)), ('glmf', (3, 4)), ('qwen4', (4, 5)),
+                 ('v41', (3, 4)), ('kimik3', (2, 3))}
+
+# The S1/S4 arm as it exports on SM120: 128-wide FC1/256-wide FC2 tiles with
+# dynamic tile claims, 32-row route blocks at m256 and 64 rows above it.
+_WS_S14_M256 = dict(route_block=32, dynamic=True, tile=TILE_RTX_MIXED)
+_WS_S14 = dict(route_block=64, dynamic=True, tile=TILE_RTX_MIXED)
+
+# Coordinator (RTX SM120) warp-specialized prefill cells, keyed by
+# (geometry, width, capacity): the measured options each cell carries, against
+# the export the coordinator shipped before it. See `warp_specialized`.
+COORDINATOR_WS_CELLS: dict[tuple[str, int, int], dict] = {
+    ('glm', 1024, 256): dict(route_block=64, wire=True, stages=3, dynamic=True),
+    ('glm', 1024, 1024): dict(route_block=64),
+    ('glm', 1024, 2752): dict(route_block=64),
+    ('glm', 2048, 256): dict(route_block=64),
+    ('glmf', 1024, 256): dict(route_block=64),
+    ('glmf', 1024, 2752): dict(route_block=64),
+    # Qwen 3.8 Flash Next wins at every served capacity, both RTX splits.
+    ('qwen4', 640, 256): _WS_S14_M256,
+    ('qwen4', 384, 256): _WS_S14_M256,
+    ('qwen4', 256, 256): _WS_S14_M256,
+    ('qwen4', 640, 1024): _WS_S14,
+    ('qwen4', 384, 1024): _WS_S14,
+    ('qwen4', 256, 1024): _WS_S14,
+    ('qwen4', 640, 2752): _WS_S14,
+    ('qwen4', 384, 2752): _WS_S14,
+    ('qwen4', 256, 2752): _WS_S14,
+    ('qwen4', 640, 4096): _WS_S14,
+    ('qwen4', 384, 4096): _WS_S14,
+    ('qwen4', 256, 4096): _WS_S14,
+    # V4.1 EXL3 wins from m1024 up; m256 stays cooperative (0.77-0.84x).
+    ('v41', 2304, 1024): _WS_S14,
+    ('v41', 1152, 1024): _WS_S14,
+    ('v41', 2304, 2752): _WS_S14,
+    ('v41', 1152, 2752): _WS_S14,
+    ('v41', 2304, 4096): _WS_S14,
+    ('v41', 1152, 4096): _WS_S14,
+    # Kimi K3 wins from m1024 up; m256 stays cooperative (0.71-0.74x), and
+    # m2752 is not one of its K64 capacities.
+    ('kimik3', 3072, 1024): _WS_S14,
+    ('kimik3', 1536, 1024): _WS_S14,
+    ('kimik3', 3072, 4096): _WS_S14,
+    ('kimik3', 1536, 4096): _WS_S14,
+}
+
+
+def coordinator_ws_cell(geometry: str, role: str, width: int, capacity: int) -> dict | None:
+    """Measured coordinator warp-specialized options for one export cell."""
+    if role != 'coordinator':
+        return None
+    return COORDINATOR_WS_CELLS.get((geometry, width, capacity))
+
+
+def ws_route_block(geometry: str, role: str, width: int, capacity: int) -> int:
+    """Packed-route M block of a warp-specialized prefill export (see
+    `warp_specialized`); every cell whose measured arm split the block by
+    capacity carries its own row count here."""
+    cell = coordinator_ws_cell(geometry, role, width, capacity)
+    return cell['route_block'] if cell else 64
+
+
 def warp_specialized(geometry: str, role: str, width: int, capacity: int) -> bool:
     """Whether a capacity exports the warp-specialized prefill kernels (b12x
     mixed_trellis_ws, 64-row route blocks): producer warps stream the Trellis
@@ -396,13 +465,39 @@ def warp_specialized(geometry: str, role: str, width: int, capacity: int) -> boo
     stay cooperative, as does width2048 (m256 3120.77 vs 3022.50 us
     inside round spread; m1024/m2752/m4096 cooperative 2817.63/6270.43/
     7966.37 vs WS 2912.93/6357.66/8128.13 us).
+
+    SM120 RTX screen of the Spark S1/S4 arm, 2026-10-25: every EXL3 family
+    that onboards coordinator experts measured at its planner capacities
+    (256/1024/2752/4096; Kimi K64 256/1024/4096), random top-k routes, one
+    layer, median of five interleaved rounds of five graph replays, us
+    (cooperative -> the S1/S4 arm: 32-row route blocks at m256, 64 above,
+    FC1 N128 / FC2 N256, dynamic claims, BF16 input). Qwen 3.8 Flash Next
+    H2560/E512/top10 K4/K5, all faster: TP1 w640 m256 992.1 -> 894.6, m1024
+    1158.0 -> 1151.6, m2752 2151.1 -> 1841.8, m4096 4034.1 -> 3672.7;
+    TP2-r0 w384 663.2 -> 554.7 / 794.3 -> 714.4 / 1438.4 -> 1160.9 / 2097.8
+    -> 1948.3; TP2-r1 w256 507.6 -> 370.3 / 616.1 -> 492.4 / 1167.0 ->
+    854.7 / 1678.2 -> 1286.8. V4.1 EXL3 H5120/E384/top6 K3/K4 wins from
+    m1024: TP1 w2304 9371.2 -> 6976.1, m2752 18563.7 -> 9005.3, m4096
+    25005.7 -> 11996.8; TP2 w1152 5188.2 -> 3431.0 / 12582.5 -> 5465.5 /
+    16159.6 -> 6595.2; m256 stays cooperative (0.770/0.837). Kimi K3
+    H3584/E896/top16 K2/K3 wins from m1024: TP1 w3072 19020.4 -> 13933.2,
+    m4096 59715.2 -> 29736.6; TP2 w1536 9590.4 -> 6859.4, m4096 33523.3 ->
+    17023.7; m256 stays cooperative (0.742/0.738). V4 Pro H7168/E384/top6
+    K2/K3 loses at every capacity (TP1 w3072 0.726/0.909/0.771/0.816, TP2
+    w1536 0.746/0.943/0.792/0.849), so it stays cooperative; the shipped GLM
+    5.3 and GLM 5.3 Flash cells keep their measured exports, which the
+    dynamic arm does not beat (glm TP2 w1024 m256 wire 1874.6 vs dynamic
+    2196.1, glm TP1 w2048 m256 3860.1 vs 4432.4, glmf TP2 w1024 m256 1049.0
+    vs 1223.6). Every arm is bitwise equal to the cooperative oracle, and
+    rows 1..128 of an m256 launch reproduce the batch prefix bit for bit with
+    every tail row poisoned individually (input, wire, weight, expert id).
+    Ties adopt the arm so that one kernel serves several families, per the
+    2026-10-25 rule; a cell with only the cooperative export is one the arm
+    measurably loses.
     Other tier pairs, widths, families and unmeasured capacities stay off.
     """
     if role == 'coordinator':
-        if geometry == 'glm':
-            return ((width == 1024 and capacity in (256, 1024, 2752))
-                    or (width == 2048 and capacity == 256))
-        return geometry == 'glmf' and width == 1024 and capacity in (256, 2752)
+        return coordinator_ws_cell(geometry, role, width, capacity) is not None
     if role != 'spark':
         return False
     if geometry == 'kimik3':
@@ -630,8 +725,10 @@ def wire_input(geometry: str, role: str, width: int, capacity: int, *,
     """
     if compact:
         return False
-    return (geometry == 'glm' and warp_specialized(geometry, role, width, capacity)
-            and (role == 'spark' or (width == 1024 and capacity == 256)))
+    if role == 'coordinator':
+        cell = coordinator_ws_cell(geometry, role, width, capacity)
+        return bool(cell and cell.get('wire'))
+    return geometry == 'glm' and warp_specialized(geometry, role, width, capacity)
 
 
 def ws_input_stages(geometry: str, role: str, width: int, capacity: int, *,
@@ -645,6 +742,9 @@ def ws_input_stages(geometry: str, role: str, width: int, capacity: int, *,
     """
     if compact:
         return None
+    if role == 'coordinator':
+        cell = coordinator_ws_cell(geometry, role, width, capacity)
+        return cell.get('stages') if cell else None
     return 3 if wire_input(geometry, role, width, capacity) else None
 
 
@@ -661,6 +761,9 @@ def ws_dynamic_tiles(geometry: str, role: str, width: int, capacity: int, *,
     """
     if compact:
         return compact_warp_specialized(geometry, role, width, capacity)
+    if role == 'coordinator':
+        cell = coordinator_ws_cell(geometry, role, width, capacity)
+        return bool(cell and cell.get('dynamic'))
     return wire_input(geometry, role, width, capacity)
 
 
@@ -676,6 +779,9 @@ def ws_tile(geometry: str, role: str, width: int, capacity: int, *,
     """
     if compact:
         return compact_ws_tile(geometry, role, width, capacity)
+    if role == 'coordinator':
+        cell = coordinator_ws_cell(geometry, role, width, capacity)
+        return cell.get('tile') if cell else None
     if (geometry != 'glm' or not warp_specialized(geometry, role, width, capacity)
             or width % 256 != 128 or width % 192):
         return None
@@ -1118,14 +1224,22 @@ def build(args: argparse.Namespace) -> None:
                 block = route_block(geometry, capacity)
                 ws = compact_ws or (len(args.bits) == 2 and tile is None
                                     and (args.role != 'coordinator'
-                                         or (geometry, tuple(args.bits)) in (('glm', (4, 5)), ('glmf', (3, 4))))
+                                         or (geometry, tuple(args.bits)) in WS_TIER_PAIRS)
                                     and warp_specialized(geometry, args.role, width, capacity))
                 if ws:
-                    block = compact_block if compact_block is not None else 64
+                    block = (compact_block if compact_block is not None
+                             else ws_route_block(geometry, args.role, width, capacity))
                     if geometry == 'kimik3' or args.role == 'coordinator':
                         # Existing policy-keyed directories contain cooperative exports.
-                        suffix = ('-wire-s3-dynamic' if wire_input(geometry, args.role, width, capacity)
-                                  else '-bf16-static' if args.role == 'coordinator' else '')
+                        # The input format and claim mode are part of the compiled
+                        # program, so they name its cache directory.
+                        if wire_input(geometry, args.role, width, capacity):
+                            suffix = '-wire-s3-dynamic'
+                        elif args.role == 'coordinator':
+                            dynamic = ws_dynamic_tiles(geometry, args.role, width, capacity)
+                            suffix = '-bf16-dynamic' if dynamic else '-bf16-static'
+                        else:
+                            suffix = ''
                         profile_dir = profile_dir.with_name(f'{profile_dir.name}+ws-m{block}{suffix}')
                         raw = profile_dir / f'm{capacity}'
                 if block != 8:
