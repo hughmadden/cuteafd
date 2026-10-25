@@ -748,7 +748,15 @@ printf '%s\n' "$MODEL_ID" "$MODEL_REVISION" "$EXPERT_FORMAT" "$SPARKINFER_EXL3" 
 
     def test_invalid_direct_overrides_fail_before_external_checks(self) -> None:
         with tempfile.TemporaryDirectory() as home:
-            env = {**os.environ, "HOME": home, "PATH": "/usr/bin:/bin"}
+            env = {**os.environ, "HOME": home, "PATH": "/usr/bin:/bin", "HF_HOME": f"{home}/hf"}
+            env.pop("CUTEAFD_NAMESPACE_ROOT", None)
+            # The checkpoint the default configuration names: family detection reads its config.json.
+            values = dict(line.split("=", 1) for line in (ROOT / "cuteafd.config").read_text().splitlines()
+                          if line.startswith(("MODEL_ID=", "MODEL_REVISION=")))
+            snapshot = (Path(home) / "hf/hub" / f"models--{values['MODEL_ID'].replace('/', '--')}" / "snapshots"
+                        / values["MODEL_REVISION"])
+            snapshot.mkdir(parents=True)
+            (snapshot / "config.json").write_text('{"model_type": "deepseek_v41"}')
             for args, message in (
                 (["--set", "CONCURRENCY=17"], "CONCURRENCY must be in 1..16"),
                 (["--set", "PREFIX_CACHE_ENTRIES=129"], "PREFIX_CACHE_ENTRIES must be in 0..128"),
