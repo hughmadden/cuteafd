@@ -149,6 +149,7 @@ serving re-admits measured free memory.
 | --- | --- | --- |
 | 2026-10-23 | Planner family, tensor contract, cache layout | — |
 | 2026-10-23 | Re-pinned to `54e4e69`: the release rewrote its history (README/docs only; every weight, config, tokenizer and template blob is identical to `9e7ebac`) | — |
+| 2026-10-25 | DFlash2 is the default speculator: RadixArk/Minimax-M3.1-Flash-Dflash2 (not distributed) on the shared drafter, E4M3 GEMMs and FP8 rings, its drafts priced by the shared generic selector prior; a selector drafter keeps its rows until the post-draft selection; drafter rings default to the requests that can draft together (32 at the shipped shapes). Release smoke at 2, 3 and 4 Sparks, full profiles with the speculator off and DFlash2. | <a href="../../benchmarks/minimax_m3/2026-10-25-smoke-minimax-m3-1-flash-1rtx-2spark-rtx5090-dflash2/report.svg"><img src="../../benchmarks/minimax_m3/2026-10-25-smoke-minimax-m3-1-flash-1rtx-2spark-rtx5090-dflash2/card.svg" width="360" alt="MiniMax-M3.1-Flash (nvfp4ct-g16) (5090, 2 Sparks, DFlash2)"></a> <a href="../../benchmarks/minimax_m3/2026-10-25-smoke-minimax-m3-1-flash-1rtx-3spark-rtx5090-dflash2/report.svg"><img src="../../benchmarks/minimax_m3/2026-10-25-smoke-minimax-m3-1-flash-1rtx-3spark-rtx5090-dflash2/card.svg" width="360" alt="MiniMax-M3.1-Flash (nvfp4ct-g16) (5090, 3 Sparks, DFlash2)"></a> <a href="../../benchmarks/minimax_m3/2026-10-25-smoke-minimax-m3-1-flash-1rtx-4spark-rtx5090-dflash2/report.svg"><img src="../../benchmarks/minimax_m3/2026-10-25-smoke-minimax-m3-1-flash-1rtx-4spark-rtx5090-dflash2/card.svg" width="360" alt="MiniMax-M3.1-Flash (nvfp4ct-g16) (5090, 4 Sparks, DFlash2)"></a> <a href="../../benchmarks/minimax_m3/2026-10-25-smoke-minimax-m3-1-flash-1rtx-4spark-rtx5090-off/report.svg"><img src="../../benchmarks/minimax_m3/2026-10-25-smoke-minimax-m3-1-flash-1rtx-4spark-rtx5090-off/card.svg" width="360" alt="MiniMax-M3.1-Flash (nvfp4ct-g16) (5090, 4 Sparks, speculator off)"></a> <a href="../../benchmarks/minimax_m3/2026-10-25-full-minimax-m3-1-flash-1rtx-2spark-rtx5090-off/report.svg"><img src="../../benchmarks/minimax_m3/2026-10-25-full-minimax-m3-1-flash-1rtx-2spark-rtx5090-off/card.svg" width="360" alt="MiniMax-M3.1-Flash (nvfp4ct-g16) (5090, 2 Sparks, full profile, speculator off)"></a> <a href="../../benchmarks/minimax_m3/2026-10-25-full-minimax-m3-1-flash-1rtx-2spark-rtx5090-dflash2/report.svg"><img src="../../benchmarks/minimax_m3/2026-10-25-full-minimax-m3-1-flash-1rtx-2spark-rtx5090-dflash2/card.svg" width="360" alt="MiniMax-M3.1-Flash (nvfp4ct-g16) (5090, 2 Sparks, full profile, DFlash2)"></a> |
 
 ## Vision
 
@@ -187,11 +188,12 @@ every temporal pair its own image delimiters and timestamp.
 | 8-frame segment 504x644 | 1,656 | 94.9 | 0.090 / 0.074 |
 | 8-frame segment 896x896 | 4,096 | 377.5 | — |
 
-Served at TP2 (two Sparks; RTX 5090 coordinator, FP8 KV, 4096 prefill
-rows, 16 sequences), the resident RTX tower takes 2.57 GB (its 2.50 GB ledger
-and module): at 1M context the largest admitted pool drops from 189,568 to
-152,512 tokens (-37,056), which is what the default serves, and the
-reference's 65,536-token pool fits either way.
+Served at the shipped shape (RTX 5090 coordinator at 31 GiB, 64 sequences, two
+4096-row prefill lanes, 1M context, FP8 KV; the 2026-10-25 reports), the
+resident RTX tower takes 2.57 GB (its 2.50 GB ledger and module), about 37,000
+pool tokens: 169,600 -> 132,608 with the speculator off and 115,840 -> 78,784
+with DFlash2 and its 32 rings, at 2, 3 and 4 Sparks alike. The reference's
+65,536-token pool fits either way.
 
 A Spark-hosted tower does not fit at TP2. It needs 3.57 GB per rank
 (weights, scratch, 1 GiB guard) beside 117.44 GB of experts, rings and
