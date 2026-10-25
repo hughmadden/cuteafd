@@ -30,9 +30,10 @@ def synthetic(tmp_path, requests=16, blocks=60, first_id=5):
             probability = np.clip(1 / (1 + np.exp(-1.5 * confidence + rng.normal(0, 0.3, 7))), 0.02, 1.0)
             features = [[float(abs(c) + 0.1), float(p), float(np.clip(1.5 - c, 0, 2.7)), float(rng.integers(0, 3))]
                         for c, p in zip(confidence, probability)]
+            x = np.asarray([replay.calibrate.transform(0.6, i + 1, f) for i, f in enumerate(features)])
             rows.append(dict(type="draft_confidence", key=KEY, request=first_id + request, history=[0.6] * 7,
-                             features=features, prior=[0.5] * 7, proposed=7, accepted=accepted,
-                             observed=min(7, accepted + 1)))
+                             features=features, prior=replay.logistic(x, replay.GENERIC).tolist(), proposed=7,
+                             accepted=accepted, observed=min(7, accepted + 1)))
     # A non-fixed record and a per-cycle row are ignored.
     rows.append(dict(rows=8, seqs=1))
     rows.append(dict(rows[0], proposed=3, accepted=1, observed=2))
@@ -73,6 +74,7 @@ def test_replay_prices_rules_and_cross_validated_priors_per_class(tmp_path):
     assert "960 fixed-K7 blocks from 16 of 16 requests" in result.stdout
     data = json.loads(out.read_text())
     table, quality = data["table"], data["quality"]
+    assert data["recorded_prior_difference"] < 1e-12
     assert set(table) >= {"all", "easy", "hard", "easy/enabled", "hard/disabled"}
     for rules in table.values():
         assert rules["ceiling"]["tok_s"] >= max(row["tok_s"] for row in rules.values()) - 1e-9
