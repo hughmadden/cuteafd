@@ -5883,14 +5883,20 @@ cancel/park/retry, with exact state restoration and no cross-model cache hits.
 Load the published alternate weights snapshot from its own metadata; the staged site
 extract is a cross-check, not the source contract.
 
-Performance acceptance requires beating the best comparable four-Spark
-full-GLM base configuration on Romeo. Warmed C1 code decode is the primary
-bar, with C16 aggregate throughput and 8K prefill also checked for regressions.
-Keep the base snapshot, drafter, workload, context and numerical policy fixed;
-report both base and alternate-layer traffic and thermal/readiness/headroom
-conditions. Published raptor results are historical references, not a
-hardware-matched baseline for Romeo's Max-Q card. An implementation that only
-builds or passes correctness is not complete under this acceptance criterion.
+Performance acceptance requires measured six-Spark candidate speeds above
+the best reported four-Spark full-GLM baseline. Per the user's update on
+2026-10-25, use the existing published speeds and do not rerun four-Spark
+baseline or control benchmark recipes. Warmed C1 code decode is the primary
+bar, with C16 aggregate throughput and 8K prefill also reported. Keep checkpoint,
+drafter and metric identities visible; report both base and alternate-layer
+traffic with thermal/readiness/headroom conditions. Historical reports from
+raptor are a reference, not a matched A/B against Romeo's Max-Q card. Any
+remaining layer-absent launch is for decode correctness only; do not attach
+another comparison benchmark sweep to it. An implementation that only builds
+or passes correctness is not complete under this acceptance criterion.
+Reuse the basic speed cards already collected by the live candidate checks
+for both public IDs; do not add another six-Spark base performance launch
+when those measurements are available.
 
 Target the staged EXL3-K4 base plus the alternate weights overlay, with `shared-only`
 explicit in the candidate configuration. Keep DFlash2 available and test its
@@ -5968,11 +5974,12 @@ base prefill/decode golden with variants absent versus configured and unused;
 shared-only component checks against published tensors within the existing
 quantization-floor tolerances; mixed base/variant graph replay; exact prompt
 and turn prefix restores with cross-variant misses; and DFlash2 verification,
-quality/tool-use and behavior smoke. Only then run the warmed C1/C16 and
-8K-prefill comparisons, recording readiness, headroom and thermal windows.
-Use the same checkpoint, draft and workload settings across arms and current
-work/p0 for the shared-path comparison. Hardware leases, preflight and cleanup
-follow AGENTS.md. Stop owned test services when finished.
+quality/tool-use and behavior smoke. Compare the candidate's collected warmed
+C1/C16 and 8K-prefill measurements with the existing reported four-Spark
+speeds, recording readiness, headroom and thermal windows. The user's later
+instruction waives new baseline/control benchmark recipes; it does not waive
+the correctness gates. Hardware leases, preflight and cleanup follow
+AGENTS.md. Stop owned test services when finished.
 
 Reuse the existing `spec_lossless_set` benchmark panel for cold DFlash2-on versus
 drafts-off token and row comparisons, and `prefix_cache` for retained turns.
