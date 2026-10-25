@@ -589,7 +589,7 @@ def test_v4_candidate_config_contract(name: str, tmp_path: Path) -> None:
     if name.startswith("glm53"):
         assert values["EXLR8_MANIFEST"] == "up1"
         assert values["MODEL_ID"] == "kindlingai/glm-5.3-exlr8-k2-k3-k4"
-        assert values["RTX_EXPERT_LAYERS"] == "0"
+        assert "RTX_EXPERT_LAYERS" not in values
         assert values["SPARK_COUNT"] == ("4" if "-min" in name else "6")
         assert values["ATTENTION_PLACEMENT"] == ("heads" if "-min" in name else "context")
         # Native-dense launcher integration is owned by #659/#663, not this prep.

@@ -96,7 +96,13 @@ def test_serving_and_glue_export_inventory():
     assert routed["device_count"] is True
     assert routed["serving_variant"] == "k1_k23_coalesced"
     assert not routed.get("shared_expert") and not routed.get("grouped")
-    assert [p[0] for p in inventory("coordinator")] == ["shared_a16_serving", "shared_group"]
+    coordinator = inventory("coordinator")
+    assert [p[0] for p in coordinator] == [
+        "a16_serving", "group", "shared_a16_serving", "shared_group",
+        "a16_grouped", "a8_grouped", "grouped_group", "a16_grouped64"]
+    routed_coordinator = [p for p in coordinator if not p[0].startswith("shared_")]
+    assert [p[:3] for p in routed_coordinator] == [p[:3] for p in spark]
+    assert [p[3]() for p in routed_coordinator] == [p[3]() for p in spark]
     with pytest.raises(ValueError):
         inventory("unknown")
 
@@ -118,6 +124,35 @@ def test_native_worker_times_requests_without_adding_waits():
     assert host.index("execution.run(") < host.index("timing.record(1,") < host.index("cuda_stream_synchronize(")
     assert host.index("cuda_stream_synchronize(") < host.index("timing.publish(")
     assert 'identity.3, "exlr8"' in host
+
+
+def test_local_tp2_input_contract_is_independent_of_partial_dtype():
+    rtx = ROOT / "rust/crates/cuteafd-daemon/src/shared/experts/rtx"
+    native = (rtx / "exlr8.rs").read_text()
+    assert "fn partial(&self) -> PartialDtype { PartialDtype::Bf16 }" in native
+    assert "fn uses_fp8_input(&self) -> bool { true }" in native
+    trait = rtx.with_suffix(".rs").read_text()
+    assert "fn uses_fp8_input(&self) -> bool;" in trait
+    pair = (rtx / "pair.rs").read_text()
+    assert "backend.uses_fp8_input() == ranks[0].uses_fp8_input()" in pair
+    glm = ROOT / "rust/crates/cuteafd-daemon/src/families/glm5"
+    tp2 = (glm / "engine/tp2.rs").read_text()
+    assert tp2.count("if pair.uses_fp8_input()") == 2
+    assert "self.ffn(" not in tp2 and "self.ffn_on(" not in tp2
+    assert "self.shared_on(rank, pair.layers[0]" in tp2
+    assert "self.shared_on(0, layer" in tp2
+    layers = (glm / "engine/layers.rs").read_text()
+    assert "e.shared_on(0, index" in layers
+    assert "e.shared_on(1, index" in layers
+
+
+def test_native_layer_remote_fixture_matches_serving_two_plane_norm():
+    golden = (ROOT / "rust/crates/cuteafd-daemon/src/families/glm5/engine/exlr8/golden.rs").read_text()
+    fixture = golden.split("fn native_layer3_same_quant()", 1)[1].split("fn native_prefill_lanes_byte_exact()", 1)[0]
+    assert "peer_add_bf16" not in fixture  # The native helper rejects aliased output.
+    assert '(engine.recv(0, slot(3, true, 0))?, 2)' in fixture
+    assert '("delta1", second)' in fixture
+    assert 'Scalar::I32(deltas)' in fixture
 
 
 def test_no_changes_to_existing_export_builders():

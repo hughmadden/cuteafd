@@ -7,6 +7,7 @@ use anyhow::Result;
 
 pub(crate) enum Tp2Weights<'a> {
     Exl3([Exl3Tp2Weights<'a>; 2]),
+    Exlr8([super::exlr8::Exlr8Tp2Weights<'a>; 2]),
     /// FP8/NVFP4 halves keep their existing owner: its executor holds no
     /// engine, pool or transport state.
     Fp8([Fp8MoeTp2<'a>; 2]),
@@ -19,6 +20,8 @@ impl<'a> Tp2Weights<'a> {
                 let pair: [Exl3Tp2<'a>; 2] = [left.execution()?, right.execution()?];
                 pair.map(|rank| Box::new(rank) as Box<dyn RtxExpertLayer>)
             }
+            Self::Exlr8([left, right]) => [left.execution()?, right.execution()?]
+                .map(|rank| Box::new(rank) as Box<dyn RtxExpertLayer>),
             Self::Fp8(pair) => pair.map(|rank| Box::new(rank) as Box<dyn RtxExpertLayer>),
         })
     }

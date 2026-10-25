@@ -166,11 +166,25 @@ impl<'a> GlmLoader<'a> {
     /// Replicate only admitted local routers; their bytes are charged to the TP2 expert arena.
     pub(crate) fn peer_routers(&self, layers: &mut [GlmLayer<'a>], range: std::ops::Range<usize>) -> Result<()> {
         let peer = *self.peers.first().context("TP2 router replica needs peer")?;
+        let native = (self.catalog.format() == cuteafd_loader::plan::checkpoint::CheckpointFormat::Exlr8)
+            .then(|| cuteafd_loader::plan::exlr8::dense::DenseRecord::inventory(self.catalog.snapshot())).transpose()?;
         for index in range {
             for (operand, suffix) in [("gate", "weight"), ("gate.bias", "e_score_correction_bias")] {
                 let allocation = crate::shared::peer_split::on_device(self.library, peer.device, self.device, || {
                     let _scope = cuteafd_ffi::memory_ledger::scope("experts/TP2 router replica");
-                    self.one(&format!("model.layers.{index}.mlp.gate.{suffix}"))
+                    let name = format!("model.layers.{index}.mlp.gate.{suffix}");
+                    if let Some(records) = &native {
+                        let record = records.iter().find(|record| record.tensor == name)
+                            .with_context(|| format!("EXLR8 local router missing {name}"))?;
+                        ensure!(record.components.len() == 1, "EXLR8 router must be one native tensor");
+                        let source = &record.components[0].source;
+                        let mut bytes = vec![0u8; source.bytes];
+                        crate::shared::memory::load_timing::read(bytes.len(), || std::fs::File::open(&source.path)?
+                            .read_exact_at(&mut bytes, source.offset))?;
+                        let allocation = DeviceAllocation::new(self.library, bytes.len().max(256))?;
+                        self.library.copy_h2d(allocation.buffer, &bytes)?;
+                        Ok(allocation)
+                    } else { self.one(&name) }
                 })?;
                 layers[index].operands.insert(operand, allocation);
             }

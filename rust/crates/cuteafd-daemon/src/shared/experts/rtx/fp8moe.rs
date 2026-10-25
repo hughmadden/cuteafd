@@ -217,6 +217,7 @@ impl<'a> Fp8MoeTp2<'a> {
 impl RtxExpertLayer for Fp8MoeTp2<'_> {
     fn shard(&self) -> RtxShard { RtxShard::Tp2 { rank: self.rank } }
     fn partial(&self) -> PartialDtype { PartialDtype::Bf16 }
+    fn uses_fp8_input(&self) -> bool { false }
     fn layers(&self) -> &[usize] { &self.layers }
     fn device(&self) -> i32 { self.device.id }
     fn workspace_bytes(&self) -> usize { self.workspace_bytes }

@@ -10,6 +10,39 @@ fn invalid(message: impl Into<String>) -> ManifestError {
     ManifestError(message.into())
 }
 
+/// Compact compute and ingress ABIs have a fixed route-slot stride.
+pub const COMPACT_GROUP_ROWS: usize = 16;
+
+/// Read the route-slot stride from the named export ABI, never a missing-field default.
+pub fn group_rows(spec: &ProgramSpec) -> Result<usize, ManifestError> {
+    let (abi, capacity, grouped) = match spec.name.as_str() {
+        "exlr8_a16_decode" | "exlr8_a16_serving" | "exlr8_shared_a16_serving" => (3, 64, false),
+        "exlr8_a16_grouped64" => (3, 64, true),
+        "exlr8_a16_grouped" | "exlr8_a8_grouped" => (3, 4096, true),
+        "exlr8_group" | "exlr8_shared_group" => (2, 64, false),
+        "exlr8_grouped_group" => (2, 4096, true),
+        _ => return Err(invalid("unknown grouping ABI kind")),
+    };
+    if spec.geometry["abi_version"].as_u64() != Some(abi)
+        || spec.geometry["max_rows"].as_u64() != Some(capacity)
+        || u64::from(spec.capacity_rows) != capacity
+    {
+        return Err(invalid("grouping ABI version or capacity mismatch"));
+    }
+    if !grouped {
+        if spec.geometry.get("group_rows").is_some_and(|r| r.as_u64() != Some(COMPACT_GROUP_ROWS as u64)) {
+            return Err(invalid("compact ABI requires its fixed group row stride"));
+        }
+        return Ok(COMPACT_GROUP_ROWS);
+    }
+    let rows = spec.geometry["group_rows"].as_u64()
+        .ok_or_else(|| invalid("grouped ABI requires explicit geometry.group_rows"))?;
+    if !matches!(rows, 16 | 32 | 64) || (capacity == 64 && rows != COMPACT_GROUP_ROWS as u64) {
+        return Err(invalid("grouped row tile must be 16, 32 or 64 (16 when decoding)"));
+    }
+    Ok(rows as usize)
+}
+
 pub fn validate(spec: &ProgramSpec) -> Result<(), ManifestError> {
     let field = |name: &str| {
         spec.geometry[name]
@@ -49,18 +82,7 @@ pub fn validate(spec: &ProgramSpec) -> Result<(), ManifestError> {
         return Err(invalid("serving_variant applies to the routed serving instance"));
     }
     let max_rows = if grouped && !grouped_decode { 4096 } else { 64 };
-    let group_rows = if grouped {
-        let rows = field("group_rows")?;
-        if !matches!(rows, 16 | 32 | 64) || (grouped_decode && rows != 16) {
-            return Err(invalid("grouped row tile must be 16, 32 or 64 (16 when decoding)"));
-        }
-        rows
-    } else {
-        if spec.geometry.get("group_rows").is_some_and(|r| r.as_u64() != Some(16)) {
-            return Err(invalid("decode requires 16-row groups"));
-        }
-        16
-    };
+    let group_rows = group_rows(spec)? as u64;
     if (!serving && spec.name != "exlr8_a16_decode")
         || field("abi_version")? != 3
         || field("max_rows")? != max_rows
@@ -160,7 +182,7 @@ pub fn validate_entry(spec: &ProgramSpec, entry: &serde_json::Value) -> Result<(
     let t = spec.geometry["top_k"].as_u64().unwrap();
     let g = spec.geometry["max_groups"].as_u64().unwrap();
     let s = h.div_ceil(1024);
-    let r = spec.geometry["group_rows"].as_u64().unwrap_or(16);
+    let r = group_rows(spec)? as u64;
     let mut shapes = vec![
         format!("[rows,{h}]"),
         format!("[E,{u},3,3]"),
@@ -256,11 +278,7 @@ fn validate_glue(spec: &ProgramSpec, entry: &serde_json::Value) -> Result<(), Ma
             let h = field("hidden")?;
             let shared = spec.name == "exlr8_shared_group";
             let grouped = spec.name == "exlr8_grouped_group";
-            let r = if grouped { field("group_rows")? } else { 16 };
-            if (grouped && !matches!(r, 16 | 32 | 64))
-                || (!grouped && spec.geometry.get("group_rows").is_some_and(|r| r.as_u64() != Some(16))) {
-                return Err(invalid("grouping row tile"));
-            }
+            let r = group_rows(spec)? as u64;
             let (format, dtype, row, row_bytes) = if shared {
                 ("bf16", "bfloat16", h, h * 2)
             } else {
@@ -351,6 +369,39 @@ mod tests {
             ]),
         }
     }
+    #[test]
+    fn grouping_stride_follows_the_export_abi_and_rejects_missing_grouped_metadata() {
+        for (name, abi, capacity, explicit) in [
+            ("exlr8_a16_serving", 3, 64, None),
+            ("exlr8_shared_a16_serving", 3, 64, None),
+            ("exlr8_group", 2, 64, None),
+            ("exlr8_shared_group", 2, 64, None),
+            ("exlr8_a16_grouped64", 3, 64, Some(16)),
+            ("exlr8_a16_grouped", 3, 4096, Some(64)),
+            ("exlr8_a8_grouped", 3, 4096, Some(64)),
+            ("exlr8_grouped_group", 2, 4096, Some(64)),
+        ] {
+            let mut spec = spec();
+            spec.name = name.into();
+            spec.capacity_rows = capacity;
+            spec.geometry["abi_version"] = serde_json::json!(abi);
+            spec.geometry["max_rows"] = serde_json::json!(capacity);
+            if let Some(rows) = explicit { spec.geometry["group_rows"] = serde_json::json!(rows); }
+            assert_eq!(group_rows(&spec).unwrap(), explicit.unwrap_or(COMPACT_GROUP_ROWS), "{name}");
+            spec.geometry.as_object_mut().unwrap().remove("group_rows");
+            assert_eq!(group_rows(&spec).is_err(), explicit.is_some(), "{name}");
+            spec.geometry["group_rows"] = serde_json::json!(32);
+            assert_eq!(group_rows(&spec).is_ok(), capacity == 4096, "{name}");
+            spec.geometry["group_rows"] = serde_json::json!("64");
+            assert!(group_rows(&spec).is_err(), "{name}");
+            spec.geometry["abi_version"] = serde_json::json!(99);
+            assert!(group_rows(&spec).is_err(), "{name}");
+        }
+        let mut unknown = spec();
+        unknown.name = "exlr8_unknown".into();
+        assert!(group_rows(&unknown).is_err());
+    }
+
     fn entry() -> serde_json::Value {
         let shapes = [
             "[rows,6144]",
