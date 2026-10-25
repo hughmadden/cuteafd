@@ -3449,6 +3449,24 @@ def test_family_plan_charges_the_speculator_this_launch_serves(tmp_path, keys, e
     assert f"--speculator {expected}" in plan
 
 
+@pytest.mark.parametrize("addr,url", [
+    ("0.0.0.0:8000", "http://127.0.0.1:8000"), ("[::]:8000", "http://[::1]:8000"), (":::8000", "http://[::1]:8000"),
+    ("10.0.0.9:8123", "http://10.0.0.9:8123"), ("[fd00::9]:8123", "http://[fd00::9]:8123"),
+    ("localhost:9000", "http://localhost:9000")])
+def test_readiness_polls_the_bound_address(addr: str, url: str) -> None:
+    script = f'source {shlex.quote(str(ROOT / "scripts/lib/release-common.sh"))}; release_local_api_url "$1"'
+    result = subprocess.run(["bash", "-c", script, "_", addr], capture_output=True, text=True, timeout=30)
+    assert result.returncode == 0 and result.stdout == url, result.stderr
+
+
+def test_v41_polls_a_lan_bound_api_where_it_listens(tmp_path: Path) -> None:
+    result = _family_launch_result(tmp_path, {"model_type": "deepseek_v41"}, "deepseek-ai/DeepSeek-V4.1-Flash",
+        "MODEL_REVISION=\nSPECULATOR=off\nVISION=off\nRTX_GPUS=1\nRTX_EXPERT_LAYERS=0\nSPARK_COUNT=2\n"
+        "SPARK_1_HOST=h1\nSPARK_1_LANE_A=10.0.0.2\nADDR=10.0.0.9:8000\n")
+    assert result.returncode == 0, result.stderr
+    assert "CUTEAFD native API is ready at http://10.0.0.9:8000/v1/" in result.stdout
+
+
 @pytest.mark.parametrize("value,enabled", [("dspark", True), ("off", False)])
 def test_v41_uses_canonical_speculator(tmp_path: Path, value: str, enabled: bool) -> None:
     result = _family_launch_result(tmp_path, {"model_type": "deepseek_v41"},

@@ -102,6 +102,14 @@ def test_minimax_refuses_unsupported_launch(tmp_path, keys, diagnostic):
     assert "docker run -d" not in result.stderr
 
 
+def test_minimax_polls_a_lan_bound_api_where_it_listens(tmp_path):
+    # A server bound to one LAN address never answers on loopback: readiness polls that address.
+    result = _launch(tmp_path, "ADDR=10.0.0.9:8123\n")
+    assert result.returncode == 0, result.stderr
+    assert _flag(_line(result, "serve-minimax --snapshot"), "--listen") == "10.0.0.9:8123"
+    assert "API ready at http://10.0.0.9:8123/v1/" in result.stdout
+
+
 def test_minimax_refuses_push_loading(tmp_path):
     result = _launch(tmp_path, extra_env={"CUTEAFD_PUSH_SOCKET": "enabled"})
     assert result.returncode != 0
