@@ -32,13 +32,23 @@ def test_kimi_gate_zero_scores_and_low_id_ties():
     np.testing.assert_array_equal(weights, 0)
 
 
-def test_existing_kernel_definitions_are_unchanged():
-    # Pin the original kernel bodies without depending on Git history in a source archive.
+def test_existing_selector_definitions_are_unchanged():
+    # Pin retained selectors; V4.1 score projection now belongs to the AOT router.
     source = (ROOT / "native/shared/cuda/expert_router.cu").read_text()
-    existing = source[source.index("__global__ void score_kernel"):
+    existing = source[source.index("// Top-k with warp-shuffle argmax rounds."):
                       source.index("// Wide sigmoid/sqrtsoftplus routing")]
     assert hashlib.sha256(existing.encode()).hexdigest() == (
-        "bcc1c81b94e131be8b640c248d1e31fb5dda48869ca7a9fc7d343994efb9b4f1")
+        "14669d34f6d106950fe3f16036faee295e7f33b23c2ad49d138f888e2e1d3a74")
+
+
+def test_v41_projection_uses_aot_without_native_score_fallback():
+    source = (ROOT / "native/shared/cuda/expert_router.cu").read_text()
+    router = source[source.index('extern "C" int32_t cuteafd_v41_router('):
+                    source.index('extern "C" int32_t cuteafd_v41_router_select_logits(')]
+    assert "cuteafd_v41_router_scores_aot(hidden,weight,scores,rows,experts,stream)" in router
+    assert "return cudaErrorNotSupported;" in router
+    for obsolete in ("score_kernel", "score_rows_kernel", "kScoreRowsMax", "MIN_ROWS"):
+        assert obsolete not in source
 
 
 def test_native_wide_dispatch_and_reducer_width():
