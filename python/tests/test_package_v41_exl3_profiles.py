@@ -979,6 +979,37 @@ class PackageProfileTests(unittest.TestCase):
                     self.assertNotIn('warp_specialized', call.kwargs)
                     self.assertNotIn('+ws-', str(call.args[0]))
 
+    def test_kimi_coordinator_prefill_policy(self):
+        for width in (1536, 3072):
+            self.assertEqual([package.warp_specialized('kimik3', 'coordinator', width, c)
+                              for c in (1, 80, 256, 1024, 4096)],
+                             [False, False, False, False, True])
+        self.assertEqual([package.route_block('kimik3', c) for c in (1, 80, 256, 1024, 4096)],
+                         [8, 8, 8, 64, 8])
+        self.assertEqual([package.route_block('kimik3', c, 'spark') for c in (1, 80, 256, 1024, 4096)],
+                         [8, 8, 8, 8, 8])
+        self.assertEqual([package.token_major_rotation('kimik3', c) for c in (1, 80, 256, 1024, 4096)],
+                         [False, False, False, True, False])
+        self.assertEqual([package.token_major_rotation('kimik3', c, 'spark') for c in (1, 80, 256, 1024, 4096)],
+                         [False, False, False, False, False])
+        for bits in ((2, 3), (3, 4)):
+            with self.subTest(bits=bits), tempfile.TemporaryDirectory() as temporary:
+                _, _, calls, _ = self.build_fixture(
+                    Path(temporary), 'coordinator', bits, geometry='kimik3',
+                    capacities=(80, 256, 1024, 4096))
+                for call in calls:
+                    capacity = call.args[3]
+                    ws = bits == (2, 3) and capacity == 4096
+                    self.assertEqual(call.kwargs.get('warp_specialized', False), ws)
+                    self.assertEqual('+ws-m64-bf16-dynamic/' in str(call.args[0]), ws)
+                    self.assertEqual(call.kwargs.get('route_block', 8),
+                                     64 if capacity == 1024 or ws else 8)
+                    self.assertEqual(call.kwargs.get('token_major_rotation', False),
+                                     capacity == 1024)
+                    self.assertEqual(call.kwargs.get('ws_dynamic_tiles', False), ws)
+                    if ws:
+                        self.assertEqual(call.kwargs['tile'], package.TILE_RTX_MIXED)
+
     def test_decode_capacities_ship_the_canonical_tile(self):
         """A decode capacity the B12x planner widens is pinned to m1's tile (#309).
 

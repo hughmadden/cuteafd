@@ -26,8 +26,9 @@ class GlmExl3PackageTest(unittest.TestCase):
         self.assertEqual(spark["tp6-width512"],
                          (512, 896, 16, "bf16", [f"tp6-rank{i}" for i in range(6)]))
         coordinator = {p[0]: p[1:] for p in tool.profiles_for_role("coordinator", "kimik3")}
-        self.assertEqual(set(coordinator), {"rtx-tp1"})
+        self.assertEqual(set(coordinator), {"rtx-tp1", "rtx-tp2"})
         self.assertEqual(coordinator["rtx-tp1"], (3072, 896, 16, "fp32", ["rtx-tp1"]))
+        self.assertEqual(coordinator["rtx-tp2"], (1536, 896, 16, "fp32", ["rtx-tp2"]))
         for geometry in set(tool.GEOMETRIES) - {"kimik3"}:
             self.assertEqual(tool.activation(geometry), "silu")
 
@@ -39,10 +40,14 @@ class GlmExl3PackageTest(unittest.TestCase):
             with self.assertRaises(ValueError):
                 tool.package_capacities('kimik3', invalid)
         for capacity in (1, 80, 256, 1024, 4096):
-            self.assertEqual(tool.route_block('kimik3', capacity), 8)
+            self.assertEqual(tool.route_block('kimik3', capacity), 64 if capacity == 1024 else 8)
+            self.assertEqual(tool.route_block('kimik3', capacity, 'spark'), 8)
+            self.assertEqual(tool.token_major_rotation('kimik3', capacity), capacity == 1024)
+            self.assertFalse(tool.token_major_rotation('kimik3', capacity, 'spark'))
             for width in (512, 3072):
                 self.assertIsNone(tool.decode_tile('kimik3', width, capacity))
-                self.assertFalse(tool.warp_specialized('kimik3', 'spark', width, capacity))
+                self.assertEqual(tool.warp_specialized('kimik3', 'spark', width, capacity),
+                                 width == 512 and capacity >= 1024)
 
     def test_profiles(self):
         coordinator = {p[0]: p[1:] for p in tool.profiles_for_role('coordinator', 'glm')}

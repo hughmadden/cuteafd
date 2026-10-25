@@ -313,7 +313,10 @@ def _export_exl3(extra, output):
                 options["hidden"] = package.GEOMETRIES[geometry][0]
             if package.activation(geometry) != "silu":
                 options["activation"] = package.activation(geometry)
-            block = package.route_block(geometry, rows)
+            role_args = ((role,) if role != "coordinator"
+                         and getattr(getattr(package.route_block, "__code__", None), "co_argcount", 0) >= 3
+                         else ())
+            block = package.route_block(geometry, rows, *role_args)
             # A baseline package that predates the measured-tier gate only has
             # the width/capacity predicate; keep its exports loadable.
             compact_ws = compact and len(bits) == 2 and (
@@ -347,7 +350,7 @@ def _export_exl3(extra, output):
                     options["tile"] = policy_tile
             elif len(bits) == 2 and tile is None and package.fused_input_rotation(geometry, role, width, rows):
                 options["fused_input_rotation"] = True
-            elif len(bits) == 2 and package.token_major_rotation(geometry, rows):
+            elif len(bits) == 2 and package.token_major_rotation(geometry, rows, *role_args):
                 options["token_major_rotation"] = True
             if block != 8:
                 options["route_block"] = block

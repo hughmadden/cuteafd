@@ -283,7 +283,7 @@ def swiglu_limit(geometry: str) -> float | None:
     return SWIGLU_LIMITS.get(geometry, 10.0)
 
 
-def route_block(geometry: str, capacity: int) -> int:
+def route_block(geometry: str, capacity: int, role: str = 'coordinator') -> int:
     """Packed-route M block per capacity: rows of one expert that share a Trellis decode.
 
     V4.1 keeps its qualified 8-row blocks everywhere. DeepSeek V4 Pro Spark prefill
@@ -293,6 +293,11 @@ def route_block(geometry: str, capacity: int) -> int:
     m81..256 stays fastest at 8). At m4096, 64-row blocks skip their empty M16
     fragments (b12x 4d7cb455), so they beat 32 from about 2048 rows up. The coordinator's whole-intermediate rtx-tp1 package
     gains the same way (RTX PRO 6000, width 3072: m4096 74 -> 35 ms, m1024 23 -> 16 ms).
+    Kimi K3 coordinator prefill (H3584, 896 experts, top-16) widens m1024 from
+    8-row blocks to 64-row blocks with token-major rotation (RTX PRO 6000, K2/K3:
+    rtx-tp2 w1536 m1024 9134.7 -> 5150.3 us, rtx-tp1 w3072 m1024 18805.4 ->
+    10596.1 us; m4096 takes its _WS_S14 cell); Spark keeps 8 rows for cooperative
+    capacities.
     """
     # Build-time A/B knob: CUTEAFD_EXL3_ROUTE_BLOCKS=CAPACITY=BLOCK[,...].
     override = dict(item.split('=') for item in os.environ.get('CUTEAFD_EXL3_ROUTE_BLOCKS', '').split(',') if item)
@@ -302,6 +307,8 @@ def route_block(geometry: str, capacity: int) -> int:
         return qwen4_route_block(capacity)
     if geometry in ('glm', 'glmf'):
         return glm_route_block(capacity)
+    if geometry == 'kimik3':
+        return 64 if role == 'coordinator' and capacity == 1024 else 8
     if geometry != 'dsv4p' or capacity <= 256:
         return 8
     return 16 if capacity <= 1024 else 64
@@ -329,15 +336,17 @@ def qwen4_route_block(capacity: int) -> int:
     return 8 if capacity <= 80 else 32
 
 
-def token_major_rotation(geometry: str, capacity: int) -> bool:
+def token_major_rotation(geometry: str, capacity: int, role: str = 'coordinator') -> bool:
     """Whether a capacity rotates each token's input once for all of its routes.
 
     Bit-identical to per-route rotation. It pays where the rotation phase is
-    large (V4 Pro m2048..4096 prefill); at m1024 and below it is neutral.
+    large (V4 Pro m2048..4096 prefill); at m1024 and below it is neutral on Spark.
     """
     if geometry in ('glm', 'glmf', 'qwen4'):
         # GLM top-8 (rtx-tp1): m1024 3910 -> 3830 us, m4096 11790 -> 11470 us.
         return capacity > 256
+    if geometry == 'kimik3':
+        return role == 'coordinator' and capacity == 1024
     return geometry == 'dsv4p' and capacity > 1024
 
 
@@ -411,10 +420,10 @@ COORDINATOR_WS_CELLS: dict[tuple[str, int, int], dict] = {
     ('v41', 1152, 2752): _WS_S14,
     ('v41', 2304, 4096): _WS_S14,
     ('v41', 1152, 4096): _WS_S14,
-    # Kimi K3 wins from m1024 up; m256 stays cooperative (0.71-0.74x), and
-    # m2752 is not one of its K64 capacities.
-    ('kimik3', 3072, 1024): _WS_S14,
-    ('kimik3', 1536, 1024): _WS_S14,
+    # Kimi K3 (H3584/E896/top16 K2/K3): m256 stays cooperative 8-row; m1024
+    # takes cooperative 64-row token-major rotation (5150.3 us on rtx-tp2 w1536
+    # and 10596.1 us on rtx-tp1 w3072 vs _WS_S14 6419.0 / 13262.4 us); m4096
+    # keeps _WS_S14, and m2752 is not one of its K64 capacities.
     ('kimik3', 3072, 4096): _WS_S14,
     ('kimik3', 1536, 4096): _WS_S14,
 }
@@ -480,9 +489,12 @@ def warp_specialized(geometry: str, role: str, width: int, capacity: int) -> boo
     m1024: TP1 w2304 9371.2 -> 6976.1, m2752 18563.7 -> 9005.3, m4096
     25005.7 -> 11996.8; TP2 w1152 5188.2 -> 3431.0 / 12582.5 -> 5465.5 /
     16159.6 -> 6595.2; m256 stays cooperative (0.770/0.837). Kimi K3
-    H3584/E896/top16 K2/K3 wins from m1024: TP1 w3072 19020.4 -> 13933.2,
-    m4096 59715.2 -> 29736.6; TP2 w1536 9590.4 -> 6859.4, m4096 33523.3 ->
-    17023.7; m256 stays cooperative (0.742/0.738). V4 Pro H7168/E384/top6
+    H3584/E896/top16 K2/K3 takes 64-row token-major cooperative rotation at
+    m1024 (rtx-tp2 w1536: 8-row coop 9134.7, _WS_S14 6419.0, 64-row token-major
+    coop 5150.3 us, 1.246x vs _WS_S14; rtx-tp1 w3072: 8-row coop 18805.4,
+    _WS_S14 13262.4, 64-row token-major coop 10596.1 us, 1.252x vs _WS_S14) and
+    keeps _WS_S14 at m4096 (TP1 w3072 59715.2 -> 29736.6, TP2 w1536 33523.3 ->
+    17023.7); m256 stays 8-row cooperative (0.742/0.738). V4 Pro H7168/E384/top6
     K2/K3 loses at every capacity (TP1 w3072 0.726/0.909/0.771/0.816, TP2
     w1536 0.746/0.943/0.792/0.849), so it stays cooperative; the shipped GLM
     5.3 and GLM 5.3 Flash cells keep their measured exports, which the
@@ -1244,7 +1256,7 @@ def build(args: argparse.Namespace) -> None:
                     options['tile'] = tile
                 if geometry != 'v41':
                     options['hidden'] = hidden
-                block = route_block(geometry, capacity)
+                block = route_block(geometry, capacity, args.role)
                 ws = compact_ws or (len(args.bits) == 2 and tile is None
                                     and (args.role != 'coordinator'
                                          or (geometry, tuple(args.bits)) in WS_TIER_PAIRS)
@@ -1284,7 +1296,7 @@ def build(args: argparse.Namespace) -> None:
                             raw = profile_dir / f'm{capacity}'
                 elif len(args.bits) == 2 and tile is None and fused_input_rotation(geometry, args.role, width, capacity):
                     options['fused_input_rotation'] = True
-                elif len(args.bits) == 2 and token_major_rotation(geometry, capacity):
+                elif len(args.bits) == 2 and token_major_rotation(geometry, capacity, args.role):
                     options['token_major_rotation'] = True
                 if (limit := swiglu_limit(geometry)) != 10.0:
                     options['swiglu_limit'] = limit
