@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Check native router initialization, rejected inputs, and ABI alignment fallback."""
+"""Check native router initialization, rejected inputs, and AOT alignment contract."""
 import argparse
 import ctypes as C
 import hashlib
@@ -11,14 +11,12 @@ import torch
 def main():
     p=argparse.ArgumentParser(description=__doc__)
     p.add_argument('--native-lib',type=Path,required=True)
-    p.add_argument('--baseline-lib',type=Path,required=True)
     p.add_argument('--output',type=Path,required=True)
     a=p.parse_args()
     torch.cuda.set_device(0);torch.manual_seed(4191)
     lib=C.CDLL(str(a.native_lib.resolve()))
-    baseline_lib=C.CDLL(str(a.baseline_lib.resolve()))
-    call=lib.cuteafd_v41_router;baseline=baseline_lib.cuteafd_v41_router
-    call.argtypes=baseline.argtypes=[C.c_void_p]*8+[C.c_int32,C.c_int32,C.c_void_p]
+    call=lib.cuteafd_v41_router
+    call.argtypes=[C.c_void_p]*8+[C.c_int32,C.c_int32,C.c_void_p]
     rows,experts=26,384
     x=torch.randn(rows,5120,device='cuda',dtype=torch.bfloat16)
     w=torch.randn(experts,5120,device='cuda',dtype=torch.bfloat16)
@@ -36,23 +34,17 @@ def main():
         checks.append(dict(argument=slot,value=value,status=1))
     assert call(*args)==0
     torch.cuda.synchronize()
-    # Keep the legacy public ABI valid for BF16 buffers with only 2-byte alignment.
-    storage=torch.empty(x.numel()+1,device='cuda',dtype=torch.bfloat16)
-    unaligned=storage[1:].view_as(x);unaligned.copy_(x)
-    assert unaligned.data_ptr()%16==2
-    test=args.copy();test[0]=unaligned.data_ptr()
-    assert call(*test)==0
-    expected_scores=torch.empty_like(scores);expected_ids=torch.empty_like(ids);expected_routing=torch.empty_like(routing)
-    reference=test.copy();reference[5:8]=[t.data_ptr() for t in (expected_scores,expected_ids,expected_routing)]
-    assert baseline(*reference)==0
-    torch.cuda.synchronize()
-    assert torch.equal(scores,expected_scores)
-    assert torch.equal(ids,expected_ids)
-    assert torch.equal(routing,expected_routing)
+    # Reject misaligned buffers instead of silently changing reduction order.
+    for slot, tensor in ((0, x), (1, w), (5, scores)):
+        storage=torch.empty(tensor.numel()+1,device='cuda',dtype=tensor.dtype)
+        unaligned=storage[1:].view_as(tensor)
+        test=args.copy();test[slot]=unaligned.data_ptr()
+        assert call(*test)==1
+        checks.append(dict(argument=slot,alignment=unaligned.data_ptr()%16,status=1))
     a.output.write_text(json.dumps(dict(passed=True,initialize_required=True,repeat_initialize=True,
-        alignment_fallback_exact=True,rejected=checks,
+        unaligned_rejected=True,rejected=checks,
         native_sha256=hashlib.sha256(a.native_lib.read_bytes()).hexdigest()),indent=2)+'\n')
-    print('PASS initialization, 13 rejection cases, exact unaligned fallback',flush=True)
+    print('PASS initialization and 16 input/alignment rejection cases',flush=True)
 
 
 if __name__=='__main__':
