@@ -407,9 +407,10 @@ _WS_S14 = dict(route_block=64, dynamic=True, tile=TILE_RTX_MIXED)
 # the export the coordinator shipped before it. See `warp_specialized`.
 COORDINATOR_WS_CELLS: dict[tuple[str, int, int], dict] = {
     ('glm', 1024, 256): dict(route_block=64, wire=True, stages=3, dynamic=True),
-    ('glm', 1024, 1024): dict(route_block=64),
+    ('glm', 1024, 1024): dict(route_block=64, dynamic=True),
     ('glm', 1024, 2752): dict(route_block=64),
     ('glm', 1024, 2048): dict(route_block=64),
+    ('glm', 1024, 4096): dict(route_block=64, dynamic=True),
     ('glm', 2048, 256): dict(route_block=64, dynamic=True),
     ('glm', 2048, 4096): dict(route_block=64, dynamic=True),
     ('glmf', 1024, 256): dict(route_block=64, dynamic=True),
