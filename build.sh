@@ -328,7 +328,6 @@ spark_export_min_free_gib="${CUTEAFD_RELEASE_SPARK_MIN_FREE_GIB:-100}"
 # release-python-lock:start
 # The release images' Python packages: exactly docker/release-python-lock.json, read
 # from a local hash-checked wheelhouse that reaches docker as a named build context.
-release_python_lock="$repo_root/docker/release-python-lock.json"
 release_wheelhouse="${CUTEAFD_RELEASE_WHEELHOUSE:-}"
 if [[ -n "$release_wheelhouse" ]]; then
   release_validate_path_setting CUTEAFD_RELEASE_WHEELHOUSE "$release_wheelhouse"
@@ -342,7 +341,7 @@ release_verify_wheelhouse() {
   [[ -n "$release_wheelhouse" ]] ||
     release_die "CUTEAFD_RELEASE_WHEELHOUSE must name the wheelhouse for docker/release-python-lock.json (fill it with scripts/build/release-python-lock.py fetch)"
   python3 -I "$repo_root/scripts/build/release-python-lock.py" verify \
-    --lock "$release_python_lock" --wheelhouse "$release_wheelhouse" ||
+    --lock "$repo_root/docker/release-python-lock.json" --wheelhouse "$release_wheelhouse" ||
     release_die "the release wheelhouse $release_wheelhouse does not hold docker/release-python-lock.json"
 }
 # release-python-lock:end
@@ -389,8 +388,6 @@ release_image_distribution_preflight() {
     done
     return 0
   fi
-  ((BASH_VERSINFO[0] > 5 || (BASH_VERSINFO[0] == 5 && BASH_VERSINFO[1] >= 1))) ||
-    release_die "ssh-hub image distribution needs bash 5.1 or newer on $(hostname)"
   mkdir -p "$release_image_hub_dir" ||
     release_die "cannot create image hub directory: $release_image_hub_dir"
   python3 "$repo_root/scripts/build/assert-build-filesystem.py" "$release_image_hub_dir" ||
@@ -445,9 +442,9 @@ release_distribute_spark_image_rdma() {
 }
 
 release_distribute_spark_image_hub() {
-  local archive="$release_image_hub_dir/cuteafd-spark-image-$$.tar" spark_image_quoted host pid
-  local failed=0
-  local -A loading=()
+  local archive="$release_image_hub_dir/cuteafd-spark-image-$$.tar" spark_image_quoted host
+  local failed=0 status start index
+  local -a peers=("${RELEASE_BUILD_HOSTS[@]:1}") wave=() pids=()
   printf -v spark_image_quoted '%q' "$SPARK_EXPERT_DOCKER_INFERENCE"
   [[ ! -e "$archive" && ! -e "$archive.part" ]] ||
     release_die "image hub archive $archive already exists; it belongs to another build"
@@ -458,26 +455,25 @@ release_distribute_spark_image_hub() {
   [[ -s "$archive.part" ]] ||
     { rm -f -- "$archive.part"; release_die "docker image save on $seed_host wrote an empty archive"; }
   mv -- "$archive.part" "$archive"
-  # reap: wait for one load and report its host; nonzero when that load failed.
-  release_image_hub_reap() {
-    local done_pid="" status=0
-    wait -n -p done_pid "${!loading[@]}" || status=$?
-    [[ -n "$done_pid" ]] || release_die "lost track of an image hub load"
-    ((status == 0)) || echo "ssh-hub image load on ${loading[$done_pid]} failed (exit $status)" >&2
-    unset "loading[$done_pid]"
-    return "$status"
-  }
-  echo "== distributing Spark image from hub to ${#RELEASE_BUILD_HOSTS[@]} hosts minus the seed, $release_image_hub_parallel at a time =="
-  for host in "${RELEASE_BUILD_HOSTS[@]:1}"; do
-    while ((${#loading[@]} >= release_image_hub_parallel)); do release_image_hub_reap || failed=1; done
-    (
-      echo "== ssh-hub image load $(hostname) -> $host =="
-      release_ssh "$host" "docker image load" <"$archive"
-      echo "== ssh-hub image load $(hostname) -> $host complete =="
-    ) &
-    loading[$!]="$host"
+  echo "== distributing Spark image from hub to ${#peers[@]} hosts, $release_image_hub_parallel at a time =="
+  # Waves of at most PARALLEL loads; each PID is waited on exactly once.
+  for ((start = 0; start < ${#peers[@]}; start += release_image_hub_parallel)); do
+    wave=("${peers[@]:start:release_image_hub_parallel}")
+    pids=()
+    for host in "${wave[@]}"; do
+      (
+        echo "== ssh-hub image load $(hostname) -> $host =="
+        release_ssh "$host" "docker image load" <"$archive" || exit $?
+        echo "== ssh-hub image load $(hostname) -> $host complete =="
+      ) &
+      pids+=("$!")
+    done
+    for index in "${!pids[@]}"; do
+      status=0
+      wait "${pids[$index]}" || status=$?
+      ((status == 0)) || { echo "ssh-hub image load on ${wave[$index]} failed (exit $status)" >&2; failed=1; }
+    done
   done
-  while ((${#loading[@]})); do release_image_hub_reap || failed=1; done
   rm -f -- "$archive"
   release_image_hub_archive=""
   ((failed == 0)) || release_die "ssh-hub Spark image distribution failed"
