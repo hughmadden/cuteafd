@@ -184,6 +184,10 @@ pub(crate) struct PlanArgs {
     /// Override automatic placement of the untied token embedding.
     #[arg(long, alias = "embed-placement", value_enum)]
     pub(crate) embedding_placement: Option<crate::shared::token_io::EmbedPlacement>,
+    /// Derive and verify weight variants against this snapshot and print only
+    /// their verdicts and table sizes (the serve flag's syntax).
+    #[command(flatten)]
+    pub(crate) variants: crate::shared::variants::VariantArgs,
     /// Hugging Face model id (resolved under HF_HOME) or a snapshot directory.
     pub(crate) model: String,
     #[arg(long)]
@@ -1190,6 +1194,8 @@ pub(crate) struct NativeServeArgs {
     /// Number of replicated Spark expert groups, each holding all 384 experts (opt-in; all-or-none with --spark-tp).
     #[arg(long, requires = "spark_tp", value_parser = clap::value_parser!(u8).range(1..=3))]
     pub spark_ep: Option<u8>,
+    #[command(flatten)]
+    pub variants: crate::shared::variants::VariantArgs,
 }
 
 /// Parse transport geometry; checkpoint admission checks native package coverage.

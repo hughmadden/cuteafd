@@ -300,7 +300,7 @@ impl PipelineKernels for Bindings<'_, '_, '_, '_, '_> {
                     let wave = e.layer_execution.as_ref().context("layer execution")?.waves.borrow_mut()[self.lane]
                         .take().context("missing dispatched Spark wave")?;
                     let ranks = runtime.block_on(e.moe_land(real, link, wave))?;
-                    e.reduce(link.intake.pointers(), w, ranks, real)?;
+                    e.reduce(link.intake.pointers(), w, ranks, real, index)?;
                     link.intake.consumed(e.stream)?;
                     None
                 },
@@ -312,7 +312,7 @@ impl PipelineKernels for Bindings<'_, '_, '_, '_, '_> {
                         .take().context("missing dispatched Spark wave")?;
                     let mut link = link.borrow_mut();
                     let ranks = runtime.block_on(e.moe_land(real, &mut link, wave))?;
-                    e.reduce(link.intake.pointers(), w, ranks, real)?;
+                    e.reduce(link.intake.pointers(), w, ranks, real, index)?;
                     link.intake.consumed(e.stream)?;
                     None
                 }
@@ -320,7 +320,7 @@ impl PipelineKernels for Bindings<'_, '_, '_, '_, '_> {
             },
             Ticket::Complete => None,
         };
-        if let Some((planes, ranks)) = planes { e.reduce(planes, w, ranks, real)?; }
+        if let Some((planes, ranks)) = planes { e.reduce(planes, w, ranks, real, index)?; }
         if !e.tp2_layer(index) {
             let bytes = self.rows() * e.cfg.hidden * 2;
             for rank in 0..2 {

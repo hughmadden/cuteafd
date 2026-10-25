@@ -53,6 +53,8 @@ pub trait Backend: Send + Sync + 'static {
     /// Extra fields for the served model's `/v1/models` entry (the engine's
     /// chat-route record: capabilities, context limits, template provenance).
     fn model_metadata(&self) -> Option<serde_json::Value> { None }
+    /// The `"variant"` object for a weight-variant model id, if `id` names one.
+    fn variant_field(&self, _id: &str) -> Option<serde_json::Value> { None }
 }
 
 /// Rough token estimate (bytes / 4 over the serialized turn) for backends

@@ -526,6 +526,39 @@ fn completed_retained_pages_unblock_admission_while_another_request_is_running()
 }
 
 #[test]
+fn the_same_tokens_in_different_namespaces_never_hit() {
+    let fake = Fake::new(64, 4, 8);
+    let mut cache = cache(&fake, 4, 1 << 20);
+    let prompt = seq(100, 50);
+    let key = |tag| super::namespaced(&prompt, tag).unwrap().into_owned();
+    let admit = |cache: &mut PrefixCache<Shared>, tag, ring| {
+        let admitted = cache.admit(&fake, &key(tag), 64, false,
+            |pages| Placement { pages, ring, len: 0, ring_from: 0 }).unwrap();
+        (admitted.resume, admitted.placement)
+    };
+    // Variant 1 prefills and retains its prompt under its own key.
+    let (resume, mut v1) = admit(&mut cache, 1, 0);
+    assert_eq!(resume, 0);
+    let logits = fake.forward(&mut v1, &prompt).unwrap();
+    cache.capture(&fake, SnapshotKind::Prompt, &key(1), &v1, After::from_logits(&logits, true)).unwrap();
+    assert_eq!(cache.peek(&key(1), false), 50);
+    // Base and variant 2 see nothing, on either tier.
+    assert_eq!((cache.peek(&key(0), false), cache.peek(&key(2), false)), (0, 0));
+    let (resume, base) = admit(&mut cache, 0, 1);
+    assert_eq!(resume, 0, "base must not restore variant state");
+    let (resume, v2) = admit(&mut cache, 2, 2);
+    assert_eq!(resume, 0, "variant 2 must not restore variant 1 state");
+    // Variant 1 itself restores exactly (the forward checks every context row).
+    let (resume, mut again) = admit(&mut cache, 1, 3);
+    assert_eq!(resume, 50);
+    let mut longer = prompt.clone();
+    longer.extend(seq(900, 5));
+    fake.forward(&mut again, &longer).unwrap();
+    for placement in [v1, base, v2, again] { cache.release(&fake, &placement.pages).unwrap(); }
+    cache.clear(&fake).unwrap();
+}
+
+#[test]
 fn prompt_repeat_is_an_exact_hit_with_its_logits_and_no_forward() {
     let fake = Fake::new(64, 4, 8);
     let mut cache = cache(&fake, 4, 0);

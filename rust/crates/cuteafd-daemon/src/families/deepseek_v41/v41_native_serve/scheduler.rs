@@ -29,7 +29,7 @@ pub(crate) fn exercise_distributed_decode<'t, 'd, 'a: 'd>(lib: &'a NativeLibrary
     let mut prefixes = PrefixCache::disabled();
     let image_keys = super::prefix::media_keys(tokens, &[])?;
     let mut request = Active { constraint: None, ticket: console::Ticket::new(id, 0, None), lease,
-        job: NativeRequest { prefix_cache_source: Default::default(), literal_spans: Vec::new(), prompt: String::new(), constraint: None, images: Vec::new(), media: Vec::new(), audio: Vec::new(), max_tokens: 4, sampling: Default::default(), stop_token_ids: Vec::new(), events, usage: None, probe: None },
+        job: NativeRequest { variant: 0, prefix_cache_source: Default::default(), literal_spans: Vec::new(), prompt: String::new(), constraint: None, images: Vec::new(), media: Vec::new(), audio: Vec::new(), max_tokens: 4, sampling: Default::default(), stop_token_ids: Vec::new(), events, usage: None, probe: None },
         decoder: cuteafd_loader::streaming_token_decoder(snapshot, false)?, anchor,
         generated: 0, buffered: 0, finished: false, cacheable: false, failed: false,
         tokens: tokens.to_vec(), image_keys, next_after_commit: None };
