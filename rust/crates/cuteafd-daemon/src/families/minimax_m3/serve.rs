@@ -280,9 +280,12 @@ fn worker(args: &ServeArgs, receive: &mut tokio::sync::mpsc::Receiver<cuteafd_ap
         sequences, rows.min(cuteafd_loader::plan::families::minimax::admission::DECODE_ROWS)));
     let draft_contract=if args.speculator=="dspark" {Some(cuteafd_loader::families::minimax_m3::dspark::DsparkContract::open(&args.snapshot)?)} else {None};
     let draft_layout=draft_contract.as_ref().map(|c|super::dspark::Layout::new(&library,c,rings,chunk)).transpose()?;
-    let dflash=args.draft.as_deref().map(|snapshot| super::dflash::Contract::open(snapshot, args.draft_fp8,
-        args.draft_kv_cache, rings, library.sm_count()?, args.draft_causal, args.draft_selector_score == "fp32"))
-        .transpose()?;
+    let dflash=args.draft.as_deref().map(|snapshot| -> Result<_> {
+        let head = checkpoint.tensors.iter().find(|t| t.meta.name == "language_model.lm_head.weight")
+            .context("MiniMax lm_head header missing")?;
+        super::dflash::Contract::open(snapshot, &head.meta, args.draft_fp8, args.draft_kv_cache, rings,
+            library.sm_count()?, args.draft_causal, args.draft_selector_score == "fp32")
+    }).transpose()?;
     // The drafter's 4 GB checkpoint is read while admission and the target load run.
     let dflash_file=dflash.as_ref().map(|c| crate::shared::speculation::dflash::prefetch(&c.snapshot));
     let (draft_bytes,draft_rings,draft_staging)=match (&draft_layout,&dflash) {

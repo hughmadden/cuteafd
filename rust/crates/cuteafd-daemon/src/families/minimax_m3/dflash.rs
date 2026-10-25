@@ -65,10 +65,14 @@ pub(super) struct Contract {
 
 impl Contract {
     /// The header-checked drafter at `snapshot` for `slots` rings (draft steps of as many
-    /// sequences, at most 32), sized for a GPU of `sms` SMs. `causal` overrides the upstream
+    /// sequences, at most 32), sized for a GPU of `sms` SMs. `head` is the target's
+    /// `language_model.lm_head.weight` header, which the drafter borrows: anything but a BF16
+    /// [200064, 6144] head is refused here, before startup. `causal` overrides the upstream
     /// mask's block causality (a diagnostic A/B; acceptance only, never output).
-    pub fn open(snapshot: &Path, fp8: Option<bool>, kv_cache: Qwen4KvCache, slots: usize, sms: usize,
-        causal: Option<bool>, selector_fp32: bool) -> Result<Self> {
+    #[allow(clippy::too_many_arguments)]
+    pub fn open(snapshot: &Path, head: &cuteafd_loader::SafetensorsTensorMetadata, fp8: Option<bool>,
+        kv_cache: Qwen4KvCache, slots: usize, sms: usize, causal: Option<bool>, selector_fp32: bool) -> Result<Self> {
+        dflash::check_target_head_source(head, HIDDEN, VOCAB)?;
         let config = cuteafd_loader::plan::checkpoint::read_json(&snapshot.join("config.json"))?;
         let representation = GlmDraftRepresentation::from_fp8_option(fp8);
         // The planner's recipe: one memory for both ledgers.
@@ -156,6 +160,24 @@ impl<'a> Dflash<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The borrowed head is checked before the drafter is read: a non-BF16 or misshapen target
+    /// head refuses at startup, where it would otherwise fail the first draft.
+    #[test]
+    fn minimax_dflash_refuses_a_head_it_cannot_borrow_at_contract_open() {
+        let head = |dtype, shape: Vec<usize>| cuteafd_loader::SafetensorsTensorMetadata {
+            name: "language_model.lm_head.weight".into(), dtype, byte_offset: 0,
+            byte_length: shape.iter().product::<usize>() as u64 * 2, shape };
+        let open = |head: &cuteafd_loader::SafetensorsTensorMetadata| Contract::open(Path::new("/nonexistent-draft"),
+            head, None, Qwen4KvCache::Fp8, 8, 170, None, true).unwrap_err().to_string();
+        let fp8 = open(&head(cuteafd_core::DType::F8E4M3, vec![VOCAB, HIDDEN]));
+        assert!(fp8.contains("requires checkpoint BF16"), "{fp8}");
+        let narrow = open(&head(cuteafd_core::DType::Bf16, vec![VOCAB, 4096]));
+        assert!(narrow.contains("expected [200064, 6144]"), "{narrow}");
+        // A borrowable head passes on to the drafter's own files.
+        let fine = open(&head(cuteafd_core::DType::Bf16, vec![VOCAB, HIDDEN]));
+        assert!(!fine.contains("BF16") && !fine.contains("expected ["), "{fine}");
+    }
 
     /// A long chunk taps its last 4096 rows across its lanes, each at its offset in the tail;
     /// a short chunk or a verify step taps every row in place.

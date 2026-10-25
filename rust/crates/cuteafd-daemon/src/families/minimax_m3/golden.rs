@@ -486,9 +486,8 @@ fn draft_diagnostics(args: &GoldenArgs, cfg: &MiniMaxM3Config, checkpoint: &Chec
     let tensor = |name: &str| checkpoint.tensors.iter().find(|t| t.meta.name == name)
         .with_context(|| format!("MiniMax {name} header missing"));
     let (embed, head_tensor) = (tensor(super::weights::EMBEDDING)?, tensor("language_model.lm_head.weight")?);
-    dflash::check_target_head_source(&head_tensor.meta, cfg.hidden, cfg.vocab_size)?;
-    let contract = super::dflash::Contract::open(draft, args.draft_fp8, args.draft_kv_cache, 8, library.sm_count()?,
-        args.draft_causal, args.draft_selector_score == "fp32")?;
+    let contract = super::dflash::Contract::open(draft, &head_tensor.meta, args.draft_fp8, args.draft_kv_cache, 8,
+        library.sm_count()?, args.draft_causal, args.draft_selector_score == "fp32")?;
     let file = dflash::prefetch(draft);
     let stream = Stream::new(device)?;
     let (embedding, ()) = TokenEmbedding::load(&library, EmbedSource::new(&args.snapshot, &embed.shard, &embed.meta,
