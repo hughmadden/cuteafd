@@ -2857,6 +2857,72 @@ def test_spark_admission_inherits_release_readiness_bound(tmp_path: Path) -> Non
     assert "CUTEAFD_SPARK_ADMISSION_TIMEOUT_SECONDS=2400" in launch
 
 
+# A simulated clock for the launcher's readiness loops: each `sleep` advances
+# bash's SECONDS by a minute, and the worker log / coordinator health probes
+# succeed only once the simulated load time is reached.
+SIMULATED_READINESS = r"""
+sleep() { SECONDS=$((SECONDS + 60)); }
+ssh() {
+  if [[ "$*" == *"docker logs"*"worker bootstrap ready"* ]] && ((SECONDS < STUB_WORKER_READY_AT)); then return 1; fi
+  command ssh "$@"
+}
+curl() {
+  if [[ "$*" == */health* ]]; then
+    ((SECONDS >= STUB_COORDINATOR_READY_AT)) || return 22
+    echo "stub-ready-at $SECONDS" >&2
+  fi
+  command curl "$@"
+}
+docker() {
+  if [[ "$1" == ps ]]; then echo running; return 0; fi
+  command docker "$@"
+}
+"""
+
+
+@pytest.mark.parametrize("stage", ["worker", "coordinator"])
+@pytest.mark.parametrize("timeout,ready", [(None, False), ("3600", True)])
+def test_generic_readiness_waits_honor_the_release_readiness_bound(tmp_path: Path, stage: str,
+                                                                  timeout: str | None, ready: bool) -> None:
+    # A Spark-mounted GLM-5.3 base load takes ~21 minutes: past the default
+    # 900 s bound, inside an explicit 3600 s one.
+    bash_env = tmp_path / "clock.sh"
+    bash_env.write_text(SIMULATED_READINESS)
+    load = 21 * 60
+    env = {"BASH_ENV": str(bash_env),
+           "STUB_WORKER_READY_AT": str(load if stage == "worker" else 0),
+           "STUB_COORDINATOR_READY_AT": str(load)}
+    if timeout is not None:
+        env["CUTEAFD_RELEASE_READY_TIMEOUT_SECONDS"] = timeout
+    result = _family_launch_result(tmp_path, SPLIT_CONFIGS["qwen4"], "test/model", "",
+                                  preferred_ranks=1, extra_env=env)
+    if ready or stage == "coordinator":
+        launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-qwen4" in line)
+        assert f"CUTEAFD_SPARK_ADMISSION_TIMEOUT_SECONDS={timeout or 900}" in launch
+    else:
+        assert "cuteafd serve-qwen4" not in result.stderr
+    if ready:
+        assert result.returncode == 0, result.stderr
+        ready_at = int(next(line for line in result.stderr.splitlines()
+                            if line.startswith("stub-ready-at ")).split()[1])
+        assert load <= ready_at < load + 120
+        assert "API ready at" in result.stdout
+    else:
+        assert result.returncode != 0
+        message = "h0 readiness timed out" if stage == "worker" else "coordinator readiness timed out"
+        assert message in result.stderr
+        assert "stub-ready-at" not in result.stderr
+
+
+@pytest.mark.parametrize("value", ["0", "-5", "abc", "1.5", "60s"])
+def test_release_readiness_bound_rejects_invalid_values_before_launch(tmp_path: Path, value: str) -> None:
+    result = _family_launch_result(tmp_path, SPLIT_CONFIGS["qwen4"], "test/model", "", preferred_ranks=1,
+                                  extra_env={"CUTEAFD_RELEASE_READY_TIMEOUT_SECONDS": value})
+    assert result.returncode != 0
+    assert "CUTEAFD_RELEASE_READY_TIMEOUT_SECONDS must be a positive integer" in result.stderr
+    assert "docker " not in result.stderr and "ssh " not in result.stderr
+
+
 def test_qwen_other_formats_skip_the_local_qualification_preflight(tmp_path: Path) -> None:
     result = _family_launch_result(tmp_path, SPLIT_CONFIGS["qwen4"], "test/model",
                                   "", preferred_ranks=1)

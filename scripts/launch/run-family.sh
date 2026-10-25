@@ -45,6 +45,11 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 ((restart_all == 0 || restart == 1)) || release_die "--all requires --restart"
+# One readiness bound for every wait: Spark admission, worker bootstrap and the
+# coordinator API (a mounted GLM-5.3 base load on Sparks takes ~21 minutes).
+ready_timeout="${CUTEAFD_RELEASE_READY_TIMEOUT_SECONDS:-900}"
+[[ "$ready_timeout" =~ ^[1-9][0-9]*$ ]] ||
+  release_die "CUTEAFD_RELEASE_READY_TIMEOUT_SECONDS must be a positive integer number of seconds"
 ((restart == 0 || dry_run == 0)) || release_die "--restart and --dry-run are mutually exclusive"
 [[ -z "$embedding_override" ]] || cfg_overrides[EMBEDDING]="$embedding_override"
 # Overrides are appended to a copy of the file (a later line wins in every
@@ -641,7 +646,7 @@ fi
 shared_env_args=(-e "HF_HOME=$namespace_hf_home" -e "CUTEAFD_SPARK_INTAKE=$intake"
   -e "CUTEAFD_CONSOLE_TEXT=$([[ $console_text == on ]] && echo true || echo false)"
   -e "CUTEAFD_ATTENTION_PLACEMENT=$attention_placement" -e "CUTEAFD_FP8_EXPERT_PREFILL=$fp8_prefill"
-  -e "CUTEAFD_SPARK_ADMISSION_TIMEOUT_SECONDS=${CUTEAFD_RELEASE_READY_TIMEOUT_SECONDS:-900}")
+  -e "CUTEAFD_SPARK_ADMISSION_TIMEOUT_SECONDS=$ready_timeout")
 if [[ $attention_plan_rows != auto ]]; then
   shared_env_args+=(-e "CUTEAFD_ATTENTION_PLAN_ROWS=$attention_plan_rows")
 fi
@@ -1479,7 +1484,7 @@ docker run -d "${RELEASE_SERVING_ARGS[@]}" --name "$coordinator" --restart no "$
   ${profile_wrapper_args[@]+"${profile_wrapper_args[@]}"} \
   -v "$namespace_root:$namespace_root:ro" "$COORDINATOR_DOCKER_INFERENCE" ${profile_wrapper[@]+"${profile_wrapper[@]}"} cuteafd "${args[@]}" >/dev/null
 }
-deadline=$((SECONDS + ${CUTEAFD_RELEASE_READY_TIMEOUT_SECONDS:-900}))
+deadline=$((SECONDS + ready_timeout))
 echo "== starting native Spark experts =="
 pids=()
 for i in "${!hosts[@]}"; do
@@ -3047,7 +3052,7 @@ for ((rank = 0; rank < ranks; rank++)); do
   # A placement worker bootstraps after media admission and waits for the
   # coordinator solve before expert weights load.
   ready_marker='worker bootstrap ready'
-  ready_deadline=$((SECONDS + 900))
+  ready_deadline=$((SECONDS + ready_timeout))
   until ssh "$host" "docker logs cuteafd-spark-expert-$host-$port 2>&1 | grep -q '$ready_marker'"; do
     ((SECONDS < ready_deadline)) || { echo "$host readiness timed out" >&2; exit 1; }
     ssh "$host" "docker ps -q -f name=cuteafd-spark-expert-$host-$port | grep -q ." ||
@@ -3101,7 +3106,7 @@ docker run -d "${RELEASE_SERVING_ARGS[@]}" --name "$coordinator_name" --restart 
   --max-output "$(get MAX_OUTPUT_TOKENS 4096)" "${dspark_args[@]}" \
   "${family_args[@]}" "${draft_args[@]}" "${served_args[@]}" ${variant_args[@]+"${variant_args[@]}"} >/dev/null
 url="http://127.0.0.1:${addr##*:}"
-ready_deadline=$((SECONDS + 900))
+ready_deadline=$((SECONDS + ready_timeout))
 until curl --max-time 5 -sf "$url/health" >/dev/null; do
   if (( SECONDS >= ready_deadline )); then
     echo "coordinator readiness timed out: $(curl --max-time 5 -s "$url/health" || true)" >&2
