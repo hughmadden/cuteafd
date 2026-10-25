@@ -113,7 +113,7 @@ esac
     common = (ROOT / 'scripts/lib/release-common.sh').read_text()
     helper = common[common.index('release_gpu_device_args() {'):common.index('\n}\n', common.index('release_gpu_device_args() {')) + 3]
     cdi = (ROOT / 'scripts/lib/cdi-gpus.sh').read_text()
-    script = 'CUTEAFD_CDI_CHECK=off\n' + cdi + helper + _function('wip_capped_export') + _function('wip_capped_export_on') + f'''
+    script = 'CUTEAFD_CDI_CHECK=off\n' + cdi + helper + _function('wip_capped_export_functions') + _function('wip_capped_export') + _function('wip_capped_export_on') + f'''
 repo_root={str(ROOT)!r} coordinator_container=wipc COORDINATOR_DOCKER_DEV=img
 wip_capped_export docker exec -e CUTEAFD_WIP_DSV4_AOT=ON -e 'CUTEAFD_WIP_EXPERT_FAMILIES=a;b' wipc /x coordinator
 '''
