@@ -186,6 +186,16 @@ impl PageAllocator {
     }
 }
 
+/// One MoE layer of a tapped verify step (real rows only): the norm output the
+/// router and shared expert read, the staged int32 ids then FP32 gate weights
+/// (`rows * topk` each), and the reduced routed + shared delta.
+pub(crate) struct WidthTap {
+    pub layer: usize,
+    pub x: Vec<u8>,
+    pub routes: Vec<u8>,
+    pub delta: Vec<u8>,
+}
+
 struct Workspace<'a> {
     rows: usize,
     h: Dev<'a>,
@@ -349,6 +359,9 @@ pub(crate) struct GlmEngine<'a> {
     /// copying received partials into the pinned staging.
     pub exchange_host: RefCell<[f64; 4]>,
     draft_probe: RefCell<Option<crate::shared::draft::probe::RoundProbe<'a>>>,
+    /// `glm-golden --width-invariance` only: each MoE layer's input rows, staged
+    /// routes and routed+shared output of the steps it verifies.
+    pub(crate) width_taps: RefCell<Option<Vec<WidthTap>>>,
     graphs: RefCell<std::collections::HashMap<GraphKey, GraphExec<'a>>>,
     graphs_warmed: Cell<bool>,
     graphs_warming: Cell<bool>,
@@ -441,7 +454,7 @@ impl<'a> GlmEngine<'a> {
             staging_owner: RefCell::new([None; 2]), context_reuse: Cell::new(false), context_unit: Cell::new(0), prefill_link: RefCell::new(None), prefill_runtime: None,
             attention_plan: cuteafd_core::coordinator_programs::AttentionReductionPlan::new(DECODE_ROWS, None, None)?,
             lanes: RefCell::new(Vec::new()), terminal: Cell::new(crate::shared::peer_split::TerminalState::Active), spark_bf16: false, full_prefill_logits: false, prefill_span_rows: DEFAULT_PREFILL_SPAN_ROWS, skip: None, l2: None, profile: RefCell::new([0.0; 3]),
-            exchange_host: RefCell::new([0.0; 4]), draft_probe: RefCell::new(None),
+            exchange_host: RefCell::new([0.0; 4]), draft_probe: RefCell::new(None), width_taps: RefCell::new(None),
             graphs: RefCell::new(std::collections::HashMap::new()), graphs_warmed: Cell::new(false), graphs_warming: Cell::new(false), graph_misses: Cell::new(0), drafter: None, embedding, prefill_w8a8: true })
     }
 
