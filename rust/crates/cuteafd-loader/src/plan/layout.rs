@@ -1370,6 +1370,22 @@ pub(crate) fn charge_host(report: &mut PlanReport, options: &LayoutOptions, chec
             .context("Qwen host staging overflow")?;
     }
     push(Category::Staging, "staging/tables-and-sync", "row metadata", staging, Basis::Estimated);
+    if family == "qwen4" {
+        let cfg = crate::families::qwen4::Qwen4Config::from_hf(&checkpoint.config)?;
+        if cfg.ple_layers.first().is_some_and(|&layer| layer < spec.layers.len()) {
+            let tensor = checkpoint.tensors.iter().find(|t| t.meta.name.contains("ngram_embedding.shard_"))
+                .context("Qwen mapped PLE layer without table headers")?;
+            ensure!(tensor.meta.shape.len() == 2 && tensor.meta.shape[0] > 0, "Qwen PLE table is not a nonempty matrix");
+            let row_bytes = tensor.meta.byte_length / tensor.meta.shape[0] as u64;
+            let ple_rows = cfg.ple_rows() as u64;
+            let prefill = unit_rows.max(64).checked_mul(ple_rows).context("Qwen PLE prefill rows overflow")?;
+            let decode = 64u64.checked_mul(ple_rows).context("Qwen PLE decode rows overflow")?;
+            let staging = crate::formats::mapped_table::MappedStaging::new(usize::try_from(prefill)?,
+                usize::try_from(report.prefill_waves.unwrap_or(options.prefill_waves))?,
+                usize::try_from(decode)?, usize::try_from(row_bytes)?)?;
+            push(Category::Staging, "staging/mapped-table", "PLE rows and counters", staging.total_bytes as u64, Basis::Formula);
+        }
+    }
     if family == "qwen4" && ranks > 0 && options.prefill_waves > 1 {
         use crate::families::qwen4::{Qwen4Config, StepTableBytes};
         use crate::serving_capacity::qwen_graphs::{qwen_pool_pages, QWEN_UNIT_PAGES};

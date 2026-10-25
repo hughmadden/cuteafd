@@ -174,6 +174,39 @@ fn qwen_prefill_publishes_unit_waves_and_span_before_host_admission() {
 }
 
 #[test]
+fn qwen_mapped_ple_host_staging_matches_runtime_allocations() {
+    use crate::formats::mapped_table::MappedStaging;
+    for (dtype, row_bytes) in [("BF16", 320usize), ("F8_E4M3", 160)] {
+        let mut config = qwen4_config(4);
+        config["text_config"]["ple_layer_ids"] = json!([2]);
+        config["text_config"]["ple_embed_dim"] = json!(2560);
+        let cfg = crate::families::qwen4::Qwen4Config::from_hf(&config).unwrap();
+        let mut tensors = qwen4_coordinator(&config, false);
+        tensors.push(t("model.language_model.layers.1.ple.ple_embedding.ngram_embedding.shard_0.weight", dtype, &[1000, 160]));
+        let dir = snapshot(config, &tensors);
+        let input = PlanInput::open(dir.path()).unwrap();
+        for (gpus, ranks) in [(1, 0), (2, 0), (1, 4)] {
+            for (unit, k) in [(512usize, 1usize), (2048, 2), (4096, 3), (4096, 4)] {
+                if ranks == 0 && k != 1 { continue; }
+                let mut report = input.plan(&sparks(ranks)).unwrap();
+                report.prefill_waves = Some(k as u64);
+                report.prefill_span_rows = Some(65536);
+                let options = layout::LayoutOptions { rtx_bytes: vec![96 << 30; gpus],
+                    prefill_unit_rows: Some(unit as u64), prefill_waves: k as u64,
+                    host_cache_bytes: Some(0), host_memory: Some((128 << 30, 128 << 30)), ..Default::default() };
+                layout::charge_host(&mut report, &options, input.checkpoint(), false).unwrap();
+                let host = report.host_ledger.as_ref().unwrap();
+                let staging = host.items.iter().filter(|item| item.group == "staging/mapped-table").collect::<Vec<_>>();
+                assert_eq!(staging.len(), 1, "a dual-owner engine still has one PLE table");
+                let runtime = MappedStaging::new(unit * cfg.ple_rows(), k, 64 * cfg.ple_rows(), row_bytes).unwrap();
+                assert_eq!(staging[0].bytes as usize, runtime.slot_bytes().sum::<usize>() + runtime.counter_bytes);
+                assert_eq!(staging[0].bytes as usize, (k * unit + 64) * cfg.ple_rows() * row_bytes + (k + 1) * 128);
+            }
+        }
+    }
+}
+
+#[test]
 fn qwen_local_and_dual_publish_whole_step_geometry_without_a_transport() {
     let config = qwen4_config(4);
     let dir = snapshot(config.clone(), &qwen4_coordinator(&config, false));

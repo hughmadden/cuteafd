@@ -41,7 +41,8 @@ pub(crate) struct MappedTableArgs {
     pub prefetch: bool,
 }
 
-const LINE: usize = 64;
+use cuteafd_loader::formats::mapped_table::MappedStaging;
+const LINE: usize = MappedStaging::COUNTER_STRIDE;
 #[derive(Clone, Copy)]
 struct Words { base: usize }
 impl Words {
@@ -171,8 +172,10 @@ impl<'a> MappedTableDevice<'a> {
     pub fn new(library: &'a NativeLibrary, name: &'static str, table: MappedTable, args: &MappedTableArgs,
         prefill_rows: usize, prefill_slots: usize, decode_rows: usize) -> Result<Self> {
         let _scope = cuteafd_ffi::memory_ledger::scope("mapped-table");
-        ensure!(prefill_rows > 0 && decode_rows > 0 && (1..=4).contains(&prefill_slots),
-            "invalid mapped-table staging geometry");
+        let staging = MappedStaging::new(prefill_rows, prefill_slots, decode_rows, table.row_bytes())?;
+        // Admission precedes pinned allocation; the later engine admission
+        // sees these resident bytes and charges only its remaining consumers.
+        super::memory::budget::admit_host_memory(0, &[("staging/mapped-table", staging.total_bytes as u64)], 0, 0)?;
         let device = library.cuda_get_device()?;
         table.name_stats(name);
         let max_rows = prefill_rows.max(decode_rows);
@@ -180,13 +183,12 @@ impl<'a> MappedTableDevice<'a> {
             Some(TablePrefetcher::new(&format!("{name}-prefetch"), 16, max_rows, 2 * max_rows)?)
         } else { None };
         let mut slots = Vec::new();
-        for rows in std::iter::repeat_n(prefill_rows, prefill_slots).chain(std::iter::once(decode_rows)) {
-            let bytes = rows.checked_mul(table.row_bytes()).context("mapped-table staging overflow")?;
+        for bytes in staging.slot_bytes() {
             let host = HostAllocation::new(library, bytes)?;
             let alias = library.cuda_host_buffer_device_alias(host.buffer)?;
             slots.push(RingSlot { host, alias, event: library.cuda_event_create_ordering()?, pending: false });
         }
-        let words_owner = HostAllocation::new(library, slots.len() * 2 * LINE)?;
+        let words_owner = HostAllocation::new(library, staging.counter_bytes)?;
         let words = Words { base: words_owner.buffer.ptr as usize };
         // Preload the copy kernel before any not-yet-ready stream wait. CUDA
         // lazy loading can otherwise wait for the very stream we just blocked.
