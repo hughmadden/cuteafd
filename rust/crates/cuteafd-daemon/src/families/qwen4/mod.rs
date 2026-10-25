@@ -662,7 +662,8 @@ impl Opened {
             "Qwen 3.8 Flash Next coordinator weights resident (one representation per weight)");
         let ple = match self.cfg.ple_layers.first() {
             Some(&layer) if layer < layers => Some(ple::PleTable::load(&self.library, &self.checkpoint, &self.cfg,
-                layer, &args.table, args.prefill_wave_rows())?),
+                layer, &args.table, args.prefill_wave_rows(), prefill_shape.map_or(1, |shape| shape.waves as usize),
+                engine::DECODE_ROWS)?),
             _ => None,
         };
         // Establish expert ownership before admission. EXL3 keeps its existing
