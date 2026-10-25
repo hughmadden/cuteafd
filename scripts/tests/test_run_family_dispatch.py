@@ -656,7 +656,8 @@ def _family_launch_result(tmp_path: Path, family_config: dict, model: str, keys:
     if family_config.get("model_type") == "glm_moe_dsa":
         _snapshot(hf, "incoai/GLM-5.3-DFlash2", {"architectures": ["DFlash2DraftModel"]})
     if family_config.get("model_type") == "minimax_m3_vl":
-        _snapshot(hf, "RadixArk/Minimax-M3.1-Flash-Dflash2", {"architectures": ["MiniMaxDFlash2DraftModel"]})
+        _snapshot(hf, "RadixArk/Minimax-M3.1-Flash-Dflash2", {"architectures": ["MiniMaxDFlash2DraftModel"]},
+                  "923bf1d4b567d5ccb71b0488c6e61b5e4794e92a")
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
     for tool in ("docker", "ssh", "nest") if with_nest else ("docker", "ssh"):

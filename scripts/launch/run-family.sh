@@ -1575,8 +1575,8 @@ if [[ "$family" == minimax_m3 ]]; then
   minimax_local_layers="$(get RTX_EXPERT_LAYERS auto)"
   [[ "$minimax_local_layers" == auto || "$minimax_local_layers" =~ ^[0-9]+$ ]] ||
     release_die "MiniMax RTX_EXPERT_LAYERS must be auto or a fixed routed-layer count"
-  case "$(get SPECULATOR off)" in off|dspark|dflash2) ;; *) release_die "MiniMax supports SPECULATOR=dspark, dflash2 or off" ;; esac
-  [[ "$(get SPECULATOR off)" == dflash2 || -z "$(get SPECULATOR_MODEL_ID)$(get SPECULATOR_MODEL_REVISION)$(get SPECULATOR_FP8)$(get DRAFT_KV_CACHE)" ]] ||
+  case "$(get SPECULATOR dflash2)" in off|dspark|dflash2) ;; *) release_die "MiniMax supports SPECULATOR=dspark, dflash2 or off" ;; esac
+  [[ "$(get SPECULATOR dflash2)" == dflash2 || -z "$(get SPECULATOR_MODEL_ID)$(get SPECULATOR_MODEL_REVISION)$(get SPECULATOR_FP8)$(get DRAFT_KV_CACHE)" ]] ||
     release_die "MiniMax SPECULATOR_MODEL_ID, SPECULATOR_MODEL_REVISION, SPECULATOR_FP8 and DRAFT_KV_CACHE apply to SPECULATOR=dflash2"
   case "$(get RTX_GPUS auto)" in auto|1|2) ;; *) release_die "RTX_GPUS must be auto, 1 or 2" ;; esac
   case "$(get COORDINATOR_SPLIT auto)" in auto|off|heads) ;; *) release_die "COORDINATOR_SPLIT must be auto, heads or off" ;; esac
@@ -1845,6 +1845,11 @@ if [[ -z "$speculator" ]]; then
     speculator=dflash2 default_drafter=incoai/GLM-5.3-DFlash2
     echo "note: GLM 5.3 drafts with DFlash2 ($default_drafter); SPECULATOR=off disables it" >&2
   fi
+  if [[ $speculator == off && $family == minimax_m3 && -z ${cfg[SPECULATOR]+set} ]]; then
+    speculator=dflash2 default_drafter=RadixArk/Minimax-M3.1-Flash-Dflash2
+    echo "note: MiniMax M3 drafts with DFlash2 ($default_drafter); SPECULATOR=dspark uses the release's" \
+      "bundled drafter, SPECULATOR=off disables speculation" >&2
+  fi
   if [[ $speculator == off && $family == glm5_flash ]]; then
     read -r speculator default_drafter <<<"$(glm5_flash_speculator "$model")"
     if [[ -d "$hub/models--${default_drafter//\//--}" ]]; then
@@ -1952,16 +1957,30 @@ case "$speculator" in
     [[ "$family" != step5 ]] || family_args+=(--mtp 0) ;;
   dflash2|dspark)
     drafter="$(get SPECULATOR_MODEL_ID)"
-    # MiniMax's DFlash2 drafter runs on the shared drafter beside the release (not bundled).
-    [[ -n "$drafter" || $family:$speculator != minimax_m3:dflash2 ]] || drafter=RadixArk/Minimax-M3.1-Flash-Dflash2
+    drafter_revision="$(get SPECULATOR_MODEL_REVISION)"
+    # MiniMax's DFlash2 drafter runs on the shared drafter beside the release. Its model card
+    # states no license, so nothing here hosts, bundles or copies it: the user's own Hugging Face
+    # download, at the qualified revision unless SPECULATOR_MODEL_REVISION says otherwise.
+    if [[ -z "$drafter" && $family:$speculator == minimax_m3:dflash2 ]]; then
+      drafter=RadixArk/Minimax-M3.1-Flash-Dflash2
+      [[ -n "$drafter_revision" ]] || drafter_revision=923bf1d4b567d5ccb71b0488c6e61b5e4794e92a
+    fi
     [[ -n "$drafter" ]] || drafter="$default_drafter"
     if [[ $family:$speculator == minimax_m3:dspark ]]; then
       : # The release owns its bundled drafter.
     elif [[ $speculator == dspark && $family == deepseek_v4 ]]; then
       dspark_args=(--dspark)
     elif [[ -n "$drafter" ]]; then
-      draft_snapshot="$(snapshot_of "$drafter" "$(get SPECULATOR_MODEL_REVISION)")" ||
-        { [[ -z "$default_drafter" ]] || echo "download it (hf download $drafter) or set SPECULATOR=off" >&2; exit 1; }
+      draft_snapshot="$(snapshot_of "$drafter" "$drafter_revision")" || {
+        if [[ $family == minimax_m3 ]]; then
+          echo "MiniMax DFlash2 needs $drafter${drafter_revision:+ at revision $drafter_revision}, which cuteafd" \
+            "does not distribute: download it from https://huggingface.co/$drafter" \
+            "(hf download $drafter${drafter_revision:+ --revision $drafter_revision}), or set SPECULATOR=dspark" \
+            "(the release's bundled drafter) or SPECULATOR=off" >&2
+        elif [[ -n "$default_drafter" ]]; then
+          echo "download it (hf download $drafter) or set SPECULATOR=off" >&2
+        fi
+        exit 1; }
       draft_args=(--draft "$draft_snapshot")
       [[ "$family" != kimi_k3 ]] || draft_args+=(--draft-fp8 true)
     elif [[ $family == mimo_v2 ]]; then

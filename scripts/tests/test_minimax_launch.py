@@ -20,6 +20,8 @@ CONFIG = {"model_type": "minimax_m3_vl", "text_config": {
 }, "quantization_config": {"quant_method": "mxfp8", "moe_quant_algo": "NVFP4",
                            "moe_quant_format": "nvfp4-pack-quantized", "group_size": 16}}
 PLANNED = {"placement_supported": True, "fits": True, "spark_budget_bytes": 108 << 30}
+# The qualified DFlash2 draft's revision, the launcher's default.
+RADIXARK_REVISION = "923bf1d4b567d5ccb71b0488c6e61b5e4794e92a"
 
 
 def _launch(tmp_path, keys="", *, ranks=4, **kwargs):
@@ -34,8 +36,10 @@ def test_minimax_launch_matches_planner(tmp_path, ranks, kv):
     result = _launch(tmp_path, f"KV_CACHE={kv}\nRTX_EXPERT_LAYERS=auto\n", ranks=ranks)
     serve = _line(result, "serve-minimax --snapshot")
     plan = _line(result, "cuteafd plan")
-    for flag, value in (("--kv-cache", kv), ("--speculator", "off")):
+    # DFlash2 is MiniMax's default speculator.
+    for flag, value in (("--kv-cache", kv), ("--speculator", "dflash2")):
         assert _flag(serve, flag) == _flag(plan, flag) == value
+    assert _flag(serve, "--draft") == _flag(plan, "--drafter-snapshot")
     assert _flag(serve, "--rtx-expert-layers") == "auto"
     assert _flag(serve, "--spark-budget-bytes") == str(108 << 30)
     assert _flag(serve, "--max-sequences") == _flag(plan, "--concurrency") == "64"
@@ -73,7 +77,8 @@ def test_minimax_host_prefix_tier_defaults_on_and_stores_on_eviction(tmp_path, k
     ("SPECULATOR=dflash2\nSPECULATOR_FP8=maybe\n", "SPECULATOR_FP8 must be auto, on or off"),
     ("SPECULATOR=dflash2\nDRAFT_KV_CACHE=int8\n", "DRAFT_KV_CACHE must be bf16 or fp8"),
     ("SPECULATOR=dspark\nDRAFT_KV_CACHE=bf16\n", "DRAFT_KV_CACHE apply to SPECULATOR=dflash2"),
-    ("SPECULATOR_MODEL_ID=other/draft\n", "apply to SPECULATOR=dflash2"),
+    ("SPECULATOR=off\nSPECULATOR_MODEL_ID=other/draft\n", "apply to SPECULATOR=dflash2"),
+    ("SPECULATOR=dspark\nSPECULATOR_MODEL_REVISION=abc\n", "apply to SPECULATOR=dflash2"),
     ("RTX_EXPERT_LAYERS=max\n", "must be auto or a fixed routed-layer count"),
     ("RTX_EXPERT_LAYERS=25%\n", "must be auto or a fixed routed-layer count"),
     ("RTX_EXPERT_LAYERS=58\n", "checkpoint has 57 routed layers"),
@@ -197,6 +202,33 @@ def test_minimax_bundled_dspark_is_explicit(tmp_path):
     assert "--draft " not in serve
 
 
+def test_minimax_defaults_to_the_users_own_dflash2_download_and_keeps_dspark_and_off(tmp_path):
+    # No SPECULATOR: DFlash2 at the qualified revision, from the user's Hugging Face cache.
+    result = _launch(tmp_path)
+    assert result.returncode == 0, result.stderr
+    assert "note: MiniMax M3 drafts with DFlash2" in result.stderr
+    serve = _line(result, "serve-minimax --snapshot")
+    assert _flag(serve, "--speculator") == "dflash2"
+    assert _flag(serve, "--draft").endswith(f"models--RadixArk--Minimax-M3.1-Flash-Dflash2/snapshots/{RADIXARK_REVISION}")
+    # Explicit choices stay: the release's bundled DSpark, or no drafter.
+    for value in ("dspark", "off"):
+        tmp = tmp_path / value
+        tmp.mkdir()
+        result = _launch(tmp, f"SPECULATOR={value}\n")
+        assert result.returncode == 0, result.stderr
+        serve = _line(result, "serve-minimax --snapshot")
+        assert _flag(serve, "--speculator") == value and "--draft " not in serve
+    # A draft that is not downloaded refuses before launch, pointing at its page and the alternatives.
+    missing = tmp_path / "missing"
+    missing.mkdir()
+    result = _launch(missing, "SPECULATOR_MODEL_REVISION=0123456789abcdef0123456789abcdef01234567\n")
+    assert result.returncode != 0 and "docker run -d" not in result.stderr
+    for needle in ("which cuteafd does not distribute", "https://huggingface.co/RadixArk/Minimax-M3.1-Flash-Dflash2",
+                   "hf download RadixArk/Minimax-M3.1-Flash-Dflash2 --revision 0123456789abcdef", "SPECULATOR=dspark",
+                   "SPECULATOR=off"):
+        assert needle in result.stderr, (needle, result.stderr)
+
+
 def test_minimax_speculation_trace_reaches_the_server_for_selector_calibration(tmp_path):
     trace = tmp_path / "traces" / "dflash2.jsonl"
     result = _launch(tmp_path, f"SPECULATOR=dflash2\nSPECULATOR_DRAFTS=7\nSPECULATION_TRACE={trace}\n")
@@ -218,7 +250,7 @@ def test_minimax_dflash2_serves_and_plans_the_radixark_drafter_on_the_shared_dra
     plan = _line(result, "cuteafd plan")
     assert _flag(serve, "--speculator") == _flag(plan, "--speculator") == "dflash2"
     draft = _flag(serve, "--draft")
-    assert draft.endswith("models--RadixArk--Minimax-M3.1-Flash-Dflash2/snapshots/abc")
+    assert draft.endswith(f"models--RadixArk--Minimax-M3.1-Flash-Dflash2/snapshots/{RADIXARK_REVISION}")
     assert _flag(plan, "--drafter-snapshot") == draft
     assert _flag(serve, "--draft-fp8") == fp8
     assert ("--minimax-draft-bf16" in plan) == (fp8 == "false")
