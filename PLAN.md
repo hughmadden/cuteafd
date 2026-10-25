@@ -5994,8 +5994,8 @@ upstream payload fetches. The full CPU plan accepts exactly the published
 96 rank-one edits, leaves the other 60 sites unchanged and agrees with the
 packed device-table charge. Both published-weight component fixtures ran
 and passed with the original numerical bars and unchanged base rows.
-Layered GPU/cache gates, DFlash2 and real-agent checks, and the matched
-four-Spark performance comparison remain required. The later
+Mixed-model and agentic cache gates, DFlash2 and real-agent checks, and the
+matched four-Spark performance comparison remain required. The later
 API and qualification-tooling fixes are integrated for the final seal;
 smoke entries now carry one exact model ID through panels and sweeps and
 use the deployment's shared hardware lock directory.
@@ -6006,8 +6006,10 @@ Pipelined full-logit scoring remains unsupported (upstream issue 749); ordinary
 serving keeps its prefill pipeline. `glm-golden --variant-suite` now composes
 the existing NLL, streamed base-logit byte comparison and exact prefix/RAM
 checks for base and each ready variant on one engine load. Its pinned-source
-focused CPU checks pass; the combined hardware run is active on sealed
-`237a3cf7b`, with no result yet. It adds
+focused CPU checks pass; the combined hardware run passes on sealed
+`237a3cf7b`. Base logits are byte-identical with the overlay configured but
+unused; both model indices restore exact prefix and continuation bytes from
+RAM after releasing device retention. alternate weights logits are finite. It adds
 no execution, graph or cache path. The capped-export child now receives all
 the CDI helper functions it calls.
 
