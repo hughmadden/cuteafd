@@ -5986,10 +5986,15 @@ prefix restore passed on Romeo and all six Sparks using sealed candidate
 `663467d14`. Device retention was released before admission from the host
 tier; captured prefix bytes, continuation layers/logits, decode and final
 paged state were identical. This is a base correctness result, not layered
-or performance qualification. The published alternate weights payload receipt, alternate
-layer component/cache gates, DFlash2 and real-agent checks, and matched
-four-Spark performance comparison remain required. The final candidate also
-needs the later API and qualification-tooling fixes sealed together.
+or performance qualification. The published alternate weights payload receipt now passes
+for every extracted site. Its executed scope remains 96 edited and 60
+unchanged sites; two verified MTP sites are excluded. The persistent source
+client cache is being qualified before derivation and repeated launches.
+Alternate-layer component/cache gates, DFlash2 and real-agent checks, and
+the matched four-Spark performance comparison remain required. The later
+API and qualification-tooling fixes are integrated for the final seal;
+smoke entries now carry one exact model ID through panels and sweeps and
+use the deployment's shared hardware lock directory.
 
 ## Backlog (lowest priority: only when nothing planned is left)
 
