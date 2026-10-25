@@ -1238,6 +1238,13 @@ wip_remote_export() {
   echo "WIP phase coordinator export-remote: $((SECONDS - started))s ($host)"
 }
 
+# wip_capped_export_functions: the definitions the capped-export child (a fresh
+# bash) needs: its entry point and every helper on its GPU-argument path.
+wip_capped_export_functions() {
+  declare -f wip_capped_export_on release_gpu_device_args cuteafd_cdi_require cuteafd_cdi_only_all \
+    cuteafd_cdi_single_gpu_host cuteafd_cdi_gpu_args
+}
+
 # wip_capped_export BUILD...: the native phase on a raptor GPU we hold: one
 # whose lock the caller already holds, else a fair-queued GPU turn (the first
 # configured GPU, held only for the export). A one-off container on
@@ -1247,7 +1254,7 @@ wip_capped_export() {
   local status=0
   CUTEAFD_CAPPED_BUILD="$(printf '%q ' "$@")" \
     python3 "$repo_root/scripts/build/export-placement.py" hold --gpus "${CUTEAFD_WIP_EXPORT_GPUS:-1,0}" --wait "${CUTEAFD_WIP_EXPORT_WAIT_S:-14400}" -- \
-    bash -c "$(declare -f wip_capped_export_on release_gpu_device_args cuteafd_cdi_require cuteafd_cdi_gpu_args); $(declare -p repo_root coordinator_container COORDINATOR_DOCKER_DEV); wip_capped_export_on" ||
+    bash -c "$(wip_capped_export_functions); $(declare -p repo_root coordinator_container COORDINATOR_DOCKER_DEV); wip_capped_export_on" ||
     status=$?
   ((status == 0)) || { echo "WIP coordinator export: capped export exited $status; next mode" >&2; return 75; }
 }

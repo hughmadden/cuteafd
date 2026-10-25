@@ -5996,6 +5996,16 @@ API and qualification-tooling fixes are integrated for the final seal;
 smoke entries now carry one exact model ID through panels and sweeps and
 use the deployment's shared hardware lock directory.
 
+The absent-overlay six-Spark base reference passes with supported single-wave
+NLL scoring: 1024 tokens, mean NLL 1.7452, logits digest `c98c3794c4eab763`.
+Pipelined full-logit scoring remains unsupported (upstream issue 749); ordinary
+serving keeps its prefill pipeline. `glm-golden --variant-suite` now composes
+the existing NLL, streamed base-logit byte comparison and exact prefix/RAM
+checks for base and each ready variant on one engine load. Its pinned-source
+focused CPU checks pass; the combined hardware run is still required. It adds
+no execution, graph or cache path. The capped-export child now receives all
+the CDI helper functions it calls.
+
 ## Backlog (lowest priority: only when nothing planned is left)
 
 - Qwen 3.8 Flash Next NVFP4 without Sparks, competitive with vLLM on one
