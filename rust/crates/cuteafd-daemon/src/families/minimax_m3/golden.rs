@@ -80,6 +80,11 @@ pub(crate) struct GoldenArgs {
     /// With --draft: block causality overriding the checkpoint's upstream mask (reference.py --causal).
     #[arg(long, requires = "draft", action = clap::ArgAction::Set)]
     draft_causal: Option<bool>,
+    /// With --draft: read each tap from the golden output of its layer plus this shift, an A/B
+    /// of the tap point (-1: the residual entering the layer rather than leaving it). Serving
+    /// taps the residual after each target layer.
+    #[arg(long, requires = "draft", hide = true, default_value_t = 0, allow_hyphen_values = true)]
+    draft_tap_shift: i64,
 }
 
 fn selection(args: &GoldenArgs) -> Result<Vec<usize>> {
@@ -495,8 +500,11 @@ fn draft_diagnostics(args: &GoldenArgs, cfg: &MiniMaxM3Config, checkpoint: &Chec
     let drafter = draft.drafter();
     // The golden's FP32 layer outputs, rounded to BF16 as the engine's taps are.
     let (tokens, hidden) = (&window.tokens, cfg.hidden);
-    let layers = drafter.cfg.taps.iter().map(|&l| std::fs::read(window.directory.join(format!("layer{l:02}.bin"))))
-        .collect::<std::io::Result<Vec<_>>>().context("--draft needs the window's layerNN.bin of every tapped layer")?;
+    let layers = drafter.cfg.taps.iter().map(|&l| -> Result<Vec<u8>> {
+        let layer = i64::try_from(l)? + args.draft_tap_shift;
+        ensure!(layer >= 0, "--draft-tap-shift moves a tap before the first layer");
+        std::fs::read(window.directory.join(format!("layer{layer:02}.bin"))).map_err(Into::into)
+    }).collect::<Result<Vec<_>>>().context("--draft needs the window's layerNN.bin of every tapped layer")?;
     ensure!(layers.iter().all(|l| l.len() == tokens.len() * hidden * 4), "golden tap layers differ from the window");
     let taps = |first: usize, n: usize| -> Result<Vec<u8>> {
         let mut out = Vec::with_capacity(n * layers.len() * hidden * 2);
@@ -696,6 +704,8 @@ mod tests {
         assert_eq!((replay.draft_replay, replay.draft_fp8, replay.draft_kv_cache), (Some(64), Some(false), Qwen4KvCache::Bf16));
         let oracle = args(&["--draft", "/draft", "--draft-oracle", "/oracle"]);
         assert_eq!((oracle.draft_oracle.as_deref(), oracle.draft_fp8), (Some(Path::new("/oracle")), None));
+        assert_eq!(oracle.draft_tap_shift, 0);
+        assert_eq!(args(&["--draft", "/draft", "--draft-replay", "64", "--draft-tap-shift", "-1"]).draft_tap_shift, -1);
         assert_eq!(oracle.draft_kv_cache, Qwen4KvCache::Fp8);
         for extra in [&["--draft-replay", "64"][..], &["--draft-oracle", "/oracle"],
             &["--draft", "/draft", "--draft-replay", "64", "--draft-oracle", "/oracle"]] {
