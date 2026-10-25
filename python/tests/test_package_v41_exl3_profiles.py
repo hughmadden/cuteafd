@@ -1035,24 +1035,28 @@ class PackageProfileTests(unittest.TestCase):
                 self.assertEqual(call.kwargs['route_block'], 64)
 
     def test_flash_spark_qualified_prefill_units_use_dynamic_tiles(self):
-        for width in (256, 512, 640, 768, 1024):
+        tiles = {384: package.TILE_384, 640: package.TILE_RTX_MIXED}
+        for width in (256, 384, 512, 640, 768, 1024):
             for capacity in (2048, 2752):
                 self.assertTrue(package.ws_dynamic_tiles('glmf', 'spark', width, capacity))
                 self.assertFalse(package.wire_input('glmf', 'spark', width, capacity))
                 self.assertEqual(package.ws_tile('glmf', 'spark', width, capacity),
-                                 package.TILE_RTX_MIXED if width == 640 else None)
+                                 tiles.get(width))
             for capacity in (80, 256, 1024, 4096):
                 self.assertFalse(package.ws_dynamic_tiles('glmf', 'spark', width, capacity))
-        self.assertFalse(package.ws_dynamic_tiles('glmf', 'spark', 384, 2048))
+        self.assertIsNone(package.ws_tile('glmf', 'spark', 384, 1024))
+        self.assertIsNone(package.ws_tile('glmf', 'spark', 384, 4096))
         with tempfile.TemporaryDirectory() as temporary:
             _, _, calls, _ = self.build_fixture(
                 Path(temporary), 'spark', (3, 4), geometry='glmf',
                 capacities=(2048, 2752))
+            self.assertTrue(calls)
             for call in calls:
                 width = call.args[1]
-                self.assertEqual(call.kwargs.get('ws_dynamic_tiles', False), width != 384)
-                if width == 640:
-                    self.assertEqual(call.kwargs['tile'], package.TILE_RTX_MIXED)
+                self.assertTrue(call.kwargs['ws_dynamic_tiles'])
+                if width in tiles:
+                    self.assertEqual(call.kwargs['tile'], tiles[width])
+                self.assertEqual(call.kwargs['route_block'], 64)
 
     def test_warp_specialized_spark_prefill_policy_is_unchanged(self):
         """Existing Spark widths retain WS; unrelated coordinator families do not."""
