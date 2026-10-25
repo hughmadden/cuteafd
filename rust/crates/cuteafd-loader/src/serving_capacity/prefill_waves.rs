@@ -48,17 +48,6 @@ impl Default for PrefillLimits {
     }
 }
 
-impl PrefillLimits {
-    /// Native `Weights::Fp8` slots still share their group's scratch. Keep the
-    /// existing two slots until PR #779 isolates it; Full/EXL3 backends are unaffected.
-    pub fn with_shared_fp8_scratch(self, shared: bool) -> Self {
-        if shared && self.max_waves > 2 {
-            Self { max_waves: 2, max_waves_reason: Some(
-                "native Fp8 execution slots share scratch; lift after the #779 slot-isolation PR merges"), ..self }
-        } else { self }
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum PrefillError {
     #[error("unsupported prefill shape: {waves} waves x {unit_rows} rows; units must be page-aligned 64..=4096 rows and waves 1..=4")]
@@ -235,24 +224,6 @@ mod tests {
                 waves: Some(waves), ..Default::default()
             }), Err(PrefillError::ExecutorCapacity { .. })));
         }
-    }
-
-    #[test]
-    fn native_scratch_hold_preserves_two_slots_and_does_not_limit_other_backends() {
-        let adaptive = PrefillLimits::default().with_shared_fp8_scratch(false);
-        assert_eq!(prefill_shape(6, adaptive, PrefillOverrides::default()).unwrap().waves, 3);
-        let held = PrefillLimits::default().with_shared_fp8_scratch(true);
-        assert!(held.max_waves_reason.unwrap().contains("#779"));
-        assert_eq!(prefill_shape(6, held, PrefillOverrides::default()).unwrap(),
-            PrefillPlan { unit_rows: 4096, waves: 2, span_rows: 8192 });
-        for waves in [3, 4] {
-            assert!(matches!(prefill_shape(6, held, PrefillOverrides {
-                waves: Some(waves), unit_rows: Some(2048), ..Default::default()
-            }), Err(PrefillError::ExecutorCapacity { max_waves: 2, .. })));
-        }
-        let local = PrefillLimits { max_waves: 1, ..Default::default() }
-            .with_shared_fp8_scratch(true);
-        assert_eq!(local.max_waves, 1);
     }
 
     #[test]

@@ -70,8 +70,7 @@ impl ServeArgs {
 
     fn shape(&self) -> Result<cuteafd_loader::serving_capacity::prefill_waves::PrefillPlan> {
         use cuteafd_loader::serving_capacity::prefill_waves::{prefill_shape, PrefillLimits, PrefillOverrides};
-        // This executor requires catalog.fp8() and always uses native Fp8 workers.
-        Ok(prefill_shape(self.peers.len(), PrefillLimits::default().with_shared_fp8_scratch(true), PrefillOverrides {
+        Ok(prefill_shape(self.peers.len(), PrefillLimits::default(), PrefillOverrides {
             unit_rows: (self.prefill_rows != 0).then_some(u64::from(self.prefill_rows)),
             waves: (self.prefill_waves != 0).then_some(u64::from(self.prefill_waves)),
             span_rows: None,
@@ -690,7 +689,7 @@ mod tests {
 
     #[test]
     fn topology_shapes_and_explicit_units_match_admission() -> Result<()> {
-        for (sparks, unit, waves, span) in [(4, 4096, 2, 8192), (6, 4096, 2, 8192)] {
+        for (sparks, unit, waves, span) in [(4, 4096, 2, 8192), (6, 2752, 3, 8256)] {
             let mut args = args();
             args.peers = (1..=sparks).map(|port| format!("127.0.0.1:{port}").parse())
                 .collect::<std::result::Result<_, _>>()?;
@@ -698,13 +697,13 @@ mod tests {
             let shape = args.shape()?;
             assert_eq!((shape.unit_rows, shape.waves, shape.span_rows), (unit, waves, span));
             args.prefill_rows = 512;
-            for waves in [3, 4] {
+            for waves in 1..=4 {
                 args.prefill_waves = waves;
-                assert!(args.shape().is_err());
+                args.validate()?;
+                let shape = args.shape()?;
+                assert_eq!((shape.unit_rows, shape.waves, shape.span_rows),
+                    (512, u64::from(waves), 512 * u64::from(waves)));
             }
-            args.prefill_waves = 2;
-            let shape = args.shape()?;
-            assert_eq!((shape.unit_rows, shape.waves, shape.span_rows), (512, 2, 1024));
             args.prefill_rows = 4097;
             assert!(args.validate().is_err());
             args.prefill_rows = 2753;

@@ -184,7 +184,7 @@ fn shared_prefill_public_plan_family_by_spark_matrix() {
             let mut options = wave_plan_options(dir.path(), ranks);
             let report = plan(dir.path(), &options).unwrap();
             assert_eq!(report.family.as_deref(), Some(family));
-            let (unit, waves) = if matches!(family, "glm5" | "glm5_flash" | "qwen4") && ranks >= 6 { (4096, 2) }
+            let (unit, waves) = if family == "qwen4" && ranks >= 6 { (4096, 2) }
                 else { match ranks { 0 => (4096, 1), 1..=5 => (4096, 2), _ => (2752, 3) } };
             // Header fixtures may independently lack kernels, rank divisibility,
             // local experts or memory. Shape resolution does not imply fit.
@@ -197,7 +197,7 @@ fn shared_prefill_public_plan_family_by_spark_matrix() {
                 layout.prefill_span_rows = Some(unit * waves);
                 let report = plan(dir.path(), &options).unwrap();
                 let max_waves = if ranks == 0 { 1 } else if family == "qwen4" { 2 }
-                    else if family == "deepseek_v4" { 3 } else { 2 };
+                    else if family == "deepseek_v4" { 3 } else { 4 };
                 if waves > max_waves {
                     assert!(!report.placement_supported, "{family} ranks={ranks}: {}", render(&report));
                     assert!(report.hints.iter().any(|hint| hint.what.contains("unsupported prefill shape")),
@@ -2190,8 +2190,8 @@ fn glm5_flash_layout_charges_the_engine_step_workspaces_and_headroom() {
     std::fs::write(&path, manifest.to_string()).unwrap();
     let cfg = GlmNextConfig::from_hf(&config).unwrap();
     let lookup = glmf_manifest_scratch(&manifest);
-    // Native FP8 keeps two waves (#779), with independent unit widths and headroom.
-    for (lanes, rows, headroom) in [(2u64, 4096u64, 2u64 << 30), (2, 2048, 1 << 30)] {
+    // Per-slot native scratch supports every admitted wave count and unit width.
+    for (lanes, rows, headroom) in [(2u64, 4096u64, 2u64 << 30), (3, 2752, 1 << 30), (4, 2048, 1 << 30)] {
         let options = PlanOptions { layout: Some(layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)), drafter_bytes: 256 << 20, rtx_bytes: vec![32 << 30], prefill_lanes: lanes,
             prefill_rows: rows, headroom_bytes: headroom, context_tokens: 131_072, workspace_manifest: Some(path.clone()),
             ..Default::default() }), ..sparks(4) };
@@ -2260,12 +2260,11 @@ fn glm5_flash_layout_charges_the_engine_step_workspaces_and_headroom() {
         .iter().find(|i| i.group == "steps").unwrap().bytes;
     let allowance = 268 * (1 << 30) / 100;
     assert_eq!(steps(2, 4096), allowance);
-    assert_eq!(steps(2, 2048), allowance);
-    for rows in [2048, 4096] {
-        let refused = plan(dir.path(), &options(4, rows)).unwrap();
-        assert!(!refused.placement_supported);
-        assert!(refused.hints.iter().any(|hint| hint.what.contains("executor supports at most 2 waves")));
-    }
+    assert_eq!(steps(3, 2752), allowance * 8256 / 8192);
+    assert_eq!(steps(4, 2048), allowance);
+    let refused = plan(dir.path(), &options(4, 4096)).unwrap();
+    assert!(!refused.placement_supported);
+    assert!(refused.hints.iter().any(|hint| hint.what.contains("live-slot reserve")));
     // A graph budget replaces the graph allowance, as the engine's admission reserves it.
     let mut budgeted = options(2, 4096);
     budgeted.layout.as_mut().unwrap().graph_budget_bytes = Some(512 << 20);

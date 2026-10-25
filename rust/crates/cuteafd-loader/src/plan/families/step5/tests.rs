@@ -1252,11 +1252,11 @@ fn shared_ffn_region_keeps_replicated_replies_apart() {
 #[test]
 fn adaptive_prefill_selection_preserves_overrides_and_never_retries_on_capacity() {
     for (kind, gpus, sparks, default_unit, default_waves) in [
-        ("nvfp4", 1, 4, 4096, 2), ("fp8", 2, 6, 4096, 2),
+        ("nvfp4", 1, 4, 4096, 2), ("fp8", 2, 6, 2752, 3),
     ] {
         let snapshot = snapshot(kind);
         let manifest = native_manifest(snapshot.path());
-        for (unit, waves) in [(0, 0), (512, 1), (1024, 2), (4096, 2)] {
+        for (unit, waves) in [(0, 0), (512, 1), (1024, 2), (2752, 3), (2048, 4), (4096, 2)] {
             let expected_unit = if unit == 0 { default_unit } else { unit };
             let expected_waves = if waves == 0 { default_waves } else { waves };
             let report = plan::plan(snapshot.path(), &PlanOptions {

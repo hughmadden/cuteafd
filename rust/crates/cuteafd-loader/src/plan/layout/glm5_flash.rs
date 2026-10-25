@@ -11,7 +11,7 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyMo
                 else if report.requested_attention == Some(placement::AttentionPlacement::Layers) {
                 placement::LAYER_PIPELINE_MAX_LANES } else { 4 },
             ..Default::default()
-        }.with_shared_fp8_scratch(input.expert_catalog().is_ok_and(|catalog| catalog.fp8().is_some()))) {
+        }) {
         Ok(shape) => shape,
         Err(error) => return unsupported_prefill(report, error),
     };
