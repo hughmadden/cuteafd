@@ -377,7 +377,7 @@ impl LocalTp4Client {
         // return to the session pool only after the owner releases them.
         // Each wave's deadline counts from when it becomes the oldest, so a
         // queued wave is not charged for the waves ahead of it.
-        self.waves.push_back(OpenWave { chunks: rx, done, deadline: None });
+        self.waves.push_back(OpenWave { chunks: rx, done, deadline: None, polls: 0 });
         self.egress_slot = (self.egress_slot + 1) % self.max_waves;
         Ok(())
     }
@@ -436,11 +436,14 @@ impl LocalTp4Client {
     {
         let timeout = self.config.timeout;
         let wave = self.waves.front_mut().context("local TP4 has no pending request")?;
-        let deadline = *wave.deadline.get_or_insert_with(|| Instant::now() + timeout);
-        anyhow::ensure!(
-            Instant::now() < deadline,
-            "local TP4 response deadline expired"
-        );
+        // The deadline (seconds) is checked on every 64th poll: a busy poller
+        // must not spend its time reading the clock.
+        wave.polls = wave.polls.wrapping_add(1);
+        if wave.deadline.is_none() || wave.polls % 64 == 0 {
+            let now = Instant::now();
+            let deadline = *wave.deadline.get_or_insert(now + timeout);
+            anyhow::ensure!(now < deadline, "local TP4 response deadline expired");
+        }
         for rank in 0..self.peers.len() {
             if !self.pending[rank].is_empty() {
                 self.sessions[rank]
@@ -479,6 +482,8 @@ struct OpenWave {
     chunks: tokio::sync::mpsc::UnboundedReceiver<VerbsHostProtocolV2ResponseChunk>,
     done: Vec<tokio::sync::oneshot::Receiver<Result<VerbsHostProtocolV2ResponseStreamStats>>>,
     deadline: Option<Instant>,
+    /// Polls of this wave while it is the oldest (paces the deadline check).
+    polls: u32,
 }
 
 fn quiesce_all<T>(owners: &[Option<T>], mut quiesce: impl FnMut(&T)->Result<()>) -> Result<()> {
@@ -653,7 +658,7 @@ mod tests {
         let mut unbound = LocalTp4Client::new_ranks(vec![peer], TcpTransportConfig::default());
         let (_sender, chunks) = tokio::sync::mpsc::unbounded_channel();
         let (_done, completed) = tokio::sync::oneshot::channel();
-        unbound.waves.push_back(OpenWave { chunks, done: vec![completed], deadline: None });
+        unbound.waves.push_back(OpenWave { chunks, done: vec![completed], deadline: None, polls: 0 });
         assert!(unbound.bind_model_endpoint(2).is_err());
         assert!(unbound.model_endpoint.is_none());
         Ok(())
@@ -687,7 +692,7 @@ mod tests {
         for _ in 0..2 {
             let (chunks, receiver) = tokio::sync::mpsc::unbounded_channel();
             let (done, completed) = tokio::sync::oneshot::channel();
-            client.waves.push_back(OpenWave { chunks: receiver, done: vec![completed], deadline: None });
+            client.waves.push_back(OpenWave { chunks: receiver, done: vec![completed], deadline: None, polls: 0 });
             senders.push((chunks, done));
         }
         assert_eq!(client.open_waves(), 2);
@@ -717,7 +722,7 @@ mod tests {
         });
         let (_sender, receiver) = tokio::sync::mpsc::unbounded_channel();
         let (_completion, completed) = tokio::sync::oneshot::channel();
-        client.waves.push_back(OpenWave { chunks: receiver, done: vec![completed], deadline: Some(Instant::now()) });
+        client.waves.push_back(OpenWave { chunks: receiver, done: vec![completed], deadline: Some(Instant::now()), polls: 0 });
         client.reset();
         assert_eq!(client.peers, peers);
         assert_eq!(client.sessions.len(), 2);

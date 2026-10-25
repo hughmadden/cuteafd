@@ -1,6 +1,7 @@
 // Stream memory operations on mapped pinned host words: the device-side wait
 // and publish the shared Spark exchange orders its streams with.
 #include "cuteafd_native.h"
+#include "cuteafd_peer_exchange.h"
 #include <cuda_runtime_api.h>
 #include <atomic>
 #include <chrono>
@@ -61,6 +62,7 @@ int main() {
   uint32_t pageable = 0;
   check(cuteafd_cuda_stream_wait_value32(stream, &pageable, 1) != CUTEAFD_STATUS_OK, "unmapped word refused");
 
+  std::cerr << "step 1\n";
   // 1. A wait holds the stream, and the work behind it, until the host stores.
   check(cudaMemsetAsync(device.ptr, 0x11, 4096, static_cast<cudaStream_t>(stream)) == cudaSuccess, "memset");
   check(cuteafd_cuda_stream_wait_value32(stream, flag, 1) == CUTEAFD_STATUS_OK, "enqueue wait 1");
@@ -130,6 +132,58 @@ int main() {
     }
   }
   wait_idle(stream);
+
+  std::cerr << "steps 1-6 passed\n";
+  // Kernels a stream waits in front of must be loaded first: a lazily loaded
+  // kernel's first launch can wait for the device to idle (a pending wait
+  // never lets it), which hangs the host in the launch.
+  check(cuteafd_peer_exchange_initialize() == cudaSuccess, "preload exchange kernels");
+  // 7. Kernels behind waits, deep run-ahead (the exchange's staging copies):
+  //    80 x [wait(flag >= k), SM copy of row k into one mapped host row,
+  //    write(published = k)], all queued first. The host releases k one at a
+  //    time and, once k is published, checks the row holds k's data and is
+  //    not yet overwritten by k+1 (which must still be held by its wait).
+  {
+    const size_t row = 4096;
+    cuteafd_device_buffer_t rows_device{};
+    check(cuteafd_alloc_device_buffer(80 * row, &rows_device) == CUTEAFD_STATUS_OK, "rows buffer");
+    std::vector<unsigned char> rows_host(80 * row);
+    for (size_t i = 0; i < rows_host.size(); ++i) rows_host[i] = static_cast<unsigned char>((i / row) * 3 + 1);
+    check(cudaMemcpy(rows_device.ptr, rows_host.data(), rows_host.size(), cudaMemcpyHostToDevice) == cudaSuccess, "rows");
+    cuteafd_host_buffer_t target_buffer{};
+    check(cuteafd_alloc_host_buffer(row, &target_buffer) == CUTEAFD_STATUS_OK, "mapped target");
+    auto* target = static_cast<volatile unsigned char*>(target_buffer.ptr);
+    void* target_alias = nullptr;
+    check(cudaHostGetDevicePointer(&target_alias, target_buffer.ptr, 0) == cudaSuccess, "target alias");
+    at(flag).store(1000, std::memory_order_release);
+    at(published).store(1000, std::memory_order_release);
+    const uint32_t depth = std::getenv("SELFTEST_DEPTH") ? uint32_t(std::atoi(std::getenv("SELFTEST_DEPTH"))) : 80;
+    std::cerr << "step 7: queueing " << depth << " kernel layers\n";
+    for (uint32_t k = 1; k <= depth; ++k) {
+      check(cuteafd_cuda_stream_wait_value32(stream, flag, 1000 + k) == CUTEAFD_STATUS_OK, "kernel wait");
+      void* destinations[1] = {target_alias};
+      const void* sources[1] = {static_cast<unsigned char*>(rows_device.ptr) + (k - 1) * row};
+      uint64_t bytes[1] = {row};
+      check(cuteafd_sm_copy_regions(destinations, sources, bytes, 1, stream) == cudaSuccess, "sm copy");
+      check(cuteafd_cuda_stream_write_value32(stream, published, 1000 + k) == CUTEAFD_STATUS_OK, "kernel write");
+    }
+    std::cerr << "step 7: queued\n";
+    for (uint32_t k = 1; k <= depth; ++k) {
+      std::this_thread::sleep_for(std::chrono::microseconds(200));
+      // k not released yet: the row must still hold k-1's data.
+      if (k > 1) check(target[0] == static_cast<unsigned char>((k - 2) * 3 + 1), "kernel ran ahead of its wait");
+      at(flag).store(1000 + k, std::memory_order_release);
+      const auto until = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+      while (at(published).load(std::memory_order_acquire) != 1000 + k) {
+        check(std::chrono::steady_clock::now() < until, "kernel layer published");
+      }
+      check(target[0] == static_cast<unsigned char>((k - 1) * 3 + 1) &&
+            target[row - 1] == static_cast<unsigned char>((k - 1) * 3 + 1), "kernel copy visible at publish");
+    }
+    wait_idle(stream);
+    check(cuteafd_free_device_buffer(&rows_device) == CUTEAFD_STATUS_OK, "free rows");
+    check(cuteafd_free_host_buffer(&target_buffer) == CUTEAFD_STATUS_OK, "free target");
+  }
 
   check(cuteafd_free_device_buffer(&device) == CUTEAFD_STATUS_OK, "free device");
   check(cuteafd_cuda_stream_destroy(other) == CUTEAFD_STATUS_OK, "destroy other");

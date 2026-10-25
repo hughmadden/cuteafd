@@ -306,6 +306,8 @@ struct EchoWorld {
     /// Device plane addresses per slot and rank (integers: they cross to the worker).
     planes: Vec<Vec<(usize, usize)>>,
     next_slot: usize,
+    /// Each layer's input rows: a request must carry exactly its layer's.
+    inputs: Vec<Vec<u8>>,
 }
 struct EchoWave { slot: usize, rows: Vec<Vec<u8>>, polls: usize }
 
@@ -323,6 +325,11 @@ impl Transport for EchoWorld {
         self.next_slot = (slot + 1) % self.planes.len();
         let hidden = request.hidden_payload.as_ref();
         ensure!(hidden.len() == request.header.row_count as usize * self.row_bytes, "echo rows differ");
+        let layer = request.header.layer_id as usize;
+        if hidden != self.inputs[layer].as_slice() {
+            let stale = self.inputs.iter().position(|input| input.as_slice() == hidden);
+            anyhow::bail!("request for layer {layer} carried staged rows of layer {stale:?}");
+        }
         Ok(EchoWave { slot, rows: (0..self.ranks).map(|rank| rank_rows(hidden, rank)).collect(), polls: 0 })
     }
     fn poll(&mut self, wave: &mut EchoWave, sink: &mut dyn FnMut(usize, u32, &[u8]) -> Result<()>)
@@ -373,7 +380,11 @@ fn gpu_exchange_queues_a_step_ahead_and_lands_byte_exact() -> Result<()> {
                 bytes: capacity * row_bytes, ..plane.buffer }).collect()).collect();
         let layout = RouteStaging::new(rows, topk, row_bytes)?;
         let arenas = (0..waves).map(|_| StagingArena::new(layout.bytes)).collect::<Result<Vec<_>>>()?;
-        let echo = EchoWorld { library: library.clone(), ranks, row_bytes, landing, next_slot: 0,
+        let hosts: Vec<Vec<u8>> = (0..layers as usize).map(|layer| (0..rows * hidden).flat_map(|i| {
+            let value = ((i * 7 + layer * 13) % 61) as f32 / 16.0 - 1.5;
+            ((value.to_bits() >> 16) as u16).to_le_bytes()
+        }).collect()).collect();
+        let echo = EchoWorld { library: library.clone(), ranks, row_bytes, landing, next_slot: 0, inputs: hosts.clone(),
             planes: planes.iter().map(|slot| slot.iter().map(|plane| (plane.ptr as usize, plane.bytes)).collect()).collect() };
         let intake = Intake { ranks, rows: capacity, row_bytes, waves, planes, landing, next_slot: 0 };
         let mut exchange = Waves::start(&library, intake, echo, Vec::new(), arenas, false)?;
@@ -385,11 +396,8 @@ fn gpu_exchange_queues_a_step_ahead_and_lands_byte_exact() -> Result<()> {
         let outputs = (0..layers).map(|_| DeviceAllocation::new(&library, rows * row_bytes)).collect::<Result<Vec<_>>>()?;
         let mut expected = Vec::new();
         for (layer, input) in inputs.iter().enumerate() {
-            let host: Vec<u8> = (0..rows * hidden).flat_map(|i| {
-                let value = ((i * 7 + layer * 13) % 61) as f32 / 16.0 - 1.5;
-                ((value.to_bits() >> 16) as u16).to_le_bytes()
-            }).collect();
-            library.copy_h2d(input.buffer, &host)?;
+            let host = &hosts[layer];
+            library.copy_h2d(input.buffer, host)?;
             let sum: Vec<u8> = (0..rows * hidden).flat_map(|i| {
                 let total: f32 = (0..ranks).map(|rank| {
                     let word = rank_rows(&host[2 * i..2 * i + 2], rank);
@@ -435,10 +443,20 @@ fn gpu_exchange_queues_a_step_ahead_and_lands_byte_exact() -> Result<()> {
         }
         stream.finish()?;
         healthy()?;
-        for (layer, (output, expected)) in outputs.iter().zip(&expected).enumerate() {
+        let all = &expected;
+    for (layer, (output, expected)) in outputs.iter().zip(all).enumerate() {
             let mut actual = vec![0u8; rows * row_bytes];
             library.copy_d2h(&mut actual, output.buffer)?;
-            assert!(actual == *expected, "ranks={ranks} landing={landing:#b} waves={waves} layer {layer} differs");
+            if actual != *expected {
+                let first = actual.iter().zip(expected.iter()).position(|(a, e)| a != e).unwrap();
+                let bad = actual.chunks(row_bytes).zip(expected.chunks(row_bytes)).filter(|(a, e)| a != e).count();
+                // Which earlier layer's sum does the bad row match (a stale or early plane)?
+                let row = first / row_bytes;
+                let source = all.iter().position(|other| other[row * row_bytes..(row + 1) * row_bytes]
+                    == actual[row * row_bytes..(row + 1) * row_bytes]);
+                panic!("ranks={ranks} landing={landing:#b} waves={waves} layer {layer} differs: first byte {first} \
+                    (row {row}), {bad} of {rows} rows, row matches layer {source:?}");
+            }
         }
         let (_echo, _) = exchange.stop::<EchoWorld>()?;
         eprintln!("exchange ranks={ranks} landing={landing:#b} waves={waves}: {layers} layers of {rows} rows byte-exact");

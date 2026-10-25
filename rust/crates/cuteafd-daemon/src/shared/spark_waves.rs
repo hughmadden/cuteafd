@@ -19,8 +19,17 @@
 //!   sequence from the host. [`Waves::land`] queues `cuStreamWaitValue32
 //!   (landed >= sequence)` on the consuming stream and returns at once; for
 //!   ranks whose rows arrive in pinned host memory (no GPU landing) it also
-//!   queues their upload from the slot's landing staging into the planes,
-//!   behind the wait. Later work there (the reduce) sees the planes.
+//!   queues an SM copy of them from the slot's mapped landing staging into the
+//!   planes, behind the wait. Later work there (the reduce) sees the planes.
+//!
+//! Every copy the engine queues around these waits (the staging copies in
+//! [`Waves::send`], the pinned ranks' landing in [`Waves::land`]) is an SM
+//! copy through the mapped host memory's device alias, never
+//! `cudaMemcpyAsync`: copy-engine work is not held by a stream memory wait
+//! (CUDA documents that ordering through these operations is invisible to
+//! it). Measured on raptor: with `cudaMemcpyAsync` staging, a decode step
+//! queued 40 layers ahead overwrote the arena while the worker was still
+//! reading the previous wave from it.
 //! - `consumed[slot]`: after the reduce, the consuming stream writes the
 //!   slot's use count; the worker posts the slot's next wave (whose rows
 //!   overwrite the planes and landing staging) only once it is reached.
@@ -55,7 +64,7 @@ use crate::shared::experts::staging::RouteStaging;
 use crate::shared::memory::HostAllocation;
 use crate::shared::spark_intake::{copy_parallel, upload_offset, MAX_INTAKE_RANKS};
 use anyhow::{ensure, Context, Result};
-use cuteafd_ffi::{CuteafdDeviceBuffer, CuteafdHostBuffer, NativeLibrary};
+use cuteafd_ffi::{CuteafdDeviceBuffer, NativeLibrary};
 use cuteafd_transport::expert::{SparkExperts, SparkExpertWave, WaveReceipt};
 use cuteafd_transport::{ExpertProtocolV2Request, ExpertProtocolV2RouteEntry, StagingArena};
 use std::collections::VecDeque;
@@ -214,11 +223,15 @@ struct Inflight<W> {
     times: WaveTimes,
 }
 
-/// With waves outstanding the worker spins this long between progress, then yields.
-const SPIN: Duration = Duration::from_micros(20);
+/// Idle passes the worker spins before it yields (each pass polls the
+/// counters and the CQs, so this is a few tens of microseconds).
+const SPIN_PASSES: u32 = 256;
+/// Idle passes between clock reads (the no-progress deadline and the idle
+/// block are seconds and hundreds of microseconds).
+const IDLE_CLOCK: u32 = 64;
 /// With nothing outstanding it keeps polling this long (a decode step's next
-/// layer follows within a layer's time), yielding after [`SPIN`], then
-/// blocks on its channel.
+/// layer follows within a layer's time), yielding after [`SPIN_PASSES`],
+/// then blocks on its channel.
 const IDLE_SPIN: Duration = Duration::from_micros(500);
 
 /// The worker's loop until its channel closes or a transport error. It never
@@ -230,13 +243,16 @@ pub(crate) fn run_worker<B: Backend>(backend: &mut B, inbox: &mpsc::Receiver<Com
     let mut queued = VecDeque::<Job>::new();
     let mut inflight = VecDeque::<Inflight<B::Wave>>::new();
     let mut highest: Option<u32> = None;
+    // When the current idle stretch began, read every IDLE_CLOCK idle passes
+    // (a busy loop must not spend its time reading the clock).
     let mut idle_since: Option<Instant> = None;
+    let mut idle_passes = 0u32;
     let result = (|| -> Result<()> {
         loop {
             let mut progressed = false;
             let mut closed = false;
             let empty = queued.is_empty() && inflight.is_empty();
-            if empty && idle_since.is_some_and(|since| since.elapsed() >= IDLE_SPIN) {
+            if empty && idle_passes % IDLE_CLOCK == 0 && idle_since.is_some_and(|since| since.elapsed() >= IDLE_SPIN) {
                 // Nothing outstanding: block until the engine sends.
                 match inbox.recv() {
                     Ok(Command::Wave(job)) => { highest = Some(job.sequence); queued.push_back(job); progressed = true; }
@@ -291,15 +307,17 @@ pub(crate) fn run_worker<B: Backend>(backend: &mut B, inbox: &mpsc::Receiver<Com
             }
             if progressed {
                 idle_since = None;
+                idle_passes = 0;
                 continue;
             }
-            let since = *idle_since.get_or_insert_with(Instant::now);
-            if !empty {
+            idle_passes = idle_passes.wrapping_add(1);
+            if idle_since.is_none() || idle_passes % IDLE_CLOCK == 0 {
+                let since = *idle_since.get_or_insert_with(Instant::now);
                 // Waiting on the GPU (staged copies, a pending reduce) or on a
                 // reply, which carries its own transport deadline.
-                ensure!(since.elapsed() < timeout, "Spark exchange made no progress for {timeout:?}");
+                ensure!(empty || since.elapsed() < timeout, "Spark exchange made no progress for {timeout:?}");
             }
-            if since.elapsed() < SPIN { std::hint::spin_loop(); } else { std::thread::yield_now(); }
+            if idle_passes < SPIN_PASSES { std::hint::spin_loop(); } else { std::thread::yield_now(); }
         }
     })();
     (result, highest)
@@ -347,7 +365,7 @@ impl Transport for SparkExperts {
 /// One rank's landing destination in a slot: device plane, and the pinned
 /// staging its rows arrive in when the rank does not land in device memory.
 #[derive(Clone, Copy)]
-struct Plane { device: usize, host: usize, bytes: usize }
+struct Plane { host: usize, bytes: usize }
 
 /// The worker's backend over a [`Transport`]: the slots' request staging
 /// and landing staging, and the control counters.
@@ -440,18 +458,41 @@ pub(crate) struct Intake {
     pub next_slot: usize,
 }
 
+/// Runs the compact reducer once over slot 0's planes on a scratch stream
+/// with nothing pending, so its module is loaded before any decode step
+/// queues a reduce behind an exchange wait.
+fn warm_reducer(library: &NativeLibrary, intake: &Intake) -> Result<()> {
+    let mut pointers = [std::ptr::null::<u16>(); MAX_INTAKE_RANKS];
+    for (pointer, plane) in pointers.iter_mut().zip(&intake.planes[0]) { *pointer = plane.ptr.cast(); }
+    let output = crate::shared::memory::DeviceAllocation::new(library, intake.row_bytes.max(256))?;
+    let stream = crate::shared::spark_intake::WarmStream::new(library)?;
+    // SAFETY: slot 0's planes and the output hold one row; the stream is
+    // drained (finish) before either can be released.
+    unsafe {
+        library.v41_compact_reducer()?.reduce_planes(pointers, intake.ranks as u32, std::ptr::null(),
+            output.buffer.ptr.cast(), 1, stream.raw())?;
+    }
+    stream.finish()
+}
+
 /// A link's persistent exchange: the engine side of the worker.
 pub(crate) struct Waves<'a> {
     library: &'a NativeLibrary,
     /// Dropped first: closing it ends the worker, joined in `Drop`.
     jobs: Option<mpsc::Sender<Command>>,
     worker: Option<std::thread::JoinHandle<(Box<dyn std::any::Any + Send>, Result<()>)>>,
-    /// The counters; freed only after the worker joined.
-    control: HostAllocation<'a>,
+    /// Owns the counters; freed only after the worker joined.
+    _control: HostAllocation<'a>,
     words: Words,
     arenas: Vec<StagingArena>,
-    /// Per slot: pinned landing staging of the ranks that arrive in host memory.
-    landing_staging: Vec<Option<HostAllocation<'a>>>,
+    /// Per slot: the request arena's device alias (mapped pinned memory).
+    arena_alias: Vec<usize>,
+    /// Per slot: owns the pinned landing staging of the ranks that arrive in
+    /// host memory (the worker writes it; `landing_alias` reads it).
+    _landing_staging: Vec<Option<HostAllocation<'a>>>,
+    /// Per slot: the staging's device alias (mapped pinned memory), read by
+    /// SM copies behind the landing wait.
+    landing_alias: Vec<Option<usize>>,
     landing: u8,
     planes: Vec<Vec<CuteafdDeviceBuffer>>,
     /// Per slot: the layout of its last staged wave (route bytes for probes).
@@ -491,10 +532,24 @@ impl<'a> Waves<'a> {
             .then(|| HostAllocation::new(library, intake.ranks * plane_bytes)).transpose())
             .collect::<Result<Vec<_>>>()?;
         let planes = intake.planes.iter().zip(&landing_staging).map(|(planes, staging)| planes.iter().enumerate()
-            .map(|(rank, plane)| Plane { device: plane.ptr as usize, bytes: plane_bytes,
+            .map(|(rank, _)| Plane { bytes: plane_bytes,
                 host: staging.as_ref().filter(|_| pinned & (1 << rank) != 0)
                     .map_or(0, |staging| staging.buffer.ptr as usize + rank * plane_bytes) })
             .collect()).collect();
+        // Pinned ranks reach the planes by an SM copy on the consuming stream:
+        // a kernel reads the mapped staging when it runs, after the wait.
+        // `cudaMemcpyAsync` H2D of small sizes may read host memory when it is
+        // queued instead, which is before the worker filled it.
+        let landing_alias = landing_staging.iter().map(|staging| staging.as_ref()
+            .map(|staging| library.cuda_host_buffer_device_alias(staging.buffer).map(|alias| alias.ptr as usize))
+            .transpose()).collect::<Result<Vec<_>>>()?;
+        let arena_alias = arenas.iter().map(|arena| library.cuda_host_buffer_device_alias(arena.host())
+            .map(|alias| alias.ptr as usize)).collect::<Result<Vec<_>>>()?;
+        // Every kernel the engine queues behind an exchange wait must be loaded
+        // before such a wait is pending: a lazily loaded kernel's first launch
+        // can wait for the device to idle, which a pending wait never allows.
+        library.peer_exchange_initialize()?;
+        warm_reducer(library, &intake)?;
         let timeout = transport.timeout();
         let mut native = Native { transport, arenas: arenas.clone(), words, planes, ranks: intake.ranks,
             row_bytes: intake.row_bytes, landing: intake.landing };
@@ -511,7 +566,7 @@ impl<'a> Waves<'a> {
             }
             (Box::new(native.transport) as Box<dyn std::any::Any + Send>, result)
         })?;
-        Ok(Self { library, jobs: Some(jobs), worker: Some(worker), control, words, arenas, landing_staging,
+        Ok(Self { library, jobs: Some(jobs), worker: Some(worker), _control: control, words, arenas, arena_alias, _landing_staging: landing_staging, landing_alias,
             landing: intake.landing, planes: intake.planes, layouts: vec![None; waves], unread: vec![false; waves],
             uses: vec![0; waves], ranks: intake.ranks, rows: intake.rows, row_bytes: intake.row_bytes, waves,
             next_slot: intake.next_slot % waves, sequence: 0, outstanding: VecDeque::new(), grouping })
@@ -545,10 +600,21 @@ impl<'a> Waves<'a> {
             // already reached on a slot's first use) has landed before the
             // copies overwrite its staging, so the NIC no longer reads it. The
             // caller vouches for the sources (`send`'s contract).
+            // The staging copies are SM copies into the arena's mapped alias:
+            // copy-engine work is not held by a stream memory wait, so a
+            // `cudaMemcpyAsync` here could overwrite the arena while the
+            // worker still reads the slot's previous wave.
+            let alias = self.arena_alias[slot];
+            let sizes = [layout.route_bytes, layout.route_bytes, layout.wire_bytes];
+            let offsets = [0, layout.route_bytes, 2 * layout.route_bytes];
+            let regions: Vec<(*mut c_void, *const c_void, u64)> = (0..3).map(|i| {
+                ensure!(sources[i].bytes >= sizes[i] && !sources[i].ptr.is_null(), "Spark staging source is short or null");
+                Ok(((alias + offsets[i]) as *mut c_void, sources[i].ptr.cast_const(), sizes[i] as u64))
+            }).collect::<Result<_>>()?;
             unsafe {
                 self.library.cuda_stream_wait_value32(stream, self.words.ptr(Counter::Landed),
                     sequence.wrapping_sub(self.waves as u32))?;
-                layout.enqueue(self.library, arena.host(), sources, stream)?;
+                self.library.sm_copy_regions(&regions, stream)?;
                 self.library.cuda_stream_write_value32(stream, self.words.ptr(Counter::Staged(slot)), sequence)?;
             }
             self.layouts[slot] = Some(layout);
@@ -593,22 +659,25 @@ impl<'a> Waves<'a> {
         let (expected, slot) = self.outstanding.pop_front().ok_or(WaveError::Lost(ticket.sequence))?;
         ensure!(expected == ticket.sequence && slot == ticket.slot,
             WaveError::Order { expected, found: ticket.sequence });
-        let bytes = ticket.rows * self.row_bytes;
-        // SAFETY: as `submit`'s waits. The uploads read the slot's landing
-        // staging after the wait (the worker filled it before publishing) and
-        // write the slot's planes, which no other stream reads before this
-        // stream's `consumed`; both outlive the queued copies (the link's
-        // owner drains its streams before dropping the link).
-        unsafe {
-            self.library.cuda_stream_wait_value32(stream, self.words.ptr(Counter::Landed), ticket.sequence)?;
-            if let Some(staging) = &self.landing_staging[slot] {
-                for (rank, plane) in self.planes[slot].iter().enumerate().filter(|(rank, _)| self.landing & (1 << rank) == 0) {
-                    let source = CuteafdHostBuffer {
-                        ptr: staging.buffer.ptr.cast::<u8>().add(rank * self.rows * self.row_bytes).cast(),
-                        bytes, ..staging.buffer };
-                    self.library.copy_host_buffer_h2d_async(CuteafdDeviceBuffer { bytes, ..*plane }, source, bytes,
-                        stream)?;
-                }
+        // SAFETY: as `submit`'s waits.
+        unsafe { self.library.cuda_stream_wait_value32(stream, self.words.ptr(Counter::Landed), ticket.sequence)? };
+        if let Some(alias) = self.landing_alias[slot] {
+            let pinned: Vec<cuteafd_ffi::peer_exchange::PeerPlane> = self.planes[slot].iter().enumerate()
+                .filter(|(rank, _)| self.landing & (1 << rank) == 0)
+                .map(|(rank, plane)| cuteafd_ffi::peer_exchange::PeerPlane {
+                    destination: plane.ptr, source: (alias + rank * self.rows * self.row_bytes) as *const c_void,
+                    rows: ticket.rows as u64, row_bytes: self.row_bytes as u64,
+                    destination_pitch: self.row_bytes as u64, source_pitch: self.row_bytes as u64 })
+                .collect();
+            for planes in pinned.chunks(cuteafd_ffi::peer_exchange::PEER_MAX_PLANES) {
+                // SAFETY: the kernel runs after the wait, when the worker has
+                // filled the slot's staging (it published only after its
+                // copies); it reads the mapped staging and writes the slot's
+                // planes, which nothing else touches before this stream's
+                // `consumed`. Both outlive the launch (the link's owner drains
+                // its streams before dropping the link). Rows are BF16 hidden
+                // rows, 16-byte multiples, from 16-byte aligned allocations.
+                unsafe { self.library.peer_push_planes(planes, None, 0, stream)? };
             }
         }
         self.unread[slot] = true;
@@ -663,23 +732,8 @@ impl<'a> Waves<'a> {
         healthy()
     }
 
-    /// The staged route ids (`rows * topk` little-endian u32) of `slot`'s last
-    /// staged wave, for draft probes. Call only once the stream that landed
-    /// the wave was synchronized; valid until the slot's next send.
-    pub(crate) fn staged_ids(&self, slot: usize) -> Result<&[u8]> {
-        let layout = self.layouts[slot].context("no wave staged in this slot")?;
-        ensure!(self.outstanding.iter().all(|&(_, pending)| pending != slot), "slot {slot}'s wave has not landed");
-        // SAFETY: the caller synchronized a stream ordered after the wave's
-        // landing, so its staged copies completed; only this slot's next
-        // send rewrites the arena.
-        let bytes = unsafe { self.arenas[slot].read(layout.bytes)? };
-        Ok(&bytes[..layout.route_bytes])
-    }
 
     pub(crate) fn waves(&self) -> usize { self.waves }
-    pub(crate) fn outstanding(&self) -> usize { self.outstanding.len() }
-    /// The slot the next send takes (the transport's landing rotation).
-    pub(crate) fn next_slot(&self) -> usize { self.next_slot }
 
     /// Stops the worker and returns the transport (after a failure, with its
     /// waves abandoned) and the slot its next wave lands in. Every sent wave

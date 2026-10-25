@@ -118,6 +118,14 @@ int32_t cuteafd_peer_wait_abortable(const uint32_t* flag, uint32_t* recv_state,
     const uint32_t* aborted, void* stream);
 int32_t cuteafd_peer_abort_publish(uint32_t* aborted, void* independent_stream);
 
+// On the stream: copy `count` (1..4) byte regions (`bytes[i]` from
+// `sources[i]` to `destinations[i]`, any alignment; device pointers or the
+// device aliases of mapped pinned host memory) with SM loads and stores,
+// then a system-scope fence. The Spark exchange stages and lands its rows
+// this way: SM work stays in stream order behind stream memory waits.
+int32_t cuteafd_sm_copy_regions(void* const* destinations, const void* const* sources,
+    const uint64_t* bytes, uint32_t count, void* stream);
+
 // P2P probe for `cuteafd fabric --p2p`. Runs one measurement between devices
 // `a` and `b` (peer access enabled both ways by the call) and writes the time
 // per operation in microseconds (median of 5 repeats of `iterations` ops):
