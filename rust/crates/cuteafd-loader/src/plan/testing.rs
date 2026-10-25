@@ -927,7 +927,7 @@ pub fn write_kimi_installed_inventory(root: &std::path::Path, spark: bool) -> st
         else { vec![("rtx-tp1".into(), 3072), ("rtx-tp2".into(), 1536)] };
     let mut variants = Vec::new();
     for (layout, intermediate) in layouts {
-        for capacity in [1, 80, 256, 1024, 4096] {
+        for capacity in [1, 80, 256, 1024, 2048, 2752, 4096] {
             let directory = format!("{layout}/m{capacity}");
             let meta = json!({"directory":directory,"capacity":capacity,"intermediate":intermediate,
                 "experts":896,"top_k":16,"bits":[2,3],"output_dtype":if spark {"bf16"} else {"fp32"},

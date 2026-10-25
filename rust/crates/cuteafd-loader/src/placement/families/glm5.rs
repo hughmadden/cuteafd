@@ -722,7 +722,7 @@ pub fn local_inventory_selected(catalog: &crate::OfficialV41Catalog, manifest: &
     let package = [parent.join("exl3").join(&stem), parent.join("../lib/exl3").join(&stem)]
         .into_iter().map(|p| p.join("rtx-tp2")).find(|p| p.is_dir())
         .ok_or_else(|| anyhow::Error::new(MissingLocalPackage(format!("{stem}/rtx-tp2"))))?;
-    let capacities = [1u64, 16, 80, 256, 1024, 4096];
+    let capacities = cuteafd_core::EXL3_CAPACITIES.map(u64::from);
     let max_rows = rows.max(DECODE_ROWS);
     let compiled = capacities.into_iter().find(|&c| c >= max_rows).unwrap();
     let manifests = capacities.into_iter().filter(|&c| c <= compiled).map(|capacity| {

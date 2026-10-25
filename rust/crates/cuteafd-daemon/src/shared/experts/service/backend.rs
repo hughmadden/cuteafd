@@ -345,11 +345,12 @@ impl<'w, 'a> Execution<'w, 'a> {
         Ok(())
     }
     /// A deferred request's stream drained ([`Self::stream_idle`]): finish its
-    /// host bookkeeping (EXLR8 publishes its timing here) before emission.
+    /// host bookkeeping (EXLR8 and EXL3 publish their timing here) before emission.
     pub(super) fn complete(&mut self) -> Result<()> {
         match self {
             Self::Exlr8(execution) => execution.complete(),
-            Self::Full(_) | Self::Exl3(_) | Self::Fp8(_) => Ok(()),
+            Self::Exl3(execution) => execution.complete(),
+            Self::Full(_) | Self::Fp8(_) => Ok(()),
         }
     }
     /// Whether every request this execution queued has completed.

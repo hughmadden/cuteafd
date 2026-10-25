@@ -12,7 +12,7 @@ elseif(CUTEAFD_CUDA_ARCHITECTURES STREQUAL "121")
 else()
   message(FATAL_ERROR "EXL3 AOT requires a single native SM120 or SM121 target")
 endif()
-set(CUTEAFD_V41_EXL3_CAPACITIES "1;16;80;256;1024;4096" CACHE STRING "EXL3 batch capacities to package")
+set(CUTEAFD_V41_EXL3_CAPACITIES "1;16;80;256;1024;2048;2752;4096" CACHE STRING "EXL3 batch capacities to package")
 # Decoder families land in sibling packages (exl3-k23, exl3-k34, exl3-k45);
 # the daemon selects the family from checkpoint tiers.
 set(CUTEAFD_V41_EXL3_BIT_FAMILIES "2,3;3,4;4,5" CACHE STRING "EXL3 decoder tier families to package; one comma-joined tier list per family")

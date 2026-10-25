@@ -571,10 +571,10 @@ pub fn image_lib(manifest: Option<&std::path::Path>) -> std::path::PathBuf {
 /// every exported capacity up to the first at or above `rows`, each once.
 /// Multi-row decode also admits m80 for canonical m1 reduction geometry.
 pub fn exl3_capacities(rows: u64) -> Vec<u64> {
-    const CAPACITIES: [u64; 6] = [1, 16, 80, 256, 1024, 4096];
+    let capacities = cuteafd_core::EXL3_CAPACITIES.map(u64::from);
     let required = if rows > 1 { rows.max(80) } else { 1 };
-    let top = CAPACITIES.into_iter().find(|&c| c >= required).unwrap_or(4096);
-    CAPACITIES.into_iter().filter(|&c| c <= top).collect()
+    let top = capacities.into_iter().find(|&c| c >= required).unwrap_or(4096);
+    capacities.into_iter().filter(|&c| c <= top).collect()
 }
 
 #[cfg(test)]
@@ -727,7 +727,8 @@ mod tests {
 
     #[test]
     fn exl3_capacities_list_4096_once() {
-        assert_eq!(exl3_capacities(4096), [1, 16, 80, 256, 1024, 4096]);
+        assert_eq!(exl3_capacities(4096), [1, 16, 80, 256, 1024, 2048, 2752, 4096]);
+        assert_eq!(exl3_capacities(2752), [1, 16, 80, 256, 1024, 2048, 2752]);
         assert_eq!(exl3_capacities(64), [1, 16, 80]);
         assert_eq!(exl3_capacities(1), [1]);
         assert_eq!(exl3_capacities(2), [1, 16, 80]);

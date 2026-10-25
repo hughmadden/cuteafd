@@ -323,6 +323,9 @@ pub(crate) struct GlmEngine<'a> {
     /// Prefill units in flight on the one Spark transport (PLAN "Prefill
     /// contract"): each unit owns a prefill workspace slot (`lane_workspaces`).
     prefill_lanes: usize,
+    /// The wave count the link's Spark idle signal recommends (#762), updated
+    /// at each prefill->decode boundary within `prefill_lanes`.
+    wave_depth: Cell<crate::shared::spark_waves::WaveDepth>,
     /// Recorded after a unit's route/wire copies to its pinned staging: the
     /// host waits for these copies only, never the whole stream.
     staged: Cell<*mut c_void>,
@@ -448,7 +451,8 @@ impl<'a> GlmEngine<'a> {
         Ok(Self { quantize_grid, device, exlr8_prefill_activations: super::Exlr8PrefillActivations::A16, native_experts: Vec::new(), native_dense: Vec::new(), peer: None, exchange: None, tp2: None, tp2_exchange: ExchangeDtype::Bf16, force_route_check: Cell::new(false), context_mode, context: None, layer_execution: None,
             context_units: RefCell::new(Vec::new()), library, programs, cfg, weights, stream, max_context, prefill_rows, pages, kv, index, cos_sin,
             decode_workspace: RefCell::new(None), lane_workspaces: RefCell::new(Vec::new()),
-            prefill_lanes, staged: Cell::new(library.cuda_event_create_ordering()?),
+            prefill_lanes, wave_depth: Cell::new(crate::shared::spark_waves::WaveDepth::new(prefill_lanes, prefill_lanes)),
+            staged: Cell::new(library.cuda_event_create_ordering()?),
             staging_owner: RefCell::new([None; 2]), context_reuse: Cell::new(false), context_unit: Cell::new(0), prefill_link: RefCell::new(None), prefill_runtime: None,
             attention_plan: cuteafd_core::coordinator_programs::AttentionReductionPlan::new(DECODE_ROWS, None, None)?,
             terminal: Cell::new(crate::shared::peer_split::TerminalState::Active), spark_bf16: false, full_prefill_logits: false, prefill_span_rows: DEFAULT_PREFILL_SPAN_ROWS, skip: None, l2: None, profile: RefCell::new([0.0; 3]),
@@ -1993,10 +1997,33 @@ impl<'a> GlmEngine<'a> {
         let mut hooks = UnitHooks { engine: self, workspaces: &workspaces, peers: &peers, layers, counts: &counts,
             begin: &begin, attention: &attention, post: &post, transport, cap, waves };
         let ran = crate::shared::prefill_pipeline::run_prefill_units(&mut hooks, &unit_list, waves);
+        drop(hooks);
         if let Some(pair) = &self.tp2 { ran.and(pair.finish_span())?; } else { ran?; }
+        self.observe_wave_depth(link.exchange()?, waves, counts.len());
         // The last unit's workspace holds the call's last rows.
         let last = lanes.len() - 1;
         self.prefill_logits(&[workspaces[last % waves]], &[counts[last]], logit_rows)
+    }
+
+    /// The prefill->decode boundary (#762): the link's always-on round trip
+    /// and Spark idle gap update the recommended wave count (one step, with
+    /// hysteresis). The admitted count fixes the return slots and Spark
+    /// execution slots at startup, so the recommendation is reported, and a
+    /// deployment applies it through the planner's PREFILL_WAVES.
+    fn observe_wave_depth(&self, link: &crate::shared::spark_waves::Waves<'_>, used: usize, units: usize) {
+        let (round_trip_us, idle_us, sampled) = link.pace();
+        let mut depth = self.wave_depth.get();
+        let before = depth.waves;
+        let recommended = depth.observe(round_trip_us, idle_us);
+        self.wave_depth.set(depth);
+        let fields = (self.prefill_lanes, used, units, recommended, round_trip_us, idle_us, sampled);
+        if recommended != before {
+            tracing::info!(admitted = fields.0, used = fields.1, units = fields.2, recommended = fields.3,
+                round_trip_us = fields.4, spark_idle_us = fields.5, waves = fields.6, "prefill wave depth");
+        } else {
+            tracing::debug!(admitted = fields.0, used = fields.1, units = fields.2, recommended = fields.3,
+                round_trip_us = fields.4, spark_idle_us = fields.5, waves = fields.6, "prefill wave depth");
+        }
     }
 
     /// Keep a last-lane suffix on device for serving; only cross-lane logits need a host join.
