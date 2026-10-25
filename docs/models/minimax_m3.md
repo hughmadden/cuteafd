@@ -122,16 +122,17 @@ Status: **under qualification**. `serve-minimax` serves the release from a
 
 `cuteafd plan --layout` on the release headers with the slot's `PROGRAMS.json`
 and the example configs' shapes: 64 sequences, two prefill lanes of 4096 rows,
-1M context, FP8 K/V, vision off, the default 114 GiB per Spark rank. Pools are offline forecasts; serving re-admits measured free memory.
+1M context, FP8 K/V, vision off, the default 114 GiB per Spark rank and the
+default 32 drafter rings. Pools are offline forecasts; serving re-admits measured free memory.
 
-| Coordinator | Sparks | Routed layers on the RTX | KV pool, speculator off | KV pool, DSpark | Spark GiB/rank |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| RTX 5090, 31.8 GiB | 2 | 0 | 179,712 | 132,288 | 112.9 |
-| RTX 5090, 31.8 GiB | 3 | 0 | 179,712 | 132,288 | 76.8 |
-| RTX 5090, 31.8 GiB | 4 | 0 | 179,712 | 132,288 | 58.8 |
-| RTX PRO 6000 | 2 | 0 | 1,162,880 | 1,115,392 | 112.9 |
-| RTX PRO 6000 | 3 | 0 | 1,161,472 | 1,113,984 | 76.8 |
-| RTX PRO 6000 | 4 | 0 | 1,160,000 | 1,112,512 | 58.8 |
+| Coordinator | Sparks | Routed layers on the RTX | KV pool, speculator off | KV pool, DSpark | KV pool, DFlash2 (E4M3) | Spark GiB/rank |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| RTX 5090, 31.8 GiB | 2 | 0 | 179,712 | 113,792 | 125,888 | 112.9 |
+| RTX 5090, 31.8 GiB | 3 | 0 | 179,712 | 113,792 | 125,888 | 76.8 |
+| RTX 5090, 31.8 GiB | 4 | 0 | 179,712 | 113,792 | 125,888 | 58.8 |
+| RTX PRO 6000 | 2 | 0 | 1,162,880 | 1,096,768 | 1,108,864 | 112.9 |
+| RTX PRO 6000 | 3 | 0 | 1,161,472 | 1,095,296 | 1,107,392 | 76.8 |
+| RTX PRO 6000 | 4 | 0 | 1,160,000 | 1,093,888 | 1,105,920 | 58.8 |
 
 ## Changelog
 
@@ -247,15 +248,23 @@ Without the image's `PROGRAMS.json` the planner refuses, as Step-5's does.
 - RoPE tables are 64 MiB each for cos and sin at 1M context; `--max-context`
   shrinks them along with the supported context.
 - DSpark: 2.30 GB of weights, 40 MiB of BF16 K/V rings per drafting ring
-  (default: concurrency, at most eight; a request admitted while every ring is
-  busy decodes target-only) and taps holding a chunk's five target layers.
+  (default: concurrency, at most half the 64-row decode step, 32 at the shipped
+  shapes: with k requests running their drafts share 64 - k rows, so no more
+  than 32 verify a draft each at once; a request admitted while every ring is
+  busy decodes target-only) and taps holding a chunk's five target layers. Its
+  32 rings cost 1.0 GB more than eight, plus 142 MB of step buffers and 130 MB
+  of target head rows for 32-sequence draft steps: 1.28 GB, 18,496 pool tokens
+  on the 5090 at TP2. They paid at C16/C32 on a 5090 (+41%/+23% at TP2,
+  +34%/+14% at TP4), where eight rings left most requests undrafted.
 - DFlash2: the shared drafter's own admission (`families::minimax_m3::dflash::DflashMemory`,
   planner and server alike): 2.22 GB of E4M3 GEMMs and BF16 norms, kernels and selector
   codebooks (4.11 GB in BF16), 21 MiB of FP8 K/V rings per drafting ring (40 MiB in BF16),
-  361 MB of taps and context-update buffers for a 4096-row tail, and its step buffers (51 MB of
-  logits at eight sequences). FP8 packing holds one 377 MB BF16 source matrix (`fc`) at load. On the
-  RTX 5090 at TP2 (planned cards' shapes) the pool is 138,112 tokens with FP8 GEMMs and FP8
-  rings, 111,104 with BF16 GEMMs.
+  361 MB of taps and context-update buffers for a 4096-row tail, and its step buffers (205 MB of
+  logits at 32 sequences). FP8 packing holds one 377 MB BF16 source matrix (`fc`) at load. On the
+  RTX 5090 at TP2 (planned cards' shapes, the default 32 rings) the pool is 125,888 tokens with
+  FP8 GEMMs and FP8 rings, 98,880 with BF16 GEMMs. The 32 rings cost 519 MB more than eight,
+  plus 330 MB of 32-sequence step buffers: 849 MB, 12,224 pool tokens on that card, for
+  +48%/+33% at C16/C32 at TP2 and +42%/+28% at TP4.
 - Spark intake: per lane and rank, a GPU plane of the lane's rows where the NIC
   lands in GPU memory; on a GeForce coordinator one GPU row, with the partials in
   pinned host planes.

@@ -145,7 +145,8 @@ impl<'e, 'a> Backend<'a> for MiniMaxBackend<'e, 'a> {
 
     fn geometry(&self) -> scheduler::Geometry {
         scheduler::Geometry { family: "minimax_m3", vocab_size: self.vocabulary, max_context: self.cache.context,
-            slots: self.cache.sequences, prefill_rows: self.rows, decode_rows: self.rows.min(64),
+            slots: self.cache.sequences, prefill_rows: self.rows,
+            decode_rows: self.rows.min(cuteafd_loader::plan::families::minimax::admission::DECODE_ROWS),
             full_prefill_logits: self.full_prefill_logits }
     }
     fn message_starts(&self) -> &[&str] { &["]~b]"] }

@@ -82,8 +82,9 @@ pub(crate) struct ServeArgs {
     /// otherwise prefill projects only the rows a request needs.
     #[arg(long)]
     full_prefill_logits: bool,
-    /// Drafter context rings (default: max sequences, at most 8; DFlash2 drafts as many
-    /// sequences per step, at most 32). A request admitted while every ring is taken decodes target-only.
+    /// Drafter context rings (default: max sequences, at most half the decode rows, 32 at the
+    /// shipped shapes; DFlash2 drafts as many sequences per step). A request admitted while every
+    /// ring is taken decodes target-only.
     #[arg(long)]
     draft_context_slots: Option<usize>,
     /// GPU memory (GiB) kept free for runtime growth, as the planner's --headroom-gib.
@@ -275,7 +276,8 @@ fn worker(args: &ServeArgs, receive: &mut tokio::sync::mpsc::Receiver<cuteafd_ap
     programs.load_matching(|name| name.starts_with("minimax_"))?;
     let (rows, sequences, lanes) = (args.prefill_rows as usize, args.max_sequences as usize, args.prefill_lanes);
     let chunk = prefill_lanes::lane_capacity(lanes, rows, cuteafd_loader::families::minimax_m3::cache::PAGE_ROWS as usize);
-    let rings = args.draft_context_slots.unwrap_or_else(|| cuteafd_loader::families::minimax_m3::dspark::default_ring_slots(sequences));
+    let rings = args.draft_context_slots.unwrap_or_else(|| cuteafd_loader::plan::families::minimax::admission::default_draft_rings(
+        sequences, rows.min(cuteafd_loader::plan::families::minimax::admission::DECODE_ROWS)));
     let draft_contract=if args.speculator=="dspark" {Some(cuteafd_loader::families::minimax_m3::dspark::DsparkContract::open(&args.snapshot)?)} else {None};
     let draft_layout=draft_contract.as_ref().map(|c|super::dspark::Layout::new(&library,c,rings,chunk)).transpose()?;
     let dflash=args.draft.as_deref().map(|snapshot| super::dflash::Contract::open(snapshot, args.draft_fp8,
@@ -289,7 +291,7 @@ fn worker(args: &ServeArgs, receive: &mut tokio::sync::mpsc::Receiver<cuteafd_ap
         (None,None) => (0,0,0),
     };
     let host_landing = super::routed::host_landing(&library)?;
-    let sizing = RuntimeSizing { rows, decode_rows: rows.min(64), sequences,
+    let sizing = RuntimeSizing { rows, decode_rows: rows.min(cuteafd_loader::plan::families::minimax::admission::DECODE_ROWS), sequences,
         context: if args.max_context == 0 {cfg.max_position as u64} else {args.max_context}, spark_ranks: args.peers.len(),
         logit_rows: RuntimeSizing::head_rows(chunk, args.full_prefill_logits, draft_layout.as_ref().map_or(0, |l| l.sequences * 7)),
         lanes, host_landing };

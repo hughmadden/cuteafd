@@ -409,6 +409,18 @@ pub fn onboard_layers(catalog: &crate::OfficialV41Catalog, cfg: &MiniMaxM3Config
 /// a desktop session or other services needs a lower `--spark-budget-gib`.
 pub const SPARK_BUDGET_BYTES: u64 = 114 << 30;
 
+/// Rows one decode step verifies at most (of a lane's rows): its startup recordings cover 1..=64.
+pub const DECODE_ROWS: usize = 64;
+
+/// Drafter context rings when none are requested. A ring is a request's for its life (a request
+/// without one decodes target-only), and a decode step verifies at most `decode_rows` rows: with
+/// k requests running, their drafts share `decode_rows - k` rows, so at most `decode_rows / 2`
+/// of them verify a draft each at once. Every running request up to that many holds a ring;
+/// more rings could never all draft. The drafter's bytes, rings included, come off the pool.
+pub fn default_draft_rings(sequences: usize, decode_rows: usize) -> usize {
+    sequences.min(decode_rows / 2).max(1)
+}
+
 /// Expert package scratch per Spark rank when the coordinator's package manifest has no layout
 /// for the Spark world (remote packages are architecture-specific and need not be installed on
 /// the coordinator): an estimate, until measured worker admission replaces it.
@@ -539,6 +551,17 @@ impl Recipe {
 pub(crate) mod tests {
     use super::*;
     use crate::families::minimax_m3::config::tests::release_config;
+
+    /// Every running request up to half the decode rows holds a ring: the shipped 64 sequences
+    /// get 32, fewer sequences one each, short decode steps fewer.
+    #[test]
+    fn draft_rings_default_to_the_requests_that_can_draft_together() {
+        assert_eq!(default_draft_rings(64, DECODE_ROWS), 32);
+        assert_eq!(default_draft_rings(16, DECODE_ROWS), 16);
+        assert_eq!(default_draft_rings(1, DECODE_ROWS), 1);
+        assert_eq!(default_draft_rings(64, 16), 8);
+        assert_eq!(default_draft_rings(4, 1), 1);
+    }
     use crate::plan::{checkpoint::Checkpoint, testing};
 
     pub(crate) fn programs_manifest() -> Value {
