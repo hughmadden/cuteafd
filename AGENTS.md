@@ -142,8 +142,13 @@ before → after tables with conditions.
   under-report usable unified memory. Remote exports reserve aggregate GPU
   and host RAM before container creation and release only after it stops.
 - Submodules are pinned with tree locks (`third_party/*.lock.json`).
-  Kernel changes go to `../sparkinfer-glmrt` master, quantizer changes to
-  `../GPTQModel` main; push there first, then bump pin and lock here.
+  Project-specific user direction (2026-10-25): stop upstream submissions
+  for the layering work, and ask the user before any future upstream
+  submission for this project (pushes, PRs, issues or comments). Keep work
+  in local checkouts or the user's fork. Upstream acceptance is not a build
+  or release prerequisite; use the reviewed, pinned kernel and matching
+  artifacts. The older upstream-first workflow for `sparkinfer-glmrt` and
+  `GPTQModel` applies only after that explicit user approval.
   Dev images are toolchain-only and pin-independent: a SparkInfer bump
   needs only a new WIP slot build. Rebuild them with
   `scripts/build/build-dev-images.sh` only when the toolchain changes;
