@@ -66,6 +66,12 @@ CUTEAFD_RELEASE_REMOTE_BUILD_DIR selects where the Spark seed host stages the so
 tree and builds the expert images (default: a cuteafd-release-build directory in the
 seed host's own home). Use a fresh one per release so a previous staging tree cannot
 be reused.
+CUTEAFD_RELEASE_WHEELHOUSE (required) names a local directory holding every wheel
+docker/release-python-lock.json lists, for both architectures: the release images
+install exactly those, --no-deps, hash-checked, with no network or index.
+`scripts/build/release-python-lock.py fetch --lock docker/release-python-lock.json
+--wheelhouse DIR` fills it from the locked HTTPS URLs; the build verifies every hash
+before any compile and copies the directory to the Spark seed's staging tree.
 CUTEAFD_RELEASE_IMAGE_TRANSPORT picks how the Spark image reaches the other build
 hosts: rdma (default; rdmapipe seed -> each peer) or ssh-hub (for hub-and-spoke
 fabrics: one docker image save from the seed into a task-owned archive under
@@ -319,6 +325,28 @@ spark_export_min_free_gib="${CUTEAFD_RELEASE_SPARK_MIN_FREE_GIB:-100}"
   release_die "CUTEAFD_RELEASE_SPARK_MIN_FREE_GIB must be positive GiB"
 # release-build-budget:end
 
+# release-python-lock:start
+# The release images' Python packages: exactly docker/release-python-lock.json, read
+# from a local hash-checked wheelhouse that reaches docker as a named build context.
+release_python_lock="$repo_root/docker/release-python-lock.json"
+release_wheelhouse="${CUTEAFD_RELEASE_WHEELHOUSE:-}"
+if [[ -n "$release_wheelhouse" ]]; then
+  release_validate_path_setting CUTEAFD_RELEASE_WHEELHOUSE "$release_wheelhouse"
+  release_path_within "$release_wheelhouse" "$repo_root" &&
+    release_die "CUTEAFD_RELEASE_WHEELHOUSE must not be $repo_root or inside it"
+fi
+# The Spark seed keeps its copy inside the staging tree's .cuteafd-release/, which
+# the source sync and the source manifest both leave alone.
+release_remote_wheelhouse=.cuteafd-release/wheelhouse
+release_verify_wheelhouse() {
+  [[ -n "$release_wheelhouse" ]] ||
+    release_die "CUTEAFD_RELEASE_WHEELHOUSE must name the wheelhouse for docker/release-python-lock.json (fill it with scripts/build/release-python-lock.py fetch)"
+  python3 -I "$repo_root/scripts/build/release-python-lock.py" verify \
+    --lock "$release_python_lock" --wheelhouse "$release_wheelhouse" ||
+    release_die "the release wheelhouse $release_wheelhouse does not hold docker/release-python-lock.json"
+}
+# release-python-lock:end
+
 # release-image-distribution:start
 # How the fresh Spark image reaches the other build hosts. `rdma` (default) streams
 # seed -> peer through rdmapipe. `ssh-hub` is for hub-and-spoke fabrics where the
@@ -508,6 +536,13 @@ if ((dry_run)); then
   fi
   echo "  build legs: $release_leg_plan"
   echo "  Spark image distribution: $release_image_transport_plan"
+  if [[ -z "$release_wheelhouse" ]]; then
+    echo "  Python packages: CUTEAFD_RELEASE_WHEELHOUSE is not set; a build stops before compiling"
+  elif (release_verify_wheelhouse) >/dev/null 2>&1; then
+    echo "  Python packages: docker/release-python-lock.json from $release_wheelhouse (offline, hash-checked)"
+  else
+    echo "  Python packages: $release_wheelhouse does not hold docker/release-python-lock.json; a build stops before compiling"
+  fi
   echo "  release tag: $release_version"
   echo "  V41 Spark expert roles: ${spark_tp_roles:-<legacy TP4 only>} ($spark_tp_roles_note)"
   echo "  coordinator image: $COORDINATOR_DOCKER_INFERENCE"
@@ -932,6 +967,7 @@ if [[ -n "$release_build_root" ]]; then
     release_die "$seed_host release build root $release_build_root needs at least 60 GiB free"
 fi
 release_image_distribution_preflight
+release_verify_wheelhouse
 
 # Only the coordinator writes local artifacts/reuse proof. Allocate the proof path
 # before forking so the shared tail can read it without importing worker variables.
@@ -1041,6 +1077,7 @@ DOCKER_BUILDKIT=1 docker build \
   --build-arg CUTEAFD_SPARKINFER_COMMIT="$sparkinfer_commit" \
   --build-arg CUTEAFD_RELEASE_VERSION="$release_version" \
   --build-arg CUTEAFD_SPARK_TP_ROLES= \
+  --build-context "wheelhouse=$release_wheelhouse" \
   -f "$repo_root/docker/Dockerfile.release" \
   -t "$COORDINATOR_DOCKER_INFERENCE" \
   "$repo_root"
@@ -1088,6 +1125,11 @@ release_sync --delete --delete-excluded \
   --exclude '*.pyo' \
   "$repo_root/third_party/xgrammar/" \
   "$seed_host:$remote_dir/third_party/xgrammar/"
+release_ssh "$seed_host" "mkdir -p $remote_dir_quoted/$release_remote_wheelhouse"
+release_sync --delete "$release_wheelhouse/" "$seed_host:$remote_dir/$release_remote_wheelhouse/"
+release_ssh "$seed_host" \
+  "cd $remote_dir_quoted && python3 -I scripts/build/release-python-lock.py verify --lock docker/release-python-lock.json --wheelhouse $release_remote_wheelhouse --arch arm64" ||
+  release_die "$seed_host staged wheelhouse does not hold docker/release-python-lock.json"
 verify_remote_source_manifest
 
 # Prepared before the leg below so the quoted heredoc region stays exactly the
@@ -1328,6 +1370,7 @@ DOCKER_BUILDKIT=1 docker build \
   --build-arg CUTEAFD_SPARKINFER_COMMIT="$sparkinfer_commit" \
   --build-arg CUTEAFD_RELEASE_VERSION="$release_version" \
   --build-arg CUTEAFD_SPARK_TP_ROLES="$spark_tp_roles" \
+  --build-context wheelhouse=.cuteafd-release/wheelhouse \
   -f docker/Dockerfile.release \
   -t "$inference_image" .
 fi
