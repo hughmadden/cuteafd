@@ -1175,9 +1175,6 @@ type CudaEventRecordFn =
     unsafe extern "C" fn(cuda_event: *mut c_void, cuda_stream: *mut c_void) -> CuteafdStatus;
 type CudaEventSynchronizeFn = unsafe extern "C" fn(cuda_event: *mut c_void) -> CuteafdStatus;
 type CudaEventQueryFn = unsafe extern "C" fn(cuda_event: *mut c_void, ready: *mut i32) -> CuteafdStatus;
-type RdmaRcEndpointTargetFn = unsafe extern "C" fn(*mut c_void, *mut u64, *mut u32) -> CuteafdStatus;
-type RdmaRcEndpointPostRequestPartFn =
-    unsafe extern "C" fn(*mut c_void, usize, usize, u32, usize, usize, usize, u64, u32, u64) -> CuteafdStatus;
 type CudaStreamWaitValue32Fn = unsafe extern "C" fn(cuda_stream: *mut c_void, word: *const u32, value: u32) -> CuteafdStatus;
 type CudaStreamWriteValue32Fn = unsafe extern "C" fn(cuda_stream: *mut c_void, word: *mut u32, value: u32) -> CuteafdStatus;
 type CudaEventElapsedMsFn = unsafe extern "C" fn(
@@ -1715,9 +1712,6 @@ native_symbols! {
     cuteafd_cuda_event_query: CudaEventQueryFn,
     cuteafd_cuda_stream_wait_value32: CudaStreamWaitValue32Fn,
     cuteafd_cuda_stream_write_value32: CudaStreamWriteValue32Fn,
-    cuteafd_rdma_rc_endpoint_request_target: RdmaRcEndpointTargetFn,
-    cuteafd_rdma_rc_endpoint_recv_landing_target: RdmaRcEndpointTargetFn,
-    cuteafd_rdma_rc_endpoint_post_request_part: RdmaRcEndpointPostRequestPartFn,
     cuteafd_cuda_stream_wait_event: CudaStreamWaitEventFn,
     cuteafd_cuda_event_create: CudaEventCreateFn,
     cuteafd_cuda_event_create_ordering: CudaEventCreateFn,
@@ -1791,8 +1785,6 @@ native_symbols! {
     cuteafd_rdma_rc_endpoint_poll: RdmaRcEndpointPollFn,
     cuteafd_rdma_rc_endpoint_copy_recv: RdmaRcEndpointCopyRecvFn,
     cuteafd_rdma_rc_endpoint_copy_recv_at: RdmaRcEndpointCopyRecvAtFn,
-    cuteafd_rdma_rc_endpoint_expose_device: unsafe extern "C" fn(*mut c_void, *mut c_void, usize, *mut u32) -> CuteafdStatus,
-    cuteafd_rdma_rc_endpoint_post_write_flagged: unsafe extern "C" fn(*mut c_void, usize, usize, u64, u32, u64, u64, u32, u64) -> CuteafdStatus,
     cuteafd_rdma_rc_endpoint_register_region: unsafe extern "C" fn(*mut c_void, *mut c_void, usize, *mut u32) -> CuteafdStatus,
     cuteafd_rdma_rc_endpoint_post_send_slot_region: unsafe extern "C" fn(*mut c_void, usize, usize, u32, usize, usize, u64) -> CuteafdStatus,
     cuteafd_rdma_rc_endpoint_destroy: RdmaRcEndpointDestroyFn,
@@ -4904,38 +4896,6 @@ impl NativeLibrary {
     /// # Safety
     /// The range must be host memory that stays allocated until the endpoint is
     /// destroyed.
-    /// Registers a device range for remote RDMA writes on the endpoint and
-    /// returns its rkey (`None` removes it).
-    ///
-    /// # Safety
-    /// `handle` is a live endpoint; the range stays allocated until removed or
-    /// the endpoint is destroyed.
-    pub unsafe fn rdma_rc_endpoint_expose_device(&self, handle: *mut c_void, device: Option<CuteafdDeviceBuffer>)
-        -> Result<u32> {
-        type ExposeFn = unsafe extern "C" fn(*mut c_void, *mut c_void, usize, *mut u32) -> CuteafdStatus;
-        let expose: ExposeFn = self.cuteafd_rdma_rc_endpoint_expose_device()?;
-        let (ptr, bytes) = device.map_or((std::ptr::null_mut(), 0), |d| (d.ptr, d.bytes));
-        let mut rkey = 0;
-        let status = unsafe { expose(handle, ptr, bytes, &mut rkey) };
-        self.status_to_result("cuteafd_rdma_rc_endpoint_expose_device", status)?;
-        Ok(rkey)
-    }
-
-    /// RDMA-writes `bytes` at `offset` of the send buffer to `remote`, then
-    /// `flag_value` to `flag_remote` (signaled with `wr_id`).
-    ///
-    /// # Safety
-    /// `handle` is a live connected endpoint; the remote ranges were exposed
-    /// by the peer with these rkeys and hold the written extents.
-    #[allow(clippy::too_many_arguments)]
-    pub unsafe fn rdma_rc_endpoint_post_write_flagged(&self, handle: *mut c_void, offset: usize, bytes: usize,
-        remote: u64, rkey: u32, flag_value: u64, flag_remote: u64, flag_rkey: u32, wr_id: u64) -> Result<()> {
-        type WriteFn = unsafe extern "C" fn(*mut c_void, usize, usize, u64, u32, u64, u64, u32, u64) -> CuteafdStatus;
-        let write: WriteFn = self.cuteafd_rdma_rc_endpoint_post_write_flagged()?;
-        let status = unsafe { write(handle, offset, bytes, remote, rkey, flag_value, flag_remote, flag_rkey, wr_id) };
-        self.status_to_result("cuteafd_rdma_rc_endpoint_post_write_flagged", status)
-    }
-
     pub unsafe fn rdma_rc_endpoint_register_region(
         &self,
         handle: *mut c_void,
@@ -4967,51 +4927,6 @@ impl NativeLibrary {
         let post: PostFn = self.cuteafd_rdma_rc_endpoint_post_send_slot_region()?;
         let status = unsafe { post(handle, slot_offset, slot_bytes, region, region_offset, region_bytes, wr_id) };
         self.status_to_result("cuteafd_rdma_rc_endpoint_post_send_slot_region", status)
-    }
-
-    /// Registers the endpoint's receive ring for remote request WRITEs and
-    /// returns its address and rkey (stable until the endpoint is destroyed).
-    pub fn rdma_rc_endpoint_request_target(&self, handle: *mut c_void) -> Result<(u64, u32)> {
-        let f = self.cuteafd_rdma_rc_endpoint_request_target()?;
-        let (mut address, mut rkey) = (0, 0);
-        // SAFETY: the caller owns the live endpoint handle; both outputs are
-        // valid locals that native writes only on success.
-        let status = unsafe { f(handle, &mut address, &mut rkey) };
-        self.status_to_result("cuteafd_rdma_rc_endpoint_request_target", status)?;
-        Ok((address, rkey))
-    }
-
-    /// Exposes the endpoint's GPU landing range for remote reply-tail WRITEs
-    /// and returns its address and rkey.
-    pub fn rdma_rc_endpoint_recv_landing_target(&self, handle: *mut c_void) -> Result<(u64, u32)> {
-        let f = self.cuteafd_rdma_rc_endpoint_recv_landing_target()?;
-        let (mut address, mut rkey) = (0, 0);
-        // SAFETY: the caller owns the live endpoint handle; both outputs are
-        // valid locals that native writes only on success.
-        let status = unsafe { f(handle, &mut address, &mut rkey) };
-        self.status_to_result("cuteafd_rdma_rc_endpoint_recv_landing_target", status)?;
-        Ok((address, rkey))
-    }
-
-    /// Posts one signaled WR carrying frame bytes `[offset, offset + bytes)`
-    /// of the request staged at send-ring `slot`: the first `prefix` bytes
-    /// from the slot, the rest from `region` (`None`: all from the slot).
-    /// `remote = None` posts a SEND, otherwise an RDMA WRITE to `(address, rkey)`.
-    ///
-    /// # Safety
-    /// `handle` is a live connected endpoint. The source bytes stay unmodified
-    /// and registered until this WR's completion or QP quiescence; a remote
-    /// range is one the peer exposed for this QP and holds the written extent.
-    #[allow(clippy::too_many_arguments)]
-    pub unsafe fn rdma_rc_endpoint_post_request_part(&self, handle: *mut c_void, slot: usize, prefix: usize,
-        region: Option<(u32, usize)>, offset: usize, bytes: usize, remote: Option<(u64, u32)>, wr: u64) -> Result<()> {
-        let f = self.cuteafd_rdma_rc_endpoint_post_request_part()?;
-        let (region, region_offset) = region.unwrap_or((u32::MAX, 0));
-        let (address, rkey) = remote.unwrap_or((0, 0));
-        // SAFETY: forwarded from this function's contract; native bounds-checks
-        // every local range against its registrations.
-        let status = unsafe { f(handle, slot, prefix, region, region_offset, offset, bytes, address, rkey, wr) };
-        self.status_to_result("cuteafd_rdma_rc_endpoint_post_request_part", status)
     }
 
     pub fn rdma_rc_endpoint_destroy(&self, handle: *mut c_void) -> Result<()> {

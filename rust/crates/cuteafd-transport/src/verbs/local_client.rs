@@ -22,14 +22,9 @@ pub(crate) struct LocalTp4Client {
     max_waves: usize,
     /// Per-rank device ranges response payloads land in (GPU landing).
     landing: Vec<Option<DeviceLanding>>,
-    /// Per-rank write targets: responses are RDMA-written there (write mode).
-    write: Vec<Option<DeviceWriteTarget>>,
     /// Shared registered request buffer (zero-copy egress).
     egress: Option<Arc<super::egress::EgressBuffer>>,
     egress_slot: usize,
-    /// Request and reply chunk sizes every session of this client opens with
-    /// (the process's installed sizes). TEMPORARY: remove after PFC test (TJ 2026-10-25).
-    chunking: super::request_write::SparkChunking,
     /// Optional terminal contract. A failed temporary/persistent endpoint
     /// publishes into this witness before its external landing owner drops.
     terminal_owner: Option<Arc<AtomicBool>>,
@@ -63,10 +58,8 @@ impl LocalTp4Client {
             waves: VecDeque::with_capacity(1),
             max_waves: 1,
             landing: vec![None; world],
-            write: vec![None; world],
             egress: None,
             egress_slot: 0,
-            chunking: super::request_write::spark_chunking(),
             terminal_owner: None,
             terminal_failed: false,
             terminal_quiesced: false,
@@ -93,11 +86,6 @@ impl LocalTp4Client {
         Ok(())
     }
     pub(crate) fn max_waves(&self) -> usize { self.max_waves }
-    /// Sessions opened from here on use `chunking` (tests compare sizes on one process).
-    #[cfg(test)]
-    pub(crate) fn set_chunking(&mut self, chunking: super::request_write::SparkChunking) {
-        self.chunking = chunking;
-    }
     pub(crate) fn timeout(&self) -> Duration { self.config.timeout }
     pub(crate) fn open_waves(&self) -> usize { self.waves.len() }
 
@@ -147,7 +135,7 @@ impl LocalTp4Client {
         self.sessions[rank] = Some(VerbsHostProtocolV2PersistentClientSession::connect_local(
             self.peers[rank], &self.config, request, landing,
             if egress { self.egress.as_ref() } else { None },
-            self.write[rank], self.terminal_owner.clone(), flow_label, capacity, self.model_endpoint, self.chunking)?);
+            self.terminal_owner.clone(), flow_label, capacity, self.model_endpoint)?);
         self.retain_grouping(rank)
     }
 
@@ -241,38 +229,6 @@ impl LocalTp4Client {
         self.landing = landing;
         Ok(())
     }
-    /// Write mode from the next connection on: each rank's responses are
-    /// RDMA-written into its target (no receives); drops current sessions.
-    pub(crate) fn set_write_targets(&mut self, write: Vec<Option<DeviceWriteTarget>>) -> Result<()> {
-        anyhow::ensure!(write.len() == self.peers.len(), "one write target entry per rank");
-        self.reset();
-        self.write = write;
-        Ok(())
-    }
-    /// Write mode: posts `request` to every rank and returns; the responses
-    /// arrive as RDMA writes (their flags tell the GPU). Send completions are
-    /// reaped as send slots are reused.
-    pub(crate) fn post_written(&mut self, request: &ExpertProtocolV2Request) -> Result<()> {
-        crate::health::ensure_available()?;
-        anyhow::ensure!(self.waves.is_empty(), "a received wave is pending on this transport");
-        self.flows.ensure_all(&self.peers)?;
-        for rank in 0..self.peers.len() {
-            anyhow::ensure!(self.write[rank].is_some(), "rank {rank} has no write target");
-            if self.sessions[rank].as_ref().map(|s| s.fits(request)).transpose()? == Some(false) {
-                self.retire_session(rank)?;
-            }
-            if self.sessions[rank].is_none() {
-                self.drain_retired()?;
-                self.open_session(rank, request, None, false)?;
-            }
-            let session = self.sessions[rank].as_mut().unwrap();
-            anyhow::ensure!(session.write_mode, "rank {rank} session is not in write mode");
-            // No reply arrives on this QP; the caller's GPU fence is the credit.
-            session.request_credits.written_reply_observed();
-            session.post_chunk_request(request, &self.config)?;
-        }
-        Ok(())
-    }
     /// Ranks whose live session lands payloads in device memory.
     pub(crate) fn landing_ranks(&self) -> Vec<bool> {
         self.sessions.iter().map(|s| s.as_ref().is_some_and(|s| s.gpu_landing)).collect()
@@ -336,31 +292,13 @@ impl LocalTp4Client {
             }
         }
         if self.expert_grouping.iter().any(Option::is_some) { self.installed_grouping()?; }
-        // Every rank's bootstrap is validated before any request enters a QP.
-        let mut uploads = Vec::with_capacity(self.peers.len());
+        // Every rank's bootstrap is validated before any request enters a QP;
+        // then each rank's request goes out as one SEND.
+        let mut timings = Vec::with_capacity(self.peers.len());
         for session in self.sessions.iter_mut() {
-            uploads.push(session.as_mut().unwrap().stage_request(request, &self.config)?);
+            timings.push(session.as_mut().unwrap().post_request(request, &self.config)?);
         }
-        // One chunk per rank per round: the coordinator port interleaves every
-        // rank's tail instead of bursting whole frames rank after rank.
-        let deadline = Instant::now() + self.config.timeout;
-        while uploads.iter().any(|upload| !upload.sent()) {
-            anyhow::ensure!(Instant::now() < deadline, "Spark request upload deadline expired");
-            let mut progressed = false;
-            for (session, upload) in self.sessions.iter_mut().zip(&mut uploads) {
-                let session = session.as_mut().unwrap();
-                progressed |= session.try_reap_request_sends()?;
-                progressed |= session.post_request_part(upload)?;
-            }
-            if !progressed {
-                // Every unsent rank's send queue is full: wait on one of them.
-                let rank = uploads.iter().position(|upload| !upload.sent()).expect("an unsent upload remains");
-                let session = self.sessions[rank].as_mut().unwrap();
-                session.post_request_parts(&mut uploads[rank], deadline.saturating_duration_since(Instant::now()))?;
-            }
-        }
-        for (rank, upload) in uploads.into_iter().enumerate() {
-            let timing = upload.timing;
+        for (rank, timing) in timings.into_iter().enumerate() {
             let (response_tx, response_rx) = tokio::sync::oneshot::channel();
             self.pending[rank].push_back(VerbsHostProtocolV2PendingChunkRoundtrip::new(
                 VerbsHostProtocolV2QueuedChunkCommand {
@@ -526,9 +464,9 @@ fn wait_for_ring_release(stream: &mut TcpStream, timeout: Duration) -> Result<()
 }
 
 /// A session opens with its landing rotation at slot 0: native posts its
-/// receive WQEs' landing slots in post order from 0 (`RdmaLandingSlots`), and
-/// the worker's reply tail WRITEs pick landing slot `sequence % slots` from
-/// the session's first reply. The client's waves rotate one wave slot per
+/// receive WQEs' landing slots in post order from 0 (`RdmaLandingSlots`), so
+/// reply `sequence` lands in slot `sequence % slots` from the session's first
+/// reply. The client's waves rotate one wave slot per
 /// dispatch (`egress_slot`), and the exchange lands wave `k` in slot `k % N`.
 /// A multi-slot GPU landing may therefore (re)open only in phase, at wave
 /// slot 0: otherwise its next reply would land in another wave's planes.
@@ -822,8 +760,8 @@ mod tests {
     /// address; `CUTEAFD_LOOPBACK_GPU=1` adds GPU landing, which needs CUDA and
     /// dma-buf). A real verbs worker and a real coordinator client on one
     /// host, for 1..=4 outstanding waves: pinned host or N-slot GPU landing,
-    /// copied or N-slot registered egress, small (decode-sized, one SEND) and
-    /// large (chunked WRITE tails) frames. Every echo is byte-exact in its own
+    /// copied or N-slot registered egress, small (decode-sized) and large
+    /// (full-capacity) frames, each one SEND. Every echo is byte-exact in its own
     /// wave's landing slot, and a registered egress slot is rewritten
     /// (`egress_target`, which drains only that slot's readers) while the
     /// other waves are still outstanding without disturbing their payloads.
@@ -927,6 +865,80 @@ mod tests {
                     result?;
                 }
             }
+        }
+        Ok(())
+    }
+    /// Explicit hardware gate only (`CUTEAFD_LOOPBACK_ADDR`, optional
+    /// `CUTEAFD_LOOPBACK_GPU=1`). A full-capacity request (2048 BF16 rows of
+    /// 6144, 25 MB, copied and from registered egress) and its 25 MB echo each
+    /// go as exactly one SEND: the request posts one send-queue entry and the
+    /// worker parses it whole from one receive; the reply arrives as one
+    /// full-size receive completion, byte-exact.
+    #[test]
+    #[ignore = "requires approved native RDMA loopback hardware gate"]
+    fn native_loopback_large_request_and_reply_are_one_send_each() -> Result<()> {
+        let ip = std::env::var("CUTEAFD_LOOPBACK_ADDR").context("set CUTEAFD_LOOPBACK_ADDR to a local RoCE address")?;
+        let gpu = std::env::var("CUTEAFD_LOOPBACK_GPU").as_deref() == Ok("1");
+        let (hidden, rows) = (6144u32, 2048u32);
+        let listener = std::net::TcpListener::bind(format!("{ip}:0"))?;
+        let addr = listener.local_addr()?;
+        drop(listener);
+        let executor: Arc<dyn crate::synthetic::ProtocolV2ExpertExecutor> = Arc::new(Echo);
+        std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+            let _ = runtime.block_on(super::super::serve_protocol_v2_verbs_host_with_executor(&addr.to_string(), executor));
+        });
+        std::thread::sleep(Duration::from_millis(300));
+        let library = load_verbs_host_native_library()?;
+        let plane_bytes = rows as usize * hidden as usize * 2;
+        for registered in [false, true] {
+            let mut client = LocalTp4Client::new_ranks(vec![addr], TcpTransportConfig {
+                timing: false, timeout: Duration::from_secs(30), max_frame_bytes: 64 << 20 });
+            if registered { client.enable_egress(plane_bytes)?; }
+            let plane = if gpu {
+                let buffer = library.alloc_device_buffer(plane_bytes)?;
+                client.set_landing(vec![Some(DeviceLanding::new(buffer))])?;
+                Some(buffer)
+            } else { None };
+            let result = (|| -> Result<()> {
+                for index in 0..3u64 {
+                    let expected: Vec<u8> = (0..plane_bytes).map(|i| ((i * 7 + index as usize) % 253) as u8).collect();
+                    let payload: bytes::Bytes = if registered {
+                        let target = client.egress_target()?;
+                        // SAFETY: egress_target returned a writable slot of `plane_bytes`
+                        // that no request views and no send still reads.
+                        unsafe { std::slice::from_raw_parts_mut(target.ptr.cast::<u8>(), plane_bytes) }
+                            .copy_from_slice(&expected);
+                        client.egress_payload(plane_bytes)?
+                    } else { expected.clone().into() };
+                    let request = bf16_request(index + 1, rows, hidden, payload)?;
+                    let wire = request.wire_stats().wire_bytes;
+                    anyhow::ensure!(wire > 16 << 20, "request of {wire} bytes is not large");
+                    let sent_before = client.sessions[0].as_ref().map_or(0, |s| s.request_sends.in_flight());
+                    client.dispatch(&request)?;
+                    let session = client.sessions[0].as_ref().context("session opened by dispatch")?;
+                    // Nothing reaps send completions between dispatch and here.
+                    anyhow::ensure!(session.request_sends.in_flight() == sent_before + 1,
+                        "a {wire}-byte request posted {} send-queue entries", session.request_sends.in_flight() - sent_before);
+                    let mut got = vec![0u8; plane_bytes];
+                    let (mut frames, mut landed) = (0usize, false);
+                    while !client.poll(|chunk| {
+                        frames += 1;
+                        landed |= chunk.landed;
+                        anyhow::ensure!(chunk.wire_bytes > 16 << 20, "a {} byte reply frame was split", chunk.wire_bytes);
+                        if !chunk.landed { got.copy_from_slice(chunk.partial_output_payload.as_ref()); }
+                        Ok(())
+                    })? {}
+                    if let Some(buffer) = plane.filter(|_| landed) { library.copy_d2h(&mut got, buffer)?; }
+                    anyhow::ensure!(frames == 1, "the echo arrived as {frames} receive completions");
+                    anyhow::ensure!(got == expected, "request {} echo differs", index + 1);
+                }
+                eprintln!("loopback gpu={gpu} registered={registered}: 3 x {plane_bytes} B one SEND each way");
+                Ok(())
+            })();
+            client.reset();
+            if let Some(mut buffer) = plane { library.free_device_buffer(&mut buffer)?; }
+            result?;
         }
         Ok(())
     }
