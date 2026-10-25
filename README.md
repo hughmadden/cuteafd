@@ -141,12 +141,6 @@ report: [benchmarks](benchmarks/README.md).
 <td width="27%" valign="top"><a href="benchmarks/qwen4/2026-10-18-smoke-qwen3-8-flash-next-nvfp4-1rtx-2spark-qwen38-nvfp4-min/card.svg"><img src="benchmarks/qwen4/2026-10-18-smoke-qwen3-8-flash-next-nvfp4-1rtx-2spark-qwen38-nvfp4-min/card.svg" alt="nvidia/Qwen3.8-Flash-Next-NVFP4 on 1× RTX PRO 6000 @ gpu-powerd 450/450 W + 2× DGX Spark"></a><br><sub>1× RTX + 2× Spark</sub></td>
 <td width="27%" valign="top">n/a<br><sub>Not measured for v3 (one card per checkpoint).</sub></td>
 </tr>
-<tr>
-<td width="19%" valign="top"><a href="docs/models/minimax_m3.md"><b>MiniMax M3.1</b></a><br><sub>MiniMaxAI/MiniMax-M3.1-Flash</sub><br><sub>nvfp4ct-g16</sub></td>
-<td width="27%" valign="top"><a href="benchmarks/minimax_m3/2026-10-24-smoke-minimax-m3-1-flash-1rtx-2spark-rtx5090-off/card.svg"><img src="benchmarks/minimax_m3/2026-10-24-smoke-minimax-m3-1-flash-1rtx-2spark-rtx5090-off/card.svg" alt="MiniMaxAI/MiniMax-M3.1-Flash on 1× GeForce RTX 5090 @ 600 W + 2× DGX Spark · 31 GiB budget"></a><br><sub>RTX 5090 (31 GiB budget) + 2× Spark</sub></td>
-<td width="27%" valign="top">pending<br><sub>Not measured yet: no RTX PRO 6000 run for this family.</sub></td>
-<td width="27%" valign="top">pending<br><sub>Not measured yet: no two-RTX run for this family.</sub></td>
-</tr>
 </table>
 
 Each card is one launch of the basic profile: tok/s for C1 decode and concurrent code with thinking off, cold 8K prefill, logit fidelity against the family golden reference, prefix-cache restore exactness and lossless speculation. Older releases, other profiles and every report: [benchmarks](benchmarks/README.md).
