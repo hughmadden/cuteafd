@@ -716,6 +716,12 @@ def _family_launch_result(tmp_path: Path, family_config: dict, model: str, keys:
         (bin_dir / tool).write_text('#!/usr/bin/env bash\nprintf "%s \\n" "$(basename "$0") $*" >&2\n'
                                     + ('case "$*" in *"docker run --rm"*"python3"*) exit 2 ;; esac\n'
                                        if preflight_error and tool == "ssh" else '') +
+                                    # STUB_SSH_FAIL fails the remote commands that contain it; a slot check answers
+                                    # STUB_SLOT_SPARKINFER_<host>, else STUB_SLOT_SPARKINFER, else the stub pin.
+                                    ('[[ -z "${STUB_SSH_FAIL:-}" || "$*" != *"$STUB_SSH_FAIL"* ]] || exit 1\n'
+                                     'case "$*" in *release_wip_spark_slot_revision*) v="STUB_SLOT_SPARKINFER_$1"; '
+                                     'echo "${!v:-${STUB_SLOT_SPARKINFER:-test-pin}}" ;; esac\n'
+                                     if tool == "ssh" else '') +
                                     'case "$*" in *"docker logs"*) echo "${STUB_WORKER_READY:-worker bootstrap ready}"; '
                                     'echo "audio encoder ready backend=mimo_audio_fp32_v1/cuda13000/cufft12000/cublas13.0.0/cute_aot_sm121/export' + 'cd' * 32 + '" ;; esac\n' +
                                     ('case "$*" in image\\ inspect*) echo test-pin ;; '
@@ -764,7 +770,8 @@ exec python3 -c "$code" "$@"
 '''
             (bin_dir / tool).write_text(stub)
         (bin_dir / tool).chmod(0o755)
-    (bin_dir / "curl").write_text('#!/usr/bin/env bash\nprintf \'%s\\n\' \'{"data":[{"id":"test/model"}]}\'\n')
+    (bin_dir / "curl").write_text('#!/usr/bin/env bash\n[[ -z "${STUB_CURL_FAIL:-}" ]] || exit 22\n'
+                                  'printf \'%s\\n\' \'{"data":[{"id":"test/model"}]}\'\n')
     (bin_dir / "curl").chmod(0o755)
     (bin_dir / "nvidia-smi").write_text('#!/usr/bin/env bash\ncase "$*" in *memory.total*) echo ' + str(gpu_total_mib) +
                                          ' ;; *memory.free*) echo ' + str(gpu_free_mib) +
@@ -1135,6 +1142,48 @@ def test_launch_and_stop_take_the_same_wip_roots(tmp_path, escapes):
         assert "docker cp" not in result.stderr and "docker run" not in result.stderr
     else:
         assert result.returncode == 0 and stop.returncode == 0, (result.stderr, stop.stderr)
+
+
+@pytest.mark.parametrize("case", ["verified", "pulled", "missing-image", "missing-slot", "unverified"])
+def test_wip_spark_slot_check_verifies_the_slot_source_without_staging(tmp_path, case):
+    """The check a WIP launch runs on every Spark before --restart stops anything, shipped
+    as `ssh HOST "$(declare -f release_wip_cp release_wip_spark_slot_revision); ..."`."""
+    home, scratch, bin_dir = tmp_path / "home", tmp_path / "scratch", tmp_path / "bin"
+    for directory in (home, scratch, bin_dir):
+        directory.mkdir()
+    workspace = home / ".cache/cuteafd/builds/wip-own/slots/s1/spark-expert/workspace"
+    if case != "missing-slot":
+        (workspace / "third_party/sparkinfer").mkdir(parents=True)
+        (workspace / "third_party/sparkinfer/b12x.py").write_text("source")
+        (workspace / "third_party/sparkinfer.lock.json").write_text('{"revision": "' + "a" * 40 + '"}')
+        (workspace / "scripts/build").mkdir(parents=True)
+        # The slot's own verifier: the source must match before it prints the lock's revision.
+        (workspace / "scripts/build/verify-sparkinfer-source.py").write_text(
+            "import json, sys\nargs = sys.argv\n"
+            "ok = open(args[args.index('--source') + 1] + '/b12x.py').read() == 'source'\n"
+            "sys.exit('source does not match the lock') if not ok else print(json.load(open(args[args.index('--lock') + 1]))['revision'])\n")
+        if case == "unverified":
+            (workspace / "third_party/sparkinfer/b12x.py").write_text("edited")
+    log = tmp_path / "docker.log"
+    # Only present-dev:tc is in the local image store; a registry image pulls; no WIP container.
+    (bin_dir / "docker").write_text(f'#!/usr/bin/env bash\necho "$*" >> {log}\n'
+        'case "$1" in image) [[ "$3" == present-dev:tc ]] ;; container) exit 1 ;; *) exit 0 ;; esac\n')
+    (bin_dir / "docker").chmod(0o755)
+    image = {"pulled": "registry.example/dev:tc", "missing-image": "absent-dev:tc"}.get(case, "present-dev:tc")
+    script = (f'source {shlex.quote(str(ROOT / "scripts/lib/release-common.sh"))}; '
+              'bash -c "$(declare -f release_wip_cp release_wip_spark_slot_revision); '
+              'release_wip_spark_slot_revision \\"\\$@\\"" _ "$@"')
+    result = subprocess.run(["bash", "-c", script, "_", "s1", image, "cuteafd-spark-expert-wip-own", "__default__", "own"],
+                            env={**os.environ, "HOME": str(home), "TMPDIR": str(scratch), "PATH": f"{bin_dir}:{os.environ['PATH']}"},
+                            capture_output=True, text=True, timeout=60)
+    if case in ("verified", "pulled"):
+        assert result.returncode == 0 and result.stdout == "a" * 40 + "\n", result.stderr
+    else:
+        assert result.returncode == 1 and result.stdout == "", result.stdout
+    assert ("missing local development image" in result.stderr) == (case == "missing-image")
+    assert ("pull registry.example/dev:tc" in log.read_text()) == (case == "pulled")
+    # Only a scratch copy, removed again; no serving layout.
+    assert list(scratch.iterdir()) == [] and not (home / ".cache/cuteafd/wip-run").exists()
 
 
 def test_mimo_transport_timing_is_resolved_once_for_all_prefill_lanes():

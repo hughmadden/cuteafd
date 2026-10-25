@@ -2900,6 +2900,27 @@ for ((arg = 0; arg < ${#family_args[@]}; arg++)); do
 done
 peers=()
 [[ -z "$deployment_peer_csv" ]] || IFS=, read -r -a peers <<<"$deployment_peer_csv"
+# A WIP launch needs its slot and development image on every Spark: checked here, before a
+# --restart stops anything (and by a dry run), from a scratch copy of the slot's SparkInfer
+# source. The Sparks must agree on that source; another pin than this checkout's is a warning,
+# since a slot carries its own verified SparkInfer.
+if [[ -n "$wip_slot" ]] && ((ranks > 0)); then
+  pinned_sparkinfer="$(python3 "$repo_root/scripts/build/verify-sparkinfer-source.py" --source "$repo_root/third_party/sparkinfer" \
+    --lock "$repo_root/third_party/sparkinfer.lock.json" --print-revision)"
+  slot_sparkinfer="" slot_sparkinfer_host=""
+  for ((rank = 0; rank < ranks; rank++)); do
+    host="$(get "SPARK_${rank}_HOST")"
+    slot_revision="$(ssh "$host" "$(declare -f release_wip_cp release_wip_spark_slot_revision); release_wip_spark_slot_revision $(printf '%q ' "$wip_slot" "$spark_image" "$wip_spark_container" "${WIP_ROOT:-__default__}" "${WIP_INSTANCE:-__none__}")")" &&
+      [[ -n "$slot_revision" ]] ||
+      release_die "$host: WIP slot $wip_slot or the image $spark_image is missing or unverified (build the slot with ./wip.sh --slot $wip_slot)"
+    [[ -z "$slot_sparkinfer" || "$slot_revision" == "$slot_sparkinfer" ]] ||
+      release_die "WIP slot $wip_slot carries SparkInfer $slot_sparkinfer on $slot_sparkinfer_host but $slot_revision on $host; rebuild it with ./wip.sh --slot $wip_slot"
+    slot_sparkinfer="$slot_revision" slot_sparkinfer_host="$host"
+  done
+  [[ "$slot_sparkinfer" == "$pinned_sparkinfer" ]] ||
+    echo "warning: WIP slot $wip_slot carries SparkInfer $slot_sparkinfer; this checkout pins $pinned_sparkinfer" \
+      "(./wip.sh --slot $wip_slot rebuilds it from this checkout)" >&2
+fi
 if ((dry_run)); then
   # No serving container, restart or remote staging below this point is allowed
   # during validation. Runtime-only proofs (including audio exports) stay pending.
@@ -2941,6 +2962,18 @@ if [[ "$restart" == 1 ]]; then
     fi
   done
 fi
+# A launch that fails from here removes what it started, as DeepSeek V4.1's does: the
+# workers whose start returned and the coordinator once it runs. A container this launch
+# did not create (a name another deployment holds) is never touched.
+started_workers=() coordinator_started=0
+remove_failed_launch() {
+  ((coordinator_started == 0)) || docker rm -f "$coordinator_name" >/dev/null || true
+  local host
+  for host in ${started_workers[@]+"${started_workers[@]}"}; do
+    ssh "$host" "docker rm -f cuteafd-spark-expert-$host-$port >/dev/null 2>&1 || true" || true
+  done
+}
+trap remove_failed_launch EXIT
 shared_coordinator_env_args
 shared_thermal_args
 # CUTEAFD_PROTOCOL_V2_VERBS_HOST_DEVICE_MAP (local-ip=device,...; each process picks the entry
@@ -2956,28 +2989,19 @@ if [[ -n "$device_map" ]]; then
   device_map_args=(-e "CUTEAFD_PROTOCOL_V2_VERBS_HOST_DEVICE_MAP=$device_map")
 fi
 if [[ -n "$wip_slot" ]]; then
-  # The slot must exist everywhere before anything starts, and the development images must
-  # carry the SparkInfer revision this checkout pins.
-  pinned_sparkinfer="$(python3 "$repo_root/scripts/build/verify-sparkinfer-source.py" --source "$repo_root/third_party/sparkinfer" \
-    --lock "$repo_root/third_party/sparkinfer.lock.json" --print-revision)"
+  # Stage the slot checked above into each Spark's serving layout (its old workers are gone).
   for ((rank = 0; rank < ranks; rank++)); do
     host="$(get "SPARK_${rank}_HOST")"
-    ssh "$host" bash -s -- "$wip_slot" "$spark_image" "$pinned_sparkinfer" "$wip_spark_container" "$WIP_LAYOUT_SLOT" "${WIP_ROOT:-__default__}" "${WIP_INSTANCE:-__none__}" <<'STAGE' ||
+    ssh "$host" bash -s -- "$wip_slot" "$wip_spark_container" "$WIP_LAYOUT_SLOT" "${WIP_ROOT:-__default__}" "${WIP_INSTANCE:-__none__}" <<'STAGE' ||
 set -euo pipefail
-slot="$1" image="$2" pinned="$3"
-container="$4" layout_slot="$5"
-wip_root_arg="${6:-__default__}"; wip_instance_arg="${7:-__none__}"
+slot="$1" container="$2" layout_slot="$3"
+wip_root_arg="${4:-__default__}"; wip_instance_arg="${5:-__none__}"
 [[ "$wip_instance_arg" != __none__ ]] || wip_instance_arg=
 [[ "$wip_root_arg" != __default__ ]] || wip_root_arg="$HOME/.cache/cuteafd/builds/wip${wip_instance_arg:+-$wip_instance_arg}"
 wip_cp() { # slot files come from the container when it exists, else from the WIP root
   if docker container inspect "$container" >/dev/null 2>&1; then docker cp "$container:/wip/$1" "$2"
   else [[ -e "$wip_root_arg/${1%/.}" ]] && cp -a "$wip_root_arg/$1" "$2"; fi
 }
-if ! docker image inspect "$image" >/dev/null 2>&1; then
-  registry="${image%%/*}"
-  [[ "$image" == */* && ( "$registry" == *.* || "$registry" == *:* || "$registry" == localhost ) ]] || { echo "missing local dev image $image" >&2; exit 1; }
-  docker pull "$image"
-fi
 layout="$HOME/.cache/cuteafd/wip-run/$layout_slot" raw="$HOME/.cache/cuteafd/wip-run/$layout_slot.tmp/raw"
 rm -rf "$layout.tmp" && mkdir -p "$raw" "$layout.tmp/bin" "$layout.tmp/lib" "$layout.tmp/share"
 wip_cp "slots/$slot/spark-expert/workspace/.cuteafd-wip/." "$raw/"
@@ -2999,6 +3023,7 @@ STAGE
       { echo "$host: WIP slot $wip_slot is not staged (build it with ./wip.sh --slot $wip_slot)" >&2; exit 1; }
   done
 fi
+worker_pids=() worker_hosts=()
 for ((rank = 0; rank < ranks; rank++)); do
   host="$(get "SPARK_${rank}_HOST")"
   encoder_args=""
@@ -3025,8 +3050,18 @@ for ((rank = 0; rank < ranks; rank++)); do
     ${worker_wrapper}cuteafd expertd-native --snapshot '$snapshot' --native-lib /opt/cuteafd/lib/libcuteafd_native.so \
     --rank $rank --world $ranks --device-budget-bytes $budget $spark_worker_args \
     --listen 0.0.0.0:$port $encoder_args >/dev/null" &
+  worker_pids+=("$!") worker_hosts+=("$host")
 done
-wait
+worker_failed=0
+for index in "${!worker_pids[@]}"; do
+  if wait "${worker_pids[index]}"; then
+    started_workers+=("${worker_hosts[index]}")
+  else
+    echo "${worker_hosts[index]}: the expert worker did not start" >&2
+    worker_failed=1
+  fi
+done
+((worker_failed == 0)) || exit 1
 for ((rank = 0; rank < ranks; rank++)); do
   host="$(get "SPARK_${rank}_HOST")"
   # A placement worker bootstraps after media admission and waits for the
@@ -3085,6 +3120,7 @@ docker run -d "${RELEASE_SERVING_ARGS[@]}" --name "$coordinator_name" --restart 
   --max-sequences "$effective_concurrency" "${context_args[@]}" \
   --max-output "$(get MAX_OUTPUT_TOKENS 4096)" "${dspark_args[@]}" \
   "${family_args[@]}" "${draft_args[@]}" "${served_args[@]}" >/dev/null
+coordinator_started=1
 url="$(release_local_api_url "$addr")"
 ready_deadline=$((SECONDS + 900))
 until curl --max-time 5 -sf "$url/health" >/dev/null; do
@@ -3097,6 +3133,7 @@ until curl --max-time 5 -sf "$url/health" >/dev/null; do
     { echo "coordinator exited:" >&2; docker logs --tail 30 "$coordinator_name" >&2; exit 1; }
   sleep 2
 done
+trap - EXIT
 echo "API ready at $url/v1/ ($(release_api_curl -s "$url/v1/models" | python3 -c 'import json,sys;print(json.load(sys.stdin)["data"][0]["id"])'))"
 
 if ((console_supported)); then release_print_console_link "http://$(hostname):${addr##*:}"; fi
