@@ -243,12 +243,7 @@ pub fn run(client: &Client, info: &ServerInfo, progress: &Progress, run_id: &str
 }
 
 fn fidelity(run: &mut Run<'_>, check: &mut Check) -> Result<()> {
-    if let Err(reason) = crate::fidelity_match::resolve(&run.info.checkpoint(),
-        run.info.configuration.snapshot.as_deref().map(std::path::Path::new)) {
-        check.status = CheckStatus::Unsupported;
-        check.summary = reason.to_string();
-        return Ok(());
-    }
+    if fidelity_unavailable(run.info, check) { return Ok(()); }
     let scored = crate::panels::fidelity::score(run.client, run.info, "quick", "decode", run.progress,
         0.50, 0.11, run.max_context)?;
     let verdict = crate::fidelity::verdict(&scored);
@@ -280,6 +275,20 @@ fn fidelity(run: &mut Run<'_>, check: &mut Check) -> Result<()> {
         check.summary.push_str(" · reference-only qualified");
     }
     Ok(())
+}
+
+/// Marks `check` unsupported when the run has no fidelity reference, naming a
+/// weight variant's source and namespace; nothing is probed or fetched.
+fn fidelity_unavailable(info: &ServerInfo, check: &mut Check) -> bool {
+    let Some(reason) = crate::panels::fidelity::reference_unavailable(info) else { return false };
+    if let Some(variant) = &info.variant {
+        check.set("variant_model", info.model.as_str());
+        check.set("variant", variant.clone());
+        check.set("source", json!(info.configuration.snapshot.as_deref().and_then(crate::report::hub_repo)));
+    }
+    check.status = CheckStatus::Unsupported;
+    check.summary = reason;
+    true
 }
 
 /// The probe record of one request.
@@ -834,6 +843,31 @@ pub fn describe(timing: &StreamTiming) -> String {
 mod tests {
     use super::*;
     use crate::report::Check;
+
+    #[test]
+    fn quick_fidelity_refuses_the_base_reference_for_a_variant() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (base, variant) = crate::panels::fidelity::tests::base_and_variant(tmp.path());
+        let mut check = Check::new("fidelity", "Logit fidelity");
+        assert!(!fidelity_unavailable(&base, &mut check));
+        assert_eq!(check.status, CheckStatus::default());
+        assert!(check.metrics.is_empty());
+        assert!(fidelity_unavailable(&variant, &mut check));
+        assert_eq!(check.status, CheckStatus::Unsupported);
+        assert!(check.summary.starts_with("No variant-qualified fidelity reference"), "{}", check.summary);
+        assert_eq!(check.metrics["variant_model"], "glm-5.3-k4-alternate");
+        assert_eq!(check.metrics["variant"]["name"], "alternate");
+        assert_eq!(check.metrics["source"], "org/GLM-5.3-K4");
+        // An unmeasured reference neither fails nor passes the quality gate.
+        crate::quality::apply_fidelity(&variant, &mut check);
+        assert_eq!(check.status, CheckStatus::Unsupported);
+        let mut quality = crate::report::Quality::default();
+        let mut cache = Check::new("cache_exact", "Prefix-cache restore");
+        cache.status = CheckStatus::Pass;
+        quality.checks = vec![check, cache];
+        quality.settle();
+        assert_eq!(quality.status, CheckStatus::Pass);
+    }
 
     #[test]
     fn concurrent_levels_respect_admission_and_card_memory() {

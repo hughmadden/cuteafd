@@ -20,6 +20,21 @@ pub fn prefill_unavailable(info: &ServerInfo) -> Option<String> {
     (!admitted).then(|| "Prefill scoring not admitted at launch; restart with FULL_PREFILL_LOGITS=on (--full-prefill-logits).".into())
 }
 
+/// Why `info`'s run has no fidelity reference, decided before any probe or
+/// dataset fetch. A weight variant scores only against a reference qualified
+/// for that exact variant; none is published, so the base checkpoint's
+/// reference (reachable through its snapshot) never stands in for it.
+pub fn reference_unavailable(info: &ServerInfo) -> Option<String> {
+    let snapshot = info.configuration.snapshot.as_deref();
+    if let Some(variant) = &info.variant {
+        let source = snapshot.and_then(crate::report::hub_repo).unwrap_or_else(|| "unknown source".into());
+        let name = variant["name"].as_str().unwrap_or("unnamed");
+        return Some(format!("No variant-qualified fidelity reference for {} (variant {name} of {source}); \
+            the base checkpoint's reference does not score a steered variant", info.model));
+    }
+    crate::fidelity_match::resolve(&info.checkpoint(), snapshot.map(std::path::Path::new)).err().map(|e| e.to_string())
+}
+
 /// Runtime scratch rows are consumed window-by-window, then the private run directory is removed.
 pub fn score(client: &Client, info: &ServerInfo, tier: &str, path: &str, progress: &Progress,
     start: f64, span: f64, max_context: u64) -> Result<Run> {
@@ -120,8 +135,7 @@ impl Panel for FidelityPanel {
         if info.checkpoint().is_empty() {
             return Some("Discovering server configuration; run the basic card first".into());
         }
-        crate::fidelity_match::resolve(&info.checkpoint(), info.configuration.snapshot.as_deref().map(std::path::Path::new))
-            .err().map(|e| e.to_string())
+        reference_unavailable(info)
             .or_else(|| if self.full { prefill_unavailable(info) } else { None })
     }
     fn run(&self, ctx: &Ctx<'_>) -> Result<Value> {
@@ -148,8 +162,37 @@ impl Panel for FidelityPanel {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+
+    /// A base server whose own snapshot card resolves to a published reference,
+    /// and the same server presenting a steered weight variant of it. The hub
+    /// is never consulted for the variant: the guard runs before resolution.
+    pub(crate) fn base_and_variant(hub: &std::path::Path) -> (ServerInfo, ServerInfo) {
+        let snapshot = hub.join("models--org--GLM-5.3-K4/snapshots/abc");
+        std::fs::create_dir_all(&snapshot).unwrap();
+        std::fs::write(snapshot.join("README.md"), "---\nbase_model: zai-org/GLM-5.3\n---\n").unwrap();
+        let mut base = ServerInfo { model: "glm-5.3-k4".into(), ..Default::default() };
+        base.configuration.snapshot = Some(snapshot.display().to_string());
+        let mut variant = base.clone();
+        variant.model = "glm-5.3-k4-alternate".into();
+        variant.variant = Some(json!({"name": "alternate", "availability": {"state": "ready"}}));
+        (base, variant)
+    }
+
+    #[test]
+    fn a_variant_never_falls_back_to_the_base_reference() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (base, variant) = base_and_variant(tmp.path());
+        assert_eq!(base.checkpoint(), "org/GLM-5.3-K4");
+        assert!(reference_unavailable(&base).is_none(), "{:?}", reference_unavailable(&base));
+        assert!(STANDARD.unavailable(&base).is_none());
+        let reason = reference_unavailable(&variant).unwrap();
+        assert!(reason.starts_with("No variant-qualified fidelity reference for glm-5.3-k4-alternate (variant alternate of org/GLM-5.3-K4)"), "{reason}");
+        for panel in [&STANDARD, &FULL] {
+            assert_eq!(panel.unavailable(&variant).as_deref(), Some(reason.as_str()));
+        }
+    }
     #[test]
     fn native_v41_sparse_prefill_is_admitted_in_old_and_new_arms_without_cli_flag() {
         let info = ServerInfo { model: "deepseek-ai/DeepSeek-V4.1-Flash".into(),
