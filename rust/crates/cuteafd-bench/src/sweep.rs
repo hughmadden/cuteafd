@@ -53,6 +53,9 @@ pub struct PrefillPoint {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct Sweep {
+    /// The `/v1/models` id the sweep measured (absent in sweeps that predate it).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt_content: Option<String>,
     pub points: Vec<Point>,
@@ -196,14 +199,16 @@ pub fn parse_lengths(text: &str) -> Result<Vec<u64>, String> {
 /// Runs the sweep against `url`; `api_key` is the server's bearer key.
 pub fn run(url: &str, api_key: Option<&str>, levels: &[usize], post_load_c1: bool, post_load_repeat: bool,
     prefill_lengths: &[u64]) -> Result<Sweep> {
-    run_windowed(url, api_key, levels, post_load_c1, post_load_repeat, prefill_lengths, false, TOKENS, None)
+    run_windowed(url, api_key, None, levels, post_load_c1, post_load_repeat, prefill_lengths, false, TOKENS, None)
 }
 
 /// [`run`], calling `on_timed` once just before the first timed request. `tokens`
 /// is each decode request's output length ([`TOKENS`] by default; longer runs give
-/// a profiled wave more decode steps at every width).
+/// a profiled wave more decode steps at every width). `model` selects the
+/// `/v1/models` id to measure exactly ([`Client::with_model`]); `None` keeps
+/// the default (`CUTEAFD_BENCH_MODEL`, else the first listed id).
 #[allow(clippy::too_many_arguments)]
-pub fn run_windowed(url: &str, api_key: Option<&str>, levels: &[usize], post_load_c1: bool,
+pub fn run_windowed(url: &str, api_key: Option<&str>, model: Option<&str>, levels: &[usize], post_load_c1: bool,
     post_load_repeat: bool, prefill_lengths: &[u64], fabric: bool, tokens: u64, mut on_timed: OnTimed) -> Result<Sweep> {
     if !(1..=MAX_TOKENS).contains(&tokens) {
         bail!("sweep tokens must be 1..={MAX_TOKENS}, got {tokens}");
@@ -212,10 +217,12 @@ pub fn run_windowed(url: &str, api_key: Option<&str>, levels: &[usize], post_loa
         bail!("post_load_repeat needs post_load_c1 and a levels list that includes 1 (it replays the levels C1)");
     }
     let key = api_key.map(cuteafd_api::openai::auth::ApiKey::new).transpose().map_err(anyhow::Error::msg)?;
-    let mut client = Client::new(url, None, Arc::new(AtomicBool::new(false))).with_api_key(key).with_fabric(fabric);
+    let mut client = Client::new(url, None, Arc::new(AtomicBool::new(false))).with_api_key(key).with_fabric(fabric)
+        .with_model(model.map(str::to_string));
     let _subscription = client.fabric_subscription();
     let record = client.discover().context("sweep: /v1/models")?;
-    let mut sweep = Sweep { prompt_content: Some(crate::text::PROMPT_CONTENT.into()), ..Sweep::default() };
+    let mut sweep = Sweep { model: Some(client.model.clone()), prompt_content: Some(crate::text::PROMPT_CONTENT.into()),
+        ..Sweep::default() };
     if !prefill_lengths.is_empty() {
         let max_context = record["max_context_tokens"].as_u64().unwrap_or(8192);
         let mark = client.thermal_mark();
