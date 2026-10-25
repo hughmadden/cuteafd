@@ -126,15 +126,17 @@ pub(crate) struct EngineArgs {
 }
 
 fn native_activation(args: &EngineArgs, first_moe: usize, layers: usize, serving: bool) -> Result<()> {
-    use cuteafd_loader::placement::{AttentionPlacement, Onboard};
+    use cuteafd_loader::placement::AttentionPlacement;
     ensure!(!args.skip_routed_experts, "EXLR8 requires real Spark experts");
-    ensure!(matches!(args.rtx_expert_layers, Onboard::Auto | Onboard::Layers(0)),
-        "EXLR8 requires no coordinator-local routed experts");
     let peers = args.peers.as_deref().context("EXLR8 requires Spark peers")?;
     ensure!(!peers.is_empty() && peers.split(',').all(|peer| !peer.trim().is_empty()),
         "EXLR8 requires nonempty Spark peers");
     let partial = args.layers.is_some_and(|count| count > first_moe && count < layers);
-    if !serving && args.split_device.is_none() && partial { return Ok(()); }
+    if !serving && partial {
+        ensure!(args.split_device.is_none_or(|device| device != args.device),
+            "EXLR8 partial execution requires distinct coordinators");
+        return Ok(());
+    }
     ensure!(matches!(args.exlr8_manifest.as_deref(), Some("up1" | "bit325")),
         "EXLR8 full execution currently admits up1 or bit325 only");
     ensure!(args.split_device.is_none_or(|device| device != args.device)
@@ -277,7 +279,7 @@ mod draft_cli_tests {
                         onboard: Some(cuteafd_loader::placement::Onboard::Layers(0)), glm5_drafter_disabled: true,
                         host_memory: Some((128 << 30, 128 << 30)), host_cache_bytes: Some(0), ..Default::default() };
                     let (memory, _) = cuteafd_loader::plan::layout::glm5::native_layout(&checkpoint, &layout,
-                        &vec![256; gpus], 256, peers.split(',').count(), &manifest).unwrap();
+                        &vec![256; gpus], 256, peers.split(',').count(), &manifest, None).unwrap();
                     assert_eq!(memory.devices.len(), gpus);
                     for device in &memory.devices {
                         let planned: u64 = device.items.iter().filter(|item| item.group == GROUP).map(|item| item.bytes).sum();
@@ -331,7 +333,10 @@ mod draft_cli_tests {
         let mut drafting = args.clone();
         drafting.draft = Some("/draft".into());
         assert!(native_activation(&drafting, 3, 78, true).is_ok());
-        for bad in 0..9 {
+        let mut onboard = args.clone();
+        onboard.rtx_expert_layers = cuteafd_loader::placement::Onboard::Layers(1);
+        assert!(native_activation(&onboard, 3, 78, true).is_ok());
+        for bad in 0..8 {
             let mut candidate = args.clone();
             match bad {
                 0 => candidate.exlr8_manifest = Some("home".into()),
@@ -341,8 +346,7 @@ mod draft_cli_tests {
                 4 => candidate.layers = Some(4),
                 5 => candidate.attention_placement = "heads".into(),
                 6 => candidate.exlr8_manifest = None,
-                7 => candidate.skip_routed_experts = true,
-                _ => candidate.rtx_expert_layers = cuteafd_loader::placement::Onboard::Layers(1),
+                _ => candidate.skip_routed_experts = true,
             }
             assert!(native_activation(&candidate, 3, 78, true).is_err(), "case {bad}");
         }
@@ -593,7 +597,7 @@ impl Opened {
         let devices: Vec<_> = std::iter::once(args.device).chain(split_device).collect();
         let inventory = crate::shared::inventory::RuntimeInventory::measure(&self.library, &devices, crate::shared::inventory::InventoryPhase::PreWeight, |_| {
             let (loaded, skipped) = programs.load_matching(|name| selected.contains(name)
-                || (native && (matches!(name, "exlr8_shared_a16_serving" | "exlr8_shared_group")
+                || (native && (name.starts_with("exlr8_")
                     || name.starts_with("exlr8_dense_") || name.starts_with("glm_stage_") || name.starts_with("glm2_stage_"))))?;
             tracing::info!(loaded, skipped, "GLM programs loaded");
             Ok(())
@@ -698,13 +702,18 @@ impl Opened {
         let exchange_f32 = glm::local_exchange_f32()?;
         let local = glm::select_local_inventory(&self.catalog, manifest_path, layers, devices.len(),
             args.prefill_rows as u64, prefill_lanes as u64, exchange_f32, args.rtx_expert_layers,
-            args.skip_routed_experts)?;
+            args.skip_routed_experts, args.exlr8_manifest.as_deref()
+                .map(|selected| (selected, args.exlr8_prefill_activations)))?;
         if let Some(local) = &local {
             let max_rows = args.prefill_rows.max(engine::DECODE_ROWS);
             match local.format {
                 glm::GlmLocalFormat::Exl3 => ensure!(crate::shared::experts::rtx::exl3::Exl3Tp2::workspace_bytes_for(
                     &local.package, self.cfg.hidden, max_rows)? as u64 == local.backend_workspace,
                     "GLM EXL3 planner/runtime backend workspace mismatch"),
+                glm::GlmLocalFormat::Exlr8 => ensure!(
+                    crate::shared::experts::rtx::exlr8::Exlr8Tp2Weights::workspace_bytes(
+                        &programs, max_rows, args.exlr8_prefill_activations)? as u64 == local.backend_workspace,
+                    "GLM EXLR8 planner/runtime backend workspace mismatch"),
                 glm::GlmLocalFormat::Nvfp4 { .. } => {
                     let tensors = self.catalog.fp8().context("NVFP4 tensors")?;
                     for rank in 0..2 {
@@ -818,6 +827,10 @@ impl Opened {
                     None => Exl3Tp2::load_pair_weights(devices, &self.catalog, geometry,
                         [&local.package; 2], range.collect(), max_rows, budgets, CanonicalDecode)?,
                 }),
+                glm::GlmLocalFormat::Exlr8 => crate::shared::experts::rtx::Tp2Weights::Exlr8(
+                    crate::shared::experts::rtx::exlr8::Exlr8Tp2Weights::load_pair(devices,
+                        &self.snapshot, args.exlr8_manifest.as_deref().context("EXLR8 manifest")?,
+                        &programs, range.collect(), max_rows, budgets, args.exlr8_prefill_activations)?),
                 glm::GlmLocalFormat::Nvfp4 { .. } => crate::shared::experts::rtx::Tp2Weights::Fp8(
                     crate::shared::experts::rtx::fp8moe::Fp8MoeTp2::load_pair(devices,
                         self.catalog.fp8().context("NVFP4 tensors")?, &local.package,
@@ -828,7 +841,8 @@ impl Opened {
             if let Some(records) = &native_records {
                 let loaded = self.load_native(args, records, layers, &programs, &manifest, &loader, &devices, stream,
                     peer_stream, native_push.take())?;
-                return Ok((loaded.0, (loaded.1, None)));
+                let tp2 = tp2_range.clone().map(|range| tp2_weights(range, None)).transpose()?;
+                return Ok((loaded.0, (loaded.1, tp2)));
             }
             let (embedding, (model, pushed)) = crate::shared::token_io::TokenEmbedding::load(&self.library,
                 self.embed_source()?, args.token_io.embed_placement, || {

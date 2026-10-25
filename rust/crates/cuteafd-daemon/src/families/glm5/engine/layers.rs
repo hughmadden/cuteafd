@@ -246,9 +246,9 @@ impl PipelineKernels for Bindings<'_, '_, '_, '_, '_> {
         if !layer.dense && e.tp2_layer(index) {
             e.moe_front(w, layer, self.rows())?;
             e.ring_local_routes(index, w, self.rows())?;
-            e.ffn(w, layer, e.cfg.moe_intermediate, self.cap(), w.shared.buffer.ptr, rows)?;
+            e.shared_on(0, index, w, layer, rows, self.cap())?;
             e.moe_front_on(1, w1, self.layer(1, index), self.rows())?;
-            e.ffn_on(1, w1, self.layer(1, index), e.cfg.moe_intermediate, self.cap(), w1.shared.buffer.ptr, rows)?;
+            e.shared_on(1, index, w1, self.layer(1, index), rows, self.cap())?;
             let pair = e.tp2.as_ref().context("TP2")?;
             e.tp2_rank(pair, 0, index, self.lane, w, self.rows())?;
             e.tp2_rank(pair, 1, index, self.lane, w1, self.rows())?;

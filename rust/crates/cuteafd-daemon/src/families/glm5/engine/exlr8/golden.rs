@@ -259,7 +259,7 @@ fn native_layer3_same_quant() -> Result<()> {
             tensor.meta.name
         );
     }
-    let args = Args::try_parse_from([
+    let mut argv = vec![
         "exlr8-gate".into(),
         "--snapshot".into(),
         snapshot.into_os_string(),
@@ -277,17 +277,22 @@ fn native_layer3_same_quant() -> Result<()> {
         "256".into(),
         "--prefill-rows".into(),
         ROWS.last().unwrap().to_string().into(),
-        "--rtx-expert-layers".into(),
-        "0".into(),
+        "--split-device".into(),
+        "1".into(),
         "--l2-prefetch".into(),
         "off".into(),
         "--peers".into(),
         std::env::var_os("CUTEAFD_GOLDEN_PEERS").context("real worker peers")?,
-    ])?
-    .engine;
+    ];
+    if let Some(layers) = std::env::var_os("CUTEAFD_GOLDEN_RTX_EXPERT_LAYERS") {
+        argv.extend(["--rtx-expert-layers".into(), layers]);
+    }
+    let args = Args::try_parse_from(argv)?.engine;
     let opened = crate::families::glm5::open(&args)?;
     opened.with_engine(&args, |engine, transport, runtime| {
-        let transport = transport.context("native gate needs real workers")?;
+        let mut transport = transport;
+        let peers = engine.peer_workspaces(false, 1)?.context("native gate needs two GPUs")?;
+        let w1 = peers.get(0)?;
         // Retain the admitted serial workspace and drain on both success and error
         // before with_engine drops transport or native owners.
         let mut workspaces = engine.lane_workspaces.borrow_mut();
@@ -313,41 +318,36 @@ fn native_layer3_same_quant() -> Result<()> {
                     ],
                     &[Scalar::I32(rows as i32), Scalar::I32(0)],
                 )?;
-                engine.moe(
-                    w,
-                    3,
-                    &engine.weights.layers[3],
-                    rows,
-                    "m4096",
-                    false,
-                    transport,
-                    runtime,
-                )?;
-                let staged = w.router_host.borrow();
-                let request = expert_request(
-                    staged.bytes(),
-                    3,
-                    rows,
-                    h,
-                    engine.cfg.topk,
-                    false,
-                    engine.spark_bf16,
-                )?;
-                ensure!(
-                    request.header.hidden_dtype
-                        == cuteafd_transport::ExpertV2Dtype::Fp8E4m3Ue8m0K32,
-                    "same-quant gate requires standard Fp8K32 requests"
-                );
-                let wire = request.hidden_payload.as_ref();
+                let normalized = engine.download(&w.x, rows * h * 2)?;
+                engine.on(1, || engine.put(&w1.x, &normalized))?;
+                if engine.tp2_layer(3) {
+                    engine.moe_front(w, &engine.weights.layers[3], rows)?;
+                    engine.shared_on(1, 3, w1, &engine.peer()?.layers[3], Scalar::I32(rows as i32), "m4096")?;
+                    engine.tp2_pair(3, 0, w, w1, rows, "m4096")?;
+                    engine.exchange()?.wait(0, slot(3, true, 0))?;
+                    let pair = engine.tp2.as_ref().context("native TP2 fixture")?;
+                    // SAFETY: both FFN payloads are published on retained streams before the sum.
+                    unsafe { pair.combine.sum(w.payload.as_ref().context("TP2 payload")?.buffer.ptr,
+                        engine.recv(0, slot(3, true, 0))?, w.delta.buffer.ptr.cast(), rows, h, engine.stream)?; }
+                } else {
+                    let transport = transport.as_deref_mut().context("remote fixture needs real workers")?;
+                    engine.moe(w, 3, &engine.weights.layers[3], rows, "m4096", false, transport, runtime)?;
+                    engine.shared_on(1, 3, w1, &engine.peer()?.layers[3], Scalar::I32(rows as i32), "m4096")?;
+                    engine.exchange()?.push(1, slot(3, true, 0), w1.shared.buffer.ptr, rows * h * 2)?;
+                    engine.exchange()?.wait(0, slot(3, true, 0))?;
+                    // SAFETY: the remote routed sum and peer shared half are live BF16 token planes.
+                    unsafe { engine.library.peer_add_bf16(w.delta.buffer.ptr,
+                        engine.recv(0, slot(3, true, 0))?, w.delta.buffer.ptr, rows * h, engine.stream)?; }
+                }
+                let wire = engine.download(&w.wire, rows * (h + h / 32))?;
                 let out = PathBuf::from(std::env::var("CUTEAFD_GOLDEN_OUT")?);
-                std::fs::write(out.join(format!("r{rows}_actual_wire.bin")), wire)?;
+                std::fs::write(out.join(format!("r{rows}_actual_wire.bin")), &wire)?;
                 let expected_wire = load("wire", "torch.uint8", &[rows, h + h / 32])?;
                 ensure!(
                     wire == expected_wire,
                     "native request differs from NumPy FP8 K32 oracle at {rows} rows"
                 );
-                drop(staged);
-                // The ordinary reducer writes delta; norm applies the residual in place.
+                // Both execution paths write delta; norm applies the residual in place.
                 engine.run(
                     "glm_norm",
                     &[
@@ -388,9 +388,11 @@ fn native_layer3_same_quant() -> Result<()> {
             }
             Ok(())
         })();
-        // SAFETY: all engine, workspace and transport allocations are retained here.
-        let drained = unsafe { engine.library.cuda_stream_synchronize(engine.stream) };
-        result.and(drained.map_err(Into::into))
+        let drained = (0..2).try_for_each(|rank| engine.on(rank, || {
+            // SAFETY: both rank workspaces and every payload remain retained here.
+            unsafe { engine.library.cuda_stream_synchronize(engine.stream_of(rank)) }
+        }));
+        result.and(drained)
     })
 }
 

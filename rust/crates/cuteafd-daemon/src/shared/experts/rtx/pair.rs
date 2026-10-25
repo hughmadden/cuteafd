@@ -245,6 +245,7 @@ impl<'a> Pair<'a> {
                 backend.shard() == RtxShard::Tp2 { rank: rank as u8 }
                     && backend.device() == devices[rank].device
                     && backend.partial() == ranks[0].partial()
+                    && backend.uses_fp8_input() == ranks[0].uses_fp8_input()
                     && (1..=max_rows).all(|rows| backend
                         .partial_layout(rows)
                         .is_ok_and(|layout| layout == super::PartialLayout::Tokens)),
@@ -292,6 +293,10 @@ impl<'a> Pair<'a> {
 
     pub(crate) fn partial(&self) -> PartialDtype {
         self.ranks[0].borrow().partial()
+    }
+
+    pub(crate) fn uses_fp8_input(&self) -> bool {
+        self.ranks[0].borrow().uses_fp8_input()
     }
 
     pub(crate) fn group_rows(&self, rows: usize) -> Result<usize> {

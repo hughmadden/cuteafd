@@ -40,30 +40,10 @@ enum Variant {
     Prefill,
 }
 
+
 impl Variant {
-    /// Owned-unit grids and unit-scaled scratch.
-    fn owned_units(self) -> bool {
-        matches!(self, Self::DecodeCompact | Self::DecodeGrouped | Self::Prefill)
-    }
-    /// Carries the `unit_count`/`unit_map` tables; the routed serving core
-    /// derives its live units on device instead.
-    fn unit_tables(self) -> bool {
-        matches!(self, Self::DecodeGrouped | Self::Prefill)
-    }
-    /// Scratch the kernel addresses by owned-unit slot, so its arena may shrink
-    /// from the global unit count to `unit_limit`. FC2 never does. The routed
-    /// serving core indexes FC1 by live owned-unit task but writes and reads the
-    /// activation `intermediate` at `(group * units + unit)` over all global
-    /// units, so it keeps the full stride; the grouped instances index both by
-    /// `group * unit_limit + local`. Shrinking the routed core's intermediate
-    /// let TP6 steps with 96+ groups (12-15 rows) overwrite live FC2 partials.
-    fn owned_unit_scratch(self, name: &str) -> bool {
-        match self {
-            Self::DecodeCompact => name == "fc1",
-            Self::DecodeGrouped | Self::Prefill => name != "fc2",
-            Self::SharedDecode => false,
-        }
-    }
+    fn owned_units(self) -> bool { self != Self::SharedDecode }
+    fn unit_tables(self) -> bool { matches!(self, Self::DecodeGrouped | Self::Prefill) }
 }
 
 fn program_names(
@@ -153,7 +133,7 @@ struct Workspace {
     unit_limit: usize,
     intermediate_bytes: usize,
     /// Owned-unit instance: FC1 (and, for grouped instances, the activation
-    /// scratch) scale with `unit_limit`; see `Variant::owned_unit_scratch`.
+    /// scratch) scale with `unit_limit`; the loader owns the exact sizing rule.
     compact: bool,
     /// Registers `unit_count`/`unit_map` and the `unit_limit` scalar.
     unit_tables: bool,
@@ -167,71 +147,19 @@ impl Workspace {
         unit_limit: usize,
         activations: Exlr8PrefillActivations,
     ) -> Result<Self> {
-        cuteafd_ffi::exlr8::validate(spec)?;
-        ensure!(
-            (set == ExpertSet::Shared) == (variant == Variant::SharedDecode),
-            "EXLR8 shared decode requires the shared expert set"
-        );
-        ensure!(
-            spec.name == program_names(set, variant, activations).0 && spec.geometry["abi_version"] == 3,
-            "EXLR8 execution requires fused rotation ABI v3"
-        );
-        ensure!(
-            rows > 0 && rows <= spec.capacity_rows as usize,
-            "EXLR8 rows outside admitted K1 capacity"
-        );
-        // Decode rows route to the K1 or the 64-row grouped instance; the
-        // 4096-row prefill instance is only admitted above the K1 row limit.
-        ensure!(
-            variant != Variant::Prefill
-                || rows > cuteafd_core::expert_geometry::EXLR8_EXECUTION_ROWS,
-            "EXLR8 prefill instance is only admitted above the K1 row limit"
-        );
-        let dimension = |name| -> Result<usize> {
-            usize::try_from(
-                spec.geometry[name]
-                    .as_u64()
-                    .context("missing K1 geometry")?,
-            )
-            .context("K1 geometry exceeds address space")
+        use cuteafd_loader::plan::exlr8::{execution_workspace, ExecutionVariant};
+        let variant = match variant {
+            Variant::SharedDecode => ExecutionVariant::SharedDecode,
+            Variant::DecodeCompact => ExecutionVariant::DecodeCompact,
+            Variant::DecodeGrouped => ExecutionVariant::DecodeGrouped,
+            Variant::Prefill => ExecutionVariant::Prefill,
         };
-        let hidden = dimension("hidden")?;
-        let top_k = dimension("top_k")?;
-        let max_groups = dimension("max_groups")?;
-        let units = dimension("units")?;
-        let scratch = |name: &str| -> Result<usize> {
-            usize::try_from(*spec.scratch.get(name).context("missing K1 scratch")?)
-                .context("K1 scratch exceeds address space")
-        };
-        let compact = set == ExpertSet::Routed && variant.owned_units();
-        let unit_tables = set == ExpertSet::Routed && variant.unit_tables();
-        ensure!(!compact || (1..=units).contains(&unit_limit), "invalid compact unit limit");
-        let scratch = |name: &str| -> Result<usize> {
-            let bytes = scratch(name)?;
-            if compact && variant.owned_unit_scratch(name) {
-                ensure!(bytes % units == 0, "compact scratch must divide by global units");
-                (bytes / units).checked_mul(unit_limit).context("compact scratch overflow")
-            } else { Ok(bytes) }
-        };
-        let intermediate_bytes = scratch("intermediate")?;
-        let (ranges, bytes) = cuteafd_loader::plan::exlr8::residency::execution_workspace_layout(
-            rows, spec.capacity_rows as usize,
-            spec.geometry["group_rows"].as_u64().unwrap_or(16) as usize,
-            hidden, top_k, max_groups, scratch("fc1")?,
-            scratch("intermediate")?, scratch("fc2")?, set)?;
-        Ok(Self {
-            ranges,
-            bytes,
-            rows,
-            top_k,
-            max_groups,
-            hidden,
-            units,
-            unit_limit: if compact { unit_limit } else { units },
-            intermediate_bytes,
-            compact,
-            unit_tables,
-        })
+        let layout = execution_workspace(spec, rows, set, variant, unit_limit, activations)?;
+        Ok(Self { ranges: layout.ranges, bytes: layout.bytes, rows: layout.rows,
+            top_k: layout.top_k, max_groups: layout.max_groups, hidden: layout.hidden,
+            units: layout.units, unit_limit: layout.unit_limit,
+            intermediate_bytes: layout.intermediate_bytes, compact: layout.compact,
+            unit_tables: layout.unit_tables })
     }
 }
 

@@ -30,7 +30,7 @@ use std::cell::{Cell, RefCell};
 use cuteafd_loader::serving_capacity::{glm_decode_row_bucket,
     glm_decode_table_width, glm_decode_table_widths, GLM_SHORT_ROW_BUCKETS};
 use std::ffi::c_void;
-use crate::shared::experts::rtx::{pair::Pair, ExpertInput, Routes, PartialDtype, ExchangeDtype, RtxExpertLayer};
+use crate::shared::experts::rtx::{pair::Pair, ExpertInput, Routes, ExchangeDtype, RtxExpertLayer};
 
 #[path = "engine/context.rs"]
 mod context;
@@ -1599,7 +1599,7 @@ impl<'a> GlmEngine<'a> {
                 std::ptr::null(), w.route_ids.buffer.ptr, w.route_weights.buffer.ptr, t, self.cfg.experts, topk,
                 self.cfg.routed_scale as f32, true, self.stream_of(rank))
         })?;
-        if self.spark_bf16 && !self.tp2.as_ref().is_some_and(|p| p.partial() == PartialDtype::F32) { return Ok(()); }
+        if self.spark_bf16 && !self.tp2.as_ref().is_some_and(|p| p.uses_fp8_input()) { return Ok(()); }
         let grid = self.quantize_grid.blocks(t, h);
         self.run_on(rank, "glm_expert_input_quant", &[("source_ptr", w.x.buffer.ptr), ("values_ptr", w.wire.buffer.ptr),
             // SAFETY: the scale rows follow the payload inside each wire row.

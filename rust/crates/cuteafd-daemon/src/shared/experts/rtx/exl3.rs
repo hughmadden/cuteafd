@@ -698,6 +698,7 @@ impl RtxExpertLayer for Exl3Tp2<'_> {
     fn partial(&self) -> PartialDtype {
         PartialDtype::F32
     }
+    fn uses_fp8_input(&self) -> bool { true }
     fn layers(&self) -> &[usize] {
         &self.layers
     }

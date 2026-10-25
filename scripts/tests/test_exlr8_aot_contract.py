@@ -96,7 +96,13 @@ def test_serving_and_glue_export_inventory():
     assert routed["device_count"] is True
     assert routed["serving_variant"] == "k1_k23_coalesced"
     assert not routed.get("shared_expert") and not routed.get("grouped")
-    assert [p[0] for p in inventory("coordinator")] == ["shared_a16_serving", "shared_group"]
+    coordinator = inventory("coordinator")
+    assert [p[0] for p in coordinator] == [
+        "a16_serving", "group", "shared_a16_serving", "shared_group",
+        "a16_grouped", "a8_grouped", "grouped_group", "a16_grouped64"]
+    routed_coordinator = [p for p in coordinator if not p[0].startswith("shared_")]
+    assert [p[:3] for p in routed_coordinator] == [p[:3] for p in spark]
+    assert [p[3]() for p in routed_coordinator] == [p[3]() for p in spark]
     with pytest.raises(ValueError):
         inventory("unknown")
 
@@ -117,6 +123,26 @@ def test_native_worker_times_routing_experts_and_reduction_before_existing_drain
     assert 'rows as u32, executor_id, "exlr8"' in execute
     # One existing per-chunk completion plus the unconditional failure drain; no timing wait.
     assert execute.count("cuda_stream_synchronize(") == 2
+
+
+def test_local_tp2_input_contract_is_independent_of_partial_dtype():
+    rtx = ROOT / "rust/crates/cuteafd-daemon/src/shared/experts/rtx"
+    native = (rtx / "exlr8.rs").read_text()
+    assert "fn partial(&self) -> PartialDtype { PartialDtype::Bf16 }" in native
+    assert "fn uses_fp8_input(&self) -> bool { true }" in native
+    trait = rtx.with_suffix(".rs").read_text()
+    assert "fn uses_fp8_input(&self) -> bool;" in trait
+    pair = (rtx / "pair.rs").read_text()
+    assert "backend.uses_fp8_input() == ranks[0].uses_fp8_input()" in pair
+    glm = ROOT / "rust/crates/cuteafd-daemon/src/families/glm5"
+    tp2 = (glm / "engine/tp2.rs").read_text()
+    assert tp2.count("if pair.uses_fp8_input()") == 2
+    assert "self.ffn(" not in tp2 and "self.ffn_on(" not in tp2
+    assert "self.shared_on(rank, pair.layers[0]" in tp2
+    assert "self.shared_on(0, layer" in tp2
+    layers = (glm / "engine/layers.rs").read_text()
+    assert "self.shared_on(0, layer" in layers
+    assert "self.shared_on(1, layer" in layers
 
 
 def test_no_changes_to_existing_export_builders():

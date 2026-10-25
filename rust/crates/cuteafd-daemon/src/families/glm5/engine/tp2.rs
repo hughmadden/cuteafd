@@ -209,16 +209,8 @@ impl<'a> GlmEngine<'a> {
                 } else {
                     "m64"
                 };
-                self.ffn_on(
-                    rank,
-                    w,
-                    layer,
-                    self.cfg.moe_intermediate,
-                    cap,
-                    w.shared.buffer.ptr,
-                    Scalar::I32(w.rows as i32),
-                )?;
-                let input = if pair.partial() == PartialDtype::F32 {
+                self.shared_on(rank, pair.layers[0], w, layer, Scalar::I32(w.rows as i32), cap)?;
+                let input = if pair.uses_fp8_input() {
                     ExpertInput::Fp8K32(w.wire.buffer.ptr)
                 } else {
                     ExpertInput::Bf16(w.x.buffer.ptr)
@@ -253,14 +245,7 @@ impl<'a> GlmEngine<'a> {
         cap: &str,
     ) -> Result<()> {
         let pair = self.tp2.as_ref().context("TP2 experts")?;
-        self.ffn(
-            w,
-            &self.weights.layers[layer],
-            self.cfg.moe_intermediate,
-            cap,
-            w.shared.buffer.ptr,
-            Scalar::I32(rows as i32),
-        )?;
+        self.shared_on(0, layer, w, &self.weights.layers[layer], Scalar::I32(rows as i32), cap)?;
         self.moe_front_on(1, w1, &self.peer()?.layers[layer], rows)?;
         self.ring_local_routes(layer, w, rows)?;
         self.tp2_rank(pair, 0, layer, lane, w, rows)?;
@@ -294,7 +279,7 @@ impl<'a> GlmEngine<'a> {
         w: &Workspace<'_>,
         rows: usize,
     ) -> Result<()> {
-        let input = if pair.partial() == PartialDtype::F32 {
+        let input = if pair.uses_fp8_input() {
             ExpertInput::Fp8K32(w.wire.buffer.ptr)
         } else {
             ExpertInput::Bf16(w.x.buffer.ptr)

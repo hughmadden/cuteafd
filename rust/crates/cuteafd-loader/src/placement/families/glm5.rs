@@ -255,8 +255,8 @@ pub fn request(inputs: &GlmInputs<'_>) -> Result<PlacementRequest, PlacementErro
         || inputs.prefill_rows == 0 || inputs.prefill_rows > 4096 || inputs.max_context == 0 {
         return Err(PlacementError::Inventory("GLM rank/lane/step/context geometry"));
     }
-    if inputs.native_experts && (inputs.spark_ranks == 0 || inputs.spark_ranks > 8 || inputs.skip_routed_experts
-        || !inputs.experts.is_empty() || inputs.scratch.is_none()
+    if inputs.native_experts && (inputs.spark_ranks > 8 || inputs.skip_routed_experts
+        || (inputs.spark_ranks == 0 && inputs.experts.is_empty()) || inputs.scratch.is_none()
         || inputs.native_workspace == 0) {
         return Err(PlacementError::Inventory("EXLR8 requires measured workspaces, real Spark experts and 1..=8 ranks"));
     }
@@ -600,6 +600,7 @@ pub fn manifest_scratch(cfg: &GlmDsaConfig, split: bool, manifest: &serde_json::
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GlmLocalFormat {
     Exl3,
+    Exlr8,
     Nvfp4 { w4a4: bool },
 }
 
@@ -844,6 +845,51 @@ fn nvfp4_inventory(catalog: &crate::OfficialV41Catalog, manifest: &std::path::Pa
             shape.topk as u64, rows, lanes, false) })
 }
 
+/// Exact checkpoint-native TP2 costs. Rotated unit ownership changes by
+/// expert and layer; neither a proportional half nor EXL3 storage is valid.
+fn exlr8_expert_costs(snapshot: &std::path::Path, selected: &str, first: usize, layers: usize,
+    router: &[crate::plan::exlr8::dense::DenseRecord]) -> anyhow::Result<Vec<ExpertCost>> {
+    use crate::plan::exlr8::residency::{ExpertSet, Residency};
+    (first..layers).map(|layer| {
+        let whole = Residency::plan(snapshot, selected, layer, 1, 0, ExpertSet::Routed)?.resident_bytes as u64;
+        let mut half = [Bytes2::default(); 2];
+        for (rank, cost) in half.iter_mut().enumerate() {
+            cost.resident = Residency::plan(snapshot, selected, layer, 2, rank, ExpertSet::Routed)?.resident_bytes as u64;
+        }
+        for record in router.iter().filter(|record| record.tensor.starts_with(&format!("model.layers.{layer}.mlp.gate."))) {
+            for component in &record.components {
+                half[1].resident = half[1].resident.checked_add((component.source.bytes as u64).max(FLOOR))
+                    .ok_or_else(|| anyhow::anyhow!("EXLR8 local router storage overflow"))?;
+            }
+        }
+        Ok(ExpertCost { whole: Bytes2 { resident: whole, staging: 0 }, half, tp2: true, spark_ok: true })
+    }).collect()
+}
+
+/// Native manifest selection is mandatory; never route EXLR8 through EXL3.
+pub fn exlr8_inventory(snapshot: &std::path::Path, selected: &str, manifest: &std::path::Path,
+    selected_layers: usize, rows: u64, lanes: u64, exchange_f32: bool,
+    activations: crate::plan::exlr8::PrefillActivations) -> anyhow::Result<LocalInventory> {
+    anyhow::ensure!(!exchange_f32, "GLM EXLR8 TP2 emits BF16 routed partials; use BF16 exchange");
+    let config = crate::plan::checkpoint::read_json(&snapshot.join("config.json"))?;
+    let cfg = GlmDsaConfig::from_hf(&config)?;
+    anyhow::ensure!(cfg.hidden == 6144 && cfg.moe_intermediate == 2048 && cfg.experts == 256
+        && cfg.topk == 8 && (cfg.first_moe_layer..=cfg.layers).contains(&selected_layers)
+        && (1..=4).contains(&lanes), "GLM EXLR8 TP2 geometry/layer extent");
+    let programs = crate::plan::checkpoint::read_json(manifest)?;
+    let backend_workspace = crate::plan::exlr8::routed_workspace(&programs, rows, 8, activations)?;
+    let records = crate::plan::exlr8::dense::DenseRecord::inventory(snapshot)?;
+    for layer in cfg.first_moe_layer..selected_layers {
+        for suffix in ["weight", "e_score_correction_bias"] {
+            let name = format!("model.layers.{layer}.mlp.gate.{suffix}");
+            anyhow::ensure!(records.iter().any(|record| record.tensor == name), "EXLR8 missing local router {name}");
+        }
+    }
+    let experts = exlr8_expert_costs(snapshot, selected, cfg.first_moe_layer, selected_layers, &records)?;
+    Ok(LocalInventory { package: manifest.to_path_buf(), format: GlmLocalFormat::Exlr8, experts, backend_workspace,
+        extra_workspace: local_extra_workspace(cfg.hidden as u64, cfg.experts as u64, cfg.topk as u64, rows, lanes, false) })
+}
+
 #[derive(Debug, thiserror::Error)]
 #[error("missing {0} package")]
 struct MissingLocalPackage(String);
@@ -852,7 +898,8 @@ struct MissingLocalPackage(String);
 #[allow(clippy::too_many_arguments)]
 pub fn select_local_inventory(catalog: &crate::OfficialV41Catalog, manifest: &std::path::Path,
     layers: usize, gpus: usize, rows: u64, lanes: u64, exchange_f32: bool,
-    onboard: Onboard, skip: bool) -> anyhow::Result<Option<LocalInventory>> {
+    onboard: Onboard, skip: bool, exlr8: Option<(&str, crate::plan::exlr8::PrefillActivations)>)
+    -> anyhow::Result<Option<LocalInventory>> {
     if skip || onboard.layers(layers.saturating_sub(catalog.routed_experts().first_layer)) == Some(0)
         || layers <= catalog.routed_experts().first_layer { return Ok(None); }
     if gpus != 2 {
@@ -860,6 +907,11 @@ pub fn select_local_inventory(catalog: &crate::OfficialV41Catalog, manifest: &st
             "GLM local experts require a two-GPU TP2 executor");
         return Ok(None);
     }
+    if catalog.format() == crate::plan::checkpoint::CheckpointFormat::Exlr8 {
+        let (selected, activations) = exlr8.ok_or_else(|| anyhow::anyhow!("EXLR8 local inventory requires the selected native manifest"))?;
+        return exlr8_inventory(catalog.snapshot(), selected, manifest, layers, rows, lanes, exchange_f32, activations).map(Some);
+    }
+    anyhow::ensure!(exlr8.is_none(), "EXLR8 manifest supplied for non-native checkpoint");
     let automatic = matches!(onboard, Onboard::Auto | Onboard::ExpertsFirst { .. });
     let supported = catalog.exl3().is_some() || catalog.fp8().is_some_and(|t|
         t.format() == crate::formats::fp8_experts::ExpertFormat::Nvfp4);
@@ -918,6 +970,43 @@ mod tests {
     const HEADS: Option<AttentionPlacement> = Some(AttentionPlacement::Heads);
 
     #[test]
+    fn exlr8_costs_use_rotated_native_residency_and_peer_router_records() {
+        use crate::plan::{exlr8::{dense::{DenseRecord, DenseEncoding, DenseComponent, DenseRange, ShardSide},
+            residency::{Residency, ExpertSet}}, testing::exlr8::fixture};
+        let root = tempfile::tempdir().unwrap();
+        fixture(root.path(), false);
+        let records = ["weight", "e_score_correction_bias"].into_iter().zip([768usize, 8]).map(|(suffix, bytes)| DenseRecord {
+            tensor: format!("model.layers.3.mlp.gate.{suffix}"), encoding: DenseEncoding::Bf16,
+            shape: vec![bytes / 2], side: ShardSide::Replicated, channels_per_shard: 0,
+            rotation_id: 0, rotation: None, hessian_solved: false, native_blocks: 0,
+            components: vec![DenseComponent { suffix: suffix.into(), dtype: "BF16".into(), shape: vec![bytes / 2],
+                source: DenseRange { path: root.path().join("router"), offset: 0, bytes } }],
+        }).collect::<Vec<_>>();
+        let original = std::fs::read(root.path().join("manifests/exlr8-manifest-mixed.json")).unwrap();
+        for selected in ["up1", "bit325"] {
+            let mut manifest: serde_json::Value = serde_json::from_slice(&original).unwrap();
+            manifest["name"] = serde_json::json!(selected);
+            std::fs::write(root.path().join(format!("manifests/exlr8-manifest-{selected}.json")), manifest.to_string()).unwrap();
+            let costs = exlr8_expert_costs(root.path(), selected, 3, 4, &records).unwrap();
+            assert_eq!(costs.len(), 1);
+            let cost = costs[0];
+            assert_eq!(cost.whole.resident, Residency::plan(root.path(), selected, 3, 1, 0, ExpertSet::Routed).unwrap().resident_bytes as u64);
+            for rank in 0..2 {
+                assert_eq!(cost.half[rank].resident, Residency::plan(root.path(), selected, 3, 2, rank, ExpertSet::Routed)
+                    .unwrap().resident_bytes as u64 + if rank == 1 { 768 + 256 } else { 0 });
+                assert_eq!(cost.half[rank].staging, 0);
+            }
+            assert!(cost.tp2 && cost.spark_ok);
+            let residents = crate::plan::exlr8::spark_resident_bytes(root.path(), selected, &[3], 2).unwrap();
+            assert_eq!(residents[0], cost.half[0].resident);
+            assert_eq!(residents[1] + 1024, cost.half[1].resident);
+        }
+        assert!(exlr8_expert_costs(root.path(), "missing", 3, 4, &records).is_err());
+        assert_eq!(crate::plan::exlr8::spark_resident_bytes(root.path(), "up1", &[], 0).unwrap(), Vec::<u64>::new());
+        assert!(crate::plan::exlr8::spark_resident_bytes(root.path(), "up1", &[], 2).is_err());
+    }
+
+    #[test]
     fn native_split_workspaces_are_exact_and_unsupported_modes_refused() {
         let cfg = config();
         let mut base = inputs(&cfg, &[96 * GIB]);
@@ -970,6 +1059,46 @@ mod tests {
         }
         let mut invalid = pair; invalid.spark_ranks = 9;
         assert!(request(&invalid).is_err());
+    }
+
+    #[test]
+    fn native_onboarding_uses_shared_tp2_solver_and_charges_lanes_before_pool() {
+        let cfg = config();
+        let mut native = inputs(&cfg, &[96 * GIB; 2]);
+        native.native_experts = true;
+        native.native_workspace = 256;
+        native.drafter_bytes = 0;
+        native.drafter_staging = 0;
+        native.onboard = Onboard::Layers(1);
+        native.prefill_lanes = 3;
+        let run = |input: &GlmInputs<'_>| solve_working_set(input, input.tp2_workspace, HEADS).unwrap();
+        let (base, working) = run(&native);
+        assert_eq!(base.onboard_layers, 1);
+        assert_eq!(working.spark.rtx_layers, vec![cfg.first_moe_layer]);
+        assert_eq!(working.spark.spark_layers, (cfg.first_moe_layer + 1..cfg.layers).collect::<Vec<_>>());
+        let extra = local_extra_workspace(cfg.hidden as u64, cfg.experts as u64, cfg.topk as u64,
+            native.prefill_rows, native.prefill_lanes, false);
+        let mut charged = native.clone();
+        charged.tp2_workspace = extra.map(|bytes| bytes + 4 * GIB);
+        let (charged_plan, charged_working) = run(&charged);
+        assert_eq!(charged_working.spark, working.spark);
+        assert!(charged_plan.pool_tokens < base.pool_tokens, "backend and every lane precede automatic KV admission");
+        let mut live = charged.clone();
+        for (capacity, baseline) in &mut live.gpus {
+            let Baseline::Planned { context_bytes, loaded_bytes } = *baseline else { unreachable!() };
+            *baseline = Baseline::Measured { free_bytes: *capacity - context_bytes - loaded_bytes };
+        }
+        assert_eq!(run(&live), (charged_plan, charged_working));
+        native.onboard = Onboard::Layers(cfg.layers - cfg.first_moe_layer);
+        for expert in &mut native.experts {
+            expert.whole.resident = 2 << 20;
+            for half in &mut expert.half { half.resident = 1 << 20; }
+        }
+        let (all, working) = run(&native);
+        assert_eq!(all.onboard_layers, cfg.layers - cfg.first_moe_layer);
+        assert!(working.spark.spark_layers.is_empty());
+        assert_eq!(working.spark.spark_ranks, 0);
+        assert_eq!(working.spark.prefill_lanes, 1);
     }
 
     #[test]
@@ -1287,24 +1416,24 @@ mod tests {
     fn activation_policy_uses_exports_and_refuses_malformed_packages() {
         let (dir, catalog, manifest) = local_fixture();
         for onboard in [Onboard::Auto, Onboard::ExpertsFirst { pool_floor: 65536 }, Onboard::Layers(1)] {
-            assert!(select_local_inventory(&catalog, &manifest, 2, 2, 64, 3, false, onboard, false)
+            assert!(select_local_inventory(&catalog, &manifest, 2, 2, 64, 3, false, onboard, false, None)
                 .unwrap().is_some());
         }
-        assert!(select_local_inventory(&catalog, &manifest, 2, 2, 64, 3, false, Onboard::Layers(0), false)
+        assert!(select_local_inventory(&catalog, &manifest, 2, 2, 64, 3, false, Onboard::Layers(0), false, None)
             .unwrap().is_none());
-        assert!(select_local_inventory(&catalog, &manifest, 2, 2, 64, 3, false, Onboard::Layers(1), true)
+        assert!(select_local_inventory(&catalog, &manifest, 2, 2, 64, 3, false, Onboard::Layers(1), true, None)
             .unwrap().is_none());
-        assert!(select_local_inventory(&catalog, &manifest, 2, 1, 64, 3, false, Onboard::Auto, false)
+        assert!(select_local_inventory(&catalog, &manifest, 2, 1, 64, 3, false, Onboard::Auto, false, None)
             .unwrap().is_none());
-        assert!(select_local_inventory(&catalog, &manifest, 2, 1, 64, 3, false, Onboard::Layers(1), false).is_err());
+        assert!(select_local_inventory(&catalog, &manifest, 2, 1, 64, 3, false, Onboard::Layers(1), false, None).is_err());
         let package = dir.path().join("exl3/exl3-glm-k45/rtx-tp2");
         std::fs::remove_file(package.join("m16/libcuteafd_exl3.so")).unwrap();
-        assert!(select_local_inventory(&catalog, &manifest, 2, 2, 64, 3, false, Onboard::Auto, false).is_err(),
+        assert!(select_local_inventory(&catalog, &manifest, 2, 2, 64, 3, false, Onboard::Auto, false, None).is_err(),
             "present but incomplete exports must fail closed");
         std::fs::remove_dir_all(package).unwrap();
-        assert!(select_local_inventory(&catalog, &manifest, 2, 2, 64, 3, false, Onboard::Auto, false)
+        assert!(select_local_inventory(&catalog, &manifest, 2, 2, 64, 3, false, Onboard::Auto, false, None)
             .unwrap().is_none());
-        assert!(select_local_inventory(&catalog, &manifest, 2, 2, 64, 3, false, Onboard::Layers(1), false).is_err());
+        assert!(select_local_inventory(&catalog, &manifest, 2, 2, 64, 3, false, Onboard::Layers(1), false, None).is_err());
     }
 
     #[test]
@@ -1312,7 +1441,7 @@ mod tests {
         let (_dir, catalog, manifest) = local_fixture();
         let cfg = GlmDsaConfig::from_hf(&crate::plan::testing::glm5_config()).unwrap();
         for onboard in [Onboard::Auto, Onboard::Layers(1)] {
-            let local = select_local_inventory(&catalog, &manifest, 2, 2, 64, 3, false, onboard, false)
+            let local = select_local_inventory(&catalog, &manifest, 2, 2, 64, 3, false, onboard, false, None)
                 .unwrap().unwrap();
             let planned = GlmInputs { prefill_rows: 64, experts: local.experts.clone(),
                 expert_workspace: 0, tp2_workspace: local.workspace(), drafter_bytes: 0,
