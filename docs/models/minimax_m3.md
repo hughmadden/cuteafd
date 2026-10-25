@@ -128,17 +128,20 @@ Status: **under qualification**. `serve-minimax` serves the release from a
 
 `cuteafd plan --layout` on the release headers with the slot's `PROGRAMS.json`
 and the example configs' shapes: 64 sequences, two prefill lanes of 4096 rows,
-1M context, FP8 K/V, vision off, the default 114 GiB per Spark rank and the
-default 32 drafter rings. Pools are offline forecasts; serving re-admits measured free memory.
+1M context, FP8 K/V, the default 114 GiB per Spark rank and the default 32
+drafter rings. Vision is off on the RTX 5090 and automatic on the RTX PRO 6000,
+whose plan puts the bundled tower on the GPU at TP2 and on Spark rank 0 at TP3
+and TP4 (the other ranks hold the lower figure). Pools are offline forecasts;
+serving re-admits measured free memory.
 
-| Coordinator | Sparks | Routed layers on the RTX | KV pool, speculator off | KV pool, DSpark | KV pool, DFlash2 (E4M3) | Spark GiB/rank |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| RTX 5090, 31.8 GiB | 2 | 0 | 179,712 | 113,792 | 125,888 | 112.9 |
-| RTX 5090, 31.8 GiB | 3 | 0 | 179,712 | 113,792 | 125,888 | 76.8 |
-| RTX 5090, 31.8 GiB | 4 | 0 | 179,712 | 113,792 | 125,888 | 58.8 |
-| RTX PRO 6000 | 2 | 0 | 1,162,880 | 1,096,768 | 1,108,864 | 112.9 |
-| RTX PRO 6000 | 3 | 0 | 1,161,472 | 1,095,296 | 1,107,392 | 76.8 |
-| RTX PRO 6000 | 4 | 0 | 1,160,000 | 1,093,888 | 1,105,920 | 58.8 |
+| Coordinator | Sparks | Vision tower | Routed layers on the RTX | KV pool, speculator off | KV pool, DSpark | KV pool, DFlash2 (E4M3) | Spark GiB/rank |
+| --- | ---: | --- | ---: | ---: | ---: | ---: | ---: |
+| RTX 5090, 31.8 GiB | 2 | off | 0 | 179,712 | 113,792 | 125,888 | 112.9 |
+| RTX 5090, 31.8 GiB | 3 | off | 0 | 179,712 | 113,792 | 125,888 | 76.8 |
+| RTX 5090, 31.8 GiB | 4 | off | 0 | 179,712 | 113,792 | 125,888 | 58.8 |
+| RTX PRO 6000 | 2 | GPU | 0 | 1,126,912 | 1,060,800 | 1,072,832 | 112.9 |
+| RTX PRO 6000 | 3 | Spark | 0 | 1,161,472 | 1,095,360 | 1,107,392 | 79.1 / 76.8 |
+| RTX PRO 6000 | 4 | Spark | 0 | 1,160,000 | 1,093,888 | 1,105,920 | 61.1 / 58.8 |
 
 ## Changelog
 
@@ -158,7 +161,9 @@ coordinator GPU, as the other families do, and the KV pool takes what is left
 --encoder` on the ranks hosts it on the Sparks instead. `cuteafd plan` (and so
 `run.sh` with `VISION=auto`) plans the same: a Spark rank with room for the
 tower hosts it (TP3 and TP4 at the shipped shapes), and otherwise the
-coordinator GPU keeps it whenever a pool is left (TP2).
+coordinator GPU keeps it whenever a pool is left (TP2). The RTX 5090 examples
+set `VISION=off` to keep that memory for KV; the RTX PRO 6000 examples serve
+the tower.
 Preprocessing is the release's: smart resize (factor 28); video samples 1 fps
 keeping the last frame, scales the longer side to at most 756 px and gives
 every temporal pair its own image delimiters and timestamp.
