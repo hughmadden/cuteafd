@@ -138,6 +138,7 @@ impl LocalTp4Client {
     /// and retains the grouping its bootstrap reported.
     fn open_session(&mut self, rank: usize, request: &ExpertProtocolV2Request, landing: Option<DeviceLanding>,
         egress: bool) -> Result<()> {
+        landing_phase_admits_open(landing, self.max_waves, self.egress_slot)?;
         let flow_label = self.flows.label(rank, self.peers[rank])?;
         // Only the compact-BF16 wire caps a session's rings by capacity; every
         // other family's rings are the request's own wire extents.
@@ -524,6 +525,21 @@ fn wait_for_ring_release(stream: &mut TcpStream, timeout: Duration) -> Result<()
     }
 }
 
+/// A session opens with its landing rotation at slot 0: native posts its
+/// receive WQEs' landing slots in post order from 0 (`RdmaLandingSlots`), and
+/// the worker's reply tail WRITEs pick landing slot `sequence % slots` from
+/// the session's first reply. The client's waves rotate one wave slot per
+/// dispatch (`egress_slot`), and the exchange lands wave `k` in slot `k % N`.
+/// A multi-slot GPU landing may therefore (re)open only in phase, at wave
+/// slot 0: otherwise its next reply would land in another wave's planes.
+fn landing_phase_admits_open(landing: Option<DeviceLanding>, max_waves: usize, next_slot: usize) -> Result<()> {
+    let slots = landing.map_or(1, |landing| landing.bytes / landing.slot_bytes.max(1));
+    anyhow::ensure!(slots <= 1 || next_slot % max_waves.max(1) == 0,
+        "a GPU-landing Spark session cannot (re)connect at wave slot {next_slot} of {max_waves}: its landing \
+        rotation restarts at slot 0 (reset the link first)");
+    Ok(())
+}
+
 #[cfg(test)]
 mod terminal_tests {
     use super::*;
@@ -556,6 +572,53 @@ mod terminal_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn multi_slot_landing_reconnects_only_in_phase() {
+        let landing = |slots: usize| Some(DeviceLanding { ptr: 4096, bytes: slots * 12288, slot_bytes: 12288 });
+        for waves in 1..=4 {
+            for next in 0..2 * waves {
+                // Host receives and a one-slot landing have no phase.
+                assert!(landing_phase_admits_open(None, waves, next).is_ok());
+                assert!(landing_phase_admits_open(landing(1), waves, next).is_ok());
+                assert_eq!(landing_phase_admits_open(landing(waves), waves, next).is_ok(),
+                    waves == 1 || next % waves == 0, "{waves} waves at slot {next}");
+            }
+        }
+    }
+
+    /// A GPU-landing session can only be (re)opened at wave slot 0: out of
+    /// phase, `open_session` refuses before any connection is attempted; in
+    /// phase (and for host receives) it goes on to connect.
+    #[test]
+    fn out_of_phase_gpu_landing_session_is_refused_before_connecting() -> Result<()> {
+        // Nothing listens here: an admitted open fails at its connect instead.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+        let peer = listener.local_addr()?;
+        drop(listener);
+        let request = ExpertProtocolV2Request::new(1, 1, 3, 64, crate::ExpertV2Dtype::Bf16,
+            vec![crate::ExpertProtocolV2RowDescriptor { row_id: 0, source_kind: crate::ExpertV2SourceKind::Prefill,
+                source_request_id: 1, token_position: 0, route_offset: 0, route_count: 1 }],
+            vec![crate::ExpertProtocolV2RouteEntry { row_index: 0, expert_id: 0, gate_weight: 1.0 }], vec![0; 128])?;
+        for waves in 2..=4usize {
+            let landing = DeviceLanding { ptr: 1 << 32, bytes: waves * 12288, slot_bytes: 12288 };
+            for slot in 0..waves {
+                for gpu in [false, true] {
+                    let mut client = LocalTp4Client::new_ranks(vec![peer], TcpTransportConfig { timing: false,
+                        timeout: Duration::from_millis(200), max_frame_bytes: 1 << 20 });
+                    client.set_max_waves(waves)?;
+                    if gpu { client.set_landing(vec![Some(landing)])?; }
+                    // As after `slot` dispatches on live sessions that then dropped.
+                    client.egress_slot = slot;
+                    let error = format!("{:#}", client.open_session(0, &request, client.landing[0], true).unwrap_err());
+                    let refused = error.contains("cannot (re)connect at wave slot");
+                    assert_eq!(refused, gpu && slot != 0, "{waves} waves, slot {slot}, gpu {gpu}: {error}");
+                    assert!(client.sessions[0].is_none());
+                }
+            }
+        }
+        Ok(())
+    }
 
     #[test]
     fn replaced_endpoint_releases_rings_before_reconnect() -> Result<()> {
@@ -730,6 +793,141 @@ mod tests {
         assert!(client.sessions.iter().all(Option::is_none));
         assert!(client.pending.iter().all(VecDeque::is_empty));
         assert!(client.waves.is_empty());
+        Ok(())
+    }
+
+    /// Echoes each request's hidden rows in one unindexed frame (a native
+    /// compact-BF16 worker's shape, which GPU landing takes).
+    struct Echo;
+    impl crate::synthetic::ProtocolV2ExpertExecutor for Echo {
+        fn name(&self) -> &'static str { "multiwave-echo" }
+        fn execute(&self, request: &crate::ExpertProtocolV2RequestView<'_>) -> Result<crate::ExpertProtocolV2Response> {
+            let h = &request.header;
+            crate::ExpertProtocolV2Response::new_with_output_stride(h.request_id, h.placement_version, h.layer_id,
+                h.row_count, h.hidden_dim, h.hidden_dtype, h.hidden_row_stride_bytes, crate::ExpertProtocolV2Status::Ok,
+                request.hidden_payload().to_vec())
+        }
+    }
+
+    fn bf16_request(id: u64, rows: u32, hidden: u32, payload: bytes::Bytes) -> Result<ExpertProtocolV2Request> {
+        ExpertProtocolV2Request::new_bytes(id, 1, 3, hidden, crate::ExpertV2Dtype::Bf16,
+            (0..rows).map(|row| crate::ExpertProtocolV2RowDescriptor { row_id: row.into(),
+                source_kind: crate::ExpertV2SourceKind::Prefill, source_request_id: id, token_position: row.into(),
+                route_offset: row, route_count: 1 }).collect(),
+            (0..rows).map(|row| crate::ExpertProtocolV2RouteEntry { row_index: row, expert_id: 0, gate_weight: 1.0 })
+                .collect(), payload)
+    }
+
+    /// Explicit hardware gate only (`CUTEAFD_LOOPBACK_ADDR` = a local RoCE
+    /// address; `CUTEAFD_LOOPBACK_GPU=1` adds GPU landing, which needs CUDA and
+    /// dma-buf). A real verbs worker and a real coordinator client on one
+    /// host, for 1..=4 outstanding waves: pinned host or N-slot GPU landing,
+    /// copied or N-slot registered egress, small (decode-sized, one SEND) and
+    /// large (chunked WRITE tails) frames. Every echo is byte-exact in its own
+    /// wave's landing slot, and a registered egress slot is rewritten
+    /// (`egress_target`, which drains only that slot's readers) while the
+    /// other waves are still outstanding without disturbing their payloads.
+    #[test]
+    #[ignore = "requires approved native RDMA loopback hardware gate"]
+    fn native_loopback_multiwave_gpu_landing_and_registered_egress_are_byte_exact() -> Result<()> {
+        let ip = std::env::var("CUTEAFD_LOOPBACK_ADDR").context("set CUTEAFD_LOOPBACK_ADDR to a local RoCE address")?;
+        let gpu = std::env::var("CUTEAFD_LOOPBACK_GPU").as_deref() == Ok("1");
+        let hidden = 6144u32;
+        let capacity = 2048u32;
+        let listener = std::net::TcpListener::bind(format!("{ip}:0"))?;
+        let addr = listener.local_addr()?;
+        drop(listener);
+        let executor: Arc<dyn crate::synthetic::ProtocolV2ExpertExecutor> = Arc::new(Echo);
+        std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+            let _ = runtime.block_on(super::super::serve_protocol_v2_verbs_host_with_executor(&addr.to_string(), executor));
+        });
+        std::thread::sleep(Duration::from_millis(300));
+        let library = load_verbs_host_native_library()?;
+        let plane_bytes = capacity as usize * hidden as usize * 2;
+        for landing in if gpu { vec![false, true] } else { vec![false] } {
+            for registered in [false, true] {
+                for waves in 1..=4usize {
+                    let mut client = LocalTp4Client::new_ranks(vec![addr], TcpTransportConfig {
+                        timing: false, timeout: Duration::from_secs(30), max_frame_bytes: 64 << 20 });
+                    client.set_max_waves(waves)?;
+                    if registered { client.enable_egress(plane_bytes)?; }
+                    let mut plane = None;
+                    if landing {
+                        let buffer = library.alloc_device_buffer(plane_bytes * waves)?;
+                        client.set_landing(vec![Some(DeviceLanding::with_slots(buffer, waves)?)])?;
+                        plane = Some(buffer);
+                    }
+                    let result = (|| -> Result<()> {
+                        // Full capacity first: it sizes the rings for every later wave.
+                        let sizes = [2048u32, 1, 21, 64, 1500, 2048, 7, 2048];
+                        let mut sent: VecDeque<(ExpertProtocolV2Request, Vec<u8>, usize)> = VecDeque::new();
+                        let mut zero_copy = 0;
+                        let check = |client: &mut LocalTp4Client, request: ExpertProtocolV2Request, expected: Vec<u8>,
+                            slot: usize| -> Result<()> {
+                            // The request's payload (an egress view) is still intact.
+                            anyhow::ensure!(request.hidden_payload.as_ref() == expected.as_slice(),
+                                "request {} payload changed while in flight", request.header.request_id);
+                            let mut got = vec![0u8; expected.len()];
+                            let mut landed = false;
+                            while !client.poll(|chunk| {
+                                landed |= chunk.landed;
+                                if !chunk.landed {
+                                    let bytes = chunk.partial_output_payload.as_ref();
+                                    got[..bytes.len()].copy_from_slice(bytes);
+                                }
+                                Ok(())
+                            })? {}
+                            if let Some(buffer) = plane.filter(|_| landed) {
+                                // SAFETY: the slot lies inside the allocated plane, whose wave landed.
+                                let view = CuteafdDeviceBuffer { ptr: unsafe { buffer.ptr.cast::<u8>()
+                                    .add(slot * plane_bytes) }.cast(), bytes: got.len(), ..buffer };
+                                library.copy_d2h(&mut got, view)?;
+                            }
+                            anyhow::ensure!(landed == plane.is_some(), "request {} landed={landed}", request.header.request_id);
+                            anyhow::ensure!(got == expected, "request {} echo differs (slot {slot})", request.header.request_id);
+                            Ok(())
+                        };
+                        for (index, &rows) in sizes.iter().cycle().take(sizes.len() * 3).enumerate() {
+                            while client.open_waves() == waves {
+                                let (request, expected, slot) = sent.pop_front().unwrap();
+                                check(&mut client, request, expected, slot)?;
+                            }
+                            let expected: Vec<u8> = (0..rows as usize * hidden as usize * 2)
+                                .map(|i| ((i * 7 + index * 13) % 253) as u8).collect();
+                            let slot = index % waves;
+                            let payload: bytes::Bytes = match registered && expected.len() >= 1 << 20 {
+                                true => {
+                                    // Rewrites this wave's slot while the other waves' requests,
+                                    // views of the other slots, are still outstanding.
+                                    let target = client.egress_target()?;
+                                    // SAFETY: egress_target returned a writable slot of `plane_bytes`
+                                    // that no request views and no send still reads.
+                                    unsafe { std::slice::from_raw_parts_mut(target.ptr.cast::<u8>(), expected.len()) }
+                                        .copy_from_slice(&expected);
+                                    zero_copy += 1;
+                                    client.egress_payload(expected.len())?
+                                }
+                                false => expected.clone().into(),
+                            };
+                            let request = bf16_request(index as u64 + 1, rows, hidden, payload)?;
+                            client.dispatch(&request)?;
+                            sent.push_back((request, expected, slot));
+                        }
+                        while let Some((request, expected, slot)) = sent.pop_front() {
+                            check(&mut client, request, expected, slot)?;
+                        }
+                        anyhow::ensure!((zero_copy > 0) == registered, "registered={registered}: {zero_copy} zero-copy waves");
+                        eprintln!("loopback landing={landing} registered={registered} waves={waves}: \
+                            {} waves byte-exact, {zero_copy} zero-copy", sizes.len() * 3);
+                        Ok(())
+                    })();
+                    client.reset();
+                    if let Some(mut buffer) = plane { library.free_device_buffer(&mut buffer)?; }
+                    result?;
+                }
+            }
+        }
         Ok(())
     }
 }
