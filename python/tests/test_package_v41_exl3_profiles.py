@@ -1155,7 +1155,10 @@ class PackageProfileTests(unittest.TestCase):
             for width in (512, 640, 768, 1024, 1536):
                 self.assertEqual([w(geometry, 'spark', width, c) for c in (1, 16, 80, 256, 1024, 4096)],
                                  [False, False, False, True, True, True])
-                if geometry not in ('glm', 'glmf') or width != 1024:
+                if geometry == 'dsv4p' and width == 1536:
+                    self.assertEqual([w(geometry, 'coordinator', width, c) for c in (256, 1024, 4096)],
+                                     [False, False, True])
+                elif geometry not in ('glm', 'glmf') or width != 1024:
                     self.assertFalse(any(w(geometry, 'coordinator', width, c) for c in (256, 1024, 4096)))
         for geometry in ('v41', 'dsv4f', 'qwen4'):
             self.assertFalse(any(w(geometry, 'spark', 512, c) for c in (256, 1024, 4096)))
@@ -1341,10 +1344,13 @@ class PackageProfileTests(unittest.TestCase):
                     capacities=(80, 256, 1024, 2752, 4096))
                 for call in calls:
                     capacity = call.args[3]
-                    self.assertNotIn('warp_specialized', call.kwargs)
+                    ws = bits == (2, 3) and call.args[1] == 1536 and capacity == 4096
+                    self.assertEqual(call.kwargs.get('warp_specialized', False), ws)
+                    self.assertEqual(call.kwargs.get('ws_dynamic_tiles', False), ws)
                     self.assertEqual(call.kwargs.get('route_block', 8), 8 if capacity <= 256 else 64)
                     self.assertEqual(call.kwargs.get('token_major_rotation', False),
-                                     len(bits) == 2 and capacity > 256)
+                                     len(bits) == 2 and capacity > 256 and not ws)
+                    self.assertEqual('+ws-m64-bf16-dynamic' in str(call.args[0]), ws)
         with tempfile.TemporaryDirectory() as temporary:
             _, _, calls, _ = self.build_fixture(
                 Path(temporary), 'spark', (2, 3, 4), geometry='dsv4p',
