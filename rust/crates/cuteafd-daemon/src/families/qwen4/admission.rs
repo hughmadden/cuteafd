@@ -645,7 +645,7 @@ mod tests {
             let experts = super::dual_experts(&args, &catalog, 4)?;
             let mut fixed = weights.fixed;
             fixed.extend(experts.transport);
-            if mtp { fixed.extend(qwen4::dual_draft_demands(&catalog, &lib, 16)?); }
+            if mtp { fixed.extend(qwen4::dual_draft_demands(&catalog, &lib, args.prefill_rows as u64)?); }
             let admission = super::inputs(&args, &cfg, 4, mtp, Some(&manifests[0]), None, 0)?;
             let runtime = qwen4::dual_placement(&qwen4::QwenDualInputs { automatic_context: false, owner_manifests: manifests.each_ref().map(Some), admission,
                 gpus: [0, 1].map(|rank| GpuBudget { capacity_bytes: capacities[rank],

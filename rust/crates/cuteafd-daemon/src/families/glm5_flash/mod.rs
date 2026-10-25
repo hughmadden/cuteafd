@@ -772,7 +772,7 @@ mod draft_cli_tests {
             (&["--prefill-rows", "2048", "--decode-rows", "128"][..], 2048), (&["--prefill-rows", "64"][..], 64)] {
             assert_eq!(parse(flags).expert_rows(), rows, "{flags:?}");
         }
-        let args = parse(&["--prefill-rows", "64", "--decode-rows", "128"]);
+        let args = parse(&["--peers", "127.0.0.1:19441", "--prefill-rows", "64", "--decode-rows", "128"]);
         check_options(&args).unwrap();
         for (sms, budget) in [(170, 127), (188, 128)] {
             let verify_rows = engine::verify_budget(args.decode_rows, sms);
@@ -793,9 +793,9 @@ mod draft_cli_tests {
             let rows = experts.unwrap();
             assert!(rows > args.prefill_rows && rows <= args.expert_rows(), "{rows} rows at {sms} SMs");
         }
-        // Two lanes' transports, each with a plane per Spark (4 ranks) of 64 more rows of 4,096 BF16.
+        // One transport, with two independent return slots per Spark (4 ranks).
         assert_eq!(wide_intake_bytes(&args, 4, 4096), 2 * 4 * 64 * 4096 * 2);
-        assert_eq!(wide_intake_bytes(&parse(&["--prefill-rows", "64", "--decode-rows", "128", "--prefill-waves", "4"]),
+        assert_eq!(wide_intake_bytes(&parse(&["--peers", "127.0.0.1:19441", "--prefill-rows", "64", "--decode-rows", "128", "--prefill-waves", "4"]),
             4, 4096), 4 * 4 * 64 * 4096 * 2);
         for flags in [&[][..], &["--decode-rows", "128"][..], &["--prefill-rows", "64"][..],
             &["--prefill-rows", "128", "--decode-rows", "128"][..]] {

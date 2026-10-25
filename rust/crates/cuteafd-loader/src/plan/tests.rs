@@ -134,9 +134,12 @@ fn host_prefill_waves_keep_unit_scratch_and_independent_return_slots() {
                 let host = report.host_ledger.as_ref().unwrap();
                 let bytes = |name| host.items.iter().find(|i| i.group == name).unwrap().bytes;
                 let endpoints = layout::spark_endpoints(family, 1) as u64;
-                let endpoint = SparkEndpoint { ring_depth: None, capacity: unit as u32, ingress: SparkIngress::Fp8K32 };
-                let (request, response) = endpoint.wire_bytes(geometry).unwrap();
-                let rings = SparkRings { max_frame_bytes: (64 << 20).max(request).max(response),
+                let ingress = if !native && family == "glm5" { SparkIngress::Bf16 } else { SparkIngress::Fp8K32 };
+                let endpoint = SparkEndpoint { ring_depth: None, capacity: unit as u32, ingress };
+                let (frame_request, response) = endpoint.wire_bytes(geometry).unwrap();
+                let request = geometry.compact_wire_bytes(unit as u32,
+                    !native && input.checkpoint().spark_input_is_bf16()).unwrap().0;
+                let rings = SparkRings { max_frame_bytes: (64 << 20).max(frame_request).max(response),
                     depth: 8, slot_bytes: 8 << 20, alignment: 4096 };
                 assert_eq!(bytes("transport/rdma-rings"), endpoint.ring_bytes(geometry, rings).unwrap() as u64
                     * endpoints * 4, "{family} {unit}x{waves}");
@@ -351,7 +354,8 @@ fn qwen_local_and_dual_publish_whole_step_geometry_without_a_transport() {
 
 #[test]
 fn spark_host_layout_requires_explicit_family_unit_even_for_one_wave() {
-    let dir = snapshot(mimo_flash_config(), &mimo_flash_tensors());
+    let config = glm5_flash_config(4);
+    let dir = snapshot(config.clone(), &glm5_flash_tensors(&config));
     let input = PlanInput::open(dir.path()).unwrap();
     for native in [false, true] {
         for waves in [1, 2] {
@@ -2186,8 +2190,8 @@ fn glm5_flash_layout_charges_the_engine_step_workspaces_and_headroom() {
     std::fs::write(&path, manifest.to_string()).unwrap();
     let cfg = GlmNextConfig::from_hf(&config).unwrap();
     let lookup = glmf_manifest_scratch(&manifest);
-    // Two lanes of 4,096 rows and the default 2 GiB headroom; four lanes of 2,048 and 1 GiB.
-    for (lanes, rows, headroom) in [(2u64, 4096u64, 2u64 << 30), (4, 2048, 1 << 30)] {
+    // Native FP8 keeps two waves (#779), with independent unit widths and headroom.
+    for (lanes, rows, headroom) in [(2u64, 4096u64, 2u64 << 30), (2, 2048, 1 << 30)] {
         let options = PlanOptions { layout: Some(layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)), drafter_bytes: 256 << 20, rtx_bytes: vec![32 << 30], prefill_lanes: lanes,
             prefill_rows: rows, headroom_bytes: headroom, context_tokens: 131_072, workspace_manifest: Some(path.clone()),
             ..Default::default() }), ..sparks(4) };
@@ -2256,10 +2260,12 @@ fn glm5_flash_layout_charges_the_engine_step_workspaces_and_headroom() {
         .iter().find(|i| i.group == "steps").unwrap().bytes;
     let allowance = 268 * (1 << 30) / 100;
     assert_eq!(steps(2, 4096), allowance);
-    assert_eq!(steps(4, 2048), allowance);
-    let refused = plan(dir.path(), &options(4, 4096)).unwrap();
-    assert!(!refused.placement_supported);
-    assert!(refused.hints.iter().any(|hint| hint.what.contains("live-slot reserve")));
+    assert_eq!(steps(2, 2048), allowance);
+    for rows in [2048, 4096] {
+        let refused = plan(dir.path(), &options(4, rows)).unwrap();
+        assert!(!refused.placement_supported);
+        assert!(refused.hints.iter().any(|hint| hint.what.contains("executor supports at most 2 waves")));
+    }
     // A graph budget replaces the graph allowance, as the engine's admission reserves it.
     let mut budgeted = options(2, 4096);
     budgeted.layout.as_mut().unwrap().graph_budget_bytes = Some(512 << 20);

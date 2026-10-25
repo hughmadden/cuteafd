@@ -190,7 +190,7 @@ mod tests {
                 ("fc1", 150_994_944), ("activated", 75_497_472), ("output", 58_720_256),
                 ("packed_route_indices", 195_072), ("block_expert_ids", 3_048), ("packed_route_count", 16),
                 ("expert_offsets", 1_540), ("expert_counts", 1_536),
-                ("fc1_scratch", 12_582_912), ("fc2_scratch", 12_582_912)], 847_635_004),
+                ("fc1_scratch", 12_582_912), ("fc2_scratch", 12_582_912)], 847_569_468),
             ("deepseek_v41", 5120, 6, vec![("rotation_gate", 251_658_240), ("rotation_up", 251_658_240),
                 ("fc1", 113_246_208), ("activated", 56_623_104), ("output", 41_943_040),
                 ("packed_route_indices", 109_056), ("block_expert_ids", 13_632), ("packed_route_count", 16),
