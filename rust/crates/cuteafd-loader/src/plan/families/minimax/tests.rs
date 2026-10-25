@@ -257,6 +257,29 @@ fn tp2_onboarding_sizes_the_sparks_for_their_load_peak() {
     assert!(memory.notes.iter().any(|n| n.starts_with("3 routed layers on the RTX")), "{:?}", memory.notes);
 }
 
+/// The default Spark budget, measured on headless Sparks, holds every routed layer at TP2 with the
+/// shipped 5090 shape (two lanes of 4096 rows, 64 sequences): nothing onboards onto the RTX.
+#[test]
+fn tp2_default_budget_keeps_every_routed_layer_on_the_sparks() {
+    let dir = snapshot(false, false);
+    let programs = dir.path().join("PROGRAMS.json");
+    std::fs::write(&programs, admission::tests::programs_manifest().to_string()).unwrap();
+    let experts = dir.path().join("fp8/fp8-minimax-nvfp4a4");
+    std::fs::create_dir_all(&experts).unwrap();
+    let mut package = admission::tests::expert_manifest();
+    package["layouts"].as_object_mut().unwrap().retain(|name, _| name == "tp1");
+    std::fs::write(experts.join("manifest.json"), package.to_string()).unwrap();
+    let mut options = with_layout(RTX_5090, 2);
+    let layout = options.layout.as_mut().unwrap();
+    layout.workspace_manifest = Some(programs);
+    layout.native_mtp_layers = 0;
+    layout.concurrency = 64;
+    let report = plan::plan(dir.path(), &options).unwrap();
+    assert!(report.wip_launchable(), "{:?}", report.hints);
+    let memory = report.memory_layout.as_ref().unwrap();
+    assert!(memory.notes.iter().any(|n| n.starts_with("0 routed layers on the RTX")), "{:?}", memory.notes);
+}
+
 #[test]
 fn native_tp2_auto_vision_preserves_text_admission() {
     use crate::plan::{encoder::EncoderKind, MediaMode};

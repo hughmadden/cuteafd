@@ -81,16 +81,15 @@ Status: **under qualification**. `serve-minimax` serves the release from a
 ## Planned cards
 
 `cuteafd plan --layout` on the release headers with the slot's `PROGRAMS.json`
-and the example configs' shapes: 64 sequences, two prefill lanes of 4096 rows
-(1024 on the 5090 at TP2), 1M context, FP8 K/V, vision off, 108 GiB per Spark
-rank. Pools are offline forecasts; serving re-admits measured free memory.
+and the example configs' shapes: 64 sequences, two prefill lanes of 4096 rows,
+1M context, FP8 K/V, vision off, the default 114 GiB per Spark rank. Pools are offline forecasts; serving re-admits measured free memory.
 
 | Coordinator | Sparks | Routed layers on the RTX | KV pool, speculator off | KV pool, DSpark | Spark GiB/rank |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| RTX 5090, 31.8 GiB | 2 | 2 | 79,168 | 38,272 | 107.8 |
+| RTX 5090, 31.8 GiB | 2 | 0 | 179,712 | 132,288 | 112.9 |
 | RTX 5090, 31.8 GiB | 3 | 0 | 179,712 | 132,288 | 76.8 |
 | RTX 5090, 31.8 GiB | 4 | 0 | 179,712 | 132,288 | 58.8 |
-| RTX PRO 6000 | 2 | 3 | 981,248 | 933,696 | 107.2 |
+| RTX PRO 6000 | 2 | 0 | 1,162,880 | 1,115,392 | 112.9 |
 | RTX PRO 6000 | 3 | 0 | 1,161,472 | 1,113,984 | 76.8 |
 | RTX PRO 6000 | 4 | 0 | 1,160,000 | 1,112,512 | 58.8 |
 
