@@ -190,9 +190,8 @@ def scratch():
         shutil.rmtree(root, ignore_errors=True)
 
 
-def test_relocated_cargo_target_is_where_the_daemon_is_installed(scratch):
-    """Behavioural proof that build and install follow one selected target."""
-    tmp_path = scratch
+def _stub_build(tmp_path: Path):
+    """Fake source, stub cargo/cmake/python3 (each logging its call) and env."""
     src = _fake_source(tmp_path)
     output = tmp_path / "output"
     relocated = tmp_path / "relocated-target"
@@ -204,6 +203,8 @@ def test_relocated_cargo_target_is_where_the_daemon_is_installed(scratch):
         """
         #!/usr/bin/env bash
         set -euo pipefail
+        echo cargo >>"$STUB_CALL_LOG"
+        [[ "${STUB_CARGO_FAIL:-0}" == 0 ]] || exit 9
         triple=""
         while [[ $# -gt 0 ]]; do [[ "$1" == --target ]] && triple="$2/"; shift; done
         mkdir -p "$CARGO_TARGET_DIR/${triple}release"
@@ -216,6 +217,7 @@ def test_relocated_cargo_target_is_where_the_daemon_is_installed(scratch):
         """
         #!/usr/bin/env bash
         set -euo pipefail
+        echo cmake >>"$STUB_CALL_LOG"
         build_dir=""
         while [[ $# -gt 0 ]]; do
           case "$1" in
@@ -279,7 +281,15 @@ def test_relocated_cargo_target_is_where_the_daemon_is_installed(scratch):
     # The script guards CARGO_HOME too, and a user's default may sit on a
     # read-only mount in a sandboxed runner.
     env["CARGO_HOME"] = str(tmp_path / "cargo-home")
+    env["STUB_CALL_LOG"] = str(tmp_path / "calls.log")
+    for name in ("CUTEAFD_RELEASE_ARTIFACT_PHASE", "CUTEAFD_RELEASE_ARTIFACT_STATE"):
+        env.pop(name, None)
+    return src, output, relocated, env
 
+
+def test_relocated_cargo_target_is_where_the_daemon_is_installed(scratch):
+    """Behavioural proof that build and install follow one selected target."""
+    src, output, relocated, env = _stub_build(scratch)
     result = subprocess.run(
         ["bash", str(SCRIPT), str(src), "coordinator", "120", str(output)],
         capture_output=True,
@@ -298,6 +308,71 @@ def test_relocated_cargo_target_is_where_the_daemon_is_installed(scratch):
     assert (output / "bin-variants" / "x86-64-v4" / "cuteafd").read_text() == "daemon\n"
     assert (output / "lib-variants" / "x86-64-v4" / "libcuteafd_native.so").read_text() == "native v4\n"
     assert not (output / "cargo-target").exists()
+
+
+# --------------------------------------------------------------------------
+# Phases: Rust without a GPU lease, then native in the same state.
+# --------------------------------------------------------------------------
+
+
+def _phase(src, output, env, phase, state, **extra):
+    run_env = {**env, "CUTEAFD_RELEASE_ARTIFACT_PHASE": phase,
+               "CUTEAFD_RELEASE_ARTIFACT_STATE": str(state), **extra}
+    return subprocess.run(["bash", str(SCRIPT), str(src), "coordinator", "120", str(output)],
+                          capture_output=True, text=True, env=run_env)
+
+
+def test_rust_then_native_phase_builds_once_and_consumes_the_state(scratch):
+    src, output, _, env = _stub_build(scratch)
+    calls = Path(env["STUB_CALL_LOG"])
+    state = scratch / "state"
+    rust = _phase(src, output, env, "rust", state)
+    assert rust.returncode == 0, rust.stdout + rust.stderr
+    assert calls.read_text().split() == ["cargo", "cargo"]  # both host ISAs, no CMake
+    assert (state / "rust.done").is_file() and not output.exists()
+    # The GPU assignment is the one input allowed to change between phases.
+    native = _phase(src, output, env, "native", state, CUDA_VISIBLE_DEVICES="GPU-x", NVIDIA_VISIBLE_DEVICES="GPU-x")
+    assert native.returncode == 0, native.stdout + native.stderr
+    assert calls.read_text().split() == ["cargo", "cargo", "cmake", "cmake"]  # no repeated Cargo
+    assert (output / "cuteafd").read_text() == "daemon\n"
+    assert not state.exists()
+
+
+def test_native_phase_refuses_missing_rust_state(scratch):
+    src, output, _, env = _stub_build(scratch)
+    result = _phase(src, output, env, "native", scratch / "state")
+    assert result.returncode == 2
+    assert "no completed rust phase" in result.stderr
+    assert not Path(env["STUB_CALL_LOG"]).exists()
+
+
+@pytest.mark.parametrize("change", ["env", "source", "daemon"])
+def test_native_phase_refuses_stale_rust_state(scratch, change):
+    src, output, relocated, env = _stub_build(scratch)
+    state = scratch / "state"
+    assert _phase(src, output, env, "rust", state).returncode == 0
+    extra = {}
+    if change == "env":
+        extra["CUTEAFD_RELEASE_AUDIO_AOT"] = "OFF"
+    elif change == "source":
+        (src / "THIRD_PARTY_NOTICES.md").write_text("changed\n")
+    else:
+        (relocated.parent / f"{relocated.name}-x86-64-v4" / "x86_64-unknown-linux-gnu" / "release" / "cuteafd").write_text("other\n")
+    result = _phase(src, output, env, "native", state, **extra)
+    assert result.returncode == 2, result.stdout + result.stderr
+    assert "changed" in result.stderr
+    assert "cmake" not in Path(env["STUB_CALL_LOG"]).read_text()
+    assert not state.exists()
+
+
+def test_failed_rust_phase_removes_its_state(scratch):
+    src, output, _, env = _stub_build(scratch)
+    state = scratch / "state"
+    result = _phase(src, output, env, "rust", state, STUB_CARGO_FAIL="1")
+    assert result.returncode != 0
+    assert not state.exists()
+    assert _phase(src, output, env, "rust", state).returncode == 0
+    assert _phase(src, output, env, "rust", state).returncode == 2  # a state is never reused
 
 
 if __name__ == "__main__":

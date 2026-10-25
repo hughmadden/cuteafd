@@ -90,7 +90,8 @@ def test_the_relocated_cargo_home_matches_the_unwritable_image_default():
 def test_both_release_legs_and_the_artifact_compiler_carry_the_group():
     text = BUILD.read_text(encoding="utf-8")
     # The coordinator leg uses the rendered array exactly once...
-    assert text.count('"${release_build_user_args[@]}" \\') == 1
+    # (in the option array both artifact phases share).
+    assert text.count('  "${release_build_user_args[@]}"\n') == 1
     assert 'release_build_container_user_args_render "$release_build_root"' in text
     # ...and the Spark leg computes the group inside the remote heredoc, where
     # `id` reports the Spark's own user (raptor is 1000, the Sparks 1001).
@@ -102,7 +103,7 @@ def test_both_release_legs_and_the_artifact_compiler_carry_the_group():
                   '-e "TORCHINDUCTOR_CACHE_DIR=$container_home/torchinductor"',
                   '-e "CARGO_HOME=$container_home/cargo"'):
         assert token in remote, token
-    # Both the idle probe and the export run as the invoking uid/gid.
+    # The idle probe and the artifact phases' shared options run as the invoking uid/gid.
     assert remote.count('--user "$(id -u):$(id -g)"') == 2
     assert 'container_home="$release_build_root/container-home"' in remote
     # The container, not the caller, creates the writable roots: the bind-mounted

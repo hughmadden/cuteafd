@@ -167,8 +167,11 @@ def test_docker_mounts_reach_each_entrypoint(tmp_path, entry, enabled):
             prefix += f'repo_root="{ROOT}"; release_build_root="{tmp_path}/build"; release_source_parent="$release_build_root"; release_toolchain_hash=abcd\n'
             prefix += 'release_die() { exit 2; }; release_build_container_home() { printf /container/home; }\n'
             body = text[text.index('compiler_cache_args=()\nmapfile'):] if 'compiler_cache_args=()\nmapfile' in text else text[text.index('compiler_cache_args=()\ncache_plan='):]
-            body = body[:body.index('timeout --foreground "$export_timeout"')]
-            prefix += body + '\ndocker run "${compiler_cache_args[@]}" image true\n'
+            # Through the real lock-free Rust phase run (the native phase shares its options).
+            body = body[:body.index('(( coordinator_rust_status == 0 ))')]
+            prefix += f'release_source_dir="{tmp_path}/source"; artifact_dir="{tmp_path}/out"; COORDINATOR_DOCKER_DEV=image\n'
+            prefix += 'export_timeout=60; coordinator_export_container=test; release_build_user_args=(); native_build_env_args=(); release_build_root_args=(); bf16_families=; audio_aot=OFF\n'
+            prefix += body + '\n(( coordinator_rust_status == 0 ))\n'
         elif entry == "wip":
             prefix += f'coordinator_container=test; COORDINATOR_DOCKER_DEV=image; RELEASE_COORDINATOR_GPU_UUID=uuid; hf_home="{tmp_path}/hf"; wip_mount_root="{tmp_path}/build"; wip_toolchain_hash=abcd; WIP_ROOT="$wip_mount_root"\n'
             prefix += 'release_die() { printf "%s\\n" "$*" >&2; exit 2; }; mkdir -p "$wip_mount_root"\n'
@@ -183,11 +186,13 @@ def test_docker_mounts_reach_each_entrypoint(tmp_path, entry, enabled):
             result = subprocess.run(['bash', '-s', '--', *args], input=body, env=env, text=True, capture_output=True)
         else:
             body = text.split('build_spark_release_leg() {', 1)[1].split("<<'REMOTE'\n", 1)[1].split('\nREMOTE', 1)[0]
-            # Cache setup + exact Docker export argv, omitting GPU admission and supervision.
-            begin = body.index('container_home=/tmp/cuteafd-home')
-            end = body.index('spark_export_container_pid=$!')
+            # Cache setup + the exact shared artifact argv through the lock-free Rust
+            # phase run, omitting GPU admission and supervision.
+            begin = body.index('if [[ "$phase" == rust || "$phase" == export ]]; then')
+            end = body.index('if [[ "$phase" == export ]]; then')
             body = body[begin:end]
             prefix += f'cd "{ROOT}"; release_build_root="{tmp_path}/build"; remote_dir="{tmp_path}/remote"; export_container=test; dev_image=image\n'
+            prefix += f'phase=rust; artifact_state_parent="{tmp_path}/build/test.artifacts"\n'
             prefix += 'compiler_cache_args=(); native_build_env_args=(); release_build_root_args=(); spark_tp_roles=; expert_families=; bf16_families=; audio_aot=OFF\n'
             prefix += body + '\nwait\n'
         if entry != "remote-wip":
