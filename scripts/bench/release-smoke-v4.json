@@ -1013,6 +1013,38 @@
         "ADDR": "0.0.0.0:8829",
         "SPECULATOR": "dspark"
       }
+    },
+    {
+      "name": "qwen38-27b-bf16-min-nospec",
+      "config": "examples/configs/qwen38-27b-bf16-min.config",
+      "family": "qwen3_5",
+      "gpus": [
+        1
+      ],
+      "sparks": [],
+      "set": {
+        "RTX_GPUS": "1",
+        "COORDINATOR_GPU": "1",
+        "SPARK_COUNT": "0",
+        "ADDR": "0.0.0.0:8841",
+        "SPECULATOR": "off"
+      }
+    },
+    {
+      "name": "qwen38-27b-fp8-min-nospec",
+      "config": "examples/configs/qwen38-27b-fp8-min.config",
+      "family": "qwen3_5",
+      "gpus": [
+        1
+      ],
+      "sparks": [],
+      "set": {
+        "RTX_GPUS": "1",
+        "COORDINATOR_GPU": "1",
+        "SPARK_COUNT": "0",
+        "ADDR": "0.0.0.0:8842",
+        "SPECULATOR": "off"
+      }
     }
   ],
   "retired": [

@@ -629,6 +629,7 @@ def test_v4_matrix_card_set_and_retired_pins() -> None:
         ("kimi-k3-max", 2, 6), ("step5-fp8-max", 2, 6),
         ("step5-nvfp4-min", 1, 4), ("qwen38-27b-bf16-min", 1, 0),
         ("qwen38-27b-fp8-min", 1, 0), ("qwen35-9b-bf16-min", 1, 0),
+        ("qwen38-27b-bf16-min-nospec", 1, 0), ("qwen38-27b-fp8-min-nospec", 1, 0),
     ]:
         assert len(entries[name]["gpus"]) == gpus
         assert len(entries[name]["sparks"]) == sparks
@@ -636,7 +637,13 @@ def test_v4_matrix_card_set_and_retired_pins() -> None:
     dense = [entry for entry in v4["entries"] if entry["family"] == "qwen3_5"]
     assert {entry["name"]: entry["set"]["SPECULATOR"] for entry in dense} == {
         "qwen35-9b-bf16-min": "off", "qwen38-27b-bf16-min": "dspark",
-        "qwen38-27b-fp8-min": "dspark"}
+        "qwen38-27b-fp8-min": "dspark", "qwen38-27b-bf16-min-nospec": "off",
+        "qwen38-27b-fp8-min-nospec": "off"}
+    for quant in ("bf16", "fp8"):
+        base = entries[f"qwen38-27b-{quant}-min"]
+        nospec = entries[f"{base['name']}-nospec"]
+        assert nospec == {**base, "name": f"{base['name']}-nospec", "set": {
+            **base["set"], "SPECULATOR": "off", "ADDR": nospec["set"]["ADDR"]}}
     assert "SPARK_EXPERT_DOCKER_INFERENCE" not in v4["defaults"]["set"]
     for entry in v4["entries"]:
         assert ("SPARK_EXPERT_DOCKER_INFERENCE" in entry["set"]) == bool(entry["sparks"])
