@@ -6090,6 +6090,56 @@ quality gates stay required. The next controlled candidate run uses this
 committed harness and the unchanged S3 runtime. No live inference, agent or
 speed pass is claimed by these startup results.
 
+The controlled retry with launcher `e87441c29` and sealed runtime `237a3cf7b`
+completed on 2026-10-25 at 18:52 AEDT. API readiness was 208.52 s; the existing
+push loader delivered 371.35 GB in 43.445 s with zero RPC fallback slots.
+Both exact IDs passed namespace isolation, retained repeats, concurrent
+requests, typo rejection, cancel/park/partial restore, exact cache state,
+the ten-case lossless DFlash2 set, structured output and real two-turn
+Claude tool tasks. Tool scores were 141/168 for base and 137/168 for Keys.
+The live prefix panel measured five retained device hits per model, not a
+new host-promotion result; the earlier RAM golden supplies that evidence.
+
+The raw retry receipt remains failed: the Keys benchmark CLI rejected its
+base-reference fidelity check, and strict report identity differed by one
+binary64 ULP in two diagnostic fit values. Reviewed private validation
+preserves those raw values and permits at most two ULP only in those two
+fields; all other identity fields and non-fidelity gates remain exact.
+Both stored reports pass that scoped validation. The benchmark fix at
+`45135282f` makes a selected variant's unavailable fidelity reference explicit
+before probing or fetching data, for both baseline and fidelity panels.
+It never scores the variant against the base, and leaves base fidelity and
+the scorer's checkpoint-change guard strict. Its 300 library tests and
+focused integration checks pass. The release CLI also carries the tested
+tool-eval token-through-environment fix; neither change alters inference.
+
+The collected warmed cards are 49.197 / 133.507 / 1895.097 tok/s for base,
+and 61.074 / 146.473 / 1019.539 for Keys (C1 code / C16 aggregate / nominal
+8K prefill). C1 and C16 exceed the reported references, with base C1 only
+0.42% above 48.9907; both prefill rates are below the 2820.191 reference.
+This is historical Raptor versus Romeo Max-Q comparison, not matched A/B.
+Each concurrency had an untimed warm batch. Coordinator windows report no
+thermal slowdown, base 2 s of power cap and Keys 0 s, maximum 75/74 C,
+and a 300 W cap. The prefill observations used 7953 uncached prompt tokens.
+Report this limitation with the decode result; do not claim a prefill win.
+
+The remaining absent-layer six-Spark run is correctness only: the existing
+`spec_lossless_set` compares ten cold cases and 1270 full-vocabulary row
+hashes with the configured base run, with pool 1227968 and otherwise matching
+resolved geometry and rank order. No baseline or performance sweep is added.
+The required full slow CPU gate ran at `e87441c29`: all three explicit slow
+checks passed; the full suites remain red and additional environment and
+fixture failures are being classified. No green full-gate claim is made.
+Final private release image assembly and canonical package smoke remain.
+
+The qualified original Keys source now has enabled persistent source/view
+units, no expiry, bounded failure restarts and the same source pin, offsets
+and private block store. Its existing Python/FUSE runtime is sealed outside
+build scratch (archive SHA256
+`00d87d11019dbcae4b77b35bfbef79dc3971b694af2bec9f8e2347526b98df4c`).
+No packages, credentials or checkpoint payloads were copied by this change;
+the dependency archive is recovery material, not another weight copy.
+
 ## Backlog (lowest priority: only when nothing planned is left)
 
 - Qwen 3.8 Flash Next NVFP4 without Sparks, competitive with vLLM on one
