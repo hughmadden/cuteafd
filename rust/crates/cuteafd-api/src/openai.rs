@@ -888,7 +888,10 @@ pub(crate) fn build(profile: &ModelProfile, limits: NativeLimits, headers: &axum
                 Some(variant) => (requested, variant),
                 None => return Err(Rejection::bad(format!("model must be {}", profile.id))),
             }},
-            Some(Err(error)) => return Err(Rejection::model_error(error)),
+            // Reserved unavailable ids keep their typed error; ordinary map
+            // rejections retain native Chat's existing bad-request contract.
+            Some(Err(error)) if error.kind == crate::gateway::error::ErrorKind::ModelUnavailable =>
+                return Err(Rejection::model_error(error)),
             _ => return Err(Rejection::bad(format!("model must be {}", profile.id))),
         }
     };

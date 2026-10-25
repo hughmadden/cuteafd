@@ -770,6 +770,16 @@ async fn chat_accepts_listed_aliases_only_with_the_gateway_mounted() {
         std::time::Duration::from_secs(1), ConsoleHub::disabled(), strict);
     let (status, text) = post(&strict, "/v1/chat/completions", body("claude-sonnet-5")).await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "official names off: {text}");
+    assert_eq!(serde_json::from_str::<Value>(&text).unwrap()["error"]["message"], "model must be test-qwen");
+    // The gateway protocols retain their own unknown-model contract.
+    for (path, body) in [
+        ("/v1/messages", json!({"model":"claude-sonnet-5","max_tokens":8,"messages":[{"role":"user","content":"hi"}]})),
+        ("/v1/responses", json!({"model":"claude-sonnet-5","input":"hi"})),
+    ] {
+        let (status, text) = post(&strict, path, body).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{path}: {text}");
+        assert_eq!(serde_json::from_str::<Value>(&text).unwrap()["error"]["type"], "not_found_error", "{path}: {text}");
+    }
     let (status, _) = post(&strict, "/v1/chat/completions", body("")).await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "an empty model id stays refused");
 }
