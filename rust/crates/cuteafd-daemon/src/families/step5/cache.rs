@@ -114,6 +114,12 @@ impl<'a> CacheRank<'a> {
         result
     }
 
+    /// Order subsequent lane work after all current cache producers without
+    /// waiting on the host. Call once before a retained predictor chain.
+    pub(super) fn fence(&self) -> Result<()> {
+        self.ordered(|| Ok(()))
+    }
+
     /// Every lane's and the maintenance stream's queued work has completed
     /// when this returns: a device fence, then a host wait on the maintenance
     /// stream only.
