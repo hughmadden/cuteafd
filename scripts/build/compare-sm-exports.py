@@ -146,7 +146,8 @@ def jobs(scope):
                    ["--geometry", "mimop", "--capacities", CAPACITIES,
                     "--layouts", "tp6", "--exact-slices"]))
     for geometry, bits in (("qwen4", "4,5"), ("glm", "4,5"), ("glmf", "3,4"),
-                           ("dsv4f", "2,3"), ("v41", "2,3"), ("v41", "3,4"), ("v41", "4,5")):
+                           ("dsv4f", "2,3"), ("dsv4f", "4,5"), ("v41", "2,3"),
+                           ("v41", "3,4"), ("v41", "4,5")):
         result.append((f"exl3-compact-{geometry}-k{bits.replace(',', '')}", "package_exl3_aot.py",
                        ["--geometry", geometry, "--capacities", CAPACITIES, "--bits", bits,
                         "--compact-companions"]))
@@ -275,6 +276,15 @@ def cpu_trellis_luts(modules, cpu_device):
             module._trellis256_execution_lut = original
 
 
+def _policy_role_args(policy, role):
+    """Role argument for a loaded package's policy function.
+
+    Every package that accepts a role is called with it explicitly; a baseline
+    from before the role split takes two arguments and is called without one.
+    """
+    return (role,) if getattr(getattr(policy, "__code__", None), "co_argcount", 0) >= 3 else ()
+
+
 def export_exl3(extra, output):
     """Follow production coordinator profiles and tuning, but allocate no CUDA buffers."""
     import torch
@@ -312,7 +322,7 @@ def _export_exl3(extra, output):
                 options["hidden"] = package.GEOMETRIES[geometry][0]
             if package.activation(geometry) != "silu":
                 options["activation"] = package.activation(geometry)
-            block = package.route_block(geometry, rows)
+            block = package.route_block(geometry, rows, *_policy_role_args(package.route_block, role))
             # A baseline package that predates the measured-tier gate only has
             # the width/capacity predicate; keep its exports loadable.
             compact_ws = compact and len(bits) == 2 and (
@@ -346,7 +356,8 @@ def _export_exl3(extra, output):
                     options["tile"] = policy_tile
             elif len(bits) == 2 and tile is None and package.fused_input_rotation(geometry, role, width, rows):
                 options["fused_input_rotation"] = True
-            elif len(bits) == 2 and package.token_major_rotation(geometry, rows):
+            elif len(bits) == 2 and package.token_major_rotation(
+                    geometry, rows, *_policy_role_args(package.token_major_rotation, role)):
                 options["token_major_rotation"] = True
             if block != 8:
                 options["route_block"] = block
@@ -369,7 +380,8 @@ def export_exl3_routes(extra, output):
         blocks = sorted({(package.ws_route_block(geometry, "coordinator", width, rows)
                           if hasattr(package, "ws_route_block") else 64)
                          if package.warp_specialized(geometry, "coordinator", width, rows)
-                         else package.route_block(geometry, rows)
+                         else package.route_block(
+                             geometry, rows, *_policy_role_args(package.route_block, "coordinator"))
                          for _, width, *_ in profiles})
         for block in blocks:
             stem = f"m{rows}" if len(blocks) == 1 else f"m{rows}-b{block}"
