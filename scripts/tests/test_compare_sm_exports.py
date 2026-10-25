@@ -162,7 +162,7 @@ def test_compact_gate_matches_packager_spark_companions(tmp_path, monkeypatch, g
             else (64, 128, 64, 128))
         assert options.get("route_block", 8) == (
             package.compact_ws_route_block(geometry, "spark", width, rows) if ws
-            else package.route_block(geometry, rows))
+            else package.route_block(geometry, rows, 'coordinator'))
         assert options.get("swiglu_limit", 10.0) == package.swiglu_limit(geometry)
     widths = {profile[1] for profile in profiles}
     assert widths == ({256, 384} if geometry == "qwen4" else
@@ -495,6 +495,8 @@ def test_exl3_routes_gate_covers_all_coordinator_route_blocks(tmp_path, monkeypa
         ("glm", [("m80", 80, 256, 8, 8), ("m256", 256, 256, 8, 64), ("m1024", 1024, 256, 8, 64)]),
         ("glmf", [("m80", 80, 288, 8, 8), ("m256-b8", 256, 288, 8, 8),
                   ("m256-b64", 256, 288, 8, 64), ("m1024", 1024, 288, 8, 64)]),
+        ("dsv4p", [("m80", 80, 384, 6, 8), ("m256", 256, 384, 6, 8), ("m1024", 1024, 384, 6, 64)]),
+        ("kimik3", [("m80", 80, 896, 16, 8), ("m256", 256, 896, 16, 8), ("m1024", 1024, 896, 16, 64)]),
     ):
         recorded = []
         monkeypatch.setitem(sys.modules, "export_b12x_exl3_routes_aot", SimpleNamespace(

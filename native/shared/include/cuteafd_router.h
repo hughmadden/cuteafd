@@ -7,7 +7,8 @@ extern "C" {
 // FP32 biases [experts]; optional byte image mask [rows] selects bias_vl.
 // FP32 scores workspace [rows,experts], u32 IDs and FP32 weights [rows,topk].
 // experts=128/topk=3 or experts=384/topk=6; outputs disjoint from all inputs.
-// Initialize AOT modules outside graph capture on the serving device first.
+// hidden, weight and scores must be 16-byte aligned. Initialize AOT modules
+// outside graph capture on the serving device first; no native GEMV fallback.
 int32_t cuteafd_v41_router_initialize();
 int32_t cuteafd_v41_router(const uint16_t* hidden,const uint16_t* weight,
     const float* bias,const float* bias_vl,const uint8_t* image_mask,float* scores,

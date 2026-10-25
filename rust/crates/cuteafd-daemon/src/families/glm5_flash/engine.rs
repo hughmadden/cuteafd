@@ -5407,7 +5407,10 @@ mod prefill_lane_tests {
             // are unchanged.
             // Fork #151 splits only `COMPENSATED_TILES_BY_ROWS[(6144, 4096)]`'s 16-row band at
             // 8 rows (bitwise-equal retiling; no GLM program reads the compensated table).
-            ("gemm/bf16_gemv/_skinny.py", 0x9952_d5a8_6510_7b35),
+            // The V4.1-only activation subclass leaves the default epilogue as identity;
+            // glmf/glmf2 SM188/170 exports remain byte-identical (88/88 objects and SASS).
+            // Router-only row tiles do not change RoutedBf16Projection or its default kernels.
+            ("gemm/bf16_gemv/_skinny.py", 0xbf9e_4b35_5893_9fad),
         ] {
             let bytes = std::fs::read(root.join(path)).unwrap();
             let hash = bytes.iter().fold(0xcbf2_9ce4_8422_2325_u64,
