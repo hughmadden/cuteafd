@@ -844,8 +844,8 @@ impl<'a> GlmEngine<'a> {
             // waves in flight (PLAN "Prefill contract"); each unit's pages start where
             // the previous unit's end.
             ensure!(start + t <= self.max_context, "prefill of {t} rows at {start} exceeds the context");
-            let cuts = crate::shared::prefill_pipeline::prefill_units(t, self.prefill_rows, self.prefill_lanes,
-                MIN_LANE_ROWS)?;
+            let cuts = crate::shared::prefill_pipeline::retained_logits_units(t, self.prefill_rows, self.prefill_lanes,
+                MIN_LANE_ROWS, logit_rows, if self.full_prefill_logits { self.prefill_rows } else { DECODE_ROWS })?;
             let (mut lanes, mut chunks) = (Vec::new(), Vec::new());
             for rows in cuts {
                 lanes.push(self.prefill_tables(placement, start + rows.start, rows.len())?);

@@ -222,6 +222,22 @@ pub(crate) fn prefill_units(span: usize, unit_rows: usize, waves: usize, min_row
     Ok((0..span).step_by(width).map(|first| first..span.min(first + width)).collect())
 }
 
+/// Plan a call whose output survives only in the final unit's workspace.
+/// Scoring callers submit at most one unit; keep it whole even when the normal
+/// serving planner would split it across waves. Last-row serving is unchanged.
+pub(crate) fn retained_logits_units(span: usize, unit_rows: usize, waves: usize, min_rows: usize,
+    logit_rows: usize, logit_capacity: usize) -> anyhow::Result<Vec<std::ops::Range<usize>>> {
+    let units = prefill_units(span, unit_rows, waves, min_rows)?;
+    anyhow::ensure!(logit_rows <= span && logit_rows <= logit_capacity,
+        "prefill requests {logit_rows} logits rows with span {span} and logits capacity {logit_capacity}");
+    if logit_rows > units.last().map_or(0, |unit| unit.len()) {
+        anyhow::ensure!(span <= unit_rows,
+            "prefill logits must lie in the last retained unit; score in calls of at most {unit_rows} rows");
+        return Ok(vec![0..span]);
+    }
+    Ok(units)
+}
+
 /// Units for one sequence's span starting at row 0, slots assigned round-robin.
 pub(crate) fn sequence_units(span: usize, unit_rows: usize, waves: usize, layers: usize)
     -> anyhow::Result<Vec<Unit>> {
@@ -479,6 +495,33 @@ mod tests {
             expected.push(Step::Commit { unit });
         }
         assert_eq!(steps, expected);
+        Ok(())
+    }
+
+    #[test]
+    fn retained_full_logits_reject_cross_unit_requests_but_keep_serving_waves() -> anyhow::Result<()> {
+        // #749: two 256-row waves cannot retain a 512-row scoring result.
+        assert!(retained_logits_units(512, 256, 2, 256, 512, 512).is_err());
+        assert!(retained_logits_units(1024, 256, 2, 256, 1024, 1024).is_err());
+        assert!(retained_logits_units(256, 256, 2, 256, 256, 64).is_err());
+        assert!(retained_logits_units(0, 256, 2, 256, 0, 256).is_err());
+        for waves in 1..=4 {
+            for rows in [256, 2048, 4096] {
+                // All-row scoring is serial even when a wide unit normally splits.
+                assert_eq!(retained_logits_units(rows, rows, waves, 256, rows, rows)?, [0..rows]);
+                for span in [rows, rows * 2, rows * 4 + 1] {
+                    assert_eq!(retained_logits_units(span, rows, waves, 256, 1, 64)?,
+                        prefill_units(span, rows, waves, 256)?);
+                }
+            }
+            let mut scored = 0;
+            for tokens in (0..1024).collect::<Vec<_>>().chunks(256) {
+                let units = retained_logits_units(tokens.len(), 256, waves, 256, tokens.len(), 256)?;
+                assert_eq!(units, [0..256]);
+                scored += tokens.len();
+            }
+            assert_eq!(scored, 1024);
+        }
         Ok(())
     }
 
