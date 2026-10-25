@@ -96,7 +96,7 @@ def test_exlr8_onboarding_reaches_shared_admission_without_zero_override(tmp_pat
             assert "--rtx-expert-layers" not in argv
         else:
             assert argv[argv.index("--rtx-expert-layers") + 1] == onboard
-        assert "--pool-tokens" not in argv
+        assert argv[argv.index("--pool-tokens") + 1] == "0"
 
 
 @pytest.mark.parametrize("keys,diagnostic", [
