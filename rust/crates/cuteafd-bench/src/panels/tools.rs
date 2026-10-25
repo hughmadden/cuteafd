@@ -34,6 +34,20 @@ pub fn points(result: &Value) -> Option<(u64, u64, u64, u64)> {
     Some((s, sm, h, hm))
 }
 
+/// The benchmark command. The bench token goes in the environment
+/// (`TOOL_EVAL_API_KEY`, which the CLI reads when `--api-key` is absent), not
+/// argv, so it never shows in a process listing.
+fn command(base: &str, model: &str, token: Option<&str>, parallel: usize, timeout: u64,
+    dir: &std::path::Path, out: &std::path::Path) -> std::process::Command {
+    let mut command = std::process::Command::new(PROGRAM);
+    command.args(["--base-url", &format!("{base}/v1"), "--model", model, "--temperature", "0", "--hardmode",
+            "--parallel", &parallel.to_string(), "--timeout", &timeout.to_string(), "--max-turns", "12",
+            "--reference-date", "2026-01-15", "--no-live", "--no-probe-engine", "--no-warmup",
+            "--output-dir", &dir.join("runs").display().to_string(), "--json-file", &out.display().to_string()])
+        .env("TOOL_EVAL_API_KEY", token.unwrap_or("local"));
+    command
+}
+
 impl Panel for ToolEval {
     fn id(&self) -> &'static str { "tool_eval" }
     fn title(&self) -> &'static str { "Tool eval" }
@@ -56,12 +70,7 @@ impl Panel for ToolEval {
         let dir = std::env::temp_dir().join(format!("cuteafd-tool-eval-{}", uuid::Uuid::new_v4().simple()));
         std::fs::create_dir_all(&dir)?;
         let out = dir.join("result.json");
-        let mut child = std::process::Command::new(PROGRAM)
-            .args(["--base-url", &format!("{}/v1", ctx.client.base), "--model", &ctx.client.model,
-                "--api-key", ctx.client.token().unwrap_or("local"), "--temperature", "0", "--hardmode",
-                "--parallel", &parallel.to_string(), "--timeout", &timeout.to_string(), "--max-turns", "12",
-                "--reference-date", "2026-01-15", "--no-live", "--no-probe-engine", "--no-warmup",
-                "--output-dir", &dir.join("runs").display().to_string(), "--json-file", &out.display().to_string()])
+        let mut child = command(&ctx.client.base, &ctx.client.model, ctx.client.token(), parallel, timeout, &dir, &out)
             .current_dir(&dir).stdout(std::fs::File::create(dir.join("stdout.log"))?)
             .stderr(std::fs::File::create(dir.join("stderr.log"))?).spawn().context("starting tool-eval-bench")?;
         let started = Instant::now();
@@ -107,5 +116,20 @@ mod tests {
             {"scenario_id": "TC-01", "points": 2}, {"scenario_id": "TC-69", "points": 1},
             {"scenario_id": "TC-70", "points": 2}, {"scenario_id": "TC-84", "points": 0}]}});
         assert_eq!(super::points(&result), Some((3, 4, 2, 4)));
+    }
+
+    #[test]
+    fn token_goes_in_the_environment_not_argv() {
+        let dir = std::path::Path::new("/tmp/run");
+        let command = super::command("http://h:1", "m", Some("secret-token"), 8, 60, dir, &dir.join("result.json"));
+        let args: Vec<_> = command.get_args().map(|a| a.to_str().unwrap().to_string()).collect();
+        assert_eq!(args, ["--base-url", "http://h:1/v1", "--model", "m", "--temperature", "0", "--hardmode",
+            "--parallel", "8", "--timeout", "60", "--max-turns", "12", "--reference-date", "2026-01-15", "--no-live",
+            "--no-probe-engine", "--no-warmup", "--output-dir", "/tmp/run/runs", "--json-file", "/tmp/run/result.json"]);
+        assert!(!args.iter().any(|a| a.contains("secret-token")));
+        let env: Vec<_> = command.get_envs().collect();
+        assert_eq!(env, [(std::ffi::OsStr::new("TOOL_EVAL_API_KEY"), Some(std::ffi::OsStr::new("secret-token")))]);
+        let local = super::command("http://h:1", "m", None, 1, 60, dir, &dir.join("r.json"));
+        assert_eq!(local.get_envs().next().unwrap().1, Some(std::ffi::OsStr::new("local")));
     }
 }
