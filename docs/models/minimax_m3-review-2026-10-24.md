@@ -373,8 +373,8 @@ document (added after the core review).
 ## Recommended order of work
 
 Each step has a stop bar so hardware time is spent only where a decision needs it
-(AGENTS.md, measure-first). Juliette and Sparks 7–10 are the dev cell and can be stopped
-and restarted freely.
+(AGENTS.md, measure-first). The dev cell (one RTX 5090 coordinator and four Sparks) can be
+stopped and restarted freely.
 
 | # | Work | Expected | Stop bar / gate |
 | --- | --- | --- | --- |
