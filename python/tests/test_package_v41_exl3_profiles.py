@@ -275,7 +275,7 @@ class PackageProfileTests(unittest.TestCase):
                           for c in capacities], [False] * 3 + [True] * 4)
         self.assertEqual([package.compact_ws_route_block('glm', 'spark', 768, c)
                           for c in capacities], [None] * 3 + [64] * 4)
-        for geometry in ('dsv4p', 'kimik3', 'dsv4f', 'glmf'):
+        for geometry in ('dsv4p', 'kimik3', 'glmf'):
             for width in (384, 768):
                 if geometry == 'glmf' and width in (384, 768):
                     continue  # measured by test_compact_ws_qualifies_v41_and_qwen_cells
@@ -327,6 +327,27 @@ class PackageProfileTests(unittest.TestCase):
         self.assertFalse(package.compact_ws_export('glm', 'spark', 384, 80, (4, 5)))
         self.assertFalse(package.compact_ws_export('glm', 'spark', 768, 80, (4, 5)))
 
+    def test_compact_ws_qualifies_dsv4f_cells(self):
+        capacities = (1, 16, 80, 256, 1024, 2752, 4096)
+        # V4 Flash K4/K5, synthetic weights on uniform top-6 routes: both
+        # compact worlds take 32-row N128 blocks at m256 and 64-row N192
+        # blocks from m1024 up.
+        for width in (384, 768):
+            self.assertEqual([package.compact_warp_specialized('dsv4f', 'spark', width, c)
+                              for c in capacities], [False] * 3 + [True] * 4)
+            self.assertEqual([package.compact_ws_route_block('dsv4f', 'spark', width, c)
+                              for c in capacities], [None] * 3 + [32, 64, 64, 64])
+            self.assertEqual([package.ws_tile('dsv4f', 'spark', width, c, compact=True)
+                              for c in capacities],
+                             [None] * 3 + [package.TILE_384_COMPACT]
+                             + [package.TILE_384_COMPACT_N192] * 3)
+            self.assertTrue(package.compact_ws_export('dsv4f', 'spark', width, 4096, (4, 5)))
+            self.assertFalse(package.compact_ws_export('dsv4f', 'spark', width, 4096, (3, 4)))
+            self.assertFalse(package.compact_warp_specialized('dsv4f', 'coordinator', width, 4096))
+        # TP5 compact width 512 was never measured.
+        self.assertFalse(any(package.compact_warp_specialized('dsv4f', 'spark', 512, c)
+                             for c in capacities))
+
     def test_compact_ws_qualifies_v41_and_qwen_cells(self):
         capacities = (1, 16, 80, 256, 1024, 2752, 4096)
         # V4.1 K3/K4 TP4 compact width 640 (the only uneven V4.1 world): the
@@ -358,13 +379,21 @@ class PackageProfileTests(unittest.TestCase):
                              for c in (512, 2048, 8192)))
         self.assertFalse(package.compact_warp_specialized('v41', 'coordinator', 640, 4096))
         self.assertFalse(package.compact_warp_specialized('qwen4', 'coordinator', 384, 4096))
-        # Width 640 and 256 cannot take a 192-wide FC1 tile at all.
-        for geometry, width in (('v41', 640), ('qwen4', 256)):
-            for capacity in (256, 1024, 2752, 4096):
-                self.assertEqual(package.ws_tile(geometry, 'spark', width, capacity,
-                                                 compact=True),
-                                 package.TILE_384_COMPACT)
-            self.assertIsNone(package.ws_tile(geometry, 'spark', width, 80, compact=True))
+        # V4.1 width 640 is not divisible by 192, but the 192-wide FC1 tile
+        # still wins at m256..m2752; m4096 keeps N128.
+        self.assertEqual([package.ws_tile('v41', 'spark', 640, c, compact=True)
+                          for c in capacities],
+                         [None] * 3 + [package.TILE_384_COMPACT_N192] * 3
+                         + [package.TILE_384_COMPACT])
+        self.assertEqual(package.compact_ws_tile('v41', 'spark', 640, 2752),
+                         package.TILE_384_COMPACT_N192)
+        self.assertIsNone(package.compact_ws_tile('v41', 'spark', 640, 80))
+        # Qwen4 width 256 cannot take a 192-wide FC1 tile at all.
+        for capacity in (256, 1024, 2752, 4096):
+            self.assertEqual(package.ws_tile('qwen4', 'spark', 256, capacity,
+                                             compact=True),
+                             package.TILE_384_COMPACT)
+        self.assertIsNone(package.ws_tile('qwen4', 'spark', 256, 80, compact=True))
         # Qwen4 width 384 divides 192: the large capacities consolidate onto
         # the N192 arm and m256 keeps N128 behind the 32-row block.
         self.assertEqual([package.ws_tile('qwen4', 'spark', 384, c, compact=True)
@@ -493,10 +522,13 @@ class PackageProfileTests(unittest.TestCase):
             # 64 rows at m256, V4.1 width 640 takes 32.
             ('qwen4', 256, 256, (4, 5), {'route_block': 32}),
             ('v41', 640, 256, (3, 4), {'route_block': 64}),
+            ('v41', 640, 2752, (3, 4), {'tile': [64, 128, 64, 256]}),
+            ('v41', 640, 4096, (3, 4), {'tile': [64, 192, 64, 256]}),
             # A measured width of another tier pair, and compact cells that
             # were never measured, may not claim the warp-specialized contract.
             ('v41', 640, 4096, (4, 5), {}),
             ('dsv4f', 768, 4096, (3, 4), {}),
+            ('dsv4f', 768, 256, (4, 5), {'tile': [64, 192, 64, 256]}),
         ]
         for geometry, width, capacity, bits, overrides in cases:
             with self.subTest(geometry=geometry, width=width, capacity=capacity,
@@ -947,6 +979,37 @@ class PackageProfileTests(unittest.TestCase):
                     self.assertNotIn('warp_specialized', call.kwargs)
                     self.assertNotIn('+ws-', str(call.args[0]))
 
+    def test_kimi_coordinator_prefill_policy(self):
+        for width in (1536, 3072):
+            self.assertEqual([package.warp_specialized('kimik3', 'coordinator', width, c)
+                              for c in (1, 80, 256, 1024, 4096)],
+                             [False, False, False, False, True])
+        self.assertEqual([package.route_block('kimik3', c, 'coordinator') for c in (1, 80, 256, 1024, 4096)],
+                         [8, 8, 8, 64, 8])
+        self.assertEqual([package.route_block('kimik3', c, 'spark') for c in (1, 80, 256, 1024, 4096)],
+                         [8, 8, 8, 8, 8])
+        self.assertEqual([package.token_major_rotation('kimik3', c, 'coordinator') for c in (1, 80, 256, 1024, 4096)],
+                         [False, False, False, True, False])
+        self.assertEqual([package.token_major_rotation('kimik3', c, 'spark') for c in (1, 80, 256, 1024, 4096)],
+                         [False, False, False, False, False])
+        for bits in ((2, 3), (3, 4)):
+            with self.subTest(bits=bits), tempfile.TemporaryDirectory() as temporary:
+                _, _, calls, _ = self.build_fixture(
+                    Path(temporary), 'coordinator', bits, geometry='kimik3',
+                    capacities=(80, 256, 1024, 4096))
+                for call in calls:
+                    capacity = call.args[3]
+                    ws = bits == (2, 3) and capacity == 4096
+                    self.assertEqual(call.kwargs.get('warp_specialized', False), ws)
+                    self.assertEqual('+ws-m64-bf16-dynamic/' in str(call.args[0]), ws)
+                    self.assertEqual(call.kwargs.get('route_block', 8),
+                                     64 if capacity == 1024 or ws else 8)
+                    self.assertEqual(call.kwargs.get('token_major_rotation', False),
+                                     capacity == 1024)
+                    self.assertEqual(call.kwargs.get('ws_dynamic_tiles', False), ws)
+                    if ws:
+                        self.assertEqual(call.kwargs['tile'], package.TILE_RTX_MIXED)
+
     def test_decode_capacities_ship_the_canonical_tile(self):
         """A decode capacity the B12x planner widens is pinned to m1's tile (#309).
 
@@ -990,14 +1053,40 @@ class PackageProfileTests(unittest.TestCase):
             self.assertEqual(package.verify(output, 'fixture-revision'), manifest)
 
     def test_route_blocks_widen_only_for_dsv4p_prefill(self):
-        """V4.1 and V4 Flash keep 8-row blocks; V4 Pro prefill widens (Spark and RTX)."""
+        """V4.1 and V4 Flash keep 8-row blocks; V4 Pro and Kimi K3 coordinator prefill widen."""
         for capacity in (1, 16, 80, 256, 1024, 4096):
-            self.assertEqual(package.route_block('v41', capacity), 8)
-            self.assertEqual(package.route_block('dsv4f', capacity), 8)
-        self.assertEqual([package.route_block('dsv4p', c) for c in (1, 16, 80, 256, 1024, 4096)],
+            self.assertEqual(package.route_block('v41', capacity, 'coordinator'), 8)
+            self.assertEqual(package.route_block('dsv4f', capacity, 'coordinator'), 8)
+        self.assertEqual([package.route_block('dsv4p', c, 'coordinator') for c in (1, 16, 80, 256, 1024, 4096)],
+                         [8, 8, 8, 8, 64, 64])
+        self.assertEqual([package.route_block('dsv4p', c, 'spark') for c in (1, 16, 80, 256, 1024, 4096)],
                          [8, 8, 8, 8, 16, 64])
-        self.assertEqual([package.token_major_rotation(g, c) for g in ('v41', 'dsv4f', 'dsv4p')
-                          for c in (1024, 4096)], [False, False, False, False, False, True])
+        self.assertEqual([package.token_major_rotation(g, c, 'coordinator') for g in ('v41', 'dsv4f', 'dsv4p')
+                          for c in (1024, 4096)], [False, False, False, False, True, True])
+        self.assertEqual([package.token_major_rotation('dsv4p', c, 'spark') for c in (1024, 4096)],
+                         [False, True])
+
+    def test_dsv4p_coordinator_m1024_uses_64_row_token_major_rotation(self):
+        for bits in ((2, 3), (3, 4), (2, 3, 4)):
+            with self.subTest(bits=bits), tempfile.TemporaryDirectory() as temporary:
+                _, _, calls, _ = self.build_fixture(
+                    Path(temporary), 'coordinator', bits, geometry='dsv4p',
+                    capacities=(80, 256, 1024, 2752, 4096))
+                for call in calls:
+                    capacity = call.args[3]
+                    self.assertNotIn('warp_specialized', call.kwargs)
+                    self.assertEqual(call.kwargs.get('route_block', 8), 8 if capacity <= 256 else 64)
+                    self.assertEqual(call.kwargs.get('token_major_rotation', False),
+                                     len(bits) == 2 and capacity > 256)
+        with tempfile.TemporaryDirectory() as temporary:
+            _, _, calls, _ = self.build_fixture(
+                Path(temporary), 'spark', (2, 3, 4), geometry='dsv4p',
+                capacities=(256, 1024, 4096), profiles=('tp4-width768',))
+            by_cap = {call.args[3]: call.kwargs for call in calls}
+            self.assertNotIn('route_block', by_cap[256])
+            self.assertEqual(by_cap[1024]['route_block'], 16)
+            self.assertEqual(by_cap[4096]['route_block'], 64)
+            self.assertTrue(all('token_major_rotation' not in kw for kw in by_cap.values()))
 
     def test_qwen4_uneven_blocks_and_route_policy(self):
         """Qwen's five H128 blocks use native unequal TP2 and Spark shards."""
@@ -1020,7 +1109,7 @@ class PackageProfileTests(unittest.TestCase):
         self.assertEqual(spark['tp2-width384'], (384, ['tp2-rank0']))
         self.assertTrue(all(topk == 10 and experts == 512
                             for _, _, experts, topk, _, _ in package.shard_profiles('qwen4', 'spark')))
-        self.assertEqual([package.route_block('qwen4', c) for c in (1, 16, 80, 256, 1024, 4096)],
+        self.assertEqual([package.route_block('qwen4', c, 'coordinator') for c in (1, 16, 80, 256, 1024, 4096)],
                          [8, 8, 8, 32, 32, 32])
         self.assertIsNone(package.swiglu_limit('qwen4'))
 

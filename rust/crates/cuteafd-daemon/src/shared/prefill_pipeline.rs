@@ -199,19 +199,43 @@ pub(crate) enum Step {
     Commit { unit: usize },
 }
 
+/// Fewest rows per wave worth splitting a prompt that fits one unit (TJ,
+/// 2026-10-25: splitting very short prompts buys nothing). Below `2 *` this a
+/// prompt runs as one unit, so its expert and projection kernels see the
+/// whole prompt's rows rather than switching route on a half.
+pub(crate) const MIN_SPLIT_ROWS: usize = 1024;
+
 /// Cut `span` rows into equal 64-row-aligned units of at most `unit_rows`,
 /// a multiple of `waves` of them while each keeps at least `min_rows`, so the
-/// in-flight units finish together and no unit runs a short tail alone.
+/// in-flight units finish together and no unit runs a short tail alone. A span
+/// that fits one unit splits only when each wave keeps [`MIN_SPLIT_ROWS`].
 pub(crate) fn prefill_units(span: usize, unit_rows: usize, waves: usize, min_rows: usize)
     -> anyhow::Result<Vec<std::ops::Range<usize>>> {
     anyhow::ensure!(span > 0 && unit_rows > 0 && unit_rows % 64 == 0 && waves > 0 && min_rows > 0,
         "prefill unit geometry must be positive and page aligned");
     let mut count = span.div_ceil(unit_rows);
     let rounded = count.next_multiple_of(waves);
-    if span / rounded >= min_rows { count = rounded; }
+    let floor = if count == 1 { min_rows.max(MIN_SPLIT_ROWS) } else { min_rows };
+    if span / rounded >= floor { count = rounded; }
     // ceil(span / count) <= unit_rows, and unit_rows is page aligned.
     let width = span.div_ceil(count).next_multiple_of(64);
     Ok((0..span).step_by(width).map(|first| first..span.min(first + width)).collect())
+}
+
+/// Plan a call whose output survives only in the final unit's workspace.
+/// Scoring callers submit at most one unit; keep it whole even when the normal
+/// serving planner would split it across waves. Last-row serving is unchanged.
+pub(crate) fn retained_logits_units(span: usize, unit_rows: usize, waves: usize, min_rows: usize,
+    logit_rows: usize, logit_capacity: usize) -> anyhow::Result<Vec<std::ops::Range<usize>>> {
+    let units = prefill_units(span, unit_rows, waves, min_rows)?;
+    anyhow::ensure!(logit_rows <= span && logit_rows <= logit_capacity,
+        "prefill requests {logit_rows} logits rows with span {span} and logits capacity {logit_capacity}");
+    if logit_rows > units.last().map_or(0, |unit| unit.len()) {
+        anyhow::ensure!(span <= unit_rows,
+            "prefill logits must lie in the last retained unit; score in calls of at most {unit_rows} rows");
+        return Ok(vec![0..span]);
+    }
+    Ok(units)
 }
 
 /// Units for one sequence's span starting at row 0, slots assigned round-robin.
@@ -475,12 +499,48 @@ mod tests {
     }
 
     #[test]
+    fn retained_full_logits_reject_cross_unit_requests_but_keep_serving_waves() -> anyhow::Result<()> {
+        // #749: two 256-row waves cannot retain a 512-row scoring result.
+        assert!(retained_logits_units(512, 256, 2, 256, 512, 512).is_err());
+        assert!(retained_logits_units(1024, 256, 2, 256, 1024, 1024).is_err());
+        assert!(retained_logits_units(256, 256, 2, 256, 256, 64).is_err());
+        assert!(retained_logits_units(0, 256, 2, 256, 0, 256).is_err());
+        for waves in 1..=4 {
+            for rows in [256, 2048, 4096] {
+                // All-row scoring is serial even when a wide unit normally splits.
+                assert_eq!(retained_logits_units(rows, rows, waves, 256, rows, rows)?, [0..rows]);
+                for span in [rows, rows * 2, rows * 4 + 1] {
+                    assert_eq!(retained_logits_units(span, rows, waves, 256, 1, 64)?,
+                        prefill_units(span, rows, waves, 256)?);
+                }
+            }
+            let mut scored = 0;
+            for tokens in (0..1024).collect::<Vec<_>>().chunks(256) {
+                let units = retained_logits_units(tokens.len(), 256, waves, 256, tokens.len(), 256)?;
+                assert_eq!(units, [0..256]);
+                scored += tokens.len();
+            }
+            assert_eq!(scored, 1024);
+        }
+        Ok(())
+    }
+
+    #[test]
     fn units_cut_equal_page_aligned_and_in_multiples_of_waves() -> anyhow::Result<()> {
         assert_eq!(prefill_units(4096, 2048, 2, 256)?, [0..2048, 2048..4096]);
         assert_eq!(prefill_units(5000, 2048, 2, 256)?, [0..1280, 1280..2560, 2560..3840, 3840..5000]);
         assert_eq!(prefill_units(300, 2048, 2, 256)?, [0..300]);
         assert_eq!(prefill_units(8192, 2048, 2, 256)?.len(), 4);
         assert!(prefill_units(0, 2048, 2, 256).is_err() && prefill_units(10, 100, 2, 256).is_err());
+        // Spans that fit one unit stay whole below 2 x MIN_SPLIT_ROWS, at any wave count.
+        for span in [512, 1033, 1354, 2047] {
+            for waves in 1..=4 {
+                assert_eq!(prefill_units(span, 4096, waves, 256)?, [0..span]);
+                assert_eq!(prefill_units(span, 2048, waves, 256)?, [0..span]);
+            }
+        }
+        assert_eq!(prefill_units(2048, 4096, 2, 256)?, [0..1024, 1024..2048]);
+        assert_eq!(prefill_units(2 * 2090, 4096, 2, 256)?, [0..2112, 2112..4180]);
         for span in 1..=9000 {
             for (rows, waves) in [(2048, 2), (1024, 2), (512, 1), (2048, 3)] {
                 let units = prefill_units(span, rows, waves, 256)?;
@@ -490,6 +550,26 @@ mod tests {
                 assert!(units.iter().all(|unit| unit.len() <= rows));
             }
         }
+        Ok(())
+    }
+
+    #[test]
+    fn spans_longer_than_one_unit_keep_their_wave_cuts() -> anyhow::Result<()> {
+        // The cut rule before MIN_SPLIT_ROWS, for spans that need several units.
+        let before = |span: usize, unit_rows: usize, waves: usize| {
+            let mut count = span.div_ceil(unit_rows);
+            if span / count.next_multiple_of(waves) >= 256 { count = count.next_multiple_of(waves); }
+            let width = span.div_ceil(count).next_multiple_of(64);
+            (0..span).step_by(width).map(|first| first..span.min(first + width)).collect::<Vec<_>>()
+        };
+        for (unit_rows, waves) in [(4096, 2), (2048, 2), (1024, 2), (512, 2), (4096, 3), (2048, 4)] {
+            for span in (unit_rows + 1..=70_000).step_by(7).chain([8192, 65536, 2 * 2090]) {
+                assert_eq!(prefill_units(span, unit_rows, waves, 256)?, before(span, unit_rows, waves),
+                    "{span} rows, {unit_rows} x {waves}");
+            }
+        }
+        assert_eq!(prefill_units(8192, 4096, 2, 256)?, [0..4096, 4096..8192]);
+        assert_eq!(prefill_units(65536, 4096, 2, 256)?.len(), 16);
         Ok(())
     }
 

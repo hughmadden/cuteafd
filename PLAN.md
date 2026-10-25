@@ -5665,7 +5665,7 @@ file, instead of forcing the 5090 / 1× RTX / 2× RTX columns.
 | GLM 5.3 | EXL3 K4 max (2 RTX + 6); EXLR8 (native dense) min 1 RTX + 4 at `up1` (4.0 bpw); **EXLR8 min 1 RTX + 4 at `bit325` (3.25 bpw)**; EXLR8 max 2 RTX + 6 | quants at max (K4 vs EXLR8), EXLR8 profiles at min (up1 vs bit325), hardware levels |
 | Kimi K3 (EXL3 K2 + Core-K6) | max 2 RTX + 6 Sparks | — (one card) |
 | Step-5 | NVFP4 min 1 RTX + 4 Sparks; FP8 max 2 RTX + 6 Sparks | quant × hardware level |
-| Dense Qwen 3.5 / 3.8 | 9B BF16 min 1 RTX, speculation off (`qwen35-9b-bf16-min`); 27B BF16 min 1 RTX + dSpark (`qwen38-27b-bf16-min`); 27B FP8 min 1 RTX + dSpark (`qwen38-27b-fp8-min`) | sizes and quants (all 0 Sparks, no TP2 card; no MTP comparison card) |
+| Dense Qwen 3.5 / 3.8 | 9B BF16 min 1 RTX, speculation off (`qwen35-9b-bf16-min`); 27B BF16 min 1 RTX + dSpark (`qwen38-27b-bf16-min`); 27B FP8 min 1 RTX + dSpark (`qwen38-27b-fp8-min`); 27B BF16 min 1 RTX, speculation off (`qwen38-27b-bf16-min-nospec`); 27B FP8 min 1 RTX, speculation off (`qwen38-27b-fp8-min-nospec`) | sizes, quants and dSpark vs no speculator (all 0 Sparks, no TP2 card; no MTP comparison card) |
 | Qwen 3.8 Flash Next | EXL3 min 1 RTX PRO 6000 (0 Sparks, `qwen38-exl3-min`); EXL3 5090 (1 RTX 5090 + 1 Spark) | hardware levels (both unchanged from v3) |
 
 EXLR8's `bit325` card is a smoke card for the 3.25 bpw width profile
