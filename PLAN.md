@@ -6046,6 +6046,30 @@ existing absolute-path variant mount support. Switch storage only between
 runs, validate actual plan/admission after filesystem-daemon memory costs,
 and resume the remaining qualification with the verified S3 binaries.
 
+Sparknest 0.6.5 is installed and active on Romeo and all six Sparks. Romeo
+is the sole voter/leader and sole registered holder of the pinned base and
+drafter; the six Sparks are fabric learners. Offline imports created hard
+links to the existing files with zero copied bytes and unchanged source
+inodes, sizes, timestamps and modes. All seven mounts agree on metadata,
+all 46 base shard headers and the `romeo` holder identity. One 8 MiB range
+read on each Spark matched the ordinary source bytes and accounted for
+exactly 8 MiB received on that Spark's direct Romeo RDMA link, without RPC
+payload fallback (56 MiB total including the ordinary source read).
+Daemon RSS is 5.68 GiB on Romeo and about 1.01 GiB per Spark. This is a
+filesystem correctness/installation result, not model-load or token-rate
+qualification. The six-Spark serving plan must use the post-daemon memory
+view. Existing SSHFS and Keys source mounts remain available for rollback.
+
+The standard-namespace launcher fix is integrated and deployed at
+`33473cce2`: both Spark preflight and launch receive the coordinator's
+namespace HF home, independently of the Spark host's environment. Six new
+checks pass and the focused base/candidate failure IDs are unchanged. The
+Keys source snapshot has 51 regular files and no symlinks, so its existing
+absolute-path read-only bind remains valid outside the Sparknest namespace.
+The engine-pinned push protocol and plan definitions are byte-identical to
+the installed filesystem release. The next live run uses the unchanged S3
+runtime, the new namespace and one explicitly shared API-key path.
+
 ## Backlog (lowest priority: only when nothing planned is left)
 
 - Qwen 3.8 Flash Next NVFP4 without Sparks, competitive with vLLM on one
