@@ -5403,7 +5403,8 @@ mod prefill_lane_tests {
             // 8 rows (bitwise-equal retiling; no GLM program reads the compensated table).
             // The V4.1-only activation subclass leaves the default epilogue as identity;
             // glmf/glmf2 SM188/170 exports remain byte-identical (88/88 objects and SASS).
-            ("gemm/bf16_gemv/_skinny.py", 0xf589_0271_b8a1_ee9f),
+            // Router-only row tiles do not change RoutedBf16Projection or its default kernels.
+            ("gemm/bf16_gemv/_skinny.py", 0xbf9e_4b35_5893_9fad),
         ] {
             let bytes = std::fs::read(root.join(path)).unwrap();
             let hash = bytes.iter().fold(0xcbf2_9ce4_8422_2325_u64,
