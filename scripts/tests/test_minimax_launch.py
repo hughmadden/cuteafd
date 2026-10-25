@@ -110,6 +110,53 @@ def test_minimax_polls_a_lan_bound_api_where_it_listens(tmp_path):
     assert "API ready at http://10.0.0.9:8123/v1/" in result.stdout
 
 
+def _after(result, needle):
+    """Stderr from the first line containing NEEDLE on."""
+    lines = result.stderr.splitlines()
+    return "\n".join(lines[next(index for index, line in enumerate(lines) if needle in line):])
+
+
+def test_minimax_failed_launch_removes_what_it_started(tmp_path):
+    # The coordinator never answers: the launch removes it and every worker it started.
+    result = _launch(tmp_path, extra_env={"STUB_CURL_FAIL": "1"})
+    assert result.returncode == 1 and "coordinator exited" in result.stderr
+    cleanup = _after(result, "serve-minimax --snapshot")
+    assert "docker rm -f cuteafd-coordinator " in cleanup
+    for rank in range(4):
+        assert f"docker rm -f cuteafd-spark-expert-h{rank}-19441 " in cleanup
+    assert "API ready" not in result.stdout
+
+
+def test_minimax_worker_start_failure_stops_the_launch_and_its_started_workers(tmp_path):
+    # One worker's `docker run` fails (its name is taken): the launch stops before the
+    # coordinator, removes the workers it did start and leaves the failed host's container alone.
+    result = _launch(tmp_path, extra_env={"STUB_SSH_FAIL": "docker run -d --name cuteafd-spark-expert-h2-"})
+    assert result.returncode == 1 and "h2: the expert worker did not start" in result.stderr
+    assert "serve-minimax --snapshot" not in result.stderr
+    cleanup = _after(result, "the expert worker did not start")
+    assert [rank for rank in range(4) if f"docker rm -f cuteafd-spark-expert-h{rank}-19441 " in cleanup] == [0, 1, 3]
+    assert "docker rm -f cuteafd-coordinator" not in cleanup
+
+
+@pytest.mark.parametrize("env,diagnostic", [
+    ({"STUB_SSH_FAIL": "release_wip_spark_slot_revision"}, "h0: WIP slot slot1 or the image cuteafd-spark-expert-dev"),
+    ({"STUB_SLOT_SPARKINFER_h3": "f" * 40}, f"carries SparkInfer test-pin on h2 but {'f' * 40} on h3"),
+])
+def test_minimax_wip_slot_is_checked_on_every_spark_before_restart_stops_anything(tmp_path, env, diagnostic):
+    result = _launch(tmp_path, restart=True, extra_args=("--wip", "slot1"), extra_env=env)
+    assert result.returncode == 2 and diagnostic in result.stderr, result.stderr
+    # Nothing was torn down, staged or started.
+    assert "docker rm -f" not in result.stderr and "docker run -d" not in result.stderr
+    assert "ssh h0 bash -s -- slot1" not in result.stderr
+
+
+def test_minimax_wip_slot_from_another_pin_is_a_warning(tmp_path):
+    result = _launch(tmp_path, extra_args=("--wip", "slot1"), extra_env={"STUB_SLOT_SPARKINFER": "e" * 40})
+    assert result.returncode == 0, result.stderr
+    assert f"warning: WIP slot slot1 carries SparkInfer {'e' * 40}; this checkout pins test-pin" in result.stderr
+    assert sum(f"docker run -d --name cuteafd-spark-expert-h{rank}-19441" in result.stderr for rank in range(4)) == 4
+
+
 def test_minimax_refuses_push_loading(tmp_path):
     result = _launch(tmp_path, extra_env={"CUTEAFD_PUSH_SOCKET": "enabled"})
     assert result.returncode != 0

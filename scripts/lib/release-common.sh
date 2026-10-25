@@ -2135,6 +2135,32 @@ release_wip_cp() {
   fi
 }
 
+# release_wip_spark_slot_revision SLOT IMAGE CONTAINER ROOT INSTANCE, on a Spark (shipped
+# with declare -f, with release_wip_cp): the development IMAGE is present (a missing
+# registry image is pulled) and the spark-expert slot's SparkInfer source verifies against
+# its own lock, whose revision it prints. ROOT and INSTANCE take __default__/__none__.
+# Only the check's inputs are copied, into a scratch directory it removes: nothing staged.
+release_wip_spark_slot_revision() {
+  local slot="$1" image="$2" container="$3" root="$4" instance="$5" registry scratch status=0
+  [[ "$instance" != __none__ ]] || instance=
+  [[ "$root" != __default__ ]] || root="$HOME/.cache/cuteafd/builds/wip${instance:+-$instance}"
+  if ! docker image inspect "$image" >/dev/null 2>&1; then
+    registry="${image%%/*}"
+    [[ "$image" == */* && ( "$registry" == *.* || "$registry" == *:* || "$registry" == localhost ) ]] ||
+      { echo "missing local development image $image" >&2; return 1; }
+    docker pull "$image" >&2 || return 1
+  fi
+  scratch="$(mktemp -d)" || return 1
+  local slot_source="slots/$slot/spark-expert/workspace"
+  { release_wip_cp "$container" "$root" "$slot_source/third_party/sparkinfer" "$scratch/" &&
+    release_wip_cp "$container" "$root" "$slot_source/third_party/sparkinfer.lock.json" "$scratch/" &&
+    release_wip_cp "$container" "$root" "$slot_source/scripts/build/verify-sparkinfer-source.py" "$scratch/"; } >&2 &&
+    python3 "$scratch/verify-sparkinfer-source.py" --source "$scratch/sparkinfer" \
+      --lock "$scratch/sparkinfer.lock.json" --print-revision || status=1
+  rm -rf -- "$scratch"
+  return "$status"
+}
+
 # A dry run stages into a private layout (RELEASE_PRIVATE_WIP_LAYOUT) and removes it
 # when the launcher exits: re-staging the shared one (rm, then mv) would pull files
 # from under a live server of the same slot and instance.
