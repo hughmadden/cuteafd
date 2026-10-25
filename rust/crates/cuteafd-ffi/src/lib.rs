@@ -404,7 +404,7 @@ mod allocatable_memory_tests {
 }
 
 pub use cuda_runtime::{select_copy_mechanism, CopyMechanism, CudaRuntime};
-pub use pinned::{transparent_hugepage_mode, HugePagePinning};
+pub use pinned::{transparent_hugepage_defrag, transparent_hugepage_mode, HugePagePinning, SlowHugepageFaults};
 pub mod nvml;
 #[cfg(feature = "test-support")]
 pub mod test_support;

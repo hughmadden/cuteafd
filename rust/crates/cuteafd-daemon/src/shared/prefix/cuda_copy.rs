@@ -3,7 +3,8 @@
 //! a nonblocking event probe per stream. Registered allocations route each copy
 //! to its owning GPU; the engine keeps those owners alive until its queues drain.
 use anyhow::{ensure, Context, Result};
-use cuteafd_ffi::{CopyMechanism, CudaRuntime, CuteafdDeviceBuffer, CuteafdHostBuffer, HugePagePinning, NativeLibrary};
+use cuteafd_ffi::{CopyMechanism, CudaRuntime, CuteafdDeviceBuffer, CuteafdHostBuffer, HugePagePinning, NativeLibrary,
+    SlowHugepageFaults};
 use cuteafd_hostcache::copy::{CopyEngine, DeviceRange, Event, Stream};
 use cuteafd_hostcache::pool::{HostChunk, HostRange, PinnedMemory};
 use std::collections::VecDeque;
@@ -190,6 +191,7 @@ impl<'a> CudaCopyEngine<'a> {
             runtime_version = runtime.as_ref().map(CudaRuntime::version).unwrap_or(0),
             pinning = if pinning.is_some() { "hugepage-register" } else { "cuda-host-alloc" },
             transparent_hugepages = cuteafd_ffi::transparent_hugepage_mode().as_deref().unwrap_or("unavailable"),
+            thp_defrag = cuteafd_ffi::transparent_hugepage_defrag().as_deref().unwrap_or("unavailable"),
             "host snapshot cache copy mechanism");
         Ok(Self { library, template, regions, chunks: Vec::new(), hugepages: pinning.is_some(), pinning,
             streams, next_event: 0,
@@ -307,8 +309,15 @@ impl PinnedMemory for CudaCopyEngine<'_> {
     fn allocate_chunk(&mut self, bytes: usize) -> Result<HostChunk> {
         let hugepage = match &self.pinning {
             Some(pinning) if self.hugepages => pinning.alloc(bytes).map_err(|error| {
-                tracing::warn!(target: "cuteafd::host_cache", %error,
-                    "hugepage pinning failed; host snapshot chunks fall back to cudaHostAlloc");
+                // Every earlier chunk took hugepages: the fallback below is sticky.
+                let hugepage_chunks = self.chunks.len();
+                match error.downcast_ref::<SlowHugepageFaults>() {
+                    Some(slow) => tracing::warn!(target: "cuteafd::host_cache", %slow, hugepage_chunks,
+                        thp_defrag = cuteafd_ffi::transparent_hugepage_defrag().as_deref().unwrap_or("unavailable"),
+                        "hugepage faults are compacting memory; this and later host snapshot chunks use cudaHostAlloc"),
+                    None => tracing::warn!(target: "cuteafd::host_cache", %error, hugepage_chunks,
+                        "hugepage pinning failed; host snapshot chunks fall back to cudaHostAlloc"),
+                }
             }).ok(),
             _ => None,
         };
