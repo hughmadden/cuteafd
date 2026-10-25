@@ -29,8 +29,8 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
         else { usize::try_from(opts.prefill_lanes)? };
     let sequences = if opts.concurrency == 0 { 64 } else { usize::try_from(opts.concurrency)? };
     ensure!(opts.state_slots.is_none_or(|n| n == sequences as u64), AdmissionError::Unsupported("sequence-slot mismatch"));
-    let rings = opts.draft_context_slots.map_or(Ok(crate::families::minimax_m3::dspark::default_ring_slots(sequences)),
-        usize::try_from)?;
+    let rings = opts.draft_context_slots.map_or(Ok(admission::default_draft_rings(sequences,
+        rows.min(admission::DECODE_ROWS))), usize::try_from)?;
     ensure!((1..=sequences).contains(&rings), AdmissionError::Unsupported("draft context slots outside 1..=max sequences"));
     let arch = ArchContext::coordinator(opts.rtx_bytes[0], None);
     let chunk = crate::serving_capacity::prefill_lanes::lane_capacity(lanes, rows, crate::families::minimax_m3::cache::PAGE_ROWS as usize);
@@ -48,7 +48,7 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
     }).transpose()?;
     // DFlash2 projects its drafts through its own logits; DSpark through the target's.
     let draft_rows = draft.as_ref().map_or(0, |d| d.sequences * 7);
-    let sizing = RuntimeSizing { rows, decode_rows: rows.min(64), sequences, context: if opts.context_tokens == 0 {
+    let sizing = RuntimeSizing { rows, decode_rows: rows.min(admission::DECODE_ROWS), sequences, context: if opts.context_tokens == 0 {
         cfg.max_position as u64 } else { opts.context_tokens }, spark_ranks: requested.spark_ranks(),
         logit_rows: RuntimeSizing::head_rows(chunk, opts.full_prefill_logits, draft_rows), lanes,
         host_landing: !arch.gpu_landing };
@@ -150,7 +150,12 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
             if draft.is_some() { "bundled DSpark" } else if dflash.is_some() { "DFlash2 (shared drafter)" } else { "off" }),
             "Offline CUDA/code baselines remain estimates; serving re-admits measured free memory before allocation".into(),
             format!("{onboarded} routed layers on the RTX ({:.1} GiB), {} on {} Sparks", local as f64 / GIB as f64,
-                recipe.onboarding.spark_layers.len(), sizing.spark_ranks)] };
+                recipe.onboarding.spark_layers.len(), sizing.spark_ranks)]
+            .into_iter().chain(draft.as_ref().map(|d| (d.slots, d.ring_bytes)).or(dflash.map(|d| (d.slots, d.ring_bytes)))
+                .map(|(slots, bytes)| format!("{slots} drafter context rings of {:.1} MiB each come off the pool \
+                    (default min(sequences, decode rows / 2); --draft-context-slots sets them)",
+                    bytes as f64 / slots as f64 / (1u64 << 20) as f64)))
+            .collect() };
     report.bytes_by_owner.clear();
     report.bytes_by_owner.insert("coordinator text weights".into(), weights.resident_bytes);
     if let Some(draft) = &draft { report.bytes_by_owner.insert("bundled DSpark weights".into(), draft.weights_bytes); }

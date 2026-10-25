@@ -167,9 +167,10 @@ fn native_manifest_admits_bundled_dspark_and_charges_its_full_layout() {
     let on = plan::plan(dir.path(), &options).unwrap();
     assert!(on.placement_supported && on.wip_launchable(), "{:?}", on.hints);
     let contract = DsparkContract::open(dir.path()).unwrap();
-    // Sixteen sequences share the default eight context rings; the taps hold a two-lane chunk.
-    let draft = DraftMemory::new(&contract, crate::families::minimax_m3::dspark::default_ring_slots(16), 2 * 256, 188).unwrap();
-    assert_eq!(draft.slots, 8);
+    // Sixteen sequences each hold a context ring (at most 64 decode rows / 2); the taps hold a
+    // two-lane chunk.
+    let draft = DraftMemory::new(&contract, admission::default_draft_rings(16, 64), 2 * 256, 188).unwrap();
+    assert_eq!(draft.slots, 16);
     let rtx = |report: &crate::plan::PlanReport| report.memory_layout.as_ref().unwrap().devices.iter()
         .find(|d| d.kind == DeviceKind::Rtx).unwrap().clone();
     let (off_rtx, on_rtx) = (rtx(&off), rtx(&on));
@@ -181,16 +182,29 @@ fn native_manifest_admits_bundled_dspark_and_charges_its_full_layout() {
         spark_ranks: 3, logit_rows: 64, lanes: crate::serving_capacity::prefill_lanes::DEFAULT_PREFILL_LANES, host_landing: false };
     assert_eq!(graphs(&off_rtx), admission::decode_graphs(sizing(16), 0).unwrap().inventory.bytes(0));
     assert_eq!(graphs(&on_rtx), admission::decode_graphs(sizing(16), draft.slots).unwrap().inventory.bytes(0));
-    assert_eq!(on_rtx.used_bytes() - off_rtx.used_bytes(), draft.bytes + graphs(&on_rtx) - graphs(&off_rtx));
+    // A DSpark step projects its sequences' drafts through the target head: sixteen drafting
+    // sequences take 112 head rows where the decode step takes 64.
+    let head = |device: &cuteafd_core::memory_layout::DeviceLayout| device.items.iter()
+        .filter(|i| ["MiniMax logits", "MiniMax head_input"].contains(&i.group.as_str())).map(|i| i.bytes).sum::<u64>();
+    assert!(head(&on_rtx) > head(&off_rtx));
+    assert_eq!(on_rtx.used_bytes() - off_rtx.used_bytes(),
+        draft.bytes + graphs(&on_rtx) - graphs(&off_rtx) + head(&on_rtx) - head(&off_rtx));
     assert_eq!(on_rtx.items.iter().filter(|i| i.category == Category::Drafter).map(|i| i.bytes).sum::<u64>(), draft.bytes);
     assert_eq!(on.bytes_by_owner["bundled DSpark weights"], draft.weights_bytes);
     assert_eq!(on.memory_layout.as_ref().unwrap().pool_tokens, 16384);
     assert!(on.memory_layout.as_ref().unwrap().notes.iter().any(|n| n.ends_with("speculation bundled DSpark")));
+    // The plan states the rings' share of the pool.
+    let ring_mib = draft.ring_bytes as f64 / draft.slots as f64 / (1u64 << 20) as f64;
+    assert!(on.memory_layout.as_ref().unwrap().notes.iter()
+        .any(|n| n.starts_with(&format!("16 drafter context rings of {ring_mib:.1} MiB each"))), "{:?}",
+        on.memory_layout.as_ref().unwrap().notes);
+    assert!(off.memory_layout.as_ref().unwrap().notes.iter().all(|n| !n.contains("drafter context rings")));
     assert!(off.memory_layout.as_ref().unwrap().notes.iter().any(|n| n.ends_with("speculation off")));
     options.layout.as_mut().unwrap().physical_sms = Some(170);
     let smaller = plan::plan(dir.path(), &options).unwrap();
     assert!(smaller.placement_supported, "{:?}", smaller.hints);
-    assert_eq!(on_rtx.used_bytes() - rtx(&smaller).used_bytes(), 4_259_840);
+    // The SM-sized draft attention arena: 532,480 bytes more per drafting sequence at 188 SMs.
+    assert_eq!(on_rtx.used_bytes() - rtx(&smaller).used_bytes(), 16 * 532_480);
     options.layout.as_mut().unwrap().prefill_rows = 6;
     options.layout.as_mut().unwrap().concurrency = 1;
     let refused = plan::plan(dir.path(), &options).unwrap();
@@ -423,6 +437,11 @@ fn minimax_draft_context_slots_honor_explicit_shapes() {
     assert!(report.placement_supported, "{:?}", report.hints);
     assert_eq!(report.prefill_rows, Some(512));
     assert!(report.memory_layout.as_ref().unwrap().notes.iter().any(|n| n.contains("sequences 4")));
+    // Four sequences default to four rings (64 decode rows hold four drafting requests and more).
+    options.layout.as_mut().unwrap().draft_context_slots = None;
+    let derived = plan::plan(dir.path(), &options).unwrap();
+    assert_eq!(derived.memory_layout.as_ref().unwrap().pool_tokens, report.memory_layout.as_ref().unwrap().pool_tokens);
+    assert!(derived.memory_layout.as_ref().unwrap().notes.iter().any(|n| n.starts_with("4 drafter context rings")));
     options.layout.as_mut().unwrap().draft_context_slots = Some(1);
     let single = plan::plan(dir.path(), &options).unwrap();
     assert!(single.placement_supported, "{:?}", single.hints);
