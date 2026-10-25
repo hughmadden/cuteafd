@@ -241,11 +241,20 @@ def validate_runtime_platform(runtime):
     return copy.deepcopy(runtime)
 
 
+def public_server(server):
+    """Immutable generation identity, not deployment arguments, addresses or local paths."""
+    return {k: server[k] for k in ('build', 'family', 'model') if k in server}
+
+
 def public_panel(panel):
     public = copy.deepcopy(panel)
-    # Keep immutable generation identity, not deployment arguments or local paths.
-    server = public.get('generation_server', {})
-    public['generation_server'] = {k: server[k] for k in ('build', 'family', 'model') if k in server}
+    public['generation_server'] = public_server(public.get('generation_server', {}))
+    # Engine-generated windows each record the serving launch too (listen and peer
+    # addresses, mount paths): the same identity-only reduction applies there.
+    for window in public['windows']:
+        provenance = window.get('provenance')
+        if isinstance(provenance, dict) and isinstance(provenance.get('server'), dict):
+            provenance['server'] = public_server(provenance['server'])
     public['publication_provenance'] = {
         **public.get('publication_provenance', {}),
         'source_set_sha256': panel['set_sha256'],

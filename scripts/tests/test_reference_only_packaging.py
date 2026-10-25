@@ -117,6 +117,24 @@ def test_public_panel_preserves_tokens_and_generation_identity_not_deployment():
         packager.public_panel(source)
 
 
+def test_public_panel_reduces_each_engine_generated_window_server_to_its_identity():
+    server = dict(build=dict(commit='b' * 40), family='minimax_m3', model='MiniMaxAI/model', snapshot='/checkpoint',
+                  settings=[dict(name='listen', value='192.0.2.10:18117'), dict(name='peers', value='192.0.2.11:19117')])
+    window = dict(tokens=[1, 2], roles=['ctx', 'gen'], score_from=1,
+                  provenance=dict(prompt_sha256='c' * 64, engine='minimax_m3', server=server, generated_tokens=1))
+    legacy = dict(tokens=[3, 4], roles=['ctx', 'ctx'], score_from=1, provenance=dict(path='anchor.json', sha256='d' * 64))
+    source = dict(set_sha256='sealed', windows=[window, legacy], generation_server=server)
+    public = packager.public_panel(source)
+    identity = dict(build=dict(commit='b' * 40), family='minimax_m3', model='MiniMaxAI/model')
+    assert public['generation_server'] == identity
+    assert public['windows'][0]['provenance'] == {**window['provenance'], 'server': identity}
+    assert public['windows'][1] == legacy
+    for got, original in zip(public['windows'], source['windows']):
+        assert {k: got[k] for k in ('tokens', 'roles', 'score_from')} == {k: original[k] for k in ('tokens', 'roles', 'score_from')}
+    assert '192.0.2.' not in repr(public['windows'])
+    assert source['windows'][0]['provenance']['server'] is server and 'settings' in server
+
+
 def test_seal_paths_cannot_escape(tmp_path):
     for value in ('../secret', '/secret', '.'):
         with pytest.raises(ValueError):
