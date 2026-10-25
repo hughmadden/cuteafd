@@ -48,8 +48,35 @@ def install_tools(mutate, dry_run):
         DOCA_SOURCES.write_text(f"Types: deb\nURIs: {repo}\nSuites: ./\nSigned-By: {DOCA_KEYRING}\n")
     else:
         print(f"DRY-RUN verify {repo}doca_keyring.gpg is {DOCA_KEY_FINGERPRINT}; write {DOCA_KEYRING}, {DOCA_SOURCES}, {DOCA_PIN} (only mlnx-tools pinned in)")
+    # apt's TLS client gets "unexpected eof" from linux.mellanox.com's server while
+    # curl does not, so fetch with curl and keep apt's chain of trust: the
+    # signed InRelease names the Packages hash, which names the .deb hash.
     mutate("apt-get", "update")
-    mutate("apt-get", "install", "-y", "--no-install-recommends", "mlnx-tools")
+    if dry_run:
+        print(f"DRY-RUN fetch {repo}InRelease + Packages, verify signature and hashes, apt-get install ./mlnx-tools.deb")
+        return
+    import hashlib, tempfile
+    def fetch(path):
+        return subprocess.check_output(["curl", "-fsSL", "--retry", "5", repo + path], timeout=120)
+    def field(block, name):
+        return re.search(rf"^{name}: (.+)$", block, re.M).group(1).strip()
+    with tempfile.TemporaryDirectory() as work:
+        work = Path(work)
+        (work / "InRelease").write_bytes(fetch("InRelease"))
+        signed = subprocess.run(["gpgv", "--keyring", str(DOCA_KEYRING), "--output", "-", str(work / "InRelease")],
+                                capture_output=True, check=True).stdout.decode()
+        packages = fetch("Packages")
+        if not re.search(rf"^ {hashlib.sha256(packages).hexdigest()} +\d+ Packages$", signed, re.M):
+            raise ValueError("DOCA Packages index does not match the signed InRelease")
+        block = re.search(r"^Package: mlnx-tools\n(?:.+\n)+", packages.decode(), re.M).group(0)
+        deb = fetch(field(block, "Filename"))
+        if hashlib.sha256(deb).hexdigest() != field(block, "SHA256"):
+            raise ValueError("mlnx-tools .deb does not match the signed index")
+        path = work / Path(field(block, "Filename")).name
+        path.write_bytes(deb)
+        path.chmod(0o644)
+        work.chmod(0o755)
+        mutate("apt-get", "install", "-y", "--no-install-recommends", str(path))
 
 
 def parse_qos(text):
