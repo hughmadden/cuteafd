@@ -50,15 +50,7 @@ impl DflashMemory {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// RadixArk/Minimax-M3.1-Flash-Dflash2's geometry (config.json fields the admission reads).
-    fn config() -> serde_json::Value {
-        serde_json::json!({"head_dim": 128, "hidden_size": 6144, "intermediate_size": 12288,
-            "num_attention_heads": 64, "num_hidden_layers": 5, "num_key_value_heads": 4, "sliding_window": 4096,
-            "vocab_size": 200064, "dflash_config": {"block_size": 8, "conv_group_size": 16, "conv_kernel_size": 2,
-                "mask_token_id": 200058, "selector_rank": 256, "selector_top_k": 16,
-                "target_layer_ids": [3, 17, 31, 45, 59]}})
-    }
+    use crate::plan::testing::minimax_dflash2_config as config;
 
     #[test]
     fn minimax_dflash_weights_match_the_checkpoint_and_fp8_halves_the_gemms() -> anyhow::Result<()> {

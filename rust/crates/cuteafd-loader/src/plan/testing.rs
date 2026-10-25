@@ -1045,3 +1045,12 @@ pub fn write_minimax_m3_snapshot(dir: &Path, vision: bool, draft: bool) {
         write_snapshot(&dir.join("dspark"), &dspark, &minimax_m3_dspark_tensors(), None);
     }
 }
+
+/// RadixArk/Minimax-M3.1-Flash-Dflash2's geometry: the `config.json` fields MiniMax's admission reads.
+pub fn minimax_dflash2_config() -> Value {
+    json!({"head_dim": 128, "hidden_size": 6144, "intermediate_size": 12288,
+        "num_attention_heads": 64, "num_hidden_layers": 5, "num_key_value_heads": 4, "sliding_window": 4096,
+        "vocab_size": 200064, "dflash_config": {"block_size": 8, "conv_group_size": 16, "conv_kernel_size": 2,
+            "mask_token_id": 200058, "selector_rank": 256, "selector_top_k": 16,
+            "target_layer_ids": [3, 17, 31, 45, 59]}})
+}
