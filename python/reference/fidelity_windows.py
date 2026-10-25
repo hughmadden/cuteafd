@@ -380,6 +380,19 @@ def bucket(position: int) -> str:
     return "0-2K" if position <= 2048 else "2-8K" if position <= 8192 else "8-16K" if position < MAX_TOKENS else "16K+"
 
 
+STANDARD_SOURCE = Path(__file__).resolve().parents[2] / "rust/crates/cuteafd-bench/src/fidelity_dataset.rs"
+
+
+def standard_split() -> dict:
+    """The bench's sealed standard-v2 window ids per half, read from its own source."""
+    source = STANDARD_SOURCE.read_text()
+    split = {}
+    for name in ("decode", "prefill"):
+        match = re.search(r"pub const STANDARD_" + name.upper() + r":[^=]+=\s*\[(.*?)\];", source, re.S)
+        split[name] = re.findall(r'"([a-e][0-9]{2}|legacy)"', match.group(1))
+    return split
+
+
 def verify_snapshot(manifest: dict, snapshot: Path) -> dict:
     """Check cheap, stable identities without hashing hundreds of GB of weights."""
     from checkpoint_tokenizer import tokenizer_identity

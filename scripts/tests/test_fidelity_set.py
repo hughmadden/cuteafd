@@ -179,6 +179,22 @@ def test_64_window_recipe_is_deterministic_and_hashed(fake_server):
         builder.validate_set(changed)
 
 
+@pytest.mark.parametrize("generated", [73, 600, 1024])
+def test_standard_halves_hold_equal_context_buckets_whatever_the_answer_length(fake_server, generated):
+    from fidelity_windows import standard_split
+    fake_server["generated"] = generated
+    manifest = make(fake_server)
+    buckets = {w["id"]: w["bucket"] for w in manifest["windows"]}
+    split = standard_split()
+    assert sorted(split["decode"] + split["prefill"]) == sorted(buckets)
+    halves = [collections.Counter(buckets[wid] for wid in split[half]) for half in ("decode", "prefill")]
+    assert halves[0] == halves[1] == {"0-2K": 13, "2-8K": 10, "8-16K": 9}
+    for block, targets in (("D", builder.D_TARGETS), ("E", builder.E_TARGETS)):
+        windows = [w for w in manifest["windows"] if w["block"] == block and w["id"] != "legacy"]
+        assert [w["bucket"] for w in windows] == ["0-2K" if target < 2048 else "2-8K" for target in targets]
+    assert manifest["recipe"]["prompt_targets"] == {"D": list(builder.D_TARGETS), "E": list(builder.E_TARGETS)}
+
+
 def test_text_recipe_requires_explicit_sealed_anchor(capsys):
     with pytest.raises(SystemExit) as error:
         builder.main(["--family", "qwen4", "--version", "test", "--model", "test",

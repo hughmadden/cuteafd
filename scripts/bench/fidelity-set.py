@@ -32,6 +32,12 @@ FAMILIES = ("deepseek_v41", "mimo_v2", "qwen4", "qwen3_5", "glm5_flash", "deepse
 # template defaults to adaptive thinking, which answers most agentic turns without reasoning
 # and leaves the standard halves short of generated rows; the recipe turns thinking on.
 FAMILY_REQUEST = {"minimax_m3": {"thinking": {"type": "enabled"}}}
+# D and E prompt sizes per window. A scored start lies between the prompt end and 512 rows into
+# a 1024-token answer, so each size keeps it inside one bucket whatever the model generates
+# (0-2K: at most 1152; 2-8K: from 2049). With the sealed standard-v2 split, both halves then hold
+# 13 / 10 / 9 windows in 0-2K / 2-8K / 8-16K.
+D_TARGETS = (1024, 1024, 2304, 2816, 768, 2304)
+E_TARGETS = (768, 1024, 2304, 768, 2816, 2304, 1024, 2816, 2304)
 REPO_FILES = ["rust/crates/cuteafd-api/src/openai/probe.rs", "scripts/bench/bench-agentic-session.py",
               "python/reference/families/deepseek_v41/golden.py", "rust/crates/cuteafd-bench/src/client.rs",
               "scripts/bench/make-fidelity-reference.py", "rust/crates/cuteafd-bench/src/reference.rs",
@@ -229,7 +235,7 @@ def build_set(*, family: str, model: str, checkpoint: str, version: str, arm: di
         tokens += corpus_ids[:padding]
         roles += ["ctx"] * padding
         expected_bucket = "0-2K" if target < 2048 else "2-8K" if target < 8192 else "8-16K"
-        if block in ("A", "B") and bucket(start) != expected_bucket:
+        if bucket(start) != expected_bucket:
             raise BucketMismatch(f"{name}: history lands in {bucket(start)}, expected {expected_bucket}; supply a shorter recording/history")
         windows.append({"id": name, "block": block, "bucket": bucket(start),
                         "tokens": tokens, "roles": roles, "score_from": start,
@@ -324,11 +330,11 @@ def build_set(*, family: str, model: str, checkpoint: str, version: str, arm: di
                         "roles": ["ctx"] * len(tokens), "score_from": start, "provenance": sources[i % len(files)]})
     for i in range(6):
         prompt = STRUCTURED[i] + " Reply in JSON." if i < 3 else "Select and call the correct tool to read, search or edit the fixture repository. " + agentic.TASKS[(i - 3) % len(agentic.TASKS)]["prompt"]
-        generate(f"d{i:02d}", "D", [{"role": "user", "content": prompt}], 1024 + (i % 3) * 512,
+        generate(f"d{i:02d}", "D", [{"role": "user", "content": prompt}], D_TARGETS[i],
                  agentic.TOOLS if i >= 3 else None,
                  {"response_format": {"type": "json_object"}} if i < 3 else None)
     for i, prompt in enumerate(MATH + [f"Explain the repository design in {files[j]} in detail." for j in range(5)]):
-        generate(f"e{i:02d}", "E", [{"role": "user", "content": prompt}], 768 + (i % 3) * 512)
+        generate(f"e{i:02d}", "E", [{"role": "user", "content": prompt}], E_TARGETS[i])
     quick = ["legacy", "a00", "a04", "a08", "a12", "a20", "a24", "b00", "b08", "c00", "d00", "e00"]
     servers = [w["provenance"]["server"] for w in windows if "server" in w["provenance"]]
     if servers and any(server != servers[0] for server in servers):
@@ -344,6 +350,7 @@ def build_set(*, family: str, model: str, checkpoint: str, version: str, arm: di
                     "context_cap": MAX_TOKENS, "temperature": 0, "seed": 0, "reasoning_effort": "high",
                     "blocks": {"A": 26, "B": 12, "C": 10, "D": 6, "E": 10},
                     "prompt_roles": "conditioning history ctx; current assistant span gen",
+                    "prompt_targets": {"D": list(D_TARGETS), "E": list(E_TARGETS)},
                     **({"request": FAMILY_REQUEST[family]} if family in FAMILY_REQUEST else {})}, "windows": windows}
     if getattr(probe, "identity", {}).get("text_source") in ("api", "hf"):
         manifest["reference_snapshot"] = {
