@@ -238,7 +238,7 @@ impl EngineArgs {
         use cuteafd_loader::serving_capacity::prefill_waves::{prefill_shape, PrefillOverrides};
         let ranks = self.peers.as_deref().map_or(0, |peers| peers.split(',').filter(|p| !p.is_empty()).count());
         let local = self.local_experts || self.split_device.is_some() || (ranks == 0 && !self.shared_only);
-        let shape = prefill_shape(ranks, cuteafd_loader::families::qwen4::prefill_limits(local),
+        let shape = prefill_shape(if local { 0 } else { ranks }, cuteafd_loader::families::qwen4::prefill_limits(local),
             PrefillOverrides {
                 unit_rows: self.prefill_units.or((self.prefill_rows > 0).then_some(self.prefill_rows)).map(|r| r as u64),
                 waves: (self.prefill_waves > 0).then_some(u64::from(self.prefill_waves)),

@@ -1250,6 +1250,20 @@ fn shared_ffn_region_keeps_replicated_replies_apart() {
 
 
 #[test]
+fn native_prefill_refuses_every_unqualified_spark_count() {
+    for (kind, gpus, supported) in [("nvfp4", 1, 4), ("fp8", 2, 6)] {
+        let dir = snapshot(kind);
+        for ranks in (0..=8).filter(|&ranks| ranks != supported) {
+            let result = report(dir.path(), gpus, 96, ranks, None);
+            assert!(!result.fits && !result.placement_supported && !result.wip_launchable());
+            assert!(result.hints.iter().any(|hint| hint.what.contains("coordinator/Spark count")),
+                "{kind} ranks={ranks}: {:?}", result.hints);
+            assert!(result.memory_layout.unwrap().devices.is_empty());
+        }
+    }
+}
+
+#[test]
 fn adaptive_prefill_selection_preserves_overrides_and_never_retries_on_capacity() {
     for (kind, gpus, sparks, default_unit, default_waves) in [
         ("nvfp4", 1, 4, 4096, 2), ("fp8", 2, 6, 2752, 3),

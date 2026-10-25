@@ -1148,6 +1148,19 @@ pub(super) mod tests {
         let capacity = cuteafd_loader::placement::inventory::PRO_TOTAL_BYTES;
         let spark_bytes = 115_964_116_992;
         use cuteafd_core::MlaCacheFormat;
+        let automatic = plan::plan(snapshot.path(), &PlanOptions {
+            placement: ExpertPlacement::Sparks { ranks: 6 },
+            layout: Some(LayoutOptions { host_memory: Some((128 << 30, 128 << 30)),
+                rtx_bytes: vec![capacity; 2], concurrency: 16,
+                workspace_manifest: Some(manifest_path.clone()),
+                spark_allocation_budget_bytes: Some(spark_bytes), ..Default::default() }),
+            ..Default::default()
+        })?;
+        ensure!(automatic.fits && automatic.placement_supported, "Auto shape/pool: {:?}", automatic.hints);
+        assert_eq!((automatic.prefill_unit_rows, automatic.prefill_waves), (Some(2752), Some(3)));
+        assert!(automatic.memory_layout.context("automatic Kimi ledger")?.pool_tokens
+            >= cuteafd_loader::families::kimi_k3::DEFAULT_CONTEXT as u64);
+        let mut refused = 0;
         for ((slots, prefix_slots, host_cache_bytes, entries, format), waves) in [
             (16, Some(1), Some(0), 20, MlaCacheFormat::Fp8),
             (8, None, None, 20, MlaCacheFormat::Fp8),
@@ -1173,8 +1186,8 @@ pub(super) mod tests {
                     workspace_manifest: Some(manifest_path.clone()), onboard: Some(Onboard::Auto),
                     spark_allocation_budget_bytes: Some(spark_bytes), ..Default::default() }), ..Default::default() };
             let report = plan::plan(snapshot.path(), &options)?;
-            ensure!(report.fits && report.placement_supported, "{:?}", report.hints);
-            let memory = report.memory_layout.context("installed Kimi planner ledger")?;
+            assert_eq!((report.prefill_unit_rows, report.prefill_waves, report.prefill_span_rows),
+                (Some(unit as u64), Some(waves as u64), Some(rows as u64)));
             let catalog = cuteafd_loader::read_expert_catalog(snapshot.path())?;
             let package = allocation::expert_package(&manifest_path)?;
             // Startup charges hook-local owners (TP2 workspace, Spark endpoint,
@@ -1212,7 +1225,31 @@ pub(super) mod tests {
                     code.pending(arch.context_bytes + resident, arch.context_bytes), arch.cublas_bytes, 1)?);
             }
             i.rtx = Some(rtx); i.spark_budget = Some(spark);
-            let admitted = admit(i)?;
+            let admitted = match admit(i) {
+                Ok(admitted) => {
+                    ensure!(report.fits && report.placement_supported,
+                        "concurrency={slots} waves={waves} format={format}: {:?}", report.hints);
+                    admitted
+                }
+                Err(error) => {
+                    assert!(!report.fits && !report.placement_supported,
+                        "planner admitted a shape refused by runtime: {error:#}");
+                    let mut typed = error.downcast_ref::<PlacementError>()
+                        .context("explicit Kimi capacity refusal must remain typed")?;
+                    while let PlacementError::OwnerCandidates { source, .. }
+                        | PlacementError::PrefixMarks { source, .. } = typed {
+                        typed = source;
+                    }
+                    assert!(matches!(typed, PlacementError::BelowFloor { floor, pool, .. }
+                        if *floor == context as u64 && *pool < *floor), "{typed}");
+                    assert!(report.hints.iter().any(|hint| hint.what.contains(&typed.to_string())),
+                        "planner/runtime capacity refusal differs: {:?}; {error:#}", report.hints);
+                    assert_eq!(report.memory_layout.context("refused Kimi ledger")?.pool_tokens, 0);
+                    refused += 1;
+                    continue;
+                }
+            };
+            let memory = report.memory_layout.context("installed Kimi planner ledger")?;
             assert_eq!(memory.pool_tokens, admitted.placement.pool_tokens);
             assert_eq!(admitted.mark_selection.slots, marks);
             for rank in 0..2 {
@@ -1229,6 +1266,7 @@ pub(super) mod tests {
             }
             assert!(admitted.placement.pool_tokens >= context as u64);
         }
+        assert!(refused > 0, "the explicit-shape matrix must exercise a real capacity refusal");
         Ok(())
     }
 
@@ -1274,7 +1312,7 @@ pub(super) mod tests {
                 let mut options = PlanOptions { placement: ExpertPlacement::Sparks { ranks: 6 },
                     layout: Some(LayoutOptions { host_memory: Some((128 << 30, 128 << 30)), rtx_bytes: vec![96 << 30; 2], concurrency: 2,
                         mla_kv: format, context_tokens: context, pool_tokens: Some(context), prefix_slots: Some(2),
-                        host_cache_bytes: Some(0), onboard: Some(Onboard::Layers(5)), ..Default::default() }),
+                        host_cache_bytes: Some(0), onboard: Some(Onboard::Auto), ..Default::default() }),
                     ..Default::default() };
                 let report = plan::plan(snapshot.path(), &options)?;
                 ensure!(report.fits && report.placement_supported, "{:?}", report.hints);
@@ -1325,7 +1363,7 @@ pub(super) mod tests {
                 placement: ExpertPlacement::Sparks { ranks: 6 },
                 layout: Some(LayoutOptions { host_memory: Some((128 << 30, 128 << 30)), rtx_bytes: vec![96 << 30; 2], concurrency: 2,
                     mla_kv: format, prefix_slots: Some(2), host_cache_bytes: Some(0),
-                    onboard: Some(Onboard::Layers(5)), ..Default::default() }),
+                    onboard: Some(Onboard::Auto), ..Default::default() }),
                 ..Default::default()
             })?;
             ensure!(report.fits && report.placement_supported, "{:?}", report.hints);

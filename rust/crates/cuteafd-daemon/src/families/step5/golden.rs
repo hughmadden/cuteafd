@@ -497,12 +497,12 @@ fn expert_admission(args: &GoldenArgs, rows: usize, layers: &[usize]) -> Result<
         args.peers.len(),
         None,
         ModelAdmission::for_units(ExpertGeometry::STEP5,
-            SparkEndpoint { ring_depth: None, capacity: rows as u32, ingress: SparkIngress::Bf16 },
+            SparkEndpoint { ring_depth: None, capacity: unit as u32, ingress: SparkIngress::Bf16 },
             unit as u32, compiled as u32, spark_rings(config.max_frame_bytes)?, 1, args.prefill_waves)?,
     )?
     .select(&args.peers)?;
     cuteafd_transport::worker_selection::require_peer_clients(&args.peers,
-        SparkEndpoint { ring_depth: None, capacity: rows as u32, ingress: SparkIngress::Bf16 }, 1)?;
+        SparkEndpoint { ring_depth: None, capacity: unit as u32, ingress: SparkIngress::Bf16 }, 1)?;
     Ok((world, config))
 }
 
@@ -869,8 +869,8 @@ fn split_run(args: &GoldenArgs, checkpoint: &Checkpoint, cfg: &Config,
     let (world, config) = expert_admission(args, rows, layers)?;
     let transport = devices[0].own(|| {
         let mut link = if waves > 1 {
-            SparkLink::new_waves(&library, world, &args.peers, rows as u32, config, H * 2, waves, unit as u32)?
-        } else { SparkLink::new(&library, world, &args.peers, rows as u32, config, H * 2)? };
+            SparkLink::new_waves(&library, world, &args.peers, unit as u32, config, H * 2, waves, unit as u32)?
+        } else { SparkLink::new(&library, world, &args.peers, unit as u32, config, H * 2)? };
         link.enable_terminal_ownership(library.clone())?;
         link.bootstrap(&super::execution::bootstrap_request(unit, 17)?)?;
         Ok(link)

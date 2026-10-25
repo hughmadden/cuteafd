@@ -126,12 +126,14 @@ fn native_planner_uses_export_contract_and_exact_dense_allocations() {
     assert!(memory.devices[0].items.iter().any(|item| item.group == "exact retained prefix marks"
         && item.bytes == buffers.prefix as u64));
     assert!(memory.notes.iter().any(|note| note.contains("no captured graphs")));
-    let spark_options = PlanOptions { placement: ExpertPlacement::Sparks { ranks: 2 }, ..options.clone() };
-    let refused = plan::plan(dir.path(), &spark_options).unwrap();
-    assert!(!refused.fits && !refused.placement_supported && !refused.native_serving_admitted
-        && !refused.wip_launchable());
-    assert!(refused.hints.iter().any(|hint| hint.what.contains("no Spark layout")));
-    assert!(refused.memory_layout.unwrap().devices.is_empty());
+    for ranks in 1..=8 {
+        let spark_options = PlanOptions { placement: ExpertPlacement::Sparks { ranks }, ..options.clone() };
+        let refused = plan::plan(dir.path(), &spark_options).unwrap();
+        assert!(!refused.fits && !refused.placement_supported && !refused.native_serving_admitted
+            && !refused.wip_launchable());
+        assert!(refused.hints.iter().any(|hint| hint.what.contains("no Spark layout")));
+        assert!(refused.memory_layout.unwrap().devices.is_empty());
+    }
     exports["programs"][0]["geometry"]["zero_centered"] = json!(false);
     std::fs::write(&manifest, serde_json::to_vec(&exports).unwrap()).unwrap();
     let refused = plan::plan(dir.path(), &options).unwrap();

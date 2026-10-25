@@ -1098,6 +1098,9 @@ mod tests {
             expert.whole.resident = 2 << 20;
             for half in &mut expert.half { half.resident = 1 << 20; }
         }
+        assert!(solve_working_set(&native, native.tp2_workspace, HEADS).is_err(),
+            "all-local admission must not silently shrink the requested three-wave shape");
+        native.prefill_lanes = 1;
         let (all, working) = run(&native);
         assert_eq!(all.onboard_layers, cfg.layers - cfg.first_moe_layer);
         assert!(working.spark.spark_layers.is_empty());

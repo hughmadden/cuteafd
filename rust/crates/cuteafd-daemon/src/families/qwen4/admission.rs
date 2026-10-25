@@ -761,6 +761,8 @@ mod tests {
             let peers = input(&with_peers, source, pending)?;
             assert_eq!(peers.pending_code_bytes, pending);
             assert_eq!(peers.spark_ranks, 0);
+            assert_eq!(with_peers.resolved_prefill()?.waves, 1);
+            assert_eq!(with_peers.resolved_prefill()?, local.resolved_prefill()?);
             assert_eq!(qwen4::request(&plain, 0)?, qwen4::request(&peers, 0)?);
             assert_eq!(qwen4::placement(&plain)?, qwen4::placement(&peers)?);
         }

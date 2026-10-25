@@ -68,6 +68,10 @@ impl ServeArgs {
     /// One prefill call's rows: `--prefill-waves` units of `--prefill-rows`.
     fn span(&self) -> u32 { self.prefill_rows * u32::from(self.prefill_waves) }
 
+    fn endpoint(&self) -> SparkEndpoint {
+        SparkEndpoint { ring_depth: None, capacity: self.prefill_rows, ingress: SparkIngress::Bf16 }
+    }
+
     fn shape(&self) -> Result<cuteafd_loader::serving_capacity::prefill_waves::PrefillPlan> {
         use cuteafd_loader::serving_capacity::prefill_waves::{prefill_shape, PrefillLimits, PrefillOverrides};
         Ok(prefill_shape(self.peers.len(), PrefillLimits::default(), PrefillOverrides {
@@ -191,7 +195,7 @@ fn with_backend<T>(args: &ServeArgs,
     }).collect::<Result<Vec<_>>>()?;
     let admission = admission::admit_mtp(&programs, &checkpoint, &inputs, usize::from(args.mtp))?;
     measured.record("step5", &measured.gpus.iter().map(|g| g.free_bytes).collect::<Vec<_>>());
-    let endpoint = SparkEndpoint { ring_depth: None, capacity: args.span(), ingress: SparkIngress::Bf16 };
+    let endpoint = args.endpoint();
     let clients = admission.ownership.routed_endpoints()?;
     let config = TcpTransportConfig { timing: cuteafd_transport::protocol_v2_timing_from_env(), ..Default::default() };
     // Spark admission is planned (headers only) here and started below, once the
@@ -306,9 +310,9 @@ fn with_backend<T>(args: &ServeArgs,
     let transport = devices[0].own(|| {
         // One return slot per prefill unit in flight, each holding one unit.
         let mut link = if args.prefill_waves > 1 {
-            SparkLink::new_waves(&library, world, &args.peers, args.span(), config, 4096 * 2,
+            SparkLink::new_waves(&library, world, &args.peers, args.prefill_rows, config, 4096 * 2,
                 usize::from(args.prefill_waves), args.prefill_rows)?
-        } else { SparkLink::new(&library, world, &args.peers, args.span(), config, 4096 * 2)? };
+        } else { SparkLink::new(&library, world, &args.peers, args.prefill_rows, config, 4096 * 2)? };
         link.enable_terminal_ownership(library.clone())?;
         link.bootstrap(&super::execution::bootstrap_request(inputs.unit_rows(), 1)?)?;
         Ok(link)
@@ -696,6 +700,13 @@ mod tests {
             args.validate()?;
             let shape = args.shape()?;
             assert_eq!((shape.unit_rows, shape.waves, shape.span_rows), (unit, waves, span));
+            args.prefill_rows = unit as u32;
+            args.prefill_waves = waves as u8;
+            assert_eq!(args.span(), span as u32);
+            let model = ModelAdmission::for_units(ExpertGeometry::STEP5, args.endpoint(), unit as u32,
+                4096, spark_rings(TcpTransportConfig::default().max_frame_bytes)?, 2, waves as u8)?;
+            assert_eq!(model.endpoints[0].capacity, unit as u32);
+            assert!(model.endpoints[0].capacity < args.span());
             args.prefill_rows = 512;
             for waves in 1..=4 {
                 args.prefill_waves = waves;

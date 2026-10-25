@@ -542,6 +542,21 @@ mod selected_spark_io_tests {
             assert_eq!(spark_slot_bytes("kimi_k3", unit), slot);
             let reserve = crate::families::kimi_k3::spark_reserve_bytes(waves, unit).unwrap();
             assert_eq!(reserve, waves * slot + cuteafd_core::memory_layout::SPARK_RUNTIME_RESIDUAL_BYTES);
+            let working = SparkWorkingSet { spark_layers: vec![1], spark_ranks: 6,
+                prefill_lanes: 1, ..Default::default() };
+            let rings = spark_ring_geometry(1);
+            let io = working.rank_io(0, ExpertGeometry::KIMI_K3, unit as u32, false, rings).unwrap();
+            let expected = reserve + io.intake + io.host_exchange + io.row_indices
+                + io.endpoint_staging + io.mapped_rings;
+            let mut device = DeviceLayout { kind: DeviceKind::Spark, index: 0,
+                capacity_bytes: 121 * GIB, items: vec![], kv_tokens: 0 };
+            for _ in 0..2 {
+                charge_spark_io(&mut device, &working, ExpertGeometry::KIMI_K3, unit as u32,
+                    false, rings, 0).unwrap();
+                charge_spark_slots(&mut device, &working, "kimi_k3", waves as u8, unit);
+                assert_eq!(device.items.iter().map(|item| item.bytes).sum::<u64>(), expected,
+                    "pre-solver Spark overhead and the final ledger must count each owner once");
+            }
         }
     }
 

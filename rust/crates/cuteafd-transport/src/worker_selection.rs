@@ -1442,28 +1442,34 @@ mod tests {
     #[test]
     fn multiunit_endpoint_storage_never_authorizes_an_oversized_kernel_request() -> Result<()> {
         use cuteafd_core::{SparkEndpoint, SparkIngress, SparkRings};
-        let mut selection = admission_selection();
-        let endpoint = SparkEndpoint { ring_depth: None, capacity: 8256, ingress: SparkIngress::Bf16 };
-        let model = ModelAdmission::for_units(selection.geometry(), endpoint, 2752, 4096,
-            SparkRings { max_frame_bytes: 128 << 20, depth: 8, slot_bytes: 8 << 20, alignment: 4096 }, 2, 3)?;
-        assert_eq!((model.capacity, model.compiled_capacity, model.execution_slots), (2752, 4096, 3));
-        assert_eq!(model.endpoints, [endpoint, endpoint]);
-        let mut invalid = model.clone();
-        invalid.execution_slots = 2;
-        assert!(invalid.validate(selection.geometry()).is_err());
-        selection.model = Some(model);
-        let mut header = crate::ExpertProtocolV2RequestHeader {
-            request_id: 1, placement_version: 17, layer_id: 13, row_count: 2752,
-            hidden_dim: 6144, hidden_dtype: crate::ExpertV2Dtype::Bf16,
-            hidden_row_stride_bytes: 12288, route_count: 2752 * 8,
-            row_descriptor_bytes: 40, route_bytes: 12, hidden_payload_bytes: 2752 * 12288,
-            flags: crate::protocol_v2::EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16,
-        };
-        validate_endpoint_request(&selection, 0, &header)?;
-        header.row_count += 1;
-        assert!(validate_endpoint_request(&selection, 0, &header).is_err());
-        header.row_count = endpoint.capacity;
-        assert!(validate_endpoint_request(&selection, 0, &header).is_err());
+        let rings = SparkRings { max_frame_bytes: 128 << 20, depth: 8, slot_bytes: 8 << 20, alignment: 4096 };
+        for (unit, endpoint_rows) in [(1024, 3072), (2752, 2752), (4096, 4096)] {
+            let mut selection = admission_selection();
+            let endpoint = SparkEndpoint { ring_depth: None, capacity: endpoint_rows, ingress: SparkIngress::Bf16 };
+            let model = ModelAdmission::for_units(selection.geometry(), endpoint, unit, 4096, rings, 2, 3)?;
+            assert_eq!((model.capacity, model.compiled_capacity, model.execution_slots), (unit, 4096, 3));
+            assert_eq!(model.endpoints, [endpoint, endpoint]);
+            if endpoint_rows > unit {
+                let mut invalid = model.clone();
+                invalid.execution_slots = 2;
+                assert!(invalid.validate(selection.geometry()).is_err());
+            }
+            selection.model = Some(model);
+            let mut header = crate::ExpertProtocolV2RequestHeader {
+                request_id: 1, placement_version: 17, layer_id: 13, row_count: unit,
+                hidden_dim: 6144, hidden_dtype: crate::ExpertV2Dtype::Bf16,
+                hidden_row_stride_bytes: 12288, route_count: unit * 8,
+                row_descriptor_bytes: 40, route_bytes: 12, hidden_payload_bytes: u64::from(unit) * 12288,
+                flags: crate::protocol_v2::EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16,
+            };
+            validate_endpoint_request(&selection, 0, &header)?;
+            header.row_count += 1;
+            assert!(validate_endpoint_request(&selection, 0, &header).is_err());
+        }
+        let selection = admission_selection();
+        let span = SparkEndpoint { ring_depth: None, capacity: 8256, ingress: SparkIngress::Bf16 };
+        assert!(ModelAdmission::for_units(selection.geometry(), span, 2752, 4096, rings, 2, 3).is_err(),
+            "a whole three-unit lane span is not a legal per-request endpoint");
         Ok(())
     }
 

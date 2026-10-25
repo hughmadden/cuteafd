@@ -180,7 +180,7 @@ fn wave_plan_options(path: &Path, ranks: usize) -> PlanOptions {
 #[test]
 fn shared_prefill_public_plan_family_by_spark_matrix() {
     for (family, dir) in shared_wave_snapshots() {
-        for ranks in [0, 1, 2, 4, 5, 6, 8] {
+        for ranks in 0..=8 {
             let mut options = wave_plan_options(dir.path(), ranks);
             let report = plan(dir.path(), &options).unwrap();
             assert_eq!(report.family.as_deref(), Some(family));
@@ -290,7 +290,7 @@ fn family_executor_prefill_markers_do_not_claim_shared_wave_ports() {
     write_v41_snapshot(v41.path());
     let mimo = snapshot(mimo_flash_config(), &mimo_flash_tensors());
     for (dir, marker) in [(v41, "#744"), (mimo, "#671 / #709")] {
-        for ranks in [0, 1, 2, 4, 5, 6, 8] {
+        for ranks in 0..=8 {
             let options = wave_plan_options(dir.path(), ranks);
             let report = plan(dir.path(), &options).unwrap();
             let rendered = render(&report);
@@ -358,7 +358,7 @@ fn qwen_mapped_ple_host_staging_matches_runtime_allocations() {
                 if ranks == 0 && k != 1 { continue; }
                 let report = input.plan(&PlanOptions {
                     layout: Some(layout::LayoutOptions { rtx_bytes: vec![96 << 30; gpus],
-                        head_split: gpus == 2, prefill_rows: unit as u64, prefill_waves: k as u64,
+                        head_split: gpus == 2, prefill_rows: unit as u64, prefill_lanes: k as u64,
                         context_tokens: 32768, prefix_slots: Some(0), host_cache_bytes: Some(0),
                         workspace_manifest: Some(manifest.clone()),
                         host_memory: Some((128 << 30, 128 << 30)), ..Default::default() }),
