@@ -150,6 +150,9 @@ pub(crate) struct Exl3Worker<'a> {
     /// mapped request returns with its work queued; the owner emits it once
     /// [`Self::stream_idle`] reports this stream drained.
     deferred: bool,
+    /// A deferred request whose expert timing publishes at [`Self::complete`]:
+    /// (request id, layer, rows, executor id).
+    pending: Option<(u64, u32, u32, u64)>,
 }
 
 impl<'a> Exl3Worker<'a> {
@@ -338,11 +341,24 @@ impl<'a> Exl3Worker<'a> {
             layer: 0,
             executor_id,
             deferred: false,
+            pending: None,
         })
     }
 
     /// Leave mapped requests queued at return (see `deferred`).
     pub(crate) fn defer(&mut self) { self.deferred = true; }
+
+    /// The deferred request finished (the owner observed its stream drained):
+    /// publish its expert timing, so per-rank Spark compute (S, #762) stays
+    /// observable under the async exchange.
+    pub(crate) fn complete(&mut self) -> Result<()> {
+        let Some((request_id, layer, rows, executor_id)) = self.pending.take() else { return Ok(()) };
+        if let Some(timing) = &mut self.worker_timing {
+            // SAFETY: the caller observed this stream drained after both records.
+            unsafe { timing.publish(request_id, layer, rows, executor_id, "exl3")?; }
+        }
+        Ok(())
+    }
 
     /// Whether every request queued on this execution's stream has completed.
     pub(crate) fn stream_idle(&self) -> Result<bool> {
@@ -548,8 +564,14 @@ impl<'a> Exl3Worker<'a> {
             unsafe { timing.record(1, self.stream.raw)?; }
         }
         // A deferred mapped request completes when the owner observes the
-        // stream idle; the transport holds both slots until then.
-        if self.deferred && destination.is_some() { return Ok(()); }
+        // stream idle; the transport holds both slots until then, and its
+        // timing publishes at `complete`.
+        if self.deferred && destination.is_some() {
+            if self.worker_timing.is_some() {
+                self.pending = Some((request.request_id(), request.layer(), request.rows(), executor_id));
+            }
+            return Ok(());
+        }
         match self.host_path {
             // Poll instead of sleeping in the driver: a blocking synchronize
             // returned about 8 us after the GPU finished (nsys of a GB10

@@ -172,8 +172,9 @@ fn exl3_worker_capacity_bounds() -> Result<()> {
     assert_eq!(Exl3Worker::capacities(40)?, vec![1, 16, 80]);
     assert_eq!(
         Exl3Worker::capacities(4096)?,
-        vec![1, 16, 80, 256, 1024, 4096]
+        vec![1, 16, 80, 256, 1024, 2048, 2752, 4096]
     );
+    assert_eq!(Exl3Worker::capacities(2752)?, vec![1, 16, 80, 256, 1024, 2048, 2752]);
     assert!(Exl3Worker::capacities(0).is_err());
     assert!(Exl3Worker::capacities(4097).is_err());
     Ok(())
@@ -426,4 +427,20 @@ fn packaged_schedule_identity_matches_exact_variant_without_a_policy_allowlist()
     std::fs::remove_file(manifest)?;
     assert!(schedule.check_export(&root, 80).is_err());
     Ok(())
+}
+
+/// #762: a deferred mapped request (the async exchange's lane-owned slots)
+/// keeps its expert timing pending and publishes it at `complete`, after the
+/// owner saw the stream drain, so per-rank Spark compute stays observable.
+#[test]
+fn deferred_exl3_requests_publish_their_timing_at_completion() {
+    let source = include_str!("../worker.rs");
+    let deferred = &source[source.find("if self.deferred && destination.is_some() {").unwrap()..];
+    let early = &deferred[..deferred.find("return Ok(());").unwrap()];
+    assert!(early.contains("self.pending = Some((request.request_id(), request.layer(), request.rows(), executor_id))"));
+    let complete = &source[source.find("pub(crate) fn complete(&mut self)").unwrap()..];
+    let complete = &complete[..complete.find("\n    }\n").unwrap()];
+    assert!(complete.contains("self.pending.take()") && complete.contains("timing.publish("));
+    let backend = include_str!("../../service/backend.rs");
+    assert!(backend.contains("Self::Exl3(execution) => execution.complete(),"));
 }

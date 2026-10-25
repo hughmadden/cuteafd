@@ -12,15 +12,23 @@ const SPARK: SparkCharges = SparkCharges { host_bytes: None, wave_bytes: gib(190
 
 /// Both checkpoint formats publish the same slot-owned GLM prefill geometry
 /// before device or host admission. The continuous span owns no workspace.
+///
+/// Unpinned, the topology picks the waves (#762): the 8192-row reserve split
+/// into `planned_waves(spark_ranks)` units of `unit_rows(k)` (3 x 2752 at six
+/// Sparks, 2 x 4096 below). `PREFILL_WAVES` pins k (its unit follows k unless
+/// `PREFILL_ROWS` pins that too); benchmarks and golden runs pin both.
 pub(crate) fn resolve_prefill(report: &mut PlanReport, options: &mut LayoutOptions,
     rows: u64, spark_ranks: usize) -> crate::serving_capacity::PrefillShape {
-    let requested = if options.prefill_lanes > 0 { options.prefill_lanes }
-        else if options.prefill_waves > 1 { options.prefill_waves }
-        else { glm_prefill_lanes(None) as u64 };
-    let shape = crate::serving_capacity::PrefillShape {
-        unit_rows: options.prefill_unit_rows.unwrap_or(rows),
-        waves: crate::placement::families::glm5::prefill_lanes(spark_ranks, requested),
-    };
+    use crate::serving_capacity::prefill_waves::{planned_waves, unit_rows};
+    let pinned = if options.prefill_lanes > 0 { Some(options.prefill_lanes) }
+        else if options.prefill_waves > 1 { Some(options.prefill_waves) } else { None };
+    let waves = crate::placement::families::glm5::prefill_lanes(spark_ranks,
+        pinned.unwrap_or_else(|| planned_waves(spark_ranks).max(1)));
+    // Shape::resolve fills prefill_unit_rows from the manifest default when
+    // nothing is pinned; only an explicit PREFILL_ROWS keeps its unit.
+    let unit = if options.prefill_rows > 0 { options.prefill_unit_rows.unwrap_or(rows) }
+        else if waves > 1 { unit_rows(waves) } else { rows };
+    let shape = crate::serving_capacity::PrefillShape { unit_rows: unit, waves };
     options.prefill_rows = shape.unit_rows;
     options.prefill_unit_rows = Some(shape.unit_rows);
     options.prefill_lanes = shape.waves;
@@ -469,8 +477,12 @@ mod tests {
                 charge_host(&mut native, &options, input.checkpoint(), true).unwrap();
                 let geometry = |r: &PlanReport| (r.prefill_unit_rows, r.prefill_waves,
                     r.prefill_span_rows, r.prefill_transports);
-                let rows = if unit == 0 { 4096 } else { unit };
-                let waves = if requested == 0 { 2 } else { requested };
+                // Unpinned, the topology picks the waves (#762): 3 x 2752 at six
+                // Sparks, 2 x 4096 below; an explicit PREFILL_WAVES pins k.
+                let planned = crate::serving_capacity::prefill_waves::planned_waves(sparks);
+                let waves = if requested == 0 { planned } else { requested };
+                let rows = if unit != 0 { unit } else if waves > 1 {
+                    crate::serving_capacity::prefill_waves::unit_rows(waves) } else { 4096 };
                 assert_eq!(geometry(&native), (Some(rows), Some(waves), Some(span.unwrap_or(16384)), Some(waves)));
                 assert_eq!(geometry(&native), geometry(&exl3), "{gpus} RTX/{sparks} Sparks");
                 let spec = native.spec.as_ref().unwrap();

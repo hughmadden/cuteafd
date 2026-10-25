@@ -373,7 +373,7 @@ impl InstalledExpertGrouping {
             "invalid installed FP8 expert read-byte descriptor");
         ensure!(self.rank < self.loaded.identity.world as usize && !self.loaded.ranges.is_empty(),
             "invalid installed expert rank/resident layers");
-        ensure!((1..=4096).contains(&self.capacity) && (1..=6).contains(&self.variants.len()),
+        ensure!((1..=4096).contains(&self.capacity) && (1..=cuteafd_core::EXL3_CAPACITIES.len()).contains(&self.variants.len()),
             "invalid installed expert report capacity/variant count");
         if let Some(model) = self.loaded.model() {
             ensure!(self.capacity == model.capacity as usize,

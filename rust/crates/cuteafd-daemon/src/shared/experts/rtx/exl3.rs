@@ -128,7 +128,13 @@ fn selected_capacities(
     selection: RtxSelectionPolicy,
 ) -> Result<Vec<u32>> {
     if selection == RtxSelectionPolicy::FirstCapacity {
-        let mut capacities = super::native::kernel_capacities(row_policy.required_capacity(max_rows))?;
+        // Every capacity up to the first at or above the required rows, on the
+        // EXL3 ladder (which also carries the 2048/2752 prefill units).
+        let required = row_policy.required_capacity(max_rows);
+        anyhow::ensure!((1..=4096).contains(&required), "invalid EXL3 rank capacity");
+        let ladder = cuteafd_core::EXL3_CAPACITIES;
+        let compiled = ladder.into_iter().find(|&c| c as usize >= required).unwrap_or(4096);
+        let mut capacities: Vec<u32> = ladder.into_iter().filter(|&c| c <= compiled).collect();
         if row_policy == Exl3RowPolicy::GlmFlashK64 {
             capacities.retain(|&capacity| capacity != 16);
         }
@@ -987,12 +993,15 @@ mod tests {
 
     #[test]
     fn first_capacity_preload_preserves_selection_without_dead_k64_m16() -> Result<()> {
+        let ladder = |rows: usize| -> Vec<u32> {
+            let top = cuteafd_core::EXL3_CAPACITIES.into_iter().find(|&c| c as usize >= rows).unwrap();
+            cuteafd_core::EXL3_CAPACITIES.into_iter().filter(|&c| c <= top).collect()
+        };
         for maximum in 1..=4096 {
-            let nearest = super::super::native::kernel_capacities(maximum)?;
             assert_eq!(selected_capacities(maximum, Exl3RowPolicy::Nearest,
-                RtxSelectionPolicy::FirstCapacity)?, nearest);
+                RtxSelectionPolicy::FirstCapacity)?, ladder(maximum));
             let policy = Exl3RowPolicy::GlmFlashK64;
-            let before = super::super::native::kernel_capacities(policy.required_capacity(maximum))?;
+            let before = ladder(policy.required_capacity(maximum));
             let after = selected_capacities(maximum, policy, RtxSelectionPolicy::FirstCapacity)?;
             assert_eq!(after, policy.capacities(maximum)?);
             assert!(!after.contains(&16));

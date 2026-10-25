@@ -96,7 +96,7 @@ fn drive(world: &Arc<World>, slots: usize, layers: u32, timeout: Duration)
     let (ops, queue) = mpsc::channel::<Op>();
     std::thread::scope(|scope| {
         let mut backend = Fake { world: world.clone() };
-        let worker = scope.spawn(move || run_worker(&mut backend, &inbox, timeout, false));
+        let worker = scope.spawn(move || run_worker(&mut backend, &inbox, timeout, false, &LinkPace::default()));
         let stream = scope.spawn(|| -> Result<()> {
             for op in queue {
                 match op {
@@ -147,7 +147,7 @@ fn a_wave_waits_for_its_staged_copies_and_its_slots_previous_reduce() {
     let (jobs, inbox) = mpsc::channel();
     std::thread::scope(|scope| {
         let mut backend = Fake { world: world.clone() };
-        let worker = scope.spawn(move || run_worker(&mut backend, &inbox, Duration::from_secs(5), false));
+        let worker = scope.spawn(move || run_worker(&mut backend, &inbox, Duration::from_secs(5), false, &LinkPace::default()));
         // Wave 2 reuses slot 0, whose wave 1 is landed but not yet reduced.
         world.store(Counter::Staged(0), 1);
         jobs.send(Command::Wave(job(1, 0, 0))).unwrap();
@@ -177,7 +177,7 @@ fn a_failure_releases_every_queued_and_later_wait() {
             let world2 = world.clone();
             let worker = scope.spawn(move || {
                 let mut backend = Fake { world: world2 };
-                let (result, highest) = run_worker(&mut backend, &inbox, Duration::from_secs(5), false);
+                let (result, highest) = run_worker(&mut backend, &inbox, Duration::from_secs(5), false, &LinkPace::default());
                 assert!(result.is_err());
                 release_until_closed(&mut backend, &inbox, highest);
             });
@@ -206,7 +206,7 @@ fn closing_with_waves_in_flight_fails_instead_of_hanging() {
     let (jobs, inbox) = mpsc::channel();
     std::thread::scope(|scope| {
         let mut backend = Fake { world: world.clone() };
-        let worker = scope.spawn(move || run_worker(&mut backend, &inbox, Duration::from_secs(5), false));
+        let worker = scope.spawn(move || run_worker(&mut backend, &inbox, Duration::from_secs(5), false, &LinkPace::default()));
         // Wave 2's copies never complete: the engine errored before.
         world.store(Counter::Staged(0), 1);
         jobs.send(Command::Wave(job(1, 0, 0))).unwrap();
@@ -224,7 +224,7 @@ fn a_stalled_gpu_times_out_instead_of_hanging() {
     let (jobs, inbox) = mpsc::channel();
     let (result, _) = std::thread::scope(|scope| {
         let mut backend = Fake { world: world.clone() };
-        let worker = scope.spawn(move || run_worker(&mut backend, &inbox, Duration::from_millis(50), false));
+        let worker = scope.spawn(move || run_worker(&mut backend, &inbox, Duration::from_millis(50), false, &LinkPace::default()));
         jobs.send(Command::Wave(job(1, 0, 0))).unwrap();
         let joined = worker.join().unwrap();
         drop(jobs);
@@ -239,7 +239,7 @@ fn an_idle_worker_blocks_instead_of_spinning() {
     let (jobs, inbox) = mpsc::channel();
     std::thread::scope(|scope| {
         let mut backend = Fake { world: world.clone() };
-        let worker = scope.spawn(move || run_worker(&mut backend, &inbox, Duration::from_secs(5), false));
+        let worker = scope.spawn(move || run_worker(&mut backend, &inbox, Duration::from_secs(5), false, &LinkPace::default()));
         world.store(Counter::Staged(0), 1);
         jobs.send(Command::Wave(job(1, 0, 0))).unwrap();
         wait(&world, Counter::Landed, 1).unwrap();
@@ -509,4 +509,36 @@ fn gpu_exchange_queues_a_step_ahead_and_lands_byte_exact() -> Result<()> {
         eprintln!("exchange ranks={ranks} landing={landing:#b} waves={waves}: {layers} layers of {rows} rows byte-exact{share}");
     }
     Ok(())
+}
+
+/// #762: the worker's idle signal is zero while a wave is always queued
+/// behind the one in flight, and positive when the engine posts late.
+#[test]
+fn link_pace_measures_spark_idle_between_waves() {
+    let pace = LinkPace::default();
+    pace.record(0.010, Some(0.0));
+    assert_eq!(pace.sample(), (10_000, 0, 1));
+    for _ in 0..64 { pace.record(0.010, Some(0.004)); }
+    let (round_trip, idle, waves) = pace.sample();
+    assert_eq!((round_trip, waves), (10_000, 65));
+    assert!((3_900..=4_000).contains(&idle), "{idle}");
+}
+
+/// Hysteresis: idle Sparks add one wave per boundary up to the admitted
+/// maximum; a gapless link drops one only after `HOLD` quiet boundaries.
+#[test]
+fn wave_depth_steps_one_wave_with_hysteresis() {
+    let mut depth = WaveDepth::new(2, 4);
+    assert_eq!(depth.observe(13_000, 3_000), 3);
+    assert_eq!(depth.observe(13_000, 3_000), 4);
+    assert_eq!(depth.observe(13_000, 3_000), 4);
+    // Between the thresholds: hold, and reset the quiet run.
+    assert_eq!(depth.observe(13_000, 300), 4);
+    for _ in 1..WaveDepth::HOLD { assert_eq!(depth.observe(13_000, 0), 4); }
+    assert_eq!(depth.observe(13_000, 0), 3);
+    // Unmeasured links never move.
+    assert_eq!(depth.observe(0, 5_000), 3);
+    let mut one = WaveDepth::new(1, 1);
+    for _ in 0..8 { assert_eq!(one.observe(13_000, 13_000), 1); }
+    for _ in 0..8 { assert_eq!(one.observe(13_000, 0), 1); }
 }

@@ -201,6 +201,70 @@ pub(crate) struct WaveTimes {
     pub received: f64,
 }
 
+/// Always-on link pacing (#762): the Spark round trip of a wave (post to the
+/// last rank landed, `S` plus the wire) and the Sparks' idle gap between
+/// waves (from a wave landing to the next post while nothing else was in
+/// flight; zero when the next wave was already queued). Running means over
+/// every wave, kept in atomics the engine reads at the prefill->decode
+/// boundary. Microseconds; zero until measured.
+#[derive(Default)]
+pub(crate) struct LinkPace {
+    round_trip_us: AtomicU32,
+    idle_us: AtomicU32,
+    waves: AtomicU32,
+}
+
+impl LinkPace {
+    fn add(cell: &AtomicU32, sample_us: f64, first: bool) {
+        let mean = if first { sample_us } else {
+            let old = f64::from(cell.load(Ordering::Relaxed));
+            old + MEAN_WEIGHT * (sample_us - old)
+        };
+        cell.store(mean.clamp(0.0, f64::from(u32::MAX)) as u32, Ordering::Relaxed);
+    }
+    fn record(&self, round_trip: f64, idle: Option<f64>) {
+        let first = self.waves.load(Ordering::Relaxed) == 0;
+        Self::add(&self.round_trip_us, round_trip * 1e6, first);
+        if let Some(idle) = idle { Self::add(&self.idle_us, idle * 1e6, first); }
+        self.waves.fetch_add(1, Ordering::Relaxed);
+    }
+    /// (mean round trip, mean idle gap) in microseconds, and the waves seen.
+    pub(crate) fn sample(&self) -> (u32, u32, u32) {
+        (self.round_trip_us.load(Ordering::Relaxed), self.idle_us.load(Ordering::Relaxed),
+            self.waves.load(Ordering::Relaxed))
+    }
+}
+
+/// Hysteresis over the idle signal at the prefill->decode boundary (#762):
+/// Sparks idle between units (gap above `IDLE_ADD` of a round trip) asks for
+/// one more wave; no gap (below `IDLE_DROP`) for `HOLD` boundaries in a row
+/// tries one fewer. One step at a time, within 1..=`max`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct WaveDepth { pub waves: usize, pub max: usize, quiet: u32 }
+
+impl WaveDepth {
+    pub(crate) const IDLE_ADD: f64 = 0.05;
+    pub(crate) const IDLE_DROP: f64 = 0.01;
+    pub(crate) const HOLD: u32 = 3;
+    pub(crate) fn new(waves: usize, max: usize) -> Self { Self { waves: waves.clamp(1, max.max(1)), max: max.max(1), quiet: 0 } }
+    /// One boundary's observation; returns the recommended wave count.
+    pub(crate) fn observe(&mut self, round_trip_us: u32, idle_us: u32) -> usize {
+        if round_trip_us == 0 { return self.waves; }
+        let share = f64::from(idle_us) / f64::from(round_trip_us);
+        if share > Self::IDLE_ADD {
+            self.quiet = 0;
+            self.waves = (self.waves + 1).min(self.max);
+        } else if share < Self::IDLE_DROP {
+            self.quiet += 1;
+            if self.quiet >= Self::HOLD {
+                self.quiet = 0;
+                self.waves = self.waves.saturating_sub(1).max(1);
+            }
+        } else { self.quiet = 0; }
+        self.waves
+    }
+}
+
 /// What the worker needs from the GPU and the transport; [`Native`] in
 /// serving, a fake in the CPU tests.
 pub(crate) trait Backend {
@@ -224,6 +288,8 @@ struct Inflight<W> {
     wave: W,
     posted: Instant,
     times: WaveTimes,
+    /// The Sparks' idle time before this post (None: the first wave of a burst).
+    idle: Option<f64>,
 }
 
 /// Idle passes the worker spins after progress before it may sleep (each
@@ -264,7 +330,7 @@ impl Pace {
 /// job once its staging is complete and its slot's planes are free, and
 /// progresses the oldest wave meanwhile. Returns the highest sequence sent.
 pub(crate) fn run_worker<B: Backend>(backend: &mut B, inbox: &mpsc::Receiver<Command>, timeout: Duration,
-    timing: bool) -> (Result<()>, Option<u32>) {
+    timing: bool, link: &LinkPace) -> (Result<()>, Option<u32>) {
     let mut queued = VecDeque::<Job>::new();
     let mut inflight = VecDeque::<Inflight<B::Wave>>::new();
     let mut highest: Option<u32> = None;
@@ -283,6 +349,9 @@ pub(crate) fn run_worker<B: Backend>(backend: &mut B, inbox: &mpsc::Receiver<Com
     // finish before that (its slot or stream waits for the landing), so its
     // wait is timed from the later of this and its send (the host runs ahead).
     let mut last_landed = Instant::now();
+    // When the Sparks went idle: the last wave landed with nothing else
+    // posted or ready to post. The next post closes the gap.
+    let mut idle_from: Option<Instant> = None;
     // Sleeps taken and seconds slept (the CPU the pacing saved).
     let mut sleeps = (0u64, 0.0f64);
     let result = (|| -> Result<()> {
@@ -316,9 +385,10 @@ pub(crate) fn run_worker<B: Backend>(backend: &mut B, inbox: &mpsc::Receiver<Com
                     let mut times = WaveTimes { staged: job.sent.elapsed().as_secs_f64(), ..Default::default() };
                     Pace::add(&mut pace.staging, job.sent.max(last_landed).elapsed().as_secs_f64());
                     let started = Instant::now();
+                    let idle = idle_from.take().map(|from| started.duration_since(from).as_secs_f64());
                     let wave = backend.post(job)?;
                     times.posted = started.elapsed().as_secs_f64();
-                    inflight.push_back(Inflight { sequence, slot, rows, wave, posted: Instant::now(), times });
+                    inflight.push_back(Inflight { sequence, slot, rows, wave, posted: Instant::now(), times, idle });
                     progressed = true;
                 }
             }
@@ -329,6 +399,9 @@ pub(crate) fn run_worker<B: Backend>(backend: &mut B, inbox: &mpsc::Receiver<Com
                     done.times.received = done.posted.elapsed().as_secs_f64();
                     Pace::add(&mut pace.round_trip, done.times.received);
                     last_landed = Instant::now();
+                    // A wave posted while another was in flight had no gap.
+                    link.record(done.times.received, Some(done.idle.unwrap_or(0.0)));
+                    if inflight.is_empty() { idle_from = Some(last_landed); }
                     backend.publish(done.sequence);
                     if timing {
                         tracing::info!(target: "cuteafd::timing", sequence = done.sequence, slot = done.slot,
@@ -579,6 +652,8 @@ pub(crate) struct Waves<'a> {
     outstanding: VecDeque<(u32, usize)>,
     /// The workers' installed grouping, fixed at bootstrap.
     grouping: Vec<cuteafd_transport::worker_selection::InstalledExpertGrouping>,
+    /// The worker's always-on round-trip and Spark idle means (#762).
+    pace: std::sync::Arc<LinkPace>,
 }
 
 impl<'a> Waves<'a> {
@@ -622,13 +697,15 @@ impl<'a> Waves<'a> {
         tracing::info!(waves, ranks = intake.ranks, landing = format!("{:#b}", intake.landing),
             staging_bytes = arenas.first().map_or(0, StagingArena::bytes), "Spark exchange worker started");
         let (jobs, inbox) = mpsc::channel();
+        let pace = std::sync::Arc::new(LinkPace::default());
+        let link_pace = pace.clone();
         let worker = std::thread::Builder::new().name("spark-exchange".into()).spawn(move || {
             // Short sleeps between a wave's post and its expected completion
             // must wake on time (see `SLEEP`).
             if let Err(error) = cuteafd_ffi::set_thread_timer_slack_ns(1_000) {
                 tracing::warn!("Spark exchange worker keeps the default timer slack: {error:#}");
             }
-            let (result, highest) = run_worker(&mut native, &inbox, timeout, timing);
+            let (result, highest) = run_worker(&mut native, &inbox, timeout, timing, &link_pace);
             if let Err(error) = &result {
                 cuteafd_transport::health::record_failure(format!("Spark exchange: {error:#}"));
                 tracing::error!(error = %format!("{error:#}"), "Spark exchange failed");
@@ -640,7 +717,7 @@ impl<'a> Waves<'a> {
         Ok(Self { library, jobs: Some(jobs), worker: Some(worker), _control: control, words, arenas, arena_alias, _landing_staging: landing_staging, landing_alias,
             landing: intake.landing, planes: intake.planes, layouts: vec![None; waves], unread: vec![false; waves],
             uses: vec![0; waves], ranks: intake.ranks, rows: intake.rows, row_bytes: intake.row_bytes, waves,
-            next_slot: intake.next_slot % waves, sequence: 0, outstanding: VecDeque::new(), grouping })
+            next_slot: intake.next_slot % waves, sequence: 0, outstanding: VecDeque::new(), grouping, pace })
     }
 
     /// The workers' installed expert grouping (from the bootstrap).
@@ -821,6 +898,9 @@ impl<'a> Waves<'a> {
 
 
     pub(crate) fn waves(&self) -> usize { self.waves }
+
+    /// The link's running means: (round trip us, Spark idle gap us, waves).
+    pub(crate) fn pace(&self) -> (u32, u32, u32) { self.pace.sample() }
 
     /// Stops the worker and returns the transport (after a failure, with its
     /// waves abandoned) and the slot its next wave lands in. Every sent wave

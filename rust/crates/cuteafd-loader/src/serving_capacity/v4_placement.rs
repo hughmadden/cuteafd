@@ -101,7 +101,7 @@ pub fn deepseek_v4_tp2_workspace(catalog: &crate::OfficialV41Catalog,
     let root = [parent.join("exl3").join(&stem), parent.join("../lib/exl3").join(&stem)]
         .into_iter().find(|p| p.join("rtx-tp2").is_dir())
         .ok_or_else(|| anyhow::anyhow!("missing {stem}/rtx-tp2 workspace manifests"))?;
-    let capacities = [1u64, 16, 80, 256, 1024, 4096];
+    let capacities = cuteafd_core::EXL3_CAPACITIES.map(u64::from);
     let compiled = capacities.into_iter().find(|&c| c >= max_rows.max(1))
         .ok_or_else(|| anyhow::anyhow!("TP2 expert capacity exceeds 4096 rows"))?;
     let manifests = capacities.into_iter().filter(|&c| c <= compiled).map(|c| {

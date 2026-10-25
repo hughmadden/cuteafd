@@ -5450,14 +5450,16 @@ Ideas TJ wants kept for later; not v2 work.
 
 Every family that sends experts to Sparks prefills the same way.
 
-- **Units:** the prompt runs as a continuous stream of row units, 2 units in
-  flight, each unit the family's largest supported size (TJ, 2026-10-24:
-  "2 × max size basically always wins"). The max is the family's expert-kernel
-  capacity, capped at 4096 rows (TJ, 2026-10-24: no larger units for now). Bigger units mean more rows per expert,
-  hence more reuse of each decoded weight and less per-wave overhead; GLM 5.3
-  measured 4096×2 about 18% over 2048×2 on 8K. If the default doesn't fit
-  (5090, tight pool), step down 4096 → 2048 → 1024 → 512; there is no
-  optimizing chooser.
+- **Units:** the prompt runs as a continuous stream of row units: a
+  planner-admitted maximum of k units in flight inside one 8192-row reserve
+  (TJ, 2026-10-25, #762), each unit reserve / k rows on its exact EXL3
+  capacity (k = 2/3/4 → 4096/2752/2048). k hides raptor's turnaround T behind
+  the Sparks' per-unit compute S: k = ⌈T/S⌉ + 1, at most 4; 3 at six Sparks,
+  2 below. A prompt that would cut units below half a unit runs on fewer
+  waves. `PREFILL_WAVES`/`PREFILL_ROWS` pin both (benchmarks, goldens). GLM
+  5.3 K4 max: 2 × 4096 2,769 / 2,723, 4 × 2048 3,296 / 3,209, 3 × 4096
+  (12,288 in flight) 3,511 / 3,597 tok/s 8K / 64K. If the default doesn't
+  fit (5090, tight pool), step down 4096 → 2048 → 1024 → 512.
 - **One transport, N waves:** each unit's expert wave goes out on one
   transport that admits N outstanding waves, each with its own return slot.
   The Spark side already pipelines (rings 8 deep, in order); only the
@@ -5474,8 +5476,8 @@ Every family that sends experts to Sparks prefills the same way.
   chunk boundaries, so the Sparks don't drain between units.
 - **Head:** logits only for the rows serving needs. Prefix snapshots happen at
   the unit boundary that carries the prompt or turn end.
-- **Admission:** N × unit rows × row-owned bytes, plus one unit of scratch,
-  plus N return slots, charged before allocation.
+- **Admission:** k × unit rows × row-owned bytes, plus one unit of scratch,
+  plus k return slots, charged before allocation.
 - **Why units and not windows inside a chunk:** per-row workspace dominates
   (V4.1 max: 8.0 / 5.8 GiB for 2 × 2048 rows, ~2 MiB/row). Lanes and windows
   cost the same memory for the same rows in flight. Units keep full-size
