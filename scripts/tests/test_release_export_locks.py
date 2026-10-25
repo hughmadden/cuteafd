@@ -374,3 +374,29 @@ def test_term_stops_the_export_before_releasing_locks(tmp_path):
     result = run_export(tmp_path, "bash -c 'kill -TERM \"$PPID\"'")
     assert result.returncode == 143, result.stderr
     assert (tmp_path / 'cleanup.log').read_text().strip() == 'rm -f housekeeping-export'
+
+
+def test_granting_hwlock_holds_the_lock_through_cmd_with_no_handoff(tmp_path):
+    """The process that ran the grant preflight still owns the flock inside
+    CMD (no release-and-reacquire gap), and a competing waiter cannot get in."""
+    lock = tmp_path / '.cache/cuteafd/gpu0.lock'
+    granter = tmp_path / 'granter'
+    holder = tmp_path / 'holder'
+    competitor = tmp_path / 'competitor'
+    probe = tmp_path / 'probe.py'
+    probe.write_text(f'''import os
+inode = os.stat({str(lock)!r}).st_ino
+pids = [line.split()[4] for line in open('/proc/locks')
+        if line.split()[1] == 'FLOCK' and line.split()[5].endswith(':' + str(inode))]
+open({str(holder)!r}, 'w').write(' '.join(pids))
+''')
+    hwlock = ROOT / 'scripts/hw/hwlock.py'
+    command = (f"bash -c 'python3 {probe}; CUTEAFD_LOCK_DIR={lock.parent} python3 {hwlock} --locks gpu0 --wait 1 -- true; "
+               f"echo $? >{competitor}'")
+    result = run_export(tmp_path, command, locks='gpu0', preflight=f'echo $PPID >{granter}')
+    assert result.returncode == 0, result.stderr
+    assert holder.read_text().split() == granter.read_text().split()
+    assert competitor.read_text().strip() == '75'
+    # Released afterwards.
+    with lock.open('w') as handle:
+        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
