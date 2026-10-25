@@ -50,7 +50,7 @@ TP2_OUTPUT_PROJECTION, TP2_DSPARK_EXPERTS. The former command-line spellings
 (--listen, --rtx-gpus, --concurrency, --kv-pool-size, --memory-reservation,
 --prefix-cache-entries, --dspark-draft-limit, --tp2-*, ...) are these keys.
 
-Optional RDMA tuning env values are forwarded to both roles only when set:
+Optional RDMA tuning env values reach both roles of every family only when set:
   CUTEAFD_PROTOCOL_V2_VERBS_HOST_DEVICE_MAP (local-ip=device,...),
   CUTEAFD_VERBS_APP_IB_PORT_NUM, CUTEAFD_PROTOCOL_V2_VERBS_HOST_EXECUTION_LANES.
 This is how a multi-homed six-rank launch pins the rail per host.

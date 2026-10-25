@@ -1652,6 +1652,7 @@ fi
 # none and serves text only.
 # Only snapshots shipping qualified MiMo audio opt into Spark-first auto.
 release_validate_verbs_device_map
+release_validate_verbs_tuning
 audio="$(release_resolve_audio_mode "$audio" "$snapshot")"
 # Auto/spark placement is resolved by the encoder plan below.
 # An explicit count or host list is exact. Unspecified means the entire inventory.
@@ -2976,18 +2977,25 @@ remove_failed_launch() {
 trap remove_failed_launch EXIT
 shared_coordinator_env_args
 shared_thermal_args
-# CUTEAFD_PROTOCOL_V2_VERBS_HOST_DEVICE_MAP (local-ip=device,...; each process picks the entry
-# for its own fabric address) reaches the coordinator and every worker when it is set. Without
-# it each opens its first RDMA device, which need not carry the fabric address (GB10 exposes
-# several RDMA functions per port).
+# The optional RDMA tuning (run.sh --help) reaches the coordinator and every worker when it is
+# set, as on DeepSeek V4.1. CUTEAFD_PROTOCOL_V2_VERBS_HOST_DEVICE_MAP (local-ip=device,...; each
+# process picks the entry for its own fabric address): without it each opens its first RDMA
+# device, which need not carry the fabric address (GB10 exposes several RDMA functions per
+# port). CUTEAFD_VERBS_APP_IB_PORT_NUM and CUTEAFD_PROTOCOL_V2_VERBS_HOST_EXECUTION_LANES are
+# whole numbers (release_validate_verbs_tuning).
 device_map="${CUTEAFD_PROTOCOL_V2_VERBS_HOST_DEVICE_MAP:-}"
-device_map_env="" device_map_args=()
+rdma_worker_env="" rdma_args=()
 if [[ -n "$device_map" ]]; then
   [[ "$device_map" =~ ^[A-Za-z0-9.:=,_-]+$ ]] ||
     { echo "CUTEAFD_PROTOCOL_V2_VERBS_HOST_DEVICE_MAP must be local-ip=device[,local-ip=device...]" >&2; exit 2; }
-  device_map_env="-e CUTEAFD_PROTOCOL_V2_VERBS_HOST_DEVICE_MAP=$device_map"
-  device_map_args=(-e "CUTEAFD_PROTOCOL_V2_VERBS_HOST_DEVICE_MAP=$device_map")
+  rdma_worker_env="-e CUTEAFD_PROTOCOL_V2_VERBS_HOST_DEVICE_MAP=$device_map"
+  rdma_args=(-e "CUTEAFD_PROTOCOL_V2_VERBS_HOST_DEVICE_MAP=$device_map")
 fi
+for rdma_name in CUTEAFD_VERBS_APP_IB_PORT_NUM CUTEAFD_PROTOCOL_V2_VERBS_HOST_EXECUTION_LANES; do
+  [[ -n "${!rdma_name:-}" ]] || continue
+  rdma_worker_env+="${rdma_worker_env:+ }-e $rdma_name=${!rdma_name}"
+  rdma_args+=(-e "$rdma_name=${!rdma_name}")
+done
 if [[ -n "$wip_slot" ]]; then
   # Stage the slot checked above into each Spark's serving layout (its old workers are gone).
   for ((rank = 0; rank < ranks; rank++)); do
@@ -3045,7 +3053,7 @@ for ((rank = 0; rank < ranks; rank++)); do
   ((${#spark_profile_wrapper[@]} == 0)) || worker_wrapper="$(printf '%q ' "${spark_profile_wrapper[@]}")"
   [[ -z "$(get PROFILE_DIR)" ]] || worker_prep="mkdir -p $(printf '%q' "$(get PROFILE_DIR)") && release_require_writable_state $(printf '%q' "$(get PROFILE_DIR)") && "
   ssh "$host" "$(declare -f release_serving_docker_args release_require_writable_state cuteafd_cdi_require cuteafd_cdi_gpu_args); release_serving_docker_args; cuteafd_cdi_gpu_args all || exit 2; ${worker_prep}docker run -d --name cuteafd-spark-expert-$host-$port --restart no \"\${CUTEAFD_CDI_ARGS[@]}\" --network host \
-    --ipc host --ulimit memlock=-1:-1 --device=/dev/infiniband \"\${RELEASE_SERVING_ARGS[@]}\" -e RUST_LOG=info $(printf '%q ' "${shared_worker_env_args[@]}")$spark_worker_env $wip_worker_args $device_map_env$worker_profile \
+    --ipc host --ulimit memlock=-1:-1 --device=/dev/infiniband \"\${RELEASE_SERVING_ARGS[@]}\" -e RUST_LOG=info $(printf '%q ' "${shared_worker_env_args[@]}")$spark_worker_env $wip_worker_args $rdma_worker_env$worker_profile \
     -v $(printf %q "$namespace_root:$namespace_root:ro") '$spark_image' \
     ${worker_wrapper}cuteafd expertd-native --snapshot '$snapshot' --native-lib /opt/cuteafd/lib/libcuteafd_native.so \
     --rank $rank --world $ranks --device-budget-bytes $budget $spark_worker_args \
@@ -3113,7 +3121,7 @@ docker run -d "${RELEASE_SERVING_ARGS[@]}" --name "$coordinator_name" --restart 
   --security-opt "seccomp=$repo_root/docker/seccomp-code-bench.json" \
   --ulimit memlock=-1:-1 --device=/dev/infiniband -e RUST_LOG=info "${shared_env_args[@]:0:4}" \
   "${bond_args[@]}" "${bench_nonce_env_args[@]}" "${tp2_env_args[@]}" "${graph_census_args[@]}" "${lane_env_args[@]}" "${thermal_args[@]}" \
-  "${shared_env_args[@]:4}" -e "CUTEAFD_IMAGE=$coordinator_image" "${wip_mount_args[@]}" "${device_map_args[@]}" \
+  "${shared_env_args[@]:4}" -e "CUTEAFD_IMAGE=$coordinator_image" "${wip_mount_args[@]}" "${rdma_args[@]}" \
   -v "$namespace_root:$namespace_root:ro" -v "$bench_dir:/run/cuteafd/bench" -v "$fidelity_cache:/run/cuteafd/fidelity" -e CUTEAFD_FIDELITY_CACHE=/run/cuteafd/fidelity \
   "${api_mount_args[@]}" "${chat_template_mounts[@]}" "${exlr8_mounts[@]}" "${trace_args[@]}" "${probe_args[@]}" ${profile_args[@]+"${profile_args[@]}"} ${profile_wrapper_args[@]+"${profile_wrapper_args[@]}"} "$coordinator_image" ${profile_wrapper[@]+"${profile_wrapper[@]}"} cuteafd "${coordinator_budget_args[@]}" $serve --snapshot "$snapshot" \
   --native-lib /opt/cuteafd/lib/libcuteafd_native.so "${peer_args[@]}" --listen "$addr" \

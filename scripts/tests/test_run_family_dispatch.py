@@ -3309,6 +3309,35 @@ def test_rdma_device_map_is_not_set_unless_given(tmp_path):
     assert "CUTEAFD_PROTOCOL_V2_VERBS_HOST_DEVICE_MAP" not in result.stderr
 
 
+@pytest.mark.parametrize("model_config,model,serve", [(_GLMF, "test/glmf", "cuteafd serve-glmf"),
+    ({"model_type": "minimax_m3_vl", "text_config": {"model_type": "minimax_m3", "num_hidden_layers": 60,
+      "moe_layer_freq": [0] * 3 + [1] * 57}}, "MiniMaxAI/MiniMax-M3.1-Flash", "cuteafd serve-minimax")])
+def test_rdma_tuning_reaches_both_roles_of_every_family_as_run_sh_documents(tmp_path, model_config, model, serve):
+    assert "reach both roles of every family only when set" in (ROOT / "run.sh").read_text()
+    keys = "VISION=off\nAUDIO=off\n" + ("SPARK_COUNT=2\nSPARK_1_HOST=h1\nSPARK_1_LANE_A=10.0.0.2\n" if "MiniMax" in model else "")
+    tuning = {"CUTEAFD_PROTOCOL_V2_VERBS_HOST_DEVICE_MAP": "10.0.0.1=rocep1s0f1",
+              "CUTEAFD_VERBS_APP_IB_PORT_NUM": "2", "CUTEAFD_PROTOCOL_V2_VERBS_HOST_EXECUTION_LANES": "3"}
+    result = _family_launch_result(tmp_path, model_config, model, keys, extra_env=tuning,
+                                   encoder_plan={"placement_supported": True, "fits": True, "spark_budget_bytes": 108 << 30})
+    assert result.returncode == 0, result.stderr
+    lines = result.stderr.splitlines()
+    workers = [line for line in lines if "docker run -d --name cuteafd-spark-expert-" in line]
+    coordinator = next(line for line in lines if serve in line)
+    assert workers
+    for name, value in tuning.items():
+        assert all(f"-e {name}={value}" in worker for worker in workers), workers
+        assert f"-e {name}={value}" in coordinator, coordinator
+    # Unset, nothing is forwarded; a value that is not a whole number stops the launch first.
+    unset = _family_launch_result(tmp_path / "unset", model_config, model, keys,
+        extra_env={name: "" for name in tuning}, encoder_plan={"placement_supported": True, "fits": True,
+                                                               "spark_budget_bytes": 108 << 30})
+    assert unset.returncode == 0 and not any(name in unset.stderr for name in tuning), unset.stderr
+    for name in ("CUTEAFD_VERBS_APP_IB_PORT_NUM", "CUTEAFD_PROTOCOL_V2_VERBS_HOST_EXECUTION_LANES"):
+        bad = _family_launch_result(tmp_path / name, model_config, model, keys, extra_env={name: "1; reboot"})
+        assert bad.returncode == 2 and f"{name} must be a whole number" in bad.stderr
+        assert not any(line.startswith(("docker ", "ssh ", "nest ")) for line in bad.stderr.splitlines())
+
+
 def test_invalid_rdma_device_map_fails_before_workers_launch(tmp_path):
     result = _family_launch_result(tmp_path, _GLMF, "test/glmf", "",
                                    extra_env={"CUTEAFD_PROTOCOL_V2_VERBS_HOST_DEVICE_MAP": "10.0.0.1=dev x"})

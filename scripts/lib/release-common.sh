@@ -1663,6 +1663,15 @@ release_validate_verbs_device_map() {
   done
 }
 
+# The numeric RDMA tuning values (run.sh --help), when set, are whole numbers: the
+# family launch splices them into each worker's remote command line.
+release_validate_verbs_tuning() {
+  local name
+  for name in CUTEAFD_VERBS_APP_IB_PORT_NUM CUTEAFD_PROTOCOL_V2_VERBS_HOST_EXECUTION_LANES; do
+    [[ -z "${!name:-}" || "${!name}" =~ ^[0-9]+$ ]] || release_die "$name must be a whole number, not ${!name}"
+  done
+}
+
 release_expert_hosts_csv() {
   local i lane separator=
   for ((i = 0; i < SPARK_COUNT; i++)); do
