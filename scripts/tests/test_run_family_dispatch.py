@@ -70,6 +70,35 @@ def test_exlr8_prefill_activations_reach_plan_coordinator_and_workers(tmp_path, 
             assert f"--exlr8-prefill-activations {activations}" in line
 
 
+@pytest.mark.parametrize("gpus", [1, 2])
+@pytest.mark.parametrize("onboard", [None, "auto", "0", "1"])
+def test_exlr8_onboarding_reaches_shared_admission_without_zero_override(tmp_path, gpus, onboard):
+    config = {"model_type": "glm_moe_dsa", "num_hidden_layers": 4, "first_k_dense_replace": 3}
+    keys = (f"EXLR8_MANIFEST=up1\nSPARK_COUNT=4\nRTX_GPUS={gpus}\n"
+            "SPECULATOR=off\nVISION=off\nAUDIO=off\nPOOL_TOKENS=auto\n")
+    if onboard is not None:
+        keys += f"RTX_EXPERT_LAYERS={onboard}\n"
+    result = _family_launch_result(tmp_path, config, "test/exlr8", keys)
+    assert result.returncode == 0, result.stderr
+    plans = [line for line in result.stderr.splitlines() if "cuteafd plan" in line]
+    coordinators = [line for line in result.stderr.splitlines() if "cuteafd serve-glm --snapshot" in line]
+    assert plans and coordinators, result.stderr
+    for line in plans:
+        argv = shlex.split(line)
+        if onboard in (None, "auto"):
+            assert "--rtx-expert-layers" not in argv
+        else:
+            assert argv[argv.index("--rtx-expert-layers") + 1] == onboard
+        assert argv[argv.index("--pool-tokens") + 1] == "0"
+    for line in coordinators:
+        argv = shlex.split(line)
+        if onboard is None:
+            assert "--rtx-expert-layers" not in argv
+        else:
+            assert argv[argv.index("--rtx-expert-layers") + 1] == onboard
+        assert "--pool-tokens" not in argv
+
+
 @pytest.mark.parametrize("keys,diagnostic", [
     ("EXLR8_MANIFEST=up1\nEXLR8_PREFILL_ACTIVATIONS=fp8\n", "EXLR8_PREFILL_ACTIVATIONS must be a16 or a8"),
     ("EXLR8_PREFILL_ACTIVATIONS=a8\n", "EXLR8_PREFILL_ACTIVATIONS requires EXLR8_MANIFEST"),
