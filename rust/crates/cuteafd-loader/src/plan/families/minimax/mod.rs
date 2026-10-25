@@ -292,7 +292,7 @@ impl FamilyModel for Model {
         (layer < self.cfg.layers).then_some(FfnActivation::SwigluOai {
             alpha: self.cfg.swiglu_alpha as f32, limit: self.cfg.swiglu_limit as f32 })
     }
-    fn spark_budget_bytes(&self) -> u64 { placement::SPARK_BUDGET_BYTES }
+    fn spark_budget_bytes(&self) -> u64 { admission::SPARK_BUDGET_BYTES }
     fn cache_geometry(&self, options: crate::serving_capacity::CacheOptions)
         -> Result<Option<crate::serving_capacity::FamilyCacheGeometry>, crate::serving_capacity::CacheGeometryError> {
         if options.coordinator_ranks != 1 || options.attention_placement

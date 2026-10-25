@@ -23,7 +23,7 @@ pub(crate) struct ServeArgs {
     device: i32,
     #[arg(long, value_delimiter = ',')]
     peers: Vec<SocketAddr>,
-    #[arg(long, default_value_t = 108 << 30)]
+    #[arg(long, default_value_t = cuteafd_loader::plan::families::minimax::admission::SPARK_BUDGET_BYTES)]
     spark_budget_bytes: u64,
     #[arg(long)]
     pool_tokens: Option<u64>,
