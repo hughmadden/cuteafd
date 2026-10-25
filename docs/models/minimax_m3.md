@@ -46,12 +46,17 @@ Status: **under qualification**. `serve-minimax` serves the release from a
   the `dynamic_res` pinpoints are inactive, so large images shrink and never
   tile); video samples 1 fps and attends in segments of 4 temporal patches
   (8 frames). See [Vision](#vision).
-- Speculator: the bundled DSpark drafter (5 dense sliding-4096 layers, blocks
-  of 7, Markov rank 256, confidence head; taps 3/17/31/45/59), or
-  `RadixArk/Minimax-M3.1-Flash-Dflash2` (revision `923bf1d4b567d5ccb71b0488c6e61b5e4794e92a`,
-  `--speculator dflash2 --draft SNAPSHOT`) on the shared DFlash2 drafter: 5 Gemma-norm
-  sliding-4096 layers, 64 query / 4 KV heads, NeoX RoPE on 64 channels, SwiGLU-OAI, blocks of
-  an anchor and 7 drafts, the same taps; it borrows the target's embedding and BF16 head.
+- Speculator: DFlash2 by default, with
+  [RadixArk/Minimax-M3.1-Flash-Dflash2](https://huggingface.co/RadixArk/Minimax-M3.1-Flash-Dflash2/tree/923bf1d4b567d5ccb71b0488c6e61b5e4794e92a)
+  at revision `923bf1d4b567d5ccb71b0488c6e61b5e4794e92a` (`--speculator dflash2 --draft SNAPSHOT`)
+  on the shared DFlash2 drafter: 5 Gemma-norm sliding-4096 layers, 64 query / 4 KV heads, NeoX
+  RoPE on 64 channels, SwiGLU-OAI, blocks of an anchor and 7 drafts, taps 3/17/31/45/59; it
+  borrows the target's embedding and BF16 head. Its model card states no license, so cuteafd
+  does not distribute these weights: download them from
+  [that page](https://huggingface.co/RadixArk/Minimax-M3.1-Flash-Dflash2) (the launcher stops
+  and says so when they are missing). The DSpark drafter bundled with the official release
+  (5 dense sliding-4096 layers, blocks of 7, Markov rank 256, confidence head, the same taps)
+  remains available with `SPECULATOR=dspark`, and `SPECULATOR=off` serves without one.
 
 ## Serving behaviour
 
@@ -65,7 +70,8 @@ Status: **under qualification**. `serve-minimax` serves the release from a
   returned as text; other tools are read best effort, as vLLM's `minimax_m3`
   parser does (values coerce to the declared type when they parse, a repeated
   parameter becomes a list).
-- DFlash2 (`SPECULATOR=dflash2`, `SPECULATOR_MODEL_ID` defaults to the RadixArk draft) taps
+- DFlash2 (the launcher's default speculator; `SPECULATOR_MODEL_ID` and
+  `SPECULATOR_MODEL_REVISION` default to the RadixArk draft at its pinned revision) taps
   the FP32 residual's last 4096 rows of every step into the shared drafter's ring, on the
   target's stream (the decode recordings carry the taps). Its block attends as SGLang serves the
   release: a per-row 4096 window and causal block rows (no `is_causal` in the config). The
