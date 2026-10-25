@@ -80,7 +80,7 @@ pub fn wait_policy() -> WaitPolicy { POLICY.get().copied().unwrap_or_default() }
 /// How long a critical-path wait under [`HostWait::Block`] polls before it
 /// starts sleeping. Most per-layer waits (a router, a Spark reply) complete
 /// within this, so they never pay a sleep's wake-up; longer ones sleep.
-pub const BLOCK_SPIN: Duration = Duration::from_micros(50);
+pub const BLOCK_SPIN: Duration = Duration::from_micros(250);
 /// One sleep of a critical-path wait past [`BLOCK_SPIN`].
 pub const BLOCK_SLEEP: Duration = Duration::from_micros(20);
 

@@ -45,7 +45,7 @@ pub(crate) struct Cli {
     #[arg(long, global = true, aliases = ["rtx-budget-gib", "rtx-gib"])]
     pub(crate) coordinator_gpu_budget_gib: Option<f64>,
     /// How host threads wait while serving: `block` (default: each
-    /// critical-path wait spins 50 us, then sleeps; the Spark exchange worker
+    /// critical-path wait spins 250 us, then sleeps; the Spark exchange worker
     /// paces its polling; a less loaded machine) or `spin` (spins throughout,
     /// one busy core per waiting thread). Spark workers read it too.
     #[arg(long, global = true, env = "CUTEAFD_HOST_WAIT", default_value = "block")]
