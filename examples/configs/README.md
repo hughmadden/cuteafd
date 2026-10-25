@@ -85,10 +85,11 @@ layers on the RTX.
 
 The 5090 TP2 example limits live prefill to 1024 rows to leave space for
 onboarded experts; the other examples use 4096. Native exports retain their
-4096-row capacity. Speculation is off (`SPECULATOR=dspark` runs the bundled
-drafter, `SPECULATOR=dflash2` the RadixArk/Minimax-M3.1-Flash-Dflash2 draft on the
-shared drafter), expert loading uses mounted checkpoints, and two-GPU head splits
-are refused.
+4096-row capacity. Speculation is DFlash2 by default, with the
+RadixArk/Minimax-M3.1-Flash-Dflash2 draft on the shared drafter, which cuteafd does
+not distribute: download it beside the release. `SPECULATOR=dspark` runs the
+release's bundled drafter and `SPECULATOR=off` none. Expert loading uses mounted
+checkpoints, and two-GPU head splits are refused.
 
 ## TP x EP layout examples (DeepSeek V4.1)
 
