@@ -907,6 +907,31 @@ class PackageProfileTests(unittest.TestCase):
         for capacity in (1, 16, 80, 256, 1024, 4096):
             self.assertFalse(f('v41', 'spark', 512, capacity) or f('dsv4p', 'coordinator', 768, capacity))
 
+    def test_glm_spark_width640_widens_only_qualified_fc2_tiles(self):
+        for capacity in (1024, 2048, 2752, 4096):
+            self.assertEqual(package.ws_tile('glm', 'spark', 640, capacity),
+                             package.TILE_RTX_MIXED)
+            self.assertTrue(package.wire_input('glm', 'spark', 640, capacity))
+            self.assertEqual(package.ws_input_stages('glm', 'spark', 640, capacity), 3)
+            self.assertTrue(package.ws_dynamic_tiles('glm', 'spark', 640, capacity))
+            self.assertEqual(package.ws_route_block('glm', 'spark', 640, capacity), 64)
+        for capacity in (1, 80, 256, 512, 1536, 8192):
+            self.assertIsNone(package.ws_tile('glm', 'spark', 640, capacity))
+        for geometry in ('glmf', 'v41', 'qwen4', 'dsv4p'):
+            self.assertIsNone(package.ws_tile(geometry, 'spark', 640, 2048))
+        self.assertIsNone(package.ws_tile('glm', 'coordinator', 640, 2048))
+        self.assertIsNone(package.ws_tile('glm', 'spark', 640, 2048, compact=True))
+        with tempfile.TemporaryDirectory() as temporary:
+            _, _, calls, _ = self.build_fixture(
+                Path(temporary), 'spark', (4, 5), geometry='glm',
+                capacities=(1024, 2048, 2752, 4096), profiles=('tp3-width640',))
+            for call in calls:
+                self.assertEqual(call.kwargs['tile'], package.TILE_RTX_MIXED)
+                self.assertTrue(call.kwargs['wire_input'])
+                self.assertTrue(call.kwargs['ws_dynamic_tiles'])
+                self.assertEqual(call.kwargs['ws_input_stages'], 3)
+                self.assertEqual(call.kwargs['route_block'], 64)
+
     def test_warp_specialized_spark_prefill_policy_is_unchanged(self):
         """Existing Spark widths retain WS; unrelated coordinator families do not."""
         w = package.warp_specialized

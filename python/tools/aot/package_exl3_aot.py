@@ -840,6 +840,10 @@ def ws_tile(geometry: str, role: str, width: int, capacity: int, *,
     if role == 'coordinator':
         cell = coordinator_ws_cell(geometry, role, width, capacity)
         return cell.get('tile') if cell else None
+    # GB10 w640: FC2 N256 wins 2.2-5.0% at m1024..m4096; FC1 stays N128.
+    if ((geometry, role, width) == ('glm', 'spark', 640)
+            and capacity in (1024, 2048, 2752, 4096)):
+        return TILE_RTX_MIXED
     if (geometry != 'glm' or not warp_specialized(geometry, role, width, capacity)
             or width % 256 != 128 or width % 192):
         return None
