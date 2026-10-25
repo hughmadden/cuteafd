@@ -45,9 +45,17 @@ impl EngramGatherTicket {
     pub fn cancel(&mut self) {
         self.0.cancel();
     }
+    /// Sleep until completion without retaining a request-bank borrow.
+    pub async fn wait(&mut self) -> Result<EngramGatherPoll> {
+        Self::result(self.0.wait().await)
+    }
     /// Nonblocking polling for a CUDA or scheduler thread; consume at most once.
     pub fn poll(&mut self) -> Result<EngramGatherPoll> {
-        match self.0.poll() {
+        Self::result(self.0.poll())
+    }
+    fn result(result: std::result::Result<GatherPoll<GatherLease<EngramBatchStaging, EngramGatherJob>>,
+        GatherFailure<anyhow::Error>>) -> Result<EngramGatherPoll> {
+        match result {
             Ok(GatherPoll::Pending) => Ok(EngramGatherPoll::Pending),
             Ok(GatherPoll::Cancelled) => Ok(EngramGatherPoll::Cancelled),
             Ok(GatherPoll::Ready(lease)) => Ok(EngramGatherPoll::Ready(EngramGatherLease(lease))),
@@ -95,6 +103,19 @@ impl EngramGatherer {
         batches: &[Arc<EngramBatch>],
         layer: usize,
     ) -> Result<Option<EngramGatherTicket>> {
+        let job = self.job(table, batches, layer)?;
+        let timed = tracing::enabled!(target: "cuteafd::timing", tracing::Level::DEBUG);
+        Ok(self.worker.try_submit(job, timed)?.map(EngramGatherTicket))
+    }
+    /// Retain the immutable job while sleeping for bounded staging admission.
+    pub async fn submit(&self, table: Arc<EngramTable>, batches: &[Arc<EngramBatch>],
+        layer: usize) -> Result<EngramGatherTicket> {
+        let job = self.job(table, batches, layer)?;
+        let timed = tracing::enabled!(target: "cuteafd::timing", tracing::Level::DEBUG);
+        Ok(EngramGatherTicket(self.worker.submit(job, timed).await?))
+    }
+    fn job(&self, table: Arc<EngramTable>, batches: &[Arc<EngramBatch>],
+        layer: usize) -> Result<EngramGatherJob> {
         ensure!(
             !batches.is_empty() && batches.len() <= 16,
             "invalid engram request batch count"
@@ -111,8 +132,6 @@ impl EngramGatherer {
             table.weights().rows() == *ENGRAM_ROWS.get(layer).context("invalid engram layer")?,
             "engram gather table belongs to another layer"
         );
-        let timed = tracing::enabled!(target: "cuteafd::timing", tracing::Level::DEBUG);
-        let job = EngramGatherJob { table, layer, batches: batches.to_vec() };
-        Ok(self.worker.try_submit(job, timed)?.map(EngramGatherTicket))
+        Ok(EngramGatherJob { table, layer, batches: batches.to_vec() })
     }
 }
