@@ -459,6 +459,26 @@ def coordinator_ws_cell(geometry: str, role: str, width: int, capacity: int) -> 
     return COORDINATOR_WS_CELLS.get((geometry, width, capacity))
 
 
+# Ordinary GB10 prefill cells qualified against shipped family controls (#762).
+SPARK_WS_CELLS = {
+    ('qwen4', 640): dict(dynamic=False, tile=(64, 128, 64, 128)),
+    ('qwen4', 384): dict(dynamic=True, tile=(64, 192, 64, 256)),
+    ('qwen4', 256): dict(dynamic=False, tile=(64, 256, 64, 256)),
+    ('qwen4', 128): dict(dynamic=True, tile=(64, 128, 64, 256)),
+    ('v41', 1152): dict(dynamic=True, tile=(64, 192, 64, 256)),
+    ('v41', 768): dict(dynamic=True, tile=(64, 256, 64, 256)),
+    ('v41', 640): dict(dynamic=True, tile=(64, 128, 64, 256)),
+    ('v41', 512): dict(dynamic=True, tile=(64, 256, 64, 256)),
+    ('v41', 384): dict(dynamic=True, tile=(64, 192, 64, 256)),
+}
+
+
+def spark_ws_cell(geometry: str, role: str, width: int, capacity: int) -> dict | None:
+    if role != 'spark' or capacity not in (2048, 2752):
+        return None
+    return SPARK_WS_CELLS.get((geometry, width))
+
+
 def ws_route_block(geometry: str, role: str, width: int, capacity: int) -> int:
     """Packed-route M block of a warp-specialized prefill export (see
     `warp_specialized`); every cell whose measured arm split the block by
@@ -535,6 +555,8 @@ def warp_specialized(geometry: str, role: str, width: int, capacity: int) -> boo
         return coordinator_ws_cell(geometry, role, width, capacity) is not None
     if role != 'spark':
         return False
+    if spark_ws_cell(geometry, role, width, capacity) is not None:
+        return True
     if geometry == 'kimik3':
         # Qualified ordinary TP6 slices; compact ownership and smaller packages stay off.
         return width == 512 and capacity >= 1024
@@ -824,6 +846,8 @@ def ws_dynamic_tiles(geometry: str, role: str, width: int, capacity: int, *,
     if role == 'coordinator':
         cell = coordinator_ws_cell(geometry, role, width, capacity)
         return bool(cell and cell.get('dynamic'))
+    if (cell := spark_ws_cell(geometry, role, width, capacity)) is not None:
+        return cell['dynamic']
     if (role == 'spark' and capacity in (2048, 2752)
             and ((geometry == 'glm' and width in (384, 640))
                  or (geometry == 'glmf' and width in (256, 384, 512, 640, 768, 1024)))):
@@ -846,6 +870,8 @@ def ws_tile(geometry: str, role: str, width: int, capacity: int, *,
     if role == 'coordinator':
         cell = coordinator_ws_cell(geometry, role, width, capacity)
         return cell.get('tile') if cell else None
+    if (cell := spark_ws_cell(geometry, role, width, capacity)) is not None:
+        return cell['tile']
     if ((geometry, role, width) == ('glmf', 'spark', 384)
             and capacity in (2048, 2752)):
         return TILE_384
@@ -1305,7 +1331,8 @@ def build(args: argparse.Namespace) -> None:
                 if ws:
                     block = (compact_block if compact_block is not None
                              else ws_route_block(geometry, args.role, width, capacity))
-                    if geometry == 'kimik3' or args.role == 'coordinator':
+                    if (geometry == 'kimik3' or args.role == 'coordinator'
+                            or (not compact and geometry in ('qwen4', 'v41'))):
                         # Existing policy-keyed directories contain cooperative exports.
                         # The input format and claim mode are part of the compiled
                         # program, so they name its cache directory.
