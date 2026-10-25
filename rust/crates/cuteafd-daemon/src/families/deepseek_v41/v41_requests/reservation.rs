@@ -74,12 +74,16 @@ impl Requests<'_> {
             Ok(cache) => cache,
             Err(error) => { engram.cancel(); return Err(error); }
         };
+        let variants = match self.row_variants(&cache, requests.iter().map(|r| r.lease)) {
+            Ok(variants) => variants,
+            Err(error) => { engram.cancel(); return Err(error); }
+        };
         for (r, next) in requests.iter().zip(advanced) {
             self.slots.iter_mut().flatten().find(|live| live.lease == r.lease)
                 .expect("validated encoder request").prefill = Some(next);
         }
         Ok(RequestBatch { cache, prepared, engram: Some(engram),
-            leases: requests.iter().map(|r| r.lease).collect(), tokens, image_mask: mask, finished: false })
+            leases: requests.iter().map(|r| r.lease).collect(), tokens, image_mask: mask, variants, finished: false })
     }
 }
 

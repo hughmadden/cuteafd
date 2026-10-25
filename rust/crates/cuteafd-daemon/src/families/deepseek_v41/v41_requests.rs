@@ -23,6 +23,8 @@ struct Request {
     history: EngramHistory,
     prefill: Option<EngramPrefillCursor>,
     images: RequestImages,
+    /// Weight variant (contract §1): 0 is base.
+    variant: u8,
 }
 /// A request's part of a prefix snapshot besides its device mark: the backbone's frontiers and
 /// the Engram lookback, as plain data.
@@ -46,9 +48,14 @@ pub(crate) struct RequestBatch {
     leases: Vec<CacheLease>,
     tokens: Vec<u32>,
     image_mask: Vec<u8>,
+    /// Each row's weight variant, in the batch's row order (positions, expert rows).
+    variants: Vec<u8>,
     finished: bool,
 }
 impl RequestBatch {
+    pub fn variant_rows(&self) -> &[u8] {
+        &self.variants
+    }
     pub fn cache(&self) -> Result<&CacheBatch> {
         ensure!(!self.finished, "request batch finished");
         Ok(&self.cache)
@@ -145,8 +152,20 @@ impl<'a> Requests<'a> {
         );
         let history = self.pipeline.new_history()?;
         let lease = self.cache.begin_request(slot, id)?;
-        self.slots[slot] = Some(Request { lease, history, prefill: None, images: RequestImages::default() });
+        self.slots[slot] = Some(Request { lease, history, prefill: None, images: RequestImages::default(), variant: 0 });
         Ok(lease)
+    }
+    /// Serve the admitted request `lease` with weight variant `variant` (before its first batch).
+    pub fn set_variant(&mut self, lease: CacheLease, variant: u8) -> Result<()> {
+        let slot = lease_slot(&self.slots, lease)?;
+        self.slots[slot].as_mut().context("request history missing")?.variant = variant;
+        Ok(())
+    }
+    /// Per-row variants in the order of `cache.expert_rows()` (the block's token order).
+    fn row_variants(&self, cache: &CacheBatch, leases: impl IntoIterator<Item = CacheLease>) -> Result<Vec<u8>> {
+        let requests = leases.into_iter().map(|lease| Ok((self.cache.request_id(lease)?, self.request(lease)?.variant)))
+            .collect::<Result<Vec<_>>>()?;
+        crate::families::deepseek_v41::v41_variants::variant_rows(&cache.expert_rows(), &requests)
     }
     pub fn attach_images(&mut self, lease: CacheLease, images: RequestImages) -> Result<()> {
         let request = self.request(lease)?;
@@ -403,8 +422,9 @@ impl<'a> Requests<'a> {
                 offset += chunk.tokens as usize;
             }
         }
+        let variants = self.row_variants(&cache, work.iter().map(|w| w.lease))?;
         let batch = RequestBatch { cache, prepared: Vec::new(), engram: None, leases: work.iter().map(|w| w.lease).collect(),
-            tokens: Vec::new(), image_mask, finished: false };
+            tokens: Vec::new(), image_mask, variants, finished: false };
         self.validate(&batch)?;
         Ok(batch)
     }
@@ -446,6 +466,7 @@ impl<'a> Requests<'a> {
             tokens.extend_from_slice(r.tokens);
             mask.extend((0..r.tokens.len()).map(|i| u8::from(image_mask.is_some_and(|m| m[i]))));
         }
+        let variants = self.row_variants(&cache, requests.iter().map(|r| r.lease))?;
         let mut engram = self.pipeline.prepare(&inputs)?;
         engram.set_decode(requests.iter().any(|r| r.kind != ExpertV2SourceKind::Prefill));
         Ok(RequestBatch {
@@ -455,6 +476,7 @@ impl<'a> Requests<'a> {
             leases: requests.iter().map(|r| r.lease).collect(),
             tokens,
             image_mask: mask,
+            variants,
             finished: false,
         })
     }
@@ -490,6 +512,7 @@ impl<'a> Requests<'a> {
         lane: &mut BackboneLane<'_, '_>,
     ) -> Result<()> {
         self.validate(batch)?;
+        lane.set_variant_rows(&batch.variants)?;
         let positions = batch.cache.positions();
         let embedded = if batch.image_mask.iter().all(|&b| b == 0) {
             embedding.execute(&batch.tokens, &positions)?

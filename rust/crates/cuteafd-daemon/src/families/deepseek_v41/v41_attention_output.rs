@@ -692,6 +692,15 @@ mod tp2_tests {
 }
 
 #[cfg(test)]
+impl AttentionOutputWave<'_, '_> {
+    /// Test access to the `wo_b` input (BF16 `[rows, 8192]`) and output (BF16 `[rows, 5120]`) and the stream.
+    pub(crate) fn wo_b_buffers(&self, rows: usize) -> ([CuteafdDeviceBuffer; 2], *mut std::ffi::c_void) {
+        ([CuteafdDeviceBuffer { bytes: rows * ROW_BYTES[1], ..self.b(1) },
+            CuteafdDeviceBuffer { bytes: rows * ROW_BYTES[2], ..self.b(2) }], self.stream.raw)
+    }
+}
+
+#[cfg(test)]
 impl AttentionOutputWeights<'_> {
     pub(crate) fn visit(&self, prefix: &str, f: &mut dyn FnMut(String, cuteafd_ffi::CuteafdDeviceBuffer)) {
         self.tensors.visit(prefix, f);

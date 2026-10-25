@@ -490,6 +490,7 @@ impl<'w, 'a> TargetPass<'w, 'a> {
             self.resources.taps.begin(guard.batch.cache()?)?;
         }
         self.resources.execution.restart_for(stage);
+        self.resources.lane.set_variant_rows(guard.batch.variant_rows())?;
         if stage == CacheStage::Replay {
             let encoder = encoder.context("missing retained encoder suffix")?;
             ensure!(encoder.tokens == guard.batch.cache()?.positions(), "encoder suffix/replay row order differs");

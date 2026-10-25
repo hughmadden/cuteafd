@@ -44,7 +44,7 @@ mod tests {
     use super::*;
 
     fn job(events: mpsc::UnboundedSender<Event>) -> NativeRequest {
-        NativeRequest {
+        NativeRequest { variant: 0,
             prefix_cache_source: Default::default(), literal_spans: Vec::new(), prompt: "queued".into(), constraint: None, images: vec![], media: Vec::new(), audio: Vec::new(), max_tokens: 1,
             sampling: Default::default(), stop_token_ids: vec![], events, usage: None, probe: None,
         }

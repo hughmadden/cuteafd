@@ -92,6 +92,7 @@ impl<'a> BackboneLaneWeights<'a> {
             placement,
             split_query_b,
             split_output_b,
+            steer: Vec::new(),
         })
     }
 }
@@ -107,6 +108,8 @@ impl<'w, 'a> BackboneLane<'w, 'a> {
         budgets:[usize;2])->Result<()> {
         ensure!(self.weights.split_output_b && self.tp2_output.is_none(),"output split configuration differs");
         let owner=self.projection.input().device_id as usize;
+        // The TP2 FFN bank captures every row count: the steering node must not depend on the batch.
+        if let Some(steer)=self.block.steer_mut() { steer.capture_every_shape(); }
         self.tp2_output=Some(crate::families::deepseek_v41::v41_projection_tp2::Wave::new(weights,self.capacity as u32,owner,budgets)?);
         Ok(())
     }
