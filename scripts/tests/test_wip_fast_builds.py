@@ -128,11 +128,11 @@ def test_finalize_records_key_and_phases(tmp_path):
     values = dict(wip_instance='i', wip_root='', wip_build_key=KEY, slot='s', role='coordinator', image='img',
                   image_id='id', source_manifest_sha256='s', artifact_sha256='a', sparkinfer_revision='r',
                   transformers_revision='t', transformers_source_digest='d', build_output=str(output),
-                  incoming=str(incoming))
+                  incoming=str(incoming), image_content='')
     prefix = ''.join(f'{k}={v!r}\n' for k, v in values.items())
     subprocess.run(['bash', '-c', 'set -euo pipefail\n' + prefix + block], check=True)
     meta = json.loads((incoming / 'META.json').read_text())
-    assert meta['build_key'] == KEY
+    assert meta['build_key'] == KEY and 'base_image_content_sha256' not in meta
     assert [(p['phase'], p['seconds']) for p in meta['build_phases']] == [('rust', 12), ('native', 3)]
 
 

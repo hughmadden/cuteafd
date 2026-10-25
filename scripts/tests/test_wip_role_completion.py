@@ -56,7 +56,12 @@ def test_wip_audio_opt_in_is_validated_before_operations_and_forwarded(value):
                'sync_local_source() { :; }; sync_seed_source() { :; }\n'
                'docker() { printf "docker %s\\n" "$*"; }\n'
                'ssh() { printf "ssh %s\\n" "$*"; }\n'
-               'timeout() { shift 2; "$@"; }\n' + helpers + 'native_store_has() { return 1; }\n' + coordinator + '\n' + expert + '\n'
+               'timeout() { shift 2; "$@"; }\n'
+               # Identified at top level: the coordinator's image ID matches, the expert's does not.
+               "wip_coordinator_image_id='docker image inspect -f {{.Id}} fixture'\n"
+               f"wip_coordinator_image_content={7:064d}\n"
+               f"wip_expert_image_id=other wip_expert_image_content={8:064d}\n"
+               + helpers + 'native_store_has() { return 1; }\n' + coordinator + '\n' + expert + '\n'
                'build_coordinator\nbuild_expert\n')
     result = subprocess.run(['bash', '-c', command], env=env, capture_output=True, text=True, timeout=10)
     if value not in (None, 'ON', 'OFF'):
@@ -65,6 +70,10 @@ def test_wip_audio_opt_in_is_validated_before_operations_and_forwarded(value):
         assert 'docker' not in result.stdout and 'ssh' not in result.stdout
         return
     assert result.returncode == 0, result.stderr
+    finalizers = [line for line in result.stdout.splitlines() if 'finalize-wip-slot.sh' in line]
+    assert len(finalizers) == 2
+    assert f'CUTEAFD_WIP_DEV_IMAGE_CONTENT={7:064d}' in finalizers[0]
+    assert 'CUTEAFD_WIP_DEV_IMAGE_CONTENT= ' in finalizers[1] and f'{8:064d}' not in finalizers[1]
     builds = [line for line in result.stdout.splitlines() if '/build-wip-artifacts.sh' in line]
     # Both roles run Cargo, then the native phase (which a native-cache hit restores).
     assert len(builds) == 4
@@ -312,8 +321,28 @@ def test_finalizer_retains_checked_programs_and_frozen_transformers_identity(tmp
     meta = json.loads((frozen / 'META.json').read_text())
     assert meta['transformers_revision'] == 'a' * 40
     assert meta['transformers_source_sha256'] == module.source_tree_sha256(transformers)
+    assert 'base_image_content_sha256' not in meta  # an older caller passes no content identity
+    content = {**os.environ, 'CUTEAFD_WIP_DEV_IMAGE_CONTENT': 'c' * 64}
+    result = subprocess.run(command, env=content, capture_output=True, text=True, timeout=10)
+    assert result.returncode == 0, result.stderr
+    assert json.loads((frozen / 'META.json').read_text())['base_image_content_sha256'] == 'c' * 64
+    bad = subprocess.run(command, env={**content, 'CUTEAFD_WIP_DEV_IMAGE_CONTENT': 'sha256:' + 'c' * 64},
+                         capture_output=True, text=True, timeout=10)
+    assert bad.returncode == 2 and 'invalid CUTEAFD_WIP_DEV_IMAGE_CONTENT' in bad.stderr
     (output / 'PROGRAMS.json').write_text('corrupted')
     assert subprocess.run(command, capture_output=True, text=True).returncode != 0
+
+
+def test_wip_seals_the_dev_image_content_it_built_with():
+    script = (ROOT / 'wip.sh').read_text()
+    top = script.index('wip_coordinator_image_content="$(docker image inspect "$wip_coordinator_image_id" |')
+    assert script.index('distribute_spark_dev_image\n') < top < script.index('build_coordinator() {')
+    assert script.count('python3 "$repo_root/scripts/lib/dev_image_content.py"') == 2
+    for role, ident in (('build_coordinator() {', 'wip_coordinator_image'), ('build_expert() (', 'wip_expert_image')):
+        body = script.split(role, 1)[1]
+        body = body[:body.index('finalize-wip-slot.sh')]
+        assert f'[[ "$image_id" != "${{{ident}_id:-}}" ]] || image_content="${{{ident}_content:-}}"' in body
+        assert 'CUTEAFD_WIP_DEV_IMAGE_CONTENT=$image_content' in body
 
 
 def test_wip_verifies_transformers_before_both_role_builds_and_frozen_source(tmp_path):
