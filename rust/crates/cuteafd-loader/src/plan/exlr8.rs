@@ -127,8 +127,8 @@ pub fn native_plan(snapshot: &Path, selected: &str,
     ensure!(!resolved_layout.host_embedding, "EXLR8 requires GPU embedding");
     let checkpoint = super::Checkpoint::open(snapshot)?;
     let mut report = super::empty_report(&checkpoint, options)?;
-    let rows = if resolved_layout.prefill_rows == 0 { 4096 } else { resolved_layout.prefill_rows };
-    super::layout::glm5::resolve_prefill(&mut report, &mut resolved_layout, rows, world);
+    super::layout::resolve_prefill(&mut report, &mut resolved_layout, world,
+        crate::serving_capacity::prefill_waves::PrefillLimits::default())?;
     let layout = &resolved_layout;
     let cfg = crate::families::glm5::GlmDsaConfig::from_hf(&checkpoint.config)?;
     ensure!(cfg.hidden == 6144 && cfg.layers == 78 && cfg.first_moe_layer == 3,

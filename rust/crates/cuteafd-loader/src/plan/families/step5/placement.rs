@@ -59,7 +59,8 @@ pub(super) fn layout(
         Unqualified("coordinator-local routed experts")
     );
     let shape = crate::plan::layout::resolve_prefill(report, opts, spark_ranks,
-        crate::serving_capacity::prefill_waves::PrefillLimits::default())?;
+        crate::serving_capacity::prefill_waves::PrefillLimits::default()
+            .with_shared_fp8_scratch(input.expert_catalog()?.fp8().is_some()))?;
     let checked_rows = usize::try_from(shape.unit_rows)?;
     let waves = usize::try_from(shape.waves)?;
 
@@ -187,7 +188,6 @@ pub(super) fn layout(
         startup: vec![],
     };
     let admitted = admission::forecast_mtp(input.checkpoint(), &inputs, opts.native_mtp_layers)?;
-    let rows = inputs.rows;
     report.attention_placement = admitted.placement.attention_placement;
     report.bytes_by_owner.clear();
     report.bytes_by_owner.insert(
@@ -243,9 +243,10 @@ pub(super) fn layout(
         spark_ranks,
         prefill_lanes: 1,
     };
+    let capacity = u32::try_from(shape.unit_rows)?;
     let endpoints = (0..admitted.ownership.routed_endpoints()?)
         .map(|_| cuteafd_core::SparkEndpoint { ring_depth: None,
-            capacity: u32::try_from(rows).unwrap_or(u32::MAX),
+            capacity,
             ingress: cuteafd_core::SparkIngress::Bf16
         })
         .collect::<Vec<_>>();
@@ -316,6 +317,11 @@ pub(super) fn layout(
                 Basis::Formula,
             ));
         }
+        // Unlike the legacy family wave allowances, Step-5 has no first-slot scratch reserve.
+        let slots = crate::plan::layout::spark_execution_slots("step5", shape.waves, opts.decode_lanes)?;
+        let slot_bytes = crate::plan::layout::spark_slots::native_slot_bytes(input, "step5", &working,
+            rank, shape.unit_rows)?.context("Step-5 requires native Spark slot sizing")?;
+        crate::plan::layout::spark_slots::charge_native_slots(&mut device, slots, slot_bytes);
         memory.devices.push(device);
     }
     report.solver_placement = Some(admitted.placement);

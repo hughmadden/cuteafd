@@ -57,7 +57,7 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyMo
                 }
                 // The tower's Spark headroom is what the worker has left after its
                 // rank I/O; the final solve re-charges it for its own working set.
-                spark_io(report, model, options, &working, &mut sparks, &mut notes);
+                spark_io(report, model, input, options, &working, &mut sparks, &mut notes);
                 resolve_encoder(report, &towers, &mut admission, &mut sparks,
                     &vec![0; ranks], options, &mut notes);
                 for (device, admitted) in devices.iter_mut().zip(admission) {
@@ -89,7 +89,7 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyMo
     let mut waste = Vec::new();
     match apply_selected(input, options, &mut devices, spark_ranks, rows, concurrency, context, manifest) {
         Ok((placement, working)) => {
-            spark_io(report, model, options, &working, &mut sparks, &mut notes);
+            spark_io(report, model, input, options, &working, &mut sparks, &mut notes);
             waste = replicated_weights(&placement);
             report.solver_placement = Some(placement.clone());
             pool_tokens = placement.pool_tokens;
@@ -126,7 +126,8 @@ const SPARK_WAVE_BYTES: u64 = gib(51);
 /// Each selected Spark rank's exact intake, host exchange, row indices and
 /// rings for the working set the solve selected, in MiMo's prefill wire
 /// format (`--expert-input`), beside the non-I/O wave residual.
-fn spark_io(report: &mut PlanReport, model: &dyn super::super::FamilyModel, options: &LayoutOptions,
+fn spark_io(report: &mut PlanReport, model: &dyn super::super::FamilyModel, input: &super::super::PlanInput,
+    options: &LayoutOptions,
     working: &crate::placement::SparkWorkingSet, sparks: &mut [DeviceLayout], notes: &mut Vec<String>) {
     let rings = spark_ring_geometry(spark_endpoints("mimo_v2", working.prefill_lanes));
     for device in sparks {
@@ -138,6 +139,14 @@ fn spark_io(report: &mut PlanReport, model: &dyn super::super::FamilyModel, opti
         if let Err(error) = io {
             report.placement_supported = false;
             notes.push(format!("{} I/O admission: {error}", device.name()));
+        }
+        let slots = spark_execution_slots("mimo_v2", working.prefill_lanes, options.decode_lanes)
+            .map_err(anyhow::Error::from)
+            .and_then(|slots| spark_slots::charge_selected_slots(device, input, working, "mimo_v2", slots,
+                options.spark_capacity_rows));
+        if let Err(error) = slots {
+            report.placement_supported = false;
+            notes.push(format!("{} execution slots: {error:#}", device.name()));
         }
     }
 }

@@ -773,13 +773,13 @@ fn nvfp4_min_card_admits_native_w4a4_and_bf16_root_stays_reference_only() {
             assert_eq!(roomy.memory_layout.unwrap().pool_tokens, target);
         }
         assert!(memory.devices.iter().all(|d| d.used_bytes() <= d.capacity_bytes));
-        // The endpoint holds the planner's whole intake span.
+        // The endpoint's frames hold one unit; the intake holds all live waves.
         let rows = result.prefill_unit_rows.expect("planned prefill unit rows");
         assert_eq!(rows, 4096);
         assert_eq!(result.prefill_waves, Some(2));
         let span = result.prefill_span_rows.expect("planned prefill span rows");
         assert_eq!(span, rows * result.prefill_waves.expect("planned prefill waves"));
-        let endpoint = cuteafd_core::SparkEndpoint { ring_depth: None, capacity: span as u32, ingress: cuteafd_core::SparkIngress::Bf16 };
+        let endpoint = cuteafd_core::SparkEndpoint { ring_depth: None, capacity: rows as u32, ingress: cuteafd_core::SparkIngress::Bf16 };
         let rings = cuteafd_core::SparkRings { max_frame_bytes: 64 << 20,
             depth: 8, slot_bytes: 8 << 20, alignment: 4096 };
         let lane_rings = endpoint.ring_bytes(cuteafd_core::ExpertGeometry::STEP5, rings).unwrap();
@@ -798,6 +798,27 @@ fn nvfp4_min_card_admits_native_w4a4_and_bf16_root_stays_reference_only() {
     let r = report(dir.path(),2,96,6,None);
     assert!(r.config_error.is_none(),"{:?}",r.config_error);
     assert!(r.hints.iter().any(|h| h.what.contains("BF16 target format")));
+}
+
+#[test]
+fn native_slot_charge_sums_quant_and_bf16_tail_groups() -> anyhow::Result<()> {
+    use crate::plan::layout::spark_slots::native_slot_bytes;
+    use crate::placement::SparkWorkingSet;
+    for (format, ranks, quant_scratch) in [("fp8", 6, 538_279_936), ("nvfp4", 4, 464_821_248)] {
+        let dir = snapshot(format);
+        let input = PlanInput::open(dir.path())?;
+        let mut working = SparkWorkingSet { spark_layers: vec![3], spark_ranks: ranks,
+            prefill_lanes: 2, ..Default::default() };
+        let quant = native_slot_bytes(&input, "step5", &working, 0, 4096)?.unwrap();
+        working.spark_layers = vec![88];
+        let tail = native_slot_bytes(&input, "step5", &working, 0, 4096)?.unwrap();
+        working.spark_layers = vec![3, 88];
+        let mixed = native_slot_bytes(&input, "step5", &working, 0, 4096)?.unwrap();
+        assert_eq!(mixed, quant + tail, "one BF16 tail layer retains its own worker");
+        let tail_scratch = if ranks == 4 { 580_747_264 } else { 538_279_936 };
+        assert!(mixed >= quant_scratch + tail_scratch + 2 * 67_371_008);
+    }
+    Ok(())
 }
 
 #[test]
@@ -1231,11 +1252,11 @@ fn shared_ffn_region_keeps_replicated_replies_apart() {
 #[test]
 fn adaptive_prefill_selection_preserves_overrides_and_never_retries_on_capacity() {
     for (kind, gpus, sparks, default_unit, default_waves) in [
-        ("nvfp4", 1, 4, 4096, 2), ("fp8", 2, 6, 2752, 3),
+        ("nvfp4", 1, 4, 4096, 2), ("fp8", 2, 6, 4096, 2),
     ] {
         let snapshot = snapshot(kind);
         let manifest = native_manifest(snapshot.path());
-        for (unit, waves) in [(0, 0), (512, 1), (1024, 4), (2048, 4)] {
+        for (unit, waves) in [(0, 0), (512, 1), (1024, 2), (4096, 2)] {
             let expected_unit = if unit == 0 { default_unit } else { unit };
             let expected_waves = if waves == 0 { default_waves } else { waves };
             let report = plan::plan(snapshot.path(), &PlanOptions {

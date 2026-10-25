@@ -125,7 +125,7 @@ pub(crate) struct EngineArgs {
     pub attention_plan_rows: Option<usize>,
 }
 
-fn resolve_prefill(args: &mut EngineArgs) -> Result<()> {
+fn resolve_prefill(args: &mut EngineArgs, shared_fp8_scratch: bool) -> Result<()> {
     use cuteafd_loader::serving_capacity::prefill_waves::{prefill_shape, PrefillLimits, PrefillOverrides};
     let ranks = args.peers.as_deref().map_or(0, |peers| peers.split(',').count());
     let attention = cuteafd_loader::placement::attention::parse(&args.attention_placement)
@@ -134,7 +134,7 @@ fn resolve_prefill(args: &mut EngineArgs) -> Result<()> {
         max_waves: if ranks == 0 { 1 }
             else if attention == Some(cuteafd_loader::placement::AttentionPlacement::Layers) { 2 } else { 4 },
         ..Default::default()
-    }, PrefillOverrides {
+    }.with_shared_fp8_scratch(shared_fp8_scratch), PrefillOverrides {
         unit_rows: (args.prefill_rows > 0).then_some(args.prefill_rows as u64),
         waves: (args.prefill_waves > 0).then_some(u64::from(args.prefill_waves)),
         span_rows: (args.prefill_span_rows > 0).then_some(args.prefill_span_rows as u64),
@@ -562,7 +562,7 @@ impl Opened {
         -> Result<T> {
         let automatic_context = args.max_context == 0;
         let mut context_args = args.clone();
-        resolve_prefill(&mut context_args)?;
+        resolve_prefill(&mut context_args, self.catalog.fp8().is_some())?;
         context_args.max_context = crate::shared::context::checkpoint_context(
             &args.snapshot, &args.manifest, "glm5", args.max_context)?;
         let args = &context_args;
@@ -1468,7 +1468,8 @@ fn bench_prefill(args: &GoldenArgs, engine: &engine::GlmEngine<'_>,
 }
 
 fn golden(mut args: GoldenArgs) -> Result<()> {
-    resolve_prefill(&mut args.engine)?;
+    let catalog = cuteafd_loader::read_expert_catalog(&args.engine.snapshot)?;
+    resolve_prefill(&mut args.engine, catalog.fp8().is_some())?;
     // Validate the scoring call before opening CUDA or loading any weights.
     let rows = args.engine.prefill_rows;
     crate::shared::prefill_pipeline::retained_logits_units(rows, rows,

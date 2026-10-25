@@ -211,17 +211,25 @@ mod prefill_shape_tests {
             args.skip_routed_experts = ranks == 0;
             let shape = args.prefill_shape(4096, None)?;
             let planned = cuteafd_loader::serving_capacity::prefill_waves::prefill_shape(ranks,
-                PrefillLimits { max_waves: 3, ..Default::default() }, PrefillOverrides::default())?;
+                PrefillLimits { max_waves: if ranks == 0 { 1 } else { 3 }, ..Default::default() },
+                PrefillOverrides::default())?;
             assert_eq!(shape, planned);
             assert_eq!((shape.unit_rows, shape.waves, shape.span_rows),
                 if ranks == 0 { (4096, 1, 4096) } else if ranks < 6 { (4096, 2, 8192) }
                 else { (2752, 3, 8256) });
             args.prefill_rows = Some(2048);
             args.prefill_waves = Some(3);
-            assert_eq!((args.prefill_shape(4096, Some(6144))?.unit_rows,
-                args.prefill_shape(4096, Some(6144))?.waves), (2048, 3));
+            if ranks == 0 {
+                assert!(matches!(args.prefill_shape(4096, Some(6144)),
+                    Err(PrefillError::ExecutorCapacity { max_waves: 1, .. })));
+            } else {
+                assert_eq!((args.prefill_shape(4096, Some(6144))?.unit_rows,
+                    args.prefill_shape(4096, Some(6144))?.waves), (2048, 3));
+            }
         }
         let mut args = base;
+        args.peers = (0..6).map(|rank| format!("127.0.0.1:{}", 19000 + rank)).collect::<Vec<_>>().join(",");
+        args.skip_routed_experts = false;
         args.prefill_rows = Some(4096);
         args.prefill_waves = Some(3);
         assert!(matches!(args.prefill_shape(4096, None), Err(PrefillError::ReserveExceeded { .. })));
@@ -244,8 +252,8 @@ impl EngineArgs {
         let ranks = if self.skip_routed_experts { 0 } else {
             self.peers.split(',').filter(|peer| !peer.is_empty()).count()
         };
-        prefill_shape(ranks, PrefillLimits { max_unit_rows: compiled_rows.min(4096), max_waves: 3,
-            ..Default::default() },
+        prefill_shape(ranks, PrefillLimits { max_unit_rows: compiled_rows.min(4096),
+            max_waves: if ranks == 0 { 1 } else { 3 }, ..Default::default() },
             PrefillOverrides { unit_rows: self.prefill_rows.map(|rows| rows as u64),
                 waves: self.prefill_waves.map(|waves| waves as u64), span_rows })
     }

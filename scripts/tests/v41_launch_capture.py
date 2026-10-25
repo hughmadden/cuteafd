@@ -134,14 +134,14 @@ if tool == "docker":
             response["decode_lanes"] = decode_lanes
             tp = int(value("--spark-tp", ranks))
             ep = int(value("--spark-ep", "1"))
-            if family in {"step5", "kimi_k3"}:
-                unit = int(value("--prefill-rows", "0")) or 2048
-                waves = int(value("--prefill-waves", "0")) or 2
-                response.update(prefill_unit_rows=unit, prefill_waves=waves, prefill_span_rows=unit * waves)
-            elif family in {"glm5", "deepseek_v4"}:
-                unit = int(value("--prefill-rows", "0")) or 4096
-                waves = 1 if family == "glm5" and int(ranks) == 0 else int(value("--prefill-waves", "0")) or 2
-                span = int(value("--prefill-span-rows", "0")) or 16384
+            if family in {"step5", "kimi_k3", "glm5", "glm5_flash", "deepseek_v4", "qwen4"}:
+                # Mirror the shared topology policy, including the declared PLE/FP8 holds.
+                waves = int(value("--prefill-waves", "0")) or (1 if int(ranks) == 0 else 2 if int(ranks) < 6 else 3)
+                native_glm = family in {"glm5", "glm5_flash"} and os.environ.get("CAPTURE_EXL3") != "1"
+                if "--prefill-waves" not in args and (family in {"qwen4", "step5"} or native_glm):
+                    waves = min(waves, 2)
+                unit = int(value("--prefill-rows", "0")) or {1: 4096, 2: 4096, 3: 2752, 4: 2048}[waves]
+                span = int(value("--prefill-span-rows", "0")) or unit * waves
                 response.update(prefill_unit_rows=unit, prefill_waves=waves, prefill_span_rows=span)
             report = dict(response)
             exl3 = os.environ.get("CAPTURE_EXL3") == "1"
@@ -398,7 +398,8 @@ def capture(launcher_root: Path, case: str, *, release_entry: dict | None = None
                "CAPTURE_LOG": str(log), "CAPTURE_ROOT": str(root), "CAPTURE_HOST": coordinator_host,
                "CAPTURE_SPARKS": str(sparks), "CAPTURE_SPARKINFER": lock["revision"],
                "CAPTURE_FAMILY": release_entry["family"] if release_entry else "deepseek_v41",
-               "CAPTURE_EXL3": "1" if release_values.get("EXPERT_FORMAT") == "exl3" else "0",
+               "CAPTURE_EXL3": "1" if release_values.get("EXPERT_FORMAT") == "exl3"
+                   or checkpoints.get(values.get("MODEL_ID", served), {}).get("quantization_config", {}).get("quant_method") == "exl3" else "0",
                "CAPTURE_FIRST_LAYER": first, "CAPTURE_LAST_LAYER": last, "CAPTURE_RELEASE": "1" if release_entry else "",
                "CAPTURE_SERVED_MODEL": served,
                "CUTEAFD_CDI_CHECK": "on", "CUTEAFD_CDI_SPECS": str(spec),

@@ -32,7 +32,7 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyMo
     let checkpoint = input.checkpoint();
     let prefill = match resolve_prefill(report, options, report.spark_ranks,
         crate::serving_capacity::prefill_waves::PrefillLimits {
-            max_waves: 3, ..Default::default()
+            max_waves: if report.spark_ranks == 0 { 1 } else { 3 }, ..Default::default()
         }) {
         Ok(shape) => shape,
         Err(error) => return unsupported_prefill(report, error),
@@ -94,7 +94,7 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyMo
         prefill_lanes: 1,
     };
     let endpoints = spark_endpoints("deepseek_v4", 1);
-    let mut sparks = spark_devices(report, model, checkpoint, options, SPARK, &spark_working, endpoints,
+    let mut sparks = spark_devices(report, model, input, options, SPARK, &spark_working, endpoints,
         &mut waste, &mut notes);
     let mut pool_tokens = 0;
     let mut local_layers = 0;
@@ -153,7 +153,7 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyMo
     }
     if local_layers > 0 { notes.push(format!("{local_layers} routed backbone layers resident on RTX")); }
     // Reapply after admission: rank-local I/O never belongs to the coordinator KV budget.
-    charge_spark_devices(report, model, checkpoint, options, SPARK, &spark_working, endpoints, &mut sparks,
+    charge_spark_devices(report, model, input, options, SPARK, &spark_working, endpoints, &mut sparks,
         &mut notes, |device| format!("{} I/O admission", device.name()));
     devices.extend(sparks);
     MemoryLayout { devices, pool_tokens, waste, notes }

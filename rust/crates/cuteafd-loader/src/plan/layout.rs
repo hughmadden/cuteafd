@@ -12,6 +12,7 @@ pub(crate) mod v41;
 pub(crate) mod mimo;
 pub mod glm5;
 pub(crate) mod qwen;
+pub(crate) mod spark_slots;
 
 const GIB: u64 = 1 << 30;
 const MIB: u64 = 1 << 20;
@@ -362,7 +363,9 @@ pub fn spark_execution_slots(family: &str, prefill_waves: u64, decode_lanes: u8)
 /// staging at the family's unit capacity), calibrated against the workers'
 /// `experts/workspace*` ledger on the shipped cards (2026-10-24): MiMo Pro max
 /// FP8 146 MiB, GLM 5.3 EXL3 max 1001 MiB, GLM Flash EXL3 569 MiB, V4.1 Flash
-/// max 208 MiB, Kimi K3 EXL3-K2 1175 MiB. Scaled by unit rows over 4096.
+/// max 208 MiB, Kimi K3 EXL3-K2 1175 MiB. Keep the compiled-capacity floor:
+/// scratch cannot be linearly reduced with live rows. Native FP8-path workers
+/// use the separate per-group census bound, including mixed/rotated groups.
 pub fn spark_slot_bytes(family: &str, unit_rows: u64) -> u64 {
     const MIB: u64 = 1 << 20;
     let at_4096 = match family {
@@ -371,9 +374,12 @@ pub fn spark_slot_bytes(family: &str, unit_rows: u64) -> u64 {
         "glm5_flash" => 569 * MIB,
         "deepseek_v41" | "deepseek_v4" => 208 * MIB,
         "kimi_k3" => 1175 * MIB,
+        // Qwen K4.5 TP1: eight retained capacity manifests plus wire/routes,
+        // 674,287,636 bytes; every TP2/3/4 rank is smaller (see census test).
+        "qwen4" => 644 * MIB,
         _ => 0,
     };
-    at_4096.saturating_mul(unit_rows.max(1)).div_ceil(4096)
+    at_4096.saturating_mul(unit_rows.max(4096)).div_ceil(4096)
 }
 
 /// The selected ring geometry for `endpoints` coordinator endpoints per rank.
@@ -412,14 +418,13 @@ pub(crate) fn charge_spark_io(device: &mut DeviceLayout, working: &crate::placem
     Ok(())
 }
 
-/// Charges each selected Spark rank's execution slots beyond the first (the
-/// first is inside the family's wave allowance): `(slots - 1)` slot workspaces.
+/// Charge the compiled-capacity slot floor for every selected execution slot,
+/// crediting only the bytes retained in the legacy first-slot residual.
 pub(crate) fn charge_spark_slots(device: &mut DeviceLayout, working: &crate::placement::SparkWorkingSet,
     family: &str, slots: u8, unit_rows: u64) {
     device.items.retain(|item| item.group != "execution slots");
-    if working.selected_ranks().contains(&(device.index as usize)) && slots > 1 {
-        device.items.push(Item::new(Category::Workspace, "execution slots", format!("{} more", slots - 1),
-            spark_slot_bytes(family, unit_rows) * u64::from(slots - 1), Basis::Calibrated));
+    if working.selected_ranks().contains(&(device.index as usize)) {
+        spark_slots::charge_native_slots(device, slots, spark_slot_bytes(family, unit_rows));
     }
 }
 
@@ -467,8 +472,8 @@ mod selected_spark_io_tests {
         assert!(spark_execution_slots("glm5", 9, 1).is_err());
         assert!(spark_execution_slots("qwen4", 0, 1).is_err());
         assert_eq!(spark_execution_slots("deepseek_v4", 3, 1).unwrap(), 3);
-        // A smaller unit with more waves costs more, smaller slots (no hard-wired 4096 x 2).
-        assert_eq!(spark_slot_bytes("glm5", 2048) * 2, spark_slot_bytes("glm5", 4096));
+        // A smaller live unit does not shrink compiled-capacity scratch.
+        assert_eq!(spark_slot_bytes("glm5", 2048), spark_slot_bytes("glm5", 4096));
         let working = SparkWorkingSet { spark_layers: vec![3], spark_ranks: 4, prefill_lanes: 2, ..Default::default() };
         let charged = |slots, rows| {
             let mut device = DeviceLayout { kind: DeviceKind::Spark, index: 0, capacity_bytes: 121 * GIB,
@@ -476,9 +481,38 @@ mod selected_spark_io_tests {
             charge_spark_slots(&mut device, &working, "glm5", slots, rows);
             device.items.iter().filter(|item| item.group == "execution slots").map(|item| item.bytes).sum::<u64>()
         };
-        assert_eq!(charged(1, 4096), 0);
-        assert_eq!(charged(2, 4096), spark_slot_bytes("glm5", 4096));
-        assert_eq!(charged(4, 2048), 3 * spark_slot_bytes("glm5", 2048));
+        assert_eq!(charged(1, 4096), spark_slot_bytes("glm5", 4096));
+        assert_eq!(charged(2, 4096), 2 * spark_slot_bytes("glm5", 4096));
+        assert_eq!(charged(4, 2048), 4 * spark_slot_bytes("glm5", 2048));
+    }
+
+    #[test]
+    fn qwen_exl3_slot_bounds_all_retained_capacity_arenas() {
+        use serde_json::json;
+        // Installed exl3-qwen4-k45/tp1-rank0 m4096 allocation census (v3.0.1).
+        // Maxima are shared, while each current capacity retains its LUT,
+        // initialization workspace and BF16 wire decode allocation privately.
+        let arenas = [("rotation_gate", 209_715_200), ("rotation_up", 209_715_200),
+            ("fc1", 104_857_600), ("activated", 52_428_800), ("output", 20_971_520),
+            ("packed_route_indices", 227_328), ("block_expert_ids", 7_104),
+            ("packed_route_count", 16), ("expert_offsets", 2_052), ("expert_counts", 2_048),
+            ("fc1_scratch", 6_291_456), ("fc2_scratch", 6_291_456)];
+        let manifests = cuteafd_core::expert_geometry::EXL3_CAPACITIES.into_iter().map(|rows| {
+            let mut buffers = serde_json::Map::new();
+            for (name, bytes) in arenas {
+                buffers.insert(name.into(), json!({"allocation": name, "bytes": bytes,
+                    "dtype": "census", "zero_on_create": false}));
+            }
+            buffers.insert("workspace".into(), json!({"allocation": "workspace", "bytes": 776,
+                "dtype": "i32", "zero_on_create": true}));
+            json!({"capacity": rows, "hidden": 2560, "trellis_lut": {"bytes": 4096}, "buffers": buffers})
+        }).collect::<Vec<_>>();
+        let retained = crate::serving_capacity::exl3_workspace_bytes(&manifests, true).unwrap();
+        let wire_routes = 4096 * (2560 + 2560 / 32 + 8 * 10);
+        assert_eq!(retained + wire_routes, 674_287_636);
+        for rows in [64, 2048, 2752, 4096] {
+            assert!(spark_slot_bytes("qwen4", rows) >= retained + wire_routes);
+        }
     }
 
     #[test]
@@ -852,7 +886,7 @@ pub(crate) fn spark_geometry(model: &dyn super::FamilyModel) -> Option<cuteafd_c
 /// The Spark ranks of `report.placement`: host footprint, routed slices and
 /// worker runtime, then the selected rank I/O for `working`.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn spark_devices(report: &mut PlanReport, model: &dyn super::FamilyModel, checkpoint: &super::Checkpoint,
+pub(crate) fn spark_devices(report: &mut PlanReport, model: &dyn super::FamilyModel, input: &super::PlanInput,
     options: &LayoutOptions, charges: SparkCharges, working: &crate::placement::SparkWorkingSet, endpoints: usize,
     waste: &mut Vec<Waste>, notes: &mut Vec<String>) -> Vec<DeviceLayout> {
     let ExpertPlacement::Sparks { ranks } = report.placement else { return Vec::new() };
@@ -872,7 +906,7 @@ pub(crate) fn spark_devices(report: &mut PlanReport, model: &dyn super::FamilyMo
         device
     }).collect::<Vec<_>>();
     for device in &mut devices {
-        charge_spark_devices(report, model, checkpoint, options, charges, working, endpoints,
+        charge_spark_devices(report, model, input, options, charges, working, endpoints,
             std::slice::from_mut(device), notes, |device| format!("Spark rank {} I/O admission", device.index));
         device.items.push(Item::new(Category::Runtime, "context+modules", "", 512 * MIB, charges.basis));
     }
@@ -883,9 +917,10 @@ pub(crate) fn spark_devices(report: &mut PlanReport, model: &dyn super::FamilyMo
 /// (Re)charges each Spark rank's selected I/O for `working`, after family
 /// admission has selected its Spark layers and lanes.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn charge_spark_devices(report: &mut PlanReport, model: &dyn super::FamilyModel, checkpoint: &super::Checkpoint,
+pub(crate) fn charge_spark_devices(report: &mut PlanReport, model: &dyn super::FamilyModel, input: &super::PlanInput,
     options: &LayoutOptions, charges: SparkCharges, working: &crate::placement::SparkWorkingSet, endpoints: usize,
     devices: &mut [DeviceLayout], notes: &mut Vec<String>, what: impl Fn(&DeviceLayout) -> String) {
+    let checkpoint = input.checkpoint();
     for device in devices {
         let io = spark_geometry(model).ok_or(crate::placement::PlacementError::Inventory("Spark experts need routed geometry"))
             .and_then(|geometry| u32::try_from(options.spark_capacity_rows)
@@ -902,7 +937,9 @@ pub(crate) fn charge_spark_devices(report: &mut PlanReport, model: &dyn super::F
         let slots = if crate::plan::exlr8::recognizes(&checkpoint.snapshot).unwrap_or(false) { Ok(1) }
             else { spark_execution_slots(family, options.prefill_waves, options.decode_lanes) };
         match slots {
-            Ok(slots) => charge_spark_slots(device, working, family, slots, options.spark_capacity_rows),
+            Ok(slots) => if let Err(error) = spark_slots::charge_selected_slots(device, input, working, family, slots, options.spark_capacity_rows) {
+                report.placement_supported = false; notes.push(format!("{}: {error:#}", what(device)));
+            },
             Err(error) => { report.placement_supported = false; notes.push(format!("{}: {error}", what(device))); }
         }
     }

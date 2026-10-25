@@ -27,7 +27,7 @@ fn dense_pushable(args: &EngineArgs) -> bool {
     args.kda_nvfp4_gate.is_none()
 }
 
-fn resolve_prefill(args: &mut EngineArgs, complete: bool) -> Result<()> {
+fn resolve_prefill(args: &mut EngineArgs, complete: bool, shared_fp8_scratch: bool) -> Result<()> {
     use cuteafd_loader::serving_capacity::prefill_waves::{prefill_shape, PrefillLimits, PrefillOverrides};
     let ranks = args.peers.as_deref().map_or(0, |peers| peers.split(',').count());
     let attention = cuteafd_loader::placement::attention::parse(&args.attention_placement)
@@ -36,7 +36,7 @@ fn resolve_prefill(args: &mut EngineArgs, complete: bool) -> Result<()> {
         max_waves: if !complete || ranks == 0 { 1 }
             else if attention == Some(cuteafd_loader::placement::AttentionPlacement::Layers) { 2 } else { 4 },
         ..Default::default()
-    }, PrefillOverrides {
+    }.with_shared_fp8_scratch(shared_fp8_scratch), PrefillOverrides {
         unit_rows: (args.prefill_rows > 0).then_some(args.prefill_rows as u64),
         waves: (args.prefill_waves > 0).then_some(args.prefill_waves as u64),
         span_rows: (args.prefill_span_rows > 0).then_some(args.prefill_span_rows as u64),
@@ -465,7 +465,7 @@ mod draft_cli_tests {
     fn parse(extra: &[&str]) -> EngineArgs {
         let mut args = Parse::try_parse_from(["test", "--snapshot", "/checkpoint", "--native-lib", "/native"].into_iter()
             .chain(extra.iter().copied())).unwrap().engine;
-        resolve_prefill(&mut args, true).unwrap();
+        resolve_prefill(&mut args, true, false).unwrap();
         args
     }
 
@@ -891,7 +891,7 @@ mod draft_cli_tests {
             args.peers = peers.map(str::to_owned);
             args.prefill_waves = waves;
             args.prefill_rows = rows;
-            assert!(resolve_prefill(&mut args, true).is_err());
+            assert!(resolve_prefill(&mut args, true, false).is_err());
         }
         assert!(Parse::try_parse_from(["test", "--snapshot", "/checkpoint", "--native-lib", "/native",
             "--prefill-waves", "5"]).is_err());
@@ -903,7 +903,7 @@ mod draft_cli_tests {
         assert_eq!(parse(&["--prefill-span-rows", "4096"]).prefill_span_rows, 4096);
         let mut args = Parse::try_parse_from(["test", "--snapshot", "/checkpoint", "--native-lib", "/native",
             "--prefill-span-rows", "16384"]).unwrap().engine;
-        assert!(resolve_prefill(&mut args, true).is_err());
+        assert!(resolve_prefill(&mut args, true, false).is_err());
     }
 
     #[test]
@@ -1633,7 +1633,8 @@ impl Opened {
         let args = &resolved;
         let automatic_context = args.max_context == 0;
         let mut context_args = args.clone();
-        resolve_prefill(&mut context_args, args.layers.is_none_or(|n| n == self.cfg.layers))?;
+        resolve_prefill(&mut context_args, args.layers.is_none_or(|n| n == self.cfg.layers),
+            self.experts.as_ref().is_some_and(|catalog| catalog.fp8().is_some()))?;
         context_args.max_context = crate::shared::context::checkpoint_context(
             &args.snapshot, &args.manifest, "glm5_flash", args.max_context)?;
         let args = &context_args;

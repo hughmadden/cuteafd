@@ -148,7 +148,7 @@ fn single_layout(report: &mut PlanReport, model: &dyn super::super::FamilyModel,
     let charges = SparkCharges { host_bytes: Some(SPARK_HOST_BYTES),
         wave_bytes: crate::placement::families::qwen4::SPARK_WORKSPACE_BYTES, basis };
     let endpoints = spark_endpoints("qwen4", 1);
-    let mut sparks = spark_devices(report, model, checkpoint, options, charges, &working, endpoints, &mut waste, &mut notes);
+    let mut sparks = spark_devices(report, model, input, options, charges, &working, endpoints, &mut waste, &mut notes);
     if report.encoder.is_none() {
         let target = options.pool_tokens.filter(|&tokens| tokens != 0)
             .unwrap_or(options.target_pool_tokens.max(shape.context_tokens));
@@ -171,7 +171,7 @@ fn single_layout(report: &mut PlanReport, model: &dyn super::super::FamilyModel,
         notes.push(format!("full-context admission shortfall: context {} tokens, pool {pool_tokens} tokens, shortfall {} tokens",
             shape.context_tokens, shape.context_tokens - pool_tokens));
     }
-    charge_spark_devices(report, model, checkpoint, options, charges, &working, endpoints, &mut sparks,
+    charge_spark_devices(report, model, input, options, charges, &working, endpoints, &mut sparks,
         &mut notes, |device| format!("{} I/O admission", device.name()));
     devices.extend(sparks);
     MemoryLayout { devices, pool_tokens, waste, notes }

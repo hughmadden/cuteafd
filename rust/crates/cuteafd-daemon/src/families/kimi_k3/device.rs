@@ -1159,7 +1159,7 @@ mod tests {
     fn three_wave_metadata_preserves_exact_unpadded_tail_rows() -> Result<()> {
         let cfg = KimiK3Config::from_hf(&cuteafd_loader::plan::testing::kimi_k3_config())?;
         let layout = LaneLayout::new(&cfg, 8256, 2752, 16384, NativeScratch { kda: 16, mla: [16; 3] })?;
-        for rows in [65, 1375, 1376, 2751, 2752] {
+        for rows in [65usize, 1375, 1376, 2751, 2752] {
             let start = 63;
             let mut pool = cuteafd_engine::prefix::RefPagePool::with_reserved(256, 64, 1);
             let pages = pool.alloc((start + rows).div_ceil(64))?;

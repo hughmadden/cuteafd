@@ -181,7 +181,7 @@ fn shared_prefill_public_plan_family_by_spark_matrix() {
             let mut options = wave_plan_options(dir.path(), ranks);
             let report = plan(dir.path(), &options).unwrap();
             assert_eq!(report.family.as_deref(), Some(family));
-            let (unit, waves) = if family == "qwen4" && ranks >= 6 { (4096, 2) }
+            let (unit, waves) = if matches!(family, "glm5" | "glm5_flash" | "qwen4") && ranks >= 6 { (4096, 2) }
                 else { match ranks { 0 => (4096, 1), 1..=5 => (4096, 2), _ => (2752, 3) } };
             // Header fixtures may independently lack kernels, rank divisibility,
             // local experts or memory. Shape resolution does not imply fit.
@@ -194,7 +194,7 @@ fn shared_prefill_public_plan_family_by_spark_matrix() {
                 layout.prefill_span_rows = Some(unit * waves);
                 let report = plan(dir.path(), &options).unwrap();
                 let max_waves = if ranks == 0 { 1 } else if family == "qwen4" { 2 }
-                    else if family == "deepseek_v4" { 3 } else { 4 };
+                    else if family == "deepseek_v4" { 3 } else { 2 };
                 if waves > max_waves {
                     assert!(!report.placement_supported, "{family} ranks={ranks}: {}", render(&report));
                     assert!(report.hints.iter().any(|hint| hint.what.contains("unsupported prefill shape")),
@@ -3428,6 +3428,28 @@ fn v41_exl3_exact_tp6_refuses_and_default_falls_back_with_reason() {
     assert!(fallback.executable(), "{}", render(&fallback));
     assert_eq!(fallback.spark_ranks, 4);
     assert!(fallback.spark_count_warning.as_ref().unwrap().contains("using 4 Sparks"));
+}
+
+#[test]
+fn qwen_small_card_one_spark_admits_both_auto_slots_before_pool() {
+    use cuteafd_core::memory_layout::DeviceKind;
+    let dir = qwen_snapshot(4);
+    let report = plan(dir.path(), &PlanOptions { layout: Some(layout::LayoutOptions {
+        rtx_bytes: vec![32 << 30], pool_tokens: Some(262_144), context_tokens: 262_144,
+        host_cache_bytes: Some(0), host_memory: Some((128 << 30, 128 << 30)),
+        ..Default::default()
+    }), ..sparks(1) }).unwrap();
+    assert!(report.executable(), "{}", render(&report));
+    assert_eq!((report.prefill_unit_rows, report.prefill_waves, report.prefill_span_rows),
+        (Some(4096), Some(2), Some(8192)));
+    let memory = report.memory_layout.unwrap();
+    assert_eq!(memory.pool_tokens, 262_144);
+    let spark = memory.devices.iter().find(|d| d.kind == DeviceKind::Spark).unwrap();
+    let slot_bytes = spark.items.iter().filter(|item|
+        matches!(item.group.as_str(), "execution slots" | "expert waves"))
+        .map(|item| item.bytes).sum::<u64>();
+    assert!(slot_bytes >= 2 * layout::spark_slot_bytes("qwen4", 4096));
+    assert!(memory.devices.iter().all(|d| d.free_bytes() >= 0), "{}", memory.render());
 }
 
 #[test]

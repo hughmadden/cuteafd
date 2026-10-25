@@ -296,20 +296,18 @@ pub fn spark_demand(shape: crate::serving_capacity::PrefillShape, lane: usize) -
         crate::serving_capacity::prefill_return_bytes(shape.waves, shape.unit_rows, 6, 3584), Basis::Exact)
 }
 
-/// `unit` overrides the page-aligned unit derived from lane rows / waves.
-/// Row planes hold every unit; kernel scratch and return slots serve one each.
+/// Row planes hold exactly the admitted units; scratch and return slots serve
+/// one unit each. Diagnostic callers normalize their shape before allocation.
 pub fn prefill_shape_with(rows: usize, waves: usize, unit: Option<usize>)
     -> Result<crate::serving_capacity::PrefillShape> {
+    use crate::serving_capacity::prefill_waves::{prefill_shape, PrefillLimits, PrefillOverrides};
     ensure!((1..=crate::serving_capacity::prefill_waves::MAX_WAVES as usize).contains(&waves)
         && (1..=LANE_ROWS_MAX).contains(&rows) && rows >= 64 * waves,
         "Kimi lane row/wave capacity: {rows} rows x {waves} waves");
-    let derived = if waves == 1 { rows.next_multiple_of(64).min(UNIT_ROWS_MAX) } else { rows / waves / 64 * 64 };
-    let shape = crate::serving_capacity::PrefillShape {
-        unit_rows: unit.unwrap_or(derived) as u64, waves: waves as u64,
-    }.validate()?;
-    ensure!(shape.slot_rows() <= rows.next_multiple_of(64) as u64,
-        "Kimi lane rows {rows} hold fewer than {waves} units of {}", shape.unit_rows);
-    Ok(shape)
+    Ok(prefill_shape(6, PrefillLimits::default(), PrefillOverrides {
+        unit_rows: Some(unit.unwrap_or(rows / waves) as u64), waves: Some(waves as u64),
+        span_rows: Some(rows as u64),
+    })?.units())
 }
 
 pub fn exchange_demand(rows: usize, rank: u8, f32_partials: bool, progress: usize) -> Result<Demand> {
@@ -439,9 +437,12 @@ mod tests {
         assert_eq!(unit(8192, 2, None)?, 4096);
         assert_eq!(unit(8192, 2, Some(4096))?, 4096);
         assert_eq!(unit(4096, 2, None)?, 2048);
-        assert_eq!(unit(8192, 1, None)?, 4096);
+        assert_eq!(unit(4096, 1, None)?, 4096);
+        assert!(unit(8192, 1, None).is_err(), "a unit is at most 4096 rows");
         assert!(unit(8192, 2, Some(8192)).is_err(), "a unit is at most 4096 rows");
         assert!(unit(4096, 2, Some(4096)).is_err(), "the lane holds both units");
+        assert!(unit(8192, 2, Some(2048)).is_err(), "the lane cannot exceed the exact live units");
+        assert!(unit(4097, 2, None).is_err(), "the lane cannot hide a rounded tail");
         Ok(())
     }
 }
