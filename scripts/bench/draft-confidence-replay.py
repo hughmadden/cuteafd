@@ -12,7 +12,8 @@ Rows:
 - fixed-7: every block verified (the run itself).
 - each prior with the `simple` rule (the largest `d` whose joint acceptance `prod p_1..p_d`
   exceeds 0.5), with per-position Platt scaling fitted on the other folds (as the policy's
-  online calibration would) and raw:
+  online calibration would) and raw, and with the expected-rate rule (`rate`: the `d` that
+  maximizes the cycle's expected tokens per ms under `T`):
   - history: the request's own conditional rates (`DraftHistory::conditional`);
   - generic: the shared GLM-5.3 `SelectorFit` (the engine's fallback);
   - fitted: `calibrate-draft-confidence.py`'s fit, cross-validated by request.
@@ -162,6 +163,12 @@ def depth(p):
     return d
 
 
+def rate_depth(p, cost):
+    """The drafts that maximize the cycle's expected tokens per ms, `(1 + sum q_1..q_d) / T(d + 1)`."""
+    expected = 1 + np.concatenate([[0.0], np.cumsum(np.cumprod(p))])
+    return int(np.argmax(expected / cost(np.arange(POSITIONS + 1) + 1)))
+
+
 def auc(scores, labels):
     """Rank AUC with tied scores averaged."""
     positive, negative = labels.sum(), len(labels) - labels.sum()
@@ -216,6 +223,7 @@ def replay(blocks, lines, names, thinking, row_ms, folds, regularization):
     for name in raw:
         rules[f"{name}"] = lambda b, name=name: depth(calibrated[name][b])
         rules[f"{name} raw"] = lambda b, name=name: depth(raw[name][b])
+        rules[f"{name} rate"] = lambda b, name=name: rate_depth(calibrated[name][b], cost)
     table = {}
     for group, members in sorted(groups.items()):
         table[group] = {}
