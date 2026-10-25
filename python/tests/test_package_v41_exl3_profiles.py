@@ -295,10 +295,23 @@ class PackageProfileTests(unittest.TestCase):
         # capacity; TP5 compact (640) and TP8 compact (256) were never measured.
         self.assertFalse(any(package.compact_warp_specialized('glm', 'spark', width, 4096)
                              for width in (256, 512, 640)))
-        self.assertEqual(package.ws_tile('glm', 'spark', 384, 4096, compact=True),
+        # The 192-wide FC1 tile wins from m1024 up on both measured widths;
+        # m256 keeps the N128 tile that names the cooperative geometry.
+        for width in (384, 768):
+            self.assertEqual(package.ws_tile('glm', 'spark', width, 1024, compact=True),
+                             package.TILE_384_COMPACT_N192)
+            self.assertEqual(package.ws_tile('glm', 'spark', width, 2752, compact=True),
+                             package.TILE_384_COMPACT_N192)
+            self.assertEqual(package.ws_tile('glm', 'spark', width, 4096, compact=True),
+                             package.TILE_384_COMPACT_N192)
+            self.assertEqual(package.ws_tile('glm', 'spark', width, 256, compact=True),
+                             package.TILE_384_COMPACT)
+            self.assertEqual(package.compact_ws_tile('glm', 'spark', width, 4096),
+                             package.TILE_384_COMPACT_N192)
+            self.assertIsNone(package.compact_ws_tile('glm', 'coordinator', width, 4096))
+        self.assertEqual(package.compact_ws_tile('glm', 'spark', 384, 256),
                          package.TILE_384_COMPACT)
-        self.assertEqual(package.ws_tile('glm', 'spark', 768, 4096, compact=True),
-                         package.TILE_384_COMPACT)
+        self.assertIsNone(package.compact_ws_tile('glm', 'spark', 384, 80))
         self.assertIsNone(package.ws_tile('glm', 'spark', 384, 80, compact=True))
         self.assertIsNone(package.ws_tile('glm', 'spark', 640, 4096, compact=True))
         # Ordinary width-384 packs keep their 192-wide FC1 tile.
@@ -345,10 +358,19 @@ class PackageProfileTests(unittest.TestCase):
                              for c in (512, 2048, 8192)))
         self.assertFalse(package.compact_warp_specialized('v41', 'coordinator', 640, 4096))
         self.assertFalse(package.compact_warp_specialized('qwen4', 'coordinator', 384, 4096))
-        for geometry, width in (('v41', 640), ('qwen4', 384), ('qwen4', 256)):
-            self.assertEqual(package.ws_tile(geometry, 'spark', width, 4096, compact=True),
-                             package.TILE_384_COMPACT)
+        # Width 640 and 256 cannot take a 192-wide FC1 tile at all.
+        for geometry, width in (('v41', 640), ('qwen4', 256)):
+            for capacity in (256, 1024, 2752, 4096):
+                self.assertEqual(package.ws_tile(geometry, 'spark', width, capacity,
+                                                 compact=True),
+                                 package.TILE_384_COMPACT)
             self.assertIsNone(package.ws_tile(geometry, 'spark', width, 80, compact=True))
+        # Qwen4 width 384 divides 192: the large capacities consolidate onto
+        # the N192 arm and m256 keeps N128 behind the 32-row block.
+        self.assertEqual([package.ws_tile('qwen4', 'spark', 384, c, compact=True)
+                          for c in capacities],
+                         [None] * 3 + [package.TILE_384_COMPACT]
+                         + [package.TILE_384_COMPACT_N192] * 3)
         # Measured tier pairs only: V4.1 K3.25 is K3/K4, Qwen's shipped quant
         # K4/K5; another pair of the same geometry stays cooperative.
         self.assertTrue(package.compact_ws_export('v41', 'spark', 640, 4096, (3, 4)))
@@ -358,14 +380,16 @@ class PackageProfileTests(unittest.TestCase):
         self.assertFalse(package.compact_ws_export('qwen4', 'spark', 384, 4096, (3, 4)))
         self.assertFalse(package.compact_ws_export('qwen4', 'spark', 256, 4096, (3, 4)))
         # GLM Flash K3/K4: TP6 compact width 384 and TP3 compact width 768
-        # both take 32-row blocks at m256 and 64 above.
+        # both take 32-row N128 blocks at m256 and 64-row N192 blocks above.
         for width in (384, 768):
             self.assertEqual([package.compact_warp_specialized('glmf', 'spark', width, c)
                               for c in capacities], [False] * 3 + [True] * 4)
             self.assertEqual([package.compact_ws_route_block('glmf', 'spark', width, c)
                               for c in capacities], [None] * 3 + [32, 64, 64, 64])
-            self.assertEqual(package.ws_tile('glmf', 'spark', width, 4096, compact=True),
-                             package.TILE_384_COMPACT)
+            self.assertEqual([package.ws_tile('glmf', 'spark', width, c, compact=True)
+                              for c in capacities],
+                             [None] * 3 + [package.TILE_384_COMPACT]
+                             + [package.TILE_384_COMPACT_N192] * 3)
             self.assertTrue(package.compact_ws_export('glmf', 'spark', width, 4096, (3, 4)))
             self.assertFalse(package.compact_ws_export('glmf', 'spark', width, 4096, (4, 5)))
         # TP5 compact width 512 was never measured.
@@ -384,12 +408,14 @@ class PackageProfileTests(unittest.TestCase):
             for call in ws_calls:
                 self.assertTrue(call.kwargs['warp_specialized'])
                 self.assertEqual(call.kwargs['route_block'], 64)
-                self.assertEqual(call.kwargs['tile'], package.TILE_384_COMPACT)
+                self.assertEqual(call.kwargs['tile'], package.TILE_384_COMPACT_N192)
                 self.assertTrue(call.kwargs['ws_dynamic_tiles'])
                 self.assertNotIn('token_major_rotation', call.kwargs)
                 self.assertNotIn('wire_input', call.kwargs)
                 self.assertNotIn('ws_input_stages', call.kwargs)
-                self.assertIn('+ws-m64-dynamic', str(call.args[0]))
+                # The N192 export gets its own build-tree key so the round-1
+                # N128 objects of the same arm are never reused.
+                self.assertIn('+ws-m64-dynamic-n192', str(call.args[0]))
             for call in [call for call in compact_calls if call.args[3] == 1]:
                 self.assertNotIn('warp_specialized', call.kwargs)
                 self.assertEqual(call.kwargs['tile'], (64, 128, 64, 128))
@@ -397,7 +423,7 @@ class PackageProfileTests(unittest.TestCase):
             variant = next(v for v in manifest['variants']
                            if '-compact-' in v['directory'] and v['capacity'] == 4096)
             self.assertTrue(variant['warp_specialized'])
-            self.assertEqual(variant['tile'], list(package.TILE_384_COMPACT))
+            self.assertEqual(variant['tile'], list(package.TILE_384_COMPACT_N192))
             self.assertEqual(variant['route_block'], 64)
             self.assertTrue(variant['ws_dynamic_tiles'])
 
@@ -413,11 +439,16 @@ class PackageProfileTests(unittest.TestCase):
                              {256: 32, 1024: 64, 4096: 64})
             self.assertTrue(any('+ws-m32-dynamic' in str(call.args[0]) for call in ws_calls
                                 if call.args[3] == 256))
-            self.assertTrue(all('+ws-m64-dynamic' in str(call.args[0]) for call in ws_calls
+            self.assertTrue(all('+ws-m64-dynamic-n192' in str(call.args[0]) for call in ws_calls
                                 if call.args[3] >= 1024))
+            tiles = {call.args[3]: call.kwargs['tile'] for call in ws_calls}
+            self.assertEqual(tiles, {256: package.TILE_384_COMPACT,
+                                     1024: package.TILE_384_COMPACT_N192,
+                                     4096: package.TILE_384_COMPACT_N192})
             for variant in manifest['variants']:
                 if '-compact-' in variant['directory'] and variant['capacity'] == 256:
                     self.assertEqual(variant['route_block'], 32)
+                    self.assertEqual(variant['tile'], list(package.TILE_384_COMPACT))
 
     def test_compact_unmeasured_tier_family_stays_cooperative(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -454,7 +485,9 @@ class PackageProfileTests(unittest.TestCase):
             ('glm', 384, 256, (4, 5), {'ws_input_stages': 3}),
             ('glm', 384, 256, (4, 5), {'token_major_rotation': True}),
             ('glm', 384, 256, (4, 5), {'fused_input_rotation': True}),
-            ('glm', 384, 256, (4, 5), {'tile': [64, 128, 64, 128]}),
+            ('glm', 384, 1024, (4, 5), {'tile': [64, 128, 64, 128]}),
+            ('glm', 768, 4096, (4, 5), {'tile': [64, 128, 64, 256]}),
+            ('glmf', 384, 4096, (3, 4), {'tile': [64, 128, 64, 256]}),
             ('glm', 384, 80, (4, 5), {}),
             # Measured cells with the wrong per-capacity block: width 256 takes
             # 64 rows at m256, V4.1 width 640 takes 32.
@@ -475,8 +508,16 @@ class PackageProfileTests(unittest.TestCase):
                                if '-compact-' in v['directory'] and v['intermediate'] == width)
                 path = output / variant['directory'] / 'v41_exl3.json'
                 meta = json.loads(path.read_text())
-                meta.update(warp_specialized=True, route_block=64,
-                            ws_dynamic_tiles=True, tile=list(package.TILE_384_COMPACT))
+                # Seed the policy's own block/tile so a case fails only for
+                # what it overrides; an unqualified cell falls back to the
+                # canonical N128 contract, which the verifier still rejects.
+                block = package.compact_ws_route_block(geometry, 'spark', width, capacity)
+                tile = package.ws_tile(geometry, 'spark', width, capacity, compact=True)
+                meta.update(warp_specialized=True,
+                            route_block=block if block is not None else 64,
+                            ws_dynamic_tiles=True,
+                            tile=list(tile) if tile is not None
+                            else list(package.TILE_384_COMPACT))
                 meta.update(overrides)
                 path.write_text(json.dumps(meta))
                 manifest['files'][str(path.relative_to(output))] = {
