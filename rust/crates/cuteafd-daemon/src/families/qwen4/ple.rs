@@ -32,9 +32,9 @@ impl<'a> PleTable<'a> {
         &self.mapped
     }
 
-    /// `max_rows`: the most token rows one step gathers (mapped placement).
+    /// Token rows per admitted prefill wave and per decode/verify step.
     pub fn load(library: &'a NativeLibrary, checkpoint: &Checkpoint, cfg: &Qwen4Config, layer: usize,
-        args: &MappedTableArgs, max_rows: usize) -> Result<Self> {
+        args: &MappedTableArgs, prefill_rows: usize, prefill_slots: usize, decode_rows: usize) -> Result<Self> {
         let _memory_scope = cuteafd_ffi::memory_ledger::scope("ple");
         let loader = super::weights::Qwen4Loader { library, checkpoint, fp8_decode: false,
             fp8_scales: crate::shared::fp8_linear::Fp8Scales::Amax, stream: std::ptr::null_mut(),
@@ -91,7 +91,8 @@ impl<'a> PleTable<'a> {
         // SAFETY: checkpoint snapshots are immutable while the server runs.
         let mapped = unsafe { cuteafd_loader::MappedTable::from_tensors(&checkpoint.snapshot, &tensors)? };
         ensure!(mapped.row_bytes() == row_bytes && mapped.rows() as usize == rows, "mapped PLE table geometry");
-        let mapped = MappedTableDevice::new(library, "ple", mapped, args, max_rows * cfg.ple_rows())?;
+        let mapped = MappedTableDevice::new(library, "ple", mapped, args, prefill_rows * cfg.ple_rows(),
+            prefill_slots, decode_rows * cfg.ple_rows())?;
         tracing::info!(gib = total as f64 / (1u64 << 30) as f64, fp8, parts = shards.len(),
             elapsed_ms = started.elapsed().as_millis() as u64, "PLE n-gram table ready");
         cuteafd_bench::context::set_mapped_placement(cuteafd_loader::formats::mapped_preload::MappedPlacement::resolve(

@@ -41,6 +41,7 @@ use cuteafd_transport::{
 use std::cell::{Cell, RefCell};
 use crate::shared::decode_graph::{check_bucket_thresholds, masked_row, real_row_moe, ProjectionThreshold};
 use std::ffi::c_void;
+use std::sync::Arc;
 
 type Dev<'a> = Rc<Allocation<'a>>;
 
@@ -305,6 +306,15 @@ struct StepTables {
     long: bool,
     /// PLE table rows [rows, 16].
     ple_ids: Vec<i64>,
+}
+
+impl crate::shared::mapped_table::RowSource for StepTables {
+    fn units(&self) -> usize { 1 }
+    fn rows(&self, unit: usize) -> &[i64] { assert_eq!(unit, 0); &self.ple_ids }
+}
+impl crate::shared::mapped_table::RowSource for Vec<StepTables> {
+    fn units(&self) -> usize { self.len() }
+    fn rows(&self, unit: usize) -> &[i64] { &self[unit].ple_ids }
 }
 
 impl StepTables {
@@ -1437,7 +1447,7 @@ impl<'a> Qwen4Engine<'a> {
                     page_width: geometry.page_stride, pool_stride: geometry.pool_stride, ..Default::default() };
                 let mut tokens = Vec::new();
                 pad_decode_tables(&mut tables, &mut tokens, rows, self.ple.as_ref().map_or(0, |_| self.cfg.ple_rows()));
-                self.step(&tables, &tokens, rows, None, None, &Default::default(), true)?;
+                self.step(&Arc::new(tables), &tokens, rows, None, None, &Default::default(), true)?;
             }
             // SAFETY: queued captures/replays drain before reporting memory or publishing readiness.
             self.drain_state()
@@ -1890,6 +1900,15 @@ impl<'a> Qwen4Engine<'a> {
         ensure!(failures.is_empty(), "{}", failures.join("; ")); Ok(())
     }
 
+    /// A partial-model diagnostic has no logits readback to retire its rows.
+    fn drain_partial_step(&self) -> Result<()> {
+        drop(self.ple_pending.borrow_mut().take());
+        self.drain_state()?;
+        let device = self.library.cuda_get_device()?;
+        if let Some(ple) = &self.ple { ple.mapped().bind_readback(device, self.execution_stream()); }
+        crate::shared::mapped_table::check_readback(device, self.execution_stream())
+    }
+
     /// `bytes` at `offset` inside `pool`.
     fn region(pool: &Dev<'_>, offset: usize, bytes: usize) -> cuteafd_ffi::CuteafdDeviceBuffer {
         debug_assert!(offset + bytes <= pool.buffer.bytes);
@@ -2177,8 +2196,10 @@ impl<'a> Qwen4Engine<'a> {
     }
 
     fn download(&self, dev: &Dev<'_>, bytes: usize) -> Result<Vec<u8>> {
+        if let Some(ple) = &self.ple { ple.mapped().bind_readback(dev.buffer.device_id, self.execution_stream()); }
         // SAFETY: the engine owns this stream.
         unsafe { self.library.cuda_stream_synchronize(self.execution_stream())? };
+        crate::shared::mapped_table::check_readback(self.library.cuda_get_device()?, self.execution_stream())?;
         let mut out = vec![0u8; bytes];
         self.library.copy_d2h(&mut out, cuteafd_ffi::CuteafdDeviceBuffer { bytes, ..dev.buffer })?;
         Ok(out)
@@ -2255,7 +2276,7 @@ impl<'a> Qwen4Engine<'a> {
             page_stride: 0, pool_stride: 0, page_width: placement.pages.len(), ..Default::default() };
         self.rows(placement, tokens, 0, &mut tables)?;
         let media = embedding_media(&[(placement, start, t)])?;
-        let logits = self.step(&tables, tokens, logit_rows.clamp(1, t), on_layer, forced, &media, true)?;
+        let logits = self.step(&Arc::new(tables), tokens, logit_rows.clamp(1, t), on_layer, forced, &media, true)?;
         placement.len += t;
         placement.state_len = placement.len;
         Ok(logits)
@@ -2294,10 +2315,12 @@ impl<'a> Qwen4Engine<'a> {
         let w = workspace.as_ref().context("Qwen prefill workspace")?;
         w.terminal_valid.set(false);
         w.units.set(true);
-        let unit_tables: Vec<_> = units.iter().map(|unit| tables.unit(unit.rows.clone(),
-            if self.ple.is_some() { self.cfg.ple_rows() } else { 0 }, self.cfg.dense_context())).collect();
+        let unit_tables: Arc<Vec<_>> = Arc::new(units.iter().map(|unit| tables.unit(unit.rows.clone(),
+            if self.ple.is_some() { self.cfg.ple_rows() } else { 0 }, self.cfg.dense_context())).collect());
+        let ple_batch = self.ple.as_ref().map(|ple| ple.mapped().batch(Arc::clone(&unit_tables)
+            as Arc<dyn crate::shared::mapped_table::RowSource>));
         let run = |transport: Option<&mut crate::shared::spark_waves::Waves<'_>>| {
-            let mut hooks = UnitHooks { engine: self, transport, w, placement, tokens, tables: unit_tables,
+            let mut hooks = UnitHooks { engine: self, transport, w, placement, tokens, tables: unit_tables, ple_batch,
                 current: vec![0; units.len()], entered: vec![false; units.len()],
                 pending: (0..units.len()).map(|_| None).collect(), logit_rows };
             run_prefill_units(&mut hooks, &units, waves)
@@ -2321,7 +2344,11 @@ impl<'a> Qwen4Engine<'a> {
         placement.len += t;
         placement.state_len = placement.len;
         tracing::debug!(rows = t, unit_rows = shape.unit_rows, waves, units = units.len(), "Qwen prefill units");
-        Ok((self.weights.layers.len() == self.cfg.layers).then(|| self.device_logits(w, logit_rows, false)))
+        if self.weights.layers.len() < self.cfg.layers {
+            self.drain_partial_step()?;
+            return Ok(None);
+        }
+        Ok(Some(self.device_logits(w, logit_rows, false)))
     }
 
     pub(crate) fn mtp_prefill_rows(&self) -> usize {
@@ -2398,7 +2425,7 @@ impl<'a> Qwen4Engine<'a> {
             pad_decode_tables(&mut tables, &mut tokens, decode_bucket(rows, spec), self.ple.as_ref().map_or(0, |_| self.cfg.ple_rows()));
         }
         let physical_rows = tokens.len();
-        let mut logits = self.step(&tables, &tokens, physical_rows, on_layer, None, &media, graphs)?;
+        let mut logits = self.step(&Arc::new(tables), &tokens, physical_rows, on_layer, None, &media, graphs)?;
         if let Some(logits) = logits.as_mut() {
             // Greedy statuses remain after the physical bucket's ids, not the real rows.
             logits.rows = rows;
@@ -2716,13 +2743,13 @@ impl<'a> Qwen4Engine<'a> {
         Ok(())
     }
 
-    fn step(&self, tables: &StepTables, tokens: &[u32], logit_rows: usize, on_layer: LayerHook<'_>,
+    fn step(&self, tables: &Arc<StepTables>, tokens: &[u32], logit_rows: usize, on_layer: LayerHook<'_>,
         forced: Forced<'_>, media: &cuteafd_engine::media::MediaChunk, graphs: bool) -> Result<Option<DeviceLogits>> {
         crate::shared::experts::rtx::pair::submit(|| self.require_live(), || self.shutdown_submission(),
             || self.step_inner(tables, tokens, logit_rows, on_layer, forced, media, graphs))
     }
 
-    fn step_inner(&self, tables: &StepTables, tokens: &[u32], logit_rows: usize, mut on_layer: LayerHook<'_>,
+    fn step_inner(&self, tables: &Arc<StepTables>, tokens: &[u32], logit_rows: usize, mut on_layer: LayerHook<'_>,
         forced: Forced<'_>, media: &cuteafd_engine::media::MediaChunk, graphs: bool) -> Result<Option<DeviceLogits>> {
         self.last_stream_offset.set(0);
         if let Some(w) = self.workspace.borrow().as_ref() {
@@ -2761,9 +2788,9 @@ impl<'a> Qwen4Engine<'a> {
         match self.ple.as_ref().map(|p| p.mapped()) {
             // Gathers while the layers before the PLE layer are enqueued (`finish_ple`).
             Some(mapped) => {
-                // A failed step's rows are dropped (their gather waited) first.
+                // Cancel unsubmitted rows without waiting on page faults.
                 drop(self.ple_pending.borrow_mut().take());
-                *self.ple_pending.borrow_mut() = Some(mapped.begin(&tables.ple_ids, tables.decode)?);
+                *self.ple_pending.borrow_mut() = Some(mapped.begin(Arc::clone(tables) as Arc<dyn crate::shared::mapped_table::RowSource>, tables.decode)?);
             }
             None => self.stage_table(w, &w.ple_ids, &tables.ple_ids)?,
         }
@@ -2829,8 +2856,7 @@ impl<'a> Qwen4Engine<'a> {
         }
         self.last_streams.set((tables.decode, cur));
         if layers.len() < self.cfg.layers {
-            // SAFETY: the engine owns this stream.
-            unsafe { self.library.cuda_stream_synchronize(self.execution_stream())? };
+            self.drain_partial_step()?;
             return Ok(None);
         }
         self.head(w, &w.streams[cur], t, rows, logit_rows)?;
@@ -2858,7 +2884,7 @@ impl<'a> Qwen4Engine<'a> {
     /// Unfused ownership transitions: post on the old owner, hop, then pre on
     /// the new owner. Same-owner boundaries retain the fused post/pre path.
     #[allow(clippy::too_many_arguments)]
-    fn step_placed(&self, tables: &StepTables, tokens: &[u32], logit_rows: usize, mut on_layer: LayerHook<'_>,
+    fn step_placed(&self, tables: &Arc<StepTables>, tokens: &[u32], logit_rows: usize, mut on_layer: LayerHook<'_>,
         forced: Forced<'_>, media: &cuteafd_engine::media::MediaChunk, graphs: bool) -> Result<Option<DeviceLogits>> {
         let graphed = graphs && self.use_graphs && tables.decode
             && on_layer.is_none() && forced.is_none() && media.indices.is_empty();
@@ -2888,7 +2914,7 @@ impl<'a> Qwen4Engine<'a> {
         let work = [root.as_ref().context("root workspace")?, peer.as_ref().context("peer workspace")?];
         if let Some(mapped) = self.ple.as_ref().map(|p| p.mapped()) {
             drop(self.ple_pending.borrow_mut().take());
-            *self.ple_pending.borrow_mut() = Some(mapped.begin(&tables.ple_ids, tables.decode)?);
+            *self.ple_pending.borrow_mut() = Some(mapped.begin(Arc::clone(tables) as Arc<dyn crate::shared::mapped_table::RowSource>, tables.decode)?);
         }
         self.on_owner(0, || {
             self.stage_embedding(work[0], tokens, HC, &work[0].streams[0], graphed)?;
@@ -2962,7 +2988,7 @@ impl<'a> Qwen4Engine<'a> {
             // SAFETY: exit wait precedes the head/MTP owner-zero stream copy.
             unsafe { self.library.copy_d2d_async(dst, src, t * HC * h * 2, self.execution_stream())?; }
             self.last_streams.set((tables.decode, cur[0]));
-            if layers.len() < self.cfg.layers { self.drain_state()?; return Ok(None); }
+            if layers.len() < self.cfg.layers { self.drain_partial_step()?; return Ok(None); }
             self.head(work[0], &work[0].streams[cur[0]], t, rows, logit_rows)?;
             Ok(Some(self.device_logits(work[0], logit_rows, false)))
         })
@@ -3067,7 +3093,7 @@ impl<'a> Qwen4Engine<'a> {
                 Ok(())
             })?;
             self.last_streams.set((true, cur[0]));
-            if n < self.cfg.layers { self.drain_state()?; return Ok(None); }
+            if n < self.cfg.layers { self.drain_partial_step()?; return Ok(None); }
             if !head { self.head(work[0], &work[0].streams[cur[0]], t, rows, logit_rows)?; }
             Ok(Some(self.device_logits(work[0], logit_rows, head)))
         })
@@ -3127,6 +3153,9 @@ impl<'a> Qwen4Engine<'a> {
     /// The first `rows` logits rows as device logits (`greedy`: with the rows'
     /// selection from [`Self::select_greedy`]).
     fn device_logits(&self, w: &Workspace<'_>, rows: usize, greedy: bool) -> DeviceLogits {
+        if let Some(ple) = &self.ple {
+            ple.mapped().bind_readback(w.logits.buffer.device_id, self.execution_stream());
+        }
         let vocab = self.cfg.vocab_size;
         DeviceLogits { ptr: w.logits.buffer.ptr, rows, vocab, stride: vocab, stream: self.execution_stream(),
             greedy: greedy.then(|| (w.select.buffer.ptr.cast_const(), Self::region(&w.select, rows * 4, rows * 4).ptr
@@ -3135,6 +3164,7 @@ impl<'a> Qwen4Engine<'a> {
 
     /// The first `rows` logits rows through the pinned landing buffer.
     fn download_logits(&self, w: &Workspace<'_>, rows: usize) -> Result<Vec<f32>> {
+        if let Some(ple) = &self.ple { ple.mapped().bind_readback(w.logits.buffer.device_id, self.execution_stream()); }
         let n = rows * self.cfg.vocab_size;
         let host = w.logits_host.borrow();
         ensure!(n * 4 <= host.buffer.bytes, "logits rows exceed the landing buffer");
@@ -3142,6 +3172,7 @@ impl<'a> Qwen4Engine<'a> {
         unsafe {
             self.library.copy_d2h_host_buffer_async(host.buffer, w.logits.buffer, n * 4, self.execution_stream())?;
             self.library.cuda_stream_synchronize(self.execution_stream())?;
+            crate::shared::mapped_table::check_readback(self.library.cuda_get_device()?, self.execution_stream())?;
             Ok(std::slice::from_raw_parts(host.buffer.ptr.cast::<f32>(), n).to_vec())
         }
     }
@@ -3235,8 +3266,7 @@ impl<'a> Qwen4Engine<'a> {
         }
         self.last_streams.set((true, cur));
         if layers.len() < self.cfg.layers {
-            // SAFETY: the engine owns this stream.
-            unsafe { self.library.cuda_stream_synchronize(self.execution_stream())? };
+            self.drain_partial_step()?;
             return Ok(None);
         }
         if !head {
@@ -3313,8 +3343,8 @@ impl<'a> Qwen4Engine<'a> {
         Ok(())
     }
 
-    /// Mapped PLE table: waits for the step's rows and queues their upload
-    /// (outside any graph capture, before the PLE layer's work).
+    /// Device-order the gathered rows before PLE, outside graph capture.
+    /// The issuer does not wait for host gathers or staging reuse.
     fn finish_ple(&self, w: &Workspace<'_>) -> Result<()> {
         let (Some(mapped), Some((rows, _))) = (self.ple.as_ref().map(|p| p.mapped()), &w.ple_rows) else {
             return Ok(());
@@ -3685,11 +3715,18 @@ struct UnitHooks<'e, 'w, 'p, 't, 'a, 'r, 'n> {
     w: &'w Workspace<'a>,
     placement: &'p Qwen4Placement,
     tokens: &'t [u32],
-    tables: Vec<StepTables>,
+    tables: Arc<Vec<StepTables>>,
+    ple_batch: Option<Arc<crate::shared::mapped_table::RowBatch>>,
     current: Vec<usize>,
     entered: Vec<bool>,
     pending: Vec<Option<crate::shared::mapped_table::PendingRows>>,
     logit_rows: usize,
+}
+
+impl Drop for UnitHooks<'_, '_, '_, '_, '_, '_, '_> {
+    fn drop(&mut self) {
+        if let Some(batch) = &self.ple_batch { batch.cancel_unbegun(); }
+    }
 }
 
 impl UnitHooks<'_, '_, '_, '_, '_, '_, '_> {
@@ -3738,7 +3775,8 @@ impl crate::shared::prefill_pipeline::PrefillHooks for UnitHooks<'_, '_, '_, '_,
         self.select(unit)?;
         let engine = self.engine;
         if let Some(mapped) = engine.ple.as_ref().map(|p| p.mapped()) {
-            self.pending[unit.index] = Some(mapped.begin(&self.tables[unit.index].ple_ids, false)?);
+            let batch = self.ple_batch.as_ref().context("PLE prefill batch ownership")?;
+            self.pending[unit.index] = Some(mapped.begin_unit(batch, unit.index, false)?);
         }
         engine.stage_embedding(self.w, &self.tokens[unit.rows.clone()], HC, &self.w.streams[0], false)?;
         let start = self.tables[unit.index].positions[0] as usize;
