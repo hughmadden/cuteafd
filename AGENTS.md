@@ -19,11 +19,12 @@ before → after tables with conditions.
   `~/.cache/cuteafd/instances/<instance>/`; never delete the shared stores
   beside `builds/` (`bench`, `fidelity`, `console`, `instances`, caches):
   Docker recreates a missing bind source root-owned and breaks the server.
-- Profiling with root: run Nsight Compute directly as
-  `agent-sudo -n --agent-context "<why>" /usr/local/cuda/bin/ncu <args> <program>`
-  with the full command line visible. Never put ncu (or anything else) under
-  sudo inside a wrapper script or interpreter (`sudo python …`, `sudo bash …`):
-  the approver can't see what it runs and will flag or deny it.
+- Profiling: GPU performance counters are unlocked for users on every host
+  (`grep RmProfilingAdminOnly /proc/driver/nvidia/params` shows 0), so run
+  Nsight Compute as yourself, launching the program under it:
+  `ncu <args> <program>` on the host or in a dev container. No sudo. Never put
+  anything under sudo inside a wrapper script or interpreter (`sudo python …`,
+  `sudo bash …`): the approver can't see what it runs and will flag or deny it.
 - Canonical lock order: `sparks.lock` -> `gpu0.lock` -> `gpu1.lock` ->
   `rhea.lock` -> `moa.lock` -> `kakapo.lock` -> `cassowary.lock` ->
   `kakapo-export.lock` -> `cassowary-export.lock`. Never acquire an earlier lock
