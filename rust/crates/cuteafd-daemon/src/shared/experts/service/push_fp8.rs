@@ -1,4 +1,4 @@
-//! Optional native Spark transaction; prepared code/scratch survive mount fallback.
+//! Optional native Spark transaction; prepared code survives mount fallback.
 #[cfg(test)]
 #[path = "push_fp8/tests.rs"]
 mod tests;
@@ -50,7 +50,7 @@ pub(super) fn load<'a>(
                 .all(|file| cuteafd_loader::push_load::is_push_shard(&root.join(file))),
             "native push source is not a SparkNest shard"
         );
-        // Group scratch is already allocated; the free-memory query includes it.
+        // Execution scratch is allocated only after the weight transaction completes.
         let available = library.cuda_allocatable_memory_info()?.0;
         let headroom = super::spark_runtime_headroom()?;
         let peak = super::push::admit_peak(

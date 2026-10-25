@@ -122,6 +122,90 @@ fn cpu_format_and_quantizer_boundaries() {
 }
 
 #[test]
+#[ignore = "requires CUDA, CUTEAFD_NATIVE_LIB and a BF16-input FP8 CUTEAFD_FP8_SLOT_PACKAGE"]
+fn native_fp8_two_stream_slots_are_byte_exact_against_serial() -> Result<()> {
+    // SAFETY: this opt-in test accepts only operator-selected trusted build artifacts.
+    let library = unsafe { NativeLibrary::load(std::env::var("CUTEAFD_NATIVE_LIB")?)? };
+    library.cuda_set_device(0)?;
+    let directory = PathBuf::from(std::env::var("CUTEAFD_FP8_SLOT_PACKAGE")?);
+    // SAFETY: the selected native package targets the current CUDA device.
+    let module = unsafe { Fp8MoeModule::load(&directory)? };
+    let info = module.info().clone();
+    ensure!(info.weights == Fp8MoeWeights::Fp8 && !info.wire_input,
+        "two-stream qualification requires native block-FP8 weights with BF16 input");
+    let capacity = 256usize;
+    ensure!(info.capacity_for(capacity).is_some(), "test package needs 256 rows");
+    let mut regions = Vec::new();
+    for (projection, n, k) in [(0, info.slice, info.hidden), (1, info.slice, info.hidden),
+        (2, info.hidden, info.slice)] {
+        let matrix = n.checked_mul(k).context("test matrix overflow")?;
+        let weights = (0..info.experts * matrix).map(|at| {
+            let expert = at / matrix;
+            0x20 + ((at + expert * 7 + projection * 3) % 8) as u8
+        }).collect::<Vec<_>>();
+        let scales = (0..info.experts * n.div_ceil(128) * k.div_ceil(128))
+            .flat_map(|at| (0.01f32 + (at % 3) as f32 * 0.001).to_le_bytes()).collect::<Vec<_>>();
+        regions.push(Some(upload(&library, &weights)?.into()));
+        regions.push(Some(upload(&library, &scales)?.into()));
+    }
+    let resident = Rc::new(Fp8Weights { layers: vec![Fp8Layer { layer: 0,
+        slice: cuteafd_core::SparkSlice { unit_map: None, layer: 0, first: 0,
+            width: info.slice as u32, stored_width: info.slice as u32,
+            tiers: vec![], projection_counts: vec![] }, regions }],
+        module, bf16_module: None, tp: info.tp, rank: 0, weight_read_bytes: 1 });
+    let slots = [Fp8Experts::from_shared(&library, resident.clone(), capacity)?,
+        Fp8Experts::from_shared(&library, resident.clone(), capacity)?];
+    ensure!(slots[0].scratch.buffer.ptr != slots[1].scratch.buffer.ptr, "slots alias scratch");
+    let inputs = (0..2).map(|slot| {
+        let bytes = (0..capacity * info.hidden).flat_map(|at| {
+            let value = bf16(((at * 17 % 127) as f32 + 1.0) / (128.0 + slot as f32 * 128.0));
+            ((value.to_bits() >> 16) as u16).to_le_bytes()
+        }).collect::<Vec<_>>();
+        upload(&library, &bytes)
+    }).collect::<Result<Vec<_>>>()?;
+    let ids = upload(&library, &(0..capacity * info.topk)
+        .flat_map(|at| ((at % info.experts) as i32).to_le_bytes()).collect::<Vec<_>>())?;
+    let routing = upload(&library, &(0..capacity * info.topk)
+        .flat_map(|_| (1.0f32 / info.topk as f32).to_le_bytes()).collect::<Vec<_>>())?;
+    let outputs = (0..2).map(|_| DeviceAllocation::new(&library, capacity * info.hidden * 2))
+        .collect::<Result<Vec<_>>>()?;
+    // Declared last: these streams drain before any slot, weights or I/O is freed on every exit.
+    let streams = (0..2).map(|_| Ok(LoadStream { library: &library, raw: library.cuda_stream_create()? }))
+        .collect::<Result<Vec<_>>>()?;
+    for rows in [16usize, capacity] {
+        let launch = |slot: usize| -> Result<()> {
+            // SAFETY: this execution owns scratch; all buffers cover capacity and outlive both streams.
+            unsafe { slots[slot].run_bf16(0, rows, inputs[slot].buffer.ptr, ids.buffer.ptr,
+                routing.buffer.ptr, outputs[slot].buffer.ptr, streams[slot].raw) }
+        };
+        let mut serial = vec![vec![0; rows * info.hidden * 2]; 2];
+        for slot in 0..2 {
+            launch(slot)?;
+            // SAFETY: owned stream; all its allocations remain live.
+            unsafe { library.cuda_stream_synchronize(streams[slot].raw)?; }
+            library.copy_d2h(&mut serial[slot], outputs[slot].buffer)?;
+            ensure!(serial[slot].iter().any(|&byte| byte != 0), "zero serial output");
+        }
+        ensure!(serial[0] != serial[1], "test inputs do not distinguish the executions");
+        for iteration in 0..32 {
+            launch(iteration % 2)?;
+            launch(1 - iteration % 2)?;
+            for stream in &streams {
+                // SAFETY: all queued work still owns its scratch, weights and I/O.
+                unsafe { library.cuda_stream_synchronize(stream.raw)?; }
+            }
+            for slot in 0..2 {
+                let mut actual = vec![0; serial[slot].len()];
+                library.copy_d2h(&mut actual, outputs[slot].buffer)?;
+                ensure!(actual == serial[slot], "rows {rows} iteration {iteration} slot {slot}: concurrent bytes differ");
+            }
+        }
+        eprintln!("rows {rows}: two private-scratch streams byte-identical to serial over 32 overlaps");
+    }
+    Ok(())
+}
+
+#[test]
 #[ignore = "requires CUDA, CUTEAFD_NATIVE_LIB and CUTEAFD_STEP5_{FORMAT,SNAPSHOT,PACKAGE,BF16_PACKAGE}"]
 fn step5_checkpoint_mixed_native_execution_and_graph_replay() -> Result<()> {
     // SAFETY: this opt-in test accepts only operator-selected trusted build artifacts.

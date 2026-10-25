@@ -75,6 +75,31 @@ int cuteafd_rdma_rc_endpoint_try_poll(void *handle, uint32_t sends,
 
 int cuteafd_set_expert_hidden(uint32_t hidden) { (void)hidden; return 0; }
 
+/* Static native expert ABI: CPU slot-ownership tests allocate real fake-device
+ * buffers but never launch expert math. Each loaded module caches these words. */
+static uint32_t fp8_words[16];
+static uint64_t fp8_scratch[6];
+void fixture_configure_fp8(const uint32_t *words, const uint64_t *scratch) {
+    memcpy(fp8_words, words, sizeof(fp8_words));
+    memcpy(fp8_scratch, scratch, sizeof(fp8_scratch));
+}
+int cuteafd_fp8moe_info(uint32_t *words, uint32_t count) {
+    if (count != 16) return 1;
+    memcpy(words, fp8_words, sizeof(fp8_words)); return 0;
+}
+int cuteafd_fp8moe_scratch_bytes(uint32_t capacity, uint64_t *bytes) {
+    for (uint32_t i = 0; i < fp8_words[9]; ++i) {
+        if (fp8_words[10 + i] == capacity) { *bytes = fp8_scratch[i]; return 0; }
+    }
+    return 1;
+}
+int cuteafd_fp8moe_create(void **out) { *out = malloc(1); return *out ? 0 : 1; }
+int cuteafd_fp8moe_launch(void *ctx, uint32_t capacity, void **ptrs, int rows, void *stream) {
+    (void)ctx; (void)capacity; (void)ptrs; (void)rows; (void)stream;
+    return 1; /* No CPU stand-in for expert math. */
+}
+void cuteafd_fp8moe_destroy(void *ctx) { free(ctx); }
+
 int cuteafd_alloc_host_buffer(size_t bytes, struct host_buffer *out) {
     out->ptr = malloc(bytes);
     if (!out->ptr) return 1;
