@@ -275,7 +275,7 @@ class PackageProfileTests(unittest.TestCase):
                           for c in capacities], [False] * 3 + [True] * 4)
         self.assertEqual([package.compact_ws_route_block('glm', 'spark', 768, c)
                           for c in capacities], [None] * 3 + [64] * 4)
-        for geometry in ('dsv4p', 'kimik3', 'dsv4f', 'glmf'):
+        for geometry in ('dsv4p', 'kimik3', 'glmf'):
             for width in (384, 768):
                 if geometry == 'glmf' and width in (384, 768):
                     continue  # measured by test_compact_ws_qualifies_v41_and_qwen_cells
@@ -327,6 +327,27 @@ class PackageProfileTests(unittest.TestCase):
         self.assertFalse(package.compact_ws_export('glm', 'spark', 384, 80, (4, 5)))
         self.assertFalse(package.compact_ws_export('glm', 'spark', 768, 80, (4, 5)))
 
+    def test_compact_ws_qualifies_dsv4f_cells(self):
+        capacities = (1, 16, 80, 256, 1024, 2752, 4096)
+        # V4 Flash K4/K5, synthetic weights on uniform top-6 routes: both
+        # compact worlds take 32-row N128 blocks at m256 and 64-row N192
+        # blocks from m1024 up.
+        for width in (384, 768):
+            self.assertEqual([package.compact_warp_specialized('dsv4f', 'spark', width, c)
+                              for c in capacities], [False] * 3 + [True] * 4)
+            self.assertEqual([package.compact_ws_route_block('dsv4f', 'spark', width, c)
+                              for c in capacities], [None] * 3 + [32, 64, 64, 64])
+            self.assertEqual([package.ws_tile('dsv4f', 'spark', width, c, compact=True)
+                              for c in capacities],
+                             [None] * 3 + [package.TILE_384_COMPACT]
+                             + [package.TILE_384_COMPACT_N192] * 3)
+            self.assertTrue(package.compact_ws_export('dsv4f', 'spark', width, 4096, (4, 5)))
+            self.assertFalse(package.compact_ws_export('dsv4f', 'spark', width, 4096, (3, 4)))
+            self.assertFalse(package.compact_warp_specialized('dsv4f', 'coordinator', width, 4096))
+        # TP5 compact width 512 was never measured.
+        self.assertFalse(any(package.compact_warp_specialized('dsv4f', 'spark', 512, c)
+                             for c in capacities))
+
     def test_compact_ws_qualifies_v41_and_qwen_cells(self):
         capacities = (1, 16, 80, 256, 1024, 2752, 4096)
         # V4.1 K3/K4 TP4 compact width 640 (the only uneven V4.1 world): the
@@ -358,13 +379,21 @@ class PackageProfileTests(unittest.TestCase):
                              for c in (512, 2048, 8192)))
         self.assertFalse(package.compact_warp_specialized('v41', 'coordinator', 640, 4096))
         self.assertFalse(package.compact_warp_specialized('qwen4', 'coordinator', 384, 4096))
-        # Width 640 and 256 cannot take a 192-wide FC1 tile at all.
-        for geometry, width in (('v41', 640), ('qwen4', 256)):
-            for capacity in (256, 1024, 2752, 4096):
-                self.assertEqual(package.ws_tile(geometry, 'spark', width, capacity,
-                                                 compact=True),
-                                 package.TILE_384_COMPACT)
-            self.assertIsNone(package.ws_tile(geometry, 'spark', width, 80, compact=True))
+        # V4.1 width 640 is not divisible by 192, but the 192-wide FC1 tile
+        # still wins at m256..m2752; m4096 keeps N128.
+        self.assertEqual([package.ws_tile('v41', 'spark', 640, c, compact=True)
+                          for c in capacities],
+                         [None] * 3 + [package.TILE_384_COMPACT_N192] * 3
+                         + [package.TILE_384_COMPACT])
+        self.assertEqual(package.compact_ws_tile('v41', 'spark', 640, 2752),
+                         package.TILE_384_COMPACT_N192)
+        self.assertIsNone(package.compact_ws_tile('v41', 'spark', 640, 80))
+        # Qwen4 width 256 cannot take a 192-wide FC1 tile at all.
+        for capacity in (256, 1024, 2752, 4096):
+            self.assertEqual(package.ws_tile('qwen4', 'spark', 256, capacity,
+                                             compact=True),
+                             package.TILE_384_COMPACT)
+        self.assertIsNone(package.ws_tile('qwen4', 'spark', 256, 80, compact=True))
         # Qwen4 width 384 divides 192: the large capacities consolidate onto
         # the N192 arm and m256 keeps N128 behind the 32-row block.
         self.assertEqual([package.ws_tile('qwen4', 'spark', 384, c, compact=True)
@@ -493,10 +522,13 @@ class PackageProfileTests(unittest.TestCase):
             # 64 rows at m256, V4.1 width 640 takes 32.
             ('qwen4', 256, 256, (4, 5), {'route_block': 32}),
             ('v41', 640, 256, (3, 4), {'route_block': 64}),
+            ('v41', 640, 2752, (3, 4), {'tile': [64, 128, 64, 256]}),
+            ('v41', 640, 4096, (3, 4), {'tile': [64, 192, 64, 256]}),
             # A measured width of another tier pair, and compact cells that
             # were never measured, may not claim the warp-specialized contract.
             ('v41', 640, 4096, (4, 5), {}),
             ('dsv4f', 768, 4096, (3, 4), {}),
+            ('dsv4f', 768, 256, (4, 5), {'tile': [64, 192, 64, 256]}),
         ]
         for geometry, width, capacity, bits, overrides in cases:
             with self.subTest(geometry=geometry, width=width, capacity=capacity,

@@ -146,7 +146,8 @@ def jobs(scope):
                    ["--geometry", "mimop", "--capacities", CAPACITIES,
                     "--layouts", "tp6", "--exact-slices"]))
     for geometry, bits in (("qwen4", "4,5"), ("glm", "4,5"), ("glmf", "3,4"),
-                           ("dsv4f", "2,3"), ("v41", "2,3"), ("v41", "3,4"), ("v41", "4,5")):
+                           ("dsv4f", "2,3"), ("dsv4f", "4,5"), ("v41", "2,3"),
+                           ("v41", "3,4"), ("v41", "4,5")):
         result.append((f"exl3-compact-{geometry}-k{bits.replace(',', '')}", "package_exl3_aot.py",
                        ["--geometry", geometry, "--capacities", CAPACITIES, "--bits", bits,
                         "--compact-companions"]))
