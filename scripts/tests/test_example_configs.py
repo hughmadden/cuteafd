@@ -618,7 +618,9 @@ def test_v4_matrix_card_set_and_retired_pins() -> None:
     assert len(entries) == len(v4["entries"])
     for entry in v3["entries"]:
         if entry["name"].endswith("-5090") and entry["name"] != "qwen38-nvfp4-5090":
-            assert entries[entry["name"]] == entry
+            candidate = {**entries[entry["name"]], "set": dict(entries[entry["name"]]["set"])}
+            candidate["set"].pop("SPARK_EXPERT_DOCKER_INFERENCE", None)
+            assert candidate == entry
     assert entries["qwen38-exl3-5090"]["set"]["SPARK_COUNT"] == "1"
     for name, gpus, sparks in [
         ("v41-flash-max", 2, 6), ("v41-flash-reference-tp4", 1, 4),
@@ -635,10 +637,13 @@ def test_v4_matrix_card_set_and_retired_pins() -> None:
     assert {entry["name"]: entry["set"]["SPECULATOR"] for entry in dense} == {
         "qwen35-9b-bf16-min": "off", "qwen38-27b-bf16-min": "dspark",
         "qwen38-27b-fp8-min": "dspark"}
-    for key in ("ADDR", "EXPERT_PORT"):
-        for entry in dense:
-            assert sum(other.get("set", {}).get(key) == entry["set"][key]
-                       for other in v4["entries"]) == 1
+    assert "SPARK_EXPERT_DOCKER_INFERENCE" not in v4["defaults"]["set"]
+    for entry in v4["entries"]:
+        assert ("SPARK_EXPERT_DOCKER_INFERENCE" in entry["set"]) == bool(entry["sparks"])
+    for entry in dense:
+        assert "EXPERT_PORT" not in entry["set"]
+        assert sum(other.get("set", {}).get("ADDR") == entry["set"]["ADDR"]
+                   for other in v4["entries"]) == 1
     assert not any(name.startswith("qwen38-nvfp4") for name in entries)
     retired = v4["retired"]
     assert len(retired) == 14
