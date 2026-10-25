@@ -55,6 +55,11 @@ pub(crate) struct ServeArgs {
     /// sliding-window layers): an acceptance A/B; verification keeps the output unchanged.
     #[arg(long, hide = true, action = clap::ArgAction::Set)]
     draft_causal: Option<bool>,
+    /// DFlash2 selector scores: FP32 sums of the unary logit and BF16 edge, as SGLang's DFlash2
+    /// selector scores (the release's serving reference), or each rounded to BF16 (the GLM
+    /// ports'): an acceptance A/B.
+    #[arg(long, hide = true, default_value = "fp32", value_parser = ["fp32", "bf16"])]
+    draft_selector_score: String,
     /// Fixed draft depth (launcher SPECULATOR_DRAFTS); absent lets the
     /// shared policy choose up to the drafter's seven drafts, as on Kimi K3.
     #[arg(long, value_parser = clap::value_parser!(u8).range(1..=7))]
@@ -274,7 +279,8 @@ fn worker(args: &ServeArgs, receive: &mut tokio::sync::mpsc::Receiver<cuteafd_ap
     let draft_contract=if args.speculator=="dspark" {Some(cuteafd_loader::families::minimax_m3::dspark::DsparkContract::open(&args.snapshot)?)} else {None};
     let draft_layout=draft_contract.as_ref().map(|c|super::dspark::Layout::new(&library,c,rings,chunk)).transpose()?;
     let dflash=args.draft.as_deref().map(|snapshot| super::dflash::Contract::open(snapshot, args.draft_fp8,
-        args.draft_kv_cache, rings, library.sm_count()?, args.draft_causal)).transpose()?;
+        args.draft_kv_cache, rings, library.sm_count()?, args.draft_causal, args.draft_selector_score == "fp32"))
+        .transpose()?;
     // The drafter's 4 GB checkpoint is read while admission and the target load run.
     let dflash_file=dflash.as_ref().map(|c| crate::shared::speculation::dflash::prefetch(&c.snapshot));
     let (draft_bytes,draft_rings,draft_staging)=match (&draft_layout,&dflash) {
@@ -428,6 +434,7 @@ mod tests {
         let crate::cli::Commands::ServeMiniMax(a) = cli.command else { panic!("MiniMax dispatch") };
         assert_eq!((a.speculator.as_str(), a.draft.as_deref()), ("dflash2", Some(Path::new("/draft"))));
         assert_eq!((a.draft_fp8, a.draft_kv_cache, a.draft_fixed), (Some(false), Qwen4KvCache::Bf16, Some(7)));
+        assert_eq!(a.draft_selector_score, "fp32");
         assert!(a.validate().is_ok());
         assert!(crate::cli::Cli::try_parse_from(["cuteafd", "serve-minimax", "--snapshot", "/model",
             "--native-lib", "/lib.so", "--peers", "127.0.0.1:1,127.0.0.1:2", "--speculator", "eagle"]).is_err());

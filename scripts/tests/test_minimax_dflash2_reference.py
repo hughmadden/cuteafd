@@ -93,25 +93,31 @@ def test_reference_drafts_with_gemma_partial_rope_swiglu_oai_and_upstream_causal
     draft, target, window = snapshots
     drafter = reference.Drafter(draft, target, "cpu")
     assert (drafter.rotary, drafter.window, drafter.causal) == (16, WINDOW, True)
+    assert drafter.score_fp32
     outputs = {}
-    for causal in (None, 0):
-        out = tmp_path / f"out-{causal}"
+    for causal, score in ((None, None), (0, None), (None, "bf16")):
+        out = tmp_path / f"out-{causal}-{score}"
         command = [sys.executable, str(SCRIPT), "--draft", str(draft), "--target", str(target), "--golden", str(window),
                    "--positions", "3:20:4,21", "--out", str(out), "--device", "cpu"]
         if causal is not None:
             command += ["--causal", str(causal)]
+        if score is not None:
+            command += ["--selector-score", score]
         subprocess.run(command, check=True, capture_output=True, text=True)
         meta = json.loads((out / "meta.json").read_text())
         assert meta["positions"] == [3, 7, 11, 15, 19, 21] and meta["causal"] == (causal is None)
+        assert meta["selector_score"] == (score or "fp32")
         drafts = np.fromfile(out / "drafts.bin", dtype="<i4").reshape(6, BLOCK - 1)
         features = np.fromfile(out / "features.bin", dtype="<f4").reshape(6, BLOCK - 1, 4)
         hidden = np.fromfile(out / "hidden.bin", dtype="<u2").reshape(6, BLOCK, HIDDEN)
         assert ((0 <= drafts) & (drafts < VOCAB)).all() and np.isfinite(features).all()
         assert ((features[..., 3] >= 0) & (features[..., 3] < 4)).all()
-        outputs[causal] = hidden
+        outputs[causal, score] = hidden
     # The block mask changes every row after the anchor; the anchor row sees the same keys only
     # in its first layer, and the layers mix the rows.
-    assert not np.array_equal(outputs[None], outputs[0])
+    assert not np.array_equal(outputs[None, None], outputs[0, None])
+    # The selector's score precision changes drafts, never the block's hidden rows.
+    assert np.array_equal(outputs[None, None], outputs[None, "bf16"])
 
 
 def test_reference_refuses_other_draft_numerics(snapshots, tmp_path):

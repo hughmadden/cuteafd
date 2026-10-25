@@ -324,9 +324,12 @@ __global__ void topk_merge_kernel(const float* values, const int* indices, float
 // One block per sequence walks its drafted rows: score_k = bf16(unary_k +
 // bf16(sum_r bf16(pred[prev, r] * proj[r]) * succ[cand_k, r])); the best
 // (lowest rank on ties) becomes the next predecessor. Also writes the margin,
-// best probability, entropy and rank over the 16 scores per row.
+// best probability, entropy and rank over the 16 scores per row. With
+// `fp32_score` the score is the FP32 sum of the unary logit and the BF16 edge,
+// as SGLang's DFlash2 selector scores (MiniMax's reference); GLM's port rounds it.
 constexpr int kRank = 256;
 
+template <bool fp32_score>
 __global__ void select_kernel(const bf16* pred_cb, const bf16* succ_cb, const bf16* projected, const int* candidates,
                               const float* unary, const uint32_t* anchors, uint32_t* tokens, float* features,
                               int block_rows, int drafts) {
@@ -347,7 +350,10 @@ __global__ void select_kernel(const bf16* pred_cb, const bf16* succ_cb, const bf
       float dot = 0;
       for (int j = lane; j < kRank; j += 32) dot = fmaf(conditioned[j], f(succ[j]), dot);
       for (int o = 16; o; o >>= 1) dot += __shfl_xor_sync(0xffffffffu, dot, o);
-      if (lane == 0) edges[k] = r(unary[n * kTopK + k] + r(dot));
+      if (lane == 0) {
+        const float score = unary[n * kTopK + k] + r(dot);
+        edges[k] = fp32_score ? score : r(score);
+      }
     }
     __syncthreads();
     if (t == 0) {
@@ -629,16 +635,34 @@ extern "C" int32_t cuteafd_glm_dflash_topk(const void* logits, void* unary, void
 // tokens [sequences, drafts] U32 and features [sequences, drafts, 4] F32 from the
 // selector codebooks [vocab, 256], projected [sequences * block_rows, 256] and the
 // top-16 of each drafted row.
-extern "C" int32_t cuteafd_glm_dflash_select(const void* pred_cb, const void* succ_cb, const void* projected,
-                                             const void* candidates, const void* unary, const void* anchors,
-                                             void* tokens, void* features, int32_t sequences, int32_t block_rows,
-                                             int32_t drafts, int32_t rank, void* stream) {
+template <bool fp32_score>
+static int32_t select(const void* pred_cb, const void* succ_cb, const void* projected, const void* candidates,
+                      const void* unary, const void* anchors, void* tokens, void* features, int32_t sequences,
+                      int32_t block_rows, int32_t drafts, int32_t rank, void* stream) {
   if (sequences < 1 || rank != kRank || drafts < 1 || drafts >= block_rows) return cudaErrorInvalidValue;
-  select_kernel<<<sequences, kRank, 0, static_cast<cudaStream_t>(stream)>>>(
+  select_kernel<fp32_score><<<sequences, kRank, 0, static_cast<cudaStream_t>(stream)>>>(
       static_cast<const bf16*>(pred_cb), static_cast<const bf16*>(succ_cb), static_cast<const bf16*>(projected),
       static_cast<const int*>(candidates), static_cast<const float*>(unary), static_cast<const uint32_t*>(anchors),
       static_cast<uint32_t*>(tokens), static_cast<float*>(features), block_rows, drafts);
   return cudaGetLastError();
+}
+
+extern "C" int32_t cuteafd_glm_dflash_select(const void* pred_cb, const void* succ_cb, const void* projected,
+                                             const void* candidates, const void* unary, const void* anchors,
+                                             void* tokens, void* features, int32_t sequences, int32_t block_rows,
+                                             int32_t drafts, int32_t rank, void* stream) {
+  return select<false>(pred_cb, succ_cb, projected, candidates, unary, anchors, tokens, features, sequences,
+                       block_rows, drafts, rank, stream);
+}
+
+// cuteafd_glm_dflash_select scoring each candidate as the FP32 sum of its unary logit and BF16 edge.
+extern "C" int32_t cuteafd_glm_dflash_select_fp32_score(const void* pred_cb, const void* succ_cb,
+                                                        const void* projected, const void* candidates,
+                                                        const void* unary, const void* anchors, void* tokens,
+                                                        void* features, int32_t sequences, int32_t block_rows,
+                                                        int32_t drafts, int32_t rank, void* stream) {
+  return select<true>(pred_cb, succ_cb, projected, candidates, unary, anchors, tokens, features, sequences,
+                      block_rows, drafts, rank, stream);
 }
 
 // dst[row, offset : offset + width] = src[row, :] for `rows` BF16 rows (width,

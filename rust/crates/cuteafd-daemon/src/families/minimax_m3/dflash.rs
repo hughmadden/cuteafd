@@ -58,6 +58,9 @@ pub(super) struct Contract {
     pub bytes: u64,
     /// The largest BF16 source matrix held while packing one FP8 weight (0 for BF16).
     pub staging: u64,
+    /// The selector scores candidates in FP32, as SGLang's DFlash2 selector does (the release's
+    /// serving reference); off, it rounds each score to BF16 as the GLM ports do.
+    pub selector_fp32: bool,
 }
 
 impl Contract {
@@ -65,7 +68,7 @@ impl Contract {
     /// sequences, at most 32), sized for a GPU of `sms` SMs. `causal` overrides the upstream
     /// mask's block causality (a diagnostic A/B; acceptance only, never output).
     pub fn open(snapshot: &Path, fp8: Option<bool>, kv_cache: Qwen4KvCache, slots: usize, sms: usize,
-        causal: Option<bool>) -> Result<Self> {
+        causal: Option<bool>, selector_fp32: bool) -> Result<Self> {
         let config = cuteafd_loader::plan::checkpoint::read_json(&snapshot.join("config.json"))?;
         let representation = GlmDraftRepresentation::from_fp8_option(fp8);
         // The planner's recipe: one memory for both ledgers.
@@ -77,7 +80,7 @@ impl Contract {
         let upstream = BlockMask::upstream(&config)?;
         let mask = BlockMask { causal: causal.unwrap_or(upstream.causal), ..upstream };
         Ok(Self { snapshot: snapshot.into(), mask, cfg, representation, kv_cache,
-            slots, sequences: memory.sequences, bytes: memory.bytes, staging: memory.staging })
+            slots, sequences: memory.sequences, bytes: memory.bytes, staging: memory.staging, selector_fp32 })
     }
 }
 
@@ -94,10 +97,12 @@ impl<'a> Dflash<'a> {
             contract.kv_cache)?;
         ensure!(drafter.cfg.window == contract.cfg.window && drafter.cfg.causal == contract.mask.causal,
             MiniMaxError::Invalid("DFlash2 drafter differs from its admission"));
+        drafter.set_selector_fp32(contract.selector_fp32);
         drafter.prepare_workspace()?;
         tracing::info!(representation = contract.representation.name(), kv_cache = %contract.kv_cache,
             rings = contract.slots, sequences = contract.sequences, bytes = contract.bytes, ring = contract.cfg.window,
-            causal = contract.mask.causal, row_window = contract.mask.row_window, "MiniMax DFlash2 drafter resident");
+            causal = contract.mask.causal, row_window = contract.mask.row_window,
+            selector_score = if contract.selector_fp32 { "fp32" } else { "bf16" }, "MiniMax DFlash2 drafter resident");
         Ok(Self { drafter })
     }
 

@@ -17,8 +17,8 @@ Run with Python containing CUDA PyTorch, on one GPU.
    `--head-input` qualifies each file at its serving row count, not as one concatenated GEMM.
    `--head` reads `lm_head.weight` from a checkpoint shard; otherwise the weight is synthetic.
 3. `--dflash2-only`: the shared DFlash2 kernels a MiniMax M3.1 Flash draft adds (`_gemma` norms,
-   partial RoPE in BF16 and FP8 rings, SwiGLU-OAI, the F32 tap, the 200,064-entry top-16, block
-   attention over 128 queries per KV head, causal or not) against torch oracles that round where
+   partial RoPE in BF16 and FP8 rings, SwiGLU-OAI, the F32 tap, the 200,064-entry top-16, the
+   FP32-scored selector, block attention over 128 queries per KV head, causal or not) against torch oracles that round where
    the kernels round, and the new block attention ABI against the GLM drafters' one bit for bit
    on GLM shapes. Every check runs and prints its result; the run fails at the end if any did.
    With --fp8-baseline (a library built before these kernels), every GLM entry point must return
@@ -937,9 +937,11 @@ def dflash2_check(lib, args):
         "cuteafd_glm_dflash_attention": attention, "cuteafd_glm_dflash_attention_fp8": attention,
         "cuteafd_glm_dflash_block_attention_workspace": ([I] * 5, C.c_uint64),
         "cuteafd_glm_dflash_block_attention": block_attention, "cuteafd_glm_dflash_block_attention_fp8": block_attention,
+        "cuteafd_glm_dflash_select": ([P] * 8 + [I] * 4 + [P], I),
+        "cuteafd_glm_dflash_select_fp32_score": ([P] * 8 + [I] * 4 + [P], I),
     }
     glm_entries = [name for name in signatures if "gemma" not in name and "swiglu" not in name
-                   and "tap_f32" not in name and "block_attention" not in name]
+                   and "tap_f32" not in name and "block_attention" not in name and "fp32_score" not in name]
     baseline = C.CDLL(args.fp8_baseline) if args.fp8_baseline else None
     for native, names in [(lib, signatures)] + ([(baseline, glm_entries)] if baseline else []):
         for name in names:
@@ -1159,6 +1161,57 @@ def dflash2_check(lib, args):
         checks("topk vocab=262145 refused", lib.cuteafd_glm_dflash_topk(ptr(logits), ptr(unary), ptr(candidates),
                ptr(workspace), 1, 8, 7, 262145, stream) != 0, "past the top-16 capacity")
 
+    def selector():
+        # The greedy candidate walk: BF16 scores (the GLM ports) and FP32 ones (SGLang's DFlash2
+        # selector, MiniMax). Each step is checked on the kernel's own path against an FP64-edge
+        # oracle: the FP32 edge sum may move a BF16 edge rounding, so a choice within that slack
+        # of the oracle's best passes, but most must be the oracle's best exactly.
+        vocab, rank, sequences, block = 4096, 256, 6, 8
+        drafts = block - 1
+        pred = (torch.randn(vocab, rank, device="cuda") * 0.3).to(bf16)
+        succ = (torch.randn(vocab, rank, device="cuda") * 0.3).to(bf16)
+        projected = (torch.randn(sequences * block, rank, device="cuda") * 0.5).to(bf16)
+        candidates = torch.stack([torch.randperm(vocab, device="cuda")[:16] for _ in range(sequences * drafts)]).int()
+        # Top-16 values as the head's top-k leaves them: BF16-rounded, largest first, close calls.
+        unary = (20 + torch.randn(sequences * drafts, 16, device="cuda") * 0.4).to(bf16).float().sort(-1, True).values
+        anchors = torch.randint(0, vocab, (sequences,), device="cuda", dtype=torch.int32)
+        chosen = {}
+        for name, fp32 in (("cuteafd_glm_dflash_select", False), ("cuteafd_glm_dflash_select_fp32_score", True)):
+            tokens = torch.zeros(sequences * drafts, device="cuda", dtype=torch.int32)
+            features = torch.zeros(sequences * drafts, 4, device="cuda")
+            if not checks.launched(name, getattr(lib, name)(ptr(pred), ptr(succ), ptr(projected), ptr(candidates),
+                    ptr(unary), ptr(anchors), ptr(tokens), ptr(features), sequences, block, drafts, rank, stream)):
+                continue
+            torch.cuda.synchronize()
+            chosen[fp32] = tokens.clone()
+            exact = within = 0
+            worst = 0.0
+            for s_ in range(sequences):
+                previous = int(anchors[s_])
+                for i in range(drafts):
+                    n = s_ * drafts + i
+                    conditioned = (pred[previous].float() * projected[s_ * block + 1 + i].float()).to(bf16)
+                    dot = (conditioned.double()[None] * succ[candidates[n].long()].double()).sum(-1)
+                    score = unary[n] + dot.float().to(bf16).float()
+                    if not fp32:
+                        score = score.to(bf16).float()
+                    best = int(torch.argmax(score))
+                    pick = int((candidates[n] == tokens[n]).nonzero()[0]) if (candidates[n] == tokens[n]).any() else -1
+                    gap = float(score[best] - score[pick]) if pick >= 0 else float("inf")
+                    exact += int(pick == best)
+                    within += int(pick >= 0 and gap <= 2.0 ** -6 * max(abs(float(score[best])), 1.0))
+                    worst = max(worst, gap)
+                    previous = int(tokens[n])
+            total = sequences * drafts
+            checks(f"{name} walk", within == total and exact >= 0.9 * total,
+                   f"{exact}/{total} the oracle's best, {within}/{total} within the edge-rounding slack (worst gap {worst:.3g})")
+            valid = bool(((features[:, 0] >= 0) & (features[:, 1] > 0) & (features[:, 1] <= 1) & (features[:, 2] >= -1e-5)
+                          & (features[:, 2] <= 2.80) & (features[:, 3] >= 0) & (features[:, 3] < 16)).all())
+            checks(f"{name} features", valid, "margin, probability, entropy and rank in the fit's ranges")
+        if len(chosen) == 2:
+            print(f"selector: FP32 and BF16 scores choose differently in {int((chosen[True] != chosen[False]).sum())}"
+                  f"/{chosen[True].numel()} steps on these close calls")
+
     def block_attention_checks():
         # Block attention: 16 queries per KV head x 8 block rows (four 32-query slices), per-row
         # 4096 windows over a 4096-position ring, causal or bidirectional blocks, BF16 and FP8 rings;
@@ -1308,10 +1361,17 @@ def dflash2_check(lib, args):
         workspace = torch.empty(lib.cuteafd_glm_dflash_topk_workspace(16 * 7), device="cuda", dtype=torch.uint8)
         same("cuteafd_glm_dflash_topk", lambda f: f(ptr(logits), ptr(unary), ptr(candidates), ptr(workspace), 16, 8, 7,
              154880, stream), [unary, candidates])
+        pred, succ = ((torch.randn(154880, 256, device="cuda") * 0.3).to(bf16) for _ in range(2))
+        projected = (torch.randn(16 * 8, 256, device="cuda") * 0.5).to(bf16)
+        anchors = torch.randint(0, 154880, (16,), device="cuda", dtype=torch.int32)
+        tokens = torch.empty(16 * 7, device="cuda", dtype=torch.int32)
+        features = torch.empty(16 * 7, 4, device="cuda")
+        same("cuteafd_glm_dflash_select", lambda f: f(ptr(pred), ptr(succ), ptr(projected), ptr(candidates), ptr(unary),
+             ptr(anchors), ptr(tokens), ptr(features), 16, 8, 7, 256, stream), [tokens, features])
 
     for name, run in (("tap_f32", tap_f32), ("swiglu_oai", swiglu), ("rmsnorm", norms),
                       ("conv_residual_norm", conv_norms), ("qk_rope_gemma", qk_rope), ("topk", topk),
-                      ("block_attention", block_attention_checks)):
+                      ("selector", selector), ("block_attention", block_attention_checks)):
         checks.section(name, run)
     if baseline is None:
         print("dflash2: no --fp8-baseline: GLM entry points were not compared with a sealed library")

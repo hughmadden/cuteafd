@@ -22,7 +22,8 @@ convolution, selector and BF16 GEMM boundaries are GLM's DFlash2 reference's:
            s = h + conv1(o) in FP32, h = bf16(s), n = gemma(s) (a fused add-norm sees the
            unrounded sum); the MLP likewise with mlp_conv, SwiGLU-OAI on [gate | up].
   head     logits = lm_head(norm(h))[1:8]; top-16 per row; the selector walks the rows
-           greedily (GLM's reference).
+           greedily (GLM's reference), scoring each candidate as its unary logit plus the BF16
+           edge in FP32 as SGLang's DFlash2 selector does (--selector-score bf16: GLM's rounding).
 
 Writes, for every anchor position p in --positions (context = golden taps of rows
 max(0, p - 4096)..p-1, anchor = tokens[p]):
@@ -71,7 +72,8 @@ def block_mask(position: int, context: int, block: int, window: int, causal: boo
 class Drafter(GlmDrafter):
     """The GLM reference's selector over MiniMax's Gemma-norm, partial-RoPE, SwiGLU-OAI block."""
 
-    def __init__(self, draft: Path, target: Path, device: str, causal: bool | None = None):
+    def __init__(self, draft: Path, target: Path, device: str, causal: bool | None = None,
+                 score_fp32: bool = True):
         self.cfg = json.loads((draft / "config.json").read_text())
         c, dc = self.cfg, self.cfg["dflash_config"]
         if (not c.get("use_gemma_norm") or c.get("hidden_act") != "swigluoai" or c.get("attention_output_gate")
@@ -87,6 +89,8 @@ class Drafter(GlmDrafter):
         self.alpha, self.limit = float(c["swiglu_alpha"]), float(c["swiglu_limit"])
         self.window, self.layers = c["sliding_window"], c["num_hidden_layers"]
         self.causal = c.get("is_causal", True) if causal is None else causal
+        # SGLang's DFlash2 selector scores candidates in FP32 (unary logit plus BF16 edge).
+        self.score_fp32 = score_fp32
         self.device = device
         f = safe_open(str(draft / "model.safetensors"), framework="pt", device=device)
         self.w = {k: f.get_tensor(k) for k in f.keys()}
@@ -179,9 +183,13 @@ def main() -> None:
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--causal", type=int, choices=(0, 1), help="block rows attend causally (default: the "
                         "config's is_causal, else 1 as SGLang serves sliding-window layers)")
+    parser.add_argument("--selector-score", choices=("fp32", "bf16"), default="fp32",
+                        help="selector scores: FP32 as SGLang's DFlash2 selector (serving's default) or BF16-rounded "
+                        "as the GLM ports (minimax-golden --draft-selector-score)")
     args = parser.parse_args()
     torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = False
-    drafter = Drafter(args.draft, args.target, args.device, None if args.causal is None else bool(args.causal))
+    drafter = Drafter(args.draft, args.target, args.device, None if args.causal is None else bool(args.causal),
+                      score_fp32=args.selector_score == "fp32")
     tokens = torch.frombuffer(bytearray((args.golden / "tokens.bin").read_bytes()), dtype=torch.int32)
     hidden_size = drafter.cfg["hidden_size"]
     taps = torch.cat([torch.frombuffer(bytearray((args.golden / f"layer{layer:02d}.bin").read_bytes()),
@@ -197,7 +205,7 @@ def main() -> None:
         for p in positions:
             first = max(0, p - drafter.window)
             h = drafter.body(int(tokens[p]), p, [(k[first:p], v[first:p]) for k, v in ctx])
-            t, f = drafter.select(int(tokens[p]), h)
+            t, f = drafter.select(int(tokens[p]), h, fp32_score=drafter.score_fp32)
             drafts.append(t)
             features.append(f)
             hidden.append(h.cpu())
@@ -209,6 +217,7 @@ def main() -> None:
              for p in positions]
     accepted = [next((i for i, (d, t) in enumerate(zip(ds, ts)) if d != t), len(ds)) for ds, ts in zip(drafts, truth)]
     (args.out / "meta.json").write_text(json.dumps({"positions": positions, "causal": drafter.causal,
+        "selector_score": args.selector_score,
         "accepted_vs_tokens": accepted, "mean_accepted": sum(accepted) / len(accepted)}, indent=1))
     print(f"{len(positions)} anchors, mean accepted prefix vs golden tokens {sum(accepted) / len(accepted):.2f}")
 

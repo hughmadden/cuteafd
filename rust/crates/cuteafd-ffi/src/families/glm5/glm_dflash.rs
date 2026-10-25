@@ -233,6 +233,23 @@ impl NativeLibrary {
         }, "select")
     }
 
+    /// [`Self::glm_dflash_select`] scoring each candidate as the FP32 sum of its unary logit and
+    /// BF16 edge (SGLang's DFlash2 selector) rather than its BF16 rounding.
+    ///
+    /// # Safety
+    /// As [`Self::linear_bf16`].
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn glm_dflash_select_fp32_score(&self, pred_cb: P, succ_cb: P, projected: P, candidates: P,
+        unary: P, anchors: P, tokens: M, features: M, sequences: usize, block_rows: usize, drafts: usize,
+        rank: usize, stream: M) -> Result<()> {
+        type F = unsafe extern "C" fn(P, P, P, P, P, P, M, M, i32, i32, i32, i32, M) -> i32;
+        let f = *unsafe { self.lib.get::<F>(b"cuteafd_glm_dflash_select_fp32_score") }?;
+        check(unsafe {
+            f(pred_cb, succ_cb, projected, candidates, unary, anchors, tokens, features, i(sequences)?,
+                i(block_rows)?, i(drafts)?, i(rank)?, stream)
+        }, "select")
+    }
+
     /// `dst[row, offset..offset + width] = src[row]` for BF16 rows.
     ///
     /// # Safety
