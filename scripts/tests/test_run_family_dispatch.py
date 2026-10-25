@@ -424,15 +424,19 @@ def test_dense_qwen_wip_uses_native_single_gpu_and_no_workers(tmp_path: Path, ca
 
 
 @pytest.mark.parametrize("model", ["Qwen/Qwen3.5-9B", "Qwen/Qwen3.8-27B-FP8"])
-def test_dense_qwen_requires_resolved_coordinator_prefill_unit(tmp_path, model):
+@pytest.mark.parametrize("inventory", ["", "EXPERT_PORT=20480\n"
+    "SPARK_EXPERT_DOCKER_INFERENCE=unused-worker:release\n"
+    "SPARK_EXPERT_DOCKER_DEV=unused-worker:dev\nSPARK_0_HOST=h0\n"])
+def test_dense_qwen_requires_resolved_coordinator_prefill_unit(tmp_path, model, inventory):
     shape = {"prefill_unit_rows": 4096, "prefill_waves": 1, "prefill_span_rows": 4096}
     result = _family_launch_result(tmp_path, DENSE_CONFIG, model,
-        "SPARK_COUNT=0\nSPECULATOR=off\n", extra_args=("--wip", "dense-test"),
+        "SPARK_COUNT=0\nSPECULATOR=off\n" + inventory, extra_args=("--wip", "dense-test"),
         deployment_overrides=shape,
         encoder_plan={"placement_supported": True, "fits": True, "spark_ranks": 0})
     assert result.returncode == 0, result.stderr
     assert "serve-qwen35 --snapshot" in result.stderr
     assert "cuteafd expertd-native" not in result.stderr
+    assert "ssh h0" not in result.stderr
 
 
 @pytest.mark.parametrize("missing", ["prefill_unit_rows", "prefill_waves"])

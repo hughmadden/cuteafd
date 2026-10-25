@@ -166,6 +166,9 @@ GATEWAY
 EOF
   if [[ "$1" == qwen3_5 ]]; then
     cat <<'EOF'
+EXPERT_PORT
+SPARK_EXPERT_DOCKER_INFERENCE
+SPARK_EXPERT_DOCKER_DEV
 SPECULATOR_DEPTH
 SPECULATOR_MODEL_ID
 SPECULATOR_MODEL_REVISION
@@ -183,7 +186,7 @@ PROFILE_NCU_SET
 PROFILE_NCU_SKIP
 PROFILE_NSYS_GPU_METRICS
 EOF
-    # Inventory hosts are accepted but never contacted by this RTX-only family.
+    # Shared worker inventory is inert for this RTX-only family.
     _spark_slot_keys HOST LANE_A
     return
   fi
