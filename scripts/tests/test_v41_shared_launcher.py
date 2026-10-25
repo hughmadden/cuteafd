@@ -303,7 +303,10 @@ def test_v41_fp8_head_key_rejects_bad_values_and_env_conflicts(tmp_root, monkeyp
     config = example_config("deepseek-v41-mxfp4-max", tmp_root)
     config.write_text(config.read_text() + "V41_FP8_HEAD=bf16\n")
     env = {**os.environ, "HOME": str(tmp_root), "PATH": "/usr/bin:/bin"}
-    hf = tmp_root / "hf" / "hub" / "models--deepseek-ai--DeepSeek-V4.1-Flash" / "snapshots" / "dba1be0a40aa45a94ad051997016db3960a90277"
+    # The checkpoint the example names: family detection reads its config.json first.
+    values = dict(line.split("=", 1) for line in config.read_text().splitlines() if line.startswith("MODEL_"))
+    hf = (tmp_root / "hf" / "hub" / f"models--{values['MODEL_ID'].replace('/', '--')}" / "snapshots"
+          / values["MODEL_REVISION"])
     hf.mkdir(parents=True, exist_ok=True)
     (hf / "config.json").write_text('{"model_type": "deepseek_v41"}')
     env["HF_HOME"] = str(tmp_root / "hf")
