@@ -1721,6 +1721,7 @@ native_symbols! {
     cuteafd_cuda_stream_wait_event: CudaStreamWaitEventFn,
     cuteafd_cuda_event_create: CudaEventCreateFn,
     cuteafd_cuda_event_create_ordering: CudaEventCreateFn,
+    cuteafd_cuda_event_create_blocking: CudaEventCreateFn,
     cuteafd_cuda_event_destroy: CudaEventDestroyFn,
     cuteafd_cuda_event_record: CudaEventRecordFn,
     cuteafd_cuda_event_record_external: CudaEventRecordFn,
@@ -2528,6 +2529,17 @@ impl NativeLibrary {
         let mut cuda_event = std::ptr::null_mut();
         let status = unsafe { create_fn(&mut cuda_event) };
         self.status_to_result("cuteafd_cuda_event_create_ordering", status)?;
+        Ok(cuda_event)
+    }
+
+    /// An ordering event whose [`Self::cuda_event_synchronize`] sleeps until
+    /// the device signals it instead of spinning: per-step host waits.
+    pub fn cuda_event_create_blocking(&self) -> Result<*mut c_void> {
+        let create_fn: CudaEventCreateFn = self.cuteafd_cuda_event_create_blocking()?;
+        let mut cuda_event = std::ptr::null_mut();
+        // SAFETY: the output is a valid local; native writes it only on success.
+        let status = unsafe { create_fn(&mut cuda_event) };
+        self.status_to_result("cuteafd_cuda_event_create_blocking", status)?;
         Ok(cuda_event)
     }
 
@@ -8278,4 +8290,24 @@ pub fn background_thread_priority() {
         // lowering its priority needs no privilege and owns no borrowed memory.
         let _ = unsafe { setpriority(0, 0, 10) };
     }
+}
+
+/// Sets the calling thread's timer slack (how late the kernel may wake it
+/// from a sleep), so a polling thread that sleeps between short waits wakes
+/// within microseconds of its deadline instead of the default 50 us.
+pub fn set_thread_timer_slack_ns(nanoseconds: u64) -> Result<()> {
+    // SAFETY: PR_SET_TIMERSLACK takes an integer argument and affects only
+    // the calling thread; no memory is passed.
+    let status = unsafe { libc::prctl(libc::PR_SET_TIMERSLACK, nanoseconds as libc::c_ulong, 0, 0, 0) };
+    anyhow::ensure!(status == 0, "prctl(PR_SET_TIMERSLACK) failed: {}", std::io::Error::last_os_error());
+    Ok(())
+}
+
+/// CPU seconds the calling thread has consumed (CLOCK_THREAD_CPUTIME_ID).
+pub fn thread_cpu_seconds() -> Result<f64> {
+    let mut now = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+    // SAFETY: `now` is a valid, writable timespec for the duration of the call.
+    let status = unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut now) };
+    anyhow::ensure!(status == 0, "clock_gettime(CLOCK_THREAD_CPUTIME_ID) failed: {}", std::io::Error::last_os_error());
+    Ok(now.tv_sec as f64 + now.tv_nsec as f64 * 1e-9)
 }

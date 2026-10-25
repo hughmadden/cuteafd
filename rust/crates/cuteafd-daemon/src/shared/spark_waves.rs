@@ -226,16 +226,38 @@ struct Inflight<W> {
     times: WaveTimes,
 }
 
-/// Idle passes the worker spins before it yields (each pass polls the
-/// counters and the CQs, so this is a few tens of microseconds).
+/// Idle passes the worker spins after progress before it may sleep (each
+/// pass polls the counters and the CQs: a few tens of microseconds).
 const SPIN_PASSES: u32 = 256;
-/// Idle passes between clock reads (the no-progress deadline and the idle
-/// block are seconds and hundreds of microseconds).
+/// Idle passes between clock reads (the no-progress deadline and the sleep
+/// decisions are tens of microseconds and up).
 const IDLE_CLOCK: u32 = 64;
-/// With nothing outstanding it keeps polling this long (a decode step's next
-/// layer follows within a layer's time), yielding after [`SPIN_PASSES`],
-/// then blocks on its channel.
-const IDLE_SPIN: Duration = Duration::from_micros(500);
+/// One sleep while a wave cannot complete yet. With the thread's timer slack
+/// at 1 us and shallow idle states this wakes within a few microseconds.
+const SLEEP: Duration = Duration::from_micros(20);
+/// A wave sleeps only through this share of its expected duration (the
+/// running mean of the last waves), then spins: completion stays within a
+/// spin of the event, while the long middle of every Spark round trip and
+/// every GPU stage costs no CPU.
+const SLEEP_SHARE: f64 = 0.7;
+/// Weight of the newest wave in the running means.
+const MEAN_WEIGHT: f64 = 0.125;
+/// With nothing outstanding it keeps polling this long (a step's layers are
+/// queued in one burst), then blocks on its channel.
+const IDLE_SPIN: Duration = Duration::from_micros(30);
+
+/// Running means of how long waves take, which decide how long the worker
+/// may sleep before a wave can complete.
+#[derive(Default)]
+struct Pace { round_trip: Option<f64>, staging: Option<f64> }
+impl Pace {
+    fn add(mean: &mut Option<f64>, sample: f64) {
+        *mean = Some(mean.map_or(sample, |mean| mean + MEAN_WEIGHT * (sample - mean)));
+    }
+    /// Whether a wait that has lasted `age` seconds, of a kind whose mean is
+    /// `mean`, is still early enough to sleep through.
+    fn early(mean: Option<f64>, age: f64) -> bool { mean.is_some_and(|mean| age < SLEEP_SHARE * mean) }
+}
 
 /// The worker's loop until its channel closes or a transport error. It never
 /// blocks on one condition while another could progress: it posts the oldest
@@ -250,6 +272,14 @@ pub(crate) fn run_worker<B: Backend>(backend: &mut B, inbox: &mpsc::Receiver<Com
     // (a busy loop must not spend its time reading the clock).
     let mut idle_since: Option<Instant> = None;
     let mut idle_passes = 0u32;
+    let mut pace = Pace::default();
+    // Whether the current wait is early enough to sleep through, and whether
+    // the last pass slept (the next one re-decides).
+    let (mut early, mut slept) = (false, false);
+    // When the last wave landed: a queued job's staging on the GPU cannot
+    // finish before that (its slot or stream waits for the landing), so its
+    // wait is timed from the later of this and its send (the host runs ahead).
+    let mut last_landed = Instant::now();
     let result = (|| -> Result<()> {
         loop {
             let mut progressed = false;
@@ -279,6 +309,7 @@ pub(crate) fn run_worker<B: Backend>(backend: &mut B, inbox: &mpsc::Receiver<Com
                     let job = queued.pop_front().expect("front job");
                     let (sequence, slot, rows) = (job.sequence, job.slot, job.rows);
                     let mut times = WaveTimes { staged: job.sent.elapsed().as_secs_f64(), ..Default::default() };
+                    Pace::add(&mut pace.staging, job.sent.max(last_landed).elapsed().as_secs_f64());
                     let started = Instant::now();
                     let wave = backend.post(job)?;
                     times.posted = started.elapsed().as_secs_f64();
@@ -291,6 +322,8 @@ pub(crate) fn run_worker<B: Backend>(backend: &mut B, inbox: &mpsc::Receiver<Com
                 if backend.poll(&mut front.wave, front.slot, front.rows)? {
                     let mut done = inflight.pop_front().expect("front wave");
                     done.times.received = done.posted.elapsed().as_secs_f64();
+                    Pace::add(&mut pace.round_trip, done.times.received);
+                    last_landed = Instant::now();
                     backend.publish(done.sequence);
                     if timing {
                         tracing::info!(target: "cuteafd::timing", sequence = done.sequence, slot = done.slot,
@@ -311,6 +344,7 @@ pub(crate) fn run_worker<B: Backend>(backend: &mut B, inbox: &mpsc::Receiver<Com
             if progressed {
                 idle_since = None;
                 idle_passes = 0;
+                (early, slept) = (false, false);
                 continue;
             }
             idle_passes = idle_passes.wrapping_add(1);
@@ -320,7 +354,23 @@ pub(crate) fn run_worker<B: Backend>(backend: &mut B, inbox: &mpsc::Receiver<Com
                 // reply, which carries its own transport deadline.
                 ensure!(empty || since.elapsed() < timeout, "Spark exchange made no progress for {timeout:?}");
             }
-            if idle_passes < SPIN_PASSES { std::hint::spin_loop(); } else { std::thread::yield_now(); }
+            if idle_passes < SPIN_PASSES || empty {
+                std::hint::spin_loop();
+                continue;
+            }
+            // Sleep only while what blocks progress is early in its expected
+            // duration: the oldest wave's round trip, or the next job's
+            // staging on the GPU. Decided after a sleep or every IDLE_CLOCK
+            // passes, so spinning near completion reads no clock.
+            if slept || idle_passes % IDLE_CLOCK == 0 {
+                early = match (inflight.front(), queued.front()) {
+                    (Some(wave), _) => Pace::early(pace.round_trip, wave.posted.elapsed().as_secs_f64()),
+                    (None, Some(job)) => Pace::early(pace.staging, job.sent.max(last_landed).elapsed().as_secs_f64()),
+                    (None, None) => false,
+                };
+            }
+            slept = early;
+            if early { std::thread::sleep(SLEEP); } else { std::hint::spin_loop(); }
         }
     })();
     (result, highest)
@@ -558,6 +608,11 @@ impl<'a> Waves<'a> {
             staging_bytes = arenas.first().map_or(0, StagingArena::bytes), "Spark exchange worker started");
         let (jobs, inbox) = mpsc::channel();
         let worker = std::thread::Builder::new().name("spark-exchange".into()).spawn(move || {
+            // Short sleeps between a wave's post and its expected completion
+            // must wake on time (see `SLEEP`).
+            if let Err(error) = cuteafd_ffi::set_thread_timer_slack_ns(1_000) {
+                tracing::warn!("Spark exchange worker keeps the default timer slack: {error:#}");
+            }
             let (result, highest) = run_worker(&mut native, &inbox, timeout, timing);
             if let Err(error) = &result {
                 cuteafd_transport::health::record_failure(format!("Spark exchange: {error:#}"));

@@ -317,6 +317,8 @@ cuteafd_status_t cuteafd_cuda_stream_query(void* cuda_stream, int32_t* ready);
 cuteafd_status_t cuteafd_cuda_stream_wait_event(void* cuda_stream, void* cuda_event);
 cuteafd_status_t cuteafd_cuda_event_create(void** out_cuda_event);
 cuteafd_status_t cuteafd_cuda_event_create_ordering(void** out_cuda_event);
+// Ordering event whose synchronize sleeps instead of spinning (per-step waits).
+cuteafd_status_t cuteafd_cuda_event_create_blocking(void** out_cuda_event);
 cuteafd_status_t cuteafd_cuda_event_destroy(void* cuda_event);
 cuteafd_status_t cuteafd_cuda_event_record(void* cuda_event, void* cuda_stream);
 // Retains a timestamp-producing event node inside captured profiling graphs.

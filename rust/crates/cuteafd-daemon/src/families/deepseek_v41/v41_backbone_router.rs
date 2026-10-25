@@ -992,5 +992,13 @@ mod host_order_tests {
         let lane = include_str!("v41_backbone_lane.rs");
         let advance = lane.split("pub fn advance(&mut self)").nth(1).unwrap().split("\n    }\n").next().unwrap();
         assert!(advance.contains("self.query.rebind(") && advance.contains("self.router.rebind("));
+        // Nothing is queued on the router's stream after that wait: the
+        // exchange stages remote requests on the wave's own stream when the
+        // router shares its GPU (the router's rebind failed otherwise, #731).
+        let coordinator = include_str!("v41_experts/coordinator.rs");
+        let dispatch = coordinator.split("pub(crate) unsafe fn dispatch_ffn<'w>(").nth(1).unwrap()
+            .split("\n    }\n").next().unwrap();
+        assert!(dispatch.contains("if sources[0].device_id == self.link.device() { self.stream.raw } else { router_stream }"));
+        assert!(dispatch.contains("exchange.send(routed.rows as usize, layout, sources, stage, build)"));
     }
 }

@@ -137,6 +137,8 @@ pub(crate) struct MimoDrafter<'a> {
     timing: crate::shared::draft::timing::DraftTiming<'a>,
     pub cfg: DflashConfig,
     stream: *mut c_void,
+    /// The draft round's host wait: sleeps instead of spinning the engine thread.
+    round: std::cell::RefCell<crate::shared::memory::BlockingWait<'a>>,
     /// Ring slots (sequences with a drafter context).
     pub slots: usize,
     max_sequences: usize,
@@ -465,6 +467,7 @@ impl<'a> MimoDrafter<'a> {
             kv_cache,
             library,
             stream,
+            round: std::cell::RefCell::new(crate::shared::memory::BlockingWait::new(library)),
             slots,
             max_sequences,
             fc: matrix(tensor("fc.weight", &[h, taps])?, h, taps, true)?,
@@ -770,7 +773,7 @@ impl<'a> MimoDrafter<'a> {
             l.glm_dflash_topk(w.logits.buffer.ptr, w.unary.buffer.ptr, w.candidates.buffer.ptr,
                 w.topk_workspace.buffer.ptr, s_count, block, c.drafts(), c.vocab, s)?;
             self.timing.end(head_span, s)?;
-            l.cuda_stream_synchronize(s)?;
+            self.round.borrow_mut().wait(s)?;
         }
         self.timing.publish_completed()?;
         self.timing.dump_head_input(w.n.buffer, rows, h)?;

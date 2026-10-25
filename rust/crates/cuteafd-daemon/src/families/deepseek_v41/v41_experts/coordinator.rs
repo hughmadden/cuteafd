@@ -358,12 +358,19 @@ impl<'a> NativeTp4Wave<'a> {
         let (binding, build) = routed.request_builder(placement, rows,
             self.native.as_ref().map(|(_, planner)| std::sync::Arc::clone(planner)))?;
         let (layout, sources) = routed.wave_sources()?;
+        // Stage on this wave's own stream when the router shares its GPU: the
+        // lane's owners (the router among them) then carry nothing past their
+        // per-layer host waits, which a host-ordered pass relies on when it
+        // rebinds them (`LoadStream::require_complete`). A router on the other
+        // GPU (TP2 shared, device-ordered passes) stages from its own stream.
+        let stage = if sources[0].device_id == self.link.device() { self.stream.raw } else { router_stream };
         let exchange = self.link.exchange()?;
-        // SAFETY: the sources are the router's live device outputs, complete
-        // in `router_stream` order once it joined the chain (caller contract).
+        // SAFETY: the sources are the router's live device outputs, complete in
+        // chain order: `stage` joins the chain head, which the router's stage
+        // finished (caller contract).
         let ticket = unsafe {
-            crate::shared::memory::chain::join(self.library, router_stream)?;
-            exchange.send(routed.rows as usize, layout, sources, router_stream, build)?
+            crate::shared::memory::chain::join(self.library, stage)?;
+            exchange.send(routed.rows as usize, layout, sources, stage, build)?
         };
         Ok(NativePendingFfn { ticket, binding, layer: routed.layer, rows: routed.rows, library: self.library,
             stream: &self.stream, link: &mut self.link, output: self.output.buffer, ready_rows: &mut self.ready_rows,

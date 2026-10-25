@@ -310,8 +310,13 @@ struct EchoWorld {
     inputs: Vec<Vec<u8>>,
     /// The exchange's counters, set once it started (diagnosis).
     words: Arc<std::sync::OnceLock<Words>>,
+    /// A rank's rows arrive this long after the post (a Spark round trip).
+    delay: Duration,
+    /// The worker thread's CPU seconds and wall time over the run.
+    cpu: Option<(f64, Instant)>,
+    spent: Option<(f64, f64)>,
 }
-struct EchoWave { slot: usize, rows: Vec<Vec<u8>>, polls: usize }
+struct EchoWave { slot: usize, rows: Vec<Vec<u8>>, polls: usize, posted: Instant }
 
 fn rank_rows(hidden: &[u8], rank: usize) -> Vec<u8> {
     hidden.chunks_exact(2).flat_map(|word| {
@@ -345,12 +350,14 @@ impl Transport for EchoWorld {
             }
             anyhow::bail!("request for layer {layer}: {}", report.join("; "));
         }
-        Ok(EchoWave { slot, rows: (0..self.ranks).map(|rank| rank_rows(hidden, rank)).collect(), polls: 0 })
+        if self.cpu.is_none() { self.cpu = Some((cuteafd_ffi::thread_cpu_seconds()?, Instant::now())); }
+        Ok(EchoWave { slot, rows: (0..self.ranks).map(|rank| rank_rows(hidden, rank)).collect(), polls: 0,
+            posted: Instant::now() })
     }
     fn poll(&mut self, wave: &mut EchoWave, sink: &mut dyn FnMut(usize, u32, &[u8]) -> Result<()>)
         -> Result<Option<u8>> {
         wave.polls += 1;
-        if wave.polls < 3 { return Ok(None); }
+        if wave.polls < 3 || wave.posted.elapsed() < self.delay { return Ok(None); }
         for (rank, rows) in wave.rows.iter().enumerate() {
             if self.landing & (1 << rank) != 0 {
                 let (ptr, _) = self.planes[wave.slot][rank];
@@ -362,6 +369,9 @@ impl Transport for EchoWorld {
                 sink(rank, 0, &rows[..half])?;
                 sink(rank, (half / self.row_bytes) as u32, &rows[half..])?;
             }
+        }
+        if let Some((cpu, wall)) = self.cpu {
+            self.spent = Some((cuteafd_ffi::thread_cpu_seconds()? - cpu, wall.elapsed().as_secs_f64()));
         }
         Ok(Some(self.landing))
     }
@@ -389,8 +399,12 @@ fn gpu_exchange_queues_a_step_ahead_and_lands_byte_exact() -> Result<()> {
     // staging copy (24-byte route rows are not 16-byte multiples).
     let (hidden, topk) = (5120usize, 6usize);
     let row_bytes = hidden * 2;
-    for (ranks, landing, waves, layers, rows) in [(3usize, 0u8, 1usize, 80u32, 16usize), (4, 0b0101, 1, 80, 64),
-        (3, 0b111, 1, 80, 1), (4, 0, 3, 24, 128), (6, 0b100001, 2, 30, 64)] {
+    // The last case models a Spark round trip (800 us per wave) and reports
+    // the worker thread's CPU share over it.
+    for (ranks, landing, waves, layers, rows, delay_us) in [(3usize, 0u8, 1usize, 80u32, 16usize, 0u64),
+        (4, 0b0101, 1, 80, 64, 0), (3, 0b111, 1, 80, 1, 0), (4, 0, 3, 24, 128, 0), (6, 0b100001, 2, 30, 64, 0),
+        (3, 0b111, 1, 80, 1, 800)] {
+        let delay = Duration::from_micros(delay_us);
         let capacity = rows;
         let planes_owned = (0..ranks).map(|_| DeviceAllocation::new(&library, capacity * row_bytes * waves))
             .collect::<Result<Vec<_>>>()?;
@@ -409,7 +423,7 @@ fn gpu_exchange_queues_a_step_ahead_and_lands_byte_exact() -> Result<()> {
             let value = if i < 8 { ((layer >> i) & 1) as f32 / 2.0 } else { ((i * 7 + layer * 13) % 9) as f32 / 2.0 - 2.0 };
             ((value.to_bits() >> 16) as u16).to_le_bytes()
         }).collect()).collect();
-        let echo = EchoWorld { library: library.clone(), ranks, row_bytes, landing, next_slot: 0, inputs: hosts.clone(), words: words.clone(),
+        let echo = EchoWorld { library: library.clone(), ranks, row_bytes, landing, next_slot: 0, inputs: hosts.clone(), words: words.clone(), delay, cpu: None, spent: None,
             planes: planes.iter().map(|slot| slot.iter().map(|plane| (plane.ptr as usize, plane.bytes)).collect()).collect() };
         let intake = Intake { ranks, rows: capacity, row_bytes, waves, planes, landing, next_slot: 0 };
         let mut exchange = Waves::start(&library, intake, echo, Vec::new(), arenas, false)?;
@@ -484,8 +498,10 @@ fn gpu_exchange_queues_a_step_ahead_and_lands_byte_exact() -> Result<()> {
                     (row {row}), {bad} of {rows} rows, row matches layer {source:?}");
             }
         }
-        let (_echo, _) = exchange.stop::<EchoWorld>()?;
-        eprintln!("exchange ranks={ranks} landing={landing:#b} waves={waves}: {layers} layers of {rows} rows byte-exact");
+        let (echo, _) = exchange.stop::<EchoWorld>()?;
+        let share = echo.spent.map(|(cpu, wall)| format!(", worker CPU {:.0}% of {:.1} ms", 100.0 * cpu / wall, wall * 1e3))
+            .filter(|_| delay_us > 0).unwrap_or_default();
+        eprintln!("exchange ranks={ranks} landing={landing:#b} waves={waves}: {layers} layers of {rows} rows byte-exact{share}");
     }
     Ok(())
 }

@@ -1339,6 +1339,27 @@ extern "C" cuteafd_status_t cuteafd_cuda_event_create(void** out_cuda_event) {
 }
 
 // Ordering-only event: no timestamp, so record and stream waits are cheaper.
+// An ordering event whose cudaEventSynchronize blocks the host thread (sleeps
+// until the device interrupts) instead of spinning, whatever the context's
+// scheduling flags: for per-step host waits that last milliseconds.
+extern "C" cuteafd_status_t cuteafd_cuda_event_create_blocking(void** out_cuda_event) {
+  if (out_cuda_event == nullptr) {
+    return fail(CUTEAFD_STATUS_INVALID_ARGUMENT, "CUDA event output pointer is null");
+  }
+  *out_cuda_event = nullptr;
+#if CUTEAFD_NATIVE_ENABLE_CUDA
+  cudaEvent_t event = nullptr;
+  cudaError_t err = cudaEventCreateWithFlags(&event, cudaEventDisableTiming | cudaEventBlockingSync);
+  if (err != cudaSuccess) {
+    return fail_cuda(CUTEAFD_STATUS_CUDA_UNAVAILABLE, "cudaEventCreateWithFlags(blocking) failed", err);
+  }
+  *out_cuda_event = reinterpret_cast<void*>(event);
+  return ok();
+#else
+  return fail(CUTEAFD_STATUS_CUDA_UNAVAILABLE, "CUDA events are unavailable in this build");
+#endif
+}
+
 extern "C" cuteafd_status_t cuteafd_cuda_event_create_ordering(void** out_cuda_event) {
   if (out_cuda_event == nullptr) {
     return fail(CUTEAFD_STATUS_INVALID_ARGUMENT, "CUDA event output pointer is null");

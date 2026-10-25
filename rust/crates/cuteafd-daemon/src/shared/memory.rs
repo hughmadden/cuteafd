@@ -186,6 +186,58 @@ impl<'a> LayerStaging<'a> {
     }
     pub(crate) fn region_bytes(&self) -> usize { self.region }
 }
+/// A host wait for a stream's queued work that sleeps instead of spinning:
+/// one blocking-sync event per device, recorded on the stream and then
+/// synchronized. For per-step waits that last milliseconds (the sampling
+/// sync, a draft round): the context's default scheduling spins the waiting
+/// thread for their whole duration.
+pub(crate) struct BlockingWait<'a> {
+    library: &'a NativeLibrary,
+    events: Vec<(i32, *mut std::ffi::c_void)>,
+}
+
+impl<'a> BlockingWait<'a> {
+    pub(crate) fn new(library: &'a NativeLibrary) -> Self { Self { library, events: Vec::new() } }
+
+    /// Waits until everything queued on `stream` so far has completed.
+    ///
+    /// # Safety
+    /// `stream` is a live stream of the current device.
+    pub(crate) unsafe fn wait(&mut self, stream: *mut std::ffi::c_void) -> Result<()> {
+        let device = self.library.cuda_get_device()?;
+        let event = match self.events.iter().find(|(owner, _)| *owner == device) {
+            Some(&(_, event)) => event,
+            None => {
+                let event = self.library.cuda_event_create_blocking()?;
+                self.events.push((device, event));
+                event
+            }
+        };
+        // SAFETY: the event belongs to the current device, as does `stream`
+        // (the caller's contract); it lives until this wait drops.
+        unsafe {
+            self.library.cuda_event_record(event, stream)?;
+            self.library.cuda_event_synchronize(event)
+        }
+    }
+}
+
+impl Drop for BlockingWait<'_> {
+    fn drop(&mut self) {
+        for &(device, event) in &self.events {
+            let previous = self.library.cuda_get_device();
+            let _ = self.library.cuda_set_device(device);
+            // SAFETY: created by this wait on `device`; synchronizing retires
+            // its last record before the event is destroyed.
+            unsafe {
+                let _ = self.library.cuda_event_synchronize(event);
+                let _ = self.library.cuda_event_destroy(event);
+            }
+            if let Ok(previous) = previous { let _ = self.library.cuda_set_device(previous); }
+        }
+    }
+}
+
 pub(crate) struct LoadStream<'a> {
     pub(crate) library: &'a NativeLibrary,
     pub(crate) raw: *mut c_void,

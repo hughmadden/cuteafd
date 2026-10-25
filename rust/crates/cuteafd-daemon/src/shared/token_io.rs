@@ -493,21 +493,6 @@ impl SelectBatch {
 
 pub(crate) type RowResult = std::result::Result<Selected, TargetSamplingError>;
 
-impl Drop for TokenSelector<'_> {
-    fn drop(&mut self) {
-        for &(device, event) in &self.landed {
-            let previous = self.library.cuda_get_device();
-            let _ = self.library.cuda_set_device(device);
-            // SAFETY: created by this selector on `device`; synchronizing
-            // retires its last record before the event is destroyed.
-            unsafe {
-                let _ = self.library.cuda_event_synchronize(event);
-                let _ = self.library.cuda_event_destroy(event);
-            }
-            if let Ok(previous) = previous { let _ = self.library.cuda_set_device(previous); }
-        }
-    }
-}
 
 
 /// Selects next tokens from device logits (see the module docs).
@@ -525,7 +510,8 @@ pub(crate) struct TokenSelector<'a> {
     /// Per CUDA device: an ordering event recorded behind a selection's
     /// landing copies, so the host waits for those and not for whatever is
     /// queued on the logits stream after them.
-    landed: Vec<(i32, *mut c_void)>,
+    /// The step's sampling wait: sleeps, does not spin the engine thread.
+    landed: crate::shared::memory::BlockingWait<'a>,
     /// Selections served by the greedy kernel, the sampler, the host.
     pub counts: [u64; 3],
 }
@@ -596,7 +582,7 @@ impl<'a> TokenSelector<'a> {
     pub fn new(library: &'a NativeLibrary, placement: SelectPlacement, vocab: usize, capacity: usize) -> Result<Self> {
         ensure!(capacity > 0 && vocab > 0, "token selector of {capacity} rows x {vocab}");
         Ok(Self { library, placement, vocab, capacity, out: DeviceAllocation::new(library, capacity * 12)?,
-            landing: HostAllocation::new(library, capacity * 12)?, wave: None, landed: Vec::new(), counts: [0; 3] })
+            landing: HostAllocation::new(library, capacity * 12)?, wave: None, landed: crate::shared::memory::BlockingWait::new(library), counts: [0; 3] })
     }
 
     /// Waits until `stream` passed the work queued on it so far (the
@@ -607,21 +593,8 @@ impl<'a> TokenSelector<'a> {
     /// # Safety
     /// `stream` is a live stream of the current device.
     unsafe fn wait_landed(&mut self, stream: *mut c_void) -> Result<()> {
-        let device = self.library.cuda_get_device()?;
-        let event = match self.landed.iter().find(|(owner, _)| *owner == device) {
-            Some(&(_, event)) => event,
-            None => {
-                let event = self.library.cuda_event_create_ordering()?;
-                self.landed.push((device, event));
-                event
-            }
-        };
-        // SAFETY: the event belongs to the current device, as does `stream`
-        // (the caller's contract); the event lives until this selector drops.
-        unsafe {
-            self.library.cuda_event_record(event, stream)?;
-            self.library.cuda_event_synchronize(event)?;
-        }
+        // SAFETY: forwarded from this function's contract.
+        unsafe { self.landed.wait(stream)? };
         crate::shared::spark_waves::healthy()
     }
 
