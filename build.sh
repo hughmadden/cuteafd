@@ -66,6 +66,13 @@ CUTEAFD_RELEASE_REMOTE_BUILD_DIR selects where the Spark seed host stages the so
 tree and builds the expert images (default: a cuteafd-release-build directory in the
 seed host's own home). Use a fresh one per release so a previous staging tree cannot
 be reused.
+CUTEAFD_RELEASE_IMAGE_TRANSPORT picks how the Spark image reaches the other build
+hosts: rdma (default; rdmapipe seed -> each peer) or ssh-hub (for hub-and-spoke
+fabrics: one docker image save from the seed into a task-owned archive under
+CUTEAFD_RELEASE_IMAGE_HUB_DIR on this host, then CUTEAFD_RELEASE_IMAGE_HUB_PARALLEL
+(default 3) concurrent docker image loads over ssh; the directory needs
+CUTEAFD_RELEASE_IMAGE_HUB_MIN_FREE_GIB, default 40). Both are checked before any
+compile, and every host's image must match the seed's ID or portable content.
 CUTEAFD_RELEASE_SSH_CONFIG, CUTEAFD_RELEASE_BUILD_ROOT and
 CUTEAFD_RELEASE_REMOTE_BUILD_DIR must each be a canonical absolute path built from
 letters, digits, dot, underscore, plus and minus - no spaces, dot segments, trailing
@@ -312,6 +319,163 @@ spark_export_min_free_gib="${CUTEAFD_RELEASE_SPARK_MIN_FREE_GIB:-100}"
   release_die "CUTEAFD_RELEASE_SPARK_MIN_FREE_GIB must be positive GiB"
 # release-build-budget:end
 
+# release-image-distribution:start
+# How the fresh Spark image reaches the other build hosts. `rdma` (default) streams
+# seed -> peer through rdmapipe. `ssh-hub` is for hub-and-spoke fabrics where the
+# Sparks reach each other only through the host running this script: one
+# `docker image save` on the seed lands in a task-owned archive here, then a bounded
+# fan-out of `docker image load` over plain ssh feeds every other host. It needs only
+# ssh and docker, sends nothing spoke to spoke, and both modes are preflighted before
+# any compile.
+release_image_transport="${CUTEAFD_RELEASE_IMAGE_TRANSPORT:-rdma}"
+release_image_hub_dir="${CUTEAFD_RELEASE_IMAGE_HUB_DIR:-}"
+release_image_hub_parallel="${CUTEAFD_RELEASE_IMAGE_HUB_PARALLEL:-3}"
+release_image_hub_min_free_gib="${CUTEAFD_RELEASE_IMAGE_HUB_MIN_FREE_GIB:-40}"
+release_image_hub_archive=""
+case "$release_image_transport" in
+  rdma) ;;
+  ssh-hub)
+    [[ -n "$release_image_hub_dir" ]] ||
+      release_die "CUTEAFD_RELEASE_IMAGE_TRANSPORT=ssh-hub needs CUTEAFD_RELEASE_IMAGE_HUB_DIR, a task-owned directory on this host"
+    release_validate_path_setting CUTEAFD_RELEASE_IMAGE_HUB_DIR "$release_image_hub_dir"
+    release_path_within "$release_image_hub_dir" "$repo_root" &&
+      release_die "CUTEAFD_RELEASE_IMAGE_HUB_DIR must not be $repo_root or inside it"
+    [[ "$release_image_hub_parallel" =~ ^[1-9][0-9]?$ ]] ||
+      release_die "CUTEAFD_RELEASE_IMAGE_HUB_PARALLEL must be 1-99 concurrent loads"
+    [[ "$release_image_hub_min_free_gib" =~ ^[1-9][0-9]*$ ]] ||
+      release_die "CUTEAFD_RELEASE_IMAGE_HUB_MIN_FREE_GIB must be positive GiB"
+    ;;
+  *) release_die "CUTEAFD_RELEASE_IMAGE_TRANSPORT must be rdma or ssh-hub, got: $release_image_transport" ;;
+esac
+release_image_transport_plan="rdma: rdmapipe seed -> each peer"
+[[ "$release_image_transport" == rdma ]] ||
+  release_image_transport_plan="ssh-hub: seed docker save -> $release_image_hub_dir on $(hostname), then up to $release_image_hub_parallel concurrent docker loads (>= ${release_image_hub_min_free_gib} GiB free)"
+
+# Before any compile: the selected transport can run on every build host.
+release_image_distribution_preflight() {
+  local host free_kib
+  if [[ "$release_image_transport" == rdma ]]; then
+    for host in "${RELEASE_BUILD_HOSTS[@]}"; do
+      release_ssh "$host" "command -v rdmapipe >/dev/null 2>&1" ||
+        release_die "rdmapipe is required on every Spark build host to distribute the Spark image ($host lacks it); CUTEAFD_RELEASE_IMAGE_TRANSPORT=ssh-hub needs only ssh and docker"
+    done
+    return 0
+  fi
+  ((BASH_VERSINFO[0] > 5 || (BASH_VERSINFO[0] == 5 && BASH_VERSINFO[1] >= 1))) ||
+    release_die "ssh-hub image distribution needs bash 5.1 or newer on $(hostname)"
+  mkdir -p "$release_image_hub_dir" ||
+    release_die "cannot create image hub directory: $release_image_hub_dir"
+  python3 "$repo_root/scripts/build/assert-build-filesystem.py" "$release_image_hub_dir" ||
+    release_die "image hub directory is not a safe writable filesystem: $release_image_hub_dir"
+  free_kib="$(df -Pk "$release_image_hub_dir" | awk 'NR == 2 { print $4 }')"
+  [[ "$free_kib" =~ ^[0-9]+$ ]] && ((free_kib >= release_image_hub_min_free_gib * 1024 * 1024)) ||
+    release_die "image hub directory $release_image_hub_dir needs at least ${release_image_hub_min_free_gib} GiB free"
+  for host in "${RELEASE_BUILD_HOSTS[@]}"; do
+    release_ssh "$host" "docker version --format '{{.Server.Version}}' >/dev/null" ||
+      release_die "$host cannot run docker over ssh for the ssh-hub image distribution"
+  done
+}
+
+# release_spark_image_identity HOST: "ID CONTENT" of the pending Spark image on HOST.
+# CONTENT is the portable identity (scripts/lib/dev_image_content.py): docker save |
+# load into a containerd store reports a different ID for identical layers and config.
+release_spark_image_identity() {
+  local id content quoted
+  printf -v quoted '%q' "$SPARK_EXPERT_DOCKER_INFERENCE"
+  id="$(release_ssh "$1" "docker image inspect -f '{{.Id}}' $quoted")" &&
+    content="$(set -o pipefail; release_ssh "$1" "docker image inspect $quoted" |
+      python3 "$repo_root/scripts/lib/dev_image_content.py")" &&
+    [[ -n "$id" && -n "$content" ]] || return 1
+  printf '%s %s\n' "$id" "$content"
+}
+
+release_distribute_spark_image_rdma() {
+  echo "== concurrently distributing Spark image over RDMA =="
+  local -a image_copy_pids=() image_copy_hosts=()
+  local host index image_copy_failed=0 spark_image_quoted
+  printf -v spark_image_quoted '%q' "$SPARK_EXPERT_DOCKER_INFERENCE"
+  for host in "${RELEASE_BUILD_HOSTS[@]:1}"; do
+    (
+      set -o pipefail
+      echo "== RDMA image copy $seed_host -> $host =="
+      release_ssh "$seed_host" \
+        "set -o pipefail; docker image save $spark_image_quoted | rdmapipe --send" |
+        release_ssh "$host" \
+          "set -o pipefail; rdmapipe --recv | docker image load"
+      echo "== RDMA image copy $seed_host -> $host complete =="
+    ) &
+    image_copy_pids+=("$!")
+    image_copy_hosts+=("$host")
+  done
+  for index in "${!image_copy_pids[@]}"; do
+    if ! wait "${image_copy_pids[$index]}"; then
+      echo "RDMA image copy to ${image_copy_hosts[$index]} failed" >&2
+      image_copy_failed=1
+    fi
+  done
+  ((image_copy_failed == 0)) || release_die "concurrent RDMA Spark image distribution failed"
+}
+
+release_distribute_spark_image_hub() {
+  local archive="$release_image_hub_dir/cuteafd-spark-image-$$.tar" spark_image_quoted host pid
+  local failed=0
+  local -A loading=()
+  printf -v spark_image_quoted '%q' "$SPARK_EXPERT_DOCKER_INFERENCE"
+  [[ ! -e "$archive" && ! -e "$archive.part" ]] ||
+    release_die "image hub archive $archive already exists; it belongs to another build"
+  release_image_hub_archive="$archive"
+  echo "== saving Spark image from $seed_host to hub archive $archive =="
+  ( set -o pipefail; release_ssh "$seed_host" "docker image save $spark_image_quoted" >"$archive.part" ) ||
+    { rm -f -- "$archive.part"; release_die "docker image save on $seed_host into $archive failed"; }
+  [[ -s "$archive.part" ]] ||
+    { rm -f -- "$archive.part"; release_die "docker image save on $seed_host wrote an empty archive"; }
+  mv -- "$archive.part" "$archive"
+  # reap: wait for one load and report its host; nonzero when that load failed.
+  release_image_hub_reap() {
+    local done_pid="" status=0
+    wait -n -p done_pid "${!loading[@]}" || status=$?
+    [[ -n "$done_pid" ]] || release_die "lost track of an image hub load"
+    ((status == 0)) || echo "ssh-hub image load on ${loading[$done_pid]} failed (exit $status)" >&2
+    unset "loading[$done_pid]"
+    return "$status"
+  }
+  echo "== distributing Spark image from hub to ${#RELEASE_BUILD_HOSTS[@]} hosts minus the seed, $release_image_hub_parallel at a time =="
+  for host in "${RELEASE_BUILD_HOSTS[@]:1}"; do
+    while ((${#loading[@]} >= release_image_hub_parallel)); do release_image_hub_reap || failed=1; done
+    (
+      echo "== ssh-hub image load $(hostname) -> $host =="
+      release_ssh "$host" "docker image load" <"$archive"
+      echo "== ssh-hub image load $(hostname) -> $host complete =="
+    ) &
+    loading[$!]="$host"
+  done
+  while ((${#loading[@]})); do release_image_hub_reap || failed=1; done
+  rm -f -- "$archive"
+  release_image_hub_archive=""
+  ((failed == 0)) || release_die "ssh-hub Spark image distribution failed"
+}
+
+release_distribute_spark_image() {
+  local seed_identity host identity
+  seed_identity="$(release_spark_image_identity "$seed_host")" ||
+    release_die "cannot identify $SPARK_EXPERT_DOCKER_INFERENCE on $seed_host"
+  if [[ "$release_image_transport" == rdma ]]; then
+    release_image_distribution_preflight
+    release_distribute_spark_image_rdma
+  else
+    release_distribute_spark_image_hub
+  fi
+  # Every host must now hold the seed's image: the same ID, or the same content
+  # under another image store's ID.
+  for host in "${RELEASE_BUILD_HOSTS[@]:1}"; do
+    identity="$(release_spark_image_identity "$host")" ||
+      release_die "$host has no $SPARK_EXPERT_DOCKER_INFERENCE after distribution"
+    [[ "${identity%% *}" == "${seed_identity%% *}" || "${identity#* }" == "${seed_identity#* }" ]] ||
+      release_die "$host Spark image ${identity%% *} differs from $seed_host's ${seed_identity%% *}"
+  done
+}
+# release-image-distribution:end
+
 release_sequential="${CUTEAFD_RELEASE_SEQUENTIAL:-0}"
 [[ "$release_sequential" == 0 || "$release_sequential" == 1 ]] ||
   release_die "CUTEAFD_RELEASE_SEQUENTIAL must be 0 or 1"
@@ -343,6 +507,7 @@ if ((dry_run)); then
     echo "  Spark dev image: build Dockerfile.dev locally on ${RELEASE_BUILD_HOSTS[0]:-}"
   fi
   echo "  build legs: $release_leg_plan"
+  echo "  Spark image distribution: $release_image_transport_plan"
   echo "  release tag: $release_version"
   echo "  V41 Spark expert roles: ${spark_tp_roles:-<legacy TP4 only>} ($spark_tp_roles_note)"
   echo "  coordinator image: $COORDINATOR_DOCKER_INFERENCE"
@@ -369,6 +534,9 @@ SPARK_EXPERT_DOCKER_INFERENCE+="-pending-$$"
 release_pending_cleanup() {
   [[ -z "${coordinator_container:-}" ]] || docker rm -f "$coordinator_container" >/dev/null 2>&1 || true
   docker image rm "$COORDINATOR_DOCKER_INFERENCE" >/dev/null 2>&1 || true
+  # Only this build's own hub archive, named by its PID; nothing else in the directory.
+  [[ -z "${release_image_hub_archive:-}" ]] ||
+    rm -f -- "$release_image_hub_archive" "$release_image_hub_archive.part"
   local host
   for host in "${RELEASE_BUILD_HOSTS[@]}"; do
     timeout 30s ssh "${release_ssh_opts[@]}" "$host" docker image rm "$SPARK_EXPERT_DOCKER_INFERENCE" >/dev/null 2>&1 || true
@@ -763,6 +931,7 @@ if [[ -n "$release_build_root" ]]; then
   ((remote_root_free_kib >= 60 * 1024 * 1024)) ||
     release_die "$seed_host release build root $release_build_root needs at least 60 GiB free"
 fi
+release_image_distribution_preflight
 
 # Only the coordinator writes local artifacts/reuse proof. Allocate the proof path
 # before forking so the shared tail can read it without importing worker variables.
@@ -1388,42 +1557,7 @@ for host in "${RELEASE_BUILD_HOSTS[@]:1}"; do
   # ensure_image cannot mistake the stale tag for the fresh seed image.
   release_ssh "$host" "docker image rm --force '$SPARK_EXPERT_DOCKER_INFERENCE' >/dev/null 2>&1 || true"
 done
-rdmapipe_ready=1
-for host in "${RELEASE_BUILD_HOSTS[@]}"; do
-  if ! release_ssh "$host" "command -v rdmapipe >/dev/null 2>&1"; then
-    rdmapipe_ready=0
-    break
-  fi
-done
-if ((rdmapipe_ready)); then
-  echo "== concurrently distributing Spark image over RDMA =="
-  image_copy_pids=()
-  image_copy_hosts=()
-  printf -v spark_image_quoted '%q' "$SPARK_EXPERT_DOCKER_INFERENCE"
-  for host in "${RELEASE_BUILD_HOSTS[@]:1}"; do
-    (
-      set -o pipefail
-      echo "== RDMA image copy $seed_host -> $host =="
-      release_ssh "$seed_host" \
-        "set -o pipefail; docker image save $spark_image_quoted | rdmapipe --send" |
-        release_ssh "$host" \
-          "set -o pipefail; rdmapipe --recv | docker image load"
-      echo "== RDMA image copy $seed_host -> $host complete =="
-    ) &
-    image_copy_pids+=("$!")
-    image_copy_hosts+=("$host")
-  done
-  image_copy_failed=0
-  for index in "${!image_copy_pids[@]}"; do
-    if ! wait "${image_copy_pids[$index]}"; then
-      echo "RDMA image copy to ${image_copy_hosts[$index]} failed" >&2
-      image_copy_failed=1
-    fi
-  done
-  ((image_copy_failed == 0)) || release_die "concurrent RDMA Spark image distribution failed"
-else
-  release_die "rdmapipe is required on every Spark build host to distribute the Spark image"
-fi
+release_distribute_spark_image
 
 coordinator_revision="$(
   docker image inspect -f '{{index .Config.Labels "org.opencontainers.image.revision"}}' \
