@@ -186,6 +186,23 @@ across the cluster: hosts with a sealed local copy of a shard read it at NVMe
 speed, others stream it over RoCE at about 5 GB/s. It is a separate project and
 not required; any standard Hugging Face cache layout works.
 
+## Host and fabric tuning
+
+Optional; the same run commands work tuned or not, tuning just makes it faster.
+Run as root on each host (`--role coordinator` on the RTX host, `--role
+spark` on each Spark); every step has `--dry-run`.
+
+| Step | Command | What it does |
+|---|---|---|
+| Host | `scripts/host/tune.sh apply` | Performance governor, shallow CPU idle only, swap off, no proactive compaction, BBR and large TCP buffers. `tune.sh persist` prints a boot unit. |
+| Tools | `scripts/host/tune.sh fabric-lossless tools` | Adds NVIDIA's signed DOCA apt repo, pinned so only `mlnx-tools` (`mlnx_qos`) installs from it. |
+| NICs | `scripts/host/tune.sh fabric-lossless apply` | ConnectX: DSCP trust, DSCP 26 (RoCE) → priority 3 with PFC and its own buffer, CNP DSCP 48 → priority 6, global pause off. Saves the original state first. |
+| Switch | `/import` [`mikrotik-crs8xx-roce-lossless.rsc`](scripts/fabric/mikrotik-crs8xx-roce-lossless.rsc) | MikroTik CRS8xx: lossless RoCE class 3, strict CNP class 6, DSCP trust on the fabric ports; everything else stays lossy. Edit the port list for your cabling. |
+
+`fabric-lossless check` shows the NIC state, and `rollback` (plus
+[`mikrotik-crs8xx-roce-rollback.rsc`](scripts/fabric/mikrotik-crs8xx-roce-rollback.rsc))
+restores the saved originals. Details: [Host tuning](docs/host-tuning.md).
+
 ## Quick start
 
 1. `cuteafd plan MODEL` (any Hugging Face model id or local snapshot

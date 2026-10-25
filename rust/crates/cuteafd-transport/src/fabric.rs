@@ -20,6 +20,8 @@ const SYSFS_INFINIBAND: &str = "/sys/class/infiniband";
 pub struct FabricReport {
     pub ports: Vec<RdmaPort>,
     pub rails: RailPlan,
+    /// GRH traffic byte applied to all native RC QPs by the shared startup key.
+    pub rdma_traffic_class: u8,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -126,8 +128,11 @@ pub fn discover() -> Result<FabricReport> {
         }
     }
     let rails = plan_rails(&ports);
-    Ok(FabricReport { ports, rails })
+    Ok(FabricReport { ports, rails, rdma_traffic_class: RDMA_TRAFFIC_CLASS })
 }
+
+/// GRH traffic class the native layer sets on every RC QP (`rdma_traffic_class.h`): DSCP 26.
+pub const RDMA_TRAFFIC_CLASS: u8 = 26 << 2;
 
 fn read_device(path: &Path, addresses: &[(String, Ipv4Addr, u8)]) -> Result<Vec<RdmaPort>> {
     let device = path.file_name().context("RDMA device name")?.to_string_lossy().into_owned();
@@ -300,7 +305,7 @@ impl FabricReport {
     /// One line per rail for startup logs.
     pub fn summary(&self) -> String {
         if self.rails.rails.is_empty() {
-            return format!("fabric: {}", self.rails.reason);
+            return format!("fabric: rdma_tc={} dscp={} {}", self.rdma_traffic_class, self.rdma_traffic_class >> 2, self.rails.reason);
         }
         let rails: Vec<_> = self
             .rails
@@ -313,13 +318,22 @@ impl FabricReport {
                 )
             })
             .collect();
-        format!("fabric: use {} rail(s) of [{}]: {}", self.rails.use_rails, rails.join(", "), self.rails.reason)
+        format!("fabric: rdma_tc={} dscp={} use {} rail(s) of [{}]: {}",
+            self.rdma_traffic_class, self.rdma_traffic_class >> 2, self.rails.use_rails, rails.join(", "), self.rails.reason)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rdma_marking_is_dscp_26_and_logged() {
+        assert_eq!(RDMA_TRAFFIC_CLASS, 104);
+        let report = FabricReport { ports: vec![], rails: plan_rails(&[]), rdma_traffic_class: RDMA_TRAFFIC_CLASS };
+        assert!(report.summary().contains("rdma_tc=104 dscp=26"));
+    }
+
 
     fn port(device: &str, gbps: f64, address: [u8; 4], pcie_width: u32) -> RdmaPort {
         let address = Ipv4Addr::from(address);
