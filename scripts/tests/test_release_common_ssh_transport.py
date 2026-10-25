@@ -243,6 +243,8 @@ engine_commit=engine-revision
 sparkinfer_commit=sparkinfer-revision
 snapshot_rel=hub/models--x--M/snapshots/rev
 namespace_root=/mnt/sparknest
+namespace_hf_home="$namespace_root/hf-home"
+ready_timeout="${CUTEAFD_RELEASE_READY_TIMEOUT_SECONDS:-900}"
 model_is_exl3=true
 exl3_family_tag=k34
 EXPERT_PORT=19441
@@ -410,6 +412,7 @@ class TestRunShLifecycle:
             "__default__",
             "__none__",
             "/mnt/sparknest",
+            "/mnt/sparknest/hf-home",
         ], call
 
     def test_launch_passes_its_contract_positionally(self, tmp_path):
