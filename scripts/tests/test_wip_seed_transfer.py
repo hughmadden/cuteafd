@@ -454,3 +454,57 @@ elif a[0] == 'tag':
                    env={**os.environ, 'PATH': f'{tools}:{os.environ["PATH"]}'})
     tags = (tmp_path / 'tags').read_text().splitlines()
     assert tags == ['sha256:' + 'o' * 64 + ' repo:prev-' + 'o' * 12, 'repo:tc-1 repo']
+
+
+def _dev_image(ident, **config):
+    import json
+    return json.dumps([{'Id': ident, 'Architecture': 'arm64', 'Os': 'linux',
+                        'Config': {'Env': ['PATH=/usr/bin'], 'Labels': {'io.cuteafd.toolchain.hash': 'aa74'}, **config},
+                        'RootFS': {'Type': 'layers', 'Layers': ['sha256:' + '11' * 32]}}])
+
+
+def _distribute(tmp_path, images):
+    """distribute_spark_dev_image against per-host `docker image inspect` records (None: no image)."""
+    store = tmp_path / 'images'
+    store.mkdir()
+    for host, record in images.items():
+        if record is not None:
+            (store / host).write_text(record)
+    targets = ' '.join(h for h in images if h != 'seed')
+    script = (_function('spark_dev_image_content') + _function('distribute_spark_dev_image') +
+              f'repo_root={ROOT}\n'
+              'release_die() { echo "$*" >&2; exit 2; }\n'
+              'stream_between_hosts() { printf "stream %s -> %s\\n" "$1" "$3" >> "$TRACE"; }\n'
+              'SPARK_EXPERT_DOCKER_DEV=spark:tc seed_host=seed wip_seed_rdma=1\n'
+              f'wip_target_hosts=({targets})\n'
+              'distribute_spark_dev_image\n')
+    # ssh -o BatchMode=yes HOST CMD: the host's inspect record, or nothing (missing image).
+    ssh = f'host="$3"; [ -f "{store}/$host" ] && cat "{store}/$host"; exit 0'
+    return _bash(script, tmp_path, {'ssh': ssh})
+
+
+def test_dev_image_with_same_content_and_another_id_is_not_resent(tmp_path):
+    result, trace = _distribute(tmp_path, {'seed': _dev_image('sha256:' + 'aa' * 32),
+                                           'spark5': _dev_image('sha256:' + 'bb' * 32),
+                                           'spark1': _dev_image('sha256:' + 'aa' * 32)})
+    assert result.returncode == 0, result.stderr
+    assert 'stream' not in trace
+
+
+@pytest.mark.parametrize('record', [
+    _dev_image('sha256:' + 'aa' * 32, Labels={'io.cuteafd.toolchain.hash': 'bb00'}),
+    _dev_image('sha256:' + 'aa' * 32, Env=['PATH=/usr/bin', 'X=1']),
+    _dev_image('sha256:' + 'aa' * 32, StopTimeout=0),
+    None,
+], ids=['toolchain-label', 'env', 'stop-timeout-0', 'missing'])
+def test_dev_image_with_changed_content_or_missing_is_sent(tmp_path, record):
+    result, trace = _distribute(tmp_path, {'seed': _dev_image('sha256:' + 'aa' * 32), 'spark5': record,
+                                           'spark1': _dev_image('sha256:' + 'cc' * 32)})
+    assert result.returncode == 0, result.stderr
+    assert trace.splitlines() == ['stream seed -> spark5']
+
+
+def test_dev_image_distribution_needs_the_seed_image(tmp_path):
+    result, trace = _distribute(tmp_path, {'seed': None, 'spark5': _dev_image('sha256:' + 'bb' * 32)})
+    assert result.returncode == 2 and 'cannot identify spark:tc on seed' in result.stderr
+    assert 'stream' not in trace

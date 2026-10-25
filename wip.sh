@@ -501,14 +501,22 @@ stream_between_hosts() {
   fi
 }
 
+# spark_dev_image_content HOST: the portable content identity of HOST's Spark dev
+# image (scripts/lib/dev_image_content.py), empty when it is missing. Image IDs differ
+# across image stores (docker save | load into containerd) for identical content.
+spark_dev_image_content() {
+  ssh -o BatchMode=yes "$1" "docker image inspect '$SPARK_EXPERT_DOCKER_DEV' 2>/dev/null || true" |
+    python3 "$repo_root/scripts/lib/dev_image_content.py" 2>/dev/null || true
+}
+
 distribute_spark_dev_image() {
-  local seed_id
-  seed_id="$(ssh -o BatchMode=yes "$seed_host" "docker image inspect -f '{{.Id}}' '$SPARK_EXPERT_DOCKER_DEV'")"
+  local seed_content
+  seed_content="$(spark_dev_image_content "$seed_host")"
+  [[ -n "$seed_content" ]] || release_die "cannot identify $SPARK_EXPERT_DOCKER_DEV on $seed_host"
   local -a targets=()
-  local host remote_id
+  local host
   for host in "${wip_target_hosts[@]}"; do
-    remote_id="$(ssh -o BatchMode=yes "$host" "docker image inspect -f '{{.Id}}' '$SPARK_EXPERT_DOCKER_DEV' 2>/dev/null || true")"
-    [[ "$remote_id" == "$seed_id" ]] || targets+=("$host")
+    [[ "$(spark_dev_image_content "$host")" == "$seed_content" ]] || targets+=("$host")
   done
   ((${#targets[@]})) || return 0
   local source="$seed_host"
@@ -623,6 +631,19 @@ preflight_existing_container_images() {
 
 preflight_existing_container_images
 ((wip_spark_leg == 0)) || distribute_spark_dev_image
+# Each role's seal records its dev image's portable content identity
+# (scripts/lib/dev_image_content.py): an image ID changes under docker save | load.
+wip_coordinator_image_id="$(docker image inspect -f '{{.Id}}' "$COORDINATOR_DOCKER_DEV")"
+wip_coordinator_image_content="$(docker image inspect "$wip_coordinator_image_id" |
+  python3 "$repo_root/scripts/lib/dev_image_content.py")" ||
+  release_die "cannot identify the content of dev image $wip_coordinator_image_id"
+wip_expert_image_id= wip_expert_image_content=
+if ((wip_spark_leg)); then
+  wip_expert_image_id="$(ssh -o BatchMode=yes "$seed_host" "docker image inspect -f '{{.Id}}' '$SPARK_EXPERT_DOCKER_DEV'")"
+  wip_expert_image_content="$(ssh -o BatchMode=yes "$seed_host" "docker image inspect '$wip_expert_image_id'" |
+    python3 "$repo_root/scripts/lib/dev_image_content.py")" ||
+    release_die "cannot identify the content of dev image $wip_expert_image_id on $seed_host"
+fi
 
 # wip_container_gpu_ok CONTAINER: its GPU still answers NVML.
 wip_container_gpu_ok() {
@@ -1261,8 +1282,10 @@ build_coordinator() {
   echo "== incrementally building coordinator slot $slot =="
   local phase="${1:-all}"
   [[ "$phase" == native ]] || sync_local_source
-  local image_id
+  local image_id image_content=
   image_id="$(docker image inspect -f '{{.Id}}' "$COORDINATOR_DOCKER_DEV")"
+  # Sealed only for the image whose content was identified above.
+  [[ "$image_id" != "${wip_coordinator_image_id:-}" ]] || image_content="${wip_coordinator_image_content:-}"
   local -a cache_env=(-e CUTEAFD_KACHE= -e CUTEAFD_SCCACHE_CUDA=0 -e "CUTEAFD_BUILD_CACHES=${CUTEAFD_BUILD_CACHES:-on}")
   if [[ "${CUTEAFD_SCCACHE_CUDA:-0}" == 1 ]]; then
     if docker exec "$coordinator_container" test -d /opt/cuteafd-sccache-cache; then
@@ -1364,6 +1387,7 @@ build_coordinator() {
   fi
   native_store_sync "" "${state_dir:-/nonexistent}" "$(uname -m)" coordinator publish
   docker exec -e "CUTEAFD_WIP_BUILD_KEY=${wip_coordinator_key:-}" ${wip_exlr8_env[@]+"${wip_exlr8_env[@]}"} \
+    -e "CUTEAFD_WIP_DEV_IMAGE_CONTENT=$image_content" \
     -e "CUTEAFD_WIP_PROGRAM_FAMILY=${wip_program_family:-}" "$coordinator_container" \
     /wip/source/scripts/build/finalize-wip-slot.sh \
     /wip/source coordinator "$slot" /wip/output/coordinator \
@@ -1389,8 +1413,9 @@ wip_seed_export_turn() {
 build_expert() (
   echo "== incrementally building Spark expert slot $slot on $seed_host =="
   sync_seed_source
-  local image_id
+  local image_id image_content=
   image_id="$(ssh -o BatchMode=yes "$seed_host" "docker image inspect -f '{{.Id}}' '$SPARK_EXPERT_DOCKER_DEV'")"
+  [[ "$image_id" != "${wip_expert_image_id:-}" ]] || image_content="${wip_expert_image_content:-}"
   local cache_wrapper= cuda_cache=0
   if [[ "${CUTEAFD_SCCACHE_CUDA:-0}" == 1 ]]; then
     if ssh -o BatchMode=yes "$seed_host" docker exec "$spark_container" test -d /opt/cuteafd-sccache-cache; then
@@ -1443,7 +1468,7 @@ build_expert() (
   fi
   native_store_sync "$seed_host" "$seed_root" aarch64 expert publish
   native_store_nest "$seed_host" aarch64 "$seed_root" expert publish
-  timeout --kill-after=30 300 ssh -o BatchMode=yes "$seed_host" docker exec -e "CUTEAFD_WIP_BUILD_KEY=${wip_expert_key:-}" ${wip_exlr8_env[@]+"${wip_exlr8_env[@]}"} "$spark_container" \
+  timeout --kill-after=30 300 ssh -o BatchMode=yes "$seed_host" docker exec -e "CUTEAFD_WIP_BUILD_KEY=${wip_expert_key:-}" -e "CUTEAFD_WIP_DEV_IMAGE_CONTENT=$image_content" ${wip_exlr8_env[@]+"${wip_exlr8_env[@]}"} "$spark_container" \
     /wip/source/scripts/build/finalize-wip-slot.sh \
     /wip/source spark-expert "$slot" /wip/output/expert \
     "$SPARK_EXPERT_DOCKER_DEV" "$image_id"
