@@ -178,8 +178,14 @@ release_phase_inputs() {
   # (a directory touched by a host-side helper) are not inputs.
   printf 'source=%s\n' "$(release_source_tar --sort=name --mtime=@0 --owner=0 --group=0 --numeric-owner \
     --format=gnu | sha256sum | awk '{print $1}')"
+  # GPU assignment and the image's driver-detection startup (BASH_ENV) are not
+  # build inputs: with a driver visible it sets _CUDA_COMPAT_STATUS and, when
+  # the CUDA forward-compat libraries apply, prepends exactly
+  # /usr/local/cuda/compat/lib.real: to LD_LIBRARY_PATH. Only that leading
+  # entry is ignored; the rest of LD_LIBRARY_PATH stays an input.
   env | LC_ALL=C sort |
-    grep -Ev '^(CUDA_VISIBLE_DEVICES|NVIDIA_[A-Z0-9_]*|CUTEAFD_RELEASE_ARTIFACT_PHASE|HOSTNAME|PWD|OLDPWD|SHLVL|_)=' || true
+    grep -Ev '^(CUDA_VISIBLE_DEVICES|NVIDIA_[A-Z0-9_]*|_CUDA_COMPAT_STATUS|CUTEAFD_RELEASE_ARTIFACT_PHASE|HOSTNAME|PWD|OLDPWD|SHLVL|_)=' |
+    sed 's#^LD_LIBRARY_PATH=/usr/local/cuda/compat/lib\.real:#LD_LIBRARY_PATH=#' || true
 }
 release_phase_daemons() {
   local isa

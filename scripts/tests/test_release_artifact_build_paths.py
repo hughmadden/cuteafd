@@ -409,6 +409,50 @@ def test_native_phase_refuses_missing_rust_state(scratch):
     assert not Path(env["STUB_CALL_LOG"]).exists()
 
 
+@pytest.mark.parametrize("native_startup,accepted", [
+    ("status", True),                      # amd64 probe: only the compat status differs
+    ("status+compat", True),               # arm64 probe: status + leading compat entry
+    ("status+other", False),               # any other LD_LIBRARY_PATH change is an input
+    ("status+compat-trailing", False),     # only the proven leading form is normalized
+])
+def test_native_phase_accepts_only_the_driver_compat_startup_delta(scratch, native_startup, accepted):
+    """The NGC image's BASH_ENV startup reacts to a visible driver: it sets
+    _CUDA_COMPAT_STATUS and may prepend /usr/local/cuda/compat/lib.real: to
+    LD_LIBRARY_PATH. Same environment in both phases; only the driver differs."""
+    src, output, _, env = _stub_build(scratch)
+    calls = Path(env["STUB_CALL_LOG"])
+    driver = scratch / "driver-visible"
+    startup = scratch / "startup.sh"
+    startup.write_text(f"""if [[ -e {driver} ]]; then
+  export _CUDA_COMPAT_STATUS="CUDA Driver OK (compat $(cat {driver}))"
+  case "$(cat {driver})" in
+    *compat-trailing*) export LD_LIBRARY_PATH="$LD_LIBRARY_PATH:/usr/local/cuda/compat/lib.real" ;;
+    *compat*) export LD_LIBRARY_PATH="/usr/local/cuda/compat/lib.real:$LD_LIBRARY_PATH" ;;
+    *other*) export LD_LIBRARY_PATH="/opt/other/lib:$LD_LIBRARY_PATH" ;;
+  esac
+else
+  export _CUDA_COMPAT_STATUS="CUDA Driver UNAVAILABLE"
+fi
+""")
+    env.update(BASH_ENV=str(startup), LD_LIBRARY_PATH="/usr/local/nvidia/lib64:/usr/local/cuda/lib64")
+    state = scratch / "state"
+    rust = _phase(src, output, env, "rust", state)
+    assert rust.returncode == 0, rust.stdout + rust.stderr
+    daemons = (state / "rust.done").read_text()
+    driver.write_text(native_startup)
+    native = _phase(src, output, env, "native", state, CUDA_VISIBLE_DEVICES="GPU-x", NVIDIA_VISIBLE_DEVICES="GPU-x")
+    if accepted:
+        assert native.returncode == 0, native.stdout + native.stderr
+        assert calls.read_text().split() == ["cargo", "cargo", "cmake", "cmake"]  # no Cargo rerun
+        assert (output / "cuteafd").read_text() == "daemon\n"
+        assert daemons.split()[1].endswith("-x86-64-v2/x86_64-unknown-linux-gnu/release/cuteafd")
+    else:
+        assert native.returncode == 2, native.stdout + native.stderr
+        assert "> env LD_LIBRARY_PATH" in native.stderr
+        assert "_CUDA_COMPAT_STATUS" not in native.stderr
+        assert "cmake" not in calls.read_text()
+
+
 def test_native_phase_accepts_a_tree_whose_only_change_is_timestamps(scratch):
     """Host helpers touch directories (a new excluded __pycache__, a staged
     output dir) between the phases; content, paths and modes are the inputs."""
