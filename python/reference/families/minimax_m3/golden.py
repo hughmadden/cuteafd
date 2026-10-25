@@ -46,10 +46,83 @@ ARITHMETIC = {
     "served_cache": "E4M3 RN-even/satfinite K/V with descale1; index row FP32 amax/448 (zero=>1), RN reciprocal then multiply and E4M3; dot * (q_scale/sqrt(dim)) * k_scale; FP32 residual and head outputs, BF16 norms and routed/shared combine",
     "limitations": "Format-level QDQ oracle, not bitwise CUDA reductions, rsqrt/exp approximations or fused RoPE emulation; served/bf16 arms omit FP8 caches; no FlashInfer global-across-experts scale reduction",
 }
+# The release ships its own numerics; there is no vendor BF16 master to score against.
+ROOT_PRECISION = "official NVFP4 W4A4 experts + MXFP8 dense, BF16 embedding and head (no vendor BF16 master)"
+BF16_CACHE = "BF16 K/V and index keys; no cache quantization"
 
 
 def digest(path):
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+
+def source_pin(identity: dict, revision: str) -> dict:
+    """Flat publication pins from a run's own source identity: the root revision, this
+    decoder and harness, and the Transformers, vLLM and cache-program sources it follows."""
+    pinned = lambda value: hashlib.sha256(canonical(value)).hexdigest()
+    return {"revision": revision, "model_sha256": identity["model_sha256"],
+            "golden_sha256": identity["golden_sha256"],
+            "shape_invariant_sha256": identity["shared_sha256"]["shape_invariant.py"],
+            "fidelity_windows_sha256": identity["shared_sha256"]["fidelity_windows.py"],
+            "transformers_revision": identity["transformers"]["revision"],
+            "transformers_sources_sha256": pinned(identity["transformers"]["sha256"]),
+            "vllm_revision": identity["vllm"]["revision"], "vllm_sources_sha256": pinned(identity["vllm"]["files"]),
+            "cache_programs_sha256": pinned(identity["cache_program_sha256"])}
+
+
+def write_reference_meta(out: Path, snapshot: Path, run_platform: dict | None = None) -> dict:
+    """Add the reference-only publication fields to a finished served-arm golden.
+
+    Per-window and aggregate NLL come again from the saved F32 scored logits with the
+    validator's float64 log-sum-exp, so a finished golden can be backfilled without a model
+    run. The pins come from the run's own recorded source identity (goldens written before
+    these fields recorded it as source_pin); run_platform overrides the recorded platform.
+    """
+    import numpy as np
+    import tokenizers
+    import torch
+    meta = json.loads((out / "meta.json").read_text())
+    activation = meta.get("activation")
+    if activation not in ("served", "served-cache"):
+        raise ValueError("only the served arms are reference datasets; bf16 is a diagnostic")
+    if verify_snapshot(load_set(out / "windows.json", "minimax_m3"), snapshot) != meta["snapshot_identity"]:
+        raise ValueError("snapshot differs from the golden's own identity")
+    total, count = 0.0, 0
+    for entry in meta["windows"]:
+        folder = (out / entry["path"]).resolve()
+        if not folder.is_relative_to(out.resolve()):
+            raise ValueError("golden path escapes its directory")
+        tokens = np.fromfile(folder / "tokens.bin", dtype="<i4")
+        logits = np.memmap(folder / "logits.bin", dtype="<f4", mode="r",
+                           shape=(len(entry["positions"]), entry["vocab"]))
+        loss = 0.0
+        for row, position in zip(logits, entry["positions"]):
+            values = row.astype(np.float64)
+            if not np.isfinite(values).all():
+                raise ValueError("non-finite golden logits")
+            peak = np.max(values)
+            loss -= float(values[tokens[position]]) - float(peak + np.log(np.exp(values - peak).sum(dtype=np.float64)))
+        entry.update(nll=loss / len(entry["positions"]), scored_tokens=len(entry["positions"]))
+        (folder / "meta.json").write_bytes(canonical(entry) + b"\n")
+        total, count = total + loss, count + len(entry["positions"])
+    identity = meta.get("source_identity") or meta["source_pin"]
+    cache = ARITHMETIC["served_cache"] if activation == "served-cache" else BF16_CACHE
+    meta.update(
+        nll=total / count, scored_tokens=count, mtp=False, use_cache=False, attention="eager", dtype="checkpoint-native",
+        source_identity=identity, source_pin=source_pin(identity, meta["snapshot_identity"]["snapshot_revision"]),
+        gates={"activation": activation, "kv_cache": cache, "nvfp4_scale_policy": ARITHMETIC["nvfp4_scale_policy"]},
+        native_fp32_parameters="checkpoint F32 tensors (router gate and score-correction bias) kept F32",
+        root_arithmetic={"precision": ROOT_PRECISION,
+                         "source": "independent MiniMax M3 decoder with its Transformers and vLLM source pins",
+                         "arithmetic": "Independent MiniMax M3 text decoder (families/minimax_m3/model.py), layer by "
+                                       f"layer over the release checkpoint. Weights: {ARITHMETIC['weights']}. Activations: "
+                                       f"{ARITHMETIC['served_activations']}. Boundaries: {ARITHMETIC['boundaries']}. "
+                                       f"Selection: {ARITHMETIC['selection']}. Cache: {cache}. Fixed-M128 linears; "
+                                       "MTP and caches off."},
+        tokenizers=tokenizers.__version__, torch=torch.__version__, transformers="not used",
+        platform=run_platform or meta["platform"])
+    (out / "meta.json").write_bytes(canonical(meta) + b"\n")
+    print(f"reference meta: {len(meta['windows'])} windows, {count} scored, NLL {meta['nll']:.9f}", flush=True)
+    return meta
 
 
 def source_identity():
@@ -177,7 +250,7 @@ def execute(args):
     weights.validate(cfg)
     args.out.mkdir(parents=True, exist_ok=True)
     if args.check_only:
-        print(json.dumps({"snapshot_identity": identity, "source_pin": source_identity(),
+        print(json.dumps({"snapshot_identity": identity, "source_identity": source_identity(),
                           "activation": args.activation, "arithmetic": ARITHMETIC}))
         return
     probing = getattr(args, "_prefix_probe", False)
@@ -209,7 +282,7 @@ def execute(args):
         weights.close()
     total = sum(e["scored_tokens"] for e in entries)
     finish_golden(args.out, manifest, entries, snapshot_identity=identity,
-                  source_pin=source_identity(), prefix_qualification=proof,
+                  source_identity=source_identity(), prefix_qualification=proof,
                   reference="independent MiniMax M3 text; native weight QDQ; fixed-M128",
                   activation=args.activation, diagnostic_only=args.activation == "bf16",
                   cache_format="fp8_e4m3" if args.activation == "served-cache" else "bf16",
@@ -220,19 +293,31 @@ def execute(args):
                   platform=({"capability": list(torch.cuda.get_device_capability(weights.device)),
                              "gpu": torch.cuda.get_device_name(weights.device)}
                             if weights.device.type == "cuda" else {"device": "cpu"}))
+    if not probing and args.activation != "bf16":
+        write_reference_meta(args.out, args.snapshot)
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    for name in ("snapshot", "windows", "out"):
+    for name in ("snapshot", "out"):
         parser.add_argument("--" + name, type=Path, required=True)
+    parser.add_argument("--windows", type=Path, help="pinned fidelity set (required except with --backfill-meta)")
     parser.add_argument("--activation", choices=("served-cache", "served", "bf16"), default="served")
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--resume", type=Path, help="previous run's state directory; use a fresh output")
     parser.add_argument("--layers", type=int, nargs="*", help="also export selected full layer states")
     parser.add_argument("--prefix-only", action="store_true")
     parser.add_argument("--check-only", action="store_true")
+    parser.add_argument("--backfill-meta", action="store_true",
+                        help="add the reference-only fields to the finished golden in --out, from its saved logits")
+    parser.add_argument("--run-platform", type=json.loads,
+                        help='with --backfill-meta: replace the recorded platform, e.g. {"gpu":"...","capability":[12,1]}')
     args = parser.parse_args()
+    if args.backfill_meta:
+        write_reference_meta(args.out, args.snapshot, args.run_platform)
+        return
+    if args.windows is None or args.run_platform is not None:
+        parser.error("a golden run needs --windows; --run-platform only goes with --backfill-meta")
     execute(args)
 
 

@@ -23,11 +23,31 @@ import urllib.request
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "python/reference"))
-from fidelity_windows import MAX_TOKENS, SET_SCHEMA, bucket, canonical, set_hash, validate_set
+from fidelity_windows import (MAX_TOKENS, NEW_SET_GENERATED_MIN, SET_SCHEMA, bucket, canonical,
+                              require_new_set_generated_rows, set_hash, standard_generated_rows, validate_set)
 from checkpoint_tokenizer import load_tokenizer, tokenizer_identity
 from fidelity_generation import token_ids
 
 FAMILIES = ("deepseek_v41", "mimo_v2", "qwen4", "qwen3_5", "glm5_flash", "deepseek_v4", "glm5", "step5", "kimi_k3", "minimax_m3")
+# Request fields a family's recipe turns add, recorded in the set's recipe. MiniMax M3's chat
+# template defaults to adaptive thinking, which answers most agentic turns without reasoning
+# and leaves the standard halves short of generated rows; the recipe turns thinking on.
+FAMILY_REQUEST = {"minimax_m3": {"thinking": {"type": "enabled"}}}
+# The fixture's system note. Only a window that declares tools may invite them: told to use
+# tools it does not have, a model emits a call anyway and its turn ends there.
+SYSTEM_NOTES = {"tools": "think carefully and use the repository tools when appropriate",
+                "no_tools": "think carefully and answer directly; no tools are available"}
+# Per-family addition to the note of windows with tools, recorded in the set's recipe. MiniMax M3
+# acts after a sentence of reasoning, so its agentic turns end short of the generated-row floor.
+FAMILY_TOOL_NOTE = {"minimax_m3": "Before each tool call, reason it through in detail: restate the problem, "
+                                  "what the files and tool results so far show, your hypotheses, and what "
+                                  "you expect the call to reveal."}
+# D and E prompt sizes per window. A scored start lies between the prompt end and 512 rows into
+# a 1024-token answer, so each size keeps it inside one bucket whatever the model generates
+# (0-2K: at most 1152; 2-8K: from 2049). With the sealed standard-v2 split, both halves then hold
+# 13 / 10 / 9 windows in 0-2K / 2-8K / 8-16K.
+D_TARGETS = (1024, 1024, 2304, 2816, 768, 2304)
+E_TARGETS = (768, 1024, 2304, 768, 2816, 2304, 1024, 2816, 2304)
 REPO_FILES = ["rust/crates/cuteafd-api/src/openai/probe.rs", "scripts/bench/bench-agentic-session.py",
               "python/reference/families/deepseek_v41/golden.py", "rust/crates/cuteafd-bench/src/client.rs",
               "scripts/bench/make-fidelity-reference.py", "rust/crates/cuteafd-bench/src/reference.rs",
@@ -171,11 +191,15 @@ def build_set(*, family: str, model: str, checkpoint: str, version: str, arm: di
     def generate(name, block, messages, target, tools=None, extra=None):
         # Size by rendered IDs, never truncate a chat template or original history.
         base = copy.deepcopy(messages)
-        base.insert(0, {"role": "system", "content": f"Fidelity fixture {name}; think carefully and use the repository tools when appropriate."})
+        note = f"Fidelity fixture {name}; {SYSTEM_NOTES['tools' if tools else 'no_tools']}."
+        if tools and family in FAMILY_TOOL_NOTE:
+            note += " " + FAMILY_TOOL_NOTE[family]
+        base.insert(0, {"role": "system", "content": note})
         count = max(0, target * 3 - len(canonical(base)))
         for attempt in range(8):
             body = {"model": model, "messages": copy.deepcopy(base), "temperature": 0,
-                    "seed": 0, "max_tokens": 1, "reasoning_effort": "high", "stream": False}
+                    "seed": 0, "max_tokens": 1, "reasoning_effort": "high", "stream": False,
+                    **copy.deepcopy(FAMILY_REQUEST.get(family, {}))}
             if count:
                 body["messages"].insert(0, {"role": "system", "content": "Repository context:\n" + (corpus * (count // len(corpus) + 1))[:count]})
             if tools:
@@ -224,7 +248,7 @@ def build_set(*, family: str, model: str, checkpoint: str, version: str, arm: di
         tokens += corpus_ids[:padding]
         roles += ["ctx"] * padding
         expected_bucket = "0-2K" if target < 2048 else "2-8K" if target < 8192 else "8-16K"
-        if block in ("A", "B") and bucket(start) != expected_bucket:
+        if bucket(start) != expected_bucket:
             raise BucketMismatch(f"{name}: history lands in {bucket(start)}, expected {expected_bucket}; supply a shorter recording/history")
         windows.append({"id": name, "block": block, "bucket": bucket(start),
                         "tokens": tokens, "roles": roles, "score_from": start,
@@ -319,11 +343,11 @@ def build_set(*, family: str, model: str, checkpoint: str, version: str, arm: di
                         "roles": ["ctx"] * len(tokens), "score_from": start, "provenance": sources[i % len(files)]})
     for i in range(6):
         prompt = STRUCTURED[i] + " Reply in JSON." if i < 3 else "Select and call the correct tool to read, search or edit the fixture repository. " + agentic.TASKS[(i - 3) % len(agentic.TASKS)]["prompt"]
-        generate(f"d{i:02d}", "D", [{"role": "user", "content": prompt}], 1024 + (i % 3) * 512,
+        generate(f"d{i:02d}", "D", [{"role": "user", "content": prompt}], D_TARGETS[i],
                  agentic.TOOLS if i >= 3 else None,
                  {"response_format": {"type": "json_object"}} if i < 3 else None)
     for i, prompt in enumerate(MATH + [f"Explain the repository design in {files[j]} in detail." for j in range(5)]):
-        generate(f"e{i:02d}", "E", [{"role": "user", "content": prompt}], 768 + (i % 3) * 512)
+        generate(f"e{i:02d}", "E", [{"role": "user", "content": prompt}], E_TARGETS[i])
     quick = ["legacy", "a00", "a04", "a08", "a12", "a20", "a24", "b00", "b08", "c00", "d00", "e00"]
     servers = [w["provenance"]["server"] for w in windows if "server" in w["provenance"]]
     if servers and any(server != servers[0] for server in servers):
@@ -338,7 +362,12 @@ def build_set(*, family: str, model: str, checkpoint: str, version: str, arm: di
                 "recipe": {"windows": 64, "positions_per_window": 512, "max_tokens": 1024,
                     "context_cap": MAX_TOKENS, "temperature": 0, "seed": 0, "reasoning_effort": "high",
                     "blocks": {"A": 26, "B": 12, "C": 10, "D": 6, "E": 10},
-                    "prompt_roles": "conditioning history ctx; current assistant span gen"}, "windows": windows}
+                    "prompt_roles": "conditioning history ctx; current assistant span gen",
+                    "prompt_targets": {"D": list(D_TARGETS), "E": list(E_TARGETS)},
+                    "system_notes": SYSTEM_NOTES,
+                    **({"request": FAMILY_REQUEST[family]} if family in FAMILY_REQUEST else {}),
+                    **({"tool_turn_note": FAMILY_TOOL_NOTE[family]} if family in FAMILY_TOOL_NOTE else {})},
+                "windows": windows}
     if getattr(probe, "identity", {}).get("text_source") in ("api", "hf"):
         manifest["reference_snapshot"] = {
             key: arm[key] for key in ("checkpoint", "snapshot_revision", "config_sha256", "tokenizer_sha256")}
@@ -666,6 +695,7 @@ def main(argv=None):
     if not a.retokenize_text and any((a.legacy_source, a.legacy_source_sha256, a.legacy_source_revision)):
         p.error("legacy extension inputs require --retokenize-text")
     from tokenizers import Tokenizer
+    generated = False
     if a.retokenize_text:
         if (not a.source_tokenizer or not a.source_sha256 or a.pinned_text or a.media_fixtures
                 or a.recording or a.file_list or a.legacy_reference or a.family != "step5"):
@@ -710,6 +740,7 @@ def main(argv=None):
             arm=json.loads(a.arm_manifest.read_text()), probe=ProbeClient(a.base_url, a.bench_token, a.timeout),
             fixtures=a.media_fixtures, tokenizer_sha256=hashlib.sha256(a.tokenizer.read_bytes()).hexdigest())
     else:
+        generated = True
         arm = json.loads(a.arm_manifest.read_text())
         probe = ProbeClient(a.base_url, a.bench_token, a.timeout)
         if a.backend != "probe":
@@ -753,9 +784,24 @@ def main(argv=None):
     if out.exists():
         p.error("set versions are immutable; choose a new --version/output")
     out.parent.mkdir(parents=True, exist_ok=True)
+    short = None
+    if generated:
+        # A new set must clear the packaging floor; check it here, before hours of reference work.
+        rows = standard_generated_rows(manifest)
+        print(f"standard-v2 generated rows: decode {rows['decode_generated_positions']:,}, "
+              f"prefill {rows['prefill_generated_positions']:,} (new sets need {NEW_SET_GENERATED_MIN:,} per half)")
+        try:
+            require_new_set_generated_rows(rows)
+        except ValueError as error:
+            short = error
+            # Keep the text for diagnosis, never under the name a reference run would read.
+            out = out.with_name(f"{out.stem}.short{out.suffix}")
     out.write_bytes(canonical(manifest) + b"\n")
     count = len(manifest["windows"])
     print(f"{out}: {count} windows, {count * 512} rows, sha256 {manifest['set_sha256']}")
+    if short:
+        print(f"{short}; the set is not publishable", file=sys.stderr)
+        sys.exit(3)
 
 
 if __name__ == "__main__":

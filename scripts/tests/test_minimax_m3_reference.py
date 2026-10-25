@@ -48,9 +48,14 @@ def tiny_config():
 
 @pytest.fixture
 def snapshot(tmp_path):
-    folder = tmp_path / "snapshot"
+    return make_snapshot(tmp_path / "snapshot")
+
+
+def make_snapshot(folder, vocab=64):
     folder.mkdir()
-    (folder / "config.json").write_text(json.dumps(tiny_config()))
+    config = tiny_config()
+    config["text_config"]["vocab_size"] = vocab
+    (folder / "config.json").write_text(json.dumps(config))
     generator = torch.Generator().manual_seed(71)
     tensors = {}
 
@@ -67,9 +72,9 @@ def snapshot(tmp_path):
         tensors[name + ".weight_global_scale"] = torch.tensor(4.)
         tensors[name + ".input_global_scale"] = torch.tensor(32.)
 
-    bf16("language_model.model.embed_tokens.weight", (64, 32), .5)
+    bf16("language_model.model.embed_tokens.weight", (vocab, 32), .5)
     bf16("language_model.model.norm.weight", (32,))
-    bf16("language_model.lm_head.weight", (64, 32))
+    bf16("language_model.lm_head.weight", (vocab, 32))
     for layer in range(2):
         prefix = f"language_model.model.layers.{layer}."
         for name in ("input_layernorm", "post_attention_layernorm"):
@@ -392,6 +397,190 @@ def test_cpu_golden_scores_and_qualifies_real_fidelity_contract(snapshot, tmp_pa
     assert np.isfinite(logits).all()
     np.testing.assert_array_equal(np.fromfile(out / entry["path"] / "tokens.bin", dtype="<i4"), manifest["windows"][0]["tokens"])
     assert len(meta["seconds_per_layer"]) == 2
+
+
+def served_golden(snapshot, tmp_path, monkeypatch, activation="served"):
+    """A CPU golden of one own-text window on a snapshot named by a 40-hex revision."""
+    import shutil
+    from types import SimpleNamespace
+    from tokenizers import Tokenizer
+    from tokenizers.models import WordLevel
+    from fidelity_windows import set_hash
+    from families.minimax_m3.golden import execute
+    revision = tmp_path / ("5" * 40)
+    shutil.copytree(snapshot, revision)
+    Tokenizer(WordLevel({str(i): i for i in range(64)}, unk_token="0")).save(str(revision / "tokenizer.json"))
+    monkeypatch.setattr(model, "REVISION", revision.name)
+    manifest = {k: v for k, v in panel(([1, 7, 3, 9, 11, 5, 2] * 92)[:640]).items() if k != "set_sha256"}
+    manifest.update(model=model.CHECKPOINT, generation_arm={"checkpoint": model.CHECKPOINT})
+    manifest["windows"][0]["block"] = "E"
+    manifest["set_sha256"] = set_hash(manifest)
+    windows = tmp_path / "windows.json"
+    windows.write_text(json.dumps(manifest))
+    out = tmp_path / "source" / "golden"
+    execute(SimpleNamespace(snapshot=revision, windows=windows, out=out, device="cpu", activation=activation,
+                            resume=None, stop_after_layer=None, layers=None, prefix_only=False, check_only=False))
+    return revision, out
+
+
+@pytest.mark.parametrize("activation", ["served", "served-cache"])
+def test_served_golden_writes_the_reference_only_fields_the_validator_seals(snapshot, tmp_path, monkeypatch, activation):
+    import importlib.util
+    from types import SimpleNamespace
+    from families.minimax_m3 import golden
+    revision, out = served_golden(snapshot, tmp_path, monkeypatch, activation)
+    meta = json.loads((out / "meta.json").read_bytes())
+    assert (meta["attention"], meta["mtp"], meta["use_cache"]) == ("eager", False, False)
+    pin = meta["source_pin"]
+    assert pin["revision"] == revision.name == meta["snapshot_identity"]["snapshot_revision"]
+    # The packager accepts only flat 40-hex revisions and 64-hex digests.
+    assert all(isinstance(v, str) and len(v) in (40, 64) and set(v) <= set("0123456789abcdef") for v in pin.values())
+    assert pin == golden.source_pin(golden.source_identity(), revision.name) and meta["source_identity"] == golden.source_identity()
+    assert meta["root_arithmetic"]["precision"] == golden.ROOT_PRECISION
+    assert (golden.BF16_CACHE in meta["root_arithmetic"]["arithmetic"]) == (activation == "served")
+    assert meta["gates"]["activation"] == activation and meta["tokenizers"] and meta["torch"]
+    for key in ("snapshot_identity", "platform", "transformers", "native_fp32_parameters"):
+        assert key in meta, key
+    tool = lambda name: importlib.util.spec_from_file_location(name, ROOT / f"scripts/bench/{name}.py")
+    converter = importlib.util.module_from_spec(tool("make-fidelity-reference"))
+    converter.__spec__.loader.exec_module(converter)
+    validator = importlib.util.module_from_spec(tool("validate-fidelity-dataset"))
+    validator.__spec__.loader.exec_module(validator)
+    root = out.parent
+    converter.convert_windows(SimpleNamespace(windows=out / "windows.json", golden=out, rows_dir=root / "full",
+        out=root / "reference.json", model=[model.CHECKPOINT], name=None, top_k=None, kl_max=None,
+        top1_min=None, quick_out=None))
+    result = validator.validate_reference_only(root, seal=True)
+    assert result["passed"] and result["scored_tokens"] == meta["scored_tokens"] == 637
+    assert abs(result["nll"] - meta["nll"]) <= 1e-8
+
+
+def test_backfill_adds_the_fields_to_a_finished_golden_from_its_own_identity(snapshot, tmp_path, monkeypatch):
+    from fidelity_windows import canonical
+    from families.minimax_m3 import golden
+    revision, out = served_golden(snapshot, tmp_path, monkeypatch)
+    meta = json.loads((out / "meta.json").read_bytes())
+    # Goldens written before these fields recorded the nested identity as source_pin.
+    added = ("source_identity", "gates", "native_fp32_parameters", "root_arithmetic", "tokenizers", "transformers", "dtype")
+    older = {**{k: v for k, v in meta.items() if k not in added}, "source_pin": meta["source_identity"],
+             "attention": "eager_fp32"}
+    (out / "meta.json").write_bytes(canonical(older) + b"\n")
+    run = {"gpu": "reference GPU", "capability": [12, 1]}
+    again = golden.write_reference_meta(out, revision, run)
+    assert again["platform"] == run
+    assert {k: v for k, v in again.items() if k != "platform"} == {k: v for k, v in meta.items() if k != "platform"}
+    for entry in again["windows"]:
+        assert json.loads((out / entry["path"] / "meta.json").read_bytes()) == entry
+    (revision / "config.json").write_text((revision / "config.json").read_text() + " ")
+    with pytest.raises(ValueError, match="snapshot differs"):
+        golden.write_reference_meta(out, revision)
+
+
+def test_bf16_diagnostic_golden_is_never_a_reference(snapshot, tmp_path, monkeypatch):
+    from families.minimax_m3 import golden
+    revision, out = served_golden(snapshot, tmp_path, monkeypatch, "bf16")
+    meta = json.loads((out / "meta.json").read_bytes())
+    assert meta["diagnostic_only"] and "source_pin" not in meta and "root_arithmetic" not in meta
+    with pytest.raises(ValueError, match="bf16 is a diagnostic"):
+        golden.write_reference_meta(out, revision)
+
+
+def package_minimax(tmp_path, monkeypatch, config="minimax_m3-test", agentic_gen=512, exception_reason=None):
+    """golden.py, make-fidelity-reference.py, validate-fidelity-dataset.py --seal and the packager
+    over a sealed-split set of 64 own-text windows on a tiny release-shaped checkpoint. Agentic
+    windows score agentic_gen generated rows; exception_reason packages under a floor exception."""
+    import importlib.util
+    from types import SimpleNamespace
+    from tokenizers import Tokenizer
+    from tokenizers.models import WordLevel
+    from fidelity_windows import set_hash, standard_split
+    from families.minimax_m3 import golden
+    revision = make_snapshot(tmp_path / ("5" * 40), vocab=1100)
+    Tokenizer(WordLevel({str(i): i for i in range(1100)}, unk_token="0")).save(str(revision / "tokenizer.json"))
+    (revision / "LICENSE").write_text("SAMPLE CHECKPOINT LICENSE\nKeep this notice with every copy.\n")
+    monkeypatch.setattr(model, "REVISION", revision.name)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *_: (12, 1))
+    monkeypatch.setenv("CUTEAFD_REFERENCE_IMAGE", "reference:test")
+    monkeypatch.setenv("CUTEAFD_REFERENCE_IMAGE_SHA256", "sha256:" + "a" * 64)
+    windows = []
+    split = standard_split()
+    for wid in split["decode"] + split["prefill"]:
+        gen = 0 if wid == "legacy" or wid.startswith("c") else agentic_gen if wid.startswith("a") else 512
+        windows.append(dict(id=wid, block="E" if wid == "legacy" else wid[0].upper(), bucket="0-2K",
+                            tokens=[(7 * i + 3 * len(windows)) % 1100 for i in range(640)],
+                            roles=["ctx"] * 128 + ["gen"] * gen + ["ctx"] * (512 - gen), score_from=128))
+    manifest = dict(schema="cuteafd.fidelity.set/1", family="minimax_m3", model=model.CHECKPOINT,
+                    checkpoint=model.CHECKPOINT, generation_arm={"checkpoint": model.CHECKPOINT},
+                    quick_windows=["legacy", "a00", "a04", "a08", "a20", "c00", "d00", "e00"], windows=windows)
+    manifest["set_sha256"] = set_hash(manifest)
+    (tmp_path / "set.json").write_text(json.dumps(manifest))
+    root = tmp_path / "source"
+    out = root / "golden"
+    golden.execute(SimpleNamespace(snapshot=revision, windows=tmp_path / "set.json", out=out, device="cpu",
+        activation="served", resume=None, stop_after_layer=None, layers=None, prefix_only=False, check_only=False))
+    # The real run records its GPU; this CPU run states one as a backfill would.
+    golden.write_reference_meta(out, revision, {"gpu": "reference GPU", "capability": [12, 1]})
+    load = lambda name: importlib.util.spec_from_file_location(name.replace("-", "_"), ROOT / f"scripts/bench/{name}.py")
+    tools = {}
+    for name in ("make-fidelity-reference", "validate-fidelity-dataset", "package-reference-only-fidelity"):
+        tools[name] = importlib.util.module_from_spec(load(name))
+        tools[name].__spec__.loader.exec_module(tools[name])
+    tools["make-fidelity-reference"].convert_windows(SimpleNamespace(windows=out / "windows.json", golden=out,
+        rows_dir=root / "full", out=root / "reference.json", model=[model.CHECKPOINT], name=None, top_k=None,
+        kl_max=None, top1_min=None, quick_out=None))
+    validation = tools["validate-fidelity-dataset"].validate_reference_only(root, seal=True)
+    (root / "reference-validation.json").write_text(json.dumps(validation, indent=2) + "\n")
+    package = tmp_path / "package"
+    packager = tools["package-reference-only-fidelity"]
+    exception = None
+    if exception_reason is not None:
+        from fidelity_windows import FLOOR_EXCEPTION_SCHEMA, standard_generated_rows
+        rows = standard_generated_rows(manifest)
+        exception = dict(schema=FLOOR_EXCEPTION_SCHEMA, set_sha256=manifest["set_sha256"], floor=6500,
+                         measured={h: rows[f"{h}_generated_positions"] for h in ("decode", "prefill")},
+                         reason=exception_reason)
+        with pytest.raises(ValueError, match="10,000 scored generated rows per half"):
+            packager.package(root, tmp_path / "refused", config, revision / "tokenizer.json", ROOT / "LICENSE")
+    index = packager.package(root, package, config, revision / "tokenizer.json", ROOT / "LICENSE",
+                             revision / "LICENSE", exception)
+    return package, index, revision
+
+
+def test_minimax_reference_packages_end_to_end_with_its_checkpoint_licence(tmp_path, monkeypatch):
+    import hashlib
+    from families.minimax_m3 import golden
+    package, index, revision = package_minimax(tmp_path, monkeypatch)
+    config = package / index["name"]
+    digest = lambda path: hashlib.sha256(path.read_bytes()).hexdigest()
+    assert (config / "CHECKPOINT_LICENSE").read_bytes() == (revision / "LICENSE").read_bytes()
+    assert (config / "LICENSE").read_bytes() == (ROOT / "LICENSE").read_bytes()
+    manifest = json.loads((config / "manifest.json").read_bytes())
+    assert manifest["licence_files"] == [dict(path=name, sha256=digest(config / name)) for name in ("LICENSE", "CHECKPOINT_LICENSE")]
+    assert manifest["root_checkpoint"] == {"id": model.CHECKPOINT, "revision": revision.name}
+    assert len(manifest["files"]) == 64 and index["sha256"] == digest(config / "manifest.json")
+    provenance = json.loads((config / "qualification.json").read_bytes())["reference_provenance"]
+    assert provenance["reference_precision"] == golden.ROOT_PRECISION
+    assert provenance["source_pin"]["revision"] == revision.name and provenance["attention"] == "eager"
+    card = (config / "README.md").read_text()
+    assert f"Official root ({golden.ROOT_PRECISION}): `{model.CHECKPOINT}` at `{revision.name}`." in card
+    assert "reproduced verbatim in CHECKPOINT_LICENSE." in card
+
+
+def test_set_below_the_new_set_floor_packages_only_under_its_recorded_exception(tmp_path, monkeypatch):
+    reason = "Agentic turns end after brief reasoning; owner decision, internal use."
+    package, index, revision = package_minimax(tmp_path, monkeypatch, agentic_gen=100, exception_reason=reason)
+    config = package / index["name"]
+    qualification = json.loads((config / "qualification.json").read_bytes())
+    exception = qualification["generated_floor_exception"]
+    measured = {"decode": 13 * 100 + 14 * 512, "prefill": 13 * 100 + 13 * 512}
+    assert exception["measured"] == measured and exception["floor"] == exception["loader_floor"] == 6500
+    assert exception["default_floor"] == 10000 and exception["reason"] == reason
+    assert qualification["standard_generated_rows"]["prefill_generated_positions"] == measured["prefill"]
+    panel = json.loads((config / "windows.json").read_bytes())
+    assert panel["publication_provenance"]["generated_floor_exception"] == exception
+    card = (config / "README.md").read_text()
+    assert "Packaged under a recorded exception to the 10,000-row new-set floor" in card and reason in card
+    assert not (tmp_path / "refused").exists() or not any((tmp_path / "refused").rglob("manifest.json"))
 
 
 def test_cache_e4m3_rounds_ties_even_saturates_and_preserves_sign():

@@ -5,7 +5,6 @@ import copy
 import hashlib
 import json
 from pathlib import Path
-import re
 import shutil
 import subprocess
 import sys
@@ -15,7 +14,10 @@ from safetensors.numpy import save_file
 
 REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO / 'python/reference'))
-from fidelity_windows import canonical, validate_public_metadata, validate_public_text, validate_text_source
+# The generated-row floor is shared with the set builder, which applies it before any reference run.
+from fidelity_windows import (canonical, generated_floor_exception, require_new_set_generated_rows,
+                              standard_generated_rows, validate_public_metadata, validate_public_text,
+                              validate_text_source)
 from checkpoint_tokenizer import load_tokenizer, tokenizer_identity
 
 QUICK = ['legacy', 'a00', 'a04', 'a08', 'a20', 'c00', 'd00', 'e00']
@@ -80,35 +82,6 @@ def compact_tensors(full, window):
                 roles=np.array([r == 'gen' for r in window['roles'][start:]], dtype='u1'),
                 top_ids=ids, top_log_probs=probabilities, tail_log_mass=tails,
                 next_token_log_prob=next_lps)
-
-
-# Scored generated rows each standard half of a newly packaged set needs (TJ, 2026-10-20).
-# The loader admits published sets from 6,500; new sets are built to this larger floor.
-NEW_SET_GENERATED_MIN = 10_000
-
-
-def require_new_set_generated_rows(rows):
-    short = {half: rows[f'{half}_generated_positions'] for half in ('decode', 'prefill')
-             if rows[f'{half}_generated_positions'] < NEW_SET_GENERATED_MIN}
-    if short:
-        raise ValueError(f'new fidelity sets need {NEW_SET_GENERATED_MIN:,} scored generated rows per half; '
-                         + ', '.join(f'{half} has {count:,}' for half, count in short.items()))
-
-
-def standard_generated_rows(panel):
-    """Report natural row counts using the consumer's fixed split, never resample."""
-    source = (REPO / 'rust/crates/cuteafd-bench/src/fidelity_dataset.rs').read_text()
-    windows = {window['id']: window for window in panel['windows']}
-    counts = {}
-    for name in ('decode', 'prefill'):
-        match = re.search(r'pub const STANDARD_' + name.upper() + r':[^=]+=\s*\[(.*?)\];', source, re.S)
-        ids = re.findall(r'"([a-e][0-9]{2}|legacy)"', match.group(1))
-        counts[name] = sum(window['roles'][window['score_from']:].count('gen')
-                           for window in (windows[wid] for wid in ids))
-    small, large = min(counts.values()), max(counts.values())
-    return dict(tier='standard-v2', decode_generated_positions=counts['decode'],
-                prefill_generated_positions=counts['prefill'],
-                max_min_ratio=large / small if small else None, informational_only=True)
 
 
 def standard_generated_note(counts):
@@ -200,6 +173,10 @@ def reference_precision(meta, panel):
     precision = panel.get('reference_snapshot', {}).get('precision')
     if isinstance(precision, str) and precision.strip():
         return precision
+    # A golden over the scored model's own text (MiniMax) records its root precision itself.
+    precision = (meta.get('root_arithmetic') or {}).get('precision')
+    if isinstance(precision, str) and precision.strip():
+        return precision
     if meta.get('root_arithmetic') == KIMI_F32_ROOT:
         return KIMI_F32_PRECISION
     raise ValueError('missing reference precision: unrecognized sealed root arithmetic')
@@ -241,11 +218,20 @@ def validate_runtime_platform(runtime):
     return copy.deepcopy(runtime)
 
 
+def public_server(server):
+    """Immutable generation identity, not deployment arguments, addresses or local paths."""
+    return {k: server[k] for k in ('build', 'family', 'model') if k in server}
+
+
 def public_panel(panel):
     public = copy.deepcopy(panel)
-    # Keep immutable generation identity, not deployment arguments or local paths.
-    server = public.get('generation_server', {})
-    public['generation_server'] = {k: server[k] for k in ('build', 'family', 'model') if k in server}
+    public['generation_server'] = public_server(public.get('generation_server', {}))
+    # Engine-generated windows each record the serving launch too (listen and peer
+    # addresses, mount paths): the same identity-only reduction applies there.
+    for window in public['windows']:
+        provenance = window.get('provenance')
+        if isinstance(provenance, dict) and isinstance(provenance.get('server'), dict):
+            provenance['server'] = public_server(provenance['server'])
     public['publication_provenance'] = {
         **public.get('publication_provenance', {}),
         'source_set_sha256': panel['set_sha256'],
@@ -255,7 +241,7 @@ def public_panel(panel):
     return public
 
 
-def package(source, out, config, tokenizer_path, license_path):
+def package(source, out, config, tokenizer_path, license_path, checkpoint_license=None, floor_exception=None):
     if out.exists() or not config or any(c not in 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_.' for c in config) or config in ('.', '..'):
         raise ValueError('output must be fresh and config must be a safe component')
     read = lambda name: json.loads(contained(source, name).read_text())
@@ -305,11 +291,21 @@ def package(source, out, config, tokenizer_path, license_path):
                 tokenizer.decode(window['tokens'], skip_special_tokens=False))
         validate_public_text(text, scored_text=True)
     precision, arithmetic, runtime_source = root_description(meta, panel)
+    generated_rows = standard_generated_rows(panel)
+    # The new-set floor holds unless the owner's recorded exception names this set and its counts.
+    exception = (require_new_set_generated_rows(generated_rows) if floor_exception is None
+                 else generated_floor_exception(floor_exception, generated_rows, set_id))
     public = public_panel(panel)
+    if exception:
+        public['publication_provenance']['generated_floor_exception'] = exception
     destination = out / config
     destination.mkdir(parents=True)
     (destination / 'windows.json').write_bytes(canonical(public) + b'\n')
     shutil.copyfile(license_path, destination / 'LICENSE')
+    # The checkpoint's own licence travels verbatim beside the data derived from it.
+    if checkpoint_license is not None:
+        shutil.copyfile(checkpoint_license, destination / 'CHECKPOINT_LICENSE')
+    licences = [name for name in ('LICENSE', 'CHECKPOINT_LICENSE') if (destination / name).is_file()]
     entries = {e['id']: e for e in rows['windows']}
     sealed_rows = {e['path']: e for e in full_seal['files']}
     if len(entries) != 64 or set(entries) != {w['id'] for w in panel['windows']}:
@@ -343,11 +339,10 @@ def package(source, out, config, tokenizer_path, license_path):
         raise ValueError('sealed runtime provenance differs')
     runtime = read('platform.json')
     provenance['runtime'] = validate_runtime_platform(runtime)
-    generated_rows = standard_generated_rows(panel)
-    require_new_set_generated_rows(generated_rows)
     role_metrics = reference_role_metrics(validation)
     qualification = dict(schema='cuteafd.fidelity.qualification/1', kind='reference', qualifies=True,
                          **role_metrics, standard_generated_rows=generated_rows,
+                         **({'generated_floor_exception': exception} if exception else {}),
                          engine_parity=False, qualification_scope='reference logits, storage and prefix invariance',
                          set_sha256=set_id, nll=meta['nll'], scored_tokens=meta['scored_tokens'],
                          prefix_qualification=meta['prefix_qualification'], reference_validation=validation,
@@ -361,7 +356,7 @@ def package(source, out, config, tokenizer_path, license_path):
                     expect=copy.deepcopy(POLICY_EXPECT),
                     expect_provenance='declared policy floors; independent of engine measurements',
                     windows_sha256=digest(destination / 'windows.json'), qualification_sha256=digest(destination / 'qualification.json'),
-                    files=files, licence_files=[dict(path='LICENSE', sha256=digest(destination / 'LICENSE'))],
+                    files=files, licence_files=[dict(path=name, sha256=digest(destination / name)) for name in licences],
                     packaging_source_commit=subprocess.check_output(['git', '-C', str(REPO), 'rev-parse', 'HEAD'], text=True).strip(),
                     packaging_source_sha256=digest(Path(__file__)),
                     publication_status='REFERENCE',
@@ -388,6 +383,9 @@ def package(source, out, config, tokenizer_path, license_path):
             f'32,768 scored positions; reference NLL {meta["nll"]:.15f} nat/token.\n'
             f'{reference_role_note(role_metrics)}'
             f'{standard_generated_note(generated_rows)}'
+            + (f'Packaged under a recorded exception to the {exception["default_floor"]:,}-row new-set floor: '
+               f'this set is held to {exception["floor"]:,} generated rows per half (the bench loader admits '
+               f'{exception["loader_floor"]:,}). Reason: {exception["reason"]}\n' if exception else '') +
             'The 576/640-token prefix probes have 512 byte-identical common F32 rows and zero argmax disagreements.\n'
             f'{arithmetic}\n'
             f'{launch_note}'
@@ -402,7 +400,8 @@ def package(source, out, config, tokenizer_path, license_path):
             '## Provenance And Privacy\n\n'
             f'Source set: `{set_id}`. Raw deployment settings and local paths are omitted.\n'
             'Public text and metadata pass credential/private-key/personal-data screening. Original public MIT notice is preserved verbatim.\n'
-            'Reference data is MIT licensed; the official checkpoint remains subject to its own upstream license.\n')
+            'Reference data is MIT licensed; the official checkpoint remains subject to its own upstream license'
+            + (', reproduced verbatim in CHECKPOINT_LICENSE.\n' if 'CHECKPOINT_LICENSE' in licences else '.\n'))
     validate_public_text(card, scored_text=True)
     (destination / 'README.md').write_text(card)
     # This is an index entry, not a replacement for the shared live configs.json.
@@ -416,8 +415,14 @@ def main():
     for name in ('source', 'out', 'tokenizer', 'license'):
         parser.add_argument('--' + name, required=True, type=Path)
     parser.add_argument('--config', required=True)
+    parser.add_argument('--checkpoint-license', type=Path,
+                        help="the checkpoint's own licence, shipped verbatim as CHECKPOINT_LICENSE")
+    parser.add_argument('--generated-floor-exception', type=Path,
+                        help='JSON record of an owner exception to the new-set generated-row floor for this set')
     args = parser.parse_args()
-    print(json.dumps(package(args.source, args.out, args.config, args.tokenizer, args.license), indent=2))
+    exception = json.loads(args.generated_floor_exception.read_text()) if args.generated_floor_exception else None
+    print(json.dumps(package(args.source, args.out, args.config, args.tokenizer, args.license,
+                             args.checkpoint_license, exception), indent=2))
     print('Staged only; no upload or engine qualification performed.')
 
 

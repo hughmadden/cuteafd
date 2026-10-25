@@ -316,6 +316,34 @@ pub fn download(agent: &ureq::Agent, cache: &Path, repo: &str, commit: &str, con
         "text_checkpoint":manifest.get("text_checkpoint").unwrap_or(&manifest["checkpoint"])})))
 }
 
+/// The repository runs record for an internal set: it has no public home or revision.
+pub const INTERNAL: &str = "internal";
+
+/// An internal set staged by package-reference-only-fidelity.py (fidelity_match::INTERNAL_ENV),
+/// held to the same checks as a published one: the manifest's format, every file's checksum, the
+/// qualification and its label. A package index beside it must name the same manifest.
+pub fn load_internal(dir: &Path) -> Result<(Reference, String, Value)> {
+    let bytes = std::fs::read(dir.join("manifest.json"))?;
+    let manifest: Value = serde_json::from_slice(&bytes)?;
+    let config = manifest["config"].as_str().filter(|c| component(c)).context("internal set config name")?;
+    ensure!(dir.file_name().is_some_and(|name| name == config), "internal set directory is not named {config}");
+    if let Some(index) = dir.parent().map(|parent| parent.join("config-entry.json")).filter(|path| path.is_file()) {
+        let entry: Value = serde_json::from_slice(&std::fs::read(index)?)?;
+        ensure!(entry["name"] == config && entry["sha256"] == digest(&bytes), "internal set manifest differs from its package index");
+    }
+    let reference = load(dir, &manifest)?;
+    let qualification: Value = serde_json::from_slice(&checked(dir, "qualification.json",
+        manifest["qualification_sha256"].as_str().context("qualification hash")?)?)?;
+    let label = qualification_label(&qualification, &manifest)?;
+    let mut identity = json!({"repository":INTERNAL, "internal":true, "config":config, "manifest_sha256":digest(&bytes),
+        "qualification":label, "root_checkpoint":manifest["root_checkpoint"],
+        "text_checkpoint":manifest.get("text_checkpoint").unwrap_or(&manifest["checkpoint"])});
+    if let Some(exception) = qualification.get("generated_floor_exception") {
+        identity["generated_floor_exception"] = exception.clone();
+    }
+    Ok((reference, digest(&bytes), identity))
+}
+
 fn tensor<'a>(bytes: &'a [u8], name: &str, dtype: &str, shape: &[usize]) -> Result<&'a [u8]> {
     ensure!(bytes.len() >= 8, "truncated safetensors prefix");
     let n = u64::from_le_bytes(bytes[..8].try_into().unwrap());
@@ -395,6 +423,10 @@ pub fn load(root: &Path, manifest: &Value) -> Result<Reference> {
     Ok(reference)
 }
 
+/// The MiniMax golden's 64-hex source pins (families/minimax_m3/golden.py `source_pin`).
+const MINIMAX_SOURCE_DIGESTS: [&str; 7] = ["model_sha256", "golden_sha256", "shape_invariant_sha256",
+    "fidelity_windows_sha256", "transformers_sources_sha256", "vllm_sources_sha256", "cache_programs_sha256"];
+
 fn qualification_label(qualification: &Value, manifest: &Value) -> Result<&'static str> {
     ensure!(qualification["set_sha256"] == manifest["set_sha256"] && qualification["qualifies"] == true,
         "unqualified or mismatched dataset set");
@@ -451,6 +483,13 @@ fn qualification_label(qualification: &Value, manifest: &Value) -> Result<&'stat
                     "transformers_source_sha256", "compressed_tensors_source_sha256"]
                     .iter().all(|key| hash(&source[key], 64))
                 && padding_valid
+        } else if manifest["family"] == "minimax_m3" {
+            // The independent decoder and harness, and the Transformers, vLLM and cache-program
+            // sources it follows, at the root's own revision.
+            manifest["root_checkpoint"]["id"] == "MiniMaxAI/MiniMax-M3.1-Flash"
+                && source["revision"] == manifest["root_checkpoint"]["revision"]
+                && ["transformers_revision", "vllm_revision"].iter().all(|key| hash(&source[key], 40))
+                && MINIMAX_SOURCE_DIGESTS.iter().all(|key| hash(&source[key], 64))
         } else {
             hash(&source["modeling_sha256"], 64) && hash(&source["source_tree_sha256"], 64)
         };
@@ -1088,6 +1127,13 @@ mod tests {
                 "path":format!("{config}/manifest.json"), "sha256":digest(&manifest_bytes)}]})).unwrap()).unwrap();
             let (_, _, identity) = download(&ureq::Agent::new(), cache.path(), "owner/repo", &revision, config).unwrap();
             assert_eq!(identity["qualification"], expected);
+            // The same staged config as an internal set: the checks of a publication, no repository.
+            let (internal, hash, identity) = load_internal(&root).unwrap();
+            assert_eq!((internal.windows.len(), hash), (64, digest(&manifest_bytes)));
+            assert_eq!(identity["repository"], INTERNAL);
+            assert_eq!((identity["internal"].as_bool(), identity["config"].as_str()), (Some(true), Some(config)));
+            assert_eq!(identity["qualification"], expected);
+            assert_eq!(identity["generated_floor_exception"], qualification["generated_floor_exception"]);
         }
     }
 
@@ -1228,6 +1274,59 @@ mod tests {
     }
 
     #[test]
+    fn minimax_reference_pins_its_decoder_sources_at_the_root_revision() {
+        let revision = "5".repeat(40);
+        let root = "MiniMaxAI/MiniMax-M3.1-Flash";
+        let identity = json!({"checkpoint":root, "snapshot_revision":revision,
+            "config_sha256":"b".repeat(64), "tokenizer_sha256":"c".repeat(64)});
+        let manifest = json!({"family":"minimax_m3", "set_sha256":"set", "vocab":200064,
+            "root_checkpoint":{"id":root, "revision":revision}});
+        let mut source = json!({"revision":revision, "transformers_revision":"6".repeat(40),
+            "vllm_revision":"7".repeat(40)});
+        for key in MINIMAX_SOURCE_DIGESTS { source[key] = json!("d".repeat(64)); }
+        let qualification = json!({"schema":"cuteafd.fidelity.qualification/1", "kind":"reference",
+            "qualifies":true, "engine_parity":false, "set_sha256":"set", "nll":0.9, "scored_tokens":32768,
+            "reference_validation":{"passed":true, "engine_parity":false, "set_sha256":"set",
+                "scored_tokens":32768, "nll":0.9, "golden_seal_sha256":"e".repeat(64), "full_seal_sha256":"f".repeat(64)},
+            "prefix_qualification":{"passed":true, "finite":true, "rows":512, "different_rows":[],
+                "argmax_disagreements":0, "set_sha256":"set", "snapshot_identity":identity, "fixed_rows":128,
+                "vocab":200064, "lengths":[576,640], "score_from":64, "logits_sha256":["1".repeat(64),"2".repeat(64)]},
+            "reference_provenance":{"snapshot_identity":identity, "source_pin":source, "tokenizers":"0.22.1",
+                "platform":{"gpu":"reference GPU"}, "mtp":false, "use_cache":false, "attention":"eager"}});
+        assert_eq!(qualification_label(&qualification, &manifest).unwrap(), "reference");
+        for key in ["revision", "transformers_revision", "vllm_revision"] {
+            for invalid in [Value::Null, json!("g".repeat(40)), json!("a".repeat(39)), json!("a".repeat(64))] {
+                let mut bad = qualification.clone();
+                bad["reference_provenance"]["source_pin"][key] = invalid;
+                assert!(qualification_label(&bad, &manifest).is_err(), "{key}");
+            }
+        }
+        for key in MINIMAX_SOURCE_DIGESTS {
+            for invalid in [Value::Null, json!("g".repeat(64)), json!("A".repeat(64)), json!("a".repeat(63))] {
+                let mut bad = qualification.clone();
+                bad["reference_provenance"]["source_pin"][key] = invalid;
+                assert!(qualification_label(&bad, &manifest).is_err(), "{key}");
+            }
+        }
+        let mut bad = qualification.clone();
+        bad["reference_provenance"]["source_pin"]["revision"] = json!("9".repeat(40));
+        assert!(qualification_label(&bad, &manifest).is_err(), "pinned sources must be the root revision's");
+        // A dense Transformers pin does not stand in for the decoder's own sources.
+        let mut dense = qualification.clone();
+        dense["reference_provenance"]["source_pin"] = json!({"revision":revision,
+            "modeling_sha256":"1".repeat(64), "source_tree_sha256":"2".repeat(64)});
+        assert!(qualification_label(&dense, &manifest).is_err());
+        // Another checkpoint published under the MiniMax family fails closed.
+        let other = "someone/MiniMax-M3.1-Flash";
+        let (mut changed, mut renamed) = (qualification.clone(), manifest.clone());
+        renamed["root_checkpoint"]["id"] = json!(other);
+        for path in ["/reference_provenance/snapshot_identity/checkpoint", "/prefix_qualification/snapshot_identity/checkpoint"] {
+            *changed.pointer_mut(path).unwrap() = json!(other);
+        }
+        assert!(qualification_label(&changed, &renamed).is_err());
+    }
+
+    #[test]
     fn cache_checksums_and_unqualified_panels_fail_closed() {
         let temporary = tempfile::tempdir().unwrap();
         let commit = "a".repeat(40);
@@ -1253,6 +1352,25 @@ mod tests {
         assert!(load(&root,&manifest).unwrap_err().to_string().contains("unqualified"));
         std::fs::write(root.join("windows.json"), b"corrupt").unwrap();
         assert!(load(&root,&manifest).unwrap_err().to_string().contains("checksum"));
+    }
+
+    #[test]
+    fn internal_sets_are_named_for_their_config_and_match_their_package_index() {
+        let tmp = tempfile::tempdir().unwrap();
+        let manifest = br#"{"config":"minimax_m3-test"}"#;
+        let renamed = tmp.path().join("package/other-name");
+        std::fs::create_dir_all(&renamed).unwrap();
+        std::fs::write(renamed.join("manifest.json"), manifest).unwrap();
+        assert!(load_internal(&renamed).unwrap_err().to_string().contains("not named minimax_m3-test"));
+        let dir = tmp.path().join("package/minimax_m3-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("manifest.json"), manifest).unwrap();
+        let index = tmp.path().join("package/config-entry.json");
+        std::fs::write(&index, serde_json::to_vec(&json!({"name":"minimax_m3-test","sha256":"0".repeat(64)})).unwrap()).unwrap();
+        assert!(load_internal(&dir).unwrap_err().to_string().contains("differs from its package index"));
+        std::fs::write(&index, serde_json::to_vec(&json!({"name":"minimax_m3-test","sha256":digest(manifest)})).unwrap()).unwrap();
+        // The index agrees, and the manifest still has to be a reference dataset.
+        assert!(load_internal(&dir).unwrap_err().to_string().contains("unsupported dataset format"));
     }
 
     #[test]
