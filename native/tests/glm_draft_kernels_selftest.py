@@ -988,6 +988,16 @@ def dflash2_check(lib, args):
         return checks(name, outside == 0, f"{outside}/{actual.numel()} outside the factor band; {count} differ "
                       f"from torch's FP32 factor, at most {worst:.2f} BF16 units")
 
+    def ring_record(values):
+        """The shared E4M3 ring writer's codes and per-head scales of BF16 `values` [..., heads, dim]:
+        amax / 448 and its reciprocal, each correctly rounded, then round-to-nearest-even codes. On
+        the CPU, as draft_kv_selftest.py packs: CUDA torch divides by a Python scalar through its
+        reciprocal, which can miss the kernel's __fdiv_rn by a unit."""
+        values = values.cpu().float()
+        amax = values.abs().amax(-1)
+        scales = torch.where(amax > 0, amax / 448.0, 1.0)
+        return (values * (1.0 / scales)[..., None]).to(torch.float8_e4m3fn), scales
+
     def tap_f32():
         # The F32 residual tap rounds to nearest even into its column block, leaving the rest.
         rows = 37
@@ -1113,16 +1123,18 @@ def dflash2_check(lib, args):
             return
         torch.cuda.synchronize()
         checks("qk_rope_gemma_fp8 queries", torch.equal(q8, q), "the BF16 kernel's bytes")
-        exact = True
-        for plane, values in ((k8, k), (v8, v)):
-            amax = values.float().abs().amax(-1)
-            scales = torch.where(amax > 0, amax / 448.0, 1.0)
-            codes = (values.float() * (1.0 / scales)[..., None]).to(torch.float8_e4m3fn)
-            for slot in slots[written].tolist():
-                exact &= torch.equal(plane[slot, :kv_heads * dim], codes[slot].view(torch.uint8).flatten())
-                exact &= torch.equal(plane[slot, kv_heads * dim:kv_heads * (dim + 4)],
-                                     scales[slot].contiguous().view(torch.uint8))
-        checks("qk_rope_gemma_fp8 ring codes and scales", exact, "the BF16 kernel's K and V packed")
+        rows = slots[written].long()
+        for name, plane, values in (("K", k8, k), ("V", v8, v)):
+            want_codes, want_scales = ring_record(values[rows])
+            got_codes = plane[rows, :kv_heads * dim].cpu().view(torch.float8_e4m3fn).view(-1, kv_heads, dim)
+            got_scales = plane[rows, kv_heads * dim:kv_heads * (dim + 4)].cpu().contiguous().view(torch.float32)
+            codes = int((got_codes.view(torch.uint8) != want_codes.view(torch.uint8)).sum())
+            scales = int((got_scales != want_scales).sum())
+            code_step = float((got_codes.float() - want_codes.float()).abs().max())
+            scale_error = float(((got_scales - want_scales).abs() / want_scales).max())
+            checks(f"qk_rope_gemma_fp8 {name} ring codes and scales", codes == 0 and scales == 0,
+                   f"the BF16 kernel's {name} packed: {codes}/{want_codes.numel()} codes differ by at most "
+                   f"{code_step:.3g}, {scales}/{want_scales.numel()} scales by at most {scale_error:.2e} relative")
 
     def topk():
         # Top-16 of BF16-rounded logits over MiniMax's vocabulary (and GLM's, and the largest admitted).
@@ -1225,13 +1237,11 @@ def dflash2_check(lib, args):
                     record = (kv_heads * (dim + 4) + 15) // 16 * 16
 
                     def pack(x):
-                        amax = x.float().abs().amax(-1)
-                        scales = torch.where(amax > 0, amax / 448.0, 1.0)
-                        codes = (x.float() * (1.0 / scales)[..., None]).to(torch.float8_e4m3fn)
-                        out = torch.zeros(*x.shape[:-2], record, device="cuda", dtype=torch.uint8)
+                        codes, scales = ring_record(x)
+                        out = torch.zeros(*x.shape[:-2], record, dtype=torch.uint8)
                         out[..., :kv_heads * dim] = codes.view(torch.uint8).flatten(-2)
                         out[..., kv_heads * dim:kv_heads * (dim + 4)] = scales.contiguous().view(torch.uint8)
-                        return out, (codes.float() * scales[..., None]).to(bf16)
+                        return out.cuda(), (codes.float() * scales[..., None]).to(bf16).cuda()
 
                     (k8, kd), (v8, vd) = pack(kr), pack(vr)
                     for causal in (0, 1):
