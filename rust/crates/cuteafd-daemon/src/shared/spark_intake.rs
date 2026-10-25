@@ -1379,7 +1379,8 @@ fn log_transfer_plan(mode: IntakeMode, ranks: usize) {
                 rail.effective_gbps)).collect::<Vec<_>>().join(", ");
             // Chunk sizes: TEMPORARY, remove after PFC test (TJ 2026-10-25).
             let chunking = cuteafd_transport::spark_chunking();
-            tracing::info!(ranks, intake = mode.name(), coordinator_rails = %ports,
+            tracing::info!(ranks, rdma_tc = report.rdma_traffic_class, dscp = report.rdma_traffic_class >> 2,
+                intake = mode.name(), coordinator_rails = %ports,
                 request_chunk_bytes = %cuteafd_transport::SparkChunking::describe(chunking.request),
                 reply_chunk_bytes = %cuteafd_transport::SparkChunking::describe(chunking.reply),
                 "Spark transfer plan: every rank on the first coordinator rail");
