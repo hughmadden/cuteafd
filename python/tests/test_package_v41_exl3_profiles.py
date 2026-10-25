@@ -937,7 +937,7 @@ class PackageProfileTests(unittest.TestCase):
             self.assertTrue(package.ws_dynamic_tiles('v41', 'coordinator', 1152, capacity))
             self.assertEqual(package.ws_route_block('v41', 'coordinator', 1152, capacity), 64)
             self.assertEqual(package.ws_tile('v41', 'coordinator', 2304, capacity),
-                             package.TILE_RTX_MIXED)
+                             (64, 256, 64, 256))
         for capacity in (1024, 4096):
             self.assertEqual(package.ws_tile('v41', 'coordinator', 1152, capacity),
                              package.TILE_RTX_MIXED)
@@ -948,6 +948,23 @@ class PackageProfileTests(unittest.TestCase):
             self.assertTrue(calls)
             for call in calls:
                 self.assertEqual(call.kwargs['tile'], (64, 192, 64, 256))
+                self.assertTrue(call.kwargs['ws_dynamic_tiles'])
+                self.assertEqual(call.kwargs['route_block'], 64)
+
+    def test_v41_coordinator_tp1_prefill_units_use_qualified_n256(self):
+        for capacity in (2048, 2752):
+            self.assertTrue(package.ws_dynamic_tiles('v41', 'coordinator', 2304, capacity))
+            self.assertEqual(package.ws_route_block('v41', 'coordinator', 2304, capacity), 64)
+        for capacity in (1024, 4096):
+            self.assertEqual(package.ws_tile('v41', 'coordinator', 2304, capacity),
+                             package.TILE_RTX_MIXED)
+        with tempfile.TemporaryDirectory() as temporary:
+            _, _, calls, _ = self.build_fixture(
+                Path(temporary), 'coordinator', (3, 4), geometry='v41',
+                capacities=(2048, 2752), profiles=('rtx-tp1',))
+            self.assertTrue(calls)
+            for call in calls:
+                self.assertEqual(call.kwargs['tile'], (64, 256, 64, 256))
                 self.assertTrue(call.kwargs['ws_dynamic_tiles'])
                 self.assertEqual(call.kwargs['route_block'], 64)
 

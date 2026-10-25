@@ -433,8 +433,8 @@ COORDINATOR_WS_CELLS: dict[tuple[str, int, int], dict] = {
     # V4.1 EXL3 wins from m1024 up; m256 stays cooperative (0.77-0.84x).
     ('v41', 2304, 1024): _WS_S14,
     ('v41', 1152, 1024): _WS_S14,
-    ('v41', 2304, 2752): _WS_S14,
-    ('v41', 2304, 2048): _WS_S14,
+    ('v41', 2304, 2752): dict(route_block=64, dynamic=True, tile=(64, 256, 64, 256)),
+    ('v41', 2304, 2048): dict(route_block=64, dynamic=True, tile=(64, 256, 64, 256)),
     ('v41', 1152, 2752): dict(route_block=64, dynamic=True, tile=(64, 192, 64, 256)),
     ('v41', 1152, 2048): dict(route_block=64, dynamic=True, tile=(64, 192, 64, 256)),
     ('v41', 2304, 4096): _WS_S14,
