@@ -151,11 +151,27 @@ fn onboarded_tp2_destinations_join_the_exlr8_group_without_changing_residency() 
                 assert_eq!(plan.exlr8.len(), 2);
                 assert_eq!(plan.layout.bytes(), resident);
                 assert_eq!(plan.logical_bytes(), resident as u64);
+                let retained = plan.exlr8.iter().map(Residency::host_bytes).sum::<usize>();
+                let descriptors = plan.exlr8.iter().map(Residency::descriptor_host_bytes)
+                    .collect::<Result<Vec<_>>>()?.into_iter().max().unwrap();
+                assert_eq!(plan.exlr8_host_bytes()?, retained + descriptors);
+                let host_peak = retained + descriptors + 128 * (1 << 20);
+                let host_plans = [Some(plan)];
+                assert_eq!(CoordinatorExpertPlan::admit_host(&host_plans, 128, 1 << 20,
+                    host_peak as u64)?, host_peak);
+                assert!(CoordinatorExpertPlan::admit_host(&host_plans, 128, 1 << 20,
+                    host_peak as u64 - 1).is_err());
                 assert!(CoordinatorExpertPlan::exlr8(&catalog, "mixed", &[5, 7], gpu,
                     resident - 1).is_err());
                 offers.push(Offer { rank: sparks + gpu, host: "coordinator".into(),
-                    arena_bytes: base + plan.logical_bytes(), placement: Vec::new() });
+                    arena_bytes: base + host_plans[0].as_ref().unwrap().logical_bytes(), placement: Vec::new() });
             }
+            let host_plans = (0..2).map(|gpu| CoordinatorExpertPlan::exlr8(&catalog, "mixed", &[5, 7], gpu,
+                usize::MAX).map(Some)).collect::<Result<Vec<_>>>()?;
+            let host_peak = 2 * 128 * (1 << 20) + host_plans.iter().map(|plan|
+                plan.as_ref().unwrap().exlr8_host_bytes()).collect::<Result<Vec<_>>>()?.into_iter().sum::<usize>();
+            assert_eq!(CoordinatorExpertPlan::admit_host(&host_plans, 128, 1 << 20, host_peak as u64)?, host_peak);
+            assert!(CoordinatorExpertPlan::admit_host(&host_plans, 128, 1 << 20, host_peak as u64 - 1).is_err());
             let coordinator = super::super::push_exl3::CoordinatorRanks { ranks: 2,
                 append: Box::new(move |builder, catalog, offers| {
                     let catalog = catalog.context("fixture catalog")?;

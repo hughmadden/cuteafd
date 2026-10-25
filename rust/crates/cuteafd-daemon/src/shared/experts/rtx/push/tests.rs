@@ -7,6 +7,18 @@ use cuteafd_loader::{plan::testing::{qwen4_config, qwen4_exl3, write_snapshot},
     push_load::{proto::{Event, Request}, slot, Listener, PushClient}};
 use std::{fs::File, net::TcpStream, os::unix::fs::FileExt, time::Duration};
 
+#[test]
+fn coordinator_host_admission_charges_every_concurrent_receive_ring() -> Result<()> {
+    for gpus in [1, 2] {
+        let plans = (0..gpus).map(|_| None).collect::<Vec<_>>();
+        let peak = gpus * 128 * (1 << 20);
+        assert_eq!(CoordinatorExpertPlan::admit_host(&plans, 128, 1 << 20, peak as u64)?, peak);
+        assert!(CoordinatorExpertPlan::admit_host(&plans, 128, 1 << 20, peak as u64 - 1).is_err());
+        assert!(CoordinatorExpertPlan::admit_host(&plans, usize::MAX, 2, u64::MAX).is_err());
+    }
+    Ok(())
+}
+
 fn control_pair() -> Result<(TcpStream, TcpStream)> {
     let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
     let client = TcpStream::connect(listener.local_addr()?)?;

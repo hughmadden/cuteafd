@@ -344,6 +344,10 @@ impl CoordinatorPush {
             }
             None => (0..gpus).map(|_| None).collect(),
         };
+        let (_, available) = cuteafd_loader::formats::mapped_preload::host_memory()?;
+        let host_peak = CoordinatorExpertPlan::admit_host(&plans, cuteafd_ffi::push_ring::DEFAULT_SLOTS,
+            cuteafd_ffi::push_ring::DEFAULT_SLOT_BYTES, available)?;
+        tracing::info!(gpus, host_peak_bytes = host_peak, "coordinator push host memory admitted");
         let (mut driver, mut ranks) = (Vec::new(), Vec::new());
         for _ in 0..gpus {
             let listener = std::net::TcpListener::bind("127.0.0.1:0")?;

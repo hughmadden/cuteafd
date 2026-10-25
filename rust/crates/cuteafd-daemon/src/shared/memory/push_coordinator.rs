@@ -91,6 +91,35 @@ impl CoordinatorExpertPlan {
         Ok(Self { residencies: Vec::new(), exlr8: Vec::new(), native, layers: layers.to_vec(), gpu, layout, validation, scales })
     }
 
+    /// EXLR8 keeps its source/index metadata through serving and constructs one
+    /// layer's relocated descriptors at a time after Done. Mount upload banks
+    /// are not used by push; its receive rings are admitted separately below.
+    pub fn exlr8_host_bytes(&self) -> Result<usize> {
+        let mut retained = 0usize;
+        let mut scratch = 0usize;
+        for residency in &self.exlr8 {
+            let host = residency.host_bytes();
+            retained = retained.checked_add(host).context("EXLR8 retained host overflow")?;
+            scratch = scratch.max(residency.descriptor_host_bytes()?);
+        }
+        retained.checked_add(scratch).context("EXLR8 host admission overflow")
+    }
+
+    /// Both coordinator ranks receive concurrently, so every format pays for
+    /// every pinned ring. EXLR8 additionally pays for retained metadata and its
+    /// per-rank post-Done descriptor scratch, not the deleted mount staging.
+    pub fn admit_host(plans: &[Option<Self>], slots: usize, slot_bytes: usize, available: u64) -> Result<usize> {
+        let rings = slots.checked_mul(slot_bytes).and_then(|bytes| bytes.checked_mul(plans.len()))
+            .context("coordinator push ring host overflow")?;
+        let peak = plans.iter().try_fold(rings, |bytes, plan| {
+            let extra = plan.as_ref().map_or(Ok(0), Self::exlr8_host_bytes)?;
+            bytes.checked_add(extra).context("coordinator push host admission overflow")
+        })?;
+        ensure!(u64::try_from(peak)? <= available,
+            "coordinator push retained metadata, descriptors and receive rings need {peak} host bytes, available {available}");
+        Ok(peak)
+    }
+
     /// Device scratch the post-Done native plane transform needs (0 for EXL3).
     pub fn scratch_bytes(&self) -> usize { self.native.iter().map(|p| p.scratch_bytes()).max().unwrap_or(0) }
     pub fn logical_bytes(&self) -> u64 { self.scales.logical_bytes(&self.layout) }
