@@ -1082,27 +1082,52 @@ class PackageProfileTests(unittest.TestCase):
                         if geometry == 'glm':
                             ws = bits == target_bits and (
                                 (width == 1024 and capacity in (256, 1024, 2752))
-                                or (width == 2048 and capacity == 256))
+                                or (width == 2048 and capacity in (256, 4096)))
                         else:
-                            ws = bits == target_bits and width == 1024 and capacity in (256, 2752)
+                            ws = bits == target_bits and (
+                                (width == 1024 and capacity in (256, 1024, 2752, 4096))
+                                or (width == 2048 and capacity == 256))
                         wire = ws and geometry == 'glm' and width == 1024 and capacity == 256
                         self.assertEqual(call.kwargs.get('warp_specialized', False), ws)
                         self.assertEqual(call.kwargs.get('wire_input', False), wire)
                         self.assertEqual(call.kwargs.get('ws_input_stages'), 3 if wire else None)
-                        self.assertEqual(call.kwargs.get('ws_dynamic_tiles', False), wire)
+                        dynamic = wire or (ws and ((geometry == 'glmf' and width == 1024)
+                                                  or (geometry == 'glm' and width == 2048)))
+                        self.assertEqual(call.kwargs.get('ws_dynamic_tiles', False), dynamic)
                         self.assertEqual('+ws-' in str(call.args[0]), ws)
                         if ws:
                             self.assertEqual(call.kwargs['route_block'], 64)
                             self.assertNotIn('token_major_rotation', call.kwargs)
-                            self.assertIn('-wire-s3-dynamic' if wire else '-bf16-static', str(call.args[0]))
+                            suffix = '-wire-s3-dynamic' if wire else '-bf16-dynamic' if dynamic else '-bf16-static'
+                            self.assertIn(suffix, str(call.args[0]))
         for geometry in ('glm', 'glmf'):
             for width in (256, 384, 512, 640, 768, 1536):
                 self.assertFalse(package.warp_specialized(geometry, 'coordinator', width, 256))
-            for capacity in (1, 16, 80, 128, 512, 1536, 4096, 8192):
+            unmeasured = (1, 16, 80, 128, 512, 1536, 8192) + ((4096,) if geometry == 'glm' else ())
+            for capacity in unmeasured:
                 self.assertFalse(package.warp_specialized(geometry, 'coordinator', 1024, capacity))
-        for capacity in (80, 256, 1024, 2752, 4096):
+        for capacity in (80, 1024, 2048, 2752, 4096):
             self.assertFalse(package.warp_specialized('glmf', 'coordinator', 2048, capacity))
-        self.assertFalse(package.warp_specialized('glmf', 'coordinator', 1024, 1024))
+
+    def test_tp1_ws_only_changes_gated_cells(self):
+        for capacity in (256, 4096):
+            self.assertEqual(package.coordinator_ws_cell('glm', 'coordinator', 2048, capacity),
+                             dict(route_block=64, dynamic=True))
+        for capacity in (1024, 2048, 2752):
+            self.assertIsNone(package.coordinator_ws_cell('glm', 'coordinator', 2048, capacity))
+        self.assertEqual(package.coordinator_ws_cell('glmf', 'coordinator', 2048, 256),
+                         dict(route_block=64))
+        self.assertFalse(package.ws_dynamic_tiles('glmf', 'coordinator', 2048, 256))
+
+    def test_flash_tp2_dynamic_ws_preserves_tune2048_static_cell(self):
+        for capacity in (256, 1024, 2752, 4096):
+            cell = package.coordinator_ws_cell('glmf', 'coordinator', 1024, capacity)
+            self.assertEqual(cell, dict(route_block=64, dynamic=True))
+            self.assertIsNone(package.ws_tile('glmf', 'coordinator', 1024, capacity))
+            self.assertFalse(package.wire_input('glmf', 'coordinator', 1024, capacity))
+        self.assertEqual(package.coordinator_ws_cell('glmf', 'coordinator', 1024, 2048),
+                         dict(route_block=64))
+        self.assertFalse(package.ws_dynamic_tiles('glmf', 'coordinator', 1024, 2048))
 
     def test_kimi_ws64_only_for_qualified_ordinary_tp6_prefill(self):
         capacities = (1, 16, 80, 256, 1024, 2048, 4096)
