@@ -1153,7 +1153,7 @@ for host in "${hosts[@]}"; do
   # arguments into one remote shell line, so an empty argument is elided and
   # every later positional shifts; the optional EXL3 family tag therefore
   # travels as a sentinel and the host name sits ahead of it.
-  spark_manifest="$(release_ssh -o ConnectTimeout=10 "$host" bash -s -- "$SPARK_EXPERT_DOCKER_INFERENCE" "$engine_commit" "$sparkinfer_commit" "$snapshot_rel" "$host" "$model_is_exl3" "${exl3_family_tag:-__none__}" "${wip_slot:-__none__}" "${wip_spark_container:-__none__}" "${WIP_LAYOUT_SLOT:-__none__}" "${WIP_ROOT:-__default__}" "${WIP_INSTANCE:-__none__}" "$namespace_root" <<'REMOTE'
+  spark_manifest="$(release_ssh -o ConnectTimeout=10 "$host" bash -s -- "$SPARK_EXPERT_DOCKER_INFERENCE" "$engine_commit" "$sparkinfer_commit" "$snapshot_rel" "$host" "$model_is_exl3" "${exl3_family_tag:-__none__}" "${wip_slot:-__none__}" "${wip_spark_container:-__none__}" "${WIP_LAYOUT_SLOT:-__none__}" "${WIP_ROOT:-__default__}" "${WIP_INSTANCE:-__none__}" "$namespace_root" "$namespace_hf_home" <<'REMOTE'
 set -euo pipefail
 image="$1"; engine="$2"; sparkinfer="$3"; snapshot_rel="$4"; host="$5"
 exl3="$6"; exl3_family="${7:-__none__}"; wip_slot="${8:-__none__}"
@@ -1161,6 +1161,7 @@ wip_spark_container="${9:-cuteafd-spark-expert-wip}"
 wip_layout_slot="${10:-$wip_slot}"
 wip_root_arg="${11:-__default__}"; wip_instance_arg="${12:-__none__}"
 namespace_root="${13:-/mnt/sparknest}"
+namespace_hf_home="${14:-$namespace_root/hf-home}"
 [[ "$wip_instance_arg" != __none__ ]] || wip_instance_arg=
 [[ "$wip_root_arg" != __default__ ]] || wip_root_arg="$HOME/.cache/cuteafd/builds/wip${wip_instance_arg:+-$wip_instance_arg}"
 wip_cp() { # slot files come from the container when it exists, else from the WIP root
@@ -1172,6 +1173,18 @@ wip_cp() { # slot files come from the container when it exists, else from the WI
 # bare nonzero exit would otherwise surface as an unexplained transport error.
 # Diagnostics go to stderr; stdout stays the EXL3 manifest alone.
 die() { echo "spark preflight on $host: $*" >&2; exit 1; }
+# The worker container mounts only the namespace root, so the snapshot is read
+# from the coordinator's namespace hf-home, never this host's HF_HOME or
+# ~/.cache/huggingface. Checked before Docker: a path the container cannot see
+# fails here, by name.
+hf_home="$namespace_hf_home"
+[[ "$hf_home" == "$namespace_root"/* ]] || die "namespace HF_HOME $hf_home is outside the mounted namespace $namespace_root"
+[[ -d "$hf_home/$snapshot_rel" ]] || die "model snapshot is missing: $hf_home/$snapshot_rel"
+resolved_snapshot="$(readlink -f "$hf_home/$snapshot_rel")"
+[[ "$resolved_snapshot" == "$namespace_root"/* ]] || die "model snapshot resolves outside the mounted namespace $namespace_root: $resolved_snapshot"
+if find "$hf_home/$snapshot_rel" -xtype l -print -quit | grep -q .; then
+  die "model snapshot has dangling links: $snapshot_rel"
+fi
 docker info >/dev/null 2>&1 || die "the Docker daemon is unavailable"
 if ! docker image inspect "$image" >/dev/null 2>&1; then
   registry="${image%%/*}"
@@ -1188,12 +1201,6 @@ if [[ "$wip_slot" == __none__ && "$image_sparkinfer" != "$sparkinfer" ]]; then
   [[ "$wip_slot" == __none__ ]] && remedy="./build.sh, or pull the matching pair" ||
     remedy="scripts/build/build-dev-images.sh, then ./wip.sh --recreate"
   die "$image carries SparkInfer ${image_sparkinfer:-<none>} but this checkout pins $sparkinfer; rebuild with $remedy"
-fi
-hf_home="${HF_HOME:-$HOME/.cache/huggingface}"
-[[ "$namespace_root" == /mnt/sparknest ]] || hf_home="$namespace_root/hf-home"
-[[ -d "$hf_home/$snapshot_rel" ]] || die "model snapshot is missing: $snapshot_rel"
-if find "$hf_home/$snapshot_rel" -xtype l -print -quit | grep -q .; then
-  die "model snapshot has dangling links: $snapshot_rel"
 fi
 if [[ "$wip_slot" != __none__ ]]; then
   layout="$HOME/.cache/cuteafd/wip-run/$wip_layout_slot"
@@ -1506,10 +1513,12 @@ for i in "${!hosts[@]}"; do
   if ((${#RELEASE_PROFILE_WRAPPER[@]})); then
     remote_args+=("${RELEASE_PROFILE_WRAPPER_DOCKER_ARGS[@]}" --profile-wrapper "${RELEASE_PROFILE_WRAPPER[@]}")
   fi
-  release_ssh "$host" "$(declare -f release_serving_docker_args release_require_writable_state cuteafd_cdi_require cuteafd_cdi_gpu_args); export -f release_serving_docker_args release_require_writable_state cuteafd_cdi_require cuteafd_cdi_gpu_args; CUTEAFD_NAMESPACE_ROOT=$(printf %q "$namespace_root") bash -s -- $(printf '%q ' "${remote_args[@]}")" <<'REMOTE' &
+  release_ssh "$host" "$(declare -f release_serving_docker_args release_require_writable_state cuteafd_cdi_require cuteafd_cdi_gpu_args); export -f release_serving_docker_args release_require_writable_state cuteafd_cdi_require cuteafd_cdi_gpu_args; CUTEAFD_NAMESPACE_ROOT=$(printf %q "$namespace_root") CUTEAFD_NAMESPACE_HF_HOME=$(printf %q "$namespace_hf_home") bash -s -- $(printf '%q ' "${remote_args[@]}")" <<'REMOTE' &
 set -euo pipefail
 namespace_root="${CUTEAFD_NAMESPACE_ROOT:-/mnt/sparknest}"
-[[ "$namespace_root" == /mnt/sparknest ]] || HF_HOME="$namespace_root/hf-home"
+# The snapshot path the preflight checked: the coordinator's namespace hf-home,
+# never this host's HF_HOME or ~/.cache/huggingface (only the root is mounted).
+hf_home="${CUTEAFD_NAMESPACE_HF_HOME:-$namespace_root/hf-home}"
 image="$1"; name="$2"; rank="$3"; budget="$4"; port="$5"; snapshot_rel="$6"; fingerprint="$7"; world="$8"
 topology_explicit="$9"; topology_tp="${10}"; topology_ep="${11}"
 topology_args=()
@@ -1553,7 +1562,6 @@ rdma_args=()
 [[ -z "$rdma_env" ]] || rdma_args+=(-e "CUTEAFD_PROTOCOL_V2_VERBS_HOST_DEVICE_MAP=$rdma_env")
 [[ -z "$ib_port" ]] || rdma_args+=(-e "CUTEAFD_VERBS_APP_IB_PORT_NUM=$ib_port")
 [[ -z "$execution_lanes" ]] || rdma_args+=(-e "CUTEAFD_PROTOCOL_V2_VERBS_HOST_EXECUTION_LANES=$execution_lanes")
-hf_home="${HF_HOME:-$HOME/.cache/huggingface}"
 # A fixed INFO default makes the worker's structured startup evidence
 # (`rank`/`world`/`role`/`intermediate`) observable; without it EnvFilter is
 # ERROR and the readiness line never reaches the container log. This adds no
