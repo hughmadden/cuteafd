@@ -128,16 +128,11 @@ pub fn discover() -> Result<FabricReport> {
         }
     }
     let rails = plan_rails(&ports);
-    let rdma_traffic_class = parse_traffic_class(std::env::var("CUTEAFD_RDMA_TRAFFIC_CLASS").ok().as_deref())?;
-    Ok(FabricReport { ports, rails, rdma_traffic_class })
+    Ok(FabricReport { ports, rails, rdma_traffic_class: RDMA_TRAFFIC_CLASS })
 }
 
-fn parse_traffic_class(value: Option<&str>) -> Result<u8> {
-    let value = value.filter(|v| !v.is_empty()).unwrap_or("0");
-    anyhow::ensure!(value.bytes().all(|b| b.is_ascii_digit()),
-        "CUTEAFD_RDMA_TRAFFIC_CLASS must be a decimal byte (0..255)");
-    value.parse().context("CUTEAFD_RDMA_TRAFFIC_CLASS must be a decimal byte (0..255)")
-}
+/// GRH traffic class the native layer sets on every RC QP (`rdma_traffic_class.h`): DSCP 26.
+pub const RDMA_TRAFFIC_CLASS: u8 = 26 << 2;
 
 fn read_device(path: &Path, addresses: &[(String, Ipv4Addr, u8)]) -> Result<Vec<RdmaPort>> {
     let device = path.file_name().context("RDMA device name")?.to_string_lossy().into_owned();
@@ -333,14 +328,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn traffic_class_is_an_opt_in_byte_not_a_dscp() {
-        for (value, expected) in [(None, 0), (Some(""), 0), (Some("104"), 104), (Some("255"), 255)] {
-            assert_eq!(parse_traffic_class(value).unwrap(), expected);
-        }
-        for value in ["-1", "+1", "256", "26x", " 104", "99999999999999"] {
-            assert!(parse_traffic_class(Some(value)).is_err(), "{value}");
-        }
-        let report = FabricReport { ports: vec![], rails: plan_rails(&[]), rdma_traffic_class: 104 };
+    fn rdma_marking_is_dscp_26_and_logged() {
+        assert_eq!(RDMA_TRAFFIC_CLASS, 104);
+        let report = FabricReport { ports: vec![], rails: plan_rails(&[]), rdma_traffic_class: RDMA_TRAFFIC_CLASS };
         assert!(report.summary().contains("rdma_tc=104 dscp=26"));
     }
 

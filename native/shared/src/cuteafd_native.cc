@@ -402,14 +402,13 @@ cuteafd_status_t modify_rc_qp_to_rtr(ibv_context* context, ibv_qp* qp,
     attr.ah_attr.grh.dgid = gid;
     attr.ah_attr.grh.sgid_index = local_gid_index;
     attr.ah_attr.grh.hop_limit = 1;
-    if (!cuteafd::rdma_traffic_class(std::getenv("CUTEAFD_RDMA_TRAFFIC_CLASS"),
-                                   &attr.ah_attr.grh.traffic_class)) {
-      return fail(CUTEAFD_STATUS_INVALID_ARGUMENT,
-                  "CUTEAFD_RDMA_TRAFFIC_CLASS must be a decimal byte (0..255)");
-    }
+    // Always mark RoCE as DSCP 26. An untuned fabric ignores it (switch trust
+    // ignore, NIC trust pcp on an untagged link); a tuned one classifies it
+    // into the lossless class, so run commands never change with tuning.
+    attr.ah_attr.grh.traffic_class = cuteafd::kRdmaTrafficClass;
     // Verbs bypasses RDMA-CM's DSCP-to-UP selection. Match the DSCP class
     // selector on transmit too, so a priority-3 PFC pause stops our RoCE QPs.
-    attr.ah_attr.sl = attr.ah_attr.grh.traffic_class >> 5;
+    attr.ah_attr.sl = cuteafd::kRdmaTrafficClass >> 5;
     attr.ah_attr.grh.flow_label = flow_label;
   }
   const int flags = IBV_QP_STATE | IBV_QP_AV | IBV_QP_PATH_MTU | IBV_QP_DEST_QPN |

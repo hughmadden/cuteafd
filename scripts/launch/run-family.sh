@@ -77,10 +77,6 @@ done < <(grep -E '^[A-Z_0-9]+=' "$config")
 [[ -z "${SPARK_COUNT:-}" ]] || { cfg[SPARK_COUNT]="$SPARK_COUNT"; cfg_file[SPARK_COUNT]=1; }
 [[ -z "${SPARK_HOSTS:-}" ]] || { cfg[SPARK_HOSTS]="$SPARK_HOSTS"; cfg_file[SPARK_HOSTS]=1; }
 get() { printf '%s' "${cfg[$1]:-${2:-}}"; }
-rdma_traffic_class="$(get RDMA_TRAFFIC_CLASS 0)"
-[[ "$rdma_traffic_class" =~ ^[0-9]{1,3}$ ]] && ((10#$rdma_traffic_class <= 255)) ||
-  release_die "RDMA_TRAFFIC_CLASS must be a decimal byte (0..255)"
-rdma_traffic_class=$((10#$rdma_traffic_class))
 # Refused before anything starts: a release never serves pages from a checkout.
 case "$(get CONSOLE_ASSETS off)" in
   on) [[ -n "$wip_slot" ]] || release_die "CONSOLE_ASSETS=on serves pages from a checkout and needs --wip SLOT; release images serve their compiled-in pages" ;;
@@ -137,7 +133,6 @@ VISION
 AUDIO
 COORDINATOR_GPU_BUDGET_GIB
 MAPPED_SCALE_PRELOAD_GIB
-RDMA_TRAFFIC_CLASS
 INSTANCE
 MODEL_ID
 MODEL_REVISION
@@ -203,7 +198,6 @@ EXPERT_PORT
 SPARK_DEVICE_BUDGET_BYTES
 MAX_CONTEXT_TOKENS
 RDMA_BOND_BALANCE
-RDMA_TRAFFIC_CLASS
 HOST_ISA
 PROBE_DUMP_ROOT
 TARGET_HEAD
@@ -236,7 +230,6 @@ EOF
   cat <<'EOF'
 VISION_REPLICAS
 RDMA_BOND_BALANCE
-RDMA_TRAFFIC_CLASS
 HOST_ISA
 ATTENTION_PLACEMENT
 CHAT_TEMPLATE_FROM
@@ -490,7 +483,6 @@ PROFILE_SPARK_NCU_SET
 PROFILE_SPARK_NCU_SKIP
 PROFILE_SPARK_NSYS_GPU_METRICS
 RDMA_BOND_BALANCE
-RDMA_TRAFFIC_CLASS
 RTX_EXPERT_LAYERS
 RTX_GPUS
 SPARK_COUNT
@@ -638,7 +630,7 @@ attention_plan_rows="$(get ATTENTION_PLAN_ROWS auto)"
 if [[ $attention_plan_rows != auto && ! $attention_plan_rows =~ ^[1-9][0-9]*$ ]]; then
   release_die "ATTENTION_PLAN_ROWS must be auto or a positive integer"
 fi
-shared_env_args=(-e "CUTEAFD_RDMA_TRAFFIC_CLASS=$rdma_traffic_class" -e "HF_HOME=$namespace_hf_home" -e "CUTEAFD_SPARK_INTAKE=$intake"
+shared_env_args=(-e "HF_HOME=$namespace_hf_home" -e "CUTEAFD_SPARK_INTAKE=$intake"
   -e "CUTEAFD_CONSOLE_TEXT=$([[ $console_text == on ]] && echo true || echo false)"
   -e "CUTEAFD_ATTENTION_PLACEMENT=$attention_placement" -e "CUTEAFD_FP8_EXPERT_PREFILL=$fp8_prefill"
   -e "CUTEAFD_SPARK_ADMISSION_TIMEOUT_SECONDS=${CUTEAFD_RELEASE_READY_TIMEOUT_SECONDS:-900}")
@@ -648,7 +640,7 @@ fi
 if [[ -n "${CUTEAFD_PUSH_SOCKET:-}" ]]; then
   shared_env_args+=(-e "CUTEAFD_PUSH_SOCKET=$CUTEAFD_PUSH_SOCKET")
 fi
-shared_worker_env_args=(-e "CUTEAFD_RDMA_TRAFFIC_CLASS=$rdma_traffic_class" -e "HF_HOME=$namespace_hf_home" -e "CUTEAFD_FP8_EXPERT_PREFILL=$fp8_prefill" -e "CUTEAFD_THERMAL=$(get THERMAL on)")
+shared_worker_env_args=(-e "HF_HOME=$namespace_hf_home" -e "CUTEAFD_FP8_EXPERT_PREFILL=$fp8_prefill" -e "CUTEAFD_THERMAL=$(get THERMAL on)")
 if [[ -n "${CUTEAFD_PUSH_SOCKET:-}" ]]; then
   shared_worker_env_args+=(-e "CUTEAFD_PUSH_SOCKET=$CUTEAFD_PUSH_SOCKET")
 fi

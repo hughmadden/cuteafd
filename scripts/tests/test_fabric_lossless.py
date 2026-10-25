@@ -8,34 +8,25 @@ import pytest
 ROOT = Path(__file__).resolve().parents[2]
 
 
-def test_native_traffic_class_parser_and_roce_sl(tmp_path):
+def test_native_marks_every_rc_qp_dscp26_priority3(tmp_path):
     compiler = shutil.which('g++')
     if compiler is None:
         pytest.skip('C++ compiler unavailable')
     source = tmp_path / 'traffic.cc'
     source.write_text(r'''
 #include "rdma_traffic_class.h"
-#include <cassert>
-int main() {
-  uint8_t tc = 99;
-  assert(cuteafd::rdma_traffic_class(nullptr, &tc) && tc == 0);
-  assert(cuteafd::rdma_traffic_class("", &tc) && tc == 0);
-  assert(cuteafd::rdma_traffic_class("104", &tc) && tc == 104);
-  assert((tc >> 2) == 26 && (tc >> 5) == 3);
-  assert(cuteafd::rdma_traffic_class("255", &tc) && tc == 255);
-  for (const char* bad : {"-1", "+1", "256", "26x", " 104", "999999999999999"})
-    assert(!cuteafd::rdma_traffic_class(bad, &tc));
-}
-'''.replace('#include <cassert>', '#include <cassert>\n#include <initializer_list>'))
-    executable = tmp_path / 'traffic'
-    subprocess.run([compiler, '-std=c++17', '-I', str(ROOT / 'native/shared/src'),
-                    str(source), '-o', str(executable)], check=True, capture_output=True)
-    subprocess.run([str(executable)], check=True, capture_output=True)
+static_assert(cuteafd::kRdmaTrafficClass == 104, "DSCP 26, Not-ECT");
+static_assert((cuteafd::kRdmaTrafficClass >> 2) == 26 && (cuteafd::kRdmaTrafficClass >> 5) == 3, "SL 3");
+int main() {}
+''')
+    subprocess.run([compiler, '-std=c++17', '-I', str(ROOT / 'native/shared/src'), str(source),
+                    '-o', str(tmp_path / 'traffic')], check=True, capture_output=True)
     native = (ROOT / 'native/shared/src/cuteafd_native.cc').read_text()
-    assert 'std::getenv("CUTEAFD_RDMA_TRAFFIC_CLASS")' in native
-    assert '&attr.ah_attr.grh.traffic_class' in native
-    assert 'attr.ah_attr.sl = attr.ah_attr.grh.traffic_class >> 5;' in native
-
+    assert 'getenv("CUTEAFD_RDMA_TRAFFIC_CLASS")' not in native
+    assert 'attr.ah_attr.grh.traffic_class = cuteafd::kRdmaTrafficClass;' in native
+    assert 'attr.ah_attr.sl = cuteafd::kRdmaTrafficClass >> 5;' in native
+    launcher = (ROOT / 'scripts/launch/run-family.sh').read_text()
+    assert 'RDMA_TRAFFIC_CLASS' not in launcher
 
 def test_switch_files_keep_updated_baseline_and_separate_dscp_only():
     setup = (ROOT / 'scripts/fabric/mikrotik-crs8xx-roce-lossless.rsc').read_text()

@@ -229,9 +229,12 @@ ssh SWITCH_ADMIN@switch.200gb '/import file-name=mikrotik-crs8xx-roce-lossless.r
 ssh SWITCH_ADMIN@switch.200gb '/import file-name=mikrotik-crs8xx-roce-lossless.rsc verbose=yes'
 ```
 
-NIC prerequisite: reviewed `mlnx-tools` (`mlnx_qos`), `iproute2` (`dcb`), Python3
-and ethtool on every host. **Raptor currently lacks mlnx_qos**; TJ installs it
-separately. Run outside containers. On raptor use `--role coordinator`; on each
+NIC prerequisites: `mlnx_qos`, `iproute2` (`dcb`), Python3 and ethtool. `apply`
+installs `mlnx_qos` when missing; `fabric-lossless tools` does only that step. It
+verifies NVIDIA's DOCA signing key (fingerprint `70454E6B…41B9CC50`), adds the
+pinned DOCA 3.5.0 apt repo for this distro/arch, and pins it so only
+`mlnx-tools` installs from it (DOCA's rdma-core never replaces the distro's).
+Sparks already ship `nvidia-mlnx-tools`, so it is a no-op there. Run outside containers. On raptor use `--role coordinator`; on each
 of ostrich/dodo/emu/kiwi/rhea/moa use `--role spark`. Stage both host files in the
 same directory on each Spark before invoking tune.sh:
 
@@ -266,12 +269,11 @@ shared-memory expansion. Verify headroom/pause counts before loading models.
 These are runtime settings, not a new boot service; rollback/reapply after NIC
 reset rather than silently overwriting the saved original state.
 
-Engine startup key: `./run.sh --wip SLOT --set RDMA_TRAFFIC_CLASS=104`. It forwards
-one byte as `CUTEAFD_RDMA_TRAFFIC_CLASS` to coordinator **and** Spark containers.
-Default0 preserves current behavior. Direct launches must set the same environment
-on every process. Startup fabric/transfer logs show `rdma_tc=104 dscp=26`; native
-RTR installs that GRH byte and SL3 (the byte's class selector), so priority3 PFC
-also stops transmit QPs. Restart all QPs after changing the key.
+The engine always marks its RoCE QPs DSCP 26 (GRH traffic class 104) with SL 3,
+the byte's class selector, so priority-3 PFC also stops transmit QPs; startup
+fabric logs show `rdma_tc=104 dscp=26`. There is no launch key: an untuned fabric
+ignores the mark (switch trust `ignore`, NIC trust `pcp` on an untagged link),
+so the same run commands work whether or not the fabric is tuned.
 
 Do **not** set a global sysfs default: `/sys/class/infiniband/DEV/tc/1/traffic_class`
 is absent on raptor's mlx5_0 and every actual ostrich RDMA device (`rocep1s0f0`,
@@ -301,7 +303,6 @@ agent-sudo --agent-context "Restore captured RoCE NIC policy" scripts/host/tune.
 for host in ostrich dodo emu kiwi rhea moa; do
   ssh -t "$host" 'agent-sudo --agent-context "Restore captured RoCE NIC policy" /home/tj/.cache/cuteafd/fabric-lossless/tune.sh fabric-lossless rollback --role spark'
 done
-# Remove RDMA_TRAFFIC_CLASS=104 from launch config (or explicitly set it to 0).
 ```
 
 NIC rollback deletes a backup only after all its restore commands succeed; retain
