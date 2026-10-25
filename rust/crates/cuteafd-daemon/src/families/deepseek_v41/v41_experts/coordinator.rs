@@ -472,6 +472,19 @@ impl<'w> NativePendingFfn<'w, '_> {
         let rows = self.rows;
         let slot = self.ticket.slot();
         let exchange = self.link.exchange()?;
+        // A host-ordered pass (1 RTX) collects as before the exchange: the
+        // host waits for the reply here, where everything this layer can
+        // issue (router, staging, shared FFN, L2 prefetch) is already queued,
+        // and only then queues the landing and reduce, so no stream sits
+        // blocked on a device wait through the round trip. A device-ordered
+        // pass queues them at once (the device waits).
+        let host_ordered = !crate::shared::memory::chain::deferred();
+        if host_ordered {
+            while !exchange.landed(&self.ticket) {
+                crate::shared::spark_waves::healthy()?;
+                if cooperative { tokio::task::yield_now().await } else { std::hint::spin_loop() }
+            }
+        }
         // SAFETY: the reduce stream joins the chain (the shared contribution's
         // producers), then waits on the device for this wave's planes; the
         // intake planes, shared values and output stay live until the stream
@@ -487,6 +500,14 @@ impl<'w> NativePendingFfn<'w, '_> {
         } else {
             // SAFETY: the same stream owns the reduction and its inputs.
             unsafe { crate::shared::memory::chain::finish(self.library, self.stream.raw)? };
+        }
+        if host_ordered && crate::shared::memory::chain::active() {
+            // The layer's one host wait for its streams: the reduce joined the
+            // chain head (attention, router, shared FFN), so its completion is
+            // what the next layer's rebinds check (`require_complete`).
+            if cooperative { self.stream.wait().await?; }
+            // SAFETY: this owner's live stream.
+            else { unsafe { self.library.cuda_stream_synchronize(self.stream.raw)? }; }
         }
         tracing::debug!(target: "cuteafd::timing", layer = self.layer, rows,
             collect_us = timing.elapsed().as_micros() as u64, "target collection");

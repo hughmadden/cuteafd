@@ -759,6 +759,14 @@ impl<'a> Waves<'a> {
         Ok(())
     }
 
+    /// Whether `ticket`'s wave has landed (or the wire failed, which releases
+    /// every wave): a host check, for host-ordered owners that hold a wave's
+    /// [`Self::land`] until it completes so no stream sits blocked on a device
+    /// wait through the round trip.
+    pub(crate) fn landed(&self, ticket: &WaveTicket) -> bool {
+        reached(self.words.load(Counter::Landed), ticket.sequence)
+    }
+
     /// Plane pointers of return slot `slot` (rank order), for the reduce.
     pub(crate) fn planes(&self, slot: usize) -> [*const u16; MAX_INTAKE_RANKS] {
         let mut pointers = [std::ptr::null::<u16>(); MAX_INTAKE_RANKS];

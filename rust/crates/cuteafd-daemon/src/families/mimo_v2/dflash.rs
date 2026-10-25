@@ -90,6 +90,9 @@ struct Workspace<'a> {
     logits: Dev<'a>,
     unary: Dev<'a>,
     candidates: Dev<'a>,
+    /// Pinned landing of `unary` then `candidates`: both download behind the
+    /// round's one host wait.
+    landing: crate::shared::memory::HostAllocation<'a>,
     positions: Dev<'a>,
     tables: Dev<'a>,
     /// Token ids of the block rows (anchors; the mask rows' sentinel).
@@ -648,6 +651,7 @@ impl<'a> MimoDrafter<'a> {
             logits: alloc(rows * c.vocab * 4)?,
             unary: alloc(drafted * 16 * 4)?,
             candidates: alloc(drafted * 16 * 4)?,
+            landing: crate::shared::memory::HostAllocation::new(self.library, 2 * drafted * 16 * 4)?,
             positions: alloc(rows * 8)?,
             tables: alloc(3 * sequences * 4)?,
             ids: alloc(rows * 4)?,
@@ -773,16 +777,26 @@ impl<'a> MimoDrafter<'a> {
             l.glm_dflash_topk(w.logits.buffer.ptr, w.unary.buffer.ptr, w.candidates.buffer.ptr,
                 w.topk_workspace.buffer.ptr, s_count, block, c.drafts(), c.vocab, s)?;
             self.timing.end(head_span, s)?;
+        }
+        let drafted = s_count * c.drafts();
+        let landing = |offset: usize| cuteafd_ffi::CuteafdHostBuffer {
+            // SAFETY: both halves stay inside the 2 x drafted x 64-byte landing.
+            ptr: unsafe { w.landing.buffer.ptr.cast::<u8>().add(offset) }.cast(), bytes: drafted * 64, ..w.landing.buffer };
+        // The round's results download on its stream, then one host wait
+        // covers the round and both copies (no second, synchronous drain).
+        // SAFETY: the device buffers hold `drafted` 64-byte rows; the landing
+        // is pinned, owned by the workspace, and read only after the wait.
+        unsafe {
+            l.copy_d2h_host_buffer_async(landing(0), CuteafdDeviceBuffer { bytes: drafted * 64, ..w.unary.buffer },
+                drafted * 64, s)?;
+            l.copy_d2h_host_buffer_async(landing(drafted * 64),
+                CuteafdDeviceBuffer { bytes: drafted * 64, ..w.candidates.buffer }, drafted * 64, s)?;
             self.round.borrow_mut().wait(s)?;
         }
         self.timing.publish_completed()?;
         self.timing.dump_head_input(w.n.buffer, rows, h)?;
         let confidence_span = self.timing.host_span();
-        let drafted = s_count * c.drafts();
-        let mut unary = vec![0u8; drafted * 64];
-        let mut candidates = vec![0u8; drafted * 64];
-        l.copy_d2h(&mut unary, CuteafdDeviceBuffer { bytes: drafted * 64, ..w.unary.buffer })?;
-        l.copy_d2h(&mut candidates, CuteafdDeviceBuffer { bytes: drafted * 64, ..w.candidates.buffer })?;
+        let (unary, candidates) = w.landing.bytes()[..2 * drafted * 64].split_at(drafted * 64);
         let word = |b: &[u8], i: usize| u32::from_le_bytes(b[i * 4..i * 4 + 4].try_into().unwrap());
         let drafts = (0..s_count).map(|i| {
             let rows = (0..c.drafts()).map(|j| i * c.drafts() + j);

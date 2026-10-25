@@ -486,6 +486,15 @@ fn gpu_exchange_queues_a_step_ahead_and_lands_byte_exact() -> Result<()> {
                 outputs[layer].buffer.ptr.cast(), rows as u32, stream.raw())?; }
             exchange.consumed(slot, stream.raw())?;
         }
+        // The stream goes idle by itself after the last wave (no host sync):
+        // no memop wait outlives its wave, so an idle server leaves no GPU
+        // work queued.
+        let idle = Instant::now();
+        // SAFETY: the stream is live until `finish`; the query only reads its state.
+        while !unsafe { library.cuda_stream_query(stream.raw())? } {
+            ensure!(idle.elapsed() < Duration::from_secs(5), "stream still busy 5 s after the last wave");
+            std::thread::yield_now();
+        }
         stream.finish()?;
         healthy()?;
         let all = &expected;

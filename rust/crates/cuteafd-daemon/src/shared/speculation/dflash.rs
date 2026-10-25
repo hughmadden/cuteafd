@@ -604,6 +604,9 @@ struct Workspace<'a> {
     ids: Dev<'a>,
     tokens: Dev<'a>,
     features: Dev<'a>,
+    /// Pinned landing of `tokens` then `features`: both download behind the
+    /// round's one host wait.
+    landing: crate::shared::memory::HostAllocation<'a>,
     positions: Dev<'a>,
     topk_workspace: Dev<'a>,
     head: VocabularyHead<'a>,
@@ -667,6 +670,8 @@ impl<'a> Workspace<'a> {
             unary: owners.take("unary")?, candidates: owners.take("candidates")?,
             projected: owners.take("projected")?, anchors: owners.take("anchors")?,
             ids: owners.take("ids")?, tokens: owners.take("tokens")?, features: owners.take("features")?,
+            // Pinned host memory (drafted x 20 bytes), outside the device admission.
+            landing: crate::shared::memory::HostAllocation::new(library, sequences * cfg.drafts() * 20)?,
             positions: owners.take("positions")?, topk_workspace: owners.take("topk_workspace")?,
             attention: AttentionWorkspace::Mla(MlaWorkspace {
                 query: owners.take("query")?, q_residual: owners.take("q_residual")?,
@@ -846,6 +851,8 @@ pub(crate) struct DflashDrafter<'a> {
     timing: crate::shared::draft::timing::DraftTiming<'a>,
     pub cfg: DflashConfig,
     stream: *mut c_void,
+    /// The draft round's host wait (`--host-wait`).
+    round: std::cell::RefCell<crate::shared::memory::BlockingWait<'a>>,
     /// Ring slots (sequences with a drafter context).
     pub slots: usize,
     max_sequences: usize,
@@ -1172,6 +1179,7 @@ impl<'a> DflashDrafter<'a> {
             confidence_scales: scales,
             fp8_workspace,
             timing: crate::shared::draft::timing::DraftTiming::from_env(library, "glm-dflash")?,
+            round: std::cell::RefCell::new(crate::shared::memory::BlockingWait::new(library)),
             head_mode: Cell::new(DraftHead::Exact),
             fp8_rows: Cell::new(fp8_rows),
             fp8_admitted: fp8_rows,
@@ -1275,6 +1283,7 @@ impl<'a> DflashDrafter<'a> {
             head_mode: Cell::new(DraftHead::Exact), fp8_rows: Cell::new(fp8_rows), fp8_admitted: fp8_rows,
             confidence_directory: snapshot.into(), confidence_scales: scales,
             timing: crate::shared::draft::timing::DraftTiming::from_env(library, "mla-dflash")?, cfg,
+            round: std::cell::RefCell::new(crate::shared::memory::BlockingWait::new(library)),
         };
         owners.finish()?;
         Ok(result)
@@ -1894,6 +1903,7 @@ impl<'a> DflashDrafter<'a> {
             ids: alloc(rows * 4)?,
             tokens: alloc(drafted * 4)?,
             features: alloc(drafted * 16)?,
+            landing: crate::shared::memory::HostAllocation::new(self.library, drafted * 20)?,
             positions: alloc(rows * 8)?,
             topk_workspace: alloc(self.library.glm_dflash_topk_workspace(drafted)?)?,
             // SAFETY: the workspace buffer lives in the same struct and drops after the head.
@@ -2135,7 +2145,18 @@ impl<'a> DflashDrafter<'a> {
                 w.candidates.buffer.ptr, w.unary.buffer.ptr, w.anchors.buffer.ptr, w.tokens.buffer.ptr,
                 w.features.buffer.ptr, s_count, block, c.drafts(), c.rank, s)?;
             self.timing.end(select_span, s)?;
-            l.cuda_stream_synchronize(s)?;
+            let drafted = s_count * c.drafts();
+            // The round's results download on its stream; one host wait then
+            // covers the round and both copies (no second, synchronous drain).
+            // SAFETY: the device buffers hold `drafted` rows; the landing is
+            // pinned, owned by the workspace and read only after the wait.
+            let landing = |offset: usize, bytes: usize| cuteafd_ffi::CuteafdHostBuffer {
+                ptr: w.landing.buffer.ptr.cast::<u8>().add(offset).cast(), bytes, ..w.landing.buffer };
+            l.copy_d2h_host_buffer_async(landing(0, drafted * 4),
+                CuteafdDeviceBuffer { bytes: drafted * 4, ..w.tokens.buffer }, drafted * 4, s)?;
+            l.copy_d2h_host_buffer_async(landing(drafted * 4, drafted * 16),
+                CuteafdDeviceBuffer { bytes: drafted * 16, ..w.features.buffer }, drafted * 16, s)?;
+            self.round.borrow_mut().wait(s)?;
         }
         if let Some(mut lease) = mla_lease.take() {
             let mut state = lease.context.state.borrow_mut();
@@ -2147,10 +2168,7 @@ impl<'a> DflashDrafter<'a> {
         self.timing.publish_completed()?;
         self.timing.dump_head_input(w.n.buffer, rows, h)?;
         let drafted = s_count * c.drafts();
-        let mut tokens = vec![0u8; drafted * 4];
-        let mut features = vec![0u8; drafted * 16];
-        l.copy_d2h(&mut tokens, CuteafdDeviceBuffer { bytes: drafted * 4, ..w.tokens.buffer })?;
-        l.copy_d2h(&mut features, CuteafdDeviceBuffer { bytes: drafted * 16, ..w.features.buffer })?;
+        let (tokens, features) = w.landing.bytes()[..drafted * 20].split_at(drafted * 4);
         let word = |b: &[u8], i: usize| u32::from_le_bytes(b[i * 4..i * 4 + 4].try_into().unwrap());
         Ok((0..s_count).map(|i| Draft {
             tokens: (0..c.drafts()).map(|j| word(&tokens, i * c.drafts() + j)).collect(),
