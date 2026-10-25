@@ -206,8 +206,15 @@ def test_build_wheelhouse_gate(tmp_path: Path, state: str) -> None:
     if state == "complete":
         lock, house_full = make_lock(tmp_path, {"alpha": b"a"})
         env["CUTEAFD_RELEASE_WHEELHOUSE"] = str(house_full)
-    script = (f"set -euo pipefail\nsource scripts/lib/release-common.sh\nrepo_root={REPO}\n" + region()
-              + f"\nrelease_python_lock={lock}\nrelease_verify_wheelhouse\necho PASSED\n")
+    root = REPO
+    if state == "complete":  # a checkout whose docker/release-python-lock.json is the synthetic lock
+        root = tmp_path / "root"
+        (root / "docker").mkdir(parents=True)
+        (root / "scripts" / "build").mkdir(parents=True)
+        (root / "docker" / "release-python-lock.json").write_bytes(lock.read_bytes())
+        (root / "scripts" / "build" / "release-python-lock.py").write_bytes(TOOL.read_bytes())
+    script = (f"set -euo pipefail\nsource scripts/lib/release-common.sh\nrepo_root={root}\n" + region()
+              + "\nrelease_verify_wheelhouse\necho PASSED\n")
     result = subprocess.run(["bash", "-c", script], cwd=REPO, env=env, capture_output=True, text=True, timeout=60)
     if state == "complete":
         assert result.returncode == 0 and "PASSED" in result.stdout, result.stderr
