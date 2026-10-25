@@ -295,8 +295,9 @@ def route_block(geometry: str, capacity: int, role: str) -> int:
     m81..256 stays fastest at 8). At m4096, 64-row blocks skip their empty M16
     fragments (b12x 4d7cb455), so they beat 32 from about 2048 rows up. The coordinator's whole-intermediate rtx-tp1 package
     gains the same way (RTX PRO 6000, width 3072: m4096 74 -> 35 ms, m1024 23 -> 16 ms).
-    Kimi K3 coordinator prefill (H3584, 896 experts, top-16) widens m1024 from
-    8-row blocks to 64-row blocks with token-major rotation (RTX PRO 6000, K2/K3:
+    Kimi K3 coordinator prefill (H3584, 896 experts, top-16) widens
+    m1024/m2048/m2752 from 8-row blocks to 64-row blocks with token-major rotation
+    (RTX PRO 6000, K2/K3:
     rtx-tp2 w1536 m1024 9134.7 -> 5150.3 us, rtx-tp1 w3072 m1024 18805.4 ->
     10596.1 us; m4096 takes its _WS_S14 cell); Spark keeps 8 rows for cooperative
     capacities.
@@ -310,7 +311,7 @@ def route_block(geometry: str, capacity: int, role: str) -> int:
     if geometry in ('glm', 'glmf'):
         return glm_route_block(capacity)
     if geometry == 'kimik3':
-        return 64 if role == 'coordinator' and capacity == 1024 else 8
+        return 64 if role == 'coordinator' and capacity in (1024, 2048, 2752) else 8
     if geometry != 'dsv4p' or capacity <= 256:
         return 8
     if role == 'coordinator':
@@ -351,7 +352,7 @@ def token_major_rotation(geometry: str, capacity: int, role: str) -> bool:
         # GLM top-8 (rtx-tp1): m1024 3910 -> 3830 us, m4096 11790 -> 11470 us.
         return capacity > 256
     if geometry == 'kimik3':
-        return role == 'coordinator' and capacity == 1024
+        return role == 'coordinator' and capacity in (1024, 2048, 2752)
     if role == 'coordinator' and geometry == 'dsv4p':
         # V4 Pro coordinator (RTX PRO 6000, K2/K3, m1024): 64-row blocks with
         # token-major rotation improve rtx-tp2 w1536 4875.9 -> 4169.3 us (1.169x,
@@ -422,31 +423,26 @@ COORDINATOR_WS_CELLS: dict[tuple[str, int, int], dict] = {
     ('qwen4', 256, 1024): _WS_S14,
     ('qwen4', 640, 2752): _WS_S14,
     ('qwen4', 640, 2048): _WS_S14,
-    ('qwen4', 384, 2752): _WS_S14,
-    ('qwen4', 384, 2048): _WS_S14,
-    ('qwen4', 256, 2752): _WS_S14,
-    ('qwen4', 256, 2048): _WS_S14,
+    # TP2 rank0: N192 wins both exact prefill units on random and recorded routes.
+    ('qwen4', 384, 2752): dict(route_block=64, dynamic=True, tile=(64, 192, 64, 256)),
+    ('qwen4', 384, 2048): dict(route_block=64, dynamic=True, tile=(64, 192, 64, 256)),
+    ('qwen4', 256, 2752): dict(route_block=64, dynamic=True, tile=(64, 256, 64, 256)),
+    ('qwen4', 256, 2048): dict(route_block=64, dynamic=True, tile=(64, 256, 64, 256)),
     ('qwen4', 640, 4096): _WS_S14,
     ('qwen4', 384, 4096): _WS_S14,
     ('qwen4', 256, 4096): _WS_S14,
     # V4.1 EXL3 wins from m1024 up; m256 stays cooperative (0.77-0.84x).
     ('v41', 2304, 1024): _WS_S14,
     ('v41', 1152, 1024): _WS_S14,
-    ('v41', 2304, 2752): _WS_S14,
-    ('v41', 2304, 2048): _WS_S14,
-    ('v41', 1152, 2752): _WS_S14,
-    ('v41', 1152, 2048): _WS_S14,
+    ('v41', 2304, 2752): dict(route_block=64, dynamic=True, tile=(64, 256, 64, 256)),
+    ('v41', 2304, 2048): dict(route_block=64, dynamic=True, tile=(64, 256, 64, 256)),
+    ('v41', 1152, 2752): dict(route_block=64, dynamic=True, tile=(64, 192, 64, 256)),
+    ('v41', 1152, 2048): dict(route_block=64, dynamic=True, tile=(64, 192, 64, 256)),
     ('v41', 2304, 4096): _WS_S14,
     ('v41', 1152, 4096): _WS_S14,
-    # Kimi K3 (H3584/E896/top16 K2/K3): m256 stays cooperative 8-row; m1024
-    # takes cooperative 64-row token-major rotation (5150.3 us on rtx-tp2 w1536
-    # and 10596.1 us on rtx-tp1 w3072 vs _WS_S14 6419.0 / 13262.4 us); m4096
-    # keeps _WS_S14. m2048/m2752 (prefill waves, #762) are placeholders that
-    # follow m4096's arm until a screen measures them.
-    ('kimik3', 3072, 2048): _WS_S14,
-    ('kimik3', 1536, 2048): _WS_S14,
-    ('kimik3', 3072, 2752): _WS_S14,
-    ('kimik3', 1536, 2752): _WS_S14,
+    # Kimi K3 m1024/m2048/m2752 take cooperative 64-row token-major rotation;
+    # m2048/m2752 beat N128 dynamic by 1.23-1.30x, exhaustively exact (#762).
+    # m4096 keeps its separately qualified N128 dynamic arm.
     ('kimik3', 3072, 4096): _WS_S14,
     ('kimik3', 1536, 4096): _WS_S14,
 }
@@ -786,6 +782,8 @@ def wire_input(geometry: str, role: str, width: int, capacity: int, *,
     if role == 'coordinator':
         cell = coordinator_ws_cell(geometry, role, width, capacity)
         return bool(cell and cell.get('wire'))
+    if role == 'spark' and width in (384, 640) and capacity in (2048, 2752):
+        return False
     return geometry == 'glm' and warp_specialized(geometry, role, width, capacity)
 
 
@@ -822,6 +820,10 @@ def ws_dynamic_tiles(geometry: str, role: str, width: int, capacity: int, *,
     if role == 'coordinator':
         cell = coordinator_ws_cell(geometry, role, width, capacity)
         return bool(cell and cell.get('dynamic'))
+    if (role == 'spark' and capacity in (2048, 2752)
+            and ((geometry == 'glm' and width in (384, 640))
+                 or (geometry == 'glmf' and width in (256, 384, 512, 640, 768, 1024)))):
+        return True
     return wire_input(geometry, role, width, capacity)
 
 
@@ -840,6 +842,16 @@ def ws_tile(geometry: str, role: str, width: int, capacity: int, *,
     if role == 'coordinator':
         cell = coordinator_ws_cell(geometry, role, width, capacity)
         return cell.get('tile') if cell else None
+    if ((geometry, role, width) == ('glmf', 'spark', 384)
+            and capacity in (2048, 2752)):
+        return TILE_384
+    if ((geometry, role, width) == ('glmf', 'spark', 640)
+            and capacity in (2048, 2752)):
+        return TILE_RTX_MIXED
+    # GB10 w640: FC2 N256 wins 2.2-5.0% at m1024..m4096; FC1 stays N128.
+    if ((geometry, role, width) == ('glm', 'spark', 640)
+            and capacity in (1024, 2048, 2752, 4096)):
+        return TILE_RTX_MIXED
     if (geometry != 'glm' or not warp_specialized(geometry, role, width, capacity)
             or width % 256 != 128 or width % 192):
         return None
