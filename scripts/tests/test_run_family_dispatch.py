@@ -3848,3 +3848,4 @@ def test_dense_qwen_forwards_speculation_trace(tmp_path: Path) -> None:
     launch = next(line for line in result.stderr.splitlines() if "serve-qwen35 --snapshot" in line)
     assert f"CUTEAFD_SPECULATION_TRACE={trace}" in launch
     assert f"{trace.parent}:{trace.parent}" in launch
+

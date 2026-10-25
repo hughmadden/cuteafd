@@ -63,7 +63,8 @@ is claimed for this host-tuning change.
   No generic PFC/DCB/ECN recommendation; coordinate with the fabric owner.
 - `nvidia-smi -q -d PERFORMANCE`: GPU clocks-event reasons, read-only.
   GPU power is gpu-powerd's job on our cluster. Never change GPU limits or
-  clocks, switch settings, NIC firmware, DCB, ECN or PFC with this script.
+  clocks or NIC firmware with this script. Ordinary report/apply never changes
+  the fabric; only the explicit operator mode below prepares PFC policy.
 
 ## GB10 core placement
 
@@ -181,3 +182,130 @@ not a watchdog. No service or host setting is installed by `persist`.
 Tests use `TUNE_SYSFS_ROOT=PATH`: sysfs files live under PATH, proc files
 under PATH/proc, and external hardware probes are suppressed. Do not set
 this fixture override for real host tuning.
+
+## MikroTik CRS8xx lossless RoCE
+
+**Prepared, not applied. Do not merge until TJ applies and measures.** Stop all
+serving before changing the fabric. The baseline is TJ's 2026-10-25 post-06:54Z
+configuration: all eight queues have `ecn=no wred=no`. Never turn either on.
+The rollback was generated from a fresh read-only verbose QoS export, not
+inferred defaults. It restores every exported field and removes only our named
+profiles/maps. Do not import over unrelated subsequent QoS changes.
+
+[RouterOS QoS / CRS8xx RoCE guidance](https://manual.mikrotik.com/docs/bridging-and-switching/quality-of-service/):
+DSCP 26 -> TC3 / PFC3, DSCP 48 CNP -> existing strict-priority TC6. Explicit
+DSCP-only maps (`automap=no`) avoid also promoting unrelated PCP-tagged traffic.
+The seven ports trust keep/keep (L3 precedence); unmatched traffic, including
+ordinary SparkNest/TCP, retains default lossy TC1. Classification is by marking,
+not application: TCP explicitly marked DSCP26 would also enter TC3. Leave its
+DSCP at the default. PFC is rx/tx on TC3 only. Queue3 egress rates match the
+observed wire speeds (required to interpret received pause time); check them
+again before import. RouterOS >=7.23 automatically sizes lossless/shared
+buffers; do not copy legacy `use-shared-buffers` settings into this export.
+
+This is **PFC-only**, not a DCQCN experiment. The manual's ECN example is for
+ECT-capable traffic; byte104 has ECN bits00 (Not-ECT). ECN/WRED stay off, including
+TC3. CNP classification does not turn on ECN or change NIC congestion controls.
+PFC prevents avoidable congestion loss only when every hop and endpoint agrees;
+it adds no sink capacity and can introduce head-of-line blocking or pause storms.
+No losslessness or speedup is claimed before counters and warmed runs prove it.
+
+Read-only LLDP/MAC mapping (2026-10-25): `dd-1-1=moa`, `dd-1-5=rhea`,
+`dd-2-1=raptor`, `dd-3-1=ostrich`, `dd-3-5=emu`, `dd-4-1=kiwi`,
+`dd-4-5=dodo` (all names start `qsfp56-`). Raptor is 400G; Sparks are 100G.
+Both active Spark NIC rails appear behind each host's one switch breakout.
+
+### Apply and check (TJ only)
+
+Use a write-capable switch login in place of `SWITCH_ADMIN`; `agent` is read-only.
+Upload both reviewed files first. RouterOS 7.24.5 supports import dry-run; inspect
+its output before the real import. These commands are instructions, not run by
+agents:
+
+```bash
+cd /home/tj/Developer/cute-worktrees/cuteafd-fabric-lossless
+scp scripts/fabric/mikrotik-crs8xx-roce-{lossless,rollback}.rsc SWITCH_ADMIN@switch.200gb:
+ssh SWITCH_ADMIN@switch.200gb '/import file-name=mikrotik-crs8xx-roce-lossless.rsc verbose=yes dry-run=yes'
+ssh SWITCH_ADMIN@switch.200gb '/import file-name=mikrotik-crs8xx-roce-lossless.rsc verbose=yes'
+```
+
+NIC prerequisites: `mlnx_qos`, `iproute2` (`dcb`), Python3 and ethtool. `apply`
+installs `mlnx_qos` when missing; `fabric-lossless tools` does only that step. It
+verifies NVIDIA's DOCA signing key (fingerprint `70454E6B…41B9CC50`), adds the
+pinned DOCA 3.5.0 apt repo for this distro/arch, and pins it so only
+`mlnx-tools` installs from it (DOCA's rdma-core never replaces the distro's).
+Sparks already ship `nvidia-mlnx-tools`, so it is a no-op there. Run outside containers. On raptor use `--role coordinator`; on each
+of ostrich/dodo/emu/kiwi/rhea/moa use `--role spark`. Stage both host files in the
+same directory on each Spark before invoking tune.sh:
+
+```bash
+scripts/host/tune.sh fabric-lossless check --role coordinator
+scripts/host/tune.sh fabric-lossless apply --role coordinator --dry-run
+agent-sudo --agent-context "Apply reviewed lossless RoCE NIC policy" scripts/host/tune.sh fabric-lossless apply --role coordinator
+for host in ostrich dodo emu kiwi rhea moa; do
+  ssh "$host" 'mkdir -p /home/tj/.cache/cuteafd/fabric-lossless'
+  scp scripts/host/{tune.sh,fabric-lossless.py} "$host":/home/tj/.cache/cuteafd/fabric-lossless/
+  ssh "$host" '/home/tj/.cache/cuteafd/fabric-lossless/tune.sh fabric-lossless apply --role spark --dry-run'
+  ssh -t "$host" 'agent-sudo --agent-context "Apply reviewed lossless RoCE NIC policy" /home/tj/.cache/cuteafd/fabric-lossless/tune.sh fabric-lossless apply --role spark'
+  ssh "$host" '/home/tj/.cache/cuteafd/fabric-lossless/tune.sh fabric-lossless check --role spark'
+done
+scripts/host/tune.sh fabric-lossless check --role coordinator
+```
+
+Mode preflights all active Ethernet RDMA ports with 10.55.0.x/10.55.1.x GIDs/netdev
+addresses. It requires OS-controlled DCBX, no pre-existing PFC, and independent
+TC3/TC6. It snapshots trust, PFC, DSCP APP mappings, buffer sizes/mapping and global
+pause to `/var/lib/cuteafd/fabric-lossless/NETDEV.json` **before** the first write.
+Existing backups refuse another apply. No sudo or implicit DCBX changes inside
+scripts. `check` and `--dry-run` never write. A partial failure stops visibly;
+roll back from the retained backups before trying again.
+
+NIC changes: global pause off (observed on raptor and ostrich), DSCP trust,
+DSCP26 -> priority3, DSCP48 -> priority6, all other DSCPs -> priority0; PFC only
+priority3. Existing receive headroom is split equally into lossy buffer0 and
+lossless buffer1, with priority3 alone in buffer1. The mlx5 driver computes
+speed/MTU/cable XOFF and rejects insufficient headroom; no guessed thresholds or
+shared-memory expansion. Verify headroom/pause counts before loading models.
+These are runtime settings, not a new boot service; rollback/reapply after NIC
+reset rather than silently overwriting the saved original state.
+
+The engine always marks its RoCE QPs DSCP 26 (GRH traffic class 104) with SL 3,
+the byte's class selector, so priority-3 PFC also stops transmit QPs; startup
+fabric logs show `rdma_tc=104 dscp=26`. There is no launch key: an untuned fabric
+ignores the mark (switch trust `ignore`, NIC trust `pcp` on an untagged link),
+so the same run commands work whether or not the fabric is tuned.
+
+Do **not** set a global sysfs default: `/sys/class/infiniband/DEV/tc/1/traffic_class`
+is absent on raptor's mlx5_0 and every actual ostrich RDMA device (`rocep1s0f0`,
+`roceP2p1s0f0`, etc.), not merely empty. This is a vendor-driver facility, not
+portable RDMA-CM behavior. Our QPs use ibv_modify_qp directly, not RDMA-CM;
+upstream mlx5's `mlx5_set_path` copies GRH `traffic_class` to DSCP and SL to
+`eth_prio`. Therefore a CM-only default cannot cover these QPs. A global vendor
+override would also mark unrelated RDMA users such as SparkNest, violating isolation.
+
+For each bounded benchmark window, save raw counters without resetting them:
+`bash scripts/fabric/snapshot.sh > BEFORE.txt` and again to `AFTER.txt`. The script
+uses the read-only switch login, captures per-queue drops and Ethernet pause
+counters, plus per-host RDMA retransmit/OOS/sequence and NIC priority statistics.
+Snapshots are sequential, not simultaneous; keep the fabric otherwise idle and
+interpret deltas, not lifetime counts. Missing/permission-denied counters invalidate
+that metric; they are not zero. The PR body holds the post-application matrix and
+stop bars from [#733](https://github.com/tpurtell/cuteafd/pull/733).
+
+### Roll back (TJ only)
+
+Stop serving. Import the reviewed switch rollback, then restore each host's
+captured NIC state. It deliberately leaves every switch queue's ECN/WRED off.
+
+```bash
+ssh SWITCH_ADMIN@switch.200gb '/import file-name=mikrotik-crs8xx-roce-rollback.rsc verbose=yes'
+agent-sudo --agent-context "Restore captured RoCE NIC policy" scripts/host/tune.sh fabric-lossless rollback --role coordinator
+for host in ostrich dodo emu kiwi rhea moa; do
+  ssh -t "$host" 'agent-sudo --agent-context "Restore captured RoCE NIC policy" /home/tj/.cache/cuteafd/fabric-lossless/tune.sh fabric-lossless rollback --role spark'
+done
+```
+
+NIC rollback deletes a backup only after all its restore commands succeed; retain
+backup copies with the run receipt. It restores the *captured* global pause state
+(including today's on/on), not a guessed default. Check switch export and every
+host after rollback; do not resume serving on a partial restore.

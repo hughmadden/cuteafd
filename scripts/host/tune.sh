@@ -1,7 +1,12 @@
 #!/usr/bin/env bash
-# Host policy only: never alter NIC/fabric, GPU, or switch settings.
+# Host policy by default; fabric-lossless is a separate, explicit operator mode.
 set -euo pipefail
 shopt -s nullglob
+
+if [[ ${1:-} == fabric-lossless ]]; then
+    shift
+    exec python3 -I "$(dirname "${BASH_SOURCE[0]}")/fabric-lossless.py" "$@"
+fi
 
 COORDINATOR_IDLE_LATENCY_US=50
 SPARK_IDLE_LATENCY_US=200
@@ -23,6 +28,7 @@ ACTION_SET=0
 
 usage() {
     echo 'Usage: tune.sh [report|apply|persist] [--role coordinator|spark] [--dry-run]'
+    echo '       tune.sh fabric-lossless tools|apply|check|rollback --role coordinator|spark [--dry-run]'
     echo 'TUNE_SYSFS_ROOT substitutes /sys; fixtures put proc files under ROOT/proc.'
 }
 
