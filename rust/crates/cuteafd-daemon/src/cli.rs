@@ -456,6 +456,9 @@ pub(crate) struct PlanArgs {
     /// Plan GLM 5.3's DFlash2 drafter with native BF16 projections.
     #[arg(long)]
     pub(crate) glm5_draft_bf16: bool,
+    /// Plan MiniMax M3's DFlash2 drafter with its checkpoint BF16 GEMMs (serve-minimax --draft-fp8 false).
+    #[arg(long)]
+    pub(crate) minimax_draft_bf16: bool,
     /// MiMo native local expert package manifest.json for exact scratch.
     #[arg(long)]
     pub(crate) mimo_expert_manifest: Option<PathBuf>,

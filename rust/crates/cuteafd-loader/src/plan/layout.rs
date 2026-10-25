@@ -149,6 +149,11 @@ pub struct LayoutOptions {
     pub step5_kv: crate::families::qwen4::Qwen4KvCache,
     /// MiniMax M3 paged K/V storage (`--kv-cache`).
     pub minimax_kv: crate::families::qwen4::Qwen4KvCache,
+    /// MiniMax M3's DFlash2 drafter checkpoint (`--speculator dflash2`), on the shared drafter
+    /// with `draft_kv_cache` rings and `draft_context_slots`; absent plans the bundled DSpark or none.
+    pub minimax_drafter_snapshot: Option<std::path::PathBuf>,
+    /// Plan that drafter with its checkpoint BF16 GEMMs (serve-minimax --draft-fp8 false).
+    pub minimax_draft_bf16: bool,
     /// Selected Qwen projection/head residency, matching serve-qwen4.
     pub qwen_representation: crate::families::qwen4::resident::Qwen4Representation,
     /// Qwen immutable attention scratch override.
@@ -233,6 +238,8 @@ impl Default for LayoutOptions {
             qwen_kv: Default::default(),
             step5_kv: crate::families::qwen4::Qwen4KvCache::Fp8,
             minimax_kv: crate::families::qwen4::Qwen4KvCache::Fp8,
+            minimax_drafter_snapshot: None,
+            minimax_draft_bf16: false,
             qwen_representation: crate::families::qwen4::resident::Qwen4Representation {
                 fp8_projections: false, fp8_head: true },
             qwen_attention_plan_rows: None,

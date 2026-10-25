@@ -155,6 +155,40 @@ fn lanes_at(plan:&AttentionPlan,rows:usize,cuts:&[usize])->Vec<Lane> {
     }).collect()
 }
 
+/// The drafter an execution taps and drafts with: the bundled DSpark or a DFlash2 checkpoint
+/// on the shared drafter.
+pub(super) enum Drafter<'a> {
+    Dspark(super::dspark::Dspark<'a>),
+    Dflash(super::dflash::Dflash<'a>),
+}
+impl<'a> Drafter<'a> {
+    /// Sequences one draft step takes.
+    pub fn sequences(&self) -> usize {
+        match self { Self::Dspark(d) => d.layout.sequences, Self::Dflash(d) => d.sequences() }
+    }
+    /// Rows of the block one draft runs at its anchor's position and after (DSpark 7, DFlash2 8).
+    pub fn block(&self) -> usize {
+        match self { Self::Dspark(_) => 7, Self::Dflash(d) => d.block() }
+    }
+    /// Whether drafts carry a confidence head's per-token acceptance (DSpark).
+    pub fn confidence(&self) -> bool { matches!(self, Self::Dspark(_)) }
+    /// The context rows a single-request `rows`-row step from `start` leaves for ring `slot`.
+    pub fn prefill_rows(&self, start: usize, rows: usize, slot: usize) -> Vec<crate::shared::speculation::dflash::ContextRow> {
+        match self {
+            Self::Dspark(_) => (0..rows).map(|tap_row| crate::shared::speculation::dflash::ContextRow {
+                tap_row, slot, position: start + tap_row }).collect(),
+            Self::Dflash(d) => d.prefill_rows(start, rows, slot),
+        }
+    }
+    /// Taps the residual rows of one lane at `layer` (`rows`: the step's rows).
+    fn tap(&self, native: &Native<'a>, layer: usize, residual: CuteafdDeviceBuffer, lane: &Lane, rows: usize) -> Result<()> {
+        match self {
+            Self::Dspark(d) => d.tap(native, layer, residual, lane.first, lane.rows),
+            Self::Dflash(d) => d.tap(native, layer, residual, lane.first, lane.rows, rows),
+        }
+    }
+}
+
 pub(super) trait ExpertExecutor<'a> {
     /// Before a step's layers: `waves` routed layers on each of `lanes` lanes.
     fn begin(&mut self, _waves:usize, _lanes:usize, _kind:ExpertV2SourceKind) -> Result<()> { Ok(()) }
@@ -191,7 +225,7 @@ pub(super) struct Execution<'a> {
     table_stride:usize,
     poisoned:std::cell::Cell<bool>,
     diagnostics:std::cell::RefCell<Option<Diagnostics>>,
-    draft:Option<super::dspark::Dspark<'a>>,
+    draft:Option<Drafter<'a>>,
     graphs:std::cell::RefCell<StepGraphs<'a>>,
 }
 impl<'a> Execution<'a> {
@@ -242,15 +276,25 @@ impl<'a> Execution<'a> {
         layout:super::dspark::Layout)->Result<()> {
         // The released drafter attends its block noncausally from the anchor.
         ensure!(contract.sample_from_anchor && !contract.causal,MiniMaxError::Unsupported("draft mask or anchor mode"));
-        self.draft=Some(self.native.device().run(|| super::dspark::Dspark::load(&self.native,contract,layout))?);
+        self.draft=Some(Drafter::Dspark(self.native.device().run(|| super::dspark::Dspark::load(&self.native,contract,layout))?));
         Ok(())
     }
-    pub fn draft(&self)->Result<&super::dspark::Dspark<'a>> { self.draft.as_ref().context("MiniMax drafter not admitted") }
+    /// Loads a DFlash2 drafter (its checkpoint bytes `file`, the mask token's target embedding
+    /// `mask_row`) onto this execution's stream.
+    pub fn load_dflash(&mut self, contract:&super::dflash::Contract, file:Vec<u8>, mask_row:Vec<u8>)->Result<()> {
+        self.draft=Some(Drafter::Dflash(self.native.device().run(||
+            super::dflash::Dflash::load(self.native.library(),self.native.raw(),contract,file,mask_row))?));
+        Ok(())
+    }
+    pub fn draft(&self)->Result<&Drafter<'a>> { self.draft.as_ref().context("MiniMax drafter not admitted") }
     pub fn update_draft(&self,rows:&[crate::shared::speculation::dflash::ContextRow])->Result<()> {
         ensure!(!self.poisoned.get(),MiniMaxError::Invalid("previous native execution failure; restart required"));
         let result=self.native.device().run(|| {
             let mut guard=self.native.cancellation_guard("MiniMax draft update");
-            let result=self.draft()?.update(&self.native,&self.scratch,rows);
+            let result=match self.draft()? {
+                Drafter::Dspark(draft) => draft.update(&self.native,&self.scratch,rows),
+                Drafter::Dflash(draft) => draft.update(rows),
+            };
             let drained=self.native.drain();
             guard.complete=true;
             result.and(drained)
@@ -261,11 +305,15 @@ impl<'a> Execution<'a> {
     pub fn propose(&self,seqs:&[crate::shared::speculation::dflash::DraftSeq],embedding:&crate::shared::token_io::TokenEmbedding<'a>)
         ->Result<Vec<crate::shared::speculation::dflash::Draft>> {
         ensure!(!self.poisoned.get(),MiniMaxError::Invalid("previous native execution failure; restart required"));
-        ensure!(seqs.iter().all(|s|s.position.checked_add(7).is_some_and(|end|end<=self.context)),
+        let block=self.draft()?.block();
+        ensure!(seqs.iter().all(|s|s.position.checked_add(block).is_some_and(|end|end<=self.context)),
             MiniMaxError::Invalid("draft RoPE extent"));
         self.native.device().run(|| {
             let mut guard=self.native.cancellation_guard("MiniMax draft step");
-            let result=self.draft()?.propose(&self.native,&self.scratch,embedding,&self.head,&self.weights,seqs);
+            let result=match self.draft()? {
+                Drafter::Dspark(draft) => draft.propose(&self.native,&self.scratch,embedding,&self.head,&self.weights,seqs),
+                Drafter::Dflash(draft) => draft.propose(seqs,embedding,self.weights.get("language_model.lm_head.weight")?),
+            };
             if result.is_err() {
                 self.poisoned.set(true);
                 let drained=self.native.drain();
@@ -457,7 +505,7 @@ impl<'a> Execution<'a> {
                     if let Some(d)=&mut dump { d.tensor(&self.native,"ffn_norm","bf16",&[rows,6144],s.get("norm")?)?; }
                     ffn::dense(&self.native,&self.weights,s,layer,lane.rows,false)?;
                     self.residual(s,lane.rows)?;
-                    if let Some(draft)=&self.draft { draft.tap(&self.native,layer,s.get("residual")?,lane.first,lane.rows)?; }
+                    if let Some(draft)=&self.draft { draft.tap(&self.native,layer,s.get("residual")?,lane,rows)?; }
                 }
                 if let Some(mut d)=dump {
                     d.tensor(&self.native,"residual","f32",&[rows,6144],self.scratch.get("residual")?)?;
@@ -468,7 +516,7 @@ impl<'a> Execution<'a> {
             let mut dump=None;
             for (index,(lane,s)) in lanes.iter().zip(&views).enumerate() {
                 if let Some((previous,previous_dump))=&mut pending {
-                    self.routed_back(*previous,index,lane,s,experts)?;
+                    self.routed_back(*previous,index,lane,s,experts,rows)?;
                     if let Some(mut d)=previous_dump.take() {
                         d.tensor(&self.native,"residual","f32",&[rows,6144],s.get("residual")?)?;
                         diagnostics.as_mut().context("MiniMax diagnostic owner")?.finish(d)?;
@@ -542,11 +590,12 @@ impl<'a> Execution<'a> {
     }
     /// Its second half: the lane's routed experts plus the shared expert into
     /// the residual, and the drafter's tap.
-    fn routed_back(&self,layer:usize,index:usize,lane:&Lane,s:&Rows<'_>,experts:&mut dyn ExpertExecutor<'a>)->Result<()> {
+    fn routed_back(&self,layer:usize,index:usize,lane:&Lane,s:&Rows<'_>,experts:&mut dyn ExpertExecutor<'a>,
+        rows:usize)->Result<()> {
         experts.collect(layer,index,lane.rows,s.get("routed")?,&self.native)?;
         self.native.add_bf16(s.get("shared")?,s.get("routed")?,s.get("delta")?,lane.rows*6144)?;
         self.residual(s,lane.rows)?;
-        if let Some(draft)=&self.draft { draft.tap(&self.native,layer,s.get("residual")?,lane.first,lane.rows)?; }
+        if let Some(draft)=&self.draft { draft.tap(&self.native,layer,s.get("residual")?,lane,rows)?; }
         Ok(())
     }
     /// Every lane's second half of routed layer `layer`, then the end of its
@@ -554,7 +603,7 @@ impl<'a> Execution<'a> {
     #[allow(clippy::too_many_arguments)]
     fn finish_routed(&self,layer:usize,rows:usize,lanes:&[Lane],views:&[Rows<'_>],experts:&mut dyn ExpertExecutor<'a>,
         dump:Option<StepDump>,diagnostics:Option<&mut Diagnostics>)->Result<()> {
-        for (index,(lane,s)) in lanes.iter().zip(views).enumerate() { self.routed_back(layer,index,lane,s,experts)?; }
+        for (index,(lane,s)) in lanes.iter().zip(views).enumerate() { self.routed_back(layer,index,lane,s,experts,rows)?; }
         if let Some(mut d)=dump {
             d.tensor(&self.native,"residual","f32",&[rows,6144],self.scratch.get("residual")?)?;
             diagnostics.context("MiniMax diagnostic owner")?.finish(d)?;

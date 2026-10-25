@@ -3,6 +3,7 @@ mod admission;
 mod backend;
 mod cache;
 mod diagnostics;
+mod dflash;
 mod dspark;
 mod execution;
 mod ffn;

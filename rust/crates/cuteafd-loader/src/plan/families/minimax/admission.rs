@@ -425,10 +425,14 @@ pub struct Request {
     /// What a Spark-hosted vision tower holds on every rank beside the experts (0 when local).
     pub spark_vision_bytes: u64,
     pub headroom: u64,
-    /// The bundled drafter's bytes (0 without it).
+    /// The drafter's bytes (0 without it): the bundled DSpark's, or a DFlash2 checkpoint's on the
+    /// shared drafter (its weights, rings, taps and step workspace).
     pub draft_bytes: u64,
     /// Drafter context rings (0 without the drafter): bounds the verify rows.
     pub draft_rings: usize,
+    /// The largest transient the drafter holds while it loads (a DFlash2 FP8 packing's BF16
+    /// source matrix; 0 otherwise): the load peak takes it after the target's weights.
+    pub draft_staging: u64,
     pub host_embedding: bool,
     /// Startup records the decode graphs (golden runs every step eagerly and records none).
     pub startup_graphs: bool,
@@ -519,11 +523,12 @@ impl Recipe {
     }
 
     /// Admit the KV pool into `available` bytes beside the reservations. The load peak adds the
-    /// one source scale matrix staged at a time while the weights load; the returned reservations
-    /// admit the same recipe again.
+    /// one source scale matrix staged at a time while the weights load, or the drafter's load
+    /// transient after them, whichever is larger; the returned reservations admit the same recipe again.
     pub fn admit(&self, cfg: &MiniMaxM3Config, available: u64, requested_pool: Option<u64>) -> Result<(Admission, Reservations)> {
         let mut reservations = self.reservations;
-        reservations.startup = reservations.fixed_bytes(&self.ledger)?.checked_add(scale_prep_staging_bytes(&self.weights))
+        let staging = scale_prep_staging_bytes(&self.weights).max(self.request.draft_staging);
+        reservations.startup = reservations.fixed_bytes(&self.ledger)?.checked_add(staging)
             .ok_or(AdmissionError::Overflow("load peak"))?;
         let admitted = admit(cfg, self.request.sizing, &self.ledger, reservations, available, requested_pool, self.request.kv_format)?;
         Ok((admitted, reservations))
@@ -660,7 +665,7 @@ pub(crate) mod tests {
         let (local, spark) = (vec![3, 5], vec![4, 6]);
         let recipe = Recipe::new(&cfg, &checkpoint, &catalog, &programs_manifest(), Some(&expert_manifest()), Request {
             sizing, kv_format: Qwen4KvCache::Fp8, local_layers: LocalLayers::Exactly { local: local.clone(), spark: spark.clone() },
-            spark_budget: u64::MAX, spark_vision_bytes: 0, headroom: 2 << 30, draft_bytes: 0, draft_rings: 0,
+            spark_budget: u64::MAX, spark_vision_bytes: 0, headroom: 2 << 30, draft_bytes: 0, draft_rings: 0, draft_staging: 0,
             host_embedding: false, startup_graphs: false, rings: cuteafd_core::SparkRings { max_frame_bytes: ring.max_frame_bytes,
                 depth: ring.depth, slot_bytes: ring.slot_bytes, alignment: ring.alignment } })?;
         assert_eq!((&recipe.onboarding.local_layers, &recipe.onboarding.spark_layers), (&local, &spark));
