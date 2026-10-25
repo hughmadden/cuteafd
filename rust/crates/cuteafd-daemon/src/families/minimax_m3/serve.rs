@@ -345,7 +345,11 @@ fn worker(args: &ServeArgs, receive: &mut tokio::sync::mpsc::Receiver<cuteafd_ap
         pending: RefCell::new(None), timing: RefCell::new([0.0; 2]), probe: RefCell::new(crate::shared::draft::routes::RoundRoutes::new(1,4)),
         rings: RefCell::new(super::backend::Rings::new(sizing.sequences, rings)), full_prefill_logits: args.full_prefill_logits,
         trace: RefCell::new(super::diagnostics::LogitTrace::from_env()?),
-        startup_captures: std::cell::Cell::new(None) };
+        startup_captures: std::cell::Cell::new(None),
+        selector: match execution.draft() {
+            Ok(super::execution::Drafter::Dflash(draft)) => Some(draft.selector_prior()?),
+            _ => None,
+        } };
     // Every decode row count the scheduler can form, recorded before ready
     // against these buffers and this expert owner (the admitted inventory).
     let graphs = &admitted.graphs;

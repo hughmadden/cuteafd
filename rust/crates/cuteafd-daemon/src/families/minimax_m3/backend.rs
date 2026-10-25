@@ -78,6 +78,8 @@ pub(super) struct MiniMaxBackend<'e, 'a> {
     pub trace: RefCell<Option<super::diagnostics::LogitTrace>>,
     /// Graph captures once the startup recordings finished: serving adds none.
     pub startup_captures: std::cell::Cell<Option<u64>>,
+    /// DFlash2's keyed selector prior (the scheduler prices its drafts' features); none for DSpark.
+    pub selector: Option<scheduler::SelectorPrior>,
 }
 impl<'e, 'a> MiniMaxBackend<'e, 'a> {
     /// One step; the head projects only the batch rows in `logits`.
@@ -254,17 +256,23 @@ impl<'e, 'a> Backend<'a> for MiniMaxBackend<'e, 'a> {
             let proposals=self.execution.propose(&batch.iter().map(|(_,s)|*s).collect::<Vec<_>>(),self.embedding)?;
             ensure!(proposals.len()==batch.len(),MiniMaxError::Invalid("draft output count"));
             for ((index,_),proposal) in batch.into_iter().zip(proposals) {
-                sequences[index].seq.confidence=proposal.confidence;
-                output[index]=proposal.tokens.into_iter().take(sequences[index].depth).collect();
+                let crate::shared::speculation::dflash::Draft { tokens, features, confidence } = proposal;
+                sequences[index].seq.confidence=confidence;
+                sequences[index].seq.features=features;
+                output[index]=tokens.into_iter().take(sequences[index].depth).collect();
             }
             timing.steps+=1;
         }
         timing.seconds+=started.elapsed().as_secs_f64(); Ok(output)
     }
     fn draft_confidence<'s>(&self, state: &'s State) -> Option<&'s [f32]> {
-        // Only DSpark's confidence head predicts acceptance; DFlash2 drafts take the shared priors.
+        // Only DSpark's confidence head predicts acceptance; DFlash2 drafts are priced by their selector.
         self.execution.draft().is_ok_and(|draft| draft.confidence()).then_some(&state.confidence[..])
     }
+    fn draft_selector<'s>(&self, state: &'s State) -> Option<&'s [[f32; 4]]> {
+        self.selector.as_ref().map(|_| &state.features[..])
+    }
+    fn selector_prior(&self) -> Option<&scheduler::SelectorPrior> { self.selector.as_ref() }
     fn accept(&self, verified: &mut [scheduler::Verified<'_, Placement, State, ()>], _: bool) -> Result<()> {
         let step = self.pending.borrow_mut().take().context("MiniMax accept has no completed wave")?;
         accept_step(step, verified)?;

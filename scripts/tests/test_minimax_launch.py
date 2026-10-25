@@ -197,6 +197,18 @@ def test_minimax_bundled_dspark_is_explicit(tmp_path):
     assert "--draft " not in serve
 
 
+def test_minimax_speculation_trace_reaches_the_server_for_selector_calibration(tmp_path):
+    trace = tmp_path / "traces" / "dflash2.jsonl"
+    result = _launch(tmp_path, f"SPECULATOR=dflash2\nSPECULATOR_DRAFTS=7\nSPECULATION_TRACE={trace}\n")
+    assert result.returncode == 0, result.stderr
+    assert f"CUTEAFD_SPECULATION_TRACE={trace}" in result.stderr
+    assert _flag(_line(result, "serve-minimax --snapshot"), "--draft-fixed") == "7"
+    relative = tmp_path / "relative"
+    relative.mkdir()
+    result = _launch(relative, "SPECULATOR=dflash2\nSPECULATION_TRACE=relative.jsonl\n")
+    assert result.returncode != 0 and "SPECULATION_TRACE must be an absolute path" in result.stderr
+
+
 @pytest.mark.parametrize("keys,fp8,kv", [("", None, "fp8"), ("SPECULATOR_FP8=off\nDRAFT_KV_CACHE=bf16\n", "false", "bf16"),
                                          ("SPECULATOR_FP8=on\n", "true", "fp8")])
 def test_minimax_dflash2_serves_and_plans_the_radixark_drafter_on_the_shared_drafter(tmp_path, keys, fp8, kv):

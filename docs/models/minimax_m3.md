@@ -72,7 +72,12 @@ Status: **under qualification**. `serve-minimax` serves the release from a
   GEMMs load as one E4M3 copy by default (`SPECULATOR_FP8=off` keeps the checkpoint's BF16),
   the rings as FP8 K/V (`DRAFT_KV_CACHE=bf16`). `minimax-golden --draft SNAPSHOT
   --draft-replay P` replays it on a golden window's taps; `--draft-oracle DIR` compares it with
-  `python/reference/families/minimax_m3/dflash2/reference.py`.
+  `python/reference/families/minimax_m3/dflash2/reference.py`. Every request drafts its whole
+  room; the shared scheduler then prices each draft's selector features (margin, candidate
+  probability, entropy, rank) through the keyed `SelectorFit`
+  (`draft-confidence.<numerics>.json` beside the drafter's config; the generic GLM-5.3 fit until
+  one is fitted). With `SPECULATION_TRACE` the scheduler writes the `draft_confidence` records
+  `scripts/bench/calibrate-draft-confidence.py` fits from a fixed-7 run (`SPECULATOR_DRAFTS=7`).
 - DSpark draft length uses the shared `simple` policy (default;
   `DRAFT_POLICY`/`DRAFT_ROW_COST` select others, `SPECULATOR_DRAFTS=N` fixes the
   depth). TP2 on a 5090, aggregate tok/s at C1/C4/C16: target only
