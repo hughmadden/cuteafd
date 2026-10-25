@@ -987,6 +987,27 @@ def test_image_content_ignores_store_specific_fields():
     assert golden.image_content(spark_image(SPARK_IMAGE, Layers=[])) is None
 
 
+@pytest.mark.parametrize('field,value', [('StopTimeout', 0), ('StopTimeout', 10), ('Tty', True),
+                                         ('StopSignal', 'SIGINT'), ('Cmd', ['bash'])])
+def test_image_content_keeps_set_config_fields(field, value):
+    base = spark_image(SPARK_IMAGE)
+    changed = spark_image(SPARK_IMAGE)
+    changed['Config'] = dict(changed['Config'], **{field: value})
+    assert golden.image_content(changed) != golden.image_content(base)
+    zero, ten = (spark_image(SPARK_IMAGE) for _ in range(2))
+    zero['Config'] = dict(zero['Config'], StopTimeout=0)
+    ten['Config'] = dict(ten['Config'], StopTimeout=10)
+    assert golden.image_content(zero) != golden.image_content(ten)
+
+
+def test_reloaded_dev_image_with_stop_timeout_zero_is_refused(spark_env, monkeypatch, capsys):
+    record = spark_image('sha256:' + 'ef' * 32)
+    record['Config'] = dict(record['Config'], StopTimeout=0)  # the sealed image has none
+    image_stores(monkeypatch, {'moa': record})
+    assert golden.main(spark_argv(spark_env, '--dry-run')) == 2
+    assert 'moa' in capsys.readouterr().err
+
+
 def test_reloaded_dev_image_with_other_id_runs_vouched_by_a_sealed_host(spark_env, monkeypatch, capsys):
     # docker save | load into a containerd store: same layers and config, another ID.
     copy = 'sha256:' + 'ef' * 32
@@ -1064,3 +1085,101 @@ def test_dev_image_change_between_enqueue_and_grant_is_refused(spark_env, monkey
     assert golden.main(spark_argv(spark_env)) != 0
     assert 'dev image on moa changed since enqueue' in capsys.readouterr().err
     assert not runs(spark_env)
+
+
+
+def seal_spark_content(home, content):
+    """Re-seal the test Spark slot's META with base_image_content_sha256 (a new-style seal)."""
+    root = home / '.cache/cuteafd/builds/wip-i1/slots/s1/spark-expert'
+    meta = json.loads((root / 'META.json').read_text())
+    meta['base_image_content_sha256'] = content
+    data = json.dumps(meta).encode()
+    (root / 'META.json').write_bytes(data)
+    (root / 'FINGERPRINT').write_text(hashlib.sha256(data).hexdigest() + '\n')
+
+
+def test_dev_image_content_cli_matches_the_runner(tmp_path):
+    record = spark_image(SPARK_IMAGE)
+    out = subprocess.run([sys.executable, str(ROOT / 'scripts/lib/dev_image_content.py')], input=json.dumps([record]),
+                         capture_output=True, text=True, check=True).stdout.strip()
+    assert out == golden.image_content(record) and len(out) == 64
+    bad = subprocess.run([sys.executable, str(ROOT / 'scripts/lib/dev_image_content.py')],
+                         input=json.dumps([spark_image(SPARK_IMAGE, Layers=[])]), capture_output=True, text=True)
+    assert bad.returncode and 'no RootFS layers' in bad.stderr
+    assert golden.IMAGE_CONTENT in golden.REMOTE_CHECK
+
+
+def test_new_seal_admits_a_reloaded_copy_without_a_voucher(spark_env, monkeypatch, capsys):
+    copy = 'sha256:' + 'ef' * 32
+    seal_spark_content(spark_env['home'], golden.image_content(spark_image(SPARK_IMAGE)))
+    image_stores(monkeypatch, {host: spark_image(copy) for host in SPARKS})
+    assert golden.main(spark_argv(spark_env, '--dry-run')) == 0
+    out = capsys.readouterr().out
+    assert f'# moa: dev image {SPARK_IMAGE} is local {copy} (same content as on the seal)' in out
+
+
+@pytest.mark.parametrize('change', [
+    {'Layers': ['sha256:' + '11' * 32, 'sha256:' + '33' * 32]},
+    {'Labels': {'io.cuteafd.toolchain.hash': 'bb00000000000000'}},
+    {'Architecture': 'amd64'}, {'Os': 'windows'}, {'Variant': 'v8'},
+    {'Env': ['PATH=/usr/bin', 'LD_PRELOAD=/x.so']}, {'Entrypoint': ['/bin/other']}, {'User': '0:0'},
+])
+@pytest.mark.parametrize('sealed_id', [True, False])
+def test_new_seal_refuses_other_content_even_under_the_sealed_id(spark_env, monkeypatch, capsys, change, sealed_id):
+    seal_spark_content(spark_env['home'], golden.image_content(spark_image(SPARK_IMAGE)))
+    ident = SPARK_IMAGE if sealed_id else 'sha256:' + 'ef' * 32
+    record = spark_image(ident, **change)
+    image_stores(monkeypatch, {'emu': record} if not sealed_id else {})
+    if sealed_id:
+        stores = json.loads(os.environ['STUB_IMAGES'])
+        stores['emu'] = {SPARK_IMAGE: record, 'spark:tc': record}
+        monkeypatch.setenv('STUB_IMAGES', json.dumps(stores))
+    assert golden.main(spark_argv(spark_env, '--dry-run')) == 2
+    err = capsys.readouterr().err
+    assert 'emu:' in err and 'not the sealed' in err
+
+
+def test_new_seal_with_malformed_content_is_refused(spark_env, monkeypatch, capsys):
+    seal_spark_content(spark_env['home'], 'sha256:' + 'ab' * 32)
+    assert golden.main(spark_argv(spark_env, '--dry-run')) == 2
+    assert 'base_image_content_sha256 is malformed' in capsys.readouterr().err
+
+
+def coordinator_meta(home, **fields):
+    root = home / '.cache/cuteafd/builds/wip-i1/slots/s1/coordinator'
+    meta = json.loads((root / 'META.json').read_text())
+    meta.update(fields)
+    data = json.dumps(meta).encode()
+    (root / 'META.json').write_bytes(data)
+    (root / 'FINGERPRINT').write_text(hashlib.sha256(data).hexdigest() + '\n')
+
+
+def coordinator_store(monkeypatch, store):
+    stores = json.loads(os.environ.get('STUB_IMAGES', '{}'))
+    stores['raptor'] = store
+    monkeypatch.setenv('STUB_IMAGES', json.dumps(stores))
+
+
+def test_coordinator_old_seal_still_needs_the_sealed_id(spark_env, monkeypatch, capsys):
+    coordinator_store(monkeypatch, {'dev:tc': spark_image('sha256:' + 'ef' * 32)})
+    assert golden.main(spark_argv(spark_env, '--dry-run')) == 2
+    assert f'dev image {IMAGE} is missing' in capsys.readouterr().err
+
+
+def test_coordinator_new_seal_runs_a_reloaded_copy_of_the_same_content(spark_env, monkeypatch, capsys):
+    copy = 'sha256:' + 'ef' * 32
+    coordinator_meta(spark_env['home'], base_image_content_sha256=golden.image_content(spark_image(IMAGE)))
+    coordinator_store(monkeypatch, {'dev:tc': spark_image(copy)})
+    assert golden.main(spark_argv(spark_env, '--dry-run')) == 0
+    out = capsys.readouterr().out
+    coordinator = [line for line in out.splitlines() if line.startswith('docker run') and '--rm' in line]
+    assert coordinator and copy in coordinator[0] and IMAGE not in coordinator[0]
+
+
+@pytest.mark.parametrize('sealed_id', [True, False])
+def test_coordinator_new_seal_refuses_other_content(spark_env, monkeypatch, capsys, sealed_id):
+    coordinator_meta(spark_env['home'], base_image_content_sha256=golden.image_content(spark_image(IMAGE)))
+    other = spark_image(IMAGE if sealed_id else 'sha256:' + 'ef' * 32, Layers=['sha256:' + '44' * 32])
+    coordinator_store(monkeypatch, {IMAGE: other} if sealed_id else {'dev:tc': other})
+    assert golden.main(spark_argv(spark_env, '--dry-run')) == 2
+    assert 'not the sealed' in capsys.readouterr().err
