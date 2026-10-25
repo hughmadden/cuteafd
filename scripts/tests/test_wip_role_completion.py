@@ -339,8 +339,8 @@ def test_wip_seals_the_dev_image_content_it_built_with():
     assert script.index('distribute_spark_dev_image\n') < top < script.index('build_coordinator() {')
     # One identity algorithm: the seal (both roles) and the image distribution use the same CLI.
     uses = script.count('python3 "$repo_root/scripts/lib/dev_image_content.py"')
-    distribute = script[script.index('spark_dev_image_content() {'):script.index('distribute_spark_dev_image() {')]
-    assert uses == 3 and 'dev_image_content.py' in distribute
+    helper = script[script.index('wip_image_content() {'):script.index('distribute_spark_dev_image() {')]
+    assert uses == 3 and 'dev_image_content.py' in helper and 'wip_image_content "$1" "$SPARK_EXPERT_DOCKER_DEV"' in helper
     assert 'docker image inspect -f' not in script[script.index('distribute_spark_dev_image() {'):
                                                    script.index('# --recreate follows --role')]
     for role, ident in (('build_coordinator() {', 'wip_coordinator_image'), ('build_expert() (', 'wip_expert_image')):
