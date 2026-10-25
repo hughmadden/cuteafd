@@ -22,6 +22,7 @@ pub(crate) mod combine;
 pub(crate) mod dense;
 pub(crate) mod draft;
 pub(crate) mod exl3;
+pub(crate) mod exlr8;
 pub(crate) mod fp8moe;
 pub(crate) mod landed;
 pub(crate) mod native;
@@ -116,6 +117,8 @@ pub(crate) trait RtxExpertLayer {
     fn shard(&self) -> RtxShard;
     /// Element type of [`Self::output`].
     fn partial(&self) -> PartialDtype;
+    /// Input and output dtypes are independent (EXLR8 consumes FP8 wire and emits BF16).
+    fn uses_fp8_input(&self) -> bool;
     fn partial_layout(&self, _rows: usize) -> Result<PartialLayout> {
         Ok(PartialLayout::Tokens)
     }

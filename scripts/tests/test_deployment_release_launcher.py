@@ -186,7 +186,6 @@ def test_exlr8_launcher_accepts_canonical_spark_worlds(ranks: int, gpus: str, at
     ({"RTX_GPUS": "1", "ATTENTION_PLACEMENT": "layers"}, "heads attention"),
     ({"SPARK_COUNT": "9"}, "canonical Spark ranks"),
     ({"SPECULATOR": "mtp"}, "SPECULATOR=off or dflash2"),
-    ({"RTX_EXPERT_LAYERS": "1"}, "cannot onboard"),
     ({"ATTENTION_PLACEMENT": "heads"}, "context attention"),
 ])
 def test_exlr8_launcher_refuses_unsupported_route(overrides: dict, reason: str) -> None:

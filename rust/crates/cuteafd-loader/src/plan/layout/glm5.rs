@@ -315,7 +315,7 @@ fn placement(report: &PlanReport, input: &crate::plan::PlanInput, options: &Layo
         std::path::Path::new("/opt/cuteafd/share/PROGRAMS.json"));
     let catalog = input.expert_catalog()?;
     let local = glm::select_local_inventory(&catalog, manifest_path, cfg.layers, devices.len(),
-        rows, lanes, exchange_f32, onboard, false)?;
+        rows, lanes, exchange_f32, onboard, false, None)?;
     let tp2_workspace = local.as_ref().map_or([0; 2], |l| l.workspace());
     let serial_workspace = local.as_ref().map_or([0; 2], |l| l.workspace_for(&cfg, rows, 1, exchange_f32));
     let inputs = glm::GlmInputs { cfg: &cfg, layers: cfg.layers, gpus,
@@ -333,7 +333,8 @@ fn placement(report: &PlanReport, input: &crate::plan::PlanInput, options: &Layo
 
 /// Native EXLR8 uses the ordinary GLM solver and coordinator shared ownership.
 pub fn native_layout(checkpoint: &Checkpoint, options: &LayoutOptions, shared_bytes: &[u64],
-    workspace: u64, spark_ranks: usize, manifest: &serde_json::Value) -> anyhow::Result<(MemoryLayout, crate::placement::Placement)> {
+    workspace: u64, spark_ranks: usize, manifest: &serde_json::Value, selected: Option<&str>)
+    -> anyhow::Result<(MemoryLayout, crate::placement::Placement)> {
     use crate::placement::{families::glm5 as glm, Baseline, Onboard};
     let gpu_count = options.rtx_bytes.len();
     anyhow::ensure!((1..=2).contains(&gpu_count) && shared_bytes.len() == gpu_count,
@@ -386,6 +387,16 @@ pub fn native_layout(checkpoint: &Checkpoint, options: &LayoutOptions, shared_by
         devices.push(DeviceLayout { kind: DeviceKind::Rtx, index: rank as u32,
             capacity_bytes: options.rtx_bytes[rank].saturating_sub(options.headroom_bytes), items, kv_tokens: 0 });
     }
+    let onboard = options.onboard.or(options.local_expert_layers.map(Onboard::Layers)).unwrap_or_else(glm::default_onboard);
+    let local = if let Some(selected) = selected {
+        let catalog = crate::read_expert_catalog(&checkpoint.snapshot)?;
+        let manifest_path = options.workspace_manifest.as_deref()
+            .unwrap_or_else(|| std::path::Path::new("/opt/cuteafd/share/PROGRAMS.json"));
+        glm::select_local_inventory(&catalog, manifest_path, cfg.layers, gpu_count, rows, lanes,
+            glm::local_exchange_f32()?, onboard, false, Some((selected, options.exlr8_prefill_activations)))?
+    } else { None };
+    let tp2_workspace = local.as_ref().map_or([0; 2], |local| local.workspace());
+    let serial_workspace = local.as_ref().map_or([0; 2], |local| local.workspace_for(&cfg, rows, 1, false));
     let inputs = glm::GlmInputs { cfg: &cfg, layers: cfg.layers,
         gpus: devices.iter().zip(&options.rtx_bytes).map(|(device, &capacity)| (capacity,
             Baseline::Planned { context_bytes: 0, loaded_bytes: device.used_bytes() })).collect(),
@@ -393,10 +404,10 @@ pub fn native_layout(checkpoint: &Checkpoint, options: &LayoutOptions, shared_by
         native_workspace: workspace, native_dense: dense_scratch, skip_routed_experts: false, prefill_rows: rows,
         prefill_lanes: lanes,
         max_context: context, automatic_context: options.context_tokens == 0, scratch: Some(scratch), drafter_bytes: draft,
-        drafter_staging: draft_staging, pending_code: Vec::new(), experts: Vec::new(), expert_workspace: 0,
-        tp2_workspace: [0; 2], requested_pool: options.pool_tokens, onboard: Onboard::Layers(0),
+        drafter_staging: draft_staging, pending_code: Vec::new(), experts: local.as_ref().map_or_else(Vec::new, |local| local.experts.clone()), expert_workspace: 0,
+        tp2_workspace, requested_pool: options.pool_tokens, onboard,
         full_prefill_logits: options.full_prefill_logits, context: context_programs };
-    let (placement, _) = glm::solve_working_set(&inputs, [0; 2], Some(attention))?;
+    let (placement, _) = glm::solve_working_set(&inputs, serial_workspace, Some(attention))?;
     for (device, items) in devices.iter_mut().zip(&placement.items) {
         device.items.extend(items.iter().cloned());
         device.kv_tokens = placement.pool_tokens;
@@ -452,7 +463,7 @@ mod tests {
                 native.cache_requirements = exl3.cache_requirements.clone();
                 native.spark_ranks = sparks;
                 native.memory_layout = Some(native_layout(input.checkpoint(), &options,
-                    &vec![256; gpus], 256, sparks, &manifest).unwrap().0);
+                    &vec![256; gpus], 256, sparks, &manifest, None).unwrap().0);
                 charge_host(&mut native, &options, input.checkpoint(), true).unwrap();
                 let geometry = |r: &PlanReport| (r.prefill_unit_rows, r.prefill_waves,
                     r.prefill_span_rows, r.prefill_transports);
@@ -506,7 +517,7 @@ mod tests {
                     ..Default::default() };
                 let plan = |activations| native_layout(&checkpoint,
                     &LayoutOptions { exlr8_prefill_activations: activations, ..options.clone() },
-                    &vec![256; gpus], 256, sparks, &manifest).unwrap();
+                    &vec![256; gpus], 256, sparks, &manifest, None).unwrap();
                 let (a16, a16_placement) = plan(PrefillActivations::A16);
                 let (a8, a8_placement) = plan(PrefillActivations::A8);
                 let (heads, inter) = (cfg.heads / gpus, cfg.dense_intermediate / gpus);
@@ -524,7 +535,7 @@ mod tests {
                 // ... and with the pool pinned, nothing but the scratch item differs.
                 let pinned = |activations| native_layout(&checkpoint, &LayoutOptions { pool_tokens: Some(1 << 19),
                     exlr8_prefill_activations: activations, ..options.clone() },
-                    &vec![256; gpus], 256, sparks, &manifest).unwrap().0;
+                    &vec![256; gpus], 256, sparks, &manifest, None).unwrap().0;
                 let (pinned_a16, pinned_a8) = (pinned(PrefillActivations::A16), pinned(PrefillActivations::A8));
                 assert_eq!(pinned_a8.pool_tokens, 1 << 19, "{context}");
                 for gpu in 0..gpus {
@@ -555,11 +566,11 @@ mod tests {
                 for pool_tokens in [None, Some(0)] {
                     let options = LayoutOptions { host_memory: Some((128 << 30, 128 << 30)), rtx_bytes: vec![96 << 30; gpus],
                         context_tokens: context, pool_tokens, glm5_drafter_disabled: true, ..Default::default() };
-                    let (memory, placement) = native_layout(&checkpoint, &options, &vec![256; gpus], 256, 4, &manifest).unwrap();
+                    let (memory, placement) = native_layout(&checkpoint, &options, &vec![256; gpus], 256, 4, &manifest, None).unwrap();
                     let drafting = LayoutOptions { host_memory: Some((128 << 30, 128 << 30)), glm5_drafter_disabled: false,
                         drafter_bytes: 1 << 30, ..options.clone() };
                     let (_, draft_placement) = native_layout(&checkpoint, &drafting,
-                        &vec![256; gpus], 256, 4, &manifest).unwrap();
+                        &vec![256; gpus], 256, 4, &manifest, None).unwrap();
                     let draft: u64 = draft_placement.items.iter().flatten()
                         .filter(|item| item.category == Category::Drafter).map(|item| item.bytes).sum();
                     assert_eq!(draft, 1 << 30);
@@ -576,7 +587,7 @@ mod tests {
                 let options = LayoutOptions { host_memory: Some((128 << 30, 128 << 30)), rtx_bytes: vec![96 << 30; gpus],
                     prefill_rows: 4096, prefill_lanes: lanes, glm5_drafter_disabled: true, ..Default::default() };
                 let sparks = if gpus == 1 { 4 } else { 6 };
-                let (unpressured, _) = native_layout(&checkpoint, &options, &vec![256; gpus], 256, sparks, &manifest).unwrap();
+                let (unpressured, _) = native_layout(&checkpoint, &options, &vec![256; gpus], 256, sparks, &manifest, None).unwrap();
                 let shared: Vec<_> = unpressured.devices.iter().map(|device| {
                     let records: u64 = device.items.iter().filter(|item| item.group == "records")
                         .map(|item| item.bytes).sum();
@@ -592,7 +603,7 @@ mod tests {
                 for pool_tokens in [None, Some(0)] {
                     let options = LayoutOptions { pool_tokens, onboard: Some(crate::placement::Onboard::Layers(0)),
                         ..options.clone() };
-                    let (memory, native) = native_layout(&checkpoint, &options, &shared, 256, sparks, &manifest).unwrap();
+                    let (memory, native) = native_layout(&checkpoint, &options, &shared, 256, sparks, &manifest, None).unwrap();
                     assert!(memory.pool_tokens >= 1 << 20);
                     assert!(memory.pool_tokens < default);
                     assert_eq!(memory.pool_tokens, native.pool_tokens);
@@ -609,21 +620,21 @@ mod tests {
                     assert_eq!(native.pool_tokens, ordinary.pool_tokens, "{gpus} RTX/{sparks} Sparks/{lanes} lanes");
                 }
                 let explicit = LayoutOptions { pool_tokens: Some(default), ..options.clone() };
-                assert!(native_layout(&checkpoint, &explicit, &shared, 256, sparks, &manifest).is_err());
+                assert!(native_layout(&checkpoint, &explicit, &shared, 256, sparks, &manifest, None).is_err());
                 let diagnostic = LayoutOptions { pool_tokens: Some(1 << 19), ..options };
-                let (memory, _) = native_layout(&checkpoint, &diagnostic, &shared, 256, sparks, &manifest).unwrap();
+                let (memory, _) = native_layout(&checkpoint, &diagnostic, &shared, 256, sparks, &manifest, None).unwrap();
                 assert_eq!(memory.pool_tokens, 1 << 19);
             }
             let options = LayoutOptions { host_memory: Some((128 << 30, 128 << 30)), rtx_bytes: vec![96 << 30; gpus],
                 context_tokens: default + 128, pool_tokens: Some(default), glm5_drafter_disabled: true, ..Default::default() };
-            let error = native_layout(&checkpoint, &options, &vec![256; gpus], 256, 4, &manifest).unwrap_err();
+            let error = native_layout(&checkpoint, &options, &vec![256; gpus], 256, 4, &manifest, None).unwrap_err();
             assert_eq!(error.downcast_ref::<PlacementError>(), Some(&PlacementError::RequestedBelowContext {
                 requested: default, floor: default + 128,
             }));
             let options = LayoutOptions { host_memory: Some((128 << 30, 128 << 30)), rtx_bytes: vec![1 << 30; gpus],
                 context_tokens: 1 << 20, pool_tokens: Some(1 << 20), glm5_drafter_disabled: true, ..Default::default() };
-            assert!(native_layout(&checkpoint, &options, &vec![256; gpus], 256, 4, &manifest).is_err());
-            assert!(native_layout(&checkpoint, &options, &[], 256, 4, &manifest).is_err());
+            assert!(native_layout(&checkpoint, &options, &vec![256; gpus], 256, 4, &manifest, None).is_err());
+            assert!(native_layout(&checkpoint, &options, &[], 256, 4, &manifest, None).is_err());
         }
     }
 
