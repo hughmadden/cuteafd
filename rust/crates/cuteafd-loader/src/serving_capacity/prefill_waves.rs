@@ -242,7 +242,7 @@ mod tests {
         let adaptive = PrefillLimits::default().with_shared_fp8_scratch(false);
         assert_eq!(prefill_shape(6, adaptive, PrefillOverrides::default()).unwrap().waves, 3);
         let held = PrefillLimits::default().with_shared_fp8_scratch(true);
-        assert!(held.max_waves_reason.unwrap().contains("#778"));
+        assert!(held.max_waves_reason.unwrap().contains("#779"));
         assert_eq!(prefill_shape(6, held, PrefillOverrides::default()).unwrap(),
             PrefillPlan { unit_rows: 4096, waves: 2, span_rows: 8192 });
         for waves in [3, 4] {

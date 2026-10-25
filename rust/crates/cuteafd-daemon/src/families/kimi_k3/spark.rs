@@ -323,7 +323,7 @@ mod tests {
             assert_eq!(charge, cuteafd_loader::families::kimi_k3::allocation::spark_demand(
                 cuteafd_loader::serving_capacity::PrefillShape { unit_rows: unit as u64, waves: waves as u64 }, 0));
         }
-        assert!(demand(4096, 3, 0).is_ok() && demand(128, 3, 0).is_err());
+        assert!(demand(8256, 3, 0).is_ok() && demand(4096, 3, 0).is_err() && demand(128, 3, 0).is_err());
         Ok(())
     }
 }

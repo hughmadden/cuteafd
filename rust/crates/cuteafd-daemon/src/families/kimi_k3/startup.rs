@@ -91,7 +91,7 @@ pub(crate) fn load<'a>(library: &'a Arc<cuteafd_ffi::NativeLibrary>,
     let spark_budget = cuteafd_loader::placement::SparkBudgetInventory::exl3(&catalog, &working,
         &[cuteafd_core::SparkEndpoint { ring_depth: None, capacity: u32::try_from(unit)?, ingress: cuteafd_core::SparkIngress::Fp8K32 }],
         model, (spark_budget_gib * (1u64 << 30) as f64) as u64,
-        cuteafd_loader::families::kimi_k3::SPARK_ESTIMATED_RESERVE_BYTES)?;
+        cuteafd_loader::families::kimi_k3::spark_reserve_bytes(options.waves as u64, unit as u64)?)?;
     let rtx = if options.rtx_expert_layers.layers(routed) == Some(0) { None } else {
         let tiers = catalog.exl3().context("Kimi TP2 experts require EXL3 checkpoint")?.decoder_tiers();
         let package = crate::shared::experts::exl3::aot_layout_directory(

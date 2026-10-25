@@ -26,10 +26,11 @@ pub(super) fn spark_model(rows: usize, waves: u64, bf16: bool)
 pub(super) fn inputs<'a>(args: &EngineArgs, cfg: &'a Qwen4Config, layers: usize, mtp: bool,
     manifest: Option<&'a serde_json::Value>, ple: Option<(u64, bool)>, future_expert_bytes: u64) -> Result<QwenAdmissionInputs<'a>> {
     let geometry = qwen_cache_geometry(cfg, layers, mtp, args.kv_format)?;
+    let shape = args.resolved_prefill()?;
     let marks = args.planner_prefix_bytes.unwrap_or(geometry.ranks[0].retained_mark_bytes * qwen4::DEFAULT_MARK_SLOTS);
     let logits = if args.full_prefill_logits { cuteafd_loader::plan::layout::full_prefill_logits_bytes(
-        "qwen4", args.prefill_rows as u64, cfg.vocab_size as u64) } else { 0 };
-    Ok(QwenAdmissionInputs { prefill_shape: args.prefill_shape()?, cfg, layers, mtp, kv_format: args.kv_format, manifest, prefill_rows: args.prefill_rows as u64,
+        "qwen4", shape.span_rows, cfg.vocab_size as u64) } else { 0 };
+    Ok(QwenAdmissionInputs { prefill_shape: args.prefill_shape()?, cfg, layers, mtp, kv_format: args.kv_format, manifest, prefill_rows: shape.span_rows,
         slots: args.slots as u64, mark_bytes: marks, full_prefill_logits: logits, ple, future_expert_bytes,
         headroom: cuteafd_loader::plan::layout::LayoutOptions::default().headroom_bytes.max(3 << 30) })
 }
@@ -248,7 +249,7 @@ mod tests {
                 let report = plan(dir.path(), &PlanOptions {
                     placement: ExpertPlacement::Sparks { ranks: 4 },
                     layout: Some(LayoutOptions { rtx_bytes: vec![32 << 30], prefill_rows: rows,
-                        prefill_waves: waves, context_tokens: 32768, prefix_slots: Some(0),
+                        prefill_waves: waves, prefill_lanes: waves, context_tokens: 32768, prefix_slots: Some(0),
                         host_cache_bytes: Some(0), host_memory: Some((128 << 30, 128 << 30)),
                         ..Default::default() }), ..Default::default()
                 })?;
@@ -614,7 +615,7 @@ mod tests {
         let cfg = cuteafd_loader::families::qwen4::Qwen4Config::read(dir.path())?;
         let mut args = Cli::try_parse_from(["serve", "--snapshot", dir.path().to_str().unwrap(),
             "--native-lib", lib.to_str().unwrap(), "--local-experts", "--split-device", "1",
-            "--prefill-rows", "16", "--max-context", "131072", "--pool-tokens", "0"])?.engine;
+            "--prefill-rows", "64", "--max-context", "131072", "--pool-tokens", "0"])?.engine;
         args.mtp = if mtp { 3 } else { 0 };
         args.planner_prefix_bytes = Some(0);
         args.planner_graph_modes = Some((8, true));
@@ -632,7 +633,7 @@ mod tests {
                 else { crate::shared::token_io::EmbedPlacement::Gpu };
             let report = plan(dir.path(), &PlanOptions { placement: ExpertPlacement::Local,
                 layout: Some(LayoutOptions { host_memory: Some((128 << 30, 128 << 30)), rtx_bytes: capacities.to_vec(),
-                    context_tokens: 131072, prefill_rows: 16, concurrency: 8, state_slots: Some(8),
+                    context_tokens: 131072, prefill_rows: 64, concurrency: 8, state_slots: Some(8),
                     prefix_slots: Some(0), native_mtp_layers: args.mtp, host_embedding: host,
                     qwen_attention_plan_rows: attention_rows,
                     qwen_representation: cuteafd_loader::families::qwen4::resident::Qwen4Representation { fp8_projections, fp8_head },

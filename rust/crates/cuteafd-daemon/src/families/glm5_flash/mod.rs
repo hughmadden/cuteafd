@@ -465,7 +465,9 @@ mod draft_cli_tests {
     fn parse(extra: &[&str]) -> EngineArgs {
         let mut args = Parse::try_parse_from(["test", "--snapshot", "/checkpoint", "--native-lib", "/native"].into_iter()
             .chain(extra.iter().copied())).unwrap().engine;
-        resolve_prefill(&mut args, true, false).unwrap();
+        if args.attention_placement != "unknown" {
+            resolve_prefill(&mut args, true, false).unwrap();
+        }
         args
     }
 
@@ -767,7 +769,7 @@ mod draft_cli_tests {
     fn experts_hold_a_verify_wave_wider_than_the_prefill_lane() {
         for (flags, rows) in [(&[][..], 4096), (&["--decode-rows", "128"][..], 4096),
             (&["--prefill-rows", "64"][..], 64), (&["--prefill-rows", "64", "--decode-rows", "128"][..], 128),
-            (&["--prefill-rows", "2048", "--decode-rows", "128"][..], 2048), (&["--prefill-rows", "32"][..], 64)] {
+            (&["--prefill-rows", "2048", "--decode-rows", "128"][..], 2048), (&["--prefill-rows", "64"][..], 64)] {
             assert_eq!(parse(flags).expert_rows(), rows, "{flags:?}");
         }
         let args = parse(&["--prefill-rows", "64", "--decode-rows", "128"]);

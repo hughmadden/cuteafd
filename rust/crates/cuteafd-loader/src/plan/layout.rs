@@ -363,7 +363,7 @@ pub fn spark_execution_slots(family: &str, prefill_waves: u64, decode_lanes: u8)
 /// staging at the family's unit capacity), calibrated against the workers'
 /// `experts/workspace*` ledger on the shipped cards (2026-10-24): MiMo Pro max
 /// FP8 146 MiB, GLM 5.3 EXL3 max 1001 MiB, GLM Flash EXL3 569 MiB, V4.1 Flash
-/// max 208 MiB, Kimi K3 EXL3-K2 1175 MiB. Keep the compiled-capacity floor:
+/// max 208 MiB; Kimi uses its retained-manifest census. Keep the compiled-capacity floor:
 /// scratch cannot be linearly reduced with live rows. Native FP8-path workers
 /// use the separate per-group census bound, including mixed/rotated groups.
 pub fn spark_slot_bytes(family: &str, unit_rows: u64) -> u64 {
@@ -373,7 +373,7 @@ pub fn spark_slot_bytes(family: &str, unit_rows: u64) -> u64 {
         "glm5" => 1001 * MIB,
         "glm5_flash" => 569 * MIB,
         "deepseek_v41" | "deepseek_v4" => 208 * MIB,
-        "kimi_k3" => 1175 * MIB,
+        "kimi_k3" => crate::families::kimi_k3::SPARK_SLOT_BYTES,
         // Qwen K4.5 TP1: eight retained capacity manifests plus wire/routes,
         // 674,287,636 bytes; every TP2/3/4 rank is smaller (see census test).
         "qwen4" => 644 * MIB,
@@ -512,6 +512,36 @@ mod selected_spark_io_tests {
         assert_eq!(retained + wire_routes, 674_287_636);
         for rows in [64, 2048, 2752, 4096] {
             assert!(spark_slot_bytes("qwen4", rows) >= retained + wire_routes);
+        }
+    }
+
+    #[test]
+    fn kimi_slot_and_admission_reserve_cover_retained_manifest_owners() {
+        use serde_json::json;
+        let arenas = [("rotation_gate", 469_762_048), ("rotation_up", 29_360_128),
+            ("fc1", 134_217_728), ("activated", 67_108_864), ("output", 29_360_128),
+            ("packed_route_indices", 487_936), ("block_expert_ids", 7_624),
+            ("packed_route_count", 16), ("expert_offsets", 3_588), ("expert_counts", 3_584),
+            ("fc1_scratch", 12_582_912), ("fc2_scratch", 12_582_912)];
+        let capacities = cuteafd_core::Exl3RowPolicy::GlmFlashK64.capacities(4096).unwrap();
+        assert_eq!(capacities, [1, 80, 256, 1024, 2048, 2752, 4096]);
+        let manifests = capacities.into_iter().map(|rows| {
+            let mut buffers = serde_json::Map::new();
+            for (name, bytes) in arenas {
+                buffers.insert(name.into(), json!({"allocation": name, "bytes": bytes,
+                    "dtype": "census", "zero_on_create": false}));
+            }
+            buffers.insert("workspace".into(), json!({"allocation": "workspace", "bytes": 776,
+                "dtype": "i32", "zero_on_create": true}));
+            json!({"capacity": rows, "hidden": 3584, "trellis_lut": {"bytes": 4096}, "buffers": buffers})
+        }).collect::<Vec<_>>();
+        let retained = crate::serving_capacity::exl3_workspace_bytes(&manifests, true).unwrap();
+        let slot = retained + 4096 * (3584 + 3584 / 32 + 8 * 16);
+        assert_eq!(slot, 844_696_852);
+        for (unit, waves) in [(4096, 1), (4096, 2), (2752, 3), (2048, 4)] {
+            assert_eq!(spark_slot_bytes("kimi_k3", unit), slot);
+            let reserve = crate::families::kimi_k3::spark_reserve_bytes(waves, unit).unwrap();
+            assert_eq!(reserve, waves * slot + cuteafd_core::memory_layout::SPARK_RUNTIME_RESIDUAL_BYTES);
         }
     }
 
@@ -1349,11 +1379,14 @@ pub(crate) fn charge_host(report: &mut PlanReport, options: &LayoutOptions, chec
     let rows = report.prefill_span_rows.unwrap_or(options.prefill_rows.max(4096));
     // Scoring retains the span; wire/router scratch serves one explicit unit.
     // The live return slots alone multiply by the number of waves.
-    ensure!(ranks == 0 || options.prefill_unit_rows.is_some(),
+    // MiMo retains its own row/transport geometry pending #709; it has no
+    // shared-wave unit metadata until its executor is ported.
+    let legacy_mimo = family == "mimo_v2";
+    ensure!(legacy_mimo || ranks == 0 || options.prefill_unit_rows.is_some(),
         "{family} Spark host admission requires family-resolved prefill_unit_rows (span {rows}, waves {})",
         options.prefill_waves);
-    let unit_rows = options.prefill_unit_rows.unwrap_or(rows);
-    let intake_rows = if options.prefill_waves == 1 {
+    let unit_rows = if legacy_mimo { rows } else { options.prefill_unit_rows.unwrap_or(rows) };
+    let intake_rows = if legacy_mimo { rows } else if options.prefill_waves == 1 {
         ensure!(ranks == 0 || (1..=4096).contains(&unit_rows),
             "{family} Spark host admission needs prefill_unit_rows in 1..=4096, got {unit_rows}");
         unit_rows

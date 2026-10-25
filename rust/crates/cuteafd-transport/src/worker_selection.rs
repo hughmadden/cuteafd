@@ -1445,7 +1445,7 @@ mod tests {
         let mut selection = admission_selection();
         let endpoint = SparkEndpoint { ring_depth: None, capacity: 8256, ingress: SparkIngress::Bf16 };
         let model = ModelAdmission::for_units(selection.geometry(), endpoint, 2752, 4096,
-            SparkRings { max_frame_bytes: 64 << 20, depth: 8, slot_bytes: 8 << 20, alignment: 4096 }, 2, 3)?;
+            SparkRings { max_frame_bytes: 128 << 20, depth: 8, slot_bytes: 8 << 20, alignment: 4096 }, 2, 3)?;
         assert_eq!((model.capacity, model.compiled_capacity, model.execution_slots), (2752, 4096, 3));
         assert_eq!(model.endpoints, [endpoint, endpoint]);
         let mut invalid = model.clone();

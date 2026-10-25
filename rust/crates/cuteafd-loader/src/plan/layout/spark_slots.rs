@@ -51,7 +51,7 @@ pub(crate) fn native_slot_bytes(input: &super::super::PlanInput, family: &str,
     let mut total = 0;
     for &layer in &working.spark_layers {
         if !tensors.has_layer(layer) { continue; }
-        let view = tensors.for_layer(layer)?;
+        let view = tensors.for_layer_metadata(layer)?;
         let format = view.format();
         let package_family = match family {
             "glm5" => "glm", "glm5_flash" => "glmf",

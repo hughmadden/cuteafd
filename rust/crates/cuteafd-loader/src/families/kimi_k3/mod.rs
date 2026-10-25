@@ -21,10 +21,16 @@ pub fn default_context(core: &core::CoreInventory) -> usize {
 }
 pub const SPARK_DEFAULT_BUDGET_BYTES: u64 = 108 << 30;
 
-/// Offline ceiling only; the first full worker load/steady census qualifies it.
-pub const SPARK_ESTIMATED_WORKSPACE_BYTES: u64 = 512 << 20;
-pub const SPARK_ESTIMATED_RESERVE_BYTES: u64 =
-    cuteafd_core::memory_layout::SPARK_RUNTIME_RESIDUAL_BYTES + SPARK_ESTIMATED_WORKSPACE_BYTES;
+/// TP6 retained EXL3 arenas/private capacities plus 4096-row K32 input/routes
+/// (#762 census). GlmFlashK64 does not retain the m16 specialization.
+pub const SPARK_SLOT_BYTES: u64 = 844_696_852;
+
+/// Use the same execution-slot reserve before placement and in its ledger.
+pub fn spark_reserve_bytes(waves: u64, unit_rows: u64) -> anyhow::Result<u64> {
+    let slots = crate::plan::layout::spark_execution_slots("kimi_k3", waves, 1)?;
+    Ok(cuteafd_core::memory_layout::SPARK_RUNTIME_RESIDUAL_BYTES
+        + u64::from(slots) * crate::plan::layout::spark_slot_bytes("kimi_k3", unit_rows))
+}
 
 /// Target taps for one prefill call (`rows` lane rows) while the common MLA
 /// drafter consumes 2048-row slices.

@@ -218,7 +218,7 @@ mod tests {
             assert!(!report.executable());
             // A rejected allocation still reports the selected topology shape;
             // capacity admission never retries a smaller unit or fewer waves.
-            let (unit, waves, rows) = if nvfp4 { (4096, 2, 8192) } else { (2752, 3, 8256) };
+            let (unit, waves, rows) = (4096, 2, 8192);
             assert_eq!(report.prefill_unit_rows, Some(unit as u64));
             assert_eq!(report.prefill_waves, Some(waves as u64));
             assert_eq!(report.prefill_span_rows, Some(rows as u64));

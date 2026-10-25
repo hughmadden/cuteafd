@@ -798,7 +798,7 @@ mod tests {
             &[cuteafd_core::SparkEndpoint { ring_depth: None, capacity: rows as u32, ingress: cuteafd_core::SparkIngress::Fp8K32 }],
             crate::shared::placement::spark_rings(cuteafd_transport::TcpTransportConfig::default().max_frame_bytes)?,
             cuteafd_loader::families::kimi_k3::SPARK_DEFAULT_BUDGET_BYTES,
-            cuteafd_loader::families::kimi_k3::SPARK_ESTIMATED_RESERVE_BYTES)?;
+            cuteafd_loader::families::kimi_k3::spark_reserve_bytes(2, rows as u64)?)?;
         let graph_set = super::super::graphs::owned_inventory(&cfg, 1, rows, slots, 0)?;
         let admitted = admission::admit(admission::Inputs { cfg: &cfg, core: Default::default(), cache_format: cuteafd_core::MlaCacheFormat::Bf16, gpus: [GpuBudget {
             capacity_bytes: 96 << 30, headroom_bytes: 2 << 30,
@@ -823,7 +823,7 @@ mod tests {
         eprintln!("Kimi CPU host forecast concurrency={slots} context=1048576 mark_bytes={mark_bytes} page_bytes={page_bytes} chunk={chunk} required={required} resolved={host_bytes} marks={} legacy_marks={marks}", admitted.mark_selection.slots);
         for rank in 0..6 {
             eprintln!("Kimi CPU Spark forecast rank={rank} retained={} budget={} reserve={} estimated_until_W9_census=true",
-                spark.rank_bytes(rank, onboard)?, spark.budget, cuteafd_loader::families::kimi_k3::SPARK_ESTIMATED_RESERVE_BYTES);
+                spark.rank_bytes(rank, onboard)?, spark.budget, cuteafd_loader::families::kimi_k3::spark_reserve_bytes(2, rows as u64)?);
         }
         for rank in 0..2 {
             let items = &admitted.placement.items[rank];

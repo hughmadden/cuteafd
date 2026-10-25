@@ -9,9 +9,6 @@ const COMPILED_CAPACITY: u64 = crate::families::kimi_k3::COMPILED_CONTEXT as u64
 const PAGE: u64 = 64;
 const MODES: &[LayerMode] = &[LayerMode::HeadSplit,
     LayerMode::Whole { gpu: 0, ffn: FfnMode::Split }, LayerMode::Whole { gpu: 1, ffn: FfnMode::Split }];
-/// Spark EXL3 workspace across the capacity set, estimated until the Kimi
-/// package manifest records it (Gemini review of #273: ~430 MiB at m4096).
-const SPARK_EXL3_WORKSPACE: u64 = crate::families::kimi_k3::SPARK_ESTIMATED_WORKSPACE_BYTES;
 /// Prefill lanes the Spark transport serves (one QP endpoint each).
 const LANES: u64 = 1;
 
@@ -190,7 +187,7 @@ pub(super) fn layout(model: &Model, report: &mut PlanReport, opts: &mut crate::p
         let spark = SparkBudgetInventory::exl3(&catalog, &working, &endpoints,
             cuteafd_core::SparkRings { max_frame_bytes: rings.max_frame_bytes, depth: rings.depth,
                 slot_bytes: rings.slot_bytes, alignment: rings.alignment }, budget,
-            crate::families::kimi_k3::SPARK_ESTIMATED_RESERVE_BYTES)?;
+            crate::families::kimi_k3::spark_reserve_bytes(shape.waves, shape.unit_rows)?)?;
         let manifest = catalog.exl3().ok_or_else(|| anyhow::anyhow!("Kimi TP2 requires EXL3 headers"))?;
         let mut costs = vec![[Bytes2::default(); 2]; cfg.layers];
         for &layer in &working.spark_layers {
@@ -373,14 +370,13 @@ pub(super) fn layout(model: &Model, report: &mut PlanReport, opts: &mut crate::p
             unit as u32, false, rings, 0) {
             refusal(report, format!("Kimi K3 Spark rank {rank} I/O: {error}"), "Fix the Spark ring geometry.");
         }
-        device.items.push(Item::new(Category::Workspace, "EXL3 expert workspace", "kimik3:exl3-k23", SPARK_EXL3_WORKSPACE, Basis::Estimated));
         match crate::plan::layout::spark_execution_slots("kimi_k3", shape.waves, 1) {
             Ok(slots) => crate::plan::layout::charge_spark_slots(&mut device, &working, "kimi_k3", slots, shape.unit_rows),
             Err(error) => refusal(report, format!("Kimi Spark slots: {error}"), "Use a supported wave count."),
         }
         memory.devices.push(device);
     }
-    memory.notes.push(format!("Spark budget {} B/rank includes exact TP6 header arenas and endpoint I/O plus {} B estimated runtime/workspace reserve; census pending",
-        spark_budget.budget, crate::families::kimi_k3::SPARK_ESTIMATED_RESERVE_BYTES));
+    memory.notes.push(format!("Spark budget {} B/rank includes exact TP6 header arenas, endpoint I/O, runtime residual and {} execution slots at {} B each",
+        spark_budget.budget, shape.waves, crate::plan::layout::spark_slot_bytes("kimi_k3", shape.unit_rows)));
     memory
 }

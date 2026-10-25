@@ -127,7 +127,7 @@ fn host_prefill_waves_keep_unit_scratch_and_independent_return_slots() {
             options.prefill_unit_rows = Some(unit);
             options.prefill_waves = waves;
             report.prefill_span_rows = Some(span);
-            for family in ["mimo_v2", "deepseek_v41"] {
+            for family in ["glm5", "glm5_flash"] {
                 report.family = Some(family.into());
                 layout::charge_host(&mut report, &options, input.checkpoint(), native).unwrap();
                 assert_eq!(report.prefill_span_rows, Some(span));
@@ -449,7 +449,7 @@ fn host_full_logits_charge_gather_and_live_lane_but_not_mimo_pipeline() {
         host_cache_bytes: Some(0), prefill_lanes: 3, full_prefill_logits: true,
         prefill_unit_rows: Some(4096), ..Default::default() };
     let vocab = report.spec.as_ref().unwrap().vocab as u64;
-    for (family, rows) in [("mimo_v2", 4096u64), ("glm5_flash", 4096 * 4), ("glm5", 4096 * 4)] {
+    for (family, rows) in [("mimo_v2", 4096u64), ("glm5_flash", 4096), ("glm5", 4096)] {
         report.family = Some(family.into());
         report.prefill_transports = None;
         layout::charge_host(&mut report, &options, input.checkpoint(), false).unwrap();

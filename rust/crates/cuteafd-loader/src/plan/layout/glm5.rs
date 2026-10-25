@@ -468,7 +468,7 @@ mod tests {
                 let moe = spec.moe.as_ref().unwrap();
                 let expert = ExpertGeometry { hidden: spec.hidden as u32, experts: moe.experts as u32,
                     topk: moe.top_k as u32, intermediate: moe.intermediate as u32, layers: spec.layers.len() as u32 };
-                let endpoints = spark_endpoints("glm5", waves) as u64;
+                let endpoints = native.prefill_transports.unwrap();
                 let endpoint = SparkEndpoint { ring_depth: None, capacity: rows as u32, ingress: SparkIngress::Fp8K32 };
                 let (request, response) = endpoint.wire_bytes(expert).unwrap();
                 let rings = SparkRings { max_frame_bytes: (64 << 20).max(request).max(response),

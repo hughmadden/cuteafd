@@ -236,12 +236,12 @@ mod draft_cli_tests {
     fn golden_rejects_invalid_unit_geometry_before_opening_checkpoint() {
         #[derive(Parser)]
         struct Golden { #[command(flatten)] args: GoldenArgs }
-        for rows in ["0", "255", "257"] {
+        for rows in ["32", "255", "257"] {
             let args = Golden::try_parse_from(["test", "--snapshot", "/missing-checkpoint",
                 "--native-lib", "/missing-library", "--golden", "/missing-fixture",
                 "--prefill-rows", rows, "--nll"]).unwrap().args;
             let error = golden(args).unwrap_err().to_string();
-            assert!(error.contains("prefill unit geometry"), "{error}");
+            assert!(error.contains("unsupported prefill shape"), "{error}");
         }
     }
 
@@ -1468,6 +1468,9 @@ fn bench_prefill(args: &GoldenArgs, engine: &engine::GlmEngine<'_>,
 }
 
 fn golden(mut args: GoldenArgs) -> Result<()> {
+    // Reject invalid explicit geometry before checkpoint I/O; the catalog then
+    // applies its backend-specific capability hold to the resolved shape.
+    resolve_prefill(&mut args.engine.clone(), false)?;
     let catalog = cuteafd_loader::read_expert_catalog(&args.engine.snapshot)?;
     resolve_prefill(&mut args.engine, catalog.fp8().is_some())?;
     // Validate the scoring call before opening CUDA or loading any weights.

@@ -768,7 +768,7 @@ fn nvfp4_min_card_admits_native_w4a4_and_bf16_root_stays_reference_only() {
             let target = crate::placement::PoolPolicy::resolve(&[96 << 30], context, None, 64, false).target;
             assert!((context..=target).contains(&memory.pool_tokens));
             // More free capacity must grow the same default-format pool to its cap.
-            let roomy = report_context(dir.path(), 1, 128, 4, None, context);
+            let roomy = report_context(dir.path(), 1, 160, 4, None, context);
             assert!(roomy.wip_launchable(), "{:?}", roomy.hints);
             assert_eq!(roomy.memory_layout.unwrap().pool_tokens, target);
         }
@@ -1264,14 +1264,14 @@ fn adaptive_prefill_selection_preserves_overrides_and_never_retries_on_capacity(
                 draft_ownership: Some(spec::DraftOwnership::None),
                 layout: Some(layout::LayoutOptions {
                     // The fixed shape must remain visible even when memory cannot admit it.
-                    rtx_bytes: vec![33 << 30; gpus],
+                    rtx_bytes: vec![33 << 30; gpus], pool_tokens: Some(64 << 20),
                     prefill_rows: unit, prefill_lanes: waves,
                     host_memory: Some((128 << 30, 128 << 30)),
                     workspace_manifest: Some(manifest.clone()),
                     ..Default::default()
                 }), ..Default::default()
             }).unwrap();
-            assert!(!report.wip_launchable(), "a 33 GiB coordinator cannot hold Step-5");
+            assert!(!report.wip_launchable(), "a 33 GiB coordinator cannot hold an explicit 64M-token pool");
             assert_eq!(report.prefill_unit_rows, Some(expected_unit));
             assert_eq!(report.prefill_waves, Some(expected_waves));
             assert_eq!(report.prefill_span_rows, Some(expected_unit * expected_waves));

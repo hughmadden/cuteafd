@@ -526,7 +526,9 @@ pub fn solve_working_set(inputs: &GlmInputs<'_>, serial_tp2_workspace: [u64; 2],
             if branch.prefill_lanes > 1 {
                 tracing::info!(waves = branch.prefill_lanes,
                     "keeping a Spark-using candidate: all-local shape transition awaits shared planner #776");
-                refusal = Some(PlacementError::Inventory("all-local GLM candidate requires a one-wave deployment; shared shape transition pending #776"));
+                if refusal.is_none() {
+                    refusal = Some(PlacementError::Inventory("all-local GLM candidate requires a one-wave deployment; shared shape transition pending #776"));
+                }
                 continue;
             }
             branch.spark_ranks = 0;

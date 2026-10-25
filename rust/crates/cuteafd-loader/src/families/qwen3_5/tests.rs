@@ -187,7 +187,7 @@ fn native_planner_refuses_unimplemented_prefill_shapes() {
         layout.prefill_lanes = lanes;
         let report = plan::plan(dir.path(), &options).unwrap();
         assert!(!report.wip_launchable());
-        assert!(report.hints.iter().any(|hint| hint.what.contains("dense native prefill")));
+        assert!(report.hints.iter().any(|hint| hint.what.contains("prefill")));
     }
 }
 

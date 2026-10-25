@@ -262,10 +262,10 @@ pub(super) mod tests {
 
     #[test]
     fn final_planes_charge_both_bf16_boundaries_logits_and_head_workspace() {
-        for rows in [1, 64, 640, 4096] {
+        for rows in [1, 64, 640, 4096, 8192, 8256] {
             let planes = HeadPlan::plane_bytes(rows).unwrap();
             assert_eq!(planes, [rows * H * 2, rows * H * 2, rows * V * 4, 4 << 20]);
         }
-        for rows in [0, 4097, usize::MAX] { assert!(HeadPlan::plane_bytes(rows).is_err()); }
+        for rows in [0, 8257, usize::MAX] { assert!(HeadPlan::plane_bytes(rows).is_err()); }
     }
 }
