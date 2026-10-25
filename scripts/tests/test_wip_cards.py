@@ -1002,6 +1002,23 @@ def test_release_arm_uses_same_launcher_without_wip(entry, tmp_path, monkeypatch
         assert saved['artifacts']['raptor']['image_id'] == 'sha256:abc'
 
 
+@pytest.mark.parametrize('dense', [False, True])
+def test_release_arm_worker_image_only_for_spark_entries(entry, tmp_path, dense):
+    if dense:
+        entry = dict(entry, name='dense-min', family='qwen3_5', sparks=[],
+                     set={'SPARK_COUNT': '0', 'ADDR': '0.0.0.0:8501'})
+    arm = cards.arms_from([], ['release=r:v2.0.0'])['release']
+    job = cards.generate(entry, 'release', arm, tmp_path, tmp_path / 'key', {}, set(), None, 1)
+    values = job['entry']['set']
+    assert job['entry']['run_args'] == []
+    assert values['COORDINATOR_DOCKER_INFERENCE'] == 'ghcr.io/tpurtell/cuteafd-coordinator:v2.0.0'
+    assert ('SPARK_EXPERT_DOCKER_INFERENCE' in values) == (not dense)
+    if not dense:
+        assert values['SPARK_EXPERT_DOCKER_INFERENCE'] == 'ghcr.io/tpurtell/cuteafd-spark-expert:v2.0.0'
+    else:
+        assert 'EXPERT_PORT' not in values
+
+
 def test_release_arm_validation_and_cleanup(entry, tmp_path, monkeypatch):
     with pytest.raises(ValueError, match='unique'):
         cards.arms_from(['base=b:s'], ['base=r:v2.0.0'])

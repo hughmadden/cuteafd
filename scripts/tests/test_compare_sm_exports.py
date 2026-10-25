@@ -477,7 +477,11 @@ def test_gate_options_match_real_package(tmp_path, monkeypatch, geometry, compac
         assert options.pop("compile_only") is True
         assert options == expected[(values[0].parent.name, values[3])]
     if compact:
-        assert not any(options.get("warp_specialized") for _, options in recorded)
+        # Qwen4 compact now carries measured warp-specialized cells at the
+        # served capacities and keeps the cooperative kernel at decode ones;
+        # the gate must reproduce both streams.
+        assert any(options.get("warp_specialized") for _, options in recorded)
+        assert any(not options.get("warp_specialized") for _, options in recorded)
         assert any(options.get("decode_schedule") == package.PURE_EVICT_FIRST for _, options in recorded)
     else:
         assert any(options.get("warp_specialized") for _, options in recorded) == (
@@ -499,6 +503,67 @@ def test_exl3_routes_gate_covers_all_coordinator_route_blocks(tmp_path, monkeypa
         compare_sm.export_exl3_routes(["--geometry", geometry, "--capacities", "80,256,1024"],
                                       tmp_path / geometry)
         assert recorded == expected
+
+
+# Measured quant of each family's coordinator warp-specialized exports: another
+# tier pair of the same geometry is a different kernel cost and stays
+# cooperative until it is measured (`WS_TIER_PAIRS`).
+COORDINATOR_TIERS = {"glm": (4, 5), "glmf": (3, 4), "qwen4": (4, 5), "v41": (3, 4),
+                     "dsv4p": (2, 3), "kimik3": (2, 3)}
+CELL_OPTIONS = {"route_block", "wire", "stages", "dynamic", "tile"}
+
+
+def coordinator_package():
+    return compare_sm.load_file("test_coordinator_package",
+                                ROOT / "python/tools/aot/package_exl3_aot.py")
+
+
+def test_coordinator_ws_cells_are_exportable():
+    package = coordinator_package()
+    assert package.COORDINATOR_WS_CELLS
+    for (geometry, width, capacity), cell in package.COORDINATOR_WS_CELLS.items():
+        assert set(cell) <= CELL_OPTIONS and "route_block" in cell
+        # Without the measured tiers the exporter would skip the cell silently.
+        assert (geometry, COORDINATOR_TIERS[geometry]) in package.WS_TIER_PAIRS
+        # A cell no shipped coordinator profile or capacity can name never runs.
+        assert width in {profile[1] for profile in package.profiles_for_role("coordinator", geometry)}
+        assert capacity in package.package_capacities(geometry, str(capacity))
+
+
+def test_coordinator_ws_options_follow_the_measured_cell():
+    package = coordinator_package()
+    for (geometry, width, capacity), cell in package.COORDINATOR_WS_CELLS.items():
+        role = "coordinator"
+        assert package.warp_specialized(geometry, role, width, capacity)
+        assert package.ws_route_block(geometry, role, width, capacity) == cell["route_block"]
+        assert package.wire_input(geometry, role, width, capacity) == bool(cell.get("wire"))
+        assert package.ws_input_stages(geometry, role, width, capacity) == cell.get("stages")
+        assert package.ws_dynamic_tiles(geometry, role, width, capacity) == bool(cell.get("dynamic"))
+        assert package.ws_tile(geometry, role, width, capacity) == cell.get("tile")
+
+
+def test_coordinator_ws_policy_is_table_driven():
+    package = coordinator_package()
+    capacities = (1, 80, 256, 1024, 2752, 4096)
+    for geometry in COORDINATOR_TIERS:
+        for _, width, *_ in package.profiles_for_role("coordinator", geometry):
+            for capacity in capacities:
+                assert package.warp_specialized(geometry, "coordinator", width, capacity) == (
+                    (geometry, width, capacity) in package.COORDINATOR_WS_CELLS)
+
+
+def test_coordinator_unmeasured_tier_pair_exports_cooperative(tmp_path):
+    fixture = compare_sm.load_file(
+        "gate_package_fixture", ROOT / "python/tests/test_package_v41_exl3_profiles.py")
+    # GLM 5.3's coordinator cells are measured on K4/K5; the same width and
+    # capacity on K3 tiers is a different kernel cost and stays cooperative.
+    build_root = tmp_path / "build-fixture"
+    build_root.mkdir()
+    _, _, calls, _ = fixture.PackageProfileTests().build_fixture(
+        build_root, "coordinator", (3, 4), geometry="glm", capacities=(1024,),
+        profiles=("rtx-tp2",))
+    assert calls
+    assert not any(call.kwargs.get("warp_specialized") for call in calls)
 
 
 def residency_gate(name="validate_table_residency"):
