@@ -255,6 +255,12 @@ pub(crate) fn run_plan(mut args: PlanArgs) -> Result<()> {
                 "Kimi MLA speculation requires --speculator dflash2 --drafter-snapshot SNAPSHOT");
             layout.kimi_drafter_snapshot = args.drafter_snapshot.clone();
         }
+        if family == "minimax_m3" && args.speculator == "dflash2" {
+            anyhow::ensure!(args.drafter_snapshot.is_some(),
+                "MiniMax DFlash2 speculation requires --drafter-snapshot SNAPSHOT");
+            layout.minimax_drafter_snapshot = args.drafter_snapshot.clone();
+            layout.minimax_draft_bf16 = args.minimax_draft_bf16;
+        }
         let config = std::fs::File::open(snapshot.join("config.json")).ok()
             .and_then(|file| serde_json::from_reader::<_, serde_json::Value>(file).ok());
         let v41 = config.as_ref().is_some_and(|value| {
@@ -435,13 +441,14 @@ fn resolve_speculator(args: &mut PlanArgs, snapshot: &std::path::Path, family: &
         anyhow::ensure!(args.drafter_snapshot.is_none() && args.role.as_deref() != Some("drafter"), "--no-speculator conflicts with drafter inputs/role");
         args.speculator = "off".into();
     } else if (args.include_speculator || args.drafter_snapshot.is_some()) && args.speculator == "off" {
-        args.speculator = if family == "kimi_k3" && args.drafter_snapshot.is_some() { "dflash2".into() } else { default.into() };
+        args.speculator = if matches!(family, "kimi_k3" | "minimax_m3") && args.drafter_snapshot.is_some() { "dflash2".into() }
+            else { default.into() };
         anyhow::ensure!(args.speculator != "off", "this family has no default speculator");
     }
     let enabled = match (family, args.speculator.as_str()) {
         (_, "off") | ("kimi_k3", "dflash2") | ("glm5", "dflash2") | ("glm5_flash", "dflash2" | "dspark")
         | ("mimo_v2", "dflash2" | "mtp") | ("qwen4" | "step5", "mtp")
-        | ("deepseek_v4" | "deepseek_v41" | "minimax_m3", "dspark") => true,
+        | ("deepseek_v4" | "deepseek_v41" | "minimax_m3", "dspark") | ("minimax_m3", "dflash2") => true,
         _ => false,
     };
     anyhow::ensure!(enabled, "SPECULATOR={} does not apply to {family}", args.speculator);
@@ -481,6 +488,7 @@ fn file_args(mut args: PlanArgs, snapshot: &std::path::Path) -> Result<PlanArgs>
                 ("glm5", "dflash2") => Some("incoai/GLM-5.3-DFlash2"),
                 ("glm5_flash", "dflash2") => Some("incoai/GLM-5.3-Flash-DFlash2"),
                 ("glm5_flash", "dspark") => Some("RedHatAI/GLM-5.3-Flash-speculator.dspark-preview"),
+                ("minimax_m3", "dflash2") => Some("RadixArk/Minimax-M3.1-Flash-Dflash2"),
                 _ => None,
             });
         if let Some(model) = model {
@@ -847,7 +855,7 @@ mod tests {
             mimo_decode_graphs: false,
             physical_sms: None,
             mimo_draft_bf16: false,
-            glm5_draft_bf16: false,
+            glm5_draft_bf16: false, minimax_draft_bf16: false,
             mimo_expert_manifest: None,
             prefix_marks: crate::families::glm5_flash::prefix::PrefixMarks::Arena,
             native_mtp_layers: 3,

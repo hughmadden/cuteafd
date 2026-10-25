@@ -1,6 +1,7 @@
 //! The native serving allocation ledger, from the image's own program metadata.
 use super::{admission, Model};
-use crate::families::minimax_m3::dspark::{DraftMemory, DsparkContract};
+use crate::families::glm5::draft_representation::GlmDraftRepresentation;
+use crate::families::minimax_m3::{dflash::DflashMemory, dspark::{DraftMemory, DsparkContract}};
 use crate::placement::{ArchContext, AttentionPlacement};
 use crate::plan::{Component, ExpertPlacement, MediaMode, PlanReport};
 use crate::plan::encoder::{encoder_placement, EncoderGpuBudget, EncoderHardware, EncoderKind, EncoderSparkBudget};
@@ -18,7 +19,8 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
     use admission::{AdmissionError, RuntimeSizing};
     ensure!(model.complete, "MiniMax native admission requires complete checkpoint headers");
     ensure!(opts.rtx_bytes.len() == 1, AdmissionError::Unsupported("two-GPU serving"));
-    ensure!(opts.drafter_bytes == 0, AdmissionError::Unsupported("external drafter; use the bundled DSpark"));
+    ensure!(opts.drafter_bytes == 0,
+        AdmissionError::Unsupported("an external drafter by size; use the bundled DSpark or a DFlash2 snapshot"));
     ensure!(report.requested_attention.is_none_or(|p| p == AttentionPlacement::Heads), AdmissionError::Unsupported("attention placement"));
     ensure!(report.audio == MediaMode::Off, AdmissionError::Unsupported("audio"));
     let cfg = model.cfg();
@@ -36,6 +38,15 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
         let contract = DsparkContract::open(&input.checkpoint().snapshot).context("MiniMax bundled DSpark")?;
         Some(DraftMemory::new(&contract, rings, chunk, opts.physical_sms.unwrap_or(arch.sms) as usize)?)
     } else { None };
+    // A DFlash2 checkpoint on the shared drafter, sized by serve-minimax's own recipe.
+    let dflash = opts.minimax_drafter_snapshot.as_ref().map(|snapshot| -> anyhow::Result<_> {
+        ensure!(draft.is_none(), AdmissionError::Unsupported("the bundled DSpark beside a DFlash2 drafter"));
+        let config = crate::plan::checkpoint::read_json(&snapshot.join("config.json")).context("MiniMax DFlash2 drafter")?;
+        DflashMemory::new(&config, rings, opts.physical_sms.unwrap_or(arch.sms) as u64,
+            if opts.minimax_draft_bf16 { GlmDraftRepresentation::Bf16Only } else { GlmDraftRepresentation::Fp8Only },
+            opts.draft_kv_cache)
+    }).transpose()?;
+    // DFlash2 projects its drafts through its own logits; DSpark through the target's.
     let draft_rows = draft.as_ref().map_or(0, |d| d.sequences * 7);
     let sizing = RuntimeSizing { rows, decode_rows: rows.min(64), sequences, context: if opts.context_tokens == 0 {
         cfg.max_position as u64 } else { opts.context_tokens }, spark_ranks: requested.spark_ranks(),
@@ -70,8 +81,9 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
     let mut recipe = admission::Recipe::new(cfg, input.checkpoint(), catalog, &manifest, package.as_ref(), admission::Request {
         sizing, kv_format: opts.minimax_kv, local_layers, spark_budget: budget,
         spark_vision_bytes: if matches!(report.vision, MediaMode::Spark(_)) { vision_weights + vision_scratch + GIB } else { 0 },
-        headroom: opts.headroom_bytes, draft_bytes: draft.as_ref().map_or(0, |d| d.bytes),
-        draft_rings: draft.as_ref().map_or(0, |d| d.slots), host_embedding: opts.host_embedding, startup_graphs: true,
+        headroom: opts.headroom_bytes, draft_bytes: draft.as_ref().map(|d| d.bytes).or(dflash.map(|d| d.bytes)).unwrap_or(0),
+        draft_rings: draft.as_ref().map(|d| d.slots).or(dflash.map(|d| d.slots)).unwrap_or(0),
+        draft_staging: dflash.map_or(0, |d| d.staging), host_embedding: opts.host_embedding, startup_graphs: true,
         rings: cuteafd_core::SparkRings { max_frame_bytes: ring.max_frame_bytes, depth: ring.depth,
             slot_bytes: ring.slot_bytes, alignment: ring.alignment } })?;
     let local = recipe.onboarding.local_bytes;
@@ -110,6 +122,14 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
         for (&name, &bytes) in &draft.buffers { items.push(Item::new(Category::Drafter,
             format!("MiniMax DSpark {name}"), "native allocation", bytes as u64, Basis::Exact)); }
     }
+    if let Some(dflash) = &dflash {
+        let format = if opts.minimax_draft_bf16 { "BF16" } else { "E4M3 GEMMs + BF16" };
+        items.push(Item::new(Category::Drafter, "MiniMax DFlash2 weights", format, dflash.weights_bytes, Basis::Exact));
+        items.push(Item::new(Category::Drafter, "MiniMax DFlash2 context rings", format!("{} K/V", opts.draft_kv_cache),
+            dflash.ring_bytes, Basis::Exact));
+        items.push(Item::new(Category::Drafter, "MiniMax DFlash2 taps, context and step buffers", "shared drafter",
+            dflash.bytes - dflash.weights_bytes - dflash.ring_bytes, Basis::Formula));
+    }
     if local > 0 {
         items.push(Item::new(Category::Experts, "onboarded bottom routed layers TP1", "NVFP4 W4A4", local, Basis::Exact));
         items.push(Item::new(Category::Workspace, "local expert package scratch", "exported capacity",
@@ -126,13 +146,15 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
         capacity_bytes: opts.rtx_bytes[0], items, kv_tokens: admitted.pool_tokens }], pool_tokens: admitted.pool_tokens,
         waste: vec![], notes: vec![format!("MiniMax coordinator native allocation ledger; {} decode steps recorded at startup \
             (rows 1..={}, estimated {} MiB each); speculation {}", graphs.keys.len(), graphs.keys.len(),
-            admission::DECODE_GRAPH_BYTES >> 20, if draft.is_some() { "bundled DSpark" } else { "off" }),
+            admission::DECODE_GRAPH_BYTES >> 20,
+            if draft.is_some() { "bundled DSpark" } else if dflash.is_some() { "DFlash2 (shared drafter)" } else { "off" }),
             "Offline CUDA/code baselines remain estimates; serving re-admits measured free memory before allocation".into(),
             format!("{onboarded} routed layers on the RTX ({:.1} GiB), {} on {} Sparks", local as f64 / GIB as f64,
                 recipe.onboarding.spark_layers.len(), sizing.spark_ranks)] };
     report.bytes_by_owner.clear();
     report.bytes_by_owner.insert("coordinator text weights".into(), weights.resident_bytes);
     if let Some(draft) = &draft { report.bytes_by_owner.insert("bundled DSpark weights".into(), draft.weights_bytes); }
+    if let Some(dflash) = &dflash { report.bytes_by_owner.insert("DFlash2 drafter weights".into(), dflash.weights_bytes); }
     report.bytes_by_owner.insert("local routed expert weights".into(), local);
     let slicing = crate::plan::experts::checkpoint_spark_recipe(input.checkpoint(), sizing.spark_ranks,
         &recipe.onboarding.spark_layers)?.slicing;

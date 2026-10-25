@@ -58,6 +58,28 @@ pub(crate) struct GoldenArgs {
     /// Read and validate checkpoint headers without loading a native library.
     #[arg(long)]
     check_headers: bool,
+    /// A DFlash2 drafter snapshot to run alone on one --window's golden taps (its layerNN.bin
+    /// for the drafter's target layers: golden.py --layers 3 17 31 45 59), with the target's
+    /// embedding and head on --device and no target layers or peers: --draft-replay or --draft-oracle.
+    #[arg(long)]
+    draft: Option<PathBuf>,
+    /// With --draft: draft after every token from this position on (at least the first scored
+    /// position less one) and report acceptance against the text and the reference's greedy picks.
+    #[arg(long, requires = "draft", conflicts_with = "draft_oracle")]
+    draft_replay: Option<usize>,
+    /// With --draft: compare the drafts, selector features and final-norm rows at
+    /// python/reference/families/minimax_m3/dflash2/reference.py's anchors (its output directory).
+    #[arg(long, requires = "draft")]
+    draft_oracle: Option<PathBuf>,
+    /// With --draft: E4M3 drafter GEMMs (unset/true, serving's default) or the checkpoint's BF16.
+    #[arg(long, requires = "draft", action = clap::ArgAction::Set)]
+    draft_fp8: Option<bool>,
+    /// With --draft: its context-ring K/V storage.
+    #[arg(long, default_value = "fp8")]
+    draft_kv_cache: Qwen4KvCache,
+    /// With --draft: block causality overriding the checkpoint's upstream mask (reference.py --causal).
+    #[arg(long, requires = "draft", action = clap::ArgAction::Set)]
+    draft_causal: Option<bool>,
 }
 
 fn selection(args: &GoldenArgs) -> Result<Vec<usize>> {
@@ -428,6 +450,127 @@ fn score_window(runner: &mut Runner<'_, '_>, args: &GoldenArgs, window: &Window,
     Ok(result)
 }
 
+/// BF16 bits of `value`, rounded to nearest even (as the engine's FP32 residual taps round).
+fn bf16_bits(value: f32) -> u16 {
+    let bits = value.to_bits();
+    (bits.wrapping_add(0x7fff + ((bits >> 16) & 1)) >> 16) as u16
+}
+
+fn bf16_values(bytes: &[u8]) -> Vec<f32> {
+    bytes.chunks_exact(2).map(|b| f32::from_bits(u32::from(u16::from_le_bytes([b[0], b[1]])) << 16)).collect()
+}
+
+/// `--draft`: the DFlash2 drafter alone on one window's golden taps, through serving's own
+/// drafter load, with the target's embedding table and BF16 head resident on `--device`.
+fn draft_diagnostics(args: &GoldenArgs, cfg: &MiniMaxM3Config, checkpoint: &Checkpoint, draft: &Path) -> Result<()> {
+    use crate::shared::{memory::device::{Device, Stream}, speculation::dflash::{self, ContextRow, DraftSeq, TargetHead},
+        token_io::EmbedSource};
+    use std::os::unix::fs::FileExt;
+    ensure!(args.draft_replay.is_some() != args.draft_oracle.is_some(), "--draft runs --draft-replay or --draft-oracle");
+    let (_, windows) = references(args, cfg)?;
+    ensure!(windows.len() == 1, "--draft runs on one --window");
+    let window = &windows[0];
+    let native = args.native_lib.as_ref().context("MiniMax --draft requires --native-lib")?;
+    let library = cuteafd_ffi::minimax::load_library(native)?;
+    library.cuda_set_device(args.device)?;
+    let device = Device { library: &library, id: args.device };
+    let tensor = |name: &str| checkpoint.tensors.iter().find(|t| t.meta.name == name)
+        .with_context(|| format!("MiniMax {name} header missing"));
+    let (embed, head_tensor) = (tensor(super::weights::EMBEDDING)?, tensor("language_model.lm_head.weight")?);
+    dflash::check_target_head_source(&head_tensor.meta, cfg.hidden, cfg.vocab_size)?;
+    let contract = super::dflash::Contract::open(draft, args.draft_fp8, args.draft_kv_cache, 8, library.sm_count()?,
+        args.draft_causal)?;
+    let file = dflash::prefetch(draft);
+    let stream = Stream::new(device)?;
+    let (embedding, ()) = TokenEmbedding::load(&library, EmbedSource::new(&args.snapshot, &embed.shard, &embed.meta,
+        cfg.hidden)?, EmbedPlacement::Gpu, || Ok(()))?;
+    let head = Allocation::new(device, usize::try_from(head_tensor.meta.byte_length)?)?;
+    let mut bytes = vec![0; head.buffer.bytes];
+    std::fs::File::open(args.snapshot.join(&head_tensor.shard))?.read_exact_at(&mut bytes, head_tensor.meta.byte_offset)?;
+    library.copy_h2d(head.buffer, &bytes)?;
+    drop(bytes);
+    let file = file.join().map_err(|_| anyhow::anyhow!("MiniMax DFlash2 drafter read panicked"))??;
+    let mask_row = embedding.host_rows(&[contract.cfg.mask_token])?;
+    let draft = device.run(|| super::dflash::Dflash::load(&library, stream.raw, &contract, file, mask_row))?;
+    let drafter = draft.drafter();
+    // The golden's FP32 layer outputs, rounded to BF16 as the engine's taps are.
+    let (tokens, hidden) = (&window.tokens, cfg.hidden);
+    let layers = drafter.cfg.taps.iter().map(|&l| std::fs::read(window.directory.join(format!("layer{l:02}.bin"))))
+        .collect::<std::io::Result<Vec<_>>>().context("--draft needs the window's layerNN.bin of every tapped layer")?;
+    ensure!(layers.iter().all(|l| l.len() == tokens.len() * hidden * 4), "golden tap layers differ from the window");
+    let taps = |first: usize, n: usize| -> Result<Vec<u8>> {
+        let mut out = Vec::with_capacity(n * layers.len() * hidden * 2);
+        for row in first..first + n {
+            for layer in &layers {
+                for value in layer[row * hidden * 4..(row + 1) * hidden * 4].chunks_exact(4) {
+                    out.extend_from_slice(&bf16_bits(f32::from_le_bytes(value.try_into().unwrap())).to_le_bytes());
+                }
+            }
+        }
+        Ok(out)
+    };
+    device.run(|| {
+        if let Some(start) = args.draft_replay {
+            // Row i of the reference's logits predicts token positions[i]: the greedy pick after positions[i] - 1.
+            let logits = std::fs::read(window.directory.join("logits.bin"))?;
+            let mut greedy = vec![u32::MAX; tokens.len()];
+            for (row, &position) in logits.chunks_exact(cfg.vocab_size * 4).zip(&window.positions) {
+                let values = floats(row, cfg.vocab_size)?;
+                greedy[position - 1] = values.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1).then_with(|| b.0.cmp(&a.0)))
+                    .map(|(index, _)| index as u32).unwrap();
+            }
+            ensure!(start + 1 >= window.positions[0], "--draft-replay starts at or after the first scored position less one");
+            return dflash::replay(drafter, tokens, &greedy, &taps, &|t| embedding.host_rows(t), head.buffer.ptr, start);
+        }
+        let dir = args.draft_oracle.as_ref().context("--draft-oracle directory")?;
+        let meta = read_json(&dir.join("meta.json"))?;
+        let positions = meta["positions"].as_array().context("oracle positions")?.iter()
+            .map(|p| p.as_u64().map(|p| p as usize).context("oracle position")).collect::<Result<Vec<_>>>()?;
+        let words = |name: &str| -> Result<Vec<u32>> {
+            Ok(std::fs::read(dir.join(name))?.chunks_exact(4).map(|b| u32::from_le_bytes(b.try_into().unwrap())).collect())
+        };
+        let (block, drafts) = (drafter.cfg.block, drafter.cfg.drafts());
+        let (ref_tokens, ref_features) = (words("drafts.bin")?, words("features.bin")?);
+        let ref_hidden = bf16_values(&std::fs::read(dir.join("hidden.bin"))?);
+        ensure!(ref_tokens.len() == positions.len() * drafts && ref_features.len() == positions.len() * drafts * 4
+            && ref_hidden.len() == positions.len() * block * hidden, "oracle outputs differ from its anchors");
+        let (mut done, mut exact, mut first, mut matched, mut worst, mut margin) = (0usize, 0, 0, 0, 1f64, 0f64);
+        let mut seconds = 0f64;
+        for (index, &position) in positions.iter().enumerate() {
+            ensure!(position < tokens.len(), "oracle anchor outside the window");
+            // Context rows done..position through the tap buffer, as the replay feeds it.
+            while done < position {
+                let n = (position - done).min(drafter.cfg.tap_rows());
+                drafter.put_taps(&taps(done, n)?)?;
+                drafter.update(&(0..n).map(|r| ContextRow { tap_row: r, slot: 0, position: done + r }).collect::<Vec<_>>())?;
+                // SAFETY: the diagnostic owns this stream; the next chunk reuses the taps and metadata.
+                unsafe { library.cuda_stream_synchronize(stream.raw)? };
+                done += n;
+            }
+            let timer = std::time::Instant::now();
+            let result = drafter.draft_device_diagnostic(&[DraftSeq { slot: 0, anchor: tokens[position], position,
+                valid_from: 0 }], &embedding, TargetHead::Bf16Buffer(&head.buffer))?.remove(0);
+            seconds += timer.elapsed().as_secs_f64();
+            let reference = &ref_tokens[index * drafts..][..drafts];
+            exact += usize::from(result.tokens == reference);
+            first += usize::from(result.tokens[0] == reference[0]);
+            matched += result.tokens.iter().zip(reference).take_while(|(a, b)| a == b).count();
+            let (cosine, _) = crate::shared::golden_scores::hidden_metrics(&bf16_values(&drafter.last_hidden(1)?),
+                &ref_hidden[index * block * hidden..][..block * hidden])?;
+            worst = worst.min(cosine);
+            if result.tokens[0] == reference[0] {
+                margin = margin.max(f64::from((result.features[0][0] - f32::from_bits(ref_features[index * drafts * 4])).abs()));
+            }
+            if result.tokens != reference { println!("position {position}: engine {:?} reference {reference:?}", result.tokens); }
+        }
+        let n = positions.len();
+        println!("MiniMax DFlash2 oracle: {n} anchors, identical drafts {exact}/{n}, first draft {first}/{n}, matching \
+            prefix {:.2} of {drafts}, worst final-norm cosine {worst:.6}, first-margin max error {margin:.4}, {:.2} ms/draft",
+            matched as f64 / n as f64, seconds * 1e3 / n as f64);
+        Ok(())
+    })
+}
+
 pub(crate) async fn run_golden(args: GoldenArgs) -> Result<()> {
     let checkpoint = Checkpoint::coordinator(&args.snapshot, false, false)?;
     let cfg = MiniMaxM3Config::from_hf(&checkpoint.config)?;
@@ -438,6 +581,7 @@ pub(crate) async fn run_golden(args: GoldenArgs) -> Result<()> {
         println!("MiniMax golden checkpoint headers passed: {} layers, native MXFP8/NVFP4", cfg.layers);
         return Ok(());
     }
+    if let Some(draft) = &args.draft { return draft_diagnostics(&args, &cfg, &checkpoint, draft); }
     let remote = selection(&args)?;
     if std::env::var_os("CUTEAFD_MINIMAX_DUMP_DIR").is_some() {
         ensure!(args.window.is_some() && !args.check_prefix,
@@ -476,7 +620,7 @@ pub(crate) async fn run_golden(args: GoldenArgs) -> Result<()> {
     let admitted = super::admission::solve(&checkpoint, &read_json(&args.manifest)?, local_package.as_ref(), admission::Request {
         sizing, kv_format: Qwen4KvCache::Fp8, local_layers: admission::LocalLayers::Exactly {
             local: args.expert_layers.clone(), spark: remote.clone() }, spark_budget: u64::MAX, spark_vision_bytes: 0,
-        headroom: 2 << 30, draft_bytes: 0, draft_rings: 0, host_embedding: false, startup_graphs: false,
+        headroom: 2 << 30, draft_bytes: 0, draft_rings: 0, draft_staging: 0, host_embedding: false, startup_graphs: false,
         rings: super::admission::spark_rings()? }, available, Some(pool_tokens))?;
     if !remote.is_empty() {
         if let Ok(selected) = std::env::var("CUTEAFD_GOLDEN_EXPERT_LAYERS") {
@@ -544,6 +688,22 @@ mod tests {
         assert_eq!(args.prefill_rows, 64); assert_eq!(args.score_shape, ScoreShape::Prefill);
         assert!(args.resume && args.check_prefix); assert!(selection(&args)?.is_empty());
         Ok(())
+    }
+
+    #[test]
+    fn minimax_golden_runs_dflash2_diagnostics_only_with_a_drafter() {
+        let replay = args(&["--draft", "/draft", "--draft-replay", "64", "--draft-fp8", "false", "--draft-kv-cache", "bf16"]);
+        assert_eq!((replay.draft_replay, replay.draft_fp8, replay.draft_kv_cache), (Some(64), Some(false), Qwen4KvCache::Bf16));
+        let oracle = args(&["--draft", "/draft", "--draft-oracle", "/oracle"]);
+        assert_eq!((oracle.draft_oracle.as_deref(), oracle.draft_fp8), (Some(Path::new("/oracle")), None));
+        assert_eq!(oracle.draft_kv_cache, Qwen4KvCache::Fp8);
+        for extra in [&["--draft-replay", "64"][..], &["--draft-oracle", "/oracle"],
+            &["--draft", "/draft", "--draft-replay", "64", "--draft-oracle", "/oracle"]] {
+            assert!(crate::cli::Cli::try_parse_from(["cuteafd", "minimax-golden", "--snapshot", "/snapshot"]
+                .into_iter().chain(extra.iter().copied())).is_err(), "{extra:?}");
+        }
+        assert_eq!((bf16_bits(1.0), bf16_bits(1.0 + 1.0 / 256.0), bf16_bits(1.0 + 3.0 / 256.0)), (0x3f80, 0x3f80, 0x3f82));
+        assert_eq!(bf16_values(&bf16_bits(-2.5).to_le_bytes()), [-2.5]);
     }
 
     #[test]

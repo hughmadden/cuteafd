@@ -228,8 +228,8 @@ impl<'e, 'a> Backend<'a> for MiniMaxBackend<'e, 'a> {
         // Without a ring the request never drafts: its state stays not ready.
         let Some(ring)=self.rings.borrow().of(p.sequence) else { return Ok(()) };
         let mut next_state=state.clone(); next_state.advance(start,chunk.len(),next)?;
-        let rows=(0..chunk.len()).map(|tap_row|crate::shared::speculation::dflash::ContextRow {
-            tap_row,slot:ring,position:start+tap_row }).collect::<Vec<_>>();
+        // DSpark keeps every chunk row; DFlash2 the chunk's tail that fills its ring.
+        let rows=self.execution.draft()?.prefill_rows(start,chunk.len(),ring);
         self.execution.update_draft(&rows)?;
         *state=next_state; Ok(())
     }
@@ -246,10 +246,10 @@ impl<'e, 'a> Backend<'a> for MiniMaxBackend<'e, 'a> {
                     position:s.placement.committed,valid_from:s.seq.valid_from,
                     anchor:s.seq.anchor.context("MiniMax draft anchor missing")?}))
             }).collect::<Result<Vec<_>>>()?;
-        for batch in selected.chunks(draft.layout.sequences) {
-            // The block always executes seven rows; near the RoPE limit use
+        for batch in selected.chunks(draft.sequences()) {
+            // The block always executes its rows (DSpark 7, DFlash2 8); near the RoPE limit use
             // target-only verification rather than inventing future positions.
-            let batch=batch.iter().filter(|(_,s)|s.position+7<=self.cache.context).copied().collect::<Vec<_>>();
+            let batch=batch.iter().filter(|(_,s)|s.position+draft.block()<=self.cache.context).copied().collect::<Vec<_>>();
             if batch.is_empty() {continue;}
             let proposals=self.execution.propose(&batch.iter().map(|(_,s)|*s).collect::<Vec<_>>(),self.embedding)?;
             ensure!(proposals.len()==batch.len(),MiniMaxError::Invalid("draft output count"));
@@ -261,7 +261,10 @@ impl<'e, 'a> Backend<'a> for MiniMaxBackend<'e, 'a> {
         }
         timing.seconds+=started.elapsed().as_secs_f64(); Ok(output)
     }
-    fn draft_confidence<'s>(&self, state: &'s State) -> Option<&'s [f32]> { Some(&state.confidence) }
+    fn draft_confidence<'s>(&self, state: &'s State) -> Option<&'s [f32]> {
+        // Only DSpark's confidence head predicts acceptance; DFlash2 drafts take the shared priors.
+        self.execution.draft().is_ok_and(|draft| draft.confidence()).then_some(&state.confidence[..])
+    }
     fn accept(&self, verified: &mut [scheduler::Verified<'_, Placement, State, ()>], _: bool) -> Result<()> {
         let step = self.pending.borrow_mut().take().context("MiniMax accept has no completed wave")?;
         accept_step(step, verified)?;

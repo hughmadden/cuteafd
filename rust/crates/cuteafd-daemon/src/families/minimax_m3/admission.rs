@@ -138,7 +138,7 @@ mod tests {
                 lanes: cuteafd_loader::serving_capacity::prefill_lanes::DEFAULT_PREFILL_LANES, host_landing: false },
             kv_format: Qwen4KvCache::Fp8, local_layers: LocalLayers::Fewest,
             spark_budget: cuteafd_loader::plan::families::minimax::admission::SPARK_BUDGET_BYTES, spark_vision_bytes: 0,
-            headroom: 0, draft_bytes: 0, draft_rings: 0, host_embedding, startup_graphs: true, rings: spark_rings()?,
+            headroom: 0, draft_bytes: 0, draft_rings: 0, draft_staging: 0, host_embedding, startup_graphs: true, rings: spark_rings()?,
         };
         let available = options.rtx_bytes[0] - measured_baseline;
         let mut live = solve(&checkpoint, &programs, Some(&package), request.clone(), available, Some(4096))?;

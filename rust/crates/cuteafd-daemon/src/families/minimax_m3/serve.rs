@@ -37,10 +37,26 @@ pub(crate) struct ServeArgs {
     prefill_rows: u32,
     #[arg(long, default_value = "auto")]
     rtx_expert_layers: String,
-    #[arg(long, default_value = "dspark", value_parser = ["dspark", "off"])]
+    /// The bundled DSpark (`dspark/`), a DFlash2 checkpoint (`dflash2`, with --draft) on the
+    /// shared drafter, or none.
+    #[arg(long, default_value = "dspark", value_parser = ["dspark", "dflash2", "off"])]
     speculator: String,
-    /// Fixed DSpark draft depth (launcher SPECULATOR_DRAFTS); absent lets the
-    /// shared policy choose up to the drafter's block of seven, as on Kimi K3.
+    /// The DFlash2 drafter snapshot (RadixArk/Minimax-M3.1-Flash-Dflash2) for --speculator dflash2.
+    #[arg(long)]
+    draft: Option<PathBuf>,
+    /// DFlash2: explicit calibration-free E4M3 quantization of the drafter's GEMMs at load.
+    /// Unset/true: one FP8 copy (the shared drafter's default); false keeps the checkpoint's BF16.
+    #[arg(long, action = clap::ArgAction::Set)]
+    draft_fp8: Option<bool>,
+    /// DFlash2 context-ring K/V storage.
+    #[arg(long, default_value = "fp8")]
+    draft_kv_cache: Qwen4KvCache,
+    /// DFlash2 block causality, overriding SGLang's mask for the checkpoint (causal rows for its
+    /// sliding-window layers): an acceptance A/B; verification keeps the output unchanged.
+    #[arg(long, hide = true, action = clap::ArgAction::Set)]
+    draft_causal: Option<bool>,
+    /// Fixed draft depth (launcher SPECULATOR_DRAFTS); absent lets the
+    /// shared policy choose up to the drafter's seven drafts, as on Kimi K3.
     #[arg(long, value_parser = clap::value_parser!(u8).range(1..=7))]
     draft_fixed: Option<u8>,
     #[arg(long, default_value = "0.0.0.0:8000")]
@@ -61,8 +77,8 @@ pub(crate) struct ServeArgs {
     /// otherwise prefill projects only the rows a request needs.
     #[arg(long)]
     full_prefill_logits: bool,
-    /// DSpark context rings (default: max sequences, at most 8). A request
-    /// admitted while every ring is taken decodes target-only.
+    /// Drafter context rings (default: max sequences, at most 8; DFlash2 drafts as many
+    /// sequences per step, at most 32). A request admitted while every ring is taken decodes target-only.
     #[arg(long)]
     draft_context_slots: Option<usize>,
     /// GPU memory (GiB) kept free for runtime growth, as the planner's --headroom-gib.
@@ -94,8 +110,13 @@ impl ServeArgs {
             return Err(MiniMaxError::Invalid("one coordinator and distinct TP2/TP3/TP4 peers required").into());
         }
         if self.kv_cache != Qwen4KvCache::Fp8 { return Err(MiniMaxError::Unsupported("BF16 KV has no exported MiniMax kernel").into()); }
-        if !matches!(self.speculator.as_str(),"off"|"dspark") { return Err(MiniMaxError::Unsupported("speculator must be dspark or off").into()); }
+        if !matches!(self.speculator.as_str(),"off"|"dspark"|"dflash2") {
+            return Err(MiniMaxError::Unsupported("speculator must be dspark, dflash2 or off").into());
+        }
         if self.speculator=="dspark" && self.prefill_rows<7 {return Err(MiniMaxError::Invalid("DSpark needs at least seven scratch rows").into());}
+        if (self.speculator=="dflash2") != self.draft.is_some() {
+            return Err(MiniMaxError::Invalid("--speculator dflash2 takes its drafter snapshot with --draft, and only it does").into());
+        }
         if matches!(std::env::var("CUTEAFD_SPARK_WRITE").as_deref(), Ok("1" | "on")) {
             return Err(MiniMaxError::Unsupported("Spark write mode has no MiniMax allocation ledger").into());
         }
@@ -150,7 +171,14 @@ pub(super) struct Start<'s> {
     pub embed: EmbedPlacement,
     /// Free coordinator bytes measured before the weights load.
     pub available: u64,
-    pub draft: Option<(&'s cuteafd_loader::families::minimax_m3::dspark::DsparkContract, super::dspark::Layout)>,
+    pub draft: Option<DraftStart<'s>>,
+}
+
+/// The drafter serve admitted, loaded by [`start`].
+pub(super) enum DraftStart<'s> {
+    Dspark(&'s cuteafd_loader::families::minimax_m3::dspark::DsparkContract, super::dspark::Layout),
+    /// A DFlash2 checkpoint and its file read, started while admission and the target load run.
+    Dflash(&'s super::dflash::Contract, std::thread::JoinHandle<std::io::Result<Vec<u8>>>),
 }
 
 /// The loaded coordinator that serve and golden drive.
@@ -188,10 +216,15 @@ pub(super) fn start<'a>(library: &'a cuteafd_ffi::NativeLibrary, device: i32,
     let tensor = checkpoint.tensors.iter().find(|t| t.meta.name == super::weights::EMBEDDING)
         .context("MiniMax embedding header missing")?;
     let source = EmbedSource::new(snapshot, &tensor.shard, &tensor.meta, cfg.hidden)?;
-    let (embedding, (execution, local)) = crate::shared::placement::load_while_admitting(pending, || {
+    let (dspark, dflash) = match draft {
+        Some(DraftStart::Dspark(contract, layout)) => (Some((contract, layout)), None),
+        Some(DraftStart::Dflash(contract, file)) => (None, Some((contract, file))),
+        None => (None, None),
+    };
+    let (embedding, (mut execution, local)) = crate::shared::placement::load_while_admitting(pending, || {
         TokenEmbedding::load(library, source, embed, || {
             let mut execution = Execution::load(Device { library, id: device }, programs, checkpoint, cfg, ledger, sizing)?;
-            if let Some((contract, layout)) = draft { execution.load_draft(contract, layout)?; }
+            if let Some((contract, layout)) = dspark { execution.load_draft(contract, layout)?; }
             let local = if local_layers.is_empty() {None} else {
                 let tensors = catalog.fp8().context("MiniMax native expert catalog missing")?.for_coordinator();
                 Some(crate::shared::experts::fp8::Fp8Experts::load(library, &tensors, package,
@@ -200,6 +233,12 @@ pub(super) fn start<'a>(library: &'a cuteafd_ffi::NativeLibrary, device: i32,
             Ok((execution, local))
         })
     })?;
+    // The DFlash2 drafter loads once the embedding is resident (its mask row), before the pool.
+    if let Some((contract, file)) = dflash {
+        let file = file.join().map_err(|_| anyhow::anyhow!("MiniMax DFlash2 drafter read panicked"))??;
+        let mask_row = embedding.host_rows(&[contract.cfg.mask_token])?;
+        execution.load_dflash(contract, file, mask_row)?;
+    }
     let mut kv = Cache::new(library, device, &cache.cache, cache.pool_pages as usize, sizing.sequences,
         cache.cache_bytes.checked_add(256).context("MiniMax cache reserve overflow")?)?;
     kv.context = kv.context.min(cache.pool_tokens as usize);
@@ -234,7 +273,15 @@ fn worker(args: &ServeArgs, receive: &mut tokio::sync::mpsc::Receiver<cuteafd_ap
     let rings = args.draft_context_slots.unwrap_or_else(|| cuteafd_loader::families::minimax_m3::dspark::default_ring_slots(sequences));
     let draft_contract=if args.speculator=="dspark" {Some(cuteafd_loader::families::minimax_m3::dspark::DsparkContract::open(&args.snapshot)?)} else {None};
     let draft_layout=draft_contract.as_ref().map(|c|super::dspark::Layout::new(&library,c,rings,chunk)).transpose()?;
-    let (draft_bytes,draft_rings)=draft_layout.as_ref().map_or((0,0),|l|(l.bytes,l.slots));
+    let dflash=args.draft.as_deref().map(|snapshot| super::dflash::Contract::open(snapshot, args.draft_fp8,
+        args.draft_kv_cache, rings, library.sm_count()?, args.draft_causal)).transpose()?;
+    // The drafter's 4 GB checkpoint is read while admission and the target load run.
+    let dflash_file=dflash.as_ref().map(|c| crate::shared::speculation::dflash::prefetch(&c.snapshot));
+    let (draft_bytes,draft_rings,draft_staging)=match (&draft_layout,&dflash) {
+        (Some(l),_) => (l.bytes,l.slots,0),
+        (None,Some(c)) => (c.bytes,c.slots,c.staging),
+        (None,None) => (0,0,0),
+    };
     let host_landing = super::routed::host_landing(&library)?;
     let sizing = RuntimeSizing { rows, decode_rows: rows.min(64), sequences,
         context: if args.max_context == 0 {cfg.max_position as u64} else {args.max_context}, spark_ranks: args.peers.len(),
@@ -258,7 +305,8 @@ fn worker(args: &ServeArgs, receive: &mut tokio::sync::mpsc::Receiver<cuteafd_ap
         MediaMode::Off
     } else { args.vision };
     let request = admission::Request { sizing, kv_format: args.kv_cache, local_layers, spark_budget: args.spark_budget_bytes,
-        spark_vision_bytes: 0, headroom, draft_bytes, draft_rings, host_embedding: args.token_io.embed_placement == EmbedPlacement::Host,
+        spark_vision_bytes: 0, headroom, draft_bytes, draft_rings, draft_staging,
+        host_embedding: args.token_io.embed_placement == EmbedPlacement::Host,
         startup_graphs: true, rings: admission::spark_rings()? };
     let text_admission = (auto_local && vision_mode == MediaMode::Auto).then(|| -> Result<_> {
         admission::solve(&checkpoint, &manifest, local_package.as_ref(), request.clone(), available()?, None)
@@ -285,7 +333,11 @@ fn worker(args: &ServeArgs, receive: &mut tokio::sync::mpsc::Receiver<cuteafd_ap
         snapshot: &args.snapshot, checkpoint: &checkpoint, cfg: &cfg, sizing, ledger: &admitted.ledger,
         cache: &admitted.cache, local_layers: &admitted.local_layers, spark_layers: &admitted.spark_layers,
         peers: &args.peers, catalog: &catalog, package: &package, embed: args.token_io.embed_placement, available,
-        draft: draft_contract.as_ref().zip(draft_layout) })?;
+        draft: match (draft_contract.as_ref().zip(draft_layout), dflash.as_ref().zip(dflash_file)) {
+            (Some((contract, layout)), _) => Some(DraftStart::Dspark(contract, layout)),
+            (None, Some((contract, file))) => Some(DraftStart::Dflash(contract, file)),
+            (None, None) => None,
+        } })?;
     let experts = routed.context("MiniMax serving admitted no routed expert owner")?;
     let expander = vision.as_ref().map(|_| cuteafd_loader::media::minimax::span_expander(&args.snapshot, cfg.vocab_size as u32)).transpose()?;
     let backend = MiniMaxBackend { execution: &execution, cache: &cache, embedding: &embedding, token_ids, embedded,
@@ -308,8 +360,9 @@ fn worker(args: &ServeArgs, receive: &mut tokio::sync::mpsc::Receiver<cuteafd_ap
     let mut media = cuteafd_engine::media::MediaAdmission::new(cuteafd_engine::media::EmbeddingCache::new(media_bytes), encoder, 16);
     tracing::info!(pool_tokens=admitted.cache.pool_tokens, context=cache.context, local_layers=?admitted.local_layers,
         lane_rows=sizing.rows, prefill_lanes=lanes, chunk_rows=chunk, logit_rows=sizing.logit_rows, draft_rings,
+        speculator=%args.speculator, draft_bytes,
         "MiniMax native target; decode replays its startup recordings, prefill uses the MSA index-prefill and attention-extend kernels");
-    let drafts=if args.speculator=="dspark" {
+    let drafts=if args.speculator!="off" {
         scheduler::Drafts::Neural {depth:args.draft_fixed.map_or(7,usize::from),fixed:args.draft_fixed.is_some()}
     } else {scheduler::Drafts::None};
     scheduler::schedule(&backend, &args.snapshot, receive, stats, sizing.sequences, drafts,
@@ -352,11 +405,30 @@ mod tests {
         let mut a=args(); a.speculator="mtp".into(); assert!(a.validate().is_err());
         assert_eq!(args().speculator,"dspark");
         let mut a=args(); a.speculator="off".into(); assert!(a.validate().is_ok());
+        // DFlash2 takes its snapshot with --draft, and only DFlash2 does.
+        let mut a=args(); a.speculator="dflash2".into(); assert!(a.validate().is_err());
+        a.draft=Some("/draft".into()); assert!(a.validate().is_ok());
+        a.speculator="dspark".into(); assert!(a.validate().is_err());
+        a.speculator="off".into(); assert!(a.validate().is_err());
+        assert_eq!((args().draft_fp8, args().draft_kv_cache), (None, Qwen4KvCache::Fp8));
         let mut a=args(); a.token_io.embed_placement=EmbedPlacement::Host; assert!(a.validate().is_ok());
         let mut a=args(); a.rtx_expert_layers="58".into(); assert!(a.validate().is_err());
         let mut a=args(); a.rtx_expert_layers="3".into(); assert_eq!(a.validate().unwrap(),Some(3));
         assert!(args().draft_fixed.is_none());
     }
+    #[test]
+    fn minimax_dflash2_takes_its_snapshot_precision_and_ring_storage() {
+        let cli = crate::cli::Cli::try_parse_from(["cuteafd", "serve-minimax", "--snapshot", "/model",
+            "--native-lib", "/lib.so", "--peers", "127.0.0.1:1,127.0.0.1:2", "--speculator", "dflash2",
+            "--draft", "/draft", "--draft-fp8", "false", "--draft-kv-cache", "bf16", "--draft-fixed", "7"]).unwrap();
+        let crate::cli::Commands::ServeMiniMax(a) = cli.command else { panic!("MiniMax dispatch") };
+        assert_eq!((a.speculator.as_str(), a.draft.as_deref()), ("dflash2", Some(Path::new("/draft"))));
+        assert_eq!((a.draft_fp8, a.draft_kv_cache, a.draft_fixed), (Some(false), Qwen4KvCache::Bf16, Some(7)));
+        assert!(a.validate().is_ok());
+        assert!(crate::cli::Cli::try_parse_from(["cuteafd", "serve-minimax", "--snapshot", "/model",
+            "--native-lib", "/lib.so", "--peers", "127.0.0.1:1,127.0.0.1:2", "--speculator", "eagle"]).is_err());
+    }
+
     #[test]
     fn minimax_fixed_draft_depth_is_one_to_the_drafter_block() {
         let parse = |depth: &str| crate::cli::Cli::try_parse_from(["cuteafd", "serve-minimax", "--snapshot", "/model",
