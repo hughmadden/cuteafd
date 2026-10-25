@@ -803,15 +803,23 @@ impl Opened {
                 coordinator_push = Some((push, peers.len(), planned));
                 (streams, ranks)
             });
-            // An EXLR8 checkpoint's own dense operands join the group as dense-only
-            // coordinator ranks (no local experts); planning failure loads by mount.
+            // Native dense operands and onboarded EXLR8 halves share each GPU's
+            // coordinator rank. Onboarded experts have no post-push mount loader.
             let ranks = match (ranks, &native_records) {
-                (None, Some(_)) if admission.coordinator_pushes() => (|| -> Result<_> {
+                (None, Some(_)) if admission.coordinator_pushes() => {
+                    let experts = tp2_range.as_ref().map(|range| -> Result<_> {
+                        let workspace = crate::shared::experts::rtx::exlr8::Exlr8Tp2Weights::workspace_bytes(
+                            &programs, max_rows, args.exlr8_prefill_activations)?;
+                        let budgets = tp2_budgets()?.map(|b| b.saturating_sub(workspace));
+                        Ok(crate::shared::experts::rtx::push::CoordinatorExperts::Exlr8Tp2 {
+                            manifest: args.exlr8_manifest.clone().context("EXLR8 manifest")?,
+                            layers: range.clone().collect(), budgets: budgets.to_vec() })
+                    }).transpose()?;
                     let (push, streams, ranks) = crate::shared::experts::rtx::push::CoordinatorPush::prepare(
-                        &self.snapshot, Some(&self.catalog), devices.len(), None)?;
-                    Ok((push, streams, ranks))
-                })().map_err(|error| tracing::info!(%error, "native dense coordinator push unavailable; mount")).ok()
-                    .map(|(push, streams, ranks)| { native_push = Some((push, peers.len())); (streams, ranks) }),
+                        &self.snapshot, Some(&self.catalog), devices.len(), experts)?;
+                    native_push = Some((push, peers.len()));
+                    Some((streams, ranks))
+                }
                 (ranks, _) => ranks,
             };
             Some(admission.start_with(&peers, ranks)?)
@@ -821,6 +829,7 @@ impl Opened {
         // their bytes land inside the Spark admission window (pushed, or through
         // the mount). Execution (modules, workspaces, routes) binds after the engine exists.
         let tp2_weights = |range: std::ops::Range<usize>, pushed| -> Result<crate::shared::experts::rtx::Tp2Weights<'_>> {
+            let pushed: Option<Vec<crate::shared::experts::rtx::push::PushedExperts<'_>>> = pushed;
             let local = local.as_ref().context("TP2 placement without local package inventory")?;
             let (devices, budgets) = (tp2_devices()?, tp2_budgets()?);
             use crate::shared::experts::rtx::{exl3::Exl3Tp2, RtxSelectionPolicy::CanonicalDecode};
@@ -828,14 +837,17 @@ impl Opened {
             Ok(match local.format {
                 glm::GlmLocalFormat::Exl3 => crate::shared::experts::rtx::Tp2Weights::Exl3(match pushed {
                     Some(pushed) => Exl3Tp2::pushed_pair_weights(devices, &self.catalog, geometry,
-                        [&local.package; 2], range.collect(), max_rows, budgets, CanonicalDecode, pushed)?,
+                        [&local.package; 2], range.collect(), max_rows, budgets, CanonicalDecode, pushed.into_iter().map(|r| r.exl3()).collect::<Result<Vec<_>>>()?
+                            .try_into().map_err(|_| anyhow::anyhow!("two EXL3 coordinator GPUs"))?)?,
                     None => Exl3Tp2::load_pair_weights(devices, &self.catalog, geometry,
                         [&local.package; 2], range.collect(), max_rows, budgets, CanonicalDecode)?,
                 }),
                 glm::GlmLocalFormat::Exlr8 => crate::shared::experts::rtx::Tp2Weights::Exlr8(
-                    crate::shared::experts::rtx::exlr8::Exlr8Tp2Weights::load_pair(devices,
-                        &self.snapshot, args.exlr8_manifest.as_deref().context("EXLR8 manifest")?,
-                        &programs, range.collect(), max_rows, budgets, args.exlr8_prefill_activations)?),
+                    crate::shared::experts::rtx::exlr8::Exlr8Tp2Weights::pushed_pair(devices,
+                        &programs, range.collect(), max_rows, budgets, args.exlr8_prefill_activations,
+                        pushed.context("onboarded EXLR8 experts require a committed push group")?
+                            .into_iter().map(|r| r.exlr8()).collect::<Result<Vec<_>>>()?
+                            .try_into().map_err(|_| anyhow::anyhow!("two EXLR8 coordinator GPUs"))?)?),
                 glm::GlmLocalFormat::Nvfp4 { .. } => crate::shared::experts::rtx::Tp2Weights::Fp8(
                     crate::shared::experts::rtx::fp8moe::Fp8MoeTp2::load_pair(devices,
                         self.catalog.fp8().context("NVFP4 tensors")?, &local.package,
@@ -846,7 +858,7 @@ impl Opened {
             if let Some(records) = &native_records {
                 let loaded = self.load_native(args, records, layers, &programs, &manifest, &loader, &devices, stream,
                     peer_stream, native_push.take())?;
-                let tp2 = tp2_range.clone().map(|range| tp2_weights(range, None)).transpose()?;
+                let tp2 = tp2_range.clone().map(|range| tp2_weights(range, loaded.2)).transpose()?;
                 return Ok((loaded.0, (loaded.1, tp2)));
             }
             let (embedding, (model, pushed)) = crate::shared::token_io::TokenEmbedding::load(&self.library,
@@ -859,10 +871,7 @@ impl Opened {
                 // receive both, then run the transforms of landed bytes.
                 let devices = tp2_devices()?;
                 let (pushed, ()) = push.receive_with(devices.to_vec(), Some(&self.catalog), sparks, Some(Ok(dense)), || ());
-                let pushed = pushed?.map(|ranks| -> Result<[_; 2]> {
-                    let ranks = ranks.into_iter().map(|r| r.exl3()).collect::<Result<Vec<_>>>()?;
-                    <[_; 2]>::try_from(ranks).map_err(|_| anyhow::anyhow!("two coordinator GPUs"))
-                }).transpose()?;
+                let pushed = pushed?;
                 let rank_stream = |device: i32| if device == args.device { stream }
                     else { peer_stream.map_or(stream, |(_, s)| s) };
                 if pushed.is_none() {
@@ -1078,7 +1087,8 @@ impl Opened {
         layers: usize, programs: &'s cuteafd_ffi::programs::Programs<'s>, _manifest: &serde_json::Value,
         loader: &weights::GlmLoader<'s>, devices: &[i32], stream: *mut c_void, peer_stream: Option<(i32, *mut c_void)>,
         push: Option<(crate::shared::experts::rtx::push::CoordinatorPush, usize)>)
-        -> Result<(crate::shared::token_io::TokenEmbedding<'s>, (weights::GlmWeights<'s>, Vec<Vec<weights::GlmLayer<'s>>>))> {
+        -> Result<(crate::shared::token_io::TokenEmbedding<'s>, (weights::GlmWeights<'s>, Vec<Vec<weights::GlmLayer<'s>>>),
+            Option<Vec<crate::shared::experts::rtx::push::PushedExperts<'s>>>)> {
         use crate::shared::token_io::native::{NativeVocabulary, VocabularyPlan};
         let _memory_scope = cuteafd_ffi::memory_ledger::scope("weights");
         let world = devices.len();
@@ -1095,7 +1105,7 @@ impl Opened {
         let per_rank = (0..world).map(|rank| native_dense::NativeDenseRecords::new(&self.snapshot, layers, world, rank))
             .collect::<Result<Vec<_>>>()?;
         let rank_stream = |device: i32| if device == args.device { stream } else { peer_stream.map_or(stream, |(_, s)| s) };
-        let (model, shares) = match push {
+        let ((model, shares), pushed) = match push {
             Some((push, sparks)) => {
                 let load = crate::shared::experts::rtx::dense::DenseLoad::push(&self.library);
                 let model = loader.native_model(&self.cfg, layers, &per_rank, &load, vocabulary.clone())?;
@@ -1105,22 +1115,22 @@ impl Opened {
                 let planned = crate::shared::experts::rtx::dense::plan_records(&self.snapshot, records.clone(),
                     &dense_devices, sparks);
                 let (pushed, ()) = push.receive_with(dense_devices, Some(&self.catalog), sparks, Some(planned), || ());
-                let pushed = pushed?.is_some();
-                if !pushed {
+                let pushed = pushed?;
+                if pushed.is_none() {
                     crate::shared::experts::rtx::dense::fill_records_by_mount(&self.library, &records, rank_stream)?;
                 }
-                tracing::info!(pushed, operands = records.operands.len(), steps = records.steps.len(),
+                tracing::info!(pushed = pushed.is_some(), operands = records.operands.len(), steps = records.steps.len(),
                     "GLM native dense operands landed");
-                model
+                (model, pushed)
             }
             None => {
                 let load = crate::shared::experts::rtx::dense::DenseLoad::mount(&self.library);
-                loader.native_model(&self.cfg, layers, &per_rank, &load, vocabulary.clone())?
+                (loader.native_model(&self.cfg, layers, &per_rank, &load, vocabulary.clone())?, None)
             }
         };
         self.library.cuda_set_device(args.device)?;
         tracing::info!(elapsed_ms = started.elapsed().as_millis() as u64, "GLM native dense weights resident");
-        Ok((embedding, (model, shares)))
+        Ok((embedding, (model, shares), pushed))
     }
 
     /// The row-FP8 embedding's identity (vocabulary file, payload offset).

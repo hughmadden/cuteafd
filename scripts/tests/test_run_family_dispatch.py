@@ -99,6 +99,24 @@ def test_exlr8_onboarding_reaches_shared_admission_without_zero_override(tmp_pat
         assert argv[argv.index("--pool-tokens") + 1] == "0"
 
 
+def test_exlr8_onboarded_halves_require_the_shared_committed_push():
+    source = (ROOT / "rust/crates/cuteafd-daemon/src/families/glm5/mod.rs").read_text()
+    planning = source.split("// Native dense operands and onboarded EXLR8 halves", 1)[1].split(
+        "Some(admission.start_with(&peers, ranks)?)", 1)[0]
+    assert "CoordinatorExperts::Exlr8Tp2" in planning
+    assert "layers: range.clone().collect()" in planning
+    assert "budgets: budgets.to_vec()" in planning
+    assert "CoordinatorPush::prepare(" in planning
+    assert "devices.len(), experts)?" in planning
+    assert "map_err" not in planning and ".ok()" not in planning
+    loading = source.split("let tp2_weights =", 1)[1].split("let (embedding,", 1)[0]
+    assert "Exlr8Tp2Weights::pushed_pair" in loading
+    assert 'pushed.context("onboarded EXLR8 experts require a committed push group")?' in loading
+    assert "tp2_weights(range, loaded.2)" in source
+    executor = (ROOT / "rust/crates/cuteafd-daemon/src/shared/experts/rtx/exlr8.rs").read_text()
+    assert "fn load_pair" not in executor and "Exlr8Weights::load(" not in executor
+
+
 @pytest.mark.parametrize("keys,diagnostic", [
     ("EXLR8_MANIFEST=up1\nEXLR8_PREFILL_ACTIVATIONS=fp8\n", "EXLR8_PREFILL_ACTIVATIONS must be a16 or a8"),
     ("EXLR8_PREFILL_ACTIVATIONS=a8\n", "EXLR8_PREFILL_ACTIVATIONS requires EXLR8_MANIFEST"),

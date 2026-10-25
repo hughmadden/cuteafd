@@ -78,6 +78,7 @@ impl<D: PushDestination<Delivered = ()>, T: PushDestination> PushDestination for
 /// when the rank carried dense operands alone).
 pub(crate) enum PushedExperts<'a> {
     Exl3(Vec<crate::shared::experts::exl3::Exl3Weights<'a>>),
+    Exlr8(Vec<crate::shared::experts::exlr8::Exlr8Weights<'a>>),
     Native(Vec<crate::shared::experts::layer::ExpertWeights<'a>>),
 }
 
@@ -86,13 +87,16 @@ impl<'a> Default for PushedExperts<'a> {
 }
 
 impl<'a> PushedExperts<'a> {
-    pub fn len(&self) -> usize { match self { Self::Exl3(w) => w.len(), Self::Native(w) => w.len() } }
+    pub fn len(&self) -> usize { match self { Self::Exl3(w) => w.len(), Self::Native(w) => w.len(), Self::Exlr8(w) => w.len() } }
     pub fn exl3(self) -> Result<Vec<crate::shared::experts::exl3::Exl3Weights<'a>>> {
-        match self { Self::Exl3(w) => Ok(w), Self::Native(_) => anyhow::bail!("native TP2 halves where EXL3 expected") }
+        match self { Self::Exl3(w) => Ok(w), _ => anyhow::bail!("non-EXL3 TP2 halves where EXL3 expected") }
+    }
+    pub fn exlr8(self) -> Result<Vec<crate::shared::experts::exlr8::Exlr8Weights<'a>>> {
+        match self { Self::Exlr8(w) => Ok(w), _ => anyhow::bail!("non-EXLR8 TP2 halves where EXLR8 expected") }
     }
     pub fn native(self) -> Result<Vec<crate::shared::experts::layer::ExpertWeights<'a>>> {
         match self { Self::Native(w) => Ok(w), Self::Exl3(w) if w.is_empty() => Ok(Vec::new()),
-            Self::Exl3(_) => anyhow::bail!("EXL3 TP2 halves where native expected") }
+            _ => anyhow::bail!("non-native TP2 halves where native expected") }
     }
 }
 
@@ -178,6 +182,15 @@ pub(crate) fn receive_rank<'a, D: PushDestination<Delivered = ()>>(
             (None, None) => unreachable!("checked above"),
         };
         let Some(((catalog, plan, _), delivered)) = tp2.zip(delivered) else { return Ok(PushedExperts::default()) };
+        if !plan.exlr8.is_empty() {
+            let initialize = plan.exlr8.iter().enumerate().map(|(region, residency)|
+                push_initialize::Layer::Exlr8 { region, residency }).collect::<Vec<_>>();
+            let ready = std::rc::Rc::new(push_initialize::initialize(delivered, &initialize, None, 0)?);
+            return plan.exlr8.into_iter().enumerate().map(|(region, layout)| {
+                let budget = crate::shared::experts::exlr8::Exlr8Weights::plan(&layout)?;
+                crate::shared::experts::exlr8::Exlr8Weights::from_push(ready.clone(), region, layout, budget)
+            }).collect::<Result<Vec<_>>>().map(PushedExperts::Exlr8);
+        }
         if !plan.native.is_empty() {
             // Native halves: the Spark native post-Done plane transform, then views.
             let initialize = plan.native.iter().enumerate().map(|(region, layout)|
@@ -244,14 +257,17 @@ type DenseSlot = std::sync::Arc<std::sync::Mutex<Option<Vec<DensePlan>>>>;
 #[derive(Clone, Debug)]
 pub(crate) enum CoordinatorExperts {
     Tp2 { layers: Vec<usize>, budgets: Vec<usize> },
+    Exlr8Tp2 { manifest: String, layers: Vec<usize>, budgets: Vec<usize> },
     Whole { selections: Vec<crate::shared::experts::layer::ExpertLayer>, budget: usize },
 }
 
 impl CoordinatorExperts {
-    fn gpus(&self) -> usize { match self { Self::Tp2 { .. } => 2, Self::Whole { .. } => 1 } }
+    fn gpus(&self) -> usize { match self { Self::Tp2 { .. } | Self::Exlr8Tp2 { .. } => 2, Self::Whole { .. } => 1 } }
     /// GPU `gpu`'s plan, re-derived from headers alone.
     fn plan(&self, catalog: &OfficialV41Catalog, gpu: usize) -> Result<CoordinatorExpertPlan> {
         match self {
+            Self::Exlr8Tp2 { manifest, layers, budgets } => CoordinatorExpertPlan::exlr8(catalog, manifest, layers, gpu,
+                *budgets.get(gpu).context("coordinator EXLR8 TP2 budget per GPU")?),
             Self::Tp2 { layers, budgets } => CoordinatorExpertPlan::new(catalog, layers, gpu,
                 *budgets.get(gpu).context("coordinator TP2 budget per GPU")?),
             Self::Whole { selections, budget } => {

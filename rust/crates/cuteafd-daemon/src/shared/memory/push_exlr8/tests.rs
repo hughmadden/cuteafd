@@ -1,4 +1,5 @@
 use super::*;
+use anyhow::Context;
 use cuteafd_loader::plan::testing::exlr8::fixture;
 use std::{fs::File, os::unix::fs::FileExt};
 
@@ -82,6 +83,105 @@ fn coordinator_suffix_preserves_mixed_exlr8_spark_plans() -> Result<()> {
             super::super::push_exl3::tests::coordinator_suffix(root.path(), &catalog, &plans,
                 |assignments, offers, coordinator| checked_plan(root.path(), root.path(), &catalog,
                     "mixed", &[3], assignments, offers, coordinator))?;
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn onboarded_tp2_destinations_join_the_exlr8_group_without_changing_residency() -> Result<()> {
+    use crate::shared::memory::push_coordinator::CoordinatorExpertPlan;
+    for padded in [false, true] {
+        let root = tempfile::tempdir()?;
+        fixture(root.path(), padded);
+        fixture_catalog(root.path())?;
+        // Complete the checkpoint inventory while selecting sparse onboarded layers.
+        let manifest_path = root.path().join("manifests/exlr8-manifest-mixed.json");
+        let mut manifest: serde_json::Value = serde_json::from_slice(&std::fs::read(&manifest_path)?)?;
+        for layer in 4..8 {
+            manifest["layers"][layer.to_string()] = manifest["layers"]["3"].clone();
+            for suffix in ["index", "k2", "k3", "k4"] {
+                let source = root.path().join(format!("experts/exlr8-layer-003.{suffix}.safetensors"));
+                let mut image = std::fs::read(source)?;
+                let header_bytes = u64::from_le_bytes(image[..8].try_into()?) as usize;
+                let mut header: serde_json::Value = serde_json::from_slice(&image[8..8 + header_bytes])?;
+                header["__metadata__"]["layer"] = layer.to_string().into();
+                let encoded = serde_json::to_vec(&header)?;
+                assert!(encoded.len() <= header_bytes);
+                image[8..8 + header_bytes].fill(b' ');
+                image[8..8 + encoded.len()].copy_from_slice(&encoded);
+                std::fs::write(root.path().join(format!("experts/exlr8-layer-{layer:03}.{suffix}.safetensors")), image)?;
+            }
+        }
+        std::fs::write(manifest_path, serde_json::to_vec(&manifest)?)?;
+        let config_path = root.path().join("config.json");
+        let mut config: serde_json::Value = serde_json::from_slice(&std::fs::read(&config_path)?)?;
+        config["num_hidden_layers"] = 8.into();
+        config["indexer_types"] = serde_json::json!(vec!["full"; 8]);
+        config["mlp_layer_types"] = serde_json::json!(["dense", "dense", "dense", "sparse", "sparse", "sparse", "sparse", "sparse"]);
+        std::fs::write(config_path, serde_json::to_vec(&config)?)?;
+        let catalog = cuteafd_loader::read_expert_catalog(root.path())?;
+        for (layers, gpu) in [(vec![], 0), (vec![7, 5], 0), (vec![5, 5], 0), (vec![5, 7], 2)] {
+            assert!(CoordinatorExpertPlan::exlr8(&catalog, "mixed", &layers, gpu, usize::MAX).is_err());
+        }
+        for sparks in [4, 6] {
+            let mut assignments = Vec::new();
+            let mut offers = Vec::new();
+            let mut spark_entries = Vec::new();
+            for rank in 0..sparks {
+                let plan = RankPlan::new(root.path(), "mixed", &[3], sparks, rank, usize::MAX)?;
+                assignments.push(cuteafd_loader::placement::SparkAssignment { rank: rank as u32,
+                    resident_bytes: plan.layout.bytes() as u64,
+                    slices: plan.placement.iter().map(|p| p.slice.clone()).collect(), io: Default::default() });
+                offers.push(Offer { rank, host: "fixture".into(), arena_bytes: plan.layout.logical_bytes() as u64,
+                    placement: plan.placement.clone() });
+                let checked = plan.checked(root.path(), root.path(), sparks, rank)?;
+                for entry in &checked.plan.entries {
+                    spark_entries.push((entry.rank, entry.src_base, entry.dst_base,
+                        checked.plan.files[entry.file as usize].clone(),
+                        checked.plan.patterns[entry.pattern as usize].clone()));
+                }
+            }
+            let base = 256;
+            for gpu in 0..2 {
+                let resident = [5, 7].into_iter().map(|layer| Residency::plan(root.path(), "mixed", layer, 2, gpu, ExpertSet::Routed)
+                    .map(|r| r.resident_bytes)).collect::<std::result::Result<Vec<_>, _>>()?.into_iter().sum::<usize>();
+                let plan = CoordinatorExpertPlan::exlr8(&catalog, "mixed", &[5, 7], gpu, resident)?;
+                assert_eq!(plan.layers, [5, 7]);
+                assert_eq!(plan.exlr8.len(), 2);
+                assert_eq!(plan.layout.bytes(), resident);
+                assert_eq!(plan.logical_bytes(), resident as u64);
+                assert!(CoordinatorExpertPlan::exlr8(&catalog, "mixed", &[5, 7], gpu,
+                    resident - 1).is_err());
+                offers.push(Offer { rank: sparks + gpu, host: "coordinator".into(),
+                    arena_bytes: base + plan.logical_bytes(), placement: Vec::new() });
+            }
+            let coordinator = super::super::push_exl3::CoordinatorRanks { ranks: 2,
+                append: Box::new(move |builder, catalog, offers| {
+                    let catalog = catalog.context("fixture catalog")?;
+                    for (gpu, offer) in offers.iter().enumerate() {
+                        let plan = CoordinatorExpertPlan::exlr8(catalog, "mixed", &[5, 7], gpu, usize::MAX)?;
+                        assert_eq!(offer.arena_bytes, base + plan.logical_bytes());
+                        plan.append_at(builder, catalog, offer.rank as u32, base)?;
+                    }
+                    Ok(())
+                }) };
+            let checked = checked_plan(root.path(), root.path(), &catalog, "mixed", &[3],
+                &assignments, &offers, Some(&coordinator))?;
+            assert_eq!(checked.arenas, offers.iter().map(|o| o.arena_bytes).collect::<Vec<_>>());
+            for rank in 0..sparks + 2 {
+                assert!(checked.plan.entries.iter().any(|e| e.rank == rank as u32));
+            }
+            for entry in checked.plan.entries.iter().filter(|e| e.rank >= sparks as u32) {
+                assert!(entry.dst_base >= base);
+                assert!(["exlr8-layer-005", "exlr8-layer-007"].iter()
+                    .any(|name| checked.plan.files[entry.file as usize].contains(name)));
+            }
+            // The Spark sources and destinations are unchanged by the two new ranks.
+            let actual = checked.plan.entries.iter().filter(|e| e.rank < sparks as u32)
+                .map(|e| (e.rank, e.src_base, e.dst_base, checked.plan.files[e.file as usize].clone(),
+                    checked.plan.patterns[e.pattern as usize].clone())).collect::<Vec<_>>();
+            assert_eq!(actual, spark_entries);
         }
     }
     Ok(())
