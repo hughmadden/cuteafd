@@ -27,6 +27,15 @@ fn draft_depths(fixed: bool, selector: bool, priors: &[Vec<f64>], selected: Vec<
     if fixed || selector { priors.iter().map(Vec::len).collect() } else { selected }
 }
 
+/// Whether the drafts' depths are evened to the step's row budget before drafting. A selector
+/// drafter at adaptive depth keeps its whole room: its post-draft selection prices every drafted
+/// position and fits the row budget itself (`select_drafted`), where evening first would cap what
+/// it can choose (three drafts each at 16 requests, one at 32). Fixed depths and drafters without a
+/// selector keep the trim.
+fn trims_before_drafting(fixed: bool, selector: bool) -> bool {
+    fixed || !selector
+}
+
 /// The post-draft `p0` of one request's `drafted` positions: a confidence head blended with its
 /// history, or a selector drafter's features through its keyed prior. `None` keeps the
 /// history prior.
@@ -100,6 +109,45 @@ mod selector_tests {
         let head = [0.9f32; 3];
         assert_eq!(drafted_prior(Some(&head), Some((&selector, &features)), &history, 3).unwrap(),
             Some(crate::shared::draft::resource::head_confidence(&history, &head)));
+    }
+
+    /// At 16 and 32 requests on a 64-row step, a selector drafter keeps its whole room to the
+    /// post-draft selection, which gives the row budget to the confident drafts; the trim before
+    /// drafting (other drafters, fixed depths) evens it to three drafts each, or one.
+    #[test]
+    fn selector_drafts_keep_their_room_until_the_post_draft_selection_fits_the_budget() {
+        use crate::shared::draft::resource::{self, Candidate, LayerHome};
+        let homes: Vec<LayerHome> = (0..45).map(|layer| if layer < 3 { LayerHome::Dense }
+            else { LayerHome::Remote { slice_bytes: 4_000_000. } }).collect();
+        for (requests, even) in [(16usize, 3usize), (32, 1)] {
+            // Every request's room is the step's spare rows, capped at the block's seven drafts.
+            let room = (64 - requests).min(7);
+            let priors = vec![vec![0.5; room]; requests];
+            let full = draft_depths(false, true, &priors, vec![0; requests]);
+            assert_eq!(full, vec![7; requests]);
+            let mut depths = full.clone();
+            if trims_before_drafting(false, true) { resource::trim_budget(&mut depths, 64); }
+            assert_eq!(depths, full, "a selector drafter's room survives to the post-draft selection");
+            for (fixed, selector) in [(true, true), (true, false), (false, false)] {
+                let mut depths = draft_depths(fixed, selector, &priors, vec![7; requests]);
+                assert!(trims_before_drafting(fixed, selector));
+                resource::trim_budget(&mut depths, 64);
+                assert_eq!(depths, vec![even; requests], "the pre-draft trim evens the budget");
+            }
+            // Half the drafts confident: the post-draft selection gives them the spare rows.
+            let mut policy = cuteafd_core::DraftPolicy::new(resource::geometry(&homes, 288, 8, 64, 7, 0).unwrap(),
+                cuteafd_core::PolicySeed::weak(7), false).unwrap();
+            policy.set_draft_mode(cuteafd_core::DraftMode::Simple);
+            let (confident, doubtful) = ([0.95; 7], [0.2; 7]);
+            let candidates: Vec<_> = (0..requests).map(|i| Candidate { id: i as u64,
+                prior: if i % 2 == 0 { &confident } else { &doubtful }, limit: 7, selector: false, cold: false })
+                .collect();
+            let lengths = resource::select_drafted(&mut policy, &candidates, 7, 64, requests).lengths;
+            assert!(lengths.len() + lengths.iter().sum::<usize>() <= 64, "{lengths:?}");
+            let confident_drafts: usize = lengths.iter().step_by(2).sum();
+            assert!(confident_drafts > even * requests / 2,
+                "{requests} requests: confident drafts {lengths:?} beat the even {even} each");
+        }
     }
 
     /// The record is the calibration tool's format; a censored verification observes no miss.
@@ -1174,7 +1222,8 @@ pub(crate) fn schedule<'a, B: Backend<'a>>(engine: &B, snapshot: &std::path::Pat
                     }
                 }
                 let pending: usize = active.iter().map(|a| a.draft.pending_rows()).sum();
-                if resource::trim_budget(&mut depths, geometry.decode_rows) { predicted = None; }
+                if trims_before_drafting(fixed, engine.selector_prior().is_some())
+                    && resource::trim_budget(&mut depths, geometry.decode_rows) { predicted = None; }
                 let rows: usize = depths.iter().map(|d| d + 1).sum();
                 if depths.iter().any(|&d| d > 0) || pending + rows > geometry.decode_rows / 2 {
                     let mut seqs: Vec<DraftSeq<'_, _, _>> = active.iter_mut().zip(&depths).map(|(a, &depth)| DraftSeq {
