@@ -230,6 +230,33 @@ fn a_missing_native_manifest_is_refused() {
     assert!(report.hints.iter().any(|h| h.what.contains("PROGRAMS.json")));
 }
 
+/// The shipped TP2 5090 shape (1024 prefill rows, 64 sequences) at a 108 GiB Spark budget: 55 Spark
+/// layers fit it while serving but not while loading. On hardware the worker refused them with "load
+/// 116371564032 serve 115379228928 budget 115964116992": its load peak adds the largest pinned upload
+/// and read scratch of a layer to the residents, package scratch and runtime residual.
+#[test]
+fn tp2_onboarding_sizes_the_sparks_for_their_load_peak() {
+    let dir = snapshot(false, false);
+    let programs = dir.path().join("PROGRAMS.json");
+    std::fs::write(&programs, admission::tests::programs_manifest().to_string()).unwrap();
+    let experts = dir.path().join("fp8/fp8-minimax-nvfp4a4");
+    std::fs::create_dir_all(&experts).unwrap();
+    let mut package = admission::tests::expert_manifest();
+    package["layouts"].as_object_mut().unwrap().retain(|name, _| name == "tp1");
+    std::fs::write(experts.join("manifest.json"), package.to_string()).unwrap();
+    let mut options = with_layout(RTX_5090, 2);
+    let layout = options.layout.as_mut().unwrap();
+    layout.workspace_manifest = Some(programs);
+    layout.native_mtp_layers = 0;
+    layout.prefill_rows = 1024;
+    layout.concurrency = 64;
+    layout.spark_allocation_budget_bytes = Some(108 << 30);
+    let report = plan::plan(dir.path(), &options).unwrap();
+    assert!(report.wip_launchable(), "{:?}", report.hints);
+    let memory = report.memory_layout.as_ref().unwrap();
+    assert!(memory.notes.iter().any(|n| n.starts_with("3 routed layers on the RTX")), "{:?}", memory.notes);
+}
+
 #[test]
 fn native_tp2_auto_vision_preserves_text_admission() {
     use crate::plan::{encoder::EncoderKind, MediaMode};
@@ -248,13 +275,15 @@ fn native_tp2_auto_vision_preserves_text_admission() {
     layout.native_mtp_layers = 0;
     layout.prefill_rows = 1024;
     layout.concurrency = 64;
+    // A 108 GiB Spark budget, so TP2 onboards layers (the load peak takes three).
+    layout.spark_allocation_budget_bytes = Some(108 << 30);
     let report = plan::plan(dir.path(), &options).unwrap();
     assert!(report.wip_launchable(), "{:?}", report.hints);
     assert_eq!(report.encoder.as_ref().unwrap().kind, EncoderKind::Off);
     let memory = report.memory_layout.as_ref().unwrap();
     assert!(memory.pool_tokens >= 64);
     assert!(memory.devices.iter().all(|d| d.used_bytes() <= d.capacity_bytes));
-    assert!(memory.notes.iter().any(|n| n.starts_with("2 routed layers on the RTX")));
+    assert!(memory.notes.iter().any(|n| n.starts_with("3 routed layers on the RTX")), "{:?}", memory.notes);
     assert!(!report.hints.iter().any(|h| h.what.starts_with("routed experts need ")));
     // Logits cover decode rows, not every prefill row, so a 4096-row prefill chunk fits too
     // (one lane: two lanes of 4096 rows hold twice the per-row buffers).
