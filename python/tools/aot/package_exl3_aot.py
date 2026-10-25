@@ -825,8 +825,9 @@ def ws_dynamic_tiles(geometry: str, role: str, width: int, capacity: int, *,
     if role == 'coordinator':
         cell = coordinator_ws_cell(geometry, role, width, capacity)
         return bool(cell and cell.get('dynamic'))
-    if (geometry == 'glm' and role == 'spark' and width in (384, 640)
-            and capacity in (2048, 2752)):
+    if (role == 'spark' and capacity in (2048, 2752)
+            and ((geometry == 'glm' and width in (384, 640))
+                 or (geometry == 'glmf' and width in (256, 512, 640, 768, 1024)))):
         return True
     return wire_input(geometry, role, width, capacity)
 
@@ -846,6 +847,9 @@ def ws_tile(geometry: str, role: str, width: int, capacity: int, *,
     if role == 'coordinator':
         cell = coordinator_ws_cell(geometry, role, width, capacity)
         return cell.get('tile') if cell else None
+    if ((geometry, role, width) == ('glmf', 'spark', 640)
+            and capacity in (2048, 2752)):
+        return TILE_RTX_MIXED
     # GB10 w640: FC2 N256 wins 2.2-5.0% at m1024..m4096; FC1 stays N128.
     if ((geometry, role, width) == ('glm', 'spark', 640)
             and capacity in (1024, 2048, 2752, 4096)):
