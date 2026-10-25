@@ -40,9 +40,9 @@ class GlmExl3PackageTest(unittest.TestCase):
             with self.assertRaises(ValueError):
                 tool.package_capacities('kimik3', invalid)
         for capacity in (1, 80, 256, 1024, 4096):
-            self.assertEqual(tool.route_block('kimik3', capacity), 64 if capacity == 1024 else 8)
+            self.assertEqual(tool.route_block('kimik3', capacity, 'coordinator'), 64 if capacity == 1024 else 8)
             self.assertEqual(tool.route_block('kimik3', capacity, 'spark'), 8)
-            self.assertEqual(tool.token_major_rotation('kimik3', capacity), capacity == 1024)
+            self.assertEqual(tool.token_major_rotation('kimik3', capacity, 'coordinator'), capacity == 1024)
             self.assertFalse(tool.token_major_rotation('kimik3', capacity, 'spark'))
             for width in (512, 3072):
                 self.assertIsNone(tool.decode_tile('kimik3', width, capacity))
@@ -58,14 +58,20 @@ class GlmExl3PackageTest(unittest.TestCase):
         self.assertEqual(spark['tp3-width768'][1], ['tp3-rank0'])
 
     def test_route_policy(self):
-        self.assertEqual([tool.route_block('glm', c) for c in (1, 16, 80, 256, 1024, 4096)],
+        self.assertEqual([tool.route_block('glm', c, 'coordinator') for c in (1, 16, 80, 256, 1024, 4096)],
                          [8, 8, 8, 8, 64, 64])
-        self.assertEqual([tool.token_major_rotation('glm', c) for c in (80, 256, 1024, 4096)],
+        self.assertEqual([tool.token_major_rotation('glm', c, 'coordinator') for c in (80, 256, 1024, 4096)],
                          [False, False, True, True])
         # Other geometries keep their policies.
-        self.assertEqual([tool.route_block('dsv4p', c) for c in (256, 1024, 4096)], [8, 64, 64])
+        self.assertEqual([tool.route_block('dsv4p', c, 'coordinator') for c in (256, 1024, 4096)], [8, 64, 64])
         self.assertEqual([tool.route_block('dsv4p', c, 'spark') for c in (256, 1024, 4096)], [8, 16, 64])
-        self.assertEqual(tool.route_block('v41', 4096), 8)
+        self.assertEqual(tool.route_block('v41', 4096, 'coordinator'), 8)
+
+    def test_policy_functions_require_an_explicit_role(self):
+        for call in (lambda: tool.route_block('dsv4p', 1024),
+                     lambda: tool.token_major_rotation('dsv4p', 1024)):
+            with self.assertRaises(TypeError):
+                call()
 
 
 if __name__ == '__main__':

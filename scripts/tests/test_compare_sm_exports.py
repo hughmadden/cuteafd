@@ -162,7 +162,7 @@ def test_compact_gate_matches_packager_spark_companions(tmp_path, monkeypatch, g
             else (64, 128, 64, 128))
         assert options.get("route_block", 8) == (
             package.compact_ws_route_block(geometry, "spark", width, rows) if ws
-            else package.route_block(geometry, rows))
+            else package.route_block(geometry, rows, 'coordinator'))
         assert options.get("swiglu_limit", 10.0) == package.swiglu_limit(geometry)
     widths = {profile[1] for profile in profiles}
     assert widths == ({256, 384} if geometry == "qwen4" else

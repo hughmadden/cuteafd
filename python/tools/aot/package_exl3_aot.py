@@ -283,9 +283,11 @@ def swiglu_limit(geometry: str) -> float | None:
     return SWIGLU_LIMITS.get(geometry, 10.0)
 
 
-def route_block(geometry: str, capacity: int, role: str = 'coordinator') -> int:
+def route_block(geometry: str, capacity: int, role: str) -> int:
     """Packed-route M block per capacity: rows of one expert that share a Trellis decode.
 
+    Callers state the role: 'coordinator' packages the whole intermediate on one
+    RTX GPU, 'spark' the GB10 per-rank shard.
     V4.1 keeps its qualified 8-row blocks everywhere. DeepSeek V4 Pro Spark prefill
     (H7168, 384 experts, top-6: ~64 rows per expert at 4096 rows) re-decodes every
     weight tile once per 8 rows, so wide prefill capacities use wider blocks
@@ -338,9 +340,10 @@ def qwen4_route_block(capacity: int) -> int:
     return 8 if capacity <= 80 else 32
 
 
-def token_major_rotation(geometry: str, capacity: int, role: str = 'coordinator') -> bool:
+def token_major_rotation(geometry: str, capacity: int, role: str) -> bool:
     """Whether a capacity rotates each token's input once for all of its routes.
 
+    Callers state the role, as for route_block: the answers differ per role.
     Bit-identical to per-route rotation. It pays where the rotation phase is
     large (V4 Pro m2048..4096 prefill); at m1024 and below it is neutral on Spark.
     """
