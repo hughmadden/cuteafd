@@ -1,6 +1,6 @@
 //! Request-owned early engram I/O and accepted-prefix history transactions.
 use crate::{
-    EngramGatherPoll, EngramGatherTicket, EngramGatherer, EngramPrefetcher, EngramTable,
+    EngramGatherLease, EngramGatherPoll, EngramGatherTicket, EngramGatherer, EngramPrefetcher, EngramTable,
     EngramTokenMap, OfficialV41Catalog, PrefetchTicket,
 };
 use anyhow::{ensure, Context, Result};
@@ -15,10 +15,14 @@ pub struct EngramRequestTokens<'a> {
 enum LayerIo {
     AwaitingAdmission,
     Queued(EngramGatherTicket),
+    Ready(EngramGatherLease),
+    Cancelled,
     Consumed,
 }
 pub struct EngramWave {
     pipeline: Arc<()>,
+    gatherer: Arc<EngramGatherer>,
+    tables: [Arc<EngramTable>; 2],
     batches: Vec<Arc<EngramBatch>>,
     prefetch: Vec<PrefetchTicket>,
     layers: [LayerIo; 2],
@@ -30,6 +34,44 @@ impl EngramWave {
     pub fn set_decode(&mut self, decode: bool) { self.decode = decode; }
     pub fn batches(&self) -> &[Arc<EngramBatch>] {
         &self.batches
+    }
+    /// Await admission and I/O using only wave-owned state. The caller must
+    /// revalidate request generations through `EngramPipeline::poll` afterwards.
+    pub async fn wait_gather(&mut self, layer: usize) -> Result<()> {
+        ensure!(!self.finished, "engram wave is already finished");
+        ensure!(layer < self.layers.len(), "invalid engram layer index");
+        self.waiting[layer].get_or_insert_with(std::time::Instant::now);
+        let result = self.wait_layer(layer).await;
+        if result.is_err() { self.cancel(); }
+        result
+    }
+    async fn wait_layer(&mut self, layer: usize) -> Result<()> {
+        if matches!(self.layers[layer], LayerIo::AwaitingAdmission) {
+            let ticket = self.gatherer.submit(Arc::clone(&self.tables[layer]),
+                &self.batches, layer).await?;
+            self.layers[layer] = LayerIo::Queued(ticket);
+        }
+        let result = match &mut self.layers[layer] {
+            LayerIo::Queued(ticket) => ticket.wait().await?,
+            LayerIo::Ready(_) | LayerIo::Cancelled => return Ok(()),
+            LayerIo::Consumed => anyhow::bail!("engram layer result already consumed"),
+            LayerIo::AwaitingAdmission => unreachable!("admission completed above"),
+        };
+        self.layers[layer] = match result {
+            EngramGatherPoll::Ready(lease) => LayerIo::Ready(lease),
+            EngramGatherPoll::Cancelled => LayerIo::Cancelled,
+            EngramGatherPoll::Pending => anyhow::bail!("engram gather wait resolved before completion"),
+        };
+        Ok(())
+    }
+    fn admit(&mut self, layer: usize) -> Result<()> {
+        if matches!(self.layers[layer], LayerIo::AwaitingAdmission) {
+            if let Some(ticket) = self.gatherer.try_submit(Arc::clone(&self.tables[layer]),
+                &self.batches, layer)? {
+                self.layers[layer] = LayerIo::Queued(ticket);
+            }
+        }
+        Ok(())
     }
     /// Cancel early I/O without committing any token history.
     pub fn cancel(&mut self) {
@@ -74,7 +116,7 @@ pub struct EngramPipeline {
     tables: [Arc<EngramTable>; 2],
     token_map: EngramTokenMap,
     prefetch: EngramPrefetcher,
-    gatherer: EngramGatherer,
+    gatherer: Arc<EngramGatherer>,
     capacity: usize,
     placement: crate::formats::mapped_preload::MappedPlacement,
 }
@@ -120,7 +162,7 @@ impl EngramPipeline {
             tables,
             token_map,
             prefetch: EngramPrefetcher::new(32, capacity * 24, capacity * 48)?,
-            gatherer: EngramGatherer::new(gather_slots, capacity, staging_budget)?,
+            gatherer: Arc::new(EngramGatherer::new(gather_slots, capacity, staging_budget)?),
             capacity,
             placement,
         })
@@ -185,6 +227,8 @@ impl EngramPipeline {
             .collect();
         let mut wave = EngramWave {
             pipeline: Arc::clone(&self.identity),
+            gatherer: Arc::clone(&self.gatherer),
+            tables: self.tables.clone(),
             batches: batches?,
             prefetch: Vec::with_capacity(32),
             layers: [LayerIo::AwaitingAdmission, LayerIo::AwaitingAdmission],
@@ -201,20 +245,9 @@ impl EngramPipeline {
                     wave.prefetch.push(ticket);
                 }
             }
-            self.admit(&mut wave, layer)?;
+            wave.admit(layer)?;
         }
         Ok(wave)
-    }
-    fn admit(&self, wave: &mut EngramWave, layer: usize) -> Result<()> {
-        if matches!(wave.layers[layer], LayerIo::AwaitingAdmission) {
-            if let Some(ticket) =
-                self.gatherer
-                    .try_submit(Arc::clone(&self.tables[layer]), &wave.batches, layer)?
-            {
-                wave.layers[layer] = LayerIo::Queued(ticket);
-            }
-        }
-        Ok(())
     }
     /// Retry bounded admission and poll without waiting for mapped pages.
     /// A returned lease must be uploaded or dropped before its staging can be reused.
@@ -224,11 +257,19 @@ impl EngramPipeline {
         histories: &[&EngramHistory],
         layer: usize,
     ) -> Result<EngramGatherPoll> {
+        wave.poll_gather(&self.identity, histories, layer)
+    }
+}
+
+impl EngramWave {
+    fn poll_gather(&mut self, pipeline: &Arc<()>, histories: &[&EngramHistory],
+        layer: usize) -> Result<EngramGatherPoll> {
+        let wave = self;
         ensure!(!wave.finished, "engram wave is already finished");
         ensure!(layer < 2, "invalid engram layer index");
         let result = (|| {
             ensure!(
-                Arc::ptr_eq(&self.identity, &wave.pipeline),
+                Arc::ptr_eq(pipeline, &wave.pipeline),
                 "engram wave belongs to another pipeline"
             );
             ensure!(
@@ -238,13 +279,19 @@ impl EngramPipeline {
             for (history, batch) in histories.iter().zip(&wave.batches) {
                 history.validate_commit(batch, 0)?;
             }
-            self.admit(wave, layer)?;
+            wave.admit(layer)?;
             let result = match &mut wave.layers[layer] {
                 LayerIo::AwaitingAdmission => {
                     wave.waiting[layer].get_or_insert_with(std::time::Instant::now);
                     return Ok(EngramGatherPoll::Pending);
                 },
                 LayerIo::Queued(ticket) => ticket.poll()?,
+                LayerIo::Ready(_) => {
+                    let LayerIo::Ready(lease) = std::mem::replace(&mut wave.layers[layer], LayerIo::Consumed)
+                        else { unreachable!("matched ready lease") };
+                    EngramGatherPoll::Ready(lease)
+                }
+                LayerIo::Cancelled => EngramGatherPoll::Cancelled,
                 LayerIo::Consumed => anyhow::bail!("engram layer result already consumed"),
             };
             if let EngramGatherPoll::Ready(lease) = &result {
@@ -262,7 +309,7 @@ impl EngramPipeline {
                 wave.waiting[layer].get_or_insert_with(std::time::Instant::now);
             } else if matches!(result, EngramGatherPoll::Ready(_)) {
                 let elapsed = wave.waiting[layer].take().map_or(std::time::Duration::ZERO, |t| t.elapsed());
-                record_layer_wait(&self.tables[layer], elapsed, wave.decode);
+                record_layer_wait(&wave.tables[layer], elapsed, wave.decode);
             }
             if !matches!(result, EngramGatherPoll::Pending) {
                 wave.layers[layer] = LayerIo::Consumed;
@@ -286,6 +333,130 @@ fn record_layer_wait(table: &EngramTable, elapsed: std::time::Duration, decode: 
 #[cfg(test)]
 mod wait_tests {
     use super::*;
+    use std::{future::Future, task::{Context as TaskContext, Poll, Wake, Waker}, time::{Duration, Instant}};
+
+    struct ThreadWake(std::thread::Thread);
+    impl Wake for ThreadWake {
+        fn wake(self: Arc<Self>) { self.0.unpark(); }
+        fn wake_by_ref(self: &Arc<Self>) { self.0.unpark(); }
+    }
+    fn block_on<T>(future: impl Future<Output = T>) -> T {
+        let waker = Waker::from(Arc::new(ThreadWake(std::thread::current())));
+        let mut cx = TaskContext::from_waker(&waker);
+        let mut future = std::pin::pin!(future);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Poll::Ready(result) = future.as_mut().poll(&mut cx) { return result; }
+            assert!(Instant::now() < deadline, "engram fixture completion timed out");
+            std::thread::park_timeout(deadline.saturating_duration_since(Instant::now()));
+        }
+    }
+    fn table_fixture(selected: &[u64]) -> Result<Arc<EngramTable>> {
+        use std::os::unix::fs::FileExt;
+        let weights = tempfile::NamedTempFile::new()?;
+        let scales = tempfile::NamedTempFile::new()?;
+        let rows = cuteafd_core::ENGRAM_ROWS[0];
+        weights.as_file().set_len(rows * 256)?;
+        scales.as_file().set_len(rows * 8)?;
+        for &row in selected {
+            let weight: Vec<_> = (0..256).map(|column| row.wrapping_mul(37).wrapping_add(column) as u8).collect();
+            let scale: Vec<_> = (0..8).map(|column| row.wrapping_mul(19).wrapping_add(column + 1) as u8).collect();
+            weights.as_file().write_all_at(&weight, row * 256)?;
+            scales.as_file().write_all_at(&scale, row * 8)?;
+        }
+        // SAFETY: immutable sparse files remain mapped after their names are removed.
+        let map = |file: &tempfile::NamedTempFile, width| unsafe {
+            crate::MappedTable::single(file.path(), 0, rows,
+                crate::RowFormat { dtype: cuteafd_core::DType::U8, width, row_bytes: width })
+        };
+        Ok(Arc::new(EngramTable::new(map(&weights, 256)?, map(&scales, 8)?)?))
+    }
+    fn wave_fixture(table: Arc<EngramTable>, gatherer: Arc<EngramGatherer>, batch: Arc<EngramBatch>) -> EngramWave {
+        EngramWave { pipeline: Arc::new(()), gatherer, tables: [table.clone(), table],
+            batches: vec![batch], prefetch: Vec::new(),
+            layers: [LayerIo::AwaitingAdmission, LayerIo::Consumed], finished: false,
+            waiting: [None; 2], decode: false }
+    }
+
+    #[test]
+    fn awaited_gather_rejects_request_reuse_and_changed_generation() -> Result<()> {
+        let table = table_fixture(&[])?;
+        let budget = crate::EngramBatchStaging::storage_bytes(1)?;
+        let gatherer = Arc::new(EngramGatherer::new(1, 1, budget)?);
+        for reused in [false, true] {
+            let mut history = EngramHistory::new(2)?;
+            let batch = Arc::new(history.prepare(0, &[Some(11)], 1)?);
+            let mut blocker = gatherer.try_submit(table.clone(), std::slice::from_ref(&batch), 0)?.unwrap();
+            let EngramGatherPoll::Ready(lease) = block_on(blocker.wait())?
+                else { anyhow::bail!("fixture gather did not complete") };
+            let mut wave = wave_fixture(table.clone(), gatherer.clone(), batch.clone());
+            let identity = wave.pipeline.clone();
+            {
+                let wait = wave.wait_gather(0);
+                let mut wait = std::pin::pin!(wait);
+                let waker = Waker::from(Arc::new(ThreadWake(std::thread::current())));
+                assert!(wait.as_mut().poll(&mut TaskContext::from_waker(&waker)).is_pending());
+                if reused { history = EngramHistory::new(2)?; }
+                else { history.commit(&batch, 0)?; }
+                drop(lease);
+                block_on(wait)?;
+            }
+            assert!(matches!(wave.layers[0], LayerIo::Ready(_)));
+            let error = wave.poll_gather(&identity, &[&history], 0).err().context("stale gather was consumed")?;
+            assert!(error.to_string().contains("stale or foreign engram batch"));
+            assert!(wave.finished);
+            let mut recycled = block_on(gatherer.submit(table.clone(), std::slice::from_ref(&batch), 0))?;
+            assert!(matches!(block_on(recycled.wait())?, EngramGatherPoll::Ready(_)));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn awaited_gather_matches_direct_rows_and_consumes_once() -> Result<()> {
+        let history = EngramHistory::new(2)?;
+        let batch = Arc::new(history.prepare(0, &[Some(11), None, Some(13)], 3)?);
+        let table = table_fixture(&batch.prefetch_rows(0)?)?;
+        let gatherer = Arc::new(EngramGatherer::new(1, 3, crate::EngramBatchStaging::storage_bytes(3)?)?);
+        let mut direct = crate::EngramBatchStaging::new(3)?;
+        let expected = direct.gather(&table, &[batch.as_ref()], 0)?;
+        assert!(expected.weights.iter().any(|&value| value != 0));
+        assert!(expected.scales.iter().any(|&value| value != 0));
+        let mut wave = wave_fixture(table.clone(), gatherer, batch);
+        let identity = wave.pipeline.clone();
+        block_on(wave.wait_gather(0))?;
+        // Waiting twice must preserve the ready lease, not consume it twice.
+        block_on(wave.wait_gather(0))?;
+        let EngramGatherPoll::Ready(lease) = wave.poll_gather(&identity, &[&history], 0)?
+            else { anyhow::bail!("awaited fixture gather was not ready") };
+        let actual = lease.view()?;
+        assert_eq!(actual.weights, expected.weights);
+        assert_eq!(actual.scales, expected.scales);
+        assert_eq!(actual.text_mask, expected.text_mask);
+        assert_eq!((actual.rows, actual.layer_index), (expected.rows, expected.layer_index));
+        assert!(block_on(wave.wait_gather(0)).is_err());
+        assert!(wave.finished);
+        assert_eq!(table.weights().stats().snapshot().consumer_steps, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn cancelled_wave_never_consumes_queued_or_ready_gathers() -> Result<()> {
+        let table = table_fixture(&[])?;
+        let gatherer = Arc::new(EngramGatherer::new(1, 1, crate::EngramBatchStaging::storage_bytes(1)?)?);
+        let history = EngramHistory::new(2)?;
+        for ready in [false, true] {
+            let batch = Arc::new(history.prepare(0, &[Some(11)], 1)?);
+            let mut wave = wave_fixture(table.clone(), gatherer.clone(), batch);
+            wave.admit(0)?;
+            if ready { block_on(wave.wait_gather(0))?; }
+            let identity = wave.pipeline.clone();
+            wave.cancel();
+            assert!(block_on(wave.wait_gather(0)).is_err());
+            assert!(wave.poll_gather(&identity, &[&history], 0).is_err());
+        }
+        Ok(())
+    }
+
     #[test]
     fn layer_wait_is_recorded_once_for_weight_scale_pair() -> Result<()> {
         let weights = tempfile::NamedTempFile::new()?;

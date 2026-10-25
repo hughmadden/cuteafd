@@ -523,44 +523,25 @@ impl<'w, 'a> TargetPass<'w, 'a> {
                 self.resources.lane.advance()?;
                 let advance_us = prepare_timing.elapsed().as_micros() as u64;
                 if let Some(gate) = [1, 14].iter().position(|&l| l == layer) {
-                    let start = Instant::now();
-                    // Inside a stage chain the gathered rows are uploaded on their
-                    // own stream and the gate joins the chain, so the direct pass
-                    // uses the same queued form instead of draining the chain.
+                    guard.batch.wait_engram_gather(gate, self.resources.engram_timeout).await?;
+                    // Revalidate only after waking; no request-bank borrow spans
+                    // admission or mapped I/O. Keep each route's upload/gate order.
                     if requests.cooperative_completion() || crate::shared::memory::chain::active() {
-                        loop {
-                            let gathered = requests.with_requests(|requests| requests.poll_engram_gather(guard.batch, &self.resources.lane))?;
-                            match gathered {
-                                cuteafd_loader::EngramGatherPoll::Ready(lease) => {
-                                    let rows = self.resources.upload.upload_cooperative(&lease.view()?).await?;
-                                    unsafe { self.resources.lane.apply_engram_cooperative(&mut self.resources.gates[gate], &rows).await?; }
-                                    break;
-                                }
-                                cuteafd_loader::EngramGatherPoll::Cancelled => anyhow::bail!("engram gather cancelled"),
-                                cuteafd_loader::EngramGatherPoll::Pending => {}
+                        let gathered = requests.with_requests(|requests| requests.poll_engram_gather(guard.batch, &self.resources.lane))?;
+                        match gathered {
+                            cuteafd_loader::EngramGatherPoll::Ready(lease) => {
+                                let rows = self.resources.upload.upload_cooperative(&lease.view()?).await?;
+                                unsafe { self.resources.lane.apply_engram_cooperative(&mut self.resources.gates[gate], &rows).await?; }
                             }
-                            ensure!(start.elapsed() < self.resources.engram_timeout, "target engram gather timed out at layer {layer}");
-                            // The gather normally lands within microseconds of this
-                            // point; a millisecond sleep would stall the whole pass.
-                            tokio::task::yield_now().await;
+                            cuteafd_loader::EngramGatherPoll::Cancelled => anyhow::bail!("engram gather cancelled"),
+                            cuteafd_loader::EngramGatherPoll::Pending => anyhow::bail!("engram gather wait returned pending"),
                         }
                     } else {
-                        // The direct engram gate uses legacy-stream copies.
                         crate::shared::memory::chain::settle(self.resources.upload.library())?;
-                        while !unsafe {
-                        requests.with_requests(|requests| requests.poll_engram(
-                            guard.batch,
-                            &mut self.resources.upload,
-                            &mut self.resources.gates[gate],
-                            &mut self.resources.lane,
-                        ))?
-                    } {
-                        ensure!(
-                            start.elapsed() < self.resources.engram_timeout,
-                            "target engram gather timed out at layer {layer}"
-                        );
-                        tokio::time::sleep(Duration::from_millis(1)).await;
-                    } }
+                        ensure!(unsafe { requests.with_requests(|requests| requests.poll_engram(
+                            guard.batch, &mut self.resources.upload, &mut self.resources.gates[gate],
+                            &mut self.resources.lane))? }, "engram gather wait returned pending");
+                    }
                 }
                 let engram_us = prepare_timing.elapsed().as_micros() as u64 - advance_us;
                 if layer >= 37 {

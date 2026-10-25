@@ -568,32 +568,23 @@ impl<'w, 'a> DistributedTargetPass<'w, 'a> {
                     self.advance(layer).await?;
                 }
                 if [1, 14].contains(&layer) {
-                    let started = Instant::now();
-                    loop {
-                        let gathered = requests.with_requests(|r| {
-                            r.poll_engram_gather(guard.batch, &self.resources.lanes[gpu])
-                        })?;
-                        match gathered {
-                            cuteafd_loader::EngramGatherPoll::Ready(lease) => {
-                                unsafe {
-                                    self.resources.engram
-                                        .apply(&mut self.resources.lanes[gpu], &lease.view()?)
-                                        .await?;
-                                }
-                                break;
+                    let gate = usize::from(layer == 14);
+                    guard.batch.wait_engram_gather(gate, self.resources.timeout).await?;
+                    let gathered = requests.with_requests(|r| {
+                        r.poll_engram_gather(guard.batch, &self.resources.lanes[gpu])
+                    })?;
+                    match gathered {
+                        cuteafd_loader::EngramGatherPoll::Ready(lease) => {
+                            unsafe {
+                                self.resources.engram
+                                    .apply(&mut self.resources.lanes[gpu], &lease.view()?)
+                                    .await?;
                             }
-                            cuteafd_loader::EngramGatherPoll::Cancelled => {
-                                anyhow::bail!("distributed Engram gather cancelled")
-                            }
-                            cuteafd_loader::EngramGatherPoll::Pending => {}
                         }
-                        ensure!(
-                            started.elapsed() < self.resources.timeout,
-                            "distributed Engram gather timed out at layer {layer}"
-                        );
-                        // A millisecond sleep here stalled the whole pass whenever
-                        // the gather landed just after the first poll.
-                        tokio::task::yield_now().await;
+                        cuteafd_loader::EngramGatherPoll::Cancelled => {
+                            anyhow::bail!("distributed Engram gather cancelled")
+                        }
+                        cuteafd_loader::EngramGatherPoll::Pending => anyhow::bail!("engram gather wait returned pending"),
                     }
                 }
                 if layer >= 37 {
