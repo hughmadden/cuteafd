@@ -1616,7 +1616,12 @@ impl<'a> SparkLink<'a> {
         if let Some(exchange) = self.exchange.take() {
             // A failed exchange already abandoned its waves; a cancelled one
             // still holds the engine's unlanded tickets, which are dropped.
-            drop(exchange);
+            // Either way the worker hands its transport back (#784).
+            let (transport, result) = exchange.close::<SparkExperts>()?;
+            self.transport = Some(transport);
+            if let Err(error) = result {
+                tracing::warn!(error = %format!("{error:#}"), "Spark exchange closed with a failure; resetting its transport");
+            }
         }
         let intake = std::rc::Rc::clone(&self.intake);
         let transport = self.transport.as_mut().context("Spark link has no transport")?;
@@ -1644,12 +1649,18 @@ impl<'a> SparkLink<'a> {
         Ok(())
     }
 
-    /// Terminal teardown, step 1: stops the exchange (releasing every queued
-    /// wait) and quiesces the QPs.
+    /// Terminal teardown, step 1: closes the exchange (releasing every queued
+    /// wait), takes its transport back and quiesces the QPs (#784: the
+    /// exchange owns the transport once started).
     pub(crate) fn terminal_quiesce(&mut self) -> Result<()> {
         if let Some(exchange) = self.exchange.take() {
-            // Teardown may abandon waves; the worker fails, releases and returns.
-            drop(exchange);
+            // Teardown may abandon waves; the worker then fails, releases its
+            // waits and still hands the transport back.
+            let (transport, result) = exchange.close::<SparkExperts>()?;
+            self.transport = Some(transport);
+            if let Err(error) = result {
+                tracing::warn!(error = %format!("{error:#}"), "Spark exchange closed with a failure; quiescing its transport");
+            }
         }
         self.transport.as_mut().context("Spark link has no transport")?.terminal_quiesce()
     }
