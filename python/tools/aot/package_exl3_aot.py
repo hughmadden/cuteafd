@@ -311,6 +311,8 @@ def route_block(geometry: str, capacity: int, role: str = 'coordinator') -> int:
         return 64 if role == 'coordinator' and capacity == 1024 else 8
     if geometry != 'dsv4p' or capacity <= 256:
         return 8
+    if role == 'coordinator':
+        return 64
     return 16 if capacity <= 1024 else 64
 
 
@@ -347,6 +349,12 @@ def token_major_rotation(geometry: str, capacity: int, role: str = 'coordinator'
         return capacity > 256
     if geometry == 'kimik3':
         return role == 'coordinator' and capacity == 1024
+    if role == 'coordinator' and geometry == 'dsv4p':
+        # V4 Pro coordinator (RTX PRO 6000, K2/K3, m1024): 64-row blocks with
+        # token-major rotation improve rtx-tp2 w1536 4875.9 -> 4169.3 us (1.169x,
+        # vs _WS_S14 5220.0 us) and rtx-tp1 w3072 9396.5 -> 7891.6 us (1.191x,
+        # vs _WS_S14 10268.8 us). Spark keeps 16/False for cooperative m1024.
+        return capacity > 256
     return geometry == 'dsv4p' and capacity > 1024
 
 

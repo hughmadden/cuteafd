@@ -63,7 +63,8 @@ class GlmExl3PackageTest(unittest.TestCase):
         self.assertEqual([tool.token_major_rotation('glm', c) for c in (80, 256, 1024, 4096)],
                          [False, False, True, True])
         # Other geometries keep their policies.
-        self.assertEqual([tool.route_block('dsv4p', c) for c in (256, 1024, 4096)], [8, 16, 64])
+        self.assertEqual([tool.route_block('dsv4p', c) for c in (256, 1024, 4096)], [8, 64, 64])
+        self.assertEqual([tool.route_block('dsv4p', c, 'spark') for c in (256, 1024, 4096)], [8, 16, 64])
         self.assertEqual(tool.route_block('v41', 4096), 8)
 
 
