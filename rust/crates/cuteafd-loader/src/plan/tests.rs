@@ -186,15 +186,20 @@ fn qwen_mapped_ple_host_staging_matches_runtime_allocations() {
         let dir = snapshot(config, &tensors);
         let input = PlanInput::open(dir.path()).unwrap();
         for (gpus, ranks) in [(1, 0), (2, 0), (1, 4)] {
-            for (unit, k) in [(512usize, 1usize), (2048, 2), (4096, 3), (4096, 4)] {
+            // The launcher currently admits at most two waves; MappedStaging's
+            // geometry test independently covers all four staging depths.
+            for (unit, k) in [(512usize, 1usize), (2048, 2), (4096, 2)] {
                 if ranks == 0 && k != 1 { continue; }
-                let mut report = input.plan(&sparks(ranks)).unwrap();
-                report.prefill_waves = Some(k as u64);
-                report.prefill_span_rows = Some(65536);
-                let options = layout::LayoutOptions { rtx_bytes: vec![96 << 30; gpus],
-                    prefill_unit_rows: Some(unit as u64), prefill_waves: k as u64,
-                    host_cache_bytes: Some(0), host_memory: Some((128 << 30, 128 << 30)), ..Default::default() };
-                layout::charge_host(&mut report, &options, input.checkpoint(), false).unwrap();
+                let report = input.plan(&PlanOptions {
+                    layout: Some(layout::LayoutOptions { rtx_bytes: vec![96 << 30; gpus],
+                        head_split: gpus == 2, prefill_rows: unit as u64, prefill_waves: k as u64,
+                        context_tokens: 32768, prefix_slots: Some(0), host_cache_bytes: Some(0),
+                        host_memory: Some((128 << 30, 128 << 30)), ..Default::default() }),
+                    ..sparks(ranks)
+                }).unwrap();
+                assert!(report.solver_placement.is_some(), "{}", render(&report));
+                assert!(report.memory_layout.as_ref().unwrap().pool_tokens >= 32768);
+                assert_eq!((report.prefill_unit_rows, report.prefill_waves), (Some(unit as u64), Some(k as u64)));
                 let host = report.host_ledger.as_ref().unwrap();
                 let staging = host.items.iter().filter(|item| item.group == "staging/mapped-table").collect::<Vec<_>>();
                 assert_eq!(staging.len(), 1, "a dual-owner engine still has one PLE table");
