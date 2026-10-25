@@ -2119,7 +2119,9 @@ impl Opened {
             let file = read.join_dflash()?;
             let device = prepared.stream.device;
             let draft = device.own(|| DflashDrafter::load(&self.library, snapshot, file, prepared.stream.raw,
-                slots, args.draft_sequences.min(slots), mask, true, representation, args.fp8_scales, args.draft_linear, args.draft_kv_cache))?;
+                slots, args.draft_sequences.min(slots), mask,
+                crate::shared::speculation::dflash::BlockMask { row_window: true, causal: false }, representation,
+                args.fp8_scales, args.draft_linear, args.draft_kv_cache))?;
             dspark::Drafter::RemoteDflash(remote_dflash::RemoteDflash::new(draft, prepared)?)
         } else {
             dspark::Drafter::load(&self.library, snapshot, stream, slots, args.draft_sequences.min(slots),
