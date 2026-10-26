@@ -40,6 +40,10 @@ pub(crate) struct ServeArgs {
     /// Prefill units in flight: Spark waves outstanding on the one transport.
     #[arg(long, default_value_t = 0, value_parser = clap::value_parser!(u8).range(0..=4))]
     prefill_waves: u8,
+    /// Admitted prefill slots of a resolved deployment (#762); 0/unset resolves
+    /// them. Equal to the waves on a static family.
+    #[arg(long, default_value_t = 0, value_parser = clap::value_parser!(u8).range(0..=4))]
+    prefill_slots: u8,
     /// Native predictor depth; 0 disables speculation.
     #[arg(long, default_value_t = 3, value_parser = clap::value_parser!(u8).range(0..=3))]
     mtp: u8,
@@ -77,7 +81,7 @@ impl ServeArgs {
         Ok(prefill_shape(self.peers.len(), cuteafd_loader::plan::Family::prefill_limits(&cuteafd_loader::plan::families::step5::STEP5), PrefillOverrides {
             unit_rows: (self.prefill_rows != 0).then_some(u64::from(self.prefill_rows)),
             waves: (self.prefill_waves != 0).then_some(u64::from(self.prefill_waves)),
-            span_rows: None,
+            span_rows: None, slots: (self.prefill_slots != 0).then_some(u64::from(self.prefill_slots)),
         })?)
     }
 

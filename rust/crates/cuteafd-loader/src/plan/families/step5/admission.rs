@@ -234,7 +234,7 @@ impl RuntimeInputs {
         use crate::serving_capacity::prefill_waves::{prefill_shape, PrefillOverrides};
         prefill_shape(self.inventory.spark_ranks, crate::plan::Family::prefill_limits(&super::STEP5), PrefillOverrides {
             unit_rows: Some(self.unit_rows() as u64), waves: Some(self.waves as u64),
-            span_rows: Some(self.rows as u64),
+            span_rows: Some(self.rows as u64), slots: None,
         })?;
         ensure!(
             cfg.max_context == EXTENT && (FLOOR..=EXTENT).contains(&self.context),

@@ -326,7 +326,7 @@ fn shared_prefill_family_estimates_match_runtime_and_pins_keep_hard_limits() {
             options.prefill_rows = unit;
             options.prefill_lanes = waves;
             let daemon = prefill_shape(6, limits, PrefillOverrides {
-                unit_rows: (unit != 0).then_some(unit), waves: (waves != 0).then_some(waves), span_rows: None,
+                unit_rows: (unit != 0).then_some(unit), waves: (waves != 0).then_some(waves), span_rows: None, slots: None,
             }).unwrap();
             let shape = layout::resolve_prefill(&mut report, &mut options, 6, limits).unwrap();
             assert_eq!(shape, daemon, "planner/daemon prefill mismatch: {}", family.id());

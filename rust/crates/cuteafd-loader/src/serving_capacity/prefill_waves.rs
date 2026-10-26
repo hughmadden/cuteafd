@@ -87,6 +87,8 @@ pub enum PrefillError {
     ReserveExceeded { unit_rows: u64, waves: u64, reserve_rows: u64 },
     #[error("unsupported prefill span: {span_rows} rows must equal {slot_rows} live slot rows within the {max_span_rows}-row shared arena")]
     IntakeSpan { span_rows: u64, slot_rows: u64, max_span_rows: u64 },
+    #[error("unsupported prefill slots: {slots} admitted slots for {waves} waves (an adaptive family admits {waves}..={max_waves}; a static one exactly its waves)")]
+    Slots { slots: u64, waves: u64, max_waves: u64 },
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -94,6 +96,10 @@ pub struct PrefillOverrides {
     pub unit_rows: Option<u64>,
     pub waves: Option<u64>,
     pub span_rows: Option<u64>,
+    /// Admitted slots of a resolved deployment (#762): `waves` starts the
+    /// depth, more slots let an adaptive executor choose. A launch passes the
+    /// deployment's value back; equal to `waves` it pins the depth.
+    pub slots: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -134,6 +140,21 @@ pub fn prefill_shape(spark_ranks: usize, limits: PrefillLimits,
             .map(u64::from).filter(|&rows| rows >= 64 && rows % 64 == 0 && rows <= automatic_budget)
             .max().unwrap_or(0));
         let shape = validate_shape(rows, waves, limits, None);
+        if let (Ok(plan), Some(slots)) = (&shape, explicit.slots) {
+            let plan = *plan;
+            // A resolved deployment: its waves start the depth inside its slots.
+            if slots == waves { return validate_shape(rows, waves, limits, explicit.span_rows); }
+            if !limits.adaptive || spark_ranks == 0 || slots < waves || slots > limits.max_waves.min(MAX_WAVES) {
+                return Err(PrefillError::Slots { slots, waves, max_waves: limits.max_waves.min(MAX_WAVES) });
+            }
+            let span = super::wave_control::reserve_rows(slots, rows);
+            let max_span_rows = limits.max_span_rows.min(RESERVE_ROWS + 64);
+            if explicit.span_rows.is_some_and(|given| given != span) || span > max_span_rows {
+                return Err(PrefillError::IntakeSpan { span_rows: explicit.span_rows.unwrap_or(span),
+                    slot_rows: span, max_span_rows });
+            }
+            return Ok(PrefillPlan { span_rows: span, slots, ..plan });
+        }
         if shape.is_ok() {
             let plan = validate_shape(rows, waves, limits, explicit.span_rows)?;
             // An adaptive family admits every slot up to its executor limit at
@@ -349,6 +370,16 @@ mod tests {
         assert_eq!(prefill_shape(0, limits, Default::default()).unwrap().slots, 1);
         let shallow = PrefillLimits { max_waves: 2, ..limits };
         assert_eq!(prefill_shape(6, shallow, Default::default()).unwrap().slots, 2);
+        // A resolved deployment's slots come back with its waves: adaptive
+        // when more, pinned when equal, refused for static families.
+        let resolved = PrefillOverrides { unit_rows: Some(2752), waves: Some(3), span_rows: Some(8256), slots: Some(4) };
+        assert_eq!(prefill_shape(6, limits, resolved).unwrap(), plan);
+        assert_eq!(prefill_shape(6, limits, PrefillOverrides { slots: Some(3), ..resolved }).unwrap().slots, 3);
+        assert!(matches!(prefill_shape(6, measured(3), resolved), Err(PrefillError::Slots { .. })));
+        assert!(matches!(prefill_shape(6, limits, PrefillOverrides { span_rows: Some(8192), ..resolved }),
+            Err(PrefillError::IntakeSpan { .. })));
+        assert!(matches!(prefill_shape(6, limits, PrefillOverrides { slots: Some(2), ..resolved }),
+            Err(PrefillError::Slots { .. })));
         // A 2048-unit family admits four 2048 slots: nothing to choose.
         let step = PrefillLimits { initial_unit_rows: Some(2048), adaptive: true, ..measured(4) };
         let plan = prefill_shape(6, step, Default::default()).unwrap();

@@ -1291,7 +1291,7 @@ fn measured_initial_unit_is_step_only_and_preserves_explicit_shapes() {
             PrefillPlan { unit_rows: 2048, waves: 4, span_rows: 8192, slots: 4 });
         for (unit, waves) in [(256, 3), (2752, 3), (4096, 2)] {
             assert_eq!(prefill_shape(ranks, limits, PrefillOverrides {
-                unit_rows: Some(unit), waves: Some(waves), span_rows: None,
+                unit_rows: Some(unit), waves: Some(waves), span_rows: None, slots: None,
             }).unwrap(), PrefillPlan { unit_rows: unit, waves, span_rows: unit * waves, slots: waves });
         }
     }
@@ -1306,7 +1306,7 @@ fn adaptive_prefill_selection_preserves_overrides_and_never_retries_on_capacity(
             let shape = crate::serving_capacity::prefill_waves::prefill_shape(sparks,
                 crate::plan::Family::prefill_limits(&super::STEP5),
                 crate::serving_capacity::prefill_waves::PrefillOverrides {
-                    unit_rows: (unit != 0).then_some(unit), waves: (waves != 0).then_some(waves), span_rows: None,
+                    unit_rows: (unit != 0).then_some(unit), waves: (waves != 0).then_some(waves), span_rows: None, slots: None,
                 }).unwrap();
             let (expected_unit, expected_waves) = (shape.unit_rows, shape.waves);
             let report = plan::plan(snapshot.path(), &PlanOptions {

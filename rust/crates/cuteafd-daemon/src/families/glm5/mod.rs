@@ -71,10 +71,13 @@ pub(crate) struct EngineArgs {
     #[arg(long, default_value_t = 0,
         value_parser = clap::value_parser!(u8).range(0..=4))]
     pub prefill_waves: u8,
-    /// Admitted prefill slots (#762), resolved with the waves: the deepest
-    /// depth the executor may choose per call (equal to the waves when pinned).
-    #[arg(skip)]
+    /// Admitted prefill slots of a resolved deployment (#762; 0 resolves them):
+    /// `--prefill-waves` starts the depth, more slots let the executor choose.
+    #[arg(long, default_value_t = 0, value_parser = clap::value_parser!(u8).range(0..=4))]
     pub prefill_slots: u8,
+    /// The resolved admitted slots (equal to the waves when pinned).
+    #[arg(skip)]
+    pub admitted_slots: u8,
     /// Pool-first by default; local requests require an exported RTX backend.
     #[arg(long, env = "RTX_EXPERT_LAYERS", default_value = "auto")]
     pub rtx_expert_layers: cuteafd_loader::placement::Onboard,
@@ -144,11 +147,12 @@ fn resolve_prefill(args: &mut EngineArgs) -> Result<()> {
         unit_rows: (args.prefill_rows > 0).then_some(args.prefill_rows as u64),
         waves: (args.prefill_waves > 0).then_some(u64::from(args.prefill_waves)),
         span_rows: (args.prefill_span_rows > 0).then_some(args.prefill_span_rows as u64),
+        slots: (args.prefill_slots > 0).then_some(u64::from(args.prefill_slots)),
     })?;
     args.prefill_rows = usize::try_from(shape.unit_rows)?;
     args.prefill_waves = u8::try_from(shape.waves)?;
     args.prefill_span_rows = usize::try_from(shape.span_rows)?;
-    args.prefill_slots = u8::try_from(shape.slots)?;
+    args.admitted_slots = u8::try_from(shape.slots)?;
     Ok(())
 }
 
@@ -308,7 +312,7 @@ mod draft_cli_tests {
             argv.extend_from_slice(extra);
             let mut args = Parse::try_parse_from(argv).unwrap().engine;
             resolve_prefill(&mut args).unwrap();
-            (args.prefill_rows, args.prefill_waves, args.prefill_span_rows, args.prefill_slots)
+            (args.prefill_rows, args.prefill_waves, args.prefill_span_rows, args.admitted_slots)
         };
         assert_eq!(resolve(&[]), (2752, 3, 8256, 4));
         assert_eq!(resolve(&["--prefill-waves", "3"]), (2752, 3, 8256, 3));
@@ -319,7 +323,12 @@ mod draft_cli_tests {
             peers.as_str()]).unwrap().engine;
         resolve_prefill(&mut args).unwrap();
         resolve_prefill(&mut args).unwrap();
-        assert_eq!((args.prefill_waves, args.prefill_slots), (3, 3));
+        assert_eq!((args.prefill_waves, args.admitted_slots), (3, 3));
+        // A launch passes its deployment's slots back: adaptive stays adaptive.
+        assert_eq!(resolve(&["--prefill-rows", "2752", "--prefill-waves", "3", "--prefill-span-rows", "8256",
+            "--prefill-slots", "4"]), (2752, 3, 8256, 4));
+        assert_eq!(resolve(&["--prefill-rows", "2752", "--prefill-waves", "3", "--prefill-span-rows", "8256",
+            "--prefill-slots", "3"]), (2752, 3, 8256, 3));
     }
 
     #[test]
@@ -812,7 +821,7 @@ impl Opened {
         }
         // Admitted slots (#762): every per-slot owner covers the deepest depth
         // the executor may run; a pinned or one-wave shape admits its waves.
-        let prefill_lanes = usize::from(args.prefill_slots.max(args.prefill_waves));
+        let prefill_lanes = usize::from(args.admitted_slots.max(args.prefill_waves));
         ensure!(owners.is_none() || prefill_lanes <= cuteafd_loader::placement::LAYER_PIPELINE_MAX_LANES as usize,
             "layer-owned prefill lacks capacity for {prefill_lanes} waves");
         let exchange_f32 = glm::local_exchange_f32()?;

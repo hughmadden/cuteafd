@@ -41,6 +41,10 @@ pub(crate) struct ServeArgs {
     /// Prefill units in flight on one transport; unset follows the shared six-Spark policy.
     #[arg(long, value_parser = clap::value_parser!(u8).range(1..=4))]
     pub prefill_waves: Option<u8>,
+    /// Admitted prefill slots of a resolved deployment (#762; unset resolves them):
+    /// `--prefill-waves` starts the depth, more slots let the executor choose.
+    #[arg(long, value_parser = clap::value_parser!(u8).range(1..=4))]
+    pub prefill_slots: Option<u8>,
     #[command(flatten)] pub prefix: PrefixArgs,
     #[command(flatten)] pub decode_share: crate::shared::prefill_share::DecodeShareArgs,
     #[command(flatten)] pub token_io: crate::shared::token_io::TokenIoArgs,
@@ -63,6 +67,7 @@ impl ServeArgs {
         Ok(prefill_shape(6, cuteafd_loader::plan::Family::prefill_limits(&cuteafd_loader::plan::families::kimi::KIMI_K3), PrefillOverrides {
             unit_rows: self.prefill_rows.map(|rows| rows as u64),
             waves: self.prefill_waves.map(u64::from), span_rows: None,
+            slots: self.prefill_slots.map(u64::from),
         })?)
     }
 

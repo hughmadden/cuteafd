@@ -696,7 +696,7 @@ pub fn resolve_prefill(report: &mut PlanReport, options: &mut LayoutOptions,
     let unit_rows = (options.prefill_rows > 0).then_some(options.prefill_rows)
         .or(options.prefill_unit_rows);
     let shape = prefill_shape(spark_ranks, limits, PrefillOverrides {
-        unit_rows, waves, span_rows: options.prefill_span_rows,
+        unit_rows, waves, span_rows: options.prefill_span_rows, slots: None,
     })?;
     options.prefill_rows = shape.unit_rows;
     options.prefill_unit_rows = Some(shape.unit_rows);
@@ -706,6 +706,7 @@ pub fn resolve_prefill(report: &mut PlanReport, options: &mut LayoutOptions,
     options.spark_capacity_rows = shape.unit_rows;
     report.prefill_unit_rows = Some(shape.unit_rows);
     report.prefill_waves = Some(shape.waves);
+    report.prefill_slots = Some(shape.slots);
     report.prefill_span_rows = Some(shape.span_rows);
     report.prefill_transports = Some(u64::from(spark_ranks > 0));
     Ok(shape)

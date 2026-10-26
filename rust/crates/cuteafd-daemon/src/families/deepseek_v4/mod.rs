@@ -55,6 +55,10 @@ pub(crate) struct EngineArgs {
     /// Independently outstanding units; defaults to one locally, two below six Sparks, three otherwise.
     #[arg(long)]
     pub prefill_waves: Option<usize>,
+    /// Admitted prefill slots of a resolved deployment (#762); 0/unset resolves
+    /// them. Equal to the waves on a static family.
+    #[arg(long)]
+    pub prefill_slots: Option<usize>,
     /// Sequences that can be resident at once (compressor state slots).
     #[arg(long, default_value_t = 8)]
     pub max_sequences: usize,
@@ -255,7 +259,8 @@ impl EngineArgs {
         prefill_shape(ranks, PrefillLimits { max_unit_rows: compiled_rows.min(4096),
             max_waves: if ranks == 0 { 1 } else { cuteafd_loader::serving_capacity::prefill_waves::MAX_WAVES }, ..cuteafd_loader::plan::Family::prefill_limits(&cuteafd_loader::plan::families::deepseek::DEEPSEEK_V4) },
             PrefillOverrides { unit_rows: self.prefill_rows.map(|rows| rows as u64),
-                waves: self.prefill_waves.map(|waves| waves as u64), span_rows })
+                waves: self.prefill_waves.map(|waves| waves as u64), span_rows,
+                slots: self.prefill_slots.map(|slots| slots as u64) })
     }
 
     /// The resolved `--rtx-expert-layers` / `--local-expert-layers`.

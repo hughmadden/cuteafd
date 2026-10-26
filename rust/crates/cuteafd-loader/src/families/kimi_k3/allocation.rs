@@ -308,7 +308,7 @@ pub fn prefill_shape_with(rows: usize, waves: usize, unit: Option<usize>)
         "Kimi lane row/wave capacity: {rows} rows x {waves} waves");
     Ok(prefill_shape(6, PrefillLimits::default(), PrefillOverrides {
         unit_rows: Some(unit.unwrap_or(rows / waves) as u64), waves: Some(waves as u64),
-        span_rows: Some(rows as u64),
+        span_rows: Some(rows as u64), slots: None,
     })?.units())
 }
 
