@@ -769,7 +769,7 @@ def docker_command(state, name, arm, slot, out_dir, golden, packages=None):
         mounts.append((state['fixtures'], state['fixtures']))
     if packages is not None:
         mounts.append((str(packages), SPARK_PACKAGES))
-    cmd = ['docker', 'run', '--rm', '--name', container_name(state['task'], name),
+    cmd = ['docker', 'run', '--rm', '--init', '--name', container_name(state['task'], name),
            '--label', f"cuteafd.golden-run={state['task']}/{name}",
            *state['serving_args'], *cards.cdi_gpu_args(gpus), '--ipc', 'host',
            '--ulimit', 'memlock=-1:-1']
@@ -1078,7 +1078,7 @@ def compare_one(state, python, tool, args, out, record):
         cmd = [*python, str(tool), *args]
     else:  # the dev image has numpy; read-only views of the outputs
         image = state['slots'][record['a']]['image_id']
-        cmd = ['docker', 'run', '--rm', '--network', 'none', '--user', f'{os.getuid()}:{os.getgid()}',
+        cmd = ['docker', 'run', '--rm', '--init', '--network', 'none', '--user', f'{os.getuid()}:{os.getgid()}',
                '-v', f'{tool}:{tool}:ro', '-v', f"{state['root']}:{state['root']}", '--entrypoint',
                'python3', image, str(tool), *args]
     proc = subprocess.run(cmd, capture_output=True, text=True, timeout=3600)

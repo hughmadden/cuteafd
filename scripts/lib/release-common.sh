@@ -541,7 +541,7 @@ release_serving_docker_args() {
   user="$(id -un)"
   primary_group="$(id -g)"
   read -ra groups <<<"$(id -G)"
-  RELEASE_SERVING_ARGS=(--user "$(id -u):$(id -g)"
+  RELEASE_SERVING_ARGS=(--init --user "$(id -u):$(id -g)"
     -e "USER=$user" -e "LOGNAME=$user" -e HOME=/tmp/cuteafd-home
     -e HF_HOME=/hf -e CUTEAFD_BENCH_DIR=/run/cuteafd/bench
     -e TORCH_EXTENSIONS_DIR=/tmp/cuteafd-home/torch-extensions
