@@ -161,3 +161,23 @@ def test_wip_dev_cargo_features_are_dev_only_keyed_and_reach_cargo():
     assert subprocess.run(['bash', '-c', check.format('dev-test,dev-x')]).returncode == 0
     for bad in ('prod', 'dev-test default', 'dev_x'):
         assert subprocess.run(['bash', '-c', check.format(bad)]).returncode == 3, bad
+
+
+def test_performance_cores_detects_runtime_big_core_frequency(tmp_path):
+    for cpu in range(20):
+        path = tmp_path / f'cpu{cpu}/cpufreq'
+        path.mkdir(parents=True)
+        (path / 'cpuinfo_max_freq').write_text('3900000' if cpu % 2 else '2808000')
+    result = run(f'cuteafd_performance_cores {tmp_path}', arch='aarch64')
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == '10'
+
+
+def test_build_parallelism_only_changes_gb10():
+    for arch, expected in [('aarch64', '10 10'), ('x86_64', '16 16')]:
+        result = run('CMAKE_BUILD_PARALLEL_LEVEL=16; CARGO_BUILD_JOBS=16; '
+                     'cuteafd_performance_cores() { echo 10; }; '
+                     'cuteafd_build_parallelism; '
+                     'echo "$CMAKE_BUILD_PARALLEL_LEVEL $CARGO_BUILD_JOBS"', arch=arch)
+        assert result.returncode == 0, result.stderr
+        assert result.stdout.strip() == expected

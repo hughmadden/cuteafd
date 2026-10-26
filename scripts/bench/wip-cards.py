@@ -888,7 +888,7 @@ def observe(job):
             gpu_list = ','.join(map(str, e['gpus']))
             image = e['set'].get('COORDINATOR_DOCKER_DEV', 'cuteafd-coordinator-dev')
             owner = hashlib.sha256(job['state'].encode()).hexdigest()
-            cmd = ['docker', 'run', '--rm', '-i', '--name', name, '--label', 'cuteafd.card.owner=' + owner, '--pid=host', '--network=none', *cdi_gpu_args(gpu_list.split(',')), '-e', 'CARD_GPUS=' + gpu_list, '--entrypoint', 'python3', image, '-u', '-c', CUDA_SAMPLER]
+            cmd = ['docker', 'run', '--rm', '--init', '-i', '--name', name, '--label', 'cuteafd.card.owner=' + owner, '--pid=host', '--network=none', *cdi_gpu_args(gpu_list.split(',')), '-e', 'CARD_GPUS=' + gpu_list, '--entrypoint', 'python3', image, '-u', '-c', CUDA_SAMPLER]
             sampler = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=memory, stderr=subprocess.PIPE, text=True)
         trace_path = Path(job['entry']['set']['SPECULATION_TRACE']) if job.get('trace') else None
         trace_due = None
@@ -1639,7 +1639,7 @@ NEST_BUILD_AREA = Path('/mnt/sparknest/build-cache/wip')
 
 def build_scopes(cards):
     env = family_scopes(cards, config)
-    env.update(CUTEAFD_KACHE_SPARK='1', CUTEAFD_WIP_EXPORT_LOCKS='on', CUTEAFD_KACHE=str(Path.home() / '.cache/cuteafd/tools/x86_64/kache'), CARGO_BUILD_JOBS='16', RUST_TEST_THREADS='16', CMAKE_BUILD_PARALLEL_LEVEL='16')
+    env.update(CUTEAFD_KACHE_SPARK='1', CUTEAFD_WIP_EXPORT_LOCKS='on', CUTEAFD_KACHE=str(Path.home() / '.cache/cuteafd/tools/x86_64/kache'), CARGO_BUILD_JOBS='16', RUST_TEST_THREADS='16')
     return env
 
 

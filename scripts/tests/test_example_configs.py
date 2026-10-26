@@ -625,7 +625,7 @@ def test_v4_matrix_card_set_and_retired_pins() -> None:
     for name, gpus, sparks in [
         ("v41-flash-max", 2, 6), ("v41-flash-reference-tp4", 1, 4),
         ("v4-flash-reference-tp4", 1, 4), ("glm53-exl3-max", 2, 6),
-        ("glm53-exlr8-min", 1, 4), ("glm53-exlr8-max", 2, 6),
+        ("glm53-exlr8-min", 1, 4), ("glm53-exlr8-max", 2, 6), ("glm53-exlr8-a8-max", 2, 6),
         ("kimi-k3-max", 2, 6), ("step5-fp8-max", 2, 6),
         ("step5-nvfp4-min", 1, 4), ("qwen38-27b-bf16-min", 1, 0),
         ("qwen38-27b-fp8-min", 1, 0), ("qwen35-9b-bf16-min", 1, 0),
@@ -634,6 +634,10 @@ def test_v4_matrix_card_set_and_retired_pins() -> None:
         assert len(entries[name]["gpus"]) == gpus
         assert len(entries[name]["sparks"]) == sparks
         assert entries[name]["set"]["SPARK_COUNT"] == str(sparks)
+    a8 = entries["glm53-exlr8-a8-max"]
+    assert a8 == {**entries["glm53-exlr8-max"], "name": "glm53-exlr8-a8-max", "set": {
+        **entries["glm53-exlr8-max"]["set"], "EXLR8_PREFILL_ACTIVATIONS": "a8",
+        "ADDR": a8["set"]["ADDR"], "EXPERT_PORT": a8["set"]["EXPERT_PORT"]}}
     dense = [entry for entry in v4["entries"] if entry["family"] == "qwen3_5"]
     assert {entry["name"]: entry["set"]["SPECULATOR"] for entry in dense} == {
         "qwen35-9b-bf16-min": "off", "qwen38-27b-bf16-min": "dspark",

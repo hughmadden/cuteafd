@@ -112,11 +112,37 @@ cuteafd_host_isa_install() {
   done
 }
 
-# cuteafd_native_build_args: extra Ninja arguments for `cmake --build DIR --`.
-# GB10 (every aarch64 builder) has 10 Cortex-X925 + 10 Cortex-A725 cores, about
-# 15 X925-equivalents; -j stays CMAKE_BUILD_PARALLEL_LEVEL (or Ninja's default)
-# and -l 14 stops starting compiles and exports while the host is already
-# loaded, a brake on the overload behind GB10 driver NV_ERR_NO_MEMORY failures.
+# CPU concurrency on heterogeneous GB10 is the number of performance cores,
+# not all logical CPUs. cpu_capacity varies with firmware/frequency, whereas
+# cpuinfo_max_freq identifies the two core classes without hardcoding a count.
+cuteafd_performance_cores() {
+  local path value max=0 count=0
+  local root="${1:-/sys/devices/system/cpu}"
+  local -a values=()
+  for path in "$root"/cpu[0-9]*/cpufreq/cpuinfo_max_freq; do
+    [[ -r "$path" ]] || continue
+    value="$(<"$path")"
+    [[ "$value" =~ ^[1-9][0-9]*$ ]] || continue
+    values+=("$value")
+    ((value <= max)) || max="$value"
+  done
+  for value in "${values[@]}"; do
+    ((value != max)) || count=$((count + 1))
+  done
+  ((count > 0)) || count="$(nproc)"
+  printf '%s\n' "$count"
+}
+
+cuteafd_build_parallelism() {
+  [[ "$(uname -m)" == aarch64 ]] || return 0
+  local cores
+  cores="$(cuteafd_performance_cores)"
+  # The build executes on this host, not the x86 launcher forwarding its -j.
+  export CMAKE_BUILD_PARALLEL_LEVEL="$cores" CARGO_BUILD_JOBS="$cores"
+  echo "GB10 build parallelism: $cores performance cores" >&2
+}
+
+# A load brake complements the explicit CPU job budget.
 cuteafd_native_build_args() {
-  [[ "$(uname -m)" != aarch64 ]] || printf '%s\n' -l 14
+  [[ "$(uname -m)" != aarch64 ]] || printf '%s\n' -l "$(cuteafd_performance_cores)"
 }
