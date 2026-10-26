@@ -377,8 +377,9 @@ does the following:
 
 **Ingress dtype.** Each endpoint has a typed `SparkIngress`
 ([core/expert_geometry.rs:57](../../rust/crates/cuteafd-core/src/expert_geometry.rs#L57)):
-`Fp8K32`, `Bf16`, or `Bf16Decode { rows }` (BF16 decode rows and FP8 K32
-prefill on one QP). Two checks keep the wire and the kernels in agreement:
+`Fp8K32`, `Bf16`, `Bf16Decode { rows }` (BF16 decode rows and FP8 K32
+prefill on one QP), or `Native` (each layer's package input dtype). Two checks
+keep the wire and the kernels in agreement:
 
 - The worker checks the installed packages against the endpoint before serving
   (`validate_ingress`, [service/backend.rs:132](../../rust/crates/cuteafd-daemon/src/shared/experts/service/backend.rs#L132);
@@ -386,11 +387,11 @@ prefill on one QP). Two checks keep the wire and the kernels in agreement:
 - Each request's header dtype must match the bound kernel's native input
   (`require_input_dtype`, [transport/expert.rs:322](../../rust/crates/cuteafd-transport/src/expert.rs#L322)).
 
-So per-layer native input already works on the wire. **Landing (#802):**
-`SparkIngress::Native` lets each layer use its package's native input. Step
-uses FP8 K32 on its FP8 layers and BF16 on layers 88–90, with fail-closed
-package validation. Send the checkpoint's native activation format; don't
-convert on the coordinator to fit an endpoint
+`SparkIngress::Native` lets each layer use its package's native input, with
+BF16-max ring and intake capacity and fail-closed package validation. Step FP8
+uses FP8 K32 on layers 3–87 and native BF16 on layers 88–90; Step NVFP4 keeps
+BF16 wire. Send the checkpoint's native activation format; don't convert on
+the coordinator to fit an endpoint
 ([AGENTS.md "Engineering principles"](../../AGENTS.md#engineering-principles)).
 
 ## 5. Admission and the planner
