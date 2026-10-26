@@ -125,7 +125,8 @@ pub(crate) async fn run(args: ServeArgs) -> Result<()> {
                 peers: worker_args.peers.clone(), rtx_expert_layers: worker_args.rtx_expert_layers,
                 spark_budget_gib: worker_args.spark_budget_gib,
                 rows: usize::try_from(prefill.span_rows)?, waves: usize::try_from(prefill.waves)?,
-                prefill_rows: Some(usize::try_from(prefill.unit_rows)?), slots, marks,
+                prefill_rows: Some(usize::try_from(prefill.unit_rows)?),
+                prefill_slots: usize::try_from(prefill.slots)?, slots, marks,
                 max_context: worker_args.max_context(&cuteafd_loader::plan::families::kimi::core_inventory(&checkpoint)?),
                 pool_tokens: worker_args.pool_tokens.filter(|&tokens| tokens > 0), graphs: true,
                 ffn_mode: cuteafd_ffi::KimiFfnMode::default(), hosted_layers: None, draft, verify_rows: 0,
@@ -222,14 +223,15 @@ mod tests {
         testing::write_kimi_snapshot(snapshot.path(), true);
         let plan_input = cuteafd_loader::plan::testing::BudgetedPlanInput::open(snapshot.path())?;
         let peers = "127.0.0.1:1,127.0.0.1:2,127.0.0.1:3,127.0.0.1:4,127.0.0.1:5,127.0.0.1:6";
-        for (extra, expected) in [
-            (vec![], (2752, 3, 8256)),
+        for (extra, expected, slots) in [
+            // Unpinned: start 3×2752, admit four slots in the same reserve (#762).
+            (vec![], (2752, 3, 8256), 4),
             // Units are the 8192-row reserve divided by k.
-            (vec!["--prefill-waves", "2"], (4096, 2, 8192)),
-            (vec!["--prefill-rows", "4096", "--prefill-waves", "2"], (4096, 2, 8192)),
-            (vec!["--prefill-waves", "3"], (2752, 3, 8256)),
-            (vec!["--prefill-waves", "4"], (2048, 4, 8192)),
-            (vec!["--prefill-rows", "1024", "--prefill-waves", "2"], (1024, 2, 2048)),
+            (vec!["--prefill-waves", "2"], (4096, 2, 8192), 2),
+            (vec!["--prefill-rows", "4096", "--prefill-waves", "2"], (4096, 2, 8192), 2),
+            (vec!["--prefill-waves", "3"], (2752, 3, 8256), 3),
+            (vec!["--prefill-waves", "4"], (2048, 4, 8192), 4),
+            (vec!["--prefill-rows", "1024", "--prefill-waves", "2"], (1024, 2, 2048), 2),
         ] {
             let mut argv = vec!["--peers", peers];
             argv.extend(extra);
@@ -237,6 +239,10 @@ mod tests {
             args.validate()?;
             let shape = args.prefill()?;
             assert_eq!((shape.unit_rows, shape.waves, shape.span_rows), expected);
+            assert_eq!(shape.slots, slots, "{expected:?}");
+            // The Spark reserve the runtime charges is the planner's admitted one.
+            assert_eq!(cuteafd_loader::families::kimi_k3::spark_reserve_bytes(shape.slots, shape.unit_rows)?,
+                cuteafd_loader::families::kimi_k3::spark_reserve_bytes(shape.admitted().waves, shape.admitted().unit_rows)?);
             assert_eq!(allocation::prefill_shape_with(shape.span_rows as usize, shape.waves as usize,
                 Some(shape.unit_rows as usize))?, shape.units());
             let options = PlanOptions { placement: ExpertPlacement::Sparks { ranks: 6 },

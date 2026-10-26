@@ -289,11 +289,13 @@ pub fn io_extents(vocab: usize, rank: usize, rows: usize, core_head: bool) -> [u
     else { [0, rows.min(64) * vocab * 4, if core_head { 0 } else { 4 << 20 }] }
 }
 
-/// One return slot per prefill wave in flight, each a unit of latent rows
-/// from all six ranks (`prefill_return_bytes`).
+/// Return slots for the admitted prefill units, from all six ranks: one
+/// reserve range per rank that every depth up to `shape.waves` slots of at
+/// most `shape.unit_rows` is cut from (#762, `wave_control::reserve_rows`).
 pub fn spark_demand(shape: crate::serving_capacity::PrefillShape, lane: usize) -> Demand {
+    let reserve = crate::serving_capacity::wave_control::reserve_rows(shape.waves, shape.unit_rows);
     Demand::new(1, Category::Workspace, format!("Kimi Spark lane {lane} latent intake"),
-        crate::serving_capacity::prefill_return_bytes(shape.waves, shape.unit_rows, 6, 3584), Basis::Exact)
+        crate::serving_capacity::prefill_return_bytes(1, reserve, 6, 3584), Basis::Exact)
 }
 
 /// Row planes hold exactly the admitted units; scratch and return slots serve

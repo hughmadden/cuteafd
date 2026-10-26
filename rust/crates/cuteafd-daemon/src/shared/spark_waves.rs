@@ -745,6 +745,8 @@ pub(crate) struct Waves<'a> {
     grouping: Vec<cuteafd_transport::worker_selection::InstalledExpertGrouping>,
     /// Waves sent now belong to a prefill call ([`Self::begin_prefill`]).
     prefill: bool,
+    /// The last prefill call's final wave, until its pace is taken.
+    prefill_last: Option<u32>,
     /// The worker's always-on round-trip and Spark idle means (#762).
     pace: std::sync::Arc<LinkPace>,
 }
@@ -811,7 +813,7 @@ impl<'a> Waves<'a> {
             unread: vec![false; slots], uses: vec![0; slots], ranks: intake.ranks, row_bytes: intake.row_bytes,
             next_slot: intake.next_slot % cut.waves, geometry: intake.geometry, cut_at: 0, sequence: 0,
             outstanding: VecDeque::new(), grouping, pace,
-            prefill: false })
+            prefill: false, prefill_last: None })
     }
 
     /// Re-cuts the reserve into `waves` return slots of `rows` rows for the
@@ -1050,6 +1052,7 @@ impl<'a> Waves<'a> {
         ensure!(self.outstanding.is_empty(), "a prefill call begins with no Spark wave outstanding");
         *self.pace.prefill() = PrefillAccumulator::default();
         self.prefill = true;
+        self.prefill_last = None;
         Ok(())
     }
 
@@ -1060,12 +1063,25 @@ impl<'a> Waves<'a> {
     /// host (`landed`, e.g. after the consuming stream drained); waves still
     /// outstanding are refused rather than silently missing from the sums.
     pub(crate) fn end_prefill(&mut self) -> Result<cuteafd_loader::serving_capacity::wave_control::PrefillPace> {
-        self.prefill = false;
-        // The worker adds a wave's pace before it publishes the wave's
-        // landing, so every wave the host sees landed is in the sums.
-        ensure!(reached(self.words.load(Counter::Landed), self.sequence),
-            "a prefill call's pace is read only after its waves landed");
-        Ok(self.pace.prefill().finish())
+        self.stop_prefill();
+        self.take_prefill().context("a prefill call's pace is read only after its waves landed")
+    }
+
+    /// Stops flagging waves as the prefill call's (its last wave was sent);
+    /// its waves may still be in flight. Later waves (decode) are not summed.
+    pub(crate) fn stop_prefill(&mut self) {
+        if std::mem::replace(&mut self.prefill, false) { self.prefill_last = Some(self.sequence); }
+    }
+
+    /// The last prefill call's Spark pace once its last wave landed on the
+    /// host (the worker sums a wave before publishing its landing). Read at
+    /// the next decode→prefill transition, without any host wait: `None`
+    /// when the host has not seen that landing yet (the sample is skipped).
+    pub(crate) fn take_prefill(&mut self) -> Option<cuteafd_loader::serving_capacity::wave_control::PrefillPace> {
+        let last = self.prefill_last?;
+        if !reached(self.words.load(Counter::Landed), last) { return None; }
+        self.prefill_last = None;
+        Some(self.pace.prefill().finish())
     }
 
     /// Stops the worker and returns the transport (after a failure, with its

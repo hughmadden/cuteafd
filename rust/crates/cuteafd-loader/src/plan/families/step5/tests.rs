@@ -1288,11 +1288,11 @@ fn measured_initial_unit_is_step_only_and_preserves_explicit_shapes() {
     assert_eq!((limits.max_unit_rows, limits.max_waves, limits.max_span_rows), (4096, 4, 8256));
     for ranks in [4, 6] {
         assert_eq!(prefill_shape(ranks, limits, Default::default()).unwrap(),
-            PrefillPlan { unit_rows: 2048, waves: 4, span_rows: 8192 });
+            PrefillPlan { unit_rows: 2048, waves: 4, span_rows: 8192, slots: 4 });
         for (unit, waves) in [(256, 3), (2752, 3), (4096, 2)] {
             assert_eq!(prefill_shape(ranks, limits, PrefillOverrides {
                 unit_rows: Some(unit), waves: Some(waves), span_rows: None,
-            }).unwrap(), PrefillPlan { unit_rows: unit, waves, span_rows: unit * waves });
+            }).unwrap(), PrefillPlan { unit_rows: unit, waves, span_rows: unit * waves, slots: waves });
         }
     }
 }

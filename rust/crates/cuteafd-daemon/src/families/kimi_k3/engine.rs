@@ -29,14 +29,18 @@ pub(crate) struct Engine<'a> {
     // PeerExchange and HopLink borrow raw handles; keep their exact streams
     // after both links and their terminal abort storage have been released.
     exchange_streams: [Rc<Stream<'a>>; 2],
-    /// Prefill units: their rows and how many are in flight on the lane.
+    /// Prefill units: the admitted unit and slots, and the starting depth.
     prefill: PrefillUnits,
+    /// The runtime depth within the admitted slots (#762 stages 2–4).
+    depth: crate::shared::prefill_depth::PrefillDepth,
+    /// Units in flight the last unit call actually ran (`waves_used`).
+    last_waves: std::cell::Cell<usize>,
 }
 
 /// The lane holds `waves` units of `unit_rows`; a step of `rows` is cut into
 /// equal units of at most `unit_rows` (`prefill_units`).
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct PrefillUnits { pub unit_rows: usize, pub waves: usize }
+pub(crate) struct PrefillUnits { pub unit_rows: usize, pub waves: usize, pub slots: usize, pub pinned: bool }
 
 impl Drop for Engine<'_> {
     fn drop(&mut self) {
@@ -133,7 +137,7 @@ impl<'a> Engine<'a> {
         let catalog = cuteafd_loader::read_expert_catalog(&checkpoint.snapshot)?;
         let executions = cuteafd_loader::plan::spark_executions::admit_family("kimi_k3",
             &cuteafd_loader::plan::spark_executions::SparkBackend::for_catalog(&catalog)?.exports(), None,
-            u64::from(rows), admission.waves() as u64)?;
+            u64::from(rows), admission.slots() as u64)?;
         let model = ModelAdmission::new(endpoints, spark_rings(config.max_frame_bytes)?, executions)?;
         model.validate(ExpertGeometry::KIMI_K3)?;
         let spark = SparkAdmission::plan(&checkpoint.snapshot, ExpertGeometry::KIMI_K3,
@@ -177,7 +181,10 @@ impl<'a> Engine<'a> {
         let world = SparkWorld::canonical(6)?;
         let routed = local.iter().map(|pair| admission.connect_spark(library, &pair[1],
             world, peers.clone(), config.clone())).collect::<Result<Vec<_>>>()?;
-        let prefill = PrefillUnits { unit_rows: admission.unit_rows(), waves: admission.waves() };
+        let prefill = PrefillUnits { unit_rows: admission.unit_rows(), waves: admission.waves(),
+            // Admitting only the starting depth's slots pins it (explicit
+            // PREFILL_WAVES, goldens); more slots let the executor choose.
+            slots: admission.slots(), pinned: admission.slots() == admission.waves() };
         let mut engine = Self::bind(exchange_streams, plan, peer, hops, local, routed, io, experts, prefill)?;
         engine.draft = draft.map(Rc::new);
         *engine.draft_probe.borrow_mut() = draft_probe;
@@ -206,7 +213,9 @@ impl<'a> Engine<'a> {
         }
         let streams = local.iter().map(|pair| pair.each_ref().map(|local| local.stream().clone())).collect();
         let execution = Execution::new(plan, &peer, &hops, exchange_streams.clone(), streams)?;
-        Ok(Self { draft: None, draft_probe: RefCell::new(None), execution, lanes: RefCell::new(Lanes { local, routed, io, experts }),
+        let depth = crate::shared::prefill_depth::PrefillDepth::new(prefill.waves, prefill.slots, prefill.unit_rows,
+            prefill.pinned)?;
+        Ok(Self { depth, last_waves: std::cell::Cell::new(0), draft: None, draft_probe: RefCell::new(None), execution, lanes: RefCell::new(Lanes { local, routed, io, experts }),
             prefix: RefCell::new(None), startup_captures: Cell::new(None), provisional: RefCell::new(None),
             hops, peer, exchange_streams, prefill })
     }
@@ -222,12 +231,16 @@ impl<'a> Engine<'a> {
         Ok(family)
     }
 
-    fn prefill_units(&self, rows: usize) -> Result<Vec<crate::shared::prefill_pipeline::Unit>> {
+    /// Units of one call at `depth` (#762: chosen at the decode→prefill transition).
+    fn prefill_units(&self, rows: usize, depth: crate::shared::prefill_depth::Depth)
+        -> Result<Vec<crate::shared::prefill_pipeline::Unit>> {
         let layers = self.execution.plan.modes().len();
-        let units = crate::shared::prefill_pipeline::prefill_units(rows, self.prefill.unit_rows, self.prefill.waves, 256)?;
+        let units = crate::shared::prefill_pipeline::prefill_units(rows, depth.unit_rows, depth.waves, 256)?;
+        // The pipeline reports the depth it ran (fewer for short prompts).
+        self.last_waves.set(units.len().min(depth.waves));
         // Every unit's rows lie in the lane; a slot is the unit's row range.
         Ok(units.into_iter().enumerate().map(|(index, rows)| crate::shared::prefill_pipeline::Unit {
-            index, sequence: 0, rows, layers: 0..layers, slot: index % self.prefill.waves, barrier: false }).collect())
+            index, sequence: 0, rows, layers: 0..layers, slot: index % depth.waves, barrier: false }).collect())
     }
 
     pub(crate) fn geometry(&self) -> Result<crate::shared::qwen::scheduler::Geometry> {
@@ -382,11 +395,14 @@ impl<'a> Engine<'a> {
             lanes.io[0][0].embed(&tokens, lanes.local[0][0].buffer("delta")?)?;
             let Lanes { local, routed, io, experts } = &mut *lanes;
             for binding in &mut local[0] { binding.enable_replay(graphed); }
-            let units = self.prefill_units(rows)?;
             let result = if unit_call {
-                self.execution.run_units(scope, &self.peer, &self.hops, &mut local[0],
-                    &mut routed[0], &mut experts[0], &units, self.prefill.waves, &metadata[0], pool,
-                    self.draft.as_deref()).map(|output| vec![output])
+                let depth = routed[0].start_prefill(&self.depth, &self.last_waves)?;
+                let units = self.prefill_units(rows, depth)?;
+                let ran = self.execution.run_units(scope, &self.peer, &self.hops, &mut local[0],
+                    &mut routed[0], &mut experts[0], &units, depth.waves, &metadata[0], pool,
+                    self.draft.as_deref()).map(|output| vec![output]);
+                routed[0].stop_prefill()?;
+                ran
             } else {
                 ensure!(rows <= self.prefill.unit_rows, "Kimi {rows}-row multi-sequence step exceeds one prefill unit");
                 self.execution.run(scope, &self.peer, &self.hops,
@@ -577,9 +593,12 @@ impl<'a> Engine<'a> {
             }
             let Lanes { local, routed, io, experts } = &mut *lanes;
             let normalized = if unit_call {
-                let units = self.prefill_units(rows[0])?;
-                vec![self.execution.run_units(scope, &self.peer, &self.hops, &mut local[0],
-                    &mut routed[0], &mut experts[0], &units, self.prefill.waves, &sequences[0][0], pool, None)?]
+                let depth = routed[0].start_prefill(&self.depth, &self.last_waves)?;
+                let units = self.prefill_units(rows[0], depth)?;
+                let ran = self.execution.run_units(scope, &self.peer, &self.hops, &mut local[0],
+                    &mut routed[0], &mut experts[0], &units, depth.waves, &sequences[0][0], pool, None);
+                routed[0].stop_prefill()?;
+                vec![ran?]
             } else {
                 ensure!(rows.iter().sum::<usize>() <= self.prefill.unit_rows,
                     "Kimi multi-sequence diagnostic step exceeds one prefill unit");
