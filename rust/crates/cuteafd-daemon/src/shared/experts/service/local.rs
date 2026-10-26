@@ -327,20 +327,22 @@ pub(super) fn run(mut config: NativeExpertServiceConfig, listen: &str) -> Result
         let mut budget = remaining;
         // Consume the maximum-unit warmed exports before constructing narrower
         // decode owners, whose module sets need not have the same capacities.
-        for index in std::iter::once(owners.decode.len()).chain(0..owners.decode.len()) {
-            let (capacity, compiled) = if index == owners.decode.len() {
-                (owners.prefill.capacity, owners.prefill.compiled_capacity)
-            } else { (owners.decode[index].capacity, owners.decode[index].compiled_capacity) };
+        let mut extents: Vec<_> = owners.owners().collect();
+        extents.rotate_right(1);
+        for extent in extents {
+            let index = match extent.owner {
+                cuteafd_core::ExecutionOwner::Decode(lane) => lane,
+                cuteafd_core::ExecutionOwner::Prefill => owners.decode.len(),
+            };
             let before = cuteafd_ffi::memory_ledger::snapshot().total(cuteafd_ffi::memory_ledger::Space::Device, device);
             let mut owner_config = config.clone();
-            owner_config.capacity = capacity;
+            owner_config.capacity = extent.capacity;
             let mut execution = {
                 let _memory_scope = cuteafd_ffi::memory_ledger::scope(
                     if index < owners.decode.len() { "experts/workspace/decode" } else { "experts/workspace/prefill" });
-                weights.execution(&library, &owner_config, compiled, budget, &mut modules)?
+                weights.execution(&library, &owner_config, extent.compiled, budget, &mut modules)?
             };
-            let staging_rows = if index == owners.decode.len() { owners.prefill.unit_rows } else { capacity };
-            execution.defer(queues.limits[index], staging_rows as usize)?;
+            execution.defer(usize::from(extent.buffered_units), extent.staging_rows as usize)?;
             let used = cuteafd_ffi::memory_ledger::snapshot().total(cuteafd_ffi::memory_ledger::Space::Device, device)
                 .saturating_sub(before);
             budget = budget.checked_sub(used).context("Spark execution owners exceed admitted workspace")?;
@@ -731,8 +733,7 @@ struct OwnerQueues {
 }
 impl OwnerQueues {
     fn new(owners: &cuteafd_transport::worker_selection::SparkExecutions) -> Self {
-        let limits: Vec<_> = std::iter::repeat_n(1, owners.decode.len())
-            .chain(std::iter::once(usize::from(owners.prefill.buffered_units))).collect();
+        let limits: Vec<_> = owners.owners().map(|extent| usize::from(extent.buffered_units)).collect();
         let capacity = limits.iter().sum();
         Self { retained: vec![0; limits.len()],
             pending: limits.iter().map(|&limit| std::collections::VecDeque::with_capacity(limit)).collect(),

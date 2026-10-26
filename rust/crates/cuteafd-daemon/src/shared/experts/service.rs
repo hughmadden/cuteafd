@@ -395,21 +395,14 @@ fn spark_runtime_headroom() -> Result<usize> {
 fn spark_execution_workspace(config: &NativeExpertServiceConfig,
     mut plan: impl FnMut(u32, u32, u32) -> Result<(usize, usize, usize)>)
     -> Result<cuteafd_core::expert_geometry::SparkWorkspaceBytes> {
-    use cuteafd_core::expert_geometry::{spark_owner_workspace_bytes, SparkOwnerWorkspace};
     let executions = &config.model_admission.as_ref()
         .context("Spark workspace requires typed execution admission")?.executions;
     executions.validate()?;
-    let mut owners = Vec::with_capacity(executions.decode.len() + 1);
-    for (capacity, compiled, staging_rows, buffered_units) in executions.decode.iter()
-        .map(|owner| (owner.capacity, owner.compiled_capacity, owner.capacity, 1))
-        .chain(std::iter::once((executions.prefill.capacity,
-            executions.prefill.compiled_capacity, executions.prefill.unit_rows, executions.prefill.buffered_units))) {
-        let (scratch, io, pinned) = plan(capacity, compiled, staging_rows)?;
-        owners.push(SparkOwnerWorkspace { scratch_bytes: u64::try_from(scratch)?,
-            io_bytes: u64::try_from(io)?, pinned_staging_bytes: u64::try_from(pinned)?,
-            buffered_units });
-    }
-    spark_owner_workspace_bytes(owners).context("Spark execution workspace overflow")
+    executions.workspace_bytes(|extent| {
+        let (scratch, io, pinned) = plan(extent.capacity, extent.compiled, extent.staging_rows)?;
+        Ok::<_, anyhow::Error>(cuteafd_core::OwnerBytes { scratch: u64::try_from(scratch)?,
+            io: u64::try_from(io)?, pinned_staging: u64::try_from(pinned)? })
+    })?.context("Spark execution workspace overflow")
 }
 
 fn spark_admission_budget(
