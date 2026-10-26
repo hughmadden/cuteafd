@@ -434,7 +434,7 @@ mod tests {
             let alias = library.cuda_host_buffer_device_alias(frames[unit].buffer)?;
             let field = |bytes: &[u8]| CuteafdDeviceBuffer {
                 ptr: bytes.as_ptr().cast_mut().cast(), bytes: bytes.len(), ..alias };
-            let mapped = ProtocolV2RequestDevicePayload { routes: field(view.route_bytes()),
+            let mapped = ProtocolV2RequestDevicePayload {
                 hidden_payload: field(view.hidden_payload()), execution_lane: 0,
                 response_slot: Some(library.cuda_host_buffer_device_alias(replies[unit].buffer)?) };
             worker.bind_layer(unit % 2)?;
