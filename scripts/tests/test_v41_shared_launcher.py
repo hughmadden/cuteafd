@@ -87,6 +87,9 @@ def test_shared_launcher_matches_the_private_v41_path(case: str, tmp_root) -> No
                 expected_options.extend(f"--device nvidia.com/gpu={name}" for name in names)
             else:
                 expected_options.append(option)
+        # Serving containers run under --init (tini forwards SIGTERM to the daemon).
+        if "--init" not in expected_options:
+            expected_options.append("--init")
         assert after["options"] == sorted(expected_options), where
         # shared_thermal_args also mounts the host power governor's state read-only
         # when gpu-powerd runs on this host (#114).
