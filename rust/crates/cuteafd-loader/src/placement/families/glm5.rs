@@ -853,12 +853,17 @@ fn nvfp4_inventory(catalog: &crate::OfficialV41Catalog, manifest: &std::path::Pa
 /// expert and layer; neither a proportional half nor EXL3 storage is valid.
 fn exlr8_expert_costs(snapshot: &std::path::Path, selected: &str, first: usize, layers: usize,
     router: &[crate::plan::exlr8::dense::DenseRecord]) -> anyhow::Result<Vec<ExpertCost>> {
-    use crate::plan::exlr8::residency::{ExpertSet, Residency};
+    exlr8_expert_costs_of(&crate::plan::exlr8::residency::MetadataInput::open(snapshot, selected)?, first, layers, router)
+}
+
+fn exlr8_expert_costs_of(input: &crate::plan::exlr8::residency::MetadataInput, first: usize, layers: usize,
+    router: &[crate::plan::exlr8::dense::DenseRecord]) -> anyhow::Result<Vec<ExpertCost>> {
+    use crate::plan::exlr8::residency::ExpertSet;
     (first..layers).map(|layer| {
-        let whole = Residency::plan(snapshot, selected, layer, 1, 0, ExpertSet::Routed)?.resident_bytes as u64;
+        let whole = input.plan(layer, 1, 0, ExpertSet::Routed)?.resident_bytes as u64;
         let mut half = [Bytes2::default(); 2];
         for (rank, cost) in half.iter_mut().enumerate() {
-            cost.resident = Residency::plan(snapshot, selected, layer, 2, rank, ExpertSet::Routed)?.resident_bytes as u64;
+            cost.resident = input.plan(layer, 2, rank, ExpertSet::Routed)?.resident_bytes as u64;
         }
         for record in router.iter().filter(|record| record.tensor.starts_with(&format!("model.layers.{layer}.mlp.gate."))) {
             for component in &record.components {
@@ -874,6 +879,14 @@ fn exlr8_expert_costs(snapshot: &std::path::Path, selected: &str, first: usize, 
 pub fn exlr8_inventory(snapshot: &std::path::Path, selected: &str, manifest: &std::path::Path,
     selected_layers: usize, rows: u64, lanes: u64, exchange_f32: bool,
     activations: crate::plan::exlr8::PrefillActivations) -> anyhow::Result<LocalInventory> {
+    let input = crate::plan::exlr8::residency::MetadataInput::open(snapshot, selected)?;
+    exlr8_inventory_with_metadata(snapshot, manifest, selected_layers, rows, lanes, exchange_f32, activations, &input)
+}
+
+pub(crate) fn exlr8_inventory_with_metadata(snapshot: &std::path::Path, manifest: &std::path::Path,
+    selected_layers: usize, rows: u64, lanes: u64, exchange_f32: bool,
+    activations: crate::plan::exlr8::PrefillActivations, input: &crate::plan::exlr8::residency::MetadataInput)
+    -> anyhow::Result<LocalInventory> {
     anyhow::ensure!(!exchange_f32, "GLM EXLR8 TP2 emits BF16 routed partials; use BF16 exchange");
     let config = crate::plan::checkpoint::read_json(&snapshot.join("config.json"))?;
     let cfg = GlmDsaConfig::from_hf(&config)?;
@@ -889,7 +902,7 @@ pub fn exlr8_inventory(snapshot: &std::path::Path, selected: &str, manifest: &st
             anyhow::ensure!(records.iter().any(|record| record.tensor == name), "EXLR8 missing local router {name}");
         }
     }
-    let experts = exlr8_expert_costs(snapshot, selected, cfg.first_moe_layer, selected_layers, &records)?;
+    let experts = exlr8_expert_costs_of(input, cfg.first_moe_layer, selected_layers, &records)?;
     Ok(LocalInventory { package: manifest.to_path_buf(), format: GlmLocalFormat::Exlr8, experts, backend_workspace,
         extra_workspace: local_extra_workspace(cfg.hidden as u64, cfg.experts as u64, cfg.topk as u64, rows, lanes, false) })
 }

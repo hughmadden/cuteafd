@@ -146,12 +146,13 @@ pub(super) fn native_plan_of(input: &super::PlanInput, selected: &str,
     let cfg = crate::families::glm5::GlmDsaConfig::from_hf(&checkpoint.config)?;
     ensure!(cfg.hidden == 6144 && cfg.layers == 78 && cfg.first_moe_layer == 3,
         "EXLR8 native full-forward requires GLM-5.3 78 layers/hidden6144/first routed3");
-    let (_, set_id) = manifest_identity(snapshot, selected)?;
     let catalog_timer = super::PhaseTimer::new(&input.phases.catalog, &[]);
+    let metadata = residency::MetadataInput::open(snapshot, selected)?;
+    let set_id = metadata.identity.clone();
     let mut shared = vec![0u64; gpu_count];
     for layer in cfg.first_moe_layer..cfg.layers {
         for (rank, resident) in shared.iter_mut().enumerate() {
-            let plan = residency::Residency::plan(snapshot, selected, layer, gpu_count, rank, residency::ExpertSet::Shared)?;
+            let plan = metadata.plan(layer, gpu_count, rank, residency::ExpertSet::Shared)?;
             *resident = resident.checked_add(plan.resident_bytes as u64).context("EXLR8 shared residency overflow")?;
         }
     }
@@ -161,18 +162,18 @@ pub(super) fn native_plan_of(input: &super::PlanInput, selected: &str,
     drop(catalog_timer);
     let (memory, placement) = {
         let _timer = super::PhaseTimer::new(&input.phases.layout, &[]);
-        super::layout::glm5::native_layout(checkpoint, layout, &shared, workspace, world, &programs, Some(selected))?
+        super::layout::glm5::native_layout_with_metadata(checkpoint, layout, &shared, workspace, world, &programs, Some(selected), Some(&metadata))?
     };
     let catalog_timer = super::PhaseTimer::new(&input.phases.catalog, &[]);
     let first_spark = cfg.first_moe_layer + placement.onboard_layers;
     let selected_world = if first_spark == cfg.layers { 0 } else { world };
-    let residents = spark_resident_bytes(snapshot, selected, &(first_spark..cfg.layers).collect::<Vec<_>>(), selected_world)?;
+    let residents = spark_resident_bytes_of(&metadata, &(first_spark..cfg.layers).collect::<Vec<_>>(), selected_world)?;
     ensure!(residents.iter().all(|&bytes| bytes <= options.spark_budget()),
         "EXLR8 selected Spark suffix exceeds Spark budget before live workspace admission");
     let mut local_routed = 0u64;
     for layer in cfg.first_moe_layer..first_spark {
         for rank in 0..gpu_count {
-            local_routed = local_routed.checked_add(residency::Residency::plan(snapshot, selected,
+            local_routed = local_routed.checked_add(metadata.plan(
                 layer, gpu_count, rank, residency::ExpertSet::Routed)?.resident_bytes as u64)
                 .context("EXLR8 local routed residency overflow")?;
         }
@@ -247,15 +248,22 @@ pub fn spark_resident_bytes(snapshot: &Path, selected: &str, layers: &[usize], w
         ensure!(world == 0, "EXLR8 empty Spark suffix must select zero ranks");
         return Ok(Vec::new());
     }
-    let config = read_json(&snapshot.join("config.json"))?;
-    let config = config.get("text_config").unwrap_or(&config);
+    spark_resident_bytes_of(&residency::MetadataInput::open(snapshot, selected)?, layers, world)
+}
+
+fn spark_resident_bytes_of(input: &residency::MetadataInput, layers: &[usize], world: usize) -> Result<Vec<u64>> {
+    if layers.is_empty() {
+        ensure!(world == 0, "EXLR8 empty Spark suffix must select zero ranks");
+        return Ok(Vec::new());
+    }
+    let config = input.config.get("text_config").unwrap_or(&input.config);
     let extent = usize::try_from(config["num_hidden_layers"].as_u64().context("EXLR8 layer extent missing")?)?;
     let first = usize::try_from(config["first_k_dense_replace"].as_u64().context("EXLR8 routed layer start missing")?)?;
     ensure!((1..=8).contains(&world) && layers.first().is_some_and(|&layer| layer >= first)
         && layers.last().copied() == extent.checked_sub(1)
         && layers.windows(2).all(|pair| pair[0] + 1 == pair[1]), "EXLR8 selected Spark suffix/rank geometry");
     (0..world).map(|rank| layers.iter().try_fold(0u64, |sum, &layer| {
-        let bytes = residency::Residency::plan(snapshot, selected, layer, world, rank, residency::ExpertSet::Routed)?.resident_bytes as u64;
+        let bytes = input.plan(layer, world, rank, residency::ExpertSet::Routed)?.resident_bytes as u64;
         sum.checked_add(bytes).context("EXLR8 Spark suffix residency overflow")
     })).collect()
 }
