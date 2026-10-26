@@ -10,7 +10,7 @@ use cuteafd_core::memory_layout::{Basis, Category, DeviceKind, DeviceLayout, Ite
 const GIB: u64 = 1 << 30;
 
 pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut PlanReport,
-    opts: &crate::plan::layout::LayoutOptions, requested: ExpertPlacement) -> anyhow::Result<MemoryLayout> {
+    opts: &mut crate::plan::layout::LayoutOptions, requested: ExpertPlacement) -> anyhow::Result<MemoryLayout> {
     use anyhow::{ensure, Context};
     use crate::placement::{inventory, Onboard, ProgramSet, SparkAssignment, SparkResidentLayout};
     use admission::{AdmissionError, RuntimeSizing};
@@ -185,8 +185,13 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
         report.bytes_by_owner.insert("host-mapped embedding".into(), edge(Component::Embedding));
         memory.notes.push("embedding placement: host (mapped BF16); untied LM head remains on GPU".into());
     }
-    report.prefill_rows = Some(rows as u64);
-    report.prefill_lanes = Some(lanes as u64);
+    // The shared prefill shape in MiniMax's lane terms, until it moves onto prefill units: each
+    // lane is its own Spark transport carrying one wave of up to `rows` rows, and a chunk spans
+    // the lanes. Host admission charges every transport's intake for that one wave.
+    report.prefill_span_rows = Some(chunk as u64);
+    report.prefill_transports = Some(lanes as u64);
+    opts.prefill_unit_rows = Some(rows as u64);
+    opts.prefill_waves = 1;
     report.attention_placement = AttentionPlacement::Heads;
     report.encoder = Some(encoder);
     if recipe.remote_scratch.is_none() { memory.notes.push("Remote expert scratch reserves 512 MiB per rank until measured worker admission; it is not an exact remote allocation ledger".into()); }

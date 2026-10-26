@@ -260,6 +260,13 @@ impl DraftPagePool {
         }).collect())
     }
 
+    /// Read-only attention view of the committed prefix, without creating a producer lease.
+    pub fn committed_page_table(&self, binding: DraftBinding) -> Result<Vec<i32>> {
+        let sequence = self.sequence(binding)?;
+        if sequence.pending.is_some() { return Err(DraftPageError::Frontier); }
+        Ok(sequence.pages.iter().map(|&page| page as i32).collect())
+    }
+
     /// Includes the provisional suffix. The caller bounds attention with the committed
     /// frontier and query offsets; page membership does not make proposal rows committed.
     pub fn page_table(&self, reservation: DraftReservation) -> Result<Vec<i32>> {
@@ -379,6 +386,26 @@ impl DraftPagePool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn committed_attention_table_rejects_pending_and_stale_bindings() {
+        let mut pool = DraftPagePool::new(256, 2, 262144, 1).unwrap();
+        let binding = pool.bind(0, 8191).unwrap();
+        assert!(pool.committed_page_table(binding).unwrap().is_empty());
+        let reservation = pool.reserve(binding, 8191, 65).unwrap();
+        let expected = pool.page_table(reservation).unwrap();
+        assert!(pool.committed_page_table(binding).is_err());
+        pool.commit(reservation, 65).unwrap();
+        assert_eq!(pool.committed_page_table(binding).unwrap(), expected);
+        let (snapshot, _) = pool.capture(binding).unwrap();
+        let (restored, _) = pool.restore(1, snapshot, 8256).unwrap();
+        let table = pool.committed_page_table(restored).unwrap();
+        assert_eq!(table.len(), 2);
+        assert_eq!(table[0], expected[0]);
+        assert_ne!(table[1], expected[1]);
+        pool.release(binding).unwrap();
+        assert!(pool.committed_page_table(binding).is_err());
+    }
 
     #[test]
     fn aggregate_live_pressure_defers_instead_of_rejecting_a_request_that_fits_alone() {

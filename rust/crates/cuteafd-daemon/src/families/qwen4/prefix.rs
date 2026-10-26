@@ -51,9 +51,29 @@ pub(crate) struct Qwen4Prefix<'e, 'a> {
     mark_layout: MarkLayout,
     arenas: Vec<Rc<Allocation<'a>>>,
     slots: usize,
+    /// Per execution owner: the prefix copy stream, fenced against that owner's stream; and
+    /// the owner index of each device.
+    copies: crate::shared::prefix::PrefixCopies<'a>,
+    owners: Vec<i32>,
 }
 
+/// Device copies `(owner, destination, source)` queued as one batch.
+type Copies = Vec<(usize, CuteafdDeviceBuffer, CuteafdDeviceBuffer)>;
+
 impl<'e, 'a> Qwen4Prefix<'e, 'a> {
+    /// Resolve the real owner geometry without allocating the mark arenas.
+    pub(super) fn geometry(engine: &Qwen4Engine<'_>) -> Result<FamilyLayout> {
+        let paged = engine.paged_buffers();
+        ensure!(!paged.is_empty(), "Qwen 3.8 Flash Next without a full-attention layer");
+        let regions = engine.snapshot_regions(0);
+        let mark = MarkLayout::new(&regions.iter().map(|r| (r.device_id, r.bytes)).collect::<Vec<_>>())?;
+        ensure!(mark.bytes > 0, "Qwen 3.8 Flash Next without GDN state");
+        Ok(FamilyLayout { page_rows: UNIT_ROWS, pages: engine.pool_pages,
+            page_bytes: paged.len() * (UNIT_ROWS * (engine.kv_record_bytes + KEY_BYTES) + POOL_PAGE_BYTES),
+            mark_bytes: mark.bytes, draft_bytes: 0, rule: ReuseRule::EXACT,
+            mark_store: MarkStore::Arena, page_owners: Default::default() })
+    }
+
     /// The family over `engine`'s buffers with a device arena of `slots(mark_bytes)` marks.
     pub fn new(engine: &'e Qwen4Engine<'a>, slots: impl FnOnce(usize) -> usize) -> Result<Self> {
         let _memory_scope = cuteafd_ffi::memory_ledger::scope("prefix");
@@ -78,7 +98,11 @@ impl<'e, 'a> Qwen4Prefix<'e, 'a> {
                 Allocation::new(Device { library: engine.library, id }, bytes).map(Rc::new)
             }).collect::<Result<Vec<_>>>()?
         };
-        Ok(Self { engine, paged, mark_bytes, mark_layout, arenas, slots })
+        let streams = engine.owner_streams();
+        let copies = crate::shared::prefix::PrefixCopies::new(engine.library, streams.iter()
+            .map(|&(device, stream)| vec![crate::shared::prefix::Reader { device, stream }]).collect())?;
+        let owners = streams.into_iter().map(|(device, _)| device).collect();
+        Ok(Self { engine, paged, mark_bytes, mark_layout, arenas, slots, copies, owners })
     }
 
     pub fn mark_bytes(&self) -> usize {
@@ -93,13 +117,20 @@ impl<'e, 'a> Qwen4Prefix<'e, 'a> {
         self.slots
     }
 
-    fn copy(&self, dst: CuteafdDeviceBuffer, src: CuteafdDeviceBuffer) -> Result<()> {
+    /// Adds a copy to `copies` on its device's owner.
+    fn copy(&self, copies: &mut Copies, dst: CuteafdDeviceBuffer, src: CuteafdDeviceBuffer) -> Result<()> {
         ensure!(dst.bytes == src.bytes && dst.device_id == src.device_id, "Qwen snapshot region mismatch");
-        let stream = self.engine.state_stream(dst.device_id)?;
-        // SAFETY: views belong to retained allocations and serialize with owner-local forward passes.
-        Device { library: self.engine.library, id: dst.device_id }.run(|| unsafe {
-            self.engine.library.copy_d2d_async(dst, src, src.bytes, stream)
-        })
+        let owner = self.owners.iter().position(|&device| device == dst.device_id)
+            .context("Qwen snapshot device without an execution owner")?;
+        copies.push((owner, dst, src));
+        Ok(())
+    }
+
+    /// Queues `copies` on their owners' prefix copy streams.
+    fn submit(&self, copies: &Copies) -> Result<()> {
+        // SAFETY: views belong to retained allocations of their owner's device (checked by
+        // `view`); the cache drains the copy streams before it hands that storage to anyone.
+        unsafe { self.copies.copy_d2d(copies) }
     }
 
     /// The device ranges of one unit, per paged layer: records, raw index keys, pooled keys.
@@ -135,10 +166,11 @@ impl<'e, 'a> Qwen4Prefix<'e, 'a> {
         let regions = self.engine.snapshot_regions(state as usize);
         let marks = self.mark_buffers(slot)?;
         ensure!(regions.len() == marks.len(), "Qwen snapshot region count changed");
+        let mut copies = Copies::new();
         for (region, mark) in regions.into_iter().zip(marks) {
-            if capture { self.copy(mark, region)?; } else { self.copy(region, mark)?; }
+            if capture { self.copy(&mut copies, mark, region)?; } else { self.copy(&mut copies, region, mark)?; }
         }
-        Ok(())
+        self.submit(&copies)
     }
 
 }
@@ -240,22 +272,24 @@ impl PrefixFamily<Frontier> for Qwen4Prefix<'_, '_> {
 
     fn copy_rows(&self, copy: TailCopy) -> Result<(), BoxError> {
         let blocks = copy.rows / BLOCK;
+        let mut copies = Copies::new();
         for &[records, keys, pools] in &self.paged {
             for (buffer, row) in [(records, self.engine.kv_record_bytes), (keys, KEY_BYTES)] {
-                self.copy(view(buffer, copy.to as usize * UNIT_ROWS * row, copy.rows * row)?,
+                self.copy(&mut copies, view(buffer, copy.to as usize * UNIT_ROWS * row, copy.rows * row)?,
                     view(buffer, copy.from as usize * UNIT_ROWS * row, copy.rows * row)?)?;
             }
             // The complete blocks' pooled keys.
             if blocks > 0 {
                 let (from, to) = (copy.from as usize * POOL_PAGE_BYTES, copy.to as usize * POOL_PAGE_BYTES);
-                self.copy(view(pools, to, blocks * BLOCK_KEY_BYTES)?, view(pools, from, blocks * BLOCK_KEY_BYTES)?)?;
+                self.copy(&mut copies, view(pools, to, blocks * BLOCK_KEY_BYTES)?,
+                    view(pools, from, blocks * BLOCK_KEY_BYTES)?)?;
             }
         }
-        Ok(())
+        Ok(self.submit(&copies)?)
     }
 
     fn drain(&self) -> Result<(), BoxError> {
-        Ok(self.engine.drain_state()?)
+        Ok(self.copies.drain()?)
     }
 
     fn page_segments(&self, page: u32) -> Vec<DeviceRange> {

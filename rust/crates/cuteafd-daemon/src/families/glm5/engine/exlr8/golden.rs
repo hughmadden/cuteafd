@@ -259,7 +259,7 @@ fn native_layer3_same_quant() -> Result<()> {
             tensor.meta.name
         );
     }
-    let args = Args::try_parse_from([
+    let mut argv = vec![
         "exlr8-gate".into(),
         "--snapshot".into(),
         snapshot.into_os_string(),
@@ -269,8 +269,6 @@ fn native_layer3_same_quant() -> Result<()> {
         std::env::var_os("CUTEAFD_PROGRAM_MANIFEST").context("program manifest")?,
         "--exlr8-manifest".into(),
         "up1".into(),
-        "--exlr8-dense-from".into(),
-        dense.into_os_string(),
         "--layers".into(),
         "4".into(),
         "--max-context".into(),
@@ -279,17 +277,22 @@ fn native_layer3_same_quant() -> Result<()> {
         "256".into(),
         "--prefill-rows".into(),
         ROWS.last().unwrap().to_string().into(),
-        "--rtx-expert-layers".into(),
-        "0".into(),
+        "--split-device".into(),
+        "1".into(),
         "--l2-prefetch".into(),
         "off".into(),
         "--peers".into(),
         std::env::var_os("CUTEAFD_GOLDEN_PEERS").context("real worker peers")?,
-    ])?
-    .engine;
+    ];
+    if let Some(layers) = std::env::var_os("CUTEAFD_GOLDEN_RTX_EXPERT_LAYERS") {
+        argv.extend(["--rtx-expert-layers".into(), layers]);
+    }
+    let args = Args::try_parse_from(argv)?.engine;
     let opened = crate::families::glm5::open(&args)?;
-    opened.with_engine(&args, |engine, transport, runtime| {
-        let transport = transport.context("native gate needs real workers")?;
+    opened.with_engine(&args, |engine, transport, _runtime| {
+        let mut transport = transport;
+        let peers = engine.peer_workspaces(false, 1)?.context("native gate needs two GPUs")?;
+        let w1 = peers.get(0)?;
         // Retain the admitted serial workspace and drain on both success and error
         // before with_engine drops transport or native owners.
         let mut workspaces = engine.lane_workspaces.borrow_mut();
@@ -315,51 +318,50 @@ fn native_layer3_same_quant() -> Result<()> {
                     ],
                     &[Scalar::I32(rows as i32), Scalar::I32(0)],
                 )?;
-                engine.moe(
-                    w,
-                    3,
-                    &engine.weights.layers[3],
-                    rows,
-                    "m4096",
-                    false,
-                    transport,
-                    runtime,
-                )?;
-                let staged = w.router_host.borrow();
-                let request = expert_request(
-                    staged.bytes(),
-                    3,
-                    rows,
-                    h,
-                    engine.cfg.topk,
-                    false,
-                    engine.spark_bf16,
-                )?;
-                ensure!(
-                    request.header.hidden_dtype
-                        == cuteafd_transport::ExpertV2Dtype::Fp8E4m3Ue8m0K32,
-                    "same-quant gate requires standard Fp8K32 requests"
-                );
-                let wire = request.hidden_payload.as_ref();
+                let normalized = engine.download(&w.x, rows * h * 2)?;
+                engine.on(1, || engine.put(&w1.x, &normalized))?;
+                let (second, deltas) = if engine.tp2_layer(3) {
+                    let pair = engine.tp2.as_ref().context("native TP2 fixture")?;
+                    let name = if rows > 64 { "exlr8_a16_grouped" } else { "exlr8_a16_serving" };
+                    ensure!(pair.group_rows(rows)? == cuteafd_ffi::exlr8::group_rows(engine.programs.spec(name)?)?,
+                        "native TP2 serving grouping differs from the export ABI");
+                    engine.moe_front(w, &engine.weights.layers[3], rows)?;
+                    engine.shared_on(1, 3, w1, &engine.peer()?.layers[3], Scalar::I32(rows as i32), "m4096")?;
+                    engine.tp2_pair(3, 0, w, w1, rows, "m4096")?;
+                    engine.exchange()?.wait(0, slot(3, true, 0))?;
+                    let pair = engine.tp2.as_ref().context("native TP2 fixture")?;
+                    // SAFETY: both FFN payloads are published on retained streams before the sum.
+                    unsafe { pair.combine.sum(w.payload.as_ref().context("TP2 payload")?.buffer.ptr,
+                        engine.recv(0, slot(3, true, 0))?, w.delta.buffer.ptr.cast(), rows, h, engine.stream)?; }
+                    (w.delta.buffer.ptr, 1)
+                } else {
+                    let transport = transport.as_deref_mut().context("remote fixture needs real workers")?;
+                    engine.moe(w, 3, &engine.weights.layers[3], rows, "m4096", false, transport)?;
+                    engine.shared_on(1, 3, w1, &engine.peer()?.layers[3], Scalar::I32(rows as i32), "m4096")?;
+                    engine.exchange()?.push(1, slot(3, true, 0), w1.shared.buffer.ptr, rows * h * 2)?;
+                    engine.exchange()?.wait(0, slot(3, true, 0))?;
+                    // Serving folds both FFN planes into the residual norm without a rounded intermediate sum.
+                    (engine.recv(0, slot(3, true, 0))?, 2)
+                };
+                let wire = engine.download(&w.wire, rows * (h + h / 32))?;
                 let out = PathBuf::from(std::env::var("CUTEAFD_GOLDEN_OUT")?);
-                std::fs::write(out.join(format!("r{rows}_actual_wire.bin")), wire)?;
+                std::fs::write(out.join(format!("r{rows}_actual_wire.bin")), &wire)?;
                 let expected_wire = load("wire", "torch.uint8", &[rows, h + h / 32])?;
                 ensure!(
                     wire == expected_wire,
                     "native request differs from NumPy FP8 K32 oracle at {rows} rows"
                 );
-                drop(staged);
-                // The ordinary reducer writes delta; norm applies the residual in place.
+                // Local payloads already combined; remote keeps both planes, as serving does.
                 engine.run(
                     "glm_norm",
                     &[
                         ("residual", w.h.buffer.ptr),
                         ("delta0", w.delta.buffer.ptr),
-                        ("delta1", w.delta.buffer.ptr),
+                        ("delta1", second),
                         ("weight", engine.weights.layers[3].ptr("post_norm")?),
                         ("out", w.x.buffer.ptr),
                     ],
-                    &[Scalar::I32(rows as i32), Scalar::I32(1)],
+                    &[Scalar::I32(rows as i32), Scalar::I32(deltas)],
                 )?;
                 let actual = engine.download(&w.h, rows * h * 2)?;
                 let ids = engine.download(&w.route_ids, rows * engine.cfg.topk * 4)?;
@@ -390,18 +392,28 @@ fn native_layer3_same_quant() -> Result<()> {
             }
             Ok(())
         })();
-        // SAFETY: all engine, workspace and transport allocations are retained here.
-        let drained = unsafe { engine.library.cuda_stream_synchronize(engine.stream) };
-        result.and(drained.map_err(Into::into))
+        let drained = (0..2).try_for_each(|rank| engine.on(rank, || {
+            // SAFETY: both rank workspaces and every payload remain retained here.
+            unsafe { engine.library.cuda_stream_synchronize(engine.stream_of(rank)) }
+        }));
+        result.and(drained)
     })
 }
 
 /// Keep projection and attention row shapes identical: the serial arm finishes
-/// each chunk, while the pipeline schedules the same three chunks layer-major.
+/// each chunk, while the pipeline schedules the same chunks layer-major.
 #[test]
 #[ignore = "requires native SM120 exports, two GPUs and real EXLR8 workers"]
 fn native_prefill_lanes_byte_exact() -> Result<()> {
-    prefill_lanes_byte_exact(3072, 1024)
+    prefill_lanes_byte_exact(3072, 1024, 3)
+}
+
+#[test]
+#[ignore = "requires native SM120 exports, two GPUs and real EXLR8 workers"]
+fn native_prefill_two_waves_byte_exact() -> Result<()> {
+    ensure!(std::env::var("CUTEAFD_SPARK_INTAKE").as_deref() == Ok("pinned"),
+        "two-wave exactness gate requires pinned intake on both links");
+    prefill_lanes_byte_exact(8192, 4096, 2)
 }
 
 #[test]
@@ -409,25 +421,24 @@ fn native_prefill_lanes_byte_exact() -> Result<()> {
 fn native_prefill_lanes_long_byte_exact() -> Result<()> {
     let lengths = std::env::var("CUTEAFD_EXLR8_LANE_LENGTHS").unwrap_or_else(|_| "10771,16384,32768".into());
     for length in lengths.split(',') {
-        prefill_lanes_byte_exact(length.parse()?, 4096)?;
+        prefill_lanes_byte_exact(length.parse()?, 4096, 3)?;
     }
     Ok(())
 }
 
-fn prefill_lanes_byte_exact(total: usize, chunk: usize) -> Result<()> {
+fn prefill_lanes_byte_exact(total: usize, chunk: usize, waves: usize) -> Result<()> {
     use clap::Parser;
     #[derive(Parser)]
     struct Args {
         #[command(flatten)]
         engine: crate::families::glm5::EngineArgs,
     }
-    const LANES: usize = 3;
     let context = total.next_multiple_of(2 * PAGE_ROWS);
     let mut shape = Vec::new();
     let mut start = 0;
     while start < total {
-        let batch = (total - start).min(chunk * LANES);
-        let count = LANES.min(batch / MIN_LANE_ROWS).max(1);
+        let batch = (total - start).min(chunk * waves);
+        let count = waves.min(batch / MIN_LANE_ROWS).max(1);
         let per_lane = batch.div_ceil(count).next_multiple_of(PAGE_ROWS);
         let mut first = 0;
         while first < batch {
@@ -437,7 +448,7 @@ fn prefill_lanes_byte_exact(total: usize, chunk: usize) -> Result<()> {
         }
         start += batch;
     }
-    eprintln!("EXLR8 lane golden total={total} chunk={chunk} shape={shape:?}");
+    eprintln!("EXLR8 lane golden total={total} chunk={chunk} waves={waves} shape={shape:?}");
     let args = Args::try_parse_from([
         "exlr8-lanes".into(),
         "--snapshot".into(),
@@ -447,14 +458,13 @@ fn prefill_lanes_byte_exact(total: usize, chunk: usize) -> Result<()> {
         "--manifest".into(),
         std::env::var_os("CUTEAFD_PROGRAM_MANIFEST").context("program manifest")?,
         "--exlr8-manifest".into(), "up1".into(),
-        "--exlr8-dense-from".into(),
-        std::env::var_os("CUTEAFD_EXLR8_DENSE_SNAPSHOT").context("dense snapshot")?,
         "--device".into(), "0".into(),
         "--split-device".into(), "1".into(),
         "--attention-placement".into(), "context".into(),
         "--max-context".into(), context.to_string().into(),
         "--pool-tokens".into(), context.to_string().into(),
         "--prefill-rows".into(), chunk.to_string().into(),
+        "--prefill-waves".into(), waves.to_string().into(),
         "--rtx-expert-layers".into(), "0".into(),
         "--l2-prefetch".into(), "off".into(),
         "--peers".into(),
@@ -462,8 +472,9 @@ fn prefill_lanes_byte_exact(total: usize, chunk: usize) -> Result<()> {
     ])?.engine;
     let opened = crate::families::glm5::open(&args)?;
     opened.with_engine(&args, |engine, transport, runtime| {
-        ensure!(engine.prefill_lanes == LANES && engine.lanes.borrow().len() == LANES,
-            "lane exactness gate requires exactly three admitted prefill lanes");
+        ensure!(engine.prefill_lanes == waves
+            && engine.prefill_link.borrow().as_ref().is_some_and(|link| link.waves() == waves),
+            "lane exactness gate requires exactly {waves} admitted waves on the prefill link");
         ensure!(engine.native_experts.len() == 2, "lane gate requires native shared owners");
         let transport = transport.context("lane gate needs real workers")?;
         let mut allocator = PageAllocator::new(engine);
@@ -531,11 +542,14 @@ fn prefill_lanes_byte_exact(total: usize, chunk: usize) -> Result<()> {
             let serial_state = snapshot()?;
             clear()?;
             let mut pipelined = None;
-            for (batch, (tables, chunks)) in tables.chunks(LANES).zip(chunks.chunks(LANES)).enumerate() {
-                let last = (batch + 1) * LANES >= shape.len();
+            for (batch, (tables, chunks)) in tables.chunks(waves).zip(chunks.chunks(waves)).enumerate() {
+                let last = (batch + 1) * waves >= shape.len();
                 eprintln!("EXLR8 lane golden pipeline total={total} batch={batch} rows={:?}",
                     chunks.iter().map(|chunk| chunk.len()).collect::<Vec<_>>());
-                let logits = engine.host_logits(engine.step_lanes(tables, chunks, usize::from(last))?)?;
+                let mut link = engine.prefill_link.borrow_mut();
+                let link = link.as_mut().context("EXLR8 lane golden needs the prefill link")?;
+                let runtime = engine.prefill_runtime.as_ref().context("prefill runtime")?;
+                let logits = engine.host_logits(engine.step_lanes(tables, chunks, usize::from(last), link, runtime)?)?;
                 if last { pipelined = logits; }
                 else { ensure!(logits.is_none(), "zero-row pipeline prefill returned logits"); }
             }
@@ -550,7 +564,7 @@ fn prefill_lanes_byte_exact(total: usize, chunk: usize) -> Result<()> {
             ensure!(serial.len() == pipelined.len() && serial.iter().zip(&pipelined)
                 .all(|(a, b)| a.is_finite() && b.is_finite() && a.to_bits() == b.to_bits()),
                 "fixed-chunk prefill final logits differ");
-            eprintln!("EXLR8 lanes exact: total={total} chunk={chunk} ranks={} layers={} logits={}",
+            eprintln!("EXLR8 lanes exact: total={total} chunk={chunk} waves={waves} ranks={} layers={} logits={}",
                 engine.ranks(), engine.weights.layers.len(), serial.len());
             Ok(())
         })();

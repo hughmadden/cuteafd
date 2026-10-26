@@ -27,9 +27,10 @@ enhanced build.
 |---|---|---|
 | **Orchestrator** (one Claude Opus session) | Plans, writes briefs, picks the model per task, makes default and policy calls, reviews every branch, resolves merge conflicts, merges into `work/p0`, cuts releases, talks to TJ | Long hardware runs, bulk implementation |
 | **Codex Sol 6.1** | The workhorse: kernels, ports, measurements, A/B campaigns, release builds and smoke matrices, investigations | Merging, tagging, pushing images, changing defaults without passing gates |
-| **Astra 6** (`high`) | Hard kernel and optimization work: new kernel structures, tiling and fusion ideas, roofline gaps, and coding those kernels | Simple kernels, investigation, profiling, probes, harnesses, integration, gates (Sol does these) |
-| **DeepSeek 4.1 Flash** | Fast structural work: renames, mechanical refactors, doc and table edits, sweeps across many files, log/report digests, simple scripts | Numerics, kernels, judgment calls |
+| **Astra 6** (`high`) | Kernel duels and targeted judgment calls, always tightly scoped (expensive): new kernel structures, tiling and fusion ideas, roofline gaps, and coding those kernels | Open-ended tasks, simple kernels, investigation, probes, harnesses, integration, gates (Sol does these) |
+| **DeepSeek 4.1 Flash** | Fast mechanical work and kernel duels: renames, refactors, doc and table edits, sweeps across many files, log/report digests, simple scripts, duel rounds against Sol or Gemini | Judgment calls, numerics outside a duel's bitwise gate |
 | **Claude Opus subagents** | Judgment-heavy cross-cutting work: engine design changes (e.g. the device-driven exchange), hard merges, investigations needing many decisions, independent reviews | Work Sol can do from a clear brief |
+| **Gemini** (`agy`, external) | Kernel duels; slower judgment-oriented work: second opinions, design reviews, research | Bulk implementation, merging |
 | **Claude Fable** | Extremely rarely: important design or planning, front-end design, a special kernel insight | Anything else |
 | **MiMo** | Only when every other option is exhausted | — |
 
@@ -45,7 +46,7 @@ Budget drives the split. Claude is the scarcest: eight parallel Opus agents
 once used ~60% of a week's capacity in under a day. Codex Sol has had ample
 budget (under 1% of a weekly subscription after a full day of work). With a
 larger Claude budget now, Opus can take somewhat more of the judgment work,
-but bounded engineering still goes to Sol.
+but bounded engineering still goes to Sol. TJ (2026-10-25): Sol is the primary agent for every task unless judgment is crucial.
 
 | Task | Model | Effort |
 |---|---|---|
@@ -157,8 +158,12 @@ The same brief works for every model. One bounded task with everything the
 agent needs to finish without asking:
 
 1. **Branch and base:** `work/<task>` off `origin/work/p0`, in a worktree
-   outside the repo (the preamble covers this). Name the PR/issue number and
-   the preflight command (`hwlock.py --preflight`) for any hardware run.
+   under `~/Developer/cute-worktrees/<name>`, outside the repo. New CuteAFD
+   and SparkInfer worktrees both go in this folder, not directly in
+   `~/Developer`; use distinct names such as `cuteafd-<task>` and
+   `sparkinfer-<task>`. Leave existing worktrees where they are. Name the
+   PR/issue number and the preflight command (`hwlock.py --preflight`) for
+   any hardware run.
 2. **Context:** the measured numbers and file paths that motivate the task,
    the `PLAN.md` item, what was already tried. Point at earlier reports
    rather than restating them.
@@ -174,6 +179,15 @@ agent needs to finish without asking:
    leave opt-in.
 6. **Report:** before → after tables with conditions, gate results, commits,
    open issues.
+
+Create the parent once, then create each task's worktree from its owning
+checkout (SparkInfer branches use that fork's base, not CuteAFD's):
+
+```sh
+mkdir -p ~/Developer/cute-worktrees
+git -C ~/Developer/cuteafd worktree add ~/Developer/cute-worktrees/cuteafd-<task> -b work/<task> origin/work/p0
+git -C ~/Developer/sparkinfer-glmrt worktree add ~/Developer/cute-worktrees/sparkinfer-<task> -b work/<task> origin/master
+```
 
 Start every cluster brief with `scripts/agents/codex-preamble.md` (worktree,
 build, lock, sudo, frugality and no-merge rules). `codex-launch.sh` prepends
@@ -381,8 +395,16 @@ before starting the gate; never move HEAD during it.
   mangles bash arrays, `$?` and `$(...)` meant for the inner shell: pass
   `--expand-environment=no`, or put the commands in a script file and run
   `bash /path/script.sh`.
+- Keep systemd's stop defaults on those units (KillMode=control-group,
+  TimeoutStopSec=90 s): never pass `-p KillMode=mixed|process` or a shorter
+  `TimeoutStopSec`. On stop, `cuteafd bench smoke` removes its coordinator
+  and Spark workers (bounded, 60 s) and `hwlock.py` / `wip-cards.py` forward
+  the signal and keep the locks until it has, so the next lock holder finds
+  clean hardware.
 - Stop your own jobs by PID or `systemctl --user stop <unit>`, never with
-  `pkill -f`: the pattern can match your own Bash command line and kill it.
+  `pkill -f` (the pattern can match your own Bash command line and kill it),
+  `kill -9` or `systemctl kill -s KILL` (no teardown runs; the containers
+  outlive the released locks).
 
 ### Known Codex behavior
 

@@ -1,6 +1,7 @@
 //! `cuteafd plan`: what a checkpoint is, where each part would live, and what
 //! this build can or cannot run - with hints a code agent can act on.
 pub mod checkpoint;
+pub mod decode_lanes;
 pub mod deployment;
 pub mod experts;
 pub mod exlr8;
@@ -14,6 +15,7 @@ pub mod layout;
 pub mod names;
 pub mod rope;
 pub mod spec;
+pub mod spark_range;
 #[doc(hidden)]
 pub mod testing;
 
@@ -146,10 +148,20 @@ impl ExpertPlacement {
 /// Planning options that cannot describe a deployment.
 #[derive(Debug, thiserror::Error)]
 pub enum PlanError {
+    #[error(transparent)]
+    SparkRange(#[from] spark_range::RangeRefusal),
     #[error("invalid {option}: {reason}")]
     InvalidOption { option: &'static str, reason: String },
+    #[error("unsupported {option}={value} for {family}: {reason}")]
+    UnsupportedOption { option: &'static str, value: u8, family: String, reason: &'static str },
     #[error(transparent)]
     Checkpoint(#[from] anyhow::Error),
+}
+
+/// Resolve the decode-lane count before layout or CUDA allocation
+/// ([`decode_lanes::resolve`]).
+pub fn resolve_decode_lanes(family: &str, requested: Option<u8>, concurrency: u64) -> Result<u8, PlanError> {
+    decode_lanes::resolve(family, requested, concurrency)
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -220,12 +232,23 @@ pub struct PlanReport {
     /// A single diagnostic when an unspecified Spark count falls back.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub spark_count_warning: Option<String>,
-    /// Resolved prefill shape, including V4.1 automatic capacity admission.
+    /// Policy refusal, distinct from absent executable packages.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub prefill_rows: Option<u64>,
-    /// Solver-selected GLM prefill lanes, shared by device and host admission.
+    pub spark_range_refusal: Option<spark_range::RangeRefusal>,
+    /// Resolved retained prefill span, not the row count of an individual unit.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub prefill_lanes: Option<u64>,
+    pub prefill_span_rows: Option<u64>,
+    /// Family-resolved rows per unit; never inferred from the retained span.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prefill_unit_rows: Option<u64>,
+    /// Family-resolved units in flight on each transport.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prefill_waves: Option<u64>,
+    /// Resolved decode views, independent of prefill units in flight.
+    pub decode_lanes: u8,
+    /// Solver-selected transport count, independent of units in flight.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prefill_transports: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prefill_selection: Option<String>,
     /// The package and layouts that serve this checkpoint's routed experts.
@@ -244,6 +267,9 @@ pub struct PlanReport {
     /// Where the expert service read the routed EXL3 storage layout from.
     pub expert_storage: Option<crate::formats::exl3_storage::Exl3StorageSource>,
     pub hints: Vec<Hint>,
+    /// Native EXLR8 trellis prefill activations the layout charged (EXLR8 native plans only).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exlr8_prefill_activations: Option<exlr8::PrefillActivations>,
     /// Per-device memory layout, when requested.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub memory_layout: Option<cuteafd_core::memory_layout::MemoryLayout>,
@@ -274,6 +300,8 @@ impl PlanReport {
 
 #[derive(Debug, Clone)]
 pub struct PlanOptions {
+    /// None preserves each family's qualified decode-view default.
+    pub decode_lanes: Option<u8>,
     pub mapped_scale_preload_bytes: u64,
     /// Available host budget override for offline planning; live cgroup-aware sample otherwise.
     pub mapped_scale_host_budget_bytes: Option<u64>,
@@ -296,6 +324,7 @@ pub struct PlanOptions {
 impl Default for PlanOptions {
     fn default() -> Self {
         Self {
+            decode_lanes: None,
             mapped_scale_preload_bytes: crate::formats::mapped_preload::DEFAULT_CAP_BYTES,
             mapped_scale_host_budget_bytes: None,
             draft_ownership: None,
@@ -320,15 +349,17 @@ impl PlanOptions {
         }
     }
 
-    /// Rejects options that describe no deployment: Spark worlds the
-    /// transport does not run (it runs 1 through 6; 0 is the local-only
-    /// placement) and empty budgets.
+    /// Rejects counts outside the shared world ceiling and empty budgets.
+    /// Zero is the local-only placement.
     pub fn validate(&self) -> Result<(), PlanError> {
+        if self.decode_lanes.is_some_and(|lanes| !(1..=2).contains(&lanes)) {
+            return Err(PlanError::InvalidOption { option: "--decode-lanes", reason: "must be 1 or 2".into() });
+        }
         if let ExpertPlacement::Sparks { ranks } = self.placement {
-            if !experts::TRANSPORT_WORLDS.contains(&ranks) {
+            if !(1..=cuteafd_core::MAX_SPARK_WORLD).contains(&ranks) {
                 return Err(PlanError::InvalidOption {
                     option: "spark ranks",
-                    reason: format!("{ranks}: the expert transport runs 1 through 6 Spark ranks \
+                    reason: format!("{ranks}: the expert transport runs 1 through 8 Spark ranks \
                         (0 places every routed expert on the coordinator)"),
                 });
             }
@@ -459,7 +490,7 @@ pub fn plan(snapshot: &Path, options: &PlanOptions) -> Result<PlanReport, PlanEr
 }
 
 fn family_layout(model: &dyn FamilyModel, input: &PlanInput, report: &mut PlanReport,
-    options: &layout::LayoutOptions, requested: ExpertPlacement)
+    options: &mut layout::LayoutOptions, requested: ExpertPlacement)
     -> anyhow::Result<cuteafd_core::memory_layout::MemoryLayout> {
     match model.placement(input, report, options, requested) {
         Some(Ok(memory)) => {
@@ -495,9 +526,22 @@ fn family_layout(model: &dyn FamilyModel, input: &PlanInput, report: &mut PlanRe
 }
 
 fn plan_of(input: &PlanInput, options: &PlanOptions) -> Result<PlanReport, PlanError> {
-    options.validate()?;
-    let checkpoint = input.checkpoint();
-    let mut report = PlanReport {
+    let mut report = plan_unrestricted(input, options)?;
+    match spark_range::admit(input, options, &report) {
+        Ok(()) => {},
+        Err(PlanError::SparkRange(refusal)) => {
+            report.placement_supported = false;
+            report.hints.push(Hint { what: refusal.to_string(),
+                how: "Choose a Spark count within the checkpoint's supported range.".into() });
+            report.spark_range_refusal = Some(refusal);
+        },
+        Err(error) => return Err(error),
+    }
+    Ok(report)
+}
+
+pub(crate) fn empty_report(checkpoint: &Checkpoint, options: &PlanOptions) -> anyhow::Result<PlanReport> {
+    Ok(PlanReport {
         mapped_placement: Default::default(),
         host_budget_bytes: 0,
         host_ledger: None,
@@ -532,8 +576,12 @@ fn plan_of(input: &PlanInput, options: &PlanOptions) -> Result<PlanReport, PlanE
         placement: options.placement,
         spark_ranks: options.placement.spark_ranks(),
         spark_count_warning: None,
-        prefill_rows: None,
-        prefill_lanes: None,
+        spark_range_refusal: None,
+        prefill_span_rows: None,
+        prefill_unit_rows: None,
+        prefill_waves: None,
+        decode_lanes: 1,
+        prefill_transports: None,
         prefill_selection: None,
         experts: None,
         placement_supported: true,
@@ -543,9 +591,16 @@ fn plan_of(input: &PlanInput, options: &PlanOptions) -> Result<PlanReport, PlanE
         launch: launch::describe(&checkpoint.config).ok(),
         expert_storage: None,
         hints: Vec::new(),
+        exlr8_prefill_activations: None,
         memory_layout: None,
         solver_placement: None,
-    };
+    })
+}
+
+fn plan_unrestricted(input: &PlanInput, options: &PlanOptions) -> Result<PlanReport, PlanError> {
+    options.validate()?;
+    let checkpoint = input.checkpoint();
+    let mut report = empty_report(checkpoint, options)?;
     // ModelOpt exports describe what they quantized; each weight's tensors
     // must agree with that description.
     let modelopt = match crate::formats::modelopt::ModelOpt::read(&checkpoint.snapshot, &checkpoint.config) {
@@ -581,6 +636,8 @@ fn plan_of(input: &PlanInput, options: &PlanOptions) -> Result<PlanReport, PlanE
         return Ok(report);
     };
     report.family = Some(family.id().into());
+    report.decode_lanes = resolve_decode_lanes(family.id(), options.decode_lanes,
+        options.layout.as_ref().map_or(2, |layout| layout.concurrency))?;
     report.precision_optimizations = precision_optimizations(family.id(), options);
     report.numerics_deviations = numerics_deviations(family.id(), &report.module_numerics);
     if let Some(executor) = crate::placement::families::executor(family.id()) {
@@ -623,6 +680,7 @@ fn plan_of(input: &PlanInput, options: &PlanOptions) -> Result<PlanReport, PlanE
     // An unset Spark budget is the family's own (Kimi K3 admits more than the
     // shared default); an explicit --spark-budget-gib always wins.
     let mut resolved = options.clone();
+    if let Some(layout) = &mut resolved.layout { layout.decode_lanes = report.decode_lanes; }
     resolved.apply_spark_budget();
     resolved.spark_budget_bytes = Some(options.spark_budget_bytes.unwrap_or_else(|| model.spark_budget_bytes()));
     let options = &resolved;
@@ -802,7 +860,9 @@ fn plan_of(input: &PlanInput, options: &PlanOptions) -> Result<PlanReport, PlanE
         let mut layout_options = layout_options.clone();
         if !ownership.uses_checkpoint() { layout_options.native_mtp_layers = 0; }
         layout_options.weight_budget_bytes = options.coordinator_budget_bytes;
-        let memory = family_layout(model.as_ref(), input, &mut report, &layout_options, options.placement)?;
+        let memory = family_layout(model.as_ref(), input, &mut report, &mut layout_options, options.placement)?;
+        report.prefill_unit_rows = layout_options.prefill_unit_rows;
+        report.prefill_waves = Some(layout_options.prefill_waves);
         if layout_options.host_embedding {
             for note in memory.notes.iter().filter(|n| n.starts_with("host embedding ineligible:")) {
                 report.fits = false;
@@ -821,8 +881,9 @@ fn plan_of(input: &PlanInput, options: &PlanOptions) -> Result<PlanReport, PlanE
                 });
             }
         }
+        let refused = !report.placement_supported && memory.devices.is_empty();
         report.memory_layout = Some(memory);
-        layout::charge_host(&mut report, &layout_options, checkpoint, false)?;
+        if !refused { layout::charge_host(&mut report, &layout_options, checkpoint, false)?; }
     }
     if !report.unclassified.is_empty() {
         report.hints.push(Hint {
@@ -843,11 +904,13 @@ fn plan_of(input: &PlanInput, options: &PlanOptions) -> Result<PlanReport, PlanE
     }
     if options.layout.is_none() {
         // A tensor-only inventory does not request an external speculation checkpoint.
-        let inventory = layout::LayoutOptions { rtx_bytes: vec![options.coordinator_budget_bytes], spark_bytes: options.spark_budget(),
+        let mut inventory = layout::LayoutOptions { rtx_bytes: vec![options.coordinator_budget_bytes], spark_bytes: options.spark_budget(),
             spark_allocation_budget_bytes: Some(options.spark_budget()), glm5_drafter_disabled: true,
             glmf_drafter_disabled: true, native_mtp_layers: if ownership.uses_checkpoint() { 3 } else { 0 },
             weight_budget_bytes: options.coordinator_budget_bytes, ..Default::default() };
-        let _ = family_layout(model.as_ref(), input, &mut report, &inventory, options.placement)?;
+        let _ = family_layout(model.as_ref(), input, &mut report, &mut inventory, options.placement)?;
+        report.prefill_unit_rows = inventory.prefill_unit_rows;
+        report.prefill_waves = Some(inventory.prefill_waves);
     }
     if let Some(encoder) = &report.encoder {
         let owner = match &encoder.kind {
@@ -1067,7 +1130,7 @@ fn plan_spark_count_of(input: &PlanInput, options: &PlanOptions, available: usiz
             return Ok(report);
         }
         let rows = candidate.layout.as_ref().unwrap().prefill_rows;
-        report.prefill_rows = Some(if rows == 0 { 2048 } else { rows });
+        report.prefill_span_rows = Some(if rows == 0 { 2048 } else { rows });
         if rows != 0 {
             if !report.executable() {
                 report.hints.push(Hint {
@@ -1085,7 +1148,7 @@ fn plan_spark_count_of(input: &PlanInput, options: &PlanOptions, available: usiz
                 layout.prefill_rows = rows;
                 layout.spark_capacity_rows = rows;
                 let mut smaller = input.plan(&candidate)?;
-                smaller.prefill_rows = Some(rows);
+                smaller.prefill_span_rows = Some(rows);
                 if smaller.executable() {
                     smaller.prefill_selection = Some(format!(
                         "V4.1 automatic prefill selected {rows} rows (2048 refused: {reason})"));
@@ -1142,6 +1205,7 @@ pub fn plan_preferred(snapshot: &Path, options: &PlanOptions) -> Result<PlanRepo
 pub fn render(report: &PlanReport) -> String {
     use std::fmt::Write;
     let mut out = String::new();
+    let _ = writeln!(out, "decode     {} lane(s)", report.decode_lanes);
     if report.mapped_placement.mapped + report.mapped_placement.preloaded > 0 {
         let p = &report.mapped_placement;
         let _ = writeln!(out, "{}; scales {} bytes / cap {} bytes; host preload {} bytes / budget {} bytes ({})",
@@ -1177,6 +1241,12 @@ pub fn render(report: &PlanReport) -> String {
     }
     let _ = writeln!(out, "snapshot   {}", report.snapshot);
     let _ = writeln!(out, "arch       {}", report.architectures.join(", "));
+    if let Some(activations) = report.exlr8_prefill_activations {
+        let _ = writeln!(out, "exlr8      prefill activations {activations}{}", match activations {
+            exlr8::PrefillActivations::A16 => " (BF16)",
+            exlr8::PrefillActivations::A8 => " (MXFP8 lane records charged)",
+        });
+    }
     if let Some(quantization) = &report.quantization {
         let _ = writeln!(out, "quant      {quantization}");
     }

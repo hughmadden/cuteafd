@@ -9,6 +9,7 @@ pub mod fabric;
 pub mod fabric_health;
 mod sparknest_traffic;
 pub mod traffic;
+pub mod wait_policy;
 
 /// A failed expert wire is terminal for a serving process. Never clear this on
 /// a new request: other lanes may still own queued work from the failed pass.
@@ -37,7 +38,7 @@ pub use expert as v41_expert;
 mod protocol_v2_tcp;
 mod synthetic;
 mod verbs;
-pub use verbs::set_verbs_host_native_library_path;
+pub use verbs::{load_verbs_host_native_library, set_verbs_host_native_library_path};
 
 pub use capabilities::{
     VERBS_HOST_APP_TRANSPORT_BLOCKER, VERBS_HOST_APP_TRANSPORT_STATUS,
@@ -87,15 +88,15 @@ pub use synthetic::{
     synthetic_expert_response,
 };
 pub use verbs::{
-    DeviceLanding, DeviceWriteTarget, FlowProbesOnly, GpuLandingProbe, LocalVerbsExpertConnection,
-    RingBudget, RingReservation, VERBS_HOST_WRITE_FLAG_ERROR, VerbsHostMappedRdmaPollStats,
+    DeviceLanding, FlowProbesOnly, GpuLandingProbe, LocalVerbsExpertConnection,
+    RingBudget, RingReservation, StagingArena, copy_pool_parallel, VerbsHostMappedRdmaPollStats,
     VerbsHostMappedRdmaRing, VerbsHostMappedRdmaRingConfig, VerbsHostMappedRdmaSlot,
     VerbsHostNativeEndpointDescriptor, VerbsHostProtocolV2EndpointPlan,
     VerbsHostProtocolV2HandshakeContract, VerbsHostProtocolV2HandshakeValidation,
     VerbsHostProtocolV2PendingResponse, VerbsHostProtocolV2PersistentClient,
     VerbsHostProtocolV2ResponseChunk, VerbsHostProtocolV2ResponsePayload,
     VerbsHostProtocolV2ResponseStreamStats, VerbsHostProtocolV2RoundTripPlan,
-    VerbsHostRcEndpointDescriptor, VerbsHostWriteTarget, gpu_landing_probe,
+    VerbsHostRcEndpointDescriptor, gpu_landing_probe,
     serve_protocol_v2_verbs_host_with_executor, serve_synthetic_verbs_host,
     verbs_host_persistent_ring_bytes, verbs_host_protocol_v2_endpoint_plan,
     verbs_host_protocol_v2_expert_request_roundtrip, verbs_host_protocol_v2_handshake_contract,

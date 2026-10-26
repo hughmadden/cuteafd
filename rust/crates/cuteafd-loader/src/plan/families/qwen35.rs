@@ -80,7 +80,7 @@ impl FamilyModel for Model {
         if mode == crate::plan::MediaMode::Auto { crate::plan::MediaMode::Off } else { mode }
     }
     fn placement(&self, input: &crate::plan::PlanInput, report: &mut crate::plan::PlanReport,
-        options: &crate::plan::layout::LayoutOptions, requested: crate::plan::ExpertPlacement)
+        options: &mut crate::plan::layout::LayoutOptions, requested: crate::plan::ExpertPlacement)
         -> Option<anyhow::Result<cuteafd_core::memory_layout::MemoryLayout>> {
         if requested != crate::plan::ExpertPlacement::Local {
             return Some(Err(anyhow::anyhow!("dense Qwen has no Spark layout or dense-FFN offboarding")));
@@ -109,10 +109,10 @@ impl FamilyModel for Model {
 }
 
 fn native_layout(cfg: &crate::families::qwen3_5::Qwen35Config, input: &crate::plan::PlanInput,
-    report: &mut crate::plan::PlanReport, options: &crate::plan::layout::LayoutOptions)
+    report: &mut crate::plan::PlanReport, options: &mut crate::plan::layout::LayoutOptions)
     -> anyhow::Result<cuteafd_core::memory_layout::MemoryLayout> {
     use anyhow::{ensure, Context};
-    use crate::placement::{self, families::qwen3_5::{DenseInputs, NativeBuffers, NativeWeights},
+    use crate::placement::{self, families::qwen3_5::{DenseInputs, NativeBuffers, NativeWeights, PREFILL_ROWS},
         ArchContext, Baseline, GpuBudget, ProgramSet};
     use cuteafd_core::memory_layout::{Basis, Category, DeviceKind, DeviceLayout, Item, MemoryLayout};
     ensure!(options.rtx_bytes.len() == 1 && report.spark_ranks == 0,
@@ -120,8 +120,19 @@ fn native_layout(cfg: &crate::families::qwen3_5::Qwen35Config, input: &crate::pl
     ensure!(!options.host_embedding, "dense Qwen requires device token embedding");
     ensure!(report.vision == crate::plan::MediaMode::Off && report.audio == crate::plan::MediaMode::Off,
         "dense Qwen media execution is not qualified");
-    ensure!(options.native_mtp_layers == 0 && options.drafter_bytes == 0,
-        "dense native planner currently requires speculation off");
+    ensure!(options.drafter_bytes == 0 && !(options.dense_qwen_mtp && options.dense_qwen_drafter_snapshot.is_some()),
+        "dense native planner requires one checkpoint-native drafter admission");
+    let rows = PREFILL_ROWS as u64;
+    ensure!(options.prefill_rows == 0 || options.prefill_rows == rows,
+        "dense native prefill requires capacity {rows}");
+    ensure!(options.prefill_unit_rows.is_none_or(|n| n == rows)
+        && options.prefill_span_rows.is_none_or(|n| n == rows)
+        && options.prefill_waves == 1 && options.prefill_lanes <= 1,
+        "dense native prefill requires one coordinator unit of {rows} rows and one wave, with no Spark exchange");
+    // Dense execution retains one coordinator chunk, not Spark exchange slots.
+    options.prefill_unit_rows = Some(rows);
+    report.prefill_span_rows = Some(rows);
+    report.prefill_transports = Some(0);
     let prefix = match (cfg.hidden, cfg.intermediate, cfg.heads, cfg.gdn.value_heads) {
         (4096, 12288, 16, 32) => "qwen35", (5120, 17408, 24, 48) => "qwen38",
         _ => anyhow::bail!("dense Qwen geometry lacks native exports"),
@@ -131,14 +142,17 @@ fn native_layout(cfg: &crate::families::qwen3_5::Qwen35Config, input: &crate::pl
         .context("dense native admission requires its PROGRAMS.json manifest")?)?;
     let set = ProgramSet::from_manifest(&manifest, &[prefix]);
     let entries = manifest["programs"].as_array().context("native manifest lacks programs")?;
+    let fp8 = input.checkpoint().tensors.iter().any(|t|
+        t.meta.name == "model.language_model.layers.0.mlp.gate_proj.weight" && t.meta.dtype == cuteafd_core::DType::F8E4M3);
     let mut scratch = 0;
     let mut norm = None;
     for (op, rows) in [("norm", 0), ("add", 0), ("gdn_commit", 0)].into_iter().chain(
         [64, 4096].into_iter().flat_map(|rows| ["gdn", "attn_producer", "full_gqa", "attn_o", "ffn"].map(|op| (op, rows)))) {
-        let name = placement::families::qwen3_5::program_name(prefix, op, rows, options.dense_qwen_kv);
+        let name = placement::families::qwen3_5::native_program_name(prefix, op, rows, options.dense_qwen_kv, fp8);
         let entry = entries.iter().find(|entry| entry["name"] == name)
             .with_context(|| format!("missing native dense program {name}"))?;
         let spec = placement::families::qwen3_5::NativeProgram::from_manifest(entry)?;
+        placement::families::qwen3_5::validate_projection_format(op, fp8, &spec)?;
         placement::families::qwen3_5::validate(cfg, op, rows, options.dense_qwen_kv, &spec)?;
         placement::families::qwen3_5::validate_abi(op, rows, &spec)?;
         scratch = scratch.max(spec.scratch.values().copied().max().unwrap_or(0));
@@ -148,21 +162,32 @@ fn native_layout(cfg: &crate::families::qwen3_5::Qwen35Config, input: &crate::pl
             norm = Some(dtype);
         }
     }
-    ensure!(scratch > 0 && matches!(options.prefill_rows, 0 | 4096), "dense native prefill requires capacity 4096");
+    ensure!(scratch > 0, "dense native prefill requires nonzero scratch");
     let slots = usize::try_from(if options.concurrency == 0 { 4 } else { options.concurrency })?;
     ensure!(options.state_slots.is_none_or(|n| n == slots as u64), "dense state slots must equal concurrency");
     let mark = NativeBuffers::new(cfg, scratch as usize, slots, 0, options.full_prefill_logits)?.mark_bytes;
     let marks = options.prefix_slots.unwrap_or_else(|| cuteafd_core::prefix::mark_slots_with_host(slots as u64,
         options.mimo_prefix_entries, mark as u64, options.mimo_prefix_mark_bytes, options.host_cache_bytes != Some(0)));
     let buffers = NativeBuffers::new(cfg, scratch as usize, slots, usize::try_from(marks)?, options.full_prefill_logits)?;
-    let weights = NativeWeights::bf16(input.checkpoint(), cfg, norm.context("missing GDN precision")?)?;
+    let weights = NativeWeights::native(input.checkpoint(), cfg, norm.context("missing GDN precision")?)?;
     let (layers, fixed) = weights.demands(cfg, &buffers, slots);
     let capacity = options.rtx_bytes[0];
     let context = ArchContext::coordinator(capacity, None).context_bytes + set.module_bytes();
+    let drafter = options.dense_qwen_drafter_snapshot.as_ref().map(|snapshot| {
+        let config = serde_json::from_slice(&std::fs::read(snapshot.join("config.json"))?)?;
+        let draft = crate::formats::block_dspark::BlockDsparkConfig::from_json(&config)?;
+        ensure!(draft.hidden == cfg.hidden && draft.vocab == cfg.vocab && draft.taps.iter().all(|&layer| layer < cfg.attention.len()),
+            "dense dSpark checkpoint differs from target geometry");
+        placement::families::qwen3_5::DrafterBytes::block_dspark(&config, slots,
+            options.physical_sms.unwrap_or_else(|| ArchContext::coordinator(capacity, None).sms) as u64, cfg.max_context)
+    }).transpose()?;
+    let drafter = if options.dense_qwen_mtp {
+        Some(placement::families::qwen3_5::DrafterBytes::native_mtp(input.checkpoint(), cfg)?)
+    } else { drafter };
     let result = placement::families::qwen3_5::placement(DenseInputs { cfg,
         gpu: GpuBudget { capacity_bytes: capacity, headroom_bytes: 1 << 30,
             baseline: Baseline::Planned { context_bytes: context, loaded_bytes: 0 } },
-        layers: &layers, fixed, drafter: None, requested_pool: options.pool_tokens.filter(|&n| n > 0),
+        layers: &layers, fixed, drafter, requested_pool: options.pool_tokens.filter(|&n| n > 0),
         max_context: cfg.max_context as u64, record_bytes: options.dense_qwen_kv.record_bytes(cfg.kv_heads, cfg.head_dim) as u64,
         pool_overhead: 0, pool_bounded: vec![] })?;
     let mut items = result.items[0].clone();

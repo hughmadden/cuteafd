@@ -105,12 +105,18 @@ pub struct LocalVerbsExpertConnection {
     response_frame: ExpertProtocolV2FrameBuffer,
     request_recv_sequence: usize,
     response_send_sequence: usize,
-    response_send_in_flight: usize,
+    /// Reply SENDs posted and not yet completed.
+    response_sends: send_queue::SendQueue,
     response_copy_stream: Option<VerbsHostCudaStream>,
     next_liveness: Instant,
     liveness_polls: u8,
     /// Startup-resolved diagnostics flag; see `protocol_v2_timing_from_env`.
     timing: bool,
+    /// Requests received by `begin_deferred` and not yet finished, oldest
+    /// first: their receive start times (timing only). Request `k` holds
+    /// receive slot `request_recv_sequence + k` and send slot
+    /// `response_send_sequence + k`; they finish in this order.
+    deferred: std::collections::VecDeque<Option<Instant>>,
     // EOF acknowledges teardown only after native rings and their credit are released.
     stream: TcpStream,
 }
@@ -118,6 +124,28 @@ pub struct LocalVerbsExpertConnection {
 // remain owned by the endpoint. Like VerbsHostMappedRdmaRing, a session may move
 // from its bootstrap thread to the GPU owner, but is never shared concurrently.
 unsafe impl Send for LocalVerbsExpertConnection {}
+
+/// Posts reply frames, each already staged contiguously at a response send
+/// slot, as one SEND into the coordinator's next posted receive.
+struct ReplyPoster<'a> {
+    endpoint: &'a NativeRdmaEndpoint,
+    sends: &'a mut send_queue::SendQueue,
+}
+impl ReplyPoster<'_> {
+    /// Frees a response send slot: fewer than `depth - held` SENDs own one.
+    fn reserve_slot(&mut self, depth: usize, held: usize) -> Result<()> {
+        while self.sends.in_flight() + held >= depth {
+            let stats = self.endpoint.poll_stats(1, 0, default_control_timeout())?;
+            self.sends.completed(stats.send_completions as usize)?;
+        }
+        Ok(())
+    }
+    fn post(&mut self, offset: usize, bytes: usize, wr_id: u64) -> Result<()> {
+        self.endpoint.post_send_at(offset, bytes, wr_id)?;
+        self.sends.posted(None);
+        Ok(())
+    }
+}
 
 impl LocalVerbsExpertConnection {
     /// An opt-in placement worker rejects unsealed or different later lanes
@@ -251,11 +279,13 @@ impl LocalVerbsExpertConnection {
         if let Some(installed) = selection {
             if let Some(spec) = installed.endpoint_spec(start.model_endpoint)? {
                 let model = installed.selection().model().expect("typed endpoint");
+                let rings = spec.resolved_rings(model.rings)
+                    .context("invalid admitted endpoint ring depth")?;
                 let (request, response) = spec.wire_bytes(installed.selection().geometry())
                     .context("invalid admitted endpoint wire geometry")?;
-                let slot = |bytes: usize| bytes.max(model.rings.slot_bytes).min(model.rings.max_frame_bytes);
-                let expected_request = VerbsHostRdmaRing::new(slot(request), model.rings.alignment, model.rings.depth)?;
-                let expected_response = VerbsHostRdmaRing::new(slot(response), model.rings.alignment, model.rings.depth)?;
+                let slot = |bytes: usize| bytes.max(rings.slot_bytes).min(rings.max_frame_bytes);
+                let expected_request = VerbsHostRdmaRing::new(slot(request), rings.alignment, rings.depth)?;
+                let expected_response = VerbsHostRdmaRing::new(slot(response), rings.alignment, rings.depth)?;
                 let (request, response) = Self::validated_rings(&start)?;
                 anyhow::ensure!(request == expected_request && response == expected_response,
                     "endpoint {:?} ring geometry differs from ModelAdmission", start.model_endpoint);
@@ -429,10 +459,11 @@ impl LocalVerbsExpertConnection {
             response_frame,
             request_recv_sequence: 0,
             response_send_sequence: 0,
-            response_send_in_flight: 0,
+            response_sends: Default::default(),
             response_copy_stream: None,
             next_liveness: Instant::now(),
             liveness_polls: 0,
+            deferred: std::collections::VecDeque::new(),
             timing,
         })
     }
@@ -446,7 +477,7 @@ impl LocalVerbsExpertConnection {
     /// QP event rather than polled. `timeout` is the whole wait (`wait_stats`):
     /// it is not raised to the 30 s floor of an exchange in flight, because the
     /// owner has other connections to sweep when it ends.
-    pub fn poll<F>(&mut self, wait: Option<Duration>, mut execute: F) -> Result<bool>
+    pub fn poll<F>(&mut self, wait: Option<Duration>, execute: F) -> Result<bool>
     where
         F: FnMut(
             &ExpertProtocolV2RequestView<'_>,
@@ -481,6 +512,21 @@ impl LocalVerbsExpertConnection {
             }
             return Ok(false);
         }
+        self.serve_received(poll_recv_started, total_started, execute).map(|()| true)
+    }
+
+    /// Serve the request whose receive completion was just consumed (or was
+    /// held by [`Self::begin_deferred`]): execute, emit, then repost its slot.
+    fn serve_received<F>(&mut self, poll_recv_started: Option<Instant>, total_started: Option<Instant>,
+        mut execute: F) -> Result<()>
+    where
+        F: FnMut(
+            &ExpertProtocolV2RequestView<'_>,
+            ProtocolV2RequestDevicePayload,
+            &mut dyn FnMut(ProtocolV2ExecutorResponseRef<'_>) -> Result<()>,
+        ) -> Result<()>,
+    {
+        let timing_enabled = self.timing;
         // Execution can take much longer than a poll; check promptly when it returns.
         self.liveness_polls = 0;
         let endpoint = &self.endpoint;
@@ -492,10 +538,9 @@ impl LocalVerbsExpertConnection {
         let response_send_view = self.response_send_view;
         let response_frame = &mut self.response_frame;
         let response_copy_stream = &mut self.response_copy_stream;
-        let write_target = self.start.write_target;
         let mut request_recv_sequence = self.request_recv_sequence;
         let mut response_send_sequence = self.response_send_sequence;
-        let mut response_send_in_flight = self.response_send_in_flight;
+        let mut poster = ReplyPoster { endpoint, sends: &mut self.response_sends };
         let result = (|| -> Result<()> {
             let poll_recv_ms = elapsed_ms_optional(poll_recv_started);
             let request_recv_slot = mapped_ring_slot(
@@ -555,12 +600,9 @@ impl LocalVerbsExpertConnection {
             let mut poll_send_ms = 0.0_f64;
             let mut direct_device_response_frames = 0_usize;
             let mut final_response_emitted = false;
-            if response_send_in_flight == response_ring.depth {
-                let poll_send_started = timing_enabled.then(Instant::now);
-                endpoint.poll(1, 0, default_control_timeout())?;
-                poll_send_ms += elapsed_ms_optional(poll_send_started);
-                response_send_in_flight -= 1;
-            }
+            let poll_send_started = timing_enabled.then(Instant::now);
+            poster.reserve_slot(response_ring.depth, 0)?;
+            poll_send_ms += elapsed_ms_optional(poll_send_started);
             let first_response_slot = mapped_ring_slot(
                 response_send_view,
                 response_ring,
@@ -574,40 +616,24 @@ impl LocalVerbsExpertConnection {
                 start.execution_lane,
             )?;
             let execute_started = timing_enabled.then(Instant::now);
+            // The final reply goes only after execute has returned and the
+            // slot's receive is reposted (below), so the coordinator's next
+            // request finds that receive posted.
+            let mut deferred_final: Option<(usize, usize, u64)> = None;
             execute(&request, device_payload, &mut |response| {
                 if final_response_emitted {
                     bail!(
                         "persistent verbs-host executor emitted a response after the final chunk"
                     );
                 }
-                if response_send_in_flight == response_ring.depth {
-                    let poll_send_started = timing_enabled.then(Instant::now);
-                    endpoint.poll(1, 0, default_control_timeout())?;
-                    poll_send_ms += elapsed_ms_optional(poll_send_started);
-                    response_send_in_flight -= 1;
-                }
+                let poll_send_started = timing_enabled.then(Instant::now);
+                poster.reserve_slot(response_ring.depth, 0)?;
+                poll_send_ms += elapsed_ms_optional(poll_send_started);
                 let response_has_more = response.more_chunks();
                 let response_send_slot = response_send_sequence % response_ring.depth;
                 let response_send_offset = response_ring.slot_offset(response_send_sequence);
                 let encode_started = timing_enabled.then(Instant::now);
                 let response_wire_bytes_for_chunk = match response {
-                    ProtocolV2ExecutorResponseRef::Host(response) if write_target.is_some() => {
-                        // Write mode: the rows go from the send slot to the client's plane.
-                        let target = write_target.expect("write target checked above");
-                        let bytes = response.partial_output_payload.len();
-                        let slot = mapped_ring_slot(response_send_view, response_ring, response_send_sequence as u64)?;
-                        anyhow::ensure!(bytes <= slot.capacity_bytes, "written response exceeds its send slot");
-                        // SAFETY: the slot lies in this endpoint's mapped send ring and
-                        // its previous send completed (the in-flight check above).
-                        unsafe { std::ptr::copy_nonoverlapping(response.partial_output_payload.as_ptr(), slot.host_ptr,
-                            bytes); }
-                        let flag = written_response_flag(&response.header, response_has_more || response.row_indices.is_some());
-                        let send_started = timing_enabled.then(Instant::now);
-                        endpoint.post_write_flagged(&target, response_send_offset, if flag & VERBS_HOST_WRITE_FLAG_ERROR != 0
-                            { 0 } else { bytes }, flag, VERBS_HOST_SEND_WR_ID + response_send_slot as u64)?;
-                        send_ms += elapsed_ms_optional(send_started);
-                        bytes
-                    }
                     ProtocolV2ExecutorResponseRef::Host(response) => {
                         let response_prefix =
                             response_frame.encode_borrowed_response_prefix(&response)?;
@@ -622,12 +648,20 @@ impl LocalVerbsExpertConnection {
                             start.response_capacity_wire_bytes
                         );
                         let send_started = timing_enabled.then(Instant::now);
-                        endpoint.send_parts_at(
-                            response_prefix,
-                            response.partial_output_payload,
-                            response_send_offset,
-                            VERBS_HOST_SEND_WR_ID + response_send_slot as u64,
-                        )?;
+                        // Staged in the send slot (the borrowed payload ends with
+                        // this callback); a final frame is posted once the
+                        // request slot is reposted.
+                        let slot = mapped_ring_slot(response_send_view, response_ring, response_send_sequence as u64)?;
+                        anyhow::ensure!(wire_bytes <= slot.capacity_bytes, "response exceeds its send slot");
+                        // SAFETY: the range lies in this endpoint's mapped send
+                        // ring (capacity checked above), and every WR of the frame
+                        // that last used this slot completed (`reserve_slot`).
+                        let dst = unsafe { std::slice::from_raw_parts_mut(slot.host_ptr, wire_bytes) };
+                        dst[..response_prefix.len()].copy_from_slice(response_prefix);
+                        dst[response_prefix.len()..].copy_from_slice(response.partial_output_payload);
+                        let reply = (response_send_offset, wire_bytes, VERBS_HOST_SEND_WR_ID + response_send_slot as u64);
+                        if response_has_more { poster.post(reply.0, reply.1, reply.2)? }
+                        else { deferred_final = Some(reply) }
                         send_ms += elapsed_ms_optional(send_started);
                         wire_bytes
                     }
@@ -684,27 +718,15 @@ impl LocalVerbsExpertConnection {
                                 library.cuda_stream_synchronize(copy_stream)?;
                             }
                         }
-                        match write_target {
-                            Some(target) => {
-                                // Write mode: rows to the client's plane, then the flag.
-                                let flag = written_response_flag(&response.header, response_has_more);
-                                endpoint.post_write_flagged(&target, response_send_offset + response_prefix.len(),
-                                    if flag & VERBS_HOST_WRITE_FLAG_ERROR != 0 { 0 } else {
-                                        response.partial_output_payload.bytes },
-                                    flag, VERBS_HOST_SEND_WR_ID + response_send_slot as u64)?;
-                            }
-                            None => endpoint.post_send_at(
-                                response_send_offset,
-                                wire_bytes,
-                                VERBS_HOST_SEND_WR_ID + response_send_slot as u64,
-                            )?,
-                        }
+                        let reply = (response_send_offset, wire_bytes, VERBS_HOST_SEND_WR_ID + response_send_slot as u64);
+                        if response_has_more { poster.post(reply.0, reply.1, reply.2)? }
+                        else { deferred_final = Some(reply) }
                         send_ms += elapsed_ms_optional(send_started);
                         wire_bytes
                     }
                 };
+                // One send slot per frame.
                 response_send_sequence = response_send_sequence.wrapping_add(1);
-                response_send_in_flight += 1;
                 response_frames += 1;
                 response_wire_bytes = response_wire_bytes
                     .checked_add(response_wire_bytes_for_chunk)
@@ -717,16 +739,17 @@ impl LocalVerbsExpertConnection {
                 bail!("persistent verbs-host executor did not emit a final response chunk");
             }
             let post_recv_started = timing_enabled.then(Instant::now);
-            endpoint.post_recv_at(
-                request_ring.slot_offset(request_recv_sequence),
-                request_ring.slot_capacity_bytes,
-                VERBS_HOST_RECV_WR_ID + request_recv_slot.slot_index as u64,
-            )?;
+            // execute has returned, so every host and GPU consumer of the request
+            // slot is done: repost it, then send the final reply.
+            endpoint.post_recv_at(request_ring.slot_offset(request_recv_sequence), request_ring.slot_capacity_bytes,
+                VERBS_HOST_RECV_WR_ID + request_recv_slot.slot_index as u64)?;
+            let (offset, bytes, wr_id) = deferred_final.context("persistent verbs-host final response was not staged")?;
+            poster.post(offset, bytes, wr_id)?;
             request_recv_sequence = request_recv_sequence.wrapping_add(1);
             post_recv_ms = elapsed_ms_optional(post_recv_started);
             if timing_enabled {
                 eprintln!(
-                "protocol_v2_verbs_persistent_server_roundtrip_timing execution_lane={} request_id={} layer_id={} rows={} routes={} request_wire_bytes={} response_frames={} direct_device_response_frames={} response_wire_bytes={} executor={} poll_recv_ms={:.3} copy_header_ms={:.3} resize_ms={:.3} copy_request_ms={:.3} post_recv_ms={:.3} parse_ms={:.3} execute_ms={:.3} encode_ms={:.3} send_ms={:.3} poll_send_ms={:.3} total_ms={:.3}",
+                "protocol_v2_verbs_persistent_server_roundtrip_timing execution_lane={} request_id={} layer_id={} rows={} routes={} request_wire_bytes={} response_frames={} direct_device_response_frames={} response_wire_bytes={} executor={} poll_recv_ms={:.3} copy_header_ms={:.3} resize_ms={:.3} copy_request_ms={:.3} post_recv_ms={:.3} parse_ms={:.3} execute_ms={:.3} encode_ms={:.3} send_ms={:.3} poll_send_ms={:.3} total_ms={:.3} end_epoch_us={}",
                 start.execution_lane,
                 request_id,
                 layer_id,
@@ -747,24 +770,102 @@ impl LocalVerbsExpertConnection {
                 encode_ms,
                 send_ms,
                 poll_send_ms,
-                elapsed_ms_optional(total_started)
+                elapsed_ms_optional(total_started),
+                // Wall-clock end, so per-rank busy intervals and idle gaps can be
+                // rebuilt across requests: [end - (total - poll_recv), end].
+                std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_micros())
             );
             }
             Ok(())
         })();
         self.request_recv_sequence = request_recv_sequence;
         self.response_send_sequence = response_send_sequence;
-        self.response_send_in_flight = response_send_in_flight;
-        result.map(|()| true)
+        result
+    }
+
+    /// Requests launched by [`Self::begin_deferred`] that await
+    /// [`Self::finish_deferred`]; their request and response slots stay held.
+    pub fn deferred(&self) -> usize { self.deferred.len() }
+
+    /// Receive at most one request and hand it to `launch`, which may leave GPU
+    /// work queued on the mapped request and response slots. The request slot
+    /// is not reposted and no response is sent until [`Self::finish_deferred`]
+    /// finishes it, so both slots stay owned by the queued work. Up to `limit`
+    /// requests may be deferred on one connection (bounded by its rings);
+    /// at the limit nothing is received.
+    pub fn begin_deferred<T, F>(&mut self, wait: Option<Duration>, limit: usize, launch: F) -> Result<Option<T>>
+    where
+        F: FnOnce(&ExpertProtocolV2RequestView<'_>, ProtocolV2RequestDevicePayload) -> Result<T>,
+    {
+        let held = self.deferred.len();
+        if !deferred_admits(held, limit, self.request_ring.depth, self.response_ring.depth) { return Ok(None); }
+        if self.liveness_polls == 0 || wait.is_some() {
+            check_peer_liveness(&self.stream, &mut self.next_liveness)?;
+        }
+        self.liveness_polls = self.liveness_polls.wrapping_add(1);
+        let started = self.timing.then(Instant::now);
+        let stats = match wait {
+            Some(timeout) => match self.endpoint.wait_stats(0, 1, timeout) {
+                Ok(stats) => stats,
+                Err(error) if is_verbs_host_rdma_poll_timeout(&error) => CuteafdRdmaRcCompletionStats::default(),
+                Err(error) => return Err(error),
+            },
+            None => self.endpoint.try_poll(0, 1)?,
+        };
+        if stats.recv_completions == 0 {
+            if wait.is_some() { check_peer_liveness(&self.stream, &mut self.next_liveness)?; }
+            return Ok(None);
+        }
+        self.liveness_polls = 0;
+        // The completion is consumed: from here the request is owned by this
+        // connection until finish_deferred reposts it, even if launch fails.
+        self.deferred.push_back(started);
+        let request_slot = mapped_ring_slot(self.request_recv_view, self.request_ring,
+            (self.request_recv_sequence + held) as u64)?;
+        // SAFETY: the received slot lies inside this endpoint's mapped receive
+        // ring and is not reposted until finish_deferred.
+        let storage = unsafe { std::slice::from_raw_parts(request_slot.host_ptr.cast_const(),
+            request_slot.capacity_bytes) };
+        let wire_bytes = persistent_protocol_v2_request_wire_bytes_from_header(
+            &storage[..EXPERT_PROTOCOL_V2_REQUEST_HEADER_LEN], self.start.request_capacity_wire_bytes)?;
+        let request = ExpertProtocolV2RequestView::parse(&storage[..wire_bytes])
+            .context("parsing deferred verbs-host ProtocolV2 request frame")?;
+        if let Some(admitted) = &self.endpoint.credits.endpoint { admitted.validate_request(&request.header)?; }
+        // The response goes into send slot `response_send_sequence + held`;
+        // drain send completions until that slot (and every earlier deferred
+        // request's) is free, exactly as the emit path does for one.
+        ReplyPoster { endpoint: &self.endpoint, sends: &mut self.response_sends }
+            .reserve_slot(self.response_ring.depth, held)?;
+        let response_slot = mapped_ring_slot(self.response_send_view, self.response_ring,
+            (self.response_send_sequence + held) as u64)?;
+        let payload = protocol_v2_request_device_payload(&storage[..wire_bytes], &request,
+            request_slot.device_buffer, Some(response_slot.device_buffer), self.start.execution_lane)?;
+        launch(&request, payload).map(Some)
+    }
+
+    /// Complete the oldest request [`Self::begin_deferred`] launched:
+    /// `complete` receives the same request and payload, waits for nothing it
+    /// did not queue (callers poll their own completion first), and emits the
+    /// response; the request slot is then reposted.
+    pub fn finish_deferred<F>(&mut self, mut complete: F) -> Result<()>
+    where
+        F: FnMut(
+            &ExpertProtocolV2RequestView<'_>,
+            ProtocolV2RequestDevicePayload,
+            &mut dyn FnMut(ProtocolV2ExecutorResponseRef<'_>) -> Result<()>,
+        ) -> Result<()>,
+    {
+        let started = self.deferred.pop_front().context("no deferred request to finish")?;
+        self.serve_received(started, started, &mut complete)
     }
 }
 
-/// A final Error must never publish a successful flag for an untouched plane.
-fn written_response_flag(header: &ExpertProtocolV2ResponseHeader, unwritable: bool) -> u64 {
-    let failed = unwritable || header.status == crate::protocol_v2::ExpertProtocolV2Status::Error;
-    (header.request_id & !VERBS_HOST_WRITE_FLAG_ERROR)
-        | if failed { VERBS_HOST_WRITE_FLAG_ERROR } else { 0 }
+/// Whether a connection holding `held` deferred requests may receive another:
+/// each holds one receive and one send slot until it finishes.
+fn deferred_admits(held: usize, limit: usize, request_depth: usize, response_depth: usize) -> bool {
+    held < limit.min(request_depth).min(response_depth)
 }
+
 
 fn check_peer_liveness(stream: &TcpStream, next: &mut Instant) -> Result<()> {
     let now = Instant::now();
@@ -781,16 +882,49 @@ fn ensure_peer_open(stream: &TcpStream) -> Result<()> {
 }
 
 #[cfg(test)]
+mod deferred_tests {
+    use super::deferred_admits;
+    use crate::verbs::send_queue::SendQueue;
+
+    /// N deferred requests per connection, bounded by the slot count and both
+    /// rings; each request's send slot is reserved before the next is received.
+    #[test]
+    fn deferred_requests_are_bounded_by_slots_and_rings() {
+        assert!(deferred_admits(0, 1, 8, 8));
+        assert!(!deferred_admits(1, 1, 8, 8));
+        assert!(deferred_admits(2, 3, 8, 8));
+        assert!(!deferred_admits(3, 3, 8, 8));
+        // A depth-one decode ring holds one request in flight whatever the pool size.
+        assert!(!deferred_admits(1, 4, 1, 1));
+        // Every reply frame is one SEND and owns one send slot until it completes.
+        let mut sends = SendQueue::default();
+        sends.posted(None);
+        sends.posted(None);
+        let free = |sends: &SendQueue, held: usize, depth: usize| sends.in_flight() + held < depth;
+        assert!(free(&sends, 1, 4) && !free(&sends, 2, 4));
+        sends.completed(1).unwrap();
+        assert!(free(&sends, 2, 4));
+        assert!(!free(&SendQueue::default(), 1, 1));
+    }
+}
+
+#[cfg(test)]
 mod budget_tests {
     use super::*;
 
     fn typed_admission() -> Result<crate::worker_selection::InstalledModelAdmission> {
+        typed_admission_with_depths(&[None])
+    }
+
+    fn typed_admission_with_depths(depths: &[Option<usize>]) -> Result<crate::worker_selection::InstalledModelAdmission> {
         use crate::worker_selection::{InstalledModelAdmission, ModelAdmission};
         use cuteafd_core::{ModelAdmissionResponse, RuntimeSample, SparkEndpoint, SparkIngress,
             SparkRings, SparkRuntimeInventory, SparkSlice};
         let selection = placement_selection(&[13]).with_model(ModelAdmission {
-            capacity: 80, compiled_capacity: 80, endpoints: vec![SparkEndpoint { capacity: 80, ingress: SparkIngress::Bf16 }],
-            rings: SparkRings { max_frame_bytes: 64 << 20, depth: 8, slot_bytes: 8 << 20, alignment: 4096 },
+            capacity: 80, compiled_capacity: 80,
+            endpoints: depths.iter().map(|&ring_depth| SparkEndpoint {
+                capacity: 80, ingress: SparkIngress::Bf16, ring_depth }).collect(),
+            rings: SparkRings { max_frame_bytes: 64 << 20, depth: 8, slot_bytes: 8 << 20, alignment: 4096 }, execution_slots: 1
         })?;
         let report = ModelAdmissionResponse {
             rank: 0, resident_bytes: 1,
@@ -804,6 +938,41 @@ mod budget_tests {
             host_exchange_bytes: 0, row_indices_bytes: 0,
         };
         InstalledModelAdmission::new(0, selection, Some(report))
+    }
+
+    #[test]
+    fn typed_mixed_depth_handshake_matches_each_endpoint_before_allocation() -> Result<()> {
+        let installed = typed_admission_with_depths(&[None, None, Some(2)])?;
+        for (index, expected_depth) in [8, 8, 2].into_iter().enumerate() {
+            for depth in [0, 1, 2, 4, 8, 9] {
+                let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+                let mut client = TcpStream::connect(listener.local_addr()?)?;
+                let (server, _) = listener.accept()?;
+                let lease = installed.reserve_endpoint(Some(index as u32))?.unwrap();
+                let (endpoint, rings) = lease.contract();
+                assert_eq!(rings.depth, expected_depth);
+                let (request, response) = endpoint.wire_bytes(installed.selection().geometry()).unwrap();
+                let (request, response) = persistent_ring_geometry(rings.max_frame_bytes, request,
+                    response, rings.slot_bytes, rings.alignment, rings.depth)?;
+                let mut start = placement_start(Some(installed.selection().digest()?), 0);
+                start["model_endpoint"] = index.into();
+                start["ring_depth"] = depth.into();
+                start["request_capacity_wire_bytes"] = request.slot_capacity_bytes.into();
+                start["response_capacity_wire_bytes"] = response.slot_capacity_bytes.into();
+                start["request_slot_stride_bytes"] = request.slot_stride_bytes.into();
+                start["response_slot_stride_bytes"] = response.slot_stride_bytes.into();
+                start["request_registered_span_bytes"] = (request.slot_stride_bytes * depth).into();
+                start["response_registered_span_bytes"] = (response.slot_stride_bytes * depth).into();
+                write_control(&mut client, &start)?;
+                let result = LocalVerbsExpertConnection::read_persistent_start(&server, 64 << 20, Some(&installed));
+                assert_eq!(result.is_ok(), depth == expected_depth,
+                    "endpoint={index} depth={depth}: {:?}", result.err());
+            }
+        }
+        for depth in [0, 9, usize::MAX] {
+            assert!(typed_admission_with_depths(&[None, Some(depth)]).is_err());
+        }
+        Ok(())
     }
 
     #[test]
@@ -869,20 +1038,6 @@ mod budget_tests {
         drop(pending);
         assert_eq!(budget.used(), 0);
         Ok(())
-    }
-
-    #[test]
-    fn write_mode_error_response_sets_error_flag_without_losing_request_identity() {
-        let mut header = ExpertProtocolV2ResponseHeader {
-            request_id: 42, placement_version: 7, layer_id: 13, row_count: 0,
-            output_dim: 80, output_dtype: crate::ExpertV2Dtype::Bf16,
-            output_row_stride_bytes: 160, output_payload_bytes: 0,
-            status: crate::ExpertProtocolV2Status::Error, flags: 0, executor_id: 1,
-        };
-        assert_eq!(written_response_flag(&header, false), 42 | VERBS_HOST_WRITE_FLAG_ERROR);
-        header.status = crate::ExpertProtocolV2Status::Ok;
-        assert_eq!(written_response_flag(&header, false), 42);
-        assert_eq!(written_response_flag(&header, true), 42 | VERBS_HOST_WRITE_FLAG_ERROR);
     }
 
     #[test]

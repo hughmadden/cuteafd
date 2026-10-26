@@ -142,12 +142,14 @@ def test_draft_attention_uses_one_shared_kernel_and_the_checked_timing_helper():
     assert 'constexpr int scalar_queries = 16;' in shared
     assert 'constexpr int scalar_context = 1024;' in shared
     assert 'queries <= scalar_queries && max_keys - block_rows <= scalar_context' in shared
-    assert 'scalar_partial_kernel<dim, windowed, has_sink, fp8>' in shared
-    assert 'dispatch_wmma<dim, fp8>' in shared
-    assert 'template <int dim, bool windowed, bool has_sink, bool fp8>' in shared
+    assert 'scalar_partial_kernel<dim, windowed, has_sink, fp8, paged>' in shared
+    assert 'dispatch_wmma<dim, fp8, paged>' in shared
+    assert 'template <int dim, bool windowed, bool has_sink, bool fp8, bool paged>' in shared
     for dim in (64, 128):
         for compact in ('false', 'true'):
-            assert f'return route<{dim}, {compact}>(' in shared
+            for paged in ('false', 'true'):
+                assert f'return ROUTE({dim}, {compact}, {paged});' in shared
+    assert '#define ROUTE(D, F, P) route<D, F, P>(' in shared
     assert 'original_layout = dim == 64 && !windowed && !has_sink' in shared
     assert 'original_layout ? queries_per_slice : scalar_queries' in shared
     assert 'original_layout ? ctx + block_rows : min(ctx + block_rows, max_keys)' in shared

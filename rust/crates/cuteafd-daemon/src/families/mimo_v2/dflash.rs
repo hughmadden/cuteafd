@@ -90,6 +90,9 @@ struct Workspace<'a> {
     logits: Dev<'a>,
     unary: Dev<'a>,
     candidates: Dev<'a>,
+    /// Pinned landing of `unary` then `candidates`: both download behind the
+    /// round's one host wait.
+    landing: crate::shared::memory::HostAllocation<'a>,
     positions: Dev<'a>,
     tables: Dev<'a>,
     /// Token ids of the block rows (anchors; the mask rows' sentinel).
@@ -137,6 +140,8 @@ pub(crate) struct MimoDrafter<'a> {
     timing: crate::shared::draft::timing::DraftTiming<'a>,
     pub cfg: DflashConfig,
     stream: *mut c_void,
+    /// The draft round's host wait: sleeps instead of spinning the engine thread.
+    round: std::cell::RefCell<crate::shared::memory::BlockingWait<'a>>,
     /// Ring slots (sequences with a drafter context).
     pub slots: usize,
     max_sequences: usize,
@@ -465,6 +470,7 @@ impl<'a> MimoDrafter<'a> {
             kv_cache,
             library,
             stream,
+            round: std::cell::RefCell::new(crate::shared::memory::BlockingWait::new(library)),
             slots,
             max_sequences,
             fc: matrix(tensor("fc.weight", &[h, taps])?, h, taps, true)?,
@@ -571,14 +577,10 @@ impl<'a> MimoDrafter<'a> {
     }
 
     /// Consume independent request banks in lane order. The context projection
-    /// scratch is reused; drain before overwriting its synchronous table uploads.
+    /// scratch and table uploads are reused in stream order (ordered uploads).
     /// No captured graph or persistent target tap pointer changes here.
     pub fn update_lane(&self, lane: usize, rows: &[ContextRow]) -> Result<()> {
-        let taps = self.lane_taps(lane)?;
-        // SAFETY: the engine owns this stream and both tap banks through its
-        // terminal guard; no pending peer wait remains after paired prefill.
-        unsafe { self.library.cuda_stream_synchronize(self.stream)? };
-        self.update_from(taps, rows)
+        self.update_from(self.lane_taps(lane)?, rows)
     }
 
     fn update_from(&self, taps: &Dev<'_>, rows: &[ContextRow]) -> Result<()> {
@@ -622,7 +624,9 @@ impl<'a> MimoDrafter<'a> {
 
     fn put(&self, dev: &Dev<'_>, bytes: &[u8]) -> Result<()> {
         ensure!(bytes.len() <= dev.buffer.bytes, "table exceeds its buffer");
-        self.library.copy_h2d(CuteafdDeviceBuffer { bytes: bytes.len(), ..dev.buffer }, bytes)
+        // SAFETY: every reader of the drafter's tables, inputs and taps runs on its
+        // stream outside capture; the ordered copy follows them and keeps its source.
+        unsafe { self.library.copy_h2d_ordered(dev.buffer, bytes, self.stream) }
     }
 
     fn workspace(&self, sequences: usize) -> Result<Workspace<'a>> {
@@ -647,6 +651,7 @@ impl<'a> MimoDrafter<'a> {
             logits: alloc(rows * c.vocab * 4)?,
             unary: alloc(drafted * 16 * 4)?,
             candidates: alloc(drafted * 16 * 4)?,
+            landing: crate::shared::memory::HostAllocation::new(self.library, 2 * drafted * 16 * 4)?,
             positions: alloc(rows * 8)?,
             tables: alloc(3 * sequences * 4)?,
             ids: alloc(rows * 4)?,
@@ -726,7 +731,7 @@ impl<'a> MimoDrafter<'a> {
                     .flat_map(|seq| std::iter::once(seq.anchor).chain(std::iter::repeat_n(MASK_ID, block - 1))).collect();
                 embedding.check(&sequences.iter().map(|seq| seq.anchor).collect::<Vec<_>>())?;
                 self.put(&w.ids, bytes_of(&ids))?;
-                // SAFETY: the ids are up (synchronous copy); `h` holds the block rows; the
+                // SAFETY: the ids are up (ordered on this stream); `h` holds the block rows; the
                 // mask row is a live [hidden] BF16 buffer.
                 unsafe { embedding.embed_device_ids(w.ids.buffer, None, rows, 1,
                     Some((self.mask_device.buffer.ptr.cast_const(), &self.mask_row)), w.h.buffer, self.stream)? };
@@ -772,16 +777,26 @@ impl<'a> MimoDrafter<'a> {
             l.glm_dflash_topk(w.logits.buffer.ptr, w.unary.buffer.ptr, w.candidates.buffer.ptr,
                 w.topk_workspace.buffer.ptr, s_count, block, c.drafts(), c.vocab, s)?;
             self.timing.end(head_span, s)?;
-            l.cuda_stream_synchronize(s)?;
+        }
+        let drafted = s_count * c.drafts();
+        let landing = |offset: usize| cuteafd_ffi::CuteafdHostBuffer {
+            // SAFETY: both halves stay inside the 2 x drafted x 64-byte landing.
+            ptr: unsafe { w.landing.buffer.ptr.cast::<u8>().add(offset) }.cast(), bytes: drafted * 64, ..w.landing.buffer };
+        // The round's results download on its stream, then one host wait
+        // covers the round and both copies (no second, synchronous drain).
+        // SAFETY: the device buffers hold `drafted` 64-byte rows; the landing
+        // is pinned, owned by the workspace, and read only after the wait.
+        unsafe {
+            l.copy_d2h_host_buffer_async(landing(0), CuteafdDeviceBuffer { bytes: drafted * 64, ..w.unary.buffer },
+                drafted * 64, s)?;
+            l.copy_d2h_host_buffer_async(landing(drafted * 64),
+                CuteafdDeviceBuffer { bytes: drafted * 64, ..w.candidates.buffer }, drafted * 64, s)?;
+            self.round.borrow_mut().wait(s)?;
         }
         self.timing.publish_completed()?;
         self.timing.dump_head_input(w.n.buffer, rows, h)?;
         let confidence_span = self.timing.host_span();
-        let drafted = s_count * c.drafts();
-        let mut unary = vec![0u8; drafted * 64];
-        let mut candidates = vec![0u8; drafted * 64];
-        l.copy_d2h(&mut unary, CuteafdDeviceBuffer { bytes: drafted * 64, ..w.unary.buffer })?;
-        l.copy_d2h(&mut candidates, CuteafdDeviceBuffer { bytes: drafted * 64, ..w.candidates.buffer })?;
+        let (unary, candidates) = w.landing.bytes()[..2 * drafted * 64].split_at(drafted * 64);
         let word = |b: &[u8], i: usize| u32::from_le_bytes(b[i * 4..i * 4 + 4].try_into().unwrap());
         let drafts = (0..s_count).map(|i| {
             let rows = (0..c.drafts()).map(|j| i * c.drafts() + j);

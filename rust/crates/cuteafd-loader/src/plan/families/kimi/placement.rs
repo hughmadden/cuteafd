@@ -15,8 +15,29 @@ const SPARK_EXL3_WORKSPACE: u64 = crate::families::kimi_k3::SPARK_ESTIMATED_WORK
 /// Prefill lanes the Spark transport serves (one QP endpoint each).
 const LANES: u64 = 1;
 
-pub(super) fn layout(model: &Model, report: &mut PlanReport, opts: &crate::plan::layout::LayoutOptions,
+pub(super) fn layout(model: &Model, report: &mut PlanReport, opts: &mut crate::plan::layout::LayoutOptions,
     requested: ExpertPlacement) -> MemoryLayout {
+    use crate::families::kimi_k3::allocation::{DEFAULT_PREFILL_UNIT_ROWS, DEFAULT_PREFILL_WAVES, LANE_ROWS_MAX};
+    let unit_rows = if opts.prefill_rows > 0 { opts.prefill_rows } else { DEFAULT_PREFILL_UNIT_ROWS as u64 };
+    let waves = if opts.prefill_lanes > 0 { opts.prefill_lanes } else { DEFAULT_PREFILL_WAVES as u64 };
+    let shape = crate::serving_capacity::PrefillShape { unit_rows, waves };
+    if let Err(error) = shape.validate().and_then(|shape| {
+        anyhow::ensure!((256..=LANE_ROWS_MAX as u64).contains(&shape.slot_rows()),
+            "Kimi prefill span must hold 256..={LANE_ROWS_MAX} rows");
+        Ok(shape)
+    }) {
+        report.fits = false;
+        report.placement_supported = false;
+        report.hints.push(Hint { what: format!("Kimi prefill: {error:#}"),
+            how: "Select page-aligned unit rows and waves with a 256..=8192-row span.".into() });
+        return MemoryLayout { devices: Vec::new(), pool_tokens: 0, waste: Vec::new(), notes: vec![error.to_string()] };
+    }
+    let rows = shape.slot_rows() as usize;
+    let unit = unit_rows as usize;
+    report.prefill_span_rows = Some(shape.slot_rows());
+    report.prefill_transports = Some(LANES);
+    opts.prefill_unit_rows = Some(unit_rows);
+    opts.prefill_waves = waves;
     let cfg = model.cfg();
     let ranks = requested.spark_ranks();
     let gpus = opts.rtx_bytes.len();
@@ -56,9 +77,9 @@ pub(super) fn layout(model: &Model, report: &mut PlanReport, opts: &crate::plan:
     let replicated_rotations = cfg.experts as u64 * 3 * cfg.latent as u64 * 2;
     let rank_layer = |world: u64| (layer_bytes - replicated_rotations).div_ceil(world) + replicated_rotations;
     if ranks != 6 {
-        refusal(report, format!("Kimi K3 needs the max card's 6 Spark ranks (requested {ranks}): TP{ranks} routed experts \
+        refusal(report, format!("Kimi K3 missing Spark recipe kimik3:exl3-k23 TP{ranks}: estimated routed experts \
             need {:.1} GiB/rank", (rank_layer(ranks.max(1) as u64) * routed_layers) as f64 / GIB as f64),
-            "Serve Kimi K3 on 2 RTX PRO 6000 + 6 Sparks (TP6 width 512); no other card column is targeted.");
+            "Export balanced H128 widths in package_exl3_aot.py, register spark_recipe, and parameterize Kimi Spark intake/admission by rank count; TP6 width 512 is currently installed.");
         return memory;
     }
     if gpus != 2 || !opts.head_split {
@@ -80,7 +101,6 @@ pub(super) fn layout(model: &Model, report: &mut PlanReport, opts: &crate::plan:
     report.bytes_by_owner.insert("coordinator text weights".into(), embedding + head + residency.split + residency.replicated + mla_weights);
     report.bytes_by_owner.insert("routed expert weights".into(), experts);
     let slots = opts.state_slots.unwrap_or_else(|| if opts.concurrency > 0 { opts.concurrency } else { 16 });
-    let rows = if opts.prefill_rows > 0 { opts.prefill_rows as usize } else { 4096 };
     let path = opts.workspace_manifest.as_deref().unwrap_or_else(||
         std::path::Path::new("/opt/cuteafd/share/PROGRAMS.json"));
     // Header-only diagnostics remain available without installed artifacts. An
@@ -135,8 +155,12 @@ pub(super) fn layout(model: &Model, report: &mut PlanReport, opts: &crate::plan:
     if let Some(manifest) = &manifest {
         let extra = (|| -> anyhow::Result<_> {
             use crate::families::kimi_k3::{allocation, core};
-            let mut demands = allocation::baseline_demands(cfg, manifest, rows, context as usize,
-                usize::try_from(slots)?, &model.core, report.requested_attention == Some(AttentionPlacement::Heads))?;
+            // Speculative verify graphs replay at each exact width up to the drafter's block.
+            let verify = opts.kimi_drafter_snapshot.as_ref().map(|snapshot|
+                crate::formats::dflash::MlaDflashConfig::read(snapshot).map(|draft| draft.block))
+                .transpose()?.unwrap_or(0);
+            let mut demands = allocation::baseline_demands(cfg, manifest, shape, context as usize,
+                usize::try_from(slots)?, verify, &model.core, report.requested_attention == Some(AttentionPlacement::Heads))?;
             let families = if model.core.projections.is_empty() { &["kimik3"][..] } else { &["kimik3", "kimi"][..] };
             let programs = ProgramSet::from_manifest(manifest, families);
             for rank in 0..2 {
@@ -148,12 +172,12 @@ pub(super) fn layout(model: &Model, report: &mut PlanReport, opts: &crate::plan:
             }
             if !model.core.projections.is_empty() {
                 // The baseline already includes the full peer receive allocation.
-                demands.extend(core::CoreCharges::from_package(cfg, &model.core, rows, manifest)?.demands()?
+                demands.extend(core::CoreCharges::from_package(cfg, &model.core, rows, unit, manifest)?.demands()?
                     .into_iter().filter(|d| d.group != "Kimi K6 peer receive"));
             }
             if opts.onboard != Some(Onboard::Layers(0)) {
                 let package = allocation::expert_package(path)?;
-                tp2_workspace = [allocation::expert_workspace(&package, rows)?; 2];
+                tp2_workspace = [allocation::expert_workspace(&package, unit)?; 2];
             }
             Ok(demands)
         })();
@@ -173,7 +197,7 @@ pub(super) fn layout(model: &Model, report: &mut PlanReport, opts: &crate::plan:
         let working = SparkWorkingSet { rtx_layers: vec![], spark_layers: cfg.dense.iter().enumerate()
             .filter_map(|(layer, dense)| (!dense).then_some(layer)).collect(), spark_ranks: ranks, prefill_lanes: LANES };
         let rings = crate::plan::layout::spark_ring_geometry(LANES as usize);
-        let endpoints = [cuteafd_core::SparkEndpoint { capacity: opts.spark_capacity_rows as u32,
+        let endpoints = [cuteafd_core::SparkEndpoint { ring_depth: None, capacity: opts.spark_capacity_rows as u32,
             ingress: cuteafd_core::SparkIngress::Fp8K32 }];
         let budget = opts.spark_allocation_budget_bytes.unwrap_or(super::SPARK_BUDGET_BYTES);
         let spark = SparkBudgetInventory::exl3(&catalog, &working, &endpoints,
@@ -208,7 +232,7 @@ pub(super) fn layout(model: &Model, report: &mut PlanReport, opts: &crate::plan:
             else { GlmDraftRepresentation::Bf16Only };
         let layout = draft.runtime_layout(representation, GlmDraftCapacity::new(slots, slots.min(8), draft.block)?,
             usize::try_from(context)?, slots.checked_mul(usize::try_from(context)?).context("draft pool overflow")?, opts.physical_sms.unwrap_or(188) as usize, 0, opts.mla_kv)?;
-        fixed.extend(crate::families::kimi_k3::draft_bridge_demands(&layout)?);
+        fixed.extend(crate::families::kimi_k3::draft_bridge_demands(&layout, rows)?);
         fixed.push(crate::families::kimi_k3::draft_probe_demand(cfg.layers, cfg.topk, 64)?);
         // A K6 vocabulary head has no BF16 operand to borrow: the drafter owns
         // a head-only K6 scratch on the head rank.
@@ -279,7 +303,7 @@ pub(super) fn layout(model: &Model, report: &mut PlanReport, opts: &crate::plan:
         policy: LayerPolicy { default: vec![LayerMode::HeadSplit], ownership: LayerOwnership::Ranges, expert_ownership: ExpertOwnership::Contiguous,
             attention: vec![(AttentionClass::Mla, AttentionPlacement::Layers), (AttentionClass::Kda, AttentionPlacement::Heads)],
             ..Default::default() },
-        hops: HopSpec { storage: HopStorage::ReceiveSlots, row_bytes: cfg.hidden as u64 * 2, rows: if manifest.is_some() { rows as u64 } else { 0 }, lanes: if manifest.is_some() { LANES } else { 0 },
+        hops: HopSpec { storage: HopStorage::ReceiveSlots, row_bytes: cfg.hidden as u64 * 2, rows: if manifest.is_some() { unit as u64 } else { 0 }, lanes: if manifest.is_some() { LANES } else { 0 },
             entry_gpu: 0, head_gpu: 1, terminal: TerminalHome::Replicated },
         executor: ExecutorModes { family: "kimi_k3", modes: MODES, hops: true, attention: AttentionPlacement::Layers },
     };

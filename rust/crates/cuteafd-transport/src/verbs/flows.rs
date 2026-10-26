@@ -625,7 +625,6 @@ mod tests {
                 max_sge: 2,
             },
             client_native_endpoint: native,
-            write_target: None,
             flow_label,
             worker_selection_digest: None,
             model_endpoint: None,

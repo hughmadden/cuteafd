@@ -60,7 +60,7 @@ impl NativePlan {
             .checked_add(pinned)
             .and_then(|n| n.checked_add(scratch))
             .context("EXLR8 coordinator host peak overflow")?;
-        let workspace = Exlr8Execution::workspace_bytes(programs, ROWS, ExpertSet::Shared)?;
+        let workspace = Exlr8Execution::shared_workspace_bytes(programs, ROWS)?;
         Ok(Self {
             plans,
             resident,
@@ -70,18 +70,8 @@ impl NativePlan {
     }
 
     pub(crate) fn admit_host(&self) -> Result<()> {
-        let text = std::fs::read_to_string("/proc/meminfo")?;
-        let available = text
-            .lines()
-            .find_map(|line| line.strip_prefix("MemAvailable:"))
-            .context("EXLR8 host admission needs MemAvailable")?
-            .split_whitespace()
-            .next()
-            .context("EXLR8 host memory value")?
-            .parse::<usize>()?
-            .checked_mul(1024)
-            .context("EXLR8 host memory overflow")?;
-        let available = cuteafd_ffi::cgroup_memory_headroom(available)?;
+        let (_, available) = cuteafd_loader::formats::mapped_preload::host_memory()?;
+        let available = usize::try_from(available)?;
         ensure!(
             self.host_peak <= available,
             "EXLR8 coordinator host peak {} exceeds available {available}",
@@ -137,7 +127,7 @@ impl<'a> NativeExperts<'a> {
         programs: &'a Programs<'a>,
     ) -> Result<Exlr8Execution<'a>> {
         let mut execution =
-            Exlr8Execution::new(library, programs, ROWS, self.workspace, ExpertSet::Shared)?;
+            Exlr8Execution::new_shared(library, programs, ROWS, self.workspace)?;
         library.copy_h2d(execution.ids()?, &vec![0; ROWS * 4])?;
         library.copy_h2d(execution.route_weights()?, bytes_of(&vec![1.0f32; ROWS]))?;
         execution.seal_graph_storage()?;

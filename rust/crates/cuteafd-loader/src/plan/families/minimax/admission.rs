@@ -484,7 +484,7 @@ impl Recipe {
         let programs = ProgramSizes::from_manifest(programs, sizing)?;
         let ledger = RuntimeLedger::new(cfg, sizing, &programs)?;
         let weights = super::coordinator::resident_weights(checkpoint, request.host_embedding)?;
-        let endpoints = vec![cuteafd_core::SparkEndpoint { capacity: u32::try_from(sizing.rows)?,
+        let endpoints = vec![cuteafd_core::SparkEndpoint { ring_depth: None, capacity: u32::try_from(sizing.rows)?,
             ingress: cuteafd_core::SparkIngress::Bf16 }; sizing.lanes];
         let all_remote = crate::placement::SparkWorkingSet { rtx_layers: vec![], spark_layers: cfg.moe.iter().enumerate()
             .filter_map(|(layer, &moe)| moe.then_some(layer)).collect(), spark_ranks: sizing.spark_ranks, prefill_lanes: sizing.lanes as u64 };

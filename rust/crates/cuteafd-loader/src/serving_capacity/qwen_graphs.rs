@@ -264,6 +264,17 @@ pub fn qwen_workspace_bytes(cfg: &crate::families::qwen4::Qwen4Config, t: u64, d
     total
 }
 
+/// Unit-owned live rows plus hook-local scratch; retained terminal rows feed
+/// the canonical MTP without keeping a whole span of every intermediate plane.
+pub fn qwen_unit_workspace_bytes(cfg: &crate::families::qwen4::Qwen4Config, shape: super::PrefillShape,
+    terminal_rows: u64, logit_rows: u64, mapped: Option<u64>, scratch: u64, topk: u64) -> u64 {
+    let unit = shape.unit_rows;
+    let h = cfg.hidden as u64;
+    let slot_bytes = |rows: u64| 2 * rows * 4 * h * 2 + rows * 4 * 2 + 3 * rows * h * 2;
+    qwen_workspace_bytes(cfg, unit, false, logit_rows, 0, mapped, scratch, topk)
+        - slot_bytes(unit) + slot_bytes(shape.slot_rows()) + terminal_rows * 4 * h * 2
+}
+
 /// The largest scratch among the programs one Qwen step launches at `cap`
 /// (`m64` / `m4096`), and the index top-k scratch, from the program manifest.
 pub fn qwen_step_scratch(manifest: &serde_json::Value, decode: bool, ple_fp8: bool,
@@ -304,6 +315,7 @@ pub struct QwenAdmissionInputs<'a> {
     pub kv_format: crate::families::qwen4::Qwen4KvCache,
     pub manifest: Option<&'a serde_json::Value>,
     pub prefill_rows: u64,
+    pub prefill_shape: Option<super::PrefillShape>,
     pub slots: u64,
     pub mark_bytes: u64,
     pub full_prefill_logits: u64,
@@ -321,7 +333,8 @@ pub fn qwen_admission(inputs: &QwenAdmissionInputs<'_>) -> Result<QwenAdmission,
     let unit = geometry.logical_unit_rows;
     // Prefill owns one page table and decode one per row, each with four
     // record page ids plus one pool page id per allocation unit.
-    let tables_per_unit = (1 + QWEN_DECODE_ROWS as u64) * 5 * 4;
+    let separate_mtp = inputs.prefill_shape.is_some() && inputs.mtp;
+    let tables_per_unit = (1 + QWEN_DECODE_ROWS as u64 + u64::from(separate_mtp)) * 5 * 4;
     let per_token = (rank.persistent_unit_bytes + rank.pool_metadata_unit_bytes + tables_per_unit).div_ceil(unit);
     let ple_fp8 = inputs.ple.is_some_and(|p| p.1);
     let mapped = inputs.ple.map(|p| p.0);
@@ -329,11 +342,22 @@ pub fn qwen_admission(inputs: &QwenAdmissionInputs<'_>) -> Result<QwenAdmission,
         let (scratch, topk) = inputs.manifest.map_or((0, 0), |m| qwen_step_scratch(m, decode, ple_fp8, inputs.kv_format));
         let (t, logits) = if decode { (QWEN_DECODE_ROWS as u64, QWEN_DECODE_ROWS as u64) } else { (inputs.prefill_rows.max(1), 1) };
         // Page tables follow the pool (per_token above).
+        if !decode {
+            if let Some(shape) = inputs.prefill_shape {
+                let terminal = if inputs.mtp { inputs.prefill_rows } else { 0 };
+                return qwen_unit_workspace_bytes(inputs.cfg, shape, terminal, logits, mapped, scratch, topk);
+            }
+        }
         qwen_workspace_bytes(inputs.cfg, t, decode, logits, 0, mapped, scratch, topk)
     };
+    let mtp_workspace = if separate_mtp {
+        let (scratch, topk) = inputs.manifest.map_or((0, 0), |m| qwen_step_scratch(m, false, ple_fp8, inputs.kv_format));
+        qwen_workspace_bytes(inputs.cfg, inputs.prefill_shape.unwrap().unit_rows, false, 1, 0, mapped, scratch, topk)
+    } else { 0 };
     let items = vec![
         (Category::Workspace, "decode step", workspace(true)),
         (Category::Workspace, "prefill step", workspace(false)),
+        (Category::Workspace, "prefill MTP step", mtp_workspace),
         (Category::Workspace, "probe prefill logits", inputs.full_prefill_logits),
         (Category::Kv, "state", rank.active_state_per_sequence_bytes * inputs.slots + rank.fixed_state_bytes
             + rank.speculative_replay_bytes),
@@ -347,6 +371,53 @@ pub fn qwen_admission(inputs: &QwenAdmissionInputs<'_>) -> Result<QwenAdmission,
 mod tests {
     use super::qwen_step_scratch;
     use crate::families::qwen4::Qwen4KvCache;
+
+    #[test]
+    fn unit_workspace_scales_only_live_planes_and_retained_terminal_rows() {
+        use super::{qwen_unit_workspace_bytes, qwen_workspace_bytes};
+        use crate::serving_capacity::PrefillShape;
+        let cfg = crate::families::qwen4::Qwen4Config::from_hf(&crate::plan::testing::qwen4_config(48)).unwrap();
+        let h = cfg.hidden as u64;
+        for rows in [512, 1024, 2048, 4096] {
+            let one = PrefillShape { unit_rows: rows, waves: 1 };
+            let two = PrefillShape { unit_rows: rows, waves: 2 };
+            let base = qwen_workspace_bytes(&cfg, rows, false, 1, 0, Some(160), 12345, 6789);
+            assert_eq!(qwen_unit_workspace_bytes(&cfg, one, 0, 1, Some(160), 12345, 6789), base);
+            let extra_slot = rows * (2 * 4 * h * 2 + 4 * 2 + 3 * h * 2);
+            let slot_bytes = qwen_unit_workspace_bytes(&cfg, two, 0, 1, Some(160), 12345, 6789);
+            assert_eq!(slot_bytes, base + extra_slot);
+            assert_eq!(qwen_unit_workspace_bytes(&cfg, two, 4096, 1, Some(160), 12345, 6789),
+                slot_bytes + 4096 * 4 * h * 2);
+        }
+        assert_eq!(crate::serving_capacity::prefill_return_bytes(2, 2048, 4, 2048), 64 << 20);
+    }
+
+    #[test]
+    fn unit_mtp_scratch_and_page_tables_are_admitted_separately() {
+        use super::{qwen_admission, qwen_workspace_bytes, QwenAdmissionInputs};
+        use crate::serving_capacity::PrefillShape;
+        let mut config = crate::plan::testing::qwen4_config(48);
+        config["text_config"]["mtp_num_hidden_layers"] = serde_json::json!(1);
+        let cfg = crate::families::qwen4::Qwen4Config::from_hf(&config).unwrap();
+        let mut inputs = QwenAdmissionInputs { cfg: &cfg, layers: 48, mtp: true, kv_format: Qwen4KvCache::Fp8,
+            manifest: None, prefill_rows: 4096, prefill_shape: None, slots: 8, mark_bytes: 0,
+            full_prefill_logits: 0, ple: Some((160, true)), future_expert_bytes: 0, headroom: 0 };
+        let legacy = qwen_admission(&inputs).unwrap();
+        inputs.prefill_shape = Some(PrefillShape { unit_rows: 2048, waves: 2 });
+        let units = qwen_admission(&inputs).unwrap();
+        let bytes = |name| units.items.iter().find(|item| item.1 == name).unwrap().2;
+        assert_eq!(bytes("prefill MTP step"), qwen_workspace_bytes(&cfg, 2048, false, 1, 0, Some(160), 0, 0));
+        let geometry = crate::serving_capacity::qwen_cache_geometry(&cfg, 48, true, Qwen4KvCache::Fp8).unwrap();
+        let rank = &geometry.ranks[0];
+        let pool_bytes = rank.persistent_unit_bytes + rank.pool_metadata_unit_bytes;
+        assert_eq!(legacy.per_token, (pool_bytes + 65 * 5 * 4).div_ceil(geometry.logical_unit_rows));
+        assert_eq!(units.per_token, (pool_bytes + 66 * 5 * 4).div_ceil(geometry.logical_unit_rows));
+        inputs.mtp = false;
+        let no_mtp = qwen_admission(&inputs).unwrap();
+        assert!(!no_mtp.items.iter().any(|item| item.1 == "prefill MTP step"));
+        assert_eq!(bytes("prefill step") - no_mtp.items.iter().find(|item| item.1 == "prefill step").unwrap().2,
+            4096 * 4 * cfg.hidden as u64 * 2);
+    }
 
     #[test]
     fn scratch_admission_selects_the_kv_format_and_capacity() {

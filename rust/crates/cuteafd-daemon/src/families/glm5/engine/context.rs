@@ -151,12 +151,19 @@ impl<'a> GlmEngine<'a> {
         rank_tables(tables, rank, self.pages)
     }
 
-    /// Uploads a prefill unit's gather lists and commit blocks for `rank` (its stream is
-    /// idle: called with the step's other tables). The unit gathers the pages holding rows
+    /// Uploads a prefill unit's gather lists and commit blocks for `rank`, queued on its
+    /// stream (earlier units' and steps' queued kernels keep reading their own lists until
+    /// the stream reaches these copies). The unit gathers the pages holding rows
     /// `[0, gather)` (0: the step's first lane gathers for every lane) and commits rows
     /// `[start, start + rows)` of `pages` (the sequence's page ids).
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn context_prefill_tables(&self, rank: usize, lane: usize, gather: usize, start: usize, rows: usize,
         pages: &[u32]) -> Result<ContextUnit> {
+        let upload = |buffer: CuteafdDeviceBuffer, bytes: &[u8]| -> Result<()> {
+            // SAFETY: a live buffer of this rank; the helper keeps the pinned source
+            // until the stream passes the copy and orders it after earlier work.
+            self.on(rank, || unsafe { self.library.copy_h2d_ordered(buffer, bytes, self.stream_of(rank)) })
+        };
         let split = self.context.as_ref().context("context split")?;
         let own = &split.ranks[rank];
         ensure!((start + rows).div_ceil(PAGE_ROWS) <= pages.len(), "prefill past the sequence's pages");
@@ -169,14 +176,15 @@ impl<'a> GlmEngine<'a> {
             let local = local_pages(&pages[..history], owner)?;
             *shard = local.len();
             if !local.is_empty() {
-                self.on(rank, || self.library.copy_h2d(view(&own.gather, owner * half * 4, local.len() * 4)?,
-                    bytes_of(&local)))?;
+                // The owner's whole list region: ordered uploads size their staging
+                // once per destination and never regrow it mid-call.
+                upload(view(&own.gather, owner * half * 4, half * 4)?, bytes_of(&local))?;
             }
         }
         let limit = context_commit_pages(self.prefill_rows as u64) as usize;
         let (table, commits) = commit_blocks(rank, start, rows, pages, limit)?;
         let commit = own.commit.get(lane).context("commit lane")?;
-        self.on(rank, || self.library.copy_h2d(commit.buffer, bytes_of(&table)))?;
+        upload(commit.buffer, bytes_of(&table))?;
         Ok(ContextUnit { history, shards, commits })
     }
 

@@ -19,6 +19,8 @@ const PREFIX: &str = "model.language_model.";
 mod verify;
 #[path = "rows.rs"]
 mod rows;
+#[path = "mtp.rs"]
+pub(crate) mod mtp;
 #[path = "prefix.rs"]
 pub(crate) mod prefix;
 pub(crate) use verify::DenseMark;
@@ -115,9 +117,10 @@ impl<'a> DenseEngine<'a> {
         cfg: Qwen35Config, requested_pool: Option<u64>, drafter: Option<DrafterBytes>, slots: usize,
         prefix: Option<crate::shared::prefix::MarkRule>, kv_format: cuteafd_loader::families::qwen4::Qwen4KvCache, full_prefill_logits: bool) -> Result<Self> {
         ensure!((1..=HEAD_ROWS).contains(&slots), "dense state slots must be 1..64");
-        let admitted = DensePrograms::new(&cfg, programs, kv_format)?;
         let reader = WeightReader { library, checkpoint };
-        let weight_bytes = NativeWeights::bf16(checkpoint, &cfg, admitted.norm_dtype.clone())?;
+        let format = super::weights::DenseFormat::detect(&reader)?;
+        let admitted = DensePrograms::new(&cfg, programs, kv_format, format)?;
+        let weight_bytes = NativeWeights::native(checkpoint, &cfg, admitted.norm_dtype.clone())?;
         programs.load_matching(|name| name.starts_with(&format!("{}_", admitted.prefix)))?;
         let device = Device { library, id: library.cuda_get_device()? };
         let stream = Stream::new(device)?;
@@ -144,7 +147,7 @@ impl<'a> DenseEngine<'a> {
         let tensor = reader.tensor(&format!("{PREFIX}embed_tokens.weight"))?;
         let source = EmbedSource::new(&checkpoint.snapshot, &tensor.shard, &tensor.meta, cfg.hidden)?;
         let (embedding, weights) = TokenEmbedding::load(library, source, EmbedPlacement::Gpu,
-            || reader.dense_bf16(&cfg, admitted.norm_dtype.clone()))?;
+            || reader.dense_native(&cfg, admitted.norm_dtype.clone(), format))?;
         let mut allocated = sizes.into_iter().map(|bytes| Allocation::new(device, alloc_bytes(bytes)))
             .collect::<Result<Vec<_>>>()?;
         let views: Vec<_> = allocated.iter().map(|allocation| allocation.buffer).collect();
@@ -236,7 +239,7 @@ impl<'a> DenseEngine<'a> {
     fn put(&self, buffer: CuteafdDeviceBuffer, bytes: &[u8]) -> Result<()> {
         ensure!(bytes.len() <= buffer.bytes, "dense step table exceeds admitted capacity");
         // SAFETY: ordered upload owns pinned staging until this stream consumes it.
-        unsafe { self.stream.device.library.copy_h2d_ordered(CuteafdDeviceBuffer { bytes: bytes.len(), ..buffer }, bytes, self.stream.raw) }
+        unsafe { self.stream.device.library.copy_h2d_ordered(buffer, bytes, self.stream.raw) }
     }
 
     fn tables(&self, rows: usize) -> Result<()> {
@@ -270,7 +273,8 @@ impl<'a> DenseEngine<'a> {
             "dense page binding changes a live KV prefix");
         ensure!(pages.iter().enumerate().all(|(index, page)| !pages[..index].contains(page)),
             "dense page binding aliases physical pages");
-        self.stream.drain()?;
+        // Host metadata only: the page table reaches the device through an ordered
+        // upload on the one target stream, after every queued reader of the old one.
         self.verification.invalidate()?;
         self.slots[slot].pages = pages.to_vec();
         Ok(())
@@ -299,6 +303,11 @@ impl<'a> DenseEngine<'a> {
     /// Prefill stays on device; the shared selector consumes the last requested
     /// logits before another engine operation reuses the admitted output arena.
     pub(crate) fn prefill_device(&mut self, slot: usize, tokens: &[u32], logit_rows: usize) -> Result<DeviceLogits> {
+        self.prefill_tapped(slot, tokens, logit_rows, |_, _| Ok(()))
+    }
+
+    pub(crate) fn prefill_tapped(&mut self, slot: usize, tokens: &[u32], logit_rows: usize,
+        mut hook: impl FnMut(usize, CuteafdDeviceBuffer) -> Result<()>) -> Result<DeviceLogits> {
         ensure!(slot < self.slots.len() && !tokens.is_empty() && tokens.len() <= ROWS,
             "dense prefill outside admitted slot/row capacity");
         ensure!(logit_rows <= self.head_rows.min(tokens.len()), "dense prefill head rows outside admission");
@@ -316,7 +325,8 @@ impl<'a> DenseEngine<'a> {
             .collect::<std::result::Result<Vec<_>, _>>()?;
         let table = rows::Rows { tokens: Vec::new(), physical: Vec::new(), groups: Vec::new(),
             slots: vec![i32::try_from(slot)?; tokens.len()], first: vec![0; tokens.len()], positions, kv, pages, stride: 0 };
-        self.stream.drain()?;
+        // Target, MTP and drafter share this one stream: tables, planes and state
+        // are reused in stream order, so prefill queues behind earlier work.
         self.verification.invalidate()?;
         self.healthy = false;
         self.row_tables(&table)?;
@@ -327,6 +337,7 @@ impl<'a> DenseEngine<'a> {
             homes: &self.homes, bank: &self.bank, stream: self.stream.raw };
         for (index, layer) in self.weights.layers.iter().enumerate() {
             blocks.run(index, layer, self.planes, self.kv[index].as_ref().map(|v| v.buffer), &step)?;
+            hook(index, self.planes.residual)?;
         }
         let output = if logit_rows == 0 {
             // Scoring may warm a prefix without consuming logits; never launch a zero-row head.
@@ -342,7 +353,7 @@ impl<'a> DenseEngine<'a> {
                 &[Scalar::I32(i32::try_from(logit_rows)?)], self.stream.raw)?; }
             self.target_head(self.planes.norm, self.logits.buffer, logit_rows)?
         };
-        self.stream.drain()?;
+        // The returned logits carry this stream; selection waits on it.
         self.slots[slot].position = end;
         self.position = self.slots[0].position;
         self.healthy = true;

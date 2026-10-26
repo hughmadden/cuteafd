@@ -134,9 +134,9 @@ def test_kimi_explicit_spark_budget_reaches_plan_and_workers(tmp_path: Path) -> 
     ("ATTENTION_PLACEMENT=context\n", "kimi_k3 supports only ATTENTION_PLACEMENT=auto"),
     ("VISION=rtx\n", "kimi_k3 bundled media execution is not qualified"),
     ("AUDIO=spark\n", "kimi_k3 bundled media execution is not qualified"),
-    ("SPARK_COUNT=4\n", "exactly six Spark ranks"),
-    ("SPARK_COUNT=0\n", "exactly six Spark ranks"),
-    ("EXPERT_BACKEND=local\nSPARK_COUNT=0\n", "exactly six Spark ranks"),
+    ("SPARK_COUNT=4\n", "no installed kimik3:exl3-k23 Spark recipe or rank-sized intake/admission"),
+    ("SPARK_COUNT=0\n", "no installed kimik3:exl3-k23 Spark recipe or rank-sized intake/admission"),
+    ("EXPERT_BACKEND=local\nSPARK_COUNT=0\n", "no installed kimik3:exl3-k23 Spark recipe or rank-sized intake/admission"),
     ("RTX_GPUS=1\n", "TP2 attention on two RTX GPUs"),
     ("COORDINATOR_SPLIT=off\n", "TP2 attention on two RTX GPUs"),
     ("EMBEDDING=host\n", "GPU token embeddings only"),
@@ -248,7 +248,7 @@ def test_kimi_gate_card_lists_and_generates_a_wip_launch(tmp_path: Path) -> None
     assert card["family"] == "kimi_k3" and card["gpus"] == [0, 1]
     assert card["sparks"] == ["ostrich", "dodo", "emu", "kiwi", "rhea", "moa"]
     assert card["profile"] == "smoke"
-    assert cards.config(card["config"])["MODEL_ID"] == KIMI_ID
+    assert cards.config(card["config"])["MODEL_ID"] == "wrldsuksgo2mars/Kimi-K3-EXL3-K2-Core-K6"
     assert cards.slot_needs(card)["coordinator"] == cards.slot_needs(card)["spark"] == ["exl3/exl3-kimik3-k23"]
     key = tmp_path / "key"
     key.write_text("k" * 64 + "\n")
@@ -256,7 +256,7 @@ def test_kimi_gate_card_lists_and_generates_a_wip_launch(tmp_path: Path) -> None
     job = cards.generate(card, "cand", {"instance": "t", "slot": "s"}, tmp_path, key, {}, {"fabric"}, None, 1)
     values = cards.config(Path(job["entry"]["config"]))
     assert job["entry"]["run_args"] == ["--wip", "s"]
-    assert (values["SPARK_COUNT"], values["RTX_GPUS"], values["SPECULATOR"]) == ("6", "2", "off")
+    assert (values["SPARK_COUNT"], values["RTX_GPUS"], values["SPECULATOR"]) == ("6", "2", "dflash2")
     assert not any(key.endswith("_LANE_B") for key in values)
 
 

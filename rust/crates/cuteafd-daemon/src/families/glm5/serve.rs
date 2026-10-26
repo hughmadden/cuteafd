@@ -460,7 +460,7 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
         let tp2 = engine.tp2_layers();
         let remote = if engine.weights.layers.iter().enumerate().any(|(layer, weights)|
             !weights.dense && !tp2.as_ref().is_some_and(|layers| layers.contains(&layer))) {
-            transport.as_ref().context("GLM installed Spark transport missing")?.transport.installed_grouping()?
+            transport.as_ref().context("GLM installed Spark transport missing")?.installed_grouping()?
         } else { Vec::new() };
         let catalog = cuteafd_loader::read_expert_catalog(&opened.snapshot)?;
         let homes = draft_homes(engine.weights.layers.iter().enumerate().map(|(layer, weights)| {
@@ -793,7 +793,7 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
                     .collect();
                 drafted_requests = seqs.len();
                 let drafts = round_clock.draft(|| drafter.draft_device(&seqs.iter().map(|(_, s)| *s).collect::<Vec<_>>(), &engine.embedding,
-                    crate::shared::speculation::dflash::TargetHead::Bf16(&engine.weights.head)));
+                    engine.weights.head.target()));
                 drafted_width = drafter.cfg.drafts();
 
                 let mut out = vec![None; active.len()];

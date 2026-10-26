@@ -588,6 +588,11 @@ fn draft_diagnostics(args: &GoldenArgs, cfg: &MiniMaxM3Config, checkpoint: &Chec
 }
 
 pub(crate) async fn run_golden(args: GoldenArgs) -> Result<()> {
+    // Spark-backed goldens need the v4 Spark exchange MiniMax is not on yet; RTX-local and
+    // draft-only goldens (no peers) still run.
+    if !args.peers.is_empty() {
+        return Err(MiniMaxError::Unsupported(super::routed::SPARK_EXCHANGE_PENDING).into());
+    }
     let checkpoint = Checkpoint::coordinator(&args.snapshot, false, false)?;
     let cfg = MiniMaxM3Config::from_hf(&checkpoint.config)?;
     cfg.release_geometry()?;

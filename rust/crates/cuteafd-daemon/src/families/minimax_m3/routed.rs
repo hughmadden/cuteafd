@@ -1,6 +1,5 @@
 use super::{MiniMaxError, execution::ExpertExecutor, native::Native};
-use crate::shared::{experts::fp8::Fp8Experts,prefill_lanes::LaneLinks,
-    spark_intake::{self,IntakePreference,SparkDeviceLink}};
+use crate::shared::{experts::fp8::Fp8Experts,spark_intake::{self,IntakePreference}};
 
 /// Whether this GPU's Spark partials land in pinned host planes (no dma-buf
 /// landing, as on GeForce cards): the ledger and the links take the same answer.
@@ -15,52 +14,29 @@ use cuteafd_transport::{ExpertProtocolV2Request,ExpertProtocolV2RouteEntry,Exper
 use std::net::SocketAddr;
 
 const ROW:usize=6144*2;
-const TOPK:usize=4;
+
+/// Why MiniMax cannot reach its Spark experts on this branch.
+pub(crate) const SPARK_EXCHANGE_PENDING:&str="MiniMax runtime is not yet on the v4 Spark exchange (phase 2): \
+    its routed experts ran on the device-driven Spark lane, which the shared per-link exchange \
+    (spark_waves) replaced; serving and Spark goldens refuse until MiniMax is ported onto it";
 
 /// The family's protocol request builder (identity, layer, rows, routes, wire, kind).
 pub(super) type Build=fn(u64,usize,usize,Vec<ExpertProtocolV2RouteEntry>,bytes::Bytes,ExpertV2SourceKind)
     ->Result<ExpertProtocolV2Request>;
 
-/// Spark expert transport: the device-driven exchange, one link per prefill
-/// lane (each its own proxy, mailbox, egress, planes and rank connections,
-/// so every lane's wave can be in flight at once). Partials land in GPU
-/// memory where the NIC can write it (dma-buf), otherwise in pinned host
-/// planes the reducer reads in place (GeForce cards have no dma-buf); either
-/// way the stream never drains, and the inference thread never parses or
-/// copies, per routed layer.
-pub(super) struct Spark<'a>(LaneLinks<SparkDeviceLink<'a>>);
+/// Spark expert transport. MiniMax exchanged its routed waves over the device-driven Spark lane
+/// (`SparkDeviceLink`), which upstream deleted for the shared per-link exchange
+/// (`shared::spark_waves`). Until MiniMax is ported onto that exchange no link can be made: this
+/// type has no values, [`Spark::connect`] refuses with [`SPARK_EXCHANGE_PENDING`], and every
+/// Spark arm below is statically unreachable. RTX-local routed layers keep working.
+pub(super) struct Spark<'a> { never:std::convert::Infallible, _link:std::marker::PhantomData<&'a ()> }
 
 impl<'a> Spark<'a> {
-    /// `first` is a Spark layer for the warm wave that sizes every rank's rings;
-    /// `host` is [`host_landing`].
+    /// Refuses: see [`SPARK_EXCHANGE_PENDING`]. The signature is the one the port will keep.
     #[allow(clippy::too_many_arguments)]
-    pub fn connect(library:&'a NativeLibrary,device:i32,world:SparkWorld,peers:&[SocketAddr],rows:usize,
-        config:TcpTransportConfig,first:usize,build:Build,lanes:usize,host:bool)->Result<Self> {
-        if host { tracing::info!("MiniMax Spark partials land in pinned host planes (no GPU landing)"); }
-        // One- and two-row waves publish with one store kernel (CUTEAFD_SPARK_PUBLISH=copy: copy engine).
-        let kernel=!matches!(std::env::var("CUTEAFD_SPARK_PUBLISH").as_deref(),Ok("copy"));
-        tracing::info!(publish=if kernel {"kernel"} else {"copy"},"MiniMax Spark small decode waves publish from the stream");
-        Ok(Self(LaneLinks::connect(lanes,|lane| {
-            let routes=(0..rows*TOPK).map(|i| ExpertProtocolV2RouteEntry {
-                row_index:(i/TOPK) as u32, expert_id:(i%128) as u32, gate_weight:0.0 }).collect();
-            // Each link numbers its own waves; lanes keep apart in the high bits.
-            let base=(lane as u64)<<40 | 1;
-            let warm=build(base,first,rows,routes,vec![0;rows*ROW].into(),ExpertV2SourceKind::Prefill)?;
-            let mut identity=base;
-            let wave_build:cuteafd_transport::expert::DeviceBuild=Box::new(move |wave,routes,wire| {
-                let kind=match wave.kind {
-                    1=>ExpertV2SourceKind::Decode,
-                    2=>ExpertV2SourceKind::Prefill,
-                    _=>return Err(MiniMaxError::Invalid("Spark wave source kind").into()),
-                };
-                identity=identity.checked_add(1).ok_or(MiniMaxError::Overflow("Spark wave identity"))?;
-                build(identity,wave.layer as usize,wave.rows as usize,routes,wire,kind)
-            });
-            let link=SparkDeviceLink::new_zero_copy(library,device,world,peers,rows,TOPK,ROW,ROW,config.clone(),
-                Some(warm),wave_build,host)?;
-            link.publish_by_kernel(kernel);
-            Ok(link)
-        })?))
+    pub fn connect(_library:&'a NativeLibrary,_device:i32,_world:SparkWorld,_peers:&[SocketAddr],_rows:usize,
+        _config:TcpTransportConfig,_first:usize,_build:Build,_lanes:usize,_host:bool)->Result<Self> {
+        Err(MiniMaxError::Unsupported(SPARK_EXCHANGE_PENDING).into())
     }
 }
 
@@ -68,7 +44,6 @@ impl<'a> Spark<'a> {
 /// (lane scratch) until it runs at collect.
 enum Pending {
     Local { layer:usize,rows:usize,index:usize,ids:CuteafdDeviceBuffer,weights:CuteafdDeviceBuffer,input:CuteafdDeviceBuffer },
-    Spark { layer:usize,rows:usize },
 }
 pub(super) struct Routed<'a> {
     local: Option<Fp8Experts<'a>>,
@@ -89,14 +64,14 @@ impl<'a> Routed<'a> {
                 && info.activation==cuteafd_ffi::fp8_moe::Fp8MoeActivation::SwigluOai && info.swiglu_limit==7.0,
                 MiniMaxError::Unsupported("RTX experts require MiniMax TP1 NVFP4 W4A4"));
         }
-        if let Some(Spark(links))=&spark { ensure!(!links.is_empty() && links.iter().all(|l|matches!(l.world_size(),2|3|4|6)),
-            MiniMaxError::Unsupported("Spark experts require TP2, TP3, TP4 or TP6")); }
+        if let Some(spark)=&spark { match spark.never {} }
         // Local layers run on the stream at collect, in any lane.
-        let lanes=spark.as_ref().map_or(MAX_PREFILL_LANES,|Spark(links)|links.len());
+        let lanes=MAX_PREFILL_LANES;
         Ok(Self{local,spark,pending:(0..lanes).map(|_|None).collect(),kind:ExpertV2SourceKind::Decode,poisoned:false})
     }
-    fn link(&self,lane:usize)->Result<&SparkDeviceLink<'a>> {
-        self.spark.as_ref().context("MiniMax routed layer has neither local experts nor Spark transport")?.0.lane(lane)
+    /// A layer that is not RTX-local needs the Spark transport, which cannot exist yet.
+    fn spark(&self)->Result<&Spark<'a>> {
+        self.spark.as_ref().context("MiniMax routed layer has neither local experts nor Spark transport")
     }
 }
 impl<'a> ExpertExecutor<'a> for Routed<'a> {
@@ -107,11 +82,9 @@ impl<'a> ExpertExecutor<'a> for Routed<'a> {
         ensure!(matches!(kind,ExpertV2SourceKind::Decode|ExpertV2SourceKind::Prefill),
             MiniMaxError::Unsupported("expert source kind"));
         self.kind=kind;
-        if let Some(Spark(links))=&self.spark {
-            let local=self.local.as_ref().map_or(0,|l|l.layers.len());
-            let remote=waves.checked_sub(local).context("MiniMax expert inventory exceeds routed layers")? as u64;
-            for link in &links[..lanes] { link.arm()?; link.expect(remote); }
-        }
+        let local=self.local.as_ref().map_or(0,|l|l.layers.len());
+        waves.checked_sub(local).context("MiniMax expert inventory exceeds routed layers")?;
+        if let Some(spark)=&self.spark { match spark.never {} }
         Ok(())
     }
     fn record(&mut self,kind:ExpertV2SourceKind)->Result<()> {
@@ -123,18 +96,14 @@ impl<'a> ExpertExecutor<'a> for Routed<'a> {
     }
     fn lanes(&self)->usize { self.pending.len() }
     fn dispatch(&mut self,layer:usize,lane:usize,rows:usize,ids:CuteafdDeviceBuffer,weights:CuteafdDeviceBuffer,
-        input:CuteafdDeviceBuffer,native:&Native<'a>)->Result<()> {
+        input:CuteafdDeviceBuffer,_native:&Native<'a>)->Result<()> {
         ensure!(self.pending.get(lane).is_some_and(Option::is_none),MiniMaxError::Invalid("overlapping expert waves"));
         let pending=if let Some(index)=self.local.as_ref().and_then(|l|l.index_of(layer).ok()) {
             Pending::Local{layer,rows,index,ids,weights,input}
         } else {
-            ensure!(rows>0 && ids.bytes>=rows*16 && weights.bytes>=rows*16 && input.bytes>=rows*ROW,
-                "MiniMax Spark expert operand extent");
-            native.check_device(&[ids,weights,input])?;
-            // SAFETY: the link's mailbox and the lane scratch outlive the stream's
-            // work; this lane collects (and reduces) each wave before the next.
-            unsafe { self.link(lane)?.dispatch(layer,rows,self.kind as u32,ids,weights,input,native.raw())? };
-            Pending::Spark{layer,rows}
+            // A routed layer that is not RTX-local is a Spark wave: it needs the shared
+            // exchange, and no Spark link exists until MiniMax is ported onto it.
+            match self.spark()?.never {}
         };
         self.pending[lane]=Some(pending);
         Ok(())
@@ -151,30 +120,16 @@ impl<'a> ExpertExecutor<'a> for Routed<'a> {
                 // stream's work; the shared expert binding verifies its package.
                 unsafe { owner.run_bf16(index,rows,input.ptr,ids.ptr,weights.ptr,output.ptr,native.raw()) }
             }
-            Pending::Spark{layer:expected,rows:count}=>{
-                ensure!((layer,rows)==(expected,count),MiniMaxError::Invalid("Spark expert wave identity"));
-                ensure!(rows>0 && output.bytes>=rows*ROW,"MiniMax Spark expert output extent");
-                native.check_device(&[output])?;
-                let link=self.link(lane)?;
-                // SAFETY: the one matching pending dispatch was queued earlier on
-                // this stream; the link owns every returned rank plane.
-                unsafe {
-                    link.collect(native.raw())?;
-                    link.reduce(std::ptr::null(),output.ptr.cast(),rows,native.raw())
-                }
-            }
         }
     }
     fn finish(&mut self)->Result<()> {
         ensure!(self.pending.iter().all(Option::is_none),MiniMaxError::Invalid("uncollected expert wave at step end"));
-        if let Some(Spark(links))=&self.spark { for link in links.iter() { link.check()?; } }
+        if let Some(spark)=&self.spark { match spark.never {} }
         Ok(())
     }
     fn abort(&mut self) {
         self.poisoned=true;
         self.pending.iter_mut().for_each(|p|{p.take();});
-        // Execution drained its stream first; closing the links joins their
-        // proxies and cancels any announced waves the failed step never sent.
         self.spark.take();
     }
 }

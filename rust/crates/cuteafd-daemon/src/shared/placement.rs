@@ -401,8 +401,8 @@ mod tests {
         SparkAdmission::plan(root.path(), ExpertGeometry::GLM5_FLASH, None,
             &SparkWorkingSet::default(), 2, None,
             ModelAdmission { capacity: 2048, compiled_capacity: 4096,
-                endpoints: vec![SparkEndpoint { capacity: 2048, ingress: SparkIngress::Fp8K32 }],
-                rings: SparkRings { max_frame_bytes: 64 << 20, depth: 8, slot_bytes: 8 << 20, alignment: 4096 } })
+                endpoints: vec![SparkEndpoint { ring_depth: None, capacity: 2048, ingress: SparkIngress::Fp8K32 }],
+                rings: SparkRings { max_frame_bytes: 64 << 20, depth: 8, slot_bytes: 8 << 20, alignment: 4096 }, execution_slots: 1 })
     }
 
     fn idle_report(rank: u32) -> ModelAdmissionResponse {
@@ -416,9 +416,9 @@ mod tests {
 
     fn fixture_model() -> ModelAdmission {
         ModelAdmission { capacity: 80, compiled_capacity: 80,
-            endpoints: vec![SparkEndpoint { capacity: 80, ingress: SparkIngress::Fp8K32 },
-                SparkEndpoint { capacity: 16, ingress: SparkIngress::Fp8K32 }],
-            rings: SparkRings { max_frame_bytes: 64 << 20, depth: 2, slot_bytes: 1 << 20, alignment: 4096 } }
+            endpoints: vec![SparkEndpoint { ring_depth: None, capacity: 80, ingress: SparkIngress::Fp8K32 },
+                SparkEndpoint { ring_depth: None, capacity: 16, ingress: SparkIngress::Fp8K32 }],
+            rings: SparkRings { max_frame_bytes: 64 << 20, depth: 2, slot_bytes: 1 << 20, alignment: 4096 }, execution_slots: 1 }
     }
 
     fn check_reports(plan: &SparkAdmission) -> Result<()> {
@@ -457,7 +457,7 @@ mod tests {
         catalog.select_draft(cuteafd_loader::plan::spec::DraftOwnership::None)?;
         let shape = catalog.routed_experts();
         let selected = [shape.first_layer];
-        for ranks in 1..=6 {
+        for ranks in 1..=8 {
             crate::shared::spark_topology::require_world(
                 cuteafd_transport::expert::SparkWorld::canonical(ranks)?, &catalog, &selected)?;
         }

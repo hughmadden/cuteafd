@@ -1,7 +1,25 @@
 use super::*;
+use std::future::Future;
 use std::io::{Seek, SeekFrom, Write};
 
 type TestResult = std::result::Result<(), Box<dyn std::error::Error>>;
+
+#[test]
+fn fixed_staging_charges_actual_wave_count_and_separate_decode_rows() -> TestResult {
+    for k in 1..=4 {
+        let staging = MappedStaging::new(2048 * 16, k, 64 * 16, 320)?;
+        assert_eq!(staging.slot_bytes().collect::<Vec<_>>(),
+            std::iter::repeat_n(2048 * 16 * 320, k).chain(std::iter::once(64 * 16 * 320)).collect::<Vec<_>>());
+        assert_eq!(staging.counter_bytes, (k + 1) * 2 * 64);
+        assert_eq!(staging.total_bytes, (k * 2048 + 64) * 16 * 320 + (k + 1) * 2 * 64);
+        assert_eq!(staging.slot_bytes().sum::<usize>() + staging.counter_bytes, staging.total_bytes);
+    }
+    for (rows, k, decode, bytes) in [(0, 1, 64, 1), (1, 0, 64, 1), (1, 5, 64, 1),
+        (1, 1, 0, 1), (1, 1, 64, 0), (usize::MAX, 1, 64, 320), (usize::MAX / 2, 4, 64, 1)] {
+        assert!(MappedStaging::new(rows, k, decode, bytes).is_err());
+    }
+    Ok(())
+}
 
 #[test]
 fn live_reader_loads_only_atomics_without_interval_or_device_locks() {
@@ -656,6 +674,151 @@ fn gather_worker_recycles_slots_and_cancels() -> TestResult {
     };
     cancelled.cancel();
     assert!(matches!(cancelled.poll(), Ok(GatherPoll::Cancelled)));
+    Ok(())
+}
+
+struct GatherTestWake(mpsc::SyncSender<()>);
+impl std::task::Wake for GatherTestWake {
+    fn wake(self: Arc<Self>) { let _ = self.0.try_send(()); }
+    fn wake_by_ref(self: &Arc<Self>) { let _ = self.0.try_send(()); }
+}
+
+fn await_gather<F: std::future::Future>(future: F) -> F::Output {
+    let (send, receive) = mpsc::sync_channel(1);
+    let waker = std::task::Waker::from(Arc::new(GatherTestWake(send)));
+    let mut context = std::task::Context::from_waker(&waker);
+    let mut future = std::pin::pin!(future);
+    loop {
+        match future.as_mut().poll(&mut context) {
+            std::task::Poll::Ready(result) => return result,
+            std::task::Poll::Pending => receive.recv_timeout(Duration::from_secs(5)).expect("gather must wake its waiter"),
+        }
+    }
+}
+
+#[test]
+fn gather_wait_wakes_for_success_failure_and_worker_panic() -> TestResult {
+    let (started, entered) = mpsc::sync_channel(1);
+    let (release, resume) = mpsc::sync_channel(1);
+    let worker: GatherWorker<Vec<u8>, u8, &'static str> = GatherWorker::new(
+        "test-gather-wake", vec![vec![0]], move |slot, job| {
+            started.send(()).unwrap();
+            resume.recv_timeout(Duration::from_secs(5)).unwrap();
+            match job {
+                0 => { slot[0] = 42; Ok(()) }
+                1 => Err("injected gather failure"),
+                _ => panic!("injected gather panic"),
+            }
+        })?;
+    for job in 0..3 {
+        let mut ticket = worker.try_submit(job, false)?.expect("free staging slot");
+        entered.recv_timeout(Duration::from_secs(5))?;
+        let (send, receive) = mpsc::sync_channel(1);
+        let waker = std::task::Waker::from(Arc::new(GatherTestWake(send)));
+        let mut context = std::task::Context::from_waker(&waker);
+        let mut future = std::pin::pin!(ticket.wait());
+        assert!(future.as_mut().poll(&mut context).is_pending());
+        release.send(())?;
+        receive.recv_timeout(Duration::from_secs(5)).expect("worker completion must signal the async waiter");
+        let result = await_gather(future);
+        match job {
+            0 => {
+                let Ok(GatherPoll::Ready(lease)) = result else { panic!("expected completed gather") };
+                assert_eq!(lease.slot().unwrap(), &[42]);
+            }
+            1 => assert!(matches!(result, Err(GatherFailure::Job("injected gather failure")))),
+            _ => assert!(matches!(result, Err(GatherFailure::Worker(MappedTableError::Stopped(_))))),
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn gather_wait_handles_early_completion_cancellation_and_dropped_future() -> TestResult {
+    let (submitted, entered) = mpsc::sync_channel(1);
+    let (release, resume) = mpsc::sync_channel(1);
+    let worker: GatherWorker<(), (), ()> = GatherWorker::new("test-gather-cancel-wait", vec![()], move |_, _| {
+        submitted.send(()).unwrap();
+        resume.recv_timeout(Duration::from_secs(5)).unwrap();
+        Ok(())
+    })?;
+    let mut ticket = worker.try_submit((), false)?.expect("free slot");
+    entered.recv_timeout(Duration::from_secs(5))?;
+    let (send, receive) = mpsc::sync_channel(1);
+    let waker = std::task::Waker::from(Arc::new(GatherTestWake(send)));
+    let mut context = std::task::Context::from_waker(&waker);
+    {
+        let mut future = std::pin::pin!(ticket.wait());
+        assert!(future.as_mut().poll(&mut context).is_pending());
+    }
+    release.send(())?;
+    receive.recv_timeout(Duration::from_secs(5))?;
+    // Completion predates the next registration, and dropping the first future
+    // must neither consume the lease nor lose the completed result.
+    let Ok(GatherPoll::Ready(lease)) = await_gather(ticket.wait()) else { panic!("expected completed gather") };
+    assert!(matches!(await_gather(ticket.wait()), Err(GatherFailure::Worker(_))));
+    drop(lease);
+    let mut cancelled = worker.try_submit((), false)?.expect("recycled slot");
+    cancelled.cancel();
+    assert!(matches!(await_gather(cancelled.wait()), Ok(GatherPoll::Cancelled)));
+    // The worker may have passed its cancellation check before cancel was called.
+    release.send(())?;
+    Ok(())
+}
+
+#[test]
+fn gather_admission_waits_for_release_and_preserves_unsubmitted_job() -> TestResult {
+    let worker: GatherWorker<Vec<u8>, u8, ()> = GatherWorker::new(
+        "test-gather-admission", vec![vec![0]], |slot, job| { slot[0] = *job; Ok(()) })?;
+    let mut first = worker.try_submit(7, false)?.expect("one free slot");
+    let Ok(GatherPoll::Ready(lease)) = await_gather(first.wait()) else { panic!("expected first gather") };
+    let (send, receive) = mpsc::sync_channel(1);
+    let waker = std::task::Waker::from(Arc::new(GatherTestWake(send)));
+    let mut context = std::task::Context::from_waker(&waker);
+    let mut capacity = std::pin::pin!(worker.wait_for_capacity());
+    assert!(capacity.as_mut().poll(&mut context).is_pending());
+    let mut admission = std::pin::pin!(worker.submit(19, false));
+    assert!(admission.as_mut().poll(&mut context).is_pending());
+    drop(lease);
+    receive.recv_timeout(Duration::from_secs(5)).expect("lease release must wake admission");
+    await_gather(capacity)?;
+    let mut second = await_gather(admission)?;
+    let Ok(GatherPoll::Ready(lease)) = await_gather(second.wait()) else { panic!("expected second gather") };
+    assert_eq!(lease.job(), &19);
+    assert_eq!(lease.slot().unwrap(), &[19]);
+    drop(lease);
+    await_gather(worker.wait_for_capacity())?;
+    Ok(())
+}
+
+#[test]
+fn gather_admission_prunes_dropped_waiters_and_replaces_repolled_wakers() -> TestResult {
+    let worker: GatherWorker<(), (), ()> = GatherWorker::new(
+        "test-gather-admission-drop", vec![()], |_, _| Ok(()))?;
+    let mut ticket = worker.try_submit((), false)?.expect("one free slot");
+    let Ok(GatherPoll::Ready(lease)) = await_gather(ticket.wait()) else { panic!("expected gather") };
+    for _ in 0..1000 {
+        let (send, _) = mpsc::sync_channel(1);
+        let waker = std::task::Waker::from(Arc::new(GatherTestWake(send)));
+        let mut context = std::task::Context::from_waker(&waker);
+        let mut capacity = Box::pin(worker.wait_for_capacity());
+        let mut admission = Box::pin(worker.submit((), false));
+        assert!(capacity.as_mut().poll(&mut context).is_pending());
+        assert!(admission.as_mut().poll(&mut context).is_pending());
+        assert_eq!(worker.slots.admission.0.lock().unwrap().len(), 2);
+        // A different task may poll the same future; replace its registration.
+        let (send, _) = mpsc::sync_channel(1);
+        let replacement = std::task::Waker::from(Arc::new(GatherTestWake(send)));
+        let mut context = std::task::Context::from_waker(&replacement);
+        assert!(capacity.as_mut().poll(&mut context).is_pending());
+        assert!(admission.as_mut().poll(&mut context).is_pending());
+        assert_eq!(worker.slots.admission.0.lock().unwrap().len(), 2);
+        drop(capacity);
+        assert_eq!(worker.slots.admission.0.lock().unwrap().len(), 1);
+        drop(admission);
+        assert!(worker.slots.admission.0.lock().unwrap().is_empty());
+    }
+    drop(lease);
     Ok(())
 }
 

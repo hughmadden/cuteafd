@@ -14,7 +14,8 @@ const RTX_5090: u64 = 34_144_990_003;
 
 fn with_layout(rtx: u64, ranks: usize) -> PlanOptions {
     PlanOptions { placement: ExpertPlacement::from_spark_ranks(ranks),
-        layout: Some(layout::LayoutOptions { rtx_bytes: vec![rtx], ..Default::default() }), ..Default::default() }
+        layout: Some(layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)), rtx_bytes: vec![rtx],
+            ..Default::default() }), ..Default::default() }
 }
 
 #[test]
@@ -396,7 +397,7 @@ fn minimax_host_embedding_and_c1_rows_preserve_draft_and_increase_pool() {
     c1(&mut sized);
     let sized = plan::plan(dir.path(), &sized).unwrap();
     assert!(sized.placement_supported, "{:?}", sized.hints);
-    assert_eq!(sized.prefill_rows, Some(256));
+    assert_eq!(sized.prefill_unit_rows, Some(256));
     assert!(sized.memory_layout.as_ref().unwrap().notes.iter().any(|n| n.contains("sequences 1")));
     let mut mapped = options.clone();
     mapped.layout.as_mut().unwrap().host_embedding = true;
@@ -435,7 +436,7 @@ fn minimax_draft_context_slots_honor_explicit_shapes() {
     layout.draft_context_slots = Some(4);
     let report = plan::plan(dir.path(), &options).unwrap();
     assert!(report.placement_supported, "{:?}", report.hints);
-    assert_eq!(report.prefill_rows, Some(512));
+    assert_eq!(report.prefill_unit_rows, Some(512));
     assert!(report.memory_layout.as_ref().unwrap().notes.iter().any(|n| n.contains("sequences 4")));
     // Four sequences default to four rings (64 decode rows hold four drafting requests and more).
     options.layout.as_mut().unwrap().draft_context_slots = None;

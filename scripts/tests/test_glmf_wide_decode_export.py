@@ -37,7 +37,7 @@ def exporter(monkeypatch):
         monkeypatch.setenv(name, "1")
     monkeypatch.setitem(sys.modules, "_pinned_sparkinfer", types.SimpleNamespace(REVISION="test"))
     package = types.ModuleType("b12x.integration.cuteafd")
-    for name in ("glmf", "glm_ffn", "glm_attention", "glm_indexer", "dsv4_mhc", "glm_sparse_mla", "context_split", "qwen4", "qwen4_gdn", "qwen4_attention", "qwen_dense", "kimi_mla", "kimi_residual", "pointwise", "mimo_attention", "mimo_ffn"):
+    for name in ("glmf", "glm_ffn", "glm_attention", "glm_indexer", "dsv4_mhc", "glm_sparse_mla", "context_split", "qwen4", "qwen4_gdn", "qwen4_attention", "qwen_dense", "qwen_dense_fp8", "kimi_mla", "kimi_residual", "pointwise", "mimo_attention", "mimo_ffn"):
         module = _Compilers(f"b12x.integration.cuteafd.{name}")
         setattr(package, name, module)
         monkeypatch.setitem(sys.modules, module.__name__, module)
@@ -113,24 +113,38 @@ def test_qwen_fp8_kv_exports_preserve_bf16_and_weight_variants(exporter):
     assert calls["attn_producer_fp8_kv_fp8_m64"] == {"max_rows": 64, "fp8": True, "kv_format": "fp8"}
 
 
+@pytest.mark.parametrize("name", ["qwen35_9b", "qwen38_27b"])
 @pytest.mark.parametrize("norm_dtype", ["torch.float32", "torch.bfloat16"])
 @pytest.mark.parametrize("decode_rows,prefill_rows", [(64, 4096), (64, 64)])
-def test_dense_qwen_exports_only_native_dense_programs(exporter, norm_dtype, decode_rows, prefill_rows):
-    programs = exporter.qwen_dense_programs(GEOMETRY, decode_rows, prefill_rows, 262144,
+def test_dense_qwen_exports_only_native_dense_programs(exporter, name, norm_dtype, decode_rows, prefill_rows):
+    geometry = types.SimpleNamespace(**vars(GEOMETRY), name=name)
+    programs = exporter.qwen_dense_programs(geometry, decode_rows, prefill_rows, 262144,
                                              norm_dtype=norm_dtype)
     calls = {stem: (op, params, thunk()) for stem, op, params, thunk in programs}
     caps = set((decode_rows, prefill_rows))
-    assert len(calls) == len(programs) == 3 + 7 * len(caps)
+    fp8 = {f"{op}_fp8_m{cap}" for cap in caps for op in ("gdn", "attn_producer", "attn_o", "ffn")}
+    fp8 |= {f"attn_producer_fp8_kv_fp8_m{cap}" for cap in caps}
+    if name != "qwen38_27b":
+        fp8 = set()
+    assert len(calls) == len(programs) == 3 + 7 * len(caps) + len(fp8)
     assert set(calls) == {"norm", "add", "gdn_commit"} | {
         f"{op}_m{cap}" for cap in caps for op in ("gdn", "attn_producer", "full_gqa", "attn_o", "ffn")} | {
-        f"{op}_kv_fp8_m{cap}" for cap in caps for op in ("attn_producer", "full_gqa")}
+        f"{op}_kv_fp8_m{cap}" for cap in caps for op in ("attn_producer", "full_gqa")} | fp8
     for stem, (op, params, call) in calls.items():
         module, function, args, kwargs = call
-        assert module == "qwen_dense" and args == (GEOMETRY,)
+        assert args == (geometry,)
         expected_function = "producer" if op == "attn_producer" else op
-        assert function == f"compile_qwen_dense_{expected_function}_aot"
-        assert params == {k: str(v) if k == "norm_dtype" else v for k, v in kwargs.items()}
+        if stem in fp8:
+            assert module == "qwen_dense_fp8"
+            assert function == f"compile_qwen_dense_{expected_function}_fp8_aot"
+            assert params == {**kwargs, "fp8_weights": "only"}
+        else:
+            assert module == "qwen_dense"
+            assert function == f"compile_qwen_dense_{expected_function}_aot"
+            assert params == {k: str(v) if k == "norm_dtype" else v for k, v in kwargs.items()}
     for cap in caps:
+        if name == "qwen38_27b":
+            assert calls[f"attn_producer_fp8_kv_fp8_m{cap}"][2][3] == {"max_rows": cap, "kv_format": "fp8"}
         assert calls[f"gdn_m{cap}"][2][3] == {"max_rows": cap, "norm_dtype": norm_dtype}
         assert calls[f"attn_producer_m{cap}"][2][3] == {"max_rows": cap}
         assert calls[f"full_gqa_m{cap}"][2][3] == {"max_rows": cap, "max_splits": 32}

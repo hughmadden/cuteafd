@@ -2,12 +2,6 @@
 //! response assembler/recycling code runs locally; no QP worker is spawned.
 use super::*;
 
-/// Requests up to this size go out rank after rank under a staggered egress.
-/// Posted alone, one rank's zero-copy request completes at ~12-14 GB/s up to
-/// 13 MB but at ~3 GB/s at 26 MB (raptor to a Spark, 200 Gb); larger requests
-/// go out all at once, where the ranks' queue pairs overlap that.
-const STAGGER_MAX_BYTES: usize = 16 << 20;
-
 pub(crate) struct LocalTp4Client {
     peers: Vec<SocketAddr>,
     config: TcpTransportConfig,
@@ -17,19 +11,20 @@ pub(crate) struct LocalTp4Client {
     retired: Vec<TcpStream>,
     retirement_error: Option<String>,
     capacity: Option<u32>,
+    /// Explicit immutable ModelAdmission endpoint; survives every QP reconnect.
+    model_endpoint: Option<u32>,
     pending: Vec<VecDeque<VerbsHostProtocolV2PendingChunkRoundtrip>>,
-    chunks: Option<tokio::sync::mpsc::UnboundedReceiver<VerbsHostProtocolV2ResponseChunk>>,
-    done: Vec<tokio::sync::oneshot::Receiver<Result<VerbsHostProtocolV2ResponseStreamStats>>>,
-    deadline: Option<Instant>,
+    /// Dispatched waves, oldest first. Every rank serves its requests in post
+    /// order, so the oldest wave completes first on each rank; `poll` serves
+    /// only the front and later waves' chunks wait in their own channels.
+    waves: VecDeque<OpenWave>,
+    /// Most waves outstanding at once (1 unless raised by the owner).
+    max_waves: usize,
     /// Per-rank device ranges response payloads land in (GPU landing).
     landing: Vec<Option<DeviceLanding>>,
-    /// Per-rank write targets: responses are RDMA-written there (write mode).
-    write: Vec<Option<DeviceWriteTarget>>,
     /// Shared registered request buffer (zero-copy egress).
     egress: Option<Arc<super::egress::EgressBuffer>>,
-    /// Post the ranks' zero-copy requests one after another (each once the
-    /// previous rank's send completed) rather than all at once.
-    stagger: bool,
+    egress_slot: usize,
     /// Optional terminal contract. A failed temporary/persistent endpoint
     /// publishes into this witness before its external landing owner drops.
     terminal_owner: Option<Arc<AtomicBool>>,
@@ -58,14 +53,13 @@ impl LocalTp4Client {
             retired: Vec::new(),
             retirement_error: None,
             capacity: None,
+            model_endpoint: None,
             pending: (0..world).map(|_| VecDeque::with_capacity(1)).collect(),
-            chunks: None,
-            done: Vec::with_capacity(world),
-            deadline: None,
+            waves: VecDeque::with_capacity(1),
+            max_waves: 1,
             landing: vec![None; world],
-            write: vec![None; world],
             egress: None,
-            stagger: false,
+            egress_slot: 0,
             terminal_owner: None,
             terminal_failed: false,
             terminal_quiesced: false,
@@ -73,6 +67,27 @@ impl LocalTp4Client {
         }
     }
     pub(crate) fn set_capacity(&mut self, capacity: u32) { self.capacity = Some(capacity); }
+    pub(crate) fn bind_model_endpoint(&mut self, endpoint: u32) -> Result<()> {
+        anyhow::ensure!(endpoint < 8, "ModelAdmission endpoint index must be below eight");
+        anyhow::ensure!(self.model_endpoint.is_none(), "ModelAdmission endpoint already bound");
+        anyhow::ensure!(self.sessions.iter().all(Option::is_none)
+            && self.expert_grouping.iter().all(Option::is_none) && self.waves.is_empty(),
+            "ModelAdmission endpoint must be bound before bootstrap or dispatch");
+        self.model_endpoint = Some(endpoint);
+        Ok(())
+    }
+    /// Admit up to `waves` outstanding waves. Raising it requires no open wave.
+    pub(crate) fn set_max_waves(&mut self, waves: usize) -> Result<()> {
+        anyhow::ensure!((1..=4).contains(&waves), "Spark transport admits 1..=4 outstanding waves");
+        anyhow::ensure!(self.waves.is_empty(), "cannot change wave admission with waves in flight");
+        anyhow::ensure!(self.egress.is_none() && self.sessions.iter().all(Option::is_none),
+            "wave admission must precede egress allocation and bootstrap");
+        self.max_waves = waves;
+        Ok(())
+    }
+    pub(crate) fn max_waves(&self) -> usize { self.max_waves }
+    pub(crate) fn timeout(&self) -> Duration { self.config.timeout }
+    pub(crate) fn open_waves(&self) -> usize { self.waves.len() }
 
     pub(crate) fn installed_grouping(&self) -> Result<Vec<crate::worker_selection::InstalledExpertGrouping>> {
         let reports = self.expert_grouping.iter().enumerate().map(|(rank, report)|
@@ -111,6 +126,7 @@ impl LocalTp4Client {
     /// and retains the grouping its bootstrap reported.
     fn open_session(&mut self, rank: usize, request: &ExpertProtocolV2Request, landing: Option<DeviceLanding>,
         egress: bool) -> Result<()> {
+        landing_phase_admits_open(landing, self.max_waves, self.egress_slot)?;
         let flow_label = self.flows.label(rank, self.peers[rank])?;
         // Only the compact-BF16 wire caps a session's rings by capacity; every
         // other family's rings are the request's own wire extents.
@@ -119,7 +135,7 @@ impl LocalTp4Client {
         self.sessions[rank] = Some(VerbsHostProtocolV2PersistentClientSession::connect_local(
             self.peers[rank], &self.config, request, landing,
             if egress { self.egress.as_ref() } else { None },
-            self.write[rank], self.terminal_owner.clone(), flow_label, capacity)?);
+            self.terminal_owner.clone(), flow_label, capacity, self.model_endpoint)?);
         self.retain_grouping(rank)
     }
 
@@ -173,28 +189,37 @@ impl LocalTp4Client {
 
     /// Allocates the shared request buffer (`bytes`, pinned and device-mapped)
     /// and registers it on every session from the next connection on.
-    pub(crate) fn enable_egress(&mut self, bytes: usize, stagger: bool) -> Result<CuteafdHostBuffer> {
-        self.reset();
-        let buffer = super::egress::EgressBuffer::new(bytes)?;
+    pub(crate) fn enable_egress(&mut self, bytes: usize) -> Result<CuteafdHostBuffer> {
+        anyhow::ensure!(self.waves.is_empty(), "cannot replace egress with outstanding waves");
+        if self.sessions.iter().any(Option::is_some) {
+            anyhow::ensure!(self.terminal_owner.is_none(), "terminal egress must precede bootstrap");
+            self.reset();
+        }
+        let buffer = super::egress::EgressBuffer::new(bytes, self.max_waves)?;
         let host = buffer.host();
         self.egress = Some(buffer);
-        self.stagger = stagger;
         Ok(host)
     }
     /// The shared request buffer, once no request payload views it and every
     /// session's request sends have left, so it may be rewritten.
     pub(crate) fn egress_target(&mut self) -> Result<CuteafdHostBuffer> {
         let buffer = self.egress.as_ref().context("this transport has no egress buffer")?;
-        anyhow::ensure!(buffer.writable(), "a request still views the egress buffer");
-        let host = buffer.host();
+        anyhow::ensure!(buffer.writable(self.egress_slot), "a request still views the egress buffer");
+        let host = buffer.target(self.egress_slot)?;
         for session in self.sessions.iter_mut().flatten() {
-            session.drain_request_sends(&self.config)?;
+            session.drain_egress_reads(self.egress_slot, &self.config)?;
         }
         Ok(host)
     }
+    /// Every slot of the registered request ring as a staging arena: requests
+    /// whose payload views one go out from it on every rank (no per-rank copy).
+    pub(crate) fn egress_arenas(&self) -> Result<Vec<super::StagingArena>> {
+        let Some(buffer) = self.egress.as_ref() else { return Ok(Vec::new()) };
+        (0..self.max_waves).map(|slot| super::StagingArena::of(buffer, slot)).collect()
+    }
     /// The first `len` bytes of the egress buffer as a request payload.
     pub(crate) fn egress_payload(&self, len: usize) -> Result<bytes::Bytes> {
-        self.egress.as_ref().context("this transport has no egress buffer")?.payload(len)
+        self.egress.as_ref().context("this transport has no egress buffer")?.payload(self.egress_slot, len)
     }
     /// Lands each rank's response payloads in its device range from the next
     /// connection on; drops current sessions so they reconnect that way.
@@ -202,36 +227,6 @@ impl LocalTp4Client {
         anyhow::ensure!(landing.len() == self.peers.len(), "one GPU landing entry per rank");
         self.reset();
         self.landing = landing;
-        Ok(())
-    }
-    /// Write mode from the next connection on: each rank's responses are
-    /// RDMA-written into its target (no receives); drops current sessions.
-    pub(crate) fn set_write_targets(&mut self, write: Vec<Option<DeviceWriteTarget>>) -> Result<()> {
-        anyhow::ensure!(write.len() == self.peers.len(), "one write target entry per rank");
-        self.reset();
-        self.write = write;
-        Ok(())
-    }
-    /// Write mode: posts `request` to every rank and returns; the responses
-    /// arrive as RDMA writes (their flags tell the GPU). Send completions are
-    /// reaped as send slots are reused.
-    pub(crate) fn post_written(&mut self, request: &ExpertProtocolV2Request) -> Result<()> {
-        crate::health::ensure_available()?;
-        anyhow::ensure!(self.deadline.is_none(), "a received wave is pending on this transport");
-        self.flows.ensure_all(&self.peers)?;
-        for rank in 0..self.peers.len() {
-            anyhow::ensure!(self.write[rank].is_some(), "rank {rank} has no write target");
-            if self.sessions[rank].as_ref().map(|s| s.fits(request)).transpose()? == Some(false) {
-                self.retire_session(rank)?;
-            }
-            if self.sessions[rank].is_none() {
-                self.drain_retired()?;
-                self.open_session(rank, request, None, false)?;
-            }
-            let session = self.sessions[rank].as_mut().unwrap();
-            anyhow::ensure!(session.write_mode, "rank {rank} session is not in write mode");
-            session.post_chunk_request(request, &self.config)?;
-        }
         Ok(())
     }
     /// Ranks whose live session lands payloads in device memory.
@@ -249,8 +244,8 @@ impl LocalTp4Client {
     }
     fn reset_storage(&mut self) {
         // Drop queued payloads before sessions unregister their receive rings.
-        self.chunks = None;
-        self.done.clear();
+        self.waves.clear();
+        self.egress_slot = 0;
         for pending in &mut self.pending {
             pending.clear();
         }
@@ -259,13 +254,13 @@ impl LocalTp4Client {
                 crate::health::record_failure(format!("expert session teardown failed: {error:#}"));
             }
         }
-        self.deadline = None;
     }
     pub(crate) fn dispatch(&mut self, request: &ExpertProtocolV2Request) -> Result<()> {
         crate::health::ensure_available()?;
         anyhow::ensure!(!self.terminal_failed && !self.terminal_quiesced,
             "terminal-owned Spark transport cannot be reused after failure or quiescence");
-        anyhow::ensure!(self.deadline.is_none(), "local TP4 request already pending");
+        anyhow::ensure!(self.waves.len() < self.max_waves,
+            "Spark transport already has {} of {} admitted waves pending", self.waves.len(), self.max_waves);
         let result = self.post(request);
         if let Err(error) = &result {
             crate::health::record_failure(format!("expert dispatch failed: {error:#}"));
@@ -277,16 +272,18 @@ impl LocalTp4Client {
         // Any rank still unplaced is measured before this wave's requests go out.
         self.flows.ensure_all(&self.peers)?;
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        self.chunks = Some(rx);
+        let mut done = Vec::with_capacity(self.peers.len());
         for rank in 0..self.peers.len() {
+            anyhow::ensure!(self.waves.is_empty() || self.sessions[rank].is_some(),
+                "a Spark session must stay open while earlier waves are outstanding");
             if self.sessions[rank]
                 .as_ref()
                 .map(|s| s.fits(request))
                 .transpose()?
                 == Some(false)
             {
-                anyhow::ensure!(self.terminal_owner.is_none(),
-                    "terminal-owned Spark request exceeds its prewarmed session capacity; reconnect is unsupported");
+                anyhow::ensure!(self.terminal_owner.is_none() && self.waves.is_empty(),
+                    "Spark request exceeds its prewarmed session capacity; reconnect is unsupported here");
                 self.retire_session(rank)?;
             }
             if self.sessions[rank].is_none() {
@@ -295,18 +292,13 @@ impl LocalTp4Client {
             }
         }
         if self.expert_grouping.iter().any(Option::is_some) { self.installed_grouping()?; }
-        // Every rank's bootstrap is validated before any request enters a QP.
-        for rank in 0..self.peers.len() {
-            let session = self.sessions[rank].as_mut().unwrap();
-            let timing = session.post_chunk_request(request, &self.config)?;
-            if self.stagger && rank + 1 < self.peers.len() && request.hidden_payload.len() <= STAGGER_MAX_BYTES
-                && session.sends_from_egress(request) {
-                // The next rank's request goes out once this one has left: each
-                // rank gets the whole link in turn and starts computing as early
-                // as it can, so the ranks finish, and their partials land,
-                // staggered instead of all at once.
-                session.drain_request_sends(&self.config)?;
-            }
+        // Every rank's bootstrap is validated before any request enters a QP;
+        // then each rank's request goes out as one SEND.
+        let mut timings = Vec::with_capacity(self.peers.len());
+        for session in self.sessions.iter_mut() {
+            timings.push(session.as_mut().unwrap().post_request(request, &self.config)?);
+        }
+        for (rank, timing) in timings.into_iter().enumerate() {
             let (response_tx, response_rx) = tokio::sync::oneshot::channel();
             self.pending[rank].push_back(VerbsHostProtocolV2PendingChunkRoundtrip::new(
                 VerbsHostProtocolV2QueuedChunkCommand {
@@ -317,21 +309,20 @@ impl LocalTp4Client {
                 },
                 timing,
             ));
-            self.done.push(response_rx);
+            done.push(response_rx);
         }
         // The same-thread channels adapt the existing assembler; they never
         // wake or hand off work to another thread. Each sink takes ownership of its chunk; retained pinned frames
         // return to the session pool only after the owner releases them.
-        self.deadline = Some(
-            Instant::now()
-                .checked_add(self.config.timeout)
-                .context("local TP4 deadline overflow")?,
-        );
+        // Each wave's deadline counts from when it becomes the oldest, so a
+        // queued wave is not charged for the waves ahead of it.
+        self.waves.push_back(OpenWave { chunks: rx, done, deadline: None, polls: 0 });
+        self.egress_slot = (self.egress_slot + 1) % self.max_waves;
         Ok(())
     }
 
     pub(crate) fn enable_terminal_ownership(&mut self) -> Result<()> {
-        anyhow::ensure!(self.sessions.iter().all(Option::is_none) && self.deadline.is_none(),
+        anyhow::ensure!(self.sessions.iter().all(Option::is_none) && self.waves.is_empty(),
             "terminal Spark ownership must precede connection/bootstrap");
         self.terminal_owner = Some(Arc::new(AtomicBool::new(false)));
         Ok(())
@@ -382,11 +373,16 @@ impl LocalTp4Client {
     where
         F: FnMut(VerbsHostProtocolV2ResponseChunk) -> Result<()>,
     {
-        let deadline = self.deadline.context("local TP4 has no pending request")?;
-        anyhow::ensure!(
-            Instant::now() < deadline,
-            "local TP4 response deadline expired"
-        );
+        let timeout = self.config.timeout;
+        let wave = self.waves.front_mut().context("local TP4 has no pending request")?;
+        // The deadline (seconds) is checked on every 64th poll: a busy poller
+        // must not spend its time reading the clock.
+        wave.polls = wave.polls.wrapping_add(1);
+        if wave.deadline.is_none() || wave.polls % 64 == 0 {
+            let now = Instant::now();
+            let deadline = *wave.deadline.get_or_insert(now + timeout);
+            anyhow::ensure!(now < deadline, "local TP4 response deadline expired");
+        }
         for rank in 0..self.peers.len() {
             if !self.pending[rank].is_empty() {
                 self.sessions[rank]
@@ -394,27 +390,39 @@ impl LocalTp4Client {
                     .context("local TP4 session missing")?
                     .try_progress_chunk_requests(&mut self.pending[rank], &self.config)?;
             }
-            let chunks = self
-                .chunks
-                .as_mut()
-                .context("local TP4 response queue missing")?;
+            let chunks = &mut self.waves.front_mut().context("local TP4 response queue missing")?.chunks;
             while let Ok(chunk) = chunks.try_recv() {
                 sink(chunk)?;
             }
         }
-        if self.pending.iter().any(|p| !p.is_empty()) {
-            return Ok(false);
+        // The oldest wave is complete once every rank's completion arrived;
+        // later waves' requests may still be pending on the same ranks.
+        let wave = self.waves.front_mut().context("local TP4 response queue missing")?;
+        let mut index = 0;
+        while index < wave.done.len() {
+            match wave.done[index].try_recv() {
+                Ok(result) => { result?; wave.done.swap_remove(index); }
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty) => index += 1,
+                Err(error) => return Err(error).context("local TP4 completion missing"),
+            }
         }
+        if !wave.done.is_empty() { return Ok(false); }
+        let mut wave = self.waves.pop_front().expect("front wave present");
         // Final validation and completion publication happen synchronously in
-        // accept_chunk_response_frame before it removes a pending request.
-        for done in &mut self.done {
-            done.try_recv().context("local TP4 completion missing")??;
-        }
-        self.done.clear();
-        self.chunks = None;
-        self.deadline = None;
+        // accept_chunk_response_frame before it removes a pending request, so
+        // every chunk of this wave was already queued.
+        anyhow::ensure!(wave.chunks.try_recv().is_err(), "local TP4 chunk arrived after its completion");
         Ok(true)
     }
+}
+
+/// One dispatched wave's response chunks and per-rank completions.
+struct OpenWave {
+    chunks: tokio::sync::mpsc::UnboundedReceiver<VerbsHostProtocolV2ResponseChunk>,
+    done: Vec<tokio::sync::oneshot::Receiver<Result<VerbsHostProtocolV2ResponseStreamStats>>>,
+    deadline: Option<Instant>,
+    /// Polls of this wave while it is the oldest (paces the deadline check).
+    polls: u32,
 }
 
 fn quiesce_all<T>(owners: &[Option<T>], mut quiesce: impl FnMut(&T)->Result<()>) -> Result<()> {
@@ -437,8 +445,7 @@ impl Drop for LocalTp4Client {
                 // external GPU landing/queued-upload owner via the witness.
                 std::mem::forget(std::mem::take(&mut self.sessions));
                 std::mem::forget(std::mem::take(&mut self.pending));
-                std::mem::forget(self.chunks.take());
-                std::mem::forget(std::mem::take(&mut self.done));
+                std::mem::forget(std::mem::take(&mut self.waves));
                 std::mem::forget(self.egress.take());
                 tracing::error!(%error,"retaining terminal Spark client owners");
             }
@@ -454,6 +461,21 @@ fn wait_for_ring_release(stream: &mut TcpStream, timeout: Duration) -> Result<()
         Ok(_) => anyhow::bail!("expert endpoint ring-release acknowledgement contained unexpected data"),
         Err(error) => Err(error).context("expert endpoint ring-release acknowledgement timed out or failed before reconnect"),
     }
+}
+
+/// A session opens with its landing rotation at slot 0: native posts its
+/// receive WQEs' landing slots in post order from 0 (`RdmaLandingSlots`), so
+/// reply `sequence` lands in slot `sequence % slots` from the session's first
+/// reply. The client's waves rotate one wave slot per
+/// dispatch (`egress_slot`), and the exchange lands wave `k` in slot `k % N`.
+/// A multi-slot GPU landing may therefore (re)open only in phase, at wave
+/// slot 0: otherwise its next reply would land in another wave's planes.
+fn landing_phase_admits_open(landing: Option<DeviceLanding>, max_waves: usize, next_slot: usize) -> Result<()> {
+    let slots = landing.map_or(1, |landing| landing.bytes / landing.slot_bytes.max(1));
+    anyhow::ensure!(slots <= 1 || next_slot % max_waves.max(1) == 0,
+        "a GPU-landing Spark session cannot (re)connect at wave slot {next_slot} of {max_waves}: its landing \
+        rotation restarts at slot 0 (reset the link first)");
+    Ok(())
 }
 
 #[cfg(test)]
@@ -488,6 +510,53 @@ mod terminal_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn multi_slot_landing_reconnects_only_in_phase() {
+        let landing = |slots: usize| Some(DeviceLanding { ptr: 4096, bytes: slots * 12288, slot_bytes: 12288 });
+        for waves in 1..=4 {
+            for next in 0..2 * waves {
+                // Host receives and a one-slot landing have no phase.
+                assert!(landing_phase_admits_open(None, waves, next).is_ok());
+                assert!(landing_phase_admits_open(landing(1), waves, next).is_ok());
+                assert_eq!(landing_phase_admits_open(landing(waves), waves, next).is_ok(),
+                    waves == 1 || next % waves == 0, "{waves} waves at slot {next}");
+            }
+        }
+    }
+
+    /// A GPU-landing session can only be (re)opened at wave slot 0: out of
+    /// phase, `open_session` refuses before any connection is attempted; in
+    /// phase (and for host receives) it goes on to connect.
+    #[test]
+    fn out_of_phase_gpu_landing_session_is_refused_before_connecting() -> Result<()> {
+        // Nothing listens here: an admitted open fails at its connect instead.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+        let peer = listener.local_addr()?;
+        drop(listener);
+        let request = ExpertProtocolV2Request::new(1, 1, 3, 64, crate::ExpertV2Dtype::Bf16,
+            vec![crate::ExpertProtocolV2RowDescriptor { row_id: 0, source_kind: crate::ExpertV2SourceKind::Prefill,
+                source_request_id: 1, token_position: 0, route_offset: 0, route_count: 1 }],
+            vec![crate::ExpertProtocolV2RouteEntry { row_index: 0, expert_id: 0, gate_weight: 1.0 }], vec![0; 128])?;
+        for waves in 2..=4usize {
+            let landing = DeviceLanding { ptr: 1 << 32, bytes: waves * 12288, slot_bytes: 12288 };
+            for slot in 0..waves {
+                for gpu in [false, true] {
+                    let mut client = LocalTp4Client::new_ranks(vec![peer], TcpTransportConfig { timing: false,
+                        timeout: Duration::from_millis(200), max_frame_bytes: 1 << 20 });
+                    client.set_max_waves(waves)?;
+                    if gpu { client.set_landing(vec![Some(landing)])?; }
+                    // As after `slot` dispatches on live sessions that then dropped.
+                    client.egress_slot = slot;
+                    let error = format!("{:#}", client.open_session(0, &request, client.landing[0], true).unwrap_err());
+                    let refused = error.contains("cannot (re)connect at wave slot");
+                    assert_eq!(refused, gpu && slot != 0, "{waves} waves, slot {slot}, gpu {gpu}: {error}");
+                    assert!(client.sessions[0].is_none());
+                }
+            }
+        }
+        Ok(())
+    }
 
     #[test]
     fn replaced_endpoint_releases_rings_before_reconnect() -> Result<()> {
@@ -577,6 +646,26 @@ mod tests {
     }
 
     #[test]
+    fn explicit_model_endpoint_is_immutable_and_survives_reset() -> Result<()> {
+        let peer = "127.0.0.1:19453".parse()?;
+        let mut client = LocalTp4Client::new_ranks(vec![peer], TcpTransportConfig::default());
+        assert!(client.bind_model_endpoint(8).is_err());
+        assert!(client.model_endpoint.is_none());
+        client.bind_model_endpoint(2)?;
+        assert!(client.bind_model_endpoint(0).is_err());
+        client.reset();
+        assert_eq!(client.model_endpoint, Some(2));
+        assert!(client.bind_model_endpoint(1).is_err());
+        let mut unbound = LocalTp4Client::new_ranks(vec![peer], TcpTransportConfig::default());
+        let (_sender, chunks) = tokio::sync::mpsc::unbounded_channel();
+        let (_done, completed) = tokio::sync::oneshot::channel();
+        unbound.waves.push_back(OpenWave { chunks, done: vec![completed], deadline: None, polls: 0 });
+        assert!(unbound.bind_model_endpoint(2).is_err());
+        assert!(unbound.model_endpoint.is_none());
+        Ok(())
+    }
+
+    #[test]
     fn configured_sim_capacity_fits_two_endpoints_on_first_connect() -> Result<()> {
         let (request, response) = crate::protocol_v2::compact_expert_wire_bytes(
             cuteafd_core::ExpertGeometry::DEEPSEEK_V41, 1024, false)?;
@@ -590,6 +679,42 @@ mod tests {
         Ok(())
     }
 
+    const STATS: VerbsHostProtocolV2ResponseStreamStats =
+        VerbsHostProtocolV2ResponseStreamStats { response_frames: 1, response_wire_bytes: 0, response_executor_id: 1 };
+
+    #[test]
+    fn waves_are_admitted_up_to_the_limit_and_served_oldest_first() -> Result<()> {
+        let peers = ["127.0.0.1:19443".parse()?];
+        let mut client = LocalTp4Client::new_ranks(peers.to_vec(), TcpTransportConfig { timing: false,
+            timeout: std::time::Duration::from_secs(1), max_frame_bytes: 200_000 });
+        assert!(client.set_max_waves(0).is_err() && client.set_max_waves(5).is_err());
+        client.set_max_waves(2)?;
+        let mut senders = Vec::new();
+        for _ in 0..2 {
+            let (chunks, receiver) = tokio::sync::mpsc::unbounded_channel();
+            let (done, completed) = tokio::sync::oneshot::channel();
+            client.waves.push_back(OpenWave { chunks: receiver, done: vec![completed], deadline: None, polls: 0 });
+            senders.push((chunks, done));
+        }
+        assert_eq!(client.open_waves(), 2);
+        assert!(client.set_max_waves(3).is_err(), "admission changed with waves in flight");
+        // A third dispatch is refused before any session or request is touched.
+        let request = crate::expert::test_request(1);
+        let error = client.dispatch(&request).unwrap_err().to_string();
+        assert!(error.contains("2 of 2 admitted waves"), "{error}");
+        // The second wave's completion does not complete the first.
+        let (first, second) = (senders.remove(0), senders.remove(0));
+        second.1.send(Ok(STATS)).ok();
+        assert!(!client.poll(|_| Ok(()))?, "a later wave completed the oldest");
+        first.1.send(Ok(STATS)).ok();
+        assert!(client.poll(|_| Ok(()))?);
+        assert_eq!(client.open_waves(), 1);
+        assert!(client.poll(|_| Ok(()))?);
+        assert_eq!(client.open_waves(), 0);
+        drop((first.0, second.0));
+        Ok(())
+    }
+
     #[test]
     fn tp2_reset_retains_only_two_actual_peer_slots() -> Result<()> {
         let peers = ["127.0.0.1:19441".parse()?, "127.0.0.1:19442".parse()?];
@@ -598,16 +723,223 @@ mod tests {
         });
         let (_sender, receiver) = tokio::sync::mpsc::unbounded_channel();
         let (_completion, completed) = tokio::sync::oneshot::channel();
-        client.chunks = Some(receiver);
-        client.done.push(completed);
-        client.deadline = Some(Instant::now());
+        client.waves.push_back(OpenWave { chunks: receiver, done: vec![completed], deadline: Some(Instant::now()), polls: 0 });
         client.reset();
         assert_eq!(client.peers, peers);
         assert_eq!(client.sessions.len(), 2);
         assert_eq!(client.pending.len(), 2);
         assert!(client.sessions.iter().all(Option::is_none));
         assert!(client.pending.iter().all(VecDeque::is_empty));
-        assert!(client.chunks.is_none() && client.done.is_empty() && client.deadline.is_none());
+        assert!(client.waves.is_empty());
+        Ok(())
+    }
+
+    /// Echoes each request's hidden rows in one unindexed frame (a native
+    /// compact-BF16 worker's shape, which GPU landing takes).
+    struct Echo;
+    impl crate::synthetic::ProtocolV2ExpertExecutor for Echo {
+        fn name(&self) -> &'static str { "multiwave-echo" }
+        fn execute(&self, request: &crate::ExpertProtocolV2RequestView<'_>) -> Result<crate::ExpertProtocolV2Response> {
+            let h = &request.header;
+            crate::ExpertProtocolV2Response::new_with_output_stride(h.request_id, h.placement_version, h.layer_id,
+                h.row_count, h.hidden_dim, h.hidden_dtype, h.hidden_row_stride_bytes, crate::ExpertProtocolV2Status::Ok,
+                request.hidden_payload().to_vec())
+        }
+    }
+
+    fn bf16_request(id: u64, rows: u32, hidden: u32, payload: bytes::Bytes) -> Result<ExpertProtocolV2Request> {
+        ExpertProtocolV2Request::new_bytes(id, 1, 3, hidden, crate::ExpertV2Dtype::Bf16,
+            (0..rows).map(|row| crate::ExpertProtocolV2RowDescriptor { row_id: row.into(),
+                source_kind: crate::ExpertV2SourceKind::Prefill, source_request_id: id, token_position: row.into(),
+                route_offset: row, route_count: 1 }).collect(),
+            (0..rows).map(|row| crate::ExpertProtocolV2RouteEntry { row_index: row, expert_id: 0, gate_weight: 1.0 })
+                .collect(), payload)
+    }
+
+    /// Explicit hardware gate only (`CUTEAFD_LOOPBACK_ADDR` = a local RoCE
+    /// address; `CUTEAFD_LOOPBACK_GPU=1` adds GPU landing, which needs CUDA and
+    /// dma-buf). A real verbs worker and a real coordinator client on one
+    /// host, for 1..=4 outstanding waves: pinned host or N-slot GPU landing,
+    /// copied or N-slot registered egress, small (decode-sized) and large
+    /// (full-capacity) frames, each one SEND. Every echo is byte-exact in its own
+    /// wave's landing slot, and a registered egress slot is rewritten
+    /// (`egress_target`, which drains only that slot's readers) while the
+    /// other waves are still outstanding without disturbing their payloads.
+    #[test]
+    #[ignore = "requires approved native RDMA loopback hardware gate"]
+    fn native_loopback_multiwave_gpu_landing_and_registered_egress_are_byte_exact() -> Result<()> {
+        let ip = std::env::var("CUTEAFD_LOOPBACK_ADDR").context("set CUTEAFD_LOOPBACK_ADDR to a local RoCE address")?;
+        let gpu = std::env::var("CUTEAFD_LOOPBACK_GPU").as_deref() == Ok("1");
+        let hidden = 6144u32;
+        let capacity = 2048u32;
+        let listener = std::net::TcpListener::bind(format!("{ip}:0"))?;
+        let addr = listener.local_addr()?;
+        drop(listener);
+        let executor: Arc<dyn crate::synthetic::ProtocolV2ExpertExecutor> = Arc::new(Echo);
+        std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+            let _ = runtime.block_on(super::super::serve_protocol_v2_verbs_host_with_executor(&addr.to_string(), executor));
+        });
+        std::thread::sleep(Duration::from_millis(300));
+        let library = load_verbs_host_native_library()?;
+        let plane_bytes = capacity as usize * hidden as usize * 2;
+        for landing in if gpu { vec![false, true] } else { vec![false] } {
+            for registered in [false, true] {
+                for waves in 1..=4usize {
+                    let mut client = LocalTp4Client::new_ranks(vec![addr], TcpTransportConfig {
+                        timing: false, timeout: Duration::from_secs(30), max_frame_bytes: 64 << 20 });
+                    client.set_max_waves(waves)?;
+                    if registered { client.enable_egress(plane_bytes)?; }
+                    let mut plane = None;
+                    if landing {
+                        let buffer = library.alloc_device_buffer(plane_bytes * waves)?;
+                        client.set_landing(vec![Some(DeviceLanding::with_slots(buffer, waves)?)])?;
+                        plane = Some(buffer);
+                    }
+                    let result = (|| -> Result<()> {
+                        // Full capacity first: it sizes the rings for every later wave.
+                        let sizes = [2048u32, 1, 21, 64, 1500, 2048, 7, 2048];
+                        let mut sent: VecDeque<(ExpertProtocolV2Request, Vec<u8>, usize)> = VecDeque::new();
+                        let mut zero_copy = 0;
+                        let check = |client: &mut LocalTp4Client, request: ExpertProtocolV2Request, expected: Vec<u8>,
+                            slot: usize| -> Result<()> {
+                            // The request's payload (an egress view) is still intact.
+                            anyhow::ensure!(request.hidden_payload.as_ref() == expected.as_slice(),
+                                "request {} payload changed while in flight", request.header.request_id);
+                            let mut got = vec![0u8; expected.len()];
+                            let mut landed = false;
+                            while !client.poll(|chunk| {
+                                landed |= chunk.landed;
+                                if !chunk.landed {
+                                    let bytes = chunk.partial_output_payload.as_ref();
+                                    got[..bytes.len()].copy_from_slice(bytes);
+                                }
+                                Ok(())
+                            })? {}
+                            if let Some(buffer) = plane.filter(|_| landed) {
+                                // SAFETY: the slot lies inside the allocated plane, whose wave landed.
+                                let view = CuteafdDeviceBuffer { ptr: unsafe { buffer.ptr.cast::<u8>()
+                                    .add(slot * plane_bytes) }.cast(), bytes: got.len(), ..buffer };
+                                library.copy_d2h(&mut got, view)?;
+                            }
+                            anyhow::ensure!(landed == plane.is_some(), "request {} landed={landed}", request.header.request_id);
+                            anyhow::ensure!(got == expected, "request {} echo differs (slot {slot})", request.header.request_id);
+                            Ok(())
+                        };
+                        for (index, &rows) in sizes.iter().cycle().take(sizes.len() * 3).enumerate() {
+                            while client.open_waves() == waves {
+                                let (request, expected, slot) = sent.pop_front().unwrap();
+                                check(&mut client, request, expected, slot)?;
+                            }
+                            let expected: Vec<u8> = (0..rows as usize * hidden as usize * 2)
+                                .map(|i| ((i * 7 + index * 13) % 253) as u8).collect();
+                            let slot = index % waves;
+                            let payload: bytes::Bytes = match registered && expected.len() >= 1 << 20 {
+                                true => {
+                                    // Rewrites this wave's slot while the other waves' requests,
+                                    // views of the other slots, are still outstanding.
+                                    let target = client.egress_target()?;
+                                    // SAFETY: egress_target returned a writable slot of `plane_bytes`
+                                    // that no request views and no send still reads.
+                                    unsafe { std::slice::from_raw_parts_mut(target.ptr.cast::<u8>(), expected.len()) }
+                                        .copy_from_slice(&expected);
+                                    zero_copy += 1;
+                                    client.egress_payload(expected.len())?
+                                }
+                                false => expected.clone().into(),
+                            };
+                            let request = bf16_request(index as u64 + 1, rows, hidden, payload)?;
+                            client.dispatch(&request)?;
+                            sent.push_back((request, expected, slot));
+                        }
+                        while let Some((request, expected, slot)) = sent.pop_front() {
+                            check(&mut client, request, expected, slot)?;
+                        }
+                        anyhow::ensure!((zero_copy > 0) == registered, "registered={registered}: {zero_copy} zero-copy waves");
+                        eprintln!("loopback landing={landing} registered={registered} waves={waves}: \
+                            {} waves byte-exact, {zero_copy} zero-copy", sizes.len() * 3);
+                        Ok(())
+                    })();
+                    client.reset();
+                    if let Some(mut buffer) = plane { library.free_device_buffer(&mut buffer)?; }
+                    result?;
+                }
+            }
+        }
+        Ok(())
+    }
+    /// Explicit hardware gate only (`CUTEAFD_LOOPBACK_ADDR`, optional
+    /// `CUTEAFD_LOOPBACK_GPU=1`). A full-capacity request (2048 BF16 rows of
+    /// 6144, 25 MB, copied and from registered egress) and its 25 MB echo each
+    /// go as exactly one SEND: the request posts one send-queue entry and the
+    /// worker parses it whole from one receive; the reply arrives as one
+    /// full-size receive completion, byte-exact.
+    #[test]
+    #[ignore = "requires approved native RDMA loopback hardware gate"]
+    fn native_loopback_large_request_and_reply_are_one_send_each() -> Result<()> {
+        let ip = std::env::var("CUTEAFD_LOOPBACK_ADDR").context("set CUTEAFD_LOOPBACK_ADDR to a local RoCE address")?;
+        let gpu = std::env::var("CUTEAFD_LOOPBACK_GPU").as_deref() == Ok("1");
+        let (hidden, rows) = (6144u32, 2048u32);
+        let listener = std::net::TcpListener::bind(format!("{ip}:0"))?;
+        let addr = listener.local_addr()?;
+        drop(listener);
+        let executor: Arc<dyn crate::synthetic::ProtocolV2ExpertExecutor> = Arc::new(Echo);
+        std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+            let _ = runtime.block_on(super::super::serve_protocol_v2_verbs_host_with_executor(&addr.to_string(), executor));
+        });
+        std::thread::sleep(Duration::from_millis(300));
+        let library = load_verbs_host_native_library()?;
+        let plane_bytes = rows as usize * hidden as usize * 2;
+        for registered in [false, true] {
+            let mut client = LocalTp4Client::new_ranks(vec![addr], TcpTransportConfig {
+                timing: false, timeout: Duration::from_secs(30), max_frame_bytes: 64 << 20 });
+            if registered { client.enable_egress(plane_bytes)?; }
+            let plane = if gpu {
+                let buffer = library.alloc_device_buffer(plane_bytes)?;
+                client.set_landing(vec![Some(DeviceLanding::new(buffer))])?;
+                Some(buffer)
+            } else { None };
+            let result = (|| -> Result<()> {
+                for index in 0..3u64 {
+                    let expected: Vec<u8> = (0..plane_bytes).map(|i| ((i * 7 + index as usize) % 253) as u8).collect();
+                    let payload: bytes::Bytes = if registered {
+                        let target = client.egress_target()?;
+                        // SAFETY: egress_target returned a writable slot of `plane_bytes`
+                        // that no request views and no send still reads.
+                        unsafe { std::slice::from_raw_parts_mut(target.ptr.cast::<u8>(), plane_bytes) }
+                            .copy_from_slice(&expected);
+                        client.egress_payload(plane_bytes)?
+                    } else { expected.clone().into() };
+                    let request = bf16_request(index + 1, rows, hidden, payload)?;
+                    let wire = request.wire_stats().wire_bytes;
+                    anyhow::ensure!(wire > 16 << 20, "request of {wire} bytes is not large");
+                    let sent_before = client.sessions[0].as_ref().map_or(0, |s| s.request_sends.in_flight());
+                    client.dispatch(&request)?;
+                    let session = client.sessions[0].as_ref().context("session opened by dispatch")?;
+                    // Nothing reaps send completions between dispatch and here.
+                    anyhow::ensure!(session.request_sends.in_flight() == sent_before + 1,
+                        "a {wire}-byte request posted {} send-queue entries", session.request_sends.in_flight() - sent_before);
+                    let mut got = vec![0u8; plane_bytes];
+                    let (mut frames, mut landed) = (0usize, false);
+                    while !client.poll(|chunk| {
+                        frames += 1;
+                        landed |= chunk.landed;
+                        anyhow::ensure!(chunk.wire_bytes > 16 << 20, "a {} byte reply frame was split", chunk.wire_bytes);
+                        if !chunk.landed { got.copy_from_slice(chunk.partial_output_payload.as_ref()); }
+                        Ok(())
+                    })? {}
+                    if let Some(buffer) = plane.filter(|_| landed) { library.copy_d2h(&mut got, buffer)?; }
+                    anyhow::ensure!(frames == 1, "the echo arrived as {frames} receive completions");
+                    anyhow::ensure!(got == expected, "request {} echo differs", index + 1);
+                }
+                eprintln!("loopback gpu={gpu} registered={registered}: 3 x {plane_bytes} B one SEND each way");
+                Ok(())
+            })();
+            client.reset();
+            if let Some(mut buffer) = plane { library.free_device_buffer(&mut buffer)?; }
+            result?;
+        }
         Ok(())
     }
 }

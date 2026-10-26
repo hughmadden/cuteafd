@@ -49,7 +49,7 @@ Core (parity tier, must match or beat the parent engines):
 
 | Model | Family | Format | Notes |
 | --- | --- | --- | --- |
-| deepseek-ai/DeepSeek-V4.1-Flash | deepseek_v41 | FP8 block + MXFP4 experts | engram ×2, dSpark 3-stage, vision. The regression anchor. |
+| deepseek-ai/DeepSeek-V4.1-Flash | deepseek_v41 | FP8 block + MXFP4 experts | engram ×2, dSpark 3-stage, vision. |
 | wrldsuksgo2mars/GLM-5.3-EXL3-K4-v1 | glm5 | EXL3 K4 experts | 78 layers, MLA+DSA, DFlash2 draft (`incoai/GLM-5.3-DFlash2`) |
 | deepseek-ai/DeepSeek-V4-Flash-0731 | deepseek_v4 | FP8 block + FP4 experts | compress 4/128 alternating, nextn 1 |
 | wrldsuksgo2mars/DeepSeek-V4-Pro-0813-EXL3-K2-calibrated-v1 | deepseek_v4 | EXL3 K2 experts | 61 layers, 7168 wide, ~96 GiB per Spark rank at TP4 |
@@ -183,20 +183,28 @@ declares its header, speculator, micro-step stages and layer classes in a `conso
 Shared page shell, palette and SVG chart primitives at `/assets/cuteafd-ui.{css,js}` (also used
 by `/bench`); logo and favicon at `/assets/cuteafd-{logo,mark}.svg`.
 
-## Execution engines (decided 2026-09-29)
+## One engine, shared structure (TJ, 2026-10-25)
 
-V4.1's execution stack is specialized to its causal encoder/decoder: KV and
-index sources [2,8,14,20], engram gates at layers 1 and 14, dSpark taps from
-layer 37, encoder/replay stages. Other families share none of that, so there
-are two engines under one scheduler, API, transport, host cache and sampler:
+There is one engine. Every family, V4.1 included, runs on the same shared
+structure: the shared prefill executor (`shared/prefill_pipeline.rs`), the
+shared decode lane contract and owners, the shared Spark exchange, scheduler,
+API, transport, host cache and sampler. A family supplies hooks (attention,
+router, experts, head, speculator taps) and its `LaneSupport` entry; it does
+not own a private prefill or decode loop. Unified prefill and decode is a v4
+feature, and new families (e.g. MiniMax) start on it.
 
-- `deepseek_v41` keeps its specialized path; nothing regresses it.
-- A generic per-layer engine runs every other family: each layer is a block
-  (norm/HC in, family attention with its own window/compressed/index/state
-  cache, router, shared expert, routed experts on Sparks, HC/residual out),
-  plus head and native speculator. DeepSeek V4 is its first tenant, then GLM,
-  MiMo, Qwen. It adopts V4.1's proven optimizations (chained stages, lanes,
-  dual RTX, route packing) as it matures.
+Family specifics are hook parameters, not separate engines. V4.1's causal
+encoder/decoder (KV and index sources [2,8,14,20], engram gates at layers 1
+and 14, dSpark taps from layer 37, encoder/replay ranges) is expressed as
+layer ranges and per-layer attributes of the shared engine. If a feature truly
+cannot fit, name it and the reason on #744 instead of forking the path.
+
+Why: the early "no regression against ds41rt" gate kept V4.1 on its own path
+and pushed every family into separate optimized loops. That hid shared defects
+behind per-family code (the reply-incast traffic problem, the compact-kernel
+prefill regression) and made each fix land once per family. One structure means
+a fix or a measured win lands for every family at once. The 2026-09-29
+two-engine decision is retired.
 
 Kernels are shared by parameterizing dimensions; `cuteafd plan` feeds the
 AOT exporters the geometry each image must carry.
@@ -5437,6 +5445,259 @@ Ideas TJ wants kept for later; not v2 work.
   stayed about 59-60 s. Speculation-on C16 is informational, not a gate.
   FUSE mincore misses are approximate residency observations, not physical
   I/O, and must not be compared as device reads between implementations.
+
+## Prefill contract (TJ, 2026-10-23)
+
+Every family that sends experts to Sparks prefills the same way.
+
+- **Units:** the prompt runs as a continuous stream of row units: a
+  planner-admitted maximum of k units in flight inside one 8192-row reserve
+  (TJ, 2026-10-25, #762), each unit reserve / k rows on its exact EXL3
+  capacity (k = 2/3/4 → 4096/2752/2048). k hides raptor's turnaround T behind
+  the Sparks' per-unit compute S: k = ⌈T/S⌉ + 1, at most 4; 3 at six Sparks,
+  2 below. A prompt that would cut units below half a unit runs on fewer
+  waves. `PREFILL_WAVES`/`PREFILL_ROWS` pin both (benchmarks, goldens). GLM
+  5.3 K4 max: 2 × 4096 2,769 / 2,723, 4 × 2048 3,296 / 3,209, 3 × 4096
+  (12,288 in flight) 3,511 / 3,597 tok/s 8K / 64K. If the default doesn't
+  fit (5090, tight pool), step down 4096 → 2048 → 1024 → 512.
+- **One transport, N waves:** each unit's expert wave goes out on one
+  transport that admits N outstanding waves, each with its own return slot.
+  The Spark side already pipelines (rings 8 deep, in order); only the
+  coordinator held one wave per link. With N ≥ 2 the next unit's wave is
+  queued on every Spark when the current one finishes.
+- **Row ownership:** each in-flight unit owns its slice of every buffer that
+  stays live across a hook (residual, FFN output, layer input, return slot),
+  at `unit_slot × rows × stride` in one allocation, never at offset 0.
+  Scratch used inside one hook is shared and sized for one unit. Arenas reused
+  across layer kinds keep attention and FFN regions disjoint, with residual
+  and output planes at fixed offsets.
+- **Ordering:** V4.1's `PipelineOrder`, generalized. Unit k+1's attention at
+  layer L waits for unit k's KV at L, and units commit in order. There are no
+  chunk boundaries, so the Sparks don't drain between units.
+- **Head:** logits only for the rows serving needs. Prefix snapshots happen at
+  the unit boundary that carries the prompt or turn end.
+- **Admission:** k × unit rows × row-owned bytes, plus one unit of scratch,
+  plus k return slots, charged before allocation.
+- **Why units and not windows inside a chunk:** per-row workspace dominates
+  (V4.1 max: 8.0 / 5.8 GiB for 2 × 2048 rows, ~2 MiB/row). Lanes and windows
+  cost the same memory for the same rows in flight. Units keep full-size
+  expert batches and never drain the Sparks at chunk ends.
+- **Gates per family:** byte-identical logits and KV at N=1 vs N, exact
+  prefix cache, and an A/B card against work/p0 with the same config.
+  - Run every N=1 and N arm on the same Spark intake
+    (`CUTEAFD_SPARK_INTAKE=pinned`) when isolating the executor: probed
+    intake is a separate transport arm.
+  - Families whose Spark exports accumulate FP32 with atomics at capacity
+    ≥256 (V4, V4.1: `--atomic-min-capacity 256`; see "Cold prefill is not
+    bit-reproducible") can't be byte-identical in prefill. Gate their N=1
+    vs N on KL, top-1 and greedy-16 within a same-day N=1-vs-N=1 noise
+    envelope; decode stays byte-exact after exact cache restores. Families
+    with ordered FP32 combines (MiMo's FP8 MoE, GLM, Kimi) keep the
+    byte-identity gate.
+  - Card bars: 8K and TTFT ≥ 0.98×, decode ≥ 0.95×, KL identical. Report a
+    64K row, the Spark busy fraction and a per-buffer workspace breakdown.
+  - **Absolute bar (TJ, 2026-10-24).** A same-day ratio against work/p0 is not
+    enough: each family's port must also match or beat its best recorded
+    absolute 8K/64K prefill on the pre-shared path, on the same layout, quant
+    and benchmark corpus, before it lands. Numbers from before #592's
+    realistic corpus (2026-10-21) are not comparable: the old filler routed
+    ~59% of tokens to one expert; re-measure the reference release on the
+    current corpus instead. References: GLM 5.3 K4 max 8K ≥ 3,168 and 64K ≥
+    3,087, min 8K ≥ 2,696 (v3.0.1 release, own launcher and defaults,
+    realistic corpus, 2026-10-24, #703; today's work/p0 does 2,063, so K4
+    regressed between v3.0.1 and the Oct 23 old path, before the shared
+    executor); MiMo Pro max 8K ≥ 3,479 (old 3-lane path, 2026-10-24). Every
+    card reports the absolute numbers next to the family's reference. A
+    family that was good before cannot land slower.
+- **Today (audit 2026-10-23):**
+  - GLM 5.3 runs 3 lanes, GLM Flash 2, MiMo 3/2 (measured), V4 2 and V4.1 2
+    on `PipelineOrder`;
+  - Kimi runs one lane with windows at 1 wave;
+  - Step-5 and Qwen 4 have no overlap.
+
+  Every family moves onto the shared executor. The full review and per-family
+  checklists are in the executor agent's proposal
+  (codex-runs/v4/prefill-shared-executor/prefill-contract-proposal.md).
+
+### Prefill executor API (shared, 2026-10-23)
+
+`shared/prefill_pipeline.rs` owns the schedule. A family implements
+`PrefillHooks` on its binding and calls `run_prefill_units(hooks, units, waves)`:
+
+- `route(layer)`: `Local` (dense or RTX-resident experts, completed inside one
+  hook) or `Spark` (a wave sent in one hook, landed in a later one);
+- `begin_unit`, `attention(layer, unit)`, `local_ffn(layer, unit)`,
+  `send_experts(layer, unit) -> Ticket`, `land_experts(layer, unit, ticket)`,
+  `end_unit` (exit hops, norm, requested head rows) and `commit_unit` (in
+  order).
+
+`prefill_units(span, unit_rows, waves, 256)` cuts equal, page-aligned units in
+multiples of `waves`. `prefill_schedule` is the pure order the executor and
+the CPU tests share:
+- units enter free slots in order and are served round-robin;
+- unit k+1 attends layer L only after unit k attended L;
+- waves land in dispatch order, and units commit in order;
+- a new unit is served before older units land again, so its first wave
+  queues behind theirs.
+
+Tests: contract rules with a stale-row detector over random routes, units,
+sequences and barriers; Spark occupancy (no idle within a unit; at a boundary
+only the new unit's GPU-only lead beyond one wave); error injection.
+
+Transport: `SparkLink::new_waves(.., waves, wave_rows)` admits `waves`
+outstanding waves on one link:
+- `LocalTp4Client` keeps a per-wave FIFO;
+- `SparkExperts` receives in dispatch order;
+- `SparkIntake` has one return slot per wave, each with its own consumed event;
+- retained receive slots repost in consumption order.
+
+Several waves use the same probed intake as one wave. Each rank registers one
+contiguous N-slot landing allocation; successful receive posts rotate slots in
+FIFO order, and consumed events fence replacement requests. Registered request
+egress likewise owns N independent slots, charged from the widest bootstrap
+request geometry before allocation. Pinned intake remains an explicit mode.
+
+Frames (every Spark link, decode and prefill, both directions): every
+request and every reply is one registered RC SEND into the peer's posted
+receive. A copied request is staged whole in its session's send slot; a
+registered-egress request gathers its header from the slot and its payload
+from its egress slot. RC holds a SEND until its receive is posted (RNR retry
+is infinite), so neither side keeps a credit for the peer's ring beyond its
+own ring depth. Request WRITE chunking (#693) and tail-WRITE replies (#714)
+were removed (TJ 2026-10-25, "keep it simple"): on GLM K4 max, 6 Sparks, two
+waves, request 256 KiB, reply 256 KiB or 1 MiB and no chunking at all landed
+within about 1% lossless; reply chunking never won; lossy three-wave without
+chunking was within 0.4% (8K) and 4.9% (64K) of lossless.
+
+Context-split staging (GLM 5.3 port; GLM Flash and V4 have the same shape):
+today only the first lane gathers each layer's history into that layer
+parity's staging view, and later lanes reuse it. Units can run ahead (dense
+leading layers, or a new unit entering mid-call), so another unit's gather for
+the same parity can land before a unit reads the view. Rule: every unit
+records its whole history. At its attention it reuses the parity view only
+when the last attention on that view was its predecessor's at the same layer;
+otherwise it gathers its own history. Steady state keeps the single gather;
+only the ramp re-gathers. Per-unit gather and commit plans are indexed by
+unit, workspaces and exchange lanes by slot. A slot reused mid-call uploads
+its tables in stream order (`copy_h2d_ordered`), and rank 0 waits on rank 1's
+progress before rewriting that slot's peer workspace.
+
+Buffer rule from the Step-5 port: two replicated replies with no head exchange
+between them never share a reply plane. Keep one fixed reply plane per
+replication kind (head-split routed reply, owned-layer reply), sliced per
+unit, and check it in every family with TP2 or head-split replication.
+Admission charges `prefill_return_bytes(waves, unit_rows, ranks, hidden)`;
+`PrefillShape::ladder` steps 2048 → 1024 → 512. Kimi K3 is the reference port
+(`kimi_k3/layers.rs` `UnitHooks`). The per-family checklists are in the
+executor agent's proposal.
+
+### Prefill migration plan (cross-family, TJ 2026-10-23)
+
+Process (TJ, 2026-10-23):
+1. One Opus agent reviews every family's prefill and proposes the contract:
+   the hook trait, ordering, admission, chunk rule, extra hooks for drafter
+   taps, head split, Engram and vision, and a per-family port checklist.
+2. TJ approves the contract.
+3. The Opus agent builds the shared executor with Kimi as the reference port.
+4. One DeepSeek agent per family ports it from the checklist, with a
+   same-config A/B against work/p0 that proves no regression: 8K prefill and
+   TTFT ≥ 0.98×, decode ≥ 0.95×, KL identical, freed memory reported.
+5. The Opus agent reviews each port for conformance.
+
+One owner holds `shared/prefill_pipeline.rs`; each family port is a separate
+task.
+
+| Phase | Work | Families | Bar |
+|---|---|---|---|
+| 0 | Shared executor: per-layer/per-window hook trait, N waves in flight on one transport, return-buffer admission, planner chunk pick, schedule test, byte-identity harness | shared; Kimi first adopter | Kimi N=1 byte-identical; Kimi N=1/2/3 card |
+| 1 | Families with no overlap today | Step-5, Qwen 4 (Spark layout) | 8K prefill ≥ 1.2× at N=1 |
+| 2 | Lane families to one lane | V4.1 (2 lanes), V4 (2) | 8K prefill ≥ 0.98× of today at the measured N, workspace freed |
+| 3 | Lane families to one lane | GLM 5.3 (3), GLM Flash (2), MiMo (3/2) | same bar; freed memory goes to the planner |
+| 4 | Shared defaults | all | the sweep (windows × N × chunk), then one default rule |
+
+Each port:
+1. implements the hook trait;
+2. deletes the family's own lane workspaces, transports and schedule loop;
+3. gates on 1-window/N=1 vs W-window/N byte-identity, exact prefix cache, and one card (8K, TTFT, memory, KL);
+4. reports the onboard layers or pool the freed workspace bought.
+
+Phases 1 and 2 can run in parallel once phase 0's API is fixed. Phases 2
+and 3 are gated on one lane family showing a win on the executor (GLM 5.3,
+#660, TJ 2026-10-23), not on the release: once it does, every lane family
+ports for v4.
+
+## Release v4 cards (TJ, 2026-10-24)
+
+The README results move from one wide table to **one section per active
+family**. Each section shows that family's chosen cards in whatever
+layout explains them best: some compare quants on the same hardware,
+some compare hardware levels for one quant, some both. Every card stays
+a Release-smoke export generated by `cuteafd bench publish`; the
+renderer groups them per family from a `sections` list in the matrix
+file, instead of forcing the 5090 / 1× RTX / 2× RTX columns.
+
+| Family | Cards in its section | Compares |
+|---|---|---|
+| DeepSeek V4.1 Flash | min 1 RTX + 3 Sparks; reference 1 RTX + 4 Sparks; max 2 RTX + 6 Sparks | hardware levels |
+| DeepSeek V4 Flash | min; reference 1 RTX + 4 Sparks; max | hardware levels |
+| GLM 5.3 | EXL3 K4 max (2 RTX + 6); EXLR8 (native dense) min 1 RTX + 4 at `up1` (4.0 bpw); **EXLR8 min 1 RTX + 4 at `bit325` (3.25 bpw)**; EXLR8 max 2 RTX + 6 | quants at max (K4 vs EXLR8), EXLR8 profiles at min (up1 vs bit325), hardware levels |
+| Kimi K3 (EXL3 K2 + Core-K6) | max 2 RTX + 6 Sparks | — (one card) |
+| Step-5 | NVFP4 min 1 RTX + 4 Sparks; FP8 max 2 RTX + 6 Sparks | quant × hardware level |
+| Dense Qwen 3.5 / 3.8 | 9B BF16 min 1 RTX, speculation off (`qwen35-9b-bf16-min`); 27B BF16 min 1 RTX + dSpark (`qwen38-27b-bf16-min`); 27B FP8 min 1 RTX + dSpark (`qwen38-27b-fp8-min`); 27B BF16 min 1 RTX, speculation off (`qwen38-27b-bf16-min-nospec`); 27B FP8 min 1 RTX, speculation off (`qwen38-27b-fp8-min-nospec`) | sizes, quants and dSpark vs no speculator (all 0 Sparks, no TP2 card; no MTP comparison card) |
+| Qwen 3.8 Flash Next | EXL3 min 1 RTX PRO 6000 (0 Sparks, `qwen38-exl3-min`); EXL3 5090 (1 RTX 5090 + 1 Spark) | hardware levels (both unchanged from v3) |
+
+EXLR8's `bit325` card is a smoke card for the 3.25 bpw width profile
+(`EXLR8_MANIFEST=bit325`, the checkpoint's KL-optimized 3.25 bpw
+manifest; ~75 GB of routed experts per rank at TP4), so the family shows
+the up1-vs-bit325 trade at the same hardware.
+
+**Retired section** (below the family sections): every model that no
+longer ships keeps its last Release-smoke card, one per row with its
+config and the version it ran on. It includes the cards cut from the v3
+matrix (GLM 5.3 NVFP4 max, GLM 5.3 Flash NVFP4 max and TR3 max, MiMo Pro
+min, MiMo Flash max, Qwen 3.8 EXL3 max and NVFP4 min/max/5090, V4 Flash
+max, V4 Pro EXL3 min) and the models retired since: the GLM 5.3 Flash
+non-core FP8 configs (`glm53-flash-fp8-min/max`, last smoke 2026-10-14)
+and the GLM 5.3 Flash EXL3 BF16-dense `-v1` card, replaced by
+`GLM-5.3-Flash-EXL3-K3.25-Core-FP8`.
+
+`cuteafd bench publish` needs: the per-family `sections` renderer (layout
+per section from the matrix file), the retired renderer, and example
+configs for EXLR8 min `bit325`, dense Qwen BF16/FP8 min.
+
+## v5: one decode graph strategy (TJ, 2026-10-24)
+
+Decode graph capture is per family today, and the memory it costs varies
+widely. The goal is less wasted memory and one standard strategy, not graphs
+shared across lanes through address tables.
+
+Where it stands (2026-10-24):
+
+| Family | Row shapes per graph key | Other key axes | Cost |
+|---|---|---|---|
+| GLM 5.3 / EXLR8 | 24 to 131K (1–16, 20 … 64), 7 above | 11 page-table widths, one capture per layer + head | 213 shapes, ~3 GiB/GPU (`glm_decode_graph_allowance`, 3 GiB floor) |
+| V4.1 | exact rows 1–64 (8 fixed on cards < 32 GB) | per layer, per lane | not measured; largest after GLM |
+| GLM Flash | 6 (1, 4, 8, 16, 32, 64; spec 2–64) | | |
+| Qwen 4 | 4 plain, 7 spec | | |
+| V4, MiMo, shared `decode_graph` | 4 (1, 4, 16, 64) | | MiMo ~0.9 GiB/GPU |
+| Kimi K3, Step-5 | exact verify rows | | not measured |
+
+Work:
+1. Measure every family's graph memory from the startup ledger, per GPU and
+   per lane, on its max card.
+2. One shared row-bucket rule and one place it lives (`shared/decode_graph`),
+   with a family override only where a measured route crossover needs one.
+   Coarser buckets pad rows; decode is bandwidth-bound, so judge by emitted
+   tok/s at C1/C4/C16, not by padded-row count.
+3. One rule for which axes key a graph (rows, table width, layer) and when a
+   shape runs eagerly instead of capturing (odd prefill tails already do).
+4. Planner admission charges each family's graphs from that same rule.
+5. Bar: graph memory down, freed memory reported as pool or onboard layers,
+   and decode within 0.98× at every concurrency. Zero captures per request
+   stays.
+
+Second decode lanes (MiMo port, 2026-10-24) double a family's graph set,
+so this lands before lanes spread to GLM or V4.1-sized graph sets.
 
 ## Backlog (lowest priority: only when nothing planned is left)
 

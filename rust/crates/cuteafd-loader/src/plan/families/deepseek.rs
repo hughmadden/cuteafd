@@ -385,7 +385,7 @@ impl FamilyModel for DeepSeekModel {
     }
 
     fn placement(&self, input: &crate::plan::PlanInput, report: &mut crate::plan::PlanReport,
-        options: &crate::plan::layout::LayoutOptions, _requested: crate::plan::ExpertPlacement)
+        options: &mut crate::plan::layout::LayoutOptions, _requested: crate::plan::ExpertPlacement)
         -> Option<anyhow::Result<cuteafd_core::memory_layout::MemoryLayout>> {
         match self.id {
             "deepseek_v4" => Some(Ok(crate::plan::layout::deepseek_v4::layout(report, self, input, options))),

@@ -25,10 +25,20 @@ pub(crate) struct DensePrefix<'e, 'a> {
     engine: &'e RefCell<DenseEngine<'a>>,
     layout: FamilyLayout,
     mark: MarkLayout,
+    drafter: Option<Rc<crate::shared::speculation::block_dspark::DsparkDrafter<'a>>>,
+    mtp: Option<Rc<super::mtp::MtpCache<'a>>>,
+    /// The prefix copy stream, fenced against the target stream (the drafter's and the MTP
+    /// chain's copies run on that stream too).
+    copies: crate::shared::prefix::PrefixCopies<'a>,
 }
 
 impl<'e, 'a> DensePrefix<'e, 'a> {
     pub fn new(engine: &'e RefCell<DenseEngine<'a>>) -> Result<Self> {
+        Self::with_draft(engine, None)
+    }
+
+    pub fn with_draft(engine: &'e RefCell<DenseEngine<'a>>,
+        drafter: Option<Rc<crate::shared::speculation::block_dspark::DsparkDrafter<'a>>>) -> Result<Self> {
         let target = engine.borrow();
         let regions = Self::state(&target, 0);
         let mark = MarkLayout::new(&regions.iter().map(|region| (region.device_id, region.bytes)).collect::<Vec<_>>())?;
@@ -40,8 +50,16 @@ impl<'e, 'a> DensePrefix<'e, 'a> {
             page_bytes: 64 * target.cfg.full_kv_bytes_per_token(target.kv_format),
             mark_bytes: mark.bytes, draft_bytes: 0, rule: ReuseRule::EXACT,
             mark_store: MarkStore::Arena, page_owners: Default::default() };
+        let copies = crate::shared::prefix::PrefixCopies::new(target.stream.device.library,
+            vec![vec![crate::shared::prefix::Reader { device: target.stream.device.id, stream: target.stream.raw }]])?;
         drop(target);
-        Ok(Self { engine, layout, mark })
+        Ok(Self { engine, layout, mark, drafter, mtp: None, copies })
+    }
+
+    pub(crate) fn with_mtp(engine: &'e RefCell<DenseEngine<'a>>, mtp: Rc<super::mtp::MtpCache<'a>>) -> Result<Self> {
+        let mut family = Self::new(engine)?;
+        family.mtp = Some(mtp);
+        Ok(family)
     }
 
     pub fn slots(&self) -> usize { self.engine.borrow().prefix_marks }
@@ -67,12 +85,10 @@ impl<'e, 'a> DensePrefix<'e, 'a> {
         let marks = self.mark_buffers(mark)?;
         let target = self.engine.borrow();
         ensure!(state < target.slots.len(), "dense prefix state outside admitted slots");
-        for (live, saved) in Self::state(&target, state).into_iter().zip(marks) {
-            let (dst, src) = if capture { (saved, live) } else { (live, saved) };
-            // SAFETY: admitted arena and live bank outlive the shared prefix cache's drain.
-            unsafe { target.stream.device.library.copy_d2d_async(dst, src, src.bytes, target.stream.raw)?; }
-        }
-        Ok(())
+        let copies: Vec<_> = Self::state(&target, state).into_iter().zip(marks)
+            .map(|(live, saved)| if capture { (0, saved, live) } else { (0, live, saved) }).collect();
+        // SAFETY: admitted arena and live bank outlive the shared prefix cache's drain.
+        unsafe { self.copies.copy_d2d(&copies) }
     }
 
     fn page_buffers(&self, page: u32, rows: usize) -> Result<Vec<CuteafdDeviceBuffer>> {
@@ -128,11 +144,184 @@ pub(crate) fn check(engine: &RefCell<DenseEngine<'_>>, tokens: &[u32]) -> Result
         family.drain().map_err(boxed)?;
         println!("dense prefix adapter: exact {len}-row state and continuation on copied full/partial KV pages byte-exact");
     }
+    check_direct_frontiers(engine, tokens)?;
+    Ok(())
+}
+
+fn check_direct_frontiers(engine: &RefCell<DenseEngine<'_>>, tokens: &[u32]) -> Result<()> {
+    let family = DensePrefix::new(engine)?;
+    ensure!(family.slots() >= 2, "dense direct prefix check requires prompt and turn marks");
+    let library = engine.borrow().stream.device.library;
+    let backend = super::super::serve::DenseBackend::new(engine, library);
+    check_backend_frontiers(engine, tokens, &backend, family, false)
+}
+
+pub(crate) fn check_backend_frontiers(engine: &RefCell<DenseEngine<'_>>, tokens: &[u32],
+    backend: &super::super::serve::DenseBackend<'_, '_>, family: DensePrefix<'_, '_>, speculative: bool) -> Result<()> {
+    use crate::shared::qwen::scheduler::{Backend, Verified};
+    let library = engine.borrow().stream.device.library;
+    let pool = cuteafd_engine::prefix::RefPagePool::new(family.layout.pages, 64);
+    let boxed = |error: BoxError| anyhow::anyhow!("dense direct prefix check: {error}");
+    let snapshot = |placement: &Placement| -> Result<Vec<Vec<u8>>> {
+        let target = engine.borrow();
+        target.stream.drain()?;
+        let mut regions = DensePrefix::state(&target, placement.slot);
+        drop(target);
+        for (index, &page) in placement.units.iter().enumerate().take(placement.len.div_ceil(64)) {
+            regions.extend(family.page_buffers(page, (placement.len - index * 64).min(64))?);
+        }
+        let mut bytes = regions.into_iter().map(|region| {
+            let mut bytes = vec![0; region.bytes];
+            library.copy_d2h(&mut bytes, region)?;
+            Ok(bytes)
+        }).collect::<Result<Vec<_>>>()?;
+        if let Some(saved) = family.capture_draft_pages(placement, placement.len).map_err(boxed)? {
+            for (index, &page) in saved.pages.iter().enumerate() {
+                let initialized = saved.frontier - usize::from(family.mtp.is_some());
+                let rows = initialized.saturating_sub(index * 64).min(64);
+                for (part, segment) in family.draft_page_segments(page).into_iter().enumerate() {
+                    // Native MTP owns only the final page's pending-hidden sidecar.
+                    if family.mtp.is_some() && part > 0 && index + 1 != saved.pages.len() { continue; }
+                    let segment_bytes = if family.mtp.is_some() && part > 0 { segment.bytes }
+                        else { segment.bytes / 64 * rows };
+                    let mut data = vec![0; segment_bytes];
+                    library.copy_d2h(&mut data, CuteafdDeviceBuffer { ptr: segment.addr as *mut _,
+                        bytes: segment_bytes, device_id: library.cuda_get_device()?, ..Default::default() })?;
+                    bytes.push(data);
+                }
+            }
+            family.release_draft_pages(&saved).map_err(boxed)?;
+        }
+        Ok(bytes)
+    };
+    let decode = |placement: &mut Placement, inputs: &[u32]| -> Result<Vec<f32>> {
+        if family.mtp.is_some() {
+            use crate::shared::qwen::scheduler::{DraftSeq, DraftState, DraftTiming};
+            let mut state = super::super::serve::DraftState::default();
+            state.close(inputs[0]);
+            let mut previous = Vec::new();
+            for depth in 1..=3 {
+                let proposed = backend.draft(&mut [DraftSeq { placement, seq: &mut state, depth }],
+                    &mut DraftTiming::default())?;
+                ensure!(proposed.len() == 1 && proposed[0].len() == depth
+                    && proposed[0].starts_with(&previous), "native serving recursive draft differs by depth");
+                previous = proposed[0].clone();
+            }
+        }
+        let start = placement.len;
+        let logits = backend.verify_device(&mut [(placement, inputs)], speculative, &pool)?
+            .context("dense direct prefix check requires logits")?.to_host(library)?;
+        let mut draft = super::super::serve::DraftState::default();
+        if speculative { placement.len = start + inputs.len(); }
+        backend.accept(&mut [Verified { placement, seq: &mut draft, start, history: (), rows: inputs,
+            first_row: 0, kept: Some((inputs.len(), 42)), finished: false, neural: speculative }], speculative)?;
+        Ok(logits)
+    };
+    let continuation = tokens.iter().copied().cycle().take(3).collect::<Vec<_>>();
+    for len in [63usize, 65, 129] {
+        let prompt = tokens.iter().copied().cycle().take(len).collect::<Vec<_>>();
+        let mut placement = Placement { units: vec![0, 1, 2], slot: 0, len: 0, state_len: 0 };
+        family.bind(&mut placement).map_err(boxed)?;
+        family.admit_draft_pages(&mut placement, len + 2 * continuation.len()).map_err(boxed)?;
+        backend.prefill_device(&mut placement, &prompt, 1, &pool)?;
+        family.capture(MarkSlot(0), &placement, len).map_err(boxed)?;
+        let prompt_draft = family.capture_draft_pages(&placement, len).map_err(boxed)?;
+        family.drain().map_err(boxed)?;
+        let prompt_bytes = snapshot(&placement)?;
+        let first = decode(&mut placement, &continuation)?;
+        let turn_len = placement.len;
+        family.capture(MarkSlot(1), &placement, turn_len).map_err(boxed)?;
+        let turn_draft = family.capture_draft_pages(&placement, turn_len).map_err(boxed)?;
+        family.drain().map_err(boxed)?;
+        let turn_bytes = snapshot(&placement)?;
+        let second = decode(&mut placement, &continuation)?;
+        for (mark, frontier, saved, expected, draft) in [(MarkSlot(0), len, &prompt_bytes, &first, prompt_draft.as_ref()),
+            (MarkSlot(1), turn_len, &turn_bytes, &second, turn_draft.as_ref())] {
+            family.discard(&mut placement).map_err(boxed)?;
+            family.restore(Some(mark), &mut placement, frontier).map_err(boxed)?;
+            family.restore_draft_pages(draft, &mut placement, frontier).map_err(boxed)?;
+            family.admit_draft_pages(&mut placement, frontier + continuation.len()).map_err(boxed)?;
+            ensure!(snapshot(&placement)? == *saved,
+                "dense direct decode changed retained frontier {frontier} state/KV bytes");
+            let actual = decode(&mut placement, &continuation)?;
+            ensure!(actual.iter().map(|v| v.to_bits()).eq(expected.iter().map(|v| v.to_bits())),
+                "dense direct decode changed retained frontier {frontier} continuation logits");
+        }
+        family.discard(&mut placement).map_err(boxed)?;
+        for saved in [prompt_draft, turn_draft].into_iter().flatten() {
+            family.release_draft_pages(&saved).map_err(boxed)?;
+        }
+        println!("dense prefix adapter: retained prompt {len} and turn {turn_len} target/draft state/KV/logits byte-exact (speculative={speculative})");
+    }
     Ok(())
 }
 
 impl PrefixFamily for DensePrefix<'_, '_> {
     type Placement = Placement;
+
+    fn draft_page_bytes(&self) -> usize {
+        self.mtp.as_ref().map_or_else(|| self.drafter.as_ref().map_or(0, |draft| draft.page_bytes()), |mtp| mtp.page_bytes())
+    }
+    fn admit_draft_pages(&self, placement: &mut Placement, capacity: usize) -> Result<(), BoxError> {
+        if let Some(mtp) = &self.mtp { mtp.admit_pages(placement.slot, capacity)?; }
+        if let Some(draft) = &self.drafter { draft.admit_pages(placement.slot, capacity)?; }
+        Ok(())
+    }
+    fn draft_pages_valid(&self, attachment: &cuteafd_engine::prefix::DraftPageAttachment) -> bool {
+        self.mtp.as_ref().is_some_and(|mtp| mtp.pages_valid(attachment))
+            || self.drafter.as_ref().is_some_and(|draft| draft.pages_valid(attachment))
+    }
+    fn draft_pages_revocable(&self, attachment: &cuteafd_engine::prefix::DraftPageAttachment) -> bool {
+        self.mtp.as_ref().is_some_and(|mtp| mtp.pages_revocable(attachment))
+            || self.drafter.as_ref().is_some_and(|draft| draft.pages_revocable(attachment))
+    }
+    fn retain_draft_pages(&self, attachment: &cuteafd_engine::prefix::DraftPageAttachment) -> Result<(), BoxError> {
+        if let Some(mtp) = &self.mtp { mtp.retain_pages(attachment)?; return Ok(()); }
+        self.drafter.as_ref().context("dense prefix has no drafter")?.retain_pages(attachment)?;
+        Ok(())
+    }
+    fn capture_draft_pages(&self, placement: &Placement, len: usize)
+        -> Result<Option<cuteafd_engine::prefix::DraftPageAttachment>, BoxError> {
+        if let Some(mtp) = &self.mtp { return Ok(Some(mtp.capture_pages(placement.slot, len)?)); }
+        self.drafter.as_ref().map(|draft| draft.capture_pages(placement.slot, len, len))
+            .transpose().map_err(Into::into)
+    }
+    fn release_draft_pages(&self, attachment: &cuteafd_engine::prefix::DraftPageAttachment) -> Result<(), BoxError> {
+        if let Some(mtp) = &self.mtp { mtp.release_pages(attachment)?; return Ok(()); }
+        self.drafter.as_ref().context("dense prefix has no drafter")?.release_pages(attachment)?;
+        Ok(())
+    }
+    fn restore_draft_pages(&self, attachment: Option<&cuteafd_engine::prefix::DraftPageAttachment>,
+        placement: &mut Placement, frontier: usize) -> Result<(), BoxError> {
+        if let Some(mtp) = &self.mtp {
+            if let Some(attachment) = attachment { mtp.restore_pages(placement.slot, attachment, frontier)?; }
+            else {
+                if frontier != 0 { return Err("dense MTP requires an exact prefix attachment".into()); }
+                mtp.reset_context(placement.slot)?;
+            }
+        }
+        if let Some(draft) = &self.drafter {
+            if let Some(attachment) = attachment {
+                if attachment.origin != 0 || attachment.frontier != frontier {
+                    return Err("dense draft prefix differs from target".into());
+                }
+                draft.restore_pages(placement.slot, attachment, frontier)?;
+            } else {
+                if frontier != 0 { return Err("dense draft requires an exact full-context prefix attachment".into()); }
+                draft.reset_context(placement.slot, 0)?;
+            }
+        }
+        Ok(())
+    }
+    fn promote_draft_pages(&self, saved: &cuteafd_engine::prefix::DraftPageAttachment)
+        -> Result<cuteafd_engine::prefix::DraftPageAttachment, BoxError> {
+        if let Some(mtp) = &self.mtp { return Ok(mtp.promote_pages(saved)?); }
+        Ok(self.drafter.as_ref().context("dense prefix has no drafter")?.promote_pages(saved)?)
+    }
+    fn draft_page_segments(&self, page: cuteafd_engine::prefix::DraftPageId) -> Vec<DeviceRange> {
+        if let Some(mtp) = &self.mtp { return mtp.page_segments(page).expect("admitted dense MTP page"); }
+        self.drafter.as_ref().map_or_else(Vec::new, |draft| draft.page_segments(page).expect("admitted dense draft page"))
+    }
 
     fn record_format(&self) -> &'static str {
         match self.engine.borrow().kv_format {
@@ -148,12 +337,16 @@ impl PrefixFamily for DensePrefix<'_, '_> {
         let mut target = self.engine.borrow_mut();
         target.reset_slot(placement.slot)?;
         target.bind_slot(placement.slot, &placement.units)?;
+        if let Some(mtp) = &self.mtp { mtp.reset_context(placement.slot)?; }
+        if let Some(draft) = &self.drafter { draft.reset_context(placement.slot, 0)?; }
         placement.state_len = 0;
         Ok(())
     }
 
     fn discard(&self, placement: &mut Placement) -> Result<(), BoxError> {
         self.engine.borrow_mut().reset_slot(placement.slot)?;
+        if let Some(mtp) = &self.mtp { mtp.discard_context(placement.slot)?; }
+        if let Some(draft) = &self.drafter { draft.discard_context(placement.slot)?; }
         placement.len = 0;
         placement.state_len = 0;
         Ok(())
@@ -187,7 +380,7 @@ impl PrefixFamily for DensePrefix<'_, '_> {
         }
         self.move_mark(mark, placement.slot, false)?;
         let mut target = self.engine.borrow_mut();
-        target.stream.drain()?;
+        // The restored state is ordered before the target stream's next pass by the copy fence.
         target.slots[placement.slot].position = len;
         target.position = target.slots[0].position;
         target.healthy = true;
@@ -199,15 +392,12 @@ impl PrefixFamily for DensePrefix<'_, '_> {
     fn copy_rows(&self, copy: TailCopy) -> Result<(), BoxError> {
         let source = self.page_buffers(copy.from, copy.rows)?;
         let destination = self.page_buffers(copy.to, copy.rows)?;
-        let target = self.engine.borrow();
-        for (dst, src) in destination.into_iter().zip(source) {
-            // SAFETY: shared pool owns both page views until this family drains.
-            unsafe { target.stream.device.library.copy_d2d_async(dst, src, src.bytes, target.stream.raw)?; }
-        }
-        Ok(())
+        let copies: Vec<_> = destination.into_iter().zip(source).map(|(dst, src)| (0, dst, src)).collect();
+        // SAFETY: shared pool owns both page views until this family drains.
+        Ok(unsafe { self.copies.copy_d2d(&copies) }?)
     }
 
-    fn drain(&self) -> Result<(), BoxError> { Ok(self.engine.borrow().stream.drain()?) }
+    fn drain(&self) -> Result<(), BoxError> { Ok(self.copies.drain()?) }
     fn page_segments(&self, page: u32) -> Vec<DeviceRange> {
         self.page_buffers(page, 64).unwrap_or_default().into_iter()
             .map(|buffer| DeviceRange { addr: buffer.ptr as u64, bytes: buffer.bytes }).collect()

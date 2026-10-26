@@ -16,7 +16,7 @@ pub fn compact_expert_wire_bytes(
 }
 
 const MAGIC: &[u8; 8] = b"CUTEAFD3";
-const VERSION: u16 = 3;
+const VERSION: u16 = 4;
 const REQUEST_KIND: u16 = 1;
 const RESPONSE_KIND: u16 = 2;
 pub const EXPERT_PROTOCOL_V2_FRAME_PROTOCOL: &str = "ExpertProtocolV2";

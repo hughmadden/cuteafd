@@ -16,13 +16,28 @@ fn snapshot(all: bool) -> tempfile::TempDir {
 
 fn with_layout(ranks: usize, budget: Option<u64>) -> PlanOptions {
     PlanOptions { placement: ExpertPlacement::from_spark_ranks(ranks), spark_budget_bytes: budget,
-        layout: Some(layout::LayoutOptions { rtx_bytes: vec![crate::placement::inventory::PRO_TOTAL_BYTES; 2],
+        layout: Some(layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)), rtx_bytes: vec![crate::placement::inventory::PRO_TOTAL_BYTES; 2],
             // The text card retains device snapshots; host spilling is disabled.
             host_cache_bytes: Some(0), spark_allocation_budget_bytes: budget, ..Default::default() }), ..Default::default() }
 }
 
 fn installed_inventory(root: &std::path::Path, spark: bool) -> std::path::PathBuf {
     testing::write_kimi_installed_inventory(root, spark)
+}
+
+#[test]
+fn planner_publishes_kimi_runtime_default_and_explicit_units() {
+    let dir = snapshot(true);
+    for (unit, waves, expected) in [(0, 0, (2048, 2, 4096)), (1024, 2, (1024, 2, 2048)), (4096, 1, (4096, 1, 4096))] {
+        let mut options = with_layout(6, None);
+        let layout = options.layout.as_mut().unwrap();
+        layout.prefill_rows = unit;
+        layout.prefill_lanes = waves;
+        layout.host_memory = Some((128 << 30, 128 << 30));
+        let report = plan::plan(dir.path(), &options).unwrap();
+        assert_eq!((report.prefill_unit_rows.unwrap(), report.prefill_waves.unwrap(), report.prefill_span_rows.unwrap()), expected);
+        assert_eq!(report.prefill_transports, Some(1));
+    }
 }
 
 #[test]
@@ -147,6 +162,19 @@ fn release_headers_classify_native_text_without_installed_artifacts() {
     let vision_report = plan::plan(dir.path(), &PlanOptions { vision: MediaMode::Rtx(None), ..Default::default() }).unwrap();
     assert!(!vision_report.wip_launchable());
     assert!(vision_report.hints.iter().any(|h| h.what.contains("vision execution is not implemented")));
+}
+
+#[test]
+fn planned_headers_supply_range_geometry_without_claiming_fit() {
+    let dir = snapshot(false);
+    let columns = PlanInput::open(dir.path()).unwrap().spark_ranges(&PlanOptions { layout: Some(layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)), ..Default::default() }), ..Default::default() }).unwrap();
+    assert_eq!(columns.len(), 2);
+    for column in columns {
+        assert_eq!(column.package, PACKAGE);
+        assert_eq!((column.intermediate, column.unit_columns, column.policy.width_cap), (3072, 128, 12));
+        assert!(column.routed_expert_bytes > 0);
+        assert!(column.range.is_none() && column.executable_minimum.is_none());
+    }
 }
 
 #[test]
@@ -280,7 +308,7 @@ fn max_card_jointly_selects_tp2_layers_marks_and_complete_spark_budget() {
     assert!(!refused.fits);
     // Other card columns are refused by name.
     let refused = plan::plan(dir.path(), &with_layout(4, None)).unwrap();
-    assert!(refused.hints.iter().any(|h| h.what.contains("6 Spark ranks")));
+    assert!(refused.hints.iter().any(|h| h.what.contains("missing Spark recipe kimik3:exl3-k23 TP4")));
 }
 
 #[test]
@@ -500,11 +528,11 @@ fn default_context_follows_the_checkpoint_core() -> Result<()> {
         assert_eq!(default_context(&Model::open(&checkpoint)?.core), expected);
         // The planner's unset context selects the same extent; an explicit one wins.
         let report = plan::plan(dir, &PlanOptions { placement: ExpertPlacement::Sparks { ranks: 6 },
-            layout: Some(plan::layout::LayoutOptions { rtx_bytes: vec![96 << 30; 2], ..Default::default() }), ..Default::default() })?;
+            layout: Some(plan::layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)), rtx_bytes: vec![96 << 30; 2], ..Default::default() }), ..Default::default() })?;
         let notes = report.memory_layout.as_ref().map(|m| m.notes.join("\n")).unwrap_or_default();
         assert!(notes.contains(&format!("Kimi API max context: {expected} tokens")), "{notes}");
         let explicit = plan::plan(dir, &PlanOptions { placement: ExpertPlacement::Sparks { ranks: 6 },
-            layout: Some(plan::layout::LayoutOptions { rtx_bytes: vec![96 << 30; 2], context_tokens: 262_144, ..Default::default() }),
+            layout: Some(plan::layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)), rtx_bytes: vec![96 << 30; 2], context_tokens: 262_144, ..Default::default() }),
             ..Default::default() })?;
         let notes = explicit.memory_layout.as_ref().map(|m| m.notes.join("\n")).unwrap_or_default();
         assert!(notes.contains("Kimi API max context: 262144 tokens"), "{notes}");

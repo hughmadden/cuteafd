@@ -52,6 +52,30 @@ def test_shell_args_and_failure(spec):
     assert bad.returncode != 0 and 'nvidia-ctk cdi generate' in bad.stderr
 
 
+WSL = 'devices:\n    - name: all\n'
+
+
+def test_wsl_all_only_spec_maps_single_gpu_host(tmp_path, monkeypatch):
+    spec = tmp_path / 'nvidia.yaml'
+    spec.write_text(WSL)
+    monkeypatch.setenv('CUTEAFD_CDI_GPU_COUNT', '1')
+    assert cdi.cdi_gpu_args('GPU-abc-123', [spec]) == ['--device', 'nvidia.com/gpu=all']
+    assert run_sh(spec, 'GPU-abc-123').stdout.split() == ['--device', 'nvidia.com/gpu=all']
+    monkeypatch.setenv('CUTEAFD_CDI_GPU_COUNT', '2')
+    with pytest.raises(RuntimeError, match='nvidia-ctk cdi generate'):
+        cdi.cdi_gpu_args('0', [spec])
+    assert run_sh(spec, '0').returncode != 0
+    monkeypatch.setenv('CUTEAFD_CDI_GPU_COUNT', '1')
+    with pytest.raises(RuntimeError):
+        cdi.cdi_gpu_args('0,1', [spec])
+
+
+def test_per_gpu_spec_keeps_exact_names(spec, monkeypatch):
+    monkeypatch.setenv('CUTEAFD_CDI_GPU_COUNT', '1')
+    assert cdi.cdi_gpu_args('0', [spec]) == ['--device', 'nvidia.com/gpu=0']
+    assert run_sh(spec, '0').stdout.split() == ['--device', 'nvidia.com/gpu=0']
+
+
 def test_v41_launch_uses_cdi_for_coordinator_and_exports_helpers_to_workers():
     text = (ROOT / 'scripts/launch/run-family.sh').read_text()
     v41 = text.split('launch_deepseek_v41() {', 1)[1].split('# The family:', 1)[0]

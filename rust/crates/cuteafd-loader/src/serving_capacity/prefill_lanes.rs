@@ -1,4 +1,5 @@
-//! Pipelined Spark prefill lanes, shared by GLM 5.3 Flash and MiniMax M3: a prefill chunk of up
+//! MiniMax M3's pipelined Spark prefill lanes (transitional: every other family plans prefill
+//! units and waves in `prefill_waves`, and MiniMax moves onto them next): a prefill chunk of up
 //! to `lanes` x `rows` rows (`--prefill-lanes`, `--prefill-rows`) runs as consecutive lanes on one
 //! stream, each lane with its own Spark transport, so one lane's expert exchange is in flight
 //! while another lane's GPU layers run. The lanes share one set of attention temporaries; each

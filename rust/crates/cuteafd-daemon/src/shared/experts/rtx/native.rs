@@ -789,6 +789,7 @@ impl RtxExpertLayer for NativeTp2<'_> {
             PartialDtype::F32
         }
     }
+    fn uses_fp8_input(&self) -> bool { !self.nvfp4 }
     fn partial_layout(&self, rows: usize) -> Result<PartialLayout> {
         ensure!(
             (1..=self.max_rows).contains(&rows),

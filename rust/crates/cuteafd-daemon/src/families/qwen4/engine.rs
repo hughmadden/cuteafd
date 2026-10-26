@@ -41,6 +41,7 @@ use cuteafd_transport::{
 use std::cell::{Cell, RefCell};
 use crate::shared::decode_graph::{check_bucket_thresholds, masked_row, real_row_moe, ProjectionThreshold};
 use std::ffi::c_void;
+use std::sync::Arc;
 
 type Dev<'a> = Rc<Allocation<'a>>;
 
@@ -259,10 +260,17 @@ pub(crate) enum Experts<'a> {
     LocalExl3(LocalExl3<'a>),
     Tp2 { routed: RefCell<QwenTp2<'a>>, mtp: Option<MtpExperts<'a>> },
     /// Spark ranks over RoCE (one BF16 partial plane per rank), plus a local draft layer.
-    Spark { transport: RefCell<SparkLink<'a>>, runtime: tokio::runtime::Runtime,
-        mtp: Option<MtpExperts<'a>> },
+    Spark { transport: RefCell<SparkLink<'a>>, mtp: Option<MtpExperts<'a>> },
     /// No routed experts (plumbing tests only: the MoE output is the shared expert alone).
     SharedOnly,
+}
+
+/// Appends one row's page list padded with zeros (or cut) to `stride` entries,
+/// without a per-row allocation.
+fn extend_padded(table: &mut Vec<i32>, pages: &[i32], stride: usize) {
+    let kept = pages.len().min(stride);
+    table.extend_from_slice(&pages[..kept]);
+    table.resize(table.len() + stride - kept, 0);
 }
 
 /// Host tables of one step.
@@ -298,6 +306,32 @@ struct StepTables {
     long: bool,
     /// PLE table rows [rows, 16].
     ple_ids: Vec<i64>,
+}
+
+impl crate::shared::mapped_table::RowSource for StepTables {
+    fn units(&self) -> usize { 1 }
+    fn rows(&self, unit: usize) -> &[i64] { assert_eq!(unit, 0); &self.ple_ids }
+}
+impl crate::shared::mapped_table::RowSource for Vec<StepTables> {
+    fn units(&self) -> usize { self.len() }
+    fn rows(&self, unit: usize) -> &[i64] { &self[unit].ple_ids }
+}
+
+impl StepTables {
+    fn unit(&self, rows: std::ops::Range<usize>, ple_rows: usize, dense_context: usize) -> Self {
+        let n = rows.len();
+        let positions = self.positions[rows.clone()].to_vec();
+        Self { long: positions.iter().any(|&p| p as usize + 1 > dense_context), positions,
+            rope_positions: self.rope_positions[rows.clone()].to_vec(),
+            block_rope_positions: self.block_rope_positions[rows.clone()].to_vec(),
+            kv_slots: self.kv_slots[rows.clone()].to_vec(), slots: self.slots[rows.clone()].to_vec(),
+            seq_first: vec![0; n], pool_slots: self.pool_slots[rows.clone()].to_vec(),
+            cache_lengths: self.cache_lengths[rows.clone()].to_vec(),
+            page_table: self.page_table.clone(), pool_table: self.pool_table.clone(),
+            page_width: self.page_width, pool_width: self.pool_width,
+            ple_ids: self.ple_ids[rows.start * ple_rows..rows.end * ple_rows].to_vec(),
+            ..Default::default() }
+    }
 }
 
 /// A sequence's allocation units (and the record and pool pages they expand to), its GDN/PLE
@@ -385,6 +419,17 @@ fn ngram_history(eos: u32, ngram_size: usize, tokens: &[u32]) -> NgramHistory {
 #[cfg(test)]
 mod tests {
     use cuteafd_loader::families::qwen4::NgramHasher;
+
+    #[test]
+    fn padded_page_rows_match_clone_and_resize() {
+        for (pages, stride) in [(vec![3, 1], 4), (vec![7, 8, 9], 3), (vec![5, 6, 7], 2), (vec![], 2)] {
+            let mut table = vec![-1];
+            super::extend_padded(&mut table, &pages, stride);
+            let mut expected = pages.clone();
+            expected.resize(stride, 0);
+            assert_eq!(table[1..], expected[..]);
+        }
+    }
 
     #[test]
     fn startup_graphs_default_on_but_respect_both_explicit_opt_outs() {
@@ -634,6 +679,10 @@ impl Allocator {
 
 struct Workspace<'a> {
     rows: usize,
+    slot_rows: usize,
+    row_offset: Cell<usize>,
+    position: Cell<usize>,
+    units: Cell<bool>,
     streams: [Dev<'a>; 2],
     inject: Dev<'a>,
     x: Dev<'a>,
@@ -665,10 +714,18 @@ struct Workspace<'a> {
     topk_scratch: Dev<'a>,
     logits: Dev<'a>,
     logit_rows: usize,
+    logit_offset: Cell<usize>,
+    /// Terminal target rows retained until the span's canonical MTP hand-off.
+    terminal_streams: Option<Dev<'a>>,
+    terminal_valid: Cell<bool>,
     router_logits: Dev<'a>,
     route_ids: Dev<'a>,
     route_weights: Dev<'a>,
     wire: Dev<'a>,
+    /// Admitted pinned route staging (the planner charges it); Spark waves
+    /// now stage in the link exchange's slots, so it stays unused until the
+    /// planner drops the charge.
+    #[allow(dead_code)]
     router_host: RefCell<HostAllocation<'a>>,
     /// MTP steps: the source row of each row's feedback, and the greedy draft
     /// (U32 token, FP32 logit) of each head row.
@@ -686,6 +743,29 @@ struct Workspace<'a> {
     logits_host: RefCell<HostAllocation<'a>>,
     head: VocabularyHead<'a>,
     _head_workspace: Dev<'a>,
+}
+
+impl Workspace<'_> {
+    fn live(&self, buffer: &Dev<'_>, stride: usize) -> *mut c_void {
+        self.live_buffer(buffer, stride).ptr
+    }
+    fn unit_offset(slot: usize, unit_rows: usize) -> usize { slot * unit_rows }
+
+    fn ordered_prefill_tables(&self, ple_ids: bool)
+        -> impl Iterator<Item = cuteafd_ffi::CuteafdDeviceBuffer> + '_ {
+        [&self.positions, &self.rope_positions, &self.block_rope_positions,
+            &self.kv_slots, &self.slots, &self.seq_first, &self.pool_slots,
+            &self.cache_lengths, &self.page_table, &self.pool_table, &self.ids]
+            .into_iter().chain(ple_ids.then_some(&self.ple_ids))
+            .map(|table| table.buffer).filter(|buffer| buffer.bytes > 0)
+    }
+
+    fn live_buffer(&self, buffer: &Dev<'_>, stride: usize) -> cuteafd_ffi::CuteafdDeviceBuffer {
+        let offset = self.row_offset.get() * stride;
+        assert!(offset < buffer.buffer.bytes);
+        cuteafd_ffi::CuteafdDeviceBuffer { ptr: buffer.buffer.ptr.wrapping_byte_add(offset),
+            bytes: buffer.buffer.bytes - offset, ..buffer.buffer }
+    }
 }
 
 /// One MTP row: the pair (target or draft pre-mixer streams at `position`,
@@ -973,6 +1053,10 @@ pub(crate) struct Qwen4Engine<'a> {
     pub stream: *mut c_void,
     pub max_context: usize,
     pub prefill_rows: usize,
+    pub(super) prefill_shape: Option<cuteafd_loader::serving_capacity::PrefillShape>,
+    pub(super) host_prefix_config: Option<cuteafd_hostcache::config::Config>,
+    host_memory_admitted: bool,
+    request_id: Cell<u64>,
     pub pages: usize,
     pub kv_format: cuteafd_loader::families::qwen4::Qwen4KvCache,
     pub kv_record_bytes: usize,
@@ -995,6 +1079,7 @@ pub(crate) struct Qwen4Engine<'a> {
     mtp_pending: Option<Dev<'a>>,
     /// Where the last step left its final streams (decode, stream buffer).
     last_streams: std::cell::Cell<(bool, usize)>,
+    last_stream_offset: Cell<usize>,
     /// Where the last MTP step left its output streams (decode, stream buffer).
     mtp_streams: std::cell::Cell<(bool, usize)>,
     /// Logical page of each pool-cache page within its sequence, and its host copy (a shared
@@ -1004,6 +1089,7 @@ pub(crate) struct Qwen4Engine<'a> {
     /// Pool-cache pages: one per allocation unit (`pages / UNIT_PAGES`).
     pub pool_pages: usize,
     workspace: RefCell<Option<Workspace<'a>>>,
+    mtp_prefill_workspace: RefCell<Option<Workspace<'a>>>,
     decode_workspace: RefCell<Option<Workspace<'a>>>,
     peer_workspace: RefCell<Option<Workspace<'a>>>,
     peer_decode_workspace: RefCell<Option<Workspace<'a>>>,
@@ -1020,9 +1106,6 @@ pub(crate) struct Qwen4Engine<'a> {
     /// (W8A8, `fp8_rows` 1) instead of W8A16 (`--fp8-prefill-w8a8`).
     pub w8a8_prefill: bool,
     pub full_prefill_logits: bool,
-    /// Recorded after a Spark exchange's device-to-host copies: the host
-    /// waits on it while the shared expert runs behind it.
-    routes_ready: *mut c_void,
     /// L2 prefetch of the next layer's weights during decode exchanges.
     pub l2: Option<crate::shared::l2_prefetch::L2Prefetch>,
     /// The token embedding table (resident on this GPU or read from its shard).
@@ -1200,17 +1283,17 @@ impl<'a> Qwen4Engine<'a> {
             (None, None)
         };
         let pool_logical = zeroed(pool_pages * 4)?;
-        Ok(Self { terminal: Cell::new(crate::shared::peer_split::TerminalState::Active), quantize_grids, active_owner: Cell::new(0), library, programs, cfg, weights, ple, stream, max_context, prefill_rows, pages, slots, kv_format, kv_record_bytes, kv, state_map, gdn_banks, index, ple_state, ple_replay, ple_pending: RefCell::new(None),
+        Ok(Self { terminal: Cell::new(crate::shared::peer_split::TerminalState::Active), quantize_grids, active_owner: Cell::new(0), library, programs, cfg, weights, ple, stream, max_context, prefill_rows, prefill_shape: None, host_prefix_config: None, host_memory_admitted: false, request_id: Cell::new(1), pages, slots, kv_format, kv_record_bytes, kv, state_map, gdn_banks, index, ple_state, ple_replay, ple_pending: RefCell::new(None),
             mtp_kv, mtp_pending,
-            last_streams: std::cell::Cell::new((false, 0)), mtp_streams: std::cell::Cell::new((false, 0)), pool_logical,
-            pool_logical_host: RefCell::new(vec![0; pool_pages]), pool_pages, workspace: RefCell::new(None),
+            last_streams: std::cell::Cell::new((false, 0)), last_stream_offset: Cell::new(0), mtp_streams: std::cell::Cell::new((false, 0)), pool_logical,
+            pool_logical_host: RefCell::new(vec![0; pool_pages]), pool_pages, workspace: RefCell::new(None), mtp_prefill_workspace: RefCell::new(None),
             decode_workspace: RefCell::new(None), peer_workspace: RefCell::new(None),
             peer_decode_workspace: RefCell::new(None), experts: None, hops: None, profile: RefCell::new([0.0; 2]), draft_probes: RefCell::new(Vec::new()),
             graphs: RefCell::new(std::collections::HashMap::new()),
             use_graphs: std::env::var("CUTEAFD_QWEN4_GRAPHS").map_or(true, |v| v != "0"),
             startup_graphs: false,
             warming_graphs: Cell::new(false), w8a8_prefill: false, spark_bf16: false, full_prefill_logits: false,
-            routes_ready: library.cuda_event_create_ordering()?, l2: None, embedding,
+            l2: None, embedding,
             mtp_drafts: zeroed(MTP_DEFERRED_STEPS * DECODE_ROWS * 4)?,
             attention_plan: cuteafd_core::coordinator_programs::AttentionReductionPlan::new(DECODE_ROWS, None, None)? })
     }
@@ -1256,6 +1339,82 @@ impl<'a> Qwen4Engine<'a> {
         Ok(())
     }
 
+    /// Admit all still-lazy host consumers, including a frozen serving cache quota.
+    pub(super) fn admit_host_memory(&mut self, args: &super::EngineArgs) -> Result<()> {
+        ensure!(!self.host_memory_admitted, "Qwen host memory was already admitted");
+        let (config, scoring, headroom) = match &args.planner_host_prefix {
+            Some((prefix, lanes)) => {
+                let prefix = prefix.with_scoring(if args.full_prefill_logits { self.prefill_rows } else { DECODE_ROWS },
+                    self.prefill_rows, self.cfg.vocab_size)?;
+                let layout = super::prefix::Qwen4Prefix::geometry(self)?;
+                (prefix.resolve_host_config(layout, self.max_context, *lanes)?, prefix.scoring_host_bytes,
+                    prefix.host_cache_headroom_bytes)
+            }
+            None => (None, cuteafd_core::memory_layout::host_logits_bytes(
+                if args.full_prefill_logits { self.prefill_rows } else { DECODE_ROWS } as u64,
+                self.prefill_rows as u64, self.cfg.vocab_size as u64).context("Qwen host scoring overflow")?, 0),
+        };
+        let tables = self.future_host_workspaces(args.full_prefill_logits)?;
+        let views: Vec<_> = tables.iter().map(|(name, bytes)| (name.as_str(), *bytes)).collect();
+        crate::shared::memory::budget::admit_host_memory(config.as_ref().map_or(0, |c| c.bytes),
+            &views, scoring, headroom)?;
+        self.host_prefix_config = config;
+        self.host_memory_admitted = true;
+        Ok(())
+    }
+
+    fn future_host_workspaces(&self, full_logits: bool) -> Result<Vec<(String, u64)>> {
+        use super::admission::HostWorkspaceBytes;
+        let mut demands = Vec::new();
+        let spark = matches!(self.experts, Some(Experts::Spark { .. }));
+        let ple_ids = self.ple.as_ref().map(|ple| ple.mapped()).is_none();
+        for owner in 0..self.gdn_banks.len() {
+            for decode in [false, true] {
+                if self.workspace_slot(owner, decode)?.borrow().is_some() { continue; }
+                let rows = if decode { DECODE_ROWS } else { self.prefill_shape
+                    .map_or(self.prefill_rows, |shape| shape.unit_rows as usize) };
+                let logits = if decode { DECODE_ROWS } else if full_logits { self.prefill_rows } else { 1 };
+                let host = HostWorkspaceBytes::new(&self.cfg, rows, decode, self.pages, self.pool_pages,
+                    spark, self.spark_bf16, !decode && self.prefill_shape.is_some(), ple_ids, logits)?;
+                let label = format!("qwen4/owner-{owner}/{}", if decode { "decode" } else { "prefill" });
+                for (kind, bytes) in [("router", host.router), ("staging", host.staging),
+                    ("ordered-tables", host.ordered), ("pinned-logits", host.logits)] {
+                    if bytes > 0 { demands.push((format!("{label}/{kind}"), bytes)); }
+                }
+            }
+        }
+        if self.prefill_shape.is_some() && self.weights.mtp.is_some() && self.mtp_prefill_workspace.borrow().is_none() {
+            let host = HostWorkspaceBytes::new(&self.cfg, self.mtp_prefill_rows(), false,
+                self.pages, self.pool_pages, spark, self.spark_bf16, false, ple_ids, 1)?;
+            for (kind, bytes) in [("router", host.router), ("staging", host.staging), ("pinned-logits", host.logits)] {
+                demands.push((format!("qwen4/owner-0/mtp-prefill/{kind}"), bytes));
+            }
+        }
+        Ok(demands)
+    }
+
+    /// Size every unit-table upload before a request can queue prefill work.
+    pub(crate) fn prepare_prefill_units(&self) -> Result<()> {
+        let Some(shape) = self.prefill_shape else { return Ok(()) };
+        let shape = shape.validate()?;
+        if self.workspace.borrow().is_none() {
+            *self.workspace.borrow_mut() = Some(self.workspace_rows(shape.unit_rows as usize, false,
+                if self.full_prefill_logits { self.prefill_rows } else { 1 }, shape.slot_rows() as usize,
+                if self.weights.mtp.is_some() { self.prefill_rows } else { 0 })?);
+        }
+        let workspace = self.workspace.borrow();
+        self.reserve_prefill_tables(workspace.as_ref().context("Qwen prefill workspace")?)
+    }
+
+    fn reserve_prefill_tables(&self, workspace: &Workspace<'_>) -> Result<()> {
+        let ple_ids = self.ple.as_ref().map(|ple| ple.mapped()).is_none();
+        for destination in workspace.ordered_prefill_tables(ple_ids) {
+            // SAFETY: the engine retains each full table and its stream through completion.
+            unsafe { self.library.reserve_h2d_ordered(destination, self.execution_stream())?; }
+        }
+        Ok(())
+    }
+
     /// Pre-capture every reachable bucket/geometry on no-storage rows, without expert traffic.
     pub fn warm_decode_graphs(&self, sequences: usize, speculation: bool) -> Result<usize> {
         if !self.use_graphs || !self.startup_graphs { return Ok(0); }
@@ -1288,7 +1447,7 @@ impl<'a> Qwen4Engine<'a> {
                     page_width: geometry.page_stride, pool_stride: geometry.pool_stride, ..Default::default() };
                 let mut tokens = Vec::new();
                 pad_decode_tables(&mut tables, &mut tokens, rows, self.ple.as_ref().map_or(0, |_| self.cfg.ple_rows()));
-                self.step(&tables, &tokens, rows, None, None, &Default::default(), true)?;
+                self.step(&Arc::new(tables), &tokens, rows, None, None, &Default::default(), true)?;
             }
             // SAFETY: queued captures/replays drain before reporting memory or publishing readiness.
             self.drain_state()
@@ -1558,7 +1717,7 @@ impl<'a> Qwen4Engine<'a> {
                             .map(|rank| rank.weight_read_bytes()).collect::<Result<Vec<_>>>()?
                             .into_iter().max().context("Qwen installed TP2 ranks missing")?,
                         Some(Experts::Spark { transport, .. }) => resource::worker_weight_read_bytes(
-                            &transport.borrow().transport.installed_grouping()?, index)?,
+                            &transport.borrow().installed_grouping()?, index)?,
                         _ => anyhow::bail!("Qwen layer {index} has no installed FP8-family byte descriptor"),
                     };
                     bytes as f64
@@ -1574,7 +1733,7 @@ impl<'a> Qwen4Engine<'a> {
         -> Result<cuteafd_core::PolicyGeometry> {
         use crate::shared::draft::resource;
         let remote = match &self.experts {
-            Some(Experts::Spark { transport, .. }) => transport.borrow().transport.installed_grouping()?,
+            Some(Experts::Spark { transport, .. }) => transport.borrow().installed_grouping()?,
             _ => Vec::new(),
         };
         resource::geometry_with_grouping(&self.draft_homes(snapshot)?, self.cfg.experts, self.cfg.topk,
@@ -1643,9 +1802,10 @@ impl<'a> Qwen4Engine<'a> {
 
     fn probe_layer(&self, w: &Workspace<'_>, index: usize, rows: usize) -> Result<()> {
         if index >= self.cfg.layers { return Ok(()); }
-        let spark = matches!(self.experts, Some(Experts::Spark { .. }));
         if let Some(probe) = self.draft_probes.borrow_mut().get_mut(self.active_owner.get()) {
-            if probe.wants_ring(spark) {
+            // Spark layers ring too: their routes reach the host only on the
+            // exchange worker, after the post.
+            if probe.wants_ring(false) {
                 // SAFETY: replay/router precedes this async copy on the owning device stream.
                 unsafe { probe.ring(self.library, index, w.route_ids.buffer, rows, self.execution_stream())?; }
             }
@@ -1671,6 +1831,12 @@ impl<'a> Qwen4Engine<'a> {
         owners.extend(self.ple_state.as_ref().cloned());
         owners.extend(self.mtp_pending.as_ref().cloned());
         owners
+    }
+
+    /// Every execution owner's (device, stream): the streams that read and write its KV pages
+    /// and GDN state (prefix copies fence against them).
+    pub(crate) fn owner_streams(&self) -> Vec<(i32, *mut c_void)> {
+        self.gdn_banks.iter().map(|bank| (bank.device.id, bank.stream)).collect()
     }
 
     pub(crate) fn state_stream(&self, device: i32) -> Result<*mut c_void> {
@@ -1732,6 +1898,15 @@ impl<'a> Qwen4Engine<'a> {
             }
         }
         ensure!(failures.is_empty(), "{}", failures.join("; ")); Ok(())
+    }
+
+    /// A partial-model diagnostic has no logits readback to retire its rows.
+    fn drain_partial_step(&self) -> Result<()> {
+        drop(self.ple_pending.borrow_mut().take());
+        self.drain_state()?;
+        let device = self.library.cuda_get_device()?;
+        if let Some(ple) = &self.ple { ple.mapped().bind_readback(device, self.execution_stream()); }
+        crate::shared::mapped_table::check_readback(device, self.execution_stream())
     }
 
     /// `bytes` at `offset` inside `pool`.
@@ -1855,6 +2030,11 @@ impl<'a> Qwen4Engine<'a> {
     }
 
     fn workspace(&self, t: usize, decode: bool, logit_rows: usize) -> Result<Workspace<'a>> {
+        self.workspace_rows(t, decode, logit_rows, t, 0)
+    }
+
+    fn workspace_rows(&self, t: usize, decode: bool, logit_rows: usize, span: usize, terminal_rows: usize)
+        -> Result<Workspace<'a>> {
         let _memory_scope = cuteafd_ffi::memory_ledger::scope("workspace");
         let h = self.cfg.hidden;
         let cap = if decode { "m64" } else { "m4096" };
@@ -1871,29 +2051,31 @@ impl<'a> Qwen4Engine<'a> {
         }
         let topk_scratch = self.scratch(&format!("qwen4_index_topk_{cap}")).unwrap_or(0);
         let blocks = self.cfg.index_budget / BLOCK;
-        let table_rows = if decode { t } else { 1 };
         let head_workspace = self.alloc(VOCABULARY_HEAD_WORKSPACE)?;
         let spark = matches!(self.experts, Some(Experts::Spark { .. }));
+        let tables = super::admission::StepTableBytes::new(t, decode, self.pages, self.pool_pages, self.cfg.ple_rows())?;
+        let host = super::admission::HostWorkspaceBytes::new(&self.cfg, t, decode, self.pages, self.pool_pages,
+            spark, self.spark_bf16, false, false, logit_rows)?;
         let (topk, heads, hd) = (self.cfg.topk, self.cfg.heads, self.cfg.head_dim);
         Ok(Workspace {
-            rows: t,
-            streams: [self.alloc(t * HC * h * 2)?, self.alloc(t * HC * h * 2)?],
-            inject: self.alloc(t * HC * 2)?,
-            x: self.alloc(t * h * 2)?,
-            delta: self.alloc(t * h * 2)?,
-            shared: self.alloc(t * h * 2)?,
+            rows: t, slot_rows: span, row_offset: Cell::new(0), position: Cell::new(0), units: Cell::new(false),
+            streams: [self.alloc(span * HC * h * 2)?, self.alloc(span * HC * h * 2)?],
+            inject: self.alloc(span * HC * 2)?,
+            x: self.alloc(span * h * 2)?,
+            delta: self.alloc(span * h * 2)?,
+            shared: self.alloc(span * h * 2)?,
             routed: self.alloc(t * h * 2)?,
-            positions: self.alloc(t * 8)?,
-            rope_positions: self.alloc(t * 12)?,
-            block_rope_positions: self.alloc(t * 12)?,
-            kv_slots: self.alloc(t * 8)?,
-            slots: self.alloc(t * 4)?,
-            seq_first: self.alloc(t * 4)?,
-            pool_slots: self.alloc(t * 8)?,
-            cache_lengths: self.alloc(t * 4)?,
-            page_table: self.alloc(table_rows * self.pages * 4)?,
-            pool_table: self.alloc(table_rows * self.pool_pages * 4)?,
-            ple_ids: self.alloc(t * self.cfg.ple_rows() * 8)?,
+            positions: self.alloc(tables.positions)?,
+            rope_positions: self.alloc(tables.rope_positions)?,
+            block_rope_positions: self.alloc(tables.block_rope_positions)?,
+            kv_slots: self.alloc(tables.kv_slots)?,
+            slots: self.alloc(tables.slots)?,
+            seq_first: self.alloc(tables.seq_first)?,
+            pool_slots: self.alloc(tables.pool_slots)?,
+            cache_lengths: self.alloc(tables.cache_lengths)?,
+            page_table: self.alloc(tables.page_table)?,
+            pool_table: self.alloc(tables.pool_table)?,
+            ple_ids: self.alloc(tables.ple_ids)?,
             ple_rows: match self.ple.as_ref() {
                 Some(ple) => {
                     let n = t * self.cfg.ple_rows();
@@ -1917,21 +2099,20 @@ impl<'a> Qwen4Engine<'a> {
                 zero
             },
             logits: self.alloc(logit_rows * self.cfg.vocab_size * 4)?,
-            logit_rows,
+            logit_rows, logit_offset: Cell::new(0),
+            terminal_streams: (terminal_rows > 0).then(|| self.alloc(terminal_rows * HC * h * 2)).transpose()?,
+            terminal_valid: Cell::new(false),
             router_logits: self.alloc(t * self.cfg.experts * 4)?,
             route_ids: self.alloc(t * topk * 4)?,
             route_weights: self.alloc(t * topk * 4)?,
             wire: self.alloc(t * (h + h / 32))?,
-            router_host: RefCell::new(HostAllocation::new(self.library,
-                if spark { t * (topk * 8 + if self.spark_bf16 { h * 2 } else { h + h / 32 }) } else { 256 })?),
+            router_host: RefCell::new(HostAllocation::new(self.library, usize::try_from(host.router)?)?),
             hidden_rows: self.alloc(t * 4)?,
             argmax: self.alloc(logit_rows * 8)?,
-            ids: self.alloc(t * 4)?,
+            ids: self.alloc(tables.ids)?,
             select: self.alloc(logit_rows * 8)?,
-            logits_host: RefCell::new(HostAllocation::new(self.library, logit_rows * self.cfg.vocab_size * 4)?),
-            staging: RefCell::new((HostAllocation::new(self.library, 16 * 16
-                + t * (8 * 3 + 4 * 4 + 24 + self.cfg.ple_rows() * 8 + (HC + 1) * h * 2)
-                + table_rows * (self.pages + self.pool_pages) * 4)?, 0)),
+            logits_host: RefCell::new(HostAllocation::new(self.library, usize::try_from(host.logits)?)?),
+            staging: RefCell::new((HostAllocation::new(self.library, usize::try_from(host.staging)?)?, 0)),
             // SAFETY: the workspace buffer lives in the same struct and drops after the head.
             head: unsafe { self.library.vocabulary_head_rows(head_workspace.buffer.ptr, h as u32, logit_rows as u32,
                 self.cfg.vocab_size as u32)? },
@@ -1950,6 +2131,7 @@ impl<'a> Qwen4Engine<'a> {
 
     /// Starts a step's staged uploads (the previous step's have drained).
     fn begin_staging(&self, w: &Workspace<'_>) -> Result<()> {
+        if w.units.get() { return Ok(()); }
         // SAFETY: the engine owns this stream; its earlier copies read the staging bytes.
         unsafe { self.library.cuda_stream_synchronize(self.execution_stream())? };
         w.staging.borrow_mut().1 = 0;
@@ -1960,6 +2142,7 @@ impl<'a> Qwen4Engine<'a> {
     /// host wait) while `bytes` more still fit: queued steps (MTP draft
     /// chains) then run back to back.
     fn continue_staging(&self, w: &Workspace<'_>, bytes: usize) -> Result<()> {
+        if w.units.get() { return Ok(()); }
         let (capacity, used) = { let staging = w.staging.borrow(); (staging.0.buffer.bytes, staging.1) };
         if used + bytes > capacity {
             self.begin_staging(w)?;
@@ -1976,7 +2159,7 @@ impl<'a> Qwen4Engine<'a> {
         if !defer_gather {
             // SAFETY: the ids are staged on this stream; `out` holds the rows.
             unsafe { self.embedding.gather(w.ids.buffer.ptr, std::ptr::null(), tokens.len(), copies,
-                std::ptr::null(), out.buffer.ptr, self.execution_stream())? };
+                std::ptr::null(), w.live(out, copies * self.cfg.hidden * 2), self.execution_stream())? };
         }
         Ok(())
     }
@@ -1987,6 +2170,11 @@ impl<'a> Qwen4Engine<'a> {
             return Ok(());
         }
         ensure!(bytes.len() <= dst.bytes, "staged upload exceeds its buffer");
+        if w.units.get() {
+            // SAFETY: unit-table readers and rewrites use this stream; the
+            // library retains the upload's pinned source through its copy event.
+            return unsafe { self.library.copy_h2d_ordered(dst, bytes, self.execution_stream()) };
+        }
         let mut staging = w.staging.borrow_mut();
         let at = staging.1;
         ensure!(at + bytes.len() <= staging.0.buffer.bytes, "step inputs exceed the staging buffer");
@@ -2008,8 +2196,10 @@ impl<'a> Qwen4Engine<'a> {
     }
 
     fn download(&self, dev: &Dev<'_>, bytes: usize) -> Result<Vec<u8>> {
+        if let Some(ple) = &self.ple { ple.mapped().bind_readback(dev.buffer.device_id, self.execution_stream()); }
         // SAFETY: the engine owns this stream.
         unsafe { self.library.cuda_stream_synchronize(self.execution_stream())? };
+        crate::shared::mapped_table::check_readback(self.library.cuda_get_device()?, self.execution_stream())?;
         let mut out = vec![0u8; bytes];
         self.library.copy_d2h(&mut out, cuteafd_ffi::CuteafdDeviceBuffer { bytes, ..dev.buffer })?;
         Ok(out)
@@ -2072,8 +2262,13 @@ impl<'a> Qwen4Engine<'a> {
     /// [`Self::prefill_forced`] leaving the logits on the device.
     pub fn prefill_device(&self, placement: &mut Qwen4Placement, tokens: &[u32], on_layer: LayerHook<'_>,
         forced: Forced<'_>, logit_rows: usize) -> Result<Option<DeviceLogits>> {
+        if self.prefill_shape.is_some() && on_layer.is_none() && forced.is_none() {
+            return crate::shared::experts::rtx::pair::submit(|| self.require_live(), || self.shutdown_submission(),
+                || self.prefill_units(placement, tokens, logit_rows));
+        }
+        self.last_stream_offset.set(0);
         let (t, start) = (tokens.len(), placement.len);
-        ensure!(t > 0 && t <= self.prefill_rows && start + t <= self.max_context, "prefill of {t} rows at {start}");
+        ensure!(t > 0 && t <= self.prefill_rows.min(4096) && start + t <= self.max_context, "prefill of {t} rows at {start}");
         if start == 0 {
             self.start(placement)?;
         }
@@ -2081,10 +2276,83 @@ impl<'a> Qwen4Engine<'a> {
             page_stride: 0, pool_stride: 0, page_width: placement.pages.len(), ..Default::default() };
         self.rows(placement, tokens, 0, &mut tables)?;
         let media = embedding_media(&[(placement, start, t)])?;
-        let logits = self.step(&tables, tokens, logit_rows.clamp(1, t), on_layer, forced, &media, true)?;
+        let logits = self.step(&Arc::new(tables), tokens, logit_rows.clamp(1, t), on_layer, forced, &media, true)?;
         placement.len += t;
         placement.state_len = placement.len;
         Ok(logits)
+    }
+
+    fn prefill_units(&self, placement: &mut Qwen4Placement, tokens: &[u32], logit_rows: usize)
+        -> Result<Option<DeviceLogits>> {
+        use crate::shared::prefill_pipeline::{sequence_units, run_prefill_units};
+        let shape = self.prefill_shape.context("Qwen prefill unit shape")?.validate()?;
+        ensure!(self.gdn_banks.len() == 1 && self.hops.is_none(),
+            "Qwen prefill units require a single attention owner; dual-owner hop slots are not admitted");
+        ensure!(matches!(self.experts, Some(Experts::Spark { .. } | Experts::SharedOnly)),
+            "Qwen prefill units require Spark experts (or shared-only diagnostics)");
+        let (t, start) = (tokens.len(), placement.len);
+        ensure!(t > 0 && t <= self.prefill_rows && start + t <= self.max_context,
+            "prefill of {t} rows at {start}");
+        let logit_rows = logit_rows.clamp(1, t);
+        if start == 0 { self.start(placement)?; }
+        let mut tables = StepTables { page_table: placement.pages.clone(), pool_table: placement.pool_pages.clone(),
+            page_width: placement.pages.len(), ..Default::default() };
+        self.rows(placement, tokens, 0, &mut tables)?;
+        let waves = shape.waves as usize;
+        // Keep the cuts independent of wave count for same-cut identity checks.
+        let mut units = sequence_units(t, shape.unit_rows as usize, 1, self.weights.layers.len())?;
+        for unit in &mut units { unit.slot = unit.index % waves; }
+        let replace = self.workspace.borrow().as_ref().is_none_or(|w| w.rows != shape.unit_rows as usize
+            || w.slot_rows != shape.slot_rows() as usize || w.logit_rows < logit_rows);
+        if replace {
+            self.drain_state()?;
+            *self.workspace.borrow_mut() = Some(self.workspace_rows(shape.unit_rows as usize, false,
+                if self.full_prefill_logits { self.prefill_rows } else { logit_rows }, shape.slot_rows() as usize,
+                if self.weights.mtp.is_some() { self.prefill_rows } else { 0 })?);
+            self.prepare_prefill_units()?;
+        }
+        let workspace = self.workspace.borrow();
+        let w = workspace.as_ref().context("Qwen prefill workspace")?;
+        w.terminal_valid.set(false);
+        w.units.set(true);
+        let unit_tables: Arc<Vec<_>> = Arc::new(units.iter().map(|unit| tables.unit(unit.rows.clone(),
+            if self.ple.is_some() { self.cfg.ple_rows() } else { 0 }, self.cfg.dense_context())).collect());
+        let ple_batch = self.ple.as_ref().map(|ple| ple.mapped().batch(Arc::clone(&unit_tables)
+            as Arc<dyn crate::shared::mapped_table::RowSource>));
+        let run = |transport: Option<&mut crate::shared::spark_waves::Waves<'_>>| {
+            let mut hooks = UnitHooks { engine: self, transport, w, placement, tokens, tables: unit_tables, ple_batch,
+                current: vec![0; units.len()], entered: vec![false; units.len()],
+                pending: (0..units.len()).map(|_| None).collect(), logit_rows };
+            run_prefill_units(&mut hooks, &units, waves)
+        };
+        // Spark waves build, post and land on the link's exchange worker
+        // while this thread queues GPU work.
+        let result = match &self.experts {
+            Some(Experts::Spark { transport, .. }) => {
+                let staging = self.wave_staging_bytes(shape.unit_rows as usize)?;
+                let mut link = transport.borrow_mut();
+                let exchange = link.exchange()?;
+                ensure!(exchange.fits(staging), "Spark exchange staging is narrower than a prefill unit");
+                run(Some(exchange))
+            }
+            _ => run(None),
+        };
+        w.row_offset.set(0); w.logit_offset.set(0); w.position.set(0); w.units.set(false);
+        self.last_stream_offset.set(0);
+        result?;
+        w.terminal_valid.set(w.terminal_streams.is_some());
+        placement.len += t;
+        placement.state_len = placement.len;
+        tracing::debug!(rows = t, unit_rows = shape.unit_rows, waves, units = units.len(), "Qwen prefill units");
+        if self.weights.layers.len() < self.cfg.layers {
+            self.drain_partial_step()?;
+            return Ok(None);
+        }
+        Ok(Some(self.device_logits(w, logit_rows, false)))
+    }
+
+    pub(crate) fn mtp_prefill_rows(&self) -> usize {
+        self.prefill_shape.map_or(self.prefill_rows, |shape| shape.unit_rows as usize)
     }
 
     pub fn prefill(&self, placement: &mut Qwen4Placement, tokens: &[u32]) -> Result<Option<Vec<f32>>> {
@@ -2142,12 +2410,8 @@ impl<'a> Qwen4Engine<'a> {
             let first = tables.kv_slots.len() as i32;
             self.rows(placement, tokens, first, &mut tables)?;
             for _ in 0..tokens.len() {
-                let mut pages = placement.pages.clone();
-                pages.resize(page_stride, 0);
-                tables.page_table.extend(pages);
-                let mut pools = placement.pool_pages.clone();
-                pools.resize(pool_stride, 0);
-                tables.pool_table.extend(pools);
+                extend_padded(&mut tables.page_table, &placement.pages, page_stride);
+                extend_padded(&mut tables.pool_table, &placement.pool_pages, pool_stride);
             }
         }
         tables.pool_width = tables.pool_width.next_power_of_two().min(pool_stride);
@@ -2161,7 +2425,7 @@ impl<'a> Qwen4Engine<'a> {
             pad_decode_tables(&mut tables, &mut tokens, decode_bucket(rows, spec), self.ple.as_ref().map_or(0, |_| self.cfg.ple_rows()));
         }
         let physical_rows = tokens.len();
-        let mut logits = self.step(&tables, &tokens, physical_rows, on_layer, None, &media, graphs)?;
+        let mut logits = self.step(&Arc::new(tables), &tokens, physical_rows, on_layer, None, &media, graphs)?;
         if let Some(logits) = logits.as_mut() {
             // Greedy statuses remain after the physical bucket's ids, not the real rows.
             logits.rows = rows;
@@ -2189,8 +2453,8 @@ impl<'a> Qwen4Engine<'a> {
                 "commit of rows {first}+{keep} in slot {slot}");
             (table[i], table[n + i], table[2 * n + i]) = (slot, i32::try_from(first)?, i32::try_from(keep)?);
         }
-        // SAFETY: the engine owns this stream; the previous commit's table is consumed.
-        unsafe { self.library.cuda_stream_synchronize(self.execution_stream())? };
+        // Each bank uploads its commit table in order on its own stream (GdnBank::commit),
+        // behind that owner's verify work and the previous commit's readers.
         let i32s = |v: usize| -> Result<Scalar> { Ok(Scalar::I32(i32::try_from(v)?)) };
         for bank in &self.gdn_banks {
             bank.device.run(|| bank.commit(&table, n))?;
@@ -2234,13 +2498,16 @@ impl<'a> Qwen4Engine<'a> {
         let row = HC * self.cfg.hidden * 2;
         for &(slot, first, count, at) in rows {
             let slot = usize::try_from(slot)?;
-            ensure!(slot < self.slots && at + count <= MTP_PENDING_ROWS && first + count <= w.rows,
+            ensure!(slot < self.slots && at + count <= MTP_PENDING_ROWS && first + count <= if decode { w.rows } else { self.prefill_rows },
                 "MTP stash of rows {first}+{count} at {at}");
             if count == 0 {
                 continue;
             }
             let dst = Self::region(pending, (slot * MTP_PENDING_ROWS + at) * row, count * row);
-            let src = Self::region(&w.streams[cur], first * row, count * row);
+            let source = if !decode && w.terminal_valid.get() {
+                w.terminal_streams.as_ref().context("missing terminal target rows")?
+            } else { &w.streams[cur] };
+            let src = Self::region(source, first * row, count * row);
             // SAFETY: both regions lie inside live buffers; the stream orders the copy.
             unsafe { self.library.copy_d2d_async(dst, src, count * row, self.execution_stream())? };
         }
@@ -2262,7 +2529,7 @@ impl<'a> Qwen4Engine<'a> {
         let (kv, keys, blocks) = self.mtp_kv.as_ref().context("MTP pools")?;
         let (h, vocab) = (self.cfg.hidden, self.cfg.vocab_size);
         let t: usize = groups.iter().map(|g| g.rows.len()).sum();
-        let capacity = if decode { DECODE_ROWS } else { self.prefill_rows };
+        let capacity = if decode { DECODE_ROWS } else { self.mtp_prefill_rows() };
         let token_rows = match tokens { MtpTokens::Host(t) => t.len(), MtpTokens::Drafts { index, .. } => index.len() };
         ensure!(t > 0 && t <= capacity && heads.len() <= t && token_rows == t, "MTP step of {t} rows");
         let mut tables = StepTables { decode, ..Default::default() };
@@ -2305,19 +2572,16 @@ impl<'a> Qwen4Engine<'a> {
                     _ => row.source,
                 });
                 if decode {
-                    let mut pages = placement.pages.clone();
-                    pages.resize(tables.page_stride, 0);
-                    tables.page_table.extend(pages);
-                    let mut pools = placement.pool_pages.clone();
-                    pools.resize(tables.pool_stride, 0);
-                    tables.pool_table.extend(pools);
+                    extend_padded(&mut tables.page_table, &placement.pages, tables.page_stride);
+                    extend_padded(&mut tables.pool_table, &placement.pool_pages, tables.pool_stride);
                 }
             }
         }
         if decode {
             tables.pool_width = tables.pool_width.next_power_of_two().min(tables.pool_stride);
         }
-        let slot = if decode { &self.decode_workspace } else { &self.workspace };
+        let separate = !decode && self.prefill_shape.is_some();
+        let slot = if decode { &self.decode_workspace } else if separate { &self.mtp_prefill_workspace } else { &self.workspace };
         if slot.borrow().is_none() {
             *slot.borrow_mut() = Some(self.workspace(capacity, decode, if decode { DECODE_ROWS } else { 1 })?);
         }
@@ -2331,12 +2595,19 @@ impl<'a> Qwen4Engine<'a> {
             MtpSource::Chain => {
                 let (d, cur) = self.mtp_streams.get();
                 ensure!(d == decode, "an MTP chain step follows an MTP step in the same workspace");
-                (w.streams[cur].buffer.ptr, cur ^ 1)
+                (w.live(&w.streams[cur], HC * self.cfg.hidden * 2), cur ^ 1)
             }
             MtpSource::Target => {
                 let (d, cur) = self.last_streams.get();
                 ensure!(d == decode, "the MTP reads the last target step of the same workspace");
-                (w.streams[cur].buffer.ptr, cur ^ 1)
+                if separate {
+                    let target = self.workspace.borrow();
+                    let target = target.as_ref().context("no target prefill ran")?;
+                    let source = if target.terminal_valid.get() {
+                        target.terminal_streams.as_ref().context("missing terminal target rows")?
+                    } else { &target.streams[cur] };
+                    (source.buffer.ptr, 0)
+                } else { (w.streams[cur].buffer.ptr, cur ^ 1) }
             }
         };
         // Staged bytes (16-byte aligned tables, then the embedding rows at most).
@@ -2364,7 +2635,7 @@ impl<'a> Qwen4Engine<'a> {
                 // SAFETY: the drafts of `step` and the staged indices are ordered on this
                 // stream before the gather; `x` holds t rows.
                 unsafe { self.embedding.embed_device_ids(drafts, Some((w.ids.buffer.ptr.cast_const(), index)), t, 1,
-                    None, w.x.buffer, self.execution_stream())? };
+                    None, w.live_buffer(&w.x, self.cfg.hidden * 2), self.execution_stream())? };
             }
         }
         if matches!(tokens, MtpTokens::Host(_)) && groups.iter().any(|group| group.placement.media.as_ref()
@@ -2375,10 +2646,10 @@ impl<'a> Qwen4Engine<'a> {
         let rows = Scalar::I32(t as i32);
         let cap = if decode { "m64" } else { "m4096" };
         self.run("qwen4_mtp_feedback", &[("hidden", src), ("hidden_rows", w.hidden_rows.buffer.ptr),
-            ("embed", w.x.buffer.ptr), ("norm_hidden", mtp.norm_hidden.buffer.ptr),
+            ("embed", w.live(&w.x, self.cfg.hidden * 2)), ("norm_hidden", mtp.norm_hidden.buffer.ptr),
             ("norm_embed", mtp.norm_embed.buffer.ptr), ("fc_hidden", mtp.fc_hidden.buffer.ptr),
-            ("fc_embed", mtp.fc_embed.buffer.ptr), ("streams", w.streams[dst].buffer.ptr),
-            ("delta", w.delta.buffer.ptr), ("inject", w.inject.buffer.ptr), ("scratch", w.scratch.buffer.ptr)],
+            ("fc_embed", mtp.fc_embed.buffer.ptr), ("streams", w.live(&w.streams[dst], HC * self.cfg.hidden * 2)),
+            ("delta", w.live(&w.delta, self.cfg.hidden * 2)), ("inject", w.live(&w.inject, HC * 2)), ("scratch", w.scratch.buffer.ptr)],
             &[rows])?;
         // The embedding branch joins every stream (unit injection), then the attention site.
         self.post_pre(w, dst, &mtp.layer, "attn", rows)?;
@@ -2392,8 +2663,8 @@ impl<'a> Qwen4Engine<'a> {
             return Ok((Vec::new(), None));
         }
         let [norm, down, up] = &mtp.mixer;
-        self.run("qwen4_head", &[("streams", w.streams[out].buffer.ptr), ("norm", norm.buffer.ptr),
-            ("w_down", down.buffer.ptr), ("w_up", up.buffer.ptr), ("out", w.x.buffer.ptr),
+        self.run("qwen4_head", &[("streams", w.live(&w.streams[out], HC * self.cfg.hidden * 2)), ("norm", norm.buffer.ptr),
+            ("w_down", down.buffer.ptr), ("w_up", up.buffer.ptr), ("out", w.live(&w.x, self.cfg.hidden * 2)),
             ("scratch", w.scratch.buffer.ptr)], &[rows])?;
         // The head rows, gathered contiguously into `delta`.
         let row = h * 2;
@@ -2408,7 +2679,7 @@ impl<'a> Qwen4Engine<'a> {
         let n = heads.len();
         ensure!(n <= DECODE_ROWS, "{n} MTP head rows");
         // The target's head (one representation shared with the drafts).
-        self.logits(w, w.delta.buffer.ptr, n)?;
+        self.logits(w, w.live(&w.delta, self.cfg.hidden * 2), n)?;
         // SAFETY: the logits and the argmax outputs are live buffers of these shapes.
         unsafe {
             self.library.cuda_logits_argmax_checked_f32_async(
@@ -2446,7 +2717,8 @@ impl<'a> Qwen4Engine<'a> {
     /// The last MTP step's output streams (BF16 [rows, 4, H]).
     pub fn mtp_output(&self, rows: usize) -> Result<Vec<u8>> {
         let (decode, cur) = self.mtp_streams.get();
-        let workspace = if decode { self.decode_workspace.borrow() } else { self.workspace.borrow() };
+        let workspace = if decode { self.decode_workspace.borrow() }
+            else if self.prefill_shape.is_some() { self.mtp_prefill_workspace.borrow() } else { self.workspace.borrow() };
         let w = workspace.as_ref().context("no MTP step ran")?;
         self.download(&w.streams[cur], rows * HC * self.cfg.hidden * 2)
     }
@@ -2457,24 +2729,33 @@ impl<'a> Qwen4Engine<'a> {
         // Scratch is consumed before norm/feedback; injection drains before the
         // reused sequence table is restored. Graph storage stays unchanged.
         self.library.embedding_injection()?.inject_host(&media.features, &media.indices,
-            w.delta.buffer, w.seq_first.buffer, out.buffer, rows, self.cfg.hidden, copies, self.execution_stream())?;
+            w.live_buffer(&w.delta, self.cfg.hidden * 2), w.seq_first.buffer, w.live_buffer(out, copies * self.cfg.hidden * 2), rows, self.cfg.hidden, copies, self.execution_stream())?;
         self.put(&w.seq_first, seq_first)
     }
 
     pub fn prepare_scoring_prefill(&mut self) -> Result<()> {
-        *self.workspace.borrow_mut() = Some(self.workspace(self.prefill_rows, false, self.prefill_rows)?);
+        *self.workspace.borrow_mut() = Some(match self.prefill_shape {
+            Some(shape) => self.workspace_rows(shape.unit_rows as usize, false, self.prefill_rows,
+                shape.slot_rows() as usize, if self.weights.mtp.is_some() { self.prefill_rows } else { 0 })?,
+            None => self.workspace(self.prefill_rows, false, self.prefill_rows)?,
+        });
         self.full_prefill_logits = true;
         Ok(())
     }
 
-    fn step(&self, tables: &StepTables, tokens: &[u32], logit_rows: usize, on_layer: LayerHook<'_>,
+    fn step(&self, tables: &Arc<StepTables>, tokens: &[u32], logit_rows: usize, on_layer: LayerHook<'_>,
         forced: Forced<'_>, media: &cuteafd_engine::media::MediaChunk, graphs: bool) -> Result<Option<DeviceLogits>> {
         crate::shared::experts::rtx::pair::submit(|| self.require_live(), || self.shutdown_submission(),
             || self.step_inner(tables, tokens, logit_rows, on_layer, forced, media, graphs))
     }
 
-    fn step_inner(&self, tables: &StepTables, tokens: &[u32], logit_rows: usize, mut on_layer: LayerHook<'_>,
+    fn step_inner(&self, tables: &Arc<StepTables>, tokens: &[u32], logit_rows: usize, mut on_layer: LayerHook<'_>,
         forced: Forced<'_>, media: &cuteafd_engine::media::MediaChunk, graphs: bool) -> Result<Option<DeviceLogits>> {
+        self.last_stream_offset.set(0);
+        if let Some(w) = self.workspace.borrow().as_ref() {
+            w.row_offset.set(0); w.logit_offset.set(0); w.units.set(false);
+            w.terminal_valid.set(false);
+        }
         ensure!(self.gdn_banks.len() == 1 || self.hops.is_some(),
             "Qwen dual owner execution needs TP2 exchange and owner graph admission");
         if self.gdn_banks.len() == 2 {
@@ -2482,7 +2763,7 @@ impl<'a> Qwen4Engine<'a> {
         }
         let (h, t) = (self.cfg.hidden, tables.kv_slots.len());
         let (slot, capacity) = if tables.decode { (&self.decode_workspace, DECODE_ROWS) } else { (&self.workspace, self.prefill_rows) };
-        if slot.borrow().as_ref().is_some_and(|w| w.logit_rows < logit_rows) {
+        if slot.borrow().as_ref().is_some_and(|w| w.logit_rows < logit_rows || w.rows < capacity) {
             *slot.borrow_mut() = None;
         }
         if slot.borrow().is_none() {
@@ -2491,6 +2772,7 @@ impl<'a> Qwen4Engine<'a> {
         }
         let workspace = slot.borrow();
         let w = workspace.as_ref().context("workspace")?;
+        w.position.set(tables.positions.first().copied().unwrap_or(0) as usize);
         ensure!(t <= w.rows && logit_rows <= t, "step exceeds the workspace");
         self.begin_staging(w)?;
         self.stage_table(w, &w.positions, &tables.positions)?;
@@ -2506,9 +2788,9 @@ impl<'a> Qwen4Engine<'a> {
         match self.ple.as_ref().map(|p| p.mapped()) {
             // Gathers while the layers before the PLE layer are enqueued (`finish_ple`).
             Some(mapped) => {
-                // A failed step's rows are dropped (their gather waited) first.
+                // Cancel unsubmitted rows without waiting on page faults.
                 drop(self.ple_pending.borrow_mut().take());
-                *self.ple_pending.borrow_mut() = Some(mapped.begin(&tables.ple_ids, tables.decode)?);
+                *self.ple_pending.borrow_mut() = Some(mapped.begin(Arc::clone(tables) as Arc<dyn crate::shared::mapped_table::RowSource>, tables.decode)?);
             }
             None => self.stage_table(w, &w.ple_ids, &tables.ple_ids)?,
         }
@@ -2574,8 +2856,7 @@ impl<'a> Qwen4Engine<'a> {
         }
         self.last_streams.set((tables.decode, cur));
         if layers.len() < self.cfg.layers {
-            // SAFETY: the engine owns this stream.
-            unsafe { self.library.cuda_stream_synchronize(self.execution_stream())? };
+            self.drain_partial_step()?;
             return Ok(None);
         }
         self.head(w, &w.streams[cur], t, rows, logit_rows)?;
@@ -2603,7 +2884,7 @@ impl<'a> Qwen4Engine<'a> {
     /// Unfused ownership transitions: post on the old owner, hop, then pre on
     /// the new owner. Same-owner boundaries retain the fused post/pre path.
     #[allow(clippy::too_many_arguments)]
-    fn step_placed(&self, tables: &StepTables, tokens: &[u32], logit_rows: usize, mut on_layer: LayerHook<'_>,
+    fn step_placed(&self, tables: &Arc<StepTables>, tokens: &[u32], logit_rows: usize, mut on_layer: LayerHook<'_>,
         forced: Forced<'_>, media: &cuteafd_engine::media::MediaChunk, graphs: bool) -> Result<Option<DeviceLogits>> {
         let graphed = graphs && self.use_graphs && tables.decode
             && on_layer.is_none() && forced.is_none() && media.indices.is_empty();
@@ -2614,7 +2895,7 @@ impl<'a> Qwen4Engine<'a> {
         for owner in 0..2 {
             self.on_owner(owner, || {
                 let slot = self.workspace_slot(owner, tables.decode)?;
-                if slot.borrow().as_ref().is_some_and(|w| w.logit_rows < logit_rows) {
+                if slot.borrow().as_ref().is_some_and(|w| w.logit_rows < logit_rows || w.rows < capacity) {
                     self.drain_state()?;
                     *slot.borrow_mut() = None;
                 }
@@ -2633,7 +2914,7 @@ impl<'a> Qwen4Engine<'a> {
         let work = [root.as_ref().context("root workspace")?, peer.as_ref().context("peer workspace")?];
         if let Some(mapped) = self.ple.as_ref().map(|p| p.mapped()) {
             drop(self.ple_pending.borrow_mut().take());
-            *self.ple_pending.borrow_mut() = Some(mapped.begin(&tables.ple_ids, tables.decode)?);
+            *self.ple_pending.borrow_mut() = Some(mapped.begin(Arc::clone(tables) as Arc<dyn crate::shared::mapped_table::RowSource>, tables.decode)?);
         }
         self.on_owner(0, || {
             self.stage_embedding(work[0], tokens, HC, &work[0].streams[0], graphed)?;
@@ -2707,7 +2988,7 @@ impl<'a> Qwen4Engine<'a> {
             // SAFETY: exit wait precedes the head/MTP owner-zero stream copy.
             unsafe { self.library.copy_d2d_async(dst, src, t * HC * h * 2, self.execution_stream())?; }
             self.last_streams.set((tables.decode, cur[0]));
-            if layers.len() < self.cfg.layers { self.drain_state()?; return Ok(None); }
+            if layers.len() < self.cfg.layers { self.drain_partial_step()?; return Ok(None); }
             self.head(work[0], &work[0].streams[cur[0]], t, rows, logit_rows)?;
             Ok(Some(self.device_logits(work[0], logit_rows, false)))
         })
@@ -2755,7 +3036,7 @@ impl<'a> Qwen4Engine<'a> {
                     if index == 0 && self.embedding.device_gather() {
                         // SAFETY: staged token ids and persistent root streams cover this graph bucket.
                         unsafe { self.embedding.gather(w.ids.buffer.ptr, std::ptr::null(), t, HC,
-                            std::ptr::null(), w.streams[0].buffer.ptr, self.execution_stream())?; }
+                            std::ptr::null(), w.live(&w.streams[0], HC * self.cfg.hidden * 2), self.execution_stream())?; }
                     }
                     if index == 0 || boundary {
                         self.enter(w, &mut c, None, layer, index, rows, tables.spec)?;
@@ -2812,7 +3093,7 @@ impl<'a> Qwen4Engine<'a> {
                 Ok(())
             })?;
             self.last_streams.set((true, cur[0]));
-            if n < self.cfg.layers { self.drain_state()?; return Ok(None); }
+            if n < self.cfg.layers { self.drain_partial_step()?; return Ok(None); }
             if !head { self.head(work[0], &work[0].streams[cur[0]], t, rows, logit_rows)?; }
             Ok(Some(self.device_logits(work[0], logit_rows, head)))
         })
@@ -2823,12 +3104,12 @@ impl<'a> Qwen4Engine<'a> {
     fn head(&self, w: &Workspace<'_>, streams: &Dev<'_>, t: usize, rows: Scalar, logit_rows: usize) -> Result<()> {
         let h = self.cfg.hidden;
         let [norm, down, up] = &self.weights.mixer;
-        self.run("qwen4_head", &[("streams", streams.buffer.ptr), ("norm", norm.buffer.ptr),
-            ("w_down", down.buffer.ptr), ("w_up", up.buffer.ptr), ("out", w.x.buffer.ptr),
+        self.run("qwen4_head", &[("streams", w.live(streams, HC * self.cfg.hidden * 2)), ("norm", norm.buffer.ptr),
+            ("w_down", down.buffer.ptr), ("w_up", up.buffer.ptr), ("out", w.live(&w.x, self.cfg.hidden * 2)),
             ("scratch", w.scratch.buffer.ptr)], &[rows])?;
         ensure!(logit_rows <= t, "{logit_rows} logits rows of a {t}-row step");
         // SAFETY: row t - logit_rows of the [t, H] mixer output lies inside `x`.
-        let x = unsafe { w.x.buffer.ptr.cast::<u8>().add((t - logit_rows) * h * 2) }.cast();
+        let x = unsafe { w.live(&w.x, self.cfg.hidden * 2).cast::<u8>().add((t - logit_rows) * h * 2) }.cast();
         self.logits(w, x, logit_rows)
     }
 
@@ -2845,12 +3126,12 @@ impl<'a> Qwen4Engine<'a> {
             // SAFETY: `x` holds `rows` head inputs; the head and the logits rows are live buffers of these shapes.
             Qwen4Head::Bf16(head) => unsafe {
                 crate::shared::target_head::launch(crate::shared::target_head::TargetHead::configured(), &w.head,
-                    x.cast_const(), head.buffer.ptr.cast_const(), w.logits.buffer.ptr.cast(), rows, self.execution_stream())
+                    x.cast_const(), head.buffer.ptr.cast_const(), Self::region(&w.logits, w.logit_offset.get() * vocab * 4, rows * vocab * 4).ptr.cast(), rows, self.execution_stream())
             },
             Qwen4Head::Fp8 { values, scales } => {
                 for (first, n) in fp8_head_spans(rows) {
                     let input = x.cast::<u8>().wrapping_add(first * h * 2).cast();
-                    let out = Self::region(&w.logits, first * vocab * 4, n * vocab * 4).ptr;
+                    let out = Self::region(&w.logits, (w.logit_offset.get() + first) * vocab * 4, n * vocab * 4).ptr;
                     self.run("qwen4_head_fp8", &[("x", input), ("w_fp8", values.buffer.ptr),
                         ("scale", scales.buffer.ptr), ("logits", out)], &[Scalar::I32(n as i32)])?;
                 }
@@ -2872,6 +3153,9 @@ impl<'a> Qwen4Engine<'a> {
     /// The first `rows` logits rows as device logits (`greedy`: with the rows'
     /// selection from [`Self::select_greedy`]).
     fn device_logits(&self, w: &Workspace<'_>, rows: usize, greedy: bool) -> DeviceLogits {
+        if let Some(ple) = &self.ple {
+            ple.mapped().bind_readback(w.logits.buffer.device_id, self.execution_stream());
+        }
         let vocab = self.cfg.vocab_size;
         DeviceLogits { ptr: w.logits.buffer.ptr, rows, vocab, stride: vocab, stream: self.execution_stream(),
             greedy: greedy.then(|| (w.select.buffer.ptr.cast_const(), Self::region(&w.select, rows * 4, rows * 4).ptr
@@ -2880,6 +3164,7 @@ impl<'a> Qwen4Engine<'a> {
 
     /// The first `rows` logits rows through the pinned landing buffer.
     fn download_logits(&self, w: &Workspace<'_>, rows: usize) -> Result<Vec<f32>> {
+        if let Some(ple) = &self.ple { ple.mapped().bind_readback(w.logits.buffer.device_id, self.execution_stream()); }
         let n = rows * self.cfg.vocab_size;
         let host = w.logits_host.borrow();
         ensure!(n * 4 <= host.buffer.bytes, "logits rows exceed the landing buffer");
@@ -2887,6 +3172,7 @@ impl<'a> Qwen4Engine<'a> {
         unsafe {
             self.library.copy_d2h_host_buffer_async(host.buffer, w.logits.buffer, n * 4, self.execution_stream())?;
             self.library.cuda_stream_synchronize(self.execution_stream())?;
+            crate::shared::mapped_table::check_readback(self.library.cuda_get_device()?, self.execution_stream())?;
             Ok(std::slice::from_raw_parts(host.buffer.ptr.cast::<f32>(), n).to_vec())
         }
     }
@@ -2933,7 +3219,7 @@ impl<'a> Qwen4Engine<'a> {
                 if index == 0 && gather {
                     // SAFETY: the step's ids are staged before the replay; the streams hold its rows.
                     unsafe { self.embedding.gather(w.ids.buffer.ptr, std::ptr::null(), t, HC, std::ptr::null(),
-                        w.streams[0].buffer.ptr, self.execution_stream())? };
+                        w.live(&w.streams[0], HC * self.cfg.hidden * 2), self.execution_stream())? };
                 }
                 if index == 0 {
                     self.enter(w, &mut c, None, layer, index, rows, spec)?;
@@ -2980,8 +3266,7 @@ impl<'a> Qwen4Engine<'a> {
         }
         self.last_streams.set((true, cur));
         if layers.len() < self.cfg.layers {
-            // SAFETY: the engine owns this stream.
-            unsafe { self.library.cuda_stream_synchronize(self.execution_stream())? };
+            self.drain_partial_step()?;
             return Ok(None);
         }
         if !head {
@@ -3035,8 +3320,8 @@ impl<'a> Qwen4Engine<'a> {
         if self.cfg.ple_layers.contains(&index) {
             self.ple(w, &w.streams[*cur], layer, rows, spec)?;
         }
-        self.run("qwen4_hc_pre", &[("residual", w.streams[*cur].buffer.ptr), ("norm", norm), ("w_di", di),
-            ("w_up", up), ("y", w.x.buffer.ptr), ("inject", w.inject.buffer.ptr), ("scratch", w.scratch.buffer.ptr)],
+        self.run("qwen4_hc_pre", &[("residual", w.live(&w.streams[*cur], HC * self.cfg.hidden * 2)), ("norm", norm), ("w_di", di),
+            ("w_up", up), ("y", w.live(&w.x, self.cfg.hidden * 2)), ("inject", w.live(&w.inject, HC * 2)), ("scratch", w.scratch.buffer.ptr)],
             &[rows])
     }
 
@@ -3044,22 +3329,22 @@ impl<'a> Qwen4Engine<'a> {
     /// to the other buffer), then `site`'s input from them.
     fn post_pre(&self, w: &Workspace<'_>, cur: usize, layer: &Qwen4Layer<'_>, site: &str, rows: Scalar) -> Result<()> {
         let [norm, di, up] = Self::site(layer, site)?;
-        self.run("qwen4_hc_post_pre", &[("x", w.delta.buffer.ptr), ("residual", w.streams[cur].buffer.ptr),
-            ("inject", w.inject.buffer.ptr), ("norm", norm), ("w_di", di), ("w_up", up),
-            ("residual_out", w.streams[cur ^ 1].buffer.ptr), ("y", w.x.buffer.ptr), ("scratch", w.scratch.buffer.ptr)],
+        self.run("qwen4_hc_post_pre", &[("x", w.live(&w.delta, self.cfg.hidden * 2)), ("residual", w.live(&w.streams[cur], HC * self.cfg.hidden * 2)),
+            ("inject", w.live(&w.inject, HC * 2)), ("norm", norm), ("w_di", di), ("w_up", up),
+            ("residual_out", w.live(&w.streams[cur ^ 1], HC * self.cfg.hidden * 2)), ("y", w.live(&w.x, self.cfg.hidden * 2)), ("scratch", w.scratch.buffer.ptr)],
             &[rows])
     }
 
     /// `delta` into streams `cur` alone (written to the other buffer).
     fn post(&self, w: &Workspace<'_>, cur: &mut usize, rows: Scalar) -> Result<()> {
-        self.run("qwen4_hc_post", &[("x", w.delta.buffer.ptr), ("residual", w.streams[*cur].buffer.ptr),
-            ("inject", w.inject.buffer.ptr), ("out", w.streams[*cur ^ 1].buffer.ptr)], &[rows])?;
+        self.run("qwen4_hc_post", &[("x", w.live(&w.delta, self.cfg.hidden * 2)), ("residual", w.live(&w.streams[*cur], HC * self.cfg.hidden * 2)),
+            ("inject", w.live(&w.inject, HC * 2)), ("out", w.live(&w.streams[*cur ^ 1], HC * self.cfg.hidden * 2))], &[rows])?;
         *cur ^= 1;
         Ok(())
     }
 
-    /// Mapped PLE table: waits for the step's rows and queues their upload
-    /// (outside any graph capture, before the PLE layer's work).
+    /// Device-order the gathered rows before PLE, outside graph capture.
+    /// The issuer does not wait for host gathers or staging reuse.
     fn finish_ple(&self, w: &Workspace<'_>) -> Result<()> {
         let (Some(mapped), Some((rows, _))) = (self.ple.as_ref().map(|p| p.mapped()), &w.ple_rows) else {
             return Ok(());
@@ -3079,7 +3364,7 @@ impl<'a> Qwen4Engine<'a> {
         // Mapped: the step's rows were gathered in id order, so identity ids read them.
         let (gathered, local) = w.ple_rows.as_ref().context("PLE layer without gathered-row workspace")?;
         let (ids, gathered) = (local.buffer.ptr, gathered.buffer.ptr);
-        self.run(name, &[("streams", streams.buffer.ptr), ("ids", ids), ("table", gathered),
+        self.run(name, &[("streams", w.live(streams, HC * self.cfg.hidden * 2)), ("ids", ids), ("table", gathered),
             ("scale", table.scale.buffer.ptr), ("w_kv", layer.ptr("ple.w_kv")?),
             ("norm_key", layer.ptr("ple.norm_key")?), ("norm_query", layer.ptr("ple.norm_query")?),
             ("norm_conv", layer.ptr("ple.norm_conv")?), ("conv_w", layer.ptr("ple.conv_w")?),
@@ -3130,13 +3415,13 @@ impl<'a> Qwen4Engine<'a> {
     fn gdn(&self, w: &Workspace<'_>, index: usize, layer: &Qwen4Layer<'_>, rows: Scalar, cap: &str, spec: bool)
         -> Result<()> {
         let [conv, state, replay] = self.gdn_pools(index)?;
-        let mut pointers = vec![("x", w.x.buffer.ptr)];
+        let mut pointers = vec![("x", w.live(&w.x, self.cfg.hidden * 2))];
         pointers.extend(Self::projection(layer, "w_in")?);
         pointers.extend([("conv_w", layer.ptr("conv_w")?), ("a_log", layer.ptr("a_log")?),
             ("dt_bias", layer.ptr("dt_bias")?), ("norm_w", layer.ptr("norm_w")?)]);
         pointers.extend(Self::projection(layer, "w_out")?);
         pointers.extend([("conv_state", conv), ("state", state), ("slots", w.slots.buffer.ptr),
-            ("seq_first", w.seq_first.buffer.ptr), ("out", w.delta.buffer.ptr)]);
+            ("seq_first", w.seq_first.buffer.ptr), ("out", w.live(&w.delta, self.cfg.hidden * 2))]);
         // Decode capacities record speculative replay inputs (spec) or advance the state.
         let decode = cap == "m64";
         if decode {
@@ -3164,7 +3449,7 @@ impl<'a> Qwen4Engine<'a> {
     #[allow(clippy::too_many_arguments)]
     fn attend(&self, w: &Workspace<'_>, layer: &Qwen4Layer<'_>, cache: *mut c_void, keys: *mut c_void,
         blocks: *mut c_void, rows: Scalar, cap: &str, tables: &StepTables) -> Result<()> {
-        let mut pointers = vec![("x", w.x.buffer.ptr)];
+        let mut pointers = vec![("x", w.live(&w.x, self.cfg.hidden * 2))];
         pointers.extend(Self::projection(layer, "w_in")?);
         pointers.extend([("q_norm", layer.ptr("q_norm")?), ("k_norm", layer.ptr("k_norm")?),
             ("iq_norm", layer.ptr("iq_norm")?), ("ik_norm", layer.ptr("ik_norm")?),
@@ -3189,7 +3474,7 @@ impl<'a> Qwen4Engine<'a> {
                 Scalar::I32(self.attention_plan.rows() as i32)])?;
         let mut pointers = vec![("attn", w.attn.buffer.ptr), ("gate", w.gate.buffer.ptr)];
         pointers.extend(Self::projection(layer, "w_o")?);
-        pointers.extend([("out", w.delta.buffer.ptr), ("scratch", w.scratch.buffer.ptr)]);
+        pointers.extend([("out", w.live(&w.delta, self.cfg.hidden * 2)), ("scratch", w.scratch.buffer.ptr)]);
         self.run(&Self::program(layer, "attn_o", cap), &pointers, &self.w8_scalars(layer, rows, cap))
     }
 
@@ -3207,14 +3492,14 @@ impl<'a> Qwen4Engine<'a> {
         let h = self.cfg.hidden;
         let experts = self.experts.as_ref().with_context(|| format!(
             "layer {index} needs routed experts: pass --local-experts, Spark --peers or --shared-only"))?;
-        self.run("qwen4_router_scores", &[("x", w.x.buffer.ptr), ("w", layer.ptr("gate")?),
+        self.run("qwen4_router_scores", &[("x", w.live(&w.x, self.cfg.hidden * 2)), ("w", layer.ptr("gate")?),
             ("logits", w.router_logits.buffer.ptr)], &[rows])?;
         // SAFETY: logits and route outputs are live buffers of `t` rows.
         unsafe {
             self.library.router_select_softmax(w.router_logits.buffer.ptr, w.route_ids.buffer.ptr,
                 w.route_weights.buffer.ptr, t, self.cfg.experts, self.cfg.topk, 1.0, true, self.execution_stream())?;
         }
-        // Spark layers run the shared expert during the exchange (spark_moe).
+        // Spark layers run the shared expert during the exchange (wave_send).
         if !matches!(experts, Experts::Spark { .. }) || index == self.cfg.layers {
             self.shared(w, layer, rows)?;
         }
@@ -3228,17 +3513,17 @@ impl<'a> Qwen4Engine<'a> {
             && !(self.spark_bf16 && index < self.cfg.layers);
         if tp2_wire || spark_wire {
             let grid = self.quantize_grids[self.active_owner.get()].blocks(t, h);
-            self.run("qwen4_expert_input_quant", &[("source_ptr", w.x.buffer.ptr), ("values_ptr", w.wire.buffer.ptr),
+            self.run("qwen4_expert_input_quant", &[("source_ptr", w.live(&w.x, self.cfg.hidden * 2)), ("values_ptr", w.wire.buffer.ptr),
                 // SAFETY: the scale rows follow the payload inside each wire row.
                 ("scale_rows_ptr", unsafe { w.wire.buffer.ptr.cast::<u8>().add(h) }.cast()),
-                ("scale_mma_ptr", w.delta.buffer.ptr)], &[rows, Scalar::I32(grid as i32)])?;
+                ("scale_mma_ptr", w.live(&w.delta, self.cfg.hidden * 2))], &[rows, Scalar::I32(grid as i32)])?;
         }
         Ok(())
     }
 
     fn shared(&self, w: &Workspace<'_>, layer: &Qwen4Layer<'_>, rows: Scalar) -> Result<()> {
-        self.run("qwen4_shared", &[("x", w.x.buffer.ptr), ("w_gate_up", layer.ptr("shared.w_gate_up")?),
-            ("w_down", layer.ptr("shared.w_down")?), ("out", w.shared.buffer.ptr), ("scratch", w.scratch.buffer.ptr)],
+        self.run("qwen4_shared", &[("x", w.live(&w.x, self.cfg.hidden * 2)), ("w_gate_up", layer.ptr("shared.w_gate_up")?),
+            ("w_down", layer.ptr("shared.w_down")?), ("out", w.live(&w.shared, self.cfg.hidden * 2)), ("scratch", w.scratch.buffer.ptr)],
             &[rows])
     }
 
@@ -3250,17 +3535,17 @@ impl<'a> Qwen4Engine<'a> {
             Experts::Tp2 { routed, mtp } => {
                 if index < self.cfg.layers {
                     let mut routed = routed.borrow_mut();
-                    let input = if routed.wire { w.wire.buffer.ptr } else { w.x.buffer.ptr };
+                    let input = if routed.wire { w.wire.buffer.ptr } else { w.live(&w.x, self.cfg.hidden * 2) };
                     // SAFETY: all owner buffers persist and were produced on this layer's stream.
                     return unsafe { routed.enqueue(self.active_owner.get(), index, t, input,
                         crate::shared::experts::rtx::Routes { ids: w.route_ids.buffer.ptr, weights: w.route_weights.buffer.ptr },
-                        w.shared.buffer.ptr, w.delta.buffer.ptr) };
+                        w.live(&w.shared, self.cfg.hidden * 2), w.live(&w.delta, self.cfg.hidden * 2)) };
                 }
                 match mtp.as_ref().context("Qwen TP2 MTP experts missing")? {
                     MtpExperts::Fp8(experts) => {
                         let resident = experts.index_of(index)?;
                         // SAFETY: MTP owner-zero buffers and resident package persist on this stream.
-                        unsafe { experts.run(resident, t, w.x.buffer.ptr, w.route_ids.buffer.ptr,
+                        unsafe { experts.run(resident, t, w.live(&w.x, self.cfg.hidden * 2), w.route_ids.buffer.ptr,
                             w.route_weights.buffer.ptr, w.routed.buffer.ptr, self.execution_stream())?; }
                     }
                     MtpExperts::Exl3(experts) => {
@@ -3269,8 +3554,8 @@ impl<'a> Qwen4Engine<'a> {
                         unsafe {
                             experts.run(crate::families::deepseek_v4::local::LocalLayer::Stage(0), t,
                                 w.wire.buffer.ptr, w.route_ids.buffer.ptr, w.route_weights.buffer.ptr,
-                                w.shared.buffer.ptr, self.execution_stream())?;
-                            self.library.copy_d2d_async(w.delta.buffer, experts.output.buffer, t * h * 2, self.execution_stream())?;
+                                w.live(&w.shared, self.cfg.hidden * 2), self.execution_stream())?;
+                            self.library.copy_d2d_async(w.live_buffer(&w.delta, self.cfg.hidden * 2), experts.output.buffer, t * h * 2, self.execution_stream())?;
                         }
                         return Ok(());
                     }
@@ -3292,7 +3577,7 @@ impl<'a> Qwen4Engine<'a> {
                 // SAFETY: input rows, route ids, weights and the output are live
                 // buffers of `t` rows on this engine's stream.
                 unsafe {
-                    fp8.run(resident, t, w.x.buffer.ptr, w.route_ids.buffer.ptr, w.route_weights.buffer.ptr,
+                    fp8.run(resident, t, w.live(&w.x, self.cfg.hidden * 2), w.route_ids.buffer.ptr, w.route_weights.buffer.ptr,
                         w.routed.buffer.ptr, self.execution_stream())?;
                 }
                 if local.window.is_some() {
@@ -3315,21 +3600,24 @@ impl<'a> Qwen4Engine<'a> {
                 // stream order; the output is copied before the window can change.
                 unsafe {
                     experts.run(layer, t, w.wire.buffer.ptr,
-                        w.route_ids.buffer.ptr, w.route_weights.buffer.ptr, w.shared.buffer.ptr, self.execution_stream())?;
-                    self.library.copy_d2d_async(w.delta.buffer, experts.output.buffer, t * h * 2, self.execution_stream())?;
+                        w.route_ids.buffer.ptr, w.route_weights.buffer.ptr, w.live(&w.shared, self.cfg.hidden * 2), self.execution_stream())?;
+                    self.library.copy_d2d_async(w.live_buffer(&w.delta, self.cfg.hidden * 2), experts.output.buffer, t * h * 2, self.execution_stream())?;
                 }
                 return Ok(());
             }
-            Experts::Spark { transport, runtime, mtp } => {
+            Experts::Spark { transport, mtp } => {
                 if index < self.cfg.layers {
-                    return self.spark_moe(w, index, t, rows, decode, &mut transport.borrow_mut(), runtime);
+                    let mut link = transport.borrow_mut();
+                    let exchange = link.exchange()?;
+                    let wave = self.wave_send(w, index, t, rows, decode, exchange)?;
+                    return self.wave_land(w, t, wave, exchange);
                 }
                 ensure!(index == self.cfg.layers, "unknown Qwen expert layer {index}");
                 match mtp.as_ref().context("Spark backbone needs coordinator-local MTP experts (--mtp)")? {
                     MtpExperts::Fp8(experts) => {
                         let resident = experts.index_of(index)?;
                         // SAFETY: MTP input/routes and its output are live on this stream.
-                        unsafe { experts.run(resident, t, w.x.buffer.ptr, w.route_ids.buffer.ptr,
+                        unsafe { experts.run(resident, t, w.live(&w.x, self.cfg.hidden * 2), w.route_ids.buffer.ptr,
                             w.route_weights.buffer.ptr, w.routed.buffer.ptr, self.execution_stream())? };
                     }
                     MtpExperts::Exl3(experts) => {
@@ -3339,8 +3627,8 @@ impl<'a> Qwen4Engine<'a> {
                         unsafe {
                             experts.run(crate::families::deepseek_v4::local::LocalLayer::Stage(0), t,
                                 w.wire.buffer.ptr, w.route_ids.buffer.ptr, w.route_weights.buffer.ptr,
-                                w.shared.buffer.ptr, self.execution_stream())?;
-                            self.library.copy_d2d_async(w.delta.buffer, experts.output.buffer, t * h * 2, self.execution_stream())?;
+                                w.live(&w.shared, self.cfg.hidden * 2), self.execution_stream())?;
+                            self.library.copy_d2d_async(w.live_buffer(&w.delta, self.cfg.hidden * 2), experts.output.buffer, t * h * 2, self.execution_stream())?;
                         }
                         return Ok(());
                     }
@@ -3348,88 +3636,350 @@ impl<'a> Qwen4Engine<'a> {
             }
             Experts::SharedOnly => {
                 // SAFETY: both are live [t, H] BF16 buffers ordered on the stream.
-                unsafe { self.library.copy_d2d_async(w.delta.buffer, w.shared.buffer, t * h * 2, self.execution_stream())? };
+                unsafe { self.library.copy_d2d_async(w.live_buffer(&w.delta, self.cfg.hidden * 2), w.live_buffer(&w.shared, self.cfg.hidden * 2), t * h * 2, self.execution_stream())? };
                 return Ok(());
             }
         }
-        self.run("qwen4_add", &[("a", w.routed.buffer.ptr), ("b", w.shared.buffer.ptr), ("out", w.delta.buffer.ptr)],
+        self.run("qwen4_add", &[("a", w.routed.buffer.ptr), ("b", w.live(&w.shared, self.cfg.hidden * 2)), ("out", w.live(&w.delta, self.cfg.hidden * 2))],
             &[rows])
     }
 
-    /// Routes and wire rows down, one request to every Spark rank, the BF16
-    /// rank partials and the shared expert summed into `delta`.
-    #[allow(clippy::too_many_arguments)]
-    fn spark_moe(&self, w: &Workspace<'_>, index: usize, t: usize, rows: Scalar, decode: bool,
-        transport: &mut SparkLink<'_>,
-        runtime: &tokio::runtime::Runtime) -> Result<()> {
+    /// A wave on the link's exchange: router outputs and wire rows copy into
+    /// the wave slot's pinned staging, the shared expert (and in a decode
+    /// step the L2 prefetch) queues behind them, and the worker builds and
+    /// posts the request once the copies complete. This thread does not wait
+    /// for the GPU. Complete with [`Self::wave_land`].
+    fn wave_send(&self, w: &Workspace<'_>, index: usize, t: usize, rows: Scalar, decode: bool,
+        exchange: &mut crate::shared::spark_waves::Waves<'_>) -> Result<crate::shared::spark_waves::WaveTicket> {
         let kind = if decode { ExpertV2SourceKind::Decode } else { ExpertV2SourceKind::Prefill };
-        let (h, topk) = (self.cfg.hidden, self.cfg.topk);
-        let (route_bytes, wire_bytes) = (t * topk * 4, t * (if self.spark_bf16 { h * 2 } else { h + h / 32 }));
-        let staging = w.router_host.borrow_mut();
-        let host = staging.buffer;
-        let at = |offset: usize| cuteafd_ffi::CuteafdHostBuffer {
-            // SAFETY: ids, weights and wire rows are consecutive inside the pinned buffer.
-            ptr: unsafe { host.ptr.cast::<u8>().add(offset) }.cast(),
-            bytes: host.bytes - offset,
-            ..host
+        let (h, topk, bf16) = (self.cfg.hidden, self.cfg.topk, self.spark_bf16);
+        let layout = crate::shared::experts::staging::RouteStaging::new(t, topk, if bf16 { h * 2 } else { h + h / 32 })?;
+        ensure!(exchange.ranks() <= MAX_RANKS, "{} Spark ranks exceed the reduction planes", exchange.ranks());
+        let sized = |buffer: cuteafd_ffi::CuteafdDeviceBuffer, bytes: usize| cuteafd_ffi::CuteafdDeviceBuffer { bytes, ..buffer };
+        let input = if bf16 { w.live_buffer(&w.x, h * 2) } else { w.wire.buffer };
+        let request_id = self.request_id.get();
+        self.request_id.set(request_id.checked_add(1).context("Qwen Spark request id overflow")?);
+        let position = w.position.get();
+        // SAFETY: ids, weights and input rows hold this wave's `t` rows in
+        // stream order; the copies read them before later stream work.
+        let ticket = unsafe {
+            exchange.send(t, layout, [sized(w.route_ids.buffer, layout.route_bytes),
+                sized(w.route_weights.buffer, layout.route_bytes), sized(input, layout.wire_bytes)],
+                self.execution_stream(), Box::new(move |routes, wire| {
+                    let mut request = ExpertProtocolV2Request::new_bytes(request_id, 17, index as u32, h as u32,
+                        if bf16 { ExpertV2Dtype::Bf16 } else { ExpertV2Dtype::Fp8E4m3Ue8m0K32 },
+                        (0..t as u32).map(|row| ExpertProtocolV2RowDescriptor {
+                            row_id: u64::from(row), source_kind: kind, source_request_id: 1,
+                            token_position: (position + row as usize) as u64, route_offset: row * topk as u32,
+                            route_count: topk as u32,
+                        }).collect(),
+                        routes, wire)?;
+                    request.header.flags |= EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16;
+                    Ok(request)
+                }))?
         };
-        let timer = std::time::Instant::now();
-        // SAFETY: the pinned regions are large enough; the sync completes them.
-        unsafe {
-            self.library.copy_d2h_host_buffer_async(at(0), w.route_ids.buffer, route_bytes, self.execution_stream())?;
-            self.library.copy_d2h_host_buffer_async(at(route_bytes), w.route_weights.buffer, route_bytes, self.execution_stream())?;
-            self.library.copy_d2h_host_buffer_async(at(2 * route_bytes), if self.spark_bf16 { w.x.buffer } else { w.wire.buffer }, wire_bytes, self.execution_stream())?;
-            self.library.cuda_event_record(self.routes_ready, self.execution_stream())?;
-        }
-        // The shared expert queues behind the copies and runs during the
-        // exchange (the L2 prefetch behind it); the host waits for the copies only.
+        // The shared expert runs during the exchange (the L2 prefetch behind it).
         self.shared(w, &self.weights.layers[index], rows)?;
         self.exchange_window(index, decode, false)?;
-        // SAFETY: the event was recorded on this engine's stream above.
-        unsafe { self.library.cuda_event_synchronize(self.routes_ready)? };
-        self.profile.borrow_mut()[0] += timer.elapsed().as_secs_f64();
-        let staged = staging.bytes();
-        if let Some(probe) = self.draft_probes.borrow_mut().get_mut(self.active_owner.get()) {
-            probe.staged(index, &staged[..route_bytes]);
-        }
-        let word = |offset: usize, i: usize| u32::from_le_bytes(staged[offset + i * 4..][..4].try_into().unwrap());
-        let routes = (0..t * topk).map(|i| ExpertProtocolV2RouteEntry {
-            row_index: (i / topk) as u32, expert_id: word(0, i), gate_weight: f32::from_bits(word(route_bytes, i)),
-        }).collect();
-        let wire = staged[2 * route_bytes..2 * route_bytes + wire_bytes].to_vec();
-        drop(staging);
-        let mut request = ExpertProtocolV2Request::new(index as u64 + 1, 17, index as u32, h as u32,
-            if self.spark_bf16 { ExpertV2Dtype::Bf16 } else { ExpertV2Dtype::Fp8E4m3Ue8m0K32 },
-            (0..t as u32).map(|row| ExpertProtocolV2RowDescriptor {
-                row_id: u64::from(row), source_kind: kind, source_request_id: 1,
-                token_position: u64::from(row), route_offset: row * topk as u32, route_count: topk as u32,
-            }).collect(),
-            routes, wire)?;
-        request.header.flags |= EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16;
-        let ranks = transport.world_size();
-        ensure!(ranks <= MAX_RANKS, "{ranks} Spark ranks exceed the reduction planes");
-        let timer = std::time::Instant::now();
-        runtime.block_on(async {
-            let wave = transport.dispatch(&request)?;
-            transport.receive(wave, t, self.execution_stream()).await
-        })?;
-        self.profile.borrow_mut()[1] += timer.elapsed().as_secs_f64();
+        Ok(ticket)
+    }
+
+    /// The land half of [`Self::wave_send`]: the stream waits for the wave's
+    /// planes and sums them with the shared expert into `delta`.
+    fn wave_land(&self, w: &Workspace<'_>, t: usize, wave: crate::shared::spark_waves::WaveTicket,
+        exchange: &mut crate::shared::spark_waves::Waves<'_>) -> Result<()> {
+        let slot = wave.slot();
+        exchange.land(wave, self.execution_stream())?;
         // SAFETY: the shared-expert plane and `delta` are live [t, h] BF16
-        // buffers; the intake planes are ordered after the wave by `receive`.
+        // buffers; the slot's planes are ordered after the wave by `land`.
         unsafe {
-            transport.reduce(w.shared.buffer.ptr.cast(), w.delta.buffer.ptr.cast(), t, self.execution_stream())?;
-            self.library.cuda_stream_synchronize(self.execution_stream())
+            exchange.reduce(slot, w.live(&w.shared, self.cfg.hidden * 2).cast(),
+                w.live(&w.delta, self.cfg.hidden * 2).cast(), t, self.execution_stream())
         }
+    }
+
+    /// Bytes of the widest prefill wave's pinned staging (routes and wire rows).
+    fn wave_staging_bytes(&self, rows: usize) -> Result<usize> {
+        let h = self.cfg.hidden;
+        Ok(crate::shared::experts::staging::RouteStaging::new(rows, self.cfg.topk,
+            if self.spark_bf16 { h * 2 } else { h + h / 32 })?.bytes)
+    }
+}
+
+/// Live rows survive hooks in slot planes; all tables and scratch are shared
+/// and rewritten on the execution stream before the hook that consumes them.
+struct UnitHooks<'e, 'w, 'p, 't, 'a, 'r, 'n> {
+    engine: &'e Qwen4Engine<'a>,
+    /// The Spark link's exchange.
+    transport: Option<&'r mut crate::shared::spark_waves::Waves<'n>>,
+    w: &'w Workspace<'a>,
+    placement: &'p Qwen4Placement,
+    tokens: &'t [u32],
+    tables: Arc<Vec<StepTables>>,
+    ple_batch: Option<Arc<crate::shared::mapped_table::RowBatch>>,
+    current: Vec<usize>,
+    entered: Vec<bool>,
+    pending: Vec<Option<crate::shared::mapped_table::PendingRows>>,
+    logit_rows: usize,
+}
+
+impl Drop for UnitHooks<'_, '_, '_, '_, '_, '_, '_> {
+    fn drop(&mut self) {
+        if let Some(batch) = &self.ple_batch { batch.cancel_unbegun(); }
+    }
+}
+
+impl UnitHooks<'_, '_, '_, '_, '_, '_, '_> {
+    fn select(&self, unit: &crate::shared::prefill_pipeline::Unit) -> Result<()> {
+        let shape = self.engine.prefill_shape.context("Qwen prefill shape")?;
+        self.w.row_offset.set(Workspace::unit_offset(unit.slot, shape.unit_rows as usize));
+        self.w.position.set(self.tables[unit.index].positions[0] as usize);
+        self.engine.stage_step_tables(self.w, &self.tables[unit.index])
+    }
+
+    fn enter(&mut self, index: usize, unit: &crate::shared::prefill_pipeline::Unit, posted: bool) -> Result<()> {
+        let engine = self.engine;
+        if engine.cfg.ple_layers.contains(&index) {
+            *engine.ple_pending.borrow_mut() = self.pending[unit.index].take();
+            engine.finish_ple(self.w)?;
+        }
+        engine.enter(self.w, &mut self.current[unit.index], posted.then_some(()),
+            &engine.weights.layers[index], index, Scalar::I32(unit.rows.len() as i32), false)?;
+        self.entered[unit.index] = true;
+        Ok(())
+    }
+
+    fn finish_ffn(&mut self, layer: usize, unit: &crate::shared::prefill_pipeline::Unit) -> Result<()> {
+        let rows = Scalar::I32(unit.rows.len() as i32);
+        if layer + 1 < self.engine.weights.layers.len() {
+            if self.engine.cfg.ple_layers.contains(&(layer + 1)) {
+                self.engine.post(self.w, &mut self.current[unit.index], rows)?;
+                self.enter(layer + 1, unit, false)
+            } else { self.enter(layer + 1, unit, true) }
+        } else {
+            self.engine.post(self.w, &mut self.current[unit.index], rows)
+        }
+    }
+}
+
+impl crate::shared::prefill_pipeline::PrefillHooks for UnitHooks<'_, '_, '_, '_, '_, '_, '_> {
+    type Ticket = crate::shared::spark_waves::WaveTicket;
+
+    fn route(&self, _: usize) -> crate::shared::prefill_pipeline::FfnRoute {
+        if matches!(self.engine.experts, Some(Experts::Spark { .. })) {
+            crate::shared::prefill_pipeline::FfnRoute::Spark
+        } else { crate::shared::prefill_pipeline::FfnRoute::Local }
+    }
+
+    fn begin_unit(&mut self, unit: &crate::shared::prefill_pipeline::Unit) -> Result<()> {
+        self.select(unit)?;
+        let engine = self.engine;
+        if let Some(mapped) = engine.ple.as_ref().map(|p| p.mapped()) {
+            let batch = self.ple_batch.as_ref().context("PLE prefill batch ownership")?;
+            self.pending[unit.index] = Some(mapped.begin_unit(batch, unit.index, false)?);
+        }
+        engine.stage_embedding(self.w, &self.tokens[unit.rows.clone()], HC, &self.w.streams[0], false)?;
+        let start = self.tables[unit.index].positions[0] as usize;
+        let media = embedding_media(&[(self.placement, start, unit.rows.len())])?;
+        engine.inject_media(self.w, &media, &self.tables[unit.index].seq_first, &self.w.streams[0], unit.rows.len(), HC)
+    }
+
+    fn attention(&mut self, layer: usize, unit: &crate::shared::prefill_pipeline::Unit) -> Result<()> {
+        self.select(unit)?;
+        if !self.entered[unit.index] { self.enter(layer, unit, false)?; }
+        let engine = self.engine;
+        let rows = Scalar::I32(unit.rows.len() as i32);
+        let weights = &engine.weights.layers[layer];
+        match weights.attention {
+            Qwen4Attention::Gdn => engine.gdn(self.w, layer, weights, rows, "m4096", false)?,
+            Qwen4Attention::Full => engine.full(self.w, layer, weights, rows, "m4096", &self.tables[unit.index])?,
+        }
+        engine.post_pre(self.w, self.current[unit.index], weights, "mlp", rows)?;
+        self.current[unit.index] ^= 1;
+        Ok(())
+    }
+
+    fn local_ffn(&mut self, layer: usize, unit: &crate::shared::prefill_pipeline::Unit) -> Result<()> {
+        self.select(unit)?;
+        self.engine.moe(self.w, layer, &self.engine.weights.layers[layer], unit.rows.len(),
+            Scalar::I32(unit.rows.len() as i32), false)?;
+        self.finish_ffn(layer, unit)
+    }
+
+    fn send_experts(&mut self, layer: usize, unit: &crate::shared::prefill_pipeline::Unit) -> Result<Self::Ticket> {
+        self.select(unit)?;
+        let rows = Scalar::I32(unit.rows.len() as i32);
+        self.engine.moe_front(self.w, layer, &self.engine.weights.layers[layer], unit.rows.len(), rows)?;
+        let transport = self.transport.as_mut().context("Qwen unit Spark route without its transport worker")?;
+        self.engine.wave_send(self.w, layer, unit.rows.len(), rows, false, transport)
+    }
+
+    fn land_experts(&mut self, layer: usize, unit: &crate::shared::prefill_pipeline::Unit, ticket: Self::Ticket)
+        -> Result<()> {
+        self.select(unit)?;
+        let transport = self.transport.as_mut().context("Qwen unit Spark route without its transport worker")?;
+        self.engine.wave_land(self.w, unit.rows.len(), ticket, transport)?;
+        self.finish_ffn(layer, unit)
+    }
+
+    fn end_unit(&mut self, unit: &crate::shared::prefill_pipeline::Unit) -> Result<()> {
+        self.select(unit)?;
+        let engine = self.engine;
+        let cur = self.current[unit.index];
+        if let Some(terminal) = &self.w.terminal_streams {
+            let stride = HC * engine.cfg.hidden * 2;
+            let bytes = unit.rows.len() * stride;
+            let src = self.w.live_buffer(&self.w.streams[cur], stride);
+            let dst = Qwen4Engine::region(terminal, unit.rows.start * stride, bytes);
+            // SAFETY: disjoint, admitted terminal and slot rows; the stream orders reuse.
+            unsafe { engine.library.copy_d2d_async(dst, src, bytes, engine.execution_stream())?; }
+        }
+        let first = self.tokens.len() - self.logit_rows;
+        let count = unit.rows.end.saturating_sub(unit.rows.start.max(first));
+        if count > 0 && engine.weights.layers.len() == engine.cfg.layers {
+            self.w.logit_offset.set(unit.rows.start.max(first) - first);
+            engine.head(self.w, &self.w.streams[cur], unit.rows.len(), Scalar::I32(unit.rows.len() as i32), count)?;
+        }
+        engine.last_streams.set((false, cur));
+        Ok(())
+    }
+
+    fn commit_unit(&mut self, _: &crate::shared::prefill_pipeline::Unit) -> Result<()> {
+        // State is causal per layer; terminal rows retain the exact span for MTP.
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod prefill_unit_tests {
+    use super::*;
+    use crate::shared::prefill_pipeline::{prefill_schedule, sequence_units, FfnRoute, Step};
+    use std::ops::Range;
+
+    #[test]
+    fn unit_tables_keep_absolute_addresses_and_reset_sequence_rows() -> Result<()> {
+        for (start, count) in [0usize, 63, 255, 1023, 2047, 4093].into_iter()
+            .flat_map(|start| [4096, 8192].map(|count| (start, count))) {
+            let ple_rows = 16;
+            let mut whole = StepTables { page_table: vec![9, 4, 7, 2], pool_table: vec![3, 8],
+                page_width: 4, pool_width: 2, ..Default::default() };
+            for row in 0..count {
+                let position = start + row;
+                whole.positions.push(position as i64);
+                whole.rope_positions.push([position as i32, 2 * position as i32, 3 * position as i32]);
+                whole.block_rope_positions.push([(position / BLOCK * BLOCK) as i32; 3]);
+                whole.kv_slots.push((700 + position) as i64);
+                whole.pool_slots.push(if position % BLOCK == BLOCK - 1 { (position / BLOCK) as i64 } else { -1 });
+                whole.slots.push(5);
+                whole.seq_first.push(0);
+                whole.cache_lengths.push(((position + 1) / BLOCK) as i32);
+                whole.ple_ids.extend((0..ple_rows).map(|head| (position * ple_rows + head) as i64));
+            }
+            for width in [512, 1024, 2048, 4096] {
+                for unit in sequence_units(count, width, 1, 48)? {
+                    let rows = unit.rows;
+                    let local = whole.unit(rows.clone(), ple_rows, 2051);
+                    assert_eq!(local.positions, whole.positions[rows.clone()]);
+                    assert_eq!(local.rope_positions, whole.rope_positions[rows.clone()]);
+                    assert_eq!(local.block_rope_positions, whole.block_rope_positions[rows.clone()]);
+                    assert_eq!(local.kv_slots, whole.kv_slots[rows.clone()]);
+                    assert_eq!(local.pool_slots, whole.pool_slots[rows.clone()]);
+                    assert_eq!(local.slots, whole.slots[rows.clone()]);
+                    assert_eq!(local.cache_lengths, whole.cache_lengths[rows.clone()]);
+                    assert_eq!(local.ple_ids, whole.ple_ids[rows.start * ple_rows..rows.end * ple_rows]);
+                    assert_eq!(local.page_table, whole.page_table);
+                    assert_eq!(local.pool_table, whole.pool_table);
+                    assert_eq!((local.page_width, local.pool_width), (whole.page_width, whole.pool_width));
+                    assert_eq!((local.page_stride, local.pool_stride), (0, 0));
+                    assert_eq!(local.long, local.positions.iter().any(|&p| p + 1 > 2051));
+                    assert_eq!(local.seq_first, vec![0; rows.len()]);
+                    // A whole-step view would leave negative first-row indices
+                    // at every nonzero cut; GDN/PLE must see a new local row 0.
+                    if rows.start > 0 { assert_ne!(local.seq_first[0], whole.seq_first[rows.start] - rows.start as i32); }
+                    assert!(!local.decode && !local.spec);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    const LIVE: [&str; 6] = ["streams0", "streams1", "inject", "x", "delta", "shared"];
+
+    /// Replay the executor's actual order with Qwen's post/pre writes in
+    /// landing, including its next-layer x surviving another unit's hooks.
+    fn replay(span: usize, width: usize, waves: usize, zero_plane: Option<&str>, scratch_alias: bool)
+        -> Result<Option<String>> {
+        let mut units = sequence_units(span, width, 1, 48)?;
+        for unit in &mut units { unit.slot = unit.index % waves; }
+        let routes = vec![FfnRoute::Spark; 48];
+        let mut current = vec![0usize; units.len()];
+        let mut entered = vec![false; units.len()];
+        let mut live = Vec::<(usize, &'static str, Range<usize>)>::new();
+        for step in prefill_schedule(&routes, &units, waves)? {
+            let (index, mut writes) = match step {
+                Step::Begin { unit } => (unit, vec!["streams0"]),
+                Step::Attention { unit, .. } => {
+                    let mut writes = vec!["delta"];
+                    if !entered[unit] { writes.extend(["inject", "x"]); }
+                    current[unit] ^= 1;
+                    writes.extend([LIVE[current[unit]], "inject", "x"]);
+                    (unit, writes)
+                }
+                Step::Send { unit, .. } => (unit, vec!["shared"]),
+                Step::Land { unit, layer } => {
+                    current[unit] ^= 1;
+                    entered[unit] = true;
+                    let mut writes = vec!["delta", LIVE[current[unit]]];
+                    if layer + 1 < 48 { writes.extend(["inject", "x"]); }
+                    (unit, writes)
+                }
+                Step::End { unit } => (unit, vec!["x"]),
+                Step::Commit { unit } => { live.retain(|(owner, _, _)| *owner != unit); continue; }
+                Step::Local { .. } => unreachable!(),
+            };
+            // Hook-local tables, query/gate/index/attn, routes/wire and scratch
+            // stay separate from all six live planes, at row zero.
+            writes.extend(["tables", "query", "gate", "index_q", "attn", "blocks", "indices",
+                "lengths", "scratch", "topk_scratch", "router_logits", "route_ids", "route_weights", "wire"]);
+            for plane in writes {
+                let (plane, first) = if plane == "scratch" && scratch_alias { ("x", 0) }
+                    else { (plane, if LIVE.contains(&plane) && zero_plane != Some(plane) {
+                        Workspace::unit_offset(units[index].slot, width)
+                    } else { 0 }) };
+                let range = first..first + units[index].rows.len();
+                if let Some((owner, _, _)) = live.iter().find(|(owner, held, rows)| *owner != index
+                    && *held == plane && rows.start < range.end && range.start < rows.end) {
+                    return Ok(Some(format!("{step:?} overwrites unit {owner} {plane}")));
+                }
+                if LIVE.contains(&plane) {
+                    live.retain(|(owner, held, _)| *owner != index || *held != plane);
+                    live.push((index, plane, range));
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    #[test]
+    fn real_schedule_preserves_all_qwen_live_planes_and_catches_shared_rows() -> Result<()> {
+        for (span, width) in [(1, 512), (513, 512), (4096, 512), (4096, 2048), (3971, 1024),
+            (8192, 4096), (8192, 2048)] {
+            for waves in [1, 2] {
+                assert_eq!(replay(span, width, waves, None, false)?, None, "{span}/{width}/{waves}");
+            }
+        }
+        for plane in LIVE {
+            let hazard = replay(4096, 1024, 2, Some(plane), false)?.expect("row-zero negative control");
+            assert!(hazard.contains(plane), "{hazard}");
+        }
+        assert!(replay(4096, 1024, 2, None, true)?.unwrap().contains("x"));
+        Ok(())
     }
 }
 
 impl Drop for Qwen4Engine<'_> {
     fn drop(&mut self) {
         crate::shared::decode_graph::fatal_drain(self.shutdown_submission(), "Qwen engine retirement");
-        if let Some(bank) = self.gdn_banks.first() {
-            // SAFETY: the root owner owns this ordering event; all streams have drained.
-            let _ = bank.device.run(|| unsafe { self.library.cuda_event_destroy(self.routes_ready) });
-        }
     }
 }
 

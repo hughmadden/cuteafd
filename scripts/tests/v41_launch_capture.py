@@ -118,14 +118,31 @@ if tool == "docker":
             ranks = args[args.index("--spark-ranks") + 1]
         rows = args[args.index("--prefill-rows") + 1] if "--prefill-rows" in args else "0"
         family = os.environ.get("CAPTURE_FAMILY", "deepseek_v41")
-        response = {"spark_ranks": int(ranks), "prefill_rows": int(rows) or 2048,
+        default_rows = 4096 if family == "qwen4" else 2048
+        response = {"spark_ranks": int(ranks), "prefill_unit_rows": int(rows) or default_rows,
+                    "prefill_waves": 1, "prefill_span_rows": int(rows) or default_rows,
                     "encoder": {"kind": {"kind": "spark", "rank": 0}, "replicas": []},
                     "encoder_plan_hash": "ab" * 32, "placement_supported": True, "fits": True}
         if "--deployment" in args:
             def value(flag, default=None):
                 return args[args.index(flag) + 1] if flag in args else default
+            decode_lanes = int(value("--decode-lanes", "2" if family == "deepseek_v41" else "1"))
+            if (family == "deepseek_v41" and decode_lanes != 2) or (family != "deepseek_v41" and decode_lanes != 1):
+                sys.exit("unsupported --decode-lanes for " + family)
+            if family == "mimo_v2" and int(value("--concurrency", "16")) == 1:
+                decode_lanes = 1
+            response["decode_lanes"] = decode_lanes
             tp = int(value("--spark-tp", ranks))
             ep = int(value("--spark-ep", "1"))
+            if family in {"step5", "kimi_k3"}:
+                unit = int(value("--prefill-rows", "0")) or 2048
+                waves = int(value("--prefill-waves", "0")) or 2
+                response.update(prefill_unit_rows=unit, prefill_waves=waves, prefill_span_rows=unit * waves)
+            elif family in {"glm5", "deepseek_v4"}:
+                unit = int(value("--prefill-rows", "0")) or 4096
+                waves = 1 if family == "glm5" and int(ranks) == 0 else int(value("--prefill-waves", "0")) or 2
+                span = int(value("--prefill-span-rows", "0")) or 16384
+                response.update(prefill_unit_rows=unit, prefill_waves=waves, prefill_span_rows=span)
             report = dict(response)
             exl3 = os.environ.get("CAPTURE_EXL3") == "1"
             explicit_topology = "--spark-tp" in args or family == "deepseek_v41" and (int(ranks) == 3 if exl3 else int(ranks) not in (0, 4))

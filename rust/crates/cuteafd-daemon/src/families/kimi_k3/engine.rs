@@ -29,7 +29,14 @@ pub(crate) struct Engine<'a> {
     // PeerExchange and HopLink borrow raw handles; keep their exact streams
     // after both links and their terminal abort storage have been released.
     exchange_streams: [Rc<Stream<'a>>; 2],
+    /// Prefill units: their rows and how many are in flight on the lane.
+    prefill: PrefillUnits,
 }
+
+/// The lane holds `waves` units of `unit_rows`; a step of `rows` is cut into
+/// equal units of at most `unit_rows` (`prefill_units`).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct PrefillUnits { pub unit_rows: usize, pub waves: usize }
 
 impl Drop for Engine<'_> {
     fn drop(&mut self) {
@@ -121,10 +128,12 @@ impl<'a> Engine<'a> {
             && std::ptr::eq(devices[0].library, library.as_ref()),
             "Kimi startup programs differ from exchange devices/library");
         let rows = u32::try_from(plan.spec().rows)?;
-        let endpoints = vec![SparkEndpoint { capacity: rows, ingress: SparkIngress::Fp8K32 };
+        let endpoints = vec![SparkEndpoint { ring_depth: None, capacity: rows, ingress: SparkIngress::Fp8K32 };
             plan.spec().lanes as usize];
         let model = ModelAdmission { capacity: rows, compiled_capacity: compiled_rows,
-            endpoints, rings: spark_rings(config.max_frame_bytes)? };
+            endpoints, rings: spark_rings(config.max_frame_bytes)?,
+            // Each routed lane's wave is in flight to a rank at once.
+            execution_slots: cuteafd_loader::plan::layout::spark_execution_slots("kimi_k3", plan.spec().lanes as u64, 1) };
         model.validate(ExpertGeometry::KIMI_K3)?;
         let catalog = cuteafd_loader::read_expert_catalog(&checkpoint.snapshot)?;
         let spark = SparkAdmission::plan(&checkpoint.snapshot, ExpertGeometry::KIMI_K3,
@@ -168,7 +177,8 @@ impl<'a> Engine<'a> {
         let world = SparkWorld::canonical(6)?;
         let routed = local.iter().map(|pair| admission.connect_spark(library, &pair[1],
             world, peers.clone(), config.clone())).collect::<Result<Vec<_>>>()?;
-        let mut engine = Self::bind(exchange_streams, plan, peer, hops, local, routed, io, experts)?;
+        let prefill = PrefillUnits { unit_rows: admission.unit_rows(), waves: admission.waves() };
+        let mut engine = Self::bind(exchange_streams, plan, peer, hops, local, routed, io, experts, prefill)?;
         engine.draft = draft.map(Rc::new);
         *engine.draft_probe.borrow_mut() = draft_probe;
         Ok(engine)
@@ -180,7 +190,10 @@ impl<'a> Engine<'a> {
         plan: LayerExecutionPlan, peer: PeerExchange<'a>, hops: HopLink<'a>,
         local: Vec<[LocalLane<'a>; 2]>, routed: Vec<RoutedLane<'a>>,
         io: Vec<[TokenIo<'a>; 2]>,
-        experts: Vec<[Option<crate::shared::experts::rtx::exl3::Exl3Tp2<'a>>; 2]>) -> Result<Self> {
+        experts: Vec<[Option<crate::shared::experts::rtx::exl3::Exl3Tp2<'a>>; 2]>,
+        prefill: PrefillUnits) -> Result<Self> {
+        ensure!(prefill.waves > 0 && local.iter().all(|pair| pair[0].rows() >= prefill.unit_rows * prefill.waves
+            || prefill.waves == 1), "Kimi lane rows hold fewer than the admitted prefill units in flight");
         ensure!(!local.is_empty() && local.len() == routed.len() && local.len() == io.len() && local.len() == experts.len(),
             "Kimi engine local, Spark and IO lane counts differ");
         check_exchange_streams(&peer, &exchange_streams)?;
@@ -195,7 +208,7 @@ impl<'a> Engine<'a> {
         let execution = Execution::new(plan, &peer, &hops, exchange_streams.clone(), streams)?;
         Ok(Self { draft: None, draft_probe: RefCell::new(None), execution, lanes: RefCell::new(Lanes { local, routed, io, experts }),
             prefix: RefCell::new(None), startup_captures: Cell::new(None), provisional: RefCell::new(None),
-            hops, peer, exchange_streams })
+            hops, peer, exchange_streams, prefill })
     }
 
     pub(crate) fn prefix_family(&self) -> Result<super::prefix::KimiPrefix<'a>> {
@@ -207,6 +220,14 @@ impl<'a> Engine<'a> {
             [kda0, kda1], [mla0, mla1])?.with_draft(self.draft.clone())?;
         *prefix = Some(family.clone());
         Ok(family)
+    }
+
+    fn prefill_units(&self, rows: usize) -> Result<Vec<crate::shared::prefill_pipeline::Unit>> {
+        let layers = self.execution.plan.modes().len();
+        let units = crate::shared::prefill_pipeline::prefill_units(rows, self.prefill.unit_rows, self.prefill.waves, 256)?;
+        // Every unit's rows lie in the lane; a slot is the unit's row range.
+        Ok(units.into_iter().enumerate().map(|(index, rows)| crate::shared::prefill_pipeline::Unit {
+            index, sequence: 0, rows, layers: 0..layers, slot: index % self.prefill.waves, barrier: false }).collect())
     }
 
     pub(crate) fn geometry(&self) -> Result<crate::shared::qwen::scheduler::Geometry> {
@@ -286,6 +307,15 @@ impl<'a> Engine<'a> {
         Ok(())
     }
 
+    pub(crate) fn graph_replays(&self) -> Result<u64> {
+        Ok(self.lanes.try_borrow()?.local.iter().flatten().map(LocalLane::graph_replays).sum())
+    }
+
+    pub(crate) fn set_grouped_kda(&self, enabled: bool) -> Result<()> {
+        for local in self.lanes.try_borrow()?.local.iter().flatten() { local.set_grouped_kda(enabled)?; }
+        Ok(())
+    }
+
     pub(crate) fn warm_graphs(&self, keys: &[super::graphs::Key]) -> Result<()> {
         ensure!(self.startup_captures.get().is_none(), "Kimi startup graphs already sealed");
         let mut lanes = self.lanes.try_borrow_mut()?;
@@ -344,17 +374,21 @@ impl<'a> Engine<'a> {
             let metadata = sequences.iter().map(|(placement, tokens)| SequenceRows {
                 slot: placement.slot, start: placement.len, rows: tokens.len(), pages: &placement.units,
             }).collect::<Vec<_>>();
-            for local in &mut lanes.local[0] { local.stage_attention(&metadata, pool)?; }
+            // Unit calls stage each unit's metadata inside its hooks; a single
+            // pass stages its whole step (at most one unit) here.
+            let unit_call = !speculative && sequences.len() == 1 && rows > 64;
+            if !unit_call { for local in &mut lanes.local[0] { local.stage_attention(&metadata, pool)?; } }
             let tokens = sequences.iter().flat_map(|(_, tokens)| tokens.iter().copied()).collect::<Vec<_>>();
             lanes.io[0][0].embed(&tokens, lanes.local[0][0].buffer("delta")?)?;
             let Lanes { local, routed, io, experts } = &mut *lanes;
             for binding in &mut local[0] { binding.enable_replay(graphed); }
-            let windows = crate::shared::prefill_pipeline::subwave_ranges(rows, 3, 64, 256)?;
-            let result = if !speculative && sequences.len() == 1 && windows.len() > 1 {
-                self.execution.run_subwaves(scope, &self.peer, &self.hops, &mut local[0],
-                    &mut routed[0], &mut experts[0], &windows, &metadata[0], pool,
+            let units = self.prefill_units(rows)?;
+            let result = if unit_call {
+                self.execution.run_units(scope, &self.peer, &self.hops, &mut local[0],
+                    &mut routed[0], &mut experts[0], &units, self.prefill.waves, &metadata[0], pool,
                     self.draft.as_deref()).map(|output| vec![output])
             } else {
+                ensure!(rows <= self.prefill.unit_rows, "Kimi {rows}-row multi-sequence step exceeds one prefill unit");
                 self.execution.run(scope, &self.peer, &self.hops,
                     &mut local[..1], &mut routed[..1], &mut experts[..1], &[rows], speculative,
                     super::layers::Output::Normalized, self.draft.as_deref(), Some(&self.draft_probe))
@@ -479,7 +513,8 @@ impl<'a> Engine<'a> {
         ensure!(self.provisional.borrow().is_none(), "Kimi diagnostic cannot overwrite pending verify");
         submit_scoped(|| self.peer.require_live(), || self.shutdown(), |scope| {
             let mut lanes = self.lanes.try_borrow_mut()?;
-            ensure!(!tokens.is_empty(), "Kimi diagnostic prefix has no tokens");
+            ensure!(!tokens.is_empty() && tokens.len() <= self.prefill.unit_rows,
+                "Kimi diagnostic prefix has no tokens or exceeds one prefill unit");
             let sequences = [SequenceRows { slot: 0, start: 0, rows: tokens.len(), pages }];
             for local in &mut lanes.local[0] { local.stage_attention(&sequences, pool)?; }
             lanes.io[0][0].embed(tokens, lanes.local[0][0].buffer("delta")?)?;
@@ -529,21 +564,25 @@ impl<'a> Engine<'a> {
             ensure!(!tokens.is_empty() && tokens.len() == sequences.len() && tokens.len() <= lanes.local.len(),
                 "Kimi forward token/sequence lane count");
             let rows = tokens.iter().map(Vec::len).collect::<Vec<_>>();
+            let unit_call = tokens.len() == 1 && sequences[0].len() == 1 && rows[0] > 64;
             for (lane, ids) in tokens.iter().enumerate() {
                 ensure!(!ids.is_empty(), "Kimi forward has an empty lane");
                 for local in &mut lanes.local[lane] {
                     ensure!(sequences[lane].iter().map(|sequence| sequence.rows).sum::<usize>() == ids.len(),
                         "Kimi forward sequence rows differ from tokens");
-                    local.stage_attention(&sequences[lane], pool)?;
+                    // Unit calls stage each unit's metadata inside its hooks.
+                    if !unit_call { local.stage_attention(&sequences[lane], pool)?; }
                 }
                 lanes.io[lane][0].embed(ids, lanes.local[lane][0].buffer("delta")?)?;
             }
             let Lanes { local, routed, io, experts } = &mut *lanes;
-            let windows = crate::shared::prefill_pipeline::subwave_ranges(rows[0], 3, 64, 256)?;
-            let normalized = if tokens.len() == 1 && sequences[0].len() == 1 && windows.len() > 1 {
-                vec![self.execution.run_subwaves(scope, &self.peer, &self.hops, &mut local[0],
-                    &mut routed[0], &mut experts[0], &windows, &sequences[0][0], pool, None)?]
+            let normalized = if unit_call {
+                let units = self.prefill_units(rows[0])?;
+                vec![self.execution.run_units(scope, &self.peer, &self.hops, &mut local[0],
+                    &mut routed[0], &mut experts[0], &units, self.prefill.waves, &sequences[0][0], pool, None)?]
             } else {
+                ensure!(rows.iter().sum::<usize>() <= self.prefill.unit_rows,
+                    "Kimi multi-sequence diagnostic step exceeds one prefill unit");
                 self.execution.run(scope, &self.peer, &self.hops,
                     &mut local[..tokens.len()], &mut routed[..tokens.len()], &mut experts[..tokens.len()], &rows, false,
                     super::layers::Output::Normalized, None, None)?

@@ -32,14 +32,62 @@ impl LaneSet {
         LaneLease { index, stop: &self.stop }
     }
 
+    /// Run both lane loops with shared failure propagation, without cancelling
+    /// an outstanding device or transport operation.
+    pub async fn run<'s, F, G>(&'s self,
+        first: impl FnOnce(LaneLease<'s>) -> F,
+        second: impl FnOnce(LaneLease<'s>) -> G,
+    ) -> Result<()>
+    where F: Future<Output = Result<()>>, G: Future<Output = Result<()>> {
+        self.join(self.lease(0).run(first(self.lease(0))),
+            self.lease(1).run(second(self.lease(1)))).await
+    }
+
     /// Poll two lanes to completion. Neither is cancelled when the other fails;
     /// a failing lane stops its peers at their next boundary ([`LaneLease::run`]).
     /// The first lane's error wins when both fail.
     pub async fn join(&self, first: impl Future<Output = Result<()>>, second: impl Future<Output = Result<()>>)
         -> Result<()> {
-        let (first, second) = tokio::join!(first, second);
+        let joined = std::pin::pin!(async { tokio::join!(first, second) });
+        let (first, second) = paced(joined).await;
         first.and(second)
     }
+}
+
+/// Lanes wait by yielding (stream queries, reply and commit polls), so the
+/// executor re-polls at once: `--host-wait spin` keeps that; under `block` a
+/// pending stretch spins for its first [`BLOCK_SPIN`] (most per-layer waits
+/// end within it, and they are the critical path), then sleeps
+/// [`BLOCK_SLEEP`] per poll. A poll that completes restarts the spin.
+///
+/// [`BLOCK_SPIN`]: cuteafd_transport::wait_policy::BLOCK_SPIN
+/// [`BLOCK_SLEEP`]: cuteafd_transport::wait_policy::BLOCK_SLEEP
+async fn paced<F: Future>(mut future: std::pin::Pin<&mut F>) -> F::Output {
+    let mut backoff = cuteafd_transport::wait_policy::Backoff::new();
+    std::future::poll_fn(move |context| {
+        let poll = future.as_mut().poll(context);
+        if poll.is_pending() { backoff.pause() } else { backoff.reset() }
+        poll
+    }).await
+}
+
+/// Balance a drained request cohort before admission. Preserve the first
+/// survivor migration and lane-zero tie break. Call only after both lanes
+/// release their outstanding device and transport work.
+pub(crate) fn rebalance<T>(entries: &mut [T], lane: impl Fn(&T) -> Option<usize>,
+    set_lane: impl Fn(&mut T, usize)) -> [usize; 2] {
+    let mut loads = [0usize; 2];
+    for entry in entries.iter() {
+        if let Some(index) = lane(entry) { loads[index] += 1; }
+    }
+    while loads[0].abs_diff(loads[1]) > 1 {
+        let heavy = usize::from(loads[1] > loads[0]);
+        let Some(entry) = entries.iter_mut().find(|entry| lane(entry) == Some(heavy)) else { break };
+        set_lane(entry, 1 - heavy);
+        loads[heavy] -= 1;
+        loads[1 - heavy] += 1;
+    }
+    loads
 }
 
 impl LaneLease<'_> {
@@ -114,11 +162,34 @@ mod tests {
     fn a_failing_lane_stops_its_peer_at_a_boundary_without_cancelling_it() {
         let set = LaneSet::default();
         let (rounds, finished) = (Cell::new(0), Cell::new(false));
-        let error = block_on(set.join(set.lease(0).run(peer(set.lease(0), &rounds, &finished)),
-            set.lease(1).run(failing(set.lease(1))))).unwrap_err();
+        let error = block_on(set.run(|lease| peer(lease, &rounds, &finished), failing)).unwrap_err();
         assert_eq!(error.to_string(), "lane failed");
         // The peer ran to its own boundary and returned; it was not dropped.
         assert!(finished.get() && rounds.get() >= 3);
+    }
+
+    #[test]
+    fn drained_cohorts_migrate_first_survivors_and_keep_balanced_assignments() {
+        for original in [vec![], vec![None], vec![Some(0); 8], vec![Some(1); 7],
+            vec![Some(0), None, Some(1), Some(0)]] {
+            let mut expected = original.clone();
+            let mut loads = [0usize; 2];
+            for index in expected.iter().flatten() { loads[*index] += 1; }
+            while loads[0].abs_diff(loads[1]) > 1 {
+                let heavy = usize::from(loads[1] > loads[0]);
+                *expected.iter_mut().flatten().find(|index| **index == heavy).unwrap() = 1 - heavy;
+                loads[heavy] -= 1;
+                loads[1 - heavy] += 1;
+            }
+            let mut actual = original;
+            assert_eq!(rebalance(&mut actual, |entry| *entry,
+                |entry, index| *entry = Some(index)), loads);
+            assert_eq!(actual, expected);
+            let unchanged = actual.clone();
+            assert_eq!(rebalance(&mut actual, |entry| *entry,
+                |entry, index| *entry = Some(index)), loads);
+            assert_eq!(actual, unchanged);
+        }
     }
 
     async fn record(ran: &RefCell<Vec<usize>>, index: usize, fail: bool) -> Result<()> {

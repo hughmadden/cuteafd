@@ -20,9 +20,7 @@ macro_rules! layer_schedule {
         for $layer in range {
             $($setup)*
             if $layer != $first && crate::shared::memory::chain::deferred() {
-                if crate::shared::memory::chain::staging_fence() {
-                    crate::shared::memory::chain::fence_wait($library, ($layer - 1) % 2).await?;
-                }
+                crate::shared::memory::chain::fence_wait($library, ($layer - 1) % 2).await?;
                 tokio::task::yield_now().await;
             }
             $body
@@ -139,6 +137,11 @@ pub(crate) struct Pass<'a, R> {
     sampled: Option<SampledTargetRows>,
     chain: Option<crate::shared::memory::chain::StageChain<'a>>,
     device_order: bool,
+    /// Device order a pass returns to after a one-pass override: on for the
+    /// two-RTX pass, off for the single-RTX pass (measured 2026-10-25, V4.1
+    /// 1 RTX + 3 Sparks: device-ordered verify 37.9 -> 38.3-39.1 ms, decode
+    /// 0.97-0.98x; 2 RTX + 6 Sparks: 25.8 -> 24.0 ms, decode 1.08-1.10x).
+    device_default: bool,
     /// The next pass may L2-prefetch during its exchanges ([`Self::set_l2_prefetch`]).
     l2_solo: bool,
 }
@@ -161,7 +164,7 @@ impl<'a, R> Pass<'a, R> {
     /// Select ordering once per pass, before borrowing its concrete resources.
     fn begin_chain(&mut self, enabled: bool) -> Result<Option<crate::shared::memory::chain::ChainHandle<'a>>> {
         if let Some(chain) = &self.chain {
-            chain.set_device_order(std::mem::replace(&mut self.device_order, true));
+            chain.set_device_order(std::mem::replace(&mut self.device_order, self.device_default));
         }
         let Some(chain) = self.chain.as_ref().filter(|_| enabled) else { return Ok(None) };
         // Cancellation may have left work queued on this owner.
@@ -171,13 +174,11 @@ impl<'a, R> Pass<'a, R> {
 
     fn drain_chain(&self) -> Result<()> {
         let chain = self.chain.as_ref().context("target pass chain absent")?;
-        if crate::shared::memory::chain::device_enabled() {
-            chain.drain_bounded(Duration::from_secs(60)).map_err(|error|
-                error.context(format!("device lanes: {}", cuteafd_transport::expert::device_stuck_report())))
-        } else { chain.drain() }
+        chain.drain_bounded(Duration::from_secs(60))
     }
 
-    pub(crate) fn set_device_order(&mut self, on: bool) { self.device_order = on; }
+    /// Device order for the next pass only, within this pass's default.
+    pub(crate) fn set_device_order(&mut self, on: bool) { self.device_order = on && self.device_default; }
     /// Whether the next pass may prefetch weights into L2 during its Spark
     /// exchanges (`--l2-prefetch`): only while the other lane is idle. Consumed
     /// by that pass, like the device order.
@@ -254,7 +255,8 @@ impl<'w, 'a> TargetPass<'w, 'a> {
             state: State::Idle,
             sampled: None,
             chain,
-            device_order: true,
+            device_order: false,
+            device_default: false,
             l2_solo: true,
         })
     }
@@ -431,17 +433,22 @@ impl<'w, 'a> TargetPass<'w, 'a> {
         // `--l2-prefetch` only while the other lane is idle (consumed per pass).
         self.resources.lane.set_l2_prefetch(std::mem::replace(&mut self.l2_solo, true));
         let Some(handle) = self.begin_chain(verification)? else {
-            return unsafe { self.execute_phase_inner(requests, batch, transport, placement, selected,
+            let result = unsafe { self.execute_phase_inner(requests, batch, transport, placement, selected,
                 suffix, encoder, terminal).await };
+            // A failed Spark wire released its waits over garbage planes.
+            let result = result.and_then(|()| crate::shared::spark_waves::healthy());
+            if result.is_ok() { self.resources.lane.drain_route_ring()?; }
+            return result;
         };
         let result = crate::shared::memory::chain::watchdog(unsafe { handle.scope(self.execute_phase_inner(
             requests, batch, transport, placement, selected, suffix, encoder, terminal)) }).await;
         // Every consumer after the pass (commit, dSpark, logits downloads) is
         // unscoped, so the chained work must be complete before returning.
         let drained = self.drain_chain();
-        let result = result.and(drained).and_then(|()| transport.check_device());
-        if result.is_ok() && crate::shared::memory::chain::device_enabled() {
-            // Device-ordered local layers left their captured routes in the router's ring.
+        // A failed Spark wire released its waits over garbage planes.
+        let result = result.and(drained).and_then(|()| crate::shared::spark_waves::healthy());
+        if result.is_ok() {
+            // Device-read layers left their captured routes in the router's ring.
             self.resources.lane.drain_route_ring()?;
         }
         if let Some((rows, started)) = step_sample {
@@ -516,44 +523,25 @@ impl<'w, 'a> TargetPass<'w, 'a> {
                 self.resources.lane.advance()?;
                 let advance_us = prepare_timing.elapsed().as_micros() as u64;
                 if let Some(gate) = [1, 14].iter().position(|&l| l == layer) {
-                    let start = Instant::now();
-                    // Inside a stage chain the gathered rows are uploaded on their
-                    // own stream and the gate joins the chain, so the direct pass
-                    // uses the same queued form instead of draining the chain.
+                    guard.batch.wait_engram_gather(gate, self.resources.engram_timeout).await?;
+                    // Revalidate only after waking; no request-bank borrow spans
+                    // admission or mapped I/O. Keep each route's upload/gate order.
                     if requests.cooperative_completion() || crate::shared::memory::chain::active() {
-                        loop {
-                            let gathered = requests.with_requests(|requests| requests.poll_engram_gather(guard.batch, &self.resources.lane))?;
-                            match gathered {
-                                cuteafd_loader::EngramGatherPoll::Ready(lease) => {
-                                    let rows = self.resources.upload.upload_cooperative(&lease.view()?).await?;
-                                    unsafe { self.resources.lane.apply_engram_cooperative(&mut self.resources.gates[gate], &rows).await?; }
-                                    break;
-                                }
-                                cuteafd_loader::EngramGatherPoll::Cancelled => anyhow::bail!("engram gather cancelled"),
-                                cuteafd_loader::EngramGatherPoll::Pending => {}
+                        let gathered = requests.with_requests(|requests| requests.poll_engram_gather(guard.batch, &self.resources.lane))?;
+                        match gathered {
+                            cuteafd_loader::EngramGatherPoll::Ready(lease) => {
+                                let rows = self.resources.upload.upload_cooperative(&lease.view()?).await?;
+                                unsafe { self.resources.lane.apply_engram_cooperative(&mut self.resources.gates[gate], &rows).await?; }
                             }
-                            ensure!(start.elapsed() < self.resources.engram_timeout, "target engram gather timed out at layer {layer}");
-                            // The gather normally lands within microseconds of this
-                            // point; a millisecond sleep would stall the whole pass.
-                            tokio::task::yield_now().await;
+                            cuteafd_loader::EngramGatherPoll::Cancelled => anyhow::bail!("engram gather cancelled"),
+                            cuteafd_loader::EngramGatherPoll::Pending => anyhow::bail!("engram gather wait returned pending"),
                         }
                     } else {
-                        // The direct engram gate uses legacy-stream copies.
                         crate::shared::memory::chain::settle(self.resources.upload.library())?;
-                        while !unsafe {
-                        requests.with_requests(|requests| requests.poll_engram(
-                            guard.batch,
-                            &mut self.resources.upload,
-                            &mut self.resources.gates[gate],
-                            &mut self.resources.lane,
-                        ))?
-                    } {
-                        ensure!(
-                            start.elapsed() < self.resources.engram_timeout,
-                            "target engram gather timed out at layer {layer}"
-                        );
-                        tokio::time::sleep(Duration::from_millis(1)).await;
-                    } }
+                        ensure!(unsafe { requests.with_requests(|requests| requests.poll_engram(
+                            guard.batch, &mut self.resources.upload, &mut self.resources.gates[gate],
+                            &mut self.resources.lane))? }, "engram gather wait returned pending");
+                    }
                 }
                 let engram_us = prepare_timing.elapsed().as_micros() as u64 - advance_us;
                 if layer >= 37 {
@@ -841,6 +829,7 @@ mod tests {
             sampled: None,
             chain: None,
             device_order: false,
+            device_default: true,
             l2_solo: true,
         };
         assert!(pass.begin_chain(false)?.is_none());
@@ -850,6 +839,10 @@ mod tests {
         assert!(pass.state.begin().is_err());
         pass.set_device_order(true);
         assert!(pass.device_order);
+        // A single-RTX pass stays host-ordered whatever a scheduler asks.
+        pass.device_default = false;
+        pass.set_device_order(true);
+        assert!(!pass.device_order);
         pass.set_l2_prefetch(false);
         assert!(!pass.l2_solo);
         Ok(())

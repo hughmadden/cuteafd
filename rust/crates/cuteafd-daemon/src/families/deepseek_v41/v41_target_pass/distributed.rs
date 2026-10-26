@@ -204,6 +204,7 @@ impl<'w, 'a> DistributedTargetPass<'w, 'a> {
             state: State::Idle,
             chain,
             device_order: true,
+            device_default: true,
             l2_solo: true,
             sampled: None,
         })
@@ -364,8 +365,10 @@ impl<'w, 'a> DistributedTargetPass<'w, 'a> {
         for lane in &mut self.resources.lanes { lane.get_mut().set_l2_prefetch(solo); }
         let chained = verification && !self.resources.lanes.iter().any(|lane| lane.uses_peer_projection());
         let Some(handle) = self.begin_chain(chained)? else {
-            return unsafe { self.execute_unchained(requests, batch, transport, placement, selected,
+            let result = unsafe { self.execute_unchained(requests, batch, transport, placement, selected,
                 suffix, encoder, greedy).await };
+            // A failed Spark wire released its waits over garbage planes.
+            return result.and_then(|()| crate::shared::spark_waves::healthy());
         };
         let timed = tracing::enabled!(target: "cuteafd::timing", tracing::Level::DEBUG).then(Instant::now);
         let result = crate::shared::memory::chain::watchdog(unsafe { handle.scope(self.execute_unchained(
@@ -373,13 +376,14 @@ impl<'w, 'a> DistributedTargetPass<'w, 'a> {
         let issued_us = timed.map(|t| t.elapsed().as_micros() as u64);
         let drained = self.drain_chain();
         let drained_us = timed.map(|t| t.elapsed().as_micros() as u64);
-        let result = result.and(drained).and_then(|()| transport.get().check_device());
+        // A failed Spark wire released its waits over garbage planes.
+        let result = result.and(drained).and_then(|()| crate::shared::spark_waves::healthy());
         if let (Some(t), Some(issued_us), Some(drained_us)) = (timed, issued_us, drained_us) {
             tracing::debug!(target: "cuteafd::timing", issued_us, drain_us=drained_us-issued_us,
                 check_us=t.elapsed().as_micros() as u64-drained_us, "distributed verification chain");
         }
         let ring_timed = timed.map(|_| Instant::now());
-        if result.is_ok() && self.resources.capture_routes && crate::shared::memory::chain::device_enabled() {
+        if result.is_ok() && self.resources.capture_routes {
             // Device-ordered local layers left their routes in the routers' rings.
             for gpu in 0..self.resources.lanes.len() {
                 let device = self.resources.lanes[gpu].device;
@@ -564,32 +568,23 @@ impl<'w, 'a> DistributedTargetPass<'w, 'a> {
                     self.advance(layer).await?;
                 }
                 if [1, 14].contains(&layer) {
-                    let started = Instant::now();
-                    loop {
-                        let gathered = requests.with_requests(|r| {
-                            r.poll_engram_gather(guard.batch, &self.resources.lanes[gpu])
-                        })?;
-                        match gathered {
-                            cuteafd_loader::EngramGatherPoll::Ready(lease) => {
-                                unsafe {
-                                    self.resources.engram
-                                        .apply(&mut self.resources.lanes[gpu], &lease.view()?)
-                                        .await?;
-                                }
-                                break;
+                    let gate = usize::from(layer == 14);
+                    guard.batch.wait_engram_gather(gate, self.resources.timeout).await?;
+                    let gathered = requests.with_requests(|r| {
+                        r.poll_engram_gather(guard.batch, &self.resources.lanes[gpu])
+                    })?;
+                    match gathered {
+                        cuteafd_loader::EngramGatherPoll::Ready(lease) => {
+                            unsafe {
+                                self.resources.engram
+                                    .apply(&mut self.resources.lanes[gpu], &lease.view()?)
+                                    .await?;
                             }
-                            cuteafd_loader::EngramGatherPoll::Cancelled => {
-                                anyhow::bail!("distributed Engram gather cancelled")
-                            }
-                            cuteafd_loader::EngramGatherPoll::Pending => {}
                         }
-                        ensure!(
-                            started.elapsed() < self.resources.timeout,
-                            "distributed Engram gather timed out at layer {layer}"
-                        );
-                        // A millisecond sleep here stalled the whole pass whenever
-                        // the gather landed just after the first poll.
-                        tokio::task::yield_now().await;
+                        cuteafd_loader::EngramGatherPoll::Cancelled => {
+                            anyhow::bail!("distributed Engram gather cancelled")
+                        }
+                        cuteafd_loader::EngramGatherPoll::Pending => anyhow::bail!("engram gather wait returned pending"),
                     }
                 }
                 if layer >= 37 {

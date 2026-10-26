@@ -21,7 +21,7 @@ impl RemotePeers {
         ensure!(matches!(mode, MediaMode::Auto | MediaMode::Spark(_)), "--vision-peers requires Spark/auto vision placement");
         let addresses = peers.split(',').map(|peer| peer.trim().parse()
             .context("vision peer must be an IP:port")).collect::<Result<Vec<_>>>()?;
-        ensure!((1..=6).contains(&addresses.len()), "vision needs 1..6 replicas");
+        ensure!((1..=8).contains(&addresses.len()), "vision needs 1..8 replicas");
         let plan_hash = super::worker::parse_plan_hash(plan_hash.context("--vision-peers requires --encoder-plan-hash")?)?;
         let revision = revision.context("--vision-peers requires --encoder-revision")?.to_owned();
         ensure!(!revision.is_empty(), "encoder revision must not be empty");
@@ -74,7 +74,10 @@ mod tests {
         assert!(parse(spark, Some("127.0.0.1:1"), Some(&hash), Some("")).is_err());
         assert!(parse(MediaMode::Rtx(None), Some("127.0.0.1:1"), Some(&hash), Some("revision")).is_err());
         assert!(parse(MediaMode::Auto, Some("127.0.0.1:1"), Some(&hash), Some("revision")).unwrap().is_some());
-        let seven = vec!["127.0.0.1:1"; 7].join(",");
-        assert!(parse(spark, Some(&seven), Some(&hash), Some("revision")).is_err());
+        // Eight Spark ranks may each host a tower replica; a ninth is refused.
+        let eight = vec!["127.0.0.1:1"; 8].join(",");
+        assert_eq!(parse(spark, Some(&eight), Some(&hash), Some("revision")).unwrap().unwrap().addresses.len(), 8);
+        let nine = vec!["127.0.0.1:1"; 9].join(",");
+        assert!(parse(spark, Some(&nine), Some(&hash), Some("revision")).is_err());
     }
 }

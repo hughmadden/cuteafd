@@ -20,6 +20,7 @@ pub(super) struct Fp8Group {
     pub bf16_directory: Option<std::path::PathBuf>,
     pub slicing: cuteafd_loader::formats::fp8_experts::Slicing,
     pub scratch: usize,
+    pub io: usize,
     pub modules: Option<Fp8Modules>,
 }
 
@@ -49,14 +50,15 @@ impl Fp8Group {
                 tensors.rank_width(config.world, config.rank, slicing)?)?;
             let metadata = fp8::package_metadata(&directory, &tensors, &layers, config.world, config.rank, slicing)?;
             let capacity = config.capacity as usize;
-            let mut scratch = metadata.scratch_for(capacity)?.max(256);
+            let mut scratch = cuteafd_ffi::fp8_moe::fp8_slot_scratch_bytes(metadata.scratch_layout(), capacity)?;
             let bf16_directory = metadata.info.wire_input.then(|| fp8::bf16_sibling(&directory))
                 .flatten().filter(|path| path.is_dir());
             if let Some(path) = &bf16_directory {
                 let sibling = fp8::package_metadata(path, &tensors, &layers, config.world, config.rank, slicing)?;
                 fp8::validate_bf16_package(&metadata.info, &sibling.info, capacity)?;
-                scratch = scratch.max(sibling.scratch_for(capacity)?);
+                scratch = scratch.max(cuteafd_ffi::fp8_moe::fp8_slot_scratch_bytes(sibling.scratch_layout(), capacity)?);
             }
+            let io = super::backend::native_slot_io_bytes(&metadata.info, bf16_directory.is_some(), capacity)?;
             if let Some(group) = groups.iter_mut().find(|group| group.directory == directory
                 && group.bf16_directory == bf16_directory && group.slicing == slicing
                 && group.tensors.format() == tensors.format()
@@ -64,7 +66,7 @@ impl Fp8Group {
                 group.layers.push(layer);
                 group.scratch = group.scratch.max(scratch);
             } else {
-                groups.push(Self { tensors, layers, directory, bf16_directory, slicing, scratch, modules: None });
+                groups.push(Self { tensors, layers, directory, bf16_directory, slicing, scratch, io, modules: None });
             }
         }
         Ok(groups)
@@ -77,13 +79,19 @@ impl<'a> WarmModules<'a> {
         programs: Option<&'a cuteafd_ffi::programs::Programs<'a>>) -> Result<Self> {
         if catalog.format() == cuteafd_loader::plan::checkpoint::CheckpointFormat::Exlr8 {
             let programs = programs.context("EXLR8 module owner requires validated programs")?;
-            crate::shared::experts::exlr8::Exlr8Execution::workspace_bytes(programs,
-                (config.capacity as usize).min(cuteafd_core::expert_geometry::EXLR8_EXECUTION_ROWS),
-                cuteafd_loader::plan::exlr8::residency::ExpertSet::Routed)?;
+            let decode_rows = (config.capacity as usize)
+                .min(cuteafd_core::expert_geometry::EXLR8_EXECUTION_ROWS);
+            // Both decode instances are part of every Spark EXLR8 image;
+            // validation here precedes any workspace allocation.
+            crate::shared::experts::exlr8::Exlr8Execution::decode_compact_workspace_bytes(programs,
+                decode_rows, 16)?;
             programs.program("exlr8_group", &["ids", "x", "signs_in", "group_expert", "route_slots", "route_group_lane", "group_count", "activation"])?;
+            crate::shared::experts::exlr8::Exlr8Execution::decode_grouped_workspace_bytes(programs,
+                decode_rows, 16)?;
             if config.capacity as usize > cuteafd_core::expert_geometry::EXLR8_EXECUTION_ROWS {
-                crate::shared::experts::exlr8::Exlr8Execution::workspace_bytes(programs,
-                    config.capacity as usize, cuteafd_loader::plan::exlr8::residency::ExpertSet::Routed)?;
+                crate::shared::experts::exlr8::Exlr8Execution::workspace_bytes_with_limit(programs,
+                    config.capacity as usize, cuteafd_loader::plan::exlr8::residency::ExpertSet::Routed, 16,
+                    config.exlr8_prefill_activations)?;
                 programs.program("exlr8_grouped_group", &["ids", "x", "signs_in", "group_expert", "route_slots", "route_group_lane", "group_count", "activation"])?;
             }
             return Ok(Self::Exlr8(programs));
@@ -131,9 +139,12 @@ impl<'a> WarmModules<'a> {
             _ => anyhow::bail!("FP8 module owner/backend mismatch"),
         }
     }
-    pub(super) fn take_exl3(&mut self) -> Result<Vec<Exl3Modules<'a>>> {
+    /// The warmed EXL3 modules for the first execution slot; later slots
+    /// (`None`) load their own module set from the same exports, so no two
+    /// slots share kernel state.
+    pub(super) fn take_exl3(&mut self) -> Result<Option<Vec<Exl3Modules<'a>>>> {
         match self {
-            Self::Exl3(modules) => modules.take().context("EXL3 modules already consumed"),
+            Self::Exl3(modules) => Ok(modules.take()),
             _ => anyhow::bail!("EXL3 module owner/backend mismatch"),
         }
     }
@@ -141,6 +152,16 @@ impl<'a> WarmModules<'a> {
 
 #[cfg(test)]
 mod tests {
+    /// Every execution slot builds its own EXL3 execution: the first takes the
+    /// warmed modules, later slots load their own (a second take is not an error).
+    #[test]
+    fn later_execution_slots_load_their_own_exl3_modules() {
+        let mut modules = super::WarmModules::Exl3(Some(Vec::new()));
+        assert!(modules.take_exl3().unwrap().is_some());
+        assert!(modules.take_exl3().unwrap().is_none());
+        assert!(modules.take_exl3().unwrap().is_none());
+    }
+
     #[test]
     fn owner_binds_primary_context_without_census_before_all_backends() {
         let worker = include_str!("local.rs");

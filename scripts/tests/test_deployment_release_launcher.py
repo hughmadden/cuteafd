@@ -50,6 +50,15 @@ def test_deployment_preserves_release_container_commands(entry: dict, swa_kv: st
                 anchor = "--kv-cache" if "--kv-cache" in before["command"] else "--prefix-partial"
                 position = before["command"].index(anchor) + 2
                 before["command"][position:position] = ["--swa-kv-cache", swa_kv or "int8"]
+            if entry["family"] == "qwen4":
+                # Local/dual still execute their whole-step default, now explicit in the plan.
+                position = before["command"].index("--console-secret-file")
+                before["command"][position:position] = ["--prefill-rows", "4096", "--prefill-waves", "1"]
+            if entry["family"] == "deepseek_v4":
+                # V4 forwards the planner's resolved unit and wave defaults.
+                anchor = "--split-device" if "--split-device" in before["command"] else "--pool-tokens"
+                position = before["command"].index(anchor) + 2
+                before["command"][position:position] = ["--prefill-rows", "4096", "--prefill-waves", "2"]
             if compact_draft:
                 anchor = {"glm5": "--pool-tokens", "glm5_flash": "--host-cache-bytes",
                           "mimo_v2": "--swa-kv-cache"}[entry["family"]]
@@ -75,8 +84,7 @@ def test_all_family_deployment_dry_run_starts_no_serving_containers(entry: dict)
 def exlr8_entry(manifest: str = "up1", **overrides: str) -> dict:
     entry = release_entry(next(e for e in ENTRIES if e["name"] == "glm53-exl3-max"))
     entry["set"].update(SPARK_COUNT="4", SPECULATOR="off", RTX_EXPERT_LAYERS="0",
-        ATTENTION_PLACEMENT="context", EXLR8_MANIFEST=manifest,
-        EXLR8_DENSE_FROM="deepseek-ai/DeepSeek-V4.1-Flash", **overrides)
+        ATTENTION_PLACEMENT="context", EXLR8_MANIFEST=manifest, **overrides)
     return entry
 
 
@@ -104,47 +112,40 @@ def test_exlr8_uses_glm_drafter_default_and_explicit_opt_out(speculator: str, tm
             assert ("--draft" in command) == (selected == "dflash2")
             if selected == "dflash2":
                 assert "models--incoai--GLM-5.3-DFlash2/snapshots/" in command[command.index("--draft") + 1]
-            assert "--exlr8-dense-from" in command
         else:
             assert "expertd-native" in command
             assert "--draft" not in command
 
 
 @pytest.mark.parametrize("manifest", ["up1", "bit325"])
-def test_exlr8_forwards_native_selection_without_dense_worker_flags(manifest: str) -> None:
+def test_exlr8_forwards_checkpoint_native_selection(manifest: str) -> None:
     result = capture(ROOT, f"exlr8-{manifest}", release_entry=exlr8_entry(manifest))
     assert len(result["plans"]) == 1
     plan = result["plans"][0]
     assert plan[plan.index("--exlr8-manifest") + 1] == manifest
-    dense = plan[plan.index("--exlr8-dense-from") + 1]
-    assert dense.startswith("<root>/hf/hub/models--deepseek-ai--DeepSeek-V4.1-Flash/snapshots/")
-    assert "CUTEAFD_GLM_PREFILL_LANES=3" in plan
+    assert "--exlr8-dense-from" not in plan
+    assert "--prefill-lanes" not in plan and "CUTEAFD_GLM_PREFILL_LANES=2" not in plan
     assert len(result["containers"]) == 5
     for run in result["containers"]:
         parsed = parse_run(run["argv"])
         command = parsed["command"]
         assert command[command.index("--exlr8-manifest") + 1] == manifest
         if "serve-glm" in command:
-            assert command[command.index("--exlr8-dense-from") + 1] == dense
-            assert parsed["env"]["CUTEAFD_GLM_PREFILL_LANES"] == "3"
+            assert "--exlr8-dense-from" not in command
+            assert command[command.index("--prefill-waves") + 1] == "2"
+            assert "CUTEAFD_GLM_PREFILL_LANES" not in parsed["env"]
         else:
             assert "expertd-native" in command
-            assert "--exlr8-dense-from" not in command
 
 
-@pytest.mark.parametrize("lanes", ["1", "2", "3", "4"])
-def test_exlr8_launcher_preserves_explicit_prefill_lanes(lanes: str, tmp_path: Path) -> None:
-    source = ROOT / "scripts/launch/run-family.sh"
-    launcher = tmp_path / "run-family.sh"
-    launcher.write_text(source.read_text().replace(
-        '    selected_lanes="${CUTEAFD_GLM_PREFILL_LANES:-3}"',
-        f'    CUTEAFD_GLM_PREFILL_LANES={lanes}\n'
-        '    selected_lanes="${CUTEAFD_GLM_PREFILL_LANES:-3}"'))
-    result = capture(ROOT, f"exlr8-lanes-{lanes}", release_entry=exlr8_entry(),
-        launcher_source=launcher)
-    assert f"CUTEAFD_GLM_PREFILL_LANES={lanes}" in result["plans"][0]
+@pytest.mark.parametrize("waves", ["1", "2", "3", "4"])
+def test_exlr8_launcher_preserves_explicit_prefill_waves(waves: str) -> None:
+    result = capture(ROOT, f"exlr8-waves-{waves}", release_entry=exlr8_entry(PREFILL_WAVES=waves))
+    plan = result["plans"][0]
+    assert plan[plan.index("--prefill-waves") + 1] == waves
     coordinator = parse_run(result["containers"][0]["argv"])
-    assert coordinator["env"]["CUTEAFD_GLM_PREFILL_LANES"] == lanes
+    assert coordinator["command"][coordinator["command"].index("--prefill-waves") + 1] == waves
+    assert "CUTEAFD_GLM_PREFILL_LANES" not in coordinator["env"]
 
 
 @pytest.mark.parametrize("gpus,attention", [("1", "auto"), ("1", "heads"), ("2", "auto"), ("2", "context")])
@@ -164,14 +165,12 @@ def test_exlr8_launcher_accepts_canonical_spark_worlds(ranks: int, gpus: str, at
 
 @pytest.mark.parametrize("overrides,reason", [
     ({"EXLR8_MANIFEST": "other"}, "EXLR8_MANIFEST"),
-    ({"EXLR8_DENSE_FROM": ""}, "EXLR8_DENSE_FROM"),
     ({"RTX_GPUS": "0"}, "RTX GPUs"),
     ({"RTX_GPUS": "3"}, "RTX GPUs"),
     ({"RTX_GPUS": "1"}, "heads attention"),
     ({"RTX_GPUS": "1", "ATTENTION_PLACEMENT": "layers"}, "heads attention"),
-    ({"SPARK_COUNT": "7"}, "canonical Spark ranks"),
+    ({"SPARK_COUNT": "9"}, "canonical Spark ranks"),
     ({"SPECULATOR": "mtp"}, "SPECULATOR=off or dflash2"),
-    ({"RTX_EXPERT_LAYERS": "1"}, "cannot onboard"),
     ({"ATTENTION_PLACEMENT": "heads"}, "context attention"),
 ])
 def test_exlr8_launcher_refuses_unsupported_route(overrides: dict, reason: str) -> None:
@@ -254,3 +253,31 @@ def test_implicit_mimo_host_cache_matches_effective_serve_argv(enabled: str) -> 
     assert serve.count("--host-cache-bytes") == 1
     assert actual == "auto"
     assert plan[plan.index("--host-cache-bytes") + 1] == actual
+
+
+@pytest.mark.parametrize("card,lanes,concurrency,resolved", [
+    ("v41-flash-max", "2", "16", "2"),
+    ("mimo-pro-max", "1", "16", "1"),
+    ("mimo-pro-max", "1", "1", "1"),
+    ("glm53-exl3-max", "1", "16", None),
+])
+def test_decode_lanes_forward_planner_resolution(card, lanes, concurrency, resolved):
+    entry = release_entry(next(e for e in ENTRIES if e["name"] == card))
+    entry["set"].update(DECODE_LANES=lanes, CONCURRENCY=concurrency)
+    result = capture(ROOT, "decode-" + card + "-" + lanes + "-" + concurrency, release_entry=entry)
+    plan = result["plans"][0]
+    assert plan[plan.index("--decode-lanes") + 1] == lanes
+    command = parse_run(result["containers"][0]["argv"])["command"]
+    if resolved is None:
+        assert "--decode-lanes" not in command
+    else:
+        assert command[command.index("--decode-lanes") + 1] == resolved
+
+
+@pytest.mark.parametrize("card,lanes", [("v41-flash-max", "1"), ("glm53-exl3-max", "2"),
+    ("mimo-pro-max", "0"), ("mimo-pro-max", "2"), ("mimo-pro-max", "3")])
+def test_decode_lanes_refuse_invalid_or_unsupported_before_serving(card, lanes):
+    entry = release_entry(next(e for e in ENTRIES if e["name"] == card))
+    entry["set"]["DECODE_LANES"] = lanes
+    with pytest.raises(RuntimeError, match="unsupported --decode-lanes|DECODE_LANES must be"):
+        capture(ROOT, "decode-refuse-" + card + "-" + lanes, release_entry=entry)

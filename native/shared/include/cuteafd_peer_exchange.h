@@ -99,22 +99,7 @@ int32_t cuteafd_peer_wait_diagnostic(const uint32_t* flag, uint32_t* recv_state,
 // (host-mapped flags work there too).
 int32_t cuteafd_host_signal(uint32_t* flag, uint32_t* send_state, uint32_t* descriptor,
     const uint32_t* words, void* stream);
-// cuteafd_host_signal with its payload: stores three spans (device `sources`
-// into pinned, device-mapped host `destinations`, `bytes` each a multiple of
-// 16 on 16-byte aligned addresses; empty spans allowed) with a small grid
-// instead of copy-engine copies, then publishes as cuteafd_host_signal.
-// `arrivals` (u32 [1], device memory, zeroed) is reset by every launch.
-int32_t cuteafd_host_publish(const void* const* sources, void* const* destinations, const uint64_t* bytes,
-    uint32_t* flag, uint32_t* send_state, uint32_t* descriptor, const uint32_t* words, uint32_t* arrivals,
-    void* stream);
 
-// Write-mode Spark completions: one warp spins (acquire, system scope) until
-// each of `ranks` u64 flags (`stride_words` apart, device memory the NICs
-// write) carries the next sequence of `state` (u32 [1], zeroed; graph-safe) in
-// its low 32 bits, sets bit r of `error` for a rank whose flag has bit 63, then
-// advances `state`. Traps after 60 s.
-int32_t cuteafd_spark_wait_written(const uint64_t* flags, uint32_t ranks, uint32_t stride_words,
-    uint32_t* state, uint32_t* error, void* stream);
 // Optional terminal cancellation. The legacy wait/symbol above is unchanged.
 // Initialize before enqueueing any abortable wait. `aborted` is a separate,
 // zeroed local u32 that outlives every eager/captured wait and is never reset.
@@ -125,6 +110,14 @@ int32_t cuteafd_peer_abort_initialize(void);
 int32_t cuteafd_peer_wait_abortable(const uint32_t* flag, uint32_t* recv_state,
     const uint32_t* aborted, void* stream);
 int32_t cuteafd_peer_abort_publish(uint32_t* aborted, void* independent_stream);
+
+// On the stream: copy `count` (1..4) byte regions (`bytes[i]` from
+// `sources[i]` to `destinations[i]`, any alignment; device pointers or the
+// device aliases of mapped pinned host memory) with SM loads and stores,
+// then a system-scope fence. The Spark exchange stages and lands its rows
+// this way: SM work stays in stream order behind stream memory waits.
+int32_t cuteafd_sm_copy_regions(void* const* destinations, const void* const* sources,
+    const uint64_t* bytes, uint32_t count, void* stream);
 
 // P2P probe for `cuteafd fabric --p2p`. Runs one measurement between devices
 // `a` and `b` (peer access enabled both ways by the call) and writes the time

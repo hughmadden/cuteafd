@@ -145,18 +145,30 @@ class PackageProfileTests(unittest.TestCase):
             # Preserve the policy's options in the fake export record.
             self.assertLessEqual(set(options), {'tile', 'blocks_per_sm', 'route_block',
                                                 'hidden', 'swiglu_limit', 'decode_schedule',
-                                                'compact_weights', 'token_major_rotation'},
+                                                'compact_weights', 'token_major_rotation', 'warp_specialized',
+                                                'wire_input', 'ws_input_stages', 'ws_dynamic_tiles', 'activation'},
                                  'unexpected option consumed by the fake export')
             if options.get('compact_weights'):
                 self.assertEqual(len(tiers), 2)
                 meta.update(descriptor_rows=7, native_info_version=3)
+            if 'warp_specialized' in options:
+                meta['warp_specialized'] = options['warp_specialized']
+            if options.get('ws_input_stages') is not None:
+                meta['ws_input_stages'] = options['ws_input_stages']
+            if options.get('ws_dynamic_tiles'):
+                meta['ws_dynamic_tiles'] = True
+            if options.get('wire_input'):
+                meta['input_format'] = 'e4m3_k32'
+            if 'fused_input_rotation' in options:
+                meta['fused_input_rotation'] = options['fused_input_rotation']
             if 'token_major_rotation' in options:
                 meta['token_major_rotation'] = options['token_major_rotation']
             if 'route_block' in options:
                 meta['route_block'] = options['route_block']
             if 'decode_schedule' in options:
-                # The exporter records b12x's canonical options; any string will do here.
-                meta['decode_schedule'] = f"canonical:{options['decode_schedule']}"
+                # Pure schedules are already canonical; retain the alias sentinel.
+                schedule = options['decode_schedule']
+                meta['decode_schedule'] = schedule if schedule.startswith('l2=') else f'canonical:{schedule}'
             if geometry != 'v41':
                 meta['hidden'] = options['hidden']
                 self.assertEqual(options['hidden'], package.GEOMETRIES[geometry][0])
@@ -226,7 +238,11 @@ class PackageProfileTests(unittest.TestCase):
                 self.assertEqual(call.args[1], 384)
                 self.assertEqual(call.kwargs['tile'], (64, 128, 64, 128))
                 self.assertNotIn('warp_specialized', call.kwargs)
-                self.assertNotIn('decode_schedule', call.kwargs)
+                expected = package.default_decode_schedule('glm', 'spark', 'tp6-compact-width384',
+                                                           call.args[3], [4, 5])
+                self.assertEqual(call.kwargs.get('decode_schedule'), expected)
+                if expected:
+                    self.assertIn('+' + expected, str(call.args[0]))
             self.assertEqual(manifest['requested_layouts'],
                              [f'tp6-compact-rank{rank}' for rank in range(6)])
             self.assertEqual(manifest['requested_capacities'], [1, 16])
@@ -247,6 +263,319 @@ class PackageProfileTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, 'descriptor contract mismatch'):
                 package.verify(output)
 
+    def test_compact_ws_qualifies_measured_glm_cells(self):
+        capacities = (1, 16, 80, 256, 1024, 2752, 4096)
+        self.assertEqual([package.compact_warp_specialized('glm', 'spark', 384, c)
+                          for c in capacities], [False] * 3 + [True] * 4)
+        self.assertEqual([package.compact_ws_route_block('glm', 'spark', 384, c)
+                          for c in capacities], [None] * 3 + [32, 64, 64, 64])
+        # TP3 compact width 768 is the second measured cell: 64-row blocks at
+        # every served capacity (32 ties at m256 and loses from m1024 up).
+        self.assertEqual([package.compact_warp_specialized('glm', 'spark', 768, c)
+                          for c in capacities], [False] * 3 + [True] * 4)
+        self.assertEqual([package.compact_ws_route_block('glm', 'spark', 768, c)
+                          for c in capacities], [None] * 3 + [64] * 4)
+        for geometry in ('dsv4p', 'kimik3', 'glmf'):
+            for width in (384, 768):
+                if geometry == 'glmf' and width in (384, 768):
+                    continue  # measured by test_compact_ws_qualifies_v41_and_qwen_cells
+                self.assertFalse(any(package.compact_warp_specialized(geometry, 'spark', width, c)
+                                     for c in capacities))
+        self.assertFalse(any(package.compact_warp_specialized('v41', 'spark', 768, c)
+                             for c in capacities))
+        self.assertFalse(any(package.compact_warp_specialized('qwen4', 'spark', 768, c)
+                             for c in capacities))
+        self.assertFalse(package.compact_warp_specialized('glm', 'coordinator', 384, 4096))
+        self.assertFalse(package.compact_warp_specialized('glm', 'coordinator', 768, 4096))
+        # Unmeasured capacities stay cooperative even above the smallest one.
+        for width in (384, 768):
+            self.assertFalse(any(package.compact_warp_specialized('glm', 'spark', width, c)
+                                 for c in (512, 1536, 8192)))
+        # Unmeasured widths of the same geometry stay cooperative at every
+        # capacity; TP5 compact (640) and TP8 compact (256) were never measured.
+        self.assertFalse(any(package.compact_warp_specialized('glm', 'spark', width, 4096)
+                             for width in (256, 512, 640)))
+        # The 192-wide FC1 tile wins from m1024 up on both measured widths;
+        # m256 keeps the N128 tile that names the cooperative geometry.
+        for width in (384, 768):
+            self.assertEqual(package.ws_tile('glm', 'spark', width, 1024, compact=True),
+                             package.TILE_384_COMPACT_N192)
+            self.assertEqual(package.ws_tile('glm', 'spark', width, 2752, compact=True),
+                             package.TILE_384_COMPACT_N192)
+            self.assertEqual(package.ws_tile('glm', 'spark', width, 4096, compact=True),
+                             package.TILE_384_COMPACT_N192)
+            self.assertEqual(package.ws_tile('glm', 'spark', width, 256, compact=True),
+                             package.TILE_384_COMPACT)
+            self.assertEqual(package.compact_ws_tile('glm', 'spark', width, 4096),
+                             package.TILE_384_COMPACT_N192)
+            self.assertIsNone(package.compact_ws_tile('glm', 'coordinator', width, 4096))
+        self.assertEqual(package.compact_ws_tile('glm', 'spark', 384, 256),
+                         package.TILE_384_COMPACT)
+        self.assertIsNone(package.compact_ws_tile('glm', 'spark', 384, 80))
+        self.assertIsNone(package.ws_tile('glm', 'spark', 384, 80, compact=True))
+        self.assertIsNone(package.ws_tile('glm', 'spark', 640, 4096, compact=True))
+        # Ordinary width-384 packs keep their 192-wide FC1 tile.
+        self.assertEqual(package.ws_tile('glm', 'spark', 384, 4096), package.TILE_384)
+        # The measured cells are the K4/K5 tier family; another tier pair is a
+        # different, unmeasured cell.
+        self.assertTrue(package.compact_ws_export('glm', 'spark', 384, 4096, (4, 5)))
+        self.assertTrue(package.compact_ws_export('glm', 'spark', 768, 4096, (4, 5)))
+        self.assertFalse(package.compact_ws_export('glm', 'spark', 384, 4096, (3, 4)))
+        self.assertFalse(package.compact_ws_export('glm', 'spark', 768, 4096, (3, 4)))
+        self.assertFalse(package.compact_ws_export('glm', 'spark', 384, 4096, (5, 6)))
+        self.assertFalse(package.compact_ws_export('glm', 'spark', 768, 4096, (5, 6)))
+        self.assertFalse(package.compact_ws_export('glm', 'spark', 384, 80, (4, 5)))
+        self.assertFalse(package.compact_ws_export('glm', 'spark', 768, 80, (4, 5)))
+
+    def test_compact_ws_qualifies_dsv4f_cells(self):
+        capacities = (1, 16, 80, 256, 1024, 2752, 4096)
+        # V4 Flash K4/K5, synthetic weights on uniform top-6 routes: both
+        # compact worlds take 32-row N128 blocks at m256 and 64-row N192
+        # blocks from m1024 up.
+        for width in (384, 768):
+            self.assertEqual([package.compact_warp_specialized('dsv4f', 'spark', width, c)
+                              for c in capacities], [False] * 3 + [True] * 4)
+            self.assertEqual([package.compact_ws_route_block('dsv4f', 'spark', width, c)
+                              for c in capacities], [None] * 3 + [32, 64, 64, 64])
+            self.assertEqual([package.ws_tile('dsv4f', 'spark', width, c, compact=True)
+                              for c in capacities],
+                             [None] * 3 + [package.TILE_384_COMPACT]
+                             + [package.TILE_384_COMPACT_N192] * 3)
+            self.assertTrue(package.compact_ws_export('dsv4f', 'spark', width, 4096, (4, 5)))
+            self.assertFalse(package.compact_ws_export('dsv4f', 'spark', width, 4096, (3, 4)))
+            self.assertFalse(package.compact_warp_specialized('dsv4f', 'coordinator', width, 4096))
+        # TP5 compact width 512 was never measured.
+        self.assertFalse(any(package.compact_warp_specialized('dsv4f', 'spark', 512, c)
+                             for c in capacities))
+
+    def test_compact_ws_qualifies_v41_and_qwen_cells(self):
+        capacities = (1, 16, 80, 256, 1024, 2752, 4096)
+        # V4.1 K3/K4 TP4 compact width 640 (the only uneven V4.1 world): the
+        # 32-row block wins m256/m1024, the 64-row block m2752/m4096.
+        self.assertEqual([package.compact_warp_specialized('v41', 'spark', 640, c)
+                          for c in capacities], [False] * 3 + [True] * 4)
+        self.assertEqual([package.compact_ws_route_block('v41', 'spark', 640, c)
+                          for c in capacities], [None] * 3 + [32, 32, 64, 64])
+        # Qwen4 K4/K5 TP2 compact width 384: 32 rows at m256, 64 above.
+        self.assertEqual([package.compact_warp_specialized('qwen4', 'spark', 384, c)
+                          for c in capacities], [False] * 3 + [True] * 4)
+        self.assertEqual([package.compact_ws_route_block('qwen4', 'spark', 384, c)
+                          for c in capacities], [None] * 3 + [32, 64, 64, 64])
+        # TP3 and TP4 share width 256 and take 64 at every served capacity.
+        self.assertEqual([package.compact_warp_specialized('qwen4', 'spark', 256, c)
+                          for c in capacities], [False] * 3 + [True] * 4)
+        self.assertEqual([package.compact_ws_route_block('qwen4', 'spark', 256, c)
+                          for c in capacities], [None] * 3 + [64] * 4)
+        # Other compact worlds of these geometries keep the cooperative kernel:
+        # V4.1 TP4's padded 512 pair split and Qwen TP1 width 640 are ordinary
+        # profiles, and the unmeasured widths stay off even under compaction.
+        self.assertFalse(any(package.compact_warp_specialized('v41', 'spark', 512, c)
+                             for c in capacities))
+        self.assertFalse(any(package.compact_warp_specialized('qwen4', 'spark', 640, c)
+                             for c in capacities))
+        self.assertFalse(any(package.compact_warp_specialized('v41', 'spark', 640, c)
+                             for c in (512, 1536, 8192)))
+        self.assertFalse(any(package.compact_warp_specialized('qwen4', 'spark', 384, c)
+                             for c in (512, 1536, 8192)))
+        self.assertFalse(package.compact_warp_specialized('v41', 'coordinator', 640, 4096))
+        self.assertFalse(package.compact_warp_specialized('qwen4', 'coordinator', 384, 4096))
+        # V4.1 width 640 is not divisible by 192, but the 192-wide FC1 tile
+        # still wins at m256..m2752; m4096 keeps N128.
+        self.assertEqual([package.ws_tile('v41', 'spark', 640, c, compact=True)
+                          for c in capacities],
+                         [None] * 3 + [package.TILE_384_COMPACT_N192] * 3
+                         + [package.TILE_384_COMPACT])
+        self.assertEqual(package.compact_ws_tile('v41', 'spark', 640, 2752),
+                         package.TILE_384_COMPACT_N192)
+        self.assertIsNone(package.compact_ws_tile('v41', 'spark', 640, 80))
+        # Qwen4 width 256 cannot take a 192-wide FC1 tile at all.
+        for capacity in (256, 1024, 2752, 4096):
+            self.assertEqual(package.ws_tile('qwen4', 'spark', 256, capacity,
+                                             compact=True),
+                             package.TILE_384_COMPACT)
+        self.assertIsNone(package.ws_tile('qwen4', 'spark', 256, 80, compact=True))
+        # Qwen4 width 384 divides 192: the large capacities consolidate onto
+        # the N192 arm and m256 keeps N128 behind the 32-row block.
+        self.assertEqual([package.ws_tile('qwen4', 'spark', 384, c, compact=True)
+                          for c in capacities],
+                         [None] * 3 + [package.TILE_384_COMPACT]
+                         + [package.TILE_384_COMPACT_N192] * 3)
+        # Measured tier pairs only: V4.1 K3.25 is K3/K4, Qwen's shipped quant
+        # K4/K5; another pair of the same geometry stays cooperative.
+        self.assertTrue(package.compact_ws_export('v41', 'spark', 640, 4096, (3, 4)))
+        self.assertTrue(package.compact_ws_export('qwen4', 'spark', 384, 4096, (4, 5)))
+        self.assertTrue(package.compact_ws_export('qwen4', 'spark', 256, 4096, (4, 5)))
+        self.assertFalse(package.compact_ws_export('v41', 'spark', 640, 4096, (4, 5)))
+        self.assertFalse(package.compact_ws_export('qwen4', 'spark', 384, 4096, (3, 4)))
+        self.assertFalse(package.compact_ws_export('qwen4', 'spark', 256, 4096, (3, 4)))
+        # GLM Flash K3/K4: TP6 compact width 384 and TP3 compact width 768
+        # both take 32-row N128 blocks at m256 and 64-row N192 blocks above.
+        for width in (384, 768):
+            self.assertEqual([package.compact_warp_specialized('glmf', 'spark', width, c)
+                              for c in capacities], [False] * 3 + [True] * 4)
+            self.assertEqual([package.compact_ws_route_block('glmf', 'spark', width, c)
+                              for c in capacities], [None] * 3 + [32, 64, 64, 64])
+            self.assertEqual([package.ws_tile('glmf', 'spark', width, c, compact=True)
+                              for c in capacities],
+                             [None] * 3 + [package.TILE_384_COMPACT]
+                             + [package.TILE_384_COMPACT_N192] * 3)
+            self.assertTrue(package.compact_ws_export('glmf', 'spark', width, 4096, (3, 4)))
+            self.assertFalse(package.compact_ws_export('glmf', 'spark', width, 4096, (4, 5)))
+        # TP5 compact width 512 was never measured.
+        self.assertFalse(any(package.compact_warp_specialized('glmf', 'spark', 512, c)
+                             for c in capacities))
+
+    def test_compact_glm_ws_prefill_export_and_verification(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            _output, manifest, calls, _ = self.build_fixture(
+                root, 'spark', (4, 5), geometry='glm', capacities=(1, 4096),
+                compact=True, profiles=('tp6-width256',))
+            compact_calls = [call for call in calls if call.kwargs.get('compact_weights')]
+            ws_calls = [call for call in compact_calls if call.args[3] == 4096]
+            self.assertTrue(ws_calls)
+            for call in ws_calls:
+                self.assertTrue(call.kwargs['warp_specialized'])
+                self.assertEqual(call.kwargs['route_block'], 64)
+                self.assertEqual(call.kwargs['tile'], package.TILE_384_COMPACT_N192)
+                self.assertTrue(call.kwargs['ws_dynamic_tiles'])
+                self.assertNotIn('token_major_rotation', call.kwargs)
+                self.assertNotIn('wire_input', call.kwargs)
+                self.assertNotIn('ws_input_stages', call.kwargs)
+                # The N192 export gets its own build-tree key so the round-1
+                # N128 objects of the same arm are never reused.
+                self.assertIn('+ws-m64-dynamic-n192', str(call.args[0]))
+            for call in [call for call in compact_calls if call.args[3] == 1]:
+                self.assertNotIn('warp_specialized', call.kwargs)
+                self.assertEqual(call.kwargs['tile'], (64, 128, 64, 128))
+                self.assertNotIn('+ws-m', str(call.args[0]))
+            variant = next(v for v in manifest['variants']
+                           if '-compact-' in v['directory'] and v['capacity'] == 4096)
+            self.assertTrue(variant['warp_specialized'])
+            self.assertEqual(variant['tile'], list(package.TILE_384_COMPACT_N192))
+            self.assertEqual(variant['route_block'], 64)
+            self.assertTrue(variant['ws_dynamic_tiles'])
+
+    def test_ordinary_spark_ws_cells_preserve_compact_cache_keys(self):
+        for geometry, bits in (('qwen4', (4, 5)), ('v41', (3, 4))):
+            with self.subTest(geometry=geometry), tempfile.TemporaryDirectory() as temporary:
+                _, _, calls, _ = self.build_fixture(
+                    Path(temporary), 'spark', bits, geometry=geometry,
+                    capacities=(2048, 2752), compact=True)
+                compact_calls = [call for call in calls
+                                 if call.kwargs.get('compact_weights')
+                                 and call.kwargs.get('warp_specialized')]
+                self.assertTrue(compact_calls)
+                for call in compact_calls:
+                    cache_key = call.args[0].parent.name
+                    self.assertEqual(cache_key.count('+ws-m'), 1)
+                    self.assertIn('+ws-m64-dynamic', cache_key)
+                    self.assertTrue(call.kwargs['ws_dynamic_tiles'])
+                    self.assertEqual(call.kwargs['route_block'], 64)
+                    self.assertFalse(call.kwargs.get('token_major_rotation', False))
+
+    def test_compact_ws_small_capacity_keeps_the_32_row_block(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            _output, manifest, calls, _ = self.build_fixture(
+                root, 'spark', (4, 5), geometry='glm', capacities=(256, 1024, 4096),
+                compact=True, profiles=('tp6-width256',))
+            ws_calls = [call for call in calls if call.kwargs.get('compact_weights')
+                        and call.kwargs.get('warp_specialized')]
+            self.assertEqual({call.args[3]: call.kwargs['route_block'] for call in ws_calls},
+                             {256: 32, 1024: 64, 4096: 64})
+            self.assertTrue(any('+ws-m32-dynamic' in str(call.args[0]) for call in ws_calls
+                                if call.args[3] == 256))
+            self.assertTrue(all('+ws-m64-dynamic-n192' in str(call.args[0]) for call in ws_calls
+                                if call.args[3] >= 1024))
+            tiles = {call.args[3]: call.kwargs['tile'] for call in ws_calls}
+            self.assertEqual(tiles, {256: package.TILE_384_COMPACT,
+                                     1024: package.TILE_384_COMPACT_N192,
+                                     4096: package.TILE_384_COMPACT_N192})
+            for variant in manifest['variants']:
+                if '-compact-' in variant['directory'] and variant['capacity'] == 256:
+                    self.assertEqual(variant['route_block'], 32)
+                    self.assertEqual(variant['tile'], list(package.TILE_384_COMPACT))
+
+    def test_compact_unmeasured_tier_family_stays_cooperative(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            output, manifest, calls, _ = self.build_fixture(
+                root, 'spark', (3, 4), geometry='glm', capacities=(4096,),
+                compact=True, profiles=('tp6-width256',))
+            compact_calls = [call for call in calls if call.kwargs.get('compact_weights')]
+            self.assertTrue(compact_calls)
+            for call in compact_calls:
+                self.assertNotIn('warp_specialized', call.kwargs)
+                self.assertEqual(call.kwargs['tile'], (64, 128, 64, 128))
+                self.assertNotIn('+ws-m', str(call.args[0]))
+            package.verify(output)
+            # The same package may not claim the qualified cell's contract.
+            variant = next(v for v in manifest['variants']
+                           if '-compact-' in v['directory'] and v['capacity'] == 4096)
+            path = output / variant['directory'] / 'v41_exl3.json'
+            meta = json.loads(path.read_text())
+            meta.update(warp_specialized=True, route_block=64,
+                        ws_dynamic_tiles=True, tile=list(package.TILE_384_COMPACT))
+            path.write_text(json.dumps(meta))
+            manifest['files'][str(path.relative_to(output))] = {
+                'bytes': path.stat().st_size, 'sha256': package.digest(path)}
+            (output / 'manifest.json').write_text(json.dumps(manifest))
+            with self.assertRaisesRegex(ValueError, 'invalid compact geometry or execution contract'):
+                package.verify(output)
+
+    def test_compact_ws_verifier_rejects_unqualified_execution_contracts(self):
+        cases = [
+            ('glm', 384, 256, (4, 5), {'route_block': 64}),
+            ('glm', 384, 1024, (4, 5), {'route_block': 32}),
+            ('glm', 384, 256, (4, 5), {'ws_dynamic_tiles': False}),
+            ('glm', 384, 256, (4, 5), {'ws_input_stages': 3}),
+            ('glm', 384, 256, (4, 5), {'token_major_rotation': True}),
+            ('glm', 384, 256, (4, 5), {'fused_input_rotation': True}),
+            ('glm', 384, 1024, (4, 5), {'tile': [64, 128, 64, 128]}),
+            ('glm', 768, 4096, (4, 5), {'tile': [64, 128, 64, 256]}),
+            ('glmf', 384, 4096, (3, 4), {'tile': [64, 128, 64, 256]}),
+            ('glm', 384, 80, (4, 5), {}),
+            # Measured cells with the wrong per-capacity block: width 256 takes
+            # 64 rows at m256, V4.1 width 640 takes 32.
+            ('qwen4', 256, 256, (4, 5), {'route_block': 32}),
+            ('v41', 640, 256, (3, 4), {'route_block': 64}),
+            ('v41', 640, 2752, (3, 4), {'tile': [64, 128, 64, 256]}),
+            ('v41', 640, 4096, (3, 4), {'tile': [64, 192, 64, 256]}),
+            # A measured width of another tier pair, and compact cells that
+            # were never measured, may not claim the warp-specialized contract.
+            ('v41', 640, 4096, (4, 5), {}),
+            ('dsv4f', 768, 4096, (3, 4), {}),
+            ('dsv4f', 768, 256, (4, 5), {'tile': [64, 192, 64, 256]}),
+        ]
+        for geometry, width, capacity, bits, overrides in cases:
+            with self.subTest(geometry=geometry, width=width, capacity=capacity,
+                              overrides=overrides), tempfile.TemporaryDirectory() as temporary:
+                output, manifest, _, _ = self.build_fixture(
+                    Path(temporary), 'spark', bits, geometry=geometry,
+                    capacities=(capacity,), compact=True)
+                variant = next(v for v in manifest['variants']
+                               if '-compact-' in v['directory'] and v['intermediate'] == width)
+                path = output / variant['directory'] / 'v41_exl3.json'
+                meta = json.loads(path.read_text())
+                # Seed the policy's own block/tile so a case fails only for
+                # what it overrides; an unqualified cell falls back to the
+                # canonical N128 contract, which the verifier still rejects.
+                block = package.compact_ws_route_block(geometry, 'spark', width, capacity)
+                tile = package.ws_tile(geometry, 'spark', width, capacity, compact=True)
+                meta.update(warp_specialized=True,
+                            route_block=block if block is not None else 64,
+                            ws_dynamic_tiles=True,
+                            tile=list(tile) if tile is not None
+                            else list(package.TILE_384_COMPACT))
+                meta.update(overrides)
+                path.write_text(json.dumps(meta))
+                manifest['files'][str(path.relative_to(output))] = {
+                    'bytes': path.stat().st_size, 'sha256': package.digest(path)}
+                (output / 'manifest.json').write_text(json.dumps(manifest))
+                with self.assertRaisesRegex(ValueError, 'invalid compact geometry or execution contract'):
+                    package.verify(output)
+
     def test_compact_prefill_keeps_cooperative_route_and_legacy_cache_keys(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -258,13 +587,38 @@ class PackageProfileTests(unittest.TestCase):
             for call in calls:
                 path = call.args[0].relative_to(root / 'build')
                 if call.kwargs.get('compact_weights'):
-                    self.assertEqual(path.parts[0], 'tp4-compact-width640+tile64-128-64-128')
-                    self.assertNotIn('warp_specialized', call.kwargs)
+                    if call.args[3] == 4096:
+                        # V4.1 TP4 width 640 is a measured compact WS cell.
+                        self.assertTrue(call.kwargs['warp_specialized'])
+                        self.assertEqual(call.kwargs['route_block'], 64)
+                        self.assertIn('+ws-m64-dynamic', path.parts[0])
+                    else:
+                        # Decode capacities keep the cooperative kernel under the
+                        # tile-pinned key earlier build trees already hold.
+                        self.assertEqual(path.parts[0],
+                                         'tp4-compact-width640+tile64-128-64-128')
+                        self.assertNotIn('warp_specialized', call.kwargs)
                 elif call.args[3] == 16:
                     self.assertIn('+tile', path.parts[0])
                 else:
                     self.assertIn(path.parts[0], ('tp4-width512', 'tp4-width640'))
                     self.assertNotIn('descriptor_rows', json.loads((call.args[0] / 'v41_exl3.json').read_text()))
+
+    def test_unmeasured_compact_cell_keeps_the_cooperative_export(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            # Every GLM/GLM Flash/V4.1/Qwen compact cell is now measured or
+            # null; the two V4 Flash compact worlds stay cooperative because
+            # no EXL3 checkpoint exists to derive their ownership.
+            _output, _manifest, calls, _ = self.build_fixture(
+                root, 'spark', (2, 3), geometry='dsv4f', capacities=(16, 4096),
+                compact=True, profiles=('tp3-width768',))
+            compact_calls = [call for call in calls if call.kwargs.get('compact_weights')]
+            self.assertTrue(compact_calls)
+            for call in compact_calls:
+                self.assertNotIn('warp_specialized', call.kwargs)
+                self.assertEqual(call.kwargs['tile'], (64, 128, 64, 128))
+                self.assertNotIn('+ws-m', str(call.args[0]))
 
     def test_compact_even_control_preserves_legacy_package(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -359,7 +713,7 @@ class PackageProfileTests(unittest.TestCase):
     def test_glmf_spark_tp4_decode_capacities_carry_the_gb10_schedule(self):
         """GLM 5.3 Flash's TP4 decode exports (m1, m80) get an m<capacity>-gb10 sibling with
         the gb10 decode schedule, compiled once per capacity and shared by the four ranks;
-        every other export, and every m<capacity>, stays the default schedule."""
+        default m1/m80 instead carry the measured pure evict-first identity."""
         with tempfile.TemporaryDirectory() as temporary:
             output, manifest, calls, capacities = self.build_fixture(
                 Path(temporary), 'spark', (3, 4), geometry='glmf')
@@ -372,7 +726,11 @@ class PackageProfileTests(unittest.TestCase):
                 meta = json.loads((output / directory / 'v41_exl3.json').read_text())
                 self.assertEqual(meta['decode_schedule'], 'canonical:gb10')
                 default = json.loads((output / directory.removesuffix('-gb10') / 'v41_exl3.json').read_text())
-                self.assertNotIn('decode_schedule', default)
+                self.assertEqual(default['decode_schedule'], package.PURE_EVICT_FIRST)
+                default_variant = next(v for v in manifest['variants']
+                                       if v['directory'] == directory.removesuffix('-gb10'))
+                self.assertNotIn('schedule', default_variant)
+                self.assertEqual(default_variant['decode_schedule'], default['decode_schedule'])
                 # m80-gb10 runs 64x128 tiles at two CTAs per SM; m1-gb10 keeps the default tile.
                 wide = directory.endswith('/m80-gb10')
                 self.assertEqual(variant['blocks_per_sm'], 2 if wide else 1)
@@ -567,18 +925,371 @@ class PackageProfileTests(unittest.TestCase):
         for capacity in (1, 16, 80, 256, 1024, 4096):
             self.assertFalse(f('v41', 'spark', 512, capacity) or f('dsv4p', 'coordinator', 768, capacity))
 
-    def test_warp_specialized_prefill_only_for_spark_prefill_capacities(self):
-        """V4 Pro, GLM 5.3 and GLM 5.3 Flash Spark packages at m256 and above;
-        decode capacities (<= 80), V4.1, V4 Flash, Qwen and the coordinator's
-        packages keep the cooperative kernel."""
+    def test_qwen_coordinator_rank0_prefill_units_use_qualified_n192(self):
+        for capacity in (2048, 2752):
+            self.assertEqual(package.ws_tile('qwen4', 'coordinator', 384, capacity),
+                             (64, 192, 64, 256))
+            self.assertTrue(package.ws_dynamic_tiles('qwen4', 'coordinator', 384, capacity))
+            self.assertEqual(package.ws_route_block('qwen4', 'coordinator', 384, capacity), 64)
+        for capacity in (256, 1024, 4096):
+            self.assertEqual(package.ws_tile('qwen4', 'coordinator', 384, capacity),
+                             package.TILE_RTX_MIXED)
+        for capacity in (2048, 2752):
+            self.assertEqual(package.ws_tile('qwen4', 'coordinator', 640, capacity),
+                             package.TILE_RTX_MIXED)
+        with tempfile.TemporaryDirectory() as temporary:
+            _, _, calls, _ = self.build_fixture(
+                Path(temporary), 'coordinator', (4, 5), geometry='qwen4',
+                capacities=(2048, 2752), profiles=('rtx-tp2-rank0',))
+            self.assertTrue(calls)
+            for call in calls:
+                self.assertEqual(call.kwargs['tile'], (64, 192, 64, 256))
+                self.assertTrue(call.kwargs['ws_dynamic_tiles'])
+                self.assertEqual(call.kwargs['route_block'], 64)
+
+    def test_qwen_coordinator_rank1_prefill_units_use_qualified_n256(self):
+        for capacity in (2048, 2752):
+            self.assertEqual(package.ws_tile('qwen4', 'coordinator', 256, capacity),
+                             (64, 256, 64, 256))
+            self.assertTrue(package.ws_dynamic_tiles('qwen4', 'coordinator', 256, capacity))
+            self.assertEqual(package.ws_route_block('qwen4', 'coordinator', 256, capacity), 64)
+        for capacity in (256, 1024, 4096):
+            self.assertEqual(package.ws_tile('qwen4', 'coordinator', 256, capacity),
+                             package.TILE_RTX_MIXED)
+        with tempfile.TemporaryDirectory() as temporary:
+            _, _, calls, _ = self.build_fixture(
+                Path(temporary), 'coordinator', (4, 5), geometry='qwen4',
+                capacities=(2048, 2752), profiles=('rtx-tp2-rank1',))
+            self.assertTrue(calls)
+            for call in calls:
+                self.assertEqual(call.kwargs['tile'], (64, 256, 64, 256))
+                self.assertTrue(call.kwargs['ws_dynamic_tiles'])
+                self.assertEqual(call.kwargs['route_block'], 64)
+
+    def test_v41_coordinator_tp2_prefill_units_use_qualified_n192(self):
+        for capacity in (2048, 2752):
+            self.assertEqual(package.ws_tile('v41', 'coordinator', 1152, capacity),
+                             (64, 192, 64, 256))
+            self.assertTrue(package.ws_dynamic_tiles('v41', 'coordinator', 1152, capacity))
+            self.assertEqual(package.ws_route_block('v41', 'coordinator', 1152, capacity), 64)
+            self.assertEqual(package.ws_tile('v41', 'coordinator', 2304, capacity),
+                             (64, 256, 64, 256))
+        for capacity in (1024, 4096):
+            self.assertEqual(package.ws_tile('v41', 'coordinator', 1152, capacity),
+                             package.TILE_RTX_MIXED)
+        with tempfile.TemporaryDirectory() as temporary:
+            _, _, calls, _ = self.build_fixture(
+                Path(temporary), 'coordinator', (3, 4), geometry='v41',
+                capacities=(2048, 2752), profiles=('rtx-tp2',))
+            self.assertTrue(calls)
+            for call in calls:
+                self.assertEqual(call.kwargs['tile'], (64, 192, 64, 256))
+                self.assertTrue(call.kwargs['ws_dynamic_tiles'])
+                self.assertEqual(call.kwargs['route_block'], 64)
+
+    def test_v41_coordinator_tp1_prefill_units_use_qualified_n256(self):
+        for capacity in (2048, 2752):
+            self.assertTrue(package.ws_dynamic_tiles('v41', 'coordinator', 2304, capacity))
+            self.assertEqual(package.ws_route_block('v41', 'coordinator', 2304, capacity), 64)
+        for capacity in (1024, 4096):
+            self.assertEqual(package.ws_tile('v41', 'coordinator', 2304, capacity),
+                             package.TILE_RTX_MIXED)
+        with tempfile.TemporaryDirectory() as temporary:
+            _, _, calls, _ = self.build_fixture(
+                Path(temporary), 'coordinator', (3, 4), geometry='v41',
+                capacities=(2048, 2752), profiles=('rtx-tp1',))
+            self.assertTrue(calls)
+            for call in calls:
+                self.assertEqual(call.kwargs['tile'], (64, 256, 64, 256))
+                self.assertTrue(call.kwargs['ws_dynamic_tiles'])
+                self.assertEqual(call.kwargs['route_block'], 64)
+
+    def test_glm_spark_width640_widens_only_qualified_fc2_tiles(self):
+        for capacity in (1024, 2048, 2752, 4096):
+            self.assertEqual(package.ws_tile('glm', 'spark', 640, capacity),
+                             package.TILE_RTX_MIXED)
+            wire = capacity in (1024, 4096)
+            self.assertEqual(package.wire_input('glm', 'spark', 640, capacity), wire)
+            self.assertEqual(package.ws_input_stages('glm', 'spark', 640, capacity),
+                             3 if wire else None)
+            self.assertTrue(package.ws_dynamic_tiles('glm', 'spark', 640, capacity))
+            self.assertEqual(package.ws_route_block('glm', 'spark', 640, capacity), 64)
+        for capacity in (1, 80, 256, 512, 1536, 8192):
+            self.assertIsNone(package.ws_tile('glm', 'spark', 640, capacity))
+        self.assertIsNone(package.ws_tile('dsv4p', 'spark', 640, 2048))
+        self.assertIsNone(package.ws_tile('glm', 'coordinator', 640, 2048))
+        self.assertIsNone(package.ws_tile('glm', 'spark', 640, 2048, compact=True))
+        with tempfile.TemporaryDirectory() as temporary:
+            _, _, calls, _ = self.build_fixture(
+                Path(temporary), 'spark', (4, 5), geometry='glm',
+                capacities=(1024, 2048, 2752, 4096), profiles=('tp3-width640',))
+            for call in calls:
+                self.assertEqual(call.kwargs['tile'], package.TILE_RTX_MIXED)
+                wire = call.args[3] in (1024, 4096)
+                self.assertEqual(call.kwargs.get('wire_input', False), wire)
+                self.assertTrue(call.kwargs['ws_dynamic_tiles'])
+                self.assertEqual(call.kwargs.get('ws_input_stages'), 3 if wire else None)
+                self.assertEqual(call.kwargs['route_block'], 64)
+
+    def test_glm_spark_width384_prefill_units_use_bf16_dynamic_n192(self):
+        for capacity in (2048, 2752):
+            self.assertFalse(package.wire_input('glm', 'spark', 384, capacity))
+            self.assertIsNone(package.ws_input_stages('glm', 'spark', 384, capacity))
+            self.assertTrue(package.ws_dynamic_tiles('glm', 'spark', 384, capacity))
+            self.assertEqual(package.ws_tile('glm', 'spark', 384, capacity), package.TILE_384)
+        for capacity in (1024, 4096):
+            self.assertTrue(package.wire_input('glm', 'spark', 384, capacity))
+        with tempfile.TemporaryDirectory() as temporary:
+            _, _, calls, _ = self.build_fixture(
+                Path(temporary), 'spark', (4, 5), geometry='glm',
+                capacities=(2048, 2752), profiles=('tp6-width384',))
+            self.assertTrue(calls)
+            for call in calls:
+                self.assertFalse(call.kwargs.get('wire_input', False))
+                self.assertIsNone(call.kwargs.get('ws_input_stages'))
+                self.assertTrue(call.kwargs['ws_dynamic_tiles'])
+                self.assertEqual(call.kwargs['tile'], package.TILE_384)
+                self.assertEqual(call.kwargs['route_block'], 64)
+
+    def test_flash_spark_qualified_prefill_units_use_dynamic_tiles(self):
+        tiles = {384: package.TILE_384, 640: package.TILE_RTX_MIXED}
+        for width in (256, 384, 512, 640, 768, 1024):
+            for capacity in (2048, 2752):
+                self.assertTrue(package.ws_dynamic_tiles('glmf', 'spark', width, capacity))
+                self.assertFalse(package.wire_input('glmf', 'spark', width, capacity))
+                self.assertEqual(package.ws_tile('glmf', 'spark', width, capacity),
+                                 tiles.get(width))
+            for capacity in (80, 256, 1024, 4096):
+                self.assertFalse(package.ws_dynamic_tiles('glmf', 'spark', width, capacity))
+        self.assertIsNone(package.ws_tile('glmf', 'spark', 384, 1024))
+        self.assertIsNone(package.ws_tile('glmf', 'spark', 384, 4096))
+        with tempfile.TemporaryDirectory() as temporary:
+            _, _, calls, _ = self.build_fixture(
+                Path(temporary), 'spark', (3, 4), geometry='glmf',
+                capacities=(2048, 2752))
+            self.assertTrue(calls)
+            for call in calls:
+                width = call.args[1]
+                self.assertTrue(call.kwargs['ws_dynamic_tiles'])
+                if width in tiles:
+                    self.assertEqual(call.kwargs['tile'], tiles[width])
+                self.assertEqual(call.kwargs['route_block'], 64)
+
+    def test_qwen_ordinary_spark_prefill_units_use_qualified_ws_cells(self):
+        cells = {
+            640: (False, (64, 128, 64, 128)),
+            384: (True, (64, 192, 64, 256)),
+            256: (False, (64, 256, 64, 256)),
+            128: (True, (64, 128, 64, 256)),
+        }
+        for width, (dynamic, tile) in cells.items():
+            for capacity in (2048, 2752):
+                self.assertTrue(package.warp_specialized('qwen4', 'spark', width, capacity))
+                self.assertEqual(package.ws_tile('qwen4', 'spark', width, capacity), tile)
+                self.assertEqual(package.ws_dynamic_tiles('qwen4', 'spark', width, capacity), dynamic)
+                self.assertFalse(package.wire_input('qwen4', 'spark', width, capacity))
+            for capacity in (1, 16, 80, 256, 1024, 4096):
+                self.assertFalse(package.warp_specialized('qwen4', 'spark', width, capacity))
+        self.assertFalse(package.warp_specialized('qwen4', 'spark', 512, 2048))
+        with tempfile.TemporaryDirectory() as temporary:
+            _, _, calls, _ = self.build_fixture(
+                Path(temporary), 'spark', (4, 5), geometry='qwen4',
+                capacities=(1024, 2048, 2752, 4096))
+            self.assertTrue(calls)
+            for call in calls:
+                width, capacity = call.args[1], call.args[3]
+                ws = capacity in (2048, 2752)
+                self.assertEqual(call.kwargs.get('warp_specialized', False), ws)
+                self.assertEqual('+ws-m64/' in str(call.args[0]), ws)
+                if ws:
+                    dynamic, tile = cells[width]
+                    self.assertEqual(call.kwargs['tile'], tile)
+                    self.assertEqual(call.kwargs.get('ws_dynamic_tiles', False), dynamic)
+                    self.assertEqual(call.kwargs['route_block'], 64)
+                    self.assertFalse(call.kwargs.get('token_major_rotation', False))
+                    self.assertFalse(call.kwargs.get('compact_weights', False))
+                else:
+                    self.assertEqual(call.kwargs['route_block'], 32)
+                    self.assertTrue(call.kwargs['token_major_rotation'])
+
+    def test_v41_ordinary_spark_prefill_units_use_qualified_ws_cells(self):
+        tiles = {
+            1152: (64, 192, 64, 256),
+            768: (64, 256, 64, 256),
+            640: (64, 128, 64, 256),
+            512: (64, 256, 64, 256),
+            384: (64, 192, 64, 256),
+        }
+        for width, tile in tiles.items():
+            for capacity in (2048, 2752):
+                self.assertTrue(package.warp_specialized('v41', 'spark', width, capacity))
+                self.assertEqual(package.ws_tile('v41', 'spark', width, capacity), tile)
+                self.assertTrue(package.ws_dynamic_tiles('v41', 'spark', width, capacity))
+                self.assertFalse(package.wire_input('v41', 'spark', width, capacity))
+            for capacity in (1, 16, 80, 256, 1024, 4096):
+                self.assertFalse(package.warp_specialized('v41', 'spark', width, capacity))
+        self.assertFalse(package.warp_specialized('v41', 'spark', 2304, 2048))
+        with tempfile.TemporaryDirectory() as temporary:
+            _, _, calls, _ = self.build_fixture(
+                Path(temporary), 'spark', (3, 4), geometry='v41',
+                capacities=(1024, 2048, 2752, 4096))
+            self.assertEqual({call.args[1] for call in calls}, set(tiles))
+            for call in calls:
+                width, capacity = call.args[1], call.args[3]
+                ws = capacity in (2048, 2752)
+                self.assertEqual(call.kwargs.get('warp_specialized', False), ws)
+                self.assertEqual('+ws-m64/' in str(call.args[0]), ws)
+                self.assertFalse(call.kwargs.get('token_major_rotation', False))
+                self.assertFalse(call.kwargs.get('compact_weights', False))
+                if ws:
+                    self.assertEqual(call.kwargs['tile'], tiles[width])
+                    self.assertTrue(call.kwargs['ws_dynamic_tiles'])
+                    self.assertEqual(call.kwargs['route_block'], 64)
+                else:
+                    self.assertEqual(call.kwargs.get('route_block', 8), 8)
+
+    def test_warp_specialized_spark_prefill_policy_is_unchanged(self):
+        """Existing Spark widths retain WS; unrelated coordinator families do not."""
         w = package.warp_specialized
         for geometry in ('dsv4p', 'glm', 'glmf'):
             for width in (512, 640, 768, 1024, 1536):
                 self.assertEqual([w(geometry, 'spark', width, c) for c in (1, 16, 80, 256, 1024, 4096)],
                                  [False, False, False, True, True, True])
-                self.assertFalse(any(w(geometry, 'coordinator', width, c) for c in (256, 1024, 4096)))
+                if geometry == 'dsv4p' and width == 1536:
+                    self.assertEqual([w(geometry, 'coordinator', width, c) for c in (256, 1024, 4096)],
+                                     [False, False, True])
+                elif geometry not in ('glm', 'glmf') or width != 1024:
+                    self.assertFalse(any(w(geometry, 'coordinator', width, c) for c in (256, 1024, 4096)))
         for geometry in ('v41', 'dsv4f', 'qwen4'):
             self.assertFalse(any(w(geometry, 'spark', 512, c) for c in (256, 1024, 4096)))
+
+    def test_glm_coordinator_ws_only_for_measured_tiers_and_capacities(self):
+        for geometry, target_bits in (('glm', (4, 5)), ('glmf', (3, 4))):
+            for bits in ((4, 5), (3, 4), (3, 4, 5)):
+                with self.subTest(geometry=geometry, bits=bits), tempfile.TemporaryDirectory() as temporary:
+                    _, _, calls, _ = self.build_fixture(
+                        Path(temporary), 'coordinator', bits, geometry=geometry,
+                        capacities=(80, 256, 1024, 2752, 4096))
+                    for call in calls:
+                        width, capacity = call.args[1], call.args[3]
+                        if geometry == 'glm':
+                            ws = bits == target_bits and (
+                                (width == 1024 and capacity in (256, 1024, 2752, 4096))
+                                or (width == 2048 and capacity in (256, 4096)))
+                        else:
+                            ws = bits == target_bits and (
+                                (width == 1024 and capacity in (256, 1024, 2752, 4096))
+                                or (width == 2048 and capacity == 256))
+                        wire = ws and geometry == 'glm' and width == 1024 and capacity == 256
+                        self.assertEqual(call.kwargs.get('warp_specialized', False), ws)
+                        self.assertEqual(call.kwargs.get('wire_input', False), wire)
+                        self.assertEqual(call.kwargs.get('ws_input_stages'), 3 if wire else None)
+                        dynamic = wire or (ws and ((geometry == 'glmf' and width == 1024)
+                                                  or (geometry == 'glm' and (width == 2048
+                                                      or capacity in (1024, 4096)))))
+                        self.assertEqual(call.kwargs.get('ws_dynamic_tiles', False), dynamic)
+                        self.assertEqual('+ws-' in str(call.args[0]), ws)
+                        if ws:
+                            self.assertEqual(call.kwargs['route_block'], 64)
+                            self.assertNotIn('token_major_rotation', call.kwargs)
+                            suffix = '-wire-s3-dynamic' if wire else '-bf16-dynamic' if dynamic else '-bf16-static'
+                            self.assertIn(suffix, str(call.args[0]))
+        for geometry in ('glm', 'glmf'):
+            for width in (256, 384, 512, 640, 768, 1536):
+                self.assertFalse(package.warp_specialized(geometry, 'coordinator', width, 256))
+            unmeasured = (1, 16, 80, 128, 512, 1536, 8192)
+            for capacity in unmeasured:
+                self.assertFalse(package.warp_specialized(geometry, 'coordinator', 1024, capacity))
+        for capacity in (80, 1024, 2048, 2752, 4096):
+            self.assertFalse(package.warp_specialized('glmf', 'coordinator', 2048, capacity))
+
+    def test_tp1_ws_only_changes_gated_cells(self):
+        for capacity in (256, 4096):
+            self.assertEqual(package.coordinator_ws_cell('glm', 'coordinator', 2048, capacity),
+                             dict(route_block=64, dynamic=True))
+        for capacity in (1024, 2048, 2752):
+            self.assertIsNone(package.coordinator_ws_cell('glm', 'coordinator', 2048, capacity))
+        self.assertEqual(package.coordinator_ws_cell('glmf', 'coordinator', 2048, 256),
+                         dict(route_block=64))
+        self.assertFalse(package.ws_dynamic_tiles('glmf', 'coordinator', 2048, 256))
+
+    def test_glm_tp2_dynamic_ws_preserves_wire_and_losing_static_cells(self):
+        for capacity in (1024, 4096):
+            self.assertEqual(package.coordinator_ws_cell('glm', 'coordinator', 1024, capacity),
+                             dict(route_block=64, dynamic=True))
+        self.assertTrue(package.wire_input('glm', 'coordinator', 1024, 256))
+        for capacity in (2048, 2752):
+            self.assertEqual(package.coordinator_ws_cell('glm', 'coordinator', 1024, capacity),
+                             dict(route_block=64))
+            self.assertFalse(package.ws_dynamic_tiles('glm', 'coordinator', 1024, capacity))
+
+    def test_flash_tp2_dynamic_ws_preserves_tune2048_static_cell(self):
+        for capacity in (256, 1024, 2752, 4096):
+            cell = package.coordinator_ws_cell('glmf', 'coordinator', 1024, capacity)
+            self.assertEqual(cell, dict(route_block=64, dynamic=True))
+            self.assertIsNone(package.ws_tile('glmf', 'coordinator', 1024, capacity))
+            self.assertFalse(package.wire_input('glmf', 'coordinator', 1024, capacity))
+        self.assertEqual(package.coordinator_ws_cell('glmf', 'coordinator', 1024, 2048),
+                         dict(route_block=64))
+        self.assertFalse(package.ws_dynamic_tiles('glmf', 'coordinator', 1024, 2048))
+
+    def test_kimi_ws64_only_for_qualified_ordinary_tp6_prefill(self):
+        capacities = (1, 16, 80, 256, 1024, 2048, 4096)
+        self.assertEqual([package.warp_specialized('kimik3', 'spark', 512, c)
+                          for c in capacities], [False] * 4 + [True] * 3)
+        for width in (384, 768, 1024, 1536, 3072):
+            self.assertFalse(any(package.warp_specialized('kimik3', 'spark', width, c)
+                                 for c in capacities))
+        self.assertFalse(any(package.warp_specialized('kimik3', 'coordinator', 512, c)
+                             for c in capacities))
+        self.assertFalse(any(package.compact_warp_specialized('kimik3', 'spark', 512, c)
+                             for c in capacities))
+        with tempfile.TemporaryDirectory() as temporary:
+            _, _, calls, _ = self.build_fixture(
+                Path(temporary), 'spark', (2, 3), geometry='kimik3',
+                capacities=(80, 256, 1024, 4096), profiles=('tp6-width512',))
+            for call in calls:
+                capacity = call.args[3]
+                self.assertEqual(call.kwargs['activation'], 'situ')
+                if capacity >= 1024:
+                    self.assertTrue(call.kwargs['warp_specialized'])
+                    self.assertEqual(call.kwargs['route_block'], 64)
+                    self.assertIn('+ws-m64/', str(call.args[0]))
+                else:
+                    self.assertNotIn('warp_specialized', call.kwargs)
+                    self.assertNotIn('+ws-', str(call.args[0]))
+
+    def test_kimi_coordinator_prefill_policy(self):
+        capacities = (1, 80, 256, 1024, 2048, 2752, 4096)
+        for width in (1536, 3072):
+            self.assertEqual([package.warp_specialized('kimik3', 'coordinator', width, c)
+                              for c in capacities],
+                             [False, False, False, False, False, False, True])
+        self.assertEqual([package.route_block('kimik3', c, 'coordinator') for c in capacities],
+                         [8, 8, 8, 64, 64, 64, 8])
+        self.assertEqual([package.route_block('kimik3', c, 'spark') for c in capacities],
+                         [8] * len(capacities))
+        self.assertEqual([package.token_major_rotation('kimik3', c, 'coordinator') for c in capacities],
+                         [False, False, False, True, True, True, False])
+        self.assertEqual([package.token_major_rotation('kimik3', c, 'spark') for c in capacities],
+                         [False] * len(capacities))
+        for bits in ((2, 3), (3, 4)):
+            with self.subTest(bits=bits), tempfile.TemporaryDirectory() as temporary:
+                _, _, calls, _ = self.build_fixture(
+                    Path(temporary), 'coordinator', bits, geometry='kimik3',
+                    capacities=(80, 256, 1024, 2048, 2752, 4096))
+                for call in calls:
+                    capacity = call.args[3]
+                    ws = bits == (2, 3) and capacity == 4096
+                    self.assertEqual(call.kwargs.get('warp_specialized', False), ws)
+                    self.assertEqual('+ws-m64-bf16-dynamic/' in str(call.args[0]), ws)
+                    self.assertEqual(call.kwargs.get('route_block', 8),
+                                     64 if capacity in (1024, 2048, 2752) or ws else 8)
+                    self.assertEqual(call.kwargs.get('token_major_rotation', False),
+                                     capacity in (1024, 2048, 2752))
+                    self.assertEqual(call.kwargs.get('ws_dynamic_tiles', False), ws)
+                    if ws:
+                        self.assertEqual(call.kwargs['tile'], package.TILE_RTX_MIXED)
 
     def test_decode_capacities_ship_the_canonical_tile(self):
         """A decode capacity the B12x planner widens is pinned to m1's tile (#309).
@@ -623,14 +1334,43 @@ class PackageProfileTests(unittest.TestCase):
             self.assertEqual(package.verify(output, 'fixture-revision'), manifest)
 
     def test_route_blocks_widen_only_for_dsv4p_prefill(self):
-        """V4.1 and V4 Flash keep 8-row blocks; V4 Pro prefill widens (Spark and RTX)."""
+        """V4.1 and V4 Flash keep 8-row blocks; V4 Pro and Kimi K3 coordinator prefill widen."""
         for capacity in (1, 16, 80, 256, 1024, 4096):
-            self.assertEqual(package.route_block('v41', capacity), 8)
-            self.assertEqual(package.route_block('dsv4f', capacity), 8)
-        self.assertEqual([package.route_block('dsv4p', c) for c in (1, 16, 80, 256, 1024, 4096)],
+            self.assertEqual(package.route_block('v41', capacity, 'coordinator'), 8)
+            self.assertEqual(package.route_block('dsv4f', capacity, 'coordinator'), 8)
+        self.assertEqual([package.route_block('dsv4p', c, 'coordinator') for c in (1, 16, 80, 256, 1024, 4096)],
+                         [8, 8, 8, 8, 64, 64])
+        self.assertEqual([package.route_block('dsv4p', c, 'spark') for c in (1, 16, 80, 256, 1024, 4096)],
                          [8, 8, 8, 8, 16, 64])
-        self.assertEqual([package.token_major_rotation(g, c) for g in ('v41', 'dsv4f', 'dsv4p')
-                          for c in (1024, 4096)], [False, False, False, False, False, True])
+        self.assertEqual([package.token_major_rotation(g, c, 'coordinator') for g in ('v41', 'dsv4f', 'dsv4p')
+                          for c in (1024, 4096)], [False, False, False, False, True, True])
+        self.assertEqual([package.token_major_rotation('dsv4p', c, 'spark') for c in (1024, 4096)],
+                         [False, True])
+
+    def test_dsv4p_coordinator_m1024_uses_64_row_token_major_rotation(self):
+        for bits in ((2, 3), (3, 4), (2, 3, 4)):
+            with self.subTest(bits=bits), tempfile.TemporaryDirectory() as temporary:
+                _, _, calls, _ = self.build_fixture(
+                    Path(temporary), 'coordinator', bits, geometry='dsv4p',
+                    capacities=(80, 256, 1024, 2752, 4096))
+                for call in calls:
+                    capacity = call.args[3]
+                    ws = bits == (2, 3) and call.args[1] == 1536 and capacity == 4096
+                    self.assertEqual(call.kwargs.get('warp_specialized', False), ws)
+                    self.assertEqual(call.kwargs.get('ws_dynamic_tiles', False), ws)
+                    self.assertEqual(call.kwargs.get('route_block', 8), 8 if capacity <= 256 else 64)
+                    self.assertEqual(call.kwargs.get('token_major_rotation', False),
+                                     len(bits) == 2 and capacity > 256 and not ws)
+                    self.assertEqual('+ws-m64-bf16-dynamic' in str(call.args[0]), ws)
+        with tempfile.TemporaryDirectory() as temporary:
+            _, _, calls, _ = self.build_fixture(
+                Path(temporary), 'spark', (2, 3, 4), geometry='dsv4p',
+                capacities=(256, 1024, 4096), profiles=('tp4-width768',))
+            by_cap = {call.args[3]: call.kwargs for call in calls}
+            self.assertNotIn('route_block', by_cap[256])
+            self.assertEqual(by_cap[1024]['route_block'], 16)
+            self.assertEqual(by_cap[4096]['route_block'], 64)
+            self.assertTrue(all('token_major_rotation' not in kw for kw in by_cap.values()))
 
     def test_qwen4_uneven_blocks_and_route_policy(self):
         """Qwen's five H128 blocks use native unequal TP2 and Spark shards."""
@@ -653,7 +1393,7 @@ class PackageProfileTests(unittest.TestCase):
         self.assertEqual(spark['tp2-width384'], (384, ['tp2-rank0']))
         self.assertTrue(all(topk == 10 and experts == 512
                             for _, _, experts, topk, _, _ in package.shard_profiles('qwen4', 'spark')))
-        self.assertEqual([package.route_block('qwen4', c) for c in (1, 16, 80, 256, 1024, 4096)],
+        self.assertEqual([package.route_block('qwen4', c, 'coordinator') for c in (1, 16, 80, 256, 1024, 4096)],
                          [8, 8, 8, 32, 32, 32])
         self.assertIsNone(package.swiglu_limit('qwen4'))
 

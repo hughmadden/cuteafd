@@ -101,8 +101,8 @@ impl BackboneRequest<'_> {
 /// As with complete responses, request IDs must identify unique in-flight waves.
 pub struct V41Tp4ChunkReceiver {
     identity: V41Tp4Planes<'static>,
-    received: [u32; 8],
-    finished: [bool; 8],
+    received: [u32; cuteafd_core::MAX_SPARK_WORLD],
+    finished: [bool; cuteafd_core::MAX_SPARK_WORLD],
     max_frame_bytes: usize,
 }
 impl V41Tp4ChunkReceiver {
@@ -121,7 +121,7 @@ impl V41Tp4ChunkReceiver {
     ) -> Result<Self> {
         Self::new_ranks(request, &executors, max_frame_bytes)
     }
-    /// Generic constructor for the validated physical rank counts 1..=6.
+    /// Generic constructor for the validated physical rank counts 1..=8.
     ///
     /// A request admitted under the native replicated-group contract must match
     /// its topology's world size.
@@ -131,8 +131,8 @@ impl V41Tp4ChunkReceiver {
         max_frame_bytes: usize,
     ) -> Result<Self> {
         ensure!(
-            (1..=6).contains(&executors.len()),
-            "native TP/EP requires 1..=6 executors"
+            (1..=cuteafd_core::MAX_SPARK_WORLD).contains(&executors.len()),
+            "native TP/EP requires 1..=8 executors"
         );
         if let Some(topology) = request.native_topology() {
             ensure!(
@@ -143,8 +143,8 @@ impl V41Tp4ChunkReceiver {
         request.response_chunk_rows(max_frame_bytes)?;
         Ok(Self {
             identity: V41Tp4Planes::from_header_ranks(&request.view.header, executors)?,
-            received: [0; 8],
-            finished: [false; 8],
+            received: [0; cuteafd_core::MAX_SPARK_WORLD],
+            finished: [false; cuteafd_core::MAX_SPARK_WORLD],
             max_frame_bytes,
         })
     }
@@ -186,8 +186,8 @@ impl V41Tp4ChunkReceiver {
         );
         Ok(Self {
             identity,
-            received: [0; 8],
-            finished: [false; 8],
+            received: [0; cuteafd_core::MAX_SPARK_WORLD],
+            finished: [false; cuteafd_core::MAX_SPARK_WORLD],
             max_frame_bytes,
         })
     }
@@ -227,8 +227,8 @@ impl V41Tp4ChunkReceiver {
         );
         Ok(Self {
             identity: V41Tp4Planes::from_header_ranks(&request.header, executors)?,
-            received: [0; 8],
-            finished: [false; 8],
+            received: [0; cuteafd_core::MAX_SPARK_WORLD],
+            finished: [false; cuteafd_core::MAX_SPARK_WORLD],
             max_frame_bytes,
         })
     }

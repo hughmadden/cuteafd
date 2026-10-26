@@ -205,7 +205,7 @@ pub(super) fn start<'a>(library: &'a cuteafd_ffi::NativeLibrary, device: i32,
     programs: &'a cuteafd_ffi::programs::Programs<'a>, start: Start<'_>) -> Result<Runtime<'a>> {
     let Start { snapshot, checkpoint, cfg, sizing, ledger, cache, local_layers, spark_layers, peers, catalog,
         package, embed, available, draft } = start;
-    let endpoint = SparkEndpoint { capacity: u32::try_from(sizing.rows)?, ingress: SparkIngress::Bf16 };
+    let endpoint = SparkEndpoint { ring_depth: None, capacity: u32::try_from(sizing.rows)?, ingress: SparkIngress::Bf16 };
     let config = TcpTransportConfig::default();
     let pending = if spark_layers.is_empty() { None } else {
         let working = SparkWorkingSet { rtx_layers: local_layers.to_vec(), spark_layers: spark_layers.to_vec(),
@@ -388,6 +388,11 @@ fn worker(args: &ServeArgs, receive: &mut tokio::sync::mpsc::Receiver<cuteafd_ap
 pub(crate) async fn run_serve(args: ServeArgs) -> Result<()> {
     use cuteafd_api::openai::{ModelEncoding, ModelProfile, NativeLimits};
     args.validate()?;
+    // Every MiniMax deployment reaches its routed experts over Spark (validate requires the
+    // peers), and MiniMax is not on the v4 Spark exchange yet: refuse before loading anything.
+    if !args.peers.is_empty() {
+        return Err(MiniMaxError::Unsupported(super::routed::SPARK_EXCHANGE_PENDING).into());
+    }
     let snapshot = args.snapshot.clone();
     let encoding = ModelEncoding::MiniMaxM3(Arc::new(cuteafd_api::openai::chat::minimax_m3::MiniMaxEncoding::from_snapshot(&snapshot)?));
     let eos = encoding.eos_token_ids();

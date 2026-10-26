@@ -17,40 +17,21 @@ pub struct DeviceLanding {
     /// Device address, carried as an integer so a landing can cross threads.
     pub ptr: usize,
     pub bytes: usize,
+    pub slot_bytes: usize,
 }
 
 impl DeviceLanding {
     pub fn new(buffer: CuteafdDeviceBuffer) -> Self {
-        Self { ptr: buffer.ptr as usize, bytes: buffer.bytes }
+        Self { ptr: buffer.ptr as usize, bytes: buffer.bytes, slot_bytes: buffer.bytes }
+    }
+    pub fn with_slots(buffer: CuteafdDeviceBuffer, slots: usize) -> Result<Self> {
+        anyhow::ensure!((1..=4).contains(&slots) && buffer.bytes > 0 && buffer.bytes % slots == 0,
+            "GPU landing requires equally sized slots");
+        Ok(Self { slot_bytes: buffer.bytes / slots, ..Self::new(buffer) })
     }
     fn buffer(self) -> CuteafdDeviceBuffer {
         CuteafdDeviceBuffer { ptr: self.ptr as *mut c_void, bytes: self.bytes, ..Default::default() }
     }
-}
-
-/// Write mode: the peer RDMA-writes each response's rows into
-/// `[base + plane_offset, + plane_bytes)` and then its request id into the
-/// u64 at `base + flag_offset`; `[base, base + bytes)` is one device range the
-/// session exposes (dma-buf, remote write, no relaxed ordering).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct DeviceWriteTarget {
-    pub base: usize,
-    pub bytes: usize,
-    pub plane_offset: usize,
-    pub plane_bytes: usize,
-    pub flag_offset: usize,
-}
-
-/// Exposes `target`'s range on `endpoint` and returns the handshake's view of it.
-pub(super) fn expose(endpoint: &NativeRdmaEndpoint, target: DeviceWriteTarget) -> Result<VerbsHostWriteTarget> {
-    anyhow::ensure!(target.plane_offset + target.plane_bytes <= target.bytes && target.flag_offset + 8 <= target.bytes
-        && target.flag_offset % 8 == 0, "write target ranges exceed the exposed range");
-    let buffer = CuteafdDeviceBuffer { ptr: target.base as *mut c_void, bytes: target.bytes, ..Default::default() };
-    // SAFETY: `SparkExperts::set_write_targets`'s contract keeps the range
-    // allocated while this endpoint (owned by the session) exists.
-    let rkey = unsafe { endpoint.library.rdma_rc_endpoint_expose_device(endpoint.info.handle, Some(buffer))? };
-    Ok(VerbsHostWriteTarget { plane_addr: (target.base + target.plane_offset) as u64, plane_bytes: target.plane_bytes as u64,
-        flag_addr: (target.base + target.flag_offset) as u64, rkey })
 }
 
 /// Registers `landing` on `endpoint` before its receives are posted; false
@@ -61,7 +42,7 @@ pub(super) fn attach(endpoint: &NativeRdmaEndpoint, landing: DeviceLanding, addr
     // long as this endpoint (owned by the session) exists.
     let attached = unsafe {
         endpoint.library.rdma_rc_endpoint_set_recv_landing(endpoint.info.handle, Some(landing.buffer()),
-            EXPERT_PROTOCOL_V2_RESPONSE_HEADER_LEN)
+            EXPERT_PROTOCOL_V2_RESPONSE_HEADER_LEN, landing.slot_bytes)
     };
     match attached {
         Ok(()) => {
@@ -111,8 +92,8 @@ impl VerbsHostProtocolV2PersistentClientSession {
         anyhow::ensure!(wire_bytes <= config.max_frame_bytes,
             "GPU-landed response of {wire_bytes} bytes exceeds the frame budget");
         self.endpoint.traffic.received(wire_bytes);
-        // The device range is written again only by the response to this
-        // session's next request, which its owner posts after consuming it.
+        // Native posts rotate the N landing slots in request order. The owner
+        // fences a slot's consumer before posting its replacement request.
         self.endpoint.post_recv_at(recv_offset, self.response_ring.slot_capacity_bytes,
             VERBS_HOST_RECV_WR_ID + recv_slot as u64)?;
         self.response_recv_sequence = self.response_recv_sequence.wrapping_add(1);
@@ -184,4 +165,23 @@ pub fn gpu_landing_probe(library: &NativeLibrary, rdma_device: Option<&str>, byt
         status: c_char_array_to_string(&probe.status),
         error,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn landing_slots_partition_the_rank_allocation() {
+        for slots in [1, 2, 3, 4] {
+            let range = CuteafdDeviceBuffer { ptr: 4096usize as *mut c_void,
+                bytes: slots * 12288, ..Default::default() };
+            let landing = DeviceLanding::with_slots(range, slots).unwrap();
+            assert_eq!(landing.slot_bytes, 12288);
+            assert_eq!(landing.bytes, slots * 12288);
+        }
+        for (bytes, slots) in [(0, 2), (4096, 0), (4096, 3), (4096, 5)] {
+            assert!(DeviceLanding::with_slots(CuteafdDeviceBuffer { bytes, ..Default::default() }, slots).is_err());
+        }
+    }
 }

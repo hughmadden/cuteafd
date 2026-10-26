@@ -47,6 +47,94 @@ def _run(repo: Path, hf: Path, *args: str) -> subprocess.CompletedProcess[str]:
                           capture_output=True, text=True, timeout=60)
 
 
+@pytest.mark.parametrize("activations", [None, "a16", "a8"])
+@pytest.mark.parametrize("wip", [False, True])
+def test_exlr8_prefill_activations_reach_plan_coordinator_and_workers(tmp_path, activations, wip):
+    config = {"model_type": "glm_moe_dsa", "num_hidden_layers": 4, "first_k_dense_replace": 3}
+    keys = "EXLR8_MANIFEST=up1\nSPARK_COUNT=4\nRTX_GPUS=1\nSPECULATOR=off\nVISION=off\nAUDIO=off\n"
+    args = ("--wip", "a8-test") if wip else ()
+    if activations is not None:
+        args += ("--set", f"EXLR8_PREFILL_ACTIVATIONS={activations}")
+    result = _family_launch_result(tmp_path, config, "test/exlr8", keys, extra_args=args)
+    assert result.returncode == 0, result.stderr
+    lines = result.stderr.splitlines()
+    plans = [line for line in lines if "cuteafd plan" in line]
+    coordinators = [line for line in lines if "cuteafd serve-glm --snapshot" in line]
+    workers = [line for line in lines if "cuteafd expertd-native" in line]
+    assert plans and coordinators and workers, result.stderr
+    for line in plans + coordinators + workers:
+        assert "--exlr8-manifest up1" in line
+        if activations is None:
+            assert "--exlr8-prefill-activations" not in line
+        else:
+            assert f"--exlr8-prefill-activations {activations}" in line
+
+
+@pytest.mark.parametrize("gpus", [1, 2])
+@pytest.mark.parametrize("onboard", [None, "auto", "0", "1"])
+def test_exlr8_onboarding_reaches_shared_admission_without_zero_override(tmp_path, gpus, onboard):
+    config = {"model_type": "glm_moe_dsa", "num_hidden_layers": 4, "first_k_dense_replace": 3}
+    keys = (f"EXLR8_MANIFEST=up1\nSPARK_COUNT=4\nRTX_GPUS={gpus}\n"
+            "SPECULATOR=off\nVISION=off\nAUDIO=off\nPOOL_TOKENS=auto\n")
+    if onboard is not None:
+        keys += f"RTX_EXPERT_LAYERS={onboard}\n"
+    result = _family_launch_result(tmp_path, config, "test/exlr8", keys)
+    assert result.returncode == 0, result.stderr
+    plans = [line for line in result.stderr.splitlines() if "cuteafd plan" in line]
+    coordinators = [line for line in result.stderr.splitlines() if "cuteafd serve-glm --snapshot" in line]
+    assert plans and coordinators, result.stderr
+    for line in plans:
+        argv = shlex.split(line)
+        if onboard in (None, "auto"):
+            assert "--rtx-expert-layers" not in argv
+        else:
+            assert argv[argv.index("--rtx-expert-layers") + 1] == onboard
+        assert argv[argv.index("--pool-tokens") + 1] == "0"
+    for line in coordinators:
+        argv = shlex.split(line)
+        if onboard is None:
+            assert "--rtx-expert-layers" not in argv
+        else:
+            assert argv[argv.index("--rtx-expert-layers") + 1] == onboard
+        assert argv[argv.index("--pool-tokens") + 1] == "0"
+
+
+def test_exlr8_onboarded_halves_require_the_shared_committed_push():
+    source = (ROOT / "rust/crates/cuteafd-daemon/src/families/glm5/mod.rs").read_text()
+    planning = source.split("// Native dense operands and onboarded EXLR8 halves", 1)[1].split(
+        "Some(admission.start_with(&peers, ranks)?)", 1)[0]
+    expert_plan = source.split("let native_push_experts =", 1)[1].split("let admission =", 1)[0]
+    assert "CoordinatorExperts::Exlr8Tp2" in expert_plan
+    assert "layers: range.clone().collect()" in expert_plan
+    assert "budgets: budgets.to_vec()" in expert_plan
+    assert "native_push_experts()?" in planning
+    assert "CoordinatorPush::prepare(" in planning
+    assert "devices.len(), experts)?" in planning
+    assert "map_err" not in planning and ".ok()" not in planning
+    loading = source.split("let tp2_weights =", 1)[1].split("let (embedding,", 1)[0]
+    assert "Exlr8Tp2Weights::pushed_pair" in loading
+    assert 'pushed.context("onboarded EXLR8 experts require a committed push group")?' in loading
+    assert "tp2_weights(range, loaded.2)" in source
+    alone = source.split("if native_records.is_some() && native_push.is_none()", 1)[1].split(
+        "let started = Instant::now();", 1)[0]
+    assert "CoordinatorPush::prepare_alone(" in alone
+    assert "native_push_experts()?" in alone
+    assert "native_push = Some((push, 0))" in alone
+    executor = (ROOT / "rust/crates/cuteafd-daemon/src/shared/experts/rtx/exlr8.rs").read_text()
+    assert "fn load_pair" not in executor and "Exlr8Weights::load(" not in executor
+
+
+@pytest.mark.parametrize("keys,diagnostic", [
+    ("EXLR8_MANIFEST=up1\nEXLR8_PREFILL_ACTIVATIONS=fp8\n", "EXLR8_PREFILL_ACTIVATIONS must be a16 or a8"),
+    ("EXLR8_PREFILL_ACTIVATIONS=a8\n", "EXLR8_PREFILL_ACTIVATIONS requires EXLR8_MANIFEST"),
+])
+def test_exlr8_prefill_activations_reject_invalid_launch_config(tmp_path, keys, diagnostic):
+    config = {"model_type": "glm_moe_dsa", "num_hidden_layers": 4, "first_k_dense_replace": 3}
+    result = _family_launch_result(tmp_path, config, "test/exlr8", keys + "SPECULATOR=off\n")
+    assert result.returncode != 0 and diagnostic in result.stderr
+    assert "docker run" not in result.stderr
+
+
 def test_glm_flash_config_goes_to_run_family(tmp_path: Path) -> None:
     repo, hf = _repo(tmp_path), tmp_path / "hf"
     _snapshot(hf, "zai-org/GLM-5.3-Flash", {"model_type": "glm5_next", "num_hidden_layers": 45,
@@ -209,6 +297,23 @@ def test_v4_rejects_removed_draft_switches_as_unknown_keys(tmp_path: Path, key: 
     assert f"unknown configuration key: {key}" in result.stderr
 
 
+@pytest.mark.parametrize("rows,waves", [(4096, 2), (2048, 1), (512, 3)])
+def test_v4_prefill_units_reach_plan_serve_and_container(tmp_path: Path, rows: int, waves: int) -> None:
+    result = _family_launch_result(tmp_path, {"model_type": "deepseek_v4"}, "test/model",
+        f"RTX_GPUS=1\nSPECULATOR=off\nVISION=off\nAUDIO=off\nPREFILL_ROWS={rows}\n"
+        f"PREFILL_WAVES={waves}\nPREFILL_SPAN_ROWS=16384\n")
+    assert result.returncode == 0, result.stderr
+    plan = next(line for line in result.stderr.splitlines() if "cuteafd plan" in line)
+    assert f"--prefill-rows {rows}" in plan
+    assert f"--prefill-waves {waves}" in plan
+    assert "--prefill-lanes" not in plan
+    serve = next(line for line in result.stderr.splitlines() if "serve-dsv4" in line)
+    assert f"--prefill-rows {rows}" in serve
+    assert f"--prefill-waves {waves}" in serve
+    assert "CUTEAFD_PREFILL_SPAN_ROWS=16384" in result.stderr
+    assert "--prefill-lanes" not in serve
+
+
 @pytest.mark.parametrize("value", [None, "auto", "1", "8", "64"])
 @pytest.mark.parametrize("config,model", [
     ({"model_type": "glm_moe_dsa", "num_hidden_layers": 4, "first_k_dense_replace": 3}, "zai-org/GLM-5.3"),
@@ -339,6 +444,57 @@ DENSE_CONFIG = {"model_type": "qwen3_5", "text_config": {
 }}
 
 
+@pytest.mark.parametrize("model", ["Qwen/Qwen3.8-27B", "Qwen/Qwen3.8-27B-FP8"])
+@pytest.mark.parametrize("selection", [None, "off", "dspark"])
+@pytest.mark.parametrize("revision", [None, "explicit-revision"])
+def test_dense_27b_dspark_default_and_explicit_disable(tmp_path, model, selection, revision):
+    config = {**DENSE_CONFIG, "text_config": {**DENSE_CONFIG["text_config"], "hidden_size": 5120}}
+    drafter = "RadixArk/Qwen3.8-27B-DSpark"
+    selected_revision = revision or "85ef153be924f17ce4bf62726954eeaa4a73e854"
+    _snapshot(tmp_path / "hf", drafter, {"speculators_model_type": "dspark"}, selected_revision)
+    # A moving main ref must not replace the qualified default or an explicit revision.
+    (tmp_path / "hf" / "hub" / f"models--{drafter.replace('/', '--')}" / "refs" / "main").write_text("unavailable-main")
+    keys = "SPARK_COUNT=0\n" + (f"SPECULATOR={selection}\n" if selection else "")
+    if revision:
+        keys += f"SPECULATOR_MODEL_REVISION={revision}\n"
+    if selection == "dspark":
+        keys += "SPECULATOR_DRAFTS=3\n"
+    result = _family_launch_result(tmp_path, config, model, keys,
+        extra_args=("--wip", "dense-test"),
+        encoder_plan={"placement_supported": True, "fits": True, "spark_ranks": 0})
+    assert result.returncode == 0, result.stderr
+    launch = shlex.split(next(line for line in result.stderr.splitlines() if "serve-qwen35 --snapshot" in line))
+    plan = shlex.split(next(line for line in result.stderr.splitlines() if "cuteafd plan " in line))
+    assert ("--draft" in launch) == (selection != "off")
+    assert ("--drafter-snapshot" in plan) == (selection != "off")
+    if selection != "off":
+        snapshot = str(tmp_path / "hf" / "hub" / f"models--{drafter.replace('/', '--')}" / "snapshots" / selected_revision)
+        assert launch[launch.index("--draft") + 1] == snapshot
+        assert plan[plan.index("--drafter-snapshot") + 1] == snapshot
+    if selection == "dspark":
+        assert launch[launch.index("--draft-fixed") + 1] == "3"
+
+
+@pytest.mark.parametrize("model", ["Qwen/Qwen3.8-27B", "Qwen/Qwen3.8-27B-FP8"])
+@pytest.mark.parametrize("depth", [None, 1, 2, 3])
+def test_dense_27b_native_mtp_needs_no_external_checkpoint(tmp_path, model, depth):
+    config = {**DENSE_CONFIG, "text_config": {**DENSE_CONFIG["text_config"],
+        "hidden_size": 5120, "mtp_num_hidden_layers": 1}}
+    keys = "SPARK_COUNT=0\nSPECULATOR=mtp\n"
+    if depth is not None:
+        keys += f"SPECULATOR_DEPTH={depth}\n"
+    result = _family_launch_result(tmp_path, config, model, keys,
+        extra_args=("--wip", "dense-test"),
+        encoder_plan={"placement_supported": True, "fits": True, "spark_ranks": 0})
+    assert result.returncode == 0, result.stderr
+    launch = shlex.split(next(line for line in result.stderr.splitlines() if "serve-qwen35 --snapshot" in line))
+    plan = shlex.split(next(line for line in result.stderr.splitlines() if "cuteafd plan " in line))
+    assert launch[launch.index("--mtp") + 1] == str(depth or 1)
+    assert plan[plan.index("--speculator") + 1] == "mtp"
+    assert "--draft" not in launch and "--drafter-snapshot" not in plan
+    assert "cuteafd expertd-native" not in result.stderr
+
+
 @pytest.mark.parametrize("cache_keys,entries,boundaries", [
     ("", 20, 1),
     ("PREFIX_CACHE_ENTRIES=4\nPREFIX_CACHE_MARK_MIB=1024\nPREFIX_POINT_BOUNDARIES=2\n", 4, 2),
@@ -368,6 +524,42 @@ def test_dense_qwen_wip_uses_native_single_gpu_and_no_workers(tmp_path: Path, ca
     assert "--spark-ranks 0" in plan and "--state-slots 8" in plan
     assert f"--prefix-cache-entries {entries}" in plan
     assert "--prefill-rows 4096" in plan and "--require-ready" not in plan
+
+
+@pytest.mark.parametrize("model", ["Qwen/Qwen3.5-9B", "Qwen/Qwen3.8-27B-FP8"])
+def test_dense_qwen_requires_resolved_coordinator_prefill_unit(tmp_path, model):
+    shape = {"prefill_unit_rows": 4096, "prefill_waves": 1, "prefill_span_rows": 4096}
+    result = _family_launch_result(tmp_path, DENSE_CONFIG, model,
+        "SPARK_COUNT=0\nSPECULATOR=off\n", extra_args=("--wip", "dense-test"),
+        deployment_overrides=shape,
+        encoder_plan={"placement_supported": True, "fits": True, "spark_ranks": 0})
+    assert result.returncode == 0, result.stderr
+    assert "serve-qwen35 --snapshot" in result.stderr
+    assert "cuteafd expertd-native" not in result.stderr
+    assert "ssh h0" not in result.stderr
+
+
+@pytest.mark.parametrize("key,value", [("EXPERT_PORT", "20480"),
+    ("SPARK_EXPERT_DOCKER_INFERENCE", "unused-worker:release"),
+    ("SPARK_EXPERT_DOCKER_DEV", "unused-worker:dev")])
+def test_dense_qwen_rejects_unused_worker_configuration(tmp_path, key, value):
+    result = _family_launch_result(tmp_path, DENSE_CONFIG, "Qwen/Qwen3.5-9B",
+        f"SPARK_COUNT=0\n{key}={value}\n", extra_args=("--wip", "dense-test"),
+        encoder_plan={"placement_supported": True, "fits": True, "spark_ranks": 0})
+    assert result.returncode != 0
+    assert f"unused configuration key: {key}" in result.stderr
+    assert "serve-qwen35 --snapshot" not in result.stderr
+
+
+@pytest.mark.parametrize("missing", ["prefill_unit_rows", "prefill_waves"])
+def test_dense_qwen_does_not_bypass_shared_prefill_contract(tmp_path, missing):
+    result = _family_launch_result(tmp_path, DENSE_CONFIG, "Qwen/Qwen3.5-9B",
+        "SPARK_COUNT=0\n", extra_args=("--wip", "dense-test"),
+        deployment_overrides={missing: 0},
+        encoder_plan={"placement_supported": True, "fits": True, "spark_ranks": 0})
+    assert result.returncode != 0
+    assert "the qwen3_5 deployment plan names no prefill" in result.stderr
+    assert "serve-qwen35 --snapshot" not in result.stderr
 
 
 @pytest.mark.parametrize("family", ["mimo_v2", "deepseek_v41"])
@@ -411,7 +603,6 @@ def test_deployment_wip_still_requires_matching_launch_family(tmp_path, family, 
     ("SPARK_COUNT=0\nVISION=rtx\n", "media execution is not qualified"),
     ("SPARK_COUNT=0\nEMBEDDING=host\n", "requires device token embedding"),
     ("SPARK_COUNT=0\nMAX_CONTEXT_TOKENS=4096\n", "unused configuration key"),
-    ("SPARK_COUNT=0\nSPECULATOR=mtp\n", "does not apply to qwen3_5"),
 ])
 def test_dense_qwen_refuses_unqualified_configuration(tmp_path: Path, keys: str, diagnostic: str) -> None:
     result = _family_launch_result(tmp_path, DENSE_CONFIG, "Qwen/Qwen3.5-9B", keys,
@@ -582,7 +773,7 @@ def test_glmf_selection_starts_after_solve_and_seals_before_opening_lanes() -> N
     assert body.index("load_while_admitting(admission,") < body.index("TokenEmbedding::load(")
     assert body.index("TokenEmbedding::load(") < body.index("engine::GlmfEngine::new(")
     assert "let spark = !spark_layers.is_empty();" in body
-    assert "selected_args.prefill_lanes = usize::try_from(working.prefill_lanes)?;" in body
+    assert "selected_args.prefill_waves = usize::try_from(working.prefill_lanes)?;" in body
     assert body.index("working.prefill_lanes") < body.index("TokenEmbedding::load(")
     assert "spark_layers == working.spark_layers" in body
     assert "rtx_layers == working.rtx_layers" in body
@@ -607,14 +798,18 @@ def test_glmf_selection_starts_after_solve_and_seals_before_opening_lanes() -> N
     admission = source[source.index("    fn admit("):source.index("    pub fn with_engine<")]
     assert "solve_attention_working_set_with_graphs(" in admission
     assert "let local_workspace = workspaces(false, lanes);" in admission
-    assert "configured_prefill_lanes(layers == self.cfg.layers, args.prefill_lanes)" in admission
+    assert "configured_prefill_waves(layers == self.cfg.layers, args.prefill_waves)" in admission
+    assert "admitted_prefill_waves(attention.mode, lanes as u64)" in admission
     engine = (ROOT / "rust/crates/cuteafd-daemon/src/families/glm5_flash/engine.rs").read_text()
-    pipeline = engine.split("    fn pipelined(&self)", 1)[1].split("    /// Longest chunk", 1)[0]
-    assert "prefill_pipeline_available(" in pipeline and "_ => None" in pipeline
-    lane_step = engine.split("    fn step_lanes_inner(", 1)[1].split("    ///", 1)[0]
-    assert "pipelined prefill needs Spark experts" not in lane_step
-    assert "self.spark_land_lane(" in lane_step
-    assert "Some(Experts::Skip)" in lane_step
+    pipeline = engine.split("    fn pipelined(&self)", 1)[1].split("    /// The continuous span", 1)[0]
+    assert "self.weights.layers.len() == self.cfg.layers" in pipeline
+    units = (ROOT / "rust/crates/cuteafd-daemon/src/families/glm5_flash/engine/units.rs").read_text()
+    assert "run_prefill_units(&mut hooks, &units, waves)" in units
+    assert "spark_land(" in units and "link.exchange()?" in units and "unit_ffn_finish(" in units
+    begin = units.split("    fn begin_unit(", 1)[1].split("    fn attention(", 1)[0]
+    attention = units.split("    fn attention(", 1)[1].split("    fn local_ffn(", 1)[0]
+    assert "exchange_direct(" not in begin
+    assert attention.index("return e.unit_attention(") < attention.index("e.exchange_direct(") < attention.index("e.peer_attention(")
     layout = (ROOT / "rust/crates/cuteafd-loader/src/plan/layout/glm5_flash.rs").read_text()
     assert "step_workspace(&ExpertPlacement::Local, lanes)" in layout
     assert "local_workspace = Some(estimate(lanes))" in layout
@@ -633,7 +828,7 @@ def test_glmf_selection_starts_after_solve_and_seals_before_opening_lanes() -> N
     assert "GlmfComponent::SparkExperts, gpu, Category::Transport, \"Spark intake\"" in request
     expert = source[source.index("    fn experts_for_layers<"):source.index("impl Opened {\n    /// The checkpoint's `embed_tokens`")]
     assert expert.index("validate_expert_layers(&self.cfg, served, selected)?;") < expert.index("if selected.is_empty() { return Ok(None); }")
-    assert expert.index("if selected.is_empty() { return Ok(None); }") < expert.index("Fp8Experts::load(") < expert.index("SparkLink::new(")
+    assert expert.index("if selected.is_empty() { return Ok(None); }") < expert.index("Fp8Experts::load(") < expert.index("SparkLink::new_waves(")
     assert "tensors, &directory, selected, 1, 0," in expert
     assert "layers: selected.to_vec()" in expert
     assert "spark_warmup_request(&self.cfg, warm_rows, remote[0], self.checkpoint.spark_input_is_bf16())" in expert
@@ -754,7 +949,7 @@ def _family_launch_result(tmp_path: Path, family_config: dict, model: str, keys:
             stub = stub.replace('case "$*" in', intercept + 'case "$*" in', 1)
             if native_v41:
                 stub += ('case "$*" in container\\ inspect*|inspect\\ *) ' + ('if [[ "$*" == *-wip* ]]; then exit 0; else exit 1; fi' if wip else 'exit 1') + ' ;; image\\ inspect*) echo test-pin ;; esac\n'
-                         'case "$*" in *"cuteafd plan"*) printf \'{"spark_ranks":%s,"prefill_rows":4096}\\n\' '
+                         'case "$*" in *"cuteafd plan"*) printf \'{"spark_ranks":%s,"prefill_unit_rows":4096,"prefill_waves":1,"prefill_span_rows":4096}\\n\' '
                          '"$STUB_SPARK_COUNT" ;; esac\n')
             if program_manifest is None:
                 stub += 'case "$*" in *"PROGRAMS.json"*) exit 1 ;; esac\n'
@@ -809,10 +1004,22 @@ report = json.loads(os.environ["STUB_ENCODER_PLAN"])
 report.update(spark_ranks=ranks)
 gpus = int(value("--rtx", "1"))
 placement_ready = report.get("placement_supported", True) and report.get("fits", True)
+shared = family in {"step5", "kimi_k3"}
+glm = family == "glm5"
+unit = int(value("--prefill-rows", "0")) or (2048 if shared else 4096)
+waves = 1 if glm and ranks == 0 else int(value("--prefill-waves", "0")) or (2 if shared or glm or family == "deepseek_v4" else 1)
+span = int(value("--prefill-span-rows", "0")) or 16384 if glm or family == "deepseek_v4" else unit * waves
+decode_lanes = int(value("--decode-lanes", "2" if family == "deepseek_v41" else "1"))
+if (family == "deepseek_v41" and decode_lanes != 2) or (family != "deepseek_v41" and decode_lanes != 1):
+    sys.exit("unsupported --decode-lanes for " + family)
+if family == "mimo_v2" and int(value("--concurrency", "16")) == 1:
+    decode_lanes = 1
+report.update(prefill_unit_rows=unit, prefill_waves=waves, prefill_span_rows=span, prefill_transports=int(ranks > 0),
+    decode_lanes=decode_lanes)
 deployment = dict(version=1, family=family, executable=family != "qwen3_5" and placement_ready, wip_launchable=placement_ready, rtx_gpus=gpus, spark_ranks=ranks,
     topology=dict(tp=tp, ep=ep,
                   wire="native_ownership" if explicit else "canonical"), peers=peers,
-    speculator=value("--speculator", "off"), prefill_rows=int(value("--prefill-rows", "4096")) or 4096,
+    speculator=value("--speculator", "off"), prefill_unit_rows=unit, prefill_waves=waves, prefill_span_rows=span, decode_lanes=decode_lanes,
     admission=dict(kv_pool_size=value("--kv-pool-size"), memory_reservation=value("--memory-reservation")),
     spark_admission="coordinator_authoritative",
     launch=dict(family=family, first_expert_layer=int(first), last_expert_layer=None if last == "-1" else int(last)),
@@ -861,6 +1068,68 @@ print(json.dumps(deployment))
             break
         time.sleep(0.05)
     return subprocess.CompletedProcess(completed.args, completed.returncode, read(stdout_path), text)
+
+
+@pytest.mark.parametrize("family_config,model,row_key,rtx,ranks", [
+    ({"model_type": "step5_vl", "text_config": {"model_type": "step5", "num_hidden_layers": 92,
+      "moe_layer_list": list(range(3, 91))}}, "test/Step-5-NVFP4", "PREFILL_BATCH_TOKENS", 1, 4),
+    ({"model_type": "step5_vl", "text_config": {"model_type": "step5", "num_hidden_layers": 92,
+      "moe_layer_list": list(range(3, 91))}}, "test/Step-5", "PREFILL_BATCH_TOKENS", 2, 6),
+    ({"model_type": "kimi_k3", "text_config": {"model_type": "kimi_linear", "num_hidden_layers": 93,
+      "first_k_dense_replace": 1, "moe_layer_freq": 1}}, "test/Kimi-K3", "PREFILL_ROWS", 2, 6),
+    ({"model_type": "qwen4_exp", "text_config": {"num_hidden_layers": 2,
+      "mtp_num_hidden_layers": 1, "layer_types": ["linear_attention", "full_attention"]}},
+     "test/Qwen4", "PREFILL_ROWS", 1, 4),
+    ({"model_type": "deepseek_v4", "num_hidden_layers": 61}, "test/V4", "PREFILL_ROWS", 1, 4),
+])
+@pytest.mark.parametrize("explicit", [False, True])
+def test_shared_prefill_launcher_forwards_resolved_units_without_span(
+    tmp_path: Path, family_config: dict, model: str, row_key: str, rtx: int, ranks: int, explicit: bool,
+) -> None:
+    keys = (f"SPARK_COUNT={ranks}\nSPECULATOR=off\nVISION=off\nAUDIO=off\n"
+            f"RTX_GPUS={rtx}\nCOORDINATOR_GPUS=" + ("0,1" if rtx == 2 else "0") + "\n")
+    keys += "".join(f"SPARK_{rank}_HOST=h{rank}\nSPARK_{rank}_LANE_A=10.0.0.{rank + 1}\n"
+                    for rank in range(1, ranks))
+    if explicit:
+        keys += f"{row_key}=1024\nPREFILL_WAVES=2\n"
+    unit, waves = (1024, 2) if explicit else (4096 if family_config["model_type"] == "deepseek_v4" else 2048, 2)
+    result = _family_launch_result(tmp_path, family_config, model, keys,
+        extra_args=("--wip", "prefill-shape"),
+        encoder_plan={"placement_supported": True, "fits": True, "spark_budget_bytes": 108 << 30},
+        deployment_overrides={"prefill_unit_rows": unit, "prefill_waves": waves,
+                              "prefill_span_rows": 32768})
+    assert result.returncode == 0, result.stderr
+    plan = next(shlex.split(line) for line in result.stderr.splitlines()
+                if "cuteafd plan" in line and "--deployment" in line)
+    if explicit:
+        assert plan[plan.index("--prefill-rows") + 1] == str(unit)
+        assert plan[plan.index("--prefill-waves") + 1] == str(waves)
+    assert "--prefill-lanes" not in plan
+    command_name = {"kimi_k3": "serve-kimi", "qwen4_exp": "serve-qwen4", "deepseek_v4": "serve-dsv4"}.get(
+        family_config["model_type"], "serve-step5")
+    serve = next(shlex.split(line) for line in result.stderr.splitlines()
+                 if "docker run -d" in line and command_name in line)
+    assert serve.count("--prefill-rows") == serve.count("--prefill-waves") == 1
+    assert serve[serve.index("--prefill-rows") + 1] == str(unit)
+    assert serve[serve.index("--prefill-waves") + 1] == str(waves)
+    assert "--prefill-span-rows" not in serve
+    assert "PREFILL_SPAN_ROWS" not in result.stdout + result.stderr
+    assert f"Resolved prefill: PREFILL_ROWS={unit} PREFILL_WAVES={waves}" in result.stdout
+
+
+@pytest.mark.parametrize("family_config", [
+    {"model_type": "mimo_v2_flash", "num_hidden_layers": 2, "moe_layer_freq": [0, 1]},
+])
+def test_legacy_prefill_launcher_does_not_forward_typed_shape(tmp_path: Path, family_config: dict) -> None:
+    result = _family_launch_result(tmp_path, family_config, "test/model",
+        "SPECULATOR=off\nVISION=off\nAUDIO=off\n",
+        deployment_overrides={"prefill_unit_rows": 1024, "prefill_waves": 3, "prefill_span_rows": 32768})
+    assert result.returncode == 0, result.stderr
+    serve = next(shlex.split(line) for line in result.stderr.splitlines()
+                 if "docker run -d" in line and "cuteafd serve-" in line)
+    assert "--prefill-waves" not in serve and "--prefill-span-rows" not in serve
+    assert "Resolved prefill:" not in result.stdout
+    assert "PREFILL_SPAN_ROWS" not in result.stdout + result.stderr
 
 
 @pytest.mark.parametrize("wip", [False, True])
@@ -1201,11 +1470,10 @@ def test_mimo_transport_timing_is_resolved_once_for_all_prefill_lanes():
 @pytest.mark.parametrize("config,keys,env,endpoints", [
     ({"model_type": "deepseek_v4"}, "", {}, 2),
     ({"model_type": "glm_moe_dsa", "num_hidden_layers": 4, "first_k_dense_replace": 3}, "", {}, 4),
-    ({"model_type": "glm_moe_dsa", "num_hidden_layers": 4, "first_k_dense_replace": 3}, "", {"CUTEAFD_GLM_PREFILL_LANES": "1"}, 1),
-    ({"model_type": "glm_moe_dsa", "num_hidden_layers": 4, "first_k_dense_replace": 3}, "", {"CUTEAFD_GLM_PREFILL_LANES": "4"}, 5),
-    ({"model_type": "glm5_next"}, "", {}, 2),
-    ({"model_type": "glm5_next"}, "GLM5_FLASH_PREFILL_LANES=4\n", {}, 4),
-    ({"model_type": "glm5_next"}, "GLM5_FLASH_PREFILL_LANES=4\n", {"CUTEAFD_GLMF_PREFILL_LANES": "1"}, 1),
+    ({"model_type": "glm_moe_dsa", "num_hidden_layers": 4, "first_k_dense_replace": 3}, "PREFILL_WAVES=1\n", {}, 1),
+    ({"model_type": "glm_moe_dsa", "num_hidden_layers": 4, "first_k_dense_replace": 3}, "PREFILL_WAVES=4\n", {}, 5),
+    ({"model_type": "glm5_next"}, "", {}, 1),
+    ({"model_type": "glm5_next"}, "PREFILL_WAVES=4\n", {}, 1),
     ({"model_type": "qwen4_exp"}, "", {}, 1),
     ({"model_type": "mimo_v2_flash"}, "", {}, 2),
     ({"model_type": "mimo_v2", "hidden_size": 6144}, "", {}, 3),
@@ -1356,6 +1624,28 @@ def test_glm53_honors_explicit_tp2_expert_limit(tmp_path, value):
         assert f"--rtx-expert-layers {expected}" in launch
 
 
+@pytest.mark.parametrize("explicit", [False, True])
+def test_glm53_units_span_forwards_the_planned_units_waves_and_span(tmp_path, explicit):
+    keys = "PREFILL_ROWS=2048\nPREFILL_WAVES=3\nPREFILL_SPAN_ROWS=8192\n" if explicit else ""
+    result = _family_launch_result(tmp_path, {
+        "model_type": "glm_moe_dsa", "num_hidden_layers": 9, "first_k_dense_replace": 3,
+    }, "test/glm", keys)
+    assert result.returncode == 0, result.stderr
+    plan = next(shlex.split(line) for line in result.stderr.splitlines()
+                if "cuteafd plan" in line and "--deployment" in line)
+    unit, waves, span = (2048, 3, 8192) if explicit else (4096, 2, 16384)
+    if explicit:
+        for flag, value in [("--prefill-rows", unit), ("--prefill-waves", waves), ("--prefill-span-rows", span)]:
+            assert plan[plan.index(flag) + 1] == str(value)
+    assert "--prefill-lanes" not in plan
+    serve = next(shlex.split(line) for line in result.stderr.splitlines()
+                 if "docker run -d" in line and "serve-glm" in line)
+    for flag, value in [("--prefill-rows", unit), ("--prefill-waves", waves), ("--prefill-span-rows", span)]:
+        assert serve.count(flag) == 1 and serve[serve.index(flag) + 1] == str(value)
+    assert not any("CUTEAFD_PREFILL_SPAN_ROWS" in arg or "CUTEAFD_GLM_PREFILL_LANES" in arg for arg in serve)
+    assert f"Resolved prefill: PREFILL_ROWS={unit} PREFILL_WAVES={waves} PREFILL_SPAN_ROWS={span}" in result.stdout
+
+
 def test_glm53_all_local_two_rtx_launch_has_no_spark_peers(tmp_path):
     result = _family_launch_result(tmp_path, {
         "model_type": "glm_moe_dsa", "num_hidden_layers": 4, "first_k_dense_replace": 3,
@@ -1367,7 +1657,7 @@ def test_glm53_all_local_two_rtx_launch_has_no_spark_peers(tmp_path):
     assert "--peers" not in launch
     assert "cuteafd expertd-native" not in result.stderr
     assert "--local-experts" not in launch
-    assert "CUTEAFD_GLM_PREFILL_LANES=1" in launch
+    assert "--prefill-waves 1" in launch and "CUTEAFD_GLM_PREFILL_LANES" not in launch
     assert "--rdma-endpoints" not in result.stderr
 
 
@@ -1724,14 +2014,14 @@ def test_glmf_index_cache_is_forwarded_only_when_compact(tmp_path, keys, compact
 
 
 @pytest.mark.parametrize("keys,expected,absent", [
-    ("", [], ["--prefill-lanes", "--prefill-lane-rows", "--headroom-gib", "--graph-budget-mib"]),
-    ("GLM5_FLASH_PREFILL_LANES=4\nGLM5_FLASH_PREFILL_LANE_ROWS=2048\n",
-     ["--prefill-lanes 4", "--prefill-lane-rows 2048"], []),
-    ("GLM5_FLASH_PREFILL_LANES=1\n", ["--prefill-lanes 1"], ["--prefill-lane-rows"]),
-    ("GLM5_FLASH_HEADROOM_GIB=1\n", ["--headroom-gib 1"], ["--prefill-lanes"]),
+    ("", [], ["--prefill-waves", "--prefill-rows", "--headroom-gib", "--graph-budget-mib"]),
+    ("PREFILL_WAVES=4\nPREFILL_ROWS=2048\n",
+     ["--prefill-waves 4", "--prefill-rows 2048"], []),
+    ("PREFILL_WAVES=1\n", ["--prefill-waves 1"], ["--prefill-rows"]),
+    ("GLM5_FLASH_HEADROOM_GIB=1\n", ["--headroom-gib 1"], ["--prefill-waves"]),
     ("GLM5_FLASH_GRAPH_BUDGET_MIB=512\n", ["--graph-budget-mib 512"], ["--headroom-gib"]),
 ])
-def test_glmf_lanes_and_headroom_are_forwarded_only_when_set(tmp_path, keys, expected, absent):
+def test_glmf_units_and_headroom_are_forwarded_only_when_set(tmp_path, keys, expected, absent):
     config = {"model_type": "glm5_next", "num_hidden_layers": 2,
               "mlp_layer_types": ["sparse"] * 2,
               "layer_types": ["linear_attention", "deepseek_sparse_attention"]}
@@ -1745,16 +2035,16 @@ def test_glmf_lanes_and_headroom_are_forwarded_only_when_set(tmp_path, keys, exp
 
 
 @pytest.mark.parametrize("key,value,message", [
-    ("GLM5_FLASH_PREFILL_LANES", "0", "GLM5_FLASH_PREFILL_LANES must be 1 to 4"),
-    ("GLM5_FLASH_PREFILL_LANES", "5", "GLM5_FLASH_PREFILL_LANES must be 1 to 4"),
-    ("GLM5_FLASH_PREFILL_LANE_ROWS", "2000", "GLM5_FLASH_PREFILL_LANE_ROWS must be a multiple of 64"),
-    ("GLM5_FLASH_PREFILL_LANE_ROWS", "8192", "GLM5_FLASH_PREFILL_LANE_ROWS must be a multiple of 64"),
-    ("GLM5_FLASH_PREFILL_LANE_ROWS", "0", "GLM5_FLASH_PREFILL_LANE_ROWS must be a multiple of 64"),
+    ("PREFILL_WAVES", "0", "PREFILL_WAVES must be 1 to 4"),
+    ("PREFILL_WAVES", "5", "PREFILL_WAVES must be 1 to 4"),
+    ("PREFILL_ROWS", "2000", "PREFILL_ROWS must be a multiple of 64"),
+    ("PREFILL_ROWS", "8192", "PREFILL_ROWS must be a multiple of 64"),
+    ("PREFILL_ROWS", "0", "PREFILL_ROWS must be a multiple of 64"),
     ("GLM5_FLASH_HEADROOM_GIB", "-1", "GLM5_FLASH_HEADROOM_GIB must be a non-negative size"),
     ("GLM5_FLASH_HEADROOM_GIB", "1GiB", "GLM5_FLASH_HEADROOM_GIB must be a non-negative size"),
     ("GLM5_FLASH_GRAPH_BUDGET_MIB", "0", "GLM5_FLASH_GRAPH_BUDGET_MIB must be a positive whole number"),
 ])
-def test_glmf_invalid_lanes_or_headroom_fail_before_workers_launch(tmp_path, key, value, message):
+def test_glmf_invalid_units_or_headroom_fail_before_workers_launch(tmp_path, key, value, message):
     config = {"model_type": "glm5_next", "num_hidden_layers": 2,
               "mlp_layer_types": ["sparse"] * 2,
               "layer_types": ["linear_attention", "deepseek_sparse_attention"]}
@@ -2370,11 +2660,27 @@ def test_qwen_default_matches_spark_free_coordinator_layout(tmp_path: Path, keys
     assert ("--split-device" in launch) == dual
     assert ("CUTEAFD_ATTENTION_PLACEMENT=layers" in launch) == dual
     assert ("--local-experts" in launch) == (ranks == 0)
+    assert "--prefill-rows 4096" in launch
+    assert "--prefill-waves 1" in launch
     if dual:
         assert "--rtx-expert-layers all" in launch
         preflight = next(line for line in result.stderr.splitlines() if "cuteafd plan" in line)
         assert "--attention-placement layers" in preflight
         assert "--rtx-expert-layers all" in preflight
+
+
+@pytest.mark.parametrize("rows,waves", [(512, 1), (1024, 2), (2048, 2), (4096, 2)])
+def test_qwen_prefill_shape_reaches_plan_and_server(tmp_path, rows, waves):
+    keys = ("RTX_GPUS=1\nSPARK_COUNT=4\nSPECULATOR=off\n"
+            f"PREFILL_ROWS={rows}\nPREFILL_WAVES={waves}\n")
+    result = _family_launch_result(tmp_path, SPLIT_CONFIGS["qwen4"], "test/model", keys)
+    assert result.returncode == 0, result.stderr
+    planner = next(line for line in result.stderr.splitlines() if "cuteafd plan" in line)
+    server = next(line for line in result.stderr.splitlines() if "cuteafd serve-qwen4" in line)
+    for command in (planner, server):
+        assert f"--prefill-rows {rows}" in command
+        assert f"--prefill-waves {waves}" in command
+    assert "--split-device" not in server
 
 
 @pytest.mark.parametrize("keys", ["RTX_GPUS=2\n", "COORDINATOR_GPUS=1,0\n", "COORDINATOR_SPLIT=heads\n"])
@@ -3482,7 +3788,7 @@ def test_generic_family_checkpoint_context_default_and_override(tmp_path, family
         keys += f"MAX_CONTEXT_TOKENS={context}\n"
     result = _family_launch_result(tmp_path, config, "test/model", keys)
     assert result.returncode == 0, result.stderr
-    launch = next(line for line in result.stderr.splitlines() if " --snapshot " in line and "serve-" in line)
+    launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-" in line)
     assert f"--max-context {context or 0}" in launch
 
 
@@ -3759,3 +4065,18 @@ def test_dense_full_prefill_logits_reaches_serve_and_plan(tmp_path, full, kv):
     expected_kv = kv or "fp8"
     assert f"--kv-cache {expected_kv}" in launch
     assert f"--kv-cache {expected_kv}" in plan
+
+
+def test_dense_qwen_forwards_speculation_trace(tmp_path: Path) -> None:
+    # Dense Qwen writes the trace through the shared Qwen scheduler; the card's
+    # --trace sets SPECULATION_TRACE, which the launcher must mount and pass on.
+    trace = tmp_path / "trace" / "speculation-trace.jsonl"
+    result = _family_launch_result(tmp_path, DENSE_CONFIG, "Qwen/Qwen3.5-9B",
+        f"SPARK_COUNT=0\nSPECULATION_TRACE={trace}\n",
+        extra_args=("--wip", "dense-test"),
+        encoder_plan={"placement_supported": True, "fits": True, "spark_ranks": 0})
+    assert result.returncode == 0, result.stderr
+    launch = next(line for line in result.stderr.splitlines() if "serve-qwen35 --snapshot" in line)
+    assert f"CUTEAFD_SPECULATION_TRACE={trace}" in launch
+    assert f"{trace.parent}:{trace.parent}" in launch
+

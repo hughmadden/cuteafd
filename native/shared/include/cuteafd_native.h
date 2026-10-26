@@ -317,11 +317,29 @@ cuteafd_status_t cuteafd_cuda_stream_query(void* cuda_stream, int32_t* ready);
 cuteafd_status_t cuteafd_cuda_stream_wait_event(void* cuda_stream, void* cuda_event);
 cuteafd_status_t cuteafd_cuda_event_create(void** out_cuda_event);
 cuteafd_status_t cuteafd_cuda_event_create_ordering(void** out_cuda_event);
+// Ordering event whose synchronize sleeps instead of spinning (per-step waits).
+cuteafd_status_t cuteafd_cuda_event_create_blocking(void** out_cuda_event);
 cuteafd_status_t cuteafd_cuda_event_destroy(void* cuda_event);
 cuteafd_status_t cuteafd_cuda_event_record(void* cuda_event, void* cuda_stream);
 // Retains a timestamp-producing event node inside captured profiling graphs.
 cuteafd_status_t cuteafd_cuda_event_record_external(void* cuda_event, void* cuda_stream);
 cuteafd_status_t cuteafd_cuda_event_synchronize(void* cuda_event);
+// Returns immediately: ready=0 means the event's work is pending; asynchronous
+// errors remain errors. Safe from any host thread on the event's device.
+cuteafd_status_t cuteafd_cuda_event_query(void* cuda_event, int32_t* ready);
+// Stream memory operations on one u32 word of mapped pinned host memory
+// (`cuteafd_alloc_host_buffer`): a host thread and the GPU exchange sequence
+// numbers through it with no host wait. `word` is the host address; the call
+// resolves its device alias on the stream's device. Both are queued eagerly
+// (between graph replays), never captured: the counters' values are runtime
+// state, not graph parameters.
+// wait: later work on `cuda_stream` starts only once (int32_t)(*word - value)
+// >= 0 (cyclic, wraparound-safe). Where the device can flush remote writes
+// the wait also orders GPUDirect RDMA writes that preceded the host's store.
+cuteafd_status_t cuteafd_cuda_stream_wait_value32(void* cuda_stream, const uint32_t* word, uint32_t value);
+// write: stores `value` to `word` once `cuda_stream`'s earlier work (copies
+// into host memory included) is complete and visible to the host.
+cuteafd_status_t cuteafd_cuda_stream_write_value32(void* cuda_stream, uint32_t* word, uint32_t value);
 cuteafd_status_t cuteafd_cuda_event_elapsed_ms(void* start_event, void* end_event, float* out_ms);
 // Opt-in census spans never synchronize. Completed device timings are drained
 // at later span calls; the bounded pending queue drops samples under overload.
@@ -527,22 +545,11 @@ cuteafd_status_t cuteafd_rdma_rc_endpoint_post_recv(void* handle, size_t bytes, 
 cuteafd_status_t cuteafd_rdma_rc_endpoint_post_recv_at(void* handle, size_t offset_bytes,
                                                    size_t bytes, uint64_t wr_id);
 // Receives scatter their first `header_bytes` into the host slot and the rest
-// into [device_ptr, device_ptr + bytes) (dma-buf MR for device memory, an
-// ordinary MR for pinned host memory); a null range restores host-only
-// receives. Applies to receives posted afterwards.
+// into equal `slot_bytes` ranges of [device_ptr, device_ptr + bytes) (dma-buf
+// MR), rotating in successful receive-post order. A null range restores host
+// receives. Register before posting; the caller fences consumers before reuse.
 cuteafd_status_t cuteafd_rdma_rc_endpoint_set_recv_landing(void* handle, void* device_ptr,
-                                                       size_t bytes, size_t header_bytes);
-// Registers [device_ptr, device_ptr + bytes) for remote RDMA writes on this
-// endpoint (dma-buf, no relaxed ordering) and returns its rkey; a null range
-// removes the registration.
-cuteafd_status_t cuteafd_rdma_rc_endpoint_expose_device(void* handle, void* device_ptr, size_t bytes,
-                                                    uint32_t* rkey);
-// RDMA-writes `bytes` at `offset_bytes` of the send buffer to `remote_addr`
-// (unsignaled), then the 8-byte `flag_value` to `flag_remote_addr` (signaled
-// with `wr_id`); the flag lands after the data. `bytes` may be 0 (flag only).
-cuteafd_status_t cuteafd_rdma_rc_endpoint_post_write_flagged(
-    void* handle, size_t offset_bytes, size_t bytes, uint64_t remote_addr, uint32_t rkey,
-    uint64_t flag_value, uint64_t flag_remote_addr, uint32_t flag_rkey, uint64_t wr_id);
+                                                       size_t bytes, size_t header_bytes, size_t slot_bytes);
 cuteafd_status_t cuteafd_rdma_gpu_landing_probe(const char* device_name, uint32_t port_num,
                                             size_t bytes, uint32_t iterations,
                                             cuteafd_rdma_gpu_landing_probe_t* out);

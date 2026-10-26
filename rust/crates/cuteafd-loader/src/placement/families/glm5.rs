@@ -191,6 +191,9 @@ pub struct GlmInputs<'a> {
     /// Native FP8 K32 ingress, BF16 partials and bounded per-step shared execution.
     pub native_experts: bool,
     pub native_workspace: u64,
+    /// Per GPU: an EXLR8 checkpoint's native dense scratch (decode plus every
+    /// prefill lane) and prefill unpack staging; zero on the official path.
+    pub native_dense: Vec<u64>,
     /// Coordinator-only diagnostics replace routed FFNs with zero intake planes.
     pub skip_routed_experts: bool,
     pub prefill_rows: u64,
@@ -252,10 +255,10 @@ pub fn request(inputs: &GlmInputs<'_>) -> Result<PlacementRequest, PlacementErro
         || inputs.prefill_rows == 0 || inputs.prefill_rows > 4096 || inputs.max_context == 0 {
         return Err(PlacementError::Inventory("GLM rank/lane/step/context geometry"));
     }
-    if inputs.native_experts && (inputs.spark_ranks == 0 || inputs.spark_ranks > 6 || inputs.skip_routed_experts
-        || !inputs.experts.is_empty() || inputs.scratch.is_none()
+    if inputs.native_experts && (inputs.spark_ranks > 8 || inputs.skip_routed_experts
+        || (inputs.spark_ranks == 0 && inputs.experts.is_empty()) || inputs.scratch.is_none()
         || inputs.native_workspace == 0) {
-        return Err(PlacementError::Inventory("EXLR8 requires measured workspaces, real Spark experts and 1..=6 ranks"));
+        return Err(PlacementError::Inventory("EXLR8 requires measured workspaces, real Spark experts and 1..=8 ranks"));
     }
     let geometry = glm_cache_geometry(cfg, inputs.layers, gpus)
         .map_err(|_| PlacementError::Inventory("GLM cache geometry"))?;
@@ -304,6 +307,10 @@ pub fn request(inputs: &GlmInputs<'_>) -> Result<PlacementRequest, PlacementErro
                 .ok_or(PlacementError::Overflow("GLM native workspaces"))?
         } else { steps };
         rows.push(GlmBufferRow::new(GlmComponent::Always, Demand::new(gpu, Category::Workspace, "steps", steps, basis)));
+        if let Some(&bytes) = inputs.native_dense.get(rank).filter(|&&bytes| bytes > 0) {
+            rows.push(GlmBufferRow::new(GlmComponent::Always, Demand::new(gpu, Category::Workspace,
+                "native dense scratch and prefill staging", bytes, Basis::Formula)));
+        }
         rows.push(GlmBufferRow::new(GlmComponent::Always, Demand::new(gpu, Category::Runtime, "decode graph allowance", graphs, Basis::Estimated)));
         if let Some(&bytes) = inputs.pending_code.get(rank).filter(|&&bytes| bytes > 0) {
             rows.push(GlmBufferRow::new(GlmComponent::Always, Demand::new(gpu, Category::Runtime, "pending loaded code", bytes, Basis::Formula)));
@@ -321,9 +328,14 @@ pub fn request(inputs: &GlmInputs<'_>) -> Result<PlacementRequest, PlacementErro
                     Basis::Formula)));
             }
             if inputs.spark_ranks > 0 {
-                let endpoints = 1 + if inputs.prefill_lanes > 1 { inputs.prefill_lanes } else { 0 };
+                // The decode link's 4096-row planes, plus the prefill link's return
+                // slots: one unit of `prefill_rows` per wave in flight.
+                let prefill = if inputs.prefill_lanes > 1 {
+                    crate::serving_capacity::prefill_return_bytes(inputs.prefill_lanes, inputs.prefill_rows,
+                        inputs.spark_ranks as u64, cfg.hidden as u64)
+                } else { 0 };
                 rows.push(GlmBufferRow::new(GlmComponent::SparkExperts, Demand::new(gpu, Category::Transport, "Spark intake planes",
-                    endpoints * inputs.spark_ranks as u64 * 4096 * cfg.hidden as u64 * 2, Basis::Formula)));
+                    inputs.spark_ranks as u64 * 4096 * cfg.hidden as u64 * 2 + prefill, Basis::Formula)));
             }
         }
         pool_overhead.push(table_bytes);
@@ -589,6 +601,7 @@ pub fn manifest_scratch(cfg: &GlmDsaConfig, split: bool, manifest: &serde_json::
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GlmLocalFormat {
     Exl3,
+    Exlr8,
     Nvfp4 { w4a4: bool },
 }
 
@@ -666,7 +679,7 @@ pub fn spark_resident_bytes(catalog: &crate::OfficialV41Catalog, layers: &[usize
         return Ok(Vec::new());
     }
     let shape = catalog.routed_experts();
-    anyhow::ensure!(matches!(ranks, 2 | 3 | 4 | 6) && shape.hidden == 6144
+    anyhow::ensure!((1..=8).contains(&ranks) && shape.hidden == 6144
         && shape.intermediate == 2048 && shape.experts == 256 && shape.topk == 8
         && shape.layers > shape.first_layer && layers.last() == Some(&(shape.layers - 1))
         && layers.iter().all(|&layer| (shape.first_layer..shape.layers).contains(&layer))
@@ -711,7 +724,7 @@ pub fn local_inventory_selected(catalog: &crate::OfficialV41Catalog, manifest: &
     let package = [parent.join("exl3").join(&stem), parent.join("../lib/exl3").join(&stem)]
         .into_iter().map(|p| p.join("rtx-tp2")).find(|p| p.is_dir())
         .ok_or_else(|| anyhow::Error::new(MissingLocalPackage(format!("{stem}/rtx-tp2"))))?;
-    let capacities = [1u64, 16, 80, 256, 1024, 4096];
+    let capacities = cuteafd_core::EXL3_CAPACITIES.map(u64::from);
     let max_rows = rows.max(DECODE_ROWS);
     let compiled = capacities.into_iter().find(|&c| c >= max_rows).unwrap();
     let manifests = capacities.into_iter().filter(|&c| c <= compiled).map(|capacity| {
@@ -833,6 +846,51 @@ fn nvfp4_inventory(catalog: &crate::OfficialV41Catalog, manifest: &std::path::Pa
             shape.topk as u64, rows, lanes, false) })
 }
 
+/// Exact checkpoint-native TP2 costs. Rotated unit ownership changes by
+/// expert and layer; neither a proportional half nor EXL3 storage is valid.
+fn exlr8_expert_costs(snapshot: &std::path::Path, selected: &str, first: usize, layers: usize,
+    router: &[crate::plan::exlr8::dense::DenseRecord]) -> anyhow::Result<Vec<ExpertCost>> {
+    use crate::plan::exlr8::residency::{ExpertSet, Residency};
+    (first..layers).map(|layer| {
+        let whole = Residency::plan(snapshot, selected, layer, 1, 0, ExpertSet::Routed)?.resident_bytes as u64;
+        let mut half = [Bytes2::default(); 2];
+        for (rank, cost) in half.iter_mut().enumerate() {
+            cost.resident = Residency::plan(snapshot, selected, layer, 2, rank, ExpertSet::Routed)?.resident_bytes as u64;
+        }
+        for record in router.iter().filter(|record| record.tensor.starts_with(&format!("model.layers.{layer}.mlp.gate."))) {
+            for component in &record.components {
+                half[1].resident = half[1].resident.checked_add((component.source.bytes as u64).max(FLOOR))
+                    .ok_or_else(|| anyhow::anyhow!("EXLR8 local router storage overflow"))?;
+            }
+        }
+        Ok(ExpertCost { whole: Bytes2 { resident: whole, staging: 0 }, half, tp2: true, spark_ok: true })
+    }).collect()
+}
+
+/// Native manifest selection is mandatory; never route EXLR8 through EXL3.
+pub fn exlr8_inventory(snapshot: &std::path::Path, selected: &str, manifest: &std::path::Path,
+    selected_layers: usize, rows: u64, lanes: u64, exchange_f32: bool,
+    activations: crate::plan::exlr8::PrefillActivations) -> anyhow::Result<LocalInventory> {
+    anyhow::ensure!(!exchange_f32, "GLM EXLR8 TP2 emits BF16 routed partials; use BF16 exchange");
+    let config = crate::plan::checkpoint::read_json(&snapshot.join("config.json"))?;
+    let cfg = GlmDsaConfig::from_hf(&config)?;
+    anyhow::ensure!(cfg.hidden == 6144 && cfg.moe_intermediate == 2048 && cfg.experts == 256
+        && cfg.topk == 8 && (cfg.first_moe_layer..=cfg.layers).contains(&selected_layers)
+        && (1..=4).contains(&lanes), "GLM EXLR8 TP2 geometry/layer extent");
+    let programs = crate::plan::checkpoint::read_json(manifest)?;
+    let backend_workspace = crate::plan::exlr8::routed_workspace(&programs, rows, 8, activations)?;
+    let records = crate::plan::exlr8::dense::DenseRecord::inventory(snapshot)?;
+    for layer in cfg.first_moe_layer..selected_layers {
+        for suffix in ["weight", "e_score_correction_bias"] {
+            let name = format!("model.layers.{layer}.mlp.gate.{suffix}");
+            anyhow::ensure!(records.iter().any(|record| record.tensor == name), "EXLR8 missing local router {name}");
+        }
+    }
+    let experts = exlr8_expert_costs(snapshot, selected, cfg.first_moe_layer, selected_layers, &records)?;
+    Ok(LocalInventory { package: manifest.to_path_buf(), format: GlmLocalFormat::Exlr8, experts, backend_workspace,
+        extra_workspace: local_extra_workspace(cfg.hidden as u64, cfg.experts as u64, cfg.topk as u64, rows, lanes, false) })
+}
+
 #[derive(Debug, thiserror::Error)]
 #[error("missing {0} package")]
 struct MissingLocalPackage(String);
@@ -841,7 +899,8 @@ struct MissingLocalPackage(String);
 #[allow(clippy::too_many_arguments)]
 pub fn select_local_inventory(catalog: &crate::OfficialV41Catalog, manifest: &std::path::Path,
     layers: usize, gpus: usize, rows: u64, lanes: u64, exchange_f32: bool,
-    onboard: Onboard, skip: bool) -> anyhow::Result<Option<LocalInventory>> {
+    onboard: Onboard, skip: bool, exlr8: Option<(&str, crate::plan::exlr8::PrefillActivations)>)
+    -> anyhow::Result<Option<LocalInventory>> {
     if skip || onboard.layers(layers.saturating_sub(catalog.routed_experts().first_layer)) == Some(0)
         || layers <= catalog.routed_experts().first_layer { return Ok(None); }
     if gpus != 2 {
@@ -849,6 +908,11 @@ pub fn select_local_inventory(catalog: &crate::OfficialV41Catalog, manifest: &st
             "GLM local experts require a two-GPU TP2 executor");
         return Ok(None);
     }
+    if catalog.format() == crate::plan::checkpoint::CheckpointFormat::Exlr8 {
+        let (selected, activations) = exlr8.ok_or_else(|| anyhow::anyhow!("EXLR8 local inventory requires the selected native manifest"))?;
+        return exlr8_inventory(catalog.snapshot(), selected, manifest, layers, rows, lanes, exchange_f32, activations).map(Some);
+    }
+    anyhow::ensure!(exlr8.is_none(), "EXLR8 manifest supplied for non-native checkpoint");
     let automatic = matches!(onboard, Onboard::Auto | Onboard::ExpertsFirst { .. });
     let supported = catalog.exl3().is_some() || catalog.fp8().is_some_and(|t|
         t.format() == crate::formats::fp8_experts::ExpertFormat::Nvfp4);
@@ -891,7 +955,7 @@ mod tests {
     fn inputs<'a>(cfg: &'a GlmDsaConfig, cards: &[u64]) -> GlmInputs<'a> {
         GlmInputs { cfg, layers: cfg.layers, gpus: cards.iter().enumerate().map(|(rank, &total)| (total,
             Baseline::Planned { context_bytes: GIB, loaded_bytes: if rank == 0 { 14 * GIB } else { 12 * GIB } })).collect(),
-            headroom_bytes: 2 * GIB, spark_ranks: 4, native_experts: false, native_workspace: 0, skip_routed_experts: false, prefill_rows: 4096, prefill_lanes: 3,
+            headroom_bytes: 2 * GIB, spark_ranks: 4, native_experts: false, native_workspace: 0, native_dense: Vec::new(), skip_routed_experts: false, prefill_rows: 4096, prefill_lanes: 3,
             max_context: 1 << 20, automatic_context: true, scratch: Some([GlmScratch { programs: 16 << 20, topk: 1 << 20 }; 2]),
             drafter_bytes: 3 * GIB, drafter_staging: 0, pending_code: vec![],
             experts: (cfg.first_moe_layer..cfg.layers).map(|_| ExpertCost {
@@ -905,6 +969,43 @@ mod tests {
     /// solve must request `heads` explicitly: auto resolves to `context`,
     /// which fails closed without its programs (issue #202).
     const HEADS: Option<AttentionPlacement> = Some(AttentionPlacement::Heads);
+
+    #[test]
+    fn exlr8_costs_use_rotated_native_residency_and_peer_router_records() {
+        use crate::plan::{exlr8::{dense::{DenseRecord, DenseEncoding, DenseComponent, DenseRange, ShardSide},
+            residency::{Residency, ExpertSet}}, testing::exlr8::fixture};
+        let root = tempfile::tempdir().unwrap();
+        fixture(root.path(), false);
+        let records = ["weight", "e_score_correction_bias"].into_iter().zip([768usize, 8]).map(|(suffix, bytes)| DenseRecord {
+            tensor: format!("model.layers.3.mlp.gate.{suffix}"), encoding: DenseEncoding::Bf16,
+            shape: vec![bytes / 2], side: ShardSide::Replicated, channels_per_shard: 0,
+            rotation_id: 0, rotation: None, hessian_solved: false, native_blocks: 0,
+            components: vec![DenseComponent { suffix: suffix.into(), dtype: "BF16".into(), shape: vec![bytes / 2],
+                source: DenseRange { path: root.path().join("router"), offset: 0, bytes } }],
+        }).collect::<Vec<_>>();
+        let original = std::fs::read(root.path().join("manifests/exlr8-manifest-mixed.json")).unwrap();
+        for selected in ["up1", "bit325"] {
+            let mut manifest: serde_json::Value = serde_json::from_slice(&original).unwrap();
+            manifest["name"] = serde_json::json!(selected);
+            std::fs::write(root.path().join(format!("manifests/exlr8-manifest-{selected}.json")), manifest.to_string()).unwrap();
+            let costs = exlr8_expert_costs(root.path(), selected, 3, 4, &records).unwrap();
+            assert_eq!(costs.len(), 1);
+            let cost = costs[0];
+            assert_eq!(cost.whole.resident, Residency::plan(root.path(), selected, 3, 1, 0, ExpertSet::Routed).unwrap().resident_bytes as u64);
+            for rank in 0..2 {
+                assert_eq!(cost.half[rank].resident, Residency::plan(root.path(), selected, 3, 2, rank, ExpertSet::Routed)
+                    .unwrap().resident_bytes as u64 + if rank == 1 { 768 + 256 } else { 0 });
+                assert_eq!(cost.half[rank].staging, 0);
+            }
+            assert!(cost.tp2 && cost.spark_ok);
+            let residents = crate::plan::exlr8::spark_resident_bytes(root.path(), selected, &[3], 2).unwrap();
+            assert_eq!(residents[0], cost.half[0].resident);
+            assert_eq!(residents[1] + 1024, cost.half[1].resident);
+        }
+        assert!(exlr8_expert_costs(root.path(), "missing", 3, 4, &records).is_err());
+        assert_eq!(crate::plan::exlr8::spark_resident_bytes(root.path(), "up1", &[], 0).unwrap(), Vec::<u64>::new());
+        assert!(crate::plan::exlr8::spark_resident_bytes(root.path(), "up1", &[], 2).is_err());
+    }
 
     #[test]
     fn native_split_workspaces_are_exact_and_unsupported_modes_refused() {
@@ -931,9 +1032,9 @@ mod tests {
             let mut ordinary = base.clone(); ordinary.prefill_lanes = lanes;
             assert_eq!(term(&request(&parallel).unwrap(), "steps")
                 - term(&request(&ordinary).unwrap(), "steps"), (1 + lanes) * 123456);
-            let endpoints = 1 + if lanes > 1 { lanes } else { 0 };
+            let prefill = if lanes > 1 { lanes * 4 * parallel.prefill_rows * h * 2 } else { 0 };
             assert_eq!(term(&request(&parallel).unwrap(), "Spark intake planes"),
-                endpoints * 4 * 4096 * h * 2);
+                4 * 4096 * h * 2 + prefill);
         }
         for gpus in 1..=2 {
             let mut drafting = native.clone();
@@ -953,12 +1054,52 @@ mod tests {
         assert!(request(&invalid).is_err());
         let mut pair = native.clone(); pair.gpus.push(pair.gpus[0]);
         assert!(request(&pair).is_ok());
-        for ranks in 1..=6 {
+        for ranks in 1..=8 {
             let mut supported = pair.clone(); supported.spark_ranks = ranks;
             assert!(request(&supported).is_ok());
         }
-        let mut invalid = pair; invalid.spark_ranks = 7;
+        let mut invalid = pair; invalid.spark_ranks = 9;
         assert!(request(&invalid).is_err());
+    }
+
+    #[test]
+    fn native_onboarding_uses_shared_tp2_solver_and_charges_lanes_before_pool() {
+        let cfg = config();
+        let mut native = inputs(&cfg, &[96 * GIB; 2]);
+        native.native_experts = true;
+        native.native_workspace = 256;
+        native.drafter_bytes = 0;
+        native.drafter_staging = 0;
+        native.onboard = Onboard::Layers(1);
+        native.prefill_lanes = 3;
+        let run = |input: &GlmInputs<'_>| solve_working_set(input, input.tp2_workspace, HEADS).unwrap();
+        let (base, working) = run(&native);
+        assert_eq!(base.onboard_layers, 1);
+        assert_eq!(working.spark.rtx_layers, vec![cfg.first_moe_layer]);
+        assert_eq!(working.spark.spark_layers, (cfg.first_moe_layer + 1..cfg.layers).collect::<Vec<_>>());
+        let extra = local_extra_workspace(cfg.hidden as u64, cfg.experts as u64, cfg.topk as u64,
+            native.prefill_rows, native.prefill_lanes, false);
+        let mut charged = native.clone();
+        charged.tp2_workspace = extra.map(|bytes| bytes + 4 * GIB);
+        let (charged_plan, charged_working) = run(&charged);
+        assert_eq!(charged_working.spark, working.spark);
+        assert!(charged_plan.pool_tokens < base.pool_tokens, "backend and every lane precede automatic KV admission");
+        let mut live = charged.clone();
+        for (capacity, baseline) in &mut live.gpus {
+            let Baseline::Planned { context_bytes, loaded_bytes } = *baseline else { unreachable!() };
+            *baseline = Baseline::Measured { free_bytes: *capacity - context_bytes - loaded_bytes };
+        }
+        assert_eq!(run(&live), (charged_plan, charged_working));
+        native.onboard = Onboard::Layers(cfg.layers - cfg.first_moe_layer);
+        for expert in &mut native.experts {
+            expert.whole.resident = 2 << 20;
+            for half in &mut expert.half { half.resident = 1 << 20; }
+        }
+        let (all, working) = run(&native);
+        assert_eq!(all.onboard_layers, cfg.layers - cfg.first_moe_layer);
+        assert!(working.spark.spark_layers.is_empty());
+        assert_eq!(working.spark.spark_ranks, 0);
+        assert_eq!(working.spark.prefill_lanes, 1);
     }
 
     #[test]
@@ -1087,7 +1228,8 @@ mod tests {
             assert!(working.spark.includes(WorkingSetComponent::SparkExperts));
             assert_eq!(working.tp2_workspace, if n == 0 { [0; 2] } else { input.tp2_workspace });
             let intake = p.items[0].iter().find(|item| item.group == "Spark intake planes").unwrap();
-            assert_eq!(intake.bytes, 4 * 4 * 4096 * 6144 * 2);
+            // Decode's 4096-row planes plus three prefill return slots of a unit each.
+            assert_eq!(intake.bytes, 4 * 4096 * 6144 * 2 + 3 * 4 * input.prefill_rows * 6144 * 2);
         }
     }
 
@@ -1275,24 +1417,24 @@ mod tests {
     fn activation_policy_uses_exports_and_refuses_malformed_packages() {
         let (dir, catalog, manifest) = local_fixture();
         for onboard in [Onboard::Auto, Onboard::ExpertsFirst { pool_floor: 65536 }, Onboard::Layers(1)] {
-            assert!(select_local_inventory(&catalog, &manifest, 2, 2, 64, 3, false, onboard, false)
+            assert!(select_local_inventory(&catalog, &manifest, 2, 2, 64, 3, false, onboard, false, None)
                 .unwrap().is_some());
         }
-        assert!(select_local_inventory(&catalog, &manifest, 2, 2, 64, 3, false, Onboard::Layers(0), false)
+        assert!(select_local_inventory(&catalog, &manifest, 2, 2, 64, 3, false, Onboard::Layers(0), false, None)
             .unwrap().is_none());
-        assert!(select_local_inventory(&catalog, &manifest, 2, 2, 64, 3, false, Onboard::Layers(1), true)
+        assert!(select_local_inventory(&catalog, &manifest, 2, 2, 64, 3, false, Onboard::Layers(1), true, None)
             .unwrap().is_none());
-        assert!(select_local_inventory(&catalog, &manifest, 2, 1, 64, 3, false, Onboard::Auto, false)
+        assert!(select_local_inventory(&catalog, &manifest, 2, 1, 64, 3, false, Onboard::Auto, false, None)
             .unwrap().is_none());
-        assert!(select_local_inventory(&catalog, &manifest, 2, 1, 64, 3, false, Onboard::Layers(1), false).is_err());
+        assert!(select_local_inventory(&catalog, &manifest, 2, 1, 64, 3, false, Onboard::Layers(1), false, None).is_err());
         let package = dir.path().join("exl3/exl3-glm-k45/rtx-tp2");
         std::fs::remove_file(package.join("m16/libcuteafd_exl3.so")).unwrap();
-        assert!(select_local_inventory(&catalog, &manifest, 2, 2, 64, 3, false, Onboard::Auto, false).is_err(),
+        assert!(select_local_inventory(&catalog, &manifest, 2, 2, 64, 3, false, Onboard::Auto, false, None).is_err(),
             "present but incomplete exports must fail closed");
         std::fs::remove_dir_all(package).unwrap();
-        assert!(select_local_inventory(&catalog, &manifest, 2, 2, 64, 3, false, Onboard::Auto, false)
+        assert!(select_local_inventory(&catalog, &manifest, 2, 2, 64, 3, false, Onboard::Auto, false, None)
             .unwrap().is_none());
-        assert!(select_local_inventory(&catalog, &manifest, 2, 2, 64, 3, false, Onboard::Layers(1), false).is_err());
+        assert!(select_local_inventory(&catalog, &manifest, 2, 2, 64, 3, false, Onboard::Layers(1), false, None).is_err());
     }
 
     #[test]
@@ -1300,7 +1442,7 @@ mod tests {
         let (_dir, catalog, manifest) = local_fixture();
         let cfg = GlmDsaConfig::from_hf(&crate::plan::testing::glm5_config()).unwrap();
         for onboard in [Onboard::Auto, Onboard::Layers(1)] {
-            let local = select_local_inventory(&catalog, &manifest, 2, 2, 64, 3, false, onboard, false)
+            let local = select_local_inventory(&catalog, &manifest, 2, 2, 64, 3, false, onboard, false, None)
                 .unwrap().unwrap();
             let planned = GlmInputs { prefill_rows: 64, experts: local.experts.clone(),
                 expert_workspace: 0, tp2_workspace: local.workspace(), drafter_bytes: 0,
@@ -1488,7 +1630,7 @@ mod tests {
         let catalog = extend_routed_fixture(&catalog, nvfp4_checkpoint_tensors());
         let scalars = 3 * 256 * 8;
         let bytes = |width| 3 * 256 * 6144 * width * (8 + 1) / 16 + scalars;
-        for ranks in [2, 3, 4, 6] {
+        for ranks in 1..=8 {
             for slicing in [Slicing::Blocks(16), Slicing::Blocks(128), Slicing::Padded] {
                 let whole_suffix = spark_resident_bytes(&catalog, &[1, 2, 3], ranks, slicing).unwrap();
                 let selected = spark_resident_bytes(&catalog, &[2, 3], ranks, slicing).unwrap();
@@ -1518,7 +1660,7 @@ mod tests {
         assert_eq!(exact.iter().sum::<u64>(), bytes(2048) + 5 * scalars);
         assert!(spark_resident_bytes(&catalog, &[], 0, Slicing::Padded).unwrap().is_empty());
         for (layers, ranks) in [(vec![], 4), (vec![1], 4), (vec![3, 2], 4),
-            (vec![1, 3], 4), (vec![2, 3], 0), (vec![2, 3], 5), (vec![4], 4)] {
+            (vec![1, 3], 4), (vec![2, 3], 0), (vec![2, 3], 9), (vec![4], 4)] {
             assert!(spark_resident_bytes(&catalog, &layers, ranks, Slicing::Padded).is_err());
         }
     }

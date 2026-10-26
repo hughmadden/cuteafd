@@ -101,7 +101,7 @@ fn native_planner_fixture() -> (tempfile::TempDir, PlanOptions, crate::placement
     let exports = json!({"programs":programs});
     std::fs::write(&manifest, serde_json::to_vec(&exports).unwrap()).unwrap();
     let options = PlanOptions { placement: ExpertPlacement::Local, vision: plan::MediaMode::Off,
-        audio: plan::MediaMode::Off, layout: Some(plan::layout::LayoutOptions {
+        audio: plan::MediaMode::Off, layout: Some(plan::layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)),
             rtx_bytes: vec![96 << 30], concurrency: 4, prefix_slots: Some(10), native_mtp_layers: 0,
             pool_tokens: Some(262144), workspace_manifest: Some(manifest.clone()),
             dense_qwen_kv: crate::families::qwen4::Qwen4KvCache::Bf16, ..Default::default() }),
@@ -146,6 +146,49 @@ fn native_planner_uses_export_contract_and_exact_dense_allocations() {
     assert!(!refused.fits && !refused.placement_supported && !refused.native_serving_admitted
         && !refused.wip_launchable());
     assert!(refused.hints.iter().any(|hint| hint.what.contains("pointer order")));
+}
+
+#[test]
+fn native_planner_resolves_zero_spark_prefill_contract() {
+    let (dir, mut options, _, _) = native_planner_fixture();
+    for explicit in [false, true] {
+        let layout = options.layout.as_mut().unwrap();
+        layout.prefill_rows = if explicit { 4096 } else { 0 };
+        layout.prefill_unit_rows = explicit.then_some(4096);
+        layout.prefill_span_rows = explicit.then_some(4096);
+        let report = plan::plan(dir.path(), &options).unwrap();
+        assert!(report.wip_launchable());
+        assert_eq!(report.spark_ranks, 0);
+        assert_eq!((report.prefill_unit_rows, report.prefill_waves,
+            report.prefill_span_rows, report.prefill_transports),
+            (Some(4096), Some(1), Some(4096), Some(0)));
+        let deployment_options = plan::deployment::DeploymentOptions { rtx_gpus: 1, ..Default::default() };
+        let deployment = plan::deployment::DeploymentSpec::from_report(&report, &deployment_options).unwrap();
+        assert_eq!((deployment.prefill_unit_rows, deployment.prefill_waves,
+            deployment.prefill_span_rows), (4096, 1, 4096));
+        assert!(deployment.peers.is_empty() && deployment.roles.is_empty());
+    }
+}
+
+#[test]
+fn native_planner_refuses_unimplemented_prefill_shapes() {
+    let (dir, options, _, _) = native_planner_fixture();
+    for (rows, unit, span, waves, lanes) in [
+        (2048, None, None, 1, 0), (0, Some(2048), None, 1, 0),
+        (0, None, Some(8192), 1, 0), (0, None, None, 2, 0),
+        (0, None, None, 1, 2),
+    ] {
+        let mut options = options.clone();
+        let layout = options.layout.as_mut().unwrap();
+        layout.prefill_rows = rows;
+        layout.prefill_unit_rows = unit;
+        layout.prefill_span_rows = span;
+        layout.prefill_waves = waves;
+        layout.prefill_lanes = lanes;
+        let report = plan::plan(dir.path(), &options).unwrap();
+        assert!(!report.wip_launchable());
+        assert!(report.hints.iter().any(|hint| hint.what.contains("dense native prefill")));
+    }
 }
 
 #[test]

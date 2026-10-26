@@ -44,7 +44,7 @@ def test_minimax_launch_matches_planner(tmp_path, ranks, kv):
     assert _flag(serve, "--spark-budget-bytes") == str(108 << 30)
     assert _flag(serve, "--max-sequences") == _flag(plan, "--concurrency") == "64"
     assert _flag(serve, "--prefill-batch-tokens") == _flag(plan, "--prefill-rows") == "4096"
-    assert _flag(serve, "--prefill-lanes") == _flag(plan, "--prefill-lanes") == "2"
+    assert _flag(serve, "--prefill-lanes") == _flag(plan, "--prefill-waves") == "2"
     assert _flag(plan, "--spark-ranks") == str(ranks)
     assert "--mtp" not in serve and "--split-device" not in serve
     workers = [line for line in result.stderr.splitlines() if "cuteafd expertd-native" in line]

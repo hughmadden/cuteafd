@@ -2,7 +2,7 @@
 use super::*;
 use crate::shared::experts::execution::ExpertExecution;
 use crate::shared::experts::exl3::{worker::Exl3Worker, Exl3Weights};
-use crate::shared::experts::fp8::{worker::Fp8Worker, Fp8Experts};
+use crate::shared::experts::fp8::{worker::Fp8Worker, Fp8Weights};
 use cuteafd_ffi::CuteafdDeviceBuffer;
 use cuteafd_loader::OfficialV41Catalog;
 use cuteafd_transport::{ExpertProtocolV2DeviceResponseRef, ExpertProtocolV2ResponseRef};
@@ -11,7 +11,7 @@ use std::rc::Rc;
 pub(super) enum Weights<'a> {
     Full(Vec<ExpertWeights<'a>>),
     Exl3(Rc<Vec<Exl3Weights<'a>>>),
-    Fp8(Vec<Rc<Fp8Experts<'a>>>),
+    Fp8(Vec<Rc<Fp8Weights<'a>>>),
     Exlr8(Vec<crate::shared::experts::exlr8::Exlr8Weights<'a>>),
 }
 
@@ -196,14 +196,15 @@ impl<'a> Weights<'a> {
                     config.capacity,
                     remaining,
                     config.exl3_schedule,
-                    Some(modules.take_exl3()?),
+                    modules.take_exl3()?,
                 )?;
                 execution.install_topology(config.spark_world()?.ownership_topology())?;
                 Execution::Exl3(execution)
             }
             Self::Fp8(experts) => {
-                let workspace = fp8_worker_workspace(config)?.checked_mul(experts.len())
-                    .context("expert group workspace overflow")?;
+                let workspace = experts.iter().try_fold(0usize, |total, group|
+                    total.checked_add(Fp8Worker::workspace_bytes(group, config.capacity as usize)?)
+                        .context("expert group workspace overflow"))?;
                 ensure!(workspace <= remaining, "expert worker workspace exceeds the device budget");
                 let mut workers = Vec::with_capacity(experts.len());
                 let mut bindings = Vec::new();
@@ -280,6 +281,10 @@ impl<'a> Fp8Groups<'a> {
         where F: FnMut(ExpertProtocolV2ResponseRef<'_>) -> Result<()> {
         self.workers[self.selected].execute_host_chunks(request, executor_id, exchange, row_indices, max_frame_bytes, sink)
     }
+    fn stream_idle(&self) -> Result<bool> {
+        for worker in &self.workers { if !worker.stream_idle()? { return Ok(false); } }
+        Ok(true)
+    }
 }
 
 pub(super) fn conservative_grouping(loaded: cuteafd_transport::worker_selection::WorkerSelection,
@@ -308,8 +313,8 @@ impl ExpertGroupBytes {
         self.host = self.host.max(load.host);
         self.pinned = self.pinned.max(load.pinned);
     }
-    fn permanent(&self) -> Result<usize> {
-        self.resident.checked_add(self.scratch).context("expert permanent overflow")
+    fn workspace(&self, io: usize) -> Result<usize> {
+        io.checked_add(self.scratch).context("expert workspace overflow")
     }
 }
 
@@ -327,6 +332,35 @@ impl<'w, 'a> Execution<'w, 'a> {
             Self::Exl3(execution) => execution.installed_grouping(loaded, rank).map(Some),
             Self::Fp8(execution) => execution.installed_grouping(loaded, rank).map(Some),
             Self::Exlr8(execution) => execution.grouping(loaded, rank).map(Some),
+        }
+    }
+    /// Lane-owned mode: mapped requests return with their work queued; the
+    /// owner emits once [`Self::stream_idle`] holds, after [`Self::complete`].
+    pub(super) fn defer(&mut self) -> Result<()> {
+        match self {
+            Self::Full(execution) => execution.defer(),
+            Self::Exl3(execution) => execution.defer(),
+            Self::Fp8(groups) => groups.workers.iter_mut().for_each(Fp8Worker::defer),
+            Self::Exlr8(execution) => execution.defer(),
+        }
+        Ok(())
+    }
+    /// A deferred request's stream drained ([`Self::stream_idle`]): finish its
+    /// host bookkeeping (EXLR8 and EXL3 publish their timing here) before emission.
+    pub(super) fn complete(&mut self) -> Result<()> {
+        match self {
+            Self::Exlr8(execution) => execution.complete(),
+            Self::Exl3(execution) => execution.complete(),
+            Self::Full(_) | Self::Fp8(_) => Ok(()),
+        }
+    }
+    /// Whether every request this execution queued has completed.
+    pub(super) fn stream_idle(&self) -> Result<bool> {
+        match self {
+            Self::Full(execution) => execution.stream_idle(),
+            Self::Exl3(execution) => execution.stream_idle(),
+            Self::Fp8(groups) => groups.stream_idle(),
+            Self::Exlr8(execution) => execution.stream_idle(),
         }
     }
     pub(super) fn bind_layer(&mut self, weights: &'w Weights<'a>, index: usize) -> Result<()> {
@@ -429,7 +463,7 @@ mod admission_tests {
     fn mixed_ingress_requires_both_backends_even_at_full_decode_extent() {
         use cuteafd_core::{SparkEndpoint, SparkIngress};
         for rows in [16, 80] {
-            let endpoint = SparkEndpoint { capacity: 80, ingress: SparkIngress::Bf16Decode { rows } };
+            let endpoint = SparkEndpoint { ring_depth: None, capacity: 80, ingress: SparkIngress::Bf16Decode { rows } };
             for (fp8, bf16) in [(false, false), (false, true), (true, false), (true, true)] {
                 assert_eq!(super::supports_ingress(endpoint.ingress, fp8, bf16), fp8 && bf16);
             }
@@ -451,7 +485,7 @@ mod admission_tests {
         assert_eq!(bytes.resident, 7000);
         assert_eq!(bytes.scratch, 756);
         assert_eq!((bytes.host, bytes.pinned), (2000, 2000));
-        assert_eq!(bytes.permanent().unwrap(), 7756);
+        assert_eq!(bytes.workspace(123).unwrap(), 879);
         assert!(bytes.add(usize::MAX, 2, 0).is_err());
     }
 
@@ -477,17 +511,9 @@ mod admission_tests {
     }
 }
 
-fn fp8_worker_workspace(config: &NativeExpertServiceConfig) -> Result<usize> {
-    if config.bf16_ingress {
-        let io = super::selected_spark_io(config, cuteafd_core::expert_geometry(),
-            super::worker_ring_geometry(config)?)?;
-        // A BF16 sibling still retains full-capacity intake, even for a mixed
-        // decode-only seal. Shrinking that owner is a separate change (#292).
-        Ok(usize::try_from(io.intake).context("BF16 worker intake exceeds address space")?
-            .max(Fp8Worker::workspace_bytes(config.capacity as usize)))
-    } else {
-        Ok(Fp8Worker::workspace_bytes(config.capacity as usize))
-    }
+pub(super) fn native_slot_io_bytes(info: &cuteafd_ffi::fp8_moe::Fp8MoeInfo,
+    bf16_sibling: bool, capacity: usize) -> Result<usize> {
+    Fp8Worker::io_bytes(info, bf16_sibling, capacity)
 }
 
 // Installation can narrow the checkpoint's qualified recipe, never widen it.
@@ -510,8 +536,7 @@ pub(super) fn load_fp8<'a>(
     push: Option<&mut std::net::TcpStream>,
 ) -> Result<(Weights<'a>, usize)> {
     ensure!(!groups.is_empty(), "native expert worker has no resident groups");
-    let workspace = fp8_worker_workspace(config)?.checked_mul(groups.len())
-        .context("expert group workspace overflow")?;
+    let mut io = 0usize;
     let mut totals = ExpertGroupBytes::default();
     let mut budgets = Vec::with_capacity(groups.len());
     for group in &groups {
@@ -525,10 +550,11 @@ pub(super) fn load_fp8<'a>(
         // Upload staging survives projection/group boundaries until the worker
         // releases it before execution arenas are allocated.
         totals.add(resident, 1, group.scratch)?;
-        budgets.push(resident.checked_add(group.scratch).context("expert group budget overflow")?);
+        io = io.checked_add(group.io).context("expert group I/O overflow")?;
+        budgets.push(resident);
     }
-    let permanent = totals.permanent()?;
-    let peak = spark_admission_budget(config, permanent, 0, totals.pinned, totals.host, workspace)?;
+    let workspace = totals.workspace(io)?;
+    let peak = spark_admission_budget(config, totals.resident, 0, totals.pinned, totals.host, workspace)?;
     ensure!(peak.load_peak <= config.device_budget && peak.serve_peak <= config.device_budget,
         "native expert groups exceed budget: load {} serve {} budget {}",
         peak.load_peak, peak.serve_peak, config.device_budget);
@@ -537,7 +563,7 @@ pub(super) fn load_fp8<'a>(
         host = totals.host, pinned = totals.pinned, workspace, "native expert groups admitted before allocation");
     let mut owners = Vec::with_capacity(groups.len());
     for (group, budget) in groups.iter_mut().zip(budgets) {
-        owners.push(Fp8Experts::prepare_with_modules(library, &group.tensors, &group.directory,
+        owners.push(Fp8Weights::prepare_with_modules(library, &group.tensors, &group.directory,
             group.bf16_directory.as_deref(), &group.layers, config.world, config.rank,
             config.capacity as usize, budget, Some(group.modules.take()
                 .context("native group modules already consumed")?))?);
@@ -553,12 +579,12 @@ pub(super) fn load_fp8<'a>(
         }
     } else {
         // Failed candidates have crossed the all-rank drain barrier. Reuse the
-        // original modules/scratch; no second package preparation on fallback.
+        // original modules; no second package preparation on fallback.
         for (owner, group) in owners.iter_mut().zip(&groups) {
             owner.load_mount(library, &group.tensors, &group.layers, group.slicing)?;
         }
     }
-    Ok((Weights::Fp8(owners.into_iter().map(Rc::new).collect()), config.device_budget - permanent))
+    Ok((Weights::Fp8(owners.into_iter().map(Rc::new).collect()), config.device_budget - totals.resident))
 }
 
 pub(super) fn load_exl3<'a>(

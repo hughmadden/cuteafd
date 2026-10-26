@@ -14,7 +14,13 @@ pub const EXLR8_EXECUTION_ROWS: usize = 64;
 pub struct SparkEndpoint {
     pub capacity: u32,
     pub ingress: SparkIngress,
+    /// Overrides only this connection's depth; other endpoints keep the model default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ring_depth: Option<usize>,
 }
+
+/// Most execution slots one Spark rank runs (a link admits at most four waves).
+pub const MAX_SPARK_EXECUTION_SLOTS: u8 = 4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -166,6 +172,12 @@ pub struct SparkRings {
 }
 
 impl SparkEndpoint {
+    /// The planner and both transport peers use the same admitted ring depth.
+    pub fn resolved_rings(self, rings: SparkRings) -> Option<SparkRings> {
+        let depth = self.ring_depth.unwrap_or(rings.depth);
+        (1..=8).contains(&depth).then_some(SparkRings { depth, ..rings })
+    }
+
     /// Retained response metadata per QP: largest header plus indexed rows.
     pub fn response_prefix_bytes(self) -> Option<usize> {
         if !(1..=4096).contains(&self.capacity) { return None; }
@@ -188,7 +200,7 @@ impl SparkEndpoint {
 
     pub fn ring_bytes(self, geometry: ExpertGeometry, rings: SparkRings) -> Option<usize> {
         let (request, response) = self.wire_bytes(geometry)?;
-        geometry.ring_bytes_for_wire(request, response, rings, 1)
+        geometry.ring_bytes_for_wire(request, response, self.resolved_rings(rings)?, 1)
     }
 }
 
@@ -323,6 +335,11 @@ impl ExpertGeometry {
     }
 }
 
+/// Every EXL3 package's capacity ladder (native/cmake/shared/exl3.cmake):
+/// decode and verify (1/16/80), tails (256/1024), and the prefill wave units
+/// (2048/2752/4096: an 8192-row reserve split into 4/3/2 waves, #762).
+pub const EXL3_CAPACITIES: [u32; 8] = [1, 16, 80, 256, 1024, 2048, 2752, 4096];
+
 /// Capacity selects the compiled reduction geometry, never the live row count.
 /// GLM Flash and Kimi use K64 at m1/m80; m16 uses K128 and causes drift.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -346,7 +363,7 @@ impl Exl3RowPolicy {
 
     /// Shared by loader admission, artifact preload and runtime dispatch.
     pub fn capacities(self, max_live_rows: usize) -> Result<Vec<u32>, crate::serving_capacity::CapacityError> {
-        const CAPACITIES: [u32; 6] = [1, 16, 80, 256, 1024, 4096];
+        const CAPACITIES: [u32; 8] = EXL3_CAPACITIES;
         if !(1..=4096).contains(&max_live_rows) {
             return Err(crate::serving_capacity::CapacityError::Invalid("EXL3 live capacity must be 1..4096"));
         }
@@ -380,9 +397,37 @@ mod tests {
     use super::*;
 
     #[test]
+    fn endpoint_ring_depth_resolves_default_and_rejects_invalid_depths() {
+        let endpoint = SparkEndpoint { capacity: 4096, ingress: SparkIngress::Fp8K32, ring_depth: None };
+        let geometry = ExpertGeometry::DEEPSEEK_V41;
+        let rings = SparkRings { max_frame_bytes: 64 << 20, depth: 8,
+            slot_bytes: 8 << 20, alignment: 4096 };
+        assert_eq!(endpoint.resolved_rings(rings), Some(rings));
+        let default_bytes = endpoint.ring_bytes(geometry, rings).unwrap();
+        for depth in 1..=8 {
+            let endpoint = SparkEndpoint { ring_depth: Some(depth), ..endpoint };
+            assert_eq!(endpoint.resolved_rings(rings), Some(SparkRings { depth, ..rings }));
+            assert_eq!(endpoint.ring_bytes(geometry, rings), Some(default_bytes / 8 * depth));
+        }
+        for depth in [0, 9, usize::MAX] {
+            assert!(endpoint.resolved_rings(SparkRings { depth, ..rings }).is_none());
+            let endpoint = SparkEndpoint { ring_depth: Some(depth), ..endpoint };
+            assert!(endpoint.resolved_rings(rings).is_none());
+            assert!(endpoint.ring_bytes(geometry, rings).is_none());
+        }
+        let serialized = serde_json::to_value(endpoint).unwrap();
+        assert!(serialized.get("ring_depth").is_none());
+        assert_eq!(serde_json::from_value::<SparkEndpoint>(serialized).unwrap(), endpoint);
+        let endpoint = SparkEndpoint { ring_depth: Some(2), ..endpoint };
+        let serialized = serde_json::to_value(endpoint).unwrap();
+        assert_eq!(serialized["ring_depth"], 2);
+        assert_eq!(serde_json::from_value::<SparkEndpoint>(serialized).unwrap(), endpoint);
+    }
+
+    #[test]
     fn endpoint_response_prefix_is_bounded_by_admitted_rows() {
         for capacity in [0, 1, 640, 4096, 4097, u32::MAX] {
-            let endpoint = SparkEndpoint { capacity, ingress: SparkIngress::Bf16 };
+            let endpoint = SparkEndpoint { ring_depth: None, capacity, ingress: SparkIngress::Bf16 };
             assert_eq!(endpoint.response_prefix_bytes(), if (1..=4096).contains(&capacity) {
                 Some(128 + capacity as usize * 4)
             } else { None });
@@ -401,9 +446,12 @@ mod tests {
             assert_eq!(policy.capacities(rows).unwrap(), [1, 80]);
             assert_eq!(Exl3RowPolicy::Nearest.capacities(rows).unwrap(), [1, 16, 80]);
         }
-        assert_eq!(policy.capacities(4096).unwrap(), [1, 80, 256, 1024, 4096]);
+        assert_eq!(policy.capacities(4096).unwrap(), [1, 80, 256, 1024, 2048, 2752, 4096]);
+        assert_eq!(Exl3RowPolicy::Nearest.capacities(4096).unwrap(), EXL3_CAPACITIES);
+        assert_eq!(policy.capacities(2048).unwrap(), [1, 80, 256, 1024, 2048]);
+        assert_eq!(policy.capacities(2049).unwrap(), [1, 80, 256, 1024, 2048, 2752]);
         assert_eq!(Exl3RowPolicy::for_geometry(ExpertGeometry::KIMI_K3), policy);
-        let old = [1, 16, 80, 256, 1024, 4096];
+        let old = [1, 16, 80, 256, 1024, 2048, 2752, 4096];
         let new = policy.capacities(4096).unwrap();
         for rows in 1..=4096 {
             let required = policy.required_capacity(rows);

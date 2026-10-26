@@ -167,81 +167,6 @@ __global__ void host_signal(uint32_t* flag, uint32_t* send_state, uint32_t* desc
   }
 }
 
-// A wave's three spans for host_publish, in 16-byte units.
-struct HostSpans {
-  const uint4* source[3];
-  uint4* destination[3];
-  uint64_t first_unit[4];
-};
-
-// host_signal with its payload: the grid stores the spans (route ids, gate
-// weights, wire rows) into pinned, device-mapped host memory with plain stores
-// instead of copy-engine copies, then the last block to finish publishes the
-// descriptor and the next sequence exactly as host_signal does. `arrivals`
-// (u32, device memory, zeroed) counts finished blocks and is reset for the next
-// wave, so recorded launches replay.
-__global__ void host_publish(HostSpans spans, uint32_t* flag, uint32_t* send_state, uint32_t* descriptor,
-    uint4 words, uint32_t* arrivals) {
-  const uint64_t units = spans.first_unit[3];
-  const uint64_t stride = uint64_t(gridDim.x) * blockDim.x;
-  for (uint64_t i = uint64_t(blockIdx.x) * blockDim.x + threadIdx.x; i < units; i += stride) {
-    const uint32_t s = i < spans.first_unit[1] ? 0 : i < spans.first_unit[2] ? 1 : 2;
-    const uint64_t unit = i - spans.first_unit[s];
-    spans.destination[s][unit] = spans.source[s][unit];
-  }
-  // Every block's host stores are ordered before its arrival; the last block
-  // publishes (fence cumulativity carries the others', as in push_signal).
-  __threadfence_system();
-  __syncthreads();
-  if (threadIdx.x == 0 && atomicAdd(arrivals, 1u) == gridDim.x - 1) {
-    __threadfence_system();
-    *arrivals = 0;
-    volatile uint32_t* out = descriptor;
-    out[0] = words.x;
-    out[1] = words.y;
-    out[2] = words.z;
-    out[3] = words.w;
-    __threadfence_system();
-    const uint32_t sequence = send_state[0] + 1;
-    send_state[0] = sequence;
-    store_release_sys(flag, sequence);
-  }
-}
-
-__device__ __forceinline__ uint64_t load_acquire_sys_u64(const uint64_t* address) {
-  uint64_t value;
-  asm volatile("ld.acquire.sys.global.u64 %0, [%1];" : "=l"(value) : "l"(address) : "memory");
-  return value;
-}
-
-// Waits for every rank's NIC-written completion flag (low 32 bits = the next
-// sequence of `state`), records ranks that flagged an error, then advances
-// the sequence. One warp; lane r watches rank r.
-__global__ void wait_written(const uint64_t* flags, uint32_t ranks, uint32_t stride_words, uint32_t* state,
-    uint32_t* error) {
-  const uint32_t expected = state[0] + 1;
-  const uint32_t rank = threadIdx.x;
-  if (rank < ranks) {
-    const uint64_t* flag = flags + uint64_t(rank) * stride_words;
-    const uint64_t start = global_ns();
-    uint32_t polls = 0;
-    uint64_t value = load_acquire_sys_u64(flag);
-    while (uint32_t(value) != expected) {
-      if ((++polls & 1023) == 0 && global_ns() - start > kWaitTimeoutNs) {
-        printf("spark wait: rank %u flag %llx, waiting for %u after 60 s\n", rank, (unsigned long long)value, expected);
-        __trap();
-      }
-      value = load_acquire_sys_u64(flag);
-    }
-    if (value >> 63) atomicOr(error, 1u << rank);
-  }
-  __syncwarp();
-  if (threadIdx.x == 0) {
-    __threadfence();
-    state[0] = expected;
-  }
-}
-
 template<bool Diagnostic = false>
 __global__ void wait_flag_abortable(const uint32_t* flag, uint32_t* state, const uint32_t* aborted,
     cuteafd_peer_diagnostic_t diagnostic = {}) {
@@ -301,6 +226,34 @@ __global__ void sm_copy(uint4* destination, const uint4* source, uint64_t units)
   const uint64_t stride = uint64_t(gridDim.x) * blockDim.x;
   for (uint64_t i = uint64_t(blockIdx.x) * blockDim.x + threadIdx.x; i < units; i += stride)
     destination[i] = source[i];
+}
+
+// Up to four byte regions in one launch (the Spark exchange's staging into
+// mapped host memory). A region whose pointers and length are 16-byte
+// aligned moves in uint4 units, any other byte by byte. SM copies run in
+// stream order behind stream memory waits, which copy-engine work need not.
+struct Regions {
+  const uint8_t* source[4];
+  uint8_t* destination[4];
+  uint64_t bytes[4];
+  uint32_t vector[4];
+  uint32_t count;
+};
+
+__global__ void copy_regions(Regions regions) {
+  const uint64_t stride = uint64_t(gridDim.x) * blockDim.x;
+  const uint64_t first = uint64_t(blockIdx.x) * blockDim.x + threadIdx.x;
+  for (uint32_t r = 0; r < regions.count; ++r) {
+    if (regions.vector[r]) {
+      const uint4* source = reinterpret_cast<const uint4*>(regions.source[r]);
+      uint4* destination = reinterpret_cast<uint4*>(regions.destination[r]);
+      for (uint64_t i = first; i < regions.bytes[r] / 16; i += stride) destination[i] = source[i];
+    } else {
+      for (uint64_t i = first; i < regions.bytes[r]; i += stride) regions.destination[r][i] = regions.source[r][i];
+    }
+  }
+  // System-scope visibility before a following stream write publishes them.
+  __threadfence_system();
 }
 
 unsigned default_blocks(uint64_t units, uint32_t blocks) {
@@ -379,7 +332,7 @@ extern "C" int32_t cuteafd_peer_exchange_initialize() {
   for (const void* kernel : {reinterpret_cast<const void*>(push_signal<false>), reinterpret_cast<const void*>(push_planes<false>),
        reinterpret_cast<const void*>(wait_flag),
        reinterpret_cast<const void*>(add_bf16), reinterpret_cast<const void*>(host_signal),
-       reinterpret_cast<const void*>(host_publish), reinterpret_cast<const void*>(wait_written)}) {
+       reinterpret_cast<const void*>(copy_regions)}) {
     const cudaError_t status = cudaFuncGetAttributes(&attributes, kernel);
     if (status != cudaSuccess) return status;
   }
@@ -495,38 +448,6 @@ extern "C" int32_t cuteafd_host_signal(uint32_t* flag, uint32_t* send_state, uin
   if (!flag || !send_state || !descriptor || !words || !stream) return cudaErrorInvalidValue;
   host_signal<<<1, 32, 0, static_cast<cudaStream_t>(stream)>>>(flag, send_state, descriptor,
       make_uint4(words[0], words[1], words[2], words[3]));
-  return cudaGetLastError();
-}
-
-extern "C" int32_t cuteafd_host_publish(const void* const* sources, void* const* destinations, const uint64_t* bytes,
-    uint32_t* flag, uint32_t* send_state, uint32_t* descriptor, const uint32_t* words, uint32_t* arrivals,
-    void* stream) {
-  if (!sources || !destinations || !bytes || !flag || !send_state || !descriptor || !words || !arrivals || !stream)
-    return cudaErrorInvalidValue;
-  HostSpans spans{};
-  uint64_t units = 0;
-  for (int s = 0; s < 3; ++s) {
-    const auto at = reinterpret_cast<uintptr_t>(sources[s]) | reinterpret_cast<uintptr_t>(destinations[s]);
-    if (bytes[s] % 16 || (bytes[s] && (!sources[s] || !destinations[s] || at % 16))) return cudaErrorInvalidValue;
-    spans.source[s] = static_cast<const uint4*>(sources[s]);
-    spans.destination[s] = static_cast<uint4*>(destinations[s]);
-    spans.first_unit[s] = units;
-    units += bytes[s] / 16;
-  }
-  spans.first_unit[3] = units;
-  if (!units) return cudaErrorInvalidValue;
-  constexpr uint32_t threads = 256;
-  // About four units per thread: one block for a decode row, at most 32.
-  const uint64_t blocks = std::min<uint64_t>(32, (units + 4 * threads - 1) / (4 * threads));
-  host_publish<<<uint32_t(blocks), threads, 0, static_cast<cudaStream_t>(stream)>>>(spans, flag, send_state,
-      descriptor, make_uint4(words[0], words[1], words[2], words[3]), arrivals);
-  return cudaGetLastError();
-}
-
-extern "C" int32_t cuteafd_spark_wait_written(const uint64_t* flags, uint32_t ranks, uint32_t stride_words,
-    uint32_t* state, uint32_t* error, void* stream) {
-  if (!flags || !state || !error || !stream || !ranks || ranks > 32 || !stride_words) return cudaErrorInvalidValue;
-  wait_written<<<1, 32, 0, static_cast<cudaStream_t>(stream)>>>(flags, ranks, stride_words, state, error);
   return cudaGetLastError();
 }
 
@@ -769,4 +690,24 @@ extern "C" int32_t cuteafd_p2p_probe(int32_t a, int32_t b, uint64_t bytes, int32
   *microseconds = median(samples);
   CHECK(cudaSetDevice(previous));
   return cudaSuccess;
+}
+
+extern "C" int32_t cuteafd_sm_copy_regions(void* const* destinations, const void* const* sources,
+    const uint64_t* bytes, uint32_t count, void* stream) {
+  if (!destinations || !sources || !bytes || !count || count > 4 || !stream) return cudaErrorInvalidValue;
+  Regions regions{};
+  regions.count = count;
+  uint64_t largest = 1;
+  for (uint32_t r = 0; r < count; ++r) {
+    if (bytes[r] && (!destinations[r] || !sources[r])) return cudaErrorInvalidValue;
+    regions.source[r] = static_cast<const uint8_t*>(sources[r]);
+    regions.destination[r] = static_cast<uint8_t*>(destinations[r]);
+    regions.bytes[r] = bytes[r];
+    regions.vector[r] = ((reinterpret_cast<uintptr_t>(sources[r]) | reinterpret_cast<uintptr_t>(destinations[r]) |
+        bytes[r]) & 15) == 0;
+    const uint64_t units = regions.vector[r] ? bytes[r] / 16 : bytes[r];
+    if (units > largest) largest = units;
+  }
+  copy_regions<<<default_blocks(largest, 0), 256, 0, static_cast<cudaStream_t>(stream)>>>(regions);
+  return cudaGetLastError();
 }

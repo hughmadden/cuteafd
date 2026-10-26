@@ -103,6 +103,10 @@ pub(crate) struct TokenEmbedding<'a> {
     /// than the row reads.
     file: std::fs::File,
     table: ResidentWeight<'a>,
+    /// An EXLR8 checkpoint's row-FP8 table (the rank-0 vocabulary owner, shared
+    /// with its head): gathers decode `bf16(e4m3 * scale)` per row and
+    /// `table` is an unused 256-byte placeholder.
+    row_fp8: Option<std::rc::Rc<native::NativeVocabulary<'a>>>,
 }
 
 impl<'a> TokenEmbedding<'a> {
@@ -139,7 +143,19 @@ impl<'a> TokenEmbedding<'a> {
         tracing::info!(vocab = source.vocab, hidden = source.hidden, gib = source.bytes() as f64 / (1u64 << 30) as f64,
             ?placement, device_bytes = table.device_bytes(), pinned_bytes = if table.is_host() { source.bytes() } else { 0 },
             elapsed_ms = started.elapsed().as_millis() as u64, "token embedding placement (single residency)");
-        Ok((Self { library, source, file, table }, result))
+        Ok((Self { library, source, file, table, row_fp8: None }, result))
+    }
+
+    /// The row-FP8 table of an EXLR8 checkpoint's vocabulary owner (`source`
+    /// names the payload `embed_tokens.fp8`; its scales follow the owner).
+    pub fn row_fp8(library: &'a NativeLibrary, source: EmbedSource,
+        owner: std::rc::Rc<native::NativeVocabulary<'a>>) -> Result<Self> {
+        let file = std::fs::File::open(&source.path).with_context(|| format!("opening {}", source.path.display()))?;
+        ensure!(owner.embedding.payload().bytes == source.vocab * source.hidden,
+            "row-FP8 embedding payload differs from [{}, {}]", source.vocab, source.hidden);
+        let table = ResidentWeight::new(library, 256, false)?;
+        tracing::info!(vocab = source.vocab, hidden = source.hidden, "token embedding: checkpoint row-FP8 (single residency)");
+        Ok(Self { library, source, file, table, row_fp8: Some(owner) })
     }
 
     pub fn placement(&self) -> EmbedPlacement {
@@ -151,7 +167,8 @@ impl<'a> TokenEmbedding<'a> {
         crate::shared::memory::device::Device { library: self.library, id: self.table.buffer().device_id }
     }
 
-    pub(crate) fn device_bytes(&self) -> usize { self.table.device_bytes() }
+    /// Table bytes this embedding charges (a row-FP8 table is charged by its owner's head).
+    pub(crate) fn device_bytes(&self) -> usize { if self.row_fp8.is_some() { 0 } else { self.table.device_bytes() } }
 
     pub fn device_gather(&self) -> bool { true }
 
@@ -176,6 +193,28 @@ impl<'a> TokenEmbedding<'a> {
         self.check(tokens)?;
         let row = self.source.hidden * 2;
         let mut out = vec![0u8; tokens.len() * row];
+        if let Some(owner) = &self.row_fp8 {
+            // The gather's exact rule: bf16(f32(e4m3) * scale), round to nearest even.
+            let hidden = self.source.hidden;
+            let mut bytes = vec![0u8; hidden];
+            let mut scale = [0u8; 4];
+            for (slot, &token) in out.chunks_exact_mut(row).zip(tokens) {
+                let token = token as usize;
+                let payload = owner.embedding.payload();
+                let scales = owner.embedding.scales();
+                self.library.copy_d2h(&mut bytes, CuteafdDeviceBuffer { bytes: hidden,
+                    // SAFETY: row `token` lies inside the [vocab, hidden] payload.
+                    ptr: unsafe { payload.ptr.cast::<u8>().add(token * hidden) }.cast(), ..payload })?;
+                self.library.copy_d2h(&mut scale, CuteafdDeviceBuffer { bytes: 4,
+                    // SAFETY: entry `token` lies inside the [vocab] scales.
+                    ptr: unsafe { scales.ptr.cast::<u8>().add(token * 4) }.cast(), ..scales })?;
+                let scale = f32::from_le_bytes(scale);
+                for (out, &b) in slot.chunks_exact_mut(2).zip(&bytes) {
+                    out.copy_from_slice(&bf16_rne(e4m3_to_f32(b) * scale).to_le_bytes());
+                }
+            }
+            return Ok(out);
+        }
         for (slot, &token) in out.chunks_exact_mut(row).zip(tokens) {
             match &self.table {
                 ResidentWeight::Host { storage, .. } => slot.copy_from_slice(&storage.bytes()[token as usize * row..(token as usize + 1) * row]),
@@ -214,7 +253,7 @@ impl<'a> TokenEmbedding<'a> {
         let bytes: Vec<u8> = tokens.iter().flat_map(|t| t.to_le_bytes()).collect();
         // SAFETY: the supplied stream owns ids and its gather; the helper keeps
         // pinned input live and orders replacement after previous consumers.
-        unsafe { self.library.copy_h2d_ordered(CuteafdDeviceBuffer { bytes: bytes.len(), ..ids }, &bytes, stream)?; }
+        unsafe { self.library.copy_h2d_ordered(ids, &bytes, stream)?; }
         // SAFETY: `ids` becomes initialized before the gather on this stream; out holds the rows.
         unsafe { self.gather(ids.ptr, std::ptr::null(), tokens.len(), copies, std::ptr::null(), out.ptr, stream) }
     }
@@ -230,6 +269,12 @@ impl<'a> TokenEmbedding<'a> {
     #[allow(clippy::too_many_arguments)]
     pub unsafe fn gather(&self, ids: *const c_void, index: *const c_void, rows: usize, copies: usize,
         fallback: *const c_void, out: *mut c_void, stream: *mut c_void) -> Result<()> {
+        if let Some(owner) = &self.row_fp8 {
+            ensure!(index.is_null() && fallback.is_null() && copies == 1,
+                "the row-FP8 embedding gathers plain ids (no index, fallback or copies)");
+            // SAFETY: the caller's contract; u32 ids below vocab are the gather's I32 ids.
+            return unsafe { owner.embed(ids.cast_mut(), out, rows, stream) };
+        }
         let table = self.table.buffer();
         // SAFETY: the caller's contract; the table is a live [vocab, hidden] BF16 buffer.
         unsafe { self.library.cuda_embed_gather_bf16_async(table.ptr, self.source.vocab, self.source.hidden,
@@ -255,6 +300,7 @@ impl<'a> TokenEmbedding<'a> {
     /// Compares every byte of the resident table with the shard (the
     /// embedding gate); returns the bytes compared.
     pub fn verify_resident(&self) -> Result<usize> {
+        ensure!(self.row_fp8.is_none(), "the row-FP8 table is verified by its owner's checksummed load");
         let table = self.table.buffer();
         let chunk = 64usize << 20;
         let (mut host, mut device) = (vec![0u8; chunk], vec![0u8; chunk]);
@@ -271,6 +317,21 @@ impl<'a> TokenEmbedding<'a> {
         }
         Ok(total)
     }
+}
+
+/// E4M3 byte to F32 (finite codes; NaN for 0x7f/0xff).
+fn e4m3_to_f32(b: u8) -> f32 {
+    let sign = if b & 0x80 != 0 { -1.0 } else { 1.0 };
+    let (e, m) = ((b >> 3) & 0xf, b & 7);
+    if e == 15 && m == 7 { return f32::NAN; }
+    sign * if e == 0 { f32::from(m) / 8.0 * 2f32.powi(-6) } else { (1.0 + f32::from(m) / 8.0) * 2f32.powi(i32::from(e) - 7) }
+}
+
+/// F32 to BF16 bits, round to nearest even (NaN quieted).
+fn bf16_rne(value: f32) -> u16 {
+    let bits = value.to_bits();
+    if value.is_nan() { return ((bits >> 16) | 0x40) as u16; }
+    ((bits + 0x7fff + ((bits >> 16) & 1)) >> 16) as u16
 }
 
 /// Reads the shard's table into the device allocation at `address` through
@@ -322,17 +383,37 @@ impl DeviceLogits {
     }
 
     fn rows_host(&self, library: &NativeLibrary, first: usize, n: usize) -> Result<Vec<f32>> {
-        // SAFETY: the producing engine's stream; the logits are complete once it drains.
-        unsafe { library.cuda_stream_synchronize(self.stream)? };
-        let mut out = vec![0f32; n * self.vocab];
-        for (i, dst) in out.chunks_exact_mut(self.vocab).enumerate() {
-            // SAFETY: row first + i lies inside the logits rows.
-            let ptr = unsafe { self.ptr.cast::<f32>().add((first + i) * self.stride) }.cast_mut().cast();
-            // SAFETY: f32 has no invalid bit patterns; the slice is the row's bytes.
-            let bytes = unsafe { std::slice::from_raw_parts_mut(dst.as_mut_ptr().cast::<u8>(), self.vocab * 4) };
-            library.copy_d2h(bytes, CuteafdDeviceBuffer { ptr, bytes: self.vocab * 4, device_id: library.cuda_get_device()?,
-                ..CuteafdDeviceBuffer::default() })?;
+        if self.stride == self.vocab {
+            return self.download(library, &[(first, n)]);
         }
+        self.download(library, &(first..first + n).map(|row| (row, 1)).collect::<Vec<_>>())
+    }
+
+    /// Rows `[row, row + count)` of each span, concatenated. Every copy queues on
+    /// the producing stream behind the logits, so one drain completes them all.
+    fn download(&self, library: &NativeLibrary, spans: &[(usize, usize)]) -> Result<Vec<f32>> {
+        let total: usize = spans.iter().map(|&(_, count)| count).sum();
+        ensure!(spans.iter().all(|&(row, count)| row + count <= self.rows && (count == 1 || self.stride == self.vocab)),
+            "logits download outside {} rows", self.rows);
+        let mut out = vec![0f32; total * self.vocab];
+        let device_id = library.cuda_get_device()?;
+        let mut rest = out.as_mut_slice();
+        let queued = spans.iter().try_for_each(|&(row, count)| {
+            let (dst, tail) = std::mem::take(&mut rest).split_at_mut(count * self.vocab);
+            rest = tail;
+            // SAFETY: row `row` lies inside the logits rows.
+            let ptr = unsafe { self.ptr.cast::<f32>().add(row * self.stride) }.cast_mut().cast();
+            // SAFETY: f32 has no invalid bit patterns; the slice is `dst`'s bytes.
+            let bytes = unsafe { std::slice::from_raw_parts_mut(dst.as_mut_ptr().cast::<u8>(), dst.len() * 4) };
+            // SAFETY: `out` outlives the drain below; the source rows are live logits of this stream.
+            unsafe { library.copy_d2h_async(bytes, CuteafdDeviceBuffer { ptr, bytes: bytes.len(), device_id,
+                ..CuteafdDeviceBuffer::default() }, self.stream) }
+        });
+        // SAFETY: the producing engine's stream; the queued copies complete before `out`
+        // is read or, after a failed enqueue, dropped.
+        let drained = unsafe { library.cuda_stream_synchronize(self.stream) };
+        queued.and(drained)?;
+        crate::shared::mapped_table::check_readback(device_id, self.stream)?;
         Ok(out)
     }
 }
@@ -413,6 +494,8 @@ impl SelectBatch {
 
 pub(crate) type RowResult = std::result::Result<Selected, TargetSamplingError>;
 
+
+
 /// Selects next tokens from device logits (see the module docs).
 pub(crate) struct TokenSelector<'a> {
     library: &'a NativeLibrary,
@@ -425,6 +508,11 @@ pub(crate) struct TokenSelector<'a> {
     landing: HostAllocation<'a>,
     /// The GPU sampler, allocated by the first sampled or masked selection.
     wave: Option<TargetSamplingWave<'a>>,
+    /// Per CUDA device: an ordering event recorded behind a selection's
+    /// landing copies, so the host waits for those and not for whatever is
+    /// queued on the logits stream after them.
+    /// The step's sampling wait: sleeps, does not spin the engine thread.
+    landed: crate::shared::memory::BlockingWait<'a>,
     /// Selections served by the greedy kernel, the sampler, the host.
     pub counts: [u64; 3],
 }
@@ -495,7 +583,21 @@ impl<'a> TokenSelector<'a> {
     pub fn new(library: &'a NativeLibrary, placement: SelectPlacement, vocab: usize, capacity: usize) -> Result<Self> {
         ensure!(capacity > 0 && vocab > 0, "token selector of {capacity} rows x {vocab}");
         Ok(Self { library, placement, vocab, capacity, out: DeviceAllocation::new(library, capacity * 12)?,
-            landing: HostAllocation::new(library, capacity * 12)?, wave: None, counts: [0; 3] })
+            landing: HostAllocation::new(library, capacity * 12)?, wave: None, landed: crate::shared::memory::BlockingWait::new(library), counts: [0; 3] })
+    }
+
+    /// Waits until `stream` passed the work queued on it so far (the
+    /// selection's landing copies), through this device's ordering event,
+    /// then checks that no Spark exchange released this step over a failed
+    /// wire.
+    ///
+    /// # Safety
+    /// `stream` is a live stream of the current device.
+    unsafe fn wait_landed(&mut self, stream: *mut c_void) -> Result<()> {
+        // SAFETY: forwarded from this function's contract.
+        unsafe { self.landed.wait(stream)? };
+        crate::shared::mapped_table::check_readback(self.library.cuda_get_device()?, stream)?;
+        crate::shared::spark_waves::healthy()
     }
 
     /// Allocates the GPU sampler now (eager start-up); otherwise the first sampled or masked
@@ -522,6 +624,7 @@ impl<'a> TokenSelector<'a> {
         if self.placement == SelectPlacement::Host {
             self.counts[2] += n as u64;
             let host = logits.to_host(self.library)?;
+            crate::shared::spark_waves::healthy()?;
             return Ok(rows.iter().enumerate()
                 .map(|(i, r)| Self::host_select(&host[i * self.vocab..][..self.vocab], r)).collect());
         }
@@ -537,10 +640,17 @@ impl<'a> TokenSelector<'a> {
         Ok(Selected { token, logprob: row.logprob.then(|| host_logprob(logits, token)) })
     }
 
-    /// Downloads row `i` and selects it on the host.
-    fn host_row(&mut self, logits: &DeviceLogits, i: usize, row: &RowSelect) -> Result<RowResult> {
-        self.counts[2] += 1;
-        Ok(Self::host_select(&logits.row_host(self.library, i)?, row))
+    /// Downloads every row in `pending` with one drain and selects each on the host.
+    fn host_rows(&mut self, logits: &DeviceLogits, rows: &[RowSelect], pending: &[usize],
+        out: &mut [Option<RowResult>]) -> Result<()> {
+        if pending.is_empty() { return Ok(()); }
+        self.counts[2] += pending.len() as u64;
+        let spans: Vec<_> = pending.iter().map(|&i| (i, 1)).collect();
+        let host = logits.download(self.library, &spans)?;
+        for (k, &i) in pending.iter().enumerate() {
+            out[i] = Some(Self::host_select(&host[k * self.vocab..][..self.vocab], &rows[i]));
+        }
+        Ok(())
     }
 
     fn greedy(&mut self, logits: &DeviceLogits, rows: &[RowSelect]) -> Result<Vec<RowResult>> {
@@ -576,22 +686,25 @@ impl<'a> TokenSelector<'a> {
                         logits.stream)?;
                 }
             }
-            self.library.cuda_stream_synchronize(logits.stream)?;
+            self.wait_landed(logits.stream)?;
         }
         self.counts[0] += n as u64;
-        let landing = self.landing.bytes().to_vec();
+        let landing = self.landing.bytes();
         let word = |offset: usize| u32::from_le_bytes(landing[offset..offset + 4].try_into().unwrap());
         let mut out = Vec::with_capacity(n);
+        let mut pending = Vec::new();
         for (i, row) in rows.iter().enumerate() {
             if word(4 * self.capacity + 4 * i) != 0 {
                 // A non-finite logit: the host reports exactly what it would have.
-                out.push(self.host_row(logits, i, row)?);
+                pending.push(i);
+                out.push(None);
                 continue;
             }
             let logprob = row.logprob.then(|| f32::from_bits(word(8 * self.capacity + 4 * i)));
-            out.push(Ok(Selected { token: word(4 * i), logprob }));
+            out.push(Some(Ok(Selected { token: word(4 * i), logprob })));
         }
-        Ok(out)
+        self.host_rows(logits, rows, &pending, &mut out)?;
+        Ok(out.into_iter().map(|row| row.expect("every row selected")).collect())
     }
 
     fn sampled(&mut self, logits: &DeviceLogits, rows: &[RowSelect], routes: &[Route]) -> Result<Vec<RowResult>> {
@@ -621,23 +734,27 @@ impl<'a> TokenSelector<'a> {
         let wave = self.wave.as_mut().context("sampler")?;
         wave.upload(&requests, masked.then_some(arena.as_slice()), words, logits.stream)?;
         wave.launch(buffer, n, ordered, logits.stream)?;
-        // SAFETY: the sampler's copies are queued on this stream.
-        unsafe { self.library.cuda_stream_synchronize(logits.stream)? };
-        let sampled = wave.output(buffer, n)?;
+        // SAFETY: the sampler's copies are queued on this stream, the
+        // current device's (the sampler just launched on it).
+        unsafe { self.wait_landed(logits.stream)? };
+        let sampled = self.wave.as_mut().context("sampler")?.output(buffer, n)?;
         self.counts[1] += n as u64;
         let mut out = Vec::with_capacity(n);
+        let mut pending = Vec::new();
         for (i, row) in rows.iter().enumerate() {
             let status = sampled.status[i];
             let device = status == cuteafd_ffi::CUTEAFD_V41_SAMPLER_STATUS_OK && routes[i] != Route::Host;
             if !device || row.logprob {
                 // Host routes, device statuses (the host reports the same
                 // error, or selects what the device could not) and logprobs.
-                out.push(self.host_row(logits, i, row)?);
+                pending.push(i);
+                out.push(None);
                 continue;
             }
-            out.push(Ok(Selected { token: sampled.ids[i], logprob: None }));
+            out.push(Some(Ok(Selected { token: sampled.ids[i], logprob: None })));
         }
-        Ok(out)
+        self.host_rows(logits, rows, &pending, &mut out)?;
+        Ok(out.into_iter().map(|row| row.expect("every row selected")).collect())
     }
 }
 
@@ -867,5 +984,21 @@ mod tests {
         let logits = [1.0f32, 2.0, 3.0, f32::NEG_INFINITY];
         let z: f64 = [1.0f64, 2.0, 3.0].iter().map(|v| (v - 3.0f64).exp()).sum();
         assert!((host_logprob(&logits, 2) - (-(z.ln()) as f32)).abs() < 1e-6);
+    }
+}
+
+#[cfg(test)]
+mod row_fp8_rule_tests {
+    #[test]
+    fn e4m3_decode_and_bf16_rounding() {
+        assert_eq!(super::e4m3_to_f32(0x38), 1.0);
+        assert_eq!(super::e4m3_to_f32(0xb8), -1.0);
+        assert_eq!(super::e4m3_to_f32(0x7e), 448.0);
+        assert_eq!(super::e4m3_to_f32(0x01), 2f32.powi(-9));
+        assert!(super::e4m3_to_f32(0x7f).is_nan());
+        assert_eq!(super::bf16_rne(1.0), 0x3f80);
+        // Ties to even: 1 + 2^-8 sits halfway between 0x3f80 and 0x3f81.
+        assert_eq!(super::bf16_rne(1.0 + 2f32.powi(-8)), 0x3f80);
+        assert_eq!(super::bf16_rne(1.0 + 3.0 * 2f32.powi(-8)), 0x3f82);
     }
 }

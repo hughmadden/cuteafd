@@ -70,7 +70,10 @@ pub struct DeploymentSpec<'a> {
     pub snapshot: &'a str,
     pub rtx_gpus: usize,
     pub spark_ranks: usize,
-    pub prefill_rows: u64,
+    pub prefill_unit_rows: u64,
+    pub prefill_waves: u64,
+    pub decode_lanes: u8,
+    pub prefill_span_rows: u64,
     pub topology: Topology,
     pub roles: Vec<SparkRole>,
     pub peers: Vec<String>,
@@ -122,9 +125,9 @@ impl<'a> DeploymentSpec<'a> {
             ep: options.spark_ep.unwrap_or(1),
             wire: if explicit { SparkWire::NativeOwnership } else { SparkWire::Canonical } };
         if explicit {
-            ensure!(ranks > 0 && topology.tp > 0 && topology.tp <= 6 && topology.ep > 0
+            ensure!(ranks > 0 && topology.tp > 0 && topology.tp <= 8 && topology.ep > 0
                 && topology.ep <= 3 && topology.tp * topology.ep == ranks,
-                "Spark topology {}x{} must match selected physical rank count {ranks} (TP 1..6, EP 1..3)",
+                "Spark topology {}x{} must match selected physical rank count {ranks} (TP 1..8, EP 1..3)",
                 topology.tp, topology.ep);
             ensure!(topology.ep == 1 || matches!((topology.tp, topology.ep), (2, 2) | (3, 2) | (2, 3)),
                 "unsupported replicated Spark topology {}x{}; supported: TP2EP2, TP3EP2, TP2EP3",
@@ -135,16 +138,12 @@ impl<'a> DeploymentSpec<'a> {
         if ranks > 0 {
             ensure!(!explicit || family == "deepseek_v41",
                 "native ownership wire requires V4.1 experts");
-            ensure!(!explicit || matches!((topology.tp, topology.ep),
-                (2, 1) | (3, 1) | (4, 1) | (6, 1) | (2, 2) | (3, 2) | (2, 3)),
-                "unqualified Spark ownership topology {}x{}; supported: TP2EP1, TP3EP1, TP4EP1, TP6EP1, TP2EP2, TP3EP2, TP2EP3",
-                topology.tp, topology.ep);
-            ensure!(ranks <= 6, "Spark worlds above six ranks have no qualified package");
+            ensure!(ranks <= 8, "Spark transport supports at most eight ranks");
             let experts = report.experts.as_ref().context("Spark deployment requires an expert package")?;
             let intermediate = report.spec.as_ref().and_then(|spec| spec.moe.as_ref())
                 .context("Spark deployment requires routed expert geometry")?.intermediate;
             if native.is_none() { super::experts::spark_recipe(&experts.package, intermediate, topology.tp)?; }
-            else { ensure!(family == "glm5" && (1..=6).contains(&ranks) && experts.package == "glm:exlr8",
+            else { ensure!(family == "glm5" && (1..=8).contains(&ranks) && experts.package == "glm:exlr8",
                 "EXLR8 deployment requires GLM native canonical Sparks"); }
         }
         ensure!(options.peers.is_empty() || options.peers.len() >= ranks,
@@ -162,7 +161,10 @@ impl<'a> DeploymentSpec<'a> {
             .then(|| format!("tp{}", topology.tp));
         Ok(Self { version: 1, family, snapshot: &report.snapshot,
             rtx_gpus: options.rtx_gpus, spark_ranks: ranks,
-            prefill_rows: report.prefill_rows.unwrap_or(0), topology, roles, peers,
+            prefill_unit_rows: report.prefill_unit_rows.unwrap_or(0),
+            prefill_waves: report.prefill_waves.unwrap_or(0),
+            decode_lanes: report.decode_lanes,
+            prefill_span_rows: report.prefill_span_rows.unwrap_or(0), topology, roles, peers,
             speculator: &options.speculator, admission: &options.admission,
             spark_admission: SparkAdmission::CoordinatorAuthoritative,
             launch: report.launch.as_ref(), exlr8: native.map(|n| &n.selection),
@@ -191,7 +193,7 @@ mod tests {
         let report = plan_spark_count(dir.path(), &PlanOptions {
             placement: ExpertPlacement::from_spark_ranks(ranks),
             vision: crate::plan::MediaMode::Off, audio: crate::plan::MediaMode::Off,
-            layout: Some(LayoutOptions { rtx_bytes: vec![96 << 30; gpus],
+            layout: Some(LayoutOptions { host_memory: Some((128 << 30, 128 << 30)), rtx_bytes: vec![96 << 30; gpus],
                 workspace_manifest: Some(manifest), pool_tokens: Some(0),
                 prefill_rows: 256, context_tokens: 262_144, ..Default::default() }),
             ..Default::default()
@@ -229,6 +231,32 @@ mod tests {
     }
 
     #[test]
+    fn deployment_preserves_independent_unit_wave_span_and_transport_geometry() {
+        for (gpus, ranks) in [(1, 4), (2, 6)] {
+            let (_dir, mut report) = fixture(gpus, ranks);
+            for family in ["deepseek_v41", "deepseek_v4", "glm5", "glm5_flash", "mimo_v2", "qwen4", "kimi_k3", "step5"] {
+                report.family = Some(family.into());
+                for (unit, waves, span, transports) in [(2048, 2, 16384, 1), (4096, 2, 8192, 3), (4096, 1, 16384, 2)] {
+                    report.prefill_unit_rows = Some(unit);
+                    report.prefill_waves = Some(waves);
+                    report.prefill_span_rows = Some(span);
+                    report.prefill_transports = Some(transports);
+                    let options = DeploymentOptions { rtx_gpus: gpus, ..Default::default() };
+                    let deployment = DeploymentSpec::from_report(&report, &options).unwrap();
+                    assert_eq!((deployment.prefill_unit_rows, deployment.prefill_waves, deployment.prefill_span_rows),
+                        (unit, waves, span), "{family} {gpus}+{ranks}");
+                    let value = serde_json::to_value(deployment).unwrap();
+                    assert_eq!(value["report"]["prefill_transports"], transports);
+                    for legacy in ["prefill_rows", "prefill_lanes"] {
+                        assert!(value.get(legacy).is_none());
+                        assert!(value["report"].get(legacy).is_none());
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn native_deployment_preserves_selection_and_live_worker_boundary() {
         use crate::plan::{exlr8::{NativePlan, NativeSelection, SparkRequirements}, RuntimeStatus, Status};
         let (_dir, mut report) = fixture(2, 4);
@@ -239,8 +267,9 @@ mod tests {
         for component in &mut report.components {
             if component.status == Status::Ready { component.status = Status::Planned; }
         }
+        report.exlr8_prefill_activations = Some(crate::plan::exlr8::PrefillActivations::A8);
         let native = NativePlan { report, selection: NativeSelection {
-            manifest: "up1".into(), set_id: "checkpoint-set".into(), dense_from: "official-fp8".into() },
+            manifest: "up1".into(), set_id: "checkpoint-set".into() },
             sparks: SparkRequirements { resident_bytes_per_rank: vec![100; 4],
                 k1_workspace: "checked_by_worker_live_admission" } };
         let mut options = DeploymentOptions { rtx_gpus: 2, speculator: "off".into(), ..Default::default() };
@@ -256,7 +285,7 @@ mod tests {
             assert_eq!(value["version"], 1);
             assert_eq!(value["exlr8"]["manifest"], "up1");
             assert_eq!(value["exlr8"]["set_id"], "checkpoint-set");
-            assert_eq!(value["exlr8"]["dense_from"], "official-fp8");
+            assert_eq!(value["report"]["exlr8_prefill_activations"], "a8");
             assert_eq!(value["spark_requirements"]["resident_bytes_per_rank"], serde_json::json!([100, 100, 100, 100]));
             assert_eq!(value["spark_requirements"]["k1_workspace"], "checked_by_worker_live_admission");
             assert_eq!(value["rtx_gpus"], gpus);
@@ -422,8 +451,8 @@ mod tests {
         report.spark_ranks = 1;
         let options = DeploymentOptions { spark_tp: Some(1), ..options };
         let error = DeploymentSpec::from_report(&report, &options).unwrap_err().to_string();
-        assert!(error.contains("ownership topology 1x1"), "{error}");
-        assert!(error.contains("supported: TP2EP1, TP3EP1, TP4EP1, TP6EP1"), "{error}");
+        assert!(error.contains("missing Spark package recipe"), "{error}");
+        assert!(error.contains("TP1"), "{error}");
     }
 
     #[test]

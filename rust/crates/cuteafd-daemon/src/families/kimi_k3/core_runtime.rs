@@ -6,7 +6,8 @@ use anyhow::{ensure,Context,Result};
 use cuteafd_core::memory_layout::{Basis,Category};
 use cuteafd_loader::placement::Demand;
 use cuteafd_ffi::{CuteafdDeviceBuffer as Buffer,programs::Programs,
-    dense_trellis::{DenseTrellisBuffers,DenseTrellisDispatch,DenseTrellisPolicy,TrellisDType},
+    dense_trellis::{DenseTrellisBuffers,DenseTrellisDispatch,DenseTrellisPolicy,TrellisDType,
+        GroupedMember,GroupedPolicy,GroupedTrellis,GroupedWorkspace,GROUPS},
     KimiKdaCore,KimiKdaCoreBatch,KimiKdaCoreWeights,KimiMlaSplit,KimiMlaRankBatch,KimiSitu,F32Add,V41PeerCopy};
 use std::collections::BTreeMap;
 use std::ffi::c_void;
@@ -28,13 +29,13 @@ impl ProjectionLayout {
             extents:self.extents.clone(),rows:self.rows }.bytes()
     }
     pub(crate) fn new(program:&DenseTrellisDispatch<'_>,rows:usize)->Result<Self> {
-        let p=program.policy();p.route(rows)?;
-        let layout=cuteafd_loader::families::kimi_k3::core::ProjectionScratchLayout::new(p.input,p.output,rows,p.chunk_columns,p.weight_scratch)?;
+        let p=program.policy();p.validate_rows(rows)?;
+        let layout=cuteafd_loader::families::kimi_k3::core::ProjectionScratchLayout::new(p.input,p.output,rows)?;
         let w=program.workspace();
         ensure!([("rotated",w.rotated),("table",w.pointer_table),("scales",w.block_scales),
             ("accumulator",w.accumulator)].iter()
             .all(|(name,bytes)|layout.extents.get(name)==Some(bytes))
-            && layout.extents["partial"]==w.partial/rows*rows.min(63),"K6 package/planner scratch mismatch");
+            && layout.extents["partial"]==w.partial,"K6 package/planner scratch mismatch");
         Ok(Self{extents:layout.extents,rows:layout.rows})
     }
     pub(crate) fn demand(&self,device:u8)->Result<Demand> {
@@ -52,7 +53,10 @@ impl ProjectionLayout {
             } else {owners[name].buffer};
             buffers.insert(name,buffer);
         }
-        let pointer=(buffers["rotated"].ptr as u64).to_le_bytes();
+        // Entry 0 is the standalone rotated input; a grouped launch reads one
+        // fixed quarter per member, and quarter 0 starts at that same address.
+        let pointer=if self.extents["table"]>=GROUPS*8 {GroupedWorkspace::pointer_table(buffers["rotated"])?}
+            else {(buffers["rotated"].ptr as u64).to_le_bytes().to_vec()};
         device.run(||device.library.copy_h2d(buffers["table"],&pointer))?;
         Ok(ProjectionScratch{_owners:owners,buffers,rows:self.rows})
     }
@@ -64,12 +68,9 @@ pub(crate) struct ProjectionScratch<'a> {
 impl ProjectionScratch<'_> {
     fn buffers(&self,input:Buffer,weights:&CoreWeights<'_>)->DenseTrellisBuffers {
         let get=|name|self.buffers[name];
-        // Decode never touches chunk storage; a valid existing view is used
-        // as the unused placeholder instead of a null device pointer.
         DenseTrellisBuffers {input,payload:weights.payload.buffer,suh:weights.suh.buffer,svh:weights.svh.buffer,
             rotated:get("rotated"),pointer_table:get("table"),scales:get("scales"),partial:get("partial"),
-            accumulator:get("accumulator"),chunk_weights:self.buffers.get("chunk weights").copied().unwrap_or(get("partial")),
-            chunk_output:self.buffers.get("chunk output").copied().unwrap_or(get("partial"))}
+            accumulator:get("accumulator")}
     }
 }
 pub(crate) struct Projection<'a> {pub program:DenseTrellisDispatch<'a>}
@@ -115,11 +116,28 @@ impl Projected<'_,'_> {
 }
 
 /// q/k/v/g are independent calibrations: four rotations, four projections.
-/// The existing recurrence owns convolution, state, replay and normalization.
-pub(crate) fn kda_projected(core:&KimiKdaCore<'_>,projections:[Projected<'_,'_>;4],
+/// They share one grouped native launch per H128 stage at every row count,
+/// bitwise-equal to the four standalone launches. The existing recurrence
+/// owns convolution, state, replay and normalization.
+pub(crate) fn kda_projected(core:&KimiKdaCore<'_>,projections:[Projected<'_,'_>;4],grouped:Option<&GroupedTrellis<'_>>,
     weights:KimiKdaCoreWeights,batch:KimiKdaCoreBatch,stream:*mut c_void)->Result<()> {
-    for (projection,output) in projections.iter().zip([batch.q,batch.k,batch.v,batch.gate]) {
-        projection.run(batch.rows,batch.input,output,stream)?;
+    let outputs=[batch.q,batch.k,batch.v,batch.gate];
+    match grouped {
+        Some(grouped)=> {
+            let scratch=projections[0].scratch;
+            ensure!(projections.iter().all(|p|std::ptr::eq(p.scratch,scratch)
+                && (p.weights.shape[1],p.weights.shape[0])==grouped.geometry()),
+                "K6 grouped KDA members differ in scratch or geometry");
+            ensure!(batch.rows<=scratch.rows,"K6 scratch live-row ceiling");
+            let get=|name|scratch.buffers[name];
+            let members=std::array::from_fn(|i|GroupedMember{payload:projections[i].weights.payload.buffer,
+                suh:projections[i].weights.suh.buffer,svh:projections[i].weights.svh.buffer,output:outputs[i]});
+            grouped.launch(batch.rows,batch.input,members,get("rotated"),get("table"),get("scales"),
+                get("partial"),get("accumulator"),stream)?;
+        }
+        None=>for (projection,output) in projections.iter().zip(outputs) {
+            projection.run(batch.rows,batch.input,output,stream)?;
+        },
     }
     core.launch(weights,batch,stream)?;Ok(())
 }
@@ -156,6 +174,9 @@ pub(crate) fn ffn_projected(gate:Projected<'_,'_>,up:Projected<'_,'_>,down:Proje
 /// layer. Their BF16 outputs remain distinct until the downstream core consumes them.
 pub(crate) struct CorePrograms<'a> {
     projections:BTreeMap<(usize,usize,usize,String),Projection<'a>>,
+    grouped:BTreeMap<(usize,usize,usize,String),GroupedTrellis<'a>>,
+    /// Diagnostic only: false forces the four standalone launches (bitwise A/B).
+    grouped_enabled:std::cell::Cell<bool>,
     pub layout:ProjectionLayout,
     pub kda:[KimiKdaCore<'a>;2],
     pub mla:BTreeMap<(usize,usize,usize),KimiMlaSplit<'a>>,
@@ -169,6 +190,7 @@ impl<'a> CorePrograms<'a> {
         inventory.validate_runtime_groups(cfg)?;
         if inventory.projections.is_empty() {return Ok(None);}
         let mut projections=BTreeMap::new();
+        let mut grouped=BTreeMap::new();
         let mut layout:Option<ProjectionLayout>=None;
         for layer in 0..cfg.layers {
             let modes=if cfg.attention[layer]==cuteafd_loader::families::kimi_k3::config::KimiAttention::Mla {
@@ -180,7 +202,13 @@ impl<'a> CorePrograms<'a> {
                         let key=projection_key(weight.shape,weight.side,weight.codebook);
                         if projections.contains_key(&key) {continue;}
                         let projection=Projection::load_geometry(programs,key.0,key.1,key.2,&key.3,rows,TrellisDType::Bf16)?;
-                        let required=ProjectionLayout::new(&projection.program,rows)?;
+                        let mut required=ProjectionLayout::new(&projection.program,rows)?;
+                        if let Some(policy)=GroupedPolicy::from_package_geometry(programs,key.0,key.1,key.2,&key.3)? {
+                            let program=GroupedTrellis::load(programs,projection.program.policy(),&policy)?;
+                            required.merge(&ProjectionLayout{rows,extents:cuteafd_loader::families::kimi_k3::core::
+                                ProjectionScratchLayout::grouped(key.0,key.1,rows,policy.groups)?.extents})?;
+                            grouped.insert(key.clone(),program);
+                        }
                         if let Some(layout)=&mut layout {layout.merge(&required)?;} else {layout=Some(required);}
                         projections.insert(key,projection);
                     }
@@ -213,13 +241,18 @@ impl<'a> CorePrograms<'a> {
             mla.insert((heads,stride,capacity),KimiMlaSplit::load(programs,
                 [&names[0],&names[1],&names[2]],heads,capacity,stride,cache_format)?);
         }}}
-        Ok(Some(Self{projections,layout,kda,mla,norm:cuteafd_ffi::KimiRmsNorm::load(programs,3584)?,situ:KimiSitu::load(programs,3072)?,
+        Ok(Some(Self{projections,grouped,grouped_enabled:std::cell::Cell::new(true),layout,kda,mla,norm:cuteafd_ffi::KimiRmsNorm::load(programs,3584)?,situ:KimiSitu::load(programs,3072)?,
             copy:programs.library().v41_peer_copy()?,add:programs.library().f32_add()?}))
     }
     pub(crate) fn projection(&self,weights:&CoreWeights<'_>)->Result<&Projection<'a>> {
         self.projections.get(&projection_key(weights.shape,weights.side,weights.codebook))
             .ok_or_else(||anyhow::anyhow!("Kimi K6 weight geometry not resolved before admission"))
     }
+    /// The grouped KDA launch for these member weights, when the package has one.
+    pub(crate) fn grouped(&self,weights:&CoreWeights<'_>)->Option<&GroupedTrellis<'a>> {
+        self.grouped.get(&projection_key(weights.shape,weights.side,weights.codebook)).filter(|_|self.grouped_enabled.get())
+    }
+    pub(crate) fn set_grouped(&self,enabled:bool) { self.grouped_enabled.set(enabled); }
     pub(crate) fn projected<'b>(&'b self,weights:&'b CoreWeights<'a>,scratch:&'b ProjectionScratch<'a>)->Result<Projected<'a,'b>> {
         Ok(Projected{projection:self.projection(weights)?,weights,scratch})
     }
@@ -245,7 +278,7 @@ mod runtime_layout_tests {
         fixture.immediate_copies(&library)?;
         let device=Device{library:&library,id:0};
         for rows in [1,16,63,64,4096] {
-            let planned=ProjectionScratchLayout::new(128,256,rows,128,128*128*2)?;
+            let planned=ProjectionScratchLayout::new(128,256,rows)?;
             let layout=ProjectionLayout{extents:planned.extents.clone(),rows};
             let scratch=layout.allocate(device)?;
             assert_eq!(layout.demand(0)?.bytes as usize,
@@ -253,14 +286,7 @@ mod runtime_layout_tests {
             assert_eq!(layout.bytes()?,planned.bytes()?);
             let arena=scratch._owners["route arena"].buffer;
             assert_eq!(scratch.buffers["partial"].ptr,arena.ptr);
-            assert_eq!(scratch.buffers["partial"].bytes,rows.min(63)*256*4);
-            if rows>=64 {
-                let weights=scratch.buffers["chunk weights"];
-                let output=scratch.buffers["chunk output"];
-                assert_eq!(weights.ptr,arena.ptr);
-                assert!((output.ptr as usize)>=weights.ptr as usize+weights.bytes);
-                assert!((output.ptr as usize)+output.bytes<=arena.ptr as usize+arena.bytes);
-            }
+            assert_eq!(scratch.buffers["partial"].bytes,rows.min(129)*256*4);
             drop(scratch);
         }
         let events=fixture.events()?;
@@ -297,11 +323,7 @@ mod runtime_layout_tests {
         let head=CoreWeightLayout::new(inventory.get_weight("language_model.lm_head").unwrap(),TrellisSide::Output,0,1)?;
         geometries.insert(projection_key(head.shape,head.side,head.codebook),());
         let policies=geometries.keys().map(|(k,n,side,book)|{
-            let chunk=if k*n*2<=256*1024*1024 {*n}else{128};
-            serde_json::json!({"input_features":k,"output_features":n,"sharded_side":side,"codebook":book,
-                "threshold_rows":64,"below":"shared_native","at_or_above":"chunk_dequant_bf16",
-                "chunk_output_dtype":"f32","stitch_before_output_transform":true,"chunk_columns":chunk,
-                "weight_scratch_bytes":k*chunk*2,"chunk_output_scratch_bytes_per_row":chunk*4})
+            serde_json::json!({"input_features":k,"output_features":n,"sharded_side":side,"codebook":book})
         }).collect::<Vec<_>>();
         let mut programs=Vec::new();
         let mut program=|name:String,bytes:usize| programs.push(serde_json::json!({"name":name,
@@ -323,38 +345,34 @@ mod runtime_layout_tests {
         }
         let metadata=serde_json::json!({"abi_version":1,"row_policies":policies});
         let manifest=serde_json::json!({"programs":programs,"families":{"kimi_k6_dense":metadata}});
-        for rows in [1,16,63,64,4096] {
+        // `rows` lane rows of `unit`-row units: one-unit lanes and the 4096 x 2 lane.
+        for (rows,unit) in [(1,1),(16,16),(63,63),(64,64),(4096,4096),(8192,4096)] {
             for on in [false,true] {
                 let empty=CoreInventory::default();
                 let core=if on {&inventory}else{&empty};
-                let charged=CoreCharges::from_package(&cfg,core,rows,&manifest)?;
+                let charged=CoreCharges::from_package(&cfg,core,rows,unit,&manifest)?;
                 let mut runtime:Option<ProjectionLayout>=None;
                 if on {
                     for ((k,n,side,_),()) in &geometries {
-                        let live=if *n==cfg.vocab_size {rows.min(64)}else{rows};
+                        let live=if *n==cfg.vocab_size {unit.min(64)}else{unit};
                         let w=DenseTrellisGeometry{input:*k,output:*n,bits:6,side:*side,rows:live,
                             input_dtype:TrellisDType::Bf16,output_dtype:TrellisDType::Bf16}.workspace()?;
-                        let mut extents=BTreeMap::from([("rotated",w.rotated),("table",w.pointer_table),
-                            ("scales",w.block_scales),("partial",w.partial/live*live.min(63)),("accumulator",w.accumulator)]);
-                        if live>=64 {
-                            let chunk=if k*n*2<=256*1024*1024 {*n}else{128};
-                            extents.insert("chunk weights",k*chunk*2);
-                            extents.insert("chunk output",live*chunk*4);
-                        }
-                        let layout=ProjectionLayout{extents,rows};
+                        let extents=BTreeMap::from([("rotated",w.rotated),("table",w.pointer_table),
+                            ("scales",w.block_scales),("partial",w.partial),("accumulator",w.accumulator)]);
+                        let layout=ProjectionLayout{extents,rows:unit};
                         if let Some(runtime)=&mut runtime {runtime.merge(&layout)?;}else{runtime=Some(layout);}
                     }
                 }
                 assert_eq!(charged.projection.as_ref().map(|p|&p.extents),runtime.as_ref().map(|p|&p.extents));
-                assert_eq!(charged.receive,super::super::startup::exchange_demands(rows,false,on)?[0].bytes as usize
+                assert_eq!(charged.receive,super::super::startup::exchange_demands(unit,false,on)?[0].bytes as usize
                     -256-256-(((cuteafd_loader::placement::HOP_SLOTS+1)*16)as usize).max(256));
-                let expected_stages=if on {core::lane_extents(rows,1024,4096,2048,2048)?}else{BTreeMap::new()};
+                let expected_stages=if on {core::lane_extents(rows,unit,1024,4096,2048,2048)?}else{BTreeMap::new()};
                 assert_eq!(charged.stages,expected_stages);
                 let sum=charged.demands()?.iter().filter(|d|d.gpu==0).map(|d|d.bytes).sum::<u64>();
                 assert_eq!(sum,runtime.as_ref().map_or(Ok(0),|p|p.bytes())? as u64
                     +charged.stage_bytes as u64+charged.receive as u64);
                 if on {
-                    let base = cuteafd_loader::families::kimi_k3::allocation::NativeLaneLayout::new(&cfg, rows,
+                    let base = cuteafd_loader::families::kimi_k3::allocation::NativeLaneLayout::new(&cfg, rows, unit,
                         1_048_576, cuteafd_loader::families::kimi_k3::allocation::NativeScratch::from_manifest(&manifest)?)?;
                     assert_eq!(charged.stage_bytes, base.clone().with_core_stages(expected_stages)?.bytes()? - base.bytes()?);
                 }
@@ -364,7 +382,7 @@ mod runtime_layout_tests {
         let mut duplicate=manifest.clone();
         let first=duplicate["families"]["kimi_k6_dense"]["row_policies"][0].clone();
         duplicate["families"]["kimi_k6_dense"]["row_policies"].as_array_mut().unwrap().push(first);
-        assert!(CoreCharges::from_package(&cfg,&inventory,64,&duplicate).is_err());
+        assert!(CoreCharges::from_package(&cfg,&inventory,64,64,&duplicate).is_err());
         Ok(())
     }
 
@@ -373,9 +391,9 @@ mod runtime_layout_tests {
         let mut shared=ProjectionLayout{rows:64,extents:BTreeMap::from([("rotated",256),("partial",4096),
             ("table",8),("accumulator",512)])};
         let other=ProjectionLayout{rows:64,extents:BTreeMap::from([("rotated",512),("partial",2048),
-            ("table",8),("accumulator",1024),("chunk weights",8192),("chunk output",512)])};
+            ("table",8),("accumulator",1024)])};
         shared.merge(&other)?;
-        assert_eq!(shared.bytes()?,512+8+1024+(8192usize+512).max(4096));
+        assert_eq!(shared.bytes()?,512+8+1024+4096);
         let once=shared.clone();shared.merge(&other)?;assert_eq!(shared,once);
         assert!(shared.merge(&ProjectionLayout{rows:63,..other}).is_err());
         Ok(())

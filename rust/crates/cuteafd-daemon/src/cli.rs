@@ -20,6 +20,13 @@ pub(crate) fn deprecated_budget_flags(args: impl IntoIterator<Item = impl AsRef<
     replacements
 }
 
+/// A positive number of seconds (fractions allowed).
+fn parse_idle_park(text: &str) -> std::result::Result<f64, String> {
+    let seconds: f64 = text.parse().map_err(|_| format!("{text:?} is not a number of seconds"))?;
+    if !(seconds.is_finite() && seconds > 0.0) { return Err(format!("idle park seconds must be positive, got {text}")); }
+    Ok(seconds)
+}
+
 #[derive(Debug, Parser)]
 #[command(name = "cuteafd", about = "CUTEAFD phase0 runtime CLI")]
 pub(crate) struct Cli {
@@ -37,6 +44,18 @@ pub(crate) struct Cli {
     /// graphs and drafts); leaves physical GPU capacity/SM/L2 unchanged.
     #[arg(long, global = true, aliases = ["rtx-budget-gib", "rtx-gib"])]
     pub(crate) coordinator_gpu_budget_gib: Option<f64>,
+    /// How host threads wait while serving: `block` (default: each
+    /// critical-path wait spins 250 us, then sleeps; the Spark exchange worker
+    /// paces its polling; a less loaded machine) or `spin` (spins throughout,
+    /// one busy core per waiting thread). Spark workers read it too.
+    #[arg(long, global = true, env = "CUTEAFD_HOST_WAIT", default_value = "block")]
+    pub(crate) host_wait: cuteafd_transport::wait_policy::HostWait,
+    /// Seconds without an active request after which every polling host thread
+    /// parks (no CPU, no GPU work), in either wait mode; the next request
+    /// wakes them. Spark workers read it too.
+    #[arg(long, global = true, env = "CUTEAFD_IDLE_PARK_SECONDS", default_value_t = 30.0,
+        value_parser = parse_idle_park)]
+    pub(crate) idle_park_seconds: f64,
     #[command(subcommand)]
     pub(crate) command: Commands,
 }
@@ -166,17 +185,13 @@ pub(crate) struct FabricArgs {
     pub(crate) p2p_bytes: Vec<usize>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
-pub(crate) enum PlanKvFormat { Bf16, Fp8 }
-impl PlanKvFormat {
-    pub(crate) fn resident(self) -> cuteafd_core::MlaCacheFormat {
-        match self { Self::Bf16 => cuteafd_core::MlaCacheFormat::Bf16, Self::Fp8 => cuteafd_core::MlaCacheFormat::Fp8 }
-    }
-}
-impl From<cuteafd_core::MlaCacheFormat> for PlanKvFormat {
-    fn from(value: cuteafd_core::MlaCacheFormat) -> Self {
-        match value { cuteafd_core::MlaCacheFormat::Bf16 => Self::Bf16, cuteafd_core::MlaCacheFormat::Fp8 => Self::Fp8 }
-    }
+/// `a16|a8` for `--exlr8-prefill-activations` on `plan` and the engine: the loader owns the one
+/// enum (the planner charges what admission charges), so clap lists its values via a parser.
+pub(crate) fn exlr8_prefill_activations_parser()
+    -> impl clap::builder::TypedValueParser<Value = cuteafd_loader::plan::exlr8::PrefillActivations> {
+    use clap::builder::TypedValueParser;
+    clap::builder::PossibleValuesParser::new(["a16", "a8"])
+        .map(|name| name.parse().expect("clap admits only the listed values"))
 }
 
 #[derive(Debug, Clone, Args)]
@@ -184,13 +199,14 @@ pub(crate) struct PlanArgs {
     /// Published EXLR8 manifest name (defaults to bit325).
     #[arg(long)]
     pub(crate) exlr8_manifest: Option<String>,
-    /// Native non-expert operands from an architecture-matched official checkpoint.
-    #[arg(long)]
-    pub(crate) exlr8_dense_from: Option<String>,
+    /// Native EXLR8 trellis prefill activations the layout charges (default a16); a8 adds every
+    /// prefill lane's MX8 records, as `serve-glm --exlr8-prefill-activations a8` admits them.
+    #[arg(long, value_parser = exlr8_prefill_activations_parser())]
+    pub(crate) exlr8_prefill_activations: Option<cuteafd_loader::plan::exlr8::PrefillActivations>,
     /// Host RAM cap for all separate per-row mapped-table scales; 0 keeps all mapped.
     #[arg(long, default_value_t = 0.0, value_parser = parse_scale_preload_gib)]
     pub mapped_scale_preload_gib: f64,
-    #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..=6))]
+    #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..=8))]
     pub(crate) vision_replicas: u32,
     /// Vision policy (auto does not imply an implemented encoder).
     #[arg(skip = cuteafd_loader::plan::MediaMode::Auto)]
@@ -218,6 +234,9 @@ pub(crate) struct PlanArgs {
     /// Spark inventory available to automatic selection.
     #[arg(long, default_value_t = 6)]
     pub(crate) available_sparks: usize,
+    /// Header-only Spark count policy for both coordinator card columns.
+    #[arg(long, conflicts_with_all = ["deployment", "files", "fetch", "role"])]
+    pub(crate) spark_range: bool,
     /// Routed-expert weight budget per Spark rank, GiB (unset: the family's
     /// default, 100 GiB for most; Kimi K3 108 GiB).
     #[arg(long)]
@@ -231,7 +250,7 @@ pub(crate) struct PlanArgs {
     /// Emit typed launch decisions; live artifact verification stays with the launcher.
     #[arg(long, conflicts_with_all = ["files", "fetch", "role", "file_layout"])]
     pub(crate) deployment: bool,
-    #[arg(long, requires = "deployment", requires = "spark_ep", value_parser = clap::value_parser!(u8).range(1..=6))]
+    #[arg(long, requires = "deployment", requires = "spark_ep", value_parser = clap::value_parser!(u8).range(1..=8))]
     pub(crate) spark_tp: Option<u8>,
     #[arg(long, requires = "deployment", requires = "spark_tp", value_parser = clap::value_parser!(u8).range(1..=3))]
     pub(crate) spark_ep: Option<u8>,
@@ -321,8 +340,8 @@ pub(crate) struct PlanArgs {
     #[arg(long)]
     pub(crate) pool_tokens: Option<u64>,
     /// Full-attention KV format for --layout (family default when omitted).
-    #[arg(long = "kv-cache", value_enum)]
-    pub(crate) kv_format: Option<PlanKvFormat>,
+    #[arg(long = "kv-cache")]
+    pub(crate) kv_format: Option<cuteafd_core::MlaCacheFormat>,
     /// Qwen projection residency for --layout.
     #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
     pub(crate) fp8_decode: bool,
@@ -374,9 +393,16 @@ pub(crate) struct PlanArgs {
     /// Include the diagnostic all-row prefill head reservation in --layout.
     #[arg(long)]
     pub(crate) full_prefill_logits: bool,
-    /// Prefill lanes for --layout (GLM 5.3 Flash, MiniMax M3; 0: the family default).
+    /// Prefill units in flight for --layout (0: the family default).
     #[arg(long, default_value_t = 0)]
-    pub(crate) prefill_lanes: u64,
+    pub(crate) prefill_waves: u64,
+    /// Decode views: V4.1 requires 2, MiMo accepts 1 or 2, other families require 1.
+    #[arg(long, value_parser = clap::value_parser!(u8).range(1..=2))]
+    pub(crate) decode_lanes: Option<u8>,
+    /// Rows one continuous prefill call streams for --layout (0: the family
+    /// default). Shared by every units-span family (launcher PREFILL_SPAN_ROWS).
+    #[arg(long, default_value_t = 0)]
+    pub(crate) prefill_span_rows: u64,
     /// Decode and verify step rows for --layout (GLM 5.3 Flash's --decode-rows: 64, or 128 with the
     /// wide programs on one GPU): its decode workspace, token selector and replay records.
     #[arg(long, default_value_t = 64, value_parser = plan_decode_rows)]
@@ -528,6 +554,9 @@ pub(crate) struct NativeExpertDaemonArgs {
     /// Published native EXLR8 manifest; binds the worker bootstrap identity.
     #[arg(long)]
     pub(crate) exlr8_manifest: Option<String>,
+    /// Native EXLR8 routed expert prefill activations; decode (`rows <= 64`) always keeps A16.
+    #[arg(long, value_parser = exlr8_prefill_activations_parser(), default_value_t = crate::shared::experts::exlr8::Exlr8PrefillActivations::A16)]
+    pub(crate) exlr8_prefill_activations: crate::shared::experts::exlr8::Exlr8PrefillActivations,
     /// Spark-role native library built with V4.1 expert AOT kernels.
     #[arg(long)]
     pub(crate) native_lib: PathBuf,
@@ -542,10 +571,10 @@ pub(crate) struct NativeExpertDaemonArgs {
     /// Override the FP8 expert package layout directory (`fp8-<family>/tp<world>`).
     #[arg(long)]
     pub(crate) fp8_package: Option<PathBuf>,
-    #[arg(long, value_parser = clap::value_parser!(u32).range(0..6))]
+    #[arg(long, value_parser = clap::value_parser!(u32).range(0..8))]
     pub(crate) rank: u32,
     /// Spark tensor-parallel world; one rank supports whole Qwen EXL3 experts.
-    #[arg(long, default_value_t = 4, value_parser = clap::value_parser!(u32).range(1..=6))]
+    #[arg(long, default_value_t = 4, value_parser = clap::value_parser!(u32).range(1..=8))]
     pub(crate) world: u32,
     /// Replicated-group tensor-parallel degree inside one group (opt-in; all-or-none with --spark-ep).
     #[arg(long, requires = "spark_ep", value_parser = parse_spark_tp)]
@@ -727,7 +756,7 @@ mod tests {
         ] {
             let super::Commands::Plan(args) = super::Cli::try_parse_from(
                 base.into_iter().chain(flags)).unwrap().command else { panic!("expected plan"); };
-            assert_eq!(args.kv_format.map(|format| match format.resident() {
+            assert_eq!(args.kv_format.map(|format| match format {
                 cuteafd_core::MlaCacheFormat::Bf16 => Qwen4KvCache::Bf16,
                 cuteafd_core::MlaCacheFormat::Fp8 => Qwen4KvCache::Fp8 }), expected);
         }
@@ -933,6 +962,42 @@ mod tests {
     }
 
     #[test]
+    fn decode_lane_cli_keeps_family_defaults_and_rejects_invalid_counts() {
+        for (value, expected) in [("1", 1), ("2", 2)] {
+            let Commands::Plan(args) = Cli::try_parse_from([
+                "cuteafd", "plan", "model", "--decode-lanes", value]).unwrap().command else { panic!("plan"); };
+            assert_eq!(args.decode_lanes, Some(expected));
+        }
+        for value in ["0", "3", "auto", "-1"] {
+            assert!(Cli::try_parse_from(["cuteafd", "plan", "model", "--decode-lanes", value]).is_err());
+        }
+        let Commands::ServeNative(args) = Cli::try_parse_from([
+            "cuteafd", "serve-native", "--snapshot", "/model", "--native-lib", "/native.so",
+            "--peers", "127.0.0.1:19441"]).unwrap().command else { panic!("native"); };
+        assert_eq!(args.decode_lanes, 2);
+    }
+
+    #[test]
+    fn plan_prefill_wave_option_has_no_lane_alias() {
+        let Commands::Plan(args) = Cli::try_parse_from([
+            "cuteafd", "plan", "model", "--prefill-waves", "2"]).unwrap().command else {
+            panic!("expected plan command");
+        };
+        assert_eq!(args.prefill_waves, 2);
+        assert!(Cli::try_parse_from(["cuteafd", "plan", "model", "--prefill-lanes", "2"]).is_err());
+    }
+
+    #[test]
+    fn plan_prefill_span_rows_is_one_shared_option() {
+        let span = |argv: &[&str]| match Cli::try_parse_from(argv).unwrap().command {
+            Commands::Plan(args) => args.prefill_span_rows,
+            _ => panic!("expected plan command"),
+        };
+        assert_eq!(span(&["cuteafd", "plan", "model"]), 0, "0 selects the family default");
+        assert_eq!(span(&["cuteafd", "plan", "model", "--prefill-span-rows", "8192"]), 8192);
+    }
+
+    #[test]
     fn transport_benchmark_defaults_use_flash_geometry() {
         let cli = Cli::try_parse_from(["cuteafd", "bench-rdma-ring"]).unwrap();
         let Commands::BenchRdmaRing(args) = cli.command else {
@@ -989,7 +1054,7 @@ mod tests {
             assert!(Cli::try_parse_from(serve.into_iter().chain(flags.clone())).is_err());
             assert!(Cli::try_parse_from(expert.into_iter().chain(flags)).is_err());
         }
-        for (tp, ep) in [("1", "2"), ("5", "1"), ("2", "0"), ("2", "4")] {
+        for (tp, ep) in [("1", "2"), ("9", "1"), ("2", "0"), ("2", "4")] {
             let flags = ["--spark-tp", tp, "--spark-ep", ep];
             assert!(Cli::try_parse_from(serve.into_iter().chain(flags)).is_err(), "{tp}x{ep}");
             assert!(Cli::try_parse_from(expert.into_iter().chain(flags)).is_err(), "{tp}x{ep}");
@@ -1000,7 +1065,7 @@ mod tests {
         let cli = Cli::try_parse_from(one.into_iter().chain(["1"])).unwrap();
         let Commands::Expertd(args) = cli.command else { panic!("expertd-native") };
         assert_eq!((args.rank, args.world), (0, 1));
-        for invalid in ["0", "7"] {
+        for invalid in ["0", "9"] {
             assert!(Cli::try_parse_from(one.into_iter().chain([invalid])).is_err());
         }
         // The worker world range also admits the six-rank layouts.
@@ -1010,8 +1075,7 @@ mod tests {
         let Commands::Expertd(args) = cli.command else { panic!("expertd-native") };
         assert_eq!((args.rank, args.world), (5, 6));
 
-        // Pure TP6EP1 is a real shard family on both processes. Five is not a
-        // family and stays rejected even though it is inside the numeric range.
+        // Pure TP6EP1 parses on both processes; TP9 is outside transport capacity.
         let six_expert = ["cuteafd", "expertd-native", "--snapshot", "/model", "--native-lib",
             "/native.so", "--device-budget-bytes", "1000", "--rank", "5", "--world", "6"];
         for command in [&serve[..], &six_expert[..]] {
@@ -1023,15 +1087,18 @@ mod tests {
                 other => panic!("unexpected command {other:?}"),
             }
             let error = Cli::try_parse_from(command.iter().copied()
-                .chain(["--spark-tp", "5", "--spark-ep", "1"]))
-                .expect_err("TP5 has no shard family");
-            assert!(error.to_string().contains("expected 2, 3, 4 or 6"), "{error}");
+                .chain(["--spark-tp", "9", "--spark-ep", "1"]))
+                .expect_err("TP9 exceeds transport capacity");
+            assert!(error.to_string().contains("expected 2 through 8"), "{error}");
         }
     }
 }
 
 #[derive(Debug, Args)]
 pub(crate) struct NativeServeArgs {
+    /// V4.1 has a fixed pair of decode views; 1 is unsupported.
+    #[arg(long, default_value_t = 2, value_parser = clap::value_parser!(u8).range(1..=2))]
+    pub decode_lanes: u8,
     /// Host RAM cap for all separate per-row mapped-table scales; 0 keeps all mapped.
     #[arg(long, default_value_t = 0.0, value_parser = parse_scale_preload_gib)]
     pub mapped_scale_preload_gib: f64,
@@ -1191,17 +1258,15 @@ pub(crate) struct NativeServeArgs {
     pub spark_ep: Option<u8>,
 }
 
-/// Spark TP degrees with a native shard family: 2/3 replicated-group shards,
-/// 4 the legacy grouped layout, and 6 the pure unreplicated `TP6EP1` slices.
-/// Five has no artifact family, so it is rejected here rather than at load time.
+/// Parse transport geometry; checkpoint admission checks native package coverage.
 fn parse_spark_tp(value: &str) -> Result<u8, String> {
     let value: u8 = value
         .parse()
-        .map_err(|_| "expected a Spark TP degree between 2 and 6".to_string())?;
+        .map_err(|_| "expected a Spark TP degree between 2 and 8".to_string())?;
     match value {
-        2 | 3 | 4 | 6 => Ok(value),
+        2..=8 => Ok(value),
         _ => Err(format!(
-            "unsupported Spark TP degree {value}; expected 2, 3, 4 or 6"
+            "unsupported Spark TP degree {value}; expected 2 through 8"
         )),
     }
 }

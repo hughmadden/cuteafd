@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::{SocketAddr, TcpStream};
 use std::path::Path;
-use std::sync::{atomic::{AtomicBool, AtomicU64, Ordering}, Arc, Condvar, Mutex, OnceLock};
+use std::sync::{atomic::{AtomicU64, Ordering}, Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -33,10 +33,6 @@ pub struct EngineSample {
     pub peer: String,
     #[serde(default)]
     pub local_gid: String,
-    /// Subset of sent_bytes posted as one-sided writes, including their flags.
-    #[serde(default)]
-    pub written_sent_bytes: u64,
-    pub receives_writes: bool,
     pub sent_bytes: u64,
     pub received_bytes: u64,
     #[serde(default)]
@@ -118,7 +114,6 @@ pub enum TrafficError {
 #[derive(Debug, Default)]
 #[repr(align(64))]
 struct WireBytes {
-    written: AtomicU64,
     sent: AtomicU64,
     received: AtomicU64,
 }
@@ -132,22 +127,15 @@ pub(crate) struct WireCounter {
     path_mtu: Option<u32>,
     peer: OnceLock<String>,
     local_gid: String,
-    receives_writes: AtomicBool,
     bytes: WireBytes,
 }
 impl WireCounter {
     pub(crate) fn sent(&self, bytes: usize) { self.bytes.sent.fetch_add(bytes as u64, Ordering::Relaxed); }
-    pub(crate) fn written(&self, bytes: usize) {
-        self.sent(bytes);
-        self.bytes.written.fetch_add(bytes as u64, Ordering::Relaxed);
-    }
-    pub(crate) fn receives_writes(&self) { self.receives_writes.store(true, Ordering::Relaxed); }
     pub(crate) fn received(&self, bytes: usize) { self.bytes.received.fetch_add(bytes as u64, Ordering::Relaxed); }
     pub(crate) fn peer(&self, peer: &str) { let _ = self.peer.set(peer.into()); }
     fn sample(&self) -> EngineSample {
         EngineSample { device: self.device.clone(), port: self.port, peer: self.peer.get().cloned().unwrap_or_default(),
-            receives_writes: self.receives_writes.load(Ordering::Relaxed),
-            local_gid: self.local_gid.clone(), written_sent_bytes: self.bytes.written.load(Ordering::Relaxed),
+            local_gid: self.local_gid.clone(),
             sent_bytes: self.bytes.sent.load(Ordering::Relaxed), received_bytes: self.bytes.received.load(Ordering::Relaxed), path_mtu: self.path_mtu, ..Default::default() }
     }
 }
@@ -166,7 +154,7 @@ fn registry() -> &'static Mutex<Registry> {
 
 pub(crate) fn register(device: &str, port: u32, peer: &str, local_gid: String, mtu: u32) -> Arc<WireCounter> {
     let counter = Arc::new(WireCounter { device: device.into(), port, path_mtu: (1..=5).contains(&mtu).then(|| 128u32 << mtu), peer: { let p = OnceLock::new(); if !peer.is_empty() { let _ = p.set(peer.into()); } p },
-        local_gid, receives_writes: AtomicBool::new(false), bytes: WireBytes::default() });
+        local_gid, bytes: WireBytes::default() });
     registry().lock().unwrap().counters.push(counter.clone());
     counter
 }
@@ -499,10 +487,9 @@ mod tests {
     #[test]
     fn wire_counter_is_cumulative_and_directional() {
         let counter = WireCounter { device: "nic".into(), port: 1, path_mtu: Some(4096), peer: OnceLock::from("peer".to_string()),
-            local_gid: "local".into(), receives_writes: AtomicBool::new(false), bytes: WireBytes::default() };
-        counter.sent(128); counter.sent(4096); counter.written(72); counter.received(64);
-        assert_eq!(counter.sample().sent_bytes, 4296);
-        assert_eq!(counter.sample().written_sent_bytes, 72);
+            local_gid: "local".into(), bytes: WireBytes::default() };
+        counter.sent(128); counter.sent(4096); counter.received(64);
+        assert_eq!(counter.sample().sent_bytes, 4224);
         assert_eq!(counter.sample().received_bytes, 64);
         assert_eq!(std::mem::align_of::<WireBytes>(), 64);
         assert_eq!((&counter.bytes as *const WireBytes as usize) % 64, 0);

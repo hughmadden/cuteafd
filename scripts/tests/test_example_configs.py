@@ -25,6 +25,8 @@ TP_EP = {"tp2ep2-native.config", "tp2ep3-native.config", "tp3ep1-native.config",
 # Qualification configs have dedicated launcher tests in
 # test_serve_launch_new_families.py and test_minimax_launch.py.
 QUALIFICATION = {"kimi-k3-exl3-max.config", "kimi-k3-exl3-k6-max.config", "step5-fp8-max.config", "step5-nvfp4-min.config"}
+V4_PREP = {"qwen35-9b-bf16-min.config", "glm53-exlr8-min.config", "glm53-exlr8-max.config",
+           "qwen38-27b-bf16-min.config", "qwen38-27b-fp8-min.config"}
 QUALIFICATION |= {f"minimax-m31-flash-nvfp4-{card}-tp{tp}.config"
                   for card in ("5090", "pro6000") for tp in (2, 3, 4)} | {"minimax-m31-flash-nvfp4-pro6000-tp6.config"}
 PRIVATE = ("raptor", "ostrich", "dodo", "emu", "kiwi", "rhea", "moa", "10.55.", "/home/", "/mnt/",
@@ -60,6 +62,20 @@ CHECKPOINTS = {
     "XiaomiMiMo/MiMo-V2.6-Pro-MOPD": {**MIMO, "hidden_size": 6144},
     "wrldsuksgo2mars/Qwen3.8-Flash-Next-EXL3-K4.25-PLE-FP8-v1": {**QWEN, "quantization_config": {"quant_method": "exl3"}},
     "nvidia/Qwen3.8-Flash-Next-NVFP4": {**QWEN, "quantization_config": {"quant_method": "modelopt", **NVFP4_GROUPS}},
+    "kindlingai/glm-5.3-exlr8-k2-k3-k4": GLM5,
+    "Qwen/Qwen3.5-9B": {"model_type": "qwen3_5", "text_config": {
+        "hidden_size": 4096, "num_hidden_layers": 32,
+        "layer_types": ["linear_attention"] * 31 + ["full_attention"]}},
+    "Qwen/Qwen3.8-27B": {"model_type": "qwen3_5", "text_config": {
+        "hidden_size": 5120, "num_hidden_layers": 32,
+        "layer_types": ["linear_attention"] * 31 + ["full_attention"]}},
+    "Qwen/Qwen3.8-27B-FP8": {"model_type": "qwen3_5", "text_config": {
+        "hidden_size": 5120, "num_hidden_layers": 32,
+        "layer_types": ["linear_attention"] * 31 + ["full_attention"]}},
+    "RadixArk/Qwen3.8-27B-DSpark": {"speculators_model_type": "dspark"},
+    "stepfun-ai/Step-5-Preview": {"model_type": "step3p5", "num_hidden_layers": 8},
+    "stepfun-ai/Step-5-Preview-NVFP4": {"model_type": "step3p5", "num_hidden_layers": 8},
+    "wrldsuksgo2mars/Kimi-K3-EXL3-K2-Core-K6": {"model_type": "kimi_k3", "num_hidden_layers": 8},
     # Drafters the starting configs name.
     "incoai/GLM-5.3-DFlash2": {"architectures": ["DFlash2DraftModel"]},
     "incoai/GLM-5.3-Flash-DFlash2": {"architectures": ["DFlash2DraftModel"]},
@@ -77,7 +93,7 @@ POOL_EXCEPTIONS = {("deepseek_v41", "POOL_TOKENS"): "auto"}
 
 
 def starting_configs() -> list[Path]:
-    return sorted(p for p in EXAMPLES.glob("*.config") if p.name not in TP_EP | QUALIFICATION)
+    return sorted(p for p in EXAMPLES.glob("*.config") if p.name not in TP_EP | QUALIFICATION | V4_PREP)
 
 
 def keys(path: Path) -> dict[str, str]:
@@ -100,6 +116,8 @@ def _hub(tmp_path: Path) -> Path:
         (root / "refs" / "main").write_text("abc")
         (root / "snapshots" / "abc").mkdir(parents=True)
         (root / "snapshots" / "abc" / "config.json").write_text(json.dumps(config))
+    draft = hf / "hub/models--RadixArk--Qwen3.8-27B-DSpark/snapshots"
+    (draft / "85ef153be924f17ce4bf62726954eeaa4a73e854").symlink_to(draft / "abc")
     return hf
 
 
@@ -159,7 +177,7 @@ report = json.loads(REPORT)
 family, first, last = FAMILY, FIRST, LAST
 print(json.dumps(dict(report, version=1, family=family, executable=True, report=report,
     launch=dict(family=family, first_expert_layer=first, last_expert_layer=last),
-    spark_admission="coordinator_authoritative",
+    spark_admission="coordinator_authoritative", decode_lanes=1,
     peers=value("--deployment-peers", "").split(",")[:report["spark_ranks"]],
     speculator=value("--speculator", "off"))))
 """.replace("REPORT", repr(json.dumps(plan))).replace("FAMILY", repr(family))
@@ -187,6 +205,7 @@ def _coordinator(result: subprocess.CompletedProcess[str]) -> str:
 
 # Encoder plans for families with towers: Spark-first vision on rank 0, or off.
 SPARK_PLAN = {"placement_supported": True, "fits": True, "spark_ranks": 2, "encoder_plan_hash": "ab" * 32,
+              "prefill_unit_rows": 4096, "prefill_waves": 1, "prefill_span_rows": 4096,
               "encoder": {"kind": {"kind": "spark", "rank": 0}, "replicas": []},
               "audio_encoder": {"kind": {"kind": "off"}, "replicas": []}}
 LOCAL_PLAN = {**SPARK_PLAN, "spark_ranks": 0, "encoder": {"kind": {"kind": "off"}, "replicas": []}}
@@ -405,9 +424,10 @@ V41 = [p for p in starting_configs() if p.name.startswith("deepseek-v41-")]
 FAMILY = [p for p in starting_configs() if not p.name.startswith("deepseek-v41-")]
 
 
-@pytest.mark.parametrize("entry", json.loads((ROOT / "scripts/bench/release-smoke-v3.json").read_text())["entries"],
+@pytest.mark.parametrize("entry", [entry for filename in ("release-smoke-v3.json", "release-smoke-v4.json")
+                                     for entry in json.loads((ROOT / "scripts/bench" / filename).read_text())["entries"]],
                          ids=lambda entry: entry["name"])
-def test_v3_release_smoke_entry_passes_config_validation(entry: dict, tmp_path: Path) -> None:
+def test_release_smoke_entry_passes_config_validation(entry: dict, tmp_path: Path) -> None:
     matrix = json.loads((ROOT / "scripts/bench/release-smoke-v3.json").read_text())
     values = {**keys(ROOT / entry["config"]), **matrix.get("defaults", {}).get("set", {}),
               **entry.get("set", {})}
@@ -557,3 +577,100 @@ def test_checkpoint_onboarding_rejects_invalid_grammar(value):
                              "--onboard", value], capture_output=True, text=True)
     assert result.returncode != 0
     assert "RTX_EXPERT_LAYERS must be" in result.stderr
+
+
+@pytest.mark.parametrize("name", sorted(V4_PREP))
+def test_v4_candidate_config_contract(name: str, tmp_path: Path) -> None:
+    path = EXAMPLES / name
+    values = keys(path)
+    text = path.read_text()
+    assert f"./run.sh --config examples/configs/{name}" in text and "--dry-run" in text
+    assert re.fullmatch("[0-9a-f]{40}", values["MODEL_REVISION"])
+    assert not any(needle in text.lower() for needle in PRIVATE)
+    assert "EXLR8_DENSE_FROM" not in values
+    if name.startswith("glm53"):
+        assert values["EXLR8_MANIFEST"] == "up1"
+        assert values["MODEL_ID"] == "kindlingai/glm-5.3-exlr8-k2-k3-k4"
+        assert "RTX_EXPERT_LAYERS" not in values
+        assert values["SPARK_COUNT"] == ("4" if "-min" in name else "6")
+        assert values["ATTENTION_PLACEMENT"] == ("heads" if "-min" in name else "context")
+        # Native-dense launcher integration is owned by #659/#663, not this prep.
+        # The smoke-entry loader test above still validates every config key.
+    else:
+        assert values["SPARK_COUNT"] == "0" and values["RTX_GPUS"] == "1"
+        speculator = "off" if name.startswith("qwen35-9b") else "dspark"
+        assert values["SPECULATOR"] == speculator
+        from test_run_family_dispatch import _family_launch_result, _snapshot
+        _snapshot(tmp_path / "hf", "RadixArk/Qwen3.8-27B-DSpark",
+                  {"speculators_model_type": "dspark"}, "85ef153be924f17ce4bf62726954eeaa4a73e854")
+        launch_values = {k: v for k, v in values.items() if k not in ("MODEL_ID", "MODEL_REVISION")}
+        result = _family_launch_result(tmp_path, CHECKPOINTS[values["MODEL_ID"]], values["MODEL_ID"],
+            "".join(f"{k}={v}\n" for k, v in launch_values.items()),
+            extra_args=("--wip", "dense-test"), encoder_plan=LOCAL_PLAN)
+        launch = _coordinator(result)
+        assert "serve-qwen35" in launch
+        assert ("--draft " in launch) == (speculator == "dspark")
+        assert "--peers " not in launch
+
+
+def test_v4_matrix_card_set_and_retired_pins() -> None:
+    v3 = json.loads((ROOT / "scripts/bench/release-smoke-v3.json").read_text())
+    v4 = json.loads((ROOT / "scripts/bench/release-smoke-v4.json").read_text())
+    entries = {entry["name"]: entry for entry in v4["entries"]}
+    assert len(entries) == len(v4["entries"])
+    for entry in v3["entries"]:
+        if entry["name"].endswith("-5090") and entry["name"] != "qwen38-nvfp4-5090":
+            candidate = {**entries[entry["name"]], "set": dict(entries[entry["name"]]["set"])}
+            candidate["set"].pop("SPARK_EXPERT_DOCKER_INFERENCE", None)
+            assert candidate == entry
+    assert entries["qwen38-exl3-5090"]["set"]["SPARK_COUNT"] == "1"
+    for name, gpus, sparks in [
+        ("v41-flash-max", 2, 6), ("v41-flash-reference-tp4", 1, 4),
+        ("v4-flash-reference-tp4", 1, 4), ("glm53-exl3-max", 2, 6),
+        ("glm53-exlr8-min", 1, 4), ("glm53-exlr8-max", 2, 6),
+        ("kimi-k3-max", 2, 6), ("step5-fp8-max", 2, 6),
+        ("step5-nvfp4-min", 1, 4), ("qwen38-27b-bf16-min", 1, 0),
+        ("qwen38-27b-fp8-min", 1, 0), ("qwen35-9b-bf16-min", 1, 0),
+        ("qwen38-27b-bf16-min-nospec", 1, 0), ("qwen38-27b-fp8-min-nospec", 1, 0),
+    ]:
+        assert len(entries[name]["gpus"]) == gpus
+        assert len(entries[name]["sparks"]) == sparks
+        assert entries[name]["set"]["SPARK_COUNT"] == str(sparks)
+    dense = [entry for entry in v4["entries"] if entry["family"] == "qwen3_5"]
+    assert {entry["name"]: entry["set"]["SPECULATOR"] for entry in dense} == {
+        "qwen35-9b-bf16-min": "off", "qwen38-27b-bf16-min": "dspark",
+        "qwen38-27b-fp8-min": "dspark", "qwen38-27b-bf16-min-nospec": "off",
+        "qwen38-27b-fp8-min-nospec": "off"}
+    for quant in ("bf16", "fp8"):
+        base = entries[f"qwen38-27b-{quant}-min"]
+        nospec = entries[f"{base['name']}-nospec"]
+        assert nospec == {**base, "name": f"{base['name']}-nospec", "set": {
+            **base["set"], "SPECULATOR": "off", "ADDR": nospec["set"]["ADDR"]}}
+    assert "SPARK_EXPERT_DOCKER_INFERENCE" not in v4["defaults"]["set"]
+    for entry in v4["entries"]:
+        assert ("SPARK_EXPERT_DOCKER_INFERENCE" in entry["set"]) == bool(entry["sparks"])
+    for entry in dense:
+        assert "EXPERT_PORT" not in entry["set"]
+        assert sum(other.get("set", {}).get("ADDR") == entry["set"]["ADDR"]
+                   for other in v4["entries"]) == 1
+    assert not any(name.startswith("qwen38-nvfp4") for name in entries)
+    retired = v4["retired"]
+    assert len(retired) == 14
+    assert "glm53-exl3-max" not in {entry["name"] for entry in retired}
+    assert {"qwen38-nvfp4-" + size for size in ("min", "max", "5090")} <= {e["name"] for e in retired}
+    assert retired == json.loads((ROOT / "benchmarks/current-matrix.json").read_text())["retired"]
+    reports = [(path, json.loads(path.read_text())) for path in (ROOT / "benchmarks").glob("*/*/report.json")]
+    for entry in retired:
+        assert (ROOT / entry["config"]).is_file()
+        report = json.loads((ROOT / entry["report"] / "report.json").read_text())
+        assert report["profile"] == "smoke" and report["baseline"]
+        build = report["server"]["build"]
+        expected = build["release"] or f"v3 dev {report['created'][:10]}"
+        assert entry["release"] == expected and entry["release_note"]
+        assert "nearest" not in entry["release_note"].lower()
+        if entry["name"] == "glm53f-exl3-v1":
+            candidates = [d for _, d in reports if d["profile"] == "smoke" and
+                          d["server"]["model"] == "wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K3.25-v1"]
+        else:
+            candidates = [d for p, d in reports if d["profile"] == "smoke" and p.parent.name.endswith("-" + entry["name"])]
+        assert report["created"] == max(d["created"] for d in candidates)

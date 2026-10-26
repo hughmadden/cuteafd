@@ -866,7 +866,7 @@ mod tests {
                 for mode in [Bf16Only, Fp8Only] {
                     let capacity = GlmDraftCapacity::new(8, 8, 8).unwrap();
                     let layout = cfg.runtime_layout(mode, capacity, context, context, sms, 2, MlaCacheFormat::Bf16).unwrap();
-                    let bridge = crate::families::kimi_k3::draft_bridge_demands(&layout).unwrap();
+                    let bridge = crate::families::kimi_k3::draft_bridge_demands(&layout, 4096).unwrap();
                     assert_eq!(bridge.len(), 5);
                     assert_eq!(bridge.iter().find(|d| d.group == "DFlash bridge taps").unwrap().bytes,
                         (4096 * 5 * 7168 * 2) as u64);

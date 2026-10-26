@@ -307,8 +307,6 @@ const QUANT_SELECTION_SETTINGS: &[&str] = &[
     "snapshot",
     // Which published EXLR8 expert manifest (per-expert bit allocation) the native arm loads.
     "exlr8-manifest",
-    // The official snapshot the native EXLR8 arm takes its dense (non-expert) operands from.
-    "exlr8-dense-from",
 ];
 
 /// Top-level server fields naming the checkpoint, which differ between two checkpoints by
@@ -953,8 +951,6 @@ mod tests {
         ];
         if native {
             settings.push(serde_json::json!({"name": "exlr8-manifest", "value": "up1", "source": "cli"}));
-            settings.push(serde_json::json!({"name": "exlr8-dense-from",
-                "value": "/hub/models--zai-org--GLM-5.3/snapshots/abc", "source": "cli"}));
         }
         r.settings = serde_json::json!({"model": model, "family": "glm5", "snapshot": snapshot,
             "build": {"version": "3.0.1", "commit": "0123abc", "dirty": false}, "settings": settings});

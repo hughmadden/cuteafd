@@ -145,6 +145,9 @@ pub(super) struct Step5Backend<'e, 'a> {
     sequences: usize,
     library: &'a NativeLibrary,
     mtp: Option<&'e super::mtp::Runtime<'a>>,
+    full_prefill_logits: bool,
+    /// Prefill unit rows and units in flight (PLAN "Prefill contract").
+    prefill: (usize, usize),
 }
 
 impl<'e, 'a> Step5Backend<'e, 'a> {
@@ -176,7 +179,22 @@ impl<'e, 'a> Step5Backend<'e, 'a> {
             _ => anyhow::bail!("CUTEAFD_DIAG_STEP5_FAIL_VERIFY_ONCE must be unset or 1"),
         };
         Ok(Self { state: BackendState::new(fail_verify_once), execution, ranks, embedding, inputs,
-            profile: RefCell::new([0.0; 2]), rows, context, sequences, library, mtp: None })
+            profile: RefCell::new([0.0; 2]), rows, context, sequences, library, mtp: None,
+            full_prefill_logits: false, prefill: (rows, 1) })
+    }
+
+    /// Prefill unit rows and units in flight; the step's rows are their product.
+    pub(super) fn with_prefill_units(mut self, unit: usize, waves: usize) -> Result<Self> {
+        ensure!(waves > 0 && unit * waves == self.rows && (waves == 1 || unit % 64 == 0),
+            "Step-5 prefill units differ from the admitted span");
+        self.prefill = (unit, waves);
+        Ok(self)
+    }
+
+    /// The head was admitted at chunk width: all-row prefill scoring is served.
+    pub(super) fn with_full_prefill_logits(mut self, enabled: bool) -> Self {
+        self.full_prefill_logits = enabled;
+        self
     }
 
     pub(super) fn with_mtp(mut self, mtp: &'e super::mtp::Runtime<'a>) -> Self {
@@ -214,8 +232,10 @@ impl<'e, 'a> Step5Backend<'e, 'a> {
     #[cfg(test)]
     pub(super) fn diagnostic_abort_once(&self) { self.state.fail_verify_once.set(true); }
 
+    /// `logit_rows` projects only the wave's last rows through the head (prefill
+    /// needs its last row); None projects every row (decode and verify).
     fn execute(&self, sequences: &[(&mut Placement, &[u32])], pool: &RefPagePool,
-        kind: cuteafd_transport::ExpertV2SourceKind) -> Result<(Evidence<'e, 'a>, DeviceLogits)> {
+        kind: cuteafd_transport::ExpertV2SourceKind, logit_rows: Option<usize>) -> Result<(Evidence<'e, 'a>, DeviceLogits)> {
         self.execution.require_live()?;
         let input = self.inputs;
         let mut first_row = 0usize;
@@ -241,7 +261,19 @@ impl<'e, 'a> Step5Backend<'e, 'a> {
                     input.residual.buffer, meta.rows * H, meta.stream.raw)
             }
         }))?;
-        self.execution.enqueue(&mut step, &input.residual, kind)?;
+        // One sequence's prefill longer than a unit runs as row units with
+        // waves in flight; every other step runs whole (at most one unit).
+        let (unit, waves) = self.prefill;
+        if kind == cuteafd_transport::ExpertV2SourceKind::Prefill && descriptors.len() == 1 && first_row > unit {
+            let units = crate::shared::prefill_pipeline::prefill_units(first_row, unit, waves, 64)?.into_iter()
+                .enumerate().map(|(index, rows)| crate::shared::prefill_pipeline::Unit { index, sequence: 0, rows,
+                    layers: 0..92, slot: index % waves, barrier: false }).collect::<Vec<_>>();
+            self.execution.enqueue_units(&mut step, &input.residual, kind, &units, waves)?;
+        } else {
+            // Each return slot and hop lane holds one unit.
+            ensure!(first_row <= unit, "Step-5 {first_row}-row step exceeds one prefill unit of {unit}");
+            self.execution.enqueue(&mut step, &input.residual, kind)?;
+        }
         let (device, output) = self.execution.terminal_output()?;
         let head_rank = self.execution.ownership().execution().spec().head_gpu as usize;
         let head = self.execution.head()?;
@@ -270,16 +302,21 @@ impl<'e, 'a> Step5Backend<'e, 'a> {
                     }
                 }
             }
-            head.device_logits_on(output, meta.rows, meta.stream)
+            let rows = logit_rows.unwrap_or(meta.rows);
+            ensure!((1..=meta.rows).contains(&rows), "Step-5 head rows outside the wave");
+            let skip = (meta.rows - rows) * H * 4;
+            let input = cuteafd_ffi::CuteafdDeviceBuffer { ptr: output.ptr.wrapping_byte_add(skip),
+                bytes: output.bytes.checked_sub(skip).context("Step-5 head input extent")?, ..output };
+            head.device_logits_on(input, rows, meta.stream)
         })?;
         Ok((step, logits))
     }
 
     fn immediate(&self, sequences: &mut [(&mut Placement, &[u32])], pool: &RefPagePool,
-        kind: cuteafd_transport::ExpertV2SourceKind) -> Result<DeviceLogits> {
+        kind: cuteafd_transport::ExpertV2SourceKind, logit_rows: Option<usize>) -> Result<DeviceLogits> {
         self.state.submit(|| {
             let submitted = ImmediateWave::record(sequences);
-            let (step, logits) = self.state.post_execution(self.execute( sequences, pool, kind)?)?;
+            let (step, logits) = self.state.post_execution(self.execute(sequences, pool, kind, logit_rows)?)?;
             let mut accepted = sequences.iter_mut().map(|(placement, tokens)| (&mut **placement, tokens.len()))
                 .collect::<Vec<_>>();
             step.publish_wave(&mut accepted)?;
@@ -304,7 +341,8 @@ impl<'e, 'a> Backend<'a> for Step5Backend<'e, 'a> {
 
     fn geometry(&self) -> scheduler::Geometry {
         scheduler::Geometry { family: "step5", vocab_size: V, max_context: self.context,
-            slots: self.sequences, prefill_rows: self.rows, decode_rows: self.rows.min(64), full_prefill_logits: true }
+            slots: self.sequences, prefill_rows: self.rows, decode_rows: self.rows.min(64),
+            full_prefill_logits: self.full_prefill_logits }
     }
     fn message_starts(&self) -> &[&str] { &["<|im_start|>"] }
     fn library(&self) -> &'a NativeLibrary { self.library }
@@ -360,22 +398,24 @@ impl<'e, 'a> Backend<'a> for Step5Backend<'e, 'a> {
         pool: &RefPagePool) -> Result<Option<DeviceLogits>> {
         self.state.retire();
         ensure!(logit_rows <= tokens.len(), "Step-5 prefill logits extent");
-        let mut logits = self.immediate(&mut [(placement, tokens)], pool, cuteafd_transport::ExpertV2SourceKind::Prefill)?;
+        ensure!(logit_rows <= 1 || self.full_prefill_logits,
+            "Step-5 all-row prefill logits require --full-prefill-logits");
+        // The head projects only the rows serving needs, never the whole chunk.
+        let logits = self.immediate(&mut [(placement, tokens)], pool,
+            cuteafd_transport::ExpertV2SourceKind::Prefill, Some(logit_rows.max(1)))?;
         if logit_rows == 0 { return Ok(None); }
-        logits.ptr = logits.ptr.wrapping_byte_add((logits.rows - logit_rows) * logits.stride * 4);
-        logits.rows = logit_rows;
         Ok(Some(logits))
     }
     fn verify_device(&self, sequences: &mut [(&mut Placement, &[u32])], speculative: bool,
         pool: &RefPagePool) -> Result<Option<DeviceLogits>> {
-        self.state.verify(|| self.execute( sequences, pool, verify_kind(speculative))).map(Some)
+        self.state.verify(|| self.execute(sequences, pool, verify_kind(speculative), None)).map(Some)
     }
     fn verify_device_ungraphed(&self, sequences: &mut [(&mut Placement, &[u32])], speculative: bool,
         kind: scheduler::UngraphedKind, pool: &RefPagePool) -> Result<Option<DeviceLogits>> {
         self.state.retire();
         let source = ungraphed_kind(speculative, kind);
-        if speculative { self.state.verify(|| self.execute( sequences, pool, source)).map(Some) }
-        else { self.immediate(sequences, pool, source).map(Some) }
+        if speculative { self.state.verify(|| self.execute(sequences, pool, source, None)).map(Some) }
+        else { self.immediate(sequences, pool, source, None).map(Some) }
     }
     fn verify_bucket_rows(&self, rows: usize, _speculative: bool, _diagnostic: bool) -> usize { rows }
     fn verify_attention_trace(&self, contexts: &[Vec<usize>], rows: usize) -> serde_json::Value {

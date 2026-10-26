@@ -424,6 +424,28 @@ impl NativeLibrary {
         Ok(())
     }
 
+    /// Copies up to four byte regions (`(destination, source, bytes)`, any
+    /// alignment) with SM loads and stores on `stream`, then a system-scope
+    /// fence (`cuteafd_sm_copy_regions`).
+    ///
+    /// # Safety
+    /// Every pointer is a device pointer (or a mapped host alias) valid for
+    /// its `bytes` on the stream's device until the copy completes; the
+    /// regions do not overlap.
+    pub unsafe fn sm_copy_regions(&self, regions: &[(*mut c_void, *const c_void, u64)], stream: *mut c_void)
+        -> Result<()> {
+        type F = unsafe extern "C" fn(*const *mut c_void, *const *const c_void, *const u64, u32, *mut c_void) -> i32;
+        ensure!((1..=4).contains(&regions.len()), "{} regions in one SM copy", regions.len());
+        let destinations: Vec<_> = regions.iter().map(|r| r.0).collect();
+        let sources: Vec<_> = regions.iter().map(|r| r.1).collect();
+        let bytes: Vec<_> = regions.iter().map(|r| r.2).collect();
+        // SAFETY: the caller vouches for the regions; native copies the descriptors.
+        let status = unsafe { self.lib.get::<F>(b"cuteafd_sm_copy_regions")?(destinations.as_ptr(), sources.as_ptr(),
+            bytes.as_ptr(), regions.len() as u32, stream) };
+        ensure!(status == 0, "SM region copy failed with CUDA error {status}");
+        Ok(())
+    }
+
     /// Copies up to [`PEER_MAX_PLANES`] strided planes (local or peer) in one
     /// launch, then publishes the next sequence to `flag` exactly as
     /// [`NativeLibrary::peer_push_signal`] does, so the two share a link
@@ -463,46 +485,6 @@ impl NativeLibrary {
         let f = *unsafe { self.lib.get::<F>(b"cuteafd_host_signal") }?;
         let status = unsafe { f(flag, send_state, descriptor, words.as_ptr(), stream) };
         ensure!(status == 0, "host mailbox signal failed with CUDA error {status}");
-        Ok(())
-    }
-
-    /// [`Self::host_signal`] with its payload (see `cuteafd_host_publish`):
-    /// a small grid stores each span (device source, host destination, bytes;
-    /// 16-byte aligned multiples) and then publishes, with no copy-engine copy.
-    ///
-    /// # Safety
-    /// As [`Self::host_signal`]; every source is live device memory complete in
-    /// stream order, every destination pinned, device-mapped host memory the
-    /// host reads only after the sequence, and `arrivals` (u32 [1]) zeroed
-    /// device memory used by no other launch at the same time.
-    #[allow(clippy::too_many_arguments)]
-    pub unsafe fn host_publish(&self, spans: [(*const c_void, *mut c_void, usize); 3], flag: *mut u32,
-        send_state: *mut u32, descriptor: *mut u32, words: [u32; 4], arrivals: *mut u32, stream: *mut c_void)
-        -> Result<()> {
-        type F = unsafe extern "C" fn(*const *const c_void, *const *mut c_void, *const u64, *mut u32, *mut u32,
-            *mut u32, *const u32, *mut u32, *mut c_void) -> i32;
-        let f = *unsafe { self.lib.get::<F>(b"cuteafd_host_publish") }?;
-        let sources = spans.map(|span| span.0);
-        let destinations = spans.map(|span| span.1);
-        let bytes = spans.map(|span| span.2 as u64);
-        let status = unsafe { f(sources.as_ptr(), destinations.as_ptr(), bytes.as_ptr(), flag, send_state,
-            descriptor, words.as_ptr(), arrivals, stream) };
-        ensure!(status == 0, "host mailbox publish failed with CUDA error {status}");
-        Ok(())
-    }
-
-    /// Write-mode Spark completions on `stream` (see `cuteafd_spark_wait_written`).
-    ///
-    /// # Safety
-    /// `flags` (`ranks` u64 words `stride_words` apart) is device memory the
-    /// NICs write; `state` and `error` are live memory mapped on the stream's
-    /// device; one wave was (or will be) posted per wait.
-    pub unsafe fn spark_wait_written(&self, flags: *const u64, ranks: u32, stride_words: u32, state: *mut u32,
-        error: *mut u32, stream: *mut c_void) -> Result<()> {
-        type F = unsafe extern "C" fn(*const u64, u32, u32, *mut u32, *mut u32, *mut c_void) -> i32;
-        let f = *unsafe { self.lib.get::<F>(b"cuteafd_spark_wait_written") }?;
-        let status = unsafe { f(flags, ranks, stride_words, state, error, stream) };
-        ensure!(status == 0, "Spark written-completion wait failed with CUDA error {status}");
         Ok(())
     }
 

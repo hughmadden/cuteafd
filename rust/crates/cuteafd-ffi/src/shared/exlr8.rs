@@ -10,6 +10,39 @@ fn invalid(message: impl Into<String>) -> ManifestError {
     ManifestError(message.into())
 }
 
+/// Compact compute and ingress ABIs have a fixed route-slot stride.
+pub const COMPACT_GROUP_ROWS: usize = 16;
+
+/// Read the route-slot stride from the named export ABI, never a missing-field default.
+pub fn group_rows(spec: &ProgramSpec) -> Result<usize, ManifestError> {
+    let (abi, capacity, grouped) = match spec.name.as_str() {
+        "exlr8_a16_decode" | "exlr8_a16_serving" | "exlr8_shared_a16_serving" => (3, 64, false),
+        "exlr8_a16_grouped64" => (3, 64, true),
+        "exlr8_a16_grouped" | "exlr8_a8_grouped" => (3, 4096, true),
+        "exlr8_group" | "exlr8_shared_group" => (2, 64, false),
+        "exlr8_grouped_group" => (2, 4096, true),
+        _ => return Err(invalid("unknown grouping ABI kind")),
+    };
+    if spec.geometry["abi_version"].as_u64() != Some(abi)
+        || spec.geometry["max_rows"].as_u64() != Some(capacity)
+        || u64::from(spec.capacity_rows) != capacity
+    {
+        return Err(invalid("grouping ABI version or capacity mismatch"));
+    }
+    if !grouped {
+        if spec.geometry.get("group_rows").is_some_and(|r| r.as_u64() != Some(COMPACT_GROUP_ROWS as u64)) {
+            return Err(invalid("compact ABI requires its fixed group row stride"));
+        }
+        return Ok(COMPACT_GROUP_ROWS);
+    }
+    let rows = spec.geometry["group_rows"].as_u64()
+        .ok_or_else(|| invalid("grouped ABI requires explicit geometry.group_rows"))?;
+    if !matches!(rows, 16 | 32 | 64) || (capacity == 64 && rows != COMPACT_GROUP_ROWS as u64) {
+        return Err(invalid("grouped row tile must be 16, 32 or 64 (16 when decoding)"));
+    }
+    Ok(rows as usize)
+}
+
 pub fn validate(spec: &ProgramSpec) -> Result<(), ManifestError> {
     let field = |name: &str| {
         spec.geometry[name]
@@ -18,21 +51,38 @@ pub fn validate(spec: &ProgramSpec) -> Result<(), ManifestError> {
             .ok_or_else(|| invalid(format!("missing or invalid geometry.{name}")))
     };
     let shared = spec.name == "exlr8_shared_a16_serving";
-    let grouped = spec.name == "exlr8_a16_grouped";
+    let grouped_a8 = spec.name == "exlr8_a8_grouped";
+    // The 64-row grouped instance reuses the grouped ABI below the K1
+    // threshold; its F32 FC2 partials must match the K1 serving kernel.
+    let grouped_decode = spec.name == "exlr8_a16_grouped64";
+    let grouped = spec.name == "exlr8_a16_grouped" || grouped_a8 || grouped_decode;
     let serving = shared || grouped || spec.name == "exlr8_a16_serving";
-    let max_rows = if grouped { 4096 } else { 64 };
-    let group_rows = if grouped {
-        let rows = field("group_rows")?;
-        if !matches!(rows, 16 | 32 | 64) {
-            return Err(invalid("grouped row tile must be 16, 32 or 64"));
+    let activations = spec.geometry.get("activations").and_then(|v| v.as_str());
+    if (grouped_a8 && activations != Some("a8"))
+        || (grouped_decode && activations.is_some())
+        || (!grouped_a8 && !grouped_decode && activations.is_some_and(|v| v != "a16"))
+    {
+        return Err(invalid("grouped activation mode mismatch"));
+    }
+    if grouped_decode
+        && spec.geometry.get("fc2_partials").and_then(|v| v.as_str()) != Some("f32")
+    {
+        return Err(invalid("64-row grouped instance requires F32 FC2 partials"));
+    }
+    // The routed serving core is a compact-unit instance selected by name and
+    // variant; its geometry must declare which served variant it is, and only
+    // the compact-unit routed variants are accepted here.
+    if spec.name == "exlr8_a16_serving" {
+        let variant = spec.geometry.get("serving_variant").and_then(|v| v.as_str());
+        if !matches!(variant, Some("k1_k23_coalesced"))
+        {
+            return Err(invalid("routed serving requires a declared compact-unit variant"));
         }
-        rows
-    } else {
-        if spec.geometry.get("group_rows").is_some_and(|r| r.as_u64() != Some(16)) {
-            return Err(invalid("decode requires 16-row groups"));
-        }
-        16
-    };
+    } else if spec.geometry.get("serving_variant").is_some() {
+        return Err(invalid("serving_variant applies to the routed serving instance"));
+    }
+    let max_rows = if grouped && !grouped_decode { 4096 } else { 64 };
+    let group_rows = group_rows(spec)? as u64;
     if (!serving && spec.name != "exlr8_a16_decode")
         || field("abi_version")? != 3
         || field("max_rows")? != max_rows
@@ -75,7 +125,7 @@ pub fn validate(spec: &ProgramSpec) -> Result<(), ManifestError> {
         expected.push("group_count");
     }
     if grouped { expected.extend(["unit_count", "unit_map"]); }
-    let scalars: &[u8] = if serving && !grouped { b"ii" } else { b"iii" };
+    let scalars: &[u8] = if grouped { b"iiii" } else if serving { b"ii" } else { b"iii" };
     if !spec.pointers.iter().map(String::as_str).eq(expected) || spec.scalar_kinds != scalars {
         return Err(invalid("pointer order or scalar ABI"));
     }
@@ -132,7 +182,7 @@ pub fn validate_entry(spec: &ProgramSpec, entry: &serde_json::Value) -> Result<(
     let t = spec.geometry["top_k"].as_u64().unwrap();
     let g = spec.geometry["max_groups"].as_u64().unwrap();
     let s = h.div_ceil(1024);
-    let r = spec.geometry["group_rows"].as_u64().unwrap_or(16);
+    let r = group_rows(spec)? as u64;
     let mut shapes = vec![
         format!("[rows,{h}]"),
         format!("[E,{u},3,3]"),
@@ -153,12 +203,19 @@ pub fn validate_entry(spec: &ProgramSpec, entry: &serde_json::Value) -> Result<(
     ];
     if matches!(
         spec.name.as_str(),
-        "exlr8_a16_serving" | "exlr8_shared_a16_serving" | "exlr8_a16_grouped"
+        "exlr8_a16_serving"
+            | "exlr8_shared_a16_serving"
+            | "exlr8_a16_grouped"
+            | "exlr8_a8_grouped"
+            | "exlr8_a16_grouped64"
     ) {
         shapes.push("[1]".into());
         dtypes.push("int32");
     }
-    if spec.name == "exlr8_a16_grouped" {
+    if matches!(
+        spec.name.as_str(),
+        "exlr8_a16_grouped" | "exlr8_a8_grouped" | "exlr8_a16_grouped64"
+    ) {
         shapes.extend(["[E]".into(), format!("[E,{u}]")]);
         dtypes.extend(["int32", "int32"]);
     }
@@ -221,11 +278,7 @@ fn validate_glue(spec: &ProgramSpec, entry: &serde_json::Value) -> Result<(), Ma
             let h = field("hidden")?;
             let shared = spec.name == "exlr8_shared_group";
             let grouped = spec.name == "exlr8_grouped_group";
-            let r = if grouped { field("group_rows")? } else { 16 };
-            if (grouped && !matches!(r, 16 | 32 | 64))
-                || (!grouped && spec.geometry.get("group_rows").is_some_and(|r| r.as_u64() != Some(16))) {
-                return Err(invalid("grouping row tile"));
-            }
+            let r = group_rows(spec)? as u64;
             let (format, dtype, row, row_bytes) = if shared {
                 ("bf16", "bfloat16", h, h * 2)
             } else {
@@ -316,6 +369,39 @@ mod tests {
             ]),
         }
     }
+    #[test]
+    fn grouping_stride_follows_the_export_abi_and_rejects_missing_grouped_metadata() {
+        for (name, abi, capacity, explicit) in [
+            ("exlr8_a16_serving", 3, 64, None),
+            ("exlr8_shared_a16_serving", 3, 64, None),
+            ("exlr8_group", 2, 64, None),
+            ("exlr8_shared_group", 2, 64, None),
+            ("exlr8_a16_grouped64", 3, 64, Some(16)),
+            ("exlr8_a16_grouped", 3, 4096, Some(64)),
+            ("exlr8_a8_grouped", 3, 4096, Some(64)),
+            ("exlr8_grouped_group", 2, 4096, Some(64)),
+        ] {
+            let mut spec = spec();
+            spec.name = name.into();
+            spec.capacity_rows = capacity;
+            spec.geometry["abi_version"] = serde_json::json!(abi);
+            spec.geometry["max_rows"] = serde_json::json!(capacity);
+            if let Some(rows) = explicit { spec.geometry["group_rows"] = serde_json::json!(rows); }
+            assert_eq!(group_rows(&spec).unwrap(), explicit.unwrap_or(COMPACT_GROUP_ROWS), "{name}");
+            spec.geometry.as_object_mut().unwrap().remove("group_rows");
+            assert_eq!(group_rows(&spec).is_err(), explicit.is_some(), "{name}");
+            spec.geometry["group_rows"] = serde_json::json!(32);
+            assert_eq!(group_rows(&spec).is_ok(), capacity == 4096, "{name}");
+            spec.geometry["group_rows"] = serde_json::json!("64");
+            assert!(group_rows(&spec).is_err(), "{name}");
+            spec.geometry["abi_version"] = serde_json::json!(99);
+            assert!(group_rows(&spec).is_err(), "{name}");
+        }
+        let mut unknown = spec();
+        unknown.name = "exlr8_unknown".into();
+        assert!(group_rows(&unknown).is_err());
+    }
+
     fn entry() -> serde_json::Value {
         let shapes = [
             "[rows,6144]",
@@ -407,6 +493,7 @@ mod tests {
         let mut s = spec();
         s.name = "exlr8_a16_serving".into();
         s.geometry["abi_version"] = serde_json::json!(3);
+        s.geometry["serving_variant"] = serde_json::json!("k1_k23_coalesced");
         s.pointers.push("group_count".into());
         s.scalar_kinds = b"ii".to_vec();
         let mut e = entry();
@@ -441,7 +528,7 @@ mod tests {
             s.geometry["group_rows"] = serde_json::json!(tile);
             s.geometry["ctas_per_sm"] = serde_json::json!(2);
             s.pointers.extend(["group_count", "unit_count", "unit_map"].map(String::from));
-            s.scalar_kinds = b"iii".to_vec();
+            s.scalar_kinds = b"iiii".to_vec();
             for bytes in s.scratch.values_mut() { *bytes *= tile / 16; }
             let mut e = entry();
             e["capacity_rows"] = serde_json::json!(4096);
@@ -457,7 +544,17 @@ mod tests {
             }
             e["scratch_bytes_at_capacity"] = serde_json::to_value(&s.scratch).unwrap();
             validate_entry(&s, &e).unwrap();
+            let mut a8 = s.clone();
+            a8.name = "exlr8_a8_grouped".into();
+            assert!(validate(&a8).is_err());
+            a8.geometry["activations"] = serde_json::json!("a8");
+            validate_entry(&a8, &e).unwrap();
+            let mut bad_a16 = s.clone();
+            bad_a16.geometry["activations"] = serde_json::json!("a8");
+            assert!(validate(&bad_a16).is_err());
             let mut legacy = s.clone();
+            legacy.scalar_kinds = b"iii".to_vec();
+            assert!(validate(&legacy).is_err());
             legacy.scalar_kinds = b"ii".to_vec();
             assert!(validate(&legacy).is_err());
             legacy = s.clone();
@@ -478,6 +575,35 @@ mod tests {
             e["pointers"][4]["shape"] = serde_json::json!("[512,8]");
             assert!(validate_entry(&s, &e).is_err());
         }
+    }
+
+    #[test]
+    fn routed_serving_requires_a_declared_compact_unit_variant() {
+        let mut s = spec();
+        s.name = "exlr8_a16_serving".into();
+        s.pointers.push("group_count".into());
+        s.scalar_kinds = b"ii".to_vec();
+        let mut e = entry();
+        e["pointers"].as_array_mut().unwrap().push(serde_json::json!({
+            "name":"group_count", "shape":"[1]", "dtype":"int32", "role":"in"}));
+        // The manifest must name the compact-unit variant it was built from.
+        assert!(validate(&s).is_err());
+        s.geometry["serving_variant"] = serde_json::json!("k1_k23_coalesced");
+        validate_entry(&s, &e).unwrap();
+        for variant in ["baseline", "k1_compact_prefetch", "k1_paired_fc1", "k1_reg_pair_b2", "k1_unknown", ""] {
+            let mut bad = s.clone();
+            bad.geometry["serving_variant"] = serde_json::json!(variant);
+            assert!(validate(&bad).is_err(), "{variant}");
+        }
+        // Only the routed serving instance carries a variant.
+        let mut shared = s.clone();
+        shared.name = "exlr8_shared_a16_serving".into();
+        shared.geometry["top_k"] = serde_json::json!(1);
+        shared.geometry["max_groups"] = serde_json::json!(4);
+        for bytes in shared.scratch.values_mut() { *bytes /= 128; }
+        assert!(validate(&shared).is_err());
+        shared.geometry.as_object_mut().unwrap().remove("serving_variant");
+        validate(&shared).unwrap();
     }
 
     #[test]

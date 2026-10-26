@@ -34,12 +34,15 @@ pub(super) fn admit_mtp<'a>(
     let ownership = &admitted.ownership;
     for rank in 0..ownership.ranks() {
         let native =
-            Execution::serving_admission(programs, checkpoint, ownership, rank, inputs.rows)?;
+            Execution::serving_admission(programs, checkpoint, ownership, rank, inputs.unit_rows(), inputs.rows,
+                inputs.logit_rows())?;
         let shared = cuteafd_loader::plan::families::step5::native::rank_admission(
             checkpoint,
             ownership,
             rank,
+            inputs.unit_rows(),
             inputs.rows,
+            inputs.logit_rows(),
         )?;
         ensure!(
             native.immutable == shared.immutable && native.workspace == shared.workspace,
@@ -188,7 +191,7 @@ mod tests {
         ].into_iter().flat_map(|case| [cuteafd_loader::families::qwen4::Qwen4KvCache::Bf16,
             cuteafd_loader::families::qwen4::Qwen4KvCache::Fp8]
             .into_iter().map(move |format| (case, format))) {
-            let opts = LayoutOptions {
+            let opts = LayoutOptions { host_memory: Some((128 << 30, 128 << 30)),
                 step5_kv: kv_format,
                 rtx_bytes: vec![96 << 30; ranks],
                 pool_tokens: pool,
@@ -210,6 +213,28 @@ mod tests {
             assert_eq!(report.wip_launchable(), launchable,
                 "nvfp4={nvfp4} context={context} pool={pool:?} host={host:?} entries={entries}: {:?}", report.hints);
             assert!(!report.executable());
+            // The planner's automatic prefill unit (2048, or the step-down that
+            // keeps its pool) is what the daemon admits.
+            let (unit, waves, rows) = if launchable {
+                (report.prefill_unit_rows.unwrap() as usize,
+                    report.prefill_waves.unwrap() as usize,
+                    report.prefill_span_rows.unwrap() as usize)
+            } else {
+                // A refused plan has no admitted geometry. The daemon must also
+                // refuse the default shape rather than fabricate a resolved plan.
+                assert!(report.prefill_unit_rows.is_none());
+                assert!(report.prefill_span_rows.is_none());
+                (2048, 2, 4096)
+            };
+            assert_eq!(rows, unit * waves);
+            if launchable {
+                assert!([2048, 1024, 512].contains(&unit), "{unit}");
+                // Two in flight unless device-only retention at full context
+                // forces the default down to one.
+                assert!(waves == 2 || (waves == 1 && host == Some(0)), "waves {waves}");
+                assert!(report.prefill_selection.as_deref().is_some_and(|s|
+                    s.contains(&format!("{unit} rows x {waves} waves"))));
+            }
             let mut code = Vec::new();
             let gpus = opts
                 .rtx_bytes
@@ -244,7 +269,9 @@ mod tests {
                     spark_ranks: sparks,
                     peer_access: ranks == 2,
                 },
-                rows: 256,
+                rows,
+                full_prefill_logits: false,
+                waves,
                 sequences: 16,
                 context,
                 requested_pool: pool,

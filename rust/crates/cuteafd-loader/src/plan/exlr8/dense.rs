@@ -1,4 +1,4 @@
-//! Dormant native coordinator layouts. No serving path selects these yet.
+//! Checkpoint-native coordinator layouts and shared runtime/planner admission.
 use super::{Header, files, number};
 use anyhow::{Context, ensure};
 use serde::Serialize;
@@ -199,6 +199,34 @@ fn component(
             bytes,
         },
     })
+}
+
+/// One native dense lane: BF16 rotations/intermediates and decode-sized split-K scratch.
+pub fn scratch_bytes(cfg: &crate::families::glm5::GlmDsaConfig, heads: usize, inter: usize, rows: usize) -> usize {
+    let (h, q, ih) = (cfg.hidden, cfg.q_lora_rank, cfg.index_heads);
+    let max_k = [h, q, heads * cfg.v_head_dim, inter].into_iter().max().unwrap_or(0);
+    let max_n = [heads * (cfg.qk_nope_head_dim + cfg.qk_rope_head_dim), h, inter, ih * 128].into_iter().max().unwrap_or(0);
+    let splits = max_k.div_ceil(1024);
+    [rows * max_k * 2, 64, max_k / 128 * 2, rows.min(64) * splits * max_n * 4, rows * max_n * 4,
+        rows * (q + cfg.kv_lora_rank + cfg.qk_rope_head_dim) * 2, rows * heads * 256 * 2, rows * inter * 2,
+        rows * inter * 2, rows * inter * 2, rows * (128 + ih) * 2, rows * ih * 128 * 2, rows * heads * cfg.v_head_dim * 2]
+        .into_iter().map(|b| b.max(256).next_multiple_of(256)).sum()
+}
+
+/// Opt-in MX8 records are per prefill lane, never retained by decode lanes.
+pub fn a8_scratch_bytes(cfg: &crate::families::glm5::GlmDsaConfig, heads: usize, inter: usize, rows: usize) -> usize {
+    if rows <= 64 { return 0; }
+    let max_k = [cfg.hidden, cfg.q_lora_rank, heads * cfg.v_head_dim, inter].into_iter().max().unwrap_or(0);
+    (rows.div_ceil(16) * (max_k / 32) * 528).next_multiple_of(256)
+}
+
+/// One coordinator's native dense charge: decode scratch, plus every prefill lane's scratch and,
+/// with opt-in A8 prefill, its MX8 records. `cuteafd plan` and runtime admission both charge this.
+pub fn lane_charge_bytes(cfg: &crate::families::glm5::GlmDsaConfig, gpus: usize, decode_rows: usize,
+    prefill_rows: usize, lanes: usize, a8: bool) -> usize {
+    let (heads, inter) = (cfg.heads / gpus, cfg.dense_intermediate / gpus);
+    let a8 = if a8 { a8_scratch_bytes(cfg, heads, inter, prefill_rows) } else { 0 };
+    scratch_bytes(cfg, heads, inter, decode_rows) + lanes * (scratch_bytes(cfg, heads, inter, prefill_rows) + a8)
 }
 
 /// Read headers and tiny record tables only. The official checkpoint is not an input.
@@ -696,6 +724,50 @@ impl DensePlan {
     }
 }
 
+/// Coordinator resident bytes of a native GLM rank, grouped as the official
+/// `layout::glm5::resident_owned` groups them (group, format, bytes): every
+/// component its own allocation of at least 256 bytes (the loader's sizes), `kv_b` split per head into
+/// E4M3 `w_uk`/`w_uv` with one F32 scale per row and 64-wide tile, router on
+/// rank 0, vocabulary (embedding + head, one row-FP8 owner) on rank 0.
+pub fn resident_native(records: &[DenseRecord], world: usize, rank: usize, layers: usize, heads: usize,
+    nope: usize, v: usize, lat: usize) -> Result<Vec<(String, String, u64)>> {
+    (|| -> anyhow::Result<_> {
+        ensure!(heads % world == 0, "GLM heads do not split over {world} coordinators");
+        let plan = DensePlan::for_rank(records, world, rank)?;
+        let mut groups = std::collections::BTreeMap::<(String, String), u64>::new();
+        let mut put = |group: &str, format: &str, bytes: usize| -> anyhow::Result<()> {
+            ensure!(bytes > 0, "empty native dense allocation in {group}");
+            *groups.entry((group.into(), format.into())).or_default() += bytes.max(256) as u64;
+            Ok(())
+        };
+        for slice in &plan.tensors {
+            let Some(rest) = slice.tensor.strip_prefix("model.layers.") else {
+                let group = match slice.tensor.as_str() {
+                    "model.embed_tokens.weight" => "embedding", "lm_head.weight" => "lm_head", _ => "norm" };
+                for c in &slice.components { put(group, &c.dtype.to_lowercase(), c.source.bytes)?; }
+                continue;
+            };
+            let layer: usize = rest.split('.').next().context("layer index")?.parse()?;
+            if layer >= layers { continue; }
+            // kv_b lands as its split operands (below), not as a record.
+            if slice.tensor.ends_with(".self_attn.kv_b_proj.weight") { continue; }
+            let group = if slice.tensor.contains(".self_attn.indexer.") { "indexer" }
+                else if slice.tensor.contains(".self_attn.") { "attention" }
+                else if slice.tensor.ends_with(".mlp.gate.weight") || slice.tensor.ends_with(".mlp.gate.e_score_correction_bias") { "router" }
+                else if slice.tensor.contains(".mlp.") { "dense" } else { "norm" };
+            for c in &slice.components { put(group, &c.dtype.to_lowercase(), c.source.bytes)?; }
+        }
+        let local = heads / world;
+        for _ in 0..layers {
+            put("attention", "fp8", local * lat * nope)?;
+            put("attention", "fp8-scale", local * lat * (nope / 64) * 4)?;
+            put("attention", "fp8", local * v * lat)?;
+            put("attention", "fp8-scale", local * v * (lat / 64) * 4)?;
+        }
+        Ok(groups.into_iter().map(|((g, f), b)| (g, f, b)).collect())
+    })().map_err(Into::into)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -914,6 +986,30 @@ mod tests {
     }
 
     #[test]
+    fn a8_lane_records_scale_with_rows_and_vanish_at_decode_width() {
+        let cfg = crate::families::glm5::GlmDsaConfig::from_hf(&crate::plan::testing::glm5_config()).unwrap();
+        // TP2: widest K is o_proj's 32 heads x 256 = 8192; one MX8 record row is K/32 x 528 B per 16 rows.
+        let (heads, inter) = (cfg.heads / 2, cfg.dense_intermediate / 2);
+        let full = a8_scratch_bytes(&cfg, heads, inter, 4096);
+        assert_eq!(full, 256 * (8192 / 32) * 528);
+        assert_eq!(a8_scratch_bytes(&cfg, heads, inter, 2048) * 2, full);
+        assert_eq!(a8_scratch_bytes(&cfg, heads, inter, 65), 5 * (8192 / 32) * 528);
+        for rows in [0, 1, 63, 64] {
+            assert_eq!(a8_scratch_bytes(&cfg, heads, inter, rows), 0, "{rows} rows");
+        }
+        // Full width: K 16384.
+        assert_eq!(a8_scratch_bytes(&cfg, cfg.heads, cfg.dense_intermediate, 4096), 256 * (16384 / 32) * 528);
+        // The shared lane charge is decode plus lanes x (prefill scratch [+ records]).
+        for (gpus, lanes) in [(1, 1), (2, 3)] {
+            let (heads, inter) = (cfg.heads / gpus, cfg.dense_intermediate / gpus);
+            let (decode, prefill) = (scratch_bytes(&cfg, heads, inter, 64), scratch_bytes(&cfg, heads, inter, 4096));
+            let a8 = a8_scratch_bytes(&cfg, heads, inter, 4096);
+            assert_eq!(lane_charge_bytes(&cfg, gpus, 64, 4096, lanes, false), decode + lanes * prefill);
+            assert_eq!(lane_charge_bytes(&cfg, gpus, 64, 4096, lanes, true), decode + lanes * (prefill + a8));
+        }
+    }
+
+    #[test]
     fn plain_norms_have_no_native_blocks_or_tp_slice() {
         let root = tempfile::tempdir().unwrap();
         let path = trellis(root.path(), 2, 128, 0);
@@ -1064,5 +1160,25 @@ mod tests {
                     .is_empty()
             );
         }
+    }
+
+    /// The real checkpoint's native coordinator residency: TP2 ranks sum to the
+    /// census plus the kv_b split's scales (embedding/head on rank 0 only).
+    /// Set CUTEAFD_EXLR8_SNAPSHOT to the EXLR8 GLM 5.3 snapshot.
+    #[test]
+    #[ignore = "requires the EXLR8 GLM 5.3 checkpoint"]
+    fn real_checkpoint_native_residency() {
+        let snapshot = std::path::PathBuf::from(std::env::var("CUTEAFD_EXLR8_SNAPSHOT").expect("snapshot"));
+        let records = DenseRecord::inventory(&snapshot).unwrap();
+        let total = |groups: &[(String, String, u64)]| groups.iter().map(|g| g.2).sum::<u64>();
+        let one = super::resident_native(&records, 1, 0, 78, 64, 192, 256, 512).unwrap();
+        let ranks: Vec<_> = (0..2).map(|r| super::resident_native(&records, 2, r, 78, 64, 192, 256, 512).unwrap()).collect();
+        assert!(ranks[1].iter().all(|(g, _, _)| g != "embedding" && g != "lm_head" && g != "router"));
+        let (whole, r0, r1) = (total(&one), total(&ranks[0]), total(&ranks[1]));
+        eprintln!("native resident bytes: TP1 {whole}, TP2 {r0} + {r1}");
+        // Replicated q_a/kv_a/indexer/norms make the pair larger than one GPU.
+        assert!(r0 + r1 > whole && r0 > r1);
+        // Census 9.68 GiB logical (kv_b E4M3 bytes identical once split) plus split scales.
+        assert!((10_000_000_000..12_500_000_000).contains(&whole), "{whole}");
     }
 }

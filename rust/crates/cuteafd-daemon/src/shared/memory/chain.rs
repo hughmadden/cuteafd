@@ -69,8 +69,7 @@ pub(crate) struct StageChain<'a> {
     device: Cell<bool>,
 }
 impl<'a> StageChain<'a> {
-    /// Whether the next scoped pass may run device-ordered (with
-    /// [`device_enabled`]); default on.
+    /// Whether the next scoped pass runs device-ordered; default on.
     pub fn set_device_order(&self, on: bool) {
         self.device.set(on);
     }
@@ -90,10 +89,8 @@ impl<'a> StageChain<'a> {
                 library.cuda_set_device(device)?;
                 events.push((device, library.cuda_event_create_ordering()?));
                 forks.push((device, library.cuda_event_create_ordering()?));
-                if device_enabled() {
-                    fences.push(Fence { device, stream: library.cuda_stream_create()?,
-                        events: [library.cuda_event_create_ordering()?, library.cuda_event_create_ordering()?] });
-                }
+                fences.push(Fence { device, stream: library.cuda_stream_create()?,
+                    events: [library.cuda_event_create_ordering()?, library.cuda_event_create_ordering()?] });
             }
             Ok(())
         })();
@@ -249,60 +246,11 @@ pub(crate) fn enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var("CUTEAFD_STAGE_CHAIN").map_or(true, |v| v != "0"))
 }
 
-/// Whether chained V4.1 passes also drop the host waits that only kept
-/// copy-engine transfers from queuing behind unresolved events
-/// (`CUTEAFD_V41_DEVICE=1`, PLAN.md device-driven exchange, stage D3): peer
-/// transfers become SM copies ordered by device events and the host enqueues
-/// the next stage at once. Off by default; the default path is unchanged.
-pub(crate) fn device_enabled() -> bool {
-    device_setting() > 0
-}
-
-/// Whether V4.1 remote verification waves also use the device-driven Spark
-/// exchange (`CUTEAFD_V41_DEVICE=1`; `chain` keeps them on the host path).
-pub(crate) fn device_exchange_enabled() -> bool {
-    device_setting() > 1
-}
-
-/// `CUTEAFD_V41_DEVICE_LANES=1`: device-ordered passes also while both lanes
-/// are busy (off: a lane runs device-ordered only while the other is idle).
-pub(crate) fn device_with_lanes() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| matches!(std::env::var("CUTEAFD_V41_DEVICE_LANES").as_deref(), Ok("1" | "on")))
-}
-
-/// `CUTEAFD_V41_STAGING_FENCE=0`: device-ordered passes do not wait for the
-/// previous layer's staged uploads before preparing the next layer (stages
-/// whose pinned staging differs by layer keep one region per layer,
-/// `LayerStaging`), so the host can queue the pass ahead of the GPU.
-pub(crate) fn staging_fence() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| !matches!(std::env::var("CUTEAFD_V41_STAGING_FENCE").as_deref(), Ok("0" | "off")))
-}
-
-fn device_setting() -> u8 {
-    static SETTING: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
-    *SETTING.get_or_init(|| {
-        let setting = match std::env::var("CUTEAFD_V41_DEVICE").as_deref() {
-            Ok("1" | "on" | "true") => 2,
-            Ok("chain") => 1,
-            _ => 0,
-        };
-        if setting > 0 {
-            tracing::info!(exchange = setting > 1, "V4.1 device-ordered passes: chained stages enqueue without host waits");
-        }
-        setting
-    })
-}
-
 /// Device-ordered passes run under this watchdog: a pass still pending after
 /// `CUTEAFD_V41_DEVICE_WATCHDOG_S` (default 60) seconds is a device wait that
-/// never released (draining it would block forever), so the process logs every
-/// device lane's sequences and exits instead of holding the GPUs.
+/// never released (draining it would block forever), so the process logs it
+/// and exits instead of holding the GPUs.
 pub(crate) async fn watchdog<F: Future>(future: F) -> F::Output {
-    if !device_enabled() {
-        return future.await;
-    }
     static LIMIT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     let limit = *LIMIT.get_or_init(|| std::env::var("CUTEAFD_V41_DEVICE_WATCHDOG_S").ok()
         .and_then(|v| v.parse().ok()).unwrap_or(60));
@@ -310,17 +258,18 @@ pub(crate) async fn watchdog<F: Future>(future: F) -> F::Output {
     tokio::select! {
         output = &mut future => output,
         () = tokio::time::sleep(std::time::Duration::from_secs(limit)) => {
-            tracing::error!(limit_s = limit, lanes = %cuteafd_transport::expert::device_stuck_report(),
-                "device-ordered pass stuck: exiting (a device wait never released)");
+            tracing::error!(limit_s = limit, "device-ordered pass stuck: exiting (a device wait never released)");
             std::process::exit(70);
         }
     }
 }
 
-/// Inside a chain scope with [`device_enabled`]: stages that used to wait on
-/// the host for a producer stream join the chain instead.
+/// Inside a device-ordered chain scope: stages that used to wait on the host
+/// for a producer stream join the chain instead. Scopes are device-ordered
+/// unless the pass owner turned it off ([`StageChain::set_device_order`]:
+/// both V4.1 lanes busy).
 pub(crate) fn deferred() -> bool {
-    device_enabled() && CURRENT.with(|c| c.borrow().as_ref().is_some_and(|c| c.device))
+    CURRENT.with(|c| c.borrow().as_ref().is_some_and(|c| c.device))
 }
 
 pub(crate) struct ChainScope<'a, F> {

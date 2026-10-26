@@ -105,7 +105,7 @@ impl Opened {
             "Qwen dual selectable weight residency disagrees with admission");
         let ple = match self.cfg.ple_layers.first().copied().filter(|&layer| layer < layers) {
             Some(layer) => Some(devices[owners[layer]].run(|| ple::PleTable::load(&self.library, &self.checkpoint,
-                &self.cfg, layer, &args.table, args.prefill_rows.max(engine::DECODE_ROWS)))?), None => None,
+                &self.cfg, layer, &args.table, args.prefill_rows, 1, engine::DECODE_ROWS))?), None => None,
         };
         // Load the independent full-width draft before the target halves, with
         // its admitted arena rather than a post-allocation free-memory guess.
@@ -138,6 +138,7 @@ impl Opened {
         if let Some(budget) = args.l2.budget(&self.library, crate::shared::l2_prefetch::OTHER_DEFAULT)? {
             engine.l2 = Some(crate::shared::l2_prefetch::L2Prefetch::new(&self.library, budget, &engine.decode_read_order())?);
         }
+        engine.admit_host_memory(args)?;
         if args.full_prefill_logits { engine.prepare_scoring_prefill()?; }
         let result = body(&engine);
         engine.drain_state()?;

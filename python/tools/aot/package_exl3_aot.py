@@ -95,10 +95,26 @@ def verify(package: Path, revision: str | None = None, runtime: Path | None = No
             companions = compact_profiles(geometry, profiles_for_role('spark', geometry))
             widths = {dest: width for _, width, _, _, _, destinations in companions
                       for dest in destinations}
+            ws = meta.get('warp_specialized', False)
+            cw_tile = (ws_tile(geometry, manifest['role'], meta['intermediate'], meta['capacity'],
+                               compact=True) if ws else None)
             if (manifest['role'] != 'spark'
                     or widths.get(directory.split('/')[0]) != meta['intermediate']
-                    or len(meta['bits']) != 2 or meta.get('tile') != [64, 128, 64, 128]
-                    or meta.get('warp_specialized', False) or meta.get('decode_schedule') is not None
+                    or len(meta['bits']) != 2
+                    or (meta.get('tile') != (list(cw_tile) if cw_tile is not None else None) if ws
+                        else meta.get('tile') != [64, 128, 64, 128])
+                    or (ws and (not compact_ws_export(geometry, manifest['role'],
+                                                     meta['intermediate'], meta['capacity'],
+                                                     meta['bits'])
+                                or meta.get('route_block', 8) != compact_ws_route_block(
+                                    geometry, manifest['role'], meta['intermediate'], meta['capacity'])
+                                or meta.get('ws_dynamic_tiles', False) != ws_dynamic_tiles(
+                                    geometry, manifest['role'], meta['intermediate'], meta['capacity'],
+                                    compact=True)
+                                or meta.get('ws_input_stages') is not None
+                                or meta.get('token_major_rotation', False)
+                                or meta.get('fused_input_rotation', False)))
+                    or meta.get('decode_schedule') not in (None, 'l2=2,pf1=0,pf2=0,pdl=1')
                     or meta.get('input_format', 'bf16') != 'bf16'):
                 raise ValueError(f'EXL3 invalid compact geometry or execution contract: {directory}')
         if 'blocks_per_sm' in variant and variant['blocks_per_sm'] != meta.get('blocks_per_sm'):
@@ -125,13 +141,17 @@ def verify(package: Path, revision: str | None = None, runtime: Path | None = No
             raise ValueError(f'EXL3 variant fused input rotation mismatch: {directory}')
         if variant.get('warp_specialized', False) != meta.get('warp_specialized', False):
             raise ValueError(f'EXL3 variant warp specialization mismatch: {directory}')
+        if variant.get('ws_dynamic_tiles', False) != meta.get('ws_dynamic_tiles', False):
+            raise ValueError(f'EXL3 variant dynamic tile claim mismatch: {directory}')
+        if variant.get('ws_input_stages') != meta.get('ws_input_stages'):
+            raise ValueError(f'EXL3 variant input stage mismatch: {directory}')
         if variant.get('input_format', 'bf16') != meta.get('input_format', 'bf16'):
             raise ValueError(f'EXL3 variant input format mismatch: {directory}')
-        # A schedule variant lives in m<capacity>-<schedule> and its export
-        # records the options; a default directory records none.
+        # The variant records its exact compiled schedule, including defaults.
+        # Explicit schedule siblings must still carry a schedule and suffix.
         schedule = variant.get('schedule')
         if (variant.get('decode_schedule') != meta.get('decode_schedule')
-                or (schedule is None) != (meta.get('decode_schedule') is None)
+                or (schedule is not None and meta.get('decode_schedule') is None)
                 or directory.rsplit('/', 1)[-1] != f"m{meta['capacity']}"
                 + ('' if schedule is None else f'-{schedule}')):
             raise ValueError(f'EXL3 variant decode schedule mismatch: {directory}')
@@ -263,9 +283,11 @@ def swiglu_limit(geometry: str) -> float | None:
     return SWIGLU_LIMITS.get(geometry, 10.0)
 
 
-def route_block(geometry: str, capacity: int) -> int:
+def route_block(geometry: str, capacity: int, role: str) -> int:
     """Packed-route M block per capacity: rows of one expert that share a Trellis decode.
 
+    Callers state the role: 'coordinator' packages the whole intermediate on one
+    RTX GPU, 'spark' the GB10 per-rank shard.
     V4.1 keeps its qualified 8-row blocks everywhere. DeepSeek V4 Pro Spark prefill
     (H7168, 384 experts, top-6: ~64 rows per expert at 4096 rows) re-decodes every
     weight tile once per 8 rows, so wide prefill capacities use wider blocks
@@ -273,6 +295,12 @@ def route_block(geometry: str, capacity: int) -> int:
     m81..256 stays fastest at 8). At m4096, 64-row blocks skip their empty M16
     fragments (b12x 4d7cb455), so they beat 32 from about 2048 rows up. The coordinator's whole-intermediate rtx-tp1 package
     gains the same way (RTX PRO 6000, width 3072: m4096 74 -> 35 ms, m1024 23 -> 16 ms).
+    Kimi K3 coordinator prefill (H3584, 896 experts, top-16) widens
+    m1024/m2048/m2752 from 8-row blocks to 64-row blocks with token-major rotation
+    (RTX PRO 6000, K2/K3:
+    rtx-tp2 w1536 m1024 9134.7 -> 5150.3 us, rtx-tp1 w3072 m1024 18805.4 ->
+    10596.1 us; m4096 takes its _WS_S14 cell); Spark keeps 8 rows for cooperative
+    capacities.
     """
     # Build-time A/B knob: CUTEAFD_EXL3_ROUTE_BLOCKS=CAPACITY=BLOCK[,...].
     override = dict(item.split('=') for item in os.environ.get('CUTEAFD_EXL3_ROUTE_BLOCKS', '').split(',') if item)
@@ -282,8 +310,12 @@ def route_block(geometry: str, capacity: int) -> int:
         return qwen4_route_block(capacity)
     if geometry in ('glm', 'glmf'):
         return glm_route_block(capacity)
+    if geometry == 'kimik3':
+        return 64 if role == 'coordinator' and capacity in (1024, 2048, 2752) else 8
     if geometry != 'dsv4p' or capacity <= 256:
         return 8
+    if role == 'coordinator':
+        return 64
     return 16 if capacity <= 1024 else 64
 
 
@@ -309,14 +341,23 @@ def qwen4_route_block(capacity: int) -> int:
     return 8 if capacity <= 80 else 32
 
 
-def token_major_rotation(geometry: str, capacity: int) -> bool:
+def token_major_rotation(geometry: str, capacity: int, role: str) -> bool:
     """Whether a capacity rotates each token's input once for all of its routes.
 
+    Callers state the role, as for route_block: the answers differ per role.
     Bit-identical to per-route rotation. It pays where the rotation phase is
-    large (V4 Pro m2048..4096 prefill); at m1024 and below it is neutral.
+    large (V4 Pro m2048..4096 prefill); at m1024 and below it is neutral on Spark.
     """
     if geometry in ('glm', 'glmf', 'qwen4'):
         # GLM top-8 (rtx-tp1): m1024 3910 -> 3830 us, m4096 11790 -> 11470 us.
+        return capacity > 256
+    if geometry == 'kimik3':
+        return role == 'coordinator' and capacity in (1024, 2048, 2752)
+    if role == 'coordinator' and geometry == 'dsv4p':
+        # V4 Pro coordinator (RTX PRO 6000, K2/K3, m1024): 64-row blocks with
+        # token-major rotation improve rtx-tp2 w1536 4875.9 -> 4169.3 us (1.169x,
+        # vs _WS_S14 5220.0 us) and rtx-tp1 w3072 9396.5 -> 7891.6 us (1.191x,
+        # vs _WS_S14 10268.8 us). Spark keeps 16/False for cooperative m1024.
         return capacity > 256
     return geometry == 'dsv4p' and capacity > 1024
 
@@ -346,6 +387,108 @@ def fused_input_rotation(geometry: str, role: str, width: int, capacity: int) ->
     return False
 
 
+# Warp-specialized tile with 128-wide FC1 N tiles and a 256-wide FC2: every
+# coordinator rank width and hidden size is a whole 128 tiles, so FC1 never
+# straddles a live edge while FC2 halves the FC2 N tile count.
+TILE_RTX_MIXED = (64, 128, 64, 256)
+
+# Tier pairs measured for warp-specialized coordinator exports. Another tier
+# pair of the same geometry is a different kernel cost and stays cooperative.
+WS_TIER_PAIRS = {('glm', (4, 5)), ('glmf', (3, 4)), ('qwen4', (4, 5)),
+                 ('v41', (3, 4)), ('kimik3', (2, 3)), ('dsv4p', (2, 3))}
+
+# The S1/S4 arm as it exports on SM120: 128-wide FC1/256-wide FC2 tiles with
+# dynamic tile claims, 32-row route blocks at m256 and 64 rows above it.
+_WS_S14_M256 = dict(route_block=32, dynamic=True, tile=TILE_RTX_MIXED)
+_WS_S14 = dict(route_block=64, dynamic=True, tile=TILE_RTX_MIXED)
+
+# Coordinator (RTX SM120) warp-specialized prefill cells, keyed by
+# (geometry, width, capacity): the measured options each cell carries, against
+# the export the coordinator shipped before it. See `warp_specialized`.
+COORDINATOR_WS_CELLS: dict[tuple[str, int, int], dict] = {
+    ('glm', 1024, 256): dict(route_block=64, wire=True, stages=3, dynamic=True),
+    ('glm', 1024, 1024): dict(route_block=64, dynamic=True),
+    ('glm', 1024, 2752): dict(route_block=64),
+    ('glm', 1024, 2048): dict(route_block=64),
+    ('glm', 1024, 4096): dict(route_block=64, dynamic=True),
+    ('glm', 2048, 256): dict(route_block=64, dynamic=True),
+    ('glm', 2048, 4096): dict(route_block=64, dynamic=True),
+    ('glmf', 1024, 256): dict(route_block=64, dynamic=True),
+    ('glmf', 1024, 1024): dict(route_block=64, dynamic=True),
+    ('glmf', 1024, 2752): dict(route_block=64, dynamic=True),
+    ('glmf', 1024, 4096): dict(route_block=64, dynamic=True),
+    ('glmf', 1024, 2048): dict(route_block=64),
+    ('glmf', 2048, 256): dict(route_block=64),
+    ('dsv4p', 1536, 4096): dict(route_block=64, dynamic=True),
+    # Qwen 3.8 Flash Next wins at every served capacity, both RTX splits.
+    ('qwen4', 640, 256): _WS_S14_M256,
+    ('qwen4', 384, 256): _WS_S14_M256,
+    ('qwen4', 256, 256): _WS_S14_M256,
+    ('qwen4', 640, 1024): _WS_S14,
+    ('qwen4', 384, 1024): _WS_S14,
+    ('qwen4', 256, 1024): _WS_S14,
+    ('qwen4', 640, 2752): _WS_S14,
+    ('qwen4', 640, 2048): _WS_S14,
+    # TP2 rank0: N192 wins both exact prefill units on random and recorded routes.
+    ('qwen4', 384, 2752): dict(route_block=64, dynamic=True, tile=(64, 192, 64, 256)),
+    ('qwen4', 384, 2048): dict(route_block=64, dynamic=True, tile=(64, 192, 64, 256)),
+    ('qwen4', 256, 2752): dict(route_block=64, dynamic=True, tile=(64, 256, 64, 256)),
+    ('qwen4', 256, 2048): dict(route_block=64, dynamic=True, tile=(64, 256, 64, 256)),
+    ('qwen4', 640, 4096): _WS_S14,
+    ('qwen4', 384, 4096): _WS_S14,
+    ('qwen4', 256, 4096): _WS_S14,
+    # V4.1 EXL3 wins from m1024 up; m256 stays cooperative (0.77-0.84x).
+    ('v41', 2304, 1024): _WS_S14,
+    ('v41', 1152, 1024): _WS_S14,
+    ('v41', 2304, 2752): dict(route_block=64, dynamic=True, tile=(64, 256, 64, 256)),
+    ('v41', 2304, 2048): dict(route_block=64, dynamic=True, tile=(64, 256, 64, 256)),
+    ('v41', 1152, 2752): dict(route_block=64, dynamic=True, tile=(64, 192, 64, 256)),
+    ('v41', 1152, 2048): dict(route_block=64, dynamic=True, tile=(64, 192, 64, 256)),
+    ('v41', 2304, 4096): _WS_S14,
+    ('v41', 1152, 4096): _WS_S14,
+    # Kimi K3 m1024/m2048/m2752 take cooperative 64-row token-major rotation;
+    # m2048/m2752 beat N128 dynamic by 1.23-1.30x, exhaustively exact (#762).
+    # m4096 keeps its separately qualified N128 dynamic arm.
+    ('kimik3', 3072, 4096): _WS_S14,
+    ('kimik3', 1536, 4096): _WS_S14,
+}
+
+
+def coordinator_ws_cell(geometry: str, role: str, width: int, capacity: int) -> dict | None:
+    """Measured coordinator warp-specialized options for one export cell."""
+    if role != 'coordinator':
+        return None
+    return COORDINATOR_WS_CELLS.get((geometry, width, capacity))
+
+
+# Ordinary GB10 prefill cells qualified against shipped family controls (#762).
+SPARK_WS_CELLS = {
+    ('qwen4', 640): dict(dynamic=False, tile=(64, 128, 64, 128)),
+    ('qwen4', 384): dict(dynamic=True, tile=(64, 192, 64, 256)),
+    ('qwen4', 256): dict(dynamic=False, tile=(64, 256, 64, 256)),
+    ('qwen4', 128): dict(dynamic=True, tile=(64, 128, 64, 256)),
+    ('v41', 1152): dict(dynamic=True, tile=(64, 192, 64, 256)),
+    ('v41', 768): dict(dynamic=True, tile=(64, 256, 64, 256)),
+    ('v41', 640): dict(dynamic=True, tile=(64, 128, 64, 256)),
+    ('v41', 512): dict(dynamic=True, tile=(64, 256, 64, 256)),
+    ('v41', 384): dict(dynamic=True, tile=(64, 192, 64, 256)),
+}
+
+
+def spark_ws_cell(geometry: str, role: str, width: int, capacity: int) -> dict | None:
+    if role != 'spark' or capacity not in (2048, 2752):
+        return None
+    return SPARK_WS_CELLS.get((geometry, width))
+
+
+def ws_route_block(geometry: str, role: str, width: int, capacity: int) -> int:
+    """Packed-route M block of a warp-specialized prefill export (see
+    `warp_specialized`); every cell whose measured arm split the block by
+    capacity carries its own row count here."""
+    cell = coordinator_ws_cell(geometry, role, width, capacity)
+    return cell['route_block'] if cell else 64
+
+
 def warp_specialized(geometry: str, role: str, width: int, capacity: int) -> bool:
     """Whether a capacity exports the warp-specialized prefill kernels (b12x
     mixed_trellis_ws, 64-row route blocks): producer warps stream the Trellis
@@ -359,18 +502,293 @@ def warp_specialized(geometry: str, role: str, width: int, capacity: int) -> boo
     -> 15.47; single runs 3-25% faster for TP2/TP3/TP6 widths (tile-128
     GLM TP3 640 included) and at m128/m256. Decode capacities (<= 80 rows)
     keep the cooperative kernel.
+
+    SM120 RTX PRO 6000, 2026-10-24, H6144/E256/top8, K4 weights with
+    K5 slots, FP32 sums, common wire-roundtripped input, three interleaved
+    rounds of five graph replays (core + sum, no packing): width1024 BF16
+    WS random/72-histogram paired-median speedups m1024 1.080/1.059,
+    m2752 1.037/1.033. Width2048 m256 is 1.054/1.148; larger capacities
+    regress and stay cooperative. Width1024 m256 uses wire (see below).
+    GLM 5.3 Flash (H4096/E288/top8, K3/K4 tiers, 72 K4 experts per
+    projection, random top-8 routes, same harness): width1024 BF16 WS
+    (resolved 3 input stages, 1 CTA/SM) beats cooperative at m256
+    (1131.30 [1125.28, 1131.30, 1159.84] -> 1080.22 [1011.36, 1080.22,
+    1084.03] us, 1.047x) and m2752 (3454.34 [3242.66, 3454.34, 3480.51]
+    -> 3344.03 [3138.21, 3351.20, 3344.03] us, 1.033x); m1024 (1516.19
+    vs 1496.10 us, overlapping samples) and m4096 (5476.22 vs 5628.48 us)
+    stay cooperative, as does width2048 (m256 3120.77 vs 3022.50 us
+    inside round spread; m1024/m2752/m4096 cooperative 2817.63/6270.43/
+    7966.37 vs WS 2912.93/6357.66/8128.13 us).
+
+    SM120 RTX screen of the Spark S1/S4 arm, 2026-10-25: every EXL3 family
+    that onboards coordinator experts measured at its planner capacities
+    (256/1024/2752/4096; Kimi K64 256/1024/4096), random top-k routes, one
+    layer, median of five interleaved rounds of five graph replays, us
+    (cooperative -> the S1/S4 arm: 32-row route blocks at m256, 64 above,
+    FC1 N128 / FC2 N256, dynamic claims, BF16 input). Qwen 3.8 Flash Next
+    H2560/E512/top10 K4/K5, all faster: TP1 w640 m256 992.1 -> 894.6, m1024
+    1158.0 -> 1151.6, m2752 2151.1 -> 1841.8, m4096 4034.1 -> 3672.7;
+    TP2-r0 w384 663.2 -> 554.7 / 794.3 -> 714.4 / 1438.4 -> 1160.9 / 2097.8
+    -> 1948.3; TP2-r1 w256 507.6 -> 370.3 / 616.1 -> 492.4 / 1167.0 ->
+    854.7 / 1678.2 -> 1286.8. V4.1 EXL3 H5120/E384/top6 K3/K4 wins from
+    m1024: TP1 w2304 9371.2 -> 6976.1, m2752 18563.7 -> 9005.3, m4096
+    25005.7 -> 11996.8; TP2 w1152 5188.2 -> 3431.0 / 12582.5 -> 5465.5 /
+    16159.6 -> 6595.2; m256 stays cooperative (0.770/0.837). Kimi K3
+    H3584/E896/top16 K2/K3 takes 64-row token-major cooperative rotation at
+    m1024 (rtx-tp2 w1536: 8-row coop 9134.7, _WS_S14 6419.0, 64-row token-major
+    coop 5150.3 us, 1.246x vs _WS_S14; rtx-tp1 w3072: 8-row coop 18805.4,
+    _WS_S14 13262.4, 64-row token-major coop 10596.1 us, 1.252x vs _WS_S14) and
+    keeps _WS_S14 at m4096 (TP1 w3072 59715.2 -> 29736.6, TP2 w1536 33523.3 ->
+    17023.7); m256 stays 8-row cooperative (0.742/0.738). V4 Pro H7168/E384/top6
+    K2/K3 loses at every capacity (TP1 w3072 0.726/0.909/0.771/0.816, TP2
+    w1536 0.746/0.943/0.792/0.849), so it stays cooperative; the shipped GLM
+    5.3 and GLM 5.3 Flash cells keep their measured exports, which the
+    dynamic arm does not beat (glm TP2 w1024 m256 wire 1874.6 vs dynamic
+    2196.1, glm TP1 w2048 m256 3860.1 vs 4432.4, glmf TP2 w1024 m256 1049.0
+    vs 1223.6). Every arm is bitwise equal to the cooperative oracle, and
+    rows 1..128 of an m256 launch reproduce the batch prefix bit for bit with
+    every tail row poisoned individually (input, wire, weight, expert id).
+    Ties adopt the arm so that one kernel serves several families, per the
+    2026-10-25 rule; a cell with only the cooperative export is one the arm
+    measurably loses.
+    Other tier pairs, widths, families and unmeasured capacities stay off.
     """
-    if role != 'spark' or geometry not in ('dsv4p', 'glm', 'glmf'):
+    if role == 'coordinator':
+        return coordinator_ws_cell(geometry, role, width, capacity) is not None
+    if role != 'spark':
         return False
-    return capacity >= 256
+    if spark_ws_cell(geometry, role, width, capacity) is not None:
+        return True
+    if geometry == 'kimik3':
+        # Qualified ordinary TP6 slices; compact ownership and smaller packages stay off.
+        return width == 512 and capacity >= 1024
+    return geometry in ('dsv4p', 'glm', 'glmf') and capacity >= 256
+
+
+# Measured compact warp-specialized cells on GB10 (SM121), keyed by
+# (geometry, width): each qualified capacity maps to its measured
+# (route block, FC1 N tile). The packaged compact profile carries 256, 1024
+# and 4096, and 2752 is the planner's intermediate prefill unit. A cell that
+# is not listed here stays cooperative.
+COMPACT_WS_CELLS = {
+    # GLM 5.3 K4/K5 TP6 width 384. Round 2 (same-session A/B against the
+    # cooperative oracle and the entrant's N192 arm) found the 192-wide FC1
+    # tile wins from m1024 up: m4096 23.019 -> 13.023 ms N128 (1.768x) /
+    # 12.538 N192 (1.836x), m2752 16.646 -> 9.342 / 9.040, m1024 7.836 ->
+    # 4.627 / 4.601; at m256 the 32-row N128 arm stays best (4.351 -> 3.408,
+    # 1.277x, vs 3.413 for N192).
+    ('glm', 384): {256: (32, 128), 1024: (64, 192), 2048: (64, 192), 2752: (64, 192), 4096: (64, 192)},
+    # GLM 5.3 TP3 width 768: N192 wins from m1024 up (m4096 31.624 -> 22.012 /
+    # 21.206, m2752 23.474 -> 15.701 / 15.361, m1024 11.384 -> 8.297 / 8.237);
+    # m256 keeps the 64-row N128 arm (7.492 -> 6.527 vs 6.541 for N192).
+    ('glm', 768): {256: (64, 128), 1024: (64, 192), 2048: (64, 192), 2752: (64, 192), 4096: (64, 192)},
+    # V4.1 K3/K4 TP4 width 640 (the only uneven V4.1 world): the 32-row block
+    # wins m256/m1024 and the 64-row block m2752/m4096. Round 2 of the Spark
+    # duel measured a non-divisible 192-wide FC1 tile here (640 = 2 x 320-row
+    # halves -> 2 x 192-wide tiles with a 128-column masked tail, uniform
+    # top-6) faster than N128 at m256/m1024/m2752 (5.594 vs 5.630, 6.630 vs
+    # 6.766, 9.942 vs 10.093 ms) and slower at m4096 (13.868 vs 13.831), so
+    # N192 takes the three smaller capacities and m4096 keeps N128.
+    ('v41', 640): {256: (32, 192), 1024: (32, 192), 2048: (64, 192), 2752: (64, 192), 4096: (64, 128)},
+    # Qwen4 K4/K5 TP2 compact width 384: N192 wins m1024/m2752 (3.141 vs
+    # 3.159, 5.549 vs 5.596) and ties m4096 (7.570 vs 7.559), so the large
+    # capacities consolidate onto the same N192/64 arm as the GLM cells; only
+    # m256 keeps N128 with 32 rows (1.933 vs 1.938 for N192, and 1.978 for
+    # the 64-row arm).
+    ('qwen4', 384): {256: (32, 128), 1024: (64, 192), 2048: (64, 192), 2752: (64, 192), 4096: (64, 192)},
+    # TP3 and TP4 compact share width 256; one table entry serves both and
+    # takes 64 everywhere (TP3 m256 1.279x vs its 32-row arm 1.282x, TP4
+    # m256 1.334x vs 1.327x). Width 256 also rejects a 192-wide tile.
+    ('qwen4', 256): {256: (64, 128), 1024: (64, 128), 2048: (64, 128), 2752: (64, 128), 4096: (64, 128)},
+    # GLM Flash K3/K4 TP6 width 384: N192 from m1024 up (m4096 14.390 ->
+    # 8.526 / 8.307, m2752 10.108 -> 6.438 / 6.241, m1024 4.779 -> 3.175 /
+    # 3.062); m256 keeps 32-row N128 (2.814 -> 2.171 vs 2.177).
+    ('glmf', 384): {256: (32, 128), 1024: (64, 192), 2048: (64, 192), 2752: (64, 192), 4096: (64, 192)},
+    # GLM Flash TP3 width 768: N192 from m1024 up (m4096 20.085 -> 14.542 /
+    # 13.928, m2752 14.319 -> 11.093 / 10.848, m1024 6.792 -> 5.645 / 5.405);
+    # m256 keeps 32-row N128 (4.804 -> 4.140 vs 4.136).
+    ('glmf', 768): {256: (32, 128), 1024: (64, 192), 2048: (64, 192), 2752: (64, 192), 4096: (64, 192)},
+    # V4 Flash K4/K5 (H4096/E256/top6) synthetic weights, uniform top-6 routes:
+    # both compact worlds take the 32-row N128 arm at m256 and the 64-row N192
+    # arm from m1024 up. Kernel + top-k sum, ms (cooperative -> WS): TP6 width
+    # 384 m4096 24.939 -> 6.940 (3.593x), m2752 16.886 -> 5.131 (3.291x),
+    # m1024 6.819 -> 3.054 (2.233x), m256 3.095 -> 2.496 (1.240x); TP3 width
+    # 768 m4096 41.574 -> 11.948 (3.480x), m2752 28.691 -> 8.811 (3.256x),
+    # m1024 11.763 -> 5.439 (2.163x), m256 5.478 -> 4.807 (1.140x). Exhaustive
+    # 1..4096 prefix row invariance and poisoned-tail graph replays are
+    # bitwise equal to the cooperative oracle.
+    ('dsv4f', 384): {256: (32, 128), 1024: (64, 192), 2048: (64, 192), 2752: (64, 192), 4096: (64, 192)},
+    ('dsv4f', 768): {256: (32, 128), 1024: (64, 192), 2048: (64, 192), 2752: (64, 192), 4096: (64, 192)},
+}
+# Measured tier families of the compact WS cells; a different tier pair is a
+# different cell and stays cooperative until it is measured.
+COMPACT_WS_BITS = {('glm', (4, 5)), ('glmf', (3, 4)), ('v41', (3, 4)), ('qwen4', (4, 5)),
+                   ('dsv4f', (4, 5))}
+
+
+def compact_warp_specialized(geometry: str, role: str, width: int, capacity: int) -> bool:
+    """Whether a compact profile exports the warp-specialized prefill kernel.
+
+    Compact ownership shipped the cooperative kernel. On GB10 the same
+    warp-specialized export (FC1-N128/FC2-N256, or FC1-N192/FC2-N256 at the
+    measured large capacities) with 64-row route blocks and dynamic tile
+    claims is bit-identical to it and much faster at the served
+    GLM 5.3 K4 TP6 compact width 384: actual rotated H128 ownership, layer-7
+    recorded histograms plus uniform top-8, kernel + top-k sum, median of
+    three interleaved rounds of twenty graph replays, ms (cooperative -> ship,
+    uniform top-8 / recorded): m4096 24.08 -> 12.95 / 24.39 -> 13.16;
+    m2752 18.88 -> 9.60 / 17.83 -> 9.42; m1024 8.17 -> 4.79 / 8.66 -> 4.92;
+    m256 5.43 -> 3.78 / 5.44 -> 3.78 (32-row blocks there). Every graph
+    replay is bitwise equal to the cooperative oracle, including three
+    replays over poisoned workspaces.
+    Wire input loses here (0.706 at m4096), so it stays off; the three
+    input stages ride with it and have no separate arm.
+
+    Against the ordinary contiguous TP6 width-384 export (warp-specialized,
+    direct wire input, `TILE_384`, 64-row blocks, three input stages) this
+    compact arm is at parity at every capacity in the same session, ms
+    (compact / ordinary, uniform top-8 / recorded): m4096 12.95 / 13.16 vs
+    12.95 / 13.16; m2752 9.60 / 9.42 vs 9.72 / 9.47; m1024 4.79 / 4.92 vs
+    4.84 / 4.96; m256 3.78 / 3.78 vs 3.88 / 3.88. So the compact layout
+    recovers what the October 20 rotation moved off warp specialization.
+
+    GLM 5.3 K4 TP3 compact width 768 is the same arm on the planner's rotated
+    ownership at world 3 (live widths 640/768), layer-7 recorded histograms,
+    kernel + top-k sum, median of three interleaved rounds of twenty graph
+    replays, ms (cooperative -> warp-specialized, kernel reduction): m4096
+    31.30 -> 21.66 (-30.8%); m2752 23.26 -> 15.61 (-32.9%); m1024 11.34 ->
+    8.18 (-27.9%); m256 7.42 -> 6.53 (-12.0%). A 64-row block ties 32 at
+    m256 here and wins from m1024 up (m4096 21.66 vs 27.29), so every
+    qualified capacity takes 64. Every prefix row count in the gate, arm
+    output and three replays over poisoned workspaces are bitwise equal to
+    the cooperative oracle.
+
+    V4.1 K3/K4 TP4 compact width 640 follows the same ranking on uniform
+    top-6 routes: cooperative -> best arm, ms, at m4096 21.51 -> 13.40
+    (1.61x, 64-row), m2752 16.78 -> 9.64 (1.74x, 64-row), m1024 8.43 ->
+    6.46 (1.31x, 32-row), m256 6.38 -> 5.53 (1.15x, 32-row). The non-divisible
+    192-wide FC1 tile wins 1.5-2.0% at m256/m1024/m2752 and loses 0.27% at
+    m4096 (5.594/6.630/9.942/13.868 vs 5.630/6.766/10.093/13.831), so the
+    three smaller capacities take it. Qwen4 K4/K5
+    TP2 compact width 384 on layer-23 recorded histograms: m4096 11.54 ->
+    7.52 (1.53x, 64-row), m2752 8.48 -> 5.57 (1.52x), m1024 4.39 -> 3.15
+    (1.39x), m256 2.33 -> 1.93 (1.21x, 32-row). Qwen4 TP3 and TP4 compact
+    width 256 both take 64-row blocks at every capacity (TP4 m4096 9.02 ->
+    4.79, 1.88x; TP3 m4096 10.14 -> 5.75, 1.76x).
+
+    GLM Flash K3/K4 (H4096/E288/top8) TP6 compact width 384 on uniform
+    top-8 routes: m4096 14.39 -> 8.37 (1.72x), m2752 9.98 -> 6.43 (1.55x),
+    m1024 4.88 -> 3.20 (1.50x, 64-row against 1.45x at 32), m256 2.82 ->
+    2.17 (1.30x, 32-row). Its layer-7 histogram fixture does not exist, so
+    the timing is labelled uniform. TP3 compact width 768 on the same
+    uniform routes: m4096 20.25 -> 14.45 (1.40x), m2752 14.30 -> 11.05
+    (1.29x), m1024 6.74 -> 5.63 (1.20x, 64-row against 1.15x at 32),
+    m256 4.79 -> 4.13 (1.16x, 32-row against 1.15x at 64).
+
+    A second same-session round re-measured the shipped N128 arm against a
+    192-wide FC1 tile (`TILE_384_COMPACT_N192`, the Gemini entrant's arm;
+    `mixed_trellis_ws.py` masks the partial live N columns) on the four
+    cells whose width is a whole multiple of 192, kernel + top-k sum, ms
+    (cooperative -> N128 -> N192): GLM 5.3 TP6 w384 m4096 23.02 -> 13.02 ->
+    12.54, m2752 16.65 -> 9.34 -> 9.04, m1024 7.84 -> 4.63 -> 4.60, m256
+    4.35 -> 3.41 -> 3.41; GLM 5.3 TP3 w768 m4096 31.62 -> 22.01 -> 21.21,
+    m2752 23.47 -> 15.70 -> 15.36, m1024 11.38 -> 8.30 -> 8.24, m256 7.49
+    -> 6.53 -> 6.54; GLM Flash TP6 w384 m4096 14.39 -> 8.53 -> 8.31, m2752
+    10.11 -> 6.44 -> 6.24, m1024 4.78 -> 3.18 -> 3.06, m256 2.81 -> 2.17 ->
+    2.18; GLM Flash TP3 w768 m4096 20.09 -> 14.54 -> 13.93, m2752 14.32 ->
+    11.09 -> 10.85, m1024 6.79 -> 5.65 -> 5.41, m256 4.80 -> 4.14 -> 4.14.
+    N192 wins 1.9-4.4% from m1024 up, well beyond the identical-control
+    spread (<=0.9%), and ties or loses at m256, so those capacities take it
+    and m256 keeps the N128 tile. Qwen4 K4/K5 TP2 width 384 is also
+    divisible by 192: N192 wins there at m1024/m2752 (3.141 vs 3.159, 5.549
+    vs 5.596) and ties at m4096 (7.570 vs 7.559), so its large capacities
+    take the same N192/64 arm; m256 keeps N128/32. Ties consolidate onto the
+    wide arm already used by the other cells, which leaves three measured
+    variants over the whole compact policy: N128 with 32 rows (GLM 5.3
+    width 384, GLM Flash widths 384/768 and Qwen4 width 384 at m256, plus
+    V4.1 m256/m1024), N128 with 64 rows (GLM 5.3 width 768 at m256, Qwen4
+    width 256 at every capacity, V4.1 m2752/m4096), and N192 with 64 rows
+    (the GLM 5.3, GLM Flash and Qwen4 width-384 large capacities, plus V4.1
+    width 640 at m256..m2752). Qwen 4
+    width 256 cannot take a 192-wide tile. Every N192 arm is bitwise
+    equal to the cooperative oracle over the 195 row counts installed in
+    front of a real workload, and every graph replay is bitwise equal too.
+    The route blocks were re-measured in the same session; the only change
+    a tie allowed was GLM 5.3 width 768 m256, where 64 already matched the
+    rest of the cell within the spread.
+
+    The remaining tuning on GLM 5.3 TP3 width 768 found no other knob better
+    than the shipped shape: static tile claims cost 6-7% at m1024 and above,
+    FC2 N128 costs 4% at m4096, four input stages cost 6%, and resolved
+    (three) stages tie the default ring within 0.3% at every capacity.
+
+    Qualification is the measured capacity set of each listed cell only;
+    every other width, family and capacity stays cooperative.
+    `compact_ws_export` adds the measured tier family (`COMPACT_WS_BITS`:
+    GLM 5.3 K4/K5, GLM Flash K3/K4, V4.1 K3/K4, Qwen K4/K5, V4 Flash
+    K4/K5), so the same
+    geometry with another tier pair (GLM 5.3 K3/K4) stays cooperative until
+    that cell is measured.
+    """
+    return role == 'spark' and capacity in COMPACT_WS_CELLS.get((geometry, width), ())
+
+
+def compact_ws_export(geometry: str, role: str, width: int, capacity: int,
+                      bits) -> bool:
+    """Whether this exact compact cell exports the warp-specialized kernel.
+
+    `compact_warp_specialized` is the width/capacity policy; this adds the
+    measured tier family so an unmeasured quant of the same geometry (for
+    example GLM 5.3 K3/K4 at TP6 compact) stays cooperative.
+    """
+    return (compact_warp_specialized(geometry, role, width, capacity)
+            and (geometry, tuple(bits)) in COMPACT_WS_BITS)
+
+
+def compact_ws_route_block(geometry: str, role: str, width: int, capacity: int) -> int | None:
+    """Route block of a compact warp-specialized export, or None when off.
+
+    Measured per capacity (see `compact_warp_specialized`). Width 384: a
+    64-row block beats 32 from m1024 up (m1024 4.79 vs 5.76 ms); at m256,
+    with dynamic tile claims, 32 is 1.2% faster (3.78 vs 3.82), so the small
+    capacity keeps the 32-row block and larger ones take 64. Gemini's S1
+    round measured the same arm set independently and splits the same way.
+    Width 768 takes 64 at every capacity (m256 6.53 vs 6.52, m4096 21.66 vs
+    27.29). `COMPACT_WS_CELLS` holds both the route block and the FC1 tile
+    of every qualified capacity.
+    """
+    cell = COMPACT_WS_CELLS.get((geometry, width), {})
+    return cell[capacity][0] if role == 'spark' and capacity in cell else None
+
+
+def compact_ws_tile(geometry: str, role: str, width: int, capacity: int) -> tuple[int, ...] | None:
+    """FC1/FC2 tile of a compact warp-specialized export, or None when cooperative.
+
+    The 192-wide FC1 tile is measured on the widths divisible by 192 where it
+    wins from m1024 up, and on V4.1 width 640 at m256..m2752 (a non-divisible
+    width whose 128-column tail is masked, see `COMPACT_WS_CELLS`); the
+    capacities where it loses keep the N128 tile that names the cooperative
+    export's own geometry.
+    """
+    cell = COMPACT_WS_CELLS.get((geometry, width), {})
+    if role != 'spark' or capacity not in cell:
+        return None
+    return TILE_384_COMPACT_N192 if cell[capacity][1] == 192 else TILE_384_COMPACT
 
 
 # Warp-specialized tile (fc1_k, fc1_n, fc2_k, fc2_n) of widths that are odd
 # multiples of 128 and multiples of 192 (GLM 5.3 TP6 width 384).
 TILE_384 = (64, 192, 64, 256)
+# Compact widths are live at 256/384 H128 blocks, so FC1 keeps 128-wide N
+# tiles (a 192 tile straddles the live edge); FC2 widens over hidden size.
+TILE_384_COMPACT = (64, 128, 64, 256)
+# The measured 192-wide compact FC1 tile: only the cells whose width is a
+# whole multiple of 192 and whose large capacities were measured with it.
+TILE_384_COMPACT_N192 = (64, 192, 64, 256)
 
 
-def wire_input(geometry: str, role: str, width: int, capacity: int) -> bool:
+def wire_input(geometry: str, role: str, width: int, capacity: int, *,
+               compact: bool = False) -> bool:
     """Whether a warp-specialized export reads the FP8 E4M3 + UE8M0 K32 wire
     rows itself (the worker then skips its BF16 decode pass and FC1 gathers
     half the bytes). Bit-identical. One of the GLM 5.3 GB10 changes below.
@@ -381,35 +799,91 @@ def wire_input(geometry: str, role: str, width: int, capacity: int) -> bool:
     (with the 192-wide tile); 256 9.04 / 10.15 -> 7.34 / 9.36. Four input
     stages instead of three lose 0.2-0.8 ms at every width on K4/K5. Measured on
     GLM 5.3 only: GLM 5.3 Flash and V4 Pro keep the former exports until measured.
+
+    SM120 RTX PRO 6000, 2026-10-24, width1024 m256: cooperative 1737.66 us
+    -> wire/stage3/dynamic 1516.48 us (1.146x random, 1.204x median paired
+    across 72 histograms), conditions in `warp_specialized`. At m1024 wire
+    loses on random (0.927x); wider coordinator profiles keep BF16 input.
     """
+    if compact:
+        return False
+    if role == 'coordinator':
+        cell = coordinator_ws_cell(geometry, role, width, capacity)
+        return bool(cell and cell.get('wire'))
+    if role == 'spark' and width in (384, 640) and capacity in (2048, 2752):
+        return False
     return geometry == 'glm' and warp_specialized(geometry, role, width, capacity)
 
 
-def ws_input_stages(geometry: str, role: str, width: int, capacity: int) -> int | None:
+def ws_input_stages(geometry: str, role: str, width: int, capacity: int, *,
+                    compact: bool = False) -> int | None:
     """Input-row ring depth of the Spark warp-specialized exports: GB10 gathers
     the routed rows from LPDDR5X at high latency, and four stages (the ring the
     weight ring of 256-wide 4-bit tiles leaves room for) hide it; with K4/K5
     tiers three stages measure faster than four (see `wire_input`). Bit-identical.
+    Compact widths keep the resolved default: wire input loses at width 384
+    (see `compact_warp_specialized`), so its stages stay off too.
     """
-    return 3 if geometry == 'glm' and warp_specialized(geometry, role, width, capacity) else None
+    if compact:
+        return None
+    if role == 'coordinator':
+        cell = coordinator_ws_cell(geometry, role, width, capacity)
+        return cell.get('stages') if cell else None
+    return 3 if wire_input(geometry, role, width, capacity) else None
 
 
-def ws_dynamic_tiles(geometry: str, role: str, width: int, capacity: int) -> bool:
+def ws_dynamic_tiles(geometry: str, role: str, width: int, capacity: int, *,
+                     compact: bool = False) -> bool:
     """Whether Spark warp-specialized exports claim tiles dynamically. With the
     static round-robin an expert's route blocks start on different CTAs at
     different times and each streams the expert's weights from LPDDR5X (ncu,
     width 512 m2752: FC1 fills 1761 MB of LPDDR5X for 805 MB of weights).
     Bit-identical; the largest of the GLM 5.3 GB10 gains (see `wire_input`).
+    Compact width 384 takes them at every qualified capacity: m4096
+    13.89 -> 12.94 ms, m2752 10.07 -> 9.53, m1024 5.16 -> 4.99, and m256 ties
+    its static arm at 3.81 (see `compact_warp_specialized`).
     """
-    return geometry == 'glm' and warp_specialized(geometry, role, width, capacity)
+    if compact:
+        return compact_warp_specialized(geometry, role, width, capacity)
+    if role == 'coordinator':
+        cell = coordinator_ws_cell(geometry, role, width, capacity)
+        return bool(cell and cell.get('dynamic'))
+    if (cell := spark_ws_cell(geometry, role, width, capacity)) is not None:
+        return cell['dynamic']
+    if (role == 'spark' and capacity in (2048, 2752)
+            and ((geometry == 'glm' and width in (384, 640))
+                 or (geometry == 'glmf' and width in (256, 384, 512, 640, 768, 1024)))):
+        return True
+    return wire_input(geometry, role, width, capacity)
 
 
-def ws_tile(geometry: str, role: str, width: int, capacity: int) -> tuple[int, ...] | None:
+def ws_tile(geometry: str, role: str, width: int, capacity: int, *,
+            compact: bool = False) -> tuple[int, ...] | None:
     """Warp-specialized tile for widths that are odd multiples of 128, which
     the B12x policy gives 128-wide tiles on both stages (four consumer warps).
     Bit-identical (the N tiling does not change any accumulation). Width 384
     (GLM 5.3 TP6 ranks 0-3) takes 192-wide FC1 tiles: m4096 14.89 -> 12.8 ms.
+    Compact ownership keeps FC1 at 128 except in the measured cells where the
+    192-wide tile wins from m1024 up (`compact_ws_tile`), and widens FC2 over
+    the unchanged hidden size.
     """
+    if compact:
+        return compact_ws_tile(geometry, role, width, capacity)
+    if role == 'coordinator':
+        cell = coordinator_ws_cell(geometry, role, width, capacity)
+        return cell.get('tile') if cell else None
+    if (cell := spark_ws_cell(geometry, role, width, capacity)) is not None:
+        return cell['tile']
+    if ((geometry, role, width) == ('glmf', 'spark', 384)
+            and capacity in (2048, 2752)):
+        return TILE_384
+    if ((geometry, role, width) == ('glmf', 'spark', 640)
+            and capacity in (2048, 2752)):
+        return TILE_RTX_MIXED
+    # GB10 w640: FC2 N256 wins 2.2-5.0% at m1024..m4096; FC1 stays N128.
+    if ((geometry, role, width) == ('glm', 'spark', 640)
+            and capacity in (1024, 2048, 2752, 4096)):
+        return TILE_RTX_MIXED
     if (geometry != 'glm' or not warp_specialized(geometry, role, width, capacity)
             or width % 256 != 128 or width % 192):
         return None
@@ -460,6 +934,40 @@ DECODE_SCHEDULES = {
                             80: {'decode_schedule': 'gb10', 'tile': (64, 128, 64, 128),
                                  'blocks_per_sm': 2}}},
 }
+
+
+PURE_EVICT_FIRST = 'l2=2,pf1=0,pf2=0,pdl=1'
+
+
+def default_decode_schedule(geometry: str, role: str, profile: str,
+                            capacity: int, bits: list[int]) -> str | None:
+    """Only measured cooperative profiles use the pure streaming hint.
+
+    GB10, default/control/hint, three alternating rounds, rows 1..80: GLM
+    compact TP6 1.054..1.123x (control .997..1.002); Flash TP4 1.027..1.082x
+    (.997..1.001); Qwen compact TP4 1.003..1.094x (1.000..1.004); Kimi TP6
+    1.020..1.107x (.991..1.004). Compact m16 rows 2/4/8/16: GLM
+    1.067..1.119x (.995..1.003), Qwen 1.019..1.083x (.989..1.002).
+    RTX TP2 m1/m80: Flash median 1.015..1.144x (control .995..1.016),
+    GLM median 1.014..1.037x (.999..1.005), finite normalized fixtures.
+    Tiles, occupancy and arithmetic unchanged.
+    """
+    measured = {
+        ('glm', 'tp6-compact-width384', (4, 5)),
+        ('glmf', 'tp4-width512', (3, 4)),
+        ('qwen4', 'tp4-compact-width256', (4, 5)),
+        ('kimik3', 'tp6-width512', (2, 3)),
+    }
+    identity = (geometry, profile, tuple(bits))
+    measured_m16 = {('glm', 'tp6-compact-width384', (4, 5)),
+                    ('qwen4', 'tp4-compact-width256', (4, 5))}
+    if role == 'spark' and ((capacity in (1, 80) and identity in measured)
+                            or (capacity == 16 and identity in measured_m16)):
+        return PURE_EVICT_FIRST
+    measured_rtx = {('glm', 'rtx-tp2', (4, 5)), ('glmf', 'rtx-tp2', (3, 4))}
+    if role == 'coordinator' and capacity in (1, 80) and identity in measured_rtx:
+        return PURE_EVICT_FIRST
+    return None
 
 
 def decode_schedule_variants(geometry: str, role: str, profile: str,
@@ -732,9 +1240,11 @@ def package_capacities(geometry: str, requested: str) -> list[int]:
     if not capacities or any(v < 1 or v > 4096 for v in capacities):
         raise ValueError('EXL3 capacities must be in 1..4096')
     if geometry == 'kimik3':
+        # m16 takes K128 tiles that drift against M1 decode; rows 2..16 run on
+        # m80 (like GLM Flash). Every other capacity is allowed.
         capacities = [v for v in capacities if v != 16]
-        if any(v not in (1, 80, 256, 1024, 4096) for v in capacities) or not capacities:
-            raise ValueError('Kimi EXL3 requires K64 capacities 1,80,256,1024,4096')
+        if not capacities:
+            raise ValueError('Kimi EXL3 needs a capacity other than 16')
     return capacities
 
 
@@ -798,6 +1308,15 @@ def build(args: argparse.Namespace) -> None:
                 # path is what every existing build used.
                 profile_dir = (args.build_dir / profile if tile is None else
                                args.build_dir / f"{profile}+tile{'-'.join(map(str, tile))}")
+                compact_ws = compact and len(args.bits) == 2 and compact_ws_export(
+                    geometry, args.role, width, capacity, args.bits)
+                compact_block = (compact_ws_route_block(geometry, args.role, width, capacity)
+                                 if compact_ws else None)
+                if compact_block is not None:
+                    # N128 alone also names the cooperative export; separate its cache.
+                    dynamic = ws_dynamic_tiles(geometry, args.role, width, capacity, compact=True)
+                    profile_dir = profile_dir.with_name(
+                        f'{profile_dir.name}+ws-m{compact_block}-{"dynamic" if dynamic else "static"}')
                 raw = profile_dir / f'm{capacity}'  # one capacity, one directory
                 options = {'compact_weights': True} if compact else {}
                 if activation(geometry) != 'silu':
@@ -806,32 +1325,58 @@ def build(args: argparse.Namespace) -> None:
                     options['tile'] = tile
                 if geometry != 'v41':
                     options['hidden'] = hidden
-                block = route_block(geometry, capacity)
-                ws = len(args.bits) == 2 and tile is None and warp_specialized(geometry, args.role, width, capacity)
+                block = route_block(geometry, capacity, args.role)
+                ws = compact_ws or (len(args.bits) == 2 and tile is None
+                                    and (args.role != 'coordinator'
+                                         or (geometry, tuple(args.bits)) in WS_TIER_PAIRS)
+                                    and warp_specialized(geometry, args.role, width, capacity))
                 if ws:
-                    block = 64
+                    block = (compact_block if compact_block is not None
+                             else ws_route_block(geometry, args.role, width, capacity))
+                    if (geometry == 'kimik3' or args.role == 'coordinator'
+                            or (not compact and geometry in ('qwen4', 'v41'))):
+                        # Existing policy-keyed directories contain cooperative exports.
+                        # The input format and claim mode are part of the compiled
+                        # program, so they name its cache directory.
+                        if wire_input(geometry, args.role, width, capacity):
+                            suffix = '-wire-s3-dynamic'
+                        elif args.role == 'coordinator':
+                            dynamic = ws_dynamic_tiles(geometry, args.role, width, capacity)
+                            suffix = '-bf16-dynamic' if dynamic else '-bf16-static'
+                        else:
+                            suffix = ''
+                        profile_dir = profile_dir.with_name(f'{profile_dir.name}+ws-m{block}{suffix}')
+                        raw = profile_dir / f'm{capacity}'
                 if block != 8:
                     options['route_block'] = block
                 if ws:
                     options['warp_specialized'] = True
-                    if wire_input(geometry, args.role, width, capacity):
+                    if wire_input(geometry, args.role, width, capacity, compact=compact_ws):
                         options['wire_input'] = True
-                    if (stages := ws_input_stages(geometry, args.role, width, capacity)) is not None:
+                    if (stages := ws_input_stages(geometry, args.role, width, capacity,
+                                                 compact=compact_ws)) is not None:
                         options['ws_input_stages'] = stages
-                    if ws_dynamic_tiles(geometry, args.role, width, capacity):
+                    if ws_dynamic_tiles(geometry, args.role, width, capacity, compact=compact_ws):
                         options['ws_dynamic_tiles'] = True
-                    if (policy_tile := ws_tile(geometry, args.role, width, capacity)) is not None:
+                    if (policy_tile := ws_tile(geometry, args.role, width, capacity,
+                                              compact=compact_ws)) is not None:
                         options['tile'] = policy_tile
+                        if compact_ws and policy_tile[1] == 192:
+                            profile_dir = profile_dir.with_name(f'{profile_dir.name}-n192')
+                            raw = profile_dir / f'm{capacity}'
                 elif len(args.bits) == 2 and tile is None and fused_input_rotation(geometry, args.role, width, capacity):
                     options['fused_input_rotation'] = True
-                elif len(args.bits) == 2 and token_major_rotation(geometry, capacity):
+                elif len(args.bits) == 2 and token_major_rotation(geometry, capacity, args.role):
                     options['token_major_rotation'] = True
                 if (limit := swiglu_limit(geometry)) != 10.0:
                     options['swiglu_limit'] = limit
-                # The default export, then any decode-schedule variant of it: the
-                # same options plus a schedule, content-keyed in the build tree and
-                # installed as m<capacity>-<schedule> beside m<capacity>.
-                exports = [(None, raw, options)]
+                default_options = options
+                if (schedule_hint := default_decode_schedule(
+                        geometry, args.role, profile, capacity, args.bits)) is not None:
+                    raw = profile_dir.with_name(f'{profile_dir.name}+{schedule_hint}') / raw.name
+                    default_options = {**options, 'decode_schedule': schedule_hint}
+                # Explicit schedule siblings keep their original options and suffix.
+                exports = [(None, raw, default_options)]
                 for schedule, schedule_options in ([] if compact else decode_schedule_variants(
                         geometry, args.role, profile, capacity)):
                     exports.append((schedule, profile_dir.with_name(f'{profile_dir.name}+{schedule}')
@@ -879,10 +1424,15 @@ def build(args: argparse.Namespace) -> None:
                     variant['fused_input_rotation'] = True
                 if meta.get('warp_specialized'):
                     variant['warp_specialized'] = True
+                if meta.get('ws_dynamic_tiles'):
+                    variant['ws_dynamic_tiles'] = True
+                if meta.get('ws_input_stages') is not None:
+                    variant['ws_input_stages'] = meta['ws_input_stages']
                 if 'input_format' in meta:
                     variant['input_format'] = meta['input_format']
                 if schedule is not None:
                     variant['schedule'] = schedule
+                if meta.get('decode_schedule') is not None:
                     variant['decode_schedule'] = meta['decode_schedule']
                 variants.append(variant)
         files = {str(p.relative_to(stage)): {'bytes': p.stat().st_size, 'sha256': digest(p)}
@@ -936,7 +1486,7 @@ def main() -> None:
                              'tp3-width768=16:64,256,64,256; default is the B12x per-capacity policy')
     create.add_argument('--loopback', action='store_true',
                         help='Build Spark-role layouts for the SM120 coordinator GPU (loopback worker tests)')
-    create.add_argument('--capacities', default='1,16,80,256,1024,4096')
+    create.add_argument('--capacities', default='1,16,80,256,1024,2048,2752,4096')
     create.add_argument('--bits', type=int, nargs='+', default=[3, 4])
     create.add_argument('--build-dir', type=Path, required=True)
     create.add_argument('--output', type=Path, required=True)
