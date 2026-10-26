@@ -39,7 +39,7 @@ fn shared_catalog_rejects_the_same_unindexed_headers_as_standalone() {
 
 #[test]
 fn planner_publishes_kimi_runtime_default_and_explicit_units() {
-    let dir = snapshot(true);
+    let dir = snapshot(false);
     let input = testing::BudgetedPlanInput::open(dir.path()).unwrap();
     for (unit, waves, expected) in [(0, 0, (2752, 3, 8256)), (1024, 2, (1024, 2, 2048)),
         (4096, 1, (4096, 1, 4096)), (0, 4, (2048, 4, 8192)), (4096, 2, (4096, 2, 8192))] {
@@ -56,7 +56,7 @@ fn planner_publishes_kimi_runtime_default_and_explicit_units() {
 
 #[test]
 fn planner_resolves_every_spark_count_before_recipe_refusal() {
-    let dir = snapshot(true);
+    let dir = snapshot(false);
     let input = testing::BudgetedPlanInput::open(dir.path()).unwrap();
     for ranks in 0..=8 {
         let report = input.plan(&with_layout(ranks, None)).unwrap();
@@ -75,7 +75,7 @@ fn planner_resolves_every_spark_count_before_recipe_refusal() {
 
 #[test]
 fn planner_refuses_shapes_outside_shared_live_reserve() {
-    let dir = snapshot(true);
+    let dir = snapshot(false);
     let input = testing::BudgetedPlanInput::open(dir.path()).unwrap();
     for (unit, waves, span) in [(4096, 4, None), (4096, 3, None), (2753, 3, None),
         (2752, 3, Some(8192)), (2752, 3, Some(16384))] {

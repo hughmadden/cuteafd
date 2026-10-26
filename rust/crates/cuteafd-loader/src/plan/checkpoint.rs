@@ -1,16 +1,12 @@
 //! Family-independent view of a Hugging Face checkpoint: configuration JSON,
 //! the safetensors index and every shard header. Nothing here reads tensor data.
-use crate::{read_safetensors_metadata, SafetensorsTensorMetadata};
+use crate::{catalog::MAX_JSON_BYTES, read_safetensors_metadata, SafetensorsTensorMetadata};
 use anyhow::{ensure, Context, Result};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
-
-/// Bounds a metadata read, not tensor data. Kimi K3 EXL3 K2's index names
-/// 991,812 tensors (~100 MiB) and its GPTQModel storage map is ~141 MiB.
-const MAX_JSON_BYTES: u64 = 512 * 1024 * 1024;
 
 pub mod identity;
 
@@ -82,17 +78,7 @@ pub(crate) fn validate_index_headers(shard: &str, names: &BTreeSet<&str>,
 }
 
 pub fn read_json(path: &Path) -> Result<Value> {
-    let mut bytes = Vec::new();
-    File::open(path)
-        .with_context(|| format!("opening {}", path.display()))?
-        .take(MAX_JSON_BYTES + 1)
-        .read_to_end(&mut bytes)?;
-    ensure!(
-        bytes.len() as u64 <= MAX_JSON_BYTES,
-        "{} exceeds {MAX_JSON_BYTES} bytes",
-        path.display()
-    );
-    serde_json::from_slice(&bytes).with_context(|| format!("parsing {}", path.display()))
+    Ok(crate::read_json_file(path)?)
 }
 
 impl Checkpoint {

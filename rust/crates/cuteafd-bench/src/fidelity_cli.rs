@@ -402,7 +402,7 @@ pub fn execute(args: Args) -> Result<bool> {
         }
         Action::CompareFull { a_decode, b_decode, a_prefill, b_prefill, bootstrap, seed, out, cross_checkpoint, code_ab } => {
             let load = |path: PathBuf| -> Result<Run> {
-                Ok(serde_json::from_reader(std::fs::File::open(path)?)?)
+                Ok(cuteafd_loader::read_json_file(&path)?)
             };
             let hub = crate::fidelity_match::hub();
             let comparison = compare_full_paired(&load(a_decode)?, &load(b_decode)?,
@@ -416,7 +416,7 @@ pub fn execute(args: Args) -> Result<bool> {
         }
         Action::Compare { a, b, score_path, top1_margin, kl_margin, bootstrap, seed, out, cross_checkpoint, code_ab } => {
             let load = |path: PathBuf| -> Result<Run> {
-                let value: Value = serde_json::from_reader(std::fs::File::open(path)?)?;
+                let value: Value = cuteafd_loader::read_json_file(&path)?;
                 let value = if value["schema"] == "cuteafd.fidelity.run/2" { value } else { value[&score_path].clone() };
                 serde_json::from_value(value).context("missing selected scoring path")
             };

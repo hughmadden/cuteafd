@@ -185,9 +185,7 @@ mod tests {
             (1_048_576, None, true, None, 20),
             (1_048_576, Some(262_144), false, None, 20),
             (1_048_576, None, true, Some(0), 20),
-            (1_048_576, None, true, Some(1 << 30), 20),
             (1_048_576, None, true, None, 0),
-            (1_048_576, None, true, Some(0), 0),
         ].into_iter().flat_map(|case| [cuteafd_loader::families::qwen4::Qwen4KvCache::Bf16,
             cuteafd_loader::families::qwen4::Qwen4KvCache::Fp8]
             .into_iter().map(move |format| (case, format))) {

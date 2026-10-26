@@ -22,6 +22,65 @@ use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 
+/// Large EXL3 indices and storage maps are metadata, never tensor payloads.
+pub(crate) const MAX_JSON_BYTES: u64 = 512 * 1024 * 1024;
+
+#[derive(Debug, thiserror::Error)]
+pub enum JsonFileError {
+    #[error("reading JSON {path}: {source}")]
+    Io { path: std::path::PathBuf, #[source] source: std::io::Error },
+    #[error("parsing JSON {path}: {source}")]
+    Json { path: std::path::PathBuf, #[source] source: serde_json::Error },
+    #[error("JSON {path} exceeds {limit} bytes")]
+    TooLarge { path: std::path::PathBuf, limit: u64 },
+}
+
+/// Reads bounded JSON in bulk; an unbuffered serde reader makes one syscall per byte.
+pub fn read_json_file<T: serde::de::DeserializeOwned>(path: &Path) -> std::result::Result<T, JsonFileError> {
+    read_json_limited(path, MAX_JSON_BYTES)
+}
+
+fn read_json_limited<T: serde::de::DeserializeOwned>(path: &Path, limit: u64) -> std::result::Result<T, JsonFileError> {
+    let io = |source| JsonFileError::Io { path: path.to_owned(), source };
+    let oversized = || JsonFileError::TooLarge { path: path.to_owned(), limit };
+    let file = File::open(path).map_err(io)?;
+    if file.metadata().map_err(io)?.len() > limit { return Err(oversized()); }
+    let mut bytes = Vec::new();
+    file.take(limit + 1).read_to_end(&mut bytes).map_err(io)?;
+    if bytes.len() as u64 > limit { return Err(oversized()); }
+    serde_json::from_slice(&bytes).map_err(|source| JsonFileError::Json { path: path.to_owned(), source })
+}
+
+#[cfg(test)]
+mod json_tests {
+    use super::*;
+
+    #[test]
+    fn bulk_json_preserves_typed_decoding_and_strict_eof() {
+        #[derive(Debug, serde::Deserialize, PartialEq)]
+        struct Record { values: Vec<u64> }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.json");
+        let bytes = br#"{"values":[1,2,3]}  "#;
+        std::fs::write(&path, bytes).unwrap();
+        assert_eq!(read_json_limited::<Record>(&path, bytes.len() as u64).unwrap(), Record { values: vec![1, 2, 3] });
+        assert!(matches!(read_json_limited::<Record>(&path, bytes.len() as u64 - 1), Err(JsonFileError::TooLarge { .. })));
+        for bytes in [br#"{"values":[1]} false"#.as_slice(), br#"{"values":["#.as_slice(), br#"{"values":null}"#.as_slice()] {
+            std::fs::write(&path, bytes).unwrap();
+            assert!(matches!(read_json_file::<Record>(&path), Err(JsonFileError::Json { .. })));
+        }
+        std::fs::remove_file(&path).unwrap();
+        assert!(matches!(read_json_file::<Record>(&path), Err(JsonFileError::Io { .. })));
+    }
+
+    #[test]
+    fn bulk_json_rejects_oversized_sparse_metadata_before_allocation() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        file.as_file().set_len(MAX_JSON_BYTES + 1).unwrap();
+        assert!(matches!(read_json_file::<Value>(file.path()), Err(JsonFileError::TooLarge { .. })));
+    }
+}
+
 const EXTERNAL_QUANTIZATION_CONFIG_FILES: [&str; 2] =
     ["quantize_config.json", "quantization_config.json"];
 
@@ -122,10 +181,8 @@ pub fn build_catalog_for_snapshot(model_id: &str, snapshot_path: &Path) -> Resul
         facts.quantization_recipe
     );
     let index_path = snapshot_path.join("model.safetensors.index.json");
-    let index: SafetensorsIndex = serde_json::from_reader(
-        File::open(&index_path).with_context(|| format!("opening {}", index_path.display()))?,
-    )
-    .with_context(|| format!("parsing {}", index_path.display()))?;
+    let index: SafetensorsIndex = crate::read_json_file(&index_path)
+        .with_context(|| format!("parsing {}", index_path.display()))?;
 
     let files = index
         .weight_map
@@ -240,10 +297,8 @@ pub fn read_safetensors_metadata(path: &Path) -> Result<Vec<SafetensorsTensorMet
 
 pub fn read_model_facts(model_id: &str, snapshot_path: &Path) -> Result<ModelFacts> {
     let config_path = snapshot_path.join("config.json");
-    let config: ConfigFile = serde_json::from_reader(
-        File::open(&config_path).with_context(|| format!("opening {}", config_path.display()))?,
-    )
-    .with_context(|| format!("parsing {}", config_path.display()))?;
+    let config: ConfigFile = crate::read_json_file(&config_path)
+        .with_context(|| format!("parsing {}", config_path.display()))?;
     anyhow::ensure!(
         config.model_type == "deepseek_v4",
         "unsupported model_type {:?} for {model_id}; CUTEAFD requires deepseek_v4",
@@ -425,10 +480,8 @@ pub(crate) fn resolve_model_quantization_config<'a>(
         if !path.is_file() {
             continue;
         }
-        let full: Value = serde_json::from_reader(
-            File::open(&path).with_context(|| format!("opening {}", path.display()))?,
-        )
-        .with_context(|| format!("parsing {}", path.display()))?;
+        let full: Value = crate::read_json_file(&path)
+            .with_context(|| format!("parsing {}", path.display()))?;
         anyhow::ensure!(
             full.is_object(),
             "external EXL3 quantization config {} must be a JSON object",
