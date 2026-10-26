@@ -565,10 +565,10 @@ impl<'a> GlmEngine<'a> {
         }
     }
 
-    /// Runs `body` with rank `rank`'s device current (this engine's device again after).
+    /// Runs `body` with rank `rank`'s device current, preserving the caller's device.
     pub(crate) fn on<T>(&self, rank: usize, body: impl FnOnce() -> Result<T>) -> Result<T> {
         match (rank, &self.peer) {
-            (1, Some(peer)) => crate::shared::peer_split::on_device(self.library, peer.device, self.device, body),
+            (1, Some(peer)) => crate::shared::peer_split::on_device(self.library, peer.device, body),
             _ => body(),
         }
     }

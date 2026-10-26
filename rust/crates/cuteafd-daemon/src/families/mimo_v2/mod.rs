@@ -902,7 +902,7 @@ impl Opened {
         // The configured bound remains a sanity cap, not a reserved GiB.
         let module_bound = cuteafd_loader::families::mimo_v2::admission::tensor_bytes("MiMo module sanity bound", &[args.runtime_reserve_mib, 1 << 20])?;
         for device in std::iter::once(args.device).chain(split_device) {
-            crate::shared::peer_split::on_device(&self.library, device, args.device, || {
+            crate::shared::peer_split::on_device(&self.library, device, || {
                 let before = self.library.cuda_memory_info()?.0;
                 let family = self.cfg.program_family()?;
                 let split_cfg = self.cfg.head_split(if split_device.is_some() { 2 } else { 1 })?;
@@ -1146,7 +1146,7 @@ impl Opened {
             // succeeds. Its caller still owns the created peer stream on an
             // earlier failure, so engine-only drainage cannot certify it.
             if let Some((device, peer_owned)) = uninstalled_peer {
-                crate::shared::peer_split::on_device(&self.library, device, args.device, || {
+                crate::shared::peer_split::on_device(&self.library, device, || {
                     // SAFETY: the stream is still owned by this scope; no peer
                     // wait was submitted before attach_peer installed exchange.
                     unsafe { self.library.cuda_stream_synchronize(peer_owned)?; }

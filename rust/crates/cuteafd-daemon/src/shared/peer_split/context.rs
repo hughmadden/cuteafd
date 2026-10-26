@@ -203,7 +203,7 @@ impl<'a> ContextExchange<'a> {
             "partial rows of {} B are not [H, 512] BF16 + [H] FP32", layout.partial_bytes);
         let bytes = usize::try_from(layout.bytes().context("context exchange bytes overflow")?)?;
         let side = |rank: usize| -> Result<DeviceAllocation<'a>> {
-            on_device(library, ranks[rank].device, ranks[0].device, || {
+            on_device(library, ranks[rank].device, || {
                 library.cuda_enable_peer(ranks[1 - rank].device)?;
                 library.peer_exchange_initialize()?;
                 let allocation = DeviceAllocation::new(library, bytes)?;
@@ -287,7 +287,7 @@ impl<'a> ContextExchange<'a> {
         // final on this stream and unchanged until later work on it; local and
         // peer destinations are this exchange's buffers, read by their GPU only
         // after the matching wait (local ones are stream-ordered after the push).
-        on_device(self.library, self.ranks[from].device, self.ranks[0].device, || unsafe {
+        on_device(self.library, self.ranks[from].device, || unsafe {
             self.library.peer_push_planes(planes, Some(link), 0, self.ranks[from].stream)
         })
     }
@@ -298,7 +298,7 @@ impl<'a> ContextExchange<'a> {
         let recv_state = flag.wrapping_add(3);
         // SAFETY: this GPU's control words; the matching push is queued by the
         // peer before or after, in the order `order::fixtures` checks.
-        on_device(self.library, self.ranks[at].device, self.ranks[0].device, || unsafe {
+        on_device(self.library, self.ranks[at].device, || unsafe {
             match self.abort {
                 Some(words) => self.library.peer_wait_abortable(flag, recv_state, words[at], self.ranks[at].stream),
                 None => self.library.peer_wait(flag, recv_state, self.ranks[at].stream),

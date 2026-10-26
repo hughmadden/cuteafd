@@ -178,7 +178,7 @@ impl<'a> HopLink<'a> {
         let per_lane = [0u8, 1].map(|gpu| hops.iter().filter(|h| h.charged() && h.to == gpu).count()
             .min(HOP_SLOTS as usize));
         let end = |rank: usize| -> Result<End<'a>> {
-            on_device(library, ranks[rank].device, ranks[0].device, || {
+            on_device(library, ranks[rank].device, || {
                 library.cuda_enable_peer(ranks[1 - rank].device)?;
                 library.peer_exchange_initialize()?;
                 let zeroed = |bytes: usize| -> Result<DeviceAllocation<'a>> {
@@ -269,7 +269,7 @@ impl<'a> HopLink<'a> {
         // the sender's stream and unchanged until later work on it; the
         // destination slot is read only after its matching wait, and the
         // executor reuses a slot only after the destination consumed it.
-        on_device(self.library, self.ranks[from].device, self.ranks[0].device, || unsafe {
+        on_device(self.library, self.ranks[from].device, || unsafe {
             self.library.peer_push_signal(destination, source, bytes, theirs.flag(flag), mine.send_state(flag), 0,
                 self.ranks[from].stream)
         })?;
@@ -281,7 +281,7 @@ impl<'a> HopLink<'a> {
     pub fn land(&self, ticket: HopTicket) -> Result<*mut c_void> {
         let end = &self.ends[ticket.to];
         // SAFETY: this GPU's control words; the matching push was queued by `send`.
-        on_device(self.library, self.ranks[ticket.to].device, self.ranks[0].device, || unsafe {
+        on_device(self.library, self.ranks[ticket.to].device, || unsafe {
             match self.abort {
                 Some(abort) => self.library.peer_wait_abortable(end.flag(ticket.flag), end.recv_state(ticket.flag),
                     abort[ticket.to], self.ranks[ticket.to].stream),
@@ -391,7 +391,7 @@ mod cuda_tests {
         library.cuda_set_device(0)?;
         let mut ranks = [RankDevice { device: 0, stream: std::ptr::null_mut() }, RankDevice { device: 1, stream: std::ptr::null_mut() }];
         for rank in &mut ranks {
-            rank.stream = on_device(&library, rank.device, 0, || library.cuda_stream_create())?;
+            rank.stream = on_device(&library, rank.device, || library.cuda_stream_create())?;
         }
         let result = (|| -> Result<()> {
             let link = HopLink::new(&library, ranks, &hops, spec)?;
@@ -414,7 +414,7 @@ mod cuda_tests {
                 for (index, hop) in hops.iter().enumerate() {
                     let from = usize::from(hop.from);
                     let pattern: Vec<u8> = (0..bytes).map(|i| (i * 7 + lane * 13 + index * 31) as u8).collect();
-                    let source = on_device(&library, from as i32, 0, || {
+                    let source = on_device(&library, from as i32, || {
                         let source = DeviceAllocation::new(&library, bytes)?;
                         library.copy_h2d(source.buffer, &pattern)?;
                         Ok(source)
@@ -423,7 +423,7 @@ mod cuda_tests {
                     let landed = link.land(ticket)?;
                     let to = usize::from(hop.to);
                     let mut out = vec![0u8; bytes];
-                    on_device(&library, to as i32, 0, || {
+                    on_device(&library, to as i32, || {
                         // SAFETY: the destination stream waited for the push; the source drains with its stream.
                         unsafe { library.cuda_stream_synchronize(ranks[to].stream)? };
                         unsafe { library.cuda_stream_synchronize(ranks[from].stream) }.ok();
@@ -431,13 +431,13 @@ mod cuda_tests {
                             device_id: to as i32, flags: 0 })
                     })?;
                     assert_eq!(out, pattern, "lane {lane} hop {index}");
-                    on_device(&library, from as i32, 0, || { drop(source); Ok(()) })?;
+                    on_device(&library, from as i32, || { drop(source); Ok(()) })?;
                 }
             }
             Ok(())
         })();
         for rank in ranks {
-            on_device(&library, rank.device, 0, || {
+            on_device(&library, rank.device, || {
                 // SAFETY: nothing else uses the test streams.
                 unsafe { library.cuda_stream_synchronize(rank.stream)?; library.cuda_stream_destroy(rank.stream) }
             })?;
