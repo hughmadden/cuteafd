@@ -96,25 +96,29 @@ fn fp8_owner_bytes(family: &str, geometry: cuteafd_core::ExpertGeometry, formats
     Ok(cuteafd_core::OwnerBytes { scratch, io, pinned_staging: 0 })
 }
 
-/// EXL3 retained arena maxima plus private capacity state at the 4096-row
-/// export (#762 census; native V4 stays at its 208 MiB slot), and the m1/m16/m80
-/// decode set's retained bytes (installed SM121 exports, 2026-10-24: largest
-/// GLM tp1 50,445,548 B). Input/route planes at the owner's rows.
+/// EXL3 owner bytes. Prefill-scale exports charge the calibrated retained
+/// arena maxima plus private capacity state (#762 census totals, which include
+/// 4096 rows of K32 wire/routes; those rows are re-charged as the owner's I/O
+/// at its own capacity). Decode exports (m80 and below) charge the m1/m16/m80
+/// retained set (installed SM121 exports, 2026-10-24: largest GLM tp1
+/// 50,445,548 B). Ownership-tagged routes stage per queued unit.
 pub(crate) fn exl3_owner_bytes(family: &str, geometry: cuteafd_core::ExpertGeometry, extent: cuteafd_core::OwnerExtent)
     -> anyhow::Result<cuteafd_core::OwnerBytes> {
     const DECODE_SET: u64 = 51 * (1 << 20);
     let hidden = u64::from(geometry.hidden);
     let topk = u64::from(geometry.topk);
+    let row = hidden + hidden / 32 + 8 * topk;
     let scratch = if extent.compiled <= 80 { DECODE_SET } else {
-        match family {
+        let total = match family {
             "glm5_flash" => 607 * (1 << 20),
             "deepseek_v4" | "deepseek_v41" => 810 * (1 << 20),
-            "kimi_k3" => crate::families::kimi_k3::SPARK_SLOT_BYTES - 4096 * (3584 + 3584 / 32 + 8 * 16),
-            "qwen4" => 644 * (1 << 20),
-            _ => anyhow::bail!("no calibrated Spark EXL3 scratch for {family}; add the package census (#776)"),
-        }
+            "kimi_k3" => crate::families::kimi_k3::SPARK_SLOT_BYTES,
+            other => spark_slot_bytes(other, 4096),
+        };
+        anyhow::ensure!(total > 0, "no calibrated Spark EXL3 scratch for {family}; add the package census (#776)");
+        total.saturating_sub(4096 * row)
     };
-    Ok(cuteafd_core::OwnerBytes { scratch, io: u64::from(extent.capacity) * (hidden + hidden / 32 + 8 * topk),
+    Ok(cuteafd_core::OwnerBytes { scratch, io: u64::from(extent.capacity) * row,
         pinned_staging: u64::from(extent.staging_rows) * topk * 8 })
 }
 
@@ -316,14 +320,13 @@ mod tests {
             items: vec![], kv_tokens: 0 };
         let mut charged = Vec::new();
         for (unit, waves) in [(4096, 1), (4096, 2), (2752, 3), (2048, 4)] {
-            let executions = crate::plan::spark_executions::admit_ladder("deepseek_v41",
+            let executions = crate::plan::spark_executions::admit_family("deepseek_v41",
                 &crate::plan::spark_executions::SparkBackend::for_catalog(input.expert_catalog()?)?.exports(),
                 None, unit, waves)?;
             charge_executions(&mut device, &input, &working, "deepseek_v41", &executions)?;
             let owners = device.items.iter().find(|item| item.group == "execution owners").unwrap().bytes;
             let staging = device.items.iter().find(|item| item.group == "execution staging").unwrap().bytes;
-            let hidden = 4096u64 * (5120 + 5120 / 32 + 6 * 8);
-            assert_eq!(owners, 810 * (1 << 20) + hidden + 2 * (51 * (1 << 20) + 64 * (5120 + 5120 / 32 + 6 * 8)));
+            assert_eq!(owners, 810 * (1 << 20) + 2 * (51 * (1 << 20) + 64 * (5120 + 5120 / 32 + 6 * 8)));
             assert_eq!(staging, 2 * 64 * 6 * 8 + unit * waves * 6 * 8);
             charged.push(owners);
         }

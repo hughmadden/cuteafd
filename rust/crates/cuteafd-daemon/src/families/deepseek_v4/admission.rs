@@ -34,6 +34,26 @@ pub(crate) struct Inputs<'a> {
 
 #[cfg(test)]
 mod spark_tests {
+
+    fn planned(family: &str, backend: cuteafd_loader::plan::spark_executions::SparkBackend, decode: Option<u32>,
+        unit: u64, waves: u64) -> cuteafd_core::SparkExecutions {
+        let options = cuteafd_loader::plan::layout::LayoutOptions { prefill_unit_rows: Some(unit),
+            prefill_waves: waves, ..Default::default() };
+        cuteafd_loader::plan::layout::planned_spark_executions(family, backend, decode, &options).unwrap()
+    }
+
+    #[test]
+    fn planner_and_serve_admit_identical_spark_owners() -> anyhow::Result<()> {
+        use cuteafd_loader::plan::spark_executions::SparkBackend;
+        for backend in [SparkBackend::Fp8, SparkBackend::Native, SparkBackend::Exl3(cuteafd_core::Exl3RowPolicy::Nearest)] {
+            for (waves, unit) in [(1usize, 4096usize), (2, 4096), (3, 2752), (4, 2048)] {
+                assert_eq!(super::spark_model(backend, 64, unit, waves)?.executions,
+                    planned("deepseek_v4", backend, Some(64), unit as u64, waves as u64));
+            }
+        }
+        Ok(())
+    }
+
     #[test]
     fn v4_spark_endpoints_match_the_decode_and_prefill_links() -> anyhow::Result<()> {
         use cuteafd_loader::plan::spark_executions::SparkBackend;
@@ -57,7 +77,7 @@ pub(crate) fn spark_model(backend: cuteafd_loader::plan::spark_executions::Spark
     decode_rows: usize, unit_rows: usize, waves: usize) -> Result<cuteafd_transport::worker_selection::ModelAdmission> {
     use cuteafd_core::{SparkEndpoint, SparkIngress};
     // The installed coordinator manifest fixes this build's decode rows.
-    let executions = cuteafd_loader::plan::spark_executions::admit_ladder("deepseek_v4", &backend.exports(),
+    let executions = cuteafd_loader::plan::spark_executions::admit_family("deepseek_v4", &backend.exports(),
         Some(u32::try_from(decode_rows)?), unit_rows as u64, waves as u64)?;
     let endpoints = vec![
         SparkEndpoint { ring_depth: None, capacity: u32::try_from(decode_rows)?, ingress: SparkIngress::Fp8K32 },

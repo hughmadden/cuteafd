@@ -963,7 +963,7 @@ impl Opened {
             // MiMo lanes are independent links; each lane's unit queues on the one prefill owner.
             let catalog = self.catalog.as_ref().context("MiMo Spark admission requires routed expert headers")?;
             let lanes = preflight.working_set.prefill_lanes;
-            let executions = cuteafd_loader::plan::spark_executions::admit_ladder("mimo_v2",
+            let executions = cuteafd_loader::plan::spark_executions::admit_family("mimo_v2",
                 &cuteafd_loader::plan::spark_executions::SparkBackend::for_catalog(catalog)?.exports(), None,
                 u64::from(capacity), lanes)?;
             let model = cuteafd_transport::worker_selection::ModelAdmission::new(

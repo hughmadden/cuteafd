@@ -19,6 +19,7 @@ pub struct DeepSeek {
     decode_lanes: u8,
     /// Rows one decode/verify step sends a Spark (V4.1: `V41_VERIFY_ROWS`).
     decode_rows: u32,
+    spark_prefill: crate::plan::spark_executions::SparkPrefill,
 }
 
 pub static DEEPSEEK_V41: DeepSeek = DeepSeek {
@@ -29,6 +30,8 @@ pub static DEEPSEEK_V41: DeepSeek = DeepSeek {
     prefill: crate::serving_capacity::prefill_waves::PrefillEstimate::Unmeasured,
     decode_lanes: 2,
     decode_rows: cuteafd_core::V41_VERIFY_ROWS as u32,
+    // The CED executor's two encoder streams queue its live chunk.
+    spark_prefill: crate::plan::spark_executions::SparkPrefill::Streams(2),
 };
 pub static DEEPSEEK_V4: DeepSeek = DeepSeek {
     id: "deepseek_v4",
@@ -41,6 +44,7 @@ pub static DEEPSEEK_V4: DeepSeek = DeepSeek {
     decode_lanes: 1,
     // Installed V4 coordinator manifests fix `decode_rows`; serve passes it.
     decode_rows: 64,
+    spark_prefill: crate::plan::spark_executions::SparkPrefill::Ladder,
 };
 
 fn usize_list(config: &Value, key: &str) -> Vec<usize> {
@@ -52,6 +56,7 @@ fn usize_list(config: &Value, key: &str) -> Vec<usize> {
 }
 
 impl Family for DeepSeek {
+    fn spark_prefill(&self) -> crate::plan::spark_executions::SparkPrefill { self.spark_prefill }
     fn spark_decode(&self) -> Option<crate::plan::spark_executions::SparkDecode> {
         Some(crate::plan::spark_executions::SparkDecode { lanes: self.decode_lanes, rows: self.decode_rows })
     }

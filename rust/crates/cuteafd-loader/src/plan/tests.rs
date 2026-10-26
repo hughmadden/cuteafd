@@ -340,7 +340,8 @@ fn family_executor_prefill_markers_do_not_claim_shared_wave_ports() {
 fn qwen_prefill_publishes_unit_waves_and_span_before_host_admission() {
     let config = qwen4_config(4);
     let dir = snapshot(config.clone(), &qwen4_coordinator(&config, false));
-    for (unit, waves) in [(512, 1), (1024, 2), (4096, 2), (2752, 3), (2048, 4)] {
+    // Qwen's mapped-PLE ring is a hard two-wave executor limit (#717).
+    for (unit, waves) in [(512, 1), (1024, 2), (2048, 2), (4096, 2)] {
         let report = plan(dir.path(), &PlanOptions {
             layout: Some(layout::LayoutOptions { rtx_bytes: vec![96 << 30],
                 prefill_rows: unit, prefill_lanes: waves, context_tokens: 32768,
@@ -389,7 +390,8 @@ fn qwen_mapped_ple_host_staging_matches_runtime_allocations() {
         }
         let input = PlanInput::open(dir.path()).unwrap();
         for (gpus, ranks) in [(1, 0), (2, 0), (1, 4)] {
-            for (unit, k) in [(512usize, 1usize), (2048, 2), (4096, 2), (2752, 3), (2048, 4)] {
+            // The mapped-PLE ring caps Qwen at two waves (#717).
+            for (unit, k) in [(512usize, 1usize), (1024, 2), (2048, 2), (4096, 2)] {
                 if ranks == 0 && k != 1 { continue; }
                 let report = input.plan(&PlanOptions {
                     layout: Some(layout::LayoutOptions { rtx_bytes: vec![96 << 30; gpus],
@@ -1934,7 +1936,8 @@ fn v4_plan_shared_span_matches_unit_rows_and_waves() {
 #[test]
 fn v4_plan_resolves_serving_wave_default_and_explicit_requests() {
     let dir = v4_snapshot();
-    for (requested, expected, unit) in [(0, 2, 4096), (1, 1, 4096), (2, 2, 4096), (3, 3, 2752)] {
+    // Unset follows the descriptor's measured best k3 (#785); pins override it.
+    for (requested, expected, unit) in [(0, 3, 2752), (1, 1, 4096), (2, 2, 4096), (3, 3, 2752), (4, 4, 2048)] {
         let report = plan(dir.path(), &PlanOptions { layout: Some(layout::LayoutOptions {
             host_memory: Some((128 << 30, 128 << 30)), host_cache_bytes: Some(0),
             prefill_lanes: requested, prefill_waves: requested.max(1),
@@ -1967,8 +1970,11 @@ fn v4_workspace_plan_matches_runtime_below_compiled_context() {
     for gib in [31.8, 95.5] {
         let total = cuteafd_core::serving_capacity::GpuMemoryBudget::from_gib(gib).unwrap().0;
         for context in [16384, 32512, 32768] {
+            // Pin the 4096 x 2 shape the runtime geometry above is built for;
+            // unpinned, the descriptor estimate selects k3.
             let report = plan(dir.path(), &PlanOptions { layout: Some(layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)),
                 rtx_bytes: vec![total], context_tokens: context, pool_tokens: Some(32768),
+                prefill_lanes: 2, prefill_waves: 2,
                 workspace_manifest: Some(path.clone()), ..Default::default()
             }), ..sparks(2) }).unwrap();
             let mut layout = report.memory_layout.unwrap();
@@ -3540,12 +3546,51 @@ fn qwen_small_card_one_spark_buffers_two_waves_with_one_compute_slot() {
     let memory = report.memory_layout.unwrap();
     assert_eq!(memory.pool_tokens, 262_144);
     let spark = memory.devices.iter().find(|d| d.kind == DeviceKind::Spark).unwrap();
-    let slots = spark.items.iter().find(|item| item.group == "execution slots").unwrap();
+    // Two buffered waves, one prefill owner: scratch once at m4096 plus the
+    // m80 decode owner; only the per-unit route staging scales with waves.
+    let owners = spark.items.iter().find(|item| item.group == "execution owners").unwrap();
+    let staging = spark.items.iter().find(|item| item.group == "execution staging").unwrap();
     let residual = spark.items.iter().filter(|item| item.group == "expert waves")
         .map(|item| item.bytes).sum::<u64>();
-    let per_slot = layout::spark_slot_bytes("qwen4", 4096);
-    assert_eq!(slots.bytes, per_slot - residual.min(per_slot));
+    let geometry = cuteafd_core::ExpertGeometry::QWEN4;
+    let row = u64::from(geometry.hidden) + u64::from(geometry.hidden) / 32 + 8 * u64::from(geometry.topk);
+    let prefill = layout::spark_slot_bytes("qwen4", 4096);
+    let decode = 51 * (1 << 20) + 64 * row;
+    assert_eq!(owners.bytes, prefill + decode - residual.min(prefill));
+    assert_eq!(staging.bytes, (64 + 2 * 4096) * 8 * u64::from(geometry.topk));
     assert!(memory.devices.iter().all(|d| d.free_bytes() >= 0), "{}", memory.render());
+}
+
+#[test]
+fn memory_constrained_spark_refuses_by_typed_owner_charge_not_waves() {
+    use cuteafd_core::memory_layout::DeviceKind;
+    let dir = qwen_snapshot(4);
+    let plan_at = |spark_bytes: u64, waves: u64| plan(dir.path(), &PlanOptions { layout: Some(layout::LayoutOptions {
+        rtx_bytes: vec![32 << 30], pool_tokens: Some(262_144), context_tokens: 262_144, spark_bytes,
+        prefill_lanes: waves, prefill_waves: waves,
+        host_cache_bytes: Some(0), host_memory: Some((128 << 30, 128 << 30)), ..Default::default()
+    }), ..sparks(1) }).unwrap();
+    let spark = |report: &PlanReport| report.memory_layout.as_ref().unwrap().devices.iter()
+        .find(|d| d.kind == DeviceKind::Spark).unwrap().clone();
+    let roomy = plan_at(121 << 30, 2);
+    assert!(roomy.executable(), "{}", render(&roomy));
+    let device = spark(&roomy);
+    let owners = device.items.iter().find(|item| item.group == "execution owners").unwrap().bytes;
+    let used = device.used_bytes();
+    // The device budget adds the host reserve to `spark_bytes`.
+    let required = used - (device.capacity_bytes - (121 << 30));
+    // A Spark exactly at the requirement admits; one byte less is refused,
+    // naming the shortfall, before any worker allocates.
+    assert!(plan_at(required, 2).executable());
+    let tight = plan_at(required - 1, 2);
+    assert!(!tight.executable());
+    assert!(tight.hints.iter().any(|hint| hint.what.starts_with("spark0") && hint.what.contains("shortfall 1 bytes")),
+        "{:?}", tight.hints);
+    // One wave fits the same budget: the k units divide the reserve, they
+    // never add a second prefill scratch (only per-unit staging differs).
+    let one = spark(&plan_at(121 << 30, 1));
+    assert_eq!(one.items.iter().find(|item| item.group == "execution owners").unwrap().bytes, owners);
+    assert!(one.used_bytes() < used);
 }
 
 #[test]

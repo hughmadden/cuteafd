@@ -1924,7 +1924,7 @@ impl Opened {
             let ingress = if self.checkpoint.spark_input_is_bf16() { cuteafd_core::SparkIngress::Bf16 }
                 else { cuteafd_core::SparkIngress::Fp8K32 };
             let catalog = self.experts.as_ref().context("GLM Flash Spark admission requires routed expert headers")?;
-            let executions = cuteafd_loader::plan::spark_executions::admit_ladder("glm5_flash",
+            let executions = cuteafd_loader::plan::spark_executions::admit_family("glm5_flash",
                 &cuteafd_loader::plan::spark_executions::SparkBackend::for_catalog(catalog)?.exports(),
                 Some(u32::try_from(args.decode_rows)?), args.prefill_rows as u64, args.prefill_waves as u64)?;
             let model = cuteafd_transport::worker_selection::ModelAdmission::new(

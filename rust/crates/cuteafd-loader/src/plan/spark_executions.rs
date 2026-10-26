@@ -17,6 +17,15 @@ pub struct PrefillUnits {
 }
 
 impl PrefillUnits {
+    /// The family's prefill owner at the resolved unit and wave count.
+    pub fn for_family(family: &dyn crate::plan::Family, unit_rows: u64, waves: u64) -> Self {
+        match family.spark_prefill() {
+            SparkPrefill::Ladder => Self::ladder(family, unit_rows, waves),
+            SparkPrefill::Streams(streams) => { let unit = u32::try_from(unit_rows).unwrap_or(u32::MAX);
+                Self { max_unit_rows: unit, unit_rows: unit, waves: streams } }
+        }
+    }
+
     /// A shape on the shared ladder: the largest unit is the reserve divided
     /// by the fewest waves that split it (8192 / 2 today), bounded by the
     /// family's executor unit limit.
@@ -27,6 +36,16 @@ impl PrefillUnits {
             unit_rows: u32::try_from(unit_rows).unwrap_or(u32::MAX),
             waves: u8::try_from(waves.max(1)).unwrap_or(u8::MAX) }
     }
+}
+
+/// How a family's executor feeds the prefill owner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SparkPrefill {
+    /// The shared ladder: scratch at the reserve's largest unit, k units in flight.
+    Ladder,
+    /// A legacy executor with fixed parallel streams of its own live chunk
+    /// (V4.1 CED): scratch at that chunk, `streams` units in flight.
+    Streams(u8),
 }
 
 /// The family's decode compute owners: lanes and the rows each admits.
@@ -101,11 +120,13 @@ pub fn descriptor(family: &str) -> anyhow::Result<&'static dyn crate::plan::Fami
         .ok_or_else(|| anyhow::anyhow!("Spark execution admission requires a family descriptor for {family}"))
 }
 
-/// Admit `family` on the shared prefill ladder (`unit_rows` x `waves`).
-pub fn admit_ladder(family: &str, exports: &[u32], decode_rows: Option<u32>,
+/// Admit `family` at its resolved prefill unit and wave count; the descriptor
+/// decides the prefill owner's shape ([`PrefillUnits::for_family`]). Plan,
+/// serve and golden all call this.
+pub fn admit_family(family: &str, exports: &[u32], decode_rows: Option<u32>,
     unit_rows: u64, waves: u64) -> anyhow::Result<SparkExecutions> {
     let descriptor = descriptor(family)?;
-    Ok(admit(descriptor, exports, decode_rows, PrefillUnits::ladder(descriptor, unit_rows, waves))?)
+    Ok(admit(descriptor, exports, decode_rows, PrefillUnits::for_family(descriptor, unit_rows, waves))?)
 }
 
 #[cfg(test)]
@@ -152,8 +173,11 @@ mod tests {
     fn uncovered_decode_capacity_and_over_capacity_pins_are_typed_refusals() {
         let glm = &crate::plan::families::glm::GLM5;
         let ladder = |unit, waves| PrefillUnits::ladder(glm, unit, waves);
-        assert_eq!(admit(glm, &SparkBackend::Exlr8.exports(), Some(80), ladder(4096, 1)).unwrap_err(),
-            ExecutionAdmissionError::Uncovered { owner: "decode", rows: 80, exports: vec![64, 4096] });
+        // A decode extent beyond the package's largest export is refused.
+        assert_eq!(admit(glm, &[1, 80, 4096], Some(4097), ladder(4096, 1)).unwrap_err(),
+            ExecutionAdmissionError::Uncovered { owner: "decode", rows: 4097, exports: vec![1, 80, 4096] });
+        // EXLR8 covers a wider decode extent only with its 4096-row arena.
+        assert_eq!(admit(glm, &SparkBackend::Exlr8.exports(), Some(80), ladder(4096, 1)).unwrap().decode[0].compiled_capacity, 4096);
         // A package without a covering prefill export is refused, not stretched.
         assert!(matches!(admit(glm, &[1, 80, 2048], None, ladder(2048, 4)),
             Err(ExecutionAdmissionError::Uncovered { owner: "prefill", rows: 4096, .. })));
@@ -162,7 +186,7 @@ mod tests {
             Err(ExecutionAdmissionError::Uncovered { owner: "prefill", rows: 4160, .. })));
         assert!(matches!(admit(glm, &SparkBackend::Fp8.exports(), None, ladder(2048, 5)),
             Err(ExecutionAdmissionError::BufferedUnits { units: 5, .. })));
-        assert!(admit_ladder("unknown", &SparkBackend::Fp8.exports(), None, 4096, 1).is_err());
+        assert!(admit_family("unknown", &SparkBackend::Fp8.exports(), None, 4096, 1).is_err());
         assert!(matches!(admit(&crate::plan::families::dflash::DFLASH2, &SparkBackend::Fp8.exports(), None, ladder(4096, 1)),
             Err(ExecutionAdmissionError::DecodeLanes { lanes: 0, .. })));
     }
