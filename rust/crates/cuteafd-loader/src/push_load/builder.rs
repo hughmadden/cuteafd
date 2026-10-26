@@ -672,20 +672,14 @@ impl Builder {
     ) -> Result<()> {
         use crate::formats::fp8_experts::ExpertFormat;
         let tensors = tensors.for_layer_metadata(layer)?;
-        tensors.validate_push_scales()?;
-        let name = tensors.name(layer, expert, projection);
+        let names = tensors.source_names(layer, expert, projection);
         let [w, mut s] = tensors.projection_slices(projection, world, rank, slicing)?;
-        let (source, _) = tensors.push_source(&name)?;
+        let (source, _) = tensors.push_source(&names[0])?;
         self.fp8_matrix(&source, w, weight)?;
         if tensors.format() == ExpertFormat::Bf16 {
             return Ok(());
         }
-        let suffix = if tensors.format().packed_fp4() {
-            "_scale"
-        } else {
-            "_scale_inv"
-        };
-        let (source, dtype) = tensors.push_source(&format!("{name}{suffix}"))?;
+        let (source, dtype) = tensors.push_source(&names[1])?;
         if dtype == cuteafd_core::DType::Bf16 {
             for value in [
                 &mut s.source_offset,
@@ -708,13 +702,10 @@ impl Builder {
             if add(image, 8)? > scale.bytes {
                 return Err(invalid("NVFP4 scalar image outside destination"));
             }
-            let input = format!(
-                "{}.input_scale",
-                name.strip_suffix(".weight")
-                    .ok_or_else(|| invalid("weight suffix missing"))?
-            );
-            for (name, offset) in [(format!("{name}_scale_2"), image), (input, image + 4)] {
-                let (source, dtype) = tensors.push_source(&name)?;
+            // Alpha then input scale; divisor scalars land raw and are
+            // staged as reciprocals after Done.
+            for (name, offset) in [(&names[2], image), (&names[3], image + 4)] {
+                let (source, dtype) = tensors.push_source(name)?;
                 if dtype != cuteafd_core::DType::F32 || source.bytes != 4 {
                     return Err(invalid("NVFP4 scalar must be F32"));
                 }

@@ -39,8 +39,8 @@ fn minimax_catalog_dispatches_before_generic_text_and_excludes_routed_weights() 
     assert_eq!(shape.geometry().unwrap(), cuteafd_core::ExpertGeometry::MINIMAX_M3);
     let tensors = catalog.fp8().unwrap();
     assert_eq!(tensors.format(), ExpertFormat::Nvfp4);
-    // The packed codes carry divisor scales, which push images cannot copy unchanged.
-    assert!(tensors.divisor_scales() && tensors.validate_push_scales().is_err());
+    // The packed codes carry divisor scales: push lands them raw and stages their reciprocals.
+    assert!(tensors.divisor_scales());
     for layer in 3..60 { tensors.validate_layer(layer).unwrap(); }
     assert!(!tensors.has_layer(2) && !tensors.has_layer(60));
     assert!(catalog.tensors().iter().all(|t| !t.metadata.name.contains(".block_sparse_moe.experts.")));
@@ -99,13 +99,10 @@ fn minimax_divisors_fail_closed_before_native_execution_or_push() {
     let error = tensors.read_input_scale(3, 0, Fp8Projection::Up).unwrap_err().to_string();
     assert!(error.contains("layer 3 expert 0") && error.contains("w1.input_global_scale=4")
         && error.contains("w3.input_global_scale=3") && error.contains("bit-identical"), "{error}");
-    let error = tensors.validate_push_scales().unwrap_err().to_string();
-    assert!(error.contains("divisors") && error.contains("use mount loading"), "{error}");
-    let mut builder = crate::push_load::builder::Builder::new(&tensors.snapshot, vec![1024]);
-    let destination = crate::push_load::builder::Destination { rank: 0, offset: 0, bytes: 1024 };
-    let error = builder.fp8_projection(&tensors, 3, 0, Fp8Projection::Gate, 2, 0, Slicing::Blocks(16),
-        destination, destination).unwrap_err().to_string();
-    assert!(error.contains("divisors") && error.contains("use mount loading"), "{error}");
+    for invalid in [0.0, -1.0, f32::NAN, f32::INFINITY, f32::from_bits(1)] {
+        assert!(Fp8ExpertTensors::stage_divisor_scalars(&mut invalid.to_le_bytes()).is_err(), "{invalid}");
+    }
+    assert!(Fp8ExpertTensors::stage_divisor_scalars(&mut [0; 6]).is_err());
     let mut missing = tensors.clone();
     Arc::make_mut(&mut missing.tensors).remove(&alpha);
     assert!(missing.validate_layer(3).is_err());
@@ -116,4 +113,39 @@ fn minimax_divisors_fail_closed_before_native_execution_or_push() {
     config["quantization_config"]["moe_quant_algo"] = "FP8".into();
     std::fs::write(tensors.snapshot.join("config.json"), config.to_string()).unwrap();
     assert!(Fp8ExpertTensors::read(&tensors.snapshot, tensors.shape).unwrap_err().to_string().contains("declared NVFP4 W4A4"));
+}
+
+#[test]
+fn minimax_push_projections_land_mount_bytes_and_stage_divisors_like_mount() {
+    use crate::push_load::builder::{Builder, Destination};
+    let (_dir, tensors) = fixture();
+    let (tp, rank, slicing) = (4, 1, Slicing::Blocks(16));
+    for projection in Fp8Projection::ALL {
+        let name = tensors.name(3, 1, projection);
+        assert_eq!(tensors.source_names(3, 1, projection),
+            [name.clone(), weight_scale_name(&name), alpha_name(&name), input_scale_name(&name)]);
+        let (w, s) = tensors.slice_bytes_with(projection, tp, rank, slicing).unwrap();
+        let mut builder = Builder::new(&tensors.snapshot, vec![(w + s + 8) as u64]);
+        let at = |offset: usize, bytes: usize| Destination { rank: 0, offset: offset as u64, bytes: bytes as u64 };
+        builder.fp8_projection(&tensors, 3, 1, projection, tp, rank, slicing, at(0, w), at(w, s + 8)).unwrap();
+        let checked = builder.finish().unwrap();
+        let mut image = vec![0; w + s + 8];
+        for entry in &checked.plan.entries {
+            let file = std::fs::File::open(tensors.snapshot.join(&checked.plan.files[entry.file as usize])).unwrap();
+            let pattern = &checked.plan.patterns[entry.pattern as usize];
+            for (source, destination) in pattern.runs() {
+                let start = (entry.dst_base + destination) as usize;
+                file.read_exact_at(&mut image[start..start + pattern.run as usize], entry.src_base + source).unwrap();
+            }
+        }
+        let (mut weights, mut scales) = (vec![0; w], vec![0; s]);
+        tensors.read_slice_with(3, 1, projection, tp, rank, slicing, &mut weights, &mut scales, &mut Vec::new()).unwrap();
+        assert_eq!(image[..w], weights, "{projection:?} codes");
+        assert_eq!(image[w..w + s], scales, "{projection:?} scale grid");
+        // The divisors land raw; staging them reproduces the mount loader's scalars bit for bit.
+        assert_eq!(image[w + s..], [3.0f32; 2].map(f32::to_le_bytes).concat());
+        Fp8ExpertTensors::stage_divisor_scalars(&mut image[w + s..]).unwrap();
+        assert_eq!(image[w + s..w + s + 4], tensors.read_alpha(3, 1, projection).unwrap().to_le_bytes());
+        assert_eq!(image[w + s + 4..], tensors.read_input_scale(3, 1, projection).unwrap().to_le_bytes());
+    }
 }

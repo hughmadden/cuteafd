@@ -947,6 +947,13 @@ pub fn compressed_nvfp4(name: &str, n: usize, k: usize) -> Vec<Tensor> {
     ]
 }
 
+/// The routed-expert catalog the family readers build, at an explicit reduced
+/// `shape` that a release-geometry check (MiniMax M3) would refuse.
+pub fn fp8_expert_catalog(snapshot: &Path, shape: crate::RoutedExpertShape)
+    -> anyhow::Result<crate::OfficialV41Catalog> {
+    crate::families::deepseek_v41::v41_catalog::fp8_catalog(snapshot, shape)
+}
+
 /// MiniMax-M3.1-Flash's own config.json.
 pub fn minimax_m3_config() -> Value {
     serde_json::from_str(include_str!("../families/minimax_m3/fixtures/config.json")).unwrap()

@@ -649,12 +649,29 @@ fn fp8_header_plans_widen_pad_and_validate_like_mount() -> Result<()> {
                 scalars: vec![0..4],
                 inputs: None,
                 expand: vec![],
+                divisors: false,
             }],
             None,
             0
         )
         .is_err());
     }
+    // Compressed-tensors divisors (MiniMax M3) land raw and stage as mount's reciprocals.
+    let divisors = |scalars: Range<usize>| Layer::Fp8 {
+        widen: vec![],
+        scalars: vec![scalars],
+        inputs: None,
+        expand: vec![],
+        divisors: true,
+    };
+    let raw = [3.0f32, 7.0].map(f32::to_le_bytes).concat();
+    let ready = initialize(delivered(device, &raw, 8)?, &[divisors(0..8)], None, 0)?;
+    let mut staged = vec![0; 8];
+    library.copy_d2h(&mut staged, ready.region(0)?.buffer())?;
+    assert_eq!(staged, [1.0f32 / 3.0, 1.0 / 7.0].map(f32::to_le_bytes).concat());
+    // A positive divisor whose reciprocal overflows fails closed, as on mount.
+    let arena = delivered(device, &f32::from_bits(1).to_le_bytes(), 4)?;
+    assert!(initialize(arena, &[divisors(0..4)], None, 0).is_err());
     Ok(())
 }
 

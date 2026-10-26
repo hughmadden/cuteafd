@@ -720,7 +720,7 @@ mod tests {
     use cuteafd_ffi::fp8_moe::{Fp8MoeInfo, Fp8MoeWeights};
 
     #[test]
-    fn minimax_contract_accepts_native_packages_and_refuses_divisor_push() {
+    fn minimax_contract_accepts_native_packages_and_stages_divisor_push() {
         use cuteafd_loader::plan::testing::{compressed_nvfp4, minimax_m3_config, write_snapshot};
         use cuteafd_loader::formats::fp8_experts::{Fp8ExpertTensors, Slicing};
         use cuteafd_ffi::fp8_moe::{Fp8MoeActivation, Fp8MoeProjection};
@@ -758,9 +758,20 @@ mod tests {
                 config["text_config"][key] = original;
             }
         }
-        let result = crate::shared::memory::push_initialize::Layer::fp8(&tensors, 3, 0, 2, 0,
-            Slicing::Blocks(16), [0..0, 0..0, 0..0]);
-        assert!(result.err().unwrap().to_string().contains("use mount loading"));
+        // Each projection's scale region: its grid, then the raw alpha and input divisors.
+        let mut end = 0;
+        let regions = cuteafd_loader::formats::fp8_experts::Fp8Projection::ALL.map(|projection| {
+            let start = end;
+            end += tensors.slice_bytes_with(projection, 2, 0, Slicing::Blocks(16)).unwrap().1 + 8;
+            start..end
+        });
+        let layer = crate::shared::memory::push_initialize::Layer::fp8(&tensors, 3, 0, 2, 0,
+            Slicing::Blocks(16), regions.clone()).unwrap();
+        let crate::shared::memory::push_initialize::Layer::Fp8 { scalars, inputs, divisors, .. } = layer
+            else { panic!("MiniMax experts initialize as FP8 layers") };
+        assert!(divisors, "compressed-tensors divisors are staged after Done");
+        assert_eq!(scalars, regions.map(|region| region.end - 8..region.end));
+        assert!(inputs.is_some_and(|(gate, up, layer)| layer == 3 && gate.len() == 4 && up.len() == 4));
         let library = std::path::Path::new("/exports/libcuteafd_native.so");
         for tp in [1, 2, 3, 4, 6] {
             assert_eq!(super::package_directory_for(library, tp, super::ExpertFormat::Nvfp4, Some("minimax")),

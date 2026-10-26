@@ -94,9 +94,9 @@ impl SparkAdmission {
                     .with_context(|| format!("Spark admission rank {rank} checkpoint assignment"))
             }).collect::<Result<Vec<_>>>()?
         };
-        // Push images copy scalar scales unchanged: divisor scales stay on mount loading.
-        let push_snapshot = if catalog.is_some_and(|c| c.fp8().is_none_or(|t| !t.divisor_scales())
-            && (c.format() != cuteafd_loader::plan::checkpoint::CheckpointFormat::Exlr8 || manifest.is_some()))
+        // Push images land scalar scales raw; divisor scales are staged after Done.
+        let push_snapshot = if catalog.is_some_and(|c|
+            c.format() != cuteafd_loader::plan::checkpoint::CheckpointFormat::Exlr8 || manifest.is_some())
             && !working.spark_layers.is_empty() && assignments.iter().all(|a| a.resident_bytes > 0)
             && topology.is_none_or(|t| t.tp() as usize == world)
             && cuteafd_loader::push_load::namespace(snapshot).is_ok() {
@@ -596,7 +596,7 @@ mod tests {
     }
 
     #[test]
-    fn minimax_admission_keeps_divisor_scales_on_mount_loading() -> Result<()> {
+    fn minimax_admission_pushes_divisor_scale_experts() -> Result<()> {
         let root = tempfile::tempdir()?;
         cuteafd_loader::plan::testing::write_minimax_m3_snapshot(root.path(), false, false);
         mark_namespace(root.path())?;
@@ -608,8 +608,8 @@ mod tests {
             spark_ranks: 3, prefill_lanes: 1 };
         let plan = SparkAdmission::plan(root.path(), ExpertGeometry::MINIMAX_M3, Some(&catalog),
             &working, 3, None, model)?;
-        assert!(!plan.pushes());
-        assert!(!plan.coordinator_pushes());
+        // Raw divisors land by push and are staged as reciprocals after Done.
+        assert!(plan.pushes());
         assert_eq!(plan.assignments.len(), 3);
         assert!(plan.assignments.iter().all(|rank| rank.resident_bytes > 0));
         Ok(())

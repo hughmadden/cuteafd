@@ -140,6 +140,11 @@ fn alpha_name(weight: &str) -> String {
     } else { format!("{weight}_scale_2") }
 }
 
+/// The FP32 scale a compressed-tensors divisor stages as (mount and push alike).
+fn reciprocal(divisor: f32) -> f32 {
+    1.0 / divisor
+}
+
 /// Whether a `quantization_config` declares its routed experts in compressed-tensors NVFP4 W4A4
 /// with 16-element groups (`nvfp4-pack-quantized`: `weight_packed` codes and divisor global scales).
 fn declares_packed_nvfp4_experts(quantization: &serde_json::Value) -> bool {
@@ -285,12 +290,33 @@ impl Fp8ExpertTensors {
     /// Whether the scalar scales are compressed-tensors divisors (see the field).
     pub fn divisor_scales(&self) -> bool { self.divisor_scales }
 
-    /// Push images currently copy scalar bytes unchanged; divisor scales need
-    /// the mount loader's reciprocal staging before a package can consume them.
-    pub fn validate_push_scales(&self) -> Result<()> {
-        ensure!(!self.divisor_scales,
-            "compressed NVFP4 push loading cannot copy weight_global_scale/input_global_scale divisors unchanged; use mount loading to stage their reciprocals");
+    /// Push images land scalar bytes unchanged; with divisor scales, push
+    /// initialization stages their reciprocals as the mount loader does.
+    pub fn stage_divisor_scalars(scalars: &mut [u8]) -> Result<()> {
+        ensure!(scalars.len() % 4 == 0, "partial FP32 divisor scalar");
+        for value in scalars.chunks_exact_mut(4) {
+            let divisor = f32::from_le_bytes(value.try_into().unwrap());
+            ensure!(divisor.is_finite() && divisor > 0.0, "divisor {divisor} is not a positive finite scale");
+            let staged = reciprocal(divisor);
+            ensure!(staged.is_finite() && staged > 0.0, "divisor {divisor}: reciprocal is not a positive finite scale");
+            value.copy_from_slice(&staged.to_le_bytes());
+        }
         Ok(())
+    }
+
+    /// The checkpoint tensors behind one projection, in push image order: the
+    /// weight, its scale grid, then (NVFP4) its alpha and input scale.
+    pub fn source_names(&self, layer: usize, expert: usize, projection: Fp8Projection) -> Vec<String> {
+        let name = self.name(layer, expert, projection);
+        let mut names = vec![name.clone()];
+        if self.format != ExpertFormat::Bf16 {
+            names.push(if self.format.packed_fp4() { weight_scale_name(&name) } else { format!("{name}_scale_inv") });
+        }
+        if self.format == ExpertFormat::Nvfp4 {
+            names.push(alpha_name(&name));
+            names.push(input_scale_name(&name));
+        }
+        names
     }
 
     pub fn name(&self, layer: usize, expert: usize, projection: Fp8Projection) -> String {
@@ -847,7 +873,7 @@ impl Fp8ExpertTensors {
         }
         let value = f32::from_le_bytes(self.read_scalar_bytes(name)?);
         ensure!(value.is_finite() && value > 0.0, "{name}: {value} is not a positive finite scale");
-        let value = if name.ends_with("_global_scale") { 1.0 / value } else { value };
+        let value = if name.ends_with("_global_scale") { reciprocal(value) } else { value };
         ensure!(value.is_finite() && value > 0.0, "{name}: reciprocal is not a positive finite scale");
         Ok(value)
     }
@@ -1475,8 +1501,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let tensors = nvfp4_snapshot(dir.path(), 2);
         assert_eq!(tensors.format(), ExpertFormat::Nvfp4);
-        // ModelOpt scales multiply: push images may copy them unchanged.
-        assert!(!tensors.divisor_scales() && tensors.validate_push_scales().is_ok());
+        // ModelOpt scales multiply: push images land them unchanged.
+        assert!(!tensors.divisor_scales());
         // Distinct per expert, gate == up in each: the guard accepts the layer.
         write_input_scales(&tensors, |expert, _| if expert == 0 { 0.25 } else { 1.5 });
         input_scales(&tensors, |t| Fp8ExpertTensors::check_input_scales(0, &t[0], &t[1])).unwrap();

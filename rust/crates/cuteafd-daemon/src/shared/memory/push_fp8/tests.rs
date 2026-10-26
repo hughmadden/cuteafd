@@ -62,7 +62,7 @@ pub(crate) fn fixture(
         let tensors = tensors.for_layer_metadata(layer)?;
         for projection in Fp8Projection::ALL {
             for expert in 0..64 {
-                for name in source_names(&tensors, layer, expert, projection) {
+                for name in tensors.source_names(layer, expert, projection) {
                     let (source, dtype) = tensors.push_source(&name)?;
                     let image = if dtype == DType::F32 && source.bytes == 4 {
                         // Input values must match gate/up, while alpha tails differ.
@@ -133,6 +133,59 @@ fn spread_packed(plan: &RankPlan, image: &mut [u8]) {
             }
         }
     }
+}
+
+/// MiniMax M3's compressed-tensors NVFP4 experts at a reduced shape (layer 3):
+/// `weight_packed` codes, E4M3 `weight_scale` grids and FP32 divisor scalars.
+fn minimax_fixture(root: &Path) -> Result<OfficialV41Catalog> {
+    use cuteafd_loader::plan::testing::{compressed_nvfp4, fp8_expert_catalog, minimax_m3_config};
+    // 32 experts keep each scalar tail (8 bytes per expert) on the 256-byte plane alignment.
+    let experts = 32;
+    let mut tensors = Vec::new();
+    for expert in 0..experts {
+        for (projection, rows, columns) in [("w1", 3072, 128), ("w3", 3072, 128), ("w2", 128, 3072)] {
+            tensors.extend(compressed_nvfp4(
+                &format!("language_model.model.layers.3.block_sparse_moe.experts.{expert}.{projection}"),
+                rows,
+                columns,
+            ));
+        }
+    }
+    write_snapshot(root, &minimax_m3_config(), &tensors, None);
+    let shape = cuteafd_loader::RoutedExpertShape { layers: 60, first_layer: 3, experts, topk: 1,
+        hidden: 128, intermediate: 3072, draft_stages: 0, draft_experts: 0 };
+    let catalog = fp8_expert_catalog(root, shape)?;
+    let tensors = catalog.fp8().context("MiniMax fixture tensors absent")?.for_layer_metadata(3)?;
+    for projection in Fp8Projection::ALL {
+        for expert in 0..experts {
+            for name in tensors.source_names(3, expert, projection) {
+                let (source, _) = tensors.push_source(&name)?;
+                // Gate and up input divisors must agree; inexact reciprocals exercise rounding.
+                let image = if name.ends_with(".input_global_scale") {
+                    (3.0 + expert as f32).to_le_bytes().to_vec()
+                } else if name.ends_with(".weight_global_scale") {
+                    (7.0 + 3.0 * expert as f32 + projection as u8 as f32).to_le_bytes().to_vec()
+                } else {
+                    (0..source.bytes)
+                        .map(|i| (i.wrapping_mul(29) + expert as u64 * 5 + projection as u8 as u64) as u8)
+                        .collect()
+                };
+                File::options().write(true).open(source.path)?.write_all_at(&image, source.offset)?;
+            }
+        }
+    }
+    Ok(catalog)
+}
+
+/// The host model of divisor staging after Done, as `push_initialize` does.
+fn stage_divisors(plan: &RankPlan, image: &mut [u8]) -> Result<()> {
+    for layer in &plan.layers {
+        let push_initialize::Layer::Fp8 { scalars, divisors: true, .. } = &layer.initialize else { continue };
+        for range in scalars {
+            Fp8ExpertTensors::stage_divisor_scalars(&mut image[range.clone()])?;
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn compare(
@@ -253,6 +306,38 @@ fn planar_rank_images_match_mount_at_tp4_tp6_with_native_scalar_tails() -> Resul
     Ok(())
 }
 
+/// MiniMax M3: codes, grids and raw divisors land as any NVFP4 rank image does;
+/// staging the divisors after Done reproduces mount loading bit for bit.
+#[test]
+fn minimax_rank_images_match_mount_once_divisors_are_staged() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let catalog = minimax_fixture(root.path())?;
+    let tensors = catalog.fp8().unwrap();
+    assert!(tensors.divisor_scales() && tensors.format() == ExpertFormat::Nvfp4);
+    for world in [3, 4, 6] {
+        for slicing in [Slicing::Padded, tensors.exact_slicing(world)] {
+            for rank in 0..world {
+                let admitted = tensors.layer_load(3, world, rank, slicing)?.resident;
+                let plan = RankPlan::new(&catalog, &[(3, slicing)], world, rank, admitted)?;
+                assert_eq!(plan.layout.bytes(), admitted);
+                let push_initialize::Layer::Fp8 { scalars, divisors, .. } = &plan.layers[0].initialize
+                    else { unreachable!() };
+                assert!(*divisors && scalars.len() == 3);
+                let checked = plan.checked(&catalog, root.path(), world, rank)?;
+                let mut image = landed(&checked, root.path(), rank)?;
+                spread_packed(&plan, &mut image);
+                // The gate's first alpha lands as its raw divisor, then stages to 1/7.
+                let first = scalars[0].start..scalars[0].start + 4;
+                assert_eq!(image[first.clone()], 7.0f32.to_le_bytes());
+                stage_divisors(&plan, &mut image)?;
+                assert_eq!(image[first], (1.0f32 / 7.0).to_le_bytes());
+                compare(&plan, &catalog, world, rank, &image)?;
+            }
+        }
+    }
+    Ok(())
+}
+
 #[test]
 #[ignore = "requires an allocated CPU build slot and explicit NVMe fixture directory"]
 fn ready_native_views_match_mount_and_retain_one_arena() -> Result<()> {
@@ -349,6 +434,53 @@ fn ready_native_views_match_mount_and_retain_one_arena() -> Result<()> {
     }
     Ok(())
 }
+/// MiniMax M3 through the real post-Done path: raw divisors delivered in
+/// arbitrary fragment order are staged on the arena and match mount loading.
+#[test]
+#[ignore = "requires an allocated CPU build slot and explicit NVMe fixture directory"]
+fn minimax_ready_views_match_mount_after_divisor_staging() -> Result<()> {
+    use crate::shared::memory::{
+        device::Device,
+        weight_arena::{ExpectedCoverage, LoadingArena},
+    };
+    use cuteafd_ffi::native_library_lifetime_fixture::Fixture;
+    let native = Fixture::build()?;
+    let library = native.load()?;
+    let root = tempfile::tempdir_in(native.directory())?;
+    let catalog = minimax_fixture(root.path())?;
+    for (world, rank) in [(4, 1), (6, 5)] {
+        let slicing = catalog.fp8().unwrap().exact_slicing(world);
+        let plan = RankPlan::new(&catalog, &[(3, slicing)], world, rank, usize::MAX)?;
+        let checked = plan.checked(&catalog, root.path(), world, rank)?;
+        let image = landed(&checked, root.path(), rank)?;
+        let mut arena = LoadingArena::new(
+            Device { library: &library, id: 0 },
+            plan.layout.clone(),
+            ExpectedCoverage::from_plan(&checked, rank as u32)?,
+        )?;
+        for entry in checked.plan.entries.iter().rev() {
+            let pattern = &checked.plan.patterns[entry.pattern as usize];
+            for (_, offset) in pattern.runs().into_iter().rev() {
+                let start = entry.dst_base + offset;
+                let bytes = &image[start as usize..start as usize + pattern.run as usize];
+                library.copy_h2d(arena.destination(start as usize, bytes.len())?, bytes)?;
+                arena.copied(start, bytes.len() as u64)?;
+            }
+        }
+        let initializers = plan.layers.iter().map(|layer| match &layer.initialize {
+            push_initialize::Layer::Fp8 { widen, scalars, inputs, expand, divisors } => push_initialize::Layer::Fp8 {
+                widen: widen.clone(), scalars: scalars.clone(), inputs: inputs.clone(), expand: expand.clone(),
+                divisors: *divisors },
+            _ => unreachable!(),
+        }).collect::<Vec<_>>();
+        let ready = push_initialize::initialize(arena.done()?, &initializers, None, 0)?;
+        let mut actual = vec![0; image.len()];
+        library.copy_d2h(&mut actual[plan.layout.region(0)?], ready.region(0)?.buffer())?;
+        compare(&plan, &catalog, world, rank, &actual)?;
+    }
+    Ok(())
+}
+
 #[test]
 fn equivalent_exact_and_padded_recipes_have_identical_placement_seals() -> Result<()> {
     let root = tempfile::tempdir()?;

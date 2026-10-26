@@ -46,6 +46,9 @@ pub(crate) enum Layer<'a> {
         /// Scale grids landed packed (`rows` x `width` from the region start)
         /// whose execution layout pads each row to `pitch`: (region, rows, width, pitch).
         expand: Vec<(Range<usize>, usize, usize, usize)>,
+        /// The `scalars` are compressed-tensors divisors (MiniMax M3): after
+        /// the raw checks they are staged as reciprocals, as mount loading does.
+        divisors: bool,
     },
 }
 
@@ -63,7 +66,6 @@ impl Layer<'_> {
     ) -> Result<Self> {
         use cuteafd_loader::formats::fp8_experts::{ExpertFormat, Fp8Projection};
         let tensors = tensors.for_layer_metadata(layer)?;
-        tensors.validate_push_scales()?;
         let mut widen = Vec::new();
         let mut scalars = Vec::new();
         let mut inputs = Vec::new();
@@ -98,6 +100,7 @@ impl Layer<'_> {
             scalars,
             inputs,
             expand: Vec::new(),
+            divisors: tensors.divisor_scales(),
         })
     }
 }
@@ -146,7 +149,7 @@ pub(crate) fn initialize<'a>(
                 }
                 Layer::Exl3 { region, residency } => exl3(arena, *region, residency)?,
                 Layer::Exlr8 { region, residency } => exlr8(arena, *region, residency)?,
-                Layer::Fp8 { widen, scalars, inputs, expand } => {
+                Layer::Fp8 { widen, scalars, inputs, expand, divisors } => {
                     for range in scalars {
                         ensure!(range.len() % 4 == 0, "partial NVFP4 scalar");
                         let mut image = vec![0; range.len()];
@@ -170,6 +173,10 @@ pub(crate) fn initialize<'a>(
                             arena.device().library.copy_d2h(&mut b, arena.buffer(up.clone())?)?;
                             cuteafd_loader::formats::fp8_experts::Fp8ExpertTensors::check_input_scales(*layer, &a, &b)
                         })?;
+                    }
+                    // After the raw comparison, as mount loading compares before reciprocal rounding.
+                    if *divisors {
+                        for range in scalars { stage_divisors(arena, range.clone())?; }
                     }
                 }
             }
@@ -415,6 +422,18 @@ pub(crate) fn expand_rows(
             end = start;
         }
         Ok(())
+    })
+}
+
+/// Compressed-tensors divisor scalars landed raw become the FP32 reciprocals
+/// mount loading stages (one projection's alphas and input scales at a time).
+pub(crate) fn stage_divisors(arena: &DeliveredArena<'_>, range: Range<usize>) -> Result<()> {
+    let device = arena.device();
+    device.run(|| {
+        let mut image = vec![0; range.len()];
+        device.library.copy_d2h(&mut image, arena.buffer(range.clone())?)?;
+        cuteafd_loader::formats::fp8_experts::Fp8ExpertTensors::stage_divisor_scalars(&mut image)?;
+        device.library.copy_h2d(arena.buffer(range.clone())?, &image)
     })
 }
 

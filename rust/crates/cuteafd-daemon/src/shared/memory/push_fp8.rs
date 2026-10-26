@@ -71,7 +71,6 @@ impl RankPlan {
         for &(layer, slicing) in layers {
             let tensors = tensors.for_layer_metadata(layer)?;
             tensors.validate_layer(layer)?;
-            tensors.validate_push_scales()?;
             let planes = RegionLayout::fp8(&tensors, world, rank, slicing)?;
             // Do not silently widen the worker-reported checkpoint admission.
             ensure!(
@@ -112,6 +111,7 @@ impl RankPlan {
                     scalars: vec![],
                     inputs: None,
                     expand: vec![],
+                    divisors: false,
                 },
             });
         }
@@ -138,7 +138,7 @@ impl RankPlan {
                     tensors.projection_slices(projection, world, rank, plan.slicing)?
                 ));
                 for expert in 0..tensors.shape().experts {
-                    for name in source_names(&tensors, plan.layer, expert, projection) {
+                    for name in tensors.source_names(plan.layer, expert, projection) {
                         hash.update(format!("{:?}", tensors.push_source(&name)?));
                     }
                 }
@@ -158,6 +158,7 @@ impl RankPlan {
                     scalars,
                     inputs,
                     expand,
+                    divisors: _,
                 } => {
                     let widening = widen
                         .iter()
@@ -209,7 +210,7 @@ impl RankPlan {
                 let (w_bytes, s_bytes) =
                     tensors.slice_bytes_with(projection, world, rank as usize, layer.slicing)?;
                 for expert in 0..experts {
-                    let names = source_names(&tensors, layer.layer, expert, projection);
+                    let names = tensors.source_names(layer.layer, expert, projection);
                     let (source, _) = tensors.push_source(&names[0])?;
                     builder.fp8_matrix(
                         &source,
@@ -303,33 +304,6 @@ fn destination(
         bytes: bytes as u64,
     })
 }
-fn source_names(
-    tensors: &Fp8ExpertTensors,
-    layer: usize,
-    expert: usize,
-    projection: Fp8Projection,
-) -> Vec<String> {
-    let name = tensors.name(layer, expert, projection);
-    let mut names = vec![name.clone()];
-    if tensors.format() != ExpertFormat::Bf16 {
-        names.push(format!(
-            "{name}{}",
-            if tensors.format().packed_fp4() {
-                "_scale"
-            } else {
-                "_scale_inv"
-            }
-        ));
-    }
-    if tensors.format() == ExpertFormat::Nvfp4 {
-        names.push(format!("{name}_scale_2"));
-        names.push(format!(
-            "{}.input_scale",
-            name.strip_suffix(".weight").unwrap()
-        ));
-    }
-    names
-}
 /// A scale grid whose execution rows pad to a wider pitch (MXFP4 down
 /// projections pad K/32 scale bytes to 4): pushed packed, spread after Done.
 fn packed_rows(image: &cuteafd_loader::formats::fp8_experts::Fp8MatrixSlice) -> bool {
@@ -383,6 +357,7 @@ fn initialize(
         scalars,
         inputs,
         expand,
+        divisors: tensors.divisor_scales(),
     })
 }
 

@@ -154,11 +154,13 @@ fn receive<'a>(
                     scalars,
                     inputs,
                     expand,
+                    divisors,
                 } => push_initialize::Layer::Fp8 {
                     widen: widen.clone(),
                     scalars: scalars.clone(),
                     inputs: inputs.clone(),
                     expand: expand.clone(),
+                    divisors: *divisors,
                 },
                 _ => unreachable!("native rank contains non-native initializer"),
             })

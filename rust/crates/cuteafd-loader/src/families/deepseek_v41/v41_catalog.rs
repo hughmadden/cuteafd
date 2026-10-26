@@ -1076,7 +1076,7 @@ fn nvfp4_catalog(snapshot: &Path, config: &serde_json::Value, shape: RoutedExper
     Ok(Some(catalog))
 }
 
-fn fp8_catalog(snapshot: &Path, shape: RoutedExpertShape) -> Result<OfficialV41Catalog> {
+pub(crate) fn fp8_catalog(snapshot: &Path, shape: RoutedExpertShape) -> Result<OfficialV41Catalog> {
     let fp8 = crate::formats::fp8_experts::Fp8ExpertTensors::read(snapshot, shape)?;
     // The coordinator's tensors (serve-glm reads its weights through the catalog):
     // everything but the backbone's routed experts, which Fp8ExpertTensors serves.
