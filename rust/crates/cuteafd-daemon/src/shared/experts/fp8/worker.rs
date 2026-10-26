@@ -26,6 +26,8 @@ pub(crate) struct Fp8Worker<'a> {
     /// Mapped requests return queued; each reply waits only for its unit fence.
     deferred: bool,
     pending: super::super::execution::timing::PendingUnits<'a>,
+    /// The owner stream's pace clock, shared with every group on that stream.
+    clock: super::super::execution::timing::PaceClock<'a>,
 }
 
 fn validate_worker_layers(layers: &[usize]) -> Result<()> {
@@ -87,6 +89,7 @@ impl<'a> Fp8Worker<'a> {
             timing,
             deferred: false,
             pending: super::super::execution::timing::PendingUnits::new(library, 1)?,
+            clock: Default::default(),
         })
     }
 
@@ -100,24 +103,25 @@ impl<'a> Fp8Worker<'a> {
     pub(crate) fn share_owner(&mut self, other: &Self) {
         self.stream = other.stream.clone();
         self.timing = other.timing.clone();
+        self.clock = other.clock.clone();
     }
 
     /// Leave mapped requests queued at return (see `deferred`).
     pub(crate) fn defer(&mut self, units: usize) -> Result<()> {
         ensure!(self.pending.is_empty(), "cannot resize an active FP8 queue");
-        self.pending = super::super::execution::timing::PendingUnits::new(self.library, units)?;
+        self.pending = super::super::execution::timing::PendingUnits::with_clock(self.library, units, self.clock.clone())?;
         self.deferred = true;
         Ok(())
     }
 
     /// Publish deferred diagnostics after the owner's existing completion check.
-    pub(crate) fn complete(&mut self) -> Result<()> {
-        let Some((request_id, layer, rows, executor_id)) = self.pending.pop()? else { return Ok(()) };
+    pub(crate) fn complete(&mut self) -> Result<Option<super::super::execution::timing::UnitPace>> {
+        let Some(((request_id, layer, rows, executor_id), pace)) = self.pending.pop()? else { return Ok(None) };
         if let Some(timing) = &mut self.timing {
             // SAFETY: the caller observed this stream drained after both records.
             unsafe { timing.borrow_mut().publish(request_id, layer, rows, executor_id, "fp8_moe")?; }
         }
-        Ok(())
+        Ok(Some(pace))
     }
 
     pub(crate) fn unit_ready(&self) -> Result<bool> { self.pending.ready() }
@@ -170,6 +174,8 @@ impl<'a> Fp8Worker<'a> {
         // Every copy follows the previous unit's consumers on this owner stream;
         // the transport retains each mapped source independently until its reply.
         let hidden_bytes = request.hidden().len();
+        // SAFETY: the owner stream outlives every queued unit (#762 pace).
+        unsafe { self.pending.arrive(self.stream.raw)?; }
         match hidden_view.filter(|view| view.bytes >= hidden_bytes) {
             // SAFETY: the view is device-visible request storage of at least
             // `hidden_bytes`, retained by the transport until this request's
