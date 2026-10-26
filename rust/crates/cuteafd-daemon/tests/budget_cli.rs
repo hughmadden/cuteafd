@@ -172,11 +172,60 @@ fn installed_example_inventory_skips_only_absent_checkpoints_and_revisions() {
         "a broken installed main ref is not an absent-checkpoint skip");
 }
 
+fn installed_example_programs(override_path: Option<std::path::PathBuf>, home: &std::path::Path,
+    image_manifest: &std::path::Path) -> Option<std::path::PathBuf> {
+    // Keep explicit overrides, even if broken. The final default is also used
+    // by the live V4 placement fixtures; never pick an arbitrary WIP export.
+    override_path.or_else(|| [
+        image_manifest.to_path_buf(),
+        home.join(".local/share/cuteafd/PROGRAMS.json"),
+        home.join(".cache/cuteafd/builds/v3-p4/c1/artifacts/PROGRAMS.json"),
+    ].into_iter().find(|path| path.exists()))
+}
+
+fn missing_programs_input(manifest: &std::path::Path, stderr: &str) -> bool {
+    // Match the loader's JSON-file ENOENT, not a generic planning refusal.
+    matches!(manifest.try_exists(), Ok(false)) && stderr.contains(&format!(
+        "reading JSON {}: No such file or directory (os error 2)", manifest.display()))
+}
+
+#[test]
+fn installed_example_programs_discovery_preserves_overrides_and_planner_errors() {
+    let home = tempfile::tempdir().unwrap();
+    let image = home.path().join("image/PROGRAMS.json");
+    let host = home.path().join(".local/share/cuteafd/PROGRAMS.json");
+    let live = home.path().join(".cache/cuteafd/builds/v3-p4/c1/artifacts/PROGRAMS.json");
+    assert!(installed_example_programs(None, home.path(), &image).is_none());
+    for path in [&live, &host, &image] {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, br#"{"schema":1,"programs":[]}"#).unwrap();
+        assert_eq!(installed_example_programs(None, home.path(), &image).as_ref(), Some(path));
+    }
+    let absent = home.path().join("absent/PROGRAMS.json");
+    assert_eq!(installed_example_programs(Some(absent.clone()), home.path(), &image), Some(absent.clone()));
+    let missing = |path: &std::path::Path| format!(
+        "Error: reading JSON {}: No such file or directory (os error 2)", path.display());
+    assert!(missing_programs_input(&absent, &missing(&absent)));
+    assert!(!missing_programs_input(&image, &missing(&image)), "present inputs must fail");
+    assert!(!missing_programs_input(&absent, &missing(&home.path().join("config.json"))));
+    for error in ["capacity exceeded", "parsing JSON", "Permission denied", "timed out"] {
+        assert!(!missing_programs_input(&absent, error), "{error}");
+    }
+    std::fs::write(&image, "not JSON").unwrap();
+    assert_eq!(installed_example_programs(None, home.path(), &image), Some(image.clone()));
+    assert!(!missing_programs_input(&image, "parsing JSON: invalid manifest"));
+}
+
 #[test]
 fn installed_example_deployments_publish_executable_prefill_shapes() {
     // cpu-gate --full enables the installed inventory; sparse fixtures always run.
     let Some(hf_home) = std::env::var_os("CUTEAFD_DEPLOYMENT_TEST_HF_HOME") else { return; };
     let hf_home = std::path::PathBuf::from(hf_home);
+    let default_programs = std::path::Path::new("/opt/cuteafd/share/PROGRAMS.json");
+    let programs = installed_example_programs(
+        std::env::var_os("CUTEAFD_DEPLOYMENT_TEST_PROGRAMS").map(Into::into),
+        &std::path::PathBuf::from(std::env::var_os("HOME").expect("HOME")), default_programs);
+    eprintln!("installed example PROGRAMS: {}", programs.as_deref().unwrap_or(default_programs).display());
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
     let mut examples = std::fs::read_dir(root.join("examples/configs")).unwrap()
         .map(|entry| entry.unwrap().path()).filter(|path|
@@ -187,6 +236,7 @@ fn installed_example_deployments_publish_executable_prefill_shapes() {
     let total = examples.len();
     let mut tested = 0;
     let mut skipped = 0;
+    let mut skipped_programs = 0;
     let mut families = std::collections::BTreeSet::new();
     for example in examples {
         let raw = std::fs::read_to_string(&example).unwrap();
@@ -215,11 +265,20 @@ fn installed_example_deployments_publish_executable_prefill_shapes() {
             ("EXLR8_MANIFEST", "--exlr8-manifest")] {
             if let Some(value) = config.get(key) { command.args([flag, value]); }
         }
-        if let Some(manifest) = std::env::var_os("CUTEAFD_DEPLOYMENT_TEST_PROGRAMS") {
+        if let Some(manifest) = &programs {
             command.arg("--workspace-manifest").arg(manifest);
         }
         let output = command.output().unwrap();
-        assert!(output.status.success(), "{name}: {}", String::from_utf8_lossy(&output.stderr));
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if output.status.code() == Some(1) && missing_programs_input(
+            programs.as_deref().unwrap_or(default_programs), &stderr) {
+            skipped += 1;
+            skipped_programs += 1;
+            eprintln!("{name}: SKIP PROGRAMS manifest not installed: {}",
+                programs.as_deref().unwrap_or(default_programs).display());
+            continue;
+        }
+        assert!(output.status.success(), "{name}: {stderr}");
         let deployment = release_accepts_prefill(&output.stdout);
         tested += 1;
         families.insert(deployment["family"].as_str().unwrap().to_owned());
@@ -227,5 +286,5 @@ fn installed_example_deployments_publish_executable_prefill_shapes() {
             deployment["prefill_unit_rows"], deployment["prefill_waves"], deployment["prefill_span_rows"]);
     }
     assert_eq!(tested + skipped, total);
-    eprintln!("installed example deployments: {tested} tested, {skipped} skipped, {total} configs, families={families:?}");
+    eprintln!("installed example deployments: {tested} tested, {skipped} skipped ({skipped_programs} missing PROGRAMS), {total} configs, families={families:?}");
 }

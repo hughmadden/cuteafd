@@ -8,9 +8,12 @@ both run, otherwise given entirely to the requested suite. Default excludes
 15 measured full-plan/cache tests; --full restores them and is required for
 work/p0 merges and releases. This includes the installed-example deployment-to-
 release_prefill_shape sweep: HF_HOME (or ~/.cache/huggingface) is the default
-inventory; CUTEAFD_DEPLOYMENT_TEST_HF_HOME overrides it. Missing checkpoints skip;
-installed ones must plan successfully. CUTEAFD_DEPLOYMENT_TEST_PROGRAMS optionally
-names the matching installed PROGRAMS.json and adjacent capacity manifests.
+inventory; CUTEAFD_DEPLOYMENT_TEST_HF_HOME overrides it. Missing checkpoints skip.
+The sweep discovers PROGRAMS.json in /opt/cuteafd/share, ~/.local/share/cuteafd,
+or the live V4 fixture's ~/.cache/cuteafd/builds/v3-p4/c1/artifacts (in that order).
+CUTEAFD_DEPLOYMENT_TEST_PROGRAMS overrides discovery, retaining adjacent capacity
+manifests. Configs requiring an absent PROGRAMS file skip with an explicit counted
+reason; planner failures with present inputs still fail.
 Receipts name every exclusion. --slow separately
 adds the explicit ignored CPU soaks and is also required at release cuts. Install cargo-nextest
 without root into the persistent architecture Cargo home (see AGENTS.md).
