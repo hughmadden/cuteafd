@@ -55,7 +55,7 @@ mod spark_tests {
     fn local_load_overlaps_spark_load_before_transport_connects() {
         for (source, load, connect) in [
             (include_str!("../v41_native_serve.rs"), "ExpertWeights::load(", "transport.bootstrap("),
-            (include_str!("distributed.rs"), "tp2_ffn::load_routed_weights(", "let mut make_transport ="),
+            (include_str!("distributed.rs"), "tp2_ffn::load_routed_weights(", "super::spark_transport("),
         ] {
             let start = source.find("admission::start_sparks(").or_else(|| source.find("plan.start_with(")).unwrap();
             let load = source[start..].find(load).unwrap() + start;
