@@ -10,18 +10,17 @@
 
 use super::prefill_waves::{unit_rows, MAX_WAVES};
 
-/// Idle share above which the Sparks starve: a deeper, narrower depth is tried.
+/// Idle share above which the Sparks starve: one more, narrower wave is tried.
 pub const IDLE_ADD: f64 = 0.05;
-/// Idle share below which the Sparks never starve: a shallower, wider depth may pay.
+/// Idle share below which the Sparks never starve.
 pub const IDLE_DROP: f64 = 0.01;
-/// Consecutive non-starving full-depth prefills before a wider depth is retried.
+/// Consecutive non-starving full-depth prefills before one fewer, wider wave is tried.
 pub const HOLD: u32 = 3;
-/// A move to another depth needs its period per row to beat the current
-/// depth's by this factor (hysteresis against noise).
+/// A trial keeps its new depth unless its period per row exceeds the old
+/// depth's by this factor.
 pub const KEEP: f64 = 1.02;
-/// Full-depth prefills after which a depth's measurement is stale and may be
-/// retried when the idle signal points at it.
-pub const STALE: u32 = 64;
+/// Full-depth prefills a rejected depth sits out before it may be retried.
+pub const COOLDOWN: u32 = 64;
 /// Weight of the newest call in each depth's running means.
 const WEIGHT: f64 = 0.25;
 
@@ -38,7 +37,7 @@ pub struct PrefillPace {
 
 impl PrefillPace {
     /// (Spark wall per prompt row in µs, idle share): the slowest rank's busy
-    /// + idle time per row, and the busiest rank's idle share (it sets the pace).
+    /// plus idle time per row, and the busiest rank's idle share (it sets the pace).
     pub fn summary(&self) -> Option<(f64, f64)> {
         if self.rows == 0 { return None; }
         let &(busy, idle) = self.ranks.iter().max_by_key(|(busy, _)| *busy)?;
@@ -52,16 +51,29 @@ impl PrefillPace {
 /// shared reserve's unit for `k`, never wider than what was admitted.
 pub fn unit_for(k: u64, unit_cap: u64) -> u64 { unit_rows(k).min(unit_cap) }
 
-/// The depths worth running under `max` waves and `unit_cap` rows: for each
-/// distinct unit, its deepest depth (more units in flight at the same unit
-/// only hide more turnaround at the same Spark cost per row). Ascending.
-pub fn candidates(max: u64, unit_cap: u64) -> Vec<u64> {
-    let max = max.clamp(1, MAX_WAVES);
+/// Rows every per-slot plane spans so any depth up to `slots` fits as views
+/// at `slot * unit_for(k)`: the largest `k * unit_for(k)` (8256 at most).
+pub fn reserve_rows(slots: u64, unit_cap: u64) -> u64 {
+    (1..=slots.clamp(1, MAX_WAVES)).map(|k| k * unit_for(k, unit_cap)).max().unwrap_or(0)
+}
+
+/// The depths worth running under `slots` and `unit_cap`: for each distinct
+/// unit, its deepest depth (more units in flight at the same unit only hide
+/// more turnaround at the same Spark cost per row). Ascending.
+pub fn candidates(slots: u64, unit_cap: u64) -> Vec<u64> {
+    let max = slots.clamp(1, MAX_WAVES);
     (1..=max).filter(|&k| k == max || unit_for(k + 1, unit_cap) != unit_for(k, unit_cap)).collect()
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
-struct Depth { period: Option<f64>, idle: Option<f64>, age: u32 }
+struct Depth { period: Option<f64>, cooldown: u32 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Phase {
+    Steady { quiet: u32 },
+    /// Running candidate `k` after `from`; decided by `k`'s next full-depth call.
+    Trial { from: u64 },
+}
 
 /// One boundary's decision (logged by the executor).
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -73,34 +85,34 @@ pub struct Decision {
     pub reason: &'static str,
 }
 
-/// Chooses the depth of each prefill among [`candidates`]. Starvation (idle
-/// above [`IDLE_ADD`]) tries the next deeper, narrower depth; no starvation
-/// for [`HOLD`] calls tries the next wider one; every candidate is measured
-/// once, because Spark cost per row is not monotone in unit width (Step's
-/// grouped-FP8 2048→2752 cliff, #762). The controller then runs the depth
-/// with the lowest measured Spark period per row. A pinned controller never
-/// moves (explicit PREFILL_WAVES, benchmarks, goldens).
+/// Chooses the depth of each prefill among [`candidates`] at each
+/// decode→prefill transition (#762): Spark idle above [`IDLE_ADD`] tries the
+/// next deeper, narrower candidate; idle below [`IDLE_DROP`] for [`HOLD`]
+/// calls tries the next wider one. A trial is kept unless its delivered Spark
+/// period per row (busy plus idle) exceeds the previous depth's by [`KEEP`];
+/// a rejected depth sits out [`COOLDOWN`] calls. Pinned controllers never
+/// move (explicit PREFILL_WAVES, benchmarks, goldens).
 #[derive(Debug, Clone, PartialEq)]
 pub struct WaveControl {
     k: u64,
     unit_cap: u64,
     pinned: bool,
     candidates: Vec<u64>,
-    quiet: u32,
+    phase: Phase,
     depths: [Depth; MAX_WAVES as usize],
 }
 
 impl WaveControl {
     /// Start at the planner's estimate `initial`, moved to the deepest depth
-    /// running the same unit.
-    pub fn new(initial: u64, max: u64, unit_cap: u64, pinned: bool) -> Self {
-        let candidates = candidates(max, unit_cap);
+    /// that runs the same unit.
+    pub fn new(initial: u64, slots: u64, unit_cap: u64, pinned: bool) -> Self {
+        let candidates = candidates(slots, unit_cap);
         let max = *candidates.last().expect("at least one depth");
         let initial = initial.clamp(1, max);
         let k = if pinned { initial } else {
             *candidates.iter().find(|&&k| k >= initial).expect("max is a candidate")
         };
-        Self { k, unit_cap, pinned, candidates, quiet: 0, depths: Default::default() }
+        Self { k, unit_cap, pinned, candidates, phase: Phase::Steady { quiet: 0 }, depths: Default::default() }
     }
     /// The wave count of the next prefill.
     pub fn waves(&self) -> u64 { self.k }
@@ -109,65 +121,54 @@ impl WaveControl {
     pub fn pinned(&self) -> bool { self.pinned }
     pub fn candidates(&self) -> &[u64] { &self.candidates }
 
-    fn at(&self, k: u64) -> &Depth { &self.depths[(k - 1) as usize] }
-
-    /// The candidate next to `k` towards deeper (`+1`) or wider (`-1`) units.
+    /// The candidate next to `k`, deeper (narrower units) or wider.
     fn neighbour(&self, k: u64, deeper: bool) -> Option<u64> {
         let index = self.candidates.iter().position(|&c| c == k)?;
         if deeper { self.candidates.get(index + 1).copied() } else { index.checked_sub(1).map(|i| self.candidates[i]) }
     }
-
-    /// Never measured, or measured long ago.
-    fn open(&self, k: u64) -> bool { let d = self.at(k); d.period.is_none() || d.age >= STALE }
+    fn ready(&self, k: u64) -> bool { self.depths[(k - 1) as usize].cooldown == 0 }
 
     /// One finished prefill that ran `waves` deep (fewer when the prompt was
-    /// short) reports its Spark pace. Only calls at the chosen depth count.
+    /// short) reports its Spark pace; only calls at the chosen depth count.
     /// Returns the next prefill's depth.
-    ///
-    /// Direction comes from the idle signal: a starving depth goes one deeper;
-    /// a depth with no idle for [`HOLD`] calls tries one wider. Every admitted
-    /// unit is measured once. Otherwise the depth with the lowest delivered
-    /// Spark period per row (busy plus idle, the critical rank's wall) runs;
-    /// a measurement older than [`STALE`] calls is retried when the idle
-    /// signal points at it, so a drifting turnaround is followed.
     pub fn observe(&mut self, waves: u64, pace: &PrefillPace) -> Decision {
         let (period, idle) = match pace.summary() {
             Some(sample) if !self.pinned && waves == self.k => sample,
             _ => return self.decision(None, None, if self.pinned { "pinned" } else { "not full depth" }),
         };
+        for depth in self.depths.iter_mut() { depth.cooldown = depth.cooldown.saturating_sub(1); }
         let k = self.k;
-        for depth in self.depths.iter_mut() { depth.age = depth.age.saturating_add(1); }
+        let trial = matches!(self.phase, Phase::Trial { .. });
         let entry = &mut self.depths[(k - 1) as usize];
-        // A stale mean restarts from its new sample.
-        let stale = entry.age > STALE;
-        let mean = |old: Option<f64>, new: f64| Some(match old { Some(old) if !stale => old + WEIGHT * (new - old), _ => new });
-        entry.period = mean(entry.period, period);
-        entry.idle = mean(entry.idle, idle);
-        entry.age = 0;
-        self.quiet = if idle < IDLE_DROP { self.quiet + 1 } else { 0 };
-        let starving = idle > IDLE_ADD;
-        let deeper = self.neighbour(k, true).filter(|_| starving);
-        let wider = self.neighbour(k, false).filter(|&w| self.quiet >= HOLD && self.open(w));
-        let unmeasured = self.candidates.iter().copied().find(|&c| self.at(c).period.is_none());
-        let (next, reason) = if let Some(d) = deeper {
-            (d, "Sparks starve: one more, narrower wave")
-        } else if let Some(w) = wider {
-            (w, "no Spark idle: one fewer, wider wave")
-        } else if let Some(u) = unmeasured.filter(|_| !starving) {
-            (u, "measure every admitted unit once")
-        } else {
-            // Exploit: the lowest measured period per row; the current depth
-            // keeps near-ties.
-            let current = self.at(k).period.unwrap_or(f64::INFINITY);
-            let best = self.candidates.iter().copied()
-                .filter_map(|c| self.at(c).period.map(|p| (c, p))).min_by(|a, b| a.1.total_cmp(&b.1));
-            match best {
-                Some((b, p)) if b != k && p * KEEP < current => (b, "lowest measured period per row"),
-                _ => (k, "hold"),
+        // A trial's first sample replaces any older mean of its depth.
+        entry.period = Some(match entry.period { Some(old) if !trial => old + WEIGHT * (period - old), _ => period });
+        let reason = match self.phase {
+            Phase::Trial { from } => {
+                self.phase = Phase::Steady { quiet: 0 };
+                if self.depths[(from - 1) as usize].period.is_some_and(|old| period > KEEP * old) {
+                    self.depths[(k - 1) as usize].cooldown = COOLDOWN;
+                    self.k = from;
+                    "trial regressed: revert"
+                } else { "trial kept" }
+            }
+            Phase::Steady { quiet } => {
+                let quiet = if idle < IDLE_DROP { quiet + 1 } else { 0 };
+                let deeper = self.neighbour(k, true).filter(|&d| idle > IDLE_ADD && self.ready(d));
+                let wider = self.neighbour(k, false).filter(|&w| quiet >= HOLD && self.ready(w));
+                if let Some(d) = deeper {
+                    self.phase = Phase::Trial { from: k };
+                    self.k = d;
+                    "Sparks starve: one more, narrower wave"
+                } else if let Some(w) = wider {
+                    self.phase = Phase::Trial { from: k };
+                    self.k = w;
+                    "no Spark idle: one fewer, wider wave"
+                } else {
+                    self.phase = Phase::Steady { quiet };
+                    "hold"
+                }
             }
         };
-        if next != k { self.quiet = 0; }
-        self.k = next;
         self.decision(Some(period), Some(idle), reason)
     }
 
@@ -180,66 +181,83 @@ impl WaveControl {
 mod tests {
     use super::*;
 
-    /// A k-deep pipeline over `units` units of `unit` rows on one Spark rank:
-    /// busy `s(unit)` per unit; the coordinator returns a unit after its wave
-    /// lands plus `t` (turnaround), so the Spark idles max(0, t - (k-1)·s).
-    fn pace(k: u64, unit: u64, rows: u64, s: impl Fn(u64) -> f64, t: f64) -> PrefillPace {
-        let units = rows.div_ceil(unit);
+    /// One rank of a k-deep pipeline: busy `s(unit)` per unit (input copies
+    /// included); the coordinator returns a unit `t` after its wave lands and a
+    /// fixed per-unit gap `g` remains (exchange/launch), so each unit after the
+    /// first idles max(g, t - (k-1)·busy).
+    fn pace(k: u64, unit: u64, rows: u64, s: impl Fn(u64) -> f64, t: f64, g: f64) -> PrefillPace {
         let busy = s(unit);
-        let idle = (t - (k as f64 - 1.0) * busy).max(0.0);
-        // Each rank's first unit is excluded.
-        let counted = units - 1;
+        let idle = (t - (k as f64 - 1.0) * busy).max(g);
+        let counted = rows.div_ceil(unit) - 1;
         PrefillPace { rows: rows - unit, ranks: vec![((busy * counted as f64) as u64, (idle * counted as f64) as u64); 6] }
     }
 
-    /// Runs `calls` 64K prefills from `start` and returns the settled depth.
-    fn settle(start: u64, max: u64, cap: u64, s: impl Fn(u64) -> f64 + Copy, t: f64, calls: usize) -> (u64, Vec<u64>) {
-        let mut control = WaveControl::new(start, max, cap, false);
-        let mut trace = Vec::new();
-        for _ in 0..calls {
+    fn run(control: &mut WaveControl, calls: usize, s: impl Fn(u64) -> f64 + Copy, t: f64, g: f64) -> Vec<u64> {
+        (0..calls).map(|_| {
             let k = control.waves();
-            let decision = control.observe(k, &pace(k, control.unit_rows(), 65536, s, t));
-            trace.push(decision.waves);
-        }
-        (control.waves(), trace)
+            control.observe(k, &pace(k, control.unit_rows(), 65536, s, t, g)).waves
+        }).collect()
     }
 
-    /// Step FP8 max oracle (#762): 4096 units 20.9 ms, 2752 16.6 ms, 2048
-    /// 8.38 ms; preceding gap ~1.1–2.2 ms. 4×2048 delivered best.
-    /// Turnaround bounded by the oracle's ~1.1 ms gaps at 3×2048 (2·8.38 + 1.1).
-    const STEP_T: f64 = 17_000.0;
+    /// Step FP8 max oracle (#762): full-unit compute 4096 rows 20.9 ms, 2752
+    /// 16.6 ms, 2048 8.38 ms (the grouped-FP8 BF16 2048→2304 cliff); 4×2048
+    /// delivered best. Turnaround bounded by 3×2048's ~1.1 ms gaps.
     fn step_s(unit: u64) -> f64 {
-        match unit { 4096 => 20_943.0, 2752 => 16_577.0, 2048 => 8_383.0, _ => 8_383.0 * unit as f64 / 2048.0 }
+        match unit { 4096 => 20_943.0, 2752 => 16_577.0, _ => 8_383.0 * unit as f64 / 2048.0 }
     }
+    const STEP_T: f64 = 17_000.0;
 
     #[test]
-    fn step_oracle_settles_on_four_by_2048_from_every_admitted_start() {
-        // 2752 units cost twice a 2048 unit for 1.34× the rows (the grouped
-        // FP8 BF16 cliff), 4096 units 2.5×: whatever the admitted extent and
-        // start, the controller settles on 4×2048 within a few prefills.
+    fn step_holds_its_measured_four_by_2048_against_wider_trials() {
         for cap in [2048, 2752, 4096] {
-            for start in 1..=4 {
-                let (k, trace) = settle(start, 4, cap, step_s, STEP_T, 40);
-                assert_eq!(k, 4, "cap {cap} start {start}: {trace:?}");
-                // At most one call per wider unit before it settles.
-                assert!(trace.iter().skip(3).all(|&k| k == 4), "cap {cap} start {start}: {trace:?}");
-            }
+            let mut control = WaveControl::new(4, 4, cap, false);
+            let trace = run(&mut control, 400, step_s, STEP_T, 0.0);
+            let off = trace.iter().filter(|&&k| k != 4).count();
+            assert!(off <= 400 / COOLDOWN as usize + 1, "cap {cap}: {off} calls off 4×2048");
+            assert_eq!(control.waves(), 4);
         }
     }
 
     #[test]
-    fn glm_estimate_holds_three_waves() {
-        // GLM K4 six Sparks: S ≈ 13 ms per 2752 unit, T ≈ 19.5 ms, and 2048
-        // rows cost more per row (#762 audit). k=3 hides T (2·13 > 19.5).
-        let s = |unit: u64| if unit == 2048 { 3.674 * 2048.0 * 13_000.0 / (3.448 * 2752.0) } else { 13_000.0 * unit as f64 / 2752.0 };
-        let (k, trace) = settle(3, 4, 2752, s, 19_500.0, 40);
-        assert_eq!(k, 3, "{trace:?}");
+    fn step_starving_at_three_by_2752_moves_to_four_by_2048() {
+        // 3×2752's measured inter-unit gap (~1.5 ms of 16.6, #762 oracle) is
+        // above the add threshold; the narrower trial is far cheaper per row.
+        let mut control = WaveControl::new(3, 4, 2752, false);
+        let trace = run(&mut control, 20, step_s, STEP_T, 1_500.0);
+        assert_eq!(trace[0], 4, "{trace:?}");
+        assert!(trace.iter().all(|&k| k == 4), "{trace:?}");
+    }
+
+    #[test]
+    fn glm_holds_three_by_2752() {
+        // GLM K4 six Sparks: S ≈ 13 ms per 2752 unit, T ≈ 19.5 ms hidden by
+        // 3 units; 2048 rows cost more per row (#762 row-band audit).
+        let s = |unit: u64| if unit == 2048 { 3.674 * 2048.0 * 13_000.0 / (3.448 * 2752.0) }
+            else { 13_000.0 * unit as f64 / 2752.0 };
+        let mut control = WaveControl::new(3, 4, 2752, false);
+        assert!(run(&mut control, 200, s, 19_500.0, 0.0).iter().all(|&k| k == 3));
+        // A starving depth whose narrower trial costs 1.5× per row (a kernel
+        // cliff) tries it once, finds the period worse, and reverts.
+        let steep = |unit: u64| if unit == 2048 { 1.5 * 13_000.0 * 2048.0 / 2752.0 } else { 13_000.0 * unit as f64 / 2752.0 };
+        let mut control = WaveControl::new(3, 4, 2752, false);
+        let trace = run(&mut control, 10, steep, 30_000.0, 0.0);
+        assert_eq!(&trace[..2], [4, 3], "{trace:?}");
+        assert!(trace[2..].iter().all(|&k| k == 3), "{trace:?}");
+    }
+
+    #[test]
+    fn a_wider_unit_is_tried_when_idle_is_zero_and_kept_when_cheaper() {
+        // Smooth curve (per-row cost falls with width) and T hidden at 2×4096.
+        let s = |unit: u64| 1_000.0 + 3.0 * unit as f64;
+        let mut control = WaveControl::new(4, 4, 4096, false);
+        let trace = run(&mut control, 12, s, 5_000.0, 0.0);
+        assert_eq!(control.waves(), 2, "{trace:?}");
     }
 
     #[test]
     fn short_prompts_and_pins_never_move_the_depth() {
         let mut control = WaveControl::new(3, 4, 2752, false);
-        let starving = pace(3, 2752, 65536, |_| 5_000.0, 50_000.0);
+        let starving = pace(3, 2752, 65536, |_| 5_000.0, 50_000.0, 0.0);
         assert_eq!(control.observe(2, &starving).reason, "not full depth");
         assert_eq!(control.waves(), 3);
         let mut pinned = WaveControl::new(2, 4, 4096, true);
@@ -249,55 +267,22 @@ mod tests {
     }
 
     #[test]
-    fn a_worse_explored_depth_is_left_after_one_call() {
-        // GLM K4 per-row Spark curve (#762 audit): 2048 rows 3.674 us/row,
-        // 2752 rows 3.448; T hidden at both. 4×2048 is explored once, then 3.
-        let s = |unit: u64| if unit == 2048 { 3.674 * 2048.0 } else { 3.448 * unit as f64 };
-        let mut control = WaveControl::new(3, 4, 2752, false);
-        let d = control.observe(3, &pace(3, 2752, 65536, s, 15_000.0));
-        assert_eq!((d.waves, d.reason), (4, "measure every admitted unit once"));
-        let d = control.observe(4, &pace(4, 2048, 65536, s, 15_000.0));
-        assert_eq!((d.waves, d.reason), (3, "lowest measured period per row"));
-        for _ in 0..200 { assert_eq!(control.observe(3, &pace(3, 2752, 65536, s, 15_000.0)).waves, 3); }
-    }
-
-    #[test]
-    fn a_wider_unit_that_starves_is_rejected_and_only_retried_when_stale() {
-        // 4096 units are cheapest per row, but 2×4096 cannot hide T (one
-        // 12.3 ms unit against 25 ms) while 3×2752 does (2·10.3 ms ≈ 20.5 ms
-        // plus its own); 2048 units pay a fixed per-unit cost that 2752 hides.
-        let s = |unit: u64| 3.0 * unit as f64 + if unit == 4096 { 0.0 } else { 2_000.0 } + if unit == 2048 { 3_000.0 } else { 0.0 };
-        let t = 20_000.0;
-        let mut control = WaveControl::new(3, 4, 4096, false);
-        let mut trace = Vec::new();
-        for _ in 0..300 {
-            let k = control.waves();
-            trace.push(control.observe(k, &pace(k, control.unit_rows(), 65536, s, t)).waves);
-        }
-        let at = |k| trace.iter().filter(|&&w| w == k).count();
-        assert!(at(2) <= 300 / STALE as usize + 2, "2×4096 retried too often: {trace:?}");
-        assert!(at(3) > 250, "{trace:?}");
-    }
-
-    #[test]
-    fn candidates_are_the_deepest_depth_per_distinct_unit() {
+    fn candidates_and_reserve_stay_inside_the_shared_reserve() {
         assert_eq!(candidates(4, 4096), [2, 3, 4]);
         assert_eq!(candidates(4, 2752), [3, 4]);
         assert_eq!(candidates(4, 2048), [4]);
         assert_eq!(candidates(2, 4096), [2]);
         assert_eq!(candidates(1, 4096), [1]);
-        assert_eq!(WaveControl::new(1, 4, 2752, false).waves(), 3);
-        assert_eq!(WaveControl::new(1, 4, 2752, true).waves(), 1);
-    }
-
-    #[test]
-    fn units_never_exceed_the_admitted_extent() {
+        assert_eq!((reserve_rows(4, 4096), reserve_rows(4, 2752), reserve_rows(4, 2048), reserve_rows(2, 4096)),
+            (8256, 8256, 8192, 8192));
         for cap in [2048, 2752, 4096] {
             for k in 1..=4 {
-                let unit = WaveControl::new(k, 4, cap, false).unit_rows();
-                assert!(unit <= cap && unit * k <= 8256 && unit % 64 == 0, "cap {cap} k {k}: {unit}");
+                let unit = WaveControl::new(k, 4, cap, true).unit_rows();
+                assert!(unit <= cap && unit * k <= reserve_rows(4, cap) && unit % 64 == 0, "cap {cap} k {k}: {unit}");
             }
         }
+        assert_eq!(WaveControl::new(1, 4, 2752, false).waves(), 3);
+        assert_eq!(WaveControl::new(1, 4, 2752, true).waves(), 1);
         assert_eq!(WaveControl::new(9, 2, 4096, false).waves(), 2);
     }
 
