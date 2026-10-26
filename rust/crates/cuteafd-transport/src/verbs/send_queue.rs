@@ -48,9 +48,13 @@ impl VerbsHostProtocolV2PersistentClientSession {
 
     /// Validates `request`, stages its frame in this session's send slot (the
     /// payload stays in registered egress if it is there) and posts it as one
-    /// SEND.
-    pub(super) fn post_request(&mut self, request: &ExpertProtocolV2Request, config: &TcpTransportConfig)
-        -> Result<VerbsHostProtocolV2ChunkSubmissionTiming> {
+    /// SEND. A placed-landing session first posts the request's own receive at
+    /// `landing` (its wave's slice of the registered range), so the reply has
+    /// a receive before the worker can answer; other sessions take `None`.
+    pub(super) fn post_request(&mut self, request: &ExpertProtocolV2Request, config: &TcpTransportConfig,
+        landing: Option<LandingSlice>) -> Result<VerbsHostProtocolV2ChunkSubmissionTiming> {
+        anyhow::ensure!(landing.is_some() == self.placed_landing,
+            "a placed GPU landing needs every request's landing slice, and only it takes one");
         if let Some(lease) = &self.endpoint.credits.endpoint { lease.validate_request(&request.header)?; }
         if let Some(ring) = &mut self.retained_response_ring {
             ring.reclaim_before_request(&self.endpoint, self.response_ring)?;
@@ -69,6 +73,9 @@ impl VerbsHostProtocolV2PersistentClientSession {
             "persistent verbs-host ProtocolV2 expected response frame length {expected_response} exceeds capacity {}",
             self.response_capacity_wire_bytes.min(config.max_frame_bytes));
         let encode_ms = elapsed_ms_optional(total_started);
+        if let Some(slice) = landing {
+            self.post_placed_receive(slice, expected_response)?;
+        }
         // Source slot: the SEND that used it last has completed.
         while self.request_sends.in_flight() >= self.request_ring.depth {
             self.wait_request_send(config.timeout)?;
@@ -113,6 +120,35 @@ impl VerbsHostProtocolV2PersistentClientSession {
         self.request_send_sequence = self.request_send_sequence.wrapping_add(1);
         Ok(VerbsHostProtocolV2ChunkSubmissionTiming { total_started, encode_ms, expected_response_ms,
             send_ms: elapsed_ms_optional(send_started) })
+    }
+}
+
+impl VerbsHostProtocolV2PersistentClientSession {
+    /// One receive for the next reply: its header into the next header slot
+    /// of the response ring (replies complete in post order on this QP), its
+    /// payload into `slice` of the registered landing range. At most a ring of
+    /// replies may be outstanding, so header slots are never reused early.
+    fn post_placed_receive(&mut self, slice: LandingSlice, expected_response: usize) -> Result<()> {
+        let outstanding = self.response_post_sequence.wrapping_sub(self.response_recv_sequence);
+        anyhow::ensure!(outstanding < self.response_ring.depth,
+            "placed GPU landing has {outstanding} replies outstanding, its header ring holds {}", self.response_ring.depth);
+        let payload = expected_response.checked_sub(EXPERT_PROTOCOL_V2_RESPONSE_HEADER_LEN)
+            .context("expected reply is shorter than its header")?;
+        anyhow::ensure!(payload <= slice.bytes,
+            "a reply of {payload} payload bytes exceeds its {}-byte landing slice", slice.bytes);
+        let sequence = self.response_post_sequence;
+        let wr_id = VERBS_HOST_RECV_WR_ID + (sequence % self.response_ring.depth) as u64;
+        // SAFETY: the range was registered at connect and is kept allocated by
+        // the landing's owner (`SparkExperts::set_gpu_landing`); the caller
+        // places only this wave in the slice until its reply is consumed, and
+        // native checks the slice against the registered range.
+        unsafe {
+            self.endpoint.library.rdma_rc_endpoint_post_recv_landing_at(self.endpoint.info.handle,
+                self.response_ring.slot_offset(sequence), self.response_ring.slot_capacity_bytes, wr_id,
+                slice.offset, slice.bytes)?;
+        }
+        self.response_post_sequence = sequence.wrapping_add(1);
+        Ok(())
     }
 }
 
