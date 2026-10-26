@@ -23,10 +23,10 @@ pub struct DecodeExecution {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PrefillExecution {
-    /// Largest unit on the admitted prefill ladder, not the selected k's rows:
-    /// scratch is sized here once, whatever k the scheduler runs.
+    /// Largest unit this owner can run. Static admission uses `unit_rows`;
+    /// a future dynamic repartition must explicitly admit a larger extent.
     pub capacity: u32,
-    /// Family package's covering export for that maximum unit.
+    /// Family package's covering export for that admitted extent.
     pub compiled_capacity: u32,
     /// Rows of one selected unit (the reserve divided by k). Per-unit input
     /// landing and reply staging are sized here, and prefill requests are
@@ -98,8 +98,8 @@ pub fn covering_export(exports: &[u32], rows: u32) -> Option<u32> {
 
 impl SparkExecutions {
     /// The one admission constructor: `decode_rows` per decode lane, the
-    /// largest prefill unit on the ladder (`prefill_rows`), the selected unit
-    /// and the retained unit count, with every compiled capacity taken from
+    /// admitted prefill extent (`prefill_rows`), the selected unit and the
+    /// retained unit count, with every compiled capacity taken from
     /// the package's export ladder. An uncovered capacity is a typed refusal,
     /// never a silently larger or smaller owner.
     pub fn admit(decode_rows: &[u32], prefill_rows: u32, unit_rows: u32, buffered_units: u8, exports: &[u32])

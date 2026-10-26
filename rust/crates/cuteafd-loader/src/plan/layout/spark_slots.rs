@@ -229,6 +229,27 @@ mod tests {
     }
 
     #[test]
+    fn static_prefill_owner_charges_the_selected_export_and_live_io() -> anyhow::Result<()> {
+        use crate::plan::spark_executions::{admit_family, SparkBackend};
+        let geometry = cuteafd_core::ExpertGeometry::STEP5;
+        let formats = [ExpertFormat::Fp8Block128, ExpertFormat::Bf16];
+        let maximum = fp8_owner_bytes("step5", geometry, &formats, extent(4096, 4096))?;
+        let mut scratch = Vec::new();
+        for (unit, waves, compiled) in [(4096, 2, 4096), (2752, 3, 4096), (256, 3, 256)] {
+            let executions = admit_family("step5", &SparkBackend::Fp8.exports(), None, unit, waves)?;
+            let prefill = executions.owners().last().unwrap();
+            let actual = fp8_owner_bytes("step5", geometry, &formats, prefill)?;
+            assert_eq!(actual.scratch, group_scratch("step5", ExpertFormat::Fp8Block128, compiled)?
+                .max(group_scratch("step5", ExpertFormat::Bf16, compiled)?));
+            assert_eq!(actual.io, maximum.io / 4096 * unit);
+            scratch.push(actual.scratch);
+        }
+        assert_eq!(scratch[0], scratch[1], "default shapes still cover the 4096 export");
+        assert!(scratch[2] < scratch[0], "narrow pin must not retain maximum-unit scratch");
+        Ok(())
+    }
+
+    #[test]
     fn rotated_widths_sum_worker_owners_but_repeated_layers_do_not() -> anyhow::Result<()> {
         use crate::plan::testing;
         let root = tempfile::tempdir()?;
@@ -333,15 +354,13 @@ mod tests {
             assert_eq!(owners, prefill + live * (5120 + 5120 / 32 + 6 * 8) + decode);
             assert_eq!(staging, 2 * 64 * 6 * 8 + 2 * live * 6 * 8);
         }
-        // A ladder executor on the same package: k units divide the reserve.
-        let mut charged = Vec::new();
-        for (unit, waves) in [(4096, 1), (4096, 2), (2752, 3), (2048, 4)] {
+        // A static ladder owner retains only the selected unit's device I/O;
+        // the calibrated scratch bound stays conservative at smaller exports.
+        for (unit, waves) in [(4096, 1), (4096, 2), (2752, 3), (2048, 4), (256, 3)] {
             let (owners, staging) = charge(&mut device, "deepseek_v4", unit, waves)?;
-            assert_eq!(owners, 810 * (1 << 20) + decode / 2);
+            assert_eq!(owners, 810 * (1 << 20) - (4096 - unit) * (5120 + 5120 / 32 + 6 * 8) + decode / 2);
             assert_eq!(staging, 64 * 6 * 8 + unit * waves * 6 * 8);
-            charged.push(owners);
         }
-        assert!(charged.windows(2).all(|pair| pair[0] == pair[1]), "{charged:?}");
         Ok(())
     }
 
