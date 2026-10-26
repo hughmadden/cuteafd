@@ -335,7 +335,7 @@ fn shared_prefill_family_estimates_match_runtime_and_pins_keep_hard_limits() {
             let expected = daemon.unit_rows;
             assert_eq!((options.prefill_rows, options.spark_capacity_rows), (expected, expected));
             assert_eq!((report.prefill_unit_rows, report.prefill_waves, report.prefill_span_rows),
-                (Some(expected), Some(daemon.waves), Some(expected * daemon.waves)));
+                (Some(expected), Some(daemon.waves), Some(daemon.span_rows)));
         }
         let mut options = wave_plan_options(dir.path(), 6).layout.unwrap();
         options.workspace_manifest = Some(manifest.clone());

@@ -199,8 +199,11 @@ impl<'a> Engine<'a> {
         io: Vec<[TokenIo<'a>; 2]>,
         experts: Vec<[Option<crate::shared::experts::rtx::exl3::Exl3Tp2<'a>>; 2]>,
         prefill: PrefillUnits) -> Result<Self> {
-        ensure!(prefill.waves > 0 && local.iter().all(|pair| pair[0].rows() >= prefill.unit_rows * prefill.waves
-            || prefill.waves == 1), "Kimi lane rows hold fewer than the admitted prefill units in flight");
+        // Every admitted depth's units (each cut at that depth, #762) fit the lane.
+        let reserve = cuteafd_loader::serving_capacity::wave_control::reserve_rows(prefill.slots as u64,
+            prefill.unit_rows as u64) as usize;
+        ensure!(prefill.waves > 0 && local.iter().all(|pair| pair[0].rows() >= reserve.min(prefill.unit_rows * prefill.slots)
+            || prefill.slots == 1), "Kimi lane rows hold fewer than the admitted prefill units in flight");
         ensure!(!local.is_empty() && local.len() == routed.len() && local.len() == io.len() && local.len() == experts.len(),
             "Kimi engine local, Spark and IO lane counts differ");
         check_exchange_streams(&peer, &exchange_streams)?;
@@ -406,6 +409,8 @@ impl<'a> Engine<'a> {
                 ran
             } else {
                 ensure!(rows <= self.prefill.unit_rows, "Kimi {rows}-row multi-sequence step exceeds one prefill unit");
+                // A step wider than the last prefill's cut runs on one admitted unit (#762).
+                routed[0].fit_rows(rows)?;
                 self.execution.run(scope, &self.peer, &self.hops,
                     &mut local[..1], &mut routed[..1], &mut experts[..1], &[rows], speculative,
                     super::layers::Output::Normalized, self.draft.as_deref(), Some(&self.draft_probe))

@@ -107,8 +107,10 @@ impl<'a> RoutedLane<'a> {
             ensure!(link.installed_grouping()?.len() == RANKS,
                 "Kimi bootstrap requires installed grouping from all six ranks");
         }
+        // One admitted unit until the first prefill re-cuts to its depth.
+        if waves > 1 { stream.device.run(|| link.set_geometry(1, unit))?; }
         Ok(Self { stream, link: Some(link), library_owner: Arc::clone(library_owner),
-            terminal: false, capacity: unit, waves, unit, sequence: std::cell::Cell::new(0),
+            terminal: false, capacity: unit, waves: 1, unit, sequence: std::cell::Cell::new(0),
             outstanding: std::collections::VecDeque::new() })
     }
 
@@ -122,6 +124,13 @@ impl<'a> RoutedLane<'a> {
         self.stream.device.run(|| link.set_geometry(waves, unit))?;
         (self.waves, self.unit) = (waves, unit);
         Ok(())
+    }
+
+    /// Re-cuts to one admitted unit when a non-prefill step of `rows` rows is
+    /// wider than the current cut (at rest, between steps; #762).
+    pub(crate) fn fit_rows(&mut self, rows: usize) -> Result<()> {
+        if rows <= self.unit { return Ok(()); }
+        self.set_depth(1, self.capacity)
     }
 
     /// The decode→prefill transition (#762): reports the previous prefill

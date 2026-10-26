@@ -131,7 +131,7 @@ fn mimo_pro_max_plan_deployment_is_accepted_by_release_prefill_shape() {
 }
 
 #[test]
-fn glm53_max_deployment_starts_at_three_2752_row_waves_in_four_slots() {
+fn glm53_max_deployment_admits_four_4096_row_slots_starting_at_three() {
     use cuteafd_loader::plan::testing;
     let snapshot = tempfile::tempdir().unwrap();
     testing::write_snapshot(snapshot.path(), &testing::glm5_config(),
@@ -144,7 +144,8 @@ fn glm53_max_deployment_starts_at_three_2752_row_waves_in_four_slots() {
             "--speculator", "off", "--workspace-manifest"]).arg(manifest).output().unwrap();
     assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
     let deployment = release_accepts_prefill(&output.stdout);
-    assert_eq!(deployment["prefill_unit_rows"], 2752);
+    // The admitted unit (reserve / 2); the depth starts at 3 (2752-row cuts).
+    assert_eq!(deployment["prefill_unit_rows"], 4096);
     assert_eq!(deployment["prefill_waves"], 3);
     assert_eq!(deployment["prefill_slots"], 4);
     assert_eq!(deployment["prefill_span_rows"], 8256);

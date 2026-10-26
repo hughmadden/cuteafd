@@ -314,19 +314,22 @@ mod draft_cli_tests {
             resolve_prefill(&mut args).unwrap();
             (args.prefill_rows, args.prefill_waves, args.prefill_span_rows, args.admitted_slots)
         };
-        assert_eq!(resolve(&[]), (2752, 3, 8256, 4));
+        assert_eq!(resolve(&[]), (4096, 3, 8256, 4));
         assert_eq!(resolve(&["--prefill-waves", "3"]), (2752, 3, 8256, 3));
         assert_eq!(resolve(&["--prefill-waves", "4"]), (2048, 4, 8192, 4));
         assert_eq!(resolve(&["--attention-placement", "layers", "--split-device", "1"]), (2752, 3, 8256, 3));
-        // Re-resolving resolved arguments (golden, then with_engine) pins the depth.
+        // A golden pins the starting depth at its own cut; with_engine keeps it.
         let mut args = Parse::try_parse_from(["test", "--snapshot", "/c", "--native-lib", "/n", "--peers",
             peers.as_str()]).unwrap().engine;
         resolve_prefill(&mut args).unwrap();
+        args.prefill_rows = cuteafd_loader::serving_capacity::wave_control::unit_for(
+            u64::from(args.prefill_waves), args.prefill_rows as u64) as usize;
+        args.prefill_span_rows = args.prefill_rows * usize::from(args.prefill_waves);
         resolve_prefill(&mut args).unwrap();
-        assert_eq!((args.prefill_waves, args.admitted_slots), (3, 3));
+        assert_eq!((args.prefill_rows, args.prefill_waves, args.admitted_slots), (2752, 3, 3));
         // A launch passes its deployment's slots back: adaptive stays adaptive.
-        assert_eq!(resolve(&["--prefill-rows", "2752", "--prefill-waves", "3", "--prefill-span-rows", "8256",
-            "--prefill-slots", "4"]), (2752, 3, 8256, 4));
+        assert_eq!(resolve(&["--prefill-rows", "4096", "--prefill-waves", "3", "--prefill-span-rows", "8256",
+            "--prefill-slots", "4"]), (4096, 3, 8256, 4));
         assert_eq!(resolve(&["--prefill-rows", "2752", "--prefill-waves", "3", "--prefill-span-rows", "8256",
             "--prefill-slots", "3"]), (2752, 3, 8256, 3));
     }
@@ -1162,6 +1165,9 @@ impl Opened {
                 let mut link = SparkLink::new_reserve(&self.library, world, &peers, 4096, config.clone(), row_bytes,
                     prefill_lanes, u32::try_from(args.prefill_rows)?, usize::try_from(reserve)?)?;
                 link.bootstrap(&warm()?)?;
+                // The warm-up wave is one admitted unit wide: one slot of it (each
+                // prefill re-cuts to its own depth at rest).
+                link.set_geometry(1, args.prefill_rows)?;
                 Some(link)
             }
             None => None,
@@ -1608,8 +1614,12 @@ fn bench_prefill(args: &GoldenArgs, engine: &engine::GlmEngine<'_>,
 }
 
 fn golden(mut args: GoldenArgs) -> Result<()> {
-    // Reject invalid explicit geometry before checkpoint I/O.
+    // Reject invalid explicit geometry before checkpoint I/O. Goldens pin the
+    // starting depth at its own unit (an adaptive unit cut at that depth).
     resolve_prefill(&mut args.engine)?;
+    args.engine.prefill_rows = usize::try_from(cuteafd_loader::serving_capacity::wave_control::unit_for(
+        u64::from(args.engine.prefill_waves), args.engine.prefill_rows as u64))?;
+    args.engine.prefill_span_rows = args.engine.prefill_rows * usize::from(args.engine.prefill_waves);
     // Validate the scoring call before opening CUDA or loading any weights.
     let rows = args.engine.prefill_rows;
     crate::shared::prefill_pipeline::retained_logits_units(rows, rows,

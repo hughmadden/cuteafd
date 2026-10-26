@@ -488,10 +488,12 @@ mod tests {
                 // Sparks, 2 x 4096 below; an explicit PREFILL_WAVES pins k.
                 let planned = crate::plan::Family::prefill_limits(&crate::plan::families::glm::GLM5).estimate.waves(sparks);
                 let waves = if requested == 0 { planned } else { requested };
-                let rows = if unit != 0 { unit } else if waves > 1 {
-                    crate::serving_capacity::prefill_waves::unit_rows(waves) } else { 4096 };
-                // An unpinned shape admits four slots of its unit inside one reserve (#762).
-                let admitted = if requested == 0 && span.is_none() {
+                // An unpinned shape admits four slots of the widest unit (4096)
+                // inside one reserve and starts at the estimate (#762).
+                let adaptive = requested == 0 && span.is_none();
+                let rows = if unit != 0 { unit } else if adaptive || waves <= 1 { 4096 } else {
+                    crate::serving_capacity::prefill_waves::unit_rows(waves) };
+                let admitted = if adaptive {
                     crate::serving_capacity::wave_control::reserve_rows(4, rows) } else { rows * waves };
                 assert_eq!(geometry(&native), (Some(rows), Some(waves), Some(span.unwrap_or(admitted)), Some(1)));
                 assert_eq!(geometry(&native), geometry(&exl3), "{gpus} RTX/{sparks} Sparks");

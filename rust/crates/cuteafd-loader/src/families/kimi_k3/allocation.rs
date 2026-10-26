@@ -307,14 +307,16 @@ pub fn prefill_shape_with(rows: usize, waves: usize, unit: Option<usize>)
         && (1..=LANE_ROWS_MAX).contains(&rows) && rows >= 64 * waves,
         "Kimi lane row/wave capacity: {rows} rows x {waves} waves");
     let unit = unit.unwrap_or(rows / waves) as u64;
-    // An adaptive lane's rows are the reserve of four admitted slots (#762).
-    // Only the starting depth's own unit (its estimate's shape) is admitted that way.
+    // An adaptive lane (#762): the reserve of four admitted slots of `unit`,
+    // starting at `waves` units of that depth's cut.
     let slots = (rows as u64 != unit * waves as u64
-        && unit == crate::serving_capacity::prefill_waves::unit_rows(waves as u64))
+        && rows as u64 == crate::serving_capacity::wave_control::reserve_rows(4, unit))
         .then_some(crate::serving_capacity::prefill_waves::MAX_WAVES);
-    Ok(prefill_shape(6, PrefillLimits { adaptive: true, ..PrefillLimits::default() }, PrefillOverrides {
+    // The admitted unit (every unit-sized owner) and the starting depth.
+    let plan = prefill_shape(6, PrefillLimits { adaptive: true, ..PrefillLimits::default() }, PrefillOverrides {
         unit_rows: Some(unit), waves: Some(waves as u64), span_rows: Some(rows as u64), slots,
-    })?.units())
+    })?;
+    Ok(crate::serving_capacity::PrefillShape { unit_rows: plan.unit_rows, waves: plan.waves })
 }
 
 pub fn exchange_demand(rows: usize, rank: u8, f32_partials: bool, progress: usize) -> Result<Demand> {
@@ -448,12 +450,15 @@ mod tests {
         assert!(unit(8192, 1, None).is_err(), "a unit is at most 4096 rows");
         assert!(unit(8192, 2, Some(8192)).is_err(), "a unit is at most 4096 rows");
         assert!(unit(4096, 2, Some(4096)).is_err(), "the lane holds both units");
-        assert!(unit(8192, 2, Some(2048)).is_err(), "the lane cannot exceed the exact live units");
+        // 8192 rows of 2048-row units are four admitted slots (#762), any starting depth.
+        assert_eq!(unit(8192, 2, Some(2048))?, 2048);
+        assert!(unit(6144, 2, Some(2048)).is_err(), "the lane cannot exceed the exact live units");
         assert!(unit(4097, 2, None).is_err(), "the lane cannot hide a rounded tail");
-        // An adaptive lane (#762): four admitted slots' reserve from the starting depth's unit.
+        // An adaptive lane (#762): four admitted 4096-row slots' reserve at any starting depth.
         assert_eq!(unit(8256, 2, Some(4096))?, 4096);
-        assert_eq!(unit(8256, 3, Some(2752))?, 2752);
-        assert!(unit(8256, 2, Some(2752)).is_err(), "only the starting depth's own unit");
+        assert_eq!(unit(8256, 3, Some(4096))?, 4096);
+        assert!(unit(8256, 4, Some(4096)).is_err(), "four of four slots is a pinned 4 x 4096");
+        assert!(unit(8256, 2, Some(2048)).is_err(), "the reserve of 2048-row slots is 8192 rows");
         Ok(())
     }
 }

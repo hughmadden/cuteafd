@@ -229,8 +229,8 @@ mod tests {
         let plan_input = cuteafd_loader::plan::testing::BudgetedPlanInput::open(snapshot.path())?;
         let peers = "127.0.0.1:1,127.0.0.1:2,127.0.0.1:3,127.0.0.1:4,127.0.0.1:5,127.0.0.1:6";
         for (extra, expected, slots) in [
-            // Unpinned: start 3×2752, admit four slots in the same reserve (#762).
-            (vec![], (2752, 3, 8256), 4),
+            // Unpinned: admit four 4096-row slots, start at 3 (2752-row cuts) (#762).
+            (vec![], (4096, 3, 8256), 4),
             // Units are the 8192-row reserve divided by k.
             (vec!["--prefill-waves", "2"], (4096, 2, 8192), 2),
             (vec!["--prefill-rows", "4096", "--prefill-waves", "2"], (4096, 2, 8192), 2),
@@ -249,7 +249,8 @@ mod tests {
             assert_eq!(cuteafd_loader::families::kimi_k3::spark_reserve_bytes(shape.slots, shape.unit_rows)?,
                 cuteafd_loader::families::kimi_k3::spark_reserve_bytes(shape.admitted().waves, shape.admitted().unit_rows)?);
             assert_eq!(allocation::prefill_shape_with(shape.span_rows as usize, shape.waves as usize,
-                Some(shape.unit_rows as usize))?, shape.units());
+                Some(shape.unit_rows as usize))?, cuteafd_loader::serving_capacity::PrefillShape {
+                    unit_rows: shape.unit_rows, waves: shape.waves });
             let options = PlanOptions { placement: ExpertPlacement::Sparks { ranks: 6 },
                 layout: Some(LayoutOptions { rtx_bytes: vec![96 << 30; 2], host_memory: Some((128 << 30, 128 << 30)),
                     host_cache_bytes: Some(0), prefill_rows: args.prefill_rows.unwrap_or(0) as u64,

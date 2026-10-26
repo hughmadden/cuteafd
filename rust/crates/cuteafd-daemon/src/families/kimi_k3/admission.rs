@@ -1166,7 +1166,8 @@ pub(super) mod tests {
             ..Default::default()
         })?;
         ensure!(automatic.fits && automatic.placement_supported, "Auto shape/pool: {:?}", automatic.hints);
-        assert_eq!((automatic.prefill_unit_rows, automatic.prefill_waves), (Some(2752), Some(3)));
+        assert_eq!((automatic.prefill_unit_rows, automatic.prefill_waves, automatic.prefill_slots),
+            (Some(4096), Some(3), Some(4)));
         assert!(automatic.memory_layout.context("automatic Kimi ledger")?.pool_tokens
             >= cuteafd_loader::families::kimi_k3::DEFAULT_CONTEXT as u64);
         let mut refused = 0;

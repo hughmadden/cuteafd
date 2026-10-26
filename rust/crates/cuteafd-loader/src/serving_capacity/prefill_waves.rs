@@ -116,9 +116,10 @@ pub struct PrefillPlan {
 }
 
 impl PrefillPlan {
-    /// The starting depth's units (the static executor's shape).
+    /// The starting depth's units: `waves` of the admitted unit's cut at that
+    /// depth (`wave_control::unit_for`; the unit itself when static).
     pub fn units(self) -> super::PrefillShape {
-        super::PrefillShape { unit_rows: self.unit_rows, waves: self.waves }
+        super::PrefillShape { unit_rows: super::wave_control::unit_for(self.waves, self.unit_rows), waves: self.waves }
     }
     /// The admitted maximum: `slots` slots of at most the admitted unit.
     pub fn admitted(self) -> super::PrefillShape {
@@ -128,9 +129,45 @@ impl PrefillPlan {
     pub fn adaptive(self) -> bool { self.slots > self.waves || super::wave_control::candidates(self.slots, self.unit_rows).len() > 1 }
 }
 
+/// The widest unit an adaptive family admits: half the shared reserve, so its
+/// controller can run any depth from 2 to 4 (#762; TJ 2026-10-27).
+pub const ADAPTIVE_UNIT_ROWS: u64 = RESERVE_ROWS / 2;
+
 pub fn prefill_shape(spark_ranks: usize, limits: PrefillLimits,
     explicit: PrefillOverrides) -> Result<PrefillPlan, PrefillError> {
     let maximum = limits.estimate.waves(spark_ranks).min(limits.max_waves).min(MAX_WAVES);
+    let slots_cap = limits.max_waves.min(MAX_WAVES);
+    // An adaptive family with Sparks: an unpinned launch, or a resolved
+    // deployment passing back more slots than waves, admits `slots` slots of
+    // the widest unit (reserve / 2) and starts at the estimate's depth (#762).
+    let resolved_adaptive = explicit.slots.is_some_and(|slots| explicit.waves.is_some_and(|waves| slots > waves));
+    let unpinned = explicit.waves.is_none() && explicit.span_rows.is_none() && explicit.slots.is_none();
+    if limits.adaptive && spark_ranks > 0 && slots_cap > 1 && (unpinned || resolved_adaptive) {
+        let slots = explicit.slots.unwrap_or(slots_cap);
+        let waves = explicit.waves.unwrap_or(maximum).min(slots);
+        if slots > slots_cap || waves < 1 {
+            return Err(PrefillError::Slots { slots, waves, max_waves: slots_cap });
+        }
+        let cap = ADAPTIVE_UNIT_ROWS.min(limits.max_unit_rows);
+        let unit = explicit.unit_rows.unwrap_or_else(|| limits.capacities.iter().copied()
+            .map(u64::from).filter(|&rows| rows >= 64 && rows % 64 == 0 && rows <= cap).max().unwrap_or(0));
+        if (super::PrefillShape { unit_rows: unit, waves: 1 }).validate().is_err() {
+            return Err(PrefillError::InvalidShape { unit_rows: unit, waves });
+        }
+        if unit > cap {
+            return Err(PrefillError::ExecutorCapacity { unit_rows: unit, waves,
+                max_unit_rows: cap, max_waves: slots_cap });
+        }
+        // The starting depth runs a valid static shape at its own cut.
+        let start = validate_shape(super::wave_control::unit_for(waves, unit), waves, limits, None)?;
+        let span = super::wave_control::reserve_rows(slots, unit);
+        let max_span_rows = limits.max_span_rows.min(RESERVE_ROWS + 64);
+        if explicit.span_rows.is_some_and(|given| given != span) || span > max_span_rows {
+            return Err(PrefillError::IntakeSpan { span_rows: explicit.span_rows.unwrap_or(span),
+                slot_rows: span, max_span_rows });
+        }
+        return Ok(PrefillPlan { unit_rows: unit, waves: start.waves, span_rows: span, slots });
+    }
     let mut waves = explicit.waves.unwrap_or(maximum);
     loop {
         let budget = unit_rows(waves).min(limits.max_unit_rows)
@@ -140,33 +177,13 @@ pub fn prefill_shape(spark_ranks: usize, limits: PrefillLimits,
             .map(u64::from).filter(|&rows| rows >= 64 && rows % 64 == 0 && rows <= automatic_budget)
             .max().unwrap_or(0));
         let shape = validate_shape(rows, waves, limits, None);
-        if let (Ok(plan), Some(slots)) = (&shape, explicit.slots) {
-            let plan = *plan;
-            // A resolved deployment: its waves start the depth inside its slots.
-            if slots == waves { return validate_shape(rows, waves, limits, explicit.span_rows); }
-            if !limits.adaptive || spark_ranks == 0 || slots < waves || slots > limits.max_waves.min(MAX_WAVES) {
-                return Err(PrefillError::Slots { slots, waves, max_waves: limits.max_waves.min(MAX_WAVES) });
-            }
-            let span = super::wave_control::reserve_rows(slots, rows);
-            let max_span_rows = limits.max_span_rows.min(RESERVE_ROWS + 64);
-            if explicit.span_rows.is_some_and(|given| given != span) || span > max_span_rows {
-                return Err(PrefillError::IntakeSpan { span_rows: explicit.span_rows.unwrap_or(span),
-                    slot_rows: span, max_span_rows });
-            }
-            return Ok(PrefillPlan { span_rows: span, slots, ..plan });
-        }
         if shape.is_ok() {
-            let plan = validate_shape(rows, waves, limits, explicit.span_rows)?;
-            // An adaptive family admits every slot up to its executor limit at
-            // this unit, inside the same reserve; a pinned depth stays static.
-            if limits.adaptive && explicit.waves.is_none() && explicit.span_rows.is_none() && spark_ranks > 0 {
-                let slots = limits.max_waves.min(MAX_WAVES);
-                let span = super::wave_control::reserve_rows(slots, rows);
-                if span <= limits.max_span_rows.min(RESERVE_ROWS + 64) {
-                    return Ok(PrefillPlan { span_rows: span, slots, ..plan });
-                }
+            // A resolved deployment's slots equal its waves (pinned or static);
+            // more slots are only an adaptive family's (above).
+            if let Some(slots) = explicit.slots.filter(|&slots| slots != waves) {
+                return Err(PrefillError::Slots { slots, waves, max_waves: slots_cap });
             }
-            return Ok(plan);
+            return validate_shape(rows, waves, limits, explicit.span_rows);
         }
         if explicit.waves.is_some() || waves <= 1 { return shape; }
         // Only automatic depth may shrink to fit the admitted arena. Pins never change.
@@ -360,30 +377,45 @@ mod tests {
 
     #[test]
     fn adaptive_plans_admit_every_slot_inside_the_same_reserve() {
+        // Four slots of the widest unit (reserve / 2), starting at the estimate.
         let limits = PrefillLimits { adaptive: true, ..measured(3) };
         let plan = prefill_shape(6, limits, Default::default()).unwrap();
-        assert_eq!(plan, PrefillPlan { unit_rows: 2752, waves: 3, span_rows: 8256, slots: 4 });
-        assert_eq!(plan.admitted(), super::super::PrefillShape { unit_rows: 2752, waves: 4 });
+        assert_eq!(plan, PrefillPlan { unit_rows: 4096, waves: 3, span_rows: 8256, slots: 4 });
+        assert_eq!(plan.units(), super::super::PrefillShape { unit_rows: 2752, waves: 3 });
+        assert_eq!(plan.admitted(), super::super::PrefillShape { unit_rows: 4096, waves: 4 });
         assert!(plan.adaptive());
+        // Every family starts where its estimate says, admitting the same unit.
+        for (waves, start) in [(2, 4096), (4, 2048)] {
+            let plan = prefill_shape(6, PrefillLimits { adaptive: true, ..measured(waves) }, Default::default()).unwrap();
+            assert_eq!((plan.unit_rows, plan.waves, plan.span_rows, plan.slots, plan.units().unit_rows),
+                (4096, waves, 8256, 4, start));
+        }
+        // A smaller compiled capacity bounds the admitted unit.
+        let capped = PrefillLimits { max_unit_rows: 2048, ..limits };
+        assert_eq!(prefill_shape(6, capped, Default::default()).unwrap(),
+            PrefillPlan { unit_rows: 2048, waves: 3, span_rows: 8192, slots: 4 });
         // Pins and spans stay static; no Sparks, one wave.
-        assert_eq!(prefill_shape(6, limits, PrefillOverrides { waves: Some(3), ..Default::default() }).unwrap().slots, 3);
+        assert_eq!(prefill_shape(6, limits, PrefillOverrides { waves: Some(3), ..Default::default() }).unwrap(),
+            PrefillPlan { unit_rows: 2752, waves: 3, span_rows: 8256, slots: 3 });
         assert_eq!(prefill_shape(0, limits, Default::default()).unwrap().slots, 1);
         let shallow = PrefillLimits { max_waves: 2, ..limits };
-        assert_eq!(prefill_shape(6, shallow, Default::default()).unwrap().slots, 2);
+        assert_eq!(prefill_shape(6, shallow, Default::default()).unwrap(),
+            PrefillPlan { unit_rows: 4096, waves: 2, span_rows: 8192, slots: 2 });
         // A resolved deployment's slots come back with its waves: adaptive
         // when more, pinned when equal, refused for static families.
-        let resolved = PrefillOverrides { unit_rows: Some(2752), waves: Some(3), span_rows: Some(8256), slots: Some(4) };
+        let resolved = PrefillOverrides { unit_rows: Some(4096), waves: Some(3), span_rows: Some(8256), slots: Some(4) };
         assert_eq!(prefill_shape(6, limits, resolved).unwrap(), plan);
-        assert_eq!(prefill_shape(6, limits, PrefillOverrides { slots: Some(3), ..resolved }).unwrap().slots, 3);
-        assert!(matches!(prefill_shape(6, measured(3), resolved), Err(PrefillError::Slots { .. })));
+        let pinned = PrefillOverrides { unit_rows: Some(2752), waves: Some(3), span_rows: Some(8256), slots: Some(3) };
+        assert_eq!(prefill_shape(6, limits, pinned).unwrap().slots, 3);
+        assert!(prefill_shape(6, measured(3), resolved).is_err(), "a static family has no 4096-row three-wave shape");
+        assert!(matches!(prefill_shape(6, measured(3), PrefillOverrides { slots: Some(4), ..pinned }),
+            Err(PrefillError::Slots { .. })));
         assert!(matches!(prefill_shape(6, limits, PrefillOverrides { span_rows: Some(8192), ..resolved }),
             Err(PrefillError::IntakeSpan { .. })));
-        assert!(matches!(prefill_shape(6, limits, PrefillOverrides { slots: Some(2), ..resolved }),
+        assert!(matches!(prefill_shape(6, limits, PrefillOverrides { slots: Some(5), ..resolved }),
             Err(PrefillError::Slots { .. })));
-        // A 2048-unit family admits four 2048 slots: nothing to choose.
-        let step = PrefillLimits { initial_unit_rows: Some(2048), adaptive: true, ..measured(4) };
-        let plan = prefill_shape(6, step, Default::default()).unwrap();
-        assert_eq!((plan.slots, plan.span_rows, plan.adaptive()), (4, 8192, false));
+        assert!(prefill_shape(6, limits, PrefillOverrides { unit_rows: Some(8192), ..resolved }).is_err());
+        assert!(prefill_shape(6, limits, PrefillOverrides { unit_rows: Some(2753), ..resolved }).is_err());
     }
 
     #[test]

@@ -41,7 +41,7 @@ fn shared_catalog_rejects_the_same_unindexed_headers_as_standalone() {
 fn planner_publishes_kimi_runtime_default_and_explicit_units() {
     let dir = snapshot(false);
     let input = testing::BudgetedPlanInput::open(dir.path()).unwrap();
-    for (unit, waves, expected) in [(0, 0, (2752, 3, 8256)), (1024, 2, (1024, 2, 2048)),
+    for (unit, waves, expected) in [(0, 0, (4096, 3, 8256)), (1024, 2, (1024, 2, 2048)),
         (4096, 1, (4096, 1, 4096)), (0, 4, (2048, 4, 8192)), (4096, 2, (4096, 2, 8192))] {
         let mut options = with_layout(6, None);
         let layout = options.layout.as_mut().unwrap();
