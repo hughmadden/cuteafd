@@ -700,7 +700,7 @@ mod tests {
 
     #[test]
     fn topology_shapes_and_explicit_units_match_admission() -> Result<()> {
-        for (sparks, unit, waves, span) in [(4, 2752, 3, 8256), (6, 2752, 3, 8256)] {
+        for (sparks, unit, waves, span) in [(4, 2048, 3, 6144), (6, 2048, 3, 6144)] {
             let mut args = args();
             args.peers = (1..=sparks).map(|port| format!("127.0.0.1:{port}").parse())
                 .collect::<std::result::Result<_, _>>()?;
