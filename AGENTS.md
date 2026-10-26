@@ -163,15 +163,15 @@ before → after tables with conditions.
   `CARGO_HOME="$HOME/.cache/cuteafd/cargo-home/$(uname -m)" cargo install --locked cargo-nextest`. Release cuts also run `cpu-gate --slow` for the explicit slow CPU
   tier, not arbitrary ignored GPU/network tests. Add no failing ids.
 - Kernel/exporter pre-merge gate: CPU-only `scripts/build/compare-sm-exports.py --sms 188,170`; review object/cubin differences.
+  From a git worktree, run it in `scripts/build/cuteafd-dev.sh cpu` by the worktree's real path
+  (`cd ~/Developer/cute-worktrees/cuteafd-<task> && CUTEAFD_SOURCE_ROOT=$PWD ...`), not `/workspace/cuteafd`:
+  relative submodule gitfiles resolve only from the real path.
 - Kernel row curves: for new kernels/families/expert formats, duel winners or export/tiling/threshold changes,
   measure warmed time per routed row across the policy's live-row band (8192/k, k=2..4: 2048/2752/4096 plus real tails),
   using runtime-selected exports on SM120 and SM121 where the kernel runs, with fork bench `--capacity` and `--routes`.
   Gate: no per-row collapse; >10% above neighbours or the curve's best, or an adjacent-size jump, needs an explanation,
   a fix or a family descriptor preference avoiding that unit. Check internal route switches with `--compare-routes-exact`
   and `--check-prefix-rows`; method: [#762](https://github.com/tpurtell/cuteafd/issues/762#issuecomment-6413296191).
-  From a git worktree, run it in `scripts/build/cuteafd-dev.sh cpu` by the worktree's real path
-  (`cd ~/Developer/cute-worktrees/cuteafd-<task> && CUTEAFD_SOURCE_ROOT=$PWD ...`), not `/workspace/cuteafd`:
-  relative submodule gitfiles resolve only from the real path.
 - Release and WIP builds persist Cargo registry/git under
   `~/.cache/cuteafd/cargo-home/<arch>`, toolchain-keyed JIT caches under
   `~/.cache/cuteafd/jit/<dev-toolchain-hash>/<arch>`, and local compiler caches
