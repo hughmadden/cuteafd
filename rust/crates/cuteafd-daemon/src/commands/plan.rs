@@ -301,7 +301,7 @@ pub(crate) fn run_plan(mut args: PlanArgs) -> Result<()> {
         let roles = if let Some(layout) = &args.file_layout {
             anyhow::ensure!(args.role.is_none(), "--role and --file-layout are mutually exclusive");
             let hosts: std::collections::BTreeMap<String, Vec<String>> =
-                serde_json::from_reader(std::fs::File::open(layout)?)?;
+                cuteafd_loader::read_json_file(layout)?;
             if let Some(host) = &args.host {
                 hosts.get(host).with_context(|| format!("host {host} is absent from {}", layout.display()))?
                     .iter().map(|name| parse(name)).collect::<Result<Vec<_>>>()?
@@ -493,7 +493,7 @@ fn file_args(mut args: PlanArgs, snapshot: &std::path::Path) -> Result<PlanArgs>
     resolve_speculator(&mut args, snapshot, family, &cfg)?;
     let needs_drafter = if let Some(layout) = &args.file_layout {
         let hosts: std::collections::BTreeMap<String, Vec<String>> =
-            serde_json::from_reader(std::fs::File::open(layout)?)?;
+            cuteafd_loader::read_json_file(layout)?;
         let roles = if let Some(host) = &args.host {
             hosts.get(host).with_context(|| format!("host {host} is absent from {}", layout.display()))?.clone()
         } else { hosts.into_values().flatten().collect() };
