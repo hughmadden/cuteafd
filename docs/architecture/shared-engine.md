@@ -230,16 +230,16 @@ This is all in [loader/serving_capacity/prefill_waves.rs](../../rust/crates/cute
   - `MAX_WAVES` = 4 (`:7`).
 - **Choosing k:**
   - `PrefillEstimate::waves` (`:43`) scales the descriptor's S to the deployed
-    Spark count (S = S_ref × N_ref / N) and calls `waves_for` (`:151`), which
+    Spark count (S = S_ref × N_ref / N) and calls `waves_for` (`:218`), which
     computes **k = ⌈T/S⌉ + 1, clamped to 2..4**.
   - `MeasuredWaves` returns its measured k, or `larger_topology_waves` above
     its reference count.
   - Zero Sparks means one wave.
-- **Fitting:** `prefill_shape` (`:108`) lowers an automatic k until the shape
+- **Fitting:** `prefill_shape` (`:136`) lowers an automatic k until the shape
   fits the admitted arena and the executor caps. An explicit pin
   (`PREFILL_WAVES`/`PREFILL_ROWS`) never moves; it either fits or fails with a
-  typed `PrefillError` (`:77`).
-- **Short prompts:** `waves_used` (`:159`) uses fewer waves when a prompt cannot
+  typed `PrefillError` (`:81`).
+- **Short prompts:** `waves_used` (`:226`) uses fewer waves when a prompt cannot
   keep each unit at least `MIN_FILL` = 50% full. Storage is not reallocated and
   graphs are not recaptured.
 
@@ -260,41 +260,58 @@ bad unit.
 
 `cuteafd plan --deployment` publishes:
 
-- `prefill_unit_rows`, `prefill_waves`, `prefill_span_rows` and
-  `decode_lanes` (`DeploymentSpec`, [loader/plan/deployment.rs:67](../../rust/crates/cuteafd-loader/src/plan/deployment.rs#L67));
+- `prefill_unit_rows`, `prefill_waves`, `prefill_slots`, `prefill_span_rows`
+  and `decode_lanes` (`DeploymentSpec`, [loader/plan/deployment.rs:67](../../rust/crates/cuteafd-loader/src/plan/deployment.rs#L67));
 - typed topology, roles and admission (the same struct).
 
 The launcher reads those fields back in `release_prefill_shape`
 ([scripts/launch/run-family.sh:402](../../scripts/launch/run-family.sh#L402)).
-It refuses a plan that names no positive unit or wave count. The family's mode
+It refuses a plan that names no positive unit, wave or slot count. The family's mode
 comes from `family_prefill_mode` (`:395`):
 
 | Mode | Families | Serve flags |
 |---|---|---|
-| `units` | step5, kimi_k3, qwen4, deepseek_v4 | `--prefill-rows` (unit), `--prefill-waves` |
-| `units-span` | glm5, glm5_flash | the above plus `--prefill-span-rows`: rows one continuous call streams. It must equal unit × waves (`IntakeSpan`, `prefill_waves.rs:144`). |
+| `units` | step5, kimi_k3, qwen4, deepseek_v4 | `--prefill-rows` (admitted unit), `--prefill-waves` (starting depth), `--prefill-slots` |
+| `units-span` | glm5, glm5_flash | the above plus `--prefill-span-rows`: the rows every per-slot plane spans. Static: unit × waves; adaptive: `reserve_rows(slots, unit)` (`IntakeSpan`, `prefill_waves.rs:89`). |
 | `legacy` | mimo_v2 (V4.1 launches through `run.sh`) | not on the shared executor |
 
 A new family opts in here once its serve CLI accepts the shape.
 
-**`--prefill-slots` (landing, #762, branch `work/runtime-waves`, not on work/p0).**
-The deployment gains `prefill_slots`, and the launcher passes
-`--prefill-slots` to every `units` and `units-span` family:
+**`--prefill-slots` and runtime depth (#762).** The deployment publishes
+`prefill_slots`, and the launcher passes `--prefill-slots` to every `units`
+and `units-span` family; every units serve takes it as `PrefillOverrides.slots`:
 
-- **slots == waves** pins the depth.
-- **slots > waves** (adaptive families: GLM 5, Kimi) admits that many slots.
-  The executor then picks each prefill's depth at the decode→prefill
-  transition:
-  - it uses the shared `PrefillDepth` (`daemon/shared/prefill_depth.rs`);
-  - its inputs are the Spark unit pace, measured on the prefill owner and
-    returned in the reply header, plus the coordinator turnaround;
-  - storage never changes, and runtime units never exceed the admitted unit.
-- Static families refuse slots > waves, and a user `PREFILL_WAVES` still
-  pins.
-
-Until #762 merges, every launch pins the planner's waves. The design is the
-[#762 runtime-waves note](https://github.com/tpurtell/cuteafd/issues/762);
-check the branch before you rely on its details.
+- **slots == waves** pins the depth (static families, and any user
+  `PREFILL_WAVES`, which makes the plan admit only its own waves).
+- **slots > waves** is an adaptive family (GLM 5 and Kimi today; Step,
+  GLM Flash and V4 to follow). It admits four slots of the widest unit the
+  reserve allows, `ADAPTIVE_UNIT_ROWS` = reserve / 2 = 4096 rows
+  (`prefill_waves.rs:134`), bounded by the compiled capacity. Its plan names
+  that unit as `prefill_unit_rows`, starts at the estimate's depth cut from it
+  (`wave_control::unit_for`; 3 × 2752 at six Sparks), and spans
+  `reserve_rows(4, 4096)` = 8256 rows
+  ([loader/serving_capacity/wave_control.rs:49](../../rust/crates/cuteafd-loader/src/serving_capacity/wave_control.rs#L49)).
+  The controller can then run any depth from 2 to 4.
+- **At each decode→prefill transition** the engine reports the previous call's
+  Spark pace to its `PrefillDepth`
+  ([daemon/shared/prefill_depth.rs:19](../../rust/crates/cuteafd-daemon/src/shared/prefill_depth.rs#L19)).
+  The pace is busy and idle time per unit, measured on the Spark prefill owner
+  and returned in the reply header, and it is read without a host wait. The
+  engine then takes the next depth, re-cuts the prefill link's return slots at
+  rest, and brackets the call. GLM 5 does this in `start_prefill`
+  ([daemon/families/glm5/engine.rs:1368](../../rust/crates/cuteafd-daemon/src/families/glm5/engine.rs#L1368)),
+  Kimi in `RoutedLane::start_prefill`
+  ([daemon/families/kimi_k3/spark.rs:140](../../rust/crates/cuteafd-daemon/src/families/kimi_k3/spark.rs#L140)).
+- **One call** is `call_rows` (`wave_control.rs:57`): the smallest
+  k × unit over the candidate depths, 8192 rows at U = 4096. Every depth
+  therefore cuts whole units.
+- **Storage never changes.** Every depth's slots are views at
+  `slot * unit_for(k)` inside per-field arenas spanning the reserve. Hook-local
+  scratch is shared by the slots on a GPU (GLM 5: one step's program and top-k
+  scratch, LM head, logits rows, EXLR8 execution and native dense scratch).
+  Per-slot owners (peer exchange, TP2 route slots, commit blocks, KV tables,
+  Spark owners) cover the admitted slots, and the planner charges exactly that.
+- **Goldens** pin the starting depth at its own cut.
 
 ## 4. Spark exchange and typed owners
 
