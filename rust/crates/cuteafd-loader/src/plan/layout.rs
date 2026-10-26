@@ -556,7 +556,8 @@ mod selected_spark_io_tests {
             for _ in 0..2 {
                 charge_spark_io(&mut device, &working, ExpertGeometry::KIMI_K3, unit as u32,
                     false, rings, 0).unwrap();
-                charge_spark_slots(&mut device, &working, "kimi_k3", waves as u8, unit);
+                let slots = spark_execution_slots("kimi_k3", waves, 1).unwrap();
+                charge_spark_slots(&mut device, &working, "kimi_k3", slots, unit);
                 assert_eq!(device.items.iter().map(|item| item.bytes).sum::<u64>(), expected,
                     "pre-solver Spark overhead and the final ledger must count each owner once");
             }

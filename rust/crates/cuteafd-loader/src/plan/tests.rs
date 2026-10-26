@@ -3534,9 +3534,11 @@ fn qwen_small_card_one_spark_admits_both_auto_waves_with_one_compute_slot() {
     let memory = report.memory_layout.unwrap();
     assert_eq!(memory.pool_tokens, 262_144);
     let spark = memory.devices.iter().find(|d| d.kind == DeviceKind::Spark).unwrap();
-    let slot_bytes = spark.items.iter().filter(|item| item.group == "execution slots")
+    let slots = spark.items.iter().find(|item| item.group == "execution slots").unwrap();
+    let residual = spark.items.iter().filter(|item| item.group == "expert waves")
         .map(|item| item.bytes).sum::<u64>();
-    assert_eq!(slot_bytes, layout::spark_slot_bytes("qwen4", 4096));
+    let per_slot = layout::spark_slot_bytes("qwen4", 4096);
+    assert_eq!(slots.bytes, per_slot - residual.min(per_slot));
     assert!(memory.devices.iter().all(|d| d.free_bytes() >= 0), "{}", memory.render());
 }
 
