@@ -457,7 +457,7 @@ impl<'weights, 'library> ExpertExecution<'weights, 'library> {
     /// Leave mapped requests queued at return (see `deferred`).
     pub(crate) fn defer(&mut self, units: usize, staging_rows: usize) -> Result<()> {
         ensure!(self.pending.is_empty(), "cannot resize an active expert queue");
-        ensure!(staging_rows > 0 && staging_rows <= self.live_capacity, "native staging exceeds owner rows");
+        ensure!(staging_rows > 0 && staging_rows <= self.live_capacity as usize, "native staging exceeds owner rows");
         self.pending = timing::PendingUnits::new(self.library, units)?;
         let bytes = staging_rows.checked_mul(cuteafd_core::expert_geometry().topk as usize * 8)
             .context("native route staging overflow")?;
