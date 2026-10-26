@@ -3,7 +3,7 @@ use anyhow::Result;
 use cuteafd_ffi::NativeLibrary;
 use std::ffi::c_void;
 
-struct Event<'a> {
+pub(crate) struct Event<'a> {
     library: &'a NativeLibrary,
     raw: *mut c_void,
 }
@@ -23,32 +23,80 @@ impl Drop for Event<'_> {
     }
 }
 
+/// The owner stream's last completed unit end, shared by every adapter that
+/// queues on that stream (FP8 weight groups), so the idle gap follows the
+/// stream rather than one group's queue.
+pub(crate) type PaceClock<'a> = std::rc::Rc<std::cell::RefCell<Option<std::rc::Rc<Event<'a>>>>>;
+
+/// One unit's measured pace on its owner stream (#762): busy from its
+/// arrival (before its input copies) to its fence, idle from the previous
+/// unit's fence on the same stream to its arrival (zero for the stream's
+/// first unit, or when it was queued behind its predecessor).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct UnitPace { pub busy_us: u32, pub idle_us: u32 }
+
 /// Per-unit fences, independent of whole-stream idleness. The transport retains
 /// each request/reply frame until its own fence completes and the reply is sent.
 /// All events are allocated at startup; hot-path submission never allocates.
+/// Each unit also records an arrival event before its input copies, so its
+/// pace is read from the completed events after its fence (no added wait).
 pub(crate) struct PendingUnits<'a> {
     library: &'a NativeLibrary,
-    events: Vec<Event<'a>>,
+    /// Per staging slot: arrival and fence. A fence is shared with the pace
+    /// clock, which retains the newest completed one; a slot whose fence the
+    /// clock still holds takes a fresh spare event before it is recorded again.
+    events: Vec<(Event<'a>, std::rc::Rc<Event<'a>>)>,
+    /// The spare fence (always exactly one): swapped with a slot's fence when
+    /// the clock still holds that slot's previous one.
+    spare: std::rc::Rc<Event<'a>>,
     free: std::collections::VecDeque<usize>,
     queued: std::collections::VecDeque<(usize, (u64, u32, u32, u64))>,
+    /// Slot whose arrival was recorded and whose fence is not yet queued.
+    arrived: Option<usize>,
+    clock: PaceClock<'a>,
 }
 impl<'a> PendingUnits<'a> {
     pub(crate) fn new(library: &'a NativeLibrary, capacity: usize) -> Result<Self> {
-        anyhow::ensure!((1..=4).contains(&capacity), "invalid expert unit queue capacity");
-        Ok(Self { library, events: (0..capacity).map(|_| Event::new(library)).collect::<Result<_>>()?,
-            free: (0..capacity).collect(), queued: std::collections::VecDeque::with_capacity(capacity) })
+        Self::with_clock(library, capacity, Default::default())
     }
+    /// A queue whose idle gaps follow `clock` (one per owner stream).
+    pub(crate) fn with_clock(library: &'a NativeLibrary, capacity: usize, clock: PaceClock<'a>) -> Result<Self> {
+        anyhow::ensure!((1..=4).contains(&capacity), "invalid expert unit queue capacity");
+        let events = (0..capacity).map(|_| Ok((Event::new(library)?, std::rc::Rc::new(Event::new(library)?))))
+            .collect::<Result<_>>()?;
+        Ok(Self { library, events, spare: std::rc::Rc::new(Event::new(library)?), free: (0..capacity).collect(),
+            queued: std::collections::VecDeque::with_capacity(capacity), arrived: None, clock })
+    }
+    /// The clock shared with every queue on the same owner stream.
+    pub(crate) fn clock(&self) -> PaceClock<'a> { self.clock.clone() }
+    /// The staging slot the next unit uses.
     pub(crate) fn next_slot(&self) -> Result<usize> {
         self.free.front().copied().ok_or_else(|| anyhow::anyhow!("expert unit queue exhausted"))
     }
     pub(crate) fn is_empty(&self) -> bool { self.queued.is_empty() }
     pub(crate) fn len(&self) -> usize { self.queued.len() }
+    /// Marks the next unit's arrival on `stream`, before its input copies.
+    /// # Safety
+    /// `stream` is the owner stream the unit's fence is later recorded on.
+    pub(crate) unsafe fn arrive(&mut self, stream: *mut c_void) -> Result<()> {
+        let slot = self.next_slot()?;
+        // SAFETY: this slot's events are exclusively reserved until the unit is popped.
+        unsafe { self.library.cuda_event_record(self.events[slot].0.raw, stream)?; }
+        self.arrived = Some(slot);
+        Ok(())
+    }
     /// # Safety
     /// The stream and every borrowed request/reply owner remain live until pop.
     pub(crate) unsafe fn record(&mut self, identity: (u64, u32, u32, u64), stream: *mut c_void) -> Result<()> {
         let slot = self.next_slot()?;
+        anyhow::ensure!(self.arrived.take() == Some(slot), "expert unit fence without its arrival");
+        // The clock may still hold this slot's previous fence (it is the
+        // stream's newest completed end): give the slot the spare instead.
+        if std::rc::Rc::strong_count(&self.events[slot].1) > 1 {
+            std::mem::swap(&mut self.events[slot].1, &mut self.spare);
+        }
         // SAFETY: this event is exclusively reserved until the unit is popped.
-        unsafe { self.library.cuda_event_record(self.events[slot].raw, stream)?; }
+        unsafe { self.library.cuda_event_record(self.events[slot].1.raw, stream)?; }
         self.free.pop_front();
         self.queued.push_back((slot, identity));
         Ok(())
@@ -56,14 +104,27 @@ impl<'a> PendingUnits<'a> {
     pub(crate) fn ready(&self) -> Result<bool> {
         let Some((slot, _)) = self.queued.front() else { return Ok(true) };
         // SAFETY: the queued unit exclusively retains its recorded live event.
-        unsafe { self.library.cuda_event_query(self.events[*slot].raw) }
+        unsafe { self.library.cuda_event_query(self.events[*slot].1.raw) }
     }
-    pub(crate) fn pop(&mut self) -> Result<Option<(u64, u32, u32, u64)>> {
+    /// The oldest unit's identity and measured pace, once its fence completed.
+    pub(crate) fn pop(&mut self) -> Result<Option<((u64, u32, u32, u64), UnitPace)>> {
         anyhow::ensure!(self.ready()?, "expert unit completed before its fence");
-        Ok(self.queued.pop_front().map(|(slot, identity)| {
-            self.free.push_back(slot);
-            identity
-        }))
+        let Some((slot, identity)) = self.queued.pop_front() else { return Ok(None) };
+        let (arrived, end) = &self.events[slot];
+        let elapsed_us = |from: *mut c_void, to: *mut c_void| -> Result<u32> {
+            // SAFETY: both events were recorded on this owner stream and have
+            // completed: the fence is ready and every earlier record precedes it.
+            let ms = unsafe { self.library.cuda_event_elapsed_ms(from, to)? };
+            Ok((f64::from(ms).max(0.0) * 1000.0).min(f64::from(u32::MAX)) as u32)
+        };
+        let busy_us = elapsed_us(arrived.raw, end.raw)?;
+        let idle_us = match self.clock.borrow().as_ref() {
+            Some(previous) => elapsed_us(previous.raw, arrived.raw)?,
+            None => 0,
+        };
+        *self.clock.borrow_mut() = Some(end.clone());
+        self.free.push_back(slot);
+        Ok(Some((identity, UnitPace { busy_us, idle_us })))
     }
 }
 
@@ -219,6 +280,7 @@ mod worker_tests {
             for unit in 0..4 {
                 // SAFETY: the source and destination outlive this stream drain.
                 unsafe {
+                    pending.arrive(stream.raw)?;
                     library.copy_h2d_async(allocation.buffer, &input, stream.raw)?;
                     timing.record(0, stream.raw)?;
                     library.copy_h2d_async(allocation.buffer, &input, stream.raw)?;
@@ -231,8 +293,10 @@ mod worker_tests {
             for unit in 0..4 {
                 assert!(!pending.ready()?);
                 fixture.advance_queued_experts(&library, 2)?;
-                let identity = pending.pop()?.unwrap();
+                let (identity, pace) = pending.pop()?.unwrap();
                 assert_eq!(identity.0, round * 4 + unit);
+                // Two queued copies per unit, back to back on the stream.
+                assert!(pace.busy_us > 0 && pace.idle_us <= pace.busy_us, "{pace:?}");
                 // SAFETY: the unit's fence is ready while later spans may be queued.
                 unsafe { timing.publish(identity.0, identity.1, identity.2, identity.3, "fp8_moe")?; }
             }

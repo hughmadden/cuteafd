@@ -206,6 +206,9 @@ impl<'w, 'a> Worker<'w, 'a> {
             // Host path: blocking uploads and downloads, drained per chunk.
             return self.execute_host(request, exchange, input_stride, output_stride, topk, identity);
         };
+        // SAFETY: the owner stream outlives every queued unit (#762 pace); the
+        // arrival precedes this unit's first input copy on that stream.
+        unsafe { self.pending.arrive(self.stream.raw)?; }
         let execution = self.arena(rows)?;
         // Mapped path: every chunk queues on the one stream with no host wait.
         // Each chunk reads its own input rows and writes its own output range;
@@ -338,13 +341,13 @@ impl<'w, 'a> Worker<'w, 'a> {
     }
 
     /// The queued request finished (its stream drained): publish its timing.
-    pub(super) fn complete(&mut self) -> Result<()> {
-        let Some((request_id, layer, rows, executor_id)) = self.pending.pop()? else { return Ok(()) };
+    pub(super) fn complete(&mut self) -> Result<Option<super::super::execution::timing::UnitPace>> {
+        let Some(((request_id, layer, rows, executor_id), pace)) = self.pending.pop()? else { return Ok(None) };
         if let Some(timing) = &mut self.timing {
             // SAFETY: the caller observed this stream drained after both records.
             unsafe { timing.publish(request_id, layer, rows, executor_id, "exlr8")?; }
         }
-        Ok(())
+        Ok(Some(pace))
     }
 
     /// # Safety

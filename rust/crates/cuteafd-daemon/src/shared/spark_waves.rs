@@ -179,6 +179,9 @@ pub(crate) struct Job {
     sequence: u32,
     slot: usize,
     rows: usize,
+    /// Sent between [`Waves::begin_prefill`] and [`Waves::end_prefill`]: its
+    /// ranks' reported unit pace counts towards the call's [`PrefillPace`].
+    prefill: bool,
     source: Source,
     /// The slot's use count the worker waits for before posting (planes free).
     consumed: u32,
@@ -212,6 +215,42 @@ pub(crate) struct LinkPace {
     round_trip_us: AtomicU32,
     idle_us: AtomicU32,
     waves: AtomicU32,
+    /// The current prefill call's Spark-reported unit pace (#762), filled by
+    /// the worker before it publishes each prefill wave's landing.
+    prefill: std::sync::Mutex<PrefillAccumulator>,
+}
+
+/// Sums each rank's reported unit busy/idle microseconds over one prefill
+/// call. A rank's first reported unit of the call is skipped: its idle gap is
+/// the decode→prefill boundary, not the pipeline's turnaround.
+#[derive(Debug, Default, Clone, PartialEq)]
+pub(crate) struct PrefillAccumulator {
+    rows: u64,
+    ranks: [(u64, u64); cuteafd_core::MAX_SPARK_WORLD],
+    seen: [bool; cuteafd_core::MAX_SPARK_WORLD],
+    world: usize,
+}
+
+impl PrefillAccumulator {
+    /// One landed prefill wave of `rows` rows with each rank's reported pace.
+    /// Its rows count once every reporting rank has passed its first unit.
+    pub(crate) fn add(&mut self, rows: usize, pace: &[Option<(u32, u32)>; cuteafd_core::MAX_SPARK_WORLD]) {
+        let mut counted = false;
+        for (rank, sample) in pace.iter().enumerate() {
+            let Some((busy, idle)) = *sample else { continue };
+            self.world = self.world.max(rank + 1);
+            if !std::mem::replace(&mut self.seen[rank], true) { continue; }
+            self.ranks[rank].0 += u64::from(busy);
+            self.ranks[rank].1 += u64::from(idle);
+            counted = true;
+        }
+        if counted { self.rows += rows as u64; }
+    }
+    /// The call's pace (empty when no rank reported past its first unit).
+    pub(crate) fn finish(&self) -> cuteafd_loader::serving_capacity::wave_control::PrefillPace {
+        cuteafd_loader::serving_capacity::wave_control::PrefillPace { rows: self.rows,
+            ranks: self.ranks[..self.world].to_vec() }
+    }
 }
 
 impl LinkPace {
@@ -227,6 +266,10 @@ impl LinkPace {
         Self::add(&self.round_trip_us, round_trip * 1e6, first);
         if let Some(idle) = idle { Self::add(&self.idle_us, idle * 1e6, first); }
         self.waves.fetch_add(1, Ordering::Relaxed);
+    }
+    fn prefill(&self) -> std::sync::MutexGuard<'_, PrefillAccumulator> {
+        // A panic while holding it leaves plain counters; keep using them.
+        self.prefill.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
     }
     /// (mean round trip, mean idle gap) in microseconds, and the waves seen.
     pub(crate) fn sample(&self) -> (u32, u32, u32) {
@@ -275,16 +318,20 @@ pub(crate) trait Backend {
     fn post(&mut self, job: Job) -> Result<Self::Wave>;
     /// One progress pass over the oldest wave in `slot` of `rows` rows:
     /// copies arrived rows of pinned ranks into the slot's landing staging.
-    /// `true` once every rank's rows are in place.
-    fn poll(&mut self, wave: &mut Self::Wave, slot: usize, rows: usize) -> Result<bool>;
+    /// `Some(per-rank unit pace)` once every rank's rows are in place.
+    fn poll(&mut self, wave: &mut Self::Wave, slot: usize, rows: usize) -> Result<Option<RankPace>>;
     /// Stores `landed = sequence` (also used to release waits after a failure).
     fn publish(&mut self, sequence: u32);
 }
+
+/// Per rank: the worker's reported (busy µs, idle µs) for one unit (#762).
+pub(crate) type RankPace = [Option<(u32, u32)>; cuteafd_core::MAX_SPARK_WORLD];
 
 struct Inflight<W> {
     sequence: u32,
     slot: usize,
     rows: usize,
+    prefill: bool,
     wave: W,
     posted: Instant,
     times: WaveTimes,
@@ -388,21 +435,23 @@ pub(crate) fn run_worker<B: Backend>(backend: &mut B, inbox: &mpsc::Receiver<Com
                 };
                 if staged && reached(backend.counter(Counter::Consumed(job.slot)), job.consumed) {
                     let job = queued.pop_front().expect("front job");
-                    let (sequence, slot, rows) = (job.sequence, job.slot, job.rows);
+                    let (sequence, slot, rows, prefill) = (job.sequence, job.slot, job.rows, job.prefill);
                     let mut times = WaveTimes { staged: job.sent.elapsed().as_secs_f64(), ..Default::default() };
                     Pace::add(&mut pace.staging, job.sent.max(last_landed).elapsed().as_secs_f64());
                     let started = Instant::now();
                     let idle = idle_from.take().map(|from| started.duration_since(from).as_secs_f64());
                     let wave = backend.post(job)?;
                     times.posted = started.elapsed().as_secs_f64();
-                    inflight.push_back(Inflight { sequence, slot, rows, wave, posted: Instant::now(), times, idle });
+                    inflight.push_back(Inflight { sequence, slot, rows, prefill, wave, posted: Instant::now(), times, idle });
                     progressed = true;
                 }
             }
             // Progress the oldest wave.
             if let Some(front) = inflight.front_mut() {
-                if backend.poll(&mut front.wave, front.slot, front.rows)? {
+                if let Some(ranks) = backend.poll(&mut front.wave, front.slot, front.rows)? {
                     let mut done = inflight.pop_front().expect("front wave");
+                    // Before `landed`: the engine reads the call's pace after it.
+                    if done.prefill { link.prefill().add(done.rows, &ranks); }
                     done.times.received = done.posted.elapsed().as_secs_f64();
                     Pace::add(&mut pace.round_trip, done.times.received);
                     last_landed = Instant::now();
@@ -486,9 +535,10 @@ pub(crate) trait Transport: Send + 'static {
     type Wave: Send;
     fn dispatch(&mut self, request: &ExpertProtocolV2Request) -> Result<Self::Wave>;
     /// One non-blocking pass: arrived rows go to `sink(rank, first row,
-    /// payload)`; `Some(landed ranks)` once every rank's rows arrived.
+    /// payload)`; `Some((landed ranks, per-rank unit pace))` once every
+    /// rank's rows arrived.
     fn poll(&mut self, wave: &mut Self::Wave, sink: &mut dyn FnMut(usize, u32, &[u8]) -> Result<()>)
-        -> Result<Option<u8>>;
+        -> Result<Option<(u8, RankPace)>>;
     /// The response deadline every wave is held to.
     fn timeout(&self) -> Duration;
     /// Gives up every outstanding wave (after a failure).
@@ -501,10 +551,10 @@ impl Transport for SparkExperts {
         Ok((self.dispatch_wave(request)?, WaveReceipt::default()))
     }
     fn poll(&mut self, wave: &mut Self::Wave, sink: &mut dyn FnMut(usize, u32, &[u8]) -> Result<()>)
-        -> Result<Option<u8>> {
+        -> Result<Option<(u8, RankPace)>> {
         let (wave, receipt) = wave;
         let done = self.poll_wave(wave, receipt, |rank, first, payload| sink(rank, first, payload.as_ref()))?;
-        Ok(done.then_some(receipt.landed))
+        Ok(done.then_some((receipt.landed, receipt.pace)))
     }
     fn timeout(&self) -> Duration { SparkExperts::timeout(self) }
     fn abandon(&mut self) { self.abandon_waves("Spark exchange failed with waves in flight"); }
@@ -553,7 +603,7 @@ impl<T: Transport> Backend for Native<T> {
         self.transport.dispatch(&request)
     }
 
-    fn poll(&mut self, wave: &mut Self::Wave, slot: usize, rows: usize) -> Result<bool> {
+    fn poll(&mut self, wave: &mut Self::Wave, slot: usize, rows: usize) -> Result<Option<RankPace>> {
         let (planes, ranks, row_bytes) = (&self.planes[slot], self.ranks, self.row_bytes);
         let plane_bytes = rows * row_bytes;
         let landing = self.landing;
@@ -573,12 +623,12 @@ impl<T: Transport> Backend for Native<T> {
             Ok(())
         })?;
         match done {
-            Some(landed) => {
+            Some((landed, pace)) => {
                 ensure!(landed == self.landing,
                     "ranks {landed:#b} landed in device memory; the link expects {:#b}", self.landing);
-                Ok(true)
+                Ok(Some(pace))
             }
-            None => Ok(false),
+            None => Ok(None),
         }
     }
 
@@ -659,6 +709,8 @@ pub(crate) struct Waves<'a> {
     outstanding: VecDeque<(u32, usize)>,
     /// The workers' installed grouping, fixed at bootstrap.
     grouping: Vec<cuteafd_transport::worker_selection::InstalledExpertGrouping>,
+    /// Waves sent now belong to a prefill call ([`Self::begin_prefill`]).
+    prefill: bool,
     /// The worker's always-on round-trip and Spark idle means (#762).
     pace: std::sync::Arc<LinkPace>,
 }
@@ -724,7 +776,8 @@ impl<'a> Waves<'a> {
         Ok(Self { library, jobs: Some(jobs), worker: Some(worker), _control: control, words, arenas, arena_alias, _landing_staging: landing_staging, landing_alias,
             landing: intake.landing, planes: intake.planes, layouts: vec![None; waves], unread: vec![false; waves],
             uses: vec![0; waves], ranks: intake.ranks, rows: intake.rows, row_bytes: intake.row_bytes, waves,
-            next_slot: intake.next_slot % waves, sequence: 0, outstanding: VecDeque::new(), grouping, pace })
+            next_slot: intake.next_slot % waves, sequence: 0, outstanding: VecDeque::new(), grouping, pace,
+            prefill: false })
     }
 
     /// The workers' installed expert grouping (from the bootstrap).
@@ -779,7 +832,8 @@ impl<'a> Waves<'a> {
             self.layouts[slot] = None;
         }
         cuteafd_transport::wait_policy::note_active();
-        let job = Job { sequence, slot, rows, source, consumed: self.uses[slot], sent: Instant::now() };
+        let job = Job { sequence, slot, rows, prefill: self.prefill, source, consumed: self.uses[slot],
+            sent: Instant::now() };
         self.jobs.as_ref().context("Spark exchange stopped")?.send(Command::Wave(job))
             .map_err(|_| WaveError::Lost(sequence))?;
         self.sequence = sequence;
@@ -908,6 +962,31 @@ impl<'a> Waves<'a> {
 
     /// The link's running means: (round trip us, Spark idle gap us, waves).
     pub(crate) fn pace(&self) -> (u32, u32, u32) { self.pace.sample() }
+
+    /// Starts a prefill call (#762): every wave sent until
+    /// [`Self::end_prefill`] reports its ranks' measured unit pace. Clears the
+    /// previous call's sums. Call with no wave outstanding.
+    pub(crate) fn begin_prefill(&mut self) -> Result<()> {
+        ensure!(self.outstanding.is_empty(), "a prefill call begins with no Spark wave outstanding");
+        *self.pace.prefill() = PrefillAccumulator::default();
+        self.prefill = true;
+        Ok(())
+    }
+
+    /// Ends the prefill call and returns its Spark pace: per rank, the summed
+    /// busy and idle microseconds the workers measured on their prefill owner
+    /// for every unit after that rank's first in the call, and the prompt rows
+    /// those units carried. Every wave of the call must have landed on the
+    /// host (`landed`, e.g. after the consuming stream drained); waves still
+    /// outstanding are refused rather than silently missing from the sums.
+    pub(crate) fn end_prefill(&mut self) -> Result<cuteafd_loader::serving_capacity::wave_control::PrefillPace> {
+        self.prefill = false;
+        // The worker adds a wave's pace before it publishes the wave's
+        // landing, so every wave the host sees landed is in the sums.
+        ensure!(reached(self.words.load(Counter::Landed), self.sequence),
+            "a prefill call's pace is read only after its waves landed");
+        Ok(self.pace.prefill().finish())
+    }
 
     /// Stops the worker and returns the transport (after a failure, with its
     /// waves abandoned) and the slot its next wave lands in. Every sent wave

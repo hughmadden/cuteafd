@@ -41,6 +41,10 @@ pub const EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16: u32 = 1 << 16;
 // Final empty Error: output_dim carries the worker's admitted row capacity.
 // Header-only metadata is also readable when the response lands on the GPU.
 pub const EXPERT_PROTOCOL_V2_FLAG_RESPONSE_ROW_CAPACITY_ERROR: u32 = 1 << 17;
+// The worker's prefill-unit pace (#762): busy and idle microseconds of the
+// unit on its prefill owner, two LE u32 at bytes 88..96. Never combined with
+// the debug checksum, which occupies those bytes.
+pub const EXPERT_PROTOCOL_V2_FLAG_RESPONSE_UNIT_PACE: u32 = 1 << 19;
 pub const EXPERT_PROTOCOL_V2_FLAG_SPARK_ROW_SHARDED_REDUCTION: u32 = 1 << 11;
 const EXPERT_PROTOCOL_V2_SPARK_COLLECTIVE_PART_COUNT_SHIFT: u32 = 12;
 const EXPERT_PROTOCOL_V2_SPARK_COLLECTIVE_PART_COUNT_MASK: u32 =
@@ -50,6 +54,7 @@ const CHECKSUM_LEN: usize = 32;
 const REQUEST_CHECKSUM_OFFSET: usize = 92;
 const RESPONSE_EXECUTOR_ID_OFFSET: usize = 80;
 const RESPONSE_CHECKSUM_OFFSET: usize = 88;
+const RESPONSE_PACE_OFFSET: usize = 88;
 
 mod batch;
 mod request;
@@ -339,6 +344,9 @@ pub struct ExpertProtocolV2ResponseHeader {
     pub status: ExpertProtocolV2Status,
     pub flags: u32,
     pub executor_id: u64,
+    /// The worker's measured (busy µs, idle µs) for this unit on its prefill
+    /// owner; present exactly when `EXPERT_PROTOCOL_V2_FLAG_RESPONSE_UNIT_PACE` is set.
+    pub pace: Option<(u32, u32)>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -528,6 +536,7 @@ fn validate_flags(flags: u32, label: &str) -> Result<()> {
                 | EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16
                 | EXPERT_PROTOCOL_V2_FLAG_RESPONSE_ROW_INDICES
                 | EXPERT_PROTOCOL_V2_FLAG_RESPONSE_MORE_CHUNKS
+                | EXPERT_PROTOCOL_V2_FLAG_RESPONSE_UNIT_PACE
         }
         _ => EXPERT_PROTOCOL_V2_FLAG_DEBUG_CHECKSUM,
     };
@@ -576,6 +585,25 @@ fn validate_flags(flags: u32, label: &str) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// The unit pace a response header carries (flag-gated; never with a checksum).
+fn read_response_pace(bytes: &[u8], flags: u32) -> Result<Option<(u32, u32)>> {
+    if flags & EXPERT_PROTOCOL_V2_FLAG_RESPONSE_UNIT_PACE == 0 { return Ok(None); }
+    if flags & EXPERT_PROTOCOL_V2_FLAG_DEBUG_CHECKSUM != 0 {
+        bail!("ExpertProtocolV2 response unit pace cannot share the header with a debug checksum");
+    }
+    Ok(Some((read_u32(bytes, RESPONSE_PACE_OFFSET, "pace_busy_us")?,
+        read_u32(bytes, RESPONSE_PACE_OFFSET + 4, "pace_idle_us")?)))
+}
+
+/// Writes a response header's pace after its executor id (the 88..96 tail).
+fn push_response_pace(out: &mut Vec<u8>, header: &ExpertProtocolV2ResponseHeader) {
+    if let Some((busy, idle)) = header.pace.filter(|_| header.flags & EXPERT_PROTOCOL_V2_FLAG_DEBUG_CHECKSUM == 0) {
+        debug_assert_eq!(out.len(), RESPONSE_PACE_OFFSET);
+        push_u32(out, busy);
+        push_u32(out, idle);
+    }
 }
 
 fn validate_header_len(header_len: usize, expected_header_len: usize) -> Result<()> {

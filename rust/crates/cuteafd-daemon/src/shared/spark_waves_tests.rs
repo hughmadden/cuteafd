@@ -52,14 +52,14 @@ impl Backend for Fake {
         occupied[job.slot] = Some(job.sequence);
         Ok(FakeWave { sequence: job.sequence, slot: job.slot, polls: 0 })
     }
-    fn poll(&mut self, wave: &mut FakeWave, slot: usize, _rows: usize) -> Result<bool> {
+    fn poll(&mut self, wave: &mut FakeWave, slot: usize, _rows: usize) -> Result<Option<RankPace>> {
         assert_eq!(slot, wave.slot);
         self.world.polls.fetch_add(1, Ordering::Relaxed);
         wave.polls += 1;
         if self.world.fail_poll == Some(wave.sequence) && wave.polls == 2 { anyhow::bail!("injected receive failure"); }
-        if wave.polls < 3 { return Ok(false); }
+        if wave.polls < 3 { return Ok(None); }
         self.world.occupied.lock().unwrap()[slot] = None;
-        Ok(true)
+        Ok(Some(Default::default()))
     }
     fn publish(&mut self, sequence: u32) {
         if !reached(self.world.load(Counter::Landed), sequence) { self.world.store(Counter::Landed, sequence); }
@@ -68,7 +68,7 @@ impl Backend for Fake {
 }
 
 fn job(sequence: u32, slot: usize, consumed: u32) -> Job {
-    Job { sequence, slot, rows: 1, consumed, sent: Instant::now(),
+    Job { sequence, slot, rows: 1, prefill: false, consumed, sent: Instant::now(),
         source: Source::Staged { layout: RouteStaging::new(1, 8, 16).unwrap(),
             build: Box::new(|_, _| anyhow::bail!("the fake posts without building")) } }
 }
@@ -360,7 +360,7 @@ impl Transport for EchoWorld {
             posted: Instant::now() })
     }
     fn poll(&mut self, wave: &mut EchoWave, sink: &mut dyn FnMut(usize, u32, &[u8]) -> Result<()>)
-        -> Result<Option<u8>> {
+        -> Result<Option<(u8, RankPace)>> {
         wave.polls += 1;
         if wave.polls < 3 || wave.posted.elapsed() < self.delay { return Ok(None); }
         for (rank, rows) in wave.rows.iter().enumerate() {
@@ -378,7 +378,11 @@ impl Transport for EchoWorld {
         if let Some((cpu, wall)) = self.cpu {
             self.spent = Some((cuteafd_ffi::thread_cpu_seconds()? - cpu, wall.elapsed().as_secs_f64()));
         }
-        Ok(Some(self.landing))
+        let mut pace = RankPace::default();
+        for (rank, sample) in pace.iter_mut().enumerate().take(self.ranks) {
+            *sample = Some((100 * (rank as u32 + 1), wave.slot as u32));
+        }
+        Ok(Some((self.landing, pace)))
     }
     fn timeout(&self) -> Duration { Duration::from_secs(10) }
     fn abandon(&mut self) {}
@@ -638,4 +642,72 @@ fn wave_depth_steps_one_wave_with_hysteresis() {
     let mut one = WaveDepth::new(1, 1);
     for _ in 0..8 { assert_eq!(one.observe(13_000, 13_000), 1); }
     for _ in 0..8 { assert_eq!(one.observe(13_000, 0), 1); }
+}
+
+/// #762: a prefill call's pace sums every rank's reported busy/idle after
+/// its first unit, counts the rows of those units, and ignores ranks that
+/// report nothing (decode owners) and waves sent outside the call.
+#[test]
+fn prefill_accumulator_skips_each_ranks_first_unit() {
+    let mut sums = PrefillAccumulator::default();
+    let wave = |busy: u32, idle: u32| {
+        let mut pace = RankPace::default();
+        pace[0] = Some((busy, idle));
+        pace[1] = Some((busy + 1, idle + 1));
+        pace
+    };
+    sums.add(2048, &wave(9_000, 5_000));
+    assert_eq!(sums.finish().rows, 0, "the first unit's idle is the decode boundary");
+    sums.add(2048, &wave(8_000, 100));
+    sums.add(1024, &wave(4_000, 0));
+    let pace = sums.finish();
+    assert_eq!(pace.rows, 3072);
+    assert_eq!(pace.ranks, vec![(12_000, 100), (12_002, 102)]);
+    sums.add(64, &RankPace::default());
+    assert_eq!(sums.finish(), pace, "a wave without reports adds nothing");
+}
+
+/// The worker adds a prefill wave's reported pace before publishing its
+/// landing, and only for waves flagged as prefill.
+#[test]
+fn worker_sums_prefill_wave_pace_before_publishing_landed() -> Result<()> {
+    struct Paced { world: Arc<World>, polls: usize }
+    impl Backend for Paced {
+        type Wave = (u32, usize);
+        fn counter(&self, counter: Counter) -> u32 { self.world.load(counter) }
+        fn post(&mut self, job: Job) -> Result<(u32, usize)> { Ok((job.sequence, job.slot)) }
+        fn poll(&mut self, wave: &mut (u32, usize), _slot: usize, _rows: usize) -> Result<Option<RankPace>> {
+            self.polls += 1;
+            let mut pace = RankPace::default();
+            pace[0] = Some((1_000 * wave.0, 10 * wave.0));
+            Ok(Some(pace))
+        }
+        fn publish(&mut self, sequence: u32) { self.world.store(Counter::Landed, sequence); }
+    }
+    let world = World::new(2);
+    let link = LinkPace::default();
+    let (jobs, inbox) = mpsc::channel();
+    std::thread::scope(|scope| -> Result<()> {
+        let mut backend = Paced { world: world.clone(), polls: 0 };
+        let link = &link;
+        let worker = scope.spawn(move || run_worker(&mut backend, &inbox, Duration::from_secs(5), false, link));
+        for (sequence, prefill) in [(1, false), (2, true), (3, true), (4, true), (5, false)] {
+            let mut job = job(sequence, (sequence as usize) % 2, 0);
+            job.rows = 100;
+            job.prefill = prefill;
+            world.store(Counter::Staged(job.slot), sequence);
+            jobs.send(Command::Wave(job)).unwrap();
+            wait(&world, Counter::Landed, sequence)?;
+            if prefill {
+                // Visible as soon as the landing is.
+                assert!(link.prefill().seen[0]);
+            }
+        }
+        drop(jobs);
+        worker.join().unwrap().0
+    })?;
+    // Wave 2 is rank 0's first prefill unit; waves 3 and 4 count.
+    assert_eq!(link.prefill().finish(),
+        cuteafd_loader::serving_capacity::wave_control::PrefillPace { rows: 200, ranks: vec![(7_000, 70)] });
+    Ok(())
 }
