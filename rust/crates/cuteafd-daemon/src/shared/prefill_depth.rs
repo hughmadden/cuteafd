@@ -52,18 +52,18 @@ impl PrefillDepth {
     /// A finished prefill that ran `waves` units deep reports the Sparks' pace.
     pub(crate) fn finish(&self, waves: usize, pace: &PrefillPace) -> Decision {
         let before = self.next();
-        let decision = self.control.borrow_mut().observe(waves as u64, pace);
-        let fields = (before.waves, before.unit_rows, decision.waves, decision.unit_rows, pace.rows,
-            decision.period_us_per_row, decision.idle_share, decision.reason);
-        if decision.waves as usize != before.waves {
-            tracing::info!(waves = fields.0, unit_rows = fields.1, next_waves = fields.2, next_unit_rows = fields.3,
-                rows = fields.4, period_us_per_row = ?fields.5, idle_share = ?fields.6, reason = fields.7,
-                "prefill depth");
+        let d = self.control.borrow_mut().observe(waves as u64, pace);
+        if d.waves as usize != before.waves {
+            tracing::info!(waves = before.waves, unit_rows = before.unit_rows, next_waves = d.waves,
+                next_unit_rows = d.unit_rows, rows = pace.rows, busy_us_per_row = ?d.busy_us_per_row,
+                idle_us_per_row = ?d.idle_us_per_row, turnaround_us = ?d.turnaround_us, exact = d.exact,
+                reason = d.reason, "prefill depth");
         } else {
-            tracing::debug!(waves = fields.0, unit_rows = fields.1, rows = fields.4, period_us_per_row = ?fields.5,
-                idle_share = ?fields.6, reason = fields.7, "prefill depth");
+            tracing::debug!(waves = before.waves, unit_rows = before.unit_rows, rows = pace.rows,
+                busy_us_per_row = ?d.busy_us_per_row, idle_us_per_row = ?d.idle_us_per_row,
+                turnaround_us = ?d.turnaround_us, exact = d.exact, reason = d.reason, "prefill depth");
         }
-        decision
+        d
     }
 }
 
