@@ -224,17 +224,7 @@ impl<'a> Programs<'a> {
                     super::native_dense::validate_entry(spec, entry)?;
                 }
             } else if name.starts_with("exlr8_") {
-                super::exlr8::validate_entry(spec, entry)?;
-                let expected: &[(&str, &str)] = match name {
-                    "exlr8_a16_grouped" | "exlr8_a8_grouped" | "exlr8_a16_grouped64" => &[("rows", "int32"), ("cta_limit", "int32"), ("unit_limit", "int32")],
-                    "exlr8_a16_serving" | "exlr8_shared_a16_serving" => &[("rows", "int32"), ("cta_limit", "int32")],
-                    "exlr8_group" | "exlr8_shared_group" | "exlr8_grouped_group" => &[("rows", "int32"), ("cta_limit", "int32")],
-                    _ => &[("rows", "int32"), ("groups", "int32"), ("cta_limit", "int32")],
-                };
-                let scalars = entry["scalars"].as_array().context("EXLR8 scalar ABI missing")?;
-                ensure!(scalars.len() == expected.len() && scalars.iter().zip(expected).all(
-                    |(s, (n, t))| s["name"].as_str() == Some(*n) && s["type"].as_str() == Some(*t)),
-                    "EXLR8 scalar names or types disagree with ABI");
+                validate_exlr8_entry(spec, entry)?;
             }
         }
         Ok(self)
@@ -365,6 +355,23 @@ impl Program<'_> {
     }
 }
 
+fn validate_exlr8_entry(spec: &ProgramSpec, entry: &serde_json::Value) -> Result<()> {
+    super::exlr8::validate_entry(spec, entry)?;
+    let expected: &[(&str, &str)] = match spec.name.as_str() {
+        "exlr8_a16_grouped" | "exlr8_a8_grouped" | "exlr8_a16_grouped64" => &[
+            ("rows", "int32"), ("cta_limit", "int32"), ("unit_limit", "int32"), ("l2_bytes", "int32"),
+        ],
+        "exlr8_a16_serving" | "exlr8_shared_a16_serving" => &[("rows", "int32"), ("cta_limit", "int32")],
+        "exlr8_group" | "exlr8_shared_group" | "exlr8_grouped_group" => &[("rows", "int32"), ("cta_limit", "int32")],
+        _ => &[("rows", "int32"), ("groups", "int32"), ("cta_limit", "int32")],
+    };
+    let scalars = entry["scalars"].as_array().context("EXLR8 scalar ABI missing")?;
+    ensure!(scalars.len() == expected.len() && scalars.iter().zip(expected).all(
+        |(s, (n, t))| s["name"].as_str() == Some(*n) && s["type"].as_str() == Some(*t)),
+        "EXLR8 scalar names or types disagree with ABI");
+    Ok(())
+}
+
 fn c_string(bytes: &[u8]) -> String {
     let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
     String::from_utf8_lossy(&bytes[..end]).into_owned()
@@ -373,6 +380,44 @@ fn c_string(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn exported_exlr8_grouped_manifest_requires_runtime_l2_scalar() {
+        // Unmodified grouped entries from the SM121 p0 WIP export that exposed the seal failure.
+        let manifest: serde_json::Value = serde_json::from_str(include_str!(
+            "../../tests/fixtures/exlr8_grouped_programs_sm121.json"
+        )).unwrap();
+        let entries = manifest["programs"].as_array().unwrap();
+        assert_eq!(entries.len(), 3);
+        for entry in entries {
+            let spec = ProgramSpec {
+                name: entry["name"].as_str().unwrap().to_owned(),
+                pointers: entry["pointers"].as_array().unwrap().iter()
+                    .map(|p| p["name"].as_str().unwrap().to_owned()).collect(),
+                scalar_kinds: b"iiii".to_vec(),
+                scratch: entry["scratch_bytes_at_capacity"].as_object().unwrap().iter()
+                    .map(|(name, bytes)| (name.clone(), bytes.as_u64().unwrap())).collect(),
+                capacity_rows: entry["capacity_rows"].as_u64().unwrap().try_into().unwrap(),
+                geometry: entry["geometry"].clone(),
+            };
+            validate_exlr8_entry(&spec, entry).unwrap();
+            for defect in ["missing", "renamed", "wrong_type", "reordered", "extra"] {
+                let mut broken = entry.clone();
+                let scalars = broken["scalars"].as_array_mut().unwrap();
+                match defect {
+                    "missing" => { scalars.pop(); }
+                    "renamed" => scalars[3]["name"] = "l2_size".into(),
+                    "wrong_type" => scalars[3]["type"] = "int64".into(),
+                    "reordered" => scalars.swap(2, 3),
+                    "extra" => scalars.push(serde_json::json!({"name": "extra", "type": "int32"})),
+                    _ => unreachable!(),
+                }
+                let error = validate_exlr8_entry(&spec, &broken).unwrap_err();
+                assert!(error.to_string().contains("EXLR8 scalar names or types disagree with ABI"),
+                    "{} {defect}: {error}", spec.name);
+            }
+        }
+    }
 
     #[test]
     fn scalar_slots() {
