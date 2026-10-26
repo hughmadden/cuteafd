@@ -727,6 +727,11 @@ mod tests {
             .split("/// One GPU's end").next().unwrap();
         assert!(helper.contains("Device { library, id: device }.run(body)"));
         assert!(!helper.contains("home"));
+        let mimo = include_str!("../families/mimo_v2/engine.rs");
+        let rank_scope = mimo.split("pub(crate) fn on<T>").nth(1).unwrap()
+            .split("pub(crate) fn is_terminal").next().unwrap();
+        assert!(rank_scope.contains("Device { library: self.library, id: device }.run(body)"));
+        assert!(!rank_scope.contains("cuda_set_device"));
     }
 
     #[test]

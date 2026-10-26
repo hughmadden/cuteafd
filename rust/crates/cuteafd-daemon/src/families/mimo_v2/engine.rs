@@ -833,11 +833,8 @@ impl<'a> MimoEngine<'a> {
 
     /// Runs `body` with rank `rank`'s device current, preserving the caller's device.
     pub(crate) fn on<T>(&self, rank: usize, body: impl FnOnce() -> Result<T>) -> Result<T> {
-        let Some(peer) = self.peer.as_ref().filter(|_| rank == 1) else { return body() };
-        self.library.cuda_set_device(peer.device)?;
-        let out = body();
-        self.library.cuda_set_device(self.device)?;
-        out
+        let device = self.peer.as_ref().filter(|_| rank == 1).map_or(self.device, |peer| peer.device);
+        crate::shared::memory::device::Device { library: self.library, id: device }.run(body)
     }
 
     pub(crate) fn is_terminal(&self) -> bool {
