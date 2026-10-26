@@ -29,6 +29,23 @@ fn plan_accepts_global_budget_and_warns_once_for_each_alias() {
 }
 
 #[test]
+fn plan_json_keeps_info_tracing_on_stderr() {
+    let snapshot = tempfile::tempdir().unwrap();
+    std::fs::write(snapshot.path().join("config.json"), br#"{"model_type":"unknown"}"#).unwrap();
+    std::fs::write(snapshot.path().join("model.safetensors.index.json"), br#"{"weight_map":{}}"#).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_cuteafd"))
+        .arg("plan").arg(snapshot.path()).arg("--json")
+        .env("RUST_LOG", "info").env("HF_HOME", snapshot.path())
+        .output().unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .unwrap_or_else(|error| panic!("invalid JSON: {error}: {}", String::from_utf8_lossy(&output.stdout)));
+    assert_eq!(report["fits"], false);
+    assert!(stderr.contains("planner phase durations"), "{stderr}");
+}
+
+#[test]
 fn deployment_rejects_conflicting_modes_and_incomplete_topology() {
     for flags in [
         vec!["--deployment", "--files"],
