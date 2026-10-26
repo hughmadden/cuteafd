@@ -34,6 +34,7 @@ use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::{CuteafdDeviceBuffer, CuteafdHostBuffer, NativeLibrary};
 use cuteafd_transport::expert::{SparkExperts, SparkExpertWave, WaveReceipt};
 use cuteafd_transport::{DeviceLanding, GpuLandingProbe, VerbsHostProtocolV2ResponsePayload};
+use crate::shared::wave_geometry::SlotGeometry;
 use std::cell::{Cell, RefCell};
 use std::ffi::c_void;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -338,19 +339,24 @@ pub(crate) fn fabric_probe(native_lib: Option<&std::path::Path>, device: i32, wa
 
 /// One transport's rank planes and the machinery that fills them.
 ///
-/// With `waves > 1` the intake owns that many return slots, each a full set of
-/// rank planes. Waves take slots in dispatch order (`sequence % waves`), the
-/// same order the transport receives them; a slot is reused only after the
-/// reduce that read its previous wave (its own consumed event).
+/// Each rank owns one reserve range; the intake admits `slots` return slots
+/// of up to `rows` rows and cuts the range into the current `waves` slots
+/// ([`SlotGeometry`], re-cut at rest with [`Self::set_geometry`]). Waves take
+/// slots in dispatch order (`sequence % waves`), the same order the transport
+/// receives them; a slot is reused only after the reduce that read its
+/// previous wave (its own consumed event).
 pub(crate) struct SparkIntake<'a> {
     library: &'a NativeLibrary,
     mode: IntakeMode,
     ranks: usize,
+    /// Admitted rows of one return slot (the widest wave).
     rows: usize,
     row_bytes: usize,
-    /// One rank-contiguous allocation containing every slot for that rank.
+    /// One allocation per rank holding its whole reserve range.
     planes: Vec<DeviceAllocation<'a>>,
+    /// Admitted return slots (events, consumed fences).
     waves: usize,
+    geometry: RefCell<SlotGeometry>,
     state: IntakeState,
     /// Host mode: every rank's plane back to back.
     staging: Option<RefCell<HostAllocation<'a>>>,
@@ -383,13 +389,19 @@ impl IntakeState {
 
     fn before_dispatch(&self, wait_consumed: impl FnOnce(usize) -> Result<()>,
         release_uploads: impl FnOnce() -> Result<()>) -> Result<()> {
+        self.before_dispatch_in(self.consumed_pending.len(), wait_consumed, release_uploads)
+    }
+
+    /// [`Self::before_dispatch`] when the current cut has `waves` slots.
+    fn before_dispatch_in(&self, waves: usize, wait_consumed: impl FnOnce(usize) -> Result<()>,
+        release_uploads: impl FnOnce() -> Result<()>) -> Result<()> {
         let slot = self.dispatch_slot.get();
         if self.consumed_pending[slot].get() {
             wait_consumed(slot)?;
             self.consumed_pending[slot].set(false);
         }
         release_uploads()?;
-        self.dispatch_slot.set((slot + 1) % self.consumed_pending.len());
+        self.dispatch_slot.set((slot + 1) % waves);
         Ok(())
     }
 
@@ -421,14 +433,25 @@ impl<'a> SparkIntake<'a> {
         Self::with_waves(library, mode, ranks, rows, row_bytes, 1)
     }
 
-    /// `waves` return slots, registered as one contiguous range per rank.
+    /// `waves` return slots of `rows` rows, registered as one contiguous
+    /// range per rank (the reserve is exactly `waves * rows`).
     pub(crate) fn with_waves(library: &'a NativeLibrary, mode: IntakeMode, ranks: usize, rows: usize,
         row_bytes: usize, waves: usize) -> Result<Self> {
+        Self::with_reserve(library, mode, ranks, rows, row_bytes, waves, waves * rows)
+    }
+
+    /// Up to `slots` return slots of up to `rows` rows inside a reserve of
+    /// `reserve_rows` rows per rank, cut at first into `slots` slots of the
+    /// widest rows that fit; [`Self::set_geometry`] re-cuts it at rest.
+    pub(crate) fn with_reserve(library: &'a NativeLibrary, mode: IntakeMode, ranks: usize, rows: usize,
+        row_bytes: usize, slots: usize, reserve_rows: usize) -> Result<Self> {
         let _memory_scope = cuteafd_ffi::memory_ledger::scope("spark-intake");
+        let waves = slots;
         ensure!((1..=8).contains(&ranks), "{ranks} Spark ranks are outside the one-through-eight transport worlds");
         ensure!((1..=4).contains(&waves), "Spark intake admits 1..=4 return slots");
+        let geometry = SlotGeometry::new(waves, rows, reserve_rows, waves, rows.min(reserve_rows / waves))?;
         let plane_bytes = rows * row_bytes;
-        let planes = (0..ranks).map(|_| DeviceAllocation::new(library, (plane_bytes * waves).max(256)))
+        let planes = (0..ranks).map(|_| DeviceAllocation::new(library, (reserve_rows * row_bytes).max(256)))
             .collect::<Result<Vec<_>>>()?;
         // Host mode stages every wave; pinned mode only small ones (see `stages`).
         let staging = match mode {
@@ -440,7 +463,7 @@ impl<'a> SparkIntake<'a> {
         // Every mode has a copy stream: prefill transport workers upload there.
         let copy_stream = library.cuda_stream_create()?;
         Ok(Self {
-            library, mode, ranks, rows, row_bytes, planes, waves,
+            library, mode, ranks, rows, row_bytes, planes, waves, geometry: RefCell::new(geometry),
             state: IntakeState::new(waves), staging, copy_stream,
             copied: library.cuda_event_create_ordering()?,
             consumed: (0..waves).map(|_| library.cuda_event_create_ordering()).collect::<Result<_>>()?,
@@ -449,15 +472,50 @@ impl<'a> SparkIntake<'a> {
         })
     }
 
-    /// The device ranges a GPU-mode transport lands in.
+    /// The device ranges a GPU-mode transport lands in: a single-slot link's
+    /// one range, or a multi-slot link's placed reserve range, whose waves
+    /// name their slices ([`Self::placed`]).
     pub(crate) fn landing(&self) -> Option<Vec<DeviceLanding>> {
-        (self.mode == IntakeMode::Gpu).then(|| self.planes.iter().map(|p|
-            DeviceLanding::with_slots(p.buffer, self.waves).expect("validated intake slot geometry")).collect())
+        (self.mode == IntakeMode::Gpu).then(|| self.planes.iter().map(|p| match self.placed() {
+            true => DeviceLanding::placed(p.buffer).expect("validated intake reserve"),
+            false => DeviceLanding::new(p.buffer),
+        }).collect())
     }
 
-    pub(crate) fn waves(&self) -> usize { self.waves }
+    /// Multi-slot links place each wave's GPU landing slice per request, so
+    /// their cut may change; a single-slot link keeps one rotating range.
+    pub(crate) fn placed(&self) -> bool { self.waves > 1 }
+
+    /// Each rank's whole reserve range.
+    pub(crate) fn ranges(&self) -> Vec<CuteafdDeviceBuffer> { self.planes.iter().map(|plane| plane.buffer).collect() }
+    /// The admitted slots and rows, and the current cut.
+    pub(crate) fn geometry(&self) -> SlotGeometry { self.geometry.borrow().clone() }
+
+    /// Re-cuts the reserve into `waves` slots of `rows` rows. Legal only at
+    /// rest: no upload or reduce pending, no receive slot held, and dispatch
+    /// and receive at the same slot. Rotation restarts at slot 0.
+    pub(crate) fn set_geometry(&self, waves: usize, rows: usize) -> Result<()> {
+        ensure!(self.placed(), "a single-slot intake has no cut to change");
+        ensure!(!self.state.copies_pending.get() && self.state.consumed_pending.iter().all(|p| !p.get())
+            && self.held.lock().map_err(|_| anyhow::anyhow!("intake slots poisoned"))?.is_empty()
+            && self.state.dispatch_slot.get() == self.state.receive_slot.get(),
+            "the Spark intake re-cuts its return slots only at rest");
+        if self.geometry.borrow_mut().set(waves, rows)? {
+            self.state.dispatch_slot.set(0);
+            self.state.receive_slot.set(0);
+        }
+        Ok(())
+    }
+
+    /// Return slots of the current cut.
+    pub(crate) fn waves(&self) -> usize { self.geometry.borrow().cut().waves }
+    /// Admitted return slots.
+    pub(crate) fn slots(&self) -> usize { self.waves }
     pub(crate) fn library(&self) -> &'a NativeLibrary { self.library }
-    pub(crate) fn rows(&self) -> usize { self.rows }
+    /// Rows of one return slot under the current cut.
+    pub(crate) fn rows(&self) -> usize { self.geometry.borrow().cut().rows }
+    /// Admitted rows of one return slot (the widest wave).
+    pub(crate) fn max_rows(&self) -> usize { self.rows }
     pub(crate) fn row_bytes(&self) -> usize { self.row_bytes }
     pub(crate) fn ranks(&self) -> usize { self.ranks }
     pub(crate) fn copy_stream(&self) -> *mut c_void { self.copy_stream }
@@ -489,15 +547,15 @@ impl<'a> SparkIntake<'a> {
     /// Return slot `slot`'s wave has landed (its upload or landing event is
     /// on the copy stream): [`Self::pointers`] and [`Self::consumed`] now name it.
     pub(crate) fn landed_into(&self, slot: usize) {
-        self.state.receive_slot.set((slot + 1) % self.waves);
+        self.state.receive_slot.set((slot + 1) % self.waves());
     }
 
     /// After a prefill transport worker retired: `next` is the slot the next
     /// wave on this intake takes, for dispatch and receive alike, and no
     /// upload is pending (the worker drained its copy stream).
     pub(crate) fn resume_at(&self, next: usize) {
-        self.state.dispatch_slot.set(next % self.waves);
-        self.state.receive_slot.set(next % self.waves);
+        self.state.dispatch_slot.set(next % self.waves());
+        self.state.receive_slot.set(next % self.waves());
     }
 
     /// The return slot the next received wave lands in.
@@ -510,11 +568,10 @@ impl<'a> SparkIntake<'a> {
     pub(crate) fn release_uploads(&self) -> Result<()> { self.release_held() }
 
     fn slot_planes(&self, slot: usize) -> impl Iterator<Item = CuteafdDeviceBuffer> + '_ {
-        assert!(slot < self.waves);
-        let bytes = self.rows * self.row_bytes;
+        let (offset, bytes) = self.geometry.borrow().slice(slot, self.row_bytes);
         self.planes.iter().map(move |plane| CuteafdDeviceBuffer {
-            // SAFETY: every slot lies within this rank's contiguous allocation.
-            ptr: unsafe { plane.buffer.ptr.cast::<u8>().add(slot * bytes) }.cast(),
+            // SAFETY: every slot of the cut lies within this rank's reserve allocation.
+            ptr: unsafe { plane.buffer.ptr.cast::<u8>().add(offset) }.cast(),
             bytes,
             ..plane.buffer
         })
@@ -536,7 +593,7 @@ impl<'a> SparkIntake<'a> {
     /// Before dispatch: the reused planes' reduce is done and completed
     /// uploads have released their receive slots, even with waves in flight.
     pub(crate) fn before_dispatch(&self) -> Result<()> {
-        self.state.before_dispatch(|slot| {
+        self.state.before_dispatch_in(self.waves(), |slot| {
             // SAFETY: the event was recorded on the engine's stream by `consumed`.
             unsafe { self.library.cuda_event_synchronize(self.consumed[slot]) }
         }, || self.release_held())
@@ -555,8 +612,9 @@ impl<'a> SparkIntake<'a> {
     }
 
     fn check(&self, t: usize, ranks: usize) -> Result<usize> {
-        ensure!(ranks == self.ranks && t <= self.rows,
-            "a wave of {t} rows from {ranks} ranks exceeds the intake ({} ranks x {} rows)", self.ranks, self.rows);
+        let rows = self.rows();
+        ensure!(ranks == self.ranks && t <= rows,
+            "a wave of {t} rows from {ranks} ranks exceeds the intake ({} ranks x {rows} rows)", self.ranks);
         Ok(t * self.row_bytes)
     }
 
@@ -612,7 +670,7 @@ impl<'a> SparkIntake<'a> {
             }
         };
         drain.complete();
-        self.state.receive_slot.set((slot + 1) % self.waves);
+        self.state.receive_slot.set((slot + 1) % self.waves());
         Ok(receipt)
     }
 
@@ -640,7 +698,7 @@ impl<'a> SparkIntake<'a> {
         pointers
     }
 
-    fn last_received(&self) -> usize { (self.state.receive_slot.get() + self.waves - 1) % self.waves }
+    fn last_received(&self) -> usize { (self.state.receive_slot.get() + self.waves() - 1) % self.waves() }
 
     /// The last received wave's planes, in rank order.
     pub(crate) fn planes(&self) -> impl Iterator<Item = CuteafdDeviceBuffer> + '_ {
@@ -655,7 +713,7 @@ impl<'a> SparkIntake<'a> {
 
     /// Marks return slot `slot`'s planes read once `stream` reaches this point.
     pub(crate) fn mark_consumed(&self, slot: usize, stream: *mut c_void) -> Result<()> {
-        ensure!(slot < self.waves, "return slot {slot} outside the intake's {}", self.waves);
+        ensure!(slot < self.waves(), "return slot {slot} outside the intake's {}", self.waves());
         // SAFETY: both handles are live; the event only orders later dispatches.
         unsafe { self.library.cuda_event_record(self.consumed[slot], stream)? };
         self.state.consumed_pending[slot].set(true);
@@ -1474,14 +1532,46 @@ impl<'a> SparkLink<'a> {
     pub(crate) fn new_waves(library: &'a NativeLibrary, world: cuteafd_transport::expert::SparkWorld,
         peers: &[std::net::SocketAddr], capacity: u32, config: cuteafd_transport::TcpTransportConfig,
         row_bytes: usize, waves: usize, wave_rows: u32) -> Result<Self> {
+        Self::new_reserve(library, world, peers, capacity, config, row_bytes, waves, wave_rows,
+            waves * wave_rows as usize)
+    }
+
+    /// A link admitting up to `slots` outstanding waves of up to `wave_rows`
+    /// rows, whose return slots are cut from one `reserve_rows`-row range per
+    /// rank ([`SparkIntake::with_reserve`]); the cut starts at `slots` slots of
+    /// the widest rows that fit and changes at rest with [`Self::set_geometry`].
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new_reserve(library: &'a NativeLibrary, world: cuteafd_transport::expert::SparkWorld,
+        peers: &[std::net::SocketAddr], capacity: u32, config: cuteafd_transport::TcpTransportConfig,
+        row_bytes: usize, slots: usize, wave_rows: u32, reserve_rows: usize) -> Result<Self> {
         ensure!((1..=capacity).contains(&wave_rows), "Spark return slot rows exceed the transport capacity");
         let timing = config.timing;
         let mut transport = SparkExperts::new_world(world, peers, capacity, config, 0)?;
-        transport.set_max_waves(waves)?;
-        Self::with_egress_waves(library, transport, row_bytes, IntakePreference::Probed, true, waves, wave_rows, timing)
+        transport.set_max_waves(slots)?;
+        Self::with_egress_waves(library, transport, row_bytes, IntakePreference::Probed, true, slots, wave_rows,
+            reserve_rows, timing)
     }
 
+    /// Return slots of the current cut.
     pub(crate) fn waves(&self) -> usize { self.intake.waves() }
+    /// Admitted return slots (the most [`Self::set_geometry`] accepts).
+    pub(crate) fn slots(&self) -> usize { self.intake.slots() }
+
+    /// Re-cuts the return slots into `waves` slots of `rows` rows (#762):
+    /// the intake and the running exchange together, at rest (every wave
+    /// landed and consumed). Nothing is allocated, registered or reconnected.
+    pub(crate) fn set_geometry(&mut self, waves: usize, rows: usize) -> Result<()> {
+        let previous = self.intake.geometry().cut();
+        self.intake.set_geometry(waves, rows)?;
+        if let Some(exchange) = self.exchange.as_mut() {
+            if let Err(error) = exchange.set_geometry(waves, rows) {
+                // Both are at rest, so the intake can return to the cut the exchange kept.
+                self.intake.set_geometry(previous.waves, previous.rows)?;
+                return Err(error);
+            }
+        }
+        Ok(())
+    }
     pub(crate) fn world_size(&self) -> usize { self.world_size }
     pub(crate) fn world(&self) -> cuteafd_transport::expert::SparkWorld { self.world }
     /// The most rows any request on this link may carry.
@@ -1494,20 +1584,20 @@ impl<'a> SparkLink<'a> {
     pub(crate) fn from_transport(library: &'a NativeLibrary, transport: SparkExperts,
         row_bytes: usize, preference: IntakePreference, timing: bool) -> Result<Self> {
         let capacity = transport.capacity();
-        Self::with_egress_waves(library, transport, row_bytes, preference, false, 1, capacity, timing)
+        Self::with_egress_waves(library, transport, row_bytes, preference, false, 1, capacity, capacity as usize, timing)
     }
 
     #[allow(clippy::too_many_arguments)]
     fn with_egress_waves(library: &'a NativeLibrary, mut transport: SparkExperts,
         row_bytes: usize, preference: IntakePreference, enable_egress: bool, waves: usize, wave_rows: u32,
-        timing: bool) -> Result<Self> {
+        reserve_rows: usize, timing: bool) -> Result<Self> {
         let _memory_scope = cuteafd_ffi::memory_ledger::scope("spark-intake");
         let ranks = transport.world_size();
         let capacity = transport.capacity();
         library.v41_compact_reducer()?.require_plane_reduction(ranks as u32)?;
         let (mode, reason) = choose_preferred_mode(library, preference)?.mode_for(ranks * capacity as usize * row_bytes);
         tracing::info!(mode = mode.name(), ranks, capacity, %reason, "Spark transport intake");
-        let intake = SparkIntake::with_waves(library, mode, ranks, wave_rows as usize, row_bytes, waves)?;
+        let intake = SparkIntake::with_reserve(library, mode, ranks, wave_rows as usize, row_bytes, waves, reserve_rows)?;
         // SAFETY: the link drops its transport (and its exchange's) before its
         // intake, and every wave's planes are read only between its landing
         // and its consume, both ordered by the exchange.
@@ -1539,7 +1629,7 @@ impl<'a> SparkLink<'a> {
         let staging = crate::shared::experts::staging::RouteStaging::new(request.header.row_count as usize,
             usize::try_from(request.header.route_count / request.header.row_count.max(1))?.max(1),
             request.hidden_payload.len() / (request.header.row_count as usize).max(1))?.bytes;
-        let (egress_enabled, egress_bytes, waves) = (self.egress_enabled, self.egress_bytes, self.waves());
+        let (egress_enabled, egress_bytes, waves) = (self.egress_enabled, self.egress_bytes, self.slots());
         let transport = self.idle_transport()?;
         let mut registered = egress_bytes;
         if egress_enabled && egress_bytes == 0 {
@@ -1560,7 +1650,6 @@ impl<'a> SparkLink<'a> {
     fn start(&mut self) -> Result<()> {
         let intake = &self.intake;
         intake.release_uploads()?;
-        let waves = intake.waves();
         let transport = self.transport.take().context("Spark link has no transport")?;
         // A link whose registered request ring has a slot per wave, each large
         // enough, stages in those slots: every rank then sends each request
@@ -1571,21 +1660,23 @@ impl<'a> SparkLink<'a> {
             Err(error) => { self.transport = Some(transport); return Err(error); }
         };
         let bytes = self.staging_bytes.max(256);
-        let registered = egress.len() == waves && egress.iter().all(|arena| arena.bytes() >= bytes);
+        let slots = intake.slots();
+        let registered = egress.len() == slots && egress.iter().all(|arena| arena.bytes() >= bytes);
         let arenas = if registered { Ok(egress) } else {
             let _scope = cuteafd_ffi::memory_ledger::scope("spark-intake");
-            (0..waves).map(|_| cuteafd_transport::StagingArena::new(bytes)).collect::<Result<Vec<_>>>()
+            (0..slots).map(|_| cuteafd_transport::StagingArena::new(bytes)).collect::<Result<Vec<_>>>()
         };
         let arenas = match arenas {
             Ok(arenas) => arenas,
             Err(error) => { self.transport = Some(transport); return Err(error); }
         };
-        tracing::info!(waves, bytes, registered, "Spark exchange staging");
+        tracing::info!(slots, bytes, registered, "Spark exchange staging");
         let landing = transport.gpu_landing_ranks().iter().enumerate()
             .fold(0u8, |bits, (rank, &landed)| if landed { bits | 1 << rank } else { bits });
-        let geometry = crate::shared::spark_waves::Intake { ranks: intake.ranks(), rows: intake.rows(),
-            row_bytes: intake.row_bytes(), waves, planes: (0..waves).map(|slot| intake.slot_buffers(slot)).collect(),
-            landing: if intake.mode == IntakeMode::Gpu { landing } else { 0 }, next_slot: intake.dispatch_slot() };
+        let geometry = crate::shared::spark_waves::Intake { ranks: intake.ranks(), row_bytes: intake.row_bytes(),
+            ranges: intake.ranges(), geometry: intake.geometry(),
+            landing: if intake.mode == IntakeMode::Gpu { landing } else { 0 }, placed: intake.placed(),
+            next_slot: intake.dispatch_slot() };
         // Read-only worker metadata, kept so callers need not reach the transport.
         let grouping = transport.installed_grouping().unwrap_or_default();
         self.exchange = Some(crate::shared::spark_waves::Waves::start(intake.library, geometry, transport, grouping,
