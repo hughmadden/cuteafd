@@ -135,9 +135,8 @@ pub(crate) struct Exl3Worker<'a> {
     /// Pinned staging of a call's routes, laid out as `inputs[1]` and
     /// `inputs[2]` receive them: int32 ids
     /// from the start, FP32 gate weights from `weights_offset`. Every
-    /// call completes its stream before returning, so the next call may
-    /// overwrite it.
-    staging: HostAllocation<'a>,
+    /// queued unit keeps its own staging until its completion fence permits reuse.
+    staging: Vec<HostAllocation<'a>>,
     weights_offset: usize,
     topology: Option<SparkTopology>,
     host_path: HostPath,
@@ -146,13 +145,11 @@ pub(crate) struct Exl3Worker<'a> {
     layer_ids: Vec<usize>,
     layer: usize,
     executor_id: u64,
-    /// Lane-owned execution on a rank serving several execution lanes: a
-    /// mapped request returns with its work queued; the owner emits it once
-    /// [`Self::stream_idle`] reports this stream drained.
+    /// Mapped requests return queued; the owner emits each reply after its unit fence.
     deferred: bool,
     /// A deferred request whose expert timing publishes at [`Self::complete`]:
     /// (request id, layer, rows, executor id).
-    pending: Option<(u64, u32, u32, u64)>,
+    pending: super::super::execution::timing::PendingUnits<'a>,
 }
 
 impl<'a> Exl3Worker<'a> {
@@ -287,7 +284,9 @@ impl<'a> Exl3Worker<'a> {
         }
         let topk = Self::topk();
         let weights_offset = capacity as usize * topk * 4;
-        let staging = HostAllocation::named(library, weights_offset + capacity as usize * topk * 4, "experts/workspace/route_staging")?;
+        let staging = (0..1).map(|_| HostAllocation::named(library,
+            weights_offset + capacity as usize * topk * 4, "experts/workspace/route_staging"))
+            .collect::<Result<Vec<_>>>()?;
         let host_path = HostPath::from_env()?;
         let executor_id = cuteafd_transport::expert::SparkWorld::canonical(first.layout.world)?.topology().executor_id(rank)?;
         let route_dump = RouteDump::from_env(executor_id)?;
@@ -341,22 +340,43 @@ impl<'a> Exl3Worker<'a> {
             layer: 0,
             executor_id,
             deferred: false,
-            pending: None,
+            pending: super::super::execution::timing::PendingUnits::new(library, 1)?,
         })
     }
 
     /// Leave mapped requests queued at return (see `deferred`).
-    pub(crate) fn defer(&mut self) { self.deferred = true; }
+    pub(crate) fn defer(&mut self, units: usize, staging_rows: usize) -> Result<()> {
+        ensure!(self.pending.is_empty(), "cannot resize an active EXL3 queue");
+        ensure!(staging_rows > 0 && staging_rows <= self.capacity, "EXL3 staging exceeds owner rows");
+        self.pending = super::super::execution::timing::PendingUnits::new(self.library, units)?;
+        self.weights_offset = staging_rows.checked_mul(Self::topk() * 4)
+            .context("EXL3 route staging overflow")?;
+        self.staging.clear();
+        for _ in 0..units {
+            self.staging.push(HostAllocation::named(self.library,
+                self.weights_offset * 2, "experts/workspace/route_staging")?);
+        }
+        self.deferred = true;
+        Ok(())
+    }
 
     /// The deferred request finished (the owner observed its stream drained):
     /// publish its expert timing, so per-rank Spark compute (S, #762) stays
     /// observable under the async exchange.
     pub(crate) fn complete(&mut self) -> Result<()> {
-        let Some((request_id, layer, rows, executor_id)) = self.pending.take() else { return Ok(()) };
+        let Some((request_id, layer, rows, executor_id)) = self.pending.pop()? else { return Ok(()) };
         if let Some(timing) = &mut self.worker_timing {
             // SAFETY: the caller observed this stream drained after both records.
             unsafe { timing.publish(request_id, layer, rows, executor_id, "exl3")?; }
         }
+        Ok(())
+    }
+
+    pub(crate) fn unit_ready(&self) -> Result<bool> { self.pending.ready() }
+
+    pub(crate) fn synchronize(&self) -> Result<()> {
+        // SAFETY: this owner retains its stream and every queued buffer.
+        unsafe { self.library.cuda_stream_synchronize(self.stream.raw)?; }
         Ok(())
     }
 
@@ -399,10 +419,10 @@ impl<'a> Exl3Worker<'a> {
     }
 
     /// The staged ids and weights of a call of `routes` routes.
-    fn staged(&mut self, routes: usize) -> (&mut [i32], &mut [f32]) {
+    fn staged(&mut self, slot: usize, routes: usize) -> (&mut [i32], &mut [f32]) {
         assert!(routes * 4 <= self.weights_offset,
             "EXL3 staged routes exceed capacity");
-        let base = self.staging.buffer.ptr.cast::<u8>();
+        let base = self.staging[slot].buffer.ptr.cast::<u8>();
         // SAFETY: the two ranges are disjoint, inside the pinned allocation
         // (ids end at or before `weights_offset`, the weights
         // region holds capacity * top-k floats), 4-byte aligned, and
@@ -416,10 +436,10 @@ impl<'a> Exl3Worker<'a> {
     }
 
     /// Read-only view of the staged ids and weights of a call of `routes` routes.
-    fn staged_view(&self, routes: usize) -> (&[i32], &[f32]) {
+    fn staged_view(&self, slot: usize, routes: usize) -> (&[i32], &[f32]) {
         assert!(routes * 4 <= self.weights_offset,
             "EXL3 staged routes exceed capacity");
-        let base = self.staging.buffer.ptr.cast::<u8>();
+        let base = self.staging[slot].buffer.ptr.cast::<u8>();
         // SAFETY: as in `staged`; shared borrows of `self` exclude writers.
         unsafe {
             (
@@ -444,7 +464,7 @@ impl<'a> Exl3Worker<'a> {
         executor_id: u64,
         exchange: &mut HostExpertExchange,
         destination: Option<CuteafdDeviceBuffer>,
-        hidden_view: Option<CuteafdDeviceBuffer>,
+        hidden_view: Option<CuteafdDeviceBuffer>, routes_view: Option<CuteafdDeviceBuffer>,
     ) -> Result<()> {
         Self::validate_layer(&self.layer_ids, self.layer, request.layer() as usize)?;
         ensure!(
@@ -462,10 +482,11 @@ impl<'a> Exl3Worker<'a> {
             "EXL3 host exchange is too small"
         );
         let started = self.timing.as_ref().map(|_| std::time::Instant::now());
+        let slot = self.pending.next_slot()?;
         let routes = request.rows() as usize * Self::topk();
         let topology = self.topology;
         {
-            let (ids, weights) = self.staged(routes);
+            let (ids, weights) = self.staged(slot, routes);
             copy_routes(request, topology, ids, weights)?;
         }
         ensure!(
@@ -499,7 +520,7 @@ impl<'a> Exl3Worker<'a> {
             None => self.library.copy_h2d(self.inputs[0].buffer, request.hidden())?,
         }
         let id_bytes = routes * 4;
-        let staged = self.staging.buffer;
+        let staged = self.staging[slot].buffer;
         let id_source = CuteafdHostBuffer { bytes: id_bytes, ..staged };
         let weight_source = CuteafdHostBuffer {
             // SAFETY: the weights region starts inside the pinned allocation.
@@ -507,7 +528,12 @@ impl<'a> Exl3Worker<'a> {
             bytes: routes * 4,
             ..staged
         };
-        match self.host_path {
+        if let Some(source) = routes_view.filter(|_| !request.is_native_group()) {
+            // SAFETY: the mapped route records remain retained for this unit.
+            unsafe { super::super::service::routes::copy_mapped_routes(self.library, request, source,
+                self.inputs[1].buffer, self.inputs[2].buffer, self.stream.raw)?; }
+        } else {
+        match if self.deferred { HostPath::Async } else { self.host_path } {
             // SAFETY: both sources are pinned staging written above and left
             // untouched until this call's stream completes (below); both
             // destinations are this worker's input allocations.
@@ -525,6 +551,7 @@ impl<'a> Exl3Worker<'a> {
                 self.library.copy_h2d(self.inputs[2].buffer,
                     std::slice::from_raw_parts(weight_source.ptr.cast::<u8>(), routes * 4))?;
             },
+        }
         }
         let uploaded_us = started.map(|t| t.elapsed().as_micros() as u64).unwrap_or(0);
         if let Some([start, _]) = &self.timing {
@@ -567,9 +594,8 @@ impl<'a> Exl3Worker<'a> {
         // stream idle; the transport holds both slots until then, and its
         // timing publishes at `complete`.
         if self.deferred && destination.is_some() {
-            if self.worker_timing.is_some() {
-                self.pending = Some((request.request_id(), request.layer(), request.rows(), executor_id));
-            }
+            // SAFETY: all input copies, math and output writes precede this unit fence.
+            unsafe { self.pending.record((request.request_id(), request.layer(), request.rows(), executor_id), self.stream.raw)?; }
             return Ok(());
         }
         match self.host_path {
@@ -596,7 +622,7 @@ impl<'a> Exl3Worker<'a> {
             // including routing and output reduction, not just the expert kernel.
             let gpu_us = unsafe { self.library.cuda_event_elapsed_ms(start.raw, end.raw)? } * 1000.;
             let mut seen = vec![false; cuteafd_core::expert_geometry().experts as usize];
-            let (ids, _) = self.staged_view(routes);
+            let (ids, _) = self.staged_view(slot, routes);
             for &id in ids {
                 if let Some(value) = seen.get_mut(id as usize) { *value = true; }
             }
@@ -609,7 +635,7 @@ impl<'a> Exl3Worker<'a> {
         if self.route_dump.is_some() {
             let (layer, rows, topk) = (request.layer(), request.rows(), Self::topk() as u32);
             let mut dump = self.route_dump.take();
-            let (ids, weights) = self.staged_view(routes);
+            let (ids, weights) = self.staged_view(slot, routes);
             if let Some(writer) = &mut dump {
                 if let Err(error) = writer.record(layer, rows, topk, ids, weights) {
                     // A debug capture never fails a request: stop capturing.
@@ -645,7 +671,23 @@ impl<'a> Exl3Worker<'a> {
             ..slot
         };
         let response = request.response_device(executor_id, output)?;
-        self.execute(request, executor_id, exchange, Some(output), hidden)?;
+        self.execute(request, executor_id, exchange, Some(output), hidden, None)?;
+        Ok(Some(response))
+    }
+
+    /// # Safety
+    /// Transport retains all mapped frames until this unit's completion and send.
+    pub(crate) unsafe fn execute_mapped_payload(&mut self, request: &BackboneRequest<'_>, executor_id: u64,
+        exchange: &mut HostExpertExchange, mapped: cuteafd_transport::ProtocolV2RequestDevicePayload)
+        -> Result<Option<ExpertProtocolV2DeviceResponseRef<'static>>> {
+        let Some(slot) = mapped.response_slot else { return Ok(None) };
+        let prefix = EXPERT_PROTOCOL_V2_RESPONSE_HEADER_LEN;
+        let bytes = request.plane_bytes()?;
+        if !request.permits_device_response() || slot.bytes < prefix + bytes { return Ok(None); }
+        // SAFETY: checked output extent stays inside the exclusively retained send frame.
+        let output = CuteafdDeviceBuffer { ptr: unsafe { slot.ptr.cast::<u8>().add(prefix).cast() }, bytes, ..slot };
+        let response = request.response_device(executor_id, output)?;
+        self.execute(request, executor_id, exchange, Some(output), Some(mapped.hidden_payload), Some(mapped.routes))?;
         Ok(Some(response))
     }
 
@@ -666,7 +708,7 @@ impl<'a> Exl3Worker<'a> {
             row_indices.len() >= chunk_rows as usize,
             "response row-index scratch is too short"
         );
-        self.execute(request, executor_id, exchange, None, None)?;
+        self.execute(request, executor_id, exchange, None, None, None)?;
         let stride = cuteafd_core::expert_geometry().row_bytes() as usize;
         for start in (0..request.rows()).step_by(chunk_rows as usize) {
             let end = start.saturating_add(chunk_rows).min(request.rows());

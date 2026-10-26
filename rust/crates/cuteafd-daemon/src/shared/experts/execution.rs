@@ -125,9 +125,8 @@ pub(crate) struct ExpertExecution<'weights, 'library> {
     ids: DeviceAllocation<'library>,
     routing: DeviceAllocation<'library>,
     /// Pinned route ids then weights, uploaded asynchronously per request. The
-    /// stream drains before each response is emitted, so the next request may
-    /// rewrite this staging.
-    route_staging: crate::shared::memory::HostAllocation<'library>,
+    /// unit fence protects each staging slot until its own response is emitted.
+    route_staging: Vec<crate::shared::memory::HostAllocation<'library>>,
     compact_reducer: Option<V41CompactReducer<'library>>,
     compact_output: Option<DeviceAllocation<'library>>,
     output: Option<DeviceAllocation<'library>>,
@@ -138,10 +137,9 @@ pub(crate) struct ExpertExecution<'weights, 'library> {
     /// explicit `TP×EP` topology, `None` for every legacy path. The group is
     /// independent of the resident layer, so rebinding a layer never changes it.
     native_group: Option<u8>,
-    /// Lane-owned execution on a rank serving several execution lanes: a
-    /// mapped request returns with its work queued; the owner emits it once
-    /// [`Self::stream_idle`] reports this stream drained.
+    /// Mapped requests return queued; the owner emits each reply after its unit fence.
     deferred: bool,
+    pending: timing::PendingUnits<'library>,
     live_capacity: u32,
     budget: ExpertExecutionBudget,
 }
@@ -280,7 +278,8 @@ impl<'library> ExpertWeights<'library> {
         };
         let decode = prepare_small(1, budget.decode_scratch_bytes)?;
         let small = prepare_small(80, budget.small_scratch_bytes)?;
-        let route_staging = crate::shared::memory::HostAllocation::named(library, budget.routing_bytes, "experts/workspace/route_staging")?;
+        let route_staging = (0..1).map(|_| crate::shared::memory::HostAllocation::named(library,
+            budget.routing_bytes, "experts/workspace/route_staging" )).collect::<Result<Vec<_>>>()?;
         Ok(ExpertExecution {
             stream,
             _weights: self,
@@ -303,6 +302,7 @@ impl<'library> ExpertWeights<'library> {
             shared,
             slots,
             deferred: false,
+            pending: timing::PendingUnits::new(library, 1)?,
             graph: None,
             native_group: None,
             live_capacity: live,
@@ -335,7 +335,7 @@ impl<'weights, 'library> ExpertExecution<'weights, 'library> {
         self.native_group = group;
         Ok(())
     }
-    /// Reuse a wave's workspace across resident layers after its prior work drains.
+    /// Rebind uncaptured launch arguments; the stream orders shared workspace use.
     /// Captured graphs retain weight addresses and cannot be rebound.
     pub fn bind_layer(&mut self, weights: &'weights ExpertWeights<'library>) -> Result<()> {
         ensure!(
@@ -348,7 +348,8 @@ impl<'weights, 'library> ExpertExecution<'weights, 'library> {
         );
         ensure!(self._weights.is_nvfp4() == weights.is_nvfp4(),
             "cannot rebind expert workspace across quantization families");
-        self.synchronize()?;
+        // Launch copies its pointer arguments; rebinding uncaptured arguments
+        // cannot mutate earlier work, and stream order protects shared scratch.
         let mut slots = self.slots;
         weights.bind(&self.kernel, &mut slots)?;
         for decode in [&mut self.decode, &mut self.small].into_iter().flatten() {
@@ -454,7 +455,32 @@ impl<'weights, 'library> ExpertExecution<'weights, 'library> {
     }
 
     /// Leave mapped requests queued at return (see `deferred`).
-    pub(crate) fn defer(&mut self) { self.deferred = true; }
+    pub(crate) fn defer(&mut self, units: usize, staging_rows: usize) -> Result<()> {
+        ensure!(self.pending.is_empty(), "cannot resize an active expert queue");
+        ensure!(staging_rows > 0 && staging_rows <= self.live_capacity as usize, "native staging exceeds owner rows");
+        self.pending = timing::PendingUnits::new(self.library, units)?;
+        let bytes = staging_rows.checked_mul(cuteafd_core::expert_geometry().topk as usize * 8)
+            .context("native route staging overflow")?;
+        self.route_staging.clear();
+        for _ in 0..units {
+            self.route_staging.push(crate::shared::memory::HostAllocation::named(self.library,
+                bytes, "experts/workspace/route_staging")?);
+        }
+        self.deferred = true;
+        Ok(())
+    }
+
+    /// Publish deferred diagnostics after the owner's existing completion check.
+    pub(crate) fn complete(&mut self) -> Result<()> {
+        let Some((request_id, layer, rows, executor_id)) = self.pending.pop()? else { return Ok(()) };
+        if let Some(timing) = &mut self.worker_timing {
+            // SAFETY: the caller observed this stream drained after both records.
+            unsafe { timing.publish(request_id, layer, rows, executor_id, "native")?; }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn unit_ready(&self) -> Result<bool> { self.pending.ready() }
 
     /// Whether every request queued on this execution's stream has completed.
     pub(crate) fn stream_idle(&self) -> Result<bool> {
@@ -652,7 +678,24 @@ impl ExpertExecution<'_, '_> {
         };
         // Validate the destination descriptor before launching any GPU work.
         let response = request.response_device(executor_id, output)?;
-        self.execute_request_output(request, executor_id, exchange, Some(output), hidden)?;
+        self.execute_request_output(request, executor_id, exchange, Some(output), hidden, None)?;
+        Ok(Some(response))
+    }
+
+    /// # Safety
+    /// Transport retains mapped request/reply frames until this unit's fence and send complete.
+    pub(crate) unsafe fn execute_mapped_payload(&mut self,
+        request: &cuteafd_transport::expert::BackboneRequest<'_>, executor_id: u64,
+        exchange: &mut HostExpertExchange, mapped: cuteafd_transport::ProtocolV2RequestDevicePayload)
+        -> Result<Option<cuteafd_transport::ExpertProtocolV2DeviceResponseRef<'static>>> {
+        let Some(slot) = mapped.response_slot else { return Ok(None) };
+        let prefix = cuteafd_transport::EXPERT_PROTOCOL_V2_RESPONSE_HEADER_LEN;
+        let bytes = request.plane_bytes()?;
+        if !request.permits_device_response() || slot.bytes < prefix + bytes { return Ok(None); }
+        // SAFETY: validated output range is inside the exclusively retained frame.
+        let output = CuteafdDeviceBuffer { ptr: unsafe { slot.ptr.cast::<u8>().add(prefix).cast() }, bytes, ..slot };
+        let response = request.response_device(executor_id, output)?;
+        self.execute_request_output(request, executor_id, exchange, Some(output), Some(mapped.hidden_payload), Some(mapped.routes))?;
         Ok(Some(response))
     }
 
@@ -664,14 +707,14 @@ impl ExpertExecution<'_, '_> {
         executor_id: u64,
         exchange: &'a mut HostExpertExchange,
     ) -> Result<cuteafd_transport::ExpertProtocolV2ResponseRef<'a>> {
-        self.execute_request_output(request, executor_id, exchange, None, None)?;
+        self.execute_request_output(request, executor_id, exchange, None, None, None)?;
         request.response(executor_id, &exchange.partials[..request.plane_bytes()?])
     }
 
     fn execute_request_output(&mut self,
         request: &cuteafd_transport::expert::BackboneRequest<'_>, executor_id: u64,
         exchange: &mut HostExpertExchange, destination: Option<CuteafdDeviceBuffer>,
-        hidden_view: Option<CuteafdDeviceBuffer>,
+        hidden_view: Option<CuteafdDeviceBuffer>, routes_view: Option<CuteafdDeviceBuffer>,
     ) -> Result<()> {
         let layer = match self._weights.layer {
             ExpertLayer::Backbone { layer, .. }
@@ -685,6 +728,7 @@ impl ExpertExecution<'_, '_> {
         ensure!(executor_id != 0, "native response needs executor identity");
         validate_live_rows(request.rows() as usize, self.live_capacity)?;
         request.require_input_dtype(self.kernel.info().input_dtype)?;
+        let stage = self.pending.next_slot()?;
         let routes = request.rows() as usize * cuteafd_core::expert_geometry().topk as usize;
         let bytes = request.plane_bytes()?;
         ensure!(
@@ -712,16 +756,16 @@ impl ExpertExecution<'_, '_> {
             cfg!(target_endian = "little"),
             "native host exchange requires little-endian storage"
         );
-        // Every earlier request drained this stream before emitting its response
-        // (and bind_layer drains on rebind), so all three inputs are enqueued
-        // back to back with no host wait: the hidden rows as a device copy from
-        // the mapped request frame when the transport exposes one, and the route
-        // ids/weights from pinned staging.
+        // Every copy follows the preceding unit's consumers on this stream.
+        // Mapped sources stay transport-owned; converted routes stay in this
+        // unit's pinned staging until its own completion fence.
         let hidden_bytes = request.hidden().len();
-        ensure!(routes * 8 <= self.route_staging.buffer.bytes && hidden_bytes <= self.hidden.buffer.bytes,
+        ensure!(routes * 8 <= self.route_staging[stage].buffer.bytes && hidden_bytes <= self.hidden.buffer.bytes,
             "native request staging is too small");
         {
-            let staging = self.route_staging.bytes_mut();
+            let staging = self.route_staging[stage].bytes_mut();
+            // SAFETY: both typed route arrays contain `routes` initialized values;
+            // their byte views do not overlap the exclusively borrowed staging.
             unsafe {
                 staging[..routes * 4].copy_from_slice(
                     std::slice::from_raw_parts(exchange.ids.as_ptr().cast::<u8>(), routes * 4));
@@ -735,11 +779,17 @@ impl ExpertExecution<'_, '_> {
                     CuteafdDeviceBuffer { bytes: hidden_bytes, ..view }, hidden_bytes, self.stream.raw)?,
                 None => self.library.copy_h2d_async(self.hidden.buffer, request.hidden(), self.stream.raw)?,
             }
-            let mut ids = self.route_staging.buffer; ids.bytes = routes * 4;
-            self.library.copy_host_buffer_h2d_async(self.ids.buffer, ids, routes * 4, self.stream.raw)?;
-            let mut weights = self.route_staging.buffer;
-            weights.ptr = weights.ptr.cast::<u8>().add(routes * 4).cast(); weights.bytes = routes * 4;
-            self.library.copy_host_buffer_h2d_async(self.routing.buffer, weights, routes * 4, self.stream.raw)?;
+            if let Some(source) = routes_view.filter(|_| !request.is_native_group()) {
+                // SAFETY: transport retains this unit's mapped canonical route records.
+                super::service::routes::copy_mapped_routes(self.library, request, source,
+                    self.ids.buffer, self.routing.buffer, self.stream.raw)?;
+            } else {
+                let mut ids = self.route_staging[stage].buffer; ids.bytes = routes * 4;
+                self.library.copy_host_buffer_h2d_async(self.ids.buffer, ids, routes * 4, self.stream.raw)?;
+                let mut weights = self.route_staging[stage].buffer;
+                weights.ptr = weights.ptr.cast::<u8>().add(routes * 4).cast(); weights.bytes = routes * 4;
+                self.library.copy_host_buffer_h2d_async(self.routing.buffer, weights, routes * 4, self.stream.raw)?;
+            }
             Ok(())
         } })();
         if let Err(error) = uploaded { self.synchronize()?; return Err(error); }
@@ -786,9 +836,13 @@ impl ExpertExecution<'_, '_> {
         unsafe {
             if let Some(timing) = &self.worker_timing { timing.record(1, self.stream.raw)?; }
         }
-        // A deferred mapped request completes when the owner observes the
-        // stream idle; the transport holds both slots until then.
-        if self.deferred && destination.is_some() { return Ok(()); }
+        // This unit's fence releases its mapped I/O independently of later
+        // requests already queued on the same stream.
+        if self.deferred && destination.is_some() {
+            // SAFETY: all copies, math and output writes precede this unit fence.
+            unsafe { self.pending.record((request.request_id(), request.layer(), request.rows(), executor_id), self.stream.raw)?; }
+            return Ok(());
+        }
         self.synchronize()?;
         if let Some(timing) = &mut self.worker_timing {
             // SAFETY: synchronize completed both event records.

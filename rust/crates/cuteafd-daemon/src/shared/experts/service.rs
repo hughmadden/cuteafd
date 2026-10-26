@@ -3,7 +3,7 @@ mod local;
 mod backend;
 mod census;
 mod modules;
-mod routes;
+pub(super) mod routes;
 mod exlr8;
 mod push;
 mod push_fp8;
@@ -177,14 +177,18 @@ fn load_weights<'a>(
     );
     // The workspace is planned from the same layer selection as the load, so a
     // TP2/TP3 topology cannot be budgeted with TP4 scratch.
-    let workspace = ExpertWeights::plan_execution(
-        config.selection(0)?,
-        library,
-        config.compiled_capacity()?,
-        config.capacity,
-        nvfp4,
-    )?
-    .total()?;
+    let workspace = spark_execution_workspace(config, |live, compiled, staging_rows| {
+        let budget = ExpertWeights::plan_execution(config.selection(0)?, library,
+            compiled, live, nvfp4)?;
+        let device = budget.total()?;
+        let scratch = budget.scratch_bytes.checked_add(budget.decode_scratch_bytes)
+            .and_then(|bytes| bytes.checked_add(budget.small_scratch_bytes))
+            .context("native Spark scratch overflow")?;
+        let staging = (staging_rows as usize).checked_mul(cuteafd_core::expert_geometry().topk as usize * 8)
+            .context("native Spark route staging overflow")?;
+        Ok((scratch, device - scratch, staging))
+    })?;
+    let workspace = usize::try_from(workspace.total().context("native Spark workspace overflow")?)?;
     ensure!(
         resident
             .checked_add(workspace)
@@ -386,6 +390,28 @@ fn spark_runtime_headroom() -> Result<usize> {
         usize::try_from(cuteafd_core::memory_layout::SPARK_RUNTIME_RESIDUAL_BYTES)?)
 }
 
+/// Query installed packages at each owner's live/export extent. The tuple is
+/// device scratch, stream-ordered device I/O and pinned staging per queued unit.
+fn spark_execution_workspace(config: &NativeExpertServiceConfig,
+    mut plan: impl FnMut(u32, u32, u32) -> Result<(usize, usize, usize)>)
+    -> Result<cuteafd_core::expert_geometry::SparkWorkspaceBytes> {
+    use cuteafd_core::expert_geometry::{spark_owner_workspace_bytes, SparkOwnerWorkspace};
+    let executions = &config.model_admission.as_ref()
+        .context("Spark workspace requires typed execution admission")?.executions;
+    executions.validate()?;
+    let mut owners = Vec::with_capacity(executions.decode.len() + 1);
+    for (capacity, compiled, staging_rows, buffered_units) in executions.decode.iter()
+        .map(|owner| (owner.capacity, owner.compiled_capacity, owner.capacity, 1))
+        .chain(std::iter::once((executions.prefill.capacity,
+            executions.prefill.compiled_capacity, executions.prefill.unit_rows, executions.prefill.buffered_units))) {
+        let (scratch, io, pinned) = plan(capacity, compiled, staging_rows)?;
+        owners.push(SparkOwnerWorkspace { scratch_bytes: u64::try_from(scratch)?,
+            io_bytes: u64::try_from(io)?, pinned_staging_bytes: u64::try_from(pinned)?,
+            buffered_units });
+    }
+    spark_owner_workspace_bytes(owners).context("Spark execution workspace overflow")
+}
+
 fn spark_admission_budget(
     config: &NativeExpertServiceConfig,
     resident: usize,
@@ -408,11 +434,8 @@ fn spark_admission_budget_for_geometry(config: &NativeExpertServiceConfig,
     let rings = usize::try_from(io.mapped_rings)?;
     let endpoint_staging = usize::try_from(io.endpoint_staging)?;
     let headroom = spark_runtime_headroom()?;
-    // Every execution slot owns a full execution workspace (stream, scratch,
-    // inputs, staging) sized for the largest admitted unit, over the shared
-    // resident weights.
-    let slots = config.model_admission.as_ref().map_or(1, |model| usize::from(model.execution_slots));
-    let workspace = workspace.checked_mul(slots).context("Spark execution slot workspace overflow")?;
+    // Backend preflight already sums capacity-specific execution owners,
+    // including retained pinned staging; weights and rings stay shared.
     // The loader's pinned buffers and read scratch live only for one layer load;
     // the exchange, row-index scratch and registered rings live while serving.
     let load_peak = resident
@@ -552,6 +575,14 @@ mod tests {
         }
     }
 
+    fn test_executions(capacity: u32, compiled_capacity: u32) -> cuteafd_core::SparkExecutions {
+        cuteafd_core::SparkExecutions {
+            decode: vec![cuteafd_core::DecodeExecution { capacity: capacity.min(80), compiled_capacity }],
+            prefill: cuteafd_core::PrefillExecution { capacity, compiled_capacity,
+                unit_rows: capacity, buffered_units: 1 },
+        }
+    }
+
     fn config(world: usize, rank: usize, topology: Option<SparkTopology>) -> NativeExpertServiceConfig {
         NativeExpertServiceConfig {
             library: PathBuf::from("/native.so"),
@@ -564,11 +595,11 @@ mod tests {
             rank,
             world,
             model_admission: Some(cuteafd_transport::worker_selection::ModelAdmission {
-                capacity: 16, compiled_capacity: 16,
+                executions: test_executions(16, 16),
                 endpoints: vec![cuteafd_core::SparkEndpoint { ring_depth: None, capacity: 16,
                     ingress: cuteafd_core::SparkIngress::Fp8K32 }; 2],
                 rings: cuteafd_core::SparkRings { max_frame_bytes: 64 << 20,
-                    depth: 8, slot_bytes: 8 << 20, alignment: 4096 }, execution_slots: 1
+                    depth: 8, slot_bytes: 8 << 20, alignment: 4096 }
             }),
             selected_layers: None,
             capacity: 16,
@@ -647,8 +678,7 @@ mod tests {
                     worker.rdma_endpoints = 1;
                     worker.selected_layers = Some(layers.clone());
                     let model = worker.model_admission.as_mut().unwrap();
-                    model.capacity = capacity;
-                    model.compiled_capacity = 4096;
+                    model.executions = test_executions(capacity, 4096);
                     model.endpoints = vec![cuteafd_core::SparkEndpoint { ring_depth: None, capacity,
                         ingress: cuteafd_core::SparkIngress::Fp8K32 }];
                     let workspace = Exl3Worker::plan(&package.join(format!("tp6-rank{rank}")), capacity,
@@ -754,12 +784,12 @@ mod tests {
 
     fn set_model(config: &mut NativeExpertServiceConfig, capacity: u32, bf16: bool, endpoints: usize) {
         config.model_admission = Some(cuteafd_transport::worker_selection::ModelAdmission {
-            capacity, compiled_capacity: capacity,
+            executions: test_executions(capacity, capacity),
             endpoints: vec![cuteafd_core::SparkEndpoint { ring_depth: None, capacity, ingress: if bf16 {
                 cuteafd_core::SparkIngress::Bf16
             } else { cuteafd_core::SparkIngress::Fp8K32 } }; endpoints],
             rings: cuteafd_core::SparkRings { max_frame_bytes: 64 << 20,
-                depth: 8, slot_bytes: 8 << 20, alignment: 4096 }, execution_slots: 1
+                depth: 8, slot_bytes: 8 << 20, alignment: 4096 }
         });
     }
 
@@ -941,21 +971,26 @@ mod tests {
         assert_eq!(HostExpertExchange::bytes_for(16).unwrap(), 16 * (48 + 10240));
     }
 
-    /// Every execution slot owns one execution workspace; every other term
-    /// (rings, exchange, staging) is unchanged by the slot count.
     #[test]
-    fn each_execution_slot_charges_one_execution_workspace() {
-        let topology = SparkTopology::new(2, 2).unwrap();
-        let mut config = config(4, 0, Some(topology));
-        config.capacity = 4096;
-        set_model(&mut config, 4096, false, 3);
-        let one = spark_admission_budget(&config, 10, 1, 2, 3, 4).unwrap();
-        for slots in 2..=4u8 {
-            config.model_admission.as_mut().unwrap().execution_slots = slots;
-            let pool = spark_admission_budget(&config, 10, 1, 2, 3, 4).unwrap();
-            assert_eq!(pool.serve_peak - one.serve_peak, 4 * (u64::from(slots) as usize - 1));
-            assert_eq!((pool.load_peak, pool.rings, pool.exchange), (one.load_peak, one.rings, one.exchange));
-        }
+    fn typed_owner_workspace_charges_one_prefill_scratch_and_retained_staging() -> Result<()> {
+        let mut config = config(4, 0, None);
+        let model = config.model_admission.as_mut().unwrap();
+        model.executions = cuteafd_core::SparkExecutions::admit(&[64, 80], 4096, 2752, 3,
+            &[1, 80, 4096])?;
+        let mut queried = Vec::new();
+        let workspace = spark_execution_workspace(&config, |live, compiled, staging_rows| {
+            queried.push((live, compiled, staging_rows));
+            Ok((compiled as usize * 10, live as usize * 2, staging_rows as usize * 8))
+        })?;
+        assert_eq!(queried, [(64, 80, 64), (80, 80, 80), (4096, 4096, 2752)]);
+        assert_eq!(workspace.device_bytes, (80 + 80 + 4096) * 10 + (64 + 80 + 4096) * 2);
+        assert_eq!(workspace.pinned_bytes, (64 + 80 + 3 * 2752) * 8);
+        let one = spark_admission_budget(&config, 10, 1, 2, 3, 4)?;
+        config.model_admission.as_mut().unwrap().executions.prefill.buffered_units = 4;
+        let four = spark_admission_budget(&config, 10, 1, 2, 3, 4)?;
+        assert_eq!(one.serve_peak, four.serve_peak,
+            "already-summed execution workspace must not be multiplied by buffered units");
+        Ok(())
     }
 
     #[test]
@@ -1038,7 +1073,7 @@ mod tests {
             config.device_budget = 104 << 30;
             let mut previous = None;
             for clients in [1, 2] {
-                let model = ModelAdmission::for_clients(geometry, endpoint, 4096, rings, clients)?;
+                let model = ModelAdmission::for_clients(geometry, endpoint, rings, clients, test_executions(endpoint.capacity, 4096))?;
                 let forecast = working.rank_endpoints_io(rank, geometry, &model.endpoints, rings)?;
                 config.rdma_endpoints = clients;
                 config.model_admission = Some(model);
@@ -1087,9 +1122,9 @@ mod tests {
             endpoints.extend(std::iter::repeat_n(cuteafd_core::SparkEndpoint { ring_depth: None, capacity: 80,
                 ingress: cuteafd_core::SparkIngress::Fp8K32 }, device));
             let model = cuteafd_transport::worker_selection::ModelAdmission {
-                capacity: 1024, compiled_capacity: 1024, endpoints,
+                executions: test_executions(1024, 1024), endpoints,
                 rings: cuteafd_core::SparkRings { max_frame_bytes: 64 << 20,
-                    depth: 8, slot_bytes: 8 << 20, alignment: 4096 }, execution_slots: 1
+                    depth: 8, slot_bytes: 8 << 20, alignment: 4096 }
             };
             model.validate(geometry).unwrap();
             let exact = model.ring_bytes(geometry).unwrap();
@@ -1177,8 +1212,7 @@ mod tests {
                         ingress: SparkIngress::Fp8K32 }, rtx));
                     endpoints.push(SparkEndpoint { ring_depth: Some(2), capacity: 1024, ingress: SparkIngress::Fp8K32 });
                     config.model_admission.as_mut().unwrap().endpoints = endpoints.clone();
-                    config.model_admission.as_mut().unwrap().capacity = 4096;
-                    config.model_admission.as_mut().unwrap().compiled_capacity = 4096;
+                    config.model_admission.as_mut().unwrap().executions = test_executions(4096, 4096);
                     let model = config.model_admission.as_ref().unwrap();
                     model.validate(geometry).unwrap();
                     let working = SparkWorkingSet { spark_layers: vec![3], spark_ranks: world,
@@ -1295,7 +1329,7 @@ fn validate_topology(config: &NativeExpertServiceConfig, catalog: &OfficialV41Ca
 
 impl NativeExpertServiceConfig {
     fn compiled_capacity(&self) -> Result<u32> {
-        Ok(self.model_admission.as_ref().context("expert extent requires coordinator model admission")?.compiled_capacity)
+        Ok(self.model_admission.as_ref().context("expert extent requires coordinator model admission")?.compiled_capacity())
     }
 
     /// Only exact coordinator-selected absolute IDs may become resident.
